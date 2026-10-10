@@ -2854,7 +2854,17 @@
               (i start))
          (cond
            ((and (integerp store-item) (%u8-bare-p seq))
-            ;; plain u8 vector: byte stores, no per-element dispatch
+            ;; plain u8 vector: byte stores, no per-element dispatch.  A ZERO
+            ;; fill -- pagetree clears every page buffer this way, 23% of a
+            ;; cabinet write -- goes eight bytes per store first: fixnum 0
+            ;; stored through :u64 is a raw 0 word, exact, and byte K of the
+            ;; packed data is at (%val->word seq) + 7 + K (see %BULK-COPY-U8).
+            ;; Nothing allocates in the loop, so the address cannot move.
+            (when (eql store-item 0)
+              (let ((a (+ (%val->word seq) 7)))
+                (loop (when (> (+ i 8) eff-end) (return))
+                  (setf (mem-ref (+ a i) :u64) 0)
+                  (setq i (+ i 8)))))
             (loop (when (>= i eff-end) (return seq))
               (%u8-set seq i store-item)
               (setq i (+ i 1))))

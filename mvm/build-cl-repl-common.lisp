@@ -166,6 +166,15 @@
     (modus.mvm::check-parses p)
     (%rpi-file-text p)))
 
+(defun %rpi-hcon-font-text ()
+  "HCON-FONT-BYTES for net/hdmi-console.lisp: boot/boot-uefi-x64.lisp's 8x8
+   font (95 glyphs, one little-endian qword each), as 760 row bytes."
+  (let ((bytes nil))
+    (dolist (qw (symbol-value (find-symbol "*FONT-8X8-QWORDS*" :modus.mvm)))
+      (dotimes (i 8) (push (ldb (byte 8 (* 8 i)) qw) bytes)))
+    (assert (= (length bytes) 760))
+    (format nil "(defun hcon-font-bytes () '~S)" (nreverse bytes))))
+
 ;;; ============================================================
 ;;; ARCH SLOTS — bare-metal AArch64 (BCM2837 / BCM2710A1)
 ;;; ============================================================
@@ -380,6 +389,44 @@
     ;; UART.  This is the bare-metal counterpart of lib/cli-toplevel.lisp, which
     ;; the hosted payload supplies and *CLI-BARE-METAL* omits.
     (%rpi-mvm-text "lib/serial-repl.lisp")
+    ;; Single-threaded answers to the SB-THREAD shim's primitives (the shim is
+    ;; boot-evaluated here too; net/hosted-sync.lisp is hosted-only).
+    (%rpi-mvm-text "net/bare-sync.lisp")
+    ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
+    ;; HDMI console's state and font.  Zeroed by the kernel prologue.
+    (if *cl-repl-rpi-p*
+        "
+(defun %bare-sync-arena () (values #x111F2000 #x111FF000))
+"
+        "")
+    ;; A board net build carries net/usb-hid-split.lisp, which is spliced
+    ;; BEFORE this text: its console must be bound HERE, after serial-repl's
+    ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
+    ;; environment because *NET-BUILD-P* is defined further down.
+    (if (and *cl-repl-rpi-p*
+             (equal #+sbcl (sb-ext:posix-getenv "MODUS_NET_BUILD") "1"))
+        (concatenate 'string "
+(defun %console-init ()
+  ;; The screen first, so everything after it (the USB-HID line, the banner)
+  ;; shows on it too.  A display failure must not cost the keyboard.
+  (handler-case (hcon-init) (t (c) nil))
+  (hid-console-init))
+(defun %console-read-char () (hid-console-read-char))
+"
+          ;; The non-blocking serial check must poll the UART READ-CHAR-SERIAL
+          ;; reads -- the same choice as the translator's serial co-init below
+          ;; (mini UART for a chainloaded board, MODUS_RPI_MINIUART overrides).
+          (if (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_MINIUART"))
+                    (c #+sbcl (sb-ext:posix-getenv "MODUS_RPI_CHAINLOAD")))
+                (if (and v (plusp (length v)))
+                    (not (string= v "0"))
+                    (equal c "1")))
+              ";; mini UART AUX_MU_LSR (0x3F215054): bit 0 = data ready.
+(defun hid-serial-ready-p ()
+  (not (zerop (logand (mem-ref #x3F215054 :u32) 1))))
+"
+              ""))
+        "")
     "
 ;; #160 bitmaps, bare-metal flavour — see the call in kernel-main for why.
 ;; gc.lisp's %gc-bitmap-init uses %mmap-exec-page, which does not exist here.
@@ -551,6 +598,9 @@
       (concatenate 'string
         (string #\Newline)
         (%rpi-mvm-text "lib/fdt.lisp")
+        (string #\Newline)
+        ;; the A53 performance counters (pmu-measure, pmu-start/pmu-read): EL2 only
+        (%rpi-mvm-text "lib/a64-pmu.lisp")
         "
 (defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
 ;;; THE CLOCK ON BARE METAL.  ansi-bridge.lisp's GET-INTERNAL-REAL-TIME and
@@ -750,6 +800,13 @@
   (if *cl-repl-virt-p*
       *cl-repl-virt-kernel-prologue*
       "
+  ;; The HDMI console's ready word (net/hdmi-console.lisp) is in Device RAM,
+  ;; which survives a board reset: clear it before the first character, or the
+  ;; banner below is drawn into the previous boot's framebuffer.
+  (setf (mem-ref #x111F0800 :u32) 0)
+  ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
+  (setf (mem-ref #x111F2000 :u32) 0)
+  (%gc-write64 #x111F2008 0)
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.
   (write-string-serial \"MODUS-CL\")
@@ -1049,6 +1106,9 @@
         (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
         (%rpi-net-text "aarch64-overrides.lisp")  (string #\Newline)
+        ;; After ssh.lisp, by last-defun-wins -- :RPI: the BCM2835/2837 hardware RNG
+        ;; behind SSH-RANDOM (ARCH-HW-RANDOM-FILL) and natrium's entropy.
+        (if *cl-repl-rpi-p* (%rpi-net-text "hwrng-bcm2835.lisp") "") (string #\Newline)
         "(defun native-eval (form) (eval form))"  (string #\Newline)
         ;; ssh-handle-connection fix + trace live in net/aarch64-overrides.lisp.
         ;; FIX: single-threaded server handles ONE connection at a time.  Guard
@@ -1258,7 +1318,27 @@
             ;; the glass blit seam.  Independent of the NIC (self-contained
             ;; hdmi-* defuns over mem-ref + the property mailbox at 0x3F00B880);
             ;; spliced here because board builds are always net builds.
-            (%rpi-net-text "hdmi-fb.lisp")       (string #\Newline))))))
+            (%rpi-net-text "hdmi-fb.lisp")       (string #\Newline)
+            ;; USB keyboard + mouse behind the board's hub: split transactions
+            ;; (dwc2-split) and the HID driver, which overrides lib/serial-repl's
+            ;; %console-init / %console-read-char seams (this text is spliced
+            ;; after it), so the REPL reads serial OR the keyboard.
+            ;; HDMI text console: every WRITE-CHAR-SERIAL also draws here
+            ;; (the compiler hook is set below for this build).  Needs
+            ;; hdmi-fb.lisp's mailbox helpers and the generated 8x8 font.
+            (%rpi-hcon-font-text)                (string #\Newline)
+            (%rpi-net-text "hdmi-console.lisp")  (string #\Newline)
+            (%rpi-net-text "dwc2-split.lisp")    (string #\Newline)
+            (%rpi-net-text "usb-hid-split.lisp") (string #\Newline)
+            ;; The boot SD card, read only (SDHOST, adopting U-Boot's setup):
+            ;; the sector source for a pagetree/cabinet store on a partition.
+            (%rpi-net-text "sdhost.lisp")        (string #\Newline))))))
+
+;; The Zero board net build mirrors the serial console to HDMI: every
+;; WRITE-CHAR-SERIAL compiled into the image calls net/hdmi-console.lisp's
+;; %CONSOLE-WRITE-CHAR (mvm/compiler.lisp *WRITE-CHAR-SERIAL-HOOK*).
+(when (and *cl-repl-rpi-p* *net-build-p*)
+  (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char))
 
 (defvar *net-source*
   (if *net-build-p*
@@ -1271,6 +1351,21 @@
         ;; ip.lisp's); both "" otherwise.
         *crypto-source*
         *ssh-transport-source*
+        ;; The Pi's SSH key exchange spent ~9 of its ~9.5 s in USB-KEEPALIVE
+        ;; (aarch64-overrides.lisp): 100 x IO-DELAY (1.5 ms each: 5000 UART
+        ;; reads) per call, called every 16 squarings of every field inversion,
+        ;; every 32 ladder steps of X25519, every 4 bytes of ED-BASE-MULT and 3x
+        ;; in SSH-HANDLE-KEX -- ~60 calls, 155 ms each.  The arithmetic is ~20
+        ;; ms.  It kept a USB GADGET's host from declaring the link dead during
+        ;; crypto; here modus is the USB HOST and the RTL8153 queues what
+        ;; arrives, so waiting buys nothing -- and the polls it made DROPPED
+        ;; any TCP segment they read.  Spliced after the transport so it wins.
+        (if (and *ssh-build-p* *cl-repl-rpi-p*)
+            (format nil "~%(defun usb-keepalive () 0)~%")
+            "")
+        ;; The Pi's TCP fast paths over the RTL8153 (net/r8152-post.lisp):
+        ;; overrides of ip.lisp's seams, so spliced after it.
+        (if *cl-repl-rpi-p* (concatenate 'string (%rpi-net-text "r8152-post.lisp") (string #\Newline)) "")
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too
@@ -1294,15 +1389,57 @@
     (let ((ip-total (buf-read-u16-mem buf 16))
           (tcp-hdr-len (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
       (let ((data-len (- ip-total (+ 20 tcp-hdr-len))))
-        (let ((data-base (+ (+ buf 34) tcp-hdr-len)))
-          (let ((i 0))
-            (loop
-              (when (>= i data-len) (return data-len))
-              (let ((dst-idx (+ dest-off i)))
-                (when (< dst-idx (%net-resp-cap))
-                  (setf (aref dest dst-idx) (mem-ref (+ data-base i) :u8))))
-              (setq i (+ i 1))))
+        ;; Four bytes per load straight into DEST's packed data (byte K of a u8
+        ;; vector is at word+7+K), not a byte at a time through AREF with a
+        ;; %NET-RESP-CAP call per byte.  Clipped to the cap once.  The LOADS
+        ;; must be ALIGNED: the RX buffer is DMA memory mapped DEVICE, where an
+        ;; unaligned access is an alignment fault (ESR 0x96000021 at
+        ;; rx+0x4E: desc 24 + headers 54 put the payload on a 2-byte
+        ;; boundary).  So bytes up to a 4-byte source boundary, then aligned
+        ;; words; DEST is ordinary memory and takes unaligned stores.
+        (let* ((data-base (+ (+ buf 34) tcp-hdr-len))
+               (n (max 0 (min data-len (- (length dest) dest-off))))
+               (da (+ (%val->word dest) 7 dest-off))
+               ;; The RTL8153's RX buffer is ordinary cacheable RAM: copy its
+               ;; whole 64-byte chunks natively (net/r8152.lisp R8152-NCOPY).
+               (i (if (eq (usb-netdev-get) 2) (r8152-ncopy da data-base n) 0)))
+          (loop
+            (when (or (>= i n) (zerop (logand (+ data-base i) 3))) (return nil))
+            (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))
+            (setq i (+ i 1)))
+          (loop
+            (when (> (+ i 4) n) (return nil))
+            (setf (mem-ref (+ da i) :u32) (mem-ref (+ data-base i) :u32))
+            (setq i (+ i 4)))
+          (loop
+            (when (>= i n) (return nil))
+            (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))
+            (setq i (+ i 1)))
           data-len)))))
+(defun %http-ci-match (buf at word)
+  (let ((i 0) (n (length word)))
+    (loop
+      (when (>= i n) (return t))
+      (let ((c (aref buf (+ at i))))
+        (when (and (>= c 65) (<= c 90)) (setq c (+ c 32)))
+        (when (not (eql c (char-code (char word i)))) (return nil)))
+      (setq i (+ i 1)))))
+(defun %http-full-length (buf len)
+  \"Header bytes + Content-Length, once the whole header is in BUF[0,LEN); else 0.\"
+  (let ((i 0) (cl -1) (hdr-end -1))
+    (loop
+      (when (or (>= (+ i 3) len) (>= hdr-end 0)) (return nil))
+      (when (and (eql (aref buf i) 13) (eql (aref buf (+ i 1)) 10)
+                 (eql (aref buf (+ i 2)) 13) (eql (aref buf (+ i 3)) 10))
+        (setq hdr-end (+ i 4)))
+      (when (and (< cl 0) (< (+ i 16) len) (%http-ci-match buf i \"content-length:\"))
+        (let ((j (+ i 15)) (v 0))
+          (loop (when (or (>= j len) (not (eql (aref buf j) 32))) (return nil)) (setq j (+ j 1)))
+          (loop (when (or (>= j len) (< (aref buf j) 48) (> (aref buf j) 57)) (return nil))
+                (setq v (+ (* v 10) (- (aref buf j) 48))) (setq j (+ j 1)))
+          (setq cl v)))
+      (setq i (+ i 1)))
+    (if (and (>= hdr-end 0) (>= cl 0)) (+ hdr-end cl) 0)))
 (defun http-fetch-impl (url url-len)
   (let ((scheme-end (url-skip-http url url-len)))
     (let ((host-end (url-host-end url scheme-end url-len)))
@@ -1356,6 +1493,18 @@
                 (let ((n (tcp-receive 300)))
                   (if (> n 0)
                       (progn
+                        ;; GROW rather than drop: %NET-RESP-CAP is now the
+                        ;; starting size.  Past a fixed cap tcp-rx-copy used to
+                        ;; discard bytes while resp-len still counted them.
+                        ;; Sized ONCE from Content-Length when the header has
+                        ;; arrived (doubling cost 5/10/20/50 ms stalls on a 4 MB
+                        ;; body); doubling only when the server sent none.
+                        (when (> (+ resp-len n) (length resp))
+                          (let ((bigger (make-array (max (* 2 (+ (length resp) n))
+                                                         (%http-full-length resp resp-len))
+                                                    :element-type (quote (unsigned-byte 8)))))
+                            (replace bigger resp :end2 resp-len)
+                            (setq resp bigger)))
                         (let ((copied (tcp-rx-copy resp resp-len)))
                           (setq resp-len (+ resp-len copied)))
                         (setq last-rx (%timer-universal-time)))
@@ -1444,11 +1593,7 @@
           ;; tarball is 40 MB, past the alloc guard band.
           (let* ((blen (- resp-len body-off))
                  (out (make-array blen :element-type (quote (unsigned-byte 8)))))
-            (let ((i 0))
-              (loop
-                (when (>= i blen) (return nil))
-                (setf (aref out i) (aref resp (+ body-off i)))
-                (setq i (+ i 1))))
+            (replace out resp :start2 body-off)     ; both packed: word copy
             (cons out blen))))))
 
 ;; Fetch URL-STRING and REPORT it: body length, the first four bytes (a .tar.gz

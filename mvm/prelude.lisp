@@ -1246,6 +1246,24 @@
 ;; At 0 we print "..." once and stop. Set to big positive to not bound.
 (defvar *write-object-budget* 0)
 
+(defun %write-bignum-dec (n)
+  "Write integer N (a bignum) in decimal to the serial console."
+  (let ((chunks nil) (m (if (< n 0) (- n) n)))
+    (when (< n 0) (write-char-serial 45))
+    (loop
+      (multiple-value-bind (q r) (floor m 1000000000000000000)
+        (setq chunks (cons r chunks))
+        (setq m q)
+        (when (= m 0) (return nil))))
+    (print-dec (car chunks))
+    (dolist (c (cdr chunks))
+      (let ((d 100000000000000000))           ; zero-pad to 18 digits
+        (loop
+          (when (or (<= d 1) (>= c d)) (return nil))
+          (write-char-serial 48)
+          (setq d (floor d 10))))
+      (print-dec c))))
+
 (defun write-object (obj)
   "Print a Lisp object to serial output (prin1-style).
    Bounded by *write-object-budget* if positive.
@@ -1334,6 +1352,13 @@
             (write-object (aref obj i))
             (setq i (+ i 1))))
         (write-char-serial 41))
+       ((and (not (fixnump obj)) (not (consp obj)) (not (null obj))
+             (= (obj-subtag obj) #x30))
+        ;; Bignum, in decimal: 18-digit chunks by FLOOR, most significant
+        ;; first, the later ones zero-padded.  It printed as #<?48> (48 = #x30,
+        ;; the bignum subtag), so every bignum at the bare REPL looked like a
+        ;; corrupt object -- which is how a real one (a lost limb array) hid.
+        (%write-bignum-dec obj))
        ((characterp obj)
         ;; #\X (print the literal character after a #\ prefix)
         (write-char-serial 35) (write-char-serial 92)
@@ -3355,12 +3380,21 @@
                              (eq (obj-subtag seq) #x12)) (%make-f32-vector len))
                        (t (make-array len)))))
         (let ((i 0))
-          (if (%bulk-copy-ok-p result seq)
-              (progn (%bulk-copy result 0 seq start len) result)
+          (cond
+            ;; Byte vectors: %BULK-COPY-OK-P excludes #x11 on purpose (word
+            ;; slots are not bytes), so they fell to the element loop below --
+            ;; a generic AREF/ASET per byte.  pagetree slices every overflow
+            ;; value out of its leaf blob with SUBSEQ: cabinet's WRITE-FILE of a
+            ;; 1.8 MB clip spent 58% of 314 s on the Zero right here.
+            ((%bulk-copy-u8-ok-p result seq)
+             (%bulk-copy-u8 result 0 seq start len) result)
+            ((%bulk-copy-ok-p result seq)
+             (%bulk-copy result 0 seq start len) result)
+            (t
               (loop
                 (when (= i len) (return result))
                 (aset result i (aref seq (+ start i)))
-                (setq i (+ i 1)))))))))
+                (setq i (+ i 1))))))))))
 
 (defun concatenate-strings (s1 s2)
   "Concatenate two strings (arrays of chars)."

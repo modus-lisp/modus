@@ -5408,6 +5408,11 @@
           (i start)
           (in (%resolve-input-stream stream))
           (char-stream (%input-stream-reads-chars-p stream)))
+      ;; bytes from a plain binary file into a packed byte vector: in bulk
+      (when (and (not char-stream) (streamp in) (= (%stream-type in) 9)
+                 (%u8-bare-p seq)
+                 (let ((spec (%fs-elt-spec in))) (and (= (car spec) 1) (not (cdr spec)))))
+        (setq i (%fs-read-u8-bulk in seq i actual-end)))
       (loop
         (when (>= i actual-end) (return i))
         (if char-stream

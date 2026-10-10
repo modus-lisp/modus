@@ -741,7 +741,8 @@
 (defun %gc-leaf-subtag-p (subtag)
   "T if an object of SUBTAG has a RAW-DATA payload (no Lisp pointers) — the
    to-space scan must NOT forward its slots.  Enumerated leaves: string #x10,
-   u8-vector #x11, u64-vector #x14, sap #x16, bignum #x30, and every float
+   u8-vector #x11, u64-vector #x14, sap #x16, and every float (NOT bignum
+   #x30: a big bignum's slot 1 is its limb-array pointer)
    flavor (#x60 double / #x64 single / #x65 short / #x66 long; #x60 also =
    mvm-bytecode, likewise raw).  Everything else (simple-vector/array/ratio/
    struct/hash/symbol/function/closure/module/…) is pointer-bearing — scan it.
@@ -752,7 +753,10 @@
    (if (= subtag #x12) t
     (if (= subtag #x14) t
      (if (= subtag #x16) t
-      (if (= subtag #x30) t
+      ;; NOT bignum #x30: a big bignum's slot 1 points at its limb array
+      ;; (cl-eval.lisp %MAKE-BB); small ones hold tagged fixnums.  Both safe to
+      ;; scan, and the big one must be (x64 9d0790c; aarch64 the same fix).
+      (if nil t
        (if (= subtag #x60) t
         (if (= subtag #x64) t
          (if (= subtag #x65) t

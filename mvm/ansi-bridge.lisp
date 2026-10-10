@@ -5290,9 +5290,18 @@
                              (store (if (and char-elt (characterp ie))
                                         (char-code ie) ie))
                              (i 0))
-                        (loop (when (>= i total) (return a))
-                          (aset a i store)
-                          (setq i (+ i 1)))))
+                        (cond
+                          ;; A byte vector comes back from %ALLOC-U8 already
+                          ;; zeroed, so :INITIAL-ELEMENT 0 -- the usual spelling
+                          ;; of a fresh buffer -- is nothing to do; any other
+                          ;; byte goes through FILL's byte-store loop.  Both used
+                          ;; to be a generic ASET per element.
+                          ((and u8-elt (eql store 0)) a)
+                          ((and u8-elt (integerp store) (<= 0 store 255)) (fill a store))
+                          (t
+                           (loop (when (>= i total) (return a))
+                             (aset a i store)
+                             (setq i (+ i 1)))))))
                      ;; :initial-contents — flatten in row-major order
                      ;; for multi-dim; copy verbatim for 1-D / flat lists.
                      (ic-p

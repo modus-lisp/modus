@@ -4389,16 +4389,26 @@
         (values 0 0 0 1 1 1900 0 nil 0))))
 
 ;;; ============================================================
-;;; COPY-STRUCTURE — CLHS §copy-structure: return a copy of STRUCT.
-;;; Tests check error on bad arity (0 args, 2 args).  Modus doesn't
-;;; have a full struct introspection runtime; for the actual ANSI
-;;; happy-path tests we'd need every defstruct to register a copier.
-;;; Adding a defun with exactly 1 required arg lets compile-call's
-;;; arity check fire for the error tests.  The body returns the
-;;; argument unchanged — incorrect for semantic tests, but those
-;;; already fail for other reasons.
+;;; COPY-STRUCTURE — CLHS §copy-structure: a fresh instance of STRUCT's type
+;;; whose slots hold the same values (a shallow copy).
+;;;
+;;; This used to be a stub that returned STRUCT itself, so a "copy" WAS the
+;;; original and setting one of its slots changed both.  cl-fips's lookup test
+;;; tampers with a COPY-STRUCTURE copy of a signed response and then verifies
+;;; the original -- it failed on modus for exactly that reason.
+;;;
+;;; A struct instance is a #x32 array: slot 0 the '%STRUCT-INSTANCE marker,
+;;; slot 1 the type name, the user slots after.  Copy every word, the same
+;;; thing each generated COPY-<NAME> does with its slot count baked in.
 (defun copy-structure (struct)
-  "Stub: return STRUCT unchanged.  Real impl would clone the struct's
-   storage and return a fresh instance of the same type."
-  struct)
+  "A fresh instance of STRUCT's type with the same slot values."
+  (if (%struct-instance-p struct)
+      (let* ((n (%prim-array-length struct))
+             (new (make-array n))
+             (i 0))
+        (loop
+          (when (>= i n) (return new))
+          (%prim-aset new i (%prim-aref struct i))
+          (setq i (+ i 1))))
+      (error 'type-error :datum struct :expected-type 'structure-object)))
 

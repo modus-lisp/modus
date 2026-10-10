@@ -89,7 +89,7 @@
       (when (>= i len) (return nil))
       ;; %prim-aref: raw char-CODE (public AREF lifts string elems to
       ;; CHARACTERs since e159986; mem-ref :u8 needs the fixnum byte).
-      (setf (mem-ref (+ addr i) :u8) (%prim-aref str i))
+      (setf (mem-ref (+ addr i) :u8) (char-code (char str i)))
       (setq i (+ i 1)))
     ;; Null terminator
     (setf (mem-ref (+ addr len) :u8) 0)
@@ -430,7 +430,9 @@
         (i 0))
     (loop
       (when (>= i len) (return path))
-      (when (= (%prim-aref path i) 58)  ; 58 = ':'  (raw code; AREF lifts to char)
+      ;; CHAR, not %PRIM-AREF: a fill-pointer or adjustable string is a header
+      ;; object whose raw slots are not its characters (%PRIM-AREF answers NIL).
+      (when (= (char-code (char path i)) 58)  ; 58 = ':'
         ;; Found colon — strip everything up to and including it
         (return (%substring path (+ i 1) len)))
       (setq i (+ i 1)))))
@@ -451,7 +453,7 @@
     ;; If path is relative (doesn't start with /), prepend defaults.
     ;; *default-pathname-defaults* may be a string or pathname obj; coerce
     ;; via namestring before treating as a directory prefix.
-    (if (and (> (length path) 0) (= (%prim-aref path 0) 47))  ; 47 = #\/  (raw code)
+    (if (and (> (length path) 0) (= (char-code (char path 0)) 47))  ; 47 = #\/
         path
         (let* ((dpd *default-pathname-defaults*)
                (base (cond
@@ -462,7 +464,7 @@
           (if (and base (> (length base) 0))
               (let ((base-len (length base)))
                 ;; Ensure base ends with /
-                (if (= (%prim-aref base (- base-len 1)) 47)
+                (if (= (char-code (char base (- base-len 1))) 47)
                     (concatenate-strings base path)
                     (concatenate-strings base (concatenate-strings "/" path))))
               path)))))
@@ -1564,7 +1566,7 @@
   (let ((i 0) (len (length s)) (found -1))
     (loop
       (when (or (>= found 0) (>= i len)) (return found))
-      (when (= (%prim-aref s i) 58) (setq found i))  ; 58 = #\:  (raw code)
+      (when (= (char-code (char s i)) 58) (setq found i))  ; 58 = #\:
       (setq i (+ i 1)))
     found))
 
@@ -1688,7 +1690,7 @@
           (i 1))
       (loop
         (when (>= i len) (return nil))
-        (when (= (%prim-aref path i) 47)  ; 47 = #\/  (raw code)
+        (when (= (char-code (char path i)) 47)  ; 47 = #\/
           (let ((dir (%substring path 0 i)))
             (%sys-mkdir dir 493)))  ; 493 = 0755
         (setq i (+ i 1)))

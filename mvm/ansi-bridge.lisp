@@ -4972,7 +4972,11 @@
      ;; standard-char for the printing ASCII range, else character.
      (let ((code (char-code obj)))
        (if (and (>= code 32) (< code 127)) 'standard-char 'character)))
-    ((stringp obj) (list 'simple-base-string (length obj)))
+    ;; A fill-pointer / adjustable / displaced string is NOT simple: claiming
+    ;; SIMPLE-BASE-STRING made (coerce x (type-of x)) copy it (COERCE.1).
+    ((stringp obj) (if (simple-string-p obj)
+                       (list 'simple-base-string (length obj))
+                       'base-string))
     ((%generic-function-p obj) 'standard-generic-function)
     ((functionp obj) 'function)
     ((consp obj) 'cons)

@@ -2427,6 +2427,12 @@
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
    for dispatch (per CLHS, compound array/string subtypes are still
    the same family of result-type)."
+  ;; Already of that type: OBJECT itself (CLHS COERCE; COERCE.1).  Only on an
+  ;; EXACT match with TYPE-OF -- TYPEP ignores element types here, so a general
+  ;; vector would pass for a byte vector and come back uncopied.
+  (when (and (not (consp object)) (or (stringp object) (vectorp object))
+             (equal result-type (type-of object)))
+    (return-from coerce object))
   (setq result-type (%coerce-expand-type result-type))
   (when (%seq-type-u8-p result-type) (return-from coerce (%seq-u8-copy object)))
   (let* ((orig-type result-type)

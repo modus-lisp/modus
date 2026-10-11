@@ -354,6 +354,7 @@
 (defun actor-spawn (fn) nil)
 (defun actor-exit () nil)
 (defun yield () (io-delay))
+(defun ssh-net-poll () (receive))   ; net/ssh.lisp's SSH-WAIT-DATA waits here
 (defun receive ()
   (io-delay)
   (let ((pkt-len (e1000-receive)))

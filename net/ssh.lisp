@@ -495,7 +495,7 @@
 ;; (or the inline poll loop that stands in for it) fills the buffer and this is
 ;; the actor RECEIVE it always was.  A hosted image overrides it with a read(2)
 ;; on the connection's socket (net/hosted-ssh.lisp).
-(defun ssh-wait-data (ssh) (receive))
+(defun ssh-wait-data (ssh) (ssh-net-poll))
 
 (defun ssh-receive-packet (ssh timeout)
   (let ((encrypted (mem-ref (+ ssh #x0C) :u32))
@@ -1829,7 +1829,13 @@
 ;; Override receive: process one round of network packets inline
 ;; In multi-threaded x86, receive() blocks until an actor message arrives.
 ;; In single-threaded AArch64, we poll the E1000 and process one packet.
-(defun receive ()
+;; NOT named RECEIVE: that is net/actors.lisp's mailbox receive, and the hosted
+;; CLI links both files -- under last-defun-wins this packet poll (folded in
+;; from net/aarch64-overrides.lisp) replaced the actor RECEIVE there, and the
+;; hosted actor tests died on (zerop NIL).  SSH-WAIT-DATA calls this; images
+;; that redefine RECEIVE after ssh.lisp (actors-net-overrides, isolated-net,
+;; the fixpoint stubs) point SSH-NET-POLL at their own.
+(defun ssh-net-poll ()
   (io-delay)
   (let ((pkt-len (e1000-receive)))
     (if (zerop pkt-len)

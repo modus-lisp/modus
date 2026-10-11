@@ -38,6 +38,7 @@
 ;;;
 ;;; Returns: 1 to continue ssh-receive-packet retry loop, 0 to close.
 
+(defun ssh-net-poll () (receive))   ; net/ssh.lisp's SSH-WAIT-DATA waits here
 (defun receive ()
   ;; Poll mailbox via try-receive + yield
   (let ((msg 0))

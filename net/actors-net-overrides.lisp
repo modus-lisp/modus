@@ -22,6 +22,7 @@
 (defun receive ()
   (yield)
   1)
+(defun ssh-net-poll () (receive))   ; net/ssh.lisp's SSH-WAIT-DATA waits here
 
 ;;; ============================================================
 ;;; net-actor-main: actor-aware network polling loop

@@ -72,6 +72,13 @@
 ;; BUILD-IMAGE.  See mvm/build-checks.lisp.
 (mvm-load "mvm/build-checks.lisp")
 
+;; HOST-ONLY: MODUS_A64_NO_FRAME_RECORDS=1 builds AArch64 code without frame
+;; records (translate-aarch64.lisp, A64-FRAME-RECORDS-P), for A/B comparison.
+(let ((v (sb-ext:posix-getenv "MODUS_A64_NO_FRAME_RECORDS")))
+  (when (and v (plusp (length v)))
+    (setf (symbol-value (intern "*A64-NO-FRAME-RECORDS*" :modus.mvm)) t)
+    (format t ";; MODUS_A64_NO_FRAME_RECORDS: no AArch64 frame records~%")))
+
 ;; HOST-ONLY knobs for the AOT special-variable cell cache (compiler.lisp,
 ;; %COMPILE-GLOBAL-READ-AOT).  Read here rather than in compiler.lisp because
 ;; that file is also image source and must never call POSIX-GETENV.

@@ -2314,8 +2314,9 @@
    *A64-NO-FRAME-RECORDS* to compare against."
   (not (boundp '*a64-no-frame-records*)))
 
-#+sbcl (when (sb-ext:posix-getenv "MODUS_A64_NO_FRAME_RECORDS")
-         (setf (symbol-value '*a64-no-frame-records*) t))
+;; MODUS_A64_NO_FRAME_RECORDS=1 is read in lib/load-mvm.lisp (host-only): this
+;; file is image source too, and a toplevel POSIX-GETENV here became an
+;; unresolved call in every image that bakes the JIT.
 
 (defun a64-locals-bytes (slots)
   "Locals region for SLOTS frame slots: slot N is at top-64-8N.  The unsized

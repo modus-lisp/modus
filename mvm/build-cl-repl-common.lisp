@@ -493,6 +493,9 @@
 ;;; and travel as slices.  Saving ends with CORE-END=<addr> on serial so a
 ;;; QEMU harness can dump exactly [0x18000000, addr) through the gdbstub.
 (defvar *cl-repl-rpi-core-source* "
+;; What a restored core runs before the REPL (see *cli-arch-core-resume*): a
+;; function designator, set just before SAVE-AND-DIE so the heap carries it.
+(defvar *core-restart-hook* nil)
 (defun %core-addr () #x18000000)
 (defun %core-cursor-slot () #x10000F60)
 (defun %core-requested-p ()
@@ -2214,7 +2217,33 @@
 "
             "    (setq *use-jit* nil)
 ")
-        "    (handler-case (cl-serial-repl)
+        ;; THE RESTART HOOK.  A core saved for a standalone boot (kiln zero
+        ;; --sd-image) sets *CORE-RESTART-HOOK* before SAVE-AND-DIE; the restored
+        ;; process calls it here -- the desk, say -- and falls into the REPL when
+        ;; it returns.  NIL (the default, and any core saved without it): straight
+        ;; to the REPL as before.
+        ;; A byte on the serial console within 2 s skips it: that is how a person
+        ;; at the console, or the QEMU rig verifying the core, gets the REPL.  The
+        ;; check PEEKS (data-ready), so that byte still reaches the REPL.  Pi only
+        ;; (the 1 MHz system timer); elsewhere the hook just runs.
+        "    (when (and (boundp (quote *core-restart-hook*)) *core-restart-hook*)
+      (write-string-serial \"CORE-RESTART-HOOK (a byte on serial within 2 s: the REPL instead)\")
+      (write-char-serial 10)
+      (let ((skip nil))
+"
+        (if *cl-repl-rpi-p*
+            "        (let ((t0 (mem-ref #x3F003004 :u32)))
+          (loop
+            (when (or skip (> (logand (- (mem-ref #x3F003004 :u32) t0) #xFFFFFFFF) 2000000)) (return nil))
+            (when (and (fboundp (quote hid-serial-ready-p)) (hid-serial-ready-p)) (setq skip t))))
+"
+            "")
+        "        (unless skip
+          (handler-case (funcall *core-restart-hook*)
+            (t (c) (write-string-serial \"RESTART-HOOK-DIED: \")
+                   (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+                   (write-char-serial 10))))))
+    (handler-case (cl-serial-repl)
       (t (c) (write-string-serial \"REPL-DIED: \")
              (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
              (write-char-serial 10)))

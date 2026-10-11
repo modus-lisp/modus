@@ -44,7 +44,12 @@ def q(form, to=30.0):
     out = rd_until(r"\(%d .+?\)\s*\n" % t, to)
     m = re.search(r"\(%d (.+?)\)\s*\n" % t, out + "\n")
     return m.group(1) if m else None
-banner = rd_until(r"Modus CL REPL", a.banner_wait)
+# A core saved with a restart hook (kiln zero --sd-image) starts it after the restore
+# unless a byte arrives on serial within 2 s: send one, so the REPL comes up to probe.
+banner = rd_until(r"Modus CL REPL|CORE-RESTART-HOOK", a.banner_wait)
+if "CORE-RESTART-HOOK" in banner and "Modus CL REPL" not in banner:
+    s.sendall(b"\r")
+    banner += rd_until(r"Modus CL REPL", a.banner_wait)
 if "Modus CL REPL" not in banner:
     say("FAIL no banner within %ds; serial tail: %r" % (a.banner_wait, banner[-300:])); sys.exit(1)
 say("BANNER yes RESTORED=%s" % ("yes" if "CORE-RESTORED" in banner else "no"))

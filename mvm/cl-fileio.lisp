@@ -917,6 +917,42 @@
                 (setq i (+ i 1)))
               (%fs-set-pos stream (+ (%fs-pos stream) k))))))))
 
+;;; --- Bulk byte transfer -------------------------------------------------
+;;; WRITE-SEQUENCE of a byte vector on a 1-byte file stream.  The element path
+;;; costs a write(2) PER BYTE (file streams are unbuffered): writing a 4 MB
+;;; file took 9 s.  This moves 4 KB per system call through this thread's
+;;; staging page.  NIL = not handled, and the caller takes the element path
+;;; exactly as before.  (Reading has its own bulk path, %FS-READ-U8-BULK.)
+
+(defun %fs-bulk-ok-p (stream seq)
+  (and (streamp stream) (= (%stream-type stream) 9)
+       (>= (%fs-fd stream) 0)
+       (vectorp seq) (not (stringp seq))
+       (equal (array-element-type seq) '(unsigned-byte 8))
+       (let ((spec (%fs-elt-spec stream))) (and (= (car spec) 1) (not (cdr spec))))))
+
+(defun %fs-write-bytes (stream seq start end)
+  "Write SEQ[START,END) to the file stream in 4 KB system calls; T if done."
+  (let ((fd (%fs-fd stream)))
+    (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)))
+      (let ((page (%fs-io-page)) (i start))
+        (loop
+          (when (>= i end) (return nil))
+          (let ((n (min 4096 (- end i))) (j 0) (off 0))
+            (loop
+              (when (>= j n) (return nil))
+              (setf (mem-ref (+ page j) :u8) (aref seq (+ i j)))
+              (setq j (+ j 1)))
+            (loop
+              (when (>= off n) (return nil))
+              (let ((w (%sys-write-raw fd (+ page off) (- n off))))
+                (cond ((> w 0) (setq off (+ off w)))
+                      ((or (= w -4) (= w -11)) nil)          ; EINTR / EAGAIN: again
+                      (t (error "write-sequence: write failed (~d)" w)))))
+            (setq i (+ i n))))
+        (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
+        t))))
+
 ;;; --- file-length ---
 (defun file-length (stream)
   "Return the length of a file stream in bytes."

@@ -5441,6 +5441,9 @@
     (let ((actual-end (if end end (length seq)))
           (i start)
           (s (%resolve-output-stream stream)))
+      ;; a byte vector to a 1-byte file stream: bulk (cl-fileio %FS-WRITE-BYTES)
+      (when (%fs-write-bytes s seq i actual-end)
+        (return-from write-sequence seq))
       ;; Dispatch on the ELEMENT, not on STRINGP: a fill-pointer / adjustable
       ;; string is a character vector but not STRINGP here, and it went down
       ;; the byte path -- %FS-WRITE-BYTE on a string-output stream, a file

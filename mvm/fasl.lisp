@@ -510,7 +510,10 @@
             (if (eq mode :verify)
                 (list :record key text 0 nil (cadddr rec) t)
                 (progn (%fasl-stat 0) (list :replay key text 0 nil (cadddr rec) t)))
-            (progn (%fasl-stat 1) (list :record key text 0 nil nil t)))))))
+            ;; Nowhere to keep a record (bare metal, no $HOME): do not pay for
+            ;; one -- the board spent 3 s of boot recording its shims
+            (when (%fasl-dir)
+              (%fasl-stat 1) (list :record key text 0 nil nil t)))))))
 
 (defun %fasl-read (fx eof)
   "The next toplevel form, EOF at the end -- or, replaying, a module marker."

@@ -3139,10 +3139,47 @@
   (let ((ty (%var-dtype form env)))
     (and ty (symbolp ty) (string= (symbol-name ty) struct-str))))
 
+(defun %make-array-dtype (form env)
+  "The type a (MAKE-ARRAY N [:ELEMENT-TYPE 'ET] [:INITIAL-ELEMENT x]
+   [:INITIAL-CONTENTS x]) call PROVABLY returns, or NIL:
+   (simple-array (unsigned-byte 8) (*)) for the packed #x11 byte vector, or
+   (simple-array ET (*)) for an element type Modus stores as a plain #x32
+   word vector.  N must be provably an integer (a list makes a multi-
+   dimensional array behind an MDA header, which neither fast path reads),
+   ET a quoted constant (a DEFTYPE name is expanded), and no other keyword
+   may appear (:adjustable, :fill-pointer and :displaced-to change the
+   representation).  Only a runtime compile: the DEFTYPE table lives there,
+   and build-time image code keeps the code it has always had."
+  (when (and *mvm-eval-runtime-p* (%cg-on-p (quote *cg-make-array-dtype*))
+             (consp form) (symbolp (car form)) (name-eq (car form) "MAKE-ARRAY")
+             (consp (cdr form)))
+    (let ((n (cadr form)) (keys (cddr form)) (et t) (ok t))
+      (when (not (or (integerp n) (%expr-width n env)))
+        (setq ok nil))
+      (loop
+        (when (or (not ok) (null keys)) (return))
+        (if (or (not (consp keys)) (not (consp (cdr keys))) (not (keywordp (car keys))))
+            (setq ok nil)
+            (let ((k (symbol-name (car keys))) (v (cadr keys)))
+              (cond ((string= k "ELEMENT-TYPE")
+                     (if (and (consp v) (name-eq (car v) "QUOTE") (consp (cdr v)))
+                         (setq et (%resolve-declared-type (cadr v)))
+                         (setq ok nil)))
+                    ((or (string= k "INITIAL-ELEMENT") (string= k "INITIAL-CONTENTS")))
+                    (t (setq ok nil)))
+              (setq keys (cddr keys)))))
+      (when ok
+        (let ((ty (list 'simple-array et (list '*))))
+          (cond ((%u8-simple-array-decl-p ty) ty)
+                ((%generic-element-type-p et) ty)
+                (t nil)))))))
+
 (defun %expr-dtype (form env)
-  "Declared type of FORM: a variable's (lexical or global) declaration, or the
-   slot type of an accessor call on a declared struct argument."
+  "Declared type of FORM: a variable's (lexical or global) declaration, the
+   slot type of an accessor call on a declared struct argument, or the
+   array type a MAKE-ARRAY call provably returns (%MAKE-ARRAY-DTYPE)."
   (cond ((symbolp form) (%var-dtype form env))
+        ((%make-array-dtype form env))
         ((and (consp form) (symbolp (car form)) (consp (cdr form)) (null (cddr form))
               (symbolp (cadr form)))
          ;; The RESULT of an accessor call has the slot's declared type
@@ -19910,6 +19947,29 @@
           (push arg result)))
     (nreverse result)))
 
+(defun %bitop-constants-last (args)
+  "ARGS of a LOGAND/LOGIOR/LOGXOR with every integer CONSTANT moved after the
+   non-constant operands (stable otherwise).  Exact: the three are
+   associative and commutative on integers, and a constant has no side
+   effect to reorder.  It matters for code size: an operand compiled AFTER
+   the accumulated left side is a leaf (an immediate into a temp), while a
+   constant FIRST makes every following non-leaf operand a push / compile /
+   pop round trip -- (logand #xffffffff (+ a b)), the shape of every 32-bit
+   word in SHA-256 and ChaCha20.  Runtime compiles only, so build-time image
+   code is unchanged.  Not done for + or *: float addition is not
+   associative, and reordering changes rounding."
+  (if (and *mvm-eval-runtime-p* (%cg-on-p (quote *cg-bitop-reorder*))
+           (consp args) (consp (cdr args)))
+      (let ((consts nil) (others nil))
+        (dolist (a args)
+          (if (integerp (%const-int-value a))
+              (setq consts (cons a consts))
+              (setq others (cons a others))))
+        (if (and others consts)
+            (append (reverse others) (reverse consts))
+            args))
+      args))
+
 (defun compile-logand (args env dest)
   "Compile (logand args...).
    Flattens nested logand to prevent push/pop stack corruption.
@@ -19918,7 +19978,7 @@
    GENERIC-LOGAND (low-limb AND of bignum magnitude) instead of doing a
    raw pointer-tag AND that returns garbage for `(logand bignum 1)`
    bodies in evenp/oddp."
-  (let ((flat-args (flatten-arith-args 'logand args)))
+  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logand args))))
     (cond
       ((null flat-args)
        ;; (logand) = -1
@@ -19951,7 +20011,7 @@
   "Compile (logior args...).
    Same emit-arith-pair routing as compile-logand — bignum operands fall
    through to GENERIC-LOGIOR."
-  (let ((flat-args (flatten-arith-args 'logior args)))
+  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logior args))))
     (cond
       ((null flat-args)
        (compile-integer 0 dest))
@@ -19979,7 +20039,7 @@
 (defun compile-logxor (args env dest)
   "Compile (logxor args...).
    Same emit-arith-pair routing as compile-logand."
-  (let ((flat-args (flatten-arith-args 'logxor args)))
+  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logxor args))))
     (cond
       ((null flat-args)
        (compile-integer 0 dest))
@@ -20209,7 +20269,14 @@
     ;; VALUE-FORM is compiled ONCE, and the bignum case is an out-of-line CALL
     ;; rather than an inlined second copy of the computation.  The fast path is
     ;; unchanged; the added cost is a test, a branch and a cold call stub.
-    ((and count (<= count 30))
+    ;; At a RUNTIME compile on a 64-bit target the guarded inline path runs
+    ;; up to 61: its overflow test (shift back and compare) is exact for any
+    ;; left count < 63 on a 64-bit word.  30 is the 32-bit-target bound;
+    ;; past it a constant shift was a call to BIGNUM-ASH, whose fixnum arms
+    ;; loop -- every (ash low-bits 31) of a 32-bit-half rotate.
+    ((and count (or (<= count 30)
+                    (and *mvm-eval-runtime-p* (= +fixnum-bits+ 62) (<= count 61)
+                         (%cg-on-p (quote *cg-ash-wide-const*)))))
      (compile-form value-form env dest)
      (let ((fix-label (make-compiler-label))
            (ash-done  (make-compiler-label))
@@ -21888,6 +21955,29 @@
             d)
            (t nil)))))
 
+(defun %make-array-zero-kwargs-p (kwargs)
+  "KWARGS is exactly :INITIAL-ELEMENT 0, optionally with an :ELEMENT-TYPE the
+   inline 1-D path already accepts (%INLINE-GENERIC-ELEMENT-TYPE-P), each at
+   most once, on a JIT target.  See COMPILE-MAKE-ARRAY."
+  (and (boundp (quote *jit-target-arch*))
+       (let ((a (symbol-value (quote *jit-target-arch*))))
+         (or (eq a :x64) (eq a :aarch64)))
+       (let ((seen-ie nil) (seen-et nil) (ok t) (k kwargs))
+         (loop
+           (when (or (not ok) (null k)) (return))
+           (if (not (and (consp k) (consp (cdr k))))
+               (setq ok nil)
+               (progn
+                 (cond ((and (eq (car k) :initial-element) (not seen-ie)
+                             (eql (cadr k) 0))
+                        (setq seen-ie t))
+                       ((and (eq (car k) :element-type) (not seen-et)
+                             (%inline-generic-element-type-p (cadr k)))
+                        (setq seen-et t))
+                       (t (setq ok nil)))
+                 (setq k (cddr k)))))
+         (and ok seen-ie))))
+
 (defun compile-make-array (form env dest)
   "Compile (make-array dim &rest kwargs).  Dispatches into:
      • Simple 1-D path (compile-make-array-1d) when no kwargs and dim
@@ -21936,6 +22026,19 @@
             (consp kwargs) (null (cddr kwargs))
             (eq (car kwargs) :element-type)
             (%inline-generic-element-type-p (cadr kwargs)))
+       (compile-make-array-1d dim-form env dest))
+      ;; :INITIAL-ELEMENT 0 (with or without a whitelisted generic
+      ;; :ELEMENT-TYPE): the inline path too.  Every allocation arm zero-
+      ;; fills -- the native ALLOC-OBJ / ALLOC-ARRAY and the interpreter's
+      ;; %ALLOC-NATIVE -- and the zero word IS fixnum 0, so the inline array
+      ;; is already exactly what the keyword asks for.  natrium's FE-ZERO,
+      ;; (make-array 5 :initial-element 0), is every field element of every
+      ;; X25519 / Ed25519 operation: the keyword runtime call was ~7% of an
+      ;; Ed25519 signature by itself.  Runtime compiles on the JIT targets
+      ;; only; build-time image code is unchanged.
+      ((and (not multi) *mvm-eval-runtime-p*
+            (%cg-on-p (quote *cg-make-array-zero*))
+            (%make-array-zero-kwargs-p kwargs))
        (compile-make-array-1d dim-form env dest))
       ((or multi kwargs)
        (compile-call 'make-array (cons dim-form kwargs) env dest))

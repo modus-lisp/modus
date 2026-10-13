@@ -81,7 +81,9 @@
            "FIRST-CHAR" "LAST-CHAR" "NATIVE-NAMESTRING" "PARSE-NATIVE-NAMESTRING"
            "MERGE-PATHNAMES*" "ENSURE-DIRECTORY-PATHNAME"
            "RUN-PROGRAM" "LAUNCH-PROGRAM" "WAIT-PROCESS" "TERMINATE-PROCESS"
-           "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"))
+           "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"
+           "SUBPROCESS-ERROR" "SUBPROCESS-ERROR-CODE" "SUBPROCESS-ERROR-COMMAND"
+           "SUBPROCESS-ERROR-PROCESS" "PROCESS-INFO" "PROCESS-INFO-PID"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -284,15 +286,170 @@
   (merge-pathnames specified defaults))
 
 (defun %uiop-no-processes (name)
-  (error "UIOP:~A: Modus has no processes to run (no fork, no exec)." name))
-(defun uiop::run-program (command &rest keys)
-  (declare (ignore command keys)) (%uiop-no-processes "RUN-PROGRAM"))
-(defun uiop::launch-program (command &rest keys)
-  (declare (ignore command keys)) (%uiop-no-processes "LAUNCH-PROGRAM"))
-(defun uiop::wait-process (p) (declare (ignore p)) (%uiop-no-processes "WAIT-PROCESS"))
-(defun uiop::terminate-process (p &rest keys)
-  (declare (ignore p keys)) (%uiop-no-processes "TERMINATE-PROCESS"))
-(defun uiop::process-alive-p (p) (declare (ignore p)) nil)
+  (error "UIOP:~A: this Modus image has no processes to run (no fork, no exec)." name))
+
+;;; RUN-PROGRAM and friends over the hosted fork/execve layer
+;;; (net/hosted-process.lisp, x86-64 hosted images).  An image without it keeps
+;;; the honest error above.  Supported, as UIOP defines them:
+;;;   COMMAND        a list (program + args) or a string (run by /bin/sh -c)
+;;;   :INPUT         NIL (/dev/null), T / :INTERACTIVE (inherit), a file, a stream
+;;;   :OUTPUT        NIL, T / :INTERACTIVE, :STRING, :LINES, a file, a stream
+;;;   :ERROR-OUTPUT  the same, plus :OUTPUT (2>&1)
+;;;   :IF-OUTPUT-EXISTS / :IF-ERROR-OUTPUT-EXISTS  :SUPERSEDE (default), :APPEND, :ERROR
+;;;   :DIRECTORY, :IGNORE-ERROR-STATUS
+;;; Returns (values output error-output exit-code); a death by signal N is 128+N.
+
+(define-condition uiop::subprocess-error (error)
+  ((code :initarg :code :reader uiop::subprocess-error-code)
+   (command :initarg :command :reader uiop::subprocess-error-command)
+   (process :initarg :process :initform nil :reader uiop::subprocess-error-process))
+  (:report (lambda (c s)
+             (format s "Subprocess ~S exited with error code ~A"
+                     (uiop::subprocess-error-command c) (uiop::subprocess-error-code c)))))
+
+(defclass uiop::process-info ()
+  ((pid :initarg :pid :reader uiop::process-info-pid)
+   (code :initform nil :accessor %pinfo-code)
+   (closes :initarg :closes :initform nil :accessor %pinfo-closes)))
+
+(defun %uiop-can-spawn-p () (fboundp '%proc-spawn))
+
+(defun %uiop-argv (command)
+  (if (stringp command)
+      (list "/bin/sh" "-c" command)
+      (mapcar (lambda (x) (if (pathnamep x) (namestring x) (princ-to-string x))) command)))
+
+(defun %uiop-file-designator-p (x) (or (stringp x) (pathnamep x)))
+
+(defun %uiop-open-or-error (path mode)
+  (let ((fd (%proc-open (namestring path) mode)))
+    (when (< fd 0) (error "UIOP:RUN-PROGRAM: cannot open ~A (errno ~D)" path (- fd)))
+    fd))
+
+(defun %uiop-in-fd (input closes)
+  "stdin for the child: (values fd closes temp-file)."
+  (cond
+    ((null input) (let ((fd (%uiop-open-or-error "/dev/null" :input))) (values fd (cons fd closes) nil)))
+    ((or (eq input t) (eq input :interactive)) (values -1 closes nil))
+    ((%uiop-file-designator-p input)
+     (let ((fd (%uiop-open-or-error input :input))) (values fd (cons fd closes) nil)))
+    ((streamp input)
+     ;; Copied to a file first: writing a pipe while draining two others is
+     ;; a deadlock waiting for a large input.
+     (let ((tmp (namestring (uiop::tmpize-pathname
+                             (merge-pathnames "uiop-input" (uiop::temporary-directory))))))
+       (with-open-file (o tmp :direction :output :if-exists :supersede)
+         (loop for line = (read-line input nil nil)
+               while line do (write-line line o)))
+       (let ((fd (%uiop-open-or-error tmp :input))) (values fd (cons fd closes) tmp))))
+    (t (error "UIOP:RUN-PROGRAM: unsupported :INPUT ~S" input))))
+
+(defun %uiop-out-fd (spec if-exists closes)
+  "A child output fd for SPEC: (values fd closes pipe-read-fd)."
+  (cond
+    ((null spec) (let ((fd (%uiop-open-or-error "/dev/null" :supersede))) (values fd (cons fd closes) -1)))
+    ((or (eq spec t) (eq spec :interactive)) (values -1 closes -1))
+    ((%uiop-file-designator-p spec)
+     (when (and (eq if-exists :error) (probe-file spec))
+       (error "UIOP:RUN-PROGRAM: output file ~A exists" spec))
+     (let ((fd (%uiop-open-or-error spec (if (eq if-exists :append) :append :supersede))))
+       (values fd (cons fd closes) -1)))
+    ((or (eq spec :string) (eq spec :lines) (streamp spec))
+     (let ((p (%proc-pipe)))
+       (unless p (error "UIOP:RUN-PROGRAM: pipe failed"))
+       (values (cdr p) (cons (cdr p) closes) (car p))))
+    (t (error "UIOP:RUN-PROGRAM: unsupported output ~S" spec))))
+
+(defun %uiop-deliver (spec bytes)
+  (let ((text (%it-utf8-bytes-to-string bytes)))
+    (cond ((eq spec :string) text)
+          ((eq spec :lines)
+           (let ((lines nil) (start 0) (n (length text)))
+             (loop
+               (when (>= start n) (return (nreverse lines)))
+               (let ((e (or (position #\Newline text :start start) n)))
+                 (push (subseq text start e) lines)
+                 (setq start (+ e 1))))))
+          ((streamp spec) (write-string text spec) nil)
+          (t nil))))
+
+(defun %uiop-start (who command input output error-output if-output-exists
+                    if-error-output-exists directory)
+  "Spawn COMMAND.  (values pid out-read-fd err-read-fd temp-input)."
+  (unless (%uiop-can-spawn-p) (%uiop-no-processes who))
+  (let* ((argv (%uiop-argv command))
+         (prog (%proc-find-program (car argv)))
+         (closes nil))
+    (unless prog (error "UIOP:~A: program ~S not found on PATH" who (car argv)))
+    (multiple-value-bind (in c1 tmp) (%uiop-in-fd input closes)
+      (setq closes c1)
+      (multiple-value-bind (out c2 out-r) (%uiop-out-fd output if-output-exists closes)
+        (setq closes c2)
+        (multiple-value-bind (err c3 err-r)
+            (if (eq error-output :output)
+                (values (if (< out 0) 1 out) closes -1)
+                (%uiop-out-fd error-output if-error-output-exists closes))
+          (setq closes c3)
+          (let ((pid (%proc-spawn prog argv
+                                  (and directory
+                                       (namestring (uiop::ensure-directory-pathname directory)))
+                                  in out err)))
+            ;; The child holds its own copies now; ours would keep pipes open.
+            (dolist (fd closes) (%proc-close fd))
+            (when (< pid 0)
+              (%proc-close out-r) (%proc-close err-r)
+              (error "UIOP:~A: fork failed (errno ~D)" who (- pid)))
+            (values pid out-r err-r tmp)))))))
+
+(defun uiop::run-program (command &key input output error-output
+                                    (if-output-exists :supersede)
+                                    (if-error-output-exists :supersede)
+                                    directory ignore-error-status
+                          &allow-other-keys)
+  (multiple-value-bind (pid out-r err-r tmp)
+      (%uiop-start "RUN-PROGRAM" command input output error-output
+                   if-output-exists if-error-output-exists directory)
+    (let* ((got (%proc-drain out-r err-r))
+           (code (%proc-wait pid t)))
+      (%proc-close out-r) (%proc-close err-r)
+      (when tmp (ignore-errors (delete-file tmp)))
+      (let ((out (%uiop-deliver output (car got)))
+            (err (if (eq error-output :output) nil (%uiop-deliver error-output (cdr got)))))
+        (when (and (not ignore-error-status) (not (eql code 0)))
+          (error 'uiop::subprocess-error :code code :command command))
+        (values out err code)))))
+
+(defun uiop::launch-program (command &key input output error-output
+                                       (if-output-exists :supersede)
+                                       (if-error-output-exists :supersede)
+                                       directory
+                             &allow-other-keys)
+  "Start COMMAND without waiting.  Outputs may be files, NIL or inherited
+   (:STREAM is not supported yet).  WAIT-PROCESS collects the exit code."
+  (when (or (member output '(:stream :string :lines)) (member error-output '(:stream :string :lines))
+            (streamp output) (streamp error-output) (eq input :stream))
+    (error "UIOP:LAUNCH-PROGRAM: stream / string outputs are not supported on Modus yet"))
+  (multiple-value-bind (pid out-r err-r tmp)
+      (%uiop-start "LAUNCH-PROGRAM" command input output error-output
+                   if-output-exists if-error-output-exists directory)
+    (declare (ignore out-r err-r))
+    (make-instance 'uiop::process-info :pid pid :closes (and tmp (list tmp)))))
+
+(defun uiop::wait-process (p)
+  (or (%pinfo-code p)
+      (let ((code (%proc-wait (uiop::process-info-pid p) t)))
+        (dolist (f (%pinfo-closes p)) (ignore-errors (delete-file f)))
+        (setf (%pinfo-code p) code))))
+
+(defun uiop::process-alive-p (p)
+  (and (null (%pinfo-code p))
+       (let ((code (%proc-wait (uiop::process-info-pid p) nil)))
+         (if code (progn (setf (%pinfo-code p) code) nil) t))))
+
+(defun uiop::terminate-process (p &key urgent)
+  (when (null (%pinfo-code p))
+    (%proc-kill (uiop::process-info-pid p) (if urgent 9 15))))
+
 (defun uiop::delete-directory-tree (dir &rest keys)
   (declare (ignore keys))
   (error "UIOP:DELETE-DIRECTORY-TREE is not implemented on Modus (~A)" dir))

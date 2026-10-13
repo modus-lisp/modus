@@ -96,6 +96,7 @@
    "OPERATION" "COMPILE-OP" "LOAD-OP" "TEST-OP" "PREPARE-OP"
    ;; conditions
    "MISSING-COMPONENT" "MISSING-DEPENDENCY"
+   "MISSING-REQUIRES" "MISSING-PARENT" "MISSING-REQUIRED-BY"
    ;; system definition + lookup
    "DEFSYSTEM" "FIND-SYSTEM" "REGISTERED-SYSTEM" "REGISTERED-SYSTEMS"
    "CLEAR-SYSTEM" "COERCE-NAME" "PRIMARY-SYSTEM-NAME"
@@ -328,10 +329,23 @@
 ;;; =====================================================================
 
 (define-condition asdf::missing-component (error)
-  ((requires :initarg :requires :reader asdf::missing-requires)))
+  ((requires :initform "(unnamed)" :initarg :requires :reader asdf::missing-requires)
+   (parent :initform nil :initarg :parent :reader asdf::missing-parent))
+  ;; ASDF's own wording, so an error message reads the same on both.
+  (:report (lambda (c s)
+             (format s "Component ~S not found~@[ in ~A~]"
+                     (asdf::missing-requires c)
+                     (let ((p (asdf::missing-parent c)))
+                       (when p (asdf::coerce-name p)))))))
 
 (define-condition asdf::missing-dependency (asdf::missing-component)
-  ((required-by :initarg :required-by :reader asdf::missing-required-by)))
+  ((required-by :initarg :required-by :reader asdf::missing-required-by))
+  (:report (lambda (c s)
+             (format s "Component ~S not found~@[ in ~A~], required by ~A"
+                     (asdf::missing-requires c)
+                     (let ((p (asdf::missing-parent c)))
+                       (when p (asdf::coerce-name p)))
+                     (asdf::missing-required-by c)))))
 
 ;;; =====================================================================
 ;;; 4.  The component / operation class namespace

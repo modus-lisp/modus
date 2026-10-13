@@ -857,7 +857,7 @@
 
 
 (defun %cli-argv-base ()
-  (+ (%gc-stack-base) 8))
+  (+ (%gc-stack-base-0) 8))
 ")
 
 (load (merge-pathnames "build-cli-common.lisp"

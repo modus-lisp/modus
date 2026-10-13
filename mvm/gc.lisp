@@ -198,6 +198,11 @@
 (defun %gc-to-start ()     (mem-ref (+ (%gc-region) #x08) :u64))
 (defun %gc-space-size ()   (mem-ref (+ (%gc-region) #x10) :u64))
 (defun %gc-stack-base ()   (mem-ref (+ (%gc-region) #x18) :u64))
+(defun %gc-stack-base-0 ()
+  "Region 0's stack base: the PROCESS's initial stack, where argv and envp
+   live.  %GC-STACK-BASE answers for the active region, which in an actor is
+   the actor's own stack, so argv/envp walks from there read garbage."
+  (mem-ref (+ (%gc-region-0) #x18) :u64))
 (defun %gc-count ()        (mem-ref (+ (%gc-region) #x20) :u64))
 (defun %gc-epoch ()
   "A value that CHANGES at every collection of the active region and is ALWAYS

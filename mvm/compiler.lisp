@@ -9875,6 +9875,21 @@
       (and (integerp op)
            (or (= op 80380232) (= op 445617652) (= op 417505106)))))
 
+(defun %defun-as-lambda (form)
+  "Under runtime eval, a DEFUN nested in a LET is compiled as
+   (SET-SYMBOL-FUNCTION 'NAME (LAMBDA LL ...)) -- a closure over the LET's
+   variables (see the LET-over-DEFUN arm of COMPILE-COMPOUND).  The boxing
+   scans must therefore see it AS that LAMBDA, or a variable the DEFUN
+   mutates is captured by value: (let ((c 10)) (defun nxt () (incf c)))
+   gave 11 11.  Returns the LAMBDA, or NIL.  Host builds compile a nested
+   DEFUN as a global function with no capture, so it is runtime-only."
+  (when (and *mvm-eval-runtime-p* (consp form) (consp (cdr form))
+             (consp (cddr form)) (symbolp (cadr form))
+             (let ((op (car form)))
+               (or (and (symbolp op) (string= (symbol-name op) "DEFUN"))
+                   (and (integerp op) (= op 238798923)))))
+    (cons 'lambda (cddr form))))
+
 (defun %form-has-closure-p (form)
   "T when FORM, walked and expanded as VARS-MUTATED-IN-LAMBDAS and
    VARS-READ-IN-LAMBDAS walk it, contains a LAMBDA, FLET or LABELS --
@@ -9915,6 +9930,8 @@
           (if mx
               (progn (setq form mx) (setq steps (+ steps 1)))
               (return nil))))))
+  (let ((lf (%defun-as-lambda form)))
+    (when lf (setq form lf)))
   (if (not (consp form))
       nil
       (let ((op (car form)))
@@ -9981,6 +9998,8 @@
                        (if mx
                            (progn (setq form mx) (setq steps (+ steps 1)))
                            (return nil))))))
+               (let ((lf (%defun-as-lambda form)))
+                 (when lf (setq form lf)))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond
@@ -10181,6 +10200,8 @@
                        (if mx
                            (progn (setq form mx) (setq steps (+ steps 1)))
                            (return nil))))))
+               (let ((lf (%defun-as-lambda form)))
+                 (when lf (setq form lf)))
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond

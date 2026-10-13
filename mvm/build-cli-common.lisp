@@ -1070,10 +1070,18 @@
     ;; A core holds raw addresses into THIS binary's text (function entries,
     ;; JIT call targets), so it may only restore under the binary that wrote
     ;; it.  A fresh id per build, checked by %RESTORE-IMAGE.
+    ;; MODUS_BUILD_ID=N (1 .. 2^28-1) makes the id a value the caller chose, so
+    ;; the same inputs give the same bytes: a launch digest can then be computed
+    ;; ahead of time (kiln does this from the modus commit and its settings).
+    ;; Unset, every build draws a fresh id, as before.
     (format nil "~%(defun %core-build-id () ~D)~%"
             ;; 28 bits: a fixnum on every target, the 32-bit ones included,
             ;; because the restore compares it before anything may allocate.
-            (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))
+            (let ((v (sb-ext:posix-getenv "MODUS_BUILD_ID")))
+              (or (and v (plusp (length v)) (every #'digit-char-p v)
+                       (let ((n (parse-integer v)))
+                         (and (<= 1 n (- (expt 2 28) 1)) n)))
+                  (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))))
       ""))
 
 ;;; THE HOSTED PLATFORM LAYER — Linux syscalls, hosted targets only.

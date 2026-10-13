@@ -7880,6 +7880,13 @@
     (emit-jmp buf cheney-loop)
     (emit-label buf cheney-done)))
 
+(defun x64-gc-limit-margin ()
+  "Bytes the allocation limit stops short of each semispace's end (see the
+   LIMIT HEADROOM note in EMIT-GC-TRAMPOLINE).  Hosted Linux: the existing
+   16 MB guard size.  Bare metal: 0 -- unchanged until its heap layout is
+   checked for the same adjacency.  The trampoline caps it at space_size/16."
+  (if *x64-linux-mode* #x1000000 0))
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -8158,6 +8165,32 @@
     (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-from-start+)
     (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-space-size+)
     (emit-add-reg-reg buf 'rax 'r11)
+    ;; LIMIT HEADROOM.  :gc-check tests R12 < R14 BEFORE an allocation whose
+    ;; size it does not know, so the allocation after a passing check runs up
+    ;; to its own size PAST R14.  The two semispaces are ADJACENT (the lower
+    ;; one ends exactly where the upper one starts), so with R14 at the very
+    ;; end of the LOWER semispace that overshoot lands in the to-space -- and
+    ;; the next collection copies survivors to to_start, i.e. ON TOP of the
+    ;; straddling object's tail.  Measured: a 5-slot vector allocated at
+    ;; to_start-16 came back with a cons (symbol . NIL) and the next vector
+    ;; written over its slots (natrium Ed25519 verify, TYPE-ERROR in
+    ;; FE25519-MUL; deterministic for a given environment size, 24 of 32
+    ;; padded environments).  The 16 MB guard past the mapping only ever
+    ;; protected the UPPER semispace.  Stop LIMIT-MARGIN short of each
+    ;; semispace's end instead, so an overshoot lands in bytes nothing copies
+    ;; into.  Same residual as before: one allocation larger than the margin.
+    ;; The margin is min(LIMIT-MARGIN, space_size/16): a carved per-thread or
+    ;; selftest region can be 16 MB, and a flat 16 MB would put its limit AT
+    ;; its start (every allocation a collection -- region-gc-depth measured
+    ;; 8002).  R11 holds space_size here and is dead after this.
+    (when (> (x64-gc-limit-margin) 0)
+      (let ((capped (make-label)))
+        (emit-shr-reg-imm buf 'r11 4)                     ; r11 = space_size / 16
+        (emit-cmp-reg-imm buf 'r11 (x64-gc-limit-margin))
+        (emit-jcc buf :be capped)
+        (emit-mov-reg-imm buf 'r11 (x64-gc-limit-margin))
+        (emit-label buf capped)
+        (emit-sub-reg-reg buf 'rax 'r11)))
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
 
     ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----

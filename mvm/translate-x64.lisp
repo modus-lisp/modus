@@ -3172,6 +3172,38 @@
            (emit-shl-reg-imm buf d 1)         ; retag
            (maybe-store-scratch buf vd)))
 
+        ((or (op= +op-mulsplit-lo+) (op= +op-mulsplit-hi+))
+         ;; (mulsplit-lo/hi Vd Va Vb k) — the SIGNED 128-bit product
+         ;; untag(Va)*untag(Vb) split at bit K: LO = bits [0,K), HI = product
+         ;; >> K (arithmetic), each retagged.  One-operand IMUL writes RDX:RAX
+         ;; implicitly and R13 (the closure env) holds the multiplier, so all
+         ;; three are saved; every operand is READ before any of them is
+         ;; written, and the result is stored only after RAX/RDX are restored,
+         ;; so Vd/Va/Vb may each be RAX, RDX or a spill slot.
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (k (fourth operands)))
+           (emit-push buf 'r13)
+           (emit-push buf 'rdx)
+           (emit-push buf 'rax)
+           (emit-load-vreg buf vb 'r13)
+           (emit-sar-reg-imm buf 'r13 1)        ; untag vb
+           (emit-load-vreg buf va 'rax)
+           (emit-sar-reg-imm buf 'rax 1)        ; untag va
+           (emit-imul1-reg buf 'r13)            ; RDX:RAX = va * vb, signed
+           (if (op= +op-mulsplit-hi+)
+               (emit-shrd-reg-reg-imm buf 'rax 'rdx k)  ; RAX = (RDX:RAX) >> k
+               (progn                                     ; RAX = low k bits
+                 (emit-shl-reg-imm buf 'rax (- 64 k))
+                 (emit-shr-reg-imm buf 'rax (- 64 k))))
+           (emit-shl-reg-imm buf 'rax 1)        ; retag
+           (emit-mov-reg-reg buf 'r13 'rax)
+           (emit-pop buf 'rax)
+           (emit-pop buf 'rdx)
+           (emit-store-vreg buf vd 'r13)
+           (emit-pop buf 'r13)))
+
         ((op= +op-mul64lo+)
          ;; (mul64lo Vd Va Vb) — low 64 bits of raw Va*Vb (no tag/untag)
          ;; On x64: MOV RAX, Va; MUL Vb → RDX:RAX; result in RAX
@@ -3382,50 +3414,31 @@
            (emit-sar-reg-imm buf d (min count 63))
            (maybe-store-scratch buf vd)))
 
-        ((op= +op-shlv+)
-         ;; (shlv Vd Vs Vc) — shift left by register count
-         ;; x86-64 variable shifts require count in CL (RCX)
+        ((or (op= +op-shlv+) (op= +op-sarv+))
+         ;; (shlv/sarv Vd Vs Vc) — shift the TAGGED word Vs by the TAGGED fixnum
+         ;; count Vc: the VALUE-level contract the aarch64 arm and the
+         ;; interpreter already implement (both untag the count).  This arm
+         ;; used to load the count into CL still tagged — a shift by 2k — and,
+         ;; with Vd in RCX, overwrote the source with the count before
+         ;; shifting.  Neither was reachable (no x64 compile path emitted these
+         ;; opcodes); compile-ash's runtime variable-count path now does.
+         ;; The source is shifted in R13 and the count untagged in RCX, both
+         ;; saved, so Vd/Vs/Vc may be any register or spill slot.  SARV leaves
+         ;; the tag bit to the caller's mask, as on aarch64.
          (let* ((vd (first operands))
                 (vs (second operands))
-                (vc (third operands))
-                (d (dest-phys-or-scratch vd))
-                (pc (vreg-phys vc))
-                (need-save (and (not (eq pc 'rcx))
-                                (not (eq d 'rcx)))))
-           ;; Load source into dest reg
-           (emit-load-vreg buf vs d)
-           ;; Get shift count into RCX
-           (cond
-             ((eq pc 'rcx))  ; already in RCX
-             (t
-              (when need-save (emit-push buf 'rcx))
-              (emit-load-vreg buf vc 'rcx)))
-           ;; Shift
-           (emit-shl-reg-cl buf d)
-           ;; Restore RCX if saved
-           (when (and need-save (not (eq pc 'rcx)))
-             (emit-pop buf 'rcx))
-           (maybe-store-scratch buf vd)))
-
-        ((op= +op-sarv+)
-         ;; (sarv Vd Vs Vc) — arithmetic shift right by register count
-         (let* ((vd (first operands))
-                (vs (second operands))
-                (vc (third operands))
-                (d (dest-phys-or-scratch vd))
-                (pc (vreg-phys vc))
-                (need-save (and (not (eq pc 'rcx))
-                                (not (eq d 'rcx)))))
-           (emit-load-vreg buf vs d)
-           (cond
-             ((eq pc 'rcx))
-             (t
-              (when need-save (emit-push buf 'rcx))
-              (emit-load-vreg buf vc 'rcx)))
-           (emit-sar-reg-cl buf d)
-           (when (and need-save (not (eq pc 'rcx)))
-             (emit-pop buf 'rcx))
-           (maybe-store-scratch buf vd)))
+                (vc (third operands)))
+           (emit-push buf 'r13)
+           (emit-push buf 'rcx)
+           (emit-load-vreg buf vs 'r13)
+           (emit-load-vreg buf vc 'rcx)
+           (emit-sar-reg-imm buf 'rcx 1)        ; untag the count
+           (if (op= +op-shlv+)
+               (emit-shl-reg-cl buf 'r13)
+               (emit-sar-reg-cl buf 'r13))
+           (emit-pop buf 'rcx)
+           (emit-store-vreg buf vd 'r13)
+           (emit-pop buf 'r13)))
 
         ((op= +op-ldb+)
          ;; (ldb Vd Vs pos:imm8 size:imm8) — bit field extract
@@ -5677,6 +5690,21 @@
     (emit-byte buf (rex-prefix w r nil b))
     (emit-bytes buf #x0F #xAF)
     (emit-byte buf (modrm #b11 (reg-code dst) (reg-code src)))))
+
+(defun emit-imul1-reg (buf src)
+  "IMUL src — SIGNED multiply RDX:RAX = RAX * src (one-operand form, the full
+   128-bit product).  REX.W + F7 /5"
+  (emit-byte buf (rex-prefix t nil nil (reg-extended-p src)))
+  (emit-byte buf #xF7)
+  (emit-byte buf (modrm #b11 5 (reg-code src))))
+
+(defun emit-shrd-reg-reg-imm (buf dst src count)
+  "SHRD dst, src, imm8 — DST = low 64 bits of (SRC:DST) >> COUNT.
+   REX.W + 0F AC /r ib (r/m = DST, reg = SRC)"
+  (emit-byte buf (rex-prefix t (reg-extended-p src) nil (reg-extended-p dst)))
+  (emit-bytes buf #x0F #xAC)
+  (emit-byte buf (modrm #b11 (reg-code src) (reg-code dst)))
+  (emit-byte buf count))
 
 (defun emit-mul-reg (buf src)
   "MUL src — unsigned multiply RDX:RAX = RAX * src (one-operand form).

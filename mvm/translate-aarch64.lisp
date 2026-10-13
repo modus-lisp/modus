@@ -1437,6 +1437,15 @@
                         (ash rn 5)
                         rd)))
 
+(defun a64-extr (buf rd rn rm lsb)
+  "EXTR Xd, Xn, Xm, #lsb — Xd = low 64 bits of (Xn:Xm) >> lsb.
+   Encoding: 1|00|100111|1|0|Rm|imms(=lsb)|Rn|Rd"
+  (a64-emit buf (logior #x93C00000
+                        (ash rm 16)
+                        (ash (logand lsb #x3F) 10)
+                        (ash rn 5)
+                        rd)))
+
 (defun a64-adc (buf rd rn rm)
   "ADC Xd, Xn, Xm — add with carry (uses C flag from previous ADDS).
    Encoding: 1|00|11010000|Rm|000000|Rn|Rd"
@@ -4315,6 +4324,30 @@
              (a64-mul buf pd +a64-x16+ +a64-x17+) ; 64-bit result
              (a64-lsr-imm buf pd pd 26)         ; shift right 26
              (a64-lsl-imm buf pd pd 1)          ; retag
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- MULSPLIT-LO / MULSPLIT-HI Vd, Va, Vb, k ----
+          ;; The SIGNED 128-bit product untag(Va)*untag(Vb) split at bit K:
+          ;; LO = bits [0,K), HI = (SMULH:MUL) >> K via EXTR, each retagged.
+          ;; x9-x11 are free scratch here, as in +op-mul-checked+.
+          ((or (= op +op-mulsplit-lo+) (= op +op-mulsplit-hi+))
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (k (vr 3))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pa 1)            ; untag va
+             (a64-asr-imm buf +a64-x10+ pb 1)           ; untag vb
+             (a64-mul buf +a64-x11+ +a64-x9+ +a64-x10+) ; low 64 of the product
+             (if (= op +op-mulsplit-hi+)
+                 (progn
+                   (a64-smulh buf +a64-x9+ +a64-x9+ +a64-x10+) ; high 64, signed
+                   (a64-extr buf pd +a64-x9+ +a64-x11+ k))     ; (hi:lo) >> k
+                 (progn                                       ; low k bits
+                   (a64-lsl-imm buf pd +a64-x11+ (- 64 k))
+                   (a64-lsr-imm buf pd pd (- 64 k))))
+             (a64-lsl-imm buf pd pd 1)                  ; retag
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

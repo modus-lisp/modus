@@ -6965,6 +6965,7 @@
     "LIDT" "NCONCING" "SYMBOLS" "STRINGP"
     "ACROSS" "<" "DEFPACKAGE" "%FLOAT-TO-INT"
     "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF" "%APPLY-SPREAD"
+    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI"
     "GET-ALLOC-LIMIT" "BLOCK" ">" "COLLECTING"
     "USE-PACKAGE" "DOTIMES" "MEMORY-BARRIER" "%MAKE-FLOAT"
     "FIXNUMP" "EVAL-WHEN" "BIGNUMP" "ALWAYS"
@@ -7930,6 +7931,8 @@
        (when (arity-ok-p form 3 3 env dest) (compile-apply-spread (cdr form) env dest)))
       ((= op-name 325386564) (compile-mul26lo (cdr form) env dest))  ; MUL26LO
       ((= op-name 421051478) (compile-mul26hi (cdr form) env dest))  ; MUL26HI
+      ((= op-name #.(compute-name-hash "%MUL-SPLIT-LO")) (compile-mul-split (cdr form) env dest nil))
+      ((= op-name #.(compute-name-hash "%MUL-SPLIT-HI")) (compile-mul-split (cdr form) env dest t))
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
       ((= op-name 12591721202407133616) (compile-mul64hi (cdr form) env dest))
       ((= op-name 920227542902379435) (compile-acc128 (cdr form) env dest))
@@ -18965,6 +18968,37 @@
     (emit-ir :mul26hi dest dest temp)
     (free-temp-reg)))
 
+(defun compile-mul-split (args env dest hi-p)
+  "Compile (%MUL-SPLIT-LO a b k) = (ldb (byte k 0) (* a b)) and
+   (%MUL-SPLIT-HI a b k) = (ash (* a b) (- k)): the two halves of a wide
+   product split at bit K, each a FIXNUM.  Radix-2^51 field arithmetic
+   (natrium's X25519/Ed25519, secp256k1-fast's 5x52 limbs) multiplies two
+   ~52-bit limbs into a ~104-bit product; through CL `*' that is a bignum per
+   limb product, ~125x the cost of the fixnum pair this emits.
+
+   One MULSPLIT instruction: a signed 64x64->128 multiply of the untagged
+   operands, then bits [0,K) or the product >> K, retagged.  Contract (the
+   caller's, as for any fixnum-only primitive): A and B fixnums, the HI half a
+   fixnum.  K must be a CONSTANT 1..62 and the target 64-bit; anything else
+   compiles the portable definition above, which is exact for every integer."
+  (let ((k (and (consp (cdr args)) (consp (cddr args)) (null (cdddr args))
+                (%const-int-value (caddr args)))))
+    (if (and (integerp k) (<= 1 k 62) (= +fixnum-bits+ 62))
+        (progn
+          (compile-form (car args) env dest)
+          (let ((temp (alloc-temp-reg)))
+            (emit-ir :push dest)
+            (compile-form (cadr args) env temp)
+            (emit-ir :pop dest)
+            (emit-ir (if hi-p :mulsplit-hi :mulsplit-lo) dest dest temp k)
+            (free-temp-reg)))
+        (compile-form (if hi-p
+                          (list 'ash (list '* (car args) (cadr args))
+                                (list '- (caddr args)))
+                          (list 'ldb (list 'byte (caddr args) 0)
+                                (list '* (car args) (cadr args))))
+                      env dest))))
+
 (defun compile-mul64lo (args env dest)
   "Compile (mul64lo a b) — low 64 bits of raw a*b. No tag/untag."
   (compile-form (car args) env dest)
@@ -20004,6 +20038,97 @@
    cold path gets the real count."
   (min 63 (- count)))
 
+(defun %compile-ash-var-fast (value-form count-form env dest)
+  "(ash VALUE COUNT) with COUNT not a constant, for a RUNTIME compile on x64 or
+   aarch64.  Every variable-count ASH used to be a call to BIGNUM-ASH, whose
+   fixnum paths loop (eight bits per step right, %FIXNUM-SHL-OR-NIL left):
+   measured ~198 ns per rotate on x64 against ~3 ns for the constant-count
+   inline shift, which is most of why natrium's SHA-256 and ChaCha20 ran
+   35-65x slower than SBCL (their ROR32 takes the count as an argument).
+
+   Fast path, both operands fixnums:
+     COUNT >= 0, COUNT < 62:  SHLV, then SARV back; equal means nothing was
+                              lost, otherwise the slow path promotes.
+     COUNT < 0:               SARV by min(-COUNT, 63), then clear the tag bit
+                              (63 is the sign fill; see %ASH-INLINE-SAR-COUNT).
+   Anything else -- a bignum or non-integer operand, a count >= 62, a left
+   shift that overflows -- calls BIGNUM-ASH with the ORIGINAL operands, so the
+   result and the TYPE-ERROR for a non-integer are exactly the old ones.
+   Only the slow path calls, so only it saves the live caller-saved temps
+   (the %COMPILE-SETQ-GLOBAL lesson); three temps, the leaf-emitter budget."
+  (let ((save-count (min *temp-reg-counter* 12)))
+    (compile-form value-form env dest)
+    (let ((cnt (alloc-temp-reg)))
+      (if (%leaf-operand-p count-form env)
+          (compile-form count-form env cnt)
+          (progn (emit-ir :push dest) (compile-form count-form env cnt) (emit-ir :pop dest)))
+      (let ((fx (alloc-temp-reg))
+            (chk (alloc-temp-reg))
+            (slow (make-compiler-label))
+            (right (make-compiler-label))
+            (small (make-compiler-label))
+            (shift (make-compiler-label))
+            (done (make-compiler-label)))
+        ;; Both fixnums?  (tag bit of VALUE | COUNT clear)
+        (emit-ir :mov fx dest)
+        (emit-ir :or fx fx cnt)
+        (emit-ir :li chk 1)
+        (emit-ir :test fx chk)
+        (emit-ir :bne slow)
+        (emit-ir :li chk 0)
+        (emit-ir :cmp cnt chk)
+        (emit-ir :blt right)
+        ;; LEFT: 0 <= COUNT < 62, verified by shifting back.
+        (emit-li-tagged chk 62)
+        (emit-ir :cmp cnt chk)
+        (emit-ir :bge slow)
+        (emit-ir :mov fx dest)
+        (emit-ir :shl-var fx fx cnt)
+        (emit-ir :mov chk fx)
+        (emit-ir :sar-var chk chk cnt)
+        (emit-ir :cmp chk dest)
+        (emit-ir :bne slow)
+        (emit-ir :mov dest fx)
+        (emit-ir :br done)
+        ;; RIGHT: shift by min(-COUNT, 63).  Compared BEFORE negating, so the
+        ;; most negative fixnum count cannot overflow the NEG.
+        (emit-ir-label right)
+        (emit-li-tagged chk 63)
+        (emit-ir :neg chk chk)
+        (emit-ir :cmp cnt chk)
+        (emit-ir :bgt small)
+        (emit-li-tagged cnt 63)
+        (emit-ir :br shift)
+        (emit-ir-label small)
+        (emit-ir :neg cnt cnt)
+        (emit-ir-label shift)
+        (emit-ir :sar-var dest dest cnt)
+        (emit-ir :li chk 2)
+        (emit-ir :neg chk chk)
+        (emit-ir :and dest dest chk)
+        (emit-ir :br done)
+        ;; SLOW: exactly the old call.
+        (emit-ir-label slow)
+        (when (> save-count 1)
+          (let ((r (+ +vreg-v4+ 1)))
+            (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+              (unless (= r dest) (emit-ir :push r))
+              (setq r (+ r 1)))))
+        (emit-ir :mov +vreg-v0+ dest)
+        (emit-ir :mov +vreg-v1+ cnt)
+        (emit-ir :set-nargs 2)
+        (emit-ir :call "BIGNUM-ASH" 2)
+        (emit-ir :mov dest +vreg-vr+)
+        (when (> save-count 1)
+          (let ((r (+ +vreg-v4+ save-count -1)))
+            (loop (when (< r (+ +vreg-v4+ 1)) (return))
+              (unless (= r dest) (emit-ir :pop r))
+              (setq r (- r 1)))))
+        (emit-ir-label done)
+        (free-temp-reg)
+        (free-temp-reg)))
+    (free-temp-reg)))
+
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.
    Positive count = left shift, negative = right shift.
@@ -20140,6 +20265,16 @@
              (free-temp-reg))))
        (free-temp-reg)
        (emit-ir-label ash-done)))
+    ;; VARIABLE COUNT at a runtime (JIT) compile on a 64-bit JIT target: an
+    ;; inline fixnum fast path, with BIGNUM-ASH kept as the out-of-line slow
+    ;; path.  See %COMPILE-ASH-VAR-FAST.  (setq *cg-var-ash* :off) at runtime
+    ;; restores the plain call, for A/B in one binary.
+    ((and (null count) *mvm-eval-runtime-p*
+          (boundp (quote *jit-target-arch*))
+          (let ((a (symbol-value (quote *jit-target-arch*))))
+            (or (eq a :x64) (eq a :aarch64)))
+          (%cg-on-p (quote *cg-var-ash*)))
+     (%compile-ash-var-fast value-form count-form env dest))
     ;; Large constant or variable count — call bignum-ash so we
     ;; promote to bignum on overflow.  Slower (a real call) but
     ;; correct for arbitrary shift sizes.
@@ -24594,6 +24729,8 @@
       (:sub-checked 4)
       (:mul26lo 4)
       (:mul26hi 4)
+      (:mulsplit-lo 5)
+      (:mulsplit-hi 5)
       (:mul64lo 4)
       (:mul64hi 4)
       (:acc128  4)
@@ -24943,6 +25080,10 @@
            (mvm-mul26lo buf (second insn) (third insn) (fourth insn)))
           (:mul26hi
            (mvm-mul26hi buf (second insn) (third insn) (fourth insn)))
+          (:mulsplit-lo
+           (mvm-mulsplit-lo buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:mulsplit-hi
+           (mvm-mulsplit-hi buf (second insn) (third insn) (fourth insn) (fifth insn)))
           (:mul64lo
            (mvm-mul64lo buf (second insn) (third insn) (fourth insn)))
           (:mul64hi

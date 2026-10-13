@@ -7881,11 +7881,13 @@
     (emit-label buf cheney-done)))
 
 (defun x64-gc-limit-margin ()
-  "Bytes the allocation limit stops short of each semispace's end (see the
-   LIMIT HEADROOM note in EMIT-GC-TRAMPOLINE).  Hosted Linux: the existing
-   16 MB guard size.  Bare metal: 0 -- unchanged until its heap layout is
-   checked for the same adjacency.  The trampoline caps it at space_size/16."
-  (if *x64-linux-mode* #x1000000 0))
+  "Upper bound on the bytes the allocation limit stops short of each
+   semispace's end (see the LIMIT HEADROOM note in EMIT-GC-TRAMPOLINE); the
+   trampoline uses min(this, space_size/16).  16 MB, the existing guard size,
+   on hosted Linux AND bare metal: boot-x64's semispaces are adjacent too
+   (from-space ends at to_start), so bare had the identical straddle.
+   boot-x64 / boot-linux-x64 apply the same margin to the boot-time R14."
+  #x1000000)
 
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.

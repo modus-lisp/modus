@@ -409,7 +409,8 @@
 (defun %console-init ()
   ;; The screen first, so everything after it (the USB-HID line, the banner)
   ;; shows on it too.  A display failure must not cost the keyboard.
-  (handler-case (hcon-init) (t (c) nil))
+  ;; Already up when a restored core brought it up before the REPL.
+  (unless (hcon-ready-p) (handler-case (hcon-init) (t (c) nil)))
   (hid-console-init))
 (defun %console-read-char () (hid-console-read-char))
 "
@@ -2192,7 +2193,16 @@
 (defvar *cli-arch-core-resume*
   (if (or *cl-repl-rpi-p* *cl-repl-x64-p*)
       (concatenate 'string
-        "    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
+        "    ;; The screen FIRST, so every line after this one shows on it too.  The
+    ;; restored process must bring the console up itself: nothing else will
+    ;; before a restart hook runs, and the HDMI state block (Device RAM) still
+    ;; holds whatever a previous boot left there -- a stale framebuffer and an
+    ;; exec page the restore has just overwritten.  (A board reset keeps DRAM:
+    ;; the desk faulted executing that page on one load address and drew into
+    ;; a dead framebuffer -- the firmware's rainbow square -- on a cold boot.)
+    (when (fboundp (quote hcon-init))
+      (handler-case (hcon-init) (t (c) nil)))
+    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
     ;; A restored core skips boot init, so raise the ARM clock here too (the
     ;; firmware idles at 600 MHz on a Zero 2 W); same guarded call as the
     ;; fresh-boot path before E2SMOKE.

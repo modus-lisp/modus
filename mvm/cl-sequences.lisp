@@ -2852,29 +2852,25 @@
                               (char-code item)
                               item))
               (i start))
+         ;; bounding indexes past the vector are a TYPE-ERROR (CLHS 17.1.1), not
+         ;; stores past it: the fast paths below do no per-element check, and
+         ;; the slow one wrote off the end silently too
+         (when (> eff-end len)
+           (%signal-type-error eff-end (list 'integer 0 len)))
+         (when (> start eff-end)
+           (%signal-type-error start (list 'integer 0 eff-end)))
          (cond
+           ;; the two fast paths store without per-element checks (bounds are
+           ;; checked above; see %FILL-U8 / %FILL-WORDS)
            ((and (integerp store-item) (%u8-bare-p seq))
-            ;; plain u8 vector: byte stores, no per-element dispatch.  A ZERO
-            ;; fill -- pagetree clears every page buffer this way, 23% of a
-            ;; cabinet write -- goes eight bytes per store first: fixnum 0
-            ;; stored through :u64 is a raw 0 word, exact, and byte K of the
-            ;; packed data is at (%val->word seq) + 7 + K (see %BULK-COPY-U8).
-            ;; Nothing allocates in the loop, so the address cannot move.
-            (when (eql store-item 0)
-              (let ((a (+ (%val->word seq) 7)))
-                (loop (when (> (+ i 8) eff-end) (return))
-                  (setf (mem-ref (+ a i) :u64) 0)
-                  (setq i (+ i 8)))))
-            (loop (when (>= i eff-end) (return seq))
-              (%u8-set seq i store-item)
-              (setq i (+ i 1))))
+            (%fill-u8 seq i eff-end store-item)
+            seq)
            ((and (not (stringp seq)) (%bulk-copy-ok-p seq seq))
             ;; plain word-slot array (general or typed-generic, not a
             ;; string / wrapper / mda): raw slot stores — a VP8 macroblock
             ;; clears 25 coefficient blocks this way
-            (loop (when (>= i eff-end) (return seq))
-              (%word-aset seq i store-item)
-              (setq i (+ i 1))))
+            (%fill-words seq i eff-end store-item)
+            seq)
            (t
             (loop (when (>= i eff-end) (return seq))
               (aset seq i store-item)

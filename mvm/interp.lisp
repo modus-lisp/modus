@@ -521,6 +521,33 @@
 (defun %obj-elt-set (obj idx val) (%prim-aset obj idx val))
 (defun %obj-elt-len (obj) (%prim-array-length obj))
 
+;;; BULK-MOVE / BULK-FILL, element by element: the semantics the native arms
+;;; must reproduce.  KIND 0 word slots, 1 bytes of a u8 vector.
+(defun %interp-bulk-move (dst di src si n kind)
+  "memmove N elements SRC[SI..] -> DST[DI..]: a same-object move upward runs from the top."
+  (if (and (eq dst src) (> di si))
+      (let ((k (- n 1)))
+        (loop (when (< k 0) (return nil))
+          (if (= kind 0)
+              (%obj-elt-set dst (+ di k) (%obj-elt-ref src (+ si k)))
+              (%u8-set dst (+ di k) (%u8-ref src (+ si k))))
+          (setq k (- k 1))))
+      (let ((k 0))
+        (loop (when (>= k n) (return nil))
+          (if (= kind 0)
+              (%obj-elt-set dst (+ di k) (%obj-elt-ref src (+ si k)))
+              (%u8-set dst (+ di k) (%u8-ref src (+ si k))))
+          (setq k (+ k 1))))))
+
+(defun %interp-bulk-fill (arr i n val kind)
+  "ARR[I..I+N) := VAL -- the value itself in word slots, its low byte in bytes."
+  (let ((k 0))
+    (loop (when (>= k n) (return nil))
+      (if (= kind 0)
+          (%obj-elt-set arr (+ i k) val)
+          (%u8-set arr (+ i k) (logand val 255)))
+      (setq k (+ k 1)))))
+
 ;;; Bytecode fetch helpers
 
 (declaim (inline fetch-byte fetch-reg fetch-u16 fetch-s32 fetch-u32 fetch-u64 fetch-li-value))
@@ -2402,6 +2429,27 @@
                    (multiple-value-bind (lane npc5) (fetch-byte bc npc4)
                      (setf (svref fregs fd)
                            (%vlane-lane sub (svref fregs fd) (svref fregs fa) (svref fregs fb) lane))
+                     (setf pc npc5)))))))
+
+          ;; ---- BULK MEMORY (reference arms; the native arms are checked against these) ----
+          (#.+op-bulk-move+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vdi npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vs npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (vsi npc4) (fetch-reg bc npc3)
+                   (multiple-value-bind (vn npc5) (fetch-reg bc npc4)
+                     (multiple-value-bind (kind npc6) (fetch-byte bc npc5)
+                       (%interp-bulk-move (svref regs vd) (svref regs vdi) (svref regs vs)
+                                          (svref regs vsi) (svref regs vn) kind)
+                       (setf pc npc6))))))))
+          (#.+op-bulk-fill+
+           (multiple-value-bind (va npc) (fetch-reg bc pc)
+             (multiple-value-bind (vi npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vn npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (vv npc4) (fetch-reg bc npc3)
+                   (multiple-value-bind (kind npc5) (fetch-byte bc npc4)
+                     (%interp-bulk-fill (svref regs va) (svref regs vi) (svref regs vn)
+                                        (svref regs vv) kind)
                      (setf pc npc5)))))))
 
           (#.+op-aref+

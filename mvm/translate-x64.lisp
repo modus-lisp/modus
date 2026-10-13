@@ -5626,6 +5626,67 @@
                (emit-mov-reg-imm buf d #xDEAD0001)))
            (maybe-store-scratch buf vd)))
 
+        ;; ---- BULK-MOVE / BULK-FILL (mvm.lisp) ----  REP MOVSB / REP STOSQ / REP STOSB.
+        ;; Element addresses as AREF and U8-REF compute them (Vobj+7+idx*8,
+        ;; Vobj+7+idx).  The string instructions want RDI/RSI/RCX/RAX, which are
+        ;; V1/V0/V5/VR: everything borrowed is pushed first, the operands are
+        ;; staged through the stack (so no operand is read after its register
+        ;; was reused), and it all comes back off.  Bytes from as/objdump.
+        ((op= +op-bulk-move+)
+         (let ((bytes (= (sixth operands) 1)) (g (translate-state-ssg-label state)))
+           (dolist (r '(rax rcx rdx rsi rdi)) (emit-push buf r))
+           (dolist (v (subseq operands 0 5)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
+           (emit-bytes buf #x59 #x58 #x5E #x5A #x5F)          ; pop rcx/rax/rsi/rdx/rdi: n si src di dst
+           (if bytes
+               (emit-bytes buf #x48 #xD1 #xF8 #x48 #x8D #x74 #x06 #x07   ; sar rax,1; lea rsi,[rsi+rax+7]
+                               #x48 #xD1 #xFA #x48 #x8D #x7C #x17 #x07   ; sar rdx,1; lea rdi,[rdi+rdx+7]
+                               #x48 #xD1 #xF9)                           ; sar rcx,1
+               (progn
+                 (emit-bytes buf #x48 #x8D #x74 #x86 #x07)              ; lea rsi,[rsi+rax*4+7]
+                 (when g
+                   ;; threads live: every source word through the shared-store
+                   ;; guard against the destination (RDI, still the object)
+                   ;; before anything is stored -- ASET's check, done ahead
+                   (let ((novalid (make-label)) (top (make-label)) (done (make-label)))
+                     (emit-bytes buf #x83 #x3C #x25) (emit-u32 buf #x10000DB8) (emit-bytes buf #x00)
+                     (emit-jcc buf :e novalid)
+                     (emit-bytes buf #x51 #x56 #x48 #xD1 #xF9)          ; push rcx; push rsi; sar rcx,1
+                     (emit-label buf top)
+                     (emit-bytes buf #x48 #x85 #xC9)                    ; test rcx,rcx
+                     (emit-jcc buf :z done)
+                     (emit-bytes buf #x57 #xFF #x36)                    ; push rdi; push qword [rsi]
+                     (emit-call buf g)
+                     (emit-bytes buf #x48 #x83 #xC4 #x10 #x48 #x83 #xC6 #x08 #x48 #xFF #xC9) ; add rsp,16; add rsi,8; dec rcx
+                     (emit-jmp buf top)
+                     (emit-label buf done)
+                     (emit-bytes buf #x5E #x59)                         ; pop rsi; pop rcx
+                     (emit-label buf novalid)))
+                 (emit-bytes buf #x48 #x8D #x7C #x97 #x07 #x48 #xC1 #xE1 #x02))) ; lea rdi,[rdi+rdx*4+7]; shl rcx,2
+           ;; memmove: backward (STD) only when dst lies inside (src, src+n)
+           (emit-bytes buf #x48 #x39 #xF7 #x76 #x19 #x48 #x8D #x04 #x0E #x48 #x39 #xC7 #x73 #x10
+                           #x48 #x8D #x74 #x0E #xFF #x48 #x8D #x7C #x0F #xFF #xFD #xF3 #xA4 #xFC
+                           #xEB #x02 #xF3 #xA4
+                           #x5F #x5E #x5A #x59 #x58)))                     ; pop rdi/rsi/rdx/rcx/rax
+        ((op= +op-bulk-fill+)
+         (let ((bytes (= (fifth operands) 1)) (g (translate-state-ssg-label state)))
+           (dolist (r '(rax rcx rdx rdi)) (emit-push buf r))
+           (dolist (v (subseq operands 0 4)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
+           (emit-bytes buf #x58 #x59 #x5A #x5F)                   ; pop rax/rcx/rdx/rdi: val n i arr
+           (if bytes
+               (emit-bytes buf #x48 #xD1 #xFA #x48 #x8D #x7C #x17 #x07  ; sar rdx,1; lea rdi,[rdi+rdx+7]
+                               #x48 #xD1 #xF9 #x48 #xD1 #xF8 #xF3 #xAA) ; sar rcx,1; sar rax,1; rep stosb
+               (progn
+                 (when g                                           ; the one value, guarded once
+                   (let ((skip (make-label)))
+                     (emit-bytes buf #x83 #x3C #x25) (emit-u32 buf #x10000DB8) (emit-bytes buf #x00)
+                     (emit-jcc buf :e skip)
+                     (emit-bytes buf #x57 #x50)                    ; push rdi (target); push rax (value)
+                     (emit-call buf g)
+                     (emit-bytes buf #x48 #x83 #xC4 #x10)          ; add rsp,16
+                     (emit-label buf skip)))
+                 (emit-bytes buf #x48 #x8D #x7C #x97 #x07 #x48 #xD1 #xF9 #xF3 #x48 #xAB))) ; lea; sar rcx,1; rep stosq
+           (emit-bytes buf #x5F #x5A #x59 #x58)))                  ; pop rdi/rdx/rcx/rax
+
         ;; ---- INTEGER LANE class (SIMD 2b): no SSE arm yet.  SIGNAL, so the
         ;; runtime JIT's %jit-translate-page returns NIL and the module runs
         ;; through the interpreter's reference arm — never a runtime trap.

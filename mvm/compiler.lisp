@@ -8343,6 +8343,12 @@
        (compile-word-aref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD-ASET"))
        (compile-word-aset (cadr form) (caddr form) (cadddr form) env dest))
+      ;; (%bulk-move dst di src si n kind) / (%bulk-fill arr i n val kind) — the
+      ;; :bulk-move / :bulk-fill instructions (KIND a literal 0 words / 1 bytes)
+      ((= op-name #.(compute-name-hash "%BULK-MOVE"))
+       (compile-bulk-op :bulk-move (cdr form) 5 env dest))
+      ((= op-name #.(compute-name-hash "%BULK-FILL"))
+       (compile-bulk-op :bulk-fill (cdr form) 4 env dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
@@ -22423,6 +22429,21 @@
         (free-temp-reg)
         (free-temp-reg))))
 
+;;; %BULK-MOVE / %BULK-FILL — one :bulk-move / :bulk-fill instruction (mvm.lisp).
+;;; NREGS register operands, evaluated left to right into temps, then the
+;;; literal KIND (0 word slots, 1 bytes).  The value is NIL.  Unchecked: the
+;;; caller has proved the kinds and the bounds (%bulk-copy-ok-p and friends).
+(defun compile-bulk-op (op args nregs env dest)
+  (let ((kind (nth nregs args)))
+    (unless (and (= (length args) (1+ nregs)) (member kind '(0 1)))
+      (error "MVM compiler: (~A ...) takes ~D values and a literal kind 0 or 1: ~S"
+             op nregs args))
+    (let ((regs (loop repeat nregs collect (alloc-temp-reg))))
+      (loop for r in regs for a in args do (compile-form a env r))
+      (apply (function emit-ir) op (append regs (list kind)))
+      (loop repeat nregs do (free-temp-reg))
+      (compile-form nil env dest))))
+
 ;;; %PRIM-AREF / %PRIM-ASET — subtag-dispatching primitive element access.
 ;;; A byte-packed u8 vector (subtag #x11) reads/writes a single byte via
 ;;; %u8-ref/%u8-set; every other object (general array #x32, string #x31,
@@ -24617,6 +24638,8 @@
       (:vi-movi 4)
       (:vi-umov 5)
       (:vi-lane 6)
+      (:bulk-move 7)
+      (:bulk-fill 6)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -24954,6 +24977,8 @@
           (:vi-movi (mvm-vi-movi buf (second insn) (third insn) (fourth insn)))
           (:vi-umov (mvm-vi-umov buf (second insn) (third insn) (fourth insn) (fifth insn)))
           (:vi-lane (mvm-vi-lane buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn)))
+          (:bulk-move (mvm-bulk-move buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn) (nth 6 insn)))
+          (:bulk-fill (mvm-bulk-fill buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

@@ -2074,6 +2074,65 @@
           (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
                   +a64-x9+))))
 
+;;; ---- BULK-MOVE / BULK-FILL bodies (as/objdump on the Pi 5, 2026-10-13) ----
+;;; Fixed blocks; every branch is relative and lands inside its block (each
+;;; ends in the NOP its exits target).
+(defparameter *a64-bulk-move-words*
+  ;; x9 dst, x10 src, x11 nbytes; temps x12 x13.  memmove: forward in 16/8/1-byte
+  ;; steps, or, when dst lies inside (src, src+n), backward in 8/1-byte steps.
+  '(#xB400046B #xEB0A013F #x54000229 #x8B0B014C #xEB0C013F #x540001C2 #x8B0B0129
+    #x8B0B014A #xF100217F #x540000A3 #xF85F8D4C #xF81F8D2C #xD100216B #x17FFFFFB
+    #xB40002AB #x385FFD4C #x381FFD2C #xD100056B #x17FFFFFC #xF100417F #x540000A3
+    #xA8C1354C #xA881352C #xD100416B #x17FFFFFB #xF100217F #x54000083 #xF840854C
+    #xF800852C #xD100216B #xB40000AB #x3840154C #x3800152C #xD100056B #x17FFFFFC
+    #xD503201F))
+(defparameter *a64-bulk-fill-words-words*
+  ;; x9 addr, x10 nwords, x11 the word: STP pairs, then one STR
+  '(#xF100095F #x54000083 #xA8812D2B #xD100094A #x17FFFFFC #xB400004A #xF900012B
+    #xD503201F))
+(defparameter *a64-bulk-fill-bytes-words*
+  ;; x9 addr, x10 nbytes, x11 the byte: x11 *= #x0101010101010101, 8-byte
+  ;; stores, then STRB; temp x12
+  '(#xB200C3EC #x9B0C7D6B #xF100215F #x54000083 #xF800852B #xD100214A #x17FFFFFC
+    #xB400008A #x3800152B #xD100054A #x17FFFFFD #xD503201F))
+
+(defun a64-bulk-elt-addr (buf rd pobj pidx bytes)
+  "RD := address of element PIDX (tagged) of PObj: +7+idx*8 for word slots, +7+idx for bytes."
+  (a64-add-imm buf rd pobj 7)
+  (if bytes
+      (a64-add-reg buf rd rd pidx 2 1)                  ; ASR #1
+      (a64-add-reg buf rd rd pidx 0 2)))                ; LSL #2
+
+(defun a64-bulk-guard-pass (buf)
+  "Before a word BULK-MOVE with threads live: every source word through the
+   shared-store guard, against the destination object in x17 -- the per-element
+   check ASET makes, done ahead of the copy.  x9 dst, x10 src, x11 nbytes are
+   preserved; the guard clobbers x9-x15, so the walk runs on x16/x17 and the
+   stack.  Single-threaded (the gate word is 0) it is one load and a branch."
+  (a64-load-conv-addr buf +a64-x12+ #x10000DB8)
+  (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ 0)
+  (let ((skip (a64-current-index buf)))
+    (a64-emit buf (logior #xB4000000 +a64-x12+))         ; CBZ x12, skip (patched)
+    (a64-stp-pre buf +a64-x9+ +a64-x10+ +a64-sp+ -32)     ; [sp]=dst [sp+8]=src
+    (a64-stp-offset buf +a64-x11+ +a64-x17+ +a64-sp+ 16)  ; [sp+16]=n [sp+24]=target
+    (a64-mov-reg buf +a64-x16+ +a64-x10+)                ; cursor
+    (a64-add-reg buf +a64-x17+ +a64-x10+ +a64-x11+ 0 0)  ; end
+    (let ((top (a64-current-index buf)))
+      (a64-cmp-reg buf +a64-x16+ +a64-x17+)
+      (let ((exit (a64-current-index buf)))
+        (a64-emit buf (logior #x54000000 +cc-cs+))        ; B.HS done (patched)
+        (a64-ldr-unsigned buf +a64-x13+ +a64-x16+ 0)      ; the value
+        (a64-ldr-unsigned buf +a64-x14+ +a64-sp+ 24)      ; the target
+        (a64-emit-shared-store-guard buf +a64-x13+ +a64-x14+)
+        (a64-add-imm buf +a64-x16+ +a64-x16+ 8)
+        (a64-emit buf (logior #x14000000 (logand (- top (a64-current-index buf)) #x3FFFFFF)))
+        (setf (aref (a64-buffer-code buf) exit)
+              (logior #x54000000 (ash (logand (- (a64-current-index buf) exit) #x7FFFF) 5) +cc-cs+))))
+    (a64-ldp-offset buf +a64-x11+ +a64-x17+ +a64-sp+ 16)
+    (a64-ldp-post buf +a64-x9+ +a64-x10+ +a64-sp+ 32)
+    (setf (aref (a64-buffer-code buf) skip)
+          (logior #xB4000000 (ash (logand (- (a64-current-index buf) skip) #x7FFFF) 5) +a64-x12+))))
+
 ;;; Plain top-level functions and explicit calls, on purpose: this file is
 ;;; also compiled IN-IMAGE for the runtime JIT, and a first version built from
 ;;; FLET closures (one pushing onto its parent's variable) and a MACROLET that
@@ -5534,6 +5593,46 @@
                   (lbits (logior (ash (logand (ash lane -2) 1) 11) (ash (logand (ash lane -1) 1) 21)
                                  (ash (logand lane 1) 20))))
              (a64-emit buf (logior base lbits (ash fb 16) (ash fa 5) fd))))
+
+          ;; ==== BULK MEMORY (mvm.lisp +op-bulk-move+ / +op-bulk-fill+) ====
+          ;; Element addresses as AREF (Vobj+7+idx*8) and U8-REF (Vobj+7+idx)
+          ;; compute them; the loops are the assembler-checked blocks in
+          ;; *A64-BULK-MOVE-WORDS* & co.  Operands go through x12-x16 only, so
+          ;; x17 (and x16 once loaded) survive to the guard pass below.
+          ;; ---- BULK-MOVE Vdst, Vdi, Vsrc, Vsi, Vn, kind ----
+          ((= op +op-bulk-move+)
+           (let ((bytes (= (vr 5) 1)))
+             (a64-bulk-elt-addr buf +a64-x9+ (ensure-src (vr 0) +a64-x12+)
+                                (ensure-src (vr 1) +a64-x13+) bytes)
+             (when (and (a64-ssg-p) (not bytes))
+               (a64-mov-reg buf +a64-x17+ (ensure-src (vr 0) +a64-x12+)))
+             (a64-bulk-elt-addr buf +a64-x10+ (ensure-src (vr 2) +a64-x14+)
+                                (ensure-src (vr 3) +a64-x15+) bytes)
+             (let ((pn (ensure-src (vr 4) +a64-x16+)))
+               (if bytes
+                   (a64-asr-imm buf +a64-x11+ pn 1)        ; n bytes
+                   (a64-lsl-imm buf +a64-x11+ pn 2)))      ; n words * 8
+             (when (and (a64-ssg-p) (not bytes))
+               (a64-bulk-guard-pass buf))
+             (dolist (w *a64-bulk-move-words*) (a64-emit buf w))))
+          ;; ---- BULK-FILL Varr, Vi, Vn, Vval, kind ----
+          ((= op +op-bulk-fill+)
+           (let ((bytes (= (vr 4) 1)))
+             ;; the one value, guarded once, before x9-x15 are in use (it
+             ;; clobbers them); x16/x17 are not the guard's
+             (when (and (a64-ssg-p) (not bytes))
+               (a64-emit-shared-store-guard buf (ensure-src (vr 3) +a64-x16+)
+                                            (ensure-src (vr 0) +a64-x17+)))
+             (a64-bulk-elt-addr buf +a64-x9+ (ensure-src (vr 0) +a64-x12+)
+                                (ensure-src (vr 1) +a64-x13+) bytes)
+             (a64-asr-imm buf +a64-x10+ (ensure-src (vr 2) +a64-x14+) 1)   ; n
+             (let ((pv (ensure-src (vr 3) +a64-x15+)))
+               (if bytes
+                   (progn (a64-lsl-imm buf +a64-x11+ pv 55)              ; low byte of
+                          (a64-lsr-imm buf +a64-x11+ +a64-x11+ 56)       ; the untagged value
+                          (dolist (w *a64-bulk-fill-bytes-words*) (a64-emit buf w)))
+                   (progn (a64-mov-reg buf +a64-x11+ pv)                   ; the tagged word
+                          (dolist (w *a64-bulk-fill-words-words*) (a64-emit buf w)))))))
 
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.

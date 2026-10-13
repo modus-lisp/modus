@@ -110,6 +110,7 @@
 ;;; init (its toplevel: serial REPL + halt).  "" = no bare-metal core support.
 (defvar *cli-arch-core-resume* "")
 
+
 ;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-bridge.lisp
 ;;; (~1.7 MB of source -> ~3.5 MB of image) from *BRIDGE-SOURCE*.  It exists for
 ;;; the Pi chain-load path, where every megabyte is minutes of UART time.  NOT
@@ -174,6 +175,16 @@
 
 (defvar *prelude-source*  (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
+;;; NATIVE BULK MEMORY (mvm/native-bulk.lisp): REPLACE / FILL's four inner loops
+;;; as BULK-MOVE / BULK-FILL instructions -- only where the translator has them,
+;;; aarch64 and x64 (the i386 bare REPL reuses *CLI-ARCH* :AARCH64, hence its
+;;; own test).  Spliced after the overrides, last-defun-wins.
+(defvar *cli-native-bulk-source*
+  (if (and (member *cli-arch* '(:x64 :aarch64))
+           (not (and (boundp 'cl-user::*cl-repl-i386-p*)
+                     (symbol-value 'cl-user::*cl-repl-i386-p*))))
+      (mvm-text "mvm/native-bulk.lisp")
+      ""))
 ;; MCGC stage-4d pin API + pin-stress probe.  Included ONLY when
 ;; MODUS_MCGC_PINNING=1; flag-off omits it (byte-identical to canonical).
 (defvar *mcgc-pin-source*
@@ -1931,6 +1942,7 @@
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
                        *cli-arch-override-source*
+                       *cli-native-bulk-source*
                        ;; HOSTED ACTORS: "" on aarch64 and on bare metal, so
                        ;; their scanner input — hence SFT-AUTO and
                        ;; SYM-NAME-AUTO — is byte-identical to before.
@@ -2178,6 +2190,8 @@
     ;; override cl-fileio.lisp and lib/cli-toplevel.lisp, both baked inside it).
     ;; "" on x64.
     *cli-arch-override-source*
+    ;; then the native REPLACE / FILL loops (aarch64 and x64 only; "" elsewhere)
+    *cli-native-bulk-source*
     ;; HOSTED ACTORS (x86-64 hosted only; "" elsewhere).  POSITION IS
     ;; LOAD-BEARING: after mvm/gc.lisp (whose %gc-region-* / %gc-read64 it
     ;; calls — a forward reference across the blob does not resolve) and after

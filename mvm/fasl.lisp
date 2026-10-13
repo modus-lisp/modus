@@ -237,6 +237,17 @@
     ((and (vectorp v) (equal (array-element-type v) '(unsigned-byte 8)))
      (%fb-byte fb 9) (%fb-uint fb (length v))
      (%fb-bulk fb v))
+    ;; a CLASS, instance, generic function, method combination or COMPLEX is
+    ;; a vector here with a marker in slot 0: encoded as a vector it replayed
+    ;; as one -- ANSI ETYPECASE.12's #.(find-class 'symbol nil) inside a
+    ;; DEFTEST body came back a plain vector and the clause stopped matching
+    ((and (simple-vector-p v) (> (length v) 0) (symbolp (svref v 0))
+          (member (symbol-name (svref v 0))
+                  '("%CLOS-INSTANCE" "%STRUCT-INSTANCE" "%CLOS-CLASS" "%CLASS-PROXY"
+                    "%GENERIC-FUNCTION" "%METHOD-COMBINATION" "%METHOD-COMBINATION-LONG"
+                    "%COMPLEX-MARKER")
+                  :test (function string=)))
+     (%fasl-reject "object constant"))
     ((and (simple-vector-p v) (eq (array-element-type v) t))
      (%fb-byte fb 8) (%fb-uint fb (length v))
      (dotimes (i (length v)) (%fasl-enc fb (svref v i) unint (+ depth 1))))

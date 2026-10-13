@@ -178,7 +178,10 @@
   "V's key when V is the live (key . value) cell of a global variable."
   ;; IGNORE-ERRORS: %GV-CELL signals TYPE-ERROR for an integer that is no name
   ;; key at all -- an ordinary (offset . name) pair reaches here
-  (and (consp v) (integerp (car v))
+  ;; FIXNUM, not INTEGERP: a global's key is a name-hash fixnum, and %GV-CELL
+  ;; hashes its argument with fixnum arithmetic -- a literal with a BIGNUM car
+  ;; sent it a heap pointer, and the fault was only hidden by IGNORE-ERRORS
+  (and (consp v) (typep (car v) 'fixnum)
        (fboundp (quote %gv-cell))
        (ignore-errors (eq v (funcall (quote %gv-cell) (car v))))
        (car v)))
@@ -488,20 +491,30 @@
               (with-open-file (i (concatenate 'string d key ".mfasl")
                                  :element-type '(unsigned-byte 8) :if-does-not-exist nil)
                 (and i
-                     (let ((b (make-array (file-length i) :element-type '(unsigned-byte 8))))
-                       (read-sequence b i)
-                       b))))))))
+                     ;; a SHORT read leaves the tail zero, and zero decodes
+                     ;; as NIL -- a record cut short would replay as valid
+                     (let* ((n (file-length i))
+                            (b (make-array n :element-type '(unsigned-byte 8))))
+                       (and (eql (read-sequence b i) n) b)))))))))
 
 (defun %fasl-put (key bytes)
+  "Publish BYTES as KEY's fasl ATOMICALLY: write a file private to this process,
+   then rename(2) it over KEY.mfasl.  Writing KEY.mfasl in place let a process
+   loading the same file concurrently -- 32 sweep shards share one cache --
+   replay another's half-written record: one of four concurrent loads of the
+   ANSI suite came back 53 tests short."
   (let ((d (%fasl-dir)))
     (when d
       (ignore-errors
-       (let ((path (concatenate 'string d key ".mfasl")))
+       (let* ((path (concatenate 'string d key ".mfasl"))
+              (tmp (format nil "~a.~a.tmp" path (or (ignore-errors (%sys-getpid)) 0))))
          (ensure-directories-exist path)
-         (with-open-file (o path :direction :output :element-type '(unsigned-byte 8)
-                                 :if-exists :supersede :if-does-not-exist :create)
+         (with-open-file (o tmp :direction :output :element-type '(unsigned-byte 8)
+                                :if-exists :supersede :if-does-not-exist :create)
            (write-sequence bytes o))
-         t)))))
+         (if (eql (%sys-rename tmp path) 0)
+             t
+             (progn (ignore-errors (delete-file tmp)) nil)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; The load loops: %FASL-OPEN / %FASL-READ / %FASL-EVAL / %FASL-CLOSE.

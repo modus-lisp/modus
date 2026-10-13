@@ -1324,10 +1324,16 @@
                  (return (if (and (not tail) dotted) cdr-val
                              (progn (when tail (set-cdr tail cdr-val)) result)))))
               (t
-               ;; Dot followed by constituent — it's part of a symbol/number
+               ;; Dot followed by constituent — it's part of a symbol/number.
+               ;; ONE unread, and the dot handed over as the token's first
+               ;; char: unreading both is two unreads in a row, which CLHS
+               ;; does not allow and a string input stream here does not
+               ;; honour, so (read-from-string "(a .5)") signalled
+               ;; READER-ERROR -- every LOAD through the fasl cache, which
+               ;; reads the file's text with READ-FROM-STRING, died on
+               ;; ANSI typep.lsp's (&optional (prob .5)).
                (unread-char next stream)
-               (unread-char ch stream)
-               (let ((obj (%read-internal stream t nil t)))
+               (let ((obj (%read-as-token ch stream rt)))
                  (when (and (not *read-suppress*)
                             (not (eq obj *rdr-no-value*)))
                    (let ((new-cons (list obj)))

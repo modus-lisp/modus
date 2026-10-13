@@ -129,6 +129,51 @@
 (defun %fasl-reject (why)
   (throw '%fasl-reject why))
 
+;; THE LITERALS MUST BE A TREE.  The encoder writes each reference out in full,
+;; so a constant that SHARES a cons or vector comes back as two objects -- and
+;; (#1=(0) #1#) prints "((0) (0))" under *PRINT-CIRCLE* -- and one that is
+;; CIRCULAR through both car and cdr, #1=(#1# . #1#), is walked exponentially:
+;; the ANSI printer tests hung a load for hours at exactly that literal.  So the
+;; form's constants are walked ONCE with an identity table first, and any
+;; cons or vector reached twice keeps the form as source.  The table is keyed by
+;; address, so a collection during the walk voids it: reject then too.  The
+;; walk is bounded at 2000 nodes, because that table is linear (see NOTE).
+(defun %fasl-check-tree (consts)
+  (let ((seen (make-hash-table :test (function eq)))
+        (n 0)
+        (e0 (and (fboundp (quote %gc-epoch)) (funcall (quote %gc-epoch)))))
+    (labels ((note (v)
+               (when (gethash v seen) (%fasl-reject "shared or circular constant"))
+               (setf (gethash v seen) t)
+               (setq n (+ n 1))
+               ;; An EQ table keyed by a cons has no index here -- PUTHASH and
+               ;; GETHASH scan its entry list -- so this walk is QUADRATIC in
+               ;; the nodes it notes.  At 1,000,000 a big literal in the ANSI
+               ;; pprint tests pinned a load for an hour; at 2000 the worst
+               ;; case is ~4M comparisons.  A larger constant stays source.
+               (when (> n 2000) (%fasl-reject "constant too large")))
+             (walk (v d)
+               ;; down the cdr chain iteratively, so a long list is not deep;
+               ;; the car depth is bounded as the encoder bounds it
+               (when (> d 2000) (%fasl-reject "too deep"))
+               (loop
+                 (cond ((or (null v) (symbolp v) (pathnamep v) (%fasl-cell-key v))
+                        ;; atoms to the encoder: a global's cell is encoded
+                        ;; by key and replays as the same live cell
+                        (return nil))
+                       ((consp v) (note v) (walk (car v) (+ d 1)) (setq v (cdr v)))
+                       ((and (vectorp v) (not (stringp v))
+                             (not (equal (array-element-type v) '(unsigned-byte 8))))
+                        (note v)
+                        (when (simple-vector-p v)
+                          (dotimes (i (length v)) (walk (svref v i) (+ d 1))))
+                        (return nil))
+                       (t (return nil))))))
+      (dolist (c consts) (walk c 0)))
+    (when (and e0 (not (eql e0 (funcall (quote %gc-epoch)))))
+      (%fasl-reject "collection during constant check"))
+    t))
+
 (defun %fasl-cell-key (v)
   "V's key when V is the live (key . value) cell of a global variable."
   ;; IGNORE-ERRORS: %GV-CELL signals TYPE-ERROR for an integer that is no name
@@ -349,6 +394,7 @@
                      (let ((consts (mapcar (lambda (p) (gethash (car p) *e2-const-pool*))
                                            (reverse idxs)))
                            (rt nil) (lam nil))
+                       (%fasl-check-tree consts)
                        ;; the runtime-call names (positive keys; the negative ones
                        ;; are per-process call caches, rebuilt on replay)
                        (maphash (lambda (key v) (when (and (integerp key) (> key 0)) (push (cons key v) rt)))

@@ -4917,14 +4917,46 @@
 ;;; INTERNAL-TIME-UNITS-PER-SECOND promised, and 201 is `listen(2)' on the
 ;;; AArch64 generic ABI, so this was never portable either.
 
-;;; CLASS-OF — strict 1-arg arity
+;;; CLASS-OF — strict 1-arg arity.  Every object has a class (CLHS 4.3.1).
+;;; This definition loads after cl-clos.lisp's and wins; it used to answer
+;;; NIL for everything but a CLOS instance -- conditions, structs, 5, "s".
+;;; Non-CLOS objects get FIND-CLASS's canonical proxy, so
+;;; (eq (class-of c) (find-class (type-of c))) holds.
+(defun %class-of-builtin-name (x)
+  "The CLHS 4.3.7 built-in class name for a non-CLOS, non-struct object."
+  (let ((ty (type-of x)))
+    (cond
+      ;; Tagged conses underneath: test before TYPE-OF says CONS.
+      ((packagep x) 'package)
+      ((streamp x)
+       (if (member ty '(broadcast-stream concatenated-stream echo-stream
+                        file-stream string-stream synonym-stream two-way-stream))
+           ty 'stream))
+      ((member ty '(symbol null cons string character hash-table package
+                    pathname logical-pathname readtable random-state
+                    single-float double-float ratio complex function
+                    broadcast-stream concatenated-stream echo-stream
+                    file-stream string-stream synonym-stream two-way-stream
+                    stream bit-vector))
+       ty)
+      ((or (eq ty 'boolean) (eq ty 'keyword)) 'symbol)
+      ((integerp x) 'integer)
+      (t (let ((d (%type-of-for-dispatch x)))
+           (if (eq d 'boolean) 'symbol d))))))
+
 (defun class-of (x &rest extra)
   (if extra
       (%program-error "class-of requires exactly 1 argument")
       (cond
-        ((%clos-instance-p x)
-         (%find-clos-class (aref x 1)))
-        (t nil))))
+        ((%clos-instance-p x) (%find-clos-class (aref x 1)))
+        ((%clos-class-p x)    (find-class 'standard-class))
+        ((%condition-p x)     (find-class (%condition-type-name x)))
+        ;; Not FIND-CLASS: a struct compiled into the image has no runtime
+        ;; type descriptor for it to find ("class not found").
+        ((%struct-instance-p x)
+         (let ((n (%struct-type-name x)))
+           (or (%find-clos-class n) (%get-class-proxy n))))
+        (t (find-class (%class-of-builtin-name x))))))
 
 ;;; TYPE-OF (CLHS) — replaces the prelude NIL stub.  The prelude's
 ;;; (defun type-of (obj) nil) made (typep x (type-of x)) NIL for every

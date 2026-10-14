@@ -4272,7 +4272,7 @@
   ;; Already of that type: OBJECT itself (CLHS COERCE; COERCE.1).  Only on an
   ;; EXACT match with TYPE-OF -- TYPEP ignores element types here, so a general
   ;; vector would pass for a byte vector and come back uncopied.
-  (when (and (not (consp object)) (or (stringp object) (vectorp object))
+  (when (and (not (consp object)) (or (stringp object) (arrayp object))
              (equal result-type (type-of object)))
     (return-from coerce object))
   (setq result-type (%coerce-expand-type result-type))
@@ -5067,6 +5067,11 @@
     ((%condition-p obj) (%condition-type-name obj))
     ;; A CLOS class object is itself an instance of STANDARD-CLASS.
     ((%clos-class-p obj) 'standard-class)
+    ;; A class proxy stands for a DEFSTRUCT's class or a built-in one.  It is
+    ;; a marked vector, so it fell through to the vector arms -- (SIMPLE-VECTOR
+    ;; 2) -- and once those stopped claiming it (ARRAYP, CLHS 4.2.2), to T.
+    ((%class-proxy-p obj)
+     (if (%find-struct-type (%class-proxy-name obj)) 'structure-class 'built-in-class))
     ;; A hash table is a tagged cons underneath; its type is HASH-TABLE.
     ((hash-table-p obj) 'hash-table)
     ;; Integers: CLHS says an (integer low high) spec is fine, but a bare

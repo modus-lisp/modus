@@ -1059,6 +1059,14 @@
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
           (%print-char 62 stream))
+         ;; #nA cannot say what follows a zero dimension: #2A() reads back
+         ;; as (0 0) whatever the array was, so (0 3) is not printable
+         ;; readably (CLHS 22.1.3.8; SBCL's answer is its own #A syntax).
+         ((and *print-readably*
+               (let ((seen0 nil) (bad nil))
+                 (dolist (d (%mda-dims obj) bad)
+                   (if (eql d 0) (setq seen0 t) (when seen0 (setq bad t))))))
+          (error 'print-not-readable :object obj))
          (t
           (let ((dims (%mda-dims obj)) (data (%mda-data obj)))
             (cond

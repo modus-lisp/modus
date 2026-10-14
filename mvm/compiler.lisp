@@ -7017,7 +7017,7 @@
     "%HANDLER-CASE-CATCH" "THEN" "-" "ARRAY-LENGTH"
     "OF-TYPE" "RETURN" "%MAKE-RATIO" "PROG*"
     "NIC-IRQ-UNMASK" "EQL" "FINALLY" "SAVE-CONTEXT"
-    "ELSE" "GET-ALLOC-PTR" "/" "PROVIDE"
+    "ELSE" "GET-ALLOC-PTR" "%FRAME-POINTER" "/" "PROVIDE"
     "CATCH" "EQUAL" "WITH-INPUT-FROM-STRING" "CDAR"
     "ADR" "NOT" "RESTART-CASE" "%HC-LONGJMP"
     "SET-RSP" "INTO" "%MAKE-BIGNUM" "PERCPU-SET"
@@ -8233,6 +8233,7 @@
 
       ;; --- System Registers ---
       ((= op-name 523513650)   (compile-get-alloc-ptr dest))  ; GET-ALLOC-PTR
+      ((= op-name 141053449)   (compile-frame-pointer dest))  ; %FRAME-POINTER
       ((= op-name 194607241) (compile-get-alloc-limit dest))  ; GET-ALLOC-LIMIT
       ((= op-name 488062438)   (compile-set-alloc-ptr (cadr form) env dest))  ; SET-ALLOC-PTR
       ((= op-name 421551229) (compile-set-alloc-limit (cadr form) env dest))  ; SET-ALLOC-LIMIT
@@ -21090,6 +21091,13 @@
 (defun compile-get-alloc-ptr (dest)
   "Compile (get-alloc-ptr) - return VA tagged as fixnum"
   (emit-ir :mov dest +vreg-va+)
+  (emit-ir :shl dest dest +fixnum-shift+))
+
+(defun compile-frame-pointer (dest)
+  "Compile (%frame-pointer) - this function's frame pointer (VFP: RBP on x86-64), as a
+   fixnum whose value is the address.  A backtrace walks the saved-frame-pointer chain
+   from here: [FP] is the caller's FP, [FP+8] the return address into it."
+  (emit-ir :mov dest +vreg-vfp+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
 (defun compile-get-alloc-limit (dest)

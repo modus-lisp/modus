@@ -18206,6 +18206,65 @@
        (every (lambda (a) (%expr-single-float-p a env)) args)))
 
 ;;; ------------------------------------------------------------
+;;; Double-float arithmetic fast path.  The single-float one above, without
+;;; the narrowing: when every operand of + - * / is provably a DOUBLE-FLOAT
+;;; (a literal, a declared variable or slot, an AREF of a declared
+;;; (simple-array double-float (*)), or such an operation) emit the :fadd /
+;;; :fsub / :fmul / :fdiv opcode per left-associated pair, boxed, instead of a
+;;; GENERIC-ADD/-MULTIPLY call -- its operand tests, contagion and the call
+;;; itself were most of a double-float FFT on modus.  Declarations are trusted
+;;; exactly as the single-float path trusts them.
+;;; ------------------------------------------------------------
+
+(defun %f64-simple-array-decl-p (ty)
+  (and (consp ty) (symbolp (car ty))
+       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (consp (cdr ty))
+       (let ((et (cadr ty)))
+         (and (symbolp et) et (string= (symbol-name et) "DOUBLE-FLOAT")))))
+
+(defun %expr-double-float-p (form env)
+  "T when FORM is provably a DOUBLE-FLOAT at compile time."
+  (cond
+    ((typep form 'double-float) t)
+    ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
+          (typep (cadr form) 'double-float)) t)
+    ((symbolp form)
+     (let ((ty (%expr-dtype form env)))
+       (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT"))))
+    ((consp form)
+     (let ((op (car form)))
+       (cond
+         ((not (symbolp op)) nil)
+         ((and (name-eq op "AREF") (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+          (and (cadr form) (symbolp (cadr form))
+               (%f64-simple-array-decl-p (%expr-dtype (cadr form) env))))
+         ((and (member (symbol-name op) '("+" "-" "*" "/") :test #'string=)
+               (consp (cdr form)) (consp (cddr form)))
+          (every (lambda (a) (%expr-double-float-p a env)) (cdr form)))
+         (t (let ((ty (%expr-dtype form env)))
+              (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")))))))
+    (t nil)))
+
+(defun %double-float-arith-applicable-p (args env)
+  (and (consp args) (consp (cdr args))
+       (every (lambda (a) (%expr-double-float-p a env)) args)))
+
+(defun %compile-double-float-arith (op-name args env dest)
+  "Left-fold ARGS with the double-float op OP-NAME (a string): :f<op> per pair,
+   each result a boxed double.  Every operand double-float (caller-checked)."
+  (let ((firop (%float-arith-op op-name)))
+    (compile-form (car args) env dest)
+    (dolist (arg (cdr args))
+      (let ((temp (alloc-temp-reg)))
+        (emit-ir :push dest)
+        (compile-form arg env temp)
+        (emit-ir :pop dest)
+        (emit-ir :gc-check)
+        (emit-ir firop dest dest temp)
+        (free-temp-reg)))))
+
+;;; ------------------------------------------------------------
 ;;; Unboxed single-float expression trees (layer 1b part 2b)
 ;;;
 ;;; A call-free tree of single-float literals, declared single-float
@@ -18720,6 +18779,8 @@
   "Compile (+ args...).  Fixnum fast path; ratio/mixed via GENERIC-ADD."
   (when (%single-float-arith-applicable-p args env)
     (return-from compile-add (%compile-single-float-arith "+" args env dest)))
+  (when (%double-float-arith-applicable-p args env)
+    (return-from compile-add (%compile-double-float-arith "+" args env dest)))
   (setq args (%swap-commutative-args args env))
   (let ((anf (and args (cdr args) (anf-normalize-arith-args '+ args env))))
     (cond
@@ -18774,6 +18835,8 @@
    because the test EXPECTS the (error ...) branch to fire."
   (when (%single-float-arith-applicable-p args env)
     (return-from compile-sub (%compile-single-float-arith "-" args env dest)))
+  (when (%double-float-arith-applicable-p args env)
+    (return-from compile-sub (%compile-double-float-arith "-" args env dest)))
   (cond
     ((null args)
      (compile-form `(error "- requires at least one argument") env dest))
@@ -18830,6 +18893,8 @@
    via bignum-mul so the slow path is correct."
   (when (%single-float-arith-applicable-p args env)
     (return-from compile-mul (%compile-single-float-arith "*" args env dest)))
+  (when (%double-float-arith-applicable-p args env)
+    (return-from compile-mul (%compile-double-float-arith "*" args env dest)))
   (setq args (%swap-commutative-args args env))
   (cond
     ((null args) (compile-integer 1 dest))
@@ -19072,6 +19137,8 @@
   ;; never handled float operands.
   (when (%single-float-arith-applicable-p args env)
     (return-from compile-div (%compile-single-float-arith "/" args env dest)))
+  (when (%double-float-arith-applicable-p args env)
+    (return-from compile-div (%compile-double-float-arith "/" args env dest)))
   (when (null args)
     (compile-form `(error "/ requires at least one argument") env dest)
     (return-from compile-div nil))

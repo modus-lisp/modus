@@ -110,17 +110,18 @@
       (setq cur (cdr cur)))))
 
 (defun %condition-all-parents (name)
-  "Get all ancestor type names of a condition type (including itself)."
+  "Every ancestor type name of a condition type, itself first, in CLASS
+   PRECEDENCE order (CLHS 4.3.5): (name) + C3-merge(L(p1) ... L(pn) (p1 ... pn)).
+   A depth-first walk put a shared ancestor before a later parent's own chain
+   -- READER-ERROR came out (... CONDITION STREAM-ERROR T) -- and %OBJ-CPL
+   orders method dispatch on conditions by this list."
   (let ((entry (%cond-reg-find name)))
     (if (null entry)
         (list name)  ; unknown type — just itself
-        (let ((result (list name)))
-          (dolist (parent (%cond-reg-parents entry))
-            (let ((parent-ancestors (%condition-all-parents parent)))
-              (dolist (anc parent-ancestors)
-                (unless (member anc result)
-                  (setq result (append result (list anc)))))))
-          result))))
+        (let ((parents (%cond-reg-parents entry)))
+          (cons name
+                (%cpl-merge (append (mapcar #'%condition-all-parents parents)
+                                    (list (copy-list parents)))))))))
 
 (defun %condition-typep (cond type-name)
   "Check if COND is of type TYPE-NAME or a subtype."

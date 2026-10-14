@@ -254,29 +254,51 @@
   (and (= (logand (%float-hi32 x) #x7FFFFFFF) #x7FF00000)
        (= (%float-lo32 x) 0)))
 
-(defun %exp-f (x)
-  "exp of double X via range-reduction + Taylor.  exp(x)=exp(x/2)^2
-   keeps the Taylor argument in [-~1,1] for fast convergence; recursion
-   depth ~log2|x| (<= ~1024 for any finite double).
+;;; EXP and LOG, fdlibm-style.  The constants are exact IEEE bit patterns (hi, lo
+;;; halves), built with %MAKE-TYPED-FLOAT rather than read as literals.
+(defun %dbl (hi lo) (%make-typed-float hi lo 'double-float))
 
-   AN INFINITE X halves to itself and recursed until the stack ran out:
-   %LOG-F's Newton step can produce one, and LOG/ATANH/ACOSH on random floats
-   died with SIGSEGV in upstream shard 14 (7336 %EXP-F frames in the core).
-   exp(+inf) = +inf, exp(-inf) = 0."
-  (cond
-    ((%float-infinite-p x)
-     (if (= (logand (%float-hi32 x) #x80000000) 0) x (%fl 0)))
-    ((%float-lt-p (%f-one) (%float-abs x))
-     (let ((half (%exp-f (%float-div x (%fl 2)))))
-       (%float-mul half half)))
-    (t
-     ;; |x| <= 1: 1 + x + x^2/2! + ...
-     (let ((term (%f-one)) (acc (%f-one)) (n 1))
-       (loop
-         (when (> n 18) (return acc))
-         (setq term (%float-div (%float-mul term x) (%fl n)))
-         (setq acc (%float-add acc term))
-         (setq n (+ n 1)))))))
+(defun %exp-f (x)
+  "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
+   exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
+   the exponent bits.  The old version halved X until |X| <= 1 and squared back,
+   which amplified the Taylor error (mean 253 ulp against libm, max 5661) and
+   cost a few hundred boxed float operations."
+  (let ((hi (%float-hi32 x)))
+    (cond
+      ;; NaN or infinity
+      ((= (logand hi #x7FF00000) #x7FF00000)
+       (if (and (= (logand hi #x000FFFFF) 0) (= (%float-lo32 x) 0))
+           (if (= (logand hi #x80000000) 0) x (%fl 0))       ; exp(+inf)=inf, exp(-inf)=0
+           x))                                                ; NaN
+      ((%float-lt-p (%dbl #x40862E42 #xFEFA39EF) x)            ; > 709.78...: overflow
+       (%dbl #x7FF00000 0))
+      ((%float-lt-p x (%dbl #xC0874910 #xD52D3051))            ; < -745.13...: underflow
+       (%fl 0))
+      (t
+       (let* ((tq (%float-mul x (%dbl #x3FF71547 #x652B82FE)))   ; x / ln2
+              (k (%float-to-int (if (%float-lt-p tq (%fl 0))
+                                    (%float-sub tq (%dbl #x3FE00000 0))
+                                    (%float-add tq (%dbl #x3FE00000 0)))))
+              (fk (%fl k))
+              (r (%float-sub (%float-sub x (%float-mul fk (%dbl #x3FE62E42 #xFEE00000)))
+                             (%float-mul fk (%dbl #x3DEA39EF #x35793C76))))
+              (acc (%fl 1))
+              (n 13))
+         ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
+         (loop
+           (when (< n 1) (return nil))
+           (setq acc (%float-add (%fl 1) (%float-div (%float-mul r acc) (%fl n))))
+           (setq n (- n 1)))
+         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends
+         (cond ((and (>= k -1022) (<= k 1023))
+                (%float-mul acc (%dbl (ash (+ k 1023) 20) 0)))
+               ((> k 1023)
+                (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
+                            (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
+               (t
+                (%float-mul (%float-mul acc (%dbl (ash (+ (+ k 600) 1023) 20) 0))
+                            (%dbl (ash (+ -600 1023) 20) 0)))))))))
 
 (defun exp (x)
   "e^x.  Exact integer 1 for integer 0; IEEE float result otherwise."
@@ -285,33 +307,37 @@
     (t (%exp-f (%any-to-float x)))))
 
 (defun %log-f (x)
-  "Natural log of double X (X > 0).  Reduce x = m·2^e with m in [1,2)
-   by repeated halving/doubling, accumulating e·ln2, then Newton on
-   the residual: y_{n+1} = y_n + x/exp(y_n) - 1 converges to ln(m)."
-  (let ((ln2 (%float-div (%fl 693147180559945) (%fl 1000000000000000)))   ; ln 2
-        (e 0)
-        (m x)
-        (two (%fl 2))
-        (half (%float-div (%fl 1) (%fl 2))))
-    ;; bring m into [0.5, 2): halve while ≥2, double while <0.5
-    (loop
-      (when (not (%float-lt-p two m)) (return nil))   ; m < 2
-      (when (numeric-equal-p m two) (return nil))
-      (setq m (%float-mul m half))
-      (setq e (+ e 1)))
-    (loop
-      (when (not (%float-lt-p m (%float-div (%fl 1) two))) (return nil)) ; m >= 0.5
-      (setq m (%float-mul m two))
-      (setq e (- e 1)))
-    ;; Newton for ln(m), m in [0.5,2), 30 iters
-    (let ((y (%float-sub m (%f-one)))   ; initial guess m-1
-          (i 0))
-      (loop
-        (when (> i 30) (return nil))
-        (let ((ey (%exp-f y)))
-          (setq y (%float-add y (%float-sub (%float-div m ey) (%f-one)))))
-        (setq i (+ i 1)))
-      (%float-add y (%float-mul (%fl e) ln2)))))
+  "Natural log of double X > 0.  x = m 2^e exactly from the IEEE bits (a
+   subnormal is scaled by 2^54 first), m brought into [sqrt(1/2), sqrt 2);
+   ln m = 2 atanh f with f = (m-1)/(m+1), |f| <= 0.172, by an 11-term series
+   in s = f^2; e ln2 with ln2 split hi/lo.  The old version ran 31 Newton steps,
+   each a full %EXP-F, with a 15-digit ln 2 (mean 9 ulp, max 20160)."
+  (let ((hi (%float-hi32 x)) (e 0))
+    (cond
+      ((= (logand hi #x7FF00000) #x7FF00000) x)                ; +inf / NaN
+      ((and (= (logand hi #x7FFFFFFF) 0) (= (%float-lo32 x) 0))
+       (%dbl #xFFF00000 0))                                     ; log 0 = -inf
+      (t
+       (when (= (logand hi #x7FF00000) 0)                       ; subnormal: x 2^54
+         (setq x (%float-mul x (%dbl #x43500000 0)) e -54 hi (%float-hi32 x)))
+       (setq e (+ e (- (logand (ash hi -20) #x7FF) 1023)))
+       (let ((m (%dbl (logior (logand hi #x000FFFFF) #x3FF00000) (%float-lo32 x))))
+         (when (%float-lt-p (%dbl #x3FF6A09E #x667F3BCD) m)       ; m > sqrt 2
+           (setq m (%float-mul m (%dbl #x3FE00000 0)) e (+ e 1)))
+         (let* ((f (%float-div (%float-sub m (%fl 1)) (%float-add m (%fl 1))))
+                (sq (%float-mul f f))
+                (acc (%float-div (%fl 1) (%fl 23)))
+                (j 10))
+           ;; 1 + s/3 + s^2/5 + ... + s^11/23
+           (loop
+             (when (< j 0) (return nil))
+             (setq acc (%float-add (%float-div (%fl 1) (%fl (+ (* 2 j) 1)))
+                                   (%float-mul sq acc)))
+             (setq j (- j 1)))
+           (let ((fe (%fl e)))
+             (%float-add (%float-mul fe (%dbl #x3FE62E42 #xFEE00000))
+                         (%float-add (%float-mul (%float-mul (%fl 2) f) acc)
+                                     (%float-mul fe (%dbl #x3DEA39EF #x35793C76)))))))))))
 
 (defun log (x &optional base)
   "Natural log (or log to BASE if supplied).  CLHS: (log z) for a complex

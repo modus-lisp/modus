@@ -5588,11 +5588,19 @@
           (if (and (or (integerp a) (floatp-impl a) (ratiop a))
                    (or (integerp b) (floatp-impl b) (ratiop b)))
               (numeric-equal-p a b)
+          ;; A complex is a number, not the vector it is stored as: =
+          ;; across types, (equalp #c(1 2) #c(1.0 2.0)) => T (CLHS EQUALP).
+          (if (or (%complex-p a) (%complex-p b))
+              (and (numberp a) (numberp b) (= a b))
+          ;; Pathnames: EQUALP is EQUAL (CLHS).  A pathname is an instance
+          ;; underneath, which is no longer compared as an array.
+          (if (and (pathnamep a) (pathnamep b))
+              (equal a b)
               ;; ANSI equalp: arrays of any type compare element-wise.
               (if (and (or (stringp a) (arrayp a))
                        (or (stringp b) (arrayp b)))
                   (%equalp-array-array a b)
-                  nil))))))))
+                  nil))))))))))
 
 
 ;;; ============================================================

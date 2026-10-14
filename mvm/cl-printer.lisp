@@ -4043,8 +4043,12 @@
          (setq j (+ j 1)))
         (t (return j))))))
 
-(defun %format-impl (stream control args)
-  "Core format. Returns remaining unused args."
+(defun %format-impl (stream control args &optional (origin args))
+  "Core format. Returns remaining unused args.
+   ORIGIN is the argument list of the directive level CONTROL belongs to: ARGS itself, except
+   for a clause of ~[...~], which is the SAME level as its ~[ (CLHS 22.3.7.2) -- it is handed
+   the args left at the ~[ and ORIGIN, so ~:* and ~@* inside it count from where the level
+   began, not from the clause."
   ;; CLHS 22.3: a format control may be a FUNCTION (the result of FORMATTER)
   ;; instead of a string.  When so, it consumes the stream + args and returns
   ;; the unused tail — exactly the formatter-closure contract.  Detect and
@@ -4384,7 +4388,7 @@
                      ;; ~@N* / ~@*: absolute goto — set arg-list to (nthcdr N args)
                      (atp
                       (let ((n (if param1 param1 0)))
-                        (let ((cur args) (j 0))
+                        (let ((cur origin) (j 0))
                           (loop
                             (when (or (null cur) (= j n)) (return nil))
                             (setq cur (cdr cur))
@@ -4395,14 +4399,14 @@
                       (let ((n (if param1 param1 1)))
                         ;; consumed = (length args) - (length arg-list)
                         ;; new pos = consumed - n  (clamped to 0)
-                        (let ((consumed 0) (al args))
+                        (let ((consumed 0) (al origin))
                           (loop (when (eq al arg-list) (return nil))
                                 (when (null al) (return nil))
                                 (setq consumed (+ consumed 1))
                                 (setq al (cdr al)))
                           (let ((new-pos (- consumed n)))
                             (when (< new-pos 0) (setq new-pos 0))
-                            (let ((cur args) (j 0))
+                            (let ((cur origin) (j 0))
                               (loop
                                 (when (or (null cur) (= j new-pos)) (return nil))
                                 (setq cur (cdr cur))
@@ -4595,15 +4599,16 @@
                             (if val
                                 (progn
                                   ;; Don't consume arg — process section with arg still there
-                                  (setq arg-list (%format-impl stream (car sections) arg-list)))
+                                  (setq arg-list (%format-impl stream (car sections) arg-list origin)))
                                 (setq arg-list (cdr arg-list)))))
                          ;; ~:[: boolean second-arg style
                          (colonp
                           (let ((val (car arg-list)))
                             (setq arg-list (cdr arg-list))
-                            (if (not val)
-                                (when sections (%format-impl stream (car sections) arg-list))
-                                (when (cdr sections) (%format-impl stream (cadr sections) arg-list)))))
+                            ;; The clause's arguments are the level's: what it consumes stays
+                            ;; consumed after the ~].
+                            (let ((sel (if (not val) (car sections) (cadr sections))))
+                              (when sel (setq arg-list (%format-impl stream sel arg-list origin))))))
                          ;; ~[: numeric selection.  If a prefix parameter
                          ;; was given (~N[), use N directly without consuming
                          ;; an arg.  Otherwise consume the next arg.  If
@@ -4618,12 +4623,12 @@
                               ((and (integerp idx) (>= idx 0) (< idx (length sections)))
                                (let ((selected (nth idx sections)))
                                  (when selected
-                                   (setq arg-list (%format-impl stream selected arg-list)))))
+                                   (setq arg-list (%format-impl stream selected arg-list origin)))))
                               ;; Out of range with default section
                               (default-idx
                                (let ((selected (nth default-idx sections)))
                                  (when selected
-                                   (setq arg-list (%format-impl stream selected arg-list))))))))))))
+                                   (setq arg-list (%format-impl stream selected arg-list origin))))))))))))
                   ;; ~<...~> — justification (simple variant) OR
                   ;; ~<...~:> — logical block (CLHS 22.3.5.2).  The close
                   ;; modifier selects: a colon on the close (~:>) means the

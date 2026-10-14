@@ -4483,11 +4483,23 @@
                (error "mvm-eval: interp-closure compile failed (params=~S)"
                       (cadr fn)))))))))
 
+(defun %deftype-cache-key (head nm)
+  "*E2IC-DEFTYPE-CACHE*'s key for deftype HEAD: its package and name.  Keyed by
+   the bare NAME, two libraries' same-named deftypes (natrium's U32 and
+   secp256k1-fast's) shared one slot and evicted each other at every use -- and
+   an eviction refilled on a WORKER is a store into the shared table, which the
+   shared-store guard refuses: (natrium:sha256 ...) failed on a worker whenever
+   main had last used the other U32."
+  (let ((p (and (symbolp head) (symbol-package head))))
+    (if p (concatenate (quote string) (package-name p) "::" nm) nm)))
+
 (defun %deftype-expander (head entry)
   "The compiled expander trampoline for deftype HEAD whose registered
    (params . body) is ENTRY, or :E2IC-FAIL; compiled once per registration
-   and cached by name (a re-registered deftype has a new ENTRY and recompiles)."
-  (let* ((nm (%eval-sym-name head))
+   and cached by package and name (a re-registered deftype has a new ENTRY and
+   recompiles)."
+  (let* ((nm0 (%eval-sym-name head))
+         (nm (and nm0 (%deftype-cache-key head nm0)))
          (hit (if (and nm *e2ic-deftype-cache*)
                   (gethash nm *e2ic-deftype-cache*)
                   nil)))

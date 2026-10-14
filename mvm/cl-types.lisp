@@ -5164,6 +5164,10 @@
   (let ((head (if (consp type) (car type) type)))
     (and (symbolp head) (%deftype-lookup head) t)))
 
+(defun %typep-array-obj-p (obj)
+  "TYPEP's ARRAY / VECTOR test: ARRAYP or a string, and not a complex."
+  (and (or (arrayp obj) (stringp obj)) (not (%complex-p obj))))
+
 (defun typep (obj type)
   (when (or (eq type 'values)
             (and (consp type)
@@ -5202,7 +5206,9 @@
          ((eq tn 'bignum) (bignump obj))
          ((eq tn 'real) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
          ((eq tn 'rational) (or (integerp obj) (ratiop obj)))
-         ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)
+                              (%complex-p obj)))
+         ((eq tn 'complex) (%complex-p obj))
          ((eq tn 'float) (floatp-impl obj))
          ;; Per-type identity by declared subtag (numeric tower N1).  Modus
          ;; uses the standard SBCL aliasing short-float==single-float and
@@ -5237,13 +5243,15 @@
          ((eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
          ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((eq tn 'signed-byte) (integerp obj))
-         ((eq tn 'array)         (or (arrayp obj) (stringp obj)))
-         ((eq tn 'simple-array)  (or (arrayp obj) (stringp obj)))
-         ((eq tn 'vector)        (or (arrayp obj) (stringp obj)))
+         ;; A COMPLEX is a marked 3-slot vector underneath (%COMPLEX-P), so the
+         ;; ARRAYP intrinsic says yes; it is a NUMBER, never an ARRAY (CLHS 4.2.2).
+         ((eq tn 'array)         (%typep-array-obj-p obj))
+         ((eq tn 'simple-array)  (%typep-array-obj-p obj))
+         ((eq tn 'vector)        (%typep-array-obj-p obj))
          ;; SIMPLE-VECTOR = (simple-array t (*)) — element-type T only.
          ;; A byte-packed u8 vector (subtag #x11) has element-type
          ;; (unsigned-byte 8), so it is NOT a simple-vector.
-         ((eq tn 'simple-vector) (and (or (arrayp obj) (stringp obj))
+         ((eq tn 'simple-vector) (and (%typep-array-obj-p obj)
                                       (not (eql (obj-subtag obj) #x11))
                                       ;; packed single-float vector (#x12)
                                       (not (eql (obj-subtag obj) #x12))))
@@ -5258,6 +5266,7 @@
          ;; because Modus' adjustable/displaced array wrappers are themselves
          ;; cons-shaped and would otherwise skip the rank test.
          ((eq tn 'sequence)      (cond ((stringp obj) t)
+                                       ((%complex-p obj) nil)
                                        ((arrayp obj) (= (array-rank obj) 1))
                                        (t (or (null obj) (consp obj)))))
          ((eq tn 'function)      (or (functionp obj) (%generic-function-p obj)))
@@ -5399,6 +5408,12 @@
                  (and (>= obj (- 0 half)) (< obj half)))))
          ((eq head 'mod)
           (and (integerp obj) (>= obj 0) (< obj (cadr type))))
+         ;; (COMPLEX PART-TYPE): both parts of that type (CLHS 12.1.5.3).
+         ((eq head 'complex)
+          (and (%complex-p obj)
+               (let ((pt (and (cdr type) (cadr type))))
+                 (or (null pt) (eq pt '*)
+                     (and (typep (realpart obj) pt) (typep (imagpart obj) pt))))))
          ((or (eq head 'bit-vector) (eq head 'simple-bit-vector))
           (and (bit-vector-p obj)
                (let ((sz (and (cdr type) (cadr type))))
@@ -5472,6 +5487,7 @@
                        ((and (consp obj) (eql (car obj) 8765432)) (cdr obj))
                        (t obj))))
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
+               (not (%complex-p obj))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
                    (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12))
                (let* ((et (and (cdr type) (%element-type-expand (cadr type))))

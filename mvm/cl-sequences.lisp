@@ -3256,7 +3256,7 @@
 ;; for fn-addrs whose low bit happened to land on 0 or 1.  Replaced
 ;; with proper subtag checks.  In MVM all vectors share +subtag-array+
 ;; (#x32) — strings (#x31) are also vector-shaped per CL semantics.
-(defun vectorp (obj) (or (arrayp obj) (stringp obj)))
+(defun vectorp (obj) (and (or (arrayp obj) (stringp obj)) (not (%complex-p obj))))
 (defun remove-duplicates (seq &rest args)
   "Remove duplicates from SEQ. CL default keeps the LAST occurrence
    of each duplicate group (so the relative order of survivors is the

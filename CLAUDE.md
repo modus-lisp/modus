@@ -268,6 +268,30 @@ Key fixes en route: call-relocation untag (5b866fa), out-of-module GC-trampoline
 `(logand …)` + `(ash (floor V 2^31) -1)`).  Next: port the JIT to aarch64; then
 back to Quicklisp.
 
+### Hot-function JIT: a runtime DEFUN goes native on its own (2026-10-14)
+
+`*jit-hot-only*` decides per TOPLEVEL FORM, and a DEFUN runs once, so a DEFUN
+from `load` of a source file, a `--script`, `eval` or the REPL stayed an
+interpreter trampoline forever unless something called `jit-eager`.  (ASDF
+loads were already native: `compile-file` and the FASL cache build them.)  Now
+each DEFUN's trampoline counts: after `*jit-hot-calls*` calls (NIL = 64, 0 =
+off) or 10 ms spent interpreted, its module is built -- after its
+still-interpreted callees, so the calls link straight to native code -- with
+`jit-eager`'s own `%jit-build-module`.  Only calls that reach the trampoline
+count; a self-call inside the function's bytecode does not, and there is no
+on-stack replacement, so a single long call finishes interpreted and the NEXT
+call is native.  Measured on x64: a script's helper loop 20.5 s -> 66 ms;
+natrium loaded with `load`: 50 x SHA-256(4K) 84 s -> 2.0 s, 50 x HMAC 200 s ->
+0.6 s; load time unchanged.  `test/hot-jit.lisp` (20 checks, x64 + aarch64).
+
+**x64 LINKAGE STUBS came with it**, because a native caller BAKED its callee's
+address: with DEFUNs going native by default, redefining a hot function would
+have been invisible to its already-native callers.  A native call to a runtime
+DEFUN now goes through a per-name 16-byte stub (`jmp [rip+2]` + target word)
+that every (re)definition retargets -- aarch64's linkage cells, without a
+translator change.  `test/redefine-native-callers.lisp`, which x64 had FAILED
+since it was written, passes; the stubs survive save-and-die.
+
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 
 `build-generic-cli` currently reports, on every build:

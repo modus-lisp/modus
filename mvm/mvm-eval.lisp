@@ -1108,7 +1108,7 @@
    the per-thread slot fs:[0x10000178] and jumps to %JIT-BRIDGE-ANY with every
    argument register, stack argument and the nargs slot untouched:
      mov dword fs:[0x10000178], idx ; movabs rax, bridge-any ; jmp rax"
-  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* 4096))
+  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* (%jit-bridge-cap)))
       nil
       (let ((addr (%jit-thunk-alloc)))
         (if (null addr)
@@ -1130,6 +1130,59 @@
       nil
       (let ((addr (%jit-thunk-alloc)))
         (if (null addr) nil (%jit-thunk-fill addr name nargs)))))
+
+;;; x64 LINKAGE STUBS -- late binding for native calls to runtime DEFUNs.
+;;; A native caller bakes its callee's address (`movabs rax, imm64; call rax'),
+;;; so a callee redefined afterwards went unseen by every caller already built
+;;; (the residual %JIT-INSTALL-NATIVE-FNS documents).  aarch64 has LINKAGE
+;;; CELLS; this is x64's equivalent without a translator change: a call to a
+;;; runtime DEFUN that is native at relocation time bakes the address of a
+;;; per-name 16-byte stub instead,
+;;;     +0  FF 25 02 00 00 00   jmp qword [rip+2]
+;;;     +6  CC CC
+;;;     +8  target (raw code address, an aligned 8-byte store)
+;;; and every (re)definition rewrites the target: the new native code, or a
+;;; late-binding any-arity bridge that resolves the name at call time when the
+;;; new definition is an interpreter trampoline.  One indirect jump per call.
+;;; Needed by default once DEFUNs go native on their own (the hot-function JIT):
+;;; before that, a caller compiled while its callee was interpreted reached it
+;;; through a bridge and was late-bound anyway.  The stubs hold arena addresses
+;;; and are not moved by %JIT-AFTER-RELOCATE: x64 restores its arena at a fixed
+;;; address.
+(defvar *jit-x64-stubs* nil
+  "NAME -> (STUB-ADDRESS . ANY-BRIDGE-THUNK-or-NIL), x64 linkage stubs.")
+
+(defun %jit-x64-stub-set (stub addr)
+  ;; RAW-ADDR, as %JIT-LCELL-SET: a :u64 store writes a fixnum's TAGGED bits,
+  ;; so half the (16-aligned) address leaves exactly ADDR in the word.
+  (setf (mem-ref (+ stub 8) :u64) (ash addr -1)))
+
+(defun %jit-x64-stub (name addr)
+  "NAME's linkage stub, pointed at raw code address ADDR; NIL if no exec slot."
+  (when (null *jit-x64-stubs*)
+    (setq *jit-x64-stubs* (make-hash-table :test (function equal))))
+  (let ((e (gethash name *jit-x64-stubs*)))
+    (if e
+        (progn (%jit-x64-stub-set (car e) addr) (car e))
+        (let ((a (and (%jit-bridge-ensure) (%jit-thunk-alloc))))
+          (when a
+            (%jit-emit-bytes a (list #xFF #x25 2 0 0 0 #xCC #xCC))
+            (%jit-x64-stub-set a addr)
+            (puthash name *jit-x64-stubs* (cons a nil))
+            a)))))
+
+(defun %jit-x64-stub-retarget (name addr)
+  "NAME was (re)defined: point its stub, if it has one, at native ADDR -- or,
+   with ADDR NIL, at a bridge that resolves NAME when called."
+  (let ((e (and *jit-x64-stubs* (gethash name *jit-x64-stubs*))))
+    (when e
+      (if addr
+          (%jit-x64-stub-set (car e) addr)
+          (let ((th (or (cdr e)
+                        (let ((b (%jit-make-bridge-any-thunk name)))
+                          (when b (setf (cdr e) b))
+                          b))))
+            (when th (%jit-x64-stub-set (car e) th)))))))
 
 ;;; aarch64 bridge thunk (96-byte slot; words, I-cache flushed).  V0..V3 =
 ;;; x0..x3.  Layout:
@@ -1382,6 +1435,10 @@
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
   (let ((h (%jit-fnaddr-thunk-entry name)))
     (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0)))
+  ;; x64 native callers reach a runtime DEFUN through its linkage stub: until
+  ;; a native definition is installed (which retargets it again), resolve late.
+  (when (not (eq *jit-target-arch* :aarch64))
+    (%jit-x64-stub-retarget name nil))
   ;; AND NATIVE CALLERS: a LINKAGE CELL held the OLD definition's native code,
   ;; and only %JIT-INSTALL-NATIVE-FNS ever repointed it -- so a redefinition
   ;; that is not native (an interpreted DEFUN under hot-only JIT, a
@@ -1495,7 +1552,13 @@
              ;; native jump.
              (word (if fn (%val->word fn) 0))
              (nativep (eql (logand word 15) 3))
-             (raw (if nativep (- word 3) 0)))
+             (raw0 (if nativep (- word 3) 0))
+             ;; A RUNTIME DEFUN (registered module) is called through its x64
+             ;; linkage stub, so a later redefinition reaches this caller.
+             (raw (if (and (> raw0 0) name (not (eq *jit-target-arch* :aarch64))
+                           (%jit-registered-p name))
+                      (or (%jit-x64-stub name raw0) raw0)
+                      raw0)))
         ;; #306 BRIDGE: a resolved-but-non-native callee gets a thunk instead
         ;; of failing the page (x64 only; nargs from the translator's parallel
         ;; alist, NIL on aarch64 → falls through to the old reject).
@@ -1809,6 +1872,8 @@
                 ;; every already-built caller that calls through the cell picks
                 ;; up this (re)definition — proper CL late binding.
                 (%jit-lcell-set nm addr)
+                (when (not (eq *jit-target-arch* :aarch64))
+                  (%jit-x64-stub-retarget nm addr))
                 (setq n (+ n 1))))))))
     (setq *jit-native-defun-count*
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
@@ -1847,6 +1912,10 @@
     (let ((m (list bc entry ft-list fn-table rt-table lam-offsets names)))
       (dolist (nm names) (puthash nm *jit-module-registry* m)))))
 
+(defun %jit-registered-p (name)
+  "T when NAME is a runtime DEFUN (it has a registered module)."
+  (if (and *jit-module-registry* (gethash name *jit-module-registry*)) t nil))
+
 (defun %jit-fn-native-p (name)
   (let ((f (%mvm-resolve-runtime-fn name)))
     (and f (eql (logand (%val->word f) 15) 3))))
@@ -1878,6 +1947,35 @@
        (dolist (p skips nil)
          (when (and (>= (length nm) (length p)) (string= p nm :end2 (length p)))
            (return t)))))
+
+(defun %jit-build-module (m now)
+  "Translate registered module M (a *JIT-MODULE-REGISTRY* value) and publish
+   its DEFUNs as native.  The number installed, or NIL when the page did not
+   build -- or would not: M failed when *JIT-NATIVE-DEFUN-COUNT* was already
+   NOW, and nothing it calls has gone native since (see %JIT-EAGER-ALL)."
+  (let ((f (assoc (car m) *jit-eager-failed* :test (function eq))))
+    (if (and f (eql (cdr f) now))
+        nil
+        (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
+                                       (car (cddddr m)))))
+          (if (and je (cadr (cddddr je)))
+              (let ((n (%jit-install-native-fns (car je) (cadr (cddddr je))
+                                                (car (cddr (cddddr m))))))
+                ;; OFF-MAIN, DO NOT RECORD: the cons would be a
+                ;; worker object in a region-0 list.
+                (when (%mvm-on-main-thread-p)
+                  (setq *jit-eager-built* (cons (car m) *jit-eager-built*))
+                  (when f (setq *jit-eager-failed*
+                                (remove f *jit-eager-failed*))))
+                n)
+              (progn
+                (when (%mvm-on-main-thread-p)
+                  (if f
+                      (setf (cdr f) (or *jit-native-defun-count* 0))
+                      (setq *jit-eager-failed*
+                            (cons (cons (car m) (or *jit-native-defun-count* 0))
+                                  *jit-eager-failed*))))
+                nil))))))
 
 (defun %jit-eager-all ()
   "Translate every registered runtime DEFUN that is still an interpreter
@@ -1918,34 +2016,125 @@
             (dolist (m pending)
               (when (not (member (car m) done :test (function eq)))
                 (setq done (cons (car m) done))
-                (let ((f (assoc (car m) *jit-eager-failed* :test (function eq))))
-                  (if (and f (eql (cdr f) now))
-                      (setq fails (+ fails 1))
-                      (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
-                                                     (car (cddddr m)))))
-                        (if (and je (cadr (cddddr je)))
-                            (let ((n (%jit-install-native-fns (car je) (cadr (cddddr je))
-                                                              (car (cddr (cddddr m))))))
-                              (setq modules (+ modules 1))
-                              (setq this-pass (+ this-pass n))
-                              ;; OFF-MAIN, DO NOT RECORD: the cons would be a
-                              ;; worker object in a region-0 list.
-                              (when (%mvm-on-main-thread-p)
-                                (setq *jit-eager-built* (cons (car m) *jit-eager-built*))
-                                (when f (setq *jit-eager-failed*
-                                              (remove f *jit-eager-failed*)))))
-                            (progn
-                              (setq fails (+ fails 1))
-                              (when (%mvm-on-main-thread-p)
-                                (if f
-                                    (setf (cdr f) (or *jit-native-defun-count* 0))
-                                    (setq *jit-eager-failed*
-                                          (cons (cons (car m) (or *jit-native-defun-count* 0))
-                                                *jit-eager-failed*)))))))))))
+                (let ((n (%jit-build-module m now)))
+                  (if n
+                      (setq modules (+ modules 1) this-pass (+ this-pass n))
+                      (setq fails (+ fails 1))))))
             (setq installed (+ installed this-pass) failed fails pass (+ pass 1))
             (when (or (= this-pass 0) (>= pass 8)) (return nil))))
         (when (> installed 0) (%jit-retry-drain))
         (list installed modules failed))))
+
+;;; ---------------------------------------------------------------------------
+;;; HOT-FUNCTION JIT.  *JIT-HOT-ONLY* decides per TOPLEVEL FORM, and a DEFUN is
+;;; a form that runs once, so a library's functions stayed interpreted however
+;;; often they were called: natrium's own test suite is one (RUN-ALL) form and
+;;; ran past 30 minutes on modus, against minutes after a JIT-EAGER.  JIT-EAGER
+;;; is the AOT tool (iOS, a core about to be saved); this is the automatic one.
+;;;
+;;; Each runtime DEFUN's trampoline counts its calls and the time they spend
+;;; interpreted.  At *JIT-HOT-CALLS* calls, or %JIT-HOT-NS of interpreted time,
+;;; it builds the function's registered module -- after the not-yet-native DEFUNs
+;;; that module calls, depth first, so its calls link to native code rather
+;;; than through late-bound bridges -- with exactly JIT-EAGER's machinery
+;;; (%JIT-BUILD-MODULE).  Publishing updates the symbol-function table entry in
+;;; place, which every caller reads at call time (the interpreter's stub cells,
+;;; the x64 bridge thunks), so callers go native without being rebuilt; a
+;;; caller still holding the trampoline object itself is forwarded.
+;;;
+;;; WHAT COUNTS: calls that reach the trampoline, i.e. from outside the
+;;; function's own module.  A self-recursive call is a call inside its own
+;;; bytecode, so one deep (FIB 30) stays interpreted to the end -- there is no
+;;; on-stack replacement either -- and so does a single call that loops for a
+;;; long time.  The next outside call after promotion runs native -- and the
+;;; time budget makes that the call after the first expensive one.
+
+(defvar *jit-hot-calls* nil
+  "Calls an interpreted runtime DEFUN takes before it is compiled native, with
+   the interpreted DEFUNs it calls.  NIL = 64.  0 = never: DEFUNs interpret
+   until JIT-EAGER.  Read when a DEFUN is installed.")
+(defvar *jit-hot-promoted* nil "CENSUS: modules built by a hot DEFUN (callees included).")
+(defvar *jit-hot-failed* nil "CENSUS: those whose page did not build (they stay interpreted).")
+(defvar *jit-hot-busy* nil "T while a hot build runs: a trampoline firing inside it waits.")
+
+(defun %jit-hot-call-threshold ()
+  (let ((v (handler-case *jit-hot-calls* (error (c) nil))))
+    (if (integerp v) v 64)))
+
+(defun %jit-hot-ns ()
+  "Interpreted time (ns) after which a DEFUN is built regardless of its call
+   count: about what translating a module costs, so a function past it has
+   already paid for its own compilation.  A target with no clock reads 0
+   from %IRT-NS throughout and is promoted by count alone."
+  10000000)
+
+(defun %jit-module-callees (m)
+  "Names registered module M calls out of module: its runtime table's stubs."
+  (let ((rt (car (cddddr m))) (out nil))
+    (when rt
+      (maphash (lambda (k v) (when (stringp v) (setq out (cons v out)))) rt))
+    out))
+
+(defun %jit-hot-build (name skips seen)
+  "Build NAME's module, its interpreted callees' modules first.  SEEN is
+   (VISITED-BYTECODES . BUDGET): each module is visited once, and at most
+   BUDGET are built, which bounds the pause one hot call can cause."
+  (let ((m (and *jit-module-registry* (gethash name *jit-module-registry*))))
+    (when (and m (> (cdr seen) 0)
+               (not (%jit-skip-name-p name skips))
+               (not (%jit-fn-native-p name))
+               (not (member (car m) (car seen) :test (function eq)))
+               (not (member (car m) *jit-eager-built* :test (function eq))))
+      (setf (car seen) (cons (car m) (car seen)))
+      (setf (cdr seen) (- (cdr seen) 1))
+      (dolist (c (%jit-module-callees m))
+        (%jit-hot-build c skips seen))
+      (if (%jit-build-module m (or *jit-native-defun-count* 0))
+          (setq *jit-hot-promoted* (if *jit-hot-promoted* (+ 1 *jit-hot-promoted*) 1))
+          (setq *jit-hot-failed* (if *jit-hot-failed* (+ 1 *jit-hot-failed*) 1))))))
+
+(defun %jit-hot-promote (name)
+  "NAME's trampoline reached its threshold.  NAME's native function once built;
+   :RETRY when this is not the moment (the JIT inhibited, a worker thread -- a
+   build records into region-0 tables -- or a build already running); NIL when
+   NAME stays interpreted (no JIT, skip-listed, or its page would not build)."
+  (cond ((not (%jit-enabled-p)) nil)
+        ((or (not (%jit-active-p)) (not (%mvm-on-main-thread-p)) *jit-hot-busy*) :retry)
+        (t (let ((before (or *jit-native-defun-count* 0)))
+             (setq *jit-hot-busy* t)
+             (unwind-protect
+                  (%jit-hot-build name (%jit-skip-list) (cons nil 64))
+               (setq *jit-hot-busy* nil))
+             (when (> (or *jit-native-defun-count* 0) before) (%jit-retry-drain)))
+           (let ((fn (%mvm-resolve-runtime-fn name)))
+             (if (and fn (eql (logand (%val->word fn) 15) 3)) fn nil)))))
+
+(defun %mvm-make-defun-trampoline (name bc ftab rt offset lam-offsets)
+  "The interpreter trampoline for runtime DEFUN NAME (%MVM-MAKE-TRAMPOLINE),
+   counting toward the hot-function JIT: NAME is built after *JIT-HOT-CALLS*
+   calls, or as soon as its calls have spent %JIT-HOT-NS interpreted, so a
+   function that is called rarely but works hard (natrium's SHA256 is the whole
+   compression loop in one DEFUN: 1.7 s a call interpreted) goes native after
+   its first expensive call rather than its 64th.  Once NAME is native, a
+   caller still holding this object is forwarded to the native code.
+   Multiple values pass through either way."
+  (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets))
+        (left (%jit-hot-call-threshold))
+        (spent 0)
+        (fwd nil))
+    (lambda (&rest args)
+      (if (or fwd (<= left 0))
+          (values-list (multiple-value-list (apply (or fwd inner) args)))
+          (let* ((t0 (%irt-ns))
+                 (vals (multiple-value-list (apply inner args))))
+            (setq left (- left 1))
+            (setq spent (+ spent (- (%irt-ns) t0)))
+            (when (or (= left 0) (> spent (%jit-hot-ns)))
+              (let ((r (%jit-hot-promote name)))
+                (if (eq r :retry)
+                    (setq left (%jit-hot-call-threshold) spent 0)
+                    (setq left 0 fwd r))))
+            (values-list vals))))))
 
 (defun %init-modus-package ()
   "Bind the MODUS package's generic runtime functions.  Called from kernel-main
@@ -3494,10 +3683,10 @@
           ;; compiled native later without re-evaluating anything.
           (%jit-register-module persist-names bc entry ft-list
                                 fn-table rt-table lam-offsets)
-          (let ((tramp (%mvm-make-trampoline
-                         bc fn-table rt-table
+          (let ((tramp (%mvm-make-defun-trampoline
+                         pn bc fn-table rt-table
                          (cadr e)
-                         nil lam-offsets)))
+                         lam-offsets)))
             ;; puthash signature is (KEY HT VALUE) — store the
             ;; trampoline as the VALUE under PN / its name-hash.  (The
             ;; earlier `(puthash pn tramp <table>)` had HT and VALUE

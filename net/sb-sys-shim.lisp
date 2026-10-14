@@ -832,3 +832,27 @@
 ;;; THE FEATURES
 ;;; ============================================================
 (pushnew :sb-bsd-sockets *features*)
+
+;;; ---- SB-DEBUG: backtraces ---------------------------------------------------------
+;;;
+;;; The frame chain, named (net/hosted-backtrace.lisp).  Called from a HANDLER-BIND handler
+;;; it shows the stack at the error, as on SBCL:
+;;;   (handler-bind ((error (lambda (c) (sb-debug:print-backtrace :count 20)))) ...)
+;;; An image without the walker (not hosted x86-64) prints nothing rather than failing.
+
+(unless (find-package "SB-DEBUG") (make-package "SB-DEBUG" :use nil))
+
+(defun sb-debug::list-backtrace (&key (count 60) &allow-other-keys)
+  (if (fboundp '%backtrace-list) (%backtrace-list count) nil))
+
+(defun sb-debug::print-backtrace (&key (stream *error-output*) (count 60) &allow-other-keys)
+  (when (fboundp '%print-backtrace) (%print-backtrace stream count))
+  nil)
+
+(defun modus::backtrace (&optional (stream *error-output*) (count 60))
+  "Print the stack -- each frame as NAME+OFFSET for code in the image, JIT@ADDR for code
+   compiled at run time -- innermost first."
+  (sb-debug::print-backtrace :stream stream :count count))
+
+(export (list (intern "PRINT-BACKTRACE" "SB-DEBUG") (intern "LIST-BACKTRACE" "SB-DEBUG")) "SB-DEBUG")
+(export (list (intern "BACKTRACE" "MODUS")) "MODUS")

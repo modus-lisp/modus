@@ -7550,13 +7550,13 @@
           (a64-cmp-reg buf +a64-x26+ +a64-x9+)))
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i cdone :bcond))
     ;; cons-kind check for cursor: conskind base @0x10000E40 (<<1)
-    (a64-load-real-addr buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0) (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-mov-reg buf +a64-x10+ +a64-x7+)
     (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)  ; cursor - page_base
     (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x12+ 0 0) ; byte addr
     (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)              ; granule
-    (a64-movz buf +a64-x13+ 7 0) (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x13+) ; bit idx
+    (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x5+) ; bit idx
     (a64-ldrb buf +a64-x14+ +a64-x12+)
-    (a64-movz buf +a64-x15+ 1 0) (a64-lslv buf +a64-x15+ +a64-x15+ +a64-x11+)  ; mask
+    (a64-lslv buf +a64-x15+ +a64-x6+ +a64-x11+)  ; mask
     (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)     ; TST
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i is-cons :bcond)) ; set → cons
     ;; headered object
@@ -7592,8 +7592,17 @@
     (a64-set-label buf sloop)
     (a64-cmp-reg buf +a64-x23+ +a64-x26+)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone2 :bcond))
-    (a64-mov-reg buf +a64-x9+ +a64-x23+)
-    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    ;; Only a word tagged 1 or 9 -- (word & 7) = 1 -- can be a pointer; anything else
+    ;; (fixnums, characters, raw data) is decided here, not in a BL/RET to scan_word
+    ;; per word, which was most of a collection: 16 ns a fixnum slot on a Pi Zero.
+    (let ((skip (incf *mvm-label-counter*)))
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x23+ 0)
+      (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+      (a64-cmp-imm buf +a64-x11+ 1)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+      (a64-mov-reg buf +a64-x9+ +a64-x23+)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-set-label buf skip))
     (a64-add-imm buf +a64-x23+ +a64-x23+ 8)
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
     (a64-set-label buf sdone2)
@@ -7602,10 +7611,15 @@
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
     ;; cons: scan car @cursor, cdr @cursor+8
     (a64-set-label buf is-cons)
-    (a64-mov-reg buf +a64-x9+ +a64-x26+)
-    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
-    (a64-add-imm buf +a64-x9+ +a64-x26+ 8)
-    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (dolist (off '(0 8))                                 ; car, cdr: the same inline tag test
+      (let ((skip (incf *mvm-label-counter*)))
+        (a64-ldr-unsigned buf +a64-x10+ +a64-x26+ off)
+        (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+        (a64-cmp-imm buf +a64-x11+ 1)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+        (a64-add-imm buf +a64-x9+ +a64-x26+ off)
+        (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+        (a64-set-label buf skip)))
     (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
     (a64-set-label buf cdone)))
@@ -7674,9 +7688,9 @@
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7)
       (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)  ; byte addr
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)              ; granule
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+) ; bit idx
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+) ; bit idx
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)    ; mask=1<<bit
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)    ; mask=1<<bit
       (a64-ands-reg buf +a64-xzr+ +a64-x15+ +a64-x16+)     ; TST byte & mask
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sret :bcond)) ; obj-start bit clear → skip
       ;; ---- CONS-KIND cross-check (x64-parity: emit-mcgc-cons-kind-or-jump) ----
@@ -7689,13 +7703,13 @@
       ;; read as a header → astronomical count → the copy loop runs off the mapped
       ;; heap → SIGSEGV (WS4-AA64 #160 root cause).  conskind base @0x10000E40 (<<1);
       ;; scratch x13..x17; preserves x9(word-addr)/x10(value)/x11(tag)/x12(raw).
-      (a64-load-real-addr buf +a64-x14+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x14+ +a64-x14+ 0) (a64-asr-imm buf +a64-x14+ +a64-x14+ 1)
+      (a64-mov-reg buf +a64-x14+ +a64-x7+)
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)          ; raw - page_base
       (a64-lsr-imm buf +a64-x15+ +a64-x13+ 7) (a64-add-reg buf +a64-x15+ +a64-x14+ +a64-x15+ 0 0) ; x15 = conskind byte addr
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)                      ; granule
-      (a64-movz buf +a64-x16+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x16+)  ; x13 = bit idx
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)  ; x13 = bit idx
       (a64-ldrb buf +a64-x16+ +a64-x15+)                           ; x16 = conskind byte
-      (a64-movz buf +a64-x17+ 1 0) (a64-lslv buf +a64-x17+ +a64-x17+ +a64-x13+)     ; x17 = mask = 1<<bit
+      (a64-lslv buf +a64-x17+ +a64-x6+ +a64-x13+)     ; x17 = mask = 1<<bit
       (let ((ck-tag1 (incf *mvm-label-counter*)) (ck-done (incf *mvm-label-counter*)))
         (a64-cmp-imm buf +a64-x11+ 1)                              ; tag == 1 (cons)?
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i ck-tag1 :bcond))
@@ -7761,10 +7775,9 @@
       (a64-set-label buf oloop)
       (a64-cmp-reg buf +a64-x16+ +a64-x9+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i odone :bcond))
-      (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)
-      (a64-str-unsigned buf +a64-x17+ +a64-x21+ 0)
-      (a64-add-imm buf +a64-x16+ +a64-x16+ 8)
-      (a64-add-imm buf +a64-x21+ +a64-x21+ 8)
+      ;; 16 bytes a step: every object is 16-aligned and a multiple of 16 long
+      (a64-ldp-post buf +a64-x15+ +a64-x17+ +a64-x16+ 16)                ; LDP x15,x17,[x16],#16
+      (a64-emit buf (logior #xA8800000 (ash 2 15) (ash +a64-x17+ 10) (ash +a64-x21+ 5) +a64-x15+)) ; STP x15,x17,[x21],#16
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i oloop :b))
       (a64-set-label buf odone)
       (a64-add-imm buf +a64-x17+ +a64-x12+ 15) (a64-str-unsigned buf +a64-x17+ +a64-x11+ 0) ; fwd ptr
@@ -7773,9 +7786,9 @@
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
       ;; ---- cons: 16 bytes ----
@@ -7789,21 +7802,21 @@
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
       ;; ALSO set the CONS-KIND bit for dest (x12) so the type-aware to-space
       ;; scan classifies this copy as a cons.  conskind base @0x10000E40 (<<1).
       ;; NB: x10 holds the RETURN value (dest|1) — must NOT clobber it; use x9
       ;; for the base and x13..x17 for the bit math.
-      (a64-load-real-addr buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0) (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
+      (a64-mov-reg buf +a64-x9+ +a64-x7+)
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x9+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
       (a64-add-imm buf +a64-x21+ +a64-x21+ 16)           ; advance free_ptr
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
@@ -7887,6 +7900,15 @@
       (load-fld +a64-x23+ +gc-off-stack-base+)          ; stack_base
       (load-abs +a64-x27+ #x10000E00)                   ; page_base
       (load-abs +a64-x28+ #x10000E18))                  ; obj-bitmap base
+    ;; Constants of the bitmap math for the whole collection, in registers the entry
+    ;; saved (x0-x17 are restored at exit; x0/x8 are left alone, the STW park's
+    ;; sched_yield clobbers them): x5 = 7, x6 = 1, x7 = cons-kind bitmap base.  They
+    ;; were rebuilt -- and the base RELOADED from 0x10000E40 -- per word and object.
+    (a64-movz buf +a64-x5+ 7 0)
+    (a64-movz buf +a64-x6+ 1 0)
+    (a64-load-real-addr buf +a64-x7+ (conv-real #x10000E40))
+    (a64-ldr-unsigned buf +a64-x7+ +a64-x7+ 0)
+    (a64-asr-imm buf +a64-x7+ +a64-x7+ 1)
     (emit-aarch64-stw-own-window-top buf)
     (a64-tramp-mark 4)
     ;; ---- scan THIS REGION'S ROOT WINDOW: [x26, stack_base) ----

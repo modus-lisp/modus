@@ -102,7 +102,7 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")))
+    (mvm-text "mvm/ansi-test-aux.lisp")))
 ;; WS3 STEP 4b (2026-07-09): mvm/tree-walker.lisp is NO LONGER part of this
 ;; image — production eval is mvm-eval only.  The full-corpus + gauntlet census
 ;; measured ZERO %e2ic walker-fallback hits (the earlier "-142 fallback
@@ -1174,7 +1174,7 @@
          ;; Plain (non-adjustable, no fill-pointer, no displaced) make-array
          ;; with :initial-element or :initial-contents.  Generate a single
          ;; runtime call to %make-array-fill-* helpers (defined in
-         ;; ansi-bridge.lisp) instead of per-element asets — this keeps
+         ;; cl-sequences.lisp) instead of per-element asets — this keeps
          ;; the per-test source small enough that it doesn't push the
          ;; enclosing run-ansi-XXX function past the size threshold that
          ;; flips unrelated tests.
@@ -3690,7 +3690,7 @@
                  '(%defclass %register-clos-slot-info %register-clos-direct-slots
                    %register-clos-class-slots %register-clos-default-initargs
                    ;; %defmethod-meta is what the defmethod rewriter emits;
-                   ;; %defmethod stays listed because ansi-bridge and hand-
+                   ;; %defmethod stays listed because the runtime and hand-
                    ;; written probe source still call it directly.
                    %defgeneric %defmethod %defmethod-meta
                    %define-condition %defpackage-impl
@@ -3847,7 +3847,7 @@
               ;;(setf forms (mapcar-safe #'rewrite-make-array-dims forms))
               (setf forms (mapcar-safe #'rewrite-eval-quote forms))
               ;; rewrite-make-array-initcontents RETIRED (Phase 4): runtime
-              ;; make-array in ansi-bridge.lisp now handles :initial-contents,
+              ;; make-array in cl-sequences.lisp now handles :initial-contents,
               ;; :initial-element, :fill-pointer, :adjustable, :displaced-to,
               ;; :element-type via native MDA storage.
               ;;(setf forms (mapcar-safe #'rewrite-make-array-initcontents forms))
@@ -4556,7 +4556,7 @@
     ;; whole file was skipped and DEF-FOLD-TEST & co. never existed on the
     ;; host: ~240 tests (list.fold, remove, count, find, ...) emitted as bare
     ;; macro calls.  Emission is deliberately unchanged: the image's copies of
-    ;; these helpers come from ansi-bridge.lisp.
+    ;; these helpers come from ansi-test-aux.lisp.
     (with-open-file (s path :direction :input)
       (let ((*package* (find-package :cl-user)) (*read-eval* t))
         (loop

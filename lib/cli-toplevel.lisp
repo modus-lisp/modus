@@ -85,8 +85,10 @@
    the raw bits into a fixnum whose machine word IS those bits, so the Lisp
    value = raw>>1).  Double it to recover the real RSP, then +8 past argc.
    The result is the REAL byte address, which is exactly what mem-ref's
-   address operand wants (mem-ref SHRs the tagged machine word back)."
-  (+ (* 2 (%gc-stack-base)) 8))
+   address operand wants (mem-ref SHRs the tagged machine word back).
+   Region 0's base, not the active region's: in an actor the active region
+   is the actor's, and getenv from an actor walked its stack as envp."
+  (+ (* 2 (%gc-stack-base-0)) 8))
 
 (defun %cli-collect-argv ()
   "Return the process arguments as a list of strings — element 0 is the
@@ -174,7 +176,7 @@
    aborts the load at the first error and exits nonzero; before this, a broken
    file loaded 'successfully' and `--script' always exited 0, so a failing load
    was indistinguishable from a working one except by reading the diagnostic
-   line.  Opt into the abort (see *LOAD-ABORT-ON-ERROR* in mvm/ansi-bridge.lisp)
+   line.  Opt into the abort (see *LOAD-ABORT-ON-ERROR* in mvm/cl-eval.lisp)
    and re-signal, so the caller's handler-case does the SBCL thing: report and
    exit 1 non-interactively.  The specific condition has already been printed
    loudly by %report-escaping-condition at the point it escaped."

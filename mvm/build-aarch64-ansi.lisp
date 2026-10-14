@@ -1026,7 +1026,7 @@
   ;; access 8-byte slots at raw+16+idx*8.  So every array mvm-eval allocated had a
   ;; bogus length and a too-small payload, corrupting the compiler's constant/
   ;; bytecode buffers: mvm-eval threw even on (+ 1 2) (E2SMOKE add=-1), so
-  ;; (demo:sq 7) could never run.  Stripping these lets ansi-bridge's full
+  ;; (demo:sq 7) could never run.  Stripping these lets cl-sequences' full
   ;; (make-array dim &rest kwargs) and cl-eval's full numberp win.  The legacy
   ;; aref/aset/array-length are NOT stripped — they have no full-CL defun
   ;; counterpart (those are compile-time primops), so they collide with nothing;
@@ -1395,7 +1395,7 @@
   (setq *gensym-counter* 0)
   (setq *gentemp-counter* 0)
 
-  ;; Float constants from ansi-bridge — defvars don't run their init
+  ;; Float constants from cl-types.lisp — defvars don't run their init
   ;; thunks (per CLAUDE.md), so without these explicit setqs every
   ;; *-float-epsilon resolves to NIL at runtime, and the first ANSI
   ;; test that funcalls DECODE-FLOAT on one of them used to loop
@@ -1487,7 +1487,7 @@
 
   ;; Character-set constants from ansi-aux.lsp (skipped at load time).
   ;; defvar init-thunks don't run at boot.  Done in a helper in
-  ;; ansi-bridge.lisp (%init-standard-chars) so the literal strings —
+  ;; ansi-test-aux.lisp (%init-standard-chars) so the literal strings —
   ;; which contain double-quotes, backslashes and a newline — live in a
   ;; real source file rather than inside this driver-source string (where
   ;; they would need triple-level escaping and broke the SBCL reader).
@@ -1782,7 +1782,7 @@
 ;; printer-control variables (*print-base* random 2-35, *print-circle*,
 ;; *print-readably*, etc.) and depends on full printer/reader
 ;; round-trip — Modus's printer doesn't honor most.  Restore the
-;; t-stub from ansi-bridge.lisp:1975 to win against printer-aux.lsp.
+;; t-stub from ansi-test-aux.lisp to win against printer-aux.lsp.
 (defun randomly-check-readability (obj &rest args)
   (declare (ignore obj args))
   nil)

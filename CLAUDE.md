@@ -90,7 +90,7 @@ mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   cl-clos.lisp         429L  CLOS (defclass, defgeneric, defmethod, dispatch)
   cl-eval.lisp       3,575L  Eval/compile/load (mvm-eval), symbol-function table
   cl-types.lisp        519L  typep, coerce, numeric helpers
-  ansi-bridge.lisp   1,888L  Test helpers (eqlt, scaffold, stubs)
+  ansi-test-aux.lisp         ANSI-test helpers (eqlt, scaffold, structures-03 stand-ins)
   gc.lisp                    GC helper functions (Lisp-side)
   mvm-eval.lisp                 Production eval: compile→MVM bytecode→interpret
   interp.lisp                MVM bytecode interpreter (in-image)
@@ -267,6 +267,63 @@ Key fixes en route: call-relocation untag (5b866fa), out-of-module GC-trampoline
 `(ldb (byte 32 32) bignum)` high-word extract was broken by limitation #8; now
 `(logand …)` + `(ash (floor V 2^31) -1)`).  Next: port the JIT to aarch64; then
 back to Quicklisp.
+
+### Hot-function JIT: a runtime DEFUN goes native on its own (2026-10-14)
+
+`*jit-hot-only*` decides per TOPLEVEL FORM, and a DEFUN runs once, so a DEFUN
+from `load` of a source file, a `--script`, `eval` or the REPL stayed an
+interpreter trampoline forever unless something called `jit-eager`.  (ASDF
+loads were already native: `compile-file` and the FASL cache build them.)  Now
+each DEFUN's trampoline counts: after `*jit-hot-calls*` calls (NIL = 64, 0 =
+off) or 10 ms spent interpreted, its module is built -- after its
+still-interpreted callees, so the calls link straight to native code -- with
+`jit-eager`'s own `%jit-build-module`.  Only calls that reach the trampoline
+count; a self-call inside the function's bytecode does not, and there is no
+on-stack replacement, so a single long call finishes interpreted and the NEXT
+call is native.  Measured on x64: a script's helper loop 20.5 s -> 66 ms;
+natrium loaded with `load`: 50 x SHA-256(4K) 84 s -> 2.0 s, 50 x HMAC 200 s ->
+0.6 s; load time unchanged.  `test/hot-jit.lisp` (20 checks, x64 + aarch64).
+
+**x64 LINKAGE STUBS came with it**, because a native caller BAKED its callee's
+address: with DEFUNs going native by default, redefining a hot function would
+have been invisible to its already-native callers.  A native call to a runtime
+DEFUN now goes through a per-name 16-byte stub (`jmp [rip+2]` + target word)
+that every (re)definition retargets -- aarch64's linkage cells, without a
+translator change.  `test/redefine-native-callers.lisp`, which x64 had FAILED
+since it was written, passes; the stubs survive save-and-die.
+
+### Redefining an IMAGE function reaches the image's own callers (2026-10-14)
+
+Image functions call each other with a direct CALL / BL, so a runtime DEFUN or
+`(setf fdefinition)` of one used to reach only late-bound callers (REPL,
+FUNCALL, JIT code) -- a fix typed at a board's REPL did nothing to the driver
+code calling it.  Now every image function has a **16-byte CALL PAD** in front
+of it: direct calls land on the pad and fall through, while the function OBJECT
+(`#'NAME`, the symbol-function table) is the address 16 bytes on.  A name's
+first redefinition rewrites its pad into a jump to the name's late-binding
+entry (x64: its linkage stub; aarch64: its `#'NAME` thunk), so every direct
+caller sees the new definition, interpreted or native, and a caller holding the
+OLD object still runs the old code (advice works; so does putting it back).
+Cost: nothing per call until redefined; +378 KB native on x64; startup
+unchanged.  `test/redefine-kernel-callers.lisp` (x64 + aarch64; main fails 5).
+
+Three things that are easy to get wrong:
+- **PRE-PACKED &REST.**  A kernel caller of an `&rest`/`&key` function with no
+  `&optional` conses the rest list itself and passes nargs = 255; only the
+  callee knows how many required arguments precede the list.  The translator
+  writes that count into the pad (`*fn-prepack-req*`, cross.lisp) and such
+  pads go through `%KREST-0..3`, which are compiled with the same shape.  Six
+  functions take more than 3 (MERGE, ENCODE-UNIVERSAL-TIME, ...): redefining
+  one leaves its kernel callers early-bound and prints a note.  Without this,
+  `trivial-gray-streams`' CLOSE wrapper broke LOAD (md5/salza2 on the ladder).
+- **A saved core does not carry kernel code**, so the restore sequence in
+  `build-cli-common` calls `%KERNEL-REDIRECTS-REAPPLY` -- not
+  `%CORE-POST-RESTORE`, which net/hosted-ssh.lisp REPLACES by last-defun-wins
+  (it also drops save-image's `MODUS_NO_RUNTIME_JIT` check: pre-existing).
+- **Kernel names are CL-USER names.**  A script's CL-USER `(defun fe-sq ...)`
+  now replaces the kernel's own FE-SQ for its kernel callers too -- the same
+  rule that makes a REPL fix work.  A defun in a library's own package is keyed
+  `PKG::NAME` and touches nothing.
 
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 
@@ -2284,7 +2341,7 @@ mechanism:
    `make-string` inside one compiled function -> main's 16 MB region collects
    -> death in the LOAD machinery (`load-read-error-stops-load` /
    `load-toplevel-form-swallowed`, TYPE-ERROR): the load loop
-   (`%load-from-stream`, mvm/ansi-bridge.lisp) reads and evals on main, and
+   (`%load-from-stream`, mvm/cl-eval.lisp) reads and evals on main, and
    the pre-hop stream/table structures in region 0 hold pointers into main's
    region that the collection never fixes — `EMIT-GC-TRAMPOLINE` scans the
    fixed tables' ROOT SLOTS and Cheney-walks only the collecting region's
@@ -2999,7 +3056,7 @@ call-counter branch on every call regardless of the syscall.  And syscall 201 is
 which made every `(- after before)` zero.
 
 Both now go through a seam — `%IRT-NS` / `%IRUN-NS`, defined at 0 in
-`mvm/ansi-bridge.lisp` ("this target has no clock") and overridden by
+`mvm/cl-fileio.lisp` ("this target has no clock") and overridden by
 last-defun-wins in `net/hosted-sync.lisp`, which is where `clock_gettime(2)` can
 be called at all because it owns the **per-CPU** timespec scratch (a shared
 timespec is two threads writing one buffer).  Real time is CLOCK_MONOTONIC, run

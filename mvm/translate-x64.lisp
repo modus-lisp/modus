@@ -1049,6 +1049,12 @@
         assemble-kernel-image and must keep the baked form).
    NIL host-side for a JIT-off build, so those images are byte-identical.")
 
+(defvar *x64-no-call-pad* nil
+  "NIL (the default -- NIL so a self-hosted compiler, whose non-NIL defvar
+   inits may not run, agrees with the host): emit a 16-byte call pad before every image function (see the pad in
+   TRANSLATE-MVM-TO-X64): direct calls enter there, function objects 16
+   bytes on, and a run-time redefinition patches the pad.")
+
 (defvar *x64-jit-mode* nil
   "WS4 STAGE 3.  When non-nil (set ONLY by the in-image runtime JIT driver
    around a translate-mvm-to-x64 call), op-call emits an absolute indirect
@@ -1385,6 +1391,9 @@
   (position-labels (make-hash-table :test 'eql))
   ;; Function table: function-index → native code label
   (function-table nil)
+  ;; Bytecode offset → the label of the function OBJECT, when it differs from
+  ;; the call label (the call pad, see TRANSLATE-MVM-TO-X64); nil = the same.
+  (entry-table nil)
   ;; GC helper label (one per translated unit)
   (gc-label nil)
   ;; Handler-stack helper labels (one per translated unit). The push helper
@@ -5596,7 +5605,9 @@
          (let* ((vd (first operands))
                 (target-offset (second operands))
                 (fn-table (translate-state-function-table state))
-                (label (when fn-table (gethash target-offset fn-table)))
+                (label (or (let ((et (translate-state-entry-table state)))
+                             (when et (gethash target-offset et)))
+                           (when fn-table (gethash target-offset fn-table))))
                 (d (dest-phys-or-scratch vd)))
            (cond
              (label
@@ -9752,6 +9763,10 @@
          (fn-map (make-hash-table :test 'equal))
          ;; Map bytecode-offset → native label for CALL resolution
          (fn-offset-to-label (make-hash-table :test 'eql))
+         ;; ... and → the function OBJECT's label, past the call pad
+         (call-pad (and (not *x64-no-call-pad*) (not *x64-jit-mode*)))
+         (fn-offset-to-entry (when call-pad (make-hash-table :test 'eql)))
+         (fn-entry-labels (when call-pad (make-array n-functions)))
          ;; GC trampoline label (pre-allocated so all translate-states can use it)
          (gc-trampoline-label (when *x64-gc-enabled* (make-label)))
          ;; MCGC stage-4 page-collector trampoline label (only when pinning on).
@@ -9784,10 +9799,14 @@
           for entry in function-table
           for name = (first entry)
           for offset = (second entry)
-          do (let ((label (make-label)))
+          do (let ((label (make-label))
+                   (entry (if call-pad (make-label) nil)))
                (setf (aref fn-labels i) label)
-               (setf (gethash name fn-map) label)
-               (setf (gethash offset fn-offset-to-label) label)))
+               (setf (gethash name fn-map) (or entry label))
+               (setf (gethash offset fn-offset-to-label) label)
+               (when call-pad
+                 (setf (aref fn-entry-labels i) entry)
+                 (setf (gethash offset fn-offset-to-entry) entry))))
     (setf *x64-genmul-label*
           (loop for entry in function-table
                 when (string-equal (first entry) "GENERIC-MULTIPLY")
@@ -9821,6 +9840,7 @@
                               :mvm-length length
                               :mvm-offset offset
                               :function-table fn-offset-to-label
+                              :entry-table fn-offset-to-entry
                               :gc-label gc-trampoline-label
                               :handler-push-label handler-push-lbl
                               :handler-pop-label handler-pop-lbl
@@ -9845,6 +9865,28 @@
                  ;; Emit function label
                  (handler-case (emit-label buf fn-label)
                    (error (c) (error "SETUP-emit-label fn ~D '~A' pos ~D: ~A" i name (code-buffer-position buf) c)))
+                 ;; THE CALL PAD.  CALL/JMP land on FN-LABEL; the function
+                 ;; OBJECT (fn-map, LI-FUNC) is the entry label 16 bytes on,
+                 ;; past two inert 8-byte NOPs.  Redefining an image function
+                 ;; at run time rewrites only these 16 bytes, into a jump to
+                 ;; NAME's late-binding stub (%KERNEL-REDIRECT, mvm-eval), so
+                 ;; every direct caller sees the new definition while a caller
+                 ;; holding the OLD object still runs the old code.  The NOPs'
+                 ;; disp32 spells KPAD so the patcher can tell a pad from
+                 ;; alignment padding (single-byte 90s).
+                 ;; The second NOP's disp32 is "KR<n>D" instead when callers
+                 ;; may pre-pack this function's &rest list after N required
+                 ;; arguments (modus.mvm::*fn-prepack-req*).
+                 (when call-pad
+                   (let ((pre (and modus.mvm::*fn-prepack-req*
+                                   (gethash offset modus.mvm::*fn-prepack-req*))))
+                     (dolist (b '(#x0F #x1F #x84 #x00 #x4B #x50 #x41 #x44))
+                       (emit-byte buf b))
+                     (dolist (b (if (and pre (< pre 256))
+                                    (list #x0F #x1F #x84 #x00 #x4B #x52 pre #x44)
+                                    '(#x0F #x1F #x84 #x00 #x4B #x50 #x41 #x44)))
+                       (emit-byte buf b)))
+                   (emit-label buf (aref fn-entry-labels i)))
                  ;; Emit prologue
                  (handler-case (emit-function-prologue
                                 buf (if (zerop length)

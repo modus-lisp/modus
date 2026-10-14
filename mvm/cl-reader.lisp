@@ -1324,10 +1324,16 @@
                  (return (if (and (not tail) dotted) cdr-val
                              (progn (when tail (set-cdr tail cdr-val)) result)))))
               (t
-               ;; Dot followed by constituent — it's part of a symbol/number
+               ;; Dot followed by constituent — it's part of a symbol/number.
+               ;; ONE unread, and the dot handed over as the token's first
+               ;; char: unreading both is two unreads in a row, which CLHS
+               ;; does not allow and a string input stream here does not
+               ;; honour, so (read-from-string "(a .5)") signalled
+               ;; READER-ERROR -- every LOAD through the fasl cache, which
+               ;; reads the file's text with READ-FROM-STRING, died on
+               ;; ANSI typep.lsp's (&optional (prob .5)).
                (unread-char next stream)
-               (unread-char ch stream)
-               (let ((obj (%read-internal stream t nil t)))
+               (let ((obj (%read-as-token ch stream rt)))
                  (when (and (not *read-suppress*)
                             (not (eq obj *rdr-no-value*)))
                    (let ((new-cons (list obj)))
@@ -2281,10 +2287,6 @@
 
 ;;; --- Make-symbol (uninterned) ---
 
-(defun make-symbol (name)
-  "Create an uninterned symbol with NAME."
-  (let ((sym (%make-cl-symbol (%pkg-string-designator name))))
-    sym))
 
 ;;; --- with-standard-io-syntax support ---
 ;;; This is a function that evaluates a thunk with standard I/O bindings.
@@ -2326,3 +2328,111 @@
 ;; The reader-stub here unconditionally errored, shadowing the real defun
 ;; only if the load order ever flipped — keep the comment so future
 ;; refactors don't re-introduce a stub.
+
+
+;;; ============================================================
+;;; parse-integer — parse an integer from a string
+;;; ============================================================
+(defun parse-integer (string &rest args)
+  "Parse an integer from STRING. Supports :start :end :radix :junk-allowed.
+   Returns (values integer end-position).  Signals error on:
+   - odd-length keyword arg list
+   - unknown keyword (unless :allow-other-keys T)
+   - empty / whitespace-only string (when :junk-allowed NIL)
+   - sign-only string '+', '-' (no digits)
+   - trailing non-digit / non-whitespace junk (when :junk-allowed NIL)"
+  (let ((start 0)
+        (end nil)
+        (radix 10)
+        (junk-allowed nil)
+        (allow-other nil)
+        (a args))
+    ;; Pre-scan :allow-other-keys
+    (let ((scan args))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (and (eq (car scan) :allow-other-keys) (cadr scan))
+          (setq allow-other t))
+        (setq scan (cddr scan))))
+    ;; Parse keyword args with validation.  CLHS 7.1.1: for repeated
+    ;; keywords the LEFTMOST value is used (parse-integer.23/.24/.35/.36),
+    ;; so a key already seen is not overwritten.
+    (let ((saw-start nil) (saw-end nil) (saw-radix nil) (saw-junk nil))
+      (loop
+        (when (null a) (return))
+        (when (null (cdr a))
+          (error "parse-integer: odd-length keyword arg list"))
+        (let ((k (car a)) (v (cadr a)))
+          (cond
+            ((eq k :start)       (unless saw-start (setq start v saw-start t)))
+            ((eq k :end)         (unless saw-end   (setq end v saw-end t)))
+            ((eq k :radix)       (unless saw-radix (setq radix v saw-radix t)))
+            ((eq k :junk-allowed)(unless saw-junk  (setq junk-allowed v saw-junk t)))
+            ((eq k :allow-other-keys) nil)
+            (allow-other nil)
+            (t (error "parse-integer: bad keyword"))))
+        (setq a (cddr a))))
+    ;; The scan below reads raw char codes with %PRIM-AREF, which is right only
+    ;; for a SIMPLE string: a fill-pointer / adjustable one is a header object
+    ;; (%MDA-P) whose own slots are not the characters, and %PRIM-STRINGP says T
+    ;; for it too.  Scan a simple copy -- LENGTH honours the fill pointer, so
+    ;; :START / :END and the returned position mean the same thing.
+    (when (%mda-p string) (setq string (coerce string 'simple-string)))
+    (let ((len (length string)))
+      (when (null end) (setq end len))
+      ;; Skip leading whitespace
+      (let ((i start))
+        (loop
+          (when (>= i end) (return))
+          ;; %prim-aref → raw char CODE (public aref returns a CHARACTER
+          ;; since e159986; this code compares against fixnum codes).
+          (let ((c (%prim-aref string i)))
+            ;; CL whitespace[2]: Space 32, Tab 9, Newline 10, Page 12, Return 13.
+            (when (and (not (= c 32)) (not (= c 9)) (not (= c 10))
+                       (not (= c 12)) (not (= c 13)))
+              (return)))
+          (setq i (+ i 1)))
+        ;; Check for sign
+        (let ((sign 1))
+          (when (< i end)
+            (let ((c (%prim-aref string i)))
+              (cond
+                ((= c 43) (setq i (+ i 1)))  ; +
+                ((= c 45) (setq sign -1) (setq i (+ i 1))))))  ; -
+          ;; Parse digits
+          (let ((result 0)
+                (digit-count 0))
+            (loop
+              (when (>= i end) (return))
+              (let* ((c (%prim-aref string i))
+                     (digit
+                      (cond
+                        ((and (>= c 48) (<= c 57)) (- c 48))   ; 0-9
+                        ((and (>= c 65) (<= c 90)) (- c 55))   ; A-Z
+                        ((and (>= c 97) (<= c 122)) (- c 87))  ; a-z
+                        (t radix))))  ; invalid → radix (too large)
+                (when (>= digit radix) (return))
+                (setq result (+ (* result radix) digit))
+                (setq digit-count (+ digit-count 1)))
+              (setq i (+ i 1)))
+            ;; Check we got at least one digit
+            (when (= digit-count 0)
+              (if junk-allowed
+                  (return-from parse-integer (values nil i))
+                  (error (make-condition 'parse-error
+                                         :format-control "parse-integer: no digits"
+                                         :format-arguments nil))))
+            ;; Check trailing chars: skip trailing whitespace, then check
+            ;; if anything non-whitespace remains.
+            (unless junk-allowed
+              (let ((j i))
+                (loop
+                  (when (>= j end) (return))
+                  (let ((c (%prim-aref string j)))
+                    (when (and (not (= c 32)) (not (= c 9)) (not (= c 10))
+                               (not (= c 12)) (not (= c 13)))
+                      (error (make-condition 'parse-error
+                                             :format-control "parse-integer: junk after digits"
+                                             :format-arguments nil))))
+                  (setq j (+ j 1)))
+                (setq i j)))
+            (values (* sign result) i)))))))

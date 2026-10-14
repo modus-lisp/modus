@@ -198,6 +198,11 @@
 (defun %gc-to-start ()     (mem-ref (+ (%gc-region) #x08) :u64))
 (defun %gc-space-size ()   (mem-ref (+ (%gc-region) #x10) :u64))
 (defun %gc-stack-base ()   (mem-ref (+ (%gc-region) #x18) :u64))
+(defun %gc-stack-base-0 ()
+  "Region 0's stack base: the PROCESS's initial stack, where argv and envp
+   live.  %GC-STACK-BASE answers for the active region, which in an actor is
+   the actor's own stack, so argv/envp walks from there read garbage."
+  (mem-ref (+ (%gc-region-0) #x18) :u64))
 (defun %gc-count ()        (mem-ref (+ (%gc-region) #x20) :u64))
 (defun %gc-epoch ()
   "A value that CHANGES at every collection of the active region and is ALWAYS
@@ -255,7 +260,7 @@
 ;;; fixnum with no shifting here.  Ticks, not nanoseconds: the collector must
 ;;; not divide (and must not allocate), so the scaling is the reader's job —
 ;;; see %GC-PAUSE-MS below, which needs (cntfrq) and therefore lives in
-;;; mvm/ansi-bridge.lisp rather than in this allocation-free file.
+;;; mvm/cl-fileio.lisp rather than in this allocation-free file.
 ;;;
 ;;; ONLY the native aarch64 trampoline writes these.  On x64/i386 the words are
 ;;; readable (the metadata window is mapped well past 0x10001000 on both) and

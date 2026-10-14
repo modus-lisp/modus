@@ -303,7 +303,7 @@
     "(defmacro locally (&rest body) (cons 'progn body))"
     "(defmacro the (type form) form)"
     "(defmacro declare (&rest decls) nil)"
-    ;; PROCLAIM is a real function (ansi-bridge.lisp): it validates the spec
+    ;; PROCLAIM is a real function (cl-eval.lisp): it validates the spec
     ;; and records INLINE / NOTINLINE.  A macro here shadowed it with NIL.
     "(defmacro declaim (&rest decls)
        ;; each spec goes through PROCLAIM, which validates it and records

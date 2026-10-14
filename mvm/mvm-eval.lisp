@@ -1099,7 +1099,7 @@
     (%jit-thunk-emit-tail addr (%jit-thunk-emit-shift addr nargs) idx nargs)
     addr))
 
-(defun %jit-make-bridge-any-thunk (name)
+(defun %jit-make-bridge-any-thunk (name &optional to)
   "x86-64 ANY-ARITY bridge thunk for a call to NAME: its address or NIL.  The
    nargs-specific thunk shifts V0..V3 up to make room for the name index, which
    cannot reach a 5th+ argument on the stack, so a site with more than 3
@@ -1108,7 +1108,7 @@
    the per-thread slot fs:[0x10000178] and jumps to %JIT-BRIDGE-ANY with every
    argument register, stack argument and the nargs slot untouched:
      mov dword fs:[0x10000178], idx ; movabs rax, bridge-any ; jmp rax"
-  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* 4096))
+  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* (%jit-bridge-cap)))
       nil
       (let ((addr (%jit-thunk-alloc)))
         (if (null addr)
@@ -1119,7 +1119,7 @@
               (%jit-emit-bytes addr (list #x64 #xC7 #x04 #x25 #x78 #x01 #x00 #x10
                                           (logand idx 255) (logand (ash idx -8) 255) 0 0))
               (%jit-emit-bytes (+ addr 12) (list #x48 #xB8))
-              (%jit-write-imm64 addr 14 (%jit-bridge-any-entry))
+              (%jit-write-imm64 addr 14 (or to (%jit-bridge-any-entry)))
               (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
               addr)))))
 
@@ -1130,6 +1130,59 @@
       nil
       (let ((addr (%jit-thunk-alloc)))
         (if (null addr) nil (%jit-thunk-fill addr name nargs)))))
+
+;;; x64 LINKAGE STUBS -- late binding for native calls to runtime DEFUNs.
+;;; A native caller bakes its callee's address (`movabs rax, imm64; call rax'),
+;;; so a callee redefined afterwards went unseen by every caller already built
+;;; (the residual %JIT-INSTALL-NATIVE-FNS documents).  aarch64 has LINKAGE
+;;; CELLS; this is x64's equivalent without a translator change: a call to a
+;;; runtime DEFUN that is native at relocation time bakes the address of a
+;;; per-name 16-byte stub instead,
+;;;     +0  FF 25 02 00 00 00   jmp qword [rip+2]
+;;;     +6  CC CC
+;;;     +8  target (raw code address, an aligned 8-byte store)
+;;; and every (re)definition rewrites the target: the new native code, or a
+;;; late-binding any-arity bridge that resolves the name at call time when the
+;;; new definition is an interpreter trampoline.  One indirect jump per call.
+;;; Needed by default once DEFUNs go native on their own (the hot-function JIT):
+;;; before that, a caller compiled while its callee was interpreted reached it
+;;; through a bridge and was late-bound anyway.  The stubs hold arena addresses
+;;; and are not moved by %JIT-AFTER-RELOCATE: x64 restores its arena at a fixed
+;;; address.
+(defvar *jit-x64-stubs* nil
+  "NAME -> (STUB-ADDRESS . ANY-BRIDGE-THUNK-or-NIL), x64 linkage stubs.")
+
+(defun %jit-x64-stub-set (stub addr)
+  ;; RAW-ADDR, as %JIT-LCELL-SET: a :u64 store writes a fixnum's TAGGED bits,
+  ;; so half the (16-aligned) address leaves exactly ADDR in the word.
+  (setf (mem-ref (+ stub 8) :u64) (ash addr -1)))
+
+(defun %jit-x64-stub (name addr)
+  "NAME's linkage stub, pointed at raw code address ADDR; NIL if no exec slot."
+  (when (null *jit-x64-stubs*)
+    (setq *jit-x64-stubs* (make-hash-table :test (function equal))))
+  (let ((e (gethash name *jit-x64-stubs*)))
+    (if e
+        (progn (%jit-x64-stub-set (car e) addr) (car e))
+        (let ((a (and (%jit-bridge-ensure) (%jit-thunk-alloc))))
+          (when a
+            (%jit-emit-bytes a (list #xFF #x25 2 0 0 0 #xCC #xCC))
+            (%jit-x64-stub-set a addr)
+            (puthash name *jit-x64-stubs* (cons a nil))
+            a)))))
+
+(defun %jit-x64-stub-retarget (name addr)
+  "NAME was (re)defined: point its stub, if it has one, at native ADDR -- or,
+   with ADDR NIL, at a bridge that resolves NAME when called."
+  (let ((e (and *jit-x64-stubs* (gethash name *jit-x64-stubs*))))
+    (when e
+      (if addr
+          (%jit-x64-stub-set (car e) addr)
+          (let ((th (or (cdr e)
+                        (let ((b (%jit-make-bridge-any-thunk name)))
+                          (when b (setf (cdr e) b))
+                          b))))
+            (when th (%jit-x64-stub-set (car e) th)))))))
 
 ;;; aarch64 bridge thunk (96-byte slot; words, I-cache flushed).  V0..V3 =
 ;;; x0..x3.  Layout:
@@ -1374,14 +1427,246 @@
             (aset g idx gen))
           f))))
 
+;;; ============================================================
+;;; REDEFINING A KERNEL FUNCTION
+;;; ============================================================
+;;; Functions compiled into the image call each other with a direct BL / CALL, so
+;;; a runtime DEFUN or (SETF FDEFINITION) of one of them reached only the callers
+;;; that look the name up -- the REPL, FUNCALL, JIT code through its linkage
+;;; cells -- and never the rest of the kernel: a fix typed at the board's REPL to
+;;; a driver function did nothing until every caller up the chain was retyped too.
+;;;
+;;; So every image function has TWO entry points (the translators' CALL PAD): a
+;;; direct call lands on 16 inert bytes that fall through into the function, and
+;;; the function OBJECT -- #'NAME, the symbol-function table -- is the address 16
+;;; bytes on.  The first redefinition of a kernel function rewrites its pad into
+;;; a jump to NAME's late-binding entry -- the #'NAME thunk (aarch64) or the
+;;; any-arity bridge thunk (x64), which resolve the current definition at call
+;;; time, interpreted or native.  Every direct caller now goes there; a caller
+;;; holding the OLD function object enters past the pad and runs the old code,
+;;; as in CL, so the advice idiom (let ((old #'f)) (setf (fdefinition 'f) ...
+;;; (apply old args))) works, and so does putting the old object back.
+;;;
+;;; The pad is written one aligned 32-bit word at a time, in an order that never
+;;; leaves a half-written instruction reachable from its first byte: first a
+;;; short jump over the pad (the fall-through, still), then the target word, then
+;;; the jump.  A thread already standing INSIDE the pad's second half while it is
+;;; written is the one window, nanoseconds wide.
+;;;
+;;; Kernel code is writable where this runs: the hosted ELF's one LOAD segment is
+;;; RWE, and the Pi maps its image Normal, executable and writable.  A saved core
+;;; does not carry kernel code, so %KERNEL-REDIRECTS-REAPPLY redoes the patches
+;;; after a restore.
+
+(defvar *kernel-redirects* nil
+  "EQUAL hash: NAME -> the address of its patched call pad.")
+(defvar *kernel-redirect-seen* nil
+  "EQUAL hash of every NAME the redefinition hook has seen.  Only a name's FIRST
+   redefinition can find its kernel code in the table -- after that the table
+   may hold anything, even another kernel function (SETF FDEFINITION of #'G).")
+
+(defun %kernel-pad-state (pad)
+  "PAD (16 bytes before a function object): :PRISTINE, :PATCHED, or NIL when it
+   is not a call pad at all (runtime-JIT code, or an image built without pads)."
+  (let ((w0 (mem-ref pad :u32)) (w1 (mem-ref (+ pad 4) :u32))
+        (w2 (mem-ref (+ pad 8) :u32)) (w3 (mem-ref (+ pad 12) :u32)))
+    (if (eq *jit-target-arch* :aarch64)
+        (cond ((and (eql w0 #xAA1103F1) (eql w1 #xAA1103F1)          ; orr x17,xzr,x17
+                    (eql w2 #xAA1103F1)
+                    (or (eql w3 #xAA1103F1)
+                        (eql (logand w3 #xFFFFE01F) #xD28A4011)))     ; movz x17,#x52nn
+               :pristine)
+              ((and (eql w0 #x58000051) (eql w1 #xD61F0220)) :patched))
+        (cond ((and (eql w0 #x00841F0F) (eql w1 #x4441504B)          ; nop [rax+rax+"KPAD"]
+                    (eql w2 #x00841F0F)
+                    (or (eql w3 #x4441504B)
+                        (eql (logand w3 #xFF00FFFF) #x4400524B)))      ; ... "KR<n>D"
+               :pristine)
+              ((and (eql w0 #x000225FF) (eql w1 #x90660000)) :patched)))))
+
+(defun %kernel-pad-prepack (pad)
+  "A pristine pad's record of how its callers call: the required-argument count
+   N when they may PRE-PACK the &rest list (compile-call's static-rest path:
+   arguments N.. arrive as ONE list, nargs slot 255), else NIL."
+  (let ((w3 (mem-ref (+ pad 12) :u32)))
+    (if (eq *jit-target-arch* :aarch64)
+        (when (eql (logand w3 #xFFFFE01F) #xD28A4011)
+          (logand (ash w3 -5) 255))
+        (when (eql (logand w3 #xFF00FFFF) #x4400524B)
+          (logand (ash w3 -16) 255)))))
+
+(defun %kernel-patch-pad (pad to)
+  "Make the call pad at PAD an absolute jump to TO.  aarch64: ldr x17,#8 /
+   br x17 / .quad (x17 is the intra-call scratch; nothing at a function's entry
+   reads it).  x64: jmp qword [rip+2] / xchg ax,ax / .quad."
+  (let ((a64 (eq *jit-target-arch* :aarch64)))
+    ;; 1. jump over the pad -- behaviour unchanged, and nothing new enters it
+    (setf (mem-ref pad :u32) (if a64 #x14000004 #x90660EEB))   ; b .+16 | jmp short .+16
+    (%jit-icache-flush pad 16)
+    ;; 2. the target word (8-aligned)
+    (setf (mem-ref (+ pad 8) :u32) (logand to #xFFFFFFFF))
+    (setf (mem-ref (+ pad 12) :u32) (logand (ash to -32) #xFFFFFFFF))
+    ;; 3. the jump's second word, then its first
+    (setf (mem-ref (+ pad 4) :u32) (if a64 #xD61F0220 #x90660000))
+    (%jit-icache-flush pad 16)
+    (setf (mem-ref pad :u32) (if a64 #x58000051 #x000225FF))
+    (%jit-icache-flush pad 16)
+    t))
+
+(defun %kernel-redirect-target (name &optional prepack)
+  "NAME's late-binding entry (raw code address) or NIL.  PREPACK (a required
+   count, see %KERNEL-PAD-PREPACK) routes the calls through %KREST-n instead.  aarch64: its #'NAME
+   thunk, which caches a native target.  x64: its linkage stub, which every
+   (re)definition retargets -- at new native code directly, else at an
+   any-arity bridge that resolves NAME when called."
+  (if prepack
+      (%kernel-rest-thunk name prepack)
+  (if (eq *jit-target-arch* :aarch64)
+      (%jit-make-fnaddr-thunk-aarch64 name)
+      (let ((e (and *jit-x64-stubs* (gethash name *jit-x64-stubs*))))
+        (if e
+            (car e)
+            (let ((b (%jit-make-bridge-any-thunk name)))
+              (when b
+                (let ((st (%jit-x64-stub name b)))
+                  (when st (setf (cdr (gethash name *jit-x64-stubs*)) b))
+                  st))))))))
+
+;;; PRE-PACKED &REST.  A kernel caller of a function with &rest (or &key) and no
+;;; &optional conses the rest list ITSELF and passes it as one argument after the
+;;; N required ones, with 255 in the nargs slot (compile-call's static-rest
+;;; path).  Only the callee knows N, so neither late-binding entry above can take
+;;; that call: their &REST prologues read the first argument as the packed list.
+;;; %KREST-N is compiled by the same compiler with the same shape, so its
+;;; prologue accepts both conventions -- pre-packed, and an honest nargs from
+;;; FUNCALL / JIT code -- and APPLYs NAME's current definition, found through
+;;; the index the thunk passes out of band exactly as %JIT-BRIDGE-ANY's.  The
+;;; index is read first, before anything can call another thunk.  Each %KREST-N
+;;; is ~35 KB -- the &REST prologue, which every &rest function carries -- so
+;;; there are four: 375 of the image's 382 pre-packed functions take at most 3
+;;; required arguments (MERGE, ENCODE-UNIVERSAL-TIME and four internals take
+;;; more, and their kernel callers keep the old definition, said at the time).
+(defun %krest-apply (idx args)
+  ;; The adapters' one APPLY site.
+  (apply (%jit-bridge-lookup idx) args))
+(defun %krest-0 (&rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) r))
+(defun %krest-1 (a &rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) (cons a r)))
+(defun %krest-2 (a b &rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) (cons a (cons b r))))
+(defun %krest-3 (a b c &rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) (cons a (cons b (cons c r)))))
+
+(defun %krest-entry (n)
+  "Raw entry of the adapter for N required arguments, or NIL past the last."
+  (let ((f (case n
+             (0 (function %krest-0)) (1 (function %krest-1)) (2 (function %krest-2))
+             (3 (function %krest-3)))))
+    (when f (- (%val->word f) 3))))
+
+(defvar *kernel-rest-thunks* nil "EQUAL hash: NAME -> its %KREST thunk.")
+
+(defun %kernel-rest-thunk (name n)
+  "A thunk that passes NAME's bridge index out of band and jumps to %KREST-N;
+   NIL when there is no such adapter (the function is then left early-bound,
+   and said so) or no executable slot."
+  (let ((old (and *kernel-rest-thunks* (gethash name *kernel-rest-thunks*)))
+        (to (%krest-entry n)))
+    (cond
+      (old old)
+      ((null to)
+       (format *error-output* "~&;; ~A: ~D required arguments before a pre-packed &rest -- kernel callers keep the old definition~%" name n)
+       nil)
+      (t
+       (let ((th (if (eq *jit-target-arch* :aarch64)
+                     (%kernel-rest-thunk-aarch64 name to)
+                     (%jit-make-bridge-any-thunk name to))))
+         (when th
+           (when (null *kernel-rest-thunks*)
+             (setq *kernel-rest-thunks* (make-hash-table :test (function equal))))
+           (puthash name *kernel-rest-thunks* th))
+         th)))))
+
+(defun %kernel-rest-thunk-aarch64 (name to)
+  "The slow path of a #'NAME thunk (%JIT-FNADDR-THUNK-FILL-AARCH64) alone, ending
+   in a branch to TO: no cached target, since a cached native definition would be
+   entered with the caller's pre-packed arguments."
+  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* (%jit-bridge-cap)))
+      nil
+      (let ((addr (%jit-thunk-alloc-aarch64)))
+        (when addr
+          (let ((idx *jit-bridge-count*) (k 0))
+            (setf (aref *jit-bridge-names* idx) name)
+            (setq *jit-bridge-count* (+ idx 1))
+            (%jit-emit-quad-placeholder (+ addr k) 17)
+            (%jit-write-movz-quad addr k idx)
+            (setq k (+ k 16))
+            (%jit-emit-quad-placeholder (+ addr k) 16)
+            (%jit-write-pcrel-quad addr k (%jit-fnaddr-idx-slot))
+            (setq k (+ k 16))
+            (setq k (+ k (%jit-emit-thread-delta-aarch64 addr k 16 9)))   ; x16 += delta (x9 scratch)
+            (%jit-emit-word32 (+ addr k) #xB9000211)          ; str w17, [x16]
+            (setq k (+ k 4))
+            (%jit-emit-quad-placeholder (+ addr k) 16)
+            (%jit-write-pcrel-quad addr k to)
+            (setq k (+ k 16))
+            (%jit-emit-word32 (+ addr k) #xD61F0200)          ; br x16
+            (%jit-icache-flush addr 96)
+            addr)))))
+
+(defun %kernel-redirect (name old)
+  "OLD, NAME's definition being replaced, is a code object: if it has a pristine
+   call pad, point the pad at NAME's late binding."
+  (let ((pad (- (%val->word old) 3 16)))
+    (when (eq (%kernel-pad-state pad) :pristine)
+      (let ((target (%kernel-redirect-target name (%kernel-pad-prepack pad))))
+        (when target
+          (%kernel-patch-pad pad target)
+          (when (null *kernel-redirects*)
+            (setq *kernel-redirects* (make-hash-table :test (function equal))))
+          (puthash name *kernel-redirects* pad)
+          t)))))
+
+(defun %kernel-redirect-hook (name)
+  "From %JIT-FNADDR-THUNK-INVALIDATE, before NAME's binding changes."
+  (when (and (stringp name) (> (length name) 0) (%jit-enabled-p)
+             (member *jit-target-arch* (quote (:aarch64 :x64)))
+             (boundp (quote *symbol-function-table*)) *symbol-function-table*
+             (%mvm-on-main-thread-p))
+    (when (null *kernel-redirect-seen*)
+      (setq *kernel-redirect-seen* (make-hash-table :test (function equal))))
+    (unless (gethash name *kernel-redirect-seen*)
+      (puthash name *kernel-redirect-seen* t)
+      (let ((old (gethash name *symbol-function-table*)))
+        ;; (Not "unless registered": a DEFUN registers its module before this
+        ;; runs.  The first-seen rule is what tells kernel code apart.)
+        (when (and old (eql (logand (%val->word old) 15) 3))
+          (%kernel-redirect name old))))))
+
+(defun %kernel-redirects-reapply ()
+  "After a core restore: the image's code came from the binary, unpatched."
+  (when *kernel-redirects*
+    (maphash (lambda (name pad)
+               (when (eq (%kernel-pad-state pad) :pristine)
+                 (let ((target (%kernel-redirect-target name (%kernel-pad-prepack pad))))
+                   (when target (%kernel-patch-pad pad target)))))
+             *kernel-redirects*))
+  nil)
+
 (defun %jit-fnaddr-thunk-invalidate (name)
   "A DEFUN / (setf symbol-function) of NAME: drop the cached native target of
    its #'NAME thunk so the next call re-resolves — late binding is what the
    thunk exists for.  No-op when NAME has no thunk (and on x64, which bakes).
    Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
+  (%kernel-redirect-hook name)
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
   (let ((h (%jit-fnaddr-thunk-entry name)))
     (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0)))
+  ;; x64 native callers reach a runtime DEFUN through its linkage stub: until
+  ;; a native definition is installed (which retargets it again), resolve late.
+  (when (not (eq *jit-target-arch* :aarch64))
+    (%jit-x64-stub-retarget name nil))
   ;; AND NATIVE CALLERS: a LINKAGE CELL held the OLD definition's native code,
   ;; and only %JIT-INSTALL-NATIVE-FNS ever repointed it -- so a redefinition
   ;; that is not native (an interpreted DEFUN under hot-only JIT, a
@@ -1495,7 +1780,13 @@
              ;; native jump.
              (word (if fn (%val->word fn) 0))
              (nativep (eql (logand word 15) 3))
-             (raw (if nativep (- word 3) 0)))
+             (raw0 (if nativep (- word 3) 0))
+             ;; A RUNTIME DEFUN (registered module) is called through its x64
+             ;; linkage stub, so a later redefinition reaches this caller.
+             (raw (if (and (> raw0 0) name (not (eq *jit-target-arch* :aarch64))
+                           (%jit-registered-p name))
+                      (or (%jit-x64-stub name raw0) raw0)
+                      raw0)))
         ;; #306 BRIDGE: a resolved-but-non-native callee gets a thunk instead
         ;; of failing the page (x64 only; nargs from the translator's parallel
         ;; alist, NIL on aarch64 → falls through to the old reject).
@@ -1809,6 +2100,8 @@
                 ;; every already-built caller that calls through the cell picks
                 ;; up this (re)definition — proper CL late binding.
                 (%jit-lcell-set nm addr)
+                (when (not (eq *jit-target-arch* :aarch64))
+                  (%jit-x64-stub-retarget nm addr))
                 (setq n (+ n 1))))))))
     (setq *jit-native-defun-count*
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
@@ -1847,6 +2140,10 @@
     (let ((m (list bc entry ft-list fn-table rt-table lam-offsets names)))
       (dolist (nm names) (puthash nm *jit-module-registry* m)))))
 
+(defun %jit-registered-p (name)
+  "T when NAME is a runtime DEFUN (it has a registered module)."
+  (if (and *jit-module-registry* (gethash name *jit-module-registry*)) t nil))
+
 (defun %jit-fn-native-p (name)
   (let ((f (%mvm-resolve-runtime-fn name)))
     (and f (eql (logand (%val->word f) 15) 3))))
@@ -1878,6 +2175,35 @@
        (dolist (p skips nil)
          (when (and (>= (length nm) (length p)) (string= p nm :end2 (length p)))
            (return t)))))
+
+(defun %jit-build-module (m now)
+  "Translate registered module M (a *JIT-MODULE-REGISTRY* value) and publish
+   its DEFUNs as native.  The number installed, or NIL when the page did not
+   build -- or would not: M failed when *JIT-NATIVE-DEFUN-COUNT* was already
+   NOW, and nothing it calls has gone native since (see %JIT-EAGER-ALL)."
+  (let ((f (assoc (car m) *jit-eager-failed* :test (function eq))))
+    (if (and f (eql (cdr f) now))
+        nil
+        (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
+                                       (car (cddddr m)))))
+          (if (and je (cadr (cddddr je)))
+              (let ((n (%jit-install-native-fns (car je) (cadr (cddddr je))
+                                                (car (cddr (cddddr m))))))
+                ;; OFF-MAIN, DO NOT RECORD: the cons would be a
+                ;; worker object in a region-0 list.
+                (when (%mvm-on-main-thread-p)
+                  (setq *jit-eager-built* (cons (car m) *jit-eager-built*))
+                  (when f (setq *jit-eager-failed*
+                                (remove f *jit-eager-failed*))))
+                n)
+              (progn
+                (when (%mvm-on-main-thread-p)
+                  (if f
+                      (setf (cdr f) (or *jit-native-defun-count* 0))
+                      (setq *jit-eager-failed*
+                            (cons (cons (car m) (or *jit-native-defun-count* 0))
+                                  *jit-eager-failed*))))
+                nil))))))
 
 (defun %jit-eager-all ()
   "Translate every registered runtime DEFUN that is still an interpreter
@@ -1918,34 +2244,125 @@
             (dolist (m pending)
               (when (not (member (car m) done :test (function eq)))
                 (setq done (cons (car m) done))
-                (let ((f (assoc (car m) *jit-eager-failed* :test (function eq))))
-                  (if (and f (eql (cdr f) now))
-                      (setq fails (+ fails 1))
-                      (let ((je (%jit-translate-page (car m) (cadr m) (reverse (caddr m))
-                                                     (car (cddddr m)))))
-                        (if (and je (cadr (cddddr je)))
-                            (let ((n (%jit-install-native-fns (car je) (cadr (cddddr je))
-                                                              (car (cddr (cddddr m))))))
-                              (setq modules (+ modules 1))
-                              (setq this-pass (+ this-pass n))
-                              ;; OFF-MAIN, DO NOT RECORD: the cons would be a
-                              ;; worker object in a region-0 list.
-                              (when (%mvm-on-main-thread-p)
-                                (setq *jit-eager-built* (cons (car m) *jit-eager-built*))
-                                (when f (setq *jit-eager-failed*
-                                              (remove f *jit-eager-failed*)))))
-                            (progn
-                              (setq fails (+ fails 1))
-                              (when (%mvm-on-main-thread-p)
-                                (if f
-                                    (setf (cdr f) (or *jit-native-defun-count* 0))
-                                    (setq *jit-eager-failed*
-                                          (cons (cons (car m) (or *jit-native-defun-count* 0))
-                                                *jit-eager-failed*)))))))))))
+                (let ((n (%jit-build-module m now)))
+                  (if n
+                      (setq modules (+ modules 1) this-pass (+ this-pass n))
+                      (setq fails (+ fails 1))))))
             (setq installed (+ installed this-pass) failed fails pass (+ pass 1))
             (when (or (= this-pass 0) (>= pass 8)) (return nil))))
         (when (> installed 0) (%jit-retry-drain))
         (list installed modules failed))))
+
+;;; ---------------------------------------------------------------------------
+;;; HOT-FUNCTION JIT.  *JIT-HOT-ONLY* decides per TOPLEVEL FORM, and a DEFUN is
+;;; a form that runs once, so a library's functions stayed interpreted however
+;;; often they were called: natrium's own test suite is one (RUN-ALL) form and
+;;; ran past 30 minutes on modus, against minutes after a JIT-EAGER.  JIT-EAGER
+;;; is the AOT tool (iOS, a core about to be saved); this is the automatic one.
+;;;
+;;; Each runtime DEFUN's trampoline counts its calls and the time they spend
+;;; interpreted.  At *JIT-HOT-CALLS* calls, or %JIT-HOT-NS of interpreted time,
+;;; it builds the function's registered module -- after the not-yet-native DEFUNs
+;;; that module calls, depth first, so its calls link to native code rather
+;;; than through late-bound bridges -- with exactly JIT-EAGER's machinery
+;;; (%JIT-BUILD-MODULE).  Publishing updates the symbol-function table entry in
+;;; place, which every caller reads at call time (the interpreter's stub cells,
+;;; the x64 bridge thunks), so callers go native without being rebuilt; a
+;;; caller still holding the trampoline object itself is forwarded.
+;;;
+;;; WHAT COUNTS: calls that reach the trampoline, i.e. from outside the
+;;; function's own module.  A self-recursive call is a call inside its own
+;;; bytecode, so one deep (FIB 30) stays interpreted to the end -- there is no
+;;; on-stack replacement either -- and so does a single call that loops for a
+;;; long time.  The next outside call after promotion runs native -- and the
+;;; time budget makes that the call after the first expensive one.
+
+(defvar *jit-hot-calls* nil
+  "Calls an interpreted runtime DEFUN takes before it is compiled native, with
+   the interpreted DEFUNs it calls.  NIL = 64.  0 = never: DEFUNs interpret
+   until JIT-EAGER.  Read when a DEFUN is installed.")
+(defvar *jit-hot-promoted* nil "CENSUS: modules built by a hot DEFUN (callees included).")
+(defvar *jit-hot-failed* nil "CENSUS: those whose page did not build (they stay interpreted).")
+(defvar *jit-hot-busy* nil "T while a hot build runs: a trampoline firing inside it waits.")
+
+(defun %jit-hot-call-threshold ()
+  (let ((v (handler-case *jit-hot-calls* (error (c) nil))))
+    (if (integerp v) v 64)))
+
+(defun %jit-hot-ns ()
+  "Interpreted time (ns) after which a DEFUN is built regardless of its call
+   count: about what translating a module costs, so a function past it has
+   already paid for its own compilation.  A target with no clock reads 0
+   from %IRT-NS throughout and is promoted by count alone."
+  10000000)
+
+(defun %jit-module-callees (m)
+  "Names registered module M calls out of module: its runtime table's stubs."
+  (let ((rt (car (cddddr m))) (out nil))
+    (when rt
+      (maphash (lambda (k v) (when (stringp v) (setq out (cons v out)))) rt))
+    out))
+
+(defun %jit-hot-build (name skips seen)
+  "Build NAME's module, its interpreted callees' modules first.  SEEN is
+   (VISITED-BYTECODES . BUDGET): each module is visited once, and at most
+   BUDGET are built, which bounds the pause one hot call can cause."
+  (let ((m (and *jit-module-registry* (gethash name *jit-module-registry*))))
+    (when (and m (> (cdr seen) 0)
+               (not (%jit-skip-name-p name skips))
+               (not (%jit-fn-native-p name))
+               (not (member (car m) (car seen) :test (function eq)))
+               (not (member (car m) *jit-eager-built* :test (function eq))))
+      (setf (car seen) (cons (car m) (car seen)))
+      (setf (cdr seen) (- (cdr seen) 1))
+      (dolist (c (%jit-module-callees m))
+        (%jit-hot-build c skips seen))
+      (if (%jit-build-module m (or *jit-native-defun-count* 0))
+          (setq *jit-hot-promoted* (if *jit-hot-promoted* (+ 1 *jit-hot-promoted*) 1))
+          (setq *jit-hot-failed* (if *jit-hot-failed* (+ 1 *jit-hot-failed*) 1))))))
+
+(defun %jit-hot-promote (name)
+  "NAME's trampoline reached its threshold.  NAME's native function once built;
+   :RETRY when this is not the moment (the JIT inhibited, a worker thread -- a
+   build records into region-0 tables -- or a build already running); NIL when
+   NAME stays interpreted (no JIT, skip-listed, or its page would not build)."
+  (cond ((not (%jit-enabled-p)) nil)
+        ((or (not (%jit-active-p)) (not (%mvm-on-main-thread-p)) *jit-hot-busy*) :retry)
+        (t (let ((before (or *jit-native-defun-count* 0)))
+             (setq *jit-hot-busy* t)
+             (unwind-protect
+                  (%jit-hot-build name (%jit-skip-list) (cons nil 64))
+               (setq *jit-hot-busy* nil))
+             (when (> (or *jit-native-defun-count* 0) before) (%jit-retry-drain)))
+           (let ((fn (%mvm-resolve-runtime-fn name)))
+             (if (and fn (eql (logand (%val->word fn) 15) 3)) fn nil)))))
+
+(defun %mvm-make-defun-trampoline (name bc ftab rt offset lam-offsets)
+  "The interpreter trampoline for runtime DEFUN NAME (%MVM-MAKE-TRAMPOLINE),
+   counting toward the hot-function JIT: NAME is built after *JIT-HOT-CALLS*
+   calls, or as soon as its calls have spent %JIT-HOT-NS interpreted, so a
+   function that is called rarely but works hard (natrium's SHA256 is the whole
+   compression loop in one DEFUN: 1.7 s a call interpreted) goes native after
+   its first expensive call rather than its 64th.  Once NAME is native, a
+   caller still holding this object is forwarded to the native code.
+   Multiple values pass through either way."
+  (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets))
+        (left (%jit-hot-call-threshold))
+        (spent 0)
+        (fwd nil))
+    (lambda (&rest args)
+      (if (or fwd (<= left 0))
+          (values-list (multiple-value-list (apply (or fwd inner) args)))
+          (let* ((t0 (%irt-ns))
+                 (vals (multiple-value-list (apply inner args))))
+            (setq left (- left 1))
+            (setq spent (+ spent (- (%irt-ns) t0)))
+            (when (or (= left 0) (> spent (%jit-hot-ns)))
+              (let ((r (%jit-hot-promote name)))
+                (if (eq r :retry)
+                    (setq left (%jit-hot-call-threshold) spent 0)
+                    (setq left 0 fwd r))))
+            (values-list vals))))))
 
 (defun %init-modus-package ()
   "Bind the MODUS package's generic runtime functions.  Called from kernel-main
@@ -3494,10 +3911,10 @@
           ;; compiled native later without re-evaluating anything.
           (%jit-register-module persist-names bc entry ft-list
                                 fn-table rt-table lam-offsets)
-          (let ((tramp (%mvm-make-trampoline
-                         bc fn-table rt-table
+          (let ((tramp (%mvm-make-defun-trampoline
+                         pn bc fn-table rt-table
                          (cadr e)
-                         nil lam-offsets)))
+                         lam-offsets)))
             ;; puthash signature is (KEY HT VALUE) — store the
             ;; trampoline as the VALUE under PN / its name-hash.  (The
             ;; earlier `(puthash pn tramp <table>)` had HT and VALUE
@@ -4325,7 +4742,7 @@
   tname)
 
 (defun %expand-deftype (type)
-  "OVERRIDE (mvm-eval images; last-defun-wins) of ansi-bridge's engine stub:
+  "The deftype engine (mvm-eval images):
    route the deftype body eval through the mvm-eval lambda-body entry, cached
    per registration (%DEFTYPE-EXPANDER).  A deftype body mvm-eval can't
    compile SIGNALS (the tree-walker is deleted)."

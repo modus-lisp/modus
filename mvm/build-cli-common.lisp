@@ -72,7 +72,7 @@
                   *cli-arch-kernel-prologue* *cli-arch-io-scratch-source*
                   *cli-arch-kernel-epilogue* *cli-arch-override-source*
                   *cli-bare-metal* *cli-bare-metal-tarball*
-                  *cli-bare-metal-net-source* *cli-omit-ansi-bridge*
+                  *cli-bare-metal-net-source* *cli-omit-ansi-test-aux*
                   *cli-arch-core-resume*))
 
 ;;; BARE-METAL SEAM.  DEFVAR, so a wrapper that binds these BEFORE loading this
@@ -110,14 +110,13 @@
 ;;; init (its toplevel: serial REPL + halt).  "" = no bare-metal core support.
 (defvar *cli-arch-core-resume* "")
 
-
-;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-bridge.lisp
-;;; (~1.7 MB of source -> ~3.5 MB of image) from *BRIDGE-SOURCE*.  It exists for
-;;; the Pi chain-load path, where every megabyte is minutes of UART time.  NOT
-;;; proven boot-safe — ansi-bridge.lisp is load-bearing (it defines list /
-;;; make-array / rplaca / the CLOS defaults and %init-clos-protocol), so measure,
-;;; do not assume.  Default NIL => every existing build is byte-identical.
-(defvar *cli-omit-ansi-bridge* nil)
+;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-test-aux.lisp
+;;; (the ANSI-test helpers; the CL runtime it once shared a file with is in
+;;; mvm/cl-*.lisp) from *BRIDGE-SOURCE*.  It exists for the Pi chain-load path,
+;;; where every megabyte is minutes of UART time.  NOT measured since the split:
+;;; the bare-metal boot calls %INIT-STANDARD-CHARS, which lives there.  Default
+;;; NIL => every existing build is byte-identical.
+(defvar *cli-omit-ansi-test-aux* nil)
 
 ;;; ============================================================
 ;;; 1. Load MVM infrastructure (SBCL-side)
@@ -258,7 +257,7 @@
     "mvm/cl-sequences.lisp" "mvm/cl-streams.lisp" "mvm/cl-fileio.lisp"
     "mvm/cl-printer.lisp" "mvm/cl-reader.lisp" "mvm/cl-eval.lisp" "mvm/cl-clos.lisp"
     "mvm/cl-types.lisp" "mvm/cl-packages.lisp" "mvm/cl-conditions.lisp"
-    "mvm/ansi-bridge.lisp"))
+    "mvm/ansi-test-aux.lisp"))
 (defvar *fasl-fingerprint-source*
   (let ((a 2166136261) (b 3735928559))
     (dolist (f *fasl-fingerprint-files*)
@@ -1108,10 +1107,18 @@
     ;; A core holds raw addresses into THIS binary's text (function entries,
     ;; JIT call targets), so it may only restore under the binary that wrote
     ;; it.  A fresh id per build, checked by %RESTORE-IMAGE.
+    ;; MODUS_BUILD_ID=N (1 .. 2^28-1) makes the id a value the caller chose, so
+    ;; the same inputs give the same bytes: a launch digest can then be computed
+    ;; ahead of time (kiln does this from the modus commit and its settings).
+    ;; Unset, every build draws a fresh id, as before.
     (format nil "~%(defun %core-build-id () ~D)~%"
             ;; 28 bits: a fixnum on every target, the 32-bit ones included,
             ;; because the restore compares it before anything may allocate.
-            (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))
+            (let ((v (sb-ext:posix-getenv "MODUS_BUILD_ID")))
+              (or (and v (plusp (length v)) (every #'digit-char-p v)
+                       (let ((n (parse-integer v)))
+                         (and (<= 1 n (- (expt 2 28) 1)) n)))
+                  (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))))
       ""))
 
 ;;; THE HOSTED PLATFORM LAYER — Linux syscalls, hosted targets only.
@@ -1174,7 +1181,7 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (if *cli-omit-ansi-bridge* "" (mvm-text "mvm/ansi-bridge.lisp"))
+    (if *cli-omit-ansi-test-aux* "" (mvm-text "mvm/ansi-test-aux.lisp"))
     (string #\Newline)
     ;; ---- BARE METAL STOPS HERE -------------------------------------------
     ;; Everything below is the HOSTED payload: Linux syscalls, fds, argv.  A
@@ -1360,11 +1367,11 @@
 ;; *driver-source* here, at exactly the position it used to occupy, so every
 ;; existing driver scanner (defun names -> SFT, symbol names -> *SYM-NAME-TABLE*)
 ;; still sees these defuns unchanged.
-;;; MACHINE-TYPE / MACHINE-VERSION per port.  mvm/ansi-bridge.lisp's are the
+;;; MACHINE-TYPE / MACHINE-VERSION per port.  mvm/cl-fileio.lisp's are the
 ;;; constant "x86_64" every image shares, so the aarch64 image on an Android
 ;;; phone answered "x86_64".  Like SBCL's, the answer is fixed when the image is
 ;;; built; the names are uname's.  Spliced into *DRIVER-SOURCE*, which comes
-;;; after ansi-bridge, so these definitions win.
+;;; after the CL runtime, so these definitions win.
 (defun %machine-type-source ()
   (let ((m (ecase *cli-arch*
              (:x64 "x86_64") (:aarch64 "aarch64") (:i386 "i386")
@@ -1400,10 +1407,16 @@
   ;; a heap snapshot IN PLACE OF the boot init below: the snapshot carries every
   ;; table init-symbol-table onward would build, so it must land first, and the
   ;; arch prologue above has already mapped this process's bitmaps.  Hosted only.
+  ;; %KERNEL-REDIRECTS-REAPPLY is called HERE and not from %CORE-POST-RESTORE,
+  ;; which several images redefine (last-defun-wins: net/hosted-ssh.lisp's
+  ;; replaces lib/save-image.lisp's outright): image functions redefined before
+  ;; the save come back unpatched with the binary (mvm-eval.lisp, REDEFINING A
+  ;; KERNEL FUNCTION), and a restored process must call the definitions it saved.
   (cond ((not *cli-bare-metal*)
          "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
+    (%kernel-redirects-reapply)
     (handler-case (cli-toplevel) (t (c) (sys-exit 1)))
     (sys-exit 0))
 ")
@@ -1413,6 +1426,7 @@
         (t (concatenate 'string "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
+    (%kernel-redirects-reapply)
 " *cli-arch-core-resume* "    )
 ")))
   ;; ---- SHARED boot init.  Identical on every arch, and the whole reason this

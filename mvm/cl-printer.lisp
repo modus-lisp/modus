@@ -5185,16 +5185,8 @@
         (%write-char-to-stream code s)))
     saved-ch))
 
-(defun finish-output (&rest args)
-  "CLHS: takes at most one argument (the stream).  Extra signal
-   program-error.  Modus's stub is a no-op otherwise."
-  (when (cdr args) (%signal-program-error))
-  nil)
-(defun force-output (&rest args)
-  "CLHS: takes at most one argument (the stream).  Extra signal
-   program-error.  Modus's stub is a no-op otherwise."
-  (when (cdr args) (%signal-program-error))
-  nil)
+
+
 (defun clear-output (&rest args)
   "CLHS: takes at most one argument (the stream).  Extra signal
    program-error.  Modus's stub is a no-op otherwise."
@@ -5585,3 +5577,119 @@
                   (%equalp-array-array a b)
                   nil))))))))
 
+
+;;; ============================================================
+;;; pprint-newline — stub (pretty-printer not supported)
+;;; ============================================================
+
+;;; Pretty-printer — best-effort impl.  pprint-newline emits an actual
+;;; newline; pprint-tab pads to a column; pprint-indent / pprint-fill /
+;;; pprint-linear / pprint-tabular just write the list space-separated.
+;;; The full PPRINT-LOGICAL-BLOCK / pprint-dispatch table machinery is
+;;; far more complex (40-page spec); we cover the common-case calls.
+(defun pprint-newline (kind &rest args)
+  "CLHS 22.4 PPRINT-NEWLINE: a conditional newline of KIND (:LINEAR :FILL
+   :MISER :MANDATORY) in the innermost logical block on STREAM, decided by
+   the layout engine (cl-printer.lisp) when that block closes.  Outside a
+   logical block, or with *PRINT-PRETTY* false, it does nothing."
+  (unless (or (eq kind :linear) (eq kind :fill) (eq kind :miser) (eq kind :mandatory))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :nl kind)))
+
+(defun pprint-tab (kind colnum colinc &rest args)
+  "CLHS 22.4 PPRINT-TAB (:LINE :SECTION :LINE-RELATIVE :SECTION-RELATIVE)."
+  (unless (or (eq kind :line) (eq kind :section)
+              (eq kind :line-relative) (eq kind :section-relative))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :tab kind colnum colinc)))
+
+(defun pprint-indent (relative-to n &rest args)
+  "CLHS 22.4 PPRINT-INDENT: :BLOCK = N past the block's start column,
+   :CURRENT = N past the current column.  Ignored in miser style."
+  (unless (or (eq relative-to :block) (eq relative-to :current))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :ind relative-to (floor n))))
+
+(defun %pprint-seq (stream object colon-p kind tabsize)
+  "PPRINT-FILL / -LINEAR / -TABULAR, as CLHS 22.4 defines them: a logical
+   block (parenthesised when COLON-P) whose elements are separated by a
+   space, a tab to the next TABSIZE column (tabular only) and a KIND
+   conditional newline.  A non-list OBJECT is printed as if by WRITE."
+  (let ((s (%resolve-output-stream stream)))
+    ;; %RT-LISTP, not LISTP: image code's LISTP is the raw tag test, which calls a
+    ;; hash table (a tagged cons) a list and printed its cells (upstream
+    ;; PPRINT-FILL/LINEAR/TABULAR.1-2 once runtime LISTP said HASH-TABLE).
+    (if (not (%rt-listp object))
+        (write-to-stream object s)
+        (let ((cap (%pp-begin s object (if colon-p "(" "") nil)))
+          (catch :%pp-tag
+            (%pprint-exit-fn)
+            (loop
+              (write-to-stream (%pprint-pop-fn) cap)
+              (%pprint-exit-fn)
+              (write-char-to-stream (code-char 32) cap)
+              (when tabsize (pprint-tab :section-relative 0 tabsize cap))
+              (pprint-newline kind cap)))
+          (%pp-end cap (if colon-p ")" "")))))
+  nil)
+
+(defun pprint-fill (stream object &optional (colon-p t) at-sign-p)
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p :fill nil))
+
+(defun pprint-linear (stream object &optional (colon-p t) at-sign-p)
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p :linear nil))
+
+(defun pprint-tabular (stream object &optional (colon-p t) at-sign-p (tabsize 16))
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p :fill (or tabsize 16)))
+
+(defvar *%pprint-dispatch-table* nil)
+
+(defun copy-pprint-dispatch (&rest args)
+  "Return a copy of the current pprint dispatch table.  We just hand
+   back a fresh symbol — the table contents aren't actually copied."
+  (declare (ignore args))
+  (gensym "PPRINT-DISP-"))
+
+(defun set-pprint-dispatch (type-spec fn &rest args)
+  "Install FN as the pprint-dispatch entry for TYPE-SPEC.  Stored in
+   *%pprint-dispatch-table* keyed by (type . priority)."
+  (declare (ignore args))
+  (setq *%pprint-dispatch-table*
+        (cons (cons type-spec fn) *%pprint-dispatch-table*))
+  nil)
+
+(defun pprint-dispatch (object &rest args)
+  "Look up the most-specific pprint-dispatch entry for OBJECT.
+   Returns (values function found-p)."
+  (declare (ignore args))
+  (let ((cur *%pprint-dispatch-table*)
+        (found nil))
+    (loop
+      (when (or found (null cur)) (return nil))
+      (let ((entry (car cur)))
+        (when (handler-case (typep object (car entry)) (t (c) nil))
+          (setq found entry)))
+      (setq cur (cdr cur)))
+    (if found
+        (values (cdr found) t)
+        (values nil nil))))
+
+;;; ============================================================
+;;; PPRINT-LOGICAL-BLOCK stub
+;;; ============================================================
+(defun pprint-logical-block (stream-and-opts object-list &rest body-args)
+  "Stub: just evaluate body (already handled by rewriter, this is fallback)."
+  nil)
+
+;;; ============================================================
+;;; DESCRIBE, APROPOS (stubs)
+;;; ============================================================
+(defun describe (object &optional stream)
+  "Default DESCRIBE — dispatches to DESCRIBE-OBJECT.  Per CLHS, DESCRIBE
+   is a regular function that calls the DESCRIBE-OBJECT generic.  We
+   default the stream to NIL (caller's responsibility to bind a real
+   one if they need formatted output)."
+  (describe-object object stream))

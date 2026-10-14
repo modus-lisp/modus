@@ -321,20 +321,19 @@
 ;;;                          is commented out at its single call site; the "MVMS"
 ;;;                          header is still emitted so the image footer's offset
 ;;;                          arithmetic stays valid.
-;;;   MODUS_RPI_NO_BRIDGE=1  drop mvm/ansi-bridge.lisp (~1.7MB of source ->
-;;;                          ~3.5MB of image).  NOT proven boot-safe — that file
-;;;                          is load-bearing (list / make-array / rplaca / the
-;;;                          CLOS defaults / %init-clos-protocol).  Measure.
+;;;   MODUS_RPI_NO_TEST_AUX=1  drop mvm/ansi-test-aux.lisp (the ANSI-test
+;;;                          helpers).  Not measured: the boot calls
+;;;                          %INIT-STANDARD-CHARS, which lives there.
 (defun %rpi-cull-p (var)
   (let ((v (sb-ext:posix-getenv var)))
     (and v (plusp (length v)) (not (string= v "0")))))
 (defvar *rpi-no-blob* (%rpi-cull-p "MODUS_RPI_NO_BLOB"))
-(defvar *cli-omit-ansi-bridge* (%rpi-cull-p "MODUS_RPI_NO_BRIDGE"))
+(defvar *cli-omit-ansi-test-aux* (%rpi-cull-p "MODUS_RPI_NO_TEST_AUX"))
 (when *rpi-no-blob*
   (setf modus.mvm::*embed-source-blob* nil)
   (format t "~&;; CULL: embedded source blob DROPPED~%"))
-(when *cli-omit-ansi-bridge*
-  (format t "~&;; CULL: mvm/ansi-bridge.lisp DROPPED~%"))
+(when *cli-omit-ansi-test-aux*
+  (format t "~&;; CULL: mvm/ansi-test-aux.lisp DROPPED~%"))
 
 ;;; ARCH SLOT: `halt', and deliberately NOT `sys-exit'.
 ;;;
@@ -617,7 +616,7 @@
         (%rpi-mvm-text "lib/a64-pmu.lisp")
         "
 (defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
-;;; THE CLOCK ON BARE METAL.  ansi-bridge.lisp's GET-INTERNAL-REAL-TIME and
+;;; THE CLOCK ON BARE METAL.  cl-fileio.lisp's GET-INTERNAL-REAL-TIME and
 ;;; GET-UNIVERSAL-TIME wrap a Linux syscall in a handler-case, expecting the
 ;;; bare-metal case to fall through to a counter.  It cannot: an SVC with no
 ;;; OS is a synchronous exception, and on a Pi that is the silent `!!FAULT'

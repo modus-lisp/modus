@@ -129,11 +129,59 @@
 (defun %fasl-reject (why)
   (throw '%fasl-reject why))
 
+;; THE LITERALS MUST BE A TREE.  The encoder writes each reference out in full,
+;; so a constant that SHARES a cons or vector comes back as two objects -- and
+;; (#1=(0) #1#) prints "((0) (0))" under *PRINT-CIRCLE* -- and one that is
+;; CIRCULAR through both car and cdr, #1=(#1# . #1#), is walked exponentially:
+;; the ANSI printer tests hung a load for hours at exactly that literal.  So the
+;; form's constants are walked ONCE with an identity table first, and any
+;; cons or vector reached twice keeps the form as source.  The table is keyed by
+;; address, so a collection during the walk voids it: reject then too.  The
+;; walk is bounded at 2000 nodes, because that table is linear (see NOTE).
+(defun %fasl-check-tree (consts)
+  (let ((seen (make-hash-table :test (function eq)))
+        (n 0)
+        (e0 (and (fboundp (quote %gc-epoch)) (funcall (quote %gc-epoch)))))
+    (labels ((note (v)
+               (when (gethash v seen) (%fasl-reject "shared or circular constant"))
+               (setf (gethash v seen) t)
+               (setq n (+ n 1))
+               ;; An EQ table keyed by a cons has no index here -- PUTHASH and
+               ;; GETHASH scan its entry list -- so this walk is QUADRATIC in
+               ;; the nodes it notes.  At 1,000,000 a big literal in the ANSI
+               ;; pprint tests pinned a load for an hour; at 2000 the worst
+               ;; case is ~4M comparisons.  A larger constant stays source.
+               (when (> n 2000) (%fasl-reject "constant too large")))
+             (walk (v d)
+               ;; down the cdr chain iteratively, so a long list is not deep;
+               ;; the car depth is bounded as the encoder bounds it
+               (when (> d 2000) (%fasl-reject "too deep"))
+               (loop
+                 (cond ((or (null v) (symbolp v) (pathnamep v) (%fasl-cell-key v))
+                        ;; atoms to the encoder: a global's cell is encoded
+                        ;; by key and replays as the same live cell
+                        (return nil))
+                       ((consp v) (note v) (walk (car v) (+ d 1)) (setq v (cdr v)))
+                       ((and (vectorp v) (not (stringp v))
+                             (not (equal (array-element-type v) '(unsigned-byte 8))))
+                        (note v)
+                        (when (simple-vector-p v)
+                          (dotimes (i (length v)) (walk (svref v i) (+ d 1))))
+                        (return nil))
+                       (t (return nil))))))
+      (dolist (c consts) (walk c 0)))
+    (when (and e0 (not (eql e0 (funcall (quote %gc-epoch)))))
+      (%fasl-reject "collection during constant check"))
+    t))
+
 (defun %fasl-cell-key (v)
   "V's key when V is the live (key . value) cell of a global variable."
   ;; IGNORE-ERRORS: %GV-CELL signals TYPE-ERROR for an integer that is no name
   ;; key at all -- an ordinary (offset . name) pair reaches here
-  (and (consp v) (integerp (car v))
+  ;; FIXNUM, not INTEGERP: a global's key is a name-hash fixnum, and %GV-CELL
+  ;; hashes its argument with fixnum arithmetic -- a literal with a BIGNUM car
+  ;; sent it a heap pointer, and the fault was only hidden by IGNORE-ERRORS
+  (and (consp v) (typep (car v) 'fixnum)
        (fboundp (quote %gv-cell))
        (ignore-errors (eq v (funcall (quote %gv-cell) (car v))))
        (car v)))
@@ -189,6 +237,17 @@
     ((and (vectorp v) (equal (array-element-type v) '(unsigned-byte 8)))
      (%fb-byte fb 9) (%fb-uint fb (length v))
      (%fb-bulk fb v))
+    ;; a CLASS, instance, generic function, method combination or COMPLEX is
+    ;; a vector here with a marker in slot 0: encoded as a vector it replayed
+    ;; as one -- ANSI ETYPECASE.12's #.(find-class 'symbol nil) inside a
+    ;; DEFTEST body came back a plain vector and the clause stopped matching
+    ((and (simple-vector-p v) (> (length v) 0) (symbolp (svref v 0))
+          (member (symbol-name (svref v 0))
+                  '("%CLOS-INSTANCE" "%STRUCT-INSTANCE" "%CLOS-CLASS" "%CLASS-PROXY"
+                    "%GENERIC-FUNCTION" "%METHOD-COMBINATION" "%METHOD-COMBINATION-LONG"
+                    "%COMPLEX-MARKER")
+                  :test (function string=)))
+     (%fasl-reject "object constant"))
     ((and (simple-vector-p v) (eq (array-element-type v) t))
      (%fb-byte fb 8) (%fb-uint fb (length v))
      (dotimes (i (length v)) (%fasl-enc fb (svref v i) unint (+ depth 1))))
@@ -349,6 +408,7 @@
                      (let ((consts (mapcar (lambda (p) (gethash (car p) *e2-const-pool*))
                                            (reverse idxs)))
                            (rt nil) (lam nil))
+                       (%fasl-check-tree consts)
                        ;; the runtime-call names (positive keys; the negative ones
                        ;; are per-process call caches, rebuilt on replay)
                        (maphash (lambda (key v) (when (and (integerp key) (> key 0)) (push (cons key v) rt)))
@@ -442,20 +502,30 @@
               (with-open-file (i (concatenate 'string d key ".mfasl")
                                  :element-type '(unsigned-byte 8) :if-does-not-exist nil)
                 (and i
-                     (let ((b (make-array (file-length i) :element-type '(unsigned-byte 8))))
-                       (read-sequence b i)
-                       b))))))))
+                     ;; a SHORT read leaves the tail zero, and zero decodes
+                     ;; as NIL -- a record cut short would replay as valid
+                     (let* ((n (file-length i))
+                            (b (make-array n :element-type '(unsigned-byte 8))))
+                       (and (eql (read-sequence b i) n) b)))))))))
 
 (defun %fasl-put (key bytes)
+  "Publish BYTES as KEY's fasl ATOMICALLY: write a file private to this process,
+   then rename(2) it over KEY.mfasl.  Writing KEY.mfasl in place let a process
+   loading the same file concurrently -- 32 sweep shards share one cache --
+   replay another's half-written record: one of four concurrent loads of the
+   ANSI suite came back 53 tests short."
   (let ((d (%fasl-dir)))
     (when d
       (ignore-errors
-       (let ((path (concatenate 'string d key ".mfasl")))
+       (let* ((path (concatenate 'string d key ".mfasl"))
+              (tmp (format nil "~a.~a.tmp" path (or (ignore-errors (%sys-getpid)) 0))))
          (ensure-directories-exist path)
-         (with-open-file (o path :direction :output :element-type '(unsigned-byte 8)
-                                 :if-exists :supersede :if-does-not-exist :create)
+         (with-open-file (o tmp :direction :output :element-type '(unsigned-byte 8)
+                                :if-exists :supersede :if-does-not-exist :create)
            (write-sequence bytes o))
-         t)))))
+         (if (eql (%sys-rename tmp path) 0)
+             t
+             (progn (ignore-errors (delete-file tmp)) nil)))))))
 
 ;;; ------------------------------------------------------------------
 ;;; The load loops: %FASL-OPEN / %FASL-READ / %FASL-EVAL / %FASL-CLOSE.

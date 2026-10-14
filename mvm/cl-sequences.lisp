@@ -2829,6 +2829,14 @@
               ((eq (car a) :allow-other-keys) nil)
               (t (unless allow-other-keys (%signal-program-error))))
         (setq a (cddr a))))
+    (%fill-pos seq item start end)))
+
+(defun %fill-pos (seq item start end)
+  "FILL with its bounds as positional arguments (END NIL = the length).  The
+   compiler turns a FILL call with literal keywords into this, so the call conses
+   no &REST list of keyword arguments (one FILL a row is how glass fills a
+   rectangle)."
+  (progn
     ;; ANSI: :START must be a non-negative integer, :END NIL or non-negative integer.
     (unless (and (integerp start) (>= start 0))
       (error "fill: :START must be a non-negative integer"))

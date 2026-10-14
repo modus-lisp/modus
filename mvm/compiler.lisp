@@ -22206,6 +22206,47 @@
       (let ((pk (symbol-package sym)))
         (and pk (string= (package-name pk) "KEYWORD")))))
 
+(defun %kw-in-order-p (plist names)
+  "True when PLIST's keywords appear in the order of NAMES (a subsequence of it)."
+  (let ((p plist) (rest names))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return t))
+      (let ((tail (member (symbol-name (car p)) rest :test (function string=))))
+        (unless tail (return nil))
+        (setq rest (cdr tail)))
+      (setq p (cddr p)))))
+
+(defun %kw-values-simple-p (plist)
+  "True when every value form in PLIST is a symbol or a self-evaluating constant:
+   evaluating them in any order is the same."
+  (let ((p plist))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return t))
+      (let ((v (cadr p)))
+        (unless (or (symbolp v) (numberp v) (stringp v) (characterp v)
+                    (and (consp v) (eq (car v) 'quote)))
+          (return nil)))
+      (setq p (cddr p)))))
+
+(defun %kw-plist-get-present (plist name)
+  "(T . FORM) for keyword NAME's value form in PLIST, (NIL) when absent -- a
+   present NIL value must not read as absent."
+  (let ((p plist))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return (cons nil nil)))
+      (when (string= (symbol-name (car p)) name) (return (cons t (cadr p))))
+      (setq p (cddr p)))))
+
+(defun %kw-plist-distinct-p (plist)
+  "True when no keyword appears twice in the KEYWORD VALUE plist PLIST."
+  (let ((p plist) (seen nil))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return t))
+      (let ((n (symbol-name (car p))))
+        (when (member n seen :test (function string=)) (return nil))
+        (setq seen (cons n seen)))
+      (setq p (cddr p)))))
+
 (defun %kw-plist-get (plist name)
   "The VALUE form after keyword NAME (a string) in PLIST, or NIL."
   (let ((p plist))
@@ -22980,6 +23021,59 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; (replace d s :start1 ..) / (fill v x :start ..) with LITERAL keywords: a call to
+  ;; the positional %REPLACE-POS / %FILL-POS, so no &REST list of keyword arguments is
+  ;; consed per call (one REPLACE a row is how glass copies a rectangle: 17 KB a
+  ;; window-drag frame on a Pi Zero).  Every argument is still evaluated once, left to
+  ;; right in source order (LET* into gensyms).  Only a plain plist of the function's
+  ;; own keywords, each at most once, is rewritten; anything else -- a duplicate,
+  ;; :ALLOW-OTHER-KEYS, a computed keyword -- keeps the general call.
+  (when (and (symbolp fn) (or (name-eq fn "REPLACE") (name-eq fn "FILL"))
+             (consp args) (consp (cdr args)))
+    (let* ((replacep (name-eq fn "REPLACE"))
+           (names (if replacep (list "START1" "END1" "START2" "END2") (list "START" "END")))
+           (kw (cddr args)))
+      (when (and (%kw-plist-p kw names)
+                 (%kw-plist-distinct-p kw)
+                 (<= (length kw) (* 2 (length names))))
+        ;; In the positional order already (:START before :END), or nothing but
+        ;; constants and variables: the direct call evaluates the forms in the same
+        ;; order, so no LET* -- which, with a computed value, cost 64 bytes a call on
+        ;; x64 (register pressure), most of what this saves.
+        (when (or (%kw-in-order-p kw names) (%kw-values-simple-p kw))
+          (flet ((val (name default)
+                   (let ((v (%kw-plist-get-present kw name)))
+                     (if (car v) (cdr v) default))))
+            (return-from compile-call
+              (compile-form
+               (if replacep
+                   (list '%replace-pos (car args) (cadr args)
+                         (val "START1" 0) (val "END1" nil) (val "START2" 0) (val "END2" nil))
+                   (list '%fill-pos (car args) (cadr args) (val "START" 0) (val "END" nil)))
+               env dest))))
+        (let ((binds (list (list (%mvm-gensym "%KA") (car args))
+                           (list (%mvm-gensym "%KB") (cadr args))))
+              (vals nil))
+          (let ((p kw))
+            (loop (when (null p) (return nil))
+              (let ((g (%mvm-gensym "%KV")))
+                (setq binds (append binds (list (list g (cadr p)))))
+                (setq vals (cons (cons (symbol-name (car p)) g) vals)))
+              (setq p (cddr p))))
+          (flet ((val (name default)
+                   (let ((e (assoc name vals :test (function string=))))
+                     (if e (cdr e) default))))
+            (return-from compile-call
+              (compile-form
+               (list 'let* binds
+                     (if replacep
+                         (list '%replace-pos (car (first binds)) (car (second binds))
+                               (val "START1" 0) (val "END1" nil) (val "START2" 0) (val "END2" nil))
+                         (list '%fill-pos (car (first binds)) (car (second binds))
+                               (val "START" 0) (val "END" nil))))
+               env dest)))))))
+  ;; (BEFORE the ordering pass below: that binds every argument of a 5+ argument
+  ;; call to a variable, keywords included, and the call it leaves has none.)
   ;; Left-to-right evaluation for 5+ argument calls: bind the args in a LET
   ;; (which evaluates its inits in order) and call with the variables, which
   ;; are leaves -- so this does not recurse.  See %CALL-ARGS-NEED-ORDERING-P.

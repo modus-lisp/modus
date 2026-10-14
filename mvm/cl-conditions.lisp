@@ -2754,6 +2754,7 @@
         (aset c 0 *%sig-program-error-sym*)
         (aset c 1 nil)
         (setq *current-condition* c)
+        (%capture-signal-frames c)
         (%sig-reentry-leave)
         (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
@@ -2800,6 +2801,15 @@
             nil))))
   nil)
 
+(defun %capture-signal-frames (c)
+  "The runtime's own signals (%SIGNAL-TYPE-ERROR and its siblings) build their condition and
+   longjmp without going through ERROR; give C the signalling stack the way ERROR does when
+   MODUS:*CAPTURE-BACKTRACES* is on.  Called inside the reentry latch, so a signal from in here
+   is dropped rather than recursing."
+  (when (fboundp '%maybe-attach-error-frames)
+    (funcall (symbol-function '%maybe-attach-error-frames) c))
+  c)
+
 (defun %signal-type-error (&optional datum (expected-type nil et-p))
   "Runtime helper: signal a TYPE-ERROR condition for handler-case.
    Used when a CL primitive is called with an argument of the wrong
@@ -2819,6 +2829,7 @@
                       (list (cons 'datum datum) (cons 'expected-type expected-type))
                       nil))
         (setq *current-condition* c)
+        (%capture-signal-frames c)
         (%sig-reentry-leave)
         (if (%error-handler-active-p) (%hc-longjmp) nil))))
 
@@ -2833,6 +2844,7 @@
         (aset c 0 *%sig-undefined-function-sym*)
         (aset c 1 nil)
         (setq *current-condition* c)
+        (%capture-signal-frames c)
         (%sig-reentry-leave)
         (if (%error-handler-active-p) (%hc-longjmp) nil))))
 

@@ -7120,9 +7120,8 @@
                                          ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
                                          (%runtime-special-p var))
-                                     (not (member (symbol-name var) declared
-                                                  :key #'symbol-name
-                                                  :test #'string=)))
+                                     (not (member (normalize-name var) declared
+                                                  :key #'normalize-name)))
                             (push var acc))))
                       (nreverse acc))))
               (specials (append declared implicit)))
@@ -7147,9 +7146,8 @@
                                          ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
                                          (%runtime-special-p var))
-                                     (not (member (symbol-name var) declared
-                                                  :key #'symbol-name
-                                                  :test #'string=)))
+                                     (not (member (normalize-name var) declared
+                                                  :key #'normalize-name)))
                             (push var acc))))
                       (nreverse acc))))
               (specials (append declared implicit)))
@@ -10761,13 +10759,13 @@
                           `(let* ,bindings ,@(or (strip-declares body) (list nil)))
                           `(let ,bindings ,@(or (strip-declares body) (list nil))))
                       env dest))))
-  (let* ((special-names (mapcar (lambda (s) (symbol-name s)) specials))
+  (let* ((special-names (mapcar (lambda (s) (normalize-name s)) specials))
          (save-vars (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))
     ;; Collect just the special bindings for save/set/restore generation
     (dolist (binding bindings)
       (let ((var (if (consp binding) (car binding) binding)))
-        (when (member (symbol-name var) special-names :test #'string=)
+        (when (member (normalize-name var) special-names)
           (push binding special-bindings))))
     (setf special-bindings (nreverse special-bindings))
     (let* ((save-bindings
@@ -10835,8 +10833,7 @@
               (mapcar (lambda (b)
                         (let ((var (if (consp b) (car b) b))
                               (init (if (consp b) (cadr b) nil)))
-                          (let ((pos (position (symbol-name var) special-names
-                                               :test #'string=)))
+                          (let ((pos (position (normalize-name var) special-names)))
                             (if pos
                                 (list (nth pos temp-vars) init)
                                 b))))
@@ -10851,8 +10848,7 @@
                   (seq-bindings
                     (mapcan (lambda (b rb)
                               (let ((var (if (consp b) (car b) b)))
-                                (let ((pos (position (symbol-name var) special-names
-                                                     :test #'string=)))
+                                (let ((pos (position (normalize-name var) special-names)))
                                   (if pos
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
@@ -23460,8 +23456,10 @@
          (and (> (length n) 0) (char= (char n 0) #\&)))))
 
 (defun %sp-name= (a b)
+  ;; NORMALIZE-NAME, not SYMBOL-NAME: two symbols whose names an image cannot
+  ;; recover both read "" and would compare equal (see %PARAM-SPECIAL-P).
   (and (symbolp a) (symbolp b) a b
-       (string= (symbol-name a) (symbol-name b))))
+       (eql (normalize-name a) (normalize-name b))))
 
 (defun %sp-subst (form alist)
   "Replace every symbol in FORM that is a KEY of ALIST with its value.
@@ -24212,8 +24210,12 @@
        (or (gethash (normalize-name var) (%ensure-clhs-specials-table))
            (member (symbol-name var) *clhs-extra-specials* :test #'string=)
            (%runtime-special-p var)
-           (member (symbol-name var) (extract-special-vars body)
-                   :key #'symbol-name :test #'string=))))
+           ;; by NORMALIZE-NAME, not SYMBOL-NAME: in an image whose name
+           ;; table lacks a symbol, SYMBOL-NAME is "" for every such symbol, so
+           ;; (declare (special *f*)) made an unrelated *x* parameter special
+           ;; (ANSI MACROLET.43, gate runner only).
+           (member (normalize-name var) (extract-special-vars body)
+                   :key #'normalize-name))))
 
 (defun mvm-compile-function-internal (name params body &optional parent-env rest-slot opt-start opt-count)
   "CLHS 3.1.2.1.1.2: a parameter named by a SPECIAL variable binds it

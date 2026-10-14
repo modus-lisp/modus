@@ -2524,7 +2524,10 @@
        (not (characterp x))
        (let ((st (obj-subtag x)))
          (or (= st #x60) (and (>= st #x64) (<= st #x66))))
-       (= (array-length x) 4)))
+       ;; The raw header count, not ARRAY-LENGTH: that one is the general
+       ;; (multi-dimensional) array length, and this predicate gates every
+       ;; arithmetic op -- it was most of %IEEE-FLOAT-P's time.
+       (= (%prim-array-length x) 4)))
 
 (defun %float-declared-type (x)
   "The declared CL float type of IEEE float X, from its subtag."
@@ -2603,17 +2606,30 @@
            s
            (%make-typed-float (%float-hi32 s) (%float-lo32 s) type))))))   ; retag short
 
+(defun %float-pair-result (r a b)
+  "R, the double-payload result of an op on IEEE floats A and B, in CLHS
+   contagion format: double when either is double (or long), else rounded to
+   single.  By subtag, with no type symbols and no re-checking of A and B."
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66))
+        r
+        (%round-to-single r))))
+
 (defun %float-result-type (a b)
   "CL float contagion (CLHS 12.1.4.4): the result float format is the
    widest among the float operands.  short/single/rational don't widen
    past single; a double or long operand forces double.  At least one of
    A/B is already a float when this is called from the float branch."
-  (if (or (double-float-p a) (double-float-p b)) 'double-float 'single-float))
+  ;; T for double, NIL for single: every caller hands this straight to
+  ;; %AS-RESULT-FLOAT, and a quoted symbol in image code is a %STATIC-SYMBOL-REF
+  ;; call -- two of them on every float operation, 15% of an Opus decode.
+  (if (or (double-float-p a) (double-float-p b)) t nil))
 
 (defun %as-result-float (r type)
-  "Retag the #x60 double-payload result R to contagion TYPE: round to
-   single-float precision when TYPE is single-float, else leave R double."
-  (if (eq type 'single-float) (%round-to-single r) r))
+  "Retag the #x60 double-payload result R to contagion TYPE (%FLOAT-RESULT-TYPE:
+   T double, NIL single): round to single-float precision for single, else
+   leave R double."
+  (if type r (%round-to-single r)))
 
 (defun %irr-result (r x)
   "Format contagion for a 1-arg irrational/transcendental fn: the #x60
@@ -2797,6 +2813,12 @@
 
 (defun generic-add (a b)
   (cond
+    ;; BOTH FLOATS FIRST, the hot case of numeric code: two predicate calls and
+    ;; the raw op, against eight ratio/integer/complex tests, then
+    ;; %ANY-TO-FLOAT x2 and %FLOAT-RESULT-TYPE (each re-checking) on the arm
+    ;; below -- which this replicates exactly for two IEEE floats.
+    ((and (%ieee-float-p a) (%ieee-float-p b))
+     (%float-pair-result (%float-add a b) a b))
     ;; RATIO +/- INTEGER (fixnum OR bignum) first: it used to reach the
     ;; bignum clause below, so (+ 1/3 (expt 2 70)) was a garbage INTEGER.
     ;; (num + b*den)/den is already in lowest terms (gcd(num+b*den, den) =
@@ -2843,6 +2865,12 @@
 
 (defun generic-multiply (a b)
   (cond
+    ;; BOTH FLOATS FIRST, the hot case of numeric code: two predicate calls and
+    ;; the raw op, against eight ratio/integer/complex tests, then
+    ;; %ANY-TO-FLOAT x2 and %FLOAT-RESULT-TYPE (each re-checking) on the arm
+    ;; below -- which this replicates exactly for two IEEE floats.
+    ((and (%ieee-float-p a) (%ieee-float-p b))
+     (%float-pair-result (%float-mul a b) a b))
     ;; Integer/integer: route through bignum-mul which has a 31-bit
     ;; fast path AND promotes to bignum on overflow.  The naked
     ;; %fixnum-* silently wrapped `(* 2^60 2^60) -> 0' for products
@@ -2881,6 +2909,12 @@
 
 (defun generic-subtract (a b)
   (cond
+    ;; BOTH FLOATS FIRST, the hot case of numeric code: two predicate calls and
+    ;; the raw op, against eight ratio/integer/complex tests, then
+    ;; %ANY-TO-FLOAT x2 and %FLOAT-RESULT-TYPE (each re-checking) on the arm
+    ;; below -- which this replicates exactly for two IEEE floats.
+    ((and (%ieee-float-p a) (%ieee-float-p b))
+     (%float-pair-result (%float-sub a b) a b))
     ;; RATIO -/+ INTEGER first -- see GENERIC-ADD.
     ((and (ratiop a) (integerp b))
      (make-ratio-obj (bignum-sub (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))

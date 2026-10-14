@@ -7914,6 +7914,12 @@
     (emit-jmp buf cheney-loop)
     (emit-label buf cheney-done)))
 
+(defconstant +x64-limit-guard+ #x1000000
+  "Bytes the allocation LIMIT (R14) is kept below the true end of a semispace
+   (capped at a sixteenth of the space, for small thread regions): room for the
+   allocation a plain :gc-check lets through.  See the R14 update at the end of
+   EMIT-GC-TRAMPOLINE, and boot-linux-x64's initial R14.")
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -8192,6 +8198,24 @@
     (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-from-start+)
     (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-space-size+)
     (emit-add-reg-reg buf 'rax 'r11)
+    ;; MINUS THE ALLOC-OVERSHOOT GUARD BAND: min(+x64-limit-guard+, space/16).
+    ;; A plain :gc-check tests R12 < R14 BEFORE an allocation whose size it
+    ;; does not know, so the allocation after a passing check runs past R14 by
+    ;; up to its whole size.  The semispaces are ADJACENT: from-space ends
+    ;; exactly where to-space begins.  An object that overshot the limit sat
+    ;; at the head of to-space, LIVE (a register held it), and the next
+    ;; collection -- which does not forward a pointer into to-space -- copied
+    ;; survivors right over it: a float box came back holding a JIT cons, a
+    ;; dot product added a stranger's term.  Keeping the guard in the LIMIT
+    ;; register (as aarch64's *aarch64-gc-limit-guard* does) leaves the scan
+    ;; and copy bounds on the true semispace end.
+    (let ((capped (make-label)))
+      (emit-shr-reg-imm buf 'r11 4)
+      (emit-cmp-reg-imm buf 'r11 +x64-limit-guard+)
+      (emit-jcc buf :be capped)
+      (emit-mov-reg-imm buf 'r11 +x64-limit-guard+)
+      (emit-label buf capped))
+    (emit-sub-reg-reg buf 'rax 'r11)
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
 
     ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----

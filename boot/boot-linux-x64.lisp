@@ -496,9 +496,15 @@
   ;; R14 = alloc limit
   ;; With GC: midpoint (GC fires when from-space fills)
   ;; Without GC: full heap end (no GC trigger)
+  ;; ... minus the alloc-overshoot guard band (see +x64-limit-guard+ in
+  ;; translate-x64): the first semispace ends where the second begins, and an
+  ;; allocation that overshoots a limit AT the boundary is overwritten by the
+  ;; first collection's survivors.
   (emit-bytes buf #x49 #x89 #xC6)                ; mov r14, rax
   (emit-bytes buf #x49 #x81 #xC6)                ; add r14, imm32
-  (emit-le32 buf *linux-x64-r14-offset*)
+  (emit-le32 buf (if (> *linux-x64-r14-offset* (* 32 modus.mvm.x64::+x64-limit-guard+))
+                     (- *linux-x64-r14-offset* modus.mvm.x64::+x64-limit-guard+)
+                     *linux-x64-r14-offset*))
 
   ;; Initialize GC metadata at ABSOLUTE addresses 0x10000040..0x10000060
   ;; These are in the ELF BSS region (zero-initialized by the kernel loader).

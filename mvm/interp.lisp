@@ -1072,6 +1072,26 @@
 ;;; Positional: the trampoline calls this once per interpreted CALL, and the
 ;;; keyword entry's &KEY parse (seven keywords, each a runtime-interned literal)
 ;;; was a measurable share of every cross-module call.
+(defun %interp-propagate (c)
+  "Pass condition C, ALREADY SIGNALLED, on to the next enclosing handler-case.
+   The interpreter's per-opcode HANDLER-CASE catches every error a bridged
+   native call signals; when the bytecode has no handler frame of its own the
+   condition must keep going outward.  It used to (ERROR C) -- a SECOND signal,
+   so every HANDLER-BIND handler between here and the catcher ran twice for one
+   error (an outer handler-bind's count of 1 read 2).  The handlers have had
+   their turn; this longjmps to the next frame the way the first signal would
+   have, with C as the condition, and re-signals only where nothing is armed
+   (and on the build host, which has no handler-frame stack)."
+  ;; %HC-LONGJMP is a compiler intrinsic (TRAP #x0511), not a function: call
+  ;; it directly.  The host never gets that far.
+  ;; %ERROR-HANDLER-ACTIVE-P is an intrinsic as well; the image-only function
+  ;; %INTERP-INFLIGHT-CONDITION (cl-conditions) is what says "in the image".
+  (if (and (fboundp '%interp-inflight-condition)
+           (%error-handler-active-p))
+      (progn (setq *current-condition* c)
+             (%hc-longjmp))
+      (error c)))
+
 (defun %mvm-interpret-1 (bytecode entry-point function-table runtime-table
                          return-raw initial-args initial-cenv lambda-offsets)
   "Execute MVM bytecode starting at ENTRY-POINT.
@@ -1285,7 +1305,7 @@
                                      (symbol-function '%interp-inflight-condition)))
                              (c (and f (funcall f))))
                         (if c
-                            (error c)
+                            (%interp-propagate c)
                             (error "MVM LONGJMP (TRAP #x0511) with no active handler-case"))))))
                ;; CLEAR-HANDLER (#x0512): the body completed normally — pop the
                ;; jmp-buf so a later error doesn't unwind to this (now exited)
@@ -3057,7 +3077,7 @@
                       (handler-case (format nil "~A" c) (t (e2) "?"))))
             (if (mvm-handlers state)
                 (setf %lj c)
-                (error c)))
+                (%interp-propagate c)))
           ;; NON-ERROR conditions arrive here too: CLHS `error` accepts ANY
           ;; condition designator, and asdf's report-invalid-form does
           ;; `(apply 'error 'invalid-source-registry …)` — a WARNING
@@ -3071,7 +3091,7 @@
           (condition (c)
             (if (mvm-handlers state)
                 (setf %lj c)
-                (error c)))
+                (%interp-propagate c)))
           ;; HARDWARE FAULT (task #236).  The boot SIGSEGV/SIGBUS/SIGFPE/SIGILL
           ;; stub recovers a fault by longjmp WITHOUT setting *CURRENT-CONDITION*
           ;; (it runs in signal context and cannot allocate).  The landing frame
@@ -3090,7 +3110,7 @@
             (let ((fc (or c (%interp-fault-condition))))
               (if (mvm-handlers state)
                   (setf %lj fc)
-                  (error fc)))))
+                  (%interp-propagate fc)))))
         (when %lj
           (let ((rpc (%mvm-longjmp-restore state)))
             (when rpc

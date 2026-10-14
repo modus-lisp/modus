@@ -662,7 +662,12 @@
    archive install (which has no on-disk .asd)."
   (let ((sys (make-instance 'asdf::system
                             :name (asdf::coerce-name name)
-                            :source-file source-file
+                            ;; Its TRUENAME, as ASDF records it: Quicklisp's local-projects
+                            ;; holds symlinks to .asd files, and a system's components are
+                            ;; beside the real file, not beside the link.
+                            :source-file (and source-file
+                                              (or (ignore-errors (namestring (truename source-file)))
+                                                  source-file))
                             :form ds
                             :state (list loaded))))
     (setq asdf::*registered-systems*
@@ -884,9 +889,13 @@
             ((%it-file-exists-p full)
              (princ "    ") (princ full) (terpri) (finish-output)
              (%it-eval-source (%it-slurp-text full) p))
+            ;; A MISSING SOURCE FILE IS AN ERROR, as in ASDF.  It used to print
+            ;; "(missing: ...)" and go on, so a system whose every file was looked
+            ;; for in the wrong directory -- a symlinked .asd whose TRUENAME did not
+            ;; follow the link -- loaded nothing and reported success.
             (t
-             (princ "    (missing: ") (princ full) (princ ")")
-             (terpri) (finish-output))))))))
+             (error "ASDF:LOAD-SYSTEM: ~A: source file ~A does not exist"
+                    (asdf::component-name sys) full))))))))
 
 (defun asdf::%remove-name (n list)
   (let ((acc nil))

@@ -3301,7 +3301,7 @@
   (and (not (fixnump x)) (not (consp x)) (not (null x))
        (not (characterp x))
        (= (obj-subtag x) #x32)
-       (>= (array-length x) 3)
+       (>= (%prim-array-length x) 3)
        (eq (aref x 0) '%complex-marker)))
 
 (defun complex (r &optional i)
@@ -3319,9 +3319,13 @@
       (t
        ;; Float contagion: if either part is a float, coerce both to float.
        (let ((rf r) (im i))
+         ;; ONE format for both parts (CLHS 12.1.5.2): the widest float among
+         ;; them.  %ANY-TO-FLOAT made a rational part DOUBLE beside a single
+         ;; one -- (+ #c(1 2) 0.5) was #C(1.5 2.0d0), not #C(1.5 2.0).
          (when (or (%ieee-float-p r) (%ieee-float-p i))
-           (setq rf (%any-to-float r))
-           (setq im (%any-to-float i)))
+           (let ((proto (if (or (double-float-p r) (double-float-p i)) 1d0 1.0)))
+             (setq rf (float r proto))
+             (setq im (float i proto))))
          (let ((c (make-array 3)))
            (aset c 0 '%complex-marker)
            (aset c 1 rf)
@@ -3374,19 +3378,40 @@
 (defun %complex-real (x) (if (%complex-p x) (aref x 1) x))
 (defun %complex-imag (x) (if (%complex-p x) (aref x 2) 0))
 
+;;; The complex arithmetic below inspects each operand ONCE (%COMPLEX-REAL and
+;;; %COMPLEX-IMAG each re-ran %COMPLEX-P, whose marker test is a quoted-symbol
+;;; lookup) and builds a float-part result with %COMPLEX-FLOATS -- what COMPLEX
+;;; returns for two float parts, without its rational-collapse and contagion
+;;; tests or the full MAKE-ARRAY.  An FFT on complex doubles spent most of its
+;;; time in those (reed's Opus MDCT).
+
+(defun %complex-floats (r i)
+  "The complex R + iI.  When both parts are IEEE floats of one format this
+   is exactly COMPLEX's object, built directly; otherwise COMPLEX."
+  (if (and (%ieee-float-p r) (%ieee-float-p i) (= (obj-subtag r) (obj-subtag i)))
+      (let ((c (%make-array-raw 3)))
+        (aset c 0 '%complex-marker)
+        (aset c 1 r)
+        (aset c 2 i)
+        c)
+      (complex r i)))
+
 (defun complex-add (a b)
-  (complex (+ (%complex-real a) (%complex-real b))
-           (+ (%complex-imag a) (%complex-imag b))))
+  (let* ((ac (%complex-p a)) (bc (%complex-p b)))
+    (%complex-floats (+ (if ac (aref a 1) a) (if bc (aref b 1) b))
+                     (+ (if ac (aref a 2) 0) (if bc (aref b 2) 0)))))
 
 (defun complex-sub (a b)
-  (complex (- (%complex-real a) (%complex-real b))
-           (- (%complex-imag a) (%complex-imag b))))
+  (let* ((ac (%complex-p a)) (bc (%complex-p b)))
+    (%complex-floats (- (if ac (aref a 1) a) (if bc (aref b 1) b))
+                     (- (if ac (aref a 2) 0) (if bc (aref b 2) 0)))))
 
 (defun complex-mul (a b)
-  (let ((ar (%complex-real a)) (ai (%complex-imag a))
-        (br (%complex-real b)) (bi (%complex-imag b)))
-    (complex (- (* ar br) (* ai bi))
-             (+ (* ar bi) (* ai br)))))
+  (let* ((ac (%complex-p a)) (bc (%complex-p b))
+         (ar (if ac (aref a 1) a)) (ai (if ac (aref a 2) 0))
+         (br (if bc (aref b 1) b)) (bi (if bc (aref b 2) 0)))
+    (%complex-floats (- (* ar br) (* ai bi))
+                     (+ (* ar bi) (* ai br)))))
 
 (defun complex-div (a b)
   (let ((ar (%complex-real a)) (ai (%complex-imag a))

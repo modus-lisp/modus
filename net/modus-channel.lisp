@@ -26,9 +26,10 @@
 ;;;; WHAT CAN BE SENT: NIL, T, integers of any size, ratios, single and double
 ;;;; floats, complexes, characters, strings, symbols (interned again by name in
 ;;;; the receiver; uninterned ones arrive as fresh uninterned symbols), lists
-;;;; (dotted too), simple vectors, (unsigned-byte 8) vectors and hash tables
-;;;; (EQ/EQL/EQUAL/EQUALP).  Anything else -- a closure, a struct, a condition, a
-;;;; stream -- SIGNALS in the sender, before the channel is touched.  Values
+;;;; (dotted too), simple vectors, (unsigned-byte 8) vectors, hash tables
+;;;; (EQ/EQL/EQUAL/EQUALP) and DEFSTRUCT instances (rebuilt as the same type).
+;;;; Anything else -- a closure, a CLOS instance, a condition, a stream --
+;;;; SIGNALS in the sender, before the channel is touched.  Values
 ;;;; arrive EQUAL, never EQ: it is a copy.  A shared substructure arrives as two
 ;;;; copies, and a circular one is refused.
 ;;;;
@@ -180,6 +181,20 @@
            (%chan-encode-1 out (car q) (+ depth 1))
            (setq q (cdr q)))
          (%chan-encode-1 out q (+ depth 1)))))
+    ;; A STRUCT is a simple vector here -- slot 0 a marker, slot 1 its type
+    ;; name -- so it must be caught before the vector arm, or it arrives as a
+    ;; plain vector.  It travels as its type name and its slots; the receiver
+    ;; rebuilds it around the genuine marker (see %CHAN-DECODE).
+    ((%struct-instance-p x)
+     (let ((n (length x)))
+       (%chan-put out 14)
+       (%chan-encode-1 out (svref x 1) (+ depth 1))
+       (%chan-put-u32 out (- n 2))
+       (do ((i 2 (+ i 1))) ((>= i n)) (%chan-encode-1 out (svref x i) (+ depth 1)))))
+    ((%clos-instance-p x) (%chan-refuse x "a CLOS instance"))
+    ((typep x 'condition) (%chan-refuse x "a condition: send its type and message instead"))
+    ((streamp x) (%chan-refuse x "a stream"))
+    ((packagep x) (%chan-refuse x "a package"))
     ((typep x '(simple-array (unsigned-byte 8) (*)))
      (%chan-put out 12)
      (%chan-put-u32 out (length x))
@@ -214,7 +229,10 @@
 
 ;;; ---- decoding (in the receiver's own heap) --------------------------------
 
-(defun %chan-decode (v)
+(defun %chan-decode (v marker)
+  "The value encoded in V.  MARKER is the struct marker (slot 0 of any struct
+   instance): the symbol read back by name is not the one the compiled struct
+   code compares against."
   (declare (type (simple-array (unsigned-byte 8) (*)) v))
   (let ((pos 0))
     (declare (type fixnum pos))
@@ -304,6 +322,10 @@
                    ((= tag 12)
                     (let* ((n (u32)) (r (make-array n :element-type '(unsigned-byte 8))))
                       (dotimes (i n r) (setf (aref r i) (u8)))))
+                   ((= tag 14)
+                    (let* ((type-name (val)) (n (u32)) (r (make-array (+ n 2))))
+                      (setf (svref r 0) marker (svref r 1) type-name)
+                      (dotimes (i n r) (setf (svref r (+ i 2)) (val)))))
                    ((= tag 13)
                     (let* ((test (val)) (n (u32))
                            (h (make-hash-table :test test)))
@@ -420,7 +442,8 @@
                (sb-thread:condition-broadcast (%chan-not-full channel)))))
       (sb-thread:release-mutex mutex))
     (if bytes
-        (values (%chan-decode bytes) t)
+        ;; The channel is itself a struct: slot 0 is the genuine marker.
+        (values (%chan-decode bytes (svref channel 0)) t)
         (values nil nil))))
 
 (defun modus::channel-try-receive (channel)

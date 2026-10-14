@@ -28,6 +28,7 @@
 ;;; 1. every sendable type, through a channel on one thread
 (defvar *c* (modus:make-channel))
 (defun rt (x) (modus:channel-send *c* x) (modus:channel-receive *c* :timeout 1))
+(defun refused (x) (handler-case (progn (modus:channel-send *c* x) :sent) (error () :refused)))
 
 (defvar *gensym* (make-symbol "LONELY"))
 (dolist (v (list nil t 0 1 -1 4611686018427387903 -4611686018427387903
@@ -58,8 +59,20 @@
          (list 2 1 "b"))))
 (chk "multiple values" (multiple-value-list (rt 42)) (list 42 t))
 
+;;; structs: rebuilt as the same type, slots copied
+(defstruct pt x y (tags nil))
+(defstruct (pt3 (:include pt)) z)
+(let ((r (rt (make-pt :x 1 :y "two" :tags (list :a 2)))))
+  (chk "a struct arrives as its type" (pt-p r) t)
+  (chk "with its slots" (list (pt-x r) (pt-y r) (pt-tags r)) (list 1 "two" (list :a 2))))
+(let ((r (rt (list 7 (make-pt3 :x 1 :z 3)))))
+  (chk "an included struct inside a list" (list (car r) (pt3-p (cadr r)) (pt-p (cadr r)) (pt3-z (cadr r)) (pt-x (cadr r)))
+       (list 7 t t 3 1)))
+
 ;;; 2. refusals: before the channel is touched
-(defun refused (x) (handler-case (progn (modus:channel-send *c* x) :sent) (error () :refused)))
+(defclass klass () ((a :initform 1)))
+(chk "a CLOS instance is refused" (refused (make-instance 'klass)) :refused)
+(chk "a condition is refused" (refused (make-condition 'simple-error :format-control "x")) :refused)
 (chk "a closure is refused" (refused (let ((k 1)) (lambda () k))) :refused)
 (let ((l (list 1 2 3))) (setf (cdr (last l)) l)
   (chk "a circular list is refused" (refused l) :refused))
@@ -135,14 +148,17 @@
            (lambda ()
              (loop (let ((m (modus:channel-receive *req*)))
                      (when (eq m :stop) (return 0))
-                     (modus:channel-send *rep* (list (car m) (* 2 (cadr m)) (string-upcase (caddr m))))))))))
+                     (modus:channel-send *rep* (list (car m) (* 2 (cadr m)) (string-upcase (caddr m))
+                                                     (make-pt :x (car m))))))))))
   (let ((bad 0))
     (dotimes (i 2000)
       (modus:channel-send *req* (list i (* i i) "ping"))
       (let ((r (modus:channel-receive *rep* :timeout 10)))
-        (unless (equal r (list i (* 2 i i) "PING")) (setq bad (+ bad 1)))))
+        (unless (and (equal (subseq r 0 3) (list i (* 2 i i) "PING"))
+                     (pt-p (fourth r)) (eql (pt-x (fourth r)) i))
+          (setq bad (+ bad 1)))))
     (modus:channel-send *req* :stop)
-    (chk "2000 request/reply round trips" bad 0)
+    (chk "2000 request/reply round trips, a struct in every reply" bad 0)
     (chk "the worker stopped on :STOP" (sb-thread:join-thread th) 0)))
 
 ;;; 7. two senders, one channel: messages never interleave

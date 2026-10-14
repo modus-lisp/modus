@@ -19,8 +19,10 @@
 ;;;; BACKTRACE is defined on it (net/sb-sys-shim.lisp).  A FAULT (a trap from compiled code,
 ;;;; the shared-store guard among them) is delivered by longjmp, so its frames are gone by the
 ;;;; time a handler runs.  So the signal stub walks them first (translate-x64, THE FAULT'S
-;;;; BACKTRACE) into this thread's window, and %FAULT-BACKTRACE-LIST names them: the stack of
-;;;; the LAST hardware fault on this thread, valid until the next one.
+;;;; BACKTRACE) into this thread's window, and the condition the fault becomes takes a copy
+;;;; (%ATTACH-FAULT-FRAMES).  With *CAPTURE-BACKTRACES* on, ERROR does the same for every
+;;;; signalled error, so a condition caught by a HANDLER-CASE -- or logged and dropped, the
+;;;; usual fate of an error in a server loop -- still says where it came from.
 
 (defun %bt-word (addr)
   "The 64-bit word at ADDR, exactly (two 32-bit loads: a :U64 load is not exact)."
@@ -168,6 +170,20 @@
     (when (<= n 63)
       (dotimes (i n) (setq out (cons (%bt-word (+ base 8 (* 8 i))) out))))
     (nreverse out)))
+
+(defvar *capture-backtraces* nil
+  "True: every condition ERROR signals carries the stack it was signalled from (slot
+   %FAULT-FRAMES, as a fault's condition does).  Off by default -- it walks the stack on every
+   error, and some libraries signal errors as routine control flow.  Per thread when bound.")
+
+(defun %maybe-attach-error-frames (c)
+  "Called by ERROR: give C the signalling stack when *CAPTURE-BACKTRACES* is on and C has none
+   yet (a condition re-signalled across an interpreter boundary keeps its first frames)."
+  (when (and *capture-backtraces* (%condition-p c)
+             (null (%condition-slot c '%fault-frames)))
+    (let ((a (%backtrace-addresses)))
+      (when a (aset c 1 (cons (cons '%fault-frames a) (aref c 1))))))
+  c)
 
 (defun %condition-fault-frames (condition)
   "The frames %ATTACH-FAULT-FRAMES gave CONDITION, or NIL."

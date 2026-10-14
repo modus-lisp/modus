@@ -854,18 +854,23 @@
    compiled at run time -- innermost first."
   (sb-debug::print-backtrace :stream stream :count count))
 
-(defun modus::fault-backtrace (&optional condition (stream *error-output*))
-  "Print the stack at a hardware fault (a trap from compiled code: a memory fault, a type
-   check, the shared-store guard), innermost first -- CONDITION's, when it is the condition a
-   fault became, else this thread's last fault.  A fault unwinds before any handler runs, so
-   MODUS:BACKTRACE in its handler shows the handler's stack; this shows the fault's."
+(defun modus::condition-backtrace (&optional condition (stream *error-output*))
+  "Print the stack CONDITION came from, innermost first: a hardware fault's (a trap from
+   compiled code: a memory fault, a type check, the shared-store guard) always, a signalled
+   error's when MODUS:*CAPTURE-BACKTRACES* was on.  With no condition, this thread's last
+   fault.  A HANDLER-CASE has unwound by the time its clause runs, so MODUS:BACKTRACE there
+   shows the handler's stack; this shows the error's."
   (when (fboundp '%print-fault-backtrace) (%print-fault-backtrace stream condition))
   nil)
 
-(defun modus::fault-backtrace-list (&optional condition)
+(defun modus::condition-backtrace-list (&optional condition)
   (if (fboundp '%fault-backtrace-list) (%fault-backtrace-list condition) nil))
 
 (export (list (intern "PRINT-BACKTRACE" "SB-DEBUG") (intern "LIST-BACKTRACE" "SB-DEBUG")) "SB-DEBUG")
-(export (list (intern "BACKTRACE" "MODUS") (intern "FAULT-BACKTRACE" "MODUS")
-              (intern "FAULT-BACKTRACE-LIST" "MODUS"))
+(export (list (intern "BACKTRACE" "MODUS") (intern "CONDITION-BACKTRACE" "MODUS")
+              (intern "CONDITION-BACKTRACE-LIST" "MODUS"))
         "MODUS")
+;; The switch is HOSTED-BACKTRACE's special; MODUS:*CAPTURE-BACKTRACES* is that symbol.
+(when (find-symbol "*CAPTURE-BACKTRACES*" (symbol-package '%backtrace-list))
+  (import (find-symbol "*CAPTURE-BACKTRACES*" (symbol-package '%backtrace-list)) "MODUS")
+  (export (find-symbol "*CAPTURE-BACKTRACES*" (symbol-package '%backtrace-list)) "MODUS"))

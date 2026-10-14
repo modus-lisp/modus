@@ -803,6 +803,13 @@
            ;; Fallback
            (t (make-condition 'simple-error :format-control "error" :format-arguments nil)))))
     (setq *current-condition* cond-obj)
+    ;; THE SIGNALLING FRAMES, when asked for (MODUS:*CAPTURE-BACKTRACES*, hosted x86-64):
+    ;; the condition takes the stack here, before any HANDLER-CASE unwinds it, so a
+    ;; handler -- or whoever reads the condition later -- can still say where it came
+    ;; from.  Not for a THROW in flight (*CATCH-ACTIVE*): that is a control transfer.
+    (unless *catch-active*
+      (when (fboundp '%maybe-attach-error-frames)
+        (funcall (symbol-function '%maybe-attach-error-frames) cond-obj)))
     ;; Associate every currently-active restart frame with this condition
     ;; (implicit with-condition-restarts per CLHS 9.1.4.2.5).
     (%associate-active-restart-frames cond-obj)

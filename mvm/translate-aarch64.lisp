@@ -1437,6 +1437,15 @@
                         (ash rn 5)
                         rd)))
 
+(defun a64-extr (buf rd rn rm lsb)
+  "EXTR Xd, Xn, Xm, #lsb — Xd = low 64 bits of (Xn:Xm) >> lsb.
+   Encoding: 1|00|100111|1|0|Rm|imms(=lsb)|Rn|Rd"
+  (a64-emit buf (logior #x93C00000
+                        (ash rm 16)
+                        (ash (logand lsb #x3F) 10)
+                        (ash rn 5)
+                        rd)))
+
 (defun a64-adc (buf rd rn rm)
   "ADC Xd, Xn, Xm — add with carry (uses C flag from previous ADDS).
    Encoding: 1|00|11010000|Rm|000000|Rn|Rd"
@@ -4315,6 +4324,30 @@
              (a64-mul buf pd +a64-x16+ +a64-x17+) ; 64-bit result
              (a64-lsr-imm buf pd pd 26)         ; shift right 26
              (a64-lsl-imm buf pd pd 1)          ; retag
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- MULSPLIT-LO / MULSPLIT-HI Vd, Va, Vb, k ----
+          ;; The SIGNED 128-bit product untag(Va)*untag(Vb) split at bit K:
+          ;; LO = bits [0,K), HI = (SMULH:MUL) >> K via EXTR, each retagged.
+          ;; x9-x11 are free scratch here, as in +op-mul-checked+.
+          ((or (= op +op-mulsplit-lo+) (= op +op-mulsplit-hi+))
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (k (vr 3))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pa 1)            ; untag va
+             (a64-asr-imm buf +a64-x10+ pb 1)           ; untag vb
+             (a64-mul buf +a64-x11+ +a64-x9+ +a64-x10+) ; low 64 of the product
+             (if (= op +op-mulsplit-hi+)
+                 (progn
+                   (a64-smulh buf +a64-x9+ +a64-x9+ +a64-x10+) ; high 64, signed
+                   (a64-extr buf pd +a64-x9+ +a64-x11+ k))     ; (hi:lo) >> k
+                 (progn                                       ; low k bits
+                   (a64-lsl-imm buf pd +a64-x11+ (- 64 k))
+                   (a64-lsr-imm buf pd pd (- 64 k))))
+             (a64-lsl-imm buf pd pd 1)                  ; retag
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -7985,12 +8018,36 @@
     ;; REGISTER (not the metadata) means scan/copy bounds still use the true
     ;; semispace end, and any alloc smaller than the guard stays inside RAM.
     (a64-mov-reg buf +a64-x24+ +a64-x21+)
-    (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
-    (when (and (boundp '*aarch64-gc-limit-guard*)
-               (integerp *aarch64-gc-limit-guard*)
-               (> *aarch64-gc-limit-guard* 0))
-      (a64-load-imm64-general buf +a64-x9+ *aarch64-gc-limit-guard*)
-      (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))
+    ;; HOSTED LINUX: the guard above was 0 there because the mmap ends 16 MB
+    ;; past the UPPER semispace -- but the two semispaces are ADJACENT, so with
+    ;; x25 at the very end of the LOWER one, an allocation that passed the
+    ;; check runs into the to-space the next collection copies survivors into,
+    ;; over the straddling object's tail (measured on x64, translate-x64's
+    ;; LIMIT HEADROOM note: a field element overwritten by a cons; fixed there
+    ;; in fcb5a4a).  Stop min(16 MB, space_size/16) short of each semispace's
+    ;; end -- SCALED, because a carved per-thread region can be 16 MB and a
+    ;; flat 16 MB would put its limit at its start.  x25 holds space_size here;
+    ;; x9/x10 are dead scratch (see the pause-timer note below).  Bare metal
+    ;; keeps its flat *AARCH64-GC-LIMIT-GUARD* (8 MB on the CL images), which
+    ;; already covers both semispaces.
+    (if *aarch64-linux-mode*
+        (let ((capped (incf *mvm-label-counter*)))
+          (a64-lsr-imm buf +a64-x9+ +a64-x25+ 4)              ; x9 = space_size/16
+          (a64-load-imm64-general buf +a64-x10+ #x1000000)    ; cap: 16 MB
+          (a64-cmp-reg buf +a64-x9+ +a64-x10+)
+          (let ((i (a64-current-index buf)))
+            (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i capped :bcond))
+          (a64-mov-reg buf +a64-x9+ +a64-x10+)
+          (a64-set-label buf capped)
+          (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
+          (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))
+        (progn
+          (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
+          (when (and (boundp '*aarch64-gc-limit-guard*)
+                     (integerp *aarch64-gc-limit-guard*)
+                     (> *aarch64-gc-limit-guard* 0))
+            (a64-load-imm64-general buf +a64-x9+ *aarch64-gc-limit-guard*)
+            (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))))
     ;; gc_count += 1 (stored <<1 → += 2), IN THIS REGION
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ +gc-off-count+)
     (a64-add-imm buf +a64-x9+ +a64-x9+ 2)

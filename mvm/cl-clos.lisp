@@ -6420,6 +6420,14 @@
        (if (%bulk-copy-ok-p r seq)
            (progn (%bulk-copy r 0 seq 0 (length seq)) r)
            (dotimes (i (length seq) r) (aset r i (aref seq i))))))
+    ;; packed (unsigned-byte 8) vector (subtag #x11) copies to a packed one.
+    ;; It fell through to the generic MAKE-ARRAY below and came back a #x32
+    ;; simple-vector: equal-looking, but a caller that DECLARES the copy
+    ;; (simple-array (unsigned-byte 8) (*)) -- natrium's BYTES= does -- takes
+    ;; the packed-byte fast path and reads the word vector as bytes.
+    ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x11))
+     (let ((r (%make-u8-vector (length seq))))
+       (dotimes (i (length seq) r) (setf (aref r i) (aref seq i)))))
     ;; packed single-float vector (subtag #x12) copies to a packed one
     ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x12))
      (let ((r (%make-f32-vector (length seq))))

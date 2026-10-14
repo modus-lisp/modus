@@ -251,7 +251,11 @@
   (setq *print-right-margin* nil)
   ;; Default *features* — built-ins always present.  Tests can rebind
   ;; via (let ((*features* …)) …) since *features* is dynamic.
-  (setq *features* (list :common-lisp :cl :ansi-cl :modus)))
+  ;; :MODUS-MUL-SPLIT advertises the %MUL-SPLIT-LO/-HI compiler intrinsic, so
+  ;; a library (natrium's fe25519) can use it under #+modus-mul-split and fall
+  ;; back to portable code on a modus that predates it -- #+modus alone made
+  ;; such a modus fail with %MUL-SPLIT-LO undefined.
+  (setq *features* (list :common-lisp :cl :ansi-cl :modus :modus-mul-split)))
 
 (defun %init-reader ()
   "Initialize reader. Must be called after %init-packages."

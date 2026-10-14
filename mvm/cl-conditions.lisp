@@ -2458,6 +2458,13 @@
             nil))))
   nil)
 
+;;; Called by the bounds check the compiler emits before every element access
+;;; (compiler.lisp %EMIT-INDEX-CHECK).  If no handler takes the TYPE-ERROR this
+;;; returns NIL and the emitted code SKIPS the access -- it is never performed
+;;; out of range.
+(defun %aref-index-error (arr idx)
+  (%signal-type-error idx (list 'integer 0 (- (%prim-array-length arr) 1))))
+
 (defun %signal-type-error (&optional datum (expected-type nil et-p))
   "Runtime helper: signal a TYPE-ERROR condition for handler-case.
    Used when a CL primitive is called with an argument of the wrong

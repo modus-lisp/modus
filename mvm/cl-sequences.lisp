@@ -2228,12 +2228,15 @@
   ;; a program-error.
   (when (and state (cdr state))
     (error "random: too many arguments"))
-  ;; (random 0) is undefined in CL but happens when callers pass an
-  ;; overflowed bound like (ASH 1 64) → 0.  Returning 0 keeps the
-  ;; caller alive instead of #DE-trapping into a kernel-killing
-  ;; nested-exception loop (we don't install an IDT entry for #DE).
-  (if (= n 0)
-      0
+  ;; CLHS: LIMIT is a positive integer or a positive float.  (random 0) used
+  ;; to return 0 -- a guard against the integer path's division #DE-trapping
+  ;; on bare metal, where no IDT entry handles #DE -- and a negative LIMIT
+  ;; returned a value in (LIMIT, 0].  Both now signal the TYPE-ERROR SBCL
+  ;; signals, which also keeps the zero away from the division.  A caller
+  ;; that indexed with (random 0) used to go on to read one past the end of
+  ;; an empty vector (ANSI subtypep 26525/26526 "passed" that way).
+  (if (not (or (and (integerp n) (> n 0)) (and (floatp-impl n) (> n 0))))
+      (error 'type-error :datum n :expected-type '(or (integer 1) (float (0.0))))
       ;; The seed lives at #x10000FD8 -- NOT #x100000A0, which is the SECOND
       ;; extra slot of the multiple-value buffer (#x10000098..#x10000138): every
       ;; function returning three or more values overwrote the seed with its

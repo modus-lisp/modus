@@ -2489,6 +2489,16 @@
                 ;; skipped while the gate is open; %RT-THREADS-ON clears what
                 ;; an earlier fault left.  With the gate shut -- every gate
                 ;; runner, every single-threaded image -- nothing changes.
+                ;;
+                ;; AND NOT AT ALL IN AN IMAGE THAT CAN RUN THREADS (X64-SSG-P).
+                ;; With the gate still shut, a fault on main left its RIP in the
+                ;; self slot until %RT-THREADS-ON cleared it, and meanwhile
+                ;; every reader of the slot took the RIP for main's window base:
+                ;; %TLS-SELF-BASE (so %HC-FAULT-FIXUP probed -- and could zero --
+                ;; a word at RIP+0x5058), %EVAL-LOCK-ME, the backtrace scratch.
+                ;; Those images record the RIP per thread instead, as frame 0 of
+                ;; THE FAULT'S BACKTRACE below.
+                (unless (x64-ssg-p)
                 (let ((skip-rip (make-label)))
                   (emit-bytes buf #x83 #x3C #x25)                   ; cmp dword [0x10000DB8], 0
                   (emit-u32 buf #x10000DB8)
@@ -2497,7 +2507,7 @@
                   (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (saved RIP)
                   (emit-bytes buf #x48 #x89 #x04 #x25)
                   (emit-u32 buf #x10000C30)
-                  (emit-label buf skip-rip))
+                  (emit-label buf skip-rip)))
                 (emit-bytes buf #x48 #x8B #x82 #xA0 #x00 #x00 #x00) ; mov rax, [rdx+0xA0] (saved RSP)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C38)
@@ -2515,6 +2525,58 @@
                 (emit-bytes buf #x48 #x89 #xD0)                     ; mov rax, rdx (ucontext ptr)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C58)
+                ;; THE FAULT'S BACKTRACE.  The longjmp below discards the
+                ;; faulting frames, so walk them NOW, while they exist: the
+                ;; interrupted RIP, then the return address of every frame up
+                ;; the RBP chain (gregs RBP = ucontext+0x78), into this
+                ;; thread's window -- +0x5200 the count, +0x5208.. up to 63
+                ;; addresses.  net/hosted-backtrace.lisp names them
+                ;; (MODUS:FAULT-BACKTRACE).  The chain is trusted only while
+                ;; it climbs: a link must be 8-aligned, above the last one,
+                ;; within 256 MB of the faulting RSP, and carry a return
+                ;; address above the zero page.  If it lies anyway and a read
+                ;; faults, SA_NODEFER re-enters this stub; the busy word at
+                ;; +0x51F8 makes that second entry skip the walk (and clear
+                ;; the word), so the fault is still recovered, just without
+                ;; frames.  Uses RAX/RCX (dead here) and saves RSI/RDI/R8.
+                (when (x64-ssg-p)
+                  (let ((walk-loop (make-label)) (walk-done (make-label))
+                        (walk-busy (make-label)))
+                    (emit-bytes buf #x56 #x57 #x41 #x50)            ; push rsi / rdi / r8
+                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf #x100051F8) (emit-bytes buf #x00)
+                    (emit-jcc buf :ne walk-busy)                    ; cmp qword fs:[busy], 0
+                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 1)
+                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x10005200) (emit-u32 buf 0)
+                    (emit-bytes buf #x48 #x8B #x72 #x78)            ; mov rsi, [rdx+0x78]  (RBP)
+                    (emit-bytes buf #x4C #x8B #x82 #xA0 #x00 #x00 #x00) ; mov r8, [rdx+0xA0] (RSP)
+                    (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (RIP)
+                    (emit-bytes buf #x64 #x48 #x89 #x04 #x25) (emit-u32 buf #x10005208) ; frame 0
+                    (emit-bytes buf #xB9 #x01 #x00 #x00 #x00)       ; mov ecx, 1
+                    (emit-bytes buf #x4C #x89 #xC7)                 ; mov rdi, r8 (the faulting RSP)
+                    (emit-label buf walk-loop)
+                    (emit-bytes buf #x83 #xF9 #x3F)                 ; cmp ecx, 63
+                    (emit-jcc buf :ae walk-done)
+                    (emit-bytes buf #x40 #xF6 #xC6 #x07)            ; test sil, 7
+                    (emit-jcc buf :ne walk-done)
+                    (emit-bytes buf #x4C #x39 #xC6)                 ; cmp rsi, r8
+                    (emit-jcc buf :b walk-done)
+                    (emit-bytes buf #x48 #x89 #xF0)                 ; mov rax, rsi
+                    (emit-bytes buf #x48 #x29 #xF8)                 ; sub rax, rdi
+                    (emit-bytes buf #x48 #x3D) (emit-u32 buf #x10000000) ; cmp rax, 256 MB
+                    (emit-jcc buf :a walk-done)
+                    (emit-bytes buf #x48 #x8B #x46 #x08)            ; mov rax, [rsi+8] (return address)
+                    (emit-bytes buf #x48 #x3D) (emit-u32 buf 4096)  ; cmp rax, 4096
+                    (emit-jcc buf :b walk-done)
+                    (emit-bytes buf #x64 #x48 #x89 #x04 #xCD) (emit-u32 buf #x10005208) ; fs:[+0x5208+rcx*8]
+                    (emit-bytes buf #xFF #xC1)                      ; inc ecx
+                    (emit-bytes buf #x4C #x8D #x46 #x10)            ; lea r8, [rsi+16]
+                    (emit-bytes buf #x48 #x8B #x36)                 ; mov rsi, [rsi]
+                    (emit-jmp buf walk-loop)
+                    (emit-label buf walk-done)
+                    (emit-bytes buf #x64 #x48 #x89 #x0C #x25) (emit-u32 buf #x10005200) ; count
+                    (emit-label buf walk-busy)
+                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 0)
+                    (emit-bytes buf #x41 #x58 #x5F #x5E)))          ; pop r8 / rdi / rsi
                 ;; lock inc qword [0x10000CA0] -- the recovered-fault COUNT.
                 ;; The longjmp below publishes no condition; %HC-FAULT-FIXUP
                 ;; (cl-conditions) compares this against the last count it

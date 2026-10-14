@@ -18,7 +18,9 @@
 ;;;; this from one shows the stack at the error -- SBCL's own idiom, and SB-DEBUG:PRINT-
 ;;;; BACKTRACE is defined on it (net/sb-sys-shim.lisp).  A FAULT (a trap from compiled code,
 ;;;; the shared-store guard among them) is delivered by longjmp, so its frames are gone by the
-;;;; time a handler runs; those need the signal handler to walk first.
+;;;; time a handler runs.  So the signal stub walks them first (translate-x64, THE FAULT'S
+;;;; BACKTRACE) into this thread's window, and %FAULT-BACKTRACE-LIST names them: the stack of
+;;;; the LAST hardware fault on this thread, valid until the next one.
 
 (defun %bt-word (addr)
   "The 64-bit word at ADDR, exactly (two 32-bit loads: a :U64 load is not exact)."
@@ -149,6 +151,30 @@
 (defun %print-backtrace (&optional (stream *error-output*) (max 60))
   (let ((i 0))
     (dolist (f (%backtrace-list max))
+      (format stream "~&~3d: ~a~%" i f)
+      (setq i (+ i 1))))
+  (force-output stream)
+  nil)
+
+(defun %fault-backtrace-addresses ()
+  "The addresses the signal stub recorded at this thread's last hardware fault -- the faulting
+   instruction, then the return addresses up the chain -- or NIL if it recorded none."
+  (let* ((base (+ (%tls-self-base) (%conv-addr #x10005200)))
+         (n (%bt-word base)) (out nil))
+    (when (<= n 63)
+      (dotimes (i n) (setq out (cons (%bt-word (+ base 8 (* 8 i))) out))))
+    (nreverse out)))
+
+(defun %fault-backtrace-list ()
+  "The stack at this thread's last hardware fault, named as %BACKTRACE-LIST names frames."
+  (let* ((addrs (%fault-backtrace-addresses))
+         (table (and addrs (%bt-code-table)))
+         (jit (and (some (lambda (a) (>= a #x3000000000)) addrs) (%bt-jit-table))))
+    (mapcar (lambda (a) (%bt-name a table jit)) addrs)))
+
+(defun %print-fault-backtrace (&optional (stream *error-output*))
+  (let ((i 0))
+    (dolist (f (%fault-backtrace-list))
       (format stream "~&~3d: ~a~%" i f)
       (setq i (+ i 1))))
   (force-output stream)

@@ -854,5 +854,18 @@
    compiled at run time -- innermost first."
   (sb-debug::print-backtrace :stream stream :count count))
 
+(defun modus::fault-backtrace (&optional (stream *error-output*))
+  "Print the stack at this thread's last hardware fault (a trap from compiled code: a memory
+   fault, a type check, the shared-store guard), innermost first.  A fault unwinds before any
+   handler runs, so MODUS:BACKTRACE in its handler shows the handler's stack; this shows the
+   fault's."
+  (when (fboundp '%print-fault-backtrace) (%print-fault-backtrace stream))
+  nil)
+
+(defun modus::fault-backtrace-list ()
+  (if (fboundp '%fault-backtrace-list) (%fault-backtrace-list) nil))
+
 (export (list (intern "PRINT-BACKTRACE" "SB-DEBUG") (intern "LIST-BACKTRACE" "SB-DEBUG")) "SB-DEBUG")
-(export (list (intern "BACKTRACE" "MODUS")) "MODUS")
+(export (list (intern "BACKTRACE" "MODUS") (intern "FAULT-BACKTRACE" "MODUS")
+              (intern "FAULT-BACKTRACE-LIST" "MODUS"))
+        "MODUS")

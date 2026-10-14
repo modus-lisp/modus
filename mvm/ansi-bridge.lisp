@@ -6217,8 +6217,12 @@
        ;; which were ~18% of an Opus decode through MAKE-ARRAY's element type.
        ;; A collision just takes the full path.  No set at all (a table filled
        ;; by some other means) also takes the full path.
-       (or (null *%deftype-name-hashes*)
-           (gethash (aref head 0) *%deftype-name-hashes*))
+       ;; ONLY WHEN IT IS A TABLE: an image that skips DEFVAR init thunks (the
+       ;; ANSI gate image, Limitation #7) leaves the variable holding the
+       ;; unbound marker, and GETHASH on that faulted -- 325 tests.
+       (let ((nh (and (boundp '*%deftype-name-hashes*) *%deftype-name-hashes*)))
+         (or (not (hash-table-p nh))
+             (gethash (aref head 0) nh)))
        (let ((nm (%eval-sym-name head)))
          (and nm (or (%deftype-pkg-get head nm)
                      (gethash nm *%runtime-deftype-table*))))))

@@ -2466,44 +2466,7 @@
 
 (defun max (a &rest more) (let ((r a)) (dolist (x more r) (when (> x r) (setq r x)))))
 (defun min (a &rest more) (let ((r a)) (dolist (x more r) (when (< x r) (setq r x)))))
-;; CL floor: q toward -∞, r = n - q·d (sign of r matches sign of d when r≠0).
-;; truncate gives q toward 0, so when sign(r_t) ≠ sign(d) we adjust.
-(defun floor (n &optional (d 1))
-  (let* ((q (truncate n d))
-         (r (- n (* q d))))
-    (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
-        (values (- q 1) (+ r d))
-        (values q r))))
-;; CL ceiling: q toward +∞, sign(r) opposite of sign(d) when r≠0.
-(defun ceiling (n &optional (d 1))
-  (let* ((q (truncate n d))
-         (r (- n (* q d))))
-    (if (and (not (zerop r)) (eq (< r 0) (< d 0)))
-        (values (+ q 1) (- r d))
-        (values q r))))
-;; CL round: nearest integer, ties to even.  Compute floor first; r_f is in
-;; [0, |d|) (with d's sign).  Compare 2·|r_f| with |d| to pick floor or ceil.
-(defun round (n &optional (d 1))
-  (let* ((q (truncate n d))
-         (r (- n (* q d)))
-         ;; Adjust to floor result (q_f, r_f).
-         (q-f (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
-                  (- q 1) q))
-         (r-f (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
-                  (+ r d) r))
-         ;; q_c = q_f + 1, r_c = r_f - d.
-         (q-c (+ q-f 1))
-         (r-c (- r-f d))
-         (a-f (abs r-f))
-         (a-c (abs r-c)))
-    (cond
-      ((< a-f a-c) (values q-f r-f))
-      ((> a-f a-c) (values q-c r-c))
-      ;; Tie — round to even.
-      ((zerop (rem q-f 2)) (values q-f r-f))
-      (t (values q-c r-c)))))
-(defun rem (n d) (- n (* (truncate n d) d)))
-(defun mod (n d) (let ((r (rem n d))) (if (and (not (zerop r)) (not (eq (< r 0) (< d 0)))) (+ r d) r)))
+
 (defun %float-non-finite-p (f)
   "True iff F is an IEEE float whose exponent is all-ones (±inf or NaN).
    Used by expt to detect IEEE-double overflow without trapping MXCSR."
@@ -2631,7 +2594,7 @@
     ((floatp-impl x) t)
     ((ratiop x) t)
     (t nil)))
-(defun rationalp (x) (integerp x))
+
 ;; complexp lives in cl-sequences.lisp with the proper %complex-p check.
 ;; The stub here always returned NIL and shadowed the real impl via
 ;; last-defun-wins (cl-eval loads after cl-sequences).
@@ -2675,9 +2638,6 @@
   val)
 
 (defun random-fixnum () (random most-positive-fixnum))
-(defun subtypep* (t1 t2)
-  (multiple-value-bind (sub good) (subtypep t1 t2)
-    (values (if sub t nil) (if good t nil))))
 
 ;;; Bignum (2-slot object, subtag #x30).  Two flavours share the subtag:
 ;;;
@@ -3667,13 +3627,11 @@
 ;; Funcallable versions of compiler builtins (needed for #'consp etc.)
 (defun consp (x) (consp x))
 (defun atom (x) (atom x))
-(defun null (x) (null x))
 ;; NUMBERP intentionally NOT redefined here.  The early version at
 ;; L2358 — `(or (integerp x) (floatp-impl x))` — is the correct one;
 ;; an "(integerp x)" reduction lived here for ages and silently won
 ;; (last-defun-wins, no compile-numberp inline), making (numberp 1.5)
 ;; return NIL.  See `NOTE: redefining` audit 2026-06-01.
-(defun symbolp (x) (symbolp x))
 
 (defun characterp (x) (characterp x))
 
@@ -3692,7 +3650,7 @@
      (aref (symbol-name x) 0))
     (t (error "CHARACTER: ~S is not a character designator" x))))
 (defun stringp (x) (stringp x))
-(defun zerop (x) (zerop x))
+
 (defun plusp (x) (> x 0))
 (defun minusp (x) (< x 0))
 (defun map (result-type fn &rest seqs)
@@ -3864,14 +3822,8 @@
     ((bignump x) nil)
     ((and (integerp x) (< x #x100000)) nil)
     (t t)))
-(defun keywordp (x)
-  "True if X is a keyword (symbol starting with :)."
-  ;; In MVM, keywords are symbols whose name-hash matches the : prefix pattern
-  ;; Stub: check if it's one of the common keywords used in tests
-  (member x '(:test :key :test-not :count :start :end :from-end
-              :initial-element :initial-contents :element-type
-              :allow-other-keys)))
-(defun symbol-package (x) nil)  ; stub
+
+  ; stub
 
 
 ;; Module system stubs
@@ -3963,13 +3915,6 @@
               (setq cur (cdr cur))
               (setq i (+ i 1)))))))))
 
-;; Adjustable arrays
-(defun adjustable-array-p (array)
-  "Return true if array is adjustable. Our arrays are not adjustable by default."
-  nil)
-(defun array-displacement (array)
-  "Return displacement info for ARRAY. Our arrays are never displaced."
-  (values nil 0))
 
 ;;; ============================================================
 ;;; SETF runtime — get-setf-expansion as a real function, plus the

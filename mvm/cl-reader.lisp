@@ -2287,10 +2287,6 @@
 
 ;;; --- Make-symbol (uninterned) ---
 
-(defun make-symbol (name)
-  "Create an uninterned symbol with NAME."
-  (let ((sym (%make-cl-symbol (%pkg-string-designator name))))
-    sym))
 
 ;;; --- with-standard-io-syntax support ---
 ;;; This is a function that evaluates a thunk with standard I/O bindings.

@@ -80,13 +80,7 @@
           (t nil)))
       nil))
 
-(defun open-stream-p (s)
-  (if (streamp s)
-      (if (= (%stream-type s) 9)
-          ;; file stream: open only if fd >= 0
-          (if (>= (%fs-fd s) 0) t nil)
-          t)
-      nil))
+
 (defun stream-element-type (s)
   ;; For file streams (type 9) report the :element-type the stream was
   ;; opened with (CHARACTER vs a byte type like (UNSIGNED-BYTE 8)).  All
@@ -102,7 +96,6 @@
 (defun stream-external-format (s) :default)
 (defun interactive-stream-p (s) nil)
 
-(defun close (stream &rest args) t)
 
 ;;; --- Stream subtype predicates ---
 ;;; Used by typep dispatch (and directly callable from CL code) to

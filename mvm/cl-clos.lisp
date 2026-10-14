@@ -6494,26 +6494,7 @@
            (let ((bits (mem-ref (+ +mv-values-addr+ (* n 8)) :u64)))
              (ash bits -1)))))
     (t nil)))
-(defun copy-symbol (sym &optional copy-props)
-  "Create a fresh uninterned symbol with the same name as SYM.
-   Per CLHS 12.7.5, the new symbol has no function/value bindings;
-   if COPY-PROPS is true the property list is shared (modus has no
-   symbol plists, so this is a no-op)."
-  (declare (ignore copy-props))
-  (cond
-    ((null sym) (make-symbol "NIL"))
-    ((eq sym t) (make-symbol "T"))
-    (t
-     (let ((name (cond ((symbolp sym) (symbol-name sym))
-                       ((stringp sym) sym)
-                       (t "G"))))
-       (make-symbol name)))))
-;; realpart / imagpart / conjugate / complexp live in cl-sequences.lisp
-;; with the proper 3-slot complex array recognition.  The stubs that
-;; were here unconditionally returned z / 0 and shadowed the real
-;; implementations via last-defun-wins.
-(defun numerator (r) r)
-(defun denominator (r) 1)
+
 (defun float (n &optional proto)
   "Convert N to a float (CLHS).  With no PROTO: an existing float is
    returned unchanged, otherwise N becomes a SINGLE-FLOAT (the CLHS
@@ -6533,8 +6514,6 @@
       ;; No prototype: keep an existing float's format; coerce others to single.
       ((%ieee-float-p n) n)
       (t (%round-to-single f)))))
-(defun rational (n) n)
-
 
 ;;; ============================================================
 ;;; CLOS MOP Stubs

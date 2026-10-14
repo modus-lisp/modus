@@ -161,17 +161,6 @@
       (setq i (+ i 1))
       (setq cur (cdr cur)))))
 
-(defun sublis (alist tree)
-  (let ((pair (assoc (car tree) alist)))
-    (if pair
-        (cdr pair)
-        (if (consp tree)
-            (let ((a (sublis alist (car tree)))
-                  (d (sublis alist (cdr tree))))
-              (if (and (eq a (car tree)) (eq d (cdr tree)))
-                  tree
-                  (cons a d)))
-            tree))))
 
 (defun mapl (fn list &rest more-lists)
   "ANSI variadic MAPL: call FN on successive sublists (tails) of the lists,
@@ -2270,7 +2259,6 @@
             (* n (/ (float next) 1073741824.0))
             (- next (* (truncate next n) n))))))
 (defun do-special-strings (fn) (funcall fn ""))
-(defun typep* (obj type) (typep obj type))
 
 ;;; String functions
 (defun %concat-elt-count (s)
@@ -2638,17 +2626,6 @@
                (aset v i (car cur))
                (setq cur (cdr cur)) (setq i (+ i 1))))))))))
 
-(defun replace (s1 s2 &rest args)
-  "Replace elements of S1 with elements from S2.
-   NOTE: this definition is SHADOWED by the one in cl-eval.lisp (loaded
-   later → last-defun-wins).  The active overlap-safe version lives there."
-  (%check-kw-allowed args '(:start1 :end1 :start2 :end2))
-  (let ((len (if (< (length s1) (length s2)) (length s1) (length s2))))
-    (dotimes (i len)
-      (if (consp s1)
-          (let ((cell (nthcdr i s1))) (when cell (set-car cell (elt s2 i))))
-          (aset s1 i (elt s2 i)))))
-  s1)
 
 (defun fill (seq item &rest args)
   "Fill SEQUENCE with ITEM. Honors :START and :END.  Strings store
@@ -3097,37 +3074,6 @@
       (dotimes (i size) (aset s i ch))
       s)))
 
-(defun string-trim (chars str)
-  "Trim characters from both ends of string."
-  (string-left-trim chars (string-right-trim chars str)))
-
-(defun string-left-trim (chars str)
-  "Trim characters from left of string."
-  (let ((char-list (if (stringp chars)
-                       (let ((r nil)) (dotimes (i (array-length chars)) (setq r (cons (aref chars i) r))) r)
-                       chars))
-        (start 0) (len (array-length str)))
-    (loop (when (>= start len) (return ""))
-      (unless (member (aref str start) char-list) (return))
-      (setq start (+ start 1)))
-    (if (= start 0) str
-        (let ((result (%make-string-array (- len start))))
-          (dotimes (i (- len start)) (aset result i (aref str (+ start i))))
-          result))))
-
-(defun string-right-trim (chars str)
-  "Trim characters from right of string."
-  (let ((char-list (if (stringp chars)
-                       (let ((r nil)) (dotimes (i (array-length chars)) (setq r (cons (aref chars i) r))) r)
-                       chars))
-        (end (array-length str)))
-    (loop (when (<= end 0) (return ""))
-      (unless (member (aref str (- end 1)) char-list) (return))
-      (setq end (- end 1)))
-    (if (= end (array-length str)) str
-        (let ((result (%make-string-array end)))
-          (dotimes (i end) (aset result i (aref str i)))
-          result))))
 
 ;;; Numeric
 (defun logbitp (index integer)
@@ -3196,7 +3142,6 @@
      (complex (aref x 1) (%negate-number (aref x 2))))
     (t x)))
 
-(defun complexp (x) (%complex-p x))
 
 (defun %complex-abs (z)
   "Magnitude of complex Z.  Used by the compiler's ABS macro for the complex
@@ -3250,12 +3195,6 @@
 ;;; (consp obj) stub that previously won under last-defun-wins so plain
 ;;; cons lists wouldn't (typep '(1 2 3) 'hash-table) → T anymore.
 
-;;; Symbol
-(defun symbol-name (sym)
-  "Return the name of a symbol as a string (stub)."
-  (if (null sym) "NIL"
-      (if (eq sym t) "T"
-          "")))
 
 ;;; Test helpers
 (defun random-from-interval (max &optional (min 0))
@@ -3285,22 +3224,7 @@
   (cond
     ((bignump n) (not (zerop (logand (%bignum-low-limb n) 1))))
     (t (not (zerop (logand n 1))))))
-(defun boundp (sym)
-  "Per CLHS, BOUNDP returns T iff SYM has a value cell binding.
-   Modus stores special-var values in the global hash table at fixed slot
-   0x10000080, keyed by name-hash.  Look SYM up by its hash.  Keywords are
-   always bound to themselves.  Non-symbol input signals type-error per
-   ANSI — we just return NIL for robustness.  (NB cl-packages.lisp defines
-   the authoritative BOUNDP later; this one is kept consistent with the
-   hash-table store so it stays correct under any load order.  The old
-   `(eq (car (car alist)) sym)` walk was ALSO wrong for the hash-keyed
-   store — the keys are name-hashes, not the SYM object.)"
-  (cond
-    ((null sym) t)
-    ((eq sym t) t)
-    ((keywordp sym) t)
-    ((or (fixnump sym) (consp sym) (characterp sym)) nil)
-    (t (%boundp-by-hash (aref sym 0)))))
+
 ;; Old definition was a process-of-elimination heuristic (the same
 ;; fragility class as the old functionp — see commit 7203e19).  It
 ;; returned T for closures, bignums, ratios, packages, and anything

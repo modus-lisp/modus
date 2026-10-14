@@ -5532,13 +5532,26 @@
                          ((eq et 'bit)                  is-bitvec)
                          ;; Any other element type -- (unsigned-byte 8), an
                          ;; integer type, a DEFTYPE -- is not CHARACTER, so a
-                         ;; STRING never has it.  A general array stays a match:
-                         ;; Modus does not track its element type.  This was
-                         ;; (t t), so (typep "abc" '(vector (unsigned-byte 8)))
-                         ;; was T and code telling octets from text (cl-marmot's
-                         ;; store hex-encodes octets and keeps strings) took a
-                         ;; string for bytes.
-                         (t (not is-string)))))
+                         ;; STRING never has it.  This was (t t), so (typep "abc"
+                         ;; '(vector (unsigned-byte 8))) was T and code telling
+                         ;; octets from text (cl-marmot's store hex-encodes
+                         ;; octets and keeps strings) took a string for bytes.
+                         ;; A GENERAL array's element type is T: everything
+                         ;; that upgrades to something else has its own
+                         ;; representation (#x11, #x12, strings).  So it has ET
+                         ;; exactly when ET upgrades to T (CLHS 15.1.2.1) --
+                         ;; FIXNUM yes, (UNSIGNED-BYTE 8) no.  Until 2026-10-14
+                         ;; it matched EVERY non-character ET, so (typep (vector
+                         ;; 1 "two") '(simple-array (unsigned-byte 8) (*))) was
+                         ;; T and a serializer that asked took it for bytes.
+                         ;; (UNSIGNED-BYTE 1), (MOD 2) ... upgrade to BIT, which
+                         ;; a Modus bit vector -- a general array of 0s and 1s
+                         ;; -- has, as the 'BIT arm above says.
+                         (t (and (not is-string)
+                                 (let ((u (upgraded-array-element-type et)))
+                                   (cond ((eq u t) t)
+                                         ((eq u 'bit) is-bitvec)
+                                         (t nil))))))))
                  (and et-ok
                       (cond
                         ((not sz-given) t)

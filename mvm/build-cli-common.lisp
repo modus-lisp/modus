@@ -1739,6 +1739,11 @@
                (read-file-text (merge-pathnames "net/sb-thread-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)
+               ;; MODUS:MAKE-CHANNEL, the message channel between threads: on
+               ;; the thread surface's mutexes, wait queues and MODUS:SHARE.
+               (read-file-text (merge-pathnames "net/modus-channel.lisp"
+                                                *modus-base*))
+               (string #\Newline)
                (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)

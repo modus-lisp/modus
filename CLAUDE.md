@@ -2566,6 +2566,24 @@ operation with its own cross-region story, untouched here; `BOUNDP` walks the
 table, so a special bound only per-thread reads as unbound on that thread; the
 58-binding ceiling; and `kiln modus-rfb PORT` was not run.
 
+### MODUS:MAKE-CHANNEL — messages between threads that cost the shared heap nothing (2026-10-14)
+
+`modus:share` (and `join-thread`'s result) copies into the runtime lock arena —
+~8.9 KB per 1000-char string — and that arena is reclaimed only by a
+STOP-THE-WORLD collection of region 0, so passing messages that way stops every
+thread every few thousand messages.  `net/modus-channel.lisp` (baked after the
+thread shim): one shared byte ring per channel, made once; `channel-send`
+encodes in the SENDER's heap and copies BYTES in (not objects, so the guard has
+nothing to refuse), `channel-receive` decodes fresh in the RECEIVER's heap.
+Plain data only (numbers, chars, strings, symbols by name, lists, simple and u8
+vectors, hash tables); anything else signals in the sender.  `:modus-channel`
+on `*features*`.  Measured: 20 000 x 1 KB worker -> main, 0 arena bytes, 0
+region-0 collections, ~95 us/message (`modus:share`: 3 stop-the-world
+collections for the same).  `test/hosted-channel.lisp` (56 checks, x64 +
+aarch64).  It surfaced a TYPEP bug: a general vector matched EVERY
+non-character element type, `(vector (unsigned-byte 8))` included — fixed
+(CLHS upgrade rule), with `make-sequence` of `(vector single-float)` now packed.
+
 ### THE COOPERATIVE ATOMICS ARE SMP-SAFE — except %ATOMIC-CAS, which is not
 
 `net/cooperative-atomics.lisp`'s `%ATOMIC-CAS` / `%ATOMIC-INCF` / `%ATOMIC-DECF`

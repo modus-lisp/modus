@@ -1988,6 +1988,14 @@
               (string= (symbol-name (car et)) "UNSIGNED-BYTE")
               (consp (cdr et)) (eql (cadr et) 8)))))
 
+(defun %seq-type-f32-p (type)
+  "True when TYPE is an array/vector type specifier whose element type
+   upgrades to SINGLE-FLOAT (the packed #x12 vector)."
+  (and (consp type) (symbolp (car type))
+       (member (symbol-name (car type)) '("SIMPLE-ARRAY" "ARRAY" "VECTOR") :test #'string=)
+       (consp (cdr type))
+       (%f32-element-type-p (cadr type))))
+
 (defun %seq-u8-copy (seq)
   "A fresh packed (unsigned-byte 8) vector holding SEQ's elements."
   (let* ((n (length seq))
@@ -2010,6 +2018,19 @@
     (return-from make-sequence
       (make-array size :element-type '(unsigned-byte 8)
                        :initial-element (let ((p (member :initial-element args))) (if p (cadr p) 0)))))
+  ;; (VECTOR SINGLE-FLOAT) is the packed #x12 vector, as MAKE-ARRAY makes it:
+  ;; this built a general vector, which TYPEP of the very type asked for
+  ;; rejects (ANSI make-sequence 17821).
+  (when (%seq-type-f32-p type)
+    (let ((n (and (eq (car type) 'vector) (consp (cddr type)) (caddr type))))
+      (when (and (integerp n) (not (= n size)))
+        (%signal-type-error)
+        (return-from make-sequence nil)))
+    (return-from make-sequence
+      (let ((p (member :initial-element args)))
+        (if p
+            (make-array size :element-type 'single-float :initial-element (cadr p))
+            (make-array size :element-type 'single-float)))))
   ;; Resolve a class designator (class object or class-proxy) to its name
   ;; so the dispatch below can match symbols uniformly.  Keeps callers
   ;; using `(find-class 'list)' / `(class-of '(a b c))' working.

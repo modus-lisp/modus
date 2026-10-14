@@ -211,12 +211,21 @@
   (syscall3 39 0 0 0))
 
 (defun %sys-read-raw (fd buf-addr count)
-  "Read COUNT bytes from FD into buf at BUF-ADDR. Returns bytes read or negative."
-  (syscall3 0 fd buf-addr count))
+  "Read COUNT bytes from FD into buf at BUF-ADDR. Returns bytes read or negative.
+   EINTR (-4) is retried: it means a signal arrived before any byte moved, and with
+   threads one does whenever another thread's collection stops the world -- a reader
+   blocked on a socket then saw a negative count, which the stream layer reads as end
+   of file, and a VNC client was dropped the moment its sender thread started work."
+  (loop
+    (let ((n (syscall3 0 fd buf-addr count)))
+      (unless (= n -4) (return n)))))
 
 (defun %sys-write-raw (fd buf-addr count)
-  "Write COUNT bytes from buf at BUF-ADDR to FD. Returns bytes written or negative."
-  (syscall3 1 fd buf-addr count))
+  "Write COUNT bytes from buf at BUF-ADDR to FD. Returns bytes written or negative.
+   EINTR is retried, as for %SYS-READ-RAW."
+  (loop
+    (let ((n (syscall3 1 fd buf-addr count)))
+      (unless (= n -4) (return n)))))
 
 ;;; Buffer transfer that never touches a raw address.
 ;;;

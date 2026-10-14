@@ -89,7 +89,29 @@
        (error (c) (princ-to-string c)))
      "picky 150")
 
-;;; 8. *JIT-HOT-CALLS* 0 turns it off for DEFUNs installed afterwards
+;;; 8. a generic function defined over a DEFUN keeps the DEFUN's trampoline as its
+;;; fallback method.  That trampoline getting hot must neither forward to the GF
+;;; (which falls back to the trampoline: a loop until the stack is gone) nor
+;;; install the DEFUN's native code over the GF.  Both orders: the GF arriving
+;;; before the DEFUN is hot, and after.
+(defun gf-early (x) (* x 2))
+(dotimes (i 5) (gf-early i))                        ; not hot yet
+(defmethod gf-early ((x string)) (concatenate 'string x x))
+(let ((ok t))
+  (dotimes (i 200) (unless (eql (gf-early i) (* i 2)) (setq ok nil)))
+  (chk "GF over a cold DEFUN: the fallback stays right across promotion" ok t))
+(chk "and the GF's own method still runs" (gf-early "ab") "abab")
+(defun gf-late (x) (+ x 100))
+(dotimes (i 100) (gf-late i))                       ; hot: native
+(defmethod gf-late ((x string)) (length x))
+(chk "GF over a hot DEFUN: the fallback" (gf-late 1) 101)
+(chk "GF over a hot DEFUN: the method" (gf-late "abc") 3)
+(let ((ok t))
+  (dotimes (i 200) (unless (and (eql (gf-late i) (+ i 100)) (eql (gf-late "xy") 2)) (setq ok nil)))
+  (chk "and stays right, with JIT-EAGER after it" (progn (jit-eager) ok) t))
+(chk "the GF survived JIT-EAGER" (gf-late "abcd") 4)
+
+;;; 9. *JIT-HOT-CALLS* 0 turns it off for DEFUNs installed afterwards
 (setq *jit-hot-calls* 0)
 (defun cold (x) (+ x 1))
 (dotimes (i 500) (cold i))

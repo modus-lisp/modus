@@ -1849,7 +1849,15 @@
   (let ((n 0))
     (dolist (e fnoffs)
       (let ((nm (car e)))
-        (when (member nm names :test (function string=))
+        (when (and (member nm names :test (function string=))
+                   ;; NEVER OVER A REPLACEMENT.  A registered module is NAME's
+                   ;; DEFUN; if NAME has since become a generic function (one that
+                   ;; adopted the DEFUN as its fallback method) or a (SETF
+                   ;; FDEFINITION) closure, installing would clobber it -- and a
+                   ;; hot call to the old trampoline, held by that GF, reaches here.
+                   (%jit-own-definition-p
+                    nm (and (boundp (quote *symbol-function-table*))
+                            (gethash nm *symbol-function-table*))))
           (let ((addr (+ base (cdr e))))
             (when (eql (logand addr 15) 0)
               (let ((fn (%word->val (logior addr 3))))
@@ -1899,6 +1907,26 @@
 ;;; page is not entered (no %jit-call), so nothing runs and no side effect
 ;;; repeats.  Call it before %save-image, or after restoring a bytecode core.
 ;;; The registry is a heap hash table, so it travels in the core too.
+
+(defvar *jit-defun-trampolines* nil
+  "NAME -> the interpreter trampoline mvm-eval installed for the runtime DEFUN
+   NAME, so a later native install can tell NAME's own definition from whatever
+   has replaced it since (a generic function, a (SETF FDEFINITION) closure).")
+
+(defun %jit-note-trampoline (name tramp)
+  (when (null *jit-defun-trampolines*)
+    (setq *jit-defun-trampolines* (make-hash-table :test (function equal))))
+  (puthash name *jit-defun-trampolines* tramp))
+
+(defun %jit-own-definition-p (name current)
+  "True when CURRENT -- NAME's definition now -- is NAME's runtime DEFUN: the
+   trampoline mvm-eval installed for it, or native code installed over that.
+   Anything else (a generic function that adopted the DEFUN, a closure set by
+   (SETF FDEFINITION)) replaced it, and a registered module for NAME is stale."
+  (or (null current)
+      (eql (logand (%val->word current) 15) 3)
+      (and *jit-defun-trampolines*
+           (eq current (gethash name *jit-defun-trampolines*)))))
 
 (defvar *jit-module-registry* nil
   "NAME (string) -> (bc entry ft-list fn-table rt-table lam-offsets persist-names)
@@ -2083,6 +2111,8 @@
     (when (and m (> (cdr seen) 0)
                (not (%jit-skip-name-p name skips))
                (not (%jit-fn-native-p name))
+               ;; a callee NAME no longer defines (a GF adopted it, say)
+               (%jit-own-definition-p name (%mvm-resolve-runtime-fn name))
                (not (member (car m) (car seen) :test (function eq)))
                (not (member (car m) *jit-eager-built* :test (function eq))))
       (setf (car seen) (cons (car m) (car seen)))
@@ -2093,12 +2123,20 @@
           (setq *jit-hot-promoted* (if *jit-hot-promoted* (+ 1 *jit-hot-promoted*) 1))
           (setq *jit-hot-failed* (if *jit-hot-failed* (+ 1 *jit-hot-failed*) 1))))))
 
-(defun %jit-hot-promote (name)
-  "NAME's trampoline reached its threshold.  NAME's native function once built;
-   :RETRY when this is not the moment (the JIT inhibited, a worker thread -- a
-   build records into region-0 tables -- or a build already running); NIL when
-   NAME stays interpreted (no JIT, skip-listed, or its page would not build)."
+(defun %jit-hot-promote (name self)
+  "NAME's trampoline SELF reached its threshold.  NAME's native function once
+   built; :RETRY when this is not the moment (the JIT inhibited, a worker thread
+   -- a build records into region-0 tables -- or a build already running); NIL
+   when NAME stays interpreted (no JIT, skip-listed, its page would not build, or
+   SELF is no longer NAME's definition).
+
+   THAT LAST CASE IS A LOOP, NOT A NICETY.  A generic function defined over a
+   DEFUN keeps the DEFUN's trampoline as its fallback method.  Promoting that
+   trampoline by NAME found the GENERIC FUNCTION, and forwarding to it closed a
+   cycle -- GF, fallback, trampoline, GF -- that ran until the stack was gone
+   (the modus agent, ~2 minutes into a cl-marmot session: SIGSEGV on a PUSH)."
   (cond ((not (%jit-enabled-p)) nil)
+        ((not (eq self (%mvm-resolve-runtime-fn name))) nil)
         ((or (not (%jit-active-p)) (not (%mvm-on-main-thread-p)) *jit-hot-busy*) :retry)
         (t (let ((before (or *jit-native-defun-count* 0)))
              (setq *jit-hot-busy* t)
@@ -2121,7 +2159,11 @@
   (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets))
         (left (%jit-hot-call-threshold))
         (spent 0)
-        (fwd nil))
+        (fwd nil)
+        ;; ITSELF, through a box: a variable assigned only OUTSIDE the closure is
+        ;; captured by value here, i.e. as NIL.
+        (self (list nil)))
+    (setf (car self)
     (lambda (&rest args)
       (if (or fwd (<= left 0))
           (values-list (multiple-value-list (apply (or fwd inner) args)))
@@ -2130,11 +2172,12 @@
             (setq left (- left 1))
             (setq spent (+ spent (- (%irt-ns) t0)))
             (when (or (= left 0) (> spent (%jit-hot-ns)))
-              (let ((r (%jit-hot-promote name)))
+              (let ((r (%jit-hot-promote name (car self))))
                 (if (eq r :retry)
                     (setq left (%jit-hot-call-threshold) spent 0)
                     (setq left 0 fwd r))))
-            (values-list vals))))))
+            (values-list vals)))))
+    (car self)))
 
 (defun %init-modus-package ()
   "Bind the MODUS package's generic runtime functions.  Called from kernel-main
@@ -3693,6 +3736,7 @@
             ;; swapped, so the closure was treated as the hash table and
             ;; nothing was actually stored — every later resolve of PF
             ;; returned NIL, so the trampoline never ran.)
+            (%jit-note-trampoline pn tramp)
             (when (boundp (quote *symbol-function-table*))
               (%jit-fnaddr-thunk-invalidate pn)
               (puthash pn *symbol-function-table* tramp))

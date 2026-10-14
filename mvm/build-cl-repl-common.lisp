@@ -661,6 +661,19 @@
              (floor (* (mod ticks hz) 1000000) hz)))
         0)))
 (defun get-universal-time () (%timer-universal-time))
+;;; ... and the nanosecond seams under them, which the hot-function JIT calls
+;;; directly to time interpreted calls: cl-fileio.lisp's defaults are the same
+;;; clock_gettime SVC, so the first DEFUN trampoline on the board faulted
+;;; (ESR 0x56000000, during the boot-time eval of the baked compat source).
+;;; One core and no scheduler, so run time is real time.
+(defun %irt-ns ()
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000000)
+             (floor (* (mod ticks hz) 1000000000) hz)))
+        0)))
+(defun %irun-ns () (%irt-ns))
 "
         (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))
 

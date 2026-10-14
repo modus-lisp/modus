@@ -1750,7 +1750,8 @@
    poisoned slot-exists-p.15/.16 (all-NIL)."
   (when (or (fixnump obj) (consp obj) (null obj)) (return-from %cond-type-name-of nil))
   (when (not (= (obj-subtag obj) #x32)) (return-from %cond-type-name-of nil))
-  (when (not (= (array-length obj) 2)) (return-from %cond-type-name-of nil))
+  (when (not (and (= (array-length obj) 3) (eq (aref obj 2) '%condition-marker)))
+    (return-from %cond-type-name-of nil))
   (let ((tn (aref obj 0)))
     (when (or (null tn) (not (symbolp tn))) (return-from %cond-type-name-of nil))
     (let ((cur *condition-type-registry*))
@@ -5242,7 +5243,7 @@
     ;; long as the number of GFs, and a library defining many GFs loaded in
     ;; quadratic time (80 DEFGENERICs: 10.7 s, 19.6 s, 28.9 s against a flat
     ;; 0.5 s; quicklisp's setup 17 s -> 60 s).
-    ((arrayp x) nil)
+    ((%raw-arrayp x) nil)
     ((member x *gf-stub-closures*) t)
     (t nil)))
 

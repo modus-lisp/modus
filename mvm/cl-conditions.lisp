@@ -75,9 +75,11 @@
   "Returns T if OBJ is a condition instance (array of size 2 with known type)."
   (if (or (fixnump obj) (consp obj) (null obj)) nil
     (if (= (obj-subtag obj) #x32)
-        (if (= (array-length obj) 2)
-            (let ((type-name (aref obj 0)))
-              (if (%cond-reg-find type-name) t nil))
+        ;; [type slots %CONDITION-MARKER]: the marker makes a condition an
+        ;; object of its own, so a user's #(ERROR NIL) is not one, and ARRAYP
+        ;; can answer NIL for a condition (CLHS 4.2.2: disjoint types).
+        (if (= (array-length obj) 3)
+            (eq (aref obj 2) '%condition-marker)
             nil)
         nil)))
 
@@ -241,8 +243,9 @@
       (setq type-name (if (consp type-designator) (cadr type-designator) type-designator)))
     (let ((entry (%cond-reg-find type-name)))
       (if (null entry)
-          (let ((c (make-array 2)))
+          (let ((c (make-array 3)))
             (aset c 0 type-name)
+            (aset c 2 '%condition-marker)
             (aset c 1 nil)
             c)
           (let ((all-slots (%collect-all-slots type-name))
@@ -283,8 +286,9 @@
                       (setq val (%eval-initform slot-initform))
                       (setq val-found t)))
                   (setq slot-alist (cons (cons slot-name val) slot-alist))))
-              (let ((c (make-array 2)))
+              (let ((c (make-array 3)))
                 (aset c 0 type-name)
+                (aset c 2 '%condition-marker)
                 (aset c 1 (nreverse slot-alist))
                 c)))))))
 
@@ -1708,8 +1712,9 @@
              (setq *restart-case-result* args)
              (setq *rc-invoked-restart* r)
              (setq *restart-invoking-p* t)
-             (let ((rc (make-array 2)))
+             (let ((rc (make-array 3)))
                (aset rc 0 '%rc-invocation)
+               (aset rc 2 '%condition-marker)
                (aset rc 1 nil)
                (setq *current-condition* rc))
              (when *%escape-trace* (%report-escaping-condition "invoke-restart-bc-trace"))
@@ -1719,8 +1724,9 @@
              (let ((vals (multiple-value-list (apply rfn args))))
                (setq *restart-case-result* vals)
                (setq *restart-invoking-p* t)
-               (let ((rc (make-array 2)))
+               (let ((rc (make-array 3)))
                  (aset rc 0 'restart-invocation)
+                 (aset rc 2 '%condition-marker)
                  (aset rc 1 nil)
                  (setq *current-condition* rc))
                (when *%escape-trace*
@@ -2357,8 +2363,9 @@
    from a GC-rooted special) rather than via MAKE-CONDITION: we are running
    immediately after a fault, and make-condition's slot-collection path is
    the flaky one those helpers were written to sidestep."
-  (let ((c (make-array 2)))
+  (let ((c (make-array 3)))
     (aset c 0 *%sig-simple-error-sym*)
+    (aset c 2 '%condition-marker)
     (aset c 1 nil)
     (setq *current-condition* c)
     c))
@@ -2418,8 +2425,9 @@
       ;; (the established no-handler contract — callers are all shaped
       ;; `(progn (%signal-...) nil)') rather than recurse.
       (progn (%sig-reentry-leave) nil)
-      (let ((c (make-array 2)))
+      (let ((c (make-array 3)))
         (aset c 0 *%sig-program-error-sym*)
+        (aset c 2 '%condition-marker)
         (aset c 1 nil)
         (setq *current-condition* c)
         (%sig-reentry-leave)
@@ -2488,8 +2496,9 @@
       ;; bare-metal Pi: GETHASH type-errors, we read *%sig-type-error-sym*,
       ;; SYMBOL-VALUE calls GETHASH, repeat until the stack has eaten the kernel.
       (progn (%sig-reentry-leave) nil)
-      (let ((c (make-array 2)))
+      (let ((c (make-array 3)))
         (aset c 0 *%sig-type-error-sym*)
+        (aset c 2 '%condition-marker)
         (aset c 1 (if et-p
                       (list (cons 'datum datum) (cons 'expected-type expected-type))
                       nil))
@@ -2504,8 +2513,9 @@
    function-pointer tagging — see TAG-PLAN.md)."
   (if (%sig-reentry-enter)
       (progn (%sig-reentry-leave) nil)
-      (let ((c (make-array 2)))
+      (let ((c (make-array 3)))
         (aset c 0 *%sig-undefined-function-sym*)
+        (aset c 2 '%condition-marker)
         (aset c 1 nil)
         (setq *current-condition* c)
         (%sig-reentry-leave)

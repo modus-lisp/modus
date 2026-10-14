@@ -5284,6 +5284,7 @@
          ;; (and CLASS / STANDARD-CLASS / METAOBJECT / T).  CLHS 4.3.7.
          ((eq tn 'standard-object) (or (%clos-instance-p obj)
                                        (%clos-class-p obj)))
+         ((eq tn 'structure-object) (%struct-instance-p obj))
          ((eq tn 'class) (%clos-class-p obj))
          ;; STANDARD-CLASS only for user (defclass) classes — those whose
          ;; CPL (slot 4) includes STANDARD-OBJECT.  Built-in classes that

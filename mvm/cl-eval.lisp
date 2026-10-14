@@ -3810,7 +3810,7 @@
     ;; glass's FB-RECT (a FILL per row) 13 ms.  The only array that is a
     ;; generic function is the GF object itself; dispatch closures are not
     ;; arrays.
-    ((arrayp x) (if (%gf-p x) t nil))
+    ((%raw-arrayp x) (if (%gf-p x) t nil))
     ((%generic-function-p x) t)
     ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
     ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →

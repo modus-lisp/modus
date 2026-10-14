@@ -6579,6 +6579,12 @@
       ((typep form 'complex)
        (compile-form `(complex ,(realpart form) ,(imagpart form)) env dest))
 
+      ;; In-image: a struct / CLOS instance / class / condition literal is
+      ;; self-evaluating.  It reached the ARRAYP arm above until ARRAYP
+      ;; stopped answering T for marked objects (CLHS 4.2.2); quoting keeps
+      ;; the object itself rather than degrading it to NIL.
+      ((and *mvm-eval-runtime-p* (not (symbolp form)))
+       (compile-quote form dest))
       ;; Unrecognized — warn and compile as nil
       (t
        (format t "  WARN: cannot compile ~S, using nil~%" form)
@@ -20712,7 +20718,9 @@
      `(let ((,g ,arg))
         (if (consp ,g)
             (%wrapper-arrayp ,g)
-            (%prim-arrayp ,g)))
+            ;; a struct / instance / condition / complex is a marked #x32
+            ;; vector, and not an ARRAY (CLHS 4.2.2) -- see %MARKED-VECTOR-P
+            (if (%prim-arrayp ,g) (not (%marked-vector-p ,g)) nil)))
      env dest)))
 
 (defun compile-prim-arrayp (arg env dest)

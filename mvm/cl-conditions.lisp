@@ -2756,7 +2756,7 @@
         (setq *current-condition* c)
         (%capture-signal-frames c)
         (%sig-reentry-leave)
-        (if (%error-handler-active-p) (%hc-longjmp) nil))))
+        (%signal-runtime-condition c))))
 
 (defun %hc-fault-fixup ()
   "Called first on a HANDLER-CASE handler path (hosted CLI, both 64-bit arches), before
@@ -2801,6 +2801,21 @@
             nil))))
   nil)
 
+(defun %signal-runtime-condition (c)
+  "The rest of what ERROR does, for a condition a runtime helper built
+   (%SIGNAL-TYPE-ERROR and its siblings): associate the active restart frames,
+   walk the HANDLER-BIND stack -- a handler may transfer control -- and then
+   longjmp to the innermost HANDLER-CASE, or return NIL when nothing is armed
+   (the helpers' old answer).  They used to longjmp straight away, so a
+   HANDLER-BIND for TYPE-ERROR never saw a compiled (CAR 5), and a restart
+   invoked from such a handler never ran.  Called after the reentry latch is
+   released: a handler that signals again is an ordinary nested signal."
+  (%associate-active-restart-frames c)
+  (let ((handled (%signal-condition c)))
+    (cond (handled nil)
+          ((%error-handler-active-p) (%hc-longjmp))
+          (t nil))))
+
 (defun %capture-signal-frames (c)
   "The runtime's own signals (%SIGNAL-TYPE-ERROR and its siblings) build their condition and
    longjmp without going through ERROR; give C the signalling stack the way ERROR does when
@@ -2831,7 +2846,7 @@
         (setq *current-condition* c)
         (%capture-signal-frames c)
         (%sig-reentry-leave)
-        (if (%error-handler-active-p) (%hc-longjmp) nil))))
+        (%signal-runtime-condition c))))
 
 (defun %signal-undefined-function ()
   "Runtime helper: signal UNDEFINED-FUNCTION.  Used by compile-funcall's
@@ -2846,7 +2861,7 @@
         (setq *current-condition* c)
         (%capture-signal-frames c)
         (%sig-reentry-leave)
-        (if (%error-handler-active-p) (%hc-longjmp) nil))))
+        (%signal-runtime-condition c))))
 
 ;;; --- Initialize standard packages ---
 

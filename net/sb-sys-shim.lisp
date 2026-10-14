@@ -80,7 +80,21 @@
            "*INVOKE-DEBUGGER-HOOK*" "RUN-PROGRAM"
            "PROCESS-PTY" "PROCESS-KILL" "PROCESS-ALIVE-P" "PROCESS-EXIT-CODE"
            "PROCESS-WAIT" "PROCESS-INPUT" "PROCESS-OUTPUT"
-           "OCTETS-TO-STRING" "STRING-TO-OCTETS"))
+           "OCTETS-TO-STRING" "STRING-TO-OCTETS"
+           "DOUBLE-FLOAT-POSITIVE-INFINITY" "DOUBLE-FLOAT-NEGATIVE-INFINITY"
+           "SINGLE-FLOAT-POSITIVE-INFINITY" "SINGLE-FLOAT-NEGATIVE-INFINITY"
+           "SEED-RANDOM-STATE" "SPIN-LOOP-HINT"))
+
+;;; SB-KERNEL and SB-INT: only the float-bits and float-trap names portable numeric code reaches
+;;; for (mill reads ONNX tensors with them; ieee-floats-style code does the same).
+(defpackage "SB-KERNEL"
+  (:use)
+  (:export "MAKE-SINGLE-FLOAT" "MAKE-DOUBLE-FLOAT" "SINGLE-FLOAT-BITS"
+           "DOUBLE-FLOAT-HIGH-BITS" "DOUBLE-FLOAT-LOW-BITS"))
+
+(defpackage "SB-INT"
+  (:use)
+  (:export "WITH-FLOAT-TRAPS-MASKED"))
 
 ;;; OCTETS-TO-STRING / STRING-TO-OCTETS — SBCL's byte<->text conversions, for
 ;;; UTF-8 (the default) and Latin-1.  cassette reads WebM tag strings with the
@@ -819,6 +833,56 @@
    region, so there is no less-than-full collection to ask for."
   options
   (%gc-collect-here)
+  nil)
+
+;;; ---- floats as bits (SB-KERNEL), SBCL's spellings ------------------------------------------
+;;;
+;;; modus boxes every float with an IEEE-64 payload (a single-float is rounded to single
+;;; precision but stored wide), so these go through the prelude's converters: %BITS->SINGLE and
+;;; %SINGLE->BITS for the 32-bit pattern, %FLOAT-HI32/LO32 for a double's halves.  Signedness is
+;;; SBCL's: SINGLE-FLOAT-BITS and DOUBLE-FLOAT-HIGH-BITS are signed 32-bit, the low half unsigned.
+
+(defun %sb-signed32 (u) (if (logbitp 31 u) (- u 4294967296) u))
+
+(defun sb-kernel:make-single-float (bits)
+  "The single-float whose IEEE-32 pattern is BITS (a signed or unsigned 32-bit integer)."
+  (%bits->single (logand bits 4294967295)))
+
+(defun sb-kernel:single-float-bits (f)
+  "F's IEEE-32 pattern as a signed 32-bit integer."
+  (%sb-signed32 (%single->bits f)))
+
+(defun sb-kernel:make-double-float (hi lo)
+  "The double-float with IEEE-64 high half HI (signed 32-bit) and low half LO (unsigned)."
+  (%make-typed-float hi lo 'double-float))
+
+(defun sb-kernel:double-float-high-bits (f)
+  (%sb-signed32 (%float-hi32 (if (typep f 'double-float) f (float f 1d0)))))
+
+(defun sb-kernel:double-float-low-bits (f)
+  (%float-lo32 (if (typep f 'double-float) f (float f 1d0))))
+
+(defvar sb-ext:double-float-positive-infinity (%make-typed-float #x7FF00000 0 'double-float))
+(defvar sb-ext:double-float-negative-infinity (%make-typed-float #xFFF00000 0 'double-float))
+(defvar sb-ext:single-float-positive-infinity (%make-typed-float #x7FF00000 0 'single-float))
+(defvar sb-ext:single-float-negative-infinity (%make-typed-float #xFFF00000 0 'single-float))
+
+(defmacro sb-int:with-float-traps-masked ((&rest traps) &body body)
+  "BODY.  modus runs with every IEEE exception masked (MXCSR is never unmasked), so an overflow
+   or a 0/0 already yields the infinity or NaN that masking asks for; TRAPS is accepted and
+   ignored."
+  (declare (ignore traps))
+  `(progn ,@body))
+
+(defun sb-ext:seed-random-state (&optional state)
+  "A random state seeded by STATE: an integer seeds it, T or NIL gives a fresh one, a random
+   state is copied.  modus's random state is (RANDOM-STATE seed)."
+  (cond ((integerp state) (list 'random-state state))
+        ((or (null state) (eq state t)) (make-random-state t))
+        (t (make-random-state state))))
+
+(defun sb-ext:spin-loop-hint ()
+  "A spin-wait's courtesy to the CPU (PAUSE on x86).  Nothing here: correctness never rests on it."
   nil)
 
 (defun sb-ext:run-program (program args &rest options)

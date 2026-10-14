@@ -56,7 +56,7 @@
            "THREAD-YIELD" "TERMINATE-THREAD" "INTERRUPT-THREAD"
            "MUTEX" "MUTEXP" "MAKE-MUTEX" "MUTEX-NAME" "MUTEX-OWNER"
            "WITH-MUTEX" "WITH-RECURSIVE-LOCK" "GRAB-MUTEX" "RELEASE-MUTEX"
-           "HOLDING-MUTEX-P"
+           "HOLDING-MUTEX-P" "BARRIER"
            "WAITQUEUE" "MAKE-WAITQUEUE" "WAITQUEUE-NAME"
            "CONDITION-WAIT" "CONDITION-NOTIFY" "CONDITION-BROADCAST"
            "SEMAPHORE" "MAKE-SEMAPHORE" "SEMAPHORE-NAME" "SEMAPHORE-COUNT"
@@ -826,3 +826,11 @@ modus: unhandled error in a thread: "))
 ;;; sb-thread surface is here", and a half-installed shim advertising it would
 ;;; send that code down the arm it cannot run.
 (pushnew :sb-thread *features*)
+
+;;; BARRIER — SBCL's memory-ordering fence, (barrier (:read)) / (:write) / (:memory) / (:compiler).
+;;; modus threads share no Lisp state, and what they do share (the shared arena, mailboxes) is
+;;; reached under the runtime's own locks, whose atomic instructions order memory on x86 and
+;;; AArch64 alike; so the fence orders nothing more and is its body.
+(defmacro sb-thread:barrier ((kind) &body body)
+  (declare (ignore kind))
+  `(progn ,@body))

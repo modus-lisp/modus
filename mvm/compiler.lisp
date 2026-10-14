@@ -1923,6 +1923,16 @@
                              (list :gc-check-r (third next) 0))
                             ((:alloc-u8)
                              (list :gc-check-r (third next) 1))
+                            ;; :alloc-f32's count is the TAGGED lane count (2n;
+                            ;; the allocator untags it) and it takes 16 + 4n
+                            ;; bytes, aligned.  KIND 0 reads the count as untagged
+                            ;; slots, 2n * 8 + 32 = 16n + 32 -- an OVERestimate,
+                            ;; so the superset property holds with no new kind
+                            ;; for any translator to learn.  Unfused, a single-
+                            ;; float array larger than the limit's guard band
+                            ;; overshot into the other semispace.
+                            ((:alloc-f32)
+                             (list :gc-check-r (third next) 0))
                             (t nil)))))
         (push (cond (nbytes (list :gc-check-n nbytes))
                     (rcheck rcheck)

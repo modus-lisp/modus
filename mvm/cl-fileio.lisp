@@ -826,13 +826,18 @@
     ;; UNSIGNED-BYTE <= 8 bits is the historic 1-byte path (CONS 1 NIL);
     ;; SIGNED-BYTE of ANY width needs sign extension on read, so it always
     ;; takes the element path, 1 byte when N <= 8.
+    ;; This runs on EVERY READ-BYTE, so the head is matched by NAME HASH (symbol
+    ;; slot 0: one fixnum compare, and right whichever intern site made the
+    ;; symbol) rather than SYMBOL-NAME + STRING=, and the common 1-byte answer
+    ;; is a shared constant rather than a fresh cons.  The spec is never
+    ;; mutated.  Hashes: UNSIGNED-BYTE 237688881, SIGNED-BYTE 398241362.
     (if (and (consp et) (symbolp (car et)) (consp (cdr et)) (integerp (cadr et))
              (> (cadr et) 0))
-        (let ((nm (symbol-name (car et))) (k (floor (+ (cadr et) 7) 8)))
-          (cond ((and (string= nm "UNSIGNED-BYTE") (> k 1)) (cons k nil))
-                ((string= nm "SIGNED-BYTE") (cons k t))
-                (t (cons 1 nil))))
-        (cons 1 nil))))
+        (let ((h (aref (car et) 0)) (k (floor (+ (cadr et) 7) 8)))
+          (cond ((and (eql h 237688881) (> k 1)) (cons k nil))
+                ((eql h 398241362) (cons k t))
+                (t '(1))))
+        '(1))))
 
 (defun %fs-elt-bytes (stream) (car (%fs-elt-spec stream)))
 

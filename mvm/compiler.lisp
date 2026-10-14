@@ -15419,7 +15419,7 @@
                              (cond
                                ((and (consp tf) (eq (car tf) 'if)
                                      (equal (caddr tf) '(return-from :%loop-exit nil)))
-                                `(if ,(cadr tf) (return-from :%loop-exit t)))
+                                `(if ,(cadr tf) (return-from :%loop-exit t) ,@(cdddr tf)))
                                ;; (if TEST (progn BACK-OUT (return nil)))
                                ((and (consp tf) (eq (car tf) 'if)
                                      (consp (caddr tf))
@@ -15427,12 +15427,20 @@
                                      (equal (car (last (caddr tf))) '(return-from :%loop-exit nil)))
                                 (let* ((then (caddr tf))
                                        (back-stmts (butlast (cdr then))))
-                                  `(if ,(cadr tf) (progn ,@back-stmts (return-from :%loop-exit t)))))
+                                  `(if ,(cadr tf) (progn ,@back-stmts (return-from :%loop-exit t))
+                                       ,@(cdddr tf))))
                                (t tf)))
                            loop-body)
                    loop-body))
              ;; CLHS 6.1.1.7 FINALLY-skip-on-body-RETURN attempt 2:
              ;; inject (setq %nat t) into each test-form exit.
+             ;;
+             ;; KEEP THE ELSE.  These rewrites (and the ALWAYS one above) were
+             ;; written for the loop's own exit tests, which have none, but they
+             ;; walk the top level of the BODY too -- and a user's DO form
+             ;; (if test (return) (setf ...)) lost its else branch: mill's
+             ;; odometer never reset an axis, and every strided gather walked
+             ;; off the end.
              (%nat-var (%mvm-gensym "NAT"))
              (%bv-var (%mvm-gensym "BV"))
              (test-forms-with-nat
@@ -15443,7 +15451,8 @@
                           (consp (caddr tf))
                           (member (car (caddr tf)) '(return return-from)))
                      `(if ,(cadr tf)
-                          (progn (setq ,%nat-var t) ,(caddr tf))))
+                          (progn (setq ,%nat-var t) ,(caddr tf))
+                          ,@(cdddr tf)))
                     ((and (consp tf) (eq (car tf) 'if)
                           (consp (caddr tf))
                           (eq (car (caddr tf)) 'progn)
@@ -15456,7 +15465,8 @@
                        `(if ,(cadr tf)
                             (progn ,@body-prefix
                                    (setq ,%nat-var t)
-                                   ,last-form))))
+                                   ,last-form)
+                            ,@(cdddr tf))))
                     (t tf)))
                 final-test-forms))
              ;; Expand LOOP-FINISH to (progn (setq %nat t) (return X)) where

@@ -72,11 +72,13 @@
                     (let* ((e (* k 24))
                            (type (logand (aref syms (+ e 4)) 15))
                            (value (%bt-u syms (+ e 8) 8))
+                           (size (%bt-u syms (+ e 16) 8))
                            (nm (%bt-u syms e 4)))
                       (when (and (member type '(0 2)) (> value 4096) (plusp nm))
                         (let ((end (or (position 0 strs :start nm) strsize)))
-                          (setq pairs (cons (cons value (map 'string (function code-char)
-                                                            (subseq strs nm end)))
+                          (setq pairs (cons (list* value (map 'string (function code-char)
+                                                              (subseq strs nm end))
+                                                   (if (plusp size) size nil))
                                             pairs))))))))))
           (and pairs (sort (coerce pairs 'vector) (function <) :key (function car)))))
     (error () nil)))
@@ -94,7 +96,7 @@
                (when (and (stringp name) (functionp f))
                  (let ((w (%gc-word-of f scratch)))
                    (when (= 3 (logand w 15))
-                     (setq pairs (cons (cons (- w 3) name) pairs))))))
+                     (setq pairs (cons (list* (- w 3) name nil) pairs))))))
              *symbol-function-table*)
     (sort (coerce pairs 'vector) (function <) :key (function car))))
 
@@ -108,7 +110,7 @@
                (when (and (stringp name) (functionp f))
                  (let ((w (%gc-word-of f scratch)))
                    (when (and (= 3 (logand w 15)) (>= w #x3000000000))
-                     (setq pairs (cons (cons (- w 3) name) pairs))))))
+                     (setq pairs (cons (list* (- w 3) name nil) pairs))))))
              *symbol-function-table*)
     (sort (coerce pairs 'vector) (function <) :key (function car))))
 
@@ -132,8 +134,8 @@
      ;; nearest name only within 16 KB (a large function); farther, say where it is.
      (let ((e (and jit-table (%bt-lookup addr jit-table))))
        (cond ((and e (< (- addr (car e)) 16384))
-              (format nil "~a+0x~x [jit]" (cdr e) (- addr (car e))))
-             (e (format nil "jit@~x (past ~a)" addr (cdr e)))
+              (format nil "~a+0x~x [jit]" (cadr e) (- addr (car e))))
+             (e (format nil "jit@~x (past ~a)" addr (cadr e)))
              (t (format nil "jit@~x" addr)))))
     (t (let ((lo 0) (hi (- (length table) 1)) (best nil))
          (loop
@@ -142,9 +144,14 @@
              (if (<= (car (aref table mid)) addr)
                  (setq best mid lo (+ mid 1))
                  (setq hi (- mid 1)))))
+         ;; An ELF entry knows its SIZE: past it, the address is in code no symbol
+         ;; names -- the image's native helpers (GC trampoline, handler stubs) all
+         ;; follow the last Lisp function, and used to be billed to it.
          (if best
              (let ((e (aref table best)))
-               (format nil "~a+0x~x" (cdr e) (- addr (car e))))
+               (if (and (cddr e) (>= (- addr (car e)) (cddr e)))
+                   (format nil "native@~x (past ~a)" addr (cadr e))
+                   (format nil "~a+0x~x" (cadr e) (- addr (car e)))))
              (format nil "?@~x" addr))))))
 
 (defun %backtrace-list (&optional (max 60))

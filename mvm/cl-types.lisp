@@ -2812,13 +2812,19 @@
 (defvar *%arith-strict* nil)
 
 (defun generic-add (a b)
+  ;; OBJ-SUBTAG is safe on any value (0 for a non-object), so the both-floats
+  ;; case is decided by two inline reads and integer compares -- no predicate
+  ;; calls -- and contagion comes from the same two numbers.
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (and (or (= sa #x60) (and (>= sa #x64) (<= sa #x66)))
+             (or (= sb #x60) (and (>= sb #x64) (<= sb #x66)))
+             (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
+        (let ((r (%float-add a b)))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
+        (%generic-add-slow a b))))
+
+(defun %generic-add-slow (a b)
   (cond
-    ;; BOTH FLOATS FIRST, the hot case of numeric code: two predicate calls and
-    ;; the raw op, against eight ratio/integer/complex tests, then
-    ;; %ANY-TO-FLOAT x2 and %FLOAT-RESULT-TYPE (each re-checking) on the arm
-    ;; below -- which this replicates exactly for two IEEE floats.
-    ((and (%ieee-float-p a) (%ieee-float-p b))
-     (%float-pair-result (%float-add a b) a b))
     ;; RATIO +/- INTEGER (fixnum OR bignum) first: it used to reach the
     ;; bignum clause below, so (+ 1/3 (expt 2 70)) was a garbage INTEGER.
     ;; (num + b*den)/den is already in lowest terms (gcd(num+b*den, den) =
@@ -2864,13 +2870,19 @@
     (t (%fixnum-+ a b))))
 
 (defun generic-multiply (a b)
+  ;; OBJ-SUBTAG is safe on any value (0 for a non-object), so the both-floats
+  ;; case is decided by two inline reads and integer compares -- no predicate
+  ;; calls -- and contagion comes from the same two numbers.
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (and (or (= sa #x60) (and (>= sa #x64) (<= sa #x66)))
+             (or (= sb #x60) (and (>= sb #x64) (<= sb #x66)))
+             (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
+        (let ((r (%float-mul a b)))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
+        (%generic-multiply-slow a b))))
+
+(defun %generic-multiply-slow (a b)
   (cond
-    ;; BOTH FLOATS FIRST, the hot case of numeric code: two predicate calls and
-    ;; the raw op, against eight ratio/integer/complex tests, then
-    ;; %ANY-TO-FLOAT x2 and %FLOAT-RESULT-TYPE (each re-checking) on the arm
-    ;; below -- which this replicates exactly for two IEEE floats.
-    ((and (%ieee-float-p a) (%ieee-float-p b))
-     (%float-pair-result (%float-mul a b) a b))
     ;; Integer/integer: route through bignum-mul which has a 31-bit
     ;; fast path AND promotes to bignum on overflow.  The naked
     ;; %fixnum-* silently wrapped `(* 2^60 2^60) -> 0' for products
@@ -2908,13 +2920,19 @@
     (t (%fixnum-* a b))))
 
 (defun generic-subtract (a b)
+  ;; OBJ-SUBTAG is safe on any value (0 for a non-object), so the both-floats
+  ;; case is decided by two inline reads and integer compares -- no predicate
+  ;; calls -- and contagion comes from the same two numbers.
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (and (or (= sa #x60) (and (>= sa #x64) (<= sa #x66)))
+             (or (= sb #x60) (and (>= sb #x64) (<= sb #x66)))
+             (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
+        (let ((r (%float-sub a b)))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
+        (%generic-subtract-slow a b))))
+
+(defun %generic-subtract-slow (a b)
   (cond
-    ;; BOTH FLOATS FIRST, the hot case of numeric code: two predicate calls and
-    ;; the raw op, against eight ratio/integer/complex tests, then
-    ;; %ANY-TO-FLOAT x2 and %FLOAT-RESULT-TYPE (each re-checking) on the arm
-    ;; below -- which this replicates exactly for two IEEE floats.
-    ((and (%ieee-float-p a) (%ieee-float-p b))
-     (%float-pair-result (%float-sub a b) a b))
     ;; RATIO -/+ INTEGER first -- see GENERIC-ADD.
     ((and (ratiop a) (integerp b))
      (make-ratio-obj (bignum-sub (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))

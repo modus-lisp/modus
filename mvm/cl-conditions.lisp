@@ -1818,14 +1818,21 @@
   "Return the canonical class-proxy object for NAME, allocating exactly
    one per name and stashing it in *class-proxy-cache* for future eq."
   (let ((entry (assoc name *class-proxy-cache*)))
-    (cond
-      (entry (cdr entry))
-      (t
-       (let ((cls (make-array 2)))
-         (aset cls 0 '%class-proxy)
-         (aset cls 1 name)
-         (setq *class-proxy-cache* (cons (cons name cls) *class-proxy-cache*))
-         cls)))))
+    (if entry
+        (cdr entry)
+        ;; Under the runtime lock: allocation goes to region 0, so a miss
+        ;; from an actor (CLASS-OF in a session) may fill the shared cache.
+        (progn
+          (%rt-enter)
+          (let ((hit (assoc name *class-proxy-cache*)))
+            (if hit
+                (progn (%rt-leave) (cdr hit))
+                (let ((cls (make-array 2)))
+                  (aset cls 0 '%class-proxy)
+                  (aset cls 1 name)
+                  (setq *class-proxy-cache* (cons (cons name cls) *class-proxy-cache*))
+                  (%rt-leave)
+                  cls)))))))
 
 (defun find-class (name &rest args)
   "Find class by name. Returns CLOS class descriptor, or a proxy object
@@ -1840,7 +1847,9 @@
           clos-cls
           ;; Built-in types and condition types both get a cached proxy.
           (if (or (%cond-reg-find name)
-                  (%builtin-class-name-p name))
+                  (%builtin-class-name-p name)
+                  ;; DEFSTRUCT defines a STRUCTURE-CLASS (CLHS 8.1).
+                  (and name (symbolp name) (%find-struct-type name)))
               (%get-class-proxy name)
               ;; Not found
               (if errorp

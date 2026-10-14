@@ -3349,6 +3349,16 @@
   ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates
   ;; it via its (null cur) terminator).  Treat present-but-nil like absent.
   (let ((end (if (and end-arg (car end-arg)) (car end-arg) (length seq))))
+  ;; BOUNDING INDICES ARE CHECKED (CLHS 17.3): START and END must satisfy
+  ;; 0 <= START <= END <= (LENGTH SEQ).  There was no check: (subseq "abc" 0 10)
+  ;; bulk-copied past the end of the string, and the fault surfaced from native
+  ;; copy code as a TYPE-ERROR (datum T, expected NUMBER) that no HANDLER-CASE
+  ;; saw -- a caller guarding a short string with an error handler was killed.
+  (let ((n (length seq)))
+    (unless (and (integerp start) (<= 0 start n))
+      (%signal-type-error start (list 'integer 0 n)))
+    (unless (and (integerp end) (<= start end n))
+      (%signal-type-error end (list 'integer start n))))
   ;; NIL is a (empty) list: (subseq nil 0 0) must return NIL, not #().
   ;; The consp-only test sent NIL down the array branch, returning an
   ;; empty VECTOR — which broke the in-image compiler's static-rest

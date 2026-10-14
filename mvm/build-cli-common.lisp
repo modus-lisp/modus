@@ -1254,6 +1254,10 @@
                    ;; group, so those images keep the single-buffer socket
                    ;; layer and their blobs are unaffected.
                    (mvm-text "net/hosted-sockets-post.lisp")
+                   (string #\Newline)
+                   ;; fork/execve for UIOP:RUN-PROGRAM (x86-64 syscall numbers).
+                   (mvm-text "net/hosted-process.lisp")
+                   (string #\Newline)
                    ;; AWS Nitro Enclaves: CBOR + the /dev/nsm attestation request
                    ;; (lib/cbor.lisp, net/nsm-attest.lisp).  Hosted x64 only: the
                    ;; NSM is a Linux device.  Inert without one (:NO-NSM).

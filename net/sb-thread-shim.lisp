@@ -192,6 +192,13 @@
   (syscall3 24 0 0 0)
   nil)
 
+;;; Allocation in SHARED memory: BODY runs under the runtime lock, whose allocations land
+;;; in the shared arena.  Defined before MAKE-THREAD, which uses it (this file is evaluated
+;;; form by form, so a macro must exist before the first form that expands it).
+(defmacro %sb-locked ((bytes) &body body)
+  `(progn (%rt-enter-sized ,bytes)
+          (unwind-protect (progn ,@body) (%rt-leave))))
+
 (defun sb-thread::make-thread (function &key name arguments ephemeral)
   "Start an OS thread running FUNCTION and return a THREAD object.
 
@@ -213,15 +220,34 @@
   (if (not (%sb-threads-up))
       (error "sb-thread:make-thread: modus could not carve the actor band, so ~
               this image cannot start a thread.")
-      (let* ((box (cons nil nil))
-             (thread (make-instance 'sb-thread::thread :name name :box box))
+      (let* ((worker (not (zerop (%tls-self-base))))
+             ;; A THREAD STARTING A THREAD.  Everything below ends up where other
+             ;; threads read it -- the thread table, the registry, the new
+             ;; thread's own stack -- so on a worker it is made in SHARED memory
+             ;; (%SB-LOCKED) and ARGUMENTS are copied there (MODUS:SHARE), as any
+             ;; message is.  FUNCTION itself cannot be copied if it is a closure
+             ;; this worker made: say so, and say what works instead.
+             (dummy (when (and worker (%sb-worker-object-p function))
+                      (error "sb-thread:make-thread on a thread: FUNCTION is a closure made on ~
+                              this thread, and modus threads share no state, so it cannot be ~
+                              handed to the new one.  Pass a global function (#'NAME) and the ~
+                              values it needs as :ARGUMENTS -- they are copied to the new thread.")))
+             (arguments (if worker (modus::share arguments) arguments))
+             (name (if worker (modus::share name) name))
+             (box (if worker (%sb-locked (64) (cons nil nil)) (cons nil nil)))
+             (thread (if worker
+                         (%sb-locked (4096) (make-instance 'sb-thread::thread :name name :box box))
+                         (make-instance 'sb-thread::thread :name name :box box)))
              ;; The body is a NAMED function (%SB-THREAD-BODY), not the
              ;; closure's own code: this defun does not compile to native code
              ;; (the JIT refuses it), so a closure written here would run
              ;; INTERPRETED, and an error unwinding into interpreter frames on
              ;; a worker crashed.  The closure only makes the call.
-             (body (lambda () (%sb-thread-body thread box function arguments)))
+             (body (if worker
+                       (%sb-locked (256) (lambda () (%sb-thread-body thread box function arguments)))
+                       (lambda () (%sb-thread-body thread box function arguments))))
              (slot (%make-native-thread body)))
+        dummy
         ;; A FULL TABLE MAY BE FULL OF THE DEAD.  SBCL does not require a
         ;; thread to be joined, and bordeaux-threads' genera backend never
         ;; joins natively (it waits for PROCESS-ACTIVE-P to go false), so
@@ -242,7 +268,9 @@
               ;; accessor is fine, so the readers stay.
               (setf (slot-value thread 'slot) slot)
               (%mutex-lock (%sb-registry-lock))
-              (setq *sb-all-threads* (cons thread *sb-all-threads*))
+              (setq *sb-all-threads* (if worker
+                                         (%sb-locked (64) (cons thread *sb-all-threads*))
+                                         (cons thread *sb-all-threads*)))
               (%mutex-unlock (%sb-registry-lock))
               thread)))))
 
@@ -280,9 +308,6 @@
                      (or (and (>= a ba) (< a (+ ba sz)))
                          (and (>= a bb) (< a (+ bb sz)))))))))))
 
-(defmacro %sb-locked ((bytes) &body body)
-  `(progn (%rt-enter-sized ,bytes)
-          (unwind-protect (progn ,@body) (%rt-leave))))
 
 (defun %sb-unpassable (why)
   (throw '%sb-unpassable why))
@@ -423,6 +448,13 @@ modus: unhandled error in a thread: "))
     (setf (cdr box) t))
   0)
 
+;;; The registry without TH.  REMOVE conses a fresh list; on a worker those conses would
+;;; be the worker's own, stored into a global -- so they are made in shared memory there.
+(defun %sb-registry-without (th)
+  (if (zerop (%tls-self-base))
+      (remove th *sb-all-threads*)
+      (%sb-locked ((+ 64 (* 16 (length *sb-all-threads*)))) (remove th *sb-all-threads*))))
+
 (defun %sb-reap-exited-threads ()
   "Free the slot of every thread this layer started that has EXITED without
    being joined, and return how many.  The thread object keeps answering: it is
@@ -438,7 +470,7 @@ modus: unhandled error in a thread: "))
     (dolist (th dead)
       (setf (slot-value th 'joined) t)
       (%join-native-thread (%thread-slot th) 1)
-      (setq *sb-all-threads* (remove th *sb-all-threads*))
+      (setq *sb-all-threads* (%sb-registry-without th))
       (setq n (+ n 1)))
     (%mutex-unlock (%sb-registry-lock))
     n))
@@ -511,7 +543,7 @@ modus: unhandled error in a thread: "))
                   (unless (%thread-joined thread)
                     (setf (slot-value thread 'joined) t)
                     (%join-native-thread slot 1000)
-                    (setq *sb-all-threads* (remove thread *sb-all-threads*)))
+                    (setq *sb-all-threads* (%sb-registry-without thread)))
                   (%mutex-unlock (%sb-registry-lock))
                   (%sb-check-passable value)))
               (if (eq default :%sb-no-default)

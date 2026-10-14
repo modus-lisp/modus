@@ -185,6 +185,13 @@
 (defun %sys-mkdir (path-str mode)
   (%string-to-cstr path-str *cstr-scratch*)
   (syscall6 34 -100 *cstr-scratch* mode 0 0 0))
+(defun %sys-readlink (path-str)
+  ;; readlinkat(AT_FDCWD, PATH, buf, 4000) -- syscall 78 on RISC-V
+  (let* ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+         (buf *io-buf-addr*)
+         (n (syscall6 78 -100 path-addr buf 4000 0 0)))
+    (if (<= n 0) nil (%utf8-mem-to-string buf n))))
+
 (defun %sys-stat-exists (path-str)
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*)))
     (if (< (syscall6 48 -100 path-addr 0 0 0 0) 0) nil t)))

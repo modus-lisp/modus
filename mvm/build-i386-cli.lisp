@@ -213,6 +213,8 @@
 (defun %sys-mkdir (path-str mode)
   (%string-to-cstr path-str *cstr-scratch*)
   (syscall3 39 *cstr-scratch* mode 0))
+(defun %sys-readlink (path-str) (declare (ignore path-str)) nil)   ; links not followed here yet
+
 (defun %sys-stat-exists (path-str)
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*)))
     (if (< (syscall3 33 path-addr 0 0) 0) nil t)))

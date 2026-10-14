@@ -277,7 +277,10 @@
 ;;; core, i.e. the same key in every enclave started from it); the guard makes
 ;;; the state honest even if it did.  Signal handlers are per process too.
 (defun %core-post-restore ()
+  ;; This definition REPLACES lib/save-image.lisp's in the generic CLI (it
+  ;; loads later), so it must redo everything that one does per process.
   (%init-signal-handling)
+  (%ignore-sigpipe)
   (setq *hssh-base* 0)
   (setq *nsm-page* 0)
   (when (> (mem-ref (+ (%hssh-base) #x10000 #x624) :u32) 0)   ; a host key WAS baked: drop it

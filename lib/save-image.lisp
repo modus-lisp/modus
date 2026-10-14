@@ -536,8 +536,12 @@
    this process may compile to native code.  An iOS app cannot write code at
    all -- its snapshot's JIT pages are signed and read-only -- and says so
    with MODUS_NO_RUNTIME_JIT (host/macos/modus-shim.c); code compiled there
-   after the restore is interpreted."
+   after the restore is interpreted.
+   SIGPIPE too: the boot path ignores it (%INSTALL-SB-SHIMS), but a restored
+   process never ran that, so a write to a peer-closed socket KILLED it --
+   an ACP server died mid-turn when an HTTPS connection dropped."
   (%init-signal-handling)
+  (%ignore-sigpipe)
   (let ((v (%cli-getenv "MODUS_NO_RUNTIME_JIT")))
     (when (and v (> (length v) 0) (not (string= v "0")))
       (setq *use-jit* nil))))

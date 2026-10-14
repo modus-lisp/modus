@@ -1045,7 +1045,8 @@
           ;; keep growing frac-div (deterministic inf -> underflow 0.0 is
           ;; correct for sub-denormal magnitudes).
           (sig-digits 0) (int-extra 0)
-          (marker :default))   ; exponent-marker class (numeric tower N1)
+          (marker :default)    ; exponent-marker class (numeric tower N1)
+          (got-exp-digit nil))
       ;; Sign
       (when (and cur (= (car cur) 45)) (setq sign -1) (setq cur (cdr cur)))
       (when (and cur (= (car cur) 43)) (setq cur (cdr cur)))
@@ -1056,6 +1057,7 @@
             ((and (>= code 48) (<= code 57))
              (let ((d (- code 48)))
                (setq got-digit t)
+               (when in-exp (setq got-exp-digit t))
                (cond
                  ;; Clamp the exponent digits: the value saturates to
                  ;; inf/0 long before 9999, and an unclamped exp-part
@@ -1083,6 +1085,12 @@
                  (= code 70) (= code 102) (= code 68) (= code 100)
                  (= code 76) (= code 108))
              (if in-exp (return-from %try-parse-float nil))
+             ;; An exponent marker needs a mantissa digit BEFORE it (CLHS 2.3.1.1):
+             ;; `f26.6', `d1.5', `-f2.5' are symbols.  The pre-scan only caught
+             ;; this for tokens without a dot, so the marker was taken as the
+             ;; first character and the rest read as the exponent -- 0.0 -- and
+             ;; scribe's (defun f26.6 ...) became a DEFUN of a float.
+             (unless got-digit (return-from %try-parse-float nil))
              (setq in-exp t)
              (setq in-frac nil)
              (setq marker (%float-marker-class code))   ; record float type (numeric tower N1)
@@ -1096,6 +1104,8 @@
             (t (return-from %try-parse-float nil))))
         (setq cur (cdr cur)))
       (unless got-digit (return-from %try-parse-float nil))
+      ;; ...and digits AFTER it: `1e' and `1.5e' are symbols, not 1.0 and 1.5.
+      (when (and in-exp (not got-exp-digit)) (return-from %try-parse-float nil))
       ;; Build a boxed float.  Use the rename'd builder — `%make-float'
       ;; is the compiler primop that allocates an uninitialized 1-slot
       ;; float, NOT a defun call.

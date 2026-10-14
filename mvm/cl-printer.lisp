@@ -917,6 +917,10 @@
            ((stringp report) (%print-string-raw report stream))
            ((functionp report) (funcall report stream))
            (t (%write-obj-1 (car obj) stream level nil)))))
+      ;; A user PRINT-OBJECT method on the condition's type wins over :REPORT
+      ;; and the defaults (ASDF reports MISSING-COMPONENT this way).
+      ((and (not preadably) (%condition-p obj) (%user-print-object-p obj))
+       (print-object obj stream))
       ((and (not preadably) (%condition-p obj))
        (if escape
            (progn (%print-string-raw "#<" stream)

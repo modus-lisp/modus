@@ -292,6 +292,39 @@ that every (re)definition retargets -- aarch64's linkage cells, without a
 translator change.  `test/redefine-native-callers.lisp`, which x64 had FAILED
 since it was written, passes; the stubs survive save-and-die.
 
+### Redefining an IMAGE function reaches the image's own callers (2026-10-14)
+
+Image functions call each other with a direct CALL / BL, so a runtime DEFUN or
+`(setf fdefinition)` of one used to reach only late-bound callers (REPL,
+FUNCALL, JIT code) -- a fix typed at a board's REPL did nothing to the driver
+code calling it.  Now every image function has a **16-byte CALL PAD** in front
+of it: direct calls land on the pad and fall through, while the function OBJECT
+(`#'NAME`, the symbol-function table) is the address 16 bytes on.  A name's
+first redefinition rewrites its pad into a jump to the name's late-binding
+entry (x64: its linkage stub; aarch64: its `#'NAME` thunk), so every direct
+caller sees the new definition, interpreted or native, and a caller holding the
+OLD object still runs the old code (advice works; so does putting it back).
+Cost: nothing per call until redefined; +378 KB native on x64; startup
+unchanged.  `test/redefine-kernel-callers.lisp` (x64 + aarch64; main fails 5).
+
+Three things that are easy to get wrong:
+- **PRE-PACKED &REST.**  A kernel caller of an `&rest`/`&key` function with no
+  `&optional` conses the rest list itself and passes nargs = 255; only the
+  callee knows how many required arguments precede the list.  The translator
+  writes that count into the pad (`*fn-prepack-req*`, cross.lisp) and such
+  pads go through `%KREST-0..3`, which are compiled with the same shape.  Six
+  functions take more than 3 (MERGE, ENCODE-UNIVERSAL-TIME, ...): redefining
+  one leaves its kernel callers early-bound and prints a note.  Without this,
+  `trivial-gray-streams`' CLOSE wrapper broke LOAD (md5/salza2 on the ladder).
+- **A saved core does not carry kernel code**, so the restore sequence in
+  `build-cli-common` calls `%KERNEL-REDIRECTS-REAPPLY` -- not
+  `%CORE-POST-RESTORE`, which net/hosted-ssh.lisp REPLACES by last-defun-wins
+  (it also drops save-image's `MODUS_NO_RUNTIME_JIT` check: pre-existing).
+- **Kernel names are CL-USER names.**  A script's CL-USER `(defun fe-sq ...)`
+  now replaces the kernel's own FE-SQ for its kernel callers too -- the same
+  rule that makes a REPL fix work.  A defun in a library's own package is keyed
+  `PKG::NAME` and touches nothing.
+
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 
 `build-generic-cli` currently reports, on every build:

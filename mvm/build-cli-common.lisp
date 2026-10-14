@@ -1397,10 +1397,16 @@
   ;; a heap snapshot IN PLACE OF the boot init below: the snapshot carries every
   ;; table init-symbol-table onward would build, so it must land first, and the
   ;; arch prologue above has already mapped this process's bitmaps.  Hosted only.
+  ;; %KERNEL-REDIRECTS-REAPPLY is called HERE and not from %CORE-POST-RESTORE,
+  ;; which several images redefine (last-defun-wins: net/hosted-ssh.lisp's
+  ;; replaces lib/save-image.lisp's outright): image functions redefined before
+  ;; the save come back unpatched with the binary (mvm-eval.lisp, REDEFINING A
+  ;; KERNEL FUNCTION), and a restored process must call the definitions it saved.
   (cond ((not *cli-bare-metal*)
          "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
+    (%kernel-redirects-reapply)
     (handler-case (cli-toplevel) (t (c) (sys-exit 1)))
     (sys-exit 0))
 ")
@@ -1410,6 +1416,7 @@
         (t (concatenate 'string "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
+    (%kernel-redirects-reapply)
 " *cli-arch-core-resume* "    )
 ")))
   ;; ---- SHARED boot init.  Identical on every arch, and the whole reason this

@@ -164,6 +164,12 @@
    (write(2) to fd=1; exit(2) with status).  NIL is bare-metal (UART
    MMIO, infinite WFI loop).")
 
+(defvar *aarch64-no-call-pad* nil
+  "NIL (the default -- NIL so a self-hosted compiler, whose non-NIL defvar
+   inits may not run, agrees with the host): emit a 16-byte call pad before every image function (see the pad in
+   TRANSLATE-MVM-TO-AARCH64): direct calls enter there, function objects
+   16 bytes on, and a run-time redefinition patches the pad.")
+
 (defvar *aarch64-fn-align-offset* 0
   "Bytes of pre-native-code wrapper between load-addr and the first
    instruction of native code at runtime.  Bare-metal puts native code
@@ -8549,6 +8555,26 @@
         (let ((label (gethash mvm-off mvm-to-native-label)))
           (when label
             (a64-set-label buf label)))
+        ;; THE CALL PAD.  A direct BL lands on the label above; the function
+        ;; OBJECT (fn-entry-offsets, so every #'NAME and the symbol-function
+        ;; table) is 16 bytes on, past four inert instructions.  Redefining a
+        ;; kernel function at run time rewrites only these 16 bytes, into a
+        ;; jump to NAME's late-binding thunk (%KERNEL-REDIRECT, mvm-eval), so
+        ;; every direct caller sees the new definition while a caller holding
+        ;; the OLD object still runs the old code.  ORR X17,XZR,X17 and not
+        ;; NOP so the patcher can tell a pad from alignment padding (<= 3
+        ;; NOPs).  Runtime-JIT code is late-bound through linkage cells and
+        ;; has no pad.
+        ;; The fourth is MOVZ X17,#(#x5200+N) instead when callers may pre-pack
+        ;; this function's &rest list after N required arguments
+        ;; (*fn-prepack-req*).
+        (when (and (not *aarch64-no-call-pad*) (not *aarch64-jit-mode*)
+                   (gethash mvm-off fn-bc-offsets))
+          (dotimes (i 3) (a64-emit buf #xAA1103F1))
+          (let ((pre (and *fn-prepack-req* (gethash mvm-off *fn-prepack-req*))))
+            (a64-emit buf (if (and pre (< pre 256))
+                              (logior #xD2800011 (ash (+ #x5200 pre) 5))
+                              #xAA1103F1))))
         ;; Record native position for function entries.  Subtract
         ;; translated-start-idx so offsets stay relative to the start
         ;; of the translated region (whether or not buf was shared

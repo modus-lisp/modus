@@ -32,7 +32,15 @@
   bytecode-offset   ; offset into module bytecode
   bytecode-length   ; length of this function's bytecode
   native-offset     ; offset in native code (filled by translator)
-  native-length)    ; length of native code (filled by translator)
+  native-length     ; length of native code (filled by translator)
+  prepack-req)      ; required count when callers may PRE-PACK its &rest list
+                    ; (compile-call's static-rest path: nargs slot = 255), else NIL
+
+(defvar *fn-prepack-req* nil
+  "While a translator runs: bytecode offset -> PREPACK-REQ for each function
+   whose callers may pre-pack its &rest list.  The translators record it in the
+   function's call pad, so a run-time redefinition can route those calls
+   through an adapter that understands the convention (mvm-eval.lisp).")
 
 ;;; ============================================================
 ;;; Image Builder
@@ -140,6 +148,14 @@
    helpers, deferred boot-side fixups — before resolving fixups once)."
   (let ((translator (target-translate-fn target))
         (modus.mvm::*aarch64-translate-into-buf* into-buf))
+    ;; SETQ, not a LET binding: the self-hosted builds bake this function and
+    ;; rewrite the LET above for the same reason (build-modus-selfhost #210).
+    (setq *fn-prepack-req*
+          (let ((h (make-hash-table :test 'eql)))
+            (dolist (fi (mvm-module-function-table module) h)
+              (when (mvm-function-info-prepack-req fi)
+                (setf (gethash (mvm-function-info-bytecode-offset fi) h)
+                      (mvm-function-info-prepack-req fi))))))
     (unless translator
       (error "No translator installed for target ~A" (target-name target)))
     (let* ((fn-list (mvm-module-function-table module))
@@ -2059,7 +2075,13 @@
               :bytecode-offset (function-info-bytecode-offset fi)
               :bytecode-length (function-info-bytecode-length fi)
               :native-offset nil
-              :native-length nil))
+              :native-length nil
+              ;; compile-call pre-packs exactly when the callee has &rest (or
+              ;; &key) and no &optional: see its static-rest pre-pack.
+              :prepack-req (and (function-info-rest-param-p fi)
+                                (not (let ((oc (function-info-optional-count fi)))
+                                       (and oc (> oc 0))))
+                                (or (function-info-required-count fi) 0))))
            (compiled-module-function-table compiled-mod))
    :constant-table (compiled-module-constant-table compiled-mod)
    :source-text source-text))

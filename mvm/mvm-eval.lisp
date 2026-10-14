@@ -1099,7 +1099,7 @@
     (%jit-thunk-emit-tail addr (%jit-thunk-emit-shift addr nargs) idx nargs)
     addr))
 
-(defun %jit-make-bridge-any-thunk (name)
+(defun %jit-make-bridge-any-thunk (name &optional to)
   "x86-64 ANY-ARITY bridge thunk for a call to NAME: its address or NIL.  The
    nargs-specific thunk shifts V0..V3 up to make room for the name index, which
    cannot reach a 5th+ argument on the stack, so a site with more than 3
@@ -1119,7 +1119,7 @@
               (%jit-emit-bytes addr (list #x64 #xC7 #x04 #x25 #x78 #x01 #x00 #x10
                                           (logand idx 255) (logand (ash idx -8) 255) 0 0))
               (%jit-emit-bytes (+ addr 12) (list #x48 #xB8))
-              (%jit-write-imm64 addr 14 (%jit-bridge-any-entry))
+              (%jit-write-imm64 addr 14 (or to (%jit-bridge-any-entry)))
               (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
               addr)))))
 
@@ -1427,11 +1427,239 @@
             (aset g idx gen))
           f))))
 
+;;; ============================================================
+;;; REDEFINING A KERNEL FUNCTION
+;;; ============================================================
+;;; Functions compiled into the image call each other with a direct BL / CALL, so
+;;; a runtime DEFUN or (SETF FDEFINITION) of one of them reached only the callers
+;;; that look the name up -- the REPL, FUNCALL, JIT code through its linkage
+;;; cells -- and never the rest of the kernel: a fix typed at the board's REPL to
+;;; a driver function did nothing until every caller up the chain was retyped too.
+;;;
+;;; So every image function has TWO entry points (the translators' CALL PAD): a
+;;; direct call lands on 16 inert bytes that fall through into the function, and
+;;; the function OBJECT -- #'NAME, the symbol-function table -- is the address 16
+;;; bytes on.  The first redefinition of a kernel function rewrites its pad into
+;;; a jump to NAME's late-binding entry -- the #'NAME thunk (aarch64) or the
+;;; any-arity bridge thunk (x64), which resolve the current definition at call
+;;; time, interpreted or native.  Every direct caller now goes there; a caller
+;;; holding the OLD function object enters past the pad and runs the old code,
+;;; as in CL, so the advice idiom (let ((old #'f)) (setf (fdefinition 'f) ...
+;;; (apply old args))) works, and so does putting the old object back.
+;;;
+;;; The pad is written one aligned 32-bit word at a time, in an order that never
+;;; leaves a half-written instruction reachable from its first byte: first a
+;;; short jump over the pad (the fall-through, still), then the target word, then
+;;; the jump.  A thread already standing INSIDE the pad's second half while it is
+;;; written is the one window, nanoseconds wide.
+;;;
+;;; Kernel code is writable where this runs: the hosted ELF's one LOAD segment is
+;;; RWE, and the Pi maps its image Normal, executable and writable.  A saved core
+;;; does not carry kernel code, so %KERNEL-REDIRECTS-REAPPLY redoes the patches
+;;; after a restore.
+
+(defvar *kernel-redirects* nil
+  "EQUAL hash: NAME -> the address of its patched call pad.")
+(defvar *kernel-redirect-seen* nil
+  "EQUAL hash of every NAME the redefinition hook has seen.  Only a name's FIRST
+   redefinition can find its kernel code in the table -- after that the table
+   may hold anything, even another kernel function (SETF FDEFINITION of #'G).")
+
+(defun %kernel-pad-state (pad)
+  "PAD (16 bytes before a function object): :PRISTINE, :PATCHED, or NIL when it
+   is not a call pad at all (runtime-JIT code, or an image built without pads)."
+  (let ((w0 (mem-ref pad :u32)) (w1 (mem-ref (+ pad 4) :u32))
+        (w2 (mem-ref (+ pad 8) :u32)) (w3 (mem-ref (+ pad 12) :u32)))
+    (if (eq *jit-target-arch* :aarch64)
+        (cond ((and (eql w0 #xAA1103F1) (eql w1 #xAA1103F1)          ; orr x17,xzr,x17
+                    (eql w2 #xAA1103F1)
+                    (or (eql w3 #xAA1103F1)
+                        (eql (logand w3 #xFFFFE01F) #xD28A4011)))     ; movz x17,#x52nn
+               :pristine)
+              ((and (eql w0 #x58000051) (eql w1 #xD61F0220)) :patched))
+        (cond ((and (eql w0 #x00841F0F) (eql w1 #x4441504B)          ; nop [rax+rax+"KPAD"]
+                    (eql w2 #x00841F0F)
+                    (or (eql w3 #x4441504B)
+                        (eql (logand w3 #xFF00FFFF) #x4400524B)))      ; ... "KR<n>D"
+               :pristine)
+              ((and (eql w0 #x000225FF) (eql w1 #x90660000)) :patched)))))
+
+(defun %kernel-pad-prepack (pad)
+  "A pristine pad's record of how its callers call: the required-argument count
+   N when they may PRE-PACK the &rest list (compile-call's static-rest path:
+   arguments N.. arrive as ONE list, nargs slot 255), else NIL."
+  (let ((w3 (mem-ref (+ pad 12) :u32)))
+    (if (eq *jit-target-arch* :aarch64)
+        (when (eql (logand w3 #xFFFFE01F) #xD28A4011)
+          (logand (ash w3 -5) 255))
+        (when (eql (logand w3 #xFF00FFFF) #x4400524B)
+          (logand (ash w3 -16) 255)))))
+
+(defun %kernel-patch-pad (pad to)
+  "Make the call pad at PAD an absolute jump to TO.  aarch64: ldr x17,#8 /
+   br x17 / .quad (x17 is the intra-call scratch; nothing at a function's entry
+   reads it).  x64: jmp qword [rip+2] / xchg ax,ax / .quad."
+  (let ((a64 (eq *jit-target-arch* :aarch64)))
+    ;; 1. jump over the pad -- behaviour unchanged, and nothing new enters it
+    (setf (mem-ref pad :u32) (if a64 #x14000004 #x90660EEB))   ; b .+16 | jmp short .+16
+    (%jit-icache-flush pad 16)
+    ;; 2. the target word (8-aligned)
+    (setf (mem-ref (+ pad 8) :u32) (logand to #xFFFFFFFF))
+    (setf (mem-ref (+ pad 12) :u32) (logand (ash to -32) #xFFFFFFFF))
+    ;; 3. the jump's second word, then its first
+    (setf (mem-ref (+ pad 4) :u32) (if a64 #xD61F0220 #x90660000))
+    (%jit-icache-flush pad 16)
+    (setf (mem-ref pad :u32) (if a64 #x58000051 #x000225FF))
+    (%jit-icache-flush pad 16)
+    t))
+
+(defun %kernel-redirect-target (name &optional prepack)
+  "NAME's late-binding entry (raw code address) or NIL.  PREPACK (a required
+   count, see %KERNEL-PAD-PREPACK) routes the calls through %KREST-n instead.  aarch64: its #'NAME
+   thunk, which caches a native target.  x64: its linkage stub, which every
+   (re)definition retargets -- at new native code directly, else at an
+   any-arity bridge that resolves NAME when called."
+  (if prepack
+      (%kernel-rest-thunk name prepack)
+  (if (eq *jit-target-arch* :aarch64)
+      (%jit-make-fnaddr-thunk-aarch64 name)
+      (let ((e (and *jit-x64-stubs* (gethash name *jit-x64-stubs*))))
+        (if e
+            (car e)
+            (let ((b (%jit-make-bridge-any-thunk name)))
+              (when b
+                (let ((st (%jit-x64-stub name b)))
+                  (when st (setf (cdr (gethash name *jit-x64-stubs*)) b))
+                  st))))))))
+
+;;; PRE-PACKED &REST.  A kernel caller of a function with &rest (or &key) and no
+;;; &optional conses the rest list ITSELF and passes it as one argument after the
+;;; N required ones, with 255 in the nargs slot (compile-call's static-rest
+;;; path).  Only the callee knows N, so neither late-binding entry above can take
+;;; that call: their &REST prologues read the first argument as the packed list.
+;;; %KREST-N is compiled by the same compiler with the same shape, so its
+;;; prologue accepts both conventions -- pre-packed, and an honest nargs from
+;;; FUNCALL / JIT code -- and APPLYs NAME's current definition, found through
+;;; the index the thunk passes out of band exactly as %JIT-BRIDGE-ANY's.  The
+;;; index is read first, before anything can call another thunk.  Each %KREST-N
+;;; is ~35 KB -- the &REST prologue, which every &rest function carries -- so
+;;; there are four: 375 of the image's 382 pre-packed functions take at most 3
+;;; required arguments (MERGE, ENCODE-UNIVERSAL-TIME and four internals take
+;;; more, and their kernel callers keep the old definition, said at the time).
+(defun %krest-apply (idx args)
+  ;; The adapters' one APPLY site.
+  (apply (%jit-bridge-lookup idx) args))
+(defun %krest-0 (&rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) r))
+(defun %krest-1 (a &rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) (cons a r)))
+(defun %krest-2 (a b &rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) (cons a (cons b r))))
+(defun %krest-3 (a b c &rest r)
+  (%krest-apply (mem-ref #x10000178 :u32) (cons a (cons b (cons c r)))))
+
+(defun %krest-entry (n)
+  "Raw entry of the adapter for N required arguments, or NIL past the last."
+  (let ((f (case n
+             (0 (function %krest-0)) (1 (function %krest-1)) (2 (function %krest-2))
+             (3 (function %krest-3)))))
+    (when f (- (%val->word f) 3))))
+
+(defvar *kernel-rest-thunks* nil "EQUAL hash: NAME -> its %KREST thunk.")
+
+(defun %kernel-rest-thunk (name n)
+  "A thunk that passes NAME's bridge index out of band and jumps to %KREST-N;
+   NIL when there is no such adapter (the function is then left early-bound,
+   and said so) or no executable slot."
+  (let ((old (and *kernel-rest-thunks* (gethash name *kernel-rest-thunks*)))
+        (to (%krest-entry n)))
+    (cond
+      (old old)
+      ((null to)
+       (format *error-output* "~&;; ~A: ~D required arguments before a pre-packed &rest -- kernel callers keep the old definition~%" name n)
+       nil)
+      (t
+       (let ((th (if (eq *jit-target-arch* :aarch64)
+                     (%kernel-rest-thunk-aarch64 name to)
+                     (%jit-make-bridge-any-thunk name to))))
+         (when th
+           (when (null *kernel-rest-thunks*)
+             (setq *kernel-rest-thunks* (make-hash-table :test (function equal))))
+           (puthash name *kernel-rest-thunks* th))
+         th)))))
+
+(defun %kernel-rest-thunk-aarch64 (name to)
+  "The slow path of a #'NAME thunk (%JIT-FNADDR-THUNK-FILL-AARCH64) alone, ending
+   in a branch to TO: no cached target, since a cached native definition would be
+   entered with the caller's pre-packed arguments."
+  (if (or (null (%jit-bridge-ensure)) (>= *jit-bridge-count* (%jit-bridge-cap)))
+      nil
+      (let ((addr (%jit-thunk-alloc-aarch64)))
+        (when addr
+          (let ((idx *jit-bridge-count*) (k 0))
+            (setf (aref *jit-bridge-names* idx) name)
+            (setq *jit-bridge-count* (+ idx 1))
+            (%jit-emit-quad-placeholder (+ addr k) 17)
+            (%jit-write-movz-quad addr k idx)
+            (setq k (+ k 16))
+            (%jit-emit-quad-placeholder (+ addr k) 16)
+            (%jit-write-pcrel-quad addr k (%jit-fnaddr-idx-slot))
+            (setq k (+ k 16))
+            (setq k (+ k (%jit-emit-thread-delta-aarch64 addr k 16 9)))   ; x16 += delta (x9 scratch)
+            (%jit-emit-word32 (+ addr k) #xB9000211)          ; str w17, [x16]
+            (setq k (+ k 4))
+            (%jit-emit-quad-placeholder (+ addr k) 16)
+            (%jit-write-pcrel-quad addr k to)
+            (setq k (+ k 16))
+            (%jit-emit-word32 (+ addr k) #xD61F0200)          ; br x16
+            (%jit-icache-flush addr 96)
+            addr)))))
+
+(defun %kernel-redirect (name old)
+  "OLD, NAME's definition being replaced, is a code object: if it has a pristine
+   call pad, point the pad at NAME's late binding."
+  (let ((pad (- (%val->word old) 3 16)))
+    (when (eq (%kernel-pad-state pad) :pristine)
+      (let ((target (%kernel-redirect-target name (%kernel-pad-prepack pad))))
+        (when target
+          (%kernel-patch-pad pad target)
+          (when (null *kernel-redirects*)
+            (setq *kernel-redirects* (make-hash-table :test (function equal))))
+          (puthash name *kernel-redirects* pad)
+          t)))))
+
+(defun %kernel-redirect-hook (name)
+  "From %JIT-FNADDR-THUNK-INVALIDATE, before NAME's binding changes."
+  (when (and (stringp name) (> (length name) 0) (%jit-enabled-p)
+             (member *jit-target-arch* (quote (:aarch64 :x64)))
+             (boundp (quote *symbol-function-table*)) *symbol-function-table*
+             (%mvm-on-main-thread-p))
+    (when (null *kernel-redirect-seen*)
+      (setq *kernel-redirect-seen* (make-hash-table :test (function equal))))
+    (unless (gethash name *kernel-redirect-seen*)
+      (puthash name *kernel-redirect-seen* t)
+      (let ((old (gethash name *symbol-function-table*)))
+        ;; (Not "unless registered": a DEFUN registers its module before this
+        ;; runs.  The first-seen rule is what tells kernel code apart.)
+        (when (and old (eql (logand (%val->word old) 15) 3))
+          (%kernel-redirect name old))))))
+
+(defun %kernel-redirects-reapply ()
+  "After a core restore: the image's code came from the binary, unpatched."
+  (when *kernel-redirects*
+    (maphash (lambda (name pad)
+               (when (eq (%kernel-pad-state pad) :pristine)
+                 (let ((target (%kernel-redirect-target name (%kernel-pad-prepack pad))))
+                   (when target (%kernel-patch-pad pad target)))))
+             *kernel-redirects*))
+  nil)
+
 (defun %jit-fnaddr-thunk-invalidate (name)
   "A DEFUN / (setf symbol-function) of NAME: drop the cached native target of
    its #'NAME thunk so the next call re-resolves — late binding is what the
    thunk exists for.  No-op when NAME has no thunk (and on x64, which bakes).
    Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
+  (%kernel-redirect-hook name)
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
   (let ((h (%jit-fnaddr-thunk-entry name)))
     (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0)))

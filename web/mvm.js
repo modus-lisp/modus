@@ -23,14 +23,16 @@ const BSS_END    = 0x10020000;
 // bytecode (14.05 MB) was 630 KB short of 0x11000000 when the thread branches
 // merged, so the windows grew: pool 3.9 MB, code 16 MB, JIT 16 MB; the stack
 // and heap moved up by 4 MB.  Nothing outside this file names these addresses.
+// 2026-10-14: the bytecode reached 16.78 MB (6.5 KB past the 16 MB window), so
+// the code window grew to 20 MB and JIT, stack and heap moved up 4 MB again.
 const POOL_ADDR  = 0x10020000;            // constant pool (strings) lives here
 const CODE_ADDR  = 0x10400000;            // the module's bytecode, executed in place
-const JIT_ADDR   = 0x11400000;            // exec pages handed out by %mmap-exec-page / mmap
-const JIT_END    = 0x12400000;
-const STACK_ADDR = 0x12400000;
+const JIT_ADDR   = 0x11800000;            // exec pages handed out by %mmap-exec-page / mmap
+const JIT_END    = 0x12800000;
+const STACK_ADDR = 0x12800000;
 const STACK_SIZE = 0x00800000;            // 8 MB
 const ARGV_AREA  = 0x00010000;            // top of the stack region: initial argv/envp
-const HEAP_ADDR  = 0x12C00000;
+const HEAP_ADDR  = 0x13000000;
 // pc values are PHYSICAL indices into memory (virtual - VBASE); a function
 // value is (phys << 4) | 3.
 const CODE_PHYS  = CODE_ADDR - VBASE, JIT_PHYS = JIT_ADDR - VBASE;

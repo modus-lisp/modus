@@ -831,8 +831,8 @@
     ;; symbol) rather than SYMBOL-NAME + STRING=, and the common 1-byte answer
     ;; is a shared constant rather than a fresh cons.  The spec is never
     ;; mutated.  Hashes: UNSIGNED-BYTE 237688881, SIGNED-BYTE 398241362.
-    (if (and (consp et) (symbolp (car et)) (consp (cdr et)) (integerp (cadr et))
-             (> (cadr et) 0))
+    (if (and (consp et) (symbolp (car et)) (car et) (not (eq (car et) t))  ; NIL/T: immediates
+             (consp (cdr et)) (integerp (cadr et)) (> (cadr et) 0))
         (let ((h (aref (car et) 0)) (k (floor (+ (cadr et) 7) 8)))
           (cond ((and (eql h 237688881) (> k 1)) (cons k nil))
                 ((eql h 398241362) (cons k t))

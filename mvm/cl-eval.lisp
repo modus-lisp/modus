@@ -1024,7 +1024,7 @@
                      (when (stringp k) (puthash (compute-name-hash k) h t)))
                    *%runtime-deftype-table*)
           (setq *%deftype-name-hashes* h)))
-      (when (symbolp tname)
+      (when (and (symbolp tname) tname (not (eq tname t)))
         (puthash (aref tname 0) *%deftype-name-hashes* t))
       (%deftype-warm tname)))
   tname)

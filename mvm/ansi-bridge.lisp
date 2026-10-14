@@ -6212,6 +6212,9 @@
    %CLOS-PKG-OBJ-COMPATIBLE."
   (and *%runtime-deftype-table*
        (symbolp head)
+       ;; NIL and T are immediates in some images (the ANSI gate's sentinels),
+       ;; with no slot 0 to read -- and neither can name a DEFTYPE.
+       (not (eq head nil)) (not (eq head t))
        ;; A name no DEFTYPE ever registered cannot be one: one fixnum probe
        ;; instead of the name-string lookups below (EQUAL hashing, STRING=),
        ;; which were ~18% of an Opus decode through MAKE-ARRAY's element type.

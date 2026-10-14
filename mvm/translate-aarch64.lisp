@@ -2230,6 +2230,51 @@
   "Per-thread window slot holding the per-CPU block's address: AArch64's GS
    base.  0 until %HA-PERCPU-INIT-CPU stores one, like a fresh GS.")
 
+;;; HEAP EXHAUSTED.  The native collector copied without checking that to-space
+;;; had room, so a live set larger than one semispace copied straight past its
+;;; end -- into the from-space it was still reading, or into the runtime
+;;; metadata at 0x10000000 -- and the machine wedged with nothing on the
+;;; console (a 60 MB live set on the Zero's 56 MB semispaces).  Now every copy
+;;; first checks free_ptr + size <= to_start + space_size; a collection that
+;;; cannot fit says so and stops.  It cannot recover: half the live set is
+;;; already forwarded.
+(defun emit-aarch64-gc-room-check (buf size-reg full-label)
+  "Branch to FULL-LABEL unless SIZE-REG more bytes fit in to-space.  Clobbers
+   x16/x17 (copy_object scratch, not yet live where this is emitted)."
+  (a64-add-reg buf +a64-x16+ +a64-x21+ size-reg 0 0)   ; free_ptr + size
+  (a64-add-reg buf +a64-x17+ +a64-x22+ +a64-x25+ 0 0)  ; to_end = to_start + space_size
+  (a64-cmp-reg buf +a64-x16+ +a64-x17+)
+  (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i full-label :bcond))) ; HI
+
+(defun emit-aarch64-gc-exhausted (buf)
+  "Print GC: HEAP EXHAUSTED and stop: exit_group(137) hosted, WFE forever on
+   bare metal."
+  (let ((msg (format nil "~%GC: HEAP EXHAUSTED (live data > one semispace)~%")))
+    (loop for ch across msg
+          do (a64-movz buf +a64-x16+ (char-code ch) 0)
+             (if *aarch64-linux-mode*
+                 (progn (a64-load-conv-addr buf +a64-x17+ #x100001F0)
+                        (a64-emit buf (logior #x39000000 (ash 17 5) 16))  ; strb w16,[x17]
+                        (a64-load-imm64 buf +a64-x0+ 2)
+                        (a64-mov-reg buf +a64-x1+ +a64-x17+)
+                        (a64-load-imm64 buf +a64-x2+ 1)
+                        (a64-load-imm64 buf +a64-x8+ 64)                  ; write
+                        (a64-svc buf 0))
+                 (progn (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
+                        (when *aarch64-serial-tx-poll*
+                          (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
+                            (a64-ldr-width buf +a64-x15+ +a64-x17+ offset 2)
+                            (a64-emit buf (logior (ash (ecase polarity (:tbz #b00110110) (:tbnz #b00110111)) 24)
+                                                  (ash bit 19) (ash (logand -1 #x3FFF) 5) +a64-x15+))))
+                        (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*)))))
+  (if *aarch64-linux-mode*
+      (progn (a64-load-imm64 buf +a64-x0+ 137)
+             (a64-load-imm64 buf +a64-x8+ 94)                             ; exit_group
+             (a64-svc buf 0))
+      (let ((top (a64-current-index buf)))
+        (a64-wfe buf)
+        (a64-b buf (- top (a64-current-index buf))))))
+
 (defun a64-gc-stat-addr (addr)
   "Where one of the aarch64-only words at 0x10000F20..0x10000F58 (the GC pause
    statistics and the JIT arena bump) lives in THIS image.  With threads they
@@ -7750,7 +7795,8 @@
           (co-cons (incf *mvm-label-counter*))
           (co-done (incf *mvm-label-counter*))
           (oloop   (incf *mvm-label-counter*))
-          (odone   (incf *mvm-label-counter*)))
+          (odone   (incf *mvm-label-counter*))
+          (co-full (incf *mvm-label-counter*)))
       (a64-cmp-imm buf +a64-x14+ 15)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-fwd :bcond))
       (a64-cmp-imm buf +a64-x12+ 1)
@@ -7776,6 +7822,7 @@
       (a64-add-imm buf +a64-x15+ +a64-x15+ 15)
       (a64-lsr-imm buf +a64-x15+ +a64-x15+ 4)
       (a64-lsl-imm buf +a64-x15+ +a64-x15+ 4)            ; size aligned16
+      (emit-aarch64-gc-room-check buf +a64-x15+ co-full)
       (a64-add-reg buf +a64-x9+ +a64-x11+ +a64-x15+ 0 0) ; x9 = src end
       (a64-mov-reg buf +a64-x16+ +a64-x11+)              ; x16 = src ptr
       (a64-set-label buf oloop)
@@ -7799,6 +7846,8 @@
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
       ;; ---- cons: 16 bytes ----
       (a64-set-label buf co-cons)
+      (a64-movz buf +a64-x15+ 16 0)
+      (emit-aarch64-gc-room-check buf +a64-x15+ co-full)
       (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; dest_start
       (a64-str-unsigned buf +a64-x13+ +a64-x21+ 0)       ; car (x13 = first word)
       (a64-ldr-unsigned buf +a64-x14+ +a64-x11+ 8)       ; cdr = [src+8] (imm=BYTE offset, scaled /8)
@@ -7831,7 +7880,9 @@
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 4) (a64-lsl-imm buf +a64-x14+ +a64-x14+ 4) ; new addr
       (a64-add-reg buf +a64-x10+ +a64-x14+ +a64-x12+ 0 0) ; new | orig tag
       (a64-set-label buf co-done)
-      (a64-ret buf))
+      (a64-ret buf)
+      (a64-set-label buf co-full)
+      (emit-aarch64-gc-exhausted buf))
 
     (a64-tramp-mark 3)
     ;; ============ SUBROUTINE park (stop-the-world; x14 = this thread's record) ============

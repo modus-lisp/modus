@@ -755,12 +755,24 @@
     (unless (eql sig 0)
       (setf (mem-ref #x10000CB0 :u32) 0)
       (setq *current-condition*
-            (cond ((eql sig 8) (make-condition 'division-by-zero
-                                               :operation nil :operands nil))
-                  ((eql sig 4) (make-condition 'illegal-instruction-error))
-                  (t (make-condition 'memory-fault-error
-                                     :datum nil :expected-type t)))))
+            (%attach-fault-frames
+             (cond ((eql sig 8) (make-condition 'division-by-zero
+                                                :operation nil :operands nil))
+                   ((eql sig 4) (make-condition 'illegal-instruction-error))
+                   (t (make-condition 'memory-fault-error
+                                      :datum nil :expected-type t))))))
     nil))
+
+(defun %attach-fault-frames (c)
+  "C, carrying the frames the signal stub recorded for the fault it stands for (hosted
+   x86-64: net/hosted-backtrace.lisp) under the slot %FAULT-FRAMES.  The stub's record is
+   per thread and only the LAST fault's -- printing the condition can fault internally and
+   overwrite it -- so the condition takes its own copy while it is still this fault's.
+   Elsewhere the reader is not defined and C is returned unchanged."
+  (when (fboundp '%fault-backtrace-addresses)
+    (let ((a (funcall (symbol-function '%fault-backtrace-addresses))))
+      (when a (aset c 1 (cons (cons '%fault-frames a) (aref c 1))))))
+  c)
 
 (defun %maybe-report-unhandled-hc ()
   "Called by compiled handler-case dispatch tails just before the
@@ -2768,13 +2780,13 @@
               ;; This condition says more than the signal would: claim it.
               (setf (mem-ref #x10000CB0 :u32) 0)
               (setq *current-condition*
-                    (make-condition 'simple-error
+                    (%attach-fault-frames (make-condition 'simple-error
                                     :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused (at #x~x)."
                                     ;; THE SITE: the guard leaves the storing code's
                                     ;; return address at +0x5060, which names the
                                     ;; function against a symbol map -- the one thing
                                     ;; that makes this error actionable.
-                                    :format-arguments (list (%gc-read64 (+ m 8))))))
+                                    :format-arguments (list (%gc-read64 (+ m 8)))))))
             ;; Any other fault: %TAKE-PENDING-FAULT, which the dispatch
             ;; calls next, builds the condition from the recorded signal
             ;; (SIGSEGV -> MEMORY-FAULT-ERROR, a TYPE-ERROR).

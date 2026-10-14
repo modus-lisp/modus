@@ -125,10 +125,14 @@
   "NAME+0xOFF for ADDR, or JIT@/?@ when no known function contains it."
   (cond
     ((>= addr #x3000000000)
+     ;; The JIT arena is bump-allocated and only named functions are on record, so code it
+     ;; made for a toplevel form or a lambda sits just past some unrelated DEFUN.  Credit the
+     ;; nearest name only within 16 KB (a large function); farther, say where it is.
      (let ((e (and jit-table (%bt-lookup addr jit-table))))
-       (if (and e (< (- addr (car e)) 262144))
-           (format nil "~a+0x~x [jit]" (cdr e) (- addr (car e)))
-           (format nil "jit@~x" addr))))
+       (cond ((and e (< (- addr (car e)) 16384))
+              (format nil "~a+0x~x [jit]" (cdr e) (- addr (car e))))
+             (e (format nil "jit@~x (past ~a)" addr (cdr e)))
+             (t (format nil "jit@~x" addr)))))
     (t (let ((lo 0) (hi (- (length table) 1)) (best nil))
          (loop
            (when (> lo hi) (return))
@@ -165,16 +169,21 @@
       (dotimes (i n) (setq out (cons (%bt-word (+ base 8 (* 8 i))) out))))
     (nreverse out)))
 
-(defun %fault-backtrace-list ()
-  "The stack at this thread's last hardware fault, named as %BACKTRACE-LIST names frames."
-  (let* ((addrs (%fault-backtrace-addresses))
+(defun %condition-fault-frames (condition)
+  "The frames %ATTACH-FAULT-FRAMES gave CONDITION, or NIL."
+  (and condition (%condition-p condition) (%condition-slot condition '%fault-frames)))
+
+(defun %fault-backtrace-list (&optional condition)
+  "The stack at a hardware fault, named as %BACKTRACE-LIST names frames: CONDITION's own
+   frames when it is a fault's condition, else this thread's last fault."
+  (let* ((addrs (or (%condition-fault-frames condition) (%fault-backtrace-addresses)))
          (table (and addrs (%bt-code-table)))
          (jit (and (some (lambda (a) (>= a #x3000000000)) addrs) (%bt-jit-table))))
     (mapcar (lambda (a) (%bt-name a table jit)) addrs)))
 
-(defun %print-fault-backtrace (&optional (stream *error-output*))
+(defun %print-fault-backtrace (&optional (stream *error-output*) condition)
   (let ((i 0))
-    (dolist (f (%fault-backtrace-list))
+    (dolist (f (%fault-backtrace-list condition))
       (format stream "~&~3d: ~a~%" i f)
       (setq i (+ i 1))))
   (force-output stream)

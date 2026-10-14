@@ -1590,6 +1590,15 @@
                               (or (%compile-lambda-form form)
                                   (list '%interp-closure
                                         (cadr form) (cddr form) nil))))
+       ;; (compile 'f) with no definition: CLHS says compile F's own definition.
+       ;; A DEFUN that LOAD evaluated once stays an interpreter trampoline
+       ;; (retry-on-hot never fires for a DEFUN), ~100x slower than native, and
+       ;; this used to return the name and change nothing.  The JIT's module
+       ;; registry holds every such DEFUN's compiled module; JIT-EAGER
+       ;; translates the pending ones (F among them) -- a module that cannot be
+       ;; translated stays interpreted and still works.
+       (when (and (null def) (fboundp '%jit-eager-all))
+         (ignore-errors (funcall (symbol-function '%jit-eager-all))))
        (values name nil nil)))))
 
 (defun compile (name &rest args)

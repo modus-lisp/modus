@@ -613,25 +613,11 @@
 
 ;;; --- frob-simple-condition helpers (for ANSI tests) ---
 
-(defun frob-simple-condition (c expected-fmt &rest expected-args)
-  "Verify that C is a valid simple-condition. Returns T if so."
-  (if (%condition-typep c 'simple-condition)
-      (let ((fc (simple-condition-format-control c))
-            (args (simple-condition-format-arguments c)))
-        (if (stringp fc)
-            t
-            nil))
-      nil))
 
-(defun frob-simple-error (c expected-fmt &rest expected-args)
-  (if (%condition-typep c 'simple-error)
-      (frob-simple-condition c expected-fmt)
-      nil))
 
-(defun frob-simple-warning (c expected-fmt &rest expected-args)
-  (if (%condition-typep c 'simple-warning)
-      (frob-simple-condition c expected-fmt)
-      nil))
+
+
+
 
 ;;; --- Updated error function to create condition objects ---
 
@@ -2216,307 +2202,7 @@
 
 ;;; --- Override typep for package type ---
 
-(defun typep (obj type)
-  "Extended typep supporting compound type specifiers and package type."
-  ;; ANSI: typep signals an error on VALUES and FUNCTION type-specifiers
-  ;; with arguments — these are valid in DECLARE/THE but not TYPEP.
-  ;; Atom 'FUNCTION is fine (= functionp).
-  (when (or (eq type 'values)
-            (and (consp type)
-                 (or (eq (car type) 'values)
-                     (eq (car type) 'function))))
-    (error "typep: this type-specifier is not legal here"))
-  (cond
-    ;; CLOS class object as type — extract its name and recurse.
-    ((%clos-class-p type)
-     (typep obj (aref type 1)))
-    ;; Built-in class proxy (find-class result for 'integer, 'array, etc.)
-    ;; — recurse on the underlying name.
-    ((%class-proxy-p type)
-     (typep obj (aref type 1)))
-    ;; Simple type names (symbols/keywords)
-    ((not (consp type))
-     (let ((tn type))
-       (cond
-         ((eq tn 'stream) (streamp obj))
-         ((eq tn 'file-stream) (file-stream-p obj))
-         ((eq tn 'package) (packagep obj))
-         ((eq tn 'keyword) (keywordp obj))
-         ((eq tn 'integer) (integerp obj))
-         ((eq tn 'fixnum) (integerp obj))
-         ((eq tn 'bignum) nil)
-         ((eq tn 'real) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((eq tn 'rational) (or (integerp obj) (ratiop obj)))
-         ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((eq tn 'float) (floatp-impl obj))
-         ((eq tn 'single-float) (floatp-impl obj))
-         ((eq tn 'double-float) (floatp-impl obj))
-         ((eq tn 'short-float) (floatp-impl obj))
-         ((eq tn 'long-float) (floatp-impl obj))
-         ((eq tn 'ratio) (ratiop obj))
-         ((eq tn 'cons) (consp obj))
-         ((eq tn 'list) (or (null obj) (consp obj)))
-         ((eq tn 'null) (null obj))
-         ((eq tn 'symbol) (or (null obj) (eq obj t) (%cl-sym-p obj) (integerp obj)
-                              ;; Native MVM symbols are heap objects subtag #x50;
-                              ;; symbolp recognizes them (along with other forms above).
-                              (symbolp obj)))
-         ((eq tn 'string) (stringp obj))
-         ((eq tn 'simple-string) (simple-string-p obj))
-         ((eq tn 'base-string) (stringp obj))
-         ((eq tn 'simple-base-string) (simple-string-p obj))
-         ((eq tn 'character) (characterp obj))
-         ((eq tn 'base-char) (characterp obj))
-         ((eq tn 'standard-char) (characterp obj))
-         ((eq tn 'atom) (not (consp obj)))
-         ((eq tn 't) t)
-         ((eq tn 'nil) nil)
-         ((eq tn 'boolean) (or (null obj) (eq obj t)))
-         ((eq tn 'bit) (or (= obj 0) (= obj 1)))
-         ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
-         ((eq tn 'signed-byte) (integerp obj))
-         ;; Array / vector / sequence — strings and arrays alike. Cons
-         ;; lists (and nil) are sequences but not vectors/arrays.
-         ((eq tn 'array)         (or (arrayp obj) (stringp obj)))
-         ((eq tn 'simple-array)  (or (arrayp obj) (stringp obj)))
-         ((eq tn 'vector)        (or (arrayp obj) (stringp obj)))
-         ((eq tn 'simple-vector) (or (arrayp obj) (stringp obj)))
-         ((eq tn 'bit-vector)    (arrayp obj))
-         ((eq tn 'simple-bit-vector) (arrayp obj))
-         ((eq tn 'sequence)      (or (null obj) (consp obj)
-                                     (arrayp obj) (stringp obj)))
-         ((eq tn 'function)      (or (functionp obj) (%generic-function-p obj)))
-         ((eq tn 'compiled-function) (functionp obj))
-         ((eq tn 'generic-function) (%generic-function-p obj))
-         ((eq tn 'standard-generic-function) (%generic-function-p obj))
-         ((eq tn 'standard-method) (%standard-method-p obj))
-         ((eq tn 'method) (%standard-method-p obj))
-         ((eq tn 'method-combination) (%mc-p obj))
-         ((eq tn 'hash-table)    (hash-table-p obj))
-         ((eq tn 'condition) (%condition-p obj))
-         ((eq tn 'standard-object) (%clos-instance-p obj))
-         ;; Restart type: active restart frame element on *restart-stack*.
-         ;; The CL spec doesn't pin a representation; we treat anything
-         ;; currently bound as a restart (its identity is on the stack)
-         ;; as a (typep r 'restart) match.  compute-restarts.1/2,
-         ;; restart-bind.8 rely on this.
-         ((eq tn 'restart) (%active-restart-p obj))
-         ;; Check if it's a condition type name
-         (t (cond
-              ((%cond-reg-find tn) (%condition-typep obj tn))
-              ;; User-defined CLOS class: search obj's class precedence list.
-              ;; Use eq, then native-MVM-sym hash compare for symbol identity.
-              ;; Native MVM symbols (1-slot, subtag #x50) carry just a hash;
-              ;; we compare hashes when both sides are native syms. CL syms
-              ;; (3-slot) have name strings — fall back to string-equal.
-              ((%clos-instance-p obj)
-               (let ((cpl (%obj-cpl obj))
-                     (found nil))
-                 (let ((c cpl))
-                   (loop
-                     (when (null c) (return found))
-                     (let ((cur (car c)))
-                       ;; Package-discriminated (#241): the hash / name
-                       ;; compares below carry no package, so TYPEP used
-                       ;; to report a DA::CLS instance as a DB::CLS.
-                       (when (and (cond
-                                    ((eq cur tn) t)
-                                    ((and (%native-mvm-sym-p cur)
-                                          (%native-mvm-sym-p tn))
-                                     (= (%native-mvm-sym-hash cur)
-                                        (%native-mvm-sym-hash tn)))
-                                    ((and (%cl-sym-p cur) (%cl-sym-p tn))
-                                     (string-equal (%cl-sym-name cur)
-                                                   (%cl-sym-name tn)))
-                                    (t nil))
-                                  (or (eq cur tn) (%gf-pkg-compatible cur tn)))
-                         (setq found t) (return found)))
-                     (setq c (cdr c))))))
-              (t nil))))))
-    ;; Class proxy (find-class result)
-    ((%class-proxy-p type)
-     (typep obj (%class-proxy-name type)))
-    ;; Compound type specifiers
-    (t
-     (let ((head (car type)))
-       (cond
-         ((eq head 'real)
-          (if (or (integerp obj) (floatp-impl obj) (ratiop obj))
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ((eq head 'integer)
-          (if (integerp obj)
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ((or (eq head 'float) (eq head 'single-float)
-              (eq head 'double-float) (eq head 'short-float) (eq head 'long-float))
-          (if (floatp-impl obj)
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ((eq head 'rational)
-          (if (or (integerp obj) (ratiop obj))
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ((eq head 'eql)
-          (eql obj (cadr type)))
-         ((eq head 'member)
-          (if (member obj (cdr type)) t nil))
-         ((eq head 'and)
-          (let ((ok t))
-            (dolist (sub (cdr type))
-              (unless (typep obj sub) (setq ok nil)))
-            ok))
-         ((eq head 'or)
-          (let ((ok nil))
-            (dolist (sub (cdr type))
-              (when (typep obj sub) (setq ok t)))
-            ok))
-         ((eq head 'not)
-          (not (typep obj (cadr type))))
-         ((eq head 'satisfies) (and (funcall (cadr type) obj) t))
-         ((eq head 'unsigned-byte)
-          (and (integerp obj) (>= obj 0)
-               (< obj (ash 1 (cadr type)))))
-         ((eq head 'signed-byte)
-          (and (integerp obj)
-               (let ((half (ash 1 (- (cadr type) 1))))
-                 (and (>= obj (- 0 half)) (< obj half)))))
-         ((eq head 'mod)
-          (and (integerp obj) (>= obj 0) (< obj (cadr type))))
-         ;; (bit-vector size) — bit-vector with optional size.
-         ((or (eq head 'bit-vector) (eq head 'simple-bit-vector))
-          (and (bit-vector-p obj)
-               (let ((sz (and (cdr type) (cadr type))))
-                 (or (null sz) (eq sz '*) (eq sz t)
-                     (and (integerp sz) (= sz (array-length obj)))))))
-         ;; (string size) — string with optional size.
-         ((or (eq head 'string) (eq head 'simple-string)
-              (eq head 'base-string) (eq head 'simple-base-string))
-          (and (stringp obj)
-               (let ((sz (and (cdr type) (cadr type))))
-                 (or (null sz) (eq sz '*) (eq sz t)
-                     (and (integerp sz) (= sz (array-length obj)))))))
-         ;; (array elt-type [dims-or-size]) / (vector elt-type [size]) /
-         ;; (simple-array elt-type [dims-or-size])
-         ;; Element-type matters: elt-type=T means a general-T array (not
-         ;; string, not bit-vector); elt-type=* matches any; elt-type=CHARACTER
-         ;; requires string; elt-type=BIT requires bit-vector.  For
-         ;; (vector T n) we still want T to match general arrays only.
-         ;; (Modus's strings are subtag #x31; general arrays #x32.)
-         ((or (eq head 'vector) (eq head 'simple-vector)
-              (eq head 'simple-array) (eq head 'array))
-          ;; Capture multi-dim wrapper's dim list BEFORE peeling — used
-          ;; for 0-rank / multi-rank dim-spec matching.
-          (let ((wrapped-dims
-                 (cond
-                   ((and (consp obj) (eql (car obj) 9867654)
-                         (consp (cdr obj)))
-                    (cadr obj))   ; the DIMS list (could be NIL for 0-rank)
-                   (t :no-wrapper))))
-          ;; Peel multi-dim/adjustable wrappers to inner array before testing.
-          (let ((obj (cond
-                       ((and (consp obj) (eql (car obj) 9867654)
-                             (consp (cdr obj))) (cddr obj))
-                       ((and (consp obj) (eql (car obj) 8765432)) (cdr obj))
-                       (t obj))))
-          (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
-               (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32))
-               (let* ((et (and (cdr type) (cadr type)))
-                      (sz-given (and (cddr type) t))
-                      (sz (and (cddr type) (caddr type)))
-                      (is-string  (= (obj-subtag obj) #x31))
-                      (is-array   (= (obj-subtag obj) #x32))
-                      ;; Only treat as bit-vector when it has elements
-                      ;; (otherwise empty array would heuristic-match
-                      ;; bit-vector and exclude (array T)).
-                      (is-bitvec  (and is-array
-                                       (> (array-length obj) 0)
-                                       (bit-vector-p obj)))
-                      (et-ok
-                       (cond
-                         ((or (null et) (eq et '*) (eq et t))
-                          ;; T excludes strings/bit-vectors; * matches all
-                          (if (or (null et) (eq et '*))
-                              t
-                              (and is-array (not is-bitvec) (not is-string))))
-                         ((eq et 'character)            is-string)
-                         ((eq et 'base-char)            is-string)
-                         ((eq et 'standard-char)        is-string)
-                         ((eq et 'bit)                  is-bitvec)
-                         (t t))))
-                 ;; dim-spec semantics:
-                 ;;   absent           — no constraint
-                 ;;   '*  / T          — any rank/size
-                 ;;   integer N        — 1D length N
-                 ;;   NIL ()           — 0-rank (matches multi-dim wrapper
-                 ;;                      with empty dim list)
-                 ;;   (d1 d2 ...)      — list of dim-specs; match by
-                 ;;                      length + per-dim
-                 (and et-ok
-                      (cond
-                        ((not sz-given) t)
-                        ((eq sz '*) t)
-                        ((eq sz t)  t)
-                        ((null sz)
-                         ;; 0-rank: match if obj is a multi-dim wrapper
-                         ;; with NIL dim list, else NIL.
-                         (and (not (eq wrapped-dims :no-wrapper))
-                              (null wrapped-dims)))
-                        ((integerp sz) (= sz (array-length obj)))
-                        ((consp sz)
-                         (cond
-                           ((null (cdr sz))          ; (d)
-                            ;; 1D match: obj must be 1D (either bare
-                            ;; array or 1-d multi-dim wrapper).  Use
-                            ;; wrapped-dims if present.
-                            (cond
-                              ((eq wrapped-dims :no-wrapper)
-                               (or (eq (car sz) '*) (eq (car sz) t)
-                                   (and (integerp (car sz))
-                                        (= (car sz) (array-length obj)))))
-                              ((and (consp wrapped-dims)
-                                    (null (cdr wrapped-dims)))
-                               (or (eq (car sz) '*) (eq (car sz) t)
-                                   (and (integerp (car sz))
-                                        (= (car sz) (car wrapped-dims)))))
-                              (t nil)))     ; rank mismatch
-                           (t
-                            ;; multi-rank: only matches a multi-dim wrapper
-                            ;; with same-length dim list and per-dim match.
-                            (and (consp wrapped-dims)
-                                 (= (length sz) (length wrapped-dims))
-                                 (let ((ok t) (a sz) (b wrapped-dims))
-                                   (loop (when (null a) (return ok))
-                                     (let ((ad (car a)) (bd (car b)))
-                                       (unless (or (eq ad '*) (eq ad t)
-                                                   (and (integerp ad)
-                                                        (integerp bd)
-                                                        (= ad bd)))
-                                         (setq ok nil) (return nil)))
-                                     (setq a (cdr a)) (setq b (cdr b)))
-                                   ok)))))
-                        (t nil))))))))
-         ;; (cons car-type cdr-type) — type-check both halves.
-         ((eq head 'cons)
-          (and (consp obj)
-               (let ((car-type (and (cdr type) (cadr type)))
-                     (cdr-type (and (cddr type) (caddr type))))
-                 (and (or (null car-type) (eq car-type '*) (eq car-type t)
-                          (typep (car obj) car-type))
-                      (or (null cdr-type) (eq cdr-type '*) (eq cdr-type t)
-                          (typep (cdr obj) cdr-type))))))
-         ;; Check if head is a condition type name
-         (t (if (%cond-reg-find head)
-                (%condition-typep obj head)
-                nil)))))))
+
 
 ;;; --- Override string for symbol/character support ---
 
@@ -3116,3 +2802,32 @@
       (dolist (n (%standard-cl-symbol-names))
         (let ((sym (intern n pkg)))
           (export sym pkg))))))
+
+
+;;; ============================================================
+;;; CHECK-TYPE (simplified)
+;;; ============================================================
+(defun check-type-fn (place-value place-form type-spec string)
+  "Runtime check-type implementation."
+  (unless (typep place-value type-spec)
+    (error "Type error: expected ~A" (or string type-spec)))
+  nil)
+
+;;; ============================================================
+;;; WITH-SIMPLE-RESTART
+;;; ============================================================
+(defun %with-simple-restart (name fn)
+  "Invoke FN, ignoring named restart."
+  (funcall fn))
+
+;;; ============================================================
+;;; TYPE-ERROR SIGNALING — override key functions to add
+;;; arity checking and type validation for ANSI compliance.
+;;; All these use (error ...) which signals via handler-case.
+;;; ============================================================
+
+;;; Helper: signal program-error for wrong arg count
+(defun %program-error (msg)
+  (error (make-condition 'program-error
+                         :format-control msg
+                         :format-arguments nil)))

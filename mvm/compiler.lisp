@@ -1664,7 +1664,7 @@
 
    The trampolines (see compile-aref/compile-aset below) call
    %MDA-P / %MDA-DATA / %MDA-DISPLACED / %ASET-STORE-VAL / %WRAPPER-ASET
-   / %AREF-MULTI / … , which live in cl-clos.lisp and ansi-bridge.lisp.
+   / %AREF-MULTI / … , which live in cl-clos.lisp and cl-sequences.lisp.
    An image that does NOT link the CL array runtime — every bare-metal
    net/ image (x64-ssh, aarch64-ssh/actors/isolated, i386-ssh, arm32-ssh,
    rpi-*) is built from net/*.lisp only — therefore has NO definition for
@@ -4442,7 +4442,7 @@
     ;; DEFTYPE (RUNTIME / mvm-eval only — same rationale as DEFPACKAGE above):
     ;; register the expander in the SAME *%runtime-deftype-table* the
     ;; tree-walker's DEFTYPE handler uses, so typep/subtypep's
-    ;; %deftype-lookup / %expand-deftype (ansi-bridge.lisp) see it.  Without
+    ;; %deftype-lookup / %expand-deftype (cl-types.lisp) see it.  Without
     ;; this, mvm-eval compiled (deftype ...) as an undefined-function call —
     ;; the deftype.7/.8/.16-.18 + documentation.symbol.type.3 flip residue.
     ;; Returns the NAME (identity-preserved via the mvm-eval quote pool, so
@@ -5001,7 +5001,7 @@
   ;;                   in ansi-tests asserts this.
   ;; (/= a)          — vacuous T (single arg trivially distinct).
   ;; (/= a b)        — inline as (not (= a b)) for the fast path.
-  ;; (/= a b c …)    — fall through to the ansi-bridge `/=` defun
+  ;; (/= a b c …)    — fall through to the cl-types `/=` defun
   ;;                   which does the O(n²) all-distinct walk.  We
   ;;                   return the input form unchanged so macroexpand-mvm
   ;;                   reports expanded-p=NIL and compile-form dispatches
@@ -5014,7 +5014,7 @@
           ((= n 2) `(progn ,(cadr form) t)) ; single-arg vacuous, side effects run
           ((= n 3) `(not (= ,(cadr form) ,(caddr form))))
           ;; 4+ args: hand off to the runtime /= defun
-          ;; (in ansi-bridge.lisp).  Returning the form unchanged is
+          ;; (in cl-types.lisp).  Returning the form unchanged is
           ;; the documented way to say "this macro doesn't expand
           ;; this particular call" — macroexpand-mvm checks (eq result
           ;; form) and stops, then compile-form falls through to
@@ -5480,7 +5480,7 @@
   ;; compile-time macro (which produced (cons 9867654 …) wrappers) to
   ;; the dispatcher in compile-make-array (which routes multi-dim and
   ;; kwarg forms to the runtime MAKE-ARRAY defun that produces real
-  ;; #x34 MDA objects).  See compile-make-array + ansi-bridge.lisp's
+  ;; #x34 MDA objects).  See compile-make-array + cl-sequences.lisp's
   ;; (defun make-array …) + project_multidim_arrays.md.  Dormant macro
   ;; from commit 1fba8b6 removed in Phase 2b.
 
@@ -16470,7 +16470,7 @@
              ;; 2-arg wrappers are the only callable form — keep them.
              ;;
              ;; <, >, <=, >=, =, /= each have a real variadic &rest
-             ;; defun in ansi-bridge.lisp that handles 0/1/2/N args
+             ;; defun in cl-types.lisp that handles 0/1/2/N args
              ;; per CLHS.  Redirecting #'< to %LT-FN (which is fixed
              ;; 2-arg) made `(apply #'< (list))` and `(apply #'< (-2))`
              ;; misbehave: the 1-arg form is supposed to return T
@@ -21808,7 +21808,7 @@
      • Simple 1-D path (compile-make-array-1d) when no kwargs and dim
        is a plain integer / variable / '(N) single-elt list.
      • Multi-dim / 0-dim / kwarg-bearing path → route to the runtime
-       MAKE-ARRAY defun (ansi-bridge.lisp) via (funcall #'make-array
+       MAKE-ARRAY defun (cl-sequences.lisp) via (funcall #'make-array
        …).  Slightly higher overhead than inline allocation, but keeps
        compile-time and runtime behavior identical and lets us share
        the kwarg-handling code.

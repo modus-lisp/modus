@@ -1050,7 +1050,7 @@
 (defvar *filesystem* nil)  ;; alist of (path . content) for bare-metal use
 
 ;;; Pathnames are CLOS-instance-shaped arrays so (typep p 'pathname) works
-;;; without modifying ansi-bridge.lisp's typep.  Layout:
+;;; without modifying cl-types.lisp's typep.  Layout:
 ;;;   [0] = '%clos-instance       (so %clos-instance-p returns T)
 ;;;   [1] = 'pathname             (class name; %obj-cpl returns (pathname t))
 ;;;   [2] = host                  (typically nil)
@@ -2117,13 +2117,7 @@
 
 ;;; --- Core read-char ---
 
-(defun read-char (&rest args)
-  "Read one character from stream. Returns character object."
-  (let ((stream-arg (if args (car args) nil))
-        (eof-error-p (if (cdr args) (cadr args) t))
-        (eof-value (if (cddr args) (caddr args) nil)))
-    (let ((s (%resolve-input-stream stream-arg)))
-      (%read-char-from-stream s eof-error-p eof-value))))
+
 
 (defun %read-char-from-stream (s eof-error-p eof-value)
   "Read one character from a resolved stream."
@@ -2446,3 +2440,312 @@
      ;; Non-file streams: consult the side table.
      (if (%stream-closed-p s) nil t))))
 
+
+;;; ============================================================
+;;; Hash Table Extensions
+;;; ============================================================
+
+;; HASH-TABLE-TEST / HASH-TABLE-REHASH-{SIZE,THRESHOLD} / CLRHASH all
+;; live in prelude.lisp now and pull real metadata out of the new
+;; cdr-cell shape.  Earlier this file had three constant-returning stubs
+;; that won under last-defun-wins, so MAKE-HASH-TABLE :TEST 'EQ tables
+;; still reported HASH-TABLE-TEST → EQUAL etc.  Removed.
+
+;;; ============================================================
+;;; Sleep (stub)
+;;; ============================================================
+(defun sleep (n) nil)
+
+;;; ============================================================
+;;; Environment introspection
+;;; ============================================================
+(defun lisp-implementation-type ()    "Modus")
+
+(defun lisp-implementation-version () "0.0.1")
+
+(defun machine-instance ()            "modus")
+
+(defun machine-type ()                "x86_64")
+
+(defun machine-version ()             "x86_64")
+
+(defun software-type ()               "Modus")
+
+(defun software-version ()            "0.0.1")
+
+(defun short-site-name ()             nil)
+
+(defun long-site-name ()              nil)
+
+;;; ============================================================
+;;; Time Functions (stubs)
+;;; ============================================================
+(defun get-universal-time ()
+  "Return seconds since 1900-01-01: CLOCK_REALTIME (Unix epoch) plus the
+   70-year offset 2208988800.  Through %CLOCK-GETTIME-NS, the one per-arch
+   clock seam, rather than time(2): 201 is time only on x86-64 -- on i386 it
+   is geteuid32, and every i386 image reported the uid (1001) as the Unix
+   time, i.e. 1970-01-01.  0 where there is no clock (bare metal)."
+  (let ((ns (%clock-gettime-ns 0)))           ; CLOCK_REALTIME
+    (if (and (integerp ns) (> ns 0))
+        (values (+ (floor ns 1000000000) 2208988800))
+        0)))
+
+(defun %timer-universal-time ()
+  "Seconds from the CPU's counter, for a machine with no RTC and no syscall
+   underneath — i.e. bare metal.  Returns 0 when the platform reports no
+   counter frequency, which callers must treat as no-clock-available.
+
+   This is NOT wall-clock time: a Raspberry Pi has no battery-backed clock, so
+   nothing in the machine knows the date at power-on.  It is seconds since
+   boot, which is a real, monotonically advancing hardware clock — enough for
+   file timestamps and elapsed-time, and honest about what it is.  Getting the
+   actual date needs NTP or a firmware-supplied time.
+
+   Do NOT make this the default GET-UNIVERSAL-TIME: on a hosted image the
+   syscall gives real wall-clock time and must win.  Bare-metal builds select
+   this explicitly (they cannot detect themselves at runtime — hosted AArch64
+   can read the same EL0 counter registers, so the counter does not
+   distinguish them)."
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (floor (rdtsc) hz)
+        0)))
+
+;;; --- GC pause statistics, scaled (#286) --------------------------------
+;;; mvm/gc.lisp owns the raw counters; the SCALING lives here because it needs
+;;; (cntfrq), and gc.lisp is the one file that must stay free of anything that
+;;; could allocate or trap unexpectedly on a target that lacks the arm.
+;;; %timer-universal-time directly above is the existing proof that (cntfrq)
+;;; compiles and runs wherever this file is baked.
+(defun %gc-pause-ms (ticks)
+  "Convert a CNTVCT tick count from the %GC-STAT-* accessors to whole
+   milliseconds.  Returns 0 when the platform reports no counter frequency
+   (which callers must read as clock-unavailable, not as a zero-length pause).
+   Integer division on purpose — this file has no float contract to lean on."
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0) (integerp ticks))
+        (floor (* ticks 1000) hz)
+        0)))
+
+(defun %gc-pause-us (ticks)
+  "As %GC-PAUSE-MS but in microseconds — the useful resolution when a
+   collection is well under a millisecond."
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0) (integerp ticks))
+        (floor (* ticks 1000000) hz)
+        0)))
+
+(defun %gc-report ()
+  "One-line-per-field GC pause report, printed to *standard-output*.  This is
+   the thing to call from a probe or a REPL; %GC-STATS is the machine-readable
+   form.  Prints ticks AND microseconds so a reading is still interpretable if
+   the counter frequency ever reads back as 0."
+  (let ((n     (%gc-stat-count))     ; collections the totals actually COVER
+        (all   (%gc-count))
+        (total (%gc-stat-total-ticks))
+        (mx    (%gc-stat-max-ticks))
+        (last  (%gc-stat-last-ticks))
+        (tb    (%gc-stat-total-bytes))
+        (lb    (%gc-stat-last-bytes)))
+    (format t "~&GC collections : ~D since boot, ~D covered by these totals~%"
+            all n)
+    (format t "GC cntfrq      : ~D Hz~%" (cntfrq))
+    (format t "GC total pause : ~D ticks = ~D us (~D ms)~%"
+            total (%gc-pause-us total) (%gc-pause-ms total))
+    (format t "GC max pause   : ~D ticks = ~D us (~D ms)~%"
+            mx (%gc-pause-us mx) (%gc-pause-ms mx))
+    (format t "GC last pause  : ~D ticks = ~D us~%" last (%gc-pause-us last))
+    (format t "GC mean pause  : ~D us~%"
+            (if (and (integerp n) (> n 0)) (floor (%gc-pause-us total) n) 0))
+    (format t "GC copied      : ~D bytes total, ~D bytes last~%" tb lb)
+    n))
+
+;; GET-INTERNAL-RUN-TIME's real body is with GET-INTERNAL-REAL-TIME below,
+;; over the same seam.  Returning a constant 0 made `(- after before)' zero
+;; for every measurement in the image.
+
+;;; ============================================================
+;;; THE INTERNAL CLOCKS ARE CLOCKS — %IRT-NS / %IRUN-NS
+;;; ============================================================
+;;;
+;;; A SEAM, defined here at 0 ("this target has no clock") and overridden
+;;; by last-defun-wins in net/hosted-sync.lisp, which is where
+;;; clock_gettime(2) can actually be called (it owns the per-CPU timespec
+;;; scratch — a shared one would be two threads writing one buffer).
+;;; Bare-metal images keep the counter fallback below, which is what they
+;;; had; hosted images get a real monotonic clock.
+;;;
+;;; UNITS ARE NANOSECONDS HERE and INTERNAL-TIME-UNITS-PER-SECOND out
+;;; there, converted in ONE place, so the two cannot drift.  They HAD
+;;; drifted: the old GET-INTERNAL-REAL-TIME returned a CALL COUNTER — 1,
+;;; 2, 3 on successive calls, unmoved by a real (SLEEP 2) — while
+;;; INTERNAL-TIME-UNITS-PER-SECOND said 1000, so every rate limit, timeout
+;;; and frame pacer written against it counted CALLS and called them
+;;; milliseconds.  (glass's RFB sender is one of those.)  The counter is
+;;; still the LAST resort, because a clock that stands still is worse than
+;;; one that ticks in the wrong unit, but it is no longer the only answer.
+(defconstant +clock-monotonic+ 1)
+
+(defconstant +clock-process-cputime+ 2)
+
+(defun %clock-gettime-ns (clk)
+  "clock_gettime(2) CLK as whole nanoseconds, or 0 where the syscall is not
+   there (bare metal, where the handler-case catches the trap).
+
+   THE DEFAULT IS A REAL CLOCK, not 0.  net/hosted-sync.lisp overrides the two
+   seams below with the per-CPU-scratch versions, but it is linked only into
+   the hosted images: the four ANSI gate runners and the bare-metal REPLs never
+   see it, and with a 0 default those images fall through to the call counter —
+   which is what GET-INTERNAL-REAL-TIME used to be, and what ansi
+   get-internal-time 4-7 fail on.  So the seam answers with the plain syscall
+   over this thread's own I/O page, and the override merely makes the timespec
+   per-CPU."
+  (let* ((buf (%fs-io-page))
+         (rc (handler-case (syscall3 228 clk buf 0) (t (c) -1))))
+    (if (and (integerp rc) (= rc 0))
+        (let ((sec  (mem-ref buf :u32))
+              (nsec (mem-ref (+ buf 8) :u32)))
+          (+ (* sec 1000000000) nsec))
+        0)))
+
+(defun %irt-ns ()
+  "Monotonic elapsed nanoseconds, or 0 if this target has no clock."
+  (%clock-gettime-ns +clock-monotonic+))
+
+(defun %irun-ns ()
+  "Consumed CPU nanoseconds, or 0 if this target has no clock."
+  (%clock-gettime-ns +clock-process-cputime+))
+
+(defvar internal-time-units-per-second 1000000)
+
+(defvar *%irt-counter* 0)
+
+(defvar *%irun-counter* 0)
+
+(defun %ns-to-itu (ns)
+  "NS nanoseconds as INTERNAL-TIME-UNITS.  Integer division, so the unit
+   is whatever INTERNAL-TIME-UNITS-PER-SECOND currently says and nothing
+   has to be edited in two places when it changes."
+  (let ((per (if (and (boundp (quote internal-time-units-per-second))
+                      (integerp internal-time-units-per-second)
+                      (> internal-time-units-per-second 0))
+                 internal-time-units-per-second
+                 1000000)))
+    ;; VALUES truncates to ONE: FLOOR returns its remainder as a second
+    ;; value, and both callers are CLHS functions specified to return
+    ;; exactly one.  Without this, (multiple-value-list
+    ;; (get-internal-run-time)) is a 2-element list.
+    (values
+     (if (>= per 1000000000)
+         (* ns (floor per 1000000000))
+         (floor ns (floor 1000000000 per))))))
+
+(defun get-internal-real-time ()
+  "CLHS GET-INTERNAL-REAL-TIME: elapsed time in INTERNAL-TIME-UNITS from an
+   arbitrary origin.  A monotonic clock where there is one; a call counter
+   only where there is not."
+  (let ((ns (%irt-ns)))
+    (if (and (integerp ns) (> ns 0))
+        (%ns-to-itu ns)
+        (progn (setq *%irt-counter* (+ *%irt-counter* 1))
+               *%irt-counter*))))
+
+(defun get-internal-run-time ()
+  "CLHS GET-INTERNAL-RUN-TIME: CPU time consumed, in INTERNAL-TIME-UNITS.
+   Was a constant 0, which made every (- after before) zero."
+  (let ((ns (%irun-ns)))
+    (if (and (integerp ns) (> ns 0))
+        (%ns-to-itu ns)
+        (progn (setq *%irun-counter* (+ *%irun-counter* 1))
+               *%irun-counter*))))
+
+(defun %leap-year-p (year)
+  (and (= 0 (mod year 4))
+       (or (not (= 0 (mod year 100)))
+           (= 0 (mod year 400)))))
+
+(defun %days-in-month (month year)
+  (cond
+    ((= month 2) (if (%leap-year-p year) 29 28))
+    ((or (= month 4) (= month 6) (= month 9) (= month 11)) 30)
+    (t 31)))
+
+;;; Decode a non-negative day count (days since 1900-01-01) into
+;;; (values year month date).
+(defun %decode-days (days)
+  (let ((year 1900))
+    ;; Advance whole years.
+    (loop
+      (let ((yd (if (%leap-year-p year) 366 365)))
+        (if (>= days yd)
+            (progn (setq days (- days yd)) (setq year (+ year 1)))
+            (return))))
+    ;; Advance whole months within YEAR.
+    (let ((month 1))
+      (loop
+        (let ((md (%days-in-month month year)))
+          (if (>= days md)
+              (progn (setq days (- days md)) (setq month (+ month 1)))
+              (return))))
+      (values year month (+ days 1)))))
+
+(defun decode-universal-time (ut &rest rest)
+  "Decode universal time UT (seconds since 1900-01-01 00:00:00 GMT) into
+   (values second minute hour date month year day daylight-p zone) per
+   CLHS 25.1.4.3.  REST may hold an optional time-zone TZ; >1 extra arg
+   is a program-error.  Modus has no real TZ database, so when TZ is
+   omitted we use GMT (zone 0, daylight nil) for a round-trippable result."
+  (when (cdr rest)
+    (%program-error "decode-universal-time accepts at most 2 arguments"))
+  (let* ((tz (if (consp rest) (car rest) 0))
+         ;; Local time = UT - zone*3600.
+         (local (- ut (* tz 3600)))
+         (secs-of-day (mod local 86400))
+         (days (floor (- local secs-of-day) 86400))
+         (second (mod secs-of-day 60))
+         (minute (mod (floor secs-of-day 60) 60))
+         (hour (floor secs-of-day 3600))
+         ;; 1900-01-01 is a Monday = day-of-week 0.
+         (day (mod days 7)))
+    (multiple-value-bind (year month date) (%decode-days days)
+      (values second minute hour date month year day nil tz))))
+
+;;; ED — accepts 0 or 1 args
+(defun ed (&rest args)
+  (if (cdr args)
+      (%program-error "ed requires 0 or 1 arguments")
+      nil))
+
+;;; DRIBBLE — accepts 0 or 1 args
+(defun dribble (&rest args)
+  (if (cdr args)
+      (%program-error "dribble requires 0 or 1 arguments")
+      nil))
+
+;;; ENCODE-UNIVERSAL-TIME — strict 6-7 arg arity
+(defun encode-universal-time (second minute hour date month year &rest more)
+  "Encode a decoded time into universal time (seconds since 1900-01-01
+   00:00:00 GMT) per CLHS 25.1.4.3.  MORE may hold an optional time-zone
+   ZONE; when omitted, GMT (zone 0) is assumed (Modus has no TZ DB)."
+  (if (cdr more)
+      (%program-error "encode-universal-time requires 6 or 7 arguments")
+      (let ((zone (if more (car more) 0)))
+        ;; Days from 1900-01-01 to YEAR-01-01.
+        (let ((days 0) (y 1900))
+          (loop while (< y year) do
+            (setq days (+ days (if (%leap-year-p y) 366 365)))
+            (setq y (+ y 1)))
+          ;; Days from YEAR-01-01 to YEAR-MONTH-01.
+          (let ((m 1))
+            (loop while (< m month) do
+              (setq days (+ days (%days-in-month m year)))
+              (setq m (+ m 1))))
+          ;; Add day-of-month (1-indexed).
+          (setq days (+ days (- date 1)))
+          ;; Local seconds + zone offset back to GMT.
+          (+ (* days 86400)
+             (* hour 3600)
+             (* minute 60)
+             second
+             (* zone 3600))))))

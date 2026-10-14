@@ -226,27 +226,11 @@
   "cos of double X (full-range)."
   (%cos-poly-f (%trig-reduce-f x)))
 
-(defun sin (x)
-  "Sine.  Exact integer 0 for integer 0; IEEE float result otherwise."
-  (cond
-    ((and (integerp x) (= x 0)) 0)
-    (t (%sin-f (%any-to-float x)))))
 
-(defun cos (x)
-  "Cosine.  Exact integer 1 for integer 0; IEEE float result otherwise."
-  (cond
-    ((and (integerp x) (= x 0)) 1)
-    (t (%cos-f (%any-to-float x)))))
 
-(defun tan (x)
-  "Tangent = sin/cos.  IEEE float result."
-  (cond
-    ((and (integerp x) (= x 0)) 0)
-    (t (let* ((xf (%any-to-float x))
-              (r (%trig-reduce-f xf))
-              (sn (%sin-poly-f r))
-              (cs (%cos-poly-f r)))
-         (%float-div sn cs)))))
+
+
+
 
 (defun %float-infinite-p (x)
   "X (a boxed float) is +inf or -inf, by its IEEE bits.  Not by comparison:
@@ -278,11 +262,7 @@
          (setq acc (%float-add acc term))
          (setq n (+ n 1)))))))
 
-(defun exp (x)
-  "e^x.  Exact integer 1 for integer 0; IEEE float result otherwise."
-  (cond
-    ((and (integerp x) (= x 0)) 1)
-    (t (%exp-f (%any-to-float x)))))
+
 
 (defun %log-f (x)
   "Natural log of double X (X > 0).  Reduce x = m·2^e with m in [1,2)
@@ -364,32 +344,11 @@
     (let ((ln-x (%log-f xf)))
       (%irr-result ln-x x))))
 
-(defun cosh (x)
-  "Hyperbolic cosine.  cosh(x) = (exp(x) + exp(-x))/2.  IEEE float result."
-  (cond
-    ((and (integerp x) (= x 0)) 1)
-    (t (let* ((xf (%any-to-float x))
-              (ep (%exp-f xf))
-              (em (%exp-f (%float-neg xf))))
-         (%float-div (%float-add ep em) (%fl 2))))))
 
-(defun sinh (x)
-  "Hyperbolic sine.  sinh(x) = (exp(x) - exp(-x))/2.  IEEE float result."
-  (cond
-    ((and (integerp x) (= x 0)) 0)
-    (t (let* ((xf (%any-to-float x))
-              (ep (%exp-f xf))
-              (em (%exp-f (%float-neg xf))))
-         (%float-div (%float-sub ep em) (%fl 2))))))
 
-(defun tanh (x)
-  "Hyperbolic tangent = sinh/cosh.  IEEE float result."
-  (cond
-    ((and (integerp x) (= x 0)) 0)
-    (t (let* ((xf (%any-to-float x))
-              (ep (%exp-f xf))
-              (em (%exp-f (%float-neg xf))))
-         (%float-div (%float-sub ep em) (%float-add ep em))))))
+
+
+
 
 (defun %sqrt-f (x)
   "sqrt of double X (X >= 0) via Newton, after RANGE REDUCTION.  The exponent
@@ -469,18 +428,9 @@
            (setq n (+ n 1)))
          (%float-mul (%fl 2) acc))))))
 
-(defun asin (x)
-  "Arc sine.  Domain |x| ≤ 1.  IEEE float result."
-  (cond
-    ((and (integerp x) (= x 0)) 0)
-    (t (%asin-f (%any-to-float x)))))
 
-(defun acos (x)
-  "Arc cosine = π/2 - asin(x).  IEEE float result."
-  (cond
-    ((and (integerp x) (= x 1)) 0)
-    ((and (integerp x) (= x 0)) (%fpi/2))
-    (t (%float-sub (%fpi/2) (%asin-f (%any-to-float x))))))
+
+
 
 (defun %atan2-signed (neg v)
   (if neg (%float-neg v) v))
@@ -515,15 +465,7 @@
            (if yneg (%float-sub base (%fpi)) (%float-add base (%fpi)))))
         (t (%atan-f (%float-div yf xf)))))))
 
-(defun atan (x &optional y)
-  "Arc tangent.  One-arg: atan(x).  Two-arg (atan y x): full-quadrant
-   angle of the point (x, y) — result in (-π, π]."
-  (cond
-    (y
-     ;; CLHS (atan number divisor): number = y, divisor = x
-     (%atan2-f (%any-to-float x) (%any-to-float y)))
-    ((and (integerp x) (= x 0)) 0)
-    (t (%atan-f (%any-to-float x)))))
+
 
 (defun phase (x)
   "Phase of x.  Per CLHS the result of PHASE is always a float: 0-valued
@@ -551,10 +493,8 @@
 (defun set-schar (str idx ch) (aset str idx ch) ch)
 (defun schar (str idx) (aref str idx))
 (defun char (str idx) (aref str idx))
-(defun symbol-plist (sym) nil)
-; fboundp defined in Layer 8 above
-(defun fill-pointer (vec)
-  (if (consp vec) (car vec) (length vec)))
+
+
 ;; BIT-VECTOR-P + SIMPLE-BIT-VECTOR-P live below at L2195+; the early
 ;; copies here (subtag-walk variant and a nil-stub) silently lost the
 ;; last-defun-wins race.  Removed 2026-06-01 (redefinition audit).
@@ -1758,7 +1698,7 @@
 (defun not (x) (if x nil t))
 (defun null (x) (if x nil t))
 (defun zerop (x) (= x 0))
-(defun identity (x) x)
+
 ;; Selectors — needed as defuns so `#'second` etc. have fdefinition entries
 ;; for function-designator contexts (SORT :KEY #'SECOND, mapcar #'FIRST, etc.).
 (defun first (x) (car x))
@@ -1775,8 +1715,7 @@
 ;; Numeric increment helpers
 (defun 1+ (n) (+ n 1))
 (defun 1- (n) (- n 1))
-;; More callable inline-equivalents
-(defun listp (x) (if (consp x) t (null x)))
+
 (defun fixnump (x) (fixnump x))
 ;; eq/eql don't have wrapper-name mapping in compile-li-func, but they
 ;; ARE inline.  Bare defun gives #'eq/#'eql callable addresses.
@@ -2432,14 +2371,7 @@
        (if (= den 1) num (%make-rat num den))))
     (t n)))
 
-;; RATIONALIZE — for IEEE doubles RATIONAL already yields the simplest
-;; exact value (binary fraction in lowest terms), so RATIONALIZE delegates
-;; to RATIONAL.  NOTE: ansi-bridge.lisp loads AFTER cl-types and defines
-;; its own (rationalize n &rest extra) that returns N unchanged, which
-;; WINS over this one.  Left here so a future load-order change picks the
-;; exact version up; the real fix is a HANDOFF to whoever owns
-;; ansi-bridge.lisp (see final report).
-(defun rationalize (n) (rational n))
+
 
 (defun exact-divide (a b)
   "Divide A by B.  Integer if exact, tagged ratio otherwise.
@@ -3756,272 +3688,7 @@
          (setq spec (cdr spec)))))
     (t nil)))
 
-(defun typep (obj type)
-  "Extended typep supporting compound type specifiers."
-  (cond
-    ;; Simple type names (symbols/keywords)
-    ((not (consp type))
-     (let ((tn type))
-       (cond
-         ((%typename-is tn 218724929) (integerp obj))
-         ((%typename-is tn 56757342) (integerp obj))
-         ;; MVM has no real bignum tower — all integers are 63-bit
-         ;; fixnums. Reporting BIGNUM as NIL traps tests like the
-         ;; (loop while (not (typep x 'bignum)) do (setf x (* x x)))
-         ;; pattern in an infinite squaring loop until SIGALRM fires.
-         ;; Treat anything beyond the 32-bit fixnum range that other
-         ;; CL impls use as "bignum" so that loop exits.
-         ((%typename-is tn 222680133)
-          (and (integerp obj)
-               (or (> obj 1073741823) (< obj -1073741824))))
-         ((%typename-is tn 2583293) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((%typename-is tn 192209213) (or (integerp obj) (ratiop obj)))
-         ((%typename-is tn 31983940) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
-         ((%typename-is tn 334057727) (floatp-impl obj))
-         ((%typename-is tn 245082776) (floatp-impl obj))
-         ((%typename-is tn 451082095) (floatp-impl obj))
-         ((%typename-is tn 403998624) (floatp-impl obj))
-         ((%typename-is tn 133316320) (floatp-impl obj))
-         ((%typename-is tn 500762750) (ratiop obj))
-         ((%typename-is tn 67772926) (consp obj))
-         ((%typename-is tn 250628549) (or (null obj) (consp obj)))
-         ((%typename-is tn 394857196) (null obj))
-         ;; (typep x 'symbol) — `(integerp obj)` was a leftover from when
-         ;; native MVM symbols were stored as bare hash fixnums.  Real
-         ;; symbols today are heap objects (subtag #x50); use symbolp.
-         ((%typename-is tn 156527617) (symbolp obj))
-         ((%typename-is tn 484323690) (stringp obj))
-         ((%typename-is tn 446812473) (stringp obj))
-         ((%typename-is tn 296661226) (stringp obj))
-         ((%typename-is tn 15127857) (stringp obj))
-         ((%typename-is tn 33307206) (characterp obj))
-         ((%typename-is tn 154532791) (characterp obj))
-         ;; CLHS: extended-char is disjoint from base-char.  Modus only
-         ;; has base characters, so this is always NIL.  extended-char.3
-         ;; verifies the disjointness.
-         ((%typename-is tn 249817149) nil)
-         ;; CLHS: standard-char = #\Newline + #\Space..#\~ — narrower than
-         ;; character.  standard-char.5.body collects (typep c 'standard-char)
-         ;; where (standard-char-p c) is nil and expects empty list.
-         ((%typename-is tn 223466737)
-          (and (characterp obj)
-               (let ((cc (char-code obj)))
-                 (if (= cc 10) t (and (>= cc 32) (<= cc 126))))))
-         ((%typename-is tn 383129664) (not (consp obj)))
-         ((eq tn t) t)
-         ((null tn) nil)
-         ((%typename-is tn 531098243) (or (null obj) (eq obj t)))
-         ;; (typep x 'bit) — must be 0 or 1 AS AN INTEGER.  Without the
-         ;; integerp guard `(= obj 0)` runs `=` on arbitrary values
-         ;; (strings, conses, fn-addrs) which goes wrong fast.
-         ((%typename-is tn 496243224) (and (integerp obj) (or (= obj 0) (= obj 1))))
-         ((%typename-is tn 524100924) (bit-vector-p obj))
-         ((%typename-is tn 73449743) (simple-bit-vector-p obj))
-         ;; Array/vector predicates: route through arrayp (which now
-         ;; recognises cons-wrappers and native MDA).  simple-vector
-         ;; requires non-string element type; simple-array tracks
-         ;; non-adjustable.  Modus mostly upgrades everything to T so
-         ;; the distinctions are coarse.
-         ((%typename-is tn 10588126) (arrayp obj))
-         ((%typename-is tn 448780229)
-          (and (arrayp obj)
-               (not (and (consp obj) (eql (car obj) 8765432)))))
-         ((%typename-is tn 116440318)
-          (and (arrayp obj) (= (array-rank obj) 1)))
-         ((%typename-is tn 295137229)
-          ;; CL: simple-vector = simple 1-D array of T.  In Modus the
-          ;; element type isn't tracked at the object level for the
-          ;; general case, so we can't strictly distinguish (vector T)
-          ;; from (vector bit) / (vector character) for arrays of 0/1 etc.
-          ;; Reject strings (#x31, char-element-typed), byte-packed u8
-          ;; vectors (#x11, element-type (unsigned-byte 8)) and adjustable
-          ;; wrappers but otherwise accept any 1-D arrayp.
-          (and (arrayp obj) (= (array-rank obj) 1)
-               (not (stringp obj))
-               (not (eql (obj-subtag obj) #x11))
-               (not (eql (obj-subtag obj) #x12))
-               (not (and (consp obj) (eql (car obj) 8765432)))))
-         ;; CLHS 4.3 / the SEQUENCE system class: sequence = the union of
-         ;; LIST and VECTOR.  A multi-dimensional array is an ARRAY but NOT
-         ;; a sequence — `(typep (make-array '(2 2)) 'sequence)' is NIL in
-         ;; SBCL/CCL.  The old `(arrayp obj)' accepted rank-2+ MDAs, which
-         ;; made alexandria's PROPER-SEQUENCE (`(or proper-list
-         ;; (and (not list) sequence))') answer T for #2A((1 2) (3 4)).
-         ;; ARRAYP is checked FIRST because Modus' adjustable/displaced
-         ;; array wrappers are CONS-shaped — a `(consp obj)' test would
-         ;; accept an adjustable rank-2 array before the rank test ran.
-         ((%typename-is tn 24777128)
-          (if (arrayp obj)
-              (= (array-rank obj) 1)
-              (or (null obj) (consp obj))))
-         ((%typename-is tn 237688881) (and (integerp obj) (>= obj 0)))
-         ((%typename-is tn 398241362) (integerp obj))
-         ((%typename-is tn 402801909) (or (functionp obj) (%generic-function-p obj)))
-         ((%typename-is tn 357975417) (%generic-function-p obj))
-         ((%typename-is tn 267254943) (%generic-function-p obj))
-         ((%typename-is tn 437104782) (%standard-method-p obj))
-         ((%typename-is tn 38548584) (%standard-method-p obj))
-         ((%typename-is tn 87270964) (%mc-p obj))
-         ;; CLOS instance check
-         ((%typename-is tn 205458436) (%clos-instance-p obj))
-         ;; User-defined CLOS class: check if obj is a CLOS instance and
-         ;; tn is in obj's class precedence list (so typep recognizes
-         ;; subclasses correctly).
-         ;; Symbol equality uses eq first, then symbol-name string-equal
-         ;; to dodge the bare-metal "duplicate-symbol" identity bug.
-         (t
-          (if (%clos-instance-p obj)
-            (let ((cpl (%obj-cpl obj))
-                  (tn-name (if (symbolp tn) (symbol-name tn) nil))
-                  (found nil))
-              (let ((c cpl))
-                (loop
-                  (when (null c) (return found))
-                  (let ((cur (car c)))
-                    (when (or (eq cur tn)
-                              (and tn-name (symbolp cur)
-                                   (string-equal (symbol-name cur) tn-name)))
-                      (setq found t) (return found)))
-                  (setq c (cdr c)))))
-            nil)))))
-    ;; Compound type specifiers.  Use %typename-eq instead of eq for
-    ;; the head comparisons — `'real' inside a literal source form and
-    ;; `'real' synthesized at runtime via (list 'real 0 10) can be
-    ;; distinct symbol objects with the same hash (per CLAUDE.md
-    ;; "Symbol identity" known bug).
-    (t
-     (let ((head (car type)))
-       (cond
-         ;; (real low high) — range check for reals
-         ((%typename-eq head 'real)
-          (if (or (integerp obj) (floatp-impl obj) (ratiop obj))
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ;; (integer low high)
-         ((%typename-eq head 'integer)
-          (if (integerp obj)
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ;; (float low high)
-         ((or (%typename-eq head 'float)         (%typename-eq head 'single-float)
-              (%typename-eq head 'double-float)  (%typename-eq head 'short-float)
-              (%typename-eq head 'long-float))
-          (if (floatp-impl obj)
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ;; (rational low high)
-         ((%typename-eq head 'rational)
-          (if (or (integerp obj) (ratiop obj))
-              (let ((low (if (cdr type) (cadr type) '*))
-                    (high (if (cddr type) (caddr type) '*)))
-                (typep-range-check obj low high))
-              nil))
-         ;; (eql val)
-         ((%typename-eq head 'eql)
-          (eql obj (cadr type)))
-         ;; (member val1 val2 ...)
-         ((%typename-eq head 'member)
-          (if (member obj (cdr type)) t nil))
-         ;; (and type1 type2 ...)
-         ((%typename-eq head 'and)
-          (let ((ok t))
-            (dolist (sub (cdr type))
-              (unless (typep obj sub) (setq ok nil)))
-            ok))
-         ;; (or type1 type2 ...)
-         ((%typename-eq head 'or)
-          (let ((ok nil))
-            (dolist (sub (cdr type))
-              (when (typep obj sub) (setq ok t)))
-            ok))
-         ;; (not type)
-         ((%typename-eq head 'not)
-          (not (typep obj (cadr type))))
-         ;; (satisfies pred)
-         ((%typename-eq head 'satisfies) (and (funcall (cadr type) obj) t))
-         ;; (unsigned-byte n) — integer in [0, 2^n - 1]
-         ((%typename-eq head 'unsigned-byte)
-          (and (integerp obj) (>= obj 0)
-               (< obj (ash 1 (cadr type)))))
-         ;; (signed-byte n) — integer in [-2^(n-1), 2^(n-1) - 1]
-         ((%typename-eq head 'signed-byte)
-          (and (integerp obj)
-               (let ((half (ash 1 (- (cadr type) 1))))
-                 (and (>= obj (- 0 half)) (< obj half)))))
-         ;; (mod n) — integer in [0, n-1]
-         ((%typename-eq head 'mod)
-          (and (integerp obj) (>= obj 0) (< obj (cadr type))))
-         ;; (bit-vector size) / (bit-vector *) — bit-vector with optional
-         ;; size constraint.  Use %typename-eq for the size sentinel so
-         ;; the literal '* compiled in the typep source matches the
-         ;; runtime '* synthesized via list construction.
-         ((or (%typename-eq head 'bit-vector)
-              (%typename-eq head 'simple-bit-vector))
-          (and (bit-vector-p obj)
-               (let ((sz (and (cdr type) (cadr type))))
-                 (or (null sz) (%typename-eq sz '*) (eq sz t)
-                     (and (integerp sz) (= sz (array-length obj)))))))
-         ;; (string size) / (simple-string size) — string with optional
-         ;; size.
-         ((or (%typename-eq head 'string)
-              (%typename-eq head 'simple-string)
-              (%typename-eq head 'base-string)
-              (%typename-eq head 'simple-base-string))
-          (and (stringp obj)
-               (let ((sz (and (cdr type) (cadr type))))
-                 (or (null sz) (%typename-eq sz '*) (eq sz t)
-                     (and (integerp sz) (= sz (array-length obj)))))))
-         ;; (vector elt-type size) — vector with optional element-type
-         ;; and a single size dimension.  Vector is always rank-1.
-         ((or (%typename-eq head 'vector)
-              (%typename-eq head 'simple-vector))
-          (and (arrayp obj)
-               (= (array-rank obj) 1)
-               (%typep-array-elt-match-p
-                obj
-                (cond
-                  ((%typename-eq head 'simple-vector) 't)
-                  ((cdr type) (cadr type))
-                  (t '*)))
-               (let ((sz (cond
-                           ((%typename-eq head 'simple-vector)
-                            (if (cdr type) (cadr type) nil))
-                           ((cddr type) (caddr type))
-                           (t nil))))
-                 (cond
-                   ((null sz) t)
-                   ((%typename-eq sz '*) t)
-                   ((eq sz t) t)
-                   ((integerp sz) (= sz (array-length obj)))
-                   (t nil)))))
-         ;; (array elt dims) / (simple-array elt dims).  Dims spec:
-         ;;   absent / '* / T            — any rank
-         ;;   integer N                  — rank N
-         ;;   NIL                        — rank 0
-         ;;   list of N elements (or *)  — rank N with per-dim spec
-         ((or (%typename-eq head 'simple-array)
-              (%typename-eq head 'array))
-          (and (arrayp obj)
-               (%typep-array-elt-match-p
-                obj (if (cdr type) (cadr type) '*))
-               (%typep-array-dims-match-p
-                obj (if (cddr type) (caddr type) '*))))
-         ;; (cons car-type cdr-type) — type-check both halves.
-         ((%typename-eq head 'cons)
-          (and (consp obj)
-               (let ((car-type (and (cdr type) (cadr type)))
-                     (cdr-type (and (cddr type) (caddr type))))
-                 (and (or (null car-type) (eq car-type '*) (eq car-type t)
-                          (typep (car obj) car-type))
-                      (or (null cdr-type) (eq cdr-type '*) (eq cdr-type t)
-                          (typep (cdr obj) cdr-type))))))
-         (t nil))))))
+
 
 (defun typep* (obj type) (typep obj type))
 
@@ -4064,9 +3731,7 @@
        (= (array-rank x) 1)
        (%array-bits-only-p x)))
 
-(defun simple-bit-vector-p (x)
-  "T if X is a simple bit-vector."
-  (bit-vector-p x))
+
 
 (defun make-bit-vector (size &optional init)
   "Allocate a bit-vector of SIZE filled with INIT (default 0)."
@@ -4175,26 +3840,1776 @@
 (defun %bit-orc1-op  (a b) (logior (if (= a 0) 1 0) b))
 (defun %bit-orc2-op  (a b) (logior a (if (= b 0) 1 0)))
 
-(defun bit-and  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-and-op))
-(defun bit-ior  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-ior-op))
+
+
 (defun bit-or   (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-ior-op))
-(defun bit-xor  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-xor-op))
-(defun bit-eqv  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-eqv-op))
-(defun bit-nand (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-nand-op))
-(defun bit-nor  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-nor-op))
-(defun bit-andc1 (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-andc1-op))
-(defun bit-andc2 (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-andc2-op))
-(defun bit-orc1  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-orc1-op))
-(defun bit-orc2  (bv1 bv2 &optional result) (%bit-binop bv1 bv2 result #'%bit-orc2-op))
 
-(defun bit-not (bv &optional result)
-  "Return a bit-vector whose elements are 1 - bv[i]."
-  (let* ((len (array-length bv))
-         (out (%bit-result-array bv result))
-         (i 0))
-    (loop
-      (when (= i len) (return out))
-      (let ((e (aref bv i)))
-        (aset out i (if (= e 0) 1 0)))
-      (setq i (+ i 1)))))
 
+;;; ============================================================
+;;; Callable numeric comparisons
+;;; ============================================================
+
+;;; Runtime versions of numeric comparison operators.
+;;; The compiler treats =, <, >, <=, >= as special forms (comparison opcodes),
+;;; so #'= etc. are not callable at runtime. These defuns provide callable
+;;; 2-arg versions for use with apply/funcall/mapcar.
+;; Variadic comparison bridges per CLHS — 0/1 arg returns T (vacuous);
+;; n≥2 walks pairwise.  Was 2-arg only, so (apply #'= '(17 17 17)) etc
+;; would crash on arity mismatch.
+(defun = (&rest cs)
+  (cond ((null cs) t)
+        ((null (cdr cs)) (%number-arg (car cs)) t)
+        (t (let ((a (car cs)) (rest (cdr cs)))
+             (loop (when (null rest) (return t))
+               (unless (%strict-eq a (car rest)) (return nil))
+               (setq rest (cdr rest)))))))
+
+(defun < (&rest cs)
+  (cond ((null cs) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
+        (t (let ((a (car cs)) (rest (cdr cs)))
+             (loop (when (null rest) (return t))
+               (unless (%strict-lt a (car rest)) (return nil))
+               (setq a (car rest))
+               (setq rest (cdr rest)))))))
+
+(defun > (&rest cs)
+  (cond ((null cs) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
+        (t (let ((a (car cs)) (rest (cdr cs)))
+             (loop (when (null rest) (return t))
+               (unless (%strict-gt a (car rest)) (return nil))
+               (setq a (car rest))
+               (setq rest (cdr rest)))))))
+
+(defun <= (&rest cs)
+  (cond ((null cs) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
+        (t (let ((a (car cs)) (rest (cdr cs)))
+             (loop (when (null rest) (return t))
+               (unless (%strict-le a (car rest)) (return nil))
+               (setq a (car rest))
+               (setq rest (cdr rest)))))))
+
+(defun >= (&rest cs)
+  (cond ((null cs) t)
+        ((null (cdr cs)) (%real-arg (car cs)) t)
+        (t (let ((a (car cs)) (rest (cdr cs)))
+             (loop (when (null rest) (return t))
+               (unless (%strict-ge a (car rest)) (return nil))
+               (setq a (car rest))
+               (setq rest (cdr rest)))))))
+
+(defun /= (&rest cs)
+  ;; All-distinct: outer-loop pairs against tail; if any equal, return NIL.
+  (cond ((null cs) t)
+        ((null (cdr cs)) (%number-arg (car cs)) t)
+        (t (let ((outer cs))
+             (dolist (x cs) (%number-arg x))
+             (loop (when (null (cdr outer)) (return t))
+               (let ((a (car outer)) (inner (cdr outer)))
+                 (loop (when (null inner) (return nil))
+                   (when (numeric-equal-p a (car inner))
+                     (return-from /= nil))
+                   (setq inner (cdr inner))))
+               (setq outer (cdr outer)))))))
+
+(defvar most-positive-fixnum +fixnum-max+)
+
+(defvar most-negative-fixnum +fixnum-neg-limit+)
+
+(defvar call-arguments-limit 120)
+
+(defvar lambda-parameters-limit 120)
+
+(defvar multiple-values-limit 20)
+
+;;; ============================================================
+;;; sxhash — hash code for objects
+;;; ============================================================
+(defun %sxhash-1 (object depth)
+  "SXHASH with bounded recursion so circular conses can't blow the stack."
+  (cond
+    ((null object) 0)
+    ((eq object t) 1)
+    ((integerp object)
+     ;; Mix bits of fixnum
+     (let ((x (if (< object 0) (- 0 object) object)))
+       (logand (logxor x (ash x -16)) most-positive-fixnum)))
+    ((characterp object)
+     (char-code object))
+    ((stringp object)
+     ;; FNV-1a 32-bit on string chars, return as fixnum
+     (let ((hash 2166136261)
+           (i 0)
+           (len (length object)))
+       (loop
+         (when (>= i len) (return))
+         (setq hash (logxor hash (%ensure-char-code (aref object i))))
+         (setq hash (logand (* hash 16777619) #xFFFFFFFF))
+         (setq i (+ i 1)))
+       hash))
+    ((symbolp object)
+     ;; Use name hash if available
+     ;; By NAME for every symbol.  Native symbols and keywords (#x50/#x53
+     ;; objects) used (ash object -1) -- ASH of a tagged object pointer
+     ;; takes the bignum path and faulted; (sxhash :foo) killed the process
+     ;; (upstream ansi-test SXHASH.1).  A name hash is also stable, as CLHS
+     ;; requires.
+     (%sxhash-1 (symbol-name object) (+ depth 1)))
+    ((consp object)
+     ;; Combine car and cdr hashes. Bound the walk so circular conses
+     ;; (e.g. (let ((c (list 'a))) (setf (cdr c) c) (sxhash c)) — ANSI
+     ;; sxhash.7) don't recurse forever and SIGSEGV the fork.
+     (if (>= depth 16)
+         42
+         (let ((h1 (%sxhash-1 (car object) (+ depth 1)))
+               (h2 (%sxhash-1 (cdr object) (+ depth 1))))
+           (logand (logxor (+ (* h1 31) h2) 12345) most-positive-fixnum))))
+    (t 42)))
+
+(defun sxhash (object) (%sxhash-1 object 0))
+
+;;; ============================================================
+;;; float-radix — IEEE floats always use base 2
+;;; ============================================================
+(defun float-radix (float) 2)
+
+;;; ============================================================
+;;; psetq / psetf — parallel assignment (runtime implementations)
+;;; ============================================================
+;;; These are macros in standard CL, but we implement them as
+;;; functions here as stubs. The real expansion happens at
+;;; SBCL-rewrite level in build-x64-linux.lisp.
+
+;;; ============================================================
+;;; float/number utility stubs
+;;; ============================================================
+(defun %single-typed-p (float)
+  "T if FLOAT's declared type is single-float or short-float (24-bit)."
+  (and (floatp-impl float)
+       (let ((ty (%float-declared-type float)))
+         (or (eq ty 'single-float) (eq ty 'short-float)))))
+
+(defun float-digits (float)
+  "Number of radix-2 digits in FLOAT's significand: 24 single/short,
+   53 double/long (numeric tower N1)."
+  (if (%single-typed-p float) 24 53))
+
+(defun float-precision (float)
+  "Precision (significant bits) of FLOAT: 0 for a zero, else 24/53 by type."
+  (if (= float 0.0d0) 0
+      (if (%single-typed-p float) 24 53)))
+
+(defun float-sign (float &rest float2-arg)
+  "Return a float with the magnitude of FLOAT2 (default (FLOAT 1 FLOAT)) and the
+   sign of FLOAT.  The sign comes from INTEGER-DECODE-FLOAT, not (< FLOAT 0):
+   that is false for -0.0, so (float-sign -0.0d0) answered 1.0d0 and a JSON
+   writer printed -0.0 as 0.0."
+  (let* ((float2 (if float2-arg (car float2-arg) (float 1 float)))
+         (mag (abs float2)))
+    (if (minusp (nth-value 2 (integer-decode-float float)))
+        (- mag)
+        mag)))
+
+(defun scale-float (float integer)
+  "FLOAT * 2^INTEGER, in FLOAT's own format.  Multiplies by powers of two of at
+   most 2^60 at a time, each exact in that format: the old
+   (* float (expt 2.0d0 integer)) built 2^|INTEGER| as a double, so any
+   INTEGER below about -1023 signalled FLOATING-POINT-OVERFLOW instead of
+   producing a subnormal, and a single-float argument came back a double."
+  (let ((one (float 1 float))
+        (r float)
+        (k integer))
+    (loop while (> k 60) do
+      (setq r (* r (float (expt 2 60) one)) k (- k 60)))
+    ;; Negative steps DIVIDE by the integer power: FLOAT of a ratio goes
+    ;; through %RATIO-TO-DOUBLE, which calls SCALE-FLOAT.
+    (loop while (< k -60) do
+      (setq r (/ r (float (expt 2 60) one)) k (+ k 60)))
+    (if (>= k 0)
+        (* r (float (expt 2 k) one))
+        (/ r (float (expt 2 (- k)) one)))))
+
+(defun decode-float (float)
+  "Decode float into (significand exponent sign).
+   Bails on non-floats (e.g. NIL from an uninitialized
+   *-float-epsilon defvar) so the caller sees a TYPE-ERROR
+   instead of looping forever in the normalize loop below."
+  (unless (floatp float)
+    (error "decode-float: not a float ~S" float))
+  ;; Stub: return approximate values
+  (if (= float 0.0d0)
+      (values 0.0d0 0 1.0d0)
+      (let ((sign (if (< float 0.0d0) -1.0d0 1.0d0))
+            (abs-f (if (< float 0.0d0) (- 0.0d0 float) float)))
+        ;; Find exponent such that 0.5 <= sig < 1.0. Safety cap so a
+        ;; pathological input (denormal, ±inf, or a value the comparisons
+        ;; never converge on) can't loop indefinitely.
+        (let ((exp 0) (sig abs-f) (iter 0))
+          (loop
+            (when (and (>= sig 0.5d0) (< sig 1.0d0)) (return))
+            (when (> iter 4096) (return))
+            (setq iter (+ iter 1))
+            (if (>= sig 1.0d0)
+                (progn (setq sig (/ sig 2.0d0)) (setq exp (+ exp 1)))
+                (progn (setq sig (* sig 2.0d0)) (setq exp (- exp 1)))))
+          (values sig exp sign)))))
+
+(defun integer-decode-float (float)
+  "Decode IEEE 64-bit float to (significand exponent sign) — three integers.
+   Returns 0, 0, 1 for ±0.  For non-IEEE (modus rational-form floats or
+   non-floats) falls back to a coarse mantissa*2^exp split."
+  (cond
+    ((%ieee-float-p float)
+     (let* ((hi-u32 (%float-hi32 float))
+            (lo (%float-lo32 float))
+            (sign-bit (logand (ash hi-u32 -31) 1))
+            (exponent (logand (ash hi-u32 -20) 2047))
+            (mantissa-hi (logand hi-u32 1048575))
+            (mantissa (logior (ash mantissa-hi 32) (logand lo 4294967295)))
+            (sign (if (= sign-bit 1) -1 1)))
+       (cond
+         ((and (= exponent 0) (= mantissa 0)) (values 0 0 sign))
+         ((= exponent 2047) (values mantissa 0 sign))  ; inf/nan
+         ((= exponent 0)
+          ;; Subnormal — exponent is -1074 effectively
+          (values mantissa -1074 sign))
+         (t
+          ;; Normal: significand = (2^52 | mantissa), exponent = e-1075
+          (values (logior (ash 1 52) mantissa)
+                  (- exponent 1075)
+                  sign)))))
+    ((= float 0)
+     (values 0 0 1))
+    ((integerp float)
+     (let ((sign (if (< float 0) -1 1))
+           (abs (if (< float 0) (- 0 float) float)))
+       (values abs 0 sign)))
+    (t
+     ;; Modus rational-form float (2-slot generic array num/den): mantissa
+     ;; ~= num*2^k for some k that makes (mantissa*2^exp ≈ num/den) — pick
+     ;; exp=0 and return num as the significand.  Approximation only.
+     (let ((sign 1) (m float))
+       (when (< (or (ignore-errors (%coerce-numeric float)) 0) 0)
+         (setq sign -1) (setq m (- 0 m)))
+       (values (or (ignore-errors (truncate m)) 0) 0 sign)))))
+
+;;; float-related constants
+(defvar double-float-epsilon 2.220446049250313d-16)
+
+(defvar single-float-epsilon 1.1920929d-7)
+
+(defvar short-float-epsilon 1.1920929d-7)
+
+(defvar long-float-epsilon 2.220446049250313d-16)
+
+(defvar double-float-negative-epsilon 1.1102230246251565d-16)
+
+(defvar single-float-negative-epsilon 5.9604645d-8)
+
+(defvar short-float-negative-epsilon 5.9604645d-8)
+
+(defvar long-float-negative-epsilon 1.1102230246251565d-16)
+
+(defvar most-positive-double-float 1.7976931348623157d308)
+
+(defvar most-negative-double-float -1.7976931348623157d308)
+
+(defvar most-positive-single-float 3.4028235d38)
+
+(defvar most-negative-single-float -3.4028235d38)
+
+(defvar most-positive-short-float 3.4028235d38)
+
+(defvar most-negative-short-float -3.4028235d38)
+
+(defvar most-positive-long-float 1.7976931348623157d308)
+
+(defvar most-negative-long-float -1.7976931348623157d308)
+
+(defvar least-positive-double-float 5.0d-324)
+
+(defvar least-negative-double-float -5.0d-324)
+
+(defvar least-positive-single-float 1.4d-45)
+
+(defvar least-negative-single-float -1.4d-45)
+
+(defvar least-positive-short-float 1.4d-45)
+
+(defvar least-negative-short-float -1.4d-45)
+
+(defvar least-positive-long-float 5.0d-324)
+
+(defvar least-negative-long-float -5.0d-324)
+
+(defvar least-positive-normalized-double-float 2.2250738585072014d-308)
+
+(defvar least-negative-normalized-double-float -2.2250738585072014d-308)
+
+(defvar least-positive-normalized-single-float 1.1754944d-38)
+
+(defvar least-negative-normalized-single-float -1.1754944d-38)
+
+(defvar least-positive-normalized-short-float 1.1754944d-38)
+
+(defvar least-negative-normalized-short-float -1.1754944d-38)
+
+(defvar least-positive-normalized-long-float 2.2250738585072014d-308)
+
+(defvar least-negative-normalized-long-float -2.2250738585072014d-308)
+
+;;; ============================================================
+;;; byte specifier functions (ldb, dpb, byte, etc.)
+;;; ============================================================
+;;; byte specifier = (cons size position) tagged as a cons
+(defun byte (size position)
+  "Create a byte specifier for SIZE bits starting at POSITION."
+  (cons size position))
+
+(defun byte-size (bytespec)
+  "Return the size field of BYTESPEC."
+  (car bytespec))
+
+(defun byte-position (bytespec)
+  "Return the position field of BYTESPEC."
+  (cdr bytespec))
+
+(defun ldb (bytespec integer)
+  "Load byte specified by BYTESPEC from INTEGER."
+  (let ((size (byte-size bytespec))
+        (pos (byte-position bytespec)))
+    (logand (ash integer (- 0 pos))
+            (- (ash 1 size) 1))))
+
+(defun ldb-test (bytespec integer)
+  "Return T if any bit in the byte specified by BYTESPEC is set in INTEGER."
+  (not (= 0 (ldb bytespec integer))))
+
+(defun dpb (newbyte bytespec integer)
+  "Deposit NEWBYTE into INTEGER at position specified by BYTESPEC."
+  (let ((size (byte-size bytespec))
+        (pos (byte-position bytespec)))
+    (let ((mask (ash (- (ash 1 size) 1) pos)))
+      (logior (logand integer (lognot mask))
+              (logand (ash newbyte pos) mask)))))
+
+(defun mask-field (bytespec integer)
+  "Return the field of INTEGER specified by BYTESPEC."
+  (logand integer
+          (ash (- (ash 1 (byte-size bytespec)) 1)
+               (byte-position bytespec))))
+
+(defun deposit-field (newbyte bytespec integer)
+  "Return integer with bits from NEWBYTE deposited at BYTESPEC."
+  (let ((size (byte-size bytespec))
+        (pos (byte-position bytespec)))
+    (let ((mask (ash (- (ash 1 size) 1) pos)))
+      (logior (logand integer (lognot mask))
+              (logand newbyte mask)))))
+
+;;; ============================================================
+;;; coerce extensions
+;;; ============================================================
+(defun %coerce-canon-head (head)
+  "Canonicalize a type-head symbol to the Modus built-in type symbol of
+   the same NAME.  A type-head read in a foreign package (e.g.
+   UIOP/UTILITY::VECTOR, when define-package inheritance hasn't exposed
+   CL:VECTOR) is a distinct object from Modus's compiled 'VECTOR, so
+   `(eq head 'vector)` fails and coerce silently returns OBJECT unchanged.
+   Type specifiers compare by name (CLHS), so re-key by name.
+
+   Pass Modus's OWN type symbols (and the EQ-recognised built-ins)
+   through untouched so the compiled hot path is byte-for-byte unchanged
+   — only re-key a symbol that the downstream EQ checks would miss
+   (i.e. NOT already EQ to the built-in literal of its name)."
+  (if (and head (not (consp head)) (not (stringp head))
+           (not (integerp head)) (not (characterp head))
+           (symbolp head)
+           ;; already a recognised built-in literal → leave as-is
+           (not (eq head 'list)) (not (eq head 'vector))
+           (not (eq head 'simple-vector)) (not (eq head 'array))
+           (not (eq head 'simple-array)) (not (eq head 'string))
+           (not (eq head 'simple-string)) (not (eq head 'base-string))
+           (not (eq head 'simple-base-string)) (not (eq head 'character))
+           (not (eq head 'bit-vector)) (not (eq head 'simple-bit-vector))
+           (not (eq head 'float)) (not (eq head 'single-float))
+           (not (eq head 'double-float)) (not (eq head 'short-float))
+           (not (eq head 'long-float)) (not (eq head 'complex))
+           (not (eq head 'function)))
+      (let ((n (symbol-name head)))
+        (cond
+          ((null n) head)
+          ((string= n "LIST") 'list)
+          ((string= n "VECTOR") 'vector)
+          ((string= n "SIMPLE-VECTOR") 'simple-vector)
+          ((string= n "ARRAY") 'array)
+          ((string= n "SIMPLE-ARRAY") 'simple-array)
+          ((string= n "STRING") 'string)
+          ((string= n "SIMPLE-STRING") 'simple-string)
+          ((string= n "BASE-STRING") 'base-string)
+          ((string= n "SIMPLE-BASE-STRING") 'simple-base-string)
+          ((string= n "CHARACTER") 'character)
+          ((string= n "BIT-VECTOR") 'bit-vector)
+          ((string= n "SIMPLE-BIT-VECTOR") 'simple-bit-vector)
+          ((string= n "FLOAT") 'float)
+          ((string= n "SINGLE-FLOAT") 'single-float)
+          ((string= n "DOUBLE-FLOAT") 'double-float)
+          ((string= n "SHORT-FLOAT") 'short-float)
+          ((string= n "LONG-FLOAT") 'long-float)
+          ((string= n "COMPLEX") 'complex)
+          ((string= n "FUNCTION") 'function)
+          (t head)))
+      head))
+
+(defun %coerce-expand-type (type)
+  "TYPE with user DEFTYPEs expanded, at the top and in the element type of a
+   (VECTOR / ARRAY / SIMPLE-ARRAY elt ...) spec."
+  (let ((type (%element-type-expand type)))
+    (if (and (consp type) (consp (cdr type))
+             (member (%coerce-canon-head (car type)) '(vector array simple-array)))
+        (list* (car type) (%element-type-expand (cadr type)) (cddr type))
+        type)))
+
+(defun coerce (object result-type)
+  "Coerce OBJECT to RESULT-TYPE.  Accepts compound type forms like
+   (vector *), (vector * 2), (simple-string 5) — uses the head symbol
+   for dispatch (per CLHS, compound array/string subtypes are still
+   the same family of result-type)."
+  ;; Already of that type: OBJECT itself (CLHS COERCE; COERCE.1).  Only on an
+  ;; EXACT match with TYPE-OF -- TYPEP ignores element types here, so a general
+  ;; vector would pass for a byte vector and come back uncopied.
+  (when (and (not (consp object)) (or (stringp object) (vectorp object))
+             (equal result-type (type-of object)))
+    (return-from coerce object))
+  (setq result-type (%coerce-expand-type result-type))
+  (when (%seq-type-u8-p result-type) (return-from coerce (%seq-u8-copy object)))
+  (let* ((orig-type result-type)
+         ;; Explicit length from a compound array/vector/string spec like
+         ;; (vector * 4) / (simple-string 5) — third element (or second for
+         ;; string specs).  NIL or '* means unconstrained.
+         (spec-len
+           (and (consp orig-type)
+                (let ((head (car orig-type)) (rest (cdr orig-type)))
+                  (cond
+                    ;; (vector elt-type len) / (array elt-type (len)) family:
+                    ;; length is the 3rd element
+                    ((and (or (eq head 'vector) (eq head 'simple-vector)
+                              (eq head 'array) (eq head 'simple-array))
+                          (consp rest) (consp (cdr rest)))
+                     (let ((l (car (cdr rest))))
+                       (cond ((integerp l) l)
+                             ((and (consp l) (integerp (car l))) (car l))
+                             (t nil))))
+                    ;; (string len) / (simple-string len) etc: length is 2nd
+                    ((and (or (eq head 'string) (eq head 'simple-string)
+                              (eq head 'base-string) (eq head 'simple-base-string)
+                              (eq head 'bit-vector) (eq head 'simple-bit-vector))
+                          (consp rest) (integerp (car rest)))
+                     (car rest))
+                    (t nil)))))
+         ;; CLHS allows RESULT-TYPE to be a class object (e.g.
+         ;; (coerce x (find-class 'vector))).  Normalize a CLOS class or
+         ;; built-in class-proxy to its name symbol first so the head
+         ;; dispatch below sees 'vector etc.
+         (result-type (cond
+                        ((and (not (consp result-type)) (not (symbolp result-type))
+                              (or (%clos-class-p result-type)
+                                  (%class-proxy-p result-type)))
+                         (class-name result-type))
+                        (t result-type)))
+         (result-type (%coerce-canon-head (if (consp result-type) (car result-type) result-type)))
+         ;; (VECTOR CHARACTER) / (SIMPLE-ARRAY CHARACTER (*)) is a string
+         ;; type (CLHS 15.1.2.2): build a string, not a general vector.
+         (result-type (if (and (member result-type '(vector array simple-array))
+                               (consp orig-type) (consp (cdr orig-type))
+                               (member (%coerce-canon-head (cadr orig-type))
+                                       '(character base-char standard-char)))
+                          'simple-string
+                          result-type))
+         (%cv
+  (cond
+    ((eq result-type 'list)
+     (cond
+       ;; Wrapped vector — use length+wrapper-aref to read effective contents
+       ((and (consp object) (array-wrapper-p object))
+        (let ((len (length object)) (result nil) (i 0)
+              (string-p (stringp object)))
+          (loop
+            (when (>= i len) (return (nreverse result)))
+            (let ((raw (%wrapper-aref object i)))
+              (setq result (cons (if (and string-p (integerp raw))
+                                     (code-char raw) raw)
+                                 result)))
+            (setq i (+ i 1)))))
+       ((consp object) object)
+       ((null object) nil)
+       ((stringp object)
+        (let ((len (length object)) (result nil) (i 0))
+          (loop
+            (when (>= i len) (return (nreverse result)))
+            (setq result (cons (aref object i) result))   ; AREF→char already
+            (setq i (+ i 1)))))
+       ((arrayp object)
+        (let ((len (array-length object)) (result nil) (i 0))
+          (loop
+            (when (>= i len) (return (nreverse result)))
+            (setq result (cons (aref object i) result))
+            (setq i (+ i 1)))))
+       (t object)))
+    ((or (eq result-type 'string) (eq result-type 'simple-string)
+         (eq result-type 'base-string) (eq result-type 'simple-base-string))
+     (cond
+       ;; Wrapped string — flatten to plain string of effective length
+       ((and (consp object) (array-wrapper-p object) (stringp object))
+        (let* ((len (length object))
+               (s (%make-string-array len))
+               (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (let ((raw (%wrapper-aref object i)))
+              (aset s i (if (integerp raw) raw (char-code raw))))
+            (setq i (+ i 1)))))
+       ;; A string that is not SIMPLE -- the header-object arrays a fill-pointer
+       ;; or adjustable MAKE-ARRAY returns, which the CONSP arm above does not
+       ;; cover -- must be COPIED for a SIMPLE- target (CLHS 4.7: COERCE returns
+       ;; an object of RESULT-TYPE).  Returning it unchanged handed back an
+       ;; object whose header said string and whose slots did not hold codes, so
+       ;; compiled CHAR/SCHAR read raw slots and got garbage: seal's UTF8-DECODE
+       ;; ends in exactly this coerce, and every websocket message it decoded
+       ;; parsed as junk.
+       ((and (%mda-p object) (stringp object)
+             (or (eq result-type 'simple-string) (eq result-type 'simple-base-string)))
+        (let* ((len (length object))
+               (s (%make-string-array len))
+               (i 0))
+          (loop
+            (when (>= i len) (return s))
+            (aset s i (char-code (char object i)))
+            (setq i (+ i 1)))))
+       ((stringp object) object)
+       ;; General (non-string-subtag) VECTOR of characters, e.g.
+       ;; (vector #\a #\b #\c).  Without this branch the cond fell through
+       ;; to `(t object)' and coerce returned the SOURCE VECTOR unchanged —
+       ;; so (coerce #(#\a #\b #\c) 'string) was EQ to its argument and not
+       ;; EQUAL to "abc" (alexandria COPY-SEQUENCE.1).  ARRAYP is true for
+       ;; the cons-shaped adjustable/displaced wrappers too, and AREF/LENGTH
+       ;; both honour the wrapper, so this must precede the CONSP branch
+       ;; (which would otherwise walk a wrapper as if it were a list).
+       ((arrayp object)
+        (let ((len (length object))
+              (i 0))
+          (let ((s (%make-string-array len)))
+            (loop
+              (when (>= i len) (return s))
+              (let ((e (aref object i)))
+                (aset s i (if (characterp e) (char-code e) e)))
+              (setq i (+ i 1))))))
+       ((consp object)
+        (let ((len (length object))
+              (i 0)
+              (cur object))
+          (let ((s (%make-string-array len)))
+            (loop
+              (when (null cur) (return s))
+              (aset s i (if (characterp (car cur)) (char-code (car cur)) (car cur)))
+              (setq cur (cdr cur))
+              (setq i (+ i 1))))))
+       ((null object) (%make-string-array 0))
+       (t object)))
+    ((or (eq result-type 'vector) (eq result-type 'simple-vector)
+         ;; Bit-vectors in Modus are plain arrays of 0/1 (bit-vector-p
+         ;; tests element values), so coercing a list/vector/bit-vector to
+         ;; BIT-VECTOR is the same flatten-to-array path as VECTOR.
+         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector)
+         ;; ARRAY / SIMPLE-ARRAY — the SAME path.  Missing them meant
+         ;; `(coerce '(1 2 3) '(simple-array (unsigned-byte 8) (*)))' fell
+         ;; through to `(t object)' and returned THE LIST, silently and with
+         ;; no error, so every downstream (aref result i) read a cons.  That
+         ;; is how pagetree's meta-page magic constant stayed a list: its
+         ;; checksum matched but the magic-byte compare never did, so
+         ;; valid-meta-p was NIL for a meta page written moments earlier —
+         ;; every committed transaction became invisible to a fresh pager and
+         ;; an aborted write txn took the whole store with it.  cl-sequences'
+         ;; COERCE already had this arm; this one wins by last-defun-wins.
+         (eq result-type 'array) (eq result-type 'simple-array))
+     (cond
+       ;; Wrapped vector — flatten to plain vector of effective length
+       ((and (consp object) (array-wrapper-p object))
+        (let* ((len (length object))
+               (v (make-array len))
+               (string-p (stringp object))
+               (i 0))
+          (loop
+            (when (>= i len) (return v))
+            (let ((raw (%wrapper-aref object i)))
+              (aset v i (if (and string-p (integerp raw)) (code-char raw) raw)))
+            (setq i (+ i 1)))))
+       ((arrayp object) object)
+       ((consp object)
+        (let ((len (length object))
+              (i 0)
+              (cur object))
+          (let ((v (make-array len)))
+            (loop
+              (when (null cur) (return v))
+              (aset v i (car cur))
+              (setq cur (cdr cur))
+              (setq i (+ i 1))))))
+       ((null object) (make-array 0))
+       (t object)))
+    ((or (eq result-type 'float) (eq result-type 'double-float)
+         (eq result-type 'single-float) (eq result-type 'short-float)
+         (eq result-type 'long-float))
+     ;; CLHS: coerce to a specific float format converts to THAT format;
+     ;; coerce to FLOAT keeps an existing float's format, else single.
+     ;; Use %any-to-float (EXACT #x60 double payload) — NOT the public
+     ;; FLOAT fn, which now rounds to single by default and would make
+     ;; (coerce big-int 'double-float) lose 28 mantissa bits.
+     (let ((f (%any-to-float object)))
+       (cond
+         ((not (%ieee-float-p f)) f)
+         ((eq result-type 'float)
+          (if (%ieee-float-p object) object (%round-to-single f)))
+         ;; single/short/double/long → exact subtag + correct precision.
+         (t (%coerce-float-to-type f result-type)))))
+    ((eq result-type 'integer)
+     (if (floatp-impl object) (truncate object) object))
+    ((eq result-type 'character)
+     ;; CLHS: object must be a character designator — a character, a
+     ;; string of length 1, or a symbol whose name has length 1.
+     (cond
+       ((characterp object) object)
+       ((integerp object) (code-char object))
+       ((stringp object) (aref object 0))            ; AREF→char already
+       ((symbolp object)                             ; symbol → its 1-char name
+        (let ((nm (symbol-name object)))
+          (if (and (stringp nm) (= (length nm) 1))
+              (aref nm 0)
+              (progn (%signal-type-error) nil))))
+       (t object)))
+    ((eq result-type 'function)
+     ;; CLHS: a symbol or lambda expression coerces to a function.  A
+     ;; symbol with no global function definition signals an error.
+     (cond
+       ((functionp object) object)
+       ((and (consp object) (symbolp (car object))
+             (string= (symbol-name (car object)) "LAMBDA"))
+        ;; (lambda ...) expression → interpreted closure (null lexenv)
+        (list '%interp-closure (cadr object) (cddr object) nil))
+       ((symbolp object)
+        (let ((fn (and (fboundp object) (symbol-function object))))
+          (if fn fn (progn (%signal-undefined-function) nil))))
+       (t (%signal-type-error) nil)))
+    ((eq result-type 'cons)
+     ;; CONS is not a valid coercion result-type unless OBJECT is already
+     ;; a cons (CLHS 4.2.1: coerce identity when already of the type).
+     ;; (coerce nil 'cons), (coerce x 'cons) for non-cons → TYPE-ERROR.
+     (if (consp object) object (progn (%signal-type-error) nil)))
+    ((eq result-type 'complex)
+     ;; CLHS coerce/COMPLEX: a rational stays a rational (a rational IS of
+     ;; type COMPLEX since (complex rational 0) = rational), but a FLOAT
+     ;; becomes a true #C(float 0.0) — float contagion forbids the collapse
+     ;; to a real that (complex r 0) does for rationals.  coerce.18/.19/.20.
+     (cond
+       ((%complex-p object) object)
+       ((floatp-impl object)
+        (let ((c (make-array 3)))
+          (aset c 0 '%complex-marker)
+          (aset c 1 object)
+          (aset c 2 (float 0))
+          c))
+       ((or (integerp object) (ratiop object)) object)
+       (t (progn (%signal-type-error) nil))))
+    (t object))))
+  ;; CLHS: if RESULT-TYPE specifies an explicit length, OBJECT must be
+  ;; coercible to a sequence of exactly that length, else TYPE-ERROR.
+  ;; The cond above ignores the length; validate it here on the result.
+    (if (and spec-len
+             (or (stringp %cv) (arrayp %cv) (consp %cv) (null %cv))
+             (not (eql (length %cv) spec-len)))
+        (progn (%signal-type-error) nil)
+        %cv)))
+
+;;; ============================================================
+;;; Bitwise Logic Extensions
+;;; ============================================================
+(defun lognand (a b) (lognot (logand a b)))
+
+(defun lognor (a b) (lognot (logior a b)))
+
+(defun logeqv (&rest args)
+  "Bitwise EQV — identity -1, n-ary fold of pairwise EQV (CLHS 12.2)."
+  (cond
+    ((null args) -1)
+    ((null (cdr args)) (car args))
+    (t (let ((acc (car args)) (rest (cdr args)))
+         (loop
+           (when (null rest) (return acc))
+           (setq acc (lognot (logxor acc (car rest))))
+           (setq rest (cdr rest)))))))
+
+(defun logandc1 (a b) (logand (lognot a) b))
+
+(defun logandc2 (a b) (logand a (lognot b)))
+
+(defun logorc1 (a b) (logior (lognot a) b))
+
+(defun logorc2 (a b) (logior a (lognot b)))
+
+;;; ============================================================
+;;; Numeric Functions
+;;; ============================================================
+(defun signum (x)
+  "Return the sign of X.  For reals: -1, 0, or 1 (float-contagious for
+   floats).  For complex X: x / |x|, which preserves the phase and has
+   modulus 1 (or x itself when x is 0).  CLHS: (signum x) ≡ (if (zerop x)
+   x (/ x (abs x)))."
+  (cond
+    ((complexp x)
+     (let ((r (realpart x)) (i (imagpart x)))
+       (if (and (zerop r) (zerop i))
+           x
+           ;; magnitude inline (the &rest-wrapped public ABS crashes when
+           ;; handed a heap complex object); sqrt of sum of squares.
+           (let ((mag (sqrt (+ (* r r) (* i i)))))
+             (complex (/ r mag) (/ i mag))))))
+    ;; A float's sign IN ITS OWN FORMAT ((signum -2d0) is -1.0d0, not the
+    ;; single -1.0), and a zero -- either sign -- is returned as itself.
+    ((floatp-impl x)
+     (cond ((zerop x) x)
+           ((minusp x) (float -1 x))
+           (t (float 1 x))))
+    (t (if (< x 0) -1 (if (> x 0) 1 0)))))
+
+(defun float-exponent (x)
+  "Return the exponent of FLOAT X (like nth value of decode-float)."
+  (if (= x 0.0) 0
+      (let ((abs-x (if (< x 0.0) (- x) x)))
+        ;; Use log base 2 approximation
+        (let ((n 0))
+          (loop
+            (when (>= abs-x 1.0) (return n))
+            (setq abs-x (* abs-x 2.0))
+            (setq n (- n 1)))
+          (loop
+            (when (< abs-x 2.0) (return n))
+            (setq abs-x (/ abs-x 2.0))
+            (setq n (+ n 1)))
+          n))))
+
+;;; ============================================================
+;;; Float versions of integer division — return integer parts as
+;;; integers (modus has no native floats); the fractional remainder is
+;;; reported as a rational.  Mostly returns sensible values for cases
+;;; the ANSI test suite asks about (integer/integer pairs).
+;;; ============================================================
+
+;;; CLHS: ffloor/fceiling/ftruncate/fround return the quotient as a
+;;; FLOAT (of the same format as the argument, or single-float if the
+;;; argument is rational).  The second value is the remainder.  Modus
+;;; coerces the integer quotient back to a float; the remainder keeps
+;;; the type the underlying floor/etc. produced (integer for
+;;; integer/integer args, float for float args).
+(defun ftruncate (n &optional (d 1))
+  (multiple-value-bind (q r) (truncate n d)
+    (values (%any-to-float q) r)))
+
+(defun ffloor (n &optional (d 1))
+  (multiple-value-bind (q r) (floor n d)
+    (values (%any-to-float q) r)))
+
+(defun fceiling (n &optional (d 1))
+  (multiple-value-bind (q r) (ceiling n d)
+    (values (%any-to-float q) r)))
+
+(defun fround (n &optional (d 1))
+  (multiple-value-bind (q r) (round n d)
+    (values (%any-to-float q) r)))
+
+;;; ============================================================
+;;; Random State
+;;; ============================================================
+(defvar *random-state* (list 'random-state 12345))
+
+(defun random-state-p (x)
+  (and (consp x) (eq (car x) 'random-state)))
+
+(defun make-random-state (&optional state)
+  (if (null state)
+      (list 'random-state (get-internal-run-time))
+      (if (eq state t)
+          (list 'random-state (get-internal-run-time))
+          (list 'random-state (cadr state)))))
+
+;;; ============================================================
+;;; Trigonometric and Transcendental Functions
+;;; ============================================================
+
+;; Strict 1-arg arity (CLHS): (atanh), (atanh 1.0 1.0) etc. signal
+;; PROGRAM-ERROR.  The &rest extra guard mirrors integerp/isqrt above.
+(defun atanh (x &rest extra)
+  "Inverse hyperbolic tangent."
+  ;; atanh(x) = 0.5 * ln((1+x)/(1-x))
+  (if extra
+      (%program-error "atanh requires exactly 1 argument")
+      (* 0.5 (log (/ (+ 1.0 (float x)) (- 1.0 (float x)))))))
+
+(defun asinh (x &rest extra)
+  "Inverse hyperbolic sine."
+  ;; asinh(x) = ln(x + sqrt(x^2 + 1))
+  (if extra
+      (%program-error "asinh requires exactly 1 argument")
+      (let ((fx (float x)))
+        (log (+ fx (sqrt (+ (* fx fx) 1.0)))))))
+
+(defun acosh (x &rest extra)
+  "Inverse hyperbolic cosine."
+  ;; acosh(x) = ln(x + sqrt(x^2 - 1))
+  (if extra
+      (%program-error "acosh requires exactly 1 argument")
+      (let ((fx (float x)))
+        (log (+ fx (sqrt (- (* fx fx) 1.0)))))))
+
+;; conjugate lives in cl-sequences.lisp — the stub here returned the
+;; arg unchanged and shadowed the real implementation that handles
+;; (complex r i) properly.
+
+;;; ============================================================
+;;; Transcendental / math arity guards (CLHS 12.2)
+;;; ============================================================
+;;; The implementations of sin/cos/tan/asin/acos/atan/sinh/cosh/tanh/
+;;; exp/sqrt/abs live in cl-types.lisp / cl-clos.lisp / cl-eval.lisp with
+;;; a single required parameter (atan: one &optional), so calling them with
+;;; surplus positional arguments — e.g. (sin 0.0 0.0), (exp 0 0 0),
+;;; (abs 0 0) — was silently accepted (extra args dropped) instead of
+;;; signalling PROGRAM-ERROR per CLHS.  These are the only definitions now
+;;; (the plain ones they replaced are gone).  Each delegates to the same
+;;; %-helpers the home defun uses (NOT to the public name), so there is no
+;;; recursion and the numeric result is bit-identical to the home version.
+;;; Tests: sin.error / cos.error / … / exp.error / sqrt.error / abs.error.
+(defun sin (x &rest extra)
+  (if extra
+      (%program-error "sin requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            ;; a float zero is its own sine: (sin -0.0) = -0.0
+            ((and (floatp x) (zerop x)) x)
+            (t (%irr-result (%sin-f (%any-to-float x)) x)))))
+
+(defun cos (x &rest extra)
+  (if extra
+      (%program-error "cos requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 1)
+            (t (%irr-result (%cos-f (%any-to-float x)) x)))))
+
+(defun tan (x &rest extra)
+  (if extra
+      (%program-error "tan requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            ((and (floatp x) (zerop x)) x)
+            (t (let* ((xf (%any-to-float x))
+                      (r (%trig-reduce-f xf))
+                      (sn (%sin-poly-f r))
+                      (cs (%cos-poly-f r)))
+                 (%irr-result (%float-div sn cs) x))))))
+
+(defun asin (x &rest extra)
+  (if extra
+      (%program-error "asin requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            (t (%irr-result (%asin-f (%any-to-float x)) x)))))
+
+(defun acos (x &rest extra)
+  (if extra
+      (%program-error "acos requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 1)) 0)
+            ((and (integerp x) (= x 0)) (%round-to-single (%fpi/2)))
+            (t (%irr-result (%float-sub (%fpi/2) (%asin-f (%any-to-float x))) x)))))
+
+;; atan accepts 1 or 2 args (atan x) / (atan y x); 0 or 3+ is the error
+;; case.  Use a plain &rest dispatch (NOT &optional+&rest, whose
+;; optional-populated call convention miscompiles in Modus) so the 2-arg
+;; (atan y x) form binds correctly.
+(defun atan (&rest args)
+  (let ((n (length args)))
+    (cond
+      ((= n 1)
+       (let ((x (car args)))
+         (cond ((and (integerp x) (= x 0)) 0)
+               (t (%irr-result (%atan-f (%any-to-float x)) x)))))
+      ((= n 2)
+       (let* ((ya (car args)) (xa (car (cdr args)))
+              (yf (%any-to-float ya))             ; CLHS (atan number divisor)
+              (xf (%any-to-float xa))             ; number=y, divisor=x
+              (r (%atan2-f yf xf)))
+         (%as-result-float r (%float-result-type ya xa))))
+      (t (%program-error "atan requires 1 or 2 arguments")))))
+
+(defun sinh (x &rest extra)
+  (if extra
+      (%program-error "sinh requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            (t (let* ((xf (%any-to-float x))
+                      (ep (%exp-f xf))
+                      (em (%exp-f (%float-neg xf))))
+                 (%irr-result (%float-div (%float-sub ep em) (%fl 2)) x))))))
+
+(defun cosh (x &rest extra)
+  (if extra
+      (%program-error "cosh requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 1)
+            (t (let* ((xf (%any-to-float x))
+                      (ep (%exp-f xf))
+                      (em (%exp-f (%float-neg xf))))
+                 (%irr-result (%float-div (%float-add ep em) (%fl 2)) x))))))
+
+(defun tanh (x &rest extra)
+  (if extra
+      (%program-error "tanh requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 0)
+            ;; a float zero is its own tanh (-0.0 stays -0.0); past |x| = 22
+            ;; tanh is +-1 to double precision, and exp(x)/exp(x) would be
+            ;; inf/inf = NaN.
+            ((and (floatp x) (zerop x)) x)
+            ((and (realp x) (> (abs x) 22))
+             (%irr-result (if (minusp x) (%fl -1) (%fl 1)) x))
+            (t (let* ((xf (%any-to-float x))
+                      (ep (%exp-f xf))
+                      (em (%exp-f (%float-neg xf))))
+                 (%irr-result (%float-div (%float-sub ep em) (%float-add ep em)) x))))))
+
+(defun exp (x &rest extra)
+  (if extra
+      (%program-error "exp requires exactly 1 argument")
+      (cond ((and (integerp x) (= x 0)) 1)
+            ;; Complex argument: e^(a+bi) = e^a (cos b + i sin b).
+            ((%complex-p x)
+             (let* ((a (realpart x)) (b (imagpart x))
+                    (ea (%exp-f (%any-to-float a))))
+               (complex (%float-mul ea (%cos-f (%any-to-float b)))
+                        (%float-mul ea (%sin-f (%any-to-float b))))))
+            (t (%irr-result (%exp-f (%any-to-float x)) x)))))
+
+;; ABS — strict 1-arg.  (abs 0 0) / (abs 0 nil nil) → PROGRAM-ERROR.
+;; Body copies the cl-eval.lisp impl (complex magnitude via sqrt; else
+;; sign-flip).  sqrt below is this file's override (terminating).
+(defun abs (n &rest extra)
+  (if extra
+      (%program-error "abs requires exactly 1 argument")
+      (cond
+        ((complexp n)
+         (let ((r (realpart n)) (i (imagpart n)))
+           (if (or (floatp r) (floatp i))
+               ;; FLOAT parts: the overflow-safe magnitude in their format --
+               ;; r*r + i*i is inf for |r| near 1e200, so (abs #C(1d200 1d200))
+               ;; was inf.  RATIONAL parts keep the exact path ((abs #C(3 4)) = 5).
+               (%irr-result (%hypot-f (%any-to-float r) (%any-to-float i))
+                            (if (double-float-p r) r i))
+               (sqrt (+ (* r r) (* i i))))))
+        ;; generic-negate-int → %safe-fixnum-negate handles
+        ;; MOST-NEGATIVE-FIXNUM (-2^62): plain (- 0 n) WRAPS it back to
+        ;; itself (still negative), and the resulting bad "magnitude"
+        ;; crashed gcd/lcm.4/.6/.7.  Also covers negative bignum inputs.
+        ;; floats by sign bit: (abs -0.0) is 0.0 though (< -0.0 0) is false
+        ((%ieee-float-p n) (if (float-negative-p n) (%negate-number n) n))
+        ((< n 0) (generic-negate-int n))
+        (t n))))
+
+;; SQRT — strict 1-arg.  (sqrt 0 nil) → PROGRAM-ERROR.  Body copies the
+;; cl-clos.lisp impl verbatim (integer/ratio/boxed-float/IEEE branches);
+;; the boxed-float branch self-recurses through this override, which
+;; terminates because the recursion target is an integer or ratio.
+;; Complex sqrt via the algebraic formula.  For z = a + bi:
+;;   m = |z| = sqrt(a^2 + b^2)
+;;   sqrt(z) = sqrt((m+a)/2) + sign(b)*sqrt((m-a)/2) i
+;; (when b = 0 and a < 0 this degenerates to the pure-imaginary branch).
+;; Inputs ar/ai are arbitrary reals; the result parts are floats.  FMT is
+;; the argument that drives single-vs-double contagion (rational => single).
+(defun %hypot-f (a b)
+  "sqrt(a^2 + b^2) without the intermediate overflow: |a| * sqrt(1 + (b/a)^2)
+   with |a| >= |b|.  The direct form overflowed to inf for |a| near 1e300."
+  (let ((aa (%float-abs a)) (bb (%float-abs b)))
+    (when (%float-lt-p aa bb) (let ((tmp aa)) (setq aa bb) (setq bb tmp)))
+    (cond ((%float-zero-p aa) aa)
+          ((%float-infinite-p aa) aa)
+          (t (let ((r (%float-div bb aa)))
+               (%float-mul aa (%sqrt-f (%float-add (%f-one) (%float-mul r r)))))))))
+
+(defun %complex-sqrt (ar ai fmt)
+  ;; The result's float FORMAT comes from the parts: a complex is never a
+  ;; DOUBLE-FLOAT itself, so passing the complex as FMT made %IRR-RESULT round
+  ;; (sqrt #C(3d0 4d0)) to single-float parts.
+  (when (double-float-p ar) (setq fmt ar))
+  (when (double-float-p ai) (setq fmt ai))
+  ;; A negative REAL (zero imaginary part) has the exact principal root
+  ;; #C(0 sqrt|a|): the general formula below computes (|a| + a)/2, which is
+  ;; inf - inf = NaN for a = -inf.
+  (when (and (%float-zero-p (%any-to-float ai))
+             (float-negative-p (%any-to-float ar)))
+    (return-from %complex-sqrt
+      (complex (%irr-result (%fl 0) fmt)
+               (%irr-result (%sqrt-f (%float-neg (%any-to-float ar))) fmt))))
+  (let* ((af (%any-to-float ar))
+         (bf (%any-to-float ai))
+         (m  (%hypot-f af bf))
+         (half (%float-div (%f-one) (%fl 2)))
+         (rp (%sqrt-f (%float-mul (%float-add m af) half)))
+         (ip (%sqrt-f (%float-mul (%float-sub m af) half))))
+    (when (float-negative-p bf) (setq ip (%float-neg ip)))
+    (complex (%irr-result rp fmt) (%irr-result ip fmt))))
+
+(defun sqrt (n &rest extra)
+  (if extra
+      (%program-error "sqrt requires exactly 1 argument")
+      (cond
+        ;; Complex argument -> complex sqrt.
+        ((%complex-p n) (%complex-sqrt (realpart n) (imagpart n) n))
+        ((integerp n)
+         (cond
+           ;; Negative real -> pure-imaginary complex (CLHS): single-float.
+           ((< n 0) (%complex-sqrt n 0 n))
+           ;; Perfect square -> exact integer; otherwise a FLOAT (CLHS: sqrt
+           ;; of a non-square rational returns an irrational => float).
+           (t
+            (let ((s (isqrt n)))
+              (if (= (* s s) n)
+                  s
+                  ;; Irrational sqrt of a rational -> single-float (CLHS).
+                  (%round-to-single (%sqrt-f (%any-to-float n))))))))
+        ((ratiop n)
+         (let* ((num (ratio-numerator n))
+                (den (ratio-denominator n)))
+           (cond
+             ((< num 0) (%complex-sqrt n 0 n))
+             (t
+              (let ((s (isqrt (* num den))))
+                (if (= (* s s) (* num den))
+                    ;; Perfect square numerator*denominator -> exact ratio s/den.
+                    (%make-rat s den)
+                    ;; Non-perfect square -> single-float (rational arg, CLHS).
+                    (%round-to-single (%sqrt-f (%any-to-float n)))))))))
+        ((and (not (fixnump n)) (not (consp n)) (not (null n))
+              (= (obj-subtag n) #x32)
+              (= (array-length n) 2))
+         (let ((num (aref n 0)) (den (aref n 1)))
+           (sqrt (if (= den 1) num (%make-rat num den)))))
+        ((%ieee-float-p n)
+         (cond
+           ((%float-zero-p n) n)
+           ;; Negative float -> pure-imaginary complex, same float format.
+           ((float-negative-p n) (%complex-sqrt n 0 n))
+           ;; %SQRT-F (range-reduced Newton).  This arm used to run its own
+           ;; EIGHT Newton steps from y = x, which only converge near 1:
+           ;; (sqrt 1d300) was 3.9d297 and (sqrt +inf) a NaN.  Preserve the
+           ;; argument's float format (single vs double).
+           (t (%irr-result (%sqrt-f n) n))))
+        (t 0))))
+
+;;; ============================================================
+;;; BOOLE
+;;; ============================================================
+(defvar boole-clr 0)
+
+(defvar boole-set 1)
+
+(defvar boole-1 2)
+
+(defvar boole-2 3)
+
+(defvar boole-c1 4)
+
+(defvar boole-c2 5)
+
+(defvar boole-and 6)
+
+(defvar boole-ior 7)
+
+(defvar boole-xor 8)
+
+(defvar boole-eqv 9)
+
+(defvar boole-nand 10)
+
+(defvar boole-nor 11)
+
+(defvar boole-andc1 12)
+
+(defvar boole-andc2 13)
+
+(defvar boole-orc1 14)
+
+(defvar boole-orc2 15)
+
+(defun %init-boole-constants ()
+  "defvar init-thunks don't run at boot (see CLAUDE.md limitation #7), so the
+   16 BOOLE-* constants above default to NIL.  Tests reference e.g. BOOLE-AND
+   directly as a value (boole.4, boole.order.1) AND pass it to BOOLE, where a
+   NIL op fell through to the (t 0) clause — every result came back 0.  Set the
+   distinct integer values explicitly; called once from kernel-main, mirroring
+   %init-standard-chars."
+  (setq boole-clr 0)
+  (setq boole-set 1)
+  (setq boole-1 2)
+  (setq boole-2 3)
+  (setq boole-c1 4)
+  (setq boole-c2 5)
+  (setq boole-and 6)
+  (setq boole-ior 7)
+  (setq boole-xor 8)
+  (setq boole-eqv 9)
+  (setq boole-nand 10)
+  (setq boole-nor 11)
+  (setq boole-andc1 12)
+  (setq boole-andc2 13)
+  (setq boole-orc1 14)
+  (setq boole-orc2 15)
+  t)
+
+(defun boole (op a b)
+  "Perform bitwise logical operation OP on integers A and B."
+  (cond
+    ((= op boole-clr) 0)
+    ((= op boole-set) -1)
+    ((= op boole-1) a)
+    ((= op boole-2) b)
+    ((= op boole-c1) (lognot a))
+    ((= op boole-c2) (lognot b))
+    ((= op boole-and) (logand a b))
+    ((= op boole-ior) (logior a b))
+    ((= op boole-xor) (logxor a b))
+    ((= op boole-eqv) (logeqv a b))
+    ((= op boole-nand) (lognand a b))
+    ((= op boole-nor) (lognor a b))
+    ((= op boole-andc1) (logandc1 a b))
+    ((= op boole-andc2) (logandc2 a b))
+    ((= op boole-orc1) (logorc1 a b))
+    ((= op boole-orc2) (logorc2 a b))
+    (t 0)))
+
+;;; ============================================================
+;;; UPGRADED-COMPLEX-PART-TYPE
+;;; ============================================================
+(defun upgraded-complex-part-type (type)
+  "Return upgraded complex part type (simplified to T)."
+  t)
+
+;;; ============================================================
+;;; Runtime LDB for non-constant byte specs
+;;; ============================================================
+(defun %ldb-rt (bytespec integer)
+  "Runtime LDB when bytespec is not a compile-time constant.
+   Bytespec is (size . pos) cons cell."
+  (let ((size (byte-size bytespec))
+        (pos (byte-position bytespec)))
+    (logand (ash integer (- 0 pos))
+            (- (ash 1 size) 1))))
+
+;;; INTEGER-LENGTH — strict 1-arg arity (last-defun-wins)
+(defun integer-length (n &rest extra)
+  (if extra
+      (%program-error "integer-length requires exactly 1 argument")
+      ;; Negative: the length of (lognot N) = |N| - 1 (CLHS), small and big
+      ;; bignums alike.  BIGNUM-HI of a big (sign-magnitude) bignum is not
+      ;; its sign, so a negative big bignum took the magnitude path and
+      ;; (integer-length (- (ash 1 124))) was 125.
+      (if (bignump n)
+          (if (< n 0)
+              (%bignum-integer-length-pos (bignum-1- (bignum-negate n)))
+              (%bignum-integer-length-pos n))
+          (%fixnum-integer-length n))))
+
+;;; INTEGERP — strict 1-arg arity (last-defun-wins)
+(defun integerp (x &rest extra)
+  (if extra
+      (%program-error "integerp requires exactly 1 argument")
+      (integerp x)))
+
+;;; ISQRT — strict 1-arg arity (last-defun-wins)
+(defun isqrt (n &rest extra)
+  (if extra
+      (%program-error "isqrt requires exactly 1 argument")
+      (if (<= n 0) 0
+          (let ((x n))
+            (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
+                    (when (>= x1 x) (return x))
+                    (setq x x1)))))))
+
+;;; RATIONALIZE — strict 1-arg arity (last-defun-wins)
+;; RATIONALIZE — for IEEE doubles RATIONAL already yields the simplest
+;; exact value (binary fraction in lowest terms), so RATIONALIZE delegates
+;; to RATIONAL.  An older stub returned N unchanged, so (rationalize 1.5)
+;; returned 1.5.
+(defun rationalize (n &rest extra)
+  (if extra
+      (%program-error "rationalize requires exactly 1 argument")
+      (rational n)))
+
+;;; TYPE-OF (CLHS) — replaces the prelude NIL stub.  The prelude's
+;;; (defun type-of (obj) nil) made (typep x (type-of x)) NIL for every
+;;; object → type-of.3 collected the whole *universe*, and type-of.6/.7
+;;; returned NIL instead of the struct/class name.  We return a type
+;;; specifier that the OBJECT is a member of (CLHS req 1.a) and that is a
+;;; subtype of its class (req via type-of.4) — leaning on the existing
+;;; most-specific-builtin-class dispatch so the result is always a name
+;;; TYPEP recognises.
+(defun type-of (obj)
+  (cond
+    ((null obj) 'null)
+    ((eq obj t)  'boolean)
+    ;; CLOS instance — proper class name if the name still names the class
+    ;; (find-class round-trips), otherwise the class OBJECT itself
+    ;; (type-of.8 / .9 after (setf (class-name c) nil) / (setf (find-class
+    ;; 'n) nil)).  CLHS 4.3.7: type-of returns the class when it has no
+    ;; proper name.
+    ((%clos-instance-p obj)
+     (let* ((cname (aref obj 1))
+            (cls   (and cname (%find-clos-class cname))))
+       (if (and cls cname (eq (find-class cname nil) cls))
+           cname
+           ;; No proper name — return the class object (class-of).
+           (if cls cls (or cname 'standard-object)))))
+    ;; Struct instance — its struct type name.
+    ((%struct-instance-p obj) (%struct-type-name obj))
+    ;; Condition — its condition type name.
+    ((%condition-p obj) (%condition-type-name obj))
+    ;; A CLOS class object is itself an instance of STANDARD-CLASS.
+    ((%clos-class-p obj) 'standard-class)
+    ;; A hash table is a tagged cons underneath; its type is HASH-TABLE.
+    ((hash-table-p obj) 'hash-table)
+    ;; Integers: CLHS says an (integer low high) spec is fine, but a bare
+    ;; recognisable supertype name also satisfies req 1.a + the subtypep
+    ;; checks.  Use FIXNUM / BIGNUM (TYPEP accepts both as INTEGER here).
+    ((fixnump obj)
+     (cond ((or (eql obj 0) (eql obj 1)) 'bit)
+           (t 'fixnum)))
+    ((bignump obj)     'bignum)
+    ((ratiop obj)      'ratio)
+    ((floatp-impl obj) (%float-declared-type obj))  ; declared float type (numeric tower N1)
+    ((%complex-p obj)  'complex)
+    ((characterp obj)
+     ;; standard-char for the printing ASCII range, else character.
+     (let ((code (char-code obj)))
+       (if (and (>= code 32) (< code 127)) 'standard-char 'character)))
+    ;; A STRING is a vector of CHARACTER (CLHS 16.1): (SIMPLE-ARRAY CHARACTER (n)),
+    ;; or (VECTOR CHARACTER *) when it has a fill pointer or is adjustable -- not
+    ;; SIMPLE-BASE-STRING for every string, which called a fill-pointer string
+    ;; simple.  The size is * there because TYPEP here measures a vector by its
+    ;; LENGTH (the fill pointer), so a dimension would not round-trip.  Not simple
+    ;; either way: claiming SIMPLE-BASE-STRING made (coerce x (type-of x)) copy
+    ;; a fill-pointer string (COERCE.1).
+    ((stringp obj)
+     (if (simple-string-p obj)
+         (list 'simple-array 'character (list (length obj)))
+         (list 'vector 'character '*)))
+    ((%generic-function-p obj) 'standard-generic-function)
+    ((functionp obj) 'function)
+    ((consp obj) 'cons)
+    ((hash-table-p obj) 'hash-table)
+    ((packagep obj) 'package)
+    ((readtablep obj) 'readtable)
+    ((random-state-p obj) 'random-state)
+    ((symbolp obj) (if (keywordp obj) 'keyword 'symbol))
+    ;; packed single-float vector (subtag #x12)
+    ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x12))
+     (list 'simple-array 'single-float (list (length obj))))
+    ;; Other arrays by their ELEMENT TYPE: a byte vector is
+    ;; (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (n)), not SIMPLE-VECTOR (CLHS: a
+    ;; simple-vector holds T).  Non-simple (fill pointer) vectors as for strings.
+    ((vectorp obj)
+     (let ((et (array-element-type obj)))
+       (cond ((array-has-fill-pointer-p obj) (list 'vector et '*))
+             ((eq et t) (list 'simple-vector (length obj)))
+             (t (list 'simple-array et (list (length obj)))))))
+    ((arrayp obj)
+     (list 'simple-array (array-element-type obj) (array-dimensions obj)))
+    (t t)))
+
+;;; ---------- typep: stream subtype dispatch (CLHS 21.1.3) -----------------
+;;;
+;;; cl-conditions.lisp's TYPEP handles 'STREAM and 'FILE-STREAM but not the
+;;; other concrete stream subtypes ('STRING-STREAM, 'BROADCAST-STREAM,
+;;; 'CONCATENATED-STREAM, 'ECHO-STREAM, 'SYNONYM-STREAM, 'TWO-WAY-STREAM).
+;;; Modus's call resolution is "last-defun-wins" with no way to call the
+;;; previous binding from a replacement (a wrapper would loop via recursion).
+;;; Re-implement here with the cl-conditions body verbatim plus the new
+;;; stream-subtype clauses inserted at the top of the symbol-name branch.
+;;; cl-streams.lisp owns the predicates (STRING-STREAM-P etc).
+
+;;; ---- user DEFTYPE expansion ----------------------------------------
+;;; Runtime (eval '(deftype NAME (params) body)) stores (params . body)
+;;; in *%runtime-deftype-table* keyed by the upcased NAME string (see
+;;; cl-eval.lisp).  TYPEP / SUBTYPEP did not consult it, so a user
+;;; deftype used as a type specifier always fell through to NIL/unknown.
+;;; %expand-deftype binds the deftype params (a full lambda-list with
+;;; &optional/&key) to the *unevaluated* type arguments and evaluates the
+;;; body to the expanded type specifier, which the caller re-checks.
+(defun %deftype-lookup (head)
+  "If HEAD names a user deftype, return its (params . body); else NIL.
+
+   PER-PACKAGE FIRST (task #241): HEAD's OWN package's registration wins
+   over the bare last-writer-wins entry, so DA::TY and DB::TY are different
+   types (CLHS 11.1) instead of aliases — and so a deftype that expands into
+   another package's same-named type terminates instead of recursing until
+   the stack is gone (probes/hang-deftype.lisp, rc 139).  The bare entry is
+   the FALLBACK, not deleted: heads with no resolvable package (native MVM
+   syms, build-time registrations) must resolve exactly as before.
+
+   This runs on the TYPEP path, so %DEFTYPE-PKG-GET compares package OBJECTS
+   with EQ and touches nothing re-entrant — see the 8efb421 note on
+   %CLOS-PKG-OBJ-COMPATIBLE."
+  (and *%runtime-deftype-table*
+       (symbolp head)
+       (let ((nm (%eval-sym-name head)))
+         (and nm (or (%deftype-pkg-get head nm)
+                     (gethash nm *%runtime-deftype-table*))))))
+
+(defun %subtypep-deftype-head-p (type)
+  "True iff TYPE's head (the symbol itself when atomic, or (car TYPE)
+   when compound) names a user DEFTYPE registered in
+   *%runtime-deftype-table*.  Used by %subtypep-result to decide whether
+   to expand TYPE before applying the built-in subtype lattice."
+  (let ((head (if (consp type) (car type) type)))
+    (and (symbolp head) (%deftype-lookup head) t)))
+
+(defun typep (obj type)
+  (when (or (eq type 'values)
+            (and (consp type)
+                 (or (eq (car type) 'values)
+                     (eq (car type) 'function))))
+    (error "typep: this type-specifier is not legal here"))
+  (cond
+    ((%clos-class-p type)
+     (typep obj (aref type 1)))
+    ((%class-proxy-p type)
+     (typep obj (aref type 1)))
+    ;; AN INSTANCE OF A NAMED CLASS, first.  Otherwise a (typep x 'my-class) --
+    ;; what every ETYPECASE over an app's own classes asks -- walked ~90 built-in
+    ;; names, the struct and condition registries, and only then the CPL: 3 us
+    ;; native.  This answers only YES (TYPE is EQ to a class in OBJ's CPL, which
+    ;; is the answer the CPL walk at the bottom gives); anything else falls
+    ;; through to the full test unchanged.
+    ((and (symbolp type) (%clos-instance-p obj) (%clos-cpl-has-p obj type)) t)
+    ((not (consp type))
+     (let ((tn type))
+       (cond
+         ;; Stream subtype names — new clauses added on top of the
+         ;; cl-conditions baseline.
+         ((eq tn 'stream)             (streamp obj))
+         ((eq tn 'file-stream)        (file-stream-p obj))
+         ((eq tn 'string-stream)      (string-stream-p obj))
+         ((eq tn 'broadcast-stream)   (broadcast-stream-p obj))
+         ((eq tn 'concatenated-stream) (concatenated-stream-p obj))
+         ((eq tn 'echo-stream)        (echo-stream-p obj))
+         ((eq tn 'synonym-stream)     (synonym-stream-p obj))
+         ((eq tn 'two-way-stream)     (two-way-stream-p obj))
+         ((eq tn 'package) (packagep obj))
+         ((eq tn 'keyword) (keywordp obj))
+         ((eq tn 'integer) (integerp obj))
+         ((eq tn 'fixnum) (fixnump obj))
+         ((eq tn 'bignum) (bignump obj))
+         ((eq tn 'real) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((eq tn 'rational) (or (integerp obj) (ratiop obj)))
+         ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((eq tn 'float) (floatp-impl obj))
+         ;; Per-type identity by declared subtag (numeric tower N1).  Modus
+         ;; uses the standard SBCL aliasing short-float==single-float and
+         ;; long-float==double-float, so single-float-p/double-float-p
+         ;; (which accept the alias subtags) implement all four predicates.
+         ((eq tn 'single-float) (single-float-p obj))
+         ((eq tn 'short-float)  (single-float-p obj))
+         ((eq tn 'double-float) (double-float-p obj))
+         ((eq tn 'long-float)   (double-float-p obj))
+         ((eq tn 'ratio) (ratiop obj))
+         ((eq tn 'cons) (consp obj))
+         ((eq tn 'list) (or (null obj) (consp obj)))
+         ((eq tn 'null) (null obj))
+         ;; NB: the old branch had `(integerp obj)` — a leftover from when
+         ;; native MVM symbols were bare hash fixnums.  It made
+         ;; (typep 1 'symbol) → T and broke typecase.2/.3, ctypecase.3,
+         ;; etypecase.3.  Dropped.  NIL and T must still be reported as
+         ;; symbols (CLHS) — keep them explicit since the live symbolp
+         ;; here doesn't reliably cover NIL in this build.
+         ((eq tn 'symbol) (or (null obj) (eq obj t) (symbolp obj)))
+         ((eq tn 'string) (stringp obj))
+         ((eq tn 'simple-string) (simple-string-p obj))
+         ((eq tn 'base-string) (stringp obj))
+         ((eq tn 'simple-base-string) (simple-string-p obj))
+         ((eq tn 'character) (characterp obj))
+         ((eq tn 'base-char) (characterp obj))
+         ((eq tn 'standard-char) (characterp obj))
+         ((eq tn 'atom) (not (consp obj)))
+         ((eq tn 't) t)
+         ((eq tn 'nil) nil)
+         ((eq tn 'boolean) (or (null obj) (eq obj t)))
+         ((eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
+         ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
+         ((eq tn 'signed-byte) (integerp obj))
+         ((eq tn 'array)         (or (arrayp obj) (stringp obj)))
+         ((eq tn 'simple-array)  (or (arrayp obj) (stringp obj)))
+         ((eq tn 'vector)        (or (arrayp obj) (stringp obj)))
+         ;; SIMPLE-VECTOR = (simple-array t (*)) — element-type T only.
+         ;; A byte-packed u8 vector (subtag #x11) has element-type
+         ;; (unsigned-byte 8), so it is NOT a simple-vector.
+         ((eq tn 'simple-vector) (and (or (arrayp obj) (stringp obj))
+                                      (not (eql (obj-subtag obj) #x11))
+                                      ;; packed single-float vector (#x12)
+                                      (not (eql (obj-subtag obj) #x12))))
+         ((eq tn 'bit-vector)    (arrayp obj))
+         ((eq tn 'simple-bit-vector) (arrayp obj))
+         ;; CLHS 4.3: the SEQUENCE system class is exactly (or list vector).
+         ;; A multi-dimensional array is an ARRAY but NOT a sequence, so the
+         ;; rank must be checked — `(typep (make-array '(2 2)) 'sequence)' is
+         ;; NIL in SBCL/CCL.  With the old unconditional ARRAYP, alexandria's
+         ;; PROPER-SEQUENCE (`(or proper-list (and (not list) sequence))')
+         ;; answered T for #2A((1 2) (3 4)).  ARRAYP is checked BEFORE CONSP
+         ;; because Modus' adjustable/displaced array wrappers are themselves
+         ;; cons-shaped and would otherwise skip the rank test.
+         ((eq tn 'sequence)      (cond ((stringp obj) t)
+                                       ((arrayp obj) (= (array-rank obj) 1))
+                                       (t (or (null obj) (consp obj)))))
+         ((eq tn 'function)      (or (functionp obj) (%generic-function-p obj)))
+         ((eq tn 'compiled-function) (functionp obj))
+         ((eq tn 'generic-function) (%generic-function-p obj))
+         ((eq tn 'standard-generic-function) (%generic-function-p obj))
+         ((eq tn 'standard-method) (%standard-method-p obj))
+         ((eq tn 'method) (%standard-method-p obj))
+         ((eq tn 'method-combination) (%mc-p obj))
+         ((eq tn 'hash-table)    (hash-table-p obj))
+         ((eq tn 'readtable)     (readtablep obj))
+         ((eq tn 'random-state)  (random-state-p obj))
+         ((eq tn 'condition) (%condition-p obj))
+         ;; A CLOS class object is itself an instance of STANDARD-OBJECT
+         ;; (and CLASS / STANDARD-CLASS / METAOBJECT / T).  CLHS 4.3.7.
+         ((eq tn 'standard-object) (or (%clos-instance-p obj)
+                                       (%clos-class-p obj)))
+         ((eq tn 'class) (%clos-class-p obj))
+         ;; STANDARD-CLASS only for user (defclass) classes — those whose
+         ;; CPL (slot 4) includes STANDARD-OBJECT.  Built-in classes that
+         ;; happen to be registered as %clos-class arrays (e.g. a proxy
+         ;; promoted for PATHNAME) do NOT have STANDARD-OBJECT in their CPL,
+         ;; so they are correctly excluded — prevents
+         ;; all-standard-classes-are-subtypes-of-standard-object from
+         ;; collecting LOGICAL-PATHNAME / PATHNAME.
+         ((eq tn 'standard-class)
+          (and (%clos-class-p obj)
+               (and (member 'standard-object (aref obj 4)) t)))
+         ((eq tn 'built-in-class) nil)
+         ((eq tn 'structure-class) nil)
+         ((eq tn 'metaobject) (%clos-class-p obj))
+         ((eq tn 'restart) (%active-restart-p obj))
+         (t (cond
+              ;; Struct instance — when OBJ is a struct, decide membership
+              ;; from the instance's own slot-1 type-name (and :include
+              ;; ancestry).  This works WITHOUT a registered descriptor for
+              ;; TN: the compile-time defstruct registration thunk may not
+              ;; have run at boot, but the instance still carries its type.
+              ;; structure-1-1 / structure-1-4 depend on this.
+              ((%struct-instance-p obj) (%struct-instance-named-p obj tn))
+              ;; Registered struct type — fall back to the registry walk
+              ;; (covers (typep non-struct 'struct-type) → NIL too).
+              ((%find-struct-type tn) (%struct-instance-typep obj tn))
+              ((%cond-reg-find tn) (%condition-typep obj tn))
+              ((%clos-instance-p obj)
+               (let ((cpl (%obj-cpl obj))
+                     (found nil))
+                 (let ((c cpl))
+                   (loop
+                     (when (null c) (return found))
+                     (let ((cur (car c)))
+                       (when (and (cond
+                                    ((eq cur tn) t)
+                                    ((and (%native-mvm-sym-p cur)
+                                          (%native-mvm-sym-p tn))
+                                     (= (%native-mvm-sym-hash cur)
+                                        (%native-mvm-sym-hash tn)))
+                                    ;; Compare 3-slot CL syms by NAME-HASH
+                                    ;; (slot 0), NOT by %cl-sym-name string —
+                                    ;; names lazy-resolve through
+                                    ;; *SYM-NAME-TABLE*, which only covers
+                                    ;; symbols harvested from a few chapter
+                                    ;; dirs.  For two class names absent from
+                                    ;; the table (e.g. CHANGE-CLASS-CLASS-01A
+                                    ;; vs -01B from objects/), %cl-sym-name
+                                    ;; returned "" for BOTH sides and
+                                    ;; (string-equal "" "") made TYPEP match
+                                    ;; EVERY class — change-class.1.x failed
+                                    ;; on (typep obj 'other-class) → T.
+                                    ((and (%cl-sym-p cur) (%cl-sym-p tn))
+                                     (= (%cl-sym-hash cur) (%cl-sym-hash tn)))
+                                    (t nil))
+                                  ;; Package-discriminated (#241): the hash
+                                  ;; compares above carry no package, so TYPEP
+                                  ;; used to report a DA::CLS instance as a
+                                  ;; DB::CLS.  Guarded, not deleted -- see
+                                  ;; %CLOS-CLASS-NAME-EQ.
+                                  (or (eq cur tn) (%gf-pkg-compatible cur tn)))
+                         (setq found t) (return found)))
+                     (setq c (cdr c))))))
+              ;; User DEFTYPE name used as an atomic type specifier —
+              ;; expand it and re-check (deftype.7/.9+ define (sym) types).
+              ((%deftype-lookup tn)
+               (typep obj (%expand-deftype tn)))
+              (t nil))))))
+    ((%class-proxy-p type)
+     (typep obj (%class-proxy-name type)))
+    (t
+     (let ((head (car type)))
+       (cond
+         ((eq head 'real)
+          (if (or (integerp obj) (floatp-impl obj) (ratiop obj))
+              (let ((low (if (cdr type) (cadr type) '*))
+                    (high (if (cddr type) (caddr type) '*)))
+                (typep-range-check obj low high))
+              nil))
+         ((eq head 'integer)
+          (if (integerp obj)
+              (let ((low (if (cdr type) (cadr type) '*))
+                    (high (if (cddr type) (caddr type) '*)))
+                (typep-range-check obj low high))
+              nil))
+         ((or (eq head 'float) (eq head 'single-float)
+              (eq head 'double-float) (eq head 'short-float) (eq head 'long-float))
+          (if (floatp-impl obj)
+              (let ((low (if (cdr type) (cadr type) '*))
+                    (high (if (cddr type) (caddr type) '*)))
+                (typep-range-check obj low high))
+              nil))
+         ((eq head 'rational)
+          (if (or (integerp obj) (ratiop obj))
+              (let ((low (if (cdr type) (cadr type) '*))
+                    (high (if (cddr type) (caddr type) '*)))
+                (typep-range-check obj low high))
+              nil))
+         ((eq head 'eql)
+          (eql obj (cadr type)))
+         ((eq head 'member)
+          (if (member obj (cdr type)) t nil))
+         ((eq head 'and)
+          (let ((ok t))
+            (dolist (sub (cdr type))
+              (unless (typep obj sub) (setq ok nil)))
+            ok))
+         ((eq head 'or)
+          (let ((ok nil))
+            (dolist (sub (cdr type))
+              (when (typep obj sub) (setq ok t)))
+            ok))
+         ((eq head 'not)
+          (not (typep obj (cadr type))))
+         ((eq head 'satisfies) (and (funcall (cadr type) obj) t))
+         ((eq head 'unsigned-byte)
+          (and (integerp obj) (>= obj 0)
+               (< obj (ash 1 (cadr type)))))
+         ((eq head 'signed-byte)
+          (and (integerp obj)
+               (let ((half (ash 1 (- (cadr type) 1))))
+                 (and (>= obj (- 0 half)) (< obj half)))))
+         ((eq head 'mod)
+          (and (integerp obj) (>= obj 0) (< obj (cadr type))))
+         ((or (eq head 'bit-vector) (eq head 'simple-bit-vector))
+          (and (bit-vector-p obj)
+               (let ((sz (and (cdr type) (cadr type))))
+                 (or (null sz) (eq sz '*) (eq sz t)
+                     (and (integerp sz) (= sz (array-length obj)))))))
+         ((or (eq head 'string) (eq head 'simple-string)
+              (eq head 'base-string) (eq head 'simple-base-string))
+          (and (stringp obj)
+               (let ((sz (and (cdr type) (cadr type))))
+                 (or (null sz) (eq sz '*) (eq sz t)
+                     (and (integerp sz) (= sz (array-length obj)))))))
+         ;; Native MDA (subtag #x34): the legacy clause below only knows
+         ;; the #x31/#x32 vector subtags and the 9867654/8765432 cons
+         ;; wrappers, so a native multi-dim array (e.g. a #2a(...) reader
+         ;; literal, now built via %alloc-mda) falls through to NIL.
+         ;; Handle it here using array-rank / array-dimensions, which both
+         ;; understand MDA.  Covers (array ELT DIMS) and (vector ELT SIZE).
+         ((and (or (eq head 'vector) (eq head 'simple-vector)
+                   (eq head 'simple-array) (eq head 'array))
+               (%mda-p obj))
+          (let ((et   (and (cdr type) (%element-type-expand (cadr type))))
+                (dims (and (cddr type) (caddr type)))
+                (dims-given (and (cddr type) t)))
+            (and
+             ;; vector / simple-vector require rank 1
+             (if (or (eq head 'vector) (eq head 'simple-vector))
+                 (= (array-rank obj) 1)
+                 t)
+             ;; element-type: MDA-with-string-data → character family;
+             ;; otherwise element type is T.
+             (let ((str (%mda-stringp obj)))
+               (cond
+                 ((or (null et) (eq et '*)) t)
+                 ((eq et t) (not str))
+                 ((or (eq et 'character) (eq et 'base-char)
+                      (eq et 'standard-char)) str)
+                 ((eq et 'bit) nil)
+                 (t (not str))))
+             ;; dimension spec
+             (cond
+               ((not dims-given) t)
+               ((eq dims '*) t)
+               ((eq dims t) t)
+               ((null dims) (= (array-rank obj) 0))
+               ((integerp dims) (= dims (array-rank obj)))
+               ((consp dims)
+                (let ((actual (array-dimensions obj)) (spec dims) (ok t))
+                  (loop
+                    (when (or (and (null actual) (null spec)) (not ok))
+                      (return ok))
+                    (when (or (null actual) (null spec))
+                      (setq ok nil) (return ok))
+                    (let ((ad (car actual)) (sd (car spec)))
+                      (unless (or (eq sd '*) (eq sd t)
+                                  (and (integerp sd) (= sd ad)))
+                        (setq ok nil)))
+                    (setq actual (cdr actual))
+                    (setq spec (cdr spec)))))
+               (t nil)))))
+         ((or (eq head 'vector) (eq head 'simple-vector)
+              (eq head 'simple-array) (eq head 'array))
+          (let ((wrapped-dims
+                 (cond
+                   ((and (consp obj) (eql (car obj) 9867654)
+                         (consp (cdr obj)))
+                    (cadr obj))
+                   (t :no-wrapper))))
+          (let ((obj (cond
+                       ((and (consp obj) (eql (car obj) 9867654)
+                             (consp (cdr obj))) (cddr obj))
+                       ((and (consp obj) (eql (car obj) 8765432)) (cdr obj))
+                       (t obj))))
+          (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
+               (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
+                   (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12))
+               (let* ((et (and (cdr type) (%element-type-expand (cadr type))))
+                      (sz-given (and (cddr type) t))
+                      (sz (and (cddr type) (caddr type)))
+                      (is-string  (= (obj-subtag obj) #x31))
+                      (is-array   (= (obj-subtag obj) #x32))
+                      ;; Byte-packed (unsigned-byte 8) vector (subtag #x11):
+                      ;; element type is exactly (UNSIGNED-BYTE 8), NOT T.
+                      (is-u8      (= (obj-subtag obj) #x11))
+                      ;; Packed single-float vector (subtag #x12): element
+                      ;; type is exactly SINGLE-FLOAT, NOT T.
+                      (is-f32     (= (obj-subtag obj) #x12))
+                      (is-bitvec  (and is-array
+                                       (> (array-length obj) 0)
+                                       (bit-vector-p obj)))
+                      (et-ok
+                       (cond
+                         ;; u8 vector: matches (unsigned-byte 8) and integer
+                         ;; supertypes; NOT T / character / bit.
+                         (is-u8
+                          (cond
+                            ((or (null et) (eq et '*)) t)
+                            ((%u8-element-type-p et) t)
+                            ((or (eq et 'unsigned-byte) (eq et 'signed-byte)
+                                 (eq et 'integer) (eq et 'fixnum)
+                                 (eq et 'rational) (eq et 'real)
+                                 (eq et 'number) (eq et 'atom))
+                             t)
+                            ((and (consp et)
+                                  (eq (car et) 'unsigned-byte)
+                                  (consp (cdr et)) (integerp (cadr et))
+                                  (>= (cadr et) 8))
+                             t)
+                            ((and (consp et)
+                                  (or (eq (car et) 'signed-byte)
+                                      (eq (car et) 'integer)
+                                      (eq (car et) 'mod)))
+                             t)
+                            (t nil)))
+                         ;; f32 vector: single-float and its float/real/number
+                         ;; supertypes; NOT T / character / integer types.
+                         (is-f32
+                          (cond
+                            ((or (null et) (eq et '*)) t)
+                            ((or (eq et 'single-float) (eq et 'short-float)
+                                 (eq et 'float) (eq et 'real)
+                                 (eq et 'number) (eq et 'atom))
+                             t)
+                            (t nil)))
+                         ((or (null et) (eq et '*) (eq et t))
+                          (if (or (null et) (eq et '*))
+                              t
+                              (and is-array (not is-bitvec) (not is-string))))
+                         ((eq et 'character)            is-string)
+                         ((eq et 'base-char)            is-string)
+                         ((eq et 'standard-char)        is-string)
+                         ((eq et 'bit)                  is-bitvec)
+                         ;; Any other element type -- (unsigned-byte 8), an
+                         ;; integer type, a DEFTYPE -- is not CHARACTER, so a
+                         ;; STRING never has it.  A general array stays a match:
+                         ;; Modus does not track its element type.  This was
+                         ;; (t t), so (typep "abc" '(vector (unsigned-byte 8)))
+                         ;; was T and code telling octets from text (cl-marmot's
+                         ;; store hex-encodes octets and keeps strings) took a
+                         ;; string for bytes.
+                         (t (not is-string)))))
+                 (and et-ok
+                      (cond
+                        ((not sz-given) t)
+                        ((eq sz '*) t)
+                        ((eq sz t)  t)
+                        ((null sz)
+                         (and (not (eq wrapped-dims :no-wrapper))
+                              (null wrapped-dims)))
+                        ;; Integer third element: for VECTOR / SIMPLE-VECTOR
+                        ;; it's the SIZE ((vector elt N) ≡ length N); for
+                        ;; ARRAY / SIMPLE-ARRAY it's the RANK ((array elt N)
+                        ;; ≡ rank N) per CLHS.  This clause only sees non-MDA
+                        ;; objects (MDAs handled above), so rank is 1 for
+                        ;; vectors/strings, 0 only for the empty wrapped-dims.
+                        ;; (array t 1) on a vector → T; (array t 0) → NIL.
+                        ((integerp sz)
+                         (if (or (eq head 'vector) (eq head 'simple-vector))
+                             (= sz (array-length obj))
+                             (cond
+                               ((eq wrapped-dims :no-wrapper) (= sz 1))
+                               ((consp wrapped-dims) (= sz (length wrapped-dims)))
+                               ((null wrapped-dims) (= sz 0))
+                               (t (= sz 1)))))
+                        ((consp sz)
+                         (cond
+                           ((null (cdr sz))
+                            (cond
+                              ((eq wrapped-dims :no-wrapper)
+                               (or (eq (car sz) '*) (eq (car sz) t)
+                                   (and (integerp (car sz))
+                                        (= (car sz) (array-length obj)))))
+                              ((and (consp wrapped-dims)
+                                    (null (cdr wrapped-dims)))
+                               (or (eq (car sz) '*) (eq (car sz) t)
+                                   (and (integerp (car sz))
+                                        (= (car sz) (car wrapped-dims)))))
+                              (t nil)))
+                           (t
+                            (and (consp wrapped-dims)
+                                 (= (length sz) (length wrapped-dims))
+                                 (let ((ok t) (a sz) (b wrapped-dims))
+                                   (loop (when (null a) (return ok))
+                                     (let ((ad (car a)) (bd (car b)))
+                                       (unless (or (eq ad '*) (eq ad t)
+                                                   (and (integerp ad)
+                                                        (integerp bd)
+                                                        (= ad bd)))
+                                         (setq ok nil) (return nil)))
+                                     (setq a (cdr a)) (setq b (cdr b)))
+                                   ok)))))
+                        (t nil))))))))
+         ((eq head 'cons)
+          (and (consp obj)
+               (let ((car-type (and (cdr type) (cadr type)))
+                     (cdr-type (and (cddr type) (caddr type))))
+                 (and (or (null car-type) (eq car-type '*) (eq car-type t)
+                          (typep (car obj) car-type))
+                      (or (null cdr-type) (eq cdr-type '*) (eq cdr-type t)
+                          (typep (cdr obj) cdr-type))))))
+         ;; Compound user DEFTYPE — (deftype-name arg…); expand with the
+         ;; args bound and re-check (deftype.9-.18 parameterized types).
+         ((%deftype-lookup head)
+          (typep obj (%expand-deftype type)))
+         (t (if (%cond-reg-find head)
+                (%condition-typep obj head)
+                nil)))))))

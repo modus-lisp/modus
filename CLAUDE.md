@@ -90,7 +90,7 @@ mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   cl-clos.lisp         429L  CLOS (defclass, defgeneric, defmethod, dispatch)
   cl-eval.lisp       3,575L  Eval/compile/load (mvm-eval), symbol-function table
   cl-types.lisp        519L  typep, coerce, numeric helpers
-  ansi-bridge.lisp   1,888L  Test helpers (eqlt, scaffold, stubs)
+  ansi-test-aux.lisp         ANSI-test helpers (eqlt, scaffold, structures-03 stand-ins)
   gc.lisp                    GC helper functions (Lisp-side)
   mvm-eval.lisp                 Production eval: compile→MVM bytecode→interpret
   interp.lisp                MVM bytecode interpreter (in-image)
@@ -2284,7 +2284,7 @@ mechanism:
    `make-string` inside one compiled function -> main's 16 MB region collects
    -> death in the LOAD machinery (`load-read-error-stops-load` /
    `load-toplevel-form-swallowed`, TYPE-ERROR): the load loop
-   (`%load-from-stream`, mvm/ansi-bridge.lisp) reads and evals on main, and
+   (`%load-from-stream`, mvm/cl-eval.lisp) reads and evals on main, and
    the pre-hop stream/table structures in region 0 hold pointers into main's
    region that the collection never fixes — `EMIT-GC-TRAMPOLINE` scans the
    fixed tables' ROOT SLOTS and Cheney-walks only the collecting region's
@@ -2999,7 +2999,7 @@ call-counter branch on every call regardless of the syscall.  And syscall 201 is
 which made every `(- after before)` zero.
 
 Both now go through a seam — `%IRT-NS` / `%IRUN-NS`, defined at 0 in
-`mvm/ansi-bridge.lisp` ("this target has no clock") and overridden by
+`mvm/cl-fileio.lisp` ("this target has no clock") and overridden by
 last-defun-wins in `net/hosted-sync.lisp`, which is where `clock_gettime(2)` can
 be called at all because it owns the **per-CPU** timespec scratch (a shared
 timespec is two threads writing one buffer).  Real time is CLOCK_MONOTONIC, run

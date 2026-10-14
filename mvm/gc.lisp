@@ -260,7 +260,7 @@
 ;;; fixnum with no shifting here.  Ticks, not nanoseconds: the collector must
 ;;; not divide (and must not allocate), so the scaling is the reader's job —
 ;;; see %GC-PAUSE-MS below, which needs (cntfrq) and therefore lives in
-;;; mvm/ansi-bridge.lisp rather than in this allocation-free file.
+;;; mvm/cl-fileio.lisp rather than in this allocation-free file.
 ;;;
 ;;; ONLY the native aarch64 trampoline writes these.  On x64/i386 the words are
 ;;; readable (the metadata window is mapped well past 0x10001000 on both) and

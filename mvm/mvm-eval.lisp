@@ -4325,7 +4325,7 @@
   tname)
 
 (defun %expand-deftype (type)
-  "OVERRIDE (mvm-eval images; last-defun-wins) of ansi-bridge's engine stub:
+  "The deftype engine (mvm-eval images):
    route the deftype body eval through the mvm-eval lambda-body entry, cached
    per registration (%DEFTYPE-EXPANDER).  A deftype body mvm-eval can't
    compile SIGNALS (the tree-walker is deleted)."

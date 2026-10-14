@@ -249,7 +249,7 @@
     (mvm-text "mvm/cl-types.lisp")     (string #\Newline)
     (mvm-text "mvm/cl-packages.lisp")  (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp") (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")  (string #\Newline)))
+    (mvm-text "mvm/ansi-test-aux.lisp")  (string #\Newline)))
 (format t "Fixpoint runtime source: ~D chars~%" (length *fixpoint-runtime-source*))
 
 ;;; ============================================================

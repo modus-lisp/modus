@@ -293,3 +293,35 @@
 (defun make-synonym-stream (sym)
   (%make-stream 7 sym))
 
+
+;;; ============================================================
+;;; CL Constants
+;;; ============================================================
+(defvar *terminal-io* nil)
+
+(defvar *standard-input* nil)
+
+(defvar *standard-output* nil)
+
+;;; FORCE-OUTPUT — check for too many args (accepts 0 or 1)
+(defun force-output (&rest args)
+  (if (cdr args)
+      (%program-error "force-output requires 0 or 1 arguments")
+      nil))
+
+;;; FINISH-OUTPUT — check for too many args
+(defun finish-output (&rest args)
+  (if (cdr args)
+      (%program-error "finish-output requires 0 or 1 arguments")
+      nil))
+
+;;; READ-CHAR — strict at most 4 args
+(defun read-char (&rest args)
+  (if (and args (cdr args) (cddr args) (cdddr args) (cddddr args))
+      (%program-error "read-char requires at most 4 arguments")
+      (let ((stream (if args (car args) nil))
+            ;; eof-errorp: default t when not supplied, use supplied value as-is
+            (eof-errorp (if (cdr args) (cadr args) t))
+            (eof-value (if (cddr args) (caddr args) nil)))
+        (let ((s (%resolve-input-stream stream)))
+          (%read-char-from-stream s eof-errorp eof-value)))))

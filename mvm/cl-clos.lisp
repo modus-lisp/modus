@@ -1148,7 +1148,7 @@
         ;; Use name/hash-robust equality (not raw EQ): a class defined at
         ;; runtime-EVAL time interns its slot-name symbols as one object,
         ;; while a query symbol arriving from a *different* compilation unit
-        ;; (e.g. map-slot-exists-p* walking a quoted list in ansi-bridge, or
+        ;; (e.g. map-slot-exists-p* walking a quoted list in ansi-test-aux, or
         ;; an eval'd test body) can be a distinct native-MVM-sym / CL-sym
         ;; wrapper with the SAME name+hash.  Mirrors the condition-slot path
         ;; and %collect-all-slots, which already key by name/hash.
@@ -2038,31 +2038,7 @@
       (%class-proxy-name cls)
       nil)))
 
-(defun class-of (x)
-  "Return the class of X.  Per ANSI 4.3.1, every object has a class.
-   For CLOS instances we look up the registered class; for everything
-   else we hand back a class-proxy keyed on the built-in type so
-   things like (class-of 5) → integer-class behave sensibly with
-   (typep ... 'class) and (class-name ...)."
-  (cond
-    ((%clos-instance-p x)
-     (%find-clos-class (aref x 1)))
-    ((%clos-class-p x)
-     ;; A class object is itself an instance of standard-class.
-     (or (%find-clos-class 'standard-class)
-         (let ((proxy (make-array 2)))
-           (aset proxy 0 '%class-proxy)
-           (aset proxy 1 'standard-class)
-           proxy)))
-    (t
-     ;; Any other value — synthesize a class-proxy for its type-of name
-     ;; so callers get an object that responds to class-name and typep.
-     (let ((type-name (%type-of-for-dispatch x)))
-       (or (%find-clos-class type-name)
-           (let ((proxy (make-array 2)))
-             (aset proxy 0 '%class-proxy)
-             (aset proxy 1 type-name)
-             proxy))))))
+
 
 ;;; ============================================================
 ;;; MOP accessors — class introspection
@@ -2210,9 +2186,7 @@
          (%defclass name slots supers)
          (%find-clos-class name))))))
 
-(defun slot-value (obj slot-name)
-  "Read slot SLOT-NAME from CLOS instance OBJ."
-  (%slot-value obj slot-name))
+
 
 (defun slot-boundp (obj slot-name)
   "True if slot SLOT-NAME of OBJ is bound."
@@ -3774,8 +3748,8 @@
    dispatch.  Called from the synthetic primary built by
    %gf-dispatch-standard when no user primary is applicable.
 
-   Dispatches on the GF name and calls the matching default helper in
-   ansi-bridge.lisp directly — those helpers internally bypass GF
+   Dispatches on the GF name and calls the matching default helper (later
+   in this file) directly — those helpers internally bypass GF
    dispatch so this can't loop back into %gf-dispatch-standard.
 
    Uses %gf-name-is-p (eq + symbol-name string-equal) because Modus's
@@ -3801,14 +3775,14 @@
 
 ;; Default-primary trampolines.  Each forwards an args list (instance
 ;; / new-class / etc., followed by initargs) to the matching default-fn
-;; in ansi-bridge.lisp without going through GF dispatch.  Defined as
+;; later in this file without going through GF dispatch.  Defined as
 ;; weak forward-references via top-level defun stubs — the real bodies
-;; are defined later via last-defun-wins; if ansi-bridge.lisp's
+;; are defined later via last-defun-wins; if those
 ;; %shared-initialize-default isn't loaded yet for some reason, the
 ;; stub returns NIL rather than crashing.
 (defun %shared-initialize-via-args (args)
   ;; (apply #'%shared-initialize-default args)
-  ;; %shared-initialize-default exists in ansi-bridge.lisp; here we
+  ;; %shared-initialize-default is defined later in this file; here we
   ;; spread by hand since (apply fn args) on a captured arg can lose
   ;; trailing elements past the register-arg limit (CLAUDE.md known
   ;; bug 7).  Same shape as %shared-init-default-spread.
@@ -3830,9 +3804,9 @@
 (defun %reinitialize-instance-via-args (args)
   (cond
     ((null args) nil)
-    ;; reinitialize-instance default body lives in ansi-bridge.lisp;
-    ;; the canonical bypass path there is `reinitialize-instance` (see
-    ;; ansi-bridge:3035) which itself dispatches.  Instead, follow the
+    ;; reinitialize-instance's default body lives later in this file;
+    ;; the canonical bypass path there is `reinitialize-instance`, which
+    ;; itself dispatches.  Instead, follow the
     ;; same pattern as shared-initialize: instance + (t) covers the
     ;; "init non-changed slots" semantics per CLHS.
     (t (apply #'%shared-initialize-default
@@ -3899,7 +3873,7 @@
   ;; the standard primary for that GF when no user primary is
   ;; applicable.  %gf-dispatch-standard calls (apply (symbol-function
   ;; SYM) args) with the GF's runtime args.  The functions named here
-  ;; live in ansi-bridge.lisp (which loads after cl-clos.lisp) and MUST
+  ;; are defined later in this file and MUST
   ;; bypass GF dispatch internally — otherwise the fallback would
   ;; re-enter %gf-dispatch-standard infinitely.
   ;;
@@ -4206,8 +4180,8 @@
       ;; Hardwired fallbacks for the standard CLOS GFs.  When the GF
       ;; has only auxiliary methods (:before / :after / :around) the
       ;; CLHS-mandated system primary still runs — we synthesize a
-      ;; fake primary that delegates to a bypass helper in
-      ;; ansi-bridge.lisp (%shared-initialize-via-args et al).
+      ;; fake primary that delegates to a bypass helper
+      ;; (%shared-initialize-via-args et al., above).
       ;;
       ;; Closure representation: use the is-eql-p heap-cell pattern
       ;; (%make-closure + top-level helper + %get-cenv) because the
@@ -6459,57 +6433,7 @@
          (if (%bulk-copy-ok-p r seq)
              (progn (%bulk-copy r 0 seq 0 (length seq)) r)
              (dotimes (i (length seq) r) (aset r i (aref seq i))))))))
-(defun sqrt (n)
-  "Square root.  Returns:
-   - exact integer for perfect-square integer input,
-   - rational approximation otherwise (Newton's method on n/1
-     with 10000:1 precision scaling — gives ~4 digit precision).
-   - For rational/float input %r/d% computes sqrt(r*d)/d scaled."
-  (cond
-    ((integerp n)
-     (when (< n 0) (error "sqrt of negative"))
-     (let ((s (isqrt n)))
-       (if (= (* s s) n)
-           s
-           ;; Newton's method on scaled value: sqrt(n*K^2)/K for precision.
-           (let* ((K 10000)
-                  (scaled (* n K K))
-                  (approx (isqrt scaled)))
-             (%make-rat approx K)))))
-    ((ratiop n)
-     (let* ((num (ratio-numerator n))
-            (den (ratio-denominator n)))
-       (when (< num 0) (error "sqrt of negative"))
-       ;; sqrt(a/b) = sqrt(a*b)/b for b>0.
-       (let ((s (isqrt (* num den))))
-         (if (= (* s s) (* num den))
-             (%make-rat s den)
-             (let* ((K 10000)
-                    (approx (isqrt (* num den K K))))
-               (%make-rat approx (* den K)))))))
-    ;; Boxed float-as-array (subtag #x32 with 2 slots, slot0=num slot1=den):
-    ;; treat as ratio and recurse.
-    ((and (not (fixnump n)) (not (consp n)) (not (null n))
-          (= (obj-subtag n) #x32)
-          (= (array-length n) 2))
-     (let ((num (aref n 0)) (den (aref n 1)))
-       (sqrt (if (= den 1) num (%make-rat num den)))))
-    ;; IEEE float input — Newton's method via %float-mul / -add / -div.
-    ;; Converges in ~4 iterations for typical inputs.  Without this
-    ;; branch (sqrt 4.0) fell through to (t 0).
-    ((%ieee-float-p n)
-     (cond
-       ((%float-zero-p n) n)
-       (t (let ((half (%float-div (%float-from-int 1) (%float-from-int 2)))
-                (x n))
-            ;; x_{i+1} = (x_i + n/x_i) / 2
-            (let ((i 0))
-              (loop
-                (when (>= i 8) (return x))
-                (setq x (%float-mul (%float-add x (%float-div n x)) half))
-                (setq i (+ i 1))))
-            x))))
-    (t 0)))
+
 (defun %aset-store-val (arr val)
   "Compute the raw value to store via ASET for destination array ARR.
    Public (setf (aref STRING i) ch) accepts a CHARACTER; the underlying
@@ -6610,5 +6534,990 @@
       ((%ieee-float-p n) n)
       (t (%round-to-single f)))))
 (defun rational (n) n)
-(defun rationalize (n) n)
 
+
+;;; ============================================================
+;;; CLOS MOP Stubs
+;;; ============================================================
+(defun allocate-instance (class &rest initargs)
+  "Allocate a new instance of CLASS (a class object or class name).
+   All slots are unbound; initforms are NOT applied (per ANSI: that
+   happens in initialize-instance, not allocate-instance)."
+  (let ((class-name (cond
+                      ((symbolp class) class)
+                      ((%clos-class-p class) (aref class 1))
+                      (t nil))))
+    (when (null class-name) (return-from allocate-instance nil))
+    (%make-instance class-name)))
+
+(defun %slot-name-member (nm slot-names)
+  "Name-robust membership of slot-name NM in the list SLOT-NAMES.  Uses
+   %clos-sym-name-eq (slot-0 hash) rather than EQL: SLOT-NAMES arriving
+   from an mvm-eval-evaluated test body (e.g. (shared-initialize obj '(a c)))
+   are interned by mvm-eval's in-image %INTERN-SYMBOL into objects that are
+   NOT eql to the class's natively-registered slot-name symbols, so the
+   old plain (member nm slot-names) silently missed every slot under
+   mvm-eval — shared-initialize then applied no initforms (slots stayed
+   -999, the shared-initialize mvm-eval divergence cluster)."
+  (let ((cur slot-names))
+    (loop
+      (when (null cur) (return nil))
+      (when (%clos-sym-name-eq nm (car cur)) (return t))
+      (setq cur (cdr cur)))))
+
+(defun %shared-initialize-default (instance slot-names &rest initargs)
+  "Default method body for SHARED-INITIALIZE.
+   Per ANSI:
+     - For each slot-name in INSTANCE's class:
+       1. If an initarg in INITARGS names this slot, set to its value (leftmost wins).
+       2. Else if (eq slot-names t) or (member slot-name slot-names),
+          and slot is currently unbound, apply initform if present.
+       3. Else leave slot alone.
+   Returns INSTANCE."
+  (when (or (null instance) (not (%clos-instance-p instance)))
+    (return-from %shared-initialize-default instance))
+  (let* ((class-name (aref instance 1))
+         (cls (%find-clos-class class-name)))
+    (when (null cls) (return-from %shared-initialize-default instance))
+    (let* ((slot-list (aref cls 2))
+           (inst-len (array-length instance))
+           (set-slots nil))
+      ;; 1. Apply initargs first (leftmost wins).
+      (let ((cur initargs))
+        (loop
+          (when (null cur) (return nil))
+          (when (null (cdr cur)) (return nil))
+          (let* ((key (car cur))
+                 (val (car (cdr cur)))
+                 ;; CLHS 7.1.4: one initarg may name several slots.
+                 (slots (%clos-initarg-to-slots class-name key)))
+            (let ((sc slots))
+              (loop
+                (when (null sc) (return nil))
+                (let ((slot-nm (car sc)))
+                  (when (not (member slot-nm set-slots))
+                    (let ((idx (%clos-slot-index cls slot-nm)))
+                      ;; idx is -1 (not found) or 0..n-1 — use `(>= idx 0)`
+                      ;; to filter not-found.  See %clos-slot-index docstring
+                      ;; for the AArch64 rationale (the previous nil sentinel
+                      ;; collided with fixnum 0 on slot 0).
+                      (when (and (>= idx 0) (< (+ 2 idx) inst-len))
+                        (aset instance (+ 2 idx) val)
+                        (setq set-slots (cons slot-nm set-slots))))))
+                (setq sc (cdr sc)))))
+          (setq cur (cdr (cdr cur)))))
+      ;; 2. Then apply initforms for slots in slot-names that are still unbound.
+      (let ((sn slot-list) (idx 0))
+        (loop
+          (when (null sn) (return nil))
+          (when (< (+ 2 idx) inst-len)
+            (let* ((nm (car sn))
+                   (already-set (member nm set-slots))
+                   (covered (cond ((eq slot-names t) t)
+                                  ((null slot-names) nil)
+                                  (t (%slot-name-member nm slot-names))))
+                   (cur-val (aref instance (+ 2 idx)))
+                   (was-unbound (and (fixnump cur-val) (= cur-val -999))))
+              (when (and (not already-set) covered was-unbound)
+                (let ((thunk (%clos-initform-thunk class-name nm)))
+                  (when thunk
+                    (aset instance (+ 2 idx) (funcall thunk)))))))
+          (setq idx (+ idx 1))
+          (setq sn (cdr sn))))
+      instance)))
+
+(defun %dispatch-shared-init (args)
+  "Inline dispatch for SHARED-INITIALIZE.  Direct call to default fn
+   when no user methods exist on the GF (cheap path); GF dispatch when
+   they do.  funcall on a quoted symbol would require the symbol-function
+   table to know about the default, which it doesn't for our internal
+   helpers — so we call the bare defun by name in the fast path."
+  (let ((gf (%find-gf 'shared-initialize)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (%shared-init-default-spread args)))
+        (%shared-init-default-spread args))))
+
+(defun %shared-init-apply-initargs (instance class-name initargs set-slots-acc)
+  "Apply initargs list to INSTANCE.  Avoids %shared-initialize-default's
+   funcall+&rest path (which loses trailing args).  Returns the
+   updated set-slots accumulator (alist of slot-name → t)."
+  (let ((cur initargs) (acc set-slots-acc))
+    (loop
+      (when (or (null cur) (null (cdr cur))) (return acc))
+      (let* ((key (car cur))
+             (val (car (cdr cur)))
+             ;; CLHS 7.1.4: one initarg may name several slots; set ALL of
+             ;; them (leftmost initarg wins per slot via the acc guard).
+             (slots (%clos-initarg-to-slots class-name key)))
+        (let ((sc slots))
+          (loop
+            (when (null sc) (return nil))
+            (let ((slot-nm (car sc)))
+              (when (null (member slot-nm acc :test #'eq))
+                (set-slot-value instance slot-nm val)
+                (setq acc (cons slot-nm acc))))
+            (setq sc (cdr sc)))))
+      (setq cur (cdr (cdr cur))))))
+
+(defun %shared-init-default-spread (args)
+  "ARGS is (instance slot-names &rest initargs) as a list.  Apply the
+   initargs and initforms directly, bypassing the &rest re-pack path
+   that loses trailing args.  Mirrors %shared-initialize-default's
+   semantics.
+
+   Per CLHS 7.1.2, MAKE-INSTANCE produces a 'defaulted initialization
+   argument list' = the explicit initargs PLUS any default-initargs whose
+   keys aren't already supplied.  Default-initarg thunks are eval'd here
+   (CLHS 7.1.4 requires re-evaluation per call).  Default-initargs that
+   map to slots also suppress those slots' :initform (per CLHS 7.1.4)."
+  (when (or (null args) (null (cdr args)))
+    (return-from %shared-init-default-spread nil))
+  (let* ((instance   (car args))
+         (slot-names (car (cdr args)))
+         (initargs   (cdr (cdr args))))
+    (when (or (null instance) (not (%clos-instance-p instance)))
+      (return-from %shared-init-default-spread instance))
+    (let* ((class-name (aref instance 1))
+           (cls        (%find-clos-class class-name)))
+      (when (null cls)
+        (return-from %shared-init-default-spread instance))
+      ;; Step 1: apply explicit initargs (leftmost wins).
+      (let ((set-slots (%shared-init-apply-initargs
+                        instance class-name initargs nil)))
+        ;; Step 2: walk default-initargs for the class (CPL-merged, most-
+        ;; specific first).  For each key NOT explicitly supplied in
+        ;; initargs, eval the thunk and apply it.  Default-initargs whose
+        ;; key maps to a slot suppress that slot's :initform via the
+        ;; set-slots accumulator.
+        ;;
+        ;; CLHS 7.1.4: default-initargs are part of MAKE-INSTANCE's
+        ;; "defaulted initialization argument list" — they are NOT applied
+        ;; by a bare SHARED-INITIALIZE / REINITIALIZE-INSTANCE call.  Only
+        ;; the make-instance entry paths bind *clos-applying-defaults* to T
+        ;; (shared-initialize.2.1: (shared-initialize obj t) must leave slot
+        ;; c — whose only initform source is (:default-initargs :c 100) —
+        ;; UNBOUND).
+        (when *clos-applying-defaults*
+          (let ((di-entries (%clos-default-initargs-for-class class-name)))
+            (let ((cur di-entries))
+              (loop
+                (when (null cur) (return nil))
+                (let* ((entry (car cur))
+                       (k (car entry))
+                       (thunk (cdr entry))
+                       (explicit-supplied (%initargs-has-key-p initargs k)))
+                  (unless explicit-supplied
+                    (let ((val (funcall thunk))
+                          ;; CLHS 7.1.4: a default-initarg's key may name
+                          ;; several slots; set ALL still-unset ones.
+                          (slots (%clos-initarg-to-slots class-name k)))
+                      (let ((sc slots))
+                        (loop
+                          (when (null sc) (return nil))
+                          (let ((slot-nm (car sc)))
+                            (when (null (member slot-nm set-slots :test #'eq))
+                              (set-slot-value instance slot-nm val)
+                              (setq set-slots (cons slot-nm set-slots))))
+                          (setq sc (cdr sc)))))))
+                (setq cur (cdr cur))))))
+        ;; Step 3: apply initforms for slots in slot-names still unbound.
+        (let ((sn (aref cls 2)) (idx 0))
+          (loop
+            (when (null sn) (return nil))
+            (let* ((nm (car sn))
+                   (already-set (member nm set-slots :test #'eq))
+                   (covered (cond ((eq slot-names t) t)
+                                  ((null slot-names) nil)
+                                  (t (%slot-name-member nm slot-names))))
+                   ;; Class-allocated slot? Check via per-class storage.
+                   (class-slot (%slot-class-owner class-name nm))
+                   (was-unbound
+                    (if class-slot
+                        (not (%class-slot-bound-p class-name nm))
+                        (let ((cur-val (aref instance (+ 2 idx))))
+                          (and (fixnump cur-val) (= cur-val -999))))))
+              (when (and (null already-set) covered was-unbound)
+                (let ((thunk (%clos-initform-thunk class-name nm)))
+                  (when thunk
+                    (set-slot-value instance nm (funcall thunk))))))
+            (setq idx (+ idx 1))
+            (setq sn (cdr sn))))
+        instance))))
+
+(defun %initargs-has-key-p (initargs key)
+  "True iff INITARGS plist contains KEY.  Uses %clos-initarg-key-equal
+   so the cl-symbol and native-MVM-symbol shapes for :foo both compare
+   correctly (cross-file identity has historical fragility)."
+  (let ((cur initargs))
+    (loop
+      (when (or (null cur) (null (cdr cur))) (return nil))
+      (when (%clos-initarg-key-equal (car cur) key) (return t))
+      (setq cur (cdr (cdr cur))))))
+
+(defun %clos-initarg-key-equal (a b)
+  "Compare two initarg keys (keyword/symbols) per the same rules used
+   internally by %clos-initarg-lookup-1.  Robust against native-MVM
+   vs CL-symbol identity drift on the same name."
+  (cond
+    ((eq a b) t)
+    ((and (%native-mvm-sym-p a) (%native-mvm-sym-p b))
+     (= (%native-mvm-sym-hash a) (%native-mvm-sym-hash b)))
+    ((and (%cl-sym-p a) (%cl-sym-p b))
+     (string-equal (%cl-sym-name a) (%cl-sym-name b)))
+    (t nil)))
+
+(defun shared-initialize (&rest %sh-args)
+  "SHARED-INITIALIZE generic function entry.  Falls through to
+   %shared-initialize-default unless user methods were defined.
+   CLHS: requires at least 2 args (instance + slot-names)."
+  (when (or (null %sh-args) (null (cdr %sh-args)))
+    (%signal-program-error))
+  ;; CLHS: the second argument is the slot-names designator — either T (all
+  ;; slots), NIL (no slots), or a proper list of slot-name symbols.  A
+  ;; non-T, non-list atom (e.g. the keyword :A in shared-initialize.error.3)
+  ;; is a type-error.  Also reject an improper / non-symbol-keyed initargs
+  ;; plist (odd length, etc.) per shared-initialize.error.4.
+  (let ((slot-names (car (cdr %sh-args)))
+        (initargs (cdr (cdr %sh-args))))
+    (when (and slot-names (not (eq slot-names t)) (not (consp slot-names)))
+      (%signal-type-error))
+    ;; initargs must form a proper, even-length plist whose keys are symbols
+    ;; (keywords or symbols).  A non-symbol key like the list (A B C) in
+    ;; shared-initialize.error.4 is a PROGRAM-ERROR (CLHS 7.1.2).
+    (let ((cur initargs))
+      (loop
+        (when (null cur) (return nil))
+        (when (not (consp cur)) (%signal-program-error))
+        (when (null (cdr cur)) (%signal-program-error))  ; odd-length
+        (let ((key (car cur)))
+          (when (not (or (symbolp key) (%cl-sym-p key)))
+            (%signal-program-error)))
+        (setq cur (cdr (cdr cur))))))
+  (%dispatch-shared-init %sh-args))
+
+(defun %change-class-validate-initargs (new-name initargs)
+  "CLHS 7.1.2-style initarg validity check for CHANGE-CLASS.
+   Signals PROGRAM-ERROR on a malformed plist (odd length, non-symbol
+   key) and ERROR on an initarg that doesn't initialize any slot of
+   NEW-NAME, unless :allow-other-keys is true (LEFTMOST occurrence
+   wins per CLHS 7.1.4 — change-class.1.10)."
+  (let ((aok-seen nil) (aok nil) (bad-key nil) (bad-key-p nil) (cur initargs))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (%signal-program-error))
+      (let ((key (car cur)) (val (car (cdr cur))))
+        (when (not (or (symbolp key) (%cl-sym-p key)))
+          (%signal-program-error))
+        (cond
+          ((%clos-initarg-key-equal key ':allow-other-keys)
+           (when (not aok-seen)
+             (setq aok-seen t)
+             (setq aok val)))
+          (t
+           ;; CLHS 7.2.2: the valid set is the slot :initargs of the NEW
+           ;; class UNIONED with the &key parameter names of the applicable
+           ;; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS / SHARED-INITIALIZE
+           ;; methods — NOT initialize-instance, which change-class never
+           ;; calls.  Checking slot initargs alone rejected the standard
+           ;; shape of passing data to a u-i-f-d-c :after method.
+           (when (null (%clos-change-class-initarg-valid-p new-name key))
+             (setq bad-key key)
+             (setq bad-key-p t)))))
+      (setq cur (cdr (cdr cur))))
+    ;; An applicable method with &ALLOW-OTHER-KEYS accepts any keyword.
+    (when (and bad-key-p (not aok)
+               (%clos-change-class-methods-aok-p new-name))
+      (setq aok t))
+    (when (and bad-key-p (not aok))
+      (error "change-class: invalid initarg ~S for class ~S"
+             bad-key new-name))
+    nil))
+
+(defun %change-class-impl (instance new-class initargs)
+  "Standard primary method body for CHANGE-CLASS (CLHS 7.2.1/7.2.2).
+   INITARGS is a proper list (not &rest) so arbitrary-length initarg
+   lists arrive untruncated.  Mutates INSTANCE in place (preserves EQ
+   identity).
+
+   Per CLHS 7.2.1:
+   - slots local in the new class that existed in the old class
+     (local OR shared) retain their values by NAME
+   - slots not in the new class disappear
+   - newly added local slots start unbound; their initforms run via
+     the UPDATE-INSTANCE-FOR-DIFFERENT-CLASS default primary
+     (shared-initialize semantics on the added slots)
+   - slots shared in the new class are left to per-class storage
+   - a copy of the original instance is passed as PREVIOUS to
+     UPDATE-INSTANCE-FOR-DIFFERENT-CLASS, dispatched as a real GF so
+     user methods (primary / :before / :after) run
+
+   Remaining limitation: if NEW-CLASS has more slots than the backing
+   array allocates, trailing slots are capped at the array size."
+  (when (null instance) (return-from %change-class-impl instance))
+  (when (not (%clos-instance-p instance)) (return-from %change-class-impl instance))
+  ;; Resolve new-class to a class object
+  (let ((new-cls (cond
+                   ((symbolp new-class) (%find-clos-class new-class))
+                   ((%clos-class-p new-class) new-class)
+                   (t nil))))
+    (when (null new-cls) (return-from %change-class-impl instance))
+    (let* ((new-name (aref new-cls 1))
+           (new-slot-names (aref new-cls 2))
+           (old-name (aref instance 1))
+           (old-cls (%find-clos-class old-name))
+           (old-slot-names (if old-cls (aref old-cls 2) nil))
+           (inst-len (array-length instance)))
+      ;; ---- 1. Validate the initarg plist (before any mutation) ----
+      (%change-class-validate-initargs new-name initargs)
+      ;; ---- 2. Snapshot PREVIOUS: copy with the old class + values ----
+      (let ((previous (make-array inst-len)))
+        (let ((i 0))
+          (loop
+            (when (>= i inst-len) (return nil))
+            (let ((dummy (aset previous i (aref instance i))))
+              dummy)
+            (setq i (+ i 1))))
+        ;; ---- 3. Snapshot old slot values keyed by name ----
+        ;; Entry: (name . (bound . value)).  Shared-in-old slots read
+        ;; through the old class's storage — CLHS 7.2.1: values of slots
+        ;; shared in Cfrom and local in Cto are retained.
+        (let ((old-values nil))
+          (let ((sn old-slot-names) (idx 0))
+            (loop
+              (when (null sn) (return nil))
+              (let* ((nm (car sn))
+                     (owner (%slot-class-owner old-name nm)))
+                (cond
+                  (owner
+                   (if (%class-slot-bound-p old-name nm)
+                       (setq old-values
+                             (cons (cons nm (cons t (%class-slot-get old-name nm nil)))
+                                   old-values))
+                       (setq old-values
+                             (cons (cons nm (cons nil nil)) old-values))))
+                  ((< (+ 2 idx) inst-len)
+                   (let* ((v (aref instance (+ 2 idx)))
+                          (unbound (and (fixnump v) (= v -999))))
+                     (if unbound
+                         (setq old-values
+                               (cons (cons nm (cons nil nil)) old-values))
+                         (setq old-values
+                               (cons (cons nm (cons t v)) old-values)))))
+                  (t nil)))
+              (setq idx (+ idx 1))
+              (setq sn (cdr sn))))
+          ;; ---- 4. Mutate instance to its new class + remap values ----
+          (aset instance 1 new-name)
+          (let ((sn new-slot-names) (idx 0))
+            (loop
+              (when (null sn) (return nil))
+              (when (< (+ 2 idx) inst-len)
+                (let* ((nm (car sn))
+                       (shared-new (%slot-class-owner new-name nm))
+                       (pair (let ((cur old-values) (found nil))
+                               (loop
+                                 (when (null cur) (return found))
+                                 (when (eq (car (car cur)) nm)
+                                   (setq found (car cur))
+                                   (return found))
+                                 (setq cur (cdr cur))))))
+                  (cond
+                    ;; Shared in the new class: value lives in per-class
+                    ;; storage; the instance cell is unused.  Old local
+                    ;; value is NOT transferred (CLHS 7.2.1 — only
+                    ;; local-in-new slots retain values).
+                    (shared-new
+                     (aset instance (+ 2 idx) -999))
+                    ;; Local in new + existed bound in old: retain.
+                    ((and pair (car (cdr pair)))
+                     (aset instance (+ 2 idx) (cdr (cdr pair))))
+                    ;; Existed-but-unbound or newly added: unbound.
+                    ;; Added slots get initforms in %uifdc-default.
+                    (t
+                     (aset instance (+ 2 idx) -999)))))
+              (setq idx (+ idx 1))
+              (setq sn (cdr sn))))
+          ;; ---- 5. UPDATE-INSTANCE-FOR-DIFFERENT-CLASS (real GF) ----
+          (%dispatch-uifdc (cons previous (cons instance initargs)))
+          instance)))))
+
+(defun %change-class-default (instance new-class &rest initargs)
+  "Default method body for CHANGE-CLASS — thin &rest wrapper over
+   %change-class-impl (which takes the initargs as a list)."
+  (%change-class-impl instance new-class initargs))
+
+(defun %dispatch-change-class (args)
+  "Inline dispatch for CHANGE-CLASS — direct call to default unless GF
+   has user methods (cheap path)."
+  (let ((gf (%find-gf 'change-class)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (%change-class-default-spread args)))
+        (%change-class-default-spread args))))
+
+(defun %change-class-default-spread (args)
+  "ARGS is (instance new-class &rest initargs) as a list.  Pass the
+   initargs tail straight through to %change-class-impl — the previous
+   by-arity ladder capped at 5 elements and silently truncated longer
+   initarg lists (change-class.1.10 passes 8)."
+  (cond
+    ((or (null args) (null (cdr args))) (%signal-program-error))
+    (t (%change-class-impl (car args) (car (cdr args)) (cdr (cdr args))))))
+
+(defun change-class (&rest %cc-args)
+  "CHANGE-CLASS generic function entry.  Falls through to
+   %change-class-default unless user methods were defined.
+   CLHS: requires at least 2 args (instance + new-class) —
+   change-class.error.1/.2 expect PROGRAM-ERROR."
+  (when (or (null %cc-args) (null (cdr %cc-args)))
+    (%signal-program-error))
+  (%dispatch-change-class %cc-args))
+
+;;; ============================================================
+;;; FIND-METHOD, ADD-METHOD, REMOVE-METHOD (CLOS MOP stubs)
+;;; ============================================================
+
+;; find-method / add-method / remove-method / method-qualifiers /
+;; compute-applicable-methods all live in cl-clos.lisp; the stubs here
+;; were shadowing them via last-defun-wins.
+
+;; ensure-generic-function lives in cl-clos.lisp now; the stub here
+;; was shadowing it via last-defun-wins.
+(defun reinitialize-instance (instance &rest initargs)
+  "Per ANSI, REINITIALIZE-INSTANCE calls SHARED-INITIALIZE with the
+   instance, slot-names = NIL (so no initforms re-apply), and the
+   passed initargs.  Returns INSTANCE.
+
+   Bypass APPLY+&rest through SHARED-INITIALIZE (which truncates
+   trailing initargs when modus's funcall passes >4 args through
+   the dispatch closure's &rest).  Call %shared-init-default-spread
+   directly with the args list, the same way make-instance does.
+
+   CLHS 7.3: the initargs are validated first — against the slot :initarg
+   names plus the &key parameter names of the applicable
+   REINITIALIZE-INSTANCE / SHARED-INITIALIZE methods.  This used to do NO
+   validation at all, so (reinitialize-instance i :totally-bogus 2)
+   returned quietly."
+  (when (%clos-instance-p instance)
+    (%clos-validate-reinit-initargs (aref instance 1) initargs))
+  (let ((gf (%find-gf 'shared-initialize)))
+    (cond
+      ((and gf (%gf-methods gf))
+       (let* ((sa-args (cons instance (cons nil initargs)))
+              (applicable (%collect-applicable-methods gf sa-args)))
+         (if applicable
+             (%gf-dispatch-standard gf sa-args applicable)
+             (%shared-init-default-spread sa-args))))
+      (t
+       (%shared-init-default-spread (cons instance (cons nil initargs))))))
+  instance)
+
+;;; Class obsolescence tracking.  When (make-instances-obsolete C)
+;;; runs, we increment a counter on C's descriptor.  Each instance
+;;; carries a stamp it was created with; if (instance-stamp ≠
+;;; class-stamp) on slot access, we run update-instance-for-redefined-class
+;;; once and refresh the stamp.  This is the AMOP redefinition protocol.
+(defvar *%class-stamps* nil
+  "Alist (class-name . stamp).  Incremented by make-instances-obsolete.")
+
+(defun %class-stamp (class-name)
+  (let ((entry (assoc class-name *%class-stamps* :test #'eq)))
+    (if entry (cdr entry) 0)))
+
+(defun (setf %class-stamp) (new-val class-name)
+  (let ((entry (assoc class-name *%class-stamps* :test #'eq)))
+    (if entry
+        (set-cdr entry new-val)
+        (setq *%class-stamps*
+              (cons (cons class-name new-val) *%class-stamps*))))
+  new-val)
+
+(defun make-instances-obsolete (class)
+  "Increment the obsolescence stamp on CLASS.  Returns CLASS.  When
+   an instance with a stale stamp next has a slot accessed, the
+   slot-access path can trigger update-instance-for-redefined-class
+   (currently not wired since modus doesn't carry per-instance stamps;
+   the bookkeeping is in place for when that arrives)."
+  (let ((name (cond ((symbolp class) class)
+                    ((%clos-class-p class) (aref class 1))
+                    (t nil))))
+    (when name
+      (let ((entry (assoc name *%class-stamps* :test #'eq)))
+        (if entry
+            (set-cdr entry (+ (cdr entry) 1))
+            (setq *%class-stamps* (cons (cons name 1) *%class-stamps*))))))
+  class)
+
+;;; ============================================================
+;;; MAKE-LOAD-FORM — GF with default error-signaling methods
+;;; ============================================================
+;;;
+;;; Per CLHS 4.3.5 / 21.1, MAKE-LOAD-FORM is a generic function.  The
+;;; system-supplied methods on STANDARD-OBJECT, STRUCTURE-OBJECT, and
+;;; CONDITION all signal an error; users override per class.  Tests in
+;;; make-load-form.lsp probe both branches:
+;;;  - (compute-applicable-methods #'make-load-form (list obj)) → non-NIL
+;;;  - (handler-case (make-load-form obj) (error nil :good)) → :good
+;;; Without the GF registered, the test bodies error on #'make-load-form
+;;; (UNDEFINED-FUNCTION), the outer handler-case catches, and the whole
+;;; file crash-fails.
+(defun %make-load-form-default (obj &optional env)
+  (declare (ignore env))
+  (error "no MAKE-LOAD-FORM method defined for ~S" obj))
+
+(defun make-load-form (obj &optional env)
+  "Generic function — dispatches via %gf-dispatch."
+  (%gf-dispatch 'make-load-form (list obj env)))
+
+(defun %init-make-load-form ()
+  "Register the MAKE-LOAD-FORM GF and its default error-signaling
+   methods on STANDARD-OBJECT, STRUCTURE-OBJECT, and CONDITION.
+   Top-level forms don't auto-run on bare-metal builds, so this has
+   to be called explicitly from kernel-main."
+  (%defgeneric 'make-load-form '(object &optional environment) nil)
+  (%defmethod 'make-load-form nil '(standard-object)
+              #'%make-load-form-default)
+  (%defmethod 'make-load-form nil '(structure-object)
+              #'%make-load-form-default)
+  (%defmethod 'make-load-form nil '(condition)
+              #'%make-load-form-default)
+  (handler-case (%register-gf-fn #'make-load-form 'make-load-form)
+                (t (c) nil)))
+
+(defun make-load-form-saving-slots (object &key slot-names environment)
+  "Per CLHS 7.1: return (values creation-form initialization-form)
+   that, when evaluated, reconstructs OBJECT with the named slots.
+
+   Returns two forms:
+     creation-form     = (allocate-instance (find-class 'CLASS-NAME))
+     initialization-form =
+       (progn
+         (setf (slot-value <obj> 'slot1) (load-time-value …))
+         …)
+
+   The caller (a binary FASL emitter, normally) walks these forms.
+   Modus doesn't have a FASL emitter, but tests probe the SHAPE of
+   the return values, and the values themselves must be valid forms."
+  (declare (ignore environment))
+  ;; DEFSTRUCT instances use a positional array representation (slot-0 =
+  ;; '%struct-instance, slot-1 = type-name, slots 2+ = field values).  The
+  ;; creation-form reconstructs the whole struct in one shot via
+  ;; %ALLOC-STRUCT — which when EVAL'd yields a fresh struct whose CLASS-OF
+  ;; is EQ to the original's (both resolve to the same struct class proxy
+  ;; keyed by type-name).  Because every slot value is embedded in the
+  ;; creation-form, the initialization-form is an empty (PROGN); the test's
+  ;; SUBST NEWOBJ OBJECT then has nothing to rewrite, which is fine.
+  (when (%struct-instance-p object)
+    (let* ((type-name (%struct-type-name object))
+           (n-slots (- (array-length object) 2))   ; slots 2+ are fields
+           ;; Read field values straight out of the instance array (slots
+           ;; 2..len-1, in effective-slot order — same order %ALLOC-STRUCT
+           ;; writes them back).  Build the positional value list literally
+           ;; so the creation-form is (%alloc-struct 'NAME '(v0 v1 ...)) —
+           ;; a single QUOTE survives runtime EVAL cleanly (a (LIST …) form
+           ;; depends on runtime LIST + nested QUOTE, which proved fragile).
+           (vals
+             (let ((acc nil) (i (- n-slots 1)))
+               (loop
+                 (when (< i 0) (return acc))
+                 (setq acc (cons (aref object (+ 2 i)) acc))
+                 (setq i (- i 1)))))
+           (creation-form
+             (list '%alloc-struct (list 'quote type-name) (list 'quote vals)))
+           (init-form (list 'progn)))
+      (return-from make-load-form-saving-slots
+        (values creation-form init-form))))
+  ;; Only standard CLOS instances reach the slot-by-slot path below.
+  (when (or (null object) (not (%clos-instance-p object)))
+    (return-from make-load-form-saving-slots (values nil nil)))
+  (let* ((class-name (aref object 1))
+         (cls (%find-clos-class class-name))
+         (slots (cond
+                  ;; explicit :slot-names list (and not T) → use as given
+                  ((and slot-names (not (eq slot-names t))) slot-names)
+                  ;; CLOS: all slots from the class slot list
+                  (cls (aref cls 2))
+                  (t nil)))
+         (creation-form
+           (list 'allocate-instance (list 'find-class (list 'quote class-name))))
+         ;; Per CLHS 3.2.4.4 / make-load-form-saving-slots: the init-form
+         ;; references the OBJECT directly so the FASL emitter (here, the
+         ;; ANSI test via SUBST NEWOBJ OBJECT) can rewrite it to operate on
+         ;; the freshly-created instance.  Only BOUND slots get a setter —
+         ;; unbound slots must stay unbound after reconstruction.  Use a
+         ;; direct SET-SLOT-VALUE call rather than the SETF macro: runtime-
+         ;; EVAL of (setf (slot-value …) …) doesn't take effect, whereas the
+         ;; direct setter does.
+         (init-pairs
+           (let ((acc nil) (cur slots))
+             (loop
+               (when (null cur) (return (nreverse acc)))
+               (let ((sname (car cur)))
+                 (when (handler-case (%slot-boundp object sname) (t (c) nil))
+                   (let ((val (handler-case (%slot-value object sname) (t (c) nil))))
+                     (setq acc (cons (list 'set-slot-value
+                                           object (list 'quote sname) (list 'quote val))
+                                     acc)))))
+               (setq cur (cdr cur)))))
+         (init-form (cons 'progn init-pairs)))
+    (values creation-form init-form)))
+
+;; NOTE: set-find-class is implemented in cl-conditions.lisp (it mutates
+;; *clos-classes*).  An earlier stub HERE shadowed it via last-defun-wins,
+;; silently dropping every (setf (find-class NAME) …).  Removed so the real
+;; one wins.
+(defun set-class-name (cls new-name)
+  "(setf (class-name CLS) NEW-NAME) per CLHS 4.3.6.  Mutate the class
+   object's name slot in place and return NEW-NAME.  The SETF macro's
+   generic fallback rewrites (setf (class-name c) v) → (set-class-name c v)."
+  (when (%clos-class-p cls)
+    (let ((dummy (aset cls 1 new-name))) dummy))
+  new-name)
+
+;;; GET-INTERNAL-REAL-TIME lives with GET-INTERNAL-RUN-TIME and
+;;; INTERNAL-TIME-UNITS-PER-SECOND, up at "THE INTERNAL CLOCKS ARE CLOCKS".
+;;; The copy that used to be here was LAST, so it was the one that won, and
+;;; it was a call counter for two reasons at once:
+;;;
+;;;   (let ((t (handler-case (syscall3 201 0 0 0) (t (c) 0)))) …)
+;;;
+;;; (1) it BOUND T.  T is a constant; a reference to `t' in the body reads
+;;; the constant, so `(integerp t)' asked whether TRUE is an integer, said
+;;; NO, and fell through to the counter on EVERY call regardless of what
+;;; the syscall returned.  (2) Even had it worked, syscall 201 is `time(2)'
+;;; — WHOLE SECONDS since the epoch — reported as if it were the 1000ths
+;;; INTERNAL-TIME-UNITS-PER-SECOND promised, and 201 is `listen(2)' on the
+;;; AArch64 generic ABI, so this was never portable either.
+
+;;; CLASS-OF — strict 1-arg arity
+(defun class-of (x &rest extra)
+  (if extra
+      (%program-error "class-of requires exactly 1 argument")
+      (cond
+        ((%clos-instance-p x)
+         (%find-clos-class (aref x 1)))
+        (t nil))))
+
+;;; SLOT-VALUE — strict 2-arg arity
+(defun slot-value (obj slot-name &rest extra)
+  (if extra
+      (%program-error "slot-value requires exactly 2 arguments")
+      (if (null slot-name)
+          (%program-error "slot-value requires a slot name")
+          (%slot-value obj slot-name))))
+
+;;; ============================================================
+;;; CLOS protocol completion
+;;; ============================================================
+;;;
+;;; Six generic functions that ANSI requires but that modus had
+;;; previously stubbed as no-ops: INITIALIZE-INSTANCE,
+;;; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS, UPDATE-INSTANCE-FOR-REDEFINED-
+;;; CLASS, NO-APPLICABLE-METHOD, NO-NEXT-METHOD, and SLOT-MISSING (the
+;;; user-callable entry on top of the internal %dispatch-slot-missing).
+;;;
+;;; Each follows the same pattern as SHARED-INITIALIZE: a
+;;; %default-NAME defun holding the system-supplied behaviour, a
+;;; %dispatch-NAME(args) that consults the GF registry for user
+;;; methods, and the user-facing NAME (&rest args) entry that calls
+;;; the dispatcher.  Init at boot via %init-clos-protocol.
+
+;;; ---- INITIALIZE-INSTANCE -----------------------------------------
+;;; Per CLHS 7.1.1, INITIALIZE-INSTANCE invokes SHARED-INITIALIZE with
+;;; the instance, slot-names = T (apply all initforms for unbound
+;;; slots), and the initargs.  Returns the instance.
+(defun %initialize-instance-default-1 (instance slot-names initargs)
+  "List-form initialize-instance default — takes initargs as a list,
+   not a &rest tail.  Modus's funcall-with-&rest collapses arguments
+   when nargs > +max-reg-args+, so the apply'd chain
+   IIdefault → shared-initialize → %dispatch → %shared-init-default
+   silently drops trailing initargs.  Bypass that whole stack: build
+   the same effect inline by directly calling %shared-initialize-default
+   through the list-spread helper that already handles this shape."
+  ;; Check for user methods on shared-initialize; fall through to default
+  ;; with the args list.  (initialize-instance methods would have already
+  ;; dispatched higher up; this is the default body.)
+  (let* ((sa-args (cons instance (cons slot-names initargs)))
+         (gf (%find-gf 'shared-initialize)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf sa-args)))
+          (if applicable
+              (%gf-dispatch-standard gf sa-args applicable)
+              (%shared-init-default-spread sa-args)))
+        (%shared-init-default-spread sa-args)))
+  instance)
+
+(defun %initialize-instance-default (instance &rest initargs)
+  "Same as -1 but exposed for the &rest signature used by methods."
+  (%initialize-instance-default-1 instance t initargs))
+
+(defun %dispatch-initialize-instance (args)
+  "ARGS is (instance &rest initargs).  Calling the default needs the
+   list-form helper because modus' funcall+&rest loses trailing args
+   when nargs > +max-reg-args+."
+  (let ((gf (%find-gf 'initialize-instance)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (%initialize-instance-default-1 (car args) t (cdr args))))
+        (%initialize-instance-default-1 (car args) t (cdr args)))))
+
+(defun initialize-instance (&rest %ii-args)
+  (%dispatch-initialize-instance %ii-args))
+
+;;; ---- NO-APPLICABLE-METHOD / NO-NEXT-METHOD -----------------------
+;;; CLHS 7.6.6.2 / 7.6.6.3.  Both are GFs whose default behaviour is to
+;;; signal an error.  Letting them be regular functions means a user
+;;; can shadow the error by adding their own method (used by some
+;;; test files to swallow expected misses).
+(defun %no-applicable-method-default (gf &rest args)
+  (declare (ignore args))
+  (error "no applicable method for generic function ~S" gf))
+
+(defun %dispatch-no-applicable-method (args)
+  (let ((gf (%find-gf 'no-applicable-method)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%no-applicable-method-default args)))
+        (apply #'%no-applicable-method-default args))))
+
+(defun no-applicable-method (&rest %nam-args)
+  (%dispatch-no-applicable-method %nam-args))
+
+(defun %no-next-method-default (gf method &rest args)
+  (declare (ignore args))
+  (error "call-next-method: no next method on ~S after ~S" gf method))
+
+(defun %dispatch-no-next-method (args)
+  (let ((gf (%find-gf 'no-next-method)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%no-next-method-default args)))
+        (apply #'%no-next-method-default args))))
+
+(defun no-next-method (&rest %nnm-args)
+  (%dispatch-no-next-method %nnm-args))
+
+;;; ---- SLOT-MISSING -------------------------------------------------
+;;; Existing internal %dispatch-slot-missing exists but there's no
+;;; user-callable entry.  Real default: signal an error.
+(defun %slot-missing-default (class instance slot-name operation &optional new-value)
+  (declare (ignore class instance new-value))
+  (error "slot-missing: ~S has no slot ~S during ~S"
+         instance slot-name operation))
+
+(defun slot-missing (class instance slot-name operation &optional new-value)
+  "Default implementation signals an error; user methods on
+   SLOT-MISSING can override via DEFMETHOD."
+  (let ((gf (%find-gf 'slot-missing))
+        (args (list class instance slot-name operation new-value)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (%slot-missing-default class instance slot-name operation new-value)))
+        (%slot-missing-default class instance slot-name operation new-value))))
+
+;;; ---- UPDATE-INSTANCE-FOR-* (real GFs, default = no-op) -----------
+;;; The default methods are no-ops so old behaviour (returning the
+;;; instance) is preserved, but registering them as GFs means users
+;;; can add methods that CHANGE-CLASS / class redefinition will pick
+;;; up.  ANSI requires these to be GFs.
+(defun %uifdc-default (previous current &rest initargs)
+  "Default primary for UPDATE-INSTANCE-FOR-DIFFERENT-CLASS (CLHS 7.7.2):
+   equivalent to (apply #'shared-initialize current added-slots initargs)
+   where added-slots are the local slots of CURRENT's class that did not
+   exist in PREVIOUS's class.  Implemented directly (initarg application
+   leftmost-wins + initforms for still-unbound added slots) rather than
+   through the shared-initialize spread path, which also runs
+   :default-initargs — those must NOT apply on change-class."
+  (when (or (null current) (not (%clos-instance-p current)))
+    (return-from %uifdc-default current))
+  (let* ((new-name (aref current 1))
+         (new-cls (%find-clos-class new-name))
+         (old-name (if (and previous (%clos-instance-p previous))
+                       (aref previous 1)
+                       nil))
+         (old-cls (if old-name (%find-clos-class old-name) nil))
+         (old-slot-names (if old-cls (aref old-cls 2) nil)))
+    (when (null new-cls) (return-from %uifdc-default current))
+    ;; Added slots: local in the new class, absent from the old class.
+    (let ((added nil))
+      (let ((sn (aref new-cls 2)))
+        (loop
+          (when (null sn) (return nil))
+          (let ((nm (car sn)))
+            (when (and (null (member nm old-slot-names :test #'eq))
+                       (null (%slot-class-owner new-name nm)))
+              (setq added (cons nm added))))
+          (setq sn (cdr sn))))
+      ;; 1. Apply initargs (leftmost wins) — they may set ANY slot of
+      ;;    the new class, not just added ones (change-class.1.5).
+      (let ((set-slots (%shared-init-apply-initargs
+                        current new-name initargs nil)))
+        ;; 2. Initforms for added slots still unbound + not initarg-set.
+        (let ((cur added))
+          (loop
+            (when (null cur) (return nil))
+            (let* ((nm (car cur))
+                   (already (member nm set-slots :test #'eq))
+                   (idx (%clos-slot-index new-cls nm))
+                   (unbound (if (>= idx 0)
+                                (let ((v (aref current (+ 2 idx))))
+                                  (and (fixnump v) (= v -999)))
+                                nil)))
+              (when (and (null already) unbound)
+                (let ((thunk (%clos-initform-thunk new-name nm)))
+                  (when thunk
+                    (set-slot-value current nm (funcall thunk))))))
+            (setq cur (cdr cur))))))
+    current))
+
+(defun %dispatch-uifdc (args)
+  (let ((gf (%find-gf 'update-instance-for-different-class)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%uifdc-default args)))
+        (apply #'%uifdc-default args))))
+
+(defun update-instance-for-different-class (&rest %u-args)
+  (%dispatch-uifdc %u-args))
+
+(defun %uifrc-default (instance added-slots discarded-slots plist &rest initargs)
+  (declare (ignore added-slots discarded-slots plist initargs))
+  instance)
+
+(defun %dispatch-uifrc (args)
+  (let ((gf (%find-gf 'update-instance-for-redefined-class)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%uifrc-default args)))
+        (apply #'%uifrc-default args))))
+
+(defun update-instance-for-redefined-class (&rest %u-args)
+  (%dispatch-uifrc %u-args))
+
+;;; ---- PRINT-OBJECT -------------------------------------------------
+;;; Default method: write something readable.  Tests in print-object.lsp
+;;; just probe that the GF exists and is dispatchable; full ~S-equivalent
+;;; output isn't required.
+(defun %print-object-default (object stream)
+  "The standard method: what the printer prints when no user method applies.
+   (It used to print nothing, so a user method's CALL-NEXT-METHOD lost the
+   default output.)"
+  (cond ((%clos-instance-p object) (%print-instance-default object stream))
+        ((%struct-instance-p object) (%print-struct-default object stream nil *print-escape*))
+        (t (%write-obj object stream nil *print-escape*)))
+  object)
+
+(defun %dispatch-print-object (args)
+  (let ((gf (%find-gf 'print-object)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%print-object-default args)))
+        (apply #'%print-object-default args))))
+
+(defun print-object (object stream)
+  (%dispatch-print-object (list object stream)))
+
+;;; ---- DESCRIBE-OBJECT ---------------------------------------------
+(defun %describe-object-default (object stream)
+  (declare (ignore stream))
+  object)
+
+(defun %dispatch-describe-object (args)
+  (let ((gf (%find-gf 'describe-object)))
+    (if (and gf (%gf-methods gf))
+        (let ((applicable (%collect-applicable-methods gf args)))
+          (if applicable
+              (%gf-dispatch-standard gf args applicable)
+              (apply #'%describe-object-default args)))
+        (apply #'%describe-object-default args))))
+
+(defun describe-object (object stream)
+  (%dispatch-describe-object (list object stream)))
+
+;;; ---- Initialization -----------------------------------------------
+(defun %init-clos-protocol ()
+  "Register the CLOS GFs that have system-supplied default methods.
+   Called once from kernel-main after %init-make-load-form."
+  ;; INITIALIZE-INSTANCE — register the GF but DON'T install a default
+  ;; method on standard-object.  %dispatch-initialize-instance falls
+  ;; through to %initialize-instance-default-1 directly when no
+  ;; user-defined methods apply.  Installing a default method whose
+  ;; body uses &rest+apply hits the funcall+&rest truncation that
+  ;; loses trailing initargs.
+  (%defgeneric 'initialize-instance '(instance &rest initargs) nil)
+  ;; NO-APPLICABLE-METHOD / NO-NEXT-METHOD
+  (%defgeneric 'no-applicable-method '(gf &rest args) nil)
+  (%defmethod 'no-applicable-method nil '(t)
+              (lambda (&rest args) (apply #'%no-applicable-method-default args)))
+  (%defgeneric 'no-next-method '(gf method &rest args) nil)
+  (%defmethod 'no-next-method nil '(t)
+              (lambda (&rest args) (apply #'%no-next-method-default args)))
+  ;; SLOT-MISSING / SLOT-UNBOUND
+  (%defgeneric 'slot-missing '(class instance slot-name operation &optional new-value) nil)
+  (%defmethod 'slot-missing nil '(t)
+              (lambda (&rest args) (apply #'%slot-missing-default args)))
+  ;; UPDATE-INSTANCE-FOR-*
+  (%defgeneric 'update-instance-for-different-class '(previous current &rest initargs) nil)
+  (%defmethod 'update-instance-for-different-class nil '(standard-object standard-object)
+              (lambda (&rest args) (apply #'%uifdc-default args)))
+  (%defgeneric 'update-instance-for-redefined-class
+              '(instance added-slots discarded-slots plist &rest initargs) nil)
+  (%defmethod 'update-instance-for-redefined-class nil '(standard-object)
+              (lambda (&rest args) (apply #'%uifrc-default args)))
+  ;; PRINT-OBJECT / DESCRIBE-OBJECT
+  (%defgeneric 'print-object '(object stream) nil)
+  (%defmethod 'print-object nil '(t)
+              (lambda (obj s) (%print-object-default obj s)))
+  (%defgeneric 'describe-object '(object stream) nil)
+  (%defmethod 'describe-object nil '(t)
+              (lambda (obj s) (%describe-object-default obj s)))
+  ;; Register all fn-pointers for #'name → GF lookup.
+  (handler-case (%register-gf-fn #'initialize-instance 'initialize-instance) (t (c) nil))
+  (handler-case (%register-gf-fn #'no-applicable-method 'no-applicable-method) (t (c) nil))
+  (handler-case (%register-gf-fn #'no-next-method 'no-next-method) (t (c) nil))
+  (handler-case (%register-gf-fn #'slot-missing 'slot-missing) (t (c) nil))
+  (handler-case (%register-gf-fn #'update-instance-for-different-class
+                                 'update-instance-for-different-class) (t (c) nil))
+  (handler-case (%register-gf-fn #'update-instance-for-redefined-class
+                                 'update-instance-for-redefined-class) (t (c) nil))
+  (handler-case (%register-gf-fn #'print-object 'print-object) (t (c) nil))
+  (handler-case (%register-gf-fn #'describe-object 'describe-object) (t (c) nil))
+  ;; SHARED-INITIALIZE, CHANGE-CLASS, REINITIALIZE-INSTANCE, MAKE-LOAD-FORM
+  ;; are registered elsewhere — but their fn-pointer→name mapping wasn't.
+  (handler-case (%register-gf-fn #'shared-initialize 'shared-initialize) (t (c) nil))
+  (handler-case (%register-gf-fn #'change-class 'change-class) (t (c) nil))
+  (handler-case (%register-gf-fn #'reinitialize-instance 'reinitialize-instance) (t (c) nil))
+  nil)
+
+;; %EXPAND-DEFTYPE has NO definition in this file (WS3 STEP 4): the
+;; evaluator engine provides it — tree-walker.lisp in the fork builds,
+;; mvm-eval.lisp in the production images.  Consumers here (typep/subtypep)
+;; resolve to the build's engine via whole-program last-defun-wins.  Do
+;; NOT add a stub defun: a third same-name copy re-triggers the
+;; duplicate-defun by-name ambiguity (CHUNK-CRASH regression class).
+(defun %clos-cpl-has-p (obj name)
+  "True iff NAME is EQ to a class name in the CPL of the CLOS instance OBJ."
+  (let ((c (%obj-cpl obj)))
+    (loop
+      (when (null c) (return nil))
+      (when (eq (car c) name) (return t))
+      (setq c (cdr c)))))

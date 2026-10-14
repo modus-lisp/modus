@@ -781,7 +781,7 @@
    into an earlier one run native too.  JIT-EAGER translates only what is new.
    MODUS_NO_LOAD_JIT=1 turns it off; a JIT failure never fails the load."
   ;; RAISED, not run: the outermost LOAD runs it between two toplevel forms
-  ;; (mvm/ansi-bridge.lisp, DEFERRED JIT) -- running it here replaced the
+  ;; (mvm/cl-eval.lisp, DEFERRED JIT) -- running it here replaced the
   ;; still-executing Quicklisp functions under their own frames.
   (let ((off (%cli-getenv "MODUS_NO_LOAD_JIT")))
     (unless (and off (> (length off) 0) (not (string= off "0")))

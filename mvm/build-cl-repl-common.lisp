@@ -499,6 +499,11 @@
 (defvar *core-restart-hook* nil)
 (defun %core-addr () #x18000000)
 (defun %core-cursor-slot () #x10000F60)
+;; Restore progress (lib/save-image.lisp %CORE-PROGRESS): the phase into a word
+;; of the Device RAM window (0x111Fxxxx survives a board reset; this word is
+;; between the HDMI font and the mutex arena, and the prologue does not clear it),
+;; readable afterwards from U-Boot (md 0x111F1F00) or the next boot's REPL.
+(defun %core-progress (k) (setf (mem-ref #x111F1F00 :u32) k))
 (defun %core-requested-p ()
   ;; The magic is a HEADER FIELD written with (setf (mem-ref .. :u64) magic),
   ;; i.e. deposited as magic<<1, so read it the same halving way -- NOT the
@@ -2242,7 +2247,14 @@
       (let ((skip nil))
 "
         (if *cl-repl-rpi-p*
-            "        (let ((t0 (mem-ref #x3F003004 :u32)))
+            "        ;; Bytes ALREADY waiting are not a person at the console: a reset leaves
+        ;; a stray byte in the mini UART often enough that a card boot fell into
+        ;; the REPL instead of the desk.  Drop them (bounded), then open the window.
+        (dotimes (i 64)
+          (if (and (fboundp (quote hid-serial-ready-p)) (hid-serial-ready-p))
+              (read-char-serial)
+              (return nil)))
+        (let ((t0 (mem-ref #x3F003004 :u32)))
           (loop
             (when (or skip (> (logand (- (mem-ref #x3F003004 :u32) t0) #xFFFFFFFF) 2000000)) (return nil))
             (when (and (fboundp (quote hid-serial-ready-p)) (hid-serial-ready-p)) (setq skip t))))

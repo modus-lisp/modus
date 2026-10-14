@@ -59,6 +59,13 @@
           (return r)))
       (setq i (+ i 1)))))
 
+(defun dwc2-wait-next-uframe ()
+  ;; Until HFNUM's frame number moves on (a microframe is 125 us), bounded.
+  (let ((f (logand (dwc2-read (dwc2-hfnum)) #x3FFF)) (i 0))
+    (loop
+      (when (or (/= f (logand (dwc2-read (dwc2-hfnum)) #x3FFF)) (> i 200000)) (return nil))
+      (setq i (+ i 1)))))
+
 (defun dwc2-split-packet (ch hcchar hcsplt hctsiz buf periodic)
   ;; One packet through the hub's TT.  Returns 1 = done (data or ACK),
   ;; 0 = the device NAKed, -1 = STALL, -2 = transaction error, -3 = timeout.
@@ -98,7 +105,11 @@
                 (when (> errs 3) (setq result -2) (return result)))))
           (t
            (cond
-             ((not (zerop (logand hcint (hcint-nyet)))) nil)
+             ;; NYET: the hub's TT has not finished the full/low-speed transaction
+             ;; yet.  Ask again in the NEXT microframe, as U-Boot does -- retried back
+             ;; to back, a LOW-speed device (well over a millisecond for its packet)
+             ;; used up every try in microseconds, and the mouse never answered.
+             ((not (zerop (logand hcint (hcint-nyet)))) (dwc2-wait-next-uframe))
              ((not (zerop (logand hcint (hcint-xfercompl)))) (setq result 1) (return result))
              ((not (zerop (logand hcint (hcint-ack)))) (setq result 1) (return result))
              ((not (zerop (logand hcint (hcint-nak))))

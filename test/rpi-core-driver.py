@@ -48,7 +48,7 @@ def q(form, to=30.0):
 # unless a byte arrives on serial within 2 s: send one, so the REPL comes up to probe.
 banner = rd_until(r"Modus CL REPL|CORE-RESTART-HOOK", a.banner_wait)
 if "CORE-RESTART-HOOK" in banner and "Modus CL REPL" not in banner:
-    s.sendall(b"\r")
+    s.sendall(b"\r"); time.sleep(0.5); s.sendall(b"\r")   # the image drops bytes already waiting
     banner += rd_until(r"Modus CL REPL", a.banner_wait)
 if "Modus CL REPL" not in banner:
     say("FAIL no banner within %ds; serial tail: %r" % (a.banner_wait, banner[-300:])); sys.exit(1)

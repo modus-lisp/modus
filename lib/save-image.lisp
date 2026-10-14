@@ -329,6 +329,19 @@
   (%core-slice fd (%conv-addr #x10000FD0) 8)       ; JIT constant-vector root (aarch64)
   (%core-slice fd stage #x28))       ; 0xFD8..0x1000
 
+;; RESTORE PROGRESS: %RESTORE-IMAGE reports each phase it finishes (1..8) here.
+;; A no-op by default; the Raspberry Pi image (build-cl-repl-common.lisp) stores
+;; it in a word that survives a board reset, so a restore that never prints can be
+;; located afterwards.  On the Pi it is also, for now, what keeps a restore from
+;; HANGING when the firmware boots the board straight from SD (under U-Boot it
+;; never did): with these eight calls, or with eight 300 us delays, or with the
+;; old serial R1..R8 markers, the same kernel+core restores every time; with
+;; none it hung before CORE-END every time.  Not a hardware race -- a store with
+;; no delay is enough -- so most likely code that depends on a register or word
+;; the firmware path leaves different.  OPEN: find it, then this is diagnostics
+;; again and nothing else.
+(defun %core-progress (k) k)
+
 (defun %restore-image ()
   "Read the snapshot named by argv[2] into this process.  See the file header
    for what is and is not restored.  Returns the restored allocation pointer."
@@ -352,7 +365,7 @@
     (when (/= (+ sfrom d) from)
       (%core-die "core: heap base differs from this process (the core was saved by an image with a different layout, or the stub did not get its fixed mapping)"))
     (unless (%core-geometry-ok-p (mem-ref (+ hdr 24) :u64))
-      (%core-die "core: heap geometry differs from this image"))
+      (%core-die "core: heap geometry differs from this image")) (%core-progress 1)
     (let ((free (mem-ref (+ hdr 32) :u64))
           (blen (mem-ref (+ hdr 48) :u64))
           (boff (mem-ref (+ hdr 56) :u64))
@@ -373,18 +386,18 @@
         (%core-die "core: snapshot carries a heap range that cannot be relocated to another slide"))
       (when (and (> xlen 0) (not (%core-extra-ok-p xaddr xlen)))
         (%core-die "core: snapshot carries a heap range this process cannot hold"))
-      (%core-restore-window fd stage)
-      (%core-slice fd from (- free sfrom))
+      (%core-restore-window fd stage) (%core-progress 2)
+      (%core-slice fd from (- free sfrom)) (%core-progress 3)
       (%core-slice fd (+ (%core-bitmap-base) boff) blen)
-      (%core-slice fd (+ (%core-cons-bitmap-base) boff) blen)
+      (%core-slice fd (+ (%core-cons-bitmap-base) boff) blen) (%core-progress 4)
       (when (> abump 0)
         ;; The arena: bitmaps + JIT pages, then the bump word (RAW: store the
         ;; halved value so the machine word is the address) and an I-cache
         ;; invalidate over the code we just read in.  JIT code is PC-relative
         ;; for the layout, so it needs no relocation.
-        (%core-load-code fd (+ alo d) (- abump alo) stage)
+        (%core-load-code fd (+ alo d) (- abump alo) stage) (%core-progress 5)
         (setf (mem-ref (%core-jit-bump-slot) :u64) (ash (+ abump d) -1))
-        (%jit-icache-flush (+ alo d) (- abump alo))
+        (%jit-icache-flush (+ alo d) (- abump alo)) (%core-progress 6)
         ;; Its data pages (the linkage cells): ordinary writable memory.
         (when (> dlo 0)
           (%core-slice fd (+ dlo d) (- l1 dlo))))
@@ -394,10 +407,10 @@
       ;; prints CORE-END via print-dec, which conses; until this runs, the
       ;; pointer is still the fresh boot's (heap base), so that string would
       ;; land ON TOP of the just-restored data at the low heap and corrupt it.
-      (set-alloc-ptr (+ free d))
+      (set-alloc-ptr (+ free d)) (%core-progress 7)
       (unless (= d 0)
         (%core-relocate from (+ free d) l0 l1 d))
-      (%core-adopt-geometry (mem-ref (+ hdr 24) :u64))
+      (%core-adopt-geometry (mem-ref (+ hdr 24) :u64)) (%core-progress 8)
       (%core-close fd)
       (+ free d)))))
 

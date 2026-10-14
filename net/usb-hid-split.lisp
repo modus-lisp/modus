@@ -72,8 +72,10 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun hid-find-hub ()
-  ;; The first device on the root port whose device class is 9 (hub).
-  (let ((a 2) (found 0) (b (usb-data-buf)))
+  ;; The first device on the root port whose device class is 9 (hub).  From 1:
+  ;; HID-USB-BRINGUP gives the hub address 1; under U-Boot, 1 is U-Boot's own
+  ;; virtual root hub, which nothing on the wire answers, so the hub is 2 there.
+  (let ((a 1) (found 0) (b (usb-data-buf)))
     (loop
       (when (or (> found 0) (> a 31)) (return found))
       (setf (mem-ref (+ b 4) :u8) 0)
@@ -100,14 +102,17 @@
 
 (defun hid-locate (hub port ls)
   ;; The address of the device behind PORT: the one U-Boot assigned when the
-  ;; port is enabled, else reset the port and give it 32+PORT.  0 = none.
-  (let ((st (hid-port-status hub port)))
-    (if (not (zerop (logand st 2)))
-        (let ((a 2) (found 0))
-          (loop
-            (when (or (> found 0) (> a 31)) (return found))
-            (when (hid-probe-addr a hub port ls) (setq found a))
-            (setq a (+ a 1))))
+  ;; port is enabled, else -- or when no U-Boot address answers (a port enabled
+  ;; but never addressed) -- reset the port and give it 32+PORT.  0 = none.
+  (let ((st (hid-port-status hub port)) (found 0))
+    (when (not (zerop (logand st 2)))
+      (let ((a 2))
+        (loop
+          (when (or (> found 0) (> a 31)) (return nil))
+          (when (hid-probe-addr a hub port ls) (setq found a))
+          (setq a (+ a 1)))))
+    (if (> found 0)
+        found
         (progn
           (usb-control-transfer hub #x23 3 4 port 0 0)
           (dwc2-delay-ms 100)
@@ -182,22 +187,106 @@
       (when (> (usb-control-transfer hub #xA0 6 #x2900 0 (usb-data-buf) 8) 0)
         (let ((n (usb-desc-byte (usb-data-buf) 2)) (p 1))
           (hid-put #x04 n)
+          ;; LOW-speed devices first: once a full-speed device (the keyboard)
+          ;; had been set up through the hub, low-speed splits to the mouse
+          ;; failed on a bus this driver brought up itself; set up first, both
+          ;; work (Zero 2 W behind an Anker hub, booted from SD).
+          (dolist (want-ls (list t nil))
+            (setq p 1)
+            (loop
+              (when (> p n) (return nil))
+              (let ((st (hid-port-status hub p)))
+                ;; connected, and not high speed (bit 10): a split device.
+                (when (and (not (zerop (logand st 1))) (zerop (logand st #x400))
+                           (eq want-ls (not (zerop (logand st #x200)))))
+                  (hid-setup-port hub p want-ls)))
+              (setq p (+ p 1))))
+          ;; what boot found is current: clear the change bits it left, so
+          ;; HID-HOTPLUG-TICK reports only what happens from here on
+          (setq p 1)
           (loop
             (when (> p n) (return nil))
-            (let ((st (hid-port-status hub p)))
-              ;; connected, and not high speed (bit 10): a split device.
-              (when (and (not (zerop (logand st 1))) (zerop (logand st #x400)))
-                (hid-setup-port hub p (not (zerop (logand st #x200))))))
-            ;; what boot found is current: clear the change bits it left, so
-            ;; HID-HOTPLUG-TICK reports only what happens from here on
             (hid-clear-port-changes hub p)
             (setq p (+ p 1)))))))
   (hid-put #x1F0 (hid-magic))
   (list (= (hid-dev-get (hid-kbd) 0) 1) (= (hid-dev-get (hid-mouse) 0) 1)))
 
+;;; ---------------------------------------------------------------------------
+;;; Booted by the firmware alone (no U-Boot)
+;;; ---------------------------------------------------------------------------
+;;; Everything above found the USB bus as U-Boot's `usb start' leaves it: the
+;;; controller powered and in host mode, the hub addressed, its ports powered.
+;;; Booted straight from an SD card nobody has done that -- the controller is not
+;;; even powered -- so there was no keyboard, no mouse.  This does what U-Boot
+;;; does, with U-Boot's register values on this board (read back from a
+;;; netbooted Zero 2 W after `usb start'): DWC2's own DWC2-INIT was written
+;;; against QEMU's model (48 MHz FS/LS clock select, other FIFO sizes), and on
+;;; the real UTMI+ PHY split transactions -- every full/low-speed keyboard and
+;;; mouse behind the high-speed hub -- failed outright with it.
+
+(defun hid-dwc2-init-hw ()
+  ;; Host mode, as U-Boot leaves it: GUSBCFG force-host, turnaround 5, 8-bit
+  ;; UTMI+, SRP/HNP capable (bits 8-9, as U-Boot: without them, splits to the
+  ;; LOW-speed mouse failed while the full-speed keyboard's worked); core reset; GAHBCFG = DMA, INCR4 (0x26); U-Boot's FIFO split;
+  ;; HCFG FS/LS clock select 0 (the 60 MHz UTMI clock); port power on.
+  (let ((cfg (dwc2-read (dwc2-gusbcfg))))
+    (dwc2-write (dwc2-gusbcfg)
+                (logior (logand cfg (logxor (logior (ash 1 30) #x3C00 #x18) #xFFFFFFFF))
+                        (ash 1 29) (ash 5 10) #x300)))
+  (dwc2-delay-ms 50)
+  (dwc2-core-reset)
+  (dwc2-write (dwc2-gahbcfg) #x26)
+  (dwc2-write (dwc2-grxfsiz) #x214)
+  (dwc2-write (dwc2-gnptxfsiz) #x01000214)
+  (dwc2-write (dwc2-hptxfsiz) #x02000314)
+  (dwc2-flush-tx-fifo)
+  (dwc2-flush-rx-fifo)
+  (dwc2-write (dwc2-hcfg) 0)
+  (let ((ch 0))
+    (loop (when (>= ch 16) (return nil))
+      (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
+      (dwc2-write (dwc2-hcintmsk ch) 0)
+      (setq ch (+ ch 1))))
+  (dwc2-write (dwc2-gintmsk) 0)
+  (dwc2-write (dwc2-hprt0) (logior (dwc2-hprt0-read-safe) (hprt0-prtpwr)))
+  (dwc2-delay-ms 100))
+
+(defun hid-usb-bringup ()
+  ;; Power the controller (firmware SET_POWER_STATE, device 3 = USB HCD, on +
+  ;; wait), host init, reset the root port, give the hub address 1, configure it
+  ;; and power its ports.  Returns the hub's address, or 0.
+  (hdmi-mbox-property-1 #x28001 3 3)
+  (hid-dwc2-init-hw)
+  (let ((b (usb-data-buf)))
+    (if (< (dwc2-port-reset) 0)
+        0
+        (progn
+          (dwc2-delay-ms 20)
+          (if (or (<= (usb-get-descriptor 0 1 0 b 8) 0)
+                  (<= (usb-set-address 1) 0))
+              0
+              (progn
+                (dwc2-delay-ms 10)
+                (if (or (<= (usb-get-descriptor 1 1 0 b 18) 0)
+                        (/= (usb-desc-byte b 4) 9)
+                        (<= (usb-get-descriptor 1 2 0 b 9) 0)
+                        (<= (usb-set-configuration 1 (usb-desc-byte b 5)) 0)
+                        (<= (usb-control-transfer 1 #xA0 6 #x2900 0 b 8) 0))
+                    0
+                    (let ((n (usb-desc-byte b 2)) (p 1))
+                      ;; SET_FEATURE(PORT_POWER) on every port, then the hub's
+                      ;; power-on-to-power-good time and a little for devices
+                      (loop (when (> p n) (return nil))
+                        (usb-control-transfer 1 #x23 3 8 p 0 0)
+                        (setq p (+ p 1)))
+                      (dwc2-delay-ms 300)
+                      1))))))))
+
 (defun hid-console-init ()
   ;; At boot, before the REPL banner.  Reports what it found on serial.
   ;; (WRITE-STRING-SERIAL takes a literal: one call per outcome.)
+  ;; No hub on the bus: the firmware booted us, not U-Boot -- bring USB up.
+  (when (zerop (hid-find-hub)) (hid-usb-bringup))
   (let ((r (hid-split-init)))
     (write-string-serial "USB-HID: keyboard ")
     (if (car r) (write-string-serial "yes") (write-string-serial "no"))

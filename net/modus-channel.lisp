@@ -184,9 +184,10 @@
     ;; A STRUCT is a simple vector here -- slot 0 a marker, slot 1 its type
     ;; name -- so it must be caught before the vector arm, or it arrives as a
     ;; plain vector.  It travels as its type name and its slots; the receiver
-    ;; rebuilds it around the genuine marker (see %CHAN-DECODE).
+    ;; rebuilds it around the genuine marker (see %CHAN-DECODE).  ARRAY-LENGTH, not
+    ;; LENGTH: a struct is a vector only underneath, and LENGTH refuses it (b891ebc).
     ((%struct-instance-p x)
-     (let ((n (length x)))
+     (let ((n (array-length x)))
        (%chan-put out 14)
        (%chan-encode-1 out (svref x 1) (+ depth 1))
        (%chan-put-u32 out (- n 2))

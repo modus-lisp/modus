@@ -1423,7 +1423,7 @@
         ;; Bare metal: the core is a RAM range the boot loader placed; the
         ;; arch says what a restored process runs instead of boot init.
         ((string= *cli-arch-core-resume* "") "")
-        (t (concatenate 'string "  (when (%core-requested-p)
+        (t (concatenate 'string "  (when (and (%core-requested-p) (%core-pre-restore))
     (%restore-image)
     (%core-post-restore)
     (%kernel-redirects-reapply)

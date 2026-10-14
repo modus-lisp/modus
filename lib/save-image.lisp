@@ -341,6 +341,10 @@
 ;; the firmware path leaves different.  OPEN: find it, then this is diagnostics
 ;; again and nothing else.
 (defun %core-progress (k) k)
+;; Before a bare-metal restore: T to go ahead.  The Raspberry Pi image replaces
+;; it (build-cl-repl-common.lisp) to report how far the PREVIOUS boot's restore
+;; got and to offer a way past a restore that hangs.
+(defun %core-pre-restore () t)
 
 (defun %restore-image ()
   "Read the snapshot named by argv[2] into this process.  See the file header

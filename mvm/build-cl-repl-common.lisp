@@ -503,6 +503,29 @@
 ;; between the HDMI font and the mutex arena, and the prologue does not clear it),
 ;; readable afterwards from U-Boot (md 0x111F1F00) or the next boot's REPL.
 (defun %core-progress (k) (setf (mem-ref #x111F1F00 :u32) k))
+;; Before restoring: say how far the PREVIOUS boot's restore got (the word above
+;; survives a RUN-pin reset, so a boot that hung is read by the next one, and the
+;; restore itself is not touched -- printing from inside it has always made the
+;; hang go away), then give a person one second to skip the restore and get the
+;; bare REPL instead.  8 = it finished; 0 = it never reached phase 1 (or the
+;; board was powered off, which clears the word).
+(defun %core-pre-restore ()
+  (let ((last (mem-ref #x111F1F00 :u32)))
+    (write-string-serial \"LAST-RESTORE-PHASE=\")
+    (print-dec last)
+    (write-char-serial 10)
+    (setf (mem-ref #x111F1F00 :u32) 0)
+    ;; bytes already waiting are line noise from the reset, not a person
+    (dotimes (i 64)
+      (if (hid-serial-ready-p) (read-char-serial) (return nil)))
+    (write-string-serial \"CORE-SKIP? (a byte on serial within 1 s: no restore)\")
+    (write-char-serial 10)
+    (let ((t0 (mem-ref #x3F003004 :u32)) (go t))
+      (loop
+        (when (> (logand (- (mem-ref #x3F003004 :u32) t0) #xFFFFFFFF) 1000000) (return nil))
+        (when (hid-serial-ready-p) (read-char-serial) (setq go nil) (return nil)))
+      (unless go (write-string-serial \"CORE-SKIPPED\") (write-char-serial 10))
+      go)))
 (defun %core-requested-p ()
   ;; The magic is a HEADER FIELD written with (setf (mem-ref .. :u64) magic),
   ;; i.e. deposited as magic<<1, so read it the same halving way -- NOT the

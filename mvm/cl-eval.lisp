@@ -27,6 +27,9 @@
 ;; Populated by %eval-compound's DEFTYPE branch; allocated lazily (defvar
 ;; init-thunks don't run at boot — CLAUDE.md item 7).
 (defvar *%runtime-deftype-table* nil)
+(defvar *%deftype-name-hashes* nil
+  "Name hash (a symbol's slot 0) -> T for every name DEFTYPE has registered;
+   NIL until the first one.  Written only where a deftype is defined.")
 
 (defun %nsft-init ()
   (setq *native-sym-function-table* (make-hash-table)))
@@ -1007,6 +1010,21 @@
         (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
       (%deftype-pkg-put tname name-str entry)
       (puthash name-str *%runtime-deftype-table* entry)
+      ;; The NAME HASH (slot 0, shared by every symbol of this name) goes in a
+      ;; fixnum-keyed set, so %DEFTYPE-LOOKUP can answer "no deftype" -- the
+      ;; case for every standard type name, on every MAKE-ARRAY with an
+      ;; :ELEMENT-TYPE -- without hashing and comparing name strings.
+      ;; Created SEEDED with every name already registered -- the image boots
+      ;; with deftypes in the table that no runtime DEFTYPE put there -- so the
+      ;; set is never missing a name the table has.
+      (unless *%deftype-name-hashes*
+        (let ((h (make-hash-table :test 'eql)))
+          (maphash (lambda (k v) (declare (ignore v))
+                     (when (stringp k) (puthash (compute-name-hash k) h t)))
+                   *%runtime-deftype-table*)
+          (setq *%deftype-name-hashes* h)))
+      (when (symbolp tname)
+        (puthash (aref tname 0) *%deftype-name-hashes* t))
       (%deftype-warm tname)))
   tname)
 

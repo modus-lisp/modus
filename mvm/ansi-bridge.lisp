@@ -6212,6 +6212,13 @@
    %CLOS-PKG-OBJ-COMPATIBLE."
   (and *%runtime-deftype-table*
        (symbolp head)
+       ;; A name no DEFTYPE ever registered cannot be one: one fixnum probe
+       ;; instead of the name-string lookups below (EQUAL hashing, STRING=),
+       ;; which were ~18% of an Opus decode through MAKE-ARRAY's element type.
+       ;; A collision just takes the full path.  No set at all (a table filled
+       ;; by some other means) also takes the full path.
+       (or (null *%deftype-name-hashes*)
+           (gethash (aref head 0) *%deftype-name-hashes*))
        (let ((nm (%eval-sym-name head)))
          (and nm (or (%deftype-pkg-get head nm)
                      (gethash nm *%runtime-deftype-table*))))))

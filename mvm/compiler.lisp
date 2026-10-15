@@ -8376,16 +8376,21 @@
          (compile-form `(nth ,n (multiple-value-list ,form-arg)) env dest)))
 
       ;; PROG — (prog bindings {tag|form}...) → (let bindings (block nil (tagbody...)))
+      ;; Leading DECLAREs belong to the LET (CLHS PROG): they were spliced into
+      ;; the TAGBODY, where they declare nothing -- cl-bench FFT's whole
+      ;; (declare (fixnum i j ...) (single-float ur ...)) was dropped.
       ((= op-name 306923725)  ; PROG
        (let ((bindings (cadr form))
-             (body (cddr form)))
-         (compile-form `(let ,bindings (block nil (tagbody ,@body))) env dest)))
+             (decls (%leading-declares (cddr form)))
+             (body (nthcdr (length (%leading-declares (cddr form))) (cddr form))))
+         (compile-form `(let ,bindings ,@decls (block nil (tagbody ,@body))) env dest)))
 
       ;; PROG* — (prog* bindings {tag|form}...) → (let* bindings (block nil (tagbody...)))
       ((= op-name 495016015)  ; PROG*
        (let ((bindings (cadr form))
-             (body (cddr form)))
-         (compile-form `(let* ,bindings (block nil (tagbody ,@body))) env dest)))
+             (decls (%leading-declares (cddr form)))
+             (body (nthcdr (length (%leading-declares (cddr form))) (cddr form))))
+         (compile-form `(let* ,bindings ,@decls (block nil (tagbody ,@body))) env dest)))
 
       ;; LOOP-FINISH — exit the current loop (like (return) from a loop)
       ((= op-name 377971397)  ; LOOP-FINISH
@@ -22182,6 +22187,38 @@
                     (consp (cdr ty))
                     (%generic-element-type-p (cadr ty)))))))
 
+(defun %leading-declares (body)
+  "The (DECLARE ...) forms at the head of BODY."
+  (let ((acc nil))
+    (loop
+      (if (and (consp body) (consp (car body)) (symbolp (car (car body)))
+               (name-eq (car (car body)) "DECLARE"))
+          (progn (setq acc (cons (car body) acc)) (setq body (cdr body)))
+          (return (nreverse acc))))))
+
+(defun %type-decl-shorthand-p (head)
+  "True when HEAD, the first element of a declaration specifier, is a type
+   specifier used as the identifier (CLHS 3.3.3.1) -- a known type name, or a
+   compound type -- rather than IGNORE, SPECIAL, OPTIMIZE, INLINE, ..."
+  (cond
+    ((and (consp head) (symbolp (car head)) (car head))
+     (member (symbol-name (car head))
+             '("SIMPLE-ARRAY" "ARRAY" "VECTOR" "SIMPLE-VECTOR" "SIMPLE-STRING"
+               "STRING" "SIGNED-BYTE" "UNSIGNED-BYTE" "INTEGER" "MOD"
+               "SIMPLE-BIT-VECTOR" "BIT-VECTOR" "SINGLE-FLOAT" "DOUBLE-FLOAT"
+               "FLOAT" "REAL" "RATIONAL")
+             :test #'string=))
+    ((and (symbolp head) head)
+     (member (symbol-name head)
+             '("FIXNUM" "SINGLE-FLOAT" "DOUBLE-FLOAT" "SHORT-FLOAT" "LONG-FLOAT"
+               "FLOAT" "INTEGER" "BIT" "CHARACTER" "BASE-CHAR" "STRING"
+               "SIMPLE-STRING" "SIMPLE-VECTOR" "BIT-VECTOR" "SIMPLE-BIT-VECTOR"
+               "LIST" "CONS" "SYMBOL" "KEYWORD" "FUNCTION" "HASH-TABLE" "BOOLEAN"
+               "REAL" "RATIONAL" "RATIO" "NUMBER" "ARRAY" "VECTOR" "SIMPLE-ARRAY"
+               "SIGNED-BYTE" "UNSIGNED-BYTE" "BIGNUM" "COMPLEX" "NULL" "SEQUENCE")
+             :test #'string=))
+    (t nil)))
+
 (defun %declared-types (body)
   "Alist (VAR . TYPE-FORM) from the leading (declare (type TYPE v1 v2 …) …)
    forms of BODY — the same forms strip-declares removes, including those
@@ -22195,11 +22232,20 @@
         ((and (consp (car b)) (symbolp (caar b))
               (string= (symbol-name (caar b)) "DECLARE"))
          (dolist (d (cdar b))
-           (when (and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "TYPE")
-                      (consp (cdr d)))
-             (let ((ty (%resolve-declared-type (cadr d))))
-               (dolist (v (cddr d))
-                 (when (symbolp v) (setq out (cons (cons v ty) out)))))))
+           (cond
+             ((and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "TYPE")
+                   (consp (cdr d)))
+              (let ((ty (%resolve-declared-type (cadr d))))
+                (dolist (v (cddr d))
+                  (when (symbolp v) (setq out (cons (cons v ty) out))))))
+             ;; CLHS 3.3.3.1: (declare (SINGLE-FLOAT x y)) is (TYPE SINGLE-FLOAT
+             ;; x y).  Only the TYPE spelling used to be read, so the shorthand
+             ;; -- cl-bench FFT's (single-float ur ui wr wi tr ti) -- left every
+             ;; such variable undeclared and its arithmetic generic (4x).
+             ((and (consp d) (%type-decl-shorthand-p (car d)))
+              (let ((ty (%resolve-declared-type (car d))))
+                (dolist (v (cdr d))
+                  (when (symbolp v) (setq out (cons (cons v ty) out))))))))
          (setq b (cdr b)))
         (t (return out))))))
 

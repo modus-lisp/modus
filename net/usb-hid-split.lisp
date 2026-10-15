@@ -282,17 +282,44 @@
                       (dwc2-delay-ms 300)
                       1))))))))
 
+;; ONE OWNER, ONCE A BOOT.  A restored core that starts the desk brings USB up in its resume
+;; path, and the REPL's console init used to do it again on top: the second bring-up reset the
+;; hub under the first, which left the keyboard and mouse dead and the hub unanswering.  The
+;; flag is reset by the resume path (a core can be saved with it set) and set here.
+(defvar *hid-console-up* nil)
+
+(defun hid-usb-preconfigured-p ()
+  ;; U-Boot (`usb start') leaves the root port ENABLED (HPRT0 bit 2); after the firmware, or a
+  ;; RUN-pin reset, the controller is at its reset values.  A register read, not a transfer:
+  ;; probing the bus to find out sent transfers to an uninitialised controller.
+  (logbitp 2 (dwc2-read (dwc2-hprt0))))
+
 (defun hid-console-init ()
   ;; At boot, before the REPL banner.  Reports what it found on serial.
   ;; (WRITE-STRING-SERIAL takes a literal: one call per outcome.)
-  ;; No hub on the bus: the firmware booted us, not U-Boot -- bring USB up.
-  (when (zerop (hid-find-hub)) (hid-usb-bringup))
-  (let ((r (hid-split-init)))
-    (write-string-serial "USB-HID: keyboard ")
-    (if (car r) (write-string-serial "yes") (write-string-serial "no"))
-    (write-string-serial ", mouse ")
-    (if (cadr r) (write-string-serial "yes") (write-string-serial "no"))
-    (write-char-serial 10)))
+  (unless *hid-console-up*
+    (if (hid-usb-preconfigured-p)
+        (when (zerop (hid-find-hub)) (hid-usb-bringup))   ; U-Boot's bus: keep it
+        (hid-usb-bringup))
+    (let ((r (hid-split-init)))
+      (write-string-serial "USB-HID: keyboard ")
+      (if (car r) (write-string-serial "yes") (write-string-serial "no"))
+      (write-string-serial ", mouse ")
+      (if (cadr r) (write-string-serial "yes") (write-string-serial "no"))
+      (write-char-serial 10))
+    (setq *hid-console-up* t)))
+
+;; REAL MILLISECONDS.  dwc2.lisp's DWC2-DELAY-MS counts IO-DELAYs (5000 UART reads each), so
+;; how long a "100 ms" wait lasts depends on the bus and the CPU, and a bring-up that worked
+;; with serial prints between its steps hung without them.  The BCM283x system timer (CLO,
+;; 1 MHz) sits 0x97CFFC below the DWC2 in every Pi's peripheral window.  Defined here, not in
+;; dwc2.lisp: this file is only in the 64-bit Pi CL images, where a :u32 time fits a fixnum.
+(defun dwc2-delay-ms (ms)
+  (let* ((clo (- (dwc2-base) #x97CFFC))
+         (t0 (mem-ref clo :u32))
+         (us (* ms 1000)))
+    (loop
+      (when (>= (logand (- (mem-ref clo :u32) t0) #xFFFFFFFF) us) (return nil)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Polling

@@ -2248,23 +2248,13 @@
     ;; holds nothing a reset did not clear.  Unconditionally from the top: after
     ;; a RUN-pin reset HID-FIND-HUB can still find the hub answering while the
     ;; host side is unconfigured, and HID-CONSOLE-INIT then skipped the bring-up.
-    ;; Only for the desk (the REPL's own console init does it otherwise, and a second
-    ;; run of the bring-up undoes the first), and only from the top when nothing set the
-    ;; bus up: under U-Boot (a netboot) the RTL8153 is already vendor-initialised at an
-    ;; address 2..7 for net/r8152.lisp to adopt, and resetting the bus loses that state.
-    (when (and (fboundp (quote hid-usb-bringup))
+    ;; Only for the desk; the REPL's console init otherwise.  HID-CONSOLE-INIT runs once a
+    ;; boot (the flag is cleared here: the core may have been saved with it set) and keeps
+    ;; a bus U-Boot already brought up (net/usb-hid-split.lisp).
+    (when (boundp (quote *hid-console-up*)) (setq *hid-console-up* nil))
+    (when (and (fboundp (quote hid-console-init))
                (boundp (quote *core-restart-hook*)) *core-restart-hook*)
-      (handler-case
-          (progn (if (and (fboundp (quote r8152-find-addr)) (> (r8152-find-addr) 0))
-                     (when (zerop (hid-find-hub)) (hid-usb-bringup))
-                     (hid-usb-bringup))
-                 (let ((r (hid-split-init)))
-                   (write-string-serial \"USB-HID: keyboard \")
-                   (write-string-serial (if (car r) \"yes\" \"no\"))
-                   (write-string-serial \", mouse \")
-                   (write-string-serial (if (cadr r) \"yes\" \"no\"))
-                   (write-char-serial 10)))
-        (t (c) nil)))
+      (handler-case (hid-console-init) (t (c) nil)))
     ;; A restored core skips boot init, so raise the ARM clock here too (the
     ;; firmware idles at 600 MHz on a Zero 2 W); same guarded call as the
     ;; fresh-boot path before E2SMOKE.

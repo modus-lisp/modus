@@ -5388,6 +5388,42 @@
                               (t                  #x1E201800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
 
+          ;; ==== Unboxed DOUBLE-float class (fpd-*): the single-float ops above in
+          ;; double precision on D(2+n).  No FCVT: the boxed payload is already a
+          ;; double.  Same scratch discipline (x9/x10/x16/x17, d0).
+
+          ;; ---- FPD-UNBOX Fd, Vsrc ----  boxed float payload -> FMOV Dd, x9
+          ((= op +op-fpd-unbox+)
+           (let* ((fd (fpp (vr 0)))
+                  (ps (ensure-src (vr 1) +a64-x16+)))
+             (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf fd +a64-x9+)))
+
+          ;; ---- FPD-BOX Vd, Fs ----  FMOV x9, Ds -> fresh boxed double (#x460)
+          ((= op +op-fpd-box+)
+           (let* ((vd (vr 0))
+                  (fs (fpp (vr 1)))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)                            ; first: clobbers x9..x13
+             (a64-fmov-x-d buf +a64-x9+ fs)
+             (a64-movz buf +a64-x10+ #x460 0)
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FPD-ADD/SUB/MUL/DIV Fd, Fa, Fb ----  F<op> Dd, Dn, Dm (type 01)
+          ((or (= op +op-fpd-add+) (= op +op-fpd-sub+)
+               (= op +op-fpd-mul+) (= op +op-fpd-div+))
+           (let* ((fd (fpp (vr 0))) (fa (fpp (vr 1))) (fb (fpp (vr 2)))
+                  (base (cond ((= op +op-fpd-add+) #x1E602800)
+                              ((= op +op-fpd-sub+) #x1E603800)
+                              ((= op +op-fpd-mul+) #x1E600800)
+                              (t                   #x1E601800))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+
           ;; ==== f32x4 vector class on the FP vregs (F0..F5 = v2..v7.4s) ====
           ;; Encodings assembler-verified (ldur/stur q, fadd/fsub/fmul/fdiv .4s,
           ;; dup .4s, ld1r).

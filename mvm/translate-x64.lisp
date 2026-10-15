@@ -1553,6 +1553,14 @@
   "FP vreg N -> xmm: 0-5 -> xmm2..7, 6-11 -> xmm8..13 (caller-saved)."
   (if (< n 6) (+ n 2) (+ 8 (- n 6))))
 
+(defun x64-sse-rr (buf prefix w op reg rm)
+  "Emit [PREFIX] [REX] 0F OP with a register-register ModRM: REG and RM are
+   xmm (or GPR) numbers 0..15; REX carries W and the high bits of REG/RM."
+  (when prefix (emit-bytes buf prefix))
+  (let ((rex (logior (if w 8 0) (if (>= reg 8) 4 0) (if (>= rm 8) 1 0))))
+    (when (/= rex 0) (emit-bytes buf (logior #x40 rex))))
+  (emit-bytes buf #x0F op (logior #xC0 (ash (logand reg 7) 3) (logand rm 7))))
+
 (defun translate-instruction (state opcode operands mvm-next-pos)
   "Translate a single MVM instruction into x86-64 code.
    OPCODE is the numeric MVM opcode.
@@ -4294,6 +4302,46 @@
 
         ;; ==== f32x4 vector class on the FP vregs (F0..F5 = xmm2..xmm7) ====
         ;; Encodings assembler-verified (movups/addps…/shufps/movss).
+
+        ;; ---- Unboxed DOUBLE-float class (fpd-*): the single-float ops above in
+        ;; double precision, with REX emitted for xmm8..13 (x64-fpp maps FP vregs
+        ;; 6..11 there).  RAX/RCX/RDX/xmm0 are scratch, as in the single ops.
+        ((op= +op-fpd-unbox+)
+         (let* ((fd (x64-fpp (first operands)))
+                (vsrc (second operands)))
+           (emit-load-vreg buf vsrc 'rax)
+           (emit-push buf 'rcx) (emit-push buf 'rdx)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
+           (x64-sse-rr buf #x66 t #x6E fd 1)                 ; movq xmmD, rcx
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
+
+        ((op= +op-fpd-box+)
+         (let* ((vd (first operands))
+                (fs (x64-fpp (second operands))))
+           (emit-push buf 'rcx) (emit-push buf 'rdx)
+           (emit-mov-reg-imm buf 'rcx #x460)                 ; (count 4)<<8 | #x60 double
+           (emit-mov-mem-reg buf 'r12 'rcx 0)
+           (x64-sse-rr buf #x66 t #x7E fs 1)                 ; movq rcx, xmmS
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
+           (emit-mcgc-set-start-bit buf 'r12)
+           (emit-lea buf 'rax 'r12 9)
+           (emit-add-reg-imm buf 'r12 48)
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
+        ((or (op= +op-fpd-add+) (op= +op-fpd-sub+) (op= +op-fpd-mul+) (op= +op-fpd-div+))
+         (let* ((fd (x64-fpp (first operands)))
+                (fa (x64-fpp (second operands)))
+                (fb (x64-fpp (third operands)))
+                (sse (cond ((op= +op-fpd-add+) #x58)     ; ADDSD
+                           ((op= +op-fpd-sub+) #x5C)     ; SUBSD
+                           ((op= +op-fpd-mul+) #x59)     ; MULSD
+                           (t                  #x5E))))  ; DIVSD
+           (x64-sse-rr buf nil nil #x28 0 fb)                ; movaps xmm0, xmmB
+           (unless (= fd fa) (x64-sse-rr buf nil nil #x28 fd fa))   ; movaps xmmD, xmmA
+           (x64-sse-rr buf #xF2 nil sse fd 0)))              ; opsd xmmD, xmm0
 
         ((op= +op-v4-lane-load+)
          ;; (v4-lane-load Fd Varr Vidx) — MOVUPS xmmD, [arr + 4*idx + 7]

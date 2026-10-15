@@ -106,6 +106,8 @@
    #:+op-fp-add+ #:+op-fp-sub+ #:+op-fp-mul+ #:+op-fp-div+
    #:mvm-fp-unbox #:mvm-fp-box #:mvm-fp-lane-load #:mvm-fp-lane-store
    #:mvm-fp-add #:mvm-fp-sub #:mvm-fp-mul #:mvm-fp-div
+   #:+op-fpd-unbox+ #:+op-fpd-box+ #:+op-fpd-add+ #:+op-fpd-sub+ #:+op-fpd-mul+ #:+op-fpd-div+
+   #:mvm-fpd-unbox #:mvm-fpd-box #:mvm-fpd-add #:mvm-fpd-sub #:mvm-fpd-mul #:mvm-fpd-div
    #:+op-v4-lane-load+ #:+op-v4-lane-store+ #:+op-v4-dup+ #:+op-v4-dup-lane-load+
    #:+op-v4-add+ #:+op-v4-sub+ #:+op-v4-mul+ #:+op-v4-div+
    #:mvm-v4-lane-load #:mvm-v4-lane-store #:mvm-v4-dup #:mvm-v4-dup-lane-load
@@ -507,6 +509,14 @@
 (defconstant +op-v4-mul+           #xDF)
 (defconstant +op-v4-div+           #xE0)
 (defconstant +op-fp-mov+           #xE1) ; (fp-mov Fd Fs)  full 128-bit register copy (scalar or vector)
+;;; Unboxed DOUBLE-float FP register class: the single-float ops above, in double
+;;; precision.  An FP vreg holds one IEEE double; nothing is live across a call.
+(defconstant +op-fpd-unbox+ #xEB) ; (fpd-unbox Fd Vsrc)  boxed float payload -> double in Fd
+(defconstant +op-fpd-box+   #xEC) ; (fpd-box Vd Fs)      double in Fs -> fresh boxed double-float (allocates)
+(defconstant +op-fpd-add+   #xED) ; (fpd-add Fd Fa Fb)   double-precision arithmetic
+(defconstant +op-fpd-sub+   #xEE)
+(defconstant +op-fpd-mul+   #xEF)
+(defconstant +op-fpd-div+   #xF0)
 ;; INTEGER LANE class (SIMD plan, layer 2b — reel's kernels): the same F vregs
 ;; hold 16 bytes read as u8x16 / s8x16 / s16x8 / s32x4 depending on the op.  No
 ;; boxed form: integer vectors exist only in registers and packed u8 arrays.
@@ -729,6 +739,12 @@
 (defopcode :v4-mul           #xDF (:reg :reg :reg) "f32x4 mul")
 (defopcode :v4-div           #xE0 (:reg :reg :reg) "f32x4 div")
 (defopcode :fp-mov           #xE1 (:reg :reg)      "FP vreg copy (128-bit)")
+(defopcode :fpd-unbox        #xEB (:reg :reg)      "Boxed float -> unboxed double in FP vreg")
+(defopcode :fpd-box          #xEC (:reg :reg)      "Unboxed double in FP vreg -> fresh boxed double-float (allocates)")
+(defopcode :fpd-add          #xED (:reg :reg :reg) "FP vreg double add")
+(defopcode :fpd-sub          #xEE (:reg :reg :reg) "FP vreg double sub")
+(defopcode :fpd-mul          #xEF (:reg :reg :reg) "FP vreg double mul")
+(defopcode :fpd-div          #xF0 (:reg :reg :reg) "FP vreg double div")
 (defopcode :vi-ld    #xE2 (:reg :reg :reg :imm8)       "u8 array bytes → FP vreg lanes (width 4/8/16)")
 (defopcode :vi-st    #xE3 (:reg :reg :reg :imm8)       "FP vreg lanes → u8 array bytes (width 4/8/16)")
 (defopcode :vi-dup   #xE4 (:reg :reg :imm8)            "fixnum → every lane (kind 1/2/4 bytes)")
@@ -1305,6 +1321,12 @@
 (defun mvm-fp-sub (buf fd fa fb) (encode-instruction buf +op-fp-sub+ fd fa fb))
 (defun mvm-fp-mul (buf fd fa fb) (encode-instruction buf +op-fp-mul+ fd fa fb))
 (defun mvm-fp-div (buf fd fa fb) (encode-instruction buf +op-fp-div+ fd fa fb))
+(defun mvm-fpd-unbox (buf fd vs) (encode-instruction buf +op-fpd-unbox+ fd vs))
+(defun mvm-fpd-box (buf vd fs) (encode-instruction buf +op-fpd-box+ vd fs))
+(defun mvm-fpd-add (buf fd fa fb) (encode-instruction buf +op-fpd-add+ fd fa fb))
+(defun mvm-fpd-sub (buf fd fa fb) (encode-instruction buf +op-fpd-sub+ fd fa fb))
+(defun mvm-fpd-mul (buf fd fa fb) (encode-instruction buf +op-fpd-mul+ fd fa fb))
+(defun mvm-fpd-div (buf fd fa fb) (encode-instruction buf +op-fpd-div+ fd fa fb))
 
 (defun mvm-v4-lane-load (buf fd varr vidx) (encode-instruction buf +op-v4-lane-load+ fd varr vidx))
 (defun mvm-v4-lane-store (buf varr vidx fs) (encode-instruction buf +op-v4-lane-store+ varr vidx fs))

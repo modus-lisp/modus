@@ -18250,9 +18250,68 @@
   (and (consp args) (consp (cdr args))
        (every (lambda (a) (%expr-double-float-p a env)) args)))
 
+;;; Unboxed double trees: a call-free tree of double literals and lexical
+;;; variables declared DOUBLE-FLOAT under + - * / is evaluated in the FP
+;;; register pool in double precision (fpd-*), and boxes ONCE at its root --
+;;; (- (* wr br) (* ws bi)) allocates one box, not three.  Runtime-compiled
+;;; code only: the fpd ops exist in the interpreter and the x64 / aarch64
+;;; translators, and the image's other targets never run the JIT.
+
+(defun %fpd-tree-need (form env)
+  "FP registers needed to evaluate FORM as an unboxed double tree, or NIL."
+  (cond
+    ((typep form 'double-float) 1)
+    ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
+          (typep (cadr form) 'double-float)) 1)
+    ((symbolp form)
+     (and form (env-lookup env form) (%expr-double-float-p form env) 1))
+    ((and (consp form) (symbolp (car form))
+          (member (symbol-name (car form)) '("+" "-" "*" "/") :test #'string=)
+          (consp (cdr form)) (consp (cddr form)))
+     (let ((worst (%fpd-tree-need (cadr form) env)))
+       (and worst
+            (dolist (a (cddr form) worst)
+              (let ((n (%fpd-tree-need a env)))
+                (unless n (return nil))
+                (setq worst (max worst (1+ n))))))))
+    (t nil)))
+
+(defun %fpd-arith-op (name)
+  (cond ((string= name "+") :fpd-add)
+        ((string= name "-") :fpd-sub)
+        ((string= name "*") :fpd-mul)
+        (t :fpd-div)))
+
+(defun compile-double-unboxed (form env fd)
+  "Compile the double tree FORM (caller checked %FPD-TREE-NEED) into FP vreg FD."
+  (if (and (consp form) (not (name-eq (car form) "QUOTE")))
+      (let ((op (%fpd-arith-op (symbol-name (car form)))))
+        (compile-double-unboxed (cadr form) env fd)
+        (dolist (arg (cddr form))
+          (let ((ft (alloc-fp-reg)))
+            (compile-double-unboxed arg env ft)
+            (emit-ir op fd fd ft)
+            (free-fp-reg))))
+      ;; a leaf: its boxed value, unboxed once
+      (let ((tmp (alloc-temp-reg)))
+        (compile-form form env tmp)
+        (emit-ir :fpd-unbox fd tmp)
+        (free-temp-reg))))
+
 (defun %compile-double-float-arith (op-name args env dest)
   "Left-fold ARGS with the double-float op OP-NAME (a string): :f<op> per pair,
-   each result a boxed double.  Every operand double-float (caller-checked)."
+   each result a boxed double.  Every operand double-float (caller-checked).
+   A whole call-free tree goes through the FP pool unboxed instead."
+  (let ((tree (cons (%float-op-symbol op-name) args)))
+    (when *mvm-eval-runtime-p*
+      (let ((need (%fpd-tree-need tree env)))
+        (when (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))
+          (let ((fd (alloc-fp-reg)))
+            (compile-double-unboxed tree env fd)
+            (emit-ir :gc-check)
+            (emit-ir :fpd-box dest fd)
+            (free-fp-reg))
+          (return-from %compile-double-float-arith nil)))))
   (let ((firop (%float-arith-op op-name)))
     (compile-form (car args) env dest)
     (dolist (arg (cdr args))
@@ -24666,6 +24725,12 @@
       (:fp-sub 4)
       (:fp-mul 4)
       (:fp-div 4)
+      (:fpd-unbox 3)
+      (:fpd-box 3)
+      (:fpd-add 4)
+      (:fpd-sub 4)
+      (:fpd-mul 4)
+      (:fpd-div 4)
       (:v4-lane-load 4)
       (:v4-lane-store 4)
       (:v4-dup 3)
@@ -25003,6 +25068,12 @@
           (:fp-sub (mvm-fp-sub buf (second insn) (third insn) (fourth insn)))
           (:fp-mul (mvm-fp-mul buf (second insn) (third insn) (fourth insn)))
           (:fp-div (mvm-fp-div buf (second insn) (third insn) (fourth insn)))
+          (:fpd-unbox (mvm-fpd-unbox buf (second insn) (third insn)))
+          (:fpd-box (mvm-fpd-box buf (second insn) (third insn)))
+          (:fpd-add (mvm-fpd-add buf (second insn) (third insn) (fourth insn)))
+          (:fpd-sub (mvm-fpd-sub buf (second insn) (third insn) (fourth insn)))
+          (:fpd-mul (mvm-fpd-mul buf (second insn) (third insn) (fourth insn)))
+          (:fpd-div (mvm-fpd-div buf (second insn) (third insn) (fourth insn)))
           (:v4-lane-load (mvm-v4-lane-load buf (second insn) (third insn) (fourth insn)))
           (:v4-lane-store (mvm-v4-lane-store buf (second insn) (third insn) (fourth insn)))
           (:v4-dup (mvm-v4-dup buf (second insn) (third insn)))

@@ -2268,6 +2268,31 @@
                                  'single-float)))
                  (setf pc npc3)))))
 
+          ;; ---- Unboxed double-float FP register class (reference arm): an FP
+          ;; slot holds a host double-float.
+          (#.+op-fpd-unbox+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (setf (svref fregs fd) (coerce (svref regs vs) 'double-float))
+               (setf pc npc2))))
+          (#.+op-fpd-box+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (fetch-reg bc npc)
+               (setf (svref regs vd) (coerce (svref fregs fs) 'double-float))
+               (setf pc npc2))))
+          ((#.+op-fpd-add+ #.+op-fpd-sub+ #.+op-fpd-mul+ #.+op-fpd-div+)
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (fetch-reg bc npc2)
+                 (let ((a (svref fregs fa)) (b (svref fregs fb)))
+                   (setf (svref fregs fd)
+                         (coerce (cond ((= opcode #.+op-fpd-add+) (+ a b))
+                                       ((= opcode #.+op-fpd-sub+) (- a b))
+                                       ((= opcode #.+op-fpd-mul+) (* a b))
+                                       (t (/ a b)))
+                                 'double-float)))
+                 (setf pc npc3)))))
+
           ;; ---- f32x4 vector class (reference arm): an FP slot holds a
           ;; 4-element host vector of single-floats.
           (#.+op-v4-lane-load+

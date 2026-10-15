@@ -25,3 +25,8 @@
 (defun s-nested2 () (sb-thread:join-thread (sb-thread:make-thread (function t-list2))))
 
 (defun s-badclosure () (let ((x (list 1 2))) (handler-case (progn (bt-spawn (lambda () x)) :started) (error () :refused))))
+
+(defun stop-word () (mem-ref #x10380900 :u32))
+(defun t-hog () (let ((n 0)) (loop (setq n (+ n 1)) (cons n nil) (unless (zerop (stop-word)) (return n)))))
+(defun t-work () (let ((t0 (%irt-ns))) (list :sum (t-sum) :ms (floor (- (%irt-ns) t0) 1000000))))
+(defun preempt-run (no-preempt) (setf (mem-ref #x10380900 :u32) 0) (setf (mem-ref (+ (%bt-table) #x20) :u32) (if no-preempt 1 0)) (let* ((hogs (spawn-n 3 (function t-hog))) (work (spawn-n 3 (function t-work))) (t0 (%irt-ns)) (done 0)) (loop (setq done (count-if (lambda (i) (zerop (%native-thread-alive-p i))) work)) (when (or (= done 3) (> (- (%irt-ns) t0) 20000000000)) (return nil)) (%sleep-ms 50)) (let ((wait-ms (floor (- (%irt-ns) t0) 1000000))) (setf (mem-ref #x10380900 :u32) 1) (list :workers-done done :after-ms wait-ms :work (if (= done 3) (mapcar (function bt-join) work) :stuck) :hogs (mapcar (function bt-join) hogs)))))

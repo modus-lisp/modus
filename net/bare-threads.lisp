@@ -52,6 +52,10 @@
 ;;;; with modus-channel's encoder), never by pointer.  Threads are started from the
 ;;;; main thread.  No preemption: a slot that never blocks keeps its core, and one
 ;;;; that never allocates holds up a region-0 collection until it does.
+;;;; PREEMPTION: a slot runs for a 10 ms slice (a CNTVCT deadline in its per-CPU block
+;;;; at +0x3F00); past it, its next loop back-edge clamps its allocation limit and its
+;;;; next allocation yields the core from inside the collector entry.  A loop that
+;;;; neither allocates nor blocks still keeps its core.
 
 (defun %bare-sync-arena () (values #x10300000 #x10380000))  ; cacheable RAM: LDAXR/STLXR
 
@@ -204,9 +208,18 @@
                     #xd280004f #xd5033bbf #xf900358f #xd503203f #xc8dffe11 #xb5ffffd1
                     #x17fffff5 #xa9400be1 #xa94113e3 #xa9421be5 #xa94323e7 #xa94453f3
                     #xa9455bf5 #xa9466ff7 #xa9477bfd #x910203ff #xd2800000 #xd65f03c0))
+    ;; PREEMPT (S+0x1400, test/rpi-smp/preempt.s): called by the collector entry when a
+    ;; slot's time slice is up -- mark it runnable, clear its deadline, tail-call the
+    ;; switch to its core's scheduler.  Its address at table+0x18 (0x10213018).
+    (%bt-poke (+ s #x1400)
+              (list #xd53bd049 #xd2a2000a #xf29ffd0a #x8b09014a #xf940014a #xf91f815f
+                    #xf940094b #xd341fd6b #xd2a2042c #xf286200c #x8b0b1d8d #xb94021ae
+                    #x8b0e1d8f #x52800030 #xb90061b0 #xd2a20c91 #x8b0e1631 #xa9003e2d
+                    #xd2a20010 #xf281e110 #x8b0b0e09 #x8b0e0e0a #xa9012a29 #x17ffff69))
     (%jit-icache-flush s 8192)
     (%jit-call (+ s #x1100))
     (setf (mem-ref #x10213000 :u64) s)
+    (%gc-write64 #x10213018 (+ s #x1400))
     s))
 
 (defun %bt-entry (sym) (- (%val->word (symbol-function sym)) 3))
@@ -369,7 +382,17 @@
         (%gc-safe-leave)
         (setq last s)
         (setf (mem-ref (+ (%bt-rec s) #x60) :u32) 2)
+        ;; ITS TIME SLICE: a CNTVCT deadline the slot's loops and allocations check
+        ;; (translate-aarch64 STW-CLAMP / STW-ENTRY); past it, it yields at its next
+        ;; allocation.
+        (%gc-write64 (+ (%bt-percpu s) #x3F00)
+                     (if (zerop (mem-ref (%bt-no-preempt-addr) :u32))
+                         (+ (%bt-ticks) (%bt-quantum))
+                         0))
         (%bt-switch c s)))))
+
+(defun %bt-quantum () (floor (cntfrq) 100))   ; 10 ms
+(defun %bt-no-preempt-addr () (+ (%bt-table) #x20))  ; non-zero: slices never end (tests)
 
 (defun %bt-slot-p () (>= (percpu-ref 16) (%bt-first-slot)))
 
@@ -860,7 +883,7 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
    under a spinlock (arena header +0x10): threads make mutexes too."
   (multiple-value-bind (start end) (%bare-sync-arena)
     (let ((lk (+ start #x10)) (r 0))
-      (loop (when (zerop (xchg-mem lk 1)) (return nil)))
+      (loop (when (zerop (xchg-mem lk 1)) (return nil)) (bt-yield))
       (let* ((n (mem-ref start :u32))
              (a (+ start 64 (* n 64))))
         (when (<= (+ a 64) end)

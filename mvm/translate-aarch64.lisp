@@ -7165,11 +7165,27 @@
    the active region's saved-limit field (unless already clamped), so this
    thread's next allocation enters the trampoline and parks there.  Uses
    x15-x17 and x9 (scratch everywhere a YIELD is emitted)."
-  (let ((skip (incf *mvm-label-counter*)))
+  (let ((skip (incf *mvm-label-counter*))
+        (clamp (incf *mvm-label-counter*)))
     (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
     (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
     (a64-cmp-imm buf +a64-x16+ 0)
-    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (if *aarch64-linux-mode*
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+        ;; BARE METAL: also PREEMPTION.  A thread slot's time slice ends at the CNTVCT
+        ;; deadline in its per-CPU block (+0x3F00, 0 = none: the main thread, the
+        ;; schedulers); past it, clamp too, and the collector entry yields the core
+        ;; (EMIT-AARCH64-STW-ENTRY) -- at an allocation, the one place a thread can stop.
+        (progn
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i clamp :bcond))
+          (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
+          (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ #x3F00)
+          (a64-cmp-imm buf +a64-x15+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+          (a64-emit buf (logior #xD53BE040 +a64-x17+))                ; MRS x17, CNTVCT_EL0
+          (a64-cmp-reg buf +a64-x17+ +a64-x15+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i skip :bcond))))
+    (a64-set-label buf clamp)
     (a64-cmp-imm buf +a64-x25+ 0)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
     (a64-load-gc-region buf +a64-x15+ +a64-x16+)
@@ -7234,6 +7250,27 @@
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i park :bl))
       (emit-aarch64-stw-refresh buf reloaded)
       (a64-set-label buf no-park)
+      ;; BARE METAL: the time slice is up (EMIT-AARCH64-STW-CLAMP) -- yield the core.
+      ;; Every mutator register is in this frame, so the routine (net/bare-threads.lisp
+      ;; preempt, its address at 0x10213018) can switch away; when the scheduler runs
+      ;; this slot again, x24/x25 are whatever its region says now (a sibling may have
+      ;; collected it), so the requested end moves with x24 exactly as after a park.
+      (unless *aarch64-linux-mode*
+        (let ((nopre (incf *mvm-label-counter*)))
+          (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
+          (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ #x3F00)
+          (a64-cmp-imm buf +a64-x15+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i nopre :bcond))
+          (a64-emit buf (logior #xD53BE040 +a64-x17+))                ; MRS x17, CNTVCT_EL0
+          (a64-cmp-reg buf +a64-x17+ +a64-x15+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i nopre :bcond))
+          (a64-mov-reg buf +a64-x19+ +a64-x24+)                       ; x24 before (x19 is in the frame)
+          (a64-load-imm64 buf +a64-x16+ #x10213018)
+          (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
+          (a64-blr buf +a64-x15+)
+          (a64-mov-reg buf +a64-x13+ +a64-x19+)
+          (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i reloaded :b))
+          (a64-set-label buf nopre)))
       (a64-cmp-imm buf +a64-x25+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
       (a64-load-gc-region buf +a64-x15+ +a64-x16+)

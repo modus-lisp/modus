@@ -122,7 +122,18 @@ and the core halts (loud, not a dangling pointer).  test/rpi-smp/shim.lisp, one 
     a closure made in the thread's own heap is REFUSED (code -7), not stored where its
     heap's next collection would leave it dangling
 
+PREEMPTION (phase 8): a slot runs a 10 ms slice -- a CNTVCT deadline the scheduler writes in its
+per-CPU block (+0x3F00).  Past it, a loop back-edge clamps the allocation limit (the stop-the-world
+poll, translate-aarch64 STW-CLAMP) and the next allocation enters the collector entry, which calls
+the preempt routine (test/rpi-smp/preempt.s, address at 0x10213018): mark the slot runnable and
+switch to the core's scheduler, every register already in the trampoline's frame.  Only at an
+allocation, the one place a thread can stop safely; a loop that neither allocates nor blocks keeps
+its core.  (preempt-run nil/t), one hog thread looping and consing on each core, then three
+workers placed on the same cores:
+
+    preemption on        workers done 3/3 after 3.4 s, all sums right
+    slices off (control) workers done 0/3 after 20 s -- stuck behind the hogs
+
 NOT YET: a thread SETQ-ing a global it has not bound, or a variable main closed over (with the
 guard armed that is now a !!FAULT, not corruption -- making it a Lisp error on bare metal needs the
-vector to resume into the guard's error path); preemption (a slot
-that never blocks keeps its core); and the board run (core 1 did not start on one board boot).
+vector to resume into the guard's error path); and the board run (core 1 did not start on one board boot).

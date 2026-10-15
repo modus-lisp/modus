@@ -165,12 +165,8 @@
     ((= n 0)
      (%print-char 48 stream))
     (t
-     (let ((digits nil) (tmp n))
-       (loop
-         (when (= tmp 0) (return nil))
-         (setq digits (cons (%digit-char-upper (mod tmp base)) digits))
-         (setq tmp (truncate tmp base)))
-       (dolist (d digits) (%print-char d stream))))))
+     ;; One TRUNCATE per digit, not a MOD and a TRUNCATE.
+     (dolist (d (%fmt-integer-digits n base)) (%print-char d stream)))))
 
 ;;; Print radix prefix: #b, #o, #x, #Nr. Base 10 with *print-radix* is
 ;;; conventionally written with a TRAILING dot (not a leading prefix), so
@@ -2556,6 +2552,26 @@
 ;;;   colonp   T = insert commachar every commaint digits
 ;;;   atp      T = always print sign (+ for non-negative)
 ;;; Non-integer falls back to ~A (princ) — no padding/commas.
+(defun %fmt-integer-digits (n base)
+  "The digit char codes of the non-negative integer N in BASE, most
+   significant first."
+  (if (and (not (bignump n)) (= n 0))
+      (cons 48 nil)
+      (let ((digits nil) (tmp n))
+        (loop
+          (when (and (not (bignump tmp)) (= tmp 0)) (return digits))
+          ;; A fixnum (every digit of every ~D of one): one TRUNCATE and no
+          ;; cons -- %BIGNUM-DIVMOD-FIXNUM's quotient/remainder pair was a
+          ;; sixth of a (format nil "k~d" i).
+          (if (fixnump tmp)
+              (let ((q (truncate tmp base)))
+                (setq digits (cons (%digit-char-upper (- tmp (* q base))) digits))
+                (setq tmp q))
+              (let* ((qr (%bignum-divmod-fixnum tmp base))
+                     (q  (car qr)) (r (cdr qr)))
+                (setq digits (cons (%digit-char-upper r) digits))
+                (setq tmp q)))))))
+
 (defun %fmt-integer (n base mincol padchar commachar commaint colonp atp stream)
   (cond
     ((not (integerp n))
@@ -2563,6 +2579,17 @@
      (let ((*print-escape* nil))
        (declare (special *print-escape*))
        (%write-obj n stream nil nil)))
+    ;; No column and no commas: sign and digits straight to STREAM, without a
+    ;; string stream of its own to build and copy out.
+    ((and (not colonp) (or (null mincol) (<= mincol 0)))
+     (cond
+       ((< n 0) (%print-char 45 stream) (setq n (- 0 n)))
+       (atp     (%print-char 43 stream)))
+     (let ((dl (%fmt-integer-digits n base)))
+       (loop
+         (when (null dl) (return nil))
+         (%print-char (car dl) stream)
+         (setq dl (cdr dl)))))
     (t
      (let ((s (make-string-output-stream)))
        ;; 1. Sign — works on bignum because numeric-value-less-p +
@@ -2572,17 +2599,7 @@
          (atp     (%print-char 43 s)))
        ;; 2. Digits — use %bignum-divmod-fixnum so bignum operands work
        ;; (raw :mod / :div IR is fixnum-only).
-       (let ((digits nil))
-         (cond
-           ((and (not (bignump n)) (= n 0)) (setq digits (cons 48 nil)))
-           (t
-            (let ((tmp n))
-              (loop
-                (when (and (not (bignump tmp)) (= tmp 0)) (return nil))
-                (let* ((qr (%bignum-divmod-fixnum tmp base))
-                       (q  (car qr)) (r (cdr qr)))
-                  (setq digits (cons (%digit-char-upper r) digits))
-                  (setq tmp q))))))
+       (let ((digits (%fmt-integer-digits n base)))
          ;; 3. With colonp, walk digit list emitting commachar at intervals
          (cond
            (colonp

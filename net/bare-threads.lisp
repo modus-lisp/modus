@@ -242,6 +242,14 @@
     ;; The window's self slot = its delta (%TLS-SELF-BASE), so %DYNBIND binds this
     ;; thread's specials in its own storage, and its dynamic-binding stack.
     (%gc-write64 (+ w #xC30) (- w #x10000000))
+    ;; THE SHARED-STORE GUARD'S WORDS: this record's heap is its core's region pair, so
+    ;; a store of one of its objects anywhere else traps (on bare metal: !!FAULT and
+    ;; the core halts -- loud, not a silent dangling pointer), and the SB-THREAD shim's
+    ;; %SB-WORKER-OBJECT-P knows what to copy when a value leaves the thread.
+    (let ((a (+ (%bt-arena) (* (- core 1) 2 (%bt-region-size)))))
+      (%gc-write64 (+ w #x5040) a)
+      (%gc-write64 (+ w #x5048) (+ a (%bt-region-size)))
+      (%gc-write64 (+ w #x5050) (%bt-region-size)))
     (setf (mem-ref (+ w #xC60) :u64) (+ #x10740000 (* i #x4000)))
     (setf (mem-ref (+ pc 16) :u64) i)                 ; CPU id = record index
     (%gc-write64 (+ #x10000F08 (* 8 i)) rcb)          ; its active region: the core's
@@ -804,3 +812,35 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
   (let ((lo (mem-ref #x10000C30 :u32))
         (hi (mem-ref #x10000C34 :u32)))
     (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo))))
+
+;;; ------------------------------------------------------------------ the SB-THREAD shim
+;;; net/sb-thread-shim.lisp brings a process up with hosted's actor-band calls; here the
+;;; band is fixed and %BT-INIT does all of it.
+
+(defun %ha-carve () (if (= (%bt-init) 1) (%ha-base) 0))
+(defun %ha-percpu-base () #x10080000)
+(defun %ha-percpu-init-cpu (base cpu) (declare (ignore base cpu)) 0)
+(defun %ha-set-percpu-mode (v) (declare (ignore v)) 0)
+(defun %ha-percpu-mode () (mem-ref #x10000FF8 :u32))
+(defun %ha-nregions () (%bt-ncores))
+
+(defun %cond-signal (cv) (%cond-bump cv) 0)
+(defun %cond-broadcast (cv) (%cond-bump cv) 0)
+(defun %cond-wait (cv mtx) (%cond-wait-ms cv mtx 0))
+(defun %futex-wake-all (addr) (declare (ignore addr)) 0)
+
+(defun %sync-cell ()
+  "A zeroed 64-byte cell in the cacheable sync arena, or 0 when it is full.  Handed out
+   under a spinlock (arena header +0x10): threads make mutexes too."
+  (multiple-value-bind (start end) (%bare-sync-arena)
+    (let ((lk (+ start #x10)) (r 0))
+      (loop (when (zerop (xchg-mem lk 1)) (return nil)))
+      (let* ((n (mem-ref start :u32))
+             (a (+ start 64 (* n 64))))
+        (when (<= (+ a 64) end)
+          (dotimes (i 8) (%gc-write64 (+ a (* i 8)) 0))
+          (setf (mem-ref start :u32) (+ n 1))
+          (setq r a)))
+      (mfence)
+      (xchg-mem lk 0)
+      r)))

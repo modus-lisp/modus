@@ -104,7 +104,21 @@ waits (join, mutex spin, sleep, condition wait) are SAFE regions: a thread's reg
                                         REPL is gone (READ-ERROR): the shared tables were
                                         pointing into the threads' heaps
 
-NOT YET: a thread SETQ-ing a global it has not bound, or a variable main closed over (the shared-
-store guard is inert here: its window words are 0 and its trap would fault on bare metal); threads
-started from threads; preemption (a slot that never blocks keeps its core); the sb-thread shim
-mapping; and the board run (core 1 did not start on one board boot; it does under QEMU).
+SB-THREAD AND CHANNELS (phase 6): net/sb-thread-shim.lisp and net/modus-channel.lisp run
+unchanged on the slots -- %HA-CARVE & co. map onto %BT-INIT, and the condition-variable entry
+points are the slot runtime's.  Each slot's window carries the SHARED-STORE GUARD words (its
+core's region pair), so the shim's JOIN-THREAD copies a result out of the thread's heap, and a
+compiled store of a thread's object into shared memory traps -- on bare metal that is !!FAULT
+and the core halts (loud, not a dangling pointer).  test/rpi-smp/shim.lisp, one boot:
+
+    (s-value)      make-thread / join-thread                    (1 2 "three" 4)
+    (s-channel)    3 threads x 200 messages -> main on one channel (4 KB ring, back-pressure)
+                                                                SEEN (200 200 200) BAD 0
+    (s-pingpong)   2 threads, 300 round trips over two channels  (OK OK)
+    (s-mutex)      6 threads x 1000 under SB-THREAD:WITH-MUTEX   6000
+    then intern / chain / sum as above, all clean
+
+NOT YET: a thread SETQ-ing a global it has not bound, or a variable main closed over (with the
+guard armed that is now a !!FAULT, not corruption -- making it a Lisp error on bare metal needs the
+vector to resume into the guard's error path); threads started from threads; preemption (a slot
+that never blocks keeps its core); and the board run (core 1 did not start on one board boot).

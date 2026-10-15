@@ -709,11 +709,27 @@
 (defun %struct-printer (name)
   (cdr (assoc name *%struct-printers*)))
 
+(defvar *%print-object-active* nil
+  "The objects a user PRINT-OBJECT method is printing right now, innermost first.")
+
 (defun %user-print-object-p (obj)
-  "True when a PRINT-OBJECT method other than the default applies to OBJ."
-  (let ((gf (%find-gf 'print-object)))
-    (and gf (%gf-methods gf)
-         (not (null (%collect-applicable-methods gf (list obj *standard-output*)))))))
+  "True when a PRINT-OBJECT method other than the default applies to OBJ -- and OBJ
+   is not already being printed by one.  A method that prints its object back
+   through the printer (PRINC/WRITE of the same object, or a fallback method on a
+   general class that does) would otherwise come straight back here and recurse
+   until the depth check: every condition on the Pi images died 'structure nested
+   deeper than 1000 levels', which broke the runtime compiler's out-of-temporaries
+   retry (it reads the error's text) and dropped DEFUNs."
+  (and (not (member obj *%print-object-active* :test (function eq)))
+       (let ((gf (%find-gf 'print-object)))
+         (and gf (%gf-methods gf)
+              (not (null (%collect-applicable-methods gf (list obj *standard-output*))))))))
+
+(defun %print-object-user (obj stream)
+  "PRINT-OBJECT, with OBJ marked as being printed (see %USER-PRINT-OBJECT-P)."
+  (let ((*%print-object-active* (cons obj *%print-object-active*)))
+    (declare (special *%print-object-active*))
+    (print-object obj stream)))
 
 (defun %instance-class-name (obj)
   (let ((c (aref obj 1)))
@@ -920,7 +936,7 @@
       ;; A user PRINT-OBJECT method on the condition's type wins over :REPORT
       ;; and the defaults (ASDF reports MISSING-COMPONENT this way).
       ((and (not preadably) (%condition-p obj) (%user-print-object-p obj))
-       (print-object obj stream))
+       (%print-object-user obj stream))
       ((and (not preadably) (%condition-p obj))
        (if escape
            (progn (%print-string-raw "#<" stream)
@@ -949,14 +965,14 @@
       ((and (%clos-instance-p obj)
             (or (not (%pathname-obj-p obj)) (%user-print-object-p obj)))
        (if (%user-print-object-p obj)
-           (print-object obj stream)
+           (%print-object-user obj stream)
            (%print-instance-default obj stream)))
       ;; Struct instance: a user PRINT-OBJECT method, then the DEFSTRUCT's
       ;; :PRINT-FUNCTION / :PRINT-OBJECT, else #S(TYPE :SLOT v ...).
       ((%struct-instance-p obj)
        (let ((printer (%struct-printer (%struct-type-name obj))))
          (cond
-           ((%user-print-object-p obj) (print-object obj stream))
+           ((%user-print-object-p obj) (%print-object-user obj stream))
            ((and printer (eq (car printer) :print-function))
             (funcall (cdr printer) obj stream (if level level 0)))
            (printer (funcall (cdr printer) obj stream))

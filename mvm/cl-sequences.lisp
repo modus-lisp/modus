@@ -2390,7 +2390,10 @@
   ;; overflowed bound like (ASH 1 64) → 0.  Returning 0 keeps the
   ;; caller alive instead of #DE-trapping into a kernel-killing
   ;; nested-exception loop (we don't install an IDT entry for #DE).
-  (if (= n 0)
+  ;; A double LIMIT skips the zero test: ZEROP of a float goes through the
+  ;; generic NUMERIC-EQUAL-P / %FLOAT-EQ-P chain (most of (random 1d0)'s
+  ;; cost), and 0d0 times the fraction below is 0d0 anyway.
+  (if (and (not (double-float-p n)) (if (fixnump n) (= n 0) (zerop n)))
       0
       ;; The seed lives at #x10000FD8 -- NOT #x100000A0, which is the SECOND
       ;; extra slot of the multiple-value buffer (#x10000098..#x10000138): every
@@ -2413,9 +2416,17 @@
         ;; never terminated).  Scale the 30-bit LCG output into [0,1) and
         ;; multiply: NEXT maxes at #x3FFFFFFF so the fraction is < 1 and the
         ;; product is strictly < N.
-        (if (floatp-impl n)
-            (* n (/ (float next) 1073741824.0))
-            (- next (* (truncate next n) n))))))
+        (cond
+          ;; A DOUBLE limit: the fraction NEXT/2^30 is exact in double (and
+          ;; < 1), and so is N times it short of N -- a double has far more
+          ;; than 30 bits.  The single-float fraction below made (random 1d0)
+          ;; single-precision, and ran through generic arithmetic and
+          ;; single rounding (cl-bench MRG32K3A, which times RANDOM).
+          ((double-float-p n)
+           (%float-mul n (%float-div (%float-from-int next) 1073741824d0)))
+          ((floatp-impl n)
+           (* n (/ (float next) 1073741824.0)))
+          (t (- next (* (truncate next n) n)))))))
 (defun do-special-strings (fn) (funcall fn ""))
 (defun typep* (obj type) (typep obj type))
 

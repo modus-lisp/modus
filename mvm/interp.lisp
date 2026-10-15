@@ -51,6 +51,10 @@
 ;; them; the conservative kind-bitmap gate also rejects such non-object-starts.)
 (declaim (inline reg-get reg-set))
 (defun reg-get (regs v) (%val->word (svref regs v)))
+(defun %interp-fpd-cmp (lt a b)
+  "The :FPD-LT (LT true) / :FPD-LE result for host doubles A and B: 1 or 0."
+  (if (if lt (< a b) (<= a b)) 1 0))
+
 (defun reg-set (regs v w) (setf (svref regs v) (%word->val w)))
 
 ;; Store the NIL / T IMMEDIATES into a register slot WITHOUT going through
@@ -2295,6 +2299,17 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (setf (svref fregs fd) (coerce (svref regs vs) 'double-float))
                (setf pc npc2))))
+          ((#.+op-fpd-lt+ #.+op-fpd-le+)
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (fetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (fetch-reg bc npc2)
+                 ;; Through a CALL: an inline comparison's slow-path helper
+                 ;; does not save live temps, and VD lived in one (it read back
+                 ;; as a double's high bits and the store faulted).
+                 (setf (svref regs vd)
+                       (%interp-fpd-cmp (= opcode #.+op-fpd-lt+)
+                                        (svref fregs fa) (svref fregs fb)))
+                 (setf pc npc3)))))
           (#.+op-fpd-itof+
            (multiple-value-bind (fd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)

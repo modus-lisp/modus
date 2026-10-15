@@ -5405,6 +5405,19 @@
              (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf fd +a64-x9+)))
 
+          ;; ---- FPD-LT / FPD-LE Vd, Fa, Fb ----  FCMP Da, Db; CSET x9, MI / LS
+          ;; (both false for an unordered pair); tag as a fixnum.
+          ((or (= op +op-fpd-lt+) (= op +op-fpd-le+))
+           (let* ((vd (vr 0)) (fa (fpp (vr 1))) (fb (fpp (vr 2)))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-emit buf (logior #x1E602000 (ash fb 16) (ash fa 5)))      ; fcmp Da, Db
+             ;; CSET x9, cond == CSINC x9, xzr, xzr, invert(cond):
+             ;; MI (4) -> PL (5); LS (9) -> HI (8)
+             (a64-emit buf (logior #x9A9F07E0 (ash (if (= op +op-fpd-lt+) 5 8) 12) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
           ;; ---- FPD-ITOF Fd, Vsrc ----  ASR x9, src, 1 ; SCVTF Dd, x9 (no box)
           ((= op +op-fpd-itof+)
            (let* ((fd (fpp (vr 0)))

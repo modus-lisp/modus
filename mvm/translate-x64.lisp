@@ -4333,6 +4333,22 @@
            (x64-sse-rr buf #x66 t #x6E fd 1)                 ; movq xmmD, rcx
            (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
 
+        ((or (op= +op-fpd-lt+) (op= +op-fpd-le+))
+         ;; (fpd-lt/-le Vd Fa Fb) -- UCOMISD Fb, Fa: Fb > Fa is "above" (CF=0,
+         ;; ZF=0) and Fb >= Fa "above or equal" (CF=0); an unordered pair
+         ;; sets CF, so a NaN answers 0 as CL requires.  SETcc, zero-extend,
+         ;; tag as a fixnum.
+         (let ((vd (first operands))
+               (fa (x64-fpp (second operands)))
+               (fb (x64-fpp (third operands))))
+           (x64-sse-rr buf #x66 nil #x2E fb fa)                 ; ucomisd xmmB, xmmA
+           (emit-bytes buf #x0F (if (op= +op-fpd-lt+) #x97 #x93) #xC0)   ; seta / setae al
+           (emit-bytes buf #x0F #xB6 #xC0)                      ; movzx eax, al
+           (emit-shl-reg-imm buf 'rax 1)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
         ((op= +op-fpd-itof+)
          ;; (fpd-itof Fd Vs) -- SAR 1, CVTSI2SD xmmD, rax: a fixnum straight into
          ;; the FP register, with no box.

@@ -18395,8 +18395,9 @@
     ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
           (typep (cadr form) 'double-float)) t)
     ((symbolp form)
-     (let ((ty (%expr-dtype form env)))
-       (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT"))))
+     (or (let ((ty (%expr-dtype form env)))
+           (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")))
+         (and (not (and env (env-lookup env form))) (%double-constant-p form))))
     ((consp form)
      (let ((op (car form)))
        (cond
@@ -18407,8 +18408,9 @@
          ((and (member (symbol-name op) '("+" "-" "*" "/") :test #'string=)
                (consp (cdr form)) (consp (cddr form)))
           (every (lambda (a) (%expr-double-float-p a env)) (cdr form)))
-         ;; unary minus of a double
-         ((and (string= (symbol-name op) "-") (consp (cdr form)) (null (cddr form)))
+         ;; unary minus, or ABS, of a double
+         ((and (or (string= (symbol-name op) "-") (string= (symbol-name op) "ABS"))
+               (consp (cdr form)) (null (cddr form)))
           (%expr-double-float-p (cadr form) env))
          (t (let ((ty (%expr-dtype form env)))
               (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")))))))
@@ -18441,7 +18443,9 @@
     ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
           (typep (cadr form) 'double-float)) 1)
     ((symbolp form)
-     (and form (env-lookup env form) (%expr-double-float-p form env) 1))
+     (cond ((and form (env-lookup env form) (%expr-double-float-p form env)) 1)
+           ((and form (not (env-lookup env form)) (%double-constant-p form)) 1)
+           (t nil)))
     ((assoc form *fpd-hoisted* :test #'eq) 1)
     ((%fpd-unary-minus-p form) (%fpd-tree-need (list '* -1.0d0 (cadr form)) env))
     ((and (consp form) (symbolp (car form))
@@ -19731,6 +19735,35 @@
 ;;; Comparison Operations
 ;;; ============================================================
 
+(defun %compile-float-compare (branch-op a b env dest)
+  "COMPILE-COMPARE-2 for two provably-float operands (see there)."
+  (let ((tmp (alloc-temp-reg))
+        (true-label (make-compiler-label))
+        (end-label (make-compiler-label)))
+    (compile-form a env dest)
+    (emit-ir :push dest)
+    (compile-form b env tmp)
+    (emit-ir :pop dest)
+    (let ((fa (alloc-fp-reg)) (fb (alloc-fp-reg)))
+      (emit-ir :fpd-unbox fa dest)
+      (emit-ir :fpd-unbox fb tmp)
+      (cond ((eq branch-op :blt) (emit-ir :fpd-lt tmp fa fb))
+            ((eq branch-op :bgt) (emit-ir :fpd-lt tmp fb fa))
+            ((eq branch-op :ble) (emit-ir :fpd-le tmp fa fb))
+            (t                   (emit-ir :fpd-le tmp fb fa)))
+      (free-fp-reg) (free-fp-reg))
+    (let ((zero (alloc-temp-reg)))
+      (emit-ir :li zero 0)
+      (emit-ir :cmp tmp zero)
+      (free-temp-reg))
+    (emit-ir :bne true-label)
+    (compile-nil dest)
+    (emit-ir :br end-label)
+    (emit-ir-label true-label)
+    (compile-t dest)
+    (emit-ir-label end-label)
+    (free-temp-reg)))
+
 (defun compile-compare-2 (branch-op a b env dest)
   "Compile a 2-operand comparison, result T or NIL into DEST.
    Fast path: both operands are tagged fixnums (low bit = 0); use :cmp.
@@ -19746,6 +19779,17 @@
      :bge -> NUMERIC->=
 
    Returns T or NIL in DEST in both paths."
+  ;; BOTH OPERANDS PROVABLY FLOATS (runtime compiles, where the fpd ops
+  ;; exist): unbox both and compare in FP registers (:fpd-lt / :fpd-le, NaN
+  ;; unordered) instead of the fixnum tag test and the %CHECKED- helper's
+  ;; generic dispatch and boxed subtraction.  Every boxed float's payload is
+  ;; a double, so single, double and mixed compare exactly.
+  (when (and *mvm-eval-runtime-p*
+             (member branch-op '(:blt :bgt :ble :bge))
+             (or (%expr-double-float-p a env) (%expr-single-float-p a env))
+             (or (%expr-double-float-p b env) (%expr-single-float-p b env))
+             (<= (+ *fp-reg-counter* 2) +fp-reg-max+))
+    (return-from compile-compare-2 (%compile-float-compare branch-op a b env dest)))
   (let ((a-temp     nil)
         (tag-temp   nil)
         (true-label (make-compiler-label))
@@ -22338,12 +22382,27 @@
    names.  %expand-deftype is an image-side function (mvm-eval.lisp); when it
    is not fbound (host-side image build) or it signals, the raw TY is kept,
    which just leaves the fast paths inert for that variable."
-  (if (and (symbolp ty) ty (fboundp (quote %expand-deftype)))
-      (handler-case
-          (let ((x (funcall (quote %expand-deftype) ty)))
-            (if (consp x) x ty))
-        (error () ty))
-      ty))
+  (cond
+    ;; A RANGE of a float format, (double-float 0d0 4294967086d0), is that
+    ;; format for the fast paths (cl-bench MRG32K3A's state words).
+    ((and (consp ty) (symbolp (car ty))
+          (member (symbol-name (car ty)) '("DOUBLE-FLOAT" "SINGLE-FLOAT") :test #'string=))
+     (car ty))
+    ((and (symbolp ty) ty (fboundp (quote %expand-deftype)))
+     (handler-case
+         (let ((x (funcall (quote %expand-deftype) ty)))
+           (if (consp x) x ty))
+       (error () ty)))
+    (t ty)))
+
+(defun %double-constant-p (sym)
+  "At a RUNTIME compile, SYM names a DEFCONSTANT whose value is a double: it
+   is then a double literal to the fast paths (MRG32K3A's +M1+ ...)."
+  (and *mvm-eval-runtime-p* sym (symbolp sym) (not (keywordp sym))
+       (fboundp (quote %constant-var-p))
+       (funcall (quote %constant-var-p) sym)
+       (boundp sym)
+       (typep (symbol-value sym) 'double-float)))
 
 (defun %f32-simple-array-decl-p (ty)
   "True for a declared (simple-array single-float …) — the packed #x12
@@ -25036,6 +25095,8 @@
       (:fpd-unbox 3)
       (:fpd-box 3)
       (:fpd-itof 3)
+      (:fpd-lt 4)
+      (:fpd-le 4)
       (:fpd-add 4)
       (:fpd-sub 4)
       (:fpd-mul 4)
@@ -25380,6 +25441,8 @@
           (:fpd-unbox (mvm-fpd-unbox buf (second insn) (third insn)))
           (:fpd-box (mvm-fpd-box buf (second insn) (third insn)))
           (:fpd-itof (mvm-fpd-itof buf (second insn) (third insn)))
+          (:fpd-lt (mvm-fpd-lt buf (second insn) (third insn) (fourth insn)))
+          (:fpd-le (mvm-fpd-le buf (second insn) (third insn) (fourth insn)))
           (:fpd-add (mvm-fpd-add buf (second insn) (third insn) (fourth insn)))
           (:fpd-sub (mvm-fpd-sub buf (second insn) (third insn) (fourth insn)))
           (:fpd-mul (mvm-fpd-mul buf (second insn) (third insn) (fourth insn)))

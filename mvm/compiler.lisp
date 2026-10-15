@@ -6144,6 +6144,20 @@
 ;;; CL allows (declare ...) forms at the start of let/defun bodies.
 ;;; MVM ignores declarations; this helper strips them.
 
+(defun %drop-docstring (body)
+  "BODY without its docstring: the first string among the leading DECLAREs
+   when more forms follow it (a lone string is the function's value).  The
+   DECLAREs stay."
+  (let ((head nil) (b body))
+    (loop
+      (cond
+        ((and (consp b) (consp (car b)) (symbolp (caar b))
+              (= (compute-name-hash (symbol-name (caar b))) 133791479))  ; DECLARE
+         (setq head (cons (car b) head)) (setq b (cdr b)))
+        ((and (consp b) (stringp (car b)) (cdr b))
+         (return (append (nreverse head) (cdr b))))
+        (t (return body))))))
+
 (defun strip-declares (body)
   "Remove leading (declare ...) forms AND a leading docstring (a string
    that isn't the only form) from BODY.  Without the docstring strip,
@@ -24058,6 +24072,12 @@
    lambda list through here, so one hook covers every binding form that has a
    parameter list.  It returns NIL unless a parameter is actually declared
    special, so every other function compiles byte-identically."
+  ;; THE DOCSTRING GOES FIRST.  The &optional / &key / &aux rewrites below
+  ;; wrap BODY in a LET*, after which a leading docstring is no longer leading
+  ;; -- STRIP-DECLARES never sees it -- and it compiled as an ordinary form:
+  ;; every call of every such function allocated and filled its docstring
+  ;; (GET, 51 characters, was most of its 0.34 us).
+  (setq body (%drop-docstring body))
   (let ((sp (%special-param-rewrite params body)))
     (when sp
       (setq params (car sp))

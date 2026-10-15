@@ -3071,7 +3071,7 @@
   "(values DIGITS N): the magnitude as half-limb digits LSB-first, trimmed, in
    a fresh vector with EXTRA spare zero digits at the top."
   (declare (type simple-vector v))
-  (let* ((n (* 2 len)) (d (make-array (+ n extra) :initial-element 0)) (i 0))
+  (let* ((n (* 2 len)) (d (make-array (+ n extra))) (i 0))
     (loop (when (>= i len) (return nil))
       (let ((l (aref v (+ off i))))
         (aset d (* 2 i) (logand l +half-limb-mask+))
@@ -3085,14 +3085,14 @@
     (loop (when (>= i len) (return nil))
       (let ((lo (aref d (* 2 i)))
             (hi (if (< (+ (* 2 i) 1) n) (aref d (+ (* 2 i) 1)) 0)))
-        (aset v i (%fixnum-+ lo (ash hi +half-limb-bits+))))
+        (aset v i (%fixnum-+ lo (%fixnum-* hi (%fixnum-+ +half-limb-mask+ 1)))))
       (setq i (+ i 1)))
     (%mag-to-int sign v 0 len)))
 
 (defun %digits-mul (a na b nb)
   "(values OUT N): schoolbook product of digit vectors."
   (declare (type simple-vector a b))
-  (let ((out (make-array (+ na nb 1) :initial-element 0)) (i 0))
+  (let ((out (make-array (+ na nb 1))) (i 0))
     (declare (type simple-vector out))
     (loop (when (>= i na) (return nil))
       (let ((ai (aref a i)))
@@ -3112,11 +3112,11 @@
 (defun %digits-divmod-1 (u n v)
   "(values Q-DIGITS R) dividing digits U[0..N-1] by one digit 0 < V < B."
   (declare (type simple-vector u))
-  (let ((q (make-array (max n 1) :initial-element 0)) (r 0) (i (- n 1)))
+  (let ((q (make-array (max n 1))) (r 0) (i (- n 1)))
     (declare (type simple-vector q))
     (loop (when (< i 0) (return nil))
       ;; r*B + u[i] < V*B <= B^2
-      (let* ((num (%fixnum-+ (ash r +half-limb-bits+) (aref u i)))
+      (let* ((num (%fixnum-+ (%fixnum-* r (%fixnum-+ +half-limb-mask+ 1)) (aref u i)))
              (qd (truncate num v)))
         (aset q i qd)
         (setq r (%fixnum-- num (%fixnum-* qd v))))
@@ -3130,9 +3130,9 @@
   (let* ((m (- m+n n))
          (base (%fixnum-+ +half-limb-mask+ 1))
          (d (truncate base (%fixnum-+ (aref v0 (- n 1)) 1)))
-         (u (make-array (+ m+n 1) :initial-element 0))
-         (v (make-array n :initial-element 0))
-         (q (make-array (+ m 1) :initial-element 0)))
+         (u (make-array (+ m+n 1)))
+         (v (make-array n))
+         (q (make-array (+ m 1))))
     (declare (type simple-vector u0 v0 u v q))
     ;; D1: U*D (one digit longer), V*D (its top digit is now >= B/2)
     (let ((carry 0) (i 0))
@@ -3157,7 +3157,7 @@
           (loop
             (when (not (or (>= qhat base)
                            (> (%fixnum-* qhat vnext)
-                              (%fixnum-+ (ash rhat +half-limb-bits+) (aref u (+ j n -2))))))
+                              (%fixnum-+ (%fixnum-* rhat (%fixnum-+ +half-limb-mask+ 1)) (aref u (+ j n -2))))))
               (return nil))
             (setq qhat (%fixnum-- qhat 1))
             (setq rhat (%fixnum-+ rhat vtop))
@@ -3198,15 +3198,60 @@
     (declare (ignore as))
     (multiple-value-bind (bs bv bo bl) (%int-mag b)
       (declare (ignore bs))
-      (if (< (%mag-cmp av ao al bv bo bl) 0)
-          (values 0 a)
+      (cond
+        ((< (%mag-cmp av ao al bv bo bl) 0) (values 0 a))
+        ;; one-digit divisor: one pass over the limbs
+        ((and (= bl 1) (<= (aref bv bo) +half-limb-mask+))
+         (multiple-value-bind (q qn r) (%mag-divmod-small av ao al (aref bv bo))
+           (values (%mag-to-int 1 q 0 qn) r)))
+        (t
           (multiple-value-bind (u un) (%mag-digits av ao al 0)
             (multiple-value-bind (v vn) (%mag-digits bv bo bl 0)
               (if (= vn 1)
                   (multiple-value-bind (q r) (%digits-divmod-1 u un (aref v 0))
                     (values (%digits-to-int 1 q un) r))
                   (multiple-value-bind (q qn r rn) (%digits-divmod u un v vn)
-                    (values (%digits-to-int 1 q qn) (%digits-to-int 1 r rn))))))))))
+                    (values (%digits-to-int 1 q qn) (%digits-to-int 1 r rn)))))))))))
+
+;;; ---- one-digit multiplier / divisor, straight on the limbs ----
+
+(defun %mag-mul-small (v off len d)
+  "(values OUT LEN): magnitude (V OFF LEN) times 0 <= D < B, in one pass over
+   the limbs (each split into its two digits) -- no digit vectors."
+  (declare (type simple-vector v))
+  (let ((out (make-array (+ len 1))) (carry 0) (i 0)
+        (base (%fixnum-+ +half-limb-mask+ 1)))
+    (declare (type simple-vector out))
+    (loop (when (>= i len) (return nil))
+      (let* ((l (aref v (+ off i)))
+             (p1 (%fixnum-+ (%fixnum-* (logand l +half-limb-mask+) d) carry))
+             (p2 (%fixnum-+ (%fixnum-* (ash l +neg-half-limb-bits+) d)
+                            (ash p1 +neg-half-limb-bits+))))
+        (aset out i (%fixnum-+ (logand p1 +half-limb-mask+)
+                               (%fixnum-* (logand p2 +half-limb-mask+) base)))
+        (setq carry (ash p2 +neg-half-limb-bits+)))
+      (setq i (+ i 1)))
+    (aset out len carry)
+    (values out (if (= carry 0) len (+ len 1)))))
+
+(defun %mag-divmod-small (v off len d)
+  "(values Q-OUT Q-LEN R): magnitude (V OFF LEN) divided by 0 < D < B, MSB
+   first over the limbs' digits."
+  (declare (type simple-vector v))
+  (let ((out (make-array (max len 1))) (r 0) (i (- len 1))
+        (base (%fixnum-+ +half-limb-mask+ 1)))
+    (declare (type simple-vector out))
+    (loop (when (< i 0) (return nil))
+      (let* ((l (aref v (+ off i)))
+             (n1 (%fixnum-+ (%fixnum-* r base) (ash l +neg-half-limb-bits+)))
+             (q1 (truncate n1 d))
+             (r1 (%fixnum-- n1 (%fixnum-* q1 d)))
+             (n2 (%fixnum-+ (%fixnum-* r1 base) (logand l +half-limb-mask+)))
+             (q2 (truncate n2 d)))
+        (setq r (%fixnum-- n2 (%fixnum-* q2 d)))
+        (aset out i (%fixnum-+ q2 (%fixnum-* q1 base))))
+      (setq i (- i 1)))
+    (values out (%mag-trim out 0 len) r)))
 
 ;;; ---- the integer operations ----
 
@@ -3233,12 +3278,20 @@
 (defun %int-mul (a b)
   (multiple-value-bind (as av ao al) (%int-mag a)
     (multiple-value-bind (bs bv bo bl) (%int-mag b)
-      (if (or (= al 0) (= bl 0))
-          0
+      (cond
+        ((or (= al 0) (= bl 0)) 0)
+        ;; one side a single digit: one pass over the other's limbs
+        ((and (= bl 1) (<= (aref bv bo) +half-limb-mask+))
+         (multiple-value-bind (o ol) (%mag-mul-small av ao al (aref bv bo))
+           (%mag-to-int (if (= as bs) 1 -1) o 0 ol)))
+        ((and (= al 1) (<= (aref av ao) +half-limb-mask+))
+         (multiple-value-bind (o ol) (%mag-mul-small bv bo bl (aref av ao))
+           (%mag-to-int (if (= as bs) 1 -1) o 0 ol)))
+        (t
           (multiple-value-bind (x xn) (%mag-digits av ao al 0)
             (multiple-value-bind (y yn) (%mag-digits bv bo bl 0)
               (multiple-value-bind (p pn) (%digits-mul x xn y yn)
-                (%digits-to-int (if (= as bs) 1 -1) p pn))))))))
+                (%digits-to-int (if (= as bs) 1 -1) p pn)))))))))
 
 (defun %int-truncate2 (a b)
   "(values Q R), CLHS TRUNCATE of integers A and B /= 0."
@@ -3265,7 +3318,7 @@
           (let* ((whole (truncate count +half-limb-bits+))
                  (bits (%fixnum-- count (%fixnum-* whole +half-limb-bits+)))
                  (p (%pow2-small bits))
-                 (out (make-array (+ n whole 1) :initial-element 0))
+                 (out (make-array (+ n whole 1)))
                  (carry 0) (i 0))
             (loop (when (>= i n) (return nil))
               (let ((x (%fixnum-+ (%fixnum-* (aref d i) p) carry)))   ; < B^2
@@ -3288,7 +3341,7 @@
                  (lost nil))
             (if (<= nn 0)
                 (if (= as -1) -1 0)
-                (let ((out (make-array nn :initial-element 0)) (i 0))
+                (let ((out (make-array nn)) (i 0))
                   ;; digits dropped whole
                   (loop (when (or (>= i whole) lost) (return nil))
                     (unless (= (aref d i) 0) (setq lost t))
@@ -3374,21 +3427,27 @@
     (%mag-trim out 0 (+ n 1))))
 
 (defun %int-gcd-lehmer (a b)
-  "gcd of non-negative integers A, B."
+  "gcd of non-negative integers A, B.  The pair stays in digit vectors for the
+   whole loop; only the answer is converted back."
   (when (< (%int-cmp a b) 0) (let ((tmp a)) (setq a b) (setq b tmp)))
-  (loop
-    (when (eql b 0) (return a))
-    (when (and (not (bignump a)) (not (bignump b)))
-      ;; both fixnums: plain Euclid
-      (loop (when (= b 0) (return nil))
-        (let ((r (rem a b))) (setq a b) (setq b r)))
-      (return a))
-    (multiple-value-bind (as av ao al) (%int-mag a)
-      (declare (ignore as))
-      (multiple-value-bind (bs bv bo bl) (%int-mag b)
-        (declare (ignore bs))
-        (multiple-value-bind (u un) (%mag-digits av ao al 1)
-          (multiple-value-bind (v vn) (%mag-digits bv bo bl 1)
+  (when (eql b 0) (return-from %int-gcd-lehmer a))
+  (when (and (not (bignump a)) (not (bignump b)))
+    (loop (when (= b 0) (return a))
+      (let ((r (rem a b))) (setq a b) (setq b r))))
+  (multiple-value-bind (as av ao al) (%int-mag a)
+    (declare (ignore as))
+    (multiple-value-bind (bs bv bo bl) (%int-mag b)
+      (declare (ignore bs))
+      (multiple-value-bind (u un) (%mag-digits av ao al 1)
+        (multiple-value-bind (v vn) (%mag-digits bv bo bl 1)
+          (loop
+            (when (= vn 0) (return (%digits-to-int 1 u un)))
+            (when (<= un 2)
+              ;; both fit a fixnum now: finish with plain Euclid
+              (let ((x (%digits-to-int 1 u un)) (y (%digits-to-int 1 v vn)))
+                (loop (when (= y 0) (return nil))
+                  (let ((r (rem x y))) (setq x y) (setq y r)))
+                (return x)))
             (let* ((k (max 0 (- (%digits-bitlen u un) +half-limb-bits+)))
                    (ah (%digits-top u un k))
                    (bh (%digits-top v vn k))
@@ -3403,19 +3462,25 @@
                   (let ((tt (%fixnum-- y (%fixnum-* q w)))) (setq y w) (setq w tt))
                   (let ((tt (%fixnum-- ah (%fixnum-* q bh)))) (setq ah bh) (setq bh tt))))
               (if (= y 0)
-                  ;; L4: no progress from the leading digits -- one full step
-                  (multiple-value-bind (q r) (%int-divmod-mag a b)
-                    (declare (ignore q))
-                    (setq a b)
-                    (setq b r))
-                  ;; L4: A, B := xA + yB, zA + wB
+                  ;; L4: no progress from the leading digits -- one full
+                  ;; division step, U, V := V, U mod V
+                  (if (= vn 1)
+                      (multiple-value-bind (q r) (%digits-divmod-1 u un (aref v 0))
+                        (declare (ignore q))
+                        (setq u v) (setq un vn)
+                        (setq v (vector r)) (setq vn (if (= r 0) 0 1)))
+                      (multiple-value-bind (q qn r rn) (%digits-divmod u un v vn)
+                        (declare (ignore q qn))
+                        (setq u v) (setq un vn)
+                        (setq v r) (setq vn rn)))
+                  ;; L4: U, V := xU + yV, zU + wV
                   (let* ((n (max un vn))
-                         (o1 (make-array (+ n 2) :initial-element 0))
-                         (o2 (make-array (+ n 2) :initial-element 0))
+                         (o1 (make-array (+ n 2)))
+                         (o2 (make-array (+ n 2)))
                          (n1 (%digits-lincomb x u un y v vn n o1))
                          (n2 (%digits-lincomb z u un w v vn n o2)))
-                    (setq a (%digits-to-int 1 o1 n1))
-                    (setq b (%digits-to-int 1 o2 n2)))))))))))
+                    (setq u o1) (setq un n1)
+                    (setq v o2) (setq vn n2))))))))))
 
 ;;; ---- ISQRT: Newton from the root of the top half (precision doubling) ----
 

@@ -3184,7 +3184,7 @@
    helpers — so we call the bare defun by name in the fast path."
   (let ((gf (%find-gf 'shared-initialize)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (%shared-init-default-spread args)))
@@ -3504,7 +3504,7 @@
    has user methods (cheap path)."
   (let ((gf (%find-gf 'change-class)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (%change-class-default-spread args)))
@@ -5622,7 +5622,7 @@
    when nargs > +max-reg-args+."
   (let ((gf (%find-gf 'initialize-instance)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (%initialize-instance-default-1 (car args) t (cdr args))))
@@ -5644,7 +5644,7 @@
 (defun %dispatch-no-applicable-method (args)
   (let ((gf (%find-gf 'no-applicable-method)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (apply #'%no-applicable-method-default args)))
@@ -5660,7 +5660,7 @@
 (defun %dispatch-no-next-method (args)
   (let ((gf (%find-gf 'no-next-method)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (apply #'%no-next-method-default args)))
@@ -5684,7 +5684,7 @@
   (let ((gf (%find-gf 'slot-missing))
         (args (list class instance slot-name operation new-value)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (%slot-missing-default class instance slot-name operation new-value)))
@@ -5749,7 +5749,7 @@
 (defun %dispatch-uifdc (args)
   (let ((gf (%find-gf 'update-instance-for-different-class)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (apply #'%uifdc-default args)))
@@ -5765,7 +5765,7 @@
 (defun %dispatch-uifrc (args)
   (let ((gf (%find-gf 'update-instance-for-redefined-class)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (apply #'%uifrc-default args)))
@@ -5791,7 +5791,7 @@
 (defun %dispatch-print-object (args)
   (let ((gf (%find-gf 'print-object)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (apply #'%print-object-default args)))
@@ -5809,7 +5809,7 @@
 (defun %dispatch-describe-object (args)
   (let ((gf (%find-gf 'describe-object)))
     (if (and gf (%gf-methods gf))
-        (let ((applicable (%collect-applicable-methods gf args)))
+        (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable
               (%gf-dispatch-standard gf args applicable)
               (apply #'%describe-object-default args)))

@@ -375,6 +375,7 @@
                 (when (not (eq (car (car cur)) name))
                   (setq new-registry (cons (car cur) new-registry)))
                 (setq cur (cdr cur)))
+              (%clos-reg-memo-drop)
               (setq *clos-classes* (cons (cons name cls) new-registry))
               (setq *clos-find-memo* nil))))
       name)))
@@ -697,6 +698,63 @@
    native build path this is a plain identity call."
   f)
 
+;;; Per-class-name registry memo.  %CLOS-SLOT-INFO-FOR, %CLASS-SLOTS-FOR,
+;;; %DIRECT-SLOTS-FOR and %CLOS-DEFAULT-INITARGS-1 each scan an alist by EQ
+;;; and, on a miss, again by name hash -- and a miss is the usual answer
+;;; (STANDARD-OBJECT and T are in every CPL, most classes have no default
+;;; initargs), so MAKE-INSTANCE paid two full scans per CPL class per lookup.
+;;; One EQ table per registry, NAME -> answer (:%NONE for NIL), dropped
+;;; whenever any of these registries is set.  Main thread only, as
+;;; *GF-FIND-MEMO*.
+(defvar *clos-reg-memo* nil)
+
+(defun %clos-reg-memo-drop () (setq *clos-reg-memo* nil))
+
+(defun %clos-reg-memo-vector ()
+  (let ((v (make-array 8)) (i 0))
+    (loop (when (= i 8) (return v))
+      (setf (svref v i) (make-hash-table :test (quote eq)))
+      (setq i (+ i 1)))))
+
+(defun %clos-reg-memo2 (idx name key scan)
+  "SCAN's answer for (NAME KEY) through slot IDX: NAME -> alist of
+   (KEY . answer), KEY compared by EQ.  For the CPL-walking per-slot and
+   per-initarg lookups MAKE-INSTANCE repeats for every instance; dropped with
+   the rest of *CLOS-REG-MEMO*, which a class (CPL) change drops too."
+  (if (and (symbolp name) name (symbolp key) (%gf-cache-writable-p))
+      (let ((v *clos-reg-memo*))
+        (when (null v)
+          (setq v (%clos-reg-memo-vector))
+          (setq *clos-reg-memo* v))
+        (let* ((tbl (svref v idx))
+               (al (gethash name tbl))
+               (e (let ((x al))
+                    (loop (when (null x) (return nil))
+                      (when (eq (car (car x)) key) (return (car x)))
+                      (setq x (cdr x))))))
+          (if e
+              (if (eq (cdr e) :%none) nil (cdr e))
+              (let ((r (funcall scan name key)))
+                (puthash name tbl (cons (cons key (if r r :%none)) al))
+                r))))
+      (funcall scan name key)))
+
+(defun %clos-reg-memo (idx name scan)
+  "SCAN's answer for NAME through slot IDX of *CLOS-REG-MEMO*."
+  (if (and (symbolp name) name (%gf-cache-writable-p))
+      (let ((v *clos-reg-memo*))
+        (when (null v)
+          (setq v (%clos-reg-memo-vector))
+          (setq *clos-reg-memo* v))
+        (let* ((tbl (svref v idx))
+               (hit (gethash name tbl)))
+          (cond ((eq hit :%none) nil)
+                (hit hit)
+                (t (let ((r (funcall scan name)))
+                     (puthash name tbl (if r r :%none))
+                     r)))))
+      (funcall scan name)))
+
 (defun %register-clos-slot-info (class-name initarg-map initform-map)
   "Register per-slot initarg→slot mapping and initform thunks for CLASS-NAME.
    Called from rewriter-emitted code right after %defclass."
@@ -708,6 +766,7 @@
       (when (not (eq (car (car cur)) class-name))
         (setq new-reg (cons (car cur) new-reg)))
       (setq cur (cdr cur)))
+    (%clos-reg-memo-drop)
     (setq *clos-slot-info*
           (cons (cons class-name (cons initarg-map initform-map))
                 new-reg)))
@@ -737,11 +796,15 @@
       (when (not (eq (car (car cur)) class-name))
         (setq new-reg (cons (car cur) new-reg)))
       (setq cur (cdr cur)))
+    (%clos-reg-memo-drop)
     (setq *clos-class-slots*
           (cons (cons class-name class-slot-names) new-reg)))
   class-name)
 
 (defun %class-slots-for (class-name)
+  (%clos-reg-memo 1 class-name (function %class-slots-for-scan)))
+
+(defun %class-slots-for-scan (class-name)
   "Return list of class-allocated slot names for CLASS-NAME (no CPL walk).
    TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
    byte-identical), name-hash fallback for the mvm-eval class-name boundary."
@@ -749,13 +812,13 @@
     (loop
       (when (null cur) (return nil))
       (when (eq (car (car cur)) class-name)
-        (return-from %class-slots-for (cdr (car cur))))
+        (return-from %class-slots-for-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   (let ((cur *clos-class-slots*))
     (loop
       (when (null cur) (return nil))
       (when (%clos-class-name-eq (car (car cur)) class-name)
-        (return-from %class-slots-for (cdr (car cur))))
+        (return-from %class-slots-for-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
 
@@ -776,11 +839,15 @@
       (when (not (eq (car (car cur)) class-name))
         (setq new-reg (cons (car cur) new-reg)))
       (setq cur (cdr cur)))
+    (%clos-reg-memo-drop)
     (setq *clos-direct-slots*
           (cons (cons class-name direct-slot-names) new-reg)))
   class-name)
 
 (defun %direct-slots-for (class-name)
+  (%clos-reg-memo 2 class-name (function %direct-slots-for-scan)))
+
+(defun %direct-slots-for-scan (class-name)
   "Return list of direct-slot-names for CLASS-NAME (any allocation).
    TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
    byte-identical), name-hash fallback for the mvm-eval class-name boundary."
@@ -788,17 +855,20 @@
     (loop
       (when (null cur) (return nil))
       (when (eq (car (car cur)) class-name)
-        (return-from %direct-slots-for (cdr (car cur))))
+        (return-from %direct-slots-for-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   (let ((cur *clos-direct-slots*))
     (loop
       (when (null cur) (return nil))
       (when (%clos-class-name-eq (car (car cur)) class-name)
-        (return-from %direct-slots-for (cdr (car cur))))
+        (return-from %direct-slots-for-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
 
 (defun %slot-class-owner (class-name slot-name)
+  (%clos-reg-memo2 5 class-name slot-name (function %slot-class-owner-scan)))
+
+(defun %slot-class-owner-scan (class-name slot-name)
   "Return the class-name in CLASS-NAME's CPL that declared SLOT-NAME
    as :allocation :class — or NIL if no class-allocation found, or NIL
    if a more-specific class shadows an ancestor's :class allocation with
@@ -810,7 +880,7 @@
      (shadowing — slot lives on the instance, no class storage)
    - Otherwise continue walking."
   (let ((cls (%find-clos-class class-name)))
-    (when (null cls) (return-from %slot-class-owner nil))
+    (when (null cls) (return-from %slot-class-owner-scan nil))
     (let ((cpl (aref cls 4))
           (result nil)
           (decided nil))
@@ -879,6 +949,9 @@
           (setq cur (cdr cur)))))))
 
 (defun %clos-slot-info-for (class-name)
+  (%clos-reg-memo 0 class-name (function %clos-slot-info-for-scan)))
+
+(defun %clos-slot-info-for-scan (class-name)
   "Return (initarg-map . initform-map) for CLASS-NAME, or nil.
 
    TWO PASSES, mirroring %find-clos-class.  Pass 1 is the historical
@@ -897,13 +970,13 @@
     (loop
       (when (null cur) (return nil))
       (when (eq (car (car cur)) class-name)
-        (return-from %clos-slot-info-for (cdr (car cur))))
+        (return-from %clos-slot-info-for-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   (let ((cur *clos-slot-info*))
     (loop
       (when (null cur) (return nil))
       (when (%clos-class-name-eq (car (car cur)) class-name)
-        (return-from %clos-slot-info-for (cdr (car cur))))
+        (return-from %clos-slot-info-for-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
 
@@ -977,6 +1050,9 @@
         (setq cur (cdr cur))))))
 
 (defun %clos-initarg-to-slots (class-name initarg-key)
+  (%clos-reg-memo2 4 class-name initarg-key (function %clos-initarg-to-slots-scan)))
+
+(defun %clos-initarg-to-slots-scan (class-name initarg-key)
   "Map INITARG-KEY to the LIST of all slot-names it initializes, walking
    the class's CPL.  CLHS 7.1.4: one initarg may set several slots."
   (let ((acc (%clos-initarg-lookup-all-1 class-name initarg-key nil)))
@@ -1003,13 +1079,16 @@
           (setq cur (cdr cur)))))))
 
 (defun %clos-initform-thunk (class-name slot-name)
+  (%clos-reg-memo2 6 class-name slot-name (function %clos-initform-thunk-scan)))
+
+(defun %clos-initform-thunk-scan (class-name slot-name)
   "Return the initform thunk for SLOT-NAME in CLASS-NAME, walking the
    CPL — inherited slots get their parent's initform.  Without the
    walk, subclass instances would leave inherited slots unbound."
   (let ((direct (%clos-initform-thunk-1 class-name slot-name)))
-    (when direct (return-from %clos-initform-thunk direct)))
+    (when direct (return-from %clos-initform-thunk-scan direct)))
   (let ((cls (%find-clos-class class-name)))
-    (when (null cls) (return-from %clos-initform-thunk nil))
+    (when (null cls) (return-from %clos-initform-thunk-scan nil))
     (let ((cpl (cdr (aref cls 4))))
       (let ((cur cpl))
         (loop
@@ -1061,11 +1140,15 @@
       (when (not (eq (car (car cur)) class-name))
         (setq new-reg (cons (car cur) new-reg)))
       (setq cur (cdr cur)))
+    (%clos-reg-memo-drop)
     (setq *clos-default-initargs*
           (cons (cons class-name initarg-thunks) new-reg)))
   class-name)
 
 (defun %clos-default-initargs-1 (class-name)
+  (%clos-reg-memo 3 class-name (function %clos-default-initargs-1-scan)))
+
+(defun %clos-default-initargs-1-scan (class-name)
   "Return the directly-declared default-initarg thunks for CLASS-NAME
    (no CPL walk).  Returns nil if none registered.
    TWO PASSES (see %clos-slot-info-for): exact-eq first (native path,
@@ -1074,13 +1157,13 @@
     (loop
       (when (null cur) (return nil))
       (when (eq (car (car cur)) class-name)
-        (return-from %clos-default-initargs-1 (cdr (car cur))))
+        (return-from %clos-default-initargs-1-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   (let ((cur *clos-default-initargs*))
     (loop
       (when (null cur) (return nil))
       (when (%clos-class-name-eq (car (car cur)) class-name)
-        (return-from %clos-default-initargs-1 (cdr (car cur))))
+        (return-from %clos-default-initargs-1-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
 
@@ -1103,13 +1186,16 @@
       (setq cur (cdr cur)))))
 
 (defun %clos-default-initargs-for-class (class-name)
+  (%clos-reg-memo 7 class-name (function %clos-default-initargs-for-class-scan)))
+
+(defun %clos-default-initargs-for-class-scan (class-name)
   "Return the combined default-initargs alist (initarg-key . thunk) for
    CLASS-NAME walking its CPL.  Per CLHS 7.1.4, more-specific classes
    win — when two classes in the CPL declare the same key, the
    more-specific class's thunk is used.  Returns a fresh list in CPL
    (most-specific first) order."
   (let ((cls (%find-clos-class class-name)))
-    (when (null cls) (return-from %clos-default-initargs-for-class nil))
+    (when (null cls) (return-from %clos-default-initargs-for-class-scan nil))
     (let ((seen-keys nil)
           (result nil))
       (let ((cur (aref cls 4)))
@@ -1139,6 +1225,14 @@
    NIL.  See reference_aa64_fixnum_zero_nil.md.  Numeric comparisons
    work correctly on fixnum 0 vs -1, so callers now use `(< idx 0)`
    to detect the not-found case."
+  ;; EQ first: the query is almost always the very symbol the class stored,
+  ;; and the name-robust test below is several calls per slot.
+  (let ((cur (aref cls 2)) (i 0))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car cur) slot-name) (return-from %clos-slot-index i))
+      (setq i (+ i 1))
+      (setq cur (cdr cur))))
   (let ((slots (aref cls 2))
         (idx 0))
     (let ((cur slots))
@@ -1162,11 +1256,14 @@
 (defun %clos-cpl-name-member-p (class-name cpl-names)
   "True if CLASS-NAME (a specializer symbol) is EQ to some entry in
    CPL-NAMES, or name-matches one (mvm-eval class-name boundary)."
+  ;; EQ over the whole list first: a miss is the common answer, and the name
+  ;; test is several calls per element.
+  (when (member class-name cpl-names :test (function eq))
+    (return-from %clos-cpl-name-member-p t))
   (let ((cur cpl-names))
     (loop
       (when (null cur) (return nil))
-      (when (or (eq (car cur) class-name)
-                (%clos-class-name-eq (car cur) class-name))
+      (when (%clos-class-name-eq (car cur) class-name)
         (return t))
       (setq cur (cdr cur)))))
 
@@ -1210,9 +1307,32 @@
    `initialize-instance :after ((plan plan-traversal) &key ... &allow-other-keys)`
    is exactly this shape — without honoring it, (make-instance 'sequential-plan
    :system s :verbose t) wrongly rejected :verbose and every asdf OPERATE died."
-  (let ((cpl-names (%clos-class-cpl-names class-name)))
-    (or (%clos-init-gf-allows-other-keys-p 'initialize-instance cpl-names)
-        (%clos-init-gf-allows-other-keys-p 'shared-initialize cpl-names))))
+  ;; Memoised per class, stamped with what the answer depends on: the
+  ;; dispatch epoch (any CPL change) and the two GFs' method lists (replaced,
+  ;; not mutated, by %GF-SET-METHODS).  Unmemoised, every MAKE-INSTANCE walked
+  ;; every INITIALIZE-INSTANCE method -- one :AFTER method per class in
+  ;; cl-bench's hierarchy -- checking CPL membership by name.
+  (let* ((ii (%find-gf 'initialize-instance))
+         (si (%find-gf 'shared-initialize))
+         (iim (and ii (%gf-methods ii)))
+         (sim (and si (%gf-methods si)))
+         (ep (%gf-cache-epoch))
+         (memo (and (symbolp class-name) class-name (%gf-cache-writable-p)
+                    (or *clos-aok-memo*
+                        (setq *clos-aok-memo* (make-hash-table :test (quote eq))))))
+         (hit (and memo (gethash class-name memo))))
+    (if (and hit (eql (svref hit 0) ep) (eq (svref hit 1) iim) (eq (svref hit 2) sim))
+        (svref hit 3)
+        (let* ((cpl-names (%clos-class-cpl-names class-name))
+               (r (if (or (%clos-init-gf-allows-other-keys-p 'initialize-instance cpl-names)
+                          (%clos-init-gf-allows-other-keys-p 'shared-initialize cpl-names))
+                      t nil)))
+          (when memo (puthash class-name memo (vector ep iim sim r)))
+          r))))
+
+(defvar *clos-aok-memo* nil
+  "EQ hash: class name -> #(epoch ii-methods si-methods answer) for
+   %CLOS-METHODS-ACCEPT-OTHER-INITARGS-P.")
 
 (defun %clos-initarg-key-string (key)
   "Printable NAME of an initarg key, or NIL when it can't be recovered.
@@ -2339,48 +2459,125 @@
   ;; %MVM-ON-MAIN-THREAD-P's test, here because not every image has mvm-eval.
   (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil)))
 
-(defun %gf-cache-get (gf args)
-  "The cached applicable-method list for ARGS, or NIL."
-  (when (and (>= (array-length gf) 10) (consp args))
-    (let ((c (aref gf 9)) (a (car args)))
-      (when (and (consp c) (eql (car c) (%gf-cache-epoch)) (%clos-instance-p a))
-        (let ((k (aref a 1)) (n (length args)) (e (cdr c)))
-          (loop
-            (when (null e) (return nil))
-            (let ((x (car e)))
-              (when (and (eq (car x) k) (eql (car (cdr x)) n))
-                (return (cdr (cdr x)))))
-            (setq e (cdr e))))))))
+;;; THE KEY.  Every argument position some method specialises (non-T) is part
+;;; of the key, one entry per position: a CLOS instance by its class name
+;;; (slot 1, what %OBJ-CPL resolves); a fixnum, character, keyword, other
+;;; symbol, NIL, T, float, bignum or ratio by a fixed tag (floats, bignums and
+;;; ratios by subtag), whose applicable methods cannot differ within the tag.
+;;; Any other argument there -- an array, a string, a cons, a struct -- makes
+;;; the call uncacheable, as does any EQL specialiser on the GF.  (Only a
+;;; first-argument instance with every other position T used to be cached:
+;;; one NUMBER-specialised second parameter, cl-bench's SIMPLE-METHOD, and
+;;; every call collected and sorted the applicable methods again.)
+(defun %gf-arg-key (a)
+  (cond ((%clos-instance-p a) (aref a 1))
+        ((fixnump a) :%fixnum)
+        ((null a) :%null)
+        ((eq a t) :%t)
+        ((characterp a) :%char)
+        ((consp a) nil)
+        ((keywordp a) :%keyword)
+        ((symbolp a) :%symbol)
+        ((or (%ieee-float-p a) (bignump a) (ratiop a)) (+ 100000 (obj-subtag a)))
+        (t nil)))
 
-(defun %gf-cacheable-p (gf)
-  "True iff every method of GF dispatches on the first argument's class alone."
-  (let ((ms (%gf-methods gf)) (ok t))
+(defun %gf-cache-keys (positions args)
+  "The key list for ARGS at POSITIONS, or :%NO when one is uncacheable."
+  (let ((acc nil) (i 0) (a args) (p positions))
     (loop
-      (when (or (null ms) (not ok)) (return ok))
-      (let ((specs (%method-specializers (car ms))))
-        (when (and (consp specs) (consp (car specs))) (setq ok nil))
-        (when ok
-          (let ((r (cdr specs)))
-            (loop
-              (when (null r) (return nil))
-              (unless (eq (car r) 't) (setq ok nil) (return nil))
-              (setq r (cdr r))))))
-      (setq ms (cdr ms)))))
+      (when (null p) (return (nreverse acc)))
+      (when (null a) (return :%no))
+      (if (= i (car p))
+          (let ((k (%gf-arg-key (car a))))
+            (when (null k) (return :%no))
+            (setq acc (cons k acc))
+            (setq p (cdr p))
+            (setq a (cdr a))
+            (setq i (+ i 1)))
+          (progn (setq a (cdr a)) (setq i (+ i 1)))))))
+
+(defun %gf-cache-positions (gf)
+  "Sorted argument positions some method of GF specialises (non-T), or :%NO
+   when any method has an EQL specialiser."
+  (let ((ms (%gf-methods gf)) (pos nil))
+    (loop
+      (when (null ms) (return nil))
+      (let ((specs (%method-specializers (car ms))) (i 0))
+        (loop
+          (when (null specs) (return nil))
+          (let ((sp (car specs)))
+            (cond ((consp sp) (return-from %gf-cache-positions :%no))
+                  ((eq sp 't) nil)
+                  ((not (member i pos)) (setq pos (%gf-insert-pos i pos)))))
+          (setq specs (cdr specs))
+          (setq i (+ i 1))))
+      (setq ms (cdr ms)))
+    pos))
+
+(defun %gf-insert-pos (i pos)
+  "POS (ascending fixnums) with I inserted in order."
+  (if (or (null pos) (< i (car pos)))
+      (cons i pos)
+      (cons (car pos) (%gf-insert-pos i (cdr pos)))))
+
+(defun %gf-cache-get (gf args)
+  "The cached applicable-method list for ARGS, or NIL.
+   Cache cell (aref gf 9) = (EPOCH POSITIONS . ENTRIES), entry =
+   (KEYS NARGS . APPLICABLE)."
+  (when (and (>= (array-length gf) 10) (consp args))
+    (let ((c (aref gf 9)))
+      (when (and (consp c) (eql (car c) (%gf-cache-epoch)) (consp (cdr c))
+                 (not (eq (car (cdr c)) :%no)))
+        (let ((keys (%gf-cache-keys (car (cdr c)) args)))
+          (unless (eq keys :%no)
+            (let ((n (length args)) (e (cdr (cdr c))))
+              (loop
+                (when (null e) (return nil))
+                (let ((x (car e)))
+                  (when (and (eql (car (cdr x)) n) (%gf-keys-eq (car x) keys))
+                    (return (cdr (cdr x)))))
+                (setq e (cdr e))))))))))
+
+(defun %gf-keys-eq (a b)
+  (loop
+    (when (null a) (return (null b)))
+    (when (or (null b) (not (eql (car a) (car b)))) (return nil))
+    (setq a (cdr a))
+    (setq b (cdr b))))
 
 (defun %gf-cache-put (gf args applicable)
+  ;; An EMPTY answer is cached too, as :%NONE (readers turn it back into NIL):
+  ;; INITIALIZE-INSTANCE on a class no method applies to collected over every
+  ;; method on every MAKE-INSTANCE.
+  (when (null applicable) (setq applicable :%none))
   (when (and applicable (>= (array-length gf) 10) (consp args)
-             (%clos-instance-p (car args))
-             (%gf-cache-writable-p)
-             (%gf-cacheable-p gf))
+             (%gf-cache-writable-p))
     (let ((c (aref gf 9)) (ep (%gf-cache-epoch)))
-      (unless (and (consp c) (eql (car c) ep))
-        (setq c (cons ep nil))
+      (unless (and (consp c) (eql (car c) ep) (consp (cdr c)))
+        (setq c (cons ep (cons (%gf-cache-positions gf) nil)))
         (aset gf 9 c))
-      ;; A handful of classes per GF; past that, stop growing rather than
-      ;; turn the lookup into the scan it replaced.
-      (when (< (length (cdr c)) 12)
-        (setf (cdr c) (cons (cons (aref (car args) 1) (cons (length args) applicable))
-                        (cdr c)))))))
+      (unless (eq (car (cdr c)) :%no)
+        (let ((keys (%gf-cache-keys (car (cdr c)) args)))
+          ;; Up to 64 key combinations per GF (INITIALIZE-INSTANCE sees every
+          ;; class); past that, stop growing rather than turn the lookup into
+          ;; the scan it replaced.
+          (when (and (not (eq keys :%no)) (< (length (cdr (cdr c))) 64))
+            (setf (cdr (cdr c))
+                  (cons (cons keys (cons (length args) applicable))
+                        (cdr (cdr c))))))))))
+
+(defun %gf-applicable-cached (gf args)
+  "%COLLECT-APPLICABLE-METHODS through the GF's dispatch cache: for the
+   system dispatchers (INITIALIZE-INSTANCE, SHARED-INITIALIZE, PRINT-OBJECT,
+   ...) that collect directly instead of going through %GF-DISPATCH.  Every
+   MAKE-INSTANCE of a class with an :AFTER INITIALIZE-INSTANCE method used to
+   collect and sort the applicable methods afresh."
+  (let ((applicable (%gf-cache-get gf args)))
+    (cond ((eq applicable :%none) nil)
+          (applicable applicable)
+          (t (setq applicable (%collect-applicable-methods gf args))
+             (%gf-cache-put gf args applicable)
+             applicable))))
 
 ;; Slot 5: methods added by a DEFGENERIC form for NAME.  CLHS DEFGENERIC:
 ;; redefining a GF removes the methods the PREVIOUS defgeneric form added
@@ -2917,8 +3114,28 @@
    reads as well as writes: an EQ table may rehash itself during a lookup, and
    a worker must not write a shared table.")
 
+(defvar *gf-find-setf-memo* nil
+  "EQ hash: NAME -> what %FIND-GF-SCAN answered for (SETF NAME).  A (SETF X)
+   name is a fresh list at each call site, so *GF-FIND-MEMO* never sees it;
+   every accessor INCF / SETF rescanned every GF.  Dropped with *GF-FIND-MEMO*.")
+
 (defun %find-gf (name)
-  "Find generic function by name -- through *GF-FIND-MEMO* for a symbol."
+  "Find generic function by name -- through *GF-FIND-MEMO* for a symbol, and
+   *GF-FIND-SETF-MEMO* for a (SETF symbol) name."
+  (when (and (consp name) (symbolp (car name))
+             (or (eq (car name) (quote setf)) (%clos-sym-name-eq (car name) (quote setf)))
+             (consp (cdr name)) (symbolp (car (cdr name))) (car (cdr name))
+             (null (cdr (cdr name))) (%gf-cache-writable-p))
+    (let ((memo *gf-find-setf-memo*) (sym (car (cdr name))))
+      (when (null memo)
+        (setq memo (make-hash-table :test (quote eq)))
+        (setq *gf-find-setf-memo* memo))
+      (let ((hit (gethash sym memo)))
+        (cond ((eq hit :%no-gf) (return-from %find-gf nil))
+              (hit (return-from %find-gf hit))
+              (t (let ((gf (%find-gf-scan name)))
+                   (puthash sym memo (if gf gf :%no-gf))
+                   (return-from %find-gf gf)))))))
   (if (and (symbolp name) name (%gf-cache-writable-p))
       ;; No BOUNDP (1 us here): an absent global reads as NIL (%GV-REF).
       (let ((memo *gf-find-memo*))
@@ -2926,11 +3143,17 @@
           (setq memo (make-hash-table :test (quote eq)))
           (setq *gf-find-memo* memo))
         (let ((hit (gethash name memo)))
-          (if hit
-              hit
-              (let ((gf (%find-gf-scan name)))
-                (when gf (puthash name memo gf))
-                gf))))
+          (cond
+            ((eq hit :%no-gf) nil)
+            (hit hit)
+            (t
+             ;; A MISS is memoised too: MAKE-INSTANCE asks for GFs that
+             ;; usually do not exist (no user INITIALIZE-INSTANCE method),
+             ;; and each miss rescanned every GF, twice.  The one push onto
+             ;; *GENERIC-FUNCTIONS* drops the memo, misses included.
+             (let ((gf (%find-gf-scan name)))
+               (puthash name memo (if gf gf :%no-gf))
+               gf)))))
       (%find-gf-scan name)))
 
 (defun %find-gf-scan (name)
@@ -3034,6 +3257,7 @@
          (setq *generic-functions* (cons (cons name gf) *generic-functions*))
          ;; A new entry can answer a name an older one answered by NAME-HASH.
          (setq *gf-find-memo* nil)
+         (setq *gf-find-setf-memo* nil)
          ;; A new named GF changes the answer %e2-name-names-gf-p memoized --
          ;; but only for THIS name.  Nuking the whole table made the memo
          ;; useless during a CLOS-heavy load (genera-shim registers constantly,
@@ -4683,10 +4907,11 @@
     ;; A cache hit was filled by a call with the same argument count, which
     ;; passed this same arity check (THE DISPATCH CACHE).
     (let ((applicable (%gf-cache-get gf args)))
-      (unless applicable
-        (%gf-check-arity gf args)
-        (setq applicable (%collect-applicable-methods gf args))
-        (%gf-cache-put gf args applicable))
+      (cond ((eq applicable :%none) (setq applicable nil))
+            ((null applicable)
+             (%gf-check-arity gf args)
+             (setq applicable (%collect-applicable-methods gf args))
+             (%gf-cache-put gf args applicable)))
       ;; No USER method applies, but the GF has a system primary (the
       ;; standard-object method of SHARED-INITIALIZE, CHANGE-CLASS, ...):
       ;; that method is always applicable, so run it.  The default-primary

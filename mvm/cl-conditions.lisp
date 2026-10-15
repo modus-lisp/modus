@@ -1912,7 +1912,7 @@
              (setq new-reg (cons (car cur) new-reg)))
            (setq cur (cdr cur)))
          (setq *clos-classes* new-reg)
-         (setq *clos-find-memo* nil)))
+         (setq *clos-find-memo* nil) (%clos-reg-memo-drop)))
       (t
        (let ((new-reg nil) (cur *clos-classes*))
          (loop
@@ -1921,7 +1921,7 @@
              (setq new-reg (cons (car cur) new-reg)))
            (setq cur (cdr cur)))
          (setq *clos-classes* (cons (cons name value) new-reg))
-         (setq *clos-find-memo* nil))))
+         (setq *clos-find-memo* nil) (%clos-reg-memo-drop))))
     value))
 
 (defun %class-proxy-p (obj)

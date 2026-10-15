@@ -6223,7 +6223,9 @@
        ;; ONLY WHEN IT IS A TABLE: an image that skips DEFVAR init thunks (the
        ;; ANSI gate image, Limitation #7) leaves the variable holding the
        ;; unbound marker, and GETHASH on that faulted -- 325 tests.
-       (let ((nh (and (boundp '*%deftype-name-hashes*) *%deftype-name-hashes*)))
+       ;; (Not BOUNDP: that is a by-name hash lookup on every MAKE-ARRAY.  The
+       ;; unbound marker reads as a fixnum, which HASH-TABLE-P rejects.)
+       (let ((nh *%deftype-name-hashes*))
          (or (not (hash-table-p nh))
              (gethash (aref head 0) nh)))
        (let ((nm (%eval-sym-name head)))

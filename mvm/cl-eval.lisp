@@ -1017,8 +1017,7 @@
       ;; Created SEEDED with every name already registered -- the image boots
       ;; with deftypes in the table that no runtime DEFTYPE put there -- so the
       ;; set is never missing a name the table has.
-      (unless (and (boundp '*%deftype-name-hashes*)
-                   (hash-table-p *%deftype-name-hashes*))   ; not NIL alone: see %DEFTYPE-LOOKUP
+      (unless (hash-table-p *%deftype-name-hashes*)   ; not NIL alone: see %DEFTYPE-LOOKUP
         (let ((h (make-hash-table :test 'eql)))
           (maphash (lambda (k v) (declare (ignore v))
                      (when (stringp k) (puthash (compute-name-hash k) h t)))

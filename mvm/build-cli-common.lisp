@@ -1373,8 +1373,8 @@
          "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
-    (handler-case (cli-toplevel) (t (c) (sys-exit 1)))
-    (sys-exit 0))
+    (handler-case (cli-toplevel) (t (c) (%cli-exit 1)))
+    (%cli-exit 0))
 ")
         ;; Bare metal: the core is a RAM range the boot loader placed; the
         ;; arch says what a restored process runs instead of boot init.

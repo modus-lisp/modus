@@ -4879,13 +4879,13 @@
 (defun force-output (&rest args)
   (if (cdr args)
       (%program-error "force-output requires 0 or 1 arguments")
-      nil))
+      (progn (%flush-output-arg (car args)) nil)))
 
 ;;; FINISH-OUTPUT — check for too many args
 (defun finish-output (&rest args)
   (if (cdr args)
       (%program-error "finish-output requires 0 or 1 arguments")
-      nil))
+      (progn (%flush-output-arg (car args)) nil)))
 
 ;;; READ-CHAR — strict at most 4 args
 (defun read-char (&rest args)

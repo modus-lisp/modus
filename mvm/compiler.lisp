@@ -18360,9 +18360,18 @@
          ((and (member (symbol-name op) '("+" "-" "*" "/") :test #'string=)
                (consp (cdr form)) (consp (cddr form)))
           (every (lambda (a) (%expr-double-float-p a env)) (cdr form)))
+         ;; unary minus of a double
+         ((and (string= (symbol-name op) "-") (consp (cdr form)) (null (cddr form)))
+          (%expr-double-float-p (cadr form) env))
          (t (let ((ty (%expr-dtype form env)))
               (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")))))))
     (t nil)))
+
+(defun %fpd-unary-minus-p (form)
+  "True for (- X): inside a double tree it is (* -1.0d0 X), the exact IEEE
+   negation (signed zeros included)."
+  (and (consp form) (symbolp (car form)) (string= (symbol-name (car form)) "-")
+       (consp (cdr form)) (null (cddr form))))
 
 (defun %double-float-arith-applicable-p (args env)
   (and (consp args) (consp (cdr args))
@@ -18387,6 +18396,7 @@
     ((symbolp form)
      (and form (env-lookup env form) (%expr-double-float-p form env) 1))
     ((assoc form *fpd-hoisted* :test #'eq) 1)
+    ((%fpd-unary-minus-p form) (%fpd-tree-need (list '* -1.0d0 (cadr form)) env))
     ((and (consp form) (symbolp (car form))
           (member (symbol-name (car form)) '("+" "-" "*" "/") :test #'string=)
           (consp (cdr form)) (consp (cddr form)))
@@ -18433,6 +18443,9 @@
         (emit-ir-label done)
         (free-temp-reg))
       (return-from compile-double-unboxed nil)))
+  (when (%fpd-unary-minus-p form)
+    (return-from compile-double-unboxed
+      (compile-double-unboxed (list '* -1.0d0 (cadr form)) env fd)))
   (if (and (consp form) (not (name-eq (car form) "QUOTE")))
       (let ((op (%fpd-arith-op (symbol-name (car form)))))
         (compile-double-unboxed (cadr form) env fd)

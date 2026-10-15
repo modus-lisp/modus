@@ -165,7 +165,7 @@
   (when finish-output
     (ignore-errors (finish-output *standard-output*))
     (ignore-errors (finish-output *error-output*)))
-  (sys-exit code))
+  (%cli-exit code))
 
 (defun uiop::getenvp (name)
   (let ((v (uiop::getenv name))) (and v (plusp (length v)))))

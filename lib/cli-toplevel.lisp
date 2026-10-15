@@ -46,6 +46,15 @@
 ;;; before dereferencing it.  %cli-cstr-at reads a NUL-terminated C string at a
 ;;; REAL byte address into a fresh Lisp string.
 
+
+(defun %cli-exit (code)
+  "Exit the CLI process with CODE, writing buffered file output first
+   (cl-fileio %FS-FLUSH-ALL).  SYS-EXIT itself is an inline trap, so it
+   cannot do this; every exit of the hosted CLI and of the SB-EXT / UIOP
+   quit shims goes through here."
+  (%fs-flush-all)
+  (sys-exit code))
+
 (defun %cli-cstr-at (addr)
   "Read a NUL-terminated C string at raw byte ADDR into a fresh Lisp string.
    Returns \"\" for an empty string; the caller guarantees ADDR is non-NULL."
@@ -219,7 +228,7 @@
   (%cli-msg "Modus: unknown toplevel option: ")
   (%cli-line flag)
   (%cli-line "Try --help for a list of options.")
-  (sys-exit 1))
+  (%cli-exit 1))
 
 ;;; ===========================================================================
 ;;; the REPL (moved here from ql-shim's %ql-repl so it is shared)
@@ -271,13 +280,13 @@
             ;; dies stops there and exits nonzero instead of running on to the
             ;; end and exiting 0.
             (%cli-load-file path))
-        (sys-exit 0))
+        (%cli-exit 0))
     (t (c)
       (%cli-msg "Modus: unhandled error in --script")
       (%cli-nl)
       (handler-case (progn (%cli-msg "  ") (write-object c) (%cli-nl))
         (t (c2) nil))
-      (sys-exit 1))))
+      (%cli-exit 1))))
 
 ;;; ===========================================================================
 ;;; the toplevel driver
@@ -332,14 +341,14 @@
           ((%cli-flag-p arg "--core")
            (unless (%core-requested-p)
              (%cli-line "Modus: --core must be the first argument")
-             (sys-exit 1))
+             (%cli-exit 1))
            (setq args (cddr args)))
           ;; --eval / -e FORM
           ((or (%cli-flag-p arg "--eval") (%cli-flag-p arg "-e"))
            (setq args (cdr args))
            (when (null args)
              (%cli-line "Modus: --eval requires an argument")
-             (sys-exit 1))
+             (%cli-exit 1))
            (push (cons :eval (car args)) actions)
            (setq args (cdr args)))
           ;; --load / -l FILE
@@ -347,7 +356,7 @@
            (setq args (cdr args))
            (when (null args)
              (%cli-line "Modus: --load requires an argument")
-             (sys-exit 1))
+             (%cli-exit 1))
            (push (cons :load (car args)) actions)
            (setq args (cdr args)))
           ;; --script [FILE]
@@ -380,7 +389,7 @@
            (setq args (cdr args))
            (when (null args)
              (%cli-line "Modus: --userinit requires an argument")
-             (sys-exit 1))
+             (%cli-exit 1))
            (setq userinit (car args))
            (setq args (cdr args)))
           ;; --no-userinit
@@ -392,7 +401,7 @@
            (setq args (cdr args))
            (when (null args)
              (%cli-line "Modus: --sysinit requires an argument")
-             (sys-exit 1))
+             (%cli-exit 1))
            ;; Defer as a load action so it interleaves correctly.
            (push (cons :load (car args)) actions)
            (setq args (cdr args)))
@@ -402,11 +411,11 @@
           ;; --version
           ((%cli-flag-p arg "--version")
            (%cli-print-version)
-           (sys-exit 0))
+           (%cli-exit 0))
           ;; --help
           ((%cli-flag-p arg "--help")
            (%cli-print-help)
-           (sys-exit 0))
+           (%cli-exit 0))
           ;; --end-toplevel-options / bare --
           ((or (%cli-flag-p arg "--end-toplevel-options")
                (%cli-flag-p arg "--"))
@@ -441,7 +450,7 @@
            (%cli-msg "Modus: error during --eval/--load: ")
            (handler-case (write-object c) (t (c2) (%cli-msg "<condition>")))
            (%cli-nl)
-           (unless interactive (sys-exit 1))))
+           (unless interactive (%cli-exit 1))))
        (cond
          (interactive
           ;; userinit rc, only interactively and only when not disabled.
@@ -453,7 +462,7 @@
                     (%cli-msg "Modus: error loading rc file ")
                     (%cli-line rc))))))
           (handler-case (%cli-repl banner) (t (c) nil))
-          (sys-exit 0))
+          (%cli-exit 0))
          (t
           ;; --non-interactive / --quit with no script: exit cleanly.
-          (sys-exit 0)))))))
+          (%cli-exit 0)))))))

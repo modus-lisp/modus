@@ -5215,11 +5215,13 @@
   "CLHS: takes at most one argument (the stream).  Extra signal
    program-error.  Modus's stub is a no-op otherwise."
   (when (cdr args) (%signal-program-error))
+  (%flush-output-arg (car args))
   nil)
 (defun force-output (&rest args)
   "CLHS: takes at most one argument (the stream).  Extra signal
    program-error.  Modus's stub is a no-op otherwise."
   (when (cdr args) (%signal-program-error))
+  (%flush-output-arg (car args))
   nil)
 (defun clear-output (&rest args)
   "CLHS: takes at most one argument (the stream).  Extra signal

@@ -2776,6 +2776,17 @@
    mantissa (to the subnormal grid 2^-1074 at the bottom) in exact integer
    arithmetic, then SCALE-FLOAT it, which is exact."
   ;; R is a ratio, or modus's 2-slot rational-form float: [numerator denominator].
+  ;; BOTH HALVES EXACT AS DOUBLES (below 2^53): their IEEE quotient is
+  ;; correctly rounded -- one rounding, the division's -- so the exact
+  ;; integer path below is only needed past that.  It cost a bignum multiply,
+  ;; a ROUND and a SCALE-FLOAT per conversion (cl-bench MANDELBROT/DFLOAT's
+  ;; (/ i n 0.25d0)).
+  (let ((n0 (aref r 0)) (d0 (aref r 1)))
+    (when (and (fixnump n0) (fixnump d0)
+               (< n0 9007199254740992) (> n0 -9007199254740992)
+               (< d0 9007199254740992) (> d0 0))
+      (return-from %ratio-to-double
+        (%float-div (%float-from-int n0) (%float-from-int d0)))))
   (let* ((neg (minusp (aref r 0)))
          (num (abs (aref r 0)))
          (den (aref r 1))

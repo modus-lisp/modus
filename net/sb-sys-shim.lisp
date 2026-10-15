@@ -818,14 +818,14 @@
   (unless abort
     (ignore-errors (finish-output *standard-output*))
     (ignore-errors (finish-output *error-output*)))
-  (sys-exit code))
+  (%cli-exit code))
 
 (defun sb-ext:quit (&key (unix-status 0) recklessly-p)
   "The pre-1.0.57 spelling of EXIT."
   (unless recklessly-p
     (ignore-errors (finish-output *standard-output*))
     (ignore-errors (finish-output *error-output*)))
-  (sys-exit unix-status))
+  (%cli-exit unix-status))
 
 (defun sb-ext:gc (&rest options)
   "Force one collection of THIS thread\'s active region.  :FULL and :GEN are

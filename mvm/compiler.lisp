@@ -26414,7 +26414,15 @@
                                           (setf (nth idx positional) (cadr cargs))))
                                       (setf cargs (cddr cargs)))
                              `(,ics ,@positional)))))
-                  (mvm-define-macro ctor-fn-name expander)
+                  ;; Build time only, for the reason MAKE-<name> gives (NOT A
+                  ;; MACRO AT RUNTIME): this table is keyed by the BARE name,
+                  ;; so bordeaux-threads v1's (:constructor
+                  ;; %make-condition-variable) rewrote v2's same-named BOA
+                  ;; constructor into v1's, and every BT2 condition variable
+                  ;; was a BT::CONDITION-VARIABLE.  At runtime the per-package
+                  ;; SET-MACRO-FUNCTION below covers it.
+                  (unless *mvm-eval-runtime-p*
+                    (mvm-define-macro ctor-fn-name expander))
                   ;; A callable function too (runtime compiles) -- quri's
                   ;; (apply #'%make-uri args); see %DEFSTRUCT-KW-CTOR-DEFUN.
                   (when *mvm-eval-runtime-p*

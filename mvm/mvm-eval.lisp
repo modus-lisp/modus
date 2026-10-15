@@ -1918,6 +1918,35 @@
     (setq *jit-defun-trampolines* (make-hash-table :test (function equal))))
   (puthash name *jit-defun-trampolines* tramp))
 
+(defvar *jit-trampoline-forwards* nil
+  "NAME -> (MODULE-BYTECODE . BOX): the forwarding box of the trampoline made
+   for runtime DEFUN NAME from that module.  When the module goes native the
+   box gets NAME's native function FROM THAT MODULE, and the trampoline calls it
+   from then on -- whatever NAME means by then.  That is what lets a trampoline
+   go native after NAME was replaced: secp256k1-fast wraps its entry points with
+   (SETF FDEFINITION), each wrapper calling the function object it replaced, and
+   those originals stayed interpreted for good (CT-MUL-G: 20 ms native-wrapped
+   vs ~9 interpreted-inner).  It cannot recreate the generic-function loop
+   %JIT-HOT-PROMOTE describes: the box is never NAME's current definition, only
+   the trampoline's own code, compiled.")
+
+(defun %jit-note-forward (name bc box)
+  (when (null *jit-trampoline-forwards*)
+    (setq *jit-trampoline-forwards* (make-hash-table :test (function equal))))
+  (puthash name *jit-trampoline-forwards* (cons bc box)))
+
+(defun %jit-set-forwards (bc base fnoffs names)
+  "Point the forwarding box of each NAMES function this module (bytecode BC)
+   defines at its native code (BASE + offset); see *JIT-TRAMPOLINE-FORWARDS*."
+  (when *jit-trampoline-forwards*
+    (dolist (e fnoffs)
+      (let ((nm (car e)))
+        (when (member nm names :test (function string=))
+          (let ((f (gethash nm *jit-trampoline-forwards*))
+                (addr (+ base (cdr e))))
+            (when (and f (eq (car f) bc) (eql (logand addr 15) 0))
+              (setf (car (cdr f)) (%word->val (logior addr 3))))))))))
+
 (defun %jit-own-definition-p (name current)
   "True when CURRENT -- NAME's definition now -- is NAME's runtime DEFUN: the
    trampoline mvm-eval installed for it, or native code installed over that.
@@ -1989,6 +2018,8 @@
           (if (and je (cadr (cddddr je)))
               (let ((n (%jit-install-native-fns (car je) (cadr (cddddr je))
                                                 (car (cddr (cddddr m))))))
+                (%jit-set-forwards (car m) (car je) (cadr (cddddr je))
+                                   (car (cddr (cddddr m))))
                 ;; OFF-MAIN, DO NOT RECORD: the cons would be a
                 ;; worker object in a region-0 list.
                 (when (%mvm-on-main-thread-p)
@@ -2111,8 +2142,10 @@
     (when (and m (> (cdr seen) 0)
                (not (%jit-skip-name-p name skips))
                (not (%jit-fn-native-p name))
-               ;; a callee NAME no longer defines (a GF adopted it, say)
-               (%jit-own-definition-p name (%mvm-resolve-runtime-fn name))
+               ;; Built even when NAME no longer names this DEFUN (a GF adopted
+               ;; it, a (SETF FDEFINITION) wrapper): installing then publishes
+               ;; nothing for NAME and only forwards the old trampoline to its
+               ;; own native code (%JIT-SET-FORWARDS).
                (not (member (car m) (car seen) :test (function eq)))
                (not (member (car m) *jit-eager-built* :test (function eq))))
       (setf (car seen) (cons (car m) (car seen)))
@@ -2124,19 +2157,19 @@
           (setq *jit-hot-failed* (if *jit-hot-failed* (+ 1 *jit-hot-failed*) 1))))))
 
 (defun %jit-hot-promote (name self)
-  "NAME's trampoline SELF reached its threshold.  NAME's native function once
-   built; :RETRY when this is not the moment (the JIT inhibited, a worker thread
-   -- a build records into region-0 tables -- or a build already running); NIL
-   when NAME stays interpreted (no JIT, skip-listed, its page would not build, or
-   SELF is no longer NAME's definition).
+  "NAME's trampoline SELF reached its threshold: build its module.  NIL once
+   done (SELF finds its native code in its forwarding box); :RETRY when this is
+   not the moment (the JIT inhibited, a worker thread -- a build records into
+   region-0 tables -- or a build already running).  SELF stays interpreted when
+   its page will not build (no JIT, skip-listed, a translator gap).
 
-   THAT LAST CASE IS A LOOP, NOT A NICETY.  A generic function defined over a
-   DEFUN keeps the DEFUN's trampoline as its fallback method.  Promoting that
-   trampoline by NAME found the GENERIC FUNCTION, and forwarding to it closed a
-   cycle -- GF, fallback, trampoline, GF -- that ran until the stack was gone
-   (the modus agent, ~2 minutes into a cl-marmot session: SIGSEGV on a PUSH)."
+   NEVER FORWARD BY NAME.  A generic function defined over a DEFUN keeps the
+   DEFUN's trampoline as its fallback method.  Promoting that trampoline by NAME
+   found the GENERIC FUNCTION, and forwarding to it closed a cycle -- GF,
+   fallback, trampoline, GF -- that ran until the stack was gone (the modus
+   agent, ~2 minutes into a cl-marmot session: SIGSEGV on a PUSH).  So SELF only
+   ever forwards to its own module's code, through its box."
   (cond ((not (%jit-enabled-p)) nil)
-        ((not (eq self (%mvm-resolve-runtime-fn name))) nil)
         ((or (not (%jit-active-p)) (not (%mvm-on-main-thread-p)) *jit-hot-busy*) :retry)
         (t (let ((before (or *jit-native-defun-count* 0)))
              (setq *jit-hot-busy* t)
@@ -2144,8 +2177,11 @@
                   (%jit-hot-build name (%jit-skip-list) (cons nil 64))
                (setq *jit-hot-busy* nil))
              (when (> (or *jit-native-defun-count* 0) before) (%jit-retry-drain)))
-           (let ((fn (%mvm-resolve-runtime-fn name)))
-             (if (and fn (eql (logand (%val->word fn) 15) 3)) fn nil)))))
+           ;; Nothing to forward to by NAME: the build put SELF's own native
+           ;; code in SELF's box (%JIT-SET-FORWARDS), and NAME may by now be
+           ;; anything -- a GF whose fallback method is SELF, a wrapper that
+           ;; calls SELF.  Forwarding to NAME's definition was the loop.
+           nil)))
 
 (defun %mvm-make-defun-trampoline (name bc ftab rt offset lam-offsets)
   "The interpreter trampoline for runtime DEFUN NAME (%MVM-MAKE-TRAMPOLINE),
@@ -2159,14 +2195,18 @@
   (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets))
         (left (%jit-hot-call-threshold))
         (spent 0)
-        (fwd nil)
+        ;; the native function this trampoline forwards to once there is one:
+        ;; set by a promotion here or by its module being built from anywhere
+        ;; (*JIT-TRAMPOLINE-FORWARDS*)
+        (fwd (list nil))
         ;; ITSELF, through a box: a variable assigned only OUTSIDE the closure is
         ;; captured by value here, i.e. as NIL.
         (self (list nil)))
+    (%jit-note-forward name bc fwd)
     (setf (car self)
     (lambda (&rest args)
-      (if (or fwd (<= left 0))
-          (values-list (multiple-value-list (apply (or fwd inner) args)))
+      (if (or (car fwd) (<= left 0))
+          (values-list (multiple-value-list (apply (or (car fwd) inner) args)))
           (let* ((t0 (%irt-ns))
                  (vals (multiple-value-list (apply inner args))))
             (setq left (- left 1))
@@ -2175,7 +2215,7 @@
               (let ((r (%jit-hot-promote name (car self))))
                 (if (eq r :retry)
                     (setq left (%jit-hot-call-threshold) spent 0)
-                    (setq left 0 fwd r))))
+                    (setq left 0))))
             (values-list vals)))))
     (car self)))
 
@@ -2860,6 +2900,7 @@
               (cond
                 ((and je (cadr (cddddr je)))
                  (%jit-install-native-fns (car je) (cadr (cddddr je)) names)
+                 (%jit-set-forwards bc (car je) (cadr (cddddr je)) names)
                  ;; The retried page MUST be in *jit-page-cache*: that is what
                  ;; %jit-refresh-all-pages sweeps to re-bake const-pool
                  ;; immediates after a GC.  Create the cache if %jit-entry-for
@@ -3075,6 +3116,7 @@
           ;; trampolines stand — the interpret fallback is unchanged.
           (when (and persist-names (cadr (cddddr je)) (%jit-native-defuns-p))
             (%jit-install-native-fns (car je) (cadr (cddddr je)) persist-names)
+            (%jit-set-forwards bc (car je) (cadr (cddddr je)) persist-names)
             ;; #306: a new native callee exists — give queued failed modules
             ;; their retry.
             (%jit-retry-drain))

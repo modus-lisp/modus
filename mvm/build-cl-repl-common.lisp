@@ -2243,6 +2243,21 @@
     (when (fboundp (quote hcon-init))
       (handler-case (hcon-init) (t (c) nil)))
     (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
+    ;; ... and USB, for the same reason: boot init brings the keyboard and mouse
+    ;; up (%CONSOLE-INIT), a restored core skips boot init, and the controller
+    ;; holds nothing a reset did not clear.  Unconditionally from the top: after
+    ;; a RUN-pin reset HID-FIND-HUB can still find the hub answering while the
+    ;; host side is unconfigured, and HID-CONSOLE-INIT then skipped the bring-up.
+    (when (fboundp (quote hid-usb-bringup))
+      (handler-case
+          (progn (hid-usb-bringup)
+                 (let ((r (hid-split-init)))
+                   (write-string-serial \"USB-HID: keyboard \")
+                   (write-string-serial (if (car r) \"yes\" \"no\"))
+                   (write-string-serial \", mouse \")
+                   (write-string-serial (if (cadr r) \"yes\" \"no\"))
+                   (write-char-serial 10)))
+        (t (c) nil)))
     ;; A restored core skips boot init, so raise the ARM clock here too (the
     ;; firmware idles at 600 MHz on a Zero 2 W); same guarded call as the
     ;; fresh-boot path before E2SMOKE.

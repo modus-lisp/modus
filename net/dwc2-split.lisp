@@ -99,7 +99,13 @@
           ((not (zerop (logand hcint (hcint-stall)))) (setq result -1) (return result))
           ((not csplit)
            (cond
-             ((not (zerop (logand hcint (hcint-ack)))) (setq csplit t))
+             ;; The start-split was accepted: the complete-split belongs in a LATER
+             ;; microframe.  Issued at once, a periodic CSPLIT never halted at all
+             ;; (every poll a -3 timeout, the keyboard and mouse lit but dead) once
+             ;; this code ran fast enough to get there inside the same microframe.
+             ((not (zerop (logand hcint (hcint-ack))))
+              (setq csplit t)
+              (when periodic (dwc2-wait-next-uframe)))
              ((not (zerop (logand hcint (hcint-nak)))) nil)
              (t (setq errs (+ errs 1))
                 (when (> errs 3) (setq result -2) (return result)))))

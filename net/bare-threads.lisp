@@ -448,25 +448,51 @@
         (when (< n bestn) (setq best c bestn n))))
     best))
 
+(defun %bt-own-object-p (x)
+  "Whether X is a heap object in the calling thread's own heap (its window's region
+   pair); NIL on the main thread."
+  (let ((self (%tls-self-base)))
+    (if (zerop self)
+        nil
+        (let ((w (%val->word x)))
+          (and (= (logand w 5) 1)
+               (let ((a (logand w -16))
+                     (ba (%gc-read64 (+ self #x10005040)))
+                     (bb (%gc-read64 (+ self #x10005048)))
+                     (sz (%gc-read64 (+ self #x10005050))))
+                 (and (> sz 0)
+                      (or (and (>= a ba) (< a (+ ba sz)))
+                          (and (>= a bb) (< a (+ bb sz)))))))))))
+
+(defun %bt-spawn-lock () (+ (%bt-table) #x10))
+
 (defun %make-native-thread (fn &rest args)
   "Start FN (no arguments) as a thread on the least-loaded core.  Its record number
-   (4..15), or -1 when every slot is in use, -2 when the cores did not start, -6
-   when called off the main thread."
+   (4..15), or -1 when every slot is in use, -2 when the cores did not start, -7 when
+   a thread passes a function object made in its own heap (it cannot outlive that
+   heap's next collection in a shared table: pass #'NAME, or let SB-THREAD:MAKE-THREAD
+   carry it).  Threads may start threads."
   (declare (ignore args))
-  (cond ((not (zerop (%thr-cpu))) -6)
-        ((zerop (%bt-init)) -2)
+  (cond ((zerop (%bt-init)) -2)
+        ((%bt-own-object-p fn) -7)
         (t
-         (when (fboundp 'jit-eager) (handler-case (jit-eager) (error () nil)))
-         (let ((i (%bt-free-slot)))
-           (if (< i 0)
-               -1
-               (let ((c (%bt-least-loaded-core)))
-                 (setf (svref *bt-funs* i) fn)
-                 (let ((rec (%bt-prepare-record i c (%bt-entry '%bt-slot-main))))
-                   (setf (mem-ref (+ rec #x08) :u32) 1)
-                   (mfence)
-                   (setf (mem-ref (+ rec #x60) :u32) 1))
-                 i))))))
+         (when (and (zerop (%thr-cpu)) (fboundp 'jit-eager))
+           (handler-case (jit-eager) (error () nil)))
+         (let ((lk (%bt-spawn-lock)))
+           (if (%bt-slot-p)
+               (loop (when (zerop (xchg-mem lk 1)) (return nil)) (bt-yield))
+               (loop (when (zerop (xchg-mem lk 1)) (return nil))))
+           (let ((i (%bt-free-slot)))
+             (if (< i 0)
+                 (progn (%mutex-unlock lk) -1)
+                 (let ((c (%bt-least-loaded-core)))
+                   (setf (svref *bt-funs* i) fn)
+                   (let ((rec (%bt-prepare-record i c (%bt-entry '%bt-slot-main))))
+                     (setf (mem-ref (+ rec #x08) :u32) 1)
+                     (mfence)
+                     (setf (mem-ref (+ rec #x60) :u32) 1))
+                   (%mutex-unlock lk)
+                   i)))))))
 
 (defun %native-thread-alive-p (i)
   (if (zerop (mem-ref (+ (%bt-rec i) #x08) :u32)) 0 1))

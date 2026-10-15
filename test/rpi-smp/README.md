@@ -117,8 +117,12 @@ and the core halts (loud, not a dangling pointer).  test/rpi-smp/shim.lisp, one 
     (s-pingpong)   2 threads, 300 round trips over two channels  (OK OK)
     (s-mutex)      6 threads x 1000 under SB-THREAD:WITH-MUTEX   6000
     then intern / chain / sum as above, all clean
+    threads start threads (phase 7): a thread BT-SPAWNs 3 and joins them; a thread
+    SB-THREAD:MAKE-THREADs one and joins it (the shim carries the body in shared memory);
+    a closure made in the thread's own heap is REFUSED (code -7), not stored where its
+    heap's next collection would leave it dangling
 
 NOT YET: a thread SETQ-ing a global it has not bound, or a variable main closed over (with the
 guard armed that is now a !!FAULT, not corruption -- making it a Lisp error on bare metal needs the
-vector to resume into the guard's error path); threads started from threads; preemption (a slot
+vector to resume into the guard's error path); preemption (a slot
 that never blocks keeps its core); and the board run (core 1 did not start on one board boot).

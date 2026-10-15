@@ -19,3 +19,9 @@
 (defvar *m* nil)
 
 (defun s-mutex () (setq *m* (sb-thread:make-mutex :name "ctr")) (setf (mem-ref #x10380800 :u32) 0) (let ((ths (loop for k below 6 collect (sb-thread:make-thread (lambda () (dotimes (i 1000) (sb-thread:with-mutex (*m*) (let ((v (mem-ref #x10380800 :u32))) (bt-yield) (setf (mem-ref #x10380800 :u32) (+ v 1))))) :done))))) (list (mapcar (function sb-thread:join-thread) ths) (mem-ref #x10380800 :u32))))
+
+(defun s-nested () (let ((ths (loop repeat 3 collect (bt-spawn (function t-sum))))) (mapcar (function bt-join) ths)))
+
+(defun s-nested2 () (sb-thread:join-thread (sb-thread:make-thread (function t-list2))))
+
+(defun s-badclosure () (let ((x (list 1 2))) (handler-case (progn (bt-spawn (lambda () x)) :started) (error () :refused))))

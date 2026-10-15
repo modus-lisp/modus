@@ -29,8 +29,8 @@ if os.environ.get("QTEST_POKE"):
     # A restored core with a restart hook starts it unless a byte arrives on serial
     # within 2 s: keep sending one until the hook offer has been answered.
     end = time.time() + 600
-    while time.time() < end and not re.search(rb"CORE-RESTART-HOOK", buf):
-        until(rb"CORE-RESTART-HOOK", 0.5)
+    while time.time() < end and not re.search(rb"CORE-RESTART-HOOK|CL REPL", buf):
+        until(rb"CORE-RESTART-HOOK|CL REPL", 0.5)
     for i in range(4):
         s.sendall(b"\r"); until(rb"$^", 0.3)
     buf += b"CL REPL\n> "      # the hook's REPL has no banner line; prompt detection below

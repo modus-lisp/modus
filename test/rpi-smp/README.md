@@ -140,9 +140,15 @@ test/rpi-smp/guardvec.s) checks an undefined-instruction fault for the guard's m
 on the thread.  (s-guard2): a thread SETFs the CAR of a main-made cons to its own list ->
 REFUSED by HANDLER-CASE, every core still running, a 6-thread run correct afterwards.
 
-NOT YET: STACK GUARDS -- a slot's 512 KB stack sits directly above its neighbours (core 3's
-scheduler stack is right below slot 4's), so a runaway recursion on a thread tramples the
-schedulers (found printing a SIMPLE-ERROR, which on MAIN too dies "printer: structure nested
-deeper than 1000 levels" -- a printer bug of its own); a thread SETQ-ing a global it has not
+STACK GUARDS (phase 10): %BT-INIT maps the thread-stack blocks (L2 41..46, 0x05200000..
+0x05E00000) with 4 KB pages, every stack's lowest page unmapped; a data abort there is resumed
+by the fault vector (test/rpi-smp/stackvec.s) at %BT-STACK-TRAP with SP 32 KB above the guard,
+in the thread's own abandoned frames, which signals on that thread.  Found when a runaway
+recursion on slot 4 trampled core 3's scheduler, right below it.  (t-deep), (deep 1000000) on
+four threads: (OVERFLOW OVERFLOW OVERFLOW OVERFLOW); then sums, channel, shared-heap chains,
+preemption and the guard all correct.  (Printing a SIMPLE-ERROR dies "printer: structure nested
+deeper than 1000 levels" on MAIN too -- a printer bug of its own, not a thread one.)
+
+NOT YET: a thread SETQ-ing a global it has not
 bound, or a variable main closed over (now a refused store, not corruption); and the board run
 (core 1 did not start on one board boot).

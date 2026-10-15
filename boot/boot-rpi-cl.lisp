@@ -263,6 +263,15 @@
     (dolist (w '(#xd53c520a #xd35afd4a #xb50001ca #xd2a2042b #xf286050b #xf940016b
                  #xb400014b #xd53bd04a #xd2a2000c #xf28a0b0c #x8b0a018c #xf940018c
                  #xf100059f #x54000061 #xd51c402b #xd69f03e0))
+      (emit-aarch64-u32 buf w))
+    ;; ... and a data abort in a thread stack's GUARD PAGE (net/bare-threads.lisp maps
+    ;; [0x05000000, 0x06000000) with 4 KB pages, the lowest page of every thread stack
+    ;; unmapped): resume at the Lisp function at 0x10213030 with SP 32 KB above the
+    ;; guard -- the thread's own abandoned frames -- so the overflow is an error on
+    ;; that thread, not a trampled neighbour.  test/rpi-smp/stackvec.s.
+    (dolist (w '(#xd53c520a #xd35afd4a #xf100955f #x540001c1 #xd53c600a #xd358fd4b
+                 #xf100157f #x54000141 #xd2a2042b #xf286060b #xf940016b #xb40000cb
+                 #x9274cd4a #x9140254a #x9100015f #xd51c402b #xd69f03e0))
       (emit-aarch64-u32 buf w)))
   ;; X17 = console data register.
   (emit-aarch64-load-imm64 buf 17 (if miniuart #x3F215040 +rpi-cl-pl011-base+))

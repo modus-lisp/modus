@@ -36,3 +36,7 @@
 (defun s-guard () (let ((mine (list 1 2 3))) (handler-case (progn (setf (car *shared-box*) mine) :stored) (error (e) (list :refused (subseq (princ-to-string e) 0 40))))))
 (defun s-guard2 () (let ((mine (list 1 2 3))) (handler-case (progn (setf (car *shared-box*) mine) :stored) (error () :refused))))
 (defun s-print-cond () (princ-to-string (make-condition 'simple-error :format-control "x ~a" :format-arguments (list 1))))
+
+(defun deep (n) (if (= n 0) 0 (+ 1 (deep (- n 1)))))
+(defun t-deep () (handler-case (deep 1000000) (error () :overflow)))
+(defun t-shallow () (deep 1000))

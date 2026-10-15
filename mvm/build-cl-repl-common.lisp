@@ -871,6 +871,7 @@
   ;; ... and the shared-store guard's resume address and main's marker, which the
   ;; threaded fault vector reads (net/bare-threads.lisp %BT-GUARD-TRAP).
   (%gc-write64 #x10213028 0)
+  (%gc-write64 #x10213030 0)
   (%gc-write64 #x10005058 0)
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.

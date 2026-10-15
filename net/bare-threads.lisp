@@ -34,6 +34,10 @@
 ;;;; 0x08000000 / 0x08400000 so they cover the thread heaps):
 ;;;;   0x05200000..0x05800000  scheduler stacks, 2 MB per core
 ;;;;   0x05800000..0x05E00000  slot stacks, 512 KB each
+;;;;                           (both mapped with 4 KB pages, the LOWEST page of every
+;;;;                           stack unmapped: an overflow faults into an error on its
+;;;;                           thread instead of running into the stack below; L3 tables
+;;;;                           at 0x10780000)
 ;;;;   0x10080000..0x10090000  per-CPU blocks, records 0..3;  0x10610000.. slots
 ;;;;   0x10090000..            region control blocks (core c at +64*c)
 ;;;;   0x10200000              thread page (table at +0x13000)
@@ -222,6 +226,10 @@
     (%gc-write64 #x10213018 (+ s #x1400))
     ;; The shared-store guard's trap resumes here (boot/boot-rpi-cl.lisp's fault vector).
     (%gc-write64 #x10213028 (%bt-entry '%bt-guard-trap))
+    (%gc-write64 #x10213030 (%bt-entry '%bt-stack-trap))
+    ;; TLBI ALLE2IS between barriers (S+0x1500), for the stack guard pages.
+    (%bt-poke (+ s #x1500) (list #xd5033a9f #xd50c831f #xd5033b9f #xd5033fdf #xd65f03c0))
+    (%jit-icache-flush (+ s #x1500) 32)
     s))
 
 (defun %bt-entry (sym) (- (%val->word (symbol-function sym)) 3))
@@ -333,6 +341,7 @@
           (%gc-write64 (+ rec0 #x78) (%gc-meta-read (+ r0 #x18) 2))
           (%gc-write64 (+ rec0 #x68) 3))
         (mfence)
+        (%bt-stack-guards)                            ; before any thread stack is used
         (%gc-write64 (+ tt #x50) 1)                   ; stop-the-world ARMED
         (when (zerop (%rt-threads-on)) (setq ok 0))   ; the runtime lock + arena
         (do ((c 1 (+ c 1))) ((>= c (%bt-ncores)))
@@ -906,3 +915,31 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
     (%gc-write64 m 0)
     (error "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused (at #x~x)."
            site)))
+
+;;; ------------------------------------------------------------------ stack guards
+
+(defun %bt-guard-page-p (a)
+  "Whether the 4 KB page at A is a thread stack's guard: the lowest page of a
+   scheduler's stack (0x05200000 + 2 MB*k) or of a slot's (0x05800000 + 512 KB*k)."
+  (or (and (>= a #x05200000) (< a #x05800000) (zerop (mod (- a #x05200000) #x200000)))
+      (and (>= a #x05800000) (< a #x05E00000) (zerop (mod (- a #x05800000) #x80000)))))
+
+(defun %bt-stack-guards ()
+  "Map the 2 MB blocks holding thread stacks (L2 41..46, 0x05200000..0x05E00000) with
+   4 KB pages -- Normal-WB, as the blocks were -- leaving every stack's lowest page
+   unmapped, then flush the TLB.  Before the secondary cores start, so they never
+   see the old blocks."
+  (dotimes (j 6)
+    (let ((l3 (+ #x10780000 (* j #x1000)))
+          (base (+ #x05200000 (* j #x200000))))
+      (dotimes (k 512)
+        (let ((pa (+ base (* k #x1000))))
+          (%gc-write64 (+ l3 (* k 8)) (if (%bt-guard-page-p pa) 0 (+ pa #x703)))))
+      (%gc-write64 (+ #x71000 (* (+ 41 j) 8)) (+ l3 3))))
+  (%jit-call (+ (%bt-stub) #x1500))
+  1)
+
+(defun %bt-stack-trap ()
+  "Where the fault vector resumes a thread whose stack ran into its guard page, on its
+   own abandoned deepest frames: signal the overflow on that thread.  Never returns."
+  (error "modus: this thread's stack is exhausted (512 KB) -- recursion too deep?"))

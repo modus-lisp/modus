@@ -917,6 +917,10 @@
            ((stringp report) (%print-string-raw report stream))
            ((functionp report) (funcall report stream))
            (t (%write-obj-1 (car obj) stream level nil)))))
+      ;; A user PRINT-OBJECT method on the condition's type wins over :REPORT
+      ;; and the defaults (ASDF reports MISSING-COMPONENT this way).
+      ((and (not preadably) (%condition-p obj) (%user-print-object-p obj))
+       (print-object obj stream))
       ((and (not preadably) (%condition-p obj))
        (if escape
            (progn (%print-string-raw "#<" stream)
@@ -1055,6 +1059,14 @@
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
           (%print-char 62 stream))
+         ;; #nA cannot say what follows a zero dimension: #2A() reads back
+         ;; as (0 0) whatever the array was, so (0 3) is not printable
+         ;; readably (CLHS 22.1.3.8; SBCL's answer is its own #A syntax).
+         ((and *print-readably*
+               (let ((seen0 nil) (bad nil))
+                 (dolist (d (%mda-dims obj) bad)
+                   (if (eql d 0) (setq seen0 t) (when seen0 (setq bad t))))))
+          (error 'print-not-readable :object obj))
          (t
           (let ((dims (%mda-dims obj)) (data (%mda-data obj)))
             (cond
@@ -1161,6 +1173,19 @@
            (progn (%print-string-raw "#P" stream)
                   (%write-obj (namestring obj) stream level t))
            (%print-string-raw (namestring obj) stream)))
+      ;; A class, class proxy, generic function or method combination: an
+      ;; object, not the vector it is stored as.  Name in slot 1 for all four.
+      ((and (not (consp obj)) (%marked-vector-p obj))
+       (let ((m (svref obj 0)))
+         (%print-string-raw "#<" stream)
+         (%print-string-raw (cond ((eq m '%clos-class) "STANDARD-CLASS")
+                                  ((eq m '%class-proxy) "BUILT-IN-CLASS")
+                                  ((eq m '%generic-function) "STANDARD-GENERIC-FUNCTION")
+                                  (t "METHOD-COMBINATION"))
+                            stream)
+         (%print-char 32 stream)
+         (%write-obj (svref obj 1) stream level t)
+         (%print-string-raw ">" stream)))
       ;; Array/string (non-cons)
       ((arrayp obj)
        (let ((plev *print-level*)
@@ -5571,11 +5596,19 @@
           (if (and (or (integerp a) (floatp-impl a) (ratiop a))
                    (or (integerp b) (floatp-impl b) (ratiop b)))
               (numeric-equal-p a b)
+          ;; A complex is a number, not the vector it is stored as: =
+          ;; across types, (equalp #c(1 2) #c(1.0 2.0)) => T (CLHS EQUALP).
+          (if (or (%complex-p a) (%complex-p b))
+              (and (numberp a) (numberp b) (= a b))
+          ;; Pathnames: EQUALP is EQUAL (CLHS).  A pathname is an instance
+          ;; underneath, which is no longer compared as an array.
+          (if (and (pathnamep a) (pathnamep b))
+              (equal a b)
               ;; ANSI equalp: arrays of any type compare element-wise.
               (if (and (or (stringp a) (arrayp a))
                        (or (stringp b) (arrayp b)))
                   (%equalp-array-array a b)
-                  nil))))))))
+                  nil))))))))))
 
 
 ;;; ============================================================

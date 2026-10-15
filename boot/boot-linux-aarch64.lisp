@@ -509,7 +509,14 @@
   (emit-aarch64-u32 buf #x8B100318)   ; ADD x24, x24, x16
   ;; MOV x25, x22 ; ADD x25, x25, #r25-offset
   (emit-aarch64-u32 buf #xAA1603F9)
-  (emit-aarch64-load-imm64 buf 16 *linux-aarch64-r25-offset*)
+  ;; Minus the limit headroom when x25 is the normal midpoint: the lower
+  ;; semispace ends where the upper begins, so a limit AT the midpoint lets an
+  ;; allocation straddle into the first collection's to-space (the trampoline
+  ;; applies min(16 MB, space_size/16) after every flip; see translate-
+  ;; aarch64).  A stress offset is taken as given.
+  (emit-aarch64-load-imm64 buf 16 (if (= *linux-aarch64-r25-offset* +linux-aarch64-gc-midpoint+)
+                                      (- *linux-aarch64-r25-offset* +linux-aarch64-gc-guard+)
+                                      *linux-aarch64-r25-offset*))
   (emit-aarch64-u32 buf #x8B100339)   ; ADD x25, x25, x16
 
   ;; GC metadata at absolute slots 0x10000040..0x10000060.

@@ -3171,10 +3171,47 @@
   (let ((ty (%var-dtype form env)))
     (and ty (symbolp ty) (string= (symbol-name ty) struct-str))))
 
+(defun %make-array-dtype (form env)
+  "The type a (MAKE-ARRAY N [:ELEMENT-TYPE 'ET] [:INITIAL-ELEMENT x]
+   [:INITIAL-CONTENTS x]) call PROVABLY returns, or NIL:
+   (simple-array (unsigned-byte 8) (*)) for the packed #x11 byte vector, or
+   (simple-array ET (*)) for an element type Modus stores as a plain #x32
+   word vector.  N must be provably an integer (a list makes a multi-
+   dimensional array behind an MDA header, which neither fast path reads),
+   ET a quoted constant (a DEFTYPE name is expanded), and no other keyword
+   may appear (:adjustable, :fill-pointer and :displaced-to change the
+   representation).  Only a runtime compile: the DEFTYPE table lives there,
+   and build-time image code keeps the code it has always had."
+  (when (and *mvm-eval-runtime-p* (%cg-on-p (quote *cg-make-array-dtype*))
+             (consp form) (symbolp (car form)) (name-eq (car form) "MAKE-ARRAY")
+             (consp (cdr form)))
+    (let ((n (cadr form)) (keys (cddr form)) (et t) (ok t))
+      (when (not (or (integerp n) (%expr-width n env)))
+        (setq ok nil))
+      (loop
+        (when (or (not ok) (null keys)) (return))
+        (if (or (not (consp keys)) (not (consp (cdr keys))) (not (keywordp (car keys))))
+            (setq ok nil)
+            (let ((k (symbol-name (car keys))) (v (cadr keys)))
+              (cond ((string= k "ELEMENT-TYPE")
+                     (if (and (consp v) (name-eq (car v) "QUOTE") (consp (cdr v)))
+                         (setq et (%resolve-declared-type (cadr v)))
+                         (setq ok nil)))
+                    ((or (string= k "INITIAL-ELEMENT") (string= k "INITIAL-CONTENTS")))
+                    (t (setq ok nil)))
+              (setq keys (cddr keys)))))
+      (when ok
+        (let ((ty (list 'simple-array et (list '*))))
+          (cond ((%u8-simple-array-decl-p ty) ty)
+                ((%generic-element-type-p et) ty)
+                (t nil)))))))
+
 (defun %expr-dtype (form env)
-  "Declared type of FORM: a variable's (lexical or global) declaration, or the
-   slot type of an accessor call on a declared struct argument."
+  "Declared type of FORM: a variable's (lexical or global) declaration, the
+   slot type of an accessor call on a declared struct argument, or the
+   array type a MAKE-ARRAY call provably returns (%MAKE-ARRAY-DTYPE)."
   (cond ((symbolp form) (%var-dtype form env))
+        ((%make-array-dtype form env))
         ((and (consp form) (symbolp (car form)) (consp (cdr form)) (null (cddr form))
               (symbolp (cadr form)))
          ;; The RESULT of an accessor call has the slot's declared type
@@ -6542,6 +6579,12 @@
       ((typep form 'complex)
        (compile-form `(complex ,(realpart form) ,(imagpart form)) env dest))
 
+      ;; In-image: a struct / CLOS instance / class / condition literal is
+      ;; self-evaluating.  It reached the ARRAYP arm above until ARRAYP
+      ;; stopped answering T for marked objects (CLHS 4.2.2); quoting keeps
+      ;; the object itself rather than degrading it to NIL.
+      ((and *mvm-eval-runtime-p* (not (symbolp form)))
+       (compile-quote form dest))
       ;; Unrecognized — warn and compile as nil
       (t
        (format t "  WARN: cannot compile ~S, using nil~%" form)
@@ -6980,7 +7023,7 @@
     "%HANDLER-CASE-CATCH" "THEN" "-" "ARRAY-LENGTH"
     "OF-TYPE" "RETURN" "%MAKE-RATIO" "PROG*"
     "NIC-IRQ-UNMASK" "EQL" "FINALLY" "SAVE-CONTEXT"
-    "ELSE" "GET-ALLOC-PTR" "/" "PROVIDE"
+    "ELSE" "GET-ALLOC-PTR" "%FRAME-POINTER" "/" "PROVIDE"
     "CATCH" "EQUAL" "WITH-INPUT-FROM-STRING" "CDAR"
     "ADR" "NOT" "RESTART-CASE" "%HC-LONGJMP"
     "SET-RSP" "INTO" "%MAKE-BIGNUM" "PERCPU-SET"
@@ -6998,6 +7041,7 @@
     "LIDT" "NCONCING" "SYMBOLS" "STRINGP"
     "ACROSS" "<" "DEFPACKAGE" "%FLOAT-TO-INT"
     "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF" "%APPLY-SPREAD"
+    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI"
     "GET-ALLOC-LIMIT" "BLOCK" ">" "COLLECTING"
     "USE-PACKAGE" "DOTIMES" "MEMORY-BARRIER" "%MAKE-FLOAT"
     "FIXNUMP" "EVAL-WHEN" "BIGNUMP" "ALWAYS"
@@ -7961,6 +8005,8 @@
        (when (arity-ok-p form 3 3 env dest) (compile-apply-spread (cdr form) env dest)))
       ((= op-name 325386564) (compile-mul26lo (cdr form) env dest))  ; MUL26LO
       ((= op-name 421051478) (compile-mul26hi (cdr form) env dest))  ; MUL26HI
+      ((= op-name #.(compute-name-hash "%MUL-SPLIT-LO")) (compile-mul-split (cdr form) env dest nil))
+      ((= op-name #.(compute-name-hash "%MUL-SPLIT-HI")) (compile-mul-split (cdr form) env dest t))
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
       ((= op-name 12591721202407133616) (compile-mul64hi (cdr form) env dest))
       ((= op-name 920227542902379435) (compile-acc128 (cdr form) env dest))
@@ -8193,6 +8239,7 @@
 
       ;; --- System Registers ---
       ((= op-name 523513650)   (compile-get-alloc-ptr dest))  ; GET-ALLOC-PTR
+      ((= op-name 141053449)   (compile-frame-pointer dest))  ; %FRAME-POINTER
       ((= op-name 194607241) (compile-get-alloc-limit dest))  ; GET-ALLOC-LIMIT
       ((= op-name 488062438)   (compile-set-alloc-ptr (cadr form) env dest))  ; SET-ALLOC-PTR
       ((= op-name 421551229) (compile-set-alloc-limit (cadr form) env dest))  ; SET-ALLOC-LIMIT
@@ -19021,6 +19068,37 @@
     (emit-ir :mul26hi dest dest temp)
     (free-temp-reg)))
 
+(defun compile-mul-split (args env dest hi-p)
+  "Compile (%MUL-SPLIT-LO a b k) = (ldb (byte k 0) (* a b)) and
+   (%MUL-SPLIT-HI a b k) = (ash (* a b) (- k)): the two halves of a wide
+   product split at bit K, each a FIXNUM.  Radix-2^51 field arithmetic
+   (natrium's X25519/Ed25519, secp256k1-fast's 5x52 limbs) multiplies two
+   ~52-bit limbs into a ~104-bit product; through CL `*' that is a bignum per
+   limb product, ~125x the cost of the fixnum pair this emits.
+
+   One MULSPLIT instruction: a signed 64x64->128 multiply of the untagged
+   operands, then bits [0,K) or the product >> K, retagged.  Contract (the
+   caller's, as for any fixnum-only primitive): A and B fixnums, the HI half a
+   fixnum.  K must be a CONSTANT 1..62 and the target 64-bit; anything else
+   compiles the portable definition above, which is exact for every integer."
+  (let ((k (and (consp (cdr args)) (consp (cddr args)) (null (cdddr args))
+                (%const-int-value (caddr args)))))
+    (if (and (integerp k) (<= 1 k 62) (= +fixnum-bits+ 62))
+        (progn
+          (compile-form (car args) env dest)
+          (let ((temp (alloc-temp-reg)))
+            (emit-ir :push dest)
+            (compile-form (cadr args) env temp)
+            (emit-ir :pop dest)
+            (emit-ir (if hi-p :mulsplit-hi :mulsplit-lo) dest dest temp k)
+            (free-temp-reg)))
+        (compile-form (if hi-p
+                          (list 'ash (list '* (car args) (cadr args))
+                                (list '- (caddr args)))
+                          (list 'ldb (list 'byte (caddr args) 0)
+                                (list '* (car args) (cadr args))))
+                      env dest))))
+
 (defun compile-mul64lo (args env dest)
   "Compile (mul64lo a b) — low 64 bits of raw a*b. No tag/untag."
   (compile-form (car args) env dest)
@@ -19932,6 +20010,29 @@
           (push arg result)))
     (nreverse result)))
 
+(defun %bitop-constants-last (args)
+  "ARGS of a LOGAND/LOGIOR/LOGXOR with every integer CONSTANT moved after the
+   non-constant operands (stable otherwise).  Exact: the three are
+   associative and commutative on integers, and a constant has no side
+   effect to reorder.  It matters for code size: an operand compiled AFTER
+   the accumulated left side is a leaf (an immediate into a temp), while a
+   constant FIRST makes every following non-leaf operand a push / compile /
+   pop round trip -- (logand #xffffffff (+ a b)), the shape of every 32-bit
+   word in SHA-256 and ChaCha20.  Runtime compiles only, so build-time image
+   code is unchanged.  Not done for + or *: float addition is not
+   associative, and reordering changes rounding."
+  (if (and *mvm-eval-runtime-p* (%cg-on-p (quote *cg-bitop-reorder*))
+           (consp args) (consp (cdr args)))
+      (let ((consts nil) (others nil))
+        (dolist (a args)
+          (if (integerp (%const-int-value a))
+              (setq consts (cons a consts))
+              (setq others (cons a others))))
+        (if (and others consts)
+            (append (reverse others) (reverse consts))
+            args))
+      args))
+
 (defun compile-logand (args env dest)
   "Compile (logand args...).
    Flattens nested logand to prevent push/pop stack corruption.
@@ -19940,7 +20041,7 @@
    GENERIC-LOGAND (low-limb AND of bignum magnitude) instead of doing a
    raw pointer-tag AND that returns garbage for `(logand bignum 1)`
    bodies in evenp/oddp."
-  (let ((flat-args (flatten-arith-args 'logand args)))
+  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logand args))))
     (cond
       ((null flat-args)
        ;; (logand) = -1
@@ -19973,7 +20074,7 @@
   "Compile (logior args...).
    Same emit-arith-pair routing as compile-logand — bignum operands fall
    through to GENERIC-LOGIOR."
-  (let ((flat-args (flatten-arith-args 'logior args)))
+  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logior args))))
     (cond
       ((null flat-args)
        (compile-integer 0 dest))
@@ -20001,7 +20102,7 @@
 (defun compile-logxor (args env dest)
   "Compile (logxor args...).
    Same emit-arith-pair routing as compile-logand."
-  (let ((flat-args (flatten-arith-args 'logxor args)))
+  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logxor args))))
     (cond
       ((null flat-args)
        (compile-integer 0 dest))
@@ -20059,6 +20160,97 @@
    after it makes fixnum 0 or -1.  Only the INLINE shift is clamped: the bignum
    cold path gets the real count."
   (min 63 (- count)))
+
+(defun %compile-ash-var-fast (value-form count-form env dest)
+  "(ash VALUE COUNT) with COUNT not a constant, for a RUNTIME compile on x64 or
+   aarch64.  Every variable-count ASH used to be a call to BIGNUM-ASH, whose
+   fixnum paths loop (eight bits per step right, %FIXNUM-SHL-OR-NIL left):
+   measured ~198 ns per rotate on x64 against ~3 ns for the constant-count
+   inline shift, which is most of why natrium's SHA-256 and ChaCha20 ran
+   35-65x slower than SBCL (their ROR32 takes the count as an argument).
+
+   Fast path, both operands fixnums:
+     COUNT >= 0, COUNT < 62:  SHLV, then SARV back; equal means nothing was
+                              lost, otherwise the slow path promotes.
+     COUNT < 0:               SARV by min(-COUNT, 63), then clear the tag bit
+                              (63 is the sign fill; see %ASH-INLINE-SAR-COUNT).
+   Anything else -- a bignum or non-integer operand, a count >= 62, a left
+   shift that overflows -- calls BIGNUM-ASH with the ORIGINAL operands, so the
+   result and the TYPE-ERROR for a non-integer are exactly the old ones.
+   Only the slow path calls, so only it saves the live caller-saved temps
+   (the %COMPILE-SETQ-GLOBAL lesson); three temps, the leaf-emitter budget."
+  (let ((save-count (min *temp-reg-counter* 12)))
+    (compile-form value-form env dest)
+    (let ((cnt (alloc-temp-reg)))
+      (if (%leaf-operand-p count-form env)
+          (compile-form count-form env cnt)
+          (progn (emit-ir :push dest) (compile-form count-form env cnt) (emit-ir :pop dest)))
+      (let ((fx (alloc-temp-reg))
+            (chk (alloc-temp-reg))
+            (slow (make-compiler-label))
+            (right (make-compiler-label))
+            (small (make-compiler-label))
+            (shift (make-compiler-label))
+            (done (make-compiler-label)))
+        ;; Both fixnums?  (tag bit of VALUE | COUNT clear)
+        (emit-ir :mov fx dest)
+        (emit-ir :or fx fx cnt)
+        (emit-ir :li chk 1)
+        (emit-ir :test fx chk)
+        (emit-ir :bne slow)
+        (emit-ir :li chk 0)
+        (emit-ir :cmp cnt chk)
+        (emit-ir :blt right)
+        ;; LEFT: 0 <= COUNT < 62, verified by shifting back.
+        (emit-li-tagged chk 62)
+        (emit-ir :cmp cnt chk)
+        (emit-ir :bge slow)
+        (emit-ir :mov fx dest)
+        (emit-ir :shl-var fx fx cnt)
+        (emit-ir :mov chk fx)
+        (emit-ir :sar-var chk chk cnt)
+        (emit-ir :cmp chk dest)
+        (emit-ir :bne slow)
+        (emit-ir :mov dest fx)
+        (emit-ir :br done)
+        ;; RIGHT: shift by min(-COUNT, 63).  Compared BEFORE negating, so the
+        ;; most negative fixnum count cannot overflow the NEG.
+        (emit-ir-label right)
+        (emit-li-tagged chk 63)
+        (emit-ir :neg chk chk)
+        (emit-ir :cmp cnt chk)
+        (emit-ir :bgt small)
+        (emit-li-tagged cnt 63)
+        (emit-ir :br shift)
+        (emit-ir-label small)
+        (emit-ir :neg cnt cnt)
+        (emit-ir-label shift)
+        (emit-ir :sar-var dest dest cnt)
+        (emit-ir :li chk 2)
+        (emit-ir :neg chk chk)
+        (emit-ir :and dest dest chk)
+        (emit-ir :br done)
+        ;; SLOW: exactly the old call.
+        (emit-ir-label slow)
+        (when (> save-count 1)
+          (let ((r (+ +vreg-v4+ 1)))
+            (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+              (unless (= r dest) (emit-ir :push r))
+              (setq r (+ r 1)))))
+        (emit-ir :mov +vreg-v0+ dest)
+        (emit-ir :mov +vreg-v1+ cnt)
+        (emit-ir :set-nargs 2)
+        (emit-ir :call "BIGNUM-ASH" 2)
+        (emit-ir :mov dest +vreg-vr+)
+        (when (> save-count 1)
+          (let ((r (+ +vreg-v4+ save-count -1)))
+            (loop (when (< r (+ +vreg-v4+ 1)) (return))
+              (unless (= r dest) (emit-ir :pop r))
+              (setq r (- r 1)))))
+        (emit-ir-label done)
+        (free-temp-reg)
+        (free-temp-reg)))
+    (free-temp-reg)))
 
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.
@@ -20140,7 +20332,14 @@
     ;; VALUE-FORM is compiled ONCE, and the bignum case is an out-of-line CALL
     ;; rather than an inlined second copy of the computation.  The fast path is
     ;; unchanged; the added cost is a test, a branch and a cold call stub.
-    ((and count (<= count 30))
+    ;; At a RUNTIME compile on a 64-bit target the guarded inline path runs
+    ;; up to 61: its overflow test (shift back and compare) is exact for any
+    ;; left count < 63 on a 64-bit word.  30 is the 32-bit-target bound;
+    ;; past it a constant shift was a call to BIGNUM-ASH, whose fixnum arms
+    ;; loop -- every (ash low-bits 31) of a 32-bit-half rotate.
+    ((and count (or (<= count 30)
+                    (and *mvm-eval-runtime-p* (= +fixnum-bits+ 62) (<= count 61)
+                         (%cg-on-p (quote *cg-ash-wide-const*)))))
      (compile-form value-form env dest)
      (let ((fix-label (make-compiler-label))
            (ash-done  (make-compiler-label))
@@ -20196,6 +20395,16 @@
              (free-temp-reg))))
        (free-temp-reg)
        (emit-ir-label ash-done)))
+    ;; VARIABLE COUNT at a runtime (JIT) compile on a 64-bit JIT target: an
+    ;; inline fixnum fast path, with BIGNUM-ASH kept as the out-of-line slow
+    ;; path.  See %COMPILE-ASH-VAR-FAST.  (setq *cg-var-ash* :off) at runtime
+    ;; restores the plain call, for A/B in one binary.
+    ((and (null count) *mvm-eval-runtime-p*
+          (boundp (quote *jit-target-arch*))
+          (let ((a (symbol-value (quote *jit-target-arch*))))
+            (or (eq a :x64) (eq a :aarch64)))
+          (%cg-on-p (quote *cg-var-ash*)))
+     (%compile-ash-var-fast value-form count-form env dest))
     ;; Large constant or variable count — call bignum-ash so we
     ;; promote to bignum on overflow.  Slower (a real call) but
     ;; correct for arbitrary shift sizes.
@@ -20515,7 +20724,9 @@
      `(let ((,g ,arg))
         (if (consp ,g)
             (%wrapper-arrayp ,g)
-            (%prim-arrayp ,g)))
+            ;; a struct / instance / condition / complex is a marked #x32
+            ;; vector, and not an ARRAY (CLHS 4.2.2) -- see %MARKED-VECTOR-P
+            (if (%prim-arrayp ,g) (not (%marked-vector-p ,g)) nil)))
      env dest)))
 
 (defun compile-prim-arrayp (arg env dest)
@@ -20894,6 +21105,13 @@
 (defun compile-get-alloc-ptr (dest)
   "Compile (get-alloc-ptr) - return VA tagged as fixnum"
   (emit-ir :mov dest +vreg-va+)
+  (emit-ir :shl dest dest +fixnum-shift+))
+
+(defun compile-frame-pointer (dest)
+  "Compile (%frame-pointer) - this function's frame pointer (VFP: RBP on x86-64), as a
+   fixnum whose value is the address.  A backtrace walks the saved-frame-pointer chain
+   from here: [FP] is the caller's FP, [FP+8] the return address into it."
+  (emit-ir :mov dest +vreg-vfp+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
 (defun compile-get-alloc-limit (dest)
@@ -21809,6 +22027,29 @@
             d)
            (t nil)))))
 
+(defun %make-array-zero-kwargs-p (kwargs)
+  "KWARGS is exactly :INITIAL-ELEMENT 0, optionally with an :ELEMENT-TYPE the
+   inline 1-D path already accepts (%INLINE-GENERIC-ELEMENT-TYPE-P), each at
+   most once, on a JIT target.  See COMPILE-MAKE-ARRAY."
+  (and (boundp (quote *jit-target-arch*))
+       (let ((a (symbol-value (quote *jit-target-arch*))))
+         (or (eq a :x64) (eq a :aarch64)))
+       (let ((seen-ie nil) (seen-et nil) (ok t) (k kwargs))
+         (loop
+           (when (or (not ok) (null k)) (return))
+           (if (not (and (consp k) (consp (cdr k))))
+               (setq ok nil)
+               (progn
+                 (cond ((and (eq (car k) :initial-element) (not seen-ie)
+                             (eql (cadr k) 0))
+                        (setq seen-ie t))
+                       ((and (eq (car k) :element-type) (not seen-et)
+                             (%inline-generic-element-type-p (cadr k)))
+                        (setq seen-et t))
+                       (t (setq ok nil)))
+                 (setq k (cddr k)))))
+         (and ok seen-ie))))
+
 (defun compile-make-array (form env dest)
   "Compile (make-array dim &rest kwargs).  Dispatches into:
      • Simple 1-D path (compile-make-array-1d) when no kwargs and dim
@@ -21857,6 +22098,19 @@
             (consp kwargs) (null (cddr kwargs))
             (eq (car kwargs) :element-type)
             (%inline-generic-element-type-p (cadr kwargs)))
+       (compile-make-array-1d dim-form env dest))
+      ;; :INITIAL-ELEMENT 0 (with or without a whitelisted generic
+      ;; :ELEMENT-TYPE): the inline path too.  Every allocation arm zero-
+      ;; fills -- the native ALLOC-OBJ / ALLOC-ARRAY and the interpreter's
+      ;; %ALLOC-NATIVE -- and the zero word IS fixnum 0, so the inline array
+      ;; is already exactly what the keyword asks for.  natrium's FE-ZERO,
+      ;; (make-array 5 :initial-element 0), is every field element of every
+      ;; X25519 / Ed25519 operation: the keyword runtime call was ~7% of an
+      ;; Ed25519 signature by itself.  Runtime compiles on the JIT targets
+      ;; only; build-time image code is unchanged.
+      ((and (not multi) *mvm-eval-runtime-p*
+            (%cg-on-p (quote *cg-make-array-zero*))
+            (%make-array-zero-kwargs-p kwargs))
        (compile-make-array-1d dim-form env dest))
       ((or multi kwargs)
        (compile-call 'make-array (cons dim-form kwargs) env dest))
@@ -22432,17 +22686,83 @@
    register-index form (:AREF / :ASET), which is correct at any width."
   (and (integerp idx) (<= 0 idx 255)))
 
+;;; BOUNDS CHECKING.  Every element access ends in one of these emitters
+;;; (generic AREF/ASET reach them through %PRIM-AREF -> %WORD-AREF / %U8-REF,
+;;; declared arrays directly), and none of them checked the index: an
+;;; out-of-range AREF read whatever followed the vector and an ASET wrote over
+;;; it -- typed or not.  For an evaluator meant to be attested that is a memory
+;;; -safety hole, not a conformance nit.  At SAFETY >= 1 (the default; a
+;;; `(declaim (optimize (safety 0)))' removes it) each access is preceded by
+;;; "INDEX is a fixnum and 0 <= INDEX < (array-len ARR)", one test, two
+;;; compares and a header load on the fast path.  On failure %AREF-INDEX-ERROR
+;;; signals a TYPE-ERROR; if no handler takes it the access is SKIPPED (DEST
+;;; gets the call's value, NIL) -- never performed out of range.
+(defun %bounds-check-p ()
+  (and (>= *compile-safety* 1) (%cg-on-p (quote *cg-bounds-check*))))
+
+(defun %emit-index-check (arr-reg idx-reg dest skip)
+  "Emit the bounds check described above.  ARR-REG and IDX-REG hold the array
+   and the tagged index; on failure branch to SKIP with %AREF-INDEX-ERROR's
+   value in DEST.  The fast path is two signed compares and a header load:
+   0 <= IDX < LEN on the TAGGED words.  No separate fixnum test -- it is not
+   needed for memory safety: a pointer or NIL compares above any length, and
+   a small odd immediate (a character) is below 2*LEN only when the element
+   it then addresses really is inside the vector.  DEST holds the length
+   (it is written only after the access) unless DEST is VR, which the x64
+   translator also uses as its spill scratch.  The cold call saves the live
+   caller-saved temps, the %COMPILE-SETQ-GLOBAL discipline."
+  (let* ((save-count (min *temp-reg-counter* 12))
+         (own (= dest +vreg-vr+))
+         (len (if own (alloc-temp-reg) dest))
+         (ok (make-compiler-label))
+         (bad (make-compiler-label)))
+    (emit-ir :li len 0)
+    (emit-ir :cmp idx-reg len)
+    (emit-ir :blt bad)
+    (emit-ir :array-len len arr-reg)
+    (emit-ir :cmp idx-reg len)
+    (emit-ir :blt ok)
+    (emit-ir-label bad)
+    (when (> save-count 1)
+      (let ((r (+ +vreg-v4+ 1)))
+        (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+          (unless (= r dest) (emit-ir :push r))
+          (setq r (+ r 1)))))
+    (emit-ir :mov +vreg-v0+ arr-reg)
+    (emit-ir :mov +vreg-v1+ idx-reg)
+    (emit-ir :set-nargs 2)
+    (emit-ir :call "%AREF-INDEX-ERROR" 2)
+    (emit-ir :mov dest +vreg-vr+)
+    (when (> save-count 1)
+      (let ((r (+ +vreg-v4+ save-count -1)))
+        (loop (when (< r (+ +vreg-v4+ 1)) (return))
+          (unless (= r dest) (emit-ir :pop r))
+          (setq r (- r 1)))))
+    (emit-ir :br skip)
+    (emit-ir-label ok)
+    (when own (free-temp-reg))))
+
 (defun compile-word-aref (arr-form idx-form env dest)
   (if (%obj-slot-imm-p idx-form)
       (let ((arr-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
-        (emit-ir :obj-ref dest arr-reg idx-form)
+        (if (%bounds-check-p)
+            (let ((idx-reg (alloc-temp-reg)) (skip (make-compiler-label)))
+              (emit-li-tagged idx-reg idx-form)
+              (%emit-index-check arr-reg idx-reg dest skip)
+              (emit-ir :obj-ref dest arr-reg idx-form)
+              (emit-ir-label skip)
+              (free-temp-reg))
+            (emit-ir :obj-ref dest arr-reg idx-form))
         (free-temp-reg))
       (let ((arr-reg (alloc-temp-reg))
-            (idx-reg (alloc-temp-reg)))
+            (idx-reg (alloc-temp-reg))
+            (skip (make-compiler-label)))
         (compile-form arr-form env arr-reg)
         (compile-form idx-form env idx-reg)
+        (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
         (emit-ir :aref dest arr-reg idx-reg)
+        (emit-ir-label skip)
         (free-temp-reg)
         (free-temp-reg))))
 
@@ -22452,37 +22772,55 @@
     (return-from compile-word-aset
       (let ((val-reg (alloc-temp-reg)))        ; see compile-u8-set: never DEST
         (compile-form val-form env val-reg)
-        (if (%obj-slot-imm-p idx-form)
-            (let ((arr-reg (alloc-temp-reg)))
-              (compile-form arr-form env arr-reg)
-              (emit-ir :obj-set arr-reg idx-form val-reg)
-              (free-temp-reg))
-            (let ((arr-reg (alloc-temp-reg))
-                  (idx-reg (alloc-temp-reg)))
-              (compile-form arr-form env arr-reg)
-              (compile-form idx-form env idx-reg)
-              (emit-ir :aset arr-reg idx-reg val-reg)
-              (free-temp-reg)
-              (free-temp-reg)))
-        (emit-ir :mov dest val-reg)
+        (let ((skip (make-compiler-label)))
+          (if (%obj-slot-imm-p idx-form)
+              (let ((arr-reg (alloc-temp-reg)))
+                (compile-form arr-form env arr-reg)
+                (when (%bounds-check-p)
+                  (let ((idx-reg (alloc-temp-reg)))
+                    (emit-li-tagged idx-reg idx-form)
+                    (%emit-index-check arr-reg idx-reg dest skip)
+                    (free-temp-reg)))
+                (emit-ir :obj-set arr-reg idx-form val-reg)
+                (free-temp-reg))
+              (let ((arr-reg (alloc-temp-reg))
+                    (idx-reg (alloc-temp-reg)))
+                (compile-form arr-form env arr-reg)
+                (compile-form idx-form env idx-reg)
+                (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+                (emit-ir :aset arr-reg idx-reg val-reg)
+                (free-temp-reg)
+                (free-temp-reg)))
+          (emit-ir :mov dest val-reg)
+          (emit-ir-label skip))
         (free-temp-reg))))
   (if (%obj-slot-imm-p idx-form)
       (let ((arr-reg (alloc-temp-reg))
-            (val-reg (alloc-temp-reg)))
+            (val-reg (alloc-temp-reg))
+            (skip (make-compiler-label)))
         (compile-form arr-form env arr-reg)
         (compile-form val-form env val-reg)
+        (when (%bounds-check-p)
+          (let ((idx-reg (alloc-temp-reg)))
+            (emit-li-tagged idx-reg idx-form)
+            (%emit-index-check arr-reg idx-reg dest skip)
+            (free-temp-reg)))
         (emit-ir :obj-set arr-reg idx-form val-reg)
         (emit-ir :mov dest val-reg)
+        (emit-ir-label skip)
         (free-temp-reg)
         (free-temp-reg))
       (let ((arr-reg (alloc-temp-reg))
             (idx-reg (alloc-temp-reg))
-            (val-reg (alloc-temp-reg)))
+            (val-reg (alloc-temp-reg))
+            (skip (make-compiler-label)))
         (compile-form arr-form env arr-reg)
         (compile-form idx-form env idx-reg)
         (compile-form val-form env val-reg)
+        (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
         (emit-ir :aset arr-reg idx-reg val-reg)
         (emit-ir :mov dest val-reg)
+        (emit-ir-label skip)
         (free-temp-reg)
         (free-temp-reg)
         (free-temp-reg))))
@@ -22579,7 +22917,10 @@
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
     (compile-form idx-form env idx-reg)
-    (emit-ir :f32-ref dest arr-reg idx-reg)
+    (let ((skip (make-compiler-label)))
+      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (emit-ir :f32-ref dest arr-reg idx-reg)
+      (emit-ir-label skip))
     (free-temp-reg)
     (free-temp-reg)))
 
@@ -22596,8 +22937,11 @@
           (idx-reg (alloc-temp-reg)))
       (compile-form arr-form env arr-reg)
       (compile-form idx-form env idx-reg)
-      (emit-ir :f32-set arr-reg idx-reg val-reg)
-      (emit-ir :mov dest val-reg)
+      (let ((skip (make-compiler-label)))
+        (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+        (emit-ir :f32-set arr-reg idx-reg val-reg)
+        (emit-ir :mov dest val-reg)
+        (emit-ir-label skip))
       (free-temp-reg)
       (free-temp-reg))
     (free-temp-reg)))
@@ -22609,8 +22953,11 @@
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
     (compile-form idx-form env idx-reg)
-    (emit-ir :gc-check)
-    (emit-ir :f32-load dest arr-reg idx-reg)
+    (let ((skip (make-compiler-label)))
+      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (emit-ir :gc-check)
+      (emit-ir :f32-load dest arr-reg idx-reg)
+      (emit-ir-label skip))
     (free-temp-reg)
     (free-temp-reg)))
 
@@ -22623,8 +22970,11 @@
           (idx-reg (alloc-temp-reg)))
       (compile-form arr-form env arr-reg)
       (compile-form idx-form env idx-reg)
-      (emit-ir :f32-store arr-reg idx-reg val-reg)
-      (emit-ir :mov dest val-reg)
+      (let ((skip (make-compiler-label)))
+        (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+        (emit-ir :f32-store arr-reg idx-reg val-reg)
+        (emit-ir :mov dest val-reg)
+        (emit-ir-label skip))
       (free-temp-reg)
       (free-temp-reg))
     (free-temp-reg)))
@@ -22643,7 +22993,10 @@
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
     (compile-form idx-form env idx-reg)
-    (emit-ir :u8-ref dest arr-reg idx-reg)
+    (let ((skip (make-compiler-label)))
+      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (emit-ir :u8-ref dest arr-reg idx-reg)
+      (emit-ir-label skip))
     (free-temp-reg)
     (free-temp-reg)))
 
@@ -22664,6 +23017,7 @@
 (defvar *cg-minmax-lit* :on)
 (defvar *cg-typed-ash* :on)
 (defvar *cg-narrow-fixnum* :on)
+(defvar *cg-bounds-check* :on)
 (defun %cg-on-p (name)
   (let ((v (and (boundp name) (symbol-value name))))
     (not (eq v :off))))
@@ -22698,8 +23052,11 @@
               (idx-reg (alloc-temp-reg)))
           (compile-form arr-form env arr-reg)
           (compile-form idx-form env idx-reg)
-          (emit-ir :u8-set arr-reg idx-reg val-reg)
-          (emit-ir :mov dest val-reg)
+          (let ((skip (make-compiler-label)))
+            (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+            (emit-ir :u8-set arr-reg idx-reg val-reg)
+            (emit-ir :mov dest val-reg)
+            (emit-ir-label skip))
           (free-temp-reg)
           (free-temp-reg))
         (free-temp-reg))
@@ -22709,8 +23066,11 @@
         (compile-form arr-form env arr-reg)
         (compile-form idx-form env idx-reg)
         (compile-form val-form env val-reg)
-        (emit-ir :u8-set arr-reg idx-reg val-reg)
-        (emit-ir :mov dest val-reg)
+        (let ((skip (make-compiler-label)))
+          (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+          (emit-ir :u8-set arr-reg idx-reg val-reg)
+          (emit-ir :mov dest val-reg)
+          (emit-ir-label skip))
         (free-temp-reg)
         (free-temp-reg)
         (free-temp-reg))))
@@ -24767,6 +25127,8 @@
       (:sub-checked 4)
       (:mul26lo 4)
       (:mul26hi 4)
+      (:mulsplit-lo 5)
+      (:mulsplit-hi 5)
       (:mul64lo 4)
       (:mul64hi 4)
       (:acc128  4)
@@ -25118,6 +25480,10 @@
            (mvm-mul26lo buf (second insn) (third insn) (fourth insn)))
           (:mul26hi
            (mvm-mul26hi buf (second insn) (third insn) (fourth insn)))
+          (:mulsplit-lo
+           (mvm-mulsplit-lo buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:mulsplit-hi
+           (mvm-mulsplit-hi buf (second insn) (third insn) (fourth insn) (fifth insn)))
           (:mul64lo
            (mvm-mul64lo buf (second insn) (third insn) (fourth insn)))
           (:mul64hi
@@ -26167,7 +26533,15 @@
                                           (setf (nth idx positional) (cadr cargs))))
                                       (setf cargs (cddr cargs)))
                              `(,ics ,@positional)))))
-                  (mvm-define-macro ctor-fn-name expander)
+                  ;; Build time only, for the reason MAKE-<name> gives (NOT A
+                  ;; MACRO AT RUNTIME): this table is keyed by the BARE name,
+                  ;; so bordeaux-threads v1's (:constructor
+                  ;; %make-condition-variable) rewrote v2's same-named BOA
+                  ;; constructor into v1's, and every BT2 condition variable
+                  ;; was a BT::CONDITION-VARIABLE.  At runtime the per-package
+                  ;; SET-MACRO-FUNCTION below covers it.
+                  (unless *mvm-eval-runtime-p*
+                    (mvm-define-macro ctor-fn-name expander))
                   ;; A callable function too (runtime compiles) -- quri's
                   ;; (apply #'%make-uri args); see %DEFSTRUCT-KW-CTOR-DEFUN.
                   (when *mvm-eval-runtime-p*

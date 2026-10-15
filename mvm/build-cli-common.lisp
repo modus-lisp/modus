@@ -1264,6 +1264,13 @@
                    ;; group, so those images keep the single-buffer socket
                    ;; layer and their blobs are unaffected.
                    (mvm-text "net/hosted-sockets-post.lisp")
+                   (string #\Newline)
+                   ;; fork/execve for UIOP:RUN-PROGRAM (x86-64 syscall numbers).
+                   (mvm-text "net/hosted-process.lisp")
+                   (string #\Newline)
+                   ;; BACKTRACES: the frame chain, named (needs %FRAME-POINTER).
+                   (mvm-text "net/hosted-backtrace.lisp")
+                   (string #\Newline)
                    ;; AWS Nitro Enclaves: CBOR + the /dev/nsm attestation request
                    ;; (lib/cbor.lisp, net/nsm-attest.lisp).  Hosted x64 only: the
                    ;; NSM is a Linux device.  Inert without one (:NO-NSM).
@@ -1750,6 +1757,11 @@
 (defvar *sb-shim-text*
   (concatenate 'string
                (read-file-text (merge-pathnames "net/sb-thread-shim.lisp"
+                                                *modus-base*))
+               (string #\Newline)
+               ;; MODUS:MAKE-CHANNEL, the message channel between threads: on
+               ;; the thread surface's mutexes, wait queues and MODUS:SHARE.
+               (read-file-text (merge-pathnames "net/modus-channel.lisp"
                                                 *modus-base*))
                (string #\Newline)
                (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"

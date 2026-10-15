@@ -1750,7 +1750,8 @@
    poisoned slot-exists-p.15/.16 (all-NIL)."
   (when (or (fixnump obj) (consp obj) (null obj)) (return-from %cond-type-name-of nil))
   (when (not (= (obj-subtag obj) #x32)) (return-from %cond-type-name-of nil))
-  (when (not (= (array-length obj) 2)) (return-from %cond-type-name-of nil))
+  (when (not (and (= (array-length obj) 3) (eq (aref obj 2) '%condition-marker)))
+    (return-from %cond-type-name-of nil))
   (let ((tn (aref obj 0)))
     (when (or (null tn) (not (symbolp tn))) (return-from %cond-type-name-of nil))
     (let ((cur *condition-type-registry*))
@@ -5242,7 +5243,7 @@
     ;; long as the number of GFs, and a library defining many GFs loaded in
     ;; quadratic time (80 DEFGENERICs: 10.7 s, 19.6 s, 28.9 s against a flat
     ;; 0.5 s; quicklisp's setup 17 s -> 60 s).
-    ((arrayp x) nil)
+    ((%raw-arrayp x) nil)
     ((member x *gf-stub-closures*) t)
     (t nil)))
 
@@ -6420,6 +6421,14 @@
        (if (%bulk-copy-ok-p r seq)
            (progn (%bulk-copy r 0 seq 0 (length seq)) r)
            (dotimes (i (length seq) r) (aset r i (aref seq i))))))
+    ;; packed (unsigned-byte 8) vector (subtag #x11) copies to a packed one.
+    ;; It fell through to the generic MAKE-ARRAY below and came back a #x32
+    ;; simple-vector: equal-looking, but a caller that DECLARES the copy
+    ;; (simple-array (unsigned-byte 8) (*)) -- natrium's BYTES= does -- takes
+    ;; the packed-byte fast path and reads the word vector as bytes.
+    ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x11))
+     (let ((r (%make-u8-vector (length seq))))
+       (dotimes (i (length seq) r) (setf (aref r i) (aref seq i)))))
     ;; packed single-float vector (subtag #x12) copies to a packed one
     ((and (not (%mda-p seq)) (eql (obj-subtag seq) #x12))
      (let ((r (%make-f32-vector (length seq))))
@@ -7173,14 +7182,45 @@
 ;;; INTERNAL-TIME-UNITS-PER-SECOND promised, and 201 is `listen(2)' on the
 ;;; AArch64 generic ABI, so this was never portable either.
 
-;;; CLASS-OF — strict 1-arg arity
+;;; CLASS-OF — strict 1-arg arity.  Every object has a class (CLHS 4.3.1).
+;;; It used to answer NIL for everything but a CLOS instance -- conditions,
+;;; structs, 5, "s".  Non-CLOS objects get FIND-CLASS's canonical proxy, so
+;;; (eq (class-of c) (find-class (type-of c))) holds.
+(defun %class-of-builtin-name (x)
+  "The CLHS 4.3.7 built-in class name for a non-CLOS, non-struct object."
+  (let ((ty (type-of x)))
+    (cond
+      ;; Tagged conses underneath: test before TYPE-OF says CONS.
+      ((packagep x) 'package)
+      ((streamp x)
+       (if (member ty '(broadcast-stream concatenated-stream echo-stream
+                        file-stream string-stream synonym-stream two-way-stream))
+           ty 'stream))
+      ((member ty '(symbol null cons string character hash-table package
+                    pathname logical-pathname readtable random-state
+                    single-float double-float ratio complex function
+                    broadcast-stream concatenated-stream echo-stream
+                    file-stream string-stream synonym-stream two-way-stream
+                    stream bit-vector))
+       ty)
+      ((or (eq ty 'boolean) (eq ty 'keyword)) 'symbol)
+      ((integerp x) 'integer)
+      (t (let ((d (%type-of-for-dispatch x)))
+           (if (eq d 'boolean) 'symbol d))))))
+
 (defun class-of (x &rest extra)
   (if extra
       (%program-error "class-of requires exactly 1 argument")
       (cond
-        ((%clos-instance-p x)
-         (%find-clos-class (aref x 1)))
-        (t nil))))
+        ((%clos-instance-p x) (%find-clos-class (aref x 1)))
+        ((%clos-class-p x)    (find-class 'standard-class))
+        ((%condition-p x)     (find-class (%condition-type-name x)))
+        ;; Not FIND-CLASS: a struct compiled into the image has no runtime
+        ;; type descriptor for it to find ("class not found").
+        ((%struct-instance-p x)
+         (let ((n (%struct-type-name x)))
+           (or (%find-clos-class n) (%get-class-proxy n))))
+        (t (find-class (%class-of-builtin-name x))))))
 
 ;;; SLOT-VALUE — strict 2-arg arity
 (defun slot-value (obj slot-name &rest extra)

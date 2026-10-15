@@ -1685,6 +1685,32 @@
                    (reg-set regs vd (tag-fixnum (ash product -26))))
                  (setf pc npc3)))))
 
+          (#.+op-mulsplit-lo+
+           ;; bits [0,k) of the signed product untag(a)*untag(b) -- always a fixnum
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (k npc4) (fetch-byte bc npc3)
+                   (setf (svref regs vd)
+                         (ldb (byte k 0) (* (%mvm-untag-value (svref regs va))
+                                            (%mvm-untag-value (svref regs vb)))))
+                   (setf pc npc4))))))
+
+          (#.+op-mulsplit-hi+
+           ;; product >> k, arithmetic.  Wrapped to the machine word exactly as
+           ;; the native SHRD/EXTR leaves it, so a caller that broke the
+           ;; fits-a-fixnum contract sees the SAME value here as under the JIT.
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (k npc4) (fetch-byte bc npc3)
+                   (%mvm-put-word regs vd
+                                  (%mvm-wrap-word
+                                   (* 2 (ash (* (%mvm-untag-value (svref regs va))
+                                                (%mvm-untag-value (svref regs vb)))
+                                             (- k)))))
+                   (setf pc npc4))))))
+
           (#.+op-mul64lo+
            ;; low 64 bits of raw Va*Vb (no tag/untag)
            (multiple-value-bind (vd npc) (fetch-reg bc pc)

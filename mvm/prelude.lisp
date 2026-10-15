@@ -575,6 +575,31 @@
            ((stringp cd) t)
            (t nil))))))
 
+;;; ARRAYP AND THE MARKED VECTORS.  A struct, CLOS instance, class, class
+;;; proxy, generic function, method combination, complex number and condition
+;;; are all #x32 vectors underneath with a marker symbol in a fixed slot.  CLHS
+;;; 4.2.2 makes ARRAY disjoint from every one of those types, so the compiled
+;;; ARRAYP (COMPILE-ARRAYP) asks %MARKED-VECTOR-P of every #x32 vector it
+;;; accepts.  %RAW-ARRAYP is the old answer, for runtime code that walks these
+;;; objects as the vectors they are.
+(defun %marked-vector-p (v)
+  "True iff V, a non-cons, is one of the runtime's marked #x32 objects."
+  (and (= (obj-subtag v) #x32)
+       (let ((n (array-length v)))
+         (and (> n 0)
+              (let ((s (svref v 0)))
+                (or (and (= n 3) (eq (svref v 2) '%condition-marker))
+                    (and s (symbolp s)
+                         (or (eq s '%clos-instance) (eq s '%struct-instance)
+                             (eq s '%complex-marker) (eq s '%clos-class)
+                             (eq s '%class-proxy) (eq s '%generic-function)
+                             (eq s '%method-combination)
+                             (eq s '%method-combination-long)))))))))
+
+(defun %raw-arrayp (x)
+  "ARRAYP as it was before marked objects were excluded: any vector shape."
+  (if (consp x) (%wrapper-arrayp x) (%prim-arrayp x)))
+
 (defun length (seq)
   "Return the length of SEQ (list or array).
    For array wrappers (commit 7c9a463: adj/fp/displaced/multi-dim wrappers
@@ -622,6 +647,8 @@
     ;; read its header count -- (length :foo) answered 1.
     ((or (symbolp seq) (characterp seq) (numberp seq) (functionp seq))
      (%signal-type-error))
+    ;; a struct / instance / condition is a vector only underneath
+    ((%marked-vector-p seq) (%signal-type-error))
     (t (array-length seq))))
 
 ;;; ============================================================
@@ -3355,6 +3382,16 @@
   ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates
   ;; it via its (null cur) terminator).  Treat present-but-nil like absent.
   (let ((end (if (and end-arg (car end-arg)) (car end-arg) (length seq))))
+  ;; BOUNDING INDICES ARE CHECKED (CLHS 17.3): START and END must satisfy
+  ;; 0 <= START <= END <= (LENGTH SEQ).  There was no check: (subseq "abc" 0 10)
+  ;; bulk-copied past the end of the string, and the fault surfaced from native
+  ;; copy code as a TYPE-ERROR (datum T, expected NUMBER) that no HANDLER-CASE
+  ;; saw -- a caller guarding a short string with an error handler was killed.
+  (let ((n (length seq)))
+    (unless (and (integerp start) (<= 0 start n))
+      (%signal-type-error start (list 'integer 0 n)))
+    (unless (and (integerp end) (<= start end n))
+      (%signal-type-error end (list 'integer start n))))
   ;; NIL is a (empty) list: (subseq nil 0 0) must return NIL, not #().
   ;; The consp-only test sent NIL down the array branch, returning an
   ;; empty VECTOR — which broke the in-image compiler's static-rest

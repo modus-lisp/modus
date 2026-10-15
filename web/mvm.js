@@ -564,10 +564,10 @@ class MVM {
     this.markStart(base); this.markCons(base);
     return base | 1;
   }
-  allocFloat(d) {
+  allocFloat(d, subtag = 0x60) {               // 0x60 double-float, 0x64 single-float: same 4-slot layout
     const base = this.bump(48);
     this.zero(base, base + 48);
-    this.st64(base, (4 << 8) | 0x60, 0);
+    this.st64(base, (4 << 8) | subtag, 0);
     this.f64[0] = d;
     for (let i = 0; i < 4; i++) this.st64(base + 16 + 8 * i, this.f64u16[3 - i] << 1, 0);
     this.markStart(base);
@@ -1272,6 +1272,9 @@ class MVM {
           const x = this.floatVal(this.rlo(code[pc + 2])), y = this.floatVal(this.rlo(code[pc + 3]));
           const r = op === 0xBE ? x + y : op === 0xBF ? x - y : op === 0xC0 ? x * y : x / y;
           this.setReg(code[pc + 1], this.allocFloat(r), 0); pc += 4; break;
+        }
+        case 0xD0: {                                                                                     // fround32: boxed float -> rounded to single -> fresh boxed single (#x64)
+          this.setReg(code[pc + 1], this.allocFloat(Math.fround(this.floatVal(this.rlo(code[pc + 2]))), 0x64), 0); pc += 3; break;
         }
         case 0xC2: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), 1); this.setReg(code[pc + 1], this.allocFloat(toNum(RL, RH)), 0); pc += 3; break; }
         case 0xC3: {                                                                                     // ftoi (cvttsd2si)

@@ -1988,6 +1988,14 @@
               (string= (symbol-name (car et)) "UNSIGNED-BYTE")
               (consp (cdr et)) (eql (cadr et) 8)))))
 
+(defun %seq-type-f32-p (type)
+  "True when TYPE is an array/vector type specifier whose element type
+   upgrades to SINGLE-FLOAT (the packed #x12 vector)."
+  (and (consp type) (symbolp (car type))
+       (member (symbol-name (car type)) '("SIMPLE-ARRAY" "ARRAY" "VECTOR") :test #'string=)
+       (consp (cdr type))
+       (%f32-element-type-p (cadr type))))
+
 (defun %seq-u8-copy (seq)
   "A fresh packed (unsigned-byte 8) vector holding SEQ's elements."
   (let* ((n (length seq))
@@ -2010,6 +2018,19 @@
     (return-from make-sequence
       (make-array size :element-type '(unsigned-byte 8)
                        :initial-element (let ((p (member :initial-element args))) (if p (cadr p) 0)))))
+  ;; (VECTOR SINGLE-FLOAT) is the packed #x12 vector, as MAKE-ARRAY makes it:
+  ;; this built a general vector, which TYPEP of the very type asked for
+  ;; rejects (ANSI make-sequence 17821).
+  (when (%seq-type-f32-p type)
+    (let ((n (and (eq (car type) 'vector) (consp (cddr type)) (caddr type))))
+      (when (and (integerp n) (not (= n size)))
+        (%signal-type-error)
+        (return-from make-sequence nil)))
+    (return-from make-sequence
+      (let ((p (member :initial-element args)))
+        (if p
+            (make-array size :element-type 'single-float :initial-element (cadr p))
+            (make-array size :element-type 'single-float)))))
   ;; Resolve a class designator (class object or class-proxy) to its name
   ;; so the dispatch below can match symbols uniformly.  Keeps callers
   ;; using `(find-class 'list)' / `(class-of '(a b c))' working.
@@ -2228,12 +2249,15 @@
   ;; a program-error.
   (when (and state (cdr state))
     (error "random: too many arguments"))
-  ;; (random 0) is undefined in CL but happens when callers pass an
-  ;; overflowed bound like (ASH 1 64) → 0.  Returning 0 keeps the
-  ;; caller alive instead of #DE-trapping into a kernel-killing
-  ;; nested-exception loop (we don't install an IDT entry for #DE).
-  (if (= n 0)
-      0
+  ;; CLHS: LIMIT is a positive integer or a positive float.  (random 0) used
+  ;; to return 0 -- a guard against the integer path's division #DE-trapping
+  ;; on bare metal, where no IDT entry handles #DE -- and a negative LIMIT
+  ;; returned a value in (LIMIT, 0].  Both now signal the TYPE-ERROR SBCL
+  ;; signals, which also keeps the zero away from the division.  A caller
+  ;; that indexed with (random 0) used to go on to read one past the end of
+  ;; an empty vector (ANSI subtypep 26525/26526 "passed" that way).
+  (if (not (or (and (integerp n) (> n 0)) (and (floatp-impl n) (> n 0))))
+      (error 'type-error :datum n :expected-type '(or (integer 1) (float (0.0))))
       ;; The seed lives at #x10000FD8 -- NOT #x100000A0, which is the SECOND
       ;; extra slot of the multiple-value buffer (#x10000098..#x10000138): every
       ;; function returning three or more values overwrote the seed with its
@@ -3236,7 +3260,10 @@
 ;; for fn-addrs whose low bit happened to land on 0 or 1.  Replaced
 ;; with proper subtag checks.  In MVM all vectors share +subtag-array+
 ;; (#x32) — strings (#x31) are also vector-shaped per CL semantics.
-(defun vectorp (obj) (or (arrayp obj) (stringp obj)))
+(defun vectorp (obj)
+  "A one-dimensional array (CLHS): ARRAYP already excludes the marked
+   objects (structs, instances, conditions, complexes)."
+  (or (stringp obj) (and (arrayp obj) (= (array-rank obj) 1))))
 (defun remove-duplicates (seq &rest args)
   "Remove duplicates from SEQ. CL default keeps the LAST occurrence
    of each duplicate group (so the relative order of survivors is the

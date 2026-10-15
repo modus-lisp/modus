@@ -524,6 +524,24 @@
               (setq res (cdr e)))))))
     res))
 
+(defun %macro-pkg-foreign-p (sym key)
+  "True when the bare-name entry for KEY can only be ANOTHER package's macro:
+   KEY has per-package expanders, and none for SYM's home package.  Every
+   lookup falls back to the bare entry SET-MACRO-FUNCTION also writes, so
+   without this a function in one package was expanded as the same-named macro
+   of another: bordeaux-threads v1's keyword constructor %MAKE-CONDITION-VARIABLE
+   rewrote v2's BOA one, and every BT2 condition variable was a v1 struct.
+   LOCKED, like %MACRO-PKG-GET."
+  (%rt-enter)
+  (let ((r (and *macro-pkg-table* (stringp key)
+                (let ((pn (%macro-sym-pkg-name sym))
+                      (al (gethash key *macro-pkg-table*)))
+                  (and pn al
+                       (not (dolist (e al nil)
+                              (when (string= (car e) pn) (return t)))))))))
+    (%rt-leave)
+    r))
+
 (defun %macro-pkg-put (sym key fn)
   "Register FN as the expander for SYM's own package under name KEY.  LOCKED."
   (%rt-enter)
@@ -755,6 +773,8 @@
       ((null key) nil)
       ;; SYM's own-package expander wins over the legacy bare-name entry.
       ((%macro-pkg-get sym key))
+      ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
+      ((%macro-pkg-foreign-p sym key) nil)
       ((and *macro-function-table* (gethash key *macro-function-table*)))
       ((%macro-table-visible-expander key))
       ((and (stringp key) (%compiler-macro-p key)) t)
@@ -787,6 +807,8 @@
              ((null key) nil)
              ;; SYM's own-package expander wins over the legacy bare entry.
              ((%macro-pkg-get sym key))
+             ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
+             ((%macro-pkg-foreign-p sym key) nil)
              ((and *macro-function-table* (gethash key *macro-function-table*)))
              ;; Compiler inlining macros over standard CL FUNCTIONS are
              ;; filtered here — see %MACRO-TABLE-VISIBLE-EXPANDER.
@@ -3810,7 +3832,7 @@
     ;; glass's FB-RECT (a FILL per row) 13 ms.  The only array that is a
     ;; generic function is the GF object itself; dispatch closures are not
     ;; arrays.
-    ((arrayp x) (if (%gf-p x) t nil))
+    ((%raw-arrayp x) (if (%gf-p x) t nil))
     ((%generic-function-p x) t)
     ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
     ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →

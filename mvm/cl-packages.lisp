@@ -1407,7 +1407,8 @@
    the type symbol in slot 0.  Used by %defpackage-impl for nickname
    conflicts (CLHS 11.1.1.1) and for disjointness violations whose CLHS
    spec calls for PACKAGE-ERROR rather than PROGRAM-ERROR."
-  (let ((c (make-array 2)))
+  (let ((c (make-array 3)))
+    (aset c 2 '%condition-marker)
     (aset c 0 'package-error)
     (aset c 1 nil)
     (setq *current-condition* c)

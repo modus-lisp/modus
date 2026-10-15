@@ -1337,6 +1337,8 @@
           ;; struct stat on AArch64 differs from x86-64 layout —
           ;; st_size is at offset 48 in both, so the same load works.
           (mem-ref (+ buf-addr 48) :u32)))))
+(defun %sys-readlink (path-str) (declare (ignore path-str)) nil)   ; links not followed here yet
+
 (defun %sys-stat-exists (path-str)
   (let ((path-addr (%string-to-cstr path-str *cstr-scratch*))
         (buf-addr *io-buf-addr*))

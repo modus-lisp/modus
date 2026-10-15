@@ -89,7 +89,54 @@
        (error (c) (princ-to-string c)))
      "picky 150")
 
-;;; 8. *JIT-HOT-CALLS* 0 turns it off for DEFUNs installed afterwards
+;;; 8. a generic function defined over a DEFUN keeps the DEFUN's trampoline as its
+;;; fallback method.  That trampoline getting hot must neither forward to the GF
+;;; (which falls back to the trampoline: a loop until the stack is gone) nor
+;;; install the DEFUN's native code over the GF.  Both orders: the GF arriving
+;;; before the DEFUN is hot, and after.
+(defun gf-early (x) (* x 2))
+(dotimes (i 5) (gf-early i))                        ; not hot yet
+(defmethod gf-early ((x string)) (concatenate 'string x x))
+(let ((ok t))
+  (dotimes (i 200) (unless (eql (gf-early i) (* i 2)) (setq ok nil)))
+  (chk "GF over a cold DEFUN: the fallback stays right across promotion" ok t))
+(chk "and the GF's own method still runs" (gf-early "ab") "abab")
+(defun gf-late (x) (+ x 100))
+(dotimes (i 100) (gf-late i))                       ; hot: native
+(defmethod gf-late ((x string)) (length x))
+(chk "GF over a hot DEFUN: the fallback" (gf-late 1) 101)
+(chk "GF over a hot DEFUN: the method" (gf-late "abc") 3)
+(let ((ok t))
+  (dotimes (i 200) (unless (and (eql (gf-late i) (+ i 100)) (eql (gf-late "xy") 2)) (setq ok nil)))
+  (chk "and stays right, with JIT-EAGER after it" (progn (jit-eager) ok) t))
+(chk "the GF survived JIT-EAGER" (gf-late "abcd") 4)
+
+;;; 8b. a (SETF FDEFINITION) wrapper that calls the function object it replaced
+;;; (secp256k1-fast's threadsafe.lisp does this to every entry point).  The
+;;; original trampoline is no longer its name's definition, so it must not be
+;;; forwarded BY NAME (that is the wrapper: a loop) -- but it must still go
+;;; native, to its OWN code: it used to stay interpreted forever.
+(defun forwarded-p (nm)
+  (let ((f (or (gethash nm *jit-trampoline-forwards*)
+               (gethash (concatenate 'string "COMMON-LISP-USER::" nm) *jit-trampoline-forwards*))))
+    (and f (car (cdr f)) (eql (logand (%val->word (car (cdr f))) 15) 3))))
+(defun wrapped (x) (* x 3))
+(defvar *wrapper-calls* 0)
+(let ((inner (fdefinition 'wrapped)))
+  (setf (fdefinition 'wrapped) (lambda (x) (setq *wrapper-calls* (+ *wrapper-calls* 1)) (funcall inner x))))
+(chk "wrapped original starts interpreted" (forwarded-p "WRAPPED") nil)
+(let ((ok t))
+  (dotimes (i 200) (unless (eql (wrapped i) (* 3 i)) (setq ok nil)))
+  (chk "wrapped: right across the original's promotion" ok t))
+(chk "the original went native, to its own code" (forwarded-p "WRAPPED") t)
+(chk "and the wrapper is still the definition, still running"
+     (list (native-p "WRAPPED") *wrapper-calls* (wrapped 7) *wrapper-calls*)
+     (list nil 200 21 201))
+(jit-eager)
+(chk "JIT-EAGER leaves the wrapper in place" (list (wrapped 1) *wrapper-calls*) (list 3 202))
+(chk "a GF's fallback trampoline also forwards to its own code" (forwarded-p "GF-EARLY") t)
+
+;;; 9. *JIT-HOT-CALLS* 0 turns it off for DEFUNs installed afterwards
 (setq *jit-hot-calls* 0)
 (defun cold (x) (+ x 1))
 (dotimes (i 500) (cold i))

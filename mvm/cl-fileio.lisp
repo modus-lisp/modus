@@ -211,12 +211,21 @@
   (syscall3 39 0 0 0))
 
 (defun %sys-read-raw (fd buf-addr count)
-  "Read COUNT bytes from FD into buf at BUF-ADDR. Returns bytes read or negative."
-  (syscall3 0 fd buf-addr count))
+  "Read COUNT bytes from FD into buf at BUF-ADDR. Returns bytes read or negative.
+   EINTR (-4) is retried: it means a signal arrived before any byte moved, and with
+   threads one does whenever another thread's collection stops the world -- a reader
+   blocked on a socket then saw a negative count, which the stream layer reads as end
+   of file, and a VNC client was dropped the moment its sender thread started work."
+  (loop
+    (let ((n (syscall3 0 fd buf-addr count)))
+      (unless (= n -4) (return n)))))
 
 (defun %sys-write-raw (fd buf-addr count)
-  "Write COUNT bytes from buf at BUF-ADDR to FD. Returns bytes written or negative."
-  (syscall3 1 fd buf-addr count))
+  "Write COUNT bytes from buf at BUF-ADDR to FD. Returns bytes written or negative.
+   EINTR is retried, as for %SYS-READ-RAW."
+  (loop
+    (let ((n (syscall3 1 fd buf-addr count)))
+      (unless (= n -4) (return n)))))
 
 ;;; Buffer transfer that never touches a raw address.
 ;;;
@@ -1714,15 +1723,80 @@
                                "" "/")
                            rel))))))
 
+(defun %sys-readlink (path-str)
+  "The target of the symbolic link PATH-STR as a string, or NIL when it is not one (or
+   cannot be read).  readlink(2) is syscall 89 on x86-64; other CLIs override this."
+  (if (%cab-on)
+      nil
+      (let* ((path-addr (%string-to-cstr path-str *cstr-scratch*))
+             (buf (%fs-io-page))
+             (n (syscall3 89 path-addr buf 4000)))
+        (if (<= n 0)
+            nil
+            (%utf8-mem-to-string buf n)))))
+
+(defun %utf8-mem-to-string (addr n)
+  "N bytes of UTF-8 at ADDR as a string."
+  (let ((out (make-string-output-stream)) (i 0))
+    (loop
+      (when (>= i n) (return (get-output-stream-string out)))
+      (let* ((b (mem-ref (+ addr i) :u8))
+             (k (cond ((< b #x80) 0) ((= (logand b #xE0) #xC0) 1)
+                      ((= (logand b #xF0) #xE0) 2) ((= (logand b #xF8) #xF0) 3) (t 0)))
+             (c (cond ((= k 1) (logand b #x1F)) ((= k 2) (logand b #x0F))
+                      ((= k 3) (logand b #x07)) (t b))))
+        (dotimes (j k)
+          (when (< (+ i 1 j) n)
+            (setq c (logior (ash c 6) (logand (mem-ref (+ addr i 1 j) :u8) #x3F)))))
+        (write-char (code-char c) out)
+        (setq i (+ i 1 k))))))
+
+(defun %resolve-symlinks (abs)
+  "ABS, an absolute path string, with every symbolic link in it followed -- what
+   realpath(3) answers.  At most 40 links, as Linux allows; past that ABS is returned."
+  (let ((todo (%split-path-components abs)) (out "") (links 0))
+    (loop
+      (when (null todo)
+        (return (if (string= out "") "/" out)))
+      (let ((c (pop todo)))
+        (cond
+          ((or (string= c "") (string= c ".")) nil)
+          ((string= c "..")
+           (let ((cut (position #\/ out :from-end t)))
+             (setq out (if cut (subseq out 0 cut) ""))))
+          (t
+           (let* ((cand (concatenate 'string out "/" c))
+                  (target (%sys-readlink cand)))
+             (cond
+               ((null target) (setq out cand))
+               ((>= (setq links (+ links 1)) 40) (return abs))
+               (t
+                (when (and (> (length target) 0) (char= (char target 0) #\/))
+                  (setq out ""))
+                (setq todo (append (%split-path-components target) todo)))))))))))
+
+(defun %split-path-components (s)
+  (let ((parts nil) (start 0) (n (length s)))
+    (loop
+      (let ((e (or (position #\/ s :start start) n)))
+        (setq parts (cons (subseq s start e) parts))
+        (when (>= e n) (return (nreverse parts)))
+        (setq start (+ e 1))))))
+
 (defun truename (x)
-  "CLHS 20.2: the truename of the file X names -- an ABSOLUTE pathname.
-   Signals FILE-ERROR when there is no such file.  (It used to return the
+  "CLHS 20.2: the truename of the file X names -- an ABSOLUTE pathname, with symbolic
+   links followed.  Signals FILE-ERROR when there is no such file.  (It used to return the
    argument's relative namestring and signal SIMPLE-ERROR; a relative
    *LOAD-TRUENAME* made the unmodified ansi-test merge a chapter directory
-   onto itself: objects/objects/...)"
+   onto itself: objects/objects/...)  Links were not followed: a system found through
+   Quicklisp's local-projects -- a directory of symlinked .asd files -- took
+   local-projects itself for its source directory."
   (let ((path (%resolve-path (pathname x))))
     (if (%sys-stat-exists path)
-        (pathname (%absolute-path-string path))
+        (let* ((abs (%absolute-path-string path))
+               (dirp (and (> (length abs) 1) (char= (char abs (- (length abs) 1)) #\/)))
+               (real (%resolve-symlinks abs)))
+          (pathname (if (and dirp (not (string= real "/"))) (concatenate 'string real "/") real)))
         (error 'file-error :pathname x))))
 
 ;;; --- delete-file ---

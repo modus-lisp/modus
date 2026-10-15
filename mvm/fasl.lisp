@@ -214,6 +214,13 @@
                (%fasl-enc fb c unint (+ depth 1)))))))
     ((integerp v) (%fb-byte fb 2) (%fb-sint fb v))
     ((characterp v) (%fb-byte fb 3) (%fb-uint fb (char-code v)))
+    ;; RANK FIRST: a zero- or multi-dimensional array is not a vector, but a 0-d
+    ;; character array answers STRINGP here, so it was written as the
+    ;; one-character string "x" and replayed as one -- ADJUST-ARRAY.STRING.17's
+    ;; #.(make-array nil :element-type 'character) then faulted the harness's
+    ;; comparison on a warm cache only.  Such a constant stays source.
+    ((and (typep v 'array) (not (eql (array-rank v) 1)))
+     (%fasl-reject "array of rank /= 1"))
     ;; any string, by its contents: a literal's identity and fill pointer do not
     ;; matter to code that loads it (and reader-made strings are not SIMPLE here)
     ((stringp v) (%fb-byte fb 4) (%fb-string fb v))

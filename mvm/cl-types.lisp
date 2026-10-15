@@ -4272,7 +4272,7 @@
   ;; Already of that type: OBJECT itself (CLHS COERCE; COERCE.1).  Only on an
   ;; EXACT match with TYPE-OF -- TYPEP ignores element types here, so a general
   ;; vector would pass for a byte vector and come back uncopied.
-  (when (and (not (consp object)) (or (stringp object) (vectorp object))
+  (when (and (not (consp object)) (or (stringp object) (arrayp object))
              (equal result-type (type-of object)))
     (return-from coerce object))
   (setq result-type (%coerce-expand-type result-type))
@@ -5067,6 +5067,11 @@
     ((%condition-p obj) (%condition-type-name obj))
     ;; A CLOS class object is itself an instance of STANDARD-CLASS.
     ((%clos-class-p obj) 'standard-class)
+    ;; A class proxy stands for a DEFSTRUCT's class or a built-in one.  It is
+    ;; a marked vector, so it fell through to the vector arms -- (SIMPLE-VECTOR
+    ;; 2) -- and once those stopped claiming it (ARRAYP, CLHS 4.2.2), to T.
+    ((%class-proxy-p obj)
+     (if (%find-struct-type (%class-proxy-name obj)) 'structure-class 'built-in-class))
     ;; A hash table is a tagged cons underneath; its type is HASH-TABLE.
     ((hash-table-p obj) 'hash-table)
     ;; Integers: CLHS says an (integer low high) spec is fine, but a bare
@@ -5164,6 +5169,10 @@
   (let ((head (if (consp type) (car type) type)))
     (and (symbolp head) (%deftype-lookup head) t)))
 
+(defun %typep-array-obj-p (obj)
+  "TYPEP's ARRAY / VECTOR test: ARRAYP or a string, and not a complex."
+  (and (or (arrayp obj) (stringp obj)) (not (%complex-p obj))))
+
 (defun typep (obj type)
   (when (or (eq type 'values)
             (and (consp type)
@@ -5202,7 +5211,9 @@
          ((eq tn 'bignum) (bignump obj))
          ((eq tn 'real) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
          ((eq tn 'rational) (or (integerp obj) (ratiop obj)))
-         ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)))
+         ((eq tn 'number) (or (integerp obj) (floatp-impl obj) (ratiop obj)
+                              (%complex-p obj)))
+         ((eq tn 'complex) (%complex-p obj))
          ((eq tn 'float) (floatp-impl obj))
          ;; Per-type identity by declared subtag (numeric tower N1).  Modus
          ;; uses the standard SBCL aliasing short-float==single-float and
@@ -5237,13 +5248,15 @@
          ((eq tn 'bit) (and (integerp obj) (or (= obj 0) (= obj 1))))
          ((eq tn 'unsigned-byte) (and (integerp obj) (>= obj 0)))
          ((eq tn 'signed-byte) (integerp obj))
-         ((eq tn 'array)         (or (arrayp obj) (stringp obj)))
-         ((eq tn 'simple-array)  (or (arrayp obj) (stringp obj)))
-         ((eq tn 'vector)        (or (arrayp obj) (stringp obj)))
+         ;; A COMPLEX is a marked 3-slot vector underneath (%COMPLEX-P), so the
+         ;; ARRAYP intrinsic says yes; it is a NUMBER, never an ARRAY (CLHS 4.2.2).
+         ((eq tn 'array)         (%typep-array-obj-p obj))
+         ((eq tn 'simple-array)  (%typep-array-obj-p obj))
+         ((eq tn 'vector)        (%typep-array-obj-p obj))
          ;; SIMPLE-VECTOR = (simple-array t (*)) — element-type T only.
          ;; A byte-packed u8 vector (subtag #x11) has element-type
          ;; (unsigned-byte 8), so it is NOT a simple-vector.
-         ((eq tn 'simple-vector) (and (or (arrayp obj) (stringp obj))
+         ((eq tn 'simple-vector) (and (%typep-array-obj-p obj)
                                       (not (eql (obj-subtag obj) #x11))
                                       ;; packed single-float vector (#x12)
                                       (not (eql (obj-subtag obj) #x12))))
@@ -5258,6 +5271,7 @@
          ;; because Modus' adjustable/displaced array wrappers are themselves
          ;; cons-shaped and would otherwise skip the rank test.
          ((eq tn 'sequence)      (cond ((stringp obj) t)
+                                       ((%complex-p obj) nil)
                                        ((arrayp obj) (= (array-rank obj) 1))
                                        (t (or (null obj) (consp obj)))))
          ((eq tn 'function)      (or (functionp obj) (%generic-function-p obj)))
@@ -5275,6 +5289,7 @@
          ;; (and CLASS / STANDARD-CLASS / METAOBJECT / T).  CLHS 4.3.7.
          ((eq tn 'standard-object) (or (%clos-instance-p obj)
                                        (%clos-class-p obj)))
+         ((eq tn 'structure-object) (%struct-instance-p obj))
          ((eq tn 'class) (%clos-class-p obj))
          ;; STANDARD-CLASS only for user (defclass) classes — those whose
          ;; CPL (slot 4) includes STANDARD-OBJECT.  Built-in classes that
@@ -5399,6 +5414,12 @@
                  (and (>= obj (- 0 half)) (< obj half)))))
          ((eq head 'mod)
           (and (integerp obj) (>= obj 0) (< obj (cadr type))))
+         ;; (COMPLEX PART-TYPE): both parts of that type (CLHS 12.1.5.3).
+         ((eq head 'complex)
+          (and (%complex-p obj)
+               (let ((pt (and (cdr type) (cadr type))))
+                 (or (null pt) (eq pt '*)
+                     (and (typep (realpart obj) pt) (typep (imagpart obj) pt))))))
          ((or (eq head 'bit-vector) (eq head 'simple-bit-vector))
           (and (bit-vector-p obj)
                (let ((sz (and (cdr type) (cadr type))))
@@ -5472,6 +5493,7 @@
                        ((and (consp obj) (eql (car obj) 8765432)) (cdr obj))
                        (t obj))))
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
+               (not (%complex-p obj))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
                    (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12))
                (let* ((et (and (cdr type) (%element-type-expand (cadr type))))
@@ -5532,13 +5554,26 @@
                          ((eq et 'bit)                  is-bitvec)
                          ;; Any other element type -- (unsigned-byte 8), an
                          ;; integer type, a DEFTYPE -- is not CHARACTER, so a
-                         ;; STRING never has it.  A general array stays a match:
-                         ;; Modus does not track its element type.  This was
-                         ;; (t t), so (typep "abc" '(vector (unsigned-byte 8)))
-                         ;; was T and code telling octets from text (cl-marmot's
-                         ;; store hex-encodes octets and keeps strings) took a
-                         ;; string for bytes.
-                         (t (not is-string)))))
+                         ;; STRING never has it.  This was (t t), so (typep "abc"
+                         ;; '(vector (unsigned-byte 8))) was T and code telling
+                         ;; octets from text (cl-marmot's store hex-encodes
+                         ;; octets and keeps strings) took a string for bytes.
+                         ;; A GENERAL array's element type is T: everything
+                         ;; that upgrades to something else has its own
+                         ;; representation (#x11, #x12, strings).  So it has ET
+                         ;; exactly when ET upgrades to T (CLHS 15.1.2.1) --
+                         ;; FIXNUM yes, (UNSIGNED-BYTE 8) no.  Until 2026-10-14
+                         ;; it matched EVERY non-character ET, so (typep (vector
+                         ;; 1 "two") '(simple-array (unsigned-byte 8) (*))) was
+                         ;; T and a serializer that asked took it for bytes.
+                         ;; (UNSIGNED-BYTE 1), (MOD 2) ... upgrade to BIT, which
+                         ;; a Modus bit vector -- a general array of 0s and 1s
+                         ;; -- has, as the 'BIT arm above says.
+                         (t (and (not is-string)
+                                 (let ((u (upgraded-array-element-type et)))
+                                   (cond ((eq u t) t)
+                                         ((eq u 'bit) is-bitvec)
+                                         (t nil))))))))
                  (and et-ok
                       (cond
                         ((not sz-given) t)

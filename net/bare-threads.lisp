@@ -35,10 +35,10 @@
 (defun %bt-rcb (cpu) (+ #x10090000 (* cpu 64)))
 (defun %bt-ncores () 4)
 
-;; Bytes per worker region.  Every limit sits *AARCH64-GC-LIMIT-GUARD* (8 MB) below the
-;; region's end, so a region must be well above that; what is left is the worker's heap.
+;; Bytes per semispace of a core's region.  Its allocation limit sits min(8 MB, size/4)
+;; below the end (translate-aarch64's trampoline), so 8 MB leaves a core 6 MB to fill.
 (defvar *bt-region-size* nil)
-(defun %bt-region-size () (or *bt-region-size* #xC00000))
+(defun %bt-region-size () (or *bt-region-size* #x800000))  ; 3 cores x 2 x 8 MB = 48 MB
 
 ;; Host-free words: the stub page (exec) and whether the layer is up.
 (defun %bt-stub () (mem-ref #x10213000 :u64))   ; table+0x00 (unused by the collector)
@@ -104,7 +104,7 @@
     (%gc-write64 (+ p 64) (- w #x10000000))
     (%gc-write64 (+ p 72) (%gc-meta-read rcb 2))      ; x24 = the region's from-start
     (%gc-write64 (+ p 80) (- (+ (%gc-meta-read rcb 2) (%gc-meta-read (+ rcb #x10) 2))
-                             #x800000))               ; x25 = its limit
+                             (%bt-guard (%gc-meta-read (+ rcb #x10) 2))))   ; x25 = its limit
     (%gc-write64 (+ p 88) (- (%val->word (symbol-function '%bt-core-main)) 3))
     (%gc-write64 (+ p 96) 0)
     (%gc-write64 (+ #xD8 (* 8 c)) s)
@@ -119,24 +119,19 @@
 
 ;;; ------------------------------------------------------------------ regions + STW
 
+(defun %bt-arena () #x18000000)       ; thread heaps: [0x18000000, 0x1B000000)
+(defun %bt-guard (size) (min #x800000 (ash size -2)))   ; the trampoline's own rule
+
 (defun %bt-carve (c)
-  "Core C's region: the top SIZE bytes of both of region 0's semispaces.  Collects
-   region 0 first when its live data reaches the carve; 0 when it still does."
-  (let* ((k 2) (r0 (%gc-region-0)) (size (%bt-region-size)))
-    (when (>= (get-alloc-ptr)
-              (- (+ (%gc-meta-read r0 k) (- (%gc-meta-read (+ r0 #x10) k) size)) #x800000))
-      (%gc-force))
-    (let* ((from (%gc-meta-read r0 k))
-           (to (%gc-meta-read (+ r0 8) k))
-           (new (- (%gc-meta-read (+ r0 #x10) k) size)))
-      (if (>= (get-alloc-ptr) (- (+ from new) #x800000))
-          0
-          (progn
-            (%gc-region-shrink r0 new k)
-            (set-alloc-limit (- (+ from new) #x800000))
-            (%gc-region-init (%bt-rcb c) (+ from new) (+ to new) size (%bt-stack-top c) k)
-            (%gc-write64 (+ #x10000F08 (* 8 c)) (%bt-rcb c))
-            1)))))
+  "Core C's region: two semispaces of SIZE out of the thread-heap arena above region 0
+   -- core C gets [arena + (C-1)*2*SIZE, +2*SIZE).  The arena is where a saved core is
+   loaded (0x18000000), free once it has been restored, and the threaded build's
+   bitmaps cover it.  Region 0 is not touched."
+  (let* ((size (%bt-region-size))
+         (from (+ (%bt-arena) (* (- c 1) 2 size))))
+    (%gc-region-init (%bt-rcb c) from (+ from size) size (%bt-stack-top c) 2)
+    (%gc-write64 (+ #x10000F08 (* 8 c)) (%bt-rcb c))
+    1))
 
 (defun %bt-init ()
   "Turn the layer on: zero the thread table and the carved-region blocks, stamp core 0,
@@ -148,6 +143,7 @@
         (dotimes (i 1024) (%gc-write64 (+ #x10090000 (* i 8)) 0))   ; rcbs, band slices/arena
         (setf (mem-ref #x10080010 :u64) 0)                          ; core 0 is CPU 0
         (setf (mem-ref #x10000FF8 :u32) 1)                          ; per-CPU region cells
+        (%gc-write64 (%bt-arena) 0)            ; the saved core's magic: the arena is ours now
         (%bt-stub-install)
         (%gc-write64 #x10000DA8 (%bt-page))
         (%gc-write64 (+ tt #x58) #x10086000)                        ; band: rcb i = +0xA000+64i

@@ -391,16 +391,18 @@
     ;; Single-threaded answers to the SB-THREAD shim's primitives (the shim is
     ;; boot-evaluated here too; net/hosted-sync.lisp is hosted-only).
     (%rpi-mvm-text "net/bare-sync.lisp")
-    ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above.
-    (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
-        (%rpi-mvm-text "net/bare-threads.lisp")
-        "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     (if *cl-repl-rpi-p*
         "
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
 "
+        "")
+    ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
+    ;; (AFTER the arena line: its own %BARE-SYNC-ARENA is cacheable RAM, which the
+    ;; SMP mutexes' LDAXR/STLXR need -- last-defun-wins).
+    (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
+        (%rpi-mvm-text "net/bare-threads.lisp")
         "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
@@ -942,6 +944,24 @@
 ;;; happens at a point where a fault would be attributable, rather than inside
 ;;; an installer's handler-case.  Wrapped, because a diagnostic must never be
 ;;; the thing that stops a boot.
+;; SMP (MODUS_RPI_THREADS=1): the per-core thread heaps live at 0x18000000..0x1B000000
+;; (net/bare-threads.lisp), above region 0, and the collector rejects any root whose
+;; granule has no start bit -- so the two bitmaps must cover page_base (0x09000000) up to
+;; 0x1B000000: 0x240000 bytes each, at 0x08000000 / 0x08400000 (free RAM between the main
+;; stack top and the heap; the restore header sits at 0x08FFFF00).
+(defvar cl-user::*rpi-threads-p*
+  (and *cl-repl-rpi-p*
+       (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
+         (and v (> (length v) 0) (string/= v "0")))))
+(when cl-user::*rpi-threads-p*
+  (let* ((old "(%rpi-gc-bitmap-init #x05000000 #x05100000 #xE0000)")
+         (new "(%rpi-gc-bitmap-init #x08000000 #x08400000 #x240000)")
+         (at (search old *cli-arch-kernel-prologue*)))
+    (unless at (error "SMP: the Pi bitmap call moved; update build-cl-repl-common"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 at) new
+                       (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
+
 (defvar *cli-arch-io-scratch-source*
   (if *cl-repl-x64-p*
       "  (setq *cstr-scratch* #x0FE00000)
@@ -2817,9 +2837,9 @@
       ;; image below and the stack above; both are checked here rather than
       ;; discovered as heap corruption at runtime.  Keep in step with the
       ;; %rpi-gc-bitmap-init call in kernel-main.
-      (let* ((objmap-lo  #x05000000)
-             (consmap-lo #x05100000)
-             (map-bytes  #xE0000)
+      (let* ((objmap-lo  (if cl-user::*rpi-threads-p* #x08000000 #x05000000))
+             (consmap-lo (if cl-user::*rpi-threads-p* #x08400000 #x05100000))
+             (map-bytes  (if cl-user::*rpi-threads-p* #x240000 #xE0000))
              (maps-hi    (+ consmap-lo map-bytes)))
         (when (< objmap-lo image-va-end)
           (error "BUILD-TIME ASSERT: #160 object-start bitmap at ~X is inside ~
@@ -2827,9 +2847,14 @@
         (when (> (+ objmap-lo map-bytes) consmap-lo)
           (error "BUILD-TIME ASSERT: #160 object-start bitmap ~X+~X overlaps ~
                   the cons-kind bitmap at ~X." objmap-lo map-bytes consmap-lo))
-        (when (>= maps-hi stack-va-lo)
-          (error "BUILD-TIME ASSERT: #160 bitmaps end ~X reach the stack low ~
-                  water ~X." maps-hi stack-va-lo))
+        (if cl-user::*rpi-threads-p*
+            ;; Threaded: ABOVE the main stack top, below the restore header.
+            (when (or (< objmap-lo stack-top) (> maps-hi #x08FFFF00))
+              (error "BUILD-TIME ASSERT: SMP bitmaps ~X..~X are not inside ~
+                      [stack top ~X, restore header 0x08FFFF00)." objmap-lo maps-hi stack-top))
+            (when (>= maps-hi stack-va-lo)
+              (error "BUILD-TIME ASSERT: #160 bitmaps end ~X reach the stack low ~
+                      water ~X." maps-hi stack-va-lo)))
         (format t "  gc bitmaps ~8,'0X .. ~8,'0X  (#160 object-start + cons-kind)~%"
                 objmap-lo maps-hi))
       (when (> heap-end periph-base)

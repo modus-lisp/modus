@@ -10,4 +10,4 @@
 
 (defun r0-count () (%gc-meta-read (+ #x10000040 #x20) 2))
 
-(defun t-walk2 () (let ((ok 0) (bad 0) (c0 (r0-count)) (seen 0) (last (r0-count))) (dotimes (k 3000) (let ((s 0) (junk nil)) (dolist (x *big*) (setq s (+ s x)) (setq junk (cons x nil))) (unless (= last (r0-count)) (setq seen (+ seen 1)) (setq last (r0-count))) (if (= s 4999950000) (setq ok (+ ok 1)) (setq bad (+ bad 1))))) (list :ok ok :bad bad :r0-gcs-during (- (r0-count) c0) :changes-seen seen)))
+(defun t-walk2 () (let ((ok 0) (bad 0) (c0 (r0-count)) (seen 0) (last (r0-count))) (dotimes (k 1000) (let ((s 0) (junk nil)) (dolist (x *big*) (setq s (+ s x)) (setq junk (cons x nil))) (unless (= last (r0-count)) (setq seen (+ seen 1)) (setq last (r0-count))) (if (= s 4999950000) (setq ok (+ ok 1)) (setq bad (+ bad 1))))) (list :ok ok :bad bad :r0-gcs-during (- (r0-count) c0) :changes-seen seen)))

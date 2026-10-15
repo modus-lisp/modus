@@ -7277,7 +7277,25 @@
       (a64-stw-table buf +a64-x9+ normal)
       (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))   ; region 0
       (a64-cmp-reg buf +a64-x17+ +a64-x10+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i normal :bcond))
+      (if *aarch64-linux-mode*
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i normal :bcond))
+          ;; BARE METAL: a core's region is SHARED by the thread slots that run on
+          ;; that core as coroutines (net/bare-threads.lisp), so collecting it is
+          ;; a SIBLING collection (frame mode 2): no stop flag -- the siblings are
+          ;; parked by construction, one core runs one slot -- but their stacks and
+          ;; windows are roots, found as the records whose region (+0x40) is this
+          ;; slot's.  [sp+56] = that region ([sp+40] is the window scan's).
+          (let ((sib (incf *mvm-label-counter*)))
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sib :bcond))
+            (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+            (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
+            (a64-str-unsigned buf +a64-x13+ +a64-sp+ 8)
+            (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x40)
+            (a64-str-unsigned buf +a64-x10+ +a64-sp+ 56)
+            (a64-movz buf +a64-x10+ 2 0)
+            (a64-str-unsigned buf +a64-x10+ +a64-sp+ 16)
+            (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i normal :b))
+            (a64-set-label buf sib)))
       (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
       (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
       (a64-str-unsigned buf +a64-x13+ +a64-sp+ 8)
@@ -7529,6 +7547,17 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i tloop :bcond)) ; not participating
       (a64-cmp-imm buf +a64-x10+ 3)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i tloop :bcond)) ; (cannot be: waited)
+      ;; Sibling mode (bare metal): only the slots sharing this region.
+      (unless *aarch64-linux-mode*
+        (let ((same (incf *mvm-label-counter*)))
+          (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+          (a64-cmp-imm buf +a64-x10+ 2)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i same :bcond))
+          (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x40)
+          (a64-ldr-unsigned buf +a64-x11+ +a64-sp+ 56)
+          (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i tloop :bcond))
+          (a64-set-label buf same)))
       ;; its stack window [SP, top)
       (a64-ldr-unsigned buf +a64-x26+ +a64-x14+ #x70)
       (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x78)
@@ -7552,6 +7581,10 @@
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i tloop :b))
       ;; ---- carved thread regions [from, parked frontier) ----
       (a64-set-label buf rloop)
+      (unless *aarch64-linux-mode*                     ; sibling mode: stacks only
+        (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+        (a64-cmp-imm buf +a64-x10+ 2)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond)))
       (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 24)
       (a64-set-label buf rnext)
       (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 24)
@@ -7599,8 +7632,8 @@
   (when *a64-tls-window*
     (let ((skip (incf *mvm-label-counter*)))
       (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
-      (a64-cmp-imm buf +a64-x10+ 0)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+      (a64-cmp-imm buf +a64-x10+ 1)                   ; 0 none, 2 sibling (bare)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
       (emit-aarch64-stw-evac-finish buf)
       ;; Region 0's new frontier and limit, for a thread whose x24/x25 were in
       ;; it while another thread collected (EMIT-AARCH64-STW-REFRESH).
@@ -8225,11 +8258,25 @@
           (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
           (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))
         (progn
-          (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
           (when (and (boundp '*aarch64-gc-limit-guard*)
                      (integerp *aarch64-gc-limit-guard*)
                      (> *aarch64-gc-limit-guard* 0))
             (a64-load-imm64-general buf +a64-x9+ *aarch64-gc-limit-guard*)
+            ;; BARE SMP (the per-thread window is on): a core's own region is
+            ;; 8 MB a semispace, so a flat 8 MB guard would put its limit at its
+            ;; start.  min(guard, space_size/4): region 0's 56 MB keeps 8 MB.
+            (when *a64-tls-window*
+              (let ((capped (incf *mvm-label-counter*)))
+                (a64-lsr-imm buf +a64-x10+ +a64-x25+ 2)          ; x10 = space_size/4
+                (a64-cmp-reg buf +a64-x10+ +a64-x9+)
+                (let ((i (a64-current-index buf)))
+                  (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i capped :bcond))
+                (a64-mov-reg buf +a64-x9+ +a64-x10+)
+                (a64-set-label buf capped))))
+          (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
+          (when (and (boundp '*aarch64-gc-limit-guard*)
+                     (integerp *aarch64-gc-limit-guard*)
+                     (> *aarch64-gc-limit-guard* 0))
             (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))))
     ;; gc_count += 1 (stored <<1 → += 2), IN THIS REGION
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ +gc-off-count+)

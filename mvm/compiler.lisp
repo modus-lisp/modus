@@ -10736,10 +10736,11 @@
                        ;; bare key) and then restored that NIL over the real
                        ;; value on exit — battery row special.after-rebind.
                        (let* ((k (%global-var-bind-key spec))
-                              (slot (%gv-aot-slot k spec)))
-                         (list sv (if slot
-                                      `(%gv-ref-fill ,k ,slot)
-                                      `(%gv-ref ,k)))))
+                              (cell (%let-special-cell spec k))
+                              (slot (and (not cell) (%gv-aot-slot k spec))))
+                         (list sv (cond (cell `(%gv-cell-ref (quote ,cell) ,k))
+                                        (slot `(%gv-ref-fill ,k ,slot))
+                                        (t `(%gv-ref ,k))))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
            ;; creating a lexical binding under the special's own name.
@@ -10759,20 +10760,22 @@
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
                          (let* ((k (%global-var-bind-key spec))
-                                (slot (%gv-aot-slot k spec)))
-                           (push (if slot
-                                     `(%dynbind-c ,k ,tmp ,slot)
-                                     `(%dynbind ,k ,tmp))
+                                (cell (%let-special-cell spec k))
+                                (slot (and (not cell) (%gv-aot-slot k spec))))
+                           (push (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
+                                       (slot `(%dynbind-c ,k ,tmp ,slot))
+                                       (t `(%dynbind ,k ,tmp)))
                                  acc))))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
                        (let* ((k (%global-var-bind-key spec))
-                              (slot (%gv-aot-slot k spec)))
-                         (if slot
-                             `(%dynunbind-c ,k ,sv ,slot)
-                             `(%dynunbind ,k ,sv))))
+                              (cell (%let-special-cell spec k))
+                              (slot (and (not cell) (%gv-aot-slot k spec))))
+                         (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
+                               (slot `(%dynunbind-c ,k ,sv ,slot))
+                               (t `(%dynunbind ,k ,sv)))))
                      save-vars specials))
            (stripped-body (strip-declares body)))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -11748,6 +11751,15 @@
   (let ((n (%setq-direct-count-occ var val)))
     (or (= n 0)
         (and (= n 1) (%setq-direct-spine-ok var val env)))))
+
+(defun %let-special-cell (spec bind-key)
+  "At a RUNTIME compile, the globals cell a LET of special SPEC may bind in
+   place: the one compiled reads of SPEC bake (%RUNTIME-GLOBAL-CELL), and only
+   when it is BIND-KEY's -- the read and write keys of a symbol can differ
+   in-image (%GLOBAL-VAR-BIND-KEY), and then the keyed calls keep the job."
+  (and *mvm-eval-runtime-p*
+       (eql (%global-name-key spec) bind-key)
+       (%runtime-global-cell spec)))
 
 (defun %runtime-global-cell (name)
   "At a RUNTIME compile: the (key . value) pair of global NAME in the globals

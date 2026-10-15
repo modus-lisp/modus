@@ -3102,6 +3102,24 @@
       (%gv-set-c %gv-key %gv-saved %gv-slot)
       (%dynunbind %gv-key %gv-saved)))
 
+(defun %gv-cell-ref (%gv-cell %gv-key)
+  "The LET-special save through a cell baked at a runtime compile: the
+   cell's value on an unarmed image, else %GV-REF (thread bindings first)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0) (cdr %gv-cell) (%gv-ref %gv-key)))
+
+(defun %dynbind-cell (%gv-cell %gv-key %gv-val)
+  "%DYNBIND through a cell baked at a runtime compile: its unarmed arm is a
+   store into the cell (%GV-SET's in-place update, without the probe)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (progn (set-cdr %gv-cell %gv-val) %gv-val)
+      (%dynbind %gv-key %gv-val)))
+
+(defun %dynunbind-cell (%gv-cell %gv-key %gv-saved)
+  "%DYNUNBIND through a cell baked at a runtime compile."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (progn (set-cdr %gv-cell %gv-saved) %gv-saved)
+      (%dynunbind %gv-key %gv-saved)))
+
 (defun %gv-set-def (%gv-key %gv-val)
   "The DEFVAR/DEFPARAMETER store: %GV-SET under a name the bytecode
    interpreter recognises as a storage sink (see %MVM-STORE-FN-NAME-P)."

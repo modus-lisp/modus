@@ -2636,8 +2636,14 @@
        (t 1)))
     ((= power 1) base)
     ((and (integerp power) (> power 0) (integerp base))
-     (let ((r 1))
-       (dotimes (i power r) (setq r (bignum-mul r base)))))
+     ;; Square-and-multiply: log2(POWER) multiplies, not POWER of them --
+     ;; (expt 10 40000) was 40000 bignum multiplies.
+     (let ((r 1) (b base) (p power))
+       (loop
+         (when (oddp p) (setq r (bignum-mul r b)))
+         (setq p (ash p -1))
+         (when (= p 0) (return r))
+         (setq b (bignum-mul b b)))))
     ((and (integerp power) (> power 0))
      ;; Float-base × integer-positive-power.  Watch for IEEE
      ;; overflow/underflow.
@@ -2675,7 +2681,8 @@
      (if (integerp power)
          (let ((r 1)) (dotimes (i power r) (setq r (* r base))))
          (exp (* power (log base)))))))
-(defun isqrt (n) (if (<= n 0) 0 (let ((x n)) (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
+(defun isqrt (n) (if (<= n 0) 0 (let ((x (ash 1 (ash (+ (integer-length n) 1) -1))))
+  (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
   (when (>= x1 x) (return x)) (setq x x1))))))
 (defun gcd (&rest args)
   ;; CLHS: (gcd) -> 0, (gcd n) -> |n|, (gcd a b ...) -> fold pairwise.
@@ -3043,13 +3050,22 @@
         (setq result (cons limb result))
         (setq cur (if (cdr cur) (cddr cur) nil))))))
 
+(defun %list-to-simple-vector (lst)
+  (let* ((n (length lst)) (v (make-array n)) (i 0))
+    (loop (when (null lst) (return v))
+      (setf (svref v i) (car lst))
+      (setq lst (cdr lst))
+      (setq i (+ i 1)))))
+
 (defun %mul-limbs-mag (xs ys)
   "Multiply two LSB-first limbs lists XS · YS via N²·O(31-bit) schoolbook.
    Each limb is 62 bits; we split into two 31-bit half-limbs so that
    half×half fits in a fixnum.  Returns LSB-first limbs list of the
    product."
-  (let* ((ah (%limbs-to-halves xs))
-         (bh (%limbs-to-halves ys))
+  ;; The half-limbs go into VECTORS: the loops below index them, and NTH on
+  ;; the lists made the schoolbook multiply cubic.
+  (let* ((ah (%list-to-simple-vector (%limbs-to-halves xs)))
+         (bh (%list-to-simple-vector (%limbs-to-halves ys)))
          (na (length ah))
          (nb (length bh))
          (nout (+ na nb))
@@ -3062,7 +3078,7 @@
     ;; Schoolbook: for each i, j → out[i+j] += ah[i] * bh[j], carry-propagate.
     (let ((i 0))
       (loop (when (>= i na) (return nil))
-        (let ((j 0) (carry 0) (ai (nth i ah)))
+        (let ((j 0) (carry 0) (ai (svref ah i)))
           (loop (when (>= j nb)
                   ;; Propagate remaining carry into successive limbs.
                   (let ((pos (+ i j)))
@@ -3075,7 +3091,7 @@
                         (setq carry newcarry)
                         (setq pos (+ pos 1)))))
                   (return nil))
-            (let* ((bj (nth j bh))
+            (let* ((bj (svref bh j))
                    (prod (* ai bj))
                    (pos (+ i j))
                    (cur (aref out pos))

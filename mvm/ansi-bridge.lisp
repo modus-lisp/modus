@@ -4852,7 +4852,10 @@
   (if extra
       (%program-error "isqrt requires exactly 1 argument")
       (if (<= n 0) 0
-          (let ((x n))
+          ;; Newton from 2^ceil(len/2) >= sqrt(N), not from N itself: the
+          ;; descent from N took one iteration per bit (a bignum division
+          ;; each) before it got anywhere near the root.
+          (let ((x (ash 1 (ash (+ (integer-length n) 1) -1))))
             (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
                     (when (>= x1 x) (return x))
                     (setq x x1)))))))

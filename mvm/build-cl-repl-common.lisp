@@ -391,6 +391,10 @@
     ;; Single-threaded answers to the SB-THREAD shim's primitives (the shim is
     ;; boot-evaluated here too; net/hosted-sync.lisp is hosted-only).
     (%rpi-mvm-text "net/bare-sync.lisp")
+    ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above.
+    (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
+        (%rpi-mvm-text "net/bare-threads.lisp")
+        "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     (if *cl-repl-rpi-p*
@@ -856,6 +860,9 @@
   ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
   (setf (mem-ref #x111F2000 :u32) 0)
   (%gc-write64 #x111F2008 0)
+  ;; ... and net/bare-threads.lisp's (cacheable: the SMP mutexes need exclusives).
+  (setf (mem-ref #x10300000 :u32) 0)
+  (%gc-write64 #x10300008 0)
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.
   (write-string-serial \"MODUS-CL\")

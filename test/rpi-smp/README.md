@@ -37,6 +37,29 @@ i.e. 115,847 iterations of "cons a 1000-element list, check its sum is 499500" a
 of core 2's OWN region, while core 0's REPL conses 200,000 cells correctly beside it.  Regions must
 be well over 8 MB: every limit sits *AARCH64-GC-LIMIT-GUARD* (8 MB) below the region's end.
 
-NOT YET: stop-the-world for region 0 (core 0 must not collect region 0 while a worker holds
-references into it -- core-alloc holds none), a thread API (make-thread on a core, with join), and
-the board run (core 1 did not start on one board boot; it does under QEMU).
+THREADS (phase 3, net/bare-threads.lisp, linked when MODUS_RPI_THREADS=1): BT-SPAWN runs a
+no-argument function on a free core and BT-JOIN returns its value (conses, strings and vectors in
+the core's region are copied out, since the region is reused).  A core is released once into
+%BT-CORE-MAIN and then takes jobs from its thread record, waiting SAFE between them.  The record
+layout is hosted aarch64's, so translate-aarch64's stop-the-world collector runs unchanged: core 0
+collecting region 0 parks every running worker at its next allocation and scans its stack, window
+and region.  On bare metal the park/wait spin is the YIELD hint, not sched_yield, and the
+safe-region traps (#x0541..#x0544) are emitted whenever the window is on.  test/rpi-smp/threads.lisp:
+
+    run as above with --blob=test/rpi-smp/threads.lisp, then
+    (setq *big* (loop for i below 100000 collect i))
+    (progn (setq w1 (bt-spawn #'t-walk2)) (setq w2 (bt-spawn #'t-walk2)) (setq w3 (bt-spawn #'t-cons))
+           (t-main-churn 40))
+    (list (bt-join w1) (bt-join w2) (bt-join w3))
+      => ((OK 3000 BAD 0 R0-GCS-DURING 41 CHANGES-SEEN 41) (same) (3000 5))
+
+i.e. two cores walking a 100,000-element list IN REGION 0 3000 times each while core 0 collected
+region 0 41 times under them -- every sum right -- and each worker collected its own region 1144
+times meanwhile.  NEGATIVE CONTROL, same image: clear the table's armed word (STW off) and the
+same run takes a data abort on a worker stack (SP 0x053FFBC0, core 1) during the first churn.
+
+NOT YET: a worker storing its objects into region-0 structures (fresh INTERN, SETQ of a global,
+special bindings, SETQ of a closed-over variable) -- needs the runtime lock + lock arena; a
+non-allocating worker loop holds a region-0 collection up; the sb-thread shim mapping; heap size
+(each worker region must be well over the 8 MB limit guard, carved from region 0's 56 MB); and the
+board run (core 1 did not start on one board boot; it does under QEMU).

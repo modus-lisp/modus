@@ -3267,7 +3267,7 @@
                   (a64-svc buf 0)
                   (a64-brk buf 0)                              ; unreachable
                   (a64-set-label buf done)))
-               ((and *aarch64-linux-mode* (= code #x0542))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0542))
                 ;; %GC-SAFE-ENTER — this thread is about to BLOCK (a futex wait,
                 ;; a sleep) holding no heap pointer in a register: publish its
                 ;; SP and frontier and mark it SAFE, so a region-0 collector
@@ -3280,7 +3280,7 @@
                     (a64-stw-publish buf +a64-x14+ 2)
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
-               ((and *aarch64-linux-mode* (= code #x0544))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0544))
                 ;; %GC-COLLECT-NOW — enter the collector with no allocation to
                 ;; follow: the caller has set the limit to the pointer, so the
                 ;; trampoline collects the ACTIVE region (for the lock arena's
@@ -3288,7 +3288,7 @@
                 (a64-mov-reg buf +a64-x16+ +a64-x24+)
                 (a64-blr buf +a64-x28+)
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
-               ((and *aarch64-linux-mode* (= code #x0543))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0543))
                 ;; %GC-SAFE-LEAVE — running again: mark RUNNING, then (after a
                 ;; full barrier, so a collector that has not seen us running
                 ;; has set its flag where we can see it) check the flag.  Held:
@@ -3330,7 +3330,7 @@
                       (a64-b buf 0) (a64-add-fixup buf i again :b))
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
-               ((and *aarch64-linux-mode* (= code #x0541))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0541))
                 ;; %SET-THREAD-DELTA — THIS thread's per-thread-window delta
                 ;; (x0, tagged).  Linux: TPIDR_EL0 directly.  Darwin: the host
                 ;; shim stores it in the reserved pthread key
@@ -7060,9 +7060,14 @@
   (a64-emit buf (logior #xC8DFFC00 (ash rn 5) rt)))
 
 (defun a64-sched-yield (buf)
-  "sched_yield(2): x8 = 124, SVC.  Clobbers x0 and x8."
-  (a64-movz buf +a64-x8+ 124 0)
-  (a64-svc buf 0))
+  "sched_yield(2): x8 = 124, SVC.  Clobbers x0 and x8.  Bare metal has no
+   scheduler to yield to: the spin's pause is the YIELD hint, and the loop
+   around it re-reads the flag (cores are never preempted, so nobody else
+   needs this one off its CPU)."
+  (if *aarch64-linux-mode*
+      (progn (a64-movz buf +a64-x8+ 124 0)
+             (a64-svc buf 0))
+      (a64-emit buf #xD503203F)))
 
 (defun a64-stw-table (buf rd skip)
   "Xd = the thread table if stop-the-world is ARMED, else branch to SKIP.

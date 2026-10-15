@@ -711,8 +711,8 @@
 (defun %clos-reg-memo-drop () (setq *clos-reg-memo* nil))
 
 (defun %clos-reg-memo-vector ()
-  (let ((v (make-array 8)) (i 0))
-    (loop (when (= i 8) (return v))
+  (let ((v (make-array 9)) (i 0))
+    (loop (when (= i 9) (return v))
       (setf (svref v i) (make-hash-table :test (quote eq)))
       (setq i (+ i 1)))))
 
@@ -1743,6 +1743,16 @@
           (setq i (+ i 1))))
       inst)))
 
+(defun %slot-locate-scan (class-name slot-name)
+  "Where SLOT-NAME lives for instances of CLASS-NAME: its instance slot index,
+   :CLASS for a class-allocated slot, :MISSING when the class has no such slot
+   or is unknown."
+  (let ((cls (%find-clos-class class-name)))
+    (cond ((null cls) :missing)
+          ((%slot-class-owner class-name slot-name) :class)
+          (t (let ((idx (%clos-slot-index cls slot-name)))
+               (if (< idx 0) :missing idx))))))
+
 (defun %slot-value (obj slot-name)
   "Read slot SLOT-NAME from CLOS instance OBJ.
    Calls slot-unbound if the slot has no value, slot-missing when
@@ -1752,6 +1762,17 @@
    %slot-class-owner / %class-slot-get."
   (when (or (null obj) (not (%clos-instance-p obj)))
     (return-from %slot-value nil))
+  ;; FAST PATH: the instance slot index through *CLOS-REG-MEMO* (one lookup
+  ;; for what took a class lookup, a CPL walk for class allocation and a
+  ;; linear slot search on every read).  Class slots and missing slots take
+  ;; the full path below.
+  (let ((loc (%clos-reg-memo2 8 (aref obj 1) slot-name (function %slot-locate-scan))))
+    (when (fixnump loc)
+      (let ((val (aref obj (+ 2 loc))))
+        (return-from %slot-value
+          (if (and (fixnump val) (= val -999))
+              (%dispatch-slot-unbound (%find-clos-class (aref obj 1)) obj slot-name)
+              val)))))
   (let* ((class-name (aref obj 1))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-value nil))
@@ -1787,6 +1808,11 @@
    :allocation :class slots route to per-class shared storage."
   (when (or (null obj) (not (%clos-instance-p obj)))
     (return-from set-slot-value new-val))
+  ;; FAST PATH: the memoised instance slot index, as %SLOT-VALUE.
+  (let ((loc (%clos-reg-memo2 8 (aref obj 1) slot-name (function %slot-locate-scan))))
+    (when (fixnump loc)
+      (aset obj (+ 2 loc) new-val)
+      (return-from set-slot-value new-val)))
   (let* ((class-name (aref obj 1))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from set-slot-value new-val))
@@ -2541,14 +2567,35 @@
       (cons e pos)
       (cons (car pos) (%gf-insert-pos e (cdr pos)))))
 
-(defun %gf-cache-get (gf args)
-  "The cached applicable-method list for ARGS, or NIL.
-   Cache cell (aref gf 9) = (EPOCH POSITIONS . ENTRIES), entry =
-   (KEYS NARGS . APPLICABLE)."
+(defun %gf-cache-entry (gf args)
+  "The cache entry for ARGS, or NIL.  Cache cell (aref gf 9) =
+   (EPOCH POSITIONS . ENTRIES), entry = (KEYS NARGS APPLICABLE . PLAN), PLAN
+   filled by %GF-DISPATCH on the entry's first hit (see %GF-MAKE-PLAN)."
   (when (and (>= (array-length gf) 10) (consp args))
     (let ((c (aref gf 9)))
       (when (and (consp c) (eql (car c) (%gf-cache-epoch)) (consp (cdr c))
                  (not (eq (car (cdr c)) :%no)))
+        ;; ONE specialised position (the common case): compare its key
+        ;; directly, consing no key list.
+        (let ((positions (car (cdr c))))
+          (when (and (consp positions) (null (cdr positions)))
+            (let* ((pe (car positions))
+                   (a (nthcdr (car pe) args))
+                   (k (and (consp a)
+                           (let ((x (car a)) (sp (cdr pe)))
+                             (loop
+                               (when (null sp) (return (%gf-arg-key x)))
+                               (when (eql x (car (cdr (car sp)))) (return (car sp)))
+                               (setq sp (cdr sp)))))))
+              (return-from %gf-cache-entry
+                (and k
+                     (let ((n (length args)) (e (cdr (cdr c))))
+                       (loop
+                         (when (null e) (return nil))
+                         (let ((x (car e)))
+                           (when (and (eql (car (cdr x)) n) (eql (car (car x)) k))
+                             (return x)))
+                         (setq e (cdr e)))))))))
         (let ((keys (%gf-cache-keys (car (cdr c)) args)))
           (unless (eq keys :%no)
             (let ((n (length args)) (e (cdr (cdr c))))
@@ -2556,8 +2603,14 @@
                 (when (null e) (return nil))
                 (let ((x (car e)))
                   (when (and (eql (car (cdr x)) n) (%gf-keys-eq (car x) keys))
-                    (return (cdr (cdr x)))))
+                    (return x)))
                 (setq e (cdr e))))))))))
+
+(defun %gf-cache-get (gf args)
+  "The cached applicable-method list for ARGS (:%NONE for a cached empty
+   answer), or NIL."
+  (let ((x (%gf-cache-entry gf args)))
+    (and x (car (cdr (cdr x))))))
 
 (defun %gf-keys-eq (a b)
   (loop
@@ -2584,7 +2637,7 @@
           ;; the scan it replaced.
           (when (and (not (eq keys :%no)) (< (length (cdr (cdr c))) 64))
             (setf (cdr (cdr c))
-                  (cons (cons keys (cons (length args) applicable))
+                  (cons (cons keys (cons (length args) (cons applicable nil)))
                         (cdr (cdr c))))))))))
 
 (defun %gf-applicable-cached (gf args)
@@ -4910,6 +4963,41 @@
           (write-char-serial 10)
           (%signal-program-error))))))
 
+(defun %gf-make-plan (gf applicable)
+  "How a cache hit for APPLICABLE runs: (:CHAIN . METHODS) when every method
+   is a primary of the STANDARD combination, the GF checks no keywords and has
+   no system default primary -- the call is then the first method with the
+   rest as its CALL-NEXT-METHOD chain -- else :GENERAL.  All of that is fixed
+   for a cache entry: the entry dies with the method list, the combination or
+   a class change."
+  (cond
+    ((or (not (consp applicable)) (%gf-combination gf)) :general)
+    ((%has-default-primary-p (%gf-name gf)) :general)
+    ((let ((ll (%gf-lambda-list gf)))
+       (and ll (nth 3 (%lambda-list-shape-cached ll))))
+     :general)
+    ((let ((m applicable) (q nil))
+       (loop (when (null m) (return q))
+         (when (%method-qualifier (car m)) (setq q t) (return q))
+         (setq m (cdr m))))
+     :general)
+    (t (cons :chain applicable))))
+
+(defun %gf-run-chain (gf args methods)
+  "Run METHODS (all primary) as an effective method: the first, with the rest
+   as its CALL-NEXT-METHOD chain -- what %GF-DISPATCH-STANDARD's general path
+   does for primaries alone, without its closure, partition and value list."
+  (let ((saved-gf *%current-gf*)
+        (saved-nm *%next-methods*)
+        (saved-args *%current-gf-args*))
+    (setq *%current-gf* gf)
+    (setq *%next-methods* (cdr methods))
+    (setq *%current-gf-args* args)
+    (multiple-value-prog1 (apply (%method-fn (car methods)) args)
+      (setq *%current-gf* saved-gf)
+      (setq *%next-methods* saved-nm)
+      (setq *%current-gf-args* saved-args))))
+
 (defun %gf-dispatch (name args)
   "Dispatch generic function NAME with ARGS.
    The combination slot holds either a bare combination name (symbol)
@@ -4927,6 +5015,17 @@
     ;; required args is a program-error, not a no-applicable-method.
     ;; A cache hit was filled by a call with the same argument count, which
     ;; passed this same arity check (THE DISPATCH CACHE).
+    ;; THE PLANNED FAST PATH: a cache hit whose entry has a :CHAIN plan runs
+    ;; it directly (see %GF-MAKE-PLAN); the first hit computes the plan.
+    (let ((entry (%gf-cache-entry gf args)))
+      (when entry
+        (let ((plan (cdr (cdr (cdr entry)))))
+          (when (null plan)
+            (setq plan (%gf-make-plan gf (car (cdr (cdr entry)))))
+            (when (%gf-cache-writable-p)
+              (setf (cdr (cdr (cdr entry))) plan)))
+          (unless (eq plan :general)
+            (return-from %gf-dispatch (%gf-run-chain gf args (cdr plan)))))))
     (let ((applicable (%gf-cache-get gf args)))
       (cond ((eq applicable :%none) (setq applicable nil))
             ((null applicable)

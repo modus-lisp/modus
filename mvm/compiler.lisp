@@ -12173,6 +12173,50 @@
            (free-temp-reg)
            (free-temp-reg)))
         (t
+         ;; INLINE CACHED STORE: an AOT SETQ of a global with a cache slot
+         ;; stores straight into the memoised cell when threads are unarmed,
+         ;; the cache vector exists and the slot holds this key's cell -- the
+         ;; write twin of %COMPILE-GLOBAL-READ-CACHED.  No call, so nothing
+         ;; to caller-save; any failed check falls to the %GV-SET-C call.
+         ;; DEST must survive the sequence: not VR (RAX, the translators'
+         ;; scratch for loads and spills -- a VR dest was clobbered before
+         ;; the store and the image died at boot), and the three temps must be
+         ;; physical registers, not frame slots reached through RAX.
+         (let ((islot (and (not cell) (eq *gv-cache-mode* :inline)
+                           (/= dest +vreg-vr+)
+                           (< *temp-reg-counter* 2)
+                           (%gv-aot-slot hash var)))
+               (inline-done (make-compiler-label))
+               (inline-slow (make-compiler-label)))
+           (when islot
+             (let ((a (alloc-temp-reg)) (b (alloc-temp-reg)) (c (alloc-temp-reg)))
+               (emit-li-tagged a (conv-real #x10000DB8))
+               (emit-ir :shr a a +fixnum-shift+)
+               (emit-ir :load b a (%tls-width (car (memory-width-code :u32)) #x10000DB8))
+               (emit-ir :li a 0)
+               (emit-ir :cmp b a)
+               (emit-ir :bne inline-slow)
+               (emit-li-tagged a (conv-real +gv-cache-root+))
+               (emit-ir :shr a a +fixnum-shift+)
+               (emit-ir :load a a (%tls-width (car (memory-width-code :u64)) +gv-cache-root+))
+               (emit-ir :li b 1)
+               (emit-ir :test a b)
+               (emit-ir :beq inline-slow)
+               (if (%obj-slot-imm-p islot)
+                   (emit-ir :obj-ref b a islot)
+                   (progn (emit-li-tagged b islot)
+                          (emit-ir :aref b a b)))
+               (emit-ir :consp a b)
+               (emit-ir :bnull a inline-slow)
+               (emit-ir :car a b)
+               (emit-li-tagged c hash)
+               (emit-ir :cmp a c)
+               (emit-ir :bne inline-slow)
+               (emit-ir :setcdr b dest)
+               (emit-ir :set-mv-count 1)
+               (emit-ir :br inline-done)
+               (emit-ir-label inline-slow)
+               (free-temp-reg) (free-temp-reg) (free-temp-reg)))
          (when (> save-count 1)
            (let ((r (+ +vreg-v4+ 1)))
              (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
@@ -12200,7 +12244,8 @@
            (let ((r (+ +vreg-v4+ save-count -1)))
              (loop (when (< r (+ +vreg-v4+ 1)) (return))
                (unless (= r dest) (emit-ir :pop r))
-               (setq r (- r 1))))))))))
+               (setq r (- r 1)))))
+         (when islot (emit-ir-label inline-done))))))))
 
 ;;; ============================================================
 ;;; Lambda

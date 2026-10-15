@@ -89,7 +89,7 @@
 (defun %sym-qn-remember (sym pair)
   (when (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil))
     (unless (consp *sym-qn-memo*) (setq *sym-qn-memo* (make-hash-table :test 'eq)))
-    (puthash sym *sym-qn-memo* pair))
+    (puthash sym *sym-qn-memo* (cons (%cl-sym-package sym) pair)))
   pair)
 
 (defun %sym-name-or-hash (sym)
@@ -127,7 +127,14 @@
        (cons full (compute-name-hash full))))
     ;; (A hash table is a cons here; the unbound marker an uninitialised
     ;; defvar reads as in the gate image is a fixnum.)
-    ((and (%cl-sym-p sym) (let ((m *sym-qn-memo*)) (and (consp m) (gethash sym m)))))
+    ;; A hit is trusted only while the symbol's home package is the one it
+    ;; was computed under: a symbol can get its home package after its first
+    ;; lookup (ANSI load.15 lost its function cell to a stale bare key).
+    ((and (%cl-sym-p sym)
+          (let ((m *sym-qn-memo*))
+            (and (consp m)
+                 (let ((e (gethash sym m)))
+                   (and e (eq (car e) (%cl-sym-package sym)) (cdr e)))))))
     ((%cl-sym-p sym)
      (let ((nm (%cl-sym-name sym)))
        (when nm

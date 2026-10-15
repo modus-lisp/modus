@@ -5305,6 +5305,11 @@
         (eof-error-p (if (cdr args) (cadr args) t))
         (eof-value (if (cddr args) (caddr args) nil)))
     (let ((s (%resolve-input-stream stream-arg)))
+      ;; A file stream with the whole line in its buffer: no per-character loop.
+      (when (and (streamp s) (= (%stream-type s) 9))
+        (let ((fast (%fs-read-line-fast s)))
+          (unless (eq fast :slow)
+            (return-from read-line (values fast nil)))))
       ;; Use read-char to read characters until newline or EOF
       (let ((chars nil)
             (found-newline nil)

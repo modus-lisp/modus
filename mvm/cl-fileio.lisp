@@ -830,6 +830,34 @@
                       (%fs-set-blen stream n)
                       (%fs-read-byte-code stream)))))))))
 
+(defun %fs-read-line-fast (s)
+  "READ-LINE on file stream S straight out of its buffer: the line, when a
+   newline is buffered past the read position with only ASCII bytes before
+   it; else :SLOW, having consumed nothing (a line that crosses the buffer
+   end, or non-ASCII bytes that need UTF-8 decoding, take READ-LINE's
+   per-character path).  READ-LINE built every line from a READ-CHAR per
+   character, a cons per character, an NREVERSE and a copy (cl-bench
+   SLURP-LINES 42x SBCL)."
+  (let ((fd (%fs-fd s)))
+    (if (< fd 0)
+        :slow
+        (let* ((buf (%fs-buf s)) (bpos (%fs-bpos s)) (blen (%fs-blen s)) (j bpos))
+          (loop
+            (when (>= j blen) (return :slow))
+            (let ((b (%prim-aref buf j)))
+              (cond
+                ((= b 10)
+                 (let* ((n (- j bpos)) (str (%make-string-array n)) (k 0))
+                   (loop
+                     (when (>= k n) (return nil))
+                     (%prim-aset str k (%prim-aref buf (+ bpos k)))
+                     (setq k (+ k 1)))
+                   (%fs-set-bpos s (+ j 1))
+                   (%fs-set-pos s (+ (%fs-pos s) n 1))
+                   (return str)))
+                ((>= b 128) (return :slow))))
+            (setq j (+ j 1)))))))
+
 ;;; --- File stream write-char ---
 (defun %fs-write-char (code stream)
   "Write a char code to a file stream, UTF-8 encoded."

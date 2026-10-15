@@ -2465,7 +2465,8 @@
 ;;; symbol, NIL, T, float, bignum or ratio by a fixed tag (floats, bignums and
 ;;; ratios by subtag), whose applicable methods cannot differ within the tag.
 ;;; Any other argument there -- an array, a string, a cons, a struct -- makes
-;;; the call uncacheable, as does any EQL specialiser on the GF.  (Only a
+;;; the call uncacheable.  At a position with EQL specialisers, an argument
+;;; EQL to one keys as that specialiser (see %GF-CACHE-KEYS).  (Only a
 ;;; first-argument instance with every other position T used to be cached:
 ;;; one NUMBER-specialised second parameter, cl-bench's SIMPLE-METHOD, and
 ;;; every call collected and sorted the applicable methods again.)
@@ -2482,13 +2483,22 @@
         (t nil)))
 
 (defun %gf-cache-keys (positions args)
-  "The key list for ARGS at POSITIONS, or :%NO when one is uncacheable."
+  "The key list for ARGS at POSITIONS ((POS . EQL-SPECS) ascending), or :%NO
+   when one is uncacheable.  At a position with EQL specialisers an argument
+   EQL to one of them keys as that specialiser (a cons no other key can be);
+   any other argument there keys by class as usual, since then only the
+   class-specialised methods can apply."
   (let ((acc nil) (i 0) (a args) (p positions))
     (loop
       (when (null p) (return (nreverse acc)))
       (when (null a) (return :%no))
-      (if (= i (car p))
-          (let ((k (%gf-arg-key (car a))))
+      (if (= i (car (car p)))
+          (let* ((x (car a))
+                 (k (let ((sp (cdr (car p))))
+                      (loop
+                        (when (null sp) (return (%gf-arg-key x)))
+                        (when (eql x (car (cdr (car sp)))) (return (car sp)))
+                        (setq sp (cdr sp))))))
             (when (null k) (return :%no))
             (setq acc (cons k acc))
             (setq p (cdr p))
@@ -2497,8 +2507,9 @@
           (progn (setq a (cdr a)) (setq i (+ i 1)))))))
 
 (defun %gf-cache-positions (gf)
-  "Sorted argument positions some method of GF specialises (non-T), or :%NO
-   when any method has an EQL specialiser."
+  "((POS . EQL-SPECS) ...) ascending by POS for the argument positions some
+   method of GF specialises (non-T), EQL-SPECS the (EQL x) specialisers seen
+   there; :%NO for any other compound specialiser."
   (let ((ms (%gf-methods gf)) (pos nil))
     (loop
       (when (null ms) (return nil))
@@ -2506,19 +2517,29 @@
         (loop
           (when (null specs) (return nil))
           (let ((sp (car specs)))
-            (cond ((consp sp) (return-from %gf-cache-positions :%no))
-                  ((eq sp 't) nil)
-                  ((not (member i pos)) (setq pos (%gf-insert-pos i pos)))))
+            (unless (eq sp 't)
+              (when (and (consp sp) (not (eq (car sp) 'eql)))
+                (return-from %gf-cache-positions :%no))
+              (let ((e (%gf-pos-entry i pos)))
+                (unless e
+                  (setq e (cons i nil))
+                  (setq pos (%gf-insert-pos e pos)))
+                (when (consp sp) (setf (cdr e) (cons sp (cdr e)))))))
           (setq specs (cdr specs))
           (setq i (+ i 1))))
       (setq ms (cdr ms)))
     pos))
 
-(defun %gf-insert-pos (i pos)
-  "POS (ascending fixnums) with I inserted in order."
-  (if (or (null pos) (< i (car pos)))
-      (cons i pos)
-      (cons (car pos) (%gf-insert-pos i (cdr pos)))))
+(defun %gf-pos-entry (i pos)
+  (loop (when (null pos) (return nil))
+    (when (= (car (car pos)) i) (return (car pos)))
+    (setq pos (cdr pos))))
+
+(defun %gf-insert-pos (e pos)
+  "POS (alist ascending by CAR) with entry E inserted in order."
+  (if (or (null pos) (< (car e) (car (car pos))))
+      (cons e pos)
+      (cons (car pos) (%gf-insert-pos e (cdr pos)))))
 
 (defun %gf-cache-get (gf args)
   "The cached applicable-method list for ARGS, or NIL.

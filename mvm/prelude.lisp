@@ -1633,7 +1633,7 @@
           (when (>= (car (cdr holder)) 32)
             (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
         (when (and vec (not (eq vec -424242001)))
-          (if (fixnump key)
+          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
               ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
               ;; keyword literal and every name-hash keyed compiler table.
@@ -1686,7 +1686,7 @@
           (when (>= (car (cdr holder)) 32)
             (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
         (when (and vec (not (eq vec -424242001)))
-          (if (fixnump key)
+          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
               ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
               ;; keyword literal and every name-hash keyed compiler table.
@@ -1729,7 +1729,7 @@
          (vec (and holder (%ht-active-vec-h ht holder)))
          (strcmp? (and vec (%ht-h-strcmp holder)))
          (existing (and vec
-                        (if (fixnump key)
+                        (if (and (fixnump key) (not (eq strcmp? :equalp)))
                             ;; fixnum fast path (mirrors GETHASH)
                             (let* ((k (if (< key 0) (- key) key))
                                    (h (logand (logxor k (logxor (ash k -8) (ash k -16)))
@@ -1787,6 +1787,33 @@
 (defun remhash (key ht)
   "Remove KEY from hash table HT. Returns T if removed, NIL otherwise.
    Keeps the bucket index (if any) and the holder count in sync."
+  ;; WITH A BUCKET INDEX the pair is found there: an absent key answers NIL
+  ;; without touching the alist, and a present one is unlinked by its IDENTITY
+  ;; (one EQ per link) instead of calling the table's test on every entry --
+  ;; cl-bench's HTABLE-SET+REMOVE removed the oldest of 16k string keys, 16k
+  ;; STRING= calls deep, 3800x SBCL.
+  (let* ((holder (%ht-bucket-holder ht))
+         (vec (and holder (%ht-active-vec-h ht holder))))
+    (when vec
+      (let* ((strcmp? (%ht-h-strcmp holder))
+             (pair (%ht-bucket-find vec key strcmp?)))
+        (cond
+          ((null pair) (return-from remhash nil))
+          ((consp pair)
+           (let ((entries (car ht)))
+             (if (eq (car entries) pair)
+                 (set-car ht (cdr entries))
+                 (let ((prev entries) (cur (cdr entries)))
+                   (loop
+                     (when (null cur) (return nil))
+                     (when (eq (car cur) pair)
+                       (set-cdr prev (cdr cur))
+                       (return nil))
+                     (setq prev cur)
+                     (setq cur (cdr cur))))))
+           (%ht-bucket-rem vec key strcmp?)
+           (%ht-h-set-count holder (- (%ht-h-count holder) 1))
+           (return-from remhash t))))))
   (let* ((entries (car ht))
          (cmp (%ht-keytest ht))
          (holder (%ht-bucket-holder ht))
@@ -1946,6 +1973,7 @@
    String hash is CASE-SENSITIVE.  MASK = bucket-count minus one (the
    bucket vector is a power of two in length and GROWS with the table)."
   (cond
+    ((eq strcmp? :equalp) (logand (%ht-equalp-hash key 0) mask))
     ;; FIXNUM FIRST: every special-variable read and write probes the globals
     ;; table with one (%GV-CELL), and it used to pass two string tests to get
     ;; here.  The mix is the one documented at the fixnum clause below.
@@ -2030,6 +2058,60 @@
 ;;; while they are keys, so a hash of their structure would go stale.
 (defun %ht-mix (h v) (logand (+ (- (ash h 5) h) v) #x3FFFFF))
 
+(defun %ht-equalp-hash (x depth)
+  "Hash for EQUALP tables: EQUALP keys hash alike.  Reals by FLOOR (= reals
+   have equal floors: 1, 1.0 and 3/3 collide as they must); characters and
+   string elements case-folded; any vector -- a string included, since
+   (equalp \"ab\" #(#\\a #\\b)) -- by length and its first 8 elements; a
+   list by its first 8 elements, 3 levels deep.  Everything EQUALP can see
+   into otherwise (structures, hash tables, multi-dimensional arrays) hashes
+   to a constant: correct, merely less spread.  Below 2^27 throughout."
+  (cond
+    ((fixnump x) (%ht-equalp-real-hash x))
+    ((characterp x) (char-code (char-upcase x)))
+    ((null x) 17)
+    ((eq x t) 19)
+    ((stringp x) (%ht-equalp-vec-hash x depth))
+    ((and (consp x) (not (%ht-opaque-cons-p x)))
+     (if (< depth 3)
+         (let ((h 7) (n 0) (c x))
+           (loop
+             (cond ((not (consp c))
+                    (return (%ht-mix h (if (null c) 0 (%ht-equalp-hash c (+ depth 1))))))
+                   ((>= n 8) (return (%ht-mix h 23))))
+             (setq h (%ht-mix h (%ht-equalp-hash (car c) (+ depth 1))))
+             (setq c (cdr c) n (+ n 1))))
+         29))
+    ((consp x) 31)
+    ((realp x) (%ht-equalp-real-hash x))
+    ;; A complex is = to a real when its imaginary part is zero, and = numbers
+    ;; have = real parts.
+    ((numberp x) (%ht-equalp-real-hash (realpart x)))
+    ((%cl-sym-p x) (logand (%cl-sym-hash x) #x3FFFFF))
+    ((%native-mvm-sym-p x) (logand (%native-mvm-sym-hash x) #x3FFFFF))
+    ;; Bit vectors too: #*101 is EQUALP to #(1 0 1).
+    ((vectorp x) (%ht-equalp-vec-hash x depth))
+    (t 41)))
+
+(defun %ht-equalp-real-hash (x)
+  "= reals hash alike: by FLOOR, one constant past 2^60 (fixnum, bignum and
+   float alike, so a float = to a huge integer still collides with it, and
+   infinities never reach FLOOR), another for NaN, which is = to nothing."
+  (cond
+    ((and (floatp x) (/= x x)) 47)
+    ((or (> x 1152921504606846976) (< x -1152921504606846976)) 43)
+    ((fixnump x) (logand (if (< x 0) (- x) x) #x3FFFFF))
+    (t (let ((f (floor x))) (logand (if (< f 0) (- f) f) #x3FFFFF)))))
+
+(defun %ht-equalp-vec-hash (v depth)
+  (let* ((n (length v)) (h (%ht-mix 11 (logand n #xFFFF))) (i 0))
+    (if (>= depth 3)
+        h
+        (loop
+          (when (or (>= i n) (>= i 8)) (return h))
+          (setq h (%ht-mix h (%ht-equalp-hash (aref v i) (+ depth 1))))
+          (setq i (+ i 1))))))
+
 (defun %ht-opaque-cons-p (x)
   "True for a cons that is a hash table or an array wrapper underneath:
    (alist %HT-TAG . meta), (8765432 . wrapper) adjustable, (fill-pointer .
@@ -2081,6 +2163,12 @@
         (%ht-nohash)
         (let ((cur (%word-aref vec h)))
           (cond
+            ((eq strcmp? :equalp)
+             (loop
+               (when (null cur) (return nil))
+               (let ((e (car cur)))
+                 (when (equalp (car e) key) (return (cdr e))))
+               (setq cur (cdr cur))))
             ((and strcmp? (stringp key))
              ;; string-content path
              (loop
@@ -2123,7 +2211,8 @@
         (loop
           (when (null cur) (return nil))
           (let ((ek (car (car cur))))
-            (unless (cond ((and strcmp? (stringp key))
+            (unless (cond ((eq strcmp? :equalp) (equalp ek key))
+                          ((and strcmp? (stringp key))
                            (and (stringp ek) (string= ek key)))
                           ((consp key) (equal ek key))
                           (t (eql ek key)))
@@ -2277,11 +2366,14 @@
     ;; The 0-arg / legacy MAKE-HASH-TABLE path (NIL test) does NOT get this
     ;; tail — it stays the pure-alist shape so boot-critical tables (the symbol
     ;; intern table, macro table, ...) are byte-identical and never bucketed.
-    ;; EQUALP gets the index pre-disabled (car=:NOHASH): EQUALP string keys are
-    ;; case-INSENSITIVE and EQUALP conflates e.g. 1/1.0, but the index is
-    ;; EQUAL-grade — so EQUALP tables stay on the correct linear path.
-    (let ((holder (cons (if (eq test 'equalp) (%ht-nohash) nil)
-                        (cons 0 (eq test 'equal)))))
+    ;; EQUALP tables get their own index mode: STRCMP? is :EQUALP, keys hash
+    ;; by %HT-EQUALP-HASH (case-folded, = numbers alike) and buckets compare
+    ;; with EQUALP.  They used to be linear for good -- cl-bench's MIXBAG,
+    ;; 16k mixed keys, was 840x SBCL.
+    (let ((holder (cons nil
+                        (cons 0 (cond ((eq test 'equal) t)
+                                      ((eq test 'equalp) :equalp)
+                                      (t nil))))))
       (cons nil
             (cons (%ht-tag)
                   (list test rsize rthresh size holder))))))

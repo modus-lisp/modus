@@ -6017,6 +6017,34 @@
             (%aset-multi a val i j)))
       (%aset-multi a val i j)))
 
+(defun %aref3 (a i j k)
+  "Three-subscript AREF without &rest/APPLY, as %AREF2: a non-displaced native
+   rank-3 MDA with non-string data is served in place, everything else goes
+   through %AREF-MULTI-PUBLIC.  (Rank 3 went through the &rest path, APPLY,
+   NREVERSE and a dims walk per access: 400 ns, cl-bench 3D-ARRAYS 162x.)"
+  (if (and (%mda-p a) (null (%mda-displaced a)))
+      (let ((dims (%mda-dims a)))
+        (if (and (consp dims) (consp (cdr dims)) (consp (cddr dims)) (null (cdddr dims))
+                 (fixnump i) (fixnump j) (fixnump k)
+                 (not (%prim-stringp (%mda-data a))))
+            (%prim-aref (%mda-data a)
+                        (+ (* (+ (* i (cadr dims)) j) (caddr dims)) k))
+            (%aref-multi-public a i j k)))
+      (%aref-multi-public a i j k)))
+
+(defun %aset3 (a val i j k)
+  "Three-subscript ASET counterpart of %AREF3; returns VAL."
+  (if (and (%mda-p a) (null (%mda-displaced a)))
+      (let ((dims (%mda-dims a)))
+        (if (and (consp dims) (consp (cdr dims)) (consp (cddr dims)) (null (cdddr dims))
+                 (fixnump i) (fixnump j) (fixnump k)
+                 (not (%prim-stringp (%mda-data a))))
+            (progn (%prim-aset (%mda-data a)
+                               (+ (* (+ (* i (cadr dims)) j) (caddr dims)) k) val)
+                   val)
+            (%aset-multi a val i j k)))
+      (%aset-multi a val i j k)))
+
 (defun %aref-multi-public (a &rest subs)
   "Public multi-subscript AREF: like %aref-multi but lifts a string-typed
    element (raw char-CODE in the u8 store) to a CHARACTER, matching the

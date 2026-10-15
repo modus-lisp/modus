@@ -22998,6 +22998,8 @@
        ;; Undeclared rank-2: a fixed-arity runtime path (no &rest list, no
        ;; APPLY) — reel's mode/partition tables are plain defparameters.
        (compile-form `(%aref2 ,arr ,(car subs) ,(cadr subs)) env dest))
+      ((and (consp subs) (consp (cdr subs)) (consp (cddr subs)) (null (cdddr subs)))
+       (compile-form `(%aref3 ,arr ,(car subs) ,(cadr subs) ,(caddr subs)) env dest))
       (t
        (compile-form `(%aref-multi-public ,arr ,@subs) env dest)))))
 
@@ -23137,9 +23139,12 @@
                (t (push (car cur) subs)
                   (setq cur (cdr cur))))))
          (let ((subs (nreverse subs)))
-           (if (and (consp subs) (consp (cdr subs)) (null (cddr subs)))
-               (compile-form `(%aset2 ,arr ,val ,(car subs) ,(cadr subs)) env dest)
-               (compile-form `(%aset-multi ,arr ,val ,@subs) env dest))))))))
+           (cond
+             ((and (consp subs) (consp (cdr subs)) (null (cddr subs)))
+              (compile-form `(%aset2 ,arr ,val ,(car subs) ,(cadr subs)) env dest))
+             ((and (consp subs) (consp (cdr subs)) (consp (cddr subs)) (null (cdddr subs)))
+              (compile-form `(%aset3 ,arr ,val ,(car subs) ,(cadr subs) ,(caddr subs)) env dest))
+             (t (compile-form `(%aset-multi ,arr ,val ,@subs) env dest)))))))))
 
 (defun compile-array-length (arr-form env dest)
   "Compile (array-length array). Routes wrapper inputs through

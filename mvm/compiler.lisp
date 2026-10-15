@@ -2511,6 +2511,25 @@
     ((or (symbolp form) (stringp form))
      (let ((v (gethash (normalize-name form) *constants* :not-found)))
        (if (and (not (eq v :not-found)) (integerp v)) v nil)))
+    ;; + - * ASH over constant integers fold too: `(ash 1 (- +fixnum-bits+ 24))'
+    ;; in the interpreter's LI arm was a runtime BIGNUM-ASH call on EVERY
+    ;; instruction (~10% of interpreted time), its count never seen as known.
+    ((and (consp form) (symbolp (car form)) (consp (cdr form))
+          (or (name-eq (car form) "+") (name-eq (car form) "-")
+              (name-eq (car form) "*") (name-eq (car form) "ASH")))
+     (let ((vals nil))
+       (dolist (a (cdr form))
+         (let ((v (%const-int-value a)))
+           (if (integerp v)
+               (setq vals (cons v vals))
+               (return-from %const-int-value nil))))
+       (setq vals (nreverse vals))
+       (cond ((name-eq (car form) "+") (apply (function +) vals))
+             ((name-eq (car form) "*") (apply (function *) vals))
+             ((name-eq (car form) "-") (apply (function -) vals))
+             ((and (= (length vals) 2) (<= (abs (cadr vals)) 64))
+              (ash (car vals) (cadr vals)))
+             (t nil))))
     (t nil)))
 
 (defun %rt-fn-name (fn)
@@ -2993,11 +3012,16 @@
 ;;; captured, the body is not rewritten, and the body's own type declarations
 ;;; land on the LET (the typed fast paths read them).
 ;;; Recursion is cut by *inline-active*; &optional/&rest/&key definitions are
-;;; never inlined; a NOTINLINE declaim retracts.  Runtime only: the image
-;;; build ignores it, so its output does not move.  Known limitation (SBCL
+;;; never inlined; a NOTINLINE declaim retracts.  The image build honours it
+;;; too while *AOT-INLINE* is true (see there).  Known limitation (SBCL
 ;;; inlines in the definition's lexical environment): a body reference to a
 ;;; global that the CALLER shadows with a lexical of the same name would see
 ;;; the caller's variable — small leaf functions read their parameters.
+(defvar *aot-inline* t
+  "When true the IMAGE build honours (declaim (inline f)) too, the same way
+   runtime compiles do.  Only mvm/interp.lisp declaims anything inline among
+   the image sources: its decode helpers (FETCH-*, REG-GET/REG-SET, ...) were
+   real calls on every interpreted instruction.  NIL restores the old output.")
 (defvar *inline-declared* nil "Names (strings) currently declaimed INLINE.")
 (defvar *inline-fn-defs* nil "Alist name-string -> (params . body) for inlinable defuns.")
 (defvar *inline-active* nil "Names whose expansion is being compiled (recursion guard).")
@@ -20783,6 +20807,11 @@
   ;; compile-variable-ref, far too late for this dispatch.  See %const-int-value.
   (let ((count (%const-int-value count-form)))
   (cond
+    ;; BOTH CONSTANT, result a fixnum with room to spare: the literal.
+    ((let ((v (and count (%const-int-value value-form))))
+       (and v (<= (abs count) 64)
+            (< (abs (ash v count)) (ash 1 (- +fixnum-bits+ 2)))))
+     (compile-form (ash (%const-int-value value-form) count) env dest))
     ;; VARIABLE COUNT WITH A PROVEN RANGE (2026-09-18, aarch64 runtime): a count
     ;; declared (unsigned-byte n), n <= 6, on a value of proven width W with
     ;; W + 2^n - 1 <= 62 (left) or any W (right, written (ash x (- n)) or
@@ -23951,7 +23980,7 @@
       (return-from compile-call
         (compile-form (list 'let (mapcar #'list vars args) (cons fn vars)) env dest))))
   ;; (declaim (inline FN)) at runtime: expand the call in place.
-  (when (and *mvm-eval-runtime-p* (symbolp fn) *inline-fn-defs*
+  (when (and (or *mvm-eval-runtime-p* *aot-inline*) (symbolp fn) *inline-fn-defs*
              (null (env-lookup-fn env (%rt-fn-name fn)))   ; a local FLET/LABELS FN wins
              (or (null *inline-only-in*)                    ; DIAGNOSTIC caller whitelist
                  (and (stringp *current-function-name*)
@@ -26496,6 +26525,8 @@
            ;; call-site expansion (see %inline-expansion).  Runtime DEFUNs
            ;; arrive here (mvm-eval-forms → mvm-compile-toplevel).
            (%inline-record-defun name params body))
+         (when (and *aot-inline* (not *mvm-eval-runtime-p*))
+           (%inline-record-defun name params body))
          ;; Detect &rest, &optional, &key before preprocessing strips them
          ;; so we can compute required-count for arity checks.
          (let* ((rest-pos (position '&rest params))
@@ -26633,6 +26664,8 @@
      ;; Same as the expression-level clause: a runtime no-op, but the
      ;; optimize policy is read out first (see *compile-safety*).
      (%declaim-note-optimize form)
+     (when (and *aot-inline* (not *mvm-eval-runtime-p*))
+       (%declaim-note-inline form))
      (when *mvm-eval-runtime-p*
        (%declaim-note-inline form)
        (%declaim-note-type form)

@@ -3028,6 +3028,12 @@
                 (a64-asr-imm buf +a64-x0+  +a64-x1+ 1)  ; x0  = arg1 untag
                 (a64-mov-reg buf +a64-x1+ +a64-x9+)     ; x1  = arg2
                 (a64-mov-reg buf +a64-x2+ +a64-x10+)    ; x2  = arg3
+                ;; Args 4-6 are zero (x3 still held arg3 TAGGED, x4/x5 are
+                ;; saved locals): a syscall that reads a fourth argument -- WAIT4's
+                ;; RUSAGE -- must not get a pointer-shaped leftover.  See the x64 arm.
+                (a64-mov-reg buf +a64-x3+ +a64-xzr+)
+                (a64-mov-reg buf +a64-x4+ +a64-xzr+)
+                (a64-mov-reg buf +a64-x5+ +a64-xzr+)
                 ;; AArch64 Linux: remap x86-64 syscall numbers to AArch64
                 ;; generic ABI numbers via a sequence of cmp/csel.  Skip
                 ;; the remap path on bare-metal (no Linux syscalls).

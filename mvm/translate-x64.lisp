@@ -1723,8 +1723,20 @@
               ;; rdx = untag V3 (arg3)
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
               (emit-bytes buf #x48 #xD1 #xFA)   ; sar rdx, 1
+              ;; ARGS 4-6 ARE ZERO, not whatever R10/R8/R9 held.  WAIT4 is
+              ;; reached through here with three arguments and reads a fourth
+              ;; -- RUSAGE -- from R10, which is a live vreg: the kernel wrote a
+              ;; 144-byte struct rusage over whatever R10 pointed at.  In the
+              ;; ANSI runner's FORK-FILE that was the cell of *WSTATUS-ADDR*
+              ;; once the global-cell cache moved register allocation there
+              ;; (key overwritten, value 0, SIGSEGV in the parent: 13371 lost).
+              (emit-bytes buf #x41 #x52)         ; push r10
+              (emit-bytes buf #x45 #x31 #xD2)   ; xor r10d, r10d
+              (emit-bytes buf #x45 #x31 #xC0)   ; xor r8d, r8d
+              (emit-bytes buf #x45 #x31 #xC9)   ; xor r9d, r9d
               ;; syscall
               (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
+              (emit-bytes buf #x41 #x5A)         ; pop r10
               ;; Tag result → V0 (RSI)
               (emit-bytes buf #x48 #x01 #xC0)   ; add rax, rax
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
@@ -1752,8 +1764,14 @@
               (emit-bytes buf #x4C #x89 #xC6)   ; mov rsi, r8
               ;; rdx = V3 (arg3, raw)
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
+              ;; Args 4-6 zero (see the #x0502 arm: WAIT4's RUSAGE in R10).
+              (emit-bytes buf #x41 #x52)         ; push r10
+              (emit-bytes buf #x45 #x31 #xD2)   ; xor r10d, r10d
+              (emit-bytes buf #x45 #x31 #xC0)   ; xor r8d, r8d
+              (emit-bytes buf #x45 #x31 #xC9)   ; xor r9d, r9d
               ;; syscall
               (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
+              (emit-bytes buf #x41 #x5A)         ; pop r10
               ;; Result → V0 (RSI), raw
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
               ;; Restore

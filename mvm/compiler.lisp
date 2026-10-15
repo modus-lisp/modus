@@ -24446,6 +24446,7 @@
             (setq renames (cons (list p g) renames))
             (setq new-params (cons g new-params)))
           (setq new-params (cons p new-params))))
+    (setq body (%rebind-boxed-params params body))
     (if renames
         (mvm-compile-function-internal-1
          name (nreverse new-params)
@@ -24453,6 +24454,29 @@
          parent-env rest-slot opt-start opt-count)
         (mvm-compile-function-internal-1
          name params body parent-env rest-slot opt-start opt-count))))
+
+(defun %rebind-boxed-params (params body)
+  "BODY with each parameter that needs a cell rebound by a LET of itself, so
+   the LET's cell boxing applies to it.  Only LET and LET* variables were ever
+   boxed: a PARAMETER assigned inside a closure -- (defun f (seq) (labels ((a ()
+   (pop seq))) (list (a) (a)))) -- was captured by value, every call saw the
+   original, and the result was (1 1) instead of (1 2) (cl-bench's SORT!
+   then faulted).  The LET goes after the docstring and declarations, which
+   stay on the parameters.  Same selection as a LET (%BOXED-VARS-FOR-LET)."
+  (let ((names (%extract-lambda-param-names params))
+        (head nil) (rest body))
+    (loop
+      (cond ((and (consp rest) (consp (car rest)) (name-eq (car (car rest)) "DECLARE"))
+             (push (car rest) head) (setq rest (cdr rest)))
+            ((and (consp rest) (stringp (car rest)) (consp (cdr rest)))
+             (push (car rest) head) (setq rest (cdr rest)))
+            (t (return))))
+    (let ((boxed (and names rest (%boxed-vars-for-let rest names))))
+      (if (null boxed)
+          body
+          (append (nreverse head)
+                  (list (cons 'let (cons (mapcar (lambda (v) (list v v)) boxed)
+                                         rest))))))))
 
 (defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR. Returns function-info.

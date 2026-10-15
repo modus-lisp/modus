@@ -3129,11 +3129,44 @@
             (t (setq a (cddr a)))))
     (list from-end start end)))
 
+(defun %dups-keep-list-eql (seq key-fn from-end start eff-end n)
+  "%DUPS-KEEP-LIST for the default (EQL) test, in linear time: walk the window
+   from the end (keep the LAST of each group) or from the start (FROM-END,
+   keep the FIRST) through an EQL hash set of the keys seen so far.  The
+   pairwise scan below was quadratic -- cl-bench's SUM-PERMUTATIONS dedups
+   362880 sums and ran for over half an hour (SBCL: 0.2 s)."
+  (let ((v (make-array n)) (keep (make-array n))
+        (seen (make-hash-table :test 'eql)) (cur seq) (i 0))
+    (loop
+      (when (null cur) (return))
+      (setf (svref v i) (car cur))
+      (setf (svref keep i) t)
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))
+    (flet ((visit (j)
+             (let ((k (if key-fn (funcall key-fn (svref v j)) (svref v j))))
+               (if (nth-value 1 (gethash k seen))
+                   (setf (svref keep j) nil)
+                   (setf (gethash k seen) t)))))
+      (if from-end
+          (let ((j start)) (loop (when (>= j eff-end) (return)) (visit j) (setq j (+ j 1))))
+          (let ((j (- eff-end 1))) (loop (when (< j start) (return)) (visit j) (setq j (- j 1))))))
+    (let ((r nil) (j (- n 1)))
+      (loop
+        (when (< j 0) (return r))
+        (when (svref keep j) (setq r (cons (svref v j) r)))
+        (setq j (- j 1))))))
+
 (defun %dups-keep-list (seq test-fn key-fn from-end start end)
   "Core list dedup honoring :start/:end.  Elements outside [start,end) are
    always retained and do NOT participate in duplicate comparison.  Within
    the window: without FROM-END keep the LAST occurrence of each group; with
    FROM-END keep the FIRST.  Result preserves original order."
+  (when (null test-fn)
+    (let ((n (length seq)))
+      (when (> n 16)
+        (return-from %dups-keep-list
+          (%dups-keep-list-eql seq key-fn from-end start (if end end n) n)))))
   (let ((eff-end (if end end (length seq)))
         (r nil) (cur seq) (i 0))
     (loop

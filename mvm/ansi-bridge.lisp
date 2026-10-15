@@ -1177,11 +1177,19 @@
      (let ((hash 2166136261)
            (i 0)
            (len (length object)))
-       (loop
-         (when (>= i len) (return))
-         (setq hash (logxor hash (%ensure-char-code (aref object i))))
-         (setq hash (logand (* hash 16777619) #xFFFFFFFF))
-         (setq i (+ i 1)))
+       ;; A plain #x31 string reads its slots directly (same codes AREF would
+       ;; lift to characters and %ENSURE-CHAR-CODE lower again).
+       (if (and (%prim-stringp object) (not (%mda-p object)))
+           (loop
+             (when (>= i len) (return))
+             (setq hash (logxor hash (%ensure-char-code (%word-aref object i))))
+             (setq hash (logand (* hash 16777619) #xFFFFFFFF))
+             (setq i (+ i 1)))
+           (loop
+             (when (>= i len) (return))
+             (setq hash (logxor hash (%ensure-char-code (aref object i))))
+             (setq hash (logand (* hash 16777619) #xFFFFFFFF))
+             (setq i (+ i 1))))
        hash))
     ((symbolp object)
      ;; Use name hash if available

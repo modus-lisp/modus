@@ -1880,6 +1880,9 @@
 ;;; the image's own code relies on; CLHS makes HASH-TABLE and LIST disjoint,
 ;;; and portable code dispatches on it -- jzon's object parser took a table for
 ;;; a list and every JSON object failed with a TYPE-ERROR.
+(defun %prim-simple-string-p (x) (%prim-simple-string-p x))   ; compiled inline (compiler.lisp)
+(defun %prim-simple-vector-p (x) (%prim-simple-vector-p x))   ; compiled inline (compiler.lisp)
+(defun %raw-consp (x) (consp x))   ; image code: CONSP is the raw tag test
 (defun %rt-consp (x) (and (consp x) (not (hash-table-p x))))
 (defun %rt-listp (x) (or (null x) (%rt-consp x)))
 (defun %rt-atom (x) (not (%rt-consp x)))
@@ -2010,13 +2013,16 @@
              (let ((h 2166136261) (len (array-length key)) (i 0))
                (loop
                  (when (>= i len) (return nil))
-                 (setq h (logand (* (logxor h (%prim-aref key i)) 16777619) #xFFFFFFFF))
+                 ;; %WORD-AREF: the clause above sent every string that is not a
+                 ;; plain #x31 through a copy, so this is one -- never byte-packed --
+                 ;; and %PRIM-AREF's u8-or-word subtag test per character is waste.
+                 (setq h (logand (* (logxor h (%word-aref key i)) 16777619) #xFFFFFFFF))
                  (setq i (+ i 1)))
                (logand h mask))
              (let ((h 1162397) (len (array-length key)) (i 0))   ; #x11BC9D
                (loop
                  (when (>= i len) (return nil))
-                 (setq h (logand (+ (- (ash h 5) h) (%prim-aref key i)) #x3FFFFF))
+                 (setq h (logand (+ (- (ash h 5) h) (%word-aref key i)) #x3FFFFF))
                  (setq i (+ i 1)))
                (logand h mask)))
          (%ht-nohash)))

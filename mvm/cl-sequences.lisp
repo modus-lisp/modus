@@ -991,16 +991,28 @@
                 ;; calls and a &rest cons per character (AREF dispatch +
                 ;; code-char boxing x2, CHAR= &rest, %CHAR2=, %ENSURE-CHAR-
                 ;; CODE x2) — CHAR= was 20% of a library-load profile.
-                (loop
-                  (when (= i len1) (return t))
-                  ;; Slots normally hold CODES, but a slot may hold a CHARACTER
-                  ;; (see %ENSURE-CHAR-CODE) — so a raw EQ miss re-compares
-                  ;; through the normalizer before declaring a mismatch.
-                  (let ((ca (%prim-aref sa (+ s1 i))) (cb (%prim-aref sb (+ s2 i))))
-                    (unless (or (eq ca cb)
-                                (eql (%ensure-char-code ca) (%ensure-char-code cb)))
-                      (return nil)))
-                  (setq i (+ i 1)))
+                ;; %WORD-AREF, not %PRIM-AREF: both are plain #x31 strings (never
+                ;; byte-packed), so the per-character u8-or-word subtag test is
+                ;; waste; and whole strings (both starts 0, the EQUAL / hash-table
+                ;; case) walk one index.
+                (if (and (eql s1 0) (eql s2 0))
+                    (loop
+                      (when (= i len1) (return t))
+                      (let ((ca (%word-aref sa i)) (cb (%word-aref sb i)))
+                        (unless (or (eq ca cb)
+                                    (eql (%ensure-char-code ca) (%ensure-char-code cb)))
+                          (return nil)))
+                      (setq i (+ i 1)))
+                    (loop
+                      (when (= i len1) (return t))
+                      ;; Slots normally hold CODES, but a slot may hold a CHARACTER
+                      ;; (see %ENSURE-CHAR-CODE) — so a raw EQ miss re-compares
+                      ;; through the normalizer before declaring a mismatch.
+                      (let ((ca (%word-aref sa (+ s1 i))) (cb (%word-aref sb (+ s2 i))))
+                        (unless (or (eq ca cb)
+                                    (eql (%ensure-char-code ca) (%ensure-char-code cb)))
+                          (return nil)))
+                      (setq i (+ i 1))))
                 (loop
                   (when (= i len1) (return t))
                   ;; AREF on strings now yields CHARACTERs — compare via char=.

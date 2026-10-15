@@ -8249,6 +8249,12 @@
       ((= op-name 338454479)             (compile-aref-form form env dest))  ; AREF
       ;; SVREF — same machinery as AREF but strict 2-arg arity (CLHS):
       ;; `(svref vec idx)` is illegal with extra args.
+      ;; CHAR / SCHAR: the AREF front end, inline, instead of a call to the
+      ;; DEFUN (cl-types.lisp), which is itself just (aref str idx).
+      ((and (or (= op-name #.(compute-name-hash "CHAR"))
+                (= op-name #.(compute-name-hash "SCHAR")))
+            (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+       (compile-aref-form (cons 'aref (cdr form)) env dest))
       ((= op-name 28329323)  ; SVREF
        (cond
          ((= (length (cdr form)) 2) (compile-aref-form form env dest))
@@ -8282,6 +8288,17 @@
        (compile-prim-array-length (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%PRIM-STRINGP"))
        (compile-prim-stringp (cadr form) env dest))
+      ;; %RAW-CONSP: the cons TAG test, which is what the compiler's own
+      ;; expansions mean by "is it a wrapper" -- in runtime-compiled code a
+      ;; plain CONSP is CL's (it excludes hash tables, see COMPILE-CONSP), and
+      ;; every AREF / ASET / LENGTH / STRINGP there paid a call for it.
+      ((= op-name #.(compute-name-hash "%PRIM-SIMPLE-STRING-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-string+))
+      ((= op-name #.(compute-name-hash "%PRIM-SIMPLE-VECTOR-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-array+))
+      ((= op-name #.(compute-name-hash "%RAW-CONSP"))
+       (compile-form (cadr form) env dest)
+       (emit-ir :consp dest dest))
       ;; %MDA-P is a two-test predicate written as a six-arm COND, and it is
       ;; called 77 times from the sequence, string and array paths -- on a
       ;; scalar benchmark it billed ~9% of everything the printer and reader
@@ -20633,13 +20650,25 @@
     (compile-t dest)
     (emit-ir-label end-label)))
 
+(defun %rt-consp-expansion (arg)
+  (let ((g (%mvm-gensym "CONSP")) (c (%mvm-gensym "CONSPD")))
+    `(let ((,g ,arg))
+       (if (%raw-consp ,g)
+           (let ((,c (cdr ,g)))
+             (if (%raw-consp ,c) (not (eql (car ,c) 442386510)) t))   ; (%ht-tag)
+           nil))))
+
 (defun compile-consp (arg env dest)
   "Compile (consp x) - true if x has cons tag.
    The MVM consp instruction produces a tagged boolean (T or NIL) in dest."
   ;; RUNTIME-COMPILED CODE sees CL's CONSP, which excludes hash tables (see
   ;; %RT-CONSP); the image's own code keeps the raw tag test it relies on.
+  ;; Inline, not a call to %RT-CONSP: CONSP is the list walk's test, and the
+  ;; call was most of a runtime-compiled (aref s i) and of every DOLIST step.
+  ;; Same predicate: a cons whose cdr is a cons carrying the hash-table tag
+  ;; (HASH-TABLE-P, prelude.lisp) is not a CL cons.
   (if *mvm-eval-runtime-p*
-      (compile-form (list '%rt-consp arg) env dest)
+      (compile-form (%rt-consp-expansion arg) env dest)
       (progn
         (compile-form arg env dest)
         ;; MVM consp: dest = (consp? src) -> T or NIL
@@ -20663,7 +20692,7 @@
   "Compile (atom x) - true if x is not a cons.
    The MVM atom instruction produces a tagged boolean (T or NIL) in dest."
   (if *mvm-eval-runtime-p*
-      (compile-form (list '%rt-atom arg) env dest)
+      (compile-form (list 'not (%rt-consp-expansion arg)) env dest)
       (progn
         (compile-form arg env dest)
         ;; MVM atom: dest = (atom? src) -> T or NIL
@@ -20672,7 +20701,8 @@
 (defun compile-listp (arg env dest)
   "Compile (listp x) - true if x is NIL or a cons"
   (when *mvm-eval-runtime-p*
-    (compile-form (list '%rt-listp arg) env dest)
+    (let ((g (%mvm-gensym "LISTP")))
+      (compile-form `(let ((,g ,arg)) (if (null ,g) t ,(%rt-consp-expansion g))) env dest))
     (return-from compile-listp nil))
   (let ((true-label (make-compiler-label))
         (check-cons-label (make-compiler-label))
@@ -20873,7 +20903,7 @@
   (let ((g-arg (%mvm-gensym "STRPA")))
     (compile-form
      `(let ((,g-arg ,arg))
-        (if (consp ,g-arg)
+        (if (%raw-consp ,g-arg)
             (%wrapper-stringp ,g-arg)
             (%prim-stringp ,g-arg)))
      env dest)))
@@ -23156,6 +23186,15 @@
      ;; raw — only this public front-end applies the code→char lift.
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
         (cond
+          ;; The two plain shapes FIRST, with the raw word load: a simple
+          ;; string (#x31) or simple vector (#x32) took the MDA, cons and
+          ;; string tests, then %PRIM-AREF's own u8-or-word subtag dispatch
+          ;; -- ~60 of the ~95 bytecode ops in a (char-code (aref s i)) loop.
+          ;; Neither shape is ever byte-packed (that is subtag #x11).
+          ;; (Exact subtag, not %PRIM-STRINGP: that one is also true of an
+          ;; MDA header whose data is a string -- a fill-pointer string.)
+          ((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx)))
+          ((%prim-simple-vector-p ,g-arr) (%word-aref ,g-arr ,g-idx))
           ;; MDA fast path — single-sub on an MDA is just an aref of
           ;; the underlying data (assuming no displacement; %aref-multi
           ;; handles the displaced case).
@@ -23167,7 +23206,7 @@
                (if (%prim-stringp (%mda-data ,g-arr))
                    (code-char ,g-raw)
                    ,g-raw))))
-          ((consp ,g-arr)
+          ((%raw-consp ,g-arr)
            (let ((,g-raw (%wrapper-aref ,g-arr ,g-idx)))
              (if (%wrapper-stringp ,g-arr) (code-char ,g-raw) ,g-raw)))
           ((%prim-stringp ,g-arr) (code-char (%prim-aref ,g-arr ,g-idx)))
@@ -23322,7 +23361,7 @@
                  (%aset-multi ,g-arr ,g-sto ,g-idx)
                  (%prim-aset (%mda-data ,g-arr) ,g-idx ,g-sto)))
            ,g-val)
-          ((consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-sto) ,g-val)
+          ((%raw-consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-sto) ,g-val)
           ;; packed single-float vector (#x12): narrow and store the lane
           ((eq (obj-subtag ,g-arr) #x12) (%f32-aset ,g-arr ,g-idx ,g-val))
           (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val)))
@@ -23380,7 +23419,7 @@
   (let ((g-arr (%mvm-gensym "ALENA")))
     (compile-form
      `(let ((,g-arr ,arr-form))
-        (if (consp ,g-arr)
+        (if (%raw-consp ,g-arr)
             (%wrapper-array-length ,g-arr)
             (%mda-array-length ,g-arr)))
      env dest)))

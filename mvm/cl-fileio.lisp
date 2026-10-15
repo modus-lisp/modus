@@ -701,8 +701,18 @@
   "Output streams that have buffered bytes at some point; %FS-FLUSH-ALL
    walks them at exit.")
 
-(defun %fs-wbuf-p (stream fd)
+(defun %fs-wbuf-eligible-p (stream fd)
+  "STREAM on FD may hold buffered output (an output-only regular file)."
   (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd))))
+
+(defun %fs-wbuf-p (stream fd)
+  ;; Unarmed images only: a worker thread writing a file would put its stream
+  ;; on the global *FS-BUFFERED-STREAMS* -- a worker object in shared memory,
+  ;; which the runtime refuses (operandi's tool turn: "a thread stored one of
+  ;; its own objects into shared memory").  Threaded images write unbuffered,
+  ;; as before.
+  (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd))
+       (eql (mem-ref #x10000DB8 :u32) 0)))
 
 (defun %fs-put-byte (stream fd byte)
   "Write one byte to file STREAM on FD, through its buffer when it has one."
@@ -716,14 +726,18 @@
             (setq *fs-buffered-streams* (cons stream *fs-buffered-streams*))))
         (%prim-aset (%fs-buf stream) n byte)
         (%fs-set-blen stream (+ n 1)))
-      (%sys-write-byte-1 fd byte)))
+      (progn
+        ;; Bytes buffered before threads armed go out first, in order.
+        (when (and (%fs-wbuf-eligible-p stream fd) (> (%fs-blen stream) 0))
+          (%fs-flush stream))
+        (%sys-write-byte-1 fd byte))))
 
 (defun %fs-flush (stream)
   "Write file STREAM's pending output bytes, if any."
   (when (streamp stream)
     (when (= (%stream-type stream) 9)
       (let ((fd (%fs-fd stream)))
-        (when (and (>= fd 0) (%fs-wbuf-p stream fd))
+        (when (and (>= fd 0) (%fs-wbuf-eligible-p stream fd))
           (let ((n (%fs-blen stream)))
             (when (> n 0)
               (let ((page (%fs-io-page)) (buf (%fs-buf stream)) (i 0))

@@ -3120,6 +3120,96 @@
       (setq i (+ i 1)))
     (values out (%mag-trim out 0 (+ na nb)))))
 
+;;; ---- Karatsuba (above +KARATSUBA-DIGITS+ digits on both sides) ----
+;;; (a1 X + a0)(b1 X + b0) = z2 X^2 + ((a1+a0)(b1+b0) - z2 - z0) X + z0, three
+;;; half-size products instead of four.  Every helper below takes and returns
+;;; digit vectors at offset 0 with an explicit trimmed length.
+
+(defun %karatsuba-digits () 48)
+
+(defun %dslice (v off len)
+  "(values W N): digits V[OFF .. OFF+LEN-1] as a fresh vector, trimmed."
+  (declare (type simple-vector v))
+  (let ((w (make-array (max len 1))) (i 0))
+    (declare (type simple-vector w))
+    (loop (when (>= i len) (return nil))
+      (aset w i (aref v (+ off i)))
+      (setq i (+ i 1)))
+    (values w (%mag-trim w 0 len))))
+
+(defun %dadd (a na b nb)
+  "(values S N): digits A + B."
+  (declare (type simple-vector a b))
+  (when (< na nb) (return-from %dadd (%dadd b nb a na)))
+  (let ((out (make-array (+ na 1))) (c 0) (i 0))
+    (declare (type simple-vector out))
+    (loop (when (>= i na) (return nil))
+      (let ((tt (%fixnum-+ (%fixnum-+ (aref a i) (if (< i nb) (aref b i) 0)) c)))
+        (aset out i (logand tt +half-limb-mask+))
+        (setq c (ash tt +neg-half-limb-bits+)))
+      (setq i (+ i 1)))
+    (aset out na c)
+    (values out (%mag-trim out 0 (+ na 1)))))
+
+(defun %dsub-into (a na b nb)
+  "A := A - B in place (A >= B); returns A's trimmed length."
+  (declare (type simple-vector a b))
+  (let ((c 0) (i 0))
+    (loop (when (or (>= i na) (and (>= i nb) (= c 0))) (return nil))
+      (let ((tt (%fixnum-+ (%fixnum-- (aref a i) (if (< i nb) (aref b i) 0)) c)))
+        (aset a i (logand tt +half-limb-mask+))
+        (setq c (ash tt +neg-half-limb-bits+)))
+      (setq i (+ i 1)))
+    (%mag-trim a 0 na)))
+
+(defun %dadd-at (out on v n shift)
+  "OUT := OUT + V * B^SHIFT in place (OUT has room); returns OUT's trimmed length."
+  (declare (type simple-vector out v))
+  (let ((c 0) (i 0) (k shift))
+    (loop (when (and (>= i n) (= c 0)) (return nil))
+      (let ((tt (%fixnum-+ (%fixnum-+ (aref out k) (if (< i n) (aref v i) 0)) c)))
+        (aset out k (logand tt +half-limb-mask+))
+        (setq c (ash tt +neg-half-limb-bits+)))
+      (setq i (+ i 1))
+      (setq k (+ k 1)))
+    (%mag-trim out 0 (max on k))))
+
+(defun %digits-kmul (a na b nb)
+  "(values OUT N): A * B, Karatsuba above the threshold."
+  (declare (type simple-vector a b))
+  (cond
+    ((or (= na 0) (= nb 0)) (values (vector 0) 0))
+    ;; A the longer, so a short operand is always B (the unbalanced split)
+    ((< na nb) (%digits-kmul b nb a na))
+    ((or (< na (%karatsuba-digits)) (< nb (%karatsuba-digits)))
+     (%digits-mul a na b nb))
+    (t
+     (let* ((m (ash (max na nb) -1))
+            (out (make-array (+ na nb 2))))
+       (declare (type simple-vector out))
+       (if (<= nb m)
+           ;; unbalanced: split A only, A1 * B shifted plus A0 * B
+           (multiple-value-bind (a0 n0) (%dslice a 0 (min m na))
+             (multiple-value-bind (a1 n1) (%dslice a m (- na m))
+               (multiple-value-bind (p0 pn0) (%digits-kmul a0 n0 b nb)
+                 (multiple-value-bind (p1 pn1) (%digits-kmul a1 n1 b nb)
+                   (let ((on (%dadd-at out 0 p0 pn0 0)))
+                     (values out (%dadd-at out on p1 pn1 m)))))))
+           (multiple-value-bind (a0 an0) (%dslice a 0 m)
+             (multiple-value-bind (a1 an1) (%dslice a m (- na m))
+               (multiple-value-bind (b0 bn0) (%dslice b 0 m)
+                 (multiple-value-bind (b1 bn1) (%dslice b m (- nb m))
+                   (multiple-value-bind (z0 zn0) (%digits-kmul a0 an0 b0 bn0)
+                     (multiple-value-bind (z2 zn2) (%digits-kmul a1 an1 b1 bn1)
+                       (multiple-value-bind (sa sna) (%dadd a0 an0 a1 an1)
+                         (multiple-value-bind (sb snb) (%dadd b0 bn0 b1 bn1)
+                           (multiple-value-bind (z1 zn1) (%digits-kmul sa sna sb snb)
+                             (let* ((zn1 (%dsub-into z1 zn1 z0 zn0))
+                                    (zn1 (%dsub-into z1 zn1 z2 zn2))
+                                    (on (%dadd-at out 0 z0 zn0 0))
+                                    (on (%dadd-at out on z1 zn1 m)))
+                               (values out (%dadd-at out on z2 zn2 (* 2 m))))))))))))))))))
+
 (defun %digits-divmod-1 (u n v)
   "(values Q-DIGITS R) dividing digits U[0..N-1] by one digit 0 < V < B."
   (declare (type simple-vector u))
@@ -3301,7 +3391,7 @@
         (t
           (multiple-value-bind (x xn) (%mag-digits av ao al 0)
             (multiple-value-bind (y yn) (%mag-digits bv bo bl 0)
-              (multiple-value-bind (p pn) (%digits-mul x xn y yn)
+              (multiple-value-bind (p pn) (%digits-kmul x xn y yn)
                 (%digits-to-int (if (= as bs) 1 -1) p pn)))))))))
 
 (defun %int-truncate2 (a b)

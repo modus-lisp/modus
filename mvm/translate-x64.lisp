@@ -4315,6 +4315,14 @@
            (x64-sse-rr buf #x66 t #x6E fd 1)                 ; movq xmmD, rcx
            (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
 
+        ((op= +op-fpd-itof+)
+         ;; (fpd-itof Fd Vs) -- SAR 1, CVTSI2SD xmmD, rax: a fixnum straight into
+         ;; the FP register, with no box.
+         (let ((fd (x64-fpp (first operands))))
+           (emit-load-vreg buf (second operands) 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           (x64-sse-rr buf #xF2 t #x2A fd 0)))               ; cvtsi2sd xmmD, rax
+
         ((op= +op-fpd-box+)
          (let* ((vd (first operands))
                 (fs (x64-fpp (second operands))))

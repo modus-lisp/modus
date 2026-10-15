@@ -18223,10 +18223,39 @@
        (let ((et (cadr ty)))
          (and (symbolp et) et (string= (symbol-name et) "DOUBLE-FLOAT")))))
 
+(defun %double-conversion-arg (form)
+  "X when FORM is (FLOAT X <double literal>), (COERCE X 'DOUBLE-FLOAT) or
+   (%TO-DOUBLE X) -- a conversion whose value is always a DOUBLE-FLOAT."
+  (and (consp form) (symbolp (car form)) (consp (cdr form))
+       (let ((rest (cddr form)))
+         (cond
+           ((and (name-eq (car form) "FLOAT") (consp rest) (null (cdr rest))
+                 (let ((p (car rest)))
+                   (or (typep p 'double-float)
+                       (and (consp p) (name-eq (car p) "QUOTE") (consp (cdr p))
+                            (typep (cadr p) 'double-float)))))
+            (cadr form))
+           ((and (name-eq (car form) "COERCE") (consp rest) (null (cdr rest))
+                 (let ((q (car rest)))
+                   (and (consp q) (name-eq (car q) "QUOTE") (consp (cdr q))
+                        (symbolp (cadr q)) (cadr q)
+                        (string= (symbol-name (cadr q)) "DOUBLE-FLOAT"))))
+            (cadr form))
+           ((and (name-eq (car form) "%TO-DOUBLE") (null rest)) (cadr form))
+           (t nil)))))
+
+(defun %compile-double-operand (form env dest)
+  "Compile a double-float fast-path operand; a conversion goes to %TO-DOUBLE."
+  (let ((x (%double-conversion-arg form)))
+    (if x
+        (compile-form (list '%to-double x) env dest)
+        (compile-form form env dest))))
+
 (defun %expr-double-float-p (form env)
   "T when FORM is provably a DOUBLE-FLOAT at compile time."
   (cond
     ((typep form 'double-float) t)
+    ((%double-conversion-arg form) t)
     ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
           (typep (cadr form) 'double-float)) t)
     ((symbolp form)
@@ -18257,6 +18286,9 @@
 ;;; code only: the fpd ops exist in the interpreter and the x64 / aarch64
 ;;; translators, and the image's other targets never run the JIT.
 
+(defvar *fpd-hoisted* nil
+  "Alist (conversion-form . temp vreg) of a double tree's hoisted operands.")
+
 (defun %fpd-tree-need (form env)
   "FP registers needed to evaluate FORM as an unboxed double tree, or NIL."
   (cond
@@ -18265,6 +18297,7 @@
           (typep (cadr form) 'double-float)) 1)
     ((symbolp form)
      (and form (env-lookup env form) (%expr-double-float-p form env) 1))
+    ((assoc form *fpd-hoisted* :test #'eq) 1)
     ((and (consp form) (symbolp (car form))
           (member (symbol-name (car form)) '("+" "-" "*" "/") :test #'string=)
           (consp (cdr form)) (consp (cddr form)))
@@ -18282,8 +18315,35 @@
         ((string= name "*") :fpd-mul)
         (t :fpd-div)))
 
+(defun %fpd-collect-conversions (form)
+  "The conversion operands (see %DOUBLE-CONVERSION-ARG) of the + - * / tree
+   FORM, left to right, or :NONE when a non-tree call stands in it."
+  (let ((acc nil))
+    (labels ((walk (f)
+               (cond ((%double-conversion-arg f) (push f acc))
+                     ((and (consp f) (symbolp (car f))
+                           (member (symbol-name (car f)) '("+" "-" "*" "/") :test #'string=))
+                      (dolist (a (cdr f)) (walk a))))))
+      (walk form))
+    (nreverse acc)))
+
 (defun compile-double-unboxed (form env fd)
   "Compile the double tree FORM (caller checked %FPD-TREE-NEED) into FP vreg FD."
+  (let ((h (assoc form *fpd-hoisted* :test #'eq)))
+    (when h
+      (let ((one (alloc-temp-reg))
+            (boxed (make-compiler-label))
+            (done (make-compiler-label)))
+        (emit-ir :li one 1)
+        (emit-ir :test (cdr h) one)
+        (emit-ir :bne boxed)
+        (emit-ir :fpd-itof fd (cdr h))
+        (emit-ir :br done)
+        (emit-ir-label boxed)
+        (emit-ir :fpd-unbox fd (cdr h))
+        (emit-ir-label done)
+        (free-temp-reg))
+      (return-from compile-double-unboxed nil)))
   (if (and (consp form) (not (name-eq (car form) "QUOTE")))
       (let ((op (%fpd-arith-op (symbol-name (car form)))))
         (compile-double-unboxed (cadr form) env fd)
@@ -18304,20 +18364,43 @@
    A whole call-free tree goes through the FP pool unboxed instead."
   (let ((tree (cons (%float-op-symbol op-name) args)))
     (when *mvm-eval-runtime-p*
-      (let ((need (%fpd-tree-need tree env)))
-        (when (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))
+      ;; Conversion operands are calls, and FP registers are caller-clobbered:
+      ;; evaluate them first, left to right, into boxed temps (the tree's
+      ;; other leaves are variables and literals, so the order is unchanged).
+      (let* ((convs (%fpd-collect-conversions tree))
+             (saved *fpd-hoisted*)
+             (hoisted (and (<= (length convs) 3)
+                           (mapcar (lambda (c) (cons c nil)) convs)))
+             (need nil))
+       (setq *fpd-hoisted* hoisted)
+       (unwind-protect
+        (progn
+         (setq need (and (= (length hoisted) (length convs))
+                         (%fpd-tree-need tree env)))
+         (when (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))
+          ;; Each hoisted operand is left a FIXNUM when it is one (the tree
+          ;; converts it in register, :fpd-itof) and a boxed double otherwise.
+          (dolist (h *fpd-hoisted*)
+            (let ((r (alloc-temp-reg))
+                  (g (%mvm-gensym "CONV")))
+              (compile-form `(let ((,g ,(%double-conversion-arg (car h))))
+                               (if (fixnump ,g) ,g (%to-double ,g)))
+                            env r)
+              (setf (cdr h) r)))
           (let ((fd (alloc-fp-reg)))
             (compile-double-unboxed tree env fd)
             (emit-ir :gc-check)
             (emit-ir :fpd-box dest fd)
             (free-fp-reg))
-          (return-from %compile-double-float-arith nil)))))
+          (dolist (h *fpd-hoisted*) (declare (ignore h)) (free-temp-reg))
+          (return-from %compile-double-float-arith nil)))
+        (setq *fpd-hoisted* saved)))))
   (let ((firop (%float-arith-op op-name)))
-    (compile-form (car args) env dest)
+    (%compile-double-operand (car args) env dest)
     (dolist (arg (cdr args))
       (let ((temp (alloc-temp-reg)))
         (emit-ir :push dest)
-        (compile-form arg env temp)
+        (%compile-double-operand arg env temp)
         (emit-ir :pop dest)
         (emit-ir :gc-check)
         (emit-ir firop dest dest temp)
@@ -24727,6 +24810,7 @@
       (:fp-div 4)
       (:fpd-unbox 3)
       (:fpd-box 3)
+      (:fpd-itof 3)
       (:fpd-add 4)
       (:fpd-sub 4)
       (:fpd-mul 4)
@@ -25070,6 +25154,7 @@
           (:fp-div (mvm-fp-div buf (second insn) (third insn) (fourth insn)))
           (:fpd-unbox (mvm-fpd-unbox buf (second insn) (third insn)))
           (:fpd-box (mvm-fpd-box buf (second insn) (third insn)))
+          (:fpd-itof (mvm-fpd-itof buf (second insn) (third insn)))
           (:fpd-add (mvm-fpd-add buf (second insn) (third insn) (fourth insn)))
           (:fpd-sub (mvm-fpd-sub buf (second insn) (third insn) (fourth insn)))
           (:fpd-mul (mvm-fpd-mul buf (second insn) (third insn) (fourth insn)))

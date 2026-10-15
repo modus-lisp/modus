@@ -2275,6 +2275,11 @@
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)
                (setf (svref fregs fd) (coerce (svref regs vs) 'double-float))
                (setf pc npc2))))
+          (#.+op-fpd-itof+
+           (multiple-value-bind (fd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (setf (svref fregs fd) (coerce (svref regs vs) 'double-float))
+               (setf pc npc2))))
           (#.+op-fpd-box+
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (fs npc2) (fetch-reg bc npc)

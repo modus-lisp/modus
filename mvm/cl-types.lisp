@@ -2632,6 +2632,12 @@
            s
            (%make-typed-float (%float-hi32 s) (%float-lo32 s) type))))))   ; retag short
 
+(defun %to-double (x)
+  "(FLOAT X 1d0): a fixnum converts inline (:itof), anything else goes
+   through FLOAT.  The compiler's double-float fast path calls this for a
+   (FLOAT X <double>) or (COERCE X 'DOUBLE-FLOAT) operand."
+  (if (fixnump x) (%float-from-int x) (float x 1d0)))
+
 (defun %float-pair-result (r a b)
   "R, the double-payload result of an op on IEEE floats A and B, in CLHS
    contagion format: double when either is double (or long), else rounded to

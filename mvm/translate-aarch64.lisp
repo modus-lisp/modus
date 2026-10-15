@@ -5399,6 +5399,13 @@
              (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
              (a64-fmov-d-x buf fd +a64-x9+)))
 
+          ;; ---- FPD-ITOF Fd, Vsrc ----  ASR x9, src, 1 ; SCVTF Dd, x9 (no box)
+          ((= op +op-fpd-itof+)
+           (let* ((fd (fpp (vr 0)))
+                  (ps (ensure-src (vr 1) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ ps 1)
+             (a64-scvtf-d-x buf fd +a64-x9+)))
+
           ;; ---- FPD-BOX Vd, Fs ----  FMOV x9, Ds -> fresh boxed double (#x460)
           ((= op +op-fpd-box+)
            (let* ((vd (vr 0))

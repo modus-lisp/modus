@@ -39,7 +39,8 @@
 ;;;;   0x10200000              thread page (table at +0x13000)
 ;;;;   0x10300000..0x10380000  sync-cell arena (cacheable: LDAXR/STLXR)
 ;;;;   0x10400000..0x10600000  per-thread windows, 0x20000 per record
-;;;;   0x10640000              per-core switch mailboxes
+;;;;   0x10640000              per-core switch mailboxes, 32 bytes each
+;;;;   0x10740000..0x10780000  per-record dynamic-binding stacks, 16 KB each
 ;;;;   0x10680000..0x10740000  per-slot result buffers, 64 KB each
 ;;;;   0x18000000..0x1B000000  core heaps: core c = two 8 MB semispaces (free once a
 ;;;;                           saved core is restored; its magic word is cleared)
@@ -64,7 +65,7 @@
       (+ #x05400000 (* (- i 1) #x200000))
       (+ #x05800000 (* (- i 3) #x80000))))
 (defun %bt-rcb (c) (+ #x10090000 (* c 64)))
-(defun %bt-mailbox (c) (+ #x10640000 (* c 16)))
+(defun %bt-mailbox (c) (+ #x10640000 (* c 32)))
 (defun %bt-result-buf (i) (+ #x10680000 (* (- i 4) #x10000)))
 (defun %bt-result-cap () #xFFF0)
 (defun %bt-ncores () 4)
@@ -82,6 +83,81 @@
 
 (defun %bt-stub () (mem-ref #x10213000 :u64))              ; table+0x00
 (defun %bt-up-p () (not (zerop (mem-ref #x10213008 :u32))))
+
+;;; Per-computation state, as hosted threads have it (net/hosted-sync.lisp): every
+;;; slot runs its body inside %WITH-COMPUTATION-STATE, so the condition system,
+;;; the interpreter's MV/NLX state and the printer's scratch are its own.
+(defvar *per-computation-specials* nil
+  "Globals whose value is PER-COMPUTATION state -- a library's random
+   generator, a lazily built cache -- registered by the library with
+   REGISTER-PER-COMPUTATION-SPECIAL.  Every thread and actor starts with its
+   own NIL binding of each, so the library's (or *x* (setf *x* ...)) fills
+   that computation's copy.  Threads share no state: without this, the first
+   worker to fill such a global would be storing one of its own objects into
+   shared memory, which the shared-store guard refuses.")
+
+(defun register-per-computation-special (symbol)
+  "Declare SYMBOL's global value per-computation state (see
+   *PER-COMPUTATION-SPECIALS*).  Call it when the library loads, on the main
+   thread; computations started afterwards get their own binding."
+  (unless (zerop (%tls-self-base))
+    (error "register-per-computation-special: call it from the main thread (at load time)."))
+  (unless (member symbol *per-computation-specials*)
+    (setq *per-computation-specials* (cons symbol *per-computation-specials*)))
+  symbol)
+
+(defmacro %with-computation-state ((serial) &body body)
+  "Bind, EMPTY, the runtime's per-computation state: the interpreter's MV and
+   NLX serial, the condition system, handler/restart stacks, printer scratch,
+   loader depth, CLOS dispatch state and CATCH/THROW's values in flight.  A
+   thread (%THR-TRAMPOLINE) and an actor (%AR-ACTOR-ENTRY, in its own window)
+   each run their whole computation inside one.  SERIAL seeds the NLX state
+   serial so no two computations mint the same one."
+  `(let ((*mvm-last-mv* nil)
+         (*nlx-state-serial* ,serial)
+         (*current-condition* nil)
+         (*catch-active* nil)
+         (*restart-stack* nil)
+         (*handler-bind-stack* nil)
+         (*handler-bind-effective-skip* 0)
+         (*restart-frame-condition-map* nil)
+         (*signal-walk-depth* 0)
+         (*restarts-being-invoked* nil)
+         (*restart-invoking-p* nil)
+         (*restart-case-result* nil)
+         (*rc-invoked-restart* nil)
+         (*format-iter-escape* nil)
+         (*write-object-budget* 0)
+         (*%circ-next* 0)
+         (*%ppx-stack* nil)
+         (*%pp-ctx* nil)
+         (*load-error-condition* nil)
+         (*%load-depth* 0)
+         (*%next-methods* nil)
+         (*%current-gf-args* nil)
+         (*%current-gf* nil)
+         (*%dmc-call-args* nil)
+         (*catch-tag* nil)
+         (*catch-value* nil)
+         (*catch-values* nil)
+         (*catch-tags* nil)
+         ;; macos-hosting's per-thread eval/JIT state, so a worker's runtime
+         ;; compile never writes main's flags (2026-09-30 reconciliation).
+         (*%escape-report-busy* nil)
+         (*jit-native-ran* nil)
+         (*jit-infra-fallback* nil)
+         (*e2-active-defun-names* nil)
+         (*e2-persist-defuns* nil)
+         (*e2-module-defuns* nil)
+         (*mvm-eval-no-cache* nil)
+         (*jit-inhibit* nil)
+         )
+     (declare (special *%escape-report-busy* *jit-native-ran* *jit-infra-fallback* *e2-active-defun-names* *e2-persist-defuns* *e2-module-defuns* *mvm-eval-no-cache* *jit-inhibit*
+                       *mvm-last-mv* *nlx-state-serial* *current-condition* *catch-active* *restart-stack* *handler-bind-stack* *handler-bind-effective-skip* *restart-frame-condition-map* *signal-walk-depth* *restarts-being-invoked* *restart-invoking-p* *restart-case-result* *rc-invoked-restart* *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods* *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tag* *catch-value* *catch-values* *catch-tags*))
+     (progv *per-computation-specials*
+         (make-list (length *per-computation-specials*))
+       ,@body)))
+
 
 ;;; ------------------------------------------------------------------ machine code
 
@@ -120,9 +196,10 @@
     (%bt-poke (+ s #x1200)
               (list #xd10203ff #xa9000be1 #xa90113e3 #xa9021be5 #xa90323e7 #xa90453f3
                     #xa9055bf5 #xa9066ff7 #xa9077bfd #xd53800a9 #x92400529 #xd2a20c8a
-                    #x8b09114a #xa940314b #x910003ed #xf900396d #xf940216e #xb40000ae
-                    #xd37ffb0f #xf90019cf #xd37ffb2f #xf9001dcf #xd5033bbf #xd280004f
-                    #xf900356f #xf9401d8d #xd51bd04d #xf940398d #x910001bf #xd2a20010
+                    #x8b09154a #xa940314b #xa941394d #x910003ef #xf900396f #xf94001af
+                    #xd37ffb10 #xf90019f0 #xb4000079 #xd37ffb30 #xf9001df0 #xd5033bbf
+                    #xd2800050 #xf9003570 #xf9401d8f #xd51bd04f #xf940398f #x910001ff
+                    #xf94001cf #xf94019f8 #xd341ff18 #xf9401df9 #xd341ff39 #xd2a20010
                     #xf281f910 #xd280006f #xf900358f #xd5033bbf #xc8dffe11 #xb4000111
                     #xd280004f #xd5033bbf #xf900358f #xd503203f #xc8dffe11 #xb5ffffd1
                     #x17fffff5 #xa9400be1 #xa94113e3 #xa9421be5 #xa94323e7 #xa94453f3
@@ -145,6 +222,8 @@
   (let ((mb (%bt-mailbox (%bt-core-id))))
     (%gc-write64 mb (%bt-rec from))
     (%gc-write64 (+ mb 8) (%bt-rec to))
+    (%gc-write64 (+ mb 16) (+ #x10000F08 (* 8 from)))   ; their ACTIVE regions: a slot
+    (%gc-write64 (+ mb 24) (+ #x10000F08 (* 8 to)))     ; in a locked section is in a slice
     (%jit-call (+ (%bt-stub) #x1200))
     0))
 
@@ -160,6 +239,10 @@
     (dotimes (k 8704) (%gc-write64 (+ w (* k 8)) 0))
     (dotimes (k 2048) (%gc-write64 (+ pc (* k 8)) 0))
     (%gc-write64 (+ w #xFFE8) pc)
+    ;; The window's self slot = its delta (%TLS-SELF-BASE), so %DYNBIND binds this
+    ;; thread's specials in its own storage, and its dynamic-binding stack.
+    (%gc-write64 (+ w #xC30) (- w #x10000000))
+    (setf (mem-ref (+ w #xC60) :u64) (+ #x10740000 (* i #x4000)))
     (setf (mem-ref (+ pc 16) :u64) i)                 ; CPU id = record index
     (%gc-write64 (+ #x10000F08 (* 8 i)) rcb)          ; its active region: the core's
     (dotimes (k 16) (%gc-write64 (+ rec (* k 8)) 0))
@@ -212,7 +295,7 @@
       (let ((tt (%bt-table)) (r0 (%gc-region-0)) (ok 1))
         (dotimes (k 512) (%gc-write64 (+ tt (* k 8)) 0))
         (dotimes (k 1024) (%gc-write64 (+ #x10090000 (* k 8)) 0))
-        (dotimes (k 8) (%gc-write64 (+ #x10640000 (* k 8)) 0))
+        (dotimes (k 16) (%gc-write64 (+ #x10640000 (* k 8)) 0))
         (setf (mem-ref #x10080010 :u64) 0)            ; core 0 is CPU 0
         (setf (mem-ref #x10000FF8 :u32) 1)            ; per-CPU region cells on
         (%gc-write64 (%bt-arena) 0)                   ; a saved core's magic: ours now
@@ -227,7 +310,8 @@
           (%gc-write64 (+ rec0 #x78) (%gc-meta-read (+ r0 #x18) 2))
           (%gc-write64 (+ rec0 #x68) 3))
         (mfence)
-        (%gc-write64 (+ tt #x50) 1)                   ; stop-the-world ARMED, last
+        (%gc-write64 (+ tt #x50) 1)                   ; stop-the-world ARMED
+        (when (zerop (%rt-threads-on)) (setq ok 0))   ; the runtime lock + arena
         (do ((c 1 (+ c 1))) ((>= c (%bt-ncores)))
           (when (zerop (%bt-core-boot c)) (setq ok 0)))
         (setf (mem-ref #x10213008 :u32) 1)
@@ -323,10 +407,11 @@
   "Every slot starts here, on its own stack, by the switch's RET."
   (let* ((i (percpu-ref 16)) (rec (%bt-rec i)))
     (%gc-write64 (+ rec #x00) 1)
-    (let* ((fn (svref *bt-funs* i))
-           (v (handler-case (funcall fn) (error () :error))))
-      (setf (svref *bt-funs* i) nil)
-      (%bt-publish-result i v))
+    (%with-computation-state ((* i 1099511627776))
+      (let* ((fn (svref *bt-funs* i))
+             (v (handler-case (funcall fn) (error () :error))))
+        (setf (svref *bt-funs* i) nil)
+        (%bt-publish-result i v)))
     (mfence)
     (setf (mem-ref (+ rec #x60) :u32) 4)
     (setf (mem-ref (+ rec #x08) :u32) 0)
@@ -381,11 +466,15 @@
 (defun %join-native-thread (i budget)
   "0 once thread I has ended (its slot is then free), 1 if BUDGET polls ran out."
   (let ((r 1) (k 0))
+    ;; Off a slot the wait is SAFE: a region-0 collection started by a thread (the
+    ;; lock arena running low) must not wait for a joiner that never allocates.
+    (unless (%bt-slot-p) (%gc-safe-enter))
     (loop
       (when (zerop (mem-ref (+ (%bt-rec i) #x08) :u32)) (setq r 0) (return nil))
       (when (>= k budget) (return nil))
       (if (%bt-slot-p) (bt-yield) nil)
       (setq k (+ k 1)))
+    (unless (%bt-slot-p) (%gc-safe-leave))
     (when (zerop r) (setf (mem-ref (+ (%bt-rec i) #x10) :u32) 1))
     r))
 
@@ -434,7 +523,9 @@
     (when (zerop (xchg-mem cell 1)) (return 1))
     (if (%bt-slot-p)
         (%bt-block cell 1 0)
-        (loop (when (zerop (mem-ref cell :u32)) (return nil))))))
+        (progn (%gc-safe-enter)
+               (loop (when (zerop (mem-ref cell :u32)) (return nil)))
+               (%gc-safe-leave)))))
 
 (defun %mutex-unlock (cell) (mfence) (xchg-mem cell 0) 0)
 
@@ -442,7 +533,9 @@
   (let ((dl (+ (%bt-ticks) (%bt-ms-ticks ms))))
     (if (%bt-slot-p)
         (%bt-block 0 0 dl)
-        (loop (when (>= (%bt-ticks) dl) (return nil)))))
+        (progn (%gc-safe-enter)
+               (loop (when (>= (%bt-ticks) dl) (return nil)))
+               (%gc-safe-leave))))
   nil)
 
 (defun %monotonic-ns () (%irt-ns))
@@ -463,8 +556,251 @@
     (%mutex-unlock mtx)
     (if (%bt-slot-p)
         (%bt-block cv seq dl)
-        (loop (when (/= (mem-ref cv :u32) seq) (return nil))
-              (when (and (> dl 0) (>= (%bt-ticks) dl)) (return nil))))
+        (progn (%gc-safe-enter)
+               (loop (when (/= (mem-ref cv :u32) seq) (return nil))
+                     (when (and (> dl 0) (>= (%bt-ticks) dl)) (return nil)))
+               (%gc-safe-leave)))
     (when (= (mem-ref cv :u32) seq) (setq r 1))
     (%mutex-lock mtx)
     r))
+;;; ------------------------------------------------------------------ the runtime lock
+;;;
+;;; THE RUNTIME LOCK AND THE LOCK ARENA -- hosted's B-LITE (net/hosted-sync.lisp, read
+;;; its block) with a spinlock: a slot that finds it held BLOCKS (%MUTEX-LOCK), the
+;;; main thread spins.  The shared tables (globals, symbols, keywords, packages,
+;;; macros) live in region 0; a locked section (%RT-ENTER .. %RT-LEAVE, which
+;;; SYMBOL-VALUE, INTERN and friends take) allocates in this CPU's SLICE of an
+;;; ARENA carved off the top of region 0's semispaces, so what it makes is region-0
+;;; address space and never in a thread's heap.  A stop-the-world collection of
+;;; region 0 evacuates the arena when the lock is free (translate-aarch64, EVACUATING
+;;; THE LOCK ARENA), and an outermost entry that finds under a quarter left starts one.
+;;; With the gate open, a slot's special bindings are its own (%DYNBIND: the window's
+;;; self slot is set by %BT-PREPARE-RECORD).
+;;;   0x10000DB8 gate  0x10000DC0 lock  DC8 owner (cpu+1)  DD0 depth  DD8 saved region
+;;;   band = 0x10086000: +0xB800 + 64*cpu slice blocks, +0xBC00 arena base, frontier,
+;;;   end, fallbacks, +0xBC20 refill cooldown.
+
+(defvar *ha-band* #x10086000)
+(defun %ha-base () #x10086000)
+(defun %rt-arena-bytes () #x400000)            ; 4 MB off each of region 0's semispaces
+
+(defun %ha-zero (start end)
+  (let ((a start))
+    (loop (when (>= a end) (return 0)) (setf (mem-ref a :u64) 0) (setq a (+ a 8)))))
+
+(defun %ha-zero-bytes (start end)
+  (let ((a start))
+    (loop (when (or (>= a end) (zerop (logand a 7))) (return 0))
+          (setf (mem-ref a :u8) 0) (setq a (+ a 1)))
+    (let ((w (logand end -8))) (when (> w a) (%ha-zero a w) (setq a w)))
+    (loop (when (>= a end) (return 0)) (setf (mem-ref a :u8) 0) (setq a (+ a 1)))))
+
+(defun %ha-bitmap-clear (lo hi)
+  (let ((pb (%gc-bitmap-page-base-exact)))
+    (when (and (> (%gc-bitmap-base) 0) (> (%gc-cons-bitmap-base) 0) (>= lo pb) (> hi lo))
+      (let ((b0 (ash (- lo pb) -7)) (b1 (ash (+ (- hi pb) 127) -7)))
+        (%ha-zero-bytes (+ (%gc-bitmap-base) b0) (+ (%gc-bitmap-base) b1))
+        (%ha-zero-bytes (+ (%gc-cons-bitmap-base) b0) (+ (%gc-cons-bitmap-base) b1))))
+    0))
+
+(defun %rt-gate-addr ()  #x10000DB8)
+(defun %rt-mutex-addr () #x10000DC0)
+(defun %rt-owner-addr () #x10000DC8)
+(defun %rt-depth-addr () #x10000DD0)
+(defun %rt-saved-addr () #x10000DD8)
+(defun %rt-slice-block (cpu) (+ (%ha-base) #xB800 (* cpu #x40)))
+(defun %rt-arena-words () (+ (%ha-base) #xBC00))
+(defun %rt-arena-base () (%gc-read64 (%rt-arena-words)))
+(defun %rt-arena-alloc () (%gc-read64 (+ (%rt-arena-words) #x08)))
+(defun %rt-arena-end () (%gc-read64 (+ (%rt-arena-words) #x10)))
+(defun %rt-arena-fallbacks () (%gc-read64 (+ (%rt-arena-words) #x18)))
+
+(defun %rt-slice-need ()
+  (let ((self (%tls-self-base)))
+    (if (zerop self)
+        #x10000
+        (let ((n (%gc-read64 (+ self #x100050A8)))) (if (> n #x10000) n #x10000)))))
+
+(defun %rt-enter-sized (bytes)
+  (let ((self (%tls-self-base)))
+    (unless (zerop self) (%gc-write64 (+ self #x100050A8) (+ bytes 64))))
+  (%rt-enter)
+  (let ((self (%tls-self-base)))
+    (unless (zerop self) (%gc-write64 (+ self #x100050A8) 0))))
+
+(defun %rt-slice-ensure (need)
+  "This CPU's slice block with NEED bytes of headroom, refilled from the arena (256 KB
+   chunks, or what NEED takes); 0 when the arena is missing or exhausted (counted)."
+  (let ((ae (%rt-arena-end)))
+    (if (zerop ae)
+        0
+        (let* ((k 2) (blk (%rt-slice-block (%thr-cpu)))
+               (alloc (%gc-meta-read (+ blk #x30) k))
+               (limit (%gc-meta-read (+ blk #x38) k)))
+          (if (>= (- limit alloc) need)
+              blk
+              (let* ((af (%rt-arena-alloc))
+                     (chunk (if (> (+ need #x10000) #x40000)
+                                (logand (+ need #x10000 #xFFFF) (- 0 #x10000))
+                                #x40000)))
+                (if (> (+ af chunk) ae)
+                    (progn (%gc-write64 (+ (%rt-arena-words) #x18) (+ (%rt-arena-fallbacks) 1))
+                           0)
+                    (progn (%gc-region-init blk af af chunk 0 k)
+                           (%gc-write64 (+ (%rt-arena-words) #x08) (+ af chunk))
+                           blk))))))))
+
+(defun %rt-reserve (bytes)
+  (if (or (= (mem-ref #x10000DB8 :u32) 0)
+          (/= (%gc-read64 (%rt-owner-addr)) (+ (%thr-cpu) 1))
+          (zerop (%rt-arena-end)))
+      0
+      (let ((blk (%rt-slice-block (%thr-cpu))))
+        (if (or (/= (%gc-region) blk)
+                (>= (- (get-alloc-limit) (get-alloc-ptr)) bytes))
+            0
+            (progn
+              (%gc-region-enter (%gc-region-0))
+              (let ((b (%rt-slice-ensure (+ bytes #x10000))))
+                (%gc-region-enter (if (zerop b) blk b)))
+              0)))))
+
+(defun %rt-own-alloc-begin ()
+  (if (or (= (mem-ref #x10000DB8 :u32) 0) (= (%thr-cpu) 0)
+          (/= (%gc-read64 (%rt-owner-addr)) (+ (%thr-cpu) 1)))
+      0
+      (let ((own (%gc-read64 (%rt-saved-addr))))
+        (if (zerop own) 0 (%gc-region-enter own)))))
+
+(defun %rt-own-alloc-end (token)
+  (if (zerop token) 0 (progn (%gc-region-enter token) 0)))
+
+(defun %gc-collect-region-0 ()
+  "Collect region 0 now from any thread (stop-the-world, evacuating the arena)."
+  (let ((k 2) (r0 (%gc-region-0)) (own (%gc-region)))
+    (if (= own r0)
+        (progn (set-alloc-limit (get-alloc-ptr)) (%gc-collect-now) 0)
+        (let ((a (get-alloc-ptr)) (l (get-alloc-limit)))
+          (%gc-meta-write (+ own #x30) a k)
+          (%gc-set-region r0)
+          (set-alloc-limit a)
+          (%gc-collect-now)
+          (%gc-set-region own)
+          (set-alloc-ptr a)
+          (set-alloc-limit l)
+          0))))
+
+(defun %rt-arena-refill-check ()
+  (let ((ae (%rt-arena-end)))
+    (when (> ae 0)
+      (let* ((base (%rt-arena-base)) (quarter (ash (- ae base) -2)))
+        (when (< (- ae (%rt-arena-alloc)) quarter)
+          (let ((cool (%gc-read64 (+ (%rt-arena-words) #x20))))
+            (if (and (> cool 0) (>= (- ae (%rt-arena-alloc)) (ash quarter -1)))
+                (%gc-write64 (+ (%rt-arena-words) #x20) (- cool 1))
+                (progn
+                  (%gc-collect-region-0)
+                  (when (< (- ae (%rt-arena-alloc)) quarter)
+                    (%gc-write64 (+ (%rt-arena-words) #x20) 256)))))))))
+  0)
+
+(defun %rt-arena-carve ()
+  "The lock arena: the top %RT-ARENA-BYTES of region 0's semispaces, once (after a
+   collection when the frontier is in the way).  1 = ready."
+  (if (> (%rt-arena-end) 0)
+      1
+      (let* ((k 2) (r0 (%gc-region-0)) (n (%rt-arena-bytes)))
+        (when (> (get-alloc-ptr)
+                 (- (+ (%gc-meta-read r0 k) (- (%gc-meta-read (+ r0 #x10) k) (+ n #x200000)))
+                    #x800000))
+          (%gc-collect-here))
+        ;; THE TOP 2 MB OF EACH SEMISPACE IS LEFT OUT: the board's *CSTR-SCRATCH* and
+        ;; *IO-BUF-ADDR* live at 0x0FE00000..0x10000000, the top of the UPPER semispace
+        ;; (inside its old 8 MB limit guard), and an arena carved there when the upper
+        ;; one is the from-space would hand the I/O staging pages out as objects.
+        (let* ((from (%gc-meta-read r0 k))
+               (size (%gc-meta-read (+ r0 #x10) k))
+               (newsize (- size (+ n #x200000)))
+               (base (+ from newsize))
+               (end (+ base n)))
+          (if (> (get-alloc-ptr) (- (+ from newsize) #x800000))
+              0
+              (progn
+                (%ha-zero base end)
+                (%ha-bitmap-clear base end)
+                (%gc-region-shrink r0 newsize k)
+                (set-alloc-limit (- (+ from newsize) #x800000))
+                (%ha-zero (%rt-slice-block 0) (+ (%rt-slice-block 0) #x400))
+                (%gc-write64 (%rt-arena-words) base)
+                (%gc-write64 (+ (%rt-arena-words) #x08) base)
+                (%gc-write64 (+ (%rt-arena-words) #x10) end)
+                (%gc-write64 (+ (%rt-arena-words) #x18) 0)
+                (%gc-write64 (+ (%rt-arena-words) #x20) 0)
+                (%gc-write64 #x10000D98 (%rt-arena-words))
+                1))))))
+
+(defun %bt-fatal (msg)
+  "MSG on the console, then stop this core: a state where going on corrupts."
+  (write-string-serial msg)
+  (loop))
+
+(defun %rt-enter-locked ()
+  (let ((me (+ (%thr-cpu) 1)))
+    (if (= (%gc-read64 (%rt-owner-addr)) me)
+        (progn (%gc-write64 (%rt-depth-addr) (+ (%gc-read64 (%rt-depth-addr)) 1)) 0)
+        (progn
+          (unless (zerop (%gc-read64 (%rt-mutex-addr)))
+            (%gc-write64 #x10000DE8 (+ (%gc-read64 #x10000DE8) 1)))
+          (%rt-arena-refill-check)
+          (%mutex-lock (%rt-mutex-addr))
+          (%gc-write64 #x10000DE0 (+ (%gc-read64 #x10000DE0) 1))
+          (%gc-write64 (%rt-owner-addr) me)
+          (%gc-write64 (%rt-depth-addr) 1)
+          (let ((blk (%rt-slice-ensure (%rt-slice-need))))
+            (when (and (zerop blk) (> (%thr-cpu) 0))
+              (%bt-fatal "
+modus: a thread needed the runtime lock but the lock arena is exhausted; stopping this core.
+"))
+            (%gc-write64 (%rt-saved-addr)
+                         (%gc-region-enter (if (zerop blk) (%gc-region-0) blk))))
+          0))))
+
+(defun %rt-leave-locked ()
+  (let ((me (+ (%thr-cpu) 1)))
+    (if (= (%gc-read64 (%rt-owner-addr)) me)
+        (let ((d (- (%gc-read64 (%rt-depth-addr)) 1)))
+          (if (> d 0)
+              (progn (%gc-write64 (%rt-depth-addr) d) 0)
+              (let ((back (%gc-read64 (%rt-saved-addr))))
+                (%gc-region-enter back)
+                (%gc-write64 (%rt-depth-addr) 0)
+                (%gc-write64 (%rt-owner-addr) 0)
+                (%mutex-unlock (%rt-mutex-addr))
+                0)))
+        0)))
+
+(defun %publish-fence ()
+  (if (= (mem-ref #x10000DB8 :u32) 0) 0 (progn (mfence) 0)))
+
+(defun %rt-threads-on ()
+  "Carve the lock arena and open the threads gate.  1, or 0 with no arena."
+  (if (= (mem-ref (%rt-gate-addr) :u32) 1)
+      1
+      (progn
+        (%gc-write64 (%rt-owner-addr) 0)
+        (%gc-write64 (%rt-depth-addr) 0)
+        (%gc-write64 (%rt-mutex-addr) 0)
+        (%gc-write64 #x10000DE0 0)
+        (%gc-write64 #x10000DE8 0)
+        (if (zerop (%rt-arena-carve))
+            0
+            (progn (mfence) (setf (mem-ref (%rt-gate-addr) :u32) 1) 1)))))
+
+(defun %rt-acquisitions () (%gc-read64 #x10000DE0))
+(defun %rt-contended () (%gc-read64 #x10000DE8))
+
+(defun %tls-self-base ()
+  "This thread's window delta, read from the self slot inside the window (0 on main)."
+  (let ((lo (mem-ref #x10000C30 :u32))
+        (hi (mem-ref #x10000C34 :u32)))
+    (if (= hi 0) lo (+ (* (* hi 65536) 65536) lo))))

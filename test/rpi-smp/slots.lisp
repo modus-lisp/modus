@@ -35,3 +35,13 @@
 (defun res-bytes (i) (let* ((rec (%bt-rec i)) (n (%gc-read64 (+ rec #x18))) (buf (%bt-result-buf i))) (list (%gc-read64 (+ rec #x28)) n (loop for k below (min n 400) collect (mem-ref (+ buf k) :u8)))))
 
 (defun main-bytes (v) (let ((out (%chan-encode v))) (list (cdr out) (loop for k below (min (cdr out) 400) collect (aref (car out) k)))))
+
+(defun churn (n) (let ((junk nil)) (dotimes (j n) (setq junk (cons j nil))) nil))
+
+(defun t-intern () (let* ((me (percpu-ref 16)) (syms (loop for k below 300 collect (intern (format nil "BT-SYM-~D-~D" me k)))) (bad 0)) (dotimes (r 20) (churn 100000) (bt-yield) (let ((k 0)) (dolist (s syms) (unless (string= (symbol-name s) (format nil "BT-SYM-~D-~D" me k)) (setq bad (+ bad 1))) (setq k (+ k 1))))) (list :me me :bad bad :gcs (my-gcs))))
+
+(defvar *sp* :global)
+
+(defun t-special () (let ((ok 0)) (dotimes (r 50) (let ((*sp* (list r (percpu-ref 16) "x"))) (churn 50000) (bt-yield) (when (and (consp *sp*) (= (car *sp*) r)) (setq ok (+ ok 1))))) (list :ok ok :after (if (eq *sp* :global) :global :leaked))))
+
+(defun intern-check (n) (let ((found 0)) (dolist (me '(4 5 6 7 8 9)) (dotimes (k n) (when (find-symbol (format nil "BT-SYM-~D-~D" me k)) (setq found (+ found 1))))) found))

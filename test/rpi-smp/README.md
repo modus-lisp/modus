@@ -82,7 +82,29 @@ Also found: the in-image JIT never got the per-thread window (its gate read a va
 after the text was built), so runtime-JIT'd code on a thread wrote MAIN's window -- main's REPL
 died with READ-ERROR after the first thread that ran the channel encoder.
 
-NOT YET: a thread storing its objects into region-0 structures (fresh INTERN, SETQ of a global,
-special bindings, SETQ of a closed-over variable) -- needs the runtime lock + lock arena; threads
+THE RUNTIME LOCK (phase 5): hosted's B-LITE with a spinlock that BLOCKS a slot.  %BT-INIT opens
+the threads gate (0x10000DB8) after carving a 4 MB lock arena off region 0's semispaces (leaving
+their top 2 MB alone: the I/O staging pages are at 0x0FE00000); a locked section (SYMBOL-VALUE,
+INTERN, ...) allocates in its CPU's slice of the arena, and a stop-the-world collection of region 0
+evacuates it.  With the gate open a slot's special bindings are its own (%DYNBIND: the window's
+self slot + a per-record dynamic-binding stack at 0x10740000), and each slot runs inside
+%WITH-COMPUTATION-STATE.  The switch now parks/loads the allocation registers in each slot's
+ACTIVE region (a slot switched out inside a locked section is in its slice).  The main thread's
+waits (join, mutex spin, sleep, condition wait) are SAFE regions: a thread's region-0 collection
+(arena refill) waited forever for a joiner that never allocates -- the first version hung so.
+
+    (join-all (spawn-n 6 #'t-intern))   6 threads x 300 fresh INTERNs + FORMAT, 10-13 own-heap
+                                        GCs each: 0 bad names; main finds all 1800; 2780 lock
+                                        entries (980 contended), 0 arena fallbacks, region 0
+                                        collected 17 times under them (arena refills)
+    (join-all (spawn-n 6 #'t-special))  (let ((*sp* ...)) ...) per thread across 50 collections:
+                                        50/50 each, and main's *SP* is still :GLOBAL
+    NEGATIVE CONTROL, same image: close the gate after %BT-INIT -> the intern run dies
+                                        TYPE-ERROR (datum 108, expected LIST) on main and the
+                                        REPL is gone (READ-ERROR): the shared tables were
+                                        pointing into the threads' heaps
+
+NOT YET: a thread SETQ-ing a global it has not bound, or a variable main closed over (the shared-
+store guard is inert here: its window words are 0 and its trap would fault on bare metal); threads
 started from threads; preemption (a slot that never blocks keeps its core); the sb-thread shim
 mapping; and the board run (core 1 did not start on one board boot; it does under QEMU).

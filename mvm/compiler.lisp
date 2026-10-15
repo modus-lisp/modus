@@ -20567,6 +20567,74 @@
                (emit-ir :neg temp temp)
                (emit-ir :and dest dest temp)))
          (free-temp-reg))))
+    ;; VARIABLE COUNT, x64 runtime compile: an inline fixnum fast path with
+    ;; the register shifts, BIGNUM-ASH only for what it is for.  Every
+    ;; variable-count ASH used to be that call, whose fixnum arms shift 8 bits
+    ;; per loop step.  Left: count < 62 and the shift reverses exactly (else
+    ;; the value may need a bignum).  Right: count clamped to 63 (the sign
+    ;; fill; x86 masks counts to 6 bits), then the tag bit cleared.  SHLV /
+    ;; SARV take the TAGGED count (translate-x64 untags it).
+    ((and (null count) *mvm-eval-runtime-p*
+          (not (and (boundp (quote *jit-target-arch*))
+                    (eq (symbol-value (quote *jit-target-arch*)) :aarch64)))
+          (%cg-on-p (quote *cg-typed-ash*)))
+     (compile-form value-form env dest)
+     (let ((ct (alloc-temp-reg)))
+       (if (%leaf-operand-p count-form env)
+           (compile-form count-form env ct)
+           (progn (emit-ir :push dest) (compile-form count-form env ct) (emit-ir :pop dest)))
+       (let ((fx (alloc-temp-reg))
+             (k (alloc-temp-reg))
+             (slow (make-compiler-label))
+             (right (make-compiler-label))
+             (done (make-compiler-label))
+             (clamped (make-compiler-label)))
+         ;; both fixnums?  (dest | ct) has the tag bit clear
+         (emit-ir :or fx dest ct)
+         (emit-ir :li k 1)
+         (emit-ir :test fx k)
+         (emit-ir :bne slow)
+         (emit-ir :li k 0)
+         (emit-ir :cmp ct k)
+         (emit-ir :blt right)
+         ;; LEFT: count < 62, then shift and verify by shifting back
+         (emit-li-tagged k 62)
+         (emit-ir :cmp ct k)
+         (emit-ir :bge slow)
+         (emit-ir :mov fx dest)
+         (emit-ir :shl-var dest dest ct)
+         (emit-ir :mov k dest)
+         (emit-ir :sar-var k k ct)
+         (emit-ir :cmp k fx)
+         (emit-ir :beq done)
+         (emit-ir :mov dest fx)
+         (emit-ir :br slow)
+         ;; RIGHT: k = min(-count, 63), as a tagged count
+         (emit-ir-label right)
+         (emit-ir :mov k ct)
+         (emit-ir :neg k k)
+         (emit-li-tagged fx 63)
+         (emit-ir :cmp k fx)
+         (emit-ir :ble clamped)
+         (emit-ir :mov k fx)
+         (emit-ir-label clamped)
+         (emit-ir :sar-var dest dest k)
+         (emit-ir :li k 2)
+         (emit-ir :neg k k)
+         (emit-ir :and dest dest k)
+         (emit-ir :br done)
+         ;; SLOW: BIGNUM-ASH(value, count)
+         (emit-ir-label slow)
+         (emit-ir :push ct)
+         (emit-ir :mov +vreg-v0+ dest)
+         (emit-ir :pop +vreg-v1+)
+         (emit-ir :set-nargs 2)
+         (emit-ir :call "BIGNUM-ASH" 2)
+         (emit-ir :mov dest +vreg-vr+)
+         (emit-ir-label done)
+         (free-temp-reg)
+         (free-temp-reg))
+       (free-temp-reg)))
     ;; TYPED operand (provable width W) at a runtime compile: a right shift
     ;; can neither see a bignum nor overflow, and a left shift with W+count
     ;; ≤ 62 cannot overflow — emit the bare shift.  reel's `(ash sum -7)`

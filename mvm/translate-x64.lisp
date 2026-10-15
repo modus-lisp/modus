@@ -3470,50 +3470,33 @@
            (emit-sar-reg-imm buf d (min count 63))
            (maybe-store-scratch buf vd)))
 
-        ((op= +op-shlv+)
-         ;; (shlv Vd Vs Vc) — shift left by register count
-         ;; x86-64 variable shifts require count in CL (RCX)
+        ;; SHLV / SARV Vd, Vs, Vc -- shift by a register count.  The count
+        ;; register holds a TAGGED fixnum and is untagged here, as aarch64 and
+        ;; the interpreter do (compile-ash relies on it).  Computed in RAX with
+        ;; RAX and RCX saved, so every register assignment is right: the old
+        ;; lowering loaded Vs into Vd and then the count into RCX, which lost
+        ;; the value whenever Vd was RCX.
+        ((or (op= +op-shlv+) (op= +op-sarv+))
          (let* ((vd (first operands))
                 (vs (second operands))
                 (vc (third operands))
-                (d (dest-phys-or-scratch vd))
-                (pc (vreg-phys vc))
-                (need-save (and (not (eq pc 'rcx))
-                                (not (eq d 'rcx)))))
-           ;; Load source into dest reg
-           (emit-load-vreg buf vs d)
-           ;; Get shift count into RCX
-           (cond
-             ((eq pc 'rcx))  ; already in RCX
-             (t
-              (when need-save (emit-push buf 'rcx))
-              (emit-load-vreg buf vc 'rcx)))
-           ;; Shift
-           (emit-shl-reg-cl buf d)
-           ;; Restore RCX if saved
-           (when (and need-save (not (eq pc 'rcx)))
-             (emit-pop buf 'rcx))
-           (maybe-store-scratch buf vd)))
-
-        ((op= +op-sarv+)
-         ;; (sarv Vd Vs Vc) — arithmetic shift right by register count
-         (let* ((vd (first operands))
-                (vs (second operands))
-                (vc (third operands))
-                (d (dest-phys-or-scratch vd))
-                (pc (vreg-phys vc))
-                (need-save (and (not (eq pc 'rcx))
-                                (not (eq d 'rcx)))))
-           (emit-load-vreg buf vs d)
-           (cond
-             ((eq pc 'rcx))
-             (t
-              (when need-save (emit-push buf 'rcx))
-              (emit-load-vreg buf vc 'rcx)))
-           (emit-sar-reg-cl buf d)
-           (when (and need-save (not (eq pc 'rcx)))
-             (emit-pop buf 'rcx))
-           (maybe-store-scratch buf vd)))
+                (pd (vreg-phys vd)))
+           (emit-push buf 'rax)
+           (emit-push buf 'rcx)
+           (emit-load-vreg buf vc 'rcx)          ; RAX and RCX still hold their own values
+           (if (eq (vreg-phys vs) 'rcx)
+               (emit-mov-reg-mem buf 'rax 'rsp 0)  ; Vs = RCX: its value is the saved word
+               (emit-load-vreg buf vs 'rax))
+           (emit-sar-reg-imm buf 'rcx 1)
+           (if (op= +op-shlv+)
+               (emit-shl-reg-cl buf 'rax)
+               (emit-sar-reg-cl buf 'rax))
+           (emit-pop buf 'rcx)
+           (if (eq pd 'rax)
+               (emit-lea buf 'rsp 'rsp 8)          ; drop the saved RAX
+               (progn
+                 (emit-store-vreg buf vd 'rax)
+                 (emit-pop buf 'rax)))))
 
         ((op= +op-ldb+)
          ;; (ldb Vd Vs pos:imm8 size:imm8) — bit field extract

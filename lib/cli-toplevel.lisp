@@ -185,7 +185,7 @@
    aborts the load at the first error and exits nonzero; before this, a broken
    file loaded 'successfully' and `--script' always exited 0, so a failing load
    was indistinguishable from a working one except by reading the diagnostic
-   line.  Opt into the abort (see *LOAD-ABORT-ON-ERROR* in mvm/ansi-bridge.lisp)
+   line.  Opt into the abort (see *LOAD-ABORT-ON-ERROR* in mvm/cl-eval.lisp)
    and re-signal, so the caller's handler-case does the SBCL thing: report and
    exit 1 non-interactively.  The specific condition has already been printed
    loudly by %report-escaping-condition at the point it escaped."

@@ -551,6 +551,24 @@
               (setq res (cdr e)))))))
     res))
 
+(defun %macro-pkg-foreign-p (sym key)
+  "True when the bare-name entry for KEY can only be ANOTHER package's macro:
+   KEY has per-package expanders, and none for SYM's home package.  Every
+   lookup falls back to the bare entry SET-MACRO-FUNCTION also writes, so
+   without this a function in one package was expanded as the same-named macro
+   of another: bordeaux-threads v1's keyword constructor %MAKE-CONDITION-VARIABLE
+   rewrote v2's BOA one, and every BT2 condition variable was a v1 struct.
+   LOCKED, like %MACRO-PKG-GET."
+  (%rt-enter)
+  (let ((r (and *macro-pkg-table* (stringp key)
+                (let ((pn (%macro-sym-pkg-name sym))
+                      (al (gethash key *macro-pkg-table*)))
+                  (and pn al
+                       (not (dolist (e al nil)
+                              (when (string= (car e) pn) (return t)))))))))
+    (%rt-leave)
+    r))
+
 (defun %macro-pkg-put (sym key fn)
   "Register FN as the expander for SYM's own package under name KEY.  LOCKED."
   (%rt-enter)
@@ -782,6 +800,8 @@
       ((null key) nil)
       ;; SYM's own-package expander wins over the legacy bare-name entry.
       ((%macro-pkg-get sym key))
+      ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
+      ((%macro-pkg-foreign-p sym key) nil)
       ((and *macro-function-table* (gethash key *macro-function-table*)))
       ((%macro-table-visible-expander key))
       ((and (stringp key) (%compiler-macro-p key)) t)
@@ -814,6 +834,8 @@
              ((null key) nil)
              ;; SYM's own-package expander wins over the legacy bare entry.
              ((%macro-pkg-get sym key))
+             ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
+             ((%macro-pkg-foreign-p sym key) nil)
              ((and *macro-function-table* (gethash key *macro-function-table*)))
              ;; Compiler inlining macros over standard CL FUNCTIONS are
              ;; filtered here — see %MACRO-TABLE-VISIBLE-EXPANDER.
@@ -873,6 +895,7 @@
    so a 3-arg call here has the FN in `fn` parameter slot but really
    that's the user's ENV, with the real new-value living in (first env).
    Detect that shape and re-route."
+  (%fasl-taint "set-macro-function")
   (cond
     ;; 3-arg setf shape: (set-macro-function sym env new-value).
     ;; Here `fn` is actually the env argument and `(car env)` is the new value.
@@ -1021,12 +1044,13 @@
   "mvm-eval DEFTYPE expansion target (compiler.lisp, *mvm-eval-runtime-p* gated).
    Registers the expander in *%runtime-deftype-table* — the SAME registry
    the tree-walker's DEFTYPE handler (below, in %eval-in-env) writes and
-   ansi-bridge.lisp's %deftype-lookup / %expand-deftype (typep/subtypep)
+   cl-types.lisp's %deftype-lookup / %expand-deftype (typep/subtypep)
    consult.  Returns TNAME per CLHS.
 
    DUAL WRITE: the per-package side entry for exact resolution, plus the
    historic bare entry so every lookup that cannot name a package (native
    MVM syms, string heads) keeps resolving exactly as before."
+  (%fasl-taint "%runtime-register-deftype")
   (let ((name-str (%eval-sym-name tname))
         (entry (cons params body)))
     (when name-str
@@ -1090,6 +1114,7 @@
    *compiler-macro-function-table* — the SAME registry the tree-walker's
    DEFINE-COMPILER-MACRO handler writes and COMPILER-MACRO-FUNCTION
    consults.  Returns MNAME per CLHS.  Dual write, as %RUNTIME-REGISTER-DEFTYPE."
+  (%fasl-taint "%runtime-register-compiler-macro")
   (let ((expander (list '%interp-closure params body nil))
         (key (%macro-sym-key mname)))
     (when key
@@ -1626,13 +1651,12 @@
   "THE single implementation of CLHS COMPILE.  Returns
    (values function warnings-p failure-p).
 
-   It lives in a named helper, not directly in `compile', because
-   ansi-bridge.lisp assembles AFTER this file and also defines `compile' —
-   under last-defun-wins that shadow is what images actually call.  It used
-   to REPLICATE this logic, and the two copies drifting apart has already
-   broken the corpus once (see the comment at that defun).  Both `compile'
-   defuns are now one-line forwarders to this function, so there is exactly
-   one behaviour no matter which one wins.
+   It lives in a named helper, not directly in `compile': there used to be
+   two `compile' defuns (one here, one in the old mvm/ansi-bridge.lisp, which
+   assembled after this file and so won), the winning one REPLICATED this
+   logic, and the two copies drifting apart broke the corpus once (see the
+   comment at `compile' below).  `compile' is a one-line forwarder to this
+   function, so the logic has exactly one home.
 
    (compile nil '(lambda …)) now genuinely COMPILES.  It used to build an
    (%INTERP-CLOSURE …) marker cons, which is NOT a function — `functionp'
@@ -1687,42 +1711,13 @@
          (ignore-errors (funcall (symbol-function '%jit-eager-all))))
        (values name nil nil)))))
 
-(defun compile (name &rest args)
-  "CLHS COMPILE — see %compile-impl for the implementation and rationale."
-  (%compile-impl name args))
+
 
 ;;; ============================================================
 ;;; Load: read + eval from file
 ;;; ============================================================
 
-(defun load (filespec &rest args)
-  "Read and evaluate all forms from FILESPEC."
-  (let ((verbose nil)
-        (print nil)
-        (cur args))
-    (loop
-      (when (null cur) (return nil))
-      (let ((k (car cur)) (v (cadr cur)))
-        (cond
-          ((eq k :verbose) (setq verbose v))
-          ((eq k :print) (setq print v))))
-      (setq cur (cddr cur)))
-    (let ((stream (open filespec :direction :input :if-does-not-exist nil)))
-      (if (null stream)
-          nil
-          (let ((eof-marker (list 'eof)))
-            (unwind-protect
-              (let ((result t))
-                (loop
-                  (let ((form (read stream nil eof-marker)))
-                    (when (eq form eof-marker) (return result))
-                    (let ((val (eval form)))
-                      (when print
-                        (write val)
-                        (write-char #\Newline))
-                      (setq result val))))
-                result)
-              (close stream)))))))
+
 
 ;;; ============================================================
 ;;; Initialize symbol-function table at startup
@@ -1739,7 +1734,7 @@
    ONLY includes functions that have actual defun definitions (verified).
    Excludes: inline ops (car, cdr, +, -, =, aref, make-array, etc.),
    macros (first, second, caddr, etc.), and undefined stubs."
-  ;; List operations (all have defun in prelude.lisp or ansi-bridge.lisp)
+  ;; List operations (all have defun in prelude.lisp or cl-sequences.lisp)
   ;; Inline ops EQ and EQL also live as wrapper fns (%EQ-FN / %EQL-FN)
   ;; in prelude.  We register them under the bare name so that
   ;; (symbol-function 'eq) and #'EQ resolve to the same address — needed
@@ -2604,56 +2599,10 @@
   (if (characterp c) (char-code c) (progn (%signal-type-error) 0)))
 (defun code-char (n) (if (characterp n) n (code-char n)))
 
-;;; Numeric
-(defun abs (n)
-  "Absolute value.  For real n: n if n>=0, else -n.  For complex
-   z = a+bi: sqrt(a*a+b*b)."
-  (cond
-    ((complexp n)
-     (let ((r (realpart n)) (i (imagpart n)))
-       (sqrt (+ (* r r) (* i i)))))
-    ((< n 0) (- 0 n))
-    (t n)))
+
 (defun max (a &rest more) (let ((r a)) (dolist (x more r) (when (> x r) (setq r x)))))
 (defun min (a &rest more) (let ((r a)) (dolist (x more r) (when (< x r) (setq r x)))))
-;; CL floor: q toward -∞, r = n - q·d (sign of r matches sign of d when r≠0).
-;; truncate gives q toward 0, so when sign(r_t) ≠ sign(d) we adjust.
-(defun floor (n &optional (d 1))
-  (let* ((q (truncate n d))
-         (r (- n (* q d))))
-    (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
-        (values (- q 1) (+ r d))
-        (values q r))))
-;; CL ceiling: q toward +∞, sign(r) opposite of sign(d) when r≠0.
-(defun ceiling (n &optional (d 1))
-  (let* ((q (truncate n d))
-         (r (- n (* q d))))
-    (if (and (not (zerop r)) (eq (< r 0) (< d 0)))
-        (values (+ q 1) (- r d))
-        (values q r))))
-;; CL round: nearest integer, ties to even.  Compute floor first; r_f is in
-;; [0, |d|) (with d's sign).  Compare 2·|r_f| with |d| to pick floor or ceil.
-(defun round (n &optional (d 1))
-  (let* ((q (truncate n d))
-         (r (- n (* q d)))
-         ;; Adjust to floor result (q_f, r_f).
-         (q-f (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
-                  (- q 1) q))
-         (r-f (if (and (not (zerop r)) (not (eq (< r 0) (< d 0))))
-                  (+ r d) r))
-         ;; q_c = q_f + 1, r_c = r_f - d.
-         (q-c (+ q-f 1))
-         (r-c (- r-f d))
-         (a-f (abs r-f))
-         (a-c (abs r-c)))
-    (cond
-      ((< a-f a-c) (values q-f r-f))
-      ((> a-f a-c) (values q-c r-c))
-      ;; Tie — round to even.
-      ((zerop (rem q-f 2)) (values q-f r-f))
-      (t (values q-c r-c)))))
-(defun rem (n d) (- n (* (truncate n d) d)))
-(defun mod (n d) (let ((r (rem n d))) (if (and (not (zerop r)) (not (eq (< r 0) (< d 0)))) (+ r d) r)))
+
 (defun %float-non-finite-p (f)
   "True iff F is an IEEE float whose exponent is all-ones (±inf or NaN).
    Used by expt to detect IEEE-double overflow without trapping MXCSR."
@@ -2749,9 +2698,7 @@
      (if (integerp power)
          (let ((r 1)) (dotimes (i power r) (setq r (* r base))))
          (exp (* power (log base)))))))
-(defun isqrt (n) (if (<= n 0) 0 (let ((x (ash 1 (ash (+ (integer-length n) 1) -1))))
-  (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
-  (when (>= x1 x) (return x)) (setq x x1))))))
+
 (defun gcd (&rest args)
   ;; CLHS: (gcd) -> 0, (gcd n) -> |n|, (gcd a b ...) -> fold pairwise.
   (cond
@@ -2789,7 +2736,7 @@
     ((floatp-impl x) t)
     ((ratiop x) t)
     (t nil)))
-(defun rationalp (x) (integerp x))
+
 ;; complexp lives in cl-sequences.lisp with the proper %complex-p check.
 ;; The stub here always returned NIL and shadowed the real impl via
 ;; last-defun-wins (cl-eval loads after cl-sequences).
@@ -2812,7 +2759,7 @@
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))
     (if (null list) nil (car list))))
-(defun nreconc (list tail) (nconc (nreverse list) tail))
+
 (defun set-elt (seq idx val)
   "Set element at IDX in SEQ to VAL.  Signals error if IDX is out of
    range or negative (matching CLHS — elt.lsp 17064/17084/17085 etc.
@@ -2831,13 +2778,8 @@
          (error "elt: index out of range"))
        (aset seq idx val))))
   val)
-(defun set-fill-pointer (vec n)
-  (when (consp vec) (set-car vec n))
-  n)
+
 (defun random-fixnum () (random most-positive-fixnum))
-(defun subtypep* (t1 t2)
-  (multiple-value-bind (sub good) (subtypep t1 t2)
-    (values (if sub t nil) (if good t nil))))
 
 ;;; Bignum (2-slot object, subtag #x30).  Two flavours share the subtag:
 ;;;
@@ -3684,14 +3626,7 @@
        (if (> hi 0) (+ +limb-bits+ (%fixnum-integer-length hi))
            (%fixnum-integer-length (bignum-lo n)))))))
 
-(defun integer-length (n)
-  (cond
-    ((not (bignump n)) (%fixnum-integer-length n))
-    ;; CLHS: a negative N's length is that of (lognot N) = |N| - 1, for every
-    ;; bignum size.  Big bignums used the bare magnitude ("conservative"),
-    ;; one too many for exactly -2^k.
-    ((< n 0) (%bignum-integer-length-pos (bignum-1- (bignum-negate n))))
-    (t (%bignum-integer-length-pos n))))
+
 
 (defun bignum-eql (a b)
   "EQL that handles bignums (small or big)."
@@ -3843,14 +3778,12 @@
 ;; Funcallable versions of compiler builtins (needed for #'consp etc.)
 (defun consp (x) (consp x))
 (defun atom (x) (atom x))
-(defun null (x) (null x))
 ;; NUMBERP intentionally NOT redefined here.  The early version at
 ;; L2358 — `(or (integerp x) (floatp-impl x))` — is the correct one;
 ;; an "(integerp x)" reduction lived here for ages and silently won
 ;; (last-defun-wins, no compile-numberp inline), making (numberp 1.5)
 ;; return NIL.  See `NOTE: redefining` audit 2026-06-01.
-(defun symbolp (x) (symbolp x))
-(defun integerp (x) (integerp x))
+
 (defun characterp (x) (characterp x))
 
 ;; CHARACTER per CLHS: designator → character.
@@ -3868,7 +3801,7 @@
      (aref (symbol-name x) 0))
     (t (error "CHARACTER: ~S is not a character designator" x))))
 (defun stringp (x) (stringp x))
-(defun zerop (x) (zerop x))
+
 (defun plusp (x) (> x 0))
 (defun minusp (x) (< x 0))
 (defun map (result-type fn &rest seqs)
@@ -4028,7 +3961,7 @@
     ;; glass's FB-RECT (a FILL per row) 13 ms.  The only array that is a
     ;; generic function is the GF object itself; dispatch closures are not
     ;; arrays.
-    ((arrayp x) (if (%gf-p x) t nil))
+    ((%raw-arrayp x) (if (%gf-p x) t nil))
     ((%generic-function-p x) t)
     ;; A BIGNUM is a tagged object (tag 9), so it slips past the tagged-fn
     ;; (nibble 3) and code-range checks and used to hit the `(t t)' fallback →
@@ -4040,16 +3973,9 @@
     ((bignump x) nil)
     ((and (integerp x) (< x #x100000)) nil)
     (t t)))
-(defun keywordp (x)
-  "True if X is a keyword (symbol starting with :)."
-  ;; In MVM, keywords are symbols whose name-hash matches the : prefix pattern
-  ;; Stub: check if it's one of the common keywords used in tests
-  (member x '(:test :key :test-not :count :start :end :from-end
-              :initial-element :initial-contents :element-type
-              :allow-other-keys)))
-(defun symbol-package (x) nil)  ; stub
-; compile defined in Layer 8 above
-(defun simple-vector-p (x) (vectorp x))
+
+  ; stub
+
 
 ;; Module system stubs
 (defvar *modules* nil)
@@ -4140,13 +4066,6 @@
               (setq cur (cdr cur))
               (setq i (+ i 1)))))))))
 
-;; Adjustable arrays
-(defun adjustable-array-p (array)
-  "Return true if array is adjustable. Our arrays are not adjustable by default."
-  nil)
-(defun array-displacement (array)
-  "Return displacement info for ARRAY. Our arrays are never displaced."
-  (values nil 0))
 
 ;;; ============================================================
 ;;; SETF runtime — get-setf-expansion as a real function, plus the
@@ -4548,3 +4467,604 @@
           (setq i (+ i 1))))
       (error 'type-error :datum struct :expected-type 'structure-object)))
 
+
+;;; ============================================================
+;;; PROCLAIM / DECLAIM — stub that respects arity
+;;; ============================================================
+(defun proclaim (&rest args)
+  "PROCLAIM accepts exactly one declaration spec — a proper list whose
+   first element identifies the declaration kind.  Modus doesn't act
+   on most declarations but per CLHS the call must:
+   - Signal program-error on wrong arity.
+   - Reject malformed (non-proper-list) declaration specs.
+   - Signal type-error for (ftype . foo).
+   The cdr walk distinguishes a proper list from a dotted one; a final
+   non-NIL atom triggers error.  Per-kind validation for type / ftype
+   / inline / notinline / optimize / declaration uses the same walk."
+  (when (null args)
+    (%signal-program-error))
+  (when (cdr args)
+    (%signal-program-error))
+  (let* ((decl (car args))
+         (kind (and (consp decl) (car decl)))
+         (cur  decl))
+    ;; Walk the spine to confirm proper-listness.  A dotted tail is
+    ;; never legal in a declaration spec — bare `(KIND . foo)' and
+    ;; deeper dots like `(type integer . foo)' both fail here.
+    ;; (ftype . foo) specifically requires type-error per CLHS.
+    (loop
+      (cond
+        ((null cur) (return nil))
+        ((not (consp cur))
+         (when (eq kind 'ftype) (%signal-type-error))
+         (error "proclaim: malformed declaration spec ~S" decl))
+        (t (setq cur (cdr cur)))))
+    ;; The spec is well-formed: INLINE / NOTINLINE are acted on (the runtime
+    ;; compiler expands calls to a declaimed-inline DEFUN in place; see
+    ;; %inline-expansion in compiler.lisp).  Other kinds stay no-ops.
+    (%declaim-note-inline (list 'declaim decl))
+    (%declaim-note-type (list 'declaim decl))
+    ;; SPECIAL: every later LET/LET* of these names must bind DYNAMICALLY
+    ;; (CLHS 3.3.4).  Record them in the same runtime registry DEFVAR feeds,
+    ;; which the LET dispatch consults.  It used to be a no-op, so after
+    ;; (declaim (special *x*)) a (let ((*x* 1)) ...) bound *x* lexically and
+    ;; every function reading *x* saw the global value instead.
+    (when (and (consp decl) (symbolp (car decl))
+               ;; by name via %MLL-NAME-EQ: SYMBOL-NAME answers "" for some
+               ;; native symbols in-image
+               (%mll-name-eq (car decl) "SPECIAL"))
+      (dolist (v (cdr decl))
+        (when (symbolp v) (%proclaim-special-name v))))
+    nil))
+
+(defun declaim (&rest decls)
+  "DECLAIM-like wrapper that accepts any declaration list."
+  (declare (ignore decls))
+  nil)
+
+;;; compile — the only definition.  It MUST stay a pure forwarder.
+;;;
+;;; History, so nobody re-inlines a body here a third time: this started as
+;;; the stub `(defun compile (name &rest args) name)', which silently
+;;; shadowed the real one and broke every
+;;; `(funcall (compile nil '(lambda ...)) ...)' — all 460 tests in misc.lsp
+;;; crashed because compile returned NIL.  The repair REPLICATED cl-eval's
+;;; body here, which merely converted the failure mode from "shadowed" to
+;;; "two copies that drift": #297 fixed COMPILE in cl-eval.lisp and nothing
+;;; changed, because THIS copy is what images actually call.
+;;;
+;;; There is now exactly one implementation (%compile-impl, in cl-eval.lisp)
+;;; and both `compile' defuns forward to it.  Do not add logic here.
+(defun compile (name &rest args)
+  "CLHS COMPILE — forwards to the single implementation in cl-eval.lisp."
+  (%compile-impl name args))
+
+;;; ============================================================
+;;; trace/untrace stubs
+;;; ============================================================
+(defun trace (&rest fns) nil)
+
+(defun untrace (&rest fns) nil)
+
+;;; ============================================================
+;;; documentation / set-documentation stubs
+;;; ============================================================
+
+;;; DOCUMENTATION — registry-keyed lookup.  CL associates doc strings
+;;; with (name . doc-type) pairs.  We store them in a single alist
+;;; *documentation-strings* with entries of shape ((name . type) . doc).
+;;; Always returns NIL for never-set entries; (setf documentation) puts.
+(defvar *documentation-strings* nil)
+
+(defun %doc-type-normalize (doc-type)
+  "CLHS: for function objects, doc-types T and FUNCTION address the same
+   documentation — (setf (documentation fn 'function) s) must be visible
+   to (documentation fn t) (defgeneric.2).  Normalize FUNCTION → T so
+   both use one storage key."
+  (if (and doc-type (symbolp doc-type)
+           (string= (symbol-name doc-type) "FUNCTION"))
+      t
+      doc-type))
+
+(defun %doc-key-eq (x k)
+  "Documentation-registry key identity.  Function-ish objects (compiled
+   fns, closures, interp-closure conses) compare by EQ — EQUAL on two
+   structurally-identical interp-closures from DIFFERENT (eval (defun
+   ...)) calls wrongly unified their doc entries
+   (documentation.function.function.1).  Names (symbols, (setf foo)
+   lists) keep structural EQUAL."
+  (if (or (functionp x)
+          (and (consp x) (eq (car x) '%interp-closure)))
+      (eq x k)
+      (equal x k)))
+
+(defun documentation (x doc-type)
+  "Look up doc string for X under DOC-TYPE, or NIL."
+  (setq doc-type (%doc-type-normalize doc-type))
+  (let ((key (cons x doc-type))
+        (cur *documentation-strings*)
+        (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (when (and (consp (car cur)) (consp (car (car cur)))
+                 (let ((k (car (car cur))))
+                   (and (%doc-key-eq x (car k)) (eq (cdr k) doc-type))))
+        (setq found (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun set-documentation (x doc-type string)
+  "Install STRING as the doc for (X . DOC-TYPE) in
+   *documentation-strings*, replacing any prior entry."
+  (setq doc-type (%doc-type-normalize doc-type))
+  (let ((key (cons x doc-type))
+        (cur *documentation-strings*)
+        (acc nil)
+        (replaced nil))
+    (loop
+      (when (null cur) (return nil))
+      (let ((entry (car cur)))
+        (let ((k (car entry)))
+          (cond
+            ((and (consp k) (%doc-key-eq x (car k)) (eq (cdr k) doc-type))
+             (setq acc (cons (cons key string) acc))
+             (setq replaced t))
+            (t (setq acc (cons entry acc))))))
+      (setq cur (cdr cur)))
+    (unless replaced (setq acc (cons (cons key string) acc)))
+    (setq *documentation-strings* acc))
+  string)
+
+;;; ============================================================
+;;; set-apply — receiver for (setf (apply #'aref arr subs...) v)
+;;; ============================================================
+(defun set-apply (fn &rest stuff)
+  "CLHS 5.1.2.5: (setf (apply #'aref array subscripts) new-value).
+   The compiler's generic-setf expansion for an unknown place head
+   compiles (setf (apply F a1 .. an tail) V) into
+   (SET-APPLY F a1 .. an tail V).  Only the #'AREF shape with a single
+   subscript (1-D arrays) is supported — the only shape the ANSI suite
+   exercises (defgeneric.33).  Returns NEW-VALUE per SETF semantics."
+  (declare (ignore fn))
+  (let ((value (car (last stuff)))
+        (apply-args (butlast stuff)))
+    (let ((spread (butlast apply-args))
+          (tail (car (last apply-args))))
+      (let ((all (append spread tail)))
+        (let ((arr (car all))
+              (subs (cdr all)))
+          (when (and arr subs (null (cdr subs)))
+            ;; Variable-index ASET as non-last form needs the let-dummy
+            ;; workaround (CLAUDE.md MVM limitation #2).
+            (let ((dummy (aset arr (car subs) value)))
+              dummy))
+          value)))))
+
+(defun %cl-constant-variable-name-p (name)
+  "T if NAME (a string) names one of CL's standard constant variables
+   (CLHS Figure 3-2 + the BOOLE-* set).  Used by the constantp override
+   below so (constantp 'boole-and) → T per CLHS (these symbols name
+   defconstants, but Modus declares them with defvar and has no
+   defconstant registry that constantp can consult)."
+  (or (string= name "BOOLE-1") (string= name "BOOLE-2")
+      (string= name "BOOLE-AND") (string= name "BOOLE-ANDC1")
+      (string= name "BOOLE-ANDC2") (string= name "BOOLE-C1")
+      (string= name "BOOLE-C2") (string= name "BOOLE-CLR")
+      (string= name "BOOLE-EQV") (string= name "BOOLE-IOR")
+      (string= name "BOOLE-NAND") (string= name "BOOLE-NOR")
+      (string= name "BOOLE-ORC1") (string= name "BOOLE-ORC2")
+      (string= name "BOOLE-SET") (string= name "BOOLE-XOR")
+      (string= name "PI")))
+
+(defun constantp (form &rest env)
+  "True if FORM is a constant per CLHS.  Extends the cl-packages.lisp
+   version (this defun wins via last-defun load order) to also recognise
+   the symbols that name CL's standard constant variables — without this,
+   (constantp 'boole-and) returned NIL because Modus tracks defconstant
+   only as plain defvars.  CONSTANTP is (form &optional environment); a
+   third positional arg is a program-error (constantp.error.2)."
+  ;; Arity: at most one optional ENVIRONMENT arg.
+  (when (and env (cdr env))
+    (%signal-program-error))
+  (cond
+    ((null form) t)              ; NIL
+    ((eq form t) t)              ; T
+    ((numberp form) t)
+    ((characterp form) t)
+    ((stringp form) t)
+    ((keywordp form) t)          ; native keyword (subtag #x53)
+    ((symbolp form)
+     (if (%cl-sym-p form)
+         (or (keywordp form)
+             (%cl-constant-variable-name-p (symbol-name form))
+             ;; symbols named by a runtime DEFCONSTANT (define-constant.1/.2)
+             (%constant-var-p form))
+         ;; Native MVM symbol: match by name too.
+         (or (%cl-constant-variable-name-p (symbol-name form))
+             (%constant-var-p form))))
+    ((and (consp form) (eq (car form) 'quote)) t)
+    (t nil)))
+
+;; SBIT / SET-BIT / SET-SBIT: canonical (any-rank) definitions live in cl-types.lisp.
+
+;;; ============================================================
+;;; Misc Symbol/Special Form Stubs
+;;; ============================================================
+(defun makunbound (symbol)
+  "Make symbol unbound (stub - no-op)."
+  symbol)
+
+(defun special-operator-p (symbol)
+  "Return T if SYMBOL is a special operator.  The eq-member check covers
+   same-package literals; the symbol-name fallback covers cross-package
+   symbols (CLHS 11.1.2 per-package interning means a CL-TEST-package
+   'LET is not EQ to ours) against the canonical CLHS Figure 3-2 set."
+  (or (member symbol '(let let* if progn setq quote lambda defun defmacro
+                       block return-from tagbody go catch throw unwind-protect
+                       eval-when locally progv multiple-value-call
+                       multiple-value-prog1 load-time-value the declare))
+      (and (symbolp symbol)
+           (let ((n (symbol-name symbol)))
+             (and (stringp n) (> (length n) 0)
+                  (%dg-string-member
+                   n '("BLOCK" "CATCH" "EVAL-WHEN" "FLET" "FUNCTION" "GO"
+                       "IF" "LABELS" "LET" "LET*" "LOAD-TIME-VALUE"
+                       "LOCALLY" "MACROLET" "MULTIPLE-VALUE-CALL"
+                       "MULTIPLE-VALUE-PROG1" "PROGN" "PROGV" "QUOTE"
+                       "RETURN-FROM" "SETQ" "SYMBOL-MACROLET" "TAGBODY"
+                       "THE" "THROW" "UNWIND-PROTECT")))))))
+
+(defun compiled-function-p (x)
+  "Return T if X is a compiled function."
+  (functionp x))
+
+(defun break (&optional message &rest args)
+  "Enter debugger (stub - no-op)."
+  nil)
+
+;;; ============================================================
+;;; SPECIAL-OPERATOR-P, MACRO-FUNCTION, FBOUNDP extensions
+;;; ============================================================
+
+;; macro-function lives in cl-eval.lisp (the real impl).  Earlier stub
+;; here returned NIL unconditionally, and last-defun-wins gave the stub
+;; (it assembled after the real one), breaking every macro
+;; lookup — including the runtime-load suite-shape probe which loads a
+;; defmacro and then immediately uses it.  Removed.
+(defun compiler-macro-function (name &optional env)
+  "Return compiler macro function for NAME, or NIL.
+
+   Looks up *compiler-macro-function-table* — populated at runtime by
+   cl-eval's DEFINE-COMPILER-MACRO handler.  Wraps interp-closure
+   expanders via %interp-macro-shim so user-facing
+   `(funcall (compiler-macro-function ...) ...)` works through the
+   compiled funcall path (same fix as for macro-function +
+   runtime-defmacro)."
+  (declare (ignore env))
+  (let ((key (%macro-sym-key name)))
+    ;; NAME's OWN package's compiler macro wins over the bare last-writer
+    ;; entry (task #241); the bare entry stays as the fallback for names with
+    ;; no resolvable package.
+    (let ((raw (or (%compiler-macro-pkg-get name key)
+                   (and key *compiler-macro-function-table*
+                        (gethash key *compiler-macro-function-table*)))))
+      (cond
+        ((null raw) nil)
+        ((%interp-closure-p raw)
+         (%make-closure #'%interp-macro-shim (cons raw nil)))
+        (t raw)))))
+
+;;; ============================================================
+;;; LOAD — read+eval all forms from a file or stream.
+;;; ============================================================
+;;;
+;;; CLHS 24.1.x.  Override of the earlier LOAD in this file (last defun
+;;; wins).  Adds
+;;;   - stream filespec support (LOAD.3/8/13/16)
+;;;   - :if-does-not-exist (LOAD.14)
+;;;   - :verbose / :print emitting visible output to *standard-output*
+;;;     so load-file-test's (position #\; str) sees the marker
+;;;   - :allow-other-keys to accept the test wrapper's apply with
+;;;     :allow-other-keys t, while still program-erroring on unknown
+;;;     keywords when allow-other-keys is absent (LOAD.error.3)
+;;;   - 0 args → program-error (LOAD.error.2)
+;;;   - missing file with default if-does-not-exist → error (LOAD.error.1)
+;;;
+;;; *load-pathname*, *load-truename*, *load-print*, *load-verbose* are
+;;; declared as defvars (default NIL) for tests LOAD-PATHNAME.1 etc.
+;;; The set! during load uses set-symbol-value on the hash so that
+;;; (symbol-value '*load-pathname*) reflects the binding while the
+;;; file is being read.  Per CLAUDE.md "defvar init-thunks not run"
+;;; the defvars stay NIL outside any LOAD call, which is what the
+;;; default tests expect.
+(defvar *load-pathname* nil)
+
+(defvar *load-truename* nil)
+
+(defvar *load-print* nil)
+
+(defvar *load-verbose* nil)
+
+;;; Helpers --------------------------------------------------------------
+(defun %load-known-key-p (k)
+  (or (eq k :verbose) (eq k :print) (eq k :if-does-not-exist)
+      (eq k :external-format) (eq k :allow-other-keys)))
+
+(defun %load-validate-kwargs (kw-list)
+  "Walk plist; if any unknown key found and :allow-other-keys not
+   present-and-true, signal program-error.  Returns T on OK."
+  (let ((aok nil)
+        (cur kw-list))
+    ;; First pass: find :allow-other-keys t
+    (loop
+      (when (null cur) (return nil))
+      (when (and (eq (car cur) :allow-other-keys) (cdr cur) (cadr cur))
+        (setq aok t))
+      (setq cur (cddr cur)))
+    ;; Second pass: program-error on first unknown (unless aok)
+    (unless aok
+      (setq cur kw-list)
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)))
+          (unless (%load-known-key-p k)
+            (%signal-program-error)))
+        (setq cur (cddr cur))))
+    t))
+
+(defun %load-getf (plist key default)
+  "GETF-equivalent that doesn't depend on plist arity checks; default
+   if missing or pair truncated."
+  (let ((cur plist))
+    (loop
+      (when (null cur) (return default))
+      (when (null (cdr cur)) (return default))
+      (when (eq (car cur) key) (return (cadr cur)))
+      (setq cur (cddr cur)))))
+
+(defun %load-getf-p (plist key)
+  "Return T if KEY appears as a key in PLIST."
+  (let ((cur plist))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (return nil))
+      (when (eq (car cur) key) (return t))
+      (setq cur (cddr cur)))))
+
+(defun %load-stream-p (x)
+  "True if X is a stream object."
+  (and x (streamp x)))
+
+;;; WS5 #203 gap 3 — make a failing LOAD *reportable* to its caller.
+;;;
+;;; %load-from-stream reports an escaping toplevel condition and then CONTINUES
+;;; with the next form (see the ladder note below).  That is load-bearing for
+;;; the ANSI harness — a corpus file whose Nth form dies must still run forms
+;;; N+1.. — but it is wrong for a hosted CLI: SBCL's `--script' ABORTS at the
+;;; first error and exits 1, whereas Modus ran on to the end and exited 0, so
+;;; `--script' could not fail and every gap this session had to be read out of
+;;; the swallow's diagnostic line.
+;;;
+;;; Rather than change the swallow (which would rewrite harness behaviour),
+;;; record the failure and let the CALLER decide:
+;;;   *LOAD-ERROR-CONDITION*  — set to the escaping condition; callers clear it
+;;;                             before (load ...) and test it after.
+;;;   *LOAD-ABORT-ON-ERROR*   — when true, stop the form loop at the first
+;;;                             failure instead of continuing.
+;;; Both default FALSE for everyone who does not opt in — and note these are
+;;; defvars, which do NOT run their init-thunks at boot (MVM limitation 7), so
+;;; "unset" reads as NIL and the harness path is bit-for-bit what it was.
+;;; lib/cli-toplevel.lisp opts in; nothing else does.
+(defvar *load-error-condition* nil
+  "The condition that escaped a toplevel form during the last LOAD, or NIL.
+   Set by %load-from-stream; cleared by the caller before it loads.")
+
+(defvar *load-abort-on-error* nil
+  "When true, %load-from-stream stops at the first toplevel form that
+   signals, instead of reporting and continuing.  The hosted CLI sets it so
+   --load/--script abort like SBCL's; the ANSI harness leaves it NIL.")
+
+;;; DEFERRED JIT.  Code loaded at runtime runs as interpreter trampolines until
+;;; JIT-EAGER makes it native, and the system loader asks for that after each
+;;; system (net/asdf-interface.lisp %JIT-LOADED-SYSTEM).  It cannot do it THEN:
+;;; the loader's callers -- Quicklisp's own functions, loaded by LOAD, i.e.
+;;; trampolines -- are active on the stack, and JIT-EAGER replaces them under
+;;; their own frames (measured: the process died silently in the JIT after
+;;; bordeaux-threads loaded; the same JIT-EAGER at top level compiled 981
+;;; functions cleanly).  So the loader only RAISES *%JIT-PENDING*, and the
+;;; outermost LOAD -- the script, whose forms are not trampolines -- runs the
+;;; JIT between two of its toplevel forms, when nothing loaded is executing.
+(defvar *%jit-pending* nil)
+
+(defvar *%load-depth* 0)
+
+(defun %load-depth ()
+  (handler-case (if (integerp *%load-depth*) *%load-depth* 0) (t (c) 0)))
+
+(defun %maybe-run-pending-jit ()
+  (when (and (= (%load-depth) 1)
+             (handler-case *%jit-pending* (t (c) nil)))
+    (setq *%jit-pending* nil)
+    ;; Through EVAL, exactly as a `(jit-eager)' toplevel form of the script
+    ;; would run it: called directly from here the same JIT left
+    ;; bordeaux-threads' JOIN-THREAD returning a TYPE-ERROR, while the
+    ;; evaluated form works.
+    (handler-case (eval (list 'jit-eager)) (serious-condition (c) nil))))
+
+(defun %load-from-stream (stream verbose print)
+  "Read+eval all forms from STREAM.  Returns T."
+  (setq *%load-depth* (+ (%load-depth) 1))
+  (unwind-protect (%load-from-stream-1 stream verbose print)
+    (setq *%load-depth* (- (%load-depth) 1))))
+
+(defun %load-from-stream-1 (stream verbose print)
+  (when verbose
+    (write-string "; loading from stream" *standard-output*)
+    (write-char #\Newline *standard-output*))
+  (let* ((eof-marker (cons 'eof nil))
+         (result t)
+         ;; FASL cache (mvm/fasl.lisp): only a FILE's text is cached -- read it
+         ;; whole, then replay or record it form by form.
+         (text (%fasl-stream-text stream))
+         (fx (and text (%fasl-open text)))
+         (read-failed nil))
+    (loop
+      ;; These T-clauses are the PRACTICAL BOTTOM of the handler-case
+      ;; ladder for anything loaded at toplevel: a condition matching no
+      ;; user clause used to be swallowed here with ZERO output (the
+      ;; caller just saw the form "return" — masked the GC signal-symbol,
+      ;; define-package and asdf find-system bugs).  Report loudly before
+      ;; the unchanged fallback (read error -> fake EOF stops the load;
+      ;; eval error -> NIL and continue).  Control flow is unchanged.
+      (let ((form (handler-case (if fx (%fasl-read fx eof-marker) (read stream nil eof-marker))
+                    (t (c)
+                       (%report-escaping-condition "load-read-error-stops-load")
+                       ;; Record it too: a read error already stops the load,
+                       ;; but the caller still needs to know the load FAILED
+                       ;; (SBCL exits 1 on a malformed --script).
+                       (when *load-abort-on-error*
+                         (setq *load-error-condition* c))
+                       (setq read-failed t)
+                       eof-marker))))
+        (when (eq form eof-marker)
+          (%fasl-close fx (not read-failed))
+          (return t))
+        (let ((val (handler-case (handler-bind ((warning #'%load-report-warning))
+                                   (if fx (%fasl-eval fx form) (eval form)))
+                     (t (c)
+                        (%report-escaping-condition "load-toplevel-form-swallowed")
+                        ;; NAME THE FORM.  A swallowed toplevel form that reports
+                        ;; only its condition TYPE cost a full round of guessing
+                        ;; (docs/handler-stack-collision.md, the glass-serve
+                        ;; runner): TYPE-ERROR, somewhere in a 300-line script.
+                        ;; The loader holds FORM right here; say its head.
+                        (handler-case
+                            (progn
+                              (write-string-serial "   in toplevel form: ")
+                              (write-object (if (consp form)
+                                                (list (car form)
+                                                      (if (consp (cdr form)) (cadr form) '|...|))
+                                                form))
+                              (write-string-serial (string #\Newline)))
+                          (t (c2) nil))
+                        ;; Recorded only when the caller asked for abort
+                        ;; semantics: a program that cleared the flag to run
+                        ;; past failing forms must not have a swallowed error
+                        ;; resurface as the OUTER --script's failure.
+                        (when *load-abort-on-error*
+                          (setq *load-error-condition* c))
+                        nil))))
+          ;; Opt-in abort (hosted CLI).  Unset/NIL for the ANSI harness, whose
+          ;; per-file runners depend on continuing past a failed form.
+          (when (and *load-abort-on-error* *load-error-condition*)
+            (return nil))
+          (%maybe-run-pending-jit)
+          (when print
+            (handler-case
+                (progn (write val :stream *standard-output*)
+                       (write-char #\Newline *standard-output*))
+              (t (c) nil)))
+          (setq result val))))
+    result))
+
+(defun %load-report-warning (c)
+  "An unhandled WARNING during LOAD: report it and let the form CONTINUE
+   (CLHS 9.2 WARN).  The per-form HANDLER-CASE below has a T clause, which
+   also caught warnings -- aborting the rest of the form and reporting the
+   warning as an UNHANDLED-ESCAPE (the real ansi-test's 'Redefining test'
+   warning did exactly that)."
+  (handler-case
+      (let ((out (symbol-value '*error-output*)))
+        (write-string "WARNING: " out)
+        (princ c out)
+        (write-char (code-char 10) out))
+    (t (e) nil))
+  (muffle-warning c))
+
+(defun %load-bind-pkg-rt-stream (stream verbose print)
+  "%LOAD-FROM-STREAM with *PACKAGE* and *READTABLE* BOUND around it, per
+   CLHS 24.2: \"load binds *readtable* and *package* to the values they held
+   before loading the file\".  Without this a loaded file's (in-package :foo)
+   escapes into the CALLER, whose next toplevel form is then READ in :foo —
+   every bare name becomes FOO::NAME and dies UNDEFINED-FUNCTION.
+
+   Hand-rolled rather than `(let ((*package* ...)) ...)` ON PURPOSE:
+   COMPILE-LET-WITH-SPECIALS emits save / set / body / restore with NO
+   unwind-protect, so a throw or an escaping error out of the body SKIPS the
+   restore (measured: probes/p1.lisp P4).  Lexical save + UNWIND-PROTECT +
+   setq restore is verified escape-safe for throw / ERROR / UNDEFINED-FUNCTION
+   (probes/p2.lisp P5-P10) — the same remedy 279f2cc used for the
+   %WITH-HANDLER-BIND frame leak."
+  (let ((saved-package *package*)
+        (saved-readtable *readtable*))
+    (unwind-protect
+         (%load-from-stream stream verbose print)
+      (setq *package* saved-package)
+      (setq *readtable* saved-readtable))))
+
+(defun load (&rest all-args)
+  "Read and evaluate all forms from a file or stream.
+   Accepts:
+     (load filespec &key verbose print if-does-not-exist
+                          external-format allow-other-keys)"
+  ;; Zero-arg → program-error (LOAD.error.2)
+  (when (null all-args)
+    (%signal-program-error)
+    (return-from load nil))
+  (let* ((filespec (car all-args))
+         (kwargs   (cdr all-args)))
+    ;; Validate keyword args; allow-other-keys disables the check.
+    (%load-validate-kwargs kwargs)
+    (let* ((verbose-p (%load-getf-p kwargs :verbose))
+           (verbose (if verbose-p
+                        (%load-getf kwargs :verbose nil)
+                        ;; Fall back to *load-verbose* (defaults to NIL).
+                        (and (boundp '*load-verbose*) *load-verbose*)))
+           (print-p (%load-getf-p kwargs :print))
+           (print   (if print-p
+                        (%load-getf kwargs :print nil)
+                        (and (boundp '*load-print*) *load-print*)))
+           (idne-p  (%load-getf-p kwargs :if-does-not-exist))
+           (idne    (if idne-p
+                        (%load-getf kwargs :if-does-not-exist nil)
+                        :error)))
+      (cond
+        ;; --- Stream filespec ---
+        ;; CLHS LOAD: returns T on success.  It used to return the value of
+        ;; the stream loader (the last form's value), which the upstream
+        ;; LOAD.* helpers reject.
+        ((%load-stream-p filespec)
+         (%load-bind-pkg-rt-stream filespec verbose print)
+         t)
+        ;; --- Pathname / string filespec ---
+        (t
+         (let ((path (cond ((stringp filespec) filespec)
+                           (t (%resolve-path filespec)))))
+           ;; Attempt open with :if-does-not-exist nil so we can decide
+           ;; ourselves whether the absence is an error vs a NIL return.
+           (let ((stream (handler-case
+                             (open path :direction :input
+                                        :if-does-not-exist nil)
+                           (t (c) nil))))
+             (cond
+               ((null stream)
+                (cond
+                  ((null idne) nil)
+                  (t (error 'file-error :pathname path))))
+               (t
+                (unwind-protect
+                     ;; CLHS 23.2: *LOAD-PATHNAME* is (pathname (merge-pathnames
+                     ;; filespec)); *LOAD-TRUENAME* is its (absolute) truename.
+                     (let ((*load-pathname* (pathname (merge-pathnames path)))
+                           (*load-truename* (handler-case (truename path)
+                                              (t (c) (pathname path))))
+                           (*load-print* print)
+                           (*load-verbose* verbose))
+                       (declare (special *load-pathname* *load-truename*
+                                         *load-print* *load-verbose*))
+                       (when verbose
+                         (write-string "; loading " *standard-output*)
+                         (write-string path *standard-output*)
+                         (write-char #\Newline *standard-output*))
+                       (%load-bind-pkg-rt-stream stream verbose print))
+                  (close stream))
+                t)))))))))

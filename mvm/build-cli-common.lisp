@@ -72,7 +72,7 @@
                   *cli-arch-kernel-prologue* *cli-arch-io-scratch-source*
                   *cli-arch-kernel-epilogue* *cli-arch-override-source*
                   *cli-bare-metal* *cli-bare-metal-tarball*
-                  *cli-bare-metal-net-source* *cli-omit-ansi-bridge*
+                  *cli-bare-metal-net-source* *cli-omit-ansi-test-aux*
                   *cli-arch-core-resume*))
 
 ;;; BARE-METAL SEAM.  DEFVAR, so a wrapper that binds these BEFORE loading this
@@ -110,13 +110,13 @@
 ;;; init (its toplevel: serial REPL + halt).  "" = no bare-metal core support.
 (defvar *cli-arch-core-resume* "")
 
-;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-bridge.lisp
-;;; (~1.7 MB of source -> ~3.5 MB of image) from *BRIDGE-SOURCE*.  It exists for
-;;; the Pi chain-load path, where every megabyte is minutes of UART time.  NOT
-;;; proven boot-safe — ansi-bridge.lisp is load-bearing (it defines list /
-;;; make-array / rplaca / the CLOS defaults and %init-clos-protocol), so measure,
-;;; do not assume.  Default NIL => every existing build is byte-identical.
-(defvar *cli-omit-ansi-bridge* nil)
+;;; BRING-UP CULL, not part of the bare-metal seam: T drops mvm/ansi-test-aux.lisp
+;;; (the ANSI-test helpers; the CL runtime it once shared a file with is in
+;;; mvm/cl-*.lisp) from *BRIDGE-SOURCE*.  It exists for the Pi chain-load path,
+;;; where every megabyte is minutes of UART time.  NOT measured since the split:
+;;; the bare-metal boot calls %INIT-STANDARD-CHARS, which lives there.  Default
+;;; NIL => every existing build is byte-identical.
+(defvar *cli-omit-ansi-test-aux* nil)
 
 ;;; ============================================================
 ;;; 1. Load MVM infrastructure (SBCL-side)
@@ -231,6 +231,33 @@
 ;; mvm-eval.lisp's `\"` extraction damage until the flip wave-3 fidelity fix
 ;; (77cea7c) repaired it; the file is now clean, directly mvm-text-readable.
 (defvar *mvm-eval-canonical-source* (mvm-text "mvm/mvm-eval.lisp"))
+
+;;; The FASL cache (mvm/fasl.lisp), and its COMPILER FINGERPRINT: a hash of the
+;;; sources that decide what bytecode a form compiles to -- the ISA, the
+;;; compiler, mvm-eval, the interpreter and every file that bakes macros or the
+;;; runtime the compiler consults -- plus the cache's format version.  Two images
+;;; whose fingerprints agree may share cached modules (host, QEMU, board); an
+;;; edit to any of these files invalidates every cache entry.  Deliberately NOT
+;;; the whole image: the board image bakes drivers the hosted CLI does not, and
+;;; they do not change what a library compiles to.
+(defvar *fasl-source* (mvm-text "mvm/fasl.lisp"))
+(defvar *fasl-fingerprint-files*
+  '("mvm/mvm.lisp" "mvm/compiler.lisp" "mvm/mvm-eval.lisp" "mvm/fasl.lisp"
+    "mvm/interp.lisp" "mvm/prelude.lisp" "mvm/runtime-cl-macros.lisp"
+    "mvm/cl-sequences.lisp" "mvm/cl-streams.lisp" "mvm/cl-fileio.lisp"
+    "mvm/cl-printer.lisp" "mvm/cl-reader.lisp" "mvm/cl-eval.lisp" "mvm/cl-clos.lisp"
+    "mvm/cl-types.lisp" "mvm/cl-packages.lisp" "mvm/cl-conditions.lisp"
+    "mvm/ansi-test-aux.lisp"))
+(defvar *fasl-fingerprint-source*
+  (let ((a 2166136261) (b 3735928559))
+    (dolist (f *fasl-fingerprint-files*)
+      (let ((text (read-file-text (merge-pathnames f *modus-base*))))
+        (loop for c across text
+              for k = (char-code c)
+              do (setf a (logand (* (logxor a k) 16777619) #xFFFFFFFF))
+                 (setf b (logand (* (logxor b (logand (+ k 41) #xFFFF)) 16777619) #xFFFFFFFF)))))
+    (format nil "(defun %fasl-compiler-fingerprint () \"mfasl1-~8,'0x~8,'0x\")~%" a b)))
+(format t "  FASL fingerprint: ~a" *fasl-fingerprint-source*)
 
 ;;; ============================================================
 ;;; WS5 rung 2: OPTIONAL runtime JIT (MODUS_USE_JIT=1)
@@ -1070,10 +1097,18 @@
     ;; A core holds raw addresses into THIS binary's text (function entries,
     ;; JIT call targets), so it may only restore under the binary that wrote
     ;; it.  A fresh id per build, checked by %RESTORE-IMAGE.
+    ;; MODUS_BUILD_ID=N (1 .. 2^28-1) makes the id a value the caller chose, so
+    ;; the same inputs give the same bytes: a launch digest can then be computed
+    ;; ahead of time (kiln does this from the modus commit and its settings).
+    ;; Unset, every build draws a fresh id, as before.
     (format nil "~%(defun %core-build-id () ~D)~%"
             ;; 28 bits: a fixnum on every target, the 32-bit ones included,
             ;; because the restore compares it before anything may allocate.
-            (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))
+            (let ((v (sb-ext:posix-getenv "MODUS_BUILD_ID")))
+              (or (and v (plusp (length v)) (every #'digit-char-p v)
+                       (let ((n (parse-integer v)))
+                         (and (<= 1 n (- (expt 2 28) 1)) n)))
+                  (+ 1 (random (- (expt 2 28) 1) (make-random-state t)))))))
       ""))
 
 ;;; THE HOSTED PLATFORM LAYER — Linux syscalls, hosted targets only.
@@ -1136,7 +1171,7 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (if *cli-omit-ansi-bridge* "" (mvm-text "mvm/ansi-bridge.lisp"))
+    (if *cli-omit-ansi-test-aux* "" (mvm-text "mvm/ansi-test-aux.lisp"))
     (string #\Newline)
     ;; ---- BARE METAL STOPS HERE -------------------------------------------
     ;; Everything below is the HOSTED payload: Linux syscalls, fds, argv.  A
@@ -1329,11 +1364,11 @@
 ;; *driver-source* here, at exactly the position it used to occupy, so every
 ;; existing driver scanner (defun names -> SFT, symbol names -> *SYM-NAME-TABLE*)
 ;; still sees these defuns unchanged.
-;;; MACHINE-TYPE / MACHINE-VERSION per port.  mvm/ansi-bridge.lisp's are the
+;;; MACHINE-TYPE / MACHINE-VERSION per port.  mvm/cl-fileio.lisp's are the
 ;;; constant "x86_64" every image shares, so the aarch64 image on an Android
 ;;; phone answered "x86_64".  Like SBCL's, the answer is fixed when the image is
 ;;; built; the names are uname's.  Spliced into *DRIVER-SOURCE*, which comes
-;;; after ansi-bridge, so these definitions win.
+;;; after the CL runtime, so these definitions win.
 (defun %machine-type-source ()
   (let ((m (ecase *cli-arch*
              (:x64 "x86_64") (:aarch64 "aarch64") (:i386 "i386")
@@ -1539,6 +1574,15 @@
   ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init
   ;; crash can never take down a normal boot.
   (handler-case (%jit-boot-init) (t (c) nil))
+  ;; A CONS IS A CONS from here on.  This image's MAKE-ARRAY builds every
+  ;; non-simple array as the #x34 MDA object, never a CONS wrapper, so a cons
+  ;; shaped like one -- (1073741824 . a-name-string) -- is the user's cons.  It used
+  ;; to be set only in CLI-TOPLEVEL, AFTER the boot-time shims below were
+  ;; evaluated, and through boot STRINGP / VECTORP / LENGTH answered for such a
+  ;; pair as if it were a fill-pointer string (the FASL cache found it: every
+  ;; runtime-call table entry encoded as a string).  The ANSI gate runners, whose
+  ;; rewriter still builds cons wrappers, have their own driver and keep NIL.
+  (setq *%no-cons-array-wrappers* t)
   ;; :GENERA — install the Genera compatibility surface and push the feature.
   ;; MUST come after %install-runtime-cl-macros (the compat source uses
   ;; DOLIST / WHEN / UNLESS / SETF) and before cli-toplevel, so that
@@ -1696,6 +1740,11 @@
 (defvar *sb-shim-text*
   (concatenate 'string
                (read-file-text (merge-pathnames "net/sb-thread-shim.lisp"
+                                                *modus-base*))
+               (string #\Newline)
+               ;; MODUS:MAKE-CHANNEL, the message channel between threads: on
+               ;; the thread surface's mutexes, wait queues and MODUS:SHARE.
+               (read-file-text (merge-pathnames "net/modus-channel.lisp"
                                                 *modus-base*))
                (string #\Newline)
                (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
@@ -1887,6 +1936,9 @@
                        *compiler-source* (string #\Newline)
                        *stage2-float-override* (string #\Newline)
                        *opcode-table-init-source* (string #\Newline)
+                       ;; the FASL cache: callable by name (FASL-STATS, FASL-MEM-PUT)
+                       *fasl-source* (string #\Newline)
+                       *fasl-fingerprint-source* (string #\Newline)
                        *mvm-eval-canonical-source* (string #\Newline)
                        ;; WS5 rung 2: register the JIT translator's defuns +
                        ;; quoted symbols in the SFT / sym-name tables so
@@ -2165,6 +2217,11 @@
     *stage2-float-override*
     (string #\Newline)
     *opcode-table-init-source*
+    (string #\Newline)
+    ;; the FASL cache, then its build fingerprint (overrides the default DEFUN)
+    *fasl-source*
+    (string #\Newline)
+    *fasl-fingerprint-source*
     (string #\Newline)
     *mvm-eval-canonical-source*
     (string #\Newline)

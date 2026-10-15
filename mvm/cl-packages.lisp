@@ -472,17 +472,11 @@
         (%pkg-nicknames p)
         (%signal-type-error))))
 
-(defun package-use-list (pkg)
-  (let ((p (%resolve-package pkg)))
-    (if p (%pkg-use-list p) nil)))
 
-(defun package-used-by-list (pkg)
-  (let ((p (%resolve-package pkg)))
-    (if p (%pkg-used-by p) nil)))
 
-(defun package-shadowing-symbols (pkg)
-  (let ((p (%resolve-package pkg)))
-    (if p (%pkg-shadowing p) nil)))
+
+
+
 
 (defun list-all-packages ()
   *all-packages*)
@@ -902,22 +896,7 @@
 ;;; --- gentemp ---
 (defvar *gentemp-counter* 0)
 
-(defun gentemp (&rest args)
-  "Generate a new symbol interned in *PACKAGE*. Prefix defaults to T."
-  (let ((prefix (if args (%pkg-string-designator (car args)) "T"))
-        (pkg (if (and args (cdr args))
-                 (%resolve-package (cadr args))
-                 *package*)))
-    (loop
-      (let* ((name (format nil "~A~D" prefix *gentemp-counter*))
-             (found (find-symbol name pkg)))
-        (setq *gentemp-counter* (+ *gentemp-counter* 1))
-        (when (null found)
-          ;; Symbol doesn't exist yet — intern it
-          (let ((sym (%make-cl-symbol name)))
-            (%cl-sym-set-package sym pkg)
-            (%pkg-set-internal pkg (%symtab-add (%pkg-internal pkg) name sym))
-            (return sym)))))))
+
 
 ;;; --- find-symbol / intern ---
 
@@ -1428,7 +1407,8 @@
    the type symbol in slot 0.  Used by %defpackage-impl for nickname
    conflicts (CLHS 11.1.1.1) and for disjointness violations whose CLHS
    spec calls for PACKAGE-ERROR rather than PROGRAM-ERROR."
-  (let ((c (make-array 2)))
+  (let ((c (make-array 3)))
+    (aset c 2 '%condition-marker)
     (aset c 0 'package-error)
     (aset c 1 nil)
     (setq *current-condition* c)
@@ -1984,22 +1964,7 @@
        (let ((k (%constant-var-key sym)))
          (and k (gethash k *constant-var-names*)))))
 
-(defun constantp (form &rest env)
-  "True if FORM is a constant per CLHS. Numbers, characters, strings,
-   bit-vectors, T, NIL, keywords, (quote ...) forms, and symbols naming a
-   constant variable (DEFCONSTANT) are constants."
-  (declare (ignore env))
-  (cond
-    ((null form) t)              ; NIL
-    ((eq form t) t)              ; T
-    ((numberp form) t)
-    ((characterp form) t)
-    ((stringp form) t)
-    ((keywordp form) t)          ; keyword (cl-sym or native #x53)
-    ((%cl-sym-p form) (%constant-var-p form))
-    ((%native-sym-p form) (%constant-var-p form))
-    ((and (consp form) (eq (car form) 'quote)) t)
-    (t nil)))
+
 
 ;;; --- Collect package symbols for with-package-iterator ---
 
@@ -2180,7 +2145,7 @@
 
 (defvar *fail-count-limit* 20)
 
-;;; documentation lives in ansi-bridge.lisp with a real registry.
+;;; documentation lives in cl-eval.lisp with a real registry.
 ;;; The cl-packages stub here returned NIL always and shadowed the real
 ;;; impl via last-defun-wins ordering — now just a forwarding comment.
 
@@ -2259,3 +2224,277 @@
         (%dynunbind (car p) (cdr p)))
       (setq cur (cdr cur)))))
 
+
+;;; ============================================================
+;;; Property Lists (GET / REMPROP)
+;;; ============================================================
+
+;; We implement property lists via a global hash table
+;; keyed by EQ identity (symbol hash index)
+(defvar *symbol-plists* nil)
+
+(defun %get-plist-ht ()
+  ;; An EXPLICIT :TEST table: a bare (MAKE-HASH-TABLE) in image code is the
+  ;; legacy alist shape with no bucket index, so every GET scanned every
+  ;; symbol that has a plist, calling the test on each (0.34 us a GET;
+  ;; cl-bench DDERIV / BOYER live on GET).
+  (when (null *symbol-plists*)
+    (setq *symbol-plists* (make-hash-table :test 'eq)))
+  *symbol-plists*)
+
+(defun get (symbol indicator &optional default)
+  "Get property INDICATOR from SYMBOL's property list."
+  (let ((plist (gethash symbol (%get-plist-ht))))
+    (if (null plist)
+        default
+        (let ((cur plist))
+          (loop
+            (when (null cur) (return default))
+            (when (eq (car cur) indicator) (return (cadr cur)))
+            (setq cur (cddr cur)))))))
+
+(defun %plist-set (plist indicator value)
+  "Rebuild plist with indicator=value, or add at front if not present."
+  (let ((cur plist)
+        (result nil)
+        (found nil))
+    (loop
+      (when (null cur)
+        (if found
+            (return (nreverse result))
+            (return (cons indicator (cons value (nreverse result)))))
+        (return nil))
+      (let ((k (car cur))
+            (v (cadr cur)))
+        (if (eq k indicator)
+            (progn
+              (setq found t)
+              (setq result (cons value (cons k result))))
+            (setq result (cons v (cons k result))))
+        (setq cur (cddr cur))))))
+
+(defun %plist-remove (plist indicator)
+  "Return new plist with INDICATOR pair removed."
+  (let ((cur plist)
+        (result nil)
+        (found nil))
+    (loop
+      (when (null cur) (return (values (nreverse result) found)))
+      (let ((k (car cur))
+            (v (cadr cur)))
+        (if (eq k indicator)
+            (setq found t)
+            (setq result (cons v (cons k result))))
+        (setq cur (cddr cur))))))
+
+(defun set-get (symbol indicator value)
+  "Set property INDICATOR on SYMBOL's property list.
+   PUTHASH's lambda list is (KEY HT VALUE) — mvm/prelude.lisp:1226.  Both
+   this function and REMPROP used to pass (KEY VALUE HT), so the plist was
+   handed to PUTHASH as the *table* and signalled a TYPE-ERROR: EVERY
+   `(setf (get sym ind) v)` failed.  cl-annot's set-annotation-options
+   goes through `(setf (annotation-real …) …)` → `(setf (get …) …)`, so
+   all 16 of its DEFANNOTATION forms died here."
+  (let ((ht (%get-plist-ht)))
+    (let ((plist (gethash symbol ht)))
+      (puthash symbol ht (%plist-set (if (null plist) nil plist) indicator value))))
+  value)
+
+(defun remprop (symbol indicator)
+  "Remove property INDICATOR from SYMBOL's property list."
+  (let ((ht (%get-plist-ht)))
+    (let ((plist (gethash symbol ht)))
+      (if (null plist) nil
+          (multiple-value-bind (new-plist found)
+              (%plist-remove plist indicator)
+            (puthash symbol ht new-plist)
+            found)))))
+
+(defun symbol-plist (symbol)
+  "Return SYMBOL's property list."
+  (let ((plist (gethash symbol (%get-plist-ht))))
+    (if (null plist) nil plist)))
+
+;; UPDATE-INSTANCE-FOR-REDEFINED-CLASS and UPDATE-INSTANCE-FOR-
+;; DIFFERENT-CLASS are defined as real GFs at the bottom of this file
+;; (%init-clos-protocol).  The previous stubs here have been removed
+;; so last-defun-wins picks the dispatcher.
+
+;;; ============================================================
+;;; WITH-HASH-TABLE-ITERATOR support
+;;; ============================================================
+;; This is a macro in CL; we provide a function-level stub
+;; The macro expansion in tests usually looks like:
+;; (with-hash-table-iterator (next ht) body)
+;; We provide a do-hash-table helper instead
+(defun %ht-to-alist (ht)
+  "Convert hash table to alist for iteration."
+  (let ((result nil))
+    (maphash (lambda (k v) (setq result (cons (cons k v) result))) ht)
+    result))
+
+(defun set-symbol-plist (symbol plist)
+  "Set SYMBOL's property list to PLIST."
+  (puthash symbol plist (%get-plist-ht))
+  plist)
+
+(defun set (symbol value)
+  "CLHS SET: set SYMBOL's value cell to VALUE.  Equivalent to
+   (setf (symbol-value sym) value).  Per CLHS arity is exactly two —
+   zero or one args signal program-error; three+ signal too.  The
+   defun's required-count enforces both ends automatically."
+  ;; SET is a seventh entry point into the global value store (task #241):
+  ;; if it kept a bare key while a compiled read of the same variable uses
+  ;; the package-qualified one, (set 'lib::*v* x) would write a cell nobody
+  ;; reads.  The pkg-key wins where there is one; every other case keeps the
+  ;; historic hash byte-for-byte, so nothing outside a runtime-born package
+  ;; changes.
+  (let ((hash (cond
+                ((%cl-sym-p symbol)
+                 (let ((q (%sym-global-pkg-key symbol)))
+                   (if q q (compute-name-hash (%cl-sym-name symbol)))))
+                ((symbolp symbol) (aref symbol 0))
+                (t (%signal-type-error) 0))))
+    (set-symbol-value hash value))
+  value)
+
+;;; ============================================================
+;;; GET-PROPERTIES and SET-GETF
+;;; ============================================================
+(defun get-properties (plist indicators)
+  "Search PLIST for first indicator in INDICATORS.
+   Returns (values indicator value tail) or (values nil nil nil)."
+  (let ((cur plist))
+    (loop
+      (when (null cur) (return (values nil nil nil)))
+      (let ((ind (car cur))
+            (val (cadr cur)))
+        (when (member ind indicators)
+          (return (values ind val cur)))
+        (setq cur (cddr cur))))))
+
+(defun set-getf (plist indicator value)
+  "Set INDICATOR to VALUE in PLIST, return modified plist."
+  (let ((cur plist))
+    (loop
+      (when (null cur)
+        ;; Not found - prepend
+        (return (cons indicator (cons value plist))))
+      (when (eq (car cur) indicator)
+        ;; Found - replace
+        (set-car (cdr cur) value)
+        (return plist))
+      (setq cur (cddr cur)))))
+
+;;; APROPOS — walk the named package's internal+external symbol tables
+;;; and collect those whose name contains the search substring.
+;;; apropos prints them; apropos-list returns the list.
+(defun %symbol-name-of (entry)
+  "Internal-symbol-table entries shape varies; pull the name string."
+  (cond
+    ((stringp entry) entry)
+    ((consp entry)
+     (cond ((stringp (car entry)) (car entry))
+           ((consp (car entry)) (%symbol-name-of (car entry)))
+           (t nil)))
+    (t nil)))
+
+(defun %string-contains (haystack needle)
+  "Case-insensitive substring search."
+  (let* ((hlen (length haystack))
+         (nlen (length needle)))
+    (when (> nlen hlen) (return-from %string-contains nil))
+    (let ((i 0) (found nil))
+      (loop
+        (when (or found (> i (- hlen nlen))) (return found))
+        (let ((j 0) (matches t))
+          (loop
+            (when (or (not matches) (>= j nlen)) (return nil))
+            (let ((c1 (aref haystack (+ i j)))
+                  (c2 (aref needle j)))
+              ;; case-insensitive
+              (when (and (>= c1 65) (<= c1 90)) (setq c1 (+ c1 32)))
+              (when (and (>= c2 65) (<= c2 90)) (setq c2 (+ c2 32)))
+              (unless (= c1 c2) (setq matches nil)))
+            (setq j (+ j 1)))
+          (when matches (setq found t))
+          (setq i (+ i 1))))
+      (if found t nil))))
+
+(defun apropos-list (string &optional package)
+  "Return list of symbols whose name contains STRING."
+  (let* ((needle (cond ((stringp string) string)
+                       ((symbolp string) (symbol-name string))
+                       (t (return-from apropos-list nil))))
+         (pkgs (if package
+                   (let ((p (find-package package)))
+                     (if p (list p) nil))
+                   (let ((cl (find-package "CL"))
+                         (clu (find-package "CL-USER")))
+                     (let ((r nil))
+                       (when cl (setq r (cons cl r)))
+                       (when clu (setq r (cons clu r)))
+                       r))))
+         (acc nil))
+    (dolist (p pkgs)
+      ;; Walk BOTH the internal and the external symbol tables —
+      ;; standard CL packages keep their exported symbols in the
+      ;; external table (slot 3), and apropos must see those.
+      (dolist (entries (list (%pkg-internal p) (%pkg-external p)))
+        (dolist (entry entries)
+          (let ((nm (%symbol-name-of entry)))
+            (when (and nm (%string-contains nm needle))
+              (setq acc (cons entry acc)))))))
+    acc))
+
+(defun apropos (string &optional package)
+  "Print apropos list to *standard-output* and return NIL."
+  (let ((syms (apropos-list string package)))
+    (dolist (s syms)
+      (let ((nm (%symbol-name-of s)))
+        (when nm
+          (write-string-serial nm)
+          (write-char-serial 10))))
+    nil))
+
+;;; PACKAGE-SHADOWING-SYMBOLS — strict 1-arg arity
+(defun package-shadowing-symbols (pkg &rest extra)
+  (if extra
+      (%program-error "package-shadowing-symbols requires exactly 1 argument")
+      (let ((p (%resolve-package pkg)))
+        (if p (%pkg-shadowing p) nil))))
+
+;;; PACKAGE-USE-LIST — strict 1-arg arity
+(defun package-use-list (pkg &rest extra)
+  (if extra
+      (%program-error "package-use-list requires exactly 1 argument")
+      (let ((p (%resolve-package pkg)))
+        (if p (%pkg-use-list p) nil))))
+
+;;; PACKAGE-USED-BY-LIST — strict 1-arg arity
+(defun package-used-by-list (pkg &rest extra)
+  (if extra
+      (%program-error "package-used-by-list requires exactly 1 argument")
+      (let ((p (%resolve-package pkg)))
+        (if p (%pkg-used-by p) nil))))
+
+;;; COMPUTE-APPLICABLE-METHODS — lives in cl-clos.lisp now with real
+;;; GF-array support + #'name reverse lookup via *gf-fn-to-name*.  The
+;;; stub here checked `(consp gf)' which never matched our array-shaped
+;;; gf-objects, silently returning NIL for every well-formed call.
+
+;;; GENTEMP — strict 0-2 arg arity; also accepts make-symbol result as package
+(defun gentemp (&rest args)
+  (if (and args (cdr args) (cddr args))
+      (%program-error "gentemp requires 0, 1, or 2 arguments")
+      (let ((actual-prefix (if args (%pkg-string-designator (car args)) "T"))
+            (actual-pkg (if (cdr args) (%resolve-package (cadr args)) *package*)))
+        (loop
+          (let* ((name (format nil "~A~D" actual-prefix *gentemp-counter*))
+                 (found (find-symbol name actual-pkg)))
+            (setq *gentemp-counter* (+ *gentemp-counter* 1))
+            (when (null found)
+              (let ((sym (%make-cl-symbol name)))
+                (%cl-sym-set-package sym actual-pkg)
+                (%pkg-set-internal actual-pkg (%symtab-add (%pkg-internal actual-pkg) name sym))
+                (return sym))))))))

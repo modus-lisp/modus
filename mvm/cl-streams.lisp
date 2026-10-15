@@ -80,13 +80,7 @@
           (t nil)))
       nil))
 
-(defun open-stream-p (s)
-  (if (streamp s)
-      (if (= (%stream-type s) 9)
-          ;; file stream: open only if fd >= 0
-          (if (>= (%fs-fd s) 0) t nil)
-          t)
-      nil))
+
 (defun stream-element-type (s)
   ;; For file streams (type 9) report the :element-type the stream was
   ;; opened with (CHARACTER vs a byte type like (UNSIGNED-BYTE 8)).  All
@@ -102,7 +96,6 @@
 (defun stream-external-format (s) :default)
 (defun interactive-stream-p (s) nil)
 
-(defun close (stream &rest args) t)
 
 ;;; --- Stream subtype predicates ---
 ;;; Used by typep dispatch (and directly callable from CL code) to
@@ -295,3 +288,35 @@
 (defun make-synonym-stream (sym)
   (%make-stream 7 sym))
 
+
+;;; ============================================================
+;;; CL Constants
+;;; ============================================================
+(defvar *terminal-io* nil)
+
+(defvar *standard-input* nil)
+
+(defvar *standard-output* nil)
+
+;;; FORCE-OUTPUT — check for too many args (accepts 0 or 1)
+(defun force-output (&rest args)
+  (if (cdr args)
+      (%program-error "force-output requires 0 or 1 arguments")
+      (progn (%flush-output-arg (car args)) nil)))
+
+;;; FINISH-OUTPUT — check for too many args
+(defun finish-output (&rest args)
+  (if (cdr args)
+      (%program-error "finish-output requires 0 or 1 arguments")
+      (progn (%flush-output-arg (car args)) nil)))
+
+;;; READ-CHAR — strict at most 4 args
+(defun read-char (&rest args)
+  (if (and args (cdr args) (cddr args) (cdddr args) (cddddr args))
+      (%program-error "read-char requires at most 4 arguments")
+      (let ((stream (if args (car args) nil))
+            ;; eof-errorp: default t when not supplied, use supplied value as-is
+            (eof-errorp (if (cdr args) (cadr args) t))
+            (eof-value (if (cddr args) (caddr args) nil)))
+        (let ((s (%resolve-input-stream stream)))
+          (%read-char-from-stream s eof-errorp eof-value)))))

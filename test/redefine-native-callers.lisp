@@ -8,9 +8,10 @@
 ;;;; DEFUN, a (SETF FDEFINITION) of a closure and a (SETF SYMBOL-FUNCTION) were
 ;;;; all invisible to OUTER: it kept calling the old INNER.  cl-fips's negative
 ;;;; controls (swap in a broken function, require checks to fail) all "passed".
-;;;; aarch64 only: x64's JIT bakes the callee address into the caller (no linkage
-;;;; cells, see "LINKAGE CELL" in mvm-eval.lisp), so x64 FAILS this today --
-;;;; measured, 2026-10-10.  Porting the cells is the fix there.
+;;;; x64 FAILED this until 2026-10-14: its JIT baked the callee address into the
+;;;; caller.  A native call to a runtime DEFUN now goes through a per-name x64
+;;;; linkage stub every redefinition retargets ("x64 LINKAGE STUBS" in
+;;;; mvm-eval.lisp), the counterpart of aarch64's linkage cells.
 
 (defpackage :rnc-lib (:use :cl))
 (in-package :rnc-lib)

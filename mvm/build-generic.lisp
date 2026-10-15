@@ -364,7 +364,7 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")
+    (mvm-text "mvm/ansi-test-aux.lisp")
     (string #\Newline)
     ;; POSIX ustar tar reader (pure CL, no FFI) — Quicklisp-client tar support.
     ;; install-tarball.lisp (the gunzip+untar+load driver) references the CHIPZ

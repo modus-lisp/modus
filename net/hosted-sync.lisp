@@ -6,7 +6,7 @@
 ;;;;
 ;;;; WHAT WAS MISSING, and why all four things are one file.
 ;;;;
-;;;;   1. SLEEP WAS A NO-OP.  mvm/ansi-bridge.lisp defines `(defun sleep (n)
+;;;;   1. SLEEP WAS A NO-OP.  mvm/cl-fileio.lisp defines `(defun sleep (n)
 ;;;;      nil)'.  Nothing in the tree could pace anything: no frame clock, no
 ;;;;      backoff, no timeout that is a duration rather than a spin budget.
 ;;;;   2. EVERY WAIT IN THE TREE BURNS A CORE.  net/actors.lisp's SPIN-LOCK is
@@ -402,7 +402,7 @@
 ;;; …AND THE CL INTERNAL CLOCKS RIDE ON THEM
 ;;; ------------------------------------------------------------
 ;;;
-;;; LAST-DEFUN-WINS overrides of the seam mvm/ansi-bridge.lisp defines at 0.
+;;; LAST-DEFUN-WINS overrides of the seam mvm/cl-fileio.lisp defines at 0.
 ;;; They live HERE and not there for the same reason %CLOCK-NS-AT does: a
 ;;; clock_gettime(2) needs a timespec that no other running thread is
 ;;; writing, and the per-CPU scratch that provides one is this file's.

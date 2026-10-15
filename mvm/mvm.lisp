@@ -56,6 +56,7 @@
    #:frame-enter-code-p #:frame-enter-nparams #:frame-enter-slots
    #:encode-frame-enter #:function-frame-slots
    #:+op-mul26lo+ #:+op-mul26hi+
+   #:+op-mulsplit-lo+ #:+op-mulsplit-hi+
    #:+op-mul64lo+ #:+op-mul64hi+ #:+op-acc128+
    #:+op-sap-new+ #:+op-sap-ref8+ #:+op-sap-ref32+ #:+op-sap-ref64+
    #:+op-sap-set8+ #:+op-sap-set32+ #:+op-sap-set64+ #:+op-sap-addr+
@@ -127,6 +128,7 @@
    #:mvm-fn-addr
    #:mvm-trap #:mvm-rdtsc
    #:mvm-mul26lo #:mvm-mul26hi
+   #:mvm-mulsplit-lo #:mvm-mulsplit-hi
    #:mvm-mul64lo #:mvm-mul64hi #:mvm-acc128
    #:mvm-sap-new #:mvm-sap-ref8 #:mvm-sap-ref32 #:mvm-sap-ref64
    #:mvm-sap-set8 #:mvm-sap-set32 #:mvm-sap-set64 #:mvm-sap-addr
@@ -419,6 +421,15 @@
 (defconstant +op-mul26lo+  #xA8)  ; (mul26lo Vd Va Vb) - low 26 bits of untag(Va)*untag(Vb), tagged
 (defconstant +op-mul26hi+  #xA9)  ; (mul26hi Vd Va Vb) - bits 26+ of untag(Va)*untag(Vb), tagged
 
+;; Wide multiply split at an IMMEDIATE bit K (64-bit targets).  The product is
+;; the full SIGNED 128-bit untag(Va)*untag(Vb); LO is its bits [0,K) and HI is
+;; the product arithmetically shifted right by K, both retagged.  This is what
+;; radix-2^51 / 2^52 field arithmetic (X25519, Ed25519, secp256k1) needs to keep
+;; every limb product a pair of FIXNUMS instead of a ~110-bit bignum.  Contract:
+;; 1 <= K <= 62 and HI fits a fixnum; LO always does.
+(defconstant +op-mulsplit-lo+ #x9E) ; (mulsplit-lo Vd Va Vb k) - bits [0,k) of the product, tagged
+(defconstant +op-mulsplit-hi+ #x9F) ; (mulsplit-hi Vd Va Vb k) - product >> k (arithmetic), tagged
+
 ;; Raw 64-bit multiply (for donna64 crypto on 64-bit targets)
 ;; All values are raw u64 (no tag/untag) — use with mem-ref :u64
 (defconstant +op-mul64lo+  #xAA)  ; (mul64lo Vd Va Vb) - low 64 bits of Va*Vb, raw
@@ -678,6 +689,8 @@
 ;; Wide multiply with 26-bit split (crypto field arithmetic)
 (defopcode :mul26lo  #xA8 (:reg :reg :reg)        "Low 26 bits of wide multiply, tagged")
 (defopcode :mul26hi  #xA9 (:reg :reg :reg)        "High bits (>>26) of wide multiply, tagged")
+(defopcode :mulsplit-lo #x9E (:reg :reg :reg :imm8) "Bits [0,k) of the signed 128-bit product, tagged")
+(defopcode :mulsplit-hi #x9F (:reg :reg :reg :imm8) "Signed 128-bit product >> k, tagged")
 (defopcode :mul64lo  #xAA (:reg :reg :reg)        "Low 64 bits of raw multiply")
 (defopcode :mul64hi  #xAB (:reg :reg :reg)        "High 64 bits of raw multiply")
 (defopcode :acc128   #xAC (:reg :reg :reg)        "128-bit accumulate: mem[Va] += Vc:Vb")
@@ -1446,6 +1459,12 @@
 
 (defun mvm-mul26hi (buf vd va vb)
   (encode-instruction buf +op-mul26hi+ vd va vb))
+
+(defun mvm-mulsplit-lo (buf vd va vb k)
+  (encode-instruction buf +op-mulsplit-lo+ vd va vb k))
+
+(defun mvm-mulsplit-hi (buf vd va vb k)
+  (encode-instruction buf +op-mulsplit-hi+ vd va vb k))
 
 (defun mvm-mul64lo (buf vd va vb)
   (encode-instruction buf +op-mul64lo+ vd va vb))

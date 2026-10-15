@@ -499,7 +499,9 @@
     ;; The guard is NOT optional — it is x64-linux's +linux-x64-gc-guard+ (16MB)
     ;; applied to bare.  The gc-check is POST-allocation: R12 overshoots R14 by up
     ;; to a whole object.  In the FIRST semispace that overshoot lands in the
-    ;; (mapped) second semispace and is harmless; in the SECOND semispace, without
+    ;; (mapped) second semispace -- NOT harmless: that is the to-space the next
+    ;; collection copies into, over the straddling object's tail, so R14 now
+    ;; stops short of to_start (below); in the SECOND semispace, without
     ;; a guard it runs off the end onto the GC config page at 0x1E000000 and
     ;; corrupts from_start/to_start/space_size/bitmap — every later collection then
     ;; uses garbage geometry (empty-name symbols, wild copies).  Bare shipped with
@@ -517,7 +519,14 @@
     ;; mov r14, 0x16800000 by default
     (mvm-emit-byte buf #x49)          ; REX.WB
     (mvm-emit-byte buf #xBE)          ; mov r14, imm64
-    (mvm-emit-u32 buf (nth-value 1 (x64-heap-geometry)))
+    ;; ...minus the limit headroom: the semispaces are ADJACENT, so a limit AT
+    ;; to_start lets the allocation after a passing gc-check straddle into the
+    ;; to-space the first collection copies into (translate-x64
+    ;; X64-GC-LIMIT-MARGIN / the LIMIT HEADROOM note; the trampoline applies
+    ;; the same min(16 MB, space_size/16) after every flip).
+    (mvm-emit-u32 buf (multiple-value-bind (from to size) (x64-heap-geometry)
+                        (declare (ignore from))
+                        (- to (min #x1000000 (ash size -4)))))
     (mvm-emit-u32 buf 0)
 
     ;; Initialize GC metadata at 0x10000040..0x10000058.  The x64 GC

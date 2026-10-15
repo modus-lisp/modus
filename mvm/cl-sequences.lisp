@@ -161,17 +161,6 @@
       (setq i (+ i 1))
       (setq cur (cdr cur)))))
 
-(defun sublis (alist tree)
-  (let ((pair (assoc (car tree) alist)))
-    (if pair
-        (cdr pair)
-        (if (consp tree)
-            (let ((a (sublis alist (car tree)))
-                  (d (sublis alist (cdr tree))))
-              (if (and (eq a (car tree)) (eq d (cdr tree)))
-                  tree
-                  (cons a d)))
-            tree))))
 
 (defun mapl (fn list &rest more-lists)
   "ANSI variadic MAPL: call FN on successive sublists (tails) of the lists,
@@ -2011,6 +2000,14 @@
               (string= (symbol-name (car et)) "UNSIGNED-BYTE")
               (consp (cdr et)) (eql (cadr et) 8)))))
 
+(defun %seq-type-f32-p (type)
+  "True when TYPE is an array/vector type specifier whose element type
+   upgrades to SINGLE-FLOAT (the packed #x12 vector)."
+  (and (consp type) (symbolp (car type))
+       (member (symbol-name (car type)) '("SIMPLE-ARRAY" "ARRAY" "VECTOR") :test #'string=)
+       (consp (cdr type))
+       (%f32-element-type-p (cadr type))))
+
 (defun %seq-u8-copy (seq)
   "A fresh packed (unsigned-byte 8) vector holding SEQ's elements."
   (let* ((n (length seq))
@@ -2033,6 +2030,19 @@
     (return-from make-sequence
       (make-array size :element-type '(unsigned-byte 8)
                        :initial-element (let ((p (member :initial-element args))) (if p (cadr p) 0)))))
+  ;; (VECTOR SINGLE-FLOAT) is the packed #x12 vector, as MAKE-ARRAY makes it:
+  ;; this built a general vector, which TYPEP of the very type asked for
+  ;; rejects (ANSI make-sequence 17821).
+  (when (%seq-type-f32-p type)
+    (let ((n (and (eq (car type) 'vector) (consp (cddr type)) (caddr type))))
+      (when (and (integerp n) (not (= n size)))
+        (%signal-type-error)
+        (return-from make-sequence nil)))
+    (return-from make-sequence
+      (let ((p (member :initial-element args)))
+        (if p
+            (make-array size :element-type 'single-float :initial-element (cadr p))
+            (make-array size :element-type 'single-float)))))
   ;; Resolve a class designator (class object or class-proxy) to its name
   ;; so the dispatch below can match symbols uniformly.  Keeps callers
   ;; using `(find-class 'list)' / `(class-of '(a b c))' working.
@@ -2149,156 +2159,9 @@
              (loop (when (= i size) (return nil))
                (aset v i init) (setq i (+ i 1)))))
          v)))))
-(defun %coerce-canon-head (head)
-  "Canonicalize a type-head symbol to the Modus built-in type symbol of
-   the same NAME.  Type specifiers are compared by name (CLHS), but a
-   type-head read in a foreign package (e.g. UIOP/UTILITY::VECTOR, when
-   define-package's inheritance hasn't exposed CL:VECTOR) is a distinct
-   object from Modus's compiled 'VECTOR, so `(eq head 'vector)` fails and
-   coerce silently returns OBJ unchanged.  Re-key by name so the downstream
-   EQ checks match regardless of the head symbol's home package."
-  (if (and head (not (consp head)) (not (stringp head))
-           (not (integerp head)) (not (characterp head))
-           (symbolp head))
-      (let ((n (symbol-name head)))
-        (cond
-          ((null n) head)
-          ((string= n "LIST") 'list)
-          ((string= n "VECTOR") 'vector)
-          ((string= n "SIMPLE-VECTOR") 'simple-vector)
-          ((string= n "ARRAY") 'array)
-          ((string= n "SIMPLE-ARRAY") 'simple-array)
-          ((string= n "STRING") 'string)
-          ((string= n "SIMPLE-STRING") 'simple-string)
-          ((string= n "BASE-STRING") 'base-string)
-          ((string= n "SIMPLE-BASE-STRING") 'simple-base-string)
-          ((string= n "CHARACTER") 'character)
-          ((string= n "BIT-VECTOR") 'bit-vector)
-          ((string= n "SIMPLE-BIT-VECTOR") 'simple-bit-vector)
-          ((string= n "FLOAT") 'float)
-          ((string= n "SINGLE-FLOAT") 'single-float)
-          ((string= n "DOUBLE-FLOAT") 'double-float)
-          ((string= n "SHORT-FLOAT") 'short-float)
-          ((string= n "LONG-FLOAT") 'long-float)
-          ((string= n "COMPLEX") 'complex)
-          ((string= n "FUNCTION") 'function)
-          (t head)))
-      head))
 
-(defun coerce (obj type)
-  "Convert OBJ to TYPE per CLHS 4.7.  Handles list/vector/string/
-   character/symbol/bit-vector and their compound forms like
-   (vector *) / (vector * 2) / (simple-string)."
-  (when (%seq-type-u8-p type) (return-from coerce (%seq-u8-copy obj)))
-  (let ((head (%coerce-canon-head (if (consp type) (car type) type))))
-    (cond
-      ((or (eq type t) (eq type 'common-lisp:t)) obj)
-      ;; List
-      ((eq head 'list)
-       (cond
-         ((null obj) nil)
-         ((consp obj) obj)
-         ((stringp obj)
-          (let ((acc nil) (i (- (length obj) 1)))
-            (loop
-              (when (< i 0) (return acc))
-              (setq acc (cons (aref obj i) acc))   ; AREF→char already
-              (setq i (- i 1)))))
-         ((or (arrayp obj) (and (consp obj) (array-wrapper-p obj)))
-          (let ((acc nil) (i (- (length obj) 1)))
-            (loop
-              (when (< i 0) (return acc))
-              (setq acc (cons (aref obj i) acc))
-              (setq i (- i 1)))))
-         (t (list obj))))
-      ;; Vector / simple-vector / array / simple-array
-      ((or (eq head 'vector) (eq head 'simple-vector)
-           (eq head 'array) (eq head 'simple-array))
-       (cond
-         ((null obj) (make-array 0))
-         ((consp obj)
-          (let* ((n (length obj))
-                 (v (make-array n))
-                 (i 0) (cur obj))
-            (loop (when (= i n) (return v))
-              (aset v i (car cur))
-              (setq cur (cdr cur))
-              (setq i (+ i 1)))))
-         ((stringp obj)
-          ;; Tests expect (coerce "ab" '(vector *)) to give #(#\a #\b).
-          (let* ((n (length obj))
-                 (v (make-array n))
-                 (i 0))
-            (loop (when (= i n) (return v))
-              (aset v i (aref obj i))   ; AREF→char already
-              (setq i (+ i 1)))))
-         (t obj)))
-      ;; String / simple-string / base-string
-      ((or (eq head 'string) (eq head 'simple-string)
-           (eq head 'base-string) (eq head 'simple-base-string))
-       (cond
-         ;; A NON-simple string (the header-object array a fill-pointer or
-         ;; adjustable MAKE-ARRAY returns) must be COPIED for a SIMPLE- target:
-         ;; returned unchanged, its header said string while its slots held no
-         ;; codes, so compiled CHAR read garbage.  seal's UTF8-DECODE ends in
-         ;; this coerce, so every websocket message decoded to junk.
-         ((and (%mda-p obj) (stringp obj)
-               (or (eq head 'simple-string) (eq head 'simple-base-string)))
-          (let* ((n (length obj)) (s (%make-string-array n)) (i 0))
-            (loop (when (= i n) (return s))
-              (aset s i (char-code (char obj i)))
-              (setq i (+ i 1)))))
-         ((stringp obj) obj)
-         ((characterp obj)
-          (let ((s (%make-string-array 1)))
-            (aset s 0 (char-code obj)) s))
-         ((null obj) (%make-string-array 0))
-         ((consp obj)
-          (let* ((n (length obj))
-                 (s (%make-string-array n))
-                 (i 0) (cur obj))
-            (loop (when (= i n) (return s))
-              (let ((c (car cur)))
-                (aset s i (if (characterp c) (char-code c) c)))
-              (setq cur (cdr cur))
-              (setq i (+ i 1)))))
-         ((arrayp obj)
-          (let* ((n (length obj))
-                 (s (%make-string-array n))
-                 (i 0))
-            (loop (when (= i n) (return s))
-              (let ((c (aref obj i)))
-                (aset s i (if (characterp c) (char-code c) c)))
-              (setq i (+ i 1)))))
-         (t obj)))
-      ;; Character
-      ((eq head 'character)
-       (cond ((characterp obj) obj)
-             ((integerp obj) (code-char obj))
-             ((and (stringp obj) (= (length obj) 1))
-              (aref obj 0))   ; AREF→char already
-             ((and (symbolp obj) (= (length (symbol-name obj)) 1))
-              (aref (symbol-name obj) 0))
-             (t obj)))
-      ;; CONS: empty list isn't a CONS — CLHS requires type-error
-      ;; (coerce.error.4).  Non-NIL list passes through.
-      ((eq head 'cons)
-       (cond ((null obj) (%signal-type-error) nil)
-             ((consp obj) obj)
-             (t (%signal-type-error) nil)))
-      ;; FUNCTION designator — symbol → (symbol-function ...).
-      ;; (lambda …) source forms would need runtime EVAL of `(function
-      ;; (lambda …))`, which Modus's interpreter can't fully compile
-      ;; — leave that case for the default pass-through so callers
-      ;; that wrap `coerce` in `funcall` get a clean function-error
-      ;; instead of a SIGSEGV.  (coerce.21)
-      ((eq head 'function)
-       (cond ((functionp obj) obj)
-             ((and (symbolp obj) (fboundp obj))
-              (symbol-function obj))
-             (t obj)))
-      ;; Default — pass through
-      (t obj))))
+
+
 (defun mismatch (s1 s2 &rest args)
   "Compare S1 vs S2 element-by-element. Returns first index where they
    differ, or NIL if equal. Honors :test, :key, :start1, :end1, :start2,
@@ -2398,15 +2261,23 @@
   ;; a program-error.
   (when (and state (cdr state))
     (error "random: too many arguments"))
-  ;; (random 0) is undefined in CL but happens when callers pass an
-  ;; overflowed bound like (ASH 1 64) → 0.  Returning 0 keeps the
-  ;; caller alive instead of #DE-trapping into a kernel-killing
-  ;; nested-exception loop (we don't install an IDT entry for #DE).
-  ;; A double LIMIT skips the zero test: ZEROP of a float goes through the
-  ;; generic NUMERIC-EQUAL-P / %FLOAT-EQ-P chain (most of (random 1d0)'s
-  ;; cost), and 0d0 times the fraction below is 0d0 anyway.
-  (if (and (not (double-float-p n)) (if (fixnump n) (= n 0) (zerop n)))
-      0
+  ;; CLHS: LIMIT is a positive integer or a positive float.  (random 0) used
+  ;; to return 0 -- a guard against the integer path's division #DE-trapping
+  ;; on bare metal, where no IDT entry handles #DE -- and a negative LIMIT
+  ;; returned a value in (LIMIT, 0].  Both now signal the TYPE-ERROR SBCL
+  ;; signals, which also keeps the zero away from the division.  A caller
+  ;; that indexed with (random 0) used to go on to read one past the end of
+  ;; an empty vector (ANSI subtypep 26525/26526 "passed" that way).
+  ;; A positive fixnum, or a finite positive double by its bits (a sign-clear
+  ;; high word below the infinity exponent, not zero), answers before the
+  ;; generic test: (> n 0) of a double is the NUMERIC-VALUE-LESS-P chain, most
+  ;; of a (random 1d0).
+  (if (not (or (and (fixnump n) (> n 0))
+               (and (double-float-p n)
+                    (let ((hi (%float-hi32 n)))
+                      (and (< hi #x7FF00000) (or (> hi 0) (> (%float-lo32 n) 0)))))
+               (and (integerp n) (> n 0)) (and (floatp-impl n) (> n 0))))
+      (error 'type-error :datum n :expected-type '(or (integer 1) (float (0.0))))
       ;; The seed lives at #x10000FD8 -- NOT #x100000A0, which is the SECOND
       ;; extra slot of the multiple-value buffer (#x10000098..#x10000138): every
       ;; function returning three or more values overwrote the seed with its
@@ -2440,7 +2311,6 @@
            (* n (/ (float next) 1073741824.0)))
           (t (- next (* (truncate next n) n)))))))
 (defun do-special-strings (fn) (funcall fn ""))
-(defun typep* (obj type) (typep obj type))
 
 ;;; String functions
 (defun %concat-elt-count (s)
@@ -2808,17 +2678,6 @@
                (aset v i (car cur))
                (setq cur (cdr cur)) (setq i (+ i 1))))))))))
 
-(defun replace (s1 s2 &rest args)
-  "Replace elements of S1 with elements from S2.
-   NOTE: this definition is SHADOWED by the one in cl-eval.lisp (loaded
-   later → last-defun-wins).  The active overlap-safe version lives there."
-  (%check-kw-allowed args '(:start1 :end1 :start2 :end2))
-  (let ((len (if (< (length s1) (length s2)) (length s1) (length s2))))
-    (dotimes (i len)
-      (if (consp s1)
-          (let ((cell (nthcdr i s1))) (when cell (set-car cell (elt s2 i))))
-          (aset s1 i (elt s2 i)))))
-  s1)
 
 (defun fill (seq item &rest args)
   "Fill SEQUENCE with ITEM. Honors :START and :END.  Strings store
@@ -3300,37 +3159,6 @@
       (dotimes (i size) (aset s i ch))
       s)))
 
-(defun string-trim (chars str)
-  "Trim characters from both ends of string."
-  (string-left-trim chars (string-right-trim chars str)))
-
-(defun string-left-trim (chars str)
-  "Trim characters from left of string."
-  (let ((char-list (if (stringp chars)
-                       (let ((r nil)) (dotimes (i (array-length chars)) (setq r (cons (aref chars i) r))) r)
-                       chars))
-        (start 0) (len (array-length str)))
-    (loop (when (>= start len) (return ""))
-      (unless (member (aref str start) char-list) (return))
-      (setq start (+ start 1)))
-    (if (= start 0) str
-        (let ((result (%make-string-array (- len start))))
-          (dotimes (i (- len start)) (aset result i (aref str (+ start i))))
-          result))))
-
-(defun string-right-trim (chars str)
-  "Trim characters from right of string."
-  (let ((char-list (if (stringp chars)
-                       (let ((r nil)) (dotimes (i (array-length chars)) (setq r (cons (aref chars i) r))) r)
-                       chars))
-        (end (array-length str)))
-    (loop (when (<= end 0) (return ""))
-      (unless (member (aref str (- end 1)) char-list) (return))
-      (setq end (- end 1)))
-    (if (= end (array-length str)) str
-        (let ((result (%make-string-array end)))
-          (dotimes (i end) (aset result i (aref str i)))
-          result))))
 
 ;;; Numeric
 (defun logbitp (index integer)
@@ -3343,13 +3171,7 @@
       (< integer 0)
       (not (zerop (logand integer (ash 1 index))))))
 
-(defun integer-length (n)
-  "CLHS 12.2: the number of bits in N's two's-complement representation,
-   excluding the sign.  For a NEGATIVE N this is the bit length of -(N+1),
-   not of (abs N) — e.g. (integer-length -1) = 0, (integer-length -2) = 1."
-  (let ((x (if (< n 0) (- (- 0 n) 1) n)) (len 0))
-    (loop (when (zerop x) (return len))
-      (setq x (ash x -1)) (setq len (+ len 1)))))
+
 
 (defun %complex-p (x)
   "Recognise a modus complex number — 3-slot array with %complex-marker
@@ -3409,7 +3231,6 @@
      (complex (aref x 1) (%negate-number (aref x 2))))
     (t x)))
 
-(defun complexp (x) (%complex-p x))
 
 (defun %complex-abs (z)
   "Magnitude of complex Z.  Used by the compiler's ABS macro for the complex
@@ -3484,12 +3305,6 @@
 ;;; (consp obj) stub that previously won under last-defun-wins so plain
 ;;; cons lists wouldn't (typep '(1 2 3) 'hash-table) → T anymore.
 
-;;; Symbol
-(defun symbol-name (sym)
-  "Return the name of a symbol as a string (stub)."
-  (if (null sym) "NIL"
-      (if (eq sym t) "T"
-          "")))
 
 ;;; Test helpers
 (defun random-from-interval (max &optional (min 0))
@@ -3519,22 +3334,7 @@
   (cond
     ((bignump n) (not (zerop (logand (%bignum-low-limb n) 1))))
     (t (not (zerop (logand n 1))))))
-(defun boundp (sym)
-  "Per CLHS, BOUNDP returns T iff SYM has a value cell binding.
-   Modus stores special-var values in the global hash table at fixed slot
-   0x10000080, keyed by name-hash.  Look SYM up by its hash.  Keywords are
-   always bound to themselves.  Non-symbol input signals type-error per
-   ANSI — we just return NIL for robustness.  (NB cl-packages.lisp defines
-   the authoritative BOUNDP later; this one is kept consistent with the
-   hash-table store so it stays correct under any load order.  The old
-   `(eq (car (car alist)) sym)` walk was ALSO wrong for the hash-keyed
-   store — the keys are name-hashes, not the SYM object.)"
-  (cond
-    ((null sym) t)
-    ((eq sym t) t)
-    ((keywordp sym) t)
-    ((or (fixnump sym) (consp sym) (characterp sym)) nil)
-    (t (%boundp-by-hash (aref sym 0)))))
+
 ;; Old definition was a process-of-elimination heuristic (the same
 ;; fragility class as the old functionp — see commit 7203e19).  It
 ;; returned T for closures, bignums, ratios, packages, and anything
@@ -3542,7 +3342,10 @@
 ;; for fn-addrs whose low bit happened to land on 0 or 1.  Replaced
 ;; with proper subtag checks.  In MVM all vectors share +subtag-array+
 ;; (#x32) — strings (#x31) are also vector-shaped per CL semantics.
-(defun vectorp (obj) (or (arrayp obj) (stringp obj)))
+(defun vectorp (obj)
+  "A one-dimensional array (CLHS): ARRAYP already excludes the marked
+   objects (structs, instances, conditions, complexes)."
+  (or (stringp obj) (and (arrayp obj) (= (array-rank obj) 1))))
 (defun remove-duplicates (seq &rest args)
   "Remove duplicates from SEQ. CL default keeps the LAST occurrence
    of each duplicate group (so the relative order of survivors is the
@@ -4185,3 +3988,1779 @@
              (setq acc (funcall fn acc (car cur)))
              (setq cur (cdr cur)))))))))
 
+
+;;; ============================================================
+;;; Missing CL functions
+;;; ============================================================
+
+;; complement was a global-cell stub here; cl-sequences.lisp now has the
+;; real per-closure implementation.  Removed so the cl-sequences version
+;; (which loads earlier but wins because we deleted the override) takes
+;; effect.  Multiple coexisting complements now work — was: every
+;; complement used the LAST fn, breaking (position x lst :test (complement
+;; #'eql)) once any other complement had been created.
+(defun identity (x) x)
+
+;; Sequence-aware REVERSE / NREVERSE — the prelude versions only handle
+;; lists.  CLHS reverse/nreverse take any sequence (list, vector, string).
+;; Override here (loads after prelude, last-defun-wins).
+(defun reverse (seq)
+  (cond
+    ((null seq) nil)
+    ((consp seq)
+     ;; List path (covers ordinary lists + chain-tail wrappers — they
+     ;; behave like lists for car/cdr walk; for true wrapper arrays
+     ;; we go through %mda-data below).
+     (let ((result nil) (cur seq))
+       (loop
+         (when (null cur) (return result))
+         (setq result (cons (car cur) result))
+         (setq cur (cdr cur)))))
+    ((%mda-p seq)
+     ;; Native MDA — reverse the logical sequence respecting fill-pointer.
+     (let* ((len (length seq))
+            (out (if (stringp seq) (make-string len) (make-array len)))
+            (i 0))
+       (loop
+         (when (= i len) (return out))
+         (aset out i (aref seq (- len i 1)))
+         (setq i (+ i 1)))))
+    ((stringp seq)
+     (let* ((len (array-length seq))
+            (out (make-string len))
+            (i 0))
+       (loop
+         (when (= i len) (return out))
+         (aset out i (aref seq (- len i 1)))
+         (setq i (+ i 1)))))
+    ((arrayp seq)
+     (let* ((len (array-length seq))
+            (out (make-array len))
+            (i 0))
+       (loop
+         (when (= i len) (return out))
+         (aset out i (aref seq (- len i 1)))
+         (setq i (+ i 1)))))
+    (t (error "REVERSE: ~S is not a sequence" seq))))
+
+(defun nreverse (seq)
+  (cond
+    ((null seq) nil)
+    ((consp seq)
+     ;; Destructive list reverse (from prelude).
+     (let ((prev nil) (cur seq))
+       (loop
+         (when (null cur) (return prev))
+         (let ((next (cdr cur)))
+           (rplacd cur prev)
+           (setq prev cur)
+           (setq cur next)))))
+    ((%mda-p seq)
+     ;; Reverse in place over logical length (respects fp).
+     (let* ((len (length seq))
+            (i 0)
+            (j (- len 1)))
+       (loop
+         (when (>= i j) (return seq))
+         (let ((tmp (aref seq i)))
+           (aset seq i (aref seq j))
+           (aset seq j tmp))
+         (setq i (+ i 1))
+         (setq j (- j 1)))))
+    ((or (stringp seq) (arrayp seq))
+     (let* ((len (array-length seq))
+            (i 0)
+            (j (- len 1)))
+       (loop
+         (when (>= i j) (return seq))
+         (let ((tmp (aref seq i)))
+           (aset seq i (aref seq j))
+           (aset seq j tmp))
+         (setq i (+ i 1))
+         (setq j (- j 1)))))
+    (t (error "NREVERSE: ~S is not a sequence" seq))))
+
+;; RPLACA + RPLACD early simple versions removed 2026-06-01 — the
+;; strict-arity, type-checking copies at L3258/L3269 win and are the
+;; ANSI-conformant ones.
+(defun list (&rest args)
+  "Return a list of all ARGS. Runtime function (list is also a compiler macro)."
+  args)
+
+(defun list* (a &rest more)
+  (if (null more) a
+    (if (null (cdr more)) (cons a (car more))
+      (let ((result (cons a nil))
+            (tail nil)
+            (cur more))
+        (setq tail result)
+        (loop
+          (when (null (cdr cur))
+            (set-cdr tail (car cur))
+            (return result))
+          (let ((new (cons (car cur) nil)))
+            (set-cdr tail new)
+            (setq tail new))
+          (setq cur (cdr cur)))))))
+
+(defun getf (plist indicator &rest default)
+  "Lookup INDICATOR in property list PLIST.  Per CLHS:
+   - extra args after the single optional default → program-error;
+   - improperly-terminated (dotted) plist → type-error/program-error
+     once the search reaches the dotted tail."
+  (when (and default (cdr default))
+    (error "getf: too many arguments"))
+  (let ((cur plist))
+    (loop
+      (cond
+        ((null cur) (return (if default (car default) nil)))
+        ((not (consp cur)) (error "getf: not a proper plist"))
+        ((not (consp (cdr cur))) (error "getf: odd-length plist"))
+        ((eq (car cur) indicator) (return (cadr cur)))
+        (t (setq cur (cddr cur)))))))
+
+(defun endp (x)
+  ;; CLHS: ENDP signals a TYPE-ERROR (not a plain error) when its argument is
+  ;; not a list.  A bare (error "…") produced a SIMPLE-ERROR that escaped
+  ;; callers' (handler-case … (type-error () …)) — e.g. alexandria proper-list-
+  ;; length on a dotted list ((endp <improper-tail>)) reported the wrong
+  ;; condition class (proper-list-length.2).
+  (cond ((null x) t)
+        ((consp x) nil)
+        (t (%signal-type-error))))
+
+;; NOTE: tree-equal lives in cl-sequences.lisp with full &key support
+;; (:test / :test-not / :allow-other-keys, leftmost-wins, program-error on
+;; bad keys).  An old 2-arg stub SHADOWED it (it assembled later),
+;; dropping all the :test variants and keyword/error tests.  Removed so the
+;; complete version wins.
+(defun copy-tree (tree)
+  ;; %RT-CONSP: a hash table is a tagged cons and must be a LEAF here, as the
+  ;; runtime CONSP now says (upstream COPY-TREE.2).
+  (if (%rt-consp tree)
+    (cons (copy-tree (car tree))
+          (copy-tree (cdr tree)))
+    tree))
+
+(defun %check-kw-allowed (args allowed)
+  "Generic kwarg validator.  Walk ARGS plist, signal program-error on
+   odd length or any indicator not EQ to a member of ALLOWED, unless
+   the plist itself contains :ALLOW-OTHER-KEYS T."
+  (let ((aok nil) (aok-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (%signal-program-error))
+      (let ((k (car cur)))
+        (when (and (eq k :allow-other-keys) (not aok-set))
+          (setq aok (cadr cur)) (setq aok-set t)))
+      (setq cur (cddr cur)))
+    (unless aok
+      (let ((cur args))
+        (loop
+          (when (null cur) (return nil))
+          (let ((k (car cur)))
+            (unless (or (eq k :allow-other-keys)
+                        (%kw-in-list-p k allowed))
+              (%signal-program-error)))
+          (setq cur (cddr cur)))))))
+
+(defun %seq-subst-check-kwargs (args)
+  "Validate keyword args for SUBSTITUTE/NSUBSTITUTE/SUBSTITUTE-IF/etc.
+   Allows :test :test-not :key :start :end :from-end :count
+   :allow-other-keys.  Signals program-error on bad input."
+  (let ((aok nil) (aok-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur)) (%signal-program-error))
+      (let ((k (car cur)))
+        (when (and (eq k :allow-other-keys) (not aok-set))
+          (setq aok (cadr cur)) (setq aok-set t)))
+      (setq cur (cddr cur)))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)))
+          (cond
+            ((eq k :test))
+            ((eq k :test-not))
+            ((eq k :key))
+            ((eq k :start))
+            ((eq k :end))
+            ((eq k :from-end))
+            ((eq k :count))
+            ((eq k :allow-other-keys))
+            (aok)
+            (t (%signal-program-error))))
+        (setq cur (cddr cur))))))
+
+(defun %subst-check-kwargs (args)
+  "Validate keyword args for SUBST/SUBST-IF/etc.  Allows :test :test-not
+   :key :allow-other-keys.  Signals program-error on bad input.
+
+   Note: don't use (symbolp k) as a type-check — compile-keyword emits
+   keywords as raw fixnums (compiler.lisp ~line 1720), so symbolp returns
+   NIL on every keyword.  The eq-vs-known-keyword cond-clauses already
+   correctly accept valid keys and reject invalid ones; falling through
+   to the (t ...) clause catches both unknown keywords and non-keyword
+   garbage (e.g. (subst ... 1 2)).  Earlier code had (not (symbolp k))
+   as a leading clause; that wrongly signaled program-error on every
+   real :key/:test/etc. and silently broke SUBST.ALLOW-OTHER-KEYS.* tests
+   (the symbolp check is unreachable as a defensive net but actively
+   misfires)."
+  ;; First pass: find :allow-other-keys (leftmost wins).
+  (let ((aok nil) (aok-set nil) (cur args))
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur))
+        (%signal-program-error))    ; odd-length plist
+      (let ((k (car cur)))
+        (when (and (eq k :allow-other-keys) (not aok-set))
+          (setq aok (cadr cur)) (setq aok-set t)))
+      (setq cur (cddr cur)))
+    ;; Second pass: each key must be recognized or :allow-other-keys T.
+    (let ((cur args))
+      (loop
+        (when (null cur) (return nil))
+        (let ((k (car cur)))
+          (cond
+            ((eq k :test))
+            ((eq k :test-not))
+            ((eq k :key))
+            ((eq k :allow-other-keys))
+            (aok)
+            (t (%signal-program-error))))
+        (setq cur (cddr cur))))))
+
+(defun %subst-match-p (item node test-fn test-not-fn key-fn)
+  (let ((v (if key-fn (funcall key-fn node) node)))
+    (cond
+      (test-fn     (funcall test-fn item v))
+      (test-not-fn (not (funcall test-not-fn item v)))
+      (t           (eql item v)))))
+
+(defun %subst-rec (new old tree test-fn test-not-fn key-fn)
+  (cond
+    ((%subst-match-p old tree test-fn test-not-fn key-fn) new)
+    ((consp tree)
+     (let ((a (%subst-rec new old (car tree) test-fn test-not-fn key-fn))
+           (d (%subst-rec new old (cdr tree) test-fn test-not-fn key-fn)))
+       (if (and (eq a (car tree)) (eq d (cdr tree))) tree
+           (cons a d))))
+    (t tree)))
+
+(defun subst (new old tree &rest args)
+  ;; Honor :test, :test-not, :key per CLHS.  Default test = eql.
+  ;; Inline kwarg validation: bad kwargs signal program-error unless
+  ;; :allow-other-keys T.  Per CLHS, leftmost :allow-other-keys wins.
+  (let ((test-fn nil) (test-not-fn nil) (key-fn nil)
+        (test-set nil) (tn-set nil) (key-set nil)
+        (aok nil) (aok-set nil)
+        (cur args)
+        (bad-key nil))
+    ;; Single pass: collect all kwargs + detect first bad key + first :aok.
+    (loop
+      (when (null cur) (return nil))
+      (when (null (cdr cur))
+        (%signal-program-error))     ; odd-length plist
+      (let ((k (car cur)) (v (cadr cur)))
+        ;; Don't reject by symbolp — keywords are emitted as raw fixnums
+        ;; (compile-keyword in compiler.lisp).  The cond's eq-clauses
+        ;; match valid keys; the (t ...) branch records anything else as
+        ;; bad-key, which only signals if no :allow-other-keys T was set.
+        (cond
+          ((eq k :test)     (unless test-set (setq test-fn v) (setq test-set t)))
+          ((eq k :test-not) (unless tn-set (setq test-not-fn v) (setq tn-set t)))
+          ((eq k :key)      (unless key-set (setq key-fn v) (setq key-set t)))
+          ((eq k :allow-other-keys)
+                            (unless aok-set (setq aok v) (setq aok-set t)))
+          (t (when (null bad-key) (setq bad-key k))))
+        (setq cur (cddr cur))))
+    ;; If a bad key was seen and :allow-other-keys T was not present, error.
+    (when (and bad-key (not aok))
+      (%signal-program-error))
+    (%subst-rec new old tree test-fn test-not-fn key-fn)))
+
+(defun revappend (list tail)
+  (let ((cur list))
+    (loop
+      (when (null cur) (return tail))
+      (setq tail (cons (car cur) tail))
+      (setq cur (cdr cur)))))
+
+;; NRECONC early simple version removed 2026-06-01 — strict-arity
+;; copy at L3284 wins.
+(defun butlast (list &rest n-arg)
+  ;; ANSI: (butlast list &optional (n 1)). Extra args → program-error.
+  (when (and n-arg (cdr n-arg))
+    (error "butlast: too many arguments"))
+  (when (and list (not (consp list)))
+    (error "butlast: argument is not a list"))
+  (let ((n (if n-arg (car n-arg) 1)))
+    (when (or (not (fixnump n)) (< n 0))
+      (%signal-type-error))
+    (let ((len (list-length list)))
+      (if (<= len n) nil
+        (let ((result nil) (i 0) (cur list))
+          (loop
+            (when (= i (- len n)) (return (nreverse result)))
+            (setq result (cons (car cur) result))
+            (setq cur (cdr cur))
+            (setq i (+ i 1))))))))
+
+;; ACONS early simple version removed 2026-06-01 — strict-arity
+;; copy at L3276+ wins.
+(defun pairlis (keys data &rest alist-arg)
+  "PAIRLIS keys data &optional alist — extra args after ALIST are a
+   program-error.  Per CLHS, KEYS and DATA must be lists of equal
+   length; an atom in place of either is a type-error."
+  (when (and alist-arg (cdr alist-arg))
+    (error "pairlis: too many arguments"))
+  (when (and keys (not (consp keys)))
+    (error "pairlis: keys is not a list"))
+  (when (and data (not (consp data)))
+    (error "pairlis: data is not a list"))
+  (let ((alist (if alist-arg (car alist-arg) nil))
+        (k keys) (d data))
+    (loop
+      (when (null k)
+        (when d (error "pairlis: keys shorter than data"))
+        (return alist))
+      (when (null d) (error "pairlis: data shorter than keys"))
+      (setq alist (cons (cons (car k) (car d)) alist))
+      (setq k (cdr k))
+      (setq d (cdr d)))))
+
+(defun make-list (n &rest args)
+  ;; ANSI: (make-list size &key initial-element). Unknown keywords
+  ;; are a program-error unless :allow-other-keys t is also present.
+  ;; For duplicate keys, first-binding wins.
+  (when (or (not (fixnump n)) (< n 0))
+    (error "make-list: size must be a non-negative fixnum"))
+  ;; Pre-scan for :allow-other-keys so it doesn't have to appear first.
+  (let ((allow-other nil) (scan args))
+    (loop
+      (when (null scan) (return nil))
+      (when (null (cdr scan))
+        (error "make-list: odd number of keyword arguments"))
+      (when (eq (car scan) :allow-other-keys)
+        (setq allow-other (cadr scan))
+        (return nil))
+      (setq scan (cddr scan)))
+    (let ((initial-element nil) (init-set nil) (cur args))
+      (loop
+        (when (null cur) (return nil))
+        (cond
+          ((eq (car cur) :initial-element)
+           (unless init-set
+             (setq initial-element (cadr cur))
+             (setq init-set t)))
+          ((eq (car cur) :allow-other-keys) nil)
+          (t (unless allow-other
+               (error "make-list: unknown keyword argument"))))
+        (setq cur (cddr cur)))
+      (let ((result nil) (i 0))
+        (loop
+          (when (= i n) (return result))
+          (setq result (cons initial-element result))
+          (setq i (+ i 1)))))))
+
+(defun tailp (obj list)
+  (let ((cur list))
+    (loop
+      (when (eql cur obj) (return t))
+      (when (atom cur) (return (eql cur obj)))
+      (setq cur (cdr cur)))))
+
+(defun ldiff (list obj)
+  "Return a copy of LIST up to (but not including) OBJ if OBJ is a tail.
+   Per CLHS LDIFF: if OBJ isn't a tail (i.e., (tailp OBJ LIST) is false),
+   return a copy of LIST including any dotted tail."
+  (let ((result nil) (cur list))
+    (loop
+      (when (eql cur obj) (return (nreverse result)))
+      (when (atom cur)
+        ;; OBJ wasn't a tail. Append the dotted final atom to preserve
+        ;; the input shape (proper list → proper list, dotted → dotted).
+        (let ((rev (nreverse result)))
+          (if (null rev)
+              (return cur)
+              (let ((last-cell rev))
+                (loop (when (null (cdr last-cell)) (return nil))
+                  (setq last-cell (cdr last-cell)))
+                (set-cdr last-cell cur)
+                (return rev)))))
+      (setq result (cons (car cur) result))
+      (setq cur (cdr cur)))))
+
+(defun listp (x)
+  (or (null x) (consp x)))
+
+;;; ============================================================
+;;; member-if / member-if-not
+;;; ============================================================
+(defun member-if (pred list &rest args)
+  "Return first tail of LIST whose car satisfies PRED.
+   Outer LISTP check signals TYPE-ERROR for non-lists so tests like
+   (catch-type-error (member-if-not #'listp \"abc\")) get a clean
+   error instead of spinning a (cdr garbage) loop until SIGALRM kills
+   the fork. Improper-list tails (proper-with-dotted-end) are walked
+   to NIL or to a non-cons; we only check the initial argument."
+  (unless (listp list)
+    (error "member-if: not a list ~S" list))
+  (%subst-check-kwargs args)
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur list))
+    (loop
+      (when (null cur) (return nil))
+      (when (atom cur) (return nil))
+      (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
+        (when (funcall pred k) (return cur)))
+      (setq cur (cdr cur)))))
+
+(defun member-if-not (pred list &rest args)
+  "Return first tail of LIST whose car does NOT satisfy PRED.  Inlined
+   instead of `(apply #'member-if (lambda ...) ...)' to avoid the
+   apply-of-rest-through-sibling-defun fragility."
+  (unless (listp list)
+    (error "member-if-not: not a list ~S" list))
+  (%subst-check-kwargs args)
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur list))
+    (loop
+      (when (null cur) (return nil))
+      (when (atom cur) (return nil))
+      (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
+        (unless (funcall pred k) (return cur)))
+      (setq cur (cdr cur)))))
+
+;;; ============================================================
+;;; rassoc / rassoc-if / rassoc-if-not / assoc-if / assoc-if-not
+;;; ============================================================
+(defun rassoc (item alist &rest args)
+  "Find first pair in ALIST whose cdr matches ITEM.
+   Skip NIL entries; error on other non-cons alist element.
+   :test defaults to inline `eql` (#'eql is unusable in MVM)."
+  (%subst-check-kwargs args)
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (cur alist))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "rassoc: not a cons"))
+              (t (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
+                   (when (if test-fn (funcall test-fn item val) (eql item val))
+                     (return pair))))))
+      (setq cur (cdr cur)))))
+
+(defun rassoc-if (pred alist &rest args)
+  "Find first pair in ALIST whose cdr satisfies PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS)."
+  (%subst-check-kwargs args)
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur alist))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "rassoc-if: not a cons"))
+              (t (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
+                   (when (funcall pred val)
+                     (return pair))))))
+      (setq cur (cdr cur)))))
+
+(defun rassoc-if-not (pred alist &rest args)
+  "Find first pair in ALIST whose cdr does NOT satisfy PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS).
+   Inlined (rather than `(apply #'rassoc-if (lambda ...) ...)') to dodge
+   apply-of-rest fragility."
+  (%subst-check-kwargs args)
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur alist))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "rassoc-if-not: not a cons"))
+              (t (let ((val (if key-fn (funcall key-fn (cdr pair)) (cdr pair))))
+                   (when (not (funcall pred val))
+                     (return pair))))))
+      (setq cur (cdr cur)))))
+
+(defun assoc-if (pred alist &rest args)
+  "Find first pair in ALIST whose car satisfies PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS)."
+  (%subst-check-kwargs args)
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur alist))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "assoc-if: not a cons"))
+              (t (let ((k (if key-fn (funcall key-fn (car pair)) (car pair))))
+                   (when (funcall pred k)
+                     (return pair))))))
+      (setq cur (cdr cur)))))
+
+(defun assoc-if-not (pred alist &rest args)
+  "Find first pair in ALIST whose car does NOT satisfy PRED.
+   Skip NIL entries (SBCL-compat); error on other non-cons (CLHS).
+   Inlined (rather than `(apply #'assoc-if (lambda ...) ...)') to dodge
+   apply-of-rest fragility."
+  (%subst-check-kwargs args)
+  (let* ((parsed (parse-test-key args))
+         (key-fn (cdr parsed))
+         (cur alist))
+    (loop
+      (when (null cur) (return nil))
+      (let ((pair (car cur)))
+        (cond ((null pair) nil)
+              ((not (consp pair)) (error "assoc-if-not: not a cons"))
+              (t (let ((k (if key-fn (funcall key-fn (car pair)) (car pair))))
+                   (when (not (funcall pred k))
+                     (return pair))))))
+      (setq cur (cdr cur)))))
+
+;; find-if / find-if-not previously had bridge overrides here that only
+;; honored :test/:key — they silently dropped :from-end, :start, :end.
+;; Removed in favor of cl-sequences.lisp's full implementations, which
+;; load earlier in source order but win because (a) they're complete and
+;; (b) MVM's "last-defun-wins" rule is satisfied by deleting the override.
+
+;;; ============================================================
+;;; vector-push / vector-push-extend / fill-pointer
+;;; ============================================================
+;;; Vectors with fill-pointers are represented as (cons fill-pointer underlying-array).
+;;; Regular arrays are just arrays (no fill pointer support).
+
+;; Helper: peel adjustable wrapper if present.  Returns the inner cell
+;; (which is either an array, a fill-pointer wrapper, a displaced wrapper,
+;; or a multi-dim wrapper).
+(defun %fp-inner (arr)
+  (if (and (consp arr) (eql (car arr) 8765432)) (cdr arr) arr))
+
+(defun array-has-fill-pointer-p (arr)
+  "True if ARR has a fill pointer.
+   Plain (cons fp underlying) → T.  (cons 8765432 (cons fp underlying)) → T.
+   (cons 8765432 underlying) → NIL (adjustable but no fp).
+   (cons 9867654 (cons dims data)) → NIL (multi-dim wrapper, no fp).
+   Native MDA #x34 → T iff %mda-fp slot is non-NIL."
+  (cond
+    ((%mda-p arr) (not (null (%mda-fp arr))))
+    ;; Multi-dim cons-wrapper has marker 9867654 in head — never has fp.
+    ((and (consp arr) (eql (car arr) 9867654)) nil)
+    (t (let ((y (%fp-inner arr)))
+         (if (consp y) (fixnump (car y)) nil)))))
+
+(defun fill-pointer (arr)
+  "Return the fill pointer of ARR.  Per CLHS, signal type-error when
+   ARR has no fill pointer (rank>1 array, rank-0 array, plain vector
+   created without :fill-pointer, etc.) — required by the test
+   suite's signals-error wrappers."
+  (cond
+    ((%mda-p arr)
+     (let ((fp (%mda-fp arr)))
+       (if fp fp (progn (%signal-type-error) nil))))
+    (t (let ((y (%fp-inner arr)))
+         (if (and (consp y) (fixnump (car y)))
+             (car y)
+             (progn (%signal-type-error) nil))))))
+
+(defun set-fill-pointer (arr val)
+  "Set fill pointer of ARR to VAL."
+  (cond
+    ((%mda-p arr) (%mda-set-fp arr val) val)
+    (t (let ((y (%fp-inner arr)))
+         (when (and (consp y) (fixnump (car y)))
+           (set-car y val))
+         val))))
+
+(defun vector (&rest elements)
+  "CLHS: return a fresh simple-vector containing the args.
+   At compile time the VECTOR macro inlines `(let ((v (make-array N))) (aset v 0 a0) … v)';
+   this defun is the runtime fallback so `(vector …)' / `(apply #'vector …)' at
+   runtime EVAL works without crashing on missing-function."
+  (let* ((n (length elements))
+         (v (make-array n))
+         (i 0)
+         (cur elements))
+    (loop
+      (when (null cur) (return v))
+      (aset v i (car cur))
+      (setq i (+ i 1))
+      (setq cur (cdr cur)))))
+
+(defun vector-push (new-element vector)
+  "Push NEW-ELEMENT onto VECTOR (with fill pointer). Returns fill pointer or nil.
+   String underlying stores fixnum char-codes; coerce a character element
+   via char-code so subsequent (aref ...) returns the char correctly.
+   CLHS: signals type-error if VECTOR has no fill pointer.
+   Displaced-aware: writes at (+ fp offset) when MDA has a displaced-to slot."
+  (cond
+    ((%mda-p vector)
+     ;; MDA fast path: read fp slot, write into data, advance fp.
+     (let ((fp (%mda-fp vector)))
+       (cond
+         ((null fp) (%signal-type-error))
+         (t (let* ((arr (%mda-data vector))
+                   (off (%mda-offset vector))
+                   (dims (%mda-dims vector))
+                   (cap (if (consp dims) (car dims) (array-length arr))))
+              (if (>= fp cap)
+                  nil
+                  (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                       (char-code new-element)
+                                       new-element)))
+                    (aset arr (+ fp off) store-val)
+                    (%mda-set-fp vector (+ fp 1))
+                    fp)))))))
+    (t (let ((inner (%fp-inner vector)))
+         (cond
+           ((and (consp inner) (fixnump (car inner)))
+            (let ((fp (car inner))
+                  (arr (cdr inner)))
+              (let ((len (array-length arr)))
+                (if (>= fp len)
+                    nil
+                    (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                         (char-code new-element)
+                                         new-element)))
+                      (aset arr fp store-val)
+                      (set-car inner (+ fp 1))
+                      fp)))))
+           (t (%signal-type-error)))))))
+
+(defun vector-push-extend (new-element vector &rest args)
+  "Push NEW-ELEMENT onto VECTOR, extending if needed.  Character on
+   string-backed vector is char-code-converted (vector-push-extend test
+   20914 was storing tagged character into the string array → garbage
+   on later aref).
+   CLHS: signals type-error if VECTOR has no fill pointer.
+   For displaced+adjustable arrays: when fp reaches declared dim, the
+   displacement is broken — fresh local backing is allocated and the
+   old contents are copied verbatim, per CLHS adjust-array semantics."
+  (cond
+    ((%mda-p vector)
+     ;; MDA fast path: handles fp + auto-extend; displacement aware.
+     (let ((fp (%mda-fp vector)))
+       (cond
+         ((null fp) (%signal-type-error))
+         (t (let* ((arr (%mda-data vector))
+                   (disp (%mda-displaced vector))
+                   (off (%mda-offset vector))
+                   ;; Declared length: dim 0 (1-D fast path).
+                   (dims (%mda-dims vector))
+                   (cap (if (consp dims) (car dims) (array-length arr))))
+              (when (>= fp cap)
+                ;; Need to grow.  Use extension hint (first &rest arg if given)
+                ;; as the MINIMUM number of additional elements per CLHS.
+                ;; Default to 1, fall back to cap (2× growth) when that's larger.
+                (let* ((hint (cond ((and (consp args) (integerp (car args)) (> (car args) 0)) (car args))
+                                   (t 1)))
+                       (new-cap (max (+ cap hint) (+ fp 1) (* cap 2)))
+                       (str-p (or (stringp arr)
+                                  (and disp (stringp disp))))
+                       (new-arr (if str-p
+                                    (%make-string-array new-cap)
+                                    (make-array new-cap))))
+                  ;; Copy old visible contents (0..cap from old aref-routing)
+                  ;; through the MDA's current view so displacement is honored.
+                  (let ((i 0))
+                    (loop
+                      (when (>= i cap) (return))
+                      (let ((v (cond
+                                 (disp (aref arr (+ off i)))
+                                 (t (aref arr i)))))
+                        (aset new-arr i v))
+                      (setq i (+ i 1))))
+                  ;; Update MDA: data ← new-arr, displaced ← nil, offset ← 0,
+                  ;; dims ← (new-cap).  Adjusting dims keeps array-total-size
+                  ;; honest after the grow.
+                  (%prim-aset vector 6 new-arr)
+                  (%prim-aset vector 3 nil)
+                  (%prim-aset vector 4 0)
+                  (%prim-aset vector 1 (list new-cap))
+                  (setq arr new-arr)
+                  (setq disp nil)
+                  (setq off 0)
+                  (setq cap new-cap)))
+              ;; Now write at (fp + off) in the underlying.
+              (let* ((target-arr arr)
+                     (target-idx (+ fp off))
+                     (store-val (if (and (stringp target-arr) (characterp new-element))
+                                    (char-code new-element)
+                                    new-element)))
+                (aset target-arr target-idx store-val))
+              (%mda-set-fp vector (+ fp 1))
+              fp)))))
+    (t (let ((inner (%fp-inner vector)))
+         (cond
+           ((and (consp inner) (fixnump (car inner)))
+            (let ((fp (car inner))
+                  (arr (cdr inner)))
+              (let ((len (array-length arr)))
+                (when (>= fp len)
+                  (let* ((hint (cond ((and (consp args) (integerp (car args)) (> (car args) 0)) (car args))
+                                     (t 1)))
+                         (new-len (max (+ len hint) (+ fp 1) (* len 2)))
+                         (new-arr nil))
+                    (if (stringp arr)
+                        (setq new-arr (%make-string-array new-len))
+                        (setq new-arr (make-array new-len)))
+                    (let ((i 0))
+                      (loop
+                        (when (>= i len) (return))
+                        (aset new-arr i (aref arr i))
+                        (setq i (+ i 1))))
+                    (set-cdr inner new-arr)
+                    (setq arr new-arr)))
+                (let ((store-val (if (and (stringp arr) (characterp new-element))
+                                     (char-code new-element)
+                                     new-element)))
+                  (aset arr fp store-val))
+                (set-car inner (+ fp 1))
+                fp)))
+           (t (%signal-type-error)))))))
+
+(defun vector-pop (vector)
+  "Pop an element from VECTOR (with fill pointer)."
+  (cond
+    ((%mda-p vector)
+     (let ((fp (%mda-fp vector)))
+       (if (and fp (> fp 0))
+           (let ((new-fp (- fp 1)))
+             (%mda-set-fp vector new-fp)
+             (aref (%mda-data vector) new-fp))
+           (error "vector-pop: empty vector"))))
+    (t (let ((vector (%fp-inner vector)))
+         (if (and (consp vector) (fixnump (car vector)))
+             (let ((fp (car vector)))
+               (if (> fp 0)
+                   (let ((new-fp (- fp 1)))
+                     (set-car vector new-fp)
+                     (aref (cdr vector) new-fp))
+                   (error "vector-pop: empty vector")))
+             (error "vector-pop: no fill pointer"))))))
+
+;;; ============================================================
+;;; set operations (set-exclusive-or, nset-exclusive-or)
+;;; ============================================================
+(defun %set-exclusive-or-impl (list1 list2 args)
+  "Positional helper for set-exclusive-or. Takes args as a real list.
+   Inlined search loops avoid the nested-lambda-with-capture pattern
+   that's fragile in MVM (closure cell aliasing across iterations)."
+  (let* ((parsed (parse-test-key args))
+         (test-fn (car parsed))
+         (key-fn (cdr parsed))
+         (result nil))
+    ;; Elements in list1 not in list2
+    (dolist (e1 list1)
+      (let ((k1 (if key-fn (funcall key-fn e1) e1))
+            (found nil)
+            (cur list2))
+        (loop
+          (when (or found (null cur)) (return nil))
+          (let ((v2 (if key-fn (funcall key-fn (car cur)) (car cur))))
+            (when (if test-fn (funcall test-fn k1 v2) (eql k1 v2))
+              (setq found t)))
+          (setq cur (cdr cur)))
+        (unless found (setq result (cons e1 result)))))
+    ;; Elements in list2 not in list1
+    (dolist (e2 list2)
+      (let ((k2 (if key-fn (funcall key-fn e2) e2))
+            (found nil)
+            (cur list1))
+        (loop
+          (when (or found (null cur)) (return nil))
+          (let ((v1 (if key-fn (funcall key-fn (car cur)) (car cur))))
+            (when (if test-fn (funcall test-fn v1 k2) (eql v1 k2))
+              (setq found t)))
+          (setq cur (cdr cur)))
+        (unless found (setq result (cons e2 result)))))
+    result))
+
+(defun set-exclusive-or (list1 list2 &rest args)
+  "Return symmetric difference of LIST1 and LIST2.
+   :test defaults to inline `eql` (#'eql is unusable in MVM)."
+  (%set-exclusive-or-impl list1 list2 args))
+
+(defun nset-exclusive-or (list1 list2 &rest args)
+  "Destructive set-exclusive-or. Routes through positional helper to
+   dodge apply-of-rest fragility."
+  (%set-exclusive-or-impl list1 list2 args))
+
+  ; Stub: return nil (unknown)
+
+;;; ============================================================
+;;; bit-vector operations
+;;; ============================================================
+(defun %bit-op (op v1 v2 &optional result-vec)
+  "Apply bitwise OP element-wise to bit arrays V1 and V2.
+   When RESULT-VEC is unsupplied, allocate a fresh array with the
+   SAME SHAPE as V1 (multi-dim aware): bit-and.{12..16}/etc. compare
+   `(values … result)` to `#2a((…) (…))`-shaped expecteds, so a flat
+   vector return mismatches the expected even when the element data
+   is correct."
+  (let ((len (min (array-length v1) (if v2 (array-length v2) (array-length v1)))))
+    (let ((result (cond
+                    ((eq result-vec t) v1)              ; in-place into V1
+                    (result-vec result-vec)             ; user-supplied dest
+                    (t
+                     ;; Allocate same shape as v1.  If v1 is an MDA
+                     ;; (multi-dim or has :element-type 'bit), preserve
+                     ;; both via :dimensions + :element-type.
+                     (make-array (array-dimensions v1)
+                                 :element-type 'bit)))))
+      (let ((i 0))
+        (loop
+          (when (>= i len) (return result))
+          (let ((b1 (aref v1 i))
+                (b2 (if v2 (aref v2 i) 0)))
+            (aset result i (logand 1 (funcall op b1 b2))))
+          (setq i (+ i 1)))))))
+
+(defun %bit-raw-data (v len)
+  "The word vector holding V's bits in row-major order when V is a plain
+   vector or a non-displaced native MDA over one, with room for LEN; else NIL."
+  (cond ((or (null v) (consp v) (fixnump v)) nil)
+        ((%mda-p v)
+         (and (null (%mda-displaced v))
+              (let ((d (%mda-data v)))
+                (and d (not (consp d)) (not (%mda-p d)) (not (%prim-stringp d))
+                     (not (eq (obj-subtag d) #x12))
+                     (>= (array-length d) len) d))))
+        ((%prim-stringp v) nil)
+        ((eq (obj-subtag v) #x12) nil)
+        ((>= (array-length v) len) v)
+        (t nil)))
+
+(defun %bit-op-fast (code v1 v2 result-vec op)
+  "%BIT-OP with the operation as CODE (0 and 1 ior 2 xor 3 eqv 4 nand 5 nor
+   6 andc1 7 andc2 8 orc1 9 orc2) over the arrays' raw data, when all three
+   expose it: one raw read per operand and one raw write per bit, where
+   %BIT-OP paid a generic AREF per operand, a closure call and a generic
+   ASET (cl-bench BITVECTORS, 2265x SBCL).  Otherwise %BIT-OP with OP."
+  (let* ((len (min (array-length v1) (array-length v2)))
+         (result (cond ((eq result-vec t) v1)
+                       (result-vec result-vec)
+                       (t (make-array (array-dimensions v1) :element-type 'bit))))
+         (d1 (%bit-raw-data v1 len))
+         (d2 (and d1 (%bit-raw-data v2 len)))
+         (dr (and d2 (%bit-raw-data result len))))
+    (if (null dr)
+        (%bit-op op v1 v2 result)
+        (let ((i 0))
+          (loop
+            (when (>= i len) (return result))
+            (let* ((a (logand (%prim-aref d1 i) 1))
+                   (b (logand (%prim-aref d2 i) 1))
+                   (r (cond ((= code 0) (logand a b))
+                            ((= code 1) (logior a b))
+                            ((= code 2) (logxor a b))
+                            ((= code 3) (logxor 1 (logxor a b)))
+                            ((= code 4) (logxor 1 (logand a b)))
+                            ((= code 5) (logxor 1 (logior a b)))
+                            ((= code 6) (logand (logxor 1 a) b))
+                            ((= code 7) (logand a (logxor 1 b)))
+                            ((= code 8) (logior (logxor 1 a) b))
+                            (t (logior a (logxor 1 b))))))
+              (%prim-aset dr i r))
+            (setq i (+ i 1)))))))
+
+(defun bit-and (v1 v2 &optional result) (%bit-op-fast 0 v1 v2 result (lambda (a b) (logand a b))))
+(defun bit-ior (v1 v2 &optional result) (%bit-op-fast 1 v1 v2 result (lambda (a b) (logior a b))))
+(defun bit-xor (v1 v2 &optional result) (%bit-op-fast 2 v1 v2 result (lambda (a b) (logxor a b))))
+(defun bit-eqv (v1 v2 &optional result) (%bit-op-fast 3 v1 v2 result (lambda (a b) (logxor 1 (logxor a b)))))
+(defun bit-nand (v1 v2 &optional result) (%bit-op-fast 4 v1 v2 result (lambda (a b) (logxor 1 (logand a b)))))
+(defun bit-nor (v1 v2 &optional result) (%bit-op-fast 5 v1 v2 result (lambda (a b) (logxor 1 (logior a b)))))
+(defun bit-andc1 (v1 v2 &optional result) (%bit-op-fast 6 v1 v2 result (lambda (a b) (logand (logxor 1 a) b))))
+(defun bit-andc2 (v1 v2 &optional result) (%bit-op-fast 7 v1 v2 result (lambda (a b) (logand a (logxor 1 b)))))
+(defun bit-orc1 (v1 v2 &optional result) (%bit-op-fast 8 v1 v2 result (lambda (a b) (logior (logxor 1 a) b))))
+(defun bit-orc2 (v1 v2 &optional result) (%bit-op-fast 9 v1 v2 result (lambda (a b) (logior a (logxor 1 b)))))
+
+(defun bit-not (v1 &optional result)
+  (let ((len (array-length v1)))
+    (let ((out (if result
+                   (if (eq result t) v1 result)
+                   (make-array len))))
+      (let ((i 0))
+        (loop
+          (when (>= i len) (return out))
+          (aset out i (logxor 1 (aref v1 i)))
+          (setq i (+ i 1)))))))
+
+;;; ============================================================
+;;; rotatef/shiftf as runtime functions (for edge cases where
+;;; SBCL macro expansion doesn't reach)
+;;; ============================================================
+;;; Note: The compiler handles ROTATEF/SHIFTF specially for common cases.
+;;; These runtime versions handle symbol-only cases.
+(defun %rotatef2 (place1-sym place2-sym)
+  "Rotate values of two dynamic variables."
+  (let ((tmp (symbol-value place1-sym)))
+    (set-symbol-value place1-sym (symbol-value place2-sym))
+    (set-symbol-value place2-sym tmp)
+    nil))
+
+;;; ============================================================
+;;; C*R Extensions (4-deep)
+;;; ============================================================
+;;;
+;;; Use %safe-car / %safe-cdr at each composition step so that calling
+;;; e.g. (cdaaar 'a) signals TYPE-ERROR (per ANSI) rather than silently
+;;; dereferencing garbage at the symbol's "car slot".
+(defun %safe-car (x)
+  (if (consp x) (car x)
+      (if (null x) nil (%signal-type-error))))
+
+(defun %safe-cdr (x)
+  (if (consp x) (cdr x)
+      (if (null x) nil (%signal-type-error))))
+
+;; 3-letter cXXr — the 2-letter forms (CAAR/CADR/CDAR/CDDR) are routed
+;; through %safe-car/%safe-cdr in compile-caar etc. (mvm/compiler.lisp);
+;; CADDR and CDDDR get safer defuns here so 4-letter forms built on top
+;; of them inherit the type-check.  runtime/cons.lisp defines a lax
+;; (car (cdr (cdr x))) version of CADDR — last-defun-wins so this
+;; override takes effect at runtime.
+;; 2-letter c*r accessors — needed as real defuns for #'cadr / #'cddr
+;; etc. in function-designator contexts (e.g. LOOP BY #'cddr).  The
+;; compile-time primitive paths handle these as direct calls, but
+;; (function NAME) needs an fdefinition table entry.
+(defun caar (x) (%safe-car (%safe-car x)))
+
+(defun cadr (x) (%safe-car (%safe-cdr x)))
+
+(defun cdar (x) (%safe-cdr (%safe-car x)))
+
+(defun cddr (x) (%safe-cdr (%safe-cdr x)))
+
+(defun caaar (x) (%safe-car (%safe-car (%safe-car x))))
+
+(defun caadr (x) (%safe-car (%safe-car (%safe-cdr x))))
+
+(defun cadar (x) (%safe-car (%safe-cdr (%safe-car x))))
+
+(defun caddr (x) (%safe-car (%safe-cdr (%safe-cdr x))))
+
+(defun cdaar (x) (%safe-cdr (%safe-car (%safe-car x))))
+
+(defun cdadr (x) (%safe-cdr (%safe-car (%safe-cdr x))))
+
+(defun cddar (x) (%safe-cdr (%safe-cdr (%safe-car x))))
+
+(defun cdddr (x) (%safe-cdr (%safe-cdr (%safe-cdr x))))
+
+(defun caaaar (x) (%safe-car (caaar x)))
+
+(defun caaadr (x) (%safe-car (caadr x)))
+
+(defun caadar (x) (%safe-car (cadar x)))
+
+(defun caaddr (x) (%safe-car (caddr x)))
+
+(defun cadaar (x) (%safe-car (cdaar x)))
+
+(defun cadadr (x) (%safe-car (cdadr x)))
+
+(defun caddar (x) (%safe-car (cddar x)))
+
+(defun cadddr (x) (%safe-car (cdddr x)))
+
+(defun cdaaar (x) (%safe-cdr (caaar x)))
+
+(defun cdaadr (x) (%safe-cdr (caadr x)))
+
+(defun cdadar (x) (%safe-cdr (cadar x)))
+
+(defun cdaddr (x) (%safe-cdr (caddr x)))
+
+(defun cddaar (x) (%safe-cdr (cdaar x)))
+
+(defun cddadr (x) (%safe-cdr (cdadr x)))
+
+(defun cdddar (x) (%safe-cdr (cddar x)))
+
+(defun cddddr (x) (%safe-cdr (cdddr x)))
+
+;;; ============================================================
+;;; Array Functions
+;;; ============================================================
+(defun array-dimensions (a)
+  "Return list of dimensions of array A.
+   First: native MDA (subtag #x34) carries dims directly in slot 1.
+   Otherwise peels (cons 8765432 ...) adjustable wrapper and detects
+   multi-dim (9867654), fill-pointer (cons FP ...), and displaced
+   (cons (cons SIZE OFFSET) ...) wrappers.
+
+   CLHS: signal TYPE-ERROR on non-array."
+  (cond
+    ((%mda-p a) (%mda-dims a))
+    (t
+     (let ((a (if (and (consp a) (eql (car a) 8765432)) (cdr a) a)))
+       (cond
+         ((and (consp a) (eql (car a) 9867654) (consp (cdr a)))
+          (cadr a))
+         ((and (consp a) (fixnump (car a)))
+          ;; fill-pointer wrapper — declared dim is underlying length
+          (list (array-length (cdr a))))
+         ((and (consp a) (consp (car a)))
+          ;; displaced wrapper — declared dim is the size in the head cons
+          (list (car (car a))))
+         ((arrayp a) (list (array-length a)))
+         ((stringp a) (list (array-length a)))
+         (t (error "ARRAY-DIMENSIONS: ~S is not an array" a)))))))
+
+(defun %element-type-expand (type)
+  "TYPE with user DEFTYPEs expanded until its head is not one (bounded), so an
+   element type spelled through a DEFTYPE -- flexi-streams' (deftype char* ()
+   'character) -- is classified as what it names.  Standard type names have no
+   DEFTYPE entry and come back unchanged."
+  (let ((n 0))
+    (loop
+      (let ((head (if (consp type) (car type) type)))
+        (if (and head (symbolp head) (< n 64) (%deftype-lookup head))
+            (setq type (%expand-deftype type) n (+ n 1))
+            (return type))))))
+
+(defun upgraded-array-element-type (type &optional environment)
+  "Return the upgraded element type Modus actually uses for arrays of TYPE.
+   Per CLHS 15.1.2.1: BIT upgrades to BIT, CHARACTER/BASE-CHAR upgrade to
+   CHARACTER (Modus stores all chars uniformly), NIL upgrades to NIL, and
+   everything else upgrades to T (Modus stores general elements as tagged
+   words)."
+  (declare (ignore environment))
+  (setq type (%element-type-expand type))
+  (cond
+    ;; NIL element type — array that can hold no objects.
+    ((null type) nil)
+    ;; BIT — Modus stores bit-vectors specialized to BIT.
+    ((eq type 'bit) 'bit)
+    ;; (UNSIGNED-BYTE 1) is type-equivalent to BIT.
+    ((equal type '(unsigned-byte 1)) 'bit)
+    ((equal type '(integer 0 1)) 'bit)
+    ((equal type '(mod 2)) 'bit)
+    ;; Character element types upgrade to CHARACTER.
+    ((or (eq type 'character)
+         (eq type 'base-char)
+         (eq type 'standard-char)
+         (eq type 'extended-char))
+     'character)
+    ;; (UNSIGNED-BYTE 8) and near-equivalents upgrade to (UNSIGNED-BYTE 8)
+    ;; — Modus stores these in a byte-packed vector (subtag #x11).
+    ((%u8-element-type-p type) '(unsigned-byte 8))
+    ;; SINGLE-FLOAT (and SHORT-FLOAT) — the packed #x12 vector.
+    ((%f32-element-type-p type) 'single-float)
+    ;; Everything else is stored as a general (T) element.
+    (t t)))
+
+(defun simple-vector-p (x)
+  "T iff X is a SIMPLE-VECTOR — a one-dimensional, non-displaced array of
+   element-type T with no fill pointer and not adjustable.  Strings, bit
+   arrays, character arrays, multi-dimensional arrays, rank-0 arrays and
+   fill-pointered / displaced vectors are NOT simple-vectors.
+
+   NB: Modus stores a literal bit-vector (#*0110) and a general fixnum
+   vector identically, so (simple-vector-p #*0110) cannot be distinguished
+   here and conservatively returns T — a representational limitation, not a
+   logic bug.  Bit / character arrays built via MAKE-ARRAY with an explicit
+   :element-type DO carry that type (MDA header slot 5 / string subtag) and
+   are correctly rejected."
+  (cond
+    ((null x) nil)
+    ((eq x t) nil)
+    ((fixnump x) nil)
+    ((consp x) nil)
+    ((characterp x) nil)
+    ;; Strings (incl. MAKE-ARRAY :element-type character/base-char, whose
+    ;; data is a subtag-#x31 string) are not simple-vectors.
+    ((stringp x) nil)
+    ;; Byte-packed (unsigned-byte 8) vector (subtag #x11): element-type
+    ;; (unsigned-byte 8), NOT T → not a simple-vector.
+    ((eql (obj-subtag x) #x11) nil)
+    ;; Packed single-float vector (subtag #x12): element-type SINGLE-FLOAT.
+    ((eql (obj-subtag x) #x12) nil)
+    ;; Native multi-dim header: only rank-1, T-element, plain vectors qualify.
+    ((%mda-p x)
+     (and (eql (%mda-rank x) 1)
+          (null (%mda-fp x))
+          (null (%mda-displaced x))
+          (let ((et (%mda-etype x)))
+            (or (eq et t) (null et)))))
+    ;; Plain 1-D MVM array (subtag #x32), element-type T → simple vector.
+    ((arrayp x) t)
+    (t nil)))
+
+(defun simple-bit-vector-p (x)
+  "T iff X is a simple bit-vector.  Modus represents a bit-vector as a
+   1-D array whose elements are all 0/1 (no distinct subtag), so this is
+   BIT-VECTOR-P (every Modus bit-vector is simple)."
+  (bit-vector-p x))
+
+;;; ============================================================
+;;; SETF Place Functions (generated by MVM setf macro)
+;;; ============================================================
+(defun set-first (x v) (set-car x v) v)
+
+(defun set-rest (x v) (set-cdr x v) v)
+
+(defun set-second (x v) (set-car (cdr x) v) v)
+
+(defun set-third (x v) (set-car (cddr x) v) v)
+
+(defun set-fourth (x v) (set-car (cdddr x) v) v)
+
+(defun set-fifth (x v) (set-car (cddddr x) v) v)
+
+(defun set-sixth (x v) (set-car (nthcdr 5 x) v) v)
+
+(defun set-seventh (x v) (set-car (nthcdr 6 x) v) v)
+
+(defun set-eighth (x v) (set-car (nthcdr 7 x) v) v)
+
+(defun set-ninth (x v) (set-car (nthcdr 8 x) v) v)
+
+(defun set-tenth (x v) (set-car (nthcdr 9 x) v) v)
+
+(defun set-car (x v) (rplaca x v) v)
+
+(defun set-cdr (x v) (rplacd x v) v)
+
+(defun set-cadr (x v) (set-car (cdr x) v) v)
+
+(defun set-caar (x v) (set-car (car x) v) v)
+
+(defun set-cdar (x v) (set-cdr (car x) v) v)
+
+(defun set-cddr (x v) (set-cdr (cdr x) v) v)
+
+(defun set-caddr (x v) (set-car (cddr x) v) v)
+
+(defun set-cadddr (x v) (set-car (cdddr x) v) v)
+
+;; Every other 3- and 4-level C*R place (CLHS 5.1.2.2).  Only CADDR and
+;; CADDDR had setters, so (setf (caaar x) v) called an undefined SET-CAAAR:
+;; 44 cxr / cons-test-05 failures.
+(defun set-caaar (x v) (set-car (caar x) v) v)
+
+(defun set-caadr (x v) (set-car (cadr x) v) v)
+
+(defun set-cadar (x v) (set-car (cdar x) v) v)
+
+(defun set-cdaar (x v) (set-cdr (caar x) v) v)
+
+(defun set-cdadr (x v) (set-cdr (cadr x) v) v)
+
+(defun set-cddar (x v) (set-cdr (cdar x) v) v)
+
+(defun set-cdddr (x v) (set-cdr (cddr x) v) v)
+
+(defun set-caaaar (x v) (set-car (caaar x) v) v)
+
+(defun set-caaadr (x v) (set-car (caadr x) v) v)
+
+(defun set-caadar (x v) (set-car (cadar x) v) v)
+
+(defun set-caaddr (x v) (set-car (caddr x) v) v)
+
+(defun set-cadaar (x v) (set-car (cdaar x) v) v)
+
+(defun set-cadadr (x v) (set-car (cdadr x) v) v)
+
+(defun set-caddar (x v) (set-car (cddar x) v) v)
+
+(defun set-cdaaar (x v) (set-cdr (caaar x) v) v)
+
+(defun set-cdaadr (x v) (set-cdr (caadr x) v) v)
+
+(defun set-cdadar (x v) (set-cdr (cadar x) v) v)
+
+(defun set-cdaddr (x v) (set-cdr (caddr x) v) v)
+
+(defun set-cddaar (x v) (set-cdr (cdaar x) v) v)
+
+(defun set-cddadr (x v) (set-cdr (cdadr x) v) v)
+
+(defun set-cdddar (x v) (set-cdr (cddar x) v) v)
+
+(defun set-cddddr (x v) (set-cdr (cdddr x) v) v)
+
+;; ENCODE-UNIVERSAL-TIME early stub removed 2026-06-01 — strict-arity
+;; copy at L3381 wins.
+
+;;; ============================================================
+;;; Array Misc
+;;; ============================================================
+(defun array-row-major-index (a &rest subscripts)
+  "Return row-major index of multi-dimensional array element.
+   Native MDA: walks dims, computing sub0*d1*d2*..*dN + sub1*d2..*dN + ..."
+  (cond
+    ((%mda-p a)
+     (let ((dims (%mda-dims a)))
+       (cond
+         ((null dims) 0)
+         ((null (cdr dims)) (if (null subscripts) 0 (car subscripts)))
+         (t (%mda-row-major-index dims subscripts)))))
+    (t (if (null subscripts) 0 (car subscripts)))))
+
+;;; RPLACA/RPLACD — type-check first arg, strict 2-arg arity
+(defun rplaca (cons-arg &rest more)
+  (if (null more)
+      (%program-error "rplaca requires exactly 2 arguments")
+      (if (cdr more)
+          (%program-error "rplaca requires exactly 2 arguments")
+          (if (consp cons-arg)
+              (progn (set-car cons-arg (car more)) cons-arg)
+              (error (make-condition 'type-error
+                                     :datum cons-arg
+                                     :expected-type 'cons))))))
+
+(defun rplacd (cons-arg &rest more)
+  (if (null more)
+      (%program-error "rplacd requires exactly 2 arguments")
+      (if (cdr more)
+          (%program-error "rplacd requires exactly 2 arguments")
+          (if (consp cons-arg)
+              (progn (set-cdr cons-arg (car more)) cons-arg)
+              (error (make-condition 'type-error
+                                     :datum cons-arg
+                                     :expected-type 'cons))))))
+
+;;; ACONS — strict 3-arg arity
+(defun acons (&rest args)
+  (if (or (null args) (null (cdr args)) (null (cddr args)))
+      (%program-error "acons requires exactly 3 arguments")
+      (if (cdddr args)
+          (%program-error "acons requires exactly 3 arguments")
+          (cons (cons (car args) (cadr args)) (caddr args)))))
+
+;;; NRECONC — strict 2-arg arity (last-defun-wins overrides line 6159)
+(defun nreconc (list &rest more)
+  (if (null more)
+      (%program-error "nreconc requires exactly 2 arguments")
+      (if (cdr more)
+          (%program-error "nreconc requires exactly 2 arguments")
+          (nconc (nreverse list) (car more)))))
+
+;;; SET-DIFFERENCE — add :key and :test support
+;; Find :test/:key in a flat &rest plist — common helper used by the
+;; set-* / -if-* family.  Returns 'em separately (nil if not present).
+(defun %find-key-arg (args key)
+  "Return the value of the leftmost KEY in ARGS plist, or NIL.
+   Symbol values (e.g. :test 'equal) are resolved via symbol-function."
+  (let ((cur args) (found nil) (was-found nil))
+    (loop (when (null cur) (return (if was-found (%resolve-fn found) nil)))
+      (when (eq (car cur) key)
+        (setq found (cadr cur))
+        (setq was-found t)
+        (return (%resolve-fn found)))
+      (setq cur (cddr cur)))))
+
+(defun %validate-test-key-plist (args)
+  "Validate ARGS as a plist of :test/:test-not/:key/:count/:start/:end/
+   :from-end/:allow-other-keys.  Per CLHS §3.4.1.4 signal PROGRAM-ERROR
+   on odd-length plist or unknown keyword (unless :allow-other-keys is
+   non-nil somewhere in the plist).  Helper for sequence/list ops that
+   pluck individual keys via %find-key-arg and would otherwise silently
+   accept (SET-DIFFERENCE NIL NIL :BAD T)."
+  (let ((allow-other-keys nil) (aok-set nil))
+    ;; First pass: probe :allow-other-keys (leftmost wins per CLHS
+    ;; §3.4.1.4.1.1.2).
+    (let ((p args))
+      (loop (when (null p) (return))
+        (when (and (not aok-set) (eq (car p) :allow-other-keys))
+          (setq allow-other-keys (and (consp (cdr p)) (cadr p)))
+          (setq aok-set t))
+        (setq p (cdr p))))
+    (let ((cur args))
+      (loop
+        (when (null cur) (return))
+        (when (null (cdr cur)) (%signal-program-error))
+        (let ((k (car cur)))
+          (unless (or (eq k :test) (eq k :test-not) (eq k :key)
+                      (eq k :count) (eq k :start) (eq k :end)
+                      (eq k :from-end) (eq k :allow-other-keys)
+                      allow-other-keys)
+            (%signal-program-error)))
+        (setq cur (cddr cur))))))
+
+(defun %set-difference-impl (l1 l2 args)
+  "Positional helper for set-difference. See set-difference docstring."
+  (%validate-test-key-plist args)
+  (let ((test-fn (%find-key-arg args :test))
+        (key-fn  (%find-key-arg args :key))
+        (r nil))
+    (dolist (item l1 (nreverse r))
+      (let ((item-key (if key-fn (funcall key-fn item) item))
+            (in-l2 nil)
+            (cur l2))
+        (loop
+          (when (or in-l2 (null cur)) (return nil))
+          (let ((x-key (if key-fn (funcall key-fn (car cur)) (car cur))))
+            (when (if test-fn (funcall test-fn item-key x-key)
+                              (eql item-key x-key))
+              (setq in-l2 t)))
+          (setq cur (cdr cur)))
+        (unless in-l2 (setq r (cons item r)))))))
+
+(defun set-difference (l1 l2 &rest args)
+  ;; #'eql is unavailable in the runtime (eql is an inline opcode, not
+  ;; a real function), so the previous (or test-fn #'eql) bound a NIL
+  ;; or otherwise-unusable function and (funcall actual-test ...)
+  ;; effectively short-circuited "no match" for every element — making
+  ;; set-difference always return l1 (or NIL via different earlier
+  ;; bug). Use the inline `eql` opcode directly when no :test is given.
+  (%set-difference-impl l1 l2 args))
+
+(defun nset-difference (l1 l2 &rest args)
+  "Routes through positional helper to dodge apply-of-rest fragility."
+  (%set-difference-impl l1 l2 args))
+
+;; -------------------------------------------------------------------
+;; %make-array-fill-init / %make-array-fill-list / %make-array-fill-vec
+;;
+;; Used by build-x64-linux's rewrite-make-array-initcontents to keep
+;; the per-test expansion small.  The previous in-line expansion
+;;   (let ((tmp (make-array N)))
+;;     (aset tmp 0 v) (aset tmp 1 v) ... (aset tmp (1- N) v)
+;;     tmp)
+;; produced O(N) source forms per make-array call, which inflated the
+;; lambda body of large test runners (run-ansi-adjust-array,
+;; run-ansi-make-array, etc.) past a compile-time fragility threshold,
+;; flipping unrelated tests to FAIL.  These runtime helpers replace the
+;; per-element ASETs with a single function call.
+;; -------------------------------------------------------------------
+;; Runtime entry point for MAKE-ARRAY — produces a native MDA (subtag
+;; #x34) for multi-dim / 0-dim / kwarg-bearing cases, or a flat 1-D
+;; #x32 array for the simple `(make-array N)` case.  Phase 2a of
+;; project_multidim_arrays.
+;;
+;; Compile-time calls (`(make-array N …)` in source) still dispatch
+;; through compile-make-array's builtin (op-name match in
+;; compile-compound), which only handles integer N + a couple of
+;; quoted-dim forms.  This defun is the path that runs when MAKE-ARRAY
+;; is reached via runtime eval or `(funcall #'make-array …)` or
+;; `(apply #'make-array …)`.  Auto-SFT (Gap A) registers it so
+;; eval/funcall find it.
+;;
+;; Limited kwarg support in Phase 2a: :initial-element, :initial-
+;; contents (flat list / list-of-lists / vector).  :fill-pointer,
+;; :adjustable, :displaced-to, :element-type non-T are deferred to
+;; Phase 2b — until then the kwarg is recorded in the MDA header but
+;; the actual semantics (fp shadowing length, displacement offset
+;; lookup, etc.) aren't yet propagated through aref/aset/length.
+
+;; make-array-with-checks: real defun is in the aux-overrides section
+;; of build-x64-linux.lisp (loads AFTER array-aux.lsp's complex &key+&aux
+;; version which the compiler can't faithfully handle).
+(defun %u8-element-type-p (etype)
+  "True if ETYPE upgrades to (UNSIGNED-BYTE 8) for Modus's byte-packed
+   u8 vector representation (subtag #x11).  Conservative: recognises the
+   common CL spellings that SBCL upgrades to (unsigned-byte 8) — the
+   exact list form, and (mod 256) / (integer 0 255) — plus the symbol
+   forms.  Anything else keeps the general tagged-word representation."
+  (cond
+    ;; (unsigned-byte 8)
+    ((and (consp etype)
+          (eq (car etype) 'unsigned-byte)
+          (consp (cdr etype))
+          (eql (cadr etype) 8)
+          (null (cddr etype)))
+     t)
+    ;; (mod 256)
+    ((and (consp etype)
+          (eq (car etype) 'mod)
+          (consp (cdr etype))
+          (eql (cadr etype) 256)
+          (null (cddr etype)))
+     t)
+    ;; (integer 0 255)
+    ((and (consp etype)
+          (eq (car etype) 'integer)
+          (consp (cdr etype))
+          (eql (cadr etype) 0)
+          (consp (cddr etype))
+          (eql (caddr etype) 255)
+          (null (cdddr etype)))
+     t)
+    (t nil)))
+
+(defun %f32-element-type-p (etype)
+  "True if ETYPE upgrades to SINGLE-FLOAT (the packed #x12 vector):
+   single-float and short-float (which upgrades to single)."
+  (or (eq etype 'single-float) (eq etype 'short-float)))
+
+(defun %make-u8-vector (n)
+  "Allocate a byte-packed (unsigned-byte 8) vector of N bytes (subtag
+   #x11), payload zero-initialised by the alloc-u8 opcode."
+  (%alloc-u8 n))
+
+(defun make-array (dim &rest kwargs)
+  "ANSI make-array — see file-level comment above for current scope."
+  (let* ((dim-list (cond ((null dim) nil)
+                         ((consp dim) dim)
+                         (t (list dim))))
+         (rank 0) (cur dim-list) (total 1))
+    ;; CLHS MAKE-ARRAY: every dimension is a valid array dimension, a
+    ;; non-negative fixnum.  Nothing checked it: a non-number's raw bits
+    ;; became the element count.  With a keyword on the heap that was a huge
+    ;; address and the allocation failed, which LOOKED like an error; with the
+    ;; keyword a static constant-pool object it is a small address and
+    ;; (make-array :fill-pointer) quietly built a vector of millions of zeros
+    ;; (ADJUST-ARRAY.ERROR.6 then hung filling it).
+    (let ((d dim-list))
+      (loop (when (null d) (return nil))
+        (unless (and (fixnump (car d)) (>= (car d) 0))
+          (%signal-type-error))
+        (setq d (cdr d))))
+    (loop (when (null cur) (return nil))
+      (setq total (* total (car cur)))
+      (setq rank (+ rank 1))
+      (setq cur (cdr cur)))
+    ;; Kwarg validation per CLHS 3.4.1.4: odd-length arg list and
+    ;; unknown keywords (without :allow-other-keys T) signal
+    ;; program-error.  Leftmost :allow-other-keys wins per CLHS
+    ;; 3.4.1.4.1.  (make-array.error.2/3/4)
+    (let ((allow-other nil) (scan kwargs))
+      (loop (when (or (null scan) (null (cdr scan))) (return))
+        (when (eq (car scan) :allow-other-keys)
+          (unless allow-other
+            (setq allow-other (if (cadr scan) t :explicit-nil))))
+        (setq scan (cddr scan))))
+    (let ((leftmost-allow nil)
+          (leftmost-allow-set nil))
+      ;; CLHS 3.4.1.4.1: LEFTMOST :allow-other-keys value wins.
+      (let ((scan kwargs))
+        (loop (when (or (null scan) (null (cdr scan))) (return))
+          (when (and (eq (car scan) :allow-other-keys)
+                     (not leftmost-allow-set))
+            (setq leftmost-allow (and (cadr scan) t))
+            (setq leftmost-allow-set t))
+          (setq scan (cddr scan))))
+      (let ((vp kwargs))
+        (loop
+          (when (null vp) (return))
+          (when (null (cdr vp)) (%signal-program-error) (return))
+          (let ((k (car vp)))
+            (unless (member k '(:initial-element :initial-contents
+                                :fill-pointer :adjustable :element-type
+                                :displaced-to :displaced-index-offset
+                                :allow-other-keys))
+              (unless leftmost-allow
+                (%signal-program-error)
+                (return))))
+          (setq vp (cddr vp)))))
+    ;; Walk kwargs into local vars.  Per CLHS 3.4.1.4.1 the LEFTMOST
+    ;; occurrence of each keyword wins on duplicates — use *-set
+    ;; sentinels so a later (:initial-element a :initial-element b)
+    ;; pair doesn't overwrite the first value.  (make-array.keywords.8)
+    (let ((ie-p nil) (ie nil) (ic-p nil) (ic nil)
+          (fp nil) (fp-set nil) (adj nil) (adj-set nil)
+          (etype t) (etype-set nil)
+          (disp nil) (disp-set nil) (off 0) (off-set nil)
+          (rest kwargs))
+      (loop (when (null rest) (return nil))
+        (let ((k (car rest)) (v (cadr rest)))
+          (cond
+            ((eq k :initial-element)
+             (unless ie-p (setq ie-p t  ie v)))
+            ((eq k :initial-contents)
+             (unless ic-p (setq ic-p t  ic v)))
+            ((eq k :fill-pointer)
+             (unless fp-set
+               (setq fp-set t)
+               (setq fp (cond ((eq v t) total) ((null v) nil) (t v)))))
+            ((eq k :adjustable)
+             (unless adj-set (setq adj-set t adj v)))
+            ((eq k :element-type)
+             (unless etype-set (setq etype-set t etype v)))
+            ((eq k :displaced-to)
+             (unless disp-set (setq disp-set t disp v)))
+            ((eq k :displaced-index-offset)
+             (unless off-set (setq off-set t off v)))))
+        (setq rest (cddr rest)))
+      (when etype-set (setq etype (%element-type-expand etype)))
+      ;; Allocate + fill the flat data vector.
+      ;; :element-type 'character / 'base-char → underlying is a string
+      ;; (subtag #x31) so STRINGP / string ops work on the result.
+      (let* ((char-elt (or (eq etype 'character) (eq etype 'base-char)
+                           (eq etype 'standard-char)))
+             ;; Byte-packed (unsigned-byte 8) storage (subtag #x11): 8x
+             ;; smaller than the general tagged-word array.  Only for real
+             ;; u8 element types; everything else is unchanged.
+             (u8-elt (and etype-set (%u8-element-type-p etype)))
+             ;; Packed single-float storage (subtag #x12), 4 bytes per lane —
+             ;; ONLY for the bare simple 1-D vector.  A fill-pointer /
+             ;; adjustable / displaced / multi-dim array is an MDA wrapper
+             ;; whose accessors read the data vector with the raw word
+             ;; primitives, so those keep the generic store (element type is
+             ;; still reported from the MDA header).  gate18 lost 18 tests
+             ;; to wrapped packed data.
+             (f32-elt (and etype-set (%f32-element-type-p etype)
+                           (= rank 1) (not (consp dim))
+                           (not fp) (not adj) (not disp)))
+             (data (cond
+                     ;; :initial-element — fill every slot.
+                     (ie-p
+                      (let* ((a (cond (char-elt (%make-string-array total))
+                                      (u8-elt (%make-u8-vector total))
+                                      (f32-elt (%make-f32-vector total))
+                                      (t (make-array total))))
+                             (store (if (and char-elt (characterp ie))
+                                        (char-code ie) ie))
+                             (i 0))
+                        (cond
+                          ;; A byte vector comes back from %ALLOC-U8 already
+                          ;; zeroed, so :INITIAL-ELEMENT 0 -- the usual spelling
+                          ;; of a fresh buffer -- is nothing to do; any other
+                          ;; byte goes through FILL's byte-store loop.  Both used
+                          ;; to be a generic ASET per element.
+                          ((and u8-elt (eql store 0)) a)
+                          ((and u8-elt (integerp store) (<= 0 store 255)) (fill a store))
+                          (t
+                           (loop (when (>= i total) (return a))
+                             (aset a i store)
+                             (setq i (+ i 1)))))))
+                     ;; :initial-contents — flatten in row-major order
+                     ;; for multi-dim; copy verbatim for 1-D / flat lists.
+                     (ic-p
+                      (let ((a (cond (char-elt (%make-string-array total))
+                                     (u8-elt (%make-u8-vector total))
+                                     (f32-elt (%make-f32-vector total))
+                                     (t (make-array total)))))
+                        (%mda-fill-contents-flat a ic dim-list)))
+                     (char-elt (%make-string-array total))
+                     (u8-elt (%make-u8-vector total))
+                     (f32-elt (%make-f32-vector total))
+                     (t (make-array total)))))
+        ;; Decide return shape.  Phase 2a: wrap in MDA whenever rank ≠ 1,
+        ;; or any non-trivial kwarg appeared, or the dim was passed as
+        ;; a list (even a single-element list) — that preserves rank
+        ;; info per CLHS (`(array-rank (make-array '(5)))` is 1, not 0).
+        ;; Character element type with no other wrapping returns the
+        ;; underlying string directly so STRINGP / EQUAL string ops work.
+        (cond
+          ;; Plain 1-D, no wrapping kwargs, and a GENERIC element type — T,
+          ;; or any declared type that is neither a u8 spelling nor a
+          ;; character type ((signed-byte 32), fixnum, …): return the bare
+          ;; tagged-word vector.  The MDA wrapper carried NOTHING for these
+          ;; (array-element-type already answered T through it) but put every
+          ;; aref on the slow wrapper branch — and it made
+          ;;   (make-array 4 :element-type '(signed-byte 32) :initial-contents …)
+          ;; a DIFFERENT representation from the same call without the fill
+          ;; kwarg (which the compiler now inlines as a bare vector).  reel's
+          ;; VP8 probability/tree tables are exactly this shape; the declared-
+          ;; array fast path (compile-aref on a declared (simple-array
+          ;; (signed-byte 32))) read their wrapper headers as elements.
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp)
+                (or (eq etype t) (and (not char-elt) (not u8-elt) (not f32-elt))))
+           data)
+          ;; Plain 1-D single-float vector: the packed #x12 object itself.
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp) f32-elt)
+           data)
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp) char-elt)
+           data)
+          ;; Plain 1-D (unsigned-byte 8) vector with no other wrapping —
+          ;; return the byte-packed #x11 vector directly so ARRAYP / TYPEP /
+          ;; ARRAY-ELEMENT-TYPE / OBJ-SUBTAG see the real specialized object.
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp) u8-elt)
+           data)
+          ;; Displaced MDA: set DATA slot to the displaced target so that
+          ;; type predicates (stringp / typep) and length helpers see
+          ;; through to the underlying.  aref/aset still consult the
+          ;; displaced+offset slots via the MDA fast path.
+          (disp (%alloc-mda rank dim-list fp disp off etype disp))
+          (t (%alloc-mda rank dim-list fp disp off etype data)))))))
+
+(defun %mda-fill-contents-flat (data contents dims)
+  "Fill DATA in row-major order from CONTENTS shaped against DIMS.
+   For rank 0: CONTENTS is the scalar value, stored at slot 0.
+   For rank 1: CONTENTS is a flat sequence (list or vector).
+   For rank >1: CONTENTS is a nested list of lists with the right
+   shape — recursively flattened.  Helper for make-array's
+   :initial-contents kwarg."
+  (let ((i 0))
+    (cond
+      ;; Rank 0: scalar.
+      ((null dims) (aset data 0 contents) data)
+      ;; Last/only dim: contents is a flat sequence.
+      ;; Strings store char-codes (fixnums), not character objects, so
+      ;; when DATA is a string we must coerce element via char-code
+      ;; before aset.
+      ((null (cdr dims))
+       (let ((cur contents)
+             (str-data (stringp data)))
+         (cond
+           ((consp cur)
+            (loop (when (null cur) (return data))
+              (let ((v (car cur)))
+                (aset data i (if (and str-data (characterp v)) (char-code v) v)))
+              (setq cur (cdr cur))
+              (setq i (+ i 1))))
+           ((stringp cur)
+            ;; Source is a string: aref returns a fixnum char-code.
+            ;; If dest is a string → store fixnum directly (string slots
+            ;; are u8); if dest is general → wrap via code-char to give
+            ;; a proper character object.
+            (let ((len (array-length cur)))
+              (loop (when (>= i len) (return data))
+                (let ((v (aref cur i)))
+                  (aset data i (cond
+                                 (str-data
+                                  (if (characterp v) (char-code v) v))
+                                 ((characterp v) v)
+                                 ((integerp v) (code-char v))
+                                 (t v))))
+                (setq i (+ i 1)))))
+           ;; Vector / bit-vector / any general array as initial-contents
+           ;; source.  CL allows any sequence; we already cover list + string,
+           ;; this catches everything else implementing aref/length.
+           ((arrayp cur)
+            (let ((len (array-length cur)))
+              (loop (when (>= i len) (return data))
+                (let ((v (aref cur i)))
+                  (aset data i (if (and str-data (characterp v)) (char-code v) v)))
+                (setq i (+ i 1)))))
+           (t data))))
+      ;; Multi-dim: recurse into each sub-row.  CONTENTS may be a list OR
+      ;; a vector (e.g. a fill-pointer vector — MAKE-ARRAY.21).
+      (t
+       (let ((sub-size 1))
+         ;; size of each "row" = product of remaining dims
+         (let ((d (cdr dims)))
+           (loop (when (null d) (return nil))
+             (setq sub-size (* sub-size (car d)))
+             (setq d (cdr d))))
+         (if (consp contents)
+             (let ((cur contents))
+               (loop (when (null cur) (return data))
+                 (%mda-fill-contents-sub data i (car cur) (cdr dims))
+                 (setq i (+ i sub-size))
+                 (setq cur (cdr cur))))
+             (let ((len (length contents)) (j 0))
+               (loop (when (>= j len) (return data))
+                 (%mda-fill-contents-sub data i (elt contents j) (cdr dims))
+                 (setq i (+ i sub-size))
+                 (setq j (+ j 1)))))
+         data)))))
+
+(defun %mda-fill-contents-sub (data offset sub-contents sub-dims)
+  "Fill DATA[offset…offset+sub-size) from SUB-CONTENTS shaped against
+   SUB-DIMS.  Recursive helper for %mda-fill-contents-flat's
+   multi-dim branch."
+  (cond
+    ((null sub-dims)
+     (aset data offset sub-contents))
+    ((null (cdr sub-dims))
+     ;; Last dim: SUB-CONTENTS is a flat sequence — list OR vector/string.
+     ;; CLHS allows any sequence at any level of :initial-contents, so a
+     ;; row may be e.g. #(a b c) (MAKE-ARRAY.18/.20/.21).  The old code
+     ;; assumed a list and CAR'd a vector → crash.
+     (let ((str-data (stringp data)))
+       (if (consp sub-contents)
+           (let ((cur sub-contents) (i offset))
+             (loop (when (null cur) (return data))
+               (let ((v (car cur)))
+                 (aset data i (if (and str-data (characterp v)) (char-code v) v)))
+               (setq cur (cdr cur))
+               (setq i (+ i 1))))
+           ;; Vector / string row.
+           (let ((len (length sub-contents)) (j 0) (i offset))
+             (loop (when (>= j len) (return data))
+               (let ((v (elt sub-contents j)))
+                 (aset data i (cond
+                                (str-data (if (characterp v) (char-code v) v))
+                                (t v))))
+               (setq j (+ j 1))
+               (setq i (+ i 1)))))))
+    (t
+     ;; Interior dim: SUB-CONTENTS is a sequence of sub-rows — list OR
+     ;; vector.  Recurse into each, advancing by the row's flat size.
+     (let ((i offset)
+           (sub-size 1))
+       (let ((d (cdr sub-dims)))
+         (loop (when (null d) (return nil))
+           (setq sub-size (* sub-size (car d)))
+           (setq d (cdr d))))
+       (if (consp sub-contents)
+           (let ((cur sub-contents))
+             (loop (when (null cur) (return data))
+               (%mda-fill-contents-sub data i (car cur) (cdr sub-dims))
+               (setq i (+ i sub-size))
+               (setq cur (cdr cur))))
+           (let ((len (length sub-contents)) (j 0))
+             (loop (when (>= j len) (return data))
+               (%mda-fill-contents-sub data i (elt sub-contents j) (cdr sub-dims))
+               (setq i (+ i sub-size))
+               (setq j (+ j 1)))))))))
+
+(defun %make-array-fill-init (n init)
+  "Allocate a fresh general array of size N and fill every slot with INIT."
+  (let ((a (make-array n)) (i 0))
+    (loop
+      (when (>= i n) (return a))
+      (aset a i init)
+      (setq i (+ i 1)))))
+
+(defun %make-array-fill-list (n lst)
+  "Allocate a fresh general array of size N and fill from LST (head-first).
+   Stops when LST is exhausted; remaining slots are left NIL."
+  (let ((a (make-array n)) (i 0) (cur lst))
+    (loop
+      (when (or (>= i n) (null cur)) (return a))
+      (aset a i (car cur))
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))))
+
+(defun %make-array-fill-any (n contents)
+  "Allocate a fresh general array of size N filled from CONTENTS, which
+   may be either a list or a vector.  Dispatches at runtime so the build
+   doesn't have to guess the shape of an arbitrary initial-contents form."
+  (cond
+    ((null contents) (make-array n))
+    ((consp contents) (%make-array-fill-list n contents))
+    (t (%make-array-fill-vec n contents))))
+
+(defun %make-array-fill-vec (n vec)
+  "Allocate a fresh general array of size N and fill from vector VEC.
+   Stops at min(N, length VEC); remaining slots NIL."
+  (let* ((vlen (array-length vec))
+         (lim (if (< vlen n) vlen n))
+         (a (make-array n))
+         (i 0))
+    (loop
+      (when (>= i lim) (return a))
+      (aset a i (aref vec i))
+      (setq i (+ i 1)))))
+
+(defun %make-array-fill-string (n s)
+  "Allocate a fresh general array of size N and fill from string S
+   (each char in S becomes a character element)."
+  (let* ((slen (array-length s))
+         (lim (if (< slen n) slen n))
+         (a (make-array n))
+         (i 0))
+    (loop
+      (when (>= i lim) (return a))
+      (aset a i (aref s i))   ; AREF→char already
+      (setq i (+ i 1)))))
+
+(defun %make-string-fill-char (n ch)
+  "Allocate a fresh string of size N and fill with character CH."
+  (let ((s (%make-string-array n)) (i 0) (code (char-code ch)))
+    (loop
+      (when (>= i n) (return s))
+      (aset s i code)
+      (setq i (+ i 1)))))

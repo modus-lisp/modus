@@ -354,7 +354,7 @@
 ;;; ---------------------------------------------------------------
 ;;; (I) #213 — A STAND-IN MUST READ IN THE PACKAGE OF THE THING IT REPLACES.
 ;;;
-;;; mvm/ansi-bridge.lisp carries a hand-written scaffold (SBT-01..SBT-16)
+;;; mvm/ansi-test-aux.lisp carries a hand-written scaffold (SBT-01..SBT-16)
 ;;; standing in for structures-03.lsp's `defstruct*` forms, which are commented
 ;;; out in the corpus.  Several of its constructors supply SYMBOL slot defaults:
 ;;;
@@ -362,7 +362,7 @@
 ;;;   (defun sbt-06-con (&optional (a 'p) (b 'q) (c 'r)) (vector 'sbt-06 c b a))
 ;;;
 ;;; structures-03.lsp declares `(in-package :cl-test)`, so the values it compares
-;;; those against are CL-TEST::Z / CL-TEST::P.  ansi-bridge.lisp declares no
+;;; those against are CL-TEST::Z / CL-TEST::P.  ansi-test-aux.lisp declares no
 ;;; package, so before #213 the scaffold produced MODUS.MVM::Z — correctly NOT
 ;;; EQL, and (once #211 made per-file package identity real) correctly failing:
 ;;; gate IDs 15733/15734/15743/15744/15745, i.e. structures-03 02/2, 02/3 and
@@ -371,11 +371,11 @@
 ;;; scaffold-supplied symbol and passed throughout.
 ;;;
 ;;; I2 is the property the fix installs; I1 records the guard-driven fallback
-;;; that keeps the clean images (which bake ansi-bridge.lisp but have no
+;;; that keeps the clean images (which bake ansi-test-aux.lisp but have no
 ;;; CL-TEST and no structures-03) byte-identical; I3 guards the precondition.
 ;;; ---------------------------------------------------------------
-(defun ansi-bridge-text ()
-  (let ((path (merge-pathnames "../mvm/ansi-bridge.lisp" *load-truename*)))
+(defun ansi-test-aux-text ()
+  (let ((path (merge-pathnames "../mvm/ansi-test-aux.lisp" *load-truename*)))
     (with-open-file (s path)
       (let ((buf (make-string (file-length s))))
         (subseq buf 0 (read-sequence buf s))))))
@@ -390,10 +390,10 @@
 
 ;;; I1: with CL-TEST absent, READ-ALL-FORMS-WITH-LOCATIONS' FIND-PACKAGE guard
 ;;; declines to switch and the block reads in MODUS.MVM, exactly as before #213.
-;;; This is what the five clean-image builds that bake ansi-bridge.lisp see.
+;;; This is what the five clean-image builds that bake ansi-test-aux.lisp see.
 (let ((existing (find-package "CL-TEST")))
   (when existing (delete-package existing)))
-(let* ((forms (forms-of (wrapped (ansi-bridge-text))))
+(let* ((forms (forms-of (wrapped (ansi-test-aux-text))))
        (con2 (bridge-defun forms "SBT-02-CON-2")))
   (chk "I1: CL-TEST absent -> the guard declines, scaffold reads in MODUS.MVM"
        (pkg-of (find-sym-named "Z" con2)) "MODUS.MVM"))
@@ -404,17 +404,17 @@
 ;;; the LAST form in the script) — the scaffold's symbol defaults must land in
 ;;; CL-TEST, and the switch must not leak into the rest of the file.
 (make-package "CL-TEST" :use '("CL"))
-(let* ((forms (forms-of (wrapped (ansi-bridge-text))))
+(let* ((forms (forms-of (wrapped (ansi-test-aux-text))))
        (con2 (bridge-defun forms "SBT-02-CON-2"))
        (con6 (bridge-defun forms "SBT-06-CON"))
        (con3 (bridge-defun forms "SBT-02-CON-3"))
        ;; The first defun AFTER the scaffold block, and one further out.
-       ;; Probed via a LAMBDA-LIST variable / a non-CL name: a defun named
-       ;; REVERSE reads as COMMON-LISP:REVERSE in both MODUS.MVM and CL-TEST
-       ;; (both :use "CL"), so the NAME of an inherited symbol discriminates
-       ;; nothing — only home-package-less symbols do.
-       (after-adjacent (bridge-defun forms "REVERSE"))
-       (after (bridge-defun forms "%CHECK-KW-ALLOWED"))
+       ;; Probed via a LAMBDA-LIST variable / a non-CL name: a defun whose
+       ;; name is a CL symbol reads as the same COMMON-LISP symbol in both
+       ;; MODUS.MVM and CL-TEST (both :use "CL"), so the NAME of an inherited
+       ;; symbol discriminates nothing — only home-package-less symbols do.
+       (after-adjacent (bridge-defun forms "APPROX="))
+       (after (bridge-defun forms "RANDOM-FROM-SEQ"))
        ;; …and one from before it.
        (before (bridge-defun forms "EXPAND-IN-CURRENT-ENV")))
   (chk "I2: sbt-02-con-2's 'Z default interns in CL-TEST"

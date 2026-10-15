@@ -23,16 +23,17 @@ const BSS_END    = 0x10020000;
 // bytecode (14.05 MB) was 630 KB short of 0x11000000 when the thread branches
 // merged, so the windows grew: pool 3.9 MB, code 16 MB, JIT 16 MB; the stack
 // and heap moved up by 4 MB.  Nothing outside this file names these addresses.
-// 2026-10-14: the bytecode reached 16.78 MB (6.5 KB past the 16 MB window), so
-// the code window grew to 20 MB and JIT, stack and heap moved up 4 MB again.
+// 2026-10-13: the bytecode filled the 16 MB code window (round-10 merge plus
+// the fasl constant check), so code is 32 MB and everything above it moved up
+// by 16 MB.
 const POOL_ADDR  = 0x10020000;            // constant pool (strings) lives here
 const CODE_ADDR  = 0x10400000;            // the module's bytecode, executed in place
-const JIT_ADDR   = 0x11800000;            // exec pages handed out by %mmap-exec-page / mmap
-const JIT_END    = 0x12800000;
-const STACK_ADDR = 0x12800000;
+const JIT_ADDR   = 0x12400000;            // exec pages handed out by %mmap-exec-page / mmap
+const JIT_END    = 0x13400000;
+const STACK_ADDR = 0x13400000;
 const STACK_SIZE = 0x00800000;            // 8 MB
 const ARGV_AREA  = 0x00010000;            // top of the stack region: initial argv/envp
-const HEAP_ADDR  = 0x13000000;
+const HEAP_ADDR  = 0x13C00000;
 // pc values are PHYSICAL indices into memory (virtual - VBASE); a function
 // value is (phys << 4) | 3.
 const CODE_PHYS  = CODE_ADDR - VBASE, JIT_PHYS = JIT_ADDR - VBASE;
@@ -563,10 +564,10 @@ class MVM {
     this.markStart(base); this.markCons(base);
     return base | 1;
   }
-  allocFloat(d) {
+  allocFloat(d, subtag = 0x60) {               // 0x60 double-float, 0x64 single-float: same 4-slot layout
     const base = this.bump(48);
     this.zero(base, base + 48);
-    this.st64(base, (4 << 8) | 0x60, 0);
+    this.st64(base, (4 << 8) | subtag, 0);
     this.f64[0] = d;
     for (let i = 0; i < 4; i++) this.st64(base + 16 + 8 * i, this.f64u16[3 - i] << 1, 0);
     this.markStart(base);
@@ -1271,6 +1272,9 @@ class MVM {
           const x = this.floatVal(this.rlo(code[pc + 2])), y = this.floatVal(this.rlo(code[pc + 3]));
           const r = op === 0xBE ? x + y : op === 0xBF ? x - y : op === 0xC0 ? x * y : x / y;
           this.setReg(code[pc + 1], this.allocFloat(r), 0); pc += 4; break;
+        }
+        case 0xD0: {                                                                                     // fround32: boxed float -> rounded to single -> fresh boxed single (#x64)
+          this.setReg(code[pc + 1], this.allocFloat(Math.fround(this.floatVal(this.rlo(code[pc + 2]))), 0x64), 0); pc += 3; break;
         }
         case 0xC2: { const s = code[pc + 2]; sar64(this.rlo(s), this.rhi(s), 1); this.setReg(code[pc + 1], this.allocFloat(toNum(RL, RH)), 0); pc += 3; break; }
         case 0xC3: {                                                                                     // ftoi (cvttsd2si)

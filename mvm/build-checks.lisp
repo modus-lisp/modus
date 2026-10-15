@@ -1664,3 +1664,74 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     t))
 
 (check-gc-region-literals)
+
+;;; ============================================================
+;;; IR DUMP (MODUS_IR_DUMP=path): the compiler's per-function IR, normalised
+;;; so two builds whose sources differ only in WHERE a definition sits can be
+;;; compared function by function.  Calls are by name in the IR, so what
+;;; varies with position alone is renumbered: labels (per function), the
+;;; static-symbol slot index (the name and package hashes beside it identify
+;;; the symbol) and constant-table indices (replaced by the constant).
+;;; Counter-numbered function names (NAME$$LAMBDAn, TOPLEVEL-n) are left for
+;;; the comparing script to renumber.  Host-only, never baked.
+;;; ============================================================
+
+(defvar *ir-dump-stream* nil)
+(defvar *ir-dump-depth* 0)
+
+(defun %ir-norm-fn (ir)
+  (let ((labels (make-hash-table)) (n 0) (out nil) (v (coerce ir 'vector)))
+    (flet ((lab (x) (or (gethash x labels) (setf (gethash x labels) (incf n)))))
+      (dotimes (i (length v))
+        (let ((ins (aref v i)))
+          (push
+           (cond
+             ((not (consp ins)) ins)
+             ((eq (car ins) :label) (list :label (lab (second ins))))
+             ((eq (car ins) :li-const)
+              (let* ((tbl *constant-table*) (idx (third ins)))
+                (list :li-const (second ins)
+                      (if (and (integerp idx) (< idx (length tbl)))
+                          (list :const (nth (- (length tbl) 1 idx) tbl))
+                          idx))))
+             ;; (:LI 0 idx) ... (:CALL "%STATIC-SYMBOL-REF" 3): blank the slot index
+             ((and (eq (car ins) :li) (eql (second ins) 0)
+                   (< (+ i 3) (length v))
+                   (equal (aref v (+ i 3)) '(:call "%STATIC-SYMBOL-REF" 3)))
+              (list :li 0 :static-slot))
+             ;; every branch op (:BR :BEQ :BNE :BLT :BGE :BNULL :BNNULL :BVS)
+             ;; carries its label last
+             ((let ((s (symbol-name (car ins))))
+                (and (> (length s) 1) (char= (char s 0) #\B)))
+              (append (butlast ins) (list (list :label (lab (car (last ins)))))))
+             (t ins))
+           out))))
+    (nreverse out)))
+
+(defun %ir-dump-result (form result)
+  (let ((items nil))
+    (flet ((add (r) (when (and (consp r) (car r) (cdr r)) (push r items))))
+      (if (and (consp result) (eq (car result) :multi-result))
+          (mapc #'add (cdr result))
+          (add result))
+      (mapc #'add *pending-flet-ir*))
+    (let ((*print-pretty* nil) (*print-readably* nil) (*print-circle* t))
+      (format *ir-dump-stream* "~&@FORM ~S~%"
+              (if (consp form) (list (car form) (if (consp (cdr form)) (cadr form))) form))
+      (dolist (r (reverse items))
+        (format *ir-dump-stream* "@FN ~S~%~S~%"
+                (function-info-name (car r)) (%ir-norm-fn (cdr r)))))))
+
+(let ((path (sb-ext:posix-getenv "MODUS_IR_DUMP")))
+  (when (and path (> (length path) 0))
+    (setf *ir-dump-stream* (open path :direction :output :if-exists :append
+                                      :if-does-not-exist :create))
+    (sb-int:encapsulate 'mvm-compile-toplevel 'ir-dump
+      (lambda (f form &rest args)
+        (let ((*ir-dump-depth* (1+ *ir-dump-depth*)))
+          (let ((r (apply f form args)))
+            (when (= *ir-dump-depth* 1)
+              (ignore-errors (%ir-dump-result form r))
+              (finish-output *ir-dump-stream*))
+            r))))
+    (format t "~&;; MODUS_IR_DUMP -> ~A~%" path)))

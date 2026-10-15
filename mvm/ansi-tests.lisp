@@ -76,7 +76,7 @@
   "Like my-equal but returns exactly T."
   (if (my-equal a b) t nil))
 
-;; Override ansi-bridge's equalpt (which used rt-equal).  rt-equal's deep
+;; Override ansi-test-aux's equalpt (which used rt-equal).  rt-equal's deep
 ;; if-chain trips a register-allocation issue when called from inside
 ;; lambda bodies that ALSO contain large let-with-specials forms — the
 ;; very pattern emitted by def-print-test for every PRINT.* test.
@@ -965,7 +965,7 @@
   ;; These lock in four compiler fixes landed for the
   ;; number-comparison.lsp wedge:
   ;;
-  ;;   1. /= macro accepts 3+ args (falls through to ansi-bridge defun).
+  ;;   1. /= macro accepts 3+ args (falls through to the cl-types defun).
   ;;   2. defun establishes implicit BLOCK <fname> so RETURN-FROM works
   ;;      from inside a nested LOOP body — `/=`'s O(n²) inner loop uses
   ;;      `(return-from /= nil)`.
@@ -979,7 +979,7 @@
   ;;      known &rest function with required-count=0 and routes via
   ;;      the static-rest sentinel — bypassing the cl-printer apply
   ;;      defun's 20-rung ladder so any list length works.
-  ;;   5. #'<, #'>, #'<=, #'>=, #'=, #'/= resolve to the ansi-bridge
+  ;;   5. #'<, #'>, #'<=, #'>=, #'=, #'/= resolve to the cl-types
   ;;      variadic defun (not the 2-arg %LT-FN wrappers), so
   ;;      `(apply #'< (single-element-list))` returns T vacuously
   ;;      instead of comparing against a stale V1.
@@ -1037,7 +1037,7 @@
   (rt-run-test 3916 (let ((i 0)) (< (progn (incf i) 5)) i) 1)
   ;; #'< funcall — the wrapper used to be the fixed-arity %LT-FN
   ;; which mis-handles 1-arg and 0-arg.  Now resolves to the
-  ;; variadic ansi-bridge defun.
+  ;; variadic cl-types defun.
   (rt-run-test 3917 (funcall #'< -2) t)
   (rt-run-test 3918 (funcall #'<) t)
   (rt-run-test 3919 (apply #'< '(-2)) t)

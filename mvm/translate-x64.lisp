@@ -3260,6 +3260,38 @@
            (emit-shl-reg-imm buf d 1)         ; retag
            (maybe-store-scratch buf vd)))
 
+        ((or (op= +op-mulsplit-lo+) (op= +op-mulsplit-hi+))
+         ;; (mulsplit-lo/hi Vd Va Vb k) — the SIGNED 128-bit product
+         ;; untag(Va)*untag(Vb) split at bit K: LO = bits [0,K), HI = product
+         ;; >> K (arithmetic), each retagged.  One-operand IMUL writes RDX:RAX
+         ;; implicitly and R13 (the closure env) holds the multiplier, so all
+         ;; three are saved; every operand is READ before any of them is
+         ;; written, and the result is stored only after RAX/RDX are restored,
+         ;; so Vd/Va/Vb may each be RAX, RDX or a spill slot.
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (k (fourth operands)))
+           (emit-push buf 'r13)
+           (emit-push buf 'rdx)
+           (emit-push buf 'rax)
+           (emit-load-vreg buf vb 'r13)
+           (emit-sar-reg-imm buf 'r13 1)        ; untag vb
+           (emit-load-vreg buf va 'rax)
+           (emit-sar-reg-imm buf 'rax 1)        ; untag va
+           (emit-imul1-reg buf 'r13)            ; RDX:RAX = va * vb, signed
+           (if (op= +op-mulsplit-hi+)
+               (emit-shrd-reg-reg-imm buf 'rax 'rdx k)  ; RAX = (RDX:RAX) >> k
+               (progn                                     ; RAX = low k bits
+                 (emit-shl-reg-imm buf 'rax (- 64 k))
+                 (emit-shr-reg-imm buf 'rax (- 64 k))))
+           (emit-shl-reg-imm buf 'rax 1)        ; retag
+           (emit-mov-reg-reg buf 'r13 'rax)
+           (emit-pop buf 'rax)
+           (emit-pop buf 'rdx)
+           (emit-store-vreg buf vd 'r13)
+           (emit-pop buf 'r13)))
+
         ((op= +op-mul64lo+)
          ;; (mul64lo Vd Va Vb) — low 64 bits of raw Va*Vb (no tag/untag)
          ;; On x64: MOV RAX, Va; MUL Vb → RDX:RAX; result in RAX
@@ -3470,33 +3502,31 @@
            (emit-sar-reg-imm buf d (min count 63))
            (maybe-store-scratch buf vd)))
 
-        ;; SHLV / SARV Vd, Vs, Vc -- shift by a register count.  The count
-        ;; register holds a TAGGED fixnum and is untagged here, as aarch64 and
-        ;; the interpreter do (compile-ash relies on it).  Computed in RAX with
-        ;; RAX and RCX saved, so every register assignment is right: the old
-        ;; lowering loaded Vs into Vd and then the count into RCX, which lost
-        ;; the value whenever Vd was RCX.
         ((or (op= +op-shlv+) (op= +op-sarv+))
+         ;; (shlv/sarv Vd Vs Vc) — shift the TAGGED word Vs by the TAGGED fixnum
+         ;; count Vc: the VALUE-level contract the aarch64 arm and the
+         ;; interpreter already implement (both untag the count).  This arm
+         ;; used to load the count into CL still tagged — a shift by 2k — and,
+         ;; with Vd in RCX, overwrote the source with the count before
+         ;; shifting.  Neither was reachable (no x64 compile path emitted these
+         ;; opcodes); compile-ash's runtime variable-count path now does.
+         ;; The source is shifted in R13 and the count untagged in RCX, both
+         ;; saved, so Vd/Vs/Vc may be any register or spill slot.  SARV leaves
+         ;; the tag bit to the caller's mask, as on aarch64.
          (let* ((vd (first operands))
                 (vs (second operands))
-                (vc (third operands))
-                (pd (vreg-phys vd)))
-           (emit-push buf 'rax)
+                (vc (third operands)))
+           (emit-push buf 'r13)
            (emit-push buf 'rcx)
-           (emit-load-vreg buf vc 'rcx)          ; RAX and RCX still hold their own values
-           (if (eq (vreg-phys vs) 'rcx)
-               (emit-mov-reg-mem buf 'rax 'rsp 0)  ; Vs = RCX: its value is the saved word
-               (emit-load-vreg buf vs 'rax))
-           (emit-sar-reg-imm buf 'rcx 1)
+           (emit-load-vreg buf vs 'r13)
+           (emit-load-vreg buf vc 'rcx)
+           (emit-sar-reg-imm buf 'rcx 1)        ; untag the count
            (if (op= +op-shlv+)
-               (emit-shl-reg-cl buf 'rax)
-               (emit-sar-reg-cl buf 'rax))
+               (emit-shl-reg-cl buf 'r13)
+               (emit-sar-reg-cl buf 'r13))
            (emit-pop buf 'rcx)
-           (if (eq pd 'rax)
-               (emit-lea buf 'rsp 'rsp 8)          ; drop the saved RAX
-               (progn
-                 (emit-store-vreg buf vd 'rax)
-                 (emit-pop buf 'rax)))))
+           (emit-store-vreg buf vd 'r13)
+           (emit-pop buf 'r13)))
 
         ((op= +op-ldb+)
          ;; (ldb Vd Vs pos:imm8 size:imm8) — bit field extract
@@ -5813,6 +5843,21 @@
     (emit-bytes buf #x0F #xAF)
     (emit-byte buf (modrm #b11 (reg-code dst) (reg-code src)))))
 
+(defun emit-imul1-reg (buf src)
+  "IMUL src — SIGNED multiply RDX:RAX = RAX * src (one-operand form, the full
+   128-bit product).  REX.W + F7 /5"
+  (emit-byte buf (rex-prefix t nil nil (reg-extended-p src)))
+  (emit-byte buf #xF7)
+  (emit-byte buf (modrm #b11 5 (reg-code src))))
+
+(defun emit-shrd-reg-reg-imm (buf dst src count)
+  "SHRD dst, src, imm8 — DST = low 64 bits of (SRC:DST) >> COUNT.
+   REX.W + 0F AC /r ib (r/m = DST, reg = SRC)"
+  (emit-byte buf (rex-prefix t (reg-extended-p src) nil (reg-extended-p dst)))
+  (emit-bytes buf #x0F #xAC)
+  (emit-byte buf (modrm #b11 (reg-code src) (reg-code dst)))
+  (emit-byte buf count))
+
 (defun emit-mul-reg (buf src)
   "MUL src — unsigned multiply RDX:RAX = RAX * src (one-operand form).
    REX.W + F7 /4"
@@ -7987,11 +8032,14 @@
     (emit-jmp buf cheney-loop)
     (emit-label buf cheney-done)))
 
-(defconstant +x64-limit-guard+ #x1000000
-  "Bytes the allocation LIMIT (R14) is kept below the true end of a semispace
-   (capped at a sixteenth of the space, for small thread regions): room for the
-   allocation a plain :gc-check lets through.  See the R14 update at the end of
-   EMIT-GC-TRAMPOLINE, and boot-linux-x64's initial R14.")
+(defun x64-gc-limit-margin ()
+  "Upper bound on the bytes the allocation limit stops short of each
+   semispace's end (see the LIMIT HEADROOM note in EMIT-GC-TRAMPOLINE); the
+   trampoline uses min(this, space_size/16).  16 MB, the existing guard size,
+   on hosted Linux AND bare metal: boot-x64's semispaces are adjacent too
+   (from-space ends at to_start), so bare had the identical straddle.
+   boot-x64 / boot-linux-x64 apply the same margin to the boot-time R14."
+  #x1000000)
 
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
@@ -8271,24 +8319,32 @@
     (emit-mov-reg-mem buf 'rax 'rsi modus.mvm::+gc-off-from-start+)
     (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-space-size+)
     (emit-add-reg-reg buf 'rax 'r11)
-    ;; MINUS THE ALLOC-OVERSHOOT GUARD BAND: min(+x64-limit-guard+, space/16).
-    ;; A plain :gc-check tests R12 < R14 BEFORE an allocation whose size it
-    ;; does not know, so the allocation after a passing check runs past R14 by
-    ;; up to its whole size.  The semispaces are ADJACENT: from-space ends
-    ;; exactly where to-space begins.  An object that overshot the limit sat
-    ;; at the head of to-space, LIVE (a register held it), and the next
-    ;; collection -- which does not forward a pointer into to-space -- copied
-    ;; survivors right over it: a float box came back holding a JIT cons, a
-    ;; dot product added a stranger's term.  Keeping the guard in the LIMIT
-    ;; register (as aarch64's *aarch64-gc-limit-guard* does) leaves the scan
-    ;; and copy bounds on the true semispace end.
-    (let ((capped (make-label)))
-      (emit-shr-reg-imm buf 'r11 4)
-      (emit-cmp-reg-imm buf 'r11 +x64-limit-guard+)
-      (emit-jcc buf :be capped)
-      (emit-mov-reg-imm buf 'r11 +x64-limit-guard+)
-      (emit-label buf capped))
-    (emit-sub-reg-reg buf 'rax 'r11)
+    ;; LIMIT HEADROOM.  :gc-check tests R12 < R14 BEFORE an allocation whose
+    ;; size it does not know, so the allocation after a passing check runs up
+    ;; to its own size PAST R14.  The two semispaces are ADJACENT (the lower
+    ;; one ends exactly where the upper one starts), so with R14 at the very
+    ;; end of the LOWER semispace that overshoot lands in the to-space -- and
+    ;; the next collection copies survivors to to_start, i.e. ON TOP of the
+    ;; straddling object's tail.  Measured: a 5-slot vector allocated at
+    ;; to_start-16 came back with a cons (symbol . NIL) and the next vector
+    ;; written over its slots (natrium Ed25519 verify, TYPE-ERROR in
+    ;; FE25519-MUL; deterministic for a given environment size, 24 of 32
+    ;; padded environments).  The 16 MB guard past the mapping only ever
+    ;; protected the UPPER semispace.  Stop LIMIT-MARGIN short of each
+    ;; semispace's end instead, so an overshoot lands in bytes nothing copies
+    ;; into.  Same residual as before: one allocation larger than the margin.
+    ;; The margin is min(LIMIT-MARGIN, space_size/16): a carved per-thread or
+    ;; selftest region can be 16 MB, and a flat 16 MB would put its limit AT
+    ;; its start (every allocation a collection -- region-gc-depth measured
+    ;; 8002).  R11 holds space_size here and is dead after this.
+    (when (> (x64-gc-limit-margin) 0)
+      (let ((capped (make-label)))
+        (emit-shr-reg-imm buf 'r11 4)                     ; r11 = space_size / 16
+        (emit-cmp-reg-imm buf 'r11 (x64-gc-limit-margin))
+        (emit-jcc buf :be capped)
+        (emit-mov-reg-imm buf 'r11 (x64-gc-limit-margin))
+        (emit-label buf capped)
+        (emit-sub-reg-reg buf 'rax 'r11)))
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
 
     ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----

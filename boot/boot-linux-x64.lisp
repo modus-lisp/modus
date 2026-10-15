@@ -32,7 +32,10 @@
 ;; is POST-allocation: R12 (alloc ptr) overshoots R14 (= from_end) by one or more
 ;; objects before the next check fires the collector (~33 KB observed for the
 ;; interp's make-string loop).  In the FIRST space that overshoot lands in the
-;; (mapped) second space and is harmless; in the SECOND space, without a guard it
+;; (mapped) second space -- which is NOT harmless, it is the TO-SPACE the next
+;; collection copies survivors into, on top of the straddling object's tail
+;; (see the LIMIT HEADROOM note in translate-x64's EMIT-GC-TRAMPOLINE; the limit
+;; now stops short of each semispace's end).  In the SECOND space, without a guard it
 ;; runs off the end of the mapping and SIGSEGVs mid-write — the deterministic
 ;; "interp value lost across the 2nd GC" fault was make-string writing at
 ;; heap_end+0 on the overshoot of the second collection.  16 MB of guard past the
@@ -496,14 +499,15 @@
   ;; R14 = alloc limit
   ;; With GC: midpoint (GC fires when from-space fills)
   ;; Without GC: full heap end (no GC trigger)
-  ;; ... minus the alloc-overshoot guard band (see +x64-limit-guard+ in
-  ;; translate-x64): the first semispace ends where the second begins, and an
-  ;; allocation that overshoots a limit AT the boundary is overwritten by the
-  ;; first collection's survivors.
   (emit-bytes buf #x49 #x89 #xC6)                ; mov r14, rax
   (emit-bytes buf #x49 #x81 #xC6)                ; add r14, imm32
-  (emit-le32 buf (if (> *linux-x64-r14-offset* (* 32 modus.mvm.x64::+x64-limit-guard+))
-                     (- *linux-x64-r14-offset* modus.mvm.x64::+x64-limit-guard+)
+  ;; The FIRST semispace needs the same headroom the trampoline leaves after
+  ;; every flip (translate-x64 X64-GC-LIMIT-MARGIN): it ends exactly where the
+  ;; second begins, so a limit AT the midpoint lets an allocation straddle into
+  ;; the to-space the first collection copies into.  Only the normal midpoint
+  ;; limit moves; a MODUS_GC_R14 stress value is taken as given.
+  (emit-le32 buf (if (= *linux-x64-r14-offset* +linux-x64-gc-midpoint+)
+                     (- *linux-x64-r14-offset* +linux-x64-gc-guard+)
                      *linux-x64-r14-offset*))
 
   ;; Initialize GC metadata at ABSOLUTE addresses 0x10000040..0x10000060

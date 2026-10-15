@@ -1095,7 +1095,7 @@
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
-    (mvm-text "mvm/ansi-bridge.lisp")
+    (mvm-text "mvm/ansi-test-aux.lisp")
     (string #\Newline)
     ;; tar + install-tarball are baked as GENERAL library primitives (NOT ql).
     ;; They are the untar->parse-.asd->topo-sort->eval pipeline; nothing about

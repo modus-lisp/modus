@@ -36,7 +36,7 @@
 ;;;;
 ;;;; Knobs (all read by the common file): MODUS_NET_BUILD, MODUS_NET_URL,
 ;;;; MODUS_NET_BUFSZ, MODUS_LIB_EXPR, MODUS_NET_NOAUTO, MODUS_RPI_NO_BLOB,
-;;;; MODUS_RPI_NO_BRIDGE, MODUS_SYMMAP.  MODUS_SSH_BUILD is :RPI-only and
+;;;; MODUS_RPI_NO_TEST_AUX, MODUS_SYMMAP.  MODUS_SSH_BUILD is :RPI-only and
 ;;;; errors here (its actor/SSH address map is Pi DRAM) — see DIVERGENCE 5.
 
 (defvar *cl-repl-platform* :virt)

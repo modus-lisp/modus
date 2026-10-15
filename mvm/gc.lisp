@@ -260,7 +260,7 @@
 ;;; fixnum with no shifting here.  Ticks, not nanoseconds: the collector must
 ;;; not divide (and must not allocate), so the scaling is the reader's job —
 ;;; see %GC-PAUSE-MS below, which needs (cntfrq) and therefore lives in
-;;; mvm/ansi-bridge.lisp rather than in this allocation-free file.
+;;; mvm/cl-fileio.lisp rather than in this allocation-free file.
 ;;;
 ;;; ONLY the native aarch64 trampoline writes these.  On x64/i386 the words are
 ;;; readable (the metadata window is mapped well past 0x10001000 on both) and
@@ -1493,7 +1493,7 @@
 (defun %gc-guarded-limit (start size)
   "The allocation limit for a space [START, START+SIZE): its end less the
    alloc-overshoot guard band, min(16 MB, SIZE/16) -- the same rule as the
-   native trampoline's R14 (translate-x64 +x64-limit-guard+).  Spaces are
+   native trampoline's R14 (translate-x64 X64-GC-LIMIT-MARGIN).  Spaces are
    adjacent, so a limit at the true end lets an allocation overshoot into the
    next space, where a collection overwrites it."
   (- (+ start size) (min #x1000000 (ash size -4))))

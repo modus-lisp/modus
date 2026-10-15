@@ -1055,6 +1055,14 @@
           (%print-char 60 stream)
           (%print-string-raw "Array" stream)
           (%print-char 62 stream))
+         ;; #nA cannot say what follows a zero dimension: #2A() reads back
+         ;; as (0 0) whatever the array was, so (0 3) is not printable
+         ;; readably (CLHS 22.1.3.8; SBCL's answer is its own #A syntax).
+         ((and *print-readably*
+               (let ((seen0 nil) (bad nil))
+                 (dolist (d (%mda-dims obj) bad)
+                   (if (eql d 0) (setq seen0 t) (when seen0 (setq bad t))))))
+          (error 'print-not-readable :object obj))
          (t
           (let ((dims (%mda-dims obj)) (data (%mda-data obj)))
             (cond
@@ -1161,6 +1169,19 @@
            (progn (%print-string-raw "#P" stream)
                   (%write-obj (namestring obj) stream level t))
            (%print-string-raw (namestring obj) stream)))
+      ;; A class, class proxy, generic function or method combination: an
+      ;; object, not the vector it is stored as.  Name in slot 1 for all four.
+      ((and (not (consp obj)) (%marked-vector-p obj))
+       (let ((m (svref obj 0)))
+         (%print-string-raw "#<" stream)
+         (%print-string-raw (cond ((eq m '%clos-class) "STANDARD-CLASS")
+                                  ((eq m '%class-proxy) "BUILT-IN-CLASS")
+                                  ((eq m '%generic-function) "STANDARD-GENERIC-FUNCTION")
+                                  (t "METHOD-COMBINATION"))
+                            stream)
+         (%print-char 32 stream)
+         (%write-obj (svref obj 1) stream level t)
+         (%print-string-raw ">" stream)))
       ;; Array/string (non-cons)
       ((arrayp obj)
        (let ((plev *print-level*)
@@ -5211,18 +5232,8 @@
         (%write-char-to-stream code s)))
     saved-ch))
 
-(defun finish-output (&rest args)
-  "CLHS: takes at most one argument (the stream).  Extra signal
-   program-error.  Modus's stub is a no-op otherwise."
-  (when (cdr args) (%signal-program-error))
-  (%flush-output-arg (car args))
-  nil)
-(defun force-output (&rest args)
-  "CLHS: takes at most one argument (the stream).  Extra signal
-   program-error.  Modus's stub is a no-op otherwise."
-  (when (cdr args) (%signal-program-error))
-  (%flush-output-arg (car args))
-  nil)
+
+
 (defun clear-output (&rest args)
   "CLHS: takes at most one argument (the stream).  Extra signal
    program-error.  Modus's stub is a no-op otherwise."
@@ -5474,6 +5485,9 @@
     (let ((actual-end (if end end (length seq)))
           (i start)
           (s (%resolve-output-stream stream)))
+      ;; a byte vector to a 1-byte file stream: bulk (cl-fileio %FS-WRITE-BYTES)
+      (when (%fs-write-bytes s seq i actual-end)
+        (return-from write-sequence seq))
       ;; Dispatch on the ELEMENT, not on STRINGP: a fill-pointer / adjustable
       ;; string is a character vector but not STRINGP here, and it went down
       ;; the byte path -- %FS-WRITE-BYTE on a string-output stream, a file
@@ -5609,9 +5623,133 @@
           (if (and (or (integerp a) (floatp-impl a) (ratiop a))
                    (or (integerp b) (floatp-impl b) (ratiop b)))
               (numeric-equal-p a b)
+          ;; A complex is a number, not the vector it is stored as: =
+          ;; across types, (equalp #c(1 2) #c(1.0 2.0)) => T (CLHS EQUALP).
+          (if (or (%complex-p a) (%complex-p b))
+              (and (numberp a) (numberp b) (= a b))
+          ;; Pathnames: EQUALP is EQUAL (CLHS).  A pathname is an instance
+          ;; underneath, which is no longer compared as an array.
+          (if (and (pathnamep a) (pathnamep b))
+              (equal a b)
               ;; ANSI equalp: arrays of any type compare element-wise.
               (if (and (or (stringp a) (arrayp a))
                        (or (stringp b) (arrayp b)))
                   (%equalp-array-array a b)
-                  nil))))))))
+                  nil))))))))))
 
+
+;;; ============================================================
+;;; pprint-newline — stub (pretty-printer not supported)
+;;; ============================================================
+
+;;; Pretty-printer — best-effort impl.  pprint-newline emits an actual
+;;; newline; pprint-tab pads to a column; pprint-indent / pprint-fill /
+;;; pprint-linear / pprint-tabular just write the list space-separated.
+;;; The full PPRINT-LOGICAL-BLOCK / pprint-dispatch table machinery is
+;;; far more complex (40-page spec); we cover the common-case calls.
+(defun pprint-newline (kind &rest args)
+  "CLHS 22.4 PPRINT-NEWLINE: a conditional newline of KIND (:LINEAR :FILL
+   :MISER :MANDATORY) in the innermost logical block on STREAM, decided by
+   the layout engine (cl-printer.lisp) when that block closes.  Outside a
+   logical block, or with *PRINT-PRETTY* false, it does nothing."
+  (unless (or (eq kind :linear) (eq kind :fill) (eq kind :miser) (eq kind :mandatory))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :nl kind)))
+
+(defun pprint-tab (kind colnum colinc &rest args)
+  "CLHS 22.4 PPRINT-TAB (:LINE :SECTION :LINE-RELATIVE :SECTION-RELATIVE)."
+  (unless (or (eq kind :line) (eq kind :section)
+              (eq kind :line-relative) (eq kind :section-relative))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :tab kind colnum colinc)))
+
+(defun pprint-indent (relative-to n &rest args)
+  "CLHS 22.4 PPRINT-INDENT: :BLOCK = N past the block's start column,
+   :CURRENT = N past the current column.  Ignored in miser style."
+  (unless (or (eq relative-to :block) (eq relative-to :current))
+    (%signal-type-error))
+  (%ppx-op (if args (car args) nil) (list :ind relative-to (floor n))))
+
+(defun %pprint-seq (stream object colon-p kind tabsize)
+  "PPRINT-FILL / -LINEAR / -TABULAR, as CLHS 22.4 defines them: a logical
+   block (parenthesised when COLON-P) whose elements are separated by a
+   space, a tab to the next TABSIZE column (tabular only) and a KIND
+   conditional newline.  A non-list OBJECT is printed as if by WRITE."
+  (let ((s (%resolve-output-stream stream)))
+    ;; %RT-LISTP, not LISTP: image code's LISTP is the raw tag test, which calls a
+    ;; hash table (a tagged cons) a list and printed its cells (upstream
+    ;; PPRINT-FILL/LINEAR/TABULAR.1-2 once runtime LISTP said HASH-TABLE).
+    (if (not (%rt-listp object))
+        (write-to-stream object s)
+        (let ((cap (%pp-begin s object (if colon-p "(" "") nil)))
+          (catch :%pp-tag
+            (%pprint-exit-fn)
+            (loop
+              (write-to-stream (%pprint-pop-fn) cap)
+              (%pprint-exit-fn)
+              (write-char-to-stream (code-char 32) cap)
+              (when tabsize (pprint-tab :section-relative 0 tabsize cap))
+              (pprint-newline kind cap)))
+          (%pp-end cap (if colon-p ")" "")))))
+  nil)
+
+(defun pprint-fill (stream object &optional (colon-p t) at-sign-p)
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p :fill nil))
+
+(defun pprint-linear (stream object &optional (colon-p t) at-sign-p)
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p :linear nil))
+
+(defun pprint-tabular (stream object &optional (colon-p t) at-sign-p (tabsize 16))
+  (declare (ignore at-sign-p))
+  (%pprint-seq stream object colon-p :fill (or tabsize 16)))
+
+(defvar *%pprint-dispatch-table* nil)
+
+(defun copy-pprint-dispatch (&rest args)
+  "Return a copy of the current pprint dispatch table.  We just hand
+   back a fresh symbol — the table contents aren't actually copied."
+  (declare (ignore args))
+  (gensym "PPRINT-DISP-"))
+
+(defun set-pprint-dispatch (type-spec fn &rest args)
+  "Install FN as the pprint-dispatch entry for TYPE-SPEC.  Stored in
+   *%pprint-dispatch-table* keyed by (type . priority)."
+  (declare (ignore args))
+  (setq *%pprint-dispatch-table*
+        (cons (cons type-spec fn) *%pprint-dispatch-table*))
+  nil)
+
+(defun pprint-dispatch (object &rest args)
+  "Look up the most-specific pprint-dispatch entry for OBJECT.
+   Returns (values function found-p)."
+  (declare (ignore args))
+  (let ((cur *%pprint-dispatch-table*)
+        (found nil))
+    (loop
+      (when (or found (null cur)) (return nil))
+      (let ((entry (car cur)))
+        (when (handler-case (typep object (car entry)) (t (c) nil))
+          (setq found entry)))
+      (setq cur (cdr cur)))
+    (if found
+        (values (cdr found) t)
+        (values nil nil))))
+
+;;; ============================================================
+;;; PPRINT-LOGICAL-BLOCK stub
+;;; ============================================================
+(defun pprint-logical-block (stream-and-opts object-list &rest body-args)
+  "Stub: just evaluate body (already handled by rewriter, this is fallback)."
+  nil)
+
+;;; ============================================================
+;;; DESCRIBE, APROPOS (stubs)
+;;; ============================================================
+(defun describe (object &optional stream)
+  "Default DESCRIBE — dispatches to DESCRIBE-OBJECT.  Per CLHS, DESCRIBE
+   is a regular function that calls the DESCRIBE-OBJECT generic.  We
+   default the stream to NIL (caller's responsibility to bind a real
+   one if they need formatted output)."
+  (describe-object object stream))

@@ -951,8 +951,113 @@
                       '(declare (ignore traps))
                       '(cons 'progn body))))))))
 
+(defun asdf::%quirk-bt-thread-wrapper ()
+  "See %QUIRK-BORDEAUX-THREADS."
+  (let ((p (find-package "BORDEAUX-THREADS-2"))
+        (share (find-symbol "SHARE" "MODUS")))
+    (when (and p share (fboundp share) (find-symbol "ESTABLISH-DYNAMIC-ENV" p))
+      (let ((*package* p))
+        (eval (read-from-string "
+(defun %modus-share-condition (c)
+  (handler-case (modus:share c)
+    (error () (modus:share (make-condition 'simple-error
+                                           :format-control \"~A\"
+                                           :format-arguments (list (princ-to-string c)))))))"))
+        (eval (read-from-string "
+(defun establish-dynamic-env (thread function special-bindings trap-conditions)
+  (let* ((bindings (compute-special-bindings special-bindings))
+         (specials (mapcar #'car bindings))
+         (values (mapcar (lambda (f) (eval (cdr f))) bindings)))
+    (named-lambda %establish-dynamic-env-wrapper ()
+      (progv specials values
+        (with-slots (%lock %return-values %exit-condition native-thread)
+            thread
+          (flet ((record-condition (c)
+                   (with-lock-held (%lock)
+                     (setf %exit-condition (%modus-share-condition c))))
+                 (run-function ()
+                   (let ((*current-thread* nil))
+                     (with-lock-held (%lock)
+                       (setf *current-thread* (%get-thread-wrapper (%current-thread))))
+                     (let ((retval
+                             (multiple-value-list (funcall function))))
+                       (with-lock-held (%lock)
+                         (setf %return-values (modus:share retval)))
+                       retval))))
+            (unwind-protect
+                 (if trap-conditions
+                     (handler-case
+                         (values-list (run-function))
+                       (condition (c)
+                         (record-condition c)))
+                     (handler-bind
+                         ((condition #'record-condition))
+                       (values-list (run-function))))
+              (when (fboundp 'remove-thread-wrapper)
+                (funcall 'remove-thread-wrapper native-thread)))))))))"))))))
+
+(defun asdf::%quirk-bordeaux-threads ()
+  "bordeaux-threads takes its GENERA backend here (modus presents as Genera), and
+   that backend's condition wait -- v2's %CONDITION-WAIT and v1's CONDITION-WAIT,
+   the same code twice -- is wrong in two ways for any caller: it returns
+   EXPIRED-P -- T after a TIMEOUT, where the API promises T only for a
+   notification -- so every `wait until notified or timed out' loop on modus spun
+   forever (cl-nostr's FETCH-EVENTS hung its caller); and it re-acquires the lock
+   only when notified, so a timed-out waiter left WITH-LOCK-HELD releasing a lock it
+   did not hold.  The replacements return T only when notified, always re-acquire,
+   and take a timed-out waiter off the queue so a later notify is not spent on it.
+   Each is installed only if its package has the Genera struct accessor, i.e. only
+   over the Genera backend.
+
+   And bt2's thread wrapper, ESTABLISH-DYNAMIC-ENV, stores the thread's return
+   values and any condition it signals into the THREAD instance, which belongs to
+   the thread that called MAKE-THREAD.  A worker's list stored there is the store
+   modus's shared-store guard refuses, so every BT2:JOIN-THREAD returned NIL and
+   the worker died printing why.  The replacement stores MODUS:SHARE copies, and
+   for a condition that cannot be copied, a SIMPLE-ERROR carrying its text."
+  (asdf::%quirk-bt-thread-wrapper)
+  (dolist (spec '(("BORDEAUX-THREADS-2" "
+(defun %condition-wait (cv lock timeout)
+  (check-type cv condition-variable)
+  (check-type lock %lock)
+  (%modus-condition-wait cv timeout
+                         (lambda () (%release-lock lock))
+                         (lambda () (%acquire-lock lock t nil))))")
+                  ("BORDEAUX-THREADS" "
+(defun condition-wait (condition-variable lock &key timeout)
+  (check-type condition-variable condition-variable)
+  (check-type lock lock)
+  (%modus-condition-wait condition-variable timeout
+                         (lambda () (release-lock lock))
+                         (lambda () (acquire-lock lock))))")))
+    (let ((p (find-package (first spec))))
+      (when (and p (find-symbol "CONDITION-VARIABLE-WAITERS" p))
+        (let ((*package* p))
+          (eval (read-from-string "
+(defun %modus-condition-wait (cv timeout release acquire)
+  (let ((waiter (cons scl:*current-process* nil)))
+    (process:atomic-updatef (condition-variable-waiters cv)
+                            #'(lambda (waiters) (append waiters (scl:ncons waiter))))
+    (let ((expired? t))
+      (unwind-protect
+           (progn
+             (funcall release)
+             (process:block-with-timeout timeout \"Waiting\"
+                                         #'(lambda (waiter expired?-loc)
+                                             (when (not (null (cdr waiter)))
+                                               (setf (sys:location-contents expired?-loc) nil)
+                                               t))
+                                         waiter (sys:value-cell-location 'expired?))
+             (not expired?))
+        (when expired?
+          (process:atomic-updatef (condition-variable-waiters cv)
+                                  #'(lambda (waiters) (remove waiter waiters))))
+        (funcall acquire)))))"))
+          (eval (read-from-string (second spec))))))))
+
 (defvar asdf::*system-quirks*
-  '(("float-features" . asdf::%quirk-float-features))
+  '(("float-features" . asdf::%quirk-float-features)
+    ("bordeaux-threads" . asdf::%quirk-bordeaux-threads))
   "System name -> a function run right after that system loads: the fix-ups
    for libraries that have a branch per implementation and none for modus.")
 
@@ -970,7 +1075,7 @@
    into an earlier one run native too.  JIT-EAGER translates only what is new.
    MODUS_NO_LOAD_JIT=1 turns it off; a JIT failure never fails the load."
   ;; RAISED, not run: the outermost LOAD runs it between two toplevel forms
-  ;; (mvm/ansi-bridge.lisp, DEFERRED JIT) -- running it here replaced the
+  ;; (mvm/cl-eval.lisp, DEFERRED JIT) -- running it here replaced the
   ;; still-executing Quicklisp functions under their own frames.
   (let ((off (%cli-getenv "MODUS_NO_LOAD_JIT")))
     (unless (and off (> (length off) 0) (not (string= off "0")))

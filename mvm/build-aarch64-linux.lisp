@@ -915,7 +915,7 @@
   (setq *gensym-counter* 0)
   (setq *gentemp-counter* 0)
 
-  ;; Float constants from ansi-bridge — defvars don't run their init
+  ;; Float constants from cl-types.lisp — defvars don't run their init
   ;; thunks (per CLAUDE.md), so without these explicit setqs every
   ;; *-float-epsilon resolves to NIL at runtime, and the first ANSI
   ;; test that funcalls DECODE-FLOAT on one of them used to loop
@@ -1007,7 +1007,7 @@
 
   ;; Character-set constants from ansi-aux.lsp (skipped at load time).
   ;; defvar init-thunks don't run at boot.  Done in a helper in
-  ;; ansi-bridge.lisp (%init-standard-chars) so the literal strings —
+  ;; ansi-test-aux.lisp (%init-standard-chars) so the literal strings —
   ;; which contain double-quotes, backslashes and a newline — live in a
   ;; real source file rather than inside this driver-source string (where
   ;; they would need triple-level escaping and broke the SBCL reader).
@@ -1236,7 +1236,7 @@
 ;; printer-control variables (*print-base* random 2-35, *print-circle*,
 ;; *print-readably*, etc.) and depends on full printer/reader
 ;; round-trip — Modus's printer doesn't honor most.  Restore the
-;; t-stub from ansi-bridge.lisp:1975 to win against printer-aux.lsp.
+;; t-stub from ansi-test-aux.lisp to win against printer-aux.lsp.
 (defun randomly-check-readability (obj &rest args)
   (declare (ignore obj args))
   nil)

@@ -90,7 +90,7 @@ mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   cl-clos.lisp         429L  CLOS (defclass, defgeneric, defmethod, dispatch)
   cl-eval.lisp       3,575L  Eval/compile/load (mvm-eval), symbol-function table
   cl-types.lisp        519L  typep, coerce, numeric helpers
-  ansi-bridge.lisp   1,888L  Test helpers (eqlt, scaffold, stubs)
+  ansi-test-aux.lisp         ANSI-test helpers (eqlt, scaffold, structures-03 stand-ins)
   gc.lisp                    GC helper functions (Lisp-side)
   mvm-eval.lisp                 Production eval: compile→MVM bytecode→interpret
   interp.lisp                MVM bytecode interpreter (in-image)
@@ -267,6 +267,30 @@ Key fixes en route: call-relocation untag (5b866fa), out-of-module GC-trampoline
 `(ldb (byte 32 32) bignum)` high-word extract was broken by limitation #8; now
 `(logand …)` + `(ash (floor V 2^31) -1)`).  Next: port the JIT to aarch64; then
 back to Quicklisp.
+
+### Hot-function JIT: a runtime DEFUN goes native on its own (2026-10-14)
+
+`*jit-hot-only*` decides per TOPLEVEL FORM, and a DEFUN runs once, so a DEFUN
+from `load` of a source file, a `--script`, `eval` or the REPL stayed an
+interpreter trampoline forever unless something called `jit-eager`.  (ASDF
+loads were already native: `compile-file` and the FASL cache build them.)  Now
+each DEFUN's trampoline counts: after `*jit-hot-calls*` calls (NIL = 64, 0 =
+off) or 10 ms spent interpreted, its module is built -- after its
+still-interpreted callees, so the calls link straight to native code -- with
+`jit-eager`'s own `%jit-build-module`.  Only calls that reach the trampoline
+count; a self-call inside the function's bytecode does not, and there is no
+on-stack replacement, so a single long call finishes interpreted and the NEXT
+call is native.  Measured on x64: a script's helper loop 20.5 s -> 66 ms;
+natrium loaded with `load`: 50 x SHA-256(4K) 84 s -> 2.0 s, 50 x HMAC 200 s ->
+0.6 s; load time unchanged.  `test/hot-jit.lisp` (20 checks, x64 + aarch64).
+
+**x64 LINKAGE STUBS came with it**, because a native caller BAKED its callee's
+address: with DEFUNs going native by default, redefining a hot function would
+have been invisible to its already-native callers.  A native call to a runtime
+DEFUN now goes through a per-name 16-byte stub (`jmp [rip+2]` + target word)
+that every (re)definition retargets -- aarch64's linkage cells, without a
+translator change.  `test/redefine-native-callers.lisp`, which x64 had FAILED
+since it was written, passes; the stubs survive save-and-die.
 
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 
@@ -2284,7 +2308,7 @@ mechanism:
    `make-string` inside one compiled function -> main's 16 MB region collects
    -> death in the LOAD machinery (`load-read-error-stops-load` /
    `load-toplevel-form-swallowed`, TYPE-ERROR): the load loop
-   (`%load-from-stream`, mvm/ansi-bridge.lisp) reads and evals on main, and
+   (`%load-from-stream`, mvm/cl-eval.lisp) reads and evals on main, and
    the pre-hop stream/table structures in region 0 hold pointers into main's
    region that the collection never fixes — `EMIT-GC-TRAMPOLINE` scans the
    fixed tables' ROOT SLOTS and Cheney-walks only the collecting region's
@@ -2541,6 +2565,24 @@ bound still writes the shared table with a caller-supplied value — a different
 operation with its own cross-region story, untouched here; `BOUNDP` walks the
 table, so a special bound only per-thread reads as unbound on that thread; the
 58-binding ceiling; and `kiln modus-rfb PORT` was not run.
+
+### MODUS:MAKE-CHANNEL — messages between threads that cost the shared heap nothing (2026-10-14)
+
+`modus:share` (and `join-thread`'s result) copies into the runtime lock arena —
+~8.9 KB per 1000-char string — and that arena is reclaimed only by a
+STOP-THE-WORLD collection of region 0, so passing messages that way stops every
+thread every few thousand messages.  `net/modus-channel.lisp` (baked after the
+thread shim): one shared byte ring per channel, made once; `channel-send`
+encodes in the SENDER's heap and copies BYTES in (not objects, so the guard has
+nothing to refuse), `channel-receive` decodes fresh in the RECEIVER's heap.
+Plain data only (numbers, chars, strings, symbols by name, lists, simple and u8
+vectors, hash tables); anything else signals in the sender.  `:modus-channel`
+on `*features*`.  Measured: 20 000 x 1 KB worker -> main, 0 arena bytes, 0
+region-0 collections, ~95 us/message (`modus:share`: 3 stop-the-world
+collections for the same).  `test/hosted-channel.lisp` (56 checks, x64 +
+aarch64).  It surfaced a TYPEP bug: a general vector matched EVERY
+non-character element type, `(vector (unsigned-byte 8))` included — fixed
+(CLHS upgrade rule), with `make-sequence` of `(vector single-float)` now packed.
 
 ### THE COOPERATIVE ATOMICS ARE SMP-SAFE — except %ATOMIC-CAS, which is not
 
@@ -2999,7 +3041,7 @@ call-counter branch on every call regardless of the syscall.  And syscall 201 is
 which made every `(- after before)` zero.
 
 Both now go through a seam — `%IRT-NS` / `%IRUN-NS`, defined at 0 in
-`mvm/ansi-bridge.lisp` ("this target has no clock") and overridden by
+`mvm/cl-fileio.lisp` ("this target has no clock") and overridden by
 last-defun-wins in `net/hosted-sync.lisp`, which is where `clock_gettime(2)` can
 be called at all because it owns the **per-CPU** timespec scratch (a shared
 timespec is two threads writing one buffer).  Real time is CLOCK_MONOTONIC, run

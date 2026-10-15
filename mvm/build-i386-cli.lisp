@@ -147,7 +147,7 @@
 ;;;
 ;;; 1. SYSCALL NUMBERS.  mvm/cl-fileio.lisp hardcodes the x86-64 table
 ;;;    (open=2 close=3 read=0 write=1 lseek=8 stat=4 fstat=5 unlink=87
-;;;    rename=82 mkdir=83 getpid=39 getdents64=217; ansi-bridge's clock uses
+;;;    rename=82 mkdir=83 getpid=39 getdents64=217; cl-fileio's clock uses
 ;;;    clock_gettime=228).  i386 shares almost none
 ;;;    of them.  Same class build-aarch64-cli.lisp fixed for the *at-only
 ;;;    AArch64 ABI (be1aef1): without these, LOAD, OPEN and every path

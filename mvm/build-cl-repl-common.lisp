@@ -2248,9 +2248,16 @@
     ;; holds nothing a reset did not clear.  Unconditionally from the top: after
     ;; a RUN-pin reset HID-FIND-HUB can still find the hub answering while the
     ;; host side is unconfigured, and HID-CONSOLE-INIT then skipped the bring-up.
-    (when (fboundp (quote hid-usb-bringup))
+    ;; Only for the desk (the REPL's own console init does it otherwise, and a second
+    ;; run of the bring-up undoes the first), and only from the top when nothing set the
+    ;; bus up: under U-Boot (a netboot) the RTL8153 is already vendor-initialised at an
+    ;; address 2..7 for net/r8152.lisp to adopt, and resetting the bus loses that state.
+    (when (and (fboundp (quote hid-usb-bringup))
+               (boundp (quote *core-restart-hook*)) *core-restart-hook*)
       (handler-case
-          (progn (hid-usb-bringup)
+          (progn (if (and (fboundp (quote r8152-find-addr)) (> (r8152-find-addr) 0))
+                     (when (zerop (hid-find-hub)) (hid-usb-bringup))
+                     (hid-usb-bringup))
                  (let ((r (hid-split-init)))
                    (write-string-serial \"USB-HID: keyboard \")
                    (write-string-serial (if (car r) \"yes\" \"no\"))

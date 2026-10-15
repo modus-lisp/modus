@@ -980,6 +980,54 @@
   ;; thunks carry the index as a 32- or 64-bit immediate; only this table bounds it.
   65536)
 
+(defvar *jit-bridge-sites* nil
+  "Vector, bridge index -> (PAGE-BASE . IMM-OFFSET) of the call site its thunk
+   was patched into, until %JIT-BRIDGE-SELF-PATCH points the site at native
+   code.")
+
+(defun %jit-bridge-note-site (idx base off)
+  (when (and (>= idx 0) (< idx 4096))
+    (unless (and *jit-bridge-sites* (not (fixnump *jit-bridge-sites*)))
+      (setq *jit-bridge-sites* (make-array 4096 :initial-element nil)))
+    (setf (svref *jit-bridge-sites* idx) (cons base off))))
+
+(defun %jit-bridge-self-patch (idx f)
+  "Bridge IDX resolved to F: when F is native code, rewrite the call site the
+   thunk was patched into to call F directly, once.  A call to a function that
+   was not native when its caller's page was built (a forward reference, the
+   usual case in a file) paid the bridge, a generic FUNCALL and its checks on
+   every call for good.  Early binding from then on, as for any call resolved
+   at page build on x86-64.  Only on an unarmed image: another thread could
+   be executing the instruction."
+  (let ((sites *jit-bridge-sites*))
+    (when (and sites (not (fixnump sites)) (< idx 4096)
+               (eql (mem-ref #x10000DB8 :u32) 0)
+               (not (eq *jit-target-arch* :aarch64)))
+      (let ((site (svref sites idx)))
+        (when (consp site)
+          (let ((word (%val->word f)))
+            (when (eql (logand word 15) 3)
+              (%jit-write-imm64 (car site) (cdr site) (- word 3))
+              (setf (svref sites idx) nil)
+              ;; Remember the site under its callee's name: a later native
+              ;; (re)definition repoints it (%JIT-INSTALL-NATIVE-FNS).
+              (let ((nm (and *jit-bridge-names* (aref *jit-bridge-names* idx))))
+                (when (stringp nm)
+                  (unless (consp *jit-patched-sites*)
+                    (setq *jit-patched-sites* (make-hash-table :test (function equal))))
+                  (setf (gethash nm *jit-patched-sites*)
+                        (cons site (gethash nm *jit-patched-sites*))))))))))))
+
+(defvar *jit-patched-sites* nil
+  "EQUAL hash NAME -> call sites %JIT-BRIDGE-SELF-PATCH pointed at NAME's
+   native code; repointed when NAME is installed native again.")
+
+(defun %jit-repatch-sites (name addr)
+  "Point every self-patched call site of NAME at ADDR (untagged entry)."
+  (when (and (consp *jit-patched-sites*) (eql (mem-ref #x10000DB8 :u32) 0))
+    (dolist (site (gethash name *jit-patched-sites*))
+      (%jit-write-imm64 (car site) (cdr site) addr))))
+
 (defun %jit-bridge-resolve (idx)
   "The callee of bridge thunk IDX, resolved at CALL time (late binding).  The
    symbol-function-table entry CONS is cached per thunk: PUTHASH updates it in
@@ -989,7 +1037,7 @@
   (let* ((pairs *jit-bridge-pairs*)
          (pair (and pairs (< idx (length pairs)) (aref pairs idx))))
     (if (and (consp pair) (cdr pair))
-        (cdr pair)
+        (progn (%jit-bridge-self-patch idx (cdr pair)) (cdr pair))
         (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
                       (aref *jit-bridge-names* idx) nil)))
           (let ((p (and nm pairs (< idx (length pairs))
@@ -1525,6 +1573,9 @@
                          (%jit-make-bridge-any-thunk name))))
             (when th
               (setq raw th)
+              ;; Remember the site, so the bridge can patch it once NAME is
+              ;; native (%JIT-BRIDGE-RESOLVE).
+              (%jit-bridge-note-site (- *jit-bridge-count* 1) base (car r))
               (setq *jit-bridged-sites*
                     (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
         (if (> raw 0)
@@ -1835,6 +1886,8 @@
                 ;; every already-built caller that calls through the cell picks
                 ;; up this (re)definition — proper CL late binding.
                 (%jit-lcell-set nm addr)
+                ;; And x86-64 sites a bridge patched to NM's earlier code.
+                (%jit-repatch-sites nm addr)
                 (setq n (+ n 1))))))))
     (setq *jit-native-defun-count*
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))

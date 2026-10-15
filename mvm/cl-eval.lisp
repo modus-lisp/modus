@@ -2988,6 +2988,7 @@
 (declaim (optimize (safety 0)))
 
 (defun %mag-trim (v off len)
+  (declare (type simple-vector v))
   (loop (when (or (<= len 0) (not (= (aref v (+ off len -1)) 0))) (return len))
     (setq len (- len 1))))
 
@@ -3004,17 +3005,20 @@
     (t (let* ((sl (%small-to-limbs n))
               (v (make-array (length (cdr sl))))
               (i 0))
+    (declare (type simple-vector v))
          (dolist (l (cdr sl)) (aset v i l) (setq i (+ i 1)))
          (values (car sl) v 0 (%mag-trim v 0 (length v)))))))
 
 (defun %mag-to-int (sign v off len)
   "The integer SIGN * magnitude (V OFF LEN), in its canonical representation."
+  (declare (type simple-vector v))
   (let ((len (%mag-trim v off len)))
     (cond
       ((= len 0) 0)
       ((= len 1) (let ((l (aref v off))) (if (= sign -1) (%fixnum-- 0 l) l)))
       ((= len 2) (%make-bb sign (list (aref v off) (aref v (+ off 1)))))
       (t (let ((arr (make-array (+ 2 len))) (b (%make-bignum)) (i 0))
+    (declare (type simple-vector arr))
            (aset arr 0 sign)
            (aset arr 1 len)
            (loop (when (>= i len) (return nil))
@@ -3042,6 +3046,7 @@
   (when (< al bl)
     (return-from %mag-add (%mag-add bv bo bl av ao al)))
   (let ((out (make-array (+ al 1))) (carry 0) (i 0))
+    (declare (type simple-vector out))
     (loop (when (>= i al) (return nil))
       (let ((s (%fixnum-+ (%fixnum-+ (aref av (+ ao i)) (if (< i bl) (aref bv (+ bo i)) 0))
                           carry)))
@@ -3056,6 +3061,7 @@
   "(values OUT LEN): A - B for magnitudes with A >= B."
   (declare (type simple-vector av bv))
   (let ((out (make-array (max al 1))) (borrow 0) (i 0))
+    (declare (type simple-vector out))
     (loop (when (>= i al) (return nil))
       (let ((d (%fixnum-- (%fixnum-- (aref av (+ ao i)) (if (< i bl) (aref bv (+ bo i)) 0))
                           borrow)))
@@ -3072,6 +3078,7 @@
    a fresh vector with EXTRA spare zero digits at the top."
   (declare (type simple-vector v))
   (let* ((n (* 2 len)) (d (make-array (+ n extra))) (i 0))
+    (declare (type simple-vector d))
     (loop (when (>= i len) (return nil))
       (let ((l (aref v (+ off i))))
         (aset d (* 2 i) (logand l +half-limb-mask+))
@@ -3081,7 +3088,9 @@
 
 (defun %digits-to-int (sign d n)
   "The integer SIGN * the half-limb digits D[0 .. N-1]."
+  (declare (type simple-vector d))
   (let* ((len (ash (+ n 1) -1)) (v (make-array (max len 1))) (i 0))
+    (declare (type simple-vector v))
     (loop (when (>= i len) (return nil))
       (let ((lo (aref d (* 2 i)))
             (hi (if (< (+ (* 2 i) 1) n) (aref d (+ (* 2 i) 1)) 0)))
@@ -3098,9 +3107,11 @@
       (let ((ai (aref a i)))
         (unless (= ai 0)
           (let ((carry 0) (j 0) (k i))
+            (declare (fixnum carry j k))
             (loop (when (>= j nb) (return nil))
               ;; out[k] + ai*b[j] + carry <= (B-1) + (B-1)^2 + (B-1) = B^2 - 1
               (let ((tt (%fixnum-+ (%fixnum-+ (aref out k) (%fixnum-* ai (aref b j))) carry)))
+                (declare (fixnum tt))
                 (aset out k (logand tt +half-limb-mask+))
                 (setq carry (ash tt +neg-half-limb-bits+)))
               (setq j (+ j 1))
@@ -3162,17 +3173,17 @@
             (setq qhat (%fixnum-- qhat 1))
             (setq rhat (%fixnum-+ rhat vtop))
             (when (>= rhat base) (return nil)))
-          ;; D4: U[j .. j+n] -= QHAT * V
-          (let ((carry 0) (borrow 0) (i 0))
+          ;; D4: U[j .. j+n] -= QHAT * V, with ONE signed carry:
+          ;; u - qhat*v + c with |c| < B stays above -B^2, and the floor
+          ;; shift of a negative sum is exactly the borrow
+          (let ((c 0) (i 0) (k j))
             (loop (when (>= i n) (return nil))
-              (let* ((p (%fixnum-+ (%fixnum-* qhat (aref v i)) carry))
-                     (tt (%fixnum-- (%fixnum-- (aref u (+ i j)) (logand p +half-limb-mask+)) borrow)))
-                (setq carry (ash p +neg-half-limb-bits+))
-                (if (< tt 0)
-                    (progn (aset u (+ i j) (%fixnum-+ tt base)) (setq borrow 1))
-                    (progn (aset u (+ i j) tt) (setq borrow 0))))
-              (setq i (+ i 1)))
-            (let ((tt (%fixnum-- (%fixnum-- (aref u (+ j n)) carry) borrow)))
+              (let ((tt (%fixnum-+ (%fixnum-- (aref u k) (%fixnum-* qhat (aref v i))) c)))
+                (aset u k (logand tt +half-limb-mask+))
+                (setq c (ash tt +neg-half-limb-bits+)))
+              (setq i (+ i 1))
+              (setq k (+ k 1)))
+            (let ((tt (%fixnum-+ (aref u (+ j n)) c)))
               (if (>= tt 0)
                   (aset u (+ j n) tt)
                   ;; D6: QHAT one too large -- add V back (the carry out of the
@@ -3320,6 +3331,7 @@
                  (p (%pow2-small bits))
                  (out (make-array (+ n whole 1)))
                  (carry 0) (i 0))
+    (declare (type simple-vector out))
             (loop (when (>= i n) (return nil))
               (let ((x (%fixnum-+ (%fixnum-* (aref d i) p) carry)))   ; < B^2
                 (aset out (+ i whole) (logand x +half-limb-mask+))
@@ -3342,6 +3354,7 @@
             (if (<= nn 0)
                 (if (= as -1) -1 0)
                 (let ((out (make-array nn)) (i 0))
+    (declare (type simple-vector out))
                   ;; digits dropped whole
                   (loop (when (or (>= i whole) lost) (return nil))
                     (unless (= (aref d i) 0) (setq lost t))
@@ -3399,15 +3412,16 @@
 
 (defun %digits-top (d n k)
   "Bits [K, K + half-limb-bits) of the digits D[0..N-1], as a fixnum digit."
+  (declare (type simple-vector d))
   (let* ((i (truncate k +half-limb-bits+))
          (s (%fixnum-- k (%fixnum-* i +half-limb-bits+)))
          (p (%pow2-small (%fixnum-- +half-limb-bits+ s)))
          (lo (if (< i n) (ash (%fixnum-* (aref d i) p) +neg-half-limb-bits+) 0))
          (hi (if (< (+ i 1) n) (logand (%fixnum-* (aref d (+ i 1)) p) +half-limb-mask+) 0)))
-    (declare (type simple-vector d))
     (%fixnum-+ lo hi)))
 
 (defun %digits-bitlen (d n)
+  (declare (type simple-vector d))
   (if (<= n 0) 0
       (+ (* (- n 1) +half-limb-bits+) (%fixnum-integer-length (aref d (- n 1))))))
 
@@ -3479,6 +3493,7 @@
                          (o2 (make-array (+ n 2)))
                          (n1 (%digits-lincomb x u un y v vn n o1))
                          (n2 (%digits-lincomb z u un w v vn n o2)))
+    (declare (type simple-vector o1 o2))
                     (setq u o1) (setq un n1)
                     (setq v o2) (setq vn n2))))))))))
 

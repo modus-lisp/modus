@@ -309,15 +309,23 @@
       (write-char-serial 10))
     (setq *hid-console-up* t)))
 
-;; REAL MILLISECONDS.  dwc2.lisp's DWC2-DELAY-MS counts IO-DELAYs (5000 UART reads each), so
-;; how long a "100 ms" wait lasts depends on the bus and the CPU, and a bring-up that worked
-;; with serial prints between its steps hung without them.  The BCM283x system timer (CLO,
-;; 1 MHz) sits 0x97CFFC below the DWC2 in every Pi's peripheral window.  Defined here, not in
-;; dwc2.lisp: this file is only in the 64-bit Pi CL images, where a :u32 time fits a fixnum.
+;; TIMED, NOT COUNTED.  dwc2.lisp's DWC2-DELAY-MS counts IO-DELAYs (5000 UART reads each), so
+;; how long a wait lasts depends on the bus and the CPU, and a bring-up that worked with serial
+;; prints between its steps hung without them.  The BCM283x system timer (CLO, 1 MHz) sits
+;; 0x97CFFC below the DWC2 in every Pi's peripheral window.
+;;
+;; ONE "MILLISECOND" HERE IS 1.87 ms, ON PURPOSE.  Measured on the Zero 2 W at 1 GHz, the
+;; counted version's 100 took 187 ms, and every wait in this driver (port reset, power-good,
+;; the RTL8153's recovery) was tuned on the board against that.  Honest milliseconds halved
+;; them all and the hub stopped answering address 0.  Keeping the tuned durations, now fixed
+;; in real time; shorten a wait by changing its caller, measured.
+;;
+;; Defined here, not in dwc2.lisp: this file is only in the 64-bit Pi CL images, where a
+;; :u32 time fits a fixnum.
 (defun dwc2-delay-ms (ms)
   (let* ((clo (- (dwc2-base) #x97CFFC))
          (t0 (mem-ref clo :u32))
-         (us (* ms 1000)))
+         (us (* ms 1870)))
     (loop
       (when (>= (logand (- (mem-ref clo :u32) t0) #xFFFFFFFF) us) (return nil)))))
 

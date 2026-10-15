@@ -2426,6 +2426,37 @@
     ((= (mod a b) 0) (%rat-exact-div a b))
     (t (%make-rat a b))))
 
+;;; RATIONAL ARITHMETIC THE WAY KNUTH DOES IT (TAOCP 2, 4.5.1).  Every ratio
+;;; op formed the cross-products and handed them to %MAKE-RAT, i.e. a GCD of
+;;; two numbers as large as the result -- PI-DECIMAL's running sum spent all its
+;;; time there.  With both operands in lowest terms the reductions can be done
+;;; on the small pieces: a/b + c/d needs only g = gcd(b, d) and gcd(t, g), and
+;;; when g = 1 (the common case) the sum is already in lowest terms; a/b * c/d
+;;; needs gcd(a, d) and gcd(c, b).  Integer +/- ratio needs none at all.
+(defun %rat-from (n d)
+  "N/D, already coprime with D > 0."
+  (if (eql d 1) n (make-ratio-obj n d)))
+
+(defun %rat-add-knuth (a b c d)
+  "a/b + c/d, both in lowest terms with b, d > 0."
+  (let ((g (gcd-impl b d)))
+    (if (eql g 1)
+        (%rat-from (bignum-add (bignum-mul a d) (bignum-mul c b)) (bignum-mul b d))
+        (let* ((bg (%rat-exact-div b g))
+               (tt (bignum-add (bignum-mul a (%rat-exact-div d g)) (bignum-mul c bg))))
+          (if (eql tt 0)
+              0
+              (let ((g2 (gcd-impl tt g)))
+                (%rat-from (%rat-exact-div tt g2) (bignum-mul bg (%rat-exact-div d g2)))))))))
+
+(defun %rat-mul-knuth (a b c d)
+  "a/b * c/d, both in lowest terms with b, d > 0."
+  (if (or (eql a 0) (eql c 0))
+      0
+      (let ((g1 (gcd-impl a d)) (g2 (gcd-impl c b)))
+        (%rat-from (bignum-mul (%rat-exact-div a g1) (%rat-exact-div c g2))
+                   (bignum-mul (%rat-exact-div b g2) (%rat-exact-div d g1))))))
+
 (defun %rational-divide (a b)
   "Divide A by B where at least one is a ratio (other may be ratio or
    integer).  Cross-multiply (na*db)/(da*nb), normalise via %make-rat.
@@ -2436,7 +2467,10 @@
         (da (if (ratiop a) (aref a 1) 1))
         (nb (if (ratiop b) (aref b 0) b))
         (db (if (ratiop b) (aref b 1) 1)))
-    (%make-rat (* na db) (* da nb))))
+    ;; times the reciprocal db/nb, its sign moved to the numerator
+    (if (%int-neg-p nb)
+        (%rat-mul-knuth na da (bignum-negate db) (bignum-negate nb))
+        (%rat-mul-knuth na da db nb))))
 
 (defun generic-negate (x)
   "Negate X (integer or ratio)."
@@ -2824,14 +2858,13 @@
     ;; cross-products can overflow 62 bits — use the bignum-safe
     ;; bignum-add / bignum-mul (neither recurses into generic-add) instead
     ;; of raw %fixnum-+ / %fixnum-* which wrap / mishandle bignum pointers.
+    ;; integer + c/d = (a*d + c)/d, already in lowest terms
     ((and (integerp a) (ratiop b))
-     (%make-rat (bignum-add (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
+     (make-ratio-obj (bignum-add (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
-     (%make-rat (bignum-add (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
+     (make-ratio-obj (bignum-add (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
-     (%make-rat (bignum-add (bignum-mul (aref a 0) (aref b 1))
-                            (bignum-mul (aref b 0) (aref a 1)))
-                (bignum-mul (aref a 1) (aref b 1))))
+     (%rat-add-knuth (aref a 0) (aref a 1) (aref b 0) (aref b 1)))
     ((or (%complex-p a) (%complex-p b)) (complex-add a b))
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-add (%any-to-float a) (%any-to-float b))
@@ -2875,12 +2908,11 @@
     ;; overflow promotion; never recurses into generic-multiply) instead of
     ;; the raw %fixnum-* which wraps / mishandles a bignum pointer.
     ((and (integerp a) (ratiop b))
-     (%make-rat (bignum-mul a (aref b 0)) (aref b 1)))
+     (%rat-mul-knuth a 1 (aref b 0) (aref b 1)))
     ((and (ratiop a) (integerp b))
-     (%make-rat (bignum-mul (aref a 0) b) (aref a 1)))
+     (%rat-mul-knuth (aref a 0) (aref a 1) b 1))
     ((and (ratiop a) (ratiop b))
-     (%make-rat (bignum-mul (aref a 0) (aref b 0))
-                (bignum-mul (aref a 1) (aref b 1))))
+     (%rat-mul-knuth (aref a 0) (aref a 1) (aref b 0) (aref b 1)))
     ((or (%complex-p a) (%complex-p b)) (complex-mul a b))
     ;; IEEE float fast path — SSE2 MULSD via %float-mul primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))
@@ -2931,13 +2963,11 @@
     ;; bignum-sub / bignum-mul (neither recurses into generic-subtract)
     ;; instead of raw %fixnum-- / %fixnum-* which wrap / mishandle pointers.
     ((and (integerp a) (ratiop b))
-     (%make-rat (bignum-sub (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
+     (make-ratio-obj (bignum-sub (bignum-mul a (aref b 1)) (aref b 0)) (aref b 1)))
     ((and (ratiop a) (integerp b))
-     (%make-rat (bignum-sub (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
+     (make-ratio-obj (bignum-sub (aref a 0) (bignum-mul b (aref a 1))) (aref a 1)))
     ((and (ratiop a) (ratiop b))
-     (%make-rat (bignum-sub (bignum-mul (aref a 0) (aref b 1))
-                            (bignum-mul (aref b 0) (aref a 1)))
-                (bignum-mul (aref a 1) (aref b 1))))
+     (%rat-add-knuth (aref a 0) (aref a 1) (bignum-negate (aref b 0)) (aref b 1)))
     ((or (%complex-p a) (%complex-p b)) (complex-sub a b))
     ;; IEEE float fast path — SSE2 SUBSD via %float-sub primop.
     ((or (%ieee-float-p a) (%ieee-float-p b))

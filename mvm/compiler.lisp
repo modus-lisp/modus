@@ -25780,7 +25780,14 @@
   (if (and (%promote-locals-p) (not *promote-inhibit*))
       (handler-case (%mvm-compile-toplevel-1 form)
         (error (e)
-          (if (search "out of temporary" (handler-case (format nil "~a" e) (error () "")))
+          ;; The FORMAT CONTROL, not the printed text: printing the condition can
+          ;; itself fail (a PRINT-OBJECT recursion once did, on every Pi image),
+          ;; and then this retry never ran and the DEFUN was silently dropped.
+          (if (or (search "out of temporary"
+                          (handler-case (let ((fc (simple-condition-format-control e)))
+                                          (if (stringp fc) fc ""))
+                            (error () "")))
+                  (search "out of temporary" (handler-case (format nil "~a" e) (error () ""))))
               (let ((*promote-inhibit* t))
                 (declare (special *promote-inhibit*))
                 (%mvm-compile-toplevel-1 form))

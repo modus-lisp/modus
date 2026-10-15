@@ -11799,32 +11799,22 @@
    the ANSI corpus adds more.  Past this the compiler simply stops handing out
    slots and those reads keep the old %GV-REF call.")
 
-(defvar *gv-cache-enabled* nil
-  "DEFAULT OFF, and the default is the honest part of this change.
+(defvar *gv-cache-enabled* t
+  "ON BY DEFAULT since the gate-runner image went 0/0 (19820 vs 19818, no test
+   lost) -- MODUS_NO_GVCACHE=1 at BUILD time turns it off.
 
-   With it ON the cached read is measurably right and measurably faster on
-   every SHIPPING image: the 24-line semantics probe (tests/gvref-probe.lisp)
-   is identical to the pre-change binary with the JIT on and off, the Pi 5
-   promote-probe is identical to its stored reference both ways, the reel md5
-   gate is 48/48, the bare-metal aarch64 self-test prints its exact expected
-   line, and the scalar benchmark on a Pi 5 goes 4572.60 -> 3713.36 M
-   instructions per rep (-18.8%, 12.33x SBCL -> 10.01x).
+   What kept it off was never the cache.  The gate runner lost tests with it on
+   because WAIT4 went through the 3-argument syscall trap, which left R10 --
+   WAIT4's fourth argument, RUSAGE -- holding a live vreg, and the kernel wrote
+   a struct rusage over whatever that pointed at.  With the cache, register
+   allocation in FORK-FILE put *WSTATUS-ADDR*'s own cell there: its key was
+   overwritten (so CAR validation sent the read to the slow path) and its value
+   read back 0 from the table as well.  The trap now passes zero for arguments
+   4-6.  The scalar benchmark measured -18.8% instructions on a Pi 5 with it on.
 
-   With it ON the ANSI GATE-RUNNER image -- which bakes the test corpus,
-   forks per file and churns the globals table far harder than any shipping
-   image -- loses 215 tests and gains 6 over six special-variable-heavy
-   ranges (5975 passes on main, which re-runs bit-identically, so this is
-   signal and not noise).  The emitted code is NOT the problem and that was
-   measured, not assumed: with the identical inline sequence emitted at every
-   site and the MEMOISATION alone disabled -- %GV-REF-FILL still probing but
-   no longer storing the cell -- the same six ranges come back 0 regressions
-   and 0 gains against main.  So a memoised pair goes stale in that image, by
-   a route this work did not find; validating the pair's CAR against the key
-   (which the emitted code does, and which turned an outright SIGSEGV in the
-   harness's fork/wait into correct behaviour) catches some of it and not all.
-
-   Turn it on with MODUS_GVCACHE=1 at BUILD time.  Do not turn it on by
-   default until the gate-runner image is 0/0.")
+   The inline read tests the threads arming word first (as the baked-cell read
+   does): once threads are armed every read goes to %GV-REF-FILL, which lets
+   this thread's own dynamic binding win and otherwise answers from the cache.")
 (defvar *gv-cache-only* nil
   "Triage: when set, a list of NAME STRINGS that alone get a cached read.")
 (defvar *gv-cache-lo* nil)
@@ -11870,12 +11860,9 @@
    the image against +5.5% for this.  Hand-emitting keeps a variable
    reference what it has always been: a few instructions that touch one temp
    and the destination, and nothing else."
-  ;; NOT GUARDED FOR THREADS, and it must be before it is ever switched on:
-  ;; this emits an inline load of the cached pair with no arming-word test,
-  ;; so on a worker it would read THROUGH that thread's own dynamic binding
-  ;; exactly as the baked-cell read did before %COMPILE-GLOBAL-READ-BAKED
-  ;; grew its guard.  Harmless today because *GV-CACHE-ENABLED* is NIL, and
-  ;; one more thing to settle before it stops being.
+  ;; GUARDED FOR THREADS: the emitted read tests the arming word first and,
+  ;; once threads are armed, takes the miss arm, where %GV-REF-FILL lets this
+  ;; thread's own dynamic binding win (see the THREADS FIRST note below).
   (when (eq *gv-cache-mode* :call)
     (return-from %compile-global-read-cached
       (compile-form (list '%gv-ref-fill key slot) env dest)))
@@ -11899,6 +11886,18 @@
           (setq r (+ r 1)))))
     (let ((cell (alloc-temp-reg))
           (want (alloc-temp-reg)))
+      ;; THREADS FIRST.  A worker's dynamic binding lives in that thread's own
+      ;; storage, not in the pair, so once the image has armed threads (the
+      ;; word %RT-ENTER, %DYNBIND and the baked-cell read test) the read goes
+      ;; to the miss arm, where %GV-REF-FILL hands it to %GV-REF.  One 32-bit
+      ;; load and a branch, as %COMPILE-GLOBAL-READ-BAKED pays.
+      (emit-li-tagged dest (conv-real #x10000DB8))
+      (emit-ir :shr dest dest +fixnum-shift+)
+      (emit-ir :load cell dest (%tls-width (car (memory-width-code :u32))
+                                           #x10000DB8))
+      (emit-ir :li dest 0)
+      (emit-ir :cmp cell dest)
+      (emit-ir :bne miss)
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
       (emit-li-tagged cell (conv-real +gv-cache-root+))
       (emit-ir :shr cell cell +fixnum-shift+)

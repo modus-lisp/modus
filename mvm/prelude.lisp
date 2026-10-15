@@ -1946,6 +1946,12 @@
    String hash is CASE-SENSITIVE.  MASK = bucket-count minus one (the
    bucket vector is a power of two in length and GROWS with the table)."
   (cond
+    ;; FIXNUM FIRST: every special-variable read and write probes the globals
+    ;; table with one (%GV-CELL), and it used to pass two string tests to get
+    ;; here.  The mix is the one documented at the fixnum clause below.
+    ((fixnump key)
+     (let ((k (if (< key 0) (- key) key)))
+       (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
     ;; A string that is not a RAW string -- an adjustable / fill-pointer /
     ;; displaced one, whose object is an array header -- is hashed by its
     ;; contents through a simple copy.  The branch below reads RAW slots
@@ -2002,9 +2008,7 @@
     ;; branch-free and allocation-free (all intermediates stay fixnums, so no
     ;; bignum path and nothing to collect).  Must agree between %ht-bucket-find
     ;; and %ht-bucket-put — both call THIS function, so they cannot diverge.
-    ((fixnump key)
-     (let ((k (if (< key 0) (- key) key)))
-       (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
+    ;; (That clause is now the FIRST one, above.)
     ((characterp key) (logand (char-code key) mask))
     ((null key) 17)
     ((eq key t) 19)
@@ -2927,8 +2931,18 @@
    costs one load there, and it is what makes the CALL-only emission
    (*GV-CACHE-MODE* :call) a real fallback rather than a slowdown."
   (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
-    (if (fixnump %gv-cv)
-        (progn (%gv-cache-init-once) (%gv-ref %gv-key))
+    ;; THREADS ARMED (the inline read sends every read here then): this
+    ;; thread's own dynamic binding, which the memoised pair cannot see, wins;
+    ;; with none -- always so on main, whose window base is zero -- the cache
+    ;; below answers as usual.
+    (let ((%gv-a (if (eql (mem-ref #x10000DB8 :u32) 0) 0 (%dynb-value-addr %gv-key))))
+     (if (not (eql %gv-a 0))
+      (mem-ref %gv-a :u64)
+     (if (fixnump %gv-cv)
+        ;; Never built on a WORKER: its allocations die with it.  Boot builds
+        ;; the vector at the first special read, long before threads arm.
+        (progn (when (eql (mem-ref #x10000DB8 :u32) 0) (%gv-cache-init-once))
+               (%gv-ref %gv-key))
         (let ((%gv-hit (%word-aref %gv-cv %gv-slot)))
           (if (if (consp %gv-hit) (eq (car %gv-hit) %gv-key) nil)
               (cdr %gv-hit)
@@ -2941,7 +2955,7 @@
                     (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
                       %gv-st
                       (cdr %gv-cl))
-                    nil)))))))
+                    nil)))))))))
 
 (defun %gv-set-def (%gv-key %gv-val)
   "The DEFVAR/DEFPARAMETER store: %GV-SET under a name the bytecode

@@ -2094,14 +2094,26 @@
     (t 41)))
 
 (defun %ht-equalp-real-hash (x)
-  "= reals hash alike: by FLOOR, one constant past 2^60 (fixnum, bignum and
-   float alike, so a float = to a huge integer still collides with it, and
-   infinities never reach FLOOR), another for NaN, which is = to nothing."
+  "= reals hash alike.  A finite real hashes by F = FLOOR(x * 2^20), folded as
+   |F| xor |F|>>20: exact scaling for floats and ratios, so 1/2, 0.5 and
+   0.5d0 collide, while fractional floats still spread (a plain FLOOR put
+   every key in [0,1) in one bucket -- cl-bench MIXBAG's vectors differ only
+   in such a float).  Integers take the same formula without the scaling
+   (%HT-EQP-INT-HASH); floats past 2^52 are integral and go there too.
+   Infinities and NaN (= to nothing) hash to a constant."
   (cond
-    ((and (floatp x) (/= x x)) 47)
-    ((or (> x 1152921504606846976) (< x -1152921504606846976)) 43)
-    ((fixnump x) (logand (if (< x 0) (- x) x) #x3FFFFF))
-    (t (let ((f (floor x))) (logand (if (< f 0) (- f) f) #x3FFFFF)))))
+    ((fixnump x) (%ht-eqp-int-hash x))
+    ((integerp x) (%ht-eqp-int-hash x))
+    ((and (floatp x) (or (/= x x) (and (/= x 0) (= x (* x 2))))) 47)
+    ((and (floatp x) (>= (abs x) 4503599627370496.0)) (%ht-eqp-int-hash (floor x)))
+    (t (let* ((f (floor (* x 1048576))) (a (if (< f 0) (- f) f)))
+         (logand (logxor a (ash a -20)) #x3FFFFF)))))
+
+(defun %ht-eqp-int-hash (x)
+  "%HT-EQUALP-REAL-HASH's fold for an integer X, i.e. of F = X * 2^20, with no
+   bignum: (|X| mod 4) << 20 xor the low 22 bits of |X|."
+  (let ((a (if (< x 0) (- x) x)))
+    (logxor (ash (logand a 3) 20) (logand a #x3FFFFF))))
 
 (defun %ht-equalp-vec-hash (v depth)
   (let* ((n (length v)) (h (%ht-mix 11 (logand n #xFFFF))) (i 0))

@@ -5,6 +5,7 @@ img = sys.argv[1]; blob = None
 if sys.argv[2].startswith("--blob="): blob = sys.argv[2][7:]; sys.argv.pop(2)
 sock = "/tmp/claude-1001/qtest-%d.sock" % os.getpid()
 forms = sys.argv[2:]
+RAW = open(os.environ["QTEST_RAW"], "ab") if os.environ.get("QTEST_RAW") else None   # whole serial transcript
 q = subprocess.Popen(["qemu-system-aarch64", "-M", "raspi3b", "-kernel", img, "-serial", "null",
                       "-serial", "unix:%s,server" % sock, "-display", "none", "-no-reboot"] + (["-device", "loader,file=%s,addr=0x1A000000" % blob] if blob else []),
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -17,7 +18,9 @@ def until(pat, to):
     while time.time() < end:
         try:
             d = s.recv(65536)
-            if d: buf += d
+            if d:
+                buf += d
+                if RAW: RAW.write(d); RAW.flush()
         except socket.timeout: pass
         if re.search(pat, buf): return True
     return False

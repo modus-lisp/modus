@@ -220,6 +220,8 @@
     (%jit-call (+ s #x1100))
     (setf (mem-ref #x10213000 :u64) s)
     (%gc-write64 #x10213018 (+ s #x1400))
+    ;; The shared-store guard's trap resumes here (boot/boot-rpi-cl.lisp's fault vector).
+    (%gc-write64 #x10213028 (%bt-entry '%bt-guard-trap))
     s))
 
 (defun %bt-entry (sym) (- (%val->word (symbol-function sym)) 3))
@@ -893,3 +895,14 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
       (mfence)
       (xchg-mem lk 0)
       r)))
+
+(defun %bt-guard-trap ()
+  "Where the fault vector resumes a thread whose store the shared-store guard refused
+   (translate-aarch64 SHARED-STORE GUARD; boot/boot-rpi-cl.lisp): clear the marker and
+   signal, on that thread, the error hosted signals for the same refusal.  Never returns."
+  (let* ((self (%tls-self-base))
+         (m (+ self #x10005058))
+         (site (%gc-read64 (+ m 8))))
+    (%gc-write64 m 0)
+    (error "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused (at #x~x)."
+           site)))

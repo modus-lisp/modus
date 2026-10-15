@@ -30,3 +30,9 @@
 (defun t-hog () (let ((n 0)) (loop (setq n (+ n 1)) (cons n nil) (unless (zerop (stop-word)) (return n)))))
 (defun t-work () (let ((t0 (%irt-ns))) (list :sum (t-sum) :ms (floor (- (%irt-ns) t0) 1000000))))
 (defun preempt-run (no-preempt) (setf (mem-ref #x10380900 :u32) 0) (setf (mem-ref (+ (%bt-table) #x20) :u32) (if no-preempt 1 0)) (let* ((hogs (spawn-n 3 (function t-hog))) (work (spawn-n 3 (function t-work))) (t0 (%irt-ns)) (done 0)) (loop (setq done (count-if (lambda (i) (zerop (%native-thread-alive-p i))) work)) (when (or (= done 3) (> (- (%irt-ns) t0) 20000000000)) (return nil)) (%sleep-ms 50)) (let ((wait-ms (floor (- (%irt-ns) t0) 1000000))) (setf (mem-ref #x10380900 :u32) 1) (list :workers-done done :after-ms wait-ms :work (if (= done 3) (mapcar (function bt-join) work) :stuck) :hogs (mapcar (function bt-join) hogs)))))
+
+(defvar *shared-box* nil)
+(defun s-guard-setup () (setq *shared-box* (list :empty)) :ok)
+(defun s-guard () (let ((mine (list 1 2 3))) (handler-case (progn (setf (car *shared-box*) mine) :stored) (error (e) (list :refused (subseq (princ-to-string e) 0 40))))))
+(defun s-guard2 () (let ((mine (list 1 2 3))) (handler-case (progn (setf (car *shared-box*) mine) :stored) (error () :refused))))
+(defun s-print-cond () (princ-to-string (make-condition 'simple-error :format-control "x ~a" :format-arguments (list 1))))

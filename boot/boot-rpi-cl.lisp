@@ -255,6 +255,15 @@
   "Body of the sync-exception reporter.  Lives in the entry-8..15 slots (lower-EL
    vectors, which this image can never take: it runs at EL2 with nothing below
    it).  Same trick the QEMU-virt image uses for its entry-7/8 continuations."
+  ;; SMP (threaded builds): an undefined instruction whose thread's shared-store-guard
+  ;; marker is set is the GUARD refusing a store, not a crash -- resume at the Lisp
+  ;; function net/bare-threads.lisp installs at 0x10213028, which signals the guard's
+  ;; error on that thread.  test/rpi-smp/guardvec.s; falls through to the report.
+  (when *rpi-cl-threads*
+    (dolist (w '(#xd53c520a #xd35afd4a #xb50001ca #xd2a2042b #xf286050b #xf940016b
+                 #xb400014b #xd53bd04a #xd2a2000c #xf28a0b0c #x8b0a018c #xf940018c
+                 #xf100059f #x54000061 #xd51c402b #xd69f03e0))
+      (emit-aarch64-u32 buf w)))
   ;; X17 = console data register.
   (emit-aarch64-load-imm64 buf 17 (if miniuart #x3F215040 +rpi-cl-pl011-base+))
   (emit-aarch64-u32 buf #xD28001EC)         ; MOVZ X12,#15   (nibble mask)

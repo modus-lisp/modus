@@ -134,6 +134,15 @@ workers placed on the same cores:
     preemption on        workers done 3/3 after 3.4 s, all sums right
     slices off (control) workers done 0/3 after 20 s -- stuck behind the hogs
 
-NOT YET: a thread SETQ-ing a global it has not bound, or a variable main closed over (with the
-guard armed that is now a !!FAULT, not corruption -- making it a Lisp error on bare metal needs the
-vector to resume into the guard's error path); and the board run (core 1 did not start on one board boot).
+THE GUARD'S REFUSAL IS A LISP ERROR (phase 9): the threaded fault vector (boot/boot-rpi-cl.lisp,
+test/rpi-smp/guardvec.s) checks an undefined-instruction fault for the guard's marker (window
++0x5058) and ERETs into %BT-GUARD-TRAP, which signals the error hosted signals for the same store,
+on the thread.  (s-guard2): a thread SETFs the CAR of a main-made cons to its own list ->
+REFUSED by HANDLER-CASE, every core still running, a 6-thread run correct afterwards.
+
+NOT YET: STACK GUARDS -- a slot's 512 KB stack sits directly above its neighbours (core 3's
+scheduler stack is right below slot 4's), so a runaway recursion on a thread tramples the
+schedulers (found printing a SIMPLE-ERROR, which on MAIN too dies "printer: structure nested
+deeper than 1000 levels" -- a printer bug of its own); a thread SETQ-ing a global it has not
+bound, or a variable main closed over (now a refused store, not corruption); and the board run
+(core 1 did not start on one board boot).

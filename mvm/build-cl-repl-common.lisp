@@ -868,6 +868,10 @@
   ;; ... and the main thread's time-slice deadline (net/bare-threads.lisp, PREEMPTION):
   ;; a threaded image's loops read it, and DRAM is not zero at reset.
   (%gc-write64 #x10083F00 0)
+  ;; ... and the shared-store guard's resume address and main's marker, which the
+  ;; threaded fault vector reads (net/bare-threads.lisp %BT-GUARD-TRAP).
+  (%gc-write64 #x10213028 0)
+  (%gc-write64 #x10005058 0)
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.
   (write-string-serial \"MODUS-CL\")

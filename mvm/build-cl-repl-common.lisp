@@ -2135,10 +2135,18 @@
   (setf (mem-ref (%jit-exec-bump) :u64) (%jit-exec-lo))
   t)
 "
-                (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT_BITMAP")))
-                  (if (and v (string= v "0"))
-                      ";; bitmap-enable OFF (MODUS_RPI_JIT_BITMAP=0 triage build)"
-                      "(setq *aarch64-gc-bitmap-enabled* t)"))
+                (concatenate 'string
+                  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT_BITMAP")))
+                    (if (and v (string= v "0"))
+                        ";; bitmap-enable OFF (MODUS_RPI_JIT_BITMAP=0 triage build)"
+                        "(setq *aarch64-gc-bitmap-enabled* t)"))
+                  ;; SMP phase 2: the in-image JIT must emit the same per-thread-window
+                  ;; accesses as the image (defvar inits never run in-image).
+                  (let ((th (find-symbol "*RPI-CL-THREADS*" :modus.mvm)))
+                    (if (and th (boundp th) (symbol-value th))
+                        "
+  (setq *a64-tls-window* t) (setq *tls-window* t) (setq *tls-window-a64* t) (setq *a64-tls-tsd-offset* nil)"
+                        "")))
                 (cond
                   ;; :VIRT — the fixpoint UART VA, NOT a Pi peripheral address.
                   ;; Same PL011 register layout as the QEMU raspi3b arm below;
@@ -2734,6 +2742,15 @@
                  (mvm/gc.lisp %GC-COLLECT) runs via the aarch64 shim~%"))))
 
 (setf *aarch64-sched-lock-addr* nil)
+
+;; SMP PHASE 2 (opt-in): the per-thread window on the bare Pi image, as hosted aarch64 has it
+;; (hosted-layout-env.lisp APPLY-LAYOUT-HOST), with the window delta in TPIDR_EL0.  The
+;; :A64-THREADS layout key is what runtime source tests with %LAYOUT-IF; every other layout
+;; lookup keeps its default, as before.  The in-image JIT gets the same flags below.
+(when (and cl-user::*cl-repl-rpi-p* (boundp (quote *rpi-cl-threads*)) *rpi-cl-threads*)
+  (setf *a64-tls-window* t *tls-window* t *tls-window-a64* t *a64-tls-tsd-offset* nil)
+  (setf *hosted-layout* (list* :a64-threads 1 *hosted-layout*))
+  (format t "~%;; RPi CL: per-thread window ON (TPIDR_EL0 delta) -- SMP phase 2~%"))
 
 ;; SP alignment stays 8-byte (bare-metal EL1 with SCTLR.SA off), unlike Linux
 ;; EL0 which demands 16.  *aarch64-fn-align-offset* stays 0: the unified

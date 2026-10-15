@@ -12220,8 +12220,12 @@
            (unless (= dest +vreg-v1+)
              (emit-ir :mov +vreg-v1+ dest))
            (emit-li-tagged +vreg-v0+ hash)
-           (when *mvm-emit-halves* (emit-ir :set-nargs 2))
-           (emit-ir :call "%GV-SET" 2)
+           ;; The slow arm passes the CELL too (%GV-SET-CELL): the call is the
+           ;; bridge that wraps an in-module closure for native code, and an
+           ;; unarmed image then stores into the cell without a table probe.
+           (emit-ir :li-const +vreg-v2+ (%e2-const-register cell))
+           (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+           (emit-ir :call "%GV-SET-CELL" 3)
            (unless (= dest +vreg-vr+)
              (emit-ir :mov dest +vreg-vr+))
            (when (> save-count 1)

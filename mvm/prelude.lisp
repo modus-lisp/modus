@@ -3120,6 +3120,14 @@
       (progn (set-cdr %gv-cell %gv-saved) %gv-saved)
       (%dynunbind %gv-key %gv-saved)))
 
+(defun %gv-set-cell (%gv-key %gv-val %gv-cell)
+  "A runtime SETQ of a special whose cell was baked at compile time, slow arm
+   (a value that may be an in-module closure): on an unarmed image store into
+   the cell, else %GV-SET (this thread's binding first)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (progn (set-cdr %gv-cell %gv-val) %gv-val)
+      (%gv-set %gv-key %gv-val)))
+
 (defun %gv-set-def (%gv-key %gv-val)
   "The DEFVAR/DEFPARAMETER store: %GV-SET under a name the bytecode
    interpreter recognises as a storage sink (see %MVM-STORE-FN-NAME-P)."

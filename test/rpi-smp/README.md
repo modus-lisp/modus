@@ -24,5 +24,19 @@ a stack (0x05400000 + 2 MB per core), a per-thread window block at 0x10400000 + 
 TPIDR_EL0), a per-CPU block at 0x10080000 + n*0x4000 (CPU id at +16, pointer in window slot
 0x1000FFE8), SMPEN, FP, x18/x26.  The stubs are stubs.s (assembled with GNU as on the Pi 5).
 
-NOT YET: allocation on a secondary core (it needs a GC region of its own and the per-CPU
-active-region cell), stop-the-world for region 0, and a thread API.  core-spin allocates nothing.
+ALLOCATION (2b): SMP-CARVE shrinks region 0 (after a collection, refusing if live data reaches the
+carve), gives core N a region at the top of both semispaces with its own stack as the root window,
+publishes it in the per-CPU active-region cell (0x10000F08 + 8N), stamps core 0's CPU id (nothing
+initialised 0x10080010 before), and turns per-CPU mode on (0x10000FF8).  Measured under QEMU, a
+16 MB region on core 2:
+
+    (let ((r (smp-carve 2 #x1000000))) (smp-start 2 (quote core-alloc) (getf r :x24) (getf r :x25)))
+    (list (smp-counters) (smp-region-gcs 2))   =>  ((0 0 115847 0) 221)
+
+i.e. 115,847 iterations of "cons a 1000-element list, check its sum is 499500" and 221 collections
+of core 2's OWN region, while core 0's REPL conses 200,000 cells correctly beside it.  Regions must
+be well over 8 MB: every limit sits *AARCH64-GC-LIMIT-GUARD* (8 MB) below the region's end.
+
+NOT YET: stop-the-world for region 0 (core 0 must not collect region 0 while a worker holds
+references into it -- core-alloc holds none), a thread API (make-thread on a core, with join), and
+the board run (core 1 did not start on one board boot; it does under QEMU).

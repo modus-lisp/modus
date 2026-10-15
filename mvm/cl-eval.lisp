@@ -3854,6 +3854,11 @@
                          (setq k (- k 8)))
                   (progn (setq result (ash result -1))
                          (setq k (- k 1)))))))
+         ;; a count past the length -- possibly a BIGNUM count (ANSI ASH.8:
+         ;; (ash j j) for j = -(2^i)) -- leaves only the sign; the kernel's
+         ;; shift arithmetic is fixnum-only
+         ((or (bignump k) (>= k (+ (%bignum-integer-length-pos (%int-abs n)) 1)))
+          (if (%int-neg-p n) -1 0))
          (t (%int-shr-floor n k)))))))
 (defun %fixnum-to-bignum-parts (n)
   "Convert fixnum N to (lo . hi) bignum parts."

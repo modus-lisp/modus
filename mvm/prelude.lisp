@@ -2957,6 +2957,47 @@
                       (cdr %gv-cl))
                     nil)))))))))
 
+(defun %gv-memo-cell (%gv-key %gv-slot)
+  "The globals cell for KEY through cache slot SLOT (filling the slot on a
+   miss), or NIL when there is no cell or no cache vector yet.  For UNARMED
+   callers only: a memoised pair cannot see a thread's own binding."
+  (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
+    (if (fixnump %gv-cv)
+        nil
+        (let ((%gv-hit (%word-aref %gv-cv %gv-slot)))
+          (if (if (consp %gv-hit) (eq (car %gv-hit) %gv-key) nil)
+              %gv-hit
+              (let ((%gv-cl (%gv-cell %gv-key)))
+                (if (consp %gv-cl)
+                    (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
+                      %gv-st
+                      %gv-cl)
+                    nil)))))))
+
+(defun %gv-set-c (%gv-key %gv-val %gv-slot)
+  "%GV-SET through the cell cache: the AOT SETQ of a special that has a slot.
+   Unarmed and the cell exists: store in place, no table probe.  Otherwise
+   exactly %GV-SET (which consults this thread's bindings, and creates the
+   cell -- flushing the cache -- when there is none)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
+        (if %gv-c
+            (progn (set-cdr %gv-c %gv-val) %gv-val)
+            (%gv-set %gv-key %gv-val)))
+      (%gv-set %gv-key %gv-val)))
+
+(defun %dynbind-c (%gv-key %gv-val %gv-slot)
+  "%DYNBIND through the cell cache: its unarmed arm is %GV-SET (see there)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (%gv-set-c %gv-key %gv-val %gv-slot)
+      (%dynbind %gv-key %gv-val)))
+
+(defun %dynunbind-c (%gv-key %gv-saved %gv-slot)
+  "%DYNUNBIND through the cell cache: its unarmed arm is %GV-SET too."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (%gv-set-c %gv-key %gv-saved %gv-slot)
+      (%dynunbind %gv-key %gv-saved)))
+
 (defun %gv-set-def (%gv-key %gv-val)
   "The DEFVAR/DEFPARAMETER store: %GV-SET under a name the bytecode
    interpreter recognises as a storage sink (see %MVM-STORE-FN-NAME-P)."

@@ -10735,7 +10735,11 @@
                        ;; package's special saved NIL (nothing lives at the
                        ;; bare key) and then restored that NIL over the real
                        ;; value on exit — battery row special.after-rebind.
-                       (list sv `(%gv-ref ,(%global-var-bind-key spec))))
+                       (let* ((k (%global-var-bind-key spec))
+                              (slot (%gv-aot-slot k spec)))
+                         (list sv (if slot
+                                      `(%gv-ref-fill ,k ,slot)
+                                      `(%gv-ref ,k)))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
            ;; creating a lexical binding under the special's own name.
@@ -10754,13 +10758,21 @@
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (push `(%dynbind ,(%global-var-bind-key spec) ,tmp)
-                               acc)))
+                         (let* ((k (%global-var-bind-key spec))
+                                (slot (%gv-aot-slot k spec)))
+                           (push (if slot
+                                     `(%dynbind-c ,k ,tmp ,slot)
+                                     `(%dynbind ,k ,tmp))
+                                 acc))))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
              (mapcar (lambda (sv spec)
-                       `(%dynunbind ,(%global-var-bind-key spec) ,sv))
+                       (let* ((k (%global-var-bind-key spec))
+                              (slot (%gv-aot-slot k spec)))
+                         (if slot
+                             `(%dynunbind-c ,k ,sv ,slot)
+                             `(%dynunbind ,k ,sv))))
                      save-vars specials))
            (stripped-body (strip-declares body)))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -11958,21 +11970,28 @@
       (free-temp-reg)
       (free-temp-reg))))
 
+(defun %gv-aot-slot (key name)
+  "The cell-cache slot for global KEY in an AHEAD-OF-TIME compile, or NIL
+   (cache off, a runtime compile, or excluded by the MODUS_GVCACHE_* triage
+   knobs).  Shared by the cached read, SETQ and the LET special triple."
+  (unless *gv-cache-names* (setq *gv-cache-names* (make-hash-table :test 'eql)))
+  (unless (gethash key *gv-cache-names*)
+    (setf (gethash key *gv-cache-names*) name))
+  (let ((slot (and *gv-cache-enabled*
+                   (not *mvm-eval-runtime-p*)
+                   (%gv-cache-slot key))))
+    (when (and slot *gv-cache-only*
+               (not (member (string name) *gv-cache-only* :test #'string=)))
+      (setq slot nil))
+    (when (and slot *gv-cache-lo* (< slot *gv-cache-lo*)) (setq slot nil))
+    (when (and slot *gv-cache-hi* (>= slot *gv-cache-hi*)) (setq slot nil))
+    slot))
+
 (defun %compile-global-read-aot (name env dest)
   "The build-time global READ.  Cached cell load when a slot is available,
    otherwise the historic %GV-REF call, byte-for-byte."
   (let ((key (%global-name-key name)))
-    (unless *gv-cache-names* (setq *gv-cache-names* (make-hash-table :test 'eql)))
-    (unless (gethash key *gv-cache-names*)
-      (setf (gethash key *gv-cache-names*) name))
-    (let ((slot (and *gv-cache-enabled*
-                     (not *mvm-eval-runtime-p*)
-                     (%gv-cache-slot key))))
-      (when (and slot *gv-cache-only*
-                 (not (member (string name) *gv-cache-only* :test #'string=)))
-        (setq slot nil))
-      (when (and slot *gv-cache-lo* (< slot *gv-cache-lo*)) (setq slot nil))
-      (when (and slot *gv-cache-hi* (>= slot *gv-cache-hi*)) (setq slot nil))
+    (let ((slot (%gv-aot-slot key name)))
       (if slot
           (%compile-global-read-cached key slot env dest)
           (progn
@@ -12164,8 +12183,17 @@
          (unless (= dest +vreg-v1+)
            (emit-ir :mov +vreg-v1+ dest))
          (emit-li-tagged +vreg-v0+ hash)  ; fixnum-safe hash (mvm-eval :li-halves)
-         (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
-         (emit-ir :call "%GV-SET" 2)
+         ;; An AOT SETQ of a global with a cell-cache slot stores through the
+         ;; memoised cell (%GV-SET-C) instead of probing the table.
+         (let ((slot (and (not cell) (%gv-aot-slot hash var))))
+           (if slot
+               (progn
+                 (emit-li-tagged +vreg-v2+ slot)
+                 (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+                 (emit-ir :call "%GV-SET-C" 3))
+               (progn
+                 (when *mvm-emit-halves* (emit-ir :set-nargs 2))  ; mvm-eval bridge nargs
+                 (emit-ir :call "%GV-SET" 2))))
          (unless (= dest +vreg-vr+)
            (emit-ir :mov dest +vreg-vr+))
          (when (> save-count 1)

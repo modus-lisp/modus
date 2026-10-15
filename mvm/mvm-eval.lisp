@@ -2045,7 +2045,16 @@
    for every runtime DEFUN installed as an interpreter trampoline.  Boots NIL
    (defvars don't init); %jit-register-module creates it lazily.")
 
+(defvar *jit-script-def-names* nil
+  "Names registered by toplevel forms of the OUTERMOST load (load depth 1),
+   not yet handed to %JIT-BUILD-SCRIPT-DEFS.  See cl-eval.lisp, A SCRIPT'S
+   OWN DEFUNS START NATIVE.")
+
 (defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
+  (when (and (boundp (quote *%load-depth*)) (eql *%load-depth* 1))
+    (setq *jit-script-def-names* (append names (if (consp *jit-script-def-names*)
+                                                   *jit-script-def-names*
+                                                   nil))))
   (when (and (boundp (quote *jit-module-registry*)) (null *jit-module-registry*))
     (setq *jit-module-registry* (make-hash-table :test (function equal))))
   (when (boundp (quote *jit-module-registry*))
@@ -2238,6 +2247,25 @@
       (if (%jit-build-module m (or *jit-native-defun-count* 0))
           (setq *jit-hot-promoted* (if *jit-hot-promoted* (+ 1 *jit-hot-promoted*) 1))
           (setq *jit-hot-failed* (if *jit-hot-failed* (+ 1 *jit-hot-failed*) 1))))))
+
+(defun %jit-build-script-defs ()
+  "Build the modules of the names in *JIT-SCRIPT-DEF-NAMES* (and their
+   interpreted callees first), as a hot promotion would, and clear the list.
+   NIL when this is not the moment (the JIT off or inhibited, a worker thread,
+   a build already running); the names then wait for the next chance."
+  (when (and (%jit-enabled-p) (%jit-active-p) (%mvm-on-main-thread-p)
+             (not *jit-hot-busy*) (consp *jit-script-def-names*))
+    (let ((names (reverse *jit-script-def-names*))
+          (before (or *jit-native-defun-count* 0))
+          (seen (cons nil 4096))
+          (skips (%jit-skip-list)))
+      (setq *jit-script-def-names* nil)
+      (setq *jit-hot-busy* t)
+      (unwind-protect
+           (dolist (nm names) (%jit-hot-build nm skips seen))
+        (setq *jit-hot-busy* nil))
+      (when (> (or *jit-native-defun-count* 0) before) (%jit-retry-drain))
+      t)))
 
 (defun %jit-hot-promote (name self)
   "NAME's trampoline SELF reached its threshold: build its module.  NIL once

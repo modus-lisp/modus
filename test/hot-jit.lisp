@@ -9,6 +9,10 @@
 ;;;; 64 calls, or once its calls have spent 10 ms interpreted.  The checks run
 ;;;; across that point, so the same call is made before, at and after it.
 
+;; This file tests the HOT promotion itself, so its DEFUNs must start
+;; interpreted: no batch JIT of the script's own DEFUNs (cl-eval.lisp).
+(setq *jit-script-defs* nil)
+
 (defvar *checks* 0)
 (defvar *fails* 0)
 (defun chk (name got want)

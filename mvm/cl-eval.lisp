@@ -4890,6 +4890,42 @@
     ;; evaluated form works.
     (handler-case (eval (list 'jit-eager)) (serious-condition (c) nil))))
 
+;;; A SCRIPT'S OWN DEFUNS START NATIVE.  The hot-function JIT promotes a DEFUN
+;;; after its first expensive call -- but that call runs to the end interpreted
+;;; (there is no on-stack replacement), and for a script that call is often the
+;;; whole program: a 4096-step loop took 64 ms its first time and 43 us after.
+;;; So when toplevel forms of the OUTERMOST load register new modules, the JIT
+;;; runs before the next toplevel form that is not itself a definition: a run of
+;;; DEFUNs is translated as one batch and the call after it -- (main) -- finds
+;;; them native.  Between two toplevel forms nothing loaded is executing (see
+;;; DEFERRED JIT above).  MODUS_NO_LOAD_JIT=1 turns it off with the loader's.
+(defvar *jit-script-defs* t
+  "NIL turns off the batch JIT of a script's own DEFUNs (%MAYBE-JIT-SCRIPT-DEFS);
+   so does *JIT-HOT-CALLS* = 0.  Boots NIL in an image that skips DEFVAR
+   inits, where it is then simply off.")
+(defun %definition-form-p (form)
+  (and (consp form) (symbolp (car form))
+       (member (symbol-name (car form))
+               '("DEFUN" "DEFMACRO" "DEFVAR" "DEFPARAMETER" "DEFCONSTANT" "DEFSTRUCT"
+                 "DEFCLASS" "DEFMETHOD" "DEFGENERIC" "DEFTYPE" "DEFPACKAGE" "IN-PACKAGE"
+                 "DECLAIM" "PROCLAIM" "EVAL-WHEN" "DEFINE-CONDITION" "DEFSETF"
+                 "DEFINE-MODIFY-MACRO" "DEFINE-COMPILER-MACRO" "DEFINE-SETF-EXPANDER"
+                 "DEFINE-SYMBOL-MACRO")
+               :test #'string=)))
+
+(defun %maybe-jit-script-defs (form)
+  (when (and (= (%load-depth) 1)
+             (handler-case (eq *jit-script-defs* t) (t (c) nil))
+             (not (handler-case (eql *jit-hot-calls* 0) (t (c) nil)))
+             (not (%definition-form-p form))
+             (handler-case (consp *jit-script-def-names*) (t (c) nil))
+             (let ((off (handler-case (and (fboundp '%cli-getenv)
+                                           (funcall '%cli-getenv "MODUS_NO_LOAD_JIT"))
+                          (t (c) nil))))
+               (not (and off (> (length off) 0) (not (string= off "0"))))))
+    ;; Through EVAL, as %MAYBE-RUN-PENDING-JIT runs JIT-EAGER.
+    (handler-case (eval (list '%jit-build-script-defs)) (serious-condition (c) nil))))
+
 (defun %load-from-stream (stream verbose print)
   "Read+eval all forms from STREAM.  Returns T."
   (setq *%load-depth* (+ (%load-depth) 1))
@@ -4928,6 +4964,7 @@
         (when (eq form eof-marker)
           (%fasl-close fx (not read-failed))
           (return t))
+        (%maybe-jit-script-defs form)
         (let ((val (handler-case (handler-bind ((warning #'%load-report-warning))
                                    (if fx (%fasl-eval fx form) (eval form)))
                      (t (c)

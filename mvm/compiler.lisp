@@ -3639,30 +3639,15 @@
     (lambda (form)
       `(defstruct ,@(cdr form))))
 
-  ;; CASE → LET + COND + EQL
+  ;; CASE → LET + COND + EQL (or, with many fixnum keys, a binary search:
+  ;; %CASE-BISECT-EXPANSION)
   (mvm-define-macro "CASE"
     (lambda (form)
-      (let ((keyform (cadr form))
-            (clauses (cddr form))
-            (tmp (%mvm-gensym "CASE")))
-        `(let ((,tmp ,keyform))
-           (cond ,@(mapcar (lambda (clause)
-                             (let* ((keys (car clause))
-                                    (body (cdr clause))
-                                    ;; Per CLHS, a clause with no body
-                                    ;; whose key matches returns NIL,
-                                    ;; not the truth value of the test.
-                                    (effective-body (or body '(nil))))
-                               (cond
-                                 ((or (eq keys t)
-                                      (and (symbolp keys)
-                                           (= (normalize-name keys) 101669203)))  ; OTHERWISE
-                                  `(t ,@effective-body))
-                                 ((listp keys)
-                                  `((or ,@(mapcar (lambda (k) `(eql ,tmp ',k)) keys))
-                                    ,@effective-body))
-                                 (t `((eql ,tmp ',keys) ,@effective-body)))))
-                           clauses))))))
+      (let ((tmp (%mvm-gensym "CASE")))
+        (let ((bis (%case-bisect-expansion tmp (cddr form))))
+          (if bis
+              (list 'let (list (list tmp (cadr form))) bis)
+              (%case-linear-expansion tmp (cadr form) (cddr form)))))))
 
   ;; ECASE → LET + COND + EQL, signalling TYPE-ERROR on no-match.
   ;; Unlike CASE, T and OTHERWISE are NOT special in ECASE — they are
@@ -8294,6 +8279,8 @@
       ;; every AREF / ASET / LENGTH / STRINGP there paid a call for it.
       ((= op-name #.(compute-name-hash "%PRIM-SIMPLE-STRING-P"))
        (compile-object-subtype-p (cadr form) env dest +subtag-string+))
+      ((= op-name #.(compute-name-hash "%PRIM-U8-VECTOR-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-u8-vector+))
       ((= op-name #.(compute-name-hash "%PRIM-SIMPLE-VECTOR-P"))
        (compile-object-subtype-p (cadr form) env dest +subtag-array+))
       ((= op-name #.(compute-name-hash "%RAW-CONSP"))
@@ -16391,6 +16378,96 @@
           (when emitting (push item out))))
     (nreverse out)))
 
+;;; CASE OVER MANY FIXNUM KEYS -- a binary search instead of the EQL chain.
+;;; The linear COND tests every key before the match, so a dispatch on a
+;;; bytecode opcode (the interpreter's ~150-arm CASE, %MVM-INTERPRET-1) cost
+;;; ~75 compares per instruction on average.  With >= 16 distinct fixnum keys
+;;; the expansion is
+;;;   (block B (tagbody (if (fixnump TMP) <tree of (< TMP K) ending in (go Li)>
+;;;                         (go OTHER))
+;;;                     L1 (return-from B (progn body1)) ... OTHER (return-from B ...)))
+;;; Each clause body appears once (a lexical GO is a branch); B is a fresh
+;;; symbol, so a (RETURN) inside a body still reaches the enclosing NIL block.
+;;; The first clause holding a key wins, as in the COND.  NIL when ineligible:
+;;; fewer keys, or any key that is not a small integer.
+(defun %case-small-fixnum-key-p (x)
+  (and (integerp x) (< x 536870911) (> x -536870911)))
+
+(defun %case-insert-key (entry sorted)
+  (if (or (null sorted) (< (car entry) (car (car sorted))))
+      (cons entry sorted)
+      (cons (car sorted) (%case-insert-key entry (cdr sorted)))))
+
+(defun %case-bisect-tree (tmp keys n other-label)
+  "KEYS: a sorted list of (KEY . LABEL), N of them."
+  (if (<= n 3)
+      `(cond ,@(let ((arms nil))
+                 (dolist (e keys)
+                   (setq arms (cons `((eql ,tmp ,(car e)) (go ,(cdr e))) arms)))
+                 (nreverse arms))
+             (t (go ,other-label)))
+      (let* ((half (floor n 2))
+             (right (nthcdr half keys))
+             (left (let ((acc nil) (k keys) (i 0))
+                     (loop (when (>= i half) (return (nreverse acc)))
+                       (setq acc (cons (car k) acc))
+                       (setq k (cdr k))
+                       (setq i (+ i 1))))))
+        `(if (< ,tmp ,(car (car right)))
+             ,(%case-bisect-tree tmp left half other-label)
+             ,(%case-bisect-tree tmp right (- n half) other-label)))))
+
+(defun %case-bisect-expansion (tmp clauses)
+  (let ((sorted nil) (nkeys 0) (arms nil) (other nil)
+        (blk (%mvm-gensym "CASEB")) (other-label (%mvm-gensym "CASEO")))
+    (dolist (cl clauses)
+      (let ((k (car cl)) (body (or (cdr cl) '(nil))))
+        (when (or (eq k t) (and (symbolp k) k (= (normalize-name k) 101669203)))   ; OTHERWISE
+          (setq other body)
+          (return nil))
+        (let ((label (%mvm-gensym "CASEL")))
+          (dolist (x (if (listp k) k (list k)))
+            (unless (%case-small-fixnum-key-p x)
+              (return-from %case-bisect-expansion nil))
+            (unless (assoc x sorted)
+              (setq sorted (%case-insert-key (cons x label) sorted))
+              (setq nkeys (+ nkeys 1))))
+          (setq arms (cons (list label body) arms)))))
+    (when (< nkeys 16)
+      (return-from %case-bisect-expansion nil))
+    `(block ,blk
+       (tagbody
+          (if (fixnump ,tmp)
+              ,(%case-bisect-tree tmp sorted nkeys other-label)
+              (go ,other-label))
+          ,@(let ((out nil))
+              (dolist (a (reverse arms))
+                (setq out (cons (car a) out))
+                (setq out (cons `(return-from ,blk (progn ,@(cadr a))) out)))
+              (nreverse out))
+          ,other-label
+          (return-from ,blk (progn ,@(or other '(nil))))))))
+
+(defun %case-linear-expansion (tmp keyform clauses)
+  `(let ((,tmp ,keyform))
+     (cond ,@(mapcar (lambda (clause)
+                       (let* ((keys (car clause))
+                              (body (cdr clause))
+                              ;; Per CLHS, a clause with no body
+                              ;; whose key matches returns NIL,
+                              ;; not the truth value of the test.
+                              (effective-body (or body '(nil))))
+                         (cond
+                           ((or (eq keys t)
+                                (and (symbolp keys)
+                                     (= (normalize-name keys) 101669203)))  ; OTHERWISE
+                            `(t ,@effective-body))
+                           ((listp keys)
+                            `((or ,@(mapcar (lambda (k) `(eql ,tmp ',k)) keys))
+                              ,@effective-body))
+                           (t `((eql ,tmp ',keys) ,@effective-body)))))
+                     clauses))))
+
 (defun compile-tagbody-nlx (body tags env dest)
   "Cross-unit GO lowering (#278).  Compile TAGBODY as a dispatch loop
    around a runtime CATCH frame:
@@ -23195,6 +23272,9 @@
           ;; MDA header whose data is a string -- a fill-pointer string.)
           ((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx)))
           ((%prim-simple-vector-p ,g-arr) (%word-aref ,g-arr ,g-idx))
+          ;; Byte-packed (unsigned-byte 8) vector: the interpreter's bytecode
+          ;; (every FETCH-* reads it), octet buffers.
+          ((%prim-u8-vector-p ,g-arr) (%u8-ref ,g-arr ,g-idx))
           ;; MDA fast path — single-sub on an MDA is just an aref of
           ;; the underlying data (assuming no displacement; %aref-multi
           ;; handles the displaced case).

@@ -1881,6 +1881,7 @@
 ;;; and portable code dispatches on it -- jzon's object parser took a table for
 ;;; a list and every JSON object failed with a TYPE-ERROR.
 (defun %prim-simple-string-p (x) (%prim-simple-string-p x))   ; compiled inline (compiler.lisp)
+(defun %prim-u8-vector-p (x) (%prim-u8-vector-p x))   ; compiled inline (compiler.lisp)
 (defun %prim-simple-vector-p (x) (%prim-simple-vector-p x))   ; compiled inline (compiler.lisp)
 (defun %raw-consp (x) (consp x))   ; image code: CONSP is the raw tag test
 (defun %rt-consp (x) (and (consp x) (not (hash-table-p x))))

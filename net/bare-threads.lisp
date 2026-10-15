@@ -500,6 +500,16 @@
 
 (defun %bt-spawn-lock () (+ (%bt-table) #x10))
 
+(defun %bt-pin-next-addr () (+ (%bt-table) #x24))   ; u32: core for the next start, 0 = any
+
+(defun bt-pin-next (core)
+  "Place the next thread started (by BT-SPAWN or SB-THREAD:MAKE-THREAD) on CORE (1..3);
+   NIL = the least-loaded core.  For a thread that should have a core to itself: a
+   device owner that polls, a compositor, an audio feeder."
+  (%bt-init)                                  ; it zeroes the table this word is in
+  (setf (mem-ref (%bt-pin-next-addr) :u32) (if core core 0))
+  core)
+
 (defun %make-native-thread (fn &rest args)
   "Start FN (no arguments) as a thread on the least-loaded core.  Its record number
    (4..15), or -1 when every slot is in use, -2 when the cores did not start, -7 when
@@ -519,7 +529,10 @@
            (let ((i (%bt-free-slot)))
              (if (< i 0)
                  (progn (%mutex-unlock lk) -1)
-                 (let ((c (%bt-least-loaded-core)))
+                 (let ((c (let ((pin (mem-ref (%bt-pin-next-addr) :u32)))
+                            (if (and (> pin 0) (< pin (%bt-ncores)))
+                                (progn (setf (mem-ref (%bt-pin-next-addr) :u32) 0) pin)
+                                (%bt-least-loaded-core)))))
                    (setf (svref *bt-funs* i) fn)
                    (let ((rec (%bt-prepare-record i c (%bt-entry '%bt-slot-main))))
                      (setf (mem-ref (+ rec #x08) :u32) 1)
@@ -562,8 +575,10 @@
 
 ;;; ------------------------------------------------------------------ public
 
-(defun bt-spawn (fn)
-  "Start FN (a function of no arguments) as a thread; its handle."
+(defun bt-spawn (fn &optional core)
+  "Start FN (a function of no arguments) as a thread -- on CORE (1..3) when given,
+   else the least-loaded core; its handle."
+  (when core (bt-pin-next core))
   (let ((i (%make-native-thread fn)))
     (if (< i 0) (error "bt-spawn: no thread could be started (~D)" i) i)))
 
@@ -943,3 +958,126 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
   "Where the fault vector resumes a thread whose stack ran into its guard page, on its
    own abandoned deepest frames: signal the overflow on that thread.  Never returns."
   (error "modus: this thread's stack is exhausted (512 KB) -- recursion too deep?"))
+
+;;; ------------------------------------------------------------------ executors
+;;;
+;;; AN EXECUTOR is a thread that OWNS something -- a device, a loop -- on a core of its
+;;; own: it runs IDLE (a function of no arguments) over and over, and between rounds runs
+;;; whatever closure another thread hands it with BT-CALL, returning the value by copy.
+;;; The closure is the caller's object (in region 0 when the caller is main): the executor
+;;; may READ the caller's data and store NUMBERS into the caller's arrays (a byte is not a
+;;; pointer), so I/O routines written against main's buffers run there unchanged.  One
+;;; call at a time per executor (a lock); the caller waits SAFE (main) or blocked (a slot).
+;;;
+;;; Record words (per executor, a 64-byte cell from the sync arena): +0x00 call lock,
+;;; +0x08 request seq, +0x10 done seq, +0x18 result kind (1 immediate, 2 bytes, 3 error,
+;;; 4 not encodable), +0x20 result word / byte count, +0x28 thread record, +0x30 running.
+;;; The closure in flight lives in *BT-EXEC-FNS* (a global vector, so a region-0
+;;; collection keeps it current); results longer than a word go through a 64 KB buffer
+;;; per executor at 0x10790000 + 64 KB * (record - 4).
+
+(defvar *bt-exec-fns* nil)
+(defvar *bt-exec-idle* nil)
+
+(defun %bt-exec-buf (rec-index) (+ #x10790000 (* (- rec-index 4) #x10000)))
+
+(defun %bt-exec-publish (cell v)
+  (let ((buf (%bt-exec-buf (%gc-read64 (+ cell #x28)))))
+    (cond ((or (typep v 'fixnum) (characterp v) (eq v nil) (eq v t))
+           (setf (mem-ref (+ cell #x20) :u64) v)
+           (%gc-write64 (+ cell #x18) 1))
+          (t
+           (let ((kind 4))
+             (handler-case
+                 (let* ((out (funcall (%bt-encoder "%CHAN-ENCODE") v))
+                        (bytes (car out)) (len (cdr out)))
+                   (when (<= len #xFFF0)
+                     (dotimes (k len) (setf (mem-ref (+ buf k) :u8) (aref bytes k)))
+                     (%gc-write64 (+ cell #x20) len)
+                     (setq kind 2)))
+               (error () (setq kind 4)))
+             (%gc-write64 (+ cell #x18) kind))))))
+
+(defun %bt-exec-main (cell idx)
+  "An executor's whole life (see EXECUTORS above)."
+  (%gc-write64 (+ cell #x28) (percpu-ref 16))
+  (setf (mem-ref (+ cell #x30) :u32) 1)
+  (let ((idle (let ((x (svref *bt-exec-idle* idx))) (if (eq x :none) nil x))))
+    (loop
+      (when idle (funcall idle))
+      ;; A SAFEPOINT: a stop-the-world collection parks a thread only at an allocation, and
+      ;; an idle round (polling a device) may never allocate -- main's collection would wait
+      ;; for this core forever.  Safe and straight back: when no collection is pending this
+      ;; is a store, a barrier and a load; when one is, the leave waits it out.
+      (%gc-safe-enter)
+      (%gc-safe-leave)
+      (let ((req (%gc-read64 (+ cell #x08))))
+        (unless (= req (%gc-read64 (+ cell #x10)))
+          (let ((fn (svref *bt-exec-fns* idx)))
+            (handler-case (%bt-exec-publish cell (funcall fn))
+              (error (e)
+                ;; The error's text travels back (as a string, by copy) and the caller
+                ;; signals it: kind 3.
+                (%bt-exec-publish cell (handler-case (princ-to-string e)
+                                         (error () "an error")))
+                (%gc-write64 (+ cell #x18) 3)))
+            (setf (svref *bt-exec-fns* idx) nil)
+            (mfence)
+            (%gc-write64 (+ cell #x10) req))))
+      (unless idle (bt-yield)))))
+
+(defun bt-start-executor (core &optional idle)
+  "Start an executor pinned to CORE (1..3) running IDLE between calls (NIL: it only
+   serves calls, yielding its core in between).  Its handle.  From the main thread."
+  (%bt-init)
+  (when (null *bt-exec-fns*)
+    (setq *bt-exec-fns* (make-array 8 :initial-element nil)
+          *bt-exec-idle* (make-array 8 :initial-element nil)))
+  (let ((idx (position nil *bt-exec-idle*)))
+    (when (null idx) (error "bt-start-executor: all 8 executors in use"))
+    (let ((cell (%sync-cell)))
+      (setf (svref *bt-exec-idle* idx) (or idle :none))      ; non-NIL: the entry is taken
+      (bt-pin-next core)
+      (let ((c cell) (i idx))
+        (bt-spawn (%bt-exec-entry c i)))
+      (loop (unless (zerop (mem-ref (+ cell #x30) :u32)) (return nil)))
+      (list cell idx))))
+
+(defun %bt-exec-entry (cell idx)
+  (lambda () (%bt-exec-main cell idx)))
+
+(defun bt-call (ex fn)
+  "Run FN (no arguments) on executor EX and return its value, copied (see EXECUTORS)."
+  (let* ((cell (first ex)) (idx (second ex)) (lk cell))
+    (if (%bt-slot-p)
+        (loop (when (zerop (xchg-mem lk 1)) (return nil)) (bt-yield))
+        (loop (when (zerop (xchg-mem lk 1)) (return nil))))
+    (setf (svref *bt-exec-fns* idx) fn)
+    (let ((req (+ (%gc-read64 (+ cell #x08)) 1)))
+      (mfence)
+      (%gc-write64 (+ cell #x08) req)
+      (if (%bt-slot-p)
+          (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil)) (bt-yield))
+          (progn (%gc-safe-enter)
+                 (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil)))
+                 (%gc-safe-leave))))
+    (let ((kind (%gc-read64 (+ cell #x18))))
+      (prog1
+          (cond ((= kind 1) (mem-ref (+ cell #x20) :u64))
+                ((= kind 2)
+                 (let* ((n (%gc-read64 (+ cell #x20)))
+                        (buf (%bt-exec-buf (%gc-read64 (+ cell #x28))))
+                        (v (make-array n :element-type '(unsigned-byte 8))))
+                   (dotimes (k n) (setf (aref v k) (mem-ref (+ buf k) :u8)))
+                   (funcall (%bt-encoder "%CHAN-DECODE") v nil)))
+                ((= kind 3)
+                 (let* ((n (%gc-read64 (+ cell #x20)))
+                        (buf (%bt-exec-buf (%gc-read64 (+ cell #x28))))
+                        (v (make-array n :element-type '(unsigned-byte 8))))
+                   (dotimes (k n) (setf (aref v k) (mem-ref (+ buf k) :u8)))
+                   (let ((msg (handler-case (funcall (%bt-encoder "%CHAN-DECODE") v nil)
+                                (error () "?"))))
+                     (%mutex-unlock lk)
+                     (error "on the executor: ~a" msg))))
+                (t (%mutex-unlock lk) (error "bt-call: the value cannot be copied back")))
+        (%mutex-unlock lk)))))

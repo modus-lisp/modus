@@ -40,3 +40,8 @@
 (defun deep (n) (if (= n 0) 0 (+ 1 (deep (- n 1)))))
 (defun t-deep () (handler-case (deep 1000000) (error () :overflow)))
 (defun t-shallow () (deep 1000))
+
+(defvar *ex* nil)
+(defun ex-idle () (setf (mem-ref #x10380A00 :u32) (+ 1 (mem-ref #x10380A00 :u32))))
+(defun ex-test () (setf (mem-ref #x10380A00 :u32) 0) (setq *ex* (bt-start-executor 1 (function ex-idle))) (let ((a (bt-call *ex* (lambda () (+ 1 2)))) (b (bt-call *ex* (lambda () (list (percpu-ref 16) "str" (> (mem-ref #x10380A00 :u32) 0))))) (buf (make-array 10 :element-type '(unsigned-byte 8)))) (bt-call *ex* (lambda () (dotimes (i 10) (setf (aref buf i) (* i 3))) :filled)) (list a b (coerce buf 'list) (handler-case (bt-call *ex* (lambda () (error "boom"))) (error () :call-error)) (let ((n0 (mem-ref #x10380A00 :u32))) (%sleep-ms 100) (> (mem-ref #x10380A00 :u32) n0)))))
+(defun ex-many () (let ((s 0)) (dotimes (i 200) (setq s (+ s (bt-call *ex* (lambda () i))))) s))

@@ -51,11 +51,15 @@
 (defun hid-u32 (s) (logand s #xFFFFFFFF))
 (defun hid-s8 (b) (if (> b 127) (- b 256) b))
 
+;; ONE PRODUCER, ONE CONSUMER, POSSIBLY ON TWO CORES (a USB-owner thread pushes, the
+;; desk pops): the byte is written before the head that publishes it, and read after the
+;; head that says it is there -- barriers, because Cortex-A53 stores are not ordered.
 (defun hid-ring-push (code)
   (let ((h (hid-get #x80)) (tl (hid-get #x84)))
     (let ((nh (logand (+ h 1) 255)))
       (when (not (= nh tl))
         (setf (mem-ref (+ (hid-st) #x100 h) :u8) code)
+        (mfence)
         (hid-put #x80 nh)))))
 
 (defun hid-ring-pop ()
@@ -63,9 +67,21 @@
   (let ((h (hid-get #x80)) (tl (hid-get #x84)))
     (if (= h tl)
         -1
-        (let ((c (mem-ref (+ (hid-st) #x100 tl) :u8)))
-          (hid-put #x84 (logand (+ tl 1) 255))
-          c))))
+        (progn
+          (mfence)
+          (let ((c (mem-ref (+ (hid-st) #x100 tl) :u8)))
+            (hid-put #x84 (logand (+ tl 1) 255))
+            c)))))
+
+;; THE USB OWNER (+0x1F8): 0, or 1 + the CPU id (thread record) of the one thread allowed
+;; to drive the host controller.  The DWC2 is one device and its channels are shared
+;; (channel 2 carries both the HID split engine and the NIC's bulk OUT), so with threads
+;; exactly one thread polls it; everyone else only drains the ring and reads the counters.
+(defun hid-owner-other-p ()
+  (let ((o (hid-get #x1F8)))
+    (and (> o 0) (/= o (+ (%thr-cpu) 1)))))
+(defun hid-claim-usb () (hid-put #x1F8 (+ (%thr-cpu) 1)) t)
+(defun hid-release-usb () (hid-put #x1F8 0) t)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Discovery
@@ -208,6 +224,7 @@
             (when (> p n) (return nil))
             (hid-clear-port-changes hub p)
             (setq p (+ p 1)))))))
+  (hid-put #x1F8 0)                             ; no USB owner yet
   (hid-put #x1F0 (hid-magic))
   (list (= (hid-dev-get (hid-kbd) 0) 1) (= (hid-dev-get (hid-mouse) 0) 1)))
 
@@ -468,8 +485,9 @@
           (setq p (+ p 1)))))))
 
 (defun hid-split-poll ()
-  ;; Poll the keyboard and the mouse once each, and the hub for hotplug.
-  (when (not (hid-ready-p)) (return-from hid-split-poll nil))
+  ;; Poll the keyboard and the mouse once each, and the hub for hotplug -- unless another
+  ;; thread owns the USB controller (HID-CLAIM-USB), which then does the polling.
+  (when (or (not (hid-ready-p)) (hid-owner-other-p)) (return-from hid-split-poll nil))
   (hid-hotplug-tick)
   (when (> (hid-poll-dev (hid-kbd) (hid-kbd-buf)) 0)
     (hid-kbd-report (hid-kbd-buf)))

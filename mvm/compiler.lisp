@@ -10742,9 +10742,11 @@
                        ;; value on exit — battery row special.after-rebind.
                        (let* ((k (%global-var-bind-key spec))
                               (cell (%let-special-cell spec k))
-                              (slot (and (not cell) (%gv-aot-slot k spec))))
+                              (slot (and (not cell) (%gv-aot-slot k spec)))
+                              (site (and (not cell) (not slot) (%let-special-site spec k))))
                          (list sv (cond (cell `(%gv-cell-ref (quote ,cell) ,k))
                                         (slot `(%gv-ref-fill ,k ,slot))
+                                        (site `(%gv-site-ref ,k (quote ,site)))
                                         (t `(%gv-ref ,k))))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
@@ -10766,9 +10768,11 @@
                                    :test #'string=)
                          (let* ((k (%global-var-bind-key spec))
                                 (cell (%let-special-cell spec k))
-                                (slot (and (not cell) (%gv-aot-slot k spec))))
+                                (slot (and (not cell) (%gv-aot-slot k spec)))
+                                (site (and (not cell) (not slot) (%let-special-site spec k))))
                            (push (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
                                        (slot `(%dynbind-c ,k ,tmp ,slot))
+                                       (site `(%dynbind-site ,k ,tmp (quote ,site)))
                                        (t `(%dynbind ,k ,tmp)))
                                  acc))))
                      specials temp-vars)
@@ -10777,9 +10781,11 @@
              (mapcar (lambda (sv spec)
                        (let* ((k (%global-var-bind-key spec))
                               (cell (%let-special-cell spec k))
-                              (slot (and (not cell) (%gv-aot-slot k spec))))
+                              (slot (and (not cell) (%gv-aot-slot k spec)))
+                              (site (and (not cell) (not slot) (%let-special-site spec k))))
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
                                (slot `(%dynunbind-c ,k ,sv ,slot))
+                               (site `(%dynunbind-site ,k ,sv (quote ,site)))
                                (t `(%dynunbind ,k ,sv)))))
                      save-vars specials))
            (stripped-body (strip-declares body)))
@@ -11757,6 +11763,24 @@
     (or (= n 0)
         (and (= n 1) (%setq-direct-spine-ok var val env)))))
 
+(defvar *let-special-sites* nil
+  "Alist (KEY . site cons): ONE cell cache per special variable for every
+   runtime-compiled read, save, bind and restore of it that had no cell at
+   compile time -- they all want the same cell, so they share the cons.")
+
+(defun %let-special-site (spec bind-key)
+  "At a RUNTIME compile, for a special with no cell yet whose read and write
+   keys agree: the per-site cache cons the LET's save / bind / restore share
+   (see %GV-SITE-CELL); NIL otherwise."
+  (and *mvm-eval-runtime-p* (not *static-build-p*)
+       (eql (%global-name-key spec) bind-key)
+       (let ((e (assoc bind-key *let-special-sites*)))
+         (if e
+             (cdr e)
+             (let ((site (list nil)))
+               (setq *let-special-sites* (cons (cons bind-key site) *let-special-sites*))
+               site)))))
+
 (defun %let-special-cell (spec bind-key)
   "At a RUNTIME compile, the globals cell a LET of special SPEC may bind in
    place: the one compiled reads of SPEC bake (%RUNTIME-GLOBAL-CELL), and only
@@ -12032,9 +12056,14 @@
   (let ((cell (%runtime-global-cell name)))
     (if cell
         (%compile-global-read-baked (%global-name-key name) cell dest)
-        (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
-                                                 (quote ,name))
-                      env dest))))
+        ;; No cell yet: a per-site cache cons (filled once the cell exists).
+        (let ((site (%let-special-site name (%global-name-key name))))
+          (compile-form (if site
+                            `(%e2-symbol-value-site ,(%global-name-key name)
+                                                    (quote ,name) (quote ,site))
+                            `(%e2-symbol-value-checked ,(%global-name-key name)
+                                                       (quote ,name)))
+                        env dest)))))
 
 (defun %compile-global-read-baked (key cell dest)
   "The baked-cell read, GUARDED on whether this image has declared threads.

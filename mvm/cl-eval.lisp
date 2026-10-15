@@ -1338,6 +1338,50 @@
 (defvar *%eval-throw-tag* nil)
 (defvar *%eval-throw-value* nil)
 
+(defun %gv-site-cell (hash site)
+  "The globals cell for HASH through SITE, a per-site cons in runtime-compiled
+   code (CAR = the cell once found, else NIL), or NIL when HASH has no cell
+   yet.  Unarmed callers only; filled on the main thread only.  Cells are never
+   replaced, so a found one stays the live cell."
+  (let ((c (car site)))
+    (if (and (consp c) (eq (car c) hash))
+        c
+        (let ((cl (%gv-cell hash)))
+          (when (and (consp cl)
+                     (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil)))
+            (set-car site cl))
+          (and (consp cl) cl)))))
+
+(defun %e2-symbol-value-site (hash sym site)
+  "%E2-SYMBOL-VALUE-CHECKED for a runtime read of a special that had no cell
+   when the read was compiled (a DEFVAR without a value, or a variable defined
+   later): through SITE's memoised cell once it exists, instead of a table
+   probe per read (cl-bench STAK)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site)))
+        (if c (cdr c) (%e2-symbol-value-checked hash sym)))
+      (%e2-symbol-value-checked hash sym)))
+
+(defun %gv-site-ref (hash site)
+  "The LET-special save (%GV-REF semantics: NIL when absent) through SITE."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site))) (if c (cdr c) nil))
+      (%gv-ref hash)))
+
+(defun %dynbind-site (hash val site)
+  "%DYNBIND through SITE: unarmed with a cell, store in place."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site)))
+        (if c (progn (set-cdr c val) val) (%dynbind hash val)))
+      (%dynbind hash val)))
+
+(defun %dynunbind-site (hash saved site)
+  "%DYNUNBIND through SITE."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site)))
+        (if c (progn (set-cdr c saved) saved) (%dynunbind hash saved)))
+      (%dynunbind hash saved)))
+
 (defun %e2-symbol-value-checked (hash sym)
   "mvm-eval (WS3 flip) global-variable READ with CL unbound-variable semantics.
    Emitted by compile-variable-ref under *mvm-eval-runtime-p* instead of a bare

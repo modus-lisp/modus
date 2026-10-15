@@ -2988,8 +2988,12 @@
 (defvar *symbol-plists* nil)
 
 (defun %get-plist-ht ()
+  ;; An EXPLICIT :TEST table: a bare (MAKE-HASH-TABLE) in image code is the
+  ;; legacy alist shape with no bucket index, so every GET scanned every
+  ;; symbol that has a plist, calling the test on each (0.34 us a GET;
+  ;; cl-bench DDERIV / BOYER live on GET).
   (when (null *symbol-plists*)
-    (setq *symbol-plists* (make-hash-table)))
+    (setq *symbol-plists* (make-hash-table :test 'eq)))
   *symbol-plists*)
 
 (defun get (symbol indicator &optional default)

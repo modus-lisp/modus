@@ -767,6 +767,16 @@
 ;;; were patches on an unfixable premise: ANY small data fixnum can equal a
 ;;; lambda offset, not just 0.
 
+(defun %lam-offset-defun-tag (nm)
+  "LAM-OFFSETS value for a module function that is not a lambda body: its
+   name when that is a global function's symbol (no $$ -- FLET/LABELS and
+   thunks are mangled), else :DEFUN.  %MVM-WRAP-ESCAPING uses the name."
+  (if (and nm (symbolp nm) (not (keywordp nm))
+           (not (search "$$" (symbol-name nm)))
+           (not (search "%MVM-EVAL" (symbol-name nm))))
+      nm
+      :defun))
+
 (defun %mvm-module-fn-offset-p (n lam-offsets)
   "True if integer N is the bytecode entry offset of ANY function in the
    current mvm-eval module — a $$LAMBDA/$$CLOSURE body (entry T) or an ordinary
@@ -834,7 +844,17 @@
     ((and v (not (consp v)) (not (integerp v))
           (= (obj-subtag v) #x52)
           (%mvm-module-fn-offset-p (%prim-aref v 0) lam-offsets))
-     (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))
+     ;; #'GLOBAL-DEFUN with no environment: hand native code the function's
+     ;; GLOBAL definition -- the JIT'd native one once the module is
+     ;; translated -- rather than a trampoline that INTERPRETS its bytecode
+     ;; on every call, allocating an interpreter state each time.  CLHS-wise
+     ;; #'NAME is the global definition anyway.  cl-bench DDERIV's
+     ;; (mapcar #'dderiv args) paid ~16 us per call this way.
+     (let ((tag (gethash (%prim-aref v 0) lam-offsets)))
+       (if (and (null (%prim-aref v 1)) tag (symbolp tag) (not (keywordp tag))
+                (fboundp tag))
+           (symbol-function tag)
+           (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))))
     ;; (No bare-integer branch — see the docstring.)
     (t v)))
 

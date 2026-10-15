@@ -1123,6 +1123,21 @@
               (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
               addr)))))
 
+(defvar *jit-fnaddr-x64-thunks* nil
+  "EQUAL hash NAME -> its x86-64 late-binding #'NAME thunk address: one per
+   name, so fn-addr sites do not each spend a slot of the bridge table.")
+
+(defun %jit-fnaddr-any-thunk-x64 (name)
+  "A 16-byte-aligned x86-64 any-arity bridge thunk for NAME (cached per name),
+   usable as a function value once tagged 3, or NIL."
+  (unless (consp *jit-fnaddr-x64-thunks*)
+    (setq *jit-fnaddr-x64-thunks* (make-hash-table :test (function equal))))
+  (or (gethash name *jit-fnaddr-x64-thunks*)
+      (let ((th (%jit-make-bridge-any-thunk name)))
+        (when (and th (eql (logand th 15) 0))
+          (setf (gethash name *jit-fnaddr-x64-thunks*) th)
+          th))))
+
 (defun %jit-make-bridge-thunk (name nargs)
   "Build the x64 bridge thunk for a NARGS-arg call to NAME; its address or NIL."
   (if (or (null nargs) (> nargs 3) (null (%jit-bridge-ensure))
@@ -1563,7 +1578,18 @@
       (let* ((name (gethash (cdr r) rt-table))
              (fn (and name (%mvm-resolve-runtime-fn name)))
              (word0 (if fn (%val->word fn) 0))
-             (word (if (eql (logand word0 15) 3) word0 0)))
+             (word (if (eql (logand word0 15) 3)
+                       word0
+                       ;; Not native (yet): a LATE-BINDING value, the x86-64
+                       ;; any-arity bridge thunk tagged as a function, which
+                       ;; resolves NAME on every call -- the x64 twin of the
+                       ;; aarch64 #'NAME thunk.  A forward #'NAME (a function
+                       ;; defined later in the file) used to fail the page and
+                       ;; leave the whole function interpreted for good;
+                       ;; cl-bench DDERIV's handlers were 17 us a call that way.
+                       (let ((th (and name (%jit-bridge-on-p)
+                                      (%jit-fnaddr-any-thunk-x64 name))))
+                         (if th (logior th 3) 0)))))
         (if (> word 0)
             (%jit-write-imm64 base (car r) word)
             (progn
@@ -3281,7 +3307,7 @@
             (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                      (not (eql off 0)))
                 (puthash off lam-offsets t)
-                (puthash off lam-offsets (quote :defun)))))
+                (puthash off lam-offsets (%lam-offset-defun-tag (function-info-name (car e)))))))
         (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))))
 
 (defvar *mvm-eval-nesting-saved* nil)
@@ -3696,7 +3722,7 @@
                     ;; any entry INCLUDING offset 0 (the first module fn — a
                     ;; materialized #'SELF closure's slot-0 is very often 0),
                     ;; which is safe because slot-0 of a #x52 is never DATA.
-                    (puthash off lam-offsets (quote :defun)))))
+                    (puthash off lam-offsets (%lam-offset-defun-tag (function-info-name (car e)))))))
             ;; WS3 def persistence: install each top-level user DEFUN as a
             ;; re-entrant interp trampoline in BOTH global function tables —
             ;; *symbol-function-table* by NAME (the mvm-eval native-call bridge's

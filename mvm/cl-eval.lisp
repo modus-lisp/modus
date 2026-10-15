@@ -79,6 +79,19 @@
               ;; fault -- a MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
               (if nfn nfn (symbol-function sym))))))))
 
+;;; A runtime-born package's symbol keys the function tables by its
+;;; package-qualified name; building and hashing that string was most of a
+;;; SYMBOL-FUNCTION (3 us -- and FUNCALL / MAPCAR of a symbol, and every
+;;; #'NAME across modules, go through it).  The pair is memoised per symbol
+;;; (EQ), filled on the main thread only, as the CLOS memos.
+(defvar *sym-qn-memo* nil)
+
+(defun %sym-qn-remember (sym pair)
+  (when (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil))
+    (unless (consp *sym-qn-memo*) (setq *sym-qn-memo* (make-hash-table :test 'eq)))
+    (puthash sym *sym-qn-memo* pair))
+  pair)
+
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:
    - CL-symbol wrapper:    (NAME . HASH-of-NAME)
@@ -112,11 +125,15 @@
                               (t (symbol-name inner))))
             (full (concatenate 'string "SETF-" inner-name)))
        (cons full (compute-name-hash full))))
+    ;; (A hash table is a cons here; the unbound marker an uninitialised
+    ;; defvar reads as in the gate image is a fixnum.)
+    ((and (%cl-sym-p sym) (let ((m *sym-qn-memo*)) (and (consp m) (gethash sym m)))))
     ((%cl-sym-p sym)
      (let ((nm (%cl-sym-name sym)))
        (when nm
          (let ((pkg (%cl-sym-package sym)))
            (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
+             (%sym-qn-remember sym
                ;; Runtime-born library package: key by the PACKAGE-QUALIFIED
                ;; name, hashed with compute-name-hash (fixnum-safe, no
                ;; multiply/bignum — %fixnum-* promotes to a BIGNUM when
@@ -125,12 +142,12 @@
                ;; TRIVIAL-GARBAGE::MAKE-HASH-TABLE a DISTINCT function cell,
                ;; so it no longer clobbers CL:MAKE-HASH-TABLE.
                (let ((qn (concatenate 'string (%pkg-name pkg) "::" nm)))
-                 (cons qn (compute-name-hash qn)))
+                 (cons qn (compute-name-hash qn))))
                ;; Bare key (system / build-baked package) — byte-identical
                ;; to the historical behavior; keeps CL functions reachable
                ;; through both native #x50 syms (boot) and COMMON-LISP
                ;; wrappers (user code).
-               (cons nm (compute-name-hash nm)))))))
+               (%sym-qn-remember sym (cons nm (compute-name-hash nm))))))))
     ((stringp sym)
      (cons sym (compute-name-hash sym)))
     ((and (not (consp sym)) (not (fixnump sym)) (not (characterp sym))

@@ -149,16 +149,7 @@
              (and (not (big-bignum-p n)) (< (bignum-hi n) 0)))
          (progn (%print-char 45 stream)
                 (%print-integer-in-base (bignum-negate n) base stream))
-         (let ((digits nil) (tmp n))
-           (loop
-             (when (and (not (bignump tmp)) (= tmp 0)) (return nil))
-             (let* ((qr (%bignum-divmod-fixnum tmp base))
-                    (q  (car qr)) (r (cdr qr)))
-               (setq digits (cons (%digit-char-upper r) digits))
-               (setq tmp q)))
-           (if (null digits)
-               (%print-char 48 stream)
-               (dolist (d digits) (%print-char d stream))))))
+         (dolist (d (%bignum-digit-codes n base)) (%print-char d stream))))
     ((< n 0)
      (%print-char 45 stream)
      (%print-integer-in-base (- 0 n) base stream))
@@ -2594,6 +2585,7 @@
    significant first."
   (if (and (not (bignump n)) (= n 0))
       (cons 48 nil)
+      (if (bignump n) (%bignum-digit-codes n base)
       (let ((digits nil) (tmp n))
         (loop
           (when (and (not (bignump tmp)) (= tmp 0)) (return digits))
@@ -2607,7 +2599,7 @@
               (let* ((qr (%bignum-divmod-fixnum tmp base))
                      (q  (car qr)) (r (cdr qr)))
                 (setq digits (cons (%digit-char-upper r) digits))
-                (setq tmp q)))))))
+                (setq tmp q))))))))
 
 (defun %fmt-integer (n base mincol padchar commachar commaint colonp atp stream)
   (cond

@@ -3420,6 +3420,24 @@
          (hi (if (< (+ i 1) n) (logand (%fixnum-* (aref d (+ i 1)) p) +half-limb-mask+) 0)))
     (%fixnum-+ lo hi)))
 
+(defun %digits-top2 (d n k)
+  "floor(D / 2^K) for digits D[0..N-1] when that has at most 2*half-limb-bits
+   - 1 bits (61 on the 62-bit tower): up to three digits, each placed with a
+   multiply (no variable-count ASH)."
+  (declare (type simple-vector d))
+  (let* ((i (truncate k +half-limb-bits+))
+         (s (%fixnum-- k (%fixnum-* i +half-limb-bits+)))
+         (lo (if (< i n) (ash (%fixnum-* (aref d i) (%pow2-small (%fixnum-- +half-limb-bits+ s)))
+                              +neg-half-limb-bits+) 0))
+         (mid (if (< (+ i 1) n) (%fixnum-* (aref d (+ i 1)) (%pow2-small (%fixnum-- +half-limb-bits+ s))) 0))
+         ;; the third digit's bits sit at 2*half - s and up; only s >= 1 leaves any
+         (hi (if (and (> s 0) (< (+ i 2) n))
+                 (%fixnum-* (aref d (+ i 2))
+                            (%fixnum-* (%pow2-small (%fixnum-- +half-limb-bits+ s))
+                                       (%fixnum-+ +half-limb-mask+ 1)))
+                 0)))
+    (%fixnum-+ (%fixnum-+ lo mid) hi)))
+
 (defun %digits-bitlen (d n)
   (declare (type simple-vector d))
   (if (<= n 0) 0
@@ -3462,18 +3480,31 @@
                 (loop (when (= y 0) (return nil))
                   (let ((r (rem x y))) (setq x y) (setq y r)))
                 (return x)))
-            (let* ((k (max 0 (- (%digits-bitlen u un) +half-limb-bits+)))
-                   (ah (%digits-top u un k))
-                   (bh (%digits-top v vn k))
+            (let* ((k (max 0 (- (%digits-bitlen u un) (- (* 2 +half-limb-bits+) 1))))
+                   ;; the top 2H-1 bits (61): twice the progress per pass of a
+                   ;; one-digit leading part, with room for ah + x
+                   (ah (%digits-top2 u un k))
+                   (bh (%digits-top2 v vn k))
+                   (cmax +half-limb-mask+)
                    (x 1) (y 0) (z 0) (w 1))
               ;; L2/L3: single-precision Euclid while the quotient of the
-              ;; true values is provably the quotient of the leading digits
+              ;; true values is provably the quotient of the leading parts,
+              ;; and while every cofactor stays below B (the linear
+              ;; combination below needs |x*a + y*b + c| < B^2)
               (loop
                 (when (or (= (%fixnum-+ bh z) 0) (= (%fixnum-+ bh w) 0)) (return nil))
                 (let ((q (truncate (%fixnum-+ ah x) (%fixnum-+ bh z))))
                   (unless (= q (truncate (%fixnum-+ ah y) (%fixnum-+ bh w))) (return nil))
-                  (let ((tt (%fixnum-- x (%fixnum-* q z)))) (setq x z) (setq z tt))
-                  (let ((tt (%fixnum-- y (%fixnum-* q w)))) (setq y w) (setq w tt))
+                  ;; q <= B keeps q*z (|z| < B) a fixnum; then the new
+                  ;; cofactors are checked directly -- no division
+                  (when (> q cmax) (return nil))
+                  (let ((nz (%fixnum-- x (%fixnum-* q z)))
+                        (nw (%fixnum-- y (%fixnum-* q w))))
+                    (when (or (> nz cmax) (< nz (%fixnum-- 0 cmax))
+                              (> nw cmax) (< nw (%fixnum-- 0 cmax)))
+                      (return nil))
+                    (setq x z) (setq z nz)
+                    (setq y w) (setq w nw))
                   (let ((tt (%fixnum-- ah (%fixnum-* q bh)))) (setq ah bh) (setq bh tt))))
               (if (= y 0)
                   ;; L4: no progress from the leading digits -- one full

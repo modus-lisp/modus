@@ -58,8 +58,31 @@ region 0 41 times under them -- every sum right -- and each worker collected its
 times meanwhile.  NEGATIVE CONTROL, same image: clear the table's armed word (STW off) and the
 same run takes a data abort on a worker stack (SP 0x053FFBC0, core 1) during the first churn.
 
-NOT YET: a worker storing its objects into region-0 structures (fresh INTERN, SETQ of a global,
-special bindings, SETQ of a closed-over variable) -- needs the runtime lock + lock arena; a
-non-allocating worker loop holds a region-0 collection up; the sb-thread shim mapping; heap size
-(each worker region must be well over the 8 MB limit guard, carved from region 0's 56 MB); and the
-board run (core 1 did not start on one board boot; it does under QEMU).
+COROUTINE SLOTS (phase 4, net/bare-threads.lisp): cores 1..3 each run a scheduler; a thread is
+a SLOT (records 4..15: stack, window, per-CPU block) pinned to a core and run there as a
+coroutine, sharing the core's heap.  A slot runs until it blocks -- %MUTEX-LOCK, %COND-WAIT-MS,
+%SLEEP-MS, BT-YIELD -- and the core runs another; the switch (test/rpi-smp/switch.s) pushes the
+registers and publishes the slot SAFE first, so stop-the-world scans it, and a collection of the
+core's own heap scans it too (translate-aarch64 SIBLING mode).  Results come back by copy
+(modus-channel's encoder).  test/rpi-smp/slots.lisp, QEMU raspi3b:
+
+    (join-all (spawn-n 8 #'t-sum))                    8 threads on 3 cores, all 4499998500000
+    (join-all (spawn-n 3 #'t-list))                   a list/string result, copied out intact
+    (join-all (spawn-n 6 #'t-chain))                  2 slots per core, each yielding with a
+                                                      2000-cons chain live while its sibling
+                                                      collects the shared heap: 28 GCs per core,
+                                                      1200/1200 sums right
+      ... with *HIDE* (a slot hides from the sibling scan while parked): 538 bad + 2 errors
+    6 x 2000 increments under %MUTEX-LOCK, yielding inside        => 12000
+      ... without the mutex                                         => 8567 (lost updates)
+    (join-all (spawn-n 3 #'t-sleep))                  (300 300 300) ms
+    6 slots walk a region-0 list while core 0 collects it 40x     all 3000/3000
+
+Also found: the in-image JIT never got the per-thread window (its gate read a variable defined
+after the text was built), so runtime-JIT'd code on a thread wrote MAIN's window -- main's REPL
+died with READ-ERROR after the first thread that ran the channel encoder.
+
+NOT YET: a thread storing its objects into region-0 structures (fresh INTERN, SETQ of a global,
+special bindings, SETQ of a closed-over variable) -- needs the runtime lock + lock arena; threads
+started from threads; preemption (a slot that never blocks keeps its core); the sb-thread shim
+mapping; and the board run (core 1 did not start on one board boot; it does under QEMU).

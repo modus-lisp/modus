@@ -2169,8 +2169,11 @@
                         "(setq *aarch64-gc-bitmap-enabled* t)"))
                   ;; SMP phase 2: the in-image JIT must emit the same per-thread-window
                   ;; accesses as the image (defvar inits never run in-image).
-                  (let ((th (find-symbol "*RPI-CL-THREADS*" :modus.mvm)))
-                    (if (and th (boundp th) (symbol-value th))
+                  ;; (CL-USER::*RPI-THREADS-P*, not boot-rpi-cl's *RPI-CL-THREADS*: that
+                  ;; file is loaded AFTER this text is built, so the old test was always
+                  ;; false and runtime-JIT'd code on a thread wrote MAIN's window.)
+                  (progn
+                    (if cl-user::*rpi-threads-p*
                         "
   (setq *a64-tls-window* t) (setq *tls-window* t) (setq *tls-window-a64* t) (setq *a64-tls-tsd-offset* nil)"
                         "")))

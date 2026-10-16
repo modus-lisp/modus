@@ -43,7 +43,7 @@ const INSN_LEN = new Uint8Array(256);
 for (const [ops, n] of [[[0x00,0x01,0x72,0x82,0x89,0x8B,0x92,0xA2,0xA3,0xA4],1],[[0x02,0x10,0x25,0x30,0x31,0x50,0x51,0x53,0x54,0x55,0x56,0x63,0x64,0x67,0x68,0xB0,0xB7,0xB9,0xC2,0xC3,0xC4,0xC8],3],
   [[0x11,0x14],10],[[0x12,0x13,0x26,0x27,0x81,0x88,0x8A,0x90,0x91,0xB8,0xBA,0xBB,0xBC,0xBD],2],
   [[0x20,0x21,0x22,0x23,0x24,0x28,0x29,0x2A,0x2B,0x2C,0x2D,0x2F,0x32,0x52,0x61,0x62,0x65,0x66,0x70,0x71,0x93,0xA5,0xA6,0xA8,0xA9,0xAA,0xAB,0xAC,0xAD,0xAE,0xAF,0xB1,0xB2,0xB3,0xB4,0xB5,0xB6,0xBE,0xBF,0xC0,0xC1,0xC5,0xC6,0xC9,0xCA],4],
-  [[0x2E,0x60,0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x80,0x83,0xA0,0xA1,0xC7],5],[[0x47,0x48,0xA7],6]]) for (const o of ops) INSN_LEN[o] = n;
+  [[0x2E,0x60,0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x80,0x83,0xA0,0xA1,0xC7],5],[[0x47,0x48,0xA7,0x33,0x34],6]]) for (const o of ops) INSN_LEN[o] = n;
 // Opcodes added to the ISA after this file was written.  RELOCATION walks the
 // module bytecode by these lengths, so a missing entry is not a slow path, it
 // is `module relocation failed' at boot — which is exactly what the SIMD block
@@ -1047,6 +1047,10 @@ class MVM {
         case 0x30: { const a = code[pc + 1], b = code[pc + 2]; this.cmp = cmp64(this.rlo(a), this.rhi(a), this.rlo(b), this.rhi(b)); pc += 3; break; }
         case 0x31: { const a = code[pc + 1], b = code[pc + 2]; const lo = this.rlo(a) & this.rlo(b), hi = this.rhi(a) & this.rhi(b);
                      this.cmp = (lo === 0 && hi === 0) ? 0 : (hi < 0 ? -1 : 1); pc += 3; break; }
+        // cmp-imm / test-imm Va imm32: the immediate sign-extended to the word
+        case 0x33: { const a = code[pc + 1], i = this.rd32(pc + 2); this.cmp = cmp64(this.rlo(a), this.rhi(a), i, i < 0 ? -1 : 0); pc += 6; break; }
+        case 0x34: { const a = code[pc + 1], i = this.rd32(pc + 2); const lo = this.rlo(a) & i, hi = this.rhi(a) & (i < 0 ? -1 : 0);
+                     this.cmp = (lo === 0 && hi === 0) ? 0 : (hi < 0 ? -1 : 1); pc += 6; break; }
         case 0x40: pc = pc + 5 + this.rd32(pc + 1); break;
         case 0x41: pc = this.cmp === 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
         case 0x42: pc = this.cmp !== 0 ? pc + 5 + this.rd32(pc + 1) : pc + 5; break;
@@ -1531,6 +1535,8 @@ class MVM {
         case 0x2D: out += `sar64(${lo(b2)},${hi(b2)},${b3});${WR(b1)}`; break;
         case 0x30: out += `cmp=cmp64(${lo(b1)},${hi(b1)},${lo(b2)},${hi(b2)});`; break;
         case 0x31: out += `{const l=${lo(b1)}&${lo(b2)},h=${hi(b1)}&${hi(b2)};cmp=(l===0&&h===0)?0:(h<0?-1:1);}`; break;
+        case 0x33: { const i = rd32(pc + 2); out += `cmp=cmp64(${lo(b1)},${hi(b1)},${i},${i < 0 ? -1 : 0});`; break; }
+        case 0x34: { const i = rd32(pc + 2), ih = i < 0 ? -1 : 0; out += `{const l=${lo(b1)}&${i},h=${hi(b1)}&${ih};cmp=(l===0&&h===0)?0:(h<0?-1:1);}`; break; }
         case 0x14: {
           const idx = rd32(pc + 2);
           if (pc >= JIT_PHYS) out += `{const v=vm.ldlo(${A_WEB_CONSTS});if(v===0)vm.fault('li-const: no constant vector');const a=v+${7 + 8 * idx};${W(b1, 'vm.ldlo(a)', 'vm.ldhi(a)')}}`;

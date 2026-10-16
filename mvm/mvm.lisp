@@ -35,7 +35,7 @@
    #:+op-neg+ #:+op-inc+ #:+op-dec+
    #:+op-and+ #:+op-or+ #:+op-xor+
    #:+op-shl+ #:+op-shr+ #:+op-sar+ #:+op-shlv+ #:+op-sarv+ #:+op-ldb+
-   #:+op-cmp+ #:+op-test+
+   #:+op-cmp+ #:+op-test+ #:+op-cmp-imm+ #:+op-test-imm+
    #:+op-br+ #:+op-beq+ #:+op-bne+ #:+op-blt+ #:+op-bge+
    #:+op-ble+ #:+op-bgt+ #:+op-bnull+ #:+op-bnnull+
    #:+op-adds+ #:+op-subs+ #:+op-bvs+
@@ -88,7 +88,7 @@
    #:mvm-itof #:mvm-ftoi #:mvm-fcmp
    #:mvm-and #:mvm-or #:mvm-xor
    #:mvm-shl #:mvm-shr #:mvm-sar #:mvm-shlv #:mvm-sarv #:mvm-ldb
-   #:mvm-cmp #:mvm-test
+   #:mvm-cmp #:mvm-test #:mvm-cmp-imm #:mvm-test-imm #:%imm32-signed
    #:mvm-br #:mvm-beq #:mvm-bne #:mvm-blt #:mvm-bge
    #:mvm-ble #:mvm-bgt #:mvm-bnull #:mvm-bnnull
    #:mvm-adds #:mvm-subs #:mvm-bvs
@@ -305,6 +305,15 @@
 ;; Comparison
 (defconstant +op-cmp+    #x30)  ; (cmp Va Vb) - 2 reg (sets flags)
 (defconstant +op-test+   #x31)  ; (test Va Vb) - 2 reg (AND, sets flags)
+;; The IMMEDIATE forms: compare / AND-test register Va's tagged word with a
+;; 32-bit immediate, SIGN-EXTENDED to the word.  The operand is encoded as
+;; :imm32 (decoded unsigned -- :off32 means "branch offset" to every
+;; branch-target scanner); each consumer sign-extends it.  A constant operand
+;; used to take a temp register of its own, and on x64 (9 physical vregs) the
+;; temps of a nested expression spill, so (logand x 1)-style tag tests became
+;; a stack store, a reload through RAX and a push/pop around it.
+(defconstant +op-cmp-imm+  #x33)  ; (cmp-imm Va imm32) - sets flags as CMP
+(defconstant +op-test-imm+ #x34)  ; (test-imm Va imm32) - sets flags as TEST
 
 ;; Branch
 (defconstant +op-br+     #x40)  ; (br off32) - unconditional
@@ -619,6 +628,8 @@
 ;; Comparison
 (defopcode :cmp    #x30 (:reg :reg)           "Compare two tagged values")
 (defopcode :test   #x31 (:reg :reg)           "Test (AND without storing)")
+(defopcode :cmp-imm  #x33 (:reg :imm32)       "Compare a tagged value with a sign-extended imm32")
+(defopcode :test-imm #x34 (:reg :imm32)       "Test (AND) with a sign-extended imm32")
 
 ;; Branch
 (defopcode :br     #x40 (:off32)              "Unconditional branch")
@@ -1222,6 +1233,16 @@
 
 (defun mvm-test (buf va vb)
   (encode-instruction buf +op-test+ va vb))
+
+(defun mvm-cmp-imm (buf va imm)
+  (encode-instruction buf +op-cmp-imm+ va (logand imm #xFFFFFFFF)))
+
+(defun mvm-test-imm (buf va imm)
+  (encode-instruction buf +op-test-imm+ va (logand imm #xFFFFFFFF)))
+
+(defun %imm32-signed (u)
+  "The :imm32 operand U of CMP-IMM / TEST-IMM as the signed value it encodes."
+  (if (>= u #x80000000) (- u #x100000000) u))
 
 ;; Branch
 (defun mvm-br (buf offset)

@@ -3637,6 +3637,16 @@
            (i386-load-vreg buf +scratch0+ va)
            (i386-emit-test-reg-reg buf +scratch0+ +scratch1+)))
 
+        ;; (cmp-imm / test-imm Va imm32): as CMP / TEST with the immediate in
+        ;; SCRATCH1 -- VR-preserving like them
+        ((or (op= +op-cmp-imm+) (op= +op-test-imm+))
+         (let ((va (first operands)) (imm (%imm32-signed (second operands))))
+           (i386-emit-mov-reg-imm buf +scratch1+ imm)
+           (i386-load-vreg buf +scratch0+ va)
+           (if (op= +op-cmp-imm+)
+               (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+               (i386-emit-test-reg-reg buf +scratch0+ +scratch1+))))
+
         ;; ============================================
         ;; Branches
         ;; ============================================

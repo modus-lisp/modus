@@ -1948,6 +1948,19 @@
          (rv-emit-and buf *rv-last-cmp-rs1* ra rb)
          (rv-emit-mv buf *rv-last-cmp-rs2* +rv-x0+)))
 
+      ;; (cmp-imm / test-imm Va imm32): as CMP / TEST with the immediate in
+      ;; the second comparison register
+      (#.+op-cmp-imm+
+       (let ((ra (resolve (vreg 0))))
+         (rv-emit-mv buf *rv-last-cmp-rs1* ra)
+         (rv-emit-li buf *rv-last-cmp-rs2* (%imm32-signed (vreg 1)))))
+
+      (#.+op-test-imm+
+       (let ((ra (resolve (vreg 0))))
+         (rv-emit-li buf *rv-last-cmp-rs2* (%imm32-signed (vreg 1)))
+         (rv-emit-and buf *rv-last-cmp-rs1* ra *rv-last-cmp-rs2*)
+         (rv-emit-mv buf *rv-last-cmp-rs2* +rv-x0+)))
+
       ;; ---- Branch ----
       (#.+op-br+
        (let* ((mvm-offset (vreg 0))

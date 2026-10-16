@@ -572,6 +572,17 @@
      (let ((pa (ensure-src-i386a64 (car operands) 16))
            (pb (ensure-src-i386a64 (car (cdr operands)) 17)))
        (a64i-tst-reg buf pa pb)))
+    ;; CMP-IMM / TEST-IMM Va imm32 (#x33 / #x34): the immediate into x17, then
+    ;; as CMP / TEST -- byte-for-byte what translate-aarch64 emits (the
+    ;; compiler only emits non-negative immediates)
+    ((= op 51)
+     (let ((pa (ensure-src-i386a64 (car operands) 16)))
+       (a64i-load-imm64 buf 17 (car (cdr operands)))
+       (a64i-cmp-reg buf pa 17)))
+    ((= op 52)
+     (let ((pa (ensure-src-i386a64 (car operands) 16)))
+       (a64i-load-imm64 buf 17 (car (cdr operands)))
+       (a64i-tst-reg buf pa 17)))
     ;; SARV Vd Vs Vc
     ((= op 50)
      (a64i-translate-shift-var buf operands 1)) ; 1=ASRV

@@ -2108,6 +2108,26 @@
                        (cond ((zerop r) 0) ((< r 0) -1) (t 1))))
                (setf pc npc2))))
 
+          ;; CMP-IMM / TEST-IMM: the immediate is a sign-extended WORD.  The
+          ;; compiler emits CMP-IMM only with a fixnum's word (2k), so its
+          ;; VALUE, the k compared here, is the word shifted down.
+          (#.+op-cmp-imm+
+           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (u npc2) (%ifetch-u32 bc npc)
+               (let ((a (svref regs va)) (b (ash (%imm32-signed u) -1)))
+                 (setf (mvm-flags state)
+                       (cond ((integerp a) (cond ((= a b) 0) ((< a b) -1) (t 1)))
+                             (t 1))))
+               (setf pc npc2))))
+
+          (#.+op-test-imm+
+           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (u npc2) (%ifetch-u32 bc npc)
+               (let ((r (logand (%mvm-word (svref regs va)) (%imm32-signed u))))
+                 (setf (mvm-flags state)
+                       (cond ((zerop r) 0) ((< r 0) -1) (t 1))))
+               (setf pc npc2))))
+
           ;; --- Branches (offsets relative to end of instruction) ---
           (#.+op-br+
            (multiple-value-bind (off npc) (%ifetch-s32 bc pc)

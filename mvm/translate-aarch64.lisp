@@ -2435,7 +2435,7 @@
   "Opcodes whose aarch64 arm writes at most operand 0's vreg and emits no
    branch, label or call.  Every OTHER opcode flushes the slot cache.")
 
-(defparameter *a64-slot-cache-noder-ops* (list +op-cmp+ +op-test+ +op-push+)
+(defparameter *a64-slot-cache-noder-ops* (list +op-cmp+ +op-test+ +op-cmp-imm+ +op-test-imm+ +op-push+)
   "Opcodes that write NO vreg at all: they only set flags or touch the
    operand stack, so the cache survives them untouched.")
 
@@ -4596,6 +4596,16 @@
            (let ((pa (ensure-src (vr 0) +a64-x16+))
                  (pb (ensure-src (vr 1) +a64-x17+)))
              (a64-cmp-reg buf pa pb)))
+
+          ;; ---- CMP-IMM / TEST-IMM Va, imm32 ---- the sign-extended
+          ;; immediate into x17, then CMP / TST as above
+          ((or (= op +op-cmp-imm+) (= op +op-test-imm+))
+           (let ((pa (ensure-src (vr 0) +a64-x16+))
+                 (imm (%imm32-signed (vr 1))))
+             (a64-load-imm64 buf +a64-x17+ (if (< imm 0) (logand imm #xFFFFFFFFFFFFFFFF) imm))
+             (if (= op +op-cmp-imm+)
+                 (a64-cmp-reg buf pa +a64-x17+)
+                 (a64-tst-reg buf pa +a64-x17+))))
 
           ;; ---- TEST Va, Vb ----
           ((= op +op-test+)

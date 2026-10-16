@@ -130,6 +130,8 @@
   (setf *mvm-source-text* (replace-all "#.+op-shr+" "44" *mvm-source-text*))
   (setf *mvm-source-text* (replace-all "#.+op-sar+" "45" *mvm-source-text*))
   (setf *mvm-source-text* (replace-all "#.+op-ldb+" "46" *mvm-source-text*))
+  (setf *mvm-source-text* (replace-all "#.+op-cmp-imm+" "51" *mvm-source-text*))
+  (setf *mvm-source-text* (replace-all "#.+op-test-imm+" "52" *mvm-source-text*))
   (setf *mvm-source-text* (replace-all "#.+op-cmp+" "48" *mvm-source-text*))
   (setf *mvm-source-text* (replace-all "#.+op-test+" "49" *mvm-source-text*))
   (setf *mvm-source-text* (replace-all "#.+op-sarv+" "50" *mvm-source-text*))

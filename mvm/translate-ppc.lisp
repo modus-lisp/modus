@@ -1832,6 +1832,18 @@
            ;; AND and set CR0: AND. r0, pa, pb
            (ppc-emit-word buf (ppc-x-form 31 pa +ppc-r0+ pb 28 1)))))
 
+      ;; (cmp-imm / test-imm Va imm32): the sign-extended immediate into
+      ;; scratch2, then as CMP / TEST
+      (#.+op-cmp-imm+
+       (let ((pa (vreg-or-scratch (first operands) +ppc-scratch1+)))
+         (ppc-emit-li buf +ppc-scratch2+ (%imm32-signed (second operands)))
+         (ppc-emit-cmp-word buf pa +ppc-scratch2+)))
+
+      (#.+op-test-imm+
+       (let ((pa (vreg-or-scratch (first operands) +ppc-scratch1+)))
+         (ppc-emit-li buf +ppc-scratch2+ (%imm32-signed (second operands)))
+         (ppc-emit-word buf (ppc-x-form 31 pa +ppc-r0+ +ppc-scratch2+ 28 1))))
+
       ;;; --- Branches ---
       (#.+op-br+
        (let* ((off16 (first operands))

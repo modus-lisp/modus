@@ -9636,6 +9636,11 @@
             (a (cadr test)) (b (caddr test))
             (ra (%operand-reg a env)) (rb (%operand-reg b env)))
        (unless ra (compile-form a env dest))
+       ;; a non-negative fixnum literal on the right: CMP-IMM, no temp
+       (when (and (integerp b) (>= b 0) (< (ash b +fixnum-shift+) #x80000000))
+         (emit-ir :cmp-imm (or ra dest) (ash b +fixnum-shift+))
+         (emit-ir (%inverse-branch bop) false-label)
+         (return-from %compile-test-branch nil))
        (let ((temp (and (not rb) (alloc-temp-reg))))
          (when temp
            (if (%leaf-operand-p b env)
@@ -12086,8 +12091,7 @@
       (emit-ir :shr dest dest +fixnum-shift+)
       (emit-ir :load cell dest (%tls-width (car (memory-width-code :u32))
                                            #x10000DB8))
-      (emit-ir :li dest 0)
-      (emit-ir :cmp cell dest)
+      (emit-ir :cmp-imm cell 0)
       (emit-ir :bne miss)
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
       (emit-li-tagged cell (conv-real +gv-cache-root+))
@@ -12095,8 +12099,7 @@
       (emit-ir :load cell cell (%tls-width (car (memory-width-code :u64))
                                            +gv-cache-root+))
       ;; A raw 0 is a FIXNUM (low bit clear): no vector yet -> miss.
-      (emit-ir :li dest 1)
-      (emit-ir :test cell dest)
+      (emit-ir :test-imm cell 1)
       (emit-ir :beq miss)
       ;; The slot index rides an IMM8 in :OBJ-REF, so only the first 256
       ;; globals can name their slot inline; the rest take the register-index
@@ -12325,8 +12328,7 @@
            ;; later form's (funcall *fn* 1) jumped to the offset (x64 and
            ;; aarch64 alike).  Counters and flags keep the fast path.
            (let ((fast (make-compiler-label)))
-             (emit-ir :li zed 1)
-             (emit-ir :test dest zed)
+             (emit-ir :test-imm dest 1)
              (emit-ir :beq fast)
              (emit-ir :mov zed +vreg-vn+)
              (emit-ir :cmp dest zed)
@@ -12387,8 +12389,7 @@
                (emit-li-tagged a (conv-real +gv-cache-root+))
                (emit-ir :shr a a +fixnum-shift+)
                (emit-ir :load a a (%tls-width (car (memory-width-code :u64)) +gv-cache-root+))
-               (emit-ir :li b 1)
-               (emit-ir :test a b)
+               (emit-ir :test-imm a 1)
                (emit-ir :beq inline-slow)
                (if (%obj-slot-imm-p islot)
                    (emit-ir :obj-ref b a islot)
@@ -18277,8 +18278,7 @@
     ;; overflow): skip the tag test, keep the checked op + slow path.
     (unless (and *arith-trust* (car *arith-trust*))
       (emit-ir :or   tag-temp src1 temp)
-      (emit-ir :li   one-temp 1)
-      (emit-ir :test tag-temp one-temp)
+      (emit-ir :test-imm tag-temp 1)
       (emit-ir :bne  slow-label))
     ;; OVERFLOW GUARD ON A 30-BIT TOWER.  Overflow promotion is disabled above
     ;; (it regressed ANSI on x64, where a 62-bit fixnum rarely overflows).  At
@@ -18698,8 +18698,7 @@
       (let ((one (alloc-temp-reg))
             (boxed (make-compiler-label))
             (done (make-compiler-label)))
-        (emit-ir :li one 1)
-        (emit-ir :test (cdr h) one)
+        (emit-ir :test-imm (cdr h) 1)
         (emit-ir :bne boxed)
         (emit-ir :fpd-itof fd (cdr h))
         (emit-ir :br done)
@@ -20077,12 +20076,7 @@
     ;; per iteration of every loop.
     (unless (and (%expr-width a env) (%expr-width b env))
       (emit-ir :or  tag-temp dest a-temp)
-      (let ((one-temp (alloc-temp-reg)))
-        (emit-ir :li  one-temp 1)
-        (emit-ir :and tag-temp tag-temp one-temp)
-        (emit-ir :li  one-temp 0)
-        (emit-ir :cmp tag-temp one-temp)
-        (free-temp-reg))
+      (emit-ir :test-imm tag-temp 1)
       (emit-ir :bne slow-label))
     ;; Fast path: tagged-fixnum compare.
     (emit-ir :cmp dest a-temp)
@@ -20734,11 +20728,9 @@
         ;; Both fixnums?  (tag bit of VALUE | COUNT clear)
         (emit-ir :mov fx dest)
         (emit-ir :or fx fx cnt)
-        (emit-ir :li chk 1)
-        (emit-ir :test fx chk)
+        (emit-ir :test-imm fx 1)
         (emit-ir :bne slow)
-        (emit-ir :li chk 0)
-        (emit-ir :cmp cnt chk)
+        (emit-ir :cmp-imm cnt 0)
         (emit-ir :blt right)
         ;; LEFT: 0 <= COUNT < 62, verified by shifting back.
         (emit-li-tagged chk 62)
@@ -20889,8 +20881,7 @@
            (ash-done  (make-compiler-label))
            (fx (alloc-temp-reg)))
        ;; fixnum? (tag bit clear)  -> take the inline path
-       (emit-ir :li fx 1)
-       (emit-ir :test dest fx)
+       (emit-ir :test-imm dest 1)
        (emit-ir :beq fix-label)
        ;; --- cold path: BIGNUM-ASH(value, count) ---
        (emit-ir :mov +vreg-v0+ dest)
@@ -21045,8 +21036,7 @@
         (end-label (make-compiler-label)))
     (compile-form arg env dest)
     ;; Test low bit: AND with 1
-    (emit-ir :li temp 1)
-    (emit-ir :test dest temp)
+    (emit-ir :test-imm dest 1)
     ;; If zero flag set (low bit is 0), it's a fixnum
     (emit-ir :beq true-label)
     (compile-type-predicate-branch dest true-label end-label)
@@ -21353,8 +21343,7 @@
         (temp2 (alloc-temp-reg)))
     (compile-form arg env dest)
     ;; Check fixnum: low bit 0
-    (emit-ir :li temp 1)
-    (emit-ir :test dest temp)
+    (emit-ir :test-imm dest 1)
     (emit-ir :bne check-bignum-label)
     ;; Low bit 0: fixnum (including NIL on AArch64).
     (emit-ir :br true-label)
@@ -25614,6 +25603,8 @@
       (:neg   3)
       (:cmp   3)
       (:test  3)
+      (:cmp-imm  6)
+      (:test-imm 6)
       (:obj-tag 3)
       (:obj-subtag 3)
       (:array-len 3)
@@ -25926,6 +25917,10 @@
            (mvm-cmp buf (second insn) (third insn)))
           (:test
            (mvm-test buf (second insn) (third insn)))
+          (:cmp-imm
+           (mvm-cmp-imm buf (second insn) (third insn)))
+          (:test-imm
+           (mvm-test-imm buf (second insn) (third insn)))
           (:obj-tag
            (mvm-obj-tag buf (second insn) (third insn)))
           (:obj-subtag

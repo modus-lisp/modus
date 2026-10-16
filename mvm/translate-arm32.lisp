@@ -1735,6 +1735,17 @@
          (with-src2 (pa (vreg 0) +arm-r12+) (pb (vreg 1) +arm-lr+)
            (arm32-tst buf pa pb)))
 
+        ;; (cmp-imm / test-imm Va imm32): the immediate into LR, then as CMP / TST
+        (#.+op-cmp-imm+
+         (with-src (pa (vreg 0) +arm-r12+)
+           (arm32-load-imm32 buf +arm-lr+ (logand (%imm32-signed (vreg 1)) #xFFFFFFFF))
+           (arm32-cmp buf pa +arm-lr+)))
+
+        (#.+op-test-imm+
+         (with-src (pa (vreg 0) +arm-r12+)
+           (arm32-load-imm32 buf +arm-lr+ (logand (%imm32-signed (vreg 1)) #xFFFFFFFF))
+           (arm32-tst buf pa +arm-lr+)))
+
         ;;; --- Branches ---
 
         (#.+op-br+

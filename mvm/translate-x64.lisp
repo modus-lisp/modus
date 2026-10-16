@@ -3578,6 +3578,22 @@
                 (emit-pop buf 'r13)
                 (emit-pop buf 'rax))))))
 
+        ;; (cmp-imm Va imm32) / (test-imm Va imm32): the sign-extended
+        ;; immediate straight into CMP / TEST r/m64, imm.
+        ((or (op= +op-cmp-imm+) (op= +op-test-imm+))
+         (let* ((va (first operands))
+                (imm (%imm32-signed (second operands)))
+                (pa (vreg-phys va))
+                (r (or pa 'rax)))
+           (unless pa
+             (emit-push buf 'rax)
+             (emit-load-vreg buf va 'rax))
+           (if (op= +op-cmp-imm+)
+               (emit-cmp-reg-imm buf r imm)
+               (emit-test-reg-imm buf r imm))
+           (unless pa
+             (emit-pop buf 'rax))))
+
         ((op= +op-test+)
          ;; (test Va Vb) — AND, sets flags, discards result
          (let ((va (first operands))

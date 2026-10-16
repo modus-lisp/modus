@@ -1670,6 +1670,19 @@
            (m68k-emit-and-dn-dn buf db +68k-d0+)
            (m68k-emit-tst buf +68k-d0+))))
 
+      ;; (cmp-imm / test-imm Va imm32): the immediate into D1, then as CMP / TEST
+      (#.+op-cmp-imm+
+       (let ((da (m68k-vreg-or-scratch buf (first operands) +68k-d0+)))
+         (m68k-emit-move-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
+         (m68k-emit-cmp-dn-dn buf +68k-d1+ da)))
+
+      (#.+op-test-imm+
+       (progn
+         (m68k-load-vreg buf +68k-d0+ (first operands))
+         (m68k-emit-move-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
+         (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-tst buf +68k-d0+)))
+
       ;;; --- Branches ---
       (#.+op-br+
        (let* ((off16 (first operands))

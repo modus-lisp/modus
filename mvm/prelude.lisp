@@ -1933,7 +1933,8 @@
 ;;; the image's own code relies on; CLHS makes HASH-TABLE and LIST disjoint,
 ;;; and portable code dispatches on it -- jzon's object parser took a table for
 ;;; a list and every JSON object failed with a TYPE-ERROR.
-(defun %prim-simple-string-p (x) (%prim-simple-string-p x))   ; compiled inline (compiler.lisp)
+(defun %prim-simple-string-p (x) (%prim-simple-string-p x))
+(defun %lowtag (x) (%lowtag x))   ; compiled inline (compiler.lisp)   ; compiled inline (compiler.lisp)
 (defun %prim-u8-vector-p (x) (%prim-u8-vector-p x))   ; compiled inline (compiler.lisp)
 (defun %prim-simple-vector-p (x) (%prim-simple-vector-p x))   ; compiled inline (compiler.lisp)
 (defun %raw-consp (x) (consp x))   ; image code: CONSP is the raw tag test
@@ -3589,6 +3590,18 @@
 
 (defun subseq (seq start &rest end-arg)
   "Return a subsequence from START to END (END defaults to length)."
+  ;; A simple string with fixnum bounds in range: the code words copied
+  ;; directly (the general path below asked LENGTH twice and the bulk-copy
+  ;; predicates; JSON-SIMPLE:PARSE spent a fifth of its time here).
+  (when (%prim-simple-string-p seq)
+    (let* ((n (array-length seq))
+           (end (if (and end-arg (car end-arg)) (car end-arg) n)))
+      (when (and (fixnump start) (fixnump end) (<= 0 start) (<= start end) (<= end n)
+                 (< (- end start) 64))
+        (let* ((len (- end start)) (r (%make-string-array len)) (i 0))
+          (loop (when (>= i len) (return-from subseq r))
+            (%word-aset r i (%word-aref seq (+ start i)))
+            (setq i (+ i 1)))))))
   ;; An EXPLICIT nil end (CL: (subseq s start nil)) means \"to the end\" —
   ;; same as omitting it.  Guarding on end-arg alone left end=NIL, which the
   ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates

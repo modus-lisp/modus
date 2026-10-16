@@ -165,7 +165,7 @@
        ;; DEFUN in this same PROGN replaced NAME first, so the original
        ;; captured was the wrapper itself and every call recursed.
        ;; Ordinary streams take the fast path: look at the stream argument
-       ;; and APPLY the original.  The DESTRUCTURING-BIND (optional and keyword
+       ;; and call the original.  The DESTRUCTURING-BIND (optional and keyword
        ;; parsing on every call) runs only for a Gray stream: done
        ;; unconditionally it made WRITE-CHAR to a string stream ~27 us once
        ;; Gray streams were installed, 200x the unwrapped call.
@@ -175,7 +175,19 @@
                       (declare (ignorable ,@(remove-if (lambda (x) (member x '(&optional &rest &key)))
                                                        (mapcar (lambda (x) (if (consp x) (car x) x)) lambda-list))))
                       ,gray-form)
-                    (apply ,orig args)))))))
+                    ;; FUNCALL for up to five arguments: APPLY's spread was
+                    ;; an eighth of JSON-SIMPLE:STRINGIFY's time.
+                    (let ((f ,orig))
+                      (cond ((null args) (funcall f))
+                            ((null (cdr args)) (funcall f (car args)))
+                            ((null (cddr args)) (funcall f (car args) (cadr args)))
+                            ((null (cdddr args)) (funcall f (car args) (cadr args) (caddr args)))
+                            ((null (cddddr args))
+                             (funcall f (car args) (cadr args) (caddr args) (cadddr args)))
+                            ((null (cdr (cddddr args)))
+                             (funcall f (car args) (cadr args) (caddr args) (cadddr args)
+                                      (car (cddddr args))))
+                            (t (apply f args))))))))))
 
 (defun %gray-eof (stream eof-error-p eof-value)
   (if eof-error-p (error 'end-of-file :stream stream) eof-value))

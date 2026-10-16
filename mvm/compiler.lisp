@@ -4088,14 +4088,28 @@
   ;; codes order like the characters); anything else takes the %CHAR2x
   ;; helper the defun itself uses.  The defuns are &REST, and every
   ;; (char= c #\a) of a parser loop cost a consed arglist and a call (83 ns
-  ;; vs SBCL's 2).  Other arities are left to the defun (no expansion).
+  ;; vs SBCL's 2).  Three arguments (not CHAR/=) are two such tests; other
+  ;; arities are left to the defun (no expansion).
   (dolist (e '(("CHAR=" eq nil %char2= nil) ("CHAR/=" eq t %char2= nil)
                ("CHAR<" < nil %char2< nil) ("CHAR>" > nil %char2< t)
                ("CHAR<=" <= nil %char2<= nil) ("CHAR>=" >= nil %char2<= t)))
     (let ((name (first e)) (op (second e)) (negate (third e))
           (slow (fourth e)) (swap (fifth e)))
       (mvm-define-macro name
-        (lambda (form)
+        (lambda (form) (block %char-cmp-expand
+          (when (and (member name '("CHAR<" "CHAR>" "CHAR<=" "CHAR>=" "CHAR=") :test #'string=)
+                     (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
+                     (null (cddddr form)))
+            ;; (char<= #\0 c #\9): two two-argument tests, every operand
+            ;; evaluated once and left to right (a literal or variable first
+            ;; operand is used as is).
+            (let* ((fa (cadr form))
+                   (a (if (or (symbolp fa) (characterp fa)) fa (%mvm-gensym "CA")))
+                   (m (%mvm-gensym "CM")) (z (%mvm-gensym "CZ")))
+              (return-from %char-cmp-expand
+                `(let (,@(unless (eq a fa) (list (list a fa)))
+                       (,m ,(caddr form)) (,z ,(cadddr form)))
+                   (and (,(car form) ,a ,m) (,(car form) ,m ,z))))))
           (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
               ;; A variable or a literal operand is used as is (no LET, so
               ;; the whole test stays in branch form -- %COMPILE-TEST-BRANCH);
@@ -4115,7 +4129,7 @@
                      (binds (append (unless (eq a fa) (list (list a fa)))
                                     (unless (eq b fb) (list (list b fb))))))
                 (if binds `(let ,binds ,body) body))
-              form)))))
+              form))))))
 
   ;; (FLOOR A B): two fixnums divide inline (%FIXNUM-TRUNCATE2, then the
   ;; toward-minus-infinity adjustment); anything else calls %FLOOR2, the
@@ -8461,6 +8475,12 @@
       ((= op-name #.(compute-name-hash "%RAW-CONSP"))
        (compile-form (cadr form) env dest)
        (emit-ir :consp dest dest))
+      ;; %LOWTAG: the low four tag bits of any value, as a fixnum (the
+      ;; :OBJ-TAG op).  (LOGAND X 15) of a non-fixnum is a GENERIC-LOGAND
+      ;; call.
+      ((and (= op-name #.(compute-name-hash "%LOWTAG")) (consp (cdr form)))
+       (compile-form (cadr form) env dest)
+       (emit-ir :obj-tag dest dest))
       ;; %MDA-P is a two-test predicate written as a six-arm COND, and it is
       ;; called 77 times from the sequence, string and array paths -- on a
       ;; scalar benchmark it billed ~9% of everything the printer and reader

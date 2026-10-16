@@ -3186,9 +3186,12 @@
           ((eq (car a) :allow-other-keys) nil)
           (t (unless allow-other-keys (%signal-program-error))))
         (setq a (cddr a))))
-    (let ((s (%make-string-array size)))
-      (dotimes (i size) (aset s i ch))
-      s)))
+    (let ((s (%make-string-array size)) (i 0))
+      ;; The fresh array is a plain #x31 string: store the code words
+      ;; directly (ASET dispatched on the array type per character).
+      (loop (when (>= i size) (return s))
+        (%word-aset s i ch)
+        (setq i (+ i 1))))))
 
 
 ;;; Numeric

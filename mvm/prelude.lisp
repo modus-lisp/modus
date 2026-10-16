@@ -921,6 +921,10 @@
               (setq i (+ i 1))))
           nil))))
 
+(defun %svref-slow (a i)
+  "SVREF of anything but a plain simple vector: the generic AREF."
+  (aref a i))
+
 (defun %simple-string= (a b)
   "Two plain #x31 strings with the same characters: lengths, then the code
    words.  (STRING= parses keywords and string designators first.)"

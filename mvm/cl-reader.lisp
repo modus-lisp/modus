@@ -1225,7 +1225,7 @@
         ;; Leading colon — keyword
         ((= colon-pos 0)
          (let ((kw-name (%substring name-str 1 len)))
-           (intern kw-name (find-package "KEYWORD"))))
+           (intern kw-name (%keyword-package))))
         ;; Package qualifier
         (t
          (let ((pkg-name (%substring name-str 0 colon-pos))
@@ -1477,15 +1477,15 @@
   "Coerce X to a keyword symbol if it's a non-keyword symbol/string.
    Used by #S to handle unkeyworded slot names like (a x b y)."
   (cond
-    ((null x) (intern "NIL" (find-package "KEYWORD")))
-    ((eq x t) (intern "T" (find-package "KEYWORD")))
-    ((characterp x) (intern (string x) (find-package "KEYWORD")))
-    ((stringp x) (intern x (find-package "KEYWORD")))
+    ((null x) (intern "NIL" (%keyword-package)))
+    ((eq x t) (intern "T" (%keyword-package)))
+    ((characterp x) (intern (string x) (%keyword-package)))
+    ((stringp x) (intern x (%keyword-package)))
     ((symbolp x)
      (let ((pkg (symbol-package x)))
        (if (and pkg (string= (package-name pkg) "KEYWORD"))
            x
-           (intern (symbol-name x) (find-package "KEYWORD")))))
+           (intern (symbol-name x) (%keyword-package)))))
     (t x)))
 
 (defun %build-sharp-s (form)

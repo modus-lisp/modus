@@ -740,7 +740,7 @@
              (when (null cur) (return nil))
              (%print-char 32 stream)   ; space
              ;; slot keyword — intern :SLOTNAME in the KEYWORD package
-             (let ((kw (intern (symbol-name (car cur)) (find-package "KEYWORD"))))
+             (let ((kw (intern (symbol-name (car cur)) (%keyword-package))))
                (%write-obj kw stream level escape))
              (%print-char 32 stream)
              (%write-obj (aref obj (+ 2 i)) stream

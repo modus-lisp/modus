@@ -37,6 +37,13 @@
       nil))
 
 (defun %pkg-data (pkg) (cdr pkg))
+;; FIND-PACKAGE's memo for SYMBOL designators: ((symbol . package) ...),
+;; dropped whenever any package's name or nicknames change.  (:KEYWORD-style
+;; designators are the common case, and each lookup paid STRING-EQUAL against
+;; "CL-TEST", a name hash and a verifying STRING-EQUAL: 1.7 us per
+;; FIND-SYMBOL.)
+(defvar *%find-package-cache* nil)
+
 (defun %pkg-name (pkg) (aref (%pkg-data pkg) 0))
 (defun %pkg-nicknames (pkg) (aref (%pkg-data pkg) 1))
 (defun %pkg-internal (pkg) (aref (%pkg-data pkg) 2))
@@ -51,8 +58,12 @@
 ;;; and then writes `dev:dev-page-size' is unreadable without it.
 (defun %pkg-local-nicknames (pkg) (aref (%pkg-data pkg) 9))
 
-(defun %pkg-set-name (pkg v) (aset (%pkg-data pkg) 0 v))
-(defun %pkg-set-nicknames (pkg v) (aset (%pkg-data pkg) 1 v))
+(defun %pkg-set-name (pkg v)
+  (setq *%find-package-cache* nil)
+  (aset (%pkg-data pkg) 0 v))
+(defun %pkg-set-nicknames (pkg v)
+  (setq *%find-package-cache* nil)
+  (aset (%pkg-data pkg) 1 v))
 (defun %pkg-set-internal (pkg v) (aset (%pkg-data pkg) 2 v))
 (defun %pkg-set-external (pkg v) (aset (%pkg-data pkg) 3 v))
 (defun %pkg-set-use-list (pkg v) (aset (%pkg-data pkg) 4 v))
@@ -515,6 +526,28 @@
    which would regress if we polluted the nicknames slot."
   (cond
     ((%pkg-p name) name)
+    ((and name (symbolp name) (not *pkg-any-local-nicknames*)
+          (let ((c *%find-package-cache*) (hit nil))
+            (loop (unless (consp c) (return))
+              (when (eq (car (car c)) name) (setq hit (cdr (car c))) (return))
+              (setq c (cdr c)))
+            hit)))
+    ((and name (symbolp name) (not *pkg-any-local-nicknames*))
+     (let ((p (%find-package-uncached name)))
+       ;; Not CL-TEST: the gate image's alias for it is spliced in later.
+       (when (and p (< (%cache-length *%find-package-cache*) 64)
+                  (not (string-equal (symbol-name name) "CL-TEST")))
+         (setq *%find-package-cache*
+               (cons (cons name p) (if (consp *%find-package-cache*) *%find-package-cache* nil))))
+       p))
+    (t (%find-package-uncached name))))
+
+(defun %cache-length (c)
+  (let ((n 0)) (loop (unless (consp c) (return n)) (setq n (+ n 1)) (setq c (cdr c)))))
+
+(defun %find-package-uncached (name)
+  (cond
+    ((%pkg-p name) name)
     (t
      (let ((name-str (%pkg-string-designator name)))
        ;; Package-local nicknames win over global names (SBCL semantics): a
@@ -522,12 +555,12 @@
        ;; package, which is the whole point of the feature.
        (when *pkg-any-local-nicknames*
          (let ((local (%pkg-lookup-local-nickname name-str *package*)))
-           (when local (return-from find-package local))))
+           (when local (return-from %find-package-uncached local))))
        (when (and name-str
                   (string-equal name-str "CL-TEST")
                   (%cl-test-alias-installed-p))
          (let ((clu (find-package-1 "COMMON-LISP-USER")))
-           (when clu (return-from find-package clu))))
+           (when clu (return-from %find-package-uncached clu))))
        (find-package-1 name-str)))))
 
 (defun %pkg-name-or-nickname-p (pkg name-str)
@@ -865,7 +898,7 @@
     ((eq sym t) (find-package "COMMON-LISP"))
     ((%cl-sym-p sym) (%cl-sym-package sym))
     ((or (integerp sym) (consp sym) (characterp sym) (stringp sym)) nil)
-    ((= (obj-subtag sym) 83) (find-package "KEYWORD"))   ; #x53 keyword
+    ((= (obj-subtag sym) 83) (%keyword-package))   ; #x53 keyword
     (t nil)))
 
 (defun make-symbol (name)
@@ -925,7 +958,7 @@
             ;; A name never minted as a keyword (find-symbol.4) is absent
             ;; from the table → falls through to (values nil nil).
             (let ((kw-existing
-                    (and (eq pkg (find-package "KEYWORD"))
+                    (and (eq pkg (%keyword-package))
                          (let ((kt (mem-ref #x10000148 :u64)))
                            (and kt (gethash (compute-name-hash name-str) kt))))))
             (if kw-existing
@@ -1009,8 +1042,8 @@
                           ;; nothing and stay copy-free — copying on the hot
                           ;; found path would burn immortal arena per lookup.
                           (let ((name-str (copy-seq name-str)))
-                          (if (and (find-package "KEYWORD")
-                                   (eq pkg (find-package "KEYWORD")))
+                          (if (and (%keyword-package)
+                                   (eq pkg (%keyword-package)))
                               ;; Keyword package: route through %INTERN-KEYWORD
                               ;; so the resulting object is the same #x53 native
                               ;; keyword that compile-keyword's `:foo' literals
@@ -1759,6 +1792,14 @@
 
 (defvar *%keyword-package* nil)
 
+(defun %keyword-package ()
+  "The KEYWORD package, looked up once: the object never changes once it
+   exists, and (FIND-PACKAGE \"KEYWORD\") per call was 400 ns of every
+   KEYWORDP and FIND-SYMBOL.  (%PKG-P, not a NIL test: this can run before
+   globals are initialised, when the cell need not read as NIL.)"
+  (let ((c *%keyword-package*))
+    (if (%pkg-p c) c (setq *%keyword-package* (find-package "KEYWORD")))))
+
 (defun keywordp (x)
   "True if X is a keyword symbol.  CL-symbol path: package eq KEYWORD.
    Native path: object with subtag #x53 (allocated by %INTERN-KEYWORD)."
@@ -1766,8 +1807,7 @@
     ((%cl-sym-p x)
      ;; The KEYWORD package object never changes once it exists: look it
      ;; up once (FIND-PACKAGE per call was 400 ns of every KEYWORDP).
-     (let ((kw-pkg (or *%keyword-package*
-                       (setq *%keyword-package* (find-package "KEYWORD")))))
+     (let ((kw-pkg (%keyword-package)))
        (and kw-pkg (eq (%cl-sym-package x) kw-pkg))))
     ((or (null x) (eq x t)) nil)
     ((or (integerp x) (consp x) (characterp x) (stringp x)) nil)

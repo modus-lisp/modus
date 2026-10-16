@@ -4074,7 +4074,7 @@
             `(let ((,tmp ,(cadr form)))
                (if (fixnump ,tmp)
                    (if (< ,tmp 0)
-                       (if (eql ,tmp most-negative-fixnum) (generic-negate-int ,tmp) (- 0 ,tmp))
+                       (if (eql ,tmp ,(- (+ +fixnum-max+ 1))) (generic-negate-int ,tmp) (- 0 ,tmp))
                        ,tmp)
                (if (%complex-p ,tmp)
                    (%complex-abs ,tmp)
@@ -4186,7 +4186,12 @@
     (lambda (form)
       (let ((n (cadr form))
             (val-form (caddr form)))
-        `(nth ,n (multiple-value-list ,val-form)))))
+        ;; A literal index binds the values instead of consing their list
+        ;; (MOD's and FLOOR's remainder, GETHASH's present-p).
+        (if (and (integerp n) (<= 0 n 7))
+            (let ((vars (loop for i from 0 to n collect (%mvm-gensym "NV"))))
+              `(multiple-value-bind ,vars ,val-form ,(car (last vars))))
+            `(nth ,n (multiple-value-list ,val-form))))))
 
   ;; MULTIPLE-VALUE-CALL → (apply FN (append (multiple-value-list f1) ...))
   ;; Modus had no compile handler for this standard special operator, so
@@ -8400,6 +8405,18 @@
        (compile-aref-form (cons 'aref (cdr form)) env dest))
       ((= op-name 28329323)  ; SVREF
        (cond
+         ;; A simple vector first, with the raw word load; anything else
+         ;; takes %SVREF-SLOW (the generic AREF, compiled once there).  The
+         ;; inline AREF chain tested for a string first and was ~300 bytes
+         ;; at every SVREF.
+         ((and (= (length (cdr form)) 2) (not *compile-plain-arrays*)
+               (not (%declared-generic-array-var-p (cadr form) env)))
+          (let ((a (%mvm-gensym "SVA")) (i (%mvm-gensym "SVI")))
+            (compile-form `(let ((,a ,(cadr form)) (,i ,(caddr form)))
+                             (if (%prim-simple-vector-p ,a)
+                                 (%word-aref ,a ,i)
+                                 (%svref-slow ,a ,i)))
+                          env dest)))
          ((= (length (cdr form)) 2) (compile-aref-form form env dest))
          (t (compile-arity-error env dest))))
       ((= op-name 273235092)             (compile-aset-form form env dest))  ; ASET
@@ -8946,13 +8963,42 @@
        ;; An inline template (root load, SVREFs, EQLs) was measured first:
        ;; it grew the i386 image's native code 43 -> 66 MB and made runtime
        ;; compilation slower.
-       (emit-li-tagged +vreg-v0+ idx)
-       (emit-li-tagged +vreg-v1+ h)
-       (emit-li-tagged +vreg-v2+ ph)
-       (when *mvm-emit-halves* (emit-ir :set-nargs 3))
-       (emit-ir :call "%STATIC-SYMBOL-REF" 3)
-       (unless (= dest +vreg-vr+)
-         (emit-ir :mov dest +vreg-vr+))))
+       ;; FILLED SLOT INLINE (2026-10-16).  The call was a tenth of the
+       ;; samples in GETHASH, FORMAT, CONCATENATE and VECTOR-PUSH-EXTEND
+       ;; profiles: every quoted symbol and type name in image code paid a
+       ;; three-argument call.  The site now loads the vector at #x10000FB0
+       ;; and the slot itself, and only an empty vector or slot (both a raw
+       ;; fixnum 0) takes the call, parked after the RET.  One temp holds the
+       ;; vector and DEST the index (the register shape %COMPILE-GLOBAL-READ-
+       ;; CACHED uses: x64's AREF with the vector in DEST = RAX overwrote the
+       ;; vector with the scaled index); the miss arm is the old site exactly.
+       (let ((miss (make-compiler-label)) (done (make-compiler-label))
+             (vec (alloc-temp-reg)))
+         (emit-li-tagged vec (conv-real #x10000FB0))
+         (emit-ir :shr vec vec +fixnum-shift+)
+         (emit-ir :load vec vec (%tls-width (car (memory-width-code :u64)) #x10000FB0))
+         (emit-ir :test-imm vec 1)
+         (emit-ir :beq miss)
+         (if (%obj-slot-imm-p idx)
+             (emit-ir :obj-ref dest vec idx)
+             (progn (emit-li-tagged dest idx)
+                    (emit-ir :aref dest vec dest)))
+         (emit-ir :cmp-imm dest 0)
+         (emit-ir :beq miss)
+         (emit-ir :set-mv-count 1)
+         (emit-ir-label done)
+         (free-temp-reg)
+         (emit-deferred-tail
+          (lambda ()
+            (emit-ir-label miss)
+            (emit-li-tagged +vreg-v0+ idx)
+            (emit-li-tagged +vreg-v1+ h)
+            (emit-li-tagged +vreg-v2+ ph)
+            (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+            (emit-ir :call "%STATIC-SYMBOL-REF" 3)
+            (unless (= dest +vreg-vr+)
+              (emit-ir :mov dest +vreg-vr+))
+            (emit-ir :br done))))))
     ((symbolp value)
      (let* ((pkg (symbol-package value))
             (pkg-name (and pkg (package-name pkg)))
@@ -9791,6 +9837,74 @@
     (emit-ir :bne false-label)
     (free-temp-reg)))
 
+(defun %compile-compare-branch (branch-op a b env dest false-label)
+  "COMPILE-COMPARE-2 in branch form: fall through when (A op B) holds, else
+   branch to FALSE-LABEL.  Two fixnums compare inline; anything else takes
+   the same %CHECKED-xx helper, parked after the RET.  A non-negative fixnum
+   literal B is compared as an immediate (one tag test, no temp)."
+  (let ((helper (cond ((eq branch-op :beq) "%CHECKED-EQ") ((eq branch-op :blt) "%CHECKED-LT")
+                      ((eq branch-op :bgt) "%CHECKED-GT") ((eq branch-op :ble) "%CHECKED-LE")
+                      (t "%CHECKED-GE")))
+        (slow (make-compiler-label)) (through (make-compiler-label)))
+    (if (and (integerp b) (%test-literal-word b))
+        (progn
+          (compile-form a env dest)
+          (unless (%expr-width a env)
+            (emit-ir :test-imm dest 1)
+            (emit-ir :bne slow))
+          (emit-ir :cmp-imm dest (%test-literal-word b))
+          (emit-ir (%inverse-branch branch-op) false-label)
+          (emit-ir-label through)
+          (emit-deferred-tail
+           (lambda ()
+             (emit-ir-label slow)
+             (emit-ir :mov +vreg-v0+ dest)
+             (emit-li-tagged +vreg-v1+ b)
+             (emit-ir :set-nargs 2)
+             (emit-ir :call helper 2)
+             (emit-ir :bnull +vreg-vr+ false-label)
+             (emit-ir :br through))))
+        (let ((a-temp nil) (tag-temp nil))
+          (if (%temps-must-spill-p 2)
+              (progn
+                (compile-form a env dest)
+                (emit-ir :push dest)
+                (compile-form b env dest)
+                (setf a-temp (alloc-temp-reg))
+                (setf tag-temp (alloc-temp-reg))
+                (emit-ir :mov a-temp dest)
+                (emit-ir :pop dest))
+              (progn
+                (setf a-temp (alloc-temp-reg))
+                (setf tag-temp (alloc-temp-reg))
+                (compile-form a env dest)
+                (if (and (%leaf-operand-p b env)
+                         (or (/= dest +vreg-vr+) (< a-temp (+ +vreg-v4+ 5))))
+                    (compile-form b env a-temp)
+                    (progn
+                      (emit-ir :push dest)
+                      (compile-form b env a-temp)
+                      (emit-ir :pop dest)))))
+          (unless (and (%expr-width a env) (%expr-width b env))
+            (emit-ir :or tag-temp dest a-temp)
+            (emit-ir :test-imm tag-temp 1)
+            (emit-ir :bne slow))
+          (emit-ir :cmp dest a-temp)
+          (emit-ir (%inverse-branch branch-op) false-label)
+          (emit-ir-label through)
+          (let ((at a-temp))
+            (emit-deferred-tail
+             (lambda ()
+               (emit-ir-label slow)
+               (emit-ir :mov +vreg-v0+ dest)
+               (emit-ir :mov +vreg-v1+ at)
+               (emit-ir :set-nargs 2)
+               (emit-ir :call helper 2)
+               (emit-ir :bnull +vreg-vr+ false-label)
+               (emit-ir :br through))))
+          (free-temp-reg)
+          (free-temp-reg)))))
+
 (defun %compile-predicate-branch (test env dest false-label)
   "Branch-mode emission for the predicate TEST (already macroexpanded), or
    NIL when it is not one this knows."
@@ -9831,6 +9945,15 @@
          (%compile-subtype-branch (car args) env dest +subtag-bignum+ false-label) t)
         ((and one (is "RATIOP"))
          (%compile-subtype-branch (car args) env dest +subtag-ratio+ false-label) t)
+        ((and two (assoc (symbol-name op) *fused-compare-ops* :test #'string=)
+              (not (string= (symbol-name op) "/="))
+              ;; COMPILE-COMPARE-2's typed-float path stays a value
+              (not (and *mvm-eval-runtime-p*
+                        (or (%expr-double-float-p (car args) env) (%expr-single-float-p (car args) env)
+                            (%expr-double-float-p (cadr args) env) (%expr-single-float-p (cadr args) env)))))
+         (%compile-compare-branch (cdr (assoc (symbol-name op) *fused-compare-ops* :test #'string=))
+                                  (car args) (cadr args) env dest false-label)
+         t)
         ((and two (is "EQ"))
          (%compile-eq-branch (car args) (cadr args) env dest false-label) t)
         ((and two (is "EQL")
@@ -20171,13 +20294,15 @@
     (let ((n-sym (%mvm-gensym "MN"))
           (d-sym (%mvm-gensym "MD"))
           (r-sym (%mvm-gensym "MR")))
+      ;; MULTIPLE-VALUE-BIND, not NTH-VALUE (which conses the value list),
+      ;; and the sign test as branches, not two materialized booleans.
       (compile-form
         `(let* ((,n-sym ,a)
-                (,d-sym ,b)
-                (,r-sym (nth-value 1 (truncate ,n-sym ,d-sym))))
-           (if (and (not (zerop ,r-sym)) (not (eq (< ,r-sym 0) (< ,d-sym 0))))
-               (+ ,r-sym ,d-sym)
-               ,r-sym))
+                (,d-sym ,b))
+           (multiple-value-bind (,(%mvm-gensym "MQ") ,r-sym) (truncate ,n-sym ,d-sym)
+             (if (and (not (zerop ,r-sym)) (if (< ,d-sym 0) (> ,r-sym 0) (< ,r-sym 0)))
+                 (+ ,r-sym ,d-sym)
+                 ,r-sym)))
         env dest))))
 
 ;;; ============================================================
@@ -23513,29 +23638,32 @@
          (len (if own (alloc-temp-reg) dest))
          (ok (make-compiler-label))
          (bad (make-compiler-label)))
-    (emit-ir :li len 0)
-    (emit-ir :cmp idx-reg len)
+    ;; The failure arm is parked after the RET (EMIT-DEFERRED-TAIL): the
+    ;; access falls straight through, and the zero bound is an immediate.
+    (emit-ir :cmp-imm idx-reg 0)
     (emit-ir :blt bad)
     (emit-ir :array-len len arr-reg)
     (emit-ir :cmp idx-reg len)
-    (emit-ir :blt ok)
-    (emit-ir-label bad)
-    (when (> save-count 1)
-      (let ((r (+ +vreg-v4+ 1)))
-        (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
-          (unless (= r dest) (emit-ir :push r))
-          (setq r (+ r 1)))))
-    (emit-ir :mov +vreg-v0+ arr-reg)
-    (emit-ir :mov +vreg-v1+ idx-reg)
-    (emit-ir :set-nargs 2)
-    (emit-ir :call "%AREF-INDEX-ERROR" 2)
-    (emit-ir :mov dest +vreg-vr+)
-    (when (> save-count 1)
-      (let ((r (+ +vreg-v4+ save-count -1)))
-        (loop (when (< r (+ +vreg-v4+ 1)) (return))
-          (unless (= r dest) (emit-ir :pop r))
-          (setq r (- r 1)))))
-    (emit-ir :br skip)
+    (emit-ir :bge bad)
+    (emit-deferred-tail
+     (lambda ()
+       (emit-ir-label bad)
+       (when (> save-count 1)
+         (let ((r (+ +vreg-v4+ 1)))
+           (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+             (unless (= r dest) (emit-ir :push r))
+             (setq r (+ r 1)))))
+       (emit-ir :mov +vreg-v0+ arr-reg)
+       (emit-ir :mov +vreg-v1+ idx-reg)
+       (emit-ir :set-nargs 2)
+       (emit-ir :call "%AREF-INDEX-ERROR" 2)
+       (emit-ir :mov dest +vreg-vr+)
+       (when (> save-count 1)
+         (let ((r (+ +vreg-v4+ save-count -1)))
+           (loop (when (< r (+ +vreg-v4+ 1)) (return))
+             (unless (= r dest) (emit-ir :pop r))
+             (setq r (- r 1)))))
+       (emit-ir :br skip)))
     (emit-ir-label ok)
     (when own (free-temp-reg))))
 

@@ -6294,7 +6294,9 @@
   (cond
     ;; a bit array is only "adjustable" when it carries a fill pointer or a
     ;; displacement: every bit-vector is an MDA, and a plain one is simple
-    ((%mda-p a) (if (%mda-bit-p a) (or (%mda-fp a) (%mda-displaced a) nil) t))
+    ((%mda-p a) (if (%mda-bit-p a)
+                    (if (or (%mda-fp a) (%mda-displaced a) (eq (%mda-offset a) :adjustable)) t nil)
+                    t))
     ((and (consp a) (eql (car a) 8765432)) t)
     ;; multi-dim wrapper or fp/displaced wrapper — treat as array
     ((and (consp a) (eql (car a) 9867654)) nil)
@@ -6310,7 +6312,9 @@
   "Return (values displaced-to displaced-index-offset) or (values nil 0)."
   ;; Native MDA: read displaced-to + offset from header slots.
   (cond
-    ((%mda-p a) (values (%mda-displaced a) (%mda-offset a)))
+    ((%mda-p a) (if (%mda-displaced a)
+                    (values (%mda-displaced a) (%mda-offset a))
+                    (values nil 0)))
     (t (let ((a (%unadj a)))
          (if (and (consp a) (consp (car a)))
              (values (cdr a) (cdr (car a)))
@@ -6528,6 +6532,9 @@
   "NEW-DATA as A's store: packed again when A is a BIT array."
   (if (and new-data (%mda-bit-p a)) (%pack-bits new-data n) new-data))
 
+(defvar *%bit-adjust-in-place* nil
+  "Bound to T while ADJUST-ARRAY adjusts an :ADJUSTABLE bit array in place.")
+
 (defun %copy-bit-array (a)
   "A fresh, undisplaced bit array with A's dimensions, fill pointer and
    elements."
@@ -6559,8 +6566,21 @@
   ;; A bit array that is not adjustable (no fill pointer, not displaced):
   ;; CLHS returns a NEW array and leaves A alone; the MDA paths below
   ;; resize in place, so give them a copy.
-  (when (and (%mda-p a) (%mda-bit-p a) (not (adjustable-array-p a)))
+  (when (and (%mda-p a) (%mda-bit-p a) (not *%bit-adjust-in-place*)
+             (not (adjustable-array-p a)))
     (setq a (%copy-bit-array a)))
+  (when (and (%mda-p a) (%mda-bit-p a) (eq (%mda-offset a) :adjustable))
+    ;; adjust in place, then put the adjustable mark back (the paths below
+    ;; treat the offset slot as a displacement offset)
+    (%prim-aset a 4 0)
+    ;; SETQ + UNWIND-PROTECT, not a LET: a compiled LET of a special is not a
+    ;; reliable dynamic binding in image code
+    (let ((r (progn
+               (setq *%bit-adjust-in-place* t)
+               (unwind-protect (apply (function adjust-array) a new-size args)
+                 (setq *%bit-adjust-in-place* nil)))))
+      (when (and (%mda-p r) (null (%mda-displaced r))) (%prim-aset r 4 :adjustable))
+      (return-from adjust-array r)))
   (when (and (%mda-p a) (consp new-size) (consp (cdr new-size))
              (>= (%mda-rank a) 2)
              (not (member :displaced-to args)))

@@ -4649,7 +4649,7 @@
             (setq i (+ i 1)))
           (%prim-aset vector 6 store)
           (%prim-aset vector 3 nil)
-          (%prim-aset vector 4 0)
+          (%prim-aset vector 4 :adjustable)
           (%prim-aset vector 1 (list new-cap))))
       (aset vector fp new-element)
       (%mda-set-fp vector (+ fp 1))
@@ -5673,7 +5673,9 @@
           (bit-elt
            (if disp
                (%alloc-mda rank dim-list fp disp off 'bit disp)
-               (%alloc-mda rank dim-list fp nil off 'bit
+               ;; :ADJUSTABLE T without a displacement is recorded in the
+               ;; (otherwise unused) offset slot: ADJUSTABLE-ARRAY-P reads it
+               (%alloc-mda rank dim-list fp nil (if adj :adjustable off) 'bit
                            (if ic-p (%pack-bits data total) data))))
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp)

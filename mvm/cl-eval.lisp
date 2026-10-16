@@ -3006,7 +3006,7 @@
               (v (make-array (length (cdr sl))))
               (i 0))
     (declare (type simple-vector v))
-         (dolist (l (cdr sl)) (aset v i l) (setq i (+ i 1)))
+         (dolist (l (cdr sl)) (aset v i l) (setq i (%fixnum-+ i 1)))
          (values (car sl) v 0 (%mag-trim v 0 (length v)))))))
 
 (defun %mag-to-int (sign v off len)
@@ -3023,7 +3023,7 @@
            (aset arr 1 len)
            (loop (when (>= i len) (return nil))
              (aset arr (+ 2 i) (aref v (+ off i)))
-             (setq i (+ i 1)))
+             (setq i (%fixnum-+ i 1)))
            (aset b 0 +bn-sentinel+)
            (aset b 1 arr)
            b)))))
@@ -3038,7 +3038,7 @@
                (let ((a (aref av (+ ao i))) (b (aref bv (+ bo i))))
                  (when (> a b) (return 1))
                  (when (< a b) (return -1)))
-               (setq i (- i 1)))))))
+               (setq i (%fixnum-- i 1)))))))
 
 (defun %mag-add (av ao al bv bo bl)
   "(values OUT LEN): the magnitude sum, OUT fresh at offset 0."
@@ -3053,7 +3053,7 @@
         ;; a tagged add wraps negative exactly when the sum reaches 2^limb-bits
         (aset out i (logand s +fixnum-max+))
         (setq carry (if (< s 0) 1 0)))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (aset out al carry)
     (values out (if (= carry 0) al (+ al 1)))))
 
@@ -3068,7 +3068,7 @@
         (if (< d 0)
             (progn (aset out i (logand d +fixnum-max+)) (setq borrow 1))
             (progn (aset out i d) (setq borrow 0))))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (values out (%mag-trim out 0 al))))
 
 ;;; ---- half-limb digits ----
@@ -3083,7 +3083,7 @@
       (let ((l (aref v (+ off i))))
         (aset d (* 2 i) (logand l +half-limb-mask+))
         (aset d (+ (* 2 i) 1) (ash l +neg-half-limb-bits+)))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (values d (%mag-trim d 0 n))))
 
 (defun %digits-to-int (sign d n)
@@ -3095,7 +3095,7 @@
       (let ((lo (aref d (* 2 i)))
             (hi (if (< (+ (* 2 i) 1) n) (aref d (+ (* 2 i) 1)) 0)))
         (aset v i (%fixnum-+ lo (%fixnum-* hi (%fixnum-+ +half-limb-mask+ 1)))))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (%mag-to-int sign v 0 len)))
 
 (defun %digits-mul (a na b nb)
@@ -3114,10 +3114,10 @@
                 (declare (fixnum tt))
                 (aset out k (logand tt +half-limb-mask+))
                 (setq carry (ash tt +neg-half-limb-bits+)))
-              (setq j (+ j 1))
-              (setq k (+ k 1)))
+              (setq j (%fixnum-+ j 1))
+              (setq k (%fixnum-+ k 1)))
             (aset out k carry))))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (values out (%mag-trim out 0 (+ na nb)))))
 
 ;;; ---- Karatsuba (above +KARATSUBA-DIGITS+ digits on both sides) ----
@@ -3134,7 +3134,7 @@
     (declare (type simple-vector w))
     (loop (when (>= i len) (return nil))
       (aset w i (aref v (+ off i)))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (values w (%mag-trim w 0 len))))
 
 (defun %dadd (a na b nb)
@@ -3147,7 +3147,7 @@
       (let ((tt (%fixnum-+ (%fixnum-+ (aref a i) (if (< i nb) (aref b i) 0)) c)))
         (aset out i (logand tt +half-limb-mask+))
         (setq c (ash tt +neg-half-limb-bits+)))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (aset out na c)
     (values out (%mag-trim out 0 (+ na 1)))))
 
@@ -3159,7 +3159,7 @@
       (let ((tt (%fixnum-+ (%fixnum-- (aref a i) (if (< i nb) (aref b i) 0)) c)))
         (aset a i (logand tt +half-limb-mask+))
         (setq c (ash tt +neg-half-limb-bits+)))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (%mag-trim a 0 na)))
 
 (defun %dadd-at (out on v n shift)
@@ -3170,8 +3170,8 @@
       (let ((tt (%fixnum-+ (%fixnum-+ (aref out k) (if (< i n) (aref v i) 0)) c)))
         (aset out k (logand tt +half-limb-mask+))
         (setq c (ash tt +neg-half-limb-bits+)))
-      (setq i (+ i 1))
-      (setq k (+ k 1)))
+      (setq i (%fixnum-+ i 1))
+      (setq k (%fixnum-+ k 1)))
     (%mag-trim out 0 (max on k))))
 
 (defun %digits-kmul (a na b nb)
@@ -3221,7 +3221,7 @@
              (qd (truncate num v)))
         (aset q i qd)
         (setq r (%fixnum-- num (%fixnum-* qd v))))
-      (setq i (- i 1)))
+      (setq i (%fixnum-- i 1)))
     (values q r)))
 
 (defun %digits-divmod (u0 m+n v0 n)
@@ -3241,14 +3241,14 @@
         (let ((p (%fixnum-+ (%fixnum-* (aref u0 i) d) carry)))
           (aset u i (logand p +half-limb-mask+))
           (setq carry (ash p +neg-half-limb-bits+)))
-        (setq i (+ i 1)))
+        (setq i (%fixnum-+ i 1)))
       (aset u m+n carry))
     (let ((carry 0) (i 0))
       (loop (when (>= i n) (return nil))
         (let ((p (%fixnum-+ (%fixnum-* (aref v0 i) d) carry)))
           (aset v i (logand p +half-limb-mask+))
           (setq carry (ash p +neg-half-limb-bits+)))
-        (setq i (+ i 1))))
+        (setq i (%fixnum-+ i 1))))
     (let ((vtop (aref v (- n 1))) (vnext (aref v (- n 2))) (j m))
       (loop (when (< j 0) (return nil))
         ;; D3: QHAT from the top two digits, corrected against the third
@@ -3271,8 +3271,8 @@
               (let ((tt (%fixnum-+ (%fixnum-- (aref u k) (%fixnum-* qhat (aref v i))) c)))
                 (aset u k (logand tt +half-limb-mask+))
                 (setq c (ash tt +neg-half-limb-bits+)))
-              (setq i (+ i 1))
-              (setq k (+ k 1)))
+              (setq i (%fixnum-+ i 1))
+              (setq k (%fixnum-+ k 1)))
             (let ((tt (%fixnum-+ (aref u (+ j n)) c)))
               (if (>= tt 0)
                   (aset u (+ j n) tt)
@@ -3284,10 +3284,10 @@
                       (let ((s (%fixnum-+ (%fixnum-+ (aref u (+ k j)) (aref v k)) c)))
                         (aset u (+ k j) (logand s +half-limb-mask+))
                         (setq c (ash s +neg-half-limb-bits+)))
-                      (setq k (+ k 1)))
+                      (setq k (%fixnum-+ k 1)))
                     (aset u (+ j n) 0)))))
           (aset q j qhat))
-        (setq j (- j 1))))
+        (setq j (%fixnum-- j 1))))
     ;; D8: the remainder is U[0..n-1] / D
     (multiple-value-bind (r rr) (%digits-divmod-1 u n d)
       (declare (ignore rr))
@@ -3331,7 +3331,7 @@
         (aset out i (%fixnum-+ (logand p1 +half-limb-mask+)
                                (%fixnum-* (logand p2 +half-limb-mask+) base)))
         (setq carry (ash p2 +neg-half-limb-bits+)))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (aset out len carry)
     (values out (if (= carry 0) len (+ len 1)))))
 
@@ -3351,7 +3351,7 @@
              (q2 (truncate n2 d)))
         (setq r (%fixnum-- n2 (%fixnum-* q2 d)))
         (aset out i (%fixnum-+ q2 (%fixnum-* q1 base))))
-      (setq i (- i 1)))
+      (setq i (%fixnum-- i 1)))
     (values out (%mag-trim out 0 len) r)))
 
 ;;; ---- the integer operations ----
@@ -3408,7 +3408,7 @@
 (defun %pow2-small (b)
   "2^B for 0 <= B <= +half-limb-bits+, by doubling (no variable-count ASH)."
   (let ((p 1) (i 0))
-    (loop (when (>= i b) (return p)) (setq p (%fixnum-+ p p)) (setq i (+ i 1)))))
+    (loop (when (>= i b) (return p)) (setq p (%fixnum-+ p p)) (setq i (%fixnum-+ i 1)))))
 
 (defun %int-shl-mag (a count)
   "|A| * 2^COUNT, COUNT >= 0, with A's sign."
@@ -3426,7 +3426,7 @@
               (let ((x (%fixnum-+ (%fixnum-* (aref d i) p) carry)))   ; < B^2
                 (aset out (+ i whole) (logand x +half-limb-mask+))
                 (setq carry (ash x +neg-half-limb-bits+)))
-              (setq i (+ i 1)))
+              (setq i (%fixnum-+ i 1)))
             (aset out (+ n whole) carry)
             (%digits-to-int as out (+ n whole 1)))))))
 
@@ -3448,7 +3448,7 @@
                   ;; digits dropped whole
                   (loop (when (or (>= i whole) lost) (return nil))
                     (unless (= (aref d i) 0) (setq lost t))
-                    (setq i (+ i 1)))
+                    (setq i (%fixnum-+ i 1)))
                   ;; d[k] >> bits = (d[k] * 2^(H-bits)) >> H; the low H bits of
                   ;; that product are what moves into the digit below
                   (setq i 0)
@@ -3459,7 +3459,7 @@
                           (aset out (- i 1) (%fixnum-+ (aref out (- i 1))
                                                        (logand x +half-limb-mask+)))
                           (unless (= (logand x +half-limb-mask+) 0) (setq lost t))))
-                    (setq i (+ i 1)))
+                    (setq i (%fixnum-+ i 1)))
                   (let ((r (%digits-to-int as out nn)))
                     (if (and (= as -1) lost) (%int-add r -1) r)))))))))
 
@@ -3475,7 +3475,7 @@
       (let ((chunk base) (k 1) (out nil))
         (loop (when (> (%fixnum-* chunk base) +half-limb-mask+) (return nil))
           (setq chunk (%fixnum-* chunk base))
-          (setq k (+ k 1)))
+          (setq k (%fixnum-+ k 1)))
         (loop (when (<= un 0) (return nil))
           (multiple-value-bind (q r) (%digits-divmod-1 u un chunk)
             (setq u q)
@@ -3485,7 +3485,7 @@
                 (let ((qq (truncate r base)))
                   (setq out (cons (%digit-char-upper (%fixnum-- r (%fixnum-* qq base))) out))
                   (setq r qq))
-                (setq j (+ j 1))))))
+                (setq j (%fixnum-+ j 1))))))
         ;; the top chunk was padded to K digits
         (loop (when (or (null out) (null (cdr out)) (not (= (car out) 48))) (return nil))
           (setq out (cdr out)))
@@ -3544,7 +3544,7 @@
                            (%fixnum-* y (if (< i nb) (aref b i) 0)))))
         (aset out i (logand tt +half-limb-mask+))
         (setq carry (ash tt +neg-half-limb-bits+)))
-      (setq i (+ i 1)))
+      (setq i (%fixnum-+ i 1)))
     (aset out n carry)
     (%mag-trim out 0 (+ n 1))))
 

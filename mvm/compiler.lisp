@@ -22997,6 +22997,11 @@
                             (and w wc (max w wc))))))))
          ((string= op "THE")
           (and (consp args) (consp (cdr args)) (%decl-int-width (car args))))
+         ;; The raw fixnum ops: a tagged-word add/sub/mul of fixnums yields a
+         ;; tagged word -- a fixnum, whatever it wrapped to.  Tag-safe, at
+         ;; the full width (so never trusted not to overflow further).
+         ((or (string= op "%FIXNUM-+") (string= op "%FIXNUM--") (string= op "%FIXNUM-*"))
+          +fixnum-signed-bits+)
          (t nil))))))
 
 (defun %arith-chain-width (trust)

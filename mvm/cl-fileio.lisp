@@ -677,6 +677,9 @@
            (when (>= fd 0)
              ;; Flush output buffer if needed
              (%fs-flush stream)
+             (when (member stream *fs-buffered-streams* :test (function eq))
+               (setq *fs-buffered-streams*
+                     (remove stream *fs-buffered-streams* :test (function eq))))
              (%sys-close fd)
              ;; Mark as closed by setting fd to -1
              (set-car (%stream-data stream) -1)
@@ -685,17 +688,83 @@
          (%mark-stream-closed stream)))))
   t)
 
-;;; Flush any pending output to file
+;;; BUFFERED FILE OUTPUT.  Every byte written to a file used to be its own
+;;; write(2) -- an 18 KB PRINT was 18k system calls (cl-bench FPRINT, 54x
+;;; SBCL).  An OUTPUT-ONLY stream on a regular fd (> 2, not a cabinet file)
+;;; now collects bytes in its 4 KB buffer (unused by an output stream; BLEN is
+;;; the pending count) and writes them when it fills, on FINISH-OUTPUT /
+;;; FORCE-OUTPUT / CLOSE, before a FILE-POSITION seek or FILE-LENGTH, and at
+;;; exit (%FS-FLUSH-ALL from SYS-EXIT).  stdin/stdout/stderr and io streams
+;;; stay unbuffered: diagnostics must appear at once and survive an exit that
+;;; skips the flush.
+(defvar *fs-buffered-streams* nil
+  "Output streams that have buffered bytes at some point; %FS-FLUSH-ALL
+   walks them at exit.")
+
+(defun %fs-wbuf-eligible-p (stream fd)
+  "STREAM on FD may hold buffered output (an output-only regular file)."
+  (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd))))
+
+(defun %fs-wbuf-p (stream fd)
+  ;; Unarmed images only: a worker thread writing a file would put its stream
+  ;; on the global *FS-BUFFERED-STREAMS* -- a worker object in shared memory,
+  ;; which the runtime refuses (operandi's tool turn: "a thread stored one of
+  ;; its own objects into shared memory").  Threaded images write unbuffered,
+  ;; as before.
+  (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd))
+       (eql (mem-ref #x10000DB8 :u32) 0)))
+
+(defun %fs-put-byte (stream fd byte)
+  "Write one byte to file STREAM on FD, through its buffer when it has one."
+  (if (%fs-wbuf-p stream fd)
+      (let ((n (%fs-blen stream)))
+        (when (>= n 4096)
+          (%fs-flush stream)
+          (setq n 0))
+        (when (= n 0)
+          (unless (member stream *fs-buffered-streams* :test (function eq))
+            (setq *fs-buffered-streams* (cons stream *fs-buffered-streams*))))
+        (%prim-aset (%fs-buf stream) n byte)
+        (%fs-set-blen stream (+ n 1)))
+      (progn
+        ;; Bytes buffered before threads armed go out first, in order.
+        (when (and (%fs-wbuf-eligible-p stream fd) (> (%fs-blen stream) 0))
+          (%fs-flush stream))
+        (%sys-write-byte-1 fd byte))))
+
 (defun %fs-flush (stream)
-  "Flush output buffer for file stream."
+  "Write file STREAM's pending output bytes, if any."
   (when (streamp stream)
     (when (= (%stream-type stream) 9)
-      (let ((fd (%fs-fd stream))
-            (dir (%fs-dir stream)))
-        (when (and (>= fd 0) (> dir 0))
-          ;; For output, write pending data
-          ;; (currently we write char-by-char so nothing to flush)
-          nil)))))
+      (let ((fd (%fs-fd stream)))
+        (when (and (>= fd 0) (%fs-wbuf-eligible-p stream fd))
+          (let ((n (%fs-blen stream)))
+            (when (> n 0)
+              (let ((page (%fs-io-page)) (buf (%fs-buf stream)) (i 0))
+                (loop
+                  (when (>= i n) (return nil))
+                  (setf (mem-ref (+ page i) :u8) (%prim-aref buf i))
+                  (setq i (+ i 1)))
+                (let ((done 0))
+                  (loop
+                    (when (>= done n) (return nil))
+                    (let ((w (%sys-write-raw fd (+ page done) (- n done))))
+                      (if (<= w 0) (return nil) (setq done (+ done w)))))))
+              (%fs-set-blen stream 0))))))))
+
+(defun %flush-output-arg (s)
+  "FINISH-OUTPUT / FORCE-OUTPUT on S: flush a buffered file stream (a
+   synonym or broadcast stream reaches its file streams)."
+  (cond ((and (streamp s) (= (%stream-type s) 9)) (%fs-flush s))
+        ((and (streamp s) (= (%stream-type s) 5)) (dolist (x (%stream-data s)) (%flush-output-arg x)))
+        ((and (streamp s) (= (%stream-type s) 7))
+         (let ((tg (%stream-data s))) (when (and (symbolp tg) (boundp tg)) (%flush-output-arg (symbol-value tg)))))
+        (t nil)))
+
+(defun %fs-flush-all ()
+  "Flush every buffered output stream (exit)."
+  (dolist (s *fs-buffered-streams*) (%fs-flush s))
+  nil)
 
 ;;; --- File stream read-char ---
 ;;; UTF-8 ON CHARACTER FILE STREAMS.  :EXTERNAL-FORMAT was accepted and ignored
@@ -775,6 +844,34 @@
                       (%fs-set-blen stream n)
                       (%fs-read-byte-code stream)))))))))
 
+(defun %fs-read-line-fast (s)
+  "READ-LINE on file stream S straight out of its buffer: the line, when a
+   newline is buffered past the read position with only ASCII bytes before
+   it; else :SLOW, having consumed nothing (a line that crosses the buffer
+   end, or non-ASCII bytes that need UTF-8 decoding, take READ-LINE's
+   per-character path).  READ-LINE built every line from a READ-CHAR per
+   character, a cons per character, an NREVERSE and a copy (cl-bench
+   SLURP-LINES 42x SBCL)."
+  (let ((fd (%fs-fd s)))
+    (if (< fd 0)
+        :slow
+        (let* ((buf (%fs-buf s)) (bpos (%fs-bpos s)) (blen (%fs-blen s)) (j bpos))
+          (loop
+            (when (>= j blen) (return :slow))
+            (let ((b (%prim-aref buf j)))
+              (cond
+                ((= b 10)
+                 (let* ((n (- j bpos)) (str (%make-string-array n)) (k 0))
+                   (loop
+                     (when (>= k n) (return nil))
+                     (%prim-aset str k (%prim-aref buf (+ bpos k)))
+                     (setq k (+ k 1)))
+                   (%fs-set-bpos s (+ j 1))
+                   (%fs-set-pos s (+ (%fs-pos s) n 1))
+                   (return str)))
+                ((>= b 128) (return :slow))))
+            (setq j (+ j 1)))))))
+
 ;;; --- File stream write-char ---
 (defun %fs-write-char (code stream)
   "Write a char code to a file stream, UTF-8 encoded."
@@ -782,19 +879,19 @@
     (when (>= fd 0)
       (cond
         ((< code #x80)
-         (%sys-write-byte-1 fd code))
+         (%fs-put-byte stream fd code))
         ((< code #x800)
-         (%sys-write-byte-1 fd (logior #xC0 (ash code -6)))
-         (%sys-write-byte-1 fd (logior #x80 (logand code #x3F))))
+         (%fs-put-byte stream fd (logior #xC0 (ash code -6)))
+         (%fs-put-byte stream fd (logior #x80 (logand code #x3F))))
         ((< code #x10000)
-         (%sys-write-byte-1 fd (logior #xE0 (ash code -12)))
-         (%sys-write-byte-1 fd (logior #x80 (logand (ash code -6) #x3F)))
-         (%sys-write-byte-1 fd (logior #x80 (logand code #x3F))))
+         (%fs-put-byte stream fd (logior #xE0 (ash code -12)))
+         (%fs-put-byte stream fd (logior #x80 (logand (ash code -6) #x3F)))
+         (%fs-put-byte stream fd (logior #x80 (logand code #x3F))))
         (t
-         (%sys-write-byte-1 fd (logior #xF0 (ash code -18)))
-         (%sys-write-byte-1 fd (logior #x80 (logand (ash code -12) #x3F)))
-         (%sys-write-byte-1 fd (logior #x80 (logand (ash code -6) #x3F)))
-         (%sys-write-byte-1 fd (logior #x80 (logand code #x3F)))))
+         (%fs-put-byte stream fd (logior #xF0 (ash code -18)))
+         (%fs-put-byte stream fd (logior #x80 (logand (ash code -12) #x3F)))
+         (%fs-put-byte stream fd (logior #x80 (logand (ash code -6) #x3F)))
+         (%fs-put-byte stream fd (logior #x80 (logand code #x3F)))))
       (%fs-set-pos stream (+ (%fs-pos stream) (%utf8-len-of-code code))))))
 
 ;;; --- File stream read-byte ---
@@ -826,13 +923,18 @@
     ;; UNSIGNED-BYTE <= 8 bits is the historic 1-byte path (CONS 1 NIL);
     ;; SIGNED-BYTE of ANY width needs sign extension on read, so it always
     ;; takes the element path, 1 byte when N <= 8.
-    (if (and (consp et) (symbolp (car et)) (consp (cdr et)) (integerp (cadr et))
-             (> (cadr et) 0))
-        (let ((nm (symbol-name (car et))) (k (floor (+ (cadr et) 7) 8)))
-          (cond ((and (string= nm "UNSIGNED-BYTE") (> k 1)) (cons k nil))
-                ((string= nm "SIGNED-BYTE") (cons k t))
-                (t (cons 1 nil))))
-        (cons 1 nil))))
+    ;; This runs on EVERY READ-BYTE, so the head is matched by NAME HASH (symbol
+    ;; slot 0: one fixnum compare, and right whichever intern site made the
+    ;; symbol) rather than SYMBOL-NAME + STRING=, and the common 1-byte answer
+    ;; is a shared constant rather than a fresh cons.  The spec is never
+    ;; mutated.  Hashes: UNSIGNED-BYTE 237688881, SIGNED-BYTE 398241362.
+    (if (and (consp et) (symbolp (car et)) (car et) (not (eq (car et) t))  ; NIL/T: immediates
+             (consp (cdr et)) (integerp (cadr et)) (> (cadr et) 0))
+        (let ((h (aref (car et) 0)) (k (floor (+ (cadr et) 7) 8)))
+          (cond ((and (eql h 237688881) (> k 1)) (cons k nil))
+                ((eql h 398241362) (cons k t))
+                (t '(1))))
+        '(1))))
 
 (defun %fs-elt-bytes (stream) (car (%fs-elt-spec stream)))
 
@@ -914,14 +1016,14 @@
       (let* ((spec (%fs-elt-spec stream)) (k (car spec)))
         (if (and (= k 1) (not (cdr spec)))
             (progn
-              (%sys-write-byte-1 fd byte)
+              (%fs-put-byte stream fd byte)
               (%fs-set-pos stream (+ (%fs-pos stream) 1)))
             (let ((v byte) (i 0))
               ;; ASH is arithmetic, so a negative SIGNED-BYTE value yields
               ;; its two's complement bytes.
               (loop
                 (when (>= i k) (return nil))
-                (%sys-write-byte-1 fd (logand v 255))
+                (%fs-put-byte stream fd (logand v 255))
                 (setq v (ash v -8))
                 (setq i (+ i 1)))
               (%fs-set-pos stream (+ (%fs-pos stream) k))))))))
@@ -970,6 +1072,7 @@
       (let ((ty (%stream-type stream)))
         (cond
           ((= ty 9)
+           (%fs-flush stream)
            (let ((fd (%fs-fd stream)))
              (if (< fd 0)
                  (error "file-length: stream is closed")
@@ -1006,8 +1109,8 @@
                      ;; reflects the logical position -- in ELEMENTS once
                      ;; divided by the element size.
                      (values (floor (%fs-pos stream) (%fs-elt-bytes stream)))
-                     ;; Set position
-                     (let ((newpos (car args)))
+                     ;; Set position (pending output goes out first)
+                     (let ((newpos (progn (%fs-flush stream) (car args))))
                        (cond
                          ((eq newpos :start)
                           (%sys-lseek fd 0 0)

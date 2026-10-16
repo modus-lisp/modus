@@ -3147,6 +3147,12 @@
                 (a64-asr-imm buf +a64-x0+  +a64-x1+ 1)  ; x0  = arg1 untag
                 (a64-mov-reg buf +a64-x1+ +a64-x9+)     ; x1  = arg2
                 (a64-mov-reg buf +a64-x2+ +a64-x10+)    ; x2  = arg3
+                ;; Args 4-6 are zero (x3 still held arg3 TAGGED, x4/x5 are
+                ;; saved locals): a syscall that reads a fourth argument -- WAIT4's
+                ;; RUSAGE -- must not get a pointer-shaped leftover.  See the x64 arm.
+                (a64-mov-reg buf +a64-x3+ +a64-xzr+)
+                (a64-mov-reg buf +a64-x4+ +a64-xzr+)
+                (a64-mov-reg buf +a64-x5+ +a64-xzr+)
                 ;; AArch64 Linux: remap x86-64 syscall numbers to AArch64
                 ;; generic ABI numbers via a sequence of cmp/csel.  Skip
                 ;; the remap path on bare-metal (no Linux syscalls).
@@ -5529,6 +5535,62 @@
                               ((= op +op-fp-sub+) #x1E203800)
                               ((= op +op-fp-mul+) #x1E200800)
                               (t                  #x1E201800))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+
+          ;; ==== Unboxed DOUBLE-float class (fpd-*): the single-float ops above in
+          ;; double precision on D(2+n).  No FCVT: the boxed payload is already a
+          ;; double.  Same scratch discipline (x9/x10/x16/x17, d0).
+
+          ;; ---- FPD-UNBOX Fd, Vsrc ----  boxed float payload -> FMOV Dd, x9
+          ((= op +op-fpd-unbox+)
+           (let* ((fd (fpp (vr 0)))
+                  (ps (ensure-src (vr 1) +a64-x16+)))
+             (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf fd +a64-x9+)))
+
+          ;; ---- FPD-LT / FPD-LE Vd, Fa, Fb ----  FCMP Da, Db; CSET x9, MI / LS
+          ;; (both false for an unordered pair); tag as a fixnum.
+          ((or (= op +op-fpd-lt+) (= op +op-fpd-le+))
+           (let* ((vd (vr 0)) (fa (fpp (vr 1))) (fb (fpp (vr 2)))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-emit buf (logior #x1E602000 (ash fb 16) (ash fa 5)))      ; fcmp Da, Db
+             ;; CSET x9, cond == CSINC x9, xzr, xzr, invert(cond):
+             ;; MI (4) -> PL (5); LS (9) -> HI (8)
+             (a64-emit buf (logior #x9A9F07E0 (ash (if (= op +op-fpd-lt+) 5 8) 12) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FPD-ITOF Fd, Vsrc ----  ASR x9, src, 1 ; SCVTF Dd, x9 (no box)
+          ((= op +op-fpd-itof+)
+           (let* ((fd (fpp (vr 0)))
+                  (ps (ensure-src (vr 1) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ ps 1)
+             (a64-scvtf-d-x buf fd +a64-x9+)))
+
+          ;; ---- FPD-BOX Vd, Fs ----  FMOV x9, Ds -> fresh boxed double (#x460)
+          ((= op +op-fpd-box+)
+           (let* ((vd (vr 0))
+                  (fs (fpp (vr 1)))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)                            ; first: clobbers x9..x13
+             (a64-fmov-x-d buf +a64-x9+ fs)
+             (a64-movz buf +a64-x10+ #x460 0)
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FPD-ADD/SUB/MUL/DIV Fd, Fa, Fb ----  F<op> Dd, Dn, Dm (type 01)
+          ((or (= op +op-fpd-add+) (= op +op-fpd-sub+)
+               (= op +op-fpd-mul+) (= op +op-fpd-div+))
+           (let* ((fd (fpp (vr 0))) (fa (fpp (vr 1))) (fb (fpp (vr 2)))
+                  (base (cond ((= op +op-fpd-add+) #x1E602800)
+                              ((= op +op-fpd-sub+) #x1E603800)
+                              ((= op +op-fpd-mul+) #x1E600800)
+                              (t                   #x1E601800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
 
           ;; ==== f32x4 vector class on the FP vregs (F0..F5 = v2..v7.4s) ====

@@ -202,18 +202,20 @@
 
 (defun get-output-stream-string (stream)
   (let ((data (if (streamp stream) (%stream-data stream) stream)))
-    (let ((chars (nreverse (car data))))
+    ;; The codes are newest first: fill the string from its end rather than
+    ;; NREVERSE the list and walk it again.
+    (let ((chars (car data)))
       (set-car data nil)
-      (let ((len (list-length chars))
-            (i 0))
+      (let ((len (list-length chars)))
         (if (null chars) (%make-string-array 0)
           (let ((s (%make-string-array len))
-                (cur chars))
+                (cur chars)
+                (i (- len 1)))
             (loop
               (when (null cur) (return s))
               (aset s i (car cur))
               (setq cur (cdr cur))
-              (setq i (+ i 1)))))))))
+              (setq i (- i 1)))))))))
 
 (defun %sis-normalize-string (str)
   "Coerce STR (which may be a fill-pointer / displaced / adjustable wrapper
@@ -300,13 +302,13 @@
 (defun force-output (&rest args)
   (if (cdr args)
       (%program-error "force-output requires 0 or 1 arguments")
-      nil))
+      (progn (%flush-output-arg (car args)) nil)))
 
 ;;; FINISH-OUTPUT — check for too many args
 (defun finish-output (&rest args)
   (if (cdr args)
       (%program-error "finish-output requires 0 or 1 arguments")
-      nil))
+      (progn (%flush-output-arg (car args)) nil)))
 
 ;;; READ-CHAR — strict at most 4 args
 (defun read-char (&rest args)

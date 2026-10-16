@@ -18,7 +18,11 @@
 ;;;; this from one shows the stack at the error -- SBCL's own idiom, and SB-DEBUG:PRINT-
 ;;;; BACKTRACE is defined on it (net/sb-sys-shim.lisp).  A FAULT (a trap from compiled code,
 ;;;; the shared-store guard among them) is delivered by longjmp, so its frames are gone by the
-;;;; time a handler runs; those need the signal handler to walk first.
+;;;; time a handler runs.  So the signal stub walks them first (translate-x64, THE FAULT'S
+;;;; BACKTRACE) into this thread's window, and the condition the fault becomes takes a copy
+;;;; (%ATTACH-FAULT-FRAMES).  With *CAPTURE-BACKTRACES* on, ERROR does the same for every
+;;;; signalled error, so a condition caught by a HANDLER-CASE -- or logged and dropped, the
+;;;; usual fate of an error in a server loop -- still says where it came from.
 
 (defun %bt-word (addr)
   "The 64-bit word at ADDR, exactly (two 32-bit loads: a :U64 load is not exact)."
@@ -68,11 +72,13 @@
                     (let* ((e (* k 24))
                            (type (logand (aref syms (+ e 4)) 15))
                            (value (%bt-u syms (+ e 8) 8))
+                           (size (%bt-u syms (+ e 16) 8))
                            (nm (%bt-u syms e 4)))
                       (when (and (member type '(0 2)) (> value 4096) (plusp nm))
                         (let ((end (or (position 0 strs :start nm) strsize)))
-                          (setq pairs (cons (cons value (map 'string (function code-char)
-                                                            (subseq strs nm end)))
+                          (setq pairs (cons (list* value (map 'string (function code-char)
+                                                              (subseq strs nm end))
+                                                   (if (plusp size) size nil))
                                             pairs))))))))))
           (and pairs (sort (coerce pairs 'vector) (function <) :key (function car)))))
     (error () nil)))
@@ -90,7 +96,7 @@
                (when (and (stringp name) (functionp f))
                  (let ((w (%gc-word-of f scratch)))
                    (when (= 3 (logand w 15))
-                     (setq pairs (cons (cons (- w 3) name) pairs))))))
+                     (setq pairs (cons (list* (- w 3) name nil) pairs))))))
              *symbol-function-table*)
     (sort (coerce pairs 'vector) (function <) :key (function car))))
 
@@ -104,7 +110,7 @@
                (when (and (stringp name) (functionp f))
                  (let ((w (%gc-word-of f scratch)))
                    (when (and (= 3 (logand w 15)) (>= w #x3000000000))
-                     (setq pairs (cons (cons (- w 3) name) pairs))))))
+                     (setq pairs (cons (list* (- w 3) name nil) pairs))))))
              *symbol-function-table*)
     (sort (coerce pairs 'vector) (function <) :key (function car))))
 
@@ -123,10 +129,14 @@
   "NAME+0xOFF for ADDR, or JIT@/?@ when no known function contains it."
   (cond
     ((>= addr #x3000000000)
+     ;; The JIT arena is bump-allocated and only named functions are on record, so code it
+     ;; made for a toplevel form or a lambda sits just past some unrelated DEFUN.  Credit the
+     ;; nearest name only within 16 KB (a large function); farther, say where it is.
      (let ((e (and jit-table (%bt-lookup addr jit-table))))
-       (if (and e (< (- addr (car e)) 262144))
-           (format nil "~a+0x~x [jit]" (cdr e) (- addr (car e)))
-           (format nil "jit@~x" addr))))
+       (cond ((and e (< (- addr (car e)) 16384))
+              (format nil "~a+0x~x [jit]" (cadr e) (- addr (car e))))
+             (e (format nil "jit@~x (past ~a)" addr (cadr e)))
+             (t (format nil "jit@~x" addr)))))
     (t (let ((lo 0) (hi (- (length table) 1)) (best nil))
          (loop
            (when (> lo hi) (return))
@@ -134,9 +144,14 @@
              (if (<= (car (aref table mid)) addr)
                  (setq best mid lo (+ mid 1))
                  (setq hi (- mid 1)))))
+         ;; An ELF entry knows its SIZE: past it, the address is in code no symbol
+         ;; names -- the image's native helpers (GC trampoline, handler stubs) all
+         ;; follow the last Lisp function, and used to be billed to it.
          (if best
              (let ((e (aref table best)))
-               (format nil "~a+0x~x" (cdr e) (- addr (car e))))
+               (if (and (cddr e) (>= (- addr (car e)) (cddr e)))
+                   (format nil "native@~x (past ~a)" addr (cadr e))
+                   (format nil "~a+0x~x" (cadr e) (- addr (car e)))))
              (format nil "?@~x" addr))))))
 
 (defun %backtrace-list (&optional (max 60))
@@ -149,6 +164,49 @@
 (defun %print-backtrace (&optional (stream *error-output*) (max 60))
   (let ((i 0))
     (dolist (f (%backtrace-list max))
+      (format stream "~&~3d: ~a~%" i f)
+      (setq i (+ i 1))))
+  (force-output stream)
+  nil)
+
+(defun %fault-backtrace-addresses ()
+  "The addresses the signal stub recorded at this thread's last hardware fault -- the faulting
+   instruction, then the return addresses up the chain -- or NIL if it recorded none."
+  (let* ((base (+ (%tls-self-base) (%conv-addr #x10005200)))
+         (n (%bt-word base)) (out nil))
+    (when (<= n 63)
+      (dotimes (i n) (setq out (cons (%bt-word (+ base 8 (* 8 i))) out))))
+    (nreverse out)))
+
+(defvar *capture-backtraces* nil
+  "True: every condition ERROR signals carries the stack it was signalled from (slot
+   %FAULT-FRAMES, as a fault's condition does).  Off by default -- it walks the stack on every
+   error, and some libraries signal errors as routine control flow.  Per thread when bound.")
+
+(defun %maybe-attach-error-frames (c)
+  "Called by ERROR: give C the signalling stack when *CAPTURE-BACKTRACES* is on and C has none
+   yet (a condition re-signalled across an interpreter boundary keeps its first frames)."
+  (when (and *capture-backtraces* (%condition-p c)
+             (null (%condition-slot c '%fault-frames)))
+    (let ((a (%backtrace-addresses)))
+      (when a (aset c 1 (cons (cons '%fault-frames a) (aref c 1))))))
+  c)
+
+(defun %condition-fault-frames (condition)
+  "The frames %ATTACH-FAULT-FRAMES gave CONDITION, or NIL."
+  (and condition (%condition-p condition) (%condition-slot condition '%fault-frames)))
+
+(defun %fault-backtrace-list (&optional condition)
+  "The stack at a hardware fault, named as %BACKTRACE-LIST names frames: CONDITION's own
+   frames when it is a fault's condition, else this thread's last fault."
+  (let* ((addrs (or (%condition-fault-frames condition) (%fault-backtrace-addresses)))
+         (table (and addrs (%bt-code-table)))
+         (jit (and (some (lambda (a) (>= a #x3000000000)) addrs) (%bt-jit-table))))
+    (mapcar (lambda (a) (%bt-name a table jit)) addrs)))
+
+(defun %print-fault-backtrace (&optional (stream *error-output*) condition)
+  (let ((i 0))
+    (dolist (f (%fault-backtrace-list condition))
       (format stream "~&~3d: ~a~%" i f)
       (setq i (+ i 1))))
   (force-output stream)

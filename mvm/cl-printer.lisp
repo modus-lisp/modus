@@ -165,12 +165,8 @@
     ((= n 0)
      (%print-char 48 stream))
     (t
-     (let ((digits nil) (tmp n))
-       (loop
-         (when (= tmp 0) (return nil))
-         (setq digits (cons (%digit-char-upper (mod tmp base)) digits))
-         (setq tmp (truncate tmp base)))
-       (dolist (d digits) (%print-char d stream))))))
+     ;; One TRUNCATE per digit, not a MOD and a TRUNCATE.
+     (dolist (d (%fmt-integer-digits n base)) (%print-char d stream)))))
 
 ;;; Print radix prefix: #b, #o, #x, #Nr. Base 10 with *print-radix* is
 ;;; conventionally written with a TRAILING dot (not a leading prefix), so
@@ -2593,6 +2589,26 @@
 ;;;   colonp   T = insert commachar every commaint digits
 ;;;   atp      T = always print sign (+ for non-negative)
 ;;; Non-integer falls back to ~A (princ) — no padding/commas.
+(defun %fmt-integer-digits (n base)
+  "The digit char codes of the non-negative integer N in BASE, most
+   significant first."
+  (if (and (not (bignump n)) (= n 0))
+      (cons 48 nil)
+      (let ((digits nil) (tmp n))
+        (loop
+          (when (and (not (bignump tmp)) (= tmp 0)) (return digits))
+          ;; A fixnum (every digit of every ~D of one): one TRUNCATE and no
+          ;; cons -- %BIGNUM-DIVMOD-FIXNUM's quotient/remainder pair was a
+          ;; sixth of a (format nil "k~d" i).
+          (if (fixnump tmp)
+              (let ((q (truncate tmp base)))
+                (setq digits (cons (%digit-char-upper (- tmp (* q base))) digits))
+                (setq tmp q))
+              (let* ((qr (%bignum-divmod-fixnum tmp base))
+                     (q  (car qr)) (r (cdr qr)))
+                (setq digits (cons (%digit-char-upper r) digits))
+                (setq tmp q)))))))
+
 (defun %fmt-integer (n base mincol padchar commachar commaint colonp atp stream)
   (cond
     ((not (integerp n))
@@ -2600,6 +2616,17 @@
      (let ((*print-escape* nil))
        (declare (special *print-escape*))
        (%write-obj n stream nil nil)))
+    ;; No column and no commas: sign and digits straight to STREAM, without a
+    ;; string stream of its own to build and copy out.
+    ((and (not colonp) (or (null mincol) (<= mincol 0)))
+     (cond
+       ((< n 0) (%print-char 45 stream) (setq n (- 0 n)))
+       (atp     (%print-char 43 stream)))
+     (let ((dl (%fmt-integer-digits n base)))
+       (loop
+         (when (null dl) (return nil))
+         (%print-char (car dl) stream)
+         (setq dl (cdr dl)))))
     (t
      (let ((s (make-string-output-stream)))
        ;; 1. Sign — works on bignum because numeric-value-less-p +
@@ -2609,17 +2636,7 @@
          (atp     (%print-char 43 s)))
        ;; 2. Digits — use %bignum-divmod-fixnum so bignum operands work
        ;; (raw :mod / :div IR is fixnum-only).
-       (let ((digits nil))
-         (cond
-           ((and (not (bignump n)) (= n 0)) (setq digits (cons 48 nil)))
-           (t
-            (let ((tmp n))
-              (loop
-                (when (and (not (bignump tmp)) (= tmp 0)) (return nil))
-                (let* ((qr (%bignum-divmod-fixnum tmp base))
-                       (q  (car qr)) (r (cdr qr)))
-                  (setq digits (cons (%digit-char-upper r) digits))
-                  (setq tmp q))))))
+       (let ((digits (%fmt-integer-digits n base)))
          ;; 3. With colonp, walk digit list emitting commachar at intervals
          (cond
            (colonp
@@ -4080,8 +4097,12 @@
          (setq j (+ j 1)))
         (t (return j))))))
 
-(defun %format-impl (stream control args)
-  "Core format. Returns remaining unused args."
+(defun %format-impl (stream control args &optional (origin args))
+  "Core format. Returns remaining unused args.
+   ORIGIN is the argument list of the directive level CONTROL belongs to: ARGS itself, except
+   for a clause of ~[...~], which is the SAME level as its ~[ (CLHS 22.3.7.2) -- it is handed
+   the args left at the ~[ and ORIGIN, so ~:* and ~@* inside it count from where the level
+   began, not from the clause."
   ;; CLHS 22.3: a format control may be a FUNCTION (the result of FORMATTER)
   ;; instead of a string.  When so, it consumes the stream + args and returns
   ;; the unused tail — exactly the formatter-closure contract.  Detect and
@@ -4421,7 +4442,7 @@
                      ;; ~@N* / ~@*: absolute goto — set arg-list to (nthcdr N args)
                      (atp
                       (let ((n (if param1 param1 0)))
-                        (let ((cur args) (j 0))
+                        (let ((cur origin) (j 0))
                           (loop
                             (when (or (null cur) (= j n)) (return nil))
                             (setq cur (cdr cur))
@@ -4432,14 +4453,14 @@
                       (let ((n (if param1 param1 1)))
                         ;; consumed = (length args) - (length arg-list)
                         ;; new pos = consumed - n  (clamped to 0)
-                        (let ((consumed 0) (al args))
+                        (let ((consumed 0) (al origin))
                           (loop (when (eq al arg-list) (return nil))
                                 (when (null al) (return nil))
                                 (setq consumed (+ consumed 1))
                                 (setq al (cdr al)))
                           (let ((new-pos (- consumed n)))
                             (when (< new-pos 0) (setq new-pos 0))
-                            (let ((cur args) (j 0))
+                            (let ((cur origin) (j 0))
                               (loop
                                 (when (or (null cur) (= j new-pos)) (return nil))
                                 (setq cur (cdr cur))
@@ -4632,15 +4653,16 @@
                             (if val
                                 (progn
                                   ;; Don't consume arg — process section with arg still there
-                                  (setq arg-list (%format-impl stream (car sections) arg-list)))
+                                  (setq arg-list (%format-impl stream (car sections) arg-list origin)))
                                 (setq arg-list (cdr arg-list)))))
                          ;; ~:[: boolean second-arg style
                          (colonp
                           (let ((val (car arg-list)))
                             (setq arg-list (cdr arg-list))
-                            (if (not val)
-                                (when sections (%format-impl stream (car sections) arg-list))
-                                (when (cdr sections) (%format-impl stream (cadr sections) arg-list)))))
+                            ;; The clause's arguments are the level's: what it consumes stays
+                            ;; consumed after the ~].
+                            (let ((sel (if (not val) (car sections) (cadr sections))))
+                              (when sel (setq arg-list (%format-impl stream sel arg-list origin))))))
                          ;; ~[: numeric selection.  If a prefix parameter
                          ;; was given (~N[), use N directly without consuming
                          ;; an arg.  Otherwise consume the next arg.  If
@@ -4655,12 +4677,12 @@
                               ((and (integerp idx) (>= idx 0) (< idx (length sections)))
                                (let ((selected (nth idx sections)))
                                  (when selected
-                                   (setq arg-list (%format-impl stream selected arg-list)))))
+                                   (setq arg-list (%format-impl stream selected arg-list origin)))))
                               ;; Out of range with default section
                               (default-idx
                                (let ((selected (nth default-idx sections)))
                                  (when selected
-                                   (setq arg-list (%format-impl stream selected arg-list))))))))))))
+                                   (setq arg-list (%format-impl stream selected arg-list origin))))))))))))
                   ;; ~<...~> — justification (simple variant) OR
                   ;; ~<...~:> — logical block (CLHS 22.3.5.2).  The close
                   ;; modifier selects: a colon on the close (~:>) means the
@@ -5310,6 +5332,11 @@
         (eof-error-p (if (cdr args) (cadr args) t))
         (eof-value (if (cddr args) (caddr args) nil)))
     (let ((s (%resolve-input-stream stream-arg)))
+      ;; A file stream with the whole line in its buffer: no per-character loop.
+      (when (and (streamp s) (= (%stream-type s) 9))
+        (let ((fast (%fs-read-line-fast s)))
+          (unless (eq fast :slow)
+            (return-from read-line (values fast nil)))))
       ;; Use read-char to read characters until newline or EOF
       (let ((chars nil)
             (found-newline nil)

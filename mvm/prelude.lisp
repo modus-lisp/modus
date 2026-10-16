@@ -1666,7 +1666,7 @@
           (when (>= (car (cdr holder)) 32)
             (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
         (when (and vec (not (eq vec -424242001)))
-          (if (fixnump key)
+          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
               ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
               ;; keyword literal and every name-hash keyed compiler table.
@@ -1719,7 +1719,7 @@
           (when (>= (car (cdr holder)) 32)
             (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
         (when (and vec (not (eq vec -424242001)))
-          (if (fixnump key)
+          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
               ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
               ;; keyword literal and every name-hash keyed compiler table.
@@ -1762,7 +1762,7 @@
          (vec (and holder (%ht-active-vec-h ht holder)))
          (strcmp? (and vec (%ht-h-strcmp holder)))
          (existing (and vec
-                        (if (fixnump key)
+                        (if (and (fixnump key) (not (eq strcmp? :equalp)))
                             ;; fixnum fast path (mirrors GETHASH)
                             (let* ((k (if (< key 0) (- key) key))
                                    (h (logand (logxor k (logxor (ash k -8) (ash k -16)))
@@ -1820,6 +1820,33 @@
 (defun remhash (key ht)
   "Remove KEY from hash table HT. Returns T if removed, NIL otherwise.
    Keeps the bucket index (if any) and the holder count in sync."
+  ;; WITH A BUCKET INDEX the pair is found there: an absent key answers NIL
+  ;; without touching the alist, and a present one is unlinked by its IDENTITY
+  ;; (one EQ per link) instead of calling the table's test on every entry --
+  ;; cl-bench's HTABLE-SET+REMOVE removed the oldest of 16k string keys, 16k
+  ;; STRING= calls deep, 3800x SBCL.
+  (let* ((holder (%ht-bucket-holder ht))
+         (vec (and holder (%ht-active-vec-h ht holder))))
+    (when vec
+      (let* ((strcmp? (%ht-h-strcmp holder))
+             (pair (%ht-bucket-find vec key strcmp?)))
+        (cond
+          ((null pair) (return-from remhash nil))
+          ((consp pair)
+           (let ((entries (car ht)))
+             (if (eq (car entries) pair)
+                 (set-car ht (cdr entries))
+                 (let ((prev entries) (cur (cdr entries)))
+                   (loop
+                     (when (null cur) (return nil))
+                     (when (eq (car cur) pair)
+                       (set-cdr prev (cdr cur))
+                       (return nil))
+                     (setq prev cur)
+                     (setq cur (cdr cur))))))
+           (%ht-bucket-rem vec key strcmp?)
+           (%ht-h-set-count holder (- (%ht-h-count holder) 1))
+           (return-from remhash t))))))
   (let* ((entries (car ht))
          (cmp (%ht-keytest ht))
          (holder (%ht-bucket-holder ht))
@@ -1886,6 +1913,10 @@
 ;;; the image's own code relies on; CLHS makes HASH-TABLE and LIST disjoint,
 ;;; and portable code dispatches on it -- jzon's object parser took a table for
 ;;; a list and every JSON object failed with a TYPE-ERROR.
+(defun %prim-simple-string-p (x) (%prim-simple-string-p x))   ; compiled inline (compiler.lisp)
+(defun %prim-u8-vector-p (x) (%prim-u8-vector-p x))   ; compiled inline (compiler.lisp)
+(defun %prim-simple-vector-p (x) (%prim-simple-vector-p x))   ; compiled inline (compiler.lisp)
+(defun %raw-consp (x) (consp x))   ; image code: CONSP is the raw tag test
 (defun %rt-consp (x) (and (consp x) (not (hash-table-p x))))
 (defun %rt-listp (x) (or (null x) (%rt-consp x)))
 (defun %rt-atom (x) (not (%rt-consp x)))
@@ -1979,6 +2010,13 @@
    String hash is CASE-SENSITIVE.  MASK = bucket-count minus one (the
    bucket vector is a power of two in length and GROWS with the table)."
   (cond
+    ((eq strcmp? :equalp) (logand (%ht-equalp-hash key 0) mask))
+    ;; FIXNUM FIRST: every special-variable read and write probes the globals
+    ;; table with one (%GV-CELL), and it used to pass two string tests to get
+    ;; here.  The mix is the one documented at the fixnum clause below.
+    ((fixnump key)
+     (let ((k (if (< key 0) (- key) key)))
+       (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
     ;; A string that is not a RAW string -- an adjustable / fill-pointer /
     ;; displaced one, whose object is an array header -- is hashed by its
     ;; contents through a simple copy.  The branch below reads RAW slots
@@ -2009,13 +2047,16 @@
              (let ((h 2166136261) (len (array-length key)) (i 0))
                (loop
                  (when (>= i len) (return nil))
-                 (setq h (logand (* (logxor h (%prim-aref key i)) 16777619) #xFFFFFFFF))
+                 ;; %WORD-AREF: the clause above sent every string that is not a
+                 ;; plain #x31 through a copy, so this is one -- never byte-packed --
+                 ;; and %PRIM-AREF's u8-or-word subtag test per character is waste.
+                 (setq h (logand (* (logxor h (%word-aref key i)) 16777619) #xFFFFFFFF))
                  (setq i (+ i 1)))
                (logand h mask))
              (let ((h 1162397) (len (array-length key)) (i 0))   ; #x11BC9D
                (loop
                  (when (>= i len) (return nil))
-                 (setq h (logand (+ (- (ash h 5) h) (%prim-aref key i)) #x3FFFFF))
+                 (setq h (logand (+ (- (ash h 5) h) (%word-aref key i)) #x3FFFFF))
                  (setq i (+ i 1)))
                (logand h mask)))
          (%ht-nohash)))
@@ -2035,9 +2076,7 @@
     ;; branch-free and allocation-free (all intermediates stay fixnums, so no
     ;; bignum path and nothing to collect).  Must agree between %ht-bucket-find
     ;; and %ht-bucket-put — both call THIS function, so they cannot diverge.
-    ((fixnump key)
-     (let ((k (if (< key 0) (- key) key)))
-       (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
+    ;; (That clause is now the FIRST one, above.)
     ((characterp key) (logand (char-code key) mask))
     ((null key) 17)
     ((eq key t) 19)
@@ -2058,6 +2097,72 @@
 ;;; constant: EQUAL treats them by identity in CL and their contents change
 ;;; while they are keys, so a hash of their structure would go stale.
 (defun %ht-mix (h v) (logand (+ (- (ash h 5) h) v) #x3FFFFF))
+
+(defun %ht-equalp-hash (x depth)
+  "Hash for EQUALP tables: EQUALP keys hash alike.  Reals by FLOOR (= reals
+   have equal floors: 1, 1.0 and 3/3 collide as they must); characters and
+   string elements case-folded; any vector -- a string included, since
+   (equalp \"ab\" #(#\\a #\\b)) -- by length and its first 8 elements; a
+   list by its first 8 elements, 3 levels deep.  Everything EQUALP can see
+   into otherwise (structures, hash tables, multi-dimensional arrays) hashes
+   to a constant: correct, merely less spread.  Below 2^27 throughout."
+  (cond
+    ((fixnump x) (%ht-equalp-real-hash x))
+    ((characterp x) (char-code (char-upcase x)))
+    ((null x) 17)
+    ((eq x t) 19)
+    ((stringp x) (%ht-equalp-vec-hash x depth))
+    ((and (consp x) (not (%ht-opaque-cons-p x)))
+     (if (< depth 3)
+         (let ((h 7) (n 0) (c x))
+           (loop
+             (cond ((not (consp c))
+                    (return (%ht-mix h (if (null c) 0 (%ht-equalp-hash c (+ depth 1))))))
+                   ((>= n 8) (return (%ht-mix h 23))))
+             (setq h (%ht-mix h (%ht-equalp-hash (car c) (+ depth 1))))
+             (setq c (cdr c) n (+ n 1))))
+         29))
+    ((consp x) 31)
+    ((realp x) (%ht-equalp-real-hash x))
+    ;; A complex is = to a real when its imaginary part is zero, and = numbers
+    ;; have = real parts.
+    ((numberp x) (%ht-equalp-real-hash (realpart x)))
+    ((%cl-sym-p x) (logand (%cl-sym-hash x) #x3FFFFF))
+    ((%native-mvm-sym-p x) (logand (%native-mvm-sym-hash x) #x3FFFFF))
+    ;; Bit vectors too: #*101 is EQUALP to #(1 0 1).
+    ((vectorp x) (%ht-equalp-vec-hash x depth))
+    (t 41)))
+
+(defun %ht-equalp-real-hash (x)
+  "= reals hash alike.  A finite real hashes by F = FLOOR(x * 2^20), folded as
+   |F| xor |F|>>20: exact scaling for floats and ratios, so 1/2, 0.5 and
+   0.5d0 collide, while fractional floats still spread (a plain FLOOR put
+   every key in [0,1) in one bucket -- cl-bench MIXBAG's vectors differ only
+   in such a float).  Integers take the same formula without the scaling
+   (%HT-EQP-INT-HASH); floats past 2^52 are integral and go there too.
+   Infinities and NaN (= to nothing) hash to a constant."
+  (cond
+    ((fixnump x) (%ht-eqp-int-hash x))
+    ((integerp x) (%ht-eqp-int-hash x))
+    ((and (floatp x) (or (/= x x) (and (/= x 0) (= x (* x 2))))) 47)
+    ((and (floatp x) (>= (abs x) 4503599627370496.0)) (%ht-eqp-int-hash (floor x)))
+    (t (let* ((f (floor (* x 1048576))) (a (if (< f 0) (- f) f)))
+         (logand (logxor a (ash a -20)) #x3FFFFF)))))
+
+(defun %ht-eqp-int-hash (x)
+  "%HT-EQUALP-REAL-HASH's fold for an integer X, i.e. of F = X * 2^20, with no
+   bignum: (|X| mod 4) << 20 xor the low 22 bits of |X|."
+  (let ((a (if (< x 0) (- x) x)))
+    (logxor (ash (logand a 3) 20) (logand a #x3FFFFF))))
+
+(defun %ht-equalp-vec-hash (v depth)
+  (let* ((n (length v)) (h (%ht-mix 11 (logand n #xFFFF))) (i 0))
+    (if (>= depth 3)
+        h
+        (loop
+          (when (or (>= i n) (>= i 8)) (return h))
+          (setq h (%ht-mix h (%ht-equalp-hash (aref v i) (+ depth 1))))
+          (setq i (+ i 1))))))
 
 (defun %ht-opaque-cons-p (x)
   "True for a cons that is a hash table or an array wrapper underneath:
@@ -2110,6 +2215,12 @@
         (%ht-nohash)
         (let ((cur (%word-aref vec h)))
           (cond
+            ((eq strcmp? :equalp)
+             (loop
+               (when (null cur) (return nil))
+               (let ((e (car cur)))
+                 (when (equalp (car e) key) (return (cdr e))))
+               (setq cur (cdr cur))))
             ((and strcmp? (stringp key))
              ;; string-content path
              (loop
@@ -2152,7 +2263,8 @@
         (loop
           (when (null cur) (return nil))
           (let ((ek (car (car cur))))
-            (unless (cond ((and strcmp? (stringp key))
+            (unless (cond ((eq strcmp? :equalp) (equalp ek key))
+                          ((and strcmp? (stringp key))
                            (and (stringp ek) (string= ek key)))
                           ((consp key) (equal ek key))
                           (t (eql ek key)))
@@ -2306,11 +2418,14 @@
     ;; The 0-arg / legacy MAKE-HASH-TABLE path (NIL test) does NOT get this
     ;; tail — it stays the pure-alist shape so boot-critical tables (the symbol
     ;; intern table, macro table, ...) are byte-identical and never bucketed.
-    ;; EQUALP gets the index pre-disabled (car=:NOHASH): EQUALP string keys are
-    ;; case-INSENSITIVE and EQUALP conflates e.g. 1/1.0, but the index is
-    ;; EQUAL-grade — so EQUALP tables stay on the correct linear path.
-    (let ((holder (cons (if (eq test 'equalp) (%ht-nohash) nil)
-                        (cons 0 (eq test 'equal)))))
+    ;; EQUALP tables get their own index mode: STRCMP? is :EQUALP, keys hash
+    ;; by %HT-EQUALP-HASH (case-folded, = numbers alike) and buckets compare
+    ;; with EQUALP.  They used to be linear for good -- cl-bench's MIXBAG,
+    ;; 16k mixed keys, was 840x SBCL.
+    (let ((holder (cons nil
+                        (cons 0 (cond ((eq test 'equal) t)
+                                      ((eq test 'equalp) :equalp)
+                                      (t nil))))))
       (cons nil
             (cons (%ht-tag)
                   (list test rsize rthresh size holder))))))
@@ -2960,8 +3075,18 @@
    costs one load there, and it is what makes the CALL-only emission
    (*GV-CACHE-MODE* :call) a real fallback rather than a slowdown."
   (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
-    (if (fixnump %gv-cv)
-        (progn (%gv-cache-init-once) (%gv-ref %gv-key))
+    ;; THREADS ARMED (the inline read sends every read here then): this
+    ;; thread's own dynamic binding, which the memoised pair cannot see, wins;
+    ;; with none -- always so on main, whose window base is zero -- the cache
+    ;; below answers as usual.
+    (let ((%gv-a (if (eql (mem-ref #x10000DB8 :u32) 0) 0 (%dynb-value-addr %gv-key))))
+     (if (not (eql %gv-a 0))
+      (mem-ref %gv-a :u64)
+     (if (fixnump %gv-cv)
+        ;; Never built on a WORKER: its allocations die with it.  Boot builds
+        ;; the vector at the first special read, long before threads arm.
+        (progn (when (eql (mem-ref #x10000DB8 :u32) 0) (%gv-cache-init-once))
+               (%gv-ref %gv-key))
         (let ((%gv-hit (%word-aref %gv-cv %gv-slot)))
           (if (if (consp %gv-hit) (eq (car %gv-hit) %gv-key) nil)
               (cdr %gv-hit)
@@ -2974,7 +3099,74 @@
                     (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
                       %gv-st
                       (cdr %gv-cl))
+                    nil)))))))))
+
+(defun %gv-memo-cell (%gv-key %gv-slot)
+  "The globals cell for KEY through cache slot SLOT (filling the slot on a
+   miss), or NIL when there is no cell or no cache vector yet.  For UNARMED
+   callers only: a memoised pair cannot see a thread's own binding."
+  (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
+    (if (fixnump %gv-cv)
+        nil
+        (let ((%gv-hit (%word-aref %gv-cv %gv-slot)))
+          (if (if (consp %gv-hit) (eq (car %gv-hit) %gv-key) nil)
+              %gv-hit
+              (let ((%gv-cl (%gv-cell %gv-key)))
+                (if (consp %gv-cl)
+                    (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
+                      %gv-st
+                      %gv-cl)
                     nil)))))))
+
+(defun %gv-set-c (%gv-key %gv-val %gv-slot)
+  "%GV-SET through the cell cache: the AOT SETQ of a special that has a slot.
+   Unarmed and the cell exists: store in place, no table probe.  Otherwise
+   exactly %GV-SET (which consults this thread's bindings, and creates the
+   cell -- flushing the cache -- when there is none)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
+        (if %gv-c
+            (progn (set-cdr %gv-c %gv-val) %gv-val)
+            (%gv-set %gv-key %gv-val)))
+      (%gv-set %gv-key %gv-val)))
+
+(defun %dynbind-c (%gv-key %gv-val %gv-slot)
+  "%DYNBIND through the cell cache: its unarmed arm is %GV-SET (see there)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (%gv-set-c %gv-key %gv-val %gv-slot)
+      (%dynbind %gv-key %gv-val)))
+
+(defun %dynunbind-c (%gv-key %gv-saved %gv-slot)
+  "%DYNUNBIND through the cell cache: its unarmed arm is %GV-SET too."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (%gv-set-c %gv-key %gv-saved %gv-slot)
+      (%dynunbind %gv-key %gv-saved)))
+
+(defun %gv-cell-ref (%gv-cell %gv-key)
+  "The LET-special save through a cell baked at a runtime compile: the
+   cell's value on an unarmed image, else %GV-REF (thread bindings first)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0) (cdr %gv-cell) (%gv-ref %gv-key)))
+
+(defun %dynbind-cell (%gv-cell %gv-key %gv-val)
+  "%DYNBIND through a cell baked at a runtime compile: its unarmed arm is a
+   store into the cell (%GV-SET's in-place update, without the probe)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (progn (set-cdr %gv-cell %gv-val) %gv-val)
+      (%dynbind %gv-key %gv-val)))
+
+(defun %dynunbind-cell (%gv-cell %gv-key %gv-saved)
+  "%DYNUNBIND through a cell baked at a runtime compile."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (progn (set-cdr %gv-cell %gv-saved) %gv-saved)
+      (%dynunbind %gv-key %gv-saved)))
+
+(defun %gv-set-cell (%gv-key %gv-val %gv-cell)
+  "A runtime SETQ of a special whose cell was baked at compile time, slow arm
+   (a value that may be an in-module closure): on an unarmed image store into
+   the cell, else %GV-SET (this thread's binding first)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (progn (set-cdr %gv-cell %gv-val) %gv-val)
+      (%gv-set %gv-key %gv-val)))
 
 (defun %gv-set-def (%gv-key %gv-val)
   "The DEFVAR/DEFPARAMETER store: %GV-SET under a name the bytecode

@@ -238,60 +238,86 @@
   (and (= (logand (%float-hi32 x) #x7FFFFFFF) #x7FF00000)
        (= (%float-lo32 x) 0)))
 
-(defun %exp-f (x)
-  "exp of double X via range-reduction + Taylor.  exp(x)=exp(x/2)^2
-   keeps the Taylor argument in [-~1,1] for fast convergence; recursion
-   depth ~log2|x| (<= ~1024 for any finite double).
+;;; EXP and LOG, fdlibm-style.  The constants are exact IEEE bit patterns (hi, lo
+;;; halves), built with %MAKE-TYPED-FLOAT rather than read as literals.
+(defun %dbl (hi lo) (%make-typed-float hi lo 'double-float))
 
-   AN INFINITE X halves to itself and recursed until the stack ran out:
-   %LOG-F's Newton step can produce one, and LOG/ATANH/ACOSH on random floats
-   died with SIGSEGV in upstream shard 14 (7336 %EXP-F frames in the core).
-   exp(+inf) = +inf, exp(-inf) = 0."
-  (cond
-    ((%float-infinite-p x)
-     (if (= (logand (%float-hi32 x) #x80000000) 0) x (%fl 0)))
-    ((%float-lt-p (%f-one) (%float-abs x))
-     (let ((half (%exp-f (%float-div x (%fl 2)))))
-       (%float-mul half half)))
-    (t
-     ;; |x| <= 1: 1 + x + x^2/2! + ...
-     (let ((term (%f-one)) (acc (%f-one)) (n 1))
-       (loop
-         (when (> n 18) (return acc))
-         (setq term (%float-div (%float-mul term x) (%fl n)))
-         (setq acc (%float-add acc term))
-         (setq n (+ n 1)))))))
+(defun %exp-f (x)
+  "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
+   exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
+   the exponent bits.  The old version halved X until |X| <= 1 and squared back,
+   which amplified the Taylor error (mean 253 ulp against libm, max 5661) and
+   cost a few hundred boxed float operations."
+  (let ((hi (%float-hi32 x)))
+    (cond
+      ;; NaN or infinity
+      ((= (logand hi #x7FF00000) #x7FF00000)
+       (if (and (= (logand hi #x000FFFFF) 0) (= (%float-lo32 x) 0))
+           (if (= (logand hi #x80000000) 0) x (%fl 0))       ; exp(+inf)=inf, exp(-inf)=0
+           x))                                                ; NaN
+      ((%float-lt-p (%dbl #x40862E42 #xFEFA39EF) x)            ; > 709.78...: overflow
+       (%dbl #x7FF00000 0))
+      ((%float-lt-p x (%dbl #xC0874910 #xD52D3051))            ; < -745.13...: underflow
+       (%fl 0))
+      (t
+       (let* ((tq (%float-mul x (%dbl #x3FF71547 #x652B82FE)))   ; x / ln2
+              (k (%float-to-int (if (%float-lt-p tq (%fl 0))
+                                    (%float-sub tq (%dbl #x3FE00000 0))
+                                    (%float-add tq (%dbl #x3FE00000 0)))))
+              (fk (%fl k))
+              (r (%float-sub (%float-sub x (%float-mul fk (%dbl #x3FE62E42 #xFEE00000)))
+                             (%float-mul fk (%dbl #x3DEA39EF #x35793C76))))
+              (acc (%fl 1))
+              (n 13))
+         ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
+         (loop
+           (when (< n 1) (return nil))
+           (setq acc (%float-add (%fl 1) (%float-div (%float-mul r acc) (%fl n))))
+           (setq n (- n 1)))
+         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends
+         (cond ((and (>= k -1022) (<= k 1023))
+                (%float-mul acc (%dbl (ash (+ k 1023) 20) 0)))
+               ((> k 1023)
+                (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
+                            (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
+               (t
+                (%float-mul (%float-mul acc (%dbl (ash (+ (+ k 600) 1023) 20) 0))
+                            (%dbl (ash (+ -600 1023) 20) 0)))))))))
 
 
 
 (defun %log-f (x)
-  "Natural log of double X (X > 0).  Reduce x = m·2^e with m in [1,2)
-   by repeated halving/doubling, accumulating e·ln2, then Newton on
-   the residual: y_{n+1} = y_n + x/exp(y_n) - 1 converges to ln(m)."
-  (let ((ln2 (%float-div (%fl 693147180559945) (%fl 1000000000000000)))   ; ln 2
-        (e 0)
-        (m x)
-        (two (%fl 2))
-        (half (%float-div (%fl 1) (%fl 2))))
-    ;; bring m into [0.5, 2): halve while ≥2, double while <0.5
-    (loop
-      (when (not (%float-lt-p two m)) (return nil))   ; m < 2
-      (when (numeric-equal-p m two) (return nil))
-      (setq m (%float-mul m half))
-      (setq e (+ e 1)))
-    (loop
-      (when (not (%float-lt-p m (%float-div (%fl 1) two))) (return nil)) ; m >= 0.5
-      (setq m (%float-mul m two))
-      (setq e (- e 1)))
-    ;; Newton for ln(m), m in [0.5,2), 30 iters
-    (let ((y (%float-sub m (%f-one)))   ; initial guess m-1
-          (i 0))
-      (loop
-        (when (> i 30) (return nil))
-        (let ((ey (%exp-f y)))
-          (setq y (%float-add y (%float-sub (%float-div m ey) (%f-one)))))
-        (setq i (+ i 1)))
-      (%float-add y (%float-mul (%fl e) ln2)))))
+  "Natural log of double X > 0.  x = m 2^e exactly from the IEEE bits (a
+   subnormal is scaled by 2^54 first), m brought into [sqrt(1/2), sqrt 2);
+   ln m = 2 atanh f with f = (m-1)/(m+1), |f| <= 0.172, by an 11-term series
+   in s = f^2; e ln2 with ln2 split hi/lo.  The old version ran 31 Newton steps,
+   each a full %EXP-F, with a 15-digit ln 2 (mean 9 ulp, max 20160)."
+  (let ((hi (%float-hi32 x)) (e 0))
+    (cond
+      ((= (logand hi #x7FF00000) #x7FF00000) x)                ; +inf / NaN
+      ((and (= (logand hi #x7FFFFFFF) 0) (= (%float-lo32 x) 0))
+       (%dbl #xFFF00000 0))                                     ; log 0 = -inf
+      (t
+       (when (= (logand hi #x7FF00000) 0)                       ; subnormal: x 2^54
+         (setq x (%float-mul x (%dbl #x43500000 0)) e -54 hi (%float-hi32 x)))
+       (setq e (+ e (- (logand (ash hi -20) #x7FF) 1023)))
+       (let ((m (%dbl (logior (logand hi #x000FFFFF) #x3FF00000) (%float-lo32 x))))
+         (when (%float-lt-p (%dbl #x3FF6A09E #x667F3BCD) m)       ; m > sqrt 2
+           (setq m (%float-mul m (%dbl #x3FE00000 0)) e (+ e 1)))
+         (let* ((f (%float-div (%float-sub m (%fl 1)) (%float-add m (%fl 1))))
+                (sq (%float-mul f f))
+                (acc (%float-div (%fl 1) (%fl 23)))
+                (j 10))
+           ;; 1 + s/3 + s^2/5 + ... + s^11/23
+           (loop
+             (when (< j 0) (return nil))
+             (setq acc (%float-add (%float-div (%fl 1) (%fl (+ (* 2 j) 1)))
+                                   (%float-mul sq acc)))
+             (setq j (- j 1)))
+           (let ((fe (%fl e)))
+             (%float-add (%float-mul fe (%dbl #x3FE62E42 #xFEE00000))
+                         (%float-add (%float-mul (%float-mul (%fl 2) f) acc)
+                                     (%float-mul fe (%dbl #x3DEA39EF #x35793C76)))))))))))
 
 (defun log (x &optional base)
   "Natural log (or log to BASE if supplied).  CLHS: (log z) for a complex
@@ -2448,7 +2474,10 @@
        (not (characterp x))
        (let ((st (obj-subtag x)))
          (or (= st #x60) (and (>= st #x64) (<= st #x66))))
-       (= (array-length x) 4)))
+       ;; The raw header count, not ARRAY-LENGTH: that one is the general
+       ;; (multi-dimensional) array length, and this predicate gates every
+       ;; arithmetic op -- it was most of %IEEE-FLOAT-P's time.
+       (= (%prim-array-length x) 4)))
 
 (defun %float-declared-type (x)
   "The declared CL float type of IEEE float X, from its subtag."
@@ -2527,17 +2556,36 @@
            s
            (%make-typed-float (%float-hi32 s) (%float-lo32 s) type))))))   ; retag short
 
+(defun %to-double (x)
+  "(FLOAT X 1d0): a fixnum converts inline (:itof), anything else goes
+   through FLOAT.  The compiler's double-float fast path calls this for a
+   (FLOAT X <double>) or (COERCE X 'DOUBLE-FLOAT) operand."
+  (if (fixnump x) (%float-from-int x) (float x 1d0)))
+
+(defun %float-pair-result (r a b)
+  "R, the double-payload result of an op on IEEE floats A and B, in CLHS
+   contagion format: double when either is double (or long), else rounded to
+   single.  By subtag, with no type symbols and no re-checking of A and B."
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66))
+        r
+        (%round-to-single r))))
+
 (defun %float-result-type (a b)
   "CL float contagion (CLHS 12.1.4.4): the result float format is the
    widest among the float operands.  short/single/rational don't widen
    past single; a double or long operand forces double.  At least one of
    A/B is already a float when this is called from the float branch."
-  (if (or (double-float-p a) (double-float-p b)) 'double-float 'single-float))
+  ;; T for double, NIL for single: every caller hands this straight to
+  ;; %AS-RESULT-FLOAT, and a quoted symbol in image code is a %STATIC-SYMBOL-REF
+  ;; call -- two of them on every float operation, 15% of an Opus decode.
+  (if (or (double-float-p a) (double-float-p b)) t nil))
 
 (defun %as-result-float (r type)
-  "Retag the #x60 double-payload result R to contagion TYPE: round to
-   single-float precision when TYPE is single-float, else leave R double."
-  (if (eq type 'single-float) (%round-to-single r) r))
+  "Retag the #x60 double-payload result R to contagion TYPE (%FLOAT-RESULT-TYPE:
+   T double, NIL single): round to single-float precision for single, else
+   leave R double."
+  (if type r (%round-to-single r)))
 
 (defun %irr-result (r x)
   "Format contagion for a 1-arg irrational/transcendental fn: the #x60
@@ -2652,6 +2700,17 @@
    mantissa (to the subnormal grid 2^-1074 at the bottom) in exact integer
    arithmetic, then SCALE-FLOAT it, which is exact."
   ;; R is a ratio, or modus's 2-slot rational-form float: [numerator denominator].
+  ;; BOTH HALVES EXACT AS DOUBLES (below 2^53): their IEEE quotient is
+  ;; correctly rounded -- one rounding, the division's -- so the exact
+  ;; integer path below is only needed past that.  It cost a bignum multiply,
+  ;; a ROUND and a SCALE-FLOAT per conversion (cl-bench MANDELBROT/DFLOAT's
+  ;; (/ i n 0.25d0)).
+  (let ((n0 (aref r 0)) (d0 (aref r 1)))
+    (when (and (fixnump n0) (fixnump d0)
+               (< n0 9007199254740992) (> n0 -9007199254740992)
+               (< d0 9007199254740992) (> d0 0))
+      (return-from %ratio-to-double
+        (%float-div (%float-from-int n0) (%float-from-int d0)))))
   (let* ((neg (minusp (aref r 0)))
          (num (abs (aref r 0)))
          (den (aref r 1))
@@ -2720,6 +2779,18 @@
 (defvar *%arith-strict* nil)
 
 (defun generic-add (a b)
+  ;; OBJ-SUBTAG is safe on any value (0 for a non-object), so the both-floats
+  ;; case is decided by two inline reads and integer compares -- no predicate
+  ;; calls -- and contagion comes from the same two numbers.
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (and (or (= sa #x60) (and (>= sa #x64) (<= sa #x66)))
+             (or (= sb #x60) (and (>= sb #x64) (<= sb #x66)))
+             (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
+        (let ((r (%float-add a b)))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
+        (%generic-add-slow a b))))
+
+(defun %generic-add-slow (a b)
   (cond
     ;; RATIO +/- INTEGER (fixnum OR bignum) first: it used to reach the
     ;; bignum clause below, so (+ 1/3 (expt 2 70)) was a garbage INTEGER.
@@ -2766,6 +2837,18 @@
     (t (%fixnum-+ a b))))
 
 (defun generic-multiply (a b)
+  ;; OBJ-SUBTAG is safe on any value (0 for a non-object), so the both-floats
+  ;; case is decided by two inline reads and integer compares -- no predicate
+  ;; calls -- and contagion comes from the same two numbers.
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (and (or (= sa #x60) (and (>= sa #x64) (<= sa #x66)))
+             (or (= sb #x60) (and (>= sb #x64) (<= sb #x66)))
+             (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
+        (let ((r (%float-mul a b)))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
+        (%generic-multiply-slow a b))))
+
+(defun %generic-multiply-slow (a b)
   (cond
     ;; Integer/integer: route through bignum-mul which has a 31-bit
     ;; fast path AND promotes to bignum on overflow.  The naked
@@ -2804,6 +2887,18 @@
     (t (%fixnum-* a b))))
 
 (defun generic-subtract (a b)
+  ;; OBJ-SUBTAG is safe on any value (0 for a non-object), so the both-floats
+  ;; case is decided by two inline reads and integer compares -- no predicate
+  ;; calls -- and contagion comes from the same two numbers.
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (if (and (or (= sa #x60) (and (>= sa #x64) (<= sa #x66)))
+             (or (= sb #x60) (and (>= sb #x64) (<= sb #x66)))
+             (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
+        (let ((r (%float-sub a b)))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
+        (%generic-subtract-slow a b))))
+
+(defun %generic-subtract-slow (a b)
   (cond
     ;; RATIO -/+ INTEGER first -- see GENERIC-ADD.
     ((and (ratiop a) (integerp b))
@@ -3935,11 +4030,19 @@
      (let ((hash 2166136261)
            (i 0)
            (len (length object)))
-       (loop
-         (when (>= i len) (return))
-         (setq hash (logxor hash (%ensure-char-code (aref object i))))
-         (setq hash (logand (* hash 16777619) #xFFFFFFFF))
-         (setq i (+ i 1)))
+       ;; A plain #x31 string reads its slots directly (same codes AREF would
+       ;; lift to characters and %ENSURE-CHAR-CODE lower again).
+       (if (and (%prim-stringp object) (not (%mda-p object)))
+           (loop
+             (when (>= i len) (return))
+             (setq hash (logxor hash (%ensure-char-code (%word-aref object i))))
+             (setq hash (logand (* hash 16777619) #xFFFFFFFF))
+             (setq i (+ i 1)))
+           (loop
+             (when (>= i len) (return))
+             (setq hash (logxor hash (%ensure-char-code (aref object i))))
+             (setq hash (logand (* hash 16777619) #xFFFFFFFF))
+             (setq i (+ i 1))))
        hash))
     ((symbolp object)
      ;; Use name hash if available
@@ -5022,7 +5125,10 @@
   (if extra
       (%program-error "isqrt requires exactly 1 argument")
       (if (<= n 0) 0
-          (let ((x n))
+          ;; Newton from 2^ceil(len/2) >= sqrt(N), not from N itself: the
+          ;; descent from N took one iteration per bit (a bignum division
+          ;; each) before it got anywhere near the root.
+          (let ((x (ash 1 (ash (+ (integer-length n) 1) -1))))
             (loop (let ((x1 (ash (+ x (truncate n x)) -1)))
                     (when (>= x1 x) (return x))
                     (setq x x1)))))))
@@ -5157,6 +5263,22 @@
    %CLOS-PKG-OBJ-COMPATIBLE."
   (and *%runtime-deftype-table*
        (symbolp head)
+       ;; NIL and T are immediates in some images (the ANSI gate's sentinels),
+       ;; with no slot 0 to read -- and neither can name a DEFTYPE.
+       (not (eq head nil)) (not (eq head t))
+       ;; A name no DEFTYPE ever registered cannot be one: one fixnum probe
+       ;; instead of the name-string lookups below (EQUAL hashing, STRING=),
+       ;; which were ~18% of an Opus decode through MAKE-ARRAY's element type.
+       ;; A collision just takes the full path.  No set at all (a table filled
+       ;; by some other means) also takes the full path.
+       ;; ONLY WHEN IT IS A TABLE: an image that skips DEFVAR init thunks (the
+       ;; ANSI gate image, Limitation #7) leaves the variable holding the
+       ;; unbound marker, and GETHASH on that faulted -- 325 tests.
+       ;; (Not BOUNDP: that is a by-name hash lookup on every MAKE-ARRAY.  The
+       ;; unbound marker reads as a fixnum, which HASH-TABLE-P rejects.)
+       (let ((nh *%deftype-name-hashes*))
+         (or (not (hash-table-p nh))
+             (gethash (aref head 0) nh)))
        (let ((nm (%eval-sym-name head)))
          (and nm (or (%deftype-pkg-get head nm)
                      (gethash nm *%runtime-deftype-table*))))))

@@ -1562,6 +1562,14 @@
   "FP vreg N -> xmm: 0-5 -> xmm2..7, 6-11 -> xmm8..13 (caller-saved)."
   (if (< n 6) (+ n 2) (+ 8 (- n 6))))
 
+(defun x64-sse-rr (buf prefix w op reg rm)
+  "Emit [PREFIX] [REX] 0F OP with a register-register ModRM: REG and RM are
+   xmm (or GPR) numbers 0..15; REX carries W and the high bits of REG/RM."
+  (when prefix (emit-bytes buf prefix))
+  (let ((rex (logior (if w 8 0) (if (>= reg 8) 4 0) (if (>= rm 8) 1 0))))
+    (when (/= rex 0) (emit-bytes buf (logior #x40 rex))))
+  (emit-bytes buf #x0F op (logior #xC0 (ash (logand reg 7) 3) (logand rm 7))))
+
 (defun translate-instruction (state opcode operands mvm-next-pos)
   "Translate a single MVM instruction into x86-64 code.
    OPCODE is the numeric MVM opcode.
@@ -1724,8 +1732,20 @@
               ;; rdx = untag V3 (arg3)
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
               (emit-bytes buf #x48 #xD1 #xFA)   ; sar rdx, 1
+              ;; ARGS 4-6 ARE ZERO, not whatever R10/R8/R9 held.  WAIT4 is
+              ;; reached through here with three arguments and reads a fourth
+              ;; -- RUSAGE -- from R10, which is a live vreg: the kernel wrote a
+              ;; 144-byte struct rusage over whatever R10 pointed at.  In the
+              ;; ANSI runner's FORK-FILE that was the cell of *WSTATUS-ADDR*
+              ;; once the global-cell cache moved register allocation there
+              ;; (key overwritten, value 0, SIGSEGV in the parent: 13371 lost).
+              (emit-bytes buf #x41 #x52)         ; push r10
+              (emit-bytes buf #x45 #x31 #xD2)   ; xor r10d, r10d
+              (emit-bytes buf #x45 #x31 #xC0)   ; xor r8d, r8d
+              (emit-bytes buf #x45 #x31 #xC9)   ; xor r9d, r9d
               ;; syscall
               (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
+              (emit-bytes buf #x41 #x5A)         ; pop r10
               ;; Tag result → V0 (RSI)
               (emit-bytes buf #x48 #x01 #xC0)   ; add rax, rax
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
@@ -1753,8 +1773,14 @@
               (emit-bytes buf #x4C #x89 #xC6)   ; mov rsi, r8
               ;; rdx = V3 (arg3, raw)
               (emit-bytes buf #x4C #x89 #xCA)   ; mov rdx, r9
+              ;; Args 4-6 zero (see the #x0502 arm: WAIT4's RUSAGE in R10).
+              (emit-bytes buf #x41 #x52)         ; push r10
+              (emit-bytes buf #x45 #x31 #xD2)   ; xor r10d, r10d
+              (emit-bytes buf #x45 #x31 #xC0)   ; xor r8d, r8d
+              (emit-bytes buf #x45 #x31 #xC9)   ; xor r9d, r9d
               ;; syscall
               (emit-syscall-saving-rcx-r11 buf)     ; syscall (RCX/R11 preserved)
+              (emit-bytes buf #x41 #x5A)         ; pop r10
               ;; Result → V0 (RSI), raw
               (emit-bytes buf #x48 #x89 #xC6)   ; mov rsi, rax
               ;; Restore
@@ -2498,6 +2524,16 @@
                 ;; skipped while the gate is open; %RT-THREADS-ON clears what
                 ;; an earlier fault left.  With the gate shut -- every gate
                 ;; runner, every single-threaded image -- nothing changes.
+                ;;
+                ;; AND NOT AT ALL IN AN IMAGE THAT CAN RUN THREADS (X64-SSG-P).
+                ;; With the gate still shut, a fault on main left its RIP in the
+                ;; self slot until %RT-THREADS-ON cleared it, and meanwhile
+                ;; every reader of the slot took the RIP for main's window base:
+                ;; %TLS-SELF-BASE (so %HC-FAULT-FIXUP probed -- and could zero --
+                ;; a word at RIP+0x5058), %EVAL-LOCK-ME, the backtrace scratch.
+                ;; Those images record the RIP per thread instead, as frame 0 of
+                ;; THE FAULT'S BACKTRACE below.
+                (unless (x64-ssg-p)
                 (let ((skip-rip (make-label)))
                   (emit-bytes buf #x83 #x3C #x25)                   ; cmp dword [0x10000DB8], 0
                   (emit-u32 buf #x10000DB8)
@@ -2506,7 +2542,7 @@
                   (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (saved RIP)
                   (emit-bytes buf #x48 #x89 #x04 #x25)
                   (emit-u32 buf #x10000C30)
-                  (emit-label buf skip-rip))
+                  (emit-label buf skip-rip)))
                 (emit-bytes buf #x48 #x8B #x82 #xA0 #x00 #x00 #x00) ; mov rax, [rdx+0xA0] (saved RSP)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C38)
@@ -2524,6 +2560,58 @@
                 (emit-bytes buf #x48 #x89 #xD0)                     ; mov rax, rdx (ucontext ptr)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C58)
+                ;; THE FAULT'S BACKTRACE.  The longjmp below discards the
+                ;; faulting frames, so walk them NOW, while they exist: the
+                ;; interrupted RIP, then the return address of every frame up
+                ;; the RBP chain (gregs RBP = ucontext+0x78), into this
+                ;; thread's window -- +0x5200 the count, +0x5208.. up to 63
+                ;; addresses.  net/hosted-backtrace.lisp names them
+                ;; (MODUS:FAULT-BACKTRACE).  The chain is trusted only while
+                ;; it climbs: a link must be 8-aligned, above the last one,
+                ;; within 256 MB of the faulting RSP, and carry a return
+                ;; address above the zero page.  If it lies anyway and a read
+                ;; faults, SA_NODEFER re-enters this stub; the busy word at
+                ;; +0x51F8 makes that second entry skip the walk (and clear
+                ;; the word), so the fault is still recovered, just without
+                ;; frames.  Uses RAX/RCX (dead here) and saves RSI/RDI/R8.
+                (when (x64-ssg-p)
+                  (let ((walk-loop (make-label)) (walk-done (make-label))
+                        (walk-busy (make-label)))
+                    (emit-bytes buf #x56 #x57 #x41 #x50)            ; push rsi / rdi / r8
+                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf #x100051F8) (emit-bytes buf #x00)
+                    (emit-jcc buf :ne walk-busy)                    ; cmp qword fs:[busy], 0
+                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 1)
+                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x10005200) (emit-u32 buf 0)
+                    (emit-bytes buf #x48 #x8B #x72 #x78)            ; mov rsi, [rdx+0x78]  (RBP)
+                    (emit-bytes buf #x4C #x8B #x82 #xA0 #x00 #x00 #x00) ; mov r8, [rdx+0xA0] (RSP)
+                    (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (RIP)
+                    (emit-bytes buf #x64 #x48 #x89 #x04 #x25) (emit-u32 buf #x10005208) ; frame 0
+                    (emit-bytes buf #xB9 #x01 #x00 #x00 #x00)       ; mov ecx, 1
+                    (emit-bytes buf #x4C #x89 #xC7)                 ; mov rdi, r8 (the faulting RSP)
+                    (emit-label buf walk-loop)
+                    (emit-bytes buf #x83 #xF9 #x3F)                 ; cmp ecx, 63
+                    (emit-jcc buf :ae walk-done)
+                    (emit-bytes buf #x40 #xF6 #xC6 #x07)            ; test sil, 7
+                    (emit-jcc buf :ne walk-done)
+                    (emit-bytes buf #x4C #x39 #xC6)                 ; cmp rsi, r8
+                    (emit-jcc buf :b walk-done)
+                    (emit-bytes buf #x48 #x89 #xF0)                 ; mov rax, rsi
+                    (emit-bytes buf #x48 #x29 #xF8)                 ; sub rax, rdi
+                    (emit-bytes buf #x48 #x3D) (emit-u32 buf #x10000000) ; cmp rax, 256 MB
+                    (emit-jcc buf :a walk-done)
+                    (emit-bytes buf #x48 #x8B #x46 #x08)            ; mov rax, [rsi+8] (return address)
+                    (emit-bytes buf #x48 #x3D) (emit-u32 buf 4096)  ; cmp rax, 4096
+                    (emit-jcc buf :b walk-done)
+                    (emit-bytes buf #x64 #x48 #x89 #x04 #xCD) (emit-u32 buf #x10005208) ; fs:[+0x5208+rcx*8]
+                    (emit-bytes buf #xFF #xC1)                      ; inc ecx
+                    (emit-bytes buf #x4C #x8D #x46 #x10)            ; lea r8, [rsi+16]
+                    (emit-bytes buf #x48 #x8B #x36)                 ; mov rsi, [rsi]
+                    (emit-jmp buf walk-loop)
+                    (emit-label buf walk-done)
+                    (emit-bytes buf #x64 #x48 #x89 #x0C #x25) (emit-u32 buf #x10005200) ; count
+                    (emit-label buf walk-busy)
+                    (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf #x100051F8) (emit-u32 buf 0)
+                    (emit-bytes buf #x41 #x58 #x5F #x5E)))          ; pop r8 / rdi / rsi
                 ;; lock inc qword [0x10000CA0] -- the recovered-fault COUNT.
                 ;; The longjmp below publishes no condition; %HC-FAULT-FIXUP
                 ;; (cl-conditions) compares this against the last count it
@@ -4254,6 +4342,70 @@
 
         ;; ==== f32x4 vector class on the FP vregs (F0..F5 = xmm2..xmm7) ====
         ;; Encodings assembler-verified (movups/addps…/shufps/movss).
+
+        ;; ---- Unboxed DOUBLE-float class (fpd-*): the single-float ops above in
+        ;; double precision, with REX emitted for xmm8..13 (x64-fpp maps FP vregs
+        ;; 6..11 there).  RAX/RCX/RDX/xmm0 are scratch, as in the single ops.
+        ((op= +op-fpd-unbox+)
+         (let* ((fd (x64-fpp (first operands)))
+                (vsrc (second operands)))
+           (emit-load-vreg buf vsrc 'rax)
+           (emit-push buf 'rcx) (emit-push buf 'rdx)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
+           (x64-sse-rr buf #x66 t #x6E fd 1)                 ; movq xmmD, rcx
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
+
+        ((or (op= +op-fpd-lt+) (op= +op-fpd-le+))
+         ;; (fpd-lt/-le Vd Fa Fb) -- UCOMISD Fb, Fa: Fb > Fa is "above" (CF=0,
+         ;; ZF=0) and Fb >= Fa "above or equal" (CF=0); an unordered pair
+         ;; sets CF, so a NaN answers 0 as CL requires.  SETcc, zero-extend,
+         ;; tag as a fixnum.
+         (let ((vd (first operands))
+               (fa (x64-fpp (second operands)))
+               (fb (x64-fpp (third operands))))
+           (x64-sse-rr buf #x66 nil #x2E fb fa)                 ; ucomisd xmmB, xmmA
+           (emit-bytes buf #x0F (if (op= +op-fpd-lt+) #x97 #x93) #xC0)   ; seta / setae al
+           (emit-bytes buf #x0F #xB6 #xC0)                      ; movzx eax, al
+           (emit-shl-reg-imm buf 'rax 1)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
+        ((op= +op-fpd-itof+)
+         ;; (fpd-itof Fd Vs) -- SAR 1, CVTSI2SD xmmD, rax: a fixnum straight into
+         ;; the FP register, with no box.
+         (let ((fd (x64-fpp (first operands))))
+           (emit-load-vreg buf (second operands) 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           (x64-sse-rr buf #xF2 t #x2A fd 0)))               ; cvtsi2sd xmmD, rax
+
+        ((op= +op-fpd-box+)
+         (let* ((vd (first operands))
+                (fs (x64-fpp (second operands))))
+           (emit-push buf 'rcx) (emit-push buf 'rdx)
+           (emit-mov-reg-imm buf 'rcx #x460)                 ; (count 4)<<8 | #x60 double
+           (emit-mov-mem-reg buf 'r12 'rcx 0)
+           (x64-sse-rr buf #x66 t #x7E fs 1)                 ; movq rcx, xmmS
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
+           (emit-mcgc-set-start-bit buf 'r12)
+           (emit-lea buf 'rax 'r12 9)
+           (emit-add-reg-imm buf 'r12 48)
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
+        ((or (op= +op-fpd-add+) (op= +op-fpd-sub+) (op= +op-fpd-mul+) (op= +op-fpd-div+))
+         (let* ((fd (x64-fpp (first operands)))
+                (fa (x64-fpp (second operands)))
+                (fb (x64-fpp (third operands)))
+                (sse (cond ((op= +op-fpd-add+) #x58)     ; ADDSD
+                           ((op= +op-fpd-sub+) #x5C)     ; SUBSD
+                           ((op= +op-fpd-mul+) #x59)     ; MULSD
+                           (t                  #x5E))))  ; DIVSD
+           (x64-sse-rr buf nil nil #x28 0 fb)                ; movaps xmm0, xmmB
+           (unless (= fd fa) (x64-sse-rr buf nil nil #x28 fd fa))   ; movaps xmmD, xmmA
+           (x64-sse-rr buf #xF2 nil sse fd 0)))              ; opsd xmmD, xmm0
 
         ((op= +op-v4-lane-load+)
          ;; (v4-lane-load Fd Varr Vidx) — MOVUPS xmmD, [arr + 4*idx + 7]

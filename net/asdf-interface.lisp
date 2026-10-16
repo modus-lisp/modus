@@ -165,7 +165,7 @@
   (when finish-output
     (ignore-errors (finish-output *standard-output*))
     (ignore-errors (finish-output *error-output*)))
-  (sys-exit code))
+  (%cli-exit code))
 
 (defun uiop::getenvp (name)
   (let ((v (uiop::getenv name))) (and v (plusp (length v)))))
@@ -888,7 +888,16 @@
           (cond
             ((%it-file-exists-p full)
              (princ "    ") (princ full) (terpri) (finish-output)
-             (%it-eval-source (%it-slurp-text full) p))
+             ;; A FORM THAT CANNOT BE READ IS AN ERROR, as in ASDF (the file fails to
+             ;; compile).  The tarball loader's read error ends the file -- the stream
+             ;; is at an unknown offset -- and it used to print "REST OF FILE
+             ;; DISCARDED" and go on, so a system with one unreadable form (an SBCL-
+             ;; internal symbol, say) lost the rest of that file and reported success.
+             (let ((before (%it-read-errors)))
+               (%it-eval-source (%it-slurp-text full) p)
+               (unless (= before (%it-read-errors))
+                 (error "ASDF:LOAD-SYSTEM: ~A: a form in ~A could not be read (the reader error is printed above); the rest of that file was not loaded."
+                        (asdf::component-name sys) full))))
             ;; A MISSING SOURCE FILE IS AN ERROR, as in ASDF.  It used to print
             ;; "(missing: ...)" and go on, so a system whose every file was looked
             ;; for in the wrong directory -- a symlinked .asd whose TRUENAME did not

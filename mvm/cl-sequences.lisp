@@ -980,16 +980,28 @@
                 ;; calls and a &rest cons per character (AREF dispatch +
                 ;; code-char boxing x2, CHAR= &rest, %CHAR2=, %ENSURE-CHAR-
                 ;; CODE x2) — CHAR= was 20% of a library-load profile.
-                (loop
-                  (when (= i len1) (return t))
-                  ;; Slots normally hold CODES, but a slot may hold a CHARACTER
-                  ;; (see %ENSURE-CHAR-CODE) — so a raw EQ miss re-compares
-                  ;; through the normalizer before declaring a mismatch.
-                  (let ((ca (%prim-aref sa (+ s1 i))) (cb (%prim-aref sb (+ s2 i))))
-                    (unless (or (eq ca cb)
-                                (eql (%ensure-char-code ca) (%ensure-char-code cb)))
-                      (return nil)))
-                  (setq i (+ i 1)))
+                ;; %WORD-AREF, not %PRIM-AREF: both are plain #x31 strings (never
+                ;; byte-packed), so the per-character u8-or-word subtag test is
+                ;; waste; and whole strings (both starts 0, the EQUAL / hash-table
+                ;; case) walk one index.
+                (if (and (eql s1 0) (eql s2 0))
+                    (loop
+                      (when (= i len1) (return t))
+                      (let ((ca (%word-aref sa i)) (cb (%word-aref sb i)))
+                        (unless (or (eq ca cb)
+                                    (eql (%ensure-char-code ca) (%ensure-char-code cb)))
+                          (return nil)))
+                      (setq i (+ i 1)))
+                    (loop
+                      (when (= i len1) (return t))
+                      ;; Slots normally hold CODES, but a slot may hold a CHARACTER
+                      ;; (see %ENSURE-CHAR-CODE) — so a raw EQ miss re-compares
+                      ;; through the normalizer before declaring a mismatch.
+                      (let ((ca (%word-aref sa (+ s1 i))) (cb (%word-aref sb (+ s2 i))))
+                        (unless (or (eq ca cb)
+                                    (eql (%ensure-char-code ca) (%ensure-char-code cb)))
+                          (return nil)))
+                      (setq i (+ i 1))))
                 (loop
                   (when (= i len1) (return t))
                   ;; AREF on strings now yields CHARACTERs — compare via char=.
@@ -2256,7 +2268,15 @@
   ;; signals, which also keeps the zero away from the division.  A caller
   ;; that indexed with (random 0) used to go on to read one past the end of
   ;; an empty vector (ANSI subtypep 26525/26526 "passed" that way).
-  (if (not (or (and (integerp n) (> n 0)) (and (floatp-impl n) (> n 0))))
+  ;; A positive fixnum, or a finite positive double by its bits (a sign-clear
+  ;; high word below the infinity exponent, not zero), answers before the
+  ;; generic test: (> n 0) of a double is the NUMERIC-VALUE-LESS-P chain, most
+  ;; of a (random 1d0).
+  (if (not (or (and (fixnump n) (> n 0))
+               (and (double-float-p n)
+                    (let ((hi (%float-hi32 n)))
+                      (and (< hi #x7FF00000) (or (> hi 0) (> (%float-lo32 n) 0)))))
+               (and (integerp n) (> n 0)) (and (floatp-impl n) (> n 0))))
       (error 'type-error :datum n :expected-type '(or (integer 1) (float (0.0))))
       ;; The seed lives at #x10000FD8 -- NOT #x100000A0, which is the SECOND
       ;; extra slot of the multiple-value buffer (#x10000098..#x10000138): every
@@ -2279,9 +2299,17 @@
         ;; never terminated).  Scale the 30-bit LCG output into [0,1) and
         ;; multiply: NEXT maxes at #x3FFFFFFF so the fraction is < 1 and the
         ;; product is strictly < N.
-        (if (floatp-impl n)
-            (* n (/ (float next) 1073741824.0))
-            (- next (* (truncate next n) n))))))
+        (cond
+          ;; A DOUBLE limit: the fraction NEXT/2^30 is exact in double (and
+          ;; < 1), and so is N times it short of N -- a double has far more
+          ;; than 30 bits.  The single-float fraction below made (random 1d0)
+          ;; single-precision, and ran through generic arithmetic and
+          ;; single rounding (cl-bench MRG32K3A, which times RANDOM).
+          ((double-float-p n)
+           (%float-mul n (%float-div (%float-from-int next) 1073741824d0)))
+          ((floatp-impl n)
+           (* n (/ (float next) 1073741824.0)))
+          (t (- next (* (truncate next n) n)))))))
 (defun do-special-strings (fn) (funcall fn ""))
 
 ;;; String functions
@@ -2987,11 +3015,44 @@
             (t (setq a (cddr a)))))
     (list from-end start end)))
 
+(defun %dups-keep-list-eql (seq key-fn from-end start eff-end n)
+  "%DUPS-KEEP-LIST for the default (EQL) test, in linear time: walk the window
+   from the end (keep the LAST of each group) or from the start (FROM-END,
+   keep the FIRST) through an EQL hash set of the keys seen so far.  The
+   pairwise scan below was quadratic -- cl-bench's SUM-PERMUTATIONS dedups
+   362880 sums and ran for over half an hour (SBCL: 0.2 s)."
+  (let ((v (make-array n)) (keep (make-array n))
+        (seen (make-hash-table :test 'eql)) (cur seq) (i 0))
+    (loop
+      (when (null cur) (return))
+      (setf (svref v i) (car cur))
+      (setf (svref keep i) t)
+      (setq cur (cdr cur))
+      (setq i (+ i 1)))
+    (flet ((visit (j)
+             (let ((k (if key-fn (funcall key-fn (svref v j)) (svref v j))))
+               (if (nth-value 1 (gethash k seen))
+                   (setf (svref keep j) nil)
+                   (setf (gethash k seen) t)))))
+      (if from-end
+          (let ((j start)) (loop (when (>= j eff-end) (return)) (visit j) (setq j (+ j 1))))
+          (let ((j (- eff-end 1))) (loop (when (< j start) (return)) (visit j) (setq j (- j 1))))))
+    (let ((r nil) (j (- n 1)))
+      (loop
+        (when (< j 0) (return r))
+        (when (svref keep j) (setq r (cons (svref v j) r)))
+        (setq j (- j 1))))))
+
 (defun %dups-keep-list (seq test-fn key-fn from-end start end)
   "Core list dedup honoring :start/:end.  Elements outside [start,end) are
    always retained and do NOT participate in duplicate comparison.  Within
    the window: without FROM-END keep the LAST occurrence of each group; with
    FROM-END keep the FIRST.  Result preserves original order."
+  (when (null test-fn)
+    (let ((n (length seq)))
+      (when (> n 16)
+        (return-from %dups-keep-list
+          (%dups-keep-list-eql seq key-fn from-end start (if end end n) n)))))
   (let ((eff-end (if end end (length seq)))
         (r nil) (cur seq) (i 0))
     (loop
@@ -3122,7 +3183,7 @@
   (and (not (fixnump x)) (not (consp x)) (not (null x))
        (not (characterp x))
        (= (obj-subtag x) #x32)
-       (>= (array-length x) 3)
+       (>= (%prim-array-length x) 3)
        (eq (aref x 0) '%complex-marker)))
 
 (defun complex (r &optional i)
@@ -3140,9 +3201,13 @@
       (t
        ;; Float contagion: if either part is a float, coerce both to float.
        (let ((rf r) (im i))
+         ;; ONE format for both parts (CLHS 12.1.5.2): the widest float among
+         ;; them.  %ANY-TO-FLOAT made a rational part DOUBLE beside a single
+         ;; one -- (+ #c(1 2) 0.5) was #C(1.5 2.0d0), not #C(1.5 2.0).
          (when (or (%ieee-float-p r) (%ieee-float-p i))
-           (setq rf (%any-to-float r))
-           (setq im (%any-to-float i)))
+           (let ((proto (if (or (double-float-p r) (double-float-p i)) 1d0 1.0)))
+             (setq rf (float r proto))
+             (setq im (float i proto))))
          (let ((c (make-array 3)))
            (aset c 0 '%complex-marker)
            (aset c 1 rf)
@@ -3194,19 +3259,40 @@
 (defun %complex-real (x) (if (%complex-p x) (aref x 1) x))
 (defun %complex-imag (x) (if (%complex-p x) (aref x 2) 0))
 
+;;; The complex arithmetic below inspects each operand ONCE (%COMPLEX-REAL and
+;;; %COMPLEX-IMAG each re-ran %COMPLEX-P, whose marker test is a quoted-symbol
+;;; lookup) and builds a float-part result with %COMPLEX-FLOATS -- what COMPLEX
+;;; returns for two float parts, without its rational-collapse and contagion
+;;; tests or the full MAKE-ARRAY.  An FFT on complex doubles spent most of its
+;;; time in those (reed's Opus MDCT).
+
+(defun %complex-floats (r i)
+  "The complex R + iI.  When both parts are IEEE floats of one format this
+   is exactly COMPLEX's object, built directly; otherwise COMPLEX."
+  (if (and (%ieee-float-p r) (%ieee-float-p i) (= (obj-subtag r) (obj-subtag i)))
+      (let ((c (%make-array-raw 3)))
+        (aset c 0 '%complex-marker)
+        (aset c 1 r)
+        (aset c 2 i)
+        c)
+      (complex r i)))
+
 (defun complex-add (a b)
-  (complex (+ (%complex-real a) (%complex-real b))
-           (+ (%complex-imag a) (%complex-imag b))))
+  (let* ((ac (%complex-p a)) (bc (%complex-p b)))
+    (%complex-floats (+ (if ac (aref a 1) a) (if bc (aref b 1) b))
+                     (+ (if ac (aref a 2) 0) (if bc (aref b 2) 0)))))
 
 (defun complex-sub (a b)
-  (complex (- (%complex-real a) (%complex-real b))
-           (- (%complex-imag a) (%complex-imag b))))
+  (let* ((ac (%complex-p a)) (bc (%complex-p b)))
+    (%complex-floats (- (if ac (aref a 1) a) (if bc (aref b 1) b))
+                     (- (if ac (aref a 2) 0) (if bc (aref b 2) 0)))))
 
 (defun complex-mul (a b)
-  (let ((ar (%complex-real a)) (ai (%complex-imag a))
-        (br (%complex-real b)) (bi (%complex-imag b)))
-    (complex (- (* ar br) (* ai bi))
-             (+ (* ar bi) (* ai br)))))
+  (let* ((ac (%complex-p a)) (bc (%complex-p b))
+         (ar (if ac (aref a 1) a)) (ai (if ac (aref a 2) 0))
+         (br (if bc (aref b 1) b)) (bi (if bc (aref b 2) 0)))
+    (%complex-floats (- (* ar br) (* ai bi))
+                     (+ (* ar bi) (* ai br)))))
 
 (defun complex-div (a b)
   (let ((ar (%complex-real a)) (ai (%complex-imag a))
@@ -4745,25 +4831,64 @@
             (aset result i (logand 1 (funcall op b1 b2))))
           (setq i (+ i 1)))))))
 
-(defun bit-and (v1 v2 &optional result) (%bit-op (lambda (a b) (logand a b)) v1 v2 result))
+(defun %bit-raw-data (v len)
+  "The word vector holding V's bits in row-major order when V is a plain
+   vector or a non-displaced native MDA over one, with room for LEN; else NIL."
+  (cond ((or (null v) (consp v) (fixnump v)) nil)
+        ((%mda-p v)
+         (and (null (%mda-displaced v))
+              (let ((d (%mda-data v)))
+                (and d (not (consp d)) (not (%mda-p d)) (not (%prim-stringp d))
+                     (not (eq (obj-subtag d) #x12))
+                     (>= (array-length d) len) d))))
+        ((%prim-stringp v) nil)
+        ((eq (obj-subtag v) #x12) nil)
+        ((>= (array-length v) len) v)
+        (t nil)))
 
-(defun bit-ior (v1 v2 &optional result) (%bit-op (lambda (a b) (logior a b)) v1 v2 result))
+(defun %bit-op-fast (code v1 v2 result-vec op)
+  "%BIT-OP with the operation as CODE (0 and 1 ior 2 xor 3 eqv 4 nand 5 nor
+   6 andc1 7 andc2 8 orc1 9 orc2) over the arrays' raw data, when all three
+   expose it: one raw read per operand and one raw write per bit, where
+   %BIT-OP paid a generic AREF per operand, a closure call and a generic
+   ASET (cl-bench BITVECTORS, 2265x SBCL).  Otherwise %BIT-OP with OP."
+  (let* ((len (min (array-length v1) (array-length v2)))
+         (result (cond ((eq result-vec t) v1)
+                       (result-vec result-vec)
+                       (t (make-array (array-dimensions v1) :element-type 'bit))))
+         (d1 (%bit-raw-data v1 len))
+         (d2 (and d1 (%bit-raw-data v2 len)))
+         (dr (and d2 (%bit-raw-data result len))))
+    (if (null dr)
+        (%bit-op op v1 v2 result)
+        (let ((i 0))
+          (loop
+            (when (>= i len) (return result))
+            (let* ((a (logand (%prim-aref d1 i) 1))
+                   (b (logand (%prim-aref d2 i) 1))
+                   (r (cond ((= code 0) (logand a b))
+                            ((= code 1) (logior a b))
+                            ((= code 2) (logxor a b))
+                            ((= code 3) (logxor 1 (logxor a b)))
+                            ((= code 4) (logxor 1 (logand a b)))
+                            ((= code 5) (logxor 1 (logior a b)))
+                            ((= code 6) (logand (logxor 1 a) b))
+                            ((= code 7) (logand a (logxor 1 b)))
+                            ((= code 8) (logior (logxor 1 a) b))
+                            (t (logior a (logxor 1 b))))))
+              (%prim-aset dr i r))
+            (setq i (+ i 1)))))))
 
-(defun bit-xor (v1 v2 &optional result) (%bit-op (lambda (a b) (logxor a b)) v1 v2 result))
-
-(defun bit-eqv (v1 v2 &optional result) (%bit-op (lambda (a b) (logxor 1 (logxor a b))) v1 v2 result))
-
-(defun bit-nand (v1 v2 &optional result) (%bit-op (lambda (a b) (logxor 1 (logand a b))) v1 v2 result))
-
-(defun bit-nor (v1 v2 &optional result) (%bit-op (lambda (a b) (logxor 1 (logior a b))) v1 v2 result))
-
-(defun bit-andc1 (v1 v2 &optional result) (%bit-op (lambda (a b) (logand (logxor 1 a) b)) v1 v2 result))
-
-(defun bit-andc2 (v1 v2 &optional result) (%bit-op (lambda (a b) (logand a (logxor 1 b))) v1 v2 result))
-
-(defun bit-orc1 (v1 v2 &optional result) (%bit-op (lambda (a b) (logior (logxor 1 a) b)) v1 v2 result))
-
-(defun bit-orc2 (v1 v2 &optional result) (%bit-op (lambda (a b) (logior a (logxor 1 b))) v1 v2 result))
+(defun bit-and (v1 v2 &optional result) (%bit-op-fast 0 v1 v2 result (lambda (a b) (logand a b))))
+(defun bit-ior (v1 v2 &optional result) (%bit-op-fast 1 v1 v2 result (lambda (a b) (logior a b))))
+(defun bit-xor (v1 v2 &optional result) (%bit-op-fast 2 v1 v2 result (lambda (a b) (logxor a b))))
+(defun bit-eqv (v1 v2 &optional result) (%bit-op-fast 3 v1 v2 result (lambda (a b) (logxor 1 (logxor a b)))))
+(defun bit-nand (v1 v2 &optional result) (%bit-op-fast 4 v1 v2 result (lambda (a b) (logxor 1 (logand a b)))))
+(defun bit-nor (v1 v2 &optional result) (%bit-op-fast 5 v1 v2 result (lambda (a b) (logxor 1 (logior a b)))))
+(defun bit-andc1 (v1 v2 &optional result) (%bit-op-fast 6 v1 v2 result (lambda (a b) (logand (logxor 1 a) b))))
+(defun bit-andc2 (v1 v2 &optional result) (%bit-op-fast 7 v1 v2 result (lambda (a b) (logand a (logxor 1 b)))))
+(defun bit-orc1 (v1 v2 &optional result) (%bit-op-fast 8 v1 v2 result (lambda (a b) (logior (logxor 1 a) b))))
+(defun bit-orc2 (v1 v2 &optional result) (%bit-op-fast 9 v1 v2 result (lambda (a b) (logior a (logxor 1 b)))))
 
 (defun bit-not (v1 &optional result)
   (let ((len (array-length v1)))

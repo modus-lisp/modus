@@ -27,6 +27,9 @@
 ;; Populated by %eval-compound's DEFTYPE branch; allocated lazily (defvar
 ;; init-thunks don't run at boot — CLAUDE.md item 7).
 (defvar *%runtime-deftype-table* nil)
+(defvar *%deftype-name-hashes* nil
+  "Name hash (a symbol's slot 0) -> T for every name DEFTYPE has registered;
+   NIL until the first one.  Written only where a deftype is defined.")
 
 (defun %nsft-init ()
   (setq *native-sym-function-table* (make-hash-table)))
@@ -76,6 +79,19 @@
               ;; fault -- a MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
               (if nfn nfn (symbol-function sym))))))))
 
+;;; A runtime-born package's symbol keys the function tables by its
+;;; package-qualified name; building and hashing that string was most of a
+;;; SYMBOL-FUNCTION (3 us -- and FUNCALL / MAPCAR of a symbol, and every
+;;; #'NAME across modules, go through it).  The pair is memoised per symbol
+;;; (EQ), filled on the main thread only, as the CLOS memos.
+(defvar *sym-qn-memo* nil)
+
+(defun %sym-qn-remember (sym pair)
+  (when (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil))
+    (unless (consp *sym-qn-memo*) (setq *sym-qn-memo* (make-hash-table :test 'eq)))
+    (puthash sym *sym-qn-memo* (cons (%cl-sym-package sym) pair)))
+  pair)
+
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:
    - CL-symbol wrapper:    (NAME . HASH-of-NAME)
@@ -109,11 +125,22 @@
                               (t (symbol-name inner))))
             (full (concatenate 'string "SETF-" inner-name)))
        (cons full (compute-name-hash full))))
+    ;; (A hash table is a cons here; the unbound marker an uninitialised
+    ;; defvar reads as in the gate image is a fixnum.)
+    ;; A hit is trusted only while the symbol's home package is the one it
+    ;; was computed under: a symbol can get its home package after its first
+    ;; lookup (ANSI load.15 lost its function cell to a stale bare key).
+    ((and (%cl-sym-p sym)
+          (let ((m *sym-qn-memo*))
+            (and (consp m)
+                 (let ((e (gethash sym m)))
+                   (and e (eq (car e) (%cl-sym-package sym)) (cdr e)))))))
     ((%cl-sym-p sym)
      (let ((nm (%cl-sym-name sym)))
        (when nm
          (let ((pkg (%cl-sym-package sym)))
            (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
+             (%sym-qn-remember sym
                ;; Runtime-born library package: key by the PACKAGE-QUALIFIED
                ;; name, hashed with compute-name-hash (fixnum-safe, no
                ;; multiply/bignum — %fixnum-* promotes to a BIGNUM when
@@ -122,12 +149,12 @@
                ;; TRIVIAL-GARBAGE::MAKE-HASH-TABLE a DISTINCT function cell,
                ;; so it no longer clobbers CL:MAKE-HASH-TABLE.
                (let ((qn (concatenate 'string (%pkg-name pkg) "::" nm)))
-                 (cons qn (compute-name-hash qn)))
+                 (cons qn (compute-name-hash qn))))
                ;; Bare key (system / build-baked package) — byte-identical
                ;; to the historical behavior; keeps CL functions reachable
                ;; through both native #x50 syms (boot) and COMMON-LISP
                ;; wrappers (user code).
-               (cons nm (compute-name-hash nm)))))))
+               (%sym-qn-remember sym (cons nm (compute-name-hash nm))))))))
     ((stringp sym)
      (cons sym (compute-name-hash sym)))
     ((and (not (consp sym)) (not (fixnump sym)) (not (characterp sym))
@@ -1031,6 +1058,21 @@
         (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
       (%deftype-pkg-put tname name-str entry)
       (puthash name-str *%runtime-deftype-table* entry)
+      ;; The NAME HASH (slot 0, shared by every symbol of this name) goes in a
+      ;; fixnum-keyed set, so %DEFTYPE-LOOKUP can answer "no deftype" -- the
+      ;; case for every standard type name, on every MAKE-ARRAY with an
+      ;; :ELEMENT-TYPE -- without hashing and comparing name strings.
+      ;; Created SEEDED with every name already registered -- the image boots
+      ;; with deftypes in the table that no runtime DEFTYPE put there -- so the
+      ;; set is never missing a name the table has.
+      (unless (hash-table-p *%deftype-name-hashes*)   ; not NIL alone: see %DEFTYPE-LOOKUP
+        (let ((h (make-hash-table :test 'eql)))
+          (maphash (lambda (k v) (declare (ignore v))
+                     (when (stringp k) (puthash (compute-name-hash k) h t)))
+                   *%runtime-deftype-table*)
+          (setq *%deftype-name-hashes* h)))
+      (when (and (symbolp tname) tname (not (eq tname t)))
+        (puthash (aref tname 0) *%deftype-name-hashes* t))
       (%deftype-warm tname)))
   tname)
 
@@ -1320,6 +1362,50 @@
 ;;; %block-return condition = (%block-return-cond . (tag . value))
 (defvar *%eval-throw-tag* nil)
 (defvar *%eval-throw-value* nil)
+
+(defun %gv-site-cell (hash site)
+  "The globals cell for HASH through SITE, a per-site cons in runtime-compiled
+   code (CAR = the cell once found, else NIL), or NIL when HASH has no cell
+   yet.  Unarmed callers only; filled on the main thread only.  Cells are never
+   replaced, so a found one stays the live cell."
+  (let ((c (car site)))
+    (if (and (consp c) (eq (car c) hash))
+        c
+        (let ((cl (%gv-cell hash)))
+          (when (and (consp cl)
+                     (if (= (mem-ref #x10000FF8 :u32) 0) t (if (= (percpu-ref 16) 0) t nil)))
+            (set-car site cl))
+          (and (consp cl) cl)))))
+
+(defun %e2-symbol-value-site (hash sym site)
+  "%E2-SYMBOL-VALUE-CHECKED for a runtime read of a special that had no cell
+   when the read was compiled (a DEFVAR without a value, or a variable defined
+   later): through SITE's memoised cell once it exists, instead of a table
+   probe per read (cl-bench STAK)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site)))
+        (if c (cdr c) (%e2-symbol-value-checked hash sym)))
+      (%e2-symbol-value-checked hash sym)))
+
+(defun %gv-site-ref (hash site)
+  "The LET-special save (%GV-REF semantics: NIL when absent) through SITE."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site))) (if c (cdr c) nil))
+      (%gv-ref hash)))
+
+(defun %dynbind-site (hash val site)
+  "%DYNBIND through SITE: unarmed with a cell, store in place."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site)))
+        (if c (progn (set-cdr c val) val) (%dynbind hash val)))
+      (%dynbind hash val)))
+
+(defun %dynunbind-site (hash saved site)
+  "%DYNUNBIND through SITE."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((c (%gv-site-cell hash site)))
+        (if c (progn (set-cdr c saved) saved) (%dynunbind hash saved)))
+      (%dynunbind hash saved)))
 
 (defun %e2-symbol-value-checked (hash sym)
   "mvm-eval (WS3 flip) global-variable READ with CL unbound-variable semantics.
@@ -1614,6 +1700,15 @@
                               (or (%compile-lambda-form form)
                                   (list '%interp-closure
                                         (cadr form) (cddr form) nil))))
+       ;; (compile 'f) with no definition: CLHS says compile F's own definition.
+       ;; A DEFUN that LOAD evaluated once stays an interpreter trampoline
+       ;; (retry-on-hot never fires for a DEFUN), ~100x slower than native, and
+       ;; this used to return the name and change nothing.  The JIT's module
+       ;; registry holds every such DEFUN's compiled module; JIT-EAGER
+       ;; translates the pending ones (F among them) -- a module that cannot be
+       ;; translated stays interpreted and still works.
+       (when (and (null def) (fboundp '%jit-eager-all))
+         (ignore-errors (funcall (symbol-function '%jit-eager-all))))
        (values name nil nil)))))
 
 
@@ -2026,11 +2121,22 @@
            (be  (%parse-start-end args len))
            (start (car be)) (end (cdr be))
            (result (%make-string-array len)))
-      (dotimes (i len)
-        (let ((ch (%ensure-char-code (aref s i))))
-          (if (and (>= i start) (< i end) (lower-case-p (code-char ch)))
-              (aset result i (- ch 32))
-              (aset result i ch))))
+      (if (and (%prim-stringp s) (not (%mda-p s)))
+          ;; A simple string: raw slots, ASCII inline, the rest by CHAR-UPCASE
+          ;; (the generic AREF / CODE-CHAR / LOWER-CASE-P per character was
+          ;; most of a STRING-UPCASE).
+          (dotimes (i len)
+            (let ((c (%ensure-char-code (%prim-aref s i))))
+              (%prim-aset result i
+                          (cond ((or (< i start) (>= i end)) c)
+                                ((and (>= c 97) (<= c 122)) (- c 32))
+                                ((< c 128) c)
+                                (t (char-code (char-upcase (code-char c))))))))
+          (dotimes (i len)
+            (let ((ch (%ensure-char-code (aref s i))))
+              (if (and (>= i start) (< i end) (lower-case-p (code-char ch)))
+                  (aset result i (char-code (char-upcase (code-char ch))))
+                  (aset result i ch)))))
       result)))
 
 (defun string-downcase (str &rest args)
@@ -2040,11 +2146,19 @@
            (be  (%parse-start-end args len))
            (start (car be)) (end (cdr be))
            (result (%make-string-array len)))
-      (dotimes (i len)
-        (let ((ch (%ensure-char-code (aref s i))))
-          (if (and (>= i start) (< i end) (upper-case-p (code-char ch)))
-              (aset result i (+ ch 32))
-              (aset result i ch))))
+      (if (and (%prim-stringp s) (not (%mda-p s)))
+          (dotimes (i len)
+            (let ((c (%ensure-char-code (%prim-aref s i))))
+              (%prim-aset result i
+                          (cond ((or (< i start) (>= i end)) c)
+                                ((and (>= c 65) (<= c 90)) (+ c 32))
+                                ((< c 128) c)
+                                (t (char-code (char-downcase (code-char c))))))))
+          (dotimes (i len)
+            (let ((ch (%ensure-char-code (aref s i))))
+              (if (and (>= i start) (< i end) (upper-case-p (code-char ch)))
+                  (aset result i (char-code (char-downcase (code-char ch))))
+                  (aset result i ch)))))
       result)))
 
 (defun string-capitalize (str &rest args)
@@ -2539,8 +2653,14 @@
        (t 1)))
     ((= power 1) base)
     ((and (integerp power) (> power 0) (integerp base))
-     (let ((r 1))
-       (dotimes (i power r) (setq r (bignum-mul r base)))))
+     ;; Square-and-multiply: log2(POWER) multiplies, not POWER of them --
+     ;; (expt 10 40000) was 40000 bignum multiplies.
+     (let ((r 1) (b base) (p power))
+       (loop
+         (when (oddp p) (setq r (bignum-mul r b)))
+         (setq p (ash p -1))
+         (when (= p 0) (return r))
+         (setq b (bignum-mul b b)))))
     ((and (integerp power) (> power 0))
      ;; Float-base × integer-positive-power.  Watch for IEEE
      ;; overflow/underflow.
@@ -2940,13 +3060,22 @@
         (setq result (cons limb result))
         (setq cur (if (cdr cur) (cddr cur) nil))))))
 
+(defun %list-to-simple-vector (lst)
+  (let* ((n (length lst)) (v (make-array n)) (i 0))
+    (loop (when (null lst) (return v))
+      (setf (svref v i) (car lst))
+      (setq lst (cdr lst))
+      (setq i (+ i 1)))))
+
 (defun %mul-limbs-mag (xs ys)
   "Multiply two LSB-first limbs lists XS · YS via N²·O(31-bit) schoolbook.
    Each limb is 62 bits; we split into two 31-bit half-limbs so that
    half×half fits in a fixnum.  Returns LSB-first limbs list of the
    product."
-  (let* ((ah (%limbs-to-halves xs))
-         (bh (%limbs-to-halves ys))
+  ;; The half-limbs go into VECTORS: the loops below index them, and NTH on
+  ;; the lists made the schoolbook multiply cubic.
+  (let* ((ah (%list-to-simple-vector (%limbs-to-halves xs)))
+         (bh (%list-to-simple-vector (%limbs-to-halves ys)))
          (na (length ah))
          (nb (length bh))
          (nout (+ na nb))
@@ -2959,7 +3088,7 @@
     ;; Schoolbook: for each i, j → out[i+j] += ah[i] * bh[j], carry-propagate.
     (let ((i 0))
       (loop (when (>= i na) (return nil))
-        (let ((j 0) (carry 0) (ai (nth i ah)))
+        (let ((j 0) (carry 0) (ai (svref ah i)))
           (loop (when (>= j nb)
                   ;; Propagate remaining carry into successive limbs.
                   (let ((pos (+ i j)))
@@ -2972,7 +3101,7 @@
                         (setq carry newcarry)
                         (setq pos (+ pos 1)))))
                   (return nil))
-            (let* ((bj (nth j bh))
+            (let* ((bj (svref bh j))
                    (prod (* ai bj))
                    (pos (+ i j))
                    (cur (aref out pos))
@@ -4769,6 +4898,42 @@
     ;; evaluated form works.
     (handler-case (eval (list 'jit-eager)) (serious-condition (c) nil))))
 
+;;; A SCRIPT'S OWN DEFUNS START NATIVE.  The hot-function JIT promotes a DEFUN
+;;; after its first expensive call -- but that call runs to the end interpreted
+;;; (there is no on-stack replacement), and for a script that call is often the
+;;; whole program: a 4096-step loop took 64 ms its first time and 43 us after.
+;;; So when toplevel forms of the OUTERMOST load register new modules, the JIT
+;;; runs before the next toplevel form that is not itself a definition: a run of
+;;; DEFUNs is translated as one batch and the call after it -- (main) -- finds
+;;; them native.  Between two toplevel forms nothing loaded is executing (see
+;;; DEFERRED JIT above).  MODUS_NO_LOAD_JIT=1 turns it off with the loader's.
+(defvar *jit-script-defs* t
+  "NIL turns off the batch JIT of a script's own DEFUNs (%MAYBE-JIT-SCRIPT-DEFS);
+   so does *JIT-HOT-CALLS* = 0.  Boots NIL in an image that skips DEFVAR
+   inits, where it is then simply off.")
+(defun %definition-form-p (form)
+  (and (consp form) (symbolp (car form))
+       (member (symbol-name (car form))
+               '("DEFUN" "DEFMACRO" "DEFVAR" "DEFPARAMETER" "DEFCONSTANT" "DEFSTRUCT"
+                 "DEFCLASS" "DEFMETHOD" "DEFGENERIC" "DEFTYPE" "DEFPACKAGE" "IN-PACKAGE"
+                 "DECLAIM" "PROCLAIM" "EVAL-WHEN" "DEFINE-CONDITION" "DEFSETF"
+                 "DEFINE-MODIFY-MACRO" "DEFINE-COMPILER-MACRO" "DEFINE-SETF-EXPANDER"
+                 "DEFINE-SYMBOL-MACRO")
+               :test #'string=)))
+
+(defun %maybe-jit-script-defs (form)
+  (when (and (= (%load-depth) 1)
+             (handler-case (eq *jit-script-defs* t) (t (c) nil))
+             (not (handler-case (eql *jit-hot-calls* 0) (t (c) nil)))
+             (not (%definition-form-p form))
+             (handler-case (consp *jit-script-def-names*) (t (c) nil))
+             (let ((off (handler-case (and (fboundp '%cli-getenv)
+                                           (funcall '%cli-getenv "MODUS_NO_LOAD_JIT"))
+                          (t (c) nil))))
+               (not (and off (> (length off) 0) (not (string= off "0"))))))
+    ;; Through EVAL, as %MAYBE-RUN-PENDING-JIT runs JIT-EAGER.
+    (handler-case (eval (list '%jit-build-script-defs)) (serious-condition (c) nil))))
+
 (defun %load-from-stream (stream verbose print)
   "Read+eval all forms from STREAM.  Returns T."
   (setq *%load-depth* (+ (%load-depth) 1))
@@ -4807,6 +4972,7 @@
         (when (eq form eof-marker)
           (%fasl-close fx (not read-failed))
           (return t))
+        (%maybe-jit-script-defs form)
         (let ((val (handler-case (handler-bind ((warning #'%load-report-warning))
                                    (if fx (%fasl-eval fx form) (eval form)))
                      (t (c)

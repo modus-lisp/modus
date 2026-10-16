@@ -980,6 +980,58 @@
   ;; thunks carry the index as a 32- or 64-bit immediate; only this table bounds it.
   65536)
 
+(defvar *jit-bridge-sites* nil
+  "Vector, bridge index -> (PAGE-BASE . IMM-OFFSET) of the call site its thunk
+   was patched into, until %JIT-BRIDGE-SELF-PATCH points the site at native
+   code.")
+
+(defun %jit-bridge-note-site (idx base off)
+  (when (and (>= idx 0) (< idx 4096))
+    (unless (and *jit-bridge-sites* (not (fixnump *jit-bridge-sites*)))
+      (setq *jit-bridge-sites* (make-array 4096 :initial-element nil)))
+    (setf (svref *jit-bridge-sites* idx) (cons base off))))
+
+(defun %jit-bridge-self-patch (idx f)
+  "Bridge IDX resolved to F: when F is native code, rewrite the call site the
+   thunk was patched into to call F directly, once.  A call to a function that
+   was not native when its caller's page was built (a forward reference, the
+   usual case in a file) paid the bridge, a generic FUNCALL and its checks on
+   every call for good.  Early binding from then on, as for any call resolved
+   at page build on x86-64.  Only on an unarmed image: another thread could
+   be executing the instruction."
+  (let ((sites *jit-bridge-sites*))
+    (when (and sites (not (fixnump sites)) (< idx 4096)
+               (eql (mem-ref #x10000DB8 :u32) 0)
+               (not (eq *jit-target-arch* :aarch64)))
+      (let ((site (svref sites idx)))
+        (when (consp site)
+          (let ((word (%val->word f)))
+            (when (eql (logand word 15) 3)
+              ;; Through the callee's LINKAGE STUB when it can have one (see
+              ;; x64 LINKAGE STUBS): every redefinition -- native or not --
+              ;; retargets the stub, so the site never goes stale.  Only
+              ;; without a stub is the raw entry baked, and the site then
+              ;; remembered under the name for %JIT-REPATCH-SITES.
+              (let* ((nm (and *jit-bridge-names* (aref *jit-bridge-names* idx)))
+                     (stub (and (stringp nm) (%jit-x64-stub nm (- word 3)))))
+                (%jit-write-imm64 (car site) (cdr site) (or stub (- word 3)))
+                (setf (svref sites idx) nil)
+                (when (and (stringp nm) (null stub))
+                  (unless (consp *jit-patched-sites*)
+                    (setq *jit-patched-sites* (make-hash-table :test (function equal))))
+                  (setf (gethash nm *jit-patched-sites*)
+                        (cons site (gethash nm *jit-patched-sites*))))))))))))
+
+(defvar *jit-patched-sites* nil
+  "EQUAL hash NAME -> call sites %JIT-BRIDGE-SELF-PATCH pointed at NAME's
+   native code; repointed when NAME is installed native again.")
+
+(defun %jit-repatch-sites (name addr)
+  "Point every self-patched call site of NAME at ADDR (untagged entry)."
+  (when (and (consp *jit-patched-sites*) (eql (mem-ref #x10000DB8 :u32) 0))
+    (dolist (site (gethash name *jit-patched-sites*))
+      (%jit-write-imm64 (car site) (cdr site) addr))))
+
 (defun %jit-bridge-resolve (idx)
   "The callee of bridge thunk IDX, resolved at CALL time (late binding).  The
    symbol-function-table entry CONS is cached per thunk: PUTHASH updates it in
@@ -989,7 +1041,7 @@
   (let* ((pairs *jit-bridge-pairs*)
          (pair (and pairs (< idx (length pairs)) (aref pairs idx))))
     (if (and (consp pair) (cdr pair))
-        (cdr pair)
+        (progn (%jit-bridge-self-patch idx (cdr pair)) (cdr pair))
         (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
                       (aref *jit-bridge-names* idx) nil)))
           (let ((p (and nm pairs (< idx (length pairs))
@@ -1122,6 +1174,21 @@
               (%jit-write-imm64 addr 14 (or to (%jit-bridge-any-entry)))
               (%jit-emit-bytes (+ addr 22) (list #xFF #xE0))
               addr)))))
+
+(defvar *jit-fnaddr-x64-thunks* nil
+  "EQUAL hash NAME -> its x86-64 late-binding #'NAME thunk address: one per
+   name, so fn-addr sites do not each spend a slot of the bridge table.")
+
+(defun %jit-fnaddr-any-thunk-x64 (name)
+  "A 16-byte-aligned x86-64 any-arity bridge thunk for NAME (cached per name),
+   usable as a function value once tagged 3, or NIL."
+  (unless (consp *jit-fnaddr-x64-thunks*)
+    (setq *jit-fnaddr-x64-thunks* (make-hash-table :test (function equal))))
+  (or (gethash name *jit-fnaddr-x64-thunks*)
+      (let ((th (%jit-make-bridge-any-thunk name)))
+        (when (and th (eql (logand th 15) 0))
+          (setf (gethash name *jit-fnaddr-x64-thunks*) th)
+          th))))
 
 (defun %jit-make-bridge-thunk (name nargs)
   "Build the x64 bridge thunk for a NARGS-arg call to NAME; its address or NIL."
@@ -1801,6 +1868,9 @@
                          (%jit-make-bridge-any-thunk name))))
             (when th
               (setq raw th)
+              ;; Remember the site, so the bridge can patch it once NAME is
+              ;; native (%JIT-BRIDGE-RESOLVE).
+              (%jit-bridge-note-site (- *jit-bridge-count* 1) base (car r))
               (setq *jit-bridged-sites*
                     (if *jit-bridged-sites* (+ 1 *jit-bridged-sites*) 1)))))
         (if (> raw 0)
@@ -1854,7 +1924,18 @@
       (let* ((name (gethash (cdr r) rt-table))
              (fn (and name (%mvm-resolve-runtime-fn name)))
              (word0 (if fn (%val->word fn) 0))
-             (word (if (eql (logand word0 15) 3) word0 0)))
+             (word (if (eql (logand word0 15) 3)
+                       word0
+                       ;; Not native (yet): a LATE-BINDING value, the x86-64
+                       ;; any-arity bridge thunk tagged as a function, which
+                       ;; resolves NAME on every call -- the x64 twin of the
+                       ;; aarch64 #'NAME thunk.  A forward #'NAME (a function
+                       ;; defined later in the file) used to fail the page and
+                       ;; leave the whole function interpreted for good;
+                       ;; cl-bench DDERIV's handlers were 17 us a call that way.
+                       (let ((th (and name (%jit-bridge-on-p)
+                                      (%jit-fnaddr-any-thunk-x64 name))))
+                         (if th (logior th 3) 0)))))
         (if (> word 0)
             (%jit-write-imm64 base (car r) word)
             (progn
@@ -2109,7 +2190,9 @@
                 ;; up this (re)definition — proper CL late binding.
                 (%jit-lcell-set nm addr)
                 (when (not (eq *jit-target-arch* :aarch64))
-                  (%jit-x64-stub-retarget nm addr))
+                  (%jit-x64-stub-retarget nm addr)
+                  ;; And x86-64 sites a bridge patched to NM's raw code (no stub).
+                  (%jit-repatch-sites nm addr))
                 (setq n (+ n 1))))))))
     (setq *jit-native-defun-count*
           (if *jit-native-defun-count* (+ *jit-native-defun-count* n) n))
@@ -2190,7 +2273,16 @@
    for every runtime DEFUN installed as an interpreter trampoline.  Boots NIL
    (defvars don't init); %jit-register-module creates it lazily.")
 
+(defvar *jit-script-def-names* nil
+  "Names registered by toplevel forms of the OUTERMOST load (load depth 1),
+   not yet handed to %JIT-BUILD-SCRIPT-DEFS.  See cl-eval.lisp, A SCRIPT'S
+   OWN DEFUNS START NATIVE.")
+
 (defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
+  (when (and (boundp (quote *%load-depth*)) (eql *%load-depth* 1))
+    (setq *jit-script-def-names* (append names (if (consp *jit-script-def-names*)
+                                                   *jit-script-def-names*
+                                                   nil))))
   (when (and (boundp (quote *jit-module-registry*)) (null *jit-module-registry*))
     (setq *jit-module-registry* (make-hash-table :test (function equal))))
   (when (boundp (quote *jit-module-registry*))
@@ -2383,6 +2475,25 @@
       (if (%jit-build-module m (or *jit-native-defun-count* 0))
           (setq *jit-hot-promoted* (if *jit-hot-promoted* (+ 1 *jit-hot-promoted*) 1))
           (setq *jit-hot-failed* (if *jit-hot-failed* (+ 1 *jit-hot-failed*) 1))))))
+
+(defun %jit-build-script-defs ()
+  "Build the modules of the names in *JIT-SCRIPT-DEF-NAMES* (and their
+   interpreted callees first), as a hot promotion would, and clear the list.
+   NIL when this is not the moment (the JIT off or inhibited, a worker thread,
+   a build already running); the names then wait for the next chance."
+  (when (and (%jit-enabled-p) (%jit-active-p) (%mvm-on-main-thread-p)
+             (not *jit-hot-busy*) (consp *jit-script-def-names*))
+    (let ((names (reverse *jit-script-def-names*))
+          (before (or *jit-native-defun-count* 0))
+          (seen (cons nil 4096))
+          (skips (%jit-skip-list)))
+      (setq *jit-script-def-names* nil)
+      (setq *jit-hot-busy* t)
+      (unwind-protect
+           (dolist (nm names) (%jit-hot-build nm skips seen))
+        (setq *jit-hot-busy* nil))
+      (when (> (or *jit-native-defun-count* 0) before) (%jit-retry-drain))
+      t)))
 
 (defun %jit-hot-promote (name self)
   "NAME's trampoline SELF reached its threshold: build its module.  NIL once
@@ -3788,7 +3899,7 @@
             (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                      (not (eql off 0)))
                 (puthash off lam-offsets t)
-                (puthash off lam-offsets (quote :defun)))))
+                (puthash off lam-offsets (%lam-offset-defun-tag (function-info-name (car e)))))))
         (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))))
 
 (defvar *mvm-eval-nesting-saved* nil)
@@ -4430,7 +4541,7 @@
                     ;; any entry INCLUDING offset 0 (the first module fn — a
                     ;; materialized #'SELF closure's slot-0 is very often 0),
                     ;; which is safe because slot-0 of a #x52 is never DATA.
-                    (puthash off lam-offsets (quote :defun)))))
+                    (puthash off lam-offsets (%lam-offset-defun-tag (function-info-name (car e)))))))
             (when %fslot
               (%fasl-record %fslot forms bc entry ft-list fn-table rt-table lam-offsets
                             persist-names %lam-bearing %ftaint0)

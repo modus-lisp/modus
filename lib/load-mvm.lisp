@@ -82,8 +82,8 @@
 ;; HOST-ONLY knobs for the AOT special-variable cell cache (compiler.lisp,
 ;; %COMPILE-GLOBAL-READ-AOT).  Read here rather than in compiler.lisp because
 ;; that file is also image source and must never call POSIX-GETENV.
-;;   MODUS_GVCACHE=1        opt IN (the cache is OFF by default -- see the
-;;                          docstring of *GV-CACHE-ENABLED* for why)
+;;   (the cache is ON by default -- docstring of *GV-CACHE-ENABLED*)
+;;   MODUS_GVCACHE=1        force on (the default)
 ;;   MODUS_NO_GVCACHE=1     force off, even if MODUS_GVCACHE is set
 ;;   MODUS_GVCACHE_LO/HI=N  triage: only slots in [LO,HI) are emitted cached
 ;;   MODUS_GVCACHE_ONLY=A,B triage: only these global names are cached

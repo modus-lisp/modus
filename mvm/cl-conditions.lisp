@@ -746,12 +746,24 @@
     (unless (eql sig 0)
       (setf (mem-ref #x10000CB0 :u32) 0)
       (setq *current-condition*
-            (cond ((eql sig 8) (make-condition 'division-by-zero
-                                               :operation nil :operands nil))
-                  ((eql sig 4) (make-condition 'illegal-instruction-error))
-                  (t (make-condition 'memory-fault-error
-                                     :datum nil :expected-type t)))))
+            (%attach-fault-frames
+             (cond ((eql sig 8) (make-condition 'division-by-zero
+                                                :operation nil :operands nil))
+                   ((eql sig 4) (make-condition 'illegal-instruction-error))
+                   (t (make-condition 'memory-fault-error
+                                      :datum nil :expected-type t))))))
     nil))
+
+(defun %attach-fault-frames (c)
+  "C, carrying the frames the signal stub recorded for the fault it stands for (hosted
+   x86-64: net/hosted-backtrace.lisp) under the slot %FAULT-FRAMES.  The stub's record is
+   per thread and only the LAST fault's -- printing the condition can fault internally and
+   overwrite it -- so the condition takes its own copy while it is still this fault's.
+   Elsewhere the reader is not defined and C is returned unchanged."
+  (when (fboundp '%fault-backtrace-addresses)
+    (let ((a (funcall (symbol-function '%fault-backtrace-addresses))))
+      (when a (aset c 1 (cons (cons '%fault-frames a) (aref c 1))))))
+  c)
 
 (defun %maybe-report-unhandled-hc ()
   "Called by compiled handler-case dispatch tails just before the
@@ -782,6 +794,13 @@
            ;; Fallback
            (t (make-condition 'simple-error :format-control "error" :format-arguments nil)))))
     (setq *current-condition* cond-obj)
+    ;; THE SIGNALLING FRAMES, when asked for (MODUS:*CAPTURE-BACKTRACES*, hosted x86-64):
+    ;; the condition takes the stack here, before any HANDLER-CASE unwinds it, so a
+    ;; handler -- or whoever reads the condition later -- can still say where it came
+    ;; from.  Not for a THROW in flight (*CATCH-ACTIVE*): that is a control transfer.
+    (unless *catch-active*
+      (when (fboundp '%maybe-attach-error-frames)
+        (funcall (symbol-function '%maybe-attach-error-frames) cond-obj)))
     ;; Associate every currently-active restart frame with this condition
     ;; (implicit with-condition-restarts per CLHS 9.1.4.2.5).
     (%associate-active-restart-frames cond-obj)
@@ -1886,7 +1905,7 @@
              (setq new-reg (cons (car cur) new-reg)))
            (setq cur (cdr cur)))
          (setq *clos-classes* new-reg)
-         (setq *clos-find-memo* nil)))
+         (setq *clos-find-memo* nil) (%clos-reg-memo-drop)))
       (t
        (let ((new-reg nil) (cur *clos-classes*))
          (loop
@@ -1895,7 +1914,7 @@
              (setq new-reg (cons (car cur) new-reg)))
            (setq cur (cdr cur)))
          (setq *clos-classes* (cons (cons name value) new-reg))
-         (setq *clos-find-memo* nil))))
+         (setq *clos-find-memo* nil) (%clos-reg-memo-drop))))
     value))
 
 (defun %class-proxy-p (obj)
@@ -2430,8 +2449,9 @@
         (aset c 2 '%condition-marker)
         (aset c 1 nil)
         (setq *current-condition* c)
+        (%capture-signal-frames c)
         (%sig-reentry-leave)
-        (if (%error-handler-active-p) (%hc-longjmp) nil))))
+        (%signal-runtime-condition c))))
 
 (defun %hc-fault-fixup ()
   "Called first on a HANDLER-CASE handler path (hosted CLI, both 64-bit arches), before
@@ -2463,19 +2483,42 @@
               ;; This condition says more than the signal would: claim it.
               (setf (mem-ref #x10000CB0 :u32) 0)
               (setq *current-condition*
-                    (make-condition 'simple-error
+                    (%attach-fault-frames (make-condition 'simple-error
                                     :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused (at #x~x)."
                                     ;; THE SITE: the guard leaves the storing code's
                                     ;; return address at +0x5060, which names the
                                     ;; function against a symbol map -- the one thing
                                     ;; that makes this error actionable.
-                                    :format-arguments (list (%gc-read64 (+ m 8))))))
+                                    :format-arguments (list (%gc-read64 (+ m 8)))))))
             ;; Any other fault: %TAKE-PENDING-FAULT, which the dispatch
             ;; calls next, builds the condition from the recorded signal
             ;; (SIGSEGV -> MEMORY-FAULT-ERROR, a TYPE-ERROR).
             nil))))
   nil)
 
+(defun %signal-runtime-condition (c)
+  "The rest of what ERROR does, for a condition a runtime helper built
+   (%SIGNAL-TYPE-ERROR and its siblings): associate the active restart frames,
+   walk the HANDLER-BIND stack -- a handler may transfer control -- and then
+   longjmp to the innermost HANDLER-CASE, or return NIL when nothing is armed
+   (the helpers' old answer).  They used to longjmp straight away, so a
+   HANDLER-BIND for TYPE-ERROR never saw a compiled (CAR 5), and a restart
+   invoked from such a handler never ran.  Called after the reentry latch is
+   released: a handler that signals again is an ordinary nested signal."
+  (%associate-active-restart-frames c)
+  (let ((handled (%signal-condition c)))
+    (cond (handled nil)
+          ((%error-handler-active-p) (%hc-longjmp))
+          (t nil))))
+
+(defun %capture-signal-frames (c)
+  "The runtime's own signals (%SIGNAL-TYPE-ERROR and its siblings) build their condition and
+   longjmp without going through ERROR; give C the signalling stack the way ERROR does when
+   MODUS:*CAPTURE-BACKTRACES* is on.  Called inside the reentry latch, so a signal from in here
+   is dropped rather than recursing."
+  (when (fboundp '%maybe-attach-error-frames)
+    (funcall (symbol-function '%maybe-attach-error-frames) c))
+  c)
 ;;; Called by the bounds check the compiler emits before every element access
 ;;; (compiler.lisp %EMIT-INDEX-CHECK).  If no handler takes the TYPE-ERROR this
 ;;; returns NIL and the emitted code SKIPS the access -- it is never performed
@@ -2503,8 +2546,9 @@
                       (list (cons 'datum datum) (cons 'expected-type expected-type))
                       nil))
         (setq *current-condition* c)
+        (%capture-signal-frames c)
         (%sig-reentry-leave)
-        (if (%error-handler-active-p) (%hc-longjmp) nil))))
+        (%signal-runtime-condition c))))
 
 (defun %signal-undefined-function ()
   "Runtime helper: signal UNDEFINED-FUNCTION.  Used by compile-funcall's
@@ -2518,8 +2562,9 @@
         (aset c 2 '%condition-marker)
         (aset c 1 nil)
         (setq *current-condition* c)
+        (%capture-signal-frames c)
         (%sig-reentry-leave)
-        (if (%error-handler-active-p) (%hc-longjmp) nil))))
+        (%signal-runtime-condition c))))
 
 ;;; --- Initialize standard packages ---
 

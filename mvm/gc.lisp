@@ -1334,7 +1334,7 @@
       (%gc-clear-bitmap-range from-start space-size)
       ;; Step 5: Update alloc pointer and limit
       (%gc-set-r12 free-ptr)
-      (%gc-set-r14 (+ to-start space-size))
+      (%gc-set-r14 (%gc-guarded-limit to-start space-size))
       ;; Step 6: Increment GC count
       (%gc-set-count (+ (%gc-count) 1))
       (write-char-serial 53)  ; '5' — done
@@ -1490,6 +1490,14 @@
   (%gc-write64 (%conv-addr #x10000ED8) 0)
   0)
 
+(defun %gc-guarded-limit (start size)
+  "The allocation limit for a space [START, START+SIZE): its end less the
+   alloc-overshoot guard band, min(16 MB, SIZE/16) -- the same rule as the
+   native trampoline's R14 (translate-x64 X64-GC-LIMIT-MARGIN).  Spaces are
+   adjacent, so a limit at the true end lets an allocation overshoot into the
+   next space, where a collection overwrites it."
+  (- (+ start size) (min #x1000000 (ash size -4))))
+
 (defun %gc-region-init (rcb from to size stack-base k)
   "Write a complete region control block at raw byte address RCB: semispaces
    [FROM,FROM+SIZE) and [TO,TO+SIZE), roots on the stack below STACK-BASE, no
@@ -1513,7 +1521,7 @@
   (%gc-meta-write (+ rcb #x20) 0 k)
   (%gc-meta-write (+ rcb #x28) 0 k)
   (%gc-meta-write (+ rcb #x30) from k)
-  (%gc-meta-write (+ rcb #x38) (+ from size) k)
+  (%gc-meta-write (+ rcb #x38) (%gc-guarded-limit from size) k)
   rcb)
 
 (defun %gc-region-enter (rcb)

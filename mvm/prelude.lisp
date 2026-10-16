@@ -618,6 +618,11 @@
     ;; wrapper, MDA and not-a-sequence tests (76 ns -> a load).
     ((%prim-simple-string-p seq) (array-length seq))
     ((%prim-u8-vector-p seq) (array-length seq))
+    ;; A simple vector that is not a struct / instance / condition / complex
+    ;; underneath (those are not sequences): its header count.  It went
+    ;; through SYMBOLP, CHARACTERP, NUMBERP and FUNCTIONP first.
+    ((%prim-simple-vector-p seq)
+     (if (%marked-vector-p seq) (%signal-type-error) (array-length seq)))
     ;; No cons-based wrappers in this image: a cons is a list.
     ((and (consp seq) *%no-cons-array-wrappers*) (list-length seq))
     ((consp seq)

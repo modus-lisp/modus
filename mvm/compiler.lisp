@@ -12696,14 +12696,22 @@
          ;; scratch for loads and spills -- a VR dest was clobbered before
          ;; the store and the image died at boot), and the three temps must be
          ;; physical registers, not frame slots reached through RAX.
+         ;; A VR DEST is first copied to a fourth temp (VR itself is the
+         ;; translators' scratch, which the sequence clobbers) and copied
+         ;; back on both exits.
          (let ((islot (and (not cell) (eq *gv-cache-mode* :inline)
-                           (/= dest +vreg-vr+)
-                           (< *temp-reg-counter* 2)
+                           (< *temp-reg-counter* (if (= dest +vreg-vr+) 1 2))
                            (%gv-aot-slot hash var)))
                (inline-done (make-compiler-label))
-               (inline-slow (make-compiler-label)))
+               (inline-slow (make-compiler-label))
+               (vreg-copy nil))
            (when islot
-             (let ((a (alloc-temp-reg)) (b (alloc-temp-reg)) (c (alloc-temp-reg)))
+             (when (= dest +vreg-vr+)
+               (setq vreg-copy (alloc-temp-reg))
+               (emit-ir :mov vreg-copy dest)))
+           (when islot
+             (let ((a (alloc-temp-reg)) (b (alloc-temp-reg)) (c (alloc-temp-reg))
+                   (dest (or vreg-copy dest)))
                (emit-li-tagged a (conv-real #x10000DB8))
                (emit-ir :shr a a +fixnum-shift+)
                (emit-ir :load b a (%tls-width (car (memory-width-code :u32)) #x10000DB8))
@@ -12726,10 +12734,13 @@
                (emit-ir :cmp a c)
                (emit-ir :bne inline-slow)
                (emit-ir :setcdr b dest)
+               (when vreg-copy (emit-ir :mov +vreg-vr+ vreg-copy))
                (emit-ir :set-mv-count 1)
                (emit-ir :br inline-done)
                (emit-ir-label inline-slow)
-               (free-temp-reg) (free-temp-reg) (free-temp-reg)))
+               (when vreg-copy (emit-ir :mov +vreg-vr+ vreg-copy))
+               (free-temp-reg) (free-temp-reg) (free-temp-reg)
+               (when vreg-copy (free-temp-reg))))
          (when (> save-count 1)
            (let ((r (+ +vreg-v4+ 1)))
              (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
@@ -24288,10 +24299,15 @@
       (compile-prim-array-length arr-form env dest)))
   (let ((g-arr (%mvm-gensym "ALENA")))
     (compile-form
+     ;; Only an MDA header needs %MDA-ARRAY-LENGTH (fill pointer, dims);
+     ;; every other array's count is its header word, read inline -- the
+     ;; call was on every ARRAY-LENGTH, LENGTH of a vector included.
      `(let ((,g-arr ,arr-form))
         (if (%raw-consp ,g-arr)
             (%wrapper-array-length ,g-arr)
-            (%mda-array-length ,g-arr)))
+            (if (%mda-p ,g-arr)
+                (%mda-array-length ,g-arr)
+                (%prim-array-length ,g-arr))))
      env dest)))
 
 ;;; ============================================================

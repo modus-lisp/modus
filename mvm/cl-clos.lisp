@@ -652,6 +652,17 @@
     (unless (eq kind ':setter) (%register-gf-fn fn name))
     fn))
 
+;; ((METHOD KIND . SLOT-NAME) ...) for every DEFCLASS-generated reader and
+;; writer method, KIND :READER or :WRITER.  Searched only when a dispatch
+;; cache entry first computes its plan.
+(defvar *%accessor-methods* nil)
+
+(defun %accessor-method-info (m)
+  (let ((c *%accessor-methods*))
+    (loop (unless (consp c) (return nil))
+      (when (eq (car (car c)) m) (return (cdr (car c))))
+      (setq c (cdr c)))))
+
 (defun %clos-maybe-accessor-method (fn-name class-name slot-name kind)
   "DEFCLASS :reader/:writer/:accessor support (CLHS 7.6.2): the accessor is
    a METHOD on the generic function FN-NAME, specialized on CLASS-NAME; the
@@ -670,11 +681,17 @@
         (setq *gf-stub-reuse-fbound* saved))
       (setq gf (%find-gf fn-name)))
     (when gf
-      (if (eq kind ':writer)
-          (%defmethod fn-name nil (list 't class-name)
-                      (lambda (nv obj) (set-slot-value obj slot-name nv)))
-          (%defmethod fn-name nil (list class-name)
-                      (lambda (obj) (slot-value obj slot-name))))
+      (let ((m (if (eq kind ':writer)
+                   (%defmethod fn-name nil (list 't class-name)
+                               (lambda (nv obj) (set-slot-value obj slot-name nv)))
+                   (%defmethod fn-name nil (list class-name)
+                               (lambda (obj) (slot-value obj slot-name))))))
+        ;; Remembered so a dispatch whose only applicable method is this one
+        ;; can read or write the slot directly (%GF-MAKE-PLAN).
+        (when (consp m)
+          (setq *%accessor-methods*
+                (cons (cons m (cons (if (eq kind ':writer) ':writer ':reader) slot-name))
+                      *%accessor-methods*))))
       ;; The DEFCLASS expansion's dispatcher DEFUN (emitted just before this
       ;; call) is the current definition; when the GF already existed no stub
       ;; re-install happens, so register it here or (typep #'NAME
@@ -2473,7 +2490,9 @@
 ;;; one NUMBER-specialised second parameter, cl-bench's SIMPLE-METHOD, and
 ;;; every call collected and sorted the applicable methods again.)
 (defun %gf-arg-key (a)
-  (cond ((%clos-instance-p a) (aref a 1))
+  (cond ((and (%prim-simple-vector-p a) (>= (array-length a) 2)
+              (eq (aref a 0) '%clos-instance))
+         (aref a 1))
         ((fixnump a) :%fixnum)
         ((null a) :%null)
         ((eq a t) :%t)
@@ -2565,7 +2584,7 @@
                                (setq sp (cdr sp)))))))
               (return-from %gf-cache-entry
                 (and k
-                     (let ((n (length args)) (e (cdr (cdr c))))
+                     (let ((n (if (null (cdr args)) 1 (length args))) (e (cdr (cdr c))))
                        (loop
                          (when (null e) (return nil))
                          (let ((x (car e)))
@@ -3169,6 +3188,18 @@
    name is a fresh list at each call site, so *GF-FIND-MEMO* never sees it;
    every accessor INCF / SETF rescanned every GF.  Dropped with *GF-FIND-MEMO*.")
 
+(defvar *%gf-dm* nil)
+
+(defun %gf-dm-fill (name gf)
+  (unless (eq name t)
+    (let ((h (aref name 0)))
+      (when (fixnump h)
+        (let ((dm *%gf-dm*))
+          (unless (%prim-simple-vector-p dm)
+            (setq dm (make-array 256))
+            (setq *%gf-dm* dm))
+          (setf (svref dm (logand h 255)) (cons name gf)))))))
+
 (defun %find-gf (name)
   "Find generic function by name -- through *GF-FIND-MEMO* for a symbol, and
    *GF-FIND-SETF-MEMO* for a (SETF symbol) name."
@@ -3186,6 +3217,17 @@
               (t (let ((gf (%find-gf-scan name)))
                    (puthash sym memo (if gf gf :%no-gf))
                    (return-from %find-gf gf)))))))
+  ;; DIRECT-MAPPED FRONT: 256 (symbol . gf) cells indexed by the symbol's
+  ;; name hash, read before the EQ table (whose GETHASH was a tenth of every
+  ;; generic call).  Filled from the table's hits, dropped with it.
+  (when (and (symbolp name) name (not (eq name t)))
+    (let ((dm *%gf-dm*))
+      (when (%prim-simple-vector-p dm)
+        (let ((h (aref name 0)))
+          (when (fixnump h)
+            (let ((e (svref dm (logand h 255))))
+              (when (and (consp e) (eq (car e) name))
+                (return-from %find-gf (cdr e)))))))))
   (if (and (symbolp name) name (%gf-cache-writable-p))
       ;; No BOUNDP (1 us here): an absent global reads as NIL (%GV-REF).
       (let ((memo *gf-find-memo*))
@@ -3195,7 +3237,7 @@
         (let ((hit (gethash name memo)))
           (cond
             ((eq hit :%no-gf) nil)
-            (hit hit)
+            (hit (%gf-dm-fill name hit) hit)
             (t
              ;; A MISS is memoised too: MAKE-INSTANCE asks for GFs that
              ;; usually do not exist (no user INITIALIZE-INSTANCE method),
@@ -3307,6 +3349,7 @@
          (setq *generic-functions* (cons (cons name gf) *generic-functions*))
          ;; A new entry can answer a name an older one answered by NAME-HASH.
          (setq *gf-find-memo* nil)
+         (setq *%gf-dm* nil)
          (setq *gf-find-setf-memo* nil)
          ;; A new named GF changes the answer %e2-name-names-gf-p memoized --
          ;; but only for THIS name.  Nuking the whole table made the memo
@@ -4939,13 +4982,20 @@
           (write-char-serial 10)
           (%signal-program-error))))))
 
-(defun %gf-make-plan (gf applicable)
+(defun %gf-make-plan (gf applicable &optional args)
   "How a cache hit for APPLICABLE runs: (:CHAIN . METHODS) when every method
    is a primary of the STANDARD combination, the GF checks no keywords and has
    no system default primary -- the call is then the first method with the
    rest as its CALL-NEXT-METHOD chain -- else :GENERAL.  All of that is fixed
    for a cache entry: the entry dies with the method list, the combination or
-   a class change."
+   a class change.
+
+   When the one applicable method is a DEFCLASS reader or writer and the
+   instance's slot is an instance slot, the plan is (:SLOT-READ INDEX .
+   METHODS) or (:SLOT-WRITE INDEX . METHODS): the entry is keyed by the
+   instance's class, whose slot layout cannot change without the epoch bump
+   that empties every cache.  (An accessor call went through the chain, three
+   special writes, APPLY and SLOT-VALUE's own lookup: 1.1 us.)"
   (cond
     ((or (not (consp applicable)) (%gf-combination gf)) :general)
     ((%has-default-primary-p (%gf-name gf)) :general)
@@ -4957,6 +5007,18 @@
          (when (%method-qualifier (car m)) (setq q t) (return q))
          (setq m (cdr m))))
      :general)
+    ((and (null (cdr applicable)) (consp args)
+          (let ((info (%accessor-method-info (car applicable))))
+            (and info
+                 (let* ((writer (eq (car info) ':writer))
+                        (obj (if writer (and (consp (cdr args)) (car (cdr args))) (car args))))
+                   (and (%clos-instance-p obj)
+                        (if writer (and (consp (cdr args)) (null (cdr (cdr args))))
+                            (null (cdr args)))
+                        (let ((loc (%slot-locate-scan (aref obj 1) (cdr info))))
+                          (and (fixnump loc)
+                               (cons (if writer :slot-write :slot-read)
+                                     (cons loc applicable))))))))))
     (t (cons :chain applicable))))
 
 (defun %gf-run-chain (gf args methods)
@@ -4969,7 +5031,14 @@
     (setq *%current-gf* gf)
     (setq *%next-methods* (cdr methods))
     (setq *%current-gf-args* args)
-    (multiple-value-prog1 (apply (%method-fn (car methods)) args)
+    (multiple-value-prog1
+        ;; One or two arguments by FUNCALL: APPLY's spread was an eighth of a
+        ;; generic call.
+        (let ((fn (%method-fn (car methods))))
+          (cond ((and (consp args) (null (cdr args))) (funcall fn (car args)))
+                ((and (consp args) (consp (cdr args)) (null (cdr (cdr args))))
+                 (funcall fn (car args) (car (cdr args))))
+                (t (apply fn args))))
       (setq *%current-gf* saved-gf)
       (setq *%next-methods* saved-nm)
       (setq *%current-gf-args* saved-args))))
@@ -4997,11 +5066,25 @@
       (when entry
         (let ((plan (cdr (cdr (cdr entry)))))
           (when (null plan)
-            (setq plan (%gf-make-plan gf (car (cdr (cdr entry)))))
+            (setq plan (%gf-make-plan gf (car (cdr (cdr entry))) args))
             (when (%gf-cache-writable-p)
               (setf (cdr (cdr (cdr entry))) plan)))
-          (unless (eq plan :general)
-            (return-from %gf-dispatch (%gf-run-chain gf args (cdr plan)))))))
+          (cond
+            ((eq plan :general) nil)
+            ;; A DEFCLASS accessor: the slot itself (an unbound slot takes the
+            ;; method, which signals through SLOT-UNBOUND).
+            ((eq (car plan) :slot-read)
+             (let* ((obj (car args)) (v (aref obj (+ 2 (car (cdr plan))))))
+               (return-from %gf-dispatch
+                 (if (and (fixnump v) (= v -999))
+                     (%gf-run-chain gf args (cdr (cdr plan)))
+                     v))))
+            ((eq (car plan) :slot-write)
+             (let ((nv (car args)))
+               (aset (car (cdr args)) (+ 2 (car (cdr plan))) nv)
+               (return-from %gf-dispatch nv)))
+            ((eq (car plan) :chain)
+             (return-from %gf-dispatch (%gf-run-chain gf args (cdr plan))))))))
     (let ((applicable (%gf-cache-get gf args)))
       (cond ((eq applicable :%none) (setq applicable nil))
             ((null applicable)

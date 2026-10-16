@@ -1864,6 +1864,11 @@
   "Emit a size-aware check for an upcoming :cons / :alloc-cons."
   (emit-ir :gc-check-n +mvm-cons-bytes+))
 
+(defvar *gc-check-unsized-var-allocs* 0
+  "Host census: variable-size allocations FUSE-GC-CHECKS could not give a
+   size-aware check (no :gc-check right before them).  See the census in
+   FUSE-GC-CHECKS.")
+
 (defun fuse-gc-checks (ir)
   "Peephole: rewrite (:gc-check) IMMEDIATELY followed by an allocation into
    the size-aware (:gc-check-n nbytes).
@@ -1948,7 +1953,27 @@
                              (list :gc-check-r (third next) 0))
                             ((:alloc-u8)
                              (list :gc-check-r (third next) 1))
+                            ;; :alloc-f32's count is a TAGGED lane count (2N).
+                            ;; Read as KIND 0 (untagged slots, x8) that checks
+                            ;; 16N + 32 bytes for an allocation of
+                            ;; align16(16 + 4N): a strict OVER-estimate, so the
+                            ;; check is safe with no third kind in every
+                            ;; translator; its only cost is collecting a little
+                            ;; early for a vector near the limit.
+                            ((:alloc-f32)
+                             (list :gc-check-r (third next) 0))
                             (t nil)))))
+        ;; CENSUS (host-only): a variable-size allocation that leaves here
+        ;; without a size-aware check right in front of it can overshoot the
+        ;; limit by its whole size -- the case the limit GUARD exists for.
+        ;; Counted so a guard smaller than the largest such object is a
+        ;; decision made with the number in hand.
+        ;; (In-image this runs only where fusion does, i.e. where
+        ;; init-all-globals bound this counter.)
+        (when (and (consp next)
+                   (member (car next) '(:alloc-array :alloc-string :alloc-u8 :alloc-f32))
+                   (not rcheck))
+          (incf *gc-check-unsized-var-allocs*))
         (push (cond (nbytes (list :gc-check-n nbytes))
                     (rcheck rcheck)
                     (t insn))

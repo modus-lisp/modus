@@ -2149,11 +2149,14 @@
   (setq *aarch64-gc-trampoline-call-via-bl* nil)
   (setq *aarch64-gc-trampoline-label* 1)
   ;; Mirror the BAKED alloc-overshoot guard band (build-cl-repl-common sets
-  ;; *aarch64-gc-limit-guard* #x800000 for the image build).  The in-image
+  ;; *aarch64-gc-limit-guard* #x100000 for the image build).  The in-image
   ;; value is the defvar's 0, so anything the runtime translator emits that
   ;; reads it -- a trampoline exit -- would hand the mutator an UNGUARDED
   ;; limit.  Bare x64 lost alexandria to exactly this class (283cccf).
-  (setq *aarch64-gc-limit-guard* #x800000)
+  (setq *aarch64-gc-limit-guard* #x100000)
+  ;; ... which is only safe while runtime-compiled code sizes its checks
+  ;; (mvm-eval's FUSE-GC-CHECKS): set here, not left to a defvar's initform.
+  (setq *gc-check-fusion-enabled* t)
   ;; *aarch64-gc-bitmap-enabled* at runtime: MUST be T — while NIL, objects
   ;; allocated by JIT'd code carry no object-start/cons-kind bit and the
   ;; native GC's bitmap gate (applied by scan_word to EVERY scanned word,
@@ -2773,7 +2776,15 @@
 ;; runs unguarded.  That is benign — an overshoot there lands in the mapped
 ;; second semispace — and every limit the trampoline computes afterwards is
 ;; guarded.
-(setf *aarch64-gc-limit-guard* #x800000)
+;; 1 MB, not the 8 MB it was (bfca1db): the guard need only exceed an allocation
+;; that is NOT checked against its own size, and every variable-size one now is --
+;; arrays, strings, u8 and f32 vectors get :GC-CHECK-R, in the image build AND in
+;; runtime-compiled code (mvm-eval runs FUSE-GC-CHECKS too; it did not, and that is
+;; what the 512 KB a64-buffer that zeroed the config page was).  What is left is a
+;; constant-size :ALLOC-OBJ (an imm16 slot count: at most 512 KB) and conses.  The
+;; build prints the census of variable-size allocations left unchecked.  The 7 MB
+;; this returns to region 0 is what the media desk needs on a threaded image.
+(setf *aarch64-gc-limit-guard* #x100000)
 
 ;; #267 step 1: use the NATIVE aarch64 Cheney collector — the same one
 ;; build-aarch64-cli.lisp runs — instead of falling through to gc.lisp's
@@ -2909,7 +2920,11 @@
               (error "BUILD-TIME ASSERT: #160 bitmaps end ~X reach the stack low ~
                       water ~X." maps-hi stack-va-lo)))
         (format t "  gc bitmaps ~8,'0X .. ~8,'0X  (#160 object-start + cons-kind)~%"
-                objmap-lo maps-hi))
+                objmap-lo maps-hi)
+        ;; The limit guard must exceed every allocation that is NOT checked
+        ;; against its own size (FUSE-GC-CHECKS census).
+        (format t "  gc-check census: ~D variable-size allocation~:P without a size-aware check~%"
+                modus.mvm::*gc-check-unsized-var-allocs*))
       (when (> heap-end periph-base)
         (error "BUILD-TIME ASSERT: heap end ~X is inside the BCM2837 ~
                 peripheral window at ~X." heap-end periph-base))

@@ -3728,6 +3728,11 @@
         (when (and (consp pend) (car pend) (cdr pend))
           (setq all-ir (cons pend all-ir))))
       (setq all-ir (reverse all-ir))
+      ;; Size-aware gc-checks, as the image build has them (FUSE-GC-CHECKS): before
+      ;; anything sizes the IR.  Runtime-compiled code otherwise checks only that
+      ;; the pointer is under the limit, so a big array overshoots by its size.
+      (when *gc-check-fusion-enabled*
+        (dolist (e all-ir) (setf (cdr e) (fuse-gc-checks (cdr e)))))
       ;; Fresh buffer (do NOT touch *mvm-eval-buffer* — keep mvm-eval-forms's reuse
       ;; buffer pristine for the oracle interpret path that runs after us).
       ;; NOTE: reusing a persistent buffer here was tried and REVERTED — the
@@ -4301,6 +4306,11 @@
         (when (and (consp pend) (car pend) (cdr pend))
           (setq all-ir (cons pend all-ir))))
       (setq all-ir (reverse all-ir))
+      ;; Size-aware gc-checks, as the image build has them (FUSE-GC-CHECKS): before
+      ;; anything sizes the IR.  Runtime-compiled code otherwise checks only that
+      ;; the pointer is under the limit, so a big array overshoots by its size.
+      (when *gc-check-fusion-enabled*
+        (dolist (e all-ir) (setf (cdr e) (fuse-gc-checks (cdr e)))))
       ;; Union the compiler-recorded defun names (macro-hidden defuns the
       ;; raw-forms pre-scan can't see — with-upgradability → eval-when →
       ;; defun) into persist-names for the trampoline install loop below.
@@ -4894,6 +4904,11 @@
         (t (when (and (car result) (cdr result))
              (setq all-ir (cons (cons (car result) (cdr result)) all-ir))))))
     (setq all-ir (reverse all-ir))
+    ;; Size-aware gc-checks, as the image build has them (FUSE-GC-CHECKS): before
+    ;; anything sizes the IR.  Runtime-compiled code otherwise checks only that
+    ;; the pointer is under the limit, so a big array overshoots by its size.
+    (when *gc-check-fusion-enabled*
+      (dolist (e all-ir) (setf (cdr e) (fuse-gc-checks (cdr e)))))
     (dolist (e all-ir)
       (let* ((info (car e))
              (ir (cdr e))

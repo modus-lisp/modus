@@ -9055,6 +9055,15 @@
               (emit-ir :li temp (ash (char-code (char value i)) +fixnum-shift+))
               (emit-ir :obj-set dest i temp))
             (free-temp-reg))))))
+    ;; A BIT-VECTOR literal (read by the host as an SBCL bit vector): the
+    ;; packed bit array, built by MAKE-ARRAY like the multi-dim literals
+    ;; below -- the plain-vector branch made it a vector of 0s and 1s, which
+    ;; is not a bit-vector (cl-clos.lisp, PACKED BIT ARRAYS).
+    ((and (bit-vector-p value) (not (stringp value)))
+     (compile-form
+      `(make-array ,(length value) :element-type 'bit
+                   :initial-contents ',(coerce value 'list))
+      nil dest))
     ;; Vector: allocate array object and fill with elements
     ((vectorp value)
      (let ((n (length value)))

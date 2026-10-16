@@ -2017,6 +2017,27 @@
         (dotimes (i n) (setf (aref v i) (aref seq i))))
     v))
 
+(defun %bit-seq-type-p (type)
+  "T when the sequence type TYPE names a bit vector: BIT-VECTOR /
+   SIMPLE-BIT-VECTOR, or a VECTOR / (SIMPLE-)ARRAY rank-1 type whose element
+   type upgrades to BIT -- MAKE-SEQUENCE, CONCATENATE and MAP then build a
+   packed bit array (cl-clos.lisp, PACKED BIT ARRAYS), not a general vector."
+  (cond
+    ((or (eq type 'bit-vector) (eq type 'simple-bit-vector)) t)
+    ((and (consp type) (symbolp (car type)))
+     (let ((h (car type)))
+       (cond
+         ((or (eq h 'bit-vector) (eq h 'simple-bit-vector)) t)
+         ((or (eq h 'vector) (eq h 'array) (eq h 'simple-array))
+          (and (consp (cdr type)) (not (eq (cadr type) '*))
+               (eq (upgraded-array-element-type (cadr type)) 'bit)
+               (or (eq h 'vector)
+                   (null (cddr type))
+                   (let ((d (caddr type)))
+                     (or (eql d 1) (and (consp d) (null (cdr d))))))))
+         (t nil))))
+    (t nil)))
+
 (defun make-sequence (type size &rest args)
   "Make a sequence of TYPE and SIZE.  Supports :initial-element.
    Accepts compound type forms like (VECTOR), (VECTOR *), (VECTOR T 5)
@@ -2026,6 +2047,10 @@
    pins a length (e.g. (VECTOR T 4)) and SIZE disagrees, the call
    must signal type-error.  Unrecognised non-sequence type names
    (SYMBOL, INTEGER, ...) likewise signal type-error."
+  (when (%bit-seq-type-p type)
+    (return-from make-sequence
+      (let ((p (member :initial-element args)))
+        (make-array size :element-type 'bit :initial-element (if p (cadr p) 0)))))
   (when (%seq-type-u8-p type)
     (return-from make-sequence
       (make-array size :element-type '(unsigned-byte 8)
@@ -2408,6 +2433,10 @@
    non-sequence designator (FIXNUM, SYMBOL, etc.), when a
    pinned-length compound spec doesn't match the produced length, or
    when any input is not a sequence."
+  (when (%bit-seq-type-p result-type)
+    (return-from concatenate
+      (let ((v (apply (function concatenate) 'vector seqs)))
+        (make-array (length v) :element-type 'bit :initial-contents v))))
   (when (%seq-type-u8-p result-type)
     (return-from concatenate (%seq-u8-copy (apply (function concatenate) 'vector seqs))))
   (%concat-check-seqs seqs)

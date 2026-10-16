@@ -4452,6 +4452,11 @@
    signals program-error."
   (when (%seq-type-u8-p result-type)
     (return-from map (%seq-u8-copy (apply (function map) 'vector fn seqs))))
+  ;; a bit-vector result: map into a general vector, then the packed array
+  (when (and seqs (%bit-seq-type-p result-type))
+    (return-from map
+      (let ((v (apply (function map) 'vector fn seqs)))
+        (make-array (length v) :element-type 'bit :initial-contents v))))
   (when (null seqs) (%signal-program-error))
   ;; Type-error on known non-sequence head + on pinned-length mismatch.
   (when result-type

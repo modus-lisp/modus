@@ -6528,6 +6528,19 @@
   "NEW-DATA as A's store: packed again when A is a BIT array."
   (if (and new-data (%mda-bit-p a)) (%pack-bits new-data n) new-data))
 
+(defun %copy-bit-array (a)
+  "A fresh, undisplaced bit array with A's dimensions, fill pointer and
+   elements."
+  (let* ((dims (array-dimensions a))
+         (n (array-total-size a))
+         (b (make-array dims :element-type 'bit))
+         (i 0))
+    (loop (when (>= i n) (return nil))
+      (unless (eql (aref a i) 0) (setf (aref b i) 1))
+      (setq i (+ i 1)))
+    (when (%mda-fp a) (%mda-set-fp b (%mda-fp a)))
+    b))
+
 (defun adjust-array (a new-size &rest args)
   "Return an array of NEW-SIZE with elements from A.
    When A is adjustable (outer (cons 8765432 ...)), we modify A in place so
@@ -6543,6 +6556,11 @@
   ;; handled BEFORE the (car new-size) collapse below (which would drop
   ;; all but dim 0).  adjust-array.21/22/23.  Only plain reshape (no
   ;; displaced-to) is supported.
+  ;; A bit array that is not adjustable (no fill pointer, not displaced):
+  ;; CLHS returns a NEW array and leaves A alone; the MDA paths below
+  ;; resize in place, so give them a copy.
+  (when (and (%mda-p a) (%mda-bit-p a) (not (adjustable-array-p a)))
+    (setq a (%copy-bit-array a)))
   (when (and (%mda-p a) (consp new-size) (consp (cdr new-size))
              (>= (%mda-rank a) 2)
              (not (member :displaced-to args)))

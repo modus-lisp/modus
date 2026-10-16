@@ -6566,21 +6566,23 @@
   ;; A bit array that is not adjustable (no fill pointer, not displaced):
   ;; CLHS returns a NEW array and leaves A alone; the MDA paths below
   ;; resize in place, so give them a copy.
-  (when (and (%mda-p a) (%mda-bit-p a) (not *%bit-adjust-in-place*)
-             (not (adjustable-array-p a)))
-    (setq a (%copy-bit-array a)))
-  (when (and (%mda-p a) (%mda-bit-p a) (eq (%mda-offset a) :adjustable))
-    ;; adjust in place, then put the adjustable mark back (the paths below
-    ;; treat the offset slot as a displacement offset)
-    (%prim-aset a 4 0)
-    ;; SETQ + UNWIND-PROTECT, not a LET: a compiled LET of a special is not a
-    ;; reliable dynamic binding in image code
-    (let ((r (progn
-               (setq *%bit-adjust-in-place* t)
-               (unwind-protect (apply (function adjust-array) a new-size args)
-                 (setq *%bit-adjust-in-place* nil)))))
-      (when (and (%mda-p r) (null (%mda-displaced r))) (%prim-aset r 4 :adjustable))
-      (return-from adjust-array r)))
+  ;; BIT arrays.  One that is not adjustable is copied first (CLHS: a NEW
+  ;; array, the original untouched -- the MDA paths below resize in place).
+  ;; An adjustable one is adjusted in place and stays adjustable: the result
+  ;; is undisplaced, so it carries the :ADJUSTABLE mark in its offset slot.
+  ;; SETQ + UNWIND-PROTECT for the re-entry flag, not a LET: a compiled LET
+  ;; of a special is not a reliable dynamic binding in image code.
+  (when (and (%mda-p a) (%mda-bit-p a) (not *%bit-adjust-in-place*))
+    (if (not (adjustable-array-p a))
+        (setq a (%copy-bit-array a))
+        (progn
+          (when (eq (%mda-offset a) :adjustable) (%prim-aset a 4 0))
+          (let ((r (progn
+                     (setq *%bit-adjust-in-place* t)
+                     (unwind-protect (apply (function adjust-array) a new-size args)
+                       (setq *%bit-adjust-in-place* nil)))))
+            (when (and (%mda-p r) (null (%mda-displaced r))) (%prim-aset r 4 :adjustable))
+            (return-from adjust-array r)))))
   (when (and (%mda-p a) (consp new-size) (consp (cdr new-size))
              (>= (%mda-rank a) 2)
              (not (member :displaced-to args)))

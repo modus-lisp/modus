@@ -420,15 +420,21 @@
                       0 buf len (usb-bulk-out-mps)))
 
 (defun usb-bulk-receive (buf max-len)
-  ;; Non-blocking bulk IN using persistent channel.
-  ;; The first call starts the transfer; subsequent calls just poll.
-  ;; DWC2's work_bh auto-retries NAK'd transfers in the background.
-  ;; Returns: 1=success (data in buf), 0=no data yet, <0=error
-  (let ((result (dwc2-poll-bulk-in 1)))
-    ;; If no data yet (0), the channel is still active — return immediately
-    (when (not (zerop result))
-      ;; Transfer completed (success, stall, or error).
-      ;; Channel is now idle (CHENA cleared by DWC2). Start a new one.
+  ;; Non-blocking bulk IN using persistent channel.  Returns: 1=success (data in buf),
+  ;; 0=no data yet, <0=error.  DWC2's work_bh auto-retries NAK'd transfers.
+  ;;
+  ;; THE NEXT TRANSFER STARTS ON THE NEXT CALL, NOT THIS ONE.  Re-arming the moment a
+  ;; transfer completed handed BUF back to the controller while the caller was still
+  ;; reading the frame in it: the next frame's DMA landed under the reader, and on the
+  ;; board a TCP fetch came back with a 1460-byte segment duplicated.  So a completion
+  ;; leaves the channel idle and sets usb-state +0xA0; the call after it (the caller
+  ;; has consumed BUF by then) starts the next transfer.  CDC-ETHER-INIT starts the
+  ;; first one and clears the flag.
+  (let ((st (+ (usb-state-addr) #xA0)))
+    (when (= (mem-ref st :u32) 1)
+      (setf (mem-ref st :u32) 0)
       (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
-                           buf max-len (usb-bulk-in-mps)))
-    result))
+                          buf max-len (usb-bulk-in-mps)))
+    (let ((result (dwc2-poll-bulk-in 1)))
+      (when (not (zerop result)) (setf (mem-ref st :u32) 1))
+      result)))

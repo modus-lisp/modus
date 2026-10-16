@@ -225,6 +225,7 @@
             (hid-clear-port-changes hub p)
             (setq p (+ p 1)))))))
   (hid-put #x1F8 0)                             ; no USB owner yet
+  (hid-put #x94 0)                              ; no port reserved (cold RAM)
   (hid-put #x1F0 (hid-magic))
   (list (= (hid-dev-get (hid-kbd) 0) 1) (= (hid-dev-get (hid-mouse) 0) 1)))
 
@@ -468,6 +469,20 @@
     (hid-dev-put (hid-mouse) 0 0)
     (hid-put #x60 0)))                          ; no button held any more
 
+;;; PORTS SOMETHING ELSE OWNS.  +0x94 is a bit mask (bit P = hub port P) of ports the scan
+;;; must leave alone.  A network bring-up resets its adapter's port and the adapter drops
+;;; off and comes back; the scan sees that connect change, and early in re-enumeration the
+;;; port does not yet report high speed -- so it was taken for a keyboard: reset again
+;;; (HID-LOCATE) and sent split control transfers through the TT.  On the Zero that left
+;;; control channel 0 at CHENA|CHDIS with its SETUP never issued, and every transfer after
+;;; it -- the NIC's bulk OUT included -- stopped.  Whoever owns a port reserves it first.
+
+(defun hid-reserve-port (port)
+  (hid-put #x94 (logior (hid-get #x94) (ash 1 port))) t)
+(defun hid-release-port (port)
+  (hid-put #x94 (logand (hid-get #x94) (lognot (ash 1 port)))) t)
+(defun hid-port-reserved-p (port) (logbitp port (hid-get #x94)))
+
 (defun hid-hotplug-tick ()
   (let ((hub (hid-get #x00)))
     (when (and (> hub 0) (hid-time-reached-p (hid-get #x90)))
@@ -475,7 +490,7 @@
       (let ((n (hid-get #x04)) (p 1))
         (loop
           (when (> p n) (return nil))
-          (let ((st (hid-port-status hub p)))
+          (let ((st (if (hid-port-reserved-p p) 0 (hid-port-status hub p))))
             (when (not (zerop (logand st #x10000)))
               (hid-clear-port-changes hub p)
               (hid-port-gone p)

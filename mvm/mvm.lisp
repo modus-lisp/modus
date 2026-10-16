@@ -554,8 +554,8 @@
 ;; reference.  Only those two builds' kernels emit them (see
 ;; *NATIVE-BULK-SOURCE* in build-cli-common.lisp), so the 32-bit translators
 ;; never see them.
-(defconstant +op-bulk-move+ #xEB) ; (bulk-move Vdst Vdi Vsrc Vsi Vn kind)  N elements src[si..] -> dst[di..]
-(defconstant +op-bulk-fill+ #xEC) ; (bulk-fill Varr Vi Vn Vval kind)       N elements from Vi := Vval
+(defconstant +op-bulk-move+ #x94) ; (bulk-move Vdst Vdi Vsrc Vsi Vn kind)  N elements src[si..] -> dst[di..]
+(defconstant +op-bulk-fill+ #x95) ; (bulk-fill Varr Vi Vn Vval kind)       N elements from Vi := Vval
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -784,8 +784,8 @@
 (defopcode :vi-movi  #xE8 (:reg :imm8 :imm8)           "immediate byte → every lane")
 (defopcode :vi-umov  #xE9 (:reg :reg :imm8 :imm8)      "one lane → fixnum")
 (defopcode :vi-lane  #xEA (:reg :reg :reg :imm8 :imm8) "s16x8 by-element mla/mls/mul/sqdmulh/sqrdmulh")
-(defopcode :bulk-move #xEB (:reg :reg :reg :reg :reg :imm8) "memmove N elements (kind 0 words, 1 bytes)")
-(defopcode :bulk-fill #xEC (:reg :reg :reg :reg :imm8)      "N elements := value (kind 0 words, 1 bytes)")
+(defopcode :bulk-move #x94 (:reg :reg :reg :reg :reg :imm8) "memmove N elements (kind 0 words, 1 bytes)")
+(defopcode :bulk-fill #x95 (:reg :reg :reg :reg :imm8)      "N elements := value (kind 0 words, 1 bytes)")
 
 ;;; ============================================================
 ;;; Memory Width Constants

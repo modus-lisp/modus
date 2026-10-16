@@ -17,7 +17,17 @@
 ;;;;
 ;;;; Depends on: dwc2.lisp.
 
-(defun split-ch () 2)
+;; CHANNEL 6, NOT 2.  The comment above says "its own channel", and 2 was not: the NIC's bulk
+;; OUT (usb.lisp USB-BULK-SEND, r8152.lisp) is hardwired to channel 2 too.  A keyboard or mouse
+;; poll leaves its split transaction on the channel between the start-split and the
+;; complete-split, so a frame sent in between reprogrammed a channel mid-split.  On a Zero with
+;; the hub's Ethernet up that was a transmit one packet behind (the SYN of a fetch left on the
+;; wire only when the next frame pushed it), channels stuck enabled-and-disabling, and in the
+;; end the root port disabled -- hub, NIC, keyboard and mouse gone at once.  0 is control, 1
+;; the NIC's bulk IN, 2 its bulk OUT; hid.lisp's non-split driver takes 3..5.  Measured with
+;; this one change, live on the board: a whole HTTP exchange clean on the wire (SYN to FIN,
+;; every segment ACKed), where before the SYN never left.
+(defun split-ch () 6)
 
 ;; DMA buffers in the Device (uncached) USB window, past the NIC's buffers.
 (defun split-dma-base () #x11180000)

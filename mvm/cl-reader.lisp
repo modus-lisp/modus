@@ -2103,7 +2103,7 @@
               (let ((fill-bit (if bit-list
                                   (car (last bit-list))
                                   0))
-                    (v (make-array vec-len))
+                    (v (make-array vec-len :element-type 'bit))
                     (i 0) (cur bit-list))
                 (loop
                   (when (>= i vec-len) (return nil))

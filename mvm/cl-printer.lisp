@@ -1073,6 +1073,21 @@
          (t
           (let ((dims (%mda-dims obj)) (data (%mda-data obj)))
             (cond
+              ;; A BIT array (packed bytes, cl-clos.lisp PACKED BIT ARRAYS):
+              ;; #*0101 at rank 1 (CLHS 22.1.3.6), else the elements unpacked
+              ;; for the #nA emitter.
+              ((and (%mda-bit-p obj) dims (null (cdr dims)))
+               (%print-char 35 stream) (%print-char 42 stream)
+               (let ((n (length obj)) (i 0))
+                 (loop (when (>= i n) (return nil))
+                   (%print-char (if (eql (aref obj i) 0) 48 49) stream)
+                   (setq i (+ i 1)))))
+              ((%mda-bit-p obj)
+               (let* ((total (array-total-size obj)) (tmp (make-array (max total 1))) (i 0))
+                 (loop (when (>= i total) (return nil))
+                   (aset tmp i (aref obj i))
+                   (setq i (+ i 1)))
+                 (%print-md-array-offset dims tmp 0 stream level escape)))
               ;; Rank 1: recurse on the data vector/string (fp aware via
               ;; the user-visible length).  Slice manually to fp when set.
               ((and dims (null (cdr dims)))

@@ -3751,15 +3751,11 @@
       (setq i (+ i 1)))))
 
 (defun bit-vector-p (x)
-  "T if X is a bit-vector — a ONE-DIMENSIONAL array whose elements are all
-   0 or 1.  Multi-dimensional bit arrays (e.g. (make-array '(2 2)
-   :element-type 'bit)) are NOT bit-vectors, so require rank 1.  NB: a 1D
-   bit array built by MAKE-ARRAY is an %mda-p object of rank 1, so test
-   ARRAY-RANK rather than (not %mda-p).  Empty arrays count as bit-vectors."
-  (and (arrayp x)
-       (not (stringp x))
-       (= (array-rank x) 1)
-       (%array-bits-only-p x)))
+  "T if X is a bit-vector: a rank-1 array of element type BIT -- a packed bit
+   array (cl-clos.lisp, PACKED BIT ARRAYS).  It used to scan the CONTENTS,
+   so (vector 0 1) was one and #*0101 was not distinguishable from it."
+  (and (not (null x)) (not (eq x t)) (not (fixnump x)) (not (consp x))
+       (%mda-p x) (%mda-bit-p x) (eql (%mda-rank x) 1)))
 
 
 
@@ -4456,11 +4452,12 @@
               (setq i (+ i 1))))))
        ((null object) (%make-string-array 0))
        (t object)))
+    ;; BIT-VECTOR: a packed bit array (not the general vector below)
+    ((or (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector))
+     (if (bit-vector-p object)
+         object
+         (make-array (length object) :element-type 'bit :initial-contents object)))
     ((or (eq result-type 'vector) (eq result-type 'simple-vector)
-         ;; Bit-vectors in Modus are plain arrays of 0/1 (bit-vector-p
-         ;; tests element values), so coercing a list/vector/bit-vector to
-         ;; BIT-VECTOR is the same flatten-to-array path as VECTOR.
-         (eq result-type 'bit-vector) (eq result-type 'simple-bit-vector)
          ;; ARRAY / SIMPLE-ARRAY — the SAME path.  Missing them meant
          ;; `(coerce '(1 2 3) '(simple-array (unsigned-byte 8) (*)))' fell
          ;; through to `(t object)' and returned THE LIST, silently and with
@@ -5149,6 +5146,11 @@
     ((readtablep obj) 'readtable)
     ((random-state-p obj) 'random-state)
     ((symbolp obj) (if (keywordp obj) 'keyword 'symbol))
+    ;; a packed BIT array (cl-clos.lisp, PACKED BIT ARRAYS)
+    ((and (not (consp obj)) (%mda-p obj) (%mda-bit-p obj))
+     (cond ((not (eql (%mda-rank obj) 1)) (list 'simple-array 'bit (array-dimensions obj)))
+           ((simple-bit-vector-p obj) (list 'simple-bit-vector (length obj)))
+           (t (list 'vector 'bit '*))))
     ;; packed single-float vector (subtag #x12)
     ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x12))
      (list 'simple-array 'single-float (list (length obj))))
@@ -5315,11 +5317,12 @@
          ;; A byte-packed u8 vector (subtag #x11) has element-type
          ;; (unsigned-byte 8), so it is NOT a simple-vector.
          ((eq tn 'simple-vector) (and (%typep-array-obj-p obj)
+                                      (not (bit-vector-p obj))
                                       (not (eql (obj-subtag obj) #x11))
                                       ;; packed single-float vector (#x12)
                                       (not (eql (obj-subtag obj) #x12))))
-         ((eq tn 'bit-vector)    (arrayp obj))
-         ((eq tn 'simple-bit-vector) (arrayp obj))
+         ((eq tn 'bit-vector)    (bit-vector-p obj))
+         ((eq tn 'simple-bit-vector) (simple-bit-vector-p obj))
          ;; CLHS 4.3: the SEQUENCE system class is exactly (or list vector).
          ;; A multi-dimensional array is an ARRAY but NOT a sequence, so the
          ;; rank must be checked — `(typep (make-array '(2 2)) 'sequence)' is
@@ -5508,8 +5511,16 @@
                  t)
              ;; element-type: MDA-with-string-data → character family;
              ;; otherwise element type is T.
-             (let ((str (%mda-stringp obj)))
+             (let ((str (%mda-stringp obj)) (bitp (%mda-bit-p obj)))
                (cond
+                 ;; a packed BIT array: element type exactly BIT, and simple
+                 ;; only without a fill pointer or displacement
+                 (bitp
+                  (and (not (eq head 'simple-vector))
+                       (or (not (eq head 'simple-array))
+                           (and (null (%mda-fp obj)) (null (%mda-displaced obj))))
+                       (or (null et) (eq et '*)
+                           (eq (upgraded-array-element-type et) 'bit))))
                  ((or (null et) (eq et '*)) t)
                  ((eq et t) (not str))
                  ((or (eq et 'character) (eq et 'base-char)

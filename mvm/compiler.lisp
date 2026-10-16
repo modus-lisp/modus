@@ -23707,7 +23707,11 @@
            (let ((disp (%mda-displaced ,g-arr)))
              (let ((,g-raw (if disp
                                (%aref-multi ,g-arr ,g-idx)
-                               (%prim-aref (%mda-data ,g-arr) ,g-idx))))
+                               ;; a BIT array's data is a packed byte store
+                               ;; (cl-clos.lisp, PACKED BIT ARRAYS)
+                               (if (%mda-bit-p ,g-arr)
+                                   (%bit-store-ref (%mda-data ,g-arr) ,g-idx)
+                                   (%prim-aref (%mda-data ,g-arr) ,g-idx)))))
                (if (%prim-stringp (%mda-data ,g-arr))
                    (code-char ,g-raw)
                    ,g-raw))))
@@ -23864,7 +23868,9 @@
            (let ((disp (%mda-displaced ,g-arr)))
              (if disp
                  (%aset-multi ,g-arr ,g-sto ,g-idx)
-                 (%prim-aset (%mda-data ,g-arr) ,g-idx ,g-sto)))
+                 (if (%mda-bit-p ,g-arr)
+                     (%bit-store-set (%mda-data ,g-arr) ,g-idx ,g-sto)
+                     (%prim-aset (%mda-data ,g-arr) ,g-idx ,g-sto))))
            ,g-val)
           ((%raw-consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-sto) ,g-val)
           ;; packed single-float vector (#x12): narrow and store the lane

@@ -4019,7 +4019,9 @@
     ((%mda-p seq)
      ;; Native MDA — reverse the logical sequence respecting fill-pointer.
      (let* ((len (length seq))
-            (out (if (stringp seq) (make-string len) (make-array len)))
+            (out (cond ((stringp seq) (make-string len))
+                       ((bit-vector-p seq) (make-array len :element-type 'bit))
+                       (t (make-array len))))
             (i 0))
        (loop
          (when (= i len) (return out))
@@ -4598,6 +4600,32 @@
       (setq i (+ i 1))
       (setq cur (cdr cur)))))
 
+(defun %bit-vector-push (new-element vector extend-p args)
+  "VECTOR-PUSH / VECTOR-PUSH-EXTEND on a fill-pointer BIT array: elements go
+   through AREF/ASET (the data is a packed byte store, not one slot per
+   element); growing allocates a new store and copies through AREF, which
+   honours a displacement and leaves the result undisplaced."
+  (let ((fp (%mda-fp vector)))
+    (when (null fp) (%signal-type-error))
+    (let* ((dims (%mda-dims vector))
+           (cap (if (consp dims) (car dims) 0)))
+      (when (>= fp cap)
+        (unless extend-p (return-from %bit-vector-push nil))
+        (let* ((hint (if (and (consp args) (integerp (car args)) (> (car args) 0)) (car args) 1))
+               (new-cap (max (+ cap hint) (+ fp 1) (* cap 2)))
+               (store (%make-bit-store new-cap))
+               (i 0))
+          (loop (when (>= i cap) (return nil))
+            (unless (eql (aref vector i) 0) (%bit-store-set store i 1))
+            (setq i (+ i 1)))
+          (%prim-aset vector 6 store)
+          (%prim-aset vector 3 nil)
+          (%prim-aset vector 4 0)
+          (%prim-aset vector 1 (list new-cap))))
+      (aset vector fp new-element)
+      (%mda-set-fp vector (+ fp 1))
+      fp)))
+
 (defun vector-push (new-element vector)
   "Push NEW-ELEMENT onto VECTOR (with fill pointer). Returns fill pointer or nil.
    String underlying stores fixnum char-codes; coerce a character element
@@ -4605,6 +4633,8 @@
    CLHS: signals type-error if VECTOR has no fill pointer.
    Displaced-aware: writes at (+ fp offset) when MDA has a displaced-to slot."
   (cond
+    ((and (%mda-p vector) (%mda-bit-p vector))
+     (%bit-vector-push new-element vector nil nil))
     ((%mda-p vector)
      ;; MDA fast path: read fp slot, write into data, advance fp.
      (let ((fp (%mda-fp vector)))
@@ -4648,6 +4678,8 @@
    displacement is broken — fresh local backing is allocated and the
    old contents are copied verbatim, per CLHS adjust-array semantics."
   (cond
+    ((and (%mda-p vector) (%mda-bit-p vector))
+     (%bit-vector-push new-element vector t args))
     ((%mda-p vector)
      ;; MDA fast path: handles fp + auto-extend; displacement aware.
      (let ((fp (%mda-fp vector)))
@@ -4738,7 +4770,9 @@
        (if (and fp (> fp 0))
            (let ((new-fp (- fp 1)))
              (%mda-set-fp vector new-fp)
-             (aref (%mda-data vector) new-fp))
+             (if (%mda-bit-p vector)
+                 (aref vector new-fp)
+                 (aref (%mda-data vector) new-fp)))
            (error "vector-pop: empty vector"))))
     (t (let ((vector (%fp-inner vector)))
          (if (and (consp vector) (fixnump (car vector)))
@@ -4827,53 +4861,70 @@
             (aset result i (logand 1 (funcall op b1 b2))))
           (setq i (+ i 1)))))))
 
-(defun %bit-raw-data (v len)
-  "The word vector holding V's bits in row-major order when V is a plain
-   vector or a non-displaced native MDA over one, with room for LEN; else NIL."
-  (cond ((or (null v) (consp v) (fixnump v)) nil)
-        ((%mda-p v)
-         (and (null (%mda-displaced v))
-              (let ((d (%mda-data v)))
-                (and d (not (consp d)) (not (%mda-p d)) (not (%prim-stringp d))
-                     (not (eq (obj-subtag d) #x12))
-                     (>= (array-length d) len) d))))
-        ((%prim-stringp v) nil)
-        ((eq (obj-subtag v) #x12) nil)
-        ((>= (array-length v) len) v)
-        (t nil)))
+(defun %bit-store-of (v)
+  "V's packed byte store when V is a non-displaced bit array, else NIL."
+  (and v (not (eq v t)) (not (consp v)) (not (fixnump v)) (not (characterp v))
+       (%mda-p v) (%mda-bit-p v) (null (%mda-displaced v))
+       (%mda-data v)))
+
+;;; The word loops are compiled at SAFETY 0: every index is below the word
+;;; count of stores this code sized itself.
+(declaim (optimize (safety 0)))
+
+(defun %bit-trim-tail (d n)
+  "Clear the unused bits of D's last word past N bits (the packed stores keep
+   them zero, so a word-wise EQUAL / COUNT is exact)."
+  (let ((r (logand n 15)))
+    (unless (= r 0)
+      (let ((j (ash n -4)))
+        (setf (svref d j) (logand (svref d j) (- (%bit-mask16 r) 1)))))))
+
+(defun %bit-words-op (code d1 d2 dr n)
+  "DR[j] := CODE's operation (0 and 1 ior 2 xor 3 eqv 4 nand 5 nor 6 andc1
+   7 andc2 8 orc1 9 orc2) of D1[j] and D2[j] for the N words -- one loop per
+   operation, so the dispatch is outside it."
+  (declare (type simple-vector d1 d2 dr))
+  (let ((j 0))
+    (case code
+      (0 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logand (svref d1 j) (svref d2 j))) (setq j (%fixnum-+ j 1))))
+      (1 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logior (svref d1 j) (svref d2 j))) (setq j (%fixnum-+ j 1))))
+      (2 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logxor (svref d1 j) (svref d2 j))) (setq j (%fixnum-+ j 1))))
+      (3 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logxor 65535 (logxor (svref d1 j) (svref d2 j)))) (setq j (%fixnum-+ j 1))))
+      (4 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logxor 65535 (logand (svref d1 j) (svref d2 j)))) (setq j (%fixnum-+ j 1))))
+      (5 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logxor 65535 (logior (svref d1 j) (svref d2 j)))) (setq j (%fixnum-+ j 1))))
+      (6 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logand (logxor 65535 (svref d1 j)) (svref d2 j))) (setq j (%fixnum-+ j 1))))
+      (7 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logand (svref d1 j) (logxor 65535 (svref d2 j)))) (setq j (%fixnum-+ j 1))))
+      (8 (loop (when (>= j n) (return nil)) (setf (svref dr j) (logior (logxor 65535 (svref d1 j)) (svref d2 j))) (setq j (%fixnum-+ j 1))))
+      (t (loop (when (>= j n) (return nil)) (setf (svref dr j) (logior (svref d1 j) (logxor 65535 (svref d2 j)))) (setq j (%fixnum-+ j 1)))))))
+
+(defun %bit-words-not (d1 dr n)
+  (declare (type simple-vector d1 dr))
+  (let ((j 0))
+    (loop (when (>= j n) (return nil))
+      (setf (svref dr j) (logxor 65535 (svref d1 j)))
+      (setq j (%fixnum-+ j 1)))))
+
+(declaim (optimize (safety 1)))
 
 (defun %bit-op-fast (code v1 v2 result-vec op)
-  "%BIT-OP with the operation as CODE (0 and 1 ior 2 xor 3 eqv 4 nand 5 nor
-   6 andc1 7 andc2 8 orc1 9 orc2) over the arrays' raw data, when all three
-   expose it: one raw read per operand and one raw write per bit, where
-   %BIT-OP paid a generic AREF per operand, a closure call and a generic
-   ASET (cl-bench BITVECTORS, 2265x SBCL).  Otherwise %BIT-OP with OP."
-  (let* ((len (min (array-length v1) (array-length v2)))
+  "%BIT-OP with the operation as CODE, sixteen bits at a time over the packed
+   word stores when all three arrays are non-displaced bit arrays (the
+   per-element path paid a generic AREF per operand, a closure call and a
+   generic ASET per bit: cl-bench BITVECTORS ran 950x SBCL).  Otherwise
+   %BIT-OP with OP."
+  (let* ((len (array-total-size v1))
          (result (cond ((eq result-vec t) v1)
                        (result-vec result-vec)
                        (t (make-array (array-dimensions v1) :element-type 'bit))))
-         (d1 (%bit-raw-data v1 len))
-         (d2 (and d1 (%bit-raw-data v2 len)))
-         (dr (and d2 (%bit-raw-data result len))))
-    (if (null dr)
+         (d1 (%bit-store-of v1))
+         (d2 (and d1 (%bit-store-of v2)))
+         (dr (and d2 (%bit-store-of result))))
+    (if (or (null dr) (/= len (array-total-size v2)) (/= len (array-total-size result)))
         (%bit-op op v1 v2 result)
-        (let ((i 0))
-          (loop
-            (when (>= i len) (return result))
-            (let* ((a (logand (%prim-aref d1 i) 1))
-                   (b (logand (%prim-aref d2 i) 1))
-                   (r (cond ((= code 0) (logand a b))
-                            ((= code 1) (logior a b))
-                            ((= code 2) (logxor a b))
-                            ((= code 3) (logxor 1 (logxor a b)))
-                            ((= code 4) (logxor 1 (logand a b)))
-                            ((= code 5) (logxor 1 (logior a b)))
-                            ((= code 6) (logand (logxor 1 a) b))
-                            ((= code 7) (logand a (logxor 1 b)))
-                            ((= code 8) (logior (logxor 1 a) b))
-                            (t (logior a (logxor 1 b))))))
-              (%prim-aset dr i r))
-            (setq i (+ i 1)))))))
+        (progn
+          (%bit-words-op code d1 d2 dr (ash (+ len 15) -4))
+          (%bit-trim-tail dr len)
+          result))))
 
 (defun bit-and (v1 v2 &optional result) (%bit-op-fast 0 v1 v2 result (lambda (a b) (logand a b))))
 (defun bit-ior (v1 v2 &optional result) (%bit-op-fast 1 v1 v2 result (lambda (a b) (logior a b))))
@@ -4887,10 +4938,21 @@
 (defun bit-orc2 (v1 v2 &optional result) (%bit-op-fast 9 v1 v2 result (lambda (a b) (logior a (logxor 1 b)))))
 
 (defun bit-not (v1 &optional result)
-  (let ((len (array-length v1)))
-    (let ((out (if result
-                   (if (eq result t) v1 result)
-                   (make-array len))))
+  (let* ((out (if result
+                  (if (eq result t) v1 result)
+                  (make-array (array-dimensions v1) :element-type 'bit)))
+         (d1 (%bit-store-of v1))
+         (dr (and d1 (%bit-store-of out))))
+    (if (and dr (= (array-total-size v1) (array-total-size out)))
+        (let ((len (array-total-size v1)))
+          (%bit-words-not d1 dr (ash (+ len 15) -4))
+          (%bit-trim-tail dr len)
+          out)
+        (%bit-not-slow v1 out))))
+
+(defun %bit-not-slow (v1 out)
+  (let ((len (array-total-size v1)))
+    (progn
       (let ((i 0))
         (loop
           (when (>= i len) (return out))
@@ -5100,10 +5162,9 @@
     (t nil)))
 
 (defun simple-bit-vector-p (x)
-  "T iff X is a simple bit-vector.  Modus represents a bit-vector as a
-   1-D array whose elements are all 0/1 (no distinct subtag), so this is
-   BIT-VECTOR-P (every Modus bit-vector is simple)."
-  (bit-vector-p x))
+  "T iff X is a simple bit-vector: a bit-vector with no fill pointer that is
+   not displaced."
+  (and (bit-vector-p x) (null (%mda-fp x)) (null (%mda-displaced x))))
 
 ;;; ============================================================
 ;;; SETF Place Functions (generated by MVM setf macro)
@@ -5507,7 +5568,27 @@
              (f32-elt (and etype-set (%f32-element-type-p etype)
                            (= rank 1) (not (consp dim))
                            (not fp) (not adj) (not disp)))
+             ;; BIT: built as the 0/1 words below like any general array,
+             ;; then packed eight to a byte under an MDA header (cl-clos.lisp,
+             ;; PACKED BIT ARRAYS) -- every rank and shape, so the header's
+             ;; etype is what says "bit".  A displaced bit array shares its
+             ;; target's store.
+             (bit-elt (and etype-set (eq (upgraded-array-element-type etype) 'bit)))
              (data (cond
+                     ;; BIT without :initial-contents: the packed store itself
+                     ;; (a fresh store is zero; an :initial-element 1 fills
+                     ;; whole words), not a word per element packed afterwards
+                     ;; -- a million-bit (make-array n :element-type 'bit) was
+                     ;; an 8 MB vector and a million single-bit stores.
+                     ((and bit-elt (not ic-p))
+                      (let ((st (%make-bit-store total)))
+                        (when (and ie-p (not (eql ie 0)))
+                          (let ((nw (ash (+ total 15) -4)) (j 0))
+                            (loop (when (>= j nw) (return nil))
+                              (setf (svref st j) 65535)
+                              (setq j (+ j 1)))
+                            (%bit-trim-tail st total)))
+                        st))
                      ;; :initial-element — fill every slot.
                      (ie-p
                       (let* ((a (cond (char-elt (%make-string-array total))
@@ -5560,6 +5641,11 @@
           ;; VP8 probability/tree tables are exactly this shape; the declared-
           ;; array fast path (compile-aref on a declared (simple-array
           ;; (signed-byte 32))) read their wrapper headers as elements.
+          (bit-elt
+           (if disp
+               (%alloc-mda rank dim-list fp disp off 'bit disp)
+               (%alloc-mda rank dim-list fp nil off 'bit
+                           (if ic-p (%pack-bits data total) data))))
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp)
                 (or (eq etype t) (and (not char-elt) (not u8-elt) (not f32-elt))))

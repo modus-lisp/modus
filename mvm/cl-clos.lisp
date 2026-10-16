@@ -5898,6 +5898,43 @@
 (defun %mda-etype     (m) (%prim-aref m 5))
 (defun %mda-data      (m) (%prim-aref m 6))
 
+;;; PACKED BIT ARRAYS.  An array of element type BIT is an MDA header (etype
+;;; slot = the symbol BIT) whose data is a simple-vector of FIXNUMS each
+;;; holding 16 elements, LSB first, the unused high bits of the last word kept
+;;; zero (16, not 32 or 62: every word is a fixnum on the 30-bit towers too, and
+;;; the index split is a constant shift and mask).  Every element access on an
+;;; MDA asks %MDA-BIT-P before the raw read.  It used to be a plain
+;;; simple-vector of the fixnums 0 and 1 -- a word per bit, BIT-VECTOR-P
+;;; decided by scanning the CONTENTS, so (vector 0 1) was a bit-vector and
+;;; #*0101 printed as #(0 1 0 1) -- and the bit-wise operations ran 950x
+;;; slower than SBCL's word-at-a-time ones.
+(defun %mda-bit-p (m) (eq (%prim-aref m 5) 'bit))
+(defun %bit-mask16 (k)
+  (case k (0 1) (1 2) (2 4) (3 8) (4 16) (5 32) (6 64) (7 128)
+          (8 256) (9 512) (10 1024) (11 2048) (12 4096) (13 8192) (14 16384) (t 32768)))
+(defun %bit-store-ref (d i)
+  (if (eql (logand (svref d (ash i -4)) (%bit-mask16 (logand i 15))) 0) 0 1))
+(defun %bit-store-set (d i v)
+  (let* ((j (ash i -4)) (m (%bit-mask16 (logand i 15))) (w (svref d j)))
+    (setf (svref d j) (if (eql v 0) (logand w (logxor 65535 m)) (logior w m)))
+    v))
+(defun %make-bit-store (nbits)
+  "A zeroed store for NBITS bits: one fixnum word per 16."
+  (make-array (max 1 (ash (+ nbits 15) -4))))
+(defun %pack-bits (src n)
+  "A bit store holding elements 0 .. N-1 of the generic 0/1 vector SRC."
+  (let ((d (%make-bit-store n)) (i 0))
+    (loop (when (>= i n) (return d))
+      (unless (eql (%prim-aref src i) 0) (%bit-store-set d i 1))
+      (setq i (+ i 1)))))
+(defun %bit-mda-unpack (m)
+  "A simple-vector of the 0/1 elements of the rank-1 bit array M, to its
+   fill pointer (the printer's and the test harness's view)."
+  (let* ((n (length m)) (v (make-array n)) (i 0))
+    (loop (when (>= i n) (return v))
+      (aset v i (aref m i))
+      (setq i (+ i 1)))))
+
 (defun %mda-set-fp        (m v) (%prim-aset m 2 v))
 (defun %mda-set-displaced (m v) (%prim-aset m 3 v))
 (defun %mda-set-offset    (m v) (%prim-aset m 4 v))
@@ -6058,7 +6095,9 @@
              (if (%mda-p disp)
                  (apply #'%aref-multi disp (+ idx off) nil)
                  (%elt-ref1 disp (+ idx off))))
-           (%elt-ref1 (%mda-data a) idx))))
+           (if (%mda-bit-p a)
+               (%bit-store-ref (%mda-data a) idx)
+               (%elt-ref1 (%mda-data a) idx)))))
     ;; Non-MDA — single-sub semantic only.
     ((null (cdr subs))
      (if (consp a) (%wrapper-aref a (car subs)) (%elt-ref1 a (car subs))))
@@ -6076,7 +6115,8 @@
       (let ((dims (%mda-dims a)))
         (if (and (consp dims) (consp (cdr dims)) (null (cddr dims))
                  (fixnump i) (fixnump j)
-                 (not (%prim-stringp (%mda-data a))))
+                 (not (%prim-stringp (%mda-data a)))
+                 (not (%mda-bit-p a)))
             (%prim-aref (%mda-data a) (+ (* i (cadr dims)) j))
             (%aref-multi-public a i j)))
       (%aref-multi-public a i j)))
@@ -6087,7 +6127,8 @@
       (let ((dims (%mda-dims a)))
         (if (and (consp dims) (consp (cdr dims)) (null (cddr dims))
                  (fixnump i) (fixnump j)
-                 (not (%prim-stringp (%mda-data a))))
+                 (not (%prim-stringp (%mda-data a)))
+                 (not (%mda-bit-p a)))
             (progn (%prim-aset (%mda-data a) (+ (* i (cadr dims)) j) val) val)
             (%aset-multi a val i j)))
       (%aset-multi a val i j)))
@@ -6101,7 +6142,8 @@
       (let ((dims (%mda-dims a)))
         (if (and (consp dims) (consp (cdr dims)) (consp (cddr dims)) (null (cdddr dims))
                  (fixnump i) (fixnump j) (fixnump k)
-                 (not (%prim-stringp (%mda-data a))))
+                 (not (%prim-stringp (%mda-data a)))
+                 (not (%mda-bit-p a)))
             (%prim-aref (%mda-data a)
                         (+ (* (+ (* i (cadr dims)) j) (caddr dims)) k))
             (%aref-multi-public a i j k)))
@@ -6113,7 +6155,8 @@
       (let ((dims (%mda-dims a)))
         (if (and (consp dims) (consp (cdr dims)) (consp (cddr dims)) (null (cdddr dims))
                  (fixnump i) (fixnump j) (fixnump k)
-                 (not (%prim-stringp (%mda-data a))))
+                 (not (%prim-stringp (%mda-data a)))
+                 (not (%mda-bit-p a)))
             (progn (%prim-aset (%mda-data a)
                                (+ (* (+ (* i (cadr dims)) j) (caddr dims)) k) val)
                    val)
@@ -6158,7 +6201,9 @@
              (if (%mda-p disp)
                  (apply #'%aset-multi disp sto (+ idx off) nil)
                  (%elt-set1 disp (+ idx off) sto)))
-           (%elt-set1 (%mda-data a) idx sto))
+           (if (%mda-bit-p a)
+               (%bit-store-set (%mda-data a) idx sto)
+               (%elt-set1 (%mda-data a) idx sto)))
        val))
     ;; Non-MDA single-sub.
     ((null (cdr subs))
@@ -6247,7 +6292,9 @@
    CLHS: signals TYPE-ERROR on non-array input (adjustable-array-p.lsp
    tests 19722/3)."
   (cond
-    ((%mda-p a) t)
+    ;; a bit array is only "adjustable" when it carries a fill pointer or a
+    ;; displacement: every bit-vector is an MDA, and a plain one is simple
+    ((%mda-p a) (if (%mda-bit-p a) (or (%mda-fp a) (%mda-displaced a) nil) t))
     ((and (consp a) (eql (car a) 8765432)) t)
     ;; multi-dim wrapper or fp/displaced wrapper — treat as array
     ((and (consp a) (eql (car a) 9867654)) nil)
@@ -6313,7 +6360,7 @@
           ((eq k :element-type)     (setq etype v))))
       (setq cur (cddr cur)))
     (let* ((old-dims (%mda-dims a))
-           (old-data (%mda-data a))
+           (old-data (%adjust-old-data a))
            (str-data (stringp old-data))
            (new-total (%mda-nd-total new-dims))
            (sz (if (= new-total 0) 1 new-total))
@@ -6352,7 +6399,7 @@
                    (setq subs nxt))))))))
       ;; Commit: data ← new-data, dims ← new-dims, rank ← length, drop
       ;; displacement (we materialised fresh storage).
-      (%prim-aset a 6 new-data)
+      (%prim-aset a 6 (%adjust-new-data a new-data sz))
       (%prim-aset a 1 new-dims)
       (%prim-aset a 0 (length new-dims))
       (%prim-aset a 3 nil)
@@ -6401,7 +6448,7 @@
           ((eq k :initial-element)         (setq init-elem v))
           ((eq k :initial-contents)        (setq init-contents v))))
       (setq cur (cddr cur)))
-    (let* ((old-data (%mda-data a))
+    (let* ((old-data (%adjust-old-data a))
            ;; Logical length / displacement offset of the array's CURRENT
            ;; view.  For a displaced source, old-data is the displaced-to
            ;; target and we must apply %mda-offset when copying, reading at
@@ -6428,7 +6475,7 @@
                (aset new-data i (car lst))
                (setq lst (cdr lst)))
              (setq i (+ i 1))))
-         (%prim-aset a 6 new-data)
+         (%prim-aset a 6 (%adjust-new-data a new-data new-size))
          (%prim-aset a 3 nil) (%prim-aset a 4 0))
         ((not (eq init-elem :unset))
          (let ((i 0)
@@ -6439,7 +6486,7 @@
                  (aset new-data i (aref old-data (+ old-off i)))
                  (aset new-data i store))
              (setq i (+ i 1))))
-         (%prim-aset a 6 new-data)
+         (%prim-aset a 6 (%adjust-new-data a new-data new-size))
          (%prim-aset a 3 nil) (%prim-aset a 4 0))
         (t
          (let ((i 0))
@@ -6447,7 +6494,7 @@
              (when (< i old-dim0)
                (aset new-data i (aref old-data (+ old-off i))))
              (setq i (+ i 1))))
-         (%prim-aset a 6 new-data)
+         (%prim-aset a 6 (%adjust-new-data a new-data new-size))
          (%prim-aset a 3 nil) (%prim-aset a 4 0)))
       ;; Update dims slot to reflect the new size (rank stays 1).
       (%prim-aset a 1 (list new-size))
@@ -6465,6 +6512,21 @@
              (%mda-set-fp a (if (> old-fp new-size) new-size old-fp))))
           (t (%mda-set-fp a fp-arg))))
       a)))
+
+(defun %adjust-old-data (a)
+  "The data ADJUST-ARRAY copies from: a non-displaced BIT array's elements
+   unpacked to one per slot (its store is packed bytes), else the data slot."
+  (if (and (%mda-bit-p a) (null (%mda-displaced a)))
+      (let* ((d (%mda-dims a)) (n (if (consp d) (%mda-nd-total d) 1))
+             (v (make-array (max n 1))) (i 0))
+        (loop (when (>= i n) (return v))
+          (aset v i (aref a i))
+          (setq i (+ i 1))))
+      (%mda-data a)))
+
+(defun %adjust-new-data (a new-data n)
+  "NEW-DATA as A's store: packed again when A is a BIT array."
+  (if (and new-data (%mda-bit-p a)) (%pack-bits new-data n) new-data))
 
 (defun adjust-array (a new-size &rest args)
   "Return an array of NEW-SIZE with elements from A.

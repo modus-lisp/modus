@@ -3603,6 +3603,7 @@
              ;; (ANSI subseq.specialized-vector.2).
              (result (cond
                        ((stringp seq) (%make-string-array len))
+                       ((bit-vector-p seq) (make-array len :element-type 'bit))
                        ((and (not (consp seq)) (not (%mda-p seq))
                              (eq (obj-subtag seq) #x11)) (%make-u8-vector len))
                        ((and (not (consp seq)) (not (%mda-p seq))

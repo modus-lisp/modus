@@ -614,6 +614,10 @@
    eventually pointing at an array/string rather than NIL/list."
   (cond
     ((null seq) 0)
+    ;; A simple string or a byte vector: the header count, before the
+    ;; wrapper, MDA and not-a-sequence tests (76 ns -> a load).
+    ((%prim-simple-string-p seq) (array-length seq))
+    ((%prim-u8-vector-p seq) (array-length seq))
     ;; No cons-based wrappers in this image: a cons is a list.
     ((and (consp seq) *%no-cons-array-wrappers*) (list-length seq))
     ((consp seq)
@@ -917,6 +921,17 @@
               (setq i (+ i 1))))
           nil))))
 
+(defun %simple-string= (a b)
+  "Two plain #x31 strings with the same characters: lengths, then the code
+   words.  (STRING= parses keywords and string designators first.)"
+  (let ((n (array-length a)))
+    (and (= n (array-length b))
+         (let ((i 0))
+           (loop
+             (when (>= i n) (return t))
+             (unless (eq (%word-aref a i) (%word-aref b i)) (return nil))
+             (setq i (+ i 1)))))))
+
 (defun equal (a b)
   "Structural equality: EQL for atoms, recursive for conses,
    case-SENSITIVE element-wise for strings.  ANSI: EQUAL on strings
@@ -929,11 +944,13 @@
                   (equal (cdr a) (cdr b))
                   nil)
               nil)
-          (if (stringp a)
-              (if (stringp b)
-                  (string= a b)
-                  nil)
-              (%equal-other a b)))))
+          (if (and (%prim-simple-string-p a) (%prim-simple-string-p b))
+              (%simple-string= a b)
+              (if (stringp a)
+                  (if (stringp b)
+                      (string= a b)
+                      nil)
+                  (%equal-other a b))))))
 
 (defun %equal-other (a b)
   "EQUAL's remaining CLHS cases, off the cons/string fast path: BIT VECTORS

@@ -1757,12 +1757,17 @@
              (or (= st 80)     ; #x50 symbol
                  (= st 83))))))  ; #x53 keyword
 
+(defvar *%keyword-package* nil)
+
 (defun keywordp (x)
   "True if X is a keyword symbol.  CL-symbol path: package eq KEYWORD.
    Native path: object with subtag #x53 (allocated by %INTERN-KEYWORD)."
   (cond
     ((%cl-sym-p x)
-     (let ((kw-pkg (find-package "KEYWORD")))
+     ;; The KEYWORD package object never changes once it exists: look it
+     ;; up once (FIND-PACKAGE per call was 400 ns of every KEYWORDP).
+     (let ((kw-pkg (or *%keyword-package*
+                       (setq *%keyword-package* (find-package "KEYWORD")))))
        (and kw-pkg (eq (%cl-sym-package x) kw-pkg))))
     ((or (null x) (eq x t)) nil)
     ((or (integerp x) (consp x) (characterp x) (stringp x)) nil)

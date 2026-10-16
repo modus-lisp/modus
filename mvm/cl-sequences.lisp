@@ -937,6 +937,8 @@
    characters, symbols).  Honors :START1, :END1, :START2, :END2.
    Signals error on odd-length args or unknown key (unless
    :allow-other-keys T precedes)."
+  (when (and (null options) (%prim-simple-string-p a) (%prim-simple-string-p b))
+    (return-from string= (%simple-string= a b)))
   (let ((sa (%string-designator a))
         (sb (%string-designator b))
         (s1 0) (e1 nil) (s2 0) (e2 nil)

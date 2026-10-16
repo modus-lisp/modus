@@ -4069,13 +4069,70 @@
             ;; A FLOAT is tested on its SIGN BIT: (< -0.0 0) is false, so
             ;; (abs -0.0) came back -0.0 once the reader produced real
             ;; negative zeros.
+            ;; A FIXNUM first: %COMPLEX-P is a call, and it ran on every
+            ;; (abs n) (113 ns).
             `(let ((,tmp ,(cadr form)))
+               (if (fixnump ,tmp)
+                   (if (< ,tmp 0)
+                       (if (eql ,tmp most-negative-fixnum) (generic-negate-int ,tmp) (- 0 ,tmp))
+                       ,tmp)
                (if (%complex-p ,tmp)
                    (%complex-abs ,tmp)
                    (if (%ieee-float-p ,tmp)
                        (if (float-negative-p ,tmp) (%negate-number ,tmp) ,tmp)
-                       (if (< ,tmp 0) (generic-negate-int ,tmp) ,tmp)))))
+                       (if (< ,tmp 0) (generic-negate-int ,tmp) ,tmp))))))
           '(%signal-program-error))))
+
+  ;; CHAR= / CHAR/= / CHAR< / CHAR> / CHAR<= / CHAR>= with TWO arguments:
+  ;; inline when both are characters (an immediate: EQ is CHAR=, and the
+  ;; codes order like the characters); anything else takes the %CHAR2x
+  ;; helper the defun itself uses.  The defuns are &REST, and every
+  ;; (char= c #\a) of a parser loop cost a consed arglist and a call (83 ns
+  ;; vs SBCL's 2).  Other arities are left to the defun (no expansion).
+  (dolist (e '(("CHAR=" eq nil %char2= nil) ("CHAR/=" eq t %char2= nil)
+               ("CHAR<" < nil %char2< nil) ("CHAR>" > nil %char2< t)
+               ("CHAR<=" <= nil %char2<= nil) ("CHAR>=" >= nil %char2<= t)))
+    (let ((name (first e)) (op (second e)) (negate (third e))
+          (slow (fourth e)) (swap (fifth e)))
+      (mvm-define-macro name
+        (lambda (form)
+          (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+              ;; A variable or a literal operand is used as is (no LET, so
+              ;; the whole test stays in branch form -- %COMPILE-TEST-BRANCH);
+              ;; a literal character needs no CHARACTERP test.
+              (let* ((fa (cadr form)) (fb (caddr form))
+                     (a (if (or (symbolp fa) (characterp fa)) fa (%mvm-gensym "CA")))
+                     (b (if (or (symbolp fb) (characterp fb)) fb (%mvm-gensym "CB")))
+                     (fast (if (eq op 'eq)
+                               `(eq ,a ,b)
+                               `(,op (char-code ,a) (char-code ,b))))
+                     (call (if swap `(,slow ,b ,a) `(,slow ,a ,b)))
+                     (checks (append (unless (characterp a) (list `(characterp ,a)))
+                                     (unless (characterp b) (list `(characterp ,b)))))
+                     (body `(if (and ,@checks)
+                                ,(if negate `(not ,fast) fast)
+                                ,(if negate `(not ,call) call)))
+                     (binds (append (unless (eq a fa) (list (list a fa)))
+                                    (unless (eq b fb) (list (list b fb))))))
+                (if binds `(let ,binds ,body) body))
+              form)))))
+
+  ;; (FLOOR A B): two fixnums divide inline (%FIXNUM-TRUNCATE2, then the
+  ;; toward-minus-infinity adjustment); anything else calls %FLOOR2, the
+  ;; defun's two-argument body.  (189 ns -> a division.)
+  (mvm-define-macro "FLOOR"
+    (lambda (form)
+      (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+          (let ((a (%mvm-gensym "FA")) (b (%mvm-gensym "FB"))
+                (q (%mvm-gensym "FQ")) (r (%mvm-gensym "FR")))
+            `(let ((,a ,(cadr form)) (,b ,(caddr form)))
+               (if (and (fixnump ,a) (fixnump ,b))
+                   (multiple-value-bind (,q ,r) (%fixnum-truncate2 ,a ,b)
+                     (if (and (not (eql ,r 0)) (if (< ,b 0) (> ,r 0) (< ,r 0)))
+                         (values (- ,q 1) (+ ,r ,b))
+                         (values ,q ,r)))
+                   (%floor2 ,a ,b))))
+          form)))
 
   ;; PROG1 → LET + body + return first value
   (mvm-define-macro "PROG1"
@@ -9660,9 +9717,144 @@
          (emit-ir :cmp (or ra dest) (or rb temp))
          (emit-ir (%inverse-branch bop) false-label)
          (when temp (free-temp-reg)))))
+    ((and (consp test) (symbolp (car test)) (name-eq (car test) "OR"))
+     ;; (or X Y ...): a true X jumps over the rest; only the last falls to
+     ;; FALSE-LABEL.  OR's macro binds each value to a LET temporary, which a
+     ;; test never reads.
+     (if (null (cdr test))
+         (emit-ir :br false-label)
+         (let ((through (make-compiler-label)) (r (cdr test)))
+           (loop
+             (when (null (cdr r))
+               (%compile-test-branch (car r) env dest false-label)
+               (return))
+             (let ((next (make-compiler-label)))
+               (%compile-test-branch (car r) env dest next)
+               (emit-ir :br through)
+               (emit-ir-label next))
+             (setq r (cdr r)))
+           (emit-ir-label through))))
+    ((and (consp test) (symbolp (car test)) (not (keywordp (car test)))
+          (let ((x (macroexpand-mvm test))) (and (not (eq x test)) (setq test x))))
+     (%compile-test-branch test env dest false-label))
+    ((%compile-predicate-branch test env dest false-label) nil)
     (t
      (compile-form test env dest)
      (emit-ir :bnull dest false-label))))
+
+;;; TESTS COMPILE TO BRANCHES.  A predicate, IF, AND or OR used as an IF test
+;;; used to produce T or NIL in a register (cmp; bcc; mov NIL; br; mov T)
+;;; which the test then compared against NIL: every WHEN/COND/AND in the
+;;; image paid a materialized boolean and a second branch, and an OR also a
+;;; LET slot per arm.  These emit the condition's own branch to FALSE-LABEL.
+
+(defun %test-literal-word (x)
+  "The machine word of literal X when CMP-IMM can compare against it -- a
+   non-negative fixnum or a character, whose word is under 2^31 -- else NIL."
+  (let ((w (cond ((and (integerp x) (>= x 0)) (ash x +fixnum-shift+))
+                 ((characterp x) (logior (ash (char-code x) +char-shift+) +char-tag+))
+                 (t nil))))
+    (and w (< w #x80000000) w)))
+
+(defun %compile-eq-branch (a b env dest false-label)
+  "Fall through when A and B are EQ, else branch to FALSE-LABEL."
+  (when (%test-literal-word a) (let ((x a)) (setq a b) (setq b x)))
+  (cond
+    ((null b)
+     (compile-form a env dest)
+     (emit-ir :bnnull dest false-label))
+    ((%test-literal-word b)
+     (let ((ra (%operand-reg a env)))
+       (unless ra (compile-form a env dest))
+       (emit-ir :cmp-imm (or ra dest) (%test-literal-word b))
+       (emit-ir :bne false-label)))
+    (t
+     (let ((temp (alloc-temp-reg)))
+       (compile-form a env dest)
+       (if (%leaf-operand-p b env)
+           (compile-form b env temp)
+           (progn (emit-ir :push dest) (compile-form b env temp) (emit-ir :pop dest)))
+       (emit-ir :cmp dest temp)
+       (emit-ir :bne false-label)
+       (free-temp-reg)))))
+
+(defun %compile-subtype-branch (arg env dest subtag false-label)
+  "Fall through when ARG is an object with SUBTAG, else branch."
+  (let ((temp nil))
+    (compile-form arg env dest)
+    (setq temp (alloc-temp-reg))
+    (emit-ir :obj-tag temp dest)
+    (emit-ir :cmp-imm temp (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :bne false-label)
+    (emit-ir :obj-subtag temp dest)
+    (emit-ir :cmp-imm temp (ash subtag +fixnum-shift+))
+    (emit-ir :bne false-label)
+    (free-temp-reg)))
+
+(defun %compile-predicate-branch (test env dest false-label)
+  "Branch-mode emission for the predicate TEST (already macroexpanded), or
+   NIL when it is not one this knows."
+  (unless (and (consp test) (symbolp (car test)) (consp (cdr test))
+               (listp (cddr test)))
+    (return-from %compile-predicate-branch nil))
+  (let* ((op (car test)) (args (cdr test)) (one (null (cdr args)))
+         (two (and (consp (cdr args)) (null (cddr args)))))
+    (flet ((is (name) (name-eq op name)))
+      (cond
+        ((and one (is "FIXNUMP"))
+         (compile-form (car args) env dest)
+         (emit-ir :test-imm dest 1)
+         (emit-ir :bne false-label)
+         t)
+        ((and one (is "CHARACTERP"))
+         ;; Same word-domain sequence as COMPILE-CHARACTERP (see there for
+         ;; why it is :and/:xor/:test and not :cmp).
+         (let ((temp (alloc-temp-reg)))
+           (compile-form (car args) env dest)
+           (emit-ir :li temp #xFF)
+           (emit-ir :and dest dest temp)
+           (emit-ir :li temp +char-tag+)
+           (emit-ir :xor dest dest temp)
+           (emit-ir :test dest dest)
+           (emit-ir :bne false-label)
+           (free-temp-reg))
+         t)
+        ((and one (is "%PRIM-SIMPLE-STRING-P"))
+         (%compile-subtype-branch (car args) env dest +subtag-string+ false-label) t)
+        ((and one (is "%PRIM-SIMPLE-VECTOR-P"))
+         (%compile-subtype-branch (car args) env dest +subtag-array+ false-label) t)
+        ((and one (is "%PRIM-U8-VECTOR-P"))
+         (%compile-subtype-branch (car args) env dest +subtag-u8-vector+ false-label) t)
+        ((and one (is "%MDA-P"))
+         (%compile-subtype-branch (car args) env dest +subtag-mda+ false-label) t)
+        ((and one (is "BIGNUMP"))
+         (%compile-subtype-branch (car args) env dest +subtag-bignum+ false-label) t)
+        ((and one (is "RATIOP"))
+         (%compile-subtype-branch (car args) env dest +subtag-ratio+ false-label) t)
+        ((and two (is "EQ"))
+         (%compile-eq-branch (car args) (cadr args) env dest false-label) t)
+        ((and two (is "EQL")
+              (or (%eql-immediate-literal-p (car args)) (%eql-immediate-literal-p (cadr args))))
+         (%compile-eq-branch (car args) (cadr args) env dest false-label) t)
+        ((and two (is "TYPEP") (consp (cadr args)) (eq (car (cadr args)) 'quote)
+              (symbolp (cadr (cadr args))) (%typep-fold-pred (cadr (cadr args))))
+         (%compile-test-branch (list (%typep-fold-pred (cadr (cadr args))) (car args))
+                               env dest false-label)
+         t)
+        ((and (is "IF") (consp (cdr args)) (listp (cddr args)) (null (cdddr args)))
+         ;; (if C X Y) as a test: X and Y are tests too.
+         (let ((else (make-compiler-label)) (through (make-compiler-label))
+               (%dd-saved *%defun-deferred*))
+           (%compile-test-branch (car args) env dest else)
+           (setq *%defun-deferred* t)
+           (%compile-test-branch (cadr args) env dest false-label)
+           (emit-ir :br through)
+           (emit-ir-label else)
+           (%compile-test-branch (caddr args) env dest false-label)
+           (setq *%defun-deferred* %dd-saved)
+           (emit-ir-label through))
+         t)
+        (t nil)))))
 
 (defun compile-if (args env dest)
   "Compile (if test then &optional else)"
@@ -19840,11 +20032,15 @@
          ;; %bignum-trunc-doubling (general), all bignum-safe.
          (compile-form
            `(let ((,a-sym ,a) (,b-sym ,b))
-              (if (or (%ieee-float-p ,a-sym) (%ieee-float-p ,b-sym)
-                      (ratiop ,a-sym) (ratiop ,b-sym)
-                      (bignump ,a-sym) (bignump ,b-sym))
-                  (%truncate2-generic ,a-sym ,b-sym)
-                  (%fixnum-truncate2 ,a-sym ,b-sym)))
+              ;; Two fixnums first: the gate below is six tests, two of
+              ;; them calls (%IEEE-FLOAT-P), on every fixnum division.
+              (if (and (fixnump ,a-sym) (fixnump ,b-sym))
+                  (%fixnum-truncate2 ,a-sym ,b-sym)
+                  (if (or (%ieee-float-p ,a-sym) (%ieee-float-p ,b-sym)
+                          (ratiop ,a-sym) (ratiop ,b-sym)
+                          (bignump ,a-sym) (bignump ,b-sym))
+                      (%truncate2-generic ,a-sym ,b-sym)
+                      (%fixnum-truncate2 ,a-sym ,b-sym))))
            env dest))))))
 
 (defun compile-fixnum-truncate2 (args env dest)
@@ -20252,7 +20448,33 @@
           (emit-ir :pop dest)
           (emit-ir :cmp dest temp)
           (emit-ir :beq true-label)
-          ;; Pointer-different: call EQL defun for the slot-compare slow path.
+          ;; Pointer-different.  Only a BOXED NUMBER can be EQL to something it
+          ;; is not EQ to (bignum #x30, ratio #x33, a complex is an array #x32,
+          ;; floats #x60+).  When neither operand is an object with such a
+          ;; subtag the answer is NIL without the call -- the common mismatch
+          ;; of MEMBER, ASSOC, POSITION, CASE and EQUAL over symbols,
+          ;; characters, strings and fixnums was a full call (32 ns) every
+          ;; time.
+          (let ((tg (alloc-temp-reg)) (slow (make-compiler-label))
+                (false-label (make-compiler-label)))
+            (dolist (r (list dest temp))
+              (let ((not-num (make-compiler-label)))
+                (emit-ir :obj-tag tg r)
+                (emit-ir :cmp-imm tg (ash +tag-object+ +fixnum-shift+))
+                (emit-ir :bne not-num)
+                (emit-ir :obj-subtag tg r)
+                (emit-ir :cmp-imm tg (ash +subtag-float+ +fixnum-shift+))
+                (emit-ir :bge slow)
+                (dolist (st (list +subtag-bignum+ +subtag-array+ +subtag-ratio+))
+                  (emit-ir :cmp-imm tg (ash st +fixnum-shift+))
+                  (emit-ir :beq slow))
+                (emit-ir-label not-num)))
+            (emit-ir-label false-label)
+            (compile-nil dest)
+            (emit-ir :br end-label)
+            (emit-ir-label slow)
+            (free-temp-reg))
+          ;; A possible boxed number: call EQL defun for the slot compare.
           (emit-ir :mov +vreg-v0+ dest)
           (emit-ir :mov +vreg-v1+ temp)
           (emit-ir :set-nargs 2)

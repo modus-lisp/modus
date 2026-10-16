@@ -498,7 +498,7 @@
 ;;; bump word at %jit-exec-bump; the bitmaps are at their own fixed addresses
 ;;; and travel as slices.  Saving ends with CORE-END=<addr> on serial so a
 ;;; QEMU harness can dump exactly [0x18000000, addr) through the gdbstub.
-(defvar *cl-repl-rpi-core-source* "
+(defvar *cl-repl-rpi-core-source* (concatenate 'string "
 ;; What a restored core runs before the REPL (see *cli-arch-core-resume*): a
 ;; function designator, set just before SAVE-AND-DIE so the heap carries it.
 (defvar *core-restart-hook* nil)
@@ -607,8 +607,12 @@
   ;; in-range bump means real JIT pages -> carry [lo,bump).
   (let ((slot (%jit-exec-bump)) (lo (%jit-exec-lo)) (hi (%jit-exec-hi)))
     (if (and (integerp slot) (integerp lo) (integerp hi))
-        (let ((b (%gc-read64 slot)))
-          (if (and (integerp b) (>= b lo) (< b hi)) b lo))
+        ;; The two halves, NOT %gc-read64: this runs before the runtime is
+        ;; initialised (the restore precedes init-all-globals), and on a cold
+        ;; board the word is DRAM fill (0x5555...), whose high half sends
+        ;; %gc-read64 through bignum arithmetic -- the restore hung there.
+        (let ((b (mem-ref slot :u32)) (bh (mem-ref (+ slot 4) :u32)))
+          (if (and (= bh 0) (>= b lo) (< b hi)) b lo))
         0)))
 (defun %core-jit-lossy-p () nil)
 (defun %core-die (msg)
@@ -621,7 +625,24 @@
 (defun save-and-die (path)
   (%save-image path)
   (halt))
-")
+"
+  ;; SMP (MODUS_RPI_THREADS=1): the sync-cell arena (net/bare-threads.lisp, 0x10300000)
+  ;; travels in the core as its EXTRA range -- its header and the cells handed out.
+  ;; Every SB-THREAD mutex the saved image made (warp's, glass's: at load) is a cell
+  ;; there, outside the heap; without them a restored image's mutex words are whatever
+  ;; the DRAM holds (0x55555555 on a cold Zero: HELD), and the arena's count restarts
+  ;; at 0 under them, handing the same cells out again.
+  (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
+    (if (and v (> (length v) 0) (string/= v "0"))
+        "
+(defun %core-extra-addr () #x10300000)
+(defun %core-extra-len ()
+  (let ((n (mem-ref #x10300000 :u32)))
+    (if (< n 8191) (+ 64 (* 64 n)) #x80000)))
+(defun %core-extra-ok-p (addr len)
+  (and (= addr #x10300000) (<= (+ addr len) #x10380000)))
+"
+        ""))))
 
 (defvar *cli-arch-override-source*
   (if *cl-repl-x64-p*
@@ -966,6 +987,24 @@
          (new "(%rpi-gc-bitmap-init #x08000000 #x08400000 #x240000)")
          (at (search old *cli-arch-kernel-prologue*)))
     (unless at (error "SMP: the Pi bitmap call moved; update build-cl-repl-common"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 at) new
+                       (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
+;; ... and DRAM is not zero at reset (a cold Zero reads 0x55555555): the threads layer's
+;; control words outside the window must start at zero, BEFORE a core restore -- the
+;; thread table (its "cores are up" word made %BT-INIT skip starting them, so the desk
+;; waited on cores that never ran), the whole sync-cell arena (a cell is a mutex word:
+;; garbage is a HELD lock, and its own allocation lock is at +0x10), and the JIT bump
+;; word, which the restore reads before anything sets it.  A restore then brings the
+;; saved arena back (%CORE-EXTRA-*).
+(when cl-user::*rpi-threads-p*
+  (let* ((old "  (%gc-write64 #x10005058 0)")
+         (at (search old *cli-arch-kernel-prologue*))
+         (new "  (%gc-write64 #x10005058 0)
+  (let ((a #x10213000)) (loop (when (>= a #x10214000) (return nil)) (setf (mem-ref a :u64) 0) (setq a (+ a 8))))
+  (let ((a #x10300000)) (loop (when (>= a #x10380000) (return nil)) (setf (mem-ref a :u64) 0) (setq a (+ a 8))))
+  (setf (mem-ref #x13FFFFF0 :u64) 0)"))
+    (unless at (error "SMP: the prologue's guard-marker line moved; update build-cl-repl-common"))
     (setq *cli-arch-kernel-prologue*
           (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 at) new
                        (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))

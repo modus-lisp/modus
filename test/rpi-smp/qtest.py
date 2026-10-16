@@ -10,8 +10,12 @@ q = subprocess.Popen(["qemu-system-aarch64", "-M", "raspi3b", "-kernel", img, "-
                       "-serial", "unix:%s,server" % sock, "-display", "none", "-no-reboot"] + (["-device", "loader,file=%s,addr=%s" % (blob, os.environ.get("QTEST_BLOB_ADDR", "0x1A000000"))] if blob else [])
                      # QTEST_EXTRA="FILE@ADDR,FILE@ADDR": more blobs in guest RAM (a clip, a disk)
                      + sum([["-device", "loader,file=%s,addr=%s" % tuple(e.rsplit("@", 1))]
-                            for e in os.environ.get("QTEST_EXTRA", "").split(",") if e], []),
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            for e in os.environ.get("QTEST_EXTRA", "").split(",") if e], [])
+                     # QTEST_QEMU_ARGS: more QEMU arguments, space-separated (a usb-net, a hostfwd)
+                     + os.environ.get("QTEST_QEMU_ARGS", "").split(),
+                     # QTEST_QEMU_LOG: QEMU's own stderr (an emulator abort says why there)
+                     stdout=subprocess.DEVNULL,
+                     stderr=open(os.environ["QTEST_QEMU_LOG"], "w") if os.environ.get("QTEST_QEMU_LOG") else subprocess.DEVNULL)
 time.sleep(2)
 s = socket.socket(socket.AF_UNIX); s.connect(sock); s.settimeout(1)
 buf = b""
@@ -25,7 +29,8 @@ def until(pat, to):
                 buf += d
                 if RAW: RAW.write(d); RAW.flush()
         except socket.timeout: pass
-        if re.search(pat, buf): return True
+        # a prompt may be followed by the echo of the line end sent after a form: still a prompt
+        if re.search(pat, buf) or re.search(pat, buf.rstrip(b"\r\n")): return True
     return False
 t0 = time.time()
 if os.environ.get("QTEST_POKE"):

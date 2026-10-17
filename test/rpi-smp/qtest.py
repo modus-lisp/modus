@@ -50,8 +50,11 @@ if ok and b"!!FAULT" not in buf:
     for f in forms:
         buf = b""
         s.settimeout(900); s.sendall((f + "\r\n").encode()); s.settimeout(1)
-        r = until(rb"\n> ?$|!!FAULT", 900)
+        r = until(rb"\n(DESK)?> ?$|!!FAULT", 900)        # DESK>: kiln's desk REPL
         out = buf.decode("latin1").replace("\r", "")
         lines = [l for l in out.split("\n") if l.strip() and not l.startswith(f[:20]) and "WARN" not in l]
-        print("FORM", f[:60], "=>", " | ".join(lines[-3:]) if r else "TIMEOUT")
+        print("FORM", f[:60], "=>", " | ".join(lines[-3:]) if r else "TIMEOUT", flush=True)
+        # QTEST_PACE: seconds between forms, waited HERE -- a wait evaluated on the board
+        # would hold whatever owns its main thread (the desk) still for that long
+        time.sleep(float(os.environ.get("QTEST_PACE", "0")))
 q.kill()

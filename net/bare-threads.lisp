@@ -971,7 +971,8 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
 ;;;
 ;;; Record words (per executor, a 64-byte cell from the sync arena): +0x00 call lock,
 ;;; +0x08 request seq, +0x10 done seq, +0x18 result kind (1 immediate, 2 bytes, 3 error,
-;;; 4 not encodable), +0x20 result word / byte count, +0x28 thread record, +0x30 running.
+;;; 4 not encodable), +0x20 result word / byte count, +0x28 thread record, +0x30 running,
+;;; +0x38 errors IDLE has signalled (BT-EXECUTOR-IDLE-ERRORS).
 ;;; The closure in flight lives in *BT-EXEC-FNS* (a global vector, so a region-0
 ;;; collection keeps it current); results longer than a word go through a 64 KB buffer
 ;;; per executor at 0x10790000 + 64 KB * (record - 4).
@@ -1001,10 +1002,20 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
 (defun %bt-exec-main (cell idx)
   "An executor's whole life (see EXECUTORS above)."
   (%gc-write64 (+ cell #x28) (percpu-ref 16))
+  (setf (mem-ref (+ cell #x38) :u32) 0)          ; idle errors (cold RAM is not zero)
   (setf (mem-ref (+ cell #x30) :u32) 1)
   (let ((idle (let ((x (svref *bt-exec-idle* idx))) (if (eq x :none) nil x))))
     (loop
-      (when idle (funcall idle))
+      ;; AN ERROR IN IDLE IS COUNTED, NOT FATAL.  Uncaught it ended the executor, and with it
+      ;; the device it owns: on the Zero the USB thread died of a stack overflow in its idle
+      ;; round and all that showed was USB going quiet -- keyboard, mouse and network at once,
+      ;; and a BT-CALL that never returns.  Now the round is abandoned, +0x38 counts it, and
+      ;; the executor keeps serving calls (so the count can be read, and the cause fixed live).
+      (when idle
+        (handler-case (funcall idle)
+          (error ()
+            (setf (mem-ref (+ cell #x38) :u32)
+                  (logand (+ 1 (mem-ref (+ cell #x38) :u32)) #xFFFFFFF)))))
       ;; A SAFEPOINT: a stop-the-world collection parks a thread only at an allocation, and
       ;; an idle round (polling a device) may never allocate -- main's collection would wait
       ;; for this core forever.  Safe and straight back: when no collection is pending this
@@ -1042,6 +1053,10 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
         (bt-spawn (%bt-exec-entry c i)))
       (loop (unless (zerop (mem-ref (+ cell #x30) :u32)) (return nil)))
       (list cell idx))))
+
+(defun bt-executor-idle-errors (ex)
+  "How many times EX's idle function has signalled an error (see %BT-EXEC-MAIN)."
+  (mem-ref (+ (first ex) #x38) :u32))
 
 (defun %bt-exec-entry (cell idx)
   (lambda () (%bt-exec-main cell idx)))

@@ -436,10 +436,13 @@
   ;; stopped for good while transmit carried on, and the peer's retransmissions backed off to
   ;; minutes.  Halting the channel and starting it again -- same toggle -- brought the frames
   ;; straight back.  So a transfer armed more than half a second ago without completing is
-  ;; restarted (+0xA4: when it was armed, the BCM2835 free-running 1 MHz counter).
-  (let ((st (+ (usb-state-addr) #xA0)) (now (mem-ref #x3F003004 :u32)))
+  ;; restarted (+0xA4: when it was armed, the low 32 bits of the generic timer, CNTVCT).
+  ;; NOT the BCM2835 system timer at 0x3F003004: it does not run under modus (it read the same
+  ;; value across a reset), so "now minus then" wrapped huge and the channel was halted on
+  ;; every poll -- receive stopped entirely.
+  (let ((st (+ (usb-state-addr) #xA0)) (now (logand (rdtsc) #xFFFFFFFF)))
     (when (and (= (mem-ref st :u32) 0)
-               (> (logand (- now (mem-ref (+ st 4) :u32)) #xFFFFFFFF) 500000))
+               (> (logand (- now (mem-ref (+ st 4) :u32)) #xFFFFFFFF) (floor (cntfrq) 2)))
       (dwc2-halt-channel 1)
       ;; the NEXT PID the core left in HCTSIZ, as a completion latches it: a frame cut off
       ;; part-way has moved the toggle, and restarting on the stale one loses every frame

@@ -185,7 +185,7 @@
           ;; Subsequent calls to usb-bulk-receive poll for completion and
           ;; re-arm on the call after one (cold RAM: clear its flag first).
           (setf (mem-ref (+ (usb-state-addr) #xA0) :u32) 0
-                (mem-ref (+ (usb-state-addr) #xA4) :u32) (mem-ref #x3F003004 :u32))
+                (mem-ref (+ (usb-state-addr) #xA4) :u32) (logand (rdtsc) #xFFFFFFFF))
           (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
                               (cdc-rx-buf-addr) 2048 (usb-bulk-in-mps))
           (return 1))))))

@@ -4101,10 +4101,12 @@
            ,@(cddr form)
            ,tmp))))
 
-  ;; DEFPARAMETER → DEFVAR
+  ;; DEFPARAMETER → DEFVAR, MARKED: DEFVAR assigns only when unbound, DEFPARAMETER
+  ;; always.  The fourth element (where a docstring would be) is the marker the
+  ;; DEFVAR arm of compile-form tests; nothing else reads it.
   (mvm-define-macro "DEFPARAMETER"
     (lambda (form)
-      `(defvar ,(cadr form) ,(caddr form))))
+      `(defvar ,(cadr form) ,(caddr form) %defparameter-always)))
 
   ;; PUSH → (setq place (cons val place)).  CLHS: ITEM evaluated first,
   ;; then the place subforms once, then store.  For compound places use
@@ -7609,7 +7611,24 @@
            ;; %GV-SET the closure inside the list stayed a raw bytecode offset
            ;; and a later FUNCALL jumped to it (upstream BOOLE.1, and the heap
            ;; corruption that then killed the numbers chapter).
-           (compile-form `(%gv-set-def ,(%global-var-bind-key var-name) ,value-form)
+           ;;
+           ;; DEFVAR ASSIGNS ONLY WHEN THE VARIABLE IS UNBOUND, and does not
+           ;; evaluate the initform otherwise (CLHS DEFVAR).  This arm used to
+           ;; store for both, so RELOADING a file re-ran every defvar: a file
+           ;; that keeps a function's old definition before redefining it --
+           ;; (defvar *old* (symbol-function 'f)) (defun f () (funcall *old*))
+           ;; -- had *OLD* become the NEW F on its second load, and F then
+           ;; called itself until the stack was gone.  On the Zero that was a
+           ;; USB thread dying silently (an executor's idle round has no
+           ;; handler), every time kiln's network code was loaded twice.
+           ;; DEFPARAMETER assigns unconditionally, as it must.
+           (compile-form (if (and (= op-name 428301013)
+                                  (not (and (consp (cdddr form))
+                                            (symbolp (cadddr form))
+                                            (name-eq (cadddr form) "%DEFPARAMETER-ALWAYS"))))
+                             `(unless (boundp ',var-name)
+                                (%gv-set-def ,(%global-var-bind-key var-name) ,value-form))
+                             `(%gv-set-def ,(%global-var-bind-key var-name) ,value-form))
                          env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)

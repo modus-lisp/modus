@@ -430,9 +430,24 @@
   ;; leaves the channel idle and sets usb-state +0xA0; the call after it (the caller
   ;; has consumed BUF by then) starts the next transfer.  CDC-ETHER-INIT starts the
   ;; first one and clears the flag.
-  (let ((st (+ (usb-state-addr) #xA0)))
+  ;;
+  ;; AND A CHANNEL THAT GOES STALE IS RESTARTED.  On the Zero, under load (the desk on three
+  ;; cores), channel 1 stayed enabled and NAKing while the RTL8153 had frames queued: receive
+  ;; stopped for good while transmit carried on, and the peer's retransmissions backed off to
+  ;; minutes.  Halting the channel and starting it again -- same toggle -- brought the frames
+  ;; straight back.  So a transfer armed more than half a second ago without completing is
+  ;; restarted (+0xA4: when it was armed, the BCM2835 free-running 1 MHz counter).
+  (let ((st (+ (usb-state-addr) #xA0)) (now (mem-ref #x3F003004 :u32)))
+    (when (and (= (mem-ref st :u32) 0)
+               (> (logand (- now (mem-ref (+ st 4) :u32)) #xFFFFFFFF) 500000))
+      (dwc2-halt-channel 1)
+      ;; the NEXT PID the core left in HCTSIZ, as a completion latches it: a frame cut off
+      ;; part-way has moved the toggle, and restarting on the stale one loses every frame
+      (usb-set-bulk-in-toggle (logand (ash (dwc2-read (dwc2-hctsiz 1)) -29) 3))
+      (setf (mem-ref st :u32) 1))
     (when (= (mem-ref st :u32) 1)
-      (setf (mem-ref st :u32) 0)
+      (setf (mem-ref st :u32) 0
+            (mem-ref (+ st 4) :u32) now)
       (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
                           buf max-len (usb-bulk-in-mps)))
     (let ((result (dwc2-poll-bulk-in 1)))

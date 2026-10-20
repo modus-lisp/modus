@@ -5237,9 +5237,15 @@
       (declare (ignore form))
       t))
   ;; LOCALLY — like progn (ignore declarations)
+  ;; LOCALLY with declarations is (LET () decl... body): a free SPECIAL
+  ;; declaration then makes references dynamic through the LET path
+  ;; (upstream LET.6, LET*.6).  Without declarations it is just PROGN.
   (mvm-define-macro "LOCALLY"
     (lambda (form)
-      `(progn ,@(cdr form))))
+      (if (and (consp (cdr form)) (consp (cadr form)) (symbolp (car (cadr form)))
+               (string= (symbol-name (car (cadr form))) "DECLARE"))
+          `(let () ,@(cdr form))
+          `(progn ,@(cdr form)))))
 
   ;; DO/DO*/DOTIMES body declarations: CLHS puts them on the implicit
   ;; binding form, so they must be hoisted above the loop's TAGBODY.
@@ -11402,7 +11408,24 @@
 ;;; Let / Let*
 ;;; ============================================================
 
-(defun compile-let-with-specials (bindings body specials env dest &optional sequential)
+(defun %special-shadow-body (names env body)
+  "BODY, wrapped so every name in NAMES that an ENCLOSING form binds
+   lexically is read and assigned dynamically inside it (CLHS 3.3.4: a
+   SPECIAL declaration makes references in its scope dynamic).  A name with
+   no lexical binding in ENV already compiles as a global access, so nothing
+   changes for it -- the wrapper appears only where an outer lexical binding
+   would otherwise capture the reference:
+     (let ((x 1)) (let (x) (declare (special x)) x))  => NIL, not 1
+   (upstream LET.6/.11, LET*.6/.11, DEFUN.5-.7, MACROLET.47)."
+  (let ((shadowed (remove-if-not (lambda (n) (and (symbolp n) (env-lookup env n))) names)))
+    (if (null shadowed)
+        body
+        (list (list* 'symbol-macrolet
+                     (mapcar (lambda (n) (list n (list 'symbol-value (list 'quote n)))) shadowed)
+                     body)))))
+
+(defun compile-let-with-specials (bindings body specials env dest &optional sequential
+                                  &aux (%all-declared-specials nil))
   "Compile let/let* with (declare (special ...)) variables.
    Special vars use dynamic binding via symbol-value/%DYNBIND/%DYNUNBIND.
    On entry: save old values, set new values.
@@ -11448,6 +11471,7 @@
    it stopped being skippable and ~^ broke (format-circumflex −149).
    Filtering free declarations out here is the CLHS-correct fix and
    makes both behaviours right."
+  (setq %all-declared-specials specials)
   (setq specials
         (remove-if-not
          (lambda (s)
@@ -11463,8 +11487,12 @@
     (let ((*let-skip-implicit-specials* t))
       (return-from compile-let-with-specials
         (compile-form (if sequential
-                          `(let* ,bindings ,@(or (strip-declares body) (list nil)))
-                          `(let ,bindings ,@(or (strip-declares body) (list nil))))
+                          `(let* ,bindings ,@(%special-shadow-body
+                                              %all-declared-specials env
+                                              (or (strip-declares body) (list nil))))
+                          `(let ,bindings ,@(%special-shadow-body
+                                             %all-declared-specials env
+                                             (or (strip-declares body) (list nil)))))
                       env dest))))
   (let* ((special-names (mapcar (lambda (s) (normalize-name s)) specials))
          (save-vars (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
@@ -11531,7 +11559,8 @@
                                (site `(%dynunbind-site ,k ,sv (quote ,site)))
                                (t `(%dynunbind ,k ,sv)))))
                      save-vars specials))
-           (stripped-body (strip-declares body)))
+           (stripped-body (%special-shadow-body %all-declared-specials env
+                                                (strip-declares body))))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
       ;; exit path, not just the normal one.  The old shape was
       ;;   (let* saves+temps set-forms (let ((r body)) restore r))
@@ -17882,7 +17911,12 @@
           ;; block with a non-values result leaves the MV count to the
           ;; dynamic path, which the heuristic already accepts.
           ((= hash #.(compute-name-hash "BLOCK"))
-           (tail-form-is-values-p (cddr form)))
+           ;; Its value is the body's tail OR any RETURN-FROM carrying values:
+           ;; (block b (return-from b (values 1 2 3 4)) 1) returned just 1
+           ;; (upstream BLOCK.6/.7).  The later LOOP/BLOCK arm said this but
+           ;; this one shadowed it.
+           (or (tail-form-is-values-p (cddr form))
+               (loop-body-has-mv-return-p (cddr form))))
           ;; (%%FLET-SELF name . body) -- a local function's implicit block
           ;; marker, (op name . body) like BLOCK.  Opaque, it read as an
           ;; unknown operator and the epilogue declined to clamp, so a
@@ -17981,6 +18015,19 @@
           ;; build scripts scan source TEXT for defun tokens to seed the
           ;; runtime symbol-function table, and one in a comment shows up as
           ;; a bogus "WARN li-func: unresolved function" in every build log.)
+          ;; Special forms that yield exactly ONE value.  (QUOTE x) is how a
+          ;; literal symbol or list reaches here, and it fell to the
+          ;; catch-all below: a function whose tail was 'A was "possibly
+          ;; multi-valued", so neither the epilogue nor %MV-CLAMP-TAIL set
+          ;; the count, and (and (values t nil) 'a) returned A, NIL
+          ;; (upstream AND.6, OR.6, COND.11, SETQ.4, TAGBODY.4 ...).
+          ((member (symbol-name op)
+                   '("QUOTE" "FUNCTION" "SETQ" "PSETQ" "TAGBODY" "LAMBDA")
+                   :test #'string=)
+           nil)
+          ;; THE and LOCALLY pass their body's values through.
+          ((string= (symbol-name op) "THE") (tail-form-is-values-p (cddr form)))
+          ((string= (symbol-name op) "LOCALLY") (tail-form-is-values-p (cdr form)))
           ((member (symbol-name op)
                    '("MULTIPLE-VALUE-LIST"
                      "+" "-" "*" "/" "=" "<" ">" "<=" ">="
@@ -17997,8 +18044,14 @@
            nil)
           ;; Any other named call — assume the callee may return
           ;; multi-values via its own (values …) tail.  The callee's
-          ;; own epilogue handles single-value resets.
-          (t t))))))
+          ;; own epilogue handles single-value resets.  A MACRO is not a
+          ;; call: judge its expansion (CASE, PROG1, SETF ... were all
+          ;; "possibly multi-valued" by name alone).  Deciding only -- the
+          ;; form itself is not rewritten here.
+          (t (let ((r (macroexpand-1-mvm form)))
+               (if (and (cdr r) (not (equal (car r) form)))
+                   (tail-form-is-values-p (list (car r)))
+                   t))))))))
 
 ;;; A function whose tail MIXES a multiple-value producer with a single-valued
 ;;; arm used to leak a stale MV count out of the single-valued arm.
@@ -18080,6 +18133,22 @@
                               (cons (car clause) (%mv-clamp-body (cdr clause)))
                               clause))
                         (cdr form))))
+         ((and (string= op "THE") (cddr form))
+          (list (car form) (cadr form) (%mv-clamp-tail (caddr form))))
+         ((and (string= op "LOCALLY") (cdr form))
+          (cons (car form) (%mv-clamp-body (cdr form))))
+         ;; Value-control macros whose arms can mix a producer with a
+         ;; single-valued leaf: rewrite to the expansion so the clamp reaches
+         ;; each arm.  A whitelist, not every macro -- LOOP and friends have
+         ;; compile paths of their own that an early expansion would bypass.
+         ((and (member op '("AND" "OR" "CASE" "ECASE" "CCASE" "TYPECASE"
+                            "ETYPECASE" "CTYPECASE" "PROG1" "PROG2")
+                       :test #'string=)
+               (tail-form-is-values-p (list form)))
+          (let ((r (macroexpand-1-mvm form)))
+            (if (and (cdr r) (not (equal (car r) form)))
+                (%mv-clamp-tail (car r))
+                form)))
          ((not (tail-form-is-values-p (list form))) (%mv-clamp-leaf form))
          (t form))))))
 

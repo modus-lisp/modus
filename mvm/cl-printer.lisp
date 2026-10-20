@@ -11,6 +11,12 @@
 
 ;;; Write a string to stream
 (defun %print-string-raw (str stream)
+  ;; A plain string onto a string-output stream: its code words pushed
+  ;; directly (%SOS-PUSH-CODES), not a generic AREF and two calls per char.
+  (when (and (%prim-simple-string-p str) (consp stream) (eql (car stream) 7770001)
+             (consp (cdr stream)) (eql (car (cdr stream)) 2))
+    (%sos-push-codes (cdr (cdr stream)) str 0 (array-length str))
+    (return-from %print-string-raw nil))
   ;; LENGTH (fp-aware) so fp-wrapped strings print only their active prefix.
   (let ((len (length str)) (i 0))
     (loop
@@ -868,6 +874,19 @@
     ;; *print-readably* overrides *print-escape*
     (when preadably (setq escape t))
     (cond
+      ;; Integer (fixnum or bignum — both route through %print-integer-in-base).
+      ;; First, with the unescaped simple string below: neither is a hash
+      ;; table, and HASH-TABLE-P was a call on every print.
+      ((or (fixnump obj) (bignump obj))
+       (let ((pbase *print-base*)
+             (pradix *print-radix*))
+         (when pradix (%print-radix-prefix pbase stream))
+         (%print-integer-in-base obj pbase stream)
+         ;; Base 10 with *print-radix* uses TRAILING dot, not a prefix.
+         (when (and pradix (= pbase 10))
+           (%print-char 46 stream))))
+      ((and (not escape) (%prim-simple-string-p obj))
+       (%print-string-raw obj stream))
       ;; A HASH TABLE IS A CONS in this image (alist . (%ht-tag . meta)), so it
       ;; must be recognised before any cons arm, or it prints as its innards.
       ((hash-table-p obj)
@@ -917,15 +936,6 @@
                ((= code 0)   (%print-string-raw "Null" stream))
                (t (%print-char code stream))))
            (%print-char (char-code obj) stream)))
-      ;; Integer (fixnum or bignum — both route through %print-integer-in-base)
-      ((or (fixnump obj) (bignump obj))
-       (let ((pbase *print-base*)
-             (pradix *print-radix*))
-         (when pradix (%print-radix-prefix pbase stream))
-         (%print-integer-in-base obj pbase stream)
-         ;; Base 10 with *print-radix* uses TRAILING dot, not a prefix.
-         (when (and pradix (= pbase 10))
-           (%print-char 46 stream))))
       ;; Float
       ((floatp-impl obj)
        ;; Use standard float printing

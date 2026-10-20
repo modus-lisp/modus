@@ -11742,7 +11742,14 @@
                                 (cell (%let-special-cell spec k))
                                 (slot (and (not cell) (%gv-aot-slot k spec)))
                                 (site (and (not cell) (not slot) (%let-special-site spec k))))
+                           ;; Unarmed, a binding is a store into the cell: the
+                           ;; inline cached SETQ, three calls before.  Armed,
+                           ;; %DYNBIND-C makes this thread's own binding.
                            (push (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
+                                       ((and slot (eql k (%global-name-key spec)))
+                                        `(if (eql (mem-ref #x10000DB8 :u32) 0)
+                                             (setq ,spec ,tmp)
+                                             (%dynbind-c ,k ,tmp ,slot)))
                                        (slot `(%dynbind-c ,k ,tmp ,slot))
                                        (site (%site-fast site `(progn (set-cdr c ,tmp) ,tmp)
                                                          `(%dynbind-site ,k ,tmp (quote ,site))))
@@ -11757,6 +11764,10 @@
                               (slot (and (not cell) (%gv-aot-slot k spec)))
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
+                               ((and slot (eql k (%global-name-key spec)))
+                                `(if (eql (mem-ref #x10000DB8 :u32) 0)
+                                     (setq ,spec ,sv)
+                                     (%dynunbind-c ,k ,sv ,slot)))
                                (slot `(%dynunbind-c ,k ,sv ,slot))
                                (site (%site-fast site `(progn (set-cdr c ,sv) ,sv)
                                                  `(%dynunbind-site ,k ,sv (quote ,site))))

@@ -1700,12 +1700,19 @@
                   (let ((e (car cur)))
                     (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
                   (setq cur (cdr cur))))
-              ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL
-              ;; table) falls through to the linear path.
+              ;; O(1) bucket path.  A :NOHASH key falls through to the linear
+              ;; path -- unless it is an object key of an EQ/EQL table and the
+              ;; ADDRESS INDEX can serve it on this thread.
               (let ((r (%ht-bucket-find vec key (cdr (cdr holder)))))
-                (unless (eq r -424242001)
-                  (setq use-linear nil)
-                  (setq found-pair r)))))))
+                (if (eq r -424242001)
+                    (when (and (null (cdr (cdr holder))) (%ht-addr-key-p key))
+                      (let ((v2 (%ht-addr-vec ht holder)))
+                        (when v2
+                          (setq use-linear nil)
+                          (setq found-pair (%ht-bucket-find v2 key nil t)))))
+                    (progn
+                      (setq use-linear nil)
+                      (setq found-pair r))))))))
     (when use-linear
       ;; Linear alist path (legacy / small / nohash table / :nohash key).
       (let ((cmp (%ht-keytest ht)) (cur (car ht)))
@@ -1753,12 +1760,19 @@
                   (let ((e (car cur)))
                     (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
                   (setq cur (cdr cur))))
-              ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL
-              ;; table) falls through to the linear path.
+              ;; O(1) bucket path.  A :NOHASH key falls through to the linear
+              ;; path -- unless it is an object key of an EQ/EQL table and the
+              ;; ADDRESS INDEX can serve it on this thread.
               (let ((r (%ht-bucket-find vec key (cdr (cdr holder)))))
-                (unless (eq r -424242001)
-                  (setq use-linear nil)
-                  (setq found-pair r)))))))
+                (if (eq r -424242001)
+                    (when (and (null (cdr (cdr holder))) (%ht-addr-key-p key))
+                      (let ((v2 (%ht-addr-vec ht holder)))
+                        (when v2
+                          (setq use-linear nil)
+                          (setq found-pair (%ht-bucket-find v2 key nil t)))))
+                    (progn
+                      (setq use-linear nil)
+                      (setq found-pair r))))))))
     (when use-linear
       ;; Linear alist path (legacy / small / nohash table / :nohash key).
       (let ((cmp (%ht-keytest ht)) (cur (car ht)))
@@ -1781,6 +1795,7 @@
                        nil)))
          (vec (and holder (%ht-active-vec-h ht holder)))
          (strcmp? (and vec (%ht-h-strcmp holder)))
+         (addr? nil)
          (existing (and vec
                         (if (and (fixnump key) (not (eq strcmp? :equalp)))
                             ;; fixnum fast path (mirrors GETHASH)
@@ -1796,6 +1811,11 @@
                                 (setq cur (cdr cur)))
                               r)
                             (%ht-bucket-find vec key strcmp?)))))
+    ;; An object key of an EQ/EQL table: the ADDRESS INDEX, when it can serve.
+    (when (and vec (eq existing (%ht-nohash)) (null strcmp?) (%ht-addr-key-p key))
+      (let ((v2 (%ht-addr-vec ht holder)))
+        (when v2
+          (setq vec v2 addr? t existing (%ht-bucket-find v2 key nil t)))))
     (cond
       ;; ---- Bucket path: key IS bucketable and already present → update. ----
       ((and vec existing (not (eq existing (%ht-nohash))))
@@ -1804,7 +1824,8 @@
        value)
       ;; ---- Bucket path: key IS bucketable and absent → add + index. ----
       ((and vec (null existing))
-       (let* ((new-pair (cons key value))
+       (let* ((epoch (and addr? (car (%ht-addr-cell ht))))
+              (new-pair (cons key value))
               (new-head (cons new-pair (car ht))))
          (%publish-fence)
          (set-car ht new-head)
@@ -1812,10 +1833,15 @@
          ;; Keep chains short: once the table holds more than 2 entries per
          ;; bucket, rebuild the index at the next power of two (the rebuild
          ;; walks the alist, which already contains NEW-PAIR).
-         (if (and (> (%ht-h-count holder) (* 2 (%prim-array-length vec)))
-                  (< (%prim-array-length vec) 65536))
-             (%ht-rebuild-index ht holder strcmp?)
-             (%ht-bucket-put vec key new-pair strcmp?))
+         (cond
+           ((and (> (%ht-h-count holder) (* 2 (%prim-array-length vec)))
+                 (< (%prim-array-length vec) 65536))
+            (%ht-rebuild-index ht holder strcmp?))
+           ;; the two conses above may have collected region 0: the key's
+           ;; address is no longer the one the index was built for
+           ((and addr? (not (eql epoch (%ht-addr-epoch))))
+            (%ht-addr-stale ht))
+           (t (%ht-bucket-put vec key new-pair strcmp? addr?)))
          value))
       ;; ---- Linear alist path (legacy / small / nohash table, OR a :NOHASH
       ;;      key under an active bucket).  Also bumps the holder count so a
@@ -1828,7 +1854,9 @@
                     (new-head (cons new-pair (car ht))))
                (%publish-fence)
                (set-car ht new-head)
-               (when holder (%ht-h-set-count holder (+ (%ht-h-count holder) 1))))
+               (when holder (%ht-h-set-count holder (+ (%ht-h-count holder) 1)))
+               ;; an object key the address index now lacks
+               (when vec (%ht-addr-stale ht)))
              (return value))
            (let ((pair (car cur)))
              (when (funcall cmp (car pair) key)
@@ -1849,7 +1877,12 @@
          (vec (and holder (%ht-active-vec-h ht holder))))
     (when vec
       (let* ((strcmp? (%ht-h-strcmp holder))
-             (pair (%ht-bucket-find vec key strcmp?)))
+             (pair (%ht-bucket-find vec key strcmp?))
+             (addr? nil))
+        ;; an object key of an EQ/EQL table: the ADDRESS INDEX, when it can serve
+        (when (and (eq pair (%ht-nohash)) (null strcmp?) (%ht-addr-key-p key))
+          (let ((v2 (%ht-addr-vec ht holder)))
+            (when v2 (setq vec v2 addr? t pair (%ht-bucket-find v2 key nil t)))))
         (cond
           ((null pair) (return-from remhash nil))
           ((consp pair)
@@ -1864,7 +1897,7 @@
                        (return nil))
                      (setq prev cur)
                      (setq cur (cdr cur))))))
-           (%ht-bucket-rem vec key strcmp?)
+           (%ht-bucket-rem vec key strcmp? addr?)
            (%ht-h-set-count holder (- (%ht-h-count holder) 1))
            (return-from remhash t))))))
   (let* ((entries (car ht))
@@ -1889,7 +1922,9 @@
            (setq cur (cdr cur))))))
     (when removed
       (when vec (%ht-bucket-rem vec key (%ht-h-strcmp holder)))
-      (when holder (%ht-h-set-count holder (- (%ht-h-count holder) 1))))
+      (when holder (%ht-h-set-count holder (- (%ht-h-count holder) 1)))
+      ;; an object key may still sit in the address index
+      (when vec (%ht-addr-stale ht)))
     removed))
 
 (defun maphash (fn ht)
@@ -2222,7 +2257,83 @@
       (%ht-vec-set vec i nil)
       (setq i (+ i 1)))))
 
-(defun %ht-bucket-find (vec key strcmp?)
+;;; -------- ADDRESS INDEX: object keys of EQ / EQL tables ---------------------
+;;; An EQ/EQL table compares a cons, string, vector, structure, instance or
+;;; function key by IDENTITY, and identity has no structure to hash, so such a
+;;; key used to be :NOHASH -- and one of them made %HT-REBUILD-INDEX disable the
+;;; whole table's index for good.  Every lookup then scanned the alist: *PRINT-
+;;; CIRCLE* keeps an EQ table of every cons it prints, so printing a big tree
+;;; was quadratic (cl-bench FPRINT/PRETTY, 20x SBCL, %EQ-FN 22% of the profile).
+;;;
+;;; These keys hash by ADDRESS.  A copying collector moves them, so the index
+;;; is valid only as of one collection: the table's cell (%HT-ADDR-CELL) holds
+;;; the epoch (%HT-ADDR-EPOCH) its object keys were indexed at, or NIL.  A
+;;; lookup of an object key whose cell is stale rebuilds the index first; a
+;;; change that leaves the index wrong for object keys (an insert or removal on
+;;; the linear path, a collection during an insert) clears the cell.  Stale
+;;; entries cannot answer wrongly in between: a bucket entry holds the key
+;;; object itself, which the collector updates, and matches by EQ.
+;;;
+;;; ONLY IN REGION 0, ON ITS OWN MUTATOR (%HT-ADDR-OK-P).  Region 0's count is
+;;; the epoch, and the keys of a table a thread may write are its own region's
+;;; objects (the shared-store guard), so a region-0 table's object keys move
+;;; exactly when region 0 collects.  A worker, or a locked section (whose
+;;; allocation slice is not region 0), takes the linear path -- correct, merely
+;;; as slow as before.  So does every image whose %GC-REGION is unresolved.
+;;; Numbers stay :NOHASH: EQL compares them by value.
+
+(defun %ht-addr-cell (ht)
+  "The (EPOCH) cell of a MAKE-HASH-TABLE-ARGS table, or NIL for any other."
+  (let ((r (cdr (cdr (cdr (cdr (cdr (cdr (cdr ht)))))))))
+    (if (consp r) (car r) nil)))
+
+(defun %ht-addr-ok-p ()
+  "True on the thread whose active region is region 0 (see ADDRESS INDEX)."
+  (eql (%gc-region) (%conv-addr #x10000040)))
+
+(defun %ht-addr-epoch ()
+  "Region 0's collection count mixed with its from-space base: changes at every
+   collection, and when a restored core put the heap somewhere else."
+  (let ((rcb (%conv-addr #x10000040)))
+    (logxor (mem-ref (+ rcb #x20) :u32) (mem-ref rcb :u32))))
+
+(defun %ht-addr-key-p (key)
+  "True for a key an EQ/EQL table compares by identity but %HT-HASH cannot
+   hash: any heap object but a number (and the caller has already found that
+   %HT-HASH answered :NOHASH, so it is not a fixnum, character, symbol, NIL or T)."
+  (not (numberp key)))
+
+(defun %ht-addr-hash (key mask)
+  (let ((k (ash (%val->word key) -4)))       ; objects are 16-byte aligned
+    (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
+
+(defun %ht-key-hash (key strcmp? mask addr?)
+  "%HT-HASH, and when ADDR? (the caller vouched that the address index is
+   current) an EQ/EQL object key's address hash."
+  (let ((h (%ht-hash key strcmp? mask)))
+    (if (and addr? (eq h (%ht-nohash)) (null strcmp?) (%ht-addr-key-p key))
+        (%ht-addr-hash key mask)
+        h)))
+
+(defun %ht-addr-vec (ht holder)
+  "The bucket vector, current for object keys, or NIL: only on region 0's own
+   thread, for a table with an address cell, rebuilding the index once when a
+   collection has moved its keys since it was built."
+  (let ((cell (%ht-addr-cell ht)))
+    (when (and cell (%ht-addr-ok-p))
+      (unless (eql (car cell) (%ht-addr-epoch))
+        (%ht-rebuild-index ht holder nil))
+      (let ((v (%ht-h-vec holder)))
+        (and v (not (eq v (%ht-nohash)))
+             (eql (car cell) (%ht-addr-epoch))
+             v)))))
+
+(defun %ht-addr-stale (ht)
+  "The index no longer covers HT's object keys: the next lookup rebuilds it."
+  (let ((cell (%ht-addr-cell ht)))
+    (when cell (set-car cell nil))))
+
+(defun %ht-bucket-find (vec key strcmp? &optional addr?)
   "Find the (key . pair) entry in VEC's bucket for KEY; returns the alist PAIR,
    NIL (absent), or :NOHASH (key not bucketable -> caller must use the linear
    alist path).  Bucket entries store the SAME pair cons that lives in the
@@ -2231,7 +2342,7 @@
    profile by itself), and identity keys compare with EQ -- every bucketable
    non-string key (fixnum, char, NIL, T, symbol) is an immediate or an interned
    object, so EQ is exact there; bignums/floats never reach a bucket."
-  (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
+  (let ((h (%ht-key-hash key strcmp? (- (%prim-array-length vec) 1) addr?)))
     (if (eq h (%ht-nohash))
         (%ht-nohash)
         (let ((cur (%word-aref vec h)))
@@ -2250,8 +2361,9 @@
                  (when (let ((ek (car e))) (and (stringp ek) (string= ek key)))
                    (return (cdr e))))
                (setq cur (cdr cur))))
-            ((consp key)
-             ;; a list key (EQUAL tables only reach here, see %HT-HASH)
+            ((and strcmp? (consp key))
+             ;; a list key of an EQUAL table, by structure (%HT-HASH); under
+             ;; EQ/EQL a cons is an identity key (the ADDRESS INDEX)
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
@@ -2265,10 +2377,10 @@
                  (when (eq (car e) key) (return (cdr e))))
                (setq cur (cdr cur)))))))))
 
-(defun %ht-bucket-put (vec key pair strcmp?)
+(defun %ht-bucket-put (vec key pair strcmp? &optional addr?)
   "Index PAIR (the alist cons) under KEY in VEC.  Caller guarantees KEY isn't
    already present (gethash/puthash check first).  No-op for :NOHASH keys."
-  (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
+  (let ((h (%ht-key-hash key strcmp? (- (%prim-array-length vec) 1) addr?)))
     (unless (eq h (%ht-nohash))
       (let* ((old (%word-aref vec h))
              (new-head (cons (cons key pair) old)))
@@ -2276,9 +2388,9 @@
         (%ht-vec-set vec h new-head))))
   pair)
 
-(defun %ht-bucket-rem (vec key strcmp?)
+(defun %ht-bucket-rem (vec key strcmp? &optional addr?)
   "Remove KEY's entry from VEC's bucket."
-  (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
+  (let ((h (%ht-key-hash key strcmp? (- (%prim-array-length vec) 1) addr?)))
     (unless (eq h (%ht-nohash))
       (let ((result nil) (cur (%word-aref vec h)))
         (loop
@@ -2287,7 +2399,7 @@
             (unless (cond ((eq strcmp? :equalp) (equalp ek key))
                           ((and strcmp? (stringp key))
                            (and (stringp ek) (string= ek key)))
-                          ((consp key) (equal ek key))
+                          ((and strcmp? (consp key)) (equal ek key))
                           (t (eql ek key)))
               (setq result (cons (car cur) result))))
           (setq cur (cdr cur)))
@@ -2326,15 +2438,30 @@
     ;; an entry.  Under the runtime lock that must fit the lock-arena slice
     ;; (%RT-RESERVE, net/hosted-sync.lisp).
     (%rt-reserve (+ (* n 8) (* cnt 32) 256))
-    (let ((vec (%ht-new-bucket-vec n)) (cur (car ht)) (ok t))
+    (let* ((vec (%ht-new-bucket-vec n)) (cur (car ht)) (ok t)
+           ;; object keys (ADDRESS INDEX): indexed when this thread may, else
+           ;; left to the linear path, with the cell saying the index lacks them
+           (cell (and (null strcmp?) (%ht-addr-cell ht)))
+           (addr? (and cell (%ht-addr-ok-p)))
+           (epoch (and addr? (%ht-addr-epoch)))
+           (skipped nil))
       (loop
         (when (null cur) (return nil))
         (let* ((pair (car cur)) (k (car pair)))
-          (when (eq (%ht-hash k strcmp? 255) (%ht-nohash)) (setq ok nil) (return nil))
-          (%ht-bucket-put vec k pair strcmp?))
+          (if (eq (%ht-hash k strcmp? 255) (%ht-nohash))
+              (cond ((not (and cell (%ht-addr-key-p k))) (setq ok nil) (return nil))
+                    (addr? (%ht-bucket-put vec k pair strcmp? t))
+                    (t (setq skipped t)))
+              (%ht-bucket-put vec k pair strcmp?)))
         (setq cur (cdr cur)))
       (if ok
-          (progn (%publish-fence) (%ht-h-set-vec holder vec) vec)
+          (progn (%publish-fence) (%ht-h-set-vec holder vec)
+                 ;; current only if no collection moved a key while we hashed
+                 (when cell
+                   (set-car cell (if (and addr? (not skipped) (eql epoch (%ht-addr-epoch)))
+                                     epoch
+                                     nil)))
+                 vec)
           (progn (%ht-h-set-vec holder (%ht-nohash)) (%ht-nohash))))))
 
 (defun %ht-active-vec-h (ht holder)
@@ -2371,6 +2498,7 @@
       (unless (eq (%ht-h-vec holder) (%ht-nohash))
         (%ht-h-set-vec holder nil))
       (%ht-h-set-count holder 0)))
+  (%ht-addr-stale ht)
   ht)
 
 ;;; --- Metadata-aware constructor.  Kept as a separate name so the
@@ -2447,9 +2575,12 @@
                         (cons 0 (cond ((eq test 'equal) t)
                                       ((eq test 'equalp) :equalp)
                                       (t nil))))))
+      ;; The 7th element, (EPOCH), is the ADDRESS INDEX's cell for EQ/EQL
+      ;; tables -- see %HT-ADDR-CELL.  Tables built without it (the 0-arg path,
+      ;; a core made before it existed) never index object keys by address.
       (cons nil
             (cons (%ht-tag)
-                  (list test rsize rthresh size holder))))))
+                  (list test rsize rthresh size holder (cons nil nil)))))))
 
 ;;; ============================================================
 ;;; Gensym (for macro expansion)

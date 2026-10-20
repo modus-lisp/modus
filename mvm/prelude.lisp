@@ -1708,17 +1708,34 @@
                   (setq found-pair r)))))))
     (when use-linear
       ;; Linear alist path (legacy / small / nohash table / :nohash key).
-      (let ((cmp (%ht-keytest ht)) (cur (car ht)))
-        (loop
-          (when (null cur) (return nil))
-          (let ((pair (car cur)))
-            (when (funcall cmp (car pair) key)
-              (setq found-pair pair)
-              (return nil)))
-          (setq cur (cdr cur)))))
+      (setq found-pair (%ht-linear-find ht key)))
     (if found-pair
         (values (cdr found-pair) t)
         (values default nil))))
+
+(defun %ht-linear-find (ht key)
+  "The (KEY . VALUE) pair of HT's alist whose key matches KEY under HT's test,
+   or NIL.  A fixnum, character or symbol key under EQ, EQL or EQUAL matches
+   exactly the EQ keys, so that scan compares inline: the small tables (under
+   the 32-entry index threshold) -- CLOS's per-class memos among them -- paid
+   a FUNCALL of the test per entry.  (A symbol is EQ-exact under all four
+   tests; a fixnum or character not under EQUALP, so those need the test to
+   be one of the other three -- by object, and anything else funcalls.)"
+  (let ((cmp (%ht-keytest ht)) (cur (car ht)))
+    (if (or (symbolp key)
+            (and (or (fixnump key) (characterp key))
+                 (or (eq cmp (function %eq-fn)) (eq cmp (function %eql-fn))
+                     (eq cmp (function %equal-fn)))))
+        (loop
+          (when (null cur) (return nil))
+          (let ((pair (car cur)))
+            (when (eq (car pair) key) (return pair)))
+          (setq cur (cdr cur)))
+        (loop
+          (when (null cur) (return nil))
+          (let ((pair (car cur)))
+            (when (funcall cmp (car pair) key) (return pair)))
+          (setq cur (cdr cur))))))
 
 (defun %gethash-pair (key ht)
   "The (KEY . VALUE) cons that holds KEY in HT, or NIL.  PUTHASH on a present
@@ -1761,14 +1778,7 @@
                   (setq found-pair r)))))))
     (when use-linear
       ;; Linear alist path (legacy / small / nohash table / :nohash key).
-      (let ((cmp (%ht-keytest ht)) (cur (car ht)))
-        (loop
-          (when (null cur) (return nil))
-          (let ((pair (car cur)))
-            (when (funcall cmp (car pair) key)
-              (setq found-pair pair)
-              (return nil)))
-          (setq cur (cdr cur)))))
+      (setq found-pair (%ht-linear-find ht key)))
     found-pair))
 
 (defun puthash (key ht value)
@@ -1821,21 +1831,18 @@
       ;;      key under an active bucket).  Also bumps the holder count so a
       ;;      small explicit-:TEST table can later flip to the bucket index. ----
       (t
-       (let ((cmp (%ht-keytest ht)) (cur (car ht)))
-         (loop
-           (when (null cur)
+       (let ((pair (%ht-linear-find ht key)))
+         (if pair
+             (progn
+               (%publish-fence)
+               (set-cdr pair value)
+               value)
              (let* ((new-pair (cons key value))
                     (new-head (cons new-pair (car ht))))
                (%publish-fence)
                (set-car ht new-head)
-               (when holder (%ht-h-set-count holder (+ (%ht-h-count holder) 1))))
-             (return value))
-           (let ((pair (car cur)))
-             (when (funcall cmp (car pair) key)
-               (%publish-fence)
-               (set-cdr pair value)
-               (return value)))
-           (setq cur (cdr cur))))))))
+               (when holder (%ht-h-set-count holder (+ (%ht-h-count holder) 1)))
+               value)))))))
 
 (defun remhash (key ht)
   "Remove KEY from hash table HT. Returns T if removed, NIL otherwise.

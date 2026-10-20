@@ -4204,7 +4204,11 @@
         ;; (MOD's and FLOOR's remainder, GETHASH's present-p).
         (if (and (integerp n) (<= 0 n 7))
             (let ((vars (loop for i from 0 to n collect (%mvm-gensym "NV"))))
-              `(multiple-value-bind ,vars ,val-form ,(car (last vars))))
+              ;; (VALUES x), not bare x: a body that is a variable leaves the
+              ;; inner form's multiple-value count behind, so (NTH-VALUE 1
+              ;; (VALUES 'A 'B 'C)) returned two values and (NTH-VALUE 0
+              ;; (VALUES)) none (upstream NTH-VALUE.3/.7).
+              `(multiple-value-bind ,vars ,val-form (values ,(car (last vars)))))
             `(nth ,n (multiple-value-list ,val-form))))))
 
   ;; MULTIPLE-VALUE-CALL → (apply FN (append (multiple-value-list f1) ...))
@@ -20331,9 +20335,13 @@
         `(let* ((,n-sym ,a)
                 (,d-sym ,b))
            (multiple-value-bind (,(%mvm-gensym "MQ") ,r-sym) (truncate ,n-sym ,d-sym)
-             (if (and (not (zerop ,r-sym)) (if (< ,d-sym 0) (> ,r-sym 0) (< ,r-sym 0)))
-                 (+ ,r-sym ,d-sym)
-                 ,r-sym)))
+             ;; (VALUES ...): one value.  The bare IF left TRUNCATE's count
+             ;; of 2 behind, so a compiled (MOD 0 -53) returned 0 and 0
+             ;; (upstream MISC.50/.77/.253A/.349).
+             (values
+              (if (and (not (zerop ,r-sym)) (if (< ,d-sym 0) (> ,r-sym 0) (< ,r-sym 0)))
+                  (+ ,r-sym ,d-sym)
+                  ,r-sym))))
         env dest))))
 
 ;;; ============================================================

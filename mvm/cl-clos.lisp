@@ -2133,8 +2133,12 @@
         ;; so we always pass both — MVM's &optional default for a missing
         ;; arg reads stack garbage, so we never rely on it.
         (funcall fn cls obj slot-name op new-val (and new-val-p t))
-        ;; Default slot-missing errors regardless of op (per CLHS).
-        (error "no slot named ~S in class ~S" slot-name class-name)))))
+        ;; No rewriter-registered method: the SLOT-MISSING generic
+        ;; function, so a method added with DEFMETHOD runs (upstream
+        ;; SLOT-MISSING.1-8).  Its default signals.
+        (if new-val-p
+            (slot-missing (class-of obj) obj slot-name op new-val)
+            (slot-missing (class-of obj) obj slot-name op))))))
 
 ;; slot-unbound dispatch
 ;; Methods stored as: (class-name slot-spec fn)
@@ -4108,6 +4112,18 @@
                  ((= len 35) (char= c #\U))                       ; UPDATE-INSTANCE-FOR-...
                  (t nil))))))
 
+(defun %documentation-gf-name-p (name)
+  "NAME is DOCUMENTATION or (SETF DOCUMENTATION)."
+  (let ((sym (cond ((symbolp name) name)
+                   ((and (consp name) (symbolp (car name))
+                         (string= (symbol-name (car name)) "SETF")
+                         (consp (cdr name)) (symbolp (cadr name)))
+                    (cadr name))
+                   (t nil))))
+    (and sym (string= (symbol-name sym) "DOCUMENTATION")
+         (or (null (symbol-package sym))
+             (string= (package-name (symbol-package sym)) "COMMON-LISP")))))
+
 (defun %has-default-primary-p (gf-name)
   "True iff GF-NAME has a registered default-primary fallback.  Driven
    by a small symbol set rather than the *gf-default-primaries* alist
@@ -5147,6 +5163,18 @@
       ;; change-class.1.x: the suite specialises these GFs on its own classes).
       (when (and (null applicable) (%has-default-primary-p name))
         (return-from %gf-dispatch (%dispatch-default-primary name args)))
+      ;; DOCUMENTATION and (SETF DOCUMENTATION) are standard generic
+      ;; functions whose system methods cover every documented object.  A
+      ;; program's own method (environment/documentation.lsp defines one on
+      ;; its class) turns the image's plain function into a GF with only
+      ;; that method, so fall back to the registry for everything else
+      ;; (upstream DOCUMENTATION.*: "no applicable method for (SETF
+      ;; DOCUMENTATION)").
+      (when (and (null applicable) (%documentation-gf-name-p name))
+        (return-from %gf-dispatch
+          (if (symbolp name)
+              (%documentation-default (car args) (cadr args))
+              (set-documentation (cadr args) (caddr args) (car args)))))
       (when (null applicable)
         ;; Name the generic function.  A bare "no applicable method" is
         ;; unactionable when a library defines dozens of GFs — say which
@@ -8100,8 +8128,18 @@
 
 ;;; ---- DESCRIBE-OBJECT ---------------------------------------------
 (defun %describe-object-default (object stream)
-  (declare (ignore stream))
-  object)
+  "The system DESCRIBE-OBJECT method: the object, its type, and for a
+   symbol its value and function.  It used to print nothing at all, so
+   DESCRIBE wrote nothing for anything (upstream DESCRIBE.1-4)."
+  (let ((*print-readably* nil))
+    (format stream "~&~S~%  [~S]~%" object (type-of object))
+    (when (symbolp object)
+      (when (boundp object)
+        (format stream "  Value: ~S~%" (symbol-value object)))
+      (when (fboundp object)
+        (format stream "  Function: ~S~%"
+                (if (macro-function object) :macro (fdefinition object))))))
+  (values))
 
 (defun %dispatch-describe-object (args)
   (let ((gf (%find-gf 'describe-object)))

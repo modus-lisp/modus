@@ -2455,52 +2455,62 @@
         (let ((j 0) (matches t))
           (loop
             (when (or (not matches) (>= j nlen)) (return nil))
-            (let ((c1 (aref haystack (+ i j)))
-                  (c2 (aref needle j)))
-              ;; case-insensitive
-              (when (and (>= c1 65) (<= c1 90)) (setq c1 (+ c1 32)))
-              (when (and (>= c2 65) (<= c2 90)) (setq c2 (+ c2 32)))
-              (unless (= c1 c2) (setq matches nil)))
+            ;; CHAR-EQUAL on the characters AREF returns.  This compared
+            ;; them as char CODES, which they stopped being when string
+            ;; AREF became conformant, so APROPOS matched nothing but "".
+            (unless (char-equal (char haystack (+ i j)) (char needle j))
+              (setq matches nil))
             (setq j (+ j 1)))
           (when matches (setq found t))
           (setq i (+ i 1))))
       (if found t nil))))
 
+(defun %apropos-collect (entries needle seen acc)
+  "ACC plus every symbol of the symtab ENTRIES ((name . sym) cells) whose
+   name contains NEEDLE and that SEEN has not recorded."
+  (dolist (entry entries acc)
+    (let ((sym (cdr entry)))
+      (when (and (symbolp sym) (not (gethash sym seen)))
+        (let ((nm (symbol-name sym)))
+          (when (and nm (%string-contains nm needle))
+            (setf (gethash sym seen) t)
+            (setq acc (cons sym acc))))))))
+
 (defun apropos-list (string &optional package)
-  "Return list of symbols whose name contains STRING."
+  "CLHS APROPOS-LIST: the symbols whose names contain STRING (a string
+   designator, so a character or symbol too), accessible in PACKAGE -- its
+   own and inherited symbols -- or, with no package, in every package.
+   Each symbol once.  It used to search CL and CL-USER only, returned the
+   symtab CELLS rather than the symbols, and refused a character
+   (upstream APROPOS-LIST.1-9)."
   (let* ((needle (cond ((stringp string) string)
                        ((symbolp string) (symbol-name string))
-                       (t (return-from apropos-list nil))))
-         (pkgs (if package
-                   (let ((p (find-package package)))
-                     (if p (list p) nil))
-                   (let ((cl (find-package "CL"))
-                         (clu (find-package "CL-USER")))
-                     (let ((r nil))
-                       (when cl (setq r (cons cl r)))
-                       (when clu (setq r (cons clu r)))
-                       r))))
+                       ((characterp string) (string string))
+                       (t (%signal-type-error))))
+         (seen (make-hash-table :test 'eq))
          (acc nil))
-    (dolist (p pkgs)
-      ;; Walk BOTH the internal and the external symbol tables —
-      ;; standard CL packages keep their exported symbols in the
-      ;; external table (slot 3), and apropos must see those.
-      (dolist (entries (list (%pkg-internal p) (%pkg-external p)))
-        (dolist (entry entries)
-          (let ((nm (%symbol-name-of entry)))
-            (when (and nm (%string-contains nm needle))
-              (setq acc (cons entry acc)))))))
+    (if package
+        (let ((p (%resolve-package package)))
+          (when p
+            (setq acc (%apropos-collect (%pkg-internal p) needle seen acc))
+            (setq acc (%apropos-collect (%pkg-external p) needle seen acc))
+            (dolist (used (%pkg-use-list p))
+              (setq acc (%apropos-collect (%pkg-external used) needle seen acc)))))
+        (dolist (p (list-all-packages))
+          (setq acc (%apropos-collect (%pkg-internal p) needle seen acc))
+          (setq acc (%apropos-collect (%pkg-external p) needle seen acc))))
     acc))
 
 (defun apropos (string &optional package)
-  "Print apropos list to *standard-output* and return NIL."
-  (let ((syms (apropos-list string package)))
-    (dolist (s syms)
-      (let ((nm (%symbol-name-of s)))
-        (when nm
-          (write-string-serial nm)
-          (write-char-serial 10))))
-    nil))
+  "CLHS APROPOS: print each symbol APROPOS-LIST finds to *STANDARD-OUTPUT*
+   and return NO values (upstream APROPOS.1-10)."
+  (dolist (s (apropos-list string package))
+    (let ((out *standard-output*))
+      (prin1 s out)
+      (when (fboundp s) (write-string " (fbound)" out))
+      (when (boundp s) (write-string " (bound)" out))
+      (terpri out)))
+  (values))
 
 ;;; PACKAGE-SHADOWING-SYMBOLS — strict 1-arg arity
 (defun package-shadowing-symbols (pkg &rest extra)

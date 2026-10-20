@@ -2312,9 +2312,20 @@
       ;; (a TYPE-ERROR with no datum) or returned garbage (upstream
       ;; REMOVE-RANDOM and friends, whose generator returns three values).
       ;; :u32 so an uninitialised (bare-metal) word still reads as an integer.
-      (let* ((seed (mem-ref #x10000FD8 :u32))
+      ;; A RANDOM-STATE (the STATE argument, else *RANDOM-STATE*) carries its
+      ;; own seed, so a copy made by MAKE-RANDOM-STATE replays the same
+      ;; sequence (upstream MAKE-RANDOM-STATE.1-3).  The BSS word stays the
+      ;; fallback for an image whose *RANDOM-STATE* was never initialised.
+      (let* ((rs (if state (car state)
+                     (if (boundp '*random-state*) *random-state* nil)))
+             (cell (if (and (consp rs) (eq (car rs) 'random-state)
+                            (consp (cdr rs)) (integerp (cadr rs)))
+                       (cdr rs) nil))
+             (seed (if cell (car cell) (mem-ref #x10000FD8 :u32)))
              (next (logand (+ (* seed 1664525) 1013904223) #x3FFFFFFF)))
-        (setf (mem-ref #x10000FD8 :u32) next)
+        (if cell
+            (rplaca cell next)
+            (setf (mem-ref #x10000FD8 :u32) next))
         ;; CLHS: LIMIT is a positive INTEGER *or* a positive FLOAT, and the
         ;; result is of the same type as LIMIT and strictly within [0,LIMIT).
         ;; The integer path below ((- next (* (truncate next n) n))) is a

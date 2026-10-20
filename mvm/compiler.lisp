@@ -5347,13 +5347,27 @@
              (result (caddr spec))
              (body (cddr form))
              (tmp (%mvm-gensym "DL")))
+        ;; The body's leading declarations go on VAR's binding (CLHS: DOLIST
+        ;; declarations are as for LET), so a free SPECIAL covers the
+        ;; result form too -- and LIST-FORM is evaluated outside them.
+        ;; Inside the TAGBODY they were dropped (upstream DOLIST.* special).
         `(block nil
-           (let ((,tmp ,list-form) (,var nil))
-             (loop
-               (when (null ,tmp) (return ,result))
-               (setq ,var (car ,tmp))
-               (tagbody ,@body)
-               (setq ,tmp (cdr ,tmp))))))))
+           (let ((,tmp ,list-form))
+             (let ((,var nil))
+               ;; SPECIAL only: a TYPE declaration on VAR would describe its
+               ;; NIL placeholder, and an unboxed float binding cannot hold it.
+               ,@(let ((sp nil))
+                   (dolist (d (%leading-declares body))
+                     (dolist (spec (cdr d))
+                       (when (and (consp spec) (symbolp (car spec))
+                                  (string= (symbol-name (car spec)) "SPECIAL"))
+                         (push spec sp))))
+                   (if sp (list (cons 'declare (nreverse sp))) nil))
+               (loop
+                 (when (null ,tmp) (return ,result))
+                 (setq ,var (car ,tmp))
+                 (tagbody ,@(%strip-leading-declares body))
+                 (setq ,tmp (cdr ,tmp)))))))))
 
   ;; MULTIPLE-VALUE-PROG1 — (multiple-value-prog1 first . rest)
   ;; Evaluate FIRST, save its multiple values, execute REST (for side
@@ -5813,7 +5827,11 @@
                 (lambda (mopt)
                   ;; mopt = (:method [qualifier] specialized-ll body...)
                   (let* ((rest (cdr mopt))
-                         (has-qual (and rest (cdr rest)
+                         ;; A qualifier is a NON-NIL symbol: an empty
+                         ;; lambda list is NIL, and taking it for a
+                         ;; qualifier made the first body form the lambda
+                         ;; list (upstream DEFGENERIC.5-7).
+                         (has-qual (and rest (cdr rest) (car rest)
                                         (symbolp (car rest))))
                          (qualifier (if has-qual (car rest) nil))
                          (rest2 (if has-qual (cdr rest) rest))
@@ -5863,6 +5881,17 @@
                     (setq params (nreverse params))
                     (setq specs (nreverse specs))
                     (setq meta-ll (nreverse meta-ll))
+                    ;; The method body is in an implicit BLOCK named by the
+                    ;; GF (CLHS 7.6.2): (:method () (return-from g 'a) 'b)
+                    ;; is A (upstream DEFGENERIC.7).  Leading declarations
+                    ;; and a docstring stay outside the block.
+                    (let ((pre nil) (bname (if (consp gf-name) (cadr gf-name) gf-name)))
+                      (loop while (and (cdr body)
+                                       (or (stringp (car body))
+                                           (and (consp (car body)) (symbolp (caar body))
+                                                (string= (symbol-name (caar body)) "DECLARE"))))
+                            do (push (pop body) pre))
+                      (setq body (append (nreverse pre) (list (list* 'block bname body)))))
                     `(%defgeneric-method ',gf-name
                                          ',(if qualifier qualifier nil)
                                          (list ,@specs)
@@ -5875,7 +5904,13 @@
              ;; PROGRAM-ERROR (defgeneric.error.1/2/3); mirrors the
              ;; tree-walker's pre-%defgeneric checks.
              ,@(when *mvm-eval-runtime-p*
-                 `((%defgeneric-mvm-eval-precheck ',gf-name)))
+                 `((%defgeneric-mvm-eval-precheck ',gf-name)
+                   ;; Option validation, as the gate runner's expansion does:
+                   ;; unknown / repeated options, a bad
+                   ;; :argument-precedence-order, and inline methods whose
+                   ;; lambda lists are not congruent (CLHS 7.6.4; upstream
+                   ;; DEFGENERIC.ERROR.10-19).
+                   (%validate-defgeneric-options ',gf-name ',lambda-list ',options)))
              (%defgeneric ',gf-name ',lambda-list
                           ',(if combination combination nil))
              ,@(when apo
@@ -14432,7 +14467,8 @@
   end-test        ; :to, :below, :above, :downto (for :from)
   by-form         ; step amount (for :from)
   list-var        ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
-  and-p)          ; introduced by AND: steps in PARALLEL with its group
+  and-p           ; introduced by AND: steps in PARALLEL with its group
+  pre-binds)      ; :from temps bound just before VAR (sequential clauses)
 
 (defun %loop-try-of-type (rest)
   "If REST starts with OF-TYPE typespec, return (typespec . new-rest).
@@ -15141,14 +15177,25 @@
                     ;; Reverse so first-clause comes first; push to with-bindings
                     ;; in source order.  with-bindings is reversed before
                     ;; the final let*, so push tail-first to get correct order.
-                    (dolist (b (nreverse clause-binds))
-                      (push b (loop-state-with-bindings state)))
-                    (push (make-loop-iter :kind :from :var var
-                                          :init-form start-form
-                                          :end-form end-form
-                                          :end-test end-test
-                                          :by-form by-form)
-                          (loop-state-iterations state))))
+                    ;; A FOR after another FOR (not joined by AND) is
+                    ;; initialised SEQUENTIALLY (CLHS 6.1.2.1): its FROM /
+                    ;; TO / BY forms may name the earlier variable --
+                    ;; (loop for i from 5 to 30 for j from 2 to i ...)
+                    ;; signalled "I is unbound" (upstream =.6, /=.6).  So
+                    ;; those temps are bound just before this clause's own
+                    ;; variable rather than among the WITH bindings.
+                    (let ((seq (and (loop-state-iterations state) (not %and-tok)))
+                          (binds (nreverse clause-binds)))
+                      (unless seq
+                        (dolist (b binds)
+                          (push b (loop-state-with-bindings state))))
+                      (push (make-loop-iter :kind :from :var var
+                                            :init-form start-form
+                                            :end-form end-form
+                                            :end-test end-test
+                                            :by-form by-form
+                                            :pre-binds (if seq binds nil))
+                            (loop-state-iterations state)))))
 
                  ;; FOR var IN list [BY step-fn]
                  ;; BY (if present) is evaluated ONCE at loop entry — captured
@@ -16015,6 +16062,8 @@
         (:from
          (let ((var (loop-iter-var iter))
                (by (or (loop-iter-by-form iter) 1)))
+           (dolist (b (loop-iter-pre-binds iter))
+             (push b bindings))
            (push (list var (loop-iter-init-form iter)) bindings)
            (when (loop-iter-end-form iter)
              (let* ((end-var (%mvm-gensym "END"))
@@ -17374,9 +17423,21 @@
    count-form returns from DOTIMES, not the surrounding block)."
   (let* ((var (car spec))
          (count-form (cadr spec))
-         (result-form (caddr spec)))
+         (result-form (caddr spec))
+         ;; COUNT-FORM is evaluated ONCE, before the binding of VAR and
+         ;; outside the scope of the body's declarations: a free
+         ;; (declare (special x)) in the body must not make the X in the
+         ;; count form dynamic now that SPECIAL declarations shadow outer
+         ;; lexicals (gate dotimes test: (dotimes (i (return-from done x))
+         ;; (declare (special x))) returns the LEXICAL x).  It used to be
+         ;; re-evaluated on every iteration, too.
+         (cnt (if (integerp count-form)
+                  nil
+                  (%mvm-gensym "DTCOUNT")))
+         (limit (or cnt count-form)))
     (compile-form
      (list 'block nil
+       (list 'let (if cnt (list (list cnt count-form)) nil)
            (list* 'let
                  (list (list var 0))
                  ;; A literal count bounds VAR at compile time: declare it so
@@ -17392,11 +17453,11 @@
                   (%leading-declares body)
                   (list
                  (list 'loop
-                       (list 'if (list '< var count-form)
+                       (list 'if (list '< var limit)
                              (list 'progn
                                    (cons 'tagbody (%strip-leading-declares body))
                                    (list 'setq var (list '1+ var)))
-                             (list 'return (or result-form nil))))))))
+                             (list 'return (or result-form nil)))))))))
      env dest)))
 
 ;;; ============================================================

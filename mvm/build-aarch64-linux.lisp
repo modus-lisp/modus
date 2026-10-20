@@ -926,14 +926,14 @@
   ;; reader-independent — (typep single-float-epsilon 'single-float) => T,
   ;; and the epsilon binary-search tests converge to the right value.
   ;; double/long constants stay #x60 double.
-  (setq double-float-epsilon          2.220446049250313d-16)
-  (setq single-float-epsilon          (%round-to-single 1.1920929d-7))
-  (setq short-float-epsilon           (%round-to-single 1.1920929d-7))
-  (setq long-float-epsilon            2.220446049250313d-16)
-  (setq double-float-negative-epsilon 1.1102230246251565d-16)
-  (setq single-float-negative-epsilon (%round-to-single 5.9604645d-8))
-  (setq short-float-negative-epsilon  (%round-to-single 5.9604645d-8))
-  (setq long-float-negative-epsilon   1.1102230246251565d-16)
+  (setq double-float-epsilon          1.1102230246251568d-16)
+  (setq single-float-epsilon          (%round-to-single 5.960465188081798d-8))
+  (setq short-float-epsilon           (%round-to-single 5.960465188081798d-8))
+  (setq long-float-epsilon            1.1102230246251568d-16)
+  (setq double-float-negative-epsilon 5.551115123125784d-17)
+  (setq single-float-negative-epsilon (%round-to-single 2.980232594040899d-8))
+  (setq short-float-negative-epsilon  (%round-to-single 2.980232594040899d-8))
+  (setq long-float-negative-epsilon   5.551115123125784d-17)
   (setq most-positive-double-float    1.7976931348623157d308)
   (setq most-negative-double-float   -1.7976931348623157d308)
   (setq most-positive-single-float    (%round-to-single 3.4028235d38))

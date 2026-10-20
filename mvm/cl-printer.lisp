@@ -282,10 +282,14 @@
             ;; it) still counts as a letter and prevents word-start reset.
             (progn
               (%print-char ch stream)
+              ;; An out-of-case letter or digit is inside a word, so the
+              ;; next in-case char is not a word start: |Xyz| under a
+              ;; :downcase readtable prints Xyz, not XYz (upstream
+              ;; PRINT.SYMBOL.3/4/7/8).
               (when (eq case :capitalize)
-                (unless (or (%ch-alphap ch)
-                            (and (>= ch 48) (<= ch 57)))  ; digit
-                  (setq at-word-start t))))
+                (setq at-word-start
+                      (not (or (%ch-alphap ch)
+                               (and (>= ch 48) (<= ch 57)))))))
             ;; In-case char: apply *print-case*.
             (progn
               (cond
@@ -327,10 +331,31 @@
 ;;; rule still applies.  This predicate stays neutral about which
 ;;; escape style (`\X` vs `|name|`) the caller chooses; the
 ;;; print-symbols / prin1.symbol tests accept either.
+(defun %name-potential-number-p (name base)
+  "NAME (a string) reads as a number in radix BASE: every character a BASE
+   digit, a sign or a ratio/decimal point, and at least one digit.  Above
+   base 10 that includes ordinary words -- BACKQUOTE is a base-31 integer --
+   so such a symbol must print escaped (CLHS 22.1.3.3; upstream
+   PRINT.BACKQUOTE.RANDOM.* print with *PRINT-BASE* 29..36)."
+  (let ((len (array-length name)) (i 0) (digits 0) (ok t))
+    (loop
+      (when (or (not ok) (= i len)) (return (and ok (> digits 0))))
+      (let* ((c (%prim-aref name i))
+             (v (cond ((and (>= c 48) (<= c 57)) (- c 48))
+                      ((and (>= c 65) (<= c 90)) (- c 55))
+                      ((and (>= c 97) (<= c 122)) (- c 87))
+                      (t nil))))
+        (cond ((and v (< v base)) (setq digits (+ digits 1)))
+              ((or (= c 43) (= c 45) (= c 46) (= c 47)) nil)
+              (t (setq ok nil))))
+      (setq i (+ i 1)))))
+
 (defun %name-needs-rcase-escape-p (name rc)
-  (let ((len (array-length name)))
+  (let ((len (array-length name))
+        (base (let ((b *print-base*)) (if (and (integerp b) (> b 10)) b nil))))
     (cond
       ((= len 0) t)
+      ((and base (%name-potential-number-p name base)) t)
       (t
        (let ((needs nil) (i 0))
          (loop
@@ -551,63 +576,63 @@
 
 ;;; Print a multi-dim array: emit "#NA" then a nested-list literal whose
 ;;; structure follows DIMS, drawing elements from FLAT-DATA in row-major order.
-;;; Returns (values).  Forward-declared so %write-obj can recurse into it.
+;;; Forward-declared so %write-obj can recurse into it.
+;;; *PRINT-LEVEL* / *PRINT-LENGTH* apply to the nested lists as they do to
+;;; ordinary lists (CLHS 22.1.3.8; upstream PRINT.ARRAY.LEVEL.*, .LENGTH.*):
+;;; every parenthesised slice is one level deeper, a slice at or past
+;;; *PRINT-LEVEL* prints as #, and a slice longer than *PRINT-LENGTH* ends
+;;; in "...".  LEVEL is the array's own depth (NIL = 0).
 (defun %print-md-array (dims flat-data stream level escape)
-  ;; Emit "#NA" prefix
-  (%print-char 35 stream)  ; #
-  (let ((rank 0) (d dims))
-    (loop (when (null d) (return nil))
-      (setq rank (+ rank 1))
-      (setq d (cdr d)))
-    (%print-decimal-to-stream rank stream))
-  (%print-char 65 stream)  ; A
-  ;; If no dims (0-dim), print the single element
-  (cond
-    ((null dims)
-     (%write-obj (aref flat-data 0) stream
-                 (if (null level) 1 (+ level 1)) escape))
-    (t
-     (%print-md-array-rec dims flat-data 0 stream level escape))))
+  (%print-md-array-offset dims flat-data 0 stream level escape))
 
-;;; Print one slice of an N-D array.  Returns the next index into FLAT-DATA
-;;; after consuming the slice.  DIMS is the remaining dimension list.
-(defun %print-md-array-rec (dims flat-data start stream level escape)
+(defun %md-slice-size (dims)
+  (let ((n 1))
+    (dolist (d dims n) (setq n (* n d)))))
+
+;;; Print one slice of an N-D array at nesting DEPTH.  Returns the index into
+;;; FLAT-DATA after the slice, whether or not all of it was printed.
+(defun %print-md-array-rec (dims flat-data start stream depth escape)
   (cond
     ((null dims)
-     ;; Leaf — print the single element at START, return START+1
-     (%write-obj (aref flat-data start) stream
-                 (if (null level) 1 (+ level 1)) escape)
+     (%write-obj (aref flat-data start) stream depth escape)
      (+ start 1))
     (t
-     (%print-char 40 stream)  ; (
-     (let ((n (car dims))
-           (rest-dims (cdr dims))
-           (i 0)
-           (cur start))
-       (loop
-         (when (= i n) (return nil))
-         (when (> i 0) (%print-char 32 stream))
-         (setq cur (%print-md-array-rec rest-dims flat-data cur stream level escape))
-         (setq i (+ i 1)))
-       (%print-char 41 stream)  ; )
-       cur))))
+     (let ((plev (if *print-readably* nil *print-level*))
+           (plen (if *print-readably* nil *print-length*))
+           (after (+ start (%md-slice-size dims))))
+       (if (and plev (>= depth plev))
+           (%print-char 35 stream)
+           (let ((n (car dims)) (rest-dims (cdr dims)) (i 0) (cur start))
+             (%print-char 40 stream)
+             (loop
+               (when (= i n) (return nil))
+               (when (> i 0) (%print-char 32 stream))
+               (when (and plen (>= i plen))
+                 (%print-string-raw "..." stream)
+                 (return nil))
+               (setq cur (%print-md-array-rec rest-dims flat-data cur stream
+                                               (+ depth 1) escape))
+               (setq i (+ i 1)))
+             (%print-char 41 stream)))
+       after))))
 
 ;;; Like %print-md-array but starts reading FLAT-DATA at START (for
 ;;; displaced MDAs: START = %mda-offset into the displaced-to target).
 (defun %print-md-array-offset (dims flat-data start stream level escape)
-  (%print-char 35 stream)  ; #
-  (let ((rank 0) (d dims))
-    (loop (when (null d) (return nil))
-      (setq rank (+ rank 1))
-      (setq d (cdr d)))
-    (%print-decimal-to-stream rank stream))
-  (%print-char 65 stream)  ; A
-  (cond
-    ((null dims)
-     (%write-obj (aref flat-data start) stream
-                 (if (null level) 1 (+ level 1)) escape))
-    (t
-     (%print-md-array-rec dims flat-data start stream level escape))))
+  (let ((d0 (if (null level) 0 level)) (plev (if *print-readably* nil *print-level*)))
+    (cond
+      ((and plev (>= d0 plev)) (%print-char 35 stream))
+      (t
+       (%print-char 35 stream)  ; #
+       (let ((rank 0) (d dims))
+         (loop (when (null d) (return nil))
+           (setq rank (+ rank 1))
+           (setq d (cdr d)))
+         (%print-decimal-to-stream rank stream))
+       (%print-char 65 stream)  ; A
+       (if (null dims)
+           (%write-obj (aref flat-data start) stream (+ d0 1) escape)
+           (%print-md-array-rec dims flat-data start stream d0 escape))))))
 
 ;;; Main printer: print OBJ to STREAM respecting all *print-* variables
 ;;; LEVEL: current nesting level (nil = not tracking)
@@ -624,7 +649,11 @@
    CONSES here, and conditions / complexes / struct instances / MDAs are
    array-shaped -- none of them may get a #n= label."
   (cond
-    ((symbolp x) nil)
+    ;; An UNINTERNED symbol is labelled like a cons: #:X read twice is two
+    ;; symbols, so (cons s s) prints (#1=#:X . #1#) (CLHS 22.1.3.3.1;
+    ;; upstream PRINT.CONS.5/6).  %WRITE-OBJ-0 emits the label only when the
+    ;; symbol would print with #:.
+    ((symbolp x) (null (symbol-package x)))
     ((consp x)
      (not (or (%pkg-p x) (readtablep x) (%restart-cell-p x)
               (eql (car x) 8765432) (eql (car x) 9867654))))
@@ -645,6 +674,7 @@
            (return nil))
         (t (setf (gethash x tbl) :seen))))
     (cond
+      ((symbolp x) (return nil))
       ((consp x)
        (%circ-scan (car x) tbl (+ depth 1))
        (setq x (cdr x)))
@@ -779,7 +809,9 @@
   (let ((tbl *%circ-table*))
     (cond
       (tbl
-       (if (%circ-labelable-p obj)
+       (if (and (%circ-labelable-p obj)
+                (or (not (symbolp obj))
+                    (and escape (symbol-value '*print-gensym*))))
            (let ((e (gethash obj tbl)))
              (cond
                ((integerp e)
@@ -1092,8 +1124,21 @@
               ;; the user-visible length).  Slice manually to fp when set.
               ((and dims (null (cdr dims)))
                (let ((fp (%mda-fp obj)))
-                 (if (or (null fp) (= fp (array-length data)))
-                     (%write-obj data stream level escape)
+                 (cond
+                   ;; DISPLACED: the data slot is the whole displaced-to
+                   ;; array, so print this vector's own elements
+                   ;; (upstream PRINT.VECTOR.DISPLACED.1-3).
+                   ((%mda-displaced obj)
+                    (let* ((n (length obj))
+                           (tmp (if (stringp data) (make-string n) (make-array n)))
+                           (i 0))
+                      (loop (when (>= i n) (return nil))
+                        (setf (aref tmp i) (aref obj i))
+                        (setq i (+ i 1)))
+                      (%write-obj tmp stream level escape)))
+                   ((or (null fp) (= fp (array-length data)))
+                     (%write-obj data stream level escape))
+                   (t
                      ;; Build a temp vector / string of fp items and print it.
                      (let ((tmp (if (stringp data)
                                     (%make-string-array fp)
@@ -1106,7 +1151,7 @@
                                              (aref data i))
                                          (aref data i)))
                          (setq i (+ i 1)))
-                       (%write-obj tmp stream level escape)))))
+                       (%write-obj tmp stream level escape))))))
               ;; Rank 0 or rank ≥ 2: full multi-dim emitter.  Honor
               ;; displacement: data slot holds the displaced-to target and
               ;; %mda-offset is the starting row-major index into it.
@@ -1133,8 +1178,8 @@
        ;; 22.1.3.4 says objects at depth N>=*print-level* print as #.
        ;; (print-level.3 / .4 pass plev=0 and expect the top-level
        ;; object itself to be elided.)
-       (let ((plev *print-level*)
-             (plen *print-length*))
+       (let ((plev (if *print-readably* nil *print-level*))
+             (plen (if *print-readably* nil *print-length*)))
         (cond
          ((and plev (>= (or level 0) plev))
           (%print-char 35 stream))   ; #
@@ -1206,8 +1251,8 @@
          (%print-string-raw ">" stream)))
       ;; Array/string (non-cons)
       ((arrayp obj)
-       (let ((plev *print-level*)
-             (plen *print-length*))
+       (let ((plev (if *print-readably* nil *print-level*))
+             (plen (if *print-readably* nil *print-length*)))
         (cond
          ;; *print-level* elision applies to arrays too: at depth
          ;; >= plev, print as "#" with no element walk.  (print-level.3)
@@ -1980,19 +2025,21 @@
               ;; Block object is a (possibly dotted) list.
               (let ((lst (aref st 1))
                     (cnt (aref st 2)))
+                ;; SBCL's order (CLHS 22.4 PPRINT-POP): a dotted tail first,
+                ;; written ". tail" -- the caller has already written the
+                ;; separating space -- then *PRINT-LENGTH* (ignored when
+                ;; printing readably), then pop, counting even a pop of an
+                ;; empty list (upstream PPRINT-POP.5-9,
+                ;; PPRINT-EXIT-IF-LIST-EXHAUSTED.3/4).
                 (cond
-                  ;; *print-length* exhausted: emit "..." and exit.
-                  ((and plen (integerp plen) (>= cnt plen))
-                   (write-string "..." stream)
-                   (throw :%pp-tag nil))
-                  ;; Proper end of list: nothing left.
-                  ((null lst) nil)
-                  ;; Dotted tail: write " . <atom>" and exit.
-                  ((not (consp lst))
-                   (write-string " . " stream)
+                  ((not (listp lst))
+                   (write-string ". " stream)
                    (%write-obj lst stream nil t)
                    (throw :%pp-tag nil))
-                  ;; Normal element.
+                  ((and plen (integerp plen) (>= cnt plen)
+                        (not (symbol-value '*print-readably*)))
+                   (write-string "..." stream)
+                   (throw :%pp-tag nil))
                   (t
                    (aset st 1 (cdr lst))
                    (aset st 2 (+ cnt 1))
@@ -2013,11 +2060,10 @@
       (let ((lst (aref st 1))
             (cnt (aref st 2))
             (plen *print-length*))
-        (cond
-          ((null lst) (throw :%pp-tag nil))
-          ((and plen (integerp plen) (>= cnt plen))
-           (write-string "..." (aref st 0))
-           (throw :%pp-tag nil))))))
+        (declare (ignore cnt plen))
+        ;; Only an EMPTY list exits here; *PRINT-LENGTH* is PPRINT-POP's
+        ;; to enforce, after the caller's separator ("{1 ...}", not "{1...}").
+        (when (null lst) (throw :%pp-tag nil)))))
   nil)
 
 ;;; ============================================================
@@ -2619,9 +2665,10 @@
 (defun %fmt-integer (n base mincol padchar commachar commaint colonp atp stream)
   (cond
     ((not (integerp n))
-     ;; ANSI: non-integer → print as ~A (princ), no padding
-     (let ((*print-escape* nil))
-       (declare (special *print-escape*))
+     ;; CLHS 22.3.2.2-5: a non-integer prints as ~A in the directive's own
+     ;; radix -- ~B of 3/5 is 11/101 (upstream FORMAT.B/O/X.18-21).
+     (let ((*print-escape* nil) (*print-base* base) (*print-radix* nil))
+       (declare (special *print-escape* *print-base* *print-radix*))
        (%write-obj n stream nil nil)))
     ;; No column and no commas: sign and digits straight to STREAM, without a
     ;; string stream of its own to build and copy out.
@@ -5813,4 +5860,9 @@
    is a regular function that calls the DESCRIBE-OBJECT generic.  We
    default the stream to NIL (caller's responsibility to bind a real
    one if they need formatted output)."
-  (describe-object object stream))
+  ;; CLHS 21.1.4: NIL means *STANDARD-OUTPUT*, T means *TERMINAL-IO*; and
+  ;; DESCRIBE returns no values (upstream DESCRIBE.1-5).
+  (describe-object object (cond ((null stream) *standard-output*)
+                                ((eq stream t) *terminal-io*)
+                                (t stream)))
+  (values))

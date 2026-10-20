@@ -218,13 +218,68 @@
       (setq acc (%float-add acc term))
       (setq n (+ n 1)))))
 
+(defun %ksin-f (x)
+  "fdlibm __kernel_sin: sin X for |X| <= pi/4."
+  (let* ((z (%float-mul x x))
+         (v (%float-mul z x))
+         (r (%float-add (%dbl #x3F811111 #x1110F8A6)
+             (%float-mul z (%float-add (%dbl #xBF2A01A0 #x19C161D5)
+              (%float-mul z (%float-add (%dbl #x3EC71DE3 #x57B1FE7D)
+               (%float-mul z (%float-add (%dbl #xBE5AE5E6 #x8A2B9CEB)
+                (%float-mul z (%dbl #x3DE5D93A #x5ACFD57C)))))))))))
+    (%float-add x (%float-mul v (%float-add (%dbl #xBFC55555 #x55555549)
+                                            (%float-mul z r))))))
+
+(defun %kcos-f (x)
+  "fdlibm __kernel_cos: cos X for |X| <= pi/4."
+  (let* ((z (%float-mul x x))
+         (r (%float-mul z
+             (%float-add (%dbl #x3FA55555 #x5555554C)
+              (%float-mul z (%float-add (%dbl #xBF56C16C #x16C15177)
+               (%float-mul z (%float-add (%dbl #x3EFA01A0 #x19CB1590)
+                (%float-mul z (%float-add (%dbl #xBE927E4F #x809C52AD)
+                 (%float-mul z (%float-add (%dbl #x3E21EE9E #xBDB4B1C4)
+                  (%float-mul z (%dbl #xBDA8FAE9 #xBE8838D4)))))))))))))
+         (hz (%float-mul (%dbl #x3FE00000 0) z))
+         (w (%float-sub (%f-one) hz)))
+    (%float-add w (%float-add (%float-sub (%float-sub (%f-one) w) hz)
+                              (%float-mul z r)))))
+
+(defun %trig-quadrant-f (x)
+  "X (finite double) as (N . R) with X = N*pi/2 + R and |R| <= ~pi/4, by
+   fdlibm's medium reduction (pi/2 split hi/lo so N*hi is exact).  A large X
+   is first brought into [-pi, pi] exactly."
+  (let* ((x (if (%float-lt-p (%float-abs x) (%fl 65536)) x (%trig-reduce-exact x)))
+         (n (%float-round-to-int (%float-mul x (%dbl #x3FE45F30 #x6DC9C883))))
+         (fn (%fl n))
+         (r (%float-sub (%float-sub x (%float-mul fn (%dbl #x3FF921FB #x54400000)))
+                        (%float-mul fn (%dbl #x3DD0B461 #x1A626331)))))
+    (cons n r)))
+
 (defun %sin-f (x)
-  "sin of double X (full-range)."
-  (%sin-poly-f (%trig-reduce-f x)))
+  "sin of double X (full-range): quadrant reduction plus fdlibm kernels.  The
+   old Taylor series over [-pi, pi] lost two ulps near pi/2 --
+   (sin (/ pi 2)) was 1.0000000000000002d0 (upstream SIN.16-19 once the
+   epsilons were right)."
+  (if (%float-nonfinite-p x)
+      (%float-sub x x)
+      (let* ((q (%trig-quadrant-f x)) (r (cdr q)))
+        (case (logand (car q) 3)
+          (0 (%ksin-f r))
+          (1 (%kcos-f r))
+          (2 (%float-neg (%ksin-f r)))
+          (t (%float-neg (%kcos-f r)))))))
 
 (defun %cos-f (x)
-  "cos of double X (full-range)."
-  (%cos-poly-f (%trig-reduce-f x)))
+  "cos of double X (full-range); see %SIN-F."
+  (if (%float-nonfinite-p x)
+      (%float-sub x x)
+      (let* ((q (%trig-quadrant-f x)) (r (cdr q)))
+        (case (logand (car q) 3)
+          (0 (%kcos-f r))
+          (1 (%float-neg (%ksin-f r)))
+          (2 (%float-neg (%kcos-f r)))
+          (t (%ksin-f r))))))
 
 
 
@@ -4132,34 +4187,38 @@
          (setq sign -1) (setq m (- 0 m)))
        (values (or (ignore-errors (truncate m)) 0) 0 sign)))))
 
-;;; float-related constants
-(defvar double-float-epsilon 2.220446049250313d-16)
+;;; float-related constants.  The epsilons are CLHS's: the smallest
+;;; positive float E with (/= (float 1 E) (+ (float 1 E) E)) -- one ulp-half
+;;; plus a bit, 2^-24(1+2^-23) for single -- not the unit roundoff 2^-23 they
+;;; used to be, and single/short ones are SINGLE-FLOATs (upstream
+;;; EPSILONS.3-13, PLUS.11/12).
+(defvar double-float-epsilon 1.1102230246251568d-16)
 
-(defvar single-float-epsilon 1.1920929d-7)
+(defvar single-float-epsilon (%round-to-single 5.960465188081798d-8))
 
-(defvar short-float-epsilon 1.1920929d-7)
+(defvar short-float-epsilon (%round-to-single 5.960465188081798d-8))
 
-(defvar long-float-epsilon 2.220446049250313d-16)
+(defvar long-float-epsilon 1.1102230246251568d-16)
 
-(defvar double-float-negative-epsilon 1.1102230246251565d-16)
+(defvar double-float-negative-epsilon 5.551115123125784d-17)
 
-(defvar single-float-negative-epsilon 5.9604645d-8)
+(defvar single-float-negative-epsilon (%round-to-single 2.980232594040899d-8))
 
-(defvar short-float-negative-epsilon 5.9604645d-8)
+(defvar short-float-negative-epsilon (%round-to-single 2.980232594040899d-8))
 
-(defvar long-float-negative-epsilon 1.1102230246251565d-16)
+(defvar long-float-negative-epsilon 5.551115123125784d-17)
 
 (defvar most-positive-double-float 1.7976931348623157d308)
 
 (defvar most-negative-double-float -1.7976931348623157d308)
 
-(defvar most-positive-single-float 3.4028235d38)
+(defvar most-positive-single-float (%round-to-single 3.4028234663852886d38))
 
-(defvar most-negative-single-float -3.4028235d38)
+(defvar most-negative-single-float (%round-to-single -3.4028234663852886d38))
 
-(defvar most-positive-short-float 3.4028235d38)
+(defvar most-positive-short-float (%round-to-single 3.4028234663852886d38))
 
-(defvar most-negative-short-float -3.4028235d38)
+(defvar most-negative-short-float (%round-to-single -3.4028234663852886d38))
 
 (defvar most-positive-long-float 1.7976931348623157d308)
 
@@ -4681,11 +4740,19 @@
   (and (consp x) (eq (car x) 'random-state)))
 
 (defun make-random-state (&optional state)
-  (if (null state)
-      (list 'random-state (get-internal-run-time))
-      (if (eq state t)
-          (list 'random-state (get-internal-run-time))
-          (list 'random-state (cadr state)))))
+  "CLHS: NIL copies the CURRENT state, T makes a fresh randomly seeded one,
+   and a random state is copied.  NIL used to make a fresh one."
+  (cond
+    ((eq state t)
+     (list 'random-state (logand (get-internal-real-time) #x3FFFFFFF)))
+    ((null state)
+     (let ((cur (if (boundp '*random-state*) *random-state* nil)))
+       (list 'random-state (if (random-state-p cur)
+                               (cadr cur)
+                               (mem-ref #x10000FD8 :u32)))))
+    ((random-state-p state) (list 'random-state (cadr state)))
+    (t (error 'type-error :datum state
+              :expected-type '(or random-state (member nil t))))))
 
 ;;; ============================================================
 ;;; Trigonometric and Transcendental Functions

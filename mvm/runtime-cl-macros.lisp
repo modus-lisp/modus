@@ -512,6 +512,15 @@
 
     "(defmacro pprint-pop () '(%pprint-pop-fn))"
 
+    ;; TIME, TRACE and UNTRACE are macros (CLHS): TIME must see the FORM to
+    ;; pass its values through, and TRACE / UNTRACE take unevaluated names
+    ;; -- as functions they evaluated FUNCTION-TO-TRACE as a variable.
+    "(defmacro time (form) (list '%time-fn (list 'lambda nil form)))"
+
+    "(defmacro trace (&rest names) (list '%trace-fn (list 'quote names)))"
+
+    "(defmacro untrace (&rest names) (list '%untrace-fn (list 'quote names)))"
+
     "(defmacro pprint-exit-if-list-exhausted () '(%pprint-exit-fn))"
 
     "(defmacro do-all-symbols (spec &rest body)

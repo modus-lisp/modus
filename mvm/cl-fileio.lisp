@@ -2113,7 +2113,16 @@
   (let ((path (handler-case (namestring x) (t (c) nil))))
     (when (null path) (return-from directory nil))
     (if (not (position #\* path))
-        (%dir-entries-raw path)
+        ;; A non-wild pathname naming a FILE matches that file (CLHS
+        ;; DIRECTORY): ansi-test's DELETE-ALL-VERSIONS is
+        ;; (mapc #'delete-file (directory pathname)), and an empty answer
+        ;; left tmp.dat behind for every later OPEN test (upstream
+        ;; OPEN.PROBE.12-20, OPEN.OUTPUT/IO.28...).  A directory keeps the
+        ;; in-tree contract: its entry names.
+        (or (%dir-entries-raw path)
+            (let ((n (length path)))
+              (and (> n 0) (not (char= (char path (- n 1)) #\/))
+                   (let ((pf (probe-file x))) (and pf (list pf))))))
         (let ((comps (%split-slash path)))
           (if (and comps (string= (car comps) ""))
               (%glob-expand "/" (cdr comps))

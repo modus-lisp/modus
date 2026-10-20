@@ -5183,9 +5183,60 @@
 ;;; ============================================================
 ;;; trace/untrace stubs
 ;;; ============================================================
-(defun trace (&rest fns) nil)
+(defvar *%traced* nil
+  "Traced functions, most recent first: (name . original-function).")
 
-(defun untrace (&rest fns) nil)
+(defun %trace-fn (specs)
+  "TRACE (CLHS 25.2): with no names, the list of traced names; otherwise
+   wrap each named function so every call reports its arguments and values
+   on *TRACE-OUTPUT*.  The macro TRACE passes its unevaluated NAMES here.
+   Tracing an already traced name is a no-op."
+  (if (null specs)
+      (let ((r nil))
+        (dolist (e *%traced* r) (setq r (cons (car e) r))))
+      (progn
+        (dolist (name specs)
+          (unless (assoc name *%traced* :test #'equal)
+            (when (fboundp name)
+              (let* ((orig (fdefinition name))
+                     (wrapper
+                       (lambda (&rest args)
+                         (let ((out *trace-output*))
+                           (format out "~&0: ~S~{ ~S~}~%" name args)
+                           (let ((vals (multiple-value-list (apply orig args))))
+                             (format out "~&0: ~S returned~{ ~S~}~%" name vals)
+                             (values-list vals))))))
+                (setq *%traced* (cons (cons name orig) *%traced*))
+                (set-fdefinition name wrapper)))))
+        (%trace-fn nil))))
+
+(defun %untrace-fn (specs)
+  "UNTRACE: restore the named functions, or every traced one."
+  (let ((keep nil))
+    (dolist (e *%traced*)
+      (if (or (null specs) (member (car e) specs :test #'equal))
+          (set-fdefinition (car e) (cdr e))
+          (setq keep (cons e keep))))
+    (setq *%traced* (nreverse keep)))
+  nil)
+
+(defun trace (&rest fns) (%trace-fn fns))
+
+(defun untrace (&rest fns) (%untrace-fn fns))
+
+(defun %time-fn (thunk)
+  "TIME: run THUNK, report real and run time on *TRACE-OUTPUT*, and return
+   THUNK's values unchanged (upstream TIME.4/.5)."
+  (let* ((r0 (get-internal-real-time))
+         (c0 (get-internal-run-time))
+         (vals (multiple-value-list (funcall thunk)))
+         (r1 (get-internal-real-time))
+         (c1 (get-internal-run-time))
+         (u internal-time-units-per-second)
+         (out *trace-output*))
+    (format out "~&Evaluation took:~%  ~,3F seconds of real time~%  ~,3F seconds of run time~%"
+            (/ (float (- r1 r0)) u) (/ (float (- c1 c0)) u))
+    (values-list vals)))
 
 ;;; ============================================================
 ;;; documentation / set-documentation stubs
@@ -5221,6 +5272,11 @@
 
 (defun documentation (x doc-type)
   "Look up doc string for X under DOC-TYPE, or NIL."
+  (%documentation-default x doc-type))
+
+(defun %documentation-default (x doc-type)
+  "The registry lookup behind DOCUMENTATION, kept under its own name so it
+   survives DOCUMENTATION becoming a generic function (see %GF-DISPATCH)."
   (setq doc-type (%doc-type-normalize doc-type))
   (let ((key (cons x doc-type))
         (cur *documentation-strings*)
@@ -5294,7 +5350,18 @@
       (string= name "BOOLE-NAND") (string= name "BOOLE-NOR")
       (string= name "BOOLE-ORC1") (string= name "BOOLE-ORC2")
       (string= name "BOOLE-SET") (string= name "BOOLE-XOR")
-      (string= name "PI")))
+      (string= name "PI")
+      ;; The rest of CLHS Figure 3-2's constant variables (upstream
+      ;; INTERNAL-TIME-UNITS-PER-SECOND.1, CALL-ARGUMENTS-LIMIT.*).
+      (and (> (length name) 8)
+           (member name '("INTERNAL-TIME-UNITS-PER-SECOND" "CALL-ARGUMENTS-LIMIT"
+                          "LAMBDA-PARAMETERS-LIMIT" "MULTIPLE-VALUES-LIMIT"
+                          "ARRAY-DIMENSION-LIMIT" "ARRAY-RANK-LIMIT"
+                          "ARRAY-TOTAL-SIZE-LIMIT" "CHAR-CODE-LIMIT"
+                          "LAMBDA-LIST-KEYWORDS" "MOST-POSITIVE-FIXNUM"
+                          "MOST-NEGATIVE-FIXNUM")
+                   :test #'string=)
+           t)))
 
 (defun constantp (form &rest env)
   "True if FORM is a constant per CLHS.  Extends the cl-packages.lisp

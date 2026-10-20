@@ -1122,6 +1122,11 @@
   ;; no-progress caps were all OFF in the image that measures conformance.
   ;; Comparing NIL now signals TYPE-ERROR, so run each one's own init thunk
   ;; (its DEFVAR's initform, not a copy of the value).
+  ;; Every (DEFVAR *X* NIL) this runner would otherwise leave UNBOUND.  Their
+  ;; thunks assign only when unbound, so this disturbs none of the above.
+  ;; (Before MAKUNBOUND and the LET restore kept unbound-ness, the first LET of
+  ;; such a variable quietly left it bound to NIL; *CATCH-TAGS* relied on it.)
+  (%run-nil-defvar-inits)
   (|INIT-*LET-BINDING-LIMIT*|)
   (|INIT-*COMPILE-SAFETY*|)
   (|INIT-*FUZZ-FUNCALL-NOPS*|)

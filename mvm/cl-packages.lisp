@@ -1944,16 +1944,26 @@
         (unless (eql blk 0)
           (let ((a (%dynb-lookup blk key)))
             (unless (eql a 0)
-              (return-from symbol-value (values (mem-ref a :u64))))))))
+              (let ((v (mem-ref a :u64)))
+                (return-from symbol-value
+                  (if (eq v (%word->val #x0BADB0B5))
+                      (if (integerp name-or-hash)
+                          nil
+                          (error 'unbound-variable :name name-or-hash))
+                      (values v)))))))))
+    ;; The unbound marker (prelude %UNBOUND-MARKER) reads as an absent pair.
     (let ((tbl (%globals-table)))
       (if (and tbl key)
           (multiple-value-bind (v found) (gethash key tbl)
             ;; A SYMBOL with no value is UNBOUND-VARIABLE (CLHS SYMBOL-VALUE;
-            ;; upstream SYMBOL-VALUE.ERROR.5).  The INTEGER path -- every
-            ;; compiled global read -- keeps answering NIL.
-            (if (or found (integerp name-or-hash))
+            ;; upstream SYMBOL-VALUE.ERROR.5), and a pair holding the unbound
+            ;; marker has no value.  The INTEGER path -- every compiled
+            ;; global read -- keeps answering NIL.
+            (if (and found (not (eq v (%word->val #x0BADB0B5))))
                 v
-                (error 'unbound-variable :name name-or-hash)))
+                (if (integerp name-or-hash)
+                    nil
+                    (error 'unbound-variable :name name-or-hash))))
           nil))))
 
 (defun boundp (sym)
@@ -1991,13 +2001,20 @@
    T if KEY is present, NIL otherwise — distinguishes 'present, bound to
    NIL' from 'absent'.  A fresh-cons sentinel (never EQ to any stored value)
    is used as the gethash default so a global bound to NIL still reads as
-   bound.  (The store is a hash table since the O(n²) globals-alist fix;
+   bound, and a pair holding the unbound marker reads as unbound.  (The store is a hash table since the O(n²) globals-alist fix;
    see symbol-value in prelude.lisp.)"
-  (let ((tbl (%globals-table)))
-    (if (null tbl)
-        nil
-        (let ((miss (cons nil nil)))
-          (not (eq (gethash key tbl miss) miss))))))
+  ;; This thread's own binding first (a worker binds in its own storage, not
+  ;; in the table); then the table, where a pair holding the unbound marker
+  ;; (prelude %UNBOUND-MARKER) is unbound.
+  (let ((a (if (eql (mem-ref #x10000DB8 :u32) 0) 0 (%dynb-value-addr key))))
+    (if (not (eql a 0))
+        (not (eq (mem-ref a :u64) (%unbound-marker)))
+        (let ((tbl (%globals-table)))
+          (if (null tbl)
+              nil
+              (let* ((miss (cons nil nil))
+                     (v (gethash key tbl miss)))
+                (not (or (eq v miss) (eq v (%unbound-marker))))))))))
 
 ;; Runtime registry of symbols named by DEFCONSTANT.  CLHS: (constantp 'name)
 ;; is true when NAME names a constant variable.  Populated by the mvm-eval
@@ -2250,26 +2267,27 @@
     (loop
       (when (null cur) (return (nreverse result)))
       (let ((h (%progv-hash (car cur))))
-        (setq result (cons (cons h (symbol-value h)) result)))
+        ;; %GV-SAVE: an unbound variable saves as the unbound marker, so
+        ;; the restore makes it unbound again.
+        (setq result (cons (cons h (%gv-save h)) result)))
       (setq cur (cdr cur)))))
 
 (defun %progv-set (vars vals)
-  "Assign successive VARS to successive VALS via set-symbol-value.
-   Stops when either list is exhausted; extras on either side are ignored.
-   Vars without a corresponding val keep their saved value (an
-   approximation of full ANSI 'makunbound' semantics)."
+  "Bind successive VARS to successive VALS.  Extra VALS are ignored; VARS
+   left without a value are bound and made UNBOUND (CLHS PROGV)."
   (let ((vc vars) (vlc vals))
     (loop
       (when (null vc) (return nil))
-      (when (null vlc) (return nil))
       ;; %DYNBIND, not SET-SYMBOL-VALUE: PROGV establishes a dynamic BINDING,
       ;; so on a worker thread it must land in that thread's own storage
       ;; rather than in region 0's globals table — the same reason
       ;; COMPILE-LET-WITH-SPECIALS emits it.  Identical to the old call on
       ;; every unarmed thread.
-      (%dynbind (%progv-hash (car vc)) (car vlc))
-      (setq vc (cdr vc))
-      (setq vlc (cdr vlc)))))
+      (if (null vlc)
+          (%dynbind (%progv-hash (car vc)) (%unbound-marker))
+          (progn (%dynbind (%progv-hash (car vc)) (car vlc))
+                 (setq vlc (cdr vlc))))
+      (setq vc (cdr vc)))))
 
 (defun %progv-restore (saves)
   "Restore values saved by %progv-save."

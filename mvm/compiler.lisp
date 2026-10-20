@@ -1538,6 +1538,13 @@
    module being compiled (one object per keyword, or EQ breaks).  Reset per
    module by MVM-COMPILE-ALL with SETQ for the reason *INIT-THUNK-NAMES* is.")
 
+(defvar *init-nil-thunk-names* nil
+  "The subset of *INIT-THUNK-NAMES* that are a NIL-initform DEFVAR's thunk,
+   which assigns only when the variable is unbound -- so calling all of them
+   (%RUN-NIL-DEFVAR-INITS) cannot disturb anything already set.  An image that
+   does not run INIT-ALL-GLOBALS (the ANSI gate runner) calls this instead,
+   or every such variable is genuinely UNBOUND there.")
+
 (defvar *init-thunk-names* nil
   "Names of auto-generated INIT-* thunks emitted by the DEFVAR /
    DEFPARAMETER handlers in mvm-compile-toplevel.  init-all-globals
@@ -8894,12 +8901,9 @@
       ;; install new values, run body inside unwind-protect, and
       ;; restore saved values on any exit (normal or non-local).
       ;;
-      ;; If fewer vals than vars, remaining vars keep their saved
-      ;; (pre-progv) value during the body — approximation of the
-      ;; ANSI "remaining vars are unbound" rule. This still produces
-      ;; correct results for tests where the body's writes to those
-      ;; vars are clobbered by restore on exit (e.g. PROGV.6A), and
-      ;; for any test that doesn't probe boundp of unbound vars.
+      ;; If fewer vals than vars, the remaining vars are bound and
+      ;; UNBOUND during the body (%PROGV-SET binds them to the unbound
+      ;; marker), as CLHS specifies.
       ((= op-name 187203043)  ; PROGV
        (let ((vars-form  (cadr form))
              (vals-form  (caddr form))
@@ -11708,11 +11712,14 @@
                               (cell (%let-special-cell spec k))
                               (slot (and (not cell) (%gv-aot-slot k spec)))
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
+                         ;; The SAVE keeps "unbound" as the unbound marker
+                         ;; (prelude %UNBOUND-MARKER), so the restore makes
+                         ;; an unbound special unbound again.
                          (list sv (cond (cell `(%gv-cell-ref (quote ,cell) ,k))
-                                        (slot `(%gv-ref-fill ,k ,slot))
+                                        (slot `(%gv-save-fill ,k ,slot))
                                         (site (%site-fast site '(cdr c)
                                                           `(%gv-site-ref ,k (quote ,site))))
-                                        (t `(%gv-ref ,k))))))
+                                        (t `(%gv-save ,k))))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
            ;; creating a lexical binding under the special's own name.
@@ -12742,7 +12749,8 @@
    site.  Each access used to be that call, which itself called
    %GV-SITE-CELL: two calls per read, bind and unbind of a special defined
    with no value (DEFVAR *X*), the common way to declare one that is only
-   ever bound -- cl-bench STAK, 12x SBCL, ~73% of it in those calls."
+   ever bound -- cl-bench STAK, 12x SBCL, ~73% of it in those calls.
+   (The READ is emitted as IR instead: %COMPILE-GLOBAL-READ-BAKED.)"
   (let ((c (%mvm-gensym "SITEC")))
     `(let ((,c (car (quote ,site))))
        (if (and ,c (eql (mem-ref #x10000DB8 :u32) 0))
@@ -12967,6 +12975,10 @@
       (emit-ir :cmp cell want)
       (emit-ir :bne miss)
       (emit-ir :cdr dest dest)
+      ;; An unbound pair (prelude %UNBOUND-MARKER) misses; %GV-REF-FILL reads
+      ;; it as NIL, which is what an absent pair has always read as here.
+      (emit-ir :cmp-imm dest #x0BADB0B5)        ; the marker's raw word
+      (emit-ir :beq miss)
       ;; A read yields exactly ONE value, and the old emission said so by
       ;; accident: it was a CALL, and %GV-REF's epilogue reset MV-COUNT.  The
       ;; miss path still gets that reset from %GV-REF-FILL's own epilogue, so
@@ -13034,18 +13046,16 @@
    a VP8 frame).  Otherwise the checked call (UNBOUND-VARIABLE semantics)."
   (let ((cell (%runtime-global-cell name)))
     (if cell
-        (%compile-global-read-baked (%global-name-key name) cell dest)
+        (%compile-global-read-baked (%global-name-key name) cell dest name)
         ;; No cell yet: a per-site cache cons (filled once the cell exists).
         (let ((site (%let-special-site name (%global-name-key name))))
-          (compile-form (if site
-                            (%site-fast site '(cdr c)
-                                        `(%e2-symbol-value-site ,(%global-name-key name)
-                                                                (quote ,name) (quote ,site)))
-                            `(%e2-symbol-value-checked ,(%global-name-key name)
-                                                       (quote ,name)))
-                        env dest)))))
+          (if site
+              (%compile-global-read-baked (%global-name-key name) nil dest name site)
+              (compile-form `(%e2-symbol-value-checked ,(%global-name-key name)
+                                                       (quote ,name))
+                            env dest))))))
 
-(defun %compile-global-read-baked (key cell dest)
+(defun %compile-global-read-baked (key cell dest name &optional site)
   "The baked-cell read, GUARDED on whether this image has declared threads.
 
    Baking the (key . value) pair into the code is right for one thread and
@@ -13088,17 +13098,40 @@
       (emit-ir :li dest 0)
       (emit-ir :cmp w dest)
       (emit-ir :bne slow)
-      (emit-ir :li-const dest (%e2-const-register cell))
+      (if site
+          ;; THE PER-SITE CACHE (see %GV-SITE-CELL): SITE's car is the cell
+          ;; once found, NIL until then, which takes the slow arm (it fills).
+          (progn
+            (emit-ir :li-const dest (%e2-const-register site))
+            (emit-ir :car dest dest)
+            (emit-ir :bnull dest slow))
+          (emit-ir :li-const dest (%e2-const-register cell)))
       (emit-ir :cdr dest dest)
+      ;; An unbound pair (holding prelude's %UNBOUND-MARKER, written by
+      ;; MAKUNBOUND or by the restore of a LET of an unbound special) takes
+      ;; the slow arm, which signals UNBOUND-VARIABLE.
+      ;; CMP-IMM compares the raw word with the sign-extended immediate on
+      ;; every back end and in the interpreter, so the marker's own word.
+      (emit-ir :cmp-imm dest #x0BADB0B5)
+      (emit-ir :beq slow)
       ;; A read yields exactly one value; the slow arm gets this from
-      ;; %GV-REF's own epilogue, so both arms agree and so does the
+      ;; its callee's own epilogue, so both arms agree and so does the
       ;; pre-change emission, which was reached the same way.
       (emit-ir :set-mv-count 1)
       (emit-ir :br done)
       (emit-ir-label slow)
+      ;; Threads armed, or unbound: the checked read (this thread's own
+      ;; binding first, UNBOUND-VARIABLE naming NAME when there is none).
       (emit-li-tagged +vreg-v0+ key)
-      (when *mvm-emit-halves* (emit-ir :set-nargs 1))
-      (emit-ir :call "%GV-REF" 1)
+      (emit-ir :li-const +vreg-v1+ (%e2-const-register name))
+      (if site
+          (progn
+            (emit-ir :li-const +vreg-v2+ (%e2-const-register site))
+            (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+            (emit-ir :call "%E2-SYMBOL-VALUE-SITE" 3))
+          (progn
+            (when *mvm-emit-halves* (emit-ir :set-nargs 2))
+            (emit-ir :call "%E2-SYMBOL-VALUE-CHECKED" 2)))
       (unless (= dest +vreg-vr+)
         (emit-ir :mov dest +vreg-vr+))
       (emit-ir-label done)
@@ -27633,6 +27666,7 @@
                 (store `(let ((,tmp-var ,value))
                           ,(%init-thunk-store name name-hash tmp-var))))
            (push thunk-name *init-thunk-names*)
+           (when (null value) (push thunk-name *init-nil-thunk-names*))
            (mvm-compile-function
             thunk-name nil
             ;; A NIL initform is the case this arm was widened to cover, and
@@ -28623,6 +28657,7 @@
     ;; init-all-globals was never generated → funcall-of-0 at modus2 boot.
     ;; Using the plain global (reset per compile) makes push+read share one cell.
     (setq *init-thunk-names* nil)
+    (setq *init-nil-thunk-names* nil)
     (setq *static-keyword-index* nil)
     (setq *static-literal-index* nil)
 
@@ -28756,7 +28791,19 @@
              (info (car result))
              (ir (cdr result)))
         (when (and info ir)
-          (setf all-ir (nconc all-ir (list (cons info ir)))))))
+          (setf all-ir (nconc all-ir (list (cons info ir))))))
+      ;; %RUN-NIL-DEFVAR-INITS: the NIL-initform DEFVARs alone (see
+      ;; *INIT-NIL-THUNK-NAMES*).  Always generated, as INIT-ALL-GLOBALS is.
+      (let ((nil-calls nil)
+            (pkg (or (find-package :modus.mvm) *package*)))
+        (dolist (thunk-name (reverse *init-nil-thunk-names*))
+          (push `(handler-case (,(intern thunk-name pkg)) (t (c) nil)) nil-calls))
+        (let* ((result (mvm-compile-toplevel
+                         `(defun %run-nil-defvar-inits () ,@(nreverse nil-calls) nil)))
+               (info (car result))
+               (ir (cdr result)))
+          (when (and info ir)
+            (setf all-ir (nconc all-ir (list (cons info ir))))))))
 
     ;; Static keywords: %SEED-STATIC-KEYWORDS registers every static keyword
     ;; object of this module in the keyword table.  Its own literals compile

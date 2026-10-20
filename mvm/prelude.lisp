@@ -2935,6 +2935,25 @@
   (error "dynamic binding stack exhausted (~D nested specials) for key ~S"
          (%dynb-capacity (%dynb-block)) key))
 
+;;; ---- UNBOUND, as a value a cell can hold ----
+;;;
+;;; A special that is unbound used to be simply ABSENT from the globals table,
+;;; and that cannot express "unbound again": a LET of an unbound special saved
+;;; absent as NIL and restored that NIL, leaving the variable BOUND after the
+;;; LET, and MAKUNBOUND was a no-op because removing a pair would strand every
+;;; cell memoised in code (the AOT cache, baked runtime cells, per-site
+;;; caches -- all rely on pairs never being replaced).  So unbound is now also
+;;; a VALUE: this immediate (low nibble 5, low byte #xB5 -- not a character,
+;;; whose low byte is #x05, and never a pointer, so no collector touches it).
+;;; A cell holding it is unbound.  Every READ maps it: the compiled AOT reads
+;;; to NIL (exactly what an absent pair already read as), runtime reads to
+;;; UNBOUND-VARIABLE, BOUNDP to NIL.  Only the LET / PROGV SAVE keeps it as
+;;; is, which is what makes the restore put "unbound" back.  The literal is
+;;; repeated at each hot site rather than called; keep them identical.
+(defun %unbound-marker ()
+  "The value a globals cell holds while its special is unbound."
+  (%word->val #x0BADB0B5))
+
 (defun %dynbind (key val)
   "Establish a dynamic binding of the global named by KEY (a name hash).
    A drop-in replacement for the SET-SYMBOL-VALUE that COMPILE-LET-WITH-
@@ -3026,7 +3045,9 @@
         (unless (eql blk 0)
           (let ((a (%dynb-lookup blk key)))
             (unless (eql a 0)
-              (return-from symbol-value (values (mem-ref a :u64))))))))
+              (let ((v (mem-ref a :u64)))
+                (return-from symbol-value
+                  (values (if (eq v (%word->val #x0BADB0B5)) nil v)))))))))
     ;; THE READ IS LOCKED TOO, and not out of caution: PUTHASH grows and
     ;; REHASHES this table, and a reader walking it mid-rehash sees a structure
     ;; that is momentarily neither the old one nor the new one.  Under a single
@@ -3044,7 +3065,7 @@
     ;; Truncate to a single value with (VALUES …), which forces MV-COUNT=1.
       (let ((v (if tbl (gethash key tbl) nil)))
         (%rt-leave)
-        (values v)))))
+        (values (if (eq v (%word->val #x0BADB0B5)) nil v))))))
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash.  O(1) via the globals
@@ -3168,13 +3189,29 @@
   ;; "one load and a branch", and this is the read every reference to a
   ;; special in compiled code becomes.  Measured with the helper called
   ;; unconditionally: PRIN1-TO-STRING +30%.
+  ;; A cell holding the unbound marker reads as an absent one: NIL.
+  (let ((%gv-v (if (eql (mem-ref #x10000DB8 :u32) 0)
+                   (let ((%gv-cl (%gv-cell %gv-key)))
+                     (if %gv-cl (cdr %gv-cl) nil))
+                   (let ((%gv-a (%dynb-value-addr %gv-key)))
+                     (if (eql %gv-a 0)
+                         (let ((%gv-cl (%gv-cell %gv-key)))
+                           (if %gv-cl (cdr %gv-cl) nil))
+                         (mem-ref %gv-a :u64))))))
+    (if (eq %gv-v (%word->val #x0BADB0B5)) nil %gv-v)))
+
+(defun %gv-save (%gv-key)
+  "The LET / PROGV SAVE of a special: %GV-REF, except that unbound -- an
+   absent pair or one holding the unbound marker -- comes back AS the marker,
+   so the restore makes the variable unbound again instead of binding it to
+   NIL."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (let ((%gv-cl (%gv-cell %gv-key)))
-        (if %gv-cl (cdr %gv-cl) nil))
+        (if %gv-cl (cdr %gv-cl) (%word->val #x0BADB0B5)))
       (let ((%gv-a (%dynb-value-addr %gv-key)))
         (if (eql %gv-a 0)
             (let ((%gv-cl (%gv-cell %gv-key)))
-              (if %gv-cl (cdr %gv-cl) nil))
+              (if %gv-cl (cdr %gv-cl) (%word->val #x0BADB0B5)))
             (mem-ref %gv-a :u64)))))
 
 ;;; ---- The global-cell cache (see the block comment above
@@ -3237,7 +3274,7 @@
     ;; below answers as usual.
     (let ((%gv-a (if (eql (mem-ref #x10000DB8 :u32) 0) 0 (%dynb-value-addr %gv-key))))
      (if (not (eql %gv-a 0))
-      (mem-ref %gv-a :u64)
+      (let ((%gv-v (mem-ref %gv-a :u64))) (if (eq %gv-v (%word->val #x0BADB0B5)) nil %gv-v))
      (if (fixnump %gv-cv)
         ;; Never built on a WORKER: its allocations die with it.  Boot builds
         ;; the vector at the first special read, long before threads arm.
@@ -3245,7 +3282,8 @@
                (%gv-ref %gv-key))
         (let ((%gv-hit (%word-aref %gv-cv %gv-slot)))
           (if (if (consp %gv-hit) (eq (car %gv-hit) %gv-key) nil)
-              (cdr %gv-hit)
+              ;; The inline read sends an unbound-marked cell here too.
+              (let ((%gv-v (cdr %gv-hit))) (if (eq %gv-v (%word->val #x0BADB0B5)) nil %gv-v))
               (let ((%gv-cl (%gv-cell %gv-key)))
                 (if (consp %gv-cl)
                     ;; The store is BOUND, not sequenced: a variable-index
@@ -3254,8 +3292,16 @@
                     ;; %HT-VEC-SET does the same.
                     (let ((%gv-st (%word-aset %gv-cv %gv-slot %gv-cl)))
                       %gv-st
-                      (cdr %gv-cl))
+                      (let ((%gv-v (cdr %gv-cl))) (if (eq %gv-v (%word->val #x0BADB0B5)) nil %gv-v)))
                     nil)))))))))
+
+(defun %gv-save-fill (%gv-key %gv-slot)
+  "The AOT LET-special SAVE through cache slot SLOT: %GV-SAVE's contract
+   (unbound comes back as the unbound marker), memoising the cell."
+  (if (eql (mem-ref #x10000DB8 :u32) 0)
+      (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
+        (if %gv-c (cdr %gv-c) (%gv-save %gv-key)))
+      (%gv-save %gv-key)))
 
 (defun %gv-memo-cell (%gv-key %gv-slot)
   "The globals cell for KEY through cache slot SLOT (filling the slot on a
@@ -3300,8 +3346,8 @@
 
 (defun %gv-cell-ref (%gv-cell %gv-key)
   "The LET-special save through a cell baked at a runtime compile: the
-   cell's value on an unarmed image, else %GV-REF (thread bindings first)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0) (cdr %gv-cell) (%gv-ref %gv-key)))
+   cell's value on an unarmed image, else %GV-SAVE (thread bindings first)."
+  (if (eql (mem-ref #x10000DB8 :u32) 0) (cdr %gv-cell) (%gv-save %gv-key)))
 
 (defun %dynbind-cell (%gv-cell %gv-key %gv-val)
   "%DYNBIND through a cell baked at a runtime compile: its unarmed arm is a

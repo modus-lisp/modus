@@ -7,21 +7,16 @@
 ;;;; code that uses it, has no globals cell when that code is compiled; its
 ;;;; reads and LET bindings go through a per-site cache, whose common case is
 ;;;; now inline.  These are the behaviours that path has to keep.
+;;;;
+;;;; Unbound is a value a cell can hold (prelude %UNBOUND-MARKER): MAKUNBOUND
+;;;; writes it, and a LET or PROGV of an unbound special saves it and puts it
+;;;; back.  Before that, such a LET left the variable bound to NIL and
+;;;; MAKUNBOUND did nothing; the checks that say "unbound" test exactly that.
 
 (defvar *fails* 0)
-(defvar *known* 0)
 (defun chk (name got want)
   (format t "~&  ~a ~a~%" (if (equal got want) "ok  " "FAIL") name)
   (unless (equal got want) (format t "      got ~s want ~s~%" got want) (setq *fails* (+ *fails* 1))))
-;;; KNOWN, and older than the inline path (the binary before it fails exactly
-;;; these): a LET of an UNBOUND special saves "absent" as NIL and restores that
-;;; NIL, so the variable is left BOUND after the LET; and a compiled read of a
-;;; special does not see MAKUNBOUND.  Reported, not counted, so that whoever
-;;; fixes it sees them turn to "ok".
-(defun known (name got want)
-  (format t "~&  ~a ~a~%" (if (equal got want) "ok  " "KNOWN") name)
-  (unless (equal got want) (setq *known* (+ *known* 1))))
-
 (defvar *a*)                         ; no value, no cell at compile time
 (defvar *b*)
 (defun read-a () *a*)
@@ -36,11 +31,11 @@
 (chk "unbound: reading signals UNBOUND-VARIABLE"
      (handler-case (progn (read-a) :no-error) (unbound-variable () :unbound)) :unbound)
 (chk "a binding is seen by a callee" (bind-a 42 #'read-a) 42)
-(known "and is gone after it (unbound again)" (boundp '*a*) nil)
-(known "nested bindings read the inner value, then restore" (after-nested) '(20 nil))
+(chk "and is gone after it (unbound again)" (boundp '*a*) nil)
+(chk "nested bindings read the inner value, then restore" (after-nested) '(20 nil))
 (dotimes (i 200) (bind-a i #'read-a))           ; hot: JIT, site filled
 (chk "hot: still right" (bind-a :hot #'read-a) :hot)
-(known "hot: still restored" (boundp '*a*) nil)
+(chk "hot: still restored" (boundp '*a*) nil)
 (setq *a* :global)
 (chk "a global value once set" (read-a) :global)
 (chk "a binding shadows it" (bind-a :bound #'read-a) :bound)
@@ -53,7 +48,7 @@
 (chk "parallel LET of two specials sees the old values" (swap) '(:bee :global))
 (chk "and restores both" (list *a* *b*) '(:global :bee))
 (makunbound '*a*)
-(known "MAKUNBOUND makes it unbound to compiled reads"
+(chk "MAKUNBOUND makes it unbound to compiled reads"
      (handler-case (progn (read-a) :no-error) (unbound-variable () :unbound)) :unbound)
 (chk "and a binding still works after it" (bind-a 7 #'read-a) 7)
 (defvar *later* :late)
@@ -62,11 +57,50 @@
 (chk "restored" (later-ref) :late)
 (let ((th (sb-thread:make-thread (lambda () (bind-a :worker #'read-a)))))
   (chk "a worker's binding is its own" (sb-thread:join-thread th) :worker))
-(known "main is unaffected" (boundp '*a*) nil)
+(chk "main is unaffected" (boundp '*a*) nil)
 (let ((th (sb-thread:make-thread (lambda () (let ((*a* :w)) (sleep 0.2) (read-a))))))
   (sleep 0.05)
-  (known "main does not see a worker's live binding" (boundp '*a*) nil)
+  (chk "main does not see a worker's live binding" (boundp '*a*) nil)
   (chk "the worker reads its own" (sb-thread:join-thread th) :w))
 (chk "and main binds normally after threads are armed" (bind-a :after #'read-a) :after)
-(format t "~&SPECIAL-SITE: ~a failed (~a known, see KNOWN)~%" *fails* *known*)
+;;; Unbound through every other door.
+(defvar *c*)
+(defvar *d* :dee)
+(defun read-c () *c*)
+(defun read-d () *d*)                ; *D* has a cell: a baked read
+(chk "PROGV with too few values leaves the rest unbound"
+     (progv '(*c* *d*) '(1)
+       (list (read-c) (boundp '*d*)
+             (handler-case (progn (read-d) :no-error) (unbound-variable () :unbound))))
+     '(1 nil :unbound))
+(chk "and restores both" (list (boundp '*c*) (read-d)) '(nil :dee))
+(makunbound '*d*)
+(chk "MAKUNBOUND of a baked-cell special: BOUNDP" (boundp '*d*) nil)
+(chk "a baked read signals"
+     (handler-case (progn (read-d) :no-error) (unbound-variable () :unbound)) :unbound)
+(chk "naming the variable"
+     (handler-case (read-d) (unbound-variable (e) (cell-error-name e))) '*d*)
+(defvar *never*)
+(chk "SYMBOL-VALUE signals, as for a never-bound one"
+     (mapcar (lambda (s) (handler-case (progn (symbol-value s) :no-error)
+                           (unbound-variable () :unbound)))
+             '(*d* *never*))
+     '(:unbound :unbound))
+(chk "a LET of it binds, then it is unbound again"
+     (list (let ((*d* 3)) (read-d)) (boundp '*d*)) '(3 nil))
+(defvar *d* :again)
+(chk "DEFVAR initialises it again" (read-d) :again)
+(setq *c* 5)
+(chk "SETQ makes it bound" (list (boundp '*c*) (read-c)) '(t 5))
+(chk "MAKUNBOUND returns the symbol" (makunbound '*c*) '*c*)
+(chk "MAKUNBOUND of an already-unbound special is harmless"
+     (progn (makunbound '*c*) (boundp '*c*)) nil)
+(dotimes (i 200) (let ((*c* i)) (read-c)))      ; hot LET of an unbound special
+(chk "a hot LET of an unbound special leaves it unbound" (boundp '*c*) nil)
+(let ((th (sb-thread:make-thread (lambda () (let ((*c* :w)) (list (boundp '*c*) (read-c)))))))
+  (chk "a worker's binding of an unbound special is bound on the worker"
+       (sb-thread:join-thread th) '(t :w)))
+(chk "and main still sees it unbound" (boundp '*c*) nil)
+(chk "a printer special survives a LET" (let ((*print-base* 16)) (format nil "~a" 255)) "FF")
+(format t "~&SPECIAL-SITE: ~a failed~%" *fails*)
 (sys-exit (if (zerop *fails*) 0 1))

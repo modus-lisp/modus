@@ -1421,14 +1421,17 @@
    probe per read (cl-bench STAK)."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (let ((c (%gv-site-cell hash site)))
-        (if c (cdr c) (%e2-symbol-value-checked hash sym)))
+        (if (and c (not (eq (cdr c) (%word->val #x0BADB0B5))))
+            (cdr c)
+            (%e2-symbol-value-checked hash sym)))
       (%e2-symbol-value-checked hash sym)))
 
 (defun %gv-site-ref (hash site)
-  "The LET-special save (%GV-REF semantics: NIL when absent) through SITE."
+  "The LET-special save (%GV-SAVE semantics: the unbound marker when unbound)
+   through SITE."
   (if (eql (mem-ref #x10000DB8 :u32) 0)
-      (let ((c (%gv-site-cell hash site))) (if c (cdr c) nil))
-      (%gv-ref hash)))
+      (let ((c (%gv-site-cell hash site))) (if c (cdr c) (%word->val #x0BADB0B5)))
+      (%gv-save hash)))
 
 (defun %dynbind-site (hash val site)
   "%DYNBIND through SITE: unarmed with a cell, store in place."
@@ -1457,13 +1460,15 @@
   ;; binding in that thread's storage rather than in the globals table, so a
   ;; read that goes straight to the table reads through the binding it is
   ;; inside.  Same question, same helper, as %GV-REF and the baked-cell read.
-  (unless (eql (mem-ref #x10000DB8 :u32) 0)
-    (let ((a (%dynb-value-addr hash)))
-      (unless (eql a 0)
-        (return-from %e2-symbol-value-checked (mem-ref a :u64)))))
-  (let ((cell (%gv-cell hash)))
-   (if cell
-      (cdr cell)
+  ;; A binding or pair holding the unbound marker (prelude %UNBOUND-MARKER)
+  ;; is unbound: it signals like an absent pair.
+  (let* ((a (if (eql (mem-ref #x10000DB8 :u32) 0) 0 (%dynb-value-addr hash)))
+         (cell (if (eql a 0) (%gv-cell hash) nil))
+         (v (cond ((not (eql a 0)) (mem-ref a :u64))
+                  (cell (cdr cell))
+                  (t (%word->val #x0BADB0B5)))))
+   (if (not (eq v (%word->val #x0BADB0B5)))
+      v
       (let ((c (%make-condition 'unbound-variable (list :name sym))))
         ;; Publish + run handler-bind stack first, then longjmp to the
         ;; nearest handler-case — same sequence as %eval-sym-lookup.
@@ -5459,7 +5464,16 @@
 ;;; Misc Symbol/Special Form Stubs
 ;;; ============================================================
 (defun makunbound (symbol)
-  "Make symbol unbound (stub - no-op)."
+  "Make SYMBOL unbound: its current binding (this thread's own, else the
+   global pair) is set to the unbound marker (prelude %UNBOUND-MARKER).  The
+   pair itself stays, because code memoises pairs; reads, BOUNDP and the LET
+   save all honour the marker.  A symbol with no pair is already unbound."
+  (unless (symbolp symbol)
+    (error 'type-error :datum symbol :expected-type 'symbol))
+  (unless (or (null symbol) (eq symbol t) (keywordp symbol))
+    (let ((key (%sym-global-key symbol)))
+      (when (and key (boundp symbol))
+        (%gv-set key (%unbound-marker)))))
   symbol)
 
 (defun special-operator-p (symbol)

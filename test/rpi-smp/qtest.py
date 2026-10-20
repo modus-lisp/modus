@@ -16,8 +16,14 @@ q = subprocess.Popen(["qemu-system-aarch64", "-M", "raspi3b", "-kernel", img, "-
                      # QTEST_QEMU_LOG: QEMU's own stderr (an emulator abort says why there)
                      stdout=subprocess.DEVNULL,
                      stderr=open(os.environ["QTEST_QEMU_LOG"], "w") if os.environ.get("QTEST_QEMU_LOG") else subprocess.DEVNULL)
-time.sleep(2)
-s = socket.socket(socket.AF_UNIX); s.connect(sock); s.settimeout(1)
+import atexit; atexit.register(q.kill)      # a harness that dies must not leave QEMU holding ports
+# QEMU makes the serial socket when it is up -- seconds on a loaded box, not a fixed 2
+s = socket.socket(socket.AF_UNIX)
+for _ in range(120):
+    try: s.connect(sock); break
+    except (FileNotFoundError, ConnectionRefusedError): time.sleep(0.5)
+else: s.connect(sock)
+s.settimeout(1)
 buf = b""
 def until(pat, to):
     global buf

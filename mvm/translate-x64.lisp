@@ -2271,6 +2271,18 @@
               ;; ISR DEFERS its longjmp while the flag is set — otherwise a
               ;; deadline expiring mid-arm longjmps through a HALF-WRITTEN
               ;; [0x10000180] frame (new RSP, stale IP).
+              ;; RCX, R10 and R11 are V5, V7 and V8: live temporaries the
+              ;; compiler keeps across a TRAP.  This block uses RCX and
+              ;; __handler_push uses R10/R11, so save all three here and
+              ;; restore them AFTER the resume point (below), where both the
+              ;; first return and every longjmp return pass -- the frame's RSP
+              ;; includes the three words, so the pops rebalance either way.
+              ;; A (catch ...) whose value lived in R10 came back as the
+              ;; handler-stack depth: (let ((it (catch 'zz nil))) it) => 1
+              ;; inside a nested LOOP (upstream <.8-10, <=.8-9, >.8, >=.8).
+              (emit-bytes buf #x51)                  ; push rcx
+              (emit-bytes buf #x41 #x52)             ; push r10
+              (emit-bytes buf #x41 #x53)             ; push r11
               (unless *x64-linux-mode*
                 (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 1
                 (emit-u32 buf #x10000D28)
@@ -2340,7 +2352,11 @@
               ;; On longjmp, execution jumps just past this and RAX holds T
               ;; (set by LONGJMP trap), so the value going into VR is T.
               (emit-bytes buf #x48 #xB8)
-              (emit-u32 buf #xDEAD0001) (emit-u32 buf 0)))
+              (emit-u32 buf #xDEAD0001) (emit-u32 buf 0)
+              ;; THE RESUME POINT: restore the temporaries saved above.
+              (emit-bytes buf #x41 #x5B)             ; pop r11
+              (emit-bytes buf #x41 #x5A)             ; pop r10
+              (emit-bytes buf #x59)))                ; pop rcx
              ((= code #x0511)
               ;; LONGJMP: Restore RSP/RBP/IP from [#x10000180], then pop
               ;; the per-fork handler stack so the OUTER handler frame
@@ -6877,6 +6893,10 @@
         (no-ovf (make-label)))
     (emit-label buf pop-label)
     (emit-bytes buf #x50)                            ; push rax
+    ;; R10 / R11 are V7 / V8, and CLEAR-HANDLER runs right after a
+    ;; handler-case body whose value may live in one of them: preserve both.
+    (emit-bytes buf #x41 #x52)                       ; push r10
+    (emit-bytes buf #x41 #x53)                       ; push r11
 
     (progn
       ;; BALANCED-CAP (universal): if the live-overflow word [0x10000D20]
@@ -6940,6 +6960,8 @@
     (emit-u32 buf #x10000180)
     (emit-u32 buf 0)
     (emit-label buf done)
+    (emit-bytes buf #x41 #x5B)                       ; pop r11
+    (emit-bytes buf #x41 #x5A)                       ; pop r10
     (emit-bytes buf #x58)                            ; pop rax
     (emit-bytes buf #xC3))                           ; ret
   ;; WS5 #203: to *ERROR-OUTPUT*, not stdout.  translate-x64 is baked INTO the

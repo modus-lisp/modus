@@ -297,8 +297,9 @@
     "(defmacro return (&rest args)
        (list 'return-from nil (if args (car args) nil)))"
 
-    "(defmacro 1+ (x) (list '+ x 1))"
-    "(defmacro 1- (x) (list '- x 1))"
+    ;; (1+ / 1- are FUNCTIONS -- CL-TYPES defines them and the compiler
+    ;; open-codes them; as runtime macros MACRO-FUNCTION answered true for
+    ;; two standard functions, upstream MACRO-FUNCTION.5.)
 
     "(defmacro locally (&rest body) (cons 'progn body))"
     "(defmacro the (type form) form)"
@@ -440,8 +441,7 @@
     ;; `(setf place (fn place . args))', writing PLACE twice — e.g.
     ;; (maxf (svref v (incf p)) (incf p)) ran (incf p) three times.
     "(defmacro define-modify-macro (name lambda-list fn &rest doc)
-       (list 'defmacro name (list 'place '&rest 'args)
-             (list '%dmm-expand (list 'quote fn) 'place 'args)))"
+       (%dmm-defmacro-form name lambda-list fn))"
 
     ;; DESTRUCTURING-BIND — expand to (apply (lambda PATTERN BODY) EXPR).
     ;; %bind-params handles &optional/&rest/&key/&aux AND dotted tails, so

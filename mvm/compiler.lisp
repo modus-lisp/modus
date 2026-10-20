@@ -868,6 +868,26 @@
           ;; it wasn't before either; correctness of the store wins.
           (values nil place (lambda (v) `(setf ,place ,v)))))))))
 
+(defun %dmm-defmacro-form (name lambda-list fn)
+  "The DEFMACRO a DEFINE-MODIFY-MACRO expands to.  LAMBDA-LIST (only &OPTIONAL
+   and &REST, CLHS) is the macro's own, so &OPTIONAL defaults apply -- it used
+   to be ignored in favour of (place &rest args), and (new-incf i) with
+   (&optional (delta 1)) passed no delta (upstream DEFINE-MODIFY-MACRO.2/.3).
+   The argument FORMS are handed to %DMM-EXPAND in order."
+  (let ((vars nil) (rest-var nil) (mode :req) (cur lambda-list))
+    (loop
+      (when (null cur) (return))
+      (let ((p (car cur)))
+        (cond
+          ((and (symbolp p) (string= (symbol-name p) "&OPTIONAL")) (setq mode :opt))
+          ((and (symbolp p) (string= (symbol-name p) "&REST")) (setq mode :rest))
+          ((eq mode :rest) (setq rest-var p))
+          (t (setq vars (cons (if (consp p) (car p) p) vars)))))
+      (setq cur (cdr cur)))
+    (list 'defmacro name (cons '%dmm-place lambda-list)
+          (list '%dmm-expand (list 'quote fn) '%dmm-place
+                (cons 'list* (append (reverse vars) (list rest-var)))))))
+
 (defun %dmm-expand (fn place args)
   "Expansion for ONE USE of a DEFINE-MODIFY-MACRO-defined macro:
    (NAME place arg…) => FN applied to the place's current value and ARGS,
@@ -3353,7 +3373,18 @@
   "HOST stub: structural hash (collisions only cost a miss — entries are
    EQ-validated).  mvm-eval.lisp overrides with the object's address."
   (sxhash form))
+(defvar *flet-shadowed-macros* nil
+  "Normalized names that an enclosing FLET / LABELS binds as LOCAL FUNCTIONS
+   in the code being compiled.  A local function shadows a macro of the same
+   name (CLHS 3.1.2.1.2.2), so a call to one of these names is not expanded:
+   (macrolet ((%f () :bad)) (flet ((%f () :good)) (%f))) => :GOOD
+   (upstream MACROLET.37, LABELS.51).  An inner MACROLET of the name takes
+   it off the list again.")
+
 (defun macroexpand-1-mvm (form)
+  (if (and *flet-shadowed-macros* (consp form) (symbolp (car form)) (car form)
+           (member (normalize-name (car form)) *flet-shadowed-macros*))
+      (return-from macroexpand-1-mvm (cons form nil)))
   (if (not (consp form))
       (%macroexpand-1-mvm-raw form)
       (let* ((k (progn (%mexp-memo-sync) (%form-key form)))
@@ -4159,7 +4190,7 @@
   ;; DEFPARAMETER → DEFVAR
   (mvm-define-macro "DEFPARAMETER"
     (lambda (form)
-      `(defvar ,(cadr form) ,(caddr form))))
+      `(defvar ,(cadr form) ,(caddr form) ,@(cdddr form))))
 
   ;; PUSH → (setq place (cons val place)).  CLHS: ITEM evaluated first,
   ;; then the place subforms once, then store.  For compound places use
@@ -4254,6 +4285,9 @@
            (cond ,@(mapcar (lambda (clause)
                              (let ((type (car clause))
                                    (body (cdr clause)))
+                               ;; An empty clause body is NIL, not the test's
+                               ;; T (upstream TYPECASE.12, ETYPECASE.11).
+                               (when (null body) (setq body (list nil)))
                                (if (or (eq type t)
                                        (and (symbolp type)
                                             (= (normalize-name type)
@@ -4764,8 +4798,19 @@
                 ;; (p1 p2 ...) form).  Per CLHS 5.1.2.3 each pi is updated
                 ;; with the corresponding return value from FORM; trailing
                 ;; pi without a value get NIL.
+                ;; It returns ALL the stored values, and a place may itself be
+                ;; any place -- a (VALUES ...) or a symbol macro -- so each is
+                ;; set through SETF from a temporary (upstream SETF-VALUES.1/.5,
+                ;; VALUES.21 returned only the primary).
                 ((and (consp place) (name-eq (car place) "VALUES"))
-                 `(multiple-value-setq ,(cdr place) ,value))
+                 (let ((gs (mapcar (lambda (p) (declare (ignore p)) (%mvm-gensym "SV"))
+                                   (cdr place))))
+                   (if (null gs)
+                       `(progn ,value (values))
+                       `(let ,(mapcar (lambda (g) (list g nil)) gs)
+                          (multiple-value-setq ,gs ,value)
+                          ,@(mapcar (lambda (p g) `(setf ,p ,g)) (cdr place) gs)
+                          (values ,@gs)))))
                 ;; (setf (symbol-value SYM) V) → set-symbol-value expects a
                 ;; name-hash, not a symbol object.  Compute the hash from
                 ;; the symbol name at runtime.  Without this, the generic
@@ -5069,10 +5114,7 @@
   ;; exactly once, left to right) — alexandria MAXF.4 / MINF.2.
   (mvm-define-macro "DEFINE-MODIFY-MACRO"
     (lambda (form)
-      (let ((name (cadr form))
-            (fn (cadddr form)))
-        `(defmacro ,name (%dmm-place &rest %dmm-args)
-           (%dmm-expand ',fn %dmm-place %dmm-args)))))
+      (%dmm-defmacro-form (cadr form) (caddr form) (cadddr form))))
 
   ;; (GET-SETF-EXPANSION used to be a stub MACRO here, shadowing the real
   ;; function in cl-eval.lisp: it returned NO temporaries and handed back the
@@ -5255,6 +5297,17 @@
                        (string= (symbol-name (caar body)) "DECLARE"))
             do (push (car body) out) (setq body (cdr body)))
       (nreverse out)))
+  (defun %special-only-declares (body)
+    "BODY's leading SPECIAL declarations, as a list of zero or one DECLARE
+     form.  Only SPECIAL can move onto a binding whose initial value is a
+     placeholder: a TYPE declaration would describe the placeholder."
+    (let ((sp nil))
+      (dolist (d (%leading-declares body))
+        (dolist (spec (cdr d))
+          (when (and (consp spec) (symbolp (car spec))
+                     (string= (symbol-name (car spec)) "SPECIAL"))
+            (push spec sp))))
+      (if sp (list (cons 'declare (nreverse sp))) nil)))
   (defun %strip-leading-declares (body)
     (loop while (and body (consp (car body)) (symbolp (caar body))
                      (string= (symbol-name (caar body)) "DECLARE"))
@@ -5364,7 +5417,8 @@
                          (push spec sp))))
                    (if sp (list (cons 'declare (nreverse sp))) nil))
                (loop
-                 (when (null ,tmp) (return ,result))
+                 ;; CLHS: the result form sees VAR bound to NIL.
+                 (when (null ,tmp) (setq ,var nil) (return ,result))
                  (setq ,var (car ,tmp))
                  (tagbody ,@(%strip-leading-declares body))
                  (setq ,tmp (cdr ,tmp)))))))))
@@ -5446,10 +5500,15 @@
            (let ((,syms nil))
              (%do-symbols-fn (lambda (,var) (setq ,syms (cons ,var ,syms))) ,pkg)
              (let ((,cur ,syms))
+               ;; The result form sees VAR bound to NIL and the body's
+               ;; SPECIAL declarations (CLHS; upstream DO-SYMBOLS.17,
+               ;; DO-ALL-SYMBOLS.4/.11, DO-EXTERNAL-SYMBOLS.17).
                (loop
-                 (when (null ,cur) (return ,result))
+                 (when (null ,cur)
+                   (return (let ((,var nil)) ,@(%special-only-declares body) ,result)))
                  (let ((,var (car ,cur)))
-                   (tagbody ,@body))
+                   ,@(%special-only-declares body)
+                   (tagbody ,@(%strip-leading-declares body)))
                  (setq ,cur (cdr ,cur)))))))))
 
   ;; DO-EXTERNAL-SYMBOLS — same shape as DO-SYMBOLS but iterates only
@@ -5468,10 +5527,15 @@
              (%do-external-symbols-fn
                (lambda (,var) (setq ,syms (cons ,var ,syms))) ,pkg)
              (let ((,cur ,syms))
+               ;; The result form sees VAR bound to NIL and the body's
+               ;; SPECIAL declarations (CLHS; upstream DO-SYMBOLS.17,
+               ;; DO-ALL-SYMBOLS.4/.11, DO-EXTERNAL-SYMBOLS.17).
                (loop
-                 (when (null ,cur) (return ,result))
+                 (when (null ,cur)
+                   (return (let ((,var nil)) ,@(%special-only-declares body) ,result)))
                  (let ((,var (car ,cur)))
-                   (tagbody ,@body))
+                   ,@(%special-only-declares body)
+                   (tagbody ,@(%strip-leading-declares body)))
                  (setq ,cur (cdr ,cur)))))))))
 
   ;; DO-ALL-SYMBOLS — (do-all-symbols (var [result]) body...).  Iterates
@@ -5488,10 +5552,15 @@
            (let ((,syms nil))
              (%do-all-symbols-fn (lambda (,var) (setq ,syms (cons ,var ,syms))))
              (let ((,cur ,syms))
+               ;; The result form sees VAR bound to NIL and the body's
+               ;; SPECIAL declarations (CLHS; upstream DO-SYMBOLS.17,
+               ;; DO-ALL-SYMBOLS.4/.11, DO-EXTERNAL-SYMBOLS.17).
                (loop
-                 (when (null ,cur) (return ,result))
+                 (when (null ,cur)
+                   (return (let ((,var nil)) ,@(%special-only-declares body) ,result)))
                  (let ((,var (car ,cur)))
-                   (tagbody ,@body))
+                   ,@(%special-only-declares body)
+                   (tagbody ,@(%strip-leading-declares body)))
                  (setq ,cur (cdr ,cur)))))))))
 
   ;; WITH-PACKAGE-ITERATOR — (with-package-iterator (MNAME PKG-OR-PKGS . TYPES)
@@ -7717,6 +7786,10 @@
            ;; corruption that then killed the numbers chapter).
            (compile-form `(%gv-set-def ,(%global-var-bind-key var-name) ,value-form)
                          env dest))
+         ;; The documentation string (upstream DEFVAR.4, DEFPARAMETER.4).
+         (when (and (consp (cdddr form)) (stringp (cadddr form)))
+           (compile-form `(set-documentation ',var-name 'variable ,(cadddr form))
+                         env dest))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
       ((= op-name 445617652)  ; FLET
@@ -7886,8 +7959,13 @@
                              mparams mbody (%env-visible-symbol-macros env))))
              (push (cons mname old) saved-macros)
              (mvm-define-macro mname expander)))
-         ;; Compile body
-         (compile-progn body env dest)
+         ;; Compile body -- a MACROLET of a name an enclosing FLET bound
+         ;; shadows that local function again.
+         (if *flet-shadowed-macros*
+             (%compile-shadowing-body
+              (mapcar (lambda (mdef) (normalize-name (car mdef))) macro-defs)
+              nil body env dest)
+             (compile-progn body env dest))
          ;; Restore previous macro bindings
          (%mexp-memo-invalidate)
          (dolist (saved saved-macros)
@@ -8808,7 +8886,10 @@
                        (setq *catch-tag* nil)
                        (setq *catch-value* nil)
                        (setq *catch-values* nil)
-                       (if %c-vs (values-list %c-vs) %c-v))
+                       ;; *CATCH-VALUES* is (:%VALS . values) so a THROW of
+                       ;; NO values ((throw 'tag (values))) returns none
+                       ;; rather than NIL (upstream CATCH.7).
+                       (if %c-vs (values-list (cdr %c-vs)) %c-v))
                      ;; Not our tag.  A throw in flight (direct longjmp, no
                      ;; condition built — THROW marks it with the keyword
                      ;; below, since *CATCH-ACTIVE* alone can be stale: probe
@@ -8833,7 +8914,7 @@
                   (%t-vals (multiple-value-list ,val-form)))
              (setq *catch-tag* %t-tag)
              (setq *catch-value* (car %t-vals))
-             (setq *catch-values* %t-vals)
+             (setq *catch-values* (cons :%vals %t-vals))
              (setq *catch-active* t)
              ;; Same fast path as %NLX-THROW: with a handler-case frame armed,
              ;; longjmp straight to it instead of building a SIMPLE-ERROR and
@@ -8874,7 +8955,7 @@
                   (%t-vals (multiple-value-list ,val-form)))
              (setq *catch-tag* %t-tag)
              (setq *catch-value* (car %t-vals))
-             (setq *catch-values* %t-vals)
+             (setq *catch-values* (cons :%vals %t-vals))
              (setq *catch-active* t)
              (if (%error-handler-active-p)
                  (%hc-longjmp)
@@ -9438,32 +9519,29 @@
     ;; result onto the no-error vars and run the clause's body.  If body
     ;; signals, MVB never reaches and the condition propagates to the
     ;; outer handler-case where the error-clauses dispatch as usual.
+    ;; :NO-ERROR runs OUTSIDE the clauses' protection, on ALL the form's
+    ;; values (zero included), and returns ITS values: an error in the
+    ;; :no-error body goes to the enclosing handler (upstream
+    ;; HANDLER-CASE.21/.22/.25/.26 -- the old rewrite ran it inside this
+    ;; handler-case through MULTIPLE-VALUE-BIND, which leaked the form's extra
+    ;; values and let the inner clauses catch the clause's own error).
     (when no-error-clause
-      (let ((var-list (cadr no-error-clause))
-            (ne-body (cddr no-error-clause)))
-        ;; CLHS: the :no-error clause takes an ORDINARY lambda list.
-        ;; compile-multiple-value-bind only understands plain vars — an
-        ;; &AUX section ((z &aux (y x)) — handler-case.29) reached it as
-        ;; a "variable" and errored the host compile ('(Y X) is not of
-        ;; type SYMBOL'), SKIPping the whole chunk defun.  Split a
-        ;; trailing &AUX section off into a LET* around the clause body.
-        (let ((mvb-vars nil)
-              (aux-bindings nil)
-              (cur var-list))
-          (loop
-            (when (null cur) (return))
-            (if (and (symbolp (car cur))
-                     (string= (symbol-name (car cur)) "&AUX"))
-                (progn (setf aux-bindings (cdr cur))
-                       (return))
-                (progn (push (car cur) mvb-vars)
-                       (setf cur (cdr cur)))))
-          (setf mvb-vars (nreverse mvb-vars))
-          (setf body-form
-                (if aux-bindings
-                    `(multiple-value-bind ,mvb-vars ,body-form
-                       (let* ,aux-bindings ,@ne-body))
-                    `(multiple-value-bind ,var-list ,body-form ,@ne-body))))))
+      (let ((ok (%mvm-gensym "HCOK"))
+            (vals (%mvm-gensym "HCVALS"))
+            (res (%mvm-gensym "HCRES")))
+        (return-from compile-handler-case
+          (compile-form
+           `(let ((,ok nil) (,vals nil))
+              (let ((,res (multiple-value-list
+                           (handler-case
+                               (progn (setq ,vals (multiple-value-list ,body-form))
+                                      (setq ,ok t)
+                                      nil)
+                             ,@other-clauses))))
+                (if ,ok
+                    (apply (lambda ,(cadr no-error-clause) ,@(cddr no-error-clause)) ,vals)
+                    (values-list ,res))))
+           env dest))))
     (setf clauses other-clauses))
   ;; Find the first non-warning handler clause
   ;; Clauses: ((type (var) body...) ...)
@@ -14196,8 +14274,26 @@
         (%fn-register-info info)
         (push info *function-table*)
         (push result *pending-flet-ir*)))
-    ;; Compile outer body with the flet env (has name mappings)
-    (compile-progn (strip-declares body) flet-env dest)))
+    ;; Compile outer body with the flet env (has name mappings).  The local
+    ;; names shadow macros of the same name inside it.
+    (%compile-shadowing-body
+     (let ((acc nil))
+       (dolist (def defs acc)
+         (when (and (consp def) (symbolp (car def)) (car def))
+           (push (normalize-name (car def)) acc))))
+     t (strip-declares body) flet-env dest)))
+
+(defun %compile-shadowing-body (names add-p body env dest)
+  "Compile BODY (a progn body) with NAMES added to (ADD-P) or removed from
+   *FLET-SHADOWED-MACROS*.  A one-binding helper: the special is bound in its
+   own frame, which the self-hosted build needs (see
+   reference_selfhost_nested_special_let)."
+  (let ((*flet-shadowed-macros*
+          (if add-p
+              (append names *flet-shadowed-macros*)
+              (remove-if (lambda (n) (member n names)) *flet-shadowed-macros*))))
+    (declare (special *flet-shadowed-macros*))
+    (compile-progn body env dest)))
 
 ;;; ============================================================
 ;;; When / Unless
@@ -17876,6 +17972,11 @@
        the form.  No stale count can leak in.
    (b) otherwise → reset the count to 1 BEFORE the form (so a form that
        stores nothing still reads as single-valued) and read it after."
+  ;; No variables: FORM for effect, then the body's values -- NIL when there
+  ;; is no body (upstream MULTIPLE-VALUE-BIND.11/.13 returned FORM's value).
+  (when (null vars)
+    (return-from compile-multiple-value-bind
+      (compile-form (list* 'progn form (or (strip-declares body) (list nil))) env dest)))
   ;; An inlined function body — a LET whose variables are all %INL- gensyms
   ;; — whose last form is (values a b …) of matching arity: bind the values
   ;; directly instead of going through the MV count / value slots.
@@ -18089,6 +18190,8 @@
           ;; THE and LOCALLY pass their body's values through.
           ((string= (symbol-name op) "THE") (tail-form-is-values-p (cddr form)))
           ((string= (symbol-name op) "LOCALLY") (tail-form-is-values-p (cdr form)))
+          ((member (symbol-name op) '("MACROLET" "SYMBOL-MACROLET") :test #'string=)
+           (tail-form-is-values-p (cddr form)))
           ((member (symbol-name op)
                    '("MULTIPLE-VALUE-LIST"
                      "+" "-" "*" "/" "=" "<" ">" "<=" ">="
@@ -18276,14 +18379,19 @@
   (let ((pri (%mvm-gensym "MVPRI"))
         (cnt (%mvm-gensym "MVC"))
         (res (%mvm-gensym "MVR"))
+        (out (%mvm-gensym "MVOUT"))
         (i   (%mvm-gensym "MVI")))
     (compile-form
      `(progn
         ;; Reset count to 1 so single-valued expressions produce (list val).
         (setf (mem-ref ,+mv-count-addr+ :u64) 1)
         ;; Evaluate form FIRST (it sets the MV count + secondary slots), capturing
-        ;; the primary value before reading the count.
-        (let ((,pri ,form))
+        ;; the primary value before reading the count.  The list is ONE value:
+        ;; the count is put back to 1 after it is built, or FORM's count
+        ;; leaked out of a toplevel form -- (macrolet (..) (multiple-value-list
+        ;; (%m (values 1 2 3)))) returned (1 2 3), 2, 3 (upstream
+        ;; MULTIPLE-VALUE-LIST.9).
+        (let ((,out (let ((,pri ,form))
           (let ((,cnt (mem-ref ,+mv-count-addr+ :u64)))
             (if (zerop ,cnt)
                 nil
@@ -18295,7 +18403,9 @@
                       (loop
                         (when (< ,i 0) (return (cons ,pri ,res)))
                         (setq ,res (cons (mem-ref (+ ,+mv-values-addr+ (* ,i 8)) :u64) ,res))
-                        (setq ,i (- ,i 1)))))))))
+                        (setq ,i (- ,i 1))))))))))
+          (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+          ,out))
      env dest)))
 
 (defun compile-unwind-protect (protected-form cleanup-forms env dest)

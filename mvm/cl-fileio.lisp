@@ -520,10 +520,12 @@
     ;; direction-based defaults apply.
     (unless if-does-not-exist-set
       (cond
+        ;; :PROBE first: it opens nothing, so :OVERWRITE / :APPEND do not
+        ;; make a missing file an error there (upstream OPEN.PROBE.17/18).
+        ((eq direction :probe)  (setq if-does-not-exist nil))
         ((or (eq if-exists :overwrite) (eq if-exists :append))
          (setq if-does-not-exist :error))
         ((eq direction :input)  (setq if-does-not-exist :error))
-        ((eq direction :probe)  (setq if-does-not-exist nil))
         ((eq direction :output) (setq if-does-not-exist :create))
         ((eq direction :io)     (setq if-does-not-exist :create))
         (t (setq if-does-not-exist nil))))
@@ -778,11 +780,17 @@
 (defun %utf8-len-of-code (code)
   (cond ((< code #x80) 1) ((< code #x800) 2) ((< code #x10000) 3) (t 4)))
 
+(defun %signal-eof (stream)
+  "Signal END-OF-FILE on STREAM -- the condition CLHS names, with its
+   STREAM-ERROR-STREAM, not a SIMPLE-ERROR saying so (upstream
+   STREAM-ERROR-STREAM.1, LISTEN.7)."
+  (error 'end-of-file :stream stream))
+
 (defun %fs-read-char (stream eof-error-p eof-value)
   "Read one character from a file stream: one UTF-8 sequence."
   (let ((b0 (%fs-read-byte-code stream)))
     (cond
-      ((< b0 0) (if eof-error-p (error "end of file") eof-value))
+      ((< b0 0) (if eof-error-p (%signal-eof stream) eof-value))
       ((< b0 #x80) (code-char b0))
       (t
        (let ((n (cond ((= (logand b0 #xE0) #xC0) 1)
@@ -950,7 +958,7 @@
               (when (eq b :eof)
                 ;; A partial trailing element is end of file too.
                 (return-from %fs-read-element
-                  (if eof-error-p (error "end of file") eof-value)))
+                  (if eof-error-p (%signal-eof stream) eof-value)))
               (setq v (+ v (ash b sh)))
               (setq sh (+ sh 8))
               (setq i (+ i 1))))
@@ -989,7 +997,7 @@
   "Read one byte directly from a type-9 file stream's buffer."
   (let ((fd (%fs-fd stream)))
     (if (< fd 0)
-        (if eof-error-p (error "end of file") eof-value)
+        (if eof-error-p (%signal-eof stream) eof-value)
         (let ((bpos (%fs-bpos stream))
               (blen (%fs-blen stream)))
           (if (< bpos blen)
@@ -1001,7 +1009,7 @@
                 b)
               (let ((n (%sys-read-into-buf fd (%fs-buf stream) 4096)))
                 (if (<= n 0)
-                    (if eof-error-p (error "end of file") eof-value)
+                    (if eof-error-p (%signal-eof stream) eof-value)
                     (progn
                       (%fs-set-bpos stream 0)
                       (%fs-set-blen stream n)
@@ -1078,11 +1086,13 @@
                  (error "file-length: stream is closed")
                  ;; In ELEMENTS (CLHS), not bytes.
                  (values (floor (%sys-fstat-size fd) (%fs-elt-bytes stream))))))
-          ((= ty 5) ;; broadcast: use first file stream
+          ;; broadcast (CLHS): the LAST component, or 0 when there is none
+          ;; (upstream MAKE-BROADCAST-STREAM.5, BROADCAST-STREAM-STREAMS.4).
+          ((= ty 5)
            (let ((streams (%stream-data stream)))
              (if streams
-                 (file-length (car streams))
-                 (error "file-length: no streams"))))
+                 (file-length (car (last streams)))
+                 0)))
           ;; Synonym: delegate
           ((= ty 7)
            (file-length (symbol-value (%stream-data stream))))
@@ -1099,6 +1109,12 @@
       nil
       (let ((ty (%stream-type stream)))
         (cond
+          ;; broadcast (CLHS): the LAST component, or 0 when there is none.
+          ((= ty 5)
+           (let ((streams (%stream-data stream)))
+             (if streams
+                 (apply #'file-position (car (last streams)) args)
+                 (if args nil 0))))
           ((= ty 9)
            (let ((fd (%fs-fd stream)))
              (if (< fd 0)
@@ -2166,7 +2182,7 @@
                (let ((data (%stream-data s)))
                  (let ((b (read-byte (car data) nil :eof-byte-sentinel-7770003)))
                    (if (eq b :eof-byte-sentinel-7770003)
-                       (if eof-error-p (error "end of file") eof-value)
+                       (if eof-error-p (%signal-eof stream) eof-value)
                        (progn (write-byte b (cdr data)) b)))))
               ;; Two-way: read from input side
               ((= ty 4)
@@ -2177,7 +2193,7 @@
                  (let ((streams (car data)))
                    (loop
                      (when (null streams)
-                       (return (if eof-error-p (error "end of file") eof-value)))
+                       (return (if eof-error-p (%signal-eof stream) eof-value)))
                      (let ((b (read-byte (car streams) nil :eof-byte-sentinel-7770003)))
                        (if (eq b :eof-byte-sentinel-7770003)
                            (progn
@@ -2187,7 +2203,7 @@
               ;; Synonym: delegate
               ((= ty 7)
                (read-byte (symbol-value (%stream-data s)) eof-error-p eof-value))
-              (t (if eof-error-p (error "end of file") eof-value))))))))
+              (t (if eof-error-p (%signal-eof stream) eof-value))))))))
 
 ;;; --- write-byte (extended for file streams) ---
 (defun write-byte (byte stream)
@@ -2252,7 +2268,10 @@
 
 ;;; file-string-length: for file streams, just return string length
 (defun file-string-length (s str)
-  (if (stringp str) (array-length str) 1))
+  ;; An empty broadcast stream answers 1 (CLHS MAKE-BROADCAST-STREAM).
+  (if (and (streamp s) (= (%stream-type s) 5) (null (%stream-data s)))
+      1
+      (if (stringp str) (length str) 1)))
 
 ;;; --- Stream type dispatchers extended for file streams ---
 
@@ -2309,7 +2328,7 @@
   "Read one character from a resolved stream."
   (if (not (streamp s))
       ;; Not a stream - signal error or return eof-value
-      (if eof-error-p (error "end of file") eof-value)
+      (if eof-error-p (%signal-eof s) eof-value)
       (let ((ty (%stream-type s)))
         (cond
           ;; String-input stream
@@ -2327,7 +2346,7 @@
                      (let ((pos (car pos-cell)))
                        (if (>= pos (length str))
                            ;; EOF
-                           (if eof-error-p (error "end of file") eof-value)
+                           (if eof-error-p (%signal-eof s) eof-value)
                            ;; %prim-aref: raw char-CODE (public AREF lifts to a
                            ;; CHARACTER since e159986; code-char must encode the
                            ;; raw code exactly once — feeding it a character
@@ -2367,7 +2386,7 @@
                    (let ((streams (car data)))
                      (loop
                        (when (null streams)
-                         (return (if eof-error-p (error "end of file") eof-value)))
+                         (return (if eof-error-p (%signal-eof s) eof-value)))
                        (let ((ch (%read-char-from-stream (car streams) nil :eof-sentinel-7770002)))
                          (if (eq ch :eof-sentinel-7770002)
                              (progn

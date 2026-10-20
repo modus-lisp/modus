@@ -54,8 +54,11 @@
              (if (streamp target) (input-stream-p target) nil)))
           ((= ty 8) t)   ;; serial-io (both)
           ((= ty 9)      ;; file stream: input or io direction
+           ;; The direction is stored as 0 / 1 / 2 (in / out / io); this
+           ;; compared it with :OUTPUT and so called every file stream an
+           ;; input stream (upstream INPUT-STREAM-P.4).
            (let ((d (%fs-dir s)))
-             (if (eq d :output) nil t)))
+             (if (or (eql d 1) (eq d :output)) nil t)))
           (t nil)))
       nil))
 
@@ -76,7 +79,7 @@
           ((= ty 8) t)   ;; serial-io (both)
           ((= ty 9)      ;; file stream: output or io direction
            (let ((d (%fs-dir s)))
-             (if (eq d :input) nil t)))
+             (if (or (eql d 0) (eq d :input)) nil t)))
           (t nil)))
       nil))
 

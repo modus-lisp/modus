@@ -5560,6 +5560,21 @@
           (i start)
           (in (%resolve-input-stream stream))
           (char-stream (%input-stream-reads-chars-p stream)))
+      ;; A LIST: fill its cells in place (upstream READ-SEQUENCE.LIST.*;
+      ;; ASET on a cons signalled "0 is not of type (INTEGER 0 -1)").
+      (when (listp seq)
+        (let ((cell (nthcdr start seq)))
+          (loop
+            (when (or (>= i actual-end) (null cell)) (return-from read-sequence i))
+            (let ((x (if char-stream
+                         (%read-char-from-stream in nil :eof-sentinel-7770002)
+                         (if (streamp stream)
+                             (%fs-read-byte stream nil :eof-sentinel-7770002)
+                             :eof-sentinel-7770002))))
+              (when (eq x :eof-sentinel-7770002) (return-from read-sequence i))
+              (rplaca cell x))
+            (setq cell (cdr cell))
+            (setq i (+ i 1)))))
       ;; bytes from a plain binary file into a packed byte vector: in bulk
       (when (and (not char-stream) (streamp in) (= (%stream-type in) 9)
                  (%u8-bare-p seq)
@@ -5605,7 +5620,7 @@
       ;; (WRITE-SEQUENCE.BV.1: "end of file" in some gate runs, not others).
       (loop
         (when (>= i actual-end) (return seq))
-        (let ((e (aref seq i)))
+        (let ((e (if (listp seq) (nth i seq) (aref seq i))))
           (if (or (stringp seq) (characterp e))
               (%write-char-to-stream (%ensure-char-code e) s)
               (if (streamp s)

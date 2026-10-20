@@ -2007,7 +2007,9 @@
 (defun %constant-var-p (sym)
   (and *constant-var-names*
        (let ((k (%constant-var-key sym)))
-         (and k (gethash k *constant-var-names*)))))
+         ;; One value: GETHASH's second leaked through CONSTANTP
+         ;; (upstream DEFCONSTANT.2: (constantp 'x) => T, T).
+         (and k (if (gethash k *constant-var-names*) t nil)))))
 
 
 

@@ -1168,6 +1168,18 @@
 ;;; image is built for (the compiler inlines the primitives at every call
 ;;; site, so there is no other defun to call).  Never call these from compiled
 ;;; code — write the primitive itself.
+(defun %runtime-fn-name-symbol (name)
+  "The symbol a runtime function-table key NAME (PKG::SYM, PKG:SYM or SYM)
+   names, when it can be found; else NAME itself."
+  (if (not (stringp name))
+      name
+      (let* ((p2 (search "::" name))
+             (p1 (and (not p2) (position (code-char 58) name)))
+             (pkg-name (cond (p2 (subseq name 0 p2)) (p1 (subseq name 0 p1)) (t nil)))
+             (sym-name (cond (p2 (subseq name (+ p2 2))) (p1 (subseq name (+ p1 1))) (t name)))
+             (pkg (if pkg-name (find-package pkg-name) *package*)))
+        (or (and pkg (find-symbol sym-name pkg)) name))))
+
 (defun %mmap-exec-page-1 (n) (%mmap-exec-page n))
 (defun %jit-call-1 (entry) (%jit-call entry))
 (defun %jit-icache-flush-1 (addr len) (%jit-icache-flush addr len))
@@ -2941,7 +2953,11 @@
                        ;; DO-instruction's outer handler-case: routed to an
                        ;; in-module handler frame when one is active, else
                        ;; re-signalled out of mvm-interpret to the caller.
-                       (error (quote undefined-function) :name name))
+                       ;; CELL-ERROR-NAME is the SYMBOL (upstream
+                       ;; CELL-ERROR-NAME.2): NAME is the runtime-table key,
+                       ;; "PKG::SYM" or a bare name.
+                       (error (quote undefined-function)
+                              :name (%runtime-fn-name-symbol name)))
                    (setf pc npc))
                  ;; In-module call: push return frame, jump to the bytecode.
                  ;; SAVE VFP (the caller's frame array) in the frame: the

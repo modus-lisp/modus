@@ -177,8 +177,21 @@
                         (gethash name *symbol-function-table*))
                    (and *native-sym-function-table*
                         (gethash hash *native-sym-function-table*)))))
-      (if fn
-          fn
+      (cond
+        (fn fn)
+        ;; CLHS SYMBOL-FUNCTION: a macro or special operator name is fbound,
+        ;; and its function is implementation-dependent but must not be an
+        ;; error -- (symbol-function 'and) signalled UNDEFINED-FUNCTION,
+        ;; which FBOUNDP calls true (upstream FUNCTION.4, FUNCTIONP.4).
+        ;; As SBCL: a function that signals UNDEFINED-FUNCTION when called, so
+        ;; (funcall 'and) -- which reaches here through %FUNCALL-n -- still
+        ;; fails the way CLHS requires.
+        ((and (> (length name) 0)
+              (or (macro-function sym) (special-operator-p sym)))
+         (lambda (&rest args)
+           (declare (ignore args))
+           (error 'undefined-function :name sym)))
+        (t
           (let ((c (%make-condition 'undefined-function (list :name sym))))
             ;; PUBLISH the condition before unwinding — same sequence as the
             ;; unbound-variable path above.  The old code longjmp'd with C
@@ -194,7 +207,7 @@
                   nil
                   (if (%error-handler-active-p)
                       (%hc-longjmp)
-                      (progn (error "undefined function") nil)))))))))
+                      (progn (error "undefined function") nil))))))))))
 
 (defun set-symbol-function (sym fn)
   "Set the function cell of SYM to FN.  Updates both the name-keyed
@@ -394,7 +407,10 @@
                     ;; every entry.  DEFMACRO is already covered; add
                     ;; the rest so REMOVE-IF #'MACRO-FUNCTION → NIL.
                     "LAMBDA" "DEFINE-COMPILER-MACRO" "DEFINE-SYMBOL-MACRO"
-                    "DECLAIM"))
+                    "DECLAIM"
+                    ;; upstream MACRO-FUNCTION.1-3: CL macros the compiler
+                    ;; implements directly with no table entry.
+                    "FORMATTER" "STEP" "WITH-OPEN-STREAM" "WITH-SIMPLE-RESTART"))
       (puthash name ht t))
     (setq *%compiler-macro-hashes* ht)))
 
@@ -764,7 +780,10 @@
                      "SIXTH" "SEVENTH" "EIGHTH" "NINTH" "TENTH"
                      "REST" "CADDR" "CADDDR" "CDDDR"
                      "ABS" "MIN" "MAX" "MINUSP" "PLUSP" "/=" "LOGNOT"
-                     "LDB" "MAPHASH" "MAKE-INSTANCE" "GET-SETF-EXPANSION"))
+                     "LDB" "MAPHASH" "MAKE-INSTANCE" "GET-SETF-EXPANSION"
+                     ;; upstream MACRO-FUNCTION.5
+                     "1+" "1-" "CHAR/=" "CHAR<" "CHAR<=" "CHAR=" "CHAR>"
+                     "CHAR>=" "FLOOR"))
           (puthash (compute-name-hash n) ht t))
         (setq *%std-fn-not-macro-hashes* ht)
         ht)))

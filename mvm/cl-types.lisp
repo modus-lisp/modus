@@ -5360,7 +5360,12 @@
          ((eq tn 'standard-object) (or (%clos-instance-p obj)
                                        (%clos-class-p obj)))
          ((eq tn 'structure-object) (%struct-instance-p obj))
-         ((eq tn 'class) (%clos-class-p obj))
+         ;; A class PROXY (FIND-CLASS of a DEFSTRUCT or a built-in type) is
+         ;; a class too, and its metaclass is STRUCTURE-CLASS or
+         ;; BUILT-IN-CLASS -- the same answer CLASS-OF gives for it.  These
+         ;; were NIL, so (typep (find-class 'my-struct) 'structure-class)
+         ;; failed for every struct (upstream STRUCT-TEST-*/14).
+         ((eq tn 'class) (or (%clos-class-p obj) (%class-proxy-p obj)))
          ;; STANDARD-CLASS only for user (defclass) classes — those whose
          ;; CPL (slot 4) includes STANDARD-OBJECT.  Built-in classes that
          ;; happen to be registered as %clos-class arrays (e.g. a proxy
@@ -5371,8 +5376,11 @@
          ((eq tn 'standard-class)
           (and (%clos-class-p obj)
                (and (member 'standard-object (aref obj 4)) t)))
-         ((eq tn 'built-in-class) nil)
-         ((eq tn 'structure-class) nil)
+         ((eq tn 'built-in-class) (%builtin-class-proxy-p obj))
+         ((eq tn 'structure-class)
+          (and (%class-proxy-p obj)
+               (%find-struct-type (%class-proxy-name obj))
+               t))
          ((eq tn 'metaobject) (%clos-class-p obj))
          ((eq tn 'restart) (%active-restart-p obj))
          (t (cond

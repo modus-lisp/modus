@@ -6277,6 +6277,7 @@
                               default-initarg-pairs))
                   (setq cur (cddr cur))))))
           `(progn
+             (%defclass-name-check ',class-name)
              (%defclass ',class-name ',slot-names ',supers)
              (%register-clos-slot-info ',class-name
                                        (list ,@(nreverse initarg-pairs))
@@ -7620,7 +7621,7 @@
                       (when (and (consp %opt) (symbolp (car %opt))
                                  (string-equal (symbol-name (car %opt)) "TYPE"))
                         (setq %has-type t)))))
-         (compile-form `(error "DEFSTRUCT :TYPE option is not supported") env dest)
+         (compile-form (cons 'progn (%ds-typed-expansion form)) env dest)
          (return-from compile-compound))
        ;; Queue the returned IR like the nested-DEFUN path above —
        ;; mvm-compile-toplevel returns (:multi-result (info . ir) …) for
@@ -10768,6 +10769,255 @@
   (intern name (if *mvm-eval-runtime-p*
                    *package*
                    (or (find-package "MODUS.MVM") *package*))))
+
+;;; ------------------------------------------------------------
+;;; DEFSTRUCT (:TYPE LIST) / (:TYPE VECTOR) / (:TYPE (VECTOR elt)) -- CLHS 3.4.6
+;;; ------------------------------------------------------------
+;;; A typed structure is not a new type at all: it is a LIST or VECTOR laid
+;;; out by the DEFSTRUCT, plus ordinary functions over it -- constructor(s),
+;;; accessors with (SETF acc) writers, a copier, and a predicate only when
+;;; :NAMED.  So it expands into DEFUNs before the native struct path ever
+;;; sees it, and registers NO struct type and no class.  Layout (CLHS): the
+;;; :INCLUDEd parent's whole layout, then :INITIAL-OFFSET unused cells, then
+;;; the name when :NAMED, then this structure's own slots.  It used to be
+;;; refused outright ("DEFSTRUCT :TYPE option is not supported"), which cost
+;;; upstream STRUCT-TEST-37..56/69/70 -- 157 tests.
+;;;
+;;; Written with LIST/APPEND rather than nested backquotes: this file is
+;;; compiled into the image too, and the in-image compiler cannot compile a
+;;; backquote nested directly inside a comma (see the CHECKED-STORE note in
+;;; the native DEFSTRUCT path).
+
+(defvar *typed-struct-layouts* nil
+  "Alist NAME -> (REP ELT TEMPLATE).  TEMPLATE lists the cells, each :PAD,
+   (:NAME sym) or (:SLOT sym init read-only).  Kept so a typed
+   (:INCLUDE parent) can inherit the parent's layout.")
+
+(defun %ds-typed-find (name)
+  (let ((cur *typed-struct-layouts*))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (car (car cur)) name) (return (cdr (car cur))))
+      (setq cur (cdr cur)))))
+
+(defun %ds-type-option (options)
+  "The (:TYPE spec) option's SPEC, or NIL."
+  (let ((found nil))
+    (dolist (opt options found)
+      (when (and (null found) (consp opt) (symbolp (car opt))
+                 (name-eq (car opt) "TYPE") (consp (cdr opt)))
+        (setq found (cadr opt))))))
+
+(defun %ds-option (options key)
+  "The option list (KEY . args), :BARE when KEY appears alone, or NIL."
+  (let ((found nil))
+    (dolist (opt options found)
+      (unless found
+        (cond ((and (consp opt) (symbolp (car opt)) (name-eq (car opt) key))
+               (setq found opt))
+              ((and (symbolp opt) (name-eq opt key))
+               (setq found :bare)))))))
+
+(defun %ds-keyword (sym)
+  (intern (symbol-name sym) (find-package "KEYWORD")))
+
+(defun %ds-list-named-p (x pos name)
+  "True when X is a list whose element POS is NAME.  Walks only conses, so
+   a dotted or short list is simply not one."
+  (let ((c x) (i 0))
+    (loop
+      (when (not (consp c)) (return nil))
+      (when (= i pos) (return (eq (car c) name)))
+      (setq c (cdr c))
+      (setq i (+ i 1)))))
+
+(defun %ds-slot-var (sym)
+  ;; A fresh variable per slot: a slot may be named by a constant
+  ;; (ARRAY-RANK-LIMIT) or by a symbol of another package, neither of which
+  ;; can simply be bound.
+  (%defstruct-intern (concatenate 'string "%DS-" (symbol-name sym))))
+
+(defun %ds-typed-ctor (cname arglist rep elt total template slot-cells)
+  "A DEFUN for constructor CNAME.  ARGLIST :KEYS is the keyword constructor;
+   anything else is a BOA lambda list naming slots (CLHS 3.4.6), whose
+   &OPTIONAL and &KEY parameters without a default take the slot's initform."
+  (let* ((vars (mapcar (lambda (sc) (%ds-slot-var (first sc))) slot-cells))
+         (cell-forms
+           (let ((acc nil) (i 0))
+             (dolist (c template (nreverse acc))
+               (cond ((and (consp c) (eq (car c) :name))
+                      (push (list 'quote (second c)) acc))
+                     ((and (consp c) (eq (car c) :slot))
+                      (let ((k 0) (found nil))
+                        (dolist (sc slot-cells)
+                          (when (and (null found) (= (second sc) i))
+                            (setq found (nth k vars)))
+                          (setq k (+ k 1)))
+                        (push found acc)))
+                     (t (push nil acc)))
+               (setq i (+ i 1)))))
+         (body
+           (if (eq rep :list)
+               (cons 'list cell-forms)
+               (let ((v (%defstruct-intern "%DS-V")) (sets nil) (i 0))
+                 (dolist (c template)
+                   (unless (eq c :pad)
+                     (push (list 'setf (list 'aref v i) (nth i cell-forms)) sets))
+                   (setq i (+ i 1)))
+                 (append (list 'let
+                               (list (list v (list 'make-array total :element-type
+                                                   (list 'quote elt)))))
+                         (nreverse sets)
+                         (list v))))))
+    (if (eq arglist :keys)
+        (list 'defun cname
+              (cons '&key
+                    (let ((k 0) (acc nil))
+                      (dolist (sc slot-cells (nreverse acc))
+                        (push (list (list (%ds-keyword (first sc)) (nth k vars))
+                                    (third sc))
+                              acc)
+                        (setq k (+ k 1)))))
+              body)
+        (let ((params nil) (mode :req) (mentioned nil))
+          (dolist (a arglist)
+            (cond ((member a '(&optional &rest &key &aux &allow-other-keys))
+                   (setq mode a)
+                   (push a params))
+                  (t (push (if (consp a) (car a) a) mentioned)
+                     (if (and (symbolp a) (member mode '(&optional &key)))
+                         (let ((sc nil))
+                           (dolist (x slot-cells)
+                             (when (eq (first x) a) (setq sc x)))
+                           (push (if sc (list a (third sc)) a) params))
+                         (push a params)))))
+          (list 'defun cname (nreverse params)
+                (list 'let
+                      (let ((k 0) (acc nil))
+                        (dolist (sc slot-cells (nreverse acc))
+                          (push (list (nth k vars)
+                                      (if (member (first sc) mentioned)
+                                          (first sc)
+                                          (third sc)))
+                                acc)
+                          (setq k (+ k 1))))
+                      body))))))
+
+(defun %ds-typed-expansion (form)
+  "FORM is a DEFSTRUCT whose options include (:TYPE ...).  Return the list of
+   forms it means, or a one-form list holding an ERROR when the options are
+   inconsistent (CLHS: :PREDICATE needs :NAMED; a :NAMED vector must be able
+   to hold its name symbol -- upstream defstruct.error.3/.4)."
+  (let* ((head (cadr form))
+         (name (car head))
+         (options (cdr head))
+         (sname (symbol-name name))
+         (tspec (%ds-type-option options))
+         (rep (cond ((and (symbolp tspec) (name-eq tspec "LIST")) :list)
+                    ((and (symbolp tspec) (name-eq tspec "VECTOR")) :vector)
+                    ((and (consp tspec) (symbolp (car tspec))
+                          (name-eq (car tspec) "VECTOR"))
+                     :vector)
+                    (t nil)))
+         (elt (if (and (consp tspec) (consp (cdr tspec))) (cadr tspec) t))
+         (named (%ds-option options "NAMED"))
+         (offset-opt (%ds-option options "INITIAL-OFFSET"))
+         (offset (if (consp offset-opt) (cadr offset-opt) 0))
+         (include-opt (%ds-option options "INCLUDE"))
+         (parent (if (consp include-opt) (cadr include-opt) nil))
+         (pred-opt (%ds-option options "PREDICATE"))
+         (copier-opt (%ds-option options "COPIER"))
+         (conc-opt (%ds-option options "CONC-NAME"))
+         (conc (cond ((null conc-opt) (concatenate 'string sname "-"))
+                     ((eq conc-opt :bare) nil)
+                     ((null (cdr conc-opt)) nil)
+                     ((null (cadr conc-opt)) nil)
+                     ((stringp (cadr conc-opt)) (cadr conc-opt))
+                     ((characterp (cadr conc-opt)) (string (cadr conc-opt)))
+                     (t (symbol-name (cadr conc-opt)))))
+         (named-elt-ok (or (eq elt t) (and (symbolp elt) (name-eq elt "T")))))
+    (cond
+      ((null rep)
+       (list (list 'error "DEFSTRUCT: :TYPE must be LIST, VECTOR or (VECTOR element-type)")))
+      ((and (consp pred-opt) (cdr pred-opt) (cadr pred-opt) (not named))
+       (list (list 'error "DEFSTRUCT: a :PREDICATE needs a :NAMED typed structure")))
+      ((and named (eq rep :vector) (not named-elt-ok))
+       (list (list 'error "DEFSTRUCT: a :NAMED structure of this vector type cannot hold its name")))
+      (t
+       (let* ((parent-layout (if parent (%ds-typed-find parent) nil))
+              (template (if parent-layout (copy-list (third parent-layout)) nil)))
+         (dotimes (i offset) (setq template (append template (list :pad))))
+         (when named (setq template (append template (list (list :name name)))))
+         (dolist (sd (cddr form))
+           (unless (stringp sd)
+             (let* ((sym (if (consp sd) (car sd) sd))
+                    (init (if (and (consp sd) (consp (cdr sd))) (cadr sd) nil))
+                    (plist (if (and (consp sd) (consp (cdr sd))) (cddr sd) nil))
+                    (ro (getf plist :read-only)))
+               (setq template (append template (list (list :slot sym init ro)))))))
+         (setq *typed-struct-layouts*
+               (cons (cons name (list rep elt template)) *typed-struct-layouts*))
+         (let* ((total (length template))
+                (name-pos (let ((pos nil) (i 0))
+                            (dolist (c template pos)
+                              (when (and (consp c) (eq (car c) :name)) (setq pos i))
+                              (setq i (+ i 1)))))
+                (slot-cells (let ((acc nil) (i 0))
+                              (dolist (c template (nreverse acc))
+                                (when (and (consp c) (eq (car c) :slot))
+                                  (push (list (second c) i (third c) (fourth c)) acc))
+                                (setq i (+ i 1)))))
+                (obj (%defstruct-intern "%DS-OBJ"))
+                (val (%defstruct-intern "%DS-VAL"))
+                (x (%defstruct-intern "%DS-X"))
+                (forms nil))
+           ;; constructors
+           (let ((ctor-opts nil) (default-suppressed nil))
+             (dolist (opt options)
+               (when (and (consp opt) (symbolp (car opt)) (name-eq (car opt) "CONSTRUCTOR"))
+                 (when (and (cdr opt) (null (cadr opt))) (setq default-suppressed t))
+                 (when (and (cdr opt) (cadr opt))
+                   (setq default-suppressed t)
+                   (push opt ctor-opts))))
+             (unless default-suppressed
+               (push (list :constructor (%defstruct-intern (concatenate 'string "MAKE-" sname)))
+                     ctor-opts))
+             (dolist (opt ctor-opts)
+               (push (%ds-typed-ctor (cadr opt) (if (cddr opt) (caddr opt) :keys)
+                                     rep elt total template slot-cells)
+                     forms)))
+           ;; accessors, and a (SETF acc) writer unless :READ-ONLY
+           (dolist (sc slot-cells)
+             (let* ((sym (first sc)) (idx (second sc)) (ro (fourth sc))
+                    (acc (if conc
+                             (%defstruct-intern (concatenate 'string conc (symbol-name sym)))
+                             sym))
+                    (place (if (eq rep :list) (list 'nth idx obj) (list 'aref obj idx))))
+               (push (list 'defun acc (list obj) place) forms)
+               (unless ro
+                 (push (list 'defun (list 'setf acc) (list val obj) (list 'setf place val))
+                       forms))))
+           ;; copier
+           (let ((cname (cond ((or (null copier-opt) (eq copier-opt :bare) (null (cdr copier-opt)))
+                               (%defstruct-intern (concatenate 'string "COPY-" sname)))
+                              (t (cadr copier-opt)))))
+             (when cname
+               (push (list 'defun cname (list obj) (list 'copy-seq obj)) forms)))
+           ;; predicate: only a :NAMED typed structure has one
+           (when named
+             (let ((pname (cond ((or (null pred-opt) (eq pred-opt :bare) (null (cdr pred-opt)))
+                                 (%defstruct-intern (concatenate 'string sname "-P")))
+                                (t (cadr pred-opt)))))
+               (when pname
+                 (push (if (eq rep :list)
+                           (list 'defun pname (list x)
+                                 (list '%ds-list-named-p x name-pos (list 'quote name)))
+                           (list 'defun pname (list x)
+                                 (list 'and (list 'vectorp x)
+                                       (list '> (list 'length x) name-pos)
+                                       (list 'eq (list 'aref x name-pos) (list 'quote name)))))
+                       forms))))
+           (append (nreverse forms) (list (list 'quote name)))))))))
 
 (defun cell-rewrite-form (form boxed-vars &optional (lambda-params nil))
   "Rewrite FORM to use cell indirection for BOXED-VARS.
@@ -27172,6 +27422,11 @@
 
     ;; (defstruct name slot1 slot2 ...)
     ;; Generates constructor (make-name), accessors (name-slot), setters (set-name-slot)
+    ;; A typed structure (:TYPE LIST / VECTOR) is plain functions over a
+    ;; list or vector: expand it (see %DS-TYPED-EXPANSION) and compile that.
+    ((and (consp form) (name-eq (car form) "DEFSTRUCT")
+          (consp (cadr form)) (%ds-type-option (cdr (cadr form))))
+     (mvm-compile-toplevel (cons 'progn (%ds-typed-expansion form))))
     ((and (consp form) (name-eq (car form) "DEFSTRUCT"))
      (let* ((name-and-options (cadr form))
             ;; Parse struct name and options
@@ -27235,8 +27490,16 @@
             (copier-name :default)
             ;; (:PRINT-FUNCTION fn) / (:PRINT-OBJECT fn): (kind . fn), or NIL.
             (print-option nil))
-       ;; Process options
+       ;; Process options.  A bare option keyword is the option with no
+       ;; arguments (CLHS 3.4.6): :CONC-NAME alone means NO prefix, exactly
+       ;; like (:CONC-NAME) -- it was ignored, so the default NAME- prefix
+       ;; stayed and a slot P collided with the predicate NAME-P.  The other
+       ;; bare options (:CONSTRUCTOR :COPIER :PREDICATE) already mean their
+       ;; defaults, which is what ignoring them does.
        (dolist (opt options)
+         (when (and (symbolp opt) (name-eq opt "CONC-NAME"))
+           (setf conc-name-specified t)
+           (setf conc-name nil))
          (when (consp opt)
            (let ((opt-name (car opt)))
              (cond
@@ -27250,9 +27513,10 @@
                                     ;; is only part of the DEFAULT, name+"-").
                                     ;; (:conc-name foo-) → prefix "FOO-".
                                     (let ((cn (cadr opt)))
-                                      (if (stringp cn)
-                                          cn
-                                          (symbol-name cn)))
+                                      (cond ((stringp cn) cn)
+                                            ;; a string DESIGNATOR: #\X is "X"
+                                            ((characterp cn) (string cn))
+                                            (t (symbol-name cn))))
                                     nil)))  ; (:conc-name nil) → no prefix
                ((and (name-eq opt-name "PRINT-FUNCTION") (cdr opt) (cadr opt))
                 (setf print-option (cons :print-function (cadr opt))))
@@ -27749,7 +28013,12 @@
              do (let ((acc-name (if conc-name
                                     (format nil "~A~A" conc-name (symbol-name slot))
                                     (format nil "~A" (symbol-name slot)))))
-                  (push `(defun ,(%defstruct-intern acc-name) (obj)
+                  ;; With no conc-name the accessor IS the slot's symbol
+                  ;; (CLHS 3.4.6: the name is the slot name), so it keeps the
+                  ;; slot symbol's package -- re-interning its NAME in
+                  ;; *PACKAGE* defined CL-TEST::A33 for a slot written
+                  ;; STRUCT-TEST-PACKAGE::A33 (upstream STRUCT-TEST-33..35).
+                  (push `(defun ,(if conc-name (%defstruct-intern acc-name) slot) (obj)
                            (if (= (obj-subtag obj) #x32)
                                (if (>= (%prim-array-length obj) ,min-inst-len)
                                    (%prim-aref obj ,(+ 2 i))
@@ -27822,9 +28091,14 @@
                     ;; and the ANSI corpus) to be had from doing so.  A user
                     ;; who later writes their own `(defun (setf ACC) …)` DOES
                     ;; register, and wins, which is correct.
-                    (push `(defun ,(format nil "SETF-~A" acc-name) (val obj)
-                             ,@writer-body)
-                          forms-to-compile)
+                    ;; Not for a :READ-ONLY slot: CLHS 3.4.6 gives it no
+                    ;; writer, and (FBOUNDP '(SETF acc)) must say so
+                    ;; (upstream STRUCT-TEST-27..29/12).  The signalling
+                    ;; SET-<ACC> above still catches a compiled SETF of it.
+                    (unless slot-read-only
+                      (push `(defun ,(format nil "SETF-~A" acc-name) (val obj)
+                               ,@writer-body)
+                            forms-to-compile))
                     (let ((setter-sym (%defstruct-intern setter-name)))
                       (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))
                         (mvm-define-macro setf-key

@@ -196,6 +196,17 @@
     ;; standard-class in their CPL.
     ((%clos-class-p obj)
      '(standard-class class standard-object t))
+    ;; A class PROXY is the class of a DEFSTRUCT or of a built-in type, so it
+    ;; dispatches as an instance of its metaclass (the CLASS-OF answer):
+    ;; (class-of (class-of 'symbol)) is BUILT-IN-CLASS, and a method on
+    ;; BUILT-IN-CLASS / CLASS must apply to it (upstream BUILT-IN-CLASS-CPL).
+    ;; Condition and STANDARD-OBJECT proxies keep the fallback below.
+    ((and (%class-proxy-p obj)
+          (or (%find-struct-type (%class-proxy-name obj))
+              (eq (%class-proxy-name obj) 'structure-object)))
+     '(structure-class class standard-object t))
+    ((%builtin-class-proxy-p obj)
+     '(built-in-class class standard-object t))
     ;; Struct instance: type-name chain + STRUCTURE-OBJECT STANDARD-OBJECT T.
     ;; Must precede the builtin-cpl fallback — %type-of-for-dispatch returns
     ;; the bare struct type-name, and %builtin-cpl's default would drop the
@@ -325,6 +336,15 @@
    direct-slot entry at all, and CLASS-DIRECT-SLOTS answered NIL for it.  This
    is the definition point and SLOT-NAMES is already in hand, so the record
    belongs here; the macro's own call is now redundant but harmless."
+  ;; A built-in class cannot be a superclass of a STANDARD-CLASS (CLHS 4.3.7,
+  ;; 7.1: built-in classes have no user-definable subclasses).  Checked
+  ;; before anything is registered, so a refused DEFCLASS leaves no trace
+  ;; (upstream DEFCLASS.ERROR.23/.24).  A name that is not yet a class is a
+  ;; forward reference and is allowed.
+  (dolist (s supers)
+    (when (and (symbolp s) (not (eq s t)) (not (%find-clos-class s))
+               (%builtin-class-proxy-p (find-class s nil)))
+      (error "DEFCLASS ~S: ~S is a built-in class and cannot be a superclass." name s)))
   (%register-clos-direct-slots name slot-names)
   ;; Any CPL may change: every GF dispatch cache is stale (THE DISPATCH CACHE).
   (setq *gf-cache-epoch* (+ (%gf-cache-epoch) 1))
@@ -1825,6 +1845,8 @@
 
    :allocation :class slots route to per-class shared storage."
   (when (or (null obj) (not (%clos-instance-p obj)))
+    (when (%builtin-class-proxy-p (class-of obj))
+      (%slot-of-builtin-error '(setf slot-value) obj slot-name))
     (return-from set-slot-value new-val))
   ;; FAST PATH: the memoised instance slot index, as %SLOT-VALUE.
   (let ((loc (%clos-reg-memo2 8 (aref obj 1) slot-name (function %slot-locate-scan))))
@@ -2352,8 +2374,32 @@
 
 
 
+(defun %slot-of-builtin-error (fn obj slot-name)
+  "A built-in object (a number, a symbol, a cons ...) has no slots, so
+   SLOT-MISSING's default method signals (CLHS 7.7.27 / 7.7.21).  These used
+   to answer NIL quietly (upstream SLOT-VALUE.ERROR.5/.6, SLOT-BOUNDP.ERROR.5,
+   SLOT-MAKUNBOUND.ERROR.4)."
+  (error "~S: ~S has no slot named ~S (its class ~S is a built-in class)."
+         fn obj slot-name (class-name (class-of obj))))
+
+(defun %builtin-instance-p (obj)
+  "True when OBJ is an instance of a BUILT-IN class -- decided by its CLASS,
+   the criterion CLHS and the upstream tests use, not by a list of the
+   representations that are not built-in."
+  (and (not (%clos-instance-p obj))
+       (%builtin-class-proxy-p (class-of obj))))
+
+(defun %defclass-name-check (name)
+  "DEFCLASS cannot redefine a built-in class's name (CLHS 4.3.7; upstream
+   DEFCLASS.ERROR.24).  Called from the DEFCLASS expansion only: boot code
+   calls %DEFCLASS directly and may promote a proxied name on purpose."
+  (when (and (symbolp name) (not (%find-clos-class name))
+             (%builtin-class-proxy-p (find-class name nil)))
+    (error "DEFCLASS: ~S names a built-in class and cannot be redefined." name)))
+
 (defun slot-boundp (obj slot-name)
   "True if slot SLOT-NAME of OBJ is bound."
+  (when (%builtin-instance-p obj) (%slot-of-builtin-error 'slot-boundp obj slot-name))
   (%slot-boundp obj slot-name))
 
 (defun slot-exists-p (obj slot-name)
@@ -2362,6 +2408,7 @@
 
 (defun slot-makunbound (obj slot-name)
   "Unset slot SLOT-NAME in OBJ."
+  (when (%builtin-instance-p obj) (%slot-of-builtin-error 'slot-makunbound obj slot-name))
   (%slot-makunbound obj slot-name))
 
 ;;; ============================================================
@@ -7522,6 +7569,15 @@
    change-class.error.1/.2 expect PROGRAM-ERROR."
   (when (or (null %cc-args) (null (cdr %cc-args)))
     (%signal-program-error))
+  ;; Neither side may be a built-in class (CLHS 7.2: CHANGE-CLASS applies to
+  ;; STANDARD-OBJECT instances and standard classes; upstream
+  ;; CHANGE-CLASS.ERROR.5/.6).  A new class given by NAME is resolved first.
+  (let* ((inst (car %cc-args))
+         (nc (cadr %cc-args))
+         (ncls (if (symbolp nc) (find-class nc nil) nc)))
+    (when (or (%builtin-instance-p inst) (%builtin-class-proxy-p ncls))
+      (error "CHANGE-CLASS: ~S cannot be changed to ~S -- a built-in class is involved."
+             inst nc)))
   (%dispatch-change-class %cc-args))
 
 ;;; ============================================================
@@ -7766,12 +7822,38 @@
       (t (let ((d (%type-of-for-dispatch x)))
            (if (eq d 'boolean) 'symbol d))))))
 
+(defun %builtin-class-proxy-p (x)
+  "True when X is the class of a BUILT-IN type (CLHS 4.3.7): a class proxy
+   that is not a DEFSTRUCT's, not a condition type's, and not
+   STANDARD-OBJECT / STRUCTURE-OBJECT.  CLASS-OF, TYPEP and DEFCLASS agree
+   on this through one predicate."
+  (and (%class-proxy-p x)
+       (let ((n (%class-proxy-name x)))
+         (not (or (%find-struct-type n)
+                  (%cond-reg-find n)
+                  (eq n 'standard-object)
+                  (eq n 'structure-object)
+                  ;; the metaclasses are STANDARD-CLASS instances, not
+                  ;; built-in classes (upstream BUILT-IN-CLASS-CPL)
+                  (member n '(class built-in-class standard-class structure-class
+                              funcallable-standard-class metaobject
+                              generic-function standard-generic-function
+                              method standard-method method-combination)))))))
+
 (defun class-of (x &rest extra)
   (if extra
       (%program-error "class-of requires exactly 1 argument")
       (cond
         ((%clos-instance-p x) (%find-clos-class (aref x 1)))
         ((%clos-class-p x)    (find-class 'standard-class))
+        ;; A class proxy is a DEFSTRUCT's or a built-in type's class: its
+        ;; metaclass is STRUCTURE-CLASS / BUILT-IN-CLASS (as TYPE-OF says),
+        ;; not the vector it is made of.
+        ((and (%class-proxy-p x)
+              (or (%find-struct-type (%class-proxy-name x))
+                  (eq (%class-proxy-name x) 'structure-object)))
+         (find-class 'structure-class))
+        ((%builtin-class-proxy-p x) (find-class 'built-in-class))
         ((%condition-p x)     (find-class (%condition-type-name x)))
         ;; Not FIND-CLASS: a struct compiled into the image has no runtime
         ;; type descriptor for it to find ("class not found").
@@ -7786,7 +7868,10 @@
       (%program-error "slot-value requires exactly 2 arguments")
       (if (null slot-name)
           (%program-error "slot-value requires a slot name")
-          (%slot-value obj slot-name))))
+          (progn
+            (when (%builtin-instance-p obj)
+              (%slot-of-builtin-error 'slot-value obj slot-name))
+            (%slot-value obj slot-name)))))
 
 ;;; ============================================================
 ;;; CLOS protocol completion

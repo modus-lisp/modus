@@ -2135,6 +2135,14 @@
                      (member t2 cpl :test #'%clos-class-name-eq))
                  t nil)
              t)))
+    ;; t1 a DEFSTRUCT type: a subtype of STRUCTURE-OBJECT and of every
+    ;; :INCLUDE ancestor.  The static table below knows no struct names, so
+    ;; (subtypep 'my-struct 'structure-object) and (subtypep 'child 'parent)
+    ;; both answered NIL (upstream STRUCT-TEST-*/15A,15B).
+    ((and (symbolp t1) (symbolp t2) (%find-struct-type t1)
+          (or (eq t2 'structure-object) (eq t2 'atom)
+              (%struct-type-ancestor-p t1 t2)))
+     (cons t t))
     ;; t1 is a user CLOS class, t2 is built-in symbol — fall through to
     ;; the static hierarchy after asking %subtype-of-p; CLOS classes
     ;; that ultimately inherit from STANDARD-OBJECT pick up that lattice.

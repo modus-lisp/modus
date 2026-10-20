@@ -6612,6 +6612,10 @@
           ((eq k :initial-element)         (setq init-elem v))
           ((eq k :initial-contents)        (setq init-contents v))))
       (setq cur (cddr cur)))
+    ;; :INITIAL-CONTENTS may be any sequence (a string, a bit vector) --
+    ;; walked as a list below (upstream ADJUST-ARRAY.BIT-VECTOR.3/.4).
+    (when (and (not (eq init-contents :unset)) (vectorp init-contents))
+      (setq init-contents (coerce init-contents 'list)))
     (let* ((old-data (%adjust-old-data a))
            ;; Logical length / displacement offset of the array's CURRENT
            ;; view.  For a displaced source, old-data is the displaced-to
@@ -6775,6 +6779,22 @@
           ((eq k :initial-element)         (setq init-elem v)          (setq cur (cddr cur)))
           ((eq k :initial-contents)        (setq init-contents v)      (setq cur (cddr cur)))
           (t                               (setq cur (cddr cur))))))
+    (when (and (not (eq init-contents :unset)) (vectorp init-contents))
+      (setq init-contents (coerce init-contents 'list)))
+    ;; A plain (simple) vector displaced elsewhere: a REAL displaced array
+    ;; of the same element type.  The cons wrapper this path used to build
+    ;; is no array to the rest of the runtime -- it printed as
+    ;; ((4 . 2) . #(...)) (upstream ADJUST-ARRAY.12/.13, .STRING.12/.13).
+    (when (and displaced-to (not (consp a)))
+      (return-from adjust-array
+        (if (or (eq fp-arg :unset) (null fp-arg))
+            (make-array new-size :element-type (array-element-type a)
+                        :displaced-to displaced-to
+                        :displaced-index-offset displaced-offset)
+            (make-array new-size :element-type (array-element-type a)
+                        :displaced-to displaced-to
+                        :displaced-index-offset displaced-offset
+                        :fill-pointer (if (eq fp-arg t) new-size fp-arg)))))
     (let* ((adj-p (and (consp a) (eql (car a) 8765432)))
            (inner (if adj-p (cdr a) a))
            (had-fp (and (consp inner) (fixnump (car inner))))

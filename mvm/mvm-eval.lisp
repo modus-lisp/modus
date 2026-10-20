@@ -336,6 +336,26 @@
    and an EQUAL-keyed cache hit would hand closure B a module whose const
    pool holds closure A's cells (shared state, the two-counters bug).")
 
+(defun %mvm-literals-same-p (a b)
+  "A and B are EQUAL forms (the cache key) whose LITERAL objects are also the
+   same: a quoted object and every self-evaluating atom that is not a symbol,
+   number or character must be EQ.  The compiled module holds the first
+   form's literals, so without this a hit for (the t 'X) with X merely EQUAL
+   to the cached one returned the cached object (upstream THE.3-11: two
+   EQUAL pathnames, *TERMINAL-IO* vs *DEBUG-IO*)."
+  (loop
+    (cond
+      ((eq a b) (return t))
+      ((consp a)
+       (unless (consp b) (return nil))
+       (if (and (eq (car a) 'quote) (consp (cdr a)))
+           (return (eq (cadr a) (cadr b)))
+           (progn
+             (unless (%mvm-literals-same-p (car a) (car b)) (return nil))
+             (setq a (cdr a) b (cdr b)))))
+      ((or (symbolp a) (numberp a) (characterp a)) (return (eql a b)))
+      (t (return nil)))))
+
 (defun %mvm-eval-cacheable-p (forms)
   "T unless any top-level form is a DEF* / IN-PACKAGE / EVAL-WHEN whose FIRST
    compile has side effects (macro/trampoline/package registration) that a
@@ -3917,7 +3937,9 @@
     (setf (gethash forms *mvm-eval-cache*)
           ;; WS4-S5b: ft-list inserted at index 2 (see %mvm-eval-run-tuple
           ;; layout comment).  reverse → source order (fn-table order).
-          (list bc entry (reverse ft-list) fn-table rt-table lam-offsets)))
+          ;; FORMS rides at index 6 so a hit can check its literals are
+          ;; the SAME objects (%mvm-literals-same-p).
+          (list bc entry (reverse ft-list) fn-table rt-table lam-offsets forms)))
   ;; Conditions PROPAGATE (see %mvm-eval-run-tuple): production EVAL
   ;; must let an error signalled by the form reach the caller's
   ;; handler-case instead of returning (:interp-err e) as a value.
@@ -4092,7 +4114,7 @@
       (unless *mvm-eval-cache*
         (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
       (let ((%hit (gethash forms *mvm-eval-cache*)))
-        (when %hit
+        (when (and %hit (%mvm-literals-same-p (nth 6 %hit) forms))
           (%eval-lock-drop-for-run)
           (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
   (let ((*functions* (make-hash-table :test (quote equal)))

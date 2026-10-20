@@ -868,6 +868,28 @@
           ;; it wasn't before either; correctness of the store wins.
           (values nil place (lambda (v) `(setf ,place ,v)))))))))
 
+(defun %boa-defaulted-lambda-list (arg-spec slot-names slot-defaults name-eq)
+  "ARG-SPEC with every &OPTIONAL / &KEY variable that has no default of its
+   own given its SLOT's initform (CLHS 3.4.6; upstream STRUCTURE-BOA-TEST-05,
+   -14).  Required, &REST and &AUX entries are left as written."
+  (let ((mode :required) (out nil))
+    (dolist (e arg-spec (nreverse out))
+      (cond
+        ((and (symbolp e) (> (length (symbol-name e)) 0)
+              (char= (char (symbol-name e) 0) #\&))
+         (let ((nm (symbol-name e)))
+           (cond ((string= nm "&OPTIONAL") (setq mode :optional))
+                 ((string= nm "&KEY") (setq mode :key))
+                 ((or (string= nm "&REST") (string= nm "&AUX")) (setq mode :other))))
+         (push e out))
+        ((and (member mode '(:optional :key))
+              (or (symbolp e) (and (consp e) (null (cdr e)))))
+         (let* ((var-spec (if (consp e) (car e) e))
+                (var (if (consp var-spec) (cadr var-spec) var-spec))
+                (pos (position var slot-names :test name-eq)))
+           (push (if pos (list var-spec (nth pos slot-defaults)) e) out)))
+        (t (push e out))))))
+
 (defun %byte-place-setf (op spec inner value)
   "Expansion of (setf (ldb SPEC INNER) VALUE) with OP = DPB, or of
    MASK-FIELD with OP = DEPOSIT-FIELD.  SPEC, INNER's argument forms (when
@@ -9734,6 +9756,24 @@
 ;;; Only the in-image compiler (mvm-eval / self-host) sees restart-case as a form
 ;;; to compile, and this special form intercepts it before it can fall through
 ;;; to a bogus function call.
+(defun %rc-signal-form-p (form env)
+  "FORM is, or macroexpands to, a call of SIGNAL, ERROR, CERROR or WARN --
+   the RESTART-CASE forms whose restarts CLHS associates with the condition
+   they signal.  Symbol macros of ENV and macros are expanded."
+  (dotimes (i 20 nil)
+    (cond
+      ((and (symbolp form) form)
+       (let ((sm (assoc form (%env-visible-symbol-macros env) :test #'eq)))
+         (if sm (setq form (cadr sm)) (return nil))))
+      ((and (consp form) (symbolp (car form)) (car form))
+       (let ((n (symbol-name (car form))))
+         (when (or (string= n "SIGNAL") (string= n "ERROR")
+                   (string= n "CERROR") (string= n "WARN"))
+           (return t)))
+       (multiple-value-bind (x p) (%macroexpand-1-mvm-raw form)
+         (if (and p (not (eq x form))) (setq form x) (return nil))))
+      (t (return nil)))))
+
 (defun compile-restart-case (protected-form clauses env dest)
   "Compile (restart-case PROTECTED (NAME (ARGS) [:report R] [:interactive I]
    [:test T] . BODY) ...) entirely in bytecode.
@@ -9831,7 +9871,9 @@
             (setf idx (+ idx 1))))
         (setf dispatch-clauses (nreverse dispatch-clauses))
         (compile-form
-         `(let ((,frame-var (%rc-enter (list ,@cell-forms))))
+         `(let ((,frame-var ,(if (%rc-signal-form-p protected-form env)
+                                 `(%rc-enter-associating (list ,@cell-forms))
+                                 `(%rc-enter (list ,@cell-forms)))))
            ;; UNWIND-PROTECT: a non-local exit through this RESTART-CASE to
            ;; an OUTER handler must still remove its restarts (see
            ;; %RESTART-FRAME-UNWIND); the normal paths already did, so the
@@ -9850,12 +9892,15 @@
                 ,cnd-var
                 (%rc-catch-cleanup ,frame-var)
                 (if (%rc-invoked-p)
-                    ;; A restart-case restart fired: read which clause (index)
-                    ;; + the invoke args, clear the handshake, run that body.
-                    (let ((,idx-var (%rc-invoked-index))
-                          (,args-var (%rc-invoked-args)))
-                      (%rc-clear-invoke)
-                      (cond ,@dispatch-clauses (t nil)))
+                    ;; A restart-case restart fired.  OURS: read which clause
+                    ;; (index) + the invoke args, clear the handshake, run
+                    ;; that body.  An OUTER restart-case's: pass it on.
+                    (if (%rc-invoked-mine-p ,frame-var)
+                        (let ((,idx-var (%rc-invoked-index))
+                              (,args-var (%rc-invoked-args)))
+                          (%rc-clear-invoke)
+                          (cond ,@dispatch-clauses (t nil)))
+                        (%rc-pass-on ,cnd-var))
                     ;; A real condition escaped the body — re-signal it so it
                     ;; propagates to the enclosing handler.  Re-signal
                     ;; UNCONDITIONALLY: this expansion runs as MVM-EVAL BYTECODE,
@@ -11125,14 +11170,15 @@
                 (x (%defstruct-intern "%DS-X"))
                 (forms nil))
            ;; constructors
-           (let ((ctor-opts nil) (default-suppressed nil))
+           (let ((ctor-opts nil) (default-suppressed nil) (default-requested nil))
              (dolist (opt options)
                (when (and (consp opt) (symbolp (car opt)) (name-eq (car opt) "CONSTRUCTOR"))
+                 (unless (cdr opt) (setq default-requested t))
                  (when (and (cdr opt) (null (cadr opt))) (setq default-suppressed t))
                  (when (and (cdr opt) (cadr opt))
                    (setq default-suppressed t)
                    (push opt ctor-opts))))
-             (unless default-suppressed
+             (unless (and default-suppressed (not default-requested))
                (push (list :constructor (%defstruct-intern (concatenate 'string "MAKE-" sname)))
                      ctor-opts))
              (dolist (opt ctor-opts)
@@ -17715,7 +17761,12 @@
         (if (and *mvm-eval-runtime-p*
                  (symbolp name)
                  (null unique-name)
-                 (%e2-name-names-gf-p name))
+                 (or (%e2-name-names-gf-p name)
+                     ;; A closure stored with (SETF FDEFINITION): read the
+                     ;; cell so #'NAME is EQ to it (see %E2-NAME-SET-FUNCTION-P).
+                     (and (fboundp (quote %e2-name-set-function-p))
+                          (%e2-name-set-function-p fn-name)
+                          (not (%e2-fn-in-module-p resolved-name)))))
             (compile-form (list 'symbol-function (list 'quote name)) env dest)
             (if (and *mvm-eval-runtime-p*
                      (symbolp name)
@@ -27791,6 +27842,9 @@
             ;; ignored it, and built an EMPTY lexer.  Every regex then parsed
             ;; to :VOID and every scanner matched "" at position 0.
             (default-ctor-suppressed nil)
+            ;; A bare (:CONSTRUCTOR) explicitly asks for MAKE-<name>, even
+            ;; beside a BOA constructor (upstream STRUCTURE-BOA-TEST-16).
+            (default-ctor-requested nil)
             ;; (:PREDICATE …) / (:COPIER …) — CLHS 3.4.6.  Three states each:
             ;;   :DEFAULT  option absent, or present with NO argument
             ;;             (`(:predicate)`) — generate under the default name
@@ -27851,8 +27905,9 @@
                   ;; `(:constructor NAME …)` and `(:constructor nil)`, both of
                   ;; which suppress the default.  Same distinction the
                   ;; PREDICATE / COPIER branches below already make.
-                  (when (cdr opt)
-                    (setf default-ctor-suppressed t))
+                  (if (cdr opt)
+                      (setf default-ctor-suppressed t)
+                      (setf default-ctor-requested t))
                   (when (and ctor-sym (symbolp ctor-sym))
                     (push (cons ctor-sym arg-spec)
                           named-constructors))))
@@ -28023,7 +28078,7 @@
                        `(,internal-ctor-sym ,@positional)))))
              ;; Only when no (:CONSTRUCTOR …) option replaced it — see
              ;; DEFAULT-CTOR-SUPPRESSED above.
-             (unless default-ctor-suppressed
+             (unless (and default-ctor-suppressed (not default-ctor-requested))
                ;; NOT A MACRO AT RUNTIME.  The compiler's macro table is keyed
                ;; by the BARE name, so a runtime struct's MAKE-<name> macro
                ;; expanded every call to that name in EVERY package: reel
@@ -28170,7 +28225,9 @@
                                 (let ((bv (find slot bound-vars
                                                 :test slot-name-eq2)))
                                   (if bv bv default)))))
-                    (push `(defun ,ctor-sym ,arg-spec
+                    (push `(defun ,ctor-sym
+                               ,(%boa-defaulted-lambda-list arg-spec slot-names
+                                                            slot-defaults slot-name-eq2)
                              (,internal-ctor-sym ,@call-args))
                           forms-to-compile))))
                ;; Old normalize path retained but unreachable (kept for ref).

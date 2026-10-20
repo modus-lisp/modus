@@ -1972,14 +1972,18 @@
   (let ((path (%resolve-path (pathname pathspec))))
     ;; Simple: try to mkdir -p by creating each component
     (let ((len (length path))
-          (i 1))
+          (i 1)
+          (created nil))
       (loop
         (when (>= i len) (return nil))
         (when (= (char-code (char path i)) 47)  ; 47 = #\/
           (let ((dir (%substring path 0 i)))
-            (%sys-mkdir dir 493)))  ; 493 = 0755
+            ;; mkdir answers 0 only when it MADE the directory; the second
+            ;; value is whether any was created (upstream
+            ;; ENSURE-DIRECTORIES-EXIST.1-9 expect NIL for existing ones).
+            (when (eql (%sys-mkdir dir 493) 0) (setq created t))))  ; 493 = 0755
         (setq i (+ i 1)))
-      (values pathspec t))))
+      (values pathspec created))))
 
 ;;; --- file-write-date ---
 (defun file-write-date (x)

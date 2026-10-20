@@ -209,6 +209,18 @@
                       (%hc-longjmp)
                       (progn (error "undefined function") nil))))))))))
 
+(defvar *%e2-set-function-names* nil
+  "Names (strings) whose definition was stored with (SETF SYMBOL-FUNCTION) /
+   (SETF FDEFINITION) rather than by DEFUN.")
+
+(defun %e2-name-set-function-p (name)
+  "NAME (a string) had its definition stored by SET-SYMBOL-FUNCTION.  A
+   runtime-compiled #'NAME of such a name compiles to a SYMBOL-FUNCTION read:
+   the default late-binding thunk CALLS the stored closure correctly but is
+   not EQ to it, so (eq #'f (fdefinition 'f)) failed inside a DEFUN body while
+   holding at top level (user report, 2026-10-20)."
+  (and *%e2-set-function-names* (gethash name *%e2-set-function-names*) t))
+
 (defun set-symbol-function (sym fn)
   "Set the function cell of SYM to FN.  Updates both the name-keyed
    table (CL-symbol path) and the hash-keyed table (native MVM symbol
@@ -228,7 +240,13 @@
         (%sft-init))
       (when (> (length name) 0)
         (%jit-fnaddr-thunk-invalidate name)   ; a #'NAME thunk must re-resolve
-        (puthash name *symbol-function-table* fn))
+        (puthash name *symbol-function-table* fn)
+        ;; Remember the name: a runtime-compiled #'NAME of it must read the
+        ;; cell, or it yields a late-binding thunk that is not EQ to FN
+        ;; (see %E2-NAME-SET-FUNCTION-P).
+        (unless *%e2-set-function-names*
+          (setq *%e2-set-function-names* (make-hash-table :test 'equal)))
+        (puthash name *%e2-set-function-names* t))
       (when *native-sym-function-table*
         (puthash hash *native-sym-function-table* fn))
       fn)))
@@ -5388,7 +5406,23 @@
                           "LAMBDA-LIST-KEYWORDS" "MOST-POSITIVE-FIXNUM"
                           "MOST-NEGATIVE-FIXNUM")
                    :test #'string=)
-           t)))
+           t)
+      (%cl-float-constant-name-p name)))
+
+(defun %cl-float-constant-name-p (name)
+  "NAME is one of CLHS 12.1's 40 float constants: MOST-/LEAST-POSITIVE/
+   NEGATIVE[-NORMALIZED]-<fmt>-FLOAT and <fmt>-FLOAT[-NEGATIVE]-EPSILON for
+   fmt in SHORT SINGLE DOUBLE LONG (upstream CL-CONSTANT-SYMBOLS.1)."
+  (dolist (fmt '("SHORT" "SINGLE" "DOUBLE" "LONG") nil)
+    (when (or (string= name (concatenate 'string fmt "-FLOAT-EPSILON"))
+              (string= name (concatenate 'string fmt "-FLOAT-NEGATIVE-EPSILON"))
+              (dolist (pre '("MOST-POSITIVE-" "MOST-NEGATIVE-"
+                             "LEAST-POSITIVE-" "LEAST-NEGATIVE-"
+                             "LEAST-POSITIVE-NORMALIZED-" "LEAST-NEGATIVE-NORMALIZED-")
+                           nil)
+                (when (string= name (concatenate 'string pre fmt "-FLOAT"))
+                  (return t))))
+      (return t))))
 
 (defun constantp (form &rest env)
   "True if FORM is a constant per CLHS.  Extends the cl-packages.lisp

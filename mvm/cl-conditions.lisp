@@ -1012,6 +1012,20 @@
 ;;; by %with-restarts longjmp recovery.
 (defvar *restart-frame-condition-map* nil)
 
+(defvar *%rc-associating-frames* nil
+  "Restart frames that take an implicit condition association (CLHS
+   RESTART-CASE: only one whose form is a SIGNAL/ERROR/CERROR/WARN call, and
+   every %WITH-RESTARTS frame, the gate runner's historic shape).  Other
+   frames stay unassociated, so an OUTER RESTART-CASE's restarts remain
+   visible to a handler of a condition signalled later (upstream
+   RESTART-CASE.25-31).")
+
+(defun %rc-enter-associating (restarts-spec)
+  "%RC-ENTER for a RESTART-CASE whose form signals: its frame associates."
+  (let ((frame (%rc-enter restarts-spec)))
+    (setq *%rc-associating-frames* (cons frame *%rc-associating-frames*))
+    frame))
+
 (defun %associate-active-restart-frames (cond-obj)
   "On signal of COND-OBJ, associate every currently-active restart
    frame (from `*restart-stack*`) with COND-OBJ, UNLESS that frame
@@ -1023,7 +1037,8 @@
       (loop
         (when (null cur) (return nil))
         (let ((frame (car cur)))
-          (unless (assoc frame *restart-frame-condition-map* :test #'eq)
+          (unless (or (not (member frame *%rc-associating-frames* :test #'eq))
+                      (assoc frame *restart-frame-condition-map* :test #'eq))
             (setq *restart-frame-condition-map*
                   (cons (cons frame cond-obj)
                         *restart-frame-condition-map*))))
@@ -1561,6 +1576,8 @@
   (let ((tail (member frame *restart-stack* :test #'eq)))
     (when tail
       (setq *restart-stack* (cdr tail))))
+  (when *%rc-associating-frames*
+    (setq *%rc-associating-frames* (remove frame *%rc-associating-frames* :test #'eq)))
   (when *restart-frame-condition-map*
     (setq *restart-frame-condition-map*
           (remove frame *restart-frame-condition-map*
@@ -1575,6 +1592,19 @@
 (defun %rc-invoked-p ()
   "T iff a restart was just invoked (INVOKE-RESTART set the flag)."
   (if *restart-invoking-p* t nil))
+
+(defun %rc-invoked-mine-p (frame)
+  "T iff the restart just invoked is a cell of FRAME.  A RESTART-CASE whose
+   handler catches the transfer for an OUTER RESTART-CASE's restart must pass
+   it on: clause indices are per frame, so dispatching on the outer index ran
+   the wrong clause (upstream RESTART-CASE.25-31)."
+  (if (and *rc-invoked-restart* (member *rc-invoked-restart* frame :test #'eq)) t nil))
+
+(defun %rc-pass-on (condition)
+  "Continue an INVOKE-RESTART transfer past this frame to the next handler
+   frame out, the handshake state left as INVOKE-RESTART set it."
+  (setq *current-condition* condition)
+  (%hc-longjmp))
 
 (defun %rc-clear-invoke ()
   "Clear the invoke handshake state after the bytecode restart-case handler
@@ -1628,6 +1658,7 @@
                     wrapped))))
     (let ((frame (nreverse wrapped)))
       (setq *restart-stack* (cons frame *restart-stack*))
+      (setq *%rc-associating-frames* (cons frame *%rc-associating-frames*))
       (unwind-protect
       (handler-case
           (multiple-value-prog1 (funcall body-fn)
@@ -1638,7 +1669,6 @@
                     (remove frame *restart-frame-condition-map*
                             :test (lambda (f e) (eq (car e) f))))))
         (condition (c)
-          (declare (ignore c))
           (setq *restart-stack* (cdr *restart-stack*))
           ;; Reset *handler-bind-effective-skip* — it was bumped when a
           ;; handler-bind handler was invoked during the body, and the
@@ -1651,10 +1681,17 @@
             (setq *restart-frame-condition-map*
                   (remove frame *restart-frame-condition-map*
                           :test (lambda (f e) (eq (car e) f)))))
+          (if (and *restart-invoking-p*
+                   *rc-invoked-restart*
+                   (not (member *rc-invoked-restart* frame :test #'eq)))
+              ;; Another frame's restart: pass the transfer on (see
+              ;; %RC-INVOKED-MINE-P; upstream RESTART-CASE.27 hung here).
+              (%rc-pass-on c)
           (if *restart-invoking-p*
               (let ((r *restart-case-result*))
                 (setq *restart-invoking-p* nil)
                 (setq *restart-case-result* nil)
+                (setq *rc-invoked-restart* nil)
                 (setq *restarts-being-invoked* nil)
                 (values-list r))
               (if (%error-handler-active-p)
@@ -1666,7 +1703,7 @@
                   ;; Report before dying so the escape is diagnosable.
                   (progn
                     (%report-escaping-condition "with-restarts-no-armed-handler")
-                    (halt))))))
+                    (halt)))))))
         ;; Any exit -- including a non-local one to an OUTER handler --
         ;; removes this frame (a no-op if a path above already did).
         (%restart-frame-unwind frame)))))
@@ -1742,6 +1779,7 @@
              ;; restart-case: run user fn, stash MV result, longjmp.
              (let ((vals (multiple-value-list (apply rfn args))))
                (setq *restart-case-result* vals)
+               (setq *rc-invoked-restart* r)
                (setq *restart-invoking-p* t)
                (let ((rc (make-array 3)))
                  (aset rc 0 'restart-invocation)
@@ -2154,8 +2192,16 @@
     ;; t1 is a user CLOS class, t2 is built-in symbol — fall through to
     ;; the static hierarchy after asking %subtype-of-p; CLOS classes
     ;; that ultimately inherit from STANDARD-OBJECT pick up that lattice.
+    ;; The cl-types lattice (%HAS-SUPERTYPE-P) knows edges this static
+    ;; table lacks: SIMPLE-STRING / SIMPLE-BIT-VECTOR under SIMPLE-ARRAY
+    ;; (upstream SIMPLE-STRING.3).
     ((and (symbolp t1) (symbolp t2))
-     (if (%subtype-of-p t1 t2)
+     ;; Only for the ARRAY family: %HAS-SUPERTYPE-P also makes every float
+     ;; name equivalent, and DOUBLE-FLOAT is not a SINGLE-FLOAT here
+     ;; (upstream UPGRADED-ARRAY-ELEMENT-TYPE.8).
+     (if (or (%subtype-of-p t1 t2)
+             (and (member t2 '(simple-array array vector) :test #'eq)
+                  (%has-supertype-p t1 t2 30)))
          (cons t t)
          (cons nil t)))
     ;; t1 is class proxy — strip and recurse
@@ -2290,7 +2336,12 @@
           (let ((st (obj-subtag x)))
             (or (= st #x50) (= st #x53))))
      (symbol-name x))
-    (t x)))
+    ;; A non-string vector of characters (a displaced / fill-pointer /
+    ;; adjustable string) is itself the string.
+    ((and (vectorp x) (subtypep (array-element-type x) 'character)) x)
+    ;; Anything else is not a string designator (upstream STRING.7: (string 0)
+    ;; returned 0).
+    (t (error 'type-error :datum x :expected-type '(or string symbol character)))))
 
 ;;; --- Signal handling: catch SIGSEGV/SIGBUS/SIGFPE/SIGILL ---
 ;;;

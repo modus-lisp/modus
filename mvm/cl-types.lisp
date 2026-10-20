@@ -1550,6 +1550,17 @@
     ;; subtype, so they aren't a subset of any one elt-type.
     ((and (%string-type-p t1) (%char-array-type-p t2))
      (values nil t))
+    ;; (string N) ⊆ (array * DIMS): a string of any character type is a
+    ;; 1-D (simple-)array, so compare it as (array * (N)) (upstream
+    ;; SIMPLE-STRING.6/.7: simple-string ⊆ (simple-array * (*)) and
+    ;; (simple-array * 1)).
+    ((and (%string-type-p t1)
+          (consp t2)
+          (or (%typename-eq (car t2) 'array) (%typename-eq (car t2) 'simple-array))
+          (or (null (cdr t2)) (%typename-eq (cadr t2) '*)))
+     (%subtypep-impl (list (if (%string-type-simple-p t1) 'simple-array 'array)
+                           '* (list (%string-type-size t1)))
+                     t2))
     ;; (string …) ⊆ (array extended-char …) — NIL T (Modus has no
     ;; extended-char, so any extended-char-array is the empty type,
     ;; and non-empty strings don't fit there).
@@ -5182,7 +5193,9 @@
     ((%clos-instance-p obj)
      (let* ((cname (aref obj 1))
             (cls   (and cname (%find-clos-class cname))))
-       (if (and cls cname (eq (find-class cname nil) cls))
+       ;; ...and the class must still CALL itself that: after
+       ;; (setf (class-name c) nil) the memo still finds C by the old name.
+       (if (and cls cname (eq (find-class cname nil) cls) (eq (aref cls 1) cname))
            cname
            ;; No proper name — return the class object (class-of).
            (if cls cls (or cname 'standard-object)))))
@@ -5326,8 +5339,11 @@
                      (eq (car type) 'function))))
     (error "typep: this type-specifier is not legal here"))
   (cond
+    ;; A class OBJECT: OBJ's own class is it, even when the class no
+    ;; longer has a name (upstream TYPE-OF.10); otherwise by name.
     ((%clos-class-p type)
-     (typep obj (aref type 1)))
+     (or (and (%clos-instance-p obj) (eq (class-of obj) type))
+         (typep obj (aref type 1))))
     ((%class-proxy-p type)
      (typep obj (aref type 1)))
     ;; AN INSTANCE OF A NAMED CLASS, first.  Otherwise a (typep x 'my-class) --
@@ -5558,16 +5574,15 @@
           (eql obj (cadr type)))
          ((eq head 'member)
           (if (member obj (cdr type)) t nil))
+         ;; AND / OR test left to right and STOP at the first answer: a later
+         ;; SATISFIES may only be valid for objects the earlier types admit
+         ;; (upstream DEFTYPE.1/.2: (and (array ...) (satisfies f)) on 1).
          ((eq head 'and)
-          (let ((ok t))
-            (dolist (sub (cdr type))
-              (unless (typep obj sub) (setq ok nil)))
-            ok))
+          (dolist (sub (cdr type) t)
+            (unless (typep obj sub) (return nil))))
          ((eq head 'or)
-          (let ((ok nil))
-            (dolist (sub (cdr type))
-              (when (typep obj sub) (setq ok t)))
-            ok))
+          (dolist (sub (cdr type) nil)
+            (when (typep obj sub) (return t))))
          ((eq head 'not)
           (not (typep obj (cadr type))))
          ((eq head 'satisfies) (and (funcall (cadr type) obj) t))

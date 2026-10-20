@@ -285,8 +285,7 @@
   (let ((obj (%read-internal stream t nil t)))
     (if *read-suppress* nil (list 'quote obj))))
 (defun %rmf-string (stream char)
-  (declare (ignore char))
-  (%read-string stream))
+  (%read-string stream char))
 (defun %rmf-backquote (stream char)
   (declare (ignore char))
   (%read-backquote stream))
@@ -418,6 +417,17 @@
   (let ((code (char-code ch)))
     (or (= code 32) (= code 9) (= code 10) (= code 13) (= code 12))))
 
+(defun %rt-ws-p (ch rt)
+  "CH has WHITESPACE syntax in readtable RT -- consulted, not assumed, so
+   SET-SYNTAX-FROM-CHAR can make Newline a comment or 'a' whitespace
+   (upstream SET-SYNTAX-FROM-CHAR.*).  RT that is not a readtable falls
+   back to the standard set."
+  (let ((code (char-code ch)))
+    (if (and (< code 128) (consp rt))
+        (and (eq (aref (%rt-syntax rt) code) :whitespace)
+             (not (consp (aref (%rt-macros rt) code))))
+        (%whitespace-char-p ch))))
+
 (defun %terminating-macro-p (ch rt)
   "True if CH is a terminating macro character in RT."
   (let ((code (char-code ch)))
@@ -461,13 +471,15 @@
    which has no :semicolon clause — the test files (every ANSI .lsp
    starts with a `;-*- Mode: Lisp -*-' magic line + author comments)
    would have their first form misread."
-  (let ((ch nil))
+  (let ((ch nil) (rt *readtable*))
     (loop
       (setq ch (read-char stream nil nil nil))
       (when (null ch) (return nil))
       (cond
-        ((%whitespace-char-p ch) nil)   ; skip whitespace
-        ((eql ch (code-char 59))         ; #\;
+        ((%rt-ws-p ch rt) nil)   ; skip whitespace
+        ((if (consp rt)
+             (eq (%read-check-macro-rt ch rt) :semicolon)
+             (eql ch (code-char 59)))         ; #\;
          ;; skip to end-of-line (or EOF)
          (loop (let ((c (read-char stream nil nil nil)))
                  (when (or (null c) (eql c (code-char 10)) (eql c (code-char 13)))
@@ -575,7 +587,7 @@
     ((eq fn :quote)
      (let ((obj (%read-internal stream t nil t)))
        (if *read-suppress* nil (list 'quote obj))))
-    ((eq fn :string) (%read-string stream))
+    ((eq fn :string) (%read-string stream ch))
     ((eq fn :backquote) (%read-backquote stream))
     ((eq fn :comma) (%read-comma stream))
     ((eq fn :sharpsign) (%read-sharpsign stream rt))
@@ -639,7 +651,7 @@
 (defun %token-handle-normal (ch stream st rt)
   "Handle a char in normal (non-escape) mode. Returns :done if token ended, nil otherwise."
   (cond
-    ((%whitespace-char-p ch)
+    ((%rt-ws-p ch rt)
      ;; CLHS 2.2 step 9: terminating whitespace is unread only when the
      ;; caller wants whitespace preserved (read-preserving-whitespace or
      ;; a recursive read).  Plain `read`/`read-from-string` discards it.
@@ -696,7 +708,7 @@
         ;; terminates a token is DISCARDED by plain read/read-from-string
         ;; and UNREAD only when whitespace is being preserved (recursive
         ;; read or read-preserving-whitespace).
-        ((%whitespace-char-p ch)
+        ((%rt-ws-p ch rt)
          (when *reader-preserve-ws*
            (unread-char ch stream))
          (return st))
@@ -1295,8 +1307,9 @@
           (setq ch (read-char stream nil nil t))
           (when (null ch) (%reader-error "end of file reading list"))
           (cond
-            ((%whitespace-char-p ch) nil)               ; keep skipping
-            ((eql ch #\;) (%skip-line-comment stream))  ; skip comment, keep going
+            ((%rt-ws-p ch rt) nil)               ; keep skipping
+            ((eq (%read-check-macro-rt ch rt) :semicolon)
+             (%skip-line-comment stream))  ; skip comment, keep going
             (t (return nil))))
         ;; Check for close paren
         (when (eql ch #\))
@@ -1309,7 +1322,7 @@
           (let ((next (read-char stream nil nil t)))
             (cond
               ((null next) (%reader-error "end of file after dot"))
-              ((or (%whitespace-char-p next) (eql next #\)) (%terminating-macro-p next rt))
+              ((or (%rt-ws-p next rt) (eql next #\)) (%terminating-macro-p next rt))
                ;; It's the consing dot.  Under *read-suppress* the list
                ;; elements are NOT accumulated (result stays nil even
                ;; after reading items — see the (not *read-suppress*)
@@ -1328,7 +1341,7 @@
                    (loop
                      (setq close-ch (read-char stream nil nil t))
                      (when (null close-ch) (%reader-error "end of file after dotted pair"))
-                     (unless (%whitespace-char-p close-ch) (return nil)))
+                     (unless (%rt-ws-p close-ch rt) (return nil)))
                    (unless (eql close-ch #\))
                      (%reader-error "more than one object after dot")))
                  ;; Set cdr of last cons
@@ -1367,14 +1380,16 @@
 
 ;;; --- String reader ---
 
-(defun %read-string (stream)
-  "Read a string delimited by double-quotes."
+(defun %read-string (stream &optional (delim #\"))
+  "Read a string ended by DELIM, the character that opened it.  That is
+   not always the double quote: SET-SYNTAX-FROM-CHAR can give another
+   character string syntax (upstream SET-SYNTAX-FROM-CHAR.DOUBLE-QUOTE)."
   (let ((chars nil))
     (loop
       (let ((ch (read-char stream nil nil t)))
         (when (null ch) (%reader-error "end of file reading string"))
         (cond
-          ((eql ch #\")
+          ((eql ch delim)
            ;; End of string
            (if *read-suppress* (return nil)
                (return (%codes-to-string (nreverse chars)))))
@@ -2245,7 +2260,7 @@
           (setq kw-cur (cddr kw-cur))))
       ;; Second pass: assign known kwargs and remember the first bad
       ;; key (signalled at the end if allow-other-keys is still nil).
-      (let ((kw-cur kwargs))
+      (let ((kw-cur kwargs) (seen nil))
         (loop
           (when (null kw-cur) (return nil))
           ;; Odd-length kwarg list — value missing.  CLHS 3.4.1.4.1:
@@ -2257,10 +2272,13 @@
             (return nil))
           (let ((key (car kw-cur))
                 (val (cadr kw-cur)))
+            ;; The LEFTMOST occurrence of a keyword wins (CLHS 3.4.1.4;
+            ;; upstream READ-FROM-STRING.11/.12).
             (cond
-              ((eq key :start) (setq start val))
-              ((eq key :end) (setq end val))
-              ((eq key :preserve-whitespace) (setq preserve-whitespace val))
+              ((eq key :start) (unless (getf seen :start) (setq start val) (setf (getf seen :start) t)))
+              ((eq key :end) (unless (getf seen :end) (setq end val) (setf (getf seen :end) t)))
+              ((eq key :preserve-whitespace)
+               (unless (getf seen :pw) (setq preserve-whitespace val) (setf (getf seen :pw) t)))
               ((eq key :allow-other-keys) nil)
               (t (when (null bad-key) (setq bad-key key)))))
           (setq kw-cur (cddr kw-cur))))

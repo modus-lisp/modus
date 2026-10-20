@@ -1946,7 +1946,15 @@
             (unless (eql a 0)
               (return-from symbol-value (values (mem-ref a :u64))))))))
     (let ((tbl (%globals-table)))
-      (if (and tbl key) (values (gethash key tbl)) nil))))
+      (if (and tbl key)
+          (multiple-value-bind (v found) (gethash key tbl)
+            ;; A SYMBOL with no value is UNBOUND-VARIABLE (CLHS SYMBOL-VALUE;
+            ;; upstream SYMBOL-VALUE.ERROR.5).  The INTEGER path -- every
+            ;; compiled global read -- keeps answering NIL.
+            (if (or found (integerp name-or-hash))
+                v
+                (error 'unbound-variable :name name-or-hash)))
+          nil))))
 
 (defun boundp (sym)
   "True if SYM has a value in the global symbol-value alist (#x10000080).

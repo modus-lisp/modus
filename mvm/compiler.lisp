@@ -11630,7 +11630,8 @@
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
                          (list sv (cond (cell `(%gv-cell-ref (quote ,cell) ,k))
                                         (slot `(%gv-ref-fill ,k ,slot))
-                                        (site `(%gv-site-ref ,k (quote ,site)))
+                                        (site (%site-fast site '(cdr c)
+                                                          `(%gv-site-ref ,k (quote ,site))))
                                         (t `(%gv-ref ,k))))))
                      save-vars specials))
            ;; Per-special TEMP names — carry the init value without
@@ -11656,7 +11657,8 @@
                                 (site (and (not cell) (not slot) (%let-special-site spec k))))
                            (push (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
                                        (slot `(%dynbind-c ,k ,tmp ,slot))
-                                       (site `(%dynbind-site ,k ,tmp (quote ,site)))
+                                       (site (%site-fast site `(progn (set-cdr c ,tmp) ,tmp)
+                                                         `(%dynbind-site ,k ,tmp (quote ,site))))
                                        (t `(%dynbind ,k ,tmp)))
                                  acc))))
                      specials temp-vars)
@@ -11669,7 +11671,8 @@
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
                                (slot `(%dynunbind-c ,k ,sv ,slot))
-                               (site `(%dynunbind-site ,k ,sv (quote ,site)))
+                               (site (%site-fast site `(progn (set-cdr c ,sv) ,sv)
+                                                 `(%dynunbind-site ,k ,sv (quote ,site))))
                                (t `(%dynunbind ,k ,sv)))))
                      save-vars specials))
            (stripped-body (%special-shadow-body %all-declared-specials env
@@ -12651,6 +12654,21 @@
    runtime-compiled read, save, bind and restore of it that had no cell at
    compile time -- they all want the same cell, so they share the cons.")
 
+(defun %site-fast (site fast slow)
+  "A per-site special access (see %GV-SITE-CELL) with its common case inline:
+   once SITE's car holds the variable's cell and the image has not armed
+   threads (the word %RT-ENTER and %DYNBIND test), FAST -- a form over the
+   variable C, the cell -- else SLOW, the out-of-line call that also fills the
+   site.  Each access used to be that call, which itself called
+   %GV-SITE-CELL: two calls per read, bind and unbind of a special defined
+   with no value (DEFVAR *X*), the common way to declare one that is only
+   ever bound -- cl-bench STAK, 12x SBCL, ~73% of it in those calls."
+  (let ((c (%mvm-gensym "SITEC")))
+    `(let ((,c (car (quote ,site))))
+       (if (and ,c (eql (mem-ref #x10000DB8 :u32) 0))
+           ,(subst c 'c fast)
+           ,slow))))
+
 (defun %let-special-site (spec bind-key)
   "At a RUNTIME compile, for a special with no cell yet whose read and write
    keys agree: the per-site cache cons the LET's save / bind / restore share
@@ -12940,8 +12958,9 @@
         ;; No cell yet: a per-site cache cons (filled once the cell exists).
         (let ((site (%let-special-site name (%global-name-key name))))
           (compile-form (if site
-                            `(%e2-symbol-value-site ,(%global-name-key name)
-                                                    (quote ,name) (quote ,site))
+                            (%site-fast site '(cdr c)
+                                        `(%e2-symbol-value-site ,(%global-name-key name)
+                                                                (quote ,name) (quote ,site)))
                             `(%e2-symbol-value-checked ,(%global-name-key name)
                                                        (quote ,name)))
                         env dest)))))

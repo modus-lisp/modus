@@ -8643,6 +8643,15 @@
       ;; cache -- see compile-let-with-specials.
       ((= op-name #.(compute-name-hash "%GV-SAVE-CACHED"))
        (%compile-global-read-cached (cadr form) (caddr form) env dest t))
+      ;; (%GV-SETQ-GLOBAL 'VAR VAL): the GLOBAL store of VAR (inline through
+      ;; the cell cache when it has a slot), whatever VAR means lexically here.
+      ;; A LET of a special binds and restores with it: a plain (SETQ VAR ..)
+      ;; at that point is compiled where an outer LEXICAL VAR may be visible,
+      ;; and assigned that instead (ANSI LET.14: (let ((x 1)) (let (x)
+      ;; (declare (special x)) x))).
+      ((= op-name #.(compute-name-hash "%GV-SETQ-GLOBAL"))
+       (compile-form (caddr form) env dest)
+       (%compile-setq-global (cadr (cadr form)) dest))
       ((= op-name #.(compute-name-hash "%PRIM-AREF"))
        (compile-prim-aref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%PRIM-ARRAYP"))
@@ -11752,12 +11761,12 @@
                                 (slot (and (not cell) (%gv-aot-slot k spec)))
                                 (site (and (not cell) (not slot) (%let-special-site spec k))))
                            ;; Unarmed, a binding is a store into the cell: the
-                           ;; inline cached SETQ, three calls before.  Armed,
+                           ;; inline cached global store, three calls before.  Armed,
                            ;; %DYNBIND-C makes this thread's own binding.
                            (push (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
                                        ((and slot (eql k (%global-name-key spec)))
                                         `(if (eql (mem-ref #x10000DB8 :u32) 0)
-                                             (setq ,spec ,tmp)
+                                             (%gv-setq-global (quote ,spec) ,tmp)
                                              (%dynbind-c ,k ,tmp ,slot)))
                                        (slot `(%dynbind-c ,k ,tmp ,slot))
                                        (site (%site-fast site `(progn (set-cdr c ,tmp) ,tmp)
@@ -11775,7 +11784,7 @@
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
                                ((and slot (eql k (%global-name-key spec)))
                                 `(if (eql (mem-ref #x10000DB8 :u32) 0)
-                                     (setq ,spec ,sv)
+                                     (%gv-setq-global (quote ,spec) ,sv)
                                      (%dynunbind-c ,k ,sv ,slot)))
                                (slot `(%dynunbind-c ,k ,sv ,slot))
                                (site (%site-fast site `(progn (set-cdr c ,sv) ,sv)

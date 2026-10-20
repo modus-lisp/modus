@@ -746,7 +746,9 @@
 ;;; *GF-FIND-MEMO*.
 (defvar *clos-reg-memo* nil)
 
-(defun %clos-reg-memo-drop () (setq *clos-reg-memo* nil))
+(defvar *%init-plans* nil)   ; MAKE-INSTANCE plans, see %INIT-PLAN
+
+(defun %clos-reg-memo-drop () (setq *clos-reg-memo* nil) (setq *%init-plans* nil))
 
 (defun %clos-reg-memo-vector ()
   (let ((v (make-array 9)) (i 0))
@@ -1704,6 +1706,9 @@
    Takes a LIST rather than a &rest tail because modus's funcall+&rest
    path collapses arguments when nargs > +max-reg-args+, which would
    silently drop trailing initargs."
+  (when (and (consp args) (car args) (symbolp (car args)))
+    (let ((r (%make-instance-planned (car args) (cdr args))))
+      (unless (eq r :no) (return-from %make-instance-list r))))
   (cond
     ((null args) (error "make-instance: requires a class designator"))
     (t
@@ -1746,6 +1751,119 @@
          (setq *clos-applying-defaults* saved-defaults))
        inst))))
 
+;;; INSTANTIATION PLANS.  MAKE-INSTANCE of a class that no INITIALIZE-INSTANCE
+;;; or SHARED-INITIALIZE method applies to, with no class-allocated slots and
+;;; no default initargs, is: allocate, store each initarg's slots (leftmost
+;;; wins), run the initforms of the slots still unset.  The general path asks
+;;; the registries for each of those by name -- validation, the GF checks, the
+;;; CPL-walking initarg and initform lookups -- about 3 us an instance.  A plan
+;;; is built once per class from the same lookups and stamped like
+;;; *CLOS-AOK-MEMO* (epoch + the two GFs' method lists); the registries' own
+;;; drop (%CLOS-REG-MEMO-DROP) drops every plan.  Plan = #(N-SLOTS THUNKS AOK
+;;; KEYS EPOCH II-METHODS SI-METHODS), KEYS ((key . slot-indices) ...) filled
+;;; as keys are seen; a non-simple class stores :COMPLEX in place of N-SLOTS.
+(defun %init-plan-gf-methods (name)
+  (let ((gf (%find-gf name))) (and gf (%gf-methods gf))))
+
+(defun %init-plan-build (class-name)
+  (let ((cls (%find-clos-class class-name))
+        (ep (%gf-cache-epoch))
+        (iim (%init-plan-gf-methods 'initialize-instance))
+        (sim (%init-plan-gf-methods 'shared-initialize)))
+    (flet ((complex () (vector :complex nil nil nil ep iim sim)))
+      (if (null cls)
+          (complex)
+          (let* ((names (aref cls 2)) (n (length names)))
+            (cond
+              ((>= n 60) (complex))
+              ((%clos-default-initargs-for-class class-name) (complex))
+              ((let ((c names) (any nil))
+                 (loop (when (null c) (return any))
+                   (when (%slot-class-owner class-name (car c)) (setq any t) (return any))
+                   (setq c (cdr c))))
+               (complex))
+              ((let ((probe (%make-instance class-name)))
+                 (or (null probe)
+                     (and iim (%collect-applicable-methods (%find-gf 'initialize-instance)
+                                                           (list probe)))
+                     (and sim (%collect-applicable-methods (%find-gf 'shared-initialize)
+                                                           (list probe t)))))
+               (complex))
+              (t
+               (let ((thunks (make-array n)) (c names) (i 0))
+                 (loop (when (null c) (return nil))
+                   (setf (svref thunks i) (%clos-initform-thunk class-name (car c)))
+                   (setq c (cdr c))
+                   (setq i (+ i 1)))
+                 (vector n thunks (if (%clos-methods-accept-other-initargs-p class-name) t nil)
+                         nil ep iim sim)))))))))
+
+(defun %init-plan (class-name)
+  "CLASS-NAME's current plan (see above), or NIL off the main thread."
+  (when (%gf-cache-writable-p)
+    (let ((tbl *%init-plans*))
+      (unless tbl
+        (setq tbl (make-hash-table :test (quote eq)))
+        (setq *%init-plans* tbl))
+      (let ((p (gethash class-name tbl)))
+        (if (and p (eql (svref p 4) (%gf-cache-epoch))
+                 (eq (svref p 5) (%init-plan-gf-methods 'initialize-instance))
+                 (eq (svref p 6) (%init-plan-gf-methods 'shared-initialize)))
+            p
+            (let ((np (%init-plan-build class-name)))
+              (puthash class-name tbl np)
+              np))))))
+
+(defun %init-plan-key-slots (plan class-name key)
+  "Slot indices KEY initializes for PLAN's class (a list, maybe empty)."
+  (let ((e (let ((c (svref plan 3)))
+             (loop (when (null c) (return nil))
+               (when (eq (car (car c)) key) (return (car c)))
+               (setq c (cdr c))))))
+    (if e
+        (cdr e)
+        (let* ((cls (%find-clos-class class-name))
+               (idxs (let ((acc nil) (sl (%clos-initarg-to-slots class-name key)))
+                       (loop (when (null sl) (return (nreverse acc)))
+                         (let ((ix (%clos-slot-index cls (car sl))))
+                           (when (>= ix 0) (setq acc (cons ix acc))))
+                         (setq sl (cdr sl))))))
+          (setf (svref plan 3) (cons (cons key idxs) (svref plan 3)))
+          idxs))))
+
+(defun %make-instance-planned (class-name initargs)
+  "The instance by CLASS-NAME's plan, or :NO when the plan does not cover
+   this call (complex class, an unknown key, :ALLOW-OTHER-KEYS, a malformed
+   list) -- the caller then runs the general path from the start."
+  (let ((plan (%init-plan class-name)))
+    (when (or (null plan) (eq (svref plan 0) :complex))
+      (return-from %make-instance-planned :no))
+    (let ((inst (%make-instance class-name)) (mask 0) (cur initargs)
+          (n (svref plan 0)) (aok (svref plan 2)))
+      (when (null inst) (return-from %make-instance-planned :no))
+      (loop
+        (when (null cur) (return nil))
+        (unless (and (consp cur) (consp (cdr cur)) (symbolp (car cur)))
+          (return-from %make-instance-planned :no))
+        (let ((key (car cur)))
+          (when (eq key :allow-other-keys) (return-from %make-instance-planned :no))
+          (let ((idxs (%init-plan-key-slots plan class-name key)))
+            (when (and (null idxs) (not aok)) (return-from %make-instance-planned :no))
+            (loop (when (null idxs) (return nil))
+              (let ((bit (ash 1 (car idxs))))
+                (when (zerop (logand mask bit))
+                  (setq mask (logior mask bit))
+                  (%word-aset inst (+ 2 (car idxs)) (car (cdr cur)))))
+              (setq idxs (cdr idxs)))))
+        (setq cur (cdr (cdr cur))))
+      (let ((thunks (svref plan 1)) (i 0))
+        (loop (when (>= i n) (return nil))
+          (when (zerop (logand mask (ash 1 i)))
+            (let ((th (svref thunks i)))
+              (when th (%word-aset inst (+ 2 i) (funcall th)))))
+          (setq i (+ i 1))))
+      inst)))
+
 (defun make-instance (&rest args)
   "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and dispatches
    INITIALIZE-INSTANCE on it with the initargs.  We bypass apply on
@@ -1770,14 +1888,16 @@
     (let* ((slot-names (aref cls 2))
            (n (length slot-names))
            (inst (make-array (+ 2 n))))
-      (aset inst 0 '%clos-instance)
-      (aset inst 1 class-name)
+      ;; The fresh vector's words directly (ASET dispatched on the array
+      ;; type per store).
+      (%word-aset inst 0 '%clos-instance)
+      (%word-aset inst 1 class-name)
       (let ((i 0))
         (loop
           (when (= i n) (return nil))
           ;; Use literal -999 (unbound sentinel) to avoid SYMBOL-VALUE clobbering
           ;; arr-reg (V0) in variable-index aset compilation
-          (aset inst (+ 2 i) -999)
+          (%word-aset inst (+ 2 i) -999)
           (setq i (+ i 1))))
       inst)))
 

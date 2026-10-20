@@ -20475,7 +20475,7 @@
         ;; div/mod emission with only 3 temps, reusing n-temp as the
         ;; MV-store address temp (a is dead by then) and dest as the
         ;; divisor register.
-        (progn
+        (let ((save-count (min *temp-reg-counter* 12)))
           (compile-form a env dest)
           (emit-ir :push dest)
           (compile-form b env dest)
@@ -20483,6 +20483,19 @@
                 (q-temp (alloc-temp-reg))   ; quotient
                 (r-temp (alloc-temp-reg)))  ; remainder
             (emit-ir :pop n-temp)
+            ;; THE CALLER'S LIVE TEMPS TOO, as in the non-spill branch below
+            ;; (SAVE THE CALLER'S LIVE TEMPS): this branch is taken exactly
+            ;; when the caller holds MANY temps, and it saved none of them.
+            ;; (setf (aref OUT b) (aref hv (floor b 4))) in a loop -- the
+            ;; inline FLOOR's truncate under a store -- lost OUT to IDIV's
+            ;; RDX, and the store signalled an index error against a
+            ;; length-0 "array" (natrium's SHA-512 output loop: every
+            ;; Ed25519 key on modus).
+            (when (> save-count 1)
+              (let ((r (+ +vreg-v4+ 1)))
+                (loop (when (>= r (+ +vreg-v4+ save-count)) (return))
+                  (unless (= r dest) (emit-ir :push r))
+                  (setq r (+ r 1)))))
             ;; quotient: :div clobbers RAX/RDX/RCX, save operands around it
             (emit-ir :push n-temp)
             (emit-ir :push dest)
@@ -20500,6 +20513,11 @@
             (emit-ir :li r-temp (ash 2 +fixnum-shift+))
             (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :mov dest q-temp)
+            (when (> save-count 1)
+              (let ((r (+ +vreg-v4+ save-count -1)))
+                (loop (when (< r (+ +vreg-v4+ 1)) (return))
+                  (unless (= r dest) (emit-ir :pop r))
+                  (setq r (- r 1)))))
             (free-temp-reg)
             (free-temp-reg)
             (free-temp-reg)))

@@ -1918,7 +1918,9 @@
    new mask."
   (dolist (pr prs mask)
     (when (eql (logand mask (cdr pr)) 0)
-      (aset inst (+ 2 (car pr)) val)
+      ;; %WORD-ASET: the instance is a plain vector, and ASET dispatched on
+      ;; the array type per store.
+      (%word-aset inst (+ 2 (car pr)) val)
       (setq mask (logior mask (cdr pr))))))
 
 (defun %clos-plan-init (plan class-name inst initargs)
@@ -1951,7 +1953,7 @@
     (dolist (f (svref plan 5))
       (when (and (eql (logand mask (cadr f)) 0)
                  (eql (aref inst (+ 2 (car f))) -999))
-        (aset inst (+ 2 (car f)) (funcall (cddr f)))))
+        (%word-aset inst (+ 2 (car f)) (funcall (cddr f)))))
     inst))
 
 (defun %make-instance-planned (plan class-name initargs)
@@ -1959,11 +1961,11 @@
   (%clos-plan-validate plan class-name initargs)
   (let* ((n (svref plan 2))
          (inst (make-array (+ 2 n))))
-    (aset inst 0 '%clos-instance)
-    (aset inst 1 class-name)
+    (%word-aset inst 0 '%clos-instance)
+    (%word-aset inst 1 class-name)
     (let ((i 0))
       (loop (when (= i n) (return nil))
-        (aset inst (+ 2 i) -999)
+        (%word-aset inst (+ 2 i) -999)
         (setq i (+ i 1))))
     (%clos-plan-init plan class-name inst initargs)))
 
@@ -1991,14 +1993,14 @@
     (let* ((slot-names (aref cls 2))
            (n (length slot-names))
            (inst (make-array (+ 2 n))))
-      (aset inst 0 '%clos-instance)
-      (aset inst 1 class-name)
+      (%word-aset inst 0 '%clos-instance)
+      (%word-aset inst 1 class-name)
       (let ((i 0))
         (loop
           (when (= i n) (return nil))
           ;; Use literal -999 (unbound sentinel) to avoid SYMBOL-VALUE clobbering
           ;; arr-reg (V0) in variable-index aset compilation
-          (aset inst (+ 2 i) -999)
+          (%word-aset inst (+ 2 i) -999)
           (setq i (+ i 1))))
       inst)))
 

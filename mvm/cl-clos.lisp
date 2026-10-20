@@ -378,7 +378,10 @@
           (progn
             (aset cls 2 effective-slots)
             (aset cls 3 supers)
-            (aset cls 4 cpl))
+            (aset cls 4 cpl)
+            ;; The memoised answers (instantiation plans among them) were
+            ;; derived from the old layout.
+            (%clos-reg-memo-drop))
           (progn
             (setq cls (make-array 5))
             (aset cls 0 '%clos-class)
@@ -749,8 +752,9 @@
 (defun %clos-reg-memo-drop () (setq *clos-reg-memo* nil))
 
 (defun %clos-reg-memo-vector ()
-  (let ((v (make-array 9)) (i 0))
-    (loop (when (= i 9) (return v))
+  ;; Slot 9 holds the per-class instantiation plans (%CLOS-INSTANCE-PLAN).
+  (let ((v (make-array 10)) (i 0))
+    (loop (when (= i 10) (return v))
       (setf (svref v i) (make-hash-table :test (quote eq)))
       (setq i (+ i 1)))))
 
@@ -1716,8 +1720,19 @@
             ;; regardless of whether the class resolves, so check it
             ;; BEFORE allocating (make-instance.error.2).
             (odd (oddp (length initargs)))
-            (inst (progn (when odd (%signal-program-error))
-                         (%make-instance class-or-name)))
+            (plan (progn (when odd (%signal-program-error))
+                         (and (symbolp class-name) class-name
+                              (%clos-instance-plan class-name)))))
+       (when (and plan (svref plan 1))
+         (return-from %make-instance-list
+           (%make-instance-planned plan class-name initargs))))
+     (let* ((class-or-name (car args))
+            (initargs (cdr args))
+            (class-name (if (%clos-class-p class-or-name)
+                            (aref class-or-name 1)
+                            class-or-name))
+            (inst (%make-instance class-or-name))
+            (plan (and (symbolp class-name) class-name (%clos-instance-plan class-name)))
             ;; make-instance applies default-initargs (CLHS 7.1.4); the
             ;; SHARED-INITIALIZE default body reads this flag.
             ;;
@@ -1739,12 +1754,218 @@
        ;; for genuine CLOS classes (registered); skip when inst allocation
        ;; succeeded but the class has no slot-info (defensive).
        (when (%find-clos-class class-name)
-         (%clos-validate-initargs class-name initargs))
+         (if (and plan (svref plan 8))
+             (%clos-plan-validate plan class-name initargs)
+             (%clos-validate-initargs class-name initargs)))
        (setq *clos-applying-defaults* t)
        (unwind-protect
             (%dispatch-initialize-instance (cons inst initargs))
          (setq *clos-applying-defaults* saved-defaults))
        inst))))
+
+;;; ---- THE INSTANTIATION PLAN ----
+;;;
+;;; Everything MAKE-INSTANCE's default protocol looks up -- which slots each
+;;; initarg fills, the class's default initargs and the slots they fill, each
+;;; slot's initform, whether an initarg list is valid -- depends on the class
+;;; and on the methods of the initialization GFs, not on the call.  cl-bench
+;;; CLOS/simple-instantiate spent ~3 us per instance re-deriving it:
+;;; validation 31%, the slot-filling walk 45%, most of both in memo-table
+;;; GETHASHes per slot and per initarg.
+;;;
+;;; So the answers are computed once per class into a PLAN, kept in slot 9 of
+;;; *CLOS-REG-MEMO* -- which every class or slot-registry change drops -- and
+;;; stamped with *CLOS-METHOD-GEN*, which every method-list change bumps.
+;;; Three uses, each with its own condition:
+;;;   VALIDATE  the initarg key lists already validated (validity depends only
+;;;             on the keys once :ALLOW-OTHER-KEYS is ruled out); not for a
+;;;             class with an :ALLOW-OTHER-KEYS default initarg.
+;;;   FILL      the default SHARED-INITIALIZE body for SLOT-NAMES T under
+;;;             MAKE-INSTANCE; not with a class-allocated slot, more than 60
+;;;             slots, or an initarg naming a slot missing from the layout.
+;;;   DIRECT    MAKE-INSTANCE without dispatching INITIALIZE-INSTANCE at all:
+;;;             FILL, and no INITIALIZE-INSTANCE / SHARED-INITIALIZE method
+;;;             could apply.
+;;; A class none of them covers takes the general path, unchanged.
+;;;
+;;; Plan: #(gen direct-p nslots initarg-map defaults initforms sigs
+;;;         fill-p validate-p)
+;;;   initarg-map  ((key (idx . bit) ...) ...)
+;;;   defaults     ((key thunk (idx . bit) ...) ...)   CPL order
+;;;   initforms    ((idx bit . thunk) ...)
+;;;   sigs         validated initarg key lists
+
+(defun %clos-plan-idxs (cls class-name key)
+  "The (index . bit) pairs of the slots initarg KEY fills, or :MISSING when
+   one of them is not in CLS's layout (a superclass redefined under it):
+   SET-SLOT-VALUE's SLOT-MISSING is the answer there, so no FILL."
+  (let ((acc nil))
+    (dolist (nm (%clos-initarg-to-slots class-name key) (nreverse acc))
+      (let ((i (%clos-slot-index cls nm)))
+        (if (>= i 0)
+            (setq acc (cons (cons i (ash 1 i)) acc))
+            (return :missing))))))
+
+(defun %clos-plan-methods-apply-p (gf-name cpl-names)
+  "True if some method of GF-NAME could apply to an instance whose class
+   has CPL-NAMES (a non-symbol specializer counts as applicable)."
+  (let ((gf (%find-gf gf-name)))
+    (and gf
+         (dolist (m (%gf-methods gf) nil)
+           (let ((spec (car (%method-specializers m))))
+             (when (or (not (symbolp spec))
+                       (%clos-cpl-name-member-p spec cpl-names))
+               (return t)))))))
+
+(defun %clos-instance-plan-build (class-name)
+  (let ((p (make-array 9))
+        (cls (%find-clos-class class-name)))
+    (aset p 0 (%clos-method-gen))
+    (aset p 1 nil) (aset p 6 nil) (aset p 7 nil) (aset p 8 nil)
+    (when cls
+      (let* ((names (aref cls 2))
+             (n (length names))
+             (cpl (%clos-class-cpl-names class-name))
+             (dis (%clos-default-initargs-for-class class-name))
+             (imap nil) (defs nil) (ifs nil) (i 0)
+             (fill (and (<= n 60)
+                        (dolist (nm names t)
+                          (when (%slot-class-owner class-name nm) (return nil))))))
+        (aset p 8 (dolist (e dis t)
+                    (when (%clos-sym-name-eq (car e) :allow-other-keys) (return nil))))
+        (when fill
+          (dolist (nm names)
+            (let ((th (%clos-initform-thunk class-name nm)))
+              (when th (setq ifs (cons (cons i (cons (ash 1 i) th)) ifs))))
+            (setq i (+ i 1)))
+          ;; Every key some class of the CPL names as a slot initarg.
+          (dolist (c cpl)
+            (let ((info (%clos-slot-info-for c)))
+              (dolist (e (and info (car info)))
+                (let ((k (car e)))
+                  (unless (assoc k imap :test (function eq))
+                    (let ((prs (%clos-plan-idxs cls class-name k)))
+                      (when (eq prs :missing) (setq fill nil))
+                      (setq imap (cons (cons k prs) imap))))))))
+          (dolist (e dis)
+            (let ((prs (%clos-plan-idxs cls class-name (car e))))
+              (when (eq prs :missing) (setq fill nil))
+              (setq defs (cons (cons (car e) (cons (cdr e) prs)) defs)))))
+        (aset p 2 n)
+        (aset p 3 imap)
+        (aset p 4 (nreverse defs))
+        (aset p 5 (nreverse ifs))
+        (aset p 7 fill)
+        (aset p 1 (and fill (svref p 8)
+                       (not (%clos-plan-methods-apply-p 'initialize-instance cpl))
+                       (not (%clos-plan-methods-apply-p 'shared-initialize cpl))))))
+    p))
+
+(defvar *clos-last-plan* nil
+  "#(memo-vector class-name plan): the last plan %CLOS-INSTANCE-PLAN found,
+   valid while *CLOS-REG-MEMO* is that vector and the plan's stamp holds.")
+
+(defun %clos-instance-plan (class-name)
+  "CLASS-NAME's instantiation plan, or NIL (no such class, or a worker thread
+   before the main thread built one).  Built and stored on the main thread
+   only."
+  (let ((v *clos-reg-memo*)
+        (last *clos-last-plan*))
+    (if (and last v (eq (svref last 0) v) (eq (svref last 1) class-name)
+             (eql (svref (svref last 2) 0) (%clos-method-gen)))
+        (svref last 2)
+        (let ((hit (and v (gethash class-name (svref v 9)))))
+          (if (and hit (eql (svref hit 0) (%clos-method-gen)))
+              (progn (when (%gf-cache-writable-p)
+                       (setq *clos-last-plan* (vector v class-name hit)))
+                     hit)
+              (if (and (%gf-cache-writable-p) (%find-clos-class class-name))
+                  (let ((p (%clos-instance-plan-build class-name))
+                        (v2 *clos-reg-memo*))
+                    (when (null v2)
+                      (setq v2 (%clos-reg-memo-vector))
+                      (setq *clos-reg-memo* v2))
+                    (puthash class-name (svref v2 9) p)
+                    p)
+                  nil))))))
+
+(defun %clos-plan-sig-p (sig initargs)
+  "True if SIG lists exactly INITARGS's keys, in order, by EQ."
+  (loop
+    (when (null initargs) (return (null sig)))
+    (when (or (null sig) (not (eq (car sig) (car initargs)))) (return nil))
+    (setq sig (cdr sig))
+    (setq initargs (cddr initargs))))
+
+(defun %clos-plan-validate (plan class-name initargs)
+  "%CLOS-VALIDATE-INITARGS through PLAN's memo of validated key lists."
+  (unless (dolist (sig (svref plan 6) nil)
+            (when (%clos-plan-sig-p sig initargs) (return t)))
+    (%clos-validate-initargs class-name initargs)
+    ;; Valid.  Remember the key list unless :ALLOW-OTHER-KEYS is among the
+    ;; keys -- then validity turned on its VALUE, not just the keys.
+    (let ((keys nil) (aok nil) (cur initargs))
+      (loop (when (null cur) (return nil))
+        (when (%clos-sym-name-eq (car cur) :allow-other-keys) (setq aok t))
+        (setq keys (cons (car cur) keys))
+        (setq cur (cddr cur)))
+      (when (and (not aok) (%gf-cache-writable-p)
+                 (< (length (svref plan 6)) 8))
+        (aset plan 6 (cons (nreverse keys) (svref plan 6)))))))
+
+(defun %clos-plan-fill (inst prs val mask)
+  "Store VAL into each slot of PRS ((idx . bit) ...) not yet in MASK; the
+   new mask."
+  (dolist (pr prs mask)
+    (when (eql (logand mask (cdr pr)) 0)
+      (aset inst (+ 2 (car pr)) val)
+      (setq mask (logior mask (cdr pr))))))
+
+(defun %clos-plan-init (plan class-name inst initargs)
+  "The default SHARED-INITIALIZE of INST for SLOT-NAMES T under MAKE-INSTANCE,
+   through PLAN -- as %SHARED-INIT-DEFAULT-SPREAD does it: explicit initargs
+   (leftmost wins per slot), then each default initarg whose key was not
+   supplied (evaluated, filling its slots not yet filled), then the initform
+   of every slot neither filled nor already bound."
+  (let ((imap (svref plan 3)) (mask 0) (cur initargs))
+    (loop
+      (when (or (null cur) (null (cdr cur))) (return nil))
+      (let* ((key (car cur))
+             (e (let ((m imap))
+                  (loop (when (null m) (return nil))
+                    (when (eq (car (car m)) key) (return (car m)))
+                    (setq m (cdr m))))))
+        ;; A key the map does not hold by EQ (a method's &KEY, or the same
+        ;; name as another symbol object) is looked up the general way.
+        (if e
+            (setq mask (%clos-plan-fill inst (cdr e) (cadr cur) mask))
+            (let ((prs (%clos-plan-idxs (%find-clos-class class-name) class-name key)))
+              (if (eq prs :missing)
+                  (dolist (nm (%clos-initarg-to-slots class-name key))
+                    (set-slot-value inst nm (cadr cur)))
+                  (setq mask (%clos-plan-fill inst prs (cadr cur) mask))))))
+      (setq cur (cddr cur)))
+    (dolist (d (svref plan 4))
+      (unless (%initargs-has-key-p initargs (car d))
+        (setq mask (%clos-plan-fill inst (cddr d) (funcall (cadr d)) mask))))
+    (dolist (f (svref plan 5))
+      (when (and (eql (logand mask (cadr f)) 0)
+                 (eql (aref inst (+ 2 (car f))) -999))
+        (aset inst (+ 2 (car f)) (funcall (cddr f)))))
+    inst))
+
+(defun %make-instance-planned (plan class-name initargs)
+  "MAKE-INSTANCE through a DIRECT plan: validate, allocate, initialize."
+  (%clos-plan-validate plan class-name initargs)
+  (let* ((n (svref plan 2))
+         (inst (make-array (+ 2 n))))
+    (aset inst 0 '%clos-instance)
+    (aset inst 1 class-name)
+    (let ((i 0))
+      (loop (when (= i n) (return nil))
+        (aset inst (+ 2 i) -999)
+        (setq i (+ i 1))))
+    (%clos-plan-init plan class-name inst initargs)))
 
 (defun make-instance (&rest args)
   "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and dispatches
@@ -2488,7 +2709,19 @@
 ;; lack slot 4.  Guard via array-length.
 (defun %gf-lambda-list (gf)
   (if (>= (array-length gf) 5) (aref gf 4) nil))
-(defun %gf-set-methods (gf m) (aset gf 2 m) (%gf-cache-clear gf))
+(defvar *clos-method-gen* 0
+  "Bumped whenever any generic function's method list changes; stamps the
+   instantiation plans (%CLOS-INSTANCE-PLAN), which depend on the methods of
+   INITIALIZE-INSTANCE, SHARED-INITIALIZE and ALLOCATE-INSTANCE.")
+
+(defun %clos-method-gen ()
+  ;; INTEGERP, as %GF-CACHE-EPOCH: CLOS runs before every defvar initform has.
+  (if (integerp *clos-method-gen*) *clos-method-gen* 0))
+
+(defun %gf-set-methods (gf m)
+  (aset gf 2 m)
+  (%gf-cache-clear gf)
+  (setq *clos-method-gen* (+ (%clos-method-gen) 1)))
 (defun %gf-set-combination (gf c) (aset gf 3 c) (%gf-cache-clear gf))
 (defun %gf-set-lambda-list (gf ll)
   (when (>= (array-length gf) 5) (aset gf 4 ll))
@@ -7327,6 +7560,14 @@
            (cls        (%find-clos-class class-name)))
       (when (null cls)
         (return-from %shared-init-default-spread instance))
+      ;; Under MAKE-INSTANCE, for every slot: the class's plan, when it has a
+      ;; FILL (see THE INSTANTIATION PLAN) and the instance has its layout.
+      (when (and (eq slot-names t) *clos-applying-defaults* (symbolp class-name))
+        (let ((plan (%clos-instance-plan class-name)))
+          (when (and plan (svref plan 7)
+                     (= (array-length instance) (+ 2 (svref plan 2))))
+            (return-from %shared-init-default-spread
+              (%clos-plan-init plan class-name instance initargs)))))
       ;; Step 1: apply explicit initargs (leftmost wins).
       (let ((set-slots (%shared-init-apply-initargs
                         instance class-name initargs nil)))

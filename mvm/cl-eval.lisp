@@ -4574,7 +4574,9 @@
     ;; Every value produced by LI-FUNC / #'NAME carries this tag, so a
     ;; single mask+compare answers FUNCTIONP correctly without going
     ;; through the code-segment range check below.
-    ((= (logand x #x0F) 3) t)
+    ;; %LOWTAG, not (LOGAND X 15): X is any object, and LOGAND of a
+    ;; non-fixnum is a GENERIC-LOGAND call on every FUNCTIONP.
+    ((= (%lowtag x) 3) t)
     ;; Legacy untagged-fn-addr range check, kept for any path that
     ;; produces a raw native address without going through LI-FUNC.
     ;; The bottom-two-bits mask preserved here for the few odd-nibble

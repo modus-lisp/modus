@@ -2368,6 +2368,11 @@
           (declare (special *jit-hot-only*))
           (eval (car form))))))
 
+;; Debug aid: a function of (BYTES LENGTH) called with every x64 JIT page's
+;; native code before it is copied out (a script sets it to dump the bytes
+;; for objdump).  NIL in normal use.
+(defvar *jit-native-dump-hook* nil)
+
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -2515,6 +2520,8 @@
     ;; an uncovered index is an unmapped read, i.e. an undiagnosable SIGSEGV.
     (unless (%jit-constvec-covers-p *x64-li-const-patches* "build")
       (return-from %jit-translate-page-1 nil))
+    (when *jit-native-dump-hook*
+      (funcall *jit-native-dump-hook* (code-buffer-bytes nbuf) (code-buffer-position nbuf)))
     (let* ((nlen (code-buffer-position nbuf))
            (nbytes (code-buffer-bytes nbuf))
            (relocs *x64-call-relocs*)

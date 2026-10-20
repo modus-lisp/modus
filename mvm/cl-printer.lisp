@@ -740,7 +740,7 @@
              (when (null cur) (return nil))
              (%print-char 32 stream)   ; space
              ;; slot keyword — intern :SLOTNAME in the KEYWORD package
-             (let ((kw (intern (symbol-name (car cur)) (find-package "KEYWORD"))))
+             (let ((kw (intern (symbol-name (car cur)) (%keyword-package))))
                (%write-obj kw stream level escape))
              (%print-char 32 stream)
              (%write-obj (aref obj (+ 2 i)) stream
@@ -5129,7 +5129,37 @@
 
 ;; ANSI: (write-string str &optional stream &key start end)
 ;; Honor :start/:end for substring writes.
+(defun %sos-push-codes (data str start end)
+  "Push the codes of plain string STR[START,END) onto string-output DATA."
+  (let ((acc (car data)) (i start))
+    (loop
+      (when (>= i end) (return nil))
+      (setq acc (cons (%word-aref str i) acc))
+      (setq i (+ i 1)))
+    (set-car data acc)))
+
 (defun write-string (str &rest args)
+  ;; FAST PATH: a plain string onto a string-output stream, with no keywords
+  ;; or only :START / :END (fixnums in range) -- the shape of every
+  ;; serializer's flush.  The general path below validated the plist twice,
+  ;; resolved the stream and pushed each character through two calls.
+  (let ((sa (car args)))
+    (when (and (consp sa) (eql (car sa) 7770001) (consp (cdr sa)) (eql (car (cdr sa)) 2)
+               (%prim-simple-string-p str))
+      (let ((kw (cdr args)) (start 0) (end nil) (start-set nil) (end-set nil) (ok t))
+        (loop
+          (when (null kw) (return nil))
+          (unless (consp (cdr kw)) (setq ok nil) (return nil))
+          (cond ((eq (car kw) :start) (unless start-set (setq start (car (cdr kw))) (setq start-set t)))
+                ((eq (car kw) :end) (unless end-set (setq end (car (cdr kw))) (setq end-set t)))
+                (t (setq ok nil) (return nil)))
+          (setq kw (cdr (cdr kw))))
+        (when ok
+          (let ((n (array-length str)))
+            (when (null end) (setq end n))
+            (when (and (fixnump start) (fixnump end) (<= 0 start) (<= start end) (<= end n))
+              (%sos-push-codes (cdr (cdr sa)) str start end)
+              (return-from write-string str)))))))
   ;; CLHS 3.4.1.4 kwarg validation for the post-stream tail.  Recognised
   ;; keys: :start :end :allow-other-keys.  (write-string.error.3/4)
   (when args
@@ -5171,11 +5201,17 @@
            (len (length str))
            (eff-end (if end end len)))
       (if (and (streamp s) (not (= (%stream-type s) 8)))
-          (let ((i start))
-            (loop
-              (when (>= i eff-end) (return nil))
-              (%write-char-to-stream (%ensure-char-code (aref str i)) s)
-              (setq i (+ i 1))))
+          (if (and (= (%stream-type s) 2) (%prim-simple-string-p str)
+                   (fixnump start) (fixnump eff-end) (<= 0 start) (<= eff-end len))
+              ;; A plain string onto a string-output stream: push the code
+              ;; words straight onto its list (two calls and a generic AREF
+              ;; per character before).
+              (%sos-push-codes (%stream-data s) str start eff-end)
+              (let ((i start))
+                (loop
+                  (when (>= i eff-end) (return nil))
+                  (%write-char-to-stream (%ensure-char-code (aref str i)) s)
+                  (setq i (+ i 1)))))
           ;; Serial fallback only handles whole-string writes; emulate.
           (let ((i start))
             (loop
@@ -5247,13 +5283,15 @@
   ;; CLHS: write-char takes char + optional stream — at most one trailing
   ;; arg.  A 3rd positional arg signals program-error.  (write-char.error.2)
   (when (cdr stream-arg) (%signal-program-error))
-  (let ((saved-ch ch))
-    (let ((code (%ensure-char-code saved-ch)))
-      (let ((s (if stream-arg
-                   (%resolve-output-stream (car stream-arg))
-                   (%resolve-output-stream nil))))
-        (%write-char-to-stream code s)))
-    saved-ch))
+  (let* ((code (if (characterp ch) (char-code ch) (%ensure-char-code ch)))
+         (sa (car stream-arg)))
+    ;; A string-output stream takes the code inline (it went through
+    ;; %RESOLVE-OUTPUT-STREAM and %WRITE-CHAR-TO-STREAM's dispatch).
+    (if (and (consp sa) (eql (car sa) 7770001) (consp (cdr sa)) (eql (car (cdr sa)) 2))
+        (let ((data (cdr (cdr sa))))
+          (set-car data (cons code (car data))))
+        (%write-char-to-stream code (%resolve-output-stream sa))))
+  ch)
 
 
 

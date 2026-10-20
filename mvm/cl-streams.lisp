@@ -211,9 +211,11 @@
           (let ((s (%make-string-array len))
                 (cur chars)
                 (i (- len 1)))
+            ;; The codes into the fresh plain string's words (ASET dispatched
+            ;; on the array type per character).
             (loop
               (when (null cur) (return s))
-              (aset s i (car cur))
+              (%word-aset s i (car cur))
               (setq cur (cdr cur))
               (setq i (- i 1)))))))))
 

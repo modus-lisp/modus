@@ -2109,14 +2109,16 @@
                (setf pc npc2))))
 
           ;; CMP-IMM / TEST-IMM: the immediate is a sign-extended WORD.  The
-          ;; compiler emits CMP-IMM only with a fixnum's word (2k), so its
-          ;; VALUE, the k compared here, is the word shifted down.
+          ;; compiler emits CMP-IMM with a fixnum's word (2k), whose VALUE k is
+          ;; compared with an integer register, or with a CHARACTER's word,
+          ;; compared for equality with the register's word (as :CMP does).
           (#.+op-cmp-imm+
            (multiple-value-bind (va npc) (%ifetch-reg bc pc)
              (multiple-value-bind (u npc2) (%ifetch-u32 bc npc)
-               (let ((a (svref regs va)) (b (ash (%imm32-signed u) -1)))
+               (let* ((a (svref regs va)) (w (%imm32-signed u)) (b (ash w -1)))
                  (setf (mvm-flags state)
-                       (cond ((integerp a) (cond ((= a b) 0) ((< a b) -1) (t 1)))
+                       (cond ((oddp w) (if (= (%mvm-word a) w) 0 1))
+                             ((integerp a) (cond ((= a b) 0) ((< a b) -1) (t 1)))
                              (t 1))))
                (setf pc npc2))))
 

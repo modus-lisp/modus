@@ -614,6 +614,15 @@
    eventually pointing at an array/string rather than NIL/list."
   (cond
     ((null seq) 0)
+    ;; A simple string or a byte vector: the header count, before the
+    ;; wrapper, MDA and not-a-sequence tests (76 ns -> a load).
+    ((%prim-simple-string-p seq) (array-length seq))
+    ((%prim-u8-vector-p seq) (array-length seq))
+    ;; A simple vector that is not a struct / instance / condition / complex
+    ;; underneath (those are not sequences): its header count.  It went
+    ;; through SYMBOLP, CHARACTERP, NUMBERP and FUNCTIONP first.
+    ((%prim-simple-vector-p seq)
+     (if (%marked-vector-p seq) (%signal-type-error) (array-length seq)))
     ;; No cons-based wrappers in this image: a cons is a list.
     ((and (consp seq) *%no-cons-array-wrappers*) (list-length seq))
     ((consp seq)
@@ -917,6 +926,21 @@
               (setq i (+ i 1))))
           nil))))
 
+(defun %svref-slow (a i)
+  "SVREF of anything but a plain simple vector: the generic AREF."
+  (aref a i))
+
+(defun %simple-string= (a b)
+  "Two plain #x31 strings with the same characters: lengths, then the code
+   words.  (STRING= parses keywords and string designators first.)"
+  (let ((n (array-length a)))
+    (and (= n (array-length b))
+         (let ((i 0))
+           (loop
+             (when (>= i n) (return t))
+             (unless (eq (%word-aref a i) (%word-aref b i)) (return nil))
+             (setq i (+ i 1)))))))
+
 (defun equal (a b)
   "Structural equality: EQL for atoms, recursive for conses,
    case-SENSITIVE element-wise for strings.  ANSI: EQUAL on strings
@@ -929,11 +953,13 @@
                   (equal (cdr a) (cdr b))
                   nil)
               nil)
-          (if (stringp a)
-              (if (stringp b)
-                  (string= a b)
-                  nil)
-              (%equal-other a b)))))
+          (if (and (%prim-simple-string-p a) (%prim-simple-string-p b))
+              (%simple-string= a b)
+              (if (stringp a)
+                  (if (stringp b)
+                      (string= a b)
+                      nil)
+                  (%equal-other a b))))))
 
 (defun %equal-other (a b)
   "EQUAL's remaining CLHS cases, off the cons/string fast path: BIT VECTORS
@@ -1907,7 +1933,8 @@
 ;;; the image's own code relies on; CLHS makes HASH-TABLE and LIST disjoint,
 ;;; and portable code dispatches on it -- jzon's object parser took a table for
 ;;; a list and every JSON object failed with a TYPE-ERROR.
-(defun %prim-simple-string-p (x) (%prim-simple-string-p x))   ; compiled inline (compiler.lisp)
+(defun %prim-simple-string-p (x) (%prim-simple-string-p x))
+(defun %lowtag (x) (%lowtag x))   ; compiled inline (compiler.lisp)   ; compiled inline (compiler.lisp)
 (defun %prim-u8-vector-p (x) (%prim-u8-vector-p x))   ; compiled inline (compiler.lisp)
 (defun %prim-simple-vector-p (x) (%prim-simple-vector-p x))   ; compiled inline (compiler.lisp)
 (defun %raw-consp (x) (consp x))   ; image code: CONSP is the raw tag test
@@ -3563,6 +3590,18 @@
 
 (defun subseq (seq start &rest end-arg)
   "Return a subsequence from START to END (END defaults to length)."
+  ;; A simple string with fixnum bounds in range: the code words copied
+  ;; directly (the general path below asked LENGTH twice and the bulk-copy
+  ;; predicates; JSON-SIMPLE:PARSE spent a fifth of its time here).
+  (when (%prim-simple-string-p seq)
+    (let* ((n (array-length seq))
+           (end (if (and end-arg (car end-arg)) (car end-arg) n)))
+      (when (and (fixnump start) (fixnump end) (<= 0 start) (<= start end) (<= end n)
+                 (< (- end start) 64))
+        (let* ((len (- end start)) (r (%make-string-array len)) (i 0))
+          (loop (when (>= i len) (return-from subseq r))
+            (%word-aset r i (%word-aref seq (+ start i)))
+            (setq i (+ i 1)))))))
   ;; An EXPLICIT nil end (CL: (subseq s start nil)) means \"to the end\" —
   ;; same as omitting it.  Guarding on end-arg alone left end=NIL, which the
   ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates

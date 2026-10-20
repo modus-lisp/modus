@@ -1883,22 +1883,25 @@
                           (- tz 1) tz)))
               (values q (generic-subtract n q))))
            (t (truncate n))))
-    (t
-     (let ((d (car rest)))
-       ;; |n| < |d| truncates to 0 with remainder n -- no bignum division.
-       ;; A float's exact rational has a denominator up to 2^1074, and
-       ;; (floor (rational 1.4d-45)) cost 52 ms in long division
-       ;; (upstream BIGNUM.FLOAT.COMPARE.4B: 16 s per tiny float).
-       (multiple-value-bind (q r) (if (and (integerp n) (integerp d) (not (eql d 0))
-                                           (< (abs n) (abs d)))
-                                      (values 0 n)
-                                      (truncate n d))
-         ;; truncate is toward zero; floor is toward negative infinity.
-         ;; If r != 0 and (sign r) != (sign d), q = q - 1, r = r + d.
-         (if (and (not (= r 0))
-                  (if (< d 0) (> r 0) (< r 0)))
-             (values (- q 1) (+ r d))
-             (values q r)))))))
+    (t (%floor2 n (car rest)))))
+
+(defun %floor2 (n d)
+  "Two-argument FLOOR.  The compiler's FLOOR expansion divides two fixnums
+   inline and calls this for everything else."
+  ;; |n| < |d| truncates to 0 with remainder n -- no bignum division.
+  ;; A float's exact rational has a denominator up to 2^1074, and
+  ;; (floor (rational 1.4d-45)) cost 52 ms in long division
+  ;; (upstream BIGNUM.FLOAT.COMPARE.4B: 16 s per tiny float).
+  (multiple-value-bind (q r) (if (and (integerp n) (integerp d) (not (eql d 0))
+                                      (< (abs n) (abs d)))
+                                 (values 0 n)
+                                 (truncate n d))
+    ;; truncate is toward zero; floor is toward negative infinity.
+    ;; If r != 0 and (sign r) != (sign d), q = q - 1, r = r + d.
+    (if (and (not (= r 0))
+             (if (< d 0) (> r 0) (< r 0)))
+        (values (- q 1) (+ r d))
+        (values q r))))
 
 (defun ceiling (n &rest rest)
   (cond

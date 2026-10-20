@@ -2553,6 +2553,12 @@
 
 (defun %write-char-to-stream (code stream)
   "Write a char code (integer) to a resolved stream. Caller must convert characters first."
+  ;; A string-output stream first, inline (STREAMP was a call per character).
+  (when (and (consp stream) (eql (car stream) 7770001) (consp (cdr stream))
+             (eql (car (cdr stream)) 2))
+    (let ((data (cdr (cdr stream))))
+      (set-car data (cons code (car data)))
+      (return-from %write-char-to-stream nil)))
   (if (not (streamp stream))
       (if (and *gray-root-class* (%clos-instance-p stream) (typep stream *gray-root-class*))
           (funcall *gray-write-char-fn* stream code)

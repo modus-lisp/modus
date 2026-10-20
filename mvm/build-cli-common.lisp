@@ -1261,6 +1261,12 @@
                    ;; BACKTRACES: the frame chain, named (needs %FRAME-POINTER).
                    (mvm-text "net/hosted-backtrace.lisp")
                    (string #\Newline)
+                   ;; PERFORMANCE COUNTERS and a sampling profiler over raw
+                   ;; perf_event_open (net/hosted-pmu.lisp): PMU-MEASURE,
+                   ;; PMU-PROFILE, PMU-ANNOTATE.  Names samples with the
+                   ;; backtrace tables above, so it follows them.
+                   (mvm-text "net/hosted-pmu.lisp")
+                   (string #\Newline)
                    ;; AWS Nitro Enclaves: CBOR + the /dev/nsm attestation request
                    ;; (lib/cbor.lisp, net/nsm-attest.lisp).  Hosted x64 only: the
                    ;; NSM is a Linux device.  Inert without one (:NO-NSM).

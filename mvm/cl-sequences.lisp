@@ -837,14 +837,24 @@
    on negative or non-fixnum N."
   (when (and n-arg (cdr n-arg))
     (error "nbutlast: too many arguments"))
+  ;; N is any non-negative INTEGER (a bignum just means "everything"), and
+  ;; LIST may be dotted: count its conses (upstream NBUTLAST.4/.7).
   (let ((n (if n-arg (car n-arg) 1)))
-    (when (or (not (fixnump n)) (< n 0))
+    (when (or (not (integerp n)) (< n 0))
       (%signal-type-error))
-    (let ((len (list-length list)))
-      (if (or (null len) (<= len n)) nil
+    (let ((len (%cons-count list)))
+      (if (<= len n) nil
         (let ((tail (nthcdr (- len n 1) list)))
           (set-cdr tail nil)
           list)))))
+
+(defun %cons-count (list)
+  "The number of conses in LIST's spine: a dotted list's length."
+  (let ((n 0) (cur list))
+    (loop
+      (when (atom cur) (return n))
+      (setq n (+ n 1))
+      (setq cur (cdr cur)))))
 
 (defun floatp-impl (x)
   "Check if x is a boxed float — any of the four float subtags
@@ -4343,9 +4353,9 @@
   (when (and list (not (consp list)))
     (error "butlast: argument is not a list"))
   (let ((n (if n-arg (car n-arg) 1)))
-    (when (or (not (fixnump n)) (< n 0))
+    (when (or (not (integerp n)) (< n 0))
       (%signal-type-error))
-    (let ((len (list-length list)))
+    (let ((len (%cons-count list)))
       (if (<= len n) nil
         (let ((result nil) (i 0) (cur list))
           (loop

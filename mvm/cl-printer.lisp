@@ -806,6 +806,8 @@
    The outermost call scans for objects reached twice; every object then
    gets #n= on its first occurrence and #n# after."
   (declare (special *print-circle*))
+  (when (%ppd-print obj stream)
+    (return-from %write-obj-0 nil))
   (let ((tbl *%circ-table*))
     (cond
       (tbl
@@ -995,6 +997,11 @@
            ((and printer (eq (car printer) :print-function))
             (funcall (cdr printer) obj stream (if level level 0)))
            (printer (funcall (cdr printer) obj stream))
+           ;; #S(...) is a level like a list: at or past *PRINT-LEVEL* it is
+           ;; "#" (upstream PRINT-LEVEL.8/.9).
+           ((let ((plev (if *print-readably* nil *print-level*)))
+              (and plev (>= (or level 0) plev)))
+            (%print-char 35 stream))
            (t (%print-struct-default obj stream level escape)))))
       ;; String  (also matches fp-wrapped strings — wrapper-aware stringp
       ;; reports T for them.  Use LENGTH (fill-pointer aware) instead of
@@ -3521,9 +3528,24 @@
                                (let ((close (%format-find-close-brace body (+ p 1) len)))
                                  (if close (%format-close-brace-end body close len) len)))
                               (t (+ p 1)))))
-               (let ((k pos))
-                 (loop (when (>= k (min end len)) (return nil))
-                   (%print-char (%prim-aref body k) out) (setq k (+ k 1))))
+               (if (and dch (= dch 123)
+                        (%format-find-close-brace body (+ p 1) len))
+                   ;; ~{...~}: its body's blanks get fill newlines too, as
+                   ;; SBCL does -- "~:@<~@{~A~^ ~}~:@>" at margin 2 breaks
+                   ;; between the elements (upstream FORMAT.LOGICAL-BLOCK.22,
+                   ;; .25, .27-.29).
+                   (let ((close (%format-find-close-brace body (+ p 1) len))
+                         (k pos))
+                     (loop (when (> k p) (return nil))
+                       (%print-char (%prim-aref body k) out) (setq k (+ k 1)))
+                     (%print-string-raw
+                      (%format-insert-fill-newlines (subseq body (+ p 1) close)) out)
+                     (setq k close)
+                     (loop (when (>= k (min end len)) (return nil))
+                       (%print-char (%prim-aref body k) out) (setq k (+ k 1))))
+                   (let ((k pos))
+                     (loop (when (>= k (min end len)) (return nil))
+                       (%print-char (%prim-aref body k) out) (setq k (+ k 1)))))
                ;; ~<Newline> swallows the following blanks itself
                (when (and dch (= dch 10))
                  (loop (when (or (>= end len) (/= (%prim-aref body end) 32)) (return nil))
@@ -4049,6 +4071,16 @@
                  (string= (subseq mant 0 2) "0."))
         (setq body (concatenate 'string sign (subseq mant 1) (string (code-char mk))
                                 (if (< expo 0) "-" "+") ed)))
+      ;; Still too wide with no D: the single 0 after the point was only
+      ;; padding, so drop it -- (format nil "~5e" 1.0) is "1.e+0" (CLHS
+      ;; 22.3.3.2; upstream FORMAT.E.4/.5/.7-.9).
+      (let ((ml (length mant)))
+        (when (and w (null d) (> (length body) w) (> ml 1)
+                   (char= (char mant (- ml 1)) #\0)
+                   (char= (char mant (- ml 2)) #\.))
+          (setq mant (subseq mant 0 (- ml 1)))
+          (setq body (concatenate 'string sign mant (string (code-char mk))
+                                  (if (< expo 0) "-" "+") ed))))
       (if (and ovc (or (and w (> (length body) w))
                        (and e (> (length ed) e))))
           (let ((i 0)) (loop (when (>= i (if w w 0)) (return nil))
@@ -5828,37 +5860,67 @@
   (declare (ignore at-sign-p))
   (%pprint-seq stream object colon-p :fill (or tabsize 16)))
 
+;;; PPRINT DISPATCH TABLES (CLHS 22.2.1.4).  A table is (:%PPD-TABLE . entries),
+;;; each entry (TYPE-SPEC FUNCTION PRIORITY).  NIL in *PRINT-PPRINT-DISPATCH*
+;;; is the initial table, which has no entries: the printer's own pretty
+;;; printing is the standard behaviour.  Copy-pprint-dispatch used to hand
+;;; back a gensym and SET-PPRINT-DISPATCH to push onto one global list that
+;;; the printer never consulted (upstream PPRINT-DISPATCH.*,
+;;; COPY-PPRINT-DISPATCH.1-4).
 (defvar *%pprint-dispatch-table* nil)
 
-(defun copy-pprint-dispatch (&rest args)
-  "Return a copy of the current pprint dispatch table.  We just hand
-   back a fresh symbol — the table contents aren't actually copied."
-  (declare (ignore args))
-  (gensym "PPRINT-DISP-"))
+(defun %ppd-table-p (x) (and (consp x) (eq (car x) :%ppd-table)))
 
-(defun set-pprint-dispatch (type-spec fn &rest args)
-  "Install FN as the pprint-dispatch entry for TYPE-SPEC.  Stored in
-   *%pprint-dispatch-table* keyed by (type . priority)."
-  (declare (ignore args))
-  (setq *%pprint-dispatch-table*
-        (cons (cons type-spec fn) *%pprint-dispatch-table*))
+(defun copy-pprint-dispatch (&optional (table *print-pprint-dispatch*))
+  "A fresh table with TABLE's entries; NIL means the initial table."
+  (cons :%ppd-table
+        (if (%ppd-table-p table)
+            (mapcar (lambda (e) (copy-list e)) (cdr table))
+            nil)))
+
+(defun set-pprint-dispatch (type-spec function &optional (priority 0)
+                                                 (table *print-pprint-dispatch*))
+  "Make FUNCTION (a function designator, or NIL to remove the entry) print
+   objects of TYPE-SPEC in TABLE at PRIORITY.  Returns NIL."
+  (unless (%ppd-table-p table)
+    ;; The initial table is not to be modified; give the current binding a
+    ;; table of its own rather than signal.
+    (setq table (copy-pprint-dispatch nil))
+    (setq *print-pprint-dispatch* table))
+  (let ((kept (remove-if (lambda (e) (equal (car e) type-spec)) (cdr table))))
+    (rplacd table (if function
+                      (cons (list type-spec function priority) kept)
+                      kept)))
   nil)
 
-(defun pprint-dispatch (object &rest args)
-  "Look up the most-specific pprint-dispatch entry for OBJECT.
-   Returns (values function found-p)."
-  (declare (ignore args))
-  (let ((cur *%pprint-dispatch-table*)
-        (found nil))
-    (loop
-      (when (or found (null cur)) (return nil))
-      (let ((entry (car cur)))
-        (when (handler-case (typep object (car entry)) (t (c) nil))
-          (setq found entry)))
-      (setq cur (cdr cur)))
-    (if found
-        (values (cdr found) t)
-        (values nil nil))))
+(defun %ppd-lookup (object table)
+  "The highest-priority entry of TABLE whose type OBJECT is of, or NIL."
+  (let ((best nil))
+    (when (%ppd-table-p table)
+      (dolist (e (cdr table))
+        (when (and (or (null best) (> (caddr e) (caddr best)))
+                   (handler-case (typep object (car e)) (t (c) nil)))
+          (setq best e))))
+    best))
+
+(defun pprint-dispatch (object &optional (table *print-pprint-dispatch*))
+  "(values function found-p) for OBJECT in TABLE.  With no entry the
+   function prints the object the standard way."
+  (let ((e (%ppd-lookup object table)))
+    (if e
+        (values (let ((f (cadr e))) (if (symbolp f) (symbol-function f) f)) t)
+        (values (lambda (stream obj) (let ((*print-pretty* nil)) (write obj :stream stream)))
+                nil))))
+
+(defun %ppd-print (obj stream)
+  "When *PRINT-PRETTY* is on and the current dispatch table has an entry for
+   OBJ, print OBJ through it and return T; else NIL."
+  (let ((table *print-pprint-dispatch*))
+    (when (and (%ppd-table-p table) (cdr table) *print-pretty*)
+      (let ((e (%ppd-lookup obj table)))
+        (when e
+          (funcall (cadr e) stream obj)
+          t)))))
 
 ;;; ============================================================
 ;;; PPRINT-LOGICAL-BLOCK stub

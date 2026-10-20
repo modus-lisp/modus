@@ -1941,7 +1941,9 @@
       (eq super 't)
       (eq sub 'nil)
       ;; Sequence tower
-      (and (member sub '(cons null list)) (member super '(list sequence atom)))
+      ;; NULL is an ATOM; CONS and LIST are not (upstream SUBTYPEP-CONS-ATOM,
+      ;; SUBTYPEP-LIST-ATOM).
+      (and (member sub '(cons null list)) (member super '(list sequence)))
       (and (eq sub 'cons) (eq super 'list))
       (and (eq sub 'null) (eq super 'list))
       (and (eq sub 'null) (eq super 'symbol))
@@ -1984,7 +1986,7 @@
       (and (eq sub 'standard-char) (member super '(base-char character)))
       (and (eq sub 'base-char)     (eq super 'character))
       ;; Atom/compound
-      (and (not (member sub '(cons list))) (eq super 'atom))
+      (and (not (member sub '(cons list sequence))) (eq super 'atom))
       ;; Symbol/keyword
       (and (eq sub 'keyword) (eq super 'symbol))
       ;; Function
@@ -2061,6 +2063,12 @@
     ((null t1) (cons t t))
     ((eq t1 'nil) (cons t t))
     ((eq t2 't) (cons t t))
+    ;; (CONS NIL ...) / (CONS ... NIL) is the empty type, a subtype of
+    ;; everything (upstream SUBTYPEP.CONS.2).
+    ((and (consp t1) (symbolp (car t1)) (string= (symbol-name (car t1)) "CONS")
+          (or (and (consp (cdr t1)) (null (cadr t1)))
+              (and (consp (cdr t1)) (consp (cddr t1)) (null (caddr t1)))))
+     (cons t t))
     ;; CLOS class OBJECTS are type specifiers (CLHS 4.2.3): unwrap to the
     ;; registered NAME symbol (slot 1) and recurse.  uiop's coerce-class
     ;; calls (subtypep (find-class 'load-op) (find-class 'operation)) —

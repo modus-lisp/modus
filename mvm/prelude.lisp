@@ -78,7 +78,8 @@
   (when (and list (not (consp list)))
     (error "last: first argument is not a list"))
   (let ((n (if n-arg (car n-arg) 1)))
-    (when (or (not (fixnump n)) (< n 0))
+    ;; Any non-negative INTEGER: a bignum N is the whole list (LAST.11/.12).
+    (when (or (not (integerp n)) (< n 0))
       (%signal-type-error))
     (if (null list)
         nil
@@ -162,7 +163,10 @@
             (cur (cdr list)))
         (setq tail result)
         (loop
-          (when (null cur) (return result))
+          ;; A dotted list keeps its final atom (upstream COPY-LIST.2/.3).
+          (when (atom cur)
+            (when cur (set-cdr tail cur))
+            (return result))
           (let ((new-cell (cons (car cur) nil)))
             (set-cdr tail new-cell)
             (setq tail new-cell)

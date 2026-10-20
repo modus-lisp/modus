@@ -1845,7 +1845,15 @@
 (defun %read-character (stream)
   "Read #\\ character."
   (let ((ch (read-char stream t nil t)))
-    (if *read-suppress* nil
+    (if *read-suppress*
+        ;; Suppressed: still consume the whole token (#\boguscharname),
+        ;; so reading resumes after it (upstream READ-SUPPRESS.SHARP-SLASH.*).
+        (loop
+          (let ((c (read-char stream nil nil t)))
+            (when (or (null c) (%whitespace-char-p c)
+                      (%terminating-macro-p c *readtable*))
+              (when c (unread-char c stream))
+              (return nil))))
         ;; Check for character name
         (let ((next (read-char stream nil nil t)))
           (if (or (null next) (%whitespace-char-p next)
@@ -1932,7 +1940,11 @@
    matches, just read and return the next form.
 
    "
-  (let* ((feature-expr (let ((*read-suppress* nil))
+  ;; CLHS 2.4.8.17: the feature expression is read in the KEYWORD package,
+  ;; so #+X is :X and does not match a CL-TEST::X in *FEATURES*
+  ;; (upstream SYNTAX.SHARP-PLUS.8).
+  (let* ((feature-expr (let ((*read-suppress* nil)
+                             (*package* (or (find-package "KEYWORD") *package*)))
                          (%read-internal stream t nil t)))
          (present (%feature-present-p feature-expr)))
     (cond
@@ -1962,10 +1974,13 @@
            ;; to pay it against every element of *FEATURES*: ~6% of a
            ;; Quicklisp load.  Only a hash match (or NIL/T, gensyms) compares
            ;; names.
-           (let ((ha (%feature-sym-hash a)) (hb (%feature-sym-hash b)))
-             (if (and ha hb (not (eql ha hb)))
-                 nil
-                 (string= (symbol-name a) (symbol-name b)))))))
+           ;; ... and only between two KEYWORDS: the expression is read in
+           ;; the keyword package, so a non-keyword feature never matches it.
+           (and (keywordp a) (keywordp b)
+                (let ((ha (%feature-sym-hash a)) (hb (%feature-sym-hash b)))
+                  (if (and ha hb (not (eql ha hb)))
+                      nil
+                      (string= (symbol-name a) (symbol-name b))))))))
 
 (defun %feature-sym-hash (s)
   "Slot-0 name hash of symbol S, or NIL for NIL/T/gensyms (no slot 0)."

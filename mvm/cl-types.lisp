@@ -66,9 +66,14 @@
 ;; Double-precision constants, built from full-precision decimal
 ;; rationals via %float-div (defvars don't auto-init at boot, so we
 ;; recompute on each call — cheap, two itof + one fdiv).
-(defun %fpi ()    (%float-div (%fl 3141592653589793) (%fl 1000000000000000)))   ; π
-(defun %f2pi ()   (%float-div (%fl 6283185307179586) (%fl 1000000000000000)))   ; 2π
-(defun %fpi/2 ()  (%float-div (%fl 1570796326794897) (%fl 1000000000000000)))   ; π/2
+;; The double nearest pi is EXACTLY 884279719003555 / 2^48, and both are exact
+;; in a double, so the division gives the right bits.  The old 16-digit
+;; decimal quotients were an ulp off, so (acos 0d0) missed (/ pi 2) and every
+;; double-float ACOS/ASIN/ATAN/PHASE test using APPROX= failed (upstream
+;; ACOS.6/.8, ASIN.6/.8, PHASE.11/.13, ATAN.IEEE.1).
+(defun %fpi ()    (%float-div (%fl 884279719003555) (%fl 281474976710656)))   ; π
+(defun %f2pi ()   (%float-div (%fl 884279719003555) (%fl 140737488355328)))   ; 2π
+(defun %fpi/2 ()  (%float-div (%fl 884279719003555) (%fl 562949953421312)))   ; π/2
 (defun %f-one ()  (%fl 1))
 (defun %f-half () (%float-div (%fl 1) (%fl 2)))
 
@@ -556,8 +561,10 @@
   (cond
     ;; Complex a+bi: phase = atan(b, a) (full -pi..pi range).
     ((%complex-p x) (atan (imagpart x) (realpart x)))
-    ((integerp x) (if (>= x 0) (%fl 0) (%fpi)))
-    ((ratiop x) (if (>= (ratio-numerator x) 0) (%fl 0) (%fpi)))
+    ;; A rational's phase is a SINGLE-FLOAT (CLHS 12.1.4.1 contagion):
+    ;; (phase -1) is (coerce pi 'single-float) (upstream PHASE.8/.9).
+    ((integerp x) (if (>= x 0) (%round-to-single (%fl 0)) (%round-to-single (%fpi))))
+    ((ratiop x) (if (>= (ratio-numerator x) 0) (%round-to-single (%fl 0)) (%round-to-single (%fpi))))
     (t (if (float-negative-p (%any-to-float x)) (%fpi) (%fl 0)))))
 
 (defun cis (x)
@@ -902,7 +909,10 @@
     ((eq n 'keyword) '(symbol))
     ((eq n 'cons) '(list))
     ((eq n 'list) '(sequence))
-    ((eq n 'sequence) '(atom))
+    ;; SEQUENCE is not under ATOM: a LIST is a sequence, and with this
+    ;; edge (subtypep 'cons 'atom) answered T (upstream SUBTYPEP-CONS-ATOM,
+    ;; SUBTYPEP-LIST-ATOM).
+    ((eq n 'sequence) '(t))
     ((eq n 'array) '(atom))
     ((eq n 'simple-array) '(array))
     ((eq n 'vector) '(array sequence))
@@ -5388,7 +5398,12 @@
          ;; ARRAYP intrinsic says yes; it is a NUMBER, never an ARRAY (CLHS 4.2.2).
          ((eq tn 'array)         (%typep-array-obj-p obj))
          ((eq tn 'simple-array)  (%typep-array-obj-p obj))
-         ((eq tn 'vector)        (%typep-array-obj-p obj))
+         ;; VECTOR is rank 1: a 0-d or multi-dimensional array is not one
+         ;; (upstream VECTOR.TYPE.7/.8, VECTOR-AS-CLASS.8-11, ARRAY-RANK.2).
+         ((eq tn 'vector)        (and (%typep-array-obj-p obj)
+                                      (or (not (%mda-p obj))
+                                          (let ((d (%mda-dims obj)))
+                                            (and (consp d) (null (cdr d)))))))
          ;; SIMPLE-VECTOR = (simple-array t (*)) — element-type T only.
          ;; A byte-packed u8 vector (subtag #x11) has element-type
          ;; (unsigned-byte 8), so it is NOT a simple-vector.
@@ -5441,12 +5456,18 @@
          ;; all-standard-classes-are-subtypes-of-standard-object from
          ;; collecting LOGICAL-PATHNAME / PATHNAME.
          ((eq tn 'standard-class)
-          (and (%clos-class-p obj)
-               (and (member 'standard-object (aref obj 4)) t)))
+          (or (and (%clos-class-p obj)
+                   (and (member 'standard-object (aref obj 4)) t))
+              ;; STANDARD-OBJECT's own class (CLHS 4.3.7; upstream
+              ;; STANDARD-OBJECT-IS-IN-STANDARD-CLASS).
+              (and (%class-proxy-p obj) (symbolp (%class-proxy-name obj))
+                   (string= (symbol-name (%class-proxy-name obj)) "STANDARD-OBJECT"))))
          ((eq tn 'built-in-class) (%builtin-class-proxy-p obj))
          ((eq tn 'structure-class)
           (and (%class-proxy-p obj)
-               (%find-struct-type (%class-proxy-name obj))
+               (or (%find-struct-type (%class-proxy-name obj))
+                   (and (symbolp (%class-proxy-name obj))
+                        (string= (symbol-name (%class-proxy-name obj)) "STRUCTURE-OBJECT")))
                t))
          ((eq tn 'metaobject) (%clos-class-p obj))
          ((eq tn 'restart) (%active-restart-p obj))

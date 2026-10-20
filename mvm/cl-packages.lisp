@@ -918,13 +918,17 @@
 ;;; pattern in defmethod tests work.  The earlier integer-returning stub
 ;;; was here because %make-cl-symbol predated this file; now it doesn't.
 (defun gensym (&optional prefix)
-  (let ((p (cond ((stringp prefix) prefix)
-                 ((null prefix) "G")
-                 (t "G")))
-        (n *gensym-counter*))
-    (let ((name (format nil "~A~D" p n)))
-      (setq *gensym-counter* (+ n 1))
-      (%make-cl-symbol name))))
+  ;; CLHS GENSYM: an INTEGER argument is the suffix itself and leaves
+  ;; *GENSYM-COUNTER* alone (upstream GENSYM.12/.13).
+  (if (integerp prefix)
+      (%make-cl-symbol (format nil "G~D" prefix))
+      (let ((p (cond ((stringp prefix) prefix)
+                     ((null prefix) "G")
+                     (t "G")))
+            (n *gensym-counter*))
+        (let ((name (format nil "~A~D" p n)))
+          (setq *gensym-counter* (+ n 1))
+          (%make-cl-symbol name)))))
 
 ;;; --- gentemp ---
 (defvar *gentemp-counter* 0)
@@ -2334,28 +2338,42 @@
             (setq result (cons v (cons k result))))
         (setq cur (cddr cur))))))
 
-(defun set-get (symbol indicator value)
+(defun set-get (symbol indicator &rest default-and-value)
   "Set property INDICATOR on SYMBOL's property list.
    PUTHASH's lambda list is (KEY HT VALUE) — mvm/prelude.lisp:1226.  Both
    this function and REMPROP used to pass (KEY VALUE HT), so the plist was
    handed to PUTHASH as the *table* and signalled a TYPE-ERROR: EVERY
    `(setf (get sym ind) v)` failed.  cl-annot's set-annotation-options
    goes through `(setf (annotation-real …) …)` → `(setf (get …) …)`, so
-   all 16 of its DEFANNOTATION forms died here."
-  (let ((ht (%get-plist-ht)))
+   all 16 of its DEFANNOTATION forms died here.
+   (setf (get s i DEFAULT) v) reaches here as (SET-GET s i DEFAULT v): the
+   value is the LAST argument (upstream GET.6, GET.ORDER.4)."
+  (let ((ht (%get-plist-ht))
+        (value (car (last default-and-value))))
     (let ((plist (gethash symbol ht)))
-      (puthash symbol ht (%plist-set (if (null plist) nil plist) indicator value))))
-  value)
+      (puthash symbol ht (%plist-set (if (null plist) nil plist) indicator value)))
+    value))
 
 (defun remprop (symbol indicator)
-  "Remove property INDICATOR from SYMBOL's property list."
-  (let ((ht (%get-plist-ht)))
-    (let ((plist (gethash symbol ht)))
-      (if (null plist) nil
-          (multiple-value-bind (new-plist found)
-              (%plist-remove plist indicator)
-            (puthash symbol ht new-plist)
-            found)))))
+  "Remove the FIRST INDICATOR property from SYMBOL's property list, in place
+   (CLHS REMPROP: destructive, first occurrence only; this used to rebuild
+   the list without every occurrence -- upstream REMPROP.4).  T if found."
+  (let* ((ht (%get-plist-ht))
+         (plist (gethash symbol ht)))
+    (cond
+      ((null plist) nil)
+      ((eq (car plist) indicator)
+       (puthash symbol ht (cddr plist))
+       t)
+      (t
+       (let ((prev (cdr plist)) (cur (cddr plist)))
+         (loop
+           (when (atom cur) (return nil))
+           (when (eq (car cur) indicator)
+             (rplacd prev (cddr cur))
+             (return t))
+           (setq prev (cdr cur))
+           (setq cur (cddr cur))))))))
 
 (defun symbol-plist (symbol)
   "Return SYMBOL's property list."
@@ -2382,7 +2400,10 @@
 
 (defun set-symbol-plist (symbol plist)
   "Set SYMBOL's property list to PLIST."
-  (puthash symbol plist (%get-plist-ht))
+  ;; PUTHASH is (KEY TABLE VALUE): this passed the PLIST as the table, so
+  ;; (setf (symbol-plist s) l) stored nothing and signalled on GET
+  ;; (upstream GET.4, REMPROP.2-4, PSETF.30, ROTATEF.30).
+  (puthash symbol (%get-plist-ht) plist)
   plist)
 
 (defun set (symbol value)

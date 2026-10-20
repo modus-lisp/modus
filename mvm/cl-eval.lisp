@@ -2667,6 +2667,10 @@
        ;; Float base or float power → float 1.0.  Modus has a single
        ;; IEEE precision so we don't model short/single/double/long
        ;; separately; (float 1 anything) collapses to the same object.
+       ;; A complex-float base: (expt #c(x y) 0) is #c(1.0 0.0) of the
+       ;; part type (upstream EXPT.8-11).
+       ((and (%complex-p base) (floatp (realpart base)))
+        (complex (float 1 (realpart base)) (float 0 (realpart base))))
        ((or (%ieee-float-p base) (%ieee-float-p power))
         (%float-from-int 1))
        (t 1)))
@@ -4631,7 +4635,11 @@
     ;; garbage / gcd.4 (test 13621) 0xDEAD0004 wild call.  A bignum is NOT a
     ;; function (CLHS).
     ((bignump x) nil)
-    ((and (integerp x) (< x #x100000)) nil)
+    ;; An untagged code address read as a fixnum is below 2^47 (user-space
+    ;; VA); a larger or negative integer is just a number -- (functionp
+    ;; 4611686018427387898) was T (upstream
+    ;; UNIVERSE-ELEMENTS-IN-AT-MOST-ONE-DISJOINT-TYPE, TYPES.3).
+    ((and (integerp x) (or (< x #x100000) (>= x 140737488355328))) nil)
     (t t)))
 
   ; stub

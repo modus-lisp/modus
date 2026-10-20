@@ -1879,9 +1879,11 @@
       (return-from %slot-boundp (%class-slot-bound-p class-name slot-name)))
     (let ((idx (%clos-slot-index cls slot-name)))
       ;; See %slot-value for the AArch64 fixnum-0/NIL rationale.
+      ;; One value: SLOT-BOUNDP is a predicate even when SLOT-MISSING's
+      ;; method returns several (upstream SLOT-MISSING.8).
       (when (< idx 0)
         (return-from %slot-boundp
-          (%dispatch-slot-missing cls obj slot-name 'slot-boundp nil nil)))
+          (values (if (%dispatch-slot-missing cls obj slot-name 'slot-boundp nil nil) t nil))))
       ;; -999 is the unbound slot sentinel (fixnum guard prevents type error)
       (let ((v (aref obj (+ 2 idx))))
         (not (and (fixnump v) (= v -999)))))))
@@ -8006,11 +8008,15 @@
   (error "slot-missing: ~S has no slot ~S during ~S"
          instance slot-name operation))
 
-(defun slot-missing (class instance slot-name operation &optional new-value)
+(defun slot-missing (class instance slot-name operation &rest new-value-arg)
   "Default implementation signals an error; user methods on
-   SLOT-MISSING can override via DEFMETHOD."
-  (let ((gf (%find-gf 'slot-missing))
-        (args (list class instance slot-name operation new-value)))
+   SLOT-MISSING can override via DEFMETHOD.  NEW-VALUE is passed on only
+   when supplied, so a method's &optional supplied-p sees the difference
+   (upstream SLOT-MISSING.1/.4/.5)."
+  (let* ((gf (%find-gf 'slot-missing))
+         (new-value (car new-value-arg))
+         (args (list* class instance slot-name operation
+                      (if new-value-arg (list new-value) nil))))
     (if (and gf (%gf-methods gf))
         (let ((applicable (%gf-applicable-cached gf args)))
           (if applicable

@@ -868,6 +868,32 @@
           ;; it wasn't before either; correctness of the store wins.
           (values nil place (lambda (v) `(setf ,place ,v)))))))))
 
+(defun %byte-place-setf (op spec inner value)
+  "Expansion of (setf (ldb SPEC INNER) VALUE) with OP = DPB, or of
+   MASK-FIELD with OP = DEPOSIT-FIELD.  SPEC, INNER's argument forms (when
+   INNER is a call to a plain accessor) and VALUE are each evaluated once,
+   left to right; the result is VALUE."
+  (let ((st (%mvm-gensym "BPS")) (vt (%mvm-gensym "BPV")))
+    (if (and (consp inner) (symbolp (car inner))
+             (member (symbol-name (car inner))
+                     '("AREF" "SVREF" "CHAR" "SCHAR" "BIT" "SBIT" "ELT" "NTH"
+                       "CAR" "CDR" "FIRST" "SECOND" "THIRD" "REST" "GETHASH"
+                       "SYMBOL-VALUE" "SLOT-VALUE" "ROW-MAJOR-AREF")
+                     :test #'string=))
+        (let* ((temps (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "BPA"))
+                              (cdr inner)))
+               (ip (cons (car inner) temps)))
+          `(let* ((,st ,spec)
+                  ,@(mapcar #'list temps (cdr inner))
+                  (,vt ,value))
+             (setf ,ip (,op ,vt ,st ,ip))
+             ,vt))
+        `(let* ((,st ,spec) (,vt ,value))
+           ,(if (symbolp inner)
+                `(setq ,inner (,op ,vt ,st ,inner))
+                `(setf ,inner (,op ,vt ,st ,inner)))
+           ,vt))))
+
 (defun %dmm-defmacro-form (name lambda-list fn)
   "The DEFMACRO a DEFINE-MODIFY-MACRO expands to.  LAMBDA-LIST (only &OPTIONAL
    and &REST, CLHS) is the macro's own, so &OPTIONAL defaults apply -- it used
@@ -3385,6 +3411,13 @@
   (if (and *flet-shadowed-macros* (consp form) (symbolp (car form)) (car form)
            (member (normalize-name (car form)) *flet-shadowed-macros*))
       (return-from macroexpand-1-mvm (cons form nil)))
+  ;; Inside a FLET / LABELS body an expansion can depend on the local names
+  ;; (SETF of a local (SETF NAME)), so do not reuse one memoised outside it.
+  (when (and *flet-shadowed-macros* (consp form))
+    (return-from macroexpand-1-mvm
+      (multiple-value-bind (x p) (%macroexpand-1-mvm-raw form)
+        (declare (ignore p))
+        x)))
   (if (not (consp form))
       (%macroexpand-1-mvm-raw form)
       (let* ((k (progn (%mexp-memo-sync) (%form-key form)))
@@ -4693,6 +4726,17 @@
                 ;; (setf var value) → (setq var value)
                 ((symbolp place)
                  `(setq ,place ,value))
+                ;; A (SETF NAME) bound by an enclosing FLET / LABELS: call it.
+                ((and (consp place) (symbolp (car place)) (car place)
+                      *flet-shadowed-macros*
+                      (member (cons :setf (normalize-name (car place)))
+                              *flet-shadowed-macros* :test #'equal))
+                 (let ((gargs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "LSFA"))
+                                      (cdr place)))
+                       (gval (%mvm-gensym "LSFV")))
+                   `(let* (,@(mapcar #'list gargs (cdr place)) (,gval ,value))
+                      (funcall #'(setf ,(car place)) ,gval ,@gargs)
+                      ,gval)))
                 ;; User-registered setf expander (defsetf / define-setf-expander)
                 ;; Consulted before the hardcoded list below — lets user code
                 ;; override built-in expansions.
@@ -4755,29 +4799,15 @@
                 ;; yields the newly-stored value, NOT the updated place).
                 ;; Bind val to a temp so it's evaluated exactly once and
                 ;; returned after the store.
-                ((and (consp place) (name-eq (car place) "LDB"))
-                 (let ((vt (%mvm-gensym "LDBV")))
-                   `(let ((,vt ,value))
-                      ,(if (symbolp (caddr place))
-                           `(setq ,(caddr place)
-                                  (dpb ,vt ,(cadr place) ,(caddr place)))
-                           `(setf ,(caddr place)
-                                  (dpb ,vt ,(cadr place) ,(caddr place))))
-                      ,vt)))
-                ;; (setf (mask-field spec n) val) → store (deposit-field
-                ;; val spec n) back into the integer place, RETURN val.
-                ;; deposit-field replaces the spec'd byte of n with the
-                ;; corresponding bits of val (CLHS).  Same return-newval
-                ;; contract as LDB.
-                ((and (consp place) (name-eq (car place) "MASK-FIELD"))
-                 (let ((vt (%mvm-gensym "MFV")))
-                   `(let ((,vt ,value))
-                      ,(if (symbolp (caddr place))
-                           `(setq ,(caddr place)
-                                  (deposit-field ,vt ,(cadr place) ,(caddr place)))
-                           `(setf ,(caddr place)
-                                  (deposit-field ,vt ,(cadr place) ,(caddr place))))
-                      ,vt)))
+                ;; (setf (ldb spec n) val) / (setf (mask-field spec n) val):
+                ;; store (dpb|deposit-field val spec n) back into N, RETURN
+                ;; val.  CLHS 5.1.1.1 order: SPEC, then N's own subforms,
+                ;; then VAL, each exactly once (upstream LDB.PLACE.ORDER.1,
+                ;; MASK-FIELD.PLACE.ORDER.1) -- %byte-place-setf binds them.
+                ((and (consp place)
+                      (or (name-eq (car place) "LDB") (name-eq (car place) "MASK-FIELD")))
+                 (%byte-place-setf (if (name-eq (car place) "LDB") 'dpb 'deposit-field)
+                                   (cadr place) (caddr place) value))
                 ;; (setf (mem-ref ...) v) → keep as %setf-mem-ref for compile-setf
                 ((and (consp place) (name-eq (car place) "MEM-REF"))
                  `(%setf-mem-ref ,place ,value))
@@ -8283,6 +8313,10 @@
       ((= op-name 229121998)      (when (arity-ok-p form 1 1 env dest) (compile-cddr (cadr form) env dest)))  ; CDDR
 
       ;; --- Bitwise Operations ---
+      ;; (logand) is -1 and (logior)/(logxor) 0 (upstream LOGAND.1 got junk).
+      ((and (= op-name 9878800) (null (cdr form))) (compile-form -1 env dest))
+      ((and (or (= op-name 256208207) (= op-name 391033398)) (null (cdr form)))
+       (compile-form 0 env dest))
       ((= op-name 9878800)   (compile-logand (cdr form) env dest))  ; LOGAND
       ((= op-name 256208207)   (compile-logior (cdr form) env dest))  ; LOGIOR
       ((= op-name 391033398)   (compile-logxor (cdr form) env dest))  ; LOGXOR
@@ -14298,8 +14332,15 @@
     (%compile-shadowing-body
      (let ((acc nil))
        (dolist (def defs acc)
-         (when (and (consp def) (symbolp (car def)) (car def))
-           (push (normalize-name (car def)) acc))))
+         (cond
+           ((and (consp def) (symbolp (car def)) (car def))
+            (push (normalize-name (car def)) acc))
+           ;; A local (SETF NAME): SETF of (NAME ...) in the body calls it
+           ;; (upstream FLET.17, LABELS.17, IGNORABLE.6/.8).
+           ((and (consp def) (consp (car def)) (symbolp (car (car def)))
+                 (string= (symbol-name (car (car def))) "SETF")
+                 (consp (cdr (car def))) (symbolp (cadr (car def))))
+            (push (cons :setf (normalize-name (cadr (car def)))) acc)))))
      t (strip-declares body) flet-env dest)))
 
 (defun %compile-shadowing-body (names add-p body env dest)

@@ -482,7 +482,29 @@
 ;;; Args: filespec &key direction element-type if-exists if-does-not-exist external-format
 ;;; We use &rest + manual parsing (no &key in MVM)
 
+(defvar *%file-stream-paths* nil
+  "EQ table: file stream -> the pathname designator it was opened with, so
+   PATHNAME / TRUENAME / PROBE-FILE / FILE-NAMESTRING of a stream answer
+   (upstream PATHNAME.3/.4, PROBE-FILE.2-5, TRUENAME.3/.4, the
+   *-NAMESTRING.3/4 tests).  The stream itself has no slot for it.")
+
+(defun %file-stream-path (stream)
+  (and *%file-stream-paths* (gethash stream *%file-stream-paths*)))
+
 (defun open (filespec &rest args)
+  "OPEN, remembering which file each stream it returns came from."
+  (let ((s (apply #'%open-1 filespec args)))
+    (when (and s (streamp s))
+      ;; Bounded: the table would otherwise keep every stream (and its 4 KB
+      ;; buffer) ever opened alive.  Only recent streams keep their path.
+      (when (or (null *%file-stream-paths*)
+                (> (hash-table-count *%file-stream-paths*) 256))
+        (setq *%file-stream-paths* (make-hash-table :test 'eq)))
+      (puthash s *%file-stream-paths*
+               (if (streamp filespec) (%file-stream-path filespec) filespec)))
+    s))
+
+(defun %open-1 (filespec &rest args)
   "Open a file. Returns a file stream or signals error.
    Options: :direction (:input/:output/:io/:probe),
             :if-exists (:error/:new-version/:rename/:supersede/:overwrite/:append/nil),
@@ -1335,8 +1357,15 @@
     ((%pathname-obj-p x) x)
     ((stringp x) (%parse-pathname-string x))
     ((streamp x)
-     ;; File streams don't track their original path; return null pathname.
-     (%make-pathname-obj nil nil nil nil nil nil))
+     ;; A file stream answers the pathname it was opened with (see OPEN);
+     ;; a synonym stream its target's.
+     (let ((p (if (= (%stream-type x) 7)
+                  (let ((target (symbol-value (%stream-data x))))
+                    (and (streamp target) (%file-stream-path target)))
+                  (%file-stream-path x))))
+       (if p
+           (%coerce-to-pathname p)
+           (%make-pathname-obj nil nil nil nil nil nil))))
     ((null x) (%make-pathname-obj nil nil nil nil nil nil))
     (t (%make-pathname-obj nil nil nil nil nil nil))))
 

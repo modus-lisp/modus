@@ -2248,11 +2248,16 @@
    LET save/restore had (battery row special.after-rebind).  So the
    package-qualified key wins when there is one; everything else keeps the
    historic bare hash exactly."
+  ;; A SYMBOL keys exactly as SYMBOL-VALUE keys it, %SYM-GLOBAL-KEY: its
+  ;; stored hash, not a hash of its NAME.  The two differ for a symbol the
+  ;; image interned before its name was known (SYMBOL-NAME "") -- the ANSI
+  ;; runner's corpus symbols -- and PROGV then bound a different variable
+  ;; from the one the code read (misc 29278, 29289, 29329, 29331).
   (cond
     ((integerp sym) sym)
     ((%cl-sym-p sym)
-     (let ((q (%sym-global-pkg-key sym)))
-       (if q q (compute-name-hash (%cl-sym-name sym)))))
+     (let ((k (%sym-global-key sym)))
+       (if k k (compute-name-hash (%cl-sym-name sym)))))
     ((stringp sym) (compute-name-hash sym))
     ;; Native MVM symbol: hash already lives in slot 0.
     ((and (not (consp sym)) (not (null sym)) (not (characterp sym))

@@ -50,7 +50,8 @@
            "MAKE-INET-ADDRESS" "GET-HOST-BY-NAME" "HOST-ENT" "HOST-ENT-ADDRESS"
            "HOST-ENT-ADDRESSES" "HOST-ENT-NAME"
            "SOCKET-ERROR" "SOCKET-ERROR-ERRNO" "CONNECTION-REFUSED-ERROR"
-           "ADDRESS-IN-USE-ERROR" "INTERRUPTED-ERROR"))
+           "ADDRESS-IN-USE-ERROR" "INTERRUPTED-ERROR"
+           "SOCKET-SEND" "SOCKET-RECEIVE" "NON-BLOCKING-MODE" "OPERATION-IN-PROGRESS"))
 
 (defpackage "SB-POSIX"
   (:use)
@@ -384,6 +385,10 @@
 (define-condition sb-bsd-sockets:address-in-use-error
     (sb-bsd-sockets:socket-error) ())
 (define-condition sb-bsd-sockets:interrupted-error
+    (sb-bsd-sockets:socket-error) ())
+;; EINPROGRESS: a non-blocking connect that has not finished (webrtc-data, cl-transport
+;; handle it by name).
+(define-condition sb-bsd-sockets:operation-in-progress
     (sb-bsd-sockets:socket-error) ())
 
 (defun %sock-signal (r)

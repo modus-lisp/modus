@@ -132,6 +132,13 @@
 (defun %cab-fd-entry (fd) (assoc fd *cab-fds*))
 (defun %cab-fd-p (fd) (and *cab-call* (>= fd 900) (%cab-fd-entry fd)))
 
+;;; SOCKET DESCRIPTORS ON BARE METAL.  The cabinet's pattern again: a descriptor >= 2000 that
+;;; *NET-FD-CALL* recognises is a socket of net/bare-sockets.lisp, and the stream layer hands
+;;; its close / read / write / flush / readiness to that function instead of a syscall.  NIL
+;;; (every hosted image) leaves every path exactly as it was.
+(defvar *net-fd-call* nil)
+(defun %net-fd-p (fd) (and *net-fd-call* (integerp fd) (>= fd 2000) (funcall *net-fd-call* :fd-p fd)))
+
 (defun %cab-fd-open (path pos)
   "Register a new cabinet fd for PATH starting at POS; return the fd."
   (let ((fd *cab-fd-next*))
@@ -203,7 +210,9 @@
 
 (defun %sys-close (fd)
   "Close file descriptor."
-  (if (%cab-fd-p fd) (%cab-fd-close fd) (syscall3 3 fd 0 0)))
+  (cond ((%cab-fd-p fd) (%cab-fd-close fd))
+        ((%net-fd-p fd) (funcall *net-fd-call* :close fd))
+        (t (syscall3 3 fd 0 0))))
 
 (defun %sys-getpid ()
   "Linux x64 syscall 39 (getpid).  Used to disambiguate per-process
@@ -239,6 +248,8 @@
 (defun %sys-read-into-buf (fd buf count)
   "Read up to COUNT bytes from FD into the STRING BUF (as char codes).
    Returns the number of bytes read, 0 at EOF, or negative on error."
+  (when (%net-fd-p fd)
+    (return-from %sys-read-into-buf (funcall *net-fd-call* :read-into fd buf count)))
   (if (%cab-fd-p fd)
       (let* ((path  (%cab-fd-path fd))
              (pos   (%cab-fd-pos fd))
@@ -267,6 +278,8 @@
 
 (defun %sys-write-byte-1 (fd code)
   "Write the single byte CODE to FD.  Returns 1, or negative on error."
+  (when (%net-fd-p fd)
+    (return-from %sys-write-byte-1 (funcall *net-fd-call* :write-byte fd code)))
   (if (%cab-fd-p fd)
       (let ((path (%cab-fd-path fd))
             (pos  (%cab-fd-pos fd)))
@@ -402,8 +415,7 @@
    the compiled blob, so the fix cannot be written where LISTEN is; it is
    written here, where LISTEN can see it, and replaced later where poll can be
    called.  Last-defun-wins is how SLEEP stops being a no-op too."
-  fd
-  t)
+  (if (%net-fd-p fd) (funcall *net-fd-call* :ready-p fd) t))
 
 (defun %make-file-stream ()
   "Create a closed/dummy file stream."
@@ -703,7 +715,7 @@
 
 (defun %fs-wbuf-eligible-p (stream fd)
   "STREAM on FD may hold buffered output (an output-only regular file)."
-  (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd))))
+  (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd)) (not (%net-fd-p fd))))
 
 (defun %fs-wbuf-p (stream fd)
   ;; Unarmed images only: a worker thread writing a file would put its stream
@@ -711,7 +723,7 @@
   ;; which the runtime refuses (operandi's tool turn: "a thread stored one of
   ;; its own objects into shared memory").  Threaded images write unbuffered,
   ;; as before.
-  (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd))
+  (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd)) (not (%net-fd-p fd))
        (eql (mem-ref #x10000DB8 :u32) 0)))
 
 (defun %fs-put-byte (stream fd byte)
@@ -737,6 +749,7 @@
   (when (streamp stream)
     (when (= (%stream-type stream) 9)
       (let ((fd (%fs-fd stream)))
+        (when (and (>= fd 0) (%net-fd-p fd)) (funcall *net-fd-call* :flush fd))
         (when (and (>= fd 0) (%fs-wbuf-eligible-p stream fd))
           (let ((n (%fs-blen stream)))
             (when (> n 0)
@@ -1045,7 +1058,7 @@
 (defun %fs-write-bytes (stream seq start end)
   "Write SEQ[START,END) to the file stream in 4 KB system calls; T if done."
   (let ((fd (%fs-fd stream)))
-    (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)))
+    (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
       (let ((page (%fs-io-page)) (i start))
         (loop
           (when (>= i end) (return nil))

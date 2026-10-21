@@ -8639,6 +8639,19 @@
        (compile-val-to-word (cdr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD->VAL"))
        (compile-word-to-val (cdr form) env dest))
+      ;; (%GV-SAVE-CACHED key slot): the LET-special save through the AOT cell
+      ;; cache -- see compile-let-with-specials.
+      ((= op-name #.(compute-name-hash "%GV-SAVE-CACHED"))
+       (%compile-global-read-cached (cadr form) (caddr form) env dest t))
+      ;; (%GV-SETQ-GLOBAL 'VAR VAL): the GLOBAL store of VAR (inline through
+      ;; the cell cache when it has a slot), whatever VAR means lexically here.
+      ;; A LET of a special binds and restores with it: a plain (SETQ VAR ..)
+      ;; at that point is compiled where an outer LEXICAL VAR may be visible,
+      ;; and assigned that instead (ANSI LET.14: (let ((x 1)) (let (x)
+      ;; (declare (special x)) x))).
+      ((= op-name #.(compute-name-hash "%GV-SETQ-GLOBAL"))
+       (compile-form (caddr form) env dest)
+       (%compile-setq-global (cadr (cadr form)) dest))
       ((= op-name #.(compute-name-hash "%PRIM-AREF"))
        (compile-prim-aref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%PRIM-ARRAYP"))
@@ -11714,8 +11727,13 @@
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
                          ;; The SAVE keeps "unbound" as the unbound marker
                          ;; (prelude %UNBOUND-MARKER), so the restore makes
-                         ;; an unbound special unbound again.
+                         ;; an unbound special unbound again.  A cached slot
+                         ;; whose read and write keys agree saves INLINE:
+                         ;; %GV-SAVE-CACHED is the cached global read without
+                         ;; the read's marker check, missing to %GV-SAVE-FILL.
                          (list sv (cond (cell `(%gv-cell-ref (quote ,cell) ,k))
+                                        ((and slot (eql k (%global-name-key spec)))
+                                         `(%gv-save-cached ,k ,slot))
                                         (slot `(%gv-save-fill ,k ,slot))
                                         (site (%site-fast site '(cdr c)
                                                           `(%gv-site-ref ,k (quote ,site))))
@@ -11743,12 +11761,12 @@
                                 (slot (and (not cell) (%gv-aot-slot k spec)))
                                 (site (and (not cell) (not slot) (%let-special-site spec k))))
                            ;; Unarmed, a binding is a store into the cell: the
-                           ;; inline cached SETQ, three calls before.  Armed,
+                           ;; inline cached global store, three calls before.  Armed,
                            ;; %DYNBIND-C makes this thread's own binding.
                            (push (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
                                        ((and slot (eql k (%global-name-key spec)))
                                         `(if (eql (mem-ref #x10000DB8 :u32) 0)
-                                             (setq ,spec ,tmp)
+                                             (%gv-setq-global (quote ,spec) ,tmp)
                                              (%dynbind-c ,k ,tmp ,slot)))
                                        (slot `(%dynbind-c ,k ,tmp ,slot))
                                        (site (%site-fast site `(progn (set-cdr c ,tmp) ,tmp)
@@ -11766,7 +11784,7 @@
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
                                ((and slot (eql k (%global-name-key spec)))
                                 `(if (eql (mem-ref #x10000DB8 :u32) 0)
-                                     (setq ,spec ,sv)
+                                     (%gv-setq-global (quote ,spec) ,sv)
                                      (%dynunbind-c ,k ,sv ,slot)))
                                (slot `(%dynunbind-c ,k ,sv ,slot))
                                (site (%site-fast site `(progn (set-cdr c ,sv) ,sv)
@@ -12901,8 +12919,10 @@
    defect in the emitted load from one in the fill path, and is a slower but
    still ~10x fallback if the inline load is ever in doubt.")
 
-(defun %compile-global-read-cached (key slot env dest)
+(defun %compile-global-read-cached (key slot env dest &optional save)
   "Emit the cached AOT read of the global named by KEY at cache SLOT.
+   SAVE: the LET-special save instead -- an unbound cell yields the unbound
+   marker itself (no marker check), and the miss arm is %GV-SAVE-FILL.
 
    Emitted as IR DIRECTLY, not by recursing into COMPILE-FORM on a source
    template.  The template version worked on its own and broke the in-image
@@ -12988,8 +13008,9 @@
       (emit-ir :cdr dest dest)
       ;; An unbound pair (prelude %UNBOUND-MARKER) misses; %GV-REF-FILL reads
       ;; it as NIL, which is what an absent pair has always read as here.
-      (emit-ir :cmp-imm dest #x0BADB0B5)        ; the marker's raw word
-      (emit-ir :beq miss)
+      (unless save
+        (emit-ir :cmp-imm dest #x0BADB0B5)      ; the marker's raw word
+        (emit-ir :beq miss))
       ;; A read yields exactly ONE value, and the old emission said so by
       ;; accident: it was a CALL, and %GV-REF's epilogue reset MV-COUNT.  The
       ;; miss path still gets that reset from %GV-REF-FILL's own epilogue, so
@@ -13001,7 +13022,7 @@
       (emit-li-tagged +vreg-v0+ key)
       (emit-li-tagged +vreg-v1+ slot)
       (when *mvm-emit-halves* (emit-ir :set-nargs 2))
-      (emit-ir :call "%GV-REF-FILL" 2)
+      (emit-ir :call (if save "%GV-SAVE-FILL" "%GV-REF-FILL") 2)
       (unless (= dest +vreg-vr+)
         (emit-ir :mov dest +vreg-vr+))
       (emit-ir-label done)

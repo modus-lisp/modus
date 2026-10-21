@@ -721,8 +721,8 @@
    (typep #'NAME 'generic-function) stays T.  The build-time expansion emits
    a native DEFUN instead (baked direct calls must bind to something)."
   (let ((fn (cond
-              ((eq kind ':reader) (lambda (obj) (%gf-dispatch name (list obj))))
-              ((eq kind ':writer) (lambda (nv obj) (%gf-dispatch name (list nv obj))))
+              ((eq kind ':reader) (lambda (obj) (%gf-dispatch-1 name obj)))
+              ((eq kind ':writer) (lambda (nv obj) (%gf-dispatch-2 name nv obj)))
               (t (let ((target (list 'setf gf-name)))
                    (lambda (obj nv) (%gf-dispatch target (list nv obj))))))))
     (set-symbol-function name fn)
@@ -2878,7 +2878,8 @@
 (defun %gf-set-combination (gf c) (aset gf 3 c) (%gf-cache-clear gf))
 (defun %gf-set-lambda-list (gf ll)
   (when (>= (array-length gf) 5) (aset gf 4 ll))
-  (%gf-cache-clear gf))
+  (%gf-cache-clear gf)
+  (%gf-install-stub (%gf-name gf) ll))
 
 ;;; ---- THE DISPATCH CACHE --------------------------------------------------
 ;;; %GF-DISPATCH used to collect and sort the applicable methods on every
@@ -4039,6 +4040,10 @@
    `(set-symbol-function gf-name (%make-gf-stub gf-name))`."
   (when (%sym-name-or-hash gf-name)
     (set-symbol-function gf-name (%make-gf-stub gf-name))
+    ;; The lambda list was set before this runs, so its fixed-arity stub
+    ;; (%GF-INSTALL-STUB) was just replaced by an &rest one: put it back.
+    (let ((gf (%find-gf gf-name)))
+      (when gf (%gf-install-stub gf-name (%gf-lambda-list gf))))
     ;; (SETF INNER) GF: alias the stub under SET-INNER for the compiler's
     ;; SETF-place call convention (see %install-setf-gf-alias).
     (%install-setf-gf-alias gf-name (fdefinition gf-name)))
@@ -5668,6 +5673,121 @@
                     (unless (eq v '%gf-miss) (return-from %gf-dispatch v)))))))))
     (%gf-dispatch-general name args)))
 
+(defun %gf-ic-key (gf ic x)
+  "The inline-cache key of first argument X (see %GF-DISPATCH)."
+  (let ((specs (%slot-ref ic 4)))
+    (if (and (null specs) (eq (obj-subtag x) #x32)
+             (>= (%prim-array-length x) 4)
+             (eq (%slot-ref x 0) '%clos-instance))
+        (%slot-ref x 1)
+        (%gf-pos-key x specs))))
+
+;;; SPREAD ENTRY POINTS.  A generic function of one or two required
+;;; parameters gets a fixed-arity stub (%GF-INSTALL-STUB) that calls these with
+;;; its arguments in registers: an inline-cache hit then conses nothing.
+;;; Anything else builds the list and takes %GF-DISPATCH.
+(defun %gf-dispatch-1 (name a)
+  (let ((gf (%gf-dm-get name)))
+    (when (and gf (>= (%prim-array-length gf) 11))
+      (let ((ic (%slot-ref gf 10)))
+        (when (%prim-simple-vector-p ic)
+          (let ((ep *gf-cache-epoch*))
+            (when (and (eq (%slot-ref ic 1) 1)
+                       (eq (%slot-ref ic 3) (if (fixnump ep) ep 0))
+                       (eq (%gf-ic-key gf ic a) (%slot-ref ic 0)))
+              (let ((plan (%slot-ref ic 2)))
+                (if (eq (%ucar plan) :direct)
+                    (return-from %gf-dispatch-1 (funcall (%ucdr plan) a))
+                    (when (eq (%ucar plan) :slot-read)
+                      (let ((l (%slot-ref a 3)))
+                        (unless (and (consp l) (null (cdr l)))
+                          (let ((v (svref (%slot-ref a 2) (%ucar (%ucdr plan)))))
+                            (unless (eq v -999)
+                              (return-from %gf-dispatch-1 v))))))))))))
+      ;; inline-cache miss: the cache entries, still without a list
+      (let ((entry (%gf-fast-entry-1 gf a)))
+        (when entry
+          (let ((plan (%ucdr (%ucdr (%ucdr entry)))))
+            (when (and (consp plan)
+                       (or (eq (%ucar plan) :direct) (eq (%ucar plan) :slot-read))
+                       (null (%slot-ref gf 10)))
+              (%gf-ic-fill gf entry plan nil))
+            (when (and (consp plan) (eq (%ucar plan) :direct))
+              (return-from %gf-dispatch-1 (funcall (%ucdr plan) a)))))))
+    (%gf-dispatch name (list a))))
+
+(defun %gf-fast-entry-1 (gf a)
+  "%GF-FAST-ENTRY for the one argument A, consing no list."
+  (let ((c (%slot-ref gf 9)) (ep *gf-cache-epoch*))
+    (and (consp c)
+         (eq (%ucar c) (if (fixnump ep) ep 0))
+         (let ((pos (%ucar (%ucdr c))))
+           (and (consp pos) (null (%ucdr pos)) (eq (%ucar (%ucar pos)) 0)
+                (let ((k (%gf-pos-key a (%ucdr (%ucar pos)))) (e (%ucdr (%ucdr c))))
+                  (and k
+                       (loop
+                         (when (null e) (return nil))
+                         (let ((x (%ucar e)))
+                           (when (and (eq (%ucar (%ucar x)) k) (eq (%ucar (%ucdr x)) 1))
+                             (return x)))
+                         (setq e (%ucdr e))))))))))
+
+(defun %gf-dispatch-2 (name a b)
+  (let ((gf (%gf-dm-get name)))
+    (when (and gf (>= (%prim-array-length gf) 11))
+      (let ((ic (%slot-ref gf 10)))
+        (when (%prim-simple-vector-p ic)
+          (let ((ep *gf-cache-epoch*))
+            (when (and (eq (%slot-ref ic 1) 2)
+                       (eq (%slot-ref ic 3) (if (fixnump ep) ep 0))
+                       (eq (%gf-ic-key gf ic a) (%slot-ref ic 0)))
+              (let ((plan (%slot-ref ic 2)))
+                (when (eq (%ucar plan) :direct)
+                  (return-from %gf-dispatch-2 (funcall (%ucdr plan) a b))))))))
+      ;; no inline cache (two specialised positions, say): the cache entries,
+      ;; still without a list
+      (let ((entry (%gf-fast-entry-2 gf a b)))
+        (when entry
+          (let ((plan (%ucdr (%ucdr (%ucdr entry)))))
+            (when (and (consp plan) (eq (%ucar plan) :direct) (null (%slot-ref gf 10)))
+              (%gf-ic-fill gf entry plan nil))
+            (when (and (consp plan) (eq (%ucar plan) :direct))
+              (return-from %gf-dispatch-2 (funcall (%ucdr plan) a b)))))))
+    (%gf-dispatch name (list a b))))
+
+(defun %gf-fast-entry-2 (gf a b)
+  "%GF-FAST-ENTRY for the two arguments A and B, consing no list."
+  (let ((c (%slot-ref gf 9)) (ep *gf-cache-epoch*))
+    (and (consp c)
+         (eq (%ucar c) (if (fixnump ep) ep 0))
+         (let ((pos (%ucar (%ucdr c))))
+           (and (consp pos)
+                (let* ((more (%ucdr pos))
+                       (p1 (%ucar pos))
+                       (i1 (%ucar p1))
+                       (p2 (and (consp more) (null (%ucdr more)) (%ucar more)))
+                       (i2 (and p2 (%ucar p2))))
+                  (and (or (eq i1 0) (eq i1 1))
+                       (or (null more) (eq i2 1))
+                       (let ((k1 (%gf-pos-key (if (eq i1 0) a b) (%ucdr p1)))
+                             (k2 (and p2 (%gf-pos-key b (%ucdr p2))))
+                             (e (%ucdr (%ucdr c))))
+                         (and k1 (or (null more) k2)
+                              (loop
+                                (when (null e) (return nil))
+                                (let* ((x (%ucar e)) (ks (%ucar x)))
+                                  (when (and (eq (%ucar ks) k1) (eq (%ucar (%ucdr x)) 2)
+                                             (or (null more) (eq (%ucar (%ucdr ks)) k2)))
+                                    (return x)))
+                                (setq e (%ucdr e))))))))))))
+
+(defun %gf-nargs-error (name n)
+  "A fixed-arity stub of generic function NAME was called with N arguments:
+   the PROGRAM-ERROR %GF-CHECK-ARITY signals for the &rest stub."
+  (let ((gf (%find-gf name)))
+    (when gf (%gf-check-arity gf (make-list n)))
+    (%signal-program-error)))
+
 (defun %gf-dispatch-general (name args)
   "Dispatch generic function NAME with ARGS.
    The combination slot holds either a bare combination name (symbol)
@@ -5886,9 +6006,69 @@
         (eval (list (quote defun) gf-name (list (quote &rest) (quote %gfdsp-args))
                     (list (quote %gf-dispatch) (list (quote quote) gf-name)
                           (quote %gfdsp-args))))
+        (%gf-note-stub gf-name :rest)
         (let ((fn (symbol-function gf-name)))
           (%register-gf-fn fn gf-name)
           fn)))))
+
+;;; FIXED-ARITY STUBS.  The &rest stub conses its argument list on every call
+;;; (about 20 cycles of a 125-cycle cached call).  A GF whose lambda list is
+;;; one or two required parameters gets
+;;;   (defun NAME (a) (if (eq (%get-nargs) 1) (%gf-dispatch-1 'NAME a)
+;;;                       (%gf-nargs-error 'NAME (%get-nargs))))
+;;; instead -- the argument-count check is the stub's own, because a runtime
+;;; fixed-arity DEFUN does not check its arguments.  Only a stub this file
+;;; EVAL'd is replaced (*%GF-STUB-SHAPES*): never an image GF's compiled DEFUN
+;;; or a DEFCLASS accessor's closure.
+(defvar *%gf-stub-shapes* nil
+  "EQ table NAME -> the shape of the stub %MAKE-GF-STUB / %GF-INSTALL-STUB last
+   EVAL'd for it: :REST, 1 or 2.")
+
+(defun %gf-note-stub (name shape)
+  (when (and (symbolp name) (%gf-cache-writable-p))
+    (unless *%gf-stub-shapes*
+      (setq *%gf-stub-shapes* (make-hash-table :test (quote eq))))
+    (puthash name *%gf-stub-shapes* shape)))
+
+(defun %gf-stub-shape-for (ll)
+  "1 or 2 for a lambda list of that many required parameters and nothing else,
+   else :REST."
+  (let ((n 0) (l ll))
+    (loop
+      (when (null l) (return (if (or (eql n 1) (eql n 2)) n :rest)))
+      (when (or (not (consp l)) (not (symbolp (car l)))
+                (member (symbol-name (car l))
+                        (quote ("&OPTIONAL" "&REST" "&KEY" "&AUX" "&ALLOW-OTHER-KEYS" "&BODY" "&WHOLE" "&ENVIRONMENT"))
+                        :test (function string=)))
+        (return :rest))
+      (setq n (+ n 1))
+      (setq l (cdr l)))))
+
+(defun %gf-install-stub (name ll)
+  "Give NAME the stub shape LL calls for, if NAME's stub is one of ours and
+   its shape differs."
+  (let ((tbl *%gf-stub-shapes*))
+    (when (and tbl (symbolp name) (%gf-cache-writable-p))
+      (let ((cur (gethash name tbl)) (want (%gf-stub-shape-for ll)))
+        (when (and cur (not (eql cur want)))
+          (let ((q (list (quote quote) name)))
+            (eval
+             (cond
+               ((eql want 1)
+                (list (quote defun) name (list (quote %gfs-a))
+                      (list (quote if) (list (quote eq) (list (quote %get-nargs)) 1)
+                            (list (quote %gf-dispatch-1) q (quote %gfs-a))
+                            (list (quote %gf-nargs-error) q (list (quote %get-nargs))))))
+               ((eql want 2)
+                (list (quote defun) name (list (quote %gfs-a) (quote %gfs-b))
+                      (list (quote if) (list (quote eq) (list (quote %get-nargs)) 2)
+                            (list (quote %gf-dispatch-2) q (quote %gfs-a) (quote %gfs-b))
+                            (list (quote %gf-nargs-error) q (list (quote %get-nargs))))))
+               (t
+                (list (quote defun) name (list (quote &rest) (quote %gfdsp-args))
+                      (list (quote %gf-dispatch) q (quote %gfdsp-args)))))))
+          (puthash name tbl want)
+          (%register-gf-fn (symbol-function name) name))))))
 
 ;;; ============================================================
 ;;; call-next-method / next-method-p

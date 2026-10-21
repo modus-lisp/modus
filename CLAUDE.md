@@ -1735,11 +1735,15 @@ read is in the same function.  Measured, no shim involved:
 The syscall IS issued; the RESULT is wrong, and a non-negative wrong result is
 indistinguishable from success to a caller checking for `-errno`.  That is how a
 `socket-bind` that appeared to succeed left a socket bound to nothing.
-**NOT FIXED.**  *(2026-09-27: these four shapes return the right pid on
-multi-arch both before and after 6045283, the fix for SYSCALL clobbering
-RCX/R11 — the same symptom in MVM-INTERPRET.  So this record no longer
-reproduces as written; the RCX/R11 clobber is a plausible cause for whatever
-shape it was, not a demonstrated one.)*  Routed around: the shim issues no syscalls at all, and
+**FIXED 2026-10-21 (3a15e60) — it was the INTERPRETER, not the JIT.**  Any
+INTERPRETED SYSCALL3/SYSCALL6 (a toplevel form; a DEFUN from a LOADed file until
+the hot JIT compiles it; script DEFUNs are JIT'd eagerly, hence "intermittent")
+returned its own number: the interpreter's syscall arms sat after the
+FRAME-ALLOC no-op range `[#x100, #x8000)`, which swallowed traps #x0502/#x0503/
+#x050B.  Fixing that exposed COMPILE-SYSCALL6 loading arguments into V4..V6
+without saving them (the interpreter keeps REGS there); it saves them now.
+*(2026-09-27 note, kept: these four shapes then returned the right pid on
+multi-arch — they were JIT'd, so they never reached the interpreter.)*  Routed around: the shim issues no syscalls at all, and
 `net/hosted-sockets-post.lisp` gained an AOT `%SBS-*` floor it calls instead.
 
 **`(LISTEN stream)` ON A DRAINED SOCKET ANSWERED T** — fixed, via a

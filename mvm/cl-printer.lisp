@@ -5004,6 +5004,20 @@
     ;; Interp-closure dispatch — fast path for runtime-eval'd lambdas.
     (when (and (consp fn) (eq (car fn) '%interp-closure))
       (return-from apply (%call-interp-closure fn all-args)))
+    ;; UP TO FOUR ARGUMENTS -- nearly every APPLY -- call directly: the ladder
+    ;; below evaluates its 96 bindings on every call whatever the count, which
+    ;; was most of a two-argument APPLY (100 ns of 140).  In tail position, so
+    ;; FN's values pass through as from the ladder's COND.
+    (if (or (null all-args) (null (cdr all-args)) (null (cdr (cdr all-args)))
+            (null (cdr (cdr (cdr all-args)))) (null (cdr (cdr (cdr (cdr all-args))))))
+        (cond
+          ((null all-args) (funcall fn))
+          ((null (cdr all-args)) (funcall fn (car all-args)))
+          ((null (cdr (cdr all-args))) (funcall fn (car all-args) (car (cdr all-args))))
+          ((null (cdr (cdr (cdr all-args))))
+           (funcall fn (car all-args) (car (cdr all-args)) (car (cdr (cdr all-args)))))
+          (t (funcall fn (car all-args) (car (cdr all-args)) (car (cdr (cdr all-args)))
+                      (car (cdr (cdr (cdr all-args)))))))
     (let* ((a0 (and all-args (car all-args)))
            (r1 (and all-args (cdr all-args)))
            (a1 (and r1 (car r1)))
@@ -5147,7 +5161,7 @@
              (if (> %asn 120)
                  (%program-error "APPLY: too many arguments (CALL-ARGUMENTS-LIMIT is 120)")
                  (let ((%asr (reverse all-args)))
-                   (%apply-spread fn %asr %asn)))))))))
+                   (%apply-spread fn %asr %asn))))))))))
 
 ;;; FUNCALL AS A FUNCTION OBJECT.
 ;;;

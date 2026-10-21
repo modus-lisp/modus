@@ -1897,17 +1897,35 @@
         (cond
           ((null pair) (return-from remhash nil))
           ((consp pair)
-           (let ((entries (car ht)))
-             (if (eq (car entries) pair)
-                 (set-car ht (cdr entries))
-                 (let ((prev entries) (cur (cdr entries)))
-                   (loop
-                     (when (null cur) (return nil))
-                     (when (eq (car cur) pair)
-                       (set-cdr prev (cdr cur))
-                       (return nil))
-                     (setq prev cur)
-                     (setq cur (cdr cur))))))
+           (let* ((entries (car ht))
+                  (head (car entries))
+                  ;; the NEWEST entry's bucket entry, when it is in this index
+                  (e0 (and (not (eq head pair))
+                           (%ht-bucket-entry vec (car head) strcmp? addr?))))
+             (cond
+               ((eq head pair) (set-car ht (cdr entries)))
+               ((and (consp e0) (eq (cdr e0) head))
+                ;; O(1): the newest entry moves into PAIR's cell and the head
+                ;; cell is dropped.  Unlinking PAIR itself meant walking the
+                ;; alist to it -- linear in the table: cl-bench HTABLE-SET+
+                ;; REMOVE removes keys prefilled 16k entries deep, 74x SBCL,
+                ;; 70 us a REMHASH at 32k entries.  Every walker still sees
+                ;; each live entry once: the moved one was the head, already
+                ;; behind an iteration that is removing its current entry.
+                (%publish-fence)
+                (set-car pair (car head))
+                (set-cdr pair (cdr head))
+                (set-cdr e0 pair)
+                (set-car ht (cdr entries)))
+               (t
+                (let ((prev entries) (cur (cdr entries)))
+                  (loop
+                    (when (null cur) (return nil))
+                    (when (eq (car cur) pair)
+                      (set-cdr prev (cdr cur))
+                      (return nil))
+                    (setq prev cur)
+                    (setq cur (cdr cur)))))))
            (%ht-bucket-rem vec key strcmp? addr?)
            (%ht-h-set-count holder (- (%ht-h-count holder) 1))
            (return-from remhash t))))))
@@ -2387,6 +2405,23 @@
                (let ((e (car cur)))
                  (when (eq (car e) key) (return (cdr e))))
                (setq cur (cdr cur)))))))))
+
+(defun %ht-bucket-entry (vec key strcmp? &optional addr?)
+  "KEY's (key . pair) entry in VEC's bucket, or NIL (absent or unbucketable).
+   Matches as %HT-BUCKET-FIND does."
+  (let ((h (%ht-key-hash key strcmp? (- (%prim-array-length vec) 1) addr?)))
+    (if (eq h (%ht-nohash))
+        nil
+        (let ((cur (%word-aref vec h)))
+          (loop
+            (when (null cur) (return nil))
+            (let* ((e (car cur)) (ek (car e)))
+              (when (cond ((eq strcmp? :equalp) (equalp ek key))
+                          ((and strcmp? (stringp key)) (and (stringp ek) (string= ek key)))
+                          ((and strcmp? (consp key)) (equal ek key))
+                          (t (eq ek key)))
+                (return e)))
+            (setq cur (cdr cur)))))))
 
 (defun %ht-bucket-put (vec key pair strcmp? &optional addr?)
   "Index PAIR (the alist cons) under KEY in VEC.  Caller guarantees KEY isn't

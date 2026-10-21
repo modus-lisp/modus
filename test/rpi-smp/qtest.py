@@ -55,8 +55,11 @@ if b"!!FAULT" in buf or not ok: print(tail)
 if ok and b"!!FAULT" not in buf:
     for f in forms:
         buf = b""
-        s.settimeout(900); s.sendall((f + "\r\n").encode()); s.settimeout(1)
-        r = until(rb"\n(DESK)?> ?$|!!FAULT", 900)        # DESK>: kiln's desk REPL
+        # QTEST_FORM_TIMEOUT: seconds one form may take (a JIT-EAGER over a few thousand
+        # functions under TCG runs past the default 900)
+        ft = float(os.environ.get("QTEST_FORM_TIMEOUT", "900"))
+        s.settimeout(ft); s.sendall((f + "\r\n").encode()); s.settimeout(1)
+        r = until(rb"\n(DESK)?> ?$|!!FAULT", ft)        # DESK>: kiln's desk REPL
         out = buf.decode("latin1").replace("\r", "")
         lines = [l for l in out.split("\n") if l.strip() and not l.startswith(f[:20]) and "WARN" not in l]
         print("FORM", f[:60], "=>", " | ".join(lines[-3:]) if r else "TIMEOUT", flush=True)

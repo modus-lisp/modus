@@ -280,3 +280,17 @@
               (make-instance (intern "HOST-ENT" "SB-BSD-SOCKETS") :name name
                              :addresses (list (funcall (intern "MAKE-INET-ADDRESS" "SB-BSD-SOCKETS") quad)))
               (error (intern "SOCKET-ERROR" "SB-BSD-SOCKETS") :errno 2)))))
+
+;;; ---- readiness, by SB-SYS's name ---------------------------------------------------------
+;;;
+;;; seal's WAIT-READABLE (and so cl-nostr's one-thread PUMP over seal.websocket's :WAIT NIL)
+;;; finds SB-SYS:WAIT-UNTIL-FD-USABLE at run time and, without it, answers "readable" -- after
+;;; which an idle relay's read blocks the pump for good.  The board has no SB-SYS surface, so
+;;; the function is provided here, over %SBS-POLL-IN.  Named at load time, as above.
+(unless (find-package "SB-SYS") (make-package "SB-SYS" :use nil))
+(setf (fdefinition (intern "WAIT-UNTIL-FD-USABLE" "SB-SYS"))
+      (lambda (fd direction &optional timeout serve-events)
+        serve-events
+        (if (eq direction :input)
+            (> (%sbs-poll-in fd (if timeout (max 0 (round (* timeout 1000))) -1)) 0)
+            t)))

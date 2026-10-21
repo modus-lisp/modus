@@ -23069,22 +23069,29 @@
    the 0x0507 trap marshals them into the x86-64 syscall ABI registers
    (rdi rsi rdx r10 r8 r9) + rax.  Enables sendto/recvfrom (UDP multi-peer)
    and setsockopt (5 args, a6 ignored)."
-  (compile-form (nth 0 args) env dest) (emit-ir :push dest)   ; num
-  (compile-form (nth 1 args) env dest) (emit-ir :push dest)   ; a1
-  (compile-form (nth 2 args) env dest) (emit-ir :push dest)   ; a2
-  (compile-form (nth 3 args) env dest) (emit-ir :push dest)   ; a3
-  (compile-form (nth 4 args) env dest) (emit-ir :push dest)   ; a4
-  (compile-form (nth 5 args) env dest) (emit-ir :push dest)   ; a5
-  (compile-form (nth 6 args) env dest)                        ; a6 in dest
-  (emit-ir :mov +vreg-v6+ dest)
-  (emit-ir :pop +vreg-v5+)
-  (emit-ir :pop +vreg-v4+)
-  (emit-ir :pop +vreg-v3+)
-  (emit-ir :pop +vreg-v2+)
-  (emit-ir :pop +vreg-v1+)
-  (emit-ir :pop +vreg-v0+)
-  (emit-ir :trap #x050B)      ; generic 6-arg syscall on BOTH arches (0x0507 is unlinkat on aarch64)
-  (emit-ir :mov dest +vreg-v0+))
+  ;; V4..V6 carry arguments 4..6 but are not argument registers: a caller may
+  ;; hold a live local in one (the interpreter's REGS vector, measured), so
+  ;; they are saved around the trap -- all but DEST, which takes the result.
+  ;; V0..V3 are the call-clobbered argument registers, as for SYSCALL3.
+  (let ((saved (remove dest (list +vreg-v4+ +vreg-v5+ +vreg-v6+))))
+    (dolist (r saved) (emit-ir :push r))
+    (compile-form (nth 0 args) env dest) (emit-ir :push dest)   ; num
+    (compile-form (nth 1 args) env dest) (emit-ir :push dest)   ; a1
+    (compile-form (nth 2 args) env dest) (emit-ir :push dest)   ; a2
+    (compile-form (nth 3 args) env dest) (emit-ir :push dest)   ; a3
+    (compile-form (nth 4 args) env dest) (emit-ir :push dest)   ; a4
+    (compile-form (nth 5 args) env dest) (emit-ir :push dest)   ; a5
+    (compile-form (nth 6 args) env dest)                        ; a6 in dest
+    (emit-ir :mov +vreg-v6+ dest)
+    (emit-ir :pop +vreg-v5+)
+    (emit-ir :pop +vreg-v4+)
+    (emit-ir :pop +vreg-v3+)
+    (emit-ir :pop +vreg-v2+)
+    (emit-ir :pop +vreg-v1+)
+    (emit-ir :pop +vreg-v0+)
+    (emit-ir :trap #x050B)      ; generic 6-arg syscall on BOTH arches (0x0507 is unlinkat on aarch64)
+    (emit-ir :mov dest +vreg-v0+)
+    (dolist (r (reverse saved)) (emit-ir :pop r))))
 
 (defun compile-aarch64-fileio-trap (trap-code args env dest)
   "Compile a Linux/AArch64 file-I/O `*at` syscall trap.

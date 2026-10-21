@@ -1508,9 +1508,10 @@
                 (setf pc npc))
                ((= code #x0500)
                 (sys-exit (svref regs +vreg-v0+)))
-               ((and (>= code #x100) (< code +frame-enter-sized+))
-                ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
-                (setf pc npc))
+               ;; BEFORE the FRAME-ALLOC range below: #x0502 / #x0503 / #x050B
+               ;; are inside [#x100, +FRAME-ENTER-SIZED+), and placed after it
+               ;; these arms never ran -- an interpreted (syscall6 39 ...)
+               ;; returned 39, a perf_event_open "returned" fd 298.
                ;; SYSCALL3 / SYSCALL3-RAW / SYSCALL6: run the same primitive
                ;; natively.  A register holds the OBJECT whose bits are the
                ;; operand word, which is exactly what the native call passes,
@@ -1535,6 +1536,9 @@
                                 (svref regs +vreg-v2+) (svref regs +vreg-v3+)
                                 (svref regs (+ +vreg-v0+ 4)) (svref regs (+ +vreg-v0+ 5))
                                 (svref regs (+ +vreg-v0+ 6))))
+                (setf pc npc))
+               ((and (>= code #x100) (< code +frame-enter-sized+))
+                ;; FRAME-ALLOC / FRAME-FREE: no-op (frame is over-allocated).
                 (setf pc npc))
                ;; Anything else (serial / MMIO / IRQ / exit / mmap / JIT /
                ;; thread traps) is not implemented here: say so, loudly.

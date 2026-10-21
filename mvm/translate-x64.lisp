@@ -8384,6 +8384,18 @@
         (emit-label buf capped)
         (emit-sub-reg-reg buf 'rax 'r11)))
     (emit-bytes buf #x49 #x89 #xC6)              ; mov r14, rax
+    ;; HEAP EXHAUSTED.  When the survivors alone reach the new limit, the next
+    ;; :gc-check collects again, copies the same live set back, and so on
+    ;; forever: one core at 100%, memory flat, no output -- what a cl-bench
+    ;; run that outgrew the semispace looked like for an hour (HTABLE-STRING-
+    ;; FAIR's setup on top of LARGE's 512 MB of keys).  Say so and stop.
+    (when *x64-linux-mode*
+      (let ((room (make-label)))
+        (emit-cmp-reg-reg buf 'r12 'r14)
+        (emit-jcc buf :b room)                   ; free ptr below the limit: fine
+        (emit-fatal-message buf (format nil "~%Modus: heap exhausted -- the live data does not fit the heap after a full collection~%")
+                            137)
+        (emit-label buf room)))
 
     ;; ---- MCGC point (c): clear the reclaimed from-space's object-start bitmap ----
     ;; RBX = old from_start: the semispace just fully evacuated by this

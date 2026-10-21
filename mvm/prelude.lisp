@@ -1849,7 +1849,7 @@
          ;; walks the alist, which already contains NEW-PAIR).
          (cond
            ((and (> (%ht-h-count holder) (* 2 (%prim-array-length vec)))
-                 (< (%prim-array-length vec) 65536))
+                 (< (%prim-array-length vec) (%ht-max-buckets)))
             (%ht-rebuild-index ht holder strcmp?))
            ;; the two conses above may have collected region 0: the key's
            ;; address is no longer the one the index was built for
@@ -2278,6 +2278,13 @@
   "Var-index ASET forced to dest=frame-slot (CLAUDE.md var-index ASET bug)."
   (let ((dummy (aset vec i val))) dummy))
 
+(defun %ht-max-buckets ()
+  "The most buckets an index grows to.  65536 held chains to ~2 entries up to
+   128k entries, and a million-key table walked chains of 15: cl-bench
+   HTABLE-FIXNUM (2^20 fixnum keys) took 620 ns a GETHASH, 13x SBCL.  4M
+   buckets is a 32 MB vector, reached only by a table of 2M entries."
+  4194304)
+
 (defun %ht-new-bucket-vec (n)
   "N NIL-filled buckets (alloc-array zero-inits to fixnum 0, NOT NIL)."
   (let ((vec (make-array n)) (i 0))
@@ -2472,13 +2479,13 @@
 (defun %ht-rebuild-index (ht holder strcmp?)
   "Build (or RE-build, larger) the bucket index from HT's current alist and
    store it in HOLDER's car.  The bucket count is a power of two sized so the
-   average chain stays at or under 2 entries (min 256, max 65536): a fixed
+   average chain stays at or under 2 entries (min 256, max %HT-MAX-BUCKETS): a fixed
    256 buckets over the 7.5k-entry symbol tables meant 30-entry chains on
    every GETHASH.  If any key isn't structurally hashable, mark :NOHASH and
    bail (the table permanently falls back to the linear alist scan)."
   (let ((cnt (%ht-h-count holder)) (n 256))
     (loop
-      (when (or (>= n (* 2 cnt)) (>= n 65536)) (return nil))
+      (when (or (>= n (* 2 cnt)) (>= n (%ht-max-buckets))) (return nil))
       (setq n (* n 2)))
     ;; The rebuild is one allocation burst: the bucket vector and two conses
     ;; an entry.  Under the runtime lock that must fit the lock-arena slice

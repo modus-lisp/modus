@@ -114,8 +114,9 @@
              *symbol-function-table*)
     (sort (coerce pairs 'vector) (function <) :key (function car))))
 
-;; Declared, not assigned: mvm/mvm-eval.lisp owns it and fills it.
+;; Declared, not assigned: mvm/mvm-eval.lisp owns them and fills them.
 (defvar *jit-code-map*)
+(defvar *jit-fnaddr-x64-thunks*)
 
 (defun %bt-jit-code-table ()
   "*JIT-CODE-MAP* (mvm-eval.lisp: every JIT'd function's exact extent, lambdas
@@ -148,6 +149,47 @@
               (if cut
                   (format nil "(lambda in ~a)" owner)
                   (if (string= owner "toplevel form") "(toplevel form)" owner)))))))))
+
+(defun %bt-fn-label (fn)
+  "The raw name of the code FN runs -- its ELF symbol for image code, its exact
+   JIT extent's name (FOO, FOO$$LAMBDA3, %MVM-EVAL-THUNK) for JIT code -- or
+   NIL.  A closure is looked up by the code address in its slot 0.  For
+   %FUNCTION-NAME (cl-eval.lisp), which turns the label into a Lisp name."
+  (when (functionp fn)
+    (let* ((scratch (+ (%tls-self-base) (%conv-addr #x100050A0)))
+           (w (%gc-word-of fn scratch))
+           (code (if (= (logand w 15) 3)
+                     (- w 3)
+                     ;; a closure object: [fn-addr env]
+                     (let ((c (%gc-word-of (%prim-aref fn 0) scratch)))
+                       (and (= (logand c 15) 3) (- c 3))))))
+      (when code
+        (if (>= code #x3000000000)
+            (or
+             ;; a #'NAME late-binding thunk (mvm-eval.lisp: one per NAME, in
+             ;; *JIT-FNADDR-X64-THUNKS*): its code is the bridge, not NAME's
+             (let ((hit nil))
+               (when (and (boundp '*jit-fnaddr-x64-thunks*)
+                          (hash-table-p *jit-fnaddr-x64-thunks*))
+                 (maphash (lambda (nm th) (when (and (null hit) (eql th code)) (setq hit nm)))
+                          *jit-fnaddr-x64-thunks*))
+               (cond ((stringp hit) hit) ((symbolp hit) (and hit (symbol-name hit))) (t nil)))
+             (let ((e (%bt-jit-code-entry code (%bt-jit-code-table))))
+               (and e (cddr e))))
+            (let ((e (%bt-lookup code (%bt-code-table))))
+              (and e (= code (car e)) (cadr e))))))))
+
+(defun %bt-jit-code-entry (addr table)
+  "The (START END . NAME) of TABLE whose extent holds ADDR, or NIL."
+  (when table
+    (let ((lo 0) (hi (- (length table) 1)) (best nil))
+      (loop
+        (when (> lo hi) (return))
+        (let ((mid (floor (+ lo hi) 2)))
+          (if (<= (car (aref table mid)) addr)
+              (setq best mid lo (+ mid 1))
+              (setq hi (- mid 1)))))
+      (and best (< addr (cadr (aref table best))) (aref table best)))))
 
 (defun %bt-lookup (addr table)
   "The entry of TABLE at or below ADDR, or NIL."

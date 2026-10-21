@@ -4972,6 +4972,74 @@
 (defvar // nil)
 (defvar /// nil)
 
+;;; FUNCTION NAMES.  A function object here carries no name: a native one is a
+;;; code address, a closure a code address and an environment.  So the name is
+;;; recovered -- for the printer (#<FUNCTION NAME>), FUNCTION-LAMBDA-EXPRESSION's
+;;; third value and SB-KERNEL:%FUN-NAME, which libraries use to say what a
+;;; function is: every function printed as #<?0> or #<?CLOSURE>.
+;;;   1. a generic function's dispatch stub: *GF-FN-TO-NAME*;
+;;;   2. a function the global environment names: the *SYMBOL-FUNCTION-TABLE*
+;;;      entry whose value it IS, its key turned back into the symbol;
+;;;   3. (hosted x64) the code it runs, by %BT-FN-LABEL: a lambda or closure as
+;;;      (LAMBDA :IN OWNER), the evaluator's thunk's as (LAMBDA :IN :TOPLEVEL).
+(defun %fn-key-symbol (key fn)
+  "The symbol a *SYMBOL-FUNCTION-TABLE* KEY names: PKG::NAME by that package,
+   a bare name preferring a symbol whose function IS FN."
+  (let ((sep (search "::" key)))
+    (if sep
+        (let ((p (find-package (subseq key 0 sep))))
+          (and p (find-symbol (subseq key (+ sep 2)) p)))
+        (let ((first nil))
+          (dolist (p (list* (find-package "COMMON-LISP") *package*
+                            (find-package "COMMON-LISP-USER") (list-all-packages))
+                     first)
+            (when p
+              (let ((s (find-symbol key p)))
+                (when s
+                  (unless first (setq first s))
+                  (when (and fn (fboundp s) (eq (ignore-errors (fdefinition s)) fn))
+                    (return s))))))))))
+
+;; Declared, not assigned: cl-clos.lisp and mvm-eval.lisp own them.
+(defvar *gf-fn-to-name*)
+(defvar *%fn-names*)
+
+(defun %gf-stub-p (fn)
+  "FN is a generic function's dispatch stub."
+  (and (consp *gf-fn-to-name*) (assoc fn *gf-fn-to-name* :test (function eq)) t))
+
+(defun %function-name (fn)
+  "FN's name as SBCL reports it -- a symbol, or (LAMBDA :IN OWNER) for an
+   anonymous function whose defining function is known -- or NIL."
+  (when (functionp fn)
+    (or (let ((g (and (consp *gf-fn-to-name*) (assoc fn *gf-fn-to-name* :test (function eq)))))
+          (and g (cdr g)))
+        ;; a runtime DEFUN's interpreter trampoline, current or redefined
+        (let ((n (and (hash-table-p *%fn-names*) (gethash fn *%fn-names*))))
+          (and (stringp n) (%fn-key-symbol n nil)))
+        (let ((key nil))
+          (when (hash-table-p *symbol-function-table*)
+            (maphash (lambda (k v) (when (and (null key) (stringp k) (eq v fn)) (setq key k)))
+                     *symbol-function-table*))
+          (and key (%fn-key-symbol key fn)))
+        (let ((label (and (fboundp '%bt-fn-label) (ignore-errors (funcall '%bt-fn-label fn)))))
+          ;; the runtime's own trampoline makers' code says nothing about which
+          ;; function it is running: no name rather than a wrong one
+          (when (and (stringp label) (not (eql 0 (search "%MVM-MAKE-" label))))
+            (let ((cut (search "$$" label)))
+              (cond
+                ((string= label "%MVM-EVAL-THUNK") (list 'lambda :in :toplevel))
+                ;; FLET / LABELS bodies are NAME$$FLETn (compile-flet)
+                ((and cut (search "$$FLET" label))
+                 (let ((local (subseq label 0 cut)))
+                   (list 'flet (or (%fn-key-symbol local nil) local))))
+                (cut (let ((owner (subseq label 0 cut)))
+                       (list 'lambda :in
+                             (if (string= owner "%MVM-EVAL-THUNK")
+                                 :toplevel
+                                 (or (%fn-key-symbol owner nil) owner)))))
+                (t (%fn-key-symbol label fn)))))))))
+
 (defun compile-file-pathname (file &rest args)
   "The pathname COMPILE-FILE would write: FILE with type \"fasl\", merged
    under :OUTPUT-FILE when one is given."

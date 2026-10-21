@@ -1297,6 +1297,19 @@
                              (if (null level) 1 (+ level 1)) escape)
                  (setq i (+ i 1))))
              (%print-char 41 stream))))))  ; ) — close let, t, cond, let, arrayp
+      ;; A function: #<FUNCTION NAME> as SBCL prints it (a generic function's
+      ;; dispatch stub as #<STANDARD-GENERIC-FUNCTION NAME>), no address, so
+      ;; output stays byte-stable.  It printed #<?0> / #<?CLOSURE>.
+      ((functionp obj)
+       (let ((nm (%function-name obj)))
+         (%print-string-raw (if (%gf-stub-p obj)
+                                "#<STANDARD-GENERIC-FUNCTION "
+                                "#<FUNCTION ")
+                            stream)
+         (if nm
+             (%write-obj nm stream level t)
+             (%print-string-raw "{anonymous}" stream))
+         (%print-string-raw ">" stream)))
       ;; Anything else — SAY WHAT IT IS.  A bare "#<?>" carried no information
       ;; at all, and this arm is exactly where a broken object arrives: a
       ;; condition whose type-name slot has gone bad prints through here, and

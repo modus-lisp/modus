@@ -1782,7 +1782,9 @@
 
 ;; Minimal stub: ANSI returns 3 values (lambda-expr closure-p name).
 ;; Returning (NIL NIL NIL) at least lets length-checking tests pass.
-(defun function-lambda-expression (fn) (values nil nil nil))
+(defun function-lambda-expression (fn)
+  ;; No lambda expression is kept; the NAME is (cl-eval.lisp %FUNCTION-NAME).
+  (values nil nil (%function-name fn)))
 ;; Many basic predicates are inline opcodes with no callable function
 ;; entry, so `#'pred' resolves to NIL/garbage and (funcall #'pred x)
 ;; silently misbehaves.  Adding real defuns gives them callable

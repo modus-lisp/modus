@@ -90,7 +90,7 @@
 (defpackage "SB-KERNEL"
   (:use)
   (:export "MAKE-SINGLE-FLOAT" "MAKE-DOUBLE-FLOAT" "SINGLE-FLOAT-BITS"
-           "DOUBLE-FLOAT-HIGH-BITS" "DOUBLE-FLOAT-LOW-BITS"))
+           "DOUBLE-FLOAT-HIGH-BITS" "DOUBLE-FLOAT-LOW-BITS" "%FUN-NAME"))
 
 (defpackage "SB-INT"
   (:use)
@@ -843,6 +843,10 @@
 ;;; SBCL's: SINGLE-FLOAT-BITS and DOUBLE-FLOAT-HIGH-BITS are signed 32-bit, the low half unsigned.
 
 (defun %sb-signed32 (u) (if (logbitp 31 u) (- u 4294967296) u))
+
+;;; The name a function reports (backtraces, documentation tools, test
+;;; frameworks ask for it): mvm/cl-eval.lisp %FUNCTION-NAME.
+(defun sb-kernel:%fun-name (f) (%function-name f))
 
 (defun sb-kernel:make-single-float (bits)
   "The single-float whose IEEE-32 pattern is BITS (a signed or unsigned 32-bit integer)."

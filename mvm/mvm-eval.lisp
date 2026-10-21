@@ -2348,7 +2348,21 @@
                     (setq left (%jit-hot-call-threshold) spent 0)
                     (setq left 0))))
             (values-list vals)))))
+    (%note-fn-name (car self) name)
     (car self)))
+
+;;; The NAME of each runtime DEFUN's trampoline, for %FUNCTION-NAME
+;;; (cl-eval.lisp): the trampoline's code is %MVM-MAKE-DEFUN-TRAMPOLINE's
+;;; lambda, shared by every DEFUN, so nothing else can say which function a
+;;; redefined DEFUN's old object was.  Main thread only (a worker's closure must
+;;; not reach a global); one entry per DEFUN and redefinition.
+(defvar *%fn-names* nil)
+
+(defun %note-fn-name (fn name)
+  (when (and fn name (%mvm-on-main-thread-p))
+    (unless (hash-table-p *%fn-names*)
+      (setq *%fn-names* (make-hash-table :test (quote eq))))
+    (setf (gethash fn *%fn-names*) (if (symbolp name) (symbol-name name) name))))
 
 (defun %init-modus-package ()
   "Bind the MODUS package's generic runtime functions.  Called from kernel-main

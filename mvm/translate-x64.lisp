@@ -4914,31 +4914,51 @@
                   ;; r13 isn't a V-phys-reg, so r13 is always disjoint
                   ;; except when d is rax — in that case use r13 ourselves.
                   (tmp (if (eq d 'rax) 'r13 'rax)))
-             (emit-push buf tmp)
-             ;; Load vs into tmp — preserves the source through clobbers.
-             (if ps
-                 (emit-mov-reg-reg buf tmp ps)
-                 (emit-load-vreg buf vs tmp))
-             ;; Tag check: low nibble of tmp == 9 ?  d is scratch for AND.
-             (emit-mov-reg-reg buf d tmp)
-             (emit-and-reg-imm buf d #x0F)
-             (emit-cmp-reg-imm buf d 9)
-             (emit-jcc buf :ne fail-label)
-             ;; T-immediate check — T (#xDEAD1009) shares tag-9 with real
-             ;; heap pointers but [T-9] is unmapped.  d still scratch.
-             (emit-mov-reg-imm buf d #xDEAD1009)
-             (emit-cmp-reg-reg buf tmp d)
-             (emit-jcc buf :e fail-label)
-             ;; Real heap object — extract subtag from header at [tmp-9].
-             (emit-mov-reg-mem buf d tmp -9)
-             (emit-and-reg-imm buf d #xFF)
-             (emit-shl-reg-imm buf d 1)
-             (emit-jmp buf done-label)
-             (emit-label buf fail-label)
-             ;; subtag = 0 — falsifies any caller's specific-subtag cmp.
-             (emit-mov-reg-imm buf d 0)
-             (emit-label buf done-label)
-             (emit-pop buf tmp))
+             (if (and ps (not (eq ps d)))
+                 ;; The source in a register other than D: read it in place,
+                 ;; no PUSH/MOV/POP of a copy (a subtype test sits under every
+                 ;; %PRIM-AREF, %MDA-P, STRINGP ...).
+                 (progn
+                   (emit-mov-reg-reg buf d ps)
+                   (emit-and-reg-imm buf d #x0F)
+                   (emit-cmp-reg-imm buf d 9)
+                   (emit-jcc buf :ne fail-label)
+                   (emit-mov-reg-imm buf d #xDEAD1009)
+                   (emit-cmp-reg-reg buf ps d)
+                   (emit-jcc buf :e fail-label)
+                   (emit-mov-reg-mem buf d ps -9)
+                   (emit-and-reg-imm buf d #xFF)
+                   (emit-shl-reg-imm buf d 1)
+                   (emit-jmp buf done-label)
+                   (emit-label buf fail-label)
+                   (emit-mov-reg-imm buf d 0)
+                   (emit-label buf done-label))
+                 (progn
+                 (emit-push buf tmp)
+                 ;; Load vs into tmp — preserves the source through clobbers.
+                 (if ps
+                     (emit-mov-reg-reg buf tmp ps)
+                     (emit-load-vreg buf vs tmp))
+                 ;; Tag check: low nibble of tmp == 9 ?  d is scratch for AND.
+                 (emit-mov-reg-reg buf d tmp)
+                 (emit-and-reg-imm buf d #x0F)
+                 (emit-cmp-reg-imm buf d 9)
+                 (emit-jcc buf :ne fail-label)
+                 ;; T-immediate check — T (#xDEAD1009) shares tag-9 with real
+                 ;; heap pointers but [T-9] is unmapped.  d still scratch.
+                 (emit-mov-reg-imm buf d #xDEAD1009)
+                 (emit-cmp-reg-reg buf tmp d)
+                 (emit-jcc buf :e fail-label)
+                 ;; Real heap object — extract subtag from header at [tmp-9].
+                 (emit-mov-reg-mem buf d tmp -9)
+                 (emit-and-reg-imm buf d #xFF)
+                 (emit-shl-reg-imm buf d 1)
+                 (emit-jmp buf done-label)
+                 (emit-label buf fail-label)
+                 ;; subtag = 0 — falsifies any caller's specific-subtag cmp.
+                 (emit-mov-reg-imm buf d 0)
+                 (emit-label buf done-label)
+                 (emit-pop buf tmp))))
            (maybe-store-scratch buf vd)))
 
         ;; ============================================
@@ -5038,28 +5058,47 @@
                   (done-label (make-label))
                   ;; tmp must differ from d; r13 isn't a V-phys-reg.
                   (tmp (if (eq d 'rax) 'r13 'rax)))
-             (emit-push buf tmp)
-             (if po
-                 (emit-mov-reg-reg buf tmp po)
-                 (emit-load-vreg buf vobj tmp))
-             ;; Tag check.
-             (emit-mov-reg-reg buf d tmp)
-             (emit-and-reg-imm buf d #x0F)
-             (emit-cmp-reg-imm buf d 9)
-             (emit-jcc buf :ne fail-label)
-             ;; T-immediate check.
-             (emit-mov-reg-imm buf d #xDEAD1009)
-             (emit-cmp-reg-reg buf tmp d)
-             (emit-jcc buf :e fail-label)
-             ;; Real heap object — read header at [tmp-9], count = h >> 8, tag.
-             (emit-mov-reg-mem buf d tmp -9)
-             (emit-shr-reg-imm buf d 8)
-             (emit-shl-reg-imm buf d 1)
-             (emit-jmp buf done-label)
-             (emit-label buf fail-label)
-             (emit-mov-reg-imm buf d 0)
-             (emit-label buf done-label)
-             (emit-pop buf tmp))
+             (if (and po (not (eq po d)))
+                 ;; Source in a register other than D: read it in place (see
+                 ;; +op-obj-subtag+).
+                 (progn
+                   (emit-mov-reg-reg buf d po)
+                   (emit-and-reg-imm buf d #x0F)
+                   (emit-cmp-reg-imm buf d 9)
+                   (emit-jcc buf :ne fail-label)
+                   (emit-mov-reg-imm buf d #xDEAD1009)
+                   (emit-cmp-reg-reg buf po d)
+                   (emit-jcc buf :e fail-label)
+                   (emit-mov-reg-mem buf d po -9)
+                   (emit-shr-reg-imm buf d 8)
+                   (emit-shl-reg-imm buf d 1)
+                   (emit-jmp buf done-label)
+                   (emit-label buf fail-label)
+                   (emit-mov-reg-imm buf d 0)
+                   (emit-label buf done-label))
+                 (progn
+                 (emit-push buf tmp)
+                 (if po
+                     (emit-mov-reg-reg buf tmp po)
+                     (emit-load-vreg buf vobj tmp))
+                 ;; Tag check.
+                 (emit-mov-reg-reg buf d tmp)
+                 (emit-and-reg-imm buf d #x0F)
+                 (emit-cmp-reg-imm buf d 9)
+                 (emit-jcc buf :ne fail-label)
+                 ;; T-immediate check.
+                 (emit-mov-reg-imm buf d #xDEAD1009)
+                 (emit-cmp-reg-reg buf tmp d)
+                 (emit-jcc buf :e fail-label)
+                 ;; Real heap object — read header at [tmp-9], count = h >> 8, tag.
+                 (emit-mov-reg-mem buf d tmp -9)
+                 (emit-shr-reg-imm buf d 8)
+                 (emit-shl-reg-imm buf d 1)
+                 (emit-jmp buf done-label)
+                 (emit-label buf fail-label)
+                 (emit-mov-reg-imm buf d 0)
+                 (emit-label buf done-label)
+                 (emit-pop buf tmp))))
            (maybe-store-scratch buf vd)))
 
         ;; ============================================

@@ -2408,6 +2408,144 @@
     (dolist (insn frag) (push insn *ir-buffer*)))
   (setq *deferred-tails* nil))
 
+;;; JUMP THREADING (2026-10-21).  Nested IF/AND/OR/WHEN leave each arm a BR
+;;; to its parent's join label, which is itself a BR to the next join: the
+;;; success path of a five-test AND ran six JMPs in a row.  And a test whose
+;;; arm is a constant NIL or T compiles to `MOV R VN ; BNULL R X` -- a branch
+;;; whose outcome is known.  This pass, over one function's finished IR:
+;;;   1. retargets every branch whose target begins (labels aside) with an
+;;;      unconditional BR, to that BR's target (to a fixed point, 16 hops);
+;;;   2. turns BNULL/BNNULL right after `MOV R VN` or `LI R T` into BR or
+;;;      nothing;
+;;;   3. retargets `MOV R VN`/`LI R T` + BR whose target begins with a
+;;;      BNULL/BNNULL of R to where that branch goes (a fresh label after it
+;;;      for the fall-through);
+;;;   4. drops a BR to the label that immediately follows it;
+;;;   5. drops the unreachable instructions between a BR and the next label;
+;;;   6. turns `Bcc L1 ; BR L2 ; L1:` into `B(not cc) L2 ; L1:`.
+;;; It never moves code and never changes what a register holds.
+(defparameter *thread-jumps* t)
+(defparameter *ir-branch-ops* '(:br :beq :bne :blt :bge :ble :bgt :bvs :bnull :bnnull))
+
+(defun %ir-branch-p (insn) (and (consp insn) (member (car insn) *ir-branch-ops*)))
+(defun %ir-branch-target (insn) (car (last insn)))
+(defun %ir-retarget (insn label)
+  (append (butlast insn) (list label)))
+(defun %ir-known-value (insn)
+  "For an instruction that sets a register to a known NIL / non-NIL, (REG . :NIL)
+   or (REG . :T); else NIL."
+  (cond ((and (eq (car insn) :mov) (eql (third insn) +vreg-vn+)) (cons (second insn) :nil))
+        ((and (eq (car insn) :li) (eql (third insn) +t-value+)) (cons (second insn) :t))
+        (t nil)))
+
+(defun %ir-invert-branch (op)
+  (cdr (assoc op '((:beq . :bne) (:bne . :beq) (:blt . :bge) (:bge . :blt)
+                   (:bgt . :ble) (:ble . :bgt) (:bnull . :bnnull) (:bnnull . :bnull)))))
+
+(defun %ir-tidy-branches (ir)
+  "Steps 5 and 6 of THREAD-JUMPS over IR (forward order); returns new IR."
+  (let ((res nil) (l ir) (dead nil))
+    (loop
+      (when (null l) (return (nreverse res)))
+      (let ((x (car l)))
+        (cond
+          ((eq (car x) :label) (setq dead nil) (push x res))
+          (dead nil)
+          ;; Bcc L1 ; BR L2 ; L1:  =>  B!cc L2 ; L1:
+          ((and (%ir-invert-branch (car x))
+                (consp (cdr l)) (eq (car (cadr l)) :br)
+                (consp (cddr l)) (eq (car (caddr l)) :label)
+                (eql (second (caddr l)) (%ir-branch-target x)))
+           (push (%ir-retarget (cons (%ir-invert-branch (car x)) (cdr x))
+                               (second (cadr l)))
+                 res)
+           (setq l (cdr l)))
+          (t (push x res)
+             (when (eq (car x) :br) (setq dead t)))))
+      (setq l (cdr l)))))
+
+(defun thread-jumps (ir)
+  (unless *thread-jumps* (return-from thread-jumps ir))
+  (let* ((v (coerce ir 'vector))
+         (n (length v))
+         (label-at (make-hash-table :test 'eql))   ; label -> index of the label insn
+         (after (make-hash-table :test 'eql))      ; index of a branch -> fresh label after it
+         (changed nil))
+    (dotimes (i n)
+      (let ((x (aref v i)))
+        (when (eq (car x) :label) (setf (gethash (second x) label-at) i))))
+    (labels ((first-real (label)
+               ;; index of the first non-label instruction at LABEL, or NIL
+               (let ((i (gethash label label-at)))
+                 (when i
+                   (loop
+                     (when (>= i n) (return nil))
+                     (unless (eq (car (aref v i)) :label) (return i))
+                     (setq i (+ i 1))))))
+             (final-target (label)
+               (let ((l label) (hops 0))
+                 (loop
+                   (let ((j (first-real l)))
+                     (if (and j (< hops 16) (eq (car (aref v j)) :br)
+                              (not (eql (%ir-branch-target (aref v j)) l)))
+                         (progn (setq l (%ir-branch-target (aref v j))) (setq hops (+ hops 1)))
+                         (return l))))))
+             (label-after (j)
+               ;; a label placed right after instruction J (created on demand)
+               (or (gethash j after)
+                   (setf (gethash j after) (make-compiler-label)))))
+      (dotimes (i n)
+        (let ((x (aref v i)))
+          (when (%ir-branch-p x)
+            ;; 2. a test of a register whose value the previous insn fixed
+            (let ((kv (and (> i 0) (member (car x) '(:bnull :bnnull))
+                           (%ir-known-value (aref v (- i 1))))))
+              (when (and kv (eql (car kv) (second x)))
+                (let ((taken (if (eq (car x) :bnull) (eq (cdr kv) :nil) (eq (cdr kv) :t))))
+                  (setq x (if taken (list :br (third x)) (list :nop-threaded)))
+                  (setf (aref v i) x)
+                  (setq changed t))))
+            (when (%ir-branch-p x)
+              ;; 1. branch to a branch
+              (let* ((old (%ir-branch-target x)) (new (final-target old)))
+                ;; 3. known register value + BR into a test of that register
+                (when (and (eq (car x) :br) (> i 0))
+                  (let ((kv (%ir-known-value (aref v (- i 1)))))
+                    (when kv
+                      (let ((j (first-real new)))
+                        (when (and j (member (car (aref v j)) '(:bnull :bnnull))
+                                   (eql (second (aref v j)) (car kv)))
+                          (let ((taken (if (eq (car (aref v j)) :bnull)
+                                           (eq (cdr kv) :nil) (eq (cdr kv) :t))))
+                            (setq new (final-target (if taken (third (aref v j)) (label-after j))))))))))
+                (unless (eql new old)
+                  (setf (aref v i) (%ir-retarget x new))
+                  (setq changed t)))))))
+      (let ((out nil))
+        (if (not changed)
+            (setq out ir)
+            (progn
+              (dotimes (i n)
+                (let ((x (aref v i)))
+                  (unless (eq (car x) :nop-threaded) (push x out))
+                  (let ((l (gethash i after))) (when l (push (list :label l) out)))))
+              (setq out (nreverse out))))
+        (setq out (%ir-tidy-branches out))
+        ;; 4. BR to the very next label(s)
+        (let ((res nil) (l out))
+          (loop
+            (when (null l) (return (nreverse res)))
+            (let ((x (car l)))
+              (if (and (eq (car x) :br)
+                       (let ((m (cdr l)) (hit nil))
+                         (loop
+                           (when (or (null m) (not (eq (car (car m)) :label))) (return hit))
+                           (when (eql (second (car m)) (second x)) (setq hit t))
+                           (setq m (cdr m)))))
+                  nil
+                  (push x res)))
+            (setq l (cdr l))))))))
+
 (defun get-ir-instructions ()
   "Return the IR instructions in forward order.
    Clears *ir-buffer* after extracting: nreverse is DESTRUCTIVE and leaves
@@ -8766,6 +8904,8 @@
        (compile-word-aref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD-ASET"))
        (compile-word-aset (cadr form) (caddr form) (cadddr form) env dest))
+      ((and (= op-name #.(compute-name-hash "%SLOT-REF")) (%obj-slot-imm-p (caddr form)))
+       (compile-slot-ref (cadr form) (caddr form) env dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
@@ -10096,6 +10236,29 @@
        (emit-ir :bne false-label)
        (free-temp-reg)))))
 
+(defun %compile-consp-branch (arg env dest false-label nil-true)
+  "Fall through when ARG is a cons (or, NIL-TRUE, NIL), else branch.  Runtime-
+   compiled code sees CL's CONSP, which excludes the hash-table cons (see
+   %RT-CONSP-EXPANSION): a cons whose cdr is a cons whose car is the tag."
+  (let ((temp nil) (through (make-compiler-label)))
+    (compile-form arg env dest)
+    (emit-ir :bnull dest (if nil-true through false-label))
+    (setq temp (alloc-temp-reg))
+    (emit-ir :obj-tag temp dest)
+    (emit-ir :cmp-imm temp (ash +tag-cons+ +fixnum-shift+))
+    (emit-ir :bne false-label)
+    (when *mvm-eval-runtime-p*
+      (emit-ir :cdr temp dest)
+      (emit-ir :bnull temp through)
+      (emit-ir :obj-tag dest temp)
+      (emit-ir :cmp-imm dest (ash +tag-cons+ +fixnum-shift+))
+      (emit-ir :bne through)
+      (emit-ir :car dest temp)
+      (emit-ir :cmp-imm dest (ash 442386510 +fixnum-shift+))   ; (%ht-tag)
+      (emit-ir :beq false-label))
+    (emit-ir-label through)
+    (free-temp-reg)))
+
 (defun %compile-subtype-branch (arg env dest subtag false-label)
   "Fall through when ARG is an object with SUBTAG, else branch."
   (let ((temp nil))
@@ -10204,6 +10367,12 @@
            (emit-ir :test dest dest)
            (emit-ir :bne false-label)
            (free-temp-reg))
+         t)
+        ((and one (or (is "CONSP") (is "LISTP")))
+         (%compile-consp-branch (car args) env dest false-label (is "LISTP"))
+         t)
+        ((and one (is "ATOM"))
+         (%compile-test-branch (list 'not (list 'consp (car args))) env dest false-label)
          t)
         ((and one (is "%PRIM-SIMPLE-STRING-P"))
          (%compile-subtype-branch (car args) env dest +subtag-string+ false-label) t)
@@ -21414,9 +21583,11 @@
         (tag-reg     (alloc-temp-reg)))
     ;; NIL short-circuit.
     (emit-ir :bnull dest null-label)
-    ;; consp dest → tag-reg (T / NIL).
-    (emit-ir :consp tag-reg dest)
-    (emit-ir :bnull tag-reg error-label)
+    ;; Not NIL, so a cons tag means a cons: test the tag in place rather than
+    ;; materialize CONSP's T/NIL (which re-tests NIL) and branch on that.
+    (emit-ir :obj-tag tag-reg dest)
+    (emit-ir :cmp-imm tag-reg (ash +tag-cons+ +fixnum-shift+))
+    (emit-ir :bne error-label)
     ;; Cons path: inline :car / :cdr.
     (emit-ir-label cons-label)
     (emit-ir op dest dest)
@@ -24453,6 +24624,18 @@
         (free-temp-reg)
         (free-temp-reg))))
 
+;;; (%SLOT-REF OBJ N), N a literal slot number: one OBJ-REF, no subtag
+;;; dispatch and no bounds check.  For runtime code that has ALREADY proved
+;;; OBJ is an object with more than N word slots (an MDA header after
+;;; %MDA-P, say).  %PRIM-AREF of a constant slot is a u8/word dispatch plus a
+;;; length check, ~35 x64 instructions; 2-D AREF read a dozen header slots
+;;; that way per element.
+(defun compile-slot-ref (obj-form idx env dest)
+  (let ((obj-reg (alloc-temp-reg)))
+    (compile-form obj-form env obj-reg)
+    (emit-ir :obj-ref dest obj-reg idx)
+    (free-temp-reg)))
+
 (defun compile-word-aset (arr-form idx-form val-form env dest)
   ;; Value first when ARR and IDX are lexical leaves — see compile-u8-set.
   (when (%store-value-first-ok-p arr-form idx-form val-form env dest)
@@ -26666,7 +26849,7 @@
     (flush-deferred-tails)
 
     ;; Build function-info
-    (let ((ir (get-ir-instructions)))
+    (let ((ir (thread-jumps (get-ir-instructions))))
       ;; Store the IR on the function-info for later bytecode emission
       (let* ((bare-name (if (symbolp name) (%rt-fn-name name) (string name)))
              (info (make-function-info

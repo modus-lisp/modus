@@ -80,7 +80,22 @@
     (:l1d-write-access 3 . #x00100) (:l1i-read-miss 3 . #x10001)
     (:llc-read-access 3 . #x00002) (:llc-read-miss 3 . #x10002)
     (:dtlb-read-miss 3 . #x10003) (:itlb-read-miss 3 . #x10004)
-    (:task-clock 1 . 1) (:page-faults 1 . 2) (:context-switches 1 . 3)))
+    (:task-clock 1 . 1) (:page-faults 1 . 2) (:context-switches 1 . 3)
+    ;; AMD Instruction-Based Sampling, sampling only (PMU-PROFILE): the IP is
+    ;; the exact instruction, not wherever a cycle sample skidded to.  :IBS-OP
+    ;; tags every PERIODth DISPATCHED op (cnt_ctl), so a stalled load is
+    ;; sampled itself and its tag-to-retire latency is its stall; :IBS-OP-CYCLES
+    ;; tags the op dispatched when PERIOD cycles have passed, which during a
+    ;; stall is the op AFTER it.  The PMU type comes from sysfs.
+    (:ibs-op :ibs . #x80000) (:ibs-op-cycles :ibs . 0)))
+
+(defun %pmu-ibs-type ()
+  "The perf type number of AMD's IBS op PMU (it varies by kernel), or an error."
+  (let ((line (ignore-errors
+               (with-open-file (i "/sys/bus/event_source/devices/ibs_op/type")
+                 (read-line i nil nil)))))
+    (or (and line (ignore-errors (parse-integer (string-trim " " line))))
+        (error "pmu: no IBS op PMU here (/sys/bus/event_source/devices/ibs_op): IBS is AMD-only"))))
 
 (defun pmu-preset (name)
   "Event sets of four, which fit beside the cycle counter: Zen 3 has six
@@ -101,12 +116,14 @@
 (defun %pmu-event (e)
   "(type . config) for event designator E."
   (cond ((integerp e) (cons 4 e))
-        ((assoc e (pmu-events)) (cdr (assoc e (pmu-events))))
+        ((assoc e (pmu-events))
+         (let ((te (cdr (assoc e (pmu-events)))))
+           (if (eq (car te) :ibs) (cons (%pmu-ibs-type) (cdr te)) te)))
         (t (error "pmu: unknown event ~s (see (pmu-events))" e))))
 
 ;;; --- perf_event_open ----------------------------------------------------------
 
-(defun %pmu-attr (type config &key (leader t) (period 0) (sample-type 0))
+(defun %pmu-attr (type config &key (leader t) (period 0) (sample-type 0) (exclude t))
   "Fill the perf_event_attr at the scratch page; return its address."
   (let ((a (%pmu-scratch)))
     (dotimes (i 32) (setf (mem-ref (+ a (* 4 i)) :u32) 0))
@@ -117,8 +134,10 @@
     (%pmu-put64 (+ a 24) sample-type)
     ;; read_format: GROUP | TOTAL_TIME_ENABLED | TOTAL_TIME_RUNNING
     (%pmu-put64 (+ a 32) (logior 8 1 2))
-    ;; flags: disabled (leader only) | exclude_kernel | exclude_hv
-    (%pmu-put64 (+ a 40) (logior (if leader 1 0) 32 64))
+    ;; flags: disabled (leader only) | exclude_kernel | exclude_hv -- not for
+    ;; IBS, whose driver refuses the exclusions (EINVAL); its kernel samples
+    ;; are named <kernel> when the ring is read
+    (%pmu-put64 (+ a 40) (logior (if leader 1 0) (if exclude (logior 32 64) 0)))
     (%pmu-put32 (+ a 48) 1)                        ; wakeup_events
     a))
 
@@ -127,7 +146,8 @@
   (let* ((group (or (getf keys :group) -1))
          (attr (%pmu-attr type config :leader (< group 0)
                           :period (or (getf keys :period) 0)
-                          :sample-type (or (getf keys :sample-type) 0)))
+                          :sample-type (or (getf keys :sample-type) 0)
+                          :exclude (if (member :exclude keys) (getf keys :exclude) t)))
          (fd (syscall6 298 attr 0 -1 group 8 0)))  ; flags: PERF_FLAG_FD_CLOEXEC
     (when (< fd 0)
       (error "pmu: perf_event_open(type ~d config #x~x) failed: errno ~d~a" type config (- fd)
@@ -256,10 +276,19 @@
   "Run THUNK sampling EVENT every PERIOD occurrences; print the hottest
    functions; (values RESULT PROFILE).  PROFILE is a plist: :SAMPLES :LOST
    :SELF and :INCLUSIVE ((name . samples) ...) sorted, and :HITS, a table of
-   sampled addresses -> count (for PMU-ANNOTATE)."
+   sampled addresses -> count (for PMU-ANNOTATE).  With an IBS EVENT
+   (:IBS-OP, :IBS-OP-CYCLES) also :DC-MISS ((name . data-cache misses) ...),
+   from each sample's raw IBS registers, and :LATENCY (tag-to-retire cycles
+   summed per function -- NOT a time profile: ops retire in order, so every
+   op queued behind a missing load carries its wait; test/pmu-calibrate.lisp
+   measures a 94% pointer chase at ~53% that way).  For WHERE TIME GOES use
+   the default :CYCLES (calibrated within a few points); IBS says exactly
+   WHICH instructions miss the data cache."
   (let* ((te (%pmu-event event))
-         (fd (%pmu-open (car te) (cdr te) :period period
-                        :sample-type (if callchain (logior 1 32) 1)))   ; IP | CALLCHAIN
+         (ibs (and (member event '(:ibs-op :ibs-op-cycles)) t))
+         (fd (%pmu-open (car te) (cdr te) :period period :exclude (not ibs)
+                        ;; IP | CALLCHAIN, and RAW (the IBS registers) for IBS
+                        :sample-type (logior 1 (if callchain 32 0) (if ibs 1024 0))))
          (ring nil) (r nil))
     (unwind-protect
          (progn
@@ -268,14 +297,19 @@
            (%pmu-ioctl fd #x2400)
            (setq r (funcall thunk))
            (%pmu-ioctl fd #x2401)
-           (let ((profile (%pmu-drain ring pages callchain)))
+           (let ((profile (%pmu-drain ring pages callchain ibs)))
              (%pmu-print-profile profile top stream)
              (setq r (list r profile))))
       (when ring (syscall3 11 ring (* 4096 (+ 1 pages)) 0))      ; munmap
       (%pmu-close fd))
     (values (first r) (second r))))
 
-(defun %pmu-drain (ring pages callchain)
+(defun %pmu-kernel-ip-p (rec-addr)
+  "The 64-bit IP stored at REC-ADDR is a kernel address (top half), read by its
+   high word so no bignum is made."
+  (>= (mem-ref (+ rec-addr 4) :u32) #xffff8000))
+
+(defun %pmu-drain (ring pages callchain &optional ibs)
   "Walk the ring's records into a profile plist."
   (let* ((head (%pmu-get64 (+ ring 1024)))          ; data_head
          (size (* 4096 pages))
@@ -285,6 +319,8 @@
          (self (make-hash-table :test 'equal))
          (incl (make-hash-table :test 'equal))
          (hits (make-hash-table))
+         (lat (make-hash-table :test 'equal))
+         (miss (make-hash-table :test 'equal))
          (samples 0) (lost 0)
          (pos (max 0 (- head size))))                ; older data is overwritten only if dropped
     (loop while (< pos head) do
@@ -294,10 +330,26 @@
         (when (zerop rsize) (return))
         (cond
           ((= type 9)                                ; PERF_RECORD_SAMPLE
-           (let ((ip (%pmu-get64 (+ data (mod (+ pos 8) size)))))
+           (let* ((kernel (%pmu-kernel-ip-p (+ data (mod (+ pos 8) size))))
+                  (ip (if kernel 0 (%pmu-get64 (+ data (mod (+ pos 8) size)))))
+                  (nm (if kernel "<kernel>" (%pmu-fn-name ip code jit))))
              (setq samples (+ samples 1))
-             (%pmu-bump hits ip 1)
-             (%pmu-bump self (%pmu-fn-name ip code jit) 1)
+             (unless kernel (%pmu-bump hits ip 1))
+             (%pmu-bump self nm 1)
+             ;; IBS: after IP (and the callchain) comes PERF_SAMPLE_RAW -- a
+             ;; u32 size, then a u32 capability word and the op registers:
+             ;; OP_CTL, OP_RIP, OP_DATA, OP_DATA2, OP_DATA3, ...  OP_DATA bits
+             ;; 31:16 are the tag-to-retire cycles; OP_DATA3 bit 7 is a
+             ;; data-cache miss.
+             (when ibs
+               (let* ((raw (+ pos 16 (if callchain
+                                         (+ 8 (* 8 (%pmu-get64 (+ data (mod (+ pos 16) size)))))
+                                         0)))
+                      (regs (+ raw 8))
+                      (opdata (mem-ref (+ data (mod (+ regs 16) size)) :u32))
+                      (opdata3 (mem-ref (+ data (mod (+ regs 32) size)) :u32)))
+                 (%pmu-bump lat nm (logand (ash opdata -16) #xffff))
+                 (when (logbitp 7 opdata3) (%pmu-bump miss nm 1))))
              (when callchain
                (let* ((nr (%pmu-get64 (+ data (mod (+ pos 16) size))))
                       (seen nil))
@@ -305,14 +357,15 @@
                    (let* ((a (+ data (mod (+ pos 24 (* 8 i)) size)))
                           (hi (mem-ref (+ a 4) :u32)))
                      ;; PERF_CONTEXT_* markers are the top 4 KB of the address
-                     ;; space; skip them without making the bignum
-                     (unless (>= hi #xffffff00)
+                     ;; space, kernel frames the top half (IBS samples the
+                     ;; kernel too); skip both without making the bignum
+                     (unless (>= hi #xffff8000)
                        (let ((nm (%pmu-fn-name (%pmu-get64 a) code jit)))
                          (unless (member nm seen :test #'string=)
                            (setq seen (cons nm seen))
                            (%pmu-bump incl nm 1))))))
-                 (unless (member (%pmu-fn-name ip code jit) seen :test #'string=)
-                   (%pmu-bump incl (%pmu-fn-name ip code jit) 1))))))
+                 (unless (member nm seen :test #'string=)
+                   (%pmu-bump incl nm 1))))))
           ((= type 2)                                ; PERF_RECORD_LOST: id, lost
            (setq lost (+ lost (%pmu-get64 (+ data (mod (+ pos 16) size)))))))
         (setq pos (+ pos rsize))))
@@ -320,20 +373,43 @@
     (flet ((sorted (h) (let ((l nil))
                          (maphash (lambda (k v) (setq l (cons (cons k v) l))) h)
                          (sort l #'> :key #'cdr))))
-      (list :samples samples :lost lost :self (sorted self)
-            :inclusive (sorted incl) :hits hits))))
+      (append (list :samples samples :lost lost :self (sorted self)
+                    :inclusive (sorted incl) :hits hits)
+              (when ibs (list :latency (sorted lat) :dc-miss (sorted miss)))))))
 
 (defun %pmu-print-profile (p top stream)
   (let ((n (max 1 (getf p :samples))))
     (format stream "~&  ~:d samples~@[, ~:d LOST (raise :pages or :period)~]~%"
             (getf p :samples) (and (plusp (getf p :lost)) (getf p :lost)))
-    (format stream "  ~6a ~6a  ~a~%" "self%" "incl%" "function")
-    (let ((incl (getf p :inclusive)) (i 0))
-      (dolist (e (getf p :self))
-        (when (>= i top) (return))
-        (format stream "  ~6,1f ~6,1f  ~a~%" (/ (* 100.0 (cdr e)) n)
-                (/ (* 100.0 (or (cdr (assoc (car e) incl :test #'string=)) 0)) n) (car e))
-        (setq i (+ i 1))))))
+    (if (getf p :latency)
+        ;; IBS: DC-MISS% is each function's share of the sampled data-cache
+        ;; misses, SELF% its share of the sampled OPS (not of time -- see
+        ;; PMU-PROFILE); sorted by misses, then ops.
+        (let* ((miss (getf p :dc-miss)) (incl (getf p :inclusive))
+               (mtot (max 1 (let ((s 0)) (dolist (e miss s) (setq s (+ s (cdr e)))))))
+               (rows (sort (copy-list (getf p :self))
+                           (lambda (a b)
+                             (let ((ma (or (cdr (assoc (car a) miss :test #'string=)) 0))
+                                   (mb (or (cdr (assoc (car b) miss :test #'string=)) 0)))
+                               (if (= ma mb) (> (cdr a) (cdr b)) (> ma mb))))))
+               (i 0))
+          (format stream "  ~:d sampled data-cache misses~%" (if miss mtot 0))
+          (format stream "  ~8a ~6a ~6a  ~a~%" "dc-miss%" "self%" "incl%" "function")
+          (dolist (e rows)
+            (when (>= i top) (return))
+            (format stream "  ~8,1f ~6,1f ~6,1f  ~a~%"
+                    (/ (* 100.0 (or (cdr (assoc (car e) miss :test #'string=)) 0)) mtot)
+                    (/ (* 100.0 (cdr e)) n)
+                    (/ (* 100.0 (or (cdr (assoc (car e) incl :test #'string=)) 0)) n) (car e))
+            (setq i (+ i 1))))
+        (progn
+          (format stream "  ~6a ~6a  ~a~%" "self%" "incl%" "function")
+          (let ((incl (getf p :inclusive)) (i 0))
+            (dolist (e (getf p :self))
+              (when (>= i top) (return))
+              (format stream "  ~6,1f ~6,1f  ~a~%" (/ (* 100.0 (cdr e)) n)
+                      (/ (* 100.0 (or (cdr (assoc (car e) incl :test #'string=)) 0)) n) (car e))
+              (setq i (+ i 1))))))))
 
 ;;; --- annotation ---------------------------------------------------------------
 

@@ -2807,7 +2807,7 @@
    %defgeneric) so %defmethod / find-method can validate method
    congruence (CLHS 7.6.4).  NIL means unknown — auto-created GFs
    from a leading %defmethod skip the check."
-  (let ((gf (make-array 10)))
+  (let ((gf (make-array 11)))
     (aset gf 0 '%generic-function)
     (aset gf 1 name)
     (aset gf 2 nil)  ; methods-alist
@@ -2836,6 +2836,8 @@
     (aset gf 8 (%make-gf-rest-closure name))
     ;; Slot 9: the dispatch cache -- see THE DISPATCH CACHE.
     (aset gf 9 nil)
+    ;; Slot 10: the one-entry inline cache in front of it (%GF-DISPATCH).
+    (aset gf 10 nil)
     gf))
 
 (defun %make-gf-rest-closure (gf-name)
@@ -2909,7 +2911,8 @@
   (if (integerp *gf-cache-epoch*) *gf-cache-epoch* 0))
 
 (defun %gf-cache-clear (gf)
-  (when (>= (array-length gf) 10) (aset gf 9 nil)))
+  (when (>= (array-length gf) 10) (aset gf 9 nil))
+  (when (>= (array-length gf) 11) (aset gf 10 nil)))
 
 (defun %gf-cache-writable-p ()
   ;; %MVM-ON-MAIN-THREAD-P's test, here because not every image has mvm-eval.
@@ -5431,6 +5434,25 @@
           (write-char-serial 10)
           (%signal-program-error))))))
 
+(defvar *%cnm-free-fns* nil
+  "EQ table of method functions whose bodies cannot call CALL-NEXT-METHOD or
+   NEXT-METHOD-P (DEFMETHOD's expansion decides, %MARK-CNM-FREE records).")
+
+(defun %mark-cnm-free (fn)
+  "Record method function FN as CNM-free; return FN.  Main thread only (a
+   worker's table entry would point a shared table into its region)."
+  (when (%gf-cache-writable-p)
+    (let ((tbl *%cnm-free-fns*))
+      (when (null tbl)
+        (setq tbl (make-hash-table :test (quote eq)))
+        (setq *%cnm-free-fns* tbl))
+      (puthash fn tbl t)))
+  fn)
+
+(defun %cnm-free-p (fn)
+  (let ((tbl *%cnm-free-fns*))
+    (and tbl (gethash fn tbl))))
+
 (defun %gf-make-plan (gf applicable &optional args)
   "How a cache hit for APPLICABLE runs: (:CHAIN . METHODS) when every method
    is a primary of the STANDARD combination, the GF checks no keywords and has
@@ -5468,6 +5490,10 @@
                           (and (fixnump loc)
                                (cons (if writer :slot-write :slot-read)
                                      (cons loc applicable))))))))))
+    ;; The first method cannot reach the next-method state: call it, with
+    ;; none of %GF-RUN-CHAIN's three special saves and restores.
+    ((%cnm-free-p (%method-fn (car applicable)))
+     (cons :direct (%method-fn (car applicable))))
     (t (cons :chain applicable))))
 
 (defun %gf-run-chain (gf args methods)
@@ -5492,13 +5518,163 @@
       (setq *%next-methods* saved-nm)
       (setq *%current-gf-args* saved-args))))
 
+;;; THE DISPATCH FRONT.  %FIND-GF and %GF-CACHE-ENTRY answer every call, but
+;;; as chains of small calls (the epoch, ARRAY-LENGTH, NTHCDR, %GF-ARG-KEY,
+;;; LENGTH, a generic AREF on the symbol): 25 + 58 ns of a 164 ns generic call.
+;;; These two read the same structures with direct slot loads for the common
+;;; shapes -- a native symbol name already in the direct-mapped front, one
+;;; specialised position, the first argument -- and answer NIL for anything
+;;; else, which then takes the general readers unchanged.
+(defun %gf-dm-get (name)
+  "NAME's GF from the direct-mapped front (*%GF-DM*), or NIL."
+  (let ((dm *%gf-dm*))
+    (when (%prim-simple-vector-p dm)
+      (let ((st (obj-subtag name)))              ; 0 for NIL, T, a list, ...
+        (when (or (eq st #x50) (eq st #x53))
+          (let ((h (%slot-ref name 0)))
+            (when (fixnump h)
+              (let ((e (svref dm (logand (the fixnum h) 255))))
+                (and (consp e) (eq (%ucar e) name) (%ucdr e))))))))))
+
+(defun %gf-pos-key (x specs)
+  "The cache key of argument X at a position whose EQL specialisers are SPECS
+   (see %GF-CACHE-KEYS): the matching specialiser, else X's class key."
+  (let ((sp specs))
+    (loop
+      (when (null sp)
+        (return
+          (if (and (eq (obj-subtag x) #x32)
+                   (>= (%prim-array-length x) 4)
+                   (eq (%slot-ref x 0) '%clos-instance))
+              (%slot-ref x 1)
+              (%gf-arg-key x))))
+      ;; SPECS is the cache's own list of (EQL value) specialisers
+      (when (eql x (%ucar (%ucdr (%ucar sp)))) (return (%ucar sp)))
+      (setq sp (%ucdr sp)))))
+
+(defun %gf-fast-entry (gf args)
+  "The cache entry for ARGS when GF's cache has one or two specialised
+   positions and ARGS matches an entry; else NIL (%GF-CACHE-ENTRY decides).
+   GF has at least ten slots (the caller checks).  The cache cell and its
+   entries are this file's own conses -- (EPOCH POSITIONS . ENTRIES), entry
+   (KEYS NARGS APPLICABLE . PLAN) -- so they are read unchecked."
+  (let ((c (%slot-ref gf 9)) (ep *gf-cache-epoch*))
+    (and (consp c)
+         (eq (%ucar c) (if (fixnump ep) ep 0))
+         (consp args)
+         (let ((pos (%ucar (%ucdr c))))
+           (and (consp pos)
+                (let* ((more (%ucdr pos))
+                       (p1 (%ucar pos))
+                       (i1 (%ucar p1))
+                       (a1 (if (eq i1 0) args (nthcdr i1 args)))
+                       (k1 (and (consp a1) (%gf-pos-key (%ucar a1) (%ucdr p1))))
+                       (p2 (and (consp more) (null (%ucdr more)) (%ucar more)))
+                       (a2 (and p2 (nthcdr (%ucar p2) args)))
+                       (k2 (and p2 (consp a2) (%gf-pos-key (%ucar a2) (%ucdr p2))))
+                       (r (%ucdr args))
+                       (n (cond ((null r) 1) ((null (cdr r)) 2) (t (length args))))
+                       (e (%ucdr (%ucdr c))))
+                  (and k1 (or (null more) k2)
+                       (loop
+                         (when (null e) (return nil))
+                         (let* ((x (%ucar e)) (ks (%ucar x)))
+                           (when (and (eq (%ucar ks) k1) (eq (%ucar (%ucdr x)) n)
+                                      (or (null more) (eq (%ucar (%ucdr ks)) k2)))
+                             (return x)))
+                         (setq e (%ucdr e))))))))))
+
+(defun %gf-call-direct (fn args)
+  "A :DIRECT plan: FN on ARGS (a non-empty list).  Returned in tail position,
+   so every value FN returns is the generic function's."
+  (let ((r (%ucdr args)))
+    (cond ((null r) (funcall fn (%ucar args)))
+          ((null (cdr r)) (funcall fn (%ucar args) (%ucar r)))
+          (t (apply fn args)))))
+
+(defun %gf-slot-read (plan args)
+  "A (:SLOT-READ INDEX . METHODS) plan on ARGS: the slot's value, or the symbol
+   %GF-MISS for another arity, an obsolete instance or an unbound slot (the
+   general path then updates or signals)."
+  (if (%ucdr args)
+      '%gf-miss
+      (let* ((obj (%ucar args)) (l (%slot-ref obj 3)))
+        (if (and (consp l) (null (cdr l)))
+            '%gf-miss
+            (let ((v (svref (%slot-ref obj 2) (%ucar (%ucdr plan)))))
+              (if (eq v -999) '%gf-miss v))))))
+
+(defun %gf-ic-fill (gf entry plan args)
+  "Make ENTRY's PLAN GF's inline cache, when GF's cache has one specialised
+   position and it is the first: #(KEY NARGS PLAN EPOCH EQL-SPECS), one
+   object stored by one write so a reader on another thread sees all of it
+   or none.  :%NO-IC instead when GF's cache does not have that shape."
+  (when (%gf-cache-writable-p)
+    (let* ((c (%slot-ref gf 9)) (pos (%ucar (%ucdr c))))
+      (if (not (and (consp pos) (null (%ucdr pos)) (eq (%ucar (%ucar pos)) 0)))
+        ;; not eligible: say so, until the cache is cleared, so the front
+        ;; stops asking on every call
+        (aset gf 10 :%no-ic)
+        (let ((ic (make-array 5)) (ep *gf-cache-epoch*))
+          (setf (svref ic 0) (%ucar (%ucar entry)))
+          (setf (svref ic 1) (%ucar (%ucdr entry)))
+          (setf (svref ic 2) plan)
+          (setf (svref ic 3) (if (fixnump ep) ep 0))
+          (setf (svref ic 4) (%ucdr (%ucar pos)))
+          (aset gf 10 ic))))))
+
 (defun %gf-dispatch (name args)
+  "Dispatch generic function NAME with ARGS.  The front: the GF's one-entry
+   inline cache (slot 10, its last :DIRECT or :SLOT-READ call), then the
+   dispatch cache's own entries; everything else -- a miss, another plan, an
+   error -- is %GF-DISPATCH-GENERAL's.  Kept small and flat: the dispatcher's
+   cost was the chain of dependent loads through the cache's conses, each
+   through a frame slot, and the whole dispatcher in one function made every
+   call pay its prologue."
+  (let ((gf (%gf-dm-get name)))
+    (when (and gf (consp args) (>= (%prim-array-length gf) 11))
+      (let ((ic (%slot-ref gf 10)))
+        (when (%prim-simple-vector-p ic)
+          (let* ((x (%ucar args))
+                 (specs (%slot-ref ic 4))
+                 (k (if (and (null specs) (eq (obj-subtag x) #x32)
+                             (>= (%prim-array-length x) 4)
+                             (eq (%slot-ref x 0) '%clos-instance))
+                        (%slot-ref x 1)
+                        (%gf-pos-key x specs)))
+                 (r (%ucdr args))
+                 (ep *gf-cache-epoch*))
+            (when (and (eq k (%slot-ref ic 0))
+                       (eq (%slot-ref ic 1) (cond ((null r) 1) ((null (cdr r)) 2) (t (length args))))
+                       (eq (%slot-ref ic 3) (if (fixnump ep) ep 0)))
+              (let ((plan (%slot-ref ic 2)))
+                (if (eq (%ucar plan) :direct)
+                    (return-from %gf-dispatch (%gf-call-direct (%ucdr plan) args))
+                    (let ((v (%gf-slot-read plan args)))
+                      (unless (eq v '%gf-miss) (return-from %gf-dispatch v)))))))))
+      (let ((entry (%gf-fast-entry gf args)))
+        (when entry
+          (let ((plan (%ucdr (%ucdr (%ucdr entry)))))
+            (when (and (consp plan)
+                       (or (eq (%ucar plan) :direct) (eq (%ucar plan) :slot-read)))
+              ;; Filled ONCE (until the cache is cleared): refilled on every
+              ;; miss, a GF that alternates between keys -- EQL-FIB's 0, 1 and
+              ;; fixnum -- allocated a fresh vector per call.
+              (when (null (%slot-ref gf 10))
+                (%gf-ic-fill gf entry plan args))
+              (if (eq (%ucar plan) :direct)
+                  (return-from %gf-dispatch (%gf-call-direct (%ucdr plan) args))
+                  (let ((v (%gf-slot-read plan args)))
+                    (unless (eq v '%gf-miss) (return-from %gf-dispatch v)))))))))
+    (%gf-dispatch-general name args)))
+
+(defun %gf-dispatch-general (name args)
   "Dispatch generic function NAME with ARGS.
    The combination slot holds either a bare combination name (symbol)
    or (NAME . :MOST-SPECIFIC-LAST) when the defgeneric supplied the
    ordering option — primaries then run least-specific-first per
    CLHS 7.6.6.4 (the :around chain ordering is NOT affected)."
-  (let ((gf (%find-gf name)))
+  (let ((gf (or (%gf-dm-get name) (%find-gf name))))
     (when (null gf)
       ;; Name it, like "no applicable method for generic function ~S" below:
       ;; a bare "undefined generic function" is unactionable when a library
@@ -5511,7 +5687,8 @@
     ;; passed this same arity check (THE DISPATCH CACHE).
     ;; THE PLANNED FAST PATH: a cache hit whose entry has a :CHAIN plan runs
     ;; it directly (see %GF-MAKE-PLAN); the first hit computes the plan.
-    (let ((entry (%gf-cache-entry gf args)))
+    (let ((entry (or (and (>= (%prim-array-length gf) 10) (%gf-fast-entry gf args))
+                     (%gf-cache-entry gf args))))
       (when entry
         (let ((plan (cdr (cdr (cdr entry)))))
           (when (null plan)
@@ -5524,16 +5701,22 @@
             ;; method, which signals through SLOT-UNBOUND).
             ((eq (car plan) :slot-read)
              (let* ((obj (car args)) (v (aref (%inst-slots obj) (car (cdr plan)))))
-               (return-from %gf-dispatch
+               (return-from %gf-dispatch-general
                  (if (and (fixnump v) (= v -999))
                      (%gf-run-chain gf args (cdr (cdr plan)))
                      v))))
             ((eq (car plan) :slot-write)
              (let ((nv (car args)))
                (aset (%inst-slots (car (cdr args))) (car (cdr plan)) nv)
-               (return-from %gf-dispatch nv)))
+               (return-from %gf-dispatch-general nv)))
+            ((eq (car plan) :direct)
+             (return-from %gf-dispatch-general
+               (let ((fn (cdr plan)))
+                 (cond ((null (cdr args)) (funcall fn (car args)))
+                       ((null (cdr (cdr args))) (funcall fn (car args) (car (cdr args))))
+                       (t (apply fn args))))))
             ((eq (car plan) :chain)
-             (return-from %gf-dispatch (%gf-run-chain gf args (cdr plan))))))))
+             (return-from %gf-dispatch-general (%gf-run-chain gf args (cdr plan))))))))
     (let ((applicable (%gf-cache-get gf args)))
       (cond ((eq applicable :%none) (setq applicable nil))
             ((null applicable)
@@ -5548,7 +5731,7 @@
       ;; with "no applicable method" (upstream shared-initialize.1.x,
       ;; change-class.1.x: the suite specialises these GFs on its own classes).
       (when (and (null applicable) (%has-default-primary-p name))
-        (return-from %gf-dispatch (%dispatch-default-primary name args)))
+        (return-from %gf-dispatch-general (%dispatch-default-primary name args)))
       ;; DOCUMENTATION and (SETF DOCUMENTATION) are standard generic
       ;; functions whose system methods cover every documented object.  A
       ;; program's own method (environment/documentation.lsp defines one on
@@ -5557,7 +5740,7 @@
       ;; (upstream DOCUMENTATION.*: "no applicable method for (SETF
       ;; DOCUMENTATION)").
       (when (and (null applicable) (%documentation-gf-name-p name))
-        (return-from %gf-dispatch
+        (return-from %gf-dispatch-general
           (if (symbolp name)
               (%documentation-default (car args) (cadr args))
               (set-documentation (cadr args) (caddr args) (car args)))))

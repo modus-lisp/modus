@@ -3862,6 +3862,32 @@
    *macro-table* (94 cheap hash inserts, no closure construction).  User
    macrolet/defmacro still add to the per-call copy and are discarded after.")
 
+;;; A method body that cannot call CALL-NEXT-METHOD or NEXT-METHOD-P needs
+;;; none of the next-method state the dispatcher sets around every method
+;;; call (three specials, saved and restored).  Conservative: no symbol of
+;;; either name anywhere in the body (FUNCALL #'CALL-NEXT-METHOD, a MACROLET
+;;; that expands to it ...), and no call to a macro outside COMMON-LISP that
+;;; might expand to one.
+(defun %body-cnm-free-p (form depth)
+  (cond
+    ((> depth 200) nil)
+    ((symbolp form)
+     (not (member (symbol-name form) '("CALL-NEXT-METHOD" "NEXT-METHOD-P")
+                  :test #'string=)))
+    ((consp form)
+     (let ((head (car form)))
+       (and (not (and head (symbolp head)
+                      (let ((pkg (symbol-package head)))
+                        (not (and pkg (string= (package-name pkg) "COMMON-LISP"))))
+                      (macro-function head)))
+            (let ((x form) (ok t))
+              (loop
+                (when (or (not ok) (atom x)) (return nil))
+                (setq ok (%body-cnm-free-p (car x) (+ depth 1)))
+                (setq x (cdr x)))
+              (and ok (%body-cnm-free-p x (+ depth 1)))))))
+    (t t)))
+
 (defun register-mvm-bootstrap-macros ()
   "Register standard CL macros needed to compile *runtime-functions*.
    Fast path (template already built): copy it into the current *macro-table*."
@@ -6355,12 +6381,13 @@
                                           (symbolp (cadr gf-name)))
                                      (cadr gf-name))
                                     (t nil))))
-              `(%defmethod-full ',gf-name ',qualifier (list ,@specs)
-                                (lambda ,lambda-params
-                                  ,(if block-name
-                                       `(block ,block-name ,@body)
-                                       `(progn ,@body)))
-                                ',params))
+              (let ((lam `(lambda ,lambda-params
+                                            ,(if block-name
+                                                 `(block ,block-name ,@body)
+                                                 `(progn ,@body)))))
+                `(%defmethod-full ',gf-name ',qualifier (list ,@specs)
+                                  ,(if (%body-cnm-free-p body 0) `(%mark-cnm-free ,lam) lam)
+                                  ',params)))
             `(progn
                ;; Ensure a dispatch defun exists (implicit GF creation).  Last
                ;; defun-wins, so a real defgeneric earlier still governs; this
@@ -8926,6 +8953,14 @@
        (compile-word-aset (cadr form) (caddr form) (cadddr form) env dest))
       ((and (= op-name #.(compute-name-hash "%SLOT-REF")) (%obj-slot-imm-p (caddr form)))
        (compile-slot-ref (cadr form) (caddr form) env dest))
+      ;; (%UCAR X) / (%UCDR X): CAR / CDR with no NIL or cons test, for runtime
+      ;; code that has already proved X a cons (a cache cell it built).
+      ((= op-name #.(compute-name-hash "%UCAR"))
+       (compile-form (cadr form) env dest)
+       (emit-ir :car dest dest))
+      ((= op-name #.(compute-name-hash "%UCDR"))
+       (compile-form (cadr form) env dest)
+       (emit-ir :cdr dest dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
@@ -13175,8 +13210,12 @@
           (progn (emit-li-tagged dest slot)
                  (emit-ir :aref dest cell dest)))
       ;; CONSP, not a null test: an unfilled slot reads back as FIXNUM 0.
-      (emit-ir :consp cell dest)
-      (emit-ir :bnull cell miss)
+      ;; (NIL, then the cons tag in place: CONSP's materialised T/NIL and a
+      ;; second compare cost every cached read ~8 instructions)
+      (emit-ir :bnull dest miss)
+      (emit-ir :obj-tag cell dest)
+      (emit-ir :cmp-imm cell (ash +tag-cons+ +fixnum-shift+))
+      (emit-ir :bne miss)
       ;; AND THE PAIR MUST STILL CARRY THIS KEY.  A cached pointer is only as
       ;; good as the invariant behind it, and in the ANSI gate-runner image --
       ;; which forks per file and collects far harder than the CLI does -- a
@@ -13493,8 +13532,10 @@
                    (emit-ir :obj-ref b a islot)
                    (progn (emit-li-tagged b islot)
                           (emit-ir :aref b a b)))
-               (emit-ir :consp a b)
-               (emit-ir :bnull a inline-slow)
+               (emit-ir :bnull b inline-slow)
+               (emit-ir :obj-tag a b)
+               (emit-ir :cmp-imm a (ash +tag-cons+ +fixnum-shift+))
+               (emit-ir :bne inline-slow)
                (emit-ir :car a b)
                (emit-li-tagged c hash)
                (emit-ir :cmp a c)

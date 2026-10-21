@@ -1059,9 +1059,22 @@
    hash of the callee's name (~10% of an operandi ACP turn).  Only a direct key
    hit is cached; the bare-name fallback resolves every time."
   (let* ((pairs *jit-bridge-pairs*)
-         (pair (and pairs (< idx (length pairs)) (aref pairs idx))))
+         (pair (and (%prim-simple-vector-p pairs) (< idx (%prim-array-length pairs))
+                    (svref pairs idx))))
     (if (and (consp pair) (cdr pair))
-        (progn (%jit-bridge-self-patch idx (cdr pair)) (cdr pair))
+        (let ((f (cdr pair)) (sites *jit-bridge-sites*))
+          ;; Only a NATIVE callee whose site is still pending can be patched:
+          ;; a closure callee -- every runtime DEFCLASS accessor -- comes back
+          ;; here on every call, and the attempt (plus a generic LENGTH) was a
+          ;; third of an accessor call.
+          (when (and (%prim-simple-vector-p sites) (< idx (%prim-array-length sites))
+                     (consp (svref sites idx)))
+            (if (eql (logand (%val->word f) 15) 3)
+                (%jit-bridge-self-patch idx f)
+                ;; Not native code (a closure): the site stays a bridge.  Stop
+                ;; asking; %JIT-BRIDGE-N's inline path then serves it.
+                (setf (svref sites idx) nil)))
+          f)
         (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
                       (aref *jit-bridge-names* idx) nil)))
           (let ((p (and nm pairs (< idx (length pairs))
@@ -1074,10 +1087,21 @@
                   ;; same call: a site whose callee did not exist when its
                   ;; page was built is bridged too (%JIT-RELOC-CALLS).
                   (if f f (error (quote undefined-function) :name nm)))))))))
-(defun %jit-bridge-0 (idx) (funcall (%jit-bridge-resolve idx)))
-(defun %jit-bridge-1 (idx a) (funcall (%jit-bridge-resolve idx) a))
-(defun %jit-bridge-2 (idx a b) (funcall (%jit-bridge-resolve idx) a b))
-(defun %jit-bridge-3 (idx a b c) (funcall (%jit-bridge-resolve idx) a b c))
+;; THE BRIDGE'S HIT, INLINE: a cached pair whose site is settled (patched, or
+;; retired because the callee is a closure -- every runtime DEFCLASS accessor)
+;; is the callee itself; anything else asks %JIT-BRIDGE-RESOLVE.
+(defun %jit-bridge-fn (idx)
+  (let ((pairs *jit-bridge-pairs*) (sites *jit-bridge-sites*))
+    (if (and (%prim-simple-vector-p pairs) (< idx (%prim-array-length pairs))
+             (or (not (%prim-simple-vector-p sites)) (>= idx (%prim-array-length sites))
+                 (null (svref sites idx))))
+        (let ((pair (svref pairs idx)))
+          (if (and (consp pair) (cdr pair)) (cdr pair) (%jit-bridge-resolve idx)))
+        (%jit-bridge-resolve idx))))
+(defun %jit-bridge-0 (idx) (funcall (%jit-bridge-fn idx)))
+(defun %jit-bridge-1 (idx a) (funcall (%jit-bridge-fn idx) a))
+(defun %jit-bridge-2 (idx a b) (funcall (%jit-bridge-fn idx) a b))
+(defun %jit-bridge-3 (idx a b c) (funcall (%jit-bridge-fn idx) a b c))
 
 (defun %jit-bridge-entry (n)
   "Untagged native entry of %jit-bridge-N."

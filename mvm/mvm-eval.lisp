@@ -2393,6 +2393,36 @@
 ;; for objdump).  NIL in normal use.
 (defvar *jit-native-dump-hook* nil)
 
+;;; THE JIT CODE MAP.  The profiler and the backtracer name a JIT address by
+;;; the DEFUNs in *SYMBOL-FUNCTION-TABLE*, which knows nothing of the other
+;;; functions a module carries -- lambdas, closures, a method's body, the
+;;; toplevel form's thunk -- so their code was credited to whichever DEFUN sat
+;;; below it in the arena (a method body profiled as ASDF::%QUIRK-FLOAT-
+;;; FEATURES).  Every x64 page now records each function's exact extent,
+;;; (START END NAME), newest first; net/hosted-backtrace.lisp reads it.  Main
+;;; thread only, as the other JIT caches: a worker's conses must not reach a
+;;; global.  The x64 arena is bump-allocated and never reused, so extents
+;;; never go stale.
+(defvar *jit-code-map* nil)
+
+(defun %jit-note-code (base ft-list fn-map nlen)
+  (when (%mvm-on-main-thread-p)
+    (let ((starts nil))
+      (dolist (e ft-list)
+        (let* ((lbl (gethash (car e) fn-map))
+               (p (and lbl (label-position lbl))))
+          (when (integerp p) (setq starts (cons (cons p (car e)) starts)))))
+      (setq starts (sort starts (function <) :key (function car)))
+      (let ((l starts))
+        (loop
+          (when (null l) (return nil))
+          (let ((s (car (car l)))
+                (e (if (cdr l) (car (car (cdr l))) nlen)))
+            (when (< s e)
+              (setq *jit-code-map*
+                    (cons (list (+ base s) (+ base e) (cdr (car l))) *jit-code-map*))))
+          (setq l (cdr l)))))))
+
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -2578,6 +2608,7 @@
                (%jit-reloc-fn-addrs base fa-relocs rt-table))
           (progn
             (%jit-patch-consts base cpatches)
+            (%jit-note-code base ft-list fn-map nlen)
             ;; 5th = PSIZE (read only on the aarch64 reclaim path; harmless
             ;; here).  6th = the per-function native-offset alist for WS5 #222
             ;; native DEFUN installation.  7th = THIS module's const pool —

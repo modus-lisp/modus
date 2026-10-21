@@ -257,11 +257,16 @@
                (if (= (- p) 1) " -- past kernel.perf_event_mlock_kb: fewer :PAGES, or CAP_IPC_LOCK" ""))
         p)))
 
+(defvar *pmu-jit-code* nil)   ; %BT-JIT-CODE-TABLE for the profile being drained
+
 (defun %pmu-fn-name (addr code jit)
-  "The name of the function containing ADDR, without an offset (aggregation key)."
+  "The name of the function containing ADDR, without an offset (aggregation key).
+   JIT code by its exact recorded extent (lambdas and toplevel forms included),
+   else -- code from before the map existed -- the nearest DEFUN below it."
   (if (>= addr #x3000000000)
-      (let ((e (and jit (%bt-lookup addr jit))))
-        (if (and e (< (- addr (car e)) 65536)) (cadr e) "<jit: unnamed>"))
+      (or (%bt-jit-code-name addr *pmu-jit-code*)
+          (let ((e (and jit (%bt-lookup addr jit))))
+            (if (and e (< (- addr (car e)) 65536)) (cadr e) "<jit: unnamed>")))
       (let ((e (%bt-lookup addr code)))
         (cond ((null e) "<outside the image>")
               ((and (cddr e) (>= (- addr (car e)) (cddr e)))
@@ -316,6 +321,7 @@
          (data (+ ring 4096))
          (code (%bt-code-table))
          (jit (%bt-jit-table))
+         (jcode (setq *pmu-jit-code* (%bt-jit-code-table)))
          (self (make-hash-table :test 'equal))
          (incl (make-hash-table :test 'equal))
          (hits (make-hash-table))

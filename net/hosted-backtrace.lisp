@@ -114,6 +114,41 @@
              *symbol-function-table*)
     (sort (coerce pairs 'vector) (function <) :key (function car))))
 
+;; Declared, not assigned: mvm/mvm-eval.lisp owns it and fills it.
+(defvar *jit-code-map*)
+
+(defun %bt-jit-code-table ()
+  "*JIT-CODE-MAP* (mvm-eval.lisp: every JIT'd function's exact extent, lambdas
+   and toplevel thunks included) as a vector of (START END . NAME) sorted by
+   START, or NIL in an image without it."
+  (let ((m (and (boundp '*jit-code-map*) *jit-code-map*)))
+    (when (consp m)
+      (sort (map 'vector (lambda (e) (list* (first e) (second e) (third e))) m)
+            (function <) :key (function car)))))
+
+(defun %bt-jit-code-name (addr table)
+  "The readable name of the JIT function whose extent holds ADDR, or NIL: a
+   DEFUN by its name, NAME$$LAMBDAn / NAME$$CLOSUREn as (lambda in NAME), the
+   evaluator's thunk as (toplevel form)."
+  (when table
+    (let ((lo 0) (hi (- (length table) 1)) (best nil))
+      (loop
+        (when (> lo hi) (return))
+        (let ((mid (floor (+ lo hi) 2)))
+          (if (<= (car (aref table mid)) addr)
+              (setq best mid lo (+ mid 1))
+              (setq hi (- mid 1)))))
+      (when best
+        (let ((e (aref table best)))
+          (when (< addr (cadr e))
+            (let* ((nm (cddr e))
+                   (cut (search "$$" nm))
+                   (owner (if cut (subseq nm 0 cut) nm)))
+              (when (string= owner "%MVM-EVAL-THUNK") (setq owner "toplevel form"))
+              (if cut
+                  (format nil "(lambda in ~a)" owner)
+                  (if (string= owner "toplevel form") "(toplevel form)" owner)))))))))
+
 (defun %bt-lookup (addr table)
   "The entry of TABLE at or below ADDR, or NIL."
   (let ((lo 0) (hi (- (length table) 1)) (best nil))
@@ -132,8 +167,10 @@
      ;; The JIT arena is bump-allocated and only named functions are on record, so code it
      ;; made for a toplevel form or a lambda sits just past some unrelated DEFUN.  Credit the
      ;; nearest name only within 16 KB (a large function); farther, say where it is.
-     (let ((e (and jit-table (%bt-lookup addr jit-table))))
-       (cond ((and e (< (- addr (car e)) 16384))
+     (let ((e (and jit-table (%bt-lookup addr jit-table)))
+           (exact (%bt-jit-code-name addr (%bt-jit-code-table))))
+       (cond (exact (format nil "~a [jit]" exact))
+             ((and e (< (- addr (car e)) 16384))
               (format nil "~a+0x~x [jit]" (cadr e) (- addr (car e))))
              (e (format nil "jit@~x (past ~a)" addr (cadr e)))
              (t (format nil "jit@~x" addr)))))

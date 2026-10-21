@@ -1450,7 +1450,9 @@
       ;; cross.lisp never found the entry point (no JMP after the boot code).
       ;; These are the HOST's build-time packages: un-mark them.
       (when (and (boundp '*runtime-born-pkgs*) *runtime-born-pkgs*)
-        (remhash (compute-name-hash (car spec)) *runtime-born-pkgs*)))))
+        (remhash (compute-name-hash (car spec)) *runtime-born-pkgs*)
+        ;; %RUNTIME-BORN-PKG-P memoizes its answers: forget the marked one
+        (setq *runtime-born-answers* nil)))))
 
 ;; ---- DDC: the compiling image's OWN JIT knobs must not leak into the output ----
 ;; modus-sh's boot co-init (build-cli-common) turns on, for its runtime JIT:

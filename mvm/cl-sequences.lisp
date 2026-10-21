@@ -2326,8 +2326,10 @@
       ;; own seed, so a copy made by MAKE-RANDOM-STATE replays the same
       ;; sequence (upstream MAKE-RANDOM-STATE.1-3).  The BSS word stays the
       ;; fallback for an image whose *RANDOM-STATE* was never initialised.
-      (let* ((rs (if state (car state)
-                     (if (boundp '*random-state*) *random-state* nil)))
+      ;; *RANDOM-STATE* is read directly: a compiled read of an unbound global
+      ;; is NIL, which is what the BOUNDP guard here answered -- at 230 ns, a
+      ;; third of every RANDOM (cl-bench MRG32K3A times RANDOM).
+      (let* ((rs (if state (car state) *random-state*))
              (cell (if (and (consp rs) (eq (car rs) 'random-state)
                             (consp (cdr rs)) (integerp (cadr rs)))
                        (cdr rs) nil))

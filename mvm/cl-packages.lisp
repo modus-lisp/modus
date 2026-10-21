@@ -663,6 +663,16 @@
    NIL until the first runtime package is created; the table is built
    lazily by %mark-runtime-born-pkg.")
 
+(defvar *runtime-born-answers* nil
+  "%RUNTIME-BORN-PKG-P's answers: an alist (NAME-STRING . T-or-NIL) keyed by
+   the IDENTITY of the package's name string, emptied whenever a package is
+   marked runtime-born.  A renamed package has a new name string, so it
+   misses.  The answer cost a COMPUTE-NAME-HASH of the package name, five
+   STRING= and a GETHASH on every BOUNDP / SYMBOL-VALUE of a symbol once any
+   library had made a package: 200 ns, most of a (RANDOM 1d0) (cl-bench
+   MRG32K3A 54x SBCL).  EQ and CAR/CDR only -- see the RE-ENTRANCY note on
+   %SYM-GLOBAL-PKG-KEY.")
+
 (defun %fn-key-system-pkg-name-p (name-string)
   "T if NAME-STRING is a system / build-baked package whose symbols must
    keep the BARE function-table key (native #x50 boot syms live here and
@@ -684,7 +694,8 @@
              (not (%fn-key-system-pkg-name-p name-string)))
     (unless *runtime-born-pkgs*
       (setq *runtime-born-pkgs* (make-hash-table)))
-    (puthash (compute-name-hash name-string) *runtime-born-pkgs* t)))
+    (puthash (compute-name-hash name-string) *runtime-born-pkgs* t)
+    (setq *runtime-born-answers* nil)))
 
 (defun %any-runtime-born-pkg-p ()
   "T once ANY runtime-born package exists in this image.  A zero-deref
@@ -699,9 +710,17 @@
   "T if package NAME-STRING was born at runtime (fold its symbols' fn
    keys), NIL for system / build-baked packages (bare keys)."
   (and *runtime-born-pkgs*
-       (not (%fn-key-system-pkg-name-p name-string))
-       (gethash (compute-name-hash name-string) *runtime-born-pkgs*)
-       t))
+       (let ((cur *runtime-born-answers*))
+         (loop
+           (when (null cur)
+             (let ((ans (and (not (%fn-key-system-pkg-name-p name-string))
+                             (gethash (compute-name-hash name-string) *runtime-born-pkgs*)
+                             t)))
+               (setq *runtime-born-answers*
+                     (cons (cons name-string ans) *runtime-born-answers*))
+               (return ans)))
+           (when (eq (car (car cur)) name-string) (return (cdr (car cur))))
+           (setq cur (cdr cur))))))
 
 (defun %make-package-object (name-string)
   "Allocate and initialize an empty package object."
@@ -2009,12 +2028,17 @@
   (let ((a (if (eql (mem-ref #x10000DB8 :u32) 0) 0 (%dynb-value-addr key))))
     (if (not (eql a 0))
         (not (eq (mem-ref a :u64) (%unbound-marker)))
-        (let ((tbl (%globals-table)))
+        (let ((tbl (%globals-table))
+              ;; the compiled read's own probe first (%GV-CELL): GETHASH's
+              ;; generality was most of a BOUNDP
+              (c (%gv-cell key)))
+          (if (consp c)
+              (not (eq (cdr c) (%unbound-marker)))
           (if (null tbl)
               nil
               (let* ((miss (cons nil nil))
                      (v (gethash key tbl miss)))
-                (not (or (eq v miss) (eq v (%unbound-marker))))))))))
+                (not (or (eq v miss) (eq v (%unbound-marker)))))))))))
 
 ;; Runtime registry of symbols named by DEFCONSTANT.  CLHS: (constantp 'name)
 ;; is true when NAME names a constant variable.  Populated by the mvm-eval

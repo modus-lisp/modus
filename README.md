@@ -4,6 +4,27 @@ A bare-metal Lisp operating system. Boots directly on hardware (or QEMU) into an
 
 A self-hosting system with a portable virtual machine (MVM) targeting 9 CPU architectures, an Erlang-style actor model, SMP multicore support, and per-actor garbage collection.
 
+## Start here: kiln
+
+**[kiln](https://github.com/modus-lisp/kiln) is the way in to modus-lisp.** It
+fetches the workspace — this repo and the rest of the org — builds it, and runs it:
+
+```sh
+git clone https://github.com/modus-lisp/kiln && cd kiln
+bin/kiln build           # set this machine up: the workspace, and a core
+bin/kiln local --view    # the desktop, in a window here
+bin/kiln sync            # every org repo as a live checkout beside kiln, kept current
+```
+
+Or in a container: `bin/kiln container` once, then `bin/kiln vnc` for the desktop
+and `bin/kiln modus` for this Lisp, hosted — a REPL, or `--script`. And as an
+attestable bare-metal image: `bin/kiln image x64-uefi`. kiln pins every repo to an
+exact commit in its `repos.lock`.
+
+This repository is Modus itself — the compiler, the runtime and the ports. Work
+here directly when you are changing those; [Building and running](#building-and-running)
+below covers that.
+
 ## Recent work
 
 Over ~1500 commits (April–July 2026) Modus grew from a bare-metal Lisp with

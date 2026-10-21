@@ -8903,6 +8903,8 @@
        (compile-f32-store (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name #.(compute-name-hash "%FROUND32"))
        (compile-fround32 (cadr form) env dest))
+      ((= op-name #.(compute-name-hash "%FSQRT"))
+       (compile-fsqrt (cadr form) env dest))
       ;; f32x4 vector contract (layer 2a): unboxed in FP registers when the
       ;; form is a call-free tree over declared arrays, else the prelude defun.
       ((or (= op-name #.(compute-name-hash "%F32V-REF"))
@@ -24852,6 +24854,14 @@
       (free-temp-reg))
     (free-temp-reg)))
 
+(defun compile-fsqrt (val-form env dest)
+  "Compile (%fsqrt float) -- a fresh DOUBLE-float box holding the correctly
+   rounded square root of the payload (sqrtsd / fsqrt / fsqrt.d / vsqrt).
+   The software Newton in %SQRT-F was ~1.1 us a call."
+  (compile-form val-form env dest)
+  (emit-ir :gc-check)
+  (emit-ir :fsqrt dest dest))
+
 (defun compile-fround32 (val-form env dest)
   "Compile (%fround32 float) — a fresh single-float box holding the payload
    rounded to single precision (cvtsd2ss / fcvt), replacing the Lisp-side
@@ -26978,6 +26988,7 @@
       (:f32-load 4)
       (:f32-store 4)
       (:fround32 3)
+      (:fsqrt 3)
       (:fp-unbox 3)
       (:fp-box 3)
       (:fp-lane-load 4)
@@ -27330,6 +27341,8 @@
            (mvm-f32-store buf (second insn) (third insn) (fourth insn)))
           (:fround32
            (mvm-fround32 buf (second insn) (third insn)))
+          (:fsqrt
+           (mvm-fsqrt buf (second insn) (third insn)))
           (:fp-unbox (mvm-fp-unbox buf (second insn) (third insn)))
           (:fp-box (mvm-fp-box buf (second insn) (third insn)))
           (:fp-lane-load (mvm-fp-lane-load buf (second insn) (third insn) (fourth insn)))

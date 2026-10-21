@@ -477,7 +477,13 @@
 
 
 (defun %sqrt-f (x)
-  "sqrt of double X (X >= 0) via Newton, after RANGE REDUCTION.  The exponent
+  "sqrt of double X (X >= 0): the FSQRT opcode, the hardware's correctly
+   rounded square root (sqrtsd / fsqrt / fsqrt.d / vsqrt.f64).  -0, +inf and
+   NaN are their own roots there too."
+  (%fsqrt x))
+
+(defun %sqrt-f-newton (x)
+  "The interpreter's FSQRT arm.  sqrt of double X (X >= 0) via Newton, after RANGE REDUCTION.  The exponent
    is read off the IEEE bits and X scaled by 2^-2k into [1, 4) in one exact
    step, so six Newton steps from (1+m)/2 reach full precision with no
    compare at all (a compare-terminated loop cost 2.3x).  Exponents past +-60
@@ -2533,7 +2539,16 @@
    real/imag parts of complex operands, so a FLOAT complex (e.g. /.8's
    (/ #C(i 0.0) #C(i 0.0))) must divide as floats — the integer/ratio
    path below runs %idiv-trunc / (mod a b) on the raw float bit-slots
-   and returns garbage integers (the #C(1 1) reciprocal bug)."
+   and returns garbage integers (the #C(1 1) reciprocal bug).
+
+   Two floats are decided first by their subtags, as GENERIC-ADD does."
+  (let ((sa (obj-subtag a)) (sb (obj-subtag b)))
+    (when (and (or (= sa #x60) (and (>= sa #x64) (<= sa #x66)))
+               (or (= sb #x60) (and (>= sb #x64) (<= sb #x66)))
+               (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
+      (return-from exact-divide
+        (let ((r (%float-div a b)))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r))))))
   (cond
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-div (%any-to-float a) (%any-to-float b))

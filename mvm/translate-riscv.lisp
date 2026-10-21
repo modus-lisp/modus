@@ -2363,6 +2363,24 @@
              (rv-float-box buf +rv-t0+ +rv-t1+ +rv-t2+)
              (store-result vd +rv-t2+))))
 
+      (#.+op-fsqrt+
+       ;; (fsqrt Vd Vs): FSQRT.D of the payload, boxed as a fresh DOUBLE --
+       ;; FROUND32's shape below.
+       (let* ((vd (vreg 0))
+              (rs (resolve (vreg 1))))
+         (if (not *riscv-64-bit*)
+             (progn
+               (rv32-float-unbox buf rs 0 +rv-t3+)
+               (rv-emit-fp-r buf #x2D 0 0 0 0)          ; FSQRT.D f0, f0
+               (rv32-float-box buf 0 +rv-t3+ +rv-t2+ #x60))
+             (progn
+               (rv-float-load-bits buf rs +rv-t0+ +rv-t1+)
+               (rv-emit-fmv-d-x buf 0 +rv-t0+)
+               (rv-emit-fp-r buf #x2D 0 0 0 0)          ; FSQRT.D f0, f0
+               (rv-emit-fmv-x-d buf +rv-t0+ 0)
+               (rv-float-box buf +rv-t0+ +rv-t1+ +rv-t2+ #x60)))
+         (store-result vd +rv-t2+)))
+
       (#.+op-fround32+
        ;; (fround32 Vd Vs): the double payload rounded to single precision and
        ;; boxed as a SINGLE-FLOAT (#x64) -- %ROUND-TO-SINGLE's native op.  It

@@ -4260,6 +4260,28 @@
            (emit-bytes buf #x89 #x48 #x07)            ; mov [rax+7], ecx
            (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
 
+        ((op= +op-fsqrt+)
+         ;; (fsqrt Vd Vs) — payload → SQRTSD → fresh boxed DOUBLE (#x460);
+         ;; the box tail is fround32's.
+         (let* ((vd (first operands))
+                (vs (second operands)))
+           (emit-push buf 'rcx) (emit-push buf 'rdx)     ; V5/V6 homes — preserve
+           (emit-load-vreg buf vs 'rax)
+           (emit-float-load-bits buf 'rax 'rcx 'rdx)
+           (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)  ; movq xmm0, rcx
+           (emit-bytes buf #xF2 #x0F #x51 #xC0)       ; sqrtsd xmm0, xmm0
+           (emit-mov-reg-imm buf 'rcx #x460)
+           (emit-mov-mem-reg buf 'r12 'rcx 0)
+           (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)  ; movq rcx, xmm0
+           (emit-float-store-bits buf 'r12 'rcx 'rdx)
+           (emit-mcgc-set-start-bit buf 'r12)
+           (emit-lea buf 'rax 'r12 9)
+           (emit-add-reg-imm buf 'r12 48)
+           (emit-pop buf 'rdx) (emit-pop buf 'rcx)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
         ((op= +op-fround32+)
          ;; (fround32 Vd Vs) — payload → CVTSD2SS → CVTSS2SD → fresh boxed
          ;; single-float.  Replaces the Lisp %round-to-single.

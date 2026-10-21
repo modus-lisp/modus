@@ -2401,6 +2401,13 @@
                  (%f32-aset (svref regs vobj) (svref regs vidx) (svref regs vs))
                  (setf pc npc3)))))
 
+          (#.+op-fsqrt+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               ;; the Lisp Newton, NOT %SQRT-F (which is (%fsqrt ...)).
+               (setf (svref regs vd) (%sqrt-f-newton (svref regs vs)))
+               (setf pc npc2))))
+
           (#.+op-fround32+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)

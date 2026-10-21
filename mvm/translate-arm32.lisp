@@ -2406,6 +2406,15 @@
         ;; obj + 2 -- the same +2 the existing :aref uses.  R12 and LR are the
         ;; translator scratch (LR is saved by the prologue, which is why the
         ;; existing :alloc-array already uses it here).
+        (#.+op-fsqrt+
+         ;; (fsqrt Vd Vs): VSQRT.F64 D0, D0 of the payload, boxed as a DOUBLE.
+         (let ((vd (vreg 0)))
+           (arm32-load-vreg buf +arm-lr+ (vreg 1))
+           (arm32-float-unbox buf +arm-lr+ 0)
+           (arm32-emit buf #xEEB10BC0)                ; VSQRT.F64 D0, D0
+           (arm32-float-box buf 0 #x460)
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
         (#.+op-fround32+
          ;; (fround32 Vd Vs): the double payload rounded to single precision,
          ;; boxed as a SINGLE-FLOAT (#x464).  VCVT.F32.F64 S2, D0 then

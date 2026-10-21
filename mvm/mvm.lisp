@@ -101,7 +101,7 @@
    #:mvm-alloc-u8 #:mvm-u8-ref #:mvm-u8-set
    #:+op-alloc-f32+ #:+op-f32-ref+ #:+op-f32-set+
    #:mvm-alloc-f32 #:mvm-f32-ref #:mvm-f32-set
-   #:+op-f32-load+ #:+op-f32-store+ #:+op-fround32+
+   #:+op-f32-load+ #:+op-f32-store+ #:+op-fround32+ #:+op-fsqrt+ #:mvm-fsqrt
    #:mvm-f32-load #:mvm-f32-store #:mvm-fround32
    #:+op-fp-unbox+ #:+op-fp-box+ #:+op-fp-lane-load+ #:+op-fp-lane-store+
    #:+op-fp-add+ #:+op-fp-sub+ #:+op-fp-mul+ #:+op-fp-div+
@@ -539,6 +539,7 @@
 (defconstant +op-fpd-div+   #xF0)
 (defconstant +op-fpd-itof+  #xF1) ; (fpd-itof Fd Vsrc)   tagged fixnum -> double in Fd, no box
 (defconstant +op-fpd-lt+    #xF2) ; (fpd-lt Vd Fa Fb)    fixnum 1 when Fa < Fb (ordered; NaN -> 0), else 0
+(defconstant +op-fsqrt+     #xF4) ; (fsqrt Vd Vs)  boxed float payload -> IEEE square root -> fresh boxed DOUBLE (allocates)
 (defconstant +op-fpd-le+    #xF3) ; (fpd-le Vd Fa Fb)    fixnum 1 when Fa <= Fb (ordered), else 0
 ;; INTEGER LANE class (SIMD plan, layer 2b — reel's kernels): the same F vregs
 ;; hold 16 bytes read as u8x16 / s8x16 / s16x8 / s32x4 depending on the op.  No
@@ -749,6 +750,7 @@
 (defopcode :f32-load  #xCE (:reg :reg :reg) "Lane of f32 vector → fresh boxed single-float (allocates)")
 (defopcode :f32-store #xCF (:reg :reg :reg) "Boxed float → single precision → f32 vector lane")
 (defopcode :fround32  #xD0 (:reg :reg)      "Boxed float rounded to single precision → fresh boxed single (allocates)")
+(defopcode :fsqrt     #xF4 (:reg :reg)      "Boxed float payload → correctly rounded square root → fresh boxed double (allocates)")
 (defopcode :fp-unbox      #xD1 (:reg :reg)      "Boxed float → unboxed single in FP vreg")
 (defopcode :fp-box        #xD2 (:reg :reg)      "Unboxed single in FP vreg → fresh boxed single-float (allocates)")
 (defopcode :fp-lane-load  #xD3 (:reg :reg :reg) "Packed f32 lane → FP vreg")
@@ -1348,6 +1350,8 @@
 
 (defun mvm-fround32 (buf vd vs)
   (encode-instruction buf +op-fround32+ vd vs))
+(defun mvm-fsqrt (buf vd vs)
+  (encode-instruction buf +op-fsqrt+ vd vs))
 
 (defun mvm-fp-unbox (buf fd vsrc)
   (encode-instruction buf +op-fp-unbox+ fd vsrc))

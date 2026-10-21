@@ -50,7 +50,7 @@ for (const [ops, n] of [[[0x00,0x01,0x72,0x82,0x89,0x8B,0x92,0xA2,0xA3,0xA4],1],
 // did.  The size-aware GC checks execute (below); the f32/v4/vi SIMD block is
 // length-only and falls to the interpreter's unknown-opcode fault if a
 // function that actually uses it is ever called in the browser.
-for (const [ops, n] of [[[0x8D,0xCB,0xD0,0xD1,0xD2,0xDB,0xE1],3],
+for (const [ops, n] of [[[0x8D,0xCB,0xD0,0xD1,0xD2,0xDB,0xE1,0xF4],3],
   [[0xCC,0xCD,0xCE,0xCF,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xDC,0xDD,0xDE,0xDF,0xE0,0xE4,0xE5,0xE8],4],
   [[0x8C,0xE2,0xE3,0xE6,0xE7,0xE9],5],[[0xEA],6]]) for (const o of ops) INSN_LEN[o] = n;
 const ALLOC_START_OFF = 0x400;            // boot-linux-x64: +linux-x64-heap-alloc-start+
@@ -1276,6 +1276,9 @@ class MVM {
           const x = this.floatVal(this.rlo(code[pc + 2])), y = this.floatVal(this.rlo(code[pc + 3]));
           const r = op === 0xBE ? x + y : op === 0xBF ? x - y : op === 0xC0 ? x * y : x / y;
           this.setReg(code[pc + 1], this.allocFloat(r), 0); pc += 4; break;
+        }
+        case 0xF4: {                                                                                     // fsqrt: boxed float -> square root -> fresh boxed double
+          this.setReg(code[pc + 1], this.allocFloat(Math.sqrt(this.floatVal(this.rlo(code[pc + 2])))), 0); pc += 3; break;
         }
         case 0xD0: {                                                                                     // fround32: boxed float -> rounded to single -> fresh boxed single (#x64)
           this.setReg(code[pc + 1], this.allocFloat(Math.fround(this.floatVal(this.rlo(code[pc + 2]))), 0x64), 0); pc += 3; break;

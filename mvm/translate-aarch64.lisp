@@ -5358,6 +5358,24 @@
              (a64-add-reg buf +a64-x10+ parr +a64-x10+ 0 2)   ; x10 = Varr + 4*idx
              (a64-emit buf (logior #xB8007000 (ash +a64-x10+ 5) +a64-x11+)))) ; STUR W11, [x10,#7]
 
+          ;; ---- FSQRT Vd, Vs ----  payload → FSQRT D0 → boxed double (FROUND32's shape)
+          ((= op +op-fsqrt+)
+           (let* ((vd (vr 0))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (emit-aarch64-gc-mark-start buf)
+             (a64-float-load-bits buf ps +a64-x9+ +a64-x10+)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             (a64-emit buf (logior #x1E61C000 0))              ; FSQRT D0, D0
+             (a64-fmov-x-d buf +a64-x9+ 0)
+             (a64-movz buf +a64-x10+ #x460 0)
+             (a64-stur buf +a64-x10+ +a64-x24+ 0)
+             (a64-float-store-bits buf +a64-x24+ +a64-x9+ +a64-x10+)
+             (a64-add-imm buf pd +a64-x24+ 9)
+             (a64-add-imm buf +a64-x24+ +a64-x24+ 48)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
           ;; ---- FROUND32 Vd, Vs ----  payload → FCVT S,D → FCVT D,S → boxed single
           ((= op +op-fround32+)
            (let* ((vd (vr 0))

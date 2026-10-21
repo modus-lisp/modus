@@ -5496,11 +5496,38 @@
     (lambda (form)
       (let ((first (cadr form))
             (rest (cddr form))
-            (tmp (%mvm-gensym "MVP1")))
+            (tmp (%mvm-gensym "MVP1"))
+            (pri (%mvm-gensym "MVP1P"))
+            (cnt (%mvm-gensym "MVP1C"))
+            (res (%mvm-gensym "MVP1R"))
+            (i (%mvm-gensym "MVP1I")))
         (if rest
-            `(let ((,tmp (multiple-value-list ,first)))
-               ,@rest
-               (values-list ,tmp))
+            ;; ONE value -- nearly every use -- is held as itself: no list, no
+            ;; VALUES-LIST.  That pair made an MV-PROG1 36 ns against 4 for a
+            ;; plain call, and %GF-RUN-CHAIN wraps every method call in one.
+            ;; FIRST is captured as COMPILE-MULTIPLE-VALUE-LIST does it (count
+            ;; reset to 1 before, read after; the proven-single-value tail
+            ;; skips the count), and only several -- or zero -- values build
+            ;; the list, from the slots, before REST can overwrite them.
+            (if (%mv-tail-cannot-set-count-p first)
+                `(let ((,pri ,first))
+                   ,@rest
+                   (values ,pri))
+                `(let* ((,pri (progn (setf (mem-ref ,+mv-count-addr+ :u64) 1) ,first))
+                        (,cnt (mem-ref ,+mv-count-addr+ :u64))
+                        (,tmp (if (= ,cnt 1)
+                                  nil
+                                  (if (zerop ,cnt)
+                                      nil
+                                      (let ((,res nil) (,i (- ,cnt 2)))
+                                        (loop
+                                          (when (< ,i 0) (return (cons ,pri ,res)))
+                                          (setq ,res (cons (mem-ref (+ ,+mv-values-addr+ (* ,i 8)) :u64) ,res))
+                                          (setq ,i (- ,i 1))))))))
+                   ,@rest
+                   (if (= ,cnt 1)
+                       (values ,pri)
+                       (values-list ,tmp))))
             ;; Degenerate (multiple-value-prog1 FIRST) — no side-effect
             ;; body; just return FIRST's values.
             first))))
@@ -26196,15 +26223,24 @@
         ;; Without this, args > +max-reg-args+ stay on caller's stack
         ;; and the ladder's stack-load reads garbage from unmapped /
         ;; uninitialised local frame slots.
-        (emit-ir :trap #x0530)
+        ;; ... but only when an argument came on the caller's stack: with
+        ;; +MAX-REG-ARGS+ or fewer there is nothing to copy, and the trap was
+        ;; most of a small &rest call (30 ns against 4 for a plain call).
+        (let ((no-copy (make-compiler-label)))
+          (emit-ir :li cmp-reg (ash (+ +max-reg-args+ 1) 1))   ; tagged, inline :shl
+          (emit-ir :cmp nargs-reg cmp-reg)
+          (emit-ir :blt no-copy)
+          (emit-ir :trap #x0530)
+          (emit-ir-label no-copy))
         ;; Extended ladder: nargs = req+1 .. req+32.  The trap above
         ;; caps at 32 total args, so max-k = 32 - req (no separate
         ;; min — let req=0 funcs use the full 32 cases).
         (let ((max-k (- 32 req))
               (cases nil))
+          ;; ASCENDING: one or two rest arguments -- the common call -- are
+          ;; matched first instead of after thirty-odd compares.
           (loop for k from max-k downto 1
                 do (push k cases))
-          (setf cases (reverse cases))
           (dolist (k cases)
             (let ((next-label (make-compiler-label)))
               (emit-ir :li cmp-reg (ash (+ req k) 1))   ; +fixnum-shift+ == 1; inline :shl

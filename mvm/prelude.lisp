@@ -2229,10 +2229,44 @@
   (cond
     ((fixnump x) (%ht-eqp-int-hash x))
     ((integerp x) (%ht-eqp-int-hash x))
+    ((and (not (consp x)) (or (eq (obj-subtag x) #x60) (eq (obj-subtag x) #x64)))
+     (%ht-float-real-hash x))
     ((and (floatp x) (or (/= x x) (and (/= x 0) (= x (* x 2))))) 47)
     ((and (floatp x) (>= (abs x) 4503599627370496.0)) (%ht-eqp-int-hash (floor x)))
     (t (let* ((f (floor (* x 1048576))) (a (if (< f 0) (- f) f)))
          (logand (logxor a (ash a -20)) #x3FFFFF)))))
+
+;;; The same hash for a double or single float (both box an IEEE64 payload in
+;;; four 16-bit slots), computed from the bits: x = M * 2^K, M the 53-bit
+;;; significand.  The generic path ran six boxed float operations (NaN and
+;;; infinity tests, ABS, * 2^20, FLOOR) a key -- most of cl-bench
+;;; HTABLE-MIXBAG.  Only the bits the fold reads are formed: the low 22 of an
+;;; integral value, the low 42 of F.
+(defun %ht-float-real-hash (x)
+  (let* ((hi (%float-hi32 x)) (lo (%float-lo32 x))
+         (e (logand (ash hi -20) #x7FF))
+         (neg (>= hi #x80000000)))
+    (cond
+      ((= e #x7FF) 47)                                   ; infinity, NaN
+      ((= e 0)                                           ; zero, subnormal: F is 0 or -1
+       (if (and neg (or (/= (logand hi #xFFFFF) 0) (/= lo 0))) 1 0))
+      (t
+       (let ((m (logior (ash (logior (logand hi #xFFFFF) #x100000) 32) lo))
+             (k (- e 1075)))
+         (if (>= k 0)
+             ;; integral: %HT-EQP-INT-HASH of M * 2^K
+             (if (>= k 22)
+                 0
+                 (let ((a (ash (logand m (- (ash 1 (- 22 k)) 1)) k)))
+                   (logxor (ash (logand a 3) 20) a)))
+             (let* ((s (+ k 20))
+                    (a (cond ((>= s 0) (ash (logand m (- (ash 1 (- 42 s)) 1)) s))
+                             ((<= s -53) (if neg 1 0))
+                             (t (let ((q (ash m s)))
+                                  (if (and neg (/= (logand m (- (ash 1 (- s)) 1)) 0))
+                                      (+ q 1)
+                                      q))))))
+               (logand (logxor a (ash a -20)) #x3FFFFF))))))))
 
 (defun %ht-eqp-int-hash (x)
   "%HT-EQUALP-REAL-HASH's fold for an integer X, i.e. of F = X * 2^20, with no

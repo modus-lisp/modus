@@ -2425,25 +2425,34 @@
 ;;;   6. turns `Bcc L1 ; BR L2 ; L1:` into `B(not cc) L2 ; L1:`.
 ;;; It never moves code and never changes what a register holds.
 (defparameter *thread-jumps* t)
-(defparameter *ir-branch-ops* '(:br :beq :bne :blt :bge :ble :bgt :bvs :bnull :bnnull))
-
-(defun %ir-branch-p (insn) (and (consp insn) (member (car insn) *ir-branch-ops*)))
-(defun %ir-branch-target (insn) (car (last insn)))
+;; Cheap by construction -- it runs on every runtime compile: no hash tables
+;; (labels index a vector over the function's label-number range), no
+;; consing except the retargeted instructions and the output list.
+(defun %ir-branch-p (insn)
+  (case (car insn)
+    ((:br :beq :bne :blt :bge :ble :bgt :bvs :bnull :bnnull) t)
+    (t nil)))
+(defun %ir-branch-target (insn)
+  (if (or (eq (car insn) :bnull) (eq (car insn) :bnnull)) (third insn) (second insn)))
 (defun %ir-retarget (insn label)
-  (append (butlast insn) (list label)))
-(defun %ir-known-value (insn)
-  "For an instruction that sets a register to a known NIL / non-NIL, (REG . :NIL)
-   or (REG . :T); else NIL."
-  (cond ((and (eq (car insn) :mov) (eql (third insn) +vreg-vn+)) (cons (second insn) :nil))
-        ((and (eq (car insn) :li) (eql (third insn) +t-value+)) (cons (second insn) :t))
+  (if (or (eq (car insn) :bnull) (eq (car insn) :bnnull))
+      (list (car insn) (second insn) label)
+      (list (car insn) label)))
+(defun %ir-known-kind (insn)
+  "For an instruction that sets a register to NIL / to T: :NIL or :T (the
+   register is its SECOND); else NIL."
+  (cond ((and (eq (car insn) :mov) (eql (third insn) +vreg-vn+)) :nil)
+        ((and (eq (car insn) :li) (eql (third insn) +t-value+)) :t)
         (t nil)))
 
 (defun %ir-invert-branch (op)
-  (cdr (assoc op '((:beq . :bne) (:bne . :beq) (:blt . :bge) (:bge . :blt)
-                   (:bgt . :ble) (:ble . :bgt) (:bnull . :bnnull) (:bnnull . :bnull)))))
+  (case op
+    (:beq :bne) (:bne :beq) (:blt :bge) (:bge :blt)
+    (:bgt :ble) (:ble :bgt) (:bnull :bnnull) (:bnnull :bnull)
+    (t nil)))
 
 (defun %ir-tidy-branches (ir)
-  "Steps 5 and 6 of THREAD-JUMPS over IR (forward order); returns new IR."
+  "Steps 4-6 of THREAD-JUMPS over IR (forward order); returns new IR."
   (let ((res nil) (l ir) (dead nil))
     (loop
       (when (null l) (return (nreverse res)))
@@ -2460,91 +2469,100 @@
                                (second (cadr l)))
                  res)
            (setq l (cdr l)))
+          ;; BR to one of the labels that immediately follow it
+          ((and (eq (car x) :br)
+                (let ((m (cdr l)) (hit nil))
+                  (loop
+                    (when (or (null m) (not (eq (car (car m)) :label))) (return hit))
+                    (when (eql (second (car m)) (second x)) (setq hit t))
+                    (setq m (cdr m)))))
+           nil)
           (t (push x res)
              (when (eq (car x) :br) (setq dead t)))))
       (setq l (cdr l)))))
 
 (defun thread-jumps (ir)
   (unless *thread-jumps* (return-from thread-jumps ir))
-  (let* ((v (coerce ir 'vector))
-         (n (length v))
-         (label-at (make-hash-table :test 'eql))   ; label -> index of the label insn
-         (after (make-hash-table :test 'eql))      ; index of a branch -> fresh label after it
-         (changed nil))
-    (dotimes (i n)
-      (let ((x (aref v i)))
-        (when (eq (car x) :label) (setf (gethash (second x) label-at) i))))
-    (labels ((first-real (label)
-               ;; index of the first non-label instruction at LABEL, or NIL
-               (let ((i (gethash label label-at)))
-                 (when i
+  (let ((n 0) (lo nil) (hi nil) (nbr 0))
+    (dolist (x ir)
+      (setq n (+ n 1))
+      (cond ((eq (car x) :label)
+             (let ((k (second x)))
+               (when (integerp k)
+                 (when (or (null lo) (< k lo)) (setq lo k))
+                 (when (or (null hi) (> k hi)) (setq hi k)))))
+            ((%ir-branch-p x) (setq nbr (+ nbr 1)))))
+    (when (or (eql nbr 0) (null lo))
+      (return-from thread-jumps ir))
+    (let ((v (make-array n))
+          (label-at (make-array (+ 1 (- hi lo)) :initial-element nil))
+          (after nil)                     ; alist: branch index -> fresh label after it
+          (changed nil))
+      (let ((i 0))
+        (dolist (x ir)
+          (setf (svref v i) x)
+          (when (and (eq (car x) :label) (integerp (second x)))
+            (setf (svref label-at (- (second x) lo)) i))
+          (setq i (+ i 1))))
+      (labels ((first-real (label)
+                 ;; index of the first non-label instruction at LABEL, or NIL
+                 (let ((i (and (integerp label) (<= lo label) (<= label hi) (svref label-at (- label lo)))))
+                   (when i
+                     (loop
+                       (when (>= i n) (return nil))
+                       (unless (eq (car (svref v i)) :label) (return i))
+                       (setq i (+ i 1))))))
+               (final-target (label)
+                 (let ((l label) (hops 0))
                    (loop
-                     (when (>= i n) (return nil))
-                     (unless (eq (car (aref v i)) :label) (return i))
-                     (setq i (+ i 1))))))
-             (final-target (label)
-               (let ((l label) (hops 0))
-                 (loop
-                   (let ((j (first-real l)))
-                     (if (and j (< hops 16) (eq (car (aref v j)) :br)
-                              (not (eql (%ir-branch-target (aref v j)) l)))
-                         (progn (setq l (%ir-branch-target (aref v j))) (setq hops (+ hops 1)))
-                         (return l))))))
-             (label-after (j)
-               ;; a label placed right after instruction J (created on demand)
-               (or (gethash j after)
-                   (setf (gethash j after) (make-compiler-label)))))
-      (dotimes (i n)
-        (let ((x (aref v i)))
-          (when (%ir-branch-p x)
-            ;; 2. a test of a register whose value the previous insn fixed
-            (let ((kv (and (> i 0) (member (car x) '(:bnull :bnnull))
-                           (%ir-known-value (aref v (- i 1))))))
-              (when (and kv (eql (car kv) (second x)))
-                (let ((taken (if (eq (car x) :bnull) (eq (cdr kv) :nil) (eq (cdr kv) :t))))
-                  (setq x (if taken (list :br (third x)) (list :nop-threaded)))
-                  (setf (aref v i) x)
-                  (setq changed t))))
+                     (let ((j (first-real l)))
+                       (if (and j (< hops 16) (eq (car (svref v j)) :br)
+                                (not (eql (second (svref v j)) l)))
+                           (progn (setq l (second (svref v j))) (setq hops (+ hops 1)))
+                           (return l))))))
+               (label-after (j)
+                 (let ((e (assoc j after)))
+                   (if e
+                       (cdr e)
+                       (let ((l (make-compiler-label)))
+                         (setq after (cons (cons j l) after))
+                         l)))))
+        (dotimes (i n)
+          (let ((x (svref v i)))
             (when (%ir-branch-p x)
-              ;; 1. branch to a branch
-              (let* ((old (%ir-branch-target x)) (new (final-target old)))
-                ;; 3. known register value + BR into a test of that register
-                (when (and (eq (car x) :br) (> i 0))
-                  (let ((kv (%ir-known-value (aref v (- i 1)))))
-                    (when kv
-                      (let ((j (first-real new)))
-                        (when (and j (member (car (aref v j)) '(:bnull :bnnull))
-                                   (eql (second (aref v j)) (car kv)))
-                          (let ((taken (if (eq (car (aref v j)) :bnull)
-                                           (eq (cdr kv) :nil) (eq (cdr kv) :t))))
-                            (setq new (final-target (if taken (third (aref v j)) (label-after j))))))))))
-                (unless (eql new old)
-                  (setf (aref v i) (%ir-retarget x new))
-                  (setq changed t)))))))
-      (let ((out nil))
-        (if (not changed)
-            (setq out ir)
-            (progn
-              (dotimes (i n)
-                (let ((x (aref v i)))
-                  (unless (eq (car x) :nop-threaded) (push x out))
-                  (let ((l (gethash i after))) (when l (push (list :label l) out)))))
-              (setq out (nreverse out))))
-        (setq out (%ir-tidy-branches out))
-        ;; 4. BR to the very next label(s)
-        (let ((res nil) (l out))
-          (loop
-            (when (null l) (return (nreverse res)))
-            (let ((x (car l)))
-              (if (and (eq (car x) :br)
-                       (let ((m (cdr l)) (hit nil))
-                         (loop
-                           (when (or (null m) (not (eq (car (car m)) :label))) (return hit))
-                           (when (eql (second (car m)) (second x)) (setq hit t))
-                           (setq m (cdr m)))))
-                  nil
-                  (push x res)))
-            (setq l (cdr l))))))))
+              ;; 2. a test of a register whose value the previous insn fixed
+              (when (and (> i 0) (or (eq (car x) :bnull) (eq (car x) :bnnull)))
+                (let* ((p (svref v (- i 1))) (kind (%ir-known-kind p)))
+                  (when (and kind (eql (second p) (second x)))
+                    (let ((taken (if (eq (car x) :bnull) (eq kind :nil) (eq kind :t))))
+                      (setq x (if taken (list :br (third x)) (list :nop-threaded)))
+                      (setf (svref v i) x)
+                      (setq changed t)))))
+              (when (%ir-branch-p x)
+                ;; 1. branch to a branch
+                (let* ((old (%ir-branch-target x)) (new (final-target old)))
+                  ;; 3. known register value + BR into a test of that register
+                  (when (and (eq (car x) :br) (> i 0))
+                    (let* ((p (svref v (- i 1))) (kind (%ir-known-kind p)))
+                      (when kind
+                        (let ((j (first-real new)))
+                          (when (and j (or (eq (car (svref v j)) :bnull) (eq (car (svref v j)) :bnnull))
+                                     (eql (second (svref v j)) (second p)))
+                            (let ((taken (if (eq (car (svref v j)) :bnull) (eq kind :nil) (eq kind :t))))
+                              (setq new (final-target (if taken (third (svref v j)) (label-after j))))))))))
+                  (unless (eql new old)
+                    (setf (svref v i) (%ir-retarget x new))
+                    (setq changed t)))))))
+        (let ((out nil))
+          (if (not changed)
+              (setq out ir)
+              (progn
+                (dotimes (i n)
+                  (let ((x (svref v i)))
+                    (unless (eq (car x) :nop-threaded) (push x out))
+                    (let ((e (assoc i after))) (when e (push (list :label (cdr e)) out)))))
+                (setq out (nreverse out))))
+          (%ir-tidy-branches out))))))
 
 (defun get-ir-instructions ()
   "Return the IR instructions in forward order.

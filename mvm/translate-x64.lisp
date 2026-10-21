@@ -1056,6 +1056,15 @@
    records the site in *x64-call-relocs* for JIT-time patching.  Nil at
    image-build time, so the image codegen is byte-identical to pre-Stage-3.")
 
+(defvar *x64-jit-shared-gc-tramp* nil
+  "Runtime JIT: the absolute address of a complete GC trampoline already
+   emitted into a JIT page (pages are never unmapped on x64), or NIL.  When
+   set, a JIT page's gc-trampoline label is a 14-byte `jmp [rip]' to it
+   instead of a fresh copy of the collector: emitting that copy was 12% of
+   a compiled-fasl LOAD.  Set by %JIT-TRANSLATE-PAGE-1 from the first page.")
+(defvar *x64-last-gc-tramp-label* nil
+  "The label of the FULL GC trampoline the last translation emitted, or NIL.")
+
 (defvar *jit-xlate-err-info* nil
   "DIAGNOSTIC: on a translate-time error, the translate loop stashes
    (:fn I :name NAME :mvm-pos POS :opcode OP :operands OPS) here before
@@ -7008,7 +7017,9 @@
   ;; build-time chatter was printing on a SHIPPED binary's stdout on every run —
   ;; the same pollution class as the implicit-global WARN, one layer down.  On
   ;; the SBCL build host *error-output* is stderr, so build logs keep it.
-  (format *error-output* "~&  Handler-stack helpers emitted (push/pop)~%"))
+  ;; Not per JIT page: every runtime-compiled form printed it.
+  (unless *x64-jit-mode*
+    (format *error-output* "~&  Handler-stack helpers emitted (push/pop)~%")))
 
 (defun emit-gc-dbg-char (buf ch)
   "DEBUG (gated by *x64-gc-debug*): write byte CH to fd 1, preserving all
@@ -10158,10 +10169,20 @@
       ;; in JIT mode we emit it whenever gc-trampoline-label exists, even with
       ;; no gc-collect-label.  Gated on *x64-jit-mode* so the ANSI/generic/
       ;; bare-metal image builds (jit-mode NIL) stay byte-identical.
-      (when (or (and gc-trampoline-label gc-collect-label)
-                (and *x64-jit-mode* gc-trampoline-label))
-        (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
-        (format *error-output* "~&  GC trampoline emitted, %GC-COLLECT wired~%"))
+      (setq *x64-last-gc-tramp-label* nil)
+      (cond
+        ((and *x64-jit-mode* gc-trampoline-label (integerp *x64-jit-shared-gc-tramp*))
+         ;; The collector is position-independent (absolute metadata
+         ;; addresses, its own labels only); reach the shared copy.
+         (emit-label buf gc-trampoline-label)
+         (emit-bytes buf #xFF #x25 0 0 0 0)          ; jmp qword [rip+0]
+         (emit-u64 buf *x64-jit-shared-gc-tramp*))
+        ((or (and gc-trampoline-label gc-collect-label)
+             (and *x64-jit-mode* gc-trampoline-label))
+         (emit-gc-trampoline buf gc-trampoline-label gc-collect-label)
+         (setq *x64-last-gc-tramp-label* gc-trampoline-label)
+         (unless *x64-jit-mode*
+           (format *error-output* "~&  GC trampoline emitted, %GC-COLLECT wired~%"))))
       ;; Emit the shared cons-kind-bit setter (CALLed from cons alloc sites).
       (when cons-bit-label
         (emit-mcgc-cons-bit-subroutine buf cons-bit-label))

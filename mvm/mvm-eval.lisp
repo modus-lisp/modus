@@ -2437,6 +2437,10 @@
                     (cons (list (+ base s) (+ base e) (cdr (car l))) *jit-code-map*))))
           (setq l (cdr l)))))))
 
+;; translate-x64.lisp's; declared here for the reads below.
+(defvar *x64-jit-shared-gc-tramp*)
+(defvar *x64-last-gc-tramp-label*)
+
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -2623,6 +2627,12 @@
           (progn
             (%jit-patch-consts base cpatches)
             (%jit-note-code base ft-list fn-map nlen)
+            ;; The first page's collector becomes every later page's (see
+            ;; *x64-jit-shared-gc-tramp*).
+            (when (and (null *x64-jit-shared-gc-tramp*) *x64-last-gc-tramp-label*
+                       (integerp (label-position *x64-last-gc-tramp-label*)))
+              (setq *x64-jit-shared-gc-tramp*
+                    (+ base (label-position *x64-last-gc-tramp-label*))))
             ;; 5th = PSIZE (read only on the aarch64 reclaim path; harmless
             ;; here).  6th = the per-function native-offset alist for WS5 #222
             ;; native DEFUN installation.  7th = THIS module's const pool —

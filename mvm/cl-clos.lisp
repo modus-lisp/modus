@@ -711,6 +711,9 @@
       (setq i (+ i 1)))
     new))
 
+(defvar *%accessor-closures* nil
+  "EQ table NAME -> the closure %INSTALL-ACCESSOR-DISPATCHER last installed.")
+
 (defun %install-accessor-dispatcher (name kind &optional gf-name)
   "Runtime (mvm-eval) DEFCLASS accessor support: install a FIXED-ARITY
    closure that dispatches the generic function NAME, and register it as a GF
@@ -721,11 +724,29 @@
    (typep #'NAME 'generic-function) stays T.  The build-time expansion emits
    a native DEFUN instead (baked direct calls must bind to something)."
   (let ((fn (cond
-              ((eq kind ':reader) (lambda (obj) (%gf-dispatch-1 name obj)))
-              ((eq kind ':writer) (lambda (nv obj) (%gf-dispatch-2 name nv obj)))
+              ;; Each counts its calls and, at the 64th, promotes NAME to a
+              ;; native stub (%GF-PROMOTE-ACCESSOR).
+              ((eq kind ':reader)
+               (let ((n 0))
+                 (lambda (obj)
+                   (when (< n 64)
+                     (setq n (+ n 1))
+                     (when (= n 64) (%gf-promote-accessor name 1)))
+                   (%gf-dispatch-1 name obj))))
+              ((eq kind ':writer)
+               (let ((n 0))
+                 (lambda (nv obj)
+                   (when (< n 64)
+                     (setq n (+ n 1))
+                     (when (= n 64) (%gf-promote-accessor name 2)))
+                   (%gf-dispatch-2 name nv obj))))
               (t (let ((target (list 'setf gf-name)))
                    (lambda (obj nv) (%gf-dispatch target (list nv obj))))))))
     (set-symbol-function name fn)
+    (when (and (symbolp name) (not (eq kind ':setter)) (%gf-cache-writable-p))
+      (unless *%accessor-closures*
+        (setq *%accessor-closures* (make-hash-table :test (quote eq))))
+      (puthash name *%accessor-closures* fn))
     (when (consp name) (%install-setf-gf-alias name fn))
     (unless (eq kind ':setter) (%register-gf-fn fn name))
     fn))
@@ -6051,24 +6072,41 @@
     (when (and tbl (symbolp name) (%gf-cache-writable-p))
       (let ((cur (gethash name tbl)) (want (%gf-stub-shape-for ll)))
         (when (and cur (not (eql cur want)))
-          (let ((q (list (quote quote) name)))
-            (eval
-             (cond
-               ((eql want 1)
-                (list (quote defun) name (list (quote %gfs-a))
-                      (list (quote if) (list (quote eq) (list (quote %get-nargs)) 1)
-                            (list (quote %gf-dispatch-1) q (quote %gfs-a))
-                            (list (quote %gf-nargs-error) q (list (quote %get-nargs))))))
-               ((eql want 2)
-                (list (quote defun) name (list (quote %gfs-a) (quote %gfs-b))
-                      (list (quote if) (list (quote eq) (list (quote %get-nargs)) 2)
-                            (list (quote %gf-dispatch-2) q (quote %gfs-a) (quote %gfs-b))
-                            (list (quote %gf-nargs-error) q (list (quote %get-nargs))))))
-               (t
-                (list (quote defun) name (list (quote &rest) (quote %gfdsp-args))
-                      (list (quote %gf-dispatch) q (quote %gfdsp-args)))))))
+          (eval (%gf-stub-form name want))
           (puthash name tbl want)
           (%register-gf-fn (symbol-function name) name))))))
+
+(defun %gf-stub-form (name shape)
+  "The DEFUN of NAME's dispatch stub of SHAPE (1, 2 or :REST)."
+  (let ((q (list (quote quote) name)))
+    (cond
+      ((eql shape 1)
+       (list (quote defun) name (list (quote %gfs-a))
+             (list (quote if) (list (quote eq) (list (quote %get-nargs)) 1)
+                   (list (quote %gf-dispatch-1) q (quote %gfs-a))
+                   (list (quote %gf-nargs-error) q (list (quote %get-nargs))))))
+      ((eql shape 2)
+       (list (quote defun) name (list (quote %gfs-a) (quote %gfs-b))
+             (list (quote if) (list (quote eq) (list (quote %get-nargs)) 2)
+                   (list (quote %gf-dispatch-2) q (quote %gfs-a) (quote %gfs-b))
+                   (list (quote %gf-nargs-error) q (list (quote %get-nargs))))))
+      (t
+       (list (quote defun) name (list (quote &rest) (quote %gfdsp-args))
+             (list (quote %gf-dispatch) q (quote %gfdsp-args)))))))
+
+(defun %gf-promote-accessor (name shape)
+  "A runtime DEFCLASS accessor's closure has been called often enough:
+   replace it, while it is still NAME's function, with a native stub of SHAPE.
+   A closure callee cannot be baked into a native caller, so every call went
+   through the JIT bridge; installing the native stub for every accessor up
+   front is the EVAL per accessor per class that made class-heavy loads ~4x
+   slower, hence only once one is hot."
+  (when (and (symbolp name) (%gf-cache-writable-p) (fboundp name)
+             *%accessor-closures*
+             (eq (symbol-function name) (gethash name *%accessor-closures*)))
+    (eval (%gf-stub-form name shape))
+    (%gf-note-stub name shape)
+    (%register-gf-fn (symbol-function name) name)))
 
 ;;; ============================================================
 ;;; call-next-method / next-method-p

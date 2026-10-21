@@ -1067,13 +1067,20 @@
           ;; a closure callee -- every runtime DEFCLASS accessor -- comes back
           ;; here on every call, and the attempt (plus a generic LENGTH) was a
           ;; third of an accessor call.
-          (when (and (%prim-simple-vector-p sites) (< idx (%prim-array-length sites))
-                     (consp (svref sites idx)))
-            (if (eql (logand (%val->word f) 15) 3)
-                (%jit-bridge-self-patch idx f)
-                ;; Not native code (a closure): the site stays a bridge.  Stop
-                ;; asking; %JIT-BRIDGE-N's inline path then serves it.
-                (setf (svref sites idx) nil)))
+          (when (and (%prim-simple-vector-p sites) (< idx (%prim-array-length sites)))
+            (let ((site (svref sites idx)))
+              (when (consp site)
+                (if (eql (logand (%val->word f) 15) 3)
+                    ;; native now -- a RETIRED site too: a runtime accessor
+                    ;; promotes itself to a native stub once hot
+                    (progn
+                      (when (eq (car site) :retired) (setf (svref sites idx) (cdr site)))
+                      (%jit-bridge-self-patch idx f))
+                    ;; Not native code (a closure): the site stays a bridge.
+                    ;; Retire it, keeping the site, so %JIT-BRIDGE-N's inline
+                    ;; path serves it until the callee turns native.
+                    (unless (eq (car site) :retired)
+                      (setf (svref sites idx) (cons :retired site)))))))
           f)
         (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
                       (aref *jit-bridge-names* idx) nil)))
@@ -1092,11 +1099,18 @@
 ;; is the callee itself; anything else asks %JIT-BRIDGE-RESOLVE.
 (defun %jit-bridge-fn (idx)
   (let ((pairs *jit-bridge-pairs*) (sites *jit-bridge-sites*))
-    (if (and (%prim-simple-vector-p pairs) (< idx (%prim-array-length pairs))
-             (or (not (%prim-simple-vector-p sites)) (>= idx (%prim-array-length sites))
-                 (null (svref sites idx))))
+    (if (and (%prim-simple-vector-p pairs) (< idx (%prim-array-length pairs)))
         (let ((pair (svref pairs idx)))
-          (if (and (consp pair) (cdr pair)) (cdr pair) (%jit-bridge-resolve idx)))
+          (if (and (consp pair) (cdr pair))
+              (let ((f (cdr pair))
+                    (site (and (%prim-simple-vector-p sites) (< idx (%prim-array-length sites))
+                               (svref sites idx))))
+                (if (or (null site)
+                        (and (eq (car site) :retired)
+                             (not (eql (logand (%val->word f) 15) 3))))
+                    f
+                    (%jit-bridge-resolve idx)))
+              (%jit-bridge-resolve idx)))
         (%jit-bridge-resolve idx))))
 (defun %jit-bridge-0 (idx) (funcall (%jit-bridge-fn idx)))
 (defun %jit-bridge-1 (idx a) (funcall (%jit-bridge-fn idx) a))

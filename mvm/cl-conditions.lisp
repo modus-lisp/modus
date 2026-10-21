@@ -656,6 +656,52 @@
       (when (eq (car cur) tag) (return t))
       (setq cur (cdr cur)))))
 
+;;; The bodies of CATCH's handler and of THROW (compiler.lisp), out of line.
+;;; Inline, every CATCH/THROW site carried the reads and SETQs of five
+;;; specials -- 3.5 KB of bytecode for one CATCH around one THROW, and in
+;;; runtime-compiled code a SETQ of anything but a fixnum or NIL is a call
+;;; that hashes the variable's name: most of cl-bench CTAK.  Here those
+;;; accesses are the image's cached ones.
+(defun %catch-receive (tag cnd)
+  "A CATCH frame for TAG has caught CND.  A THROW to TAG: its values (CLHS
+   5.2, all of them; *CATCH-VALUES* is (:%VALS . values), NIL only when the
+   thrower recorded no list).  Otherwise not ours: a throw in flight (THROW
+   marks CND :%THROW-IN-FLIGHT, since *CATCH-ACTIVE* alone can be stale --
+   probe 8447, a real TYPE-ERROR unwinding through a CATCH was hijacked)
+   longjmps on to the next frame; anything else is re-signalled."
+  (if (if *catch-active* (eql *catch-tag* tag) nil)
+      (let ((v *catch-value*) (vs *catch-values*))
+        (setq *catch-active* nil)
+        (setq *catch-tag* nil)
+        (setq *catch-value* nil)
+        (setq *catch-values* nil)
+        (if vs
+            (let ((l (cdr vs)))
+              ;; one value, the common THROW: no VALUES-LIST (a LENGTH walk)
+              (if (and (consp l) (null (cdr l))) (car l) (values-list l)))
+            v))
+      (if (if (eq cnd :%throw-in-flight) (%error-handler-active-p) nil)
+          (%hc-longjmp)
+          (error cnd))))
+
+(defun %throw-to (tag vals)
+  "THROW TAG with the value list VALS: record them and longjmp straight to
+   the nearest handler-case frame (the marker tells intervening frames this
+   is a throw, not an error).  With no CATCH for TAG dynamically active, a
+   CONTROL-ERROR from here (CLHS THROW; catch.16) -- and nothing recorded:
+   *CATCH-ACTIVE* makes every HANDLER-CASE pass a condition on as a throw in
+   flight, so setting it first let (throw 'nope 1) escape a handler for
+   ERROR entirely."
+  (unless (%catch-tag-active-p tag)
+    (error 'control-error))
+  (setq *catch-tag* tag)
+  (setq *catch-value* (car vals))
+  (setq *catch-values* (cons :%vals vals))
+  (setq *catch-active* t)
+  (if (%error-handler-active-p)
+      (progn (setq *current-condition* :%throw-in-flight) (%hc-longjmp))
+      (error "throw")))
+
 ;;; ============================================================
 ;;; Unhandled-condition escape report (diagnostic, purely additive)
 ;;; ============================================================

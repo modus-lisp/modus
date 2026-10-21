@@ -9125,11 +9125,10 @@
           env dest)))
 
       ;; CATCH — (catch tag body...) — establish catch frame for THROW.
-      ;; Wraps body in handler-case; the handler returns *catch-value*
-      ;; if the throw's tag matches our tag. We don't support nested
-      ;; catches with the SAME tag (the inner catches the throw); good
-      ;; enough for most ANSI tests. The tag is evaluated once and saved
-      ;; locally so it isn't re-evaluated by the handler.
+      ;; Wraps body in handler-case; the handler (%CATCH-RECEIVE,
+      ;; cl-conditions.lisp) returns the thrown values if the throw's tag is
+      ;; ours, else passes the throw or condition on.  The tag is evaluated
+      ;; once and saved locally so it isn't re-evaluated by the handler.
       ((= op-name 44774594)  ; CATCH
        (let ((tag-form (cadr form))
              (body-forms (cddr form)))
@@ -9138,36 +9137,11 @@
                   (*catch-tags* (cons %c-tag *catch-tags*)))
              (declare (special *catch-tags*))  ; a real dynamic bind (task #248): THROW's fast path reads it
              (%handler-case-catch (progn ,@body-forms)
-               (t (%c-cnd)
-                 (if (if *catch-active* (eql *catch-tag* %c-tag) nil)
-                     ;; CLHS 5.2: CATCH returns ALL the values THROW was given.
-                     ;; *CATCH-VALUES* carries them; it is NIL only when the
-                     ;; thrower recorded no list, in which case fall back to
-                     ;; the single *CATCH-VALUE* (also the right answer for
-                     ;; (throw tag (values)) modulo the zero-values case).
-                     (let ((%c-v *catch-value*)
-                           (%c-vs *catch-values*))
-                       (setq *catch-active* nil)
-                       (setq *catch-tag* nil)
-                       (setq *catch-value* nil)
-                       (setq *catch-values* nil)
-                       ;; *CATCH-VALUES* is (:%VALS . values) so a THROW of
-                       ;; NO values ((throw 'tag (values))) returns none
-                       ;; rather than NIL (upstream CATCH.7).
-                       (if %c-vs (values-list (cdr %c-vs)) %c-v))
-                     ;; Not our tag.  A throw in flight (direct longjmp, no
-                     ;; condition built — THROW marks it with the keyword
-                     ;; below, since *CATCH-ACTIVE* alone can be stale: probe
-                     ;; 8447, a real TYPE-ERROR unwinding through a CATCH was
-                     ;; hijacked) re-throws by longjmp to the next frame;
-                     ;; anything else is a real condition -> re-signal.
-                     (if (if (eq %c-cnd :%throw-in-flight) (%error-handler-active-p) nil)
-                         (%hc-longjmp)
-                         (error %c-cnd))))))
+               (t (%c-cnd) (%catch-receive %c-tag %c-cnd))))
           env dest)))
 
-      ;; THROW — (throw tag value) — set globals, signal error to unwind
-      ;; to the nearest CATCH. The (error ...) call longjmps out.
+      ;; THROW — (throw tag value): %THROW-TO (cl-conditions.lisp) records
+      ;; the tag and values and longjmps to the nearest CATCH frame.
       ((= op-name 218356233)  ; THROW
        (let ((tag-form (cadr form))
              (val-form (caddr form)))
@@ -9177,20 +9151,7 @@
           ;; can re-spread them (CLHS 5.2 — THROW/CATCH transmits all values).
           `(let* ((%t-tag ,tag-form)
                   (%t-vals (multiple-value-list ,val-form)))
-             (setq *catch-tag* %t-tag)
-             (setq *catch-value* (car %t-vals))
-             (setq *catch-values* (cons :%vals %t-vals))
-             (setq *catch-active* t)
-             ;; Same fast path as %NLX-THROW: with a handler-case frame armed,
-             ;; longjmp straight to it instead of building a SIMPLE-ERROR and
-             ;; running the whole signal path (15.7 us -> tens of ns).  The
-             ;; marker tells intervening frames this is a throw, not an error.
-             ;; Only when a CATCH with this tag is dynamically active: a throw to
-             ;; a nonexistent tag must signal CONTROL-ERROR from here (catch.16),
-             ;; not unwind to some unrelated handler-case carrying the marker.
-             (if (if (%error-handler-active-p) (%catch-tag-active-p %t-tag) nil)
-                 (progn (setq *current-condition* :%throw-in-flight) (%hc-longjmp))
-                 (error "throw")))
+             (%throw-to %t-tag %t-vals))
           env dest)))
 
       ;; %NLX-THROW — (%nlx-throw tag value) — internal non-local-exit
@@ -11855,6 +11816,27 @@
                      (mapcar (lambda (n) (list n (list 'symbol-value (list 'quote n)))) shadowed)
                      body)))))
 
+(defun %special-bind-form (spec tmp)
+  "The form that dynamically binds special SPEC to the value of variable TMP:
+   unarmed, a store into the variable's cell (baked at a runtime compile, the
+   AOT cache slot, or the per-site cache); armed, this thread's own binding.
+   Shared by LET and LET* -- LET* used to emit the bare %DYNBIND, a
+   globals-table probe per binding, so every runtime-compiled CATCH (a LET*
+   of *CATCH-TAGS*) paid one."
+  (let* ((k (%global-var-bind-key spec))
+         (cell (%let-special-cell spec k))
+         (slot (and (not cell) (%gv-aot-slot k spec)))
+         (site (and (not cell) (not slot) (%let-special-site spec k))))
+    (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
+          ((and slot (eql k (%global-name-key spec)))
+           `(if (eql (mem-ref #x10000DB8 :u32) 0)
+                (%gv-setq-global (quote ,spec) ,tmp)
+                (%dynbind-c ,k ,tmp ,slot)))
+          (slot `(%dynbind-c ,k ,tmp ,slot))
+          (site (%site-fast site `(progn (set-cdr c ,tmp) ,tmp)
+                            `(%dynbind-site ,k ,tmp (quote ,site))))
+          (t `(%dynbind ,k ,tmp)))))
+
 (defun compile-let-with-specials (bindings body specials env dest &optional sequential
                                   &aux (%all-declared-specials nil))
   "Compile let/let* with (declare (special ...)) variables.
@@ -11977,23 +11959,7 @@
                                    :key (lambda (b)
                                           (symbol-name (if (consp b) (car b) b)))
                                    :test #'string=)
-                         (let* ((k (%global-var-bind-key spec))
-                                (cell (%let-special-cell spec k))
-                                (slot (and (not cell) (%gv-aot-slot k spec)))
-                                (site (and (not cell) (not slot) (%let-special-site spec k))))
-                           ;; Unarmed, a binding is a store into the cell: the
-                           ;; inline cached global store, three calls before.  Armed,
-                           ;; %DYNBIND-C makes this thread's own binding.
-                           (push (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
-                                       ((and slot (eql k (%global-name-key spec)))
-                                        `(if (eql (mem-ref #x10000DB8 :u32) 0)
-                                             (%gv-setq-global (quote ,spec) ,tmp)
-                                             (%dynbind-c ,k ,tmp ,slot)))
-                                       (slot `(%dynbind-c ,k ,tmp ,slot))
-                                       (site (%site-fast site `(progn (set-cdr c ,tmp) ,tmp)
-                                                         `(%dynbind-site ,k ,tmp (quote ,site))))
-                                       (t `(%dynbind ,k ,tmp)))
-                                 acc))))
+                         (push (%special-bind-form spec tmp) acc)))
                      specials temp-vars)
                (nreverse acc)))
            (restore-forms
@@ -12062,9 +12028,8 @@
                                   (if pos
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
-                                                  `(%dynbind
-                                                    ,(%global-var-bind-key (nth pos specials))
-                                                    ,(nth pos temp-vars))))
+                                                  (%special-bind-form (nth pos specials)
+                                                                      (nth pos temp-vars))))
                                       (list rb)))))
                             bindings renamed-bindings)))
               (compile-form

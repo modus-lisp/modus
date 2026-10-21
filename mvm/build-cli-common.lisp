@@ -1767,6 +1767,9 @@
                (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)
+               (read-file-text (merge-pathnames "net/sb-bsd-sockets-shim.lisp"
+                                                *modus-base*))
+               (string #\Newline)
                ;; SB-MOP LAST: it IMPORTs into its own package and touches nothing the two above
                ;; define, but it does read modus's CLOS internals (%FIND-CLOS-CLASS, %GF-METHODS),
                ;; so it wants the image fully up.  Rides MODUS_NO_SB with the others.

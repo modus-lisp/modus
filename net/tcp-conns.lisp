@@ -140,8 +140,14 @@
       (t
        (setf (tc-peer-window c) win)
        ;; our side: SYN-ACK completes an open
-       (when (and (eq (tc-state c) :syn-sent) (logbitp 1 flags) (logbitp 4 flags))
-         (setf (tc-rcv-nxt c) (%u32+ seq 1) (tc-state c) :established))
+       ;; ACK IT AT ONCE: the handshake's third segment.  Waiting for the first data to carry
+       ;; it worked while that data came at once; seal spends seconds making its ClientHello on
+       ;; the Zero, and the peer (QEMU's slirp, under capture) re-sent its SYN-ACK at 6 s and
+       ;; 18 s and then answered the late data with a FIN.  A repeated SYN-ACK is ACKed again.
+       (when (and (logbitp 1 flags) (logbitp 4 flags))
+         (when (eq (tc-state c) :syn-sent)
+           (setf (tc-rcv-nxt c) (%u32+ seq 1) (tc-state c) :established))
+         (%tcp-ack c))
        ;; ACKs retire what they cover
        (when (logbitp 4 flags)
          (when (%seq< (tc-snd-una c) ack) (setf (tc-snd-una c) ack))

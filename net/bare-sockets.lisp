@@ -210,3 +210,73 @@
          n)))))
 
 (setq *net-fd-call* (function %net-fd-dispatch))
+
+;;; ---- names: DNS over the pump's UDP ------------------------------------------------------
+;;;
+;;; The shim's GET-HOST-BY-NAME ends in net/ip.lisp's DNS-LOOKUP, whose UDP-RECEIVE reads the
+;;; NIC itself and would take frames NET-PUMP is owed.  On bare metal it is replaced by an A
+;;; query over UDP-SEND-TO / UDP-RECV.  No /etc/resolv.conf: *BARE-DNS-SERVERS*, in order.
+
+(defvar *bare-dns-servers* (list #x01010101 #x08080808) "Resolvers to ask, as host-order IPs.")
+(defvar *bare-dns-id* 0)
+
+(defun %dns-query (name)
+  (let ((q (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
+    (setq *bare-dns-id* (logand (+ *bare-dns-id* 4097) #xFFFF))
+    (dolist (b (list (ash *bare-dns-id* -8) (logand *bare-dns-id* 255) 1 0 0 1 0 0 0 0 0 0))
+      (vector-push-extend b q))
+    (let ((start 0))
+      (loop
+        (let ((dot (or (position #\. name :start start) (length name))))
+          (vector-push-extend (- dot start) q)
+          (loop for i from start below dot do (vector-push-extend (char-code (char name i)) q))
+          (setq start (+ dot 1))
+          (when (>= start (length name)) (return)))))
+    (dolist (b '(0 0 1 0 1)) (vector-push-extend b q))
+    q))
+
+(defun %dns-skip-name (v p)
+  (loop
+    (let ((len (aref v p)))
+      (cond ((zerop len) (return (+ p 1)))
+            ((>= len #xC0) (return (+ p 2)))
+            (t (setq p (+ p 1 len)))))))
+
+(defun %dns-first-a (v)
+  "The first A record's address in the DNS answer V, host order, or NIL."
+  (let ((an (+ (* 256 (aref v 6)) (aref v 7)))
+        (p (%dns-skip-name v 12)))
+    (setq p (+ p 4))
+    (dotimes (i an nil)
+      (setq p (%dns-skip-name v p))
+      (let ((type (+ (* 256 (aref v p)) (aref v (+ p 1))))
+            (rdlen (+ (* 256 (aref v (+ p 8))) (aref v (+ p 9)))))
+        (when (and (= type 1) (= rdlen 4))
+          (return (logior (ash (aref v (+ p 10)) 24) (ash (aref v (+ p 11)) 16)
+                          (ash (aref v (+ p 12)) 8) (aref v (+ p 13)))))
+        (setq p (+ p 10 rdlen))))))
+
+(defun bare-dns-lookup (name &key (timeout-ms 3000))
+  (let ((lport (%ephemeral-port)) (q (%dns-query name)))
+    (udp-open lport)
+    (unwind-protect
+         (dolist (server *bare-dns-servers* nil)
+           (udp-send-to server 53 lport q (length q))
+           (let ((r (udp-recv lport :timeout-ms timeout-ms)))
+             (when r
+               (let ((ip (ignore-errors (%dns-first-a (third r)))))
+                 (when ip (return ip))))))
+      (setq *udp-ports* (remove lport *udp-ports* :key #'car)))))
+
+(defun %dotted (ip)
+  (format nil "~D.~D.~D.~D" (ldb (byte 8 24) ip) (ldb (byte 8 16) ip) (ldb (byte 8 8) ip) (ldb (byte 8 0) ip)))
+
+(setf (fdefinition (intern "GET-HOST-BY-NAME" "SB-BSD-SOCKETS"))
+      (lambda (name)
+        (let ((quad (if (every (lambda (c) (or (digit-char-p c) (char= c #\.))) name)
+                        name
+                        (let ((ip (bare-dns-lookup name))) (and ip (%dotted ip))))))
+          (if quad
+              (make-instance (intern "HOST-ENT" "SB-BSD-SOCKETS") :name name
+                             :addresses (list (funcall (intern "MAKE-INET-ADDRESS" "SB-BSD-SOCKETS") quad)))
+              (error (intern "SOCKET-ERROR" "SB-BSD-SOCKETS") :errno 2)))))

@@ -72,6 +72,34 @@
                    (setq i (+ i 1))))
     (list :code (hdmi-rd (+ b 4)) :state (hdmi-rd (+ b 24)))))
 
+(defun em-mbox-2 (tag a b)
+  "One property-mailbox tag with a two-word value {A, B}; returns the two answer words."
+  (let ((buf (hdmi-mbox-buf)))
+    (hdmi-wr (+ buf 0) 32) (hdmi-wr (+ buf 4) 0)
+    (hdmi-wr (+ buf 8) tag) (hdmi-wr (+ buf 12) 8) (hdmi-wr (+ buf 16) 8)
+    (hdmi-wr (+ buf 20) a) (hdmi-wr (+ buf 24) b) (hdmi-wr (+ buf 28) 0)
+    (let ((i 0)) (loop (when (> i 1000000) (return nil))
+                   (when (zerop (logand (hdmi-rd (+ (hdmi-mbox-base) #x38)) #x80000000)) (return nil))
+                   (setq i (+ i 1))))
+    (hdmi-wr (hdmi-mbox-write) (logior (hdmi-mbox-buf-bus) 8))
+    (let ((i 0)) (loop (when (> i 1000000) (return nil))
+                   (when (zerop (logand (hdmi-rd (hdmi-mbox-status)) #x40000000))
+                     (hdmi-rd (hdmi-mbox-read)) (return nil))
+                   (setq i (+ i 1))))
+    (list (hdmi-rd (+ buf 20)) (hdmi-rd (+ buf 24)))))
+
+(defun emmc-speed (&optional (div 5))
+  "Run the card clock at base / (2 x DIV), a 10-bit divisor over CONTROL1 bits 8-15 and
+   6-7.  The base (the EMMC clock) is 200-250 MHz on these boards, so the default 5 keeps
+   the card at or under SD default speed, 25 MHz, either way.  (GET_CLOCK_RATE through
+   the property mailbox answered 0 for every clock here, even the core: not trusted.)"
+  (em-set #x2C (logand (em-reg #x2C) (lognot 4)))            ; SD clock off
+  (em-set #x2C (logior (logand (em-reg #x2C) (lognot #xFFC0))
+                       (ash (logand div #xFF) 8) (ash (logand (ash div -8) 3) 6)))
+  (unless (em-wait #x2C 2 2 2000000) (error "emmc: clock never stable at divisor ~D" div))
+  (em-set #x2C (logior (em-reg #x2C) 4))                     ; SD clock on
+  div)
+
 (defun emmc-init ()
   "Reset the controller, route the pins, bring the card up 4-bit.  T, or signals."
   (sd-mbox-power 2)                                          ; the card off, then on
@@ -100,6 +128,7 @@
   (em-cmd #x371A0000 (ash *em-rca* 16) "CMD55")
   (em-cmd #x061A0000 2 "ACMD6")
   (em-set #x28 (logior (em-reg #x28) 2))                     ; 4-bit data bus
+  (emmc-speed)
   t)
 
 (defun emmc-read-block (lba buf start)

@@ -4109,7 +4109,11 @@
   ;; effecting DEF*) and already compiled, re-interpret the cached module and
   ;; skip the whole compile pipeline.  Checked BEFORE the big let so a hit pays
   ;; none of the setup/hash-alloc cost either.
-  (let ((%cacheable (and (not *mvm-eval-no-cache*) (%mvm-eval-cacheable-p forms))))
+  ;; Not for COMPILE-FILE's own compile of a toplevel form (mvm/fasl.lisp): a
+  ;; hit would RUN the form, and record nothing.
+  (let ((%cacheable (and (not *mvm-eval-no-cache*)
+                         (not (and *fasl-compile-only* (%fasl-compile-only-here-p)))
+                         (%mvm-eval-cacheable-p forms))))
     (when %cacheable
       (unless *mvm-eval-cache*
         (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
@@ -4337,8 +4341,11 @@
               (%fasl-record %fslot forms bc entry ft-list fn-table rt-table lam-offsets
                             persist-names %lam-bearing %ftaint0)
               (setq *fasl-effects* nil))
-            (%mvm-eval-publish-and-run forms bc entry ft-list fn-table rt-table
-                                       lam-offsets persist-names %lam-bearing %cacheable))
+            ;; COMPILE-FILE (mvm/fasl.lisp): built, recorded, and not run.
+            (if (and *fasl-compile-only* (%fasl-compile-only-skip-p %fslot forms %ftaint0))
+                nil
+                (%mvm-eval-publish-and-run forms bc entry ft-list fn-table rt-table
+                                           lam-offsets persist-names %lam-bearing %cacheable)))
           :no-entry))))
   ))
 ;; Single-expression convenience.

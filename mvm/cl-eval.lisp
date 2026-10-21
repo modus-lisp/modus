@@ -5009,20 +5009,24 @@
          (*compile-file-truename* in-true)
          (*package* *package*))
     (declare (special *compile-file-pathname* *compile-file-truename*))
-    ;; Compile-time effects, in order, with *PACKAGE* tracking IN-PACKAGE.
-    (with-open-file (in in-true :direction :input)
-      (loop
-        (let ((form (read in nil in)))
-          (when (eq form in) (return nil))
-          (%compile-file-toplevel-effects form))))
-    ;; The output: the source text itself.
-    (with-open-file (in in-true :direction :input)
-      (with-open-file (out out-path :direction :output :if-exists :supersede)
+    ;; A COMPILED fasl (mvm/fasl.lisp): each form's module, built now, which
+    ;; LOAD replays.  Where this image has no FASL machinery (the ANSI gate
+    ;; runners do not bake mvm/fasl.lisp) the call answers NIL and the output
+    ;; is the source text, compiled when it is loaded.
+    (unless (%fasl-compile-file in-true out-path)
+      ;; Compile-time effects, in order, with *PACKAGE* tracking IN-PACKAGE.
+      (with-open-file (in in-true :direction :input)
         (loop
-          (let ((line (read-line in nil nil)))
-            (when (null line) (return nil))
-            (write-string line out)
-            (terpri out)))))
+          (let ((form (read in nil in)))
+            (when (eq form in) (return nil))
+            (%compile-file-toplevel-effects form))))
+      (with-open-file (in in-true :direction :input)
+        (with-open-file (out out-path :direction :output :if-exists :supersede)
+          (loop
+            (let ((line (read-line in nil nil)))
+              (when (null line) (return nil))
+              (write-string line out)
+              (terpri out))))))
     (values (truename out-path) nil nil)))
 
 ;;; Function objects for array accessors the compiler otherwise only
@@ -5709,13 +5713,17 @@
     ;; Through EVAL, as %MAYBE-RUN-PENDING-JIT runs JIT-EAGER.
     (handler-case (eval (list '%jit-build-script-defs)) (serious-condition (c) nil))))
 
-(defun %load-from-stream (stream verbose print)
-  "Read+eval all forms from STREAM.  Returns T."
+(defun %load-from-stream (stream verbose print &optional fx0)
+  "Read+eval all forms from STREAM (or replay FX0, a compiled fasl).  Returns T."
   (setq *%load-depth* (+ (%load-depth) 1))
-  (unwind-protect (%load-from-stream-1 stream verbose print)
-    (setq *%load-depth* (- (%load-depth) 1))))
+  ;; A LOAD run at compile time (a COMPILE-FILE'd EVAL-WHEN) loads for real:
+  ;; its forms are not COMPILE-FILE's to withhold (mvm/fasl.lisp).
+  (let ((sv-only (%fasl-load-begin)))
+    (unwind-protect (%load-from-stream-1 stream verbose print fx0)
+      (%fasl-load-end sv-only)
+      (setq *%load-depth* (- (%load-depth) 1)))))
 
-(defun %load-from-stream-1 (stream verbose print)
+(defun %load-from-stream-1 (stream verbose print &optional fx0)
   (when verbose
     (write-string "; loading from stream" *standard-output*)
     (write-char #\Newline *standard-output*))
@@ -5723,8 +5731,8 @@
          (result t)
          ;; FASL cache (mvm/fasl.lisp): only a FILE's text is cached -- read it
          ;; whole, then replay or record it form by form.
-         (text (%fasl-stream-text stream))
-         (fx (and text (%fasl-open text)))
+         (text (and (null fx0) (%fasl-stream-text stream)))
+         (fx (or fx0 (and text (%fasl-open text))))
          (read-failed nil))
     (loop
       ;; These T-clauses are the PRACTICAL BOTTOM of the handler-case
@@ -5800,7 +5808,7 @@
     (t (e) nil))
   (muffle-warning c))
 
-(defun %load-bind-pkg-rt-stream (stream verbose print)
+(defun %load-bind-pkg-rt-stream (stream verbose print &optional fx0)
   "%LOAD-FROM-STREAM with *PACKAGE* and *READTABLE* BOUND around it, per
    CLHS 24.2: \"load binds *readtable* and *package* to the values they held
    before loading the file\".  Without this a loaded file's (in-package :foo)
@@ -5817,7 +5825,7 @@
   (let ((saved-package *package*)
         (saved-readtable *readtable*))
     (unwind-protect
-         (%load-from-stream stream verbose print)
+         (%load-from-stream stream verbose print fx0)
       (setq *package* saved-package)
       (setq *readtable* saved-readtable))))
 
@@ -5885,6 +5893,8 @@
                          (write-string "; loading " *standard-output*)
                          (write-string path *standard-output*)
                          (write-char #\Newline *standard-output*))
-                       (%load-bind-pkg-rt-stream stream verbose print))
+                       ;; COMPILE-FILE's output replays (mvm/fasl.lisp).
+                       (%load-bind-pkg-rt-stream stream verbose print
+                                                 (%fasl-compiled-fx path)))
                   (close stream))
                 t)))))))))

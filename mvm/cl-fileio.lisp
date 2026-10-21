@@ -1012,7 +1012,23 @@
             (replace seq bytes :start1 i :start2 pos :end2 (+ pos n))
             (%cab-fd-set-pos fd (+ pos n))
             (%fs-set-pos stream (+ (%fs-pos stream) n))
-            (setq i (+ i n))))))
+            (setq i (+ i n)))))
+      ;; A host file: read(2) the rest a page at a time straight into SEQ.  The
+      ;; stream's buffer is drained, so the next READ-BYTE refills from where
+      ;; this leaves the descriptor.  It used to fall back to READ-BYTE per
+      ;; element -- ~186 ns a byte, 50 ms to read one 270 KB fasl.
+      (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)))
+        (loop
+          (when (>= i end) (return nil))
+          (let ((n (%sys-read-raw fd (%fs-io-page) (min 4096 (- end i)))))
+            (when (<= n 0) (return nil))
+            (let ((io (%fs-io-page)) (k 0))
+              (loop
+                (when (>= k n) (return nil))
+                (setf (aref seq (+ i k)) (mem-ref (+ io k) :u8))
+                (setq k (+ k 1))))
+            (setq i (+ i n))
+            (%fs-set-pos stream (+ (%fs-pos stream) n))))))
     i))
 
 (defun %fs-read-byte-raw (stream eof-error-p eof-value)

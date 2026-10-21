@@ -398,8 +398,14 @@
                    (when (%fasl-source-head-p forms)
                      (%fasl-reject (format nil "definition head ~a" (car (car forms)))))
                    ;; constants: renumber every pool index this bytecode loads,
-                   ;; densely, in first-use order
-                   (let ((bc2 (copy-seq bc)) (idxs nil) (k 0))
+                   ;; densely, in first-use order -- and two indices holding ONE
+                   ;; object share a number.  A special's per-site cache cons
+                   ;; (%LET-SPECIAL-SITE, the global-read sites) is quoted by
+                   ;; every access to it, each quote its own pool index: as two
+                   ;; constants it was a "shared constant" and kept every DEFUN
+                   ;; that reads a special as source, recompiled at each load.
+                   ;; One number replays it as one object, still shared.
+                   (let ((bc2 (copy-seq bc)) (idxs nil) (objs nil) (k 0))
                      (%fasl-walk-bc bc2
                        (lambda (op operands np)
                          (cond
@@ -408,12 +414,16 @@
                            ((eql op +op-li-const+)
                             (let* ((idx (cadr operands)) (hit (assoc idx idxs)))
                               (unless hit
-                                (setq hit (cons idx k))
-                                (setq idxs (cons hit idxs))
-                                (setq k (+ k 1)))
+                                (let* ((obj (gethash idx *e2-const-pool*))
+                                       (pos (position obj objs :test (function eq))))
+                                  (if pos
+                                      (setq hit (cons idx (- k 1 pos)))
+                                      (progn (setq hit (cons idx k))
+                                             (setq objs (cons obj objs))
+                                             (setq k (+ k 1))))
+                                  (setq idxs (cons hit idxs))))
                               (%fasl-put-u64 bc2 np (cdr hit)))))))
-                     (let ((consts (mapcar (lambda (p) (gethash (car p) *e2-const-pool*))
-                                           (reverse idxs)))
+                     (let ((consts (reverse objs))
                            (rt nil) (lam nil))
                        (%fasl-check-tree consts)
                        ;; the runtime-call names (positive keys; the negative ones
@@ -675,3 +685,166 @@
   (let ((s (or *fasl-stats* (list 0 0 0 0 0))))
     (list :hits (nth 0 s) :misses (nth 1 s) :modules (nth 2 s) :sources (nth 3 s) :rejected (nth 4 s)
           :why *fasl-reasons* :ms (mapcar (lambda (p) (cons (car p) (round (* 1000 (cdr p)) internal-time-units-per-second))) *fasl-times*))))
+
+;;; ------------------------------------------------------------------
+;;; COMPILE-FILE's output: a COMPILED fasl.
+;;;
+;;; COMPILE-FILE used to copy the source text to the .fasl, so every LOAD of
+;;; it compiled the whole file again -- and the cache above could not help a
+;;; second load in one session, because its key chains every file loaded
+;;; before (cl-bench LOAD-FASL: twenty loads of one fasl, twenty misses, 0.45 s
+;;; each).  A compiled fasl is what CLHS 3.2.2.2 describes: the code the file
+;;; compiled to, fixed at COMPILE-FILE time, which LOAD replays without asking
+;;; what was loaded before it.
+;;;
+;;; It is the cache's own record -- per toplevel form a module or the form's
+;;; source span -- plus the file's text, behind a magic line.  COMPILE-FILE
+;;; produces it by compiling each form WITHOUT RUNNING it (*FASL-COMPILE-ONLY*,
+;;; honoured at the one compile the record takes, in %MVM-EVAL-FORMS-2).  What
+;;; must happen at compile time does: IN-PACKAGE, DEFPACKAGE and
+;;; EVAL-WHEN :COMPILE-TOPLEVEL through %COMPILE-FILE-TOPLEVEL-EFFECTS, and every
+;;; form the cache keeps as source because compiling it registered something
+;;; (a macro, a struct, a setf expander, a constant ...) is run, so later forms
+;;; compile against it -- the compile-time side of DEFMACRO and friends.  Other
+;;; forms kept as source (a literal the encoder cannot write) are not run;
+;;; LOAD evaluates them from the text, in order.
+;;;
+;;; A fasl from a different compiler (fingerprint) is loaded from its text,
+;;; through the cache, like a source file.
+;;; ------------------------------------------------------------------
+
+;; *FASL-COMPILE-ONLY* / *FASL-COMPILE-HANDLED* live in compiler.lisp beside
+;; *FASL-TAINT*: cl-eval.lisp and mvm-eval.lisp read them in every image.
+
+(defun %fasl-magic () ";MODUS-FASL 1
+")
+
+(defun %fasl-compile-only-here-p ()
+  "This compile is COMPILE-FILE's own compile of a toplevel form (not a nested
+   EVAL inside a macroexpander or a compile-time run)."
+  (and *fasl-compile-only*
+       (eql *fasl-depth* (+ (if (integerp *fasl-base*) *fasl-base* 0) 1))))
+
+(defun %fasl-compile-only-skip-p (slot forms taint0)
+  "COMPILE-FILE: do not run what this compile built -- it became a module (LOAD
+   runs it), it was already run for its compile-time effect, or it is a plain
+   form kept as source (LOAD reads and runs it).  Run only a form whose compile
+   registered something or whose head is a compile-time definer."
+  (and (%fasl-compile-only-here-p)
+       ;; CLHS DEFCLASS / DEFINE-CONDITION: at toplevel the compiler must know
+       ;; the class for the rest of the file -- a macro's FIND-CLASS with the
+       ;; environment, a TYPEP (ANSI FIND-CLASS.24).  So they run now as well,
+       ;; and their module replays at LOAD.
+       (not (let ((f (car forms)))
+              (and (consp f) (symbolp (car f))
+                   (member (symbol-name (car f)) '("DEFCLASS" "DEFINE-CONDITION")
+                           :test (function string=)))))
+       (or (and slot (car slot) t)
+           *fasl-compile-handled*
+           (not (or (not (eql taint0 *fasl-taint*))
+                    (%fasl-source-head-p forms))))))
+
+(defun %fasl-cf-handled-p (form)
+  "%COMPILE-FILE-TOPLEVEL-EFFECTS ran all of FORM."
+  (and (consp form) (symbolp (car form))
+       (let ((h (symbol-name (car form))))
+         (or (string= h "IN-PACKAGE") (string= h "DEFPACKAGE")
+             (and (string= h "EVAL-WHEN") (consp (cdr form)) (listp (cadr form))
+                  (or (member :compile-toplevel (cadr form))
+                      (member 'compile (cadr form))))))))
+
+(defun %fasl-load-begin ()
+  "A LOAD starts: one run at compile time (an EVAL-WHEN of a file being
+   COMPILE-FILE'd) runs its forms -- they are not COMPILE-FILE's to withhold.
+   Returns the state for %FASL-LOAD-END."
+  (prog1 *fasl-compile-only* (setq *fasl-compile-only* nil)))
+
+(defun %fasl-load-end (saved)
+  (setq *fasl-compile-only* saved))
+
+(defun %fasl-slurp (stream)
+  (with-output-to-string (o)
+    (loop
+      (let ((c (read-char stream nil nil)))
+        (if c (write-char c o) (return nil))))))
+
+(defun %fasl-text-pack (text)
+  "TEXT as the fasl stores it: an (UNSIGNED-BYTE 8) vector when every character
+   fits one, which is copied in bulk -- a string is a varint per character, and
+   decoding gabriel.lisp's 55 KB that way was a quarter of each LOAD."
+  (let ((n (length text)))
+    (if (dotimes (i n t) (when (> (char-code (char text i)) 255) (return nil)))
+        (let ((v (make-array n :element-type '(unsigned-byte 8))))
+          (dotimes (i n) (setf (aref v i) (char-code (char text i))))
+          v)
+        text)))
+
+(defun %fasl-text-unpack (v)
+  (if (stringp v)
+      v
+      (let* ((n (length v)) (s (make-string n)))
+        (dotimes (i n) (setf (char s i) (code-char (aref v i))))
+        s)))
+
+(defun %fasl-compile-file (in out)
+  "Compile the file IN to a compiled fasl at OUT; T.  NIL (and OUT untouched)
+   where this image cannot -- off the main thread, or a build-time compile --
+   and the caller writes the source instead."
+  (when (and (%mvm-on-main-thread-p) (not *static-build-p*))
+    (let* ((text (with-open-file (s in :direction :input) (%fasl-slurp s)))
+           (fx (list :record "compile-file" text 0 nil nil t))
+           (eof (cons nil nil))
+           (sv-only *fasl-compile-only*)
+           (sv-handled *fasl-compile-handled*))
+      (unwind-protect
+           (loop
+             (let ((form (%fasl-read fx eof)))
+               (when (eq form eof) (return nil))
+               (%compile-file-toplevel-effects form)
+               (setq *fasl-compile-handled* (%fasl-cf-handled-p form))
+               (setq *fasl-compile-only* t)
+               ;; A form that does not compile is left as source: LOAD meets
+               ;; the error where the source-copying COMPILE-FILE let it.
+               (handler-case (%fasl-eval fx form)
+                 (error (c)
+                   (let ((e (car (nth 4 fx))))
+                     (when (consp e) (setf (nth 2 e) nil)))))
+               (setq *fasl-compile-only* sv-only)))
+        (setq *fasl-compile-only* sv-only)
+        (setq *fasl-compile-handled* sv-handled))
+      (let ((m (%fasl-magic))
+            (b (%fasl-encode (list :modus-compiled-fasl 1 (%fasl-compiler-fingerprint)
+                                   (%fasl-text-pack text) (reverse (nth 4 fx))))))
+        (with-open-file (o out :direction :output :element-type '(unsigned-byte 8)
+                               :if-exists :supersede :if-does-not-exist :create)
+          ;; Not WRITE-BYTE: a board's one-argument console WRITE-BYTE can
+          ;; be the definition that wins in an image (CLAUDE.md).
+          (let ((mb (make-array (length m) :element-type '(unsigned-byte 8))))
+            (dotimes (k (length m)) (setf (aref mb k) (char-code (char m k))))
+            (write-sequence mb o))
+          (write-sequence b o)))
+      t)))
+
+(defun %fasl-compiled-fx (path)
+  "PATH is a compiled fasl: the load loop's FX for it -- a replay, or (another
+   compiler's fasl) its text loaded as source through the cache.  Else NIL."
+  (let ((m (%fasl-magic)))
+    (ignore-errors
+     (with-open-file (i path :element-type '(unsigned-byte 8) :if-does-not-exist nil)
+       (when i
+         (let ((n (file-length i)) (k (length m)))
+           (when (> n k)
+             (let ((b (make-array n :element-type '(unsigned-byte 8))))
+               (when (and (eql (read-sequence b i :end k) k)
+                          (dotimes (j k t)
+                            (unless (eql (aref b j) (char-code (char m j))) (return nil)))
+                          (eql (read-sequence b i :start k) n))
+                 (let ((rec (%fasl-dec (cons b k) (list nil))))
+                   (when (and (consp rec) (eq (car rec) :modus-compiled-fasl))
+                     (let ((text (%fasl-text-unpack (nth 3 rec))))
+                       (if (equal (nth 2 rec) (%fasl-compiler-fingerprint))
+                           (progn (%fasl-stat 0)
+                                  (list :replay (concatenate 'string "compiled-" (%fasl-hash-string text))
+                                        text 0 nil (nth 4 rec) t))
+                           (or (%fasl-open text)
+                               (list :plain nil text 0 nil nil t)))))))))))))))

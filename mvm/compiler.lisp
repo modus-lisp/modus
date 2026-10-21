@@ -1187,6 +1187,11 @@
 
 (defvar *fasl-taint* nil)
 (defvar *fasl-taint-who* nil)
+(defvar *fasl-compile-only* nil
+  "T while COMPILE-FILE compiles a toplevel form (mvm/fasl.lisp): a form that
+   becomes a module is built and recorded, not run.")
+(defvar *fasl-compile-handled* nil
+  "T while COMPILE-FILE compiles a form %COMPILE-FILE-TOPLEVEL-EFFECTS already ran.")
 (defun %fasl-taint (&optional who)
   (setq *fasl-taint-who* who)
   (setq *fasl-taint* (if (integerp *fasl-taint*) (+ *fasl-taint* 1) 1)))

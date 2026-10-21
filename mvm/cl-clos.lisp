@@ -383,19 +383,28 @@
     (let ((cls (%find-clos-class name)))
       (if (and cls (%clos-class-p cls))
           (progn
-            (aset cls 2 effective-slots)
+            ;; The same slots keep the same LAYOUT, so its instances stay
+            ;; current; different slots invalidate it (see INSTANCES AND
+            ;; THEIR LAYOUT).
+            (if (equal old-slots effective-slots)
+                (aset cls 2 old-slots)
+                (progn
+                  (%clos-invalidate-layout cls)
+                  (aset cls 2 effective-slots)
+                  (aset cls 5 (cons effective-slots t))))
             (aset cls 3 supers)
             (aset cls 4 cpl)
             ;; The memoised answers (instantiation plans among them) were
             ;; derived from the old layout.
             (%clos-reg-memo-drop))
           (progn
-            (setq cls (make-array 5))
+            (setq cls (make-array 6))
             (aset cls 0 '%clos-class)
             (aset cls 1 name)
             (aset cls 2 effective-slots)
             (aset cls 3 supers)
             (aset cls 4 cpl)
+            (aset cls 5 (cons effective-slots t))
             ;; Remove any stale entry (different array object for same
             ;; name) then add the fresh one.
             (let ((new-registry nil)
@@ -1835,7 +1844,7 @@
 ;;; A class none of them covers takes the general path, unchanged.
 ;;;
 ;;; Plan: #(gen direct-p nslots initarg-map defaults initforms sigs
-;;;         fill-p validate-p)
+;;;         fill-p validate-p layout)
 ;;;   initarg-map  ((key (idx . bit) ...) ...)
 ;;;   defaults     ((key thunk (idx . bit) ...) ...)   CPL order
 ;;;   initforms    ((idx bit . thunk) ...)
@@ -1864,7 +1873,7 @@
                (return t)))))))
 
 (defun %clos-instance-plan-build (class-name)
-  (let ((p (make-array 9))
+  (let ((p (make-array 10))
         (cls (%find-clos-class class-name)))
     (aset p 0 (%clos-method-gen))
     (aset p 1 nil) (aset p 6 nil) (aset p 7 nil) (aset p 8 nil)
@@ -1898,6 +1907,7 @@
               (when (eq prs :missing) (setq fill nil))
               (setq defs (cons (cons (car e) (cons (cdr e) prs)) defs)))))
         (aset p 2 n)
+        (aset p 9 (%clos-layout cls))
         (aset p 3 imap)
         (aset p 4 (nreverse defs))
         (aset p 5 (nreverse ifs))
@@ -1959,14 +1969,14 @@
                  (< (length (svref plan 6)) 8))
         (aset plan 6 (cons (nreverse keys) (svref plan 6)))))))
 
-(defun %clos-plan-fill (inst prs val mask)
-  "Store VAL into each slot of PRS ((idx . bit) ...) not yet in MASK; the
-   new mask."
+(defun %clos-plan-fill (sv prs val mask)
+  "Store VAL into each slot of PRS ((idx . bit) ...) of slot vector SV not
+   yet in MASK; the new mask."
   (dolist (pr prs mask)
     (when (eql (logand mask (cdr pr)) 0)
       ;; %WORD-ASET: the instance is a plain vector, and ASET dispatched on
       ;; the array type per store.
-      (%word-aset inst (+ 2 (car pr)) val)
+      (%word-aset sv (car pr) val)
       (setq mask (logior mask (cdr pr))))))
 
 (defun %clos-plan-init (plan class-name inst initargs)
@@ -1975,7 +1985,7 @@
    (leftmost wins per slot), then each default initarg whose key was not
    supplied (evaluated, filling its slots not yet filled), then the initform
    of every slot neither filled nor already bound."
-  (let ((imap (svref plan 3)) (mask 0) (cur initargs))
+  (let ((imap (svref plan 3)) (mask 0) (cur initargs) (sv (%inst-slots inst)))
     (loop
       (when (or (null cur) (null (cdr cur))) (return nil))
       (let* ((key (car cur))
@@ -1986,34 +1996,28 @@
         ;; A key the map does not hold by EQ (a method's &KEY, or the same
         ;; name as another symbol object) is looked up the general way.
         (if e
-            (setq mask (%clos-plan-fill inst (cdr e) (cadr cur) mask))
+            (setq mask (%clos-plan-fill sv (cdr e) (cadr cur) mask))
             (let ((prs (%clos-plan-idxs (%find-clos-class class-name) class-name key)))
               (if (eq prs :missing)
                   (dolist (nm (%clos-initarg-to-slots class-name key))
                     (set-slot-value inst nm (cadr cur)))
-                  (setq mask (%clos-plan-fill inst prs (cadr cur) mask))))))
+                  (setq mask (%clos-plan-fill sv prs (cadr cur) mask))))))
       (setq cur (cddr cur)))
     (dolist (d (svref plan 4))
       (unless (%initargs-has-key-p initargs (car d))
-        (setq mask (%clos-plan-fill inst (cddr d) (funcall (cadr d)) mask))))
+        (setq mask (%clos-plan-fill sv (cddr d) (funcall (cadr d)) mask))))
     (dolist (f (svref plan 5))
       (when (and (eql (logand mask (cadr f)) 0)
-                 (eql (aref inst (+ 2 (car f))) -999))
-        (%word-aset inst (+ 2 (car f)) (funcall (cddr f)))))
+                 (eql (aref sv (car f)) -999))
+        (%word-aset sv (car f) (funcall (cddr f)))))
     inst))
 
 (defun %make-instance-planned (plan class-name initargs)
   "MAKE-INSTANCE through a DIRECT plan: validate, allocate, initialize."
   (%clos-plan-validate plan class-name initargs)
-  (let* ((n (svref plan 2))
-         (inst (make-array (+ 2 n))))
-    (%word-aset inst 0 '%clos-instance)
-    (%word-aset inst 1 class-name)
-    (let ((i 0))
-      (loop (when (= i n) (return nil))
-        (%word-aset inst (+ 2 i) -999)
-        (setq i (+ i 1))))
-    (%clos-plan-init plan class-name inst initargs)))
+  (%clos-plan-init plan class-name
+                   (%clos-alloc-instance class-name (svref plan 2) (svref plan 9))
+                   initargs))
 
 (defun make-instance (&rest args)
   "Per CLHS 7.1.1, MAKE-INSTANCE allocates an instance and dispatches
@@ -2036,19 +2040,118 @@
                          (aref class-or-name 1)
                          class-or-name)))
     (when (null cls) (return-from %make-instance nil))
-    (let* ((slot-names (aref cls 2))
-           (n (length slot-names))
-           (inst (make-array (+ 2 n))))
-      (%word-aset inst 0 '%clos-instance)
-      (%word-aset inst 1 class-name)
-      (let ((i 0))
-        (loop
-          (when (= i n) (return nil))
-          ;; Use literal -999 (unbound sentinel) to avoid SYMBOL-VALUE clobbering
-          ;; arr-reg (V0) in variable-index aset compilation
-          (%word-aset inst (+ 2 i) -999)
-          (setq i (+ i 1))))
-      inst)))
+    (%clos-alloc-instance class-name (length (aref cls 2)) (%clos-layout cls))))
+
+;;; ---- INSTANCES AND THEIR LAYOUT ----
+;;;
+;;; An instance is #(%CLOS-INSTANCE class-name SLOTS LAYOUT): SLOTS a vector of
+;;; the slot values in the class's effective-slot order (-999 = unbound), and
+;;; LAYOUT the class's (effective-slot-names . VALID) when it was made -- what
+;;; SBCL calls the wrapper.  The slots live in their own vector so a class
+;;; REDEFINITION can give an existing instance a different number of them
+;;; without changing the instance's identity (CLHS 4.3.6), and so CHANGE-CLASS
+;;; can.  Redefining a class with different slots, or MAKE-INSTANCES-OBSOLETE,
+;;; clears VALID on its layout and installs a new one; the next slot access to
+;;; an instance holding the old one updates it first (%CLOS-UPDATE-OBSOLETE-
+;;; INSTANCE): values carried over by slot name, then
+;;; UPDATE-INSTANCE-FOR-REDEFINED-CLASS with the added and discarded slots.
+;;; Before this, an instance was the flat vector #(%CLOS-INSTANCE class-name
+;;; s0 s1 ...), and after a redefinition its reads used the NEW slot indices
+;;; on the OLD cells -- another slot's value, silently.
+;;;
+;;; Pathnames are %CLOS-INSTANCE vectors of their own shape (cl-fileio) with
+;;; no slots; nothing here indexes them.
+
+(defun %clos-layout (cls)
+  "CLS's current layout: (effective-slot-names . T)."
+  (if (>= (array-length cls) 6)
+      (aref cls 5)
+      (let ((l (cons (aref cls 2) t))) l)))
+
+(defun %clos-invalidate-layout (cls)
+  "Make CLS's instances obsolete: their layout stops being VALID."
+  (when (>= (array-length cls) 6)
+    (let ((l (aref cls 5)))
+      (when (consp l) (set-cdr l nil)))))
+
+(defun %clos-alloc-instance (class-name n layout)
+  "A fresh instance of CLASS-NAME with N unbound slots and LAYOUT."
+  (let ((inst (make-array 4))
+        (sv (make-array n))
+        (i 0))
+    (loop
+      (when (= i n) (return nil))
+      ;; Literal -999 (the unbound marker); %WORD-ASET, the vector is fresh.
+      (%word-aset sv i -999)
+      (setq i (+ i 1)))
+    (%word-aset inst 0 '%clos-instance)
+    (%word-aset inst 1 class-name)
+    (%word-aset inst 2 sv)
+    (%word-aset inst 3 layout)
+    inst))
+
+(defun %inst-slots (obj)
+  "OBJ's slot vector, after bringing OBJ up to its class's current layout."
+  (let ((l (aref obj 3)))
+    (if (and (consp l) (null (cdr l)))
+        (%clos-update-obsolete-instance obj)
+        (aref obj 2))))
+
+(defun %clos-list-index (nm names)
+  (let ((i 0))
+    (loop
+      (when (null names) (return nil))
+      (when (eq (car names) nm) (return i))
+      (setq i (+ i 1))
+      (setq names (cdr names)))))
+
+(defun %clos-update-obsolete-instance (obj)
+  "CLHS 4.3.6: OBJ's class was redefined since OBJ was made (its layout is
+   no longer valid).  Carry each slot's value over by name into a vector for
+   the current layout, install both, then call
+   UPDATE-INSTANCE-FOR-REDEFINED-CLASS with the added local slots, the
+   discarded ones and a plist of the discarded slots' values (whose default
+   method runs SHARED-INITIALIZE on the added slots, i.e. their initforms).
+   Returns the new slot vector."
+  (let* ((class-name (aref obj 1))
+         (cls (%find-clos-class class-name))
+         (new-layout (and cls (%clos-layout cls))))
+    (if (or (null new-layout) (eq new-layout (aref obj 3)))
+        (aref obj 2)
+        (let* ((old-names (car (aref obj 3)))
+               (old-v (aref obj 2))
+               (old-n (array-length old-v))
+               (new-names (car new-layout))
+               (nv (make-array (length new-names)))
+               (added nil) (discarded nil) (plist nil) (i 0))
+          (dolist (nm new-names)
+            (let ((j (%clos-list-index nm old-names)))
+              (if (and j (< j old-n))
+                  (aset nv i (aref old-v j))
+                  (progn
+                    (aset nv i -999)
+                    (unless (%slot-class-owner class-name nm)
+                      (setq added (cons nm added))))))
+            (setq i (+ i 1)))
+          (let ((j 0))
+            (dolist (nm old-names)
+              (unless (%clos-list-index nm new-names)
+                (setq discarded (cons nm discarded))
+                (when (< j old-n)
+                  (let ((v (aref old-v j)))
+                    (unless (and (fixnump v) (= v -999))
+                      (setq plist (cons nm (cons v plist)))))))
+              (setq j (+ j 1))))
+          (aset obj 2 nv)
+          (aset obj 3 new-layout)
+          ;; Default initargs belong to MAKE-INSTANCE, not to this update.
+          (let ((saved *clos-applying-defaults*))
+            (setq *clos-applying-defaults* nil)
+            (unwind-protect
+                 (update-instance-for-redefined-class
+                  obj (nreverse added) (nreverse discarded) plist)
+              (setq *clos-applying-defaults* saved)))
+          (aref obj 2)))))
 
 (defun %slot-locate-scan (class-name slot-name)
   "Where SLOT-NAME lives for instances of CLASS-NAME: its instance slot index,
@@ -2075,7 +2178,7 @@
   ;; the full path below.
   (let ((loc (%clos-reg-memo2 8 (aref obj 1) slot-name (function %slot-locate-scan))))
     (when (fixnump loc)
-      (let ((val (aref obj (+ 2 loc))))
+      (let ((val (aref (%inst-slots obj) loc)))
         (return-from %slot-value
           (if (and (fixnump val) (= val -999))
               (%dispatch-slot-unbound (%find-clos-class (aref obj 1)) obj slot-name)
@@ -2100,7 +2203,7 @@
       (when (< idx 0)
         (return-from %slot-value
           (%dispatch-slot-missing cls obj slot-name 'slot-value nil nil)))
-      (let ((val (aref obj (+ 2 idx))))
+      (let ((val (aref (%inst-slots obj) idx)))
         ;; -999 is the unbound slot sentinel (fixnum, no global lookup needed)
         ;; Guard with fixnump to avoid type error when slot contains non-fixnum
         (if (and (fixnump val) (= val -999))
@@ -2120,7 +2223,7 @@
   ;; FAST PATH: the memoised instance slot index, as %SLOT-VALUE.
   (let ((loc (%clos-reg-memo2 8 (aref obj 1) slot-name (function %slot-locate-scan))))
     (when (fixnump loc)
-      (aset obj (+ 2 loc) new-val)
+      (aset (%inst-slots obj) loc new-val)
       (return-from set-slot-value new-val)))
   (let* ((class-name (aref obj 1))
          (cls (%find-clos-class class-name)))
@@ -2134,7 +2237,7 @@
       (when (< idx 0)
         (%dispatch-slot-missing cls obj slot-name 'setf new-val t)
         (return-from set-slot-value new-val))
-      (aset obj (+ 2 idx) new-val)
+      (aset (%inst-slots obj) idx new-val)
       new-val)))
 
 (defun %slot-boundp (obj slot-name)
@@ -2154,7 +2257,7 @@
         (return-from %slot-boundp
           (values (if (%dispatch-slot-missing cls obj slot-name 'slot-boundp nil nil) t nil))))
       ;; -999 is the unbound slot sentinel (fixnum guard prevents type error)
-      (let ((v (aref obj (+ 2 idx))))
+      (let ((v (aref (%inst-slots obj) idx)))
         (not (and (fixnump v) (= v -999)))))))
 
 (defun %slot-makunbound (obj slot-name)
@@ -2176,7 +2279,7 @@
         (%dispatch-slot-missing cls obj slot-name 'slot-makunbound nil nil)
         (return-from %slot-makunbound obj))
       ;; Use literal -999 to avoid SYMBOL-VALUE clobber in variable-index aset
-      (aset obj (+ 2 idx) -999)
+      (aset (%inst-slots obj) idx -999)
       obj)))
 
 (defun %class-slot-makunbound (class-name slot-name)
@@ -2621,17 +2724,17 @@
 (defun standard-instance-access (instance location)
   "MOP raw slot access by LOCATION (integer slot index).  Returns
    the unbound sentinel if the slot is unbound."
-  (let ((idx (+ 2 location)))
-    (when (and (%clos-instance-p instance)
-               (< idx (array-length instance)))
-      (aref instance idx))))
+  (when (%clos-instance-p instance)
+    (let ((sv (%inst-slots instance)))
+      (when (< location (array-length sv))
+        (aref sv location)))))
 
 (defun (setf standard-instance-access) (new-val instance location)
-  (let ((idx (+ 2 location)))
-    (when (and (%clos-instance-p instance)
-               (< idx (array-length instance)))
-      (aset instance idx new-val)
-      new-val)))
+  (when (%clos-instance-p instance)
+    (let ((sv (%inst-slots instance)))
+      (when (< location (array-length sv))
+        (aset sv location new-val)
+        new-val))))
 
 (defun ensure-class (name &rest options)
   "Lightweight ensure-class — looks up the class by NAME and returns it,
@@ -5420,14 +5523,14 @@
             ;; A DEFCLASS accessor: the slot itself (an unbound slot takes the
             ;; method, which signals through SLOT-UNBOUND).
             ((eq (car plan) :slot-read)
-             (let* ((obj (car args)) (v (aref obj (+ 2 (car (cdr plan))))))
+             (let* ((obj (car args)) (v (aref (%inst-slots obj) (car (cdr plan)))))
                (return-from %gf-dispatch
                  (if (and (fixnump v) (= v -999))
                      (%gf-run-chain gf args (cdr (cdr plan)))
                      v))))
             ((eq (car plan) :slot-write)
              (let ((nv (car args)))
-               (aset (car (cdr args)) (+ 2 (car (cdr plan))) nv)
+               (aset (%inst-slots (car (cdr args))) (car (cdr plan)) nv)
                (return-from %gf-dispatch nv)))
             ((eq (car plan) :chain)
              (return-from %gf-dispatch (%gf-run-chain gf args (cdr plan))))))))
@@ -7504,7 +7607,8 @@
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %shared-initialize-default instance))
     (let* ((slot-list (aref cls 2))
-           (inst-len (array-length instance))
+           (sv (%inst-slots instance))
+           (inst-len (array-length sv))
            (set-slots nil))
       ;; 1. Apply initargs first (leftmost wins).
       (let ((cur initargs))
@@ -7525,8 +7629,8 @@
                       ;; to filter not-found.  See %clos-slot-index docstring
                       ;; for the AArch64 rationale (the previous nil sentinel
                       ;; collided with fixnum 0 on slot 0).
-                      (when (and (>= idx 0) (< (+ 2 idx) inst-len))
-                        (aset instance (+ 2 idx) val)
+                      (when (and (>= idx 0) (< idx inst-len))
+                        (aset sv idx val)
                         (setq set-slots (cons slot-nm set-slots))))))
                 (setq sc (cdr sc)))))
           (setq cur (cdr (cdr cur)))))
@@ -7534,18 +7638,18 @@
       (let ((sn slot-list) (idx 0))
         (loop
           (when (null sn) (return nil))
-          (when (< (+ 2 idx) inst-len)
+          (when (< idx inst-len)
             (let* ((nm (car sn))
                    (already-set (member nm set-slots))
                    (covered (cond ((eq slot-names t) t)
                                   ((null slot-names) nil)
                                   (t (%slot-name-member nm slot-names))))
-                   (cur-val (aref instance (+ 2 idx)))
+                   (cur-val (aref sv idx))
                    (was-unbound (and (fixnump cur-val) (= cur-val -999))))
               (when (and (not already-set) covered was-unbound)
                 (let ((thunk (%clos-initform-thunk class-name nm)))
                   (when thunk
-                    (aset instance (+ 2 idx) (funcall thunk)))))))
+                    (aset sv idx (funcall thunk)))))))
           (setq idx (+ idx 1))
           (setq sn (cdr sn))))
       instance)))
@@ -7613,7 +7717,7 @@
       (when (and (eq slot-names t) *clos-applying-defaults* (symbolp class-name))
         (let ((plan (%clos-instance-plan class-name)))
           (when (and plan (svref plan 7)
-                     (= (array-length instance) (+ 2 (svref plan 2))))
+                     (= (array-length (%inst-slots instance)) (svref plan 2)))
             (return-from %shared-init-default-spread
               (%clos-plan-init plan class-name instance initargs)))))
       ;; Step 1: apply explicit initargs (leftmost wins).
@@ -7669,7 +7773,7 @@
                    (was-unbound
                     (if class-slot
                         (not (%class-slot-bound-p class-name nm))
-                        (let ((cur-val (aref instance (+ 2 idx))))
+                        (let ((cur-val (aref (%inst-slots instance) idx)))
                           (and (fixnump cur-val) (= cur-val -999))))))
               (when (and (null already-set) covered was-unbound)
                 (let ((thunk (%clos-initform-thunk class-name nm)))
@@ -7786,8 +7890,8 @@
      UPDATE-INSTANCE-FOR-DIFFERENT-CLASS, dispatched as a real GF so
      user methods (primary / :before / :after) run
 
-   Remaining limitation: if NEW-CLASS has more slots than the backing
-   array allocates, trailing slots are capped at the array size."
+   The instance's slot vector is replaced by one for NEW-CLASS (see INSTANCES
+   AND THEIR LAYOUT), so a new class with more slots keeps all of them."
   (when (null instance) (return-from %change-class-impl instance))
   (when (not (%clos-instance-p instance)) (return-from %change-class-impl instance))
   ;; Resolve new-class to a class object
@@ -7801,15 +7905,16 @@
            (old-name (aref instance 1))
            (old-cls (%find-clos-class old-name))
            (old-slot-names (if old-cls (aref old-cls 2) nil))
-           (inst-len (array-length instance)))
+           (old-sv (%inst-slots instance))
+           (inst-len (array-length old-sv)))
       ;; ---- 1. Validate the initarg plist (before any mutation) ----
       (%change-class-validate-initargs new-name initargs)
       ;; ---- 2. Snapshot PREVIOUS: copy with the old class + values ----
-      (let ((previous (make-array inst-len)))
-        (let ((i 0))
+      (let ((previous (%clos-alloc-instance old-name inst-len (aref instance 3))))
+        (let ((i 0) (psv (aref previous 2)))
           (loop
             (when (>= i inst-len) (return nil))
-            (let ((dummy (aset previous i (aref instance i))))
+            (let ((dummy (aset psv i (aref old-sv i))))
               dummy)
             (setq i (+ i 1))))
         ;; ---- 3. Snapshot old slot values keyed by name ----
@@ -7830,8 +7935,8 @@
                                    old-values))
                        (setq old-values
                              (cons (cons nm (cons nil nil)) old-values))))
-                  ((< (+ 2 idx) inst-len)
-                   (let* ((v (aref instance (+ 2 idx)))
+                  ((< idx inst-len)
+                   (let* ((v (aref old-sv idx))
                           (unbound (and (fixnump v) (= v -999))))
                      (if unbound
                          (setq old-values
@@ -7843,10 +7948,12 @@
               (setq sn (cdr sn))))
           ;; ---- 4. Mutate instance to its new class + remap values ----
           (aset instance 1 new-name)
-          (let ((sn new-slot-names) (idx 0))
+          (aset instance 2 (make-array (length new-slot-names)))
+          (aset instance 3 (%clos-layout new-cls))
+          (let ((sn new-slot-names) (idx 0) (nsv (aref instance 2)))
             (loop
               (when (null sn) (return nil))
-              (when (< (+ 2 idx) inst-len)
+              (progn
                 (let* ((nm (car sn))
                        (shared-new (%slot-class-owner new-name nm))
                        (pair (let ((cur old-values) (found nil))
@@ -7862,14 +7969,14 @@
                     ;; value is NOT transferred (CLHS 7.2.1 — only
                     ;; local-in-new slots retain values).
                     (shared-new
-                     (aset instance (+ 2 idx) -999))
+                     (aset nsv idx -999))
                     ;; Local in new + existed bound in old: retain.
                     ((and pair (car (cdr pair)))
-                     (aset instance (+ 2 idx) (cdr (cdr pair))))
+                     (aset nsv idx (cdr (cdr pair))))
                     ;; Existed-but-unbound or newly added: unbound.
                     ;; Added slots get initforms in %uifdc-default.
                     (t
-                     (aset instance (+ 2 idx) -999)))))
+                     (aset nsv idx -999)))))
               (setq idx (+ idx 1))
               (setq sn (cdr sn))))
           ;; ---- 5. UPDATE-INSTANCE-FOR-DIFFERENT-CLASS (real GF) ----
@@ -7979,11 +8086,9 @@
   new-val)
 
 (defun make-instances-obsolete (class)
-  "Increment the obsolescence stamp on CLASS.  Returns CLASS.  When
-   an instance with a stale stamp next has a slot accessed, the
-   slot-access path can trigger update-instance-for-redefined-class
-   (currently not wired since modus doesn't carry per-instance stamps;
-   the bookkeeping is in place for when that arrives)."
+  "Make every instance of CLASS (and of its subclasses) obsolete: each is
+   updated through UPDATE-INSTANCE-FOR-REDEFINED-CLASS at its next slot
+   access (see INSTANCES AND THEIR LAYOUT).  Returns CLASS."
   (let ((name (cond ((symbolp class) class)
                     ((%clos-class-p class) (aref class 1))
                     (t nil))))
@@ -7991,7 +8096,14 @@
       (let ((entry (assoc name *%class-stamps* :test #'eq)))
         (if entry
             (set-cdr entry (+ (cdr entry) 1))
-            (setq *%class-stamps* (cons (cons name 1) *%class-stamps*))))))
+            (setq *%class-stamps* (cons (cons name 1) *%class-stamps*))))
+      (dolist (e *clos-classes*)
+        (let ((c (cdr e)))
+          (when (and (%clos-class-p c) (>= (array-length c) 6)
+                     (or (eq (car e) name) (member name (aref c 4) :test #'eq)))
+            (%clos-invalidate-layout c)
+            (aset c 5 (cons (aref c 2) t)))))
+      (%clos-reg-memo-drop)))
   class)
 
 ;;; ============================================================
@@ -8378,7 +8490,7 @@
                    (already (member nm set-slots :test #'eq))
                    (idx (%clos-slot-index new-cls nm))
                    (unbound (if (>= idx 0)
-                                (let ((v (aref current (+ 2 idx))))
+                                (let ((v (aref (%inst-slots current) idx)))
                                   (and (fixnump v) (= v -999)))
                                 nil)))
               (when (and (null already) unbound)
@@ -8401,7 +8513,11 @@
   (%dispatch-uifdc %u-args))
 
 (defun %uifrc-default (instance added-slots discarded-slots plist &rest initargs)
-  (declare (ignore added-slots discarded-slots plist initargs))
+  "The standard UPDATE-INSTANCE-FOR-REDEFINED-CLASS method (CLHS 4.3.6.2):
+   SHARED-INITIALIZE on the ADDED slots, so their initforms (and any
+   INITARGS) fill them."
+  (declare (ignore discarded-slots plist))
+  (%dispatch-shared-init (cons instance (cons added-slots initargs)))
   instance)
 
 (defun %dispatch-uifrc (args)

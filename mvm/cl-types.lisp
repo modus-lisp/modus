@@ -2530,13 +2530,22 @@
               (let ((g2 (gcd-impl tt g)))
                 (%rat-from (%rat-exact-div tt g2) (bignum-mul bg (%rat-exact-div d g2)))))))))
 
+(defun %rat-unit-p (x) (or (eql x 1) (eql x -1)))
+(defun %rat-mul2 (x y)
+  (cond ((eql x 1) y) ((eql y 1) x) (t (bignum-mul x y))))
+(defun %rat-div-g (x g)
+  (if (eql g 1) x (%rat-exact-div x g)))
+
 (defun %rat-mul-knuth (a b c d)
-  "a/b * c/d, both in lowest terms with b, d > 0."
+  "a/b * c/d, both in lowest terms with b, d > 0.  A unit numerator or
+   denominator needs no GCD and no multiply: (/ p/q) is q/p, and the
+   bignum GCDs of the general case were 77% of cl-bench FIB-RATIO."
   (if (or (eql a 0) (eql c 0))
       0
-      (let ((g1 (gcd-impl a d)) (g2 (gcd-impl c b)))
-        (%rat-from (bignum-mul (%rat-exact-div a g1) (%rat-exact-div c g2))
-                   (bignum-mul (%rat-exact-div b g2) (%rat-exact-div d g1))))))
+      (let ((g1 (if (or (%rat-unit-p a) (eql d 1)) 1 (gcd-impl a d)))
+            (g2 (if (or (%rat-unit-p c) (eql b 1)) 1 (gcd-impl c b))))
+        (%rat-from (%rat-mul2 (%rat-div-g a g1) (%rat-div-g c g2))
+                   (%rat-mul2 (%rat-div-g b g2) (%rat-div-g d g1))))))
 
 (defun %rational-divide (a b)
   "Divide A by B where at least one is a ratio (other may be ratio or

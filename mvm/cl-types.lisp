@@ -91,6 +91,46 @@
 (defun %float-mag-lt (h1 l1 h2 l2)
   (or (< h1 h2) (and (= h1 h2) (< l1 l2))))
 
+;;; Two boxed floats (subtag #x60 double / #x64 single -- both an IEEE64
+;;; payload in four 16-bit slots) compared on their bits, the payload read
+;;; with %SLOT-REF.  %FLOAT-LT-P subtracts (allocating a boxed float) and
+;;; then makes three predicate calls; = was two NaN tests and two of those.
+;;; NaN is unordered and = nothing, +0 = -0, otherwise sign then magnitude.
+(defun %float4-p (x)
+  "X is a boxed double or single float with the four-slot payload."
+  (let ((st (obj-subtag x)))
+    (and (or (eq st #x60) (eq st #x64)) (eq (%prim-array-length x) 4))))
+
+(defun %float-bits-eq (a b)
+  (let ((ah (logior (ash (%slot-ref a 0) 16) (%slot-ref a 1)))
+        (al (logior (ash (%slot-ref a 2) 16) (%slot-ref a 3)))
+        (bh (logior (ash (%slot-ref b 0) 16) (%slot-ref b 1)))
+        (bl (logior (ash (%slot-ref b 2) 16) (%slot-ref b 3))))
+    (if (and (= ah bh) (= al bl))
+        (not (and (= (logand ah #x7FF00000) #x7FF00000)
+                  (or (/= (logand ah #xFFFFF) 0) (/= al 0))))
+        (and (= (logand ah #x7FFFFFFF) 0) (= al 0)
+             (= (logand bh #x7FFFFFFF) 0) (= bl 0)))))
+
+(defun %float-bits-lt (a b)
+  (let ((ah (logior (ash (%slot-ref a 0) 16) (%slot-ref a 1)))
+        (al (logior (ash (%slot-ref a 2) 16) (%slot-ref a 3)))
+        (bh (logior (ash (%slot-ref b 0) 16) (%slot-ref b 1)))
+        (bl (logior (ash (%slot-ref b 2) 16) (%slot-ref b 3))))
+    (if (or (and (= (logand ah #x7FF00000) #x7FF00000)
+                 (or (/= (logand ah #xFFFFF) 0) (/= al 0)))
+            (and (= (logand bh #x7FF00000) #x7FF00000)
+                 (or (/= (logand bh #xFFFFF) 0) (/= bl 0))))
+        nil
+        (let ((am (logand ah #x7FFFFFFF)) (bm (logand bh #x7FFFFFFF)))
+          (cond ((and (= am 0) (= al 0) (= bm 0) (= bl 0)) nil)
+                ((>= ah #x80000000)
+                 (if (>= bh #x80000000)
+                     (or (> am bm) (and (= am bm) (> al bl)))
+                     t))
+                ((>= bh #x80000000) nil)
+                (t (or (< am bm) (and (= am bm) (< al bl)))))))))
+
 (defun %float-lt-p (a b)
   "True if float A < float B, by IEEE ordering on the BITS: a NaN is unordered
    (NIL against anything), +0 and -0 are equal, otherwise sign then magnitude.
@@ -3310,6 +3350,8 @@
    Handles integers, boxed floats (subtag #x60 IEEE or #x32 rational
    form), and tagged ratios (subtag #x33)."
   ;; BOTH IEEE floats first: the common case pays nothing for the checks below.
+  (when (and (%float4-p a) (%float4-p b))
+    (return-from numeric-value-less-p (%float-bits-lt a b)))
   (when (and (%ieee-float-p a) (%ieee-float-p b))
     (return-from numeric-value-less-p (%float-lt-p a b)))
   ;; A NON-FINITE float against a non-float real: decided by the float alone,
@@ -3424,6 +3466,8 @@
   ;; fixnum-compare path never pays the type-walk.  The guard used to
   ;; require BOTH sides non-fixnum, so a complex against a fixnum -- e.g.
   ;; ZEROP, which is (= x 0) -- skipped this arm: (zerop #C(0.0 0.0)) was NIL.
+  (when (and (%float4-p a) (%float4-p b))
+    (return-from numeric-equal-p (%float-bits-eq a b)))
   (when (or (and (not (fixnump a)) (%complex-p a))
             (and (not (fixnump b)) (%complex-p b)))
     (return-from numeric-equal-p

@@ -2864,8 +2864,10 @@ Stopping.
          (*e2-module-defuns* nil)
          (*mvm-eval-no-cache* nil)
          (*jit-inhibit* nil)
+         ;; OPEN's stream -> path table: a worker opening a file fills its own.
+         (*%file-stream-paths* nil)
          )
-     (declare (special *%escape-report-busy* *jit-native-ran* *jit-infra-fallback* *e2-active-defun-names* *e2-persist-defuns* *e2-module-defuns* *mvm-eval-no-cache* *jit-inhibit*
+     (declare (special *%file-stream-paths* *%escape-report-busy* *jit-native-ran* *jit-infra-fallback* *e2-active-defun-names* *e2-persist-defuns* *e2-module-defuns* *mvm-eval-no-cache* *jit-inhibit*
                        *mvm-last-mv* *nlx-state-serial* *current-condition* *catch-active* *restart-stack* *handler-bind-stack* *handler-bind-effective-skip* *restart-frame-condition-map* *signal-walk-depth* *restarts-being-invoked* *restart-invoking-p* *restart-case-result* *rc-invoked-restart* *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods* *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tag* *catch-value* *catch-values* *catch-tags*))
      (progv *per-computation-specials*
          (make-list (length *per-computation-specials*))

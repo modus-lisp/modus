@@ -348,6 +348,13 @@
   (%register-clos-direct-slots name slot-names)
   ;; Any CPL may change: every GF dispatch cache is stale (THE DISPATCH CACHE).
   (setq *gf-cache-epoch* (+ (%gf-cache-epoch) 1))
+  ;; What NAME's subclasses were derived from, to tell whether they must be
+  ;; derived again (%CLOS-PROPAGATE-TO-SUBCLASSES).  Both lists are replaced,
+  ;; never mutated, so holding them is enough.
+  (let* ((old-cls (%find-clos-class name))
+         (old-slots (and old-cls (%clos-class-p old-cls) (aref old-cls 2)))
+         (old-cpl (and old-cls (%clos-class-p old-cls) (aref old-cls 4))))
+  (prog1
   (let* ((cpl (%compute-cpl name (if (null supers) '(standard-object) supers)))
          ;; Effective slots: this class's slots + each ancestor's slots
          ;; (de-duplicated, in CPL order).  Walk cpl skipping the leading
@@ -401,7 +408,46 @@
               (%clos-reg-memo-drop)
               (setq *clos-classes* (cons (cons name cls) new-registry))
               (setq *clos-find-memo* nil))))
-      name)))
+      name))
+    (let ((cls (%find-clos-class name)))
+      (unless (and old-cls (equal old-slots (aref cls 2)) (equal old-cpl (aref cls 4)))
+        (%clos-propagate-to-subclasses name))))))
+
+;;; ---- SUBCLASSES FOLLOW THEIR SUPERCLASSES ----
+;;;
+;;; A class's CPL and effective slots are computed when it is defined, from
+;;; its superclasses as they are THEN.  So a subclass defined before its
+;;; superclass (a forward reference -- (defclass b (a) ...) above
+;;; (defclass a ...), an ordinary file order) never got A's slots, and one
+;;; whose superclass was later redefined kept the old layout: MAKE-INSTANCE
+;;; and SLOT-VALUE signalled SLOT-MISSING for an inherited slot.  So when
+;;; a class is defined, or redefined with a different CPL or slot list, every
+;;; registered class that has it in its CPL is derived again from its own
+;;; direct slots and superclasses -- shallowest first, so each sees its
+;;; parents' new layout -- and the nested definitions do not propagate again.
+;;;
+;;; Instances made before the change keep the layout they were made with
+;;; (CLHS 4.3.6 updates them; modus does not yet -- see MAKE-INSTANCES-OBSOLETE).
+
+(defvar *%clos-propagating* nil)
+
+(defun %clos-propagate-to-subclasses (name)
+  (unless *%clos-propagating*
+    (let ((subs nil))
+      (dolist (e *clos-classes*)
+        (let ((c (cdr e)))
+          (when (and (not (eq (car e) name)) (%clos-class-p c)
+                     (member name (aref c 4) :test (function eq)))
+            (setq subs (cons (cons (length (aref c 4)) (car e)) subs)))))
+      (when subs
+        (setq subs (sort subs (function <) :key (function car)))
+        (setq *%clos-propagating* t)
+        (unwind-protect
+             (dolist (pr subs)
+               (let ((c (%find-clos-class (cdr pr))))
+                 (when c
+                   (%defclass (cdr pr) (%direct-slots-for (cdr pr)) (aref c 3)))))
+          (setq *%clos-propagating* nil))))))
 
 (defvar *clos-find-memo* nil
   "EQ hash: symbol class NAME -> what %FIND-CLOS-CLASS-SCAN answered.  %OBJ-CPL

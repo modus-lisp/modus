@@ -110,13 +110,8 @@
      (twice (lambda () (slots (make-instance 'base :a 1) '(a b e)))) '(1 :new-b :e))
 (chk "a dropped initarg is invalid"
      (err-of (lambda () (make-instance 'base :aa 1))) :error)
-;;; KNOWN, older than the plan: a superclass redefined after a subclass was
-;;; defined does not reach the subclass's layout, so the subclass has no slot E
-;;; and its initarg signals SLOT-MISSING.  Reported, not counted.
-(let ((got (handler-case (twice (lambda () (slots (make-instance 'derived :e 2) '(a e c))))
-             (error () :error))))
-  (format t "~&  ~a a subclass picks the change up~%"
-          (if (equal got '((:a-default) 2 :c-default)) "ok  " "KNOWN")))
+(chk "a subclass picks the change up"
+     (twice (lambda () (slots (make-instance 'derived :e 2) '(a e c)))) '((:a-default) 2 :c-default))
 
 ;;; Shapes the plan declines, still right.
 (defclass shared () ((s :allocation :class :initarg :s :initform :shared) (i :initarg :i)))

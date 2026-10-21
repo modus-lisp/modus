@@ -4735,6 +4735,26 @@
    displacement is broken — fresh local backing is allocated and the
    old contents are copied verbatim, per CLHS adjust-array semantics."
   (cond
+    ;; THE COMMON CASE, slots read directly (MDA: 1 dims, 2 fill pointer,
+    ;; 3 displaced-to, 5 element type, 6 data): a non-displaced vector with
+    ;; room, storing a character into string data or anything into a simple
+    ;; vector.  Seven out-of-line slot readers and a generic ASET per push made
+    ;; cl-bench fill-strings/adjustable 9.5x SBCL.
+    ((and (%mda-p vector)
+          (fixnump (%prim-aref vector 2))
+          (null (%prim-aref vector 3))
+          (not (eq (%prim-aref vector 5) 'bit))
+          (let ((dims (%prim-aref vector 1)))
+            (and (consp dims) (null (cdr dims)) (fixnump (car dims))
+                 (< (%prim-aref vector 2) (car dims))))
+          (let ((d (%prim-aref vector 6)))
+            (if (%prim-stringp d)
+                (characterp new-element)
+                (%prim-simple-vector-p d))))
+     (let ((fp (%prim-aref vector 2)) (d (%prim-aref vector 6)))
+       (%prim-aset d fp (if (%prim-stringp d) (char-code new-element) new-element))
+       (%prim-aset vector 2 (+ fp 1))
+       fp))
     ((and (%mda-p vector) (%mda-bit-p vector))
      (%bit-vector-push new-element vector t args))
     ((%mda-p vector)
@@ -4762,14 +4782,26 @@
                                     (make-array new-cap))))
                   ;; Copy old visible contents (0..cap from old aref-routing)
                   ;; through the MDA's current view so displacement is honored.
-                  (let ((i 0))
-                    (loop
-                      (when (>= i cap) (return))
-                      (let ((v (cond
-                                 (disp (aref arr (+ off i)))
-                                 (t (aref arr i)))))
-                        (aset new-arr i v))
-                      (setq i (+ i 1))))
+                  (if (and (null disp)
+                           (or (and (%prim-stringp arr) (%prim-stringp new-arr))
+                               (and (%prim-simple-vector-p arr)
+                                    (%prim-simple-vector-p new-arr))))
+                      ;; same raw representation (codes or words): copy the
+                      ;; slots -- the generic AREF / ASET pair per element was
+                      ;; most of a growing VECTOR-PUSH-EXTEND
+                      (let ((i 0))
+                        (loop
+                          (when (>= i cap) (return))
+                          (%prim-aset new-arr i (%prim-aref arr i))
+                          (setq i (+ i 1))))
+                      (let ((i 0))
+                        (loop
+                          (when (>= i cap) (return))
+                          (let ((v (cond
+                                     (disp (aref arr (+ off i)))
+                                     (t (aref arr i)))))
+                            (aset new-arr i v))
+                          (setq i (+ i 1)))))
                   ;; Update MDA: data ← new-arr, displaced ← nil, offset ← 0,
                   ;; dims ← (new-cap).  Adjusting dims keeps array-total-size
                   ;; honest after the grow.

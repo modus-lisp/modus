@@ -2548,7 +2548,13 @@
                (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
       (return-from exact-divide
         (let ((r (%float-div a b)))
-          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r))))))
+          (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))))
+    (when (and (fixnump b) (not (eql b 0)) (or (= sa #x60) (= sa #x64)) (= (%prim-array-length a) 4))
+      (return-from exact-divide
+        (let ((r (%float-div a (%float-from-int b)))) (if (= sa #x60) r (%round-to-single r)))))
+    (when (and (fixnump a) (or (= sb #x60) (= sb #x64)) (= (%prim-array-length b) 4))
+      (return-from exact-divide
+        (let ((r (%float-div (%float-from-int a) b))) (if (= sb #x60) r (%round-to-single r))))))
   (cond
     ((or (%ieee-float-p a) (%ieee-float-p b))
      (%as-result-float (%float-div (%any-to-float a) (%any-to-float b))
@@ -2970,7 +2976,14 @@
              (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
         (let ((r (%float-add a b)))
           (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
-        (%generic-add-slow a b))))
+        ;; a float with a fixnum: the fixnum converted exactly-rounded, the
+        ;; result in the float's own format (CLHS 12.1.4.1)
+        (cond
+          ((and (fixnump b) (or (= sa #x60) (= sa #x64)) (= (%prim-array-length a) 4))
+           (let ((r (%float-add a (%float-from-int b)))) (if (= sa #x60) r (%round-to-single r))))
+          ((and (fixnump a) (or (= sb #x60) (= sb #x64)) (= (%prim-array-length b) 4))
+           (let ((r (%float-add (%float-from-int a) b))) (if (= sb #x60) r (%round-to-single r))))
+          (t (%generic-add-slow a b))))))
 
 (defun %generic-add-slow (a b)
   (cond
@@ -3027,7 +3040,14 @@
              (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
         (let ((r (%float-mul a b)))
           (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
-        (%generic-multiply-slow a b))))
+        ;; a float with a fixnum: the fixnum converted exactly-rounded, the
+        ;; result in the float's own format (CLHS 12.1.4.1)
+        (cond
+          ((and (fixnump b) (or (= sa #x60) (= sa #x64)) (= (%prim-array-length a) 4))
+           (let ((r (%float-mul a (%float-from-int b)))) (if (= sa #x60) r (%round-to-single r))))
+          ((and (fixnump a) (or (= sb #x60) (= sb #x64)) (= (%prim-array-length b) 4))
+           (let ((r (%float-mul (%float-from-int a) b))) (if (= sb #x60) r (%round-to-single r))))
+          (t (%generic-multiply-slow a b))))))
 
 (defun %generic-multiply-slow (a b)
   (cond
@@ -3076,7 +3096,14 @@
              (= (%prim-array-length a) 4) (= (%prim-array-length b) 4))
         (let ((r (%float-sub a b)))
           (if (or (= sa #x60) (= sa #x66) (= sb #x60) (= sb #x66)) r (%round-to-single r)))
-        (%generic-subtract-slow a b))))
+        ;; a float with a fixnum: the fixnum converted exactly-rounded, the
+        ;; result in the float's own format (CLHS 12.1.4.1)
+        (cond
+          ((and (fixnump b) (or (= sa #x60) (= sa #x64)) (= (%prim-array-length a) 4))
+           (let ((r (%float-sub a (%float-from-int b)))) (if (= sa #x60) r (%round-to-single r))))
+          ((and (fixnump a) (or (= sb #x60) (= sb #x64)) (= (%prim-array-length b) 4))
+           (let ((r (%float-sub (%float-from-int a) b))) (if (= sb #x60) r (%round-to-single r))))
+          (t (%generic-subtract-slow a b))))))
 
 (defun %generic-subtract-slow (a b)
   (cond

@@ -17599,6 +17599,7 @@
                                        :test #'eql))
                       (setq found t)))
                    ((%form-op-is form 80380232 "LAMBDA")
+                    (walk-defaults (cadr form))
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) t)
                             (setq cur (cdr cur)))))
@@ -17619,6 +17620,8 @@
                         (%form-op-is form 417505106 "LABELS"))
                     (let ((cur (cadr form)))
                       (loop while (consp cur) do
+                        (when (and (consp (car cur)) (consp (cdr (car cur))))
+                          (walk-defaults (cadr (car cur))))
                         (let ((bcur (cddr (car cur))))
                           (loop while (consp bcur) do (walk (car bcur) t)
                                 (setq bcur (cdr bcur))))
@@ -17630,7 +17633,17 @@
                     (walk (cadr form) in-fn))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
-                              (setq cur (cdr cur)))))))))
+                              (setq cur (cdr cur))))))))
+             ;; A local function's &optional / &key / &aux defaults run
+             ;; inside it, so a GO there is cross-unit too (misc test 29340:
+             ;; (labels ((%f3 (x &optional (y (go tag4))) ...)) ...) in a
+             ;; TAGBODY warned "unknown GO tag" and compiled the GO to NIL).
+             (walk-defaults (ll)
+               (loop while (consp ll) do
+                 (let ((p (car ll)))
+                   (when (and (consp p) (consp (cdr p)))
+                     (walk (cadr p) t)))
+                 (setq ll (cdr ll)))))
       (let ((cur body))
         (loop while (consp cur) do (walk (car cur) nil)
               (setq cur (cdr cur)))))

@@ -2789,6 +2789,19 @@
             (symbol-name fn)))
       (symbol-name fn)))
 
+(defun %local-fn-key (fn)
+  "The FLET/LABELS environment key for function-name symbol FN: its
+   %RT-FN-NAME, except that a native MVM symbol carries only a hash (its
+   name is \"\") -- symbols an image bakes into quoted data, the ANSI gate's
+   test forms among them -- so every local function of such a form keyed as
+   \"\" and a call to one reached the innermost (misc test 29341:
+   (%F11) called %F13 with no arguments).  Those key by their hash.
+   Runtime only, so built images are unchanged."
+  (let ((k (%rt-fn-name fn)))
+    (if (and *mvm-eval-runtime-p* (string= k ""))
+        (format nil "%NAMELESS-~D" (%sym-hash fn))
+        k)))
+
 (defun %setf-fn-name (sym)
   "Function-table KEY STRING for the CLHS function name (SETF SYM).
 
@@ -14613,7 +14626,7 @@
             (params (cadr def))
             (fbody (cddr def)))
         ;; Generate unique global name
-        (let* ((base-name (cond ((symbolp name) (%rt-fn-name name))
+        (let* ((base-name (cond ((symbolp name) (%local-fn-key name))
                                 ((and (consp name) (eq (car name) 'setf))
                                  (%setf-fn-name (cadr name)))
                                 (t (format nil "~A" name))))
@@ -17978,7 +17991,7 @@
                         ((stringp name) name)
                         (t "UNKNOWN")))
              ;; Check if this name is a flet/labels local name — use the unique name
-             (unique-name (env-lookup-fn env fn-name))
+             (unique-name (env-lookup-fn env (if (symbolp name) (%local-fn-key name) fn-name)))
              ;; Primitive-op names → corresponding %*-fn wrapper.
              ;;
              ;; EQ/EQL/EQUAL have no proper variadic defun, so the
@@ -25324,7 +25337,7 @@
         (compile-form (list 'let (mapcar #'list vars args) (cons fn vars)) env dest))))
   ;; (declaim (inline FN)) at runtime: expand the call in place.
   (when (and (or *mvm-eval-runtime-p* *aot-inline*) (symbolp fn) *inline-fn-defs*
-             (null (env-lookup-fn env (%rt-fn-name fn)))   ; a local FLET/LABELS FN wins
+             (null (env-lookup-fn env (%local-fn-key fn)))   ; a local FLET/LABELS FN wins
              (or (null *inline-only-in*)                    ; DIAGNOSTIC caller whitelist
                  (and (stringp *current-function-name*)
                       (member *current-function-name* *inline-only-in*
@@ -25528,7 +25541,7 @@
   (let ((static-rest-pack nil)
         (true-nargs nil))
     (when (and (symbolp fn) (boundp '*functions*) *functions*
-               (not (env-lookup-fn env (%rt-fn-name fn)))
+               (not (env-lookup-fn env (%local-fn-key fn)))
                (%final-shape-arity-error-p (%rt-fn-name fn) (length args)))
       ;; Multi-shape name called with an arity its FINAL definition rejects.
       (compile-arity-error env dest)
@@ -25539,10 +25552,10 @@
              ;; SHADOWS the global, so it is consulted BEFORE the #211
              ;; package-qualified key (env-lookup-fn is keyed on the bare
              ;; name at both bind and lookup — see compile-flet's base-name).
-             (resolved-fn-name (or (env-lookup-fn env fn-name)
+             (resolved-fn-name (or (env-lookup-fn env (%local-fn-key fn))
                                    (%fn-key-qualify fn fn-name)))
              (fn-info (if (and (%multi-shape-defun-p fn-name)
-                               (not (env-lookup-fn env fn-name)))
+                               (not (env-lookup-fn env (%local-fn-key fn))))
                           ;; Defined more than once with DIFFERENT lambda
                           ;; lists: the entry here may be an EARLY definition
                           ;; the final one replaces (last-defun-wins).  Treat
@@ -25721,7 +25734,7 @@
       ((symbolp fn)
        (let* ((fn-name (%rt-fn-name fn))
               ;; Check env for flet/labels name mapping (unique name)
-              (unique-name (env-lookup-fn env fn-name))
+              (unique-name (env-lookup-fn env (%local-fn-key fn)))
               ;; #211: otherwise emit the key of the package this call was
               ;; READ in.  Phase 3 (%fn-info-for-key) falls back to the bare
               ;; key when that package defines no such name, so a call that
@@ -26423,7 +26436,7 @@
     ;; The name's load may call (and set the nargs slot), so the count rides
     ;; the stack across it.
     (emit-ir :push nargs-reg)
-    (compile-form (if (and name (symbolp name)) (list 'quote name) nil)
+    (compile-form (if (and name (or (symbolp name) (stringp name))) (list 'quote name) nil)
                   (make-compile-env :stack-depth 0 :bindings nil :parent nil)
                   +vreg-v0+)
     (emit-ir :pop +vreg-v1+)

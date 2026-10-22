@@ -6197,6 +6197,18 @@
             (setq *%next-methods* saved-nm)
             (setq *%current-gf-args* saved-args)))))))
 
+(defun %cnm-with-state (next args gf new-args)
+  "CALL-NEXT-METHOD for a method's own #'CALL-NEXT-METHOD closure: run it with
+   the dispatch state the method was entered with."
+  (let ((s-nm *%next-methods*) (s-args *%current-gf-args*) (s-gf *%current-gf*))
+    (setq *%next-methods* next)
+    (setq *%current-gf-args* args)
+    (setq *%current-gf* gf)
+    (multiple-value-prog1 (apply (function call-next-method) new-args)
+      (setq *%next-methods* s-nm)
+      (setq *%current-gf-args* s-args)
+      (setq *%current-gf* s-gf))))
+
 (defun next-method-p (&rest args)
   "True if there is a next method available.  NEXT-METHOD-P takes no
    arguments (CLHS 7.6.6.2); calling it with any is a program-error

@@ -3917,6 +3917,40 @@
               (and ok (%body-cnm-free-p x (+ depth 1)))))))
     (t t)))
 
+(defun %body-escapes-next-method-fns-p (form depth)
+  "FORM takes #'NEXT-METHOD-P or #'CALL-NEXT-METHOD as a VALUE -- a closure
+   that may run after the method has returned."
+  (cond
+    ((> depth 200) nil)
+    ((atom form) nil)
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "FUNCTION")
+          (consp (cdr form)) (symbolp (cadr form)))
+     (and (member (symbol-name (cadr form)) '("CALL-NEXT-METHOD" "NEXT-METHOD-P")
+                  :test #'string=)
+          t))
+    (t (let ((x form) (hit nil))
+         (loop
+           (when (or hit (atom x)) (return nil))
+           (setq hit (%body-escapes-next-method-fns-p (car x) (+ depth 1)))
+           (setq x (cdr x)))
+         hit))))
+
+(defun %wrap-escaping-next-method-fns (body)
+  "BODY, a method body, with NEXT-METHOD-P / CALL-NEXT-METHOD bound as local
+   functions over the call's dispatch state when it takes either as a VALUE
+   (CLHS 7.6.6.2); unchanged otherwise.  The global ones read the dynamic
+   state, so an escaped #'NEXT-METHOD-P answered for whichever method ran
+   last (upstream NEXT-METHOD-P.6-9 flipped with test order)."
+  (if (%body-escapes-next-method-fns-p body 0)
+      `((let ((%nm-next *%next-methods*)
+              (%nm-args *%current-gf-args*)
+              (%nm-gf *%current-gf*))
+          (flet ((next-method-p () (not (null %nm-next)))
+                 (call-next-method (&rest %nm-new)
+                   (%cnm-with-state %nm-next %nm-args %nm-gf %nm-new)))
+            ,@body)))
+      body))
+
 (defun register-mvm-bootstrap-macros ()
   "Register standard CL macros needed to compile *runtime-functions*.
    Fast path (template already built): copy it into the current *macro-table*."
@@ -6266,7 +6300,9 @@
                                            (and (consp (car body)) (symbolp (caar body))
                                                 (string= (symbol-name (caar body)) "DECLARE"))))
                             do (push (pop body) pre))
-                      (setq body (append (nreverse pre) (list (list* 'block bname body)))))
+                      (setq body (append (nreverse pre)
+                                         (list (list* 'block bname
+                                                      (%wrap-escaping-next-method-fns body))))))
                     `(%defgeneric-method ',gf-name
                                          ',(if qualifier qualifier nil)
                                          (list ,@specs)
@@ -6414,6 +6450,12 @@
                                           (symbolp (cadr gf-name)))
                                      (cadr gf-name))
                                     (t nil))))
+              ;; #'NEXT-METHOD-P / #'CALL-NEXT-METHOD as a value (CLHS 7.6.6.2:
+              ;; local functions of the method): close them over THIS call's
+              ;; next methods, arguments and GF.  The global ones read the
+              ;; dynamic state, so the closure answered for whichever method
+              ;; ran last (upstream NEXT-METHOD-P.6-9 flipped with test order).
+              (setq body (%wrap-escaping-next-method-fns body))
               (let ((lam `(lambda ,lambda-params
                                             ,(if block-name
                                                  `(block ,block-name ,@body)

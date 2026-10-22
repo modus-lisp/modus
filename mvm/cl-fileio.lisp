@@ -2228,10 +2228,15 @@
             (let ((n (length path)))
               (and (> n 0) (not (char= (char path (- n 1)) #\/))
                    (let ((pf (probe-file x))) (and pf (list pf))))))
+        ;; Each match as its TRUENAME, as CLHS DIRECTORY returns them:
+        ;; they were strings, which stopped being EQUAL to PROBE-FILE's answer
+        ;; once that became the truename (upstream DIRECTORY.7).  In-tree
+        ;; callers take NAMESTRING of them, which a pathname answers too.
         (let ((comps (%split-slash path)))
-          (if (and comps (string= (car comps) ""))
-              (%glob-expand "/" (cdr comps))
-              (%glob-expand "" comps))))))
+          (mapcar (function truename)
+                  (if (and comps (string= (car comps) ""))
+                      (%glob-expand "/" (cdr comps))
+                      (%glob-expand "" comps)))))))
 
 ;;; --- with-open-stream ---
 (defun %with-open-stream-fn (stream thunk)

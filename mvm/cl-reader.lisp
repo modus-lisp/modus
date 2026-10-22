@@ -617,7 +617,18 @@
       ((eq syn :multiple-escape)
        (list nil nil t t))
       (t
+       (%token-check-invalid first-char)
        (list (list (char-code first-char)) (list nil) nil nil)))))
+
+(defun %token-check-invalid (ch)
+  "CLHS 2.1.4.2: Backspace, Tab, Newline, Page, Return, Space and Rubout have
+   the INVALID constituent trait, so one read unescaped as part of a token is
+   a reader error -- what SET-SYNTAX-FROM-CHAR exposes when it makes
+   whitespace a constituent (SET-SYNTAX-FROM-CHAR-TRAIT-X-Space ...)."
+  (let ((c (char-code ch)))
+    (when (and (not *read-suppress*)
+               (or (= c 8) (= c 9) (= c 10) (= c 12) (= c 13) (= c 32) (= c 127)))
+      (%reader-error "invalid constituent character in a token"))))
 
 (defun %token-add-char (chars all-escaped ch escaped)
   "Add a character to the token accumulator."
@@ -672,6 +683,7 @@
      (aset st 3 t)
      nil)
     (t
+     (%token-check-invalid ch)
      (aset st 0 (cons (char-code ch) (aref st 0)))
      (aset st 1 (cons nil (aref st 1)))
      nil)))
@@ -1396,7 +1408,9 @@
            ;; End of string
            (if *read-suppress* (return nil)
                (return (%codes-to-string (nreverse chars)))))
-          ((eql ch #\\)
+          ;; Any SINGLE ESCAPE character of the readtable, not only the
+          ;; backslash (SET-SYNTAX-FROM-CHAR.SINGLE-ESCAPE.2)
+          ((eq (%syntax-type ch *readtable*) :single-escape)
            ;; Escape: next char is literal
            (let ((next (read-char stream t nil t)))
              (setq chars (cons (char-code next) chars))))
@@ -2380,7 +2394,10 @@
         (*print-pretty* nil)
         (*print-radix* nil)
         (*print-readably* nil)
-        (*print-right-margin* nil))
+        (*print-right-margin* nil)
+        ;; NIL is the initial (standard) pprint dispatch table
+        ;; (WITH-STANDARD-IO-SYNTAX.23)
+        (*print-pprint-dispatch* nil))
     (funcall thunk)))
 
 

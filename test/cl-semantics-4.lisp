@@ -1,0 +1,83 @@
+;;; test/cl-semantics-4.lisp -- characters, complex hyperbolics, macro
+;;; environments, string comparison, printer and type fixes made against
+;;; the upstream ansi-test suite.  Expected values are SBCL's.
+;;;
+;;;   ./modus --script test/cl-semantics-4.lisp
+
+(defvar *fails* 0)
+(defvar *checks* 0)
+(defun check (what got want)
+  (setq *checks* (+ *checks* 1))
+  (unless (equalp got want)
+    (setq *fails* (+ *fails* 1))
+    (format t "~&FAIL ~a: got ~s want ~s~%" what got want)))
+
+;;; Characters
+(check "non-graphic characters have names"
+       (list (char-name (code-char 1)) (char-name (code-char 7))
+             (graphic-char-p (code-char 7)) (graphic-char-p (code-char 200)))
+       '("Soh" "Bel" nil t))
+(check "~:C spells the name" (format nil "~:c" (code-char 7)) "Bel")
+(check "standard-char is the 96" (list (typep #\a 'standard-char) (typep (code-char 127) 'standard-char))
+       '(t nil))
+
+;;; Complex hyperbolics keep the argument's float format
+(check "cosh of a complex"
+       (typep (cosh (complex 1.0 2.0)) '(complex single-float))
+       t)
+(check "acosh of complex one"
+       (equal (acosh (coerce 1 '(complex single-float))) (coerce 0 '(complex single-float)))
+       t)
+(check "coerce to (complex double-float)" (coerce 1 '(complex double-float)) #c(1d0 0d0))
+(check "least-positive-single-float is single"
+       (typep least-positive-single-float 'single-float) t)
+
+;;; Macro environments
+(check "macroexpand sees the enclosing symbol-macrolet"
+       (symbol-macrolet ((a b))
+         (macrolet ((foo (x &environment env)
+                      (if (eq (macroexpand x env) 'a) 1 2)))
+           (foo a)))
+       2)
+
+;;; Strings
+(check "string<= on equal slices answers END1"
+       (list (string<= "xabc" "abc" :start1 1) (string>= "xabc" "yabc" :start1 1 :start2 1))
+       '(4 4))
+(check "any single escape works inside a string"
+       (let ((*readtable* (copy-readtable nil)))
+         (set-syntax-from-char #\z #\\)
+         (read-from-string "\"az\"\""))
+       "a\"")
+
+;;; Printer
+(check "with-standard-io-syntax restores the pprint dispatch table"
+       (let ((*print-pprint-dispatch* (copy-pprint-dispatch nil)))
+         (set-pprint-dispatch 'symbol (lambda (s o) (declare (ignore o)) (write-string "FOO" s)))
+         (list (let ((*print-pretty* t)) (princ-to-string 'bar))
+               (with-standard-io-syntax (let ((*print-pretty* t)) (princ-to-string 'bar)))))
+       '("FOO" "BAR"))
+(defvar *cs4-params* nil)
+(defun cs4-slash (stream arg colon at &rest params)
+  (declare (ignore stream arg colon at))
+  (setq *cs4-params* params))
+(check "~/ passes character and every parameter"
+       (progn (format nil "~'X,2,3,4,5,6/cs4-slash/" 1) *cs4-params*)
+       '(#\X 2 3 4 5 6))
+(check "pprint-fill of a circular list"
+       (let ((*print-pretty* t) (*print-circle* t) (*print-right-margin* 100))
+         (with-output-to-string (s)
+           (pprint-fill s (let ((x (list 'a))) (setf (cdr x) x) x))))
+       "#1=(A . #1#)")
+
+;;; Types
+(check "type-of a positive bignum is an unsigned-byte type"
+       (list (subtypep (type-of (expt 2 70)) 'unsigned-byte)
+             (subtypep (type-of (expt 2 70)) 'bignum))
+       '(t t))
+(check "a fill-pointered vector is not a simple-array"
+       (typep (make-array 3 :fill-pointer 2) 'simple-array)
+       nil)
+
+(format t "~&cl-semantics-4: ~d checks, ~d failed~%" *checks* *fails*)
+(when (and (> *fails* 0) (fboundp (quote sys-exit))) (funcall (quote sys-exit) 1))

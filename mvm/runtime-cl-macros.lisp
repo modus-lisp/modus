@@ -518,8 +518,8 @@
                 (if (not (listp ,lv))
                     (write ,lv :stream ,sv)
                     (let ((,sym (%pprint-lb-begin ,sv ,lv ,(getf kw :prefix) ,(getf kw :per-line-prefix))))
-                      (catch :%pp-tag ,@body)
-                      (%pprint-lb-end ,sym ,(getf kw :suffix)))))
+                      (unwind-protect (catch :%pp-tag ,@body)
+                        (%pprint-lb-end ,sym ,(getf kw :suffix))))))
             nil)))"
 
     "(defmacro pprint-pop () '(%pprint-pop-fn))"

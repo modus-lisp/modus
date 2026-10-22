@@ -4367,13 +4367,13 @@
 
 (defvar least-negative-double-float -5.0d-324)
 
-(defvar least-positive-single-float 1.4d-45)
+(defvar least-positive-single-float (%round-to-single 1.4d-45))
 
-(defvar least-negative-single-float -1.4d-45)
+(defvar least-negative-single-float (%round-to-single -1.4d-45))
 
-(defvar least-positive-short-float 1.4d-45)
+(defvar least-positive-short-float (%round-to-single 1.4d-45))
 
-(defvar least-negative-short-float -1.4d-45)
+(defvar least-negative-short-float (%round-to-single -1.4d-45))
 
 (defvar least-positive-long-float 5.0d-324)
 
@@ -4383,13 +4383,13 @@
 
 (defvar least-negative-normalized-double-float -2.2250738585072014d-308)
 
-(defvar least-positive-normalized-single-float 1.1754944d-38)
+(defvar least-positive-normalized-single-float (%round-to-single 1.1754944d-38))
 
-(defvar least-negative-normalized-single-float -1.1754944d-38)
+(defvar least-negative-normalized-single-float (%round-to-single -1.1754944d-38))
 
-(defvar least-positive-normalized-short-float 1.1754944d-38)
+(defvar least-positive-normalized-short-float (%round-to-single 1.1754944d-38))
 
-(defvar least-negative-normalized-short-float -1.1754944d-38)
+(defvar least-negative-normalized-short-float (%round-to-single -1.1754944d-38))
 
 (defvar least-positive-normalized-long-float 2.2250738585072014d-308)
 
@@ -4519,7 +4519,31 @@
              (equal result-type (type-of object)))
     (return-from coerce object))
   (setq result-type (%coerce-expand-type result-type))
+  ;; OR / AND / NOT name no one sequence type to build: an object already of
+  ;; the type is returned, anything else is a TYPE-ERROR (COERCE.ERROR.10
+  ;; got its list back unchanged).
+  (when (and (consp result-type) (member (car result-type) '(or and not)))
+    (return-from coerce
+      (if (typep object result-type)
+          object
+          (error 'type-error :datum object :expected-type result-type))))
   (when (%seq-type-u8-p result-type) (return-from coerce (%seq-u8-copy object)))
+  ;; (COMPLEX <float type>): a real becomes a complex of that format with a
+  ;; zero imaginary part, a complex has its parts converted (SBCL; the
+  ;; upstream ACOSH.3/ASINH.3/ATANH.3 build their zeros this way).
+  (when (and (consp result-type) (eq (car result-type) 'complex)
+             (consp (cdr result-type))
+             (member (cadr result-type)
+                     '(float short-float single-float double-float long-float))
+             (numberp object))
+    (let ((proto (if (member (cadr result-type) '(double-float long-float)) 1d0 1.0)))
+      (return-from coerce
+        (if (%complex-p object)
+            (%make-float-complex (float (realpart object) proto)
+                                 (float (imagpart object) proto))
+            (if (realp object)
+                (%make-float-complex (float object proto) (float 0 proto))
+                (progn (%signal-type-error) nil))))))
   (let* ((orig-type result-type)
          ;; Explicit length from a compound array/vector/string spec like
          ;; (vector * 4) / (simple-string 5) — third element (or second for
@@ -4903,28 +4927,59 @@
 
 ;; Strict 1-arg arity (CLHS): (atanh), (atanh 1.0 1.0) etc. signal
 ;; PROGRAM-ERROR.  The &rest extra guard mirrors integerp/isqrt above.
+(defun %make-float-complex (r i)
+  "A complex with float parts R and I, never collapsed to a real."
+  (let ((c (make-array 3)))
+    (aset c 0 '%complex-marker)
+    (aset c 1 r)
+    (aset c 2 i)
+    c))
+
+(defun %complex-in-format (w z)
+  "W (a number) as a complex in the float format of complex Z's parts."
+  (let ((proto (realpart z)))
+    (%make-float-complex (float (realpart w) proto) (float (imagpart w) proto))))
+
+(defun %complex-zero-p (z)
+  (and (zerop (realpart z)) (zerop (imagpart z))))
+
 (defun atanh (x &rest extra)
   "Inverse hyperbolic tangent."
   ;; atanh(x) = 0.5 * ln((1+x)/(1-x))
   (if extra
       (%program-error "atanh requires exactly 1 argument")
-      (* 0.5 (log (/ (+ 1.0 (float x)) (- 1.0 (float x)))))))
+      (if (complexp x)
+          ;; CLHS 12.2: (log(1+z) - log(1-z))/2, a complex of Z's format
+          (if (%complex-zero-p x)
+              x
+              (%complex-in-format (/ (- (log (+ 1 x)) (log (- 1 x))) 2) x))
+          (* 0.5 (log (/ (+ 1.0 (float x)) (- 1.0 (float x))))))))
 
 (defun asinh (x &rest extra)
   "Inverse hyperbolic sine."
   ;; asinh(x) = ln(x + sqrt(x^2 + 1))
   (if extra
       (%program-error "asinh requires exactly 1 argument")
-      (let ((fx (float x)))
-        (log (+ fx (sqrt (+ (* fx fx) 1.0)))))))
+      (if (complexp x)
+          (if (%complex-zero-p x)
+              x
+              (%complex-in-format (log (+ x (sqrt (+ 1 (* x x))))) x))
+          (let ((fx (float x)))
+            (log (+ fx (sqrt (+ (* fx fx) 1.0))))))))
 
 (defun acosh (x &rest extra)
   "Inverse hyperbolic cosine."
   ;; acosh(x) = ln(x + sqrt(x^2 - 1))
   (if extra
       (%program-error "acosh requires exactly 1 argument")
-      (let ((fx (float x)))
-        (log (+ fx (sqrt (- (* fx fx) 1.0)))))))
+      (if (complexp x)
+          ;; CLHS 12.2: 2 log(sqrt((z+1)/2) + sqrt((z-1)/2))
+          (if (and (= (realpart x) 1) (zerop (imagpart x)))
+              (%make-float-complex (float 0 (realpart x)) (float 0 (realpart x)))
+              (%complex-in-format
+               (* 2 (log (+ (sqrt (/ (+ x 1) 2)) (sqrt (/ (- x 1) 2))))) x))
+          (let ((fx (float x)))
+            (log (+ fx (sqrt (- (* fx fx) 1.0))))))))
 
 ;; conjugate lives in cl-sequences.lisp — the stub here returned the
 ;; arg unchanged and shadowed the real implementation that handles
@@ -5011,7 +5066,8 @@
 (defun sinh (x &rest extra)
   (if extra
       (%program-error "sinh requires exactly 1 argument")
-      (cond ((and (integerp x) (= x 0)) 0)
+      (cond ((complexp x) (%complex-in-format (/ (- (exp x) (exp (- x))) 2) x))
+            ((and (integerp x) (= x 0)) 0)
             (t (let* ((xf (%any-to-float x))
                       (ep (%exp-f xf))
                       (em (%exp-f (%float-neg xf))))
@@ -5020,7 +5076,8 @@
 (defun cosh (x &rest extra)
   (if extra
       (%program-error "cosh requires exactly 1 argument")
-      (cond ((and (integerp x) (= x 0)) 1)
+      (cond ((complexp x) (%complex-in-format (/ (+ (exp x) (exp (- x))) 2) x))
+            ((and (integerp x) (= x 0)) 1)
             (t (let* ((xf (%any-to-float x))
                       (ep (%exp-f xf))
                       (em (%exp-f (%float-neg xf))))
@@ -5029,7 +5086,8 @@
 (defun tanh (x &rest extra)
   (if extra
       (%program-error "tanh requires exactly 1 argument")
-      (cond ((and (integerp x) (= x 0)) 0)
+      (cond ((complexp x) (%complex-in-format (let ((ep (exp x)) (em (exp (- x)))) (/ (- ep em) (+ ep em))) x))
+            ((and (integerp x) (= x 0)) 0)
             ;; a float zero is its own tanh (-0.0 stays -0.0); past |x| = 22
             ;; tanh is +-1 to double precision, and exp(x)/exp(x) would be
             ;; inf/inf = NaN.
@@ -5361,14 +5419,18 @@
      (cond ((or (eql obj 0) (eql obj 1)) 'bit)
            ((> obj 0) (list 'integer 0 most-positive-fixnum))
            (t 'fixnum)))
-    ((bignump obj)     'bignum)
+    ;; a positive bignum is an UNSIGNED-BYTE too, so its type must say so
+    ;; (SBCL: (INTEGER 4611686018427387904)); a negative one stays BIGNUM
+    ((bignump obj)     (if (> obj 0) (list 'integer (+ most-positive-fixnum 1)) 'bignum))
     ((ratiop obj)      'ratio)
     ((floatp-impl obj) (%float-declared-type obj))  ; declared float type (numeric tower N1)
     ((%complex-p obj)  'complex)
     ((characterp obj)
      ;; standard-char for the printing ASCII range, else character.
      (let ((code (char-code obj)))
-       (if (and (>= code 32) (< code 127)) 'standard-char 'character)))
+       ;; every character here is a BASE-CHAR (TYPEP agrees), so the others
+       ;; say BASE-CHAR rather than CHARACTER (TYPE-OF.1)
+       (if (or (and (>= code 32) (< code 127)) (= code 10)) 'standard-char 'base-char)))
     ;; A STRING is a vector of CHARACTER (CLHS 16.1): (SIMPLE-ARRAY CHARACTER (n)),
     ;; or (VECTOR CHARACTER *) when it has a fill pointer or is adjustable -- not
     ;; SIMPLE-BASE-STRING for every string, which called a fill-pointer string
@@ -5381,7 +5443,9 @@
          (list 'simple-array 'character (list (length obj)))
          (list 'vector 'character '*)))
     ((%generic-function-p obj) 'standard-generic-function)
-    ((functionp obj) 'function)
+    ;; every function here is compiled (COMPILED-FUNCTION-P is FUNCTIONP),
+    ;; so that is its type (SBCL; TYPE-OF.1)
+    ((functionp obj) 'compiled-function)
     ;; Packages, readtables, random states and streams are tagged conses
     ;; underneath: ask for them before CONSP claims them.
     ((packagep obj) 'package)
@@ -5559,7 +5623,8 @@
          ((eq tn 'simple-base-string) (simple-string-p obj))
          ((eq tn 'character) (characterp obj))
          ((eq tn 'base-char) (characterp obj))
-         ((eq tn 'standard-char) (characterp obj))
+         ;; the 96 standard characters only (STANDARD-CHAR.5)
+         ((eq tn 'standard-char) (and (characterp obj) (standard-char-p obj)))
          ((eq tn 'atom) (not (%cl-cons-p obj)))
          ((eq tn 't) t)
          ((eq tn 'nil) nil)
@@ -5570,7 +5635,14 @@
          ;; A COMPLEX is a marked 3-slot vector underneath (%COMPLEX-P), so the
          ;; ARRAYP intrinsic says yes; it is a NUMBER, never an ARRAY (CLHS 4.2.2).
          ((eq tn 'array)         (%typep-array-obj-p obj))
-         ((eq tn 'simple-array)  (%typep-array-obj-p obj))
+         ;; not a fill-pointered or displaced one (TYPE-OF.1).  Not judged by
+         ;; TYPE-OF: a MAKE-ARRAY string with no initial contents is a
+         ;; wrapper TYPE-OF calls (VECTOR CHARACTER *), and it is simple
+         ;; (MAKE-ARRAY.5A).
+         ((eq tn 'simple-array)
+          (and (%typep-array-obj-p obj)
+               (not (array-has-fill-pointer-p obj))
+               (null (array-displacement obj))))
          ;; VECTOR is rank 1: a 0-d or multi-dimensional array is not one
          ;; (upstream VECTOR.TYPE.7/.8, VECTOR-AS-CLASS.8-11, ARRAY-RANK.2).
          ((eq tn 'vector)        (and (%typep-array-obj-p obj)

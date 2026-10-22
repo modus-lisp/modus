@@ -2160,7 +2160,7 @@
                          standard-generic-function))
            (eq super 'function))
       (and (member sub '(generic-function standard-generic-function))
-           (eq super 'generic-function))
+           (member super '(generic-function compiled-function)))
       ;; Stream family
       (and (member sub '(file-stream broadcast-stream concatenated-stream
                          echo-stream string-stream synonym-stream
@@ -2266,6 +2266,14 @@
           (or (and (consp (cdr t1)) (null (cadr t1)))
               (and (consp (cdr t1)) (consp (cddr t1)) (null (caddr t1)))))
      (cons t t))
+    ;; An integer interval wholly outside the fixnum range is a BIGNUM type:
+    ;; TYPE-OF of a positive bignum is (INTEGER 4611686018427387904)
+    ;; (TYPE-OF.1).
+    ((and (eq t2 'bignum) (not (eq t1 'bignum)) (%integer-type-bounds t1))
+     (let* ((b (%integer-type-bounds t1)) (lo (car b)) (hi (cadr b)))
+       (cons (or (and (integerp lo) (> lo most-positive-fixnum))
+                 (and (integerp hi) (< hi most-negative-fixnum)))
+             t)))
     ;; CLOS class OBJECTS are type specifiers (CLHS 4.2.3): unwrap to the
     ;; registered NAME symbol (slot 1) and recurse.  uiop's coerce-class
     ;; calls (subtypep (find-class 'load-op) (find-class 'operation)) —

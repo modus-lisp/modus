@@ -1028,6 +1028,9 @@
   (when (and env-arg (cdr env-arg))
     (%signal-program-error))
   (cond
+    ;; A symbol macro of the environment a MACROLET expander was handed.
+    ((and (symbolp form) form (%symbol-macro-env-lookup form (car env-arg)))
+     (values (cadr (%symbol-macro-env-lookup form (car env-arg))) t))
     ;; Recognise CL syms AND native MVM #x50 syms as macro heads.
     ((and (consp form)
           (or (%cl-sym-p (car form))
@@ -1068,11 +1071,26 @@
         (let ((mf (if (and (consp cur) (%cl-sym-p (car cur)))
                       (macro-function (car cur))
                       nil)))
+          (when (and (symbolp cur) cur (%symbol-macro-env-lookup cur (car env-arg)))
+            (setq cur (cadr (%symbol-macro-env-lookup cur (car env-arg))))
+            (setq any t)
+            (setq mf :again))
+          (if (eq mf :again)
+              nil
           (if mf
               (progn
                 (setq cur (funcall mf cur nil))
                 (setq any t))
-              (return (values cur any))))))))
+              (return (values cur any)))))))))
+
+(defun %symbol-macro-env-lookup (sym env)
+  "The (NAME EXPANSION) entry for SYM in ENV when ENV is the environment a
+   MACROLET expander received inside SYMBOL-MACROLET, else NIL."
+  (and (consp env) (eq (car env) :%symbol-macro-env)
+       (let ((hit nil))
+         (dolist (b (cdr env) hit)
+           (when (and (null hit) (consp b) (eq (car b) sym))
+             (setq hit b))))))
 
 ;;; ============================================================
 ;;; Eval global variable table
@@ -2420,7 +2438,9 @@
          (bounds (%parse-str-cmp-bounds args))
          (s1 (car bounds))
          (e1 (or (cadr bounds) (array-length sa))))
-    (- e1 s1)))
+    ;; the mismatch index is in STRING1's coordinates, so equal slices
+    ;; answer END1, not the slice length (RANDOM-STRING-COMPARISON-TESTS)
+    (and s1 e1)))
 (defun string<= (a b &rest args)
   (let ((r (%str-cmp-core a b args nil)))
     (cond ((eq (car r) :less) (cadr r))
@@ -2488,7 +2508,10 @@
 (defun alphanumericp (c) (if (or (alpha-char-p c) (digit-char-p c)) t nil))
 (defun graphic-char-p (c)
   (unless (characterp c) (%signal-type-error))
-  (let ((code (%ensure-char-code c))) (and (>= code 32) (<= code 126))))
+  ;; Printing characters are 32..126 and everything from 160 up; the C0 and
+  ;; C1 controls and Rubout are not (as in SBCL).
+  (let ((code (%ensure-char-code c)))
+    (or (and (>= code 32) (<= code 126)) (>= code 160))))
 ;;; CLHS standard-char-p: true for #\Newline and #\Space..#\~.  Newline
 ;;; (code 10) is explicitly standard even though it's not "graphic".
 (defun standard-char-p (c)
@@ -2520,25 +2543,44 @@
       ((string= s "NUL")       (code-char 0))
       ((string= s "ESCAPE")    (code-char 27))
       ((string= s "DELETE")    (code-char 127))
-      (t nil))))
+      ;; every name CHAR-NAME gives
+      (t (let ((i 0) (hit nil))
+           (loop
+             (when (or hit (>= i 160)) (return hit))
+             (let ((n (%code-char-name i)))
+               (when (and n (string-equal n s)) (setq hit (code-char i))))
+             (setq i (+ i 1))))))))
+
+(defun %code-char-name (code)
+  "The name of the character with CODE, or NIL.  Every non-graphic
+   character has one (CLHS 13.1.7; FORMAT.C.4A needs ~:C = CHAR-NAME for
+   each): the control characters get their ASCII mnemonics as SBCL spells
+   them, and 128..159 are U80..U9F."
+  (cond
+    ((= code 32)  "Space")
+    ((= code 10)  "Newline")
+    ((= code 9)   "Tab")
+    ((= code 13)  "Return")
+    ((= code 8)   "Backspace")
+    ((= code 127) "Rubout")
+    ((= code 12)  "Page")
+    ((= code 27)  "Escape")
+    ((= code 7)   "Bel")
+    ((= code 0)   "Null")
+    ((< code 32)
+     (nth code '("Null" "Soh" "Stx" "Etx" "Eot" "Enq" "Ack" "Bel" "Backspace"
+                 "Tab" "Newline" "Vt" "Page" "Return" "So" "Si" "Dle" "Dc1"
+                 "Dc2" "Dc3" "Dc4" "Nak" "Syn" "Etb" "Can" "Em" "Sub" "Escape"
+                 "Fs" "Gs" "Rs" "Us")))
+    ((and (>= code 128) (< code 160))
+     (concatenate 'string "U" (string-upcase (write-to-string code :base 16 :radix nil))))
+    (t nil)))
 
 (defun char-name (c)
   "Return the name of the character, or nil.  Signals TYPE-ERROR on
    non-character per CLHS — required by char-name.5 (char-type-error-check)."
   (unless (characterp c) (%signal-type-error))
-  (let ((code (%ensure-char-code c)))
-    (cond
-      ((= code 32)  "Space")
-      ((= code 10)  "Newline")
-      ((= code 9)   "Tab")
-      ((= code 13)  "Return")
-      ((= code 8)   "Backspace")
-      ((= code 127) "Rubout")
-      ((= code 12)  "Page")
-      ((= code 27)  "Escape")
-      ((= code 7)   "Bel")
-      ((= code 0)   "Null")
-      (t nil))))
+  (%code-char-name (%ensure-char-code c)))
 
 ;; Char comparisons are variadic per CLHS — single-arg returns T,
 ;; multi-arg checks pairwise.  Tests like (CHAR= (progn (incf i) #\a))

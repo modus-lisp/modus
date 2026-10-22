@@ -3869,7 +3869,15 @@
     (let* ((bindings (append
                       (when (and whole-var (symbolp whole-var))
                         (list (list whole-var 'form)))
-                      (when env-var (list (list env-var nil)))))
+                      ;; In the image the environment carries the enclosing
+                      ;; SYMBOL-MACROLET bindings, so MACROEXPAND with it
+                      ;; expands them (MACROLET.13/14).  The host build keeps
+                      ;; NIL: SBCL's MACROEXPAND would not take this object.
+                      (when env-var
+                        (list (list env-var
+                                    (if (and sym-macros *mvm-eval-runtime-p*)
+                                        (list 'quote (cons :%symbol-macro-env sym-macros))
+                                        nil))))))
            (db-form `(destructuring-bind (,@rest-params) (cdr form)
                        ,@mbody)))
       ;; &WHOLE destructuring pattern: bind the pattern against the whole

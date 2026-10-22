@@ -954,9 +954,8 @@
                ((= code 12)  (%print-string-raw "Page" stream))
                ((= code 8)   (%print-string-raw "Backspace" stream))
                ;; BEL (Altmode is ESC, code 27; PRINT.CHAR.7)
-               ((= code 7)   (%print-string-raw "Bel" stream))
-               ((= code 127) (%print-string-raw "Rubout" stream))
-               ((= code 0)   (%print-string-raw "Null" stream))
+               ((%code-char-name code)
+                (%print-string-raw (%code-char-name code) stream))
                (t (%print-char code stream))))
            (%print-char (char-code obj) stream)))
       ;; Float
@@ -2093,6 +2092,12 @@
                         (not (symbol-value '*print-readably*)))
                    (write-string "..." stream)
                    (throw :%pp-tag nil))
+                  ;; the rest of the list is a labelled (shared) object:
+                  ;; ". #n#" or ". #n=(...)" (CLHS PPRINT-POP; PPRINT-FILL.14)
+                  ((and (> cnt 0) (consp lst) (%circ-tail-labelled-p lst))
+                   (write-string ". " stream)
+                   (%write-obj lst stream nil t)
+                   (throw :%pp-tag nil))
                   (t
                    (aset st 1 (cdr lst))
                    (aset st 2 (+ cnt 1))
@@ -2175,7 +2180,8 @@
   (%pp-check-string prefix)
   (%pp-check-string per-line-prefix)
   (let* ((s (%resolve-output-stream stream))
-         (rec (%ppx-current s)))
+         (rec (%ppx-current s))
+         (outer (null rec)))
     (when (null rec)
       (setq rec (make-array 5))
       (aset rec 0 s)
@@ -2184,19 +2190,48 @@
       (aset rec 3 0)
       (aset rec 4 (or (%stream-column s) 0))
       (setq *%ppx-stack* (cons rec *%ppx-stack*)))
-    (%ppx-record rec (list :start (%ppx-simple prefix) (%ppx-simple per-line-prefix)))
-    (aset rec 3 (+ (aref rec 3) 1))
-    (let ((st (make-array 4)))
-      (aset st 0 (aref rec 1))
-      (aset st 1 obj)
-      (aset st 2 0)
-      (aset st 3 (%pp-list-arg-p obj))
-      (setq *%pp-ctx* (cons st *%pp-ctx*)))
+    ;; *PRINT-CIRCLE* (CLHS 22.1.3): a block that is not inside a printing
+    ;; call starts the scan itself, and a shared block object is written
+    ;; with its #n= label (PPRINT-FILL.14, FORMAT.LOGICAL-BLOCK.CIRCLE.3).
+    (let ((owns nil))
+      (when (and (symbol-value '*print-circle*) (null *%circ-table*)
+                 (%circ-labelable-p obj))
+        (let ((scan (make-hash-table :test 'eq)))
+          (%circ-scan obj scan 0)
+          (setq owns *%circ-next*)
+          (setq *%circ-next* 0)
+          (setq *%circ-table* scan)))
+      (when (and *%circ-table* (consp obj) (eq (gethash obj *%circ-table*) :shared))
+        (let ((n (+ *%circ-next* 1)))
+          (setq *%circ-next* n)
+          (setf (gethash obj *%circ-table*) n)
+          ;; the outermost block's layout starts at its :START, so the label
+          ;; goes straight to the real stream ahead of it
+          (let ((out (if outer s (aref rec 1))))
+            (write-char-to-stream (code-char 35) out)
+            (%print-integer-in-base n 10 out)
+            (write-char-to-stream (code-char 61) out))))
+      (%ppx-record rec (list :start (%ppx-simple prefix) (%ppx-simple per-line-prefix)))
+      (aset rec 3 (+ (aref rec 3) 1))
+      (let ((st (make-array 5)))
+        (aset st 0 (aref rec 1))
+        (aset st 1 obj)
+        (aset st 2 0)
+        (aset st 3 (%pp-list-arg-p obj))
+        ;; the *%CIRC-NEXT* to restore when this block made the table
+        (aset st 4 (if owns (list owns) nil))
+        (setq *%pp-ctx* (cons st *%pp-ctx*))))
     (aref rec 1)))
 
 (defun %pp-end (cap suffix)
   (%pp-check-string suffix)
-  (when *%pp-ctx* (setq *%pp-ctx* (cdr *%pp-ctx*)))
+  (when *%pp-ctx*
+    (let ((st (car *%pp-ctx*)))
+      ;; this block started the *PRINT-CIRCLE* scan: end it
+      (when (and (arrayp st) (> (length st) 4) (consp (aref st 4)))
+        (setq *%circ-table* nil)
+        (setq *%circ-next* (car (aref st 4)))))
+    (setq *%pp-ctx* (cdr *%pp-ctx*)))
   (let ((rec (%ppx-current cap)))
     (when rec
       (%ppx-record rec (list :end (%ppx-simple suffix)))
@@ -4258,6 +4293,8 @@
             (let ((pos (+ i 1))
                   (param1 nil) (param2 nil) (param3 nil) (param4 nil)
                   (param5 nil) (param6 nil) (param7 nil)
+                  ;; every parameter, 'c ones as CHARACTERS: what ~/ passes
+                  (all-params nil) (char-idxs nil)
                   (colonp nil) (atp nil))
               ;; Parse parameters (comma-separated integers or v/V/# placeholders)
               (let ((params nil) (pcount 0))
@@ -4285,6 +4322,7 @@
                       ((= c 39)  ; '
                        (setq pos (+ pos 1))
                        (when (< pos len)
+                         (setq char-idxs (cons pcount char-idxs))
                          (setq params (cons (%prim-aref control pos) params))
                          (setq pos (+ pos 1))
                          (setq pcount (+ pcount 1)))
@@ -4315,7 +4353,14 @@
                 (setq param4 (if (>= pcount 4) (nth 3 params) nil))
                 (setq param5 (if (>= pcount 5) (nth 4 params) nil))
                 (setq param6 (if (>= pcount 6) (nth 5 params) nil))
-                (setq param7 (if (>= pcount 7) (nth 6 params) nil)))
+                (setq param7 (if (>= pcount 7) (nth 6 params) nil))
+                (let ((k 0))
+                  (dolist (p params)
+                    (setq all-params
+                          (cons (if (and (integerp p) (member k char-idxs)) (code-char p) p)
+                                all-params))
+                    (setq k (+ k 1))))
+                (setq all-params (nreverse all-params)))
               ;; Parse modifiers : and @
               (loop
                 (when (>= pos len) (return nil))
@@ -4488,8 +4533,9 @@
                             ((= code 13)  (%print-string-raw "Return" stream))
                             ((= code 12)  (%print-string-raw "Page" stream))
                             ((= code 8)   (%print-string-raw "Backspace" stream))
-                            ((= code 127) (%print-string-raw "Rubout" stream))
-                            ((= code 0)   (%print-string-raw "Null" stream))
+                            ((and (or (< code 32) (and (> code 126) (< code 160)))
+                                  (%code-char-name code))
+                             (%print-string-raw (%code-char-name code) stream))
                             (t (%print-char code stream))))
                          ;; ~@C: #\Name style
                          (atp
@@ -4501,8 +4547,9 @@
                             ((= code 13)  (%print-string-raw "Return" stream))
                             ((= code 12)  (%print-string-raw "Page" stream))
                             ((= code 8)   (%print-string-raw "Backspace" stream))
-                            ((= code 127) (%print-string-raw "Rubout" stream))
-                            ((= code 0)   (%print-string-raw "Null" stream))
+                            ((and (or (< code 32) (and (> code 126) (< code 160)))
+                                  (%code-char-name code))
+                             (%print-string-raw (%code-char-name code) stream))
                             (t (%print-char code stream))))
                          ;; Plain ~C: print char
                          (t (%print-char code stream))))))
@@ -4942,7 +4989,7 @@
                      (setq arg-list
                            (%format-call-user-fn stream control fn-start fn-end
                                                  arg-list colonp atp
-                                                 (list param1 param2 param3 param4 param5)))))
+                                                 all-params))))
                   ;; Unknown directive
                   (t
                    (%print-char 126 stream)

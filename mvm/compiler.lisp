@@ -25335,7 +25335,20 @@
         ;; Extended ladder: nargs = req+1 .. req+32.  The trap above
         ;; caps at 32 total args, so max-k = 32 - req (no separate
         ;; min — let req=0 funcs use the full 32 cases).
-        (let ((max-k (- 32 req))
+        ;; ONLY THE SHORTEST CASES UNROLLED.  The ladder used to run to
+        ;; req+32, and case k is k conses: 528 conses, ~6,300 aarch64
+        ;; instructions (~25 KB) in EVERY &rest function -- measured on a
+        ;; Zero core, 173,080 conses in 328 functions, nearly half of all its
+        ;; native code.  The loop below does any count (slot i holds arg i
+        ;; for every i < 64, the #x0530 trap above having copied the overflow
+        ;; arguments), so only two cases stay unrolled.
+        ;; RUNTIME COMPILES ONLY, for now: an image BUILT this way restarts in
+        ;; a loop early in boot (QEMU raspi3b, 2026-10-22; cause not found --
+        ;; the same loop is right for 40 arguments in runtime-compiled code,
+        ;; interpreted and native).  The image keeps its ladder; every
+        ;; library loaded into it gets the loop, which is where a Zero
+        ;; core's code is.  Not a DEFVAR: its init does not run in-image.
+        (let ((max-k (if *mvm-eval-runtime-p* (min (- 32 req) 2) (- 32 req)))
               (cases nil))
           (loop for k from max-k downto 1
                 do (push k cases))

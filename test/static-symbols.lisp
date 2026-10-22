@@ -64,9 +64,17 @@
     (dotimes (i 400000) (push (make-list 4) keep) (when (> (length keep) 1000) (setq keep nil)))
     keep))
 
+;; Churn until collections HAPPEN rather than a fixed amount: how much a fixed
+;; loop allocates moves with the compiler (it once collected; after the
+;; allocation fast paths it allocated too little to, and every check passed
+;; vacuously).  At least three rounds, each ending past a collection.
 (ss-check 0)
 (let ((e0 (%gc-epoch)))
-  (dotimes (r 5) (ss-churn) (ss-check (+ r 1)))
+  (dotimes (r 3)
+    (let ((e (%gc-epoch)) (n 0))
+      (loop (ss-churn) (setq n (+ n 1))
+            (when (or (/= (%gc-epoch) e) (> n 200)) (return))))
+    (ss-check (+ r 1)))
   (format t "~&static-symbols: collections ~D~%" (- (%gc-epoch) e0))
   (ss 'collected (> (%gc-epoch) e0) t))
 (format t "~&static-symbols: ~D failure(s)~%" *ss-fail*)

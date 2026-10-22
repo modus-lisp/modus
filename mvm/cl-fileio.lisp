@@ -576,6 +576,10 @@
     ;; we let the underlying syscall path's error path handle it below.
     (when (handler-case (wild-pathname-p filespec) (t (c) nil))
       (error 'file-error :pathname filespec))
+    ;; A file stream names its file (upstream OPEN.IO.30 opens one).
+    (when (streamp filespec)
+      (let ((p (%file-stream-path filespec)))
+        (when p (setq filespec p))))
     (let ((path (%resolve-path filespec)))
       ;; Determine open flags based on direction and options.
       ;; All "file does not exist + :error" and "file exists + :error" /
@@ -664,10 +668,25 @@
                 ((null if-exists) nil)
                 ((or (eq if-exists :error) (eq if-exists :new-version))
                  (error 'file-error :pathname filespec))
+                ;; A NEW file, as :DIRECTION :OUTPUT gives one: it used to
+                ;; open the old contents for update (upstream OPEN.IO.21-26
+                ;; read "wxyzefghij" back after writing "wxyz").
+                ((or (eq if-exists :supersede) (eq if-exists :rename)
+                     (eq if-exists :rename-and-delete))
+                 (let ((tfd (%sys-open-wronly path)))   ; O_CREAT|O_TRUNC
+                   (when (>= tfd 0) (%sys-close tfd)))
+                 (let ((fd (%sys-open-rdwr path)))
+                   (if (< fd 0)
+                       (error 'file-error :pathname filespec)
+                       (%make-file-stream-full fd 2 element-type))))
                 (t (let ((fd (%sys-open-rdwr path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 2 element-type))))))
+                         (let ((st (%make-file-stream-full fd 2 element-type)))
+                           ;; :APPEND: the file position starts at the end
+                           (when (eq if-exists :append)
+                             (file-position st (file-length st)))
+                           st))))))
              (t
               (cond
                 ((null if-does-not-exist) nil)
@@ -1860,9 +1879,11 @@
 
 ;;; --- probe-file ---
 (defun probe-file (x)
-  "Return truename if file exists, nil otherwise."
+  "The file's TRUENAME -- an absolute pathname, links followed -- when it
+   exists, else NIL.  (It answered the argument's relative namestring, a
+   string: upstream PROBE-FILE.2/3/5, RENAME-FILE.*.)"
   (let ((path (%resolve-path (pathname x))))
-    (if (%sys-stat-exists path) path nil)))
+    (if (%sys-stat-exists path) (truename x) nil)))
 
 ;;; --- truename ---
 (defun %sys-getcwd ()
@@ -1987,13 +2008,19 @@
 
 ;;; --- rename-file ---
 (defun rename-file (old new)
-  "Rename a file. Returns (values new-truename old-truename new-truename)."
-  (let ((old-path (%resolve-path (pathname old)))
-        (new-path (%resolve-path (pathname new))))
+  "CLHS RENAME-FILE: NEW is merged with OLD for its missing components, and the
+   values are that defaulted name, OLD's truename and the new truename -- all
+   pathnames (they were the resolved strings, and NEW was not merged, so a
+   NEW with no type lost OLD's)."
+  (let* ((old-pn (pathname old))
+         (old-true (truename old-pn))
+         (defaulted (merge-pathnames (pathname new) old-pn))
+         (old-path (%resolve-path old-pn))
+         (new-path (%resolve-path defaulted)))
     (let ((ret (%sys-rename old-path new-path)))
       (if (< ret 0)
-          (error "Cannot rename ~A to ~A" old-path new-path)
-          (values new-path old-path new-path)))))
+          (error 'file-error :pathname old)
+          (values defaulted old-true (truename defaulted))))))
 
 ;;; --- ensure-directories-exist ---
 (defun ensure-directories-exist (pathspec &rest args)

@@ -1462,7 +1462,11 @@
 
 (defun find-all-symbols (name)
   "Find all symbols with NAME in all packages."
-  (let ((name-str (%pkg-string-designator name))
+  ;; T and NIL are string designators for "T" and "NIL" (they answered NIL
+  ;; through %PKG-STRING-DESIGNATOR; upstream FIND-ALL-SYMBOLS.1)
+  (let ((name-str (if (and (symbolp name) (or (null name) (eq name t)))
+                      (symbol-name name)
+                      (%pkg-string-designator name)))
         (result nil))
     (dolist (pkg *all-packages*)
       (when (%pkg-name pkg)

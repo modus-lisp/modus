@@ -25341,14 +25341,15 @@
         ;; Zero core, 173,080 conses in 328 functions, nearly half of all its
         ;; native code.  The loop below does any count (slot i holds arg i
         ;; for every i < 64, the #x0530 trap above having copied the overflow
-        ;; arguments), so only two cases stay unrolled.
-        ;; RUNTIME COMPILES ONLY, for now: an image BUILT this way restarts in
-        ;; a loop early in boot (QEMU raspi3b, 2026-10-22; cause not found --
-        ;; the same loop is right for 40 arguments in runtime-compiled code,
-        ;; interpreted and native).  The image keeps its ladder; every
-        ;; library loaded into it gets the loop, which is where a Zero
-        ;; core's code is.  Not a DEFVAR: its init does not run in-image.
-        (let ((max-k (if *mvm-eval-runtime-p* (min (- 32 req) 2) (- 32 req)))
+        ;; arguments), so only two cases stay unrolled -- three in an IMAGE
+        ;; build.  An image built with two restarts in a loop early in boot
+        ;; (QEMU raspi3b, 2026-10-22), while one built with three boots and
+        ;; gets every count 0..40 right through APPLY of VECTOR / APPEND / MAX
+        ;; -- and the loop reads a subset of the same slots in the failing
+        ;; case, so this looks like a latent layout-sensitive bug elsewhere,
+        ;; not the loop.  (Runtime-compiled code: every count 0..35 right,
+        ;; interpreted and native.)  Not a DEFVAR: its init does not run in-image.
+        (let ((max-k (min (- 32 req) (if *mvm-eval-runtime-p* 2 3)))
               (cases nil))
           (loop for k from max-k downto 1
                 do (push k cases))

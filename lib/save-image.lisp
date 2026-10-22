@@ -73,6 +73,12 @@
    layout's :JIT-ARENA-BASE).  Arch builds without one override to 0."
   (%layout :jit-arena-base #x3000000000))
 
+(defun %core-jit-arena-hi ()
+  "End of the JIT exec arena: code grows up from its base, data pages
+   (mvm-eval.lisp %JIT-DATA-PAGE) down from here.  Hosted reserves 512 MB;
+   a board's arena is the fixed region it has (the Pi overrides)."
+  (+ (%core-jit-arena-lo) #x20000000))
+
 (defun %core-jit-bump-slot ()
   "Address of the arena's RAW bump word (the trap reads it).  Hosted aarch64:
    0x10000F58 (0x1000FF38 with threads: translate-aarch64 A64-GC-STAT-ADDR);
@@ -483,7 +489,7 @@
 
 (defun %core-layout-hi ()
   "High end of this process's layout: the end of the JIT arena."
-  (+ (%core-jit-arena-lo) #x20000000))
+  (%core-jit-arena-hi))
 
 (defun %core-set-word (at w)
   (setf (mem-ref at :u32) (logand w #xFFFFFFFF))

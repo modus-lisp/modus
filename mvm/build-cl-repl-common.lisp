@@ -521,6 +521,18 @@
     (print-dec last)
     (write-char-serial 10)
     (setf (mem-ref #x111F1F00 :u32) 0)
+    ;; A SPLIT CORE (U-Boot netboot): U-Boot sits at the top of RAM while it loads,
+    ;; so only [0x18000000, ~0x1CB00000) is free for the core there.  The loader
+    ;; then puts the file's tail at a SPILL address and leaves a descriptor at
+    ;; 0x111F1F10: 'SPLT', the slot end, the spill address.  Taken here into
+    ;; 0x111F1F20/24 for %CORE-READ-ALL and cleared, so a descriptor surviving a
+    ;; RUN-pin reset can never redirect a later boot's restore.  No descriptor
+    ;; (QEMU, an SD card): slot end 0, the core is read contiguously as ever.
+    (if (= (mem-ref #x111F1F10 :u32) #x53504C54)
+        (progn (setf (mem-ref #x111F1F20 :u32) (mem-ref #x111F1F14 :u32))
+               (setf (mem-ref #x111F1F24 :u32) (mem-ref #x111F1F18 :u32)))
+        (setf (mem-ref #x111F1F20 :u32) 0))
+    (setf (mem-ref #x111F1F10 :u32) 0)
     ;; bytes already waiting are line noise from the reset, not a person
     (dotimes (i 64)
       (if (hid-serial-ready-p) (read-char-serial) (return nil)))
@@ -568,8 +580,20 @@
       (setf (mem-ref (+ dst i 4) :u32)   (mem-ref (+ src i 4) :u32))
       (setq i (+ i 8)))))
 (defun %core-read-all (fd addr len)
-  (let ((src (%gc-read64 fd)) (padded (logand (+ len 7) -8)))
-    (%core-copy-words addr src len)
+  ;; The cursor walks the core as one contiguous file; past a split core's slot
+  ;; end (see %CORE-PRE-RESTORE) the bytes live at the spill address instead.
+  ;; Every cursor value stays 8-aligned and the slot end is page-aligned, so a
+  ;; read straddling the end splits on a word boundary.
+  (let ((src (%gc-read64 fd)) (padded (logand (+ len 7) -8))
+        (b (mem-ref #x111F1F20 :u32)))
+    (if (or (= b 0) (<= (+ src padded) b))
+        (%core-copy-words addr src len)
+        (let ((sp (mem-ref #x111F1F24 :u32)))
+          (if (>= src b)
+              (%core-copy-words addr (+ sp (- src b)) len)
+              (let ((n1 (- b src)))
+                (%core-copy-words addr src n1)
+                (%core-copy-words (+ addr n1) sp (- len n1))))))
     (%gc-write64 fd (+ src padded))
     len))
 (defun %core-write-all (fd addr len)
@@ -597,6 +621,11 @@
 ;; (0xDEAD0001>>1 = 0x6F568000) -> data abort inside %save-image.  A
 ;; JIT-enabled image returns real integers and carries [lo,bump) as before.
 (defun %core-jit-arena-lo () (let ((l (%jit-exec-lo))) (if (integerp l) l 0)))
+;; The arena ENDS at the region's top: hosted's lo + 512 MB put the JIT's data
+;; pages at 0x33FF4000 -- RAM under QEMU's 1 GB raspi3b, but past the Zero's
+;; 512 MB, where they alias 0x13FF4000 and the first full page overwrites the
+;; bump word at 0x13FFFFF0.
+(defun %core-jit-arena-hi () (let ((h (%jit-exec-hi))) (if (integerp h) h 0)))
 (defun %core-jit-bump-slot () (%jit-exec-bump))
 (defun %core-jit-arena-bump ()
   ;; JIT off: no region, no arena -> 0.  JIT on: the exec REGION always exists

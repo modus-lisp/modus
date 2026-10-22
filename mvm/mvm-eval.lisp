@@ -476,7 +476,7 @@
   (let ((alo (%core-jit-arena-lo)) (bump (%core-jit-arena-bump)))
     (if (or (= bump 0) (= alo 0))
         0
-        (let* ((top (or *jit-data-next* (+ alo #x20000000)))
+        (let* ((top (or *jit-data-next* (%core-jit-arena-hi)))
                (p (- top 16384)))
           (if (<= p (+ bump 16384))
               0

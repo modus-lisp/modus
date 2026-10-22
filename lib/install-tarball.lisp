@@ -328,6 +328,10 @@
       (setq *package* saved-package)
       (setq *readtable* saved-readtable))))
 
+(defvar *%it-source-file* nil "The file %IT-EVAL-SOURCE-1 is reading (its path in the tarball).")
+(defvar *%it-form-index* nil "The top-level form %IT-EVAL-SOURCE-1 is on.")
+(defvar *%it-form-offset* nil "Its character offset in the file, or NIL.")
+
 (defun %it-eval-source-1 (source-string tag)
   "The read+eval loop itself (see %it-eval-source for the binding contract).
    INTERLEAVES read and eval one form at a time from a single stream — this
@@ -336,6 +340,13 @@
    or those symbols intern in the wrong package.  Reading the whole file up
    front (the old path) left symbols split across packages across files.  An
    error in one form is reported but does not abort the whole file."
+  (let ((saved-file (and (boundp (quote *%it-source-file*)) *%it-source-file*)))
+    (unwind-protect
+         (%it-eval-source-2 source-string tag)
+      ;; a later REPL DEFUN must not be credited to this file
+      (setq *%it-source-file* saved-file))))
+
+(defun %it-eval-source-2 (source-string tag)
   (let ((s (make-string-input-stream source-string))
         (eof (list 'eof))
         (count 0)
@@ -343,6 +354,12 @@
         (fx (%fasl-open source-string))
         (read-failed nil))
     (loop
+      ;; where this form starts, for the JIT's source links (mvm-eval.lisp
+      ;; *JIT-SOURCE-LINKS*): its index always, its character offset when read
+      ;; from the source text (the FASL cache has no text position)
+      (setq *%it-source-file* tag)
+      (setq *%it-form-index* count)
+      (setq *%it-form-offset* (if fx nil (handler-case (file-position s) (t (c) nil))))
       (let ((form (handler-case (if fx (%fasl-read fx eof) (read s nil eof))
                     (t (c)
                       ;; A READ error ENDS THE FILE (an EVAL error, below, just
@@ -747,7 +764,10 @@
                    (write-string-serial rel) (write-string-serial ")") (write-char-serial 10))
                   (t
                    (write-string-serial "    ") (write-string-serial rel) (write-char-serial 10)
-                   (%it-eval-source (%it-utf8-bytes-to-string (cdr ent)) p)))))
+                   ;; REL, the file's path in the archive ("cl-nostr/src/relay.lisp"):
+                   ;; it names the file in read-error reports and the JIT's source
+                   ;; links (*%IT-SOURCE-FILE*), where P ("src/relay") is ambiguous
+                   (%it-eval-source (%it-utf8-bytes-to-string (cdr ent)) rel)))))
             ;; 5. announce the system to whoever is keeping the registry.
             ;;    ASDF's LOAD-SYSTEM leaves the system REGISTERED and marked
             ;;    loaded, and mgl-pax's autoload stubs call ASDF:LOAD-SYSTEM

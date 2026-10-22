@@ -2278,7 +2278,40 @@
    not yet handed to %JIT-BUILD-SCRIPT-DEFS.  See cl-eval.lisp, A SCRIPT'S
    OWN DEFUNS START NATIVE.")
 
+(defvar *jit-source-links* nil
+  "NAME (string) -> (FILE FORM-INDEX . CHAR-OFFSET): where a runtime DEFUN came
+   from, recorded when its module registers -- FILE the file install-tarball is
+   reading (its path in the tarball; else *LOAD-TRUENAME*), one shared object
+   per file, FORM-INDEX its top-level form in that
+   file, CHAR-OFFSET where the form starts (NIL when read through the FASL
+   cache).  It outlives JIT-PRUNE, which drops the bytecode and translation
+   tables of native modules: the source, not the bytecode, is the way back from
+   compiled code.  See JIT-SOURCE.")
+
+(defun %jit-note-source (names)
+  (let ((file (or (and (boundp (quote *%it-source-file*)) *%it-source-file*)
+                  (and (boundp (quote *load-truename*)) *load-truename*))))
+    (when file
+      (when (null *jit-source-links*)
+        (setq *jit-source-links* (make-hash-table :test (function equal))))
+      (let ((link (cons file
+                        (cons (and (boundp (quote *%it-form-index*)) *%it-form-index*)
+                              (and (boundp (quote *%it-form-offset*)) *%it-form-offset*)))))
+        (dolist (nm names) (puthash nm *jit-source-links* link))))))
+
+(defun jit-source (name)
+  "Where runtime DEFUN NAME (\"PKG::NAME\", or a symbol) was loaded from:
+   (FILE FORM-INDEX . CHAR-OFFSET), or NIL."
+  (let ((key (if (symbolp name)
+                 (let ((p (symbol-package name)))
+                   (if (and p (not (string= (package-name p) "COMMON-LISP-USER")))
+                       (concatenate (quote string) (package-name p) "::" (symbol-name name))
+                       (symbol-name name)))
+                 name)))
+    (and *jit-source-links* (gethash key *jit-source-links*))))
+
 (defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
+  (%jit-note-source names)
   (when (and (boundp (quote *%load-depth*)) (eql *%load-depth* 1))
     (setq *jit-script-def-names* (append names (if (consp *jit-script-def-names*)
                                                    *jit-script-def-names*
@@ -2290,8 +2323,43 @@
       (dolist (nm names) (puthash nm *jit-module-registry* m)))))
 
 (defun %jit-registered-p (name)
-  "T when NAME is a runtime DEFUN (it has a registered module)."
-  (if (and *jit-module-registry* (gethash name *jit-module-registry*)) t nil))
+  "T when NAME is a runtime DEFUN (it has a registered module, or had one before
+   JIT-PRUNE: a source link)."
+  (if (or (and *jit-module-registry* (gethash name *jit-module-registry*))
+          (and *jit-source-links* (gethash name *jit-source-links*)))
+      t nil))
+
+(defun jit-prune ()
+  "THE EXPLICIT CLEAN STEP, run before a save (alongside SAVE-AND-DIE's full
+   collection).  A runtime DEFUN keeps, for JIT-EAGER, its module's bytecode
+   and translation tables (call relocations, function offsets, lambda offsets)
+   -- in *JIT-MODULE-REGISTRY*, *JIT-EAGER-BUILT*, the trampoline tables and
+   the page cache -- long after its native code is installed.  Measured on a
+   Zero network core: the registry was the largest structure in the heap.
+   For every module that JIT-EAGER built and whose names ALL still resolve to
+   native code, drop all of it; the native code keeps its own constants (the
+   GC-rooted constant vector) and its linkage cells, and *JIT-SOURCE-LINKS*
+   keeps the way back to the source.  A module with any name not native --
+   failed, skipped, or replaced since -- is left whole.  Returns
+   (:PRUNED modules :NAMES n :KEPT modules)."
+  (let ((pruned 0) (nnames 0) (kept 0) (mods nil))
+    (when *jit-module-registry*
+      (maphash (lambda (k m) k (unless (member m mods :test (function eq)) (setq mods (cons m mods))))
+               *jit-module-registry*)
+      (dolist (m mods)
+        (let ((bc (car m)) (names (car (cddr (cddddr m)))) (all t))
+          (dolist (nm names) (unless (%jit-fn-native-p nm) (setq all nil)))
+          (if (and all names (member bc *jit-eager-built* :test (function eq)))
+              (progn
+                (dolist (nm names)
+                  (remhash nm *jit-module-registry*)
+                  (when *jit-defun-trampolines* (remhash nm *jit-defun-trampolines*))
+                  (when *jit-trampoline-forwards* (remhash nm *jit-trampoline-forwards*)))
+                (when *jit-page-cache* (remhash bc *jit-page-cache*))
+                (setq *jit-eager-built* (delete bc *jit-eager-built* :test (function eq)))
+                (setq pruned (+ pruned 1) nnames (+ nnames (length names))))
+              (setq kept (+ kept 1))))))
+    (list :pruned pruned :names nnames :kept kept)))
 
 (defun %jit-fn-native-p (name)
   (let ((f (%mvm-resolve-runtime-fn name)))
@@ -2566,7 +2634,7 @@
    symbol's function cell and the qualified SFT key are set."
   (let ((p (find-package "MODUS")))
     (when p
-      (dolist (nm (list "JIT-EAGER"))
+      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE"))
         (let ((fn (%mvm-resolve-runtime-fn nm)))
           (when fn
             (let ((dst (intern nm p)))

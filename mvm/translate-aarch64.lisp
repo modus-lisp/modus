@@ -1019,11 +1019,50 @@
     (a64-emit buf #x3900016D)                         ; STRB w13, [x11]
     (a64-set-label buf skip)))
 
+;;; THE MARKS ARE OUT OF LINE.  EMIT-AARCH64-GC-SET-BIT is 16 instructions, and
+;;; every allocation site paid it inline -- every cons twice.  Measured on a
+;;; saved Zero core (natrium, seal, cl-transport, cl-nostr; 2026-10-22): 370,086
+;;; start marks and 185,602 cons marks, ~7.8 M of the arena's 11.3 M live
+;;; instructions -- two thirds of all native code, in a 64 MB arena the board
+;;; cannot grow.  So, as the shared-store guard does: one subroutine per mark
+;;; per translation unit, emitted at the unit's end, and each site is two
+;;; instructions -- ADR x15 (the return), B.  It returns with BR x15: x30 is
+;;; untouched, and x15 holds no vreg (*A64-VREG-TO-PHYS*); the body clobbers
+;;; x9..x13 exactly as the inline mark did.
+
+(defvar *a64-mark-start-label* nil
+  "The current unit's object-start mark subroutine, or NIL.  SETQ'd, never bound.")
+(defvar *a64-mark-cons-label* nil
+  "The current unit's cons-kind mark subroutine, or NIL.  SETQ'd, never bound.")
+
+(defun a64-emit-mark-call (buf label)
+  (let ((adr (a64-current-index buf)))
+    (a64-emit buf (logior #x10000000 +a64-x15+))       ; ADR x15, <return>
+    (a64-emit-call-label buf label t)                   ; B mark (any length)
+    (setf (aref (a64-buffer-code buf) adr)
+          (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
+                  +a64-x15+))))
+
+(defun a64-emit-mark-subs (buf)
+  "At a unit's end: the mark subroutines its sites called."
+  (when *a64-mark-start-label*
+    (a64-set-label buf *a64-mark-start-label*)
+    (emit-aarch64-gc-set-bit buf #x10000E18)
+    (a64-br buf +a64-x15+)
+    (setq *a64-mark-start-label* nil))
+  (when *a64-mark-cons-label*
+    (a64-set-label buf *a64-mark-cons-label*)
+    (emit-aarch64-gc-set-bit buf #x10000E40)
+    (a64-br buf +a64-x15+)
+    (setq *a64-mark-cons-label* nil)))
+
 (defun emit-aarch64-gc-mark-start (buf)
   "Set the OBJECT-START bit (bitmap base @0x10000E18) for the object at x24.
    Emitted at every alloc site under *aarch64-gc-bitmap-enabled*."
   (when *aarch64-gc-bitmap-enabled*
-    (emit-aarch64-gc-set-bit buf #x10000E18)))
+    (unless *a64-mark-start-label*
+      (setq *a64-mark-start-label* (incf *mvm-label-counter*)))
+    (a64-emit-mark-call buf *a64-mark-start-label*)))
 
 (defun emit-aarch64-gc-mark-cons (buf)
   "WS4-AA64 #160 bug#4: ALSO set the CONS-KIND bit (bitmap base @0x10000E40) for
@@ -1031,7 +1070,9 @@
    car+cdr) rather than reading car as an object header.  Emitted only at the
    CONS alloc site, after emit-aarch64-gc-mark-start."
   (when *aarch64-gc-bitmap-enabled*
-    (emit-aarch64-gc-set-bit buf #x10000E40)))
+    (unless *a64-mark-cons-label*
+      (setq *a64-mark-cons-label* (incf *mvm-label-counter*)))
+    (a64-emit-mark-call buf *a64-mark-cons-label*)))
 
 ;;; --- ADD (shifted register) ---
 ;;; sf|0|0|01011|shift(2)|0|Rm(5)|imm6(6)|Rn(5)|Rd(5)
@@ -8842,6 +8883,7 @@
   (setf *aarch64-fn-addr-local-relocs* nil)
   (a64-slot-cache-flush)   ; never inherit a previous translation's state
   (setq *a64-ssg-label* nil)
+  (setq *a64-mark-start-label* nil *a64-mark-cons-label* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're
@@ -8986,6 +9028,8 @@
     (when *a64-ssg-label*
       (a64-emit-shared-store-guard-sub buf *a64-ssg-label*)
       (setq *a64-ssg-label* nil))
+    ;; The GC bitmap marks, when an allocation in this unit called them.
+    (a64-emit-mark-subs buf)
 
     ;; Pass 2: Resolve all branch fixups.  Skip if we're appending into
     ;; a shared buffer — the caller will resolve once after appending
@@ -9093,6 +9137,8 @@
         (when label
           (a64-set-label buf label))))
 
+    ;; The GC bitmap mark subroutines its allocations called.
+    (a64-emit-mark-subs buf)
     ;; Resolve fixups
     (a64-resolve-fixups buf)
 

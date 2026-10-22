@@ -562,6 +562,9 @@
           ;; #252 diag: final position and the KERNEL-MAIN entry as recorded
           (write-char-serial 81) (print-dec (a64-buffer-position buf)) (write-char-serial 32)
           (print-dec (gethash (td-read-u32 #x3000028) fn-map)) (write-char-serial 10) ;; Q<pos> <km-off>
+          ;; The GC bitmap mark subroutines the allocations called
+          ;; (translate-aarch64.lisp: the marks are out of line).
+          (a64-emit-mark-subs buf)
           ;; Resolve fixups
           (write-char-serial 82) (write-char-serial 10) ;; R
           (a64-resolve-fixups buf)

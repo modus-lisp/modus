@@ -2808,6 +2808,18 @@
       (setf (mem-ref (+ at 2) :u8) (logand (ash new -16) 255))
       (setf (mem-ref (+ at 3) :u8) (logand (ash new -24) 255)))))
 
+(defun %jit-reclaim-page (b0 b1)
+  "A REJECTED PAGE GOES BACK.  The arena is a bump allocator, so a page built
+   and then refused (a relocation it could not resolve) was simply lost -- and
+   %JIT-EAGER-ALL retries every failed module whenever anything new is native,
+   so 27 modules that never build cost ~780 KB per JIT-EAGER, for ever.  B0/B1:
+   the arena's bump before and after this page was taken.  Rewound only while
+   the page is still the last thing taken (a thunk page taken during
+   relocation moves the bump, and then the page stays)."
+  (when (and (> b0 0) (> b1 b0) (= (%core-jit-arena-bump) b1))
+    (setf (mem-ref (%core-jit-bump-slot) :u64) (ash b0 -1))
+    t))
+
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
   "WS4-S5 (aarch64) sibling of %jit-translate-page-1.  translate-mvm-to-aarch64
    wants an eql-keyed func-idx→MVM-offset HASH (not x64's (name offset length)
@@ -2923,7 +2935,9 @@
              (eoff (gethash mvm-entry fn-map))
              (npages (+ 1 (ash nlen -12)))
              (psize (ash npages 12))
+             (b0 (%core-jit-arena-bump))
              (base (%mmap-exec-page psize))
+             (b1 (%core-jit-arena-bump))
              ;; WHY: 0 = no failure yet, 1 = out-of-module CALL, 2 = #'NAME
              ;; value load, 3 = in-module fn-addr.  FIRST cause wins, so the
              ;; page-level counters partition the rejected pages exactly.
@@ -3147,7 +3161,7 @@
             (list base eoff cpat (%gc-epoch) psize
                   (%jit-fn-native-offsets-aarch64 ft-list fn-map nlen cpat)
                   *e2-const-pool*)
-            nil)))))
+            (progn (%jit-reclaim-page b0 b1) nil))))))
 
 (defvar *jit-translate-err-count* 0
   "DIAGNOSTIC: count of translate-time errors caught by %jit-translate-page's

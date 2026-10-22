@@ -8401,6 +8401,10 @@
        (compile-word-to-val (cdr form) env dest))
       ((= op-name #.(compute-name-hash "%PRIM-AREF"))
        (compile-prim-aref (cadr form) (caddr form) env dest))
+      ((= op-name #.(compute-name-hash "%STRUCT-SLOT-REF"))
+       (compile-struct-slot (cdr form) nil env dest))
+      ((= op-name #.(compute-name-hash "%STRUCT-SLOT-SET"))
+       (compile-struct-slot (cdr form) t env dest))
       ((= op-name #.(compute-name-hash "%PRIM-ARRAYP"))
        (compile-prim-arrayp (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%PRIM-ASET"))
@@ -23516,6 +23520,51 @@
             (%word-aref ,g-arr ,g-idx)))
      env dest)))
 
+(defun compile-struct-slot (args setp env dest)
+  "(%STRUCT-SLOT-REF OBJ MIN-LEN IDX TYPE-NAME) / (%STRUCT-SLOT-SET OBJ MIN-LEN IDX VAL):
+   a defstruct accessor's whole body.  OBJ is checked to be a word array
+   (subtag #x32) of at least MIN-LEN words, then slot IDX (a literal) is read
+   or VAL stored -- one load or store.  Anything else signals TYPE-ERROR.
+
+   Written as the accessor's Lisp body -- (= (obj-subtag obj) #x32), (>= len
+   N), (%prim-aref obj IDX) -- it compiled to ~200 aarch64 instructions: the
+   two generic compares each an inline fast path plus a slow-path call, and
+   %PRIM-AREF a runtime byte-vs-word dispatch with a bounds check and a call
+   on each arm.  The check needs none of it: OBJ-SUBTAG is a tagged fixnum,
+   so is the length, and both compares are of tagged words (as
+   %EMIT-INDEX-CHECK's); the subtag and length proven, the slot is in bounds."
+  (let ((obj (car args)) (min-len (cadr args)) (idx (caddr args)))
+    (if (not (symbolp obj))
+        (let ((g (%mvm-gensym "SSLOT")))
+          (compile-form `(let ((,g ,obj)) (,(if setp '%struct-slot-set '%struct-slot-ref) ,g ,@(cdr args)))
+                        env dest))
+        (let ((r (alloc-temp-reg)) (k (alloc-temp-reg)) (c (alloc-temp-reg))
+              (v (and setp (alloc-temp-reg)))
+              (bad (make-compiler-label)) (done (make-compiler-label)))
+          (when setp (compile-form (cadddr args) env v))
+          (compile-form obj env r)
+          (emit-ir :obj-subtag k r)
+          (emit-li-tagged c #x32)
+          (emit-ir :cmp k c)
+          (emit-ir :bne bad)
+          (emit-ir :array-len k r)
+          (emit-li-tagged c min-len)
+          (emit-ir :cmp k c)
+          (emit-ir :blt bad)
+          (if setp
+              (progn (emit-ir :obj-set r idx v)
+                     (emit-ir :mov dest v))
+              (emit-ir :obj-ref dest r idx))
+          (emit-ir :br done)
+          (when setp (free-temp-reg))
+          (free-temp-reg) (free-temp-reg) (free-temp-reg)
+          (emit-ir-label bad)
+          (compile-form (if setp
+                            '(%signal-type-error)
+                            `(%signal-type-error ,obj (quote ,(cadddr args))))
+                        env dest)
+          (emit-ir-label done)))))
+
 (defun compile-prim-aset (arr-form idx-form val-form env dest)
   (let ((g-arr (%mvm-gensym "PASETA"))
         (g-idx (%mvm-gensym "PASETI"))
@@ -27494,12 +27543,20 @@
              do (let ((acc-name (if conc-name
                                     (format nil "~A~A" conc-name (symbol-name slot))
                                     (format nil "~A" (symbol-name slot)))))
-                  (push `(defun ,(%defstruct-intern acc-name) (obj)
-                           (if (= (obj-subtag obj) #x32)
-                               (if (>= (%prim-array-length obj) ,min-inst-len)
-                                   (%prim-aref obj ,(+ 2 i))
-                                   (%signal-type-error obj ',struct-name))
-                               (%signal-type-error obj ',struct-name)))
+                  ;; %STRUCT-SLOT-REF is this same check as ONE primitive
+                  ;; (compile-struct-slot): ~10 instructions, where the Lisp
+                  ;; spelling below compiled to ~200.  Its slot index is an
+                  ;; :OBJ-REF immediate (8 bits), so a slot past 253 keeps the
+                  ;; Lisp spelling.
+                  (push (if (%obj-slot-imm-p (+ 2 i))
+                            `(defun ,(%defstruct-intern acc-name) (obj)
+                               (%struct-slot-ref obj ,min-inst-len ,(+ 2 i) ,struct-name))
+                            `(defun ,(%defstruct-intern acc-name) (obj)
+                               (if (= (obj-subtag obj) #x32)
+                                   (if (>= (%prim-array-length obj) ,min-inst-len)
+                                       (%prim-aref obj ,(+ 2 i))
+                                       (%signal-type-error obj ',struct-name))
+                                   (%signal-type-error obj ',struct-name))))
                         forms-to-compile)
                   ;; compile-time record: a call on an argument DECLARED to be
                   ;; this struct reads the slot in place (see compile-call)
@@ -27525,11 +27582,13 @@
                          ;; inner backquote sits in a LAMBDA body, a separate
                          ;; compilation scope.
                          (checked-store
-                           `(if (= (obj-subtag obj) #x32)
-                                (if (>= (%prim-array-length obj) ,min-inst-len)
-                                    (%prim-aset obj ,(+ 2 i) val)
-                                    (%signal-type-error))
-                                (%signal-type-error)))
+                           (if (%obj-slot-imm-p (+ 2 i))
+                               `(%struct-slot-set obj ,min-inst-len ,(+ 2 i) val)
+                               `(if (= (obj-subtag obj) #x32)
+                                    (if (>= (%prim-array-length obj) ,min-inst-len)
+                                        (%prim-aset obj ,(+ 2 i) val)
+                                        (%signal-type-error))
+                                    (%signal-type-error))))
                          ;; CLHS 3.4.6: a :READ-ONLY slot has no writer at all.
                          ;; Modus always emits SET-<ACC> / SETF-<ACC> (the SETF
                          ;; place expansion calls SET-<ACC> unconditionally), so

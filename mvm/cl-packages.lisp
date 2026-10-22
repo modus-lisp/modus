@@ -1395,6 +1395,18 @@
   (let ((pkg (%resolve-package (if pkg-arg (car pkg-arg) *package*)))
         (name-str (symbol-name sym))
         (removed nil))
+    ;; Uninterning a SHADOWING symbol uncovers the used packages' symbols of
+    ;; its name: two different ones are a name conflict, a correctable
+    ;; PACKAGE-ERROR (CLHS UNINTERN; UNINTERN.8).
+    (when (member sym (%pkg-shadowing pkg) :test #'eq)
+      (let ((seen nil))
+        (dolist (used (%pkg-use-list pkg))
+          (let ((e (%symtab-find (%pkg-external used) name-str)))
+            (when (and e (not (member (cdr e) seen :test #'eq)))
+              (setq seen (cons (cdr e) seen)))))
+        (when (cdr seen)
+          (restart-case (error 'package-error :package pkg)
+            (continue () :report "Unintern it anyway." nil)))))
     (when (%symtab-find (%pkg-internal pkg) name-str)
       (%pkg-set-internal pkg (%symtab-remove (%pkg-internal pkg) name-str))
       (setq removed t))
@@ -2189,7 +2201,9 @@
                     (unless (or (%symtab-find (%pkg-internal pkg) name-str)
                                 (%symtab-find (%pkg-external pkg) name-str))
                       (setq result
-                        (cons (list (cdr entry) :inherited used) result)))))))))))
+                        ;; the package iterated over, not the one the
+                        ;; symbol came from (CLHS; WITH-PACKAGE-ITERATOR.3)
+                        (cons (list (cdr entry) :inherited pkg) result)))))))))))
     result))
 
 ;;; --- Test helper functions from packages00-aux ---

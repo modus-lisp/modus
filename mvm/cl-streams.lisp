@@ -93,7 +93,9 @@
   (if (streamp s)
       (if (= (%stream-type s) 9)
           (let ((et (%fs-element-type s)))
-            (if et et (quote character)))
+            ;; :ELEMENT-TYPE :DEFAULT opens a character stream
+            ;; (STREAM-ELEMENT-TYPE.6)
+            (if (and et (not (eq et :default))) et (quote character)))
           (quote character))
       (quote character)))
 (defun stream-external-format (s) :default)

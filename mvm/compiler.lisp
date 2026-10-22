@@ -5039,8 +5039,24 @@
                 ;; (setf var value) → (setq var value)
                 ((symbolp place)
                  `(setq ,place ,value))
+                ;; (setf (apply #'aref A SUBS... LIST) V) (CLHS 5.1.2.5;
+                ;; SETF-APPLY.2): store through the row-major index.
+                ((and (consp place) (symbolp (car place)) (name-eq (car place) "APPLY")
+                      (consp (cdr place)) (consp (cadr place))
+                      (symbolp (car (cadr place)))
+                      (or (name-eq (car (cadr place)) "FUNCTION")
+                          (name-eq (car (cadr place)) "QUOTE"))
+                      (symbolp (cadr (cadr place)))
+                      (member (symbol-name (cadr (cadr place))) '("AREF" "BIT" "SBIT")
+                              :test #'string=)
+                      (consp (cddr place)))
+                 (let ((ga (%mvm-gensym "SAA")) (gi (%mvm-gensym "SAI")) (gv (%mvm-gensym "SAV")))
+                   `(let* ((,ga ,(caddr place))
+                           (,gi (apply #'array-row-major-index ,ga ,@(cdddr place)))
+                           (,gv ,value))
+                      (setf (row-major-aref ,ga ,gi) ,gv))))
                 ;; A (SETF NAME) bound by an enclosing FLET / LABELS: call it.
-                ((and (consp place) (symbolp (car place)) (car place)
+                ((and (consp place) (symbolp (car place))   ; NIL too (FLET.51)
                       *flet-shadowed-macros*
                       (member (cons :setf (normalize-name (car place)))
                               *flet-shadowed-macros* :test #'equal))
@@ -5380,9 +5396,15 @@
                                     `(lambda ,(append vars-list store-list)
                                        (block ,accessor ,@body-forms)))
                                    (append var-gensyms store-gensyms))))
-                     `(let* (,@(mapcar #'list var-gensyms place-args)
-                             ,@(mapcar #'list store-gensyms (list value-form)))
-                        ,expansion)))))
+                     ;; several store variables take the value form's
+                     ;; several values (DEFSETF.7A)
+                     (if (cdr store-gensyms)
+                         `(let* (,@(mapcar #'list var-gensyms place-args))
+                            (multiple-value-bind ,store-gensyms ,value-form
+                              ,expansion))
+                         `(let* (,@(mapcar #'list var-gensyms place-args)
+                                 ,@(mapcar #'list store-gensyms (list value-form)))
+                            ,expansion))))))
              `(quote ,accessor)))
           ;; Short form: (defsetf accessor setter-fn [doc])
           ((and (consp rest) (symbolp (car rest)))
@@ -7120,6 +7142,24 @@
          ;; expanders see no environment, so they took the place for a
          ;; variable and its subforms ran at the store, after every value
          ;; form (PSETF.7).  Substitute the expansion first, where ENV is known.
+         ;; MULTIPLE-VALUE-SETQ of a symbol macro is SETF of VALUES of the
+         ;; expansions (CLHS; MULTIPLE-VALUE-SETQ.8): their subforms run first.
+         (form (or (and (consp form) (symbolp (car form)) (car form)
+                        (= (normalize-name (car form)) #.(compute-name-hash "MULTIPLE-VALUE-SETQ"))
+                        (consp (cdr form)) (listp (cadr form)) (consp (cddr form))
+                        (let ((any nil))
+                          (dolist (v (cadr form))
+                            (when (%symbol-macro-place-expansion v env) (setq any t)))
+                          any)
+                        (list 'values
+                              (list 'setf
+                                    (cons 'values
+                                          (mapcar (lambda (v)
+                                                    (let ((e (%symbol-macro-place-expansion v env)))
+                                                      (if e (car e) v)))
+                                                  (cadr form)))
+                                    (caddr form))))
+                   form))
          (form (or (and (consp form) (symbolp (car form)) (car form)
                         (member (normalize-name (car form))
                                 '(#.(compute-name-hash "PSETF")
@@ -13974,6 +14014,20 @@
          (labels ((chk (v) (valid v))) (list (chk 5) (chk 50)))))
    This is why alexandria's GAUSSIAN-RANDOM.1 sampled out of range: its
    rejection test lives behind a macro inside a LABELS."
+  ;; HANDLER-BIND is a special form here, but COMPILE-HANDLER-BIND makes its
+  ;; body a LAMBDA: show the walkers that, or a variable set inside the body
+  ;; and read after it was captured BY VALUE (CTYPECASE.12: a STORE-VALUE
+  ;; under HANDLER-BIND was lost).
+  (when (and (consp form) (symbolp (car form)) (car form)
+             (name-eq (car form) "HANDLER-BIND") (consp (cdr form)) (listp (cadr form)))
+    (return-from %cfv-macroexpand
+      (list '%with-handler-bind
+            (cons 'list (let ((acc nil))
+                          (dolist (b (cadr form) (nreverse acc))
+                            (when (consp b)
+                              (push (list '%hb-handler-entry (list 'quote (car b)) (cadr b))
+                                    acc)))))
+            (cons 'lambda (cons nil (cddr form))))))
   (and (consp form)
        (symbolp (car form))
        (car form)
@@ -18840,6 +18894,13 @@
           ;; misidentified as values-preserving.  Now we check FIRST.
           ((= hash #.(compute-name-hash "MULTIPLE-VALUE-PROG1"))
            (tail-form-is-values-p (list (cadr form))))
+          ;; UNWIND-PROTECT returns its PROTECTED form's values (it saves
+          ;; and restores them around the cleanup), so that form decides.
+          ;; As an opaque call it read "possibly multi-valued", nothing
+          ;; clamped, and a stale count from inside it leaked out
+          ;; (STREAM-ELEMENT-TYPE.6 got T, T).
+          ((= hash #.(compute-name-hash "UNWIND-PROTECT"))
+           (tail-form-is-values-p (list (cadr form))))
           ;; (apply #'values ...) or (apply <whatever> ...) — APPLY's
           ;; result is whatever the called function returned, including
           ;; its MV state.  ANSI aux helpers shaped as
@@ -18994,6 +19055,8 @@
           (list (car form) (cadr form) (%mv-clamp-tail (caddr form))))
          ((and (string= op "LOCALLY") (cdr form))
           (cons (car form) (%mv-clamp-body (cdr form))))
+         ((and (string= op "UNWIND-PROTECT") (cdr form))
+          (list* (car form) (%mv-clamp-tail (cadr form)) (cddr form)))
          ;; Value-control macros whose arms can mix a producer with a
          ;; single-valued leaf: rewrite to the expansion so the clamp reaches
          ;; each arm.  A whitelist, not every macro -- LOOP and friends have
@@ -29307,7 +29370,15 @@
                            (if slot-read-only
                                (list '(%signal-program-error))
                                (list checked-store 'val))))
-                    (push `(defun ,(%defstruct-intern setter-name) (obj val)
+                    ;; With no conc-name the setter goes beside the accessor
+                    ;; (the slot's own symbol): SETF's fallback interns
+                    ;; SET-<ACC> in the accessor's package (STRUCT-TEST-33/7).
+                    (push `(defun ,(if (or conc-name (not *mvm-eval-runtime-p*) (not (symbolp slot))
+                                           (null (symbol-package slot))
+                                           (eq (symbol-package slot) (find-package "COMMON-LISP")))
+                                       (%defstruct-intern setter-name)
+                                       (intern setter-name (symbol-package slot)))
+                               (obj val)
                              ,@writer-body)
                           forms-to-compile)
                     ;; Real (setf ACC) FUNCTION (CLHS 3.1.2.1.2.3 arg order:

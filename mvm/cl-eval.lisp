@@ -259,11 +259,20 @@
         (puthash hash *native-sym-function-table* fn))
       fn)))
 
+(defun %check-setf-function-name (x)
+  "A list function name must be (SETF symbol): (SETF 0) is a TYPE-ERROR for
+   FBOUNDP, FDEFINITION and FMAKUNBOUND (FBOUNDP.ERROR.10 &c.)."
+  (when (and (consp x)
+             (not (and (symbolp (car x)) (string= (symbol-name (car x)) "SETF")
+                       (consp (cdr x)) (symbolp (cadr x)) (null (cddr x)))))
+    (error 'type-error :datum x :expected-type '(or symbol (cons (eql setf) (cons symbol null))))))
+
 (defun fboundp (sym)
   "Return T if SYM has a function binding.  Looks up via the unified
    %sym-name-or-hash helper so all symbol flavors hit the right
    storage tier — without this, set-symbol-function on a native MVM
    symbol could install a fn that fboundp wouldn't see."
+  (%check-setf-function-name sym)
   (let ((nh (%sym-name-or-hash sym)))
     (when (null nh) (return-from fboundp nil))
     (let ((name (car nh))
@@ -289,6 +298,7 @@
    that, set-symbol-function on a native MVM symbol survives an
    fmakunbound because the function lives in the hash-keyed table that
    the name-only remhash couldn't reach."
+  (%check-setf-function-name sym)
   (let ((nh (%sym-name-or-hash sym)))
     (when (null nh)
       (error "fmakunbound: not a function name"))
@@ -343,6 +353,7 @@
 (defun fdefinition (sym)
   "Return the function definition of SYM.
    For generic functions, returns the GF object."
+  (%check-setf-function-name sym)
   ;; PRECEDENCE (CLHS-faithful): generic function, then ORDINARY FUNCTION,
   ;; then macro, then special operator.  A real function binding MUST win
   ;; over an inlining macro: 1+/1-/… are funcallable functions that ALSO

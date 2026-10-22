@@ -556,6 +556,9 @@
   (%define-condition 'floating-point-invalid-operation '(arithmetic-error) nil nil nil)
   ;; program-error
   (%define-condition 'program-error '(error) nil nil nil)
+  ;; simple-program-error: a PROGRAM-ERROR with a message (SBCL's
+  ;; sb-int:simple-program-error) -- PROGRAM-ERROR itself has no slots.
+  (%define-condition 'simple-program-error '(simple-condition program-error) nil nil nil)
   ;; control-error
   (%define-condition 'control-error '(error) nil nil nil)
   ;; package-error
@@ -3013,6 +3016,17 @@
 
 ;;; Helper: signal program-error for wrong arg count
 (defun %program-error (msg)
-  (error (make-condition 'program-error
+  (error (make-condition 'simple-program-error
                          :format-control msg
                          :format-arguments nil)))
+
+(defun %wrong-nargs (name n)
+  "A function compiled at runtime was called with N arguments its lambda list
+   does not accept (the entry check emit-arity-range-check-prologue emits)."
+  (if name
+      (error 'simple-program-error
+             :format-control "invalid number of arguments to ~S: ~D"
+             :format-arguments (list name n))
+      (error 'simple-program-error
+             :format-control "invalid number of arguments: ~D"
+             :format-arguments (list n))))

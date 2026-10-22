@@ -26390,6 +26390,51 @@
     (free-temp-reg)
     (free-temp-reg)))
 
+(defun emit-arity-range-check-prologue (name min-count max-count)
+  "Runtime-compiled code (*MVM-EVAL-RUNTIME-P*): signal PROGRAM-ERROR at
+   entry unless MIN-COUNT <= NARGS <= MAX-COUNT (CLHS 3.5.1.2/3.5.1.3).
+   Every caller sets the slot -- a direct call to its true count, FUNCALL
+   and APPLY to the count they spread -- except a call to a function it
+   believed took &rest, which passes the packed sentinel 255 and is let
+   through.  On mismatch calls (%WRONG-NARGS NAME NARGS), NAME being NIL
+   for an anonymous function; it signals, and if a handler declines and it
+   returns, the body still never runs on the wrong arguments."
+  (let ((ok-label (make-compiler-label))
+        (bad-label (make-compiler-label))
+        (nargs-reg (alloc-temp-reg))
+        (cmp-reg (alloc-temp-reg)))
+    ;; The accepted count(s) first, so a good call costs one or two
+    ;; compares; the 255 sentinel is only tested on the way out.
+    (emit-ir :get-nargs nargs-reg)
+    (emit-ir :li cmp-reg (ash min-count +fixnum-shift+))
+    (emit-ir :cmp nargs-reg cmp-reg)
+    (if (= min-count max-count)
+        (emit-ir :beq ok-label)
+        (progn
+          (emit-ir :blt bad-label)
+          (emit-ir :li cmp-reg (ash max-count +fixnum-shift+))
+          (emit-ir :cmp nargs-reg cmp-reg)
+          (emit-ir :bgt bad-label)
+          (emit-ir :br ok-label)))
+    (emit-ir-label bad-label)
+    (emit-ir :li cmp-reg (ash 255 +fixnum-shift+))
+    (emit-ir :cmp nargs-reg cmp-reg)
+    (emit-ir :beq ok-label)
+    ;; The name's load may call (and set the nargs slot), so the count rides
+    ;; the stack across it.
+    (emit-ir :push nargs-reg)
+    (compile-form (if (and name (symbolp name)) (list 'quote name) nil)
+                  (make-compile-env :stack-depth 0 :bindings nil :parent nil)
+                  +vreg-v0+)
+    (emit-ir :pop +vreg-v1+)
+    (emit-ir :set-nargs 2)
+    (emit-ir :call "%WRONG-NARGS" 2)
+    (emit-ir :mov +vreg-vr+ +vreg-vn+)
+    (emit-ir :br *function-return-label*)
+    (emit-ir-label ok-label)
+    (free-temp-reg)
+    (free-temp-reg)))
+
 (defun emit-rest-prologue (rest-slot)
   "Emit IR for the &rest prologue.
 
@@ -26741,6 +26786,20 @@
                                     (string name))))
                      (member fname *compile-arity-check-names* :test #'string=))))
       (emit-arity-check-prologue (length params)))
+    ;; Runtime-compiled code checks every fixed-arity and &optional
+    ;; function: user code called through FUNCALL / APPLY / a #'NAME with
+    ;; the wrong count must signal, not run on missing or ignored
+    ;; arguments.  (&rest / &key functions are left to their own prologues.)
+    (when (and *mvm-eval-runtime-p*
+               (not *compile-arity-check*)
+               (null rest-slot)
+               ;; mvm-eval's toplevel thunk is entered by the evaluator,
+               ;; which sets no count.
+               (not (and (symbolp name)
+                         (string= (symbol-name name) "%MVM-EVAL-THUNK"))))
+      (let ((req (if (and opt-count (> opt-count 0)) opt-start (length params))))
+        (emit-arity-range-check-prologue
+         name req (if (and opt-count (> opt-count 0)) (+ opt-start opt-count) req))))
 
     ;; Build initial environment with parameter bindings.
     ;; Parameters arrive in V0-V3 (for the first 4), rest on stack.

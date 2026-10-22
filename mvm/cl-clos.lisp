@@ -5471,14 +5471,12 @@
              (variadic (or (> (nth 1 sh) 0) (nth 2 sh) (nth 3 sh)))
              (n (length args)))
         (when (or (< n req) (and (not variadic) (> n req)))
-          ;; %signal-program-error carries no message (it bypasses
-          ;; make-condition); say WHICH gf and the counts on the console first.
-          (write-string-serial "PROGRAM-ERROR: generic function ")
-          (write-string-serial (handler-case (princ-to-string (%gf-name gf)) (t (c) "?")))
-          (write-string-serial " called with ") (print-dec n)
-          (write-string-serial " args, lambda-list wants ") (print-dec req)
-          (write-char-serial 10)
-          (%signal-program-error))))))
+          ;; The message names the gf and the counts.  (It used to be
+          ;; written to the console before a message-less PROGRAM-ERROR, so
+          ;; a HANDLED arity error still printed.)
+          (error 'simple-program-error
+                 :format-control "invalid number of arguments to generic function ~S: ~D (it takes ~D)"
+                 :format-arguments (list (%gf-name gf) n req)))))))
 
 (defvar *%cnm-free-fns* nil
   "EQ table of method functions whose bodies cannot call CALL-NEXT-METHOD or

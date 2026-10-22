@@ -5434,6 +5434,15 @@
 (defun set-documentation (x doc-type string)
   "Install STRING as the doc for (X . DOC-TYPE) in
    *documentation-strings*, replacing any prior entry."
+  (%set-documentation-default x doc-type string))
+
+(defun %set-documentation-default (x doc-type string)
+  "The registry store behind SET-DOCUMENTATION, under its own name for the
+   same reason as %DOCUMENTATION-DEFAULT: a program's (SETF DOCUMENTATION)
+   method installs a SET-DOCUMENTATION alias that dispatches the GF, and a
+   redefined image function now reaches the image's own callers -- so the
+   GF's no-applicable-method fallback calling SET-DOCUMENTATION went round
+   the alias forever (upstream DEFGENERIC.2, DOCUMENTATION.*: SIGSEGV)."
   (setq doc-type (%doc-type-normalize doc-type))
   (let ((key (cons x doc-type))
         (cur *documentation-strings*)

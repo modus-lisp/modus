@@ -5913,7 +5913,7 @@
         (return-from %gf-dispatch-general
           (if (symbolp name)
               (%documentation-default (car args) (cadr args))
-              (set-documentation (cadr args) (caddr args) (car args)))))
+              (%set-documentation-default (cadr args) (caddr args) (car args)))))
       (when (null applicable)
         ;; Name the generic function.  A bare "no applicable method" is
         ;; unactionable when a library defines dozens of GFs — say which

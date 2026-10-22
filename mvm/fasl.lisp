@@ -612,9 +612,13 @@
               (progn
                 (setf (nth 5 fx) (cdr (nth 5 fx)))
                 (if (nth 2 e)
-                    (list '%fasl-module-marker (nth 2 e) (nth 0 e) (nth 1 e))
+                    (list '%fasl-module-marker (nth 2 e) (nth 0 e) (nth 1 e) (nth 3 e))
                     (progn (%fasl-stat 3)
-                           (values (read-from-string text t nil :start (nth 0 e))))))))
+                           ;; a form COMPILE-FILE wrote itself (externalized
+                           ;; literal objects) has no text of its own
+                           (if (nth 3 e)
+                               (nth 3 e)
+                               (values (read-from-string text t nil :start (nth 0 e)))))))))
         (let ((start (nth 3 fx)))
           (multiple-value-bind (form end) (read-from-string text nil eof :start start)
             (setf (nth 3 fx) end)
@@ -633,7 +637,8 @@
        (if (stringp p)
            ;; the module cannot be rebuilt here: compile its source instead
            (progn (%fasl-stat 4)
-                  (eval (values (read-from-string (nth 2 fx) t nil :start (caddr form)))))
+                  (eval (or (nth 4 form)
+                            (values (read-from-string (nth 2 fx) t nil :start (caddr form))))))
            (progn (%fasl-stat 2)
                   (let ((t0 (get-internal-real-time)))
                     (multiple-value-prog1 (eval (list '%fasl-module-marker p))
@@ -786,6 +791,193 @@
         (dotimes (i n) (setf (char s i) (code-char (aref v i))))
         s)))
 
+;;; ------------------------------------------------------------------
+;;; Literal objects in a compiled file: MAKE-LOAD-FORM (CLHS 3.2.4.4).
+;;;
+;;; A CLOS or structure instance in a form's code (#.(make-instance ...))
+;;; cannot be written into the fasl.  COMPILE-FILE asks the object for its
+;;; creation and initialization forms and writes them as forms of their own,
+;;; ahead of the form that uses it: the creation form stores the object in a
+;;; per-file table (%FASL-OBJ-SET), and every reference -- in the form, or in
+;;; another object's forms -- is replaced by (%FASL-OBJ-REF key n).  One object
+;;; is one table slot, so the file's references stay EQ.  A class is replaced
+;;; by (FIND-CLASS 'NAME).
+;;;
+;;; Order, as CLHS MAKE-LOAD-FORM puts it: an object's creation form runs after
+;;; the creation (and, when possible, initialization) of the objects it
+;;; references; its initialization form runs as soon after its creation as the
+;;; objects it references allow -- one still being created defers it, and
+;;; deferred initializations run, most recent first, once they can.
+;;; ------------------------------------------------------------------
+
+(defun %fasl-object-marker (v)
+  "The marker symbol's name in slot 0 of an instance / class object, else NIL.
+   (Such an object is a #x32 array but not SIMPLE-VECTOR-P here.)"
+  (and (not (listp v)) (not (numberp v)) (not (characterp v)) (not (symbolp v))
+       (not (stringp v)) (not (pathnamep v)) (not (functionp v))
+       (let ((m (ignore-errors (svref v 0))))
+         (and m (symbolp m) (symbol-name m)))))
+
+(defun %fasl-instance-p (v)
+  (let ((m (%fasl-object-marker v)))
+    (and m (or (string= m "%CLOS-INSTANCE") (string= m "%STRUCT-INSTANCE")))))
+
+(defun %fasl-class-literal-p (v)
+  (and (let ((m (%fasl-object-marker v)))
+         (and m (or (string= m "%CLOS-CLASS") (string= m "%CLASS-PROXY"))))
+       (let ((n (ignore-errors (class-name v))))
+         (and n (symbolp n) (eq (find-class n nil) v)))))
+
+(defun %fasl-has-objects-p (form)
+  (let ((n 0))
+    (labels ((walk (v d)
+               (when (or (> d 200) (> n 20000)) (return-from %fasl-has-objects-p nil))
+               (loop
+                 (setq n (+ n 1))
+                 (cond ((consp v) (walk (car v) (+ d 1)) (setq v (cdr v)))
+                       ((or (%fasl-instance-p v) (%fasl-class-literal-p v))
+                        (return-from %fasl-has-objects-p t))
+                       ((and (simple-vector-p v) (not (stringp v)))
+                        (dotimes (i (length v)) (walk (svref v i) (+ d 1)))
+                        (return nil))
+                       (t (return nil))))))
+      (walk form 0)
+      nil)))
+
+(defun %fasl-objects-in (form)
+  "The instances FORM refers to, in first-reference order."
+  (let ((acc nil))
+    (labels ((walk (v d)
+               (when (< d 200)
+                 (loop
+                   (cond ((consp v) (walk (car v) (+ d 1)) (setq v (cdr v)))
+                         ((%fasl-instance-p v)
+                          (unless (member v acc :test (function eq)) (push v acc))
+                          (return nil))
+                         ((and (simple-vector-p v) (not (stringp v))
+                               (not (%fasl-class-literal-p v)))
+                          (dotimes (i (length v)) (walk (svref v i) (+ d 1)))
+                          (return nil))
+                         (t (return nil)))))))
+      (walk form 0))
+    (nreverse acc)))
+
+(defvar *%fasl-ext-counter* 0)
+
+(defun %fasl-ext-state ()
+  "One file's externalization state: (KEY TABLE PRE DEFERRED NEXT), TABLE an
+   alist object -> (index . :creating/:created)."
+  (setq *%fasl-ext-counter* (+ (if (integerp *%fasl-ext-counter*) *%fasl-ext-counter* 0) 1))
+  (list (format nil "~d-~d" (get-universal-time) *%fasl-ext-counter*) nil nil nil 0))
+
+(defun %fasl-ext-entry (xs obj) (cdr (assoc obj (nth 1 xs) :test (function eq))))
+
+(defun %fasl-datum-form (xs d)
+  "A form evaluating to datum D, its instances replaced by table references."
+  (cond ((%fasl-instance-p d)
+         (list '%fasl-obj-ref (nth 0 xs) (car (%fasl-ext-entry xs d))))
+        ((%fasl-class-literal-p d)
+         (list 'find-class (list 'quote (class-name d))))
+        ((not (%fasl-has-objects-p d)) (list 'quote d))
+        ((consp d) (list 'cons (%fasl-datum-form xs (car d)) (%fasl-datum-form xs (cdr d))))
+        ((simple-vector-p d)
+         (cons 'vector (map 'list (lambda (e) (%fasl-datum-form xs e)) d)))
+        (t (list 'quote d))))
+
+(defun %fasl-subst-code (xs form)
+  "FORM with each literal object replaced: a quoted datum by a form building
+   it, a bare object by its table reference."
+  (cond ((or (%fasl-instance-p form) (%fasl-class-literal-p form))
+         (%fasl-datum-form xs form))
+        ((atom form) form)
+        ((and (eq (car form) 'quote) (consp (cdr form)))
+         (if (%fasl-has-objects-p (cadr form)) (%fasl-datum-form xs (cadr form)) form))
+        (t (let ((acc nil) (c form))
+             (loop
+               (cond ((consp c) (push (%fasl-subst-code xs (car c)) acc) (setq c (cdr c)))
+                     (t (return (let ((r (nreverse acc)))
+                                  (when c (setf (cdr (last r)) (%fasl-subst-code xs c)))
+                                  r)))))))))
+
+(defun %fasl-ext-push (xs form) (setf (nth 2 xs) (cons form (nth 2 xs))))
+
+(defun %fasl-ext-flush (xs)
+  "Emit every deferred initialization whose objects now all exist."
+  (loop
+    (let ((ready nil))
+      (dolist (d (nth 3 xs))
+        (when (and (null ready)
+                   (every (lambda (o) (eq (cdr (%fasl-ext-entry xs o)) :created)) (cadr d)))
+          (setq ready d)))
+      (unless ready (return nil))
+      (setf (nth 3 xs) (remove ready (nth 3 xs) :test (function eq)))
+      (%fasl-ext-push xs (%fasl-subst-code xs (car ready))))))
+
+(defun %fasl-ext-emit (xs obj)
+  (unless (%fasl-ext-entry xs obj)
+    (let ((idx (nth 4 xs)))
+      (setf (nth 4 xs) (+ idx 1))
+      (setf (nth 1 xs) (cons (cons obj (cons idx :creating)) (nth 1 xs)))
+      (multiple-value-bind (create init) (make-load-form obj)
+        (dolist (d (%fasl-objects-in create))
+          (unless (eq d obj)
+            (let ((e (%fasl-ext-entry xs d)))
+              (when (and e (eq (cdr e) :creating))
+                (error "circular MAKE-LOAD-FORM creation dependency between ~S and ~S" obj d))
+              (%fasl-ext-emit xs d))))
+        (%fasl-ext-push xs (list '%fasl-obj-set (nth 0 xs) idx (%fasl-subst-code xs create)))
+        (setf (cdr (%fasl-ext-entry xs obj)) :created)
+        (when init
+          (let ((deps (remove obj (%fasl-objects-in init) :test (function eq))))
+            (dolist (d deps) (%fasl-ext-emit xs d))
+            (let ((waiting (remove-if (lambda (d) (eq (cdr (%fasl-ext-entry xs d)) :created))
+                                      deps)))
+              (if waiting
+                  (setf (nth 3 xs) (cons (list init waiting) (nth 3 xs)))
+                  (%fasl-ext-push xs (%fasl-subst-code xs init))))))
+        (%fasl-ext-flush xs)))))
+
+(defun %fasl-externalize (form xs)
+  "(PRE-FORMS . NEW-FORM) for FORM: the creation / initialization forms of
+   the objects it refers to not yet written, then FORM referring to them.
+   Anything going wrong (no MAKE-LOAD-FORM method, a circular creation, a
+   form the fasl cannot write) restores the state and signals: FORM then
+   stays source, as before."
+  (let ((saved-table (mapcar (lambda (e) (cons (car e) (cons (cadr e) (cddr e)))) (nth 1 xs)))
+        (saved-deferred (nth 3 xs))
+        (saved-next (nth 4 xs))
+        (ok nil))
+    (unwind-protect
+         (progn
+           (setf (nth 2 xs) nil)
+           (dolist (o (%fasl-objects-in form)) (%fasl-ext-emit xs o))
+           (let ((r (cons (reverse (nth 2 xs)) (%fasl-subst-code xs form))))
+             (dolist (f (cons (cdr r) (car r)))
+               (when (stringp (catch '%fasl-reject (%fasl-encode f)))
+                 (error "an externalized form cannot be written")))
+             (setq ok t)
+             r))
+      (unless ok
+        (setf (nth 1 xs) saved-table)
+        (setf (nth 3 xs) saved-deferred)
+        (setf (nth 4 xs) saved-next)))))
+
+(defvar *%fasl-object-table* nil)
+
+(defun %fasl-obj-set (key idx v)
+  (unless (and (boundp '*%fasl-object-table*) (hash-table-p *%fasl-object-table*))
+    (setq *%fasl-object-table* (make-hash-table :test (function equal))))
+  (setf (gethash (cons key idx) *%fasl-object-table*) v)
+  v)
+
+(defun %fasl-obj-ref (key idx)
+  (multiple-value-bind (v found)
+      (if (and (boundp '*%fasl-object-table*) (hash-table-p *%fasl-object-table*))
+          (gethash (cons key idx) *%fasl-object-table*)
+          (values nil nil))
+    (unless found (error "a compiled file's literal object ~D was not created" idx))
+    v))
+
 (defun %fasl-compile-file (in out)
   "Compile the file IN to a compiled fasl at OUT; T.  NIL (and OUT untouched)
    where this image cannot -- off the main thread, or a build-time compile --
@@ -795,7 +987,8 @@
            (fx (list :record "compile-file" text 0 nil nil t))
            (eof (cons nil nil))
            (sv-only *fasl-compile-only*)
-           (sv-handled *fasl-compile-handled*))
+           (sv-handled *fasl-compile-handled*)
+           (xs (%fasl-ext-state)))
       (unwind-protect
            (loop
              (let ((form (%fasl-read fx eof)))
@@ -803,6 +996,21 @@
                (%compile-file-toplevel-effects form)
                (setq *fasl-compile-handled* (%fasl-cf-handled-p form))
                (setq *fasl-compile-only* t)
+               ;; Literal objects (#.(make-instance ...)) become MAKE-LOAD-FORM
+               ;; creation / initialization forms of their own, ahead of FORM.
+               (let ((ext (and (%fasl-has-objects-p form)
+                               (handler-case (%fasl-externalize form xs)
+                                 (error (c) nil)))))
+                 (when ext
+                   (let ((own (car (nth 4 fx))))
+                     (setf (nth 4 fx) (cdr (nth 4 fx)))
+                     (dolist (pre (car ext))
+                       (setf (nth 4 fx) (cons (list (nth 0 own) (nth 0 own) nil pre)
+                                              (nth 4 fx)))
+                       (handler-case (%fasl-eval fx pre) (error (c) nil)))
+                     (setq form (cdr ext))
+                     (setf (nth 4 fx) (cons (list (nth 0 own) (nth 1 own) nil form)
+                                            (nth 4 fx))))))
                ;; A form that does not compile is left as source: LOAD meets
                ;; the error where the source-copying COMPILE-FILE let it.
                (handler-case (%fasl-eval fx form)

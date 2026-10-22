@@ -8559,7 +8559,15 @@
    methods on STANDARD-OBJECT, STRUCTURE-OBJECT, and CONDITION.
    Top-level forms don't auto-run on bare-metal builds, so this has
    to be called explicitly from kernel-main."
-  (%defgeneric 'make-load-form '(object &optional environment) nil)
+  ;; Keep the image's own MAKE-LOAD-FORM (it dispatches by name already):
+  ;; letting %MAKE-GF EVAL a dispatch stub this early in boot compiled the
+  ;; stub's quoted name as an unrelated string, and every MAKE-LOAD-FORM
+  ;; call then signalled "undefined generic function
+  ;; \"%MVM-EVAL-THUNK$$LAMBDA2\"" (upstream MAKE-LOAD-FORM.13-15).
+  (let ((saved (and (boundp '*gf-stub-reuse-fbound*) *gf-stub-reuse-fbound*)))
+    (setq *gf-stub-reuse-fbound* t)
+    (%defgeneric 'make-load-form '(object &optional environment) nil)
+    (setq *gf-stub-reuse-fbound* saved))
   (%defmethod 'make-load-form nil '(standard-object)
               #'%make-load-form-default)
   (%defmethod 'make-load-form nil '(structure-object)

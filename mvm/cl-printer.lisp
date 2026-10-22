@@ -5549,8 +5549,16 @@
               ;; file streams; if binary tracking lands, this picks it up.
               (let ((et (stream-element-type s)))
                 (if (eq et 'character) t nil))
-              ;; All other composite stream types are character streams.
-              t))
+              ;; A composite stream reads what its input side reads: an echo
+              ;; or concatenated stream over binary files is binary
+              ;; (upstream MAKE-CONCATENATED-STREAM.22-24, MAKE-ECHO-STREAM.9
+              ;; read characters out of them).
+              (let ((data (ignore-errors (%stream-data s))))
+                (cond ((and (or (= ty 3) (= ty 4)) (consp data) (streamp (car data)))
+                       (%input-stream-reads-chars-p (car data)))
+                      ((and (= ty 6) (consp data) (consp (car data)) (streamp (car (car data))))
+                       (%input-stream-reads-chars-p (car (car data))))
+                      (t t)))))
         ;; Non-stream designator resolved to a serial/terminal fallback —
         ;; treat as character.
         t)))
@@ -5620,6 +5628,13 @@
         (error 'type-error :datum end :expected-type 'unsigned-byte))
       (cons (or start 0) end))))
 
+(defun %rs-read-byte (stream)
+  "READ-SEQUENCE's byte read: a file stream directly, a composite one through
+   READ-BYTE (which reads through echo / concatenated / two-way streams)."
+  (cond ((not (streamp stream)) :eof-sentinel-7770002)
+        ((= (%stream-type stream) 9) (%fs-read-byte stream nil :eof-sentinel-7770002))
+        (t (read-byte stream nil :eof-sentinel-7770002))))
+
 (defun read-sequence (seq stream &rest args)
   "Read elements from STREAM into SEQ. Returns end position."
   (let* ((%bounds (%rw-seq-bounds args))
@@ -5637,9 +5652,7 @@
             (when (or (>= i actual-end) (null cell)) (return-from read-sequence i))
             (let ((x (if char-stream
                          (%read-char-from-stream in nil :eof-sentinel-7770002)
-                         (if (streamp stream)
-                             (%fs-read-byte stream nil :eof-sentinel-7770002)
-                             :eof-sentinel-7770002))))
+                         (%rs-read-byte stream))))
               (when (eq x :eof-sentinel-7770002) (return-from read-sequence i))
               (rplaca cell x))
             (setq cell (cdr cell))
@@ -5659,9 +5672,7 @@
                   ;; (CLHS string element access) and stores the CHARACTER
                   ;; object unchanged into a general vector.
                   (aset seq i ch)))
-            (let ((b (if (streamp stream)
-                         (%fs-read-byte stream nil :eof-sentinel-7770002)
-                         :eof-sentinel-7770002)))
+            (let ((b (%rs-read-byte stream)))
               (if (eq b :eof-sentinel-7770002)
                   (return i)
                   (aset seq i b))))

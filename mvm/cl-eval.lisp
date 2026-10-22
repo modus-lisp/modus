@@ -881,8 +881,14 @@
              ((null key) nil)
              ;; SYM's own-package expander wins over the legacy bare entry.
              ((%macro-pkg-get sym key))
-             ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
-             ((%macro-pkg-foreign-p sym key) nil)
+             ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P)
+             ;; -- unless SYM is COMMON-LISP's own: a package that shadows
+             ;; CL:HANDLER-CASE and DEFMACROs its own (ansi-test's CL-TEST
+             ;; does) hid the CL one (upstream MACRO-FUNCTION.1-3).
+             ((and (not (let ((p (ignore-errors (symbol-package sym))))
+                          (and p (string= (package-name p) "COMMON-LISP"))))
+                   (%macro-pkg-foreign-p sym key))
+              nil)
              ((and *macro-function-table* (gethash key *macro-function-table*)))
              ;; Compiler inlining macros over standard CL FUNCTIONS are
              ;; filtered here — see %MACRO-TABLE-VISIBLE-EXPANDER.

@@ -775,9 +775,22 @@
         ((eq (car a) :allow-other-keys)  nil)
         (t (unless allow-other-keys (%signal-program-error))))
       (setq a (cddr a)))
-    ;; Check for existing package
-    (when (find-package name-str)
-      (return-from make-package (find-package name-str)))
+    ;; A name or nickname already in use is a correctable PACKAGE-ERROR
+    ;; (CLHS MAKE-PACKAGE; upstream MAKE-PACKAGE.ERROR.1-4): CONTINUE answers
+    ;; the existing package -- what this always returned silently, and still
+    ;; does for the CL-TEST alias above.
+    (let ((existing (or (find-package name-str)
+                        (let ((hit nil))
+                          (dolist (n (%mapcar-pkg-string-designator nicknames) hit)
+                            (unless hit (setq hit (find-package n))))))))
+      (when existing
+        (if (string= name-str "CL-TEST")
+            (return-from make-package existing)
+            (restart-case
+                (error 'package-error :package name-str)
+              (continue ()
+                :report "Use the existing package."
+                (return-from make-package existing))))))
     ;; Create package
     (let ((pkg (%make-package-object name-str)))
       ;; Set nicknames (coerce to strings)
@@ -1465,6 +1478,13 @@
 
 ;;; --- defpackage ---
 
+(defun %defpkg-missing-symbol (from-pkg)
+  "DEFPACKAGE :IMPORT-FROM / :SHADOWING-IMPORT-FROM named a symbol FROM-PKG
+   does not have: a correctable PACKAGE-ERROR (CLHS), CONTINUE skipping it.
+   (It was skipped silently: upstream DEFPACKAGE.24/25.)"
+  (restart-case (error 'package-error :package from-pkg)
+    (continue () :report "Skip the missing symbol." nil)))
+
 (defun %defpkg-pool-contains (pool s)
   "True if string S (case-sensitive) is already in POOL (list of strings).
    Used by %defpackage-impl's disjointness checks."
@@ -1640,18 +1660,20 @@
           (when from-pkg
             (dolist (sname (cdr spec))
               (let ((sname-str (%pkg-string-designator sname)))
-                (let ((found (find-symbol sname-str from-pkg)))
-                  (when found
-                    (shadowing-import found pkg))))))))
+                (multiple-value-bind (found status) (find-symbol sname-str from-pkg)
+                  (if status
+                      (shadowing-import found pkg)
+                      (%defpkg-missing-symbol from-pkg))))))))
       ;; Import-from: ((pkg-name sym-name ...) ...)
       (dolist (spec import-from)
         (let ((from-pkg (%resolve-package (car spec))))
           (when from-pkg
             (dolist (sname (cdr spec))
               (let ((sname-str (%pkg-string-designator sname)))
-                (let ((found (find-symbol sname-str from-pkg)))
-                  (when found
-                    (import found pkg))))))))
+                (multiple-value-bind (found status) (find-symbol sname-str from-pkg)
+                  (if status
+                      (import found pkg)
+                      (%defpkg-missing-symbol from-pkg))))))))
       ;; Intern
       (dolist (sname intern-names)
         (intern (%pkg-string-designator sname) pkg))

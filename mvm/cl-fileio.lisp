@@ -2455,10 +2455,15 @@
           ;; get-output-stream-string output.
           ((= ty 3)
            (let ((data (%stream-data s)))
-             (let ((ch (%read-char-from-stream (car data) eof-error-p eof-value)))
-               (when (characterp ch)
-                 (%write-char-to-stream (%ensure-char-code ch) (cdr data)))
-               ch)))
+             ;; read with a private EOF marker: the caller's EOF-VALUE can
+             ;; itself be a character, and it was echoed (upstream
+             ;; MAKE-ECHO-STREAM.7: output "fooz" for input "foo")
+             (let ((ch (%read-char-from-stream (car data) nil :echo-eof-7770004)))
+               (cond ((eq ch :echo-eof-7770004)
+                      (if eof-error-p (%signal-eof s) eof-value))
+                     (t (when (characterp ch)
+                          (%write-char-to-stream (%ensure-char-code ch) (cdr data)))
+                        ch)))))
           ;; Two-way stream: read from input side
           ((= ty 4)
            (%read-char-from-stream (car (%stream-data s)) eof-error-p eof-value))

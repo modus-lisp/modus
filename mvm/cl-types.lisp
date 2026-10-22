@@ -4946,12 +4946,17 @@
   (if extra
       (%program-error "asin requires exactly 1 argument")
       (cond ((and (integerp x) (= x 0)) 0)
+            ;; CLHS: asin z = -i asinh(iz) for a complex Z (it answered a
+            ;; real)
+            ((complexp x) (* #c(0 -1) (asinh (* #c(0 1) x))))
             (t (%irr-result (%asin-f (%any-to-float x)) x)))))
 
 (defun acos (x &rest extra)
   (if extra
       (%program-error "acos requires exactly 1 argument")
       (cond ((and (integerp x) (= x 1)) 0)
+            ;; CLHS: acos z = pi/2 - asin z, in Z's float format
+            ((complexp x) (- (float (* 0.5d0 pi) (realpart (asin x))) (asin x)))
             ((and (integerp x) (= x 0)) (%round-to-single (%fpi/2)))
             (t (%irr-result (%float-sub (%fpi/2) (%asin-f (%any-to-float x))) x)))))
 
@@ -4965,6 +4970,9 @@
       ((= n 1)
        (let ((x (car args)))
          (cond ((and (integerp x) (= x 0)) 0)
+               ;; CLHS: atan z = -i atanh(iz) for a complex Z -- always a
+               ;; complex result (it answered a real: upstream ATAN.7-9)
+               ((complexp x) (* #c(0 -1) (atanh (* #c(0 1) x))))
                (t (%irr-result (%atan-f (%any-to-float x)) x)))))
       ((= n 2)
        (let* ((ya (car args)) (xa (car (cdr args)))

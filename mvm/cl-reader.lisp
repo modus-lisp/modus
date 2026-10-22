@@ -1231,8 +1231,11 @@
              (when (car ec) (setq any-escape t) (return nil))
              (setq ec (cdr ec)))
            (cond
-             ((and (not any-escape) (string-equal name-str "NIL")) nil)
-             ((and (not any-escape) (string-equal name-str "T")) t)
+             ;; CASE-SENSITIVE, after the readtable case was applied: under
+             ;; :PRESERVE / :DOWNCASE / :INVERT the token "t" names the symbol
+             ;; |t|, not T (upstream READ-SYMBOL.16-18).
+             ((and (not any-escape) (string= name-str "NIL")) nil)
+             ((and (not any-escape) (string= name-str "T")) t)
              (t (intern name-str *package*)))))
         ;; Leading colon — keyword
         ((= colon-pos 0)

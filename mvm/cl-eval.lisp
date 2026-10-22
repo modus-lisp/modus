@@ -13,7 +13,9 @@
 (defun %sft-init ()
   "Initialize the symbol-function table.
    Keyed by name-string, so :TEST 'EQUAL is mandatory."
-  (setq *symbol-function-table* (make-hash-table :test 'equal)))
+  (setq *symbol-function-table* (make-hash-table :test 'equal))
+  ;; its pairs are cached by the JIT bridge and the interpreter (see REMHASH)
+  (setq *%ht-pinned-pairs* (cons *symbol-function-table* *%ht-pinned-pairs*)))
 
 ;;; Parallel hash → function table, keyed by the 60-bit FNV-1a hash that
 ;;; native MVM symbols carry in slot 0. ANSI (funcall 'sym ...) / (apply
@@ -306,7 +308,15 @@
         (return-from fmakunbound sym))
       (when (and (> (length name) 0) *symbol-function-table*)
         (%jit-fnaddr-thunk-invalidate name)
-        (remhash name *symbol-function-table*))
+        (remhash name *symbol-function-table*)
+        ;; A native caller reaches NAME through its linkage stub: point that
+        ;; at a bridge that resolves NAME when called (UNDEFINED-FUNCTION
+        ;; now), not at the code just unbound.
+        (when (fboundp (quote %jit-x64-stub-retarget))
+          (%jit-x64-stub-retarget name nil))
+        ;; and NAME stops naming its generic function, if it had one
+        (when (fboundp (quote %gf-forget))
+          (%gf-forget sym)))
       (when *native-sym-function-table*
         (remhash hash *native-sym-function-table*))
       ;; Also clear any RUNTIME-registered macro binding (defmacro via
@@ -1636,24 +1646,26 @@
       (%gf-dispatch (%gf-name fn) nil)
       (%signal-undefined-function)))
 
+;; FUNCALL of the GF OBJECT dispatches THAT object (after FMAKUNBOUND its
+;; name may name another GF), and one or two arguments cons no list.
 (defun %funcall-gf-1 (fn a)
   (if (%gf-p fn)
-      (%gf-dispatch (%gf-name fn) (list a))
+      (%gf-dispatch-1g fn (%gf-name fn) a)
       (%signal-undefined-function)))
 
 (defun %funcall-gf-2 (fn a b)
   (if (%gf-p fn)
-      (%gf-dispatch (%gf-name fn) (list a b))
+      (%gf-dispatch-2g fn (%gf-name fn) a b)
       (%signal-undefined-function)))
 
 (defun %funcall-gf-3 (fn a b c)
   (if (%gf-p fn)
-      (%gf-dispatch (%gf-name fn) (list a b c))
+      (%gf-dispatch (%gf-name fn) (list a b c) fn)
       (%signal-undefined-function)))
 
 (defun %funcall-gf-4 (fn a b c d)
   (if (%gf-p fn)
-      (%gf-dispatch (%gf-name fn) (list a b c d))
+      (%gf-dispatch (%gf-name fn) (list a b c d) fn)
       (%signal-undefined-function)))
 
 (defun eval (form)

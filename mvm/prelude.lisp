@@ -1876,6 +1876,14 @@
                (when vec (%ht-addr-stale ht))
                value)))))))
 
+(defvar *%ht-pinned-pairs* nil
+  "Hash tables whose (key . value) PAIRS are cached outside the table -- the
+   symbol-function table: the JIT bridge and the interpreter's call cells keep
+   a name's pair, relying on PUTHASH updating it in place.  REMHASH never
+   reuses such a table's pair for another entry (its O(1) path does exactly
+   that) and clears the removed pair's value, so a cache holding it resolves
+   the name again.")
+
 (defun remhash (key ht)
   "Remove KEY from hash table HT. Returns T if removed, NIL otherwise.
    Keeps the bucket index (if any) and the holder count in sync."
@@ -1904,7 +1912,8 @@
                            (%ht-bucket-entry vec (car head) strcmp? addr?))))
              (cond
                ((eq head pair) (set-car ht (cdr entries)))
-               ((and (consp e0) (eq (cdr e0) head))
+               ((and (consp e0) (eq (cdr e0) head)
+                     (not (member ht *%ht-pinned-pairs* :test (function eq))))
                 ;; O(1): the newest entry moves into PAIR's cell and the head
                 ;; cell is dropped.  Unlinking PAIR itself meant walking the
                 ;; alist to it -- linear in the table: cl-bench HTABLE-SET+
@@ -1928,6 +1937,8 @@
                     (setq cur (cdr cur)))))))
            (%ht-bucket-rem vec key strcmp? addr?)
            (%ht-h-set-count holder (- (%ht-h-count holder) 1))
+           (when (member ht *%ht-pinned-pairs* :test (function eq))
+             (set-cdr pair nil))
            (return-from remhash t))))))
   (let* ((entries (car ht))
          (cmp (%ht-keytest ht))

@@ -164,6 +164,12 @@
    (write(2) to fd=1; exit(2) with status).  NIL is bare-metal (UART
    MMIO, infinite WFI loop).")
 
+(defvar *aarch64-no-call-pad* nil
+  "NIL (the default -- NIL so a self-hosted compiler, whose non-NIL defvar
+   inits may not run, agrees with the host): emit a 16-byte call pad before every image function (see the pad in
+   TRANSLATE-MVM-TO-AARCH64): direct calls enter there, function objects
+   16 bytes on, and a run-time redefinition patches the pad.")
+
 (defvar *aarch64-fn-align-offset* 0
   "Bytes of pre-native-code wrapper between load-addr and the first
    instruction of native code at runtime.  Bare-metal puts native code
@@ -1013,11 +1019,50 @@
     (a64-emit buf #x3900016D)                         ; STRB w13, [x11]
     (a64-set-label buf skip)))
 
+;;; THE MARKS ARE OUT OF LINE.  EMIT-AARCH64-GC-SET-BIT is 16 instructions, and
+;;; every allocation site paid it inline -- every cons twice.  Measured on a
+;;; saved Zero core (natrium, seal, cl-transport, cl-nostr; 2026-10-22): 370,086
+;;; start marks and 185,602 cons marks, ~7.8 M of the arena's 11.3 M live
+;;; instructions -- two thirds of all native code, in a 64 MB arena the board
+;;; cannot grow.  So, as the shared-store guard does: one subroutine per mark
+;;; per translation unit, emitted at the unit's end, and each site is two
+;;; instructions -- ADR x15 (the return), B.  It returns with BR x15: x30 is
+;;; untouched, and x15 holds no vreg (*A64-VREG-TO-PHYS*); the body clobbers
+;;; x9..x13 exactly as the inline mark did.
+
+(defvar *a64-mark-start-label* nil
+  "The current unit's object-start mark subroutine, or NIL.  SETQ'd, never bound.")
+(defvar *a64-mark-cons-label* nil
+  "The current unit's cons-kind mark subroutine, or NIL.  SETQ'd, never bound.")
+
+(defun a64-emit-mark-call (buf label)
+  (let ((adr (a64-current-index buf)))
+    (a64-emit buf (logior #x10000000 +a64-x15+))       ; ADR x15, <return>
+    (a64-emit-call-label buf label t)                   ; B mark (any length)
+    (setf (aref (a64-buffer-code buf) adr)
+          (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
+                  +a64-x15+))))
+
+(defun a64-emit-mark-subs (buf)
+  "At a unit's end: the mark subroutines its sites called."
+  (when *a64-mark-start-label*
+    (a64-set-label buf *a64-mark-start-label*)
+    (emit-aarch64-gc-set-bit buf #x10000E18)
+    (a64-br buf +a64-x15+)
+    (setq *a64-mark-start-label* nil))
+  (when *a64-mark-cons-label*
+    (a64-set-label buf *a64-mark-cons-label*)
+    (emit-aarch64-gc-set-bit buf #x10000E40)
+    (a64-br buf +a64-x15+)
+    (setq *a64-mark-cons-label* nil)))
+
 (defun emit-aarch64-gc-mark-start (buf)
   "Set the OBJECT-START bit (bitmap base @0x10000E18) for the object at x24.
    Emitted at every alloc site under *aarch64-gc-bitmap-enabled*."
   (when *aarch64-gc-bitmap-enabled*
-    (emit-aarch64-gc-set-bit buf #x10000E18)))
+    (unless *a64-mark-start-label*
+      (setq *a64-mark-start-label* (incf *mvm-label-counter*)))
+    (a64-emit-mark-call buf *a64-mark-start-label*)))
 
 (defun emit-aarch64-gc-mark-cons (buf)
   "WS4-AA64 #160 bug#4: ALSO set the CONS-KIND bit (bitmap base @0x10000E40) for
@@ -1025,7 +1070,9 @@
    car+cdr) rather than reading car as an object header.  Emitted only at the
    CONS alloc site, after emit-aarch64-gc-mark-start."
   (when *aarch64-gc-bitmap-enabled*
-    (emit-aarch64-gc-set-bit buf #x10000E40)))
+    (unless *a64-mark-cons-label*
+      (setq *a64-mark-cons-label* (incf *mvm-label-counter*)))
+    (a64-emit-mark-call buf *a64-mark-cons-label*)))
 
 ;;; --- ADD (shifted register) ---
 ;;; sf|0|0|01011|shift(2)|0|Rm(5)|imm6(6)|Rn(5)|Rd(5)
@@ -2083,6 +2130,65 @@
           (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
                   +a64-x9+))))
 
+;;; ---- BULK-MOVE / BULK-FILL bodies (as/objdump on the Pi 5, 2026-10-13) ----
+;;; Fixed blocks; every branch is relative and lands inside its block (each
+;;; ends in the NOP its exits target).
+(defparameter *a64-bulk-move-words*
+  ;; x9 dst, x10 src, x11 nbytes; temps x12 x13.  memmove: forward in 16/8/1-byte
+  ;; steps, or, when dst lies inside (src, src+n), backward in 8/1-byte steps.
+  '(#xB400046B #xEB0A013F #x54000229 #x8B0B014C #xEB0C013F #x540001C2 #x8B0B0129
+    #x8B0B014A #xF100217F #x540000A3 #xF85F8D4C #xF81F8D2C #xD100216B #x17FFFFFB
+    #xB40002AB #x385FFD4C #x381FFD2C #xD100056B #x17FFFFFC #xF100417F #x540000A3
+    #xA8C1354C #xA881352C #xD100416B #x17FFFFFB #xF100217F #x54000083 #xF840854C
+    #xF800852C #xD100216B #xB40000AB #x3840154C #x3800152C #xD100056B #x17FFFFFC
+    #xD503201F))
+(defparameter *a64-bulk-fill-words-words*
+  ;; x9 addr, x10 nwords, x11 the word: STP pairs, then one STR
+  '(#xF100095F #x54000083 #xA8812D2B #xD100094A #x17FFFFFC #xB400004A #xF900012B
+    #xD503201F))
+(defparameter *a64-bulk-fill-bytes-words*
+  ;; x9 addr, x10 nbytes, x11 the byte: x11 *= #x0101010101010101, 8-byte
+  ;; stores, then STRB; temp x12
+  '(#xB200C3EC #x9B0C7D6B #xF100215F #x54000083 #xF800852B #xD100214A #x17FFFFFC
+    #xB400008A #x3800152B #xD100054A #x17FFFFFD #xD503201F))
+
+(defun a64-bulk-elt-addr (buf rd pobj pidx bytes)
+  "RD := address of element PIDX (tagged) of PObj: +7+idx*8 for word slots, +7+idx for bytes."
+  (a64-add-imm buf rd pobj 7)
+  (if bytes
+      (a64-add-reg buf rd rd pidx 2 1)                  ; ASR #1
+      (a64-add-reg buf rd rd pidx 0 2)))                ; LSL #2
+
+(defun a64-bulk-guard-pass (buf)
+  "Before a word BULK-MOVE with threads live: every source word through the
+   shared-store guard, against the destination object in x17 -- the per-element
+   check ASET makes, done ahead of the copy.  x9 dst, x10 src, x11 nbytes are
+   preserved; the guard clobbers x9-x15, so the walk runs on x16/x17 and the
+   stack.  Single-threaded (the gate word is 0) it is one load and a branch."
+  (a64-load-conv-addr buf +a64-x12+ #x10000DB8)
+  (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ 0)
+  (let ((skip (a64-current-index buf)))
+    (a64-emit buf (logior #xB4000000 +a64-x12+))         ; CBZ x12, skip (patched)
+    (a64-stp-pre buf +a64-x9+ +a64-x10+ +a64-sp+ -32)     ; [sp]=dst [sp+8]=src
+    (a64-stp-offset buf +a64-x11+ +a64-x17+ +a64-sp+ 16)  ; [sp+16]=n [sp+24]=target
+    (a64-mov-reg buf +a64-x16+ +a64-x10+)                ; cursor
+    (a64-add-reg buf +a64-x17+ +a64-x10+ +a64-x11+ 0 0)  ; end
+    (let ((top (a64-current-index buf)))
+      (a64-cmp-reg buf +a64-x16+ +a64-x17+)
+      (let ((exit (a64-current-index buf)))
+        (a64-emit buf (logior #x54000000 +cc-cs+))        ; B.HS done (patched)
+        (a64-ldr-unsigned buf +a64-x13+ +a64-x16+ 0)      ; the value
+        (a64-ldr-unsigned buf +a64-x14+ +a64-sp+ 24)      ; the target
+        (a64-emit-shared-store-guard buf +a64-x13+ +a64-x14+)
+        (a64-add-imm buf +a64-x16+ +a64-x16+ 8)
+        (a64-emit buf (logior #x14000000 (logand (- top (a64-current-index buf)) #x3FFFFFF)))
+        (setf (aref (a64-buffer-code buf) exit)
+              (logior #x54000000 (ash (logand (- (a64-current-index buf) exit) #x7FFFF) 5) +cc-cs+))))
+    (a64-ldp-offset buf +a64-x11+ +a64-x17+ +a64-sp+ 16)
+    (a64-ldp-post buf +a64-x9+ +a64-x10+ +a64-sp+ 32)
+    (setf (aref (a64-buffer-code buf) skip)
+          (logior #xB4000000 (ash (logand (- (a64-current-index buf) skip) #x7FFFF) 5) +a64-x12+))))
+
 ;;; Plain top-level functions and explicit calls, on purpose: this file is
 ;;; also compiled IN-IMAGE for the runtime JIT, and a first version built from
 ;;; FLET closures (one pushing onto its parent's variable) and a MACROLET that
@@ -2173,6 +2279,51 @@
 (defconstant +a64-percpu-ptr-addr+ #x1000FFE8
   "Per-thread window slot holding the per-CPU block's address: AArch64's GS
    base.  0 until %HA-PERCPU-INIT-CPU stores one, like a fresh GS.")
+
+;;; HEAP EXHAUSTED.  The native collector copied without checking that to-space
+;;; had room, so a live set larger than one semispace copied straight past its
+;;; end -- into the from-space it was still reading, or into the runtime
+;;; metadata at 0x10000000 -- and the machine wedged with nothing on the
+;;; console (a 60 MB live set on the Zero's 56 MB semispaces).  Now every copy
+;;; first checks free_ptr + size <= to_start + space_size; a collection that
+;;; cannot fit says so and stops.  It cannot recover: half the live set is
+;;; already forwarded.
+(defun emit-aarch64-gc-room-check (buf size-reg full-label)
+  "Branch to FULL-LABEL unless SIZE-REG more bytes fit in to-space.  Clobbers
+   x16/x17 (copy_object scratch, not yet live where this is emitted)."
+  (a64-add-reg buf +a64-x16+ +a64-x21+ size-reg 0 0)   ; free_ptr + size
+  (a64-add-reg buf +a64-x17+ +a64-x22+ +a64-x25+ 0 0)  ; to_end = to_start + space_size
+  (a64-cmp-reg buf +a64-x16+ +a64-x17+)
+  (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i full-label :bcond))) ; HI
+
+(defun emit-aarch64-gc-exhausted (buf)
+  "Print GC: HEAP EXHAUSTED and stop: exit_group(137) hosted, WFE forever on
+   bare metal."
+  (let ((msg (format nil "~%GC: HEAP EXHAUSTED (live data > one semispace)~%")))
+    (loop for ch across msg
+          do (a64-movz buf +a64-x16+ (char-code ch) 0)
+             (if *aarch64-linux-mode*
+                 (progn (a64-load-conv-addr buf +a64-x17+ #x100001F0)
+                        (a64-emit buf (logior #x39000000 (ash 17 5) 16))  ; strb w16,[x17]
+                        (a64-load-imm64 buf +a64-x0+ 2)
+                        (a64-mov-reg buf +a64-x1+ +a64-x17+)
+                        (a64-load-imm64 buf +a64-x2+ 1)
+                        (a64-load-imm64 buf +a64-x8+ 64)                  ; write
+                        (a64-svc buf 0))
+                 (progn (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
+                        (when *aarch64-serial-tx-poll*
+                          (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
+                            (a64-ldr-width buf +a64-x15+ +a64-x17+ offset 2)
+                            (a64-emit buf (logior (ash (ecase polarity (:tbz #b00110110) (:tbnz #b00110111)) 24)
+                                                  (ash bit 19) (ash (logand -1 #x3FFF) 5) +a64-x15+))))
+                        (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*)))))
+  (if *aarch64-linux-mode*
+      (progn (a64-load-imm64 buf +a64-x0+ 137)
+             (a64-load-imm64 buf +a64-x8+ 94)                             ; exit_group
+             (a64-svc buf 0))
+      (let ((top (a64-current-index buf)))
+        (a64-wfe buf)
+        (a64-b buf (- top (a64-current-index buf))))))
 
 (defun a64-gc-stat-addr (addr)
   "Where one of the aarch64-only words at 0x10000F20..0x10000F58 (the GC pause
@@ -3172,7 +3323,7 @@
                   (a64-svc buf 0)
                   (a64-brk buf 0)                              ; unreachable
                   (a64-set-label buf done)))
-               ((and *aarch64-linux-mode* (= code #x0542))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0542))
                 ;; %GC-SAFE-ENTER — this thread is about to BLOCK (a futex wait,
                 ;; a sleep) holding no heap pointer in a register: publish its
                 ;; SP and frontier and mark it SAFE, so a region-0 collector
@@ -3185,7 +3336,7 @@
                     (a64-stw-publish buf +a64-x14+ 2)
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
-               ((and *aarch64-linux-mode* (= code #x0544))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0544))
                 ;; %GC-COLLECT-NOW — enter the collector with no allocation to
                 ;; follow: the caller has set the limit to the pointer, so the
                 ;; trampoline collects the ACTIVE region (for the lock arena's
@@ -3193,7 +3344,7 @@
                 (a64-mov-reg buf +a64-x16+ +a64-x24+)
                 (a64-blr buf +a64-x28+)
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
-               ((and *aarch64-linux-mode* (= code #x0543))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0543))
                 ;; %GC-SAFE-LEAVE — running again: mark RUNNING, then (after a
                 ;; full barrier, so a collector that has not seen us running
                 ;; has set its flag where we can see it) check the flag.  Held:
@@ -3235,7 +3386,7 @@
                       (a64-b buf 0) (a64-add-fixup buf i again :b))
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
-               ((and *aarch64-linux-mode* (= code #x0541))
+               ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0541))
                 ;; %SET-THREAD-DELTA — THIS thread's per-thread-window delta
                 ;; (x0, tagged).  Linux: TPIDR_EL0 directly.  Darwin: the host
                 ;; shim stores it in the reserved pthread key
@@ -5658,6 +5809,46 @@
                                  (ash (logand lane 1) 20))))
              (a64-emit buf (logior base lbits (ash fb 16) (ash fa 5) fd))))
 
+          ;; ==== BULK MEMORY (mvm.lisp +op-bulk-move+ / +op-bulk-fill+) ====
+          ;; Element addresses as AREF (Vobj+7+idx*8) and U8-REF (Vobj+7+idx)
+          ;; compute them; the loops are the assembler-checked blocks in
+          ;; *A64-BULK-MOVE-WORDS* & co.  Operands go through x12-x16 only, so
+          ;; x17 (and x16 once loaded) survive to the guard pass below.
+          ;; ---- BULK-MOVE Vdst, Vdi, Vsrc, Vsi, Vn, kind ----
+          ((= op +op-bulk-move+)
+           (let ((bytes (= (vr 5) 1)))
+             (a64-bulk-elt-addr buf +a64-x9+ (ensure-src (vr 0) +a64-x12+)
+                                (ensure-src (vr 1) +a64-x13+) bytes)
+             (when (and (a64-ssg-p) (not bytes))
+               (a64-mov-reg buf +a64-x17+ (ensure-src (vr 0) +a64-x12+)))
+             (a64-bulk-elt-addr buf +a64-x10+ (ensure-src (vr 2) +a64-x14+)
+                                (ensure-src (vr 3) +a64-x15+) bytes)
+             (let ((pn (ensure-src (vr 4) +a64-x16+)))
+               (if bytes
+                   (a64-asr-imm buf +a64-x11+ pn 1)        ; n bytes
+                   (a64-lsl-imm buf +a64-x11+ pn 2)))      ; n words * 8
+             (when (and (a64-ssg-p) (not bytes))
+               (a64-bulk-guard-pass buf))
+             (dolist (w *a64-bulk-move-words*) (a64-emit buf w))))
+          ;; ---- BULK-FILL Varr, Vi, Vn, Vval, kind ----
+          ((= op +op-bulk-fill+)
+           (let ((bytes (= (vr 4) 1)))
+             ;; the one value, guarded once, before x9-x15 are in use (it
+             ;; clobbers them); x16/x17 are not the guard's
+             (when (and (a64-ssg-p) (not bytes))
+               (a64-emit-shared-store-guard buf (ensure-src (vr 3) +a64-x16+)
+                                            (ensure-src (vr 0) +a64-x17+)))
+             (a64-bulk-elt-addr buf +a64-x9+ (ensure-src (vr 0) +a64-x12+)
+                                (ensure-src (vr 1) +a64-x13+) bytes)
+             (a64-asr-imm buf +a64-x10+ (ensure-src (vr 2) +a64-x14+) 1)   ; n
+             (let ((pv (ensure-src (vr 3) +a64-x15+)))
+               (if bytes
+                   (progn (a64-lsl-imm buf +a64-x11+ pv 55)              ; low byte of
+                          (a64-lsr-imm buf +a64-x11+ +a64-x11+ 56)       ; the untagged value
+                          (dolist (w *a64-bulk-fill-bytes-words*) (a64-emit buf w)))
+                   (progn (a64-mov-reg buf +a64-x11+ pv)                   ; the tagged word
+                          (dolist (w *a64-bulk-fill-words-words*) (a64-emit buf w)))))))
+
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
           ;; Vidx is a TAGGED fixnum (real_idx*2); result is a TAGGED fixnum
@@ -7033,9 +7224,14 @@
   (a64-emit buf (logior #xC8DFFC00 (ash rn 5) rt)))
 
 (defun a64-sched-yield (buf)
-  "sched_yield(2): x8 = 124, SVC.  Clobbers x0 and x8."
-  (a64-movz buf +a64-x8+ 124 0)
-  (a64-svc buf 0))
+  "sched_yield(2): x8 = 124, SVC.  Clobbers x0 and x8.  Bare metal has no
+   scheduler to yield to: the spin's pause is the YIELD hint, and the loop
+   around it re-reads the flag (cores are never preempted, so nobody else
+   needs this one off its CPU)."
+  (if *aarch64-linux-mode*
+      (progn (a64-movz buf +a64-x8+ 124 0)
+             (a64-svc buf 0))
+      (a64-emit buf #xD503203F)))
 
 (defun a64-stw-table (buf rd skip)
   "Xd = the thread table if stop-the-world is ARMED, else branch to SKIP.
@@ -7100,11 +7296,27 @@
    the active region's saved-limit field (unless already clamped), so this
    thread's next allocation enters the trampoline and parks there.  Uses
    x15-x17 and x9 (scratch everywhere a YIELD is emitted)."
-  (let ((skip (incf *mvm-label-counter*)))
+  (let ((skip (incf *mvm-label-counter*))
+        (clamp (incf *mvm-label-counter*)))
     (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
     (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
     (a64-cmp-imm buf +a64-x16+ 0)
-    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (if *aarch64-linux-mode*
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+        ;; BARE METAL: also PREEMPTION.  A thread slot's time slice ends at the CNTVCT
+        ;; deadline in its per-CPU block (+0x3F00, 0 = none: the main thread, the
+        ;; schedulers); past it, clamp too, and the collector entry yields the core
+        ;; (EMIT-AARCH64-STW-ENTRY) -- at an allocation, the one place a thread can stop.
+        (progn
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i clamp :bcond))
+          (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
+          (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ #x3F00)
+          (a64-cmp-imm buf +a64-x15+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+          (a64-emit buf (logior #xD53BE040 +a64-x17+))                ; MRS x17, CNTVCT_EL0
+          (a64-cmp-reg buf +a64-x17+ +a64-x15+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i skip :bcond))))
+    (a64-set-label buf clamp)
     (a64-cmp-imm buf +a64-x25+ 0)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
     (a64-load-gc-region buf +a64-x15+ +a64-x16+)
@@ -7169,6 +7381,27 @@
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i park :bl))
       (emit-aarch64-stw-refresh buf reloaded)
       (a64-set-label buf no-park)
+      ;; BARE METAL: the time slice is up (EMIT-AARCH64-STW-CLAMP) -- yield the core.
+      ;; Every mutator register is in this frame, so the routine (net/bare-threads.lisp
+      ;; preempt, its address at 0x10213018) can switch away; when the scheduler runs
+      ;; this slot again, x24/x25 are whatever its region says now (a sibling may have
+      ;; collected it), so the requested end moves with x24 exactly as after a park.
+      (unless *aarch64-linux-mode*
+        (let ((nopre (incf *mvm-label-counter*)))
+          (a64-load-percpu-base buf +a64-x16+ +a64-x17+)
+          (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ #x3F00)
+          (a64-cmp-imm buf +a64-x15+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i nopre :bcond))
+          (a64-emit buf (logior #xD53BE040 +a64-x17+))                ; MRS x17, CNTVCT_EL0
+          (a64-cmp-reg buf +a64-x17+ +a64-x15+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i nopre :bcond))
+          (a64-mov-reg buf +a64-x19+ +a64-x24+)                       ; x24 before (x19 is in the frame)
+          (a64-load-imm64 buf +a64-x16+ #x10213018)
+          (a64-ldr-unsigned buf +a64-x15+ +a64-x16+ 0)
+          (a64-blr buf +a64-x15+)
+          (a64-mov-reg buf +a64-x13+ +a64-x19+)
+          (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i reloaded :b))
+          (a64-set-label buf nopre)))
       (a64-cmp-imm buf +a64-x25+ 0)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
       (a64-load-gc-region buf +a64-x15+ +a64-x16+)
@@ -7212,7 +7445,25 @@
       (a64-stw-table buf +a64-x9+ normal)
       (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))   ; region 0
       (a64-cmp-reg buf +a64-x17+ +a64-x10+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i normal :bcond))
+      (if *aarch64-linux-mode*
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i normal :bcond))
+          ;; BARE METAL: a core's region is SHARED by the thread slots that run on
+          ;; that core as coroutines (net/bare-threads.lisp), so collecting it is
+          ;; a SIBLING collection (frame mode 2): no stop flag -- the siblings are
+          ;; parked by construction, one core runs one slot -- but their stacks and
+          ;; windows are roots, found as the records whose region (+0x40) is this
+          ;; slot's.  [sp+56] = that region ([sp+40] is the window scan's).
+          (let ((sib (incf *mvm-label-counter*)))
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sib :bcond))
+            (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+            (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
+            (a64-str-unsigned buf +a64-x13+ +a64-sp+ 8)
+            (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x40)
+            (a64-str-unsigned buf +a64-x10+ +a64-sp+ 56)
+            (a64-movz buf +a64-x10+ 2 0)
+            (a64-str-unsigned buf +a64-x10+ +a64-sp+ 16)
+            (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i normal :b))
+            (a64-set-label buf sib)))
       (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
       (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
       (a64-str-unsigned buf +a64-x13+ +a64-sp+ 8)
@@ -7464,6 +7715,17 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i tloop :bcond)) ; not participating
       (a64-cmp-imm buf +a64-x10+ 3)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i tloop :bcond)) ; (cannot be: waited)
+      ;; Sibling mode (bare metal): only the slots sharing this region.
+      (unless *aarch64-linux-mode*
+        (let ((same (incf *mvm-label-counter*)))
+          (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+          (a64-cmp-imm buf +a64-x10+ 2)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i same :bcond))
+          (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x40)
+          (a64-ldr-unsigned buf +a64-x11+ +a64-sp+ 56)
+          (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i tloop :bcond))
+          (a64-set-label buf same)))
       ;; its stack window [SP, top)
       (a64-ldr-unsigned buf +a64-x26+ +a64-x14+ #x70)
       (a64-ldr-unsigned buf +a64-x10+ +a64-x14+ #x78)
@@ -7487,6 +7749,10 @@
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i tloop :b))
       ;; ---- carved thread regions [from, parked frontier) ----
       (a64-set-label buf rloop)
+      (unless *aarch64-linux-mode*                     ; sibling mode: stacks only
+        (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+        (a64-cmp-imm buf +a64-x10+ 2)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond)))
       (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 24)
       (a64-set-label buf rnext)
       (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 24)
@@ -7534,8 +7800,8 @@
   (when *a64-tls-window*
     (let ((skip (incf *mvm-label-counter*)))
       (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
-      (a64-cmp-imm buf +a64-x10+ 0)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+      (a64-cmp-imm buf +a64-x10+ 1)                   ; 0 none, 2 sibling (bare)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
       (emit-aarch64-stw-evac-finish buf)
       ;; Region 0's new frontier and limit, for a thread whose x24/x25 were in
       ;; it while another thread collected (EMIT-AARCH64-STW-REFRESH).
@@ -7574,13 +7840,13 @@
           (a64-cmp-reg buf +a64-x26+ +a64-x9+)))
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i cdone :bcond))
     ;; cons-kind check for cursor: conskind base @0x10000E40 (<<1)
-    (a64-load-real-addr buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0) (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-mov-reg buf +a64-x10+ +a64-x7+)
     (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)  ; cursor - page_base
     (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x12+ 0 0) ; byte addr
     (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)              ; granule
-    (a64-movz buf +a64-x13+ 7 0) (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x13+) ; bit idx
+    (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x5+) ; bit idx
     (a64-ldrb buf +a64-x14+ +a64-x12+)
-    (a64-movz buf +a64-x15+ 1 0) (a64-lslv buf +a64-x15+ +a64-x15+ +a64-x11+)  ; mask
+    (a64-lslv buf +a64-x15+ +a64-x6+ +a64-x11+)  ; mask
     (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)     ; TST
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i is-cons :bcond)) ; set → cons
     ;; headered object
@@ -7616,8 +7882,17 @@
     (a64-set-label buf sloop)
     (a64-cmp-reg buf +a64-x23+ +a64-x26+)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i sdone2 :bcond))
-    (a64-mov-reg buf +a64-x9+ +a64-x23+)
-    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    ;; Only a word tagged 1 or 9 -- (word & 7) = 1 -- can be a pointer; anything else
+    ;; (fixnums, characters, raw data) is decided here, not in a BL/RET to scan_word
+    ;; per word, which was most of a collection: 16 ns a fixnum slot on a Pi Zero.
+    (let ((skip (incf *mvm-label-counter*)))
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x23+ 0)
+      (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+      (a64-cmp-imm buf +a64-x11+ 1)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+      (a64-mov-reg buf +a64-x9+ +a64-x23+)
+      (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+      (a64-set-label buf skip))
     (a64-add-imm buf +a64-x23+ +a64-x23+ 8)
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
     (a64-set-label buf sdone2)
@@ -7626,10 +7901,15 @@
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
     ;; cons: scan car @cursor, cdr @cursor+8
     (a64-set-label buf is-cons)
-    (a64-mov-reg buf +a64-x9+ +a64-x26+)
-    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
-    (a64-add-imm buf +a64-x9+ +a64-x26+ 8)
-    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (dolist (off '(0 8))                                 ; car, cdr: the same inline tag test
+      (let ((skip (incf *mvm-label-counter*)))
+        (a64-ldr-unsigned buf +a64-x10+ +a64-x26+ off)
+        (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+        (a64-cmp-imm buf +a64-x11+ 1)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+        (a64-add-imm buf +a64-x9+ +a64-x26+ off)
+        (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+        (a64-set-label buf skip)))
     (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cloop :b))
     (a64-set-label buf cdone)))
@@ -7698,9 +7978,9 @@
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7)
       (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)  ; byte addr
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)              ; granule
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+) ; bit idx
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+) ; bit idx
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)    ; mask=1<<bit
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)    ; mask=1<<bit
       (a64-ands-reg buf +a64-xzr+ +a64-x15+ +a64-x16+)     ; TST byte & mask
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i sret :bcond)) ; obj-start bit clear → skip
       ;; ---- CONS-KIND cross-check (x64-parity: emit-mcgc-cons-kind-or-jump) ----
@@ -7713,13 +7993,13 @@
       ;; read as a header → astronomical count → the copy loop runs off the mapped
       ;; heap → SIGSEGV (WS4-AA64 #160 root cause).  conskind base @0x10000E40 (<<1);
       ;; scratch x13..x17; preserves x9(word-addr)/x10(value)/x11(tag)/x12(raw).
-      (a64-load-real-addr buf +a64-x14+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x14+ +a64-x14+ 0) (a64-asr-imm buf +a64-x14+ +a64-x14+ 1)
+      (a64-mov-reg buf +a64-x14+ +a64-x7+)
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)          ; raw - page_base
       (a64-lsr-imm buf +a64-x15+ +a64-x13+ 7) (a64-add-reg buf +a64-x15+ +a64-x14+ +a64-x15+ 0 0) ; x15 = conskind byte addr
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)                      ; granule
-      (a64-movz buf +a64-x16+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x16+)  ; x13 = bit idx
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)  ; x13 = bit idx
       (a64-ldrb buf +a64-x16+ +a64-x15+)                           ; x16 = conskind byte
-      (a64-movz buf +a64-x17+ 1 0) (a64-lslv buf +a64-x17+ +a64-x17+ +a64-x13+)     ; x17 = mask = 1<<bit
+      (a64-lslv buf +a64-x17+ +a64-x6+ +a64-x13+)     ; x17 = mask = 1<<bit
       (let ((ck-tag1 (incf *mvm-label-counter*)) (ck-done (incf *mvm-label-counter*)))
         (a64-cmp-imm buf +a64-x11+ 1)                              ; tag == 1 (cons)?
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i ck-tag1 :bcond))
@@ -7754,7 +8034,8 @@
           (co-cons (incf *mvm-label-counter*))
           (co-done (incf *mvm-label-counter*))
           (oloop   (incf *mvm-label-counter*))
-          (odone   (incf *mvm-label-counter*)))
+          (odone   (incf *mvm-label-counter*))
+          (co-full (incf *mvm-label-counter*)))
       (a64-cmp-imm buf +a64-x14+ 15)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-fwd :bcond))
       (a64-cmp-imm buf +a64-x12+ 1)
@@ -7780,15 +8061,15 @@
       (a64-add-imm buf +a64-x15+ +a64-x15+ 15)
       (a64-lsr-imm buf +a64-x15+ +a64-x15+ 4)
       (a64-lsl-imm buf +a64-x15+ +a64-x15+ 4)            ; size aligned16
+      (emit-aarch64-gc-room-check buf +a64-x15+ co-full)
       (a64-add-reg buf +a64-x9+ +a64-x11+ +a64-x15+ 0 0) ; x9 = src end
       (a64-mov-reg buf +a64-x16+ +a64-x11+)              ; x16 = src ptr
       (a64-set-label buf oloop)
       (a64-cmp-reg buf +a64-x16+ +a64-x9+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i odone :bcond))
-      (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)
-      (a64-str-unsigned buf +a64-x17+ +a64-x21+ 0)
-      (a64-add-imm buf +a64-x16+ +a64-x16+ 8)
-      (a64-add-imm buf +a64-x21+ +a64-x21+ 8)
+      ;; 16 bytes a step: every object is 16-aligned and a multiple of 16 long
+      (a64-ldp-post buf +a64-x15+ +a64-x17+ +a64-x16+ 16)                ; LDP x15,x17,[x16],#16
+      (a64-emit buf (logior #xA8800000 (ash 2 15) (ash +a64-x17+ 10) (ash +a64-x21+ 5) +a64-x15+)) ; STP x15,x17,[x21],#16
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i oloop :b))
       (a64-set-label buf odone)
       (a64-add-imm buf +a64-x17+ +a64-x12+ 15) (a64-str-unsigned buf +a64-x17+ +a64-x11+ 0) ; fwd ptr
@@ -7797,13 +8078,15 @@
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
       ;; ---- cons: 16 bytes ----
       (a64-set-label buf co-cons)
+      (a64-movz buf +a64-x15+ 16 0)
+      (emit-aarch64-gc-room-check buf +a64-x15+ co-full)
       (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; dest_start
       (a64-str-unsigned buf +a64-x13+ +a64-x21+ 0)       ; car (x13 = first word)
       (a64-ldr-unsigned buf +a64-x14+ +a64-x11+ 8)       ; cdr = [src+8] (imm=BYTE offset, scaled /8)
@@ -7813,21 +8096,21 @@
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
       ;; ALSO set the CONS-KIND bit for dest (x12) so the type-aware to-space
       ;; scan classifies this copy as a cons.  conskind base @0x10000E40 (<<1).
       ;; NB: x10 holds the RETURN value (dest|1) — must NOT clobber it; use x9
       ;; for the base and x13..x17 for the bit math.
-      (a64-load-real-addr buf +a64-x9+ (conv-real #x10000E40)) (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0) (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
+      (a64-mov-reg buf +a64-x9+ +a64-x7+)
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x9+ +a64-x14+ 0 0)
       (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
-      (a64-movz buf +a64-x17+ 7 0) (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x17+)
+      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)
       (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-movz buf +a64-x16+ 1 0) (a64-lslv buf +a64-x16+ +a64-x16+ +a64-x13+)
+      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
       (a64-add-imm buf +a64-x21+ +a64-x21+ 16)           ; advance free_ptr
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
@@ -7836,7 +8119,9 @@
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 4) (a64-lsl-imm buf +a64-x14+ +a64-x14+ 4) ; new addr
       (a64-add-reg buf +a64-x10+ +a64-x14+ +a64-x12+ 0 0) ; new | orig tag
       (a64-set-label buf co-done)
-      (a64-ret buf))
+      (a64-ret buf)
+      (a64-set-label buf co-full)
+      (emit-aarch64-gc-exhausted buf))
 
     (a64-tramp-mark 3)
     ;; ============ SUBROUTINE park (stop-the-world; x14 = this thread's record) ============
@@ -7911,6 +8196,15 @@
       (load-fld +a64-x23+ +gc-off-stack-base+)          ; stack_base
       (load-abs +a64-x27+ #x10000E00)                   ; page_base
       (load-abs +a64-x28+ #x10000E18))                  ; obj-bitmap base
+    ;; Constants of the bitmap math for the whole collection, in registers the entry
+    ;; saved (x0-x17 are restored at exit; x0/x8 are left alone, the STW park's
+    ;; sched_yield clobbers them): x5 = 7, x6 = 1, x7 = cons-kind bitmap base.  They
+    ;; were rebuilt -- and the base RELOADED from 0x10000E40 -- per word and object.
+    (a64-movz buf +a64-x5+ 7 0)
+    (a64-movz buf +a64-x6+ 1 0)
+    (a64-load-real-addr buf +a64-x7+ (conv-real #x10000E40))
+    (a64-ldr-unsigned buf +a64-x7+ +a64-x7+ 0)
+    (a64-asr-imm buf +a64-x7+ +a64-x7+ 1)
     (emit-aarch64-stw-own-window-top buf)
     (a64-tramp-mark 4)
     ;; ---- scan THIS REGION'S ROOT WINDOW: [x26, stack_base) ----
@@ -8132,11 +8426,25 @@
           (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
           (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))
         (progn
-          (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
           (when (and (boundp '*aarch64-gc-limit-guard*)
                      (integerp *aarch64-gc-limit-guard*)
                      (> *aarch64-gc-limit-guard* 0))
             (a64-load-imm64-general buf +a64-x9+ *aarch64-gc-limit-guard*)
+            ;; BARE SMP (the per-thread window is on): a core's own region is
+            ;; 8 MB a semispace, so a flat 8 MB guard would put its limit at its
+            ;; start.  min(guard, space_size/4): region 0's 56 MB keeps 8 MB.
+            (when *a64-tls-window*
+              (let ((capped (incf *mvm-label-counter*)))
+                (a64-lsr-imm buf +a64-x10+ +a64-x25+ 2)          ; x10 = space_size/4
+                (a64-cmp-reg buf +a64-x10+ +a64-x9+)
+                (let ((i (a64-current-index buf)))
+                  (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i capped :bcond))
+                (a64-mov-reg buf +a64-x9+ +a64-x10+)
+                (a64-set-label buf capped))))
+          (a64-add-reg buf +a64-x25+ +a64-x22+ +a64-x25+ 0 0)
+          (when (and (boundp '*aarch64-gc-limit-guard*)
+                     (integerp *aarch64-gc-limit-guard*)
+                     (> *aarch64-gc-limit-guard* 0))
             (a64-sub-reg buf +a64-x25+ +a64-x25+ +a64-x9+ 0 0))))
     ;; gc_count += 1 (stored <<1 → += 2), IN THIS REGION
     (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ +gc-off-count+)
@@ -8603,6 +8911,7 @@
   (setf *aarch64-fn-addr-local-relocs* nil)
   (a64-slot-cache-flush)   ; never inherit a previous translation's state
   (setq *a64-ssg-label* nil)
+  (setq *a64-mark-start-label* nil *a64-mark-cons-label* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're
@@ -8696,6 +9005,26 @@
         (let ((label (gethash mvm-off mvm-to-native-label)))
           (when label
             (a64-set-label buf label)))
+        ;; THE CALL PAD.  A direct BL lands on the label above; the function
+        ;; OBJECT (fn-entry-offsets, so every #'NAME and the symbol-function
+        ;; table) is 16 bytes on, past four inert instructions.  Redefining a
+        ;; kernel function at run time rewrites only these 16 bytes, into a
+        ;; jump to NAME's late-binding thunk (%KERNEL-REDIRECT, mvm-eval), so
+        ;; every direct caller sees the new definition while a caller holding
+        ;; the OLD object still runs the old code.  ORR X17,XZR,X17 and not
+        ;; NOP so the patcher can tell a pad from alignment padding (<= 3
+        ;; NOPs).  Runtime-JIT code is late-bound through linkage cells and
+        ;; has no pad.
+        ;; The fourth is MOVZ X17,#(#x5200+N) instead when callers may pre-pack
+        ;; this function's &rest list after N required arguments
+        ;; (*fn-prepack-req*).
+        (when (and (not *aarch64-no-call-pad*) (not *aarch64-jit-mode*)
+                   (gethash mvm-off fn-bc-offsets))
+          (dotimes (i 3) (a64-emit buf #xAA1103F1))
+          (let ((pre (and *fn-prepack-req* (gethash mvm-off *fn-prepack-req*))))
+            (a64-emit buf (if (and pre (< pre 256))
+                              (logior #xD2800011 (ash (+ #x5200 pre) 5))
+                              #xAA1103F1))))
         ;; Record native position for function entries.  Subtract
         ;; translated-start-idx so offsets stay relative to the start
         ;; of the translated region (whether or not buf was shared
@@ -8727,6 +9056,8 @@
     (when *a64-ssg-label*
       (a64-emit-shared-store-guard-sub buf *a64-ssg-label*)
       (setq *a64-ssg-label* nil))
+    ;; The GC bitmap marks, when an allocation in this unit called them.
+    (a64-emit-mark-subs buf)
 
     ;; Pass 2: Resolve all branch fixups.  Skip if we're appending into
     ;; a shared buffer — the caller will resolve once after appending
@@ -8834,6 +9165,8 @@
         (when label
           (a64-set-label buf label))))
 
+    ;; The GC bitmap mark subroutines its allocations called.
+    (a64-emit-mark-subs buf)
     ;; Resolve fixups
     (a64-resolve-fixups buf)
 

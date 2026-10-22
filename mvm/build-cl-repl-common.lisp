@@ -398,6 +398,12 @@
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
 "
         "")
+    ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
+    ;; (AFTER the arena line: its own %BARE-SYNC-ARENA is cacheable RAM, which the
+    ;; SMP mutexes' LDAXR/STLXR need -- last-defun-wins).
+    (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
+        (%rpi-mvm-text "net/bare-threads.lisp")
+        "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
     ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
@@ -408,7 +414,8 @@
 (defun %console-init ()
   ;; The screen first, so everything after it (the USB-HID line, the banner)
   ;; shows on it too.  A display failure must not cost the keyboard.
-  (handler-case (hcon-init) (t (c) nil))
+  ;; Already up when a restored core brought it up before the REPL.
+  (unless (hcon-ready-p) (handler-case (hcon-init) (t (c) nil)))
   (hid-console-init))
 (defun %console-read-char () (hid-console-read-char))
 "
@@ -491,9 +498,52 @@
 ;;; bump word at %jit-exec-bump; the bitmaps are at their own fixed addresses
 ;;; and travel as slices.  Saving ends with CORE-END=<addr> on serial so a
 ;;; QEMU harness can dump exactly [0x18000000, addr) through the gdbstub.
-(defvar *cl-repl-rpi-core-source* "
+(defvar *cl-repl-rpi-core-source* (concatenate 'string "
+;; What a restored core runs before the REPL (see *cli-arch-core-resume*): a
+;; function designator, set just before SAVE-AND-DIE so the heap carries it.
+(defvar *core-restart-hook* nil)
 (defun %core-addr () #x18000000)
 (defun %core-cursor-slot () #x10000F60)
+;; Restore progress (lib/save-image.lisp %CORE-PROGRESS): the phase into a word
+;; of the Device RAM window (0x111Fxxxx survives a board reset; this word is
+;; between the HDMI font and the mutex arena, and the prologue does not clear it),
+;; readable afterwards from U-Boot (md 0x111F1F00) or the next boot's REPL.
+(defun %core-progress (k) (setf (mem-ref #x111F1F00 :u32) k))
+;; Before restoring: say how far the PREVIOUS boot's restore got (the word above
+;; survives a RUN-pin reset, so a boot that hung is read by the next one, and the
+;; restore itself is not touched -- printing from inside it has always made the
+;; hang go away), then give a person one second to skip the restore and get the
+;; bare REPL instead.  8 = it finished; 0 = it never reached phase 1 (or the
+;; board was powered off, which clears the word).
+(defun %core-pre-restore ()
+  (let ((last (mem-ref #x111F1F00 :u32)))
+    (write-string-serial \"LAST-RESTORE-PHASE=\")
+    (print-dec last)
+    (write-char-serial 10)
+    (setf (mem-ref #x111F1F00 :u32) 0)
+    ;; A SPLIT CORE (U-Boot netboot): U-Boot sits at the top of RAM while it loads,
+    ;; so only [0x18000000, ~0x1CB00000) is free for the core there.  The loader
+    ;; then puts the file's tail at a SPILL address and leaves a descriptor at
+    ;; 0x111F1F10: 'SPLT', the slot end, the spill address.  Taken here into
+    ;; 0x111F1F20/24 for %CORE-READ-ALL and cleared, so a descriptor surviving a
+    ;; RUN-pin reset can never redirect a later boot's restore.  No descriptor
+    ;; (QEMU, an SD card): slot end 0, the core is read contiguously as ever.
+    (if (= (mem-ref #x111F1F10 :u32) #x53504C54)
+        (progn (setf (mem-ref #x111F1F20 :u32) (mem-ref #x111F1F14 :u32))
+               (setf (mem-ref #x111F1F24 :u32) (mem-ref #x111F1F18 :u32)))
+        (setf (mem-ref #x111F1F20 :u32) 0))
+    (setf (mem-ref #x111F1F10 :u32) 0)
+    ;; bytes already waiting are line noise from the reset, not a person
+    (dotimes (i 64)
+      (if (hid-serial-ready-p) (read-char-serial) (return nil)))
+    (write-string-serial \"CORE-SKIP? (a byte on serial within 1 s: no restore)\")
+    (write-char-serial 10)
+    (let ((t0 (mem-ref #x3F003004 :u32)) (go t))
+      (loop
+        (when (> (logand (- (mem-ref #x3F003004 :u32) t0) #xFFFFFFFF) 1000000) (return nil))
+        (when (hid-serial-ready-p) (read-char-serial) (setq go nil) (return nil)))
+      (unless go (write-string-serial \"CORE-SKIPPED\") (write-char-serial 10))
+      go)))
 (defun %core-requested-p ()
   ;; The magic is a HEADER FIELD written with (setf (mem-ref .. :u64) magic),
   ;; i.e. deposited as magic<<1, so read it the same halving way -- NOT the
@@ -530,8 +580,20 @@
       (setf (mem-ref (+ dst i 4) :u32)   (mem-ref (+ src i 4) :u32))
       (setq i (+ i 8)))))
 (defun %core-read-all (fd addr len)
-  (let ((src (%gc-read64 fd)) (padded (logand (+ len 7) -8)))
-    (%core-copy-words addr src len)
+  ;; The cursor walks the core as one contiguous file; past a split core's slot
+  ;; end (see %CORE-PRE-RESTORE) the bytes live at the spill address instead.
+  ;; Every cursor value stays 8-aligned and the slot end is page-aligned, so a
+  ;; read straddling the end splits on a word boundary.
+  (let ((src (%gc-read64 fd)) (padded (logand (+ len 7) -8))
+        (b (mem-ref #x111F1F20 :u32)))
+    (if (or (= b 0) (<= (+ src padded) b))
+        (%core-copy-words addr src len)
+        (let ((sp (mem-ref #x111F1F24 :u32)))
+          (if (>= src b)
+              (%core-copy-words addr (+ sp (- src b)) len)
+              (let ((n1 (- b src)))
+                (%core-copy-words addr src n1)
+                (%core-copy-words (+ addr n1) sp (- len n1))))))
     (%gc-write64 fd (+ src padded))
     len))
 (defun %core-write-all (fd addr len)
@@ -559,6 +621,11 @@
 ;; (0xDEAD0001>>1 = 0x6F568000) -> data abort inside %save-image.  A
 ;; JIT-enabled image returns real integers and carries [lo,bump) as before.
 (defun %core-jit-arena-lo () (let ((l (%jit-exec-lo))) (if (integerp l) l 0)))
+;; The arena ENDS at the region's top: hosted's lo + 512 MB put the JIT's data
+;; pages at 0x33FF4000 -- RAM under QEMU's 1 GB raspi3b, but past the Zero's
+;; 512 MB, where they alias 0x13FF4000 and the first full page overwrites the
+;; bump word at 0x13FFFFF0.
+(defun %core-jit-arena-hi () (let ((h (%jit-exec-hi))) (if (integerp h) h 0)))
 (defun %core-jit-bump-slot () (%jit-exec-bump))
 (defun %core-jit-arena-bump ()
   ;; JIT off: no region, no arena -> 0.  JIT on: the exec REGION always exists
@@ -569,8 +636,12 @@
   ;; in-range bump means real JIT pages -> carry [lo,bump).
   (let ((slot (%jit-exec-bump)) (lo (%jit-exec-lo)) (hi (%jit-exec-hi)))
     (if (and (integerp slot) (integerp lo) (integerp hi))
-        (let ((b (%gc-read64 slot)))
-          (if (and (integerp b) (>= b lo) (< b hi)) b lo))
+        ;; The two halves, NOT %gc-read64: this runs before the runtime is
+        ;; initialised (the restore precedes init-all-globals), and on a cold
+        ;; board the word is DRAM fill (0x5555...), whose high half sends
+        ;; %gc-read64 through bignum arithmetic -- the restore hung there.
+        (let ((b (mem-ref slot :u32)) (bh (mem-ref (+ slot 4) :u32)))
+          (if (and (= bh 0) (>= b lo) (< b hi)) b lo))
         0)))
 (defun %core-jit-lossy-p () nil)
 (defun %core-die (msg)
@@ -583,7 +654,24 @@
 (defun save-and-die (path)
   (%save-image path)
   (halt))
-")
+"
+  ;; SMP (MODUS_RPI_THREADS=1): the sync-cell arena (net/bare-threads.lisp, 0x10300000)
+  ;; travels in the core as its EXTRA range -- its header and the cells handed out.
+  ;; Every SB-THREAD mutex the saved image made (warp's, glass's: at load) is a cell
+  ;; there, outside the heap; without them a restored image's mutex words are whatever
+  ;; the DRAM holds (0x55555555 on a cold Zero: HELD), and the arena's count restarts
+  ;; at 0 under them, handing the same cells out again.
+  (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
+    (if (and v (> (length v) 0) (string/= v "0"))
+        "
+(defun %core-extra-addr () #x10300000)
+(defun %core-extra-len ()
+  (let ((n (mem-ref #x10300000 :u32)))
+    (if (< n 8191) (+ 64 (* 64 n)) #x80000)))
+(defun %core-extra-ok-p (addr len)
+  (and (= addr #x10300000) (<= (+ addr len) #x10380000)))
+"
+        ""))))
 
 (defvar *cli-arch-override-source*
   (if *cl-repl-x64-p*
@@ -629,6 +717,19 @@
              (floor (* (mod ticks hz) 1000000) hz)))
         0)))
 (defun get-universal-time () (%timer-universal-time))
+;;; ... and the nanosecond seams under them, which the hot-function JIT calls
+;;; directly to time interpreted calls: cl-fileio.lisp's defaults are the same
+;;; clock_gettime SVC, so the first DEFUN trampoline on the board faulted
+;;; (ESR 0x56000000, during the boot-time eval of the baked compat source).
+;;; One core and no scheduler, so run time is real time.
+(defun %irt-ns ()
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000000)
+             (floor (* (mod ticks hz) 1000000000) hz)))
+        0)))
+(defun %irun-ns () (%irt-ns))
 "
         (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))
 
@@ -811,6 +912,17 @@
   ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
   (setf (mem-ref #x111F2000 :u32) 0)
   (%gc-write64 #x111F2008 0)
+  ;; ... and net/bare-threads.lisp's (cacheable: the SMP mutexes need exclusives).
+  (setf (mem-ref #x10300000 :u32) 0)
+  (%gc-write64 #x10300008 0)
+  ;; ... and the main thread's time-slice deadline (net/bare-threads.lisp, PREEMPTION):
+  ;; a threaded image's loops read it, and DRAM is not zero at reset.
+  (%gc-write64 #x10083F00 0)
+  ;; ... and the shared-store guard's resume address and main's marker, which the
+  ;; threaded fault vector reads (net/bare-threads.lisp %BT-GUARD-TRAP).
+  (%gc-write64 #x10213028 0)
+  (%gc-write64 #x10213030 0)
+  (%gc-write64 #x10005058 0)
   ;; Banner first: proves native code is executing and the UART is alive
   ;; before any runtime init runs.
   (write-string-serial \"MODUS-CL\")
@@ -890,6 +1002,42 @@
 ;;; happens at a point where a fault would be attributable, rather than inside
 ;;; an installer's handler-case.  Wrapped, because a diagnostic must never be
 ;;; the thing that stops a boot.
+;; SMP (MODUS_RPI_THREADS=1): the per-core thread heaps live at 0x18000000..0x1B000000
+;; (net/bare-threads.lisp), above region 0, and the collector rejects any root whose
+;; granule has no start bit -- so the two bitmaps must cover page_base (0x09000000) up to
+;; 0x1B000000: 0x240000 bytes each, at 0x08000000 / 0x08400000 (free RAM between the main
+;; stack top and the heap; the restore header sits at 0x08FFFF00).
+(defvar cl-user::*rpi-threads-p*
+  (and *cl-repl-rpi-p*
+       (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
+         (and v (> (length v) 0) (string/= v "0")))))
+(when cl-user::*rpi-threads-p*
+  (let* ((old "(%rpi-gc-bitmap-init #x05000000 #x05100000 #xE0000)")
+         (new "(%rpi-gc-bitmap-init #x08000000 #x08400000 #x240000)")
+         (at (search old *cli-arch-kernel-prologue*)))
+    (unless at (error "SMP: the Pi bitmap call moved; update build-cl-repl-common"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 at) new
+                       (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
+;; ... and DRAM is not zero at reset (a cold Zero reads 0x55555555): the threads layer's
+;; control words outside the window must start at zero, BEFORE a core restore -- the
+;; thread table (its "cores are up" word made %BT-INIT skip starting them, so the desk
+;; waited on cores that never ran), the whole sync-cell arena (a cell is a mutex word:
+;; garbage is a HELD lock, and its own allocation lock is at +0x10), and the JIT bump
+;; word, which the restore reads before anything sets it.  A restore then brings the
+;; saved arena back (%CORE-EXTRA-*).
+(when cl-user::*rpi-threads-p*
+  (let* ((old "  (%gc-write64 #x10005058 0)")
+         (at (search old *cli-arch-kernel-prologue*))
+         (new "  (%gc-write64 #x10005058 0)
+  (let ((a #x10213000)) (loop (when (>= a #x10214000) (return nil)) (setf (mem-ref a :u64) 0) (setq a (+ a 8))))
+  (let ((a #x10300000)) (loop (when (>= a #x10380000) (return nil)) (setf (mem-ref a :u64) 0) (setq a (+ a 8))))
+  (setf (mem-ref #x13FFFFF0 :u64) 0)"))
+    (unless at (error "SMP: the prologue's guard-marker line moved; update build-cl-repl-common"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 at) new
+                       (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
+
 (defvar *cli-arch-io-scratch-source*
   (if *cl-repl-x64-p*
       "  (setq *cstr-scratch* #x0FE00000)
@@ -1361,6 +1509,9 @@
             (%rpi-net-text "hdmi-console.lisp")  (string #\Newline)
             (%rpi-net-text "dwc2-split.lisp")    (string #\Newline)
             (%rpi-net-text "usb-hid-split.lisp") (string #\Newline)
+            ;; LPCM audio into the firmware's HDMI link (polled MAI FIFO), fed from a ring
+            ;; any thread can fill -- the Zero desk's audio thread pumps it.
+            (%rpi-net-text "hdmi-audio.lisp")    (string #\Newline)
             ;; The boot SD card, read only (SDHOST, adopting U-Boot's setup):
             ;; the sector source for a pagetree/cabinet store on a partition.
             (%rpi-net-text "sdhost.lisp")        (string #\Newline))))))
@@ -2027,11 +2178,14 @@
   (setq *aarch64-gc-trampoline-call-via-bl* nil)
   (setq *aarch64-gc-trampoline-label* 1)
   ;; Mirror the BAKED alloc-overshoot guard band (build-cl-repl-common sets
-  ;; *aarch64-gc-limit-guard* #x800000 for the image build).  The in-image
+  ;; *aarch64-gc-limit-guard* #x100000 for the image build).  The in-image
   ;; value is the defvar's 0, so anything the runtime translator emits that
   ;; reads it -- a trampoline exit -- would hand the mutator an UNGUARDED
   ;; limit.  Bare x64 lost alexandria to exactly this class (283cccf).
-  (setq *aarch64-gc-limit-guard* #x800000)
+  (setq *aarch64-gc-limit-guard* #x100000)
+  ;; ... which is only safe while runtime-compiled code sizes its checks
+  ;; (mvm-eval's FUSE-GC-CHECKS): set here, not left to a defvar's initform.
+  (setq *gc-check-fusion-enabled* t)
   ;; *aarch64-gc-bitmap-enabled* at runtime: MUST be T — while NIL, objects
   ;; allocated by JIT'd code carry no object-start/cons-kind bit and the
   ;; native GC's bitmap gate (applied by scan_word to EVERY scanned word,
@@ -2090,10 +2244,21 @@
   (setf (mem-ref (%jit-exec-bump) :u64) (%jit-exec-lo))
   t)
 "
-                (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT_BITMAP")))
-                  (if (and v (string= v "0"))
-                      ";; bitmap-enable OFF (MODUS_RPI_JIT_BITMAP=0 triage build)"
-                      "(setq *aarch64-gc-bitmap-enabled* t)"))
+                (concatenate 'string
+                  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_JIT_BITMAP")))
+                    (if (and v (string= v "0"))
+                        ";; bitmap-enable OFF (MODUS_RPI_JIT_BITMAP=0 triage build)"
+                        "(setq *aarch64-gc-bitmap-enabled* t)"))
+                  ;; SMP phase 2: the in-image JIT must emit the same per-thread-window
+                  ;; accesses as the image (defvar inits never run in-image).
+                  ;; (CL-USER::*RPI-THREADS-P*, not boot-rpi-cl's *RPI-CL-THREADS*: that
+                  ;; file is loaded AFTER this text is built, so the old test was always
+                  ;; false and runtime-JIT'd code on a thread wrote MAIN's window.)
+                  (progn
+                    (if cl-user::*rpi-threads-p*
+                        "
+  (setq *a64-tls-window* t) (setq *tls-window* t) (setq *tls-window-a64* t) (setq *a64-tls-tsd-offset* nil)"
+                        "")))
                 (cond
                   ;; :VIRT — the fixpoint UART VA, NOT a Pi peripheral address.
                   ;; Same PL011 register layout as the QEMU raspi3b arm below;
@@ -2188,7 +2353,28 @@
 (defvar *cli-arch-core-resume*
   (if (or *cl-repl-rpi-p* *cl-repl-x64-p*)
       (concatenate 'string
-        "    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
+        "    ;; The screen FIRST, so every line after this one shows on it too.  The
+    ;; restored process must bring the console up itself: nothing else will
+    ;; before a restart hook runs, and the HDMI state block (Device RAM) still
+    ;; holds whatever a previous boot left there -- a stale framebuffer and an
+    ;; exec page the restore has just overwritten.  (A board reset keeps DRAM:
+    ;; the desk faulted executing that page on one load address and drew into
+    ;; a dead framebuffer -- the firmware's rainbow square -- on a cold boot.)
+    (when (fboundp (quote hcon-init))
+      (handler-case (hcon-init) (t (c) nil)))
+    (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
+    ;; ... and USB, for the same reason: boot init brings the keyboard and mouse
+    ;; up (%CONSOLE-INIT), a restored core skips boot init, and the controller
+    ;; holds nothing a reset did not clear.  Unconditionally from the top: after
+    ;; a RUN-pin reset HID-FIND-HUB can still find the hub answering while the
+    ;; host side is unconfigured, and HID-CONSOLE-INIT then skipped the bring-up.
+    ;; Only for the desk; the REPL's console init otherwise.  HID-CONSOLE-INIT runs once a
+    ;; boot (the flag is cleared here: the core may have been saved with it set) and keeps
+    ;; a bus U-Boot already brought up (net/usb-hid-split.lisp).
+    (when (boundp (quote *hid-console-up*)) (setq *hid-console-up* nil))
+    (when (and (fboundp (quote hid-console-init))
+               (boundp (quote *core-restart-hook*)) *core-restart-hook*)
+      (handler-case (hid-console-init) (t (c) nil)))
     ;; A restored core skips boot init, so raise the ARM clock here too (the
     ;; firmware idles at 600 MHz on a Zero 2 W); same guarded call as the
     ;; fresh-boot path before E2SMOKE.
@@ -2213,7 +2399,40 @@
 "
             "    (setq *use-jit* nil)
 ")
-        "    (handler-case (cl-serial-repl)
+        ;; THE RESTART HOOK.  A core saved for a standalone boot (kiln zero
+        ;; --sd-image) sets *CORE-RESTART-HOOK* before SAVE-AND-DIE; the restored
+        ;; process calls it here -- the desk, say -- and falls into the REPL when
+        ;; it returns.  NIL (the default, and any core saved without it): straight
+        ;; to the REPL as before.
+        ;; A byte on the serial console within 2 s skips it: that is how a person
+        ;; at the console, or the QEMU rig verifying the core, gets the REPL.  The
+        ;; check PEEKS (data-ready), so that byte still reaches the REPL.  Pi only
+        ;; (the 1 MHz system timer); elsewhere the hook just runs.
+        "    (when (and (boundp (quote *core-restart-hook*)) *core-restart-hook*)
+      (write-string-serial \"CORE-RESTART-HOOK (a byte on serial within 2 s: the REPL instead)\")
+      (write-char-serial 10)
+      (let ((skip nil))
+"
+        (if *cl-repl-rpi-p*
+            "        ;; Bytes ALREADY waiting are not a person at the console: a reset leaves
+        ;; a stray byte in the mini UART often enough that a card boot fell into
+        ;; the REPL instead of the desk.  Drop them (bounded), then open the window.
+        (dotimes (i 64)
+          (if (and (fboundp (quote hid-serial-ready-p)) (hid-serial-ready-p))
+              (read-char-serial)
+              (return nil)))
+        (let ((t0 (mem-ref #x3F003004 :u32)))
+          (loop
+            (when (or skip (> (logand (- (mem-ref #x3F003004 :u32) t0) #xFFFFFFFF) 2000000)) (return nil))
+            (when (and (fboundp (quote hid-serial-ready-p)) (hid-serial-ready-p)) (setq skip t))))
+"
+            "")
+        "        (unless skip
+          (handler-case (funcall *core-restart-hook*)
+            (t (c) (write-string-serial \"RESTART-HOOK-DIED: \")
+                   (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+                   (write-char-serial 10))))))
+    (handler-case (cl-serial-repl)
       (t (c) (write-string-serial \"REPL-DIED: \")
              (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
              (write-char-serial 10)))
@@ -2586,7 +2805,15 @@
 ;; runs unguarded.  That is benign — an overshoot there lands in the mapped
 ;; second semispace — and every limit the trampoline computes afterwards is
 ;; guarded.
-(setf *aarch64-gc-limit-guard* #x800000)
+;; 1 MB, not the 8 MB it was (bfca1db): the guard need only exceed an allocation
+;; that is NOT checked against its own size, and every variable-size one now is --
+;; arrays, strings, u8 and f32 vectors get :GC-CHECK-R, in the image build AND in
+;; runtime-compiled code (mvm-eval runs FUSE-GC-CHECKS too; it did not, and that is
+;; what the 512 KB a64-buffer that zeroed the config page was).  What is left is a
+;; constant-size :ALLOC-OBJ (an imm16 slot count: at most 512 KB) and conses.  The
+;; build prints the census of variable-size allocations left unchecked.  The 7 MB
+;; this returns to region 0 is what the media desk needs on a threaded image.
+(setf *aarch64-gc-limit-guard* #x100000)
 
 ;; #267 step 1: use the NATIVE aarch64 Cheney collector — the same one
 ;; build-aarch64-cli.lisp runs — instead of falling through to gc.lisp's
@@ -2635,6 +2862,15 @@
                  (mvm/gc.lisp %GC-COLLECT) runs via the aarch64 shim~%"))))
 
 (setf *aarch64-sched-lock-addr* nil)
+
+;; SMP PHASE 2 (opt-in): the per-thread window on the bare Pi image, as hosted aarch64 has it
+;; (hosted-layout-env.lisp APPLY-LAYOUT-HOST), with the window delta in TPIDR_EL0.  The
+;; :A64-THREADS layout key is what runtime source tests with %LAYOUT-IF; every other layout
+;; lookup keeps its default, as before.  The in-image JIT gets the same flags below.
+(when (and cl-user::*cl-repl-rpi-p* (boundp (quote *rpi-cl-threads*)) *rpi-cl-threads*)
+  (setf *a64-tls-window* t *tls-window* t *tls-window-a64* t *a64-tls-tsd-offset* nil)
+  (setf *hosted-layout* (list* :a64-threads 1 *hosted-layout*))
+  (format t "~%;; RPi CL: per-thread window ON (TPIDR_EL0 delta) -- SMP phase 2~%"))
 
 ;; SP alignment stays 8-byte (bare-metal EL1 with SCTLR.SA off), unlike Linux
 ;; EL0 which demands 16.  *aarch64-fn-align-offset* stays 0: the unified
@@ -2694,9 +2930,9 @@
       ;; image below and the stack above; both are checked here rather than
       ;; discovered as heap corruption at runtime.  Keep in step with the
       ;; %rpi-gc-bitmap-init call in kernel-main.
-      (let* ((objmap-lo  #x05000000)
-             (consmap-lo #x05100000)
-             (map-bytes  #xE0000)
+      (let* ((objmap-lo  (if cl-user::*rpi-threads-p* #x08000000 #x05000000))
+             (consmap-lo (if cl-user::*rpi-threads-p* #x08400000 #x05100000))
+             (map-bytes  (if cl-user::*rpi-threads-p* #x240000 #xE0000))
              (maps-hi    (+ consmap-lo map-bytes)))
         (when (< objmap-lo image-va-end)
           (error "BUILD-TIME ASSERT: #160 object-start bitmap at ~X is inside ~
@@ -2704,11 +2940,20 @@
         (when (> (+ objmap-lo map-bytes) consmap-lo)
           (error "BUILD-TIME ASSERT: #160 object-start bitmap ~X+~X overlaps ~
                   the cons-kind bitmap at ~X." objmap-lo map-bytes consmap-lo))
-        (when (>= maps-hi stack-va-lo)
-          (error "BUILD-TIME ASSERT: #160 bitmaps end ~X reach the stack low ~
-                  water ~X." maps-hi stack-va-lo))
+        (if cl-user::*rpi-threads-p*
+            ;; Threaded: ABOVE the main stack top, below the restore header.
+            (when (or (< objmap-lo stack-top) (> maps-hi #x08FFFF00))
+              (error "BUILD-TIME ASSERT: SMP bitmaps ~X..~X are not inside ~
+                      [stack top ~X, restore header 0x08FFFF00)." objmap-lo maps-hi stack-top))
+            (when (>= maps-hi stack-va-lo)
+              (error "BUILD-TIME ASSERT: #160 bitmaps end ~X reach the stack low ~
+                      water ~X." maps-hi stack-va-lo)))
         (format t "  gc bitmaps ~8,'0X .. ~8,'0X  (#160 object-start + cons-kind)~%"
-                objmap-lo maps-hi))
+                objmap-lo maps-hi)
+        ;; The limit guard must exceed every allocation that is NOT checked
+        ;; against its own size (FUSE-GC-CHECKS census).
+        (format t "  gc-check census: ~D variable-size allocation~:P without a size-aware check~%"
+                modus.mvm::*gc-check-unsized-var-allocs*))
       (when (> heap-end periph-base)
         (error "BUILD-TIME ASSERT: heap end ~X is inside the BCM2837 ~
                 peripheral window at ~X." heap-end periph-base))

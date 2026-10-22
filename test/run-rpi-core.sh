@@ -27,7 +27,7 @@ for a in "$@"; do case $a in --load=*) loads+=("${a#*=}");; --blob=*) blobs+=("$
 W=$(mktemp -d /tmp/modus-rpi-core.XXXXXX); SOCK=$W/uart.sock
 LOADERS=(); TARSPEC=(); k=0
 for n in "${loads[@]}"; do f=$(readlink -f "$TARS/$n.tar"); [ -s "$f" ] || { echo "FAIL: no tarball $TARS/$n.tar"; exit 1; }
-  addr=$((0x1A000000 + k*16777216)); LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n"); k=$((k+1)); done
+  addr=$((${TAR_BASE:-0x1A000000} + k*16777216)); LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n"); k=$((k+1)); done
 for b in "${blobs[@]}"; do f=$(readlink -f "${b%@*}"); [ -s "$f" ] || { echo "FAIL: no blob ${b%@*}"; exit 1; }
   LOADERS+=(-device "loader,file=$f,addr=${b##*@}"); done
 boot() { # extra qemu args...
@@ -54,8 +54,12 @@ PY
   fi; }
 trap '[ -n "${QP:-}" ] && kill $QP 2>/dev/null' EXIT
 echo "== phase 1: boot, install from RAM, save ($W)"
-boot "${LOADERS[@]}"
-python3 test/rpi-core-driver.py $SOCK "${TARSPEC[@]}" "${forms[@]}" ${probe:+--probe "$probe"} --save | tee $W/phase1.txt | sed 's/^/   /'
+# BASE_CORE=FILE: a SECOND STAGE -- phase 1 boots with that core restored (the driver takes
+# the REPL over its restart hook), so only the new tarballs and forms are installed, compiled
+# and JIT-translated before the save.  Put the tarballs clear of it with TAR_BASE (a core runs
+# past 0x1A000000; 0x24000000 is mapped and free).
+boot "${LOADERS[@]}" ${BASE_CORE:+-device loader,file=$(readlink -f "${BASE_CORE:-/dev/null}"),addr=0x18000000}
+python3 test/rpi-core-driver.py $SOCK --banner-wait 900 "${TARSPEC[@]}" "${forms[@]}" ${probe:+--probe "$probe"} --save | tee $W/phase1.txt | sed 's/^/   /'
 end=$(grep -a '^CORE-END=' $W/phase1.txt | tail -1 | cut -d= -f2)
 [ -n "$end" ] || { echo "FAIL: no CORE-END"; exit 1; }
 size=$((end - 0x18000000)); echo "   core: [0x18000000, $end) = $size bytes"

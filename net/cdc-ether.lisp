@@ -182,7 +182,10 @@
 
           ;; Start the first bulk IN transfer (persistent channel).
           ;; DWC2's work_bh will auto-retry NAK'd transfers.
-          ;; Subsequent calls to usb-bulk-receive just poll for completion.
+          ;; Subsequent calls to usb-bulk-receive poll for completion and
+          ;; re-arm on the call after one (cold RAM: clear its flag first).
+          (setf (mem-ref (+ (usb-state-addr) #xA0) :u32) 0
+                (mem-ref (+ (usb-state-addr) #xA4) :u32) (logand (rdtsc) #xFFFFFFFF))
           (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
                               (cdc-rx-buf-addr) 2048 (usb-bulk-in-mps))
           (return 1))))))
@@ -208,19 +211,14 @@
 
 ;; Check for received packet. Returns length or 0 if none.
 (defun cdcether-receive ()
-  ;; Read HCTSIZ BEFORE polling — the poll may start a new transfer,
-  ;; overwriting the register. We need the remaining bytes from the
-  ;; completed transfer to compute the actual received length.
-  (let ((hctsiz-before (dwc2-read (dwc2-hctsiz 1))))
-    (let ((result (usb-bulk-receive (cdc-rx-buf-addr) 2048)))
-      (if (eq result 1)
-          ;; Data received. Use saved HCTSIZ to compute actual length.
-          (let ((remaining (logand hctsiz-before #x7FFFF)))
-            (let ((actual (- 2048 remaining)))
-              (setf (mem-ref (+ (e1000-state-base) #x44) :u32) actual)
-              actual))
-          ;; No data or error
-          0))))
+  ;; USB-BULK-RECEIVE leaves the channel idle after a completion, so HCTSIZ still
+  ;; describes the transfer that just finished: the bytes it did not fill.
+  (let ((result (usb-bulk-receive (cdc-rx-buf-addr) 2048)))
+    (if (eq result 1)
+        (let ((actual (- 2048 (logand (dwc2-read (dwc2-hctsiz 1)) #x7FFFF))))
+          (setf (mem-ref (+ (e1000-state-base) #x44) :u32) actual)
+          actual)
+        0)))
 
 ;; Get pointer to current RX buffer data (physical address).
 ;; Called after e1000-receive returns non-zero.

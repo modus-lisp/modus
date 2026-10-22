@@ -116,6 +116,7 @@
    #:+op-fp-mov+ #:mvm-fp-mov
    #:+op-vi-ld+ #:+op-vi-st+ #:+op-vi-dup+ #:+op-vi-un+ #:+op-vi-shift+
    #:+op-vi-bin+ #:+op-vi-movi+ #:+op-vi-umov+ #:+op-vi-lane+
+   #:+op-bulk-move+ #:+op-bulk-fill+ #:mvm-bulk-move #:mvm-bulk-fill
    #:mvm-vi-ld #:mvm-vi-st #:mvm-vi-dup #:mvm-vi-un #:mvm-vi-shift
    #:mvm-vi-bin #:mvm-vi-movi #:mvm-vi-umov #:mvm-vi-lane
    #:mvm-load #:mvm-store #:mvm-fence
@@ -555,6 +556,16 @@
 (defconstant +op-vi-movi+  #xE8) ; (vi-movi Fd kind val)         immediate 0..255 into every lane; kind 1=16b 2=8h
 (defconstant +op-vi-umov+  #xE9) ; (vi-umov Vd Fs kind lane)     one lane → fixnum; kind 1=b 2=h 4=s
 (defconstant +op-vi-lane+  #xEA) ; (vi-lane Fd Fa Fb op lane)    8h by-element: 0 mla 1 mls 2 mul 3 sqdmulh 4 sqrdmulh, Fb.h[lane]
+;; BULK MEMORY: the element loops under REPLACE and FILL as one instruction each.
+;; Elements are addressed as AREF / U8-REF address them (the translator knows its
+;; own layout); KIND 0 is word slots -- the tagged value is stored as it is -- and
+;; KIND 1 bytes of a u8 vector.  BULK-MOVE is memmove: a same-object move upward
+;; copies from the top.  Native on aarch64 and x64; the interpreter arm is the
+;; reference.  Only those two builds' kernels emit them (see
+;; *NATIVE-BULK-SOURCE* in build-cli-common.lisp), so the 32-bit translators
+;; never see them.
+(defconstant +op-bulk-move+ #x94) ; (bulk-move Vdst Vdi Vsrc Vsi Vn kind)  N elements src[si..] -> dst[di..]
+(defconstant +op-bulk-fill+ #x95) ; (bulk-fill Varr Vi Vn Vval kind)       N elements from Vi := Vval
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -786,6 +797,8 @@
 (defopcode :vi-movi  #xE8 (:reg :imm8 :imm8)           "immediate byte → every lane")
 (defopcode :vi-umov  #xE9 (:reg :reg :imm8 :imm8)      "one lane → fixnum")
 (defopcode :vi-lane  #xEA (:reg :reg :reg :imm8 :imm8) "s16x8 by-element mla/mls/mul/sqdmulh/sqrdmulh")
+(defopcode :bulk-move #x94 (:reg :reg :reg :reg :reg :imm8) "memmove N elements (kind 0 words, 1 bytes)")
+(defopcode :bulk-fill #x95 (:reg :reg :reg :reg :imm8)      "N elements := value (kind 0 words, 1 bytes)")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -1394,6 +1407,8 @@
 (defun mvm-vi-movi (buf fd kind val) (encode-instruction buf +op-vi-movi+ fd kind val))
 (defun mvm-vi-umov (buf vd fs kind lane) (encode-instruction buf +op-vi-umov+ vd fs kind lane))
 (defun mvm-vi-lane (buf fd fa fb op lane) (encode-instruction buf +op-vi-lane+ fd fa fb op lane))
+(defun mvm-bulk-move (buf vd vdi vs vsi vn kind) (encode-instruction buf +op-bulk-move+ vd vdi vs vsi vn kind))
+(defun mvm-bulk-fill (buf va vi vn vv kind) (encode-instruction buf +op-bulk-fill+ va vi vn vv kind))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

@@ -4726,6 +4726,14 @@
             ((and (eq k :start2) (not s2-set)) (setq start2 v s2-set t))
             ((and (eq k :end2)   (not e2-set)) (setq end2 v   e2-set t))))
         (setq cur (cddr cur))))
+    (%replace-pos seq1 seq2 start1 end1 start2 end2)))
+
+(defun %replace-pos (seq1 seq2 start1 end1 start2 end2)
+  "REPLACE with its bounds as positional arguments (END1 / END2 NIL = the length).
+   The compiler turns a REPLACE call with literal keywords into this, so the call
+   conses no &REST list of keyword arguments -- glass copies a rectangle with one
+   REPLACE a row, and that list was 17 KB of every window-drag frame on a Pi Zero."
+  (progn
     (when (null end1) (setq end1 (length seq1)))
     (when (null end2) (setq end2 (length seq2)))
     (let ((n1 (- end1 start1))
@@ -4740,10 +4748,10 @@
         ;; allocation, not the copying, is most of its cost.
         (when (%bulk-copy-u8-ok-p seq1 seq2)
           (%bulk-copy-u8 seq1 start1 seq2 start2 count)
-          (return-from replace seq1))
+          (return-from %replace-pos seq1))
         (when (%bulk-copy-ok-p seq1 seq2)
           (%bulk-copy seq1 start1 seq2 start2 count)
-          (return-from replace seq1))
+          (return-from %replace-pos seq1))
         ;; CLHS REPLACE: when SEQ1 and SEQ2 are the same object and the
         ;; source/destination regions overlap, the result is as if the
         ;; whole source window were copied to a temporary first.  We always

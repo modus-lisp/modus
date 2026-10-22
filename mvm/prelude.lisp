@@ -732,37 +732,25 @@
   (and (%u8-bare-p dst) (%u8-bare-p src)))
 
 (defun %bulk-copy-u8 (dst dstart src sstart n)
-  "Byte copy SRC[sstart…] → DST[dstart…], memmove semantics like %bulk-copy.
-   Distinct objects (or a same-object copy that moves DOWN) go eight bytes
-   at a time through raw word loads/stores on the packed data — the object
-   pointer is tag 9 and the data starts 16 bytes past the header, so byte
-   K lives at raw address (word - 9 + 16 + K) = word + 7 + K.  Nothing in
-   the loop allocates, so the raw addresses cannot move under it.  Hosted
-   x64 / aarch64 both allow unaligned 64-bit access."
+  "Byte copy SRC[sstart…] → DST[dstart…], memmove semantics like %bulk-copy:
+   a same-object copy that moves UP runs from the top.  A byte at a time; the
+   aarch64 and x64 images replace this with one BULK-MOVE (native-bulk.lisp).
+   It used to go eight bytes a step through :u64 MEM-REF, which a 32-bit
+   target splits wrongly -- i386 corrupted every byte REPLACE of 8 or more."
   (declare (type fixnum dstart sstart n))
-  (cond
-    ;; same object, destination above the source AND the ranges overlap:
-    ;; copy descending, byte-wise.  Disjoint ranges take the word path.
-    ((and (eq dst src) (> dstart sstart) (< (- dstart sstart) n))
-     (let ((i (- n 1)))
-       (declare (type fixnum i))
-       (loop
-         (when (< i 0) (return dst))
-         (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
-         (setq i (- i 1)))))
-    (t
-     (let ((i 0)
-           (da (+ (%val->word dst) 7 dstart))
-           (sa (+ (%val->word src) 7 sstart)))
-       (declare (type fixnum i da sa))
-       (loop
-         (when (> (+ i 8) n) (return))
-         (setf (mem-ref (+ da i) :u64) (mem-ref (+ sa i) :u64))
-         (setq i (+ i 8)))
-       (loop
-         (when (>= i n) (return dst))
-         (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
-         (setq i (+ i 1)))))))
+  (if (and (eq dst src) (> dstart sstart))
+      (let ((i (- n 1)))
+        (declare (type fixnum i))
+        (loop
+          (when (< i 0) (return dst))
+          (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
+          (setq i (- i 1))))
+      (let ((i 0))
+        (declare (type fixnum i))
+        (loop
+          (when (>= i n) (return dst))
+          (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
+          (setq i (+ i 1))))))
 
 (defun %bulk-copy (dst dstart src sstart n)
   "Copy N elements SRC[sstart…] → DST[dstart…] by raw word slots.
@@ -784,6 +772,24 @@
           (when (>= i n) (return dst))
           (%word-aset dst (+ dstart i) (%word-aref src (+ sstart i)))
           (setq i (+ i 1))))))
+
+(defun %fill-u8 (seq start end item)
+  "SEQ[START..END) := the low byte of ITEM, SEQ a plain u8 vector, END within it.
+   A byte at a time; the aarch64 and x64 images replace this with one BULK-FILL
+   (native-bulk.lisp).  (The zero fill's eight-bytes-a-step :u64 path is gone
+   with it: a 32-bit target splits that store wrongly.)"
+  (let ((i start))
+    (loop (when (>= i end) (return seq))
+      (%u8-set seq i item)
+      (setq i (+ i 1)))))
+
+(defun %fill-words (seq start end item)
+  "SEQ[START..END) := ITEM in raw word slots (%BULK-COPY-OK-P SEQ SEQ, END within
+   it).  The aarch64 and x64 images replace this with one BULK-FILL."
+  (let ((i start))
+    (loop (when (>= i end) (return seq))
+      (%word-aset seq i item)
+      (setq i (+ i 1)))))
 
 (defun copy-seq (array)
   "Copy an array, returning a new array with the same elements."

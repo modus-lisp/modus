@@ -420,15 +420,39 @@
                       0 buf len (usb-bulk-out-mps)))
 
 (defun usb-bulk-receive (buf max-len)
-  ;; Non-blocking bulk IN using persistent channel.
-  ;; The first call starts the transfer; subsequent calls just poll.
-  ;; DWC2's work_bh auto-retries NAK'd transfers in the background.
-  ;; Returns: 1=success (data in buf), 0=no data yet, <0=error
-  (let ((result (dwc2-poll-bulk-in 1)))
-    ;; If no data yet (0), the channel is still active — return immediately
-    (when (not (zerop result))
-      ;; Transfer completed (success, stall, or error).
-      ;; Channel is now idle (CHENA cleared by DWC2). Start a new one.
+  ;; Non-blocking bulk IN using persistent channel.  Returns: 1=success (data in buf),
+  ;; 0=no data yet, <0=error.  DWC2's work_bh auto-retries NAK'd transfers.
+  ;;
+  ;; THE NEXT TRANSFER STARTS ON THE NEXT CALL, NOT THIS ONE.  Re-arming the moment a
+  ;; transfer completed handed BUF back to the controller while the caller was still
+  ;; reading the frame in it: the next frame's DMA landed under the reader, and on the
+  ;; board a TCP fetch came back with a 1460-byte segment duplicated.  So a completion
+  ;; leaves the channel idle and sets usb-state +0xA0; the call after it (the caller
+  ;; has consumed BUF by then) starts the next transfer.  CDC-ETHER-INIT starts the
+  ;; first one and clears the flag.
+  ;;
+  ;; AND A CHANNEL THAT GOES STALE IS RESTARTED.  On the Zero, under load (the desk on three
+  ;; cores), channel 1 stayed enabled and NAKing while the RTL8153 had frames queued: receive
+  ;; stopped for good while transmit carried on, and the peer's retransmissions backed off to
+  ;; minutes.  Halting the channel and starting it again -- same toggle -- brought the frames
+  ;; straight back.  So a transfer armed more than half a second ago without completing is
+  ;; restarted (+0xA4: when it was armed, the low 32 bits of the generic timer, CNTVCT).
+  ;; NOT the BCM2835 system timer at 0x3F003004: it does not run under modus (it read the same
+  ;; value across a reset), so "now minus then" wrapped huge and the channel was halted on
+  ;; every poll -- receive stopped entirely.
+  (let ((st (+ (usb-state-addr) #xA0)) (now (logand (rdtsc) #xFFFFFFFF)))
+    (when (and (= (mem-ref st :u32) 0)
+               (> (logand (- now (mem-ref (+ st 4) :u32)) #xFFFFFFFF) (floor (cntfrq) 2)))
+      (dwc2-halt-channel 1)
+      ;; the NEXT PID the core left in HCTSIZ, as a completion latches it: a frame cut off
+      ;; part-way has moved the toggle, and restarting on the stale one loses every frame
+      (usb-set-bulk-in-toggle (logand (ash (dwc2-read (dwc2-hctsiz 1)) -29) 3))
+      (setf (mem-ref st :u32) 1))
+    (when (= (mem-ref st :u32) 1)
+      (setf (mem-ref st :u32) 0
+            (mem-ref (+ st 4) :u32) now)
       (dwc2-start-bulk-in 1 (usb-dev-addr) (usb-bulk-in-ep)
-                           buf max-len (usb-bulk-in-mps)))
-    result))
+                          buf max-len (usb-bulk-in-mps)))
+    (let ((result (dwc2-poll-bulk-in 1)))
+      (when (not (zerop result)) (setf (mem-ref st :u32) 1))
+      result)))

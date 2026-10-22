@@ -17,7 +17,17 @@
 ;;;;
 ;;;; Depends on: dwc2.lisp.
 
-(defun split-ch () 2)
+;; CHANNEL 6, NOT 2.  The comment above says "its own channel", and 2 was not: the NIC's bulk
+;; OUT (usb.lisp USB-BULK-SEND, r8152.lisp) is hardwired to channel 2 too.  A keyboard or mouse
+;; poll leaves its split transaction on the channel between the start-split and the
+;; complete-split, so a frame sent in between reprogrammed a channel mid-split.  On a Zero with
+;; the hub's Ethernet up that was a transmit one packet behind (the SYN of a fetch left on the
+;; wire only when the next frame pushed it), channels stuck enabled-and-disabling, and in the
+;; end the root port disabled -- hub, NIC, keyboard and mouse gone at once.  0 is control, 1
+;; the NIC's bulk IN, 2 its bulk OUT; hid.lisp's non-split driver takes 3..5.  Measured with
+;; this one change, live on the board: a whole HTTP exchange clean on the wire (SYN to FIN,
+;; every segment ACKed), where before the SYN never left.
+(defun split-ch () 6)
 
 ;; DMA buffers in the Device (uncached) USB window, past the NIC's buffers.
 (defun split-dma-base () #x11180000)
@@ -59,6 +69,13 @@
           (return r)))
       (setq i (+ i 1)))))
 
+(defun dwc2-wait-next-uframe ()
+  ;; Until HFNUM's frame number moves on (a microframe is 125 us), bounded.
+  (let ((f (logand (dwc2-read (dwc2-hfnum)) #x3FFF)) (i 0))
+    (loop
+      (when (or (/= f (logand (dwc2-read (dwc2-hfnum)) #x3FFF)) (> i 200000)) (return nil))
+      (setq i (+ i 1)))))
+
 (defun dwc2-split-packet (ch hcchar hcsplt hctsiz buf periodic)
   ;; One packet through the hub's TT.  Returns 1 = done (data or ACK),
   ;; 0 = the device NAKed, -1 = STALL, -2 = transaction error, -3 = timeout.
@@ -92,13 +109,23 @@
           ((not (zerop (logand hcint (hcint-stall)))) (setq result -1) (return result))
           ((not csplit)
            (cond
-             ((not (zerop (logand hcint (hcint-ack)))) (setq csplit t))
+             ;; The start-split was accepted: the complete-split belongs in a LATER
+             ;; microframe.  Issued at once, a periodic CSPLIT never halted at all
+             ;; (every poll a -3 timeout, the keyboard and mouse lit but dead) once
+             ;; this code ran fast enough to get there inside the same microframe.
+             ((not (zerop (logand hcint (hcint-ack))))
+              (setq csplit t)
+              (when periodic (dwc2-wait-next-uframe)))
              ((not (zerop (logand hcint (hcint-nak)))) nil)
              (t (setq errs (+ errs 1))
                 (when (> errs 3) (setq result -2) (return result)))))
           (t
            (cond
-             ((not (zerop (logand hcint (hcint-nyet)))) nil)
+             ;; NYET: the hub's TT has not finished the full/low-speed transaction
+             ;; yet.  Ask again in the NEXT microframe, as U-Boot does -- retried back
+             ;; to back, a LOW-speed device (well over a millisecond for its packet)
+             ;; used up every try in microseconds, and the mouse never answered.
+             ((not (zerop (logand hcint (hcint-nyet)))) (dwc2-wait-next-uframe))
              ((not (zerop (logand hcint (hcint-xfercompl)))) (setq result 1) (return result))
              ((not (zerop (logand hcint (hcint-ack)))) (setq result 1) (return result))
              ((not (zerop (logand hcint (hcint-nak))))

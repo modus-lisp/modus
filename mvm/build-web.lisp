@@ -184,6 +184,11 @@
 ;; rebase; %GV-CELL's inlined copy of this same hash was the previous casualty.
 "))
 
+;; No BULK-MOVE / BULK-FILL: web/mvm.js models the x64 machine but does not
+;; implement those two opcodes, so REPLACE and FILL keep their Lisp loops here.
+;; Bound before build-cli-common's DEFVAR, which then leaves it alone.
+(defvar *cli-native-bulk-source* "")
+
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 

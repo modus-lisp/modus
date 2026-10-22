@@ -1944,6 +1944,11 @@
   "Emit a size-aware check for an upcoming :cons / :alloc-cons."
   (emit-ir :gc-check-n +mvm-cons-bytes+))
 
+(defvar *gc-check-unsized-var-allocs* 0
+  "Host census: variable-size allocations FUSE-GC-CHECKS could not give a
+   size-aware check (no :gc-check right before them).  See the census in
+   FUSE-GC-CHECKS.")
+
 (defun fuse-gc-checks (ir)
   "Peephole: rewrite (:gc-check) IMMEDIATELY followed by an allocation into
    the size-aware (:gc-check-n nbytes).
@@ -2039,6 +2044,17 @@
                             ((:alloc-f32)
                              (list :gc-check-r (third next) 0))
                             (t nil)))))
+        ;; CENSUS (host-only): a variable-size allocation that leaves here
+        ;; without a size-aware check right in front of it can overshoot the
+        ;; limit by its whole size -- the case the limit GUARD exists for.
+        ;; Counted so a guard smaller than the largest such object is a
+        ;; decision made with the number in hand.
+        ;; (In-image this runs only where fusion does, i.e. where
+        ;; init-all-globals bound this counter.)
+        (when (and (consp next)
+                   (member (car next) '(:alloc-array :alloc-string :alloc-u8 :alloc-f32))
+                   (not rcheck))
+          (incf *gc-check-unsized-var-allocs*))
         (push (cond (nbytes (list :gc-check-n nbytes))
                     (rcheck rcheck)
                     (t insn))
@@ -4449,10 +4465,14 @@
            ,@(cddr form)
            ,tmp))))
 
-  ;; DEFPARAMETER → DEFVAR
+  ;; DEFPARAMETER → DEFVAR, MARKED: DEFVAR assigns only when unbound, DEFPARAMETER
+  ;; always.  The fourth element (where a docstring would be) is the marker the
+  ;; DEFVAR arm of compile-form tests; nothing else reads it.
   (mvm-define-macro "DEFPARAMETER"
     (lambda (form)
-      `(defvar ,(cadr form) ,(caddr form) ,@(cdddr form))))
+      ;; The marker comes before any docstring, which DEFVAR's arm reads
+      ;; from the next position when the marker is present.
+      `(defvar ,(cadr form) ,(caddr form) %defparameter-always ,@(cdddr form))))
 
   ;; PUSH → (setq place (cons val place)).  CLHS: ITEM evaluated first,
   ;; then the place subforms once, then store.  For compound places use
@@ -8071,12 +8091,33 @@
            ;; %GV-SET the closure inside the list stayed a raw bytecode offset
            ;; and a later FUNCALL jumped to it (upstream BOOLE.1, and the heap
            ;; corruption that then killed the numbers chapter).
-           (compile-form `(%gv-set-def ,(%global-var-bind-key var-name) ,value-form)
+           ;;
+           ;; DEFVAR ASSIGNS ONLY WHEN THE VARIABLE IS UNBOUND, and does not
+           ;; evaluate the initform otherwise (CLHS DEFVAR).  This arm used to
+           ;; store for both, so RELOADING a file re-ran every defvar: a file
+           ;; that keeps a function's old definition before redefining it --
+           ;; (defvar *old* (symbol-function 'f)) (defun f () (funcall *old*))
+           ;; -- had *OLD* become the NEW F on its second load, and F then
+           ;; called itself until the stack was gone.  On the Zero that was a
+           ;; USB thread dying silently (an executor's idle round has no
+           ;; handler), every time kiln's network code was loaded twice.
+           ;; DEFPARAMETER assigns unconditionally, as it must.
+           (compile-form (if (and (= op-name 428301013)
+                                  (not (and (consp (cdddr form))
+                                            (symbolp (cadddr form))
+                                            (name-eq (cadddr form) "%DEFPARAMETER-ALWAYS"))))
+                             `(unless (boundp ',var-name)
+                                (%gv-set-def ,(%global-var-bind-key var-name) ,value-form))
+                             `(%gv-set-def ,(%global-var-bind-key var-name) ,value-form))
                          env dest))
          ;; The documentation string (upstream DEFVAR.4, DEFPARAMETER.4).
-         (when (and (consp (cdddr form)) (stringp (cadddr form)))
-           (compile-form `(set-documentation ',var-name 'variable ,(cadddr form))
-                         env dest))
+         (let ((doc (if (and (consp (cdddr form)) (symbolp (cadddr form))
+                             (name-eq (cadddr form) "%DEFPARAMETER-ALWAYS"))
+                        (car (cdr (cdddr form)))
+                        (car (cdddr form)))))
+           (when (stringp doc)
+             (compile-form `(set-documentation ',var-name 'variable ,doc)
+                           env dest)))
          (compile-quote var-name dest)))
       ;; FLET — compile local functions, bodies see only parent env (no mutual recursion)
       ((= op-name 445617652)  ; FLET
@@ -8882,6 +8923,10 @@
        (%compile-setq-global (cadr (cadr form)) dest))
       ((= op-name #.(compute-name-hash "%PRIM-AREF"))
        (compile-prim-aref (cadr form) (caddr form) env dest))
+      ((= op-name #.(compute-name-hash "%STRUCT-SLOT-REF"))
+       (compile-struct-slot (cdr form) nil env dest))
+      ((= op-name #.(compute-name-hash "%STRUCT-SLOT-SET"))
+       (compile-struct-slot (cdr form) t env dest))
       ((= op-name #.(compute-name-hash "%PRIM-ARRAYP"))
        (compile-prim-arrayp (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%PRIM-ASET"))
@@ -8974,6 +9019,12 @@
       ((= op-name #.(compute-name-hash "%UCDR"))
        (compile-form (cadr form) env dest)
        (emit-ir :cdr dest dest))
+      ;; (%bulk-move dst di src si n kind) / (%bulk-fill arr i n val kind) — the
+      ;; :bulk-move / :bulk-fill instructions (KIND a literal 0 words / 1 bytes)
+      ((= op-name #.(compute-name-hash "%BULK-MOVE"))
+       (compile-bulk-op :bulk-move (cdr form) 5 env dest))
+      ((= op-name #.(compute-name-hash "%BULK-FILL"))
+       (compile-bulk-op :bulk-fill (cdr form) 4 env dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
@@ -24425,6 +24476,47 @@
       (let ((pk (symbol-package sym)))
         (and pk (string= (package-name pk) "KEYWORD")))))
 
+(defun %kw-in-order-p (plist names)
+  "True when PLIST's keywords appear in the order of NAMES (a subsequence of it)."
+  (let ((p plist) (rest names))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return t))
+      (let ((tail (member (symbol-name (car p)) rest :test (function string=))))
+        (unless tail (return nil))
+        (setq rest (cdr tail)))
+      (setq p (cddr p)))))
+
+(defun %kw-values-simple-p (plist)
+  "True when every value form in PLIST is a symbol or a self-evaluating constant:
+   evaluating them in any order is the same."
+  (let ((p plist))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return t))
+      (let ((v (cadr p)))
+        (unless (or (symbolp v) (numberp v) (stringp v) (characterp v)
+                    (and (consp v) (eq (car v) 'quote)))
+          (return nil)))
+      (setq p (cddr p)))))
+
+(defun %kw-plist-get-present (plist name)
+  "(T . FORM) for keyword NAME's value form in PLIST, (NIL) when absent -- a
+   present NIL value must not read as absent."
+  (let ((p plist))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return (cons nil nil)))
+      (when (string= (symbol-name (car p)) name) (return (cons t (cadr p))))
+      (setq p (cddr p)))))
+
+(defun %kw-plist-distinct-p (plist)
+  "True when no keyword appears twice in the KEYWORD VALUE plist PLIST."
+  (let ((p plist) (seen nil))
+    (loop
+      (when (or (null p) (not (consp (cdr p)))) (return t))
+      (let ((n (symbol-name (car p))))
+        (when (member n seen :test (function string=)) (return nil))
+        (setq seen (cons n seen)))
+      (setq p (cddr p)))))
+
 (defun %kw-plist-get (plist name)
   "The VALUE form after keyword NAME (a string) in PLIST, or NIL."
   (let ((p plist))
@@ -24747,6 +24839,21 @@
         (free-temp-reg)
         (free-temp-reg))))
 
+;;; %BULK-MOVE / %BULK-FILL — one :bulk-move / :bulk-fill instruction (mvm.lisp).
+;;; NREGS register operands, evaluated left to right into temps, then the
+;;; literal KIND (0 word slots, 1 bytes).  The value is NIL.  Unchecked: the
+;;; caller has proved the kinds and the bounds (%bulk-copy-ok-p and friends).
+(defun compile-bulk-op (op args nregs env dest)
+  (let ((kind (nth nregs args)))
+    (unless (and (= (length args) (1+ nregs)) (member kind '(0 1)))
+      (error "MVM compiler: (~A ...) takes ~D values and a literal kind 0 or 1: ~S"
+             op nregs args))
+    (let ((regs (loop repeat nregs collect (alloc-temp-reg))))
+      (loop for r in regs for a in args do (compile-form a env r))
+      (apply (function emit-ir) op (append regs (list kind)))
+      (loop repeat nregs do (free-temp-reg))
+      (compile-form nil env dest))))
+
 ;;; %PRIM-AREF / %PRIM-ASET — subtag-dispatching primitive element access.
 ;;; A byte-packed u8 vector (subtag #x11) reads/writes a single byte via
 ;;; %u8-ref/%u8-set; every other object (general array #x32, string #x31,
@@ -24768,6 +24875,51 @@
             (%u8-ref ,g-arr ,g-idx)
             (%word-aref ,g-arr ,g-idx)))
      env dest)))
+
+(defun compile-struct-slot (args setp env dest)
+  "(%STRUCT-SLOT-REF OBJ MIN-LEN IDX TYPE-NAME) / (%STRUCT-SLOT-SET OBJ MIN-LEN IDX VAL):
+   a defstruct accessor's whole body.  OBJ is checked to be a word array
+   (subtag #x32) of at least MIN-LEN words, then slot IDX (a literal) is read
+   or VAL stored -- one load or store.  Anything else signals TYPE-ERROR.
+
+   Written as the accessor's Lisp body -- (= (obj-subtag obj) #x32), (>= len
+   N), (%prim-aref obj IDX) -- it compiled to ~200 aarch64 instructions: the
+   two generic compares each an inline fast path plus a slow-path call, and
+   %PRIM-AREF a runtime byte-vs-word dispatch with a bounds check and a call
+   on each arm.  The check needs none of it: OBJ-SUBTAG is a tagged fixnum,
+   so is the length, and both compares are of tagged words (as
+   %EMIT-INDEX-CHECK's); the subtag and length proven, the slot is in bounds."
+  (let ((obj (car args)) (min-len (cadr args)) (idx (caddr args)))
+    (if (not (symbolp obj))
+        (let ((g (%mvm-gensym "SSLOT")))
+          (compile-form `(let ((,g ,obj)) (,(if setp '%struct-slot-set '%struct-slot-ref) ,g ,@(cdr args)))
+                        env dest))
+        (let ((r (alloc-temp-reg)) (k (alloc-temp-reg)) (c (alloc-temp-reg))
+              (v (and setp (alloc-temp-reg)))
+              (bad (make-compiler-label)) (done (make-compiler-label)))
+          (when setp (compile-form (cadddr args) env v))
+          (compile-form obj env r)
+          (emit-ir :obj-subtag k r)
+          (emit-li-tagged c #x32)
+          (emit-ir :cmp k c)
+          (emit-ir :bne bad)
+          (emit-ir :array-len k r)
+          (emit-li-tagged c min-len)
+          (emit-ir :cmp k c)
+          (emit-ir :blt bad)
+          (if setp
+              (progn (emit-ir :obj-set r idx v)
+                     (emit-ir :mov dest v))
+              (emit-ir :obj-ref dest r idx))
+          (emit-ir :br done)
+          (when setp (free-temp-reg))
+          (free-temp-reg) (free-temp-reg) (free-temp-reg)
+          (emit-ir-label bad)
+          (compile-form (if setp
+                            '(%signal-type-error)
+                            `(%signal-type-error ,obj (quote ,(cadddr args))))
+                        env dest)
+          (emit-ir-label done)))))
 
 (defun compile-prim-aset (arr-form idx-form val-form env dest)
   (let ((g-arr (%mvm-gensym "PASETA"))
@@ -25341,6 +25493,59 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; (replace d s :start1 ..) / (fill v x :start ..) with LITERAL keywords: a call to
+  ;; the positional %REPLACE-POS / %FILL-POS, so no &REST list of keyword arguments is
+  ;; consed per call (one REPLACE a row is how glass copies a rectangle: 17 KB a
+  ;; window-drag frame on a Pi Zero).  Every argument is still evaluated once, left to
+  ;; right in source order (LET* into gensyms).  Only a plain plist of the function's
+  ;; own keywords, each at most once, is rewritten; anything else -- a duplicate,
+  ;; :ALLOW-OTHER-KEYS, a computed keyword -- keeps the general call.
+  (when (and (symbolp fn) (or (name-eq fn "REPLACE") (name-eq fn "FILL"))
+             (consp args) (consp (cdr args)))
+    (let* ((replacep (name-eq fn "REPLACE"))
+           (names (if replacep (list "START1" "END1" "START2" "END2") (list "START" "END")))
+           (kw (cddr args)))
+      (when (and (%kw-plist-p kw names)
+                 (%kw-plist-distinct-p kw)
+                 (<= (length kw) (* 2 (length names))))
+        ;; In the positional order already (:START before :END), or nothing but
+        ;; constants and variables: the direct call evaluates the forms in the same
+        ;; order, so no LET* -- which, with a computed value, cost 64 bytes a call on
+        ;; x64 (register pressure), most of what this saves.
+        (when (or (%kw-in-order-p kw names) (%kw-values-simple-p kw))
+          (flet ((val (name default)
+                   (let ((v (%kw-plist-get-present kw name)))
+                     (if (car v) (cdr v) default))))
+            (return-from compile-call
+              (compile-form
+               (if replacep
+                   (list '%replace-pos (car args) (cadr args)
+                         (val "START1" 0) (val "END1" nil) (val "START2" 0) (val "END2" nil))
+                   (list '%fill-pos (car args) (cadr args) (val "START" 0) (val "END" nil)))
+               env dest))))
+        (let ((binds (list (list (%mvm-gensym "%KA") (car args))
+                           (list (%mvm-gensym "%KB") (cadr args))))
+              (vals nil))
+          (let ((p kw))
+            (loop (when (null p) (return nil))
+              (let ((g (%mvm-gensym "%KV")))
+                (setq binds (append binds (list (list g (cadr p)))))
+                (setq vals (cons (cons (symbol-name (car p)) g) vals)))
+              (setq p (cddr p))))
+          (flet ((val (name default)
+                   (let ((e (assoc name vals :test (function string=))))
+                     (if e (cdr e) default))))
+            (return-from compile-call
+              (compile-form
+               (list 'let* binds
+                     (if replacep
+                         (list '%replace-pos (car (first binds)) (car (second binds))
+                               (val "START1" 0) (val "END1" nil) (val "START2" 0) (val "END2" nil))
+                         (list '%fill-pos (car (first binds)) (car (second binds))
+                               (val "START" 0) (val "END" nil))))
+               env dest)))))))
+  ;; (BEFORE the ordering pass below: that binds every argument of a 5+ argument
+  ;; call to a variable, keywords included, and the call it leaves has none.)
   ;; Left-to-right evaluation for 5+ argument calls: bind the args in a LET
   ;; (which evaluates its inits in order) and call with the variables, which
   ;; are leaves -- so this does not recurse.  See %CALL-ARGS-NEED-ORDERING-P.
@@ -27115,6 +27320,8 @@
       (:vi-movi 4)
       (:vi-umov 5)
       (:vi-lane 6)
+      (:bulk-move 7)
+      (:bulk-fill 6)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -27469,6 +27676,8 @@
           (:vi-movi (mvm-vi-movi buf (second insn) (third insn) (fourth insn)))
           (:vi-umov (mvm-vi-umov buf (second insn) (third insn) (fourth insn) (fifth insn)))
           (:vi-lane (mvm-vi-lane buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn)))
+          (:bulk-move (mvm-bulk-move buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn) (nth 6 insn)))
+          (:bulk-fill (mvm-bulk-fill buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn)))
 
           ;; ---- 3-reg instructions ----
           (:add
@@ -28812,12 +29021,21 @@
                   ;; slot symbol's package -- re-interning its NAME in
                   ;; *PACKAGE* defined CL-TEST::A33 for a slot written
                   ;; STRUCT-TEST-PACKAGE::A33 (upstream STRUCT-TEST-33..35).
-                  (push `(defun ,(if conc-name (%defstruct-intern acc-name) slot) (obj)
-                           (if (= (obj-subtag obj) #x32)
-                               (if (>= (%prim-array-length obj) ,min-inst-len)
-                                   (%prim-aref obj ,(+ 2 i))
-                                   (%signal-type-error obj ',struct-name))
-                               (%signal-type-error obj ',struct-name)))
+                  ;; %STRUCT-SLOT-REF is the type-and-length check as ONE
+                  ;; primitive (compile-struct-slot): ~10 instructions, where
+                  ;; the Lisp spelling below compiled to ~200.  Its slot index
+                  ;; is an :OBJ-REF immediate (8 bits), so a slot past 253
+                  ;; keeps the Lisp spelling.
+                  (push (let ((acc (if conc-name (%defstruct-intern acc-name) slot)))
+                          (if (%obj-slot-imm-p (+ 2 i))
+                              `(defun ,acc (obj)
+                                 (%struct-slot-ref obj ,min-inst-len ,(+ 2 i) ,struct-name))
+                              `(defun ,acc (obj)
+                                 (if (= (obj-subtag obj) #x32)
+                                     (if (>= (%prim-array-length obj) ,min-inst-len)
+                                         (%prim-aref obj ,(+ 2 i))
+                                         (%signal-type-error obj ',struct-name))
+                                     (%signal-type-error obj ',struct-name)))))
                         forms-to-compile)
                   ;; compile-time record: a call on an argument DECLARED to be
                   ;; this struct reads the slot in place (see compile-call)
@@ -28843,11 +29061,13 @@
                          ;; inner backquote sits in a LAMBDA body, a separate
                          ;; compilation scope.
                          (checked-store
-                           `(if (= (obj-subtag obj) #x32)
-                                (if (>= (%prim-array-length obj) ,min-inst-len)
-                                    (%prim-aset obj ,(+ 2 i) val)
-                                    (%signal-type-error))
-                                (%signal-type-error)))
+                           (if (%obj-slot-imm-p (+ 2 i))
+                               `(%struct-slot-set obj ,min-inst-len ,(+ 2 i) val)
+                               `(if (= (obj-subtag obj) #x32)
+                                    (if (>= (%prim-array-length obj) ,min-inst-len)
+                                        (%prim-aset obj ,(+ 2 i) val)
+                                        (%signal-type-error))
+                                    (%signal-type-error))))
                          ;; CLHS 3.4.6: a :READ-ONLY slot has no writer at all.
                          ;; Modus always emits SET-<ACC> / SETF-<ACC> (the SETF
                          ;; place expansion calls SET-<ACC> unconditionally), so

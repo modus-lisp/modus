@@ -111,6 +111,14 @@
 ;; gauntlet 243/243 x2 at 11 FAILFORMs).  tree-walker.lisp remains the eval
 ;; engine of the four legacy fork builds ONLY.  If %e2ic-compile ever fails on
 ;; a new shape it signals honestly (UNDEFINED-FUNCTION via the NIL fn sentinel).
+;;; The gate runners are x64 and aarch64, whose translators have BULK-MOVE /
+;;; BULK-FILL: test REPLACE / FILL the way the shipping images run them
+;;; (build-cli-common *CLI-NATIVE-BULK-SOURCE*).  Last in the bridge, so it wins.
+(when (member *ansi-target-arch* '(:x64 :aarch64))
+  (setq *bridge-source*
+        (concatenate 'string *bridge-source* (string #\Newline)
+                     (mvm-text "mvm/native-bulk.lisp"))))
+
 (defvar *test-source*    (mvm-text "mvm/ansi-tests.lisp"))
 
 ;;; --- WS3: self-host the MVM compiler in the image (mvm-eval foundation) ---

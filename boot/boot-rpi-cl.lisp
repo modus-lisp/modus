@@ -133,6 +133,13 @@
 (defconstant +rpi-cl-heap-mid+      #x0C800000)  ; x25 — semispace midpoint
 (defconstant +rpi-cl-heap-end+      #x10000000)  ; 112 MB total
 (defconstant +rpi-cl-percpu+        #x10080000)  ; TPIDR_EL1
+;; SMP PHASE 2 (opt-in, MODUS_RPI_THREADS=1): the hosted aarch64 per-thread WINDOW on bare
+;; metal.  TPIDR_EL0 holds the window delta exactly as on Linux; core 0 runs at delta 0, so
+;; its window IS the historic absolute slots.  Off (the default) = the shipping image,
+;; byte-identical.
+(defvar *rpi-cl-threads*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_RPI_THREADS") #-sbcl nil))
+    (and v (> (length v) 0) (string/= v "0"))))
 
 ;; #271: where the boot preamble parks the firmware's device-tree pointer.
 ;;
@@ -248,6 +255,24 @@
   "Body of the sync-exception reporter.  Lives in the entry-8..15 slots (lower-EL
    vectors, which this image can never take: it runs at EL2 with nothing below
    it).  Same trick the QEMU-virt image uses for its entry-7/8 continuations."
+  ;; SMP (threaded builds): an undefined instruction whose thread's shared-store-guard
+  ;; marker is set is the GUARD refusing a store, not a crash -- resume at the Lisp
+  ;; function net/bare-threads.lisp installs at 0x10213028, which signals the guard's
+  ;; error on that thread.  test/rpi-smp/guardvec.s; falls through to the report.
+  (when *rpi-cl-threads*
+    (dolist (w '(#xd53c520a #xd35afd4a #xb50001ca #xd2a2042b #xf286050b #xf940016b
+                 #xb400014b #xd53bd04a #xd2a2000c #xf28a0b0c #x8b0a018c #xf940018c
+                 #xf100059f #x54000061 #xd51c402b #xd69f03e0))
+      (emit-aarch64-u32 buf w))
+    ;; ... and a data abort in a thread stack's GUARD PAGE (net/bare-threads.lisp maps
+    ;; [0x05000000, 0x06000000) with 4 KB pages, the lowest page of every thread stack
+    ;; unmapped): resume at the Lisp function at 0x10213030 with SP 32 KB above the
+    ;; guard -- the thread's own abandoned frames -- so the overflow is an error on
+    ;; that thread, not a trampled neighbour.  test/rpi-smp/stackvec.s.
+    (dolist (w '(#xd53c520a #xd35afd4a #xf100955f #x540001c1 #xd53c600a #xd358fd4b
+                 #xf100157f #x54000141 #xd2a2042b #xf286060b #xf940016b #xb40000cb
+                 #x9274cd4a #x9140254a #x9100015f #xd51c402b #xd69f03e0))
+      (emit-aarch64-u32 buf w)))
   ;; X17 = console data register.
   (emit-aarch64-load-imm64 buf 17 (if miniuart #x3F215040 +rpi-cl-pl011-base+))
   (emit-aarch64-u32 buf #xD28001EC)         ; MOVZ X12,#15   (nibble mask)
@@ -533,6 +558,18 @@
       (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
     (emit-aarch64-load-imm64 buf x16 #x10010000)
     (a64-stur buf +a64-xzr+ x16 0)
+    ;; With the per-thread window (*RPI-CL-THREADS*): its high slots 0x1000F000..0x10010000
+    ;; (GC statistics, the saved LR, the per-CPU pointer) are uninitialised RAM too, and
+    ;; TPIDR_EL0 -- the window delta -- resets to an UNKNOWN value; core 0's must be 0.
+    (when *rpi-cl-threads*
+      (emit-aarch64-load-imm64 buf x16 #x1000F000)
+      (emit-aarch64-load-imm64 buf x17 #x10010000)
+      (let ((loop-start (a64-current-index buf)))
+        (a64-stur buf +a64-xzr+ x16 0)
+        (a64-add-imm buf x16 x16 8)
+        (a64-cmp-reg buf x16 x17)
+        (a64-bcond buf #b0011 (- loop-start (a64-current-index buf))))
+      (emit-aarch64-u32 buf #xD51BD05F))     ; MSR TPIDR_EL0, XZR
 
     ;; --- 0a. FIRMWARE DEVICE-TREE POINTER (#271) --------------------------
     ;; MUST FOLLOW step 0, which zeroes the window this slot lives in, and
@@ -691,6 +728,11 @@
     ;; --- 4. TPIDR_EL1 = per-CPU base -------------------------------------
     (emit-aarch64-load-imm64 buf x16 +rpi-cl-percpu+)
     (emit-aarch64-u32 buf #xD518D090)       ; MSR TPIDR_EL1, X16
+    ;; With the window, A64-LOAD-PERCPU-BASE reads the per-CPU pointer from window slot
+    ;; 0x1000FFE8 (+A64-PERCPU-PTR-ADDR+) instead of TPIDR_EL1.
+    (when *rpi-cl-threads*
+      (emit-aarch64-load-imm64 buf x17 #x1000FFE8)
+      (a64-stur buf x16 x17 0))
 
     ;; --- 5. VBAR_EL1 *AND* VBAR_EL2 ---------------------------------------
     ;; This image RUNS AT EL2 on a Pi 3B / Zero 2 W (measured: PSTATE 0x3c9,

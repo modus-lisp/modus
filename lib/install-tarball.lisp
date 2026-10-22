@@ -675,6 +675,14 @@
    construction (lexical save + unwind-protect + setq), NOT (let ((*package*
    ...))) — see %it-eval-source's docstring for why that is not enough."
   (%it-reset-read-errors)   ; per-install; the final report reads this
+  ;; Gray streams are installed on first use (net/sb-gray-shim.lisp), as
+  ;; ASDF:LOAD-SYSTEM does -- a bare image installs through HERE, not ASDF,
+  ;; so without this seal's TLS-STREAM got anonymous superclasses and every
+  ;; READ-BYTE / WRITE-SEQUENCE on it was "not a stream".  Looked up at RUN
+  ;; time: this file is baked, and the installer is published into CL-USER's
+  ;; symbol cell at boot -- a quoted (fboundp '...) here never saw it.
+  (let ((s (find-symbol "%ENSURE-GRAY-STREAMS" "COMMON-LISP-USER")))
+    (when (and s (fboundp s)) (funcall s)))
   (let ((saved-package *package*)
         (saved-readtable *readtable*))
     (unwind-protect

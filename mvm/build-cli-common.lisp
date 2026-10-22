@@ -174,6 +174,16 @@
 
 (defvar *prelude-source*  (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
+;;; NATIVE BULK MEMORY (mvm/native-bulk.lisp): REPLACE / FILL's four inner loops
+;;; as BULK-MOVE / BULK-FILL instructions -- only where the translator has them,
+;;; aarch64 and x64 (the i386 bare REPL reuses *CLI-ARCH* :AARCH64, hence its
+;;; own test).  Spliced after the overrides, last-defun-wins.
+(defvar *cli-native-bulk-source*
+  (if (and (member *cli-arch* '(:x64 :aarch64))
+           (not (and (boundp 'cl-user::*cl-repl-i386-p*)
+                     (symbol-value 'cl-user::*cl-repl-i386-p*))))
+      (mvm-text "mvm/native-bulk.lisp")
+      ""))
 ;; MCGC stage-4d pin API + pin-stress probe.  Included ONLY when
 ;; MODUS_MCGC_PINNING=1; flag-off omits it (byte-identical to canonical).
 (defvar *mcgc-pin-source*
@@ -1410,19 +1420,26 @@
   ;; a heap snapshot IN PLACE OF the boot init below: the snapshot carries every
   ;; table init-symbol-table onward would build, so it must land first, and the
   ;; arch prologue above has already mapped this process's bitmaps.  Hosted only.
+  ;; %KERNEL-REDIRECTS-REAPPLY is called HERE and not from %CORE-POST-RESTORE,
+  ;; which several images redefine (last-defun-wins: net/hosted-ssh.lisp's
+  ;; replaces lib/save-image.lisp's outright): image functions redefined before
+  ;; the save come back unpatched with the binary (mvm-eval.lisp, REDEFINING A
+  ;; KERNEL FUNCTION), and a restored process must call the definitions it saved.
   (cond ((not *cli-bare-metal*)
          "  (when (%core-requested-p)
     (%restore-image)
     (%core-post-restore)
+    (%kernel-redirects-reapply)
     (handler-case (cli-toplevel) (t (c) (%cli-exit 1)))
     (%cli-exit 0))
 ")
         ;; Bare metal: the core is a RAM range the boot loader placed; the
         ;; arch says what a restored process runs instead of boot init.
         ((string= *cli-arch-core-resume* "") "")
-        (t (concatenate 'string "  (when (%core-requested-p)
+        (t (concatenate 'string "  (when (and (%core-requested-p) (%core-pre-restore))
     (%restore-image)
     (%core-post-restore)
+    (%kernel-redirects-reapply)
 " *cli-arch-core-resume* "    )
 ")))
   ;; ---- SHARED boot init.  Identical on every arch, and the whole reason this
@@ -1756,6 +1773,9 @@
                (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)
+               (read-file-text (merge-pathnames "net/sb-bsd-sockets-shim.lisp"
+                                                *modus-base*))
+               (string #\Newline)
                ;; SB-MOP LAST: it IMPORTs into its own package and touches nothing the two above
                ;; define, but it does read modus's CLOS internals (%FIND-CLOS-CLASS, %GF-METHODS),
                ;; so it wants the image fully up.  Rides MODUS_NO_SB with the others.
@@ -1957,6 +1977,7 @@
                        *rt-macros-source* (string #\Newline)
                        *bridge-source*   (string #\Newline)
                        *cli-arch-override-source*
+                       *cli-native-bulk-source*
                        ;; HOSTED ACTORS: "" on aarch64 and on bare metal, so
                        ;; their scanner input — hence SFT-AUTO and
                        ;; SYM-NAME-AUTO — is byte-identical to before.
@@ -2204,6 +2225,8 @@
     ;; override cl-fileio.lisp and lib/cli-toplevel.lisp, both baked inside it).
     ;; "" on x64.
     *cli-arch-override-source*
+    ;; then the native REPLACE / FILL loops (aarch64 and x64 only; "" elsewhere)
+    *cli-native-bulk-source*
     ;; HOSTED ACTORS (x86-64 hosted only; "" elsewhere).  POSITION IS
     ;; LOAD-BEARING: after mvm/gc.lisp (whose %gc-region-* / %gc-read64 it
     ;; calls — a forward reference across the blob does not resolve) and after

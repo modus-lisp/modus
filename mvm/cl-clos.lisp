@@ -6739,6 +6739,47 @@
            (%prim-aset u (+ off i) val))))
     (t (%prim-aset w i val))))
 
+;;; THE OUT-OF-LINE ARMS OF A GENERIC AREF / ASET (compiler.lisp COMPILE-AREF /
+;;; COMPILE-ASET).  An AREF on an array of unknown shape used to inline the WHOLE
+;;; dispatch -- simple string, simple vector, u8, MDA (displaced or not), cons
+;;; wrapper, primitive string, f32 -- and most arms carried their own bounds
+;;; check and its cold error call: ~6 %AREF-INDEX-ERROR sites and ~6 runtime
+;;; calls at every site.  Measured on a Zero core: 18,853 inline index-error
+;;; calls, a quarter of all call sites.  The site now keeps the common shapes
+;;; (simple string, simple vector, u8) and calls these for the rest.  Each is
+;;; the COMPLETE former dispatch, in the former order, so any array is right
+;;; here.  Written in primitives: an AREF in this body would call itself.
+(defun %aref-slow (a i)
+  (cond
+    ((%prim-simple-string-p a) (code-char (%word-aref a i)))
+    ((%prim-simple-vector-p a) (%word-aref a i))
+    ((%prim-u8-vector-p a) (%u8-ref a i))
+    ((%mda-p a)
+     (let ((disp (%mda-displaced a)))
+       (let ((raw (if disp
+                      (%aref-multi a i)
+                      (%prim-aref (%mda-data a) i))))
+         (if (%prim-stringp (%mda-data a)) (code-char raw) raw))))
+    ((%raw-consp a)
+     (let ((raw (%wrapper-aref a i)))
+       (if (%wrapper-stringp a) (code-char raw) raw)))
+    ((%prim-stringp a) (code-char (%prim-aref a i)))
+    ((eq (obj-subtag a) #x12) (%f32-aref a i))
+    (t (%prim-aref a i))))
+
+(defun %aset-slow (a i val)
+  (let ((sto (%aset-store-val a val)))
+    (cond
+      ((%mda-p a)
+       (let ((disp (%mda-displaced a)))
+         (if disp
+             (%aset-multi a sto i)
+             (%prim-aset (%mda-data a) i sto)))
+       val)
+      ((%raw-consp a) (%wrapper-aset a i sto) val)
+      ((eq (obj-subtag a) #x12) (%f32-aset a i val))
+      (t (%prim-aset a i sto) val))))
+
 ;;; %wrapper-array-length: ARRAY-LENGTH semantics — returns the underlying
 ;;; storage size (NOT the fill-pointer).  ARRAY-IN-BOUNDS-P relies on this
 ;;; matching the actual array dimension (e.g. fp 5 in length-10 backing →

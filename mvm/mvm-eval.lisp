@@ -2933,8 +2933,15 @@
              (lrel *aarch64-fn-addr-local-relocs*)
              (cpat *aarch64-li-const-patches*)
              (eoff (gethash mvm-entry fn-map))
-             (npages (+ 1 (ash nlen -12)))
-             (psize (ash npages 12))
+             ;; EXACT SIZE, 16-aligned: the arena is a bump allocator that
+             ;; hands out 16-aligned blocks (#x0531), so a module needs no
+             ;; page of its own.  Rounding each to a page plus a page of slack
+             ;; was ~2 KB a module -- 5 MB of a 25 MB Zero core's arena.  Pages
+             ;; only if JIT pages are ever freed (%JIT-FREE-PAGE munmaps, which
+             ;; would take the neighbours with them); *JIT-RECLAIM-ON* is unbound.
+             (psize (if (and (boundp (quote *jit-reclaim-on*)) (symbol-value (quote *jit-reclaim-on*)))
+                        (ash (+ 1 (ash nlen -12)) 12)
+                        (logand (+ nlen 15) -16)))
              (b0 (%core-jit-arena-bump))
              (base (%mmap-exec-page psize))
              (b1 (%core-jit-arena-bump))

@@ -23791,6 +23791,13 @@
 ;;; / %wrapper-length helpers (defined in cl-clos.lisp).  Plain (non-cons)
 ;;; arrays go straight to the primitive op so the common case stays fast
 ;;; (one consp test).
+(defvar *aref-out-of-line* t
+  "Whether a generic (undeclared) AREF / ASET keeps only the simple string,
+   simple vector and u8 shapes inline and calls cl-clos.lisp's %AREF-SLOW /
+   %ASET-SLOW for the rest.  The full inline dispatch it replaces already
+   called into cl-clos.lisp (%WRAPPER-AREF, %AREF-MULTI), so every image that
+   reaches this expansion has them.")
+
 (defun compile-aref (arr-form idx-form env dest)
   "Compile (aref array index) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aref.  Multi-subscript
@@ -23827,9 +23834,39 @@
          env tmp)
         (free-temp-reg)))
     (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
-  (let ((g-arr (%mvm-gensym "AREFA"))
-        (g-idx (%mvm-gensym "AREFI"))
-        (g-raw (%mvm-gensym "AREFR")))
+  (let* ((g-arr (%mvm-gensym "AREFA"))
+         (g-idx (%mvm-gensym "AREFI"))
+         (g-raw (%mvm-gensym "AREFR"))
+         ;; EVERY OTHER SHAPE OUT OF LINE (cl-clos.lisp %AREF-SLOW, the same
+         ;; arms in the same order): inlined, they were most of every generic
+         ;; AREF's native code.  Bound HERE as their own backquotes and
+         ;; spliced below as a variable -- a backquote nested directly in a
+         ;; comma of the outer one does not compile when this file is
+         ;; compiled into the image (see CHECKED-STORE in the defstruct
+         ;; expander).
+         (rest-arms
+           (if *aref-out-of-line*
+               (list `(t (%aref-slow ,g-arr ,g-idx)))
+               `(;; MDA fast path — single-sub on an MDA is just an aref of
+                 ;; the underlying data (assuming no displacement; %aref-multi
+                 ;; handles the displaced case).
+                 ((%mda-p ,g-arr)
+                  (let ((disp (%mda-displaced ,g-arr)))
+                    (let ((,g-raw (if disp
+                                      (%aref-multi ,g-arr ,g-idx)
+                                      (%prim-aref (%mda-data ,g-arr) ,g-idx))))
+                      (if (%prim-stringp (%mda-data ,g-arr))
+                          (code-char ,g-raw)
+                          ,g-raw))))
+                 ((%raw-consp ,g-arr)
+                  (let ((,g-raw (%wrapper-aref ,g-arr ,g-idx)))
+                    (if (%wrapper-stringp ,g-arr) (code-char ,g-raw) ,g-raw)))
+                 ((%prim-stringp ,g-arr) (code-char (%prim-aref ,g-arr ,g-idx)))
+                 ;; packed single-float vector (#x12): the PUBLIC aref boxes the
+                 ;; lane here, so %prim-aref (header/slot access everywhere in the
+                 ;; runtime) stays a two-way u8/word dispatch with no call.
+                 ((eq (obj-subtag ,g-arr) #x12) (%f32-aref ,g-arr ,g-idx))
+                 (t (%prim-aref ,g-arr ,g-idx))))))
     (compile-form
      ;; CL conformance: (aref STRING i) must return a CHARACTER, not the
      ;; raw char-CODE.  All three storage shapes (native MDA char-data,
@@ -23852,26 +23889,7 @@
           ;; Byte-packed (unsigned-byte 8) vector: the interpreter's bytecode
           ;; (every FETCH-* reads it), octet buffers.
           ((%prim-u8-vector-p ,g-arr) (%u8-ref ,g-arr ,g-idx))
-          ;; MDA fast path — single-sub on an MDA is just an aref of
-          ;; the underlying data (assuming no displacement; %aref-multi
-          ;; handles the displaced case).
-          ((%mda-p ,g-arr)
-           (let ((disp (%mda-displaced ,g-arr)))
-             (let ((,g-raw (if disp
-                               (%aref-multi ,g-arr ,g-idx)
-                               (%prim-aref (%mda-data ,g-arr) ,g-idx))))
-               (if (%prim-stringp (%mda-data ,g-arr))
-                   (code-char ,g-raw)
-                   ,g-raw))))
-          ((%raw-consp ,g-arr)
-           (let ((,g-raw (%wrapper-aref ,g-arr ,g-idx)))
-             (if (%wrapper-stringp ,g-arr) (code-char ,g-raw) ,g-raw)))
-          ((%prim-stringp ,g-arr) (code-char (%prim-aref ,g-arr ,g-idx)))
-          ;; packed single-float vector (#x12): the PUBLIC aref boxes the
-          ;; lane here, so %prim-aref (header/slot access everywhere in the
-          ;; runtime) stays a two-way u8/word dispatch with no call.
-          ((eq (obj-subtag ,g-arr) #x12) (%f32-aref ,g-arr ,g-idx))
-          (t (%prim-aref ,g-arr ,g-idx))))
+          ,@rest-arms))
      env dest)))
 
 (defun compile-aref-form (form env dest)
@@ -24009,6 +24027,16 @@
      ;; ASET returns the value actually stored; for the char case that is
      ;; the code, but CLHS (setf aref) returns the original value — so we
      ;; bind ,g-val and return it explicitly only when we coerced.
+     (if *aref-out-of-line*
+         ;; Simple vector and u8 vector inline (neither is string-typed, so
+         ;; the store is the value as given); every other shape in
+         ;; cl-clos.lisp %ASET-SLOW -- the former dispatch, store-value
+         ;; coercion included.  Same evaluation order: array, index, value.
+         `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
+            (cond
+              ((%prim-simple-vector-p ,g-arr) (%word-aset ,g-arr ,g-idx ,g-val) ,g-val)
+              ((%prim-u8-vector-p ,g-arr) (%u8-set ,g-arr ,g-idx ,g-val) ,g-val)
+              (t (%aset-slow ,g-arr ,g-idx ,g-val))))
      `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form)
              (,g-sto (%aset-store-val ,g-arr ,g-val)))
         (cond
@@ -24021,7 +24049,7 @@
           ((%raw-consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-sto) ,g-val)
           ;; packed single-float vector (#x12): narrow and store the lane
           ((eq (obj-subtag ,g-arr) #x12) (%f32-aset ,g-arr ,g-idx ,g-val))
-          (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val)))
+          (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val))))
      env dest)))
 
 (defun compile-aset-form (form env dest)

@@ -815,8 +815,14 @@
    (Such an object is a #x32 array but not SIMPLE-VECTOR-P here.)"
   (and (not (listp v)) (not (numberp v)) (not (characterp v)) (not (symbolp v))
        (not (stringp v)) (not (pathnamep v)) (not (functionp v))
-       (let ((m (ignore-errors (svref v 0))))
-         (and m (symbolp m) (symbol-name m)))))
+       ;; the length first: an EMPTY vector's SVREF 0 signalled out of the
+       ;; IGNORE-ERRORS that used to be all this had (image code) and killed
+       ;; COMPILE-FILE of any file holding a #() -- the ANSI suite's own
+       ;; ansi-aux.lsp among them
+       (let ((n (ignore-errors (%prim-array-length v))))
+         (and (integerp n) (> n 0)
+              (let ((m (ignore-errors (svref v 0))))
+                (and m (symbolp m) (symbol-name m)))))))
 
 (defun %fasl-instance-p (v)
   (let ((m (%fasl-object-marker v)))
@@ -998,9 +1004,9 @@
                (setq *fasl-compile-only* t)
                ;; Literal objects (#.(make-instance ...)) become MAKE-LOAD-FORM
                ;; creation / initialization forms of their own, ahead of FORM.
-               (let ((ext (and (%fasl-has-objects-p form)
-                               (handler-case (%fasl-externalize form xs)
-                                 (error (c) nil)))))
+               (let ((ext (handler-case (and (%fasl-has-objects-p form)
+                                             (%fasl-externalize form xs))
+                            (error (c) nil))))
                  (when ext
                    (let ((own (car (nth 4 fx))))
                      (setf (nth 4 fx) (cdr (nth 4 fx)))

@@ -125,7 +125,13 @@
             (inner-name (cond ((stringp inner) inner)
                               ((%cl-sym-p inner) (%cl-sym-name inner))
                               (t (symbol-name inner))))
-            (full (concatenate 'string "SETF-" inner-name)))
+            (full (concatenate 'string "SETF-" inner-name))
+            ;; a runtime-born package's (SETF X) is compiled under
+            ;; "PKG::SETF-X" (%SETF-FN-NAME), so look it up there (FBOUNDP.6)
+            (pkg (and (%cl-sym-p inner) (%cl-sym-package inner)))
+            (full (if (and pkg (%pkg-name pkg) (%runtime-born-pkg-p (%pkg-name pkg)))
+                      (concatenate 'string (%pkg-name pkg) "::" full)
+                      full)))
        (cons full (compute-name-hash full))))
     ;; (A hash table is a cons here; the unbound marker an uninitialised
     ;; defvar reads as in the gate image is a fixnum.)
@@ -376,7 +382,11 @@
   (symbol-function sym))
 
 (defun set-fdefinition (sym fn)
-  "Set the function definition of SYM."
+  "Set the function definition of SYM.  For (SETF NAME), SETF of (NAME ...)
+   then calls it, as for a DEFUN of it (FDEFINITION.5)."
+  (when (and (consp sym) (symbolp (car sym)) (string= (symbol-name (car sym)) "SETF")
+             (consp (cdr sym)) (symbolp (cadr sym)))
+    (%register-setf-function (cadr sym)))
   (set-symbol-function sym fn))
 
 ;;; ============================================================
@@ -750,6 +760,13 @@
   (declare (ignore args))
   (%signal-program-error))
 
+(defun %lambda-macro-shim (&rest args)
+  "MACRO-FUNCTION of LAMBDA: (LAMBDA ...) expands to (FUNCTION (LAMBDA ...))
+   (CLHS LAMBDA; LAMBDA.MACRO.2).  Called as (FORM ENV)."
+  (unless (and (consp args) (consp (cdr args)) (null (cddr args)))
+    (%signal-program-error))
+  (list 'function (car args)))
+
 ;;; ------------------------------------------------------------------
 ;;; Compiler-internal inlining macros for standard CL FUNCTIONS.
 ;;;
@@ -905,6 +922,8 @@
         ;; Compiler-macro marker: no runtime expander exists.  Return a
         ;; real closure (NOT bare T — that funcall-of-T SIGSEGVs) that is
         ;; truthful about macro-ness and arity-checks per CLHS.
+        ((and (eq raw t) (equal key "LAMBDA"))
+         (%make-closure #'%lambda-macro-shim (cons nil nil)))
         ((eq raw t)
          (%make-closure #'%compiler-macro-shim (cons nil nil)))
         ;; Runtime-defmacro expanders are %interp-closures.  Wrap via
@@ -1007,6 +1026,11 @@
      ;; funcall works; we dispatch on the raw shape here.
      (let ((mf (%raw-macro-expander (car form))))
        (cond
+         ;; CL:LAMBDA is a macro: (FUNCTION (LAMBDA ...)) (LAMBDA.MACRO.2)
+         ((and (%cl-sym-p (car form))
+               (string= (symbol-name (car form)) "LAMBDA")
+               (eq (symbol-package (car form)) (find-package "COMMON-LISP")))
+          (values (list 'function form) t))
          ((null mf) (values form nil))
          ((eq mf t) (values form nil))   ; compiler-macro marker
          ((%interp-closure-p mf)
@@ -1093,6 +1117,25 @@
                (%reg-pkg-alist-put (gethash key *%runtime-deftype-pkg-table*)
                                    p val)))))
 
+(defun %deftype-star-defaults (params)
+  (let ((mode nil) (out nil) (cur params))
+    (loop
+      (cond ((null cur) (return (nreverse out)))
+            ((not (consp cur)) (return (append (nreverse out) cur)))) ; dotted rest
+      (let ((p (car cur)))
+        (cond
+          ((and (symbolp p) p (> (length (symbol-name p)) 0)
+                (char= (char (symbol-name p) 0) #\&))
+           (setq mode (if (member (symbol-name p) '("&OPTIONAL" "&KEY") :test #'string=)
+                          :opt nil))
+           (push p out))
+          ((and (eq mode :opt) (symbolp p))
+           (push (list p (list 'quote '*)) out))
+          ((and (eq mode :opt) (consp p) (null (cdr p)))
+           (push (list (car p) (list 'quote '*)) out))
+          (t (push p out))))
+      (setq cur (cdr cur)))))
+
 (defun %runtime-register-deftype (tname params body)
   "mvm-eval DEFTYPE expansion target (compiler.lisp, *mvm-eval-runtime-p* gated).
    Registers the expander in *%runtime-deftype-table* — the SAME registry
@@ -1104,6 +1147,9 @@
    historic bare entry so every lookup that cannot name a package (native
    MVM syms, string heads) keeps resolving exactly as before."
   (%fasl-taint "%runtime-register-deftype")
+  ;; An &OPTIONAL / &KEY parameter with no default defaults to * in a DEFTYPE
+  ;; lambda list (CLHS DEFTYPE; DEFTYPE.9).
+  (setq params (%deftype-star-defaults params))
   (let ((name-str (%eval-sym-name tname))
         (entry (cons params body)))
     (when name-str
@@ -2410,8 +2456,10 @@
   (unless (characterp c) (%signal-type-error))
   (let ((code (%ensure-char-code c)))
     (code-char (if (and (>= code 97) (<= code 122)) (- code 32) code))))
-(defun char-downcase (c) (let ((code (%ensure-char-code c)))
-  (code-char (if (and (>= code 65) (<= code 90)) (+ code 32) code))))
+(defun char-downcase (c)
+  (unless (characterp c) (%signal-type-error))   ; CHAR-DOWNCASE.4
+  (let ((code (%ensure-char-code c)))
+    (code-char (if (and (>= code 65) (<= code 90)) (+ code 32) code))))
 (defun upper-case-p (c)
   (unless (characterp c) (%signal-type-error))
   (let ((code (%ensure-char-code c))) (if (>= code 65) (<= code 90) nil)))
@@ -2455,6 +2503,8 @@
       ((string= s "PAGE")      (code-char 12))
       ((string= s "LINEFEED")  (code-char 10))
       ((string= s "ALTMODE")   (code-char 27))
+      ((string= s "BEL")       (code-char 7))
+      ((string= s "BELL")      (code-char 7))
       ((string= s "NULL")      (code-char 0))
       ((string= s "NUL")       (code-char 0))
       ((string= s "ESCAPE")    (code-char 27))
@@ -2475,6 +2525,7 @@
       ((= code 127) "Rubout")
       ((= code 12)  "Page")
       ((= code 27)  "Escape")
+      ((= code 7)   "Bel")
       ((= code 0)   "Null")
       (t nil))))
 
@@ -2816,7 +2867,7 @@
           (idx 0))
       (loop
         (when (null cur) (return nil))
-        (when (>= idx 16) (return nil))
+        (when (>= idx 20) (return nil))   ; the 20 slots #x10000098..#x10000130
         (setf (mem-ref (+ +mv-values-addr+ (* idx 8)) :u64) (car cur))
         (setq idx (+ idx 1))
         (setq cur (cdr cur))))
@@ -4474,8 +4525,10 @@
         (if (= sign -1) (bignum-negate q) q)))))
 
 ;; Funcallable versions of compiler builtins (needed for #'consp etc.)
-(defun consp (x) (consp x))
-(defun atom (x) (atom x))
+;; As runtime-compiled code sees them (%RT-CONSP): a hash table, package,
+;; stream, readtable or random state is no CONS (CONSP-CONS-UNIVERSE).
+(defun consp (x) (%rt-consp x))
+(defun atom (x) (not (%rt-consp x)))
 ;; NUMBERP intentionally NOT redefined here.  The early version at
 ;; L2358 — `(or (integerp x) (floatp-impl x))` — is the correct one;
 ;; an "(integerp x)" reduction lived here for ages and silently won
@@ -4680,7 +4733,12 @@
     ;; VA); a larger or negative integer is just a number -- (functionp
     ;; 4611686018427387898) was T (upstream
     ;; UNIVERSE-ELEMENTS-IN-AT-MOST-ONE-DISJOINT-TYPE, TYPES.3).
-    ((and (integerp x) (or (< x #x100000) (>= x 140737488355328))) nil)
+    ;; Any other integer is just a number: every function value is a tagged
+    ;; object (#'NAME, closures, JIT'd and compiled functions alike), so the
+    ;; old 2^20..2^47 window only answered T for numbers like 1048576.
+    ((integerp x) nil)
+    ;; floats, ratios and complexes are objects too (UNIVERSE-ELEMENTS-...)
+    ((numberp x) nil)
     (t t)))
 
   ; stub
@@ -4899,6 +4957,16 @@
           ;; User defsetf — expand via the registered descriptor.
           (values temps args (list g)
                   (%apply-setf-expander expander temps g)
+                  (cons accessor temps)))
+         ;; A name that is neither a function nor a macro (nor a CL name):
+         ;; the place is a call of the setf FUNCTION (CLHS 5.1.2.9;
+         ;; GET-SETF-EXPANSION.1).
+         ((and (symbolp accessor) accessor
+               (not (fboundp accessor))
+               (not (eq (symbol-package accessor) (find-package "COMMON-LISP"))))
+          (values temps args (list g)
+                  (cons 'funcall (cons (list 'function (list 'setf accessor))
+                                       (cons g temps)))
                   (cons accessor temps)))
          (t
           ;; Fall through to (setf …) — the compiler's SETF macro will
@@ -5562,8 +5630,16 @@
          ;; Native MVM symbol: match by name too.
          (or (%cl-constant-variable-name-p (symbol-name form))
              (%constant-var-p form))))
-    ((and (consp form) (eq (car form) 'quote)) t)
-    (t nil)))
+    ;; Hash tables, packages, readtables, random states and streams are
+    ;; tagged conses underneath, but as forms they are self-evaluating objects.
+    ((consp form)
+     (if (or (hash-table-p form) (packagep form) (readtablep form)
+             (random-state-p form) (streamp form))
+         t
+         (eq (car form) 'quote)))
+    ;; Every other object (a condition, an array, a function, ...) evaluates
+    ;; to itself (CLHS 3.1.2.1.3).
+    (t t)))
 
 ;; SBIT / SET-BIT / SET-SBIT: canonical (any-rank) definitions live in cl-types.lisp.
 

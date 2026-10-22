@@ -116,6 +116,12 @@
     ((eq type-name 'character) '(character t))
     ((eq type-name 'function)  '(function t))
     ((eq type-name 'boolean)   '(boolean symbol t))
+    ((eq type-name 'standard-generic-function)
+     '(standard-generic-function generic-function function t))
+    ((eq type-name 'standard-method) '(standard-method method standard-object t))
+    ((member type-name '(broadcast-stream concatenated-stream echo-stream
+                         file-stream string-stream synonym-stream two-way-stream))
+     (list type-name 'stream 't))
     (t                         (list type-name 't))))
 
 (defun %type-of-for-dispatch (obj)
@@ -150,6 +156,22 @@
     ;; precede CONSP -- jzon's (defmethod write-value (w (v hash-table))) was
     ;; never applicable and every JSON object was written as a list.
     ((hash-table-p obj) 'hash-table)
+    ;; Packages, random states and streams are tagged conses too, each a
+    ;; class of its own (upstream PACKAGE-CPL, RANDOM-STATE-CPL, the stream
+    ;; CPL tests): they dispatched as CONS.
+    ((packagep obj)     'package)
+    ((random-state-p obj) 'random-state)
+    ;; a method record is a cons too (STANDARD-METHOD-CPL)
+    ((%standard-method-p obj) 'standard-method)
+    ((streamp obj)
+     (cond ((broadcast-stream-p obj) 'broadcast-stream)
+           ((concatenated-stream-p obj) 'concatenated-stream)
+           ((echo-stream-p obj) 'echo-stream)
+           ((synonym-stream-p obj) 'synonym-stream)
+           ((two-way-stream-p obj) 'two-way-stream)
+           ((string-stream-p obj) 'string-stream)
+           ((file-stream-p obj) 'file-stream)
+           (t 'stream)))
     ((consp obj)       'cons)
     ;; conditions — detectable via the condition-type registry; their
     ;; CPL keeps STANDARD-OBJECT so methods that matched under the old
@@ -166,7 +188,9 @@
     ;; closure fell through to the (regex t) default, which PARSED it as a
     ;; regex string: "Unknown token #<closure> in parse tree" -- every
     ;; ALL-MATCHES / REGEX-REPLACE on the library ladder.
+    ((%generic-function-p obj) 'standard-generic-function)
     ((functionp obj)   'function)
+    ((bignump obj)     'integer)
     ;; vectors / arrays — without these every array dispatched as
     ;; STANDARD-OBJECT, so methods specialized on (y array) / (y vector)
     ;; were never applicable (defgeneric.33).  CLOS instances never
@@ -7939,7 +7963,7 @@
 
 (defun set-char (str idx ch) (aset str idx (char-code ch)) ch)
 (defun set-subseq (seq start &rest rest)
-  "Destructively replace seq[start..end] with val.  Returns seq.
+  "Destructively replace seq[start..end] with val.  Returns val.
    Per CLHS, this is the SETF expansion of subseq with two arities:
      (set-subseq seq start val)         ; SETF (SUBSEQ seq start)
      (set-subseq seq start end val)     ; SETF (SUBSEQ seq start end)
@@ -7959,10 +7983,11 @@
     ;; dispatched calls and a redundant round trip PER CHARACTER (measured
     ;; 122 ns/char before this).  %bulk-copy-ok-p hoists all the type tests
     ;; out of the loop; anything it rejects falls through unchanged.
+    ;; SETF of SUBSEQ returns the new value, not the sequence.
     (if (%bulk-copy-ok-p seq val)
-        (progn (%bulk-copy seq start val 0 copy-len) seq)
+        (progn (%bulk-copy seq start val 0 copy-len) val)
         (loop
-          (when (>= i copy-len) (return seq))
+          (when (>= i copy-len) (return val))
           (setf (elt seq (+ start i)) (elt val i))
           (setq i (+ i 1))))))
 (defun is-ordered-by (pred) (lambda (x y) (funcall pred x y)))

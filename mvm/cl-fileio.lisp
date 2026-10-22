@@ -2403,7 +2403,10 @@
    nil -> *standard-output*, t -> *terminal-io* output side."
   (cond
     ((null stream) *standard-output*)
-    ((eq stream t) (if (streamp *terminal-io*)
+    ;; *TERMINAL-IO* is not always a two-way stream: PPRINT-LOGICAL-BLOCK
+    ;; with stream designator T binds it to the block's stream
+    ;; (PPRINT-NEWLINE.2, PPRINT-TAB.T.1).
+    ((eq stream t) (if (and (streamp *terminal-io*) (= (%stream-type *terminal-io*) 4))
                        (two-way-stream-output-stream *terminal-io*)
                        *terminal-io*))
     ((streamp stream)
@@ -2461,6 +2464,9 @@
              (let ((ch (%read-char-from-stream (car data) nil :echo-eof-7770004)))
                (cond ((eq ch :echo-eof-7770004)
                       (if eof-error-p (%signal-eof s) eof-value))
+                     ;; a char UNREAD-CHAR pushed back was echoed already
+                     ;; (UNREAD-CHAR.3: "abc", not "aabcc")
+                     ((%echo-take-unread s) ch)
                      (t (when (characterp ch)
                           (%write-char-to-stream (%ensure-char-code ch) (cdr data)))
                         ch)))))
@@ -2501,6 +2507,20 @@
 
 ;;; --- unread-char ---
 
+(defvar *%echo-unread* nil
+  "Echo streams with an UNREAD-CHAR pending, one entry per pushed-back char.")
+
+(defun %echo-take-unread (s)
+  "T (and forget it) when echo stream S has an unread char pending."
+  (when (member s *%echo-unread* :test #'eq)
+    (let ((out nil) (done nil))
+      (dolist (x *%echo-unread*)
+        (if (and (not done) (eq x s))
+            (setq done t)
+            (setq out (cons x out))))
+      (setq *%echo-unread* (nreverse out)))
+    t))
+
 (defun unread-char (ch &rest args)
   "Push back a character onto a stream."
   ;; CLHS: (unread-char character &optional input-stream) — at most one
@@ -2516,7 +2536,9 @@
              (let ((pos-cell (cdr (%stream-data s))))
                (set-cdr pos-cell ch)))
             ((= ty 3)
-             ;; Echo stream: unread on input side (don't echo unreads)
+             ;; Echo stream: unread on input side; the next read of it is
+             ;; not echoed again.
+             (setq *%echo-unread* (cons s *%echo-unread*))
              (unread-char ch (car (%stream-data s))))
             ((= ty 4)
              ;; Two-way: unread on input side
@@ -2587,7 +2609,8 @@
              (let ((ch (%read-char-from-stream resolved eof-error-p eof-value)))
                (cond
                  ((not (characterp ch)) (return ch))
-                 ((not (%whitespace-p ch))
+                 ;; whitespace as *READTABLE* says (PEEK-CHAR.20/21)
+                 ((not (%rt-ws-p ch *readtable*))
                   (cond
                     (echo-p
                      ;; Undo the trailing echo of the peeked char

@@ -4203,7 +4203,26 @@
           (let ((place (first pairs))
                 (val (second pairs)))
             (multiple-value-bind (bindings access writer)
-                (mvm-place-expansion place)
+                (if (and (consp place) (symbolp (car place)) (name-eq (car place) "VALUES"))
+                    ;; (VALUES p1 ... pn): every subplace's subforms, in
+                    ;; order; the value form's values are stored by position.
+                    (let ((sub-binds nil) (sub-writers nil))
+                      (dolist (sp (cdr place))
+                        (multiple-value-bind (b a w) (mvm-place-expansion sp)
+                          (declare (ignore a))
+                          (dolist (x b) (push x sub-binds))
+                          (push w sub-writers)))
+                      (setq val (list 'multiple-value-list val))
+                      (setq sub-writers (nreverse sub-writers))
+                      (values (nreverse sub-binds) nil
+                              (lambda (v)
+                                (let ((k -1))
+                                  (cons 'progn
+                                        (mapcar (lambda (w)
+                                                  (setq k (+ k 1))
+                                                  (funcall w (list 'nth k v)))
+                                                sub-writers))))))
+                    (mvm-place-expansion place))
               (declare (ignore access))
               (let ((vg (%mvm-gensym "PSV")))
                 ;; place subforms first (left-to-right), then the value.
@@ -4970,6 +4989,12 @@
                   ;; Mark NAME a constant variable so (constantp 'name) is T
                   ;; (CLHS) — alexandria define-constant.1/.2 check this.
                   (list '%mark-constant-var (list 'quote (cadr form)))
+                  ;; (defconstant name value doc): the documentation string
+                  ;; (DEFCONSTANT.4).
+                  (if (stringp (cadddr form))
+                      (list 'set-documentation (list 'quote (cadr form))
+                            (list 'quote 'variable) (cadddr form))
+                      nil)
                   (list 'quote (cadr form))))))
     ;; DEFINE-COMPILER-MACRO (RUNTIME / mvm-eval only): register the expander in
     ;; the SAME *compiler-macro-function-table* the tree-walker's handler
@@ -5022,9 +5047,10 @@
                  (let ((gargs (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "LSFA"))
                                       (cdr place)))
                        (gval (%mvm-gensym "LSFV")))
+                   ;; The SETF form's value is the setf function's
+                   ;; (FLET.51, LABELS.26).
                    `(let* (,@(mapcar #'list gargs (cdr place)) (,gval ,value))
-                      (funcall #'(setf ,(car place)) ,gval ,@gargs)
-                      ,gval)))
+                      (funcall #'(setf ,(car place)) ,gval ,@gargs))))
                 ;; User-registered setf expander (defsetf / define-setf-expander)
                 ;; Consulted before the hardcoded list below — lets user code
                 ;; override built-in expansions.
@@ -5129,14 +5155,29 @@
                 ;; set through SETF from a temporary (upstream SETF-VALUES.1/.5,
                 ;; VALUES.21 returned only the primary).
                 ((and (consp place) (name-eq (car place) "VALUES"))
+                 ;; The subplaces' subforms are evaluated BEFORE the value
+                 ;; form, left to right (CLHS 5.1.2.3; SETF-VALUES.5): an
+                 ;; accessor place binds its argument forms first.  Other
+                 ;; places (variables, symbol macros, ...) store through SETF.
                  (let ((gs (mapcar (lambda (p) (declare (ignore p)) (%mvm-gensym "SV"))
-                                   (cdr place))))
+                                   (cdr place)))
+                       (pre nil) (stores nil))
+                   (dolist (p (cdr place))
+                     (multiple-value-bind (b a w) (if (consp p)
+                                                      (mvm-place-expansion p)
+                                                      (values nil p nil))
+                       (declare (ignore a))
+                       (dolist (x b) (push x pre))
+                       (push (if b w nil) stores)))
+                   (setq pre (nreverse pre) stores (nreverse stores))
                    (if (null gs)
                        `(progn ,value (values))
-                       `(let ,(mapcar (lambda (g) (list g nil)) gs)
-                          (multiple-value-setq ,gs ,value)
-                          ,@(mapcar (lambda (p g) `(setf ,p ,g)) (cdr place) gs)
-                          (values ,@gs)))))
+                       `(let* ,pre
+                          (let ,(mapcar (lambda (g) (list g nil)) gs)
+                            (multiple-value-setq ,gs ,value)
+                            ,@(mapcar (lambda (p g w) (if w (funcall w g) `(setf ,p ,g)))
+                                      (cdr place) gs stores)
+                            (values ,@gs))))))
                 ;; (setf (symbol-value SYM) V) → set-symbol-value expects a
                 ;; name-hash, not a symbol object.  Compute the hash from
                 ;; the symbol name at runtime.  Without this, the generic
@@ -5186,9 +5227,7 @@
                 ;; fires where the old expansion was UNDEFINED-FUNCTION.
                 ;;
                 ;; The let* is CLHS 5.1.1.1 evaluation order — place subforms
-                ;; left to right, then the value form — and the trailing GV
-                ;; makes SETF yield the NEW VALUE rather than whatever the
-                ;; setf function happened to return.
+                ;; left to right, then the value form.
                 ((and (consp place)
                       (symbolp (car place))
                       (%find-setf-function (car place)))
@@ -5199,10 +5238,11 @@
                                           (%mvm-gensym "SFA"))
                                         pargs))
                         (gval   (%mvm-gensym "SFV")))
+                   ;; The SETF form's value is the setf function's, as in
+                   ;; SBCL (FDEFINITION.5); a conforming one returns GVAL.
                    `(let* (,@(mapcar #'list gargs pargs)
                            (,gval ,value))
-                      (,setter ,gval ,@gargs)
-                      ,gval)))
+                      (,setter ,gval ,@gargs))))
                 ;; (setf (cXYr x) v), 2-4 letters of A/D: set the CAR or CDR of
                 ;; (cYr x) -- the outermost letter is the last step taken.
                 ;; Only CAR/CDR had clauses; the rest reached SET-CAAAR &c.,
@@ -6830,8 +6870,12 @@
                  (when (and (consp spec) (symbolp (car spec))
                             (= (compute-name-hash (symbol-name (car spec)))
                                511973006))  ; SPECIAL
+                   ;; once each: (with-input-from-string (*s* ..) (declare
+                   ;; (special *s*)) ..) declares *S* twice, and a duplicate
+                   ;; bound a second, never-set temp (MAKE-SYNONYM-STREAM.1)
                    (dolist (var (cdr spec))
-                     (push var specials))))
+                     (unless (member var specials :test #'eq)
+                       (push var specials)))))
                (setf body (cdr body))))
     (nreverse specials)))
 
@@ -7072,6 +7116,18 @@
   ;; object (macroexpand-mvm may return a fresh cons), so the SETQ / PROGN /
   ;; WHEN dispatch below sees it (*unused-value-form* is identity-keyed).
   (let* ((%stmt-unused (eq form *unused-value-form*))
+         ;; PSETF / ROTATEF / SHIFTF over a SYMBOL-MACRO place: their
+         ;; expanders see no environment, so they took the place for a
+         ;; variable and its subforms ran at the store, after every value
+         ;; form (PSETF.7).  Substitute the expansion first, where ENV is known.
+         (form (or (and (consp form) (symbolp (car form)) (car form)
+                        (member (normalize-name (car form))
+                                '(#.(compute-name-hash "PSETF")
+                                  #.(compute-name-hash "PSETQ")
+                                  #.(compute-name-hash "ROTATEF")
+                                  #.(compute-name-hash "SHIFTF")))
+                        (%symbol-macro-places-rewrite form env))
+                   form))
          (form (macroexpand-mvm form)))
    (%cf-trace-note form)
    (when %stmt-unused (%fp-diag-bump 3))
@@ -7084,6 +7140,12 @@
       ;; T
       ((eq form t)
        (compile-t dest))
+
+      ;; A hash table, package, stream, readtable or random state is a cons
+      ;; underneath, but as a form it evaluates to itself (THE.8: (eval
+      ;; `(the hash-table ,ht))).
+      ((and *mvm-eval-runtime-p* (consp form) (not (%rt-consp form)))
+       (compile-quote form dest))
 
       ;; Integer literal
       ((integerp form)
@@ -7679,6 +7741,41 @@
           ((string= n "KEYWORD") 'keywordp)
           ((string= n "ATOM") 'atom)
           (t nil))))
+
+(defun %symbol-macro-place-expansion (place env)
+  "The expansion of PLACE when it is a symbol naming a symbol macro in ENV
+   (lexical first, then global), else NIL."
+  (when (and place (symbolp place))
+    (let ((b (env-lookup env place)))
+      (cond
+        (b (and (eq (binding-location b) :symbol-macro)
+                (list (binding-expansion b))))
+        ((%gsm-pkg-get place (normalize-name place))
+         (%gsm-pkg-get place (normalize-name place)))
+        ((and *global-symbol-macros*
+              (nth-value 1 (gethash (normalize-name place) *global-symbol-macros*)))
+         (list (gethash (normalize-name place) *global-symbol-macros*)))
+        (t nil)))))
+
+(defun %symbol-macro-places-rewrite (form env)
+  "FORM (PSETF / PSETQ / ROTATEF / SHIFTF) with each symbol-macro PLACE replaced by
+   its expansion, or NIL when no place is one."
+  (let* ((psetq-p (= (normalize-name (car form)) #.(compute-name-hash "PSETQ")))
+         (psetf-p (or psetq-p (= (normalize-name (car form)) #.(compute-name-hash "PSETF"))))
+         (shiftf-p (= (normalize-name (car form)) #.(compute-name-hash "SHIFTF")))
+         (args (cdr form))
+         (out nil) (changed nil) (i 0) (n (length args)))
+    (dolist (a args)
+      (let ((placep (cond (psetf-p (evenp i))
+                          (shiftf-p (< i (- n 1)))
+                          (t t))))
+        (let ((e (and placep (%symbol-macro-place-expansion a env))))
+          (if e
+              (progn (setq changed t) (push (car e) out))
+              (push a out))))
+      (setq i (+ i 1)))
+    ;; PSETQ of a symbol macro is PSETF of its expansion (CLHS PSETQ).
+    (and changed (cons (if psetq-p 'psetf (car form)) (nreverse out)))))
 
 (defun compile-compound (form env dest)
   "Compile a compound form (operator . args)"
@@ -8334,6 +8431,10 @@
        (let ((saved-macros nil)
              (macro-defs (cadr form))
              (body (cddr form)))
+         ;; Leading declarations apply to the body, as in LOCALLY (MACROLET.47).
+         (when (and (consp body) (consp (car body)) (symbolp (car (car body)))
+                    (name-eq (car (car body)) "DECLARE"))
+           (setq body (list (cons 'locally body))))
          ;; Register macrolet macros
          (dolist (mdef macro-defs)
            (let* ((mname (normalize-name (car mdef)))
@@ -8403,6 +8504,19 @@
                             (when ,(car spec) (close ,(car spec)))))
                        env dest)))
       ;; WITH-OUTPUT-TO-STRING — create string-output-stream, run body, return string
+      ;; An :ELEMENT-TYPE form is evaluated (outside the body's
+      ;; declarations; WITH-OUTPUT-TO-STRING.16) and its value ignored.
+      ((and (= op-name 163216281)
+            (consp (cadr form))
+            (let ((et (getf (cddr (cadr form)) :element-type :none)))
+              (and (not (eq et :none)) (not (constantp et)))))
+       (let ((g (%mvm-gensym "WOTSET")))
+         (compile-form
+          `(let ((,g ,(getf (cddr (cadr form)) :element-type)))
+             (declare (ignorable ,g))
+             (with-output-to-string (,(car (cadr form)) ,(cadr (cadr form)))
+               ,@(cddr form)))
+          env dest)))
       ((= op-name 163216281)  ; WITH-OUTPUT-TO-STRING
        (let* ((spec (cadr form))
               (var (car spec))
@@ -9237,7 +9351,12 @@
                          :stack-depth (compile-env-stack-depth env)
                          :parent (compile-env-parent env)
                          :fn-names (compile-env-fn-names env))))
-           (compile-progn sm-body new-env dest))))
+           ;; Leading declarations apply to the body, as in LOCALLY: a
+           ;; (declare (special x)) makes X dynamic there (SYMBOL-MACROLET.8).
+           (if (and (consp sm-body) (consp (car sm-body)) (symbolp (car (car sm-body)))
+                    (name-eq (car (car sm-body)) "DECLARE"))
+               (compile-form (cons 'locally sm-body) new-env dest)
+               (compile-progn sm-body new-env dest)))))
 
       ;; EVAL-WHEN — (eval-when (situations) forms...)
       ;; This is the NON-top-level path (compile-form).  Per CLHS 3.2.3.1,
@@ -9422,7 +9541,11 @@
          (%declaim-note-inline form)
          (%declaim-note-type form)
          (%declaim-note-special form))
-       (compile-nil dest))
+       ;; PROCLAIM is a FUNCTION: at runtime its argument is evaluated (it may
+       ;; be computed, `(special ,sym)) and the runtime PROCLAIM acts on it.
+       (if (and *mvm-eval-runtime-p* (= op-name 62725856))
+           (compile-call op (cdr form) env dest)
+           (compile-nil dest)))
 
       (t (compile-call op (cdr form) env dest)))))
 
@@ -10096,8 +10219,9 @@
          (when (or (string= n "SIGNAL") (string= n "ERROR")
                    (string= n "CERROR") (string= n "WARN"))
            (return t)))
-       (multiple-value-bind (x p) (%macroexpand-1-mvm-raw form)
-         (if (and p (not (eq x form))) (setq form x) (return nil))))
+       ;; %MACROEXPAND-1-MVM-RAW returns (EXPANSION . EXPANDED-P), one value.
+       (let ((r (%macroexpand-1-mvm-raw form)))
+         (if (and (cdr r) (not (eq (car r) form))) (setq form (car r)) (return nil))))
       (t (return nil)))))
 
 (defun compile-restart-case (protected-form clauses env dest)
@@ -10377,7 +10501,10 @@
   "Fall through when ARG is a cons (or, NIL-TRUE, NIL), else branch.  Runtime-
    compiled code sees CL's CONSP, which excludes the hash-table cons (see
    %RT-CONSP-EXPANSION): a cons whose cdr is a cons whose car is the tag."
-  (let ((temp nil) (through (make-compiler-label)))
+  ;; ... nor a package, stream, readtable or random state: a fixnum tag in
+  ;; the CAR (987654321 / 7770001 / 7770003 / 7770005; see %RT-CONSP).
+  (let ((temp nil) (temp2 nil) (through (make-compiler-label))
+        (carcheck (make-compiler-label)))
     (compile-form arg env dest)
     (emit-ir :bnull dest (if nil-true through false-label))
     (setq temp (alloc-temp-reg))
@@ -10385,14 +10512,23 @@
     (emit-ir :cmp-imm temp (ash +tag-cons+ +fixnum-shift+))
     (emit-ir :bne false-label)
     (when *mvm-eval-runtime-p*
+      (setq temp2 (alloc-temp-reg))
       (emit-ir :cdr temp dest)
-      (emit-ir :bnull temp through)
-      (emit-ir :obj-tag dest temp)
-      (emit-ir :cmp-imm dest (ash +tag-cons+ +fixnum-shift+))
-      (emit-ir :bne through)
-      (emit-ir :car dest temp)
-      (emit-ir :cmp-imm dest (ash 442386510 +fixnum-shift+))   ; (%ht-tag)
-      (emit-ir :beq false-label))
+      (emit-ir :bnull temp carcheck)
+      (emit-ir :obj-tag temp2 temp)
+      (emit-ir :cmp-imm temp2 (ash +tag-cons+ +fixnum-shift+))
+      (emit-ir :bne carcheck)
+      (emit-ir :car temp2 temp)
+      (emit-ir :cmp-imm temp2 (ash 442386510 +fixnum-shift+))   ; (%ht-tag)
+      (emit-ir :beq false-label)
+      (emit-ir-label carcheck)
+      (emit-ir :car temp dest)
+      (emit-ir :test-imm temp 1)
+      (emit-ir :bne through)                                     ; not a fixnum
+      (dolist (tag '(987654321 7770001 7770003 7770005))
+        (emit-ir :cmp-imm temp (ash tag +fixnum-shift+))
+        (emit-ir :beq false-label))
+      (free-temp-reg))
     (emit-ir-label through)
     (free-temp-reg)))
 
@@ -12328,7 +12464,13 @@
          (t
           (when (member (symbol-name op) *promote-loop-ops* :test #'string=)
             (setq *promote-walk-loop-seen* t))
-          (multiple-value-bind (exp expanded) (%macroexpand-1-mvm-raw form)
+          ;; %MACROEXPAND-1-MVM-RAW returns (EXPANSION . EXPANDED-P), one
+          ;; value: read as two values a macro call was never expanded, so a
+          ;; macro whose expansion holds a forbidden op (HANDLER-CASE ...) was
+          ;; judged by its arguments alone.
+          (let* ((r (%macroexpand-1-mvm-raw form))
+                 (exp (car r))
+                 (expanded (and (cdr r) (not (eq exp form)))))
             (if expanded
                 (%promote-walk exp (+ depth 1))
                 (let ((r (cdr form)))
@@ -16787,14 +16929,18 @@
                (alist (loop-iter-list-var iter))
                (pair-var (%mvm-gensym "HP")))
            (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
-           (push (list var nil) bindings)
-           (when using (push (list using nil) bindings))
            (push (list pair-var nil) bindings)
            (push `(if (null ,alist) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,pair-var (car ,alist)) init-stmts)
-           (push `(setq ,var (car ,pair-var)) init-stmts)
+           ;; VAR and the USING var may be destructuring patterns
+           ;; (LOOP.6.37: USING (HASH-KEY (K1 . K2))).
+           (dolist (pr (%loop-destr-pairs var `(car ,pair-var)))
+             (push (list (car pr) nil) bindings)
+             (push `(setq ,(car pr) ,(cdr pr)) init-stmts))
            (when using
-             (push `(setq ,using (cdr ,pair-var)) init-stmts))
+             (dolist (pr (%loop-destr-pairs using `(cdr ,pair-var)))
+               (push (list (car pr) nil) bindings)
+               (push `(setq ,(car pr) ,(cdr pr)) init-stmts)))
            (push `(setq ,alist (cdr ,alist)) step-stmts)))
 
         ;; FOR var BEING THE HASH-VALUE[S] OF ht [USING (HASH-KEY k)]
@@ -16804,14 +16950,18 @@
                (alist (loop-iter-list-var iter))
                (pair-var (%mvm-gensym "HP")))
            (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
-           (push (list var nil) bindings)
-           (when using (push (list using nil) bindings))
            (push (list pair-var nil) bindings)
            (push `(if (null ,alist) (return-from :%loop-exit nil)) test-forms)
            (push `(setq ,pair-var (car ,alist)) init-stmts)
-           (push `(setq ,var (cdr ,pair-var)) init-stmts)
+           ;; VAR and the USING var may be destructuring patterns
+           ;; (LOOP.6.37: USING (HASH-KEY (K1 . K2))).
+           (dolist (pr (%loop-destr-pairs var `(cdr ,pair-var)))
+             (push (list (car pr) nil) bindings)
+             (push `(setq ,(car pr) ,(cdr pr)) init-stmts))
            (when using
-             (push `(setq ,using (car ,pair-var)) init-stmts))
+             (dolist (pr (%loop-destr-pairs using `(car ,pair-var)))
+               (push (list (car pr) nil) bindings)
+               (push `(setq ,(car pr) ,(cdr pr)) init-stmts)))
            (push `(setq ,alist (cdr ,alist)) step-stmts)))
 
         ;; FOR var BEING THE SYMBOL[S] OF pkg
@@ -17112,8 +17262,12 @@
                  ;; rewritten (return t) / (return nil) — keep that value.
                  ((or has-always has-thereis)
                   `(progn ,@collect-fixups ,@finally ,%bv-var))
+                 ;; (VALUES var): exactly one value -- the MV count may
+                 ;; still hold what a call in the body left
+                 ;; ((loop ... unless (eql (read-from-string s) 1) collect s)
+                 ;; answered ("2") 1).
                  (anon-acc
-                  `(progn ,@collect-fixups ,@finally ,anon-acc-var))
+                  `(progn ,@collect-fixups ,@finally (values ,anon-acc-var)))
                  ((or accs cond-into)
                   `(progn ,@collect-fixups ,@finally nil))
                  (finally
@@ -17992,7 +18146,9 @@
                (not (%tagbody-nlx-unsafe-p body)))
       (compile-tagbody-nlx body %tb-tags env dest)
       (return-from compile-tagbody)))
-  (let ((*tagbody-tags* nil)
+  ;; An enclosing TAGBODY's tags stay visible (a GO in an inner TAGBODY
+  ;; may name an outer tag); the inner tags, pushed in front, shadow them.
+  (let ((*tagbody-tags* *tagbody-tags*)
         (tb-seq (%uwp-current-seq)))
     ;; First pass: collect tags and create labels
     (dolist (item body)
@@ -18390,7 +18546,7 @@
               (,idx-tmp 0))
           (loop
             (when (null ,cur-tmp) (return nil))
-            (when (>= ,idx-tmp 16) (return nil))   ; cap MV-VALUES storage
+            (when (>= ,idx-tmp 20) (return nil))   ; cap: the 20 slots #x10000098..#x10000130
             (setf (mem-ref (+ ,+mv-values-addr+ (* ,idx-tmp 8)) :u64) (car ,cur-tmp))
             (setq ,idx-tmp (+ ,idx-tmp 1))
             (setq ,cur-tmp (cdr ,cur-tmp))))
@@ -22449,10 +22605,18 @@
 
 (defun %rt-consp-expansion (arg)
   (let ((g (%mvm-gensym "CONSP")) (c (%mvm-gensym "CONSPD")))
+    ;; Not a hash table ((alist %ht-tag . meta)), nor a package, stream,
+    ;; readtable or random state (a fixnum tag in the CAR; see %RT-CONSP).
     `(let ((,g ,arg))
        (if (%raw-consp ,g)
            (let ((,c (cdr ,g)))
-             (if (%raw-consp ,c) (not (eql (car ,c) 442386510)) t))   ; (%ht-tag)
+             (if (if (%raw-consp ,c) (eql (car ,c) 442386510) nil)   ; (%ht-tag)
+                 nil
+                 (let ((,c (car ,g)))
+                   (if (fixnump ,c)
+                       (not (or (eql ,c 987654321) (eql ,c 7770001)
+                                (eql ,c 7770003) (eql ,c 7770005)))
+                       t))))
            nil))))
 
 (defun compile-consp (arg env dest)
@@ -22696,12 +22860,19 @@
    from the extra trampolines, or compile-stringp being recursively
    invoked during build of %mda-stringp itself.  Phase 4b TODO: route
    via a dedicated MDA-aware predicate that doesn't recurse."
+  ;; A STRING is a VECTOR (CLHS 16.1): a character array of rank other than
+  ;; 1 is not one, though %PRIM-STRINGP (character storage, which AREF's
+  ;; decoding needs) says yes for it.  The rank is slot 0 of the MDA header.
   (let ((g-arg (%mvm-gensym "STRPA")))
     (compile-form
      `(let ((,g-arg ,arg))
         (if (%raw-consp ,g-arg)
             (%wrapper-stringp ,g-arg)
-            (%prim-stringp ,g-arg)))
+            (if (%prim-simple-string-p ,g-arg)
+                t
+                (if (%prim-stringp ,g-arg)
+                    (eql (%prim-aref ,g-arg 0) 1)
+                    nil))))
      env dest)))
 
 (defun compile-arrayp (arg env dest)

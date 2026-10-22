@@ -127,6 +127,9 @@
 
 (defun %condition-typep (cond type-name)
   "Check if COND is of type TYPE-NAME or a subtype."
+  ;; A condition CLASS stands for its name (HANDLER-BIND.17, MAKE-CONDITION.2).
+  (cond ((%clos-class-p type-name) (setq type-name (aref type-name 1)))
+        ((%class-proxy-p type-name) (setq type-name (%class-proxy-name type-name))))
   (if (not (%condition-p cond)) nil
     (let ((cond-type (%condition-type-name cond)))
       (let ((ancestors (%condition-all-parents cond-type)))
@@ -240,7 +243,12 @@
    and silently missed every value."
   (let ((type-name (if (symbolp type-designator) type-designator nil)))
     (when (null type-name)
-      (setq type-name (if (consp type-designator) (cadr type-designator) type-designator)))
+      (setq type-name
+            (cond ((consp type-designator) (cadr type-designator))
+                  ;; a condition CLASS designates its name (MAKE-CONDITION.2)
+                  ((%clos-class-p type-designator) (aref type-designator 1))
+                  ((%class-proxy-p type-designator) (%class-proxy-name type-designator))
+                  (t type-designator))))
     (let ((entry (%cond-reg-find type-name)))
       (if (null entry)
           (let ((c (make-array 3)))
@@ -493,6 +501,7 @@
   (setq *handler-bind-stack* nil)
   (setq *restart-stack* nil)
   (setq *restart-frame-condition-map* nil)
+  (setq *restart-condition-assoc* nil)
   (setq *restarts-being-invoked* nil)
   (setq *restart-case-result* nil)
   (setq *restart-invoking-p* nil)
@@ -938,6 +947,8 @@
     (when (null cond-obj)
       (return-from warn nil))
     (setq *current-condition* cond-obj)
+    ;; The enclosing RESTART-CASE frames take this warning (as CERROR does).
+    (%associate-active-restart-frames cond-obj)
     ;; -------- Signal under a MUFFLE-WARNING restart --------
     ;; We reuse %with-restarts (the restart-case machinery) so the
     ;; restart's wrapper does the setjmp/longjmp recovery for us — its
@@ -952,7 +963,9 @@
        (list (list 'muffle-warning
                    (lambda () (setq muffled t) nil)
                    "Skip the warning."))
-       (lambda () (%signal-condition cond-obj)))
+       (lambda ()
+         (%associate-active-restart-frames cond-obj)
+         (%signal-condition cond-obj)))
       (unless muffled
         ;; The report, not the bare control string (the old code printed
         ;; "~a" directives literally, through two helpers defined nowhere).
@@ -1093,26 +1106,44 @@
                         *restart-frame-condition-map*))))
         (setq cur (cdr cur))))))
 
+(defvar *restart-condition-assoc* nil
+  "WITH-CONDITION-RESTARTS associations in force: ((RESTART . CONDITION) ...).
+   A restart may carry several, from nested forms.")
+
+(defun %with-condition-restarts (condition restarts body-fn)
+  "Associate each of RESTARTS with CONDITION for the extent of BODY-FN."
+  (let ((saved *restart-condition-assoc*))
+    (dolist (r restarts)
+      (setq *restart-condition-assoc* (cons (cons r condition) *restart-condition-assoc*)))
+    (unwind-protect (funcall body-fn)
+      (setq *restart-condition-assoc* saved))))
+
 (defun %restart-applicable-for-condition-p (restart cond-obj)
   "Per CLHS 9.1.4.2.5 + find-restart semantics: a restart is applicable
-   to COND-OBJ if it has no condition association, OR its association
-   is exactly COND-OBJ.  COND-OBJ NIL means no constraint (the
-   no-condition-arg branch of find-restart)."
+   to COND-OBJ if it has no condition association, OR one of its
+   associations is COND-OBJ.  COND-OBJ NIL means no constraint (the
+   no-condition-arg branch of find-restart).  Associations come from the
+   implicit RESTART-CASE frame map and from WITH-CONDITION-RESTARTS."
   (if (null cond-obj)
       t
       (let ((cur *restart-frame-condition-map*)
-            (frame-found nil)
-            (frame-cond nil))
+            (associated nil)
+            (matched nil))
         (loop
-          (when (or frame-found (null cur)) (return nil))
+          (when (or matched (null cur)) (return nil))
           (let ((entry (car cur)))
             (when (member restart (car entry) :test #'eq)
-              (setq frame-found t)
-              (setq frame-cond (cdr entry))))
+              (setq associated t)
+              (when (eq (cdr entry) cond-obj) (setq matched t))))
           (setq cur (cdr cur)))
-        (if (not frame-found)
-            t   ; not in any associated frame → applicable
-            (eq frame-cond cond-obj)))))
+        (setq cur *restart-condition-assoc*)
+        (loop
+          (when (or matched (null cur)) (return nil))
+          (when (eq (car (car cur)) restart)
+            (setq associated t)
+            (when (eq (cdr (car cur)) cond-obj) (setq matched t)))
+          (setq cur (cdr cur)))
+        (or matched (not associated)))))
 
 (defun compute-restarts (&optional condition)
   "Return list of currently active restarts — filtered by CONDITION
@@ -1421,6 +1452,9 @@
     ((%condition-p type-spec)
      ;; type-spec is itself a class object — check by name
      (%condition-typep cond-obj (%condition-type-name type-spec)))
+    ;; a CLASS object (HANDLER-BIND.17: (handler-bind ((#.(find-class 'error) ...))))
+    ((or (%clos-class-p type-spec) (%class-proxy-p type-spec))
+     (%condition-typep cond-obj type-spec))
     (t nil)))
 
 ;;; --- handler-bind macro support ---
@@ -1537,6 +1571,7 @@
   (setq *signal-walk-depth* 0)
   (setq *restart-stack* nil)
   (setq *restart-frame-condition-map* nil)
+  (setq *restart-condition-assoc* nil)
   (setq *restarts-being-invoked* nil))
 
 ;;; --- restart-case implementation ---
@@ -1844,6 +1879,40 @@
              (values-list (multiple-value-list (apply rfn args))))))
         (error "No restart named ~A" name-or-restart))))
 
+;;; CCASE / CTYPECASE (CLHS 5.3): no clause matching signals a correctable
+;;; TYPE-ERROR whose STORE-VALUE restart stores a new value in KEYPLACE, and
+;;; the test is made again.  The runtime macros expand through this.
+(defun %correctable-case-form (keyplace clauses typep-p)
+  (let ((blk (gensym "CC-B")) (again (gensym "CC-A"))
+        (k (gensym "CC-K")) (v (gensym "CC-V"))
+        (arms nil) (keys nil))
+    (dolist (cl clauses)
+      (let ((body (or (cdr cl) (list nil))) (sel (car cl)))
+        (if typep-p
+            (progn
+              (setq keys (cons sel keys))
+              (setq arms (cons (cons (list 'typep k (list 'quote sel)) body) arms)))
+            (let ((ks (if (listp sel) sel (list sel))) (tests nil))
+              (dolist (x ks)
+                (setq keys (cons x keys))
+                (setq tests (cons (list 'eql k (list 'quote x)) tests)))
+              (setq arms (cons (cons (cons 'or (nreverse tests)) body) arms))))))
+    (setq arms
+          (cons (list t
+                      (list 'restart-case
+                            (list 'error (list 'quote 'type-error) :datum k
+                                  :expected-type (list 'quote (cons (if typep-p 'or 'member)
+                                                                    (reverse keys))))
+                            (list 'store-value (list v) :report "Supply a new value."
+                                  (list 'setf keyplace v)))
+                      (list 'go again))
+                arms))
+    (list 'block blk
+          (list 'tagbody again
+                (list 'return-from blk
+                      (list 'let (list (list k keyplace))
+                            (cons 'cond (reverse arms))))))))
+
 (defun abort (&optional condition)
   "Invoke the ABORT restart.  Per CLHS, if no ABORT restart is active
    (associated with CONDITION when supplied), signal a CONTROL-ERROR."
@@ -1869,12 +1938,12 @@
 (defun store-value (value &optional condition)
   "Invoke the STORE-VALUE restart with VALUE."
   (let ((r (find-restart 'store-value condition)))
-    (when r (invoke-restart 'store-value value))))
+    (when r (invoke-restart r value))))
 
 (defun use-value (value &optional condition)
   "Invoke the USE-VALUE restart with VALUE."
   (let ((r (find-restart 'use-value condition)))
-    (when r (invoke-restart 'use-value value))))
+    (when r (invoke-restart r value))))
 
 ;;; ASSERT — RESOLVED.  The old note here said "left as the cl-sequences.lisp
 ;;; stub (silent NIL) … there's no safe runtime spot for it without compiler
@@ -2035,8 +2104,13 @@
       (and (eq sub 'null) (eq super 'list))
       (and (eq sub 'null) (eq super 'symbol))
       (and (eq sub 'null) (eq super 'atom))
+      ;; BOOLEAN = (member t nil): symbols, atoms (TYPE-OF.1/.4: (type-of t))
+      (and (eq sub 'boolean) (member super '(symbol atom)))
+      (and (eq sub 'null) (eq super 'boolean))
       (and (member sub '(string base-string simple-base-string simple-string))
            (member super '(string vector array sequence)))
+      ;; (TYPES.3)
+      (and (eq sub 'simple-base-string) (member super '(base-string simple-string)))
       (and (member sub '(bit-vector simple-bit-vector))
            (member super '(bit-vector vector array sequence)))
       (and (member sub '(simple-vector vector bit-vector string
@@ -2050,7 +2124,10 @@
       ;; Numeric tower
       (and (eq sub 'fixnum) (member super '(integer rational real number)))
       (and (eq sub 'bignum) (member super '(integer rational real number)))
-      (and (eq sub 'bit)    (member super '(fixnum unsigned-byte integer rational real number)))
+      (and (eq sub 'bit)    (member super '(fixnum unsigned-byte signed-byte integer rational real number)))
+      (and (eq sub 'fixnum) (eq super 'signed-byte))
+      (and (eq sub 'bignum) (eq super 'signed-byte))
+      (and (eq sub 'unsigned-byte) (eq super 'signed-byte))
       (and (eq sub 'integer) (member super '(rational real number)))
       (and (eq sub 'ratio)  (member super '(rational real number)))
       (and (eq sub 'rational) (member super '(real number)))
@@ -2067,6 +2144,8 @@
       (and (eq sub 'complex) (eq super 'number))
       (and (member sub '(unsigned-byte signed-byte))
            (member super '(integer rational real number)))
+      ;; SIGNED-BYTE is INTEGER (TYPES.3)
+      (and (eq sub 'integer) (eq super 'signed-byte))
       ;; Character tower
       (and (member sub '(standard-char base-char extended-char character))
            (member super '(character)))
@@ -2090,7 +2169,13 @@
       ;; Class/condition (basic)
       (and (eq sub 'standard-class) (eq super 'class))
       (and (eq sub 'built-in-class) (eq super 'class))
-      (and (eq sub 'structure-class) (eq super 'class))))
+      (and (eq sub 'structure-class) (eq super 'class))
+      ;; metaobjects are standard objects (TYPES.3)
+      (and (member sub '(class standard-class built-in-class structure-class
+                         method standard-method generic-function
+                         standard-generic-function method-combination))
+           (eq super 'standard-object))
+      (and (eq sub 'standard-method) (eq super 'method))))
 
 (defun %int-bound-ge (a b)
   "Range comparison: is lower-bound A >= lower-bound B?
@@ -2121,6 +2206,16 @@
     ((eq type 'integer) (list '* '*))
     ((eq type 'fixnum) (list most-negative-fixnum most-positive-fixnum))
     ((eq type 'bignum) nil)  ; can't express as single range easily
+    ;; UNSIGNED-BYTE / SIGNED-BYTE / BIT are integer ranges too
+    ;; (TYPE-OF.1: (subtypep '(integer 0 10) 'unsigned-byte)).
+    ((eq type 'bit) (list 0 1))
+    ((eq type 'unsigned-byte) (list 0 '*))
+    ((eq type 'signed-byte) (list '* '*))
+    ((and (consp type) (member (car type) '(unsigned-byte signed-byte)))
+     (let ((n (if (cdr type) (cadr type) '*)))
+       (cond ((not (integerp n)) (if (eq (car type) 'unsigned-byte) (list 0 '*) (list '* '*)))
+             ((eq (car type) 'unsigned-byte) (list 0 (- (ash 1 n) 1)))
+             (t (list (- (ash 1 (- n 1))) (- (ash 1 (- n 1)) 1))))))
     ((and (consp type) (eq (car type) 'integer))
      (let ((low  (if (cdr type) (cadr type) '*))
            (high (if (cddr type) (caddr type) '*)))
@@ -2133,6 +2228,21 @@
 ;;; clobbers the second value and `multiple-value-list` only sees the
 ;;; primary.  All the recursive paths use this cons-returning helper;
 ;;; only the top-level subtypep / subtypep* convert to multi-values.
+
+(defun %complex-type-spec-p (x)
+  (or (eq x 'complex)
+      (and (consp x) (eq (car x) 'complex))))
+
+(defun %complex-type-part (x)
+  "The part type of a complex type spec: * for COMPLEX, (COMPLEX), (COMPLEX *)."
+  (if (and (consp x) (consp (cdr x))) (cadr x) '*))
+
+(defun %real-type-spec-p (x)
+  "A REAL numeric type: a real type name or an interval of one."
+  (let ((h (if (consp x) (car x) x)))
+    (member h '(real rational integer ratio float single-float double-float
+                short-float long-float fixnum bignum bit unsigned-byte
+                signed-byte mod))))
 
 (defun %subtypep-result (t1 t2)
   "Returns a cons (sub . valid) describing the subtypep relation.
@@ -2164,6 +2274,40 @@
     ((or (%clos-class-p t1) (%clos-class-p t2))
      (%subtypep-result (if (%clos-class-p t1) (aref t1 1) t1)
                        (if (%clos-class-p t2) (aref t2 1) t2)))
+    ;; COMPLEX types: (complex) and (complex *) are COMPLEX; a complex type
+    ;; and a REAL type are disjoint; (complex A) <= (complex B) as the
+    ;; upgraded part types are (SUBTYPEP-COMPLEX.*).
+    ((or (and (%complex-type-spec-p t1)
+              (or (%complex-type-spec-p t2) (%real-type-spec-p t2)))
+         (and (%complex-type-spec-p t2) (%real-type-spec-p t1)))
+     (let ((p1 (%complex-type-part t1)) (p2 (%complex-type-part t2)))
+       (cond
+         ((not (and (%complex-type-spec-p t1) (%complex-type-spec-p t2)))
+          (cons nil t))
+         ((eq p2 '*) (cons t t))
+         ((eq p1 '*) (%subtypep-result 'real (upgraded-complex-part-type p2)))
+         (t (%subtypep-result (upgraded-complex-part-type p1)
+                              (upgraded-complex-part-type p2))))))
+    ;; (complex) / (complex *) against anything else is COMPLEX.
+    ((and (consp t1) (%complex-type-spec-p t1) (eq (%complex-type-part t1) '*))
+     (%subtypep-result 'complex t2))
+    ((and (consp t2) (%complex-type-spec-p t2) (eq (%complex-type-part t2) '*))
+     (%subtypep-result t1 'complex))
+    ;; A one-dimensional array type is a SEQUENCE (TYPE-OF.1:
+    ;; (subtypep '(simple-array character (5)) 'sequence)).
+    ((and (eq t2 'sequence) (consp t1)
+          (or (member (car t1) '(vector simple-vector string simple-string base-string
+                                 simple-base-string bit-vector simple-bit-vector))
+              (and (member (car t1) '(array simple-array))
+                   (consp (cdr t1)) (consp (cddr t1))
+                   (or (eql (caddr t1) 1)
+                       (and (consp (caddr t1)) (null (cdr (caddr t1))))))))
+     (cons t t))
+    ;; Likewise the class of a built-in type or a structure (a class proxy):
+    ;; (subtypep '(simple-vector 10) (find-class 'vector)) (TYPE-OF.4).
+    ((or (%class-proxy-p t1) (%class-proxy-p t2))
+     (%subtypep-result (if (%class-proxy-p t1) (%class-proxy-name t1) t1)
+                       (if (%class-proxy-p t2) (%class-proxy-name t2) t2)))
     ;; Same name as itself
     ((and (symbolp t1) (symbolp t2) (eq t1 t2)) (cons t t))
     ;; User DEFTYPE on either side — expand to the underlying type
@@ -2336,9 +2480,15 @@
 
 ;;; invoke-debugger stub
 (defun invoke-debugger (condition)
-  "Stub — just signal the error.  Publishes CONDITION first: the longjmp's
-   landing handler-case dispatches on *CURRENT-CONDITION*, and leaving the
-   previous one there reported (and matched) a stale condition."
+  "Calls *DEBUGGER-HOOK* first, with it bound to NIL (CLHS; INVOKE-DEBUGGER.1);
+   then, as there is no debugger, signals.  Publishes CONDITION first: the
+   longjmp's landing handler-case dispatches on *CURRENT-CONDITION*, and
+   leaving the previous one there reported (and matched) a stale condition."
+  (let ((hook (if (boundp '*debugger-hook*) (symbol-value '*debugger-hook*) nil)))
+    (when hook
+      (let ((*debugger-hook* nil))
+        (declare (special *debugger-hook*))
+        (funcall hook condition hook))))
   (setq *current-condition* condition)
   (if (%error-handler-active-p)
       (progn (when *%escape-trace* (%report-escaping-condition "invoke-debugger-trace"))

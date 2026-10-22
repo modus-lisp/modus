@@ -346,6 +346,9 @@
   (loop
     (cond
       ((eq a b) (return t))
+      ;; a hash table, package, stream, readtable or random state is a
+      ;; self-evaluating object made of conses: the SAME object (THE.8)
+      ((and (consp a) (not (%rt-consp a))) (return nil))
       ((consp a)
        (unless (consp b) (return nil))
        (if (and (eq (car a) 'quote) (consp (cdr a)))

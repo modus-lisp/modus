@@ -186,7 +186,11 @@
          ;; (integer 0 COUNT) so the per-iteration (>= var n) and (+ var 1)
          ;; take the typed fast path (no tag test; see the compiler's
          ;; %expr-width / %decl-int-width).
-         (list* 'let (list (list var 0) (list n count-form))
+         ;; The count form is inside the implicit BLOCK NIL ((dotimes (i
+         ;; (return 1))) returns from the DOTIMES) and the body is an
+         ;; implicit TAGBODY.
+         (list 'block nil
+          (list* 'let (list (list var 0) (list n count-form))
                (append
                 (if (and (integerp count-form) (>= count-form 0))
                     (list (list 'declare (list 'type (list 'integer 0 count-form) var n)))
@@ -207,11 +211,11 @@
                 (list
                  (list 'loop
                    (list 'when (list '>= var n) (list 'return result))
-                   (cons 'progn body)
+                   (cons 'tagbody body)
                    ;; the counter cannot reach 2^60 iterations: bound it so
                    ;; the increment compiles to a plain add (no overflow
                    ;; check) in every loop
-                   (list 'setq var (list '+ (list 'the (list 'integer 0 576460752303423487) var) 1))))))))"
+                   (list 'setq var (list '+ (list 'the (list 'integer 0 576460752303423487) var) 1)))))))))"
 
     "(defmacro case (key &rest clauses)
        (let ((kv (gensym \"CASE\")))
@@ -219,8 +223,9 @@
            (loop
              (when (null cur) (return nil))
              (let ((clause (car cur)))
-               (let ((tst (car clause)) (body (cdr clause)))
+               (let ((tst (car clause)) (body (or (cdr clause) (list nil))))
                  (cond
+                   ((null tst) nil)
                    ((or (eq tst t)
                         (and (symbolp tst) (string= (symbol-name tst) \"OTHERWISE\")))
                     (setq acc (cons (cons t body) acc)))
@@ -239,17 +244,16 @@
     ;; ECASE / CCASE — like CASE but signal an error when no clause matches
     ;; instead of returning NIL (CLHS 5.3).  No T/OTHERWISE clause is allowed,
     ;; so every key list becomes an (or (eql ...) ...) test and the cond ends
-    ;; with a (t (error ...)) fallthrough.  CCASE is a correctable error in
-    ;; full CL (store-value + retry); minimally we degrade it to an ECASE-like
-    ;; signal (matching the CLAUDE.md CCASE→ECASE degrade pattern).
+    ;; with a TYPE-ERROR fallthrough.  CCASE's error is correctable: see
+    ;; %CORRECTABLE-CASE-FORM.
     "(defmacro ecase (key &rest clauses)
        (let ((kv (gensym \"ECASE\")))
          (let ((acc nil) (cur clauses))
            (loop
              (when (null cur) (return nil))
              (let ((clause (car cur)))
-               (let ((tst (car clause)) (body (cdr clause)))
-                 (if (consp tst)
+               (let ((tst (car clause)) (body (or (cdr clause) (list nil))))
+                 (if (listp tst)
                      (let ((tests nil) (vs tst))
                        (loop (when (null vs) (return nil))
                          (setq tests (cons (list 'eql kv (list 'quote (car vs))) tests))
@@ -257,12 +261,20 @@
                        (setq acc (cons (cons (cons 'or (nreverse tests)) body) acc)))
                      (setq acc (cons (cons (list 'eql kv (list 'quote tst)) body) acc)))))
              (setq cur (cdr cur)))
-           (setq acc (cons (list t (list 'error \"ECASE: no clause matches\")) acc))
+           (setq acc (cons (list t (list 'error ''type-error :datum kv
+                                         :expected-type
+                                         (list 'quote (cons 'member
+                                                            (let ((ks nil))
+                                                              (dolist (cl clauses (nreverse ks))
+                                                                (if (listp (car cl))
+                                                                    (dolist (x (car cl)) (setq ks (cons x ks)))
+                                                                    (setq ks (cons (car cl) ks)))))))))
+                           acc))
            (list 'let (list (list kv key))
                  (cons 'cond (nreverse acc))))))"
 
     "(defmacro ccase (key &rest clauses)
-       (cons 'ecase (cons key clauses)))"
+       (%correctable-case-form key clauses nil))"
 
     "(defmacro prog1 (first &rest rest)
        (let ((tmp (gensym \"P1\")))
@@ -382,10 +394,12 @@
                                    (getf (cddr b) :test-function)))
                            bindings))
              (list 'function (cons 'lambda (cons nil body)))))"
-    ;; WITH-CONDITION-RESTARTS: both forms are evaluated (CLHS 9.2); the
-    ;; condition/restart association itself is not modelled yet.
+    ;; WITH-CONDITION-RESTARTS: the restarts are associated with the
+    ;; condition while BODY runs (FIND-RESTART / COMPUTE-RESTARTS with a
+    ;; condition argument skip a restart associated only with others).
     "(defmacro with-condition-restarts (condition-form restarts-form &rest body)
-       (list 'progn condition-form restarts-form (cons 'progn body)))"
+       (list '%with-condition-restarts condition-form restarts-form
+             (list 'function (cons 'lambda (cons nil body)))))"
     "(defmacro ignore-errors (&rest body)
        (list 'handler-case (cons 'progn body) (list 'error (list 'c) (list 'values nil 'c))))"
     ;; NOT a PROGN: w-s-i-s must bind the whole printer/reader variable set
@@ -406,6 +420,7 @@
                (cons 'cond
                  (mapcar (lambda (cl)
                            (let ((ty (car cl)) (body (cdr cl)))
+                             (if (null body) (setq body (list nil)))
                              (if (or (eq ty t) (and (symbolp ty) (string= (symbol-name ty) \"OTHERWISE\")))
                                  (cons t body)
                                  (cons (list 'typep g (list 'quote ty)) body))))
@@ -417,26 +432,16 @@
                (append
                  (cons 'cond
                    (mapcar (lambda (cl)
-                             (let ((ty (car cl)) (body (cdr cl)))
+                             (let ((ty (car cl)) (body (or (cdr cl) (list nil))))
                                (cons (list 'typep g (list 'quote ty)) body)))
                            clauses))
                  (list (list t (list '%signal-type-error g
                                      (list 'quote (cons 'or (mapcar (function car) clauses))))))))))"
 
-    ;; CTYPECASE — like ETYPECASE but a correctable (store-and-retry) error in
-    ;; full CL.  Minimally we degrade it to an ETYPECASE-like signal on no
-    ;; match (mirroring the CCASE→ECASE degrade); no retry/store-value yet.
+    ;; CTYPECASE — like ETYPECASE, but no match is a correctable TYPE-ERROR
+    ;; whose STORE-VALUE restart sets the keyplace and tests again.
     "(defmacro ctypecase (key &rest clauses)
-       (let ((g (gensym \"CTC\")))
-         (list 'let (list (list g key))
-               (append
-                 (cons 'cond
-                   (mapcar (lambda (cl)
-                             (let ((ty (car cl)) (body (cdr cl)))
-                               (cons (list 'typep g (list 'quote ty)) body)))
-                           clauses))
-                 (list (list t (list '%signal-type-error g
-                                     (list 'quote (cons 'or (mapcar (function car) clauses))))))))))"
+       (%correctable-case-form key clauses t))"
 
     ;; DEFINE-MODIFY-MACRO — (define-modify-macro name lambda-list fn [doc]).
     ;; Defines NAME as a macro: (name place a b …) => FN applied to the place's

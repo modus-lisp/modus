@@ -1459,7 +1459,7 @@
   (setq lambda-list-keywords    '(&allow-other-keys &aux &body &environment &key
                                    &optional &rest &whole))
   (setq lambda-parameters-limit 120)
-  (setq multiple-values-limit   16)
+  (setq multiple-values-limit   20)
   (setq internal-time-units-per-second 1000000)
   ;; MVM fixnums are 63-bit signed (tag bit + 1-bit shift).
   (setq most-positive-fixnum  +fixnum-max+)
@@ -1472,7 +1472,7 @@
   ;; which the per-test handler-case catches but burns time and noise.
   ;; T makes NORMALLY a no-op pass-through.
   (setq *should-always-be-true* t)
-  (setq *random-state* (list 'random-state 12345))
+  (setq *random-state* (list 7770005 12345))
   (setq *use-random-byte* t)
   (setq *random-readable* nil)
   (setq *random-read-check-debug* nil)

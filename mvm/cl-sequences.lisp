@@ -2330,7 +2330,7 @@
       ;; is NIL, which is what the BOUNDP guard here answered -- at 230 ns, a
       ;; third of every RANDOM (cl-bench MRG32K3A times RANDOM).
       (let* ((rs (if state (car state) *random-state*))
-             (cell (if (and (consp rs) (eq (car rs) 'random-state)
+             (cell (if (and (consp rs) (or (eql (car rs) 7770005) (eq (car rs) 'random-state))
                             (consp (cdr rs)) (integerp (cadr rs)))
                        (cdr rs) nil))
              (seed (if cell (car cell) (mem-ref #x10000FD8 :u32)))
@@ -2952,7 +2952,8 @@
          (%tree-equal-rec (cdr a) (cdr b) test)
          nil))
     ((or (consp a) (consp b)) nil)
-    (t (if test (funcall test a b) (eql a b)))))
+    ;; a generalized boolean, one value (TREE-EQUAL.6)
+    (t (if (if test (funcall test a b) (eql a b)) t nil))))
 
 (defun adjoin (item list &rest args)
   "Add ITEM to LIST if not already present."
@@ -4456,7 +4457,7 @@
       (setq cur (cdr cur)))))
 
 (defun listp (x)
-  (or (null x) (consp x)))
+  (or (null x) (%rt-consp x)))
 
 ;;; ============================================================
 ;;; member-if / member-if-not
@@ -4469,14 +4470,15 @@
    the fork. Improper-list tails (proper-with-dotted-end) are walked
    to NIL or to a non-cons; we only check the initial argument."
   (unless (listp list)
-    (error "member-if: not a list ~S" list))
+    (error 'type-error :datum list :expected-type 'list))
   (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur list))
     (loop
       (when (null cur) (return nil))
-      (when (atom cur) (return nil))
+      ;; a dotted list ends in an atom: not a proper list (CLHS 14.1.2.1)
+      (when (atom cur) (error 'type-error :datum cur :expected-type 'list))
       (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
         (when (funcall pred k) (return cur)))
       (setq cur (cdr cur)))))
@@ -4486,14 +4488,15 @@
    instead of `(apply #'member-if (lambda ...) ...)' to avoid the
    apply-of-rest-through-sibling-defun fragility."
   (unless (listp list)
-    (error "member-if-not: not a list ~S" list))
+    (error 'type-error :datum list :expected-type 'list))
   (%subst-check-kwargs args)
   (let* ((parsed (parse-test-key args))
          (key-fn (cdr parsed))
          (cur list))
     (loop
       (when (null cur) (return nil))
-      (when (atom cur) (return nil))
+      ;; a dotted list ends in an atom: not a proper list (CLHS 14.1.2.1)
+      (when (atom cur) (error 'type-error :datum cur :expected-type 'list))
       (let ((k (if key-fn (funcall key-fn (car cur)) (car cur))))
         (unless (funcall pred k) (return cur)))
       (setq cur (cdr cur)))))

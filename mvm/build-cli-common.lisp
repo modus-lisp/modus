@@ -1557,7 +1557,7 @@
   ;; as array-dimension-limit above; the aarch64 builds already set this.)
   (setq lambda-list-keywords    '(&allow-other-keys &aux &body &environment &key
                                    &optional &rest &whole))
-  (setq multiple-values-limit   16)
+  (setq multiple-values-limit   20)
   (setq pi 3.141592653589793d0)
   ;; AFTER init-all-globals — overrides defvar's init.  *write-object-
   ;; budget* defvars to 0 which immediately exhausts; we want a huge

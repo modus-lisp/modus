@@ -716,6 +716,20 @@
    Returns cons (CANON-LOW . CANON-HIGH).  Caller has already
    verified the head matches the desired numeric type."
   (cond
+    ;; The integer types that are intervals carry their bounds.
+    ((eq type 'fixnum) (cons (%canon-low most-negative-fixnum) (%canon-high most-positive-fixnum)))
+    ((eq type 'bit) (cons (%canon-low 0) (%canon-high 1)))
+    ((eq type 'unsigned-byte) (cons (%canon-low 0) (cons ':pos-inf nil)))
+    ((and (consp type) (member (car type) '(unsigned-byte signed-byte)))
+     (let ((n (if (cdr type) (cadr type) '*)))
+       (cond ((not (integerp n))
+              (if (eq (car type) 'unsigned-byte)
+                  (cons (%canon-low 0) (cons ':pos-inf nil))
+                  (cons (cons ':neg-inf nil) (cons ':pos-inf nil))))
+             ((eq (car type) 'unsigned-byte)
+              (cons (%canon-low 0) (%canon-high (- (ash 1 n) 1))))
+             (t (cons (%canon-low (- (ash 1 (- n 1))))
+                      (%canon-high (- (ash 1 (- n 1)) 1)))))))
     ((symbolp type) (cons (cons ':neg-inf nil) (cons ':pos-inf nil)))
     ((not (consp type)) (cons (cons ':neg-inf nil) (cons ':pos-inf nil)))
     (t
@@ -862,6 +876,15 @@
       (setq sup-hi (%normalize-int-high sup-hi)))
     ;; First: check head-level subtype
     (cond
+      ;; Two integer ranges (not BIGNUM, which is not one interval): plain
+      ;; containment.  (subtypep '(integer -10 10) 'fixnum) took the
+      ;; INTEGER-is-wider branch below and answered NIL
+      ;; (SUBTYPEP.FIXNUM.INTEGER).
+      ((and (%integer-head-p sub-head) (%integer-head-p sup-head)
+            (not (eq sub-head 'bignum)) (not (eq sup-head 'bignum)))
+       (cond ((%range-contains-p sup-lo sup-hi sub-lo sub-hi) (values t t))
+             ((%num-range-nonempty-p sub-lo sub-hi) (values nil t))
+             (t (values t t))))
       ;; FLOAT vs RATIONAL/INTEGER are disjoint
       ((and (or (eq sub-head 'float) (eq sub-head 'single-float)
                 (eq sub-head 'double-float) (eq sub-head 'short-float)
@@ -1759,17 +1782,14 @@
    types are compatible — Modus upgrades everything to T)."
   (cond
     ((or (eq et1 '*) (%typename-eq et1 '*))
-     (or (eq et2 '*) (%typename-eq et2 '*) (eq et2 't) (%typename-eq et2 't)))
+     (or (eq et2 '*) (%typename-eq et2 '*)))
+    ((or (eq et2 '*) (%typename-eq et2 '*)) t)
     ((or (eq et1 't) (%typename-eq et1 't))
-     (or (eq et2 '*) (%typename-eq et2 '*) (eq et2 't) (%typename-eq et2 't)))
-    ((or (eq et2 '*) (%typename-eq et2 '*) (eq et2 't) (%typename-eq et2 't))
-     ;; ET1 is some specific non-* type, ET2 is T-like.  ARRAY of
-     ;; specific-type IS a subtype of ARRAY of T (specific upgrades to
-     ;; T), so this direction can be T — but we're called for the
-     ;; equality of upgraded types.  Modus upgrades nearly everything
-     ;; to T, so treat the inclusion as element-type-OK; the SUBTYPEP
-     ;; caller already handles the array-direction via dims walk.
-     t)
+     (or (eq et2 't) (%typename-eq et2 't)))
+    ;; (array X) <= (array T) only when X upgrades to T: a bit, character,
+    ;; float or byte array is not an (ARRAY T) (SUBTYPEP.ARRAY.7).
+    ((or (eq et2 't) (%typename-eq et2 't))
+     (eq (upgraded-array-element-type et1) t))
     ;; Character family.
     ((and (%typename-character-elt-p et1) (%typename-character-elt-p et2)) t)
     ;; NIL element-type is the empty type — never matches anything
@@ -1829,7 +1849,9 @@
 ;; Returning (NIL NIL NIL) at least lets length-checking tests pass.
 (defun function-lambda-expression (fn)
   ;; No lambda expression is kept; the NAME is (cl-eval.lisp %FUNCTION-NAME).
-  (values nil nil (%function-name fn)))
+  ;; CLOSURE-P is T: CLHS lets an implementation that cannot tell answer
+  ;; true, and a closure must not answer false (FUNCTION-LAMBDA-EXPRESSION.2).
+  (values nil t (%function-name fn)))
 ;; Many basic predicates are inline opcodes with no callable function
 ;; entry, so `#'pred' resolves to NIL/garbage and (funcall #'pred x)
 ;; silently misbehaves.  Adding real defuns gives them callable
@@ -4851,23 +4873,27 @@
 ;;; ============================================================
 ;;; Random State
 ;;; ============================================================
-(defvar *random-state* (list 'random-state 12345))
+;;; A random state is (7770005 SEED): a fixnum-tagged cons like a package
+;;; (987654321 ...), stream (7770001 ...) or readtable (7770003 ...), so CONSP
+;;; can tell it from a list.  The old (RANDOM-STATE SEED) shape is still
+;;; recognised.
+(defvar *random-state* (list 7770005 12345))
 
 (defun random-state-p (x)
-  (and (consp x) (eq (car x) 'random-state)))
+  (and (consp x) (or (eql (car x) 7770005) (eq (car x) 'random-state))))
 
 (defun make-random-state (&optional state)
   "CLHS: NIL copies the CURRENT state, T makes a fresh randomly seeded one,
    and a random state is copied.  NIL used to make a fresh one."
   (cond
     ((eq state t)
-     (list 'random-state (logand (get-internal-real-time) #x3FFFFFFF)))
+     (list 7770005 (logand (get-internal-real-time) #x3FFFFFFF)))
     ((null state)
      (let ((cur (if (boundp '*random-state*) *random-state* nil)))
-       (list 'random-state (if (random-state-p cur)
+       (list 7770005 (if (random-state-p cur)
                                (cadr cur)
                                (mem-ref #x10000FD8 :u32)))))
-    ((random-state-p state) (list 'random-state (cadr state)))
+    ((random-state-p state) (list 7770005 (cadr state)))
     (t (error 'type-error :datum state
               :expected-type '(or random-state (member nil t))))))
 
@@ -5226,9 +5252,14 @@
 ;;; ============================================================
 ;;; UPGRADED-COMPLEX-PART-TYPE
 ;;; ============================================================
-(defun upgraded-complex-part-type (type)
-  "Return upgraded complex part type (simplified to T)."
-  t)
+(defun upgraded-complex-part-type (type &optional env)
+  "The part type of the most specialized complex that holds TYPE: TYPE
+   itself, as SBCL answers, but SHORT-FLOAT / LONG-FLOAT are SINGLE-FLOAT /
+   DOUBLE-FLOAT here.  (It used to answer T, which is not a part type.)"
+  (declare (ignore env))
+  (cond ((eq type 'short-float) 'single-float)
+        ((eq type 'long-float) 'double-float)
+        (t type)))
 
 ;;; ============================================================
 ;;; Runtime LDB for non-constant byte specs
@@ -5285,6 +5316,11 @@
 ;;; subtype of its class (req via type-of.4) — leaning on the existing
 ;;; most-specific-builtin-class dispatch so the result is always a name
 ;;; TYPEP recognises.
+(defun %cl-cons-p (x)
+  "CL's CONSP: a cons that is not a tagged-cons object -- the same test
+   runtime-compiled CONSP makes (%RT-CONSP)."
+  (%rt-consp x))
+
 (defun type-of (obj)
   (cond
     ((null obj) 'null)
@@ -5319,8 +5355,11 @@
     ;; Integers: CLHS says an (integer low high) spec is fine, but a bare
     ;; recognisable supertype name also satisfies req 1.a + the subtypep
     ;; checks.  Use FIXNUM / BIGNUM (TYPEP accepts both as INTEGER here).
+    ;; As SBCL: a non-negative integer's type says so, so it is a subtype of
+    ;; UNSIGNED-BYTE like the integer itself (TYPE-OF.1).
     ((fixnump obj)
      (cond ((or (eql obj 0) (eql obj 1)) 'bit)
+           ((> obj 0) (list 'integer 0 most-positive-fixnum))
            (t 'fixnum)))
     ((bignump obj)     'bignum)
     ((ratiop obj)      'ratio)
@@ -5343,11 +5382,22 @@
          (list 'vector 'character '*)))
     ((%generic-function-p obj) 'standard-generic-function)
     ((functionp obj) 'function)
-    ((consp obj) 'cons)
-    ((hash-table-p obj) 'hash-table)
+    ;; Packages, readtables, random states and streams are tagged conses
+    ;; underneath: ask for them before CONSP claims them.
     ((packagep obj) 'package)
     ((readtablep obj) 'readtable)
     ((random-state-p obj) 'random-state)
+    ((streamp obj)
+     (cond ((broadcast-stream-p obj) 'broadcast-stream)
+           ((concatenated-stream-p obj) 'concatenated-stream)
+           ((echo-stream-p obj) 'echo-stream)
+           ((synonym-stream-p obj) 'synonym-stream)
+           ((two-way-stream-p obj) 'two-way-stream)
+           ((string-stream-p obj) 'string-stream)
+           ((file-stream-p obj) 'file-stream)
+           (t 'stream)))
+    ((consp obj) 'cons)
+    ((hash-table-p obj) 'hash-table)
     ((symbolp obj) (if (keywordp obj) 'keyword 'symbol))
     ;; a packed BIT array (cl-clos.lisp, PACKED BIT ARRAYS)
     ((and (not (consp obj)) (%mda-p obj) (%mda-bit-p obj))
@@ -5490,8 +5540,11 @@
          ((eq tn 'double-float) (double-float-p obj))
          ((eq tn 'long-float)   (double-float-p obj))
          ((eq tn 'ratio) (ratiop obj))
-         ((eq tn 'cons) (consp obj))
-         ((eq tn 'list) (or (null obj) (consp obj)))
+         ;; Hash tables, packages, readtables, random states and streams are
+         ;; tagged conses underneath, but no CONS or LIST
+         ;; (UNIVERSE-ELEMENTS-IN-AT-MOST-ONE-DISJOINT-TYPE).
+         ((eq tn 'cons) (%cl-cons-p obj))
+         ((eq tn 'list) (or (null obj) (%cl-cons-p obj)))
          ((eq tn 'null) (null obj))
          ;; NB: the old branch had `(integerp obj)` — a leftover from when
          ;; native MVM symbols were bare hash fixnums.  It made
@@ -5507,7 +5560,7 @@
          ((eq tn 'character) (characterp obj))
          ((eq tn 'base-char) (characterp obj))
          ((eq tn 'standard-char) (characterp obj))
-         ((eq tn 'atom) (not (consp obj)))
+         ((eq tn 'atom) (not (%cl-cons-p obj)))
          ((eq tn 't) t)
          ((eq tn 'nil) nil)
          ((eq tn 'boolean) (or (null obj) (eq obj t)))
@@ -5527,11 +5580,11 @@
          ;; SIMPLE-VECTOR = (simple-array t (*)) — element-type T only.
          ;; A byte-packed u8 vector (subtag #x11) has element-type
          ;; (unsigned-byte 8), so it is NOT a simple-vector.
+         ;; Not a string or a multi-dimensional array either: the predicate
+         ;; already answers all of it (SIMPLE-VECTOR-P.1).
          ((eq tn 'simple-vector) (and (%typep-array-obj-p obj)
                                       (not (bit-vector-p obj))
-                                      (not (eql (obj-subtag obj) #x11))
-                                      ;; packed single-float vector (#x12)
-                                      (not (eql (obj-subtag obj) #x12))))
+                                      (simple-vector-p obj)))
          ((eq tn 'bit-vector)    (bit-vector-p obj))
          ((eq tn 'simple-bit-vector) (simple-bit-vector-p obj))
          ;; CLHS 4.3: the SEQUENCE system class is exactly (or list vector).
@@ -5545,7 +5598,7 @@
          ((eq tn 'sequence)      (cond ((stringp obj) t)
                                        ((%complex-p obj) nil)
                                        ((arrayp obj) (= (array-rank obj) 1))
-                                       (t (or (null obj) (consp obj)))))
+                                       (t (or (null obj) (%cl-cons-p obj)))))
          ((eq tn 'function)      (or (functionp obj) (%generic-function-p obj)))
          ((eq tn 'compiled-function) (functionp obj))
          ((eq tn 'generic-function) (%generic-function-p obj))

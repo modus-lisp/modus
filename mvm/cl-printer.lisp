@@ -362,6 +362,15 @@
     (cond
       ((= len 0) t)
       ((and base (%name-potential-number-p name base)) t)
+      ;; a package marker, whitespace, a macro or escape character
+      ;; (READ-SYMBOL.10: (make-symbol ":") is #:|:|)
+      ((%sym-name-needs-escape-p name) t)
+      ;; a name of dots alone reads as the consing dot or an error
+      ((let ((all-dots t) (j 0))
+         (loop (when (or (not all-dots) (= j len)) (return all-dots))
+               (unless (= (%prim-aref name j) 46) (setq all-dots nil))
+               (setq j (+ j 1))))
+       t)
       (t
        (let ((needs nil) (i 0))
          (loop
@@ -767,22 +776,35 @@
        (%print-char 35 stream)   ; #
        (%print-char 83 stream)   ; S
        (%print-char 40 stream)   ; (
+       ;; *PRINT-LENGTH* counts the slots, as SBCL does: the rest are "..."
+       ;; (PRINT-LENGTH.11 accepts this layout).  The keywords print as
+       ;; keywords, :FOO, even unescaped (PRINT-STRUCTURE.1).
        (let* ((tname (%struct-type-name obj))
               (desc (%find-struct-type tname))
-              (slots (if desc (%struct-type-desc-slots desc) nil)))
-         (%write-obj tname stream level escape)
-         (let ((i 0) (cur slots))
-           (loop
-             (when (null cur) (return nil))
-             (%print-char 32 stream)   ; space
-             ;; slot keyword — intern :SLOTNAME in the KEYWORD package
-             (let ((kw (intern (symbol-name (car cur)) (%keyword-package))))
-               (%write-obj kw stream level escape))
-             (%print-char 32 stream)
-             (%write-obj (aref obj (+ 2 i)) stream
-                         (if (null level) 1 (+ level 1)) escape)
-             (setq i (+ i 1))
-             (setq cur (cdr cur)))))
+              (slots (if desc (%struct-type-desc-slots desc) nil))
+              (plen (if *print-readably* nil *print-length*))
+              (n 0))
+         (block items
+           (flet ((room-p ()
+                    (if (and (integerp plen) (>= n plen))
+                        (progn (%print-string-raw " ..." stream) nil)
+                        (progn (setq n (+ n 1)) t))))
+             (%write-obj tname stream level escape)
+             (let ((i 0) (cur slots))
+               (loop
+                 (when (null cur) (return nil))
+                 (unless (room-p) (return-from items nil))
+                 (%print-char 32 stream)   ; space
+                 ;; slot keyword — intern :SLOTNAME in the KEYWORD package
+                 (let ((kw (intern (symbol-name (car cur)) (%keyword-package))))
+                   ;; unescaped, the symbol printer leaves the colon off
+                   (unless escape (%print-char 58 stream))
+                   (%write-obj kw stream level escape))
+                 (%print-char 32 stream)
+                 (%write-obj (aref obj (+ 2 i)) stream
+                             (if (null level) 1 (+ level 1)) escape)
+                 (setq i (+ i 1))
+                 (setq cur (cdr cur)))))))
   (%print-char 41 stream))  ; )
 
 (defun %write-obj (obj stream level escape)
@@ -931,7 +953,8 @@
                ((= code 13)  (%print-string-raw "Return" stream))
                ((= code 12)  (%print-string-raw "Page" stream))
                ((= code 8)   (%print-string-raw "Backspace" stream))
-               ((= code 7)   (%print-string-raw "Altmode" stream))
+               ;; BEL (Altmode is ESC, code 27; PRINT.CHAR.7)
+               ((= code 7)   (%print-string-raw "Bel" stream))
                ((= code 127) (%print-string-raw "Rubout" stream))
                ((= code 0)   (%print-string-raw "Null" stream))
                (t (%print-char code stream))))
@@ -2424,39 +2447,19 @@
 ;;; (print-unreadable-object (obj stream :type t :identity t) body...)
 ;;; is rewritten by SBCL to (%print-unreadable-object obj stream type-p identity-p thunk)
 (defun %print-unreadable-object (obj stream type-p identity-p thunk)
-  "Implement print-unreadable-object."
+  "Implement print-unreadable-object, as SBCL lays it out: \"#<\", the
+   TYPE-OF (then a space), the body, \" {id}\" when asked, \">\".  So :TYPE T
+   with no body is \"#<NULL >\" (PRINT-UNREADABLE-OBJECT.2)."
   (let ((s (%resolve-output-stream stream)))
     (%print-char 35 s)  ; #
     (%print-char 60 s)  ; <
     (when type-p
-      ;; Print type name
-      (let ((type-str
-             (cond
-               ((%clos-instance-p obj) (symbol-name (%instance-class-name obj)))
-               ((%struct-instance-p obj) (symbol-name (%struct-type-name obj)))
-               ((%condition-p obj) (symbol-name (%condition-type-name obj)))
-               ((null obj) "NULL")
-               ((eq obj t) "BOOLEAN")
-               ((fixnump obj) "FIXNUM")
-               ((floatp-impl obj) "FLOAT")
-               ((ratiop obj) "RATIO")
-               ((stringp obj) "STRING")
-               ((characterp obj) "CHARACTER")
-               ((%cl-sym-p obj) "SYMBOL")
-               ((consp obj) "CONS")
-               ((arrayp obj) "ARRAY")
-               ((packagep obj) "PACKAGE")
-               ((streamp obj) "STREAM")
-               (t "T"))))
-        (%print-string-raw type-str s)
-        (when (and thunk identity-p)
-          (%print-char 32 s))))
+      (write (type-of obj) :stream s :circle nil :level nil :length nil)
+      (%print-char 32 s))
     (when thunk
-      (when (and type-p (not identity-p))
-        (%print-char 32 s))
       (funcall thunk))
     (when identity-p
-      (when (or thunk type-p) (%print-char 32 s))
+      (when (or thunk (not type-p)) (%print-char 32 s))
       ;; Print a fake address (use object hash or 0)
       (%print-string-raw "{" s)
       (%print-decimal-to-stream 0 s)
@@ -3632,6 +3635,10 @@
           (%pp-end cap suffix)
           (if atp rest-args (cdr arg-list))))))
 
+(defvar *format-justify-spare* 0
+  "The SPARE parameter (the first) of the ~spare,width:; clause last read by
+   %FORMAT-JUSTIFY-OVERFLOW-WIDTH.")
+
 (defun %format-justify-overflow-width (body)
   "If the FIRST top-level segment of justification BODY is terminated by a
    ~:; (colon-semicolon, the CLHS 22.3.5.3 line-overflow clause) rather than a
@@ -3649,7 +3656,7 @@
       (if (/= (%prim-aref body pos) 126)
           (setq pos (+ pos 1))
           (let ((p (+ pos 1)) (dch nil) (sawcolon nil)
-                (cur 0) (have-cur nil) (pidx 0) (width nil))
+                (cur 0) (have-cur nil) (pidx 0) (width nil) (spare nil))
             (loop
               (when (>= p len) (return nil))
               (let ((c (%prim-aref body p)))
@@ -3664,6 +3671,7 @@
                    (setq have-cur t) (setq p (+ p 1)))
                   ((= c 44)            ; , — param separator
                    (when (and (= pidx 1) have-cur) (setq width cur))
+                   (when (and (= pidx 0) have-cur) (setq spare cur))
                    (setq pidx (+ pidx 1)) (setq cur 0) (setq have-cur nil)
                    (setq p (+ p 1)))
                   ((or (= c 118) (= c 86) (= c 35))  ; V / # — runtime param
@@ -3678,6 +3686,8 @@
               ;; First top-level `;' decides: ~:; → overflow clause.
               ((= dch 59)
                (when (and (= pidx 1) have-cur) (setq width cur))
+               (when (and (= pidx 0) have-cur) (setq spare cur))
+               (setq *format-justify-spare* (if spare spare 0))
                (if sawcolon
                    (setq result (if width width t))
                    (setq result nil)))
@@ -3753,13 +3763,6 @@
       ;; which we use *print-right-margin* (defaulting to a wide line) so short
       ;; content never trips it.  With an explicit numeric WIDTH (e.g. ~0,3:;)
       ;; the prefix fires once the content is at least that wide.
-      (when overflow-prefix
-        (let* ((rm *print-right-margin*)
-               (w (cond ((integerp overflow-w) overflow-w)
-                        ((integerp rm) rm)
-                        (t 72))))
-          (when (>= text-len w)
-            (%print-string-raw overflow-prefix stream))))
       ;; Number of inter-segment gaps that receive padding.
       ;; N segments → N-1 internal gaps; : adds a leading gap, @ a trailing.
       (let* ((internal-gaps (if (> nsegs 1) (- nsegs 1) 0))
@@ -3792,15 +3795,27 @@
           (loop
             (when (>= total needed) (return nil))
             (setq total (+ total colinc)))
+          ;; The overflow clause is printed when the justified field would
+          ;; pass WIDTH from the current column: COLUMN + SPARE + FIELD > WIDTH
+          ;; (as SBCL; format.justify.38/40).
+          (when overflow-prefix
+            (let* ((rm *print-right-margin*)
+                   (w (cond ((integerp overflow-w) overflow-w)
+                            ((integerp rm) rm)
+                            (t 72)))
+                   (col (%stream-column stream)))
+              (when (> (+ (if (integerp col) col 0) *format-justify-spare* total) w)
+                (%print-string-raw overflow-prefix stream))))
           (let* ((pad-total (- total text-len))
                  (gapn gaps))
             (when (< pad-total 0) (setq pad-total 0))
             (when (= gapn 0) (setq gapn 1))
-            ;; Distribute pad-total across gapn gaps, extra to leftmost gaps.
+            ;; Distribute pad-total across gapn gaps, the extra to the
+            ;; RIGHTMOST gaps (as SBCL: ~15<AA~;BBBB~;CCCC~> pads 1 then 2).
             (let* ((base (%floordiv pad-total gapn))
                    (extra (- pad-total (* base gapn))))
               (%format-emit-justified stream kept nsegs colonp atp
-                                      base extra padcode))))))
+                                      base (- gapn extra) padcode))))))
     args))
 
 (defun %floordiv (a b)
@@ -3813,22 +3828,22 @@
       (%print-char code stream)
       (setq i (+ i 1)))))
 
-(defun %format-emit-justified (stream segs nsegs colonp atp base extra padcode)
+(defun %format-emit-justified (stream segs nsegs colonp atp base first-extra padcode)
   "Emit the kept SEGS interleaved with padding gaps.  BASE is the base pad
-   per gap; EXTRA gaps get one more (leftmost-first).  Gap layout:
+   per gap; the gaps from index FIRST-EXTRA on get one more.  Gap layout:
      nsegs=1: one gap, placed before/after/both per : @.
      nsegs>1: internal gaps (nsegs-1), plus a leading gap if :, trailing if @."
   ;; gap-sizes computed on the fly; we track which gap index we're at.
   (let ((gap-idx 0))
     (flet ((gap-size ()
              (let ((sz base))
-               (when (< gap-idx extra) (setq sz (+ sz 1)))
+               (when (>= gap-idx first-extra) (setq sz (+ sz 1)))
                (setq gap-idx (+ gap-idx 1))
                sz)))
       (cond
         ((= nsegs 0)
-         ;; No segments (e.g. ~<~>): one gap; emit base+extra padding.
-         (%format-emit-pad (+ base extra) padcode stream))
+         ;; No segments (e.g. ~<~>): one gap.
+         (%format-emit-pad (gap-size) padcode stream))
         ((= nsegs 1)
          (let ((seg (car segs)))
            (cond
@@ -3997,7 +4012,11 @@
         (let ((len (length core)))
           ;; Leading-zero drop: if too wide and core is "0.xxx" or "-0."/"+0.",
           ;; remove the 0 before the decimal point to try to fit W.
-          (when (> len w)
+          ;; ... but never down to a bare "." with no digit at all ("~0,0f"
+          ;; of 0.01 is "0.", FORMAT.F.46B; "~1f" of it is ".0").
+          (when (and (> len w)
+                     (let ((dp (%string-find-char core 46)))
+                       (and dp (< (+ dp 1) len))))
             (let* ((dotpos (%string-find-char core 46))
                    (zpos (if (and dotpos (> dotpos 0)) (- dotpos 1) -1)))
               (when (and (>= zpos 0)
@@ -4159,16 +4178,18 @@
    %FORMAT-IMPL: inlined there it made every ~/ signal PROGRAM-ERROR."
   (let ((pkg-out (make-string-output-stream))
         (sym-out (make-string-output-stream))
-        (seen-colon nil)
+        (seen-colon nil) (just-colon nil)
         (k fn-start))
-    ;; Split at the first ':' ("PKG:NAME" / "PKG::NAME"), upcasing.
+    ;; Split at the first ':' ("PKG:NAME" / "PKG::NAME"), upcasing.  Later
+    ;; colons belong to the name (FORMAT./.11: "cL-tESt:FUNCTION:FOR::...").
     (loop
       (when (>= k fn-end) (return nil))
       (let ((c (%prim-aref control k)))
         (cond
-          ((and (= c 58) (not seen-colon)) (setq seen-colon t))
-          ((= c 58) nil)
-          (t (%print-char (if (and (>= c 97) (<= c 122)) (- c 32) c)
+          ((and (= c 58) (not seen-colon)) (setq seen-colon t just-colon t))
+          ((and (= c 58) just-colon) (setq just-colon nil))
+          (t (setq just-colon nil)
+             (%print-char (if (and (>= c 97) (<= c 122)) (- c 32) c)
                           (if seen-colon sym-out pkg-out)))))
       (setq k (+ k 1)))
     (let* ((first-part (get-output-stream-string pkg-out))
@@ -5359,15 +5380,16 @@
                 (return)))
             (setq vp (cddr vp)))))))
   (let ((stream-arg (if args (car args) nil))
-        (start 0)
-        (end nil))
+        (start 0) (start-set nil)
+        (end nil) (end-set nil))
+    ;; the FIRST occurrence of a keyword wins (CLHS 3.4.1.4; WRITE-LINE.10)
     (let ((cur (if args (cdr args) nil)))
       (loop
         (when (null cur) (return nil))
         (let ((k (car cur)) (v (cadr cur)))
           (cond
-            ((eq k :start) (setq start v))
-            ((eq k :end)   (setq end v))))
+            ((and (eq k :start) (not start-set)) (setq start v start-set t))
+            ((and (eq k :end) (not end-set))   (setq end v end-set t))))
         (setq cur (cddr cur))))
     (let* ((s (%resolve-output-stream stream-arg))
            (len (length str))

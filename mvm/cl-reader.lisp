@@ -1692,8 +1692,9 @@
          (%read-radix-integer stream 2))
         ;; #r — radix integer (arg is the radix)
         ((or (= code 82) (= code 114))  ; R r
-         (if arg
-             (%read-radix-integer stream arg)
+         ;; under *READ-SUPPRESS* the radix may be missing (READ-SUPPRESS.SHARP-R.4)
+         (if (or arg *read-suppress*)
+             (%read-radix-integer stream (or arg 10))
              (%reader-error "missing radix for #R")))
         ;; #* — bit vector
         ((= code 42)  ; *
@@ -1905,7 +1906,14 @@
                     ((string-equal name-str "Escape") (code-char 27))
                     ((string-equal name-str "Altmode") (code-char 27))
                     ((string-equal name-str "Delete") (code-char 127))
+                    ;; every other name CHAR-NAME gives (Bel, ...)
+                    ((name-char name-str))
                     (t (%reader-error "unknown character name"))))))))))
+
+(defun %sharp-colon-plain-p (ch)
+  "CH starts a #: token that needs no forcing to a symbol: a letter."
+  (let ((c (char-code ch)))
+    (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)))))
 
 (defun %read-uninterned-symbol (stream rt)
   "Read #:symbol — uninterned symbol."
@@ -1914,7 +1922,10 @@
     ;; %read-token-from consumes CH as the first char and reads the REST
     ;; from the stream — do NOT unread CH, or it is processed twice and the
     ;; first char of the name is doubled (#:foo -> FFOO).
-    (let ((obj (%read-token-from stream ch rt nil)))
+    ;; HAS-ESCAPE T: what follows #: is a symbol name even when it would
+    ;; read as a number or the consing dot (#:. is the symbol named ".",
+    ;; SYNTAX.SHARP-COLON.7).
+    (let ((obj (%read-token-from stream ch rt (not (%sharp-colon-plain-p ch)))))
       ;; obj would be interned — we need to make uninterned version
       ;; Extract name from the interned result
       (if *read-suppress* nil

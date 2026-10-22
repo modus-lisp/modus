@@ -2724,13 +2724,22 @@
                              `(list ',rname ,fn nil))))
                      bindings)))
        `(%push-restarts (list ,@restart-forms) (lambda () ,@body))))
+    ;; (export '(A B C)) after an (in-package X) written at top level: the
+    ;; reader would have interned A B C in X, but this corpus is read by the
+    ;; host in ONE package, so the symbols belong elsewhere and EXPORT (which
+    ;; signals for a symbol not accessible in the package) refused them
+    ;; (loop7).  Intern the names in the current package at run time.
+    ((and (eq (car form) 'export) (consp (cdr form)) (null (cddr form))
+          (consp (cadr form)) (eq (car (cadr form)) 'quote)
+          (consp (cadr (cadr form)))
+          (every #'symbolp (cadr (cadr form))))
+     `(export (list ,@(mapcar (lambda (s) `(intern ,(symbol-name s)))
+                              (cadr (cadr form))))))
     ;; (with-condition-restarts condition restarts-form body...)
-    ;; stub: just execute body
     ((and (eq (car form) 'with-condition-restarts) (cdr form))
-     (let ((body (mapcar #'rewrite-reader-forms (nthcdr 3 form))))
-       (if body
-           `(progn ,@body)
-           nil)))
+     `(%with-condition-restarts ,(rewrite-reader-forms (cadr form))
+                                ,(rewrite-reader-forms (caddr form))
+                                (lambda () ,@(mapcar #'rewrite-reader-forms (nthcdr 3 form)))))
 
     ;; ---- Minimal CLOS support ----
 

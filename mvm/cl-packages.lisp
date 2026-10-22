@@ -807,7 +807,21 @@
 (defun delete-package (pkg)
   "Delete package PKG."
   (let ((p (%resolve-package pkg)))
+    ;; A designator naming no package: a correctable PACKAGE-ERROR whose
+    ;; CONTINUE returns NIL (DELETE-PACKAGE.6).  A deleted package object
+    ;; just returns NIL.
+    (when (and (null p) (not (packagep pkg)))
+      (restart-case (error 'package-error :package pkg)
+        (continue () :report "Return NIL." (return-from delete-package nil))))
     (when (and p (%pkg-name p))
+      ;; Packages that use it: a correctable PACKAGE-ERROR, then they stop
+      ;; using it (DELETE-PACKAGE.5).
+      (when (%pkg-used-by p)
+        (restart-case (error 'package-error :package p)
+          (continue () :report "Delete it anyway." nil))
+        (dolist (user (%pkg-used-by p))
+          (%pkg-set-use-list user (%remove-eq-item p (%pkg-use-list user))))
+        (%pkg-set-used-by p nil))
       ;; Remove from used-by lists
       (dolist (used (%pkg-use-list p))
         (%pkg-set-used-by used
@@ -939,8 +953,14 @@
     sym))
 
 (defun copy-symbol (sym &optional copy-props)
-  "Create a copy of SYM."
+  "A fresh uninterned symbol named as SYM; with COPY-PROPS, it also gets a
+   copy of SYM's property list and SYM's value and function, if any
+   (CLHS COPY-SYMBOL; COPY-SYMBOL.2/.3)."
   (let ((new (%make-cl-symbol (symbol-name sym))))
+    (when copy-props
+      (setf (symbol-plist new) (copy-list (symbol-plist sym)))
+      (when (boundp sym) (setf (symbol-value new) (symbol-value sym)))
+      (when (fboundp sym) (setf (symbol-function new) (symbol-function sym))))
     new))
 
 ;;; --- gensym (override prelude.lisp's integer-returning stub) ---
@@ -1247,6 +1267,14 @@
                               (%rt-leave)
                               (values (car r) (car (cdr r))))))))))))))
 
+(defun %pkg-accessible-sym (pkg name-str)
+  "The symbol named NAME-STR accessible in PKG (external, internal, then
+   inherited -- INTERN's lookup, creating nothing), or NIL."
+  (let ((e (or (%symtab-find-in pkg 3 name-str)
+               (%symtab-find-in pkg 2 name-str)
+               (%cl-intern-inherited pkg name-str))))
+    (if e (cdr e) nil)))
+
 (defun %cl-intern-inherited (pkg name-str)
   "The external entry for NAME-STR in the first package PKG uses that has
    one, or NIL — %CL-INTERN-IN's inherited check, without the lock."
@@ -1269,6 +1297,28 @@
                       (list symbols))))
     (dolist (sym sym-list)
       (let ((name-str (symbol-name sym)))
+        ;; CLHS EXPORT: a symbol not accessible in PKG is a correctable
+        ;; PACKAGE-ERROR (CONTINUE imports it, EXPORT.4) ...
+        ;; (Only for a real CL symbol: a native MVM symbol literal of the
+        ;; image is not EQ to the package's symbol of its name.)
+        ;; The primary value alone: SYM itself found means accessible.
+        (unless (or (null sym) (not (%cl-sym-p sym))
+                    (eq (%pkg-accessible-sym pkg name-str) sym))
+          (restart-case (error 'package-error :package pkg)
+            (continue ()
+              :report "Import the symbol first."
+              (import (list sym) pkg))))
+        ;; ... and so is a name conflict in a package that uses PKG: a
+        ;; different symbol of that name present there and not shadowing it
+        ;; (EXPORT.5).
+        (dolist (user (if (%cl-sym-p sym) (package-used-by-list pkg) nil))
+          (multiple-value-bind (other ostatus) (find-symbol name-str user)
+            (when (and ostatus (not (eq other sym))
+                       (not (member other (package-shadowing-symbols user))))
+              (restart-case (error 'package-error :package user)
+                (continue ()
+                  :report "Export it anyway."
+                  nil)))))
         ;; If in internal, move to external
         (let ((int-entry (%symtab-find (%pkg-internal pkg) name-str)))
           (when int-entry
@@ -1766,8 +1816,10 @@
    current *package*.  This is what the IN-PACKAGE macro expands to, so
    the designator arrives QUOTED (unevaluated) per CLHS 11.1.2.1.2."
   (let ((pkg (find-package name)))
-    (when pkg
-      (setq *package* pkg))
+    ;; No such package: a PACKAGE-ERROR (CLHS IN-PACKAGE; IN-PACKAGE.5).
+    (unless pkg
+      (error 'package-error :package name))
+    (setq *package* pkg)
     pkg))
 
 (defun in-package (name)

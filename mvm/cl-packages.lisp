@@ -991,16 +991,17 @@
                 (if int-entry
                     (values (cdr int-entry) :internal)
                     ;; Check inherited (use-list external symbols)
-                    (let ((found nil)
+                    (let ((found nil) (found-p nil)
                           (use (%pkg-use-list pkg)))
                       (loop
                         (when (null use) (return nil))
                         (let ((uext (%symtab-find-in (car use) 3 name-str)))
                           (when uext
                             (setq found (cdr uext))
+                            (setq found-p t)    ; FOUND may be NIL itself
                             (return nil)))
                         (setq use (cdr use)))
-                      (if found
+                      (if found-p
                           (values found :inherited)
                           (values nil nil))))))))))))
 
@@ -1036,16 +1037,17 @@
                 (if int-entry
                     (list (cdr int-entry) :internal)
                     ;; Check inherited
-                    (let ((found nil)
+                    (let ((found nil) (found-p nil)
                           (use (%pkg-use-list pkg)))
                       (loop
                         (when (null use) (return nil))
                         (let ((uext (%symtab-find-in (car use) 3 name-str)))
                           (when uext
                             (setq found (cdr uext))
+                            (setq found-p t)    ; FOUND may be NIL itself
                             (return nil)))
                         (setq use (cdr use)))
-                      (if found
+                      (if found-p
                           (list found :inherited)
                           ;; Create new symbol.
                           ;;
@@ -1297,12 +1299,27 @@
                       symbols
                       (list symbols))))
     (dolist (sym sym-list)
-      (let ((name-str (symbol-name sym)))
-        ;; Only add if not already accessible
-        (unless (or (%symtab-find (%pkg-internal pkg) name-str)
-                    (%symtab-find (%pkg-external pkg) name-str))
-          (%pkg-set-internal pkg
-            (%symtab-add (%pkg-internal pkg) name-str sym)))))
+      (let ((name-str (symbol-name sym)) (skip nil))
+        (multiple-value-bind (existing status) (find-symbol name-str pkg)
+          ;; CLHS IMPORT: a DIFFERENT symbol of that name already accessible is
+          ;; a name conflict -- a correctable PACKAGE-ERROR; CONTINUE leaves
+          ;; this symbol out (upstream IMPORT.ERROR.4/5: it was added over the
+          ;; other silently).
+          (when (and status (not (eq existing sym)))
+            (restart-case
+                (error 'package-error :package pkg)
+              (continue ()
+                :report "Do not import the symbol."
+                (setq skip t))))
+          (unless skip
+            ;; present now, unless it already was (an inherited one becomes
+            ;; present too)
+            (unless (and status (not (eq status :inherited)))
+              (%pkg-set-internal pkg
+                (%symtab-add (%pkg-internal pkg) name-str sym)))
+            ;; an uninterned symbol gets PKG as its home (IMPORT.5)
+            (when (and (%cl-sym-p sym) (null (symbol-package sym)))
+              (%cl-sym-set-package sym pkg))))))
     t))
 
 ;;; --- unintern ---

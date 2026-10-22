@@ -2989,7 +2989,14 @@
     (when pkg
       (dolist (n (%standard-cl-symbol-names))
         (let ((sym (intern n pkg)))
-          (export sym pkg))))))
+          (export sym pkg)))
+      ;; CL:T and CL:NIL ARE T and NIL.  The loop above made a symbol object
+      ;; named each, so (EQ T (FIND-SYMBOL "T" "CL")) was NIL and
+      ;; (FIND-ALL-SYMBOLS "NIL") did not contain NIL (upstream READ-SYMBOL.15-18,
+      ;; FIND-ALL-SYMBOLS.3-9).
+      (dolist (slot '(2 3))
+        (let ((e (%symtab-find-in pkg slot "T"))) (when e (setf (cdr e) t)))
+        (let ((e (%symtab-find-in pkg slot "NIL"))) (when e (setf (cdr e) nil)))))))
 
 
 ;;; ============================================================

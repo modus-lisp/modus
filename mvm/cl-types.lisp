@@ -619,7 +619,6 @@
    (complex r 0.0) → real simplification does NOT collapse it (except when
    sin x is exactly the rational 0, which is the correct degenerate case)."
   (complex (cos x) (sin x)))
-(defun integer (n) n)  ; not a real CL function but used as type coercion
 ;; Public AREF/ASET now apply the string code↔char lift themselves, so
 ;; CHAR/SCHAR just forward (no extra code-char) and SET-SCHAR lets ASET
 ;; coerce the character to its code.  Wrapped strings are handled by the

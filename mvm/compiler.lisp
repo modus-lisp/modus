@@ -4290,11 +4290,16 @@
       (let ((place (cadr form))
             (indicator (caddr form))
             (result (%mvm-gensym "R")))
-        (if (symbolp place)
-            `(let ((,result (%remf ,place ,indicator)))
-               (setq ,place (cdr ,result))
-               (car ,result))
-            `(car (%remf ,place ,indicator))))))
+        ;; The place's subforms, then the indicator, then the place is READ
+        ;; (upstream REMF.ORDER.2/3) -- and a compound place is written back:
+        ;; removing the first pair makes a new list head (REMF.6).
+        (multiple-value-bind (bindings access writer) (mvm-place-expansion place)
+          (let ((ig (%mvm-gensym "RI")))
+            `(let* (,@bindings
+                    (,ig ,indicator)
+                    (,result (%remf ,access ,ig)))
+               ,(funcall writer `(cdr ,result))
+               (car ,result)))))))
 
   ;; PUSHNEW → adjoin + store.  ITEM first, then place subforms once.
   (mvm-define-macro "PUSHNEW"
@@ -5068,15 +5073,23 @@
                 ;; like (getf (db-state c) :k), never wrote it back at all --
                 ;; sqlite-pure's (or (getf …) (setf (getf …) (list 0))) got
                 ;; (:K (0)) and a slot still NIL.
+                ;; CLHS 5.1.1.1 order: the plist place's subforms, the
+                ;; indicator, the default, then the value -- each once (the
+                ;; place was evaluated twice and the default never:
+                ;; upstream SETF-GETF.5, SETF-GETF.ORDER.1/2).
                 ((and (consp place) (name-eq (car place) "GETF"))
-                 (let ((vt (%mvm-gensym "GETFV")))
-                   `(let ((,vt ,value))
-                      ,(if (symbolp (cadr place))
-                           `(setq ,(cadr place)
-                                  (set-getf ,(cadr place) ,(caddr place) ,vt))
-                           `(setf ,(cadr place)
-                                  (set-getf ,(cadr place) ,(caddr place) ,vt)))
-                      ,vt)))
+                 (multiple-value-bind (bindings access writer)
+                     (mvm-place-expansion (cadr place))
+                   (let ((vt (%mvm-gensym "GETFV"))
+                         (ig (%mvm-gensym "GETFI"))
+                         (dg (%mvm-gensym "GETFD")))
+                     `(let* (,@bindings
+                             (,ig ,(caddr place))
+                             ,@(when (cdddr place) `((,dg ,(cadddr place))))
+                             (,vt ,value))
+                        ,@(when (cdddr place) `(,dg))
+                        ,(funcall writer `(set-getf ,access ,ig ,vt))
+                        ,vt))))
                 ;; (setf (ldb spec n) val) → store (dpb val spec n) back
                 ;; into the integer place, but RETURN val (CLHS: setf
                 ;; yields the newly-stored value, NOT the updated place).
@@ -6075,8 +6088,10 @@
             (val-form (caddr form))
             (tmp (%mvm-gensym "MVS")))
         (cond
-          ((null vars) val-form)
+          ;; the PRIMARY value only (it returned every value)
+          ((null vars) `(values ,val-form))
           ((null (cdr vars)) `(setf ,(car vars) ,val-form))
+          ;; (Not via SETF of VALUES: that expands to MULTIPLE-VALUE-SETQ.)
           (t
            (let ((sets nil) (i 0))
              (dolist (v vars)

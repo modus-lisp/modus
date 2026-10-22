@@ -322,12 +322,19 @@
     ;; buffer-size both 0 and the loop SPINS FOREVER
     ;; (READ-STREAM-CONTENT-INTO-STRING.2 expects a TYPE-ERROR).
     ;; Signal a real TYPE-ERROR carrying :DATUM/:EXPECTED-TYPE so
-    ;; `(handler-case ... (type-error () ...))' can see it.  (CLHS also
-    ;; specifies a correctable STORE-VALUE restart; not provided here.)
+    ;; `(handler-case ... (type-error () ...))' can see it -- and, as CLHS
+    ;; specifies, inside a STORE-VALUE restart that stores the new value into
+    ;; PLACE and checks again (upstream CHECK-TYPE.3-7).  Returns NIL.
     "(defmacro check-type (place type &rest args)
-       (list 'unless (list 'typep place (list 'quote type))
-             (list 'error ''type-error :datum place
-                   :expected-type (list 'quote type))))"
+       (let ((v (gensym \"CT-V\")))
+         (list 'loop
+               (list 'when (list 'typep place (list 'quote type)) (list 'return nil))
+               (list 'restart-case
+                     (list 'error ''type-error :datum place
+                           :expected-type (list 'quote type))
+                     (list 'store-value (list v)
+                           :report \"Supply a new value.\"
+                           (list 'setf place v))))))"
     ;; WITH-HASH-TABLE-ITERATOR (CLHS).  Only the ANSI gate's REWRITER ever
     ;; expanded it, so the image had none: at runtime the iterator call was an
     ;; undefined function (upstream ansi-test W-H-T-I.1..11).  Same expansion

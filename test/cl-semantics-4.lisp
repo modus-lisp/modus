@@ -79,5 +79,17 @@
        (typep (make-array 3 :fill-pointer 2) 'simple-array)
        nil)
 
+;;; Batch 6
+(check "DEFUN returns its name in any context"
+       (list (prog1 (defun cs4-df () 1) 2) (list (defun cs4-df2 () 2)))
+       '(cs4-df (cs4-df2)))
+(check "&whole may be a pattern"
+       (destructuring-bind (&whole (a . b) c . d) '(1 . 2) (list a b c d))
+       '(1 2 1 2))
+(check "keyword case is preserved"
+       (list (eq (intern "qwerty" "KEYWORD") :qwerty) (symbol-name :qwerty)
+             (symbol-name (intern "qwerty" "KEYWORD")))
+       '(nil "QWERTY" "qwerty"))
+
 (format t "~&cl-semantics-4: ~d checks, ~d failed~%" *checks* *fails*)
 (when (and (> *fails* 0) (fboundp (quote sys-exit))) (funcall (quote sys-exit) 1))

@@ -1810,6 +1810,11 @@
    silently drop trailing initargs."
   (cond
     ((null args) (error "make-instance: requires a class designator"))
+    ;; Neither a class nor a class name: the user's own MAKE-INSTANCE
+    ;; methods decide (MAKE-INSTANCE.1/.2 specialise it on an instance).
+    ((and (not (symbolp (car args))) (not (%clos-class-p (car args)))
+          (not (%class-proxy-p (car args))) (%find-gf 'make-instance))
+     (%gf-dispatch 'make-instance args))
     (t
      (let* ((class-or-name (car args))
             (initargs (cdr args))
@@ -8034,6 +8039,18 @@
   "Allocate a new instance of CLASS (a class object or class name).
    All slots are unbound; initforms are NOT applied (per ANSI: that
    happens in initialize-instance, not allocate-instance)."
+  ;; A STRUCTURE-CLASS: a fresh structure of that type, slots NIL
+  ;; (ALLOCATE-INSTANCE.5 got NIL).  Same layout as a constructor's:
+  ;; [%STRUCT-INSTANCE type-name slot...].
+  (let* ((sname (cond ((symbolp class) class)
+                      ((%class-proxy-p class) (%class-proxy-name class))
+                      (t nil)))
+         (sdesc (and sname (%find-struct-type sname))))
+    (when sdesc
+      (let ((obj (make-array (+ 2 (length (aref sdesc 3))))))
+        (aset obj 0 '%struct-instance)
+        (aset obj 1 (aref sdesc 1))
+        (return-from allocate-instance obj))))
   (let ((class-name (cond
                       ((symbolp class) class)
                       ((%clos-class-p class) (aref class 1))

@@ -4672,8 +4672,10 @@
                         ;; Bind a temp for the value to avoid re-evaluation
                         (let ((tmp (%mvm-gensym "DB")))
                           (let ((result (list (list tmp acc))))
+                            ;; &WHOLE may itself be a pattern (CLHS 3.4.5;
+                            ;; DESTRUCTURING-BIND.20)
                             (when whole-var
-                              (setf result (append result (list (list whole-var tmp)))))
+                              (setf result (append result (gen-bindings whole-var tmp))))
                             ;; Walk pattern elements
                             (let ((cur tmp)
                                   (remaining rest-pat)
@@ -8115,7 +8117,11 @@
              ;; stub, and every BY-NAME call to it returned immediately
              ;; with stale VR (probes 9850/9853, dg-mc.N.10/.11 GOT:T).
              (push result *pending-flet-ir*)))
-         (compile-nil dest)))
+         ;; CLHS DEFUN returns the function NAME: (prog1 (defun f ...) x)
+         ;; and (list (defun f ...)) answered NIL (DEFUN.ERROR.4)
+         (if (and *mvm-eval-runtime-p* (or (symbolp raw-name) (consp raw-name)))
+             (compile-form (list 'quote raw-name) env dest)
+             (compile-nil dest))))
       ;; DEFMACRO inside an expression context.  Same fall-through trap
       ;; as nested DEFUN: a `(defmacro foo (x) (list 'quote x))` inside a
       ;; deftest body reached compile-call which treated DEFMACRO as a

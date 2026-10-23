@@ -459,8 +459,21 @@
     ;; %bind-params handles &optional/&rest/&key/&aux AND dotted tails, so
     ;; the apply-lambda trick covers ASDF's `(destructuring-bind (car . cdr)
     ;; form …)' (a dotted macro-style lambda list).
+    ;; A leading &WHOLE binds (or destructures, when it is itself a pattern)
+    ;; the whole value; the rest of the pattern then destructures the same
+    ;; value (DESTRUCTURING-BIND.20).
     "(defmacro destructuring-bind (pattern expr &rest body)
-       (list 'apply (cons 'lambda (cons pattern body)) expr))"
+       (if (and (consp pattern) (symbolp (car pattern))
+                (string= (symbol-name (car pattern)) \"&WHOLE\")
+                (consp (cdr pattern)))
+           (let ((g (gensym \"DBW\")) (w (cadr pattern)))
+             (list 'let (list (list g expr))
+                   (if (symbolp w)
+                       (list 'let (list (list w g))
+                             (cons 'destructuring-bind (cons (cddr pattern) (cons g body))))
+                       (list 'destructuring-bind w g
+                             (cons 'destructuring-bind (cons (cddr pattern) (cons g body)))))))
+           (list 'apply (cons 'lambda (cons pattern body)) expr)))"
 
     ;; DO-SYMBOLS / DO-EXTERNAL-SYMBOLS / DO-ALL-SYMBOLS — package
     ;; iteration.  Mirror compiler.lisp's mvm-define-macro expansions so

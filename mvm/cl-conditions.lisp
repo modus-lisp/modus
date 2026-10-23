@@ -2229,6 +2229,15 @@
 ;;; primary.  All the recursive paths use this cons-returning helper;
 ;;; only the top-level subtypep / subtypep* convert to multi-values.
 
+(defun %nil-vector-type-p (x)
+  "X is (ARRAY NIL d) / (SIMPLE-ARRAY NIL d) / (VECTOR NIL ...) of rank one."
+  (and (consp x) (member (car x) '(array simple-array vector))
+       (consp (cdr x)) (null (cadr x))
+       (if (eq (car x) 'vector)
+           t
+           (let ((d (if (consp (cddr x)) (caddr x) '*)))
+             (or (eql d 1) (and (consp d) (null (cdr d))))))))
+
 (defun %complex-type-spec-p (x)
   (or (eq x 'complex)
       (and (consp x) (eq (car x) 'complex))))
@@ -2266,6 +2275,15 @@
           (or (and (consp (cdr t1)) (null (cadr t1)))
               (and (consp (cdr t1)) (consp (cddr t1)) (null (caddr t1)))))
      (cons t t))
+    ;; A one-dimensional array of element type NIL is a STRING (CLHS
+    ;; STRING: (or (vector character) (vector base-char) (vector nil) ...)),
+    ;; a SIMPLE-STRING when simple, but no BASE-STRING (STRING.8/.9,
+    ;; SIMPLE-STRING.11, BASE-STRING.5, SIMPLE-BASE-STRING.9).
+    ((and (%nil-vector-type-p t1)
+          (member t2 '(string simple-string base-string simple-base-string)))
+     (cond ((eq t2 'string) (cons t t))
+           ((eq t2 'simple-string) (cons (eq (car t1) 'simple-array) t))
+           (t (cons nil t))))
     ;; An integer interval wholly outside the fixnum range is a BIGNUM type:
     ;; TYPE-OF of a positive bignum is (INTEGER 4611686018427387904)
     ;; (TYPE-OF.1).

@@ -5645,6 +5645,12 @@
              (unless off-set (setq off-set t off v)))))
         (setq rest (cddr rest)))
       (when etype-set (setq etype (%element-type-expand etype)))
+      ;; A one-dimensional array of element type NIL holds no element: as in
+      ;; SBCL it is a STRING (NIL is a subtype of CHARACTER), so STRINGP,
+      ;; EQUAL "" and printing as "" hold (STRINGP.9/10, EQUAL.13/14,
+      ;; SXHASH.8, PRINT.STRING.NIL.1).  Stored as a string.
+      (when (and etype-set (null etype) (= rank 1))
+        (setq etype 'character))
       ;; Allocate + fill the flat data vector.
       ;; :element-type 'character / 'base-char → underlying is a string
       ;; (subtag #x31) so STRINGP / string ops work on the result.
@@ -5752,7 +5758,9 @@
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) f32-elt)
            data)
-          ((and (= rank 1) (not (consp dim))
+          ;; '(n) is as one-dimensional as n: a wrapper here was a string
+          ;; SIMPLE-STRING-P refused (MAKE-ARRAY.5A, SIMPLE-STRING.12)
+          ((and (= rank 1)
                 (not fp) (not adj) (not disp) char-elt)
            data)
           ;; Plain 1-D (unsigned-byte 8) vector with no other wrapping —

@@ -864,44 +864,68 @@
 
 ;;; --- Symbol operations ---
 
-(defun %native-mvm-sym-name-lookup (h)
+(defun %native-mvm-sym-name-lookup (h &optional sym)
   "Walk every interned-package symbol table looking for a symbol whose
    slot-0 hash equals H.  Returns the matching name string or NIL.
    Used by SYMBOL-NAME for native-MVM symbols (which carry only a hash,
-   no name slot of their own)."
-  (let ((cur *all-packages*) (found nil))
+   no name slot of their own).  The hash folds case, so an entry whose
+   symbol IS SYM wins over one that merely hashes alike: once :|abc| had
+   an entry, :ABC was answered \"abc\" (KEYWORD-BEHAVIOR)."
+  (let ((cur *all-packages*) (loose nil) (exact nil))
     (loop
-      (when (or (null cur) found) (return found))
+      (when (or (null cur) exact) (return nil))
       (let ((p (car cur)))
         (when (%pkg-p p)
-          ;; Internal table
-          (let ((entries (%pkg-internal p)))
+          (dolist (entries (list (%pkg-internal p) (%pkg-external p)))
             (let ((c2 entries))
               (loop
-                (when (or (null c2) found) (return found))
+                (when (or (null c2) exact) (return nil))
                 (let ((entry (car c2)))
-                  (when (and (consp entry) (stringp (car entry)))
-                    (when (= (compute-name-hash (car entry)) h)
-                      (setq found (car entry)))))
-                (setq c2 (cdr c2)))))
-          ;; External table
-          (unless found
-            (let ((entries (%pkg-external p)))
-              (let ((c2 entries))
-                (loop
-                  (when (or (null c2) found) (return found))
-                  (let ((entry (car c2)))
-                    (when (and (consp entry) (stringp (car entry)))
-                      (when (= (compute-name-hash (car entry)) h)
-                        (setq found (car entry)))))
-                  (setq c2 (cdr c2))))))))
+                  (when (and (consp entry) (stringp (car entry))
+                             (= (compute-name-hash (car entry)) h))
+                    (cond ((and sym (eq (cdr entry) sym)) (setq exact (car entry)))
+                          ;; another KEYWORD's entry names that keyword only
+                          ((and sym (keywordp (cdr entry))) nil)
+                          ((null loose) (setq loose (car entry))))))
+                (setq c2 (cdr c2)))))))
       (setq cur (cdr cur)))
-    found))
+    (or exact loose)))
 
 ;; *sym-name-table* — hash → name string, populated at boot by
 ;; %init-sym-name-auto.  Lets symbol-name recover names for native MVM
 ;; syms (#x50, hash-only) that aren't in any package symbol table.
 (defvar *sym-name-table* nil)
+
+(defun %keyword-key (name-str)
+  "The keyword table key for NAME-STR.  The name hash folds case (the whole
+   compiler relies on that), and the keyword table is keyed by the hash alone,
+   so (intern \"qwerty\" :keyword) answered :QWERTY itself -- and renamed it.
+   A name with a lower-case letter is keyed by the hash of the name with
+   a #\Soh marking each such letter, which no upper-case name can collide
+   with, and that name is recorded for SYMBOL-NAME (DEFPACKAGE.6)."
+  ;; Codes throughout: whatever string representation NAME-STR has (a
+  ;; wrapped base-string's CHAR may hand back the code), the key must not
+  ;; depend on it -- two keys for one name made two :|abc| (KEYWORD-BEHAVIOR).
+  (let ((n (length name-str)) (lower nil) (i 0))
+    (loop
+      (when (>= i n) (return nil))
+      (let ((c (%ensure-char-code (char name-str i))))
+        (when (and (>= c 97) (<= c 122)) (setq lower t)))
+      (setq i (+ i 1)))
+    (if (not lower)
+        (compute-name-hash name-str)
+        (let ((out (make-string-output-stream)) (j 0))
+          (loop
+            (when (>= j n) (return nil))
+            (let ((c (%ensure-char-code (char name-str j))))
+              (when (and (>= c 97) (<= c 122)) (write-char (code-char 1) out))
+              (write-char (code-char c) out))
+            (setq j (+ j 1)))
+          (let ((key (compute-name-hash (get-output-stream-string out))))
+            (when (hash-table-p *sym-name-table*)
+              (setf (gethash key *sym-name-table*) name-str))
+            key)))))
+
 
 (defun symbol-name (sym)
   "Return the name of a symbol as a string. For Modus's integer-valued
@@ -930,7 +954,7 @@
            (t
             ;; Fall back to walking package symtabs (for runtime-interned
             ;; symbols whose name was registered via package machinery).
-            (let ((pn (%native-mvm-sym-name-lookup h)))
+            (let ((pn (%native-mvm-sym-name-lookup h sym)))
               (if pn pn "")))))))
     (t "")))
 
@@ -1110,7 +1134,7 @@
                               ;; external symtab so find-symbol / symbol-name /
                               ;; do-external-symbols still see it.
                               (let ((kw (%intern-keyword
-                                          (compute-name-hash name-str))))
+                                          (%keyword-key name-str))))
                                 (%pkg-set-external pkg
                                   (%symtab-add (%pkg-external pkg) name-str kw))
                                 (list kw :external))

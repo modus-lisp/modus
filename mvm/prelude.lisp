@@ -2054,7 +2054,7 @@
             (let ((e (cdr vec)))
               (when (eq (%ht-hash key strcmp? 255) (%ht-nohash))
                 (%ht-vec-set e 1 (- (%word-aref e 1) 1)))
-              (%ht-vec-set e (+ 2 (+ n n)) (car vec))
+              (%ht-vec-set e (+ 2 (+ n n)) e)
               (%ht-vec-set e (+ 3 (+ n n)) nil)
               (%ht-h-set-count holder (- (%ht-h-count holder) 1))
               (return-from remhash t))
@@ -2169,7 +2169,7 @@
           (loop
             (when (< j 0) (return nil))
             (let ((k (%word-aref e (+ 2 (+ j j)))))
-              (unless (eq k idx)
+              (unless (eq k e)
                 (funcall fn k (%word-aref e (+ 3 (+ j j))))))
             (setq j (- j 1))))
         (let ((cur (car ht)))
@@ -2813,8 +2813,9 @@
 ;;;   dict    = (index . entries)
 ;;;   entries = simple vector, 2 + 2*CAP: [0] = entry slots used, [1] = how many
 ;;;             live keys are OBJECT keys (below), then key/value pairs in
-;;;             INSERTION ORDER.  A free or removed key slot holds the dict's
-;;;             INDEX object, which no key is ever EQ to.
+;;;             INSERTION ORDER.  A free or removed key slot holds the ENTRIES
+;;;             vector itself, which no key is ever EQ to (and which a re-placed
+;;;             index, below, shares).
 ;;;   index   = u8 vector of 2-byte slots (4-byte past 65534 entries), open
 ;;;             addressing, linear probe, <= 3/4 full: 0 = empty, else entry
 ;;;             number + 1.  A removed entry keeps its slot (its key is the
@@ -2828,8 +2829,8 @@
 ;;;
 ;;; OBJECT KEYS of an EQ/EQL table (the ADDRESS INDEX, see %HT-ADDR-CELL) are
 ;;; placed by address.  The table's address cell says the epoch the index was
-;;; placed at; after a collection the next object-key operation re-places the
-;;; index IN PLACE from the entries (which the collector updated), so object
+;;; placed at; after a collection the next object-key operation re-places a
+;;; FRESH index from the entries (which the collector updated), so object
 ;;; keys stay O(1) -- print-circle tables, FPRINT.  Off region 0's thread an
 ;;; object key is found by an EQ scan of the entries and left for the next
 ;;; re-placing.
@@ -2838,13 +2839,12 @@
 ;;; table), whose (K . V) pairs are held outside the table, keep the alist and
 ;;; the classic bucket vector instead.
 ;;;
-;;; Readers without the lock (%HT-GET-RO, fixnum keys) stay safe: an insert
-;;; writes the entry, fences, then fills the slot; a rebuild publishes a whole
-;;; new dict with one store.  Slot bytes are written one at a time, so a racing
+;;; Readers without the lock (%HT-GET-RO, any thread's GETHASH) stay safe: an
+;;; insert writes the entry, fences, then fills the slot; a rebuild, and the
+;;; re-placing after a collection, publish a whole new dict with one store.  Slot bytes are written one at a time, so a racing
 ;;; reader may see a partial entry number: it is bounds-checked and lands on a
 ;;; marker or a non-matching key, i.e. a miss, which the lock would have ordered
-;;; anyway.  (The in-place re-placing is only ever of an EQ/EQL table with
-;;; object keys, never one of the fixnum-keyed tables such readers serve.)
+;;; anyway.
 
 (defun %ht-pinned-p (ht)
   "Are HT's pairs held outside it?  *%HT-PINNED-PAIRS*, and the globals table:
@@ -2897,7 +2897,7 @@
       (%ht-vec-set entries 1 0)
       (loop
         (when (>= i n) (return nil))
-        (%ht-vec-set entries i idx)
+        (%ht-vec-set entries i entries)
         (%ht-vec-set entries (+ i 1) nil)
         (setq i (+ i 2)))
       (cons idx entries))))
@@ -2947,7 +2947,7 @@
                           ;; the general comparison's dispatch
                           ((and strings (stringp k)) (string= k key))
                           (strings nil)
-                          (t (and (not (eq k idx)) (%htd-key= k key strcmp?))))
+                          (t (and (not (eq k entries)) (%htd-key= k key strcmp?))))
                 (return n))))))
       (setq i (logand (+ i 1) mask)))))
 
@@ -2987,7 +2987,7 @@
     (loop
       (when (>= j used) (return nil))
       (let ((k (%word-aref e (+ 2 (+ j j)))))
-        (unless (eq k idx)
+        (unless (eq k e)
           (let ((h (%ht-hash k strcmp? mask)))
             (if (eq h (%ht-nohash))
                 (if addr?
@@ -3000,15 +3000,25 @@
     dict))
 
 (defun %htd-addr-current (ht dict strcmp?)
-  "Make DICT's index current for object keys on this (region 0's) thread: re-place
-   it in place when a collection moved keys since it was placed."
+  "DICT, or the dict that replaces it, current for object keys on this (region
+   0's) thread: when a collection moved keys since the index was placed, a
+   fresh index over the SAME entries is placed and published with one store to
+   the holder.  Clearing the old index in place instead left any other
+   thread's probe of that table an empty index for a moment -- a false miss."
   (let ((cell (%ht-addr-cell ht)))
-    (unless (eql (car cell) (%ht-addr-epoch))
-      (if (eq (%word-aref (cdr dict) 1) 0)
-          (set-car cell (%ht-addr-epoch))   ; no object keys: nothing to move
-          (let* ((idx (car dict)) (n (%prim-array-length idx)) (b 0))
-            (loop (when (>= b n) (return nil)) (%u8-set idx b 0) (setq b (+ b 1)))
-            (%htd-place-all ht dict strcmp?))))))
+    (cond
+      ((eql (car cell) (%ht-addr-epoch)) dict)
+      ((eq (%word-aref (cdr dict) 1) 0)
+       (set-car cell (%ht-addr-epoch))     ; no object keys: nothing to move
+       dict)
+      (t
+       ;; the allocation may collect: the epoch is read by %HTD-PLACE-ALL,
+       ;; which allocates nothing, after it
+       (let ((new (cons (%alloc-u8 (%prim-array-length (car dict))) (cdr dict))))
+         (%htd-place-all ht new strcmp?)
+         (%publish-fence)
+         (%ht-h-set-vec (%ht-bucket-holder ht) new)
+         new)))))
 
 (defun %htd-find (ht dict key strcmp?)
   "Entry number of KEY in DICT, NIL if absent, or %HT-NOHASH for a key the dict
@@ -3021,7 +3031,7 @@
       ((not (eq h (%ht-nohash))) (%htd-probe dict key strcmp? h))
       ((not (%htd-obj-key-p ht key strcmp?)) h)
       ((%ht-addr-ok-p)
-       (%htd-addr-current ht dict strcmp?)
+       (setq dict (%htd-addr-current ht dict strcmp?))
        (if (eql (car (%ht-addr-cell ht)) (%ht-addr-epoch))
            (%htd-probe dict key nil (%ht-addr-hash key (%htd-mask dict)))
            (%htd-scan dict key)))
@@ -3036,7 +3046,7 @@
     (loop
       (when (>= j used) (return nil))
       (let ((k (%word-aref oe (+ 2 (+ j j)))))
-        (unless (eq k oi)
+        (unless (eq k oe)
           (%ht-vec-set ne (+ 2 (+ m m)) k)
           (%ht-vec-set ne (+ 3 (+ m m)) (%word-aref oe (+ 3 (+ j j))))
           (setq m (+ m 1))))
@@ -3118,7 +3128,7 @@
     (loop
       (when (>= j used) (return nil))
       (let ((k (%word-aref e (+ 2 (+ j j)))))
-        (unless (eq k idx)
+        (unless (eq k e)
           (setq alist (cons (cons k (%word-aref e (+ 3 (+ j j)))) alist))
           (setq n (+ n 1))))
       (setq j (+ j 1)))
@@ -3139,7 +3149,7 @@
           (loop
             (when (>= j used) (return (if (car ht) (append (car ht) alist) alist)))
             (let ((k (%word-aref e (+ 2 (+ j j)))))
-              (unless (eq k idx)
+              (unless (eq k e)
                 (setq alist (cons (cons k (%word-aref e (+ 3 (+ j j)))) alist))))
             (setq j (+ j 1))))
         (car ht))))

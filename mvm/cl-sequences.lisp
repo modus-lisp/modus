@@ -1986,7 +1986,7 @@
           (loop
             (when (< j 0) (return nil))
             (let ((k (%word-aref e (+ 2 (+ j j)))))
-              (unless (eq k idx)
+              (unless (eq k e)
                 (funcall fn k (%word-aref e (+ 3 (+ j j))))))
             (setq j (- j 1))))
         (let ((cur (car ht)))

@@ -2341,7 +2341,8 @@
    GC-rooted constant vector) and its linkage cells, and *JIT-SOURCE-LINKS*
    keeps the way back to the source.  A module with any name not native --
    failed, skipped, or replaced since -- is left whole.  Returns
-   (:PRUNED modules :NAMES n :KEPT modules)."
+   (:PRUNED modules :NAMES n :KEPT modules :EVAL-CACHE forms), and drops the
+   eval cache (below)."
   (let ((pruned 0) (nnames 0) (kept 0) (mods nil))
     (when *jit-module-registry*
       (maphash (lambda (k m) k (unless (member m mods :test (function eq)) (setq mods (cons m mods))))
@@ -2359,7 +2360,14 @@
                 (setq *jit-eager-built* (delete bc *jit-eager-built* :test (function eq)))
                 (setq pruned (+ pruned 1) nnames (+ nnames (length names))))
               (setq kept (+ kept 1))))))
-    (list :pruned pruned :names nnames :kept kept)))
+    ;; The eval cache (*MVM-EVAL-CACHE*: source forms -> compiled module) is a
+    ;; compile-speed cache for forms evaluated again; in a saved core it held
+    ;; every top-level form of every library loaded, its bytecode and tables --
+    ;; 0.45 MB of bytecode nothing else referenced on a Zero network core.  It
+    ;; refills itself on demand.
+    (let ((forms (if (hash-table-p *mvm-eval-cache*) (hash-table-count *mvm-eval-cache*) 0)))
+      (setq *mvm-eval-cache* nil)
+      (list :pruned pruned :names nnames :kept kept :eval-cache forms))))
 
 (defun compact-names ()
   "THE OTHER EXPLICIT CLEAN STEP before a save (kiln runs it after JIT-PRUNE):

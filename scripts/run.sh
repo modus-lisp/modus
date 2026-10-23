@@ -76,7 +76,7 @@ repair the legacy :RPI path — so this target is expected to fail at build."
 declare -A SPECIAL=(
   [uefi-repl]="scripts/run-uefi-repl.sh — needs OVMF + mtools + a FAT image"
   [i386-cli]="scripts/run-i386.sh — hosted CLI, runs under qemu-i386-static"
-  [ansi]="scripts/ansi-summary.sh — the 64-shard conformance gate"
+  [ansi]="scripts/ansi-sweep.sh BIN OUTDIR — the upstream suite on a CLI (scripts/acceptance-gate.sh compares two refs)"
 )
 
 row_for() { echo "$TARGETS" | grep -E "^$1\|" || true; }

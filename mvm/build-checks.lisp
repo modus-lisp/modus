@@ -197,22 +197,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
       shipping /home/claude/modus-aa64-cli signals UNBOUND-VARIABLE for
       BOOLE-AND, INTERNAL-TIME-UNITS-PER-SECOND, DOUBLE-FLOAT-EPSILON,
       MOST-POSITIVE-DOUBLE-FLOAT and *RANDOM-STATE*, where the x64 CLI built
-      from the same sources returns 6 / 1000 / 2.22d-16 / ... correctly.")
-    ;; The four ANSI GATE RUNNERS.  Over the size cap, so normally skipped
-    ;; outright; these entries make MODUS_GLOBAL_CHECK=force honest rather
-    ;; than a 57-line wall.  All four share build-ansi-common.lisp's harness
-    ;; and none of them calls INIT-ALL-GLOBALS -- deliberately ("init-all-
-    ;; globals not safe -- some thunks...", build-x64-linux.lisp ~1070) -- so
-    ;; they set what they need by hand instead.
-    ("build-x64-linux" :suppress-check-a
-     "#243 FINDING 3 (unfixed, filed): 57 check-A findings, 0 check-B.
-      MEASURED on this one.  Most are ANSI-corpus scaffolding (*UNIVERSE*,
-      *SEARCHED-LIST*, *MY-CLASSES*) which genuinely does not care, but
-      *MCGC-BITMAP-ENABLED* / *MCGC-COLLECTOR-ENABLED* /
-      *MCGC-KIND-CHECK-ENABLED* are bug 5 from the header list, still live in
-      the gate image, and *%TRIG-PI* / *%UNBOUND-SLOT* / *SETF-EXPANDERS*
-      deserve their own look.")
-    ("build-aarch64"      :suppress-check-a "#243 FINDING 3 — same harness as build-x64-linux (not separately measured)."))
+      from the same sources returns 6 / 1000 / 2.22d-16 / ... correctly."))
   "Alist (build-script-basename . entries) of KNOWN, FILED, UNFIXED findings.")
 
 (defun %gck-baseline-entry (label)
@@ -1039,28 +1024,7 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
   '(("build-generic-cli"
      (:implicit-global . 41)
      (:implicit-global-setq . 123)
-     (:unresolved-function . 40))
-    ;; ANSI GATE RUNNER — bakes the transformed ANSI corpus into the image
-    ;; (CLAUDE.md, "Build taxonomy").  See :CORPUS-IMAGE below for why the
-    ;; non-fatal counts are recorded but not ratcheted.  Measured at 8ca0b6d.
-    ("build-x64-linux"
-     (:corpus-image . t)
-     ;; Was 5 (a stray-comma form x1 + #2A(…) x4).  The four 2-D array
-     ;; literals now COMPILE — compile-form routes any-rank array literals to
-     ;; compile-quote, which already rebuilt them.  Only the stray
-     ;; `,(RANDOM-FROM-SEQ #(…))` remains, i.e. a comma outside any backquote,
-     ;; which is corpus weirdness rather than a Modus gap.  Re-measured here;
-     ;; the other three gate runners share this corpus and should also drop to
-     ;; 1, but their rows stay at 5 until someone actually MEASURES them --
-     ;; a fatal shape only fails when n > base, so a stale-high baseline is
-     ;; merely loose, and a guessed-low one would fail the build for no reason.
-     (:cannot-compile . 1)
-     (:macroexpand-failed . 4)
-     (:implicit-global . 1709)
-     (:implicit-global-setq . 354)
-     (:unresolved-function . 22)
-     (:unknown-go-tag . 5)
-     (:unknown-loop-clause . 1)))
+     (:unresolved-function . 40)))
   "Per-build-script (LABEL . ((SHAPE . COUNT) …)).
 
    A FATAL shape (today only :CANNOT-COMPILE) ratchets at its baseline — 0 when

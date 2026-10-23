@@ -11,7 +11,6 @@
 ;;;;   sbcl --script mvm/build.lisp --list
 ;;;;   sbcl --script mvm/build.lisp x64/bare/qemu/repl
 ;;;;   sbcl --script mvm/build.lisp aarch64/bare/rpi/ssh
-;;;;   sbcl --script mvm/build.lisp x64/hosted/-/ansi
 ;;;;
 ;;;; WHY THIS EXISTS
 ;;;;
@@ -61,8 +60,6 @@
 ;;; writes.  A wrong path here is not cosmetic now that this table is the
 ;;; interface: `run.sh` boots the path this column names.
 ;;;
-;;; One row is PARAMETERISED and the column shows the shape, not a literal:
-;;;   build-*-linux      -> honours MODUS_ANSI_OUT
 ;;; ------------------------------------------------------------------
 (defparameter *matrix*
   '(;; ---------------- hosted (Linux ELF) ----------------
@@ -72,8 +69,6 @@
      :legacy nil :aarch64 "/home/claude/modus-aa64-cli"    "build-aarch64-cli")
     ("i386/hosted/-/cli"      :i386    :hosted :-    :cli
      :legacy nil :i386    "/tmp/modus-i386-cli"            "build-i386-cli")
-    ("x64/hosted/-/ansi"      :x64     :hosted :-    :ansi
-     :legacy nil :x64     "/home/claude/modus/tmp/modus-ansi-test" "build-x64-linux")
     ("x64/hosted/-/selfhost"  :x64     :hosted :-    :selfhost
      :legacy nil :x64     "/tmp/modus-selfhost"            "build-modus-selfhost")
 

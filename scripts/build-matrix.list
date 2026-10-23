@@ -20,8 +20,6 @@ riscv64-cli        | -                                                 | mvm/bui
 x64-selfhost       | MODUS_CLI_OUT=/tmp/modus-selfhost                 | mvm/build-modus-selfhost.lisp
 web                | MODUS_WEB_OUT=/tmp/modus-web MODUS_NO_JIT=1       | mvm/build-web.lisp
 
-# ---- ANSI gate runners (build-ansi-common) ----
-x64-linux-ansi     | MODUS_ANSI_OUT=/tmp/modus-ansi-test               | mvm/build-x64-linux.lisp
 
 # ---- bare-metal CL images (build-cl-repl-common) ----
 x64-cl-repl        | -                                                 | mvm/build-x64-cl-repl.lisp

@@ -176,14 +176,7 @@ Now the harness:
 
 **SUPERSEDED (2026-10-23):** the gate is `scripts/acceptance-gate.sh`, which runs
 the upstream suite on the CLI (`scripts/ansi-sweep.sh BIN OUTDIR`); see "Build
-taxonomy".  The baked runner below is kept only until nothing uses it.
-
-Build: `sbcl --dynamic-space-size 12288 --script mvm/build-x64-linux.lisp`
-(2048 was enough historically; the assembled blob is now ~17.6 MB and 2 GB
-dies with an SBCL HEAP-EXHAUSTED-ERROR partway through BUILD-IMAGE.  Always
-set `MODUS_ANSI_OUT` too — the default path is outside the worktree and two
-concurrent builds overwrite each other.)
-Run with summary: `./scripts/ansi-summary.sh` (runs binary, prints honest pass/fail/lost counts)
+taxonomy".  The baked runner the numbers above were measured with is retired.
 
 ### CL Implementation Status
 
@@ -559,11 +552,11 @@ Two kinds of build:
   that breaks fails the gate), boots the web image, and runs the upstream
   ansi-test suite (pinned, 21,676 tests) on both refs' plain x64 CLI with
   `scripts/ansi-sweep.sh`, comparing pass sets by test name and re-running lost
-  tests to separate flakes.  The four corpus-baking runners it replaced are
-  retired; `build-x64-linux` (+ `mvm/build-ansi-common.lisp`) remains only
-  until nothing uses the baked runner, and bare-metal / aarch64 conformance has
-  no runner until the sweep runs there (the aarch64 CLI under qemu-user is the
-  next candidate).
+  tests to separate flakes.  The four corpus-baking runners it replaced
+  (`build-x64-linux`, `build-x64`, `build-aarch64-linux`, `build-aarch64-ansi`
+  and their `build-ansi-common.lisp`) are retired; bare-metal and aarch64
+  conformance have no runner until the sweep runs there (the aarch64 CLI under
+  qemu-user is the next candidate).
 
 ### QEMU AArch64 (virt machine, E1000)
 ```bash
@@ -3634,7 +3627,7 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 ## MVM Compiler — Source-Quality Guardrails
 
-- **`check-parses` at build time**: Build scripts (`build-x64-linux.lisp`, `build-fixpoint.lisp`, `build-mvm.lisp`) call `modus.mvm::check-parses` on every first-party source file before reading it. A paren mismatch in `%format-impl` once hid behind the lenient in-build reader for weeks, presenting as a fake "late cond branch miscompilation". `check-parses` fails fast with the specific file and error so this can't recur silently. If you write a new build script, wire it into your `mvm-text` wrapper.
+- **`check-parses` at build time**: Every build reads first-party sources through `mvm-text` (lib/load-mvm.lisp), which calls `modus.mvm::check-parses` on the file before reading it. A paren mismatch in `%format-impl` once hid behind the lenient in-build reader for weeks, presenting as a fake "late cond branch miscompilation". `check-parses` fails fast with the specific file and error so this can't recur silently. If you write a new build script, read sources with `mvm-text`.
 - **Never call `CL:GENSYM` in `mvm/compiler.lisp` — use `%MVM-GENSYM`** (task #251).
   The compiler's expanders bake names into the image, so `CL:GENSYM` made the
   emitted binary a function of `CL:*GENSYM-COUNTER*` — i.e. of HOST state, not

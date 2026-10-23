@@ -1141,6 +1141,17 @@
                  (dolist (d (%mda-dims obj) bad)
                    (if (eql d 0) (setq seen0 t) (when seen0 (setq bad t))))))
           (error 'print-not-readable :object obj))
+         ;; #nA reads back as an array of element type T, so a specialized
+         ;; one (other than a bit or character vector, which have their own
+         ;; syntax) is not printable readably (CLHS 22.1.3.8; PRINT.ARRAY.0.8,
+         ;; 0.11, 2.24 read back a (UNSIGNED-BYTE n) / float array as T).
+         ((and *print-readably*
+               (not (eq (array-element-type obj) t))
+               (not (and (= (length (%mda-dims obj)) 1)
+                         (or (%mda-bit-p obj) (stringp obj)
+                             (member (array-element-type obj)
+                                     '(character base-char bit))))))
+          (error 'print-not-readable :object obj))
          (t
           (let ((dims (%mda-dims obj)) (data (%mda-data obj)))
             (cond
@@ -1624,10 +1635,12 @@
          (defn (if (symbolp def) (symbol-name def) "SINGLE-FLOAT")))
     (if (eq (%float-width-class tyn) (%float-width-class defn))
         nil
+        ;; short and long are single and double here, and print with
+        ;; their markers so they read back as the same format (SBCL)
         (cond ((eq ty 'single-float) 102)   ; f
-              ((eq ty 'short-float)  115)   ; s
+              ((eq ty 'short-float)  102)   ; f
               ((eq ty 'double-float) 100)   ; d
-              ((eq ty 'long-float)   108)   ; l
+              ((eq ty 'long-float)   100)   ; d
               (t 100)))))
 
 (defun float-to-string (f)
@@ -3038,9 +3051,21 @@
       (when *format-iter-escape* (setq *format-iter-escape* nil) (return arg-list))
       (when (null arg-list) (return arg-list))
       (when (and (>= max-iter 0) (>= count max-iter)) (return arg-list))
+      ;; Inside a logical block the arguments are the block's list, and
+      ;; under *PRINT-CIRCLE* a shared rest of it is written ". #n#" as
+      ;; PPRINT-POP does (FORMAT.LOGICAL-BLOCK.CIRCLE.2/3).
+      (when (and (> count 0) *%pp-ctx* (consp arg-list)
+                 (%circ-tail-labelled-p arg-list))
+        (write-string ". " stream)
+        (%write-obj arg-list stream nil t)
+        (return nil))
       (let ((new-args (%format-impl stream body arg-list)))
         (when *format-iter-escape* (setq *format-iter-escape* nil) (return new-args))
-        (when (eq new-args arg-list) (return arg-list))
+        ;; no progress -- but a circular list's rest can be the list itself
+        ;; (FORMAT.LOGICAL-BLOCK.CIRCLE.3), which the check above ends
+        (when (and (eq new-args arg-list)
+                   (not (and (consp arg-list) (eq (cdr arg-list) arg-list))))
+          (return arg-list))
         (setq arg-list new-args))
       (setq count (+ count 1)))))
 

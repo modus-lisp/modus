@@ -6490,7 +6490,15 @@
                 ;; meta = (has-key has-rest aok keynames)
                 (when (and meta (or (nth 0 meta) (nth 1 meta)))
                   (error "add-method: lambda lists not congruent (&key/&rest)")))))))
-      (%gf-set-methods gf (cons method (%gf-methods gf))))
+      ;; CLHS ADD-METHOD: a method with the same specializers and
+      ;; qualifiers is REPLACED, not shadowed (ADD-METHOD.2 kept the old
+      ;; one, which dispatch still chose).
+      (let ((q (%method-qualifier method)) (sp (%method-specializers method)) (kept nil))
+        (dolist (m (%gf-methods gf))
+          (unless (and (eq (%method-qualifier m) q)
+                       (equal (%method-specializers m) sp))
+            (setq kept (cons m kept))))
+        (%gf-set-methods gf (cons method (nreverse kept)))))
     orig))
 
 ;;; Generic-function metaobject accessors (AMOP).  The data has always been in
@@ -8758,6 +8766,11 @@
                     stream bit-vector))
        ty)
       ((or (eq ty 'boolean) (eq ty 'keyword)) 'symbol)
+      ;; LONG-FLOAT is DOUBLE-FLOAT's format here and SHORT-FLOAT is
+      ;; SINGLE-FLOAT's (as SBCL): one class each (PRINT.ARRAY.0.11 read a
+      ;; long 0.0 back as a double of another class)
+      ((eq ty 'long-float) 'double-float)
+      ((eq ty 'short-float) 'single-float)
       ((integerp x) 'integer)
       (t (let ((d (%type-of-for-dispatch x)))
            (if (eq d 'boolean) 'symbol d))))))

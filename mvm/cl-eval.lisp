@@ -1244,13 +1244,26 @@
    consults.  Returns MNAME per CLHS.  Dual write, as %RUNTIME-REGISTER-DEFTYPE."
   (%fasl-taint "%runtime-register-compiler-macro")
   (let ((expander (list '%interp-closure params body nil))
-        (key (%macro-sym-key mname)))
+        (key (%cm-name-key mname)))
     (when key
       (unless *compiler-macro-function-table*
         (setq *compiler-macro-function-table* (make-hash-table)))
-      (%compiler-macro-pkg-put mname key expander)
+      (%compiler-macro-pkg-put (%cm-name-sym mname) key expander)
       (puthash key *compiler-macro-function-table* expander))
     mname))
+
+(defun %cm-name-key (name)
+  "The compiler-macro table key of function NAME: a (SETF F) name has one
+   of its own (DEFINE-COMPILER-MACRO.4 registered nothing for it)."
+  (if (and (consp name) (consp (cdr name)) (symbolp (car name))
+           (string= (symbol-name (car name)) "SETF"))
+      (let ((k (%macro-sym-key (cadr name))))
+        (and (stringp k) (concatenate 'string "(SETF " k ")")))
+      (%macro-sym-key name)))
+
+(defun %cm-name-sym (name)
+  "The symbol whose package owns compiler-macro NAME's entry."
+  (if (consp name) (cadr name) name))
 
 (defun %eval-set-global (sym value)
   "Set the global value of SYM in BOTH the eval-only name-string alist
@@ -5759,11 +5772,11 @@
    compiled funcall path (same fix as for macro-function +
    runtime-defmacro)."
   (declare (ignore env))
-  (let ((key (%macro-sym-key name)))
+  (let ((key (%cm-name-key name)))
     ;; NAME's OWN package's compiler macro wins over the bare last-writer
     ;; entry (task #241); the bare entry stays as the fallback for names with
     ;; no resolvable package.
-    (let ((raw (or (%compiler-macro-pkg-get name key)
+    (let ((raw (or (%compiler-macro-pkg-get (%cm-name-sym name) key)
                    (and key *compiler-macro-function-table*
                         (gethash key *compiler-macro-function-table*)))))
       (cond

@@ -2530,12 +2530,25 @@
          ;; Address in r12 — r0 is not a base register (see :obj-ref).
          (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 2 1))
          (ppc-emit-shift-left buf +ppc-scratch2+ pidx +ppc-r0+)
-         (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ pobj)
-         ;; Tag folded into the BASE, so the displacement stays a clean
-         ;; multiple of the word size — ld's DS field cannot hold -1.
-         (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+
-                        (logand (- +tag-object+) #xFFFF))
-         (ppc-emit-load-word buf pd +ppc-scratch2+ ws)
+         (if (= (second operands) +vreg-vfp+)
+             ;; VARIABLE-INDEX FRAME SLOT load: the &rest prologue's loop
+             ;; (emit-rest-prologue) walks frame slots with `aref VFP idx'.  The
+             ;; constant-index VFP case in OBJ-REF addresses frame slots, not an
+             ;; object; without the same arm here the loop read object-formula
+             ;; addresses off the frame pointer, and every &rest call with more
+             ;; than three rest arguments in an image built since adebd4f got a
+             ;; garbage list (x64 and aarch64 had this arm already).
+             ;; Slot N is at r31 + base + N*word (slots grow up here).
+             (progn
+               (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ +ppc-r31+)
+               (ppc-emit-load-word buf pd +ppc-scratch2+ (ppc-frame-slot-base)))
+             (progn
+               (ppc-emit-add buf +ppc-scratch2+ +ppc-scratch2+ pobj)
+               ;; Tag folded into the BASE, so the displacement stays a clean
+               ;; multiple of the word size — ld's DS field cannot hold -1.
+               (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+
+                              (logand (- +tag-object+) #xFFFF))
+               (ppc-emit-load-word buf pd +ppc-scratch2+ ws)))
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 

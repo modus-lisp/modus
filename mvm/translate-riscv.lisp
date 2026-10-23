@@ -2782,11 +2782,24 @@
 
       (#.+op-aref+
        (let* ((vd (vreg 0))
-              (robj (resolve (vreg 1)))
               (ridx (resolve2 (vreg 2))))
-         (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
-         (rv-emit-add buf +rv-t2+ +rv-t2+ robj)
-         (rv-emit-load-word buf +rv-t2+ +rv-t2+ (- (rv-word-size) (rv-object-tag)))
+         (if (= (vreg 1) +vreg-vfp+)
+             (progn
+               ;; VARIABLE-INDEX FRAME SLOT load: the &rest prologue's loop
+               ;; (emit-rest-prologue) walks frame slots with `aref VFP idx'.  The
+               ;; constant-index VFP case in OBJ-REF addresses frame slots, not an
+               ;; object; without the same arm here the loop read object-formula
+               ;; addresses off the frame pointer, and every &rest call with more
+               ;; than three rest arguments in an image built since adebd4f got a
+               ;; garbage list (x64 and aarch64 had this arm already).
+               ;; Slot N is at fp + base - N*word.
+               (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
+               (rv-emit-sub buf +rv-t2+ +rv-fp+ +rv-t2+)
+               (rv-emit-load-word buf +rv-t2+ +rv-t2+ +rv-frame-slot-base+))
+             (let ((robj (resolve (vreg 1))))
+               (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
+               (rv-emit-add buf +rv-t2+ +rv-t2+ robj)
+               (rv-emit-load-word buf +rv-t2+ +rv-t2+ (- (rv-word-size) (rv-object-tag)))))
          (store-result vd +rv-t2+)))
 
       (#.+op-aset+

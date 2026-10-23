@@ -4108,9 +4108,23 @@
            ;; Load Vidx into scratch0, shift left 1 (Vidx*2 = real_idx*4)
            (i386-load-vreg buf +scratch0+ vidx)
            (i386-emit-shl-reg-imm buf +scratch0+ 1)
-           (i386-load-vreg buf +scratch1+ vobj)
-           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ -5)
+           (if (= vobj +vreg-vfp+)
+               ;; VARIABLE-INDEX FRAME SLOT load: the &rest prologue's loop
+               ;; (emit-rest-prologue) walks frame slots with `aref VFP idx'.  The
+               ;; constant-index VFP case in OBJ-REF addresses frame slots, not an
+               ;; object; without the same arm here the loop read object-formula
+               ;; addresses off the frame pointer, and every &rest call with more
+               ;; than three rest arguments in an image built since adebd4f got a
+               ;; garbage list (x64 and aarch64 had this arm already).
+               ;; Slot N is at EBP + base - N*4.
+               (progn
+                 (i386-emit-neg-reg buf +scratch0+)
+                 (i386-emit-add-reg-reg buf +scratch0+ +i386-ebp+)
+                 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ +frame-slot-base+))
+               (progn
+                 (i386-load-vreg buf +scratch1+ vobj)
+                 (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+                 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ -5)))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-aset+)

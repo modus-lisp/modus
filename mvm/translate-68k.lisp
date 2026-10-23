@@ -2315,10 +2315,26 @@
              (vidx (third operands)))
          (m68k-load-vreg buf +68k-d0+ vidx)
          (m68k-emit-lsl-imm buf +68k-d0+ 1)            ; tagged*2 = k*4
-         (m68k-load-vreg buf +68k-d1+ vobj)
-         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)   ; D0 += Vobj
-         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-         (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-object+) +68k-d0+)
+         (if (= vobj +vreg-vfp+)
+             ;; VARIABLE-INDEX FRAME SLOT load: the &rest prologue's loop
+             ;; (emit-rest-prologue) walks frame slots with `aref VFP idx'.  The
+             ;; constant-index VFP case in OBJ-REF addresses frame slots, not an
+             ;; object; without the same arm here the loop read object-formula
+             ;; addresses off the frame pointer, and every &rest call with more
+             ;; than three rest arguments in an image built since adebd4f got a
+             ;; garbage list (x64 and aarch64 had this arm already).
+             ;; Slot N is at A6 + base - N*4.
+             (progn
+               (m68k-emit-neg buf +68k-d0+)                 ; D0 = -k*4
+               (m68k-emit-move-an-dn buf +68k-a6+ +68k-d1+)
+               (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)  ; D0 = A6 - k*4
+               (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+               (m68k-emit-move-disp-dn buf +68k-a0+ +68k-frame-slot-base+ +68k-d0+))
+             (progn
+               (m68k-load-vreg buf +68k-d1+ vobj)
+               (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)   ; D0 += Vobj
+               (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+               (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-object+) +68k-d0+)))
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-aset+

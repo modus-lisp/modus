@@ -1971,12 +1971,29 @@
 ;; win under last-defun-wins and worked the same way for the alist shape,
 ;; but routing through prelude keeps a single point of truth.
 (defun %maphash-impl (fn ht)
-  "Apply FN to each key-value pair in hash table (function version)."
-  (let ((cur (car ht)))
-    (loop (when (null cur) (return nil))
-      (let ((pair (car cur)))
-        (funcall fn (car pair) (cdr pair)))
-      (setq cur (cdr cur)))))
+  "Apply FN to each key-value pair in hash table (function version), newest
+   first.  What the compiler turns a non-lambda MAPHASH into, so it must not
+   call MAPHASH (that recursed until the stack ran out).  Same walk as
+   prelude.lisp MAPHASH: a compact dict's entries, or the alist."
+  (let* ((holder (%ht-bucket-holder ht))
+         (d (and holder (%ht-h-vec holder))))
+    (if (consp d)
+        (let* ((idx (car d)) (e (cdr d)) (j (- (%word-aref e 0) 1)) (cur (car ht)))
+          (loop
+            (when (null cur) (return nil))
+            (let ((pair (car cur))) (funcall fn (car pair) (cdr pair)))
+            (setq cur (cdr cur)))
+          (loop
+            (when (< j 0) (return nil))
+            (let ((k (%word-aref e (+ 2 (+ j j)))))
+              (unless (eq k idx)
+                (funcall fn k (%word-aref e (+ 3 (+ j j))))))
+            (setq j (- j 1))))
+        (let ((cur (car ht)))
+          (loop (when (null cur) (return nil))
+            (let ((pair (car cur)))
+              (funcall fn (car pair) (cdr pair)))
+            (setq cur (cdr cur)))))))
 (defun array-element-type (a)
   "Return the element type the array A is specialized to (CLHS 15.2.13).
    For a native multi-dim/specialized array (MDA) consult its stored

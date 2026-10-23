@@ -5975,8 +5975,8 @@
   (if (eql (hash-table-test a) (hash-table-test b))
       (if (= (hash-table-count a) (hash-table-count b))
           (let ((test (hash-table-test a))
-                (b-pairs (car b))
-                (cur (car a))
+                (b-pairs (%ht-pairs b))
+                (cur (%ht-pairs a))
                 (ok t))
             (loop
               (when (or (not ok) (null cur)) (return ok))

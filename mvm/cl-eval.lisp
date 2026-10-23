@@ -40,7 +40,7 @@
   "Walk SRC hash-table internal alist and mirror each (name-string → fn)
    entry as (name-hash → fn) into *native-sym-function-table*.
    Written without maphash to avoid closure-capture issues."
-  (let ((cur (car src)))
+  (let ((cur (%ht-pairs src)))
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))

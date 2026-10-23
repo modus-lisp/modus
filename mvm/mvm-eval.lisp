@@ -4270,6 +4270,7 @@
   ;; later mvm-eval of the same forms skips the whole compile.  bc is a
   ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
   (when (and %cacheable
+             (not *%mexp-impure*)
              ;; OFF-MAIN, DO NOT CACHE — the tuple below was
              ;; allocated in THIS thread's region during the
              ;; compile, and the cache is region-0-reachable.
@@ -4464,6 +4465,7 @@
         (when (and %hit (%mvm-literals-same-p (nth 6 %hit) forms))
           (%eval-lock-drop-for-run)
           (return-from mvm-eval-forms (%mvm-eval-run-tuple %hit)))))
+  (setq *%mexp-impure* nil)
   (let ((*functions* (make-hash-table :test (quote equal)))
         (*function-table* nil)
         (*constant-table* nil)

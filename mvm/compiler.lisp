@@ -1186,6 +1186,11 @@
     (setf (car *fasl-effects*) (cons (cons kind args) (car *fasl-effects*)))))
 
 (defvar *fasl-taint* nil)
+
+(defvar *%mexp-impure* nil
+  "Set when this compile expanded a runtime macro whose expander closes over
+   a lexical environment: its expansion can depend on state that changes, so
+   EVAL must not cache the compiled form (DEFMACRO.3).")
 (defvar *fasl-taint-who* nil)
 (defvar *fasl-compile-only* nil
   "T while COMPILE-FILE compiles a toplevel form (mvm/fasl.lisp): a form that
@@ -3722,9 +3727,17 @@
                (t
                 (let ((result (handler-case (funcall mf form)
                                 (t (c) (funcall mf form nil)))))
+                  (when (%expander-has-env-p mf) (setq *%mexp-impure* t))
                   (if (eq result form) (cons form nil) (cons result t)))))))
           (t (cons form nil))))
       (cons form nil)))
+
+(defun %expander-has-env-p (mf)
+  "MF, a compiled macro expander, closes over a lexical environment."
+  (and (functionp mf) (not (consp mf)) (not (fixnump mf))
+       (let ((st (obj-subtag mf))) (or (eql st #x51) (eql st #x52)))
+       (%slot-ref mf 1)
+       t))
 
 (defun macroexpand-mvm (form)
   "Fully expand macros in FORM"
@@ -14042,6 +14055,19 @@
                               (push (list '%hb-handler-entry (list 'quote (car b)) (cadr b))
                                     acc)))))
             (cons 'lambda (cons nil (cddr form))))))
+  ;; A DEFMACRO body (and a long DEFSETF's) is compiled as a closure in the
+  ;; enclosing environment: show it to the walkers as one, or a LET variable
+  ;; it reads and something else sets was captured BY VALUE (DEFMACRO.3,
+  ;; DEFSETF.6A).  Its lambda list is dropped: an unneeded box is harmless.
+  (when (and *mvm-eval-runtime-p* (consp form) (symbolp (car form)) (car form)
+             (or (name-eq (car form) "DEFMACRO") (name-eq (car form) "DEFSETF"))
+             (consp (cdr form)) (consp (cddr form)) (listp (caddr form))
+             (or (name-eq (car form) "DEFMACRO") (consp (cdddr form))))
+    (return-from %cfv-macroexpand
+      (list 'function
+            (cons 'lambda (cons nil (if (name-eq (car form) "DEFMACRO")
+                                        (cdddr form)
+                                        (cddddr form)))))))
   (and (consp form)
        (symbolp (car form))
        (car form)
@@ -26509,6 +26535,20 @@
       ;; COMPILE-LET-WITH-SPECIALS sees the very same (special …) the user
       ;; wrote — including any names that are NOT parameters, which it then
       ;; filters out as free declarations.
+      ;; &AUX inits run INSIDE the dynamic binding: they need no nargs, so
+      ;; unlike &optional/&key (see KNOWN RESIDUAL) they can follow it, and
+      ;; a callee in one then sees the parameter's binding (LAMBDA.64).
+      ;; Only when no &aux variable is itself special.
+      (let ((auxp (member '&aux new-params :test (function %sp-name=))))
+        (when (and auxp *mvm-eval-runtime-p*
+                   (notany (lambda (a)
+                             (let ((v (if (consp a) (car a) a)))
+                               (find v pairs :key (function cdr))))
+                           (cdr auxp)))
+          (setq rest (list (list* 'let* (mapcar (lambda (a) (if (consp a) a (list a nil)))
+                                                (cdr auxp))
+                                  (or rest (list nil)))))
+          (setq new-params (ldiff new-params auxp))))
       (cons new-params
             (append
              (when doc (list doc))
@@ -26517,6 +26557,40 @@
                                          pairs))
                            decls
                            (or rest (list nil))))))))))
+
+(defun %wrap-free-specials (params body)
+  "A SPECIAL declaration at the head of a function BODY for a variable that
+   is not one of PARAMS is a free declaration: it covers the body but not
+   the parameters' init forms (CLHS 3.3.4).  The init forms become code at
+   the head of the body later, so the body proper is wrapped now in a
+   LOCALLY carrying those declarations (DEFUN.6/7, LAMBDA.64: the
+   declaration was ignored and the body read the lexical X)."
+  (let ((decls nil) (rest body) (free nil) (pnames nil))
+    (dolist (p params)
+      (cond ((and (symbolp p) p (not (member p lambda-list-keywords))) (push p pnames))
+            ((consp p)
+             (let ((v (car p)))
+               (push (if (consp v) (cadr v) v) pnames)
+               (when (and (consp (cdr p)) (consp (cddr p)) (symbolp (caddr p)))
+                 (push (caddr p) pnames))))))
+    (loop
+      (if (and (consp rest) (consp (car rest)) (symbolp (caar rest))
+               (string= (symbol-name (caar rest)) "DECLARE"))
+          (progn
+            (dolist (spec (cdar rest))
+              (when (and (consp spec) (symbolp (car spec))
+                         (string= (symbol-name (car spec)) "SPECIAL"))
+                (dolist (v (cdr spec))
+                  (when (and (symbolp v) (not (member v pnames)) (not (member v free)))
+                    (push v free)))))
+            (push (car rest) decls)
+            (setq rest (cdr rest)))
+          (return nil)))
+    (if (null free)
+        body
+        (append (nreverse decls)
+                (list (list* 'locally (list 'declare (cons 'special (nreverse free)))
+                             rest))))))
 
 (defun preprocess-params (params body &optional allow-key-transform)
   "Transform a CL parameter list with &optional/&key/&aux into simple
@@ -26572,6 +26646,8 @@
   ;; every call of every such function allocated and filled its docstring
   ;; (GET, 51 characters, was most of its 0.34 us).
   (setq body (%drop-docstring body))
+  (when *mvm-eval-runtime-p*
+    (setq body (%wrap-free-specials params body)))
   (let ((sp (%special-param-rewrite params body)))
     (when sp
       (setq params (car sp))

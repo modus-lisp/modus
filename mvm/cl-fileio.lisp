@@ -1394,6 +1394,7 @@
                    (t (%substring basename 0 last-dot))))
              (tp (cond
                    ((= last-dot -1) nil)
+                   ((= last-dot 0) nil)     ; ".txt" is a NAME (as SBCL)
                    ((= last-dot (- blen 1)) nil)
                    (t (%substring basename (+ last-dot 1) blen))))
              (dir (%split-directory-string dir-str)))
@@ -1499,7 +1500,8 @@
   (cond
     ((stringp x) x)
     ((null x) "")
-    ((streamp x) "")
+    ;; a file stream: the namestring of its pathname (ENOUGH-NAMESTRING.4)
+    ((streamp x) (let ((p (pathname x))) (if (%pathname-obj-p p) (namestring p) "")))
     ((%pathname-obj-p x)
      (let* ((dir (aref x 4))
             (name (aref x 5))
@@ -1790,13 +1792,41 @@
          (setq si star-si))
         (t (return nil))))))
 
+(defun %pm-component-p (c w)
+  "Does pathname component C match wildcard component W?  A missing (NIL) or
+   :WILD W matches anything (CLHS PATHNAME-MATCH-P); a string W may hold * and ?."
+  (cond
+    ((or (null w) (eq w :wild) (eq w :unspecific)) t)
+    ((and (stringp w) (stringp c)) (%glob-match w c))
+    (t (equal c w))))
+
+(defun %pm-directory-p (d w)
+  "Does directory list D match wildcard directory W (:WILD one component,
+   :WILD-INFERIORS any number)?"
+  (cond
+    ((or (null w) (eq w :wild)) t)
+    ((null d) (equal w '(:relative)))
+    ((not (eq (car d) (car w))) nil)
+    (t (%pm-dir-rest (cdr d) (cdr w)))))
+
+(defun %pm-dir-rest (d w)
+  (cond
+    ((null w) (null d))
+    ((eq (car w) :wild-inferiors)
+     (or (%pm-dir-rest d (cdr w))
+         (and d (%pm-dir-rest (cdr d) w))))
+    ((null d) nil)
+    ((%pm-component-p (car d) (car w)) (%pm-dir-rest (cdr d) (cdr w)))
+    (t nil)))
+
 (defun pathname-match-p (path wild)
-  "Return T if PATH matches the glob pattern WILD."
-  (let ((ps (handler-case (namestring path) (t (c) nil)))
-        (ws (handler-case (namestring wild) (t (c) nil))))
-    (cond
-      ((or (null ps) (null ws)) nil)
-      (t (%glob-match ws ps)))))
+  "T if PATH matches WILD, component by component (CLHS 19.2.2.4)."
+  (let ((p (%coerce-to-pathname (if (stringp path) (coerce path 'simple-string) path)))
+        (w (%coerce-to-pathname (if (stringp wild) (coerce wild 'simple-string) wild))))
+    (and (%pm-directory-p (pathname-directory p) (pathname-directory w))
+         (%pm-component-p (pathname-name p) (pathname-name w))
+         (%pm-component-p (pathname-type p) (pathname-type w))
+         t)))
 
 (defun translate-pathname (source from-wild to-wild &rest args)
   "Translate SOURCE matching FROM-WILD using TO-WILD as template.

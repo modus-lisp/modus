@@ -14163,8 +14163,7 @@
        (symbolp (car form))
        (car form)
        (not (%cfv-definition-head-p (car form)))
-       (let ((r (handler-case (macroexpand-1-mvm form)
-                  (t (c) (progn c nil)))))
+       (let ((r (%quiet-macroexpand-1 form)))
          (and (consp r) (cdr r) (car r)))))
 
 (defun %collect-free-vars (form bound env acc)
@@ -17762,6 +17761,20 @@
   (%emit-pop-to-label-depth exit-label)
   (emit-ir :br exit-label))
 
+(defun %quiet-macroexpand-1 (form)
+  "MACROEXPAND-1-MVM of FORM, or NIL if the expander signals: the compiler's
+   speculative expansions.  Under runtime EVAL a HANDLER-CASE barrier hides
+   the signal from the user's HANDLER-BINDs outside the compile -- image
+   HANDLER-CASEs push none, so rt's DO-ENTRY saw the COND expander reject
+   the binding (COND 17) of (LET ((COND 17)) ...) and aborted the test
+   (LET.15, SYMBOL-MACROLET.1)."
+  (if *mvm-eval-runtime-p*
+      (let ((prev (funcall '%hc-barrier-push '(error))))
+        (unwind-protect
+             (handler-case (macroexpand-1-mvm form) (t (c) (progn c nil)))
+          (funcall '%hc-barrier-pop prev)))
+      (handler-case (macroexpand-1-mvm form) (t (c) (progn c nil)))))
+
 (defun %walker-macroexpand (form)
   "Bounded, error-safe full macroexpansion for the escape/unsafe walkers
    (%return-from-escapes-block-p / %block-runtime-catch-unsafe-p).
@@ -17797,7 +17810,7 @@
                       (= h 182681998)   ; UNWIND-PROTECT
                       (= h 44774594))   ; CATCH
               (return cur)))
-          (let ((r (handler-case (macroexpand-1-mvm cur) (t (c) nil))))
+          (let ((r (%quiet-macroexpand-1 cur)))
             (if (and (consp r) (cdr r))
                 (progn (setq cur (car r)) (setq n (+ n 1)))
                 (return cur)))))))

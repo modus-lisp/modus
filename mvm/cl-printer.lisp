@@ -1331,6 +1331,16 @@
       ;; #P"..." with escaping, the namestring without.  Placed just before the
       ;; array clause so no other object pays for the test.
       ((%pathname-obj-p obj)
+       ;; Readably only when the namestring parses back to it (as SBCL: a
+       ;; type with no name, ".txt", reads back as a NAME).
+       (when (and (symbol-value '*print-readably*)
+                  (eq (aref obj 1) 'pathname)
+                  (let ((back (handler-case (parse-namestring (namestring obj))
+                                (error () nil))))
+                    (not (and back
+                              (equal (pathname-name back) (pathname-name obj))
+                              (equal (pathname-type back) (pathname-type obj))))))
+         (error 'print-not-readable :object obj))
        (if escape
            (progn (%print-string-raw "#P" stream)
                   (%write-obj (namestring obj) stream level t))

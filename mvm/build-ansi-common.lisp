@@ -2234,6 +2234,7 @@
                                               ,(if have-prefix prefix nil)
                                               ,(if have-per-line per-line nil))))
                             (catch :%pp-tag
+                              (%pp-maybe-skip)
                               ,@(or body `((write ,lvar :stream ,stream-sym))))
                             (%pprint-lb-end ,stream-sym ,suffix))))
                   nil))))))

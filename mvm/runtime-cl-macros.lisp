@@ -526,13 +526,15 @@
               (sv (gensym \"PPS\"))
               (lv (gensym \"PPL\")))
          `(let ((,sv (%resolve-output-stream ,sym)) (,lv ,obj))
-            (if (%pp-level-exceeded-p)
-                (write-string \"#\" ,sv)
-                (if (not (listp ,lv))
-                    (write ,lv :stream ,sv)
-                    (let ((,sym (%pprint-lb-begin ,sv ,lv ,(getf kw :prefix) ,(getf kw :per-line-prefix))))
-                      (unwind-protect (catch :%pp-tag ,@body)
-                        (%pprint-lb-end ,sym ,(getf kw :suffix))))))
+            (%pprint-lb-twice ,sv ,lv
+              (lambda ()
+                (if (%pp-level-exceeded-p)
+                    (write-string \"#\" ,sv)
+                    (if (not (listp ,lv))
+                        (write ,lv :stream ,sv)
+                        (let ((,sym (%pprint-lb-begin ,sv ,lv ,(getf kw :prefix) ,(getf kw :per-line-prefix))))
+                          (unwind-protect (catch :%pp-tag (%pp-maybe-skip) ,@body)
+                            (%pprint-lb-end ,sym ,(getf kw :suffix))))))))
             nil)))"
 
     "(defmacro pprint-pop () '(%pprint-pop-fn))"

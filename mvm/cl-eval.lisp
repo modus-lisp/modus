@@ -1165,7 +1165,10 @@
           (t (push p out))))
       (setq cur (cdr cur)))))
 
-(defun %runtime-register-deftype (tname params body)
+(defvar *%deftype-closures* nil
+  "Registry entry -> the expander closure compiled where the DEFTYPE was.")
+
+(defun %runtime-register-deftype (tname params body &optional fn)
   "mvm-eval DEFTYPE expansion target (compiler.lisp, *mvm-eval-runtime-p* gated).
    Registers the expander in *%runtime-deftype-table* — the SAME registry
    the tree-walker's DEFTYPE handler (below, in %eval-in-env) writes and
@@ -1184,6 +1187,10 @@
     (when name-str
       (unless *%runtime-deftype-table*
         (setq *%runtime-deftype-table* (make-hash-table :test 'equal)))
+      (when fn
+        (unless (hash-table-p *%deftype-closures*)
+          (setq *%deftype-closures* (make-hash-table :test 'eq)))
+        (puthash entry *%deftype-closures* fn))
       (%deftype-pkg-put tname name-str entry)
       (puthash name-str *%runtime-deftype-table* entry)
       ;; The NAME HASH (slot 0, shared by every symbol of this name) goes in a

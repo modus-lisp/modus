@@ -393,7 +393,14 @@
   (cond
     ((and (or escape readably) (%name-needs-rcase-escape-p name rc))
      (%print-char 124 stream)  ; |
-     (%print-string-raw name stream)
+     ;; | and \ inside the bars take a backslash (the symbol named "|").
+     (let ((len (array-length name)) (i 0))
+       (loop
+         (when (= i len) (return nil))
+         (let ((ch (%prim-aref name i)))
+           (when (or (= ch 124) (= ch 92)) (%print-char 92 stream))
+           (%print-char ch stream))
+         (setq i (+ i 1))))
      (%print-char 124 stream)) ; |
     (t
      (%print-symbol-name-matrix name stream case rc))))
@@ -661,6 +668,39 @@
    (seen more than once, not yet labelled) or its integer label N.  NIL
    otherwise.")
 (defvar *%circ-next* 0)
+(defvar *%circ-scan-mode* nil
+  "True during the first of the two passes an outermost PPRINT-LOGICAL-BLOCK
+   makes under *PRINT-CIRCLE* (as SBCL): output is discarded, and the table
+   records what the block actually reaches -- so *PRINT-LENGTH* decides
+   whether a second reference is printed, hence whether #n= appears
+   (PPRINT-POP.7/8).")
+
+(defun %pprint-lb-twice (sv lv thunk)
+  "Run THUNK (a whole PPRINT-LOGICAL-BLOCK) once to find the shared objects it
+   prints, then again to print, when it starts a *PRINT-CIRCLE* print."
+  (if (and (symbol-value '*print-circle*) (null *%circ-table*)
+           (%circ-labelable-p lv) (not (%pp-level-exceeded-p))
+           (null (%ppx-current sv)))
+      (let ((saved-next *%circ-next*))
+        (unwind-protect
+             (progn
+               (setq *%circ-table* (make-hash-table :test 'eq))
+               (setq *%circ-next* 0)
+               (setq *%circ-scan-mode* t)
+               (funcall thunk)
+               (setq *%circ-scan-mode* nil)
+               (setq *%circ-next* 0)
+               (funcall thunk))
+          (setq *%circ-scan-mode* nil)
+          (setq *%circ-table* nil)
+          (setq *%circ-next* saved-next)))
+      (funcall thunk)))
+
+(defun %pp-maybe-skip ()
+  "Leave a logical block whose object is already labelled (it printed #n#)."
+  (let ((st (car *%pp-ctx*)))
+    (when (and (arrayp st) (eq (aref st 3) :skip))
+      (throw :%pp-tag nil))))
 
 (defun %circ-labelable-p (x)
   "Only what reaches %WRITE-OBJ-1's plain list / vector arms.  Symbols,
@@ -842,6 +882,15 @@
     (return-from %write-obj-0 nil))
   (let ((tbl *%circ-table*))
     (cond
+      ((and tbl *%circ-scan-mode*)
+       ;; first pass: record OBJ and what it reaches; print nothing
+       (if (and (%circ-labelable-p obj)
+                (or (not (symbolp obj))
+                    (and escape (symbol-value '*print-gensym*))))
+           (if (gethash obj tbl)
+               (setf (gethash obj tbl) :shared)
+               (%circ-scan obj tbl 0))
+           (%write-obj-1 obj stream level escape)))
       (tbl
        (if (and (%circ-labelable-p obj)
                 (or (not (symbolp obj))
@@ -2105,13 +2154,21 @@
                         (not (symbol-value '*print-readably*)))
                    (write-string "..." stream)
                    (throw :%pp-tag nil))
+                  ;; first *PRINT-CIRCLE* pass: a rest reached again is shared
+                  ((and *%circ-scan-mode* *%circ-table* (> cnt 0) (consp lst)
+                        (gethash lst *%circ-table*))
+                   (setf (gethash lst *%circ-table*) :shared)
+                   (throw :%pp-tag nil))
                   ;; the rest of the list is a labelled (shared) object:
                   ;; ". #n#" or ". #n=(...)" (CLHS PPRINT-POP; PPRINT-FILL.14)
-                  ((and (> cnt 0) (consp lst) (%circ-tail-labelled-p lst))
+                  ((and (not *%circ-scan-mode*) (> cnt 0) (consp lst)
+                        (%circ-tail-labelled-p lst))
                    (write-string ". " stream)
                    (%write-obj lst stream nil t)
                    (throw :%pp-tag nil))
                   (t
+                   (when (and *%circ-scan-mode* *%circ-table* (> cnt 0) (consp lst))
+                     (setf (gethash lst *%circ-table*) :seen))
                    (aset st 1 (cdr lst))
                    (aset st 2 (+ cnt 1))
                    (car lst)))))))))
@@ -2203,9 +2260,39 @@
       (aset rec 3 0)
       (aset rec 4 (or (%stream-column s) 0))
       (setq *%ppx-stack* (cons rec *%ppx-stack*)))
+    ;; the first *PRINT-CIRCLE* pass lays out into nothing
+    (when (and outer *%circ-scan-mode*)
+      (aset rec 0 (make-string-output-stream)))
     ;; *PRINT-CIRCLE* (CLHS 22.1.3): a block that is not inside a printing
     ;; call starts the scan itself, and a shared block object is written
     ;; with its #n= label (PPRINT-FILL.14, FORMAT.LOGICAL-BLOCK.CIRCLE.3).
+    ;; A block whose object is already labelled prints #n# and nothing else
+    ;; (PPRINT-LOGICAL-BLOCK.17).
+    (let ((skip nil))
+      (when (and *%circ-table* (not outer) (%circ-labelable-p obj))
+        (let ((e (gethash obj *%circ-table*)))
+          (cond
+            (*%circ-scan-mode*
+             (if e
+                 (progn (setf (gethash obj *%circ-table*) :shared) (setq skip t))
+                 (setf (gethash obj *%circ-table*) :seen)))
+            ((integerp e)
+             (let ((out (aref rec 1)))
+               (write-char-to-stream (code-char 35) out)
+               (%print-integer-in-base e 10 out)
+               (write-char-to-stream (code-char 35) out))
+             (setq skip t)))))
+      (when (and outer *%circ-scan-mode* *%circ-table* (%circ-labelable-p obj))
+        (setf (gethash obj *%circ-table*) :seen))
+      (when skip
+        (let ((st (make-array 5)))
+          (aset st 0 (aref rec 1))
+          (aset st 1 obj)
+          (aset st 2 0)
+          (aset st 3 :skip)
+          (aset st 4 nil)
+          (setq *%pp-ctx* (cons st *%pp-ctx*)))
+        (return-from %pp-begin (aref rec 1))))
     (let ((owns nil))
       (when (and (symbol-value '*print-circle*) (null *%circ-table*)
                  (%circ-labelable-p obj))
@@ -2214,7 +2301,8 @@
           (setq owns *%circ-next*)
           (setq *%circ-next* 0)
           (setq *%circ-table* scan)))
-      (when (and *%circ-table* (consp obj) (eq (gethash obj *%circ-table*) :shared))
+      (when (and *%circ-table* (not *%circ-scan-mode*) (consp obj)
+                 (eq (gethash obj *%circ-table*) :shared))
         (let ((n (+ *%circ-next* 1)))
           (setq *%circ-next* n)
           (setf (gethash obj *%circ-table*) n)
@@ -2238,6 +2326,10 @@
 
 (defun %pp-end (cap suffix)
   (%pp-check-string suffix)
+  ;; a skipped block (#n#) recorded no :START
+  (when (and *%pp-ctx* (arrayp (car *%pp-ctx*)) (eq (aref (car *%pp-ctx*) 3) :skip))
+    (setq *%pp-ctx* (cdr *%pp-ctx*))
+    (return-from %pp-end nil))
   (when *%pp-ctx*
     (let ((st (car *%pp-ctx*)))
       ;; this block started the *PRINT-CIRCLE* scan: end it

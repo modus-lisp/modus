@@ -5118,7 +5118,9 @@
          (entry (%deftype-lookup head)))
     (if (null entry)
         nil
-        (let ((tramp (%deftype-expander head entry)))
+        (let ((tramp (let ((c (and (hash-table-p *%deftype-closures*)
+                                   (gethash entry *%deftype-closures*))))
+                       (or c (%deftype-expander head entry)))))
           (if (eq tramp (quote :e2ic-fail))
               (progn (%e2ic-bump-fallback)
                      (error "mvm-eval: deftype expander compile failed (type=~S)"

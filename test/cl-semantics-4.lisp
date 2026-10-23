@@ -116,5 +116,28 @@
                  (prin1-to-string '(nil t)))))
        '("(nil t)" "(Nil T)"))
 
+;;; Batch 10
+(check "| inside a |...| symbol name is escaped"
+       (prin1-to-string (intern "x|y" "CL-USER")) "|x\\|y|")
+(check "* in a namestring is :WILD"
+       (list (pathname-name #p"*") (pathname-directory #p"/a/*/**/b.c"))
+       '(:wild (:absolute "a" :wild :wild-inferiors)))
+(let ((a 1))
+  (deftype cs4-upto (&optional (x a)) (declare (special a)) `(integer 0 ,x)))
+(check "a DEFTYPE default sees its LET, not a special"
+       (let ((a 2)) (declare (special a)) (list (typep 1 'cs4-upto) (typep 2 'cs4-upto)))
+       '(t nil))
+(check "#n= only when the second reference is printed"
+       (let ((*print-pretty* t) (*print-circle* t) (*print-length* 2) (*print-right-margin* 100))
+         (with-output-to-string (os)
+           (let* ((tail (list 1)) (x (list* tail 2 tail)))
+             (pprint-logical-block (os x :prefix "<" :suffix ">")
+               (pprint-exit-if-list-exhausted)
+               (write (pprint-pop) :stream os)
+               (loop (pprint-exit-if-list-exhausted)
+                     (write-char #\Space os)
+                     (write (pprint-pop) :stream os))))))
+       "<(1) 2 ...>")
+
 (format t "~&cl-semantics-4: ~d checks, ~d failed~%" *checks* *fails*)
 (when (and (> *fails* 0) (fboundp (quote sys-exit))) (funcall (quote sys-exit) 1))

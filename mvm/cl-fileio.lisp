@@ -1397,6 +1397,17 @@
                    ((= last-dot (- blen 1)) nil)
                    (t (%substring basename (+ last-dot 1) blen))))
              (dir (%split-directory-string dir-str)))
+        ;; "*" is the WILD component and "**" a WILD-INFERIORS directory
+        ;; (as SBCL; #P"*" read back as name "*", PRINT.PATHNAME.1).
+        (when (equal nm "*") (setq nm :wild))
+        (when (equal tp "*") (setq tp :wild))
+        (when (consp dir)
+          (setq dir (cons (car dir)
+                          (mapcar (lambda (c)
+                                    (cond ((equal c "*") :wild)
+                                          ((equal c "**") :wild-inferiors)
+                                          (t c)))
+                                  (cdr dir)))))
         (%make-pathname-obj nil nil dir nm tp nil)))))
 
 (defun %coerce-to-pathname (x)

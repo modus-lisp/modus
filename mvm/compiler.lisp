@@ -5031,12 +5031,29 @@
     ;; the deftype.7/.8/.16-.18 + documentation.symbol.type.3 flip residue.
     ;; Returns the NAME (identity-preserved via the mvm-eval quote pool, so
     ;; (eq (eval `(deftype ,sym ...)) sym) holds).
+    ;; The expander is also compiled HERE, as a closure, so a DEFTYPE inside a
+    ;; LET sees the LET (DEFTYPE.15: an &OPTIONAL default naming it).  Not for
+    ;; a lambda list with &WHOLE / &ENVIRONMENT, which keep the old path.
     (mvm-define-macro "DEFTYPE"
       (lambda (form)
-        (list '%runtime-register-deftype
-              (list 'quote (cadr form))
-              (list 'quote (caddr form))
-              (list 'quote (cdddr form)))))
+        (let ((name (cadr form))
+              (params (caddr form))
+              (body (cdddr form)))
+          (list* '%runtime-register-deftype
+                 (list 'quote name)
+                 (list 'quote params)
+                 (list 'quote body)
+                 (if (and (listp params)
+                          (notany (lambda (p) (and (symbolp p)
+                                                   (or (name-eq p "&WHOLE")
+                                                       (name-eq p "&ENVIRONMENT"))))
+                                  params))
+                     (multiple-value-bind (decls rest) (%split-body-decls body)
+                       (list `(function
+                               (lambda ,(funcall '%deftype-star-defaults params)
+                                 ,@(remove-if #'stringp decls)
+                                 (block ,name ,@rest)))))
+                     nil)))))
     ;; DEFCONSTANT (RUNTIME / mvm-eval only): mirror the tree-walker's handler —
     ;; evaluate the value and set the global via %eval-set-global (both the
     ;; eval-only alist AND compiled code's hash-keyed store), return the name.

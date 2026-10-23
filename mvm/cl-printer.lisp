@@ -428,7 +428,10 @@
          (gensym *print-gensym*)
          (readably *print-readably*)
          (rt *readtable*)
-         (rc (if (and rt (readtablep rt)) (readtable-case rt) :upcase))
+         ;; *PRINT-READABLY* output must read back under the STANDARD
+         ;; readtable, so its case is the one that counts (as SBCL;
+         ;; PRINT.SYMBOL.RANDOM.*: |a| printed "a" under :DOWNCASE).
+         (rc (if (and rt (readtablep rt) (not readably)) (readtable-case rt) :upcase))
          (cur-pkg *package*))
     ;; Native keyword (subtag #x53): just emit ":NAME" — no package qualifier
     ;; logic.  The CL-symbol path below handles KEYWORD-package CL symbols
@@ -537,7 +540,8 @@
             ;; Package-qualified
             (need-qualifier
              (let ((pkg-name (if (%pkg-p pkg) (package-name pkg) "")))
-               (%print-string-raw pkg-name stream)
+               ;; *PRINT-CASE* applies to the prefix too, unescaped (as SBCL).
+               (%print-symbol-name-matrix pkg-name stream case rc)
                ;; Check if external: use : else ::
                (let ((ext (if (%pkg-p pkg)
                               (let ((s (%pkg-find-sym name pkg)))
@@ -920,18 +924,14 @@
       ;; NIL — honor *print-case*. NIL is a symbol whose name is "NIL";
       ;; under :downcase / :capitalize the printed form must follow.
       ;; (:capitalize on "NIL" → "Nil", which needs per-word handling.)
-      ((null obj)
-       (let ((pcase *print-case*))
-         (cond
-           ((eq pcase :downcase)
-            (%print-char 110 stream) (%print-char 105 stream) (%print-char 108 stream))
-           ((eq pcase :capitalize)
-            (%print-char 78 stream) (%print-char 105 stream) (%print-char 108 stream))
-           (t
-            (%print-char 78 stream) (%print-char 73 stream) (%print-char 76 stream)))))
-      ;; T
-      ((eq obj t)
-       (%print-char (if (eq *print-case* :downcase) 116 84) stream))
+      ;; And the readtable's case: under :INVERT it is "nil" whatever
+      ;; *PRINT-CASE* says (PRINT.CONS.RANDOM.1).
+      ((or (null obj) (eq obj t))
+       (let ((rt *readtable*))
+         (%print-symbol-name-maybe-escape
+          (if obj "T" "NIL") stream *print-case*
+          (if (and rt (readtablep rt) (not preadably)) (readtable-case rt) :upcase)
+          escape preadably)))
       ;; Character
       ((characterp obj)
        (if escape

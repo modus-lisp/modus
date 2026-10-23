@@ -867,13 +867,16 @@
       ;; ...)) -- reached native code as a bare module closure and any call
       ;; of it jumped to a bytecode offset (the upstream REMOVE-RANDOM fault:
       ;; its generator returns its :KEY lambda as the 9th of 11 values).
-      (values-list (if (if mv (> (car mv) 1) nil)
+      ;; Zero values stay zero (DEFGENERIC.5: a method returning (VALUES)).
+      (values-list (if (if mv (eql (car mv) 0) nil)
+                       nil
+                     (if (if mv (> (car mv) 1) nil)
                        (cons r (let ((acc nil))
                                  (dolist (x (cdr mv) (nreverse acc))
                                    (setq acc (cons (%mvm-wrap-escaping-result
                                                     x bc ftab rt lam-offsets)
                                                    acc)))))
-                       (list r))))))
+                       (list r)))))))
 
 ;;; NOTE (retired predicate): there used to be a `%mvm-lambda-offset-p' here,
 ;;; used by %MVM-WRAP-ESCAPING to decide whether a BARE FIXNUM argument

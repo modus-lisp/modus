@@ -1081,6 +1081,57 @@
               (+ 1 (if *mvm-gensym-counter* *mvm-gensym-counter* 0)))
         (make-symbol (format nil "~A%~D" prefix *mvm-gensym-counter*)))))
 
+(defun %ds-closure-initforms (form note)
+  "FORM, a DEFSTRUCT, with each slot initform that is not a constant replaced
+   by a call of the closure in a fresh symbol's value; NOTE receives the form
+   that stores each closure."
+  (let* ((head (cadr form))
+         (sname (if (consp head) (car head) head))
+         (n 0))
+    (list* (car form) head
+           (mapcar
+            (lambda (slot)
+              (let ((init (and (consp slot) (consp (cdr slot)) (cadr slot))))
+                (if (or (not (consp slot)) (not (consp (cdr slot)))
+                        (null init) (eq init t) (keywordp init)
+                        (and (atom init) (not (symbolp init)))
+                        (and (consp init) (symbolp (car init))
+                             (name-eq (car init) "QUOTE"))
+                        ;; already rewritten
+                        (and (consp init) (symbolp (car init))
+                             (name-eq (car init) "FUNCALL")
+                             (consp (cadr init)) (consp (cdr (cadr init)))
+                             (consp (cadr (cadr init)))
+                             (symbolp (cadr (cadr (cadr init))))
+                             (let ((nm (symbol-name (cadr (cadr (cadr init))))))
+                               (and (> (length nm) 8)
+                                    (string= (subseq nm 0 8) "%DSINIT-")))))
+                    slot
+                    (let ((sym (intern (format nil "%DSINIT-~A-~D-~D"
+                                               (symbol-name sname) (incf n)
+                                               (make-compiler-label))
+                                       (or (symbol-package sname) *package*))))
+                      (funcall note `(setf (symbol-value ',sym) (function (lambda () ,init))))
+                      (list* (car slot) `(funcall (symbol-value ',sym)) (cddr slot))))))
+            (cddr form)))))
+
+(defun %defsetf-long-expander (vars store-vars fn)
+  "The setf expander of a long DEFSETF whose body is the closure FN over
+   (VARS... STORE-VARS...): it is called on gensyms and its value is the
+   expansion, wrapped so the place arguments and the value form are evaluated
+   once, left to right."
+  (lambda (place-args value-form)
+    (let* ((var-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) vars))
+           (store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-vars))
+           (expansion (apply fn (append var-gensyms store-gensyms))))
+      (if (cdr store-gensyms)
+          `(let* (,@(mapcar #'list var-gensyms place-args))
+             (multiple-value-bind ,store-gensyms ,value-form
+               ,expansion))
+          `(let* (,@(mapcar #'list var-gensyms place-args)
+                  ,@(mapcar #'list store-gensyms (list value-form)))
+             ,expansion)))))
+
 (defun %eval-expander-runtime (lambda-form)
   "Evaluate LAMBDA-FORM (a `(lambda …)` macro-expander) into a CALLABLE, in
    RUNTIME-eval codegen mode.  Host-side (SBCL build) this is a transparent
@@ -5428,7 +5479,20 @@
                          `(let* (,@(mapcar #'list var-gensyms place-args)
                                  ,@(mapcar #'list store-gensyms (list value-form)))
                             ,expansion))))))
-             `(quote ,accessor)))
+             ;; Under runtime EVAL the body is also compiled where the DEFSETF
+             ;; is, as a closure, and that expander replaces the one above when
+             ;; the form runs: a DEFSETF inside a LET sees the LET's variables
+             ;; (DEFSETF.6A).
+             (if *mvm-eval-runtime-p*
+                 `(progn
+                    (mvm-define-setf-expander
+                     ',accessor
+                     (%defsetf-long-expander
+                      ',vars ',store-vars
+                      (function (lambda ,(append vars store-vars)
+                                  (block ,accessor ,@body)))))
+                    (quote ,accessor))
+                 `(quote ,accessor))))
           ;; Short form: (defsetf accessor setter-fn [doc])
           ((and (consp rest) (symbolp (car rest)))
            (let ((setter-fn (car rest)))
@@ -8261,6 +8325,16 @@
                         (setq %has-type t)))))
          (compile-form (cons 'progn (%ds-typed-expansion form)) env dest)
          (return-from compile-compound))
+       ;; Slot initforms are evaluated in the DEFSTRUCT's lexical
+       ;; environment (STRUCTURE-62): under runtime EVAL each non-constant
+       ;; one becomes a closure made HERE, stored in a symbol the
+       ;; constructor calls.
+       (when *mvm-eval-runtime-p*
+         (let ((sets nil))
+           (let ((new (%ds-closure-initforms form (lambda (f) (push f sets)))))
+             (when sets
+               (compile-form `(progn ,@(nreverse sets) ,new) env dest)
+               (return-from compile-compound)))))
        ;; Queue the returned IR like the nested-DEFUN path above —
        ;; mvm-compile-toplevel returns (:multi-result (info . ir) …) for
        ;; defstruct; dropping it left every nested-defstruct accessor a
@@ -14825,6 +14899,36 @@
             (setq any-captures t)))))
     any-captures))
 
+(defun %flet-names-function-ref-p (tree names)
+  "True if TREE contains a (FUNCTION NAME) with NAME (a symbol) in NAMES.  A
+   coarse textual walk: a false positive only costs the cell transform."
+  (cond ((atom tree) nil)
+        ((and (symbolp (car tree)) (car tree)
+              (string= (symbol-name (car tree)) "FUNCTION") (consp (cdr tree))
+              (symbolp (cadr tree)) (cadr tree)
+              (member (cadr tree) names :test #'name-equal))
+         t)
+        ((and (symbolp (car tree)) (car tree)
+              (or (string= (symbol-name (car tree)) "QUOTE")
+                  (string= (symbol-name (car tree)) "DECLARE")))
+         nil)
+        ;; Lambda lists are not walked: the cell rewrite does not reach a
+        ;; default form there (MISC.190), so such a #'F keeps the plain path.
+        ((and (symbolp (car tree)) (car tree)
+              (string= (symbol-name (car tree)) "LAMBDA") (consp (cdr tree)))
+         (%flet-names-function-ref-p (cddr tree) names))
+        ((and (symbolp (car tree)) (car tree)
+              (or (string= (symbol-name (car tree)) "FLET")
+                  (string= (symbol-name (car tree)) "LABELS")
+                  (string= (symbol-name (car tree)) "MACROLET"))
+              (consp (cdr tree)) (listp (cadr tree)))
+         (or (some (lambda (d) (and (consp d) (consp (cdr d))
+                                    (%flet-names-function-ref-p (cddr d) names)))
+                   (cadr tree))
+             (%flet-names-function-ref-p (cddr tree) names)))
+        (t (or (%flet-names-function-ref-p (car tree) names)
+               (%flet-names-function-ref-p (cdr tree) names)))))
+
 (defun %flet-def-mark-self (def)
   "DEF (name params . body) with BODY wrapped in (%%FLET-SELF name ...), after
    any leading declarations and docstring.  The marker compiles exactly as
@@ -14902,7 +15006,16 @@
   ;; while its car is mutated.
   (when (consp defs)
     (setq defs (mapcar #'%flet-def-mark-self defs)))
-  (when (and (consp defs) (%flet-functions-capture-vars-p defs env))
+  (when (and (consp defs)
+             (or (%flet-functions-capture-vars-p defs env)
+                 ;; mvm-eval: #'F of an in-module local function makes a fresh
+                 ;; closure object at every evaluation, so (EQ #'F #'F) was
+                 ;; false (LABELS.37-40).  The cell transform below turns each
+                 ;; #'F into (CAR cell): one object per FLET/LABELS entry.
+                 (and *mvm-eval-runtime-p*
+                      (%flet-names-function-ref-p
+                       (cons body (mapcar (lambda (d) (if (consp d) (cddr d) nil)) defs))
+                       (mapcar (lambda (d) (if (consp d) (car d) nil)) defs)))))
     (let* ((local-names nil)
            (cell-names  nil)
            (defs-data   nil))

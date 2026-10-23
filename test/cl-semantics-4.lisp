@@ -91,5 +91,30 @@
              (symbol-name (intern "qwerty" "KEYWORD")))
        '(nil "QWERTY" "qwerty"))
 
+;;; Batch 9
+(check "#'F of a local function is one object"
+       (list (labels ((f () 'foo)) (eq #'f #'f))
+             (labels ((f () #'f)) (eq (f) #'f)))
+       '(t t))
+(defun cs4-acc (x) (car x))
+(let ((z 'car))
+  (defsetf cs4-acc (y) (val) `(setf (,z ,y) ,val)))
+(check "a long DEFSETF sees its LET"
+       (let ((x (cons 'a 'b))) (list (setf (cs4-acc x) 'c) x))
+       '(c (c . b)))
+(let ((n 7))
+  (defstruct cs4-st (a n)))
+(check "a DEFSTRUCT initform sees its LET" (cs4-st-a (make-cs4-st)) 7)
+(check "zero values through a function defined in the same form"
+       (progn (eval '(defun cs4-zv () (values))) (multiple-value-list (cs4-zv)))
+       nil)
+(check "readable printing uses the standard readtable case"
+       (let ((*readtable* (copy-readtable nil)))
+         (setf (readtable-case *readtable*) :invert)
+         (list (let ((*print-case* :capitalize)) (prin1-to-string '(nil t)))
+               (let ((*print-case* :capitalize) (*print-readably* t))
+                 (prin1-to-string '(nil t)))))
+       '("(nil t)" "(Nil T)"))
+
 (format t "~&cl-semantics-4: ~d checks, ~d failed~%" *checks* *fails*)
 (when (and (> *fails* 0) (fboundp (quote sys-exit))) (funcall (quote sys-exit) 1))

@@ -1705,7 +1705,7 @@
              (multiple-value-bind (idx npc2) (%ifetch-u64 bc npc)
                (reg-set regs vd (%val->word
                                  (if *e2-const-pool*
-                                     (gethash idx *e2-const-pool*)
+                                     (%e2-const-ref idx)
                                      nil)))
                (setf pc npc2))))
 

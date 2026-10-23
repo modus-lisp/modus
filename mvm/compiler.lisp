@@ -1158,14 +1158,35 @@
   (setq *fasl-taint* (if (integerp *fasl-taint*) (+ *fasl-taint* 1) 1)))
 
 (defun %e2-const-register (value)
-  "Register VALUE in the mvm-eval quote pool; return its index."
+  "Register VALUE in the mvm-eval quote pool; return its index.  The pool is a
+   HOLDER cons whose car is a simple vector, doubled when full: the indices are
+   dense and the pool append-only, and as an EQL hash table each entry cost four
+   conses (64 bytes) -- 1.5 MB of a Zero network core, against 8 bytes a slot.
+   The holder keeps one identity across growth, so a JIT page or retry entry
+   that saved \"its\" pool (%JIT-RETRY-DRAIN swaps it back in) still writes
+   and reads the one live vector."
   (unless *e2-const-pool*
-    (setq *e2-const-pool* (make-hash-table))
+    (setq *e2-const-pool* (cons (make-array 1024 :initial-element nil) nil))
     (setq *e2-const-count* 0))
-  (let ((idx *e2-const-count*))
-    (setf (gethash idx *e2-const-pool*) value)
+  (let* ((idx *e2-const-count*) (holder *e2-const-pool*) (vec (car holder)))
+    (when (>= idx (length vec))
+      (let ((new (make-array (* 2 (length vec)) :initial-element nil)) (i 0))
+        (loop
+          (when (>= i idx) (return nil))
+          (setf (aref new i) (aref vec i))
+          (setq i (+ i 1)))
+        (setq vec new)
+        (setf (car holder) new)))
+    (setf (aref vec idx) value)
     (setq *e2-const-count* (+ idx 1))
     idx))
+
+(defun %e2-const-ref (idx)
+  "Entry IDX of the quote pool, NIL if none."
+  (let ((vec (and (consp *e2-const-pool*) (car *e2-const-pool*))))
+    (if (and vec (integerp idx) (>= idx 0) (< idx (length vec)))
+        (aref vec idx)
+        nil)))
 
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")

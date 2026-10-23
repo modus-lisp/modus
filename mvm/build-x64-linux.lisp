@@ -844,7 +844,7 @@
     (when (>= (car p) 0)
       (let* ((imm-off (car p))
              (idx (cdr p))
-             (obj (if *e2-const-pool* (gethash idx *e2-const-pool*) nil))
+             (obj (if *e2-const-pool* (%e2-const-ref idx) nil))
              ;; obj's actual tagged native word.  Empirically (see DIAG probe): a
              ;; heap object/cons value's native tagged word == (%val->word obj)
              ;; directly — %val->word (SHL 1) maps the runtime value cell to the
@@ -962,9 +962,9 @@
                 (when (> consts-n 0)
                   (let* ((p0 (car cpatches))
                          (idx0 (cdr p0))
-                         (pre (%val->word (gethash idx0 *e2-const-pool*)))
+                         (pre (%val->word (%e2-const-ref idx0)))
                          (ngc (%ws4-s4-force-gc))
-                         (post (%val->word (gethash idx0 *e2-const-pool*))))
+                         (post (%val->word (%e2-const-ref idx0))))
                     (%ws4-s4-patch-consts base cpatches)
                     (let ((jit2 (%jit-call (+ base eoff))))
                       (write-string-serial \"WS4-S4 \") (write-string-serial label)

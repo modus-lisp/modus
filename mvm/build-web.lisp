@@ -292,7 +292,7 @@
         (setq *web-jit-consts* new)))
     (let ((i synced))
       (loop (when (>= i n) (return nil))
-            (aset vec i (gethash i *e2-const-pool*))
+            (aset vec i (%e2-const-ref i))
             (setq i (+ i 1))))
     (setq *web-jit-consts-synced* n)
     (setf (mem-ref #x10000D40 :u64) vec)))

@@ -655,7 +655,7 @@
     ;; site: there is no immediate to bake, the index is carried only so
     ;; %jit-constvec-need can size the vector.  Skip it.
     (when (>= (car p) 0)
-      (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+      (let ((obj (if *e2-const-pool* (%e2-const-ref (cdr p)) nil)))
         (%jit-write-imm64 base (car p) (%val->word obj))))))
 
 (defun %jit-constvec-need (cpatches)
@@ -717,7 +717,7 @@
                ;; through the globals alist, detects recycling for free.
                (intact (or (null *e2-const-count*) (eql *e2-const-count* 0)
                            (and v (> vlen 0)
-                                (eq (aref v 0) (gethash 0 *e2-const-pool*)))))
+                                (eq (aref v 0) (%e2-const-ref 0)))))
                (ok (and v (> vlen mx) intact)))
           (setq *jit-cv-sites* (if *jit-cv-sites* (+ 1 *jit-cv-sites*) 1))
           (when (null *jit-cv-diag*) (setq *jit-cv-diag* 0))
@@ -749,7 +749,7 @@
 ;;; i.e. slot IDX of an ordinary heap ARRAY reachable from a fixed BSS word that
 ;;; the collector scans as a root.  This file owns that array: allocating it,
 ;;; installing it in the BSS word, growing it, and keeping slot I equal to
-;;; (gethash I *e2-const-pool*).
+;;; (%e2-const-ref I).
 ;;;
 ;;; The pool is APPEND-ONLY (%e2-const-register in mvm/compiler.lisp hands out
 ;;; *e2-const-count* and increments; nothing ever rewrites or removes an entry),
@@ -908,7 +908,7 @@
     (let ((k *jit-constvec-hi*))
       (loop
         (when (>= k n) (return nil))
-        (let ((o (if *e2-const-pool* (gethash k *e2-const-pool*) nil)))
+        (let ((o (if *e2-const-pool* (%e2-const-ref k) nil)))
           (let ((dummy (aset (%jit-constvec) k o))) dummy))
         (setq k (+ k 1))))
     (setq *jit-constvec-hi* n)
@@ -926,7 +926,7 @@
     ;; same).  This also covers %jit-entry-for's post-GC re-bake, which calls
     ;; through here with the entry's stored cpatches.
     (when (>= (car p) 0)
-      (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+      (let ((obj (if *e2-const-pool* (%e2-const-ref (cdr p)) nil)))
         (%jit-write-movz-quad base (car p) (%val->word obj))))))
 
 ;; Pool-EXPLICIT patcher variants for the cross-page sweep
@@ -2788,7 +2788,7 @@
     ;;
     ;; The interpreted module is immune for the reason the DEFUN trampolines
     ;; already were: mvm-interpret's op-LI-CONST does
-    ;; `(gethash idx *e2-const-pool*)` at EXECUTION time, so it reads whatever
+    ;; `(%e2-const-ref idx)` at EXECUTION time, so it reads whatever
     ;; the collector has updated the pool to hold.  Measured directly — inside
     ;; ONE lambda body after a collection, an explicit `(gethash idx
     ;; *e2-const-pool*)` returned the live object while the quoted literal

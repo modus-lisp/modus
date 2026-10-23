@@ -1708,7 +1708,7 @@
               (loop
                 (when (null cur) (return r))
                 (let ((e (car cur)))
-                  (when (eq (car e) key) (setq r (cdr (cdr e))) (return r)))
+                  (when (eq (car e) key) (setq r (cdr e)) (return r)))
                 (setq cur (cdr cur))))
             (let ((cur (car ht)))
               (loop
@@ -1753,7 +1753,7 @@
                 (loop
                   (when (null cur) (return nil))
                   (let ((e (car cur)))
-                    (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
+                    (when (eq (car e) key) (setq found-pair e) (return nil)))
                   (setq cur (cdr cur))))
               ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL
               ;; table) falls through to the linear path.
@@ -1806,7 +1806,7 @@
                 (loop
                   (when (null cur) (return nil))
                   (let ((e (car cur)))
-                    (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
+                    (when (eq (car e) key) (setq found-pair e) (return nil)))
                   (setq cur (cdr cur))))
               ;; O(1) bucket path.  :NOHASH key (e.g. a string in an EQ/EQL
               ;; table) falls through to the linear path.
@@ -1847,7 +1847,7 @@
                               (loop
                                 (when (null cur) (return nil))
                                 (let ((e (car cur)))
-                                  (when (eq (car e) key) (setq r (cdr e)) (return nil)))
+                                  (when (eq (car e) key) (setq r e) (return nil)))
                                 (setq cur (cdr cur)))
                               r)
                             (%ht-bucket-find vec key strcmp?)))))
@@ -2289,7 +2289,7 @@
       (setq i (+ i 1)))))
 
 (defun %ht-bucket-find (vec key strcmp?)
-  "Find the (key . pair) entry in VEC's bucket for KEY; returns the alist PAIR,
+  "Find KEY's entry in VEC's bucket -- the alist PAIR itself; returns that PAIR,
    NIL (absent), or :NOHASH (key not bucketable -> caller must use the linear
    alist path).  Bucket entries store the SAME pair cons that lives in the
    table's CAR alist.  HOT PATH: the bucket is read with the leaf %WORD-AREF
@@ -2306,7 +2306,7 @@
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
-                 (when (equalp (car e) key) (return (cdr e))))
+                 (when (equalp (car e) key) (return e)))
                (setq cur (cdr cur))))
             ((and strcmp? (stringp key))
              ;; string-content path
@@ -2314,21 +2314,21 @@
                (when (null cur) (return nil))
                (let ((e (car cur)))
                  (when (let ((ek (car e))) (and (stringp ek) (string= ek key)))
-                   (return (cdr e))))
+                   (return e)))
                (setq cur (cdr cur))))
             ((consp key)
              ;; a list key (EQUAL tables only reach here, see %HT-HASH)
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
-                 (when (equal (car e) key) (return (cdr e))))
+                 (when (equal (car e) key) (return e)))
                (setq cur (cdr cur))))
             (t
              ;; identity path
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
-                 (when (eq (car e) key) (return (cdr e))))
+                 (when (eq (car e) key) (return e)))
                (setq cur (cdr cur)))))))))
 
 (defun %ht-bucket-put (vec key pair strcmp?)
@@ -2337,7 +2337,7 @@
   (let ((h (%ht-hash key strcmp? (- (%prim-array-length vec) 1))))
     (unless (eq h (%ht-nohash))
       (let* ((old (%word-aref vec h))
-             (new-head (cons (cons key pair) old)))
+             (new-head (cons pair old)))
         (%publish-fence)
         (%ht-vec-set vec h new-head))))
   pair)
@@ -2388,10 +2388,10 @@
     (loop
       (when (or (>= n (* 2 cnt)) (>= n 65536)) (return nil))
       (setq n (* n 2)))
-    ;; The rebuild is one allocation burst: the bucket vector and two conses
+    ;; The rebuild is one allocation burst: the bucket vector and one cons
     ;; an entry.  Under the runtime lock that must fit the lock-arena slice
     ;; (%RT-RESERVE, net/hosted-sync.lisp).
-    (%rt-reserve (+ (* n 8) (* cnt 32) 256))
+    (%rt-reserve (+ (* n 8) (* cnt 16) 256))
     (let ((vec (%ht-new-bucket-vec n)) (cur (car ht)) (ok t))
       (loop
         (when (null cur) (return nil))
@@ -3046,7 +3046,7 @@
                       (loop
                         (when (null %gv-cur) (return nil))
                         (let ((%gv-e (car %gv-cur)))
-                          (when (eq (car %gv-e) %gv-key) (return (cdr %gv-e))))
+                          (when (eq (car %gv-e) %gv-key) (return %gv-e)))
                         (setq %gv-cur (cdr %gv-cur))))
                     ;; :NOHASH — not a bucketable key; the alist is the answer
                     (%gv-cell-slow %gv-key %gv-ht))))))))

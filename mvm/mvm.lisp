@@ -582,7 +582,8 @@
 ;; %e2-const-register (defvar init-thunks don't run in-image — CLAUDE.md
 ;; limitation 7).
 (defvar *e2-const-pool* nil
-  "In-image mvm-eval quote pool: hash-table idx -> original quoted value.")
+  "In-image mvm-eval quote pool: a simple vector, idx -> original quoted value
+   (compiler.lisp %E2-CONST-REGISTER / %E2-CONST-REF).")
 (defvar *e2-const-count* 0
   "Next free index in *e2-const-pool*.")
 

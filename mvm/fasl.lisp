@@ -422,7 +422,7 @@
                                 (setq idxs (cons hit idxs))
                                 (setq k (+ k 1)))
                               (%fasl-put-u64 bc2 np (cdr hit)))))))
-                     (let ((consts (mapcar (lambda (p) (gethash (car p) *e2-const-pool*))
+                     (let ((consts (mapcar (lambda (p) (%e2-const-ref (car p)))
                                            (reverse idxs)))
                            (rt nil) (lam nil))
                        (%fasl-check-tree consts)

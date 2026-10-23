@@ -1007,7 +1007,7 @@
        for string literals >= 256 chars (compiler.lisp ~6169), for *static-build-p*
        builds, and by the generic `t` fallback (~6236).
    The baked-immediate path tolerated the second kind by accident:
-   %jit-patch-consts' (gethash idx *e2-const-pool*) missed, and it baked
+   %jit-patch-consts' (%e2-const-ref idx) missed, and it baked
    (%val->word nil) — a WRONG VALUE (NIL) but a well-formed, non-faulting word.
    A vector load of the same index runs off the end of the array and yields an
    arbitrary heap word, which is a crash, not a wrong value.  So the vector is

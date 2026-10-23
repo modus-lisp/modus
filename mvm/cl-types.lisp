@@ -265,26 +265,29 @@
 
 (defun %ksin-f (x)
   "fdlibm __kernel_sin: sin X for |X| <= pi/4."
+  ;; Horner one step per binding: nested, the 32-bit back ends run out of
+  ;; their 12 temporaries (i386/arm32/riscv32 failed to build).
   (let* ((z (%float-mul x x))
          (v (%float-mul z x))
-         (r (%float-add (%dbl #x3F811111 #x1110F8A6)
-             (%float-mul z (%float-add (%dbl #xBF2A01A0 #x19C161D5)
-              (%float-mul z (%float-add (%dbl #x3EC71DE3 #x57B1FE7D)
-               (%float-mul z (%float-add (%dbl #xBE5AE5E6 #x8A2B9CEB)
-                (%float-mul z (%dbl #x3DE5D93A #x5ACFD57C)))))))))))
+         (r1 (%dbl #x3DE5D93A #x5ACFD57C))
+         (r2 (%float-add (%dbl #xBE5AE5E6 #x8A2B9CEB) (%float-mul z r1)))
+         (r3 (%float-add (%dbl #x3EC71DE3 #x57B1FE7D) (%float-mul z r2)))
+         (r4 (%float-add (%dbl #xBF2A01A0 #x19C161D5) (%float-mul z r3)))
+         (r (%float-add (%dbl #x3F811111 #x1110F8A6) (%float-mul z r4))))
     (%float-add x (%float-mul v (%float-add (%dbl #xBFC55555 #x55555549)
                                             (%float-mul z r))))))
 
 (defun %kcos-f (x)
   "fdlibm __kernel_cos: cos X for |X| <= pi/4."
+  ;; Horner one step per binding, as in %KSIN-F.
   (let* ((z (%float-mul x x))
-         (r (%float-mul z
-             (%float-add (%dbl #x3FA55555 #x5555554C)
-              (%float-mul z (%float-add (%dbl #xBF56C16C #x16C15177)
-               (%float-mul z (%float-add (%dbl #x3EFA01A0 #x19CB1590)
-                (%float-mul z (%float-add (%dbl #xBE927E4F #x809C52AD)
-                 (%float-mul z (%float-add (%dbl #x3E21EE9E #xBDB4B1C4)
-                  (%float-mul z (%dbl #xBDA8FAE9 #xBE8838D4)))))))))))))
+         (r1 (%dbl #xBDA8FAE9 #xBE8838D4))
+         (r2 (%float-add (%dbl #x3E21EE9E #xBDB4B1C4) (%float-mul z r1)))
+         (r3 (%float-add (%dbl #xBE927E4F #x809C52AD) (%float-mul z r2)))
+         (r4 (%float-add (%dbl #x3EFA01A0 #x19CB1590) (%float-mul z r3)))
+         (r5 (%float-add (%dbl #xBF56C16C #x16C15177) (%float-mul z r4)))
+         (r6 (%float-add (%dbl #x3FA55555 #x5555554C) (%float-mul z r5)))
+         (r (%float-mul z r6))
          (hz (%float-mul (%dbl #x3FE00000 0) z))
          (w (%float-sub (%f-one) hz)))
     (%float-add w (%float-add (%float-sub (%float-sub (%f-one) w) hz)

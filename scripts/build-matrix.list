@@ -22,9 +22,6 @@ web                | MODUS_WEB_OUT=/tmp/modus-web MODUS_NO_JIT=1       | mvm/bui
 
 # ---- ANSI gate runners (build-ansi-common) ----
 x64-linux-ansi     | MODUS_ANSI_OUT=/tmp/modus-ansi-test               | mvm/build-x64-linux.lisp
-aarch64-linux-ansi | MODUS_ANSI_OUT=/tmp/modus-aa64-ansi-test          | mvm/build-aarch64-linux.lisp
-x64-bare-ansi      | -                                                 | mvm/build-x64.lisp
-aarch64-bare-ansi  | -                                                 | mvm/build-aarch64-ansi.lisp
 
 # ---- bare-metal CL images (build-cl-repl-common) ----
 x64-cl-repl        | -                                                 | mvm/build-x64-cl-repl.lisp

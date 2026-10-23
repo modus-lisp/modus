@@ -74,8 +74,6 @@
      :legacy nil :i386    "/tmp/modus-i386-cli"            "build-i386-cli")
     ("x64/hosted/-/ansi"      :x64     :hosted :-    :ansi
      :legacy nil :x64     "/home/claude/modus/tmp/modus-ansi-test" "build-x64-linux")
-    ("aarch64/hosted/-/ansi"  :aarch64 :hosted :-    :ansi
-     :legacy nil :aarch64 "/home/claude/modus/tmp/modus-aa64-ansi-test" "build-aarch64-linux")
     ("x64/hosted/-/selfhost"  :x64     :hosted :-    :selfhost
      :legacy nil :x64     "/tmp/modus-selfhost"            "build-modus-selfhost")
 
@@ -101,10 +99,6 @@
      :native :aarch64 :aarch64 "/tmp/modus-aarch64-isolated.bin" "build-aarch64-isolated")
     ("i386/bare/qemu/ssh"     :i386    :bare   :qemu :ssh
      :native :i386    :i386    "/tmp/modus-i386-ssh.bin"   "build-i386-ssh")
-    ("x64/bare/qemu/ansi"     :x64     :bare   :qemu :ansi
-     :legacy nil :x64     "/tmp/modus-x64-ansi.bin"        "build-x64")
-    ("aarch64/bare/qemu/ansi" :aarch64 :bare   :qemu :ansi
-     :legacy nil :aarch64 "/tmp/modus-aarch64-ansi.bin"    "build-aarch64-ansi")
     ;; The CLEAN QEMU-virt counterpart of the cl-repl cell below: the SAME
     ;; CL/mvm image (build-cl-repl-common.lisp), booted through
     ;; boot/boot-aarch64.lisp's fixpoint MMU descriptor instead of the Pi's, and

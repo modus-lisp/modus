@@ -1,11 +1,12 @@
 ;;;; build-ansi-common.lisp — shared ANSI CL test-runner harness (x64 + AArch64)
 ;;;;
-;;;; Loaded by all FOUR ANSI gate runners AFTER each sets the target flag
-;;;; *ANSI-TARGET-BARE-METAL* and the arch selector *ANSI-TARGET-ARCH*:
-;;;;   build-x64-linux.lisp      (nil :x64)     — Linux ELF, the 64-shard gate
-;;;;   build-x64.lisp            (t   :x64)     — bare-metal multiboot kernel (QEMU)
-;;;;   build-aarch64-linux.lisp  (nil :aarch64) — Linux AArch64 ELF gate
-;;;;   build-aarch64-ansi.lisp        (t   :aarch64) — bare-metal AArch64 (QEMU virt)
+;;;; Loaded by build-x64-linux.lisp, the last ANSI gate runner, after it
+;;;; sets *ANSI-TARGET-BARE-METAL* (nil) and *ANSI-TARGET-ARCH* (:x64).  Its
+;;;; siblings -- build-x64 (bare x64), build-aarch64-linux and
+;;;; build-aarch64-ansi (bare aarch64) -- were retired 2026-10-23 with the
+;;;; baked gate: scripts/acceptance-gate.sh runs the upstream suite on the CLI.
+;;;; This file and build-x64-linux go once nothing uses the baked runner.
+;;;; The arch/bare-metal branches below are what the four used to share.
 ;;;;
 ;;;; This file holds everything the four share: load the MVM system, read the
 ;;;; first-party + mvm-eval sources, all the build-time transforms (chunking,

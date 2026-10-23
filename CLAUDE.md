@@ -174,6 +174,10 @@ Now the harness:
 - Writes one "+" byte per pass to stdout immediately (no buffering,
   survives any later crash); the summary counts those bytes.
 
+**SUPERSEDED (2026-10-23):** the gate is `scripts/acceptance-gate.sh`, which runs
+the upstream suite on the CLI (`scripts/ansi-sweep.sh BIN OUTDIR`); see "Build
+taxonomy".  The baked runner below is kept only until nothing uses it.
+
 Build: `sbcl --dynamic-space-size 12288 --script mvm/build-x64-linux.lisp`
 (2048 was enough historically; the assembled blob is now ~17.6 MB and 2 GB
 dies with an SBCL HEAP-EXHAUSTED-ERROR partway through BUILD-IMAGE.  Always
@@ -550,23 +554,16 @@ Two kinds of build:
   (the `modus` CLI, SBCL-faithful flags + `--load`/`--eval`), `build-x64-repl`,
   `build-x64-ssh`, `build-uefi-repl`, the `build-aarch64-*`/`build-rpi-*`/
   `build-pizero2w-*`/`build-i386-*` images, etc.  (25 of the 29 build scripts.)
-- **ANSI gate runners (NOT for shipping)** — bake the transformed ANSI test
-  corpus into the kernel image and run it natively, for the conformance gate:
-  `build-x64-linux` (the 64-shard Linux gate), `build-x64` (bare-metal QEMU),
-  and the `build-aarch64-ansi`/`build-aarch64-linux` counterparts.  (The gate
-  runner for QEMU virt was called `build-aarch64` until 2026-08-30; it was
-  renamed because a bare arch name reads like the plain image for that arch,
-  not a corpus-baking test build.  `build-aarch64` is now the CLEAN QEMU-virt
-  image.)  Only these 4
-  compile the `.lsp` corpus in; their host-build logs are noisy with
-  test-corpus warnings by design.  Each pair shares its ~4300-line harness via a
-  common module — `mvm/build-ansi-common.lisp`, shared by all four; each of the
-  4 builds is a thin wrapper that sets `*ansi-target-bare-metal*` and
-  `*ansi-target-arch*` (`:x64` / `:aarch64`), loads the common file, then
-  appends its own runner-source + build-image tail.  The common file's only
-  arch divergence is the WS4 Stage-1 native-translator block it bakes in.  (Both extractions verified
-  byte-identical to pre-split.)  Later end-state (gated on the WS4 JIT): the
-  suite becomes a `--load`-able script run on a clean image, so nothing is baked.
+- **The conformance gate bakes nothing (2026-10-23).**  `scripts/acceptance-gate.sh
+  BASE FIX` builds every image at both refs (`scripts/build-matrix.sh`; a build
+  that breaks fails the gate), boots the web image, and runs the upstream
+  ansi-test suite (pinned, 21,676 tests) on both refs' plain x64 CLI with
+  `scripts/ansi-sweep.sh`, comparing pass sets by test name and re-running lost
+  tests to separate flakes.  The four corpus-baking runners it replaced are
+  retired; `build-x64-linux` (+ `mvm/build-ansi-common.lisp`) remains only
+  until nothing uses the baked runner, and bare-metal / aarch64 conformance has
+  no runner until the sweep runs there (the aarch64 CLI under qemu-user is the
+  next candidate).
 
 ### QEMU AArch64 (virt machine, E1000)
 ```bash

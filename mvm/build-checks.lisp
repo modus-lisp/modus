@@ -212,8 +212,6 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
       *MCGC-KIND-CHECK-ENABLED* are bug 5 from the header list, still live in
       the gate image, and *%TRIG-PI* / *%UNBOUND-SLOT* / *SETF-EXPANDERS*
       deserve their own look.")
-    ("build-x64"          :suppress-check-a "#243 FINDING 3 — same harness as build-x64-linux (not separately measured).")
-    ("build-aarch64-linux" :suppress-check-a "#243 FINDING 3 — same harness as build-x64-linux (not separately measured).")
     ("build-aarch64"      :suppress-check-a "#243 FINDING 3 — same harness as build-x64-linux (not separately measured)."))
   "Alist (build-script-basename . entries) of KNOWN, FILED, UNFIXED findings.")
 
@@ -1061,40 +1059,6 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
      (:implicit-global . 1709)
      (:implicit-global-setq . 354)
      (:unresolved-function . 22)
-     (:unknown-go-tag . 5)
-     (:unknown-loop-clause . 1))
-    ("build-x64"
-     (:corpus-image . t)
-     (:cannot-compile . 5)
-     (:macroexpand-failed . 4)
-     (:implicit-global . 1709)
-     (:implicit-global-setq . 346)
-     (:unresolved-function . 25)
-     (:unknown-go-tag . 5)
-     (:unknown-loop-clause . 1))
-    ;; NOTE: the aarch64 gate runners need a BIGGER HOST heap than the x64 pair
-    ;; — `--dynamic-space-size 4096` dies with SB-KERNEL::HEAP-EXHAUSTED-ERROR
-    ;; partway through BUILD-IMAGE.  Build them with 12288.
-    ("build-aarch64-linux"
-     (:corpus-image . t)
-     (:cannot-compile . 5)
-     (:macroexpand-failed . 4)
-     (:implicit-global . 1715)
-     (:implicit-global-setq . 340)
-     (:unresolved-function . 25)
-     (:unknown-go-tag . 5)
-     (:unknown-loop-clause . 1))
-    ;; The bare-metal QEMU-virt gate runner.  Keyed build-aarch64 until
-    ;; 2026-10-23, though that script was renamed build-aarch64-ansi on
-    ;; 2026-08-30 (build-aarch64 is now the CLEAN virt image): the runner had
-    ;; no row, so its one stray-comma corpus form failed it at baseline 0.
-    ("build-aarch64-ansi"                ; identical histogram to its Linux sibling
-     (:corpus-image . t)
-     (:cannot-compile . 5)
-     (:macroexpand-failed . 4)
-     (:implicit-global . 1715)
-     (:implicit-global-setq . 340)
-     (:unresolved-function . 25)
      (:unknown-go-tag . 5)
      (:unknown-loop-clause . 1)))
   "Per-build-script (LABEL . ((SHAPE . COUNT) …)).

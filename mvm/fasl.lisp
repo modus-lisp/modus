@@ -984,6 +984,21 @@
     (unless found (error "a compiled file's literal object ~D was not created" idx))
     v))
 
+(defun %fasl-toplevel-eval-when (form)
+  "FORM as COMPILE-FILE emits it for LOAD: a toplevel EVAL-WHEN becomes the
+   PROGN of its body (each one processed alike) if :LOAD-TOPLEVEL is a
+   situation, else NIL; other forms, and a PROGN's, unchanged / recursed."
+  (cond
+    ((not (and (consp form) (symbolp (car form)))) form)
+    ((and (string= (symbol-name (car form)) "EVAL-WHEN") (consp (cdr form))
+          (listp (cadr form)))
+     (if (or (member :load-toplevel (cadr form)) (member 'load (cadr form)))
+         (cons 'progn (mapcar (function %fasl-toplevel-eval-when) (cddr form)))
+         nil))
+    ((string= (symbol-name (car form)) "PROGN")
+     (cons 'progn (mapcar (function %fasl-toplevel-eval-when) (cdr form))))
+    (t form)))
+
 (defun %fasl-compile-file (in out)
   "Compile the file IN to a compiled fasl at OUT; T.  NIL (and OUT untouched)
    where this image cannot -- off the main thread, or a build-time compile --
@@ -1001,6 +1016,13 @@
                (when (eq form eof) (return nil))
                (%compile-file-toplevel-effects form)
                (setq *fasl-compile-handled* (%fasl-cf-handled-p form))
+               ;; A toplevel EVAL-WHEN (CLHS 3.2.3.1): its compile-time part
+               ;; ran just above; what LOAD runs is its body when
+               ;; :LOAD-TOPLEVEL is among the situations, else nothing.  Kept
+               ;; whole it was run now for :EXECUTE and replayed as a
+               ;; non-toplevel EVAL-WHEN, which drops :LOAD-TOPLEVEL bodies
+               ;; (EVAL-WHEN.1, LOAD.18).
+               (setq form (%fasl-toplevel-eval-when form))
                (setq *fasl-compile-only* t)
                ;; Literal objects (#.(make-instance ...)) become MAKE-LOAD-FORM
                ;; creation / initialization forms of their own, ahead of FORM.

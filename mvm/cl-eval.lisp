@@ -5244,6 +5244,22 @@
          (*compile-file-truename* in-true)
          (*package* *package*))
     (declare (special *compile-file-pathname* *compile-file-truename*))
+    (let ((warnings-p nil) (failure-p nil)
+          (verbose (getf args :verbose *compile-verbose*)))
+      (when verbose
+        (format t "~&; compiling file ~A~%" (namestring in-true)))
+      ;; WARNINGS-P / FAILURE-P (CLHS COMPILE-FILE): a warning seen while
+      ;; compiling, and one that is not a STYLE-WARNING (COMPILE-FILE.2).
+      (handler-bind ((warning (lambda (c)
+                                (setq warnings-p t)
+                                (unless (typep c 'style-warning) (setq failure-p t)))))
+        (%compile-file-1 in-true out-path))
+      (when verbose
+        (format t "~&; wrote ~A~%" (namestring out-path)))
+      (values (truename out-path) warnings-p failure-p))))
+
+(defun %compile-file-1 (in-true out-path)
+  (progn
     ;; A COMPILED fasl (mvm/fasl.lisp): each form's module, built now, which
     ;; LOAD replays.  Where this image has no FASL machinery (the ANSI gate
     ;; runners do not bake mvm/fasl.lisp) the call answers NIL and the output
@@ -5262,7 +5278,7 @@
               (when (null line) (return nil))
               (write-string line out)
               (terpri out))))))
-    (values (truename out-path) nil nil)))
+    nil))
 
 ;;; Function objects for array accessors the compiler otherwise only
 ;;; inlines, so #'AREF / (FUNCALL 'SVREF ...) / (APPLY #'AREF ...) work.

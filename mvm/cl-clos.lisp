@@ -287,6 +287,9 @@
    At each step, pick the first list's head that doesn't appear in
    the tail of any other list, append to result, remove from heads
    of all lists.  Repeat until all lists are empty."
+  ;; A precedence list names each class once; %BUILTIN-CPL of T is (T T),
+  ;; whose T would sit in its own tail and stop the merge.
+  (setq lists (mapcar (lambda (l) (remove-duplicates l :test #'eq :from-end t)) lists))
   (let ((result nil))
     (loop
       ;; Drop empty lists.
@@ -307,8 +310,11 @@
                 (setq found cand))))
           (setq cur (cdr cur)))
         (when (null found)
-          ;; Inconsistent precedence graph — fall back to first head.
-          (setq found (car (car lists))))
+          ;; Inconsistent precedence graph: no class precedence list exists
+          ;; (CLHS 4.3.5; DEFCLASS.FORWARD-REF.4).  It used to fall back to
+          ;; the first head, silently.
+          (error "Inconsistent class precedence: no class can come next among ~S"
+                 (mapcar #'car lists)))
         (setq result (cons found result))
         ;; Remove found from heads of all lists.
         (setq lists (mapcar (lambda (lst)

@@ -18,7 +18,6 @@ arm32-cli          | -                                                 | mvm/bui
 riscv32-cli        | -                                                 | mvm/build-riscv32-cli.lisp
 riscv64-cli        | -                                                 | mvm/build-riscv64-cli.lisp
 x64-selfhost       | MODUS_CLI_OUT=/tmp/modus-selfhost                 | mvm/build-modus-selfhost.lisp
-x64-generic        | MODUS_GENERIC_OUT=/tmp/modus-generic              | mvm/build-generic.lisp
 web                | MODUS_WEB_OUT=/tmp/modus-web MODUS_NO_JIT=1       | mvm/build-web.lisp
 
 # ---- ANSI gate runners (build-ansi-common) ----
@@ -67,7 +66,3 @@ pizero2w-hdmi      | -                                                 | mvm/bui
 uart-bootloader    | -                                                 | mvm/build-uart-bootloader.lisp
 
 # ---- tools and harnesses ----
-compiler-test      | -                                                 | mvm/build-compiler-test.lisp
-bench-x64          | -                                                 | mvm/build-bench.lisp x64
-fixpoint           | -                                                 | mvm/build-fixpoint.lisp
-mvm                | -                                                 | mvm/build-mvm.lisp

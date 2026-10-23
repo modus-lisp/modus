@@ -198,24 +198,6 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
       BOOLE-AND, INTERNAL-TIME-UNITS-PER-SECOND, DOUBLE-FLOAT-EPSILON,
       MOST-POSITIVE-DOUBLE-FLOAT and *RANDOM-STATE*, where the x64 CLI built
       from the same sources returns 6 / 1000 / 2.22d-16 / ... correctly.")
-    ("build-compiler-test" :suppress-check-a
-     "#243 FINDING 2 (unfixed, filed): the compiler smoke image bakes
-      compiler.lisp but its KERNEL-MAIN never calls (INIT-ALL-GLOBALS), so
-      *OPCODE-TABLE*, *UNRESOLVED-CALLS*, *SETF-EXPANDERS*, *LET-BINDING-LIMIT*
-      etc. are NIL in-image.  Diagnostic build, not shipped.")
-    ("build-mvm" :suppress-check-a
-     "#252: same image family and same root cause as build-compiler-test — the
-      `mvm' cross-compiler command bakes compiler.lisp + the translators into a
-      bare-metal image whose KERNEL-MAIN never calls (INIT-ALL-GLOBALS), so 20
-      compiler-config defvars read NIL: *ARITH-OPS*, *LET-BINDING-LIMIT*,
-      *UNRESOLVED-CALLS*, *SETF-EXPANDERS*, *X64-NATIVE-CODE-OFFSET*,
-      *REGISTERS*, *VREG-NAMES*, the *MCGC-* set, and friends.  NOT NEWLY
-      BROKEN and not a #252 regression: build-mvm.lisp has never been readable
-      by this check before (it died in the READER at line 340 until #252 fixed
-      the string literal), and the script itself already compensates in source
-      — `check-arith-nesting no-op — *arith-ops* defvar isn't initialized on
-      bare metal' is a comment in its own *ADAPTER-SOURCE*.  Filed as its own
-      gate, same as FINDING 2.")
     ;; The four ANSI GATE RUNNERS.  Over the size cap, so normally skipped
     ;; outright; these entries make MODUS_GLOBAL_CHECK=force honest rather
     ;; than a 57-line wall.  All four share build-ansi-common.lisp's harness

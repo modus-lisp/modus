@@ -4,9 +4,8 @@
 ;;;; The file list lives in ONE place, lib/load-mvm.lisp, and this defers to it: the
 ;;;; sources must be LOADed form by form (compiler.lisp uses #.(compute-name-hash ...)
 ;;;; after defining it earlier in the same file), which COMPILE-FILE cannot do.
-;;;; The full build system is invoked via:
-;;;;   sbcl --script mvm/build-fixpoint.lisp
-;;;;   sbcl --script mvm/build-{x64,i386,aarch64,arm32}-{repl,ssh}.lisp
+;;;; Images are built by the scripts in mvm/: `sbcl --script mvm/build.lisp --list`
+;;;; names every one, and scripts/build-matrix.sh builds them all.
 
 (asdf:defsystem :modus
   :description "Modus - bare-metal Lisp OS via MVM"

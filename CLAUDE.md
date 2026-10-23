@@ -360,8 +360,7 @@ ARCH_LADDER_JOBS=16 scripts/arch-ladder-gate.sh
 ```
 
 Boots a real image per (architecture, rung) in QEMU and reads the answer back
-out of guest memory over QMP `pmemsave` — the same extraction
-`run-fixpoint-i386.sh` uses. No UART driver, no interrupt controller, no boot
+out of guest memory over QMP `pmemsave`. No UART driver, no interrupt controller, no boot
 work: just what QEMU needs to load the image and start it. **An architecture
 passes only when every rung returns the right VALUE**; "the image wrote
 something" is not a pass.
@@ -3806,40 +3805,6 @@ If you still suspect layout, the fuzz knob settles it in one build: set
 `MODUS_FUZZ_FUNCALL_NOPS=4`, rebuild, rerun the same range.  Bit-identical
 results ⇒ not layout; go find the semantic bug.  (Do this before, not after,
 spending hours on a "fragility" theory.)
-
-## Fixpoint Build (`mvm/build-fixpoint.lisp`)
-
-The fixpoint build combines source from multiple architectures into a single multi-arch binary.
-It uses an `*override-fns*` dispatch system to select 32-bit vs 64-bit function variants at runtime.
-
-### `*override-fns*` dispatch pitfall
-
-Functions listed in `*override-fns*` get their `defun` names renamed: `c64-*` in text-64 source,
-`c32-*` in text-32 source. A dispatch wrapper checks `(mem-ref #x48006D :u8)` at runtime.
-
-**Critical**: Within text-64, multiple `arch-*.lisp` files define the same function with different
-addresses (e.g., `edit-line-len` in `arch-i386.lisp`, `arch-x86.lisp`, `arch-aarch64.lisp`).
-Since `arch-aarch64.lisp` loads LAST, `c64-edit-line-len` uses AArch64's address (`#x41112800`).
-On x64, this address is past the 1GB identity map → page fault → silent hang.
-
-**Rule**: Any function in `*override-fns*` that uses architecture-specific base addresses
-MUST be overridden in `*fixpoint-extra-source*` with a dynamic version using `(ssh-ipc-base)`.
-Functions already correctly overridden: `write-byte`, `edit-line-len`, `edit-set-line-len`,
-`edit-cursor-pos`, `edit-set-cursor-pos`. Check before adding new address-dependent functions
-to `*override-fns*`.
-
-### Fixpoint SSH test
-
-```bash
-# Build Gen0
-sbcl --script mvm/build-fixpoint.lisp
-
-# Run x64→x64 SSH chain
-./scripts/run-fixpoint-ssh.sh x64 x64
-
-# Test
-echo '(+ 1 2)' | ssh -p 2223 test@localhost   # → = 3
-```
 
 ## Actor System
 

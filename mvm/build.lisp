@@ -61,14 +61,7 @@
 ;;; writes.  A wrong path here is not cosmetic now that this table is the
 ;;; interface: `run.sh` boots the path this column names.
 ;;;
-;;; !! COLLISION: build-generic-cli and build-generic BOTH default to
-;;; /tmp/modus, so x64/hosted/-/cli and x64/hosted/-/generic overwrite each
-;;; other.  The old (wrong) table hid this by claiming /tmp/modus-generic for
-;;; the latter.  build-generic honours MODUS_GENERIC_OUT; set it when you
-;;; need both.  Left as-is rather than silently changing a shipping default.
-;;;
-;;; Two rows are PARAMETERISED and the column shows the shape, not a literal:
-;;;   build-bench        -> /tmp/modus-bench-<target>.bin  (per arch)
+;;; One row is PARAMETERISED and the column shows the shape, not a literal:
 ;;;   build-*-linux      -> honours MODUS_ANSI_OUT
 ;;; ------------------------------------------------------------------
 (defparameter *matrix*
@@ -85,12 +78,6 @@
      :legacy nil :aarch64 "/home/claude/modus/tmp/modus-aa64-ansi-test" "build-aarch64-linux")
     ("x64/hosted/-/selfhost"  :x64     :hosted :-    :selfhost
      :legacy nil :x64     "/tmp/modus-selfhost"            "build-modus-selfhost")
-    ("x64/hosted/-/generic"   :x64     :hosted :-    :generic
-     :legacy nil :x64     "/tmp/modus"                     "build-generic")   ; !! see COLLISION note
-    ("x64/hosted/-/mvm"       :x64     :hosted :-    :mvm
-     :legacy nil :x64     "/tmp/modus-out"                 "build-mvm")
-    ("x64/hosted/-/bench"     :x64     :hosted :-    :bench
-     :legacy nil :x64     "/tmp/modus-bench-<target>.bin"  "build-bench")
 
     ;; ---------------- bare / qemu ----------------
     ;; The four REPL cells are MIGRATED: pure table data, no per-cell code.
@@ -181,11 +168,9 @@
 ;;; reachable so nothing silently disappears, but listed apart.
 (defparameter *outside-matrix*
   '(("arm32/bare/qemu/repl" "build-arm32-repl"  "4th arch — not in the x64/aarch64/i386 matrix")
-    ("multi/fixpoint"       "build-fixpoint"    "BROKEN; superseded by #210 cross-arch fixpoint")
     ("aarch64/bare/rpi/uart-bootloader" "build-uart-bootloader" "deploy tool, not an image")
     ("aarch64/bare/rpi/pizero-hdmi"     "build-pizero2w-hdmi"   "board bring-up variant")
-    ("x64/bare/qemu/console-repl"       "build-x64-console-repl" "second-Lisp variant; #204 retires it")
-    ("x64/hosted/-/compiler-test"       "build-compiler-test"    "test harness, not an image")))
+    ("x64/bare/qemu/console-repl"       "build-x64-console-repl" "second-Lisp variant; #204 retires it")))
 
 (defun row-key (r) (first r))
 (defun row-status (r) (sixth r))

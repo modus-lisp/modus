@@ -6,8 +6,7 @@ stored at a fixed physical address, and the image spins; this reads that
 address back over QMP `pmemsave' and compares it to an expected value.  That
 needs no UART driver, no interrupt controller and no boot work beyond the stub
 each architecture already has — just what QEMU needs to load the image and
-start it.  It is also the repo's own idiom: run-fixpoint-i386.sh extracts each
-generation the same way.
+start it.
 
 Two rules this file exists to enforce, both learned the hard way:
 

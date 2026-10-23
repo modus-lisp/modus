@@ -1,0 +1,73 @@
+# Every image the tree can build, for scripts/build-matrix.sh.
+#
+# One line per build:   NAME | ENV | SCRIPT AND ARGS
+# ENV is a space-separated list of VAR=VALUE (or "-" for none).  Each build
+# runs with a PRIVATE /tmp, so scripts that write fixed /tmp paths cannot
+# collide; scripts whose default output is outside /tmp get a knob here
+# pointing back into it.  Everything the build leaves in its /tmp is the
+# build's output, and is what build-matrix-compare.sh compares.
+#
+# Add a line when you add a build or a variant someone depends on.
+
+# ---- hosted CLIs (build-cli-common) ----
+x64-cli            | MODUS_CLI_OUT=/tmp/modus                          | mvm/build-generic-cli.lisp
+x64-cli-narrow     | MODUS_CLI_OUT=/tmp/modus MODUS_NARROW_STRINGS=1   | mvm/build-generic-cli.lisp
+aarch64-cli        | MODUS_CLI_OUT=/tmp/modus-aa64-cli                 | mvm/build-aarch64-cli.lisp
+i386-cli           | -                                                 | mvm/build-i386-cli.lisp
+arm32-cli          | -                                                 | mvm/build-arm32-cli.lisp
+riscv32-cli        | -                                                 | mvm/build-riscv32-cli.lisp
+riscv64-cli        | -                                                 | mvm/build-riscv64-cli.lisp
+x64-selfhost       | MODUS_CLI_OUT=/tmp/modus-selfhost                 | mvm/build-modus-selfhost.lisp
+x64-generic        | MODUS_GENERIC_OUT=/tmp/modus-generic              | mvm/build-generic.lisp
+web                | MODUS_WEB_OUT=/tmp/modus-web MODUS_NO_JIT=1       | mvm/build-web.lisp
+
+# ---- ANSI gate runners (build-ansi-common) ----
+x64-linux-ansi     | MODUS_ANSI_OUT=/tmp/modus-ansi-test               | mvm/build-x64-linux.lisp
+aarch64-linux-ansi | MODUS_ANSI_OUT=/tmp/modus-aa64-ansi-test          | mvm/build-aarch64-linux.lisp
+x64-bare-ansi      | -                                                 | mvm/build-x64.lisp
+aarch64-bare-ansi  | -                                                 | mvm/build-aarch64-ansi.lisp
+
+# ---- bare-metal CL images (build-cl-repl-common) ----
+x64-cl-repl        | -                                                 | mvm/build-x64-cl-repl.lisp
+i386-cl-repl       | -                                                 | mvm/build-i386-cl-repl.lisp
+uefi-cl-repl       | -                                                 | mvm/build-uefi-cl-repl.lisp
+aarch64-virt       | -                                                 | mvm/build-aarch64.lisp
+rpi-cl-repl        | -                                                 | mvm/build-rpi-cl-repl.lisp
+rpi-cl-repl-board  | MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1 | mvm/build-rpi-cl-repl.lisp
+
+# ---- hosted ladder ports (take a source file) ----
+68k-linux          | -                                                 | mvm/build-68k-linux.lisp test/arch-rungs/r08-cons.lisp
+arm32-linux        | -                                                 | mvm/build-arm32-linux.lisp test/arch-rungs/r08-cons.lisp
+ppc32-linux        | -                                                 | mvm/build-ppc32-linux.lisp test/arch-rungs/r08-cons.lisp
+ppc64-linux        | -                                                 | mvm/build-ppc64-linux.lisp test/arch-rungs/r08-cons.lisp
+riscv-linux        | -                                                 | mvm/build-riscv-linux.lisp test/arch-rungs/r08-cons.lisp
+riscv32-linux      | -                                                 | mvm/build-riscv32-linux.lisp test/arch-rungs/r08-cons.lisp
+
+# ---- mini-Lisp (repl-source) images: build.lisp native cells ----
+x64-repl           | -                                                 | mvm/build.lisp x64/bare/qemu/repl
+aarch64-repl       | -                                                 | mvm/build.lisp aarch64/bare/qemu/repl
+rpi-repl           | -                                                 | mvm/build.lisp aarch64/bare/rpi/repl
+x64-ssh            | -                                                 | mvm/build.lisp x64/bare/qemu/ssh
+aarch64-ssh        | -                                                 | mvm/build.lisp aarch64/bare/qemu/ssh
+aarch64-actors     | -                                                 | mvm/build.lisp aarch64/bare/qemu/actors
+aarch64-isolated   | -                                                 | mvm/build.lisp aarch64/bare/qemu/isolated
+i386-ssh           | -                                                 | mvm/build.lisp i386/bare/qemu/ssh
+
+# ---- mini-Lisp images: standalone scripts ----
+i386-repl          | -                                                 | mvm/build-i386-repl.lisp
+arm32-repl         | -                                                 | mvm/build-arm32-repl.lisp
+uefi-repl          | -                                                 | mvm/build-uefi-repl.lisp
+x64-console-repl   | -                                                 | mvm/build-x64-console-repl.lisp
+rpi-ssh            | -                                                 | mvm/build-rpi-ssh.lisp
+rpi-hid            | -                                                 | mvm/build-rpi-hid.lisp
+rpi-periph         | -                                                 | mvm/build-rpi-periph.lisp
+pizero2w-ssh       | -                                                 | mvm/build-pizero2w-ssh.lisp
+pizero2w-actors    | -                                                 | mvm/build-pizero2w-actors.lisp
+pizero2w-hdmi      | -                                                 | mvm/build-pizero2w-hdmi.lisp
+uart-bootloader    | -                                                 | mvm/build-uart-bootloader.lisp
+
+# ---- tools and harnesses ----
+compiler-test      | -                                                 | mvm/build-compiler-test.lisp
+bench-x64          | -                                                 | mvm/build-bench.lisp x64
+fixpoint           | -                                                 | mvm/build-fixpoint.lisp
+mvm                | -                                                 | mvm/build-mvm.lisp

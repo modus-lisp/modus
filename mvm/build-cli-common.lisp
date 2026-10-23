@@ -140,19 +140,6 @@
 ;;; 2. Read source files as text (SBCL-side)
 ;;; ============================================================
 
-(defun read-file-text (path)
-  (with-open-file (s path :direction :input)
-    (let ((text (make-string (file-length s))))
-      (subseq text 0 (read-sequence text s)))))
-
-(defun mvm-text (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (modus.mvm::check-parses path)
-    ;; #211: wrap each file so its own (in-package …) cannot leak into the
-    ;; next file of the concatenated build blob.  See
-    ;; modus.mvm::*build-package-reset-text*.
-    (modus.mvm::%build-package-scoped-source (read-file-text path))))
-
 ;; Strip `chipz::' / `chipz:' package qualifiers from a source string so the
 ;; flat-namespace image reader doesn't error `Package CHIPZ does not exist'
 ;; (which would silently drop the whole enclosing form).  Longer prefix first.

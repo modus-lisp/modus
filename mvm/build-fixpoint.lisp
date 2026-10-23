@@ -35,25 +35,6 @@
 ;;; Read all fixpoint source files
 ;;; ============================================================
 
-(defun read-file-text (path)
-  "Read entire file as a string."
-  (with-open-file (s path :direction :input)
-    (let ((text (make-string (file-length s))))
-      (let ((n (read-sequence text s)))
-        (subseq text 0 n)))))
-
-(defun mvm-text (relative-path)
-  "Read a file relative to *modus-base* as text, parse-checking it first.
-   A missing close paren in %format-impl once hid behind the lenient
-   mid-build reader for weeks — see ansi-notes.md: SOLVED:
-   late-cond-branch."
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (modus.mvm::check-parses path)
-    ;; #211: wrap each file so its own (in-package …) cannot leak into the
-    ;; next file of the concatenated build blob.  See
-    ;; modus.mvm::*build-package-reset-text*.
-    (modus.mvm::%build-package-scoped-source (read-file-text path))))
-
 (format t "Collecting fixpoint source...~%")
 
 ;;; The fixpoint source includes:

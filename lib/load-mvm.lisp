@@ -118,3 +118,25 @@
     (format t ";; MODUS_GVCACHE_MODE=~A~%" md)))
 
 )  ; end with-compilation-unit
+
+;;; ------------------------------------------------------------------
+;;; Source-text helpers every build script uses.  Each script used to carry
+;;; its own copy (eighteen of READ-FILE-TEXT, six of MVM-TEXT, all the same
+;;; function).
+;;; ------------------------------------------------------------------
+
+(defun read-file-text (path)
+  "Read entire file as a string."
+  (with-open-file (s path :direction :input)
+    (let ((text (make-string (file-length s))))
+      (subseq text 0 (read-sequence text s)))))
+
+(defun mvm-text (relative-path)
+  "Read a first-party source file (relative to *MODUS-BASE*) as text,
+   parse-checking it first: a missing close paren in %format-impl once hid
+   behind the lenient mid-build reader for weeks.  The text is wrapped so
+   its own (in-package ...) cannot leak into the next file of the
+   concatenated build blob (#211, modus.mvm::*build-package-reset-text*)."
+  (let ((path (merge-pathnames relative-path *modus-base*)))
+    (modus.mvm::check-parses path)
+    (modus.mvm::%build-package-scoped-source (read-file-text path))))

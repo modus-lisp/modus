@@ -310,13 +310,6 @@
 ;;; byte-identical image — see GATE-RESULT-ssh-cells.md.
 ;;; ------------------------------------------------------------------
 
-(defun read-file-text (path)
-  "Read entire file as a string."
-  (with-open-file (s path :direction :input)
-    (let ((text (make-string (file-length s))))
-      (let ((n (read-sequence text s)))
-        (subseq text 0 n)))))
-
 (defparameter *x64-ssh-main*
   '(
                          ;; Fix ssh-receive-version: (when 0 ...) is truthy on x64 (nil=0xDEAD0001)

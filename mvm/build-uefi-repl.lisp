@@ -12,13 +12,6 @@
                        (directory-namestring (truename *load-truename*))))
 (mvm-load "mvm/repl-source.lisp")
 
-(defun read-file-text (path)
-  "Read entire file as a string."
-  (with-open-file (s path :direction :input)
-    (let ((text (make-string (file-length s))))
-      (let ((n (read-sequence text s)))
-        (subseq text 0 n)))))
-
 (defvar *console-source*
   (read-file-text (merge-pathnames "net/uefi-console.lisp" *modus-base*)))
 

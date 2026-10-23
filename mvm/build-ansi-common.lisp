@@ -47,22 +47,6 @@
 ;;; 2. Read source files (SBCL-side)
 ;;; ============================================================
 
-(defun read-file-text (path)
-  (with-open-file (s path :direction :input)
-    (let ((text (make-string (file-length s))))
-      (subseq text 0 (read-sequence text s)))))
-
-(defun mvm-text (relative-path)
-  "Read a first-party source file as text, verifying it parses cleanly
-   first. A paren mismatch here fails fast at the specific file instead
-   of getting silently skipped later during the concatenated compile."
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (modus.mvm::check-parses path)
-    ;; #211: wrap each file so its own (in-package …) cannot leak into the
-    ;; next file of the concatenated build blob.  See
-    ;; modus.mvm::*build-package-reset-text*.
-    (modus.mvm::%build-package-scoped-source (read-file-text path))))
-
 (defvar *prelude-source* (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*      (mvm-text "mvm/gc.lisp"))
 ;; MCGC stage-4d pin API.  Bare metal has no mmap page pool, so it is always

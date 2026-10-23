@@ -1102,7 +1102,11 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
      (:unresolved-function . 25)
      (:unknown-go-tag . 5)
      (:unknown-loop-clause . 1))
-    ("build-aarch64"                     ; identical histogram to its Linux sibling
+    ;; The bare-metal QEMU-virt gate runner.  Keyed build-aarch64 until
+    ;; 2026-10-23, though that script was renamed build-aarch64-ansi on
+    ;; 2026-08-30 (build-aarch64 is now the CLEAN virt image): the runner had
+    ;; no row, so its one stray-comma corpus form failed it at baseline 0.
+    ("build-aarch64-ansi"                ; identical histogram to its Linux sibling
      (:corpus-image . t)
      (:cannot-compile . 5)
      (:macroexpand-failed . 4)

@@ -140,31 +140,15 @@
               (*cl-repl-x64-p*  "x86-64 QEMU-pc")
               (t "RPi 3B")))
 
-;;; Source readers.  Deliberately %RPI--prefixed rather than reusing
-;;; build-cli-common's READ-FILE-TEXT / MVM-TEXT: those do not exist yet (this
-;;; file runs first) and defining them under the same names would have them
-;;; redefined out from under us when that file loads.  (The names are host-side
-;;; only — nothing they are called from reaches the image — so they kept their
-;;; original spelling through the :rpi/:virt split rather than churn every call
-;;; site for cosmetics.)
-(defun %rpi-file-text (path)
-  (with-open-file (s path :direction :input)
-    (let ((text (make-string (file-length s))))
-      (subseq text 0 (read-sequence text s)))))
-
-;; #211: wrap the file so its own (in-package …) cannot leak into the next file
-;; of the concatenated build blob.  Same contract as build-cli-common's MVM-TEXT.
-(defun %rpi-mvm-text (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (modus.mvm::check-parses path)
-    (modus.mvm::%build-package-scoped-source (%rpi-file-text path))))
+;;; Source readers: READ-FILE-TEXT / MVM-TEXT come from lib/load-mvm.lisp,
+;;; loaded just above.
 
 ;; net/ sources are read RAW (no package wrapper) — they are flat-namespace
 ;; bare-metal drivers and none of them declares a package.
 (defun %rpi-net-text (rel)
   (let ((p (merge-pathnames rel (merge-pathnames "net/" *modus-base*))))
     (modus.mvm::check-parses p)
-    (%rpi-file-text p)))
+    (read-file-text p)))
 
 (defun %rpi-hcon-font-text ()
   "HCON-FONT-BYTES for net/hdmi-console.lisp: boot/boot-uefi-x64.lisp's 8x8
@@ -387,10 +371,10 @@
     ;; The serial REPL itself: CL reader + EVAL(=mvm-eval) + CL printer over the
     ;; UART.  This is the bare-metal counterpart of lib/cli-toplevel.lisp, which
     ;; the hosted payload supplies and *CLI-BARE-METAL* omits.
-    (%rpi-mvm-text "lib/serial-repl.lisp")
+    (mvm-text "lib/serial-repl.lisp")
     ;; Single-threaded answers to the SB-THREAD shim's primitives (the shim is
     ;; boot-evaluated here too; net/hosted-sync.lisp is hosted-only).
-    (%rpi-mvm-text "net/bare-sync.lisp")
+    (mvm-text "net/bare-sync.lisp")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     (if *cl-repl-rpi-p*
@@ -402,7 +386,7 @@
     ;; (AFTER the arena line: its own %BARE-SYNC-ARENA is cacheable RAM, which the
     ;; SMP mutexes' LDAXR/STLXR need -- last-defun-wins).
     (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
-        (%rpi-mvm-text "net/bare-threads.lisp")
+        (mvm-text "net/bare-threads.lisp")
         "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
@@ -692,10 +676,10 @@
 ")
       (concatenate 'string
         (string #\Newline)
-        (%rpi-mvm-text "lib/fdt.lisp")
+        (mvm-text "lib/fdt.lisp")
         (string #\Newline)
         ;; the A53 performance counters (pmu-measure, pmu-start/pmu-read): EL2 only
-        (%rpi-mvm-text "lib/a64-pmu.lisp")
+        (mvm-text "lib/a64-pmu.lisp")
         "
 (defun %cli-getenv (name) (%bootargs-lookup (%fdt-bootargs) name))
 ;;; THE CLOCK ON BARE METAL.  cl-fileio.lisp's GET-INTERNAL-REAL-TIME and
@@ -2291,13 +2275,13 @@
 (defvar *snp-attest-source*
   (if (and (boundp 'modus.mvm::*x64-snp-mode*) modus.mvm::*x64-snp-mode*)
       (concatenate 'string
-        (%rpi-mvm-text "crypto/aes.lisp")       (string #\Newline)
-        (%rpi-mvm-text "crypto/gcm.lisp")       (string #\Newline)
-        (%rpi-mvm-text "crypto/snp-guest.lisp") (string #\Newline)
-        (%rpi-mvm-text "net/snp-attest.lisp")   (string #\Newline)
+        (mvm-text "crypto/aes.lisp")       (string #\Newline)
+        (mvm-text "crypto/gcm.lisp")       (string #\Newline)
+        (mvm-text "crypto/snp-guest.lisp") (string #\Newline)
+        (mvm-text "net/snp-attest.lisp")   (string #\Newline)
         ;; The SSH-host-key binding needs both the SNP half and the SSH server
         ;; (SHA512, the host key slots), so only an SNP+SSH image carries it.
-        (if *ssh-build-p* (%rpi-mvm-text "net/snp-ssh-attest.lisp") "")
+        (if *ssh-build-p* (mvm-text "net/snp-ssh-attest.lisp") "")
         (string #\Newline))
       ""))
 

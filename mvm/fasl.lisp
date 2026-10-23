@@ -567,12 +567,21 @@
 
 (defun %fasl-key (text)
   (%fasl-hash-string
-   (format nil "~a|~a|~a|~a|~a"
+   (format nil "~a|~a|~a|~a|~a|~a"
            (%fasl-compiler-fingerprint)
            (%fasl-hash-string (%fasl-features-string))
            (if *package* (package-name *package*) "")
            (or *fasl-chain* "")
-           (%fasl-hash-string text))))
+           (%fasl-hash-string text)
+           ;; A file that evaluates at READ time (#.) can bake where it was
+           ;; loaded from -- '#.*load-truename* -- so the same text loaded from
+           ;; another path must not replay it (upstream LOAD.17, seen when two
+           ;; sweeps of one tree ran from two directories).  Other read-time
+           ;; dependencies remain a documented risk, as --eval forms are.
+           (if (search "#." text)
+               (let ((tn (symbol-value '*load-truename*)))
+                 (if tn (namestring tn) ""))
+               ""))))
 
 (defun %fasl-active-p ()
   "The cache is in use for this load: switched on, main thread, runtime eval."

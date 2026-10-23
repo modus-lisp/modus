@@ -461,6 +461,9 @@
 (defun %resolve-path (filespec)
   "Convert filespec to a path string, prepending *default-pathname-defaults* if relative.
    Accepts strings, pathname objects, and streams."
+  ;; a logical pathname names the file its translation names
+  (when (and (%lp-hosts-p) (not (streamp filespec)) (%lp-designator filespec))
+    (setq filespec (namestring (translate-logical-pathname filespec))))
   (let ((path (cond
                 ((stringp filespec) (%strip-logical-host filespec))
                 ;; %pathname-obj-p is defined later in this file but the
@@ -1145,8 +1148,9 @@
 ;;; --- file-length ---
 (defun file-length (stream)
   "Return the length of a file stream in bytes."
+  ;; TYPE-ERRORs (FILE-LENGTH.ERROR.3): the argument must be a file stream
   (if (not (streamp stream))
-      (error "file-length: not a stream")
+      (error 'type-error :datum stream :expected-type '(or file-stream broadcast-stream))
       (let ((ty (%stream-type stream)))
         (cond
           ((= ty 9)
@@ -1166,7 +1170,8 @@
           ;; Synonym: delegate
           ((= ty 7)
            (file-length (symbol-value (%stream-data stream))))
-          (t (error "file-length: not a file stream"))))))
+          (t (error 'type-error :datum stream
+                    :expected-type '(or file-stream broadcast-stream)))))))
 
 ;;; --- file-position ---
 (defun file-position (stream &rest args)
@@ -1366,6 +1371,10 @@
   "Parse a namestring S into a pathname object.  Strips logical host prefix
    (anything up to and including the first colon).  Splits directory parts
    on '/', then the basename into name + type at the last '.'."
+  (let ((h (%lp-string-host s)))
+    (when h
+      (return-from %parse-pathname-string
+        (%parse-logical-namestring h (%substring s (+ (%find-colon s) 1) (length s))))))
   (let* ((stripped (%strip-logical-host s))
          (len (length stripped))
          (last-slash -1)
@@ -1502,6 +1511,7 @@
     ((null x) "")
     ;; a file stream: the namestring of its pathname (ENOUGH-NAMESTRING.4)
     ((streamp x) (let ((p (pathname x))) (if (%pathname-obj-p p) (namestring p) "")))
+    ((%logical-pathname-p x) (%lp-namestring x))
     ((%pathname-obj-p x)
      (let* ((dir (aref x 4))
             (name (aref x 5))
@@ -1611,7 +1621,22 @@
       ((eq directory :wild) (setq directory '(:absolute :wild)))
       ((eq directory :wild-inferiors) (setq directory '(:absolute :wild-inferiors)))
       ((stringp directory) (setq directory (%split-directory-string directory))))
-    (%make-pathname-obj host device directory name type version)))
+    (%maybe-logical (%make-pathname-obj host device directory name type version))))
+
+(defun %maybe-logical (p)
+  "P, made a logical pathname in upper case when its host is a defined logical
+   host (as SBCL: COMPILE-FILE-PATHNAME / MERGE-PATHNAMES of CLTEST:X.LSP stay
+   on CLTEST, they did not become /X.fasl -- COMPILE-FILE.17/18)."
+  (let ((host (aref p 2)))
+    (when (and (stringp host) (eq (aref p 1) 'pathname) (%lp-host-entry host))
+      (aset p 1 'logical-pathname)
+      (aset p 2 (string-upcase host))
+      (aset p 3 :unspecific)
+      (when (stringp (aref p 5)) (aset p 5 (string-upcase (aref p 5))))
+      (when (stringp (aref p 6)) (aset p 6 (string-upcase (aref p 6))))
+      (when (consp (aref p 4))
+        (aset p 4 (mapcar (lambda (c) (if (stringp c) (string-upcase c) c)) (aref p 4)))))
+    p))
 
 ;;; --- parse-namestring ---
 
@@ -1680,7 +1705,7 @@
                     ((aref p 7) (aref p 7))
                     ((null p-name) (or (aref d 7) default-version))
                     (t default-version))))
-    (%make-pathname-obj host device directory name type version)))
+    (%maybe-logical (%make-pathname-obj host device directory name type version))))
 
 ;;; --- wild-pathname-p ---
 ;;;
@@ -1699,7 +1724,8 @@
      (let ((i 0) (len (length c)) (found nil))
        (loop
          (when (or found (>= i len)) (return found))
-         (let ((ch (%prim-aref c i)))  ; raw code: 42 = #\*, 63 = #\?
+         (let ((ch (char-code (char c i))))  ; 42 = #\*, 63 = #\? (CHAR: a
+                                              ; fill-pointer string, DIRECTORY.9)
            (when (or (= ch 42) (= ch 63))
              (setq found t)))
          (setq i (+ i 1)))
@@ -1837,7 +1863,6 @@
   (if (pathname-match-p source from-wild)
       to-wild
       source))
-(defun translate-logical-pathname (x) (pathname x))
 
 ;;; Logical pathname.  Per CLHS 19.3.1, a logical pathname is a structured
 ;;; object built from a namestring "HOST:DIR;NAME.TYPE.VERSION".  We
@@ -1853,22 +1878,172 @@
      (let ((colon-idx (%find-colon x)))
        (when (< colon-idx 0)
          (error 'type-error :datum x :expected-type 'logical-pathname))
-       (%ensure-pathname-classes)
-       (let* ((host (%substring x 0 colon-idx))
-              (rest (%substring x (+ colon-idx 1) (length x)))
-              (p (%parse-pathname-string rest)))
-         (let ((q (make-array 8)))
-           (aset q 0 '%clos-instance)
-           (aset q 1 'logical-pathname)
-           (aset q 2 host)
-           (aset q 3 (aref p 3))
-           (aset q 4 (aref p 4))
-           (aset q 5 (aref p 5))
-           (aset q 6 (aref p 6))
-           (aset q 7 (aref p 7))
-           q))))
+       (%parse-logical-namestring (%substring x 0 colon-idx)
+                                  (%substring x (+ colon-idx 1) (length x)))))
     ((streamp x) (logical-pathname (namestring x)))
     (t (error 'type-error :datum x :expected-type '(or string stream logical-pathname)))))
+
+;;; LOGICAL PATHNAMES (CLHS 19.3).  A logical namestring is
+;;; HOST:dir;dir;name.type.version -- upper case, ";" between directories (a
+;;; leading ";" makes the directory relative), "*" / "**" wild.  A host is
+;;; defined by (SETF LOGICAL-PATHNAME-TRANSLATIONS); a namestring whose host
+;;; is defined parses as a logical pathname, and file operations translate it
+;;; (TRANSLATE-LOGICAL-PATHNAME) to the physical file.  A host that is not
+;;; defined keeps the old reading: the prefix is stripped.
+
+(defvar *%lp-hosts* nil
+  "Alist (HOST-NAME . translations) of the defined logical hosts.")
+
+(defun %lp-hosts-p ()
+  "Any logical host defined?  (Read guarded: file operations run at boot,
+   before the DEFVAR's value is stored.)"
+  (and (boundp '*%lp-hosts*) *%lp-hosts* t))
+
+(defun %lp-host-entry (host)
+  (let ((h (cond ((stringp host) (string-upcase host))
+                 ((symbolp host) (symbol-name host))
+                 (t nil))))
+    (and h (%lp-hosts-p) (assoc h *%lp-hosts* :test #'string=))))
+
+(defun %lp-string-host (s)
+  "The defined logical host S names before its colon, or NIL."
+  (let ((c (%find-colon s)))
+    (and (> c 0)
+         (let ((e (%lp-host-entry (%substring s 0 c)))) (and e (car e))))))
+
+(defun %lp-component (c)
+  (cond ((string= c "") nil)
+        ((string= c "*") :wild)
+        ((string= c "**") :wild-inferiors)
+        (t (string-upcase c))))
+
+(defun %parse-logical-namestring (host rest)
+  "The logical pathname HOST:REST."
+  (%ensure-pathname-classes)
+  (let* ((parts nil) (start 0) (n (length rest)) (i 0) (relative nil))
+    (when (and (> n 0) (char= (char rest 0) #\;))
+      (setq relative t) (setq start 1) (setq i 1))
+    (loop
+      (when (>= i n) (return nil))
+      (when (char= (char rest i) #\;)
+        (push (%lp-component (%substring rest start i)) parts)
+        (setq start (+ i 1)))
+      (setq i (+ i 1)))
+    (let* ((file (%substring rest start n))
+           (d1 (position #\. file))
+           (d2 (and d1 (position #\. file :start (+ d1 1))))
+           (nm (%lp-component (if d1 (%substring file 0 d1) file)))
+           (tp (and d1 (%lp-component (%substring file (+ d1 1) (or d2 (length file))))))
+           (vs (and d2 (string-upcase (%substring file (+ d2 1) (length file)))))
+           (ver (cond ((null vs) nil)
+                      ((string= vs "NEWEST") :newest)
+                      ((string= vs "*") :wild)
+                      ((and (> (length vs) 0) (every #'digit-char-p vs))
+                       (parse-integer vs))
+                      (t nil)))
+           (q (make-array 8)))
+      (aset q 0 '%clos-instance)
+      (aset q 1 'logical-pathname)
+      (aset q 2 (string-upcase host))
+      (aset q 3 :unspecific)
+      (aset q 4 (cons (if relative :relative :absolute) (nreverse parts)))
+      (aset q 5 nm)
+      (aset q 6 tp)
+      (aset q 7 ver)
+      q)))
+
+(defun %lp-namestring (p)
+  (let ((out (make-string-output-stream))
+        (dir (aref p 4)))
+    (write-string (aref p 2) out)
+    (write-char #\: out)
+    (when (consp dir)
+      (when (eq (car dir) :relative) (write-char #\; out))
+      (dolist (c (cdr dir))
+        (write-string (cond ((eq c :wild) "*") ((eq c :wild-inferiors) "**") (t c)) out)
+        (write-char #\; out)))
+    (let ((nm (aref p 5)) (tp (aref p 6)) (ver (aref p 7)))
+      (when nm (write-string (if (eq nm :wild) "*" nm) out))
+      (when tp
+        (write-char #\. out)
+        (write-string (if (eq tp :wild) "*" tp) out)
+        (when ver
+          (write-char #\. out)
+          (write-string (cond ((eq ver :newest) "NEWEST") ((eq ver :wild) "*")
+                              (t (princ-to-string ver)))
+                        out))))
+    (get-output-stream-string out)))
+
+(defun %lp-designator (x)
+  "X as a logical pathname when it is one or is a namestring on a defined
+   logical host, else NIL."
+  (cond ((%logical-pathname-p x) x)
+        ((and (stringp x) (%lp-string-host x))
+         (logical-pathname x))
+        (t nil)))
+
+(defun %lp-dir-captures (d w)
+  "Match directory tail D against wildcard tail W; the list of captures
+   (a list per :WILD-INFERIORS, a component per :WILD), or :FAIL."
+  (cond
+    ((null w) (if (null d) nil :fail))
+    ((eq (car w) :wild-inferiors)
+     (let ((k 0) (n (length d)))
+       (loop
+         (when (> k n) (return :fail))
+         (let ((rest (%lp-dir-captures (nthcdr k d) (cdr w))))
+           (unless (eq rest :fail)
+             (return (cons (subseq d 0 k) rest))))
+         (setq k (+ k 1)))))
+    ((null d) :fail)
+    ((eq (car w) :wild)
+     (let ((rest (%lp-dir-captures (cdr d) (cdr w))))
+       (if (eq rest :fail) :fail (cons (car d) rest))))
+    ((equal (car d) (car w)) (%lp-dir-captures (cdr d) (cdr w)))
+    (t :fail)))
+
+(defun %lp-down (c) (if (stringp c) (string-downcase c) c))
+
+(defun %lp-translate (p from to)
+  "P (logical) translated by the rule FROM -> TO, or NIL if it does not match."
+  (let* ((pd (aref p 4)) (fd (pathname-directory from)) (td (pathname-directory to))
+         (caps (if (and (consp pd) (consp fd) (eq (car pd) (car fd)))
+                   (%lp-dir-captures (cdr pd) (cdr fd))
+                   (if (null fd) nil :fail))))
+    (when (or (eq caps :fail)
+              (not (%pm-component-p (aref p 5) (pathname-name from)))
+              (not (%pm-component-p (aref p 6) (pathname-type from))))
+      (return-from %lp-translate nil))
+    (let ((dir (if (consp td)
+                   (cons (car td)
+                         (let ((acc nil))
+                           (dolist (c (cdr td) (nreverse acc))
+                             (cond
+                               ((eq c :wild-inferiors)
+                                (let ((cap (pop caps)))
+                                  (dolist (x (if (listp cap) cap (list cap)))
+                                    (push (%lp-down x) acc))))
+                               ((eq c :wild) (push (%lp-down (pop caps)) acc))
+                               (t (push c acc))))))
+                   td))
+          (nm (let ((tn (pathname-name to)))
+                (if (or (null tn) (eq tn :wild)) (%lp-down (aref p 5)) tn)))
+          (tp (let ((tt (pathname-type to)))
+                (if (or (null tt) (eq tt :wild)) (%lp-down (aref p 6)) tt))))
+      (%make-pathname-obj nil nil dir nm tp nil))))
+
+(defun translate-logical-pathname (x &rest args)
+  "The physical pathname logical X names (a physical X is returned)."
+  (declare (ignore args))
+  (let ((p (%lp-designator x)))
+    (if (null p)
+        (pathname x)
+        (let ((e (%lp-host-entry (aref p 2))))
+          (unless e
+            (error 'file-error :pathname x))
+          (dolist (rule (cdr e) (error 'file-error :pathname x))
+            (let ((r (%lp-translate p (car rule) (cadr rule))))
+              (when r (return (translate-logical-pathname r)))))))))
 
 (defun %find-colon (s)
   "Return position of first ':' in S, or -1 if absent."
@@ -1890,7 +2065,30 @@
                 (eq (aref x 1) 'logical-pathname))
          (t (c) nil)))))
 
-(defun logical-pathname-translations (host) (declare (ignore host)) nil)
+(defun logical-pathname-translations (host)
+  (let ((e (%lp-host-entry host))) (and e (cdr e))))
+
+(defun set-logical-pathname-translations (host new)
+  "(SETF LOGICAL-PATHNAME-TRANSLATIONS): define logical HOST; each rule
+   (FROM TO) has FROM read on HOST.  (The name is the one SETF of an
+   unknown accessor calls, place arguments first.)"
+  (let* ((h (string-upcase (if (stringp host) host (string host))))
+         (e (and (%lp-hosts-p) (assoc h *%lp-hosts* :test #'string=))))
+    ;; the host must exist before FROM can be parsed on it
+    (unless e
+      (setq e (cons h nil))
+      (setq *%lp-hosts* (cons e (if (%lp-hosts-p) *%lp-hosts* nil))))
+    (setf (cdr e)
+          (mapcar (lambda (rule)
+                    (list* (let ((f (car rule)))
+                             (if (stringp f)
+                                 (%parse-logical-namestring h (let ((c (%find-colon f)))
+                                                                 (if (>= c 0) (%substring f (+ c 1) (length f)) f)))
+                                 f))
+                           (pathname (cadr rule))
+                           (cddr rule)))
+                  new))
+    new))
 
 (defun load-logical-pathname-translations (host)
   "Stub: load translations for HOST.  Modus has no logical pathname
@@ -1923,6 +2121,9 @@
   "The file's TRUENAME -- an absolute pathname, links followed -- when it
    exists, else NIL.  (It answered the argument's relative namestring, a
    string: upstream PROBE-FILE.2/3/5, RENAME-FILE.*.)"
+  ;; a wild pathname names no one file (FILE-ERROR.1)
+  (when (and (not (streamp x)) (wild-pathname-p (pathname x)))
+    (error 'file-error :pathname x))
   (let ((path (%resolve-path (pathname x))))
     (if (%sys-stat-exists path) (truename x) nil)))
 
@@ -2256,6 +2457,8 @@
    against the real filesystem.  Directory-only matches are requested by
    a trailing slash."
   (declare (ignore args))
+  (when (and (%lp-hosts-p) (not (streamp x)) (%lp-designator x))
+    (setq x (translate-logical-pathname x)))
   (let ((path (handler-case (namestring x) (t (c) nil))))
     (when (null path) (return-from directory nil))
     (if (not (position #\* path))
@@ -2268,7 +2471,9 @@
         (or (%dir-entries-raw path)
             (let ((n (length path)))
               (and (> n 0) (not (char= (char path (- n 1)) #\/))
-                   (let ((pf (probe-file x))) (and pf (list pf))))))
+                   ;; the namestring, which holds no wildcard: X may be
+                   ;; wild in its version only (DELETE-ALL-VERSIONS)
+                   (let ((pf (probe-file path))) (and pf (list pf))))))
         ;; Each match as its TRUENAME, as CLHS DIRECTORY returns them:
         ;; they were strings, which stopped being EQUAL to PROBE-FILE's answer
         ;; once that became the truename (upstream DIRECTORY.7).  In-tree

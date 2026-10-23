@@ -5667,7 +5667,15 @@
              (let ((bpos (%fs-bpos s))
                    (blen (%fs-blen s)))
                (if (< bpos blen) t
-                   (if (>= (%fs-fd s) 0) (%fd-input-ready-p (%fs-fd s)) nil))))
+                   (let ((fd (%fs-fd s)))
+                     (if (< fd 0)
+                         nil
+                         ;; a seekable file: data iff the offset is short of
+                         ;; the end (poll says "ready" at EOF too; LISTEN.7)
+                         (let ((cur (%sys-lseek fd 0 1)))
+                           (if (and (integerp cur) (>= cur 0))
+                               (< cur (%sys-fstat-size fd))
+                               (%fd-input-ready-p fd))))))))
             (t nil)))
         nil)))
 (defun %substring (str start end)
@@ -5900,7 +5908,9 @@
           (if (or (stringp seq) (characterp e))
               (%write-char-to-stream (%ensure-char-code e) s)
               (if (streamp s)
-                  (%fs-write-byte e s)
+                  ;; WRITE-BYTE routes an echo / two-way / broadcast /
+                  ;; synonym stream to its output (MAKE-ECHO-STREAM.16)
+                  (if (member (%stream-type s) '(3 4 5 7)) (write-byte e s) (%fs-write-byte e s))
                   (write-char-serial e))))
         (setq i (+ i 1)))))
   seq)

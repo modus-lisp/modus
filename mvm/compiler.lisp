@@ -23599,8 +23599,11 @@
              `(let ((st (obj-subtag ,g-arr)))
                 (if (or (eq st #x11) (eq st #x13))
                     (%u8-ref ,g-arr ,g-idx)
+                    ;; 32-bit string: out of line (prelude.lisp %C32-AREF) -- an
+                    ;; inline arm put an index check and its cold call at every
+                    ;; %PRIM-AREF site in the image, +0.5 MB of JIT code
                     (if (eq st #x15)
-                        (%c32-ref ,g-arr ,g-idx)
+                        (%c32-aref ,g-arr ,g-idx)
                         (%word-aref ,g-arr ,g-idx))))
              `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
                   (%u8-ref ,g-arr ,g-idx)
@@ -23664,8 +23667,7 @@
                 (if (or (eq st #x11) (eq st #x13))
                     (%u8-set ,g-arr ,g-idx ,g-val)
                     (if (eq st #x15)
-                        ;; a code; a character is lowered to its code
-                        (%c32-set ,g-arr ,g-idx (if (fixnump ,g-val) ,g-val (char-code ,g-val)))
+                        (%c32-aset ,g-arr ,g-idx ,g-val)   ; out of line, as above
                         (%word-aset ,g-arr ,g-idx ,g-val))))
              `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
                   (%u8-set ,g-arr ,g-idx ,g-val)
@@ -24029,15 +24031,18 @@
           ;; Neither shape is ever byte-packed (that is subtag #x11).
           ;; (Exact subtag, not %PRIM-STRINGP: that one is also true of an
           ;; MDA header whose data is a string -- a fill-pointer string.)
-          ((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx)))
+          ;; With 32-bit strings (%STRING32-ON-P) the mutable string is #x15 and
+          ;; #x31 is left to non-Latin-1 literals: #x15 takes #x31's inline arm,
+          ;; and #x31 goes to the rest (%AREF-SLOW's first arm).
+          ,(if (%string32-on-p)
+               `((%prim-string32-p ,g-arr) (code-char (%c32-ref ,g-arr ,g-idx)))
+               `((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx))))
           ((%prim-simple-vector-p ,g-arr) (%word-aref ,g-arr ,g-idx))
           ;; Byte-packed (unsigned-byte 8) vector: the interpreter's bytecode
           ;; (every FETCH-* reads it), octet buffers.
           ((%prim-u8-vector-p ,g-arr) (%u8-ref ,g-arr ,g-idx))
           ;; narrow string (#x13): a byte per character
           ((%prim-base-string-p ,g-arr) (code-char (%u8-ref ,g-arr ,g-idx)))
-          ,@(if (%string32-on-p)
-                `(((%prim-string32-p ,g-arr) (code-char (%c32-ref ,g-arr ,g-idx)))))
           ,@rest-arms))
      env dest)))
 

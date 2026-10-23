@@ -751,6 +751,14 @@
             s))
       s))
 
+(defun %c32-aref (s i)
+  "%PRIM-AREF's 32-bit string arm, out of line (compiler.lisp COMPILE-PRIM-AREF)."
+  (%c32-ref s i))
+
+(defun %c32-aset (s i code)
+  "%PRIM-ASET's 32-bit string arm: store CODE (a character is lowered to its code)."
+  (%c32-set s i (if (fixnump code) code (char-code code))))
+
 (defun %make-string32 (n)
   "A fresh 32-bit string (#x15) of N characters, all code 0: a byte vector of 4N
    whose header is rewritten to (N << 8) | #x15 -- both halves, since the byte

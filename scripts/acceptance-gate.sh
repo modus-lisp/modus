@@ -35,9 +35,12 @@ wt_for() { # ref -> worktree dir (idempotent)
 echo "== acceptance gate: base=$BASE_REF fix=$FIX_REF workdir=$WORKDIR =="
 # Two image matrices and two sweeps need several GB; a full disk shows up as
 # shards dying mid-test (write failed, -28), not as a clear error.
+# A run peaks around 4 GB (two image matrices before trimming, then two
+# sweeps' trees); GATE_MIN_FREE_GB lowers the 8 GB floor on a tight disk.
 free_kb=$(df -Pk "$WORKDIR" | awk 'NR==2 {print $4}')
-if [ "$free_kb" -lt $((8 * 1024 * 1024)) ]; then
-  echo "VERDICT: NOT RUN (only $((free_kb / 1024)) MB free under $WORKDIR; need 8 GB)"; exit 2
+need_gb=${GATE_MIN_FREE_GB:-8}
+if [ "$free_kb" -lt $((need_gb * 1024 * 1024)) ]; then
+  echo "VERDICT: NOT RUN (only $((free_kb / 1024)) MB free under $WORKDIR; need $need_gb GB)"; exit 2
 fi
 BASE_WT=$(wt_for "$BASE_REF") || exit 2
 FIX_WT=$(wt_for "$FIX_REF") || exit 2

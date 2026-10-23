@@ -13,6 +13,14 @@
 ;;;; Deliberately small: in-order receive (an out-of-order segment is dropped and the ACK
 ;;;; repeated, the peer retransmits), immediate ACKs, a fixed 32 KB send window over the
 ;;;; peer's, retransmission with doubling timeout, no SACK, no window scaling.
+;;;;
+;;;; LOOPBACK: a connection to 127.x.x.x, or to this board's own address, on a port something
+;;;; here listens on is a PAIR of connections joined to each other, no frames at all: a write
+;;;; appends to the peer's receive buffer, a close is the peer's EOF.  Reads, polls and accepts
+;;;; are the network ones unchanged (they look only at the receive buffer, its EOF and the
+;;;; listener's ready list), so an image can talk to itself over TCP -- a gateway to the desktop
+;;;; it serves, an admission client to the admission service beside it.  Both ends belong to the
+;;;; one thread that owns every connection (above), so nothing here races.
 
 (defvar *tcp-conns* nil "Every connection the pump knows, most recent first.")
 (defvar *tcp-listeners* nil)
@@ -33,7 +41,9 @@
    (rx-eof :initform nil :accessor tc-rx-eof)
    (unacked :initform nil :accessor tc-unacked)   ; list of #(seq bytes flags sent-at rto tries)
    (peer-window :initform 65535 :accessor tc-peer-window)
-   (listener :initform nil :initarg :listener :accessor tc-listener)))
+   (listener :initform nil :initarg :listener :accessor tc-listener)
+   ;; the other end of a LOOPBACK connection (above), or NIL for one over the network
+   (peer :initform nil :accessor tc-peer)))
 
 (defclass tcp-listener ()
   ((port :initarg :port :accessor tl-port)
@@ -237,8 +247,28 @@
 
 ;;; ---- the API ------------------------------------------------------------------------------
 
+(defun %loopback-ip-p (ip)
+  "127.0.0.0/8, or this board's own address."
+  (or (= (ldb (byte 8 24) ip) 127) (= ip (%our-ip))))
+
+(defun %tcpc-open-loopback (ip port)
+  "A LOOPBACK pair to local listener PORT (see the top of the file): the client end, with
+   the server end on the listener's ready list.  NIL when nothing here listens on PORT."
+  (let ((l (find port *tcp-listeners* :key #'tl-port)))
+    (when l
+      (let* ((lport (+ 49152 (setq *tcp-port-next* (logand (+ *tcp-port-next* 1) #x3FFF))))
+             (client (make-instance 'tcp-conn :lport lport :rip ip :rport port
+                                              :state :established :snd-nxt 0))
+             (server (make-instance 'tcp-conn :lport port :rip ip :rport lport
+                                              :state :established :snd-nxt 0 :listener l)))
+        (setf (tc-peer client) server (tc-peer server) client)
+        (setf (tl-ready l) (append (tl-ready l) (list server)))
+        client))))
+
 (defun tcpc-open (ip port &key (timeout-ms 3000))
   "A connection to IP:PORT, established, or NIL."
+  (when (%loopback-ip-p ip)
+    (return-from tcpc-open (%tcpc-open-loopback ip port)))
   (let ((c (make-instance 'tcp-conn :lport (+ 49152 (setq *tcp-port-next* (logand (+ *tcp-port-next* 1) #x3FFF)))
                           :rip ip :rport port :state :syn-sent
                           :snd-nxt (logand (* 2654435761 (+ (%now-ms) *tcp-port-next*)) #xFFFFFFFF))))
@@ -250,6 +280,14 @@
 
 (defun tcpc-write (c data &key (start 0) end (timeout-ms 10000))
   "Send DATA[START, END) on C, segment by segment, keeping at most 32 KB unacknowledged."
+  (when (tc-peer c)
+    ;; LOOPBACK: straight into the other end's receive buffer
+    (let ((p (tc-peer c)) (end (or end (length data))))
+      (unless (and (eq (tc-state c) :established) (not (eq (tc-state p) :closed)))
+        (return-from tcpc-write nil))
+      (let ((rx (tc-rx p)))
+        (do ((i start (+ i 1))) ((>= i end)) (vector-push-extend (aref data i) rx 4096)))
+      (return-from tcpc-write t)))
   (let ((end (or end (length data))) (pos start))
     (loop
       (when (>= pos end) (return t))
@@ -277,6 +315,10 @@
 
 (defun tcpc-close (c &key (timeout-ms 2000))
   "Send FIN and wait (briefly) for it to be acknowledged."
+  (when (tc-peer c)
+    ;; LOOPBACK: the other end reads EOF once it has read what was written
+    (setf (tc-rx-eof (tc-peer c)) t (tc-state c) :closed)
+    (return-from tcpc-close t))
   (case (tc-state c)
     (:established (%tcp-emit c #x11) (setf (tc-state c) :fin-wait))
     (:close-wait (%tcp-emit c #x11) (setf (tc-state c) :last-ack)))

@@ -13,7 +13,8 @@
 (defun %sft-init ()
   "Initialize the symbol-function table.
    Keyed by name-string, so :TEST 'EQUAL is mandatory."
-  (setq *symbol-function-table* (make-hash-table :test 'equal)))
+  ;; a CELL table (prelude.lisp %HT-KEEP-CELLS): %GETHASH-PAIR hands out its pairs
+  (setq *symbol-function-table* (%ht-keep-cells (make-hash-table :test 'equal))))
 
 ;;; Parallel hash → function table, keyed by the 60-bit FNV-1a hash that
 ;;; native MVM symbols carry in slot 0. ANSI (funcall 'sym ...) / (apply
@@ -38,7 +39,7 @@
   "Walk SRC hash-table internal alist and mirror each (name-string → fn)
    entry as (name-hash → fn) into *native-sym-function-table*.
    Written without maphash to avoid closure-capture issues."
-  (let ((cur (car src)))
+  (let ((cur (%ht-pairs src)))
     (loop
       (when (null cur) (return nil))
       (let ((pair (car cur)))

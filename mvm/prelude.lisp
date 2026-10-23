@@ -1703,6 +1703,13 @@
                          nil))
              (vec (if holder (car holder) nil))
              (r nil))
+        (when (consp vec)
+          ;; compact dict: one probe, no allocation (see %HTD-FIND)
+          (let ((n (%htd-find vec key nil)))
+            (return-from %ht-get-ro
+              (if (and (fixnump n) (not (eq n -424242001)))
+                  (%word-aref (cdr vec) (+ 2 (+ n n)))
+                  nil))))
         (if (and vec (not (eq vec -424242001)))
             (let ((cur (%word-aref vec (%ht-hash key nil (- (%prim-array-length vec) 1)))))
               (loop
@@ -1729,6 +1736,7 @@
    is compared as its literal fixnum (-424242001, see %HT-NOHASH) — every
    helper call here showed up as its own line in the in-image profile."
   (let ((found-pair nil)
+        (dict-hit nil) (dict-val nil)
         (use-linear t)
         (holder (let ((c (cdr ht)))          ; %ht-bucket-holder, inlined
                   (if (and (consp c) (eq (car c) (%ht-tag)))
@@ -1740,7 +1748,34 @@
           ;; still small: build the index once the table crosses the threshold
           (when (>= (car (cdr holder)) 32)
             (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
-        (when (and vec (not (eq vec -424242001)))
+        (when (consp vec)
+          ;; COMPACT DICT (see %HTD-FIND).  It never holds an unhashable key.
+          (setq use-linear nil)
+          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp))
+                   (< (%prim-array-length (cdr vec)) 131071))
+              ;; FIXNUM FAST PATH, inline like the bucket path's: %HTD-FIND's
+              ;; probe for a 2-byte index and an EQ key, without the call
+              (let* ((idx (car vec)) (e (cdr vec))
+                     (mask (- (ash (%prim-array-length idx) -1) 1))
+                     (cap (ash (- (%prim-array-length e) 1) -1))
+                     (k (if (< key 0) (- key) key))
+                     (i (logand (logxor k (logxor (ash k -8) (ash k -16))) mask)))
+                (loop
+                  (let* ((b (+ i i))
+                         (sl (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8))))
+                    (when (eq sl 0) (return nil))
+                    (let ((n (- sl 1)))
+                      (when (and (< n cap) (eq (%word-aref e (+ 1 (+ n n))) key))
+                        (setq dict-hit t)
+                        (setq dict-val (%word-aref e (+ 2 (+ n n))))
+                        (return nil))))
+                  (setq i (logand (+ i 1) mask))))
+              (let ((n (%htd-find vec key (cdr (cdr holder)))))
+                (when (fixnump n)
+                  (unless (eq n -424242001)
+                    (setq dict-hit t)
+                    (setq dict-val (%word-aref (cdr vec) (+ 2 (+ n n)))))))))
+        (when (and vec (not (consp vec)) (not (eq vec -424242001)))
           (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
               ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
@@ -1771,9 +1806,9 @@
               (setq found-pair pair)
               (return nil)))
           (setq cur (cdr cur)))))
-    (if found-pair
-        (values (cdr found-pair) t)
-        (values default nil))))
+    ;; ONE VALUES call, at the tail (see the docstring)
+    (values (cond (found-pair (cdr found-pair)) (dict-hit dict-val) (t default))
+            (if (or found-pair dict-hit) t nil))))
 
 (defun %gethash-pair (key ht)
   "The (KEY . VALUE) cons that holds KEY in HT, or NIL.  PUTHASH on a present
@@ -1793,6 +1828,12 @@
           ;; still small: build the index once the table crosses the threshold
           (when (>= (car (cdr holder)) 32)
             (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
+        (when (consp vec)
+          ;; A pair is about to be handed out: this table keeps cells from now
+          ;; on (see %HT-KEEP-CELLS) -- back to its alist, classic buckets.
+          (%ht-keep-cells ht)
+          (%htd-to-alist ht holder nil)
+          (return-from %gethash-pair (%gethash-pair key ht)))
         (when (and vec (not (eq vec -424242001)))
           (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
@@ -1828,8 +1869,20 @@
 
 (defun puthash (key ht value)
   "Set KEY to VALUE in hash table HT. Returns VALUE.
-   Maintains both the authoritative CAR alist and (for large explicit-:TEST
-   tables) the O(1) bucket index + the holder's entry count."
+   A large table is a compact dict (see %HTD-FIND); a small one, or a cell
+   table, keeps the authoritative CAR alist and (cell tables) the O(1) bucket
+   index, + the holder's entry count."
+  (let* ((holder (%ht-bucket-holder ht))
+         (vec (and holder (%ht-active-vec-h ht holder))))
+    (when (consp vec)
+      (let* ((strcmp? (%ht-h-strcmp holder)) (n (%htd-find vec key strcmp?)))
+        (cond
+          ;; a key the dict cannot hash: the table goes linear for good
+          ((eq n (%ht-nohash)) (%htd-to-alist ht holder (%ht-nohash)))
+          (n (%publish-fence)
+             (%ht-vec-set (cdr vec) (+ 2 (+ n n)) value)
+             (return-from puthash value))
+          (t (return-from puthash (%htd-add holder key value strcmp?)))))))
   (let* ((holder (let ((c (cdr ht)))          ; %ht-bucket-holder, inlined
                    (if (and (consp c) (eq (car c) (%ht-tag)))
                        (car (cdr (cdr (cdr (cdr (cdr c))))))
@@ -1902,6 +1955,16 @@
   ;; STRING= calls deep, 3800x SBCL.
   (let* ((holder (%ht-bucket-holder ht))
          (vec (and holder (%ht-active-vec-h ht holder))))
+    (when (consp vec)
+      ;; compact dict: the key slot becomes the marker, then the value goes
+      (let ((n (%htd-find vec key (%ht-h-strcmp holder))))
+        (if (and n (not (eq n (%ht-nohash))))
+            (progn
+              (%ht-vec-set (cdr vec) (+ 1 (+ n n)) (car vec))
+              (%ht-vec-set (cdr vec) (+ 2 (+ n n)) nil)
+              (%ht-h-set-count holder (- (%ht-h-count holder) 1))
+              (return-from remhash t))
+            (return-from remhash nil))))
     (when vec
       (let* ((strcmp? (%ht-h-strcmp holder))
              (pair (%ht-bucket-find vec key strcmp?)))
@@ -1948,13 +2011,24 @@
     removed))
 
 (defun maphash (fn ht)
-  "Call FN with each key-value pair in HT."
-  (let ((cur (car ht)))
-    (loop
-      (when (null cur) (return nil))
-      (let ((pair (car cur)))
-        (funcall fn (car pair) (cdr pair)))
-      (setq cur (cdr cur)))))
+  "Call FN with each key-value pair in HT, newest first."
+  (let* ((holder (%ht-bucket-holder ht))
+         (d (and holder (%ht-h-vec holder))))
+    (if (consp d)
+        ;; compact dict: its entries newest first, as the alist ran
+        (let* ((idx (car d)) (e (cdr d)) (j (- (%word-aref e 0) 1)))
+          (loop
+            (when (< j 0) (return nil))
+            (let ((k (%word-aref e (+ 1 (+ j j)))))
+              (unless (eq k idx)
+                (funcall fn k (%word-aref e (+ 2 (+ j j))))))
+            (setq j (- j 1))))
+        (let ((cur (car ht)))
+          (loop
+            (when (null cur) (return nil))
+            (let ((pair (car cur)))
+              (funcall fn (car pair) (cdr pair)))
+            (setq cur (cdr cur)))))))
 
 ;;; -------- ANSI hash-table accessors (added 2026-04-27) --------
 ;;;
@@ -2384,6 +2458,12 @@
    256 buckets over the 7.5k-entry symbol tables meant 30-entry chains on
    every GETHASH.  If any key isn't structurally hashable, mark :NOHASH and
    bail (the table permanently falls back to the linear alist scan)."
+  (unless (%ht-cells-p ht)
+    ;; every table but a cell table becomes a compact dict (see above)
+    (return-from %ht-rebuild-index
+      (let ((d (%htd-from-alist ht holder strcmp?)))
+        (when (eq d (%ht-nohash)) (%ht-h-set-vec holder (%ht-nohash)))
+        d)))
   (let ((cnt (%ht-h-count holder)) (n 256))
     (loop
       (when (or (>= n (* 2 cnt)) (>= n 65536)) (return nil))
@@ -2416,8 +2496,261 @@
          (if (eq r (%ht-nohash)) nil r)))
       (t nil))))
 
+;;; -------- COMPACT DICT (the index of every large table but the cell tables) ----
+;;; A bucketed table used to cost FOUR, then three, conses an entry: the alist's
+;;; (K . V) pair and list cell plus a bucket chain cell -- 48 bytes, and on a
+;;; Zero network core ~91k entries, ~4.4 MB, most of the heap's conses.  Past
+;;; %HT-BUCKET-THRESHOLD a table now becomes a DICT, the holder's car:
+;;;
+;;;   dict    = (index . entries)
+;;;   entries = simple vector, 1 + 2*CAP: [0] = entry slots used, then
+;;;             key/value pairs in INSERTION ORDER.  A free or removed key slot
+;;;             holds the dict's INDEX object, which no key is ever EQ to.
+;;;   index   = u8 vector of 2-byte slots (4-byte once CAP reaches 65535),
+;;;             open addressing, linear probe, <= 3/4 full: 0 = empty, else
+;;;             entry number + 1.  A removed entry keeps its slot (its key is
+;;;             the marker, so it never matches); the next rebuild drops it.
+;;;
+;;; ~24 bytes an entry, no conses, insertion order kept (MAPHASH still yields
+;;; newest first, as the alist did).  The table's alist (car) is NIL meanwhile.
+;;; CELL TABLES -- the globals table and *SYMBOL-FUNCTION-TABLE*, whose (K . V)
+;;; pairs are handed out and held (%GV-CELL, %GETHASH-PAIR, cells the compiler
+;;; quotes into code) -- keep the alist and the classic bucket vector instead:
+;;; see %HT-KEEP-CELLS.
+;;;
+;;; Readers without the lock (%HT-GET-RO) stay safe: an insert writes the entry,
+;;; fences, then fills the slot; a rebuild publishes a whole new dict with one
+;;; store to the holder.  Slot bytes are written one at a time, so a racing
+;;; reader may see a partial entry number: it is bounds-checked and lands on a
+;;; marker or a non-matching key, i.e. a miss, which the lock would have
+;;; ordered anyway.
+
+(defun %ht-cells-p (ht)
+  "Does HT hand out its (K . V) pairs as cells (see %HT-KEEP-CELLS)?"
+  (let ((c (cdr ht)))
+    (and (consp c) (eq (car c) (%ht-tag))
+         (let ((hc (cdr (cdr (cdr (cdr (cdr c)))))))
+           (and (consp hc) (consp (cdr hc)) (car (cdr hc)))))))
+
+(defun %ht-keep-cells (ht)
+  "Mark HT as a CELL table: its pairs are held by others, so it keeps the
+   alist and classic buckets and never becomes a dict.  Returns HT."
+  (let ((c (cdr ht)))
+    (when (and (consp c) (eq (car c) (%ht-tag)))
+      (let ((hc (cdr (cdr (cdr (cdr (cdr c)))))))
+        (when (consp hc) (set-cdr hc (cons t nil))))))
+  ht)
+
+(defun %htd-w (entries)
+  "Bytes per index slot for ENTRIES' capacity."
+  (if (< (%prim-array-length entries) 131071) 2 4))
+
+(defun %htd-slots (idx w)
+  (if (eq w 2) (ash (%prim-array-length idx) -1) (ash (%prim-array-length idx) -2)))
+
+(defun %htd-slot (idx i w)
+  (if (eq w 2)
+      (let ((b (+ i i)))
+        (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8)))
+      (let ((b (* i 4)))
+        (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8)
+           (ash (%u8-ref idx (+ b 2)) 16) (ash (%u8-ref idx (+ b 3)) 24)))))
+
+(defun %htd-set-slot (idx i w v)
+  (if (eq w 2)
+      (let ((b (+ i i)))
+        (%u8-set idx (+ b 1) (logand (ash v -8) 255))
+        (%u8-set idx b (logand v 255)))
+      (let ((b (* i 4)))
+        (%u8-set idx (+ b 3) (logand (ash v -24) 255))
+        (%u8-set idx (+ b 2) (logand (ash v -16) 255))
+        (%u8-set idx (+ b 1) (logand (ash v -8) 255))
+        (%u8-set idx b (logand v 255))))
+  v)
+
+(defun %htd-make (cap)
+  "An empty dict with room for CAP entries."
+  (let ((slots 64))
+    (loop (when (>= (* slots 3) (* cap 4)) (return nil)) (setq slots (+ slots slots)))
+    ;; one allocation burst; under the runtime lock it must fit the lock-arena
+    ;; slice (%RT-RESERVE, as %HT-REBUILD-INDEX)
+    (%rt-reserve (+ (* 8 (+ 1 (* 2 cap))) (* 4 slots) 256))
+    (let* ((n (+ 1 (* 2 cap)))
+           (entries (make-array n))
+           (idx (%alloc-u8 (* (%htd-w entries) slots)))
+           (i 1))
+      (%ht-vec-set entries 0 0)
+      (loop
+        (when (>= i n) (return nil))
+        (%ht-vec-set entries i idx)
+        (%ht-vec-set entries (+ i 1) nil)
+        (setq i (+ i 2)))
+      (cons idx entries))))
+
+(defun %htd-key= (k key strcmp?)
+  (cond ((eq strcmp? :equalp) (equalp k key))
+        ((and strcmp? (stringp key)) (and (stringp k) (string= k key)))
+        ((consp key) (equal k key))
+        (t (eq k key))))
+
+(defun %htd-find (dict key strcmp?)
+  "Entry number of KEY in DICT, NIL if absent, or %HT-NOHASH for a key that
+   cannot be hashed (the caller turns the table back into an alist).
+   HOT PATH (every GETHASH of a large table): the comparison is chosen once,
+   identity keys compare with an inline EQ, a fixnum key hashes inline (the
+   same mix as %HT-HASH's fixnum clause), and a 2-byte slot is read inline --
+   each call here was its own profile line, and the first version, calling
+   %HTD-SLOT and %HTD-KEY= per probe, ran a fixnum GETHASH at half the
+   speed of the bucket chains it replaced."
+  (let* ((idx (car dict)) (entries (cdr dict))
+         (elen (%prim-array-length entries))
+         (w (if (< elen 131071) 2 4))                       ; %HTD-W, inline
+         ;; two CONSTANT shifts: a variable-count ASH goes through BIGNUM-ASH
+         (mask (- (if (eq w 2)
+                      (ash (%prim-array-length idx) -1)
+                      (ash (%prim-array-length idx) -2))
+                  1))
+         (h (if (and (fixnump key) (not (eq strcmp? :equalp)))
+                (let ((k (if (< key 0) (- key) key)))
+                  (logand (logxor k (logxor (ash k -8) (ash k -16))) mask))
+                (%ht-hash key strcmp? mask))))
+    (if (eq h (%ht-nohash))
+        h
+        (let ((i h) (cap (ash (- elen 1) -1))
+              ;; EQ unless EQUALP (1 is EQUALP to 1.0), string content or a list
+              (ident (and (not (eq strcmp? :equalp))
+                          (or (fixnump key)
+                              (not (or (and strcmp? (stringp key)) (consp key)))))))
+          (loop
+            (let ((s (if (eq w 2)
+                         (let ((b (+ i i)))
+                           (+ (%u8-ref idx b) (ash (%u8-ref idx (+ b 1)) 8)))
+                         (%htd-slot idx i w))))
+              (when (eq s 0) (return nil))
+              (let ((n (- s 1)))
+                (when (< n cap)
+                  (let ((k (%word-aref entries (+ 1 (+ n n)))))
+                    (when (if ident
+                              (eq k key)
+                              (and (not (eq k idx)) (%htd-key= k key strcmp?)))
+                      (return n))))))
+            (setq i (logand (+ i 1) mask)))))))
+
+(defun %htd-place (dict n key strcmp?)
+  "Enter entry N (whose key is KEY) in DICT's index."
+  (let* ((idx (car dict)) (w (%htd-w (cdr dict)))
+         (mask (- (%htd-slots idx w) 1))
+         (i (%ht-hash key strcmp? mask)))
+    (loop
+      (when (eq (%htd-slot idx i w) 0)
+        (%htd-set-slot idx i w (+ n 1))
+        (return nil))
+      (setq i (logand (+ i 1) mask)))))
+
+(defun %htd-rebuild (holder dict cap strcmp?)
+  "A new dict of capacity CAP holding DICT's live entries in order, published
+   in HOLDER.  Returns it."
+  (let* ((new (%htd-make cap)) (ne (cdr new))
+         (oi (car dict)) (oe (cdr dict)) (used (%word-aref oe 0))
+         (j 0) (m 0))
+    (loop
+      (when (>= j used) (return nil))
+      (let ((k (%word-aref oe (+ 1 (+ j j)))))
+        (unless (eq k oi)
+          (%ht-vec-set ne (+ 1 (+ m m)) k)
+          (%ht-vec-set ne (+ 2 (+ m m)) (%word-aref oe (+ 2 (+ j j))))
+          (%htd-place new m k strcmp?)
+          (setq m (+ m 1))))
+      (setq j (+ j 1)))
+    (%ht-vec-set ne 0 m)
+    (%publish-fence)
+    (%ht-h-set-vec holder new)
+    new))
+
+(defun %htd-add (holder key value strcmp?)
+  "Append KEY -> VALUE (absent) to HOLDER's dict, growing it when full."
+  (let* ((dict (%ht-h-vec holder)) (entries (cdr dict))
+         (used (%word-aref entries 0))
+         (cap (ash (- (%prim-array-length entries) 1) -1)))
+    (when (>= used cap)
+      (let ((live (%ht-h-count holder)))
+        ;; the room the pruned live set needs, doubled
+        (setq dict (%htd-rebuild holder dict (if (< live 8) 16 (* 2 (+ live 1))) strcmp?))
+        (setq entries (cdr dict))
+        (setq used (%word-aref entries 0))))
+    (%ht-vec-set entries (+ 2 (+ used used)) value)
+    (%ht-vec-set entries (+ 1 (+ used used)) key)
+    (%publish-fence)
+    (%htd-place dict used key strcmp?)
+    (%ht-vec-set entries 0 (+ used 1))
+    (%ht-h-set-count holder (+ (%ht-h-count holder) 1))
+    value))
+
+(defun %htd-from-alist (ht holder strcmp?)
+  "Turn HT's alist into a dict in HOLDER (and empty the alist), or answer
+   %HT-NOHASH, changing nothing, when some key cannot be hashed."
+  (let ((cur (car ht)) (n 0) (rev nil))
+    (loop
+      (when (null cur) (return nil))
+      (when (eq (%ht-hash (car (car cur)) strcmp? 255) (%ht-nohash))
+        (return-from %htd-from-alist (%ht-nohash)))
+      (setq rev (cons (car cur) rev))          ; oldest first
+      (setq n (+ n 1))
+      (setq cur (cdr cur)))
+    (let* ((d (%htd-make (if (< n 8) 16 (* 2 n)))) (e (cdr d)) (m 0))
+      (loop
+        (when (null rev) (return nil))
+        (let ((pair (car rev)))
+          (%ht-vec-set e (+ 1 (+ m m)) (car pair))
+          (%ht-vec-set e (+ 2 (+ m m)) (cdr pair))
+          (%htd-place d m (car pair) strcmp?))
+        (setq m (+ m 1))
+        (setq rev (cdr rev)))
+      (%ht-vec-set e 0 m)
+      (%ht-h-set-count holder m)
+      (%publish-fence)
+      (%ht-h-set-vec holder d)
+      (set-car ht nil)
+      d)))
+
+(defun %htd-to-alist (ht holder state)
+  "Turn HT's dict back into its alist (newest first), and set HOLDER's car to
+   STATE (NIL: small again; %HT-NOHASH: linear for good)."
+  (let* ((d (%ht-h-vec holder)) (idx (car d)) (e (cdr d))
+         (used (%word-aref e 0)) (j 0) (alist nil) (n 0))
+    (loop
+      (when (>= j used) (return nil))
+      (let ((k (%word-aref e (+ 1 (+ j j)))))
+        (unless (eq k idx)
+          (setq alist (cons (cons k (%word-aref e (+ 2 (+ j j)))) alist))
+          (setq n (+ n 1))))
+      (setq j (+ j 1)))
+    (set-car ht alist)
+    (%ht-h-set-count holder n)
+    (%publish-fence)
+    (%ht-h-set-vec holder state)
+    alist))
+
+(defun %ht-pairs (ht)
+  "HT's entries as an alist of (K . V), newest first: the table's own alist,
+   or a fresh one for a dict.  For walkers; PUTHASH does not reach a fresh one."
+  (let ((holder (%ht-bucket-holder ht)))
+    (if (and holder (consp (%ht-h-vec holder)))
+        (let* ((d (%ht-h-vec holder)) (idx (car d)) (e (cdr d))
+               (used (%word-aref e 0)) (j 0) (alist nil))
+          (loop
+            (when (>= j used) (return alist))
+            (let ((k (%word-aref e (+ 1 (+ j j)))))
+              (unless (eq k idx)
+                (setq alist (cons (cons k (%word-aref e (+ 2 (+ j j)))) alist))))
+            (setq j (+ j 1))))
+        (car ht))))
+
 (defun hash-table-count (ht)
   "Return the number of entries in HT."
+  (let ((holder (%ht-bucket-holder ht)))
+    (when (and holder (consp (%ht-h-vec holder)))
+      (return-from hash-table-count (%ht-h-count holder))))
   (let ((cur (car ht)) (n 0))
     (loop
       (when (null cur) (return n))
@@ -2996,7 +3329,9 @@
   (%rt-enter)
   (let ((tbl (%globals-table)))
     (unless tbl
-      (setq tbl (make-hash-table))
+      ;; a CELL table: %GV-CELL hands out its pairs, and the compiler quotes
+      ;; them into code (see %HT-KEEP-CELLS)
+      (setq tbl (%ht-keep-cells (make-hash-table)))
       (setf (mem-ref #x10000080 :u64) tbl))
     ;; A pair that does not exist yet is about to be CREATED, and a memoised
     ;; pointer to some earlier pair for this key would then address a cell the

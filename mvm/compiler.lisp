@@ -5686,7 +5686,8 @@
                    (cur-tmp (%mvm-gensym "MH-CUR"))
                    (pair-tmp (%mvm-gensym "MH-PAIR")))
               `(let ((,ht-tmp ,ht-form))
-                 (let ((,cur-tmp (car ,ht-tmp)))
+                 ;; %HT-PAIRS: the table's own alist, or a dict's entries as one
+                 (let ((,cur-tmp (%ht-pairs ,ht-tmp)))
                    (loop (when (null ,cur-tmp) (return nil))
                      (let ((,pair-tmp (car ,cur-tmp)))
                        (let ((,k-var (car ,pair-tmp))
@@ -15592,7 +15593,7 @@
            (push `(setq ,var (- ,var 1)) step-stmts)))
 
         ;; FOR var BEING THE HASH-KEY[S] OF ht [USING (HASH-VALUE v)]
-        ;; Walks the alist that backs HT (`(car ht)` is `((k . v) ...)`),
+        ;; Walks HT's entries as an alist (%HT-PAIRS: `((k . v) ...)`),
         ;; binding VAR to each key.  USING-var, when given, is bound to
         ;; the matching value via the same pair.
         (:hash-keys
@@ -15600,7 +15601,7 @@
                (using (loop-iter-step-form iter))
                (alist (loop-iter-list-var iter))
                (pair-var (%mvm-gensym "HP")))
-           (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
+           (push (list alist `(%ht-pairs ,(loop-iter-init-form iter))) bindings)
            (push (list var nil) bindings)
            (when using (push (list using nil) bindings))
            (push (list pair-var nil) bindings)
@@ -15617,7 +15618,7 @@
                (using (loop-iter-step-form iter))
                (alist (loop-iter-list-var iter))
                (pair-var (%mvm-gensym "HP")))
-           (push (list alist `(car ,(loop-iter-init-form iter))) bindings)
+           (push (list alist `(%ht-pairs ,(loop-iter-init-form iter))) bindings)
            (push (list var nil) bindings)
            (when using (push (list using nil) bindings))
            (push (list pair-var nil) bindings)

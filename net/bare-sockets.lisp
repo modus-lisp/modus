@@ -28,12 +28,14 @@
    (out :initform (make-array 1460 :element-type '(unsigned-byte 8) :fill-pointer 0)
         :accessor bs-out)))
 
-(defun %bs (fd) (gethash fd *bsocks*))
+(defun %bs (fd) (with-net-lock (gethash fd *bsocks*)))
 (defun %bs-new (kind)
-  (let ((fd *bsock-next*))
-    (setq *bsock-next* (+ fd 1))
-    (setf (gethash fd *bsocks*) (make-instance 'bsock :kind kind))
-    fd))
+  ;; the descriptor table is shared by every thread that opens sockets (tcp-conns.lisp)
+  (with-net-lock
+    (let ((fd *bsock-next*))
+      (setq *bsock-next* (+ fd 1))
+      (setf (gethash fd *bsocks*) (make-instance 'bsock :kind kind))
+      fd)))
 (defun %ephemeral-port () (+ 49152 (setq *tcp-port-next* (logand (+ *tcp-port-next* 1) #x3FFF))))
 
 ;;; ---- the primitives the shim calls -----------------------------------------------------
@@ -92,7 +94,7 @@
       (let ((c (bs-conn b))) (when (typep c 'tcp-conn) (tcpc-close c)))
       (when (bs-listener b) (setq *tcp-listeners* (remove (bs-listener b) *tcp-listeners*)))
       (when (eq (bs-kind b) :datagram) (setq *udp-ports* (remove (bs-lport b) *udp-ports* :key #'car)))
-      (remhash fd *bsocks*))
+      (with-net-lock (remhash fd *bsocks*)))
     0))
 
 (defun %sbs-shutdown (fd how)

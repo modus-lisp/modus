@@ -5389,11 +5389,11 @@
     ;; 'n) nil)).  CLHS 4.3.7: type-of returns the class when it has no
     ;; proper name.
     ((%clos-instance-p obj)
-     (let* ((cname (aref obj 1))
-            (cls   (and cname (%find-clos-class cname))))
-       ;; ...and the class must still CALL itself that: after
-       ;; (setf (class-name c) nil) the memo still finds C by the old name.
-       (if (and cls cname (eq (find-class cname nil) cls) (eq (aref cls 1) cname))
+     (let* ((cls (%inst-class obj))
+            (cname (if cls (class-name cls) (aref obj 1))))
+       ;; the name only when it is the class's PROPER name: FIND-CLASS of
+       ;; it answers this class
+       (if (and cls cname (symbolp cname) (eq (find-class cname nil) cls))
            cname
            ;; No proper name — return the class object (class-of).
            (if cls cls (or cname 'standard-object)))))
@@ -5560,7 +5560,11 @@
     ;; A class OBJECT: OBJ's own class is it, even when the class no
     ;; longer has a name (upstream TYPE-OF.10); otherwise by name.
     ((%clos-class-p type)
-     (or (and (%clos-instance-p obj) (eq (class-of obj) type))
+     (if (%clos-instance-p obj)
+         ;; by KEY, exactly: a class that has lost its name to another
+         ;; keeps a key with the same NAME (CLASS-0309..0311)
+         (or (eq (class-of obj) type)
+             (and (member (aref type 1) (%obj-cpl obj) :test #'eq) t))
          (typep obj (aref type 1))))
     ((%class-proxy-p type)
      (typep obj (aref type 1)))

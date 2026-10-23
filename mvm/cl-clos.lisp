@@ -202,14 +202,14 @@
 (defun %obj-class-name (obj)
   "Return most-specific class name for OBJ (CLOS or built-in)."
   (if (%clos-instance-p obj)
-    (aref obj 1)
+    (%inst-key obj)
     (%type-of-for-dispatch obj)))
 
 (defun %obj-cpl (obj)
   "Return CPL for OBJ as list of class names."
   (cond
     ((%clos-instance-p obj)
-     (let ((cls-name (aref obj 1)))
+     (let ((cls-name (%inst-key obj)))
        (let ((cls (%find-clos-class cls-name)))
          (if cls
            (aref cls 4)
@@ -269,6 +269,91 @@
       nil)))
 
 ;;; ============================================================
+;;; CLASS IDENTITY (CLHS 4.3.6, CLASS-NAME, (SETF FIND-CLASS)).
+;;;
+;;; A class's slot 1 is its KEY: the symbol every name-keyed registry (slot
+;;; info, CPLs, default initargs, class slots, plans) files it under -- its
+;;; name, normally.  An instance's slot 1 is its CLASS OBJECT (a symbol for
+;;; the built-in shapes, pathnames).  The class's NAME, as CLASS-NAME answers
+;;; it, is the key unless (SETF CLASS-NAME) gave it another.
+;;;
+;;; When a class stops being the class its name names -- renamed, or its name
+;;; given to another class / to NIL by (SETF FIND-CLASS) -- it is DETACHED: it
+;;; moves to a fresh uninterned key with its registry entries, so a later
+;;; DEFCLASS of the name makes a new class and the old one's instances keep
+;;; theirs (CLASS-0309..0311, TYPE-OF.8/9).
+;;; ============================================================
+
+(defun %inst-key (obj)
+  "The registry key of instance OBJ's class."
+  (let ((c (aref obj 1)))
+    (if (%clos-class-p c) (aref c 1) c)))
+
+(defun %inst-class (obj)
+  "Instance OBJ's class object."
+  (let ((c (aref obj 1)))
+    (if (%clos-class-p c) c (%find-clos-class c))))
+
+(defvar *%class-names* nil
+  "Alist (class-object . name) for classes whose name is not their key.  An
+   alist, not an EQ table: a copying collector moves the class objects.")
+
+(defun %class-visible-name (cls)
+  (let ((e (and (boundp '*%class-names*) *%class-names*
+                (assoc cls *%class-names* :test #'eq))))
+    (if e (cdr e) (aref cls 1))))
+
+(defun %clos-registry-copy (alist from to)
+  "ALIST with an entry for TO copied from FROM's, if FROM has one."
+  (let ((e (assoc from alist :test #'eq)))
+    (if e (cons (cons to (cdr e)) alist) alist)))
+
+(defvar *%clos-detached-keys* nil
+  "The fresh keys detached classes moved to (not found by name hash).")
+
+(defun %clos-detached-key-p (k)
+  ;; read guarded: class lookups run at boot, before DEFVAR values are stored
+  (and (boundp '*%clos-detached-keys*) *%clos-detached-keys*
+       (member k *%clos-detached-keys* :test #'eq) t))
+
+(defun %clos-detach (cls)
+  "Move CLS to a fresh key (see above), unless it has one already."
+  (let ((k (aref cls 1)))
+    (when (and (symbolp k) k (not (%clos-detached-key-p k)))
+      (let ((nk (make-symbol (symbol-name k))))
+        (setq *%clos-detached-keys*
+              (cons nk (if (boundp '*%clos-detached-keys*) *%clos-detached-keys* nil)))
+        (unless (and (boundp '*%class-names*) (assoc cls *%class-names* :test #'eq))
+          (setq *%class-names* (cons (cons cls k) (if (boundp '*%class-names*) *%class-names* nil))))
+        (setq *clos-slot-info* (%clos-registry-copy *clos-slot-info* k nk))
+        (setq *clos-default-initargs* (%clos-registry-copy *clos-default-initargs* k nk))
+        (setq *clos-class-slots* (%clos-registry-copy *clos-class-slots* k nk))
+        (setq *clos-direct-slots* (%clos-registry-copy *clos-direct-slots* k nk))
+        (let ((vals nil))
+          (dolist (e *clos-class-slot-values*)
+            (when (eq (car (car e)) k)
+              (push (cons (cons nk (cdr (car e))) (cdr e)) vals)))
+          (setq *clos-class-slot-values* (append vals *clos-class-slot-values*)))
+        (let ((cpl (aref cls 4)))
+          (when (and (consp cpl) (eq (car cpl) k))
+            (aset cls 4 (cons nk (cdr cpl)))))
+        (aset cls 1 nk)
+        (setq *clos-classes* (cons (cons nk cls) *clos-classes*))
+        (setq *clos-find-memo* nil)
+        (%clos-reg-memo-drop)
+        (setq *gf-cache-epoch* (+ (%gf-cache-epoch) 1))))
+    cls))
+
+(defun %set-class-name (cls new)
+  "(SETF CLASS-NAME): CLS keeps its key (detached) and is called NEW."
+  (%clos-detach cls)
+  (let ((e (assoc cls *%class-names* :test #'eq)))
+    (if e
+        (setf (cdr e) new)
+        (setq *%class-names* (cons (cons cls new) *%class-names*))))
+  new)
+
+;;; ============================================================
 ;;; Class registration with inheritance + CPL computation
 ;;; ============================================================
 
@@ -322,36 +407,56 @@
                             lists))))))
 
 (defun %compute-cpl (name supers)
-  "Compute CPL for NAME with SUPERS via C3 linearization (CLHS 4.3.5).
-   Strategy:
-     L(name) = (name) + merge(L(s1), L(s2), …, (s1 s2 …))
-   For built-in supers like T or STANDARD-OBJECT, use %builtin-cpl.
-
-   Diamond inheritance ordering: (D inherits (B C); B, C share A) →
-   (D B C A standard-object T).  Critical for initform lookup: the
-   most-specific class declaring an initform wins, and C must come
-   before A in the CPL.
-
-   Previous naive DFS-and-dedup produced (D B A C standard-object T),
-   making A's initform win over C's — wrong per CLHS."
-  (let* ((super-cpls
-          (let ((acc nil) (cur supers))
-            (loop
-              (when (null cur) (return (nreverse acc)))
-              (let* ((sup-name (car cur))
-                     (sup-cls (%find-clos-class sup-name))
-                     (cpl (if sup-cls
-                              (aref sup-cls 4)
-                              (%builtin-cpl sup-name))))
-                (setq acc (cons cpl acc)))
-              (setq cur (cdr cur)))))
-         (merge-input
-          (let ((acc nil) (cur super-cpls))
-            (loop
-              (when (null cur) (return (nreverse (cons supers acc))))
-              (setq acc (cons (car cur) acc))
-              (setq cur (cdr cur))))))
-    (cons name (%cpl-merge merge-input))))
+  "The class precedence list of NAME with direct superclasses SUPERS, by CLHS
+   4.3.5: the topological sort of the local precedence orders of NAME and all
+   its superclasses; among several classes free to come next, the one with a
+   direct subclass rightmost in the list so far.  (This was C3, which
+   disagrees in the non-monotonic case: CLASS-0306.1 / .2.)  Signals when no
+   order exists.  T and the built-in classes contribute their built-in
+   precedence lists."
+  (let ((classes nil) (pairs nil))
+    (labels ((dsupers (n)
+               (cond
+                 ((eq n name) supers)
+                 (t (let ((c (and (not (eq n 't)) (not (eq n 'standard-object))
+                                  (%find-clos-class n))))
+                      (if c
+                          (or (aref c 3) '(standard-object))
+                          (let ((b (remove-duplicates (%builtin-cpl n) :test #'eq :from-end t)))
+                            (if (and (consp b) (eq (car b) n) (cdr b))
+                                (list (cadr b))
+                                nil)))))))
+             (visit (n)
+               (unless (member n classes :test #'eq)
+                 (push n classes)
+                 (let ((prev n))
+                   (dolist (d (dsupers n))
+                     (push (cons prev d) pairs)
+                     (setq prev d)))
+                 (dolist (d (dsupers n)) (visit d)))))
+      (visit name)
+      (let ((result nil) (remaining (reverse classes)))
+        (loop
+          (when (null remaining) (return (nreverse result)))
+          (let ((cands nil))
+            (dolist (x remaining)
+              (unless (dolist (p pairs nil)
+                        (when (and (eq (cdr p) x) (member (car p) remaining :test #'eq))
+                          (return t)))
+                (push x cands)))
+            (setq cands (nreverse cands))
+            (when (null cands)
+              (error "Inconsistent class precedence for ~S: no order of ~S exists"
+                     name remaining))
+            (let ((pick (if (cdr cands)
+                            ;; RESULT is rightmost-first
+                            (dolist (r result (car cands))
+                              (let ((f (dolist (c cands nil)
+                                         (when (member c (dsupers r) :test #'eq) (return c)))))
+                                (when f (return f))))
+                            (car cands))))
+              (push pick result)
+              (setq remaining (remove pick remaining :test #'eq)))))))))
 
 (defun %defclass (name slot-names supers)
   "Register CLOS class NAME with SLOT-NAMES list and SUPERS.
@@ -495,7 +600,9 @@
    only, as *GF-FIND-MEMO*.")
 
 (defun %find-clos-class (name)
-  "Return class descriptor for NAME, or nil -- through *CLOS-FIND-MEMO*."
+  "Return class descriptor for NAME, or nil -- through *CLOS-FIND-MEMO*.
+   A class object is its own descriptor (an instance's class slot holds one)."
+  (when (%clos-class-p name) (return-from %find-clos-class name))
   (if (and (symbolp name) name (%gf-cache-writable-p))
       (let ((memo *clos-find-memo*))
         (when (null memo)
@@ -532,7 +639,9 @@
   (let ((cur *clos-classes*))
     (loop
       (when (null cur) (return nil))
-      (when (%clos-class-name-eq (car (car cur)) name)
+      ;; not a detached class's key: it has the name's NAME, not the name
+      (when (and (%clos-class-name-eq (car (car cur)) name)
+                 (not (%clos-detached-key-p (car (car cur)))))
         (return-from %find-clos-class-scan (cdr (car cur))))
       (setq cur (cdr cur))))
   nil)
@@ -2141,7 +2250,8 @@
       (%word-aset sv i -999)
       (setq i (+ i 1)))
     (%word-aset inst 0 '%clos-instance)
-    (%word-aset inst 1 class-name)
+    ;; the class OBJECT (see CLASS IDENTITY), when there is one
+    (%word-aset inst 1 (or (%find-clos-class class-name) class-name))
     (%word-aset inst 2 sv)
     (%word-aset inst 3 layout)
     inst))
@@ -2169,7 +2279,7 @@
    discarded ones and a plist of the discarded slots' values (whose default
    method runs SHARED-INITIALIZE on the added slots, i.e. their initforms).
    Returns the new slot vector."
-  (let* ((class-name (aref obj 1))
+  (let* ((class-name (%inst-key obj))
          (cls (%find-clos-class class-name))
          (new-layout (and cls (%clos-layout cls))))
     (if (or (null new-layout) (eq new-layout (aref obj 3)))
@@ -2232,14 +2342,14 @@
   ;; for what took a class lookup, a CPL walk for class allocation and a
   ;; linear slot search on every read).  Class slots and missing slots take
   ;; the full path below.
-  (let ((loc (%clos-reg-memo2 8 (aref obj 1) slot-name (function %slot-locate-scan))))
+  (let ((loc (%clos-reg-memo2 8 (%inst-key obj) slot-name (function %slot-locate-scan))))
     (when (fixnump loc)
       (let ((val (aref (%inst-slots obj) loc)))
         (return-from %slot-value
           (if (and (fixnump val) (= val -999))
-              (%dispatch-slot-unbound (%find-clos-class (aref obj 1)) obj slot-name)
+              (%dispatch-slot-unbound (%find-clos-class (%inst-key obj)) obj slot-name)
               val)))))
-  (let* ((class-name (aref obj 1))
+  (let* ((class-name (%inst-key obj))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-value nil))
     ;; Class-allocated slot?  Walk CPL via %slot-class-owner.
@@ -2277,11 +2387,11 @@
       (%slot-of-builtin-error '(setf slot-value) obj slot-name))
     (return-from set-slot-value new-val))
   ;; FAST PATH: the memoised instance slot index, as %SLOT-VALUE.
-  (let ((loc (%clos-reg-memo2 8 (aref obj 1) slot-name (function %slot-locate-scan))))
+  (let ((loc (%clos-reg-memo2 8 (%inst-key obj) slot-name (function %slot-locate-scan))))
     (when (fixnump loc)
       (aset (%inst-slots obj) loc new-val)
       (return-from set-slot-value new-val)))
-  (let* ((class-name (aref obj 1))
+  (let* ((class-name (%inst-key obj))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from set-slot-value new-val))
     ;; Class-allocated slot?
@@ -2299,7 +2409,7 @@
 (defun %slot-boundp (obj slot-name)
   "True if slot SLOT-NAME of OBJ is bound.  Calls slot-missing for
    nonexistent slots; whatever it returns is taken as the boundp answer."
-  (let* ((class-name (aref obj 1))
+  (let* ((class-name (%inst-key obj))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-boundp nil))
     ;; Class-allocated slot?
@@ -2322,7 +2432,7 @@
    slots to per-class storage so the shared slot is actually cleared
    (otherwise slot-value would still return the class-bound value via
    %class-slot-get — defeating class-0203/0207-style makunbound semantics)."
-  (let* ((class-name (aref obj 1))
+  (let* ((class-name (%inst-key obj))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-makunbound obj))
     ;; Class-allocated slot? Remove the per-class storage entry.
@@ -2403,7 +2513,7 @@
       (>= (%struct-slot-index (%struct-type-name obj) slot-name) 0)))
   (when (not (%clos-instance-p obj))
     (return-from %slot-exists-p nil))
-  (let ((cls (%find-clos-class (aref obj 1))))
+  (let ((cls (%find-clos-class (%inst-key obj))))
     (when (null cls) (return-from %slot-exists-p nil))
     (let ((idx (%clos-slot-index cls slot-name)))
       ;; See %slot-value for the AArch64 fixnum-0/NIL rationale —
@@ -2653,7 +2763,7 @@
           (return-from class-name
             (%gf-dispatch-standard gf (list cls) applicable))))))
   (if (%clos-class-p cls)
-    (aref cls 1)
+    (%class-visible-name cls)
     (if (%class-proxy-p cls)
       (%class-proxy-name cls)
       nil)))
@@ -2829,7 +2939,14 @@
    calls %DEFCLASS directly and may promote a proxied name on purpose."
   (when (and (symbolp name) (not (%find-clos-class name))
              (%builtin-class-proxy-p (find-class name nil)))
-    (error "DEFCLASS: ~S names a built-in class and cannot be redefined." name)))
+    (error "DEFCLASS: ~S names a built-in class and cannot be redefined." name))
+  ;; NAME's class has been renamed (it is detached): NAME names it no more for
+  ;; DEFCLASS, which makes a new class (CLASS-0309/0310).
+  (let ((e (assoc name *clos-classes* :test #'eq)))
+    (when (and e (%clos-class-p (cdr e)) (not (eq (aref (cdr e) 1) name)))
+      (setq *clos-classes* (remove e *clos-classes* :test #'eq))
+      (setq *clos-find-memo* nil)
+      (%clos-reg-memo-drop))))
 
 (defun slot-boundp (obj slot-name)
   "True if slot SLOT-NAME of OBJ is bound."
@@ -5621,7 +5738,7 @@
                    (and (%clos-instance-p obj)
                         (if writer (and (consp (cdr args)) (null (cdr (cdr args))))
                             (null (cdr args)))
-                        (let ((loc (%slot-locate-scan (aref obj 1) (cdr info))))
+                        (let ((loc (%slot-locate-scan (%inst-key obj) (cdr info))))
                           (and (fixnump loc)
                                (cons (if writer :slot-write :slot-read)
                                      (cons loc applicable))))))))))
@@ -8154,7 +8271,7 @@
    Returns INSTANCE."
   (when (or (null instance) (not (%clos-instance-p instance)))
     (return-from %shared-initialize-default instance))
-  (let* ((class-name (aref instance 1))
+  (let* ((class-name (%inst-key instance))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %shared-initialize-default instance))
     (let* ((slot-list (aref cls 2))
@@ -8259,7 +8376,7 @@
          (initargs   (cdr (cdr args))))
     (when (or (null instance) (not (%clos-instance-p instance)))
       (return-from %shared-init-default-spread instance))
-    (let* ((class-name (aref instance 1))
+    (let* ((class-name (%inst-key instance))
            (cls        (%find-clos-class class-name)))
       (when (null cls)
         (return-from %shared-init-default-spread instance))
@@ -8453,7 +8570,7 @@
     (when (null new-cls) (return-from %change-class-impl instance))
     (let* ((new-name (aref new-cls 1))
            (new-slot-names (aref new-cls 2))
-           (old-name (aref instance 1))
+           (old-name (%inst-key instance))
            (old-cls (%find-clos-class old-name))
            (old-slot-names (if old-cls (aref old-cls 2) nil))
            (old-sv (%inst-slots instance))
@@ -8498,7 +8615,7 @@
               (setq idx (+ idx 1))
               (setq sn (cdr sn))))
           ;; ---- 4. Mutate instance to its new class + remap values ----
-          (aset instance 1 new-name)
+          (aset instance 1 new-cls)
           (aset instance 2 (make-array (length new-slot-names)))
           (aset instance 3 (%clos-layout new-cls))
           (let ((sn new-slot-names) (idx 0) (nsv (aref instance 2)))
@@ -8603,7 +8720,7 @@
    validation at all, so (reinitialize-instance i :totally-bogus 2)
    returned quietly."
   (when (%clos-instance-p instance)
-    (%clos-validate-reinit-initargs (aref instance 1) initargs))
+    (%clos-validate-reinit-initargs (%inst-key instance) initargs))
   (let ((gf (%find-gf 'shared-initialize)))
     (cond
       ((and gf (%gf-methods gf))
@@ -8747,7 +8864,7 @@
   ;; Only standard CLOS instances reach the slot-by-slot path below.
   (when (or (null object) (not (%clos-instance-p object)))
     (return-from make-load-form-saving-slots (values nil nil)))
-  (let* ((class-name (aref object 1))
+  (let* ((class-name (%inst-key object))
          (cls (%find-clos-class class-name))
          (slots (cond
                   ;; explicit :slot-names list (and not T) → use as given
@@ -8788,7 +8905,7 @@
    object's name slot in place and return NEW-NAME.  The SETF macro's
    generic fallback rewrites (setf (class-name c) v) → (set-class-name c v)."
   (when (%clos-class-p cls)
-    (let ((dummy (aset cls 1 new-name))) dummy))
+    (%set-class-name cls new-name))
   new-name)
 
 ;;; GET-INTERNAL-REAL-TIME lives with GET-INTERNAL-RUN-TIME and
@@ -8859,7 +8976,7 @@
   (if extra
       (%program-error "class-of requires exactly 1 argument")
       (cond
-        ((%clos-instance-p x) (%find-clos-class (aref x 1)))
+        ((%clos-instance-p x) (%inst-class x))
         ((%clos-class-p x)    (find-class 'standard-class))
         ;; A class proxy is a DEFSTRUCT's or a built-in type's class: its
         ;; metaclass is STRUCTURE-CLASS / BUILT-IN-CLASS (as TYPE-OF says),
@@ -9024,10 +9141,10 @@
    :default-initargs — those must NOT apply on change-class."
   (when (or (null current) (not (%clos-instance-p current)))
     (return-from %uifdc-default current))
-  (let* ((new-name (aref current 1))
+  (let* ((new-name (%inst-key current))
          (new-cls (%find-clos-class new-name))
          (old-name (if (and previous (%clos-instance-p previous))
-                       (aref previous 1)
+                       (%inst-key previous)
                        nil))
          (old-cls (if old-name (%find-clos-class old-name) nil))
          (old-slot-names (if old-cls (aref old-cls 2) nil)))

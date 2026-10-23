@@ -2052,6 +2052,10 @@
   (let* ((name (car args))
          ;; The value is the last positional arg (n=1 → 2 args, n=2 → 3, …).
          (value (car (last args))))
+    ;; the class NAME named until now keeps its instances (CLASS IDENTITY)
+    (let ((old (%find-clos-class name)))
+      (when (and old (%clos-class-p old) (not (eq old value)) (eq (aref old 1) name))
+        (%clos-detach old)))
     (cond
       ((null value)
        (let ((new-reg nil) (cur *clos-classes*))

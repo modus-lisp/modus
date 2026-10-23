@@ -4358,6 +4358,59 @@
 ;; defvar default NIL (CLAUDE.md item 7); %gf-dispatch-custom-long sets it
 ;; with save/restore (Modus LET doesn't dynamically bind a defvar).
 (defvar *%dmc-call-args* nil)
+(defvar *%dmc-gf* nil)
+
+(defun %dmc-ll-split (ll)
+  "Counts of required and &optional parameters of lambda list LL."
+  (let ((req 0) (opt 0) (state :req))
+    (dolist (p ll)
+      (cond ((member p '(&optional)) (setq state :opt))
+            ((member p '(&rest &key &aux &allow-other-keys &body &whole)) (setq state :other))
+            ((eq state :req) (setq req (+ req 1)))
+            ((eq state :opt) (setq opt (+ opt 1)))))
+    (cons req opt)))
+
+(defun %dmc-arguments-values (ll)
+  "The values of the variables of a long-form combination's :ARGUMENTS lambda
+   list LL, in order (a supplied-p variable after its parameter), for the
+   current call (CLHS 7.6.6.1.3): matched against the generic function's own
+   lambda list position by position -- a required parameter with no
+   counterpart is NIL, an &OPTIONAL one gets its default."
+  (let* ((args *%dmc-call-args*)
+         (g (%dmc-ll-split (and *%dmc-gf* (%gf-lambda-list *%dmc-gf*))))
+         (greq (car g)) (gopt (cdr g))
+         (out nil) (state :req) (i 0) (j 0) (rest nil))
+    (dolist (p ll)
+      (cond
+        ((eq p '&whole) (setq state :whole))
+        ((eq p '&optional) (setq state :opt))
+        ((eq p '&rest) (setq state :rest))
+        ((eq p '&key) (setq state :key)
+         (setq rest (nthcdr (+ greq gopt) args)))
+        ((eq p '&allow-other-keys) nil)
+        ((eq p '&aux) (setq state :aux))
+        ((eq state :whole) (push args out) (setq state :req))
+        ((eq state :req)
+         (push (if (< i greq) (nth i args) nil) out)
+         (setq i (+ i 1)))
+        ((eq state :opt)
+         (let* ((spec (if (consp p) p (list p)))
+                (pos (+ greq j))
+                (sup (and (< j gopt) (< pos (length args)))))
+           (push (if sup (nth pos args) (eval (cadr spec))) out)
+           (when (cddr spec) (push sup out))
+           (setq j (+ j 1))))
+        ((eq state :rest) (push (nthcdr (+ greq gopt) args) out))
+        ((eq state :key)
+         (let* ((spec (if (consp p) p (list p)))
+                (v (car spec))
+                (kw (if (consp v) (car v) (intern (symbol-name v) "KEYWORD")))
+                (tail (do ((r rest (cddr r))) ((or (null r) (eq (car r) kw)) r))))
+           (push (if tail (cadr tail) (eval (cadr spec))) out)
+           (when (cddr spec) (push (if tail t nil) out))))
+        ((eq state :aux)
+         (push (if (consp p) (eval (cadr p)) nil) out))))
+    (nreverse out)))
 
 (defun %dmc-emf-call-method (method)
   "Invoke METHOD (a method record) with the current GF args (held in
@@ -4522,9 +4575,12 @@
   (let* ((comb-raw (%gf-combination gf))
          (cargs (if (consp comb-raw) (cdr comb-raw) nil))
          (builder (%mc-long-builder mc))
-         (saved-args *%dmc-call-args*))
+         (saved-args *%dmc-call-args*)
+         (saved-gf *%dmc-gf*))
     (setq *%dmc-call-args* args)
-    (let ((emf (funcall builder applicable cargs)))
+    (setq *%dmc-gf* gf)
+    (let ((emf (unwind-protect (funcall builder applicable cargs)
+                 (setq *%dmc-gf* saved-gf))))
       ;; emf is built before any method runs; partition errors propagate
       ;; here (caught by the test's handler-case).  Restore on normal exit;
       ;; an error unwinds straight past (the next dispatch re-sets it).

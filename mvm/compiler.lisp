@@ -6721,6 +6721,27 @@
                                (return nil))
                              (setq b (cdr b)))
                            b))
+                   (args-ll (let ((a (find-if (lambda (x) (and (consp x) (eq (car x) :arguments)))
+                                              body-and-aux)))
+                              (and a (cdr a))))
+                   ;; :ARGUMENTS (CLHS 7.6.6.1.3): each variable is bound, in
+                   ;; the body, to a form that yields the call's argument
+                   (args-bindings
+                    (let ((k -1) (acc nil) (state :req))
+                      (dolist (p args-ll (nreverse acc))
+                        (cond
+                          ((member p '(&whole &optional &rest &key &aux))
+                           (setq state p))
+                          ((eq p '&allow-other-keys) nil)
+                          (t
+                           (let ((spec (if (consp p) p (list p))))
+                             (push `(,(let ((v (car spec))) (if (consp v) (cadr v) v))
+                                     (list 'quote (nth ,(incf k) %dmc-argvals)))
+                                   acc)
+                             (when (and (member state '(&optional &key)) (cddr spec))
+                               (push `(,(caddr spec) (list 'quote (nth ,(incf k) %dmc-argvals)))
+                                     acc))
+                             (when (eq state '&whole) (setq state :req))))))))
                    (group-rec-forms nil)
                    (group-var-bindings nil)
                    (gi 0))
@@ -6761,7 +6782,10 @@
                    (apply
                     (function
                      (lambda ,lambda-list
-                       (let* ((%dmc-group-recs (list ,@group-rec-forms))
+                       (let* (,@(when args-ll
+                                  `((%dmc-argvals (%dmc-arguments-values ',args-ll))
+                                    ,@args-bindings))
+                              (%dmc-group-recs (list ,@group-rec-forms))
                               (%dmc-groups
                                (%dmc-partition-groups %dmc-applicable
                                                       %dmc-group-recs))

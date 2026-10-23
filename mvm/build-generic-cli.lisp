@@ -167,6 +167,13 @@
   (%core-slice fd stage #x28))
 ")
 
+;; NARROW STRINGS (prelude.lisp %NARROW-STRINGS-P): x64's collector sizes #x13
+;; as bytes; MODUS_NARROW_STRINGS=1 has the reader make them in this build.
+(when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline))))
+
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 
@@ -177,6 +184,10 @@
 (mvm-load "boot/boot-linux-x64.lisp")
 
 (in-package :modus.mvm)
+
+;; ... and its AOT string literals narrow too (compiler.lisp *NARROW-LITERALS-P*).
+(when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
+  (setq *narrow-literals-p* t))
 
 (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)

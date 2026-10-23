@@ -1043,8 +1043,101 @@
           (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
                   +a64-x15+))))
 
+(defvar *a64-cold-stubs* nil
+  "The current unit's shared cold-call stubs: (KEY LABEL INSNS MVM-TO-NATIVE-LABEL)
+   per distinct sequence.  SETQ'd, never bound.")
+(defvar *a64-cold-stubs-on* t
+  "Whether cold calls are shared out of line (A64-COLD-CALL-MATCH).")
+
+;;; COLD CALLS ARE SHARED OUT OF LINE.  A failed bounds check calls
+;;; %AREF-INDEX-ERROR through the compiler's fixed cold sequence -- save the
+;;; live temps, move the arguments, SET-NARGS, CALL, take the value, restore,
+;;; BR back (compiler.lisp %EMIT-INDEX-CHECK) -- 15 instructions inline at each
+;;; of ~19,000 sites in a Zero network core, a quarter of all its calls.  The
+;;; error functions CAN return (a reentrant signal returns NIL), so the way back
+;;; is kept: the site is ADR x15, <its BR's target>; B stub, and each distinct
+;;; sequence is ONE stub per unit -- x15 saved, the same instructions
+;;; translated, x15 restored, BR x15.  Matched only where it is safe to move:
+;;; the sequence starts at a branch target, nothing inside it is one, and every
+;;; register is physical (a spilled vreg is a frame slot, which differs from
+;;; function to function).
+
+(defun a64-cold-call-match (tail mvm-to-native-label fn-bc-offsets)
+  "When the instructions at TAIL are a cold call, (values COUNT BR-TARGET KEY);
+   else NIL.  COUNT includes the closing BR."
+  (let ((l tail) (n 0) (key nil) (nmov 0) (nargs nil)
+        (phys (lambda (r) (a64-phys-reg r))))
+    (flet ((op (i) (decoded-mvm-insn-opcode i))
+           (ops (i) (decoded-mvm-insn-operands i))
+           (inside-ok (i) (and (not (gethash (decoded-mvm-insn-offset i) mvm-to-native-label))
+                               (not (gethash (decoded-mvm-insn-offset i) fn-bc-offsets)))))
+      (when (null l) (return-from a64-cold-call-match nil))
+      ;; pushes
+      (loop while (and l (= (op (car l)) +op-push+) (funcall phys (car (ops (car l))))
+                       (or (= n 0) (inside-ok (car l))))
+            do (push (cons (op (car l)) (ops (car l))) key) (incf n) (setq l (cdr l)))
+      ;; argument moves into V0, V1, ...
+      ;; (at most four: V0-V3 are the argument registers -- a fifth argument
+      ;; goes on the stack, where the stub's saved x15 would be in the way)
+      (loop while (and l (< nmov 4) (= (op (car l)) +op-mov+) (or (= n 0) (inside-ok (car l)))
+                       (= (car (ops (car l))) (+ +vreg-v0+ nmov))
+                       (funcall phys (cadr (ops (car l)))))
+            do (push (cons (op (car l)) (ops (car l))) key) (incf n) (incf nmov) (setq l (cdr l)))
+      (unless (and (> nmov 0) l (= (op (car l)) +op-set-nargs+) (inside-ok (car l))
+                   (= (car (ops (car l))) nmov))
+        (return-from a64-cold-call-match nil))
+      (setq nargs (car (ops (car l))))
+      (push (cons (op (car l)) (ops (car l))) key) (incf n) (setq l (cdr l))
+      (unless (and l (= (op (car l)) +op-call+) (inside-ok (car l)))
+        (return-from a64-cold-call-match nil))
+      (push (cons (op (car l)) (ops (car l))) key) (incf n) (setq l (cdr l))
+      ;; the value: MOV Vd VR
+      (when (and l (= (op (car l)) +op-mov+) (inside-ok (car l))
+                 (= (cadr (ops (car l))) +vreg-vr+) (funcall phys (car (ops (car l)))))
+        (push (cons (op (car l)) (ops (car l))) key) (incf n) (setq l (cdr l)))
+      ;; pops
+      (loop while (and l (= (op (car l)) +op-pop+) (inside-ok (car l))
+                       (funcall phys (car (ops (car l)))))
+            do (push (cons (op (car l)) (ops (car l))) key) (incf n) (setq l (cdr l)))
+      (unless (and l (= (op (car l)) +op-br+) (inside-ok (car l)))
+        (return-from a64-cold-call-match nil))
+      (let* ((br (car l))
+             (target (+ (decoded-mvm-insn-offset br) (decoded-mvm-insn-size br)
+                        (car (ops br)))))
+        (unless (gethash target mvm-to-native-label)
+          (return-from a64-cold-call-match nil))
+        nargs
+        (values (+ n 1) target (format nil "~S" (reverse key)))))))
+
+(defun a64-emit-cold-call-site (buf tail count target key mvm-to-native-label)
+  "The site of a matched cold call: ADR x15, <target>; B <the shared stub>."
+  (let ((e (assoc key *a64-cold-stubs* :test (function string=))))
+    (unless e
+      (let ((insns nil) (l tail))
+        (dotimes (i (- count 1)) (push (car l) insns) (setq l (cdr l)))
+        (setq e (list key (incf *mvm-label-counter*) (nreverse insns) mvm-to-native-label))
+        (push e *a64-cold-stubs*)))
+    (let ((adr (a64-current-index buf)))
+      (a64-emit buf (logior #x10000000 +a64-x15+))          ; ADR x15, <target>
+      (a64-add-fixup buf adr (gethash target mvm-to-native-label) :adr))
+    (a64-emit-call-label buf (cadr e) t)                     ; B stub
+    (a64-slot-cache-flush)))
+
+(defun a64-emit-cold-stubs (buf)
+  (dolist (e (reverse *a64-cold-stubs*))
+    (a64-slot-cache-flush)
+    (a64-set-label buf (cadr e))
+    (a64-str-pre buf +a64-x15+ +a64-sp+ -16)
+    (dolist (insn (caddr e)) (translate-mvm-insn insn buf (cadddr e)))
+    (a64-ldr-post buf +a64-x15+ +a64-sp+ 16)
+    (a64-br buf +a64-x15+))
+  (a64-slot-cache-flush)
+  (setq *a64-cold-stubs* nil))
+
 (defun a64-emit-mark-subs (buf)
-  "At a unit's end: the mark subroutines its sites called."
+  "At a unit's end: the mark subroutines its sites called, and its shared
+   cold-call stubs."
+  (a64-emit-cold-stubs buf)
   (when *a64-mark-start-label*
     (a64-set-label buf *a64-mark-start-label*)
     (emit-aarch64-gc-set-bit buf #x10000E18)
@@ -7857,7 +7950,11 @@
     (a64-add-imm buf +a64-x23+ +a64-x26+ 16)             ; x23 = slot cursor (obj+16)
     (a64-cmp-imm buf +a64-x14+ #x11)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz2 :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x13)                     ; narrow string: bytes too
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz2 :bcond))
     (a64-cmp-imm buf +a64-x14+ #x12)                     ; f32-vector: 4 bytes/lane
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x15)                     ; 32-bit string: 4 bytes/char
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
     (a64-add-imm buf +a64-x9+ +a64-x16+ 16)              ; general: count*8+16
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i haveslots :b))
@@ -7875,7 +7972,7 @@
     ;; from-space was reused -- natrium's *P25519* after a tarball install on the
     ;; Pi (INTEGER-LENGTH never returned).  A small bignum's two slots are tagged
     ;; fixnums, safe to scan.  x64 made the same fix in 9d0790c.
-    (dolist (st (list #x10 #x11 #x12 #x14 #x16 #x31 #x60 #x64 #x65 #x66))
+    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66))
       (a64-cmp-imm buf +a64-x14+ st)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
     ;; pointer-bearing: scan slots [x23 .. slot_end=x26)
@@ -8049,7 +8146,11 @@
       (let ((u8sz (incf *mvm-label-counter*)) (hadsz (incf *mvm-label-counter*))
             (f32sz (incf *mvm-label-counter*)))
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+        (a64-cmp-imm buf +a64-x9+ #x13)                  ; narrow string: bytes too
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
         (a64-cmp-imm buf +a64-x9+ #x12)                  ; f32-vector: 4 bytes/lane
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+        (a64-cmp-imm buf +a64-x9+ #x15)                  ; 32-bit string: 4 bytes/char
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
         (a64-lsl-imm buf +a64-x15+ +a64-x15+ 3) (a64-add-imm buf +a64-x15+ +a64-x15+ 16) ; (count+2)*8 = count*8+16
         (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i hadsz :b))
@@ -8911,7 +9012,7 @@
   (setf *aarch64-fn-addr-local-relocs* nil)
   (a64-slot-cache-flush)   ; never inherit a previous translation's state
   (setq *a64-ssg-label* nil)
-  (setq *a64-mark-start-label* nil *a64-mark-cons-label* nil)
+  (setq *a64-mark-start-label* nil *a64-mark-cons-label* nil *a64-cold-stubs* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
          ;; buf.  Zero when buf is a fresh one; non-zero when we're
@@ -8971,7 +9072,13 @@
                     (incf *mvm-label-counter*)))))))
 
     ;; Pass 1: Translate all instructions
+    (let ((skip 0) (tail insns))
     (dolist (insn insns)
+      (if (> skip 0)
+          ;; consumed by a shared cold call (A64-COLD-CALL-MATCH)
+          (progn (decf skip)
+                 (setf (gethash (decoded-mvm-insn-offset insn) mvm-offset-to-native-index)
+                       (a64-current-index buf)))
       (let ((mvm-off (decoded-mvm-insn-offset insn)))
         ;; Function-entry alignment.  Fn pointers are tagged with
         ;; +tag-function+ (3) at LI-FUNC patch time (see cross.lisp
@@ -9035,8 +9142,17 @@
         ;; Record MVM offset → native index mapping
         (setf (gethash mvm-off mvm-offset-to-native-index)
               (a64-current-index buf))
-        ;; Translate the instruction
-        (translate-mvm-insn insn buf mvm-to-native-label)))
+        ;; Translate the instruction -- or, at a cold call, its shared stub
+        (multiple-value-bind (count target key)
+            (and *a64-cold-stubs-on*
+                 (gethash mvm-off mvm-to-native-label)
+                 (not (gethash mvm-off fn-bc-offsets))
+                 (a64-cold-call-match tail mvm-to-native-label fn-bc-offsets))
+          (if count
+              (progn (a64-emit-cold-call-site buf tail count target key mvm-to-native-label)
+                     (setq skip (- count 1)))
+              (translate-mvm-insn insn buf mvm-to-native-label)))))
+      (setq tail (cdr tail))))
 
     ;; Any labels pointing to the end of the bytecode stream
     (let ((end-offset (length bytecode)))

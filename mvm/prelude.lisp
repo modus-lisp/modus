@@ -716,9 +716,84 @@
        (not (eq (obj-subtag src) #x11))
        (not (eq (obj-subtag dst) #x12))
        (not (eq (obj-subtag src) #x12))
+       ;; narrow strings (#x13) are byte-packed too
+       (not (eq (obj-subtag dst) #x13))
+       (not (eq (obj-subtag src) #x13))
+       ;; ...and 32-bit strings (#x15) a u32 per character
+       (not (eq (obj-subtag dst) #x15))
+       (not (eq (obj-subtag src) #x15))
        (if (%prim-stringp dst)
            (%prim-stringp src)
            (not (%prim-stringp src)))))
+
+;;; NARROW STRINGS (compiler.lisp +SUBTAG-BASE-STRING+, #x13): a byte per
+;;; character.  %NARROW-STRINGS-P says whether this build makes them; the
+;;; collectors of the 64-bit targets size #x13 as bytes, and those builds
+;;; override it to T (last definition wins).  Everything READS both kinds
+;;; regardless.
+(defun %narrow-strings-p () nil)
+
+(defun %make-base-string (n)
+  "A fresh narrow string of N zero bytes: a byte vector whose header's subtag
+   is rewritten #x11 -> #x13.  Nothing allocates between the two, so no
+   collection sees the byte vector it briefly was."
+  (let* ((s (%alloc-u8 n))
+         (raw (- (%val->word s) 9)))
+    (setf (mem-ref raw :u32) (logior (ash n 8) #x13))
+    s))
+
+(defun %narrow-copy (s)
+  "S as a narrow string, when this build has them, S is a plain wide string
+   (#x31) and every code fits a byte: a copy at an eighth of the size.  Else S
+   itself.  For strings CL leaves immutable or that are internal -- symbol and
+   package names, the JIT's name keys -- never a caller's mutable string."
+  (if (and (%narrow-strings-p) (not (consp s))
+           (or (%prim-simple-string-p s) (%prim-string32-p s)))
+      (let ((n (array-length s)) (i 0) (ok t))
+        (loop
+          (when (or (not ok) (>= i n)) (return nil))
+          (let ((c (%prim-aref s i)))
+            (unless (and (fixnump c) (< c 256)) (setq ok nil)))
+          (setq i (+ i 1)))
+        (if ok
+            (let ((b (%make-base-string n)) (j 0))
+              (loop
+                (when (>= j n) (return b))
+                (%u8-set b j (%prim-aref s j))
+                (setq j (+ j 1))))
+            s))
+      s))
+
+(defun %c32-aref (s i)
+  "%PRIM-AREF's 32-bit string arm, out of line (compiler.lisp COMPILE-PRIM-AREF)."
+  (%c32-ref s i))
+
+(defun %c32-aset (s i code)
+  "%PRIM-ASET's 32-bit string arm: store CODE (a character is lowered to its code)."
+  (%c32-set s i (if (fixnump code) code (char-code code))))
+
+(defun %make-string32 (n)
+  "A fresh 32-bit string (#x15) of N characters, all code 0: a byte vector of 4N
+   whose header is rewritten to (N << 8) | #x15 -- both halves, since the byte
+   count's header can reach past 32 bits where the character count's does not.
+   What %MAKE-STRING-ARRAY makes in a narrow-strings build (compiler.lisp
+   COMPILE-MAKE-STRING-ARRAY).  Nothing allocates in between."
+  (let* ((s (%alloc-u8 (* 4 n)))
+         (raw (- (%val->word s) 9)))
+    (setf (mem-ref raw :u32) (logand (logior (ash n 8) #x15) #xFFFFFFFF))
+    (setf (mem-ref (+ raw 4) :u32) (ash n -24))
+    s))
+
+(defun %fresh-string (s)
+  "A fresh copy of the pooled string literal S, what an AOT literal evaluates to
+   in a *NARROW-LITERALS-P* build (compiler.lisp): narrow when S is."
+  (if (%prim-base-string-p s)
+      (let* ((n (array-length s)) (b (%make-base-string n)) (j 0))
+        (loop
+          (when (>= j n) (return b))
+          (%u8-set b j (%u8-ref s j))
+          (setq j (+ j 1))))
+      (copy-seq s)))
 
 (defun %u8-bare-p (x)
   "True for a plain byte-packed (subtag #x11) u8 vector: no fill-pointer /
@@ -1663,7 +1738,7 @@
               (loop
                 (when (null cur) (return r))
                 (let ((e (car cur)))
-                  (when (eq (car e) key) (setq r (cdr (cdr e))) (return r)))
+                  (when (eq (car e) key) (setq r (cdr e)) (return r)))
                 (setq cur (cdr cur))))
             (let ((cur (car ht)))
               (loop
@@ -1708,7 +1783,7 @@
                 (loop
                   (when (null cur) (return nil))
                   (let ((e (car cur)))
-                    (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
+                    (when (eq (car e) key) (setq found-pair e) (return nil)))
                   (setq cur (cdr cur))))
               ;; O(1) bucket path.  A :NOHASH key falls through to the linear
               ;; path -- unless it is an object key of an EQ/EQL table and the
@@ -1785,7 +1860,7 @@
                 (loop
                   (when (null cur) (return nil))
                   (let ((e (car cur)))
-                    (when (eq (car e) key) (setq found-pair (cdr e)) (return nil)))
+                    (when (eq (car e) key) (setq found-pair e) (return nil)))
                   (setq cur (cdr cur))))
               ;; O(1) bucket path.  A :NOHASH key falls through to the linear
               ;; path -- unless it is an object key of an EQ/EQL table and the
@@ -1827,7 +1902,7 @@
                               (loop
                                 (when (null cur) (return nil))
                                 (let ((e (car cur)))
-                                  (when (eq (car e) key) (setq r (cdr e)) (return nil)))
+                                  (when (eq (car e) key) (setq r e) (return nil)))
                                 (setq cur (cdr cur)))
                               r)
                             (%ht-bucket-find vec key strcmp?)))))
@@ -1913,12 +1988,12 @@
           ((consp pair)
            (let* ((entries (car ht))
                   (head (car entries))
-                  ;; the NEWEST entry's bucket entry, when it is in this index
+                  ;; the NEWEST entry's bucket cell, when it is in this index
                   (e0 (and (not (eq head pair))
-                           (%ht-bucket-entry vec (car head) strcmp? addr?))))
+                           (%ht-bucket-cell vec (car head) strcmp? addr?))))
              (cond
                ((eq head pair) (set-car ht (cdr entries)))
-               ((and (consp e0) (eq (cdr e0) head)
+               ((and (consp e0) (eq (car e0) head)
                      (not (member ht *%ht-pinned-pairs* :test (function eq))))
                 ;; O(1): the newest entry moves into PAIR's cell and the head
                 ;; cell is dropped.  Unlinking PAIR itself meant walking the
@@ -1927,10 +2002,16 @@
                 ;; 70 us a REMHASH at 32k entries.  Every walker still sees
                 ;; each live entry once: the moved one was the head, already
                 ;; behind an iteration that is removing its current entry.
+                ;; A bucket chain holds the alist pairs themselves: take
+                ;; PAIR out of KEY's chain first (that may rebuild the chain
+                ;; HEAD is in, so find HEAD's cell again after), then PAIR
+                ;; takes HEAD's contents and HEAD's chain cell points at it.
+                (%ht-bucket-rem vec key strcmp? addr?)
+                (setq e0 (%ht-bucket-cell vec (car head) strcmp? addr?))
                 (%publish-fence)
                 (set-car pair (car head))
                 (set-cdr pair (cdr head))
-                (set-cdr e0 pair)
+                (when (and (consp e0) (eq (car e0) head)) (set-car e0 pair))
                 (set-car ht (cdr entries)))
                (t
                 (let ((prev entries) (cur (cdr entries)))
@@ -2155,18 +2236,30 @@
          ;; 64-bit path is FNV-1a exactly as before.
          (if (> +fixnum-bits+ 32)
              (let ((h 2166136261) (len (array-length key)) (i 0))
-               (loop
-                 (when (>= i len) (return nil))
-                 ;; %WORD-AREF: the clause above sent every string that is not a
-                 ;; plain #x31 through a copy, so this is one -- never byte-packed --
-                 ;; and %PRIM-AREF's u8-or-word subtag test per character is waste.
-                 (setq h (logand (* (logxor h (%word-aref key i)) 16777619) #xFFFFFFFF))
-                 (setq i (+ i 1)))
+               ;; A plain string here: wide (#x31, a word per character) or narrow
+               ;; (#x13, a byte) -- chosen ONCE, not per character as %PRIM-AREF
+               ;; would.  Both read the CODE, so equal contents hash equally across
+               ;; the two representations, as an EQUAL table needs.
+               (if (%prim-base-string-p key)
+                   (loop
+                     (when (>= i len) (return nil))
+                     (setq h (logand (* (logxor h (%u8-ref key i)) 16777619) #xFFFFFFFF))
+                     (setq i (+ i 1)))
+                 (if (%prim-string32-p key)
+                   ;; ...or a 32-bit string (#x15): a u32 code per character
+                   (loop
+                     (when (>= i len) (return nil))
+                     (setq h (logand (* (logxor h (%c32-ref key i)) 16777619) #xFFFFFFFF))
+                     (setq i (+ i 1)))
+                   (loop
+                     (when (>= i len) (return nil))
+                     (setq h (logand (* (logxor h (%word-aref key i)) 16777619) #xFFFFFFFF))
+                     (setq i (+ i 1)))))
                (logand h mask))
              (let ((h 1162397) (len (array-length key)) (i 0))   ; #x11BC9D
                (loop
                  (when (>= i len) (return nil))
-                 (setq h (logand (+ (- (ash h 5) h) (%word-aref key i)) #x3FFFFF))
+                 (setq h (logand (+ (- (ash h 5) h) (%prim-aref key i)) #x3FFFFF))
                  (setq i (+ i 1)))
                (logand h mask)))
          (%ht-nohash)))
@@ -2429,7 +2522,7 @@
     (when cell (set-car cell nil))))
 
 (defun %ht-bucket-find (vec key strcmp? &optional addr?)
-  "Find the (key . pair) entry in VEC's bucket for KEY; returns the alist PAIR,
+  "Find KEY's entry in VEC's bucket -- the alist PAIR itself; returns that PAIR,
    NIL (absent), or :NOHASH (key not bucketable -> caller must use the linear
    alist path).  Bucket entries store the SAME pair cons that lives in the
    table's CAR alist.  HOT PATH: the bucket is read with the leaf %WORD-AREF
@@ -2446,7 +2539,7 @@
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
-                 (when (equalp (car e) key) (return (cdr e))))
+                 (when (equalp (car e) key) (return e)))
                (setq cur (cdr cur))))
             ((and strcmp? (stringp key))
              ;; string-content path
@@ -2454,7 +2547,7 @@
                (when (null cur) (return nil))
                (let ((e (car cur)))
                  (when (let ((ek (car e))) (and (stringp ek) (string= ek key)))
-                   (return (cdr e))))
+                   (return e)))
                (setq cur (cdr cur))))
             ((and strcmp? (consp key))
              ;; a list key of an EQUAL table, by structure (%HT-HASH); under
@@ -2462,19 +2555,19 @@
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
-                 (when (equal (car e) key) (return (cdr e))))
+                 (when (equal (car e) key) (return e)))
                (setq cur (cdr cur))))
             (t
              ;; identity path
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
-                 (when (eq (car e) key) (return (cdr e))))
+                 (when (eq (car e) key) (return e)))
                (setq cur (cdr cur)))))))))
 
-(defun %ht-bucket-entry (vec key strcmp? &optional addr?)
-  "KEY's (key . pair) entry in VEC's bucket, or NIL (absent or unbucketable).
-   Matches as %HT-BUCKET-FIND does."
+(defun %ht-bucket-cell (vec key strcmp? &optional addr?)
+  "The cons of VEC's bucket chain whose CAR is KEY's pair, or NIL (absent or
+   unbucketable).  Matches as %HT-BUCKET-FIND does."
   (let ((h (%ht-key-hash key strcmp? (- (%prim-array-length vec) 1) addr?)))
     (if (eq h (%ht-nohash))
         nil
@@ -2486,7 +2579,7 @@
                           ((and strcmp? (stringp key)) (and (stringp ek) (string= ek key)))
                           ((and strcmp? (consp key)) (equal ek key))
                           (t (eq ek key)))
-                (return e)))
+                (return cur)))
             (setq cur (cdr cur)))))))
 
 (defun %ht-bucket-put (vec key pair strcmp? &optional addr?)
@@ -2495,7 +2588,7 @@
   (let ((h (%ht-key-hash key strcmp? (- (%prim-array-length vec) 1) addr?)))
     (unless (eq h (%ht-nohash))
       (let* ((old (%word-aref vec h))
-             (new-head (cons (cons key pair) old)))
+             (new-head (cons pair old)))
         (%publish-fence)
         (%ht-vec-set vec h new-head))))
   pair)
@@ -2546,10 +2639,10 @@
     (loop
       (when (or (>= n (* 2 cnt)) (>= n (%ht-max-buckets))) (return nil))
       (setq n (* n 2)))
-    ;; The rebuild is one allocation burst: the bucket vector and two conses
+    ;; The rebuild is one allocation burst: the bucket vector and one cons
     ;; an entry.  Under the runtime lock that must fit the lock-arena slice
     ;; (%RT-RESERVE, net/hosted-sync.lisp).
-    (%rt-reserve (+ (* n 8) (* cnt 32) 256))
+    (%rt-reserve (+ (* n 8) (* cnt 16) 256))
     (let* ((vec (%ht-new-bucket-vec n)) (cur (car ht)) (ok t)
            ;; object keys (ADDRESS INDEX): indexed when this thread may, else
            ;; left to the linear path, with the cell saying the index lacks them
@@ -3244,7 +3337,7 @@
                       (loop
                         (when (null %gv-cur) (return nil))
                         (let ((%gv-e (car %gv-cur)))
-                          (when (eq (car %gv-e) %gv-key) (return (cdr %gv-e))))
+                          (when (eq (car %gv-e) %gv-key) (return %gv-e)))
                         (setq %gv-cur (cdr %gv-cur))))
                     ;; :NOHASH — not a bucketable key; the alist is the answer
                     (%gv-cell-slow %gv-key %gv-ht))))))))
@@ -3888,9 +3981,14 @@
       (when (and (fixnump start) (fixnump end) (<= 0 start) (<= start end) (<= end n)
                  (< (- end start) 64))
         (let* ((len (- end start)) (r (%make-string-array len)) (i 0))
-          (loop (when (>= i len) (return-from subseq r))
-            (%word-aset r i (%word-aref seq (+ start i)))
-            (setq i (+ i 1)))))))
+          ;; a narrow-strings build makes 32-bit (#x15) strings
+          (if (%prim-string32-p r)
+              (loop (when (>= i len) (return-from subseq r))
+                (%c32-set r i (%word-aref seq (+ start i)))
+                (setq i (+ i 1)))
+              (loop (when (>= i len) (return-from subseq r))
+                (%word-aset r i (%word-aref seq (+ start i)))
+                (setq i (+ i 1))))))))
   ;; An EXPLICIT nil end (CL: (subseq s start nil)) means \"to the end\" —
   ;; same as omitting it.  Guarding on end-arg alone left end=NIL, which the
   ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates

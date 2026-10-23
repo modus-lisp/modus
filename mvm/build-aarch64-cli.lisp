@@ -180,7 +180,7 @@
             (if (> word 0) (%jit-patch-quad base (car r) word) (setq ok nil))))
         ;; Quoted-literal / string li-const patches (pool object tagged word).
         (dolist (p cpat)
-          (let* ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+          (let* ((obj (if *e2-const-pool* (%e2-const-ref (cdr p)) nil)))
             (%jit-patch-quad base (car p) (%val->word obj))))
         (%jit-icache-flush base (* nwords 4))
         (if (and ok eoff)

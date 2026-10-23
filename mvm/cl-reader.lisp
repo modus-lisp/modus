@@ -834,7 +834,29 @@
     result))
 
 (defun %codes-to-string (codes)
-  "Convert a list of char codes to a string."
+  "Convert a list of char codes to a string -- NARROW (a byte per character,
+   subtag #x13) when the build has them and every code fits, which is nearly
+   every literal and symbol name; the reader's strings are literals and token
+   names, which CL leaves immutable."
+  (if (and (%narrow-strings-p) (%codes-narrow-p codes))
+      (let ((s (%make-base-string (list-length codes))) (i 0) (cur codes))
+        (loop
+          (when (null cur) (return s))
+          (%u8-set s i (car cur))
+          (setq i (+ i 1))
+          (setq cur (cdr cur))))
+      (%codes-to-wide-string codes)))
+
+(defun %codes-narrow-p (codes)
+  (let ((cur codes))
+    (loop
+      (when (null cur) (return t))
+      (let ((c (car cur)))
+        (unless (and (fixnump c) (>= c 0) (< c 256)) (return nil)))
+      (setq cur (cdr cur)))))
+
+(defun %codes-to-wide-string (codes)
+  "A wide string (a word per character) of CODES."
   (let ((len (list-length codes)))
     (let ((s (%make-string-array len))
           (i 0)

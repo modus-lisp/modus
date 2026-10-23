@@ -371,16 +371,31 @@
                        (tag (target-object-tag target))
                        (data-off (target-object-data-offset target))
                        (pad-words (1- (/ data-off word-size))))
-                  ;; Header: (count << 8) | subtag-string (#x31), matching
-                  ;; alloc-obj's runtime header format, then however many
-                  ;; padding words this target's layout puts before the data.
-                  (emit-word (logior #x31 (ash len 8)))
-                  (dotimes (i pad-words)
-                    (emit-word 0))
-                  ;; One TAGGED character code per word, as every target's
-                  ;; :alloc-string does.
-                  (loop for c across constant
-                        do (emit-word (ash (char-code c) 1)))
+                  (if (and (= word-size 8) (= data-off 16)
+                           (every (lambda (c) (< (char-code c) 256)) constant))
+                      ;; NARROW (compiler.lisp +SUBTAG-BASE-STRING+): header
+                      ;; (count << 8) | #x13, the pad word, then a BYTE per
+                      ;; character -- an eighth of the wide form.  x64 and AArch64
+                      ;; only (8-byte words, data at +16): their collectors size
+                      ;; #x13 as bytes.  A pooled string is a literal, which CL
+                      ;; leaves immutable.
+                      (progn
+                        (emit-word (logior #x13 (ash len 8)))
+                        (dotimes (i pad-words)
+                          (emit-word 0))
+                        (loop for c across constant
+                              do (mvm-emit-byte buf (char-code c))))
+                      (progn
+                        ;; Header: (count << 8) | subtag-string (#x31), matching
+                        ;; alloc-obj's runtime header format, then however many
+                        ;; padding words this target's layout puts before the data.
+                        (emit-word (logior #x31 (ash len 8)))
+                        (dotimes (i pad-words)
+                          (emit-word 0))
+                        ;; One TAGGED character code per word, as every target's
+                        ;; :alloc-string does.
+                        (loop for c across constant
+                              do (emit-word (ash (char-code c) 1)))))
                   (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))

@@ -986,6 +986,22 @@
       (if (= len1 len2)
           (let ((i 0))
             (if (and (%prim-stringp sa) (not (%mda-p sa))
+                     (%prim-stringp sb) (not (%mda-p sb))
+                     (or (%prim-base-string-p sa) (%prim-base-string-p sb)
+                         (%prim-string32-p sa) (%prim-string32-p sb)))
+                ;; A NARROW string (#x13, a byte per character) on either side:
+                ;; %PRIM-AREF reads the CODE from either representation, so a
+                ;; narrow and a wide string with the same characters compare
+                ;; equal.  (Symbol names are narrow: INTERN and FIND-SYMBOL
+                ;; compare them here.)
+                (loop
+                  (when (= i len1) (return t))
+                  (let ((ca (%prim-aref sa (+ s1 i))) (cb (%prim-aref sb (+ s2 i))))
+                    (unless (or (eq ca cb)
+                                (eql (%ensure-char-code ca) (%ensure-char-code cb)))
+                      (return nil)))
+                  (setq i (+ i 1)))
+            (if (and (%prim-stringp sa) (not (%mda-p sa))
                      (%prim-stringp sb) (not (%mda-p sb)))
                 ;; FAST PATH (both plain #x31 strings): compare raw char
                 ;; codes slot-by-slot.  The generic loop below costs ~8
@@ -1018,7 +1034,7 @@
                   (when (= i len1) (return t))
                   ;; AREF on strings now yields CHARACTERs — compare via char=.
                   (unless (char= (aref sa (+ s1 i)) (aref sb (+ s2 i))) (return nil))
-                  (setq i (+ i 1)))))
+                  (setq i (+ i 1))))))
           nil))))
 (defun string/= (a b &rest args)
   "Case-sensitive inequality.  Returns position of mismatch (in a's
@@ -3217,9 +3233,14 @@
     (let ((s (%make-string-array size)) (i 0))
       ;; The fresh array is a plain #x31 string: store the code words
       ;; directly (ASET dispatched on the array type per character).
-      (loop (when (>= i size) (return s))
-        (%word-aset s i ch)
-        (setq i (+ i 1))))))
+      ;; (a 32-bit #x15 string in a narrow-strings build: a u32 a code)
+      (if (%prim-string32-p s)
+          (loop (when (>= i size) (return s))
+            (%c32-set s i ch)
+            (setq i (+ i 1)))
+          (loop (when (>= i size) (return s))
+            (%word-aset s i ch)
+            (setq i (+ i 1)))))))
 
 
 ;;; Numeric

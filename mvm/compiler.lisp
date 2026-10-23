@@ -50,6 +50,21 @@
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
 (defconstant +subtag-u8-vector+ #x11)   ; byte-packed (unsigned-byte 8) vector
+;; NARROW STRING: a string whose every code is < 256, one BYTE per character --
+;; the u8 vector's layout (header (N<<8)|#x13, pad word, N packed bytes) under
+;; its own subtag, so the collectors size it exactly as #x11 and every octet
+;; predicate (exact #x11) still excludes it.  A wide string (#x31) spends a word
+;; per character; on a Zero network core 98.8% of string content was narrow.
+;; Made by the producers whose results CL leaves immutable (reader literals and
+;; tokens, symbol names, the JIT's name keys); MAKE-STRING and friends stay wide.
+(defconstant +subtag-base-string+ #x13)
+;; 32-BIT STRING: the general (CHARACTER) string of a narrow-strings build --
+;; MAKE-STRING and every %MAKE-STRING-ARRAY producer -- with one raw u32 code per
+;; character (header (N<<8)|#x15, pad word, 4N bytes): half the #x31 form, which
+;; spends a tagged word per character.  Any code fits.  Its own subtag rather
+;; than a new #x31 layout: code that reads a #x31 string as words and was not
+;; taught #x15 says "not a string" instead of reading the wrong bytes.
+(defconstant +subtag-string32+ #x15)
 (defconstant +subtag-f32-vector+ #x12)  ; packed single-float vector (4-byte IEEE32 lanes)
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-mda+    #x34)   ; 7-slot multi-dim array header:
@@ -986,6 +1001,15 @@
    OUTPUT-codegen sites (compile-quote's :li-const path, compile-variable-ref's
    checked read) test (and *mvm-eval-runtime-p* (not *static-build-p*)).")
 
+(defvar *narrow-literals-p* nil
+  "T in a build whose collector sizes narrow strings (#x13, x64 and AArch64):
+   an AOT string literal whose codes all fit a byte is pooled once -- cross.lisp
+   lays a pooled string out narrow on those targets -- and each evaluation
+   returns %FRESH-STRING of it, a narrow copy.  Fresh per evaluation, as the
+   char-by-char path below is (pooling the object itself had CLOS regressions),
+   but one call instead of three instructions per character, and an eighth of
+   the bytes.  Set by the build scripts next to their %NARROW-STRINGS-P.")
+
 (defvar *ws5-str-bake-min* 0
   "WS5 GC-corruption threshold PROBE.  In a static build, a quoted STRING whose
    length is >= this value is BAKED into the serialized constant pool (adds pool
@@ -1183,6 +1207,16 @@
    with its own fallback.  Saved/restored with SETQ, not LET (see
    *MVM-GENSYM-COUNTER*).")
 
+(defun %string32-on-p ()
+  "Does this build make #x15 strings (and so emit their arms)?  The AOT build
+   says so with *NARROW-LITERALS-P*; in-image, %NARROW-STRINGS-P does."
+  (if *mvm-eval-runtime-p* (%narrow-strings-p) *narrow-literals-p*))
+
+(defun %maybe-narrow (s)
+  "A name key, narrow in-image (prelude.lisp %NARROW-COPY); the host build,
+   which has neither narrow strings nor that function, keeps S."
+  (if *mvm-eval-runtime-p* (%narrow-copy s) s))
+
 (defvar *e2-persist-defuns* nil
   "COMPILER-RECORDED DEFUN PERSISTENCE (in-image ONLY, *mvm-eval-runtime-p*
    gated).  mvm-eval-forms' pre-scan walks the RAW forms for top-level DEFUNs to
@@ -1253,14 +1287,35 @@
   (setq *fasl-taint* (if (integerp *fasl-taint*) (+ *fasl-taint* 1) 1)))
 
 (defun %e2-const-register (value)
-  "Register VALUE in the mvm-eval quote pool; return its index."
+  "Register VALUE in the mvm-eval quote pool; return its index.  The pool is a
+   HOLDER cons whose car is a simple vector, doubled when full: the indices are
+   dense and the pool append-only, and as an EQL hash table each entry cost four
+   conses (64 bytes) -- 1.5 MB of a Zero network core, against 8 bytes a slot.
+   The holder keeps one identity across growth, so a JIT page or retry entry
+   that saved \"its\" pool (%JIT-RETRY-DRAIN swaps it back in) still writes
+   and reads the one live vector."
   (unless *e2-const-pool*
-    (setq *e2-const-pool* (make-hash-table))
+    (setq *e2-const-pool* (cons (make-array 1024 :initial-element nil) nil))
     (setq *e2-const-count* 0))
-  (let ((idx *e2-const-count*))
-    (setf (gethash idx *e2-const-pool*) value)
+  (let* ((idx *e2-const-count*) (holder *e2-const-pool*) (vec (car holder)))
+    (when (>= idx (length vec))
+      (let ((new (make-array (* 2 (length vec)) :initial-element nil)) (i 0))
+        (loop
+          (when (>= i idx) (return nil))
+          (setf (aref new i) (aref vec i))
+          (setq i (+ i 1)))
+        (setq vec new)
+        (setf (car holder) new)))
+    (setf (aref vec idx) value)
     (setq *e2-const-count* (+ idx 1))
     idx))
+
+(defun %e2-const-ref (idx)
+  "Entry IDX of the quote pool, NIL if none."
+  (let ((vec (and (consp *e2-const-pool*) (car *e2-const-pool*))))
+    (if (and vec (integerp idx) (>= idx 0) (< idx (length vec)))
+        (aref vec idx)
+        nil)))
 
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")
@@ -2857,7 +2912,7 @@
   (if (and *mvm-eval-runtime-p* (%cl-sym-p fn))
       (let ((pkg (%cl-sym-package fn)))
         (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
-            (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn))
+            (%maybe-narrow (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn)))
             (symbol-name fn)))
       (symbol-name fn)))
 
@@ -2894,7 +2949,7 @@
     (if (and *mvm-eval-runtime-p* (%cl-sym-p sym))
         (let ((pkg (%cl-sym-package sym)))
           (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
-              (concatenate 'string (%pkg-name pkg) "::" base)
+              (%maybe-narrow (concatenate 'string (%pkg-name pkg) "::" base))
               base))
         base)))
 
@@ -3028,7 +3083,7 @@
   (if (%fn-key-unqualify bare)
       bare
       (let ((pn (%fn-key-pkg-of fn)))
-        (if pn (concatenate 'string pn "::" bare) bare))))
+        (if pn (%maybe-narrow (concatenate 'string pn "::" bare)) bare))))
 
 (defun %fn-info-for-key (key)
   "*FUNCTIONS* entry for KEY, falling back to KEY's bare name when the
@@ -3241,7 +3296,7 @@
                      (let ((nm (%cl-sym-name sym)))
                        (and nm (> (length nm) 0)
                             (compute-name-hash
-                             (concatenate 'string pn "::" nm))))))))))
+                             (%maybe-narrow (concatenate 'string pn "::" nm)))))))))))
 
 (defun %global-var-bind-key (sym)
   "Store key for a global-variable WRITE site: DEFVAR/DEFPARAMETER's initform
@@ -9308,6 +9363,10 @@
        (compile-object-subtype-p (cadr form) env dest +subtag-string+))
       ((= op-name #.(compute-name-hash "%PRIM-U8-VECTOR-P"))
        (compile-object-subtype-p (cadr form) env dest +subtag-u8-vector+))
+      ((= op-name #.(compute-name-hash "%PRIM-BASE-STRING-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-base-string+))
+      ((= op-name #.(compute-name-hash "%PRIM-STRING32-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-string32+))
       ((= op-name #.(compute-name-hash "%PRIM-SIMPLE-VECTOR-P"))
        (compile-object-subtype-p (cadr form) env dest +subtag-array+))
       ((= op-name #.(compute-name-hash "%RAW-CONSP"))
@@ -9341,6 +9400,10 @@
        (compile-u8-ref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%U8-SET"))
        (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name #.(compute-name-hash "%C32-REF"))
+       (compile-c32-ref (cadr form) (caddr form) env dest))
+      ((= op-name #.(compute-name-hash "%C32-SET"))
+       (compile-c32-set (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name #.(compute-name-hash "%ALLOC-F32"))
        (compile-alloc-f32 (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%F32-BITS-REF"))
@@ -9986,6 +10049,15 @@
         (let ((idx (length *constant-table*)))
           (push value *constant-table*)
           (emit-ir :li-const dest idx)))
+       ((and *narrow-literals-p* (not *mvm-eval-runtime-p*)
+             (every (lambda (c) (< (char-code c) 256)) value))
+        (let ((idx (length *constant-table*)))
+          (push value *constant-table*)
+          (emit-ir :li-const +vreg-v0+ idx)
+          (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+          (emit-ir :call "%FRESH-STRING" 1)
+          (unless (= dest +vreg-vr+)
+            (emit-ir :mov dest +vreg-vr+))))
        (t
         (let ((n (length value)))
           ;; GC check BEFORE the alloc.  Without it, every quoted string
@@ -23099,6 +23171,14 @@
     (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
+    ;; ...or a narrow string (#x13)
+    (emit-ir :li temp2 (ash +subtag-base-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; ...or a 32-bit string (#x15)
+    (emit-ir :li temp2 (ash +subtag-string32+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
     ;; Check subtag == #x34 (MDA) — if so, peel data slot
     (emit-ir :li temp2 (ash +subtag-mda+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
@@ -23114,6 +23194,14 @@
     (emit-ir :bne false-label)
     (emit-ir :obj-subtag temp dest)
     (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; ...or a narrow string (#x13)
+    (emit-ir :li temp2 (ash +subtag-base-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; ...or a 32-bit string (#x15)
+    (emit-ir :li temp2 (ash +subtag-string32+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
     ;; The peeled storage is itself an MDA when the array is DISPLACED to a
@@ -23152,9 +23240,15 @@
             (%wrapper-stringp ,g-arg)
             (if (%prim-simple-string-p ,g-arg)
                 t
-                (if (%prim-stringp ,g-arg)
-                    (eql (%prim-aref ,g-arg 0) 1)
-                    nil))))
+                ;; narrow (#x13) and 32-bit (#x15) strings are simple strings
+                ;; too; only an MDA header has a rank in slot 0
+                (if (%prim-base-string-p ,g-arg)
+                    t
+                    (if (%prim-string32-p ,g-arg)
+                        t
+                        (if (%prim-stringp ,g-arg)
+                            (eql (%prim-aref ,g-arg 0) 1)
+                            nil))))))
      env dest)))
 
 (defun compile-arrayp (arg env dest)
@@ -23202,6 +23296,14 @@
     (emit-ir :beq true-label)
     ;; Packed single-float vector (subtag #x12).
     (emit-ir :li temp2 (ash +subtag-f32-vector+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; Narrow string (subtag #x13): a string, so an array.
+    (emit-ir :li temp2 (ash +subtag-base-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; 32-bit string (subtag #x15)
+    (emit-ir :li temp2 (ash +subtag-string32+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
     (emit-ir-label false-label)
@@ -25159,9 +25261,13 @@
   (%u8-simple-array-decl-p (%expr-dtype form env)))
 
 (defun compile-make-string-array (size-form env dest)
-  "Like compile-make-array but with string subtag #x31.
+  "Like compile-make-array but with string subtag #x31 -- or, in a build with
+   32-bit strings (%STRING32-ON-P), a call to %MAKE-STRING32.
    GC-check before each alloc (overshoot-past-R14 hazard; see
    compile-make-bignum)."
+  (if (%string32-on-p)
+      (return-from compile-make-string-array
+        (compile-form `(%make-string32 ,size-form) env dest)))
   (if (and (integerp size-form) (<= size-form 65535))
       (progn
         (emit-ir :gc-check)
@@ -25381,9 +25487,20 @@
         ;; the MISMATCH case (any array that is not byte-packed) is the
         ;; common one — 19 ns of call per element read.  compile-eql now
         ;; folds this itself, but say what is meant.
-        (if (eq (obj-subtag ,g-arr) #x11)
-            (%u8-ref ,g-arr ,g-idx)
-            (%word-aref ,g-arr ,g-idx)))
+        ;; byte-packed: a u8 vector (#x11) or a narrow string (#x13)
+        ,(if (%string32-on-p)
+             `(let ((st (obj-subtag ,g-arr)))
+                (if (or (eq st #x11) (eq st #x13))
+                    (%u8-ref ,g-arr ,g-idx)
+                    ;; 32-bit string: out of line (prelude.lisp %C32-AREF) -- an
+                    ;; inline arm put an index check and its cold call at every
+                    ;; %PRIM-AREF site in the image, +0.5 MB of JIT code
+                    (if (eq st #x15)
+                        (%c32-aref ,g-arr ,g-idx)
+                        (%word-aref ,g-arr ,g-idx))))
+             `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
+                  (%u8-ref ,g-arr ,g-idx)
+                  (%word-aref ,g-arr ,g-idx))))
      env dest)))
 
 (defun compile-struct-slot (args setp env dest)
@@ -25438,9 +25555,16 @@
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
         ;; EQ, not EQL — see compile-prim-aref.
-        (if (eq (obj-subtag ,g-arr) #x11)
-            (%u8-set ,g-arr ,g-idx ,g-val)
-            (%word-aset ,g-arr ,g-idx ,g-val)))
+        ,(if (%string32-on-p)
+             `(let ((st (obj-subtag ,g-arr)))
+                (if (or (eq st #x11) (eq st #x13))
+                    (%u8-set ,g-arr ,g-idx ,g-val)
+                    (if (eq st #x15)
+                        (%c32-aset ,g-arr ,g-idx ,g-val)   ; out of line, as above
+                        (%word-aset ,g-arr ,g-idx ,g-val))))
+             `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
+                  (%u8-set ,g-arr ,g-idx ,g-val)
+                  (%word-aset ,g-arr ,g-idx ,g-val))))
      env dest)))
 
 (defun compile-prim-array-length (arr-form env dest)
@@ -25652,6 +25776,56 @@
         (free-temp-reg)
         (free-temp-reg))))
 
+;;; %C32-REF / %C32-SET: element I of a 32-bit string (#x15), a raw u32 code at
+;;; byte 16 + 4I of the object.  No opcode of their own: the tagged pointer is
+;;; the address + 9 and the tagged index is 2I, so the element's address is
+;;; ptr + 7 + 2*idx, read or written by the :u32 LOAD / STORE MEM-REF uses.
+;;; Nothing allocates between the address and the access.
+(defun %c32-address (arr-reg idx-reg addr)
+  (let ((k (alloc-temp-reg)))
+    (emit-ir :shl addr idx-reg 1)
+    (emit-ir :add addr addr arr-reg)
+    (emit-ir :li k 7)
+    (emit-ir :add addr addr k)
+    (free-temp-reg)))
+
+(defun compile-c32-ref (arr-form idx-form env dest)
+  "Compile (%c32-ref s i): the code (a fixnum) of element I of #x15 string S."
+  (let ((arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg))
+        (addr (alloc-temp-reg)))
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (let ((skip (make-compiler-label)))
+      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (%c32-address arr-reg idx-reg addr)
+      (emit-ir :load addr addr (car (memory-width-code :u32)))
+      (emit-ir :shl dest addr +fixnum-shift+)
+      (emit-ir-label skip))
+    (free-temp-reg)
+    (free-temp-reg)
+    (free-temp-reg)))
+
+(defun compile-c32-set (arr-form idx-form val-form env dest)
+  "Compile (%c32-set s i code): store fixnum CODE as element I of #x15 string S.
+   Returns CODE.  Value first into its own temp, as COMPILE-U8-SET explains."
+  (let ((val-reg (alloc-temp-reg))
+        (arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg))
+        (addr (alloc-temp-reg))
+        (raw (alloc-temp-reg)))
+    (compile-form val-form env val-reg)
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (let ((skip (make-compiler-label)))
+      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (%c32-address arr-reg idx-reg addr)
+      (emit-ir :sar raw val-reg +fixnum-shift+)
+      (emit-ir :store addr raw (car (memory-width-code :u32)))
+      (emit-ir :mov dest val-reg)
+      (emit-ir-label skip))
+    (free-temp-reg) (free-temp-reg) (free-temp-reg) (free-temp-reg) (free-temp-reg)))
+
 ;;; AREF / ASET / ARRAY-LENGTH — wrapper-aware front-ends.
 ;;;
 ;;; Build commit 7c9a463 introduced array wrappers
@@ -25665,6 +25839,13 @@
 ;;; / %wrapper-length helpers (defined in cl-clos.lisp).  Plain (non-cons)
 ;;; arrays go straight to the primitive op so the common case stays fast
 ;;; (one consp test).
+(defvar *aref-out-of-line* t
+  "Whether a generic (undeclared) AREF / ASET keeps only the simple string,
+   simple vector and u8 shapes inline and calls cl-clos.lisp's %AREF-SLOW /
+   %ASET-SLOW for the rest.  The full inline dispatch it replaces already
+   called into cl-clos.lisp (%WRAPPER-AREF, %AREF-MULTI), so every image that
+   reaches this expansion has them.")
+
 (defun compile-aref (arr-form idx-form env dest)
   "Compile (aref array index) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aref.  Multi-subscript
@@ -25701,9 +25882,43 @@
          env tmp)
         (free-temp-reg)))
     (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
-  (let ((g-arr (%mvm-gensym "AREFA"))
-        (g-idx (%mvm-gensym "AREFI"))
-        (g-raw (%mvm-gensym "AREFR")))
+  (let* ((g-arr (%mvm-gensym "AREFA"))
+         (g-idx (%mvm-gensym "AREFI"))
+         (g-raw (%mvm-gensym "AREFR"))
+         ;; EVERY OTHER SHAPE OUT OF LINE (cl-clos.lisp %AREF-SLOW, the same
+         ;; arms in the same order): inlined, they were most of every generic
+         ;; AREF's native code.  Bound HERE as their own backquotes and
+         ;; spliced below as a variable -- a backquote nested directly in a
+         ;; comma of the outer one does not compile when this file is
+         ;; compiled into the image (see CHECKED-STORE in the defstruct
+         ;; expander).
+         (rest-arms
+           (if *aref-out-of-line*
+               (list `(t (%aref-slow ,g-arr ,g-idx)))
+               `(;; MDA fast path — single-sub on an MDA is just an aref of
+                 ;; the underlying data (assuming no displacement; %aref-multi
+                 ;; handles the displaced case).
+                 ((%mda-p ,g-arr)
+                  (let ((disp (%mda-displaced ,g-arr)))
+                    (let ((,g-raw (if disp
+                                      (%aref-multi ,g-arr ,g-idx)
+                                      ;; a BIT array's data is a packed byte store
+                                      ;; (cl-clos.lisp, PACKED BIT ARRAYS)
+                                      (if (%mda-bit-p ,g-arr)
+                                          (%bit-store-ref (%mda-data ,g-arr) ,g-idx)
+                                          (%prim-aref (%mda-data ,g-arr) ,g-idx)))))
+                      (if (%prim-stringp (%mda-data ,g-arr))
+                          (code-char ,g-raw)
+                          ,g-raw))))
+                 ((%raw-consp ,g-arr)
+                  (let ((,g-raw (%wrapper-aref ,g-arr ,g-idx)))
+                    (if (%wrapper-stringp ,g-arr) (code-char ,g-raw) ,g-raw)))
+                 ((%prim-stringp ,g-arr) (code-char (%prim-aref ,g-arr ,g-idx)))
+                 ;; packed single-float vector (#x12): the PUBLIC aref boxes the
+                 ;; lane here, so %prim-aref (header/slot access everywhere in the
+                 ;; runtime) stays a two-way u8/word dispatch with no call.
+                 ((eq (obj-subtag ,g-arr) #x12) (%f32-aref ,g-arr ,g-idx))
+                 (t (%prim-aref ,g-arr ,g-idx))))))
     (compile-form
      ;; CL conformance: (aref STRING i) must return a CHARACTER, not the
      ;; raw char-CODE.  All three storage shapes (native MDA char-data,
@@ -25721,35 +25936,19 @@
           ;; Neither shape is ever byte-packed (that is subtag #x11).
           ;; (Exact subtag, not %PRIM-STRINGP: that one is also true of an
           ;; MDA header whose data is a string -- a fill-pointer string.)
-          ((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx)))
+          ;; With 32-bit strings (%STRING32-ON-P) the mutable string is #x15 and
+          ;; #x31 is left to non-Latin-1 literals: #x15 takes #x31's inline arm,
+          ;; and #x31 goes to the rest (%AREF-SLOW's first arm).
+          ,(if (%string32-on-p)
+               `((%prim-string32-p ,g-arr) (code-char (%c32-ref ,g-arr ,g-idx)))
+               `((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx))))
           ((%prim-simple-vector-p ,g-arr) (%word-aref ,g-arr ,g-idx))
           ;; Byte-packed (unsigned-byte 8) vector: the interpreter's bytecode
           ;; (every FETCH-* reads it), octet buffers.
           ((%prim-u8-vector-p ,g-arr) (%u8-ref ,g-arr ,g-idx))
-          ;; MDA fast path — single-sub on an MDA is just an aref of
-          ;; the underlying data (assuming no displacement; %aref-multi
-          ;; handles the displaced case).
-          ((%mda-p ,g-arr)
-           (let ((disp (%mda-displaced ,g-arr)))
-             (let ((,g-raw (if disp
-                               (%aref-multi ,g-arr ,g-idx)
-                               ;; a BIT array's data is a packed byte store
-                               ;; (cl-clos.lisp, PACKED BIT ARRAYS)
-                               (if (%mda-bit-p ,g-arr)
-                                   (%bit-store-ref (%mda-data ,g-arr) ,g-idx)
-                                   (%prim-aref (%mda-data ,g-arr) ,g-idx)))))
-               (if (%prim-stringp (%mda-data ,g-arr))
-                   (code-char ,g-raw)
-                   ,g-raw))))
-          ((%raw-consp ,g-arr)
-           (let ((,g-raw (%wrapper-aref ,g-arr ,g-idx)))
-             (if (%wrapper-stringp ,g-arr) (code-char ,g-raw) ,g-raw)))
-          ((%prim-stringp ,g-arr) (code-char (%prim-aref ,g-arr ,g-idx)))
-          ;; packed single-float vector (#x12): the PUBLIC aref boxes the
-          ;; lane here, so %prim-aref (header/slot access everywhere in the
-          ;; runtime) stays a two-way u8/word dispatch with no call.
-          ((eq (obj-subtag ,g-arr) #x12) (%f32-aref ,g-arr ,g-idx))
-          (t (%prim-aref ,g-arr ,g-idx))))
+          ;; narrow string (#x13): a byte per character
+          ((%prim-base-string-p ,g-arr) (code-char (%u8-ref ,g-arr ,g-idx)))
+          ,@rest-arms))
      env dest)))
 
 (defun compile-aref-form (form env dest)
@@ -25887,6 +26086,16 @@
      ;; ASET returns the value actually stored; for the char case that is
      ;; the code, but CLHS (setf aref) returns the original value — so we
      ;; bind ,g-val and return it explicitly only when we coerced.
+     (if *aref-out-of-line*
+         ;; Simple vector and u8 vector inline (neither is string-typed, so
+         ;; the store is the value as given); every other shape in
+         ;; cl-clos.lisp %ASET-SLOW -- the former dispatch, store-value
+         ;; coercion included.  Same evaluation order: array, index, value.
+         `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
+            (cond
+              ((%prim-simple-vector-p ,g-arr) (%word-aset ,g-arr ,g-idx ,g-val) ,g-val)
+              ((%prim-u8-vector-p ,g-arr) (%u8-set ,g-arr ,g-idx ,g-val) ,g-val)
+              (t (%aset-slow ,g-arr ,g-idx ,g-val))))
      `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form)
              (,g-sto (%aset-store-val ,g-arr ,g-val)))
         (cond
@@ -25901,7 +26110,7 @@
           ((%raw-consp ,g-arr) (%wrapper-aset ,g-arr ,g-idx ,g-sto) ,g-val)
           ;; packed single-float vector (#x12): narrow and store the lane
           ((eq (obj-subtag ,g-arr) #x12) (%f32-aset ,g-arr ,g-idx ,g-val))
-          (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val)))
+          (t (%prim-aset ,g-arr ,g-idx ,g-sto) ,g-val))))
      env dest)))
 
 (defun compile-aset-form (form env dest)
@@ -27295,7 +27504,21 @@
         ;; Extended ladder: nargs = req+1 .. req+32.  The trap above
         ;; caps at 32 total args, so max-k = 32 - req (no separate
         ;; min — let req=0 funcs use the full 32 cases).
-        (let ((max-k (- 32 req))
+        ;; ONLY THE SHORTEST CASES UNROLLED.  The ladder used to run to
+        ;; req+32, and case k is k conses: 528 conses, ~6,300 aarch64
+        ;; instructions (~25 KB) in EVERY &rest function -- measured on a
+        ;; Zero core, 173,080 conses in 328 functions, nearly half of all its
+        ;; native code.  The loop below does any count (slot i holds arg i
+        ;; for every i < 64, the #x0530 trap above having copied the overflow
+        ;; arguments), so only two cases stay unrolled -- three in an IMAGE
+        ;; build.  An image built with two restarts in a loop early in boot
+        ;; (QEMU raspi3b, 2026-10-22), while one built with three boots and
+        ;; gets every count 0..40 right through APPLY of VECTOR / APPEND / MAX
+        ;; -- and the loop reads a subset of the same slots in the failing
+        ;; case, so this looks like a latent layout-sensitive bug elsewhere,
+        ;; not the loop.  (Runtime-compiled code: every count 0..35 right,
+        ;; interpreted and native.)  Not a DEFVAR: its init does not run in-image.
+        (let ((max-k (min (- 32 req) (if *mvm-eval-runtime-p* 2 3)))
               (cases nil))
           ;; ASCENDING: one or two rest arguments -- the common call -- are
           ;; matched first instead of after thirty-odd compares.

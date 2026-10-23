@@ -678,7 +678,7 @@
     ;; site: there is no immediate to bake, the index is carried only so
     ;; %jit-constvec-need can size the vector.  Skip it.
     (when (>= (car p) 0)
-      (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+      (let ((obj (if *e2-const-pool* (%e2-const-ref (cdr p)) nil)))
         (%jit-write-imm64 base (car p) (%val->word obj))))))
 
 (defun %jit-constvec-need (cpatches)
@@ -740,7 +740,7 @@
                ;; through the globals alist, detects recycling for free.
                (intact (or (null *e2-const-count*) (eql *e2-const-count* 0)
                            (and v (> vlen 0)
-                                (eq (aref v 0) (gethash 0 *e2-const-pool*)))))
+                                (eq (aref v 0) (%e2-const-ref 0)))))
                (ok (and v (> vlen mx) intact)))
           (setq *jit-cv-sites* (if *jit-cv-sites* (+ 1 *jit-cv-sites*) 1))
           (when (null *jit-cv-diag*) (setq *jit-cv-diag* 0))
@@ -772,7 +772,7 @@
 ;;; i.e. slot IDX of an ordinary heap ARRAY reachable from a fixed BSS word that
 ;;; the collector scans as a root.  This file owns that array: allocating it,
 ;;; installing it in the BSS word, growing it, and keeping slot I equal to
-;;; (gethash I *e2-const-pool*).
+;;; (%e2-const-ref I).
 ;;;
 ;;; The pool is APPEND-ONLY (%e2-const-register in mvm/compiler.lisp hands out
 ;;; *e2-const-count* and increments; nothing ever rewrites or removes an entry),
@@ -931,7 +931,7 @@
     (let ((k *jit-constvec-hi*))
       (loop
         (when (>= k n) (return nil))
-        (let ((o (if *e2-const-pool* (gethash k *e2-const-pool*) nil)))
+        (let ((o (if *e2-const-pool* (%e2-const-ref k) nil)))
           (let ((dummy (aset (%jit-constvec) k o))) dummy))
         (setq k (+ k 1))))
     (setq *jit-constvec-hi* n)
@@ -949,7 +949,7 @@
     ;; same).  This also covers %jit-entry-for's post-GC re-bake, which calls
     ;; through here with the entry's stored cpatches.
     (when (>= (car p) 0)
-      (let ((obj (if *e2-const-pool* (gethash (cdr p) *e2-const-pool*) nil)))
+      (let ((obj (if *e2-const-pool* (%e2-const-ref (cdr p)) nil)))
         (%jit-write-movz-quad base (car p) (%val->word obj))))))
 
 ;; Pool-EXPLICIT patcher variants for the cross-page sweep
@@ -2339,7 +2339,40 @@
    not yet handed to %JIT-BUILD-SCRIPT-DEFS.  See cl-eval.lisp, A SCRIPT'S
    OWN DEFUNS START NATIVE.")
 
+(defvar *jit-source-links* nil
+  "NAME (string) -> (FILE FORM-INDEX . CHAR-OFFSET): where a runtime DEFUN came
+   from, recorded when its module registers -- FILE the file install-tarball is
+   reading (its path in the tarball; else *LOAD-TRUENAME*), one shared object
+   per file, FORM-INDEX its top-level form in that
+   file, CHAR-OFFSET where the form starts (NIL when read through the FASL
+   cache).  It outlives JIT-PRUNE, which drops the bytecode and translation
+   tables of native modules: the source, not the bytecode, is the way back from
+   compiled code.  See JIT-SOURCE.")
+
+(defun %jit-note-source (names)
+  (let ((file (or (and (boundp (quote *%it-source-file*)) *%it-source-file*)
+                  (and (boundp (quote *load-truename*)) *load-truename*))))
+    (when file
+      (when (null *jit-source-links*)
+        (setq *jit-source-links* (make-hash-table :test (function equal))))
+      (let ((link (cons file
+                        (cons (and (boundp (quote *%it-form-index*)) *%it-form-index*)
+                              (and (boundp (quote *%it-form-offset*)) *%it-form-offset*)))))
+        (dolist (nm names) (puthash nm *jit-source-links* link))))))
+
+(defun jit-source (name)
+  "Where runtime DEFUN NAME (\"PKG::NAME\", or a symbol) was loaded from:
+   (FILE FORM-INDEX . CHAR-OFFSET), or NIL."
+  (let ((key (if (symbolp name)
+                 (let ((p (symbol-package name)))
+                   (if (and p (not (string= (package-name p) "COMMON-LISP-USER")))
+                       (concatenate (quote string) (package-name p) "::" (symbol-name name))
+                       (symbol-name name)))
+                 name)))
+    (and *jit-source-links* (gethash key *jit-source-links*))))
+
 (defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
+  (%jit-note-source names)
   (when (and (boundp (quote *%load-depth*)) (eql *%load-depth* 1))
     (setq *jit-script-def-names* (append names (if (consp *jit-script-def-names*)
                                                    *jit-script-def-names*
@@ -2351,8 +2384,106 @@
       (dolist (nm names) (puthash nm *jit-module-registry* m)))))
 
 (defun %jit-registered-p (name)
-  "T when NAME is a runtime DEFUN (it has a registered module)."
-  (if (and *jit-module-registry* (gethash name *jit-module-registry*)) t nil))
+  "T when NAME is a runtime DEFUN (it has a registered module, or had one before
+   JIT-PRUNE: a source link)."
+  (if (or (and *jit-module-registry* (gethash name *jit-module-registry*))
+          (and *jit-source-links* (gethash name *jit-source-links*)))
+      t nil))
+
+(defun jit-prune ()
+  "THE EXPLICIT CLEAN STEP, run before a save (alongside SAVE-AND-DIE's full
+   collection).  A runtime DEFUN keeps, for JIT-EAGER, its module's bytecode
+   and translation tables (call relocations, function offsets, lambda offsets)
+   -- in *JIT-MODULE-REGISTRY*, *JIT-EAGER-BUILT*, the trampoline tables and
+   the page cache -- long after its native code is installed.  Measured on a
+   Zero network core: the registry was the largest structure in the heap.
+   For every module that JIT-EAGER built and whose names ALL still resolve to
+   native code, drop all of it; the native code keeps its own constants (the
+   GC-rooted constant vector) and its linkage cells, and *JIT-SOURCE-LINKS*
+   keeps the way back to the source.  A module with any name not native --
+   failed, skipped, or replaced since -- is left whole.  Returns
+   (:PRUNED modules :NAMES n :KEPT modules :EVAL-CACHE forms), and drops the
+   eval cache (below)."
+  (let ((pruned 0) (nnames 0) (kept 0) (mods nil))
+    (when *jit-module-registry*
+      (maphash (lambda (k m) k (unless (member m mods :test (function eq)) (setq mods (cons m mods))))
+               *jit-module-registry*)
+      (dolist (m mods)
+        (let ((bc (car m)) (names (car (cddr (cddddr m)))) (all t))
+          (dolist (nm names) (unless (%jit-fn-native-p nm) (setq all nil)))
+          (if (and all names (member bc *jit-eager-built* :test (function eq)))
+              (progn
+                (dolist (nm names)
+                  (remhash nm *jit-module-registry*)
+                  (when *jit-defun-trampolines* (remhash nm *jit-defun-trampolines*))
+                  (when *jit-trampoline-forwards* (remhash nm *jit-trampoline-forwards*)))
+                (when *jit-page-cache* (remhash bc *jit-page-cache*))
+                (setq *jit-eager-built* (delete bc *jit-eager-built* :test (function eq)))
+                (setq pruned (+ pruned 1) nnames (+ nnames (length names))))
+              (setq kept (+ kept 1))))))
+    ;; The eval cache (*MVM-EVAL-CACHE*: source forms -> compiled module) is a
+    ;; compile-speed cache for forms evaluated again; in a saved core it held
+    ;; every top-level form of every library loaded, its bytecode and tables --
+    ;; 0.45 MB of bytecode nothing else referenced on a Zero network core.  It
+    ;; refills itself on demand.
+    (let ((forms (if (hash-table-p *mvm-eval-cache*) (hash-table-count *mvm-eval-cache*) 0)))
+      (setq *mvm-eval-cache* nil)
+      (list :pruned pruned :names nnames :kept kept :eval-cache forms))))
+
+(defun compact-names ()
+  "THE OTHER EXPLICIT CLEAN STEP before a save (kiln runs it after JIT-PRUNE):
+   one narrow string per name across the image's name tables --
+   *SYMBOL-FUNCTION-TABLE*'s keys, *JIT-SOURCE-LINKS*'s keys, *SYM-NAME-TABLE*'s
+   values.  The image fills those from its own literals, a separate copy per
+   table; on a Zero network core that was 9000 entries and 0.4 MB of heap.
+   The table that matches them up is local and dropped with the call: kept in
+   the image, canonicalising as the JIT went, it cost more than it saved.
+   Returns how many entries changed."
+  (let ((canon (make-hash-table :test (function equal))))
+    (+ (%narrow-table-keys (if (boundp (quote *symbol-function-table*))
+                               *symbol-function-table* nil)
+                           canon)
+       (%narrow-table-keys *jit-source-links* canon)
+       (%narrow-table-values (if (boundp (quote *sym-name-table*))
+                                 *sym-name-table* nil)
+                             canon))))
+
+(defun %canonical-name (name canon)
+  "NAME's one narrow string in CANON (an EQUAL table), entered on first sight."
+  (or (gethash name canon)
+      (let ((c (%narrow-copy name)))
+        (puthash c canon c)
+        c)))
+
+(defun %narrow-table-keys (ht canon)
+  "Re-key EQUAL hash table HT with CANON's strings.  Returns how many keys changed."
+  (let ((pairs nil) (n 0))
+    (when (hash-table-p ht)
+      (maphash (lambda (k v)
+                 (when (stringp k)
+                   (let ((c (%canonical-name k canon)))
+                     (unless (eq c k) (setq pairs (cons (cons c v) pairs))))))
+               ht)
+      (dolist (p pairs)
+        (remhash (car p) ht)
+        (puthash (car p) ht (cdr p))
+        (setq n (+ n 1))))
+    n))
+
+(defun %narrow-table-values (ht canon)
+  "Replace the string values of hash table HT with CANON's strings.  Returns how
+   many values changed."
+  (let ((pairs nil) (n 0))
+    (when (hash-table-p ht)
+      (maphash (lambda (k v)
+                 (when (stringp v)
+                   (let ((c (%canonical-name v canon)))
+                     (unless (eq c v) (setq pairs (cons (cons k c) pairs))))))
+               ht)
+      (dolist (p pairs)
+        (puthash (car p) ht (cdr p))
+        (setq n (+ n 1))))
+    n))
 
 (defun %jit-fn-native-p (name)
   (let ((f (%mvm-resolve-runtime-fn name)))
@@ -2641,7 +2772,7 @@
    symbol's function cell and the qualified SFT key are set."
   (let ((p (find-package "MODUS")))
     (when p
-      (dolist (nm (list "JIT-EAGER"))
+      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE"))
         (let ((fn (%mvm-resolve-runtime-fn nm)))
           (when fn
             (let ((dst (intern nm p)))
@@ -2779,7 +2910,7 @@
     ;;
     ;; The interpreted module is immune for the reason the DEFUN trampolines
     ;; already were: mvm-interpret's op-LI-CONST does
-    ;; `(gethash idx *e2-const-pool*)` at EXECUTION time, so it reads whatever
+    ;; `(%e2-const-ref idx)` at EXECUTION time, so it reads whatever
     ;; the collector has updated the pool to hold.  Measured directly — inside
     ;; ONE lambda body after a collection, an explicit `(gethash idx
     ;; *e2-const-pool*)` returned the live object while the quoted literal
@@ -3056,8 +3187,15 @@
              (lrel *aarch64-fn-addr-local-relocs*)
              (cpat *aarch64-li-const-patches*)
              (eoff (gethash mvm-entry fn-map))
-             (npages (+ 1 (ash nlen -12)))
-             (psize (ash npages 12))
+             ;; EXACT SIZE, 16-aligned: the arena is a bump allocator that
+             ;; hands out 16-aligned blocks (#x0531), so a module needs no
+             ;; page of its own.  Rounding each to a page plus a page of slack
+             ;; was ~2 KB a module -- 5 MB of a 25 MB Zero core's arena.  Pages
+             ;; only if JIT pages are ever freed (%JIT-FREE-PAGE munmaps, which
+             ;; would take the neighbours with them); *JIT-RECLAIM-ON* is unbound.
+             (psize (if (and (boundp (quote *jit-reclaim-on*)) (symbol-value (quote *jit-reclaim-on*)))
+                        (ash (+ 1 (ash nlen -12)) 12)
+                        (logand (+ nlen 15) -16)))
              (b0 (%core-jit-arena-bump))
              (base (%mmap-exec-page psize))
              (b1 (%core-jit-arena-bump))
@@ -5074,7 +5212,7 @@
    shared-store guard refuses: (natrium:sha256 ...) failed on a worker whenever
    main had last used the other U32."
   (let ((p (and (symbolp head) (symbol-package head))))
-    (if p (concatenate (quote string) (package-name p) "::" nm) nm)))
+    (if p (%narrow-copy (concatenate (quote string) (package-name p) "::" nm)) nm)))
 
 (defun %deftype-expander (head entry)
   "The compiled expander trampoline for deftype HEAD whose registered

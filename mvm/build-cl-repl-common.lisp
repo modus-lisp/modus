@@ -503,6 +503,9 @@
 ;; function designator, set just before SAVE-AND-DIE so the heap carries it.
 (defvar *core-restart-hook* nil)
 (defun %core-addr () #x18000000)
+;; NARROW STRINGS ON (prelude.lisp %NARROW-STRINGS-P): the aarch64 collector
+;; sizes #x13 as bytes, so the reader makes them.  Last definition wins.
+(defun %narrow-strings-p () t)
 (defun %core-cursor-slot () #x10000F60)
 ;; Restore progress (lib/save-image.lisp %CORE-PROGRESS): the phase into a word
 ;; of the Device RAM window (0x111Fxxxx survives a board reset; this word is
@@ -2535,6 +2538,10 @@
   (t                (mvm-load "boot/boot-rpi-cl.lisp")))
 
 (in-package :modus.mvm)
+
+;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*) wherever
+;; *CL-REPL-RPI-CORE-SOURCE* turns %NARROW-STRINGS-P on.
+(when cl-user::*cl-repl-rpi-p* (setq *narrow-literals-p* t))
 
 ;;; DIVERGENCE 6/7 (:I386 arm) — the 32-bit x86 boot descriptor and console.
 ;;;

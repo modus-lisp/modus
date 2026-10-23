@@ -2278,6 +2278,24 @@
    not yet handed to %JIT-BUILD-SCRIPT-DEFS.  See cl-eval.lisp, A SCRIPT'S
    OWN DEFUNS START NATIVE.")
 
+(defvar *jit-name-strings* nil
+  "One shared string per function NAME the JIT keeps: every compiled module's
+   runtime-call table names its callees, and each got its OWN copy of the
+   string -- the compiler's literal (\"%AREF-INDEX-ERROR\", \"GENERIC-ADD\")
+   is built afresh per evaluation in an image -- 375 copies of one name in a
+   Zero core.  Canonical copies are narrow when the build has them.")
+
+(defun %jit-canonical-name (name)
+  (if (not (stringp name))
+      name
+      (progn
+        (when (null *jit-name-strings*)
+          (setq *jit-name-strings* (make-hash-table :test (function equal))))
+        (or (gethash name *jit-name-strings*)
+            (let ((c (%narrow-copy name)))
+              (puthash c *jit-name-strings* c)
+              c)))))
+
 (defvar *jit-source-links* nil
   "NAME (string) -> (FILE FORM-INDEX . CHAR-OFFSET): where a runtime DEFUN came
    from, recorded when its module registers -- FILE the file install-tarball is
@@ -2311,6 +2329,7 @@
     (and *jit-source-links* (gethash key *jit-source-links*))))
 
 (defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
+  (setq names (mapcar (function %jit-canonical-name) names))
   (%jit-note-source names)
   (when (and (boundp (quote *%load-depth*)) (eql *%load-depth* 1))
     (setq *jit-script-def-names* (append names (if (consp *jit-script-def-names*)
@@ -2342,7 +2361,7 @@
    keeps the way back to the source.  A module with any name not native --
    failed, skipped, or replaced since -- is left whole.  Returns
    (:PRUNED modules :NAMES n :KEPT modules)."
-  (let ((pruned 0) (nnames 0) (kept 0) (mods nil))
+  (let ((pruned 0) (nnames 0) (kept 0) (mods nil) (narrowed 0))
     (when *jit-module-registry*
       (maphash (lambda (k m) k (unless (member m mods :test (function eq)) (setq mods (cons m mods))))
                *jit-module-registry*)
@@ -2359,7 +2378,50 @@
                 (setq *jit-eager-built* (delete bc *jit-eager-built* :test (function eq)))
                 (setq pruned (+ pruned 1) nnames (+ nnames (length names))))
               (setq kept (+ kept 1))))))
-    (list :pruned pruned :names nnames :kept kept)))
+    (setq narrowed (+ (%narrow-table-keys (if (boundp (quote *symbol-function-table*))
+                                              *symbol-function-table* nil))
+                      (%narrow-table-keys *jit-source-links*)
+                      (%narrow-table-values (if (boundp (quote *sym-name-table*))
+                                                *sym-name-table* nil))))
+    ;; The canonical table has done its job (one string per name, everywhere
+    ;; above); it is ~0.9 MB of entries on a network core.  Later DEFUNs start
+    ;; a fresh one.
+    (setq *jit-name-strings* nil)
+    (list :pruned pruned :names nnames :kept kept :narrowed narrowed)))
+
+(defun %narrow-table-keys (ht)
+  "Re-key EQUAL hash table HT with the JIT's canonical narrow name strings.
+   The image's own entries were put in under inline literals, which are wide:
+   on a Zero network core, *SYMBOL-FUNCTION-TABLE*'s keys alone were most of
+   the wide strings left in the heap.  Returns how many keys changed."
+  (let ((pairs nil) (n 0))
+    (when (hash-table-p ht)
+      (maphash (lambda (k v)
+                 (when (stringp k)
+                   (let ((c (%jit-canonical-name k)))
+                     (unless (eq c k) (setq pairs (cons (cons c v) pairs))))))
+               ht)
+      (dolist (p pairs)
+        (remhash (car p) ht)
+        (puthash (car p) ht (cdr p))
+        (setq n (+ n 1))))
+    n))
+
+(defun %narrow-table-values (ht)
+  "Replace the string values of hash table HT (*SYM-NAME-TABLE*: hash -> name,
+   filled from inline literals) with the canonical narrow name strings.
+   Returns how many values changed."
+  (let ((pairs nil) (n 0))
+    (when (hash-table-p ht)
+      (maphash (lambda (k v)
+                 (when (stringp v)
+                   (let ((c (%jit-canonical-name v)))
+                     (unless (eq c v) (setq pairs (cons (cons k c) pairs))))))
+               ht)
+      (dolist (p pairs)
+        (puthash (car p) ht (cdr p))
+        (setq n (+ n 1))))
+    n))
 
 (defun %jit-fn-native-p (name)
   (let ((f (%mvm-resolve-runtime-fn name)))
@@ -3958,7 +4020,7 @@
               (let ((info (make-function-info :name name :bytecode-offset rt-next
                                               :bytecode-length 0)))
                 (setf (gethash name *functions*) info)
-                (setf (gethash rt-next rt-table) name)
+                (setf (gethash rt-next rt-table) (%jit-canonical-name name))
                 ;; The interpreter's per-stub cache cell (%mvm-rt-cell-fn), made HERE
                 ;; on the compiling thread: an actor running this module only RPLACAs it.
                 (setf (gethash (- rt-next) rt-table) (cons nil 0))
@@ -4569,7 +4631,7 @@
             (let ((info (make-function-info :name name :bytecode-offset rt-next
                                             :bytecode-length 0)))
               (setf (gethash name *functions*) info)
-              (setf (gethash rt-next rt-table) name)
+              (setf (gethash rt-next rt-table) (%jit-canonical-name name))
               ;; The interpreter's per-stub cache cell (%mvm-rt-cell-fn), made HERE
               ;; on the compiling thread: an actor running this module only RPLACAs it.
               (setf (gethash (- rt-next) rt-table) (cons nil 0))
@@ -5015,7 +5077,7 @@
    shared-store guard refuses: (natrium:sha256 ...) failed on a worker whenever
    main had last used the other U32."
   (let ((p (and (symbolp head) (symbol-package head))))
-    (if p (concatenate (quote string) (package-name p) "::" nm) nm)))
+    (if p (%narrow-copy (concatenate (quote string) (package-name p) "::" nm)) nm)))
 
 (defun %deftype-expander (head entry)
   "The compiled expander trampoline for deftype HEAD whose registered

@@ -236,7 +236,10 @@
       ;; (Not SIMPLE-STRING-P: it answers T for these.  An ordinary string
       ;; is subtag #x31; the fill-pointer/adjustable/displaced one is the
       ;; #x34 MDA header.)
-      (if (and (stringp str) (not (consp str)) (not (= (obj-subtag str) #x31)))
+      (if (and (stringp str) (not (consp str))
+               ;; the simple ones: wide (#x31), narrow (#x13), 32-bit (#x15)
+               (not (= (obj-subtag str) #x31)) (not (= (obj-subtag str) #x13))
+               (not (= (obj-subtag str) #x15)))
           ;; Any OTHER non-simple string (the MDA representation that
           ;; fill-pointer / adjustable / displaced MAKE-ARRAY now builds)
           ;; went through untouched and %PRIM-AREF read its header as

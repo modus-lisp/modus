@@ -8053,7 +8053,7 @@
         ;; left that pointer un-forwarded, and modus-sh --compile-uefi then read
         ;; a stale threshold and compiled 2^130 as a small bignum (the UEFI DDC
         ;; caught it).  Only pointer-free layouts may be skipped.
-        (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+        (dolist (st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x60 #x64 #x65 #x66))
           (emit-cmp-reg-imm buf 'r8 st)
           (emit-jcc buf :e leaf))
         (emit-jmp buf scan-it)
@@ -8062,7 +8062,11 @@
         (emit-shr-reg-imm buf 'r9 8)                   ; r9 = element count
         (emit-cmp-reg-imm buf 'r8 #x11)
         (emit-jcc buf :e sz-u8)
+        (emit-cmp-reg-imm buf 'r8 #x13)                ; narrow string: bytes too
+        (emit-jcc buf :e sz-u8)
         (emit-cmp-reg-imm buf 'r8 #x12)
+        (emit-jcc buf :e sz-f32)
+        (emit-cmp-reg-imm buf 'r8 #x15)                ; 32-bit string: 4 bytes/char
         (emit-jcc buf :e sz-f32)
         (emit-add-reg-imm buf 'r9 2)                   ; general: (count+2)*8, align 16
         (emit-shl-reg-imm buf 'r9 3)
@@ -8686,7 +8690,11 @@
         (emit-and-reg-imm buf 'r9 #xFF)          ; r9 = subtag byte
         (emit-cmp-reg-imm buf 'r9 #x11)          ; u8-vector?
         (emit-jcc buf :e u8-size)
+        (emit-cmp-reg-imm buf 'r9 #x13)          ; narrow string: bytes too
+        (emit-jcc buf :e u8-size)
         (emit-cmp-reg-imm buf 'r9 #x12)          ; f32-vector? (4 bytes/lane)
+        (emit-jcc buf :e f32-size)
+        (emit-cmp-reg-imm buf 'r9 #x15)          ; 32-bit string: 4 bytes/char
         (emit-jcc buf :e f32-size)
         ;; ---- General (word) object: size = (count + 2) * 8, align 16 ----
         (emit-add-reg-imm buf 'r8 2)             ; count + 2
@@ -9707,7 +9715,11 @@
         (emit-and-reg-imm buf 'r9 #xFF)
         (emit-cmp-reg-imm buf 'r9 #x11)
         (emit-jcc buf :e u8-size)
+        (emit-cmp-reg-imm buf 'r9 #x13)
+        (emit-jcc buf :e u8-size)
         (emit-cmp-reg-imm buf 'r9 #x12)
+        (emit-jcc buf :e f32-size)
+        (emit-cmp-reg-imm buf 'r9 #x15)
         (emit-jcc buf :e f32-size)
         (emit-add-reg-imm buf 'r8 2)
         (emit-shl-reg-imm buf 'r8 3)

@@ -289,9 +289,19 @@
     (if (oddp z) (- (ash (+ z 1) -1)) (ash z -1))))
 
 (defun %fd-string (cur)
-  (let* ((n (%fd-uint cur)) (s (make-string n)))
-    (dotimes (i n) (setf (char s i) (code-char (%fd-uint cur))))
-    s))
+  ;; Read the codes first, then build: NARROW (a byte per character) when the
+  ;; build has narrow strings and every code fits -- a cached module's strings
+  ;; are its literals and names, as the reader would have made them.
+  (let* ((n (%fd-uint cur)) (codes (make-array n)) (narrow (%narrow-strings-p)))
+    (dotimes (i n)
+      (let ((c (%fd-uint cur)))
+        (setf (svref codes i) c)
+        (when (>= c 256) (setq narrow nil))))
+    (if narrow
+        (let ((s (%make-base-string n)))
+          (dotimes (i n s) (%u8-set s i (svref codes i))))
+        (let ((s (make-string n)))
+          (dotimes (i n s) (setf (char s i) (code-char (svref codes i))))))))
 
 (defun %fasl-dec (cur unint)
   (let ((tag (%fd-byte cur)))

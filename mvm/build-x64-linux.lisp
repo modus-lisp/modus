@@ -1642,6 +1642,11 @@
     ;; positional, misbinding when callers pass `:test bar`).  Replace
     ;; the &key-using helpers with &rest forwarders that route through
     ;; apply (which the compiler handles correctly on a single &rest).
+    ;; 4a. NARROW STRINGS ON: x64's collector sizes #x13 as bytes (prelude.lisp
+    ;; %NARROW-STRINGS-P), so the reader makes them -- last definition wins.
+    "
+(defun %narrow-strings-p () t)
+"
     "
 ;; Aux overrides — replace &key-using helpers with &rest versions.
 ;; make-array-with-checks — array-aux.lsp's def uses &key with supplied-p
@@ -1809,6 +1814,10 @@
 (mvm-load "boot/boot-linux-x64.lisp")
 
 (in-package :modus.mvm)
+
+;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*), with the
+;; %NARROW-STRINGS-P override in *FULL-SOURCE*.
+(setq *narrow-literals-p* t)
 
 ;; Override linux-x64-boot-descriptor to include nil page mmap
 ;; (car nil must not segfault)

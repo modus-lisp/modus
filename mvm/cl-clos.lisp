@@ -6754,6 +6754,8 @@
     ((%prim-simple-string-p a) (code-char (%word-aref a i)))
     ((%prim-simple-vector-p a) (%word-aref a i))
     ((%prim-u8-vector-p a) (%u8-ref a i))
+    ((%prim-base-string-p a) (code-char (%u8-ref a i)))
+    ((%prim-string32-p a) (code-char (%c32-ref a i)))
     ((%mda-p a)
      (let ((disp (%mda-displaced a)))
        (let ((raw (if disp
@@ -6770,6 +6772,20 @@
 (defun %aset-slow (a i val)
   (let ((sto (%aset-store-val a val)))
     (cond
+      ;; A NARROW string holds a byte per character: a code that does not fit
+      ;; is refused, never truncated.  (Narrow strings are literals and names,
+      ;; which CL leaves immutable; MAKE-STRING's strings are wide.)
+      ((%prim-base-string-p a)
+       (let ((c (%ensure-char-code sto)))
+         (if (and (fixnump c) (< c 256))
+             (progn (%u8-set a i c) val)
+             (error "~S cannot be stored in a narrow (base) string" val))))
+      ;; A 32-bit string holds any character's code, and nothing else.
+      ((%prim-string32-p a)
+       (let ((c (%ensure-char-code sto)))
+         (if (fixnump c)
+             (progn (%c32-set a i c) val)
+             (error 'type-error :datum val :expected-type 'character))))
       ((%mda-p a)
        (let ((disp (%mda-displaced a)))
          (if disp

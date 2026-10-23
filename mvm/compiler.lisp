@@ -50,6 +50,21 @@
 (defconstant +subtag-string+ #x31)
 (defconstant +subtag-array+  #x32)
 (defconstant +subtag-u8-vector+ #x11)   ; byte-packed (unsigned-byte 8) vector
+;; NARROW STRING: a string whose every code is < 256, one BYTE per character --
+;; the u8 vector's layout (header (N<<8)|#x13, pad word, N packed bytes) under
+;; its own subtag, so the collectors size it exactly as #x11 and every octet
+;; predicate (exact #x11) still excludes it.  A wide string (#x31) spends a word
+;; per character; on a Zero network core 98.8% of string content was narrow.
+;; Made by the producers whose results CL leaves immutable (reader literals and
+;; tokens, symbol names, the JIT's name keys); MAKE-STRING and friends stay wide.
+(defconstant +subtag-base-string+ #x13)
+;; 32-BIT STRING: the general (CHARACTER) string of a narrow-strings build --
+;; MAKE-STRING and every %MAKE-STRING-ARRAY producer -- with one raw u32 code per
+;; character (header (N<<8)|#x15, pad word, 4N bytes): half the #x31 form, which
+;; spends a tagged word per character.  Any code fits.  Its own subtag rather
+;; than a new #x31 layout: code that reads a #x31 string as words and was not
+;; taught #x15 says "not a string" instead of reading the wrong bytes.
+(defconstant +subtag-string32+ #x15)
 (defconstant +subtag-f32-vector+ #x12)  ; packed single-float vector (4-byte IEEE32 lanes)
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-mda+    #x34)   ; 7-slot multi-dim array header:
@@ -918,6 +933,15 @@
    OUTPUT-codegen sites (compile-quote's :li-const path, compile-variable-ref's
    checked read) test (and *mvm-eval-runtime-p* (not *static-build-p*)).")
 
+(defvar *narrow-literals-p* nil
+  "T in a build whose collector sizes narrow strings (#x13, x64 and AArch64):
+   an AOT string literal whose codes all fit a byte is pooled once -- cross.lisp
+   lays a pooled string out narrow on those targets -- and each evaluation
+   returns %FRESH-STRING of it, a narrow copy.  Fresh per evaluation, as the
+   char-by-char path below is (pooling the object itself had CLOS regressions),
+   but one call instead of three instructions per character, and an eighth of
+   the bytes.  Set by the build scripts next to their %NARROW-STRINGS-P.")
+
 (defvar *ws5-str-bake-min* 0
   "WS5 GC-corruption threshold PROBE.  In a static build, a quoted STRING whose
    length is >= this value is BAKED into the serialized constant pool (adds pool
@@ -1063,6 +1087,16 @@
    unmodified ansi-test's compile-and-load.lsp replaced COMPILE-FILE-PATHNAME
    with its own fallback.  Saved/restored with SETQ, not LET (see
    *MVM-GENSYM-COUNTER*).")
+
+(defun %string32-on-p ()
+  "Does this build make #x15 strings (and so emit their arms)?  The AOT build
+   says so with *NARROW-LITERALS-P*; in-image, %NARROW-STRINGS-P does."
+  (if *mvm-eval-runtime-p* (%narrow-strings-p) *narrow-literals-p*))
+
+(defun %maybe-narrow (s)
+  "A name key, narrow in-image (prelude.lisp %NARROW-COPY); the host build,
+   which has neither narrow strings nor that function, keeps S."
+  (if *mvm-eval-runtime-p* (%narrow-copy s) s))
 
 (defvar *e2-persist-defuns* nil
   "COMPILER-RECORDED DEFUN PERSISTENCE (in-image ONLY, *mvm-eval-runtime-p*
@@ -2565,7 +2599,7 @@
   (if (and *mvm-eval-runtime-p* (%cl-sym-p fn))
       (let ((pkg (%cl-sym-package fn)))
         (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
-            (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn))
+            (%maybe-narrow (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn)))
             (symbol-name fn)))
       (symbol-name fn)))
 
@@ -2589,7 +2623,7 @@
     (if (and *mvm-eval-runtime-p* (%cl-sym-p sym))
         (let ((pkg (%cl-sym-package sym)))
           (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
-              (concatenate 'string (%pkg-name pkg) "::" base)
+              (%maybe-narrow (concatenate 'string (%pkg-name pkg) "::" base))
               base))
         base)))
 
@@ -2723,7 +2757,7 @@
   (if (%fn-key-unqualify bare)
       bare
       (let ((pn (%fn-key-pkg-of fn)))
-        (if pn (concatenate 'string pn "::" bare) bare))))
+        (if pn (%maybe-narrow (concatenate 'string pn "::" bare)) bare))))
 
 (defun %fn-info-for-key (key)
   "*FUNCTIONS* entry for KEY, falling back to KEY's bare name when the
@@ -2936,7 +2970,7 @@
                      (let ((nm (%cl-sym-name sym)))
                        (and nm (> (length nm) 0)
                             (compute-name-hash
-                             (concatenate 'string pn "::" nm))))))))))
+                             (%maybe-narrow (concatenate 'string pn "::" nm)))))))))))
 
 (defun %global-var-bind-key (sym)
   "Store key for a global-variable WRITE site: DEFVAR/DEFPARAMETER's initform
@@ -8421,6 +8455,10 @@
        (compile-object-subtype-p (cadr form) env dest +subtag-string+))
       ((= op-name #.(compute-name-hash "%PRIM-U8-VECTOR-P"))
        (compile-object-subtype-p (cadr form) env dest +subtag-u8-vector+))
+      ((= op-name #.(compute-name-hash "%PRIM-BASE-STRING-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-base-string+))
+      ((= op-name #.(compute-name-hash "%PRIM-STRING32-P"))
+       (compile-object-subtype-p (cadr form) env dest +subtag-string32+))
       ((= op-name #.(compute-name-hash "%PRIM-SIMPLE-VECTOR-P"))
        (compile-object-subtype-p (cadr form) env dest +subtag-array+))
       ((= op-name #.(compute-name-hash "%RAW-CONSP"))
@@ -8448,6 +8486,10 @@
        (compile-u8-ref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%U8-SET"))
        (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name #.(compute-name-hash "%C32-REF"))
+       (compile-c32-ref (cadr form) (caddr form) env dest))
+      ((= op-name #.(compute-name-hash "%C32-SET"))
+       (compile-c32-set (cadr form) (caddr form) (cadddr form) env dest))
       ((= op-name #.(compute-name-hash "%ALLOC-F32"))
        (compile-alloc-f32 (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%F32-BITS-REF"))
@@ -9082,6 +9124,15 @@
         (let ((idx (length *constant-table*)))
           (push value *constant-table*)
           (emit-ir :li-const dest idx)))
+       ((and *narrow-literals-p* (not *mvm-eval-runtime-p*)
+             (every (lambda (c) (< (char-code c) 256)) value))
+        (let ((idx (length *constant-table*)))
+          (push value *constant-table*)
+          (emit-ir :li-const +vreg-v0+ idx)
+          (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+          (emit-ir :call "%FRESH-STRING" 1)
+          (unless (= dest +vreg-vr+)
+            (emit-ir :mov dest +vreg-vr+))))
        (t
         (let ((n (length value)))
           ;; GC check BEFORE the alloc.  Without it, every quoted string
@@ -21266,6 +21317,14 @@
     (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
+    ;; ...or a narrow string (#x13)
+    (emit-ir :li temp2 (ash +subtag-base-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; ...or a 32-bit string (#x15)
+    (emit-ir :li temp2 (ash +subtag-string32+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
     ;; Check subtag == #x34 (MDA) — if so, peel data slot
     (emit-ir :li temp2 (ash +subtag-mda+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
@@ -21281,6 +21340,14 @@
     (emit-ir :bne false-label)
     (emit-ir :obj-subtag temp dest)
     (emit-ir :li temp2 (ash +subtag-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; ...or a narrow string (#x13)
+    (emit-ir :li temp2 (ash +subtag-base-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; ...or a 32-bit string (#x15)
+    (emit-ir :li temp2 (ash +subtag-string32+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
     ;; The peeled storage is itself an MDA when the array is DISPLACED to a
@@ -21362,6 +21429,14 @@
     (emit-ir :beq true-label)
     ;; Packed single-float vector (subtag #x12).
     (emit-ir :li temp2 (ash +subtag-f32-vector+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; Narrow string (subtag #x13): a string, so an array.
+    (emit-ir :li temp2 (ash +subtag-base-string+ +fixnum-shift+))
+    (emit-ir :cmp temp temp2)
+    (emit-ir :beq true-label)
+    ;; 32-bit string (subtag #x15)
+    (emit-ir :li temp2 (ash +subtag-string32+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
     (emit-ir-label false-label)
@@ -23308,9 +23383,13 @@
   (%u8-simple-array-decl-p (%expr-dtype form env)))
 
 (defun compile-make-string-array (size-form env dest)
-  "Like compile-make-array but with string subtag #x31.
+  "Like compile-make-array but with string subtag #x31 -- or, in a build with
+   32-bit strings (%STRING32-ON-P), a call to %MAKE-STRING32.
    GC-check before each alloc (overshoot-past-R14 hazard; see
    compile-make-bignum)."
+  (if (%string32-on-p)
+      (return-from compile-make-string-array
+        (compile-form `(%make-string32 ,size-form) env dest)))
   (if (and (integerp size-form) (<= size-form 65535))
       (progn
         (emit-ir :gc-check)
@@ -23515,9 +23594,17 @@
         ;; the MISMATCH case (any array that is not byte-packed) is the
         ;; common one — 19 ns of call per element read.  compile-eql now
         ;; folds this itself, but say what is meant.
-        (if (eq (obj-subtag ,g-arr) #x11)
-            (%u8-ref ,g-arr ,g-idx)
-            (%word-aref ,g-arr ,g-idx)))
+        ;; byte-packed: a u8 vector (#x11) or a narrow string (#x13)
+        ,(if (%string32-on-p)
+             `(let ((st (obj-subtag ,g-arr)))
+                (if (or (eq st #x11) (eq st #x13))
+                    (%u8-ref ,g-arr ,g-idx)
+                    (if (eq st #x15)
+                        (%c32-ref ,g-arr ,g-idx)
+                        (%word-aref ,g-arr ,g-idx))))
+             `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
+                  (%u8-ref ,g-arr ,g-idx)
+                  (%word-aref ,g-arr ,g-idx))))
      env dest)))
 
 (defun compile-struct-slot (args setp env dest)
@@ -23572,9 +23659,17 @@
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
         ;; EQ, not EQL — see compile-prim-aref.
-        (if (eq (obj-subtag ,g-arr) #x11)
-            (%u8-set ,g-arr ,g-idx ,g-val)
-            (%word-aset ,g-arr ,g-idx ,g-val)))
+        ,(if (%string32-on-p)
+             `(let ((st (obj-subtag ,g-arr)))
+                (if (or (eq st #x11) (eq st #x13))
+                    (%u8-set ,g-arr ,g-idx ,g-val)
+                    (if (eq st #x15)
+                        ;; a code; a character is lowered to its code
+                        (%c32-set ,g-arr ,g-idx (if (fixnump ,g-val) ,g-val (char-code ,g-val)))
+                        (%word-aset ,g-arr ,g-idx ,g-val))))
+             `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
+                  (%u8-set ,g-arr ,g-idx ,g-val)
+                  (%word-aset ,g-arr ,g-idx ,g-val))))
      env dest)))
 
 (defun compile-prim-array-length (arr-form env dest)
@@ -23778,6 +23873,56 @@
         (free-temp-reg)
         (free-temp-reg))))
 
+;;; %C32-REF / %C32-SET: element I of a 32-bit string (#x15), a raw u32 code at
+;;; byte 16 + 4I of the object.  No opcode of their own: the tagged pointer is
+;;; the address + 9 and the tagged index is 2I, so the element's address is
+;;; ptr + 7 + 2*idx, read or written by the :u32 LOAD / STORE MEM-REF uses.
+;;; Nothing allocates between the address and the access.
+(defun %c32-address (arr-reg idx-reg addr)
+  (let ((k (alloc-temp-reg)))
+    (emit-ir :shl addr idx-reg 1)
+    (emit-ir :add addr addr arr-reg)
+    (emit-ir :li k 7)
+    (emit-ir :add addr addr k)
+    (free-temp-reg)))
+
+(defun compile-c32-ref (arr-form idx-form env dest)
+  "Compile (%c32-ref s i): the code (a fixnum) of element I of #x15 string S."
+  (let ((arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg))
+        (addr (alloc-temp-reg)))
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (let ((skip (make-compiler-label)))
+      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (%c32-address arr-reg idx-reg addr)
+      (emit-ir :load addr addr (car (memory-width-code :u32)))
+      (emit-ir :shl dest addr +fixnum-shift+)
+      (emit-ir-label skip))
+    (free-temp-reg)
+    (free-temp-reg)
+    (free-temp-reg)))
+
+(defun compile-c32-set (arr-form idx-form val-form env dest)
+  "Compile (%c32-set s i code): store fixnum CODE as element I of #x15 string S.
+   Returns CODE.  Value first into its own temp, as COMPILE-U8-SET explains."
+  (let ((val-reg (alloc-temp-reg))
+        (arr-reg (alloc-temp-reg))
+        (idx-reg (alloc-temp-reg))
+        (addr (alloc-temp-reg))
+        (raw (alloc-temp-reg)))
+    (compile-form val-form env val-reg)
+    (compile-form arr-form env arr-reg)
+    (compile-form idx-form env idx-reg)
+    (let ((skip (make-compiler-label)))
+      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (%c32-address arr-reg idx-reg addr)
+      (emit-ir :sar raw val-reg +fixnum-shift+)
+      (emit-ir :store addr raw (car (memory-width-code :u32)))
+      (emit-ir :mov dest val-reg)
+      (emit-ir-label skip))
+    (free-temp-reg) (free-temp-reg) (free-temp-reg) (free-temp-reg) (free-temp-reg)))
+
 ;;; AREF / ASET / ARRAY-LENGTH — wrapper-aware front-ends.
 ;;;
 ;;; Build commit 7c9a463 introduced array wrappers
@@ -23889,6 +24034,10 @@
           ;; Byte-packed (unsigned-byte 8) vector: the interpreter's bytecode
           ;; (every FETCH-* reads it), octet buffers.
           ((%prim-u8-vector-p ,g-arr) (%u8-ref ,g-arr ,g-idx))
+          ;; narrow string (#x13): a byte per character
+          ((%prim-base-string-p ,g-arr) (code-char (%u8-ref ,g-arr ,g-idx)))
+          ,@(if (%string32-on-p)
+                `(((%prim-string32-p ,g-arr) (code-char (%c32-ref ,g-arr ,g-idx)))))
           ,@rest-arms))
      env dest)))
 

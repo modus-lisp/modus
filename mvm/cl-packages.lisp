@@ -153,7 +153,8 @@
   (let ((sym (%alloc-sym3)))
     (aset sym 0 (compute-name-hash name-string))
     (aset sym 1 nil)         ; package
-    (aset sym 2 name-string) ; name
+    ;; name: narrow when it fits (CL forbids modifying a symbol's name)
+    (aset sym 2 (%narrow-copy name-string))
     sym))
 
 ;;; --- Global package registry ---
@@ -435,8 +436,15 @@
                   r)))))))
 
 (defun %symtab-add (table name-string symbol)
-  "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table."
-  (cons (cons name-string symbol) table))
+  "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table.
+   The key is the symbol's own name when they match -- one string per symbol
+   however many packages it is present in -- and narrow when it fits."
+  (let ((sn (symbol-name symbol)))
+    (cons (cons (%narrow-copy (if (and (stringp sn) (string= sn name-string))
+                                  sn
+                                  name-string))
+                symbol)
+          table)))
 
 (defun %symtab-remove (table name-string)
   "Remove NAME-STRING from alist TABLE. Returns new table."
@@ -1821,7 +1829,7 @@
                      (let ((nm (%cl-sym-name sym)))
                        (and nm (stringp nm) (> (length nm) 0)
                             (compute-name-hash
-                             (concatenate 'string pn "::" nm))))))))))
+                             (%narrow-copy (concatenate 'string pn "::" nm)))))))))))
 
 (defun %sym-global-key (sym)
   "Global-value store KEY for SYM: the package-qualified name hash when SYM's

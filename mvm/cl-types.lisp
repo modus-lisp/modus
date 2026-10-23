@@ -528,7 +528,10 @@
   "CLHS: a string that is a SIMPLE-ARRAY -- no fill pointer, not adjustable,
    not displaced.  It used to be STRINGP, so a fill-pointer string (the
    #x34 MDA header, or a cons wrapper) passed as simple."
-  (and (stringp x) (not (consp x)) (= (obj-subtag x) #x31)))
+  (and (stringp x) (not (consp x))
+       ;; a wide (#x31) or narrow (#x13) string object -- the representation is
+       ;; storage only; to the type system both are (SIMPLE-ARRAY CHARACTER (n))
+       (or (= (obj-subtag x) #x31) (= (obj-subtag x) #x13) (= (obj-subtag x) #x15))))
 ;;; ============================================================
 ;;; SUBTYPEP — basic ANSI lattice support.
 ;;;
@@ -4032,7 +4035,8 @@
            (len (length object)))
        ;; A plain #x31 string reads its slots directly (same codes AREF would
        ;; lift to characters and %ENSURE-CHAR-CODE lower again).
-       (if (and (%prim-stringp object) (not (%mda-p object)))
+       (if (and (%prim-stringp object) (not (%mda-p object)) (not (%prim-base-string-p object))
+                (not (%prim-string32-p object)))
            (loop
              (when (>= i len) (return))
              (setq hash (logxor hash (%ensure-char-code (%word-aref object i))))
@@ -5617,11 +5621,14 @@
           (and (not (or (fixnump obj) (characterp obj) (consp obj) (null obj)))
                (not (%complex-p obj))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
-                   (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12))
+                   (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12)
+                   (= (obj-subtag obj) #x13) (= (obj-subtag obj) #x15))
                (let* ((et (and (cdr type) (%element-type-expand (cadr type))))
                       (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
-                      (is-string  (= (obj-subtag obj) #x31))
+                      (is-string  (or (= (obj-subtag obj) #x31)
+                                      (= (obj-subtag obj) #x13)
+                                      (= (obj-subtag obj) #x15)))
                       (is-array   (= (obj-subtag obj) #x32))
                       ;; Byte-packed (unsigned-byte 8) vector (subtag #x11):
                       ;; element type is exactly (UNSIGNED-BYTE 8), NOT T.

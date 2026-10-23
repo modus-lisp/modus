@@ -703,9 +703,76 @@
        (not (eq (obj-subtag src) #x11))
        (not (eq (obj-subtag dst) #x12))
        (not (eq (obj-subtag src) #x12))
+       ;; narrow strings (#x13) are byte-packed too
+       (not (eq (obj-subtag dst) #x13))
+       (not (eq (obj-subtag src) #x13))
+       ;; ...and 32-bit strings (#x15) a u32 per character
+       (not (eq (obj-subtag dst) #x15))
+       (not (eq (obj-subtag src) #x15))
        (if (%prim-stringp dst)
            (%prim-stringp src)
            (not (%prim-stringp src)))))
+
+;;; NARROW STRINGS (compiler.lisp +SUBTAG-BASE-STRING+, #x13): a byte per
+;;; character.  %NARROW-STRINGS-P says whether this build makes them; the
+;;; collectors of the 64-bit targets size #x13 as bytes, and those builds
+;;; override it to T (last definition wins).  Everything READS both kinds
+;;; regardless.
+(defun %narrow-strings-p () nil)
+
+(defun %make-base-string (n)
+  "A fresh narrow string of N zero bytes: a byte vector whose header's subtag
+   is rewritten #x11 -> #x13.  Nothing allocates between the two, so no
+   collection sees the byte vector it briefly was."
+  (let* ((s (%alloc-u8 n))
+         (raw (- (%val->word s) 9)))
+    (setf (mem-ref raw :u32) (logior (ash n 8) #x13))
+    s))
+
+(defun %narrow-copy (s)
+  "S as a narrow string, when this build has them, S is a plain wide string
+   (#x31) and every code fits a byte: a copy at an eighth of the size.  Else S
+   itself.  For strings CL leaves immutable or that are internal -- symbol and
+   package names, the JIT's name keys -- never a caller's mutable string."
+  (if (and (%narrow-strings-p) (not (consp s))
+           (or (%prim-simple-string-p s) (%prim-string32-p s)))
+      (let ((n (array-length s)) (i 0) (ok t))
+        (loop
+          (when (or (not ok) (>= i n)) (return nil))
+          (let ((c (%prim-aref s i)))
+            (unless (and (fixnump c) (< c 256)) (setq ok nil)))
+          (setq i (+ i 1)))
+        (if ok
+            (let ((b (%make-base-string n)) (j 0))
+              (loop
+                (when (>= j n) (return b))
+                (%u8-set b j (%prim-aref s j))
+                (setq j (+ j 1))))
+            s))
+      s))
+
+(defun %make-string32 (n)
+  "A fresh 32-bit string (#x15) of N characters, all code 0: a byte vector of 4N
+   whose header is rewritten to (N << 8) | #x15 -- both halves, since the byte
+   count's header can reach past 32 bits where the character count's does not.
+   What %MAKE-STRING-ARRAY makes in a narrow-strings build (compiler.lisp
+   COMPILE-MAKE-STRING-ARRAY).  Nothing allocates in between."
+  (let* ((s (%alloc-u8 (* 4 n)))
+         (raw (- (%val->word s) 9)))
+    (setf (mem-ref raw :u32) (logand (logior (ash n 8) #x15) #xFFFFFFFF))
+    (setf (mem-ref (+ raw 4) :u32) (ash n -24))
+    s))
+
+(defun %fresh-string (s)
+  "A fresh copy of the pooled string literal S, what an AOT literal evaluates to
+   in a *NARROW-LITERALS-P* build (compiler.lisp): narrow when S is."
+  (if (%prim-base-string-p s)
+      (let* ((n (array-length s)) (b (%make-base-string n)) (j 0))
+        (loop
+          (when (>= j n) (return b))
+          (%u8-set b j (%u8-ref s j))
+          (setq j (+ j 1))))
+      (copy-seq s)))
 
 (defun %u8-bare-p (x)
   "True for a plain byte-packed (subtag #x11) u8 vector: no fill-pointer /
@@ -2045,18 +2112,30 @@
          ;; 64-bit path is FNV-1a exactly as before.
          (if (> +fixnum-bits+ 32)
              (let ((h 2166136261) (len (array-length key)) (i 0))
-               (loop
-                 (when (>= i len) (return nil))
-                 ;; %WORD-AREF: the clause above sent every string that is not a
-                 ;; plain #x31 through a copy, so this is one -- never byte-packed --
-                 ;; and %PRIM-AREF's u8-or-word subtag test per character is waste.
-                 (setq h (logand (* (logxor h (%word-aref key i)) 16777619) #xFFFFFFFF))
-                 (setq i (+ i 1)))
+               ;; A plain string here: wide (#x31, a word per character) or narrow
+               ;; (#x13, a byte) -- chosen ONCE, not per character as %PRIM-AREF
+               ;; would.  Both read the CODE, so equal contents hash equally across
+               ;; the two representations, as an EQUAL table needs.
+               (if (%prim-base-string-p key)
+                   (loop
+                     (when (>= i len) (return nil))
+                     (setq h (logand (* (logxor h (%u8-ref key i)) 16777619) #xFFFFFFFF))
+                     (setq i (+ i 1)))
+                 (if (%prim-string32-p key)
+                   ;; ...or a 32-bit string (#x15): a u32 code per character
+                   (loop
+                     (when (>= i len) (return nil))
+                     (setq h (logand (* (logxor h (%c32-ref key i)) 16777619) #xFFFFFFFF))
+                     (setq i (+ i 1)))
+                   (loop
+                     (when (>= i len) (return nil))
+                     (setq h (logand (* (logxor h (%word-aref key i)) 16777619) #xFFFFFFFF))
+                     (setq i (+ i 1)))))
                (logand h mask))
              (let ((h 1162397) (len (array-length key)) (i 0))   ; #x11BC9D
                (loop
                  (when (>= i len) (return nil))
-                 (setq h (logand (+ (- (ash h 5) h) (%word-aref key i)) #x3FFFFF))
+                 (setq h (logand (+ (- (ash h 5) h) (%prim-aref key i)) #x3FFFFF))
                  (setq i (+ i 1)))
                (logand h mask)))
          (%ht-nohash)))

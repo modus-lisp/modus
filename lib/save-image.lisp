@@ -513,14 +513,14 @@
    aarch64 EMIT-AARCH64-OBJECT-WALK): a byte vector counts bytes, a single-
    float vector 4-byte lanes, everything else words; header and padding word
    first, rounded to 16."
-  (logand (+ 15 (+ 16 (cond ((= subtag #x11) count)
-                            ((= subtag #x12) (* count 4))
+  (logand (+ 15 (+ 16 (cond ((or (= subtag #x11) (= subtag #x13)) count)
+                            ((or (= subtag #x12) (= subtag #x15)) (* count 4))
                             (t (* count 8)))))
           (lognot 15)))
 
 (defun %core-leaf-p (subtag)
   "A raw payload, as the native walk's leaf set: never relocated."
-  (or (= subtag #x10) (= subtag #x11) (= subtag #x12) (= subtag #x14)
+  (or (= subtag #x10) (= subtag #x11) (= subtag #x12) (= subtag #x13) (= subtag #x14) (= subtag #x15)
       (= subtag #x16) (= subtag #x30) (= subtag #x31) (= subtag #x60)
       (= subtag #x64) (= subtag #x65) (= subtag #x66)))
 

@@ -364,14 +364,21 @@
     (if (stringp m) m (let ((n (ignore-errors (symbol-name (type-of e))))) (if (stringp n) n "an error")))))
 
 (defun %sb-raw-report (msg)
-  "MSG to fd 2 with raw write(2) calls from this thread's scratch word."
-  (let ((w (+ (%tls-self-base) (%conv-addr #x100050B0)))
-        (pre "
+  "MSG to fd 2 with raw write(2) calls from this thread's scratch word -- or, on bare metal
+   (net/bare-threads.lisp, the only place %BT-INIT is defined), to the serial console: there
+   is no OS behind a write(2) there, and the SVC halted the core, so the one report of what
+   went wrong was what stopped the board (the thread's error, already caught, was lost)."
+  (let ((pre "
 modus: unhandled error in a thread: "))
-    (dolist (str (list pre msg (string #\Newline)))
-      (dotimes (i (length str))
-        (%gc-write64 w (logand (char-code (char str i)) 255))
-        (syscall3 1 2 w 1)))))
+    (if (fboundp '%bt-init)
+        (dolist (str (list pre msg (string #\Newline)))
+          (dotimes (i (length str))
+            (%serial-byte (logand (char-code (char str i)) 255))))
+        (let ((w (+ (%tls-self-base) (%conv-addr #x100050B0))))
+          (dolist (str (list pre msg (string #\Newline)))
+            (dotimes (i (length str))
+              (%gc-write64 w (logand (char-code (char str i)) 255))
+              (syscall3 1 2 w 1)))))))
 
 (defun %sb-publish-value (v)
   "V as a message: a copy JOIN-THREAD can hand to another thread, or the

@@ -29,13 +29,13 @@ aarch64-virt       | -                                                 | mvm/bui
 rpi-cl-repl        | -                                                 | mvm/build-rpi-cl-repl.lisp
 rpi-cl-repl-board  | MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1 | mvm/build-rpi-cl-repl.lisp
 
-# ---- hosted ladder ports (take a source file) ----
-68k-linux          | -                                                 | mvm/build-68k-linux.lisp test/arch-rungs/r08-cons.lisp
-arm32-linux        | -                                                 | mvm/build-arm32-linux.lisp test/arch-rungs/r08-cons.lisp
-ppc32-linux        | -                                                 | mvm/build-ppc32-linux.lisp test/arch-rungs/r08-cons.lisp
-ppc64-linux        | -                                                 | mvm/build-ppc64-linux.lisp test/arch-rungs/r08-cons.lisp
-riscv-linux        | -                                                 | mvm/build-riscv-linux.lisp test/arch-rungs/r08-cons.lisp
-riscv32-linux      | -                                                 | mvm/build-riscv32-linux.lisp test/arch-rungs/r08-cons.lisp
+# ---- hosted ladder ports: mvm/build-hosted.lisp ARCH SOURCE ----
+68k-linux          | -                                                 | mvm/build-hosted.lisp 68k test/arch-rungs/r08-cons.lisp
+arm32-linux        | -                                                 | mvm/build-hosted.lisp arm32 test/arch-rungs/r08-cons.lisp
+ppc32-linux        | -                                                 | mvm/build-hosted.lisp ppc32 test/arch-rungs/r08-cons.lisp
+ppc64-linux        | -                                                 | mvm/build-hosted.lisp ppc64 test/arch-rungs/r08-cons.lisp
+riscv-linux        | -                                                 | mvm/build-hosted.lisp riscv64 test/arch-rungs/r08-cons.lisp
+riscv32-linux      | -                                                 | mvm/build-hosted.lisp riscv32 test/arch-rungs/r08-cons.lisp
 
 # ---- mini-Lisp (repl-source) images: build.lisp native cells ----
 x64-repl           | -                                                 | mvm/build.lisp x64/bare/qemu/repl

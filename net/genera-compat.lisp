@@ -106,27 +106,28 @@
 ;;; 2.  FUTURE-COMMON-LISP
 ;;;
 ;;; On a real Genera, LISP is CLtL1 and FUTURE-COMMON-LISP is the ANSI CL
-;;; package.  On Modus, COMMON-LISP *is* the ANSI package — there is no
-;;; CLtL1 package to be distinct from.  So FUTURE-COMMON-LISP is not a
-;;; separate namespace here; it is another name for COMMON-LISP, installed
-;;; as a nickname.  cl-ppcre's
+;;; package.  On Modus, COMMON-LISP *is* the ANSI package, so
+;;; FUTURE-COMMON-LISP is a package that USES COMMON-LISP and EXPORTS every
+;;; one of its external symbols -- an exported inherited symbol is that very
+;;; symbol, so a package that uses FUTURE-COMMON-LISP sees exactly CL's.
+;;; cl-ppcre's
 ;;;     (:use #-:genera :cl #+:genera :future-common-lisp)
 ;;;     #+:genera (:shadowing-import-from :common-lisp :lambda :simple-string :string)
 ;;; then means exactly what the #-:genera branch meant, and the
-;;; shadowing-import is a no-op because the three symbols it imports are
-;;; already the very symbols inherited.
+;;; shadowing-import is a no-op because the three symbols are already the
+;;; ones inherited.
 ;;;
-;;; A separate package that :USEs CL would NOT work: :USE is not transitive,
-;;; so a package using FUTURE-COMMON-LISP would inherit only FCL's own
-;;; externals, and every CL symbol would have to be re-exported by hand.
-;;; The nickname is both simpler and semantically the truth.
+;;; It used to be a NICKNAME of COMMON-LISP, which is non-conforming: CLHS
+;;; 11.1.2.1 gives COMMON-LISP the one nickname CL (upstream ansi-test
+;;; COMMON-LISP-PACKAGE-NICKNAMES).
 ;;; =====================================================================
 
-(defun %genera-add-cl-nickname ()
-  (let ((cl (find-package "COMMON-LISP")))
-    (when (and cl (not (find-package "FUTURE-COMMON-LISP")))
-      (rename-package cl "COMMON-LISP"
-                      (cons "FUTURE-COMMON-LISP" (package-nicknames cl))))))
+(defun %genera-make-future-common-lisp ()
+  (unless (find-package "FUTURE-COMMON-LISP")
+    (let ((fcl (make-package "FUTURE-COMMON-LISP" :use (list "COMMON-LISP")))
+          (syms nil))
+      (do-external-symbols (s "COMMON-LISP") (push s syms))
+      (export syms fcl))))
 
 ;;; =====================================================================
 ;;; 3.  GRAY-STREAMS
@@ -352,7 +353,7 @@
       (setq *features* (cons :genera *features*)))))
 
 (defun %init-genera-compat ()
-  (handler-case (%genera-add-cl-nickname) (t (c) nil))
+  (handler-case (%genera-make-future-common-lisp) (t (c) nil))
   (%genera-install-features)
   t)
 

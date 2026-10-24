@@ -309,6 +309,13 @@
     "(defmacro return (&rest args)
        (list 'return-from nil (if args (car args) nil)))"
 
+    ;; LOOP-FINISH is a macro (CLHS 6.2), so MACRO-FUNCTION must answer for it
+    ;; inside a LOOP body (upstream LOOP-FINISH.ERROR.1).  LOOP itself rewrites
+    ;; every (LOOP-FINISH) in its clauses; this global definition is what any
+    ;; other occurrence reaches, and there is no loop for it to finish.
+    "(defmacro loop-finish ()
+       (list 'error \"LOOP-FINISH used outside a LOOP\"))"
+
     ;; (1+ / 1- are FUNCTIONS -- CL-TYPES defines them and the compiler
     ;; open-codes them; as runtime macros MACRO-FUNCTION answered true for
     ;; two standard functions, upstream MACRO-FUNCTION.5.)
@@ -758,7 +765,7 @@
           ;; comment claimed :genera was unusable because it "reexports
           ;; FUTURE-COMMON-LISP, which Modus lacks".  Measured, that is
           ;; wrong: cl-ppcre's (:use :future-common-lisp) is satisfied by
-          ;; making FUTURE-COMMON-LISP a nickname of COMMON-LISP — on Modus
+          ;; a FUTURE-COMMON-LISP that re-exports all of COMMON-LISP — on Modus
           ;; the CL package IS the ANSI package — and cl-ppcre loads
           ;; bit-identically with :genera on.  Task #237.)
           (unless (member :modus *features*)

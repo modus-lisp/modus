@@ -62,7 +62,7 @@ cp "$here/test/ansi-upstream/shard.lisp" "$pristine/zz-shard.lisp"
 run_shard() { # index lo hi
   local t=$out/trees/t$1
   cp -a "$pristine" "$t"
-  ( cd "$t" && SHARD_LO=$2 SHARD_HI=$3 ${names:+SHARD_NAMES=$names} \
+  ( cd "$t" && env SHARD_LO=$2 SHARD_HI=$3 ${names:+SHARD_NAMES=$names} \
       timeout 7200 "$bin" --script zz-shard.lisp < /dev/null > "$out/s$1.out" 2>&1
     echo "rc=$?" >> "$out/s$1.out" )
 }

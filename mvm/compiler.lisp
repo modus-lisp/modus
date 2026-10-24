@@ -6267,11 +6267,23 @@
                        ;; the reader as a method specialized on NAME so the
                        ;; bare defun below doesn't CLOBBER the generic's
                        ;; existing methods (which broke register-system's
-                       ;; (component-name system) with a TYPE-ERROR).  Only
-                       ;; when no GF exists do we install the plain defun.
-                       (push `(unless (%cond-install-reader
-                                       (quote ,r) (quote ,name) (quote ,sname))
-                                (defun ,r (c) (%condition-slot c (quote ,sname))))
+                       ;; (component-name system) with a TYPE-ERROR).
+                       ;; RUNTIME code (mvm-eval) always makes the reader a
+                       ;; generic function, installing a dispatcher as DEFCLASS
+                       ;; does when none exists (upstream
+                       ;; CONDITION-27-READER-IS-GENERIC).  The IMAGE's own
+                       ;; conditions keep the plain defun when no GF exists: a
+                       ;; dispatcher there would depend on a boot-time
+                       ;; %DEFMETHOD, and image toplevel forms need not run.
+                       (push (if *mvm-eval-runtime-p*
+                                 `(progn
+                                    (unless (%find-gf (quote ,r))
+                                      (%install-accessor-dispatcher (quote ,r) ':reader))
+                                    (%cond-install-reader
+                                     (quote ,r) (quote ,name) (quote ,sname)))
+                                 `(unless (%cond-install-reader-if-generic
+                                           (quote ,r) (quote ,name) (quote ,sname))
+                                    (defun ,r (c) (%condition-slot c (quote ,sname)))))
                              acc)))))))
         `(progn ,def-call ,@reader-defuns))))
 
@@ -10769,7 +10781,7 @@
    compiled code sees CL's CONSP, which excludes the hash-table cons (see
    %RT-CONSP-EXPANSION): a cons whose cdr is a cons whose car is the tag."
   ;; ... nor a package, stream, readtable or random state: a fixnum tag in
-  ;; the CAR (987654321 / 7770001 / 7770003 / 7770005; see %RT-CONSP).
+  ;; the CAR (987654321 / 7770001 / 7770003 / 7770005 / 7770007; see %RT-CONSP).
   (let ((temp nil) (temp2 nil) (through (make-compiler-label))
         (carcheck (make-compiler-label)))
     (compile-form arg env dest)
@@ -10792,7 +10804,7 @@
       (emit-ir :car temp dest)
       (emit-ir :test-imm temp 1)
       (emit-ir :bne through)                                     ; not a fixnum
-      (dolist (tag '(987654321 7770001 7770003 7770005))
+      (dolist (tag '(987654321 7770001 7770003 7770005 7770007))
         (emit-ir :cmp-imm temp (ash tag +fixnum-shift+))
         (emit-ir :beq false-label))
       (free-temp-reg))
@@ -22970,7 +22982,8 @@
                  (let ((,c (car ,g)))
                    (if (fixnump ,c)
                        (not (or (eql ,c 987654321) (eql ,c 7770001)
-                                (eql ,c 7770003) (eql ,c 7770005)))
+                                (eql ,c 7770003) (eql ,c 7770005)
+                                (eql ,c 7770007)))
                        t))))
            nil))))
 

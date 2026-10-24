@@ -460,15 +460,19 @@
 ;;; unrelated instance (register-system → (component-name system)) then ran
 ;;; the condition's slot reader and TYPE-ERROR'd.  Fix: if a GF exists,
 ;;; register the condition reader as a METHOD specialized on the condition
-;;; CLASS-NAME instead of shadowing the GF; return T so the expansion
-;;; suppresses the plain defun.  If no GF exists, return NIL → the plain
-;;; defun is installed (the common, byte-stable case).
+;;; CLASS-NAME instead of shadowing the GF.  The expansion has already made
+;;; READER-NAME a dispatcher when no GF existed, so %DEFMETHOD creates the GF
+;;; here and the reader is generic either way.
 (defun %cond-install-reader (reader-name class-name slot-name)
+  (%defmethod reader-name nil (list class-name)
+              (lambda (c) (%condition-slot c slot-name)))
+  t)
+
+;;; The image's own DEFINE-CONDITIONs (build-time expansion): a method only when
+;;; a GF already exists; NIL -> the expansion installs the plain defun.
+(defun %cond-install-reader-if-generic (reader-name class-name slot-name)
   (if (%find-gf reader-name)
-      (progn
-        (%defmethod reader-name nil (list class-name)
-                    (lambda (c) (%condition-slot c slot-name)))
-        t)
+      (%cond-install-reader reader-name class-name slot-name)
       nil))
 
 (defun type-error-datum (c) (%condition-slot c 'datum))
@@ -2155,6 +2159,10 @@
            (member super '(character)))
       (and (eq sub 'standard-char) (member super '(base-char character)))
       (and (eq sub 'base-char)     (eq super 'character))
+      ;; ... and every character IS a base character here (TYPEP and TYPE-OF
+      ;; say so; CLHS 13.1.4.1 lets BASE-CHAR be all of CHARACTER), so the
+      ;; two are one type (UPGRADED-ARRAY-ELEMENT-TYPE.2).
+      (and (member sub '(character extended-char)) (eq super 'base-char))
       ;; Atom/compound
       (and (not (member sub '(cons list sequence))) (eq super 'atom))
       ;; Symbol/keyword
@@ -2272,6 +2280,10 @@
     ;; Trivial cases first: handle T and NIL specially.
     ((null t1) (cons t t))
     ((eq t1 'nil) (cons t t))
+    ;; every character is a base character here, so EXTENDED-CHAR (CHARACTER
+    ;; minus BASE-CHAR) is empty -- a subtype of everything
+    ;; (SUBTYPEP.EXTENDED-CHAR.1)
+    ((eq t1 'extended-char) (cons t t))
     ((eq t2 't) (cons t t))
     ;; (CONS NIL ...) / (CONS ... NIL) is the empty type, a subtype of
     ;; everything (upstream SUBTYPEP.CONS.2).
@@ -2903,16 +2915,8 @@
   ;; without walking *all-packages*.  Stored at a fixed mem slot
   ;; (not a special var) to avoid recursive intern.
   (%init-pkg-by-hash)
-  ;; "LISP" is added alongside "CL" as a nickname.  The gcl ansi-test
-  ;; suite (and many older CL programs) reference the standard package
-  ;; via `'lisp`, e.g. cl-symbols-aux.lsp's
-  ;;   (defun is-external-symbol-of (sym package)
-  ;;     (do-external-symbols (s package) ...))
-  ;; called as `(is-external-symbol-of str 'lisp)`.  Without the LISP
-  ;; nickname, find-package returns NIL and do-external-symbols
-  ;; iterates nothing — every cl-symbols.lsp test fails GOT:T EXP:NIL.
-  ;; "LISP" is an accepted historical nickname per CLHS.
-  (make-package "COMMON-LISP" :nicknames (list "CL" "LISP") :use nil)
+  ;; CLHS 11.1.2.1: COMMON-LISP's one nickname is CL.
+  (make-package "COMMON-LISP" :nicknames (list "CL") :use nil)
   (%register-pkg-by-hash (find-package "COMMON-LISP"))
   (make-package "COMMON-LISP-USER" :nicknames (list "CL-USER") :use (list "CL"))
   (%register-pkg-by-hash (find-package "COMMON-LISP-USER"))

@@ -456,8 +456,8 @@
 
 (defun sb-ext:seed-random-state (&optional state)
   "A random state seeded by STATE: an integer seeds it, T or NIL gives a fresh one, a random
-   state is copied.  modus's random state is (RANDOM-STATE seed)."
-  (cond ((integerp state) (list 'random-state state))
+   state is copied.  modus's random state is (7770005 seed): see RANDOM-STATE-P."
+  (cond ((integerp state) (list 7770005 (logand state #x3FFFFFFF)))
         ((or (null state) (eq state t)) (make-random-state t))
         (t (make-random-state state))))
 

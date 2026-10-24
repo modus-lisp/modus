@@ -798,8 +798,10 @@
    retry (it reads the error's text) and dropped DEFUNs."
   (and (not (member obj *%print-object-active* :test (function eq)))
        (let ((gf (%find-gf 'print-object)))
+         ;; the system's own default method does not count: the printer IS
+         ;; that default, and handles *PRINT-LEVEL* / readable pathnames
          (and gf (%gf-methods gf)
-              (not (null (%collect-applicable-methods gf (list obj *standard-output*))))))))
+              (%gf-applicable-non-default-p gf (list obj *standard-output*))))))
 
 (defun %print-object-user (obj stream)
   "PRINT-OBJECT, with OBJ marked as being printed (see %USER-PRINT-OBJECT-P)."
@@ -1269,6 +1271,13 @@
       ((readtablep obj)
        (%print-char 35 stream) (%print-char 60 stream)
        (%print-string-raw "READTABLE" stream)
+       (%print-char 62 stream))
+      ;; A method record is a tagged cons too (%MAKE-METHOD).
+      ((%standard-method-p obj)
+       (%print-string-raw "#<STANDARD-METHOD " stream)
+       (%write-obj-0 (%method-qualifier obj) stream level t)
+       (%print-char 32 stream)
+       (%write-obj-0 (%method-specializers obj) stream level t)
        (%print-char 62 stream))
       ;; Cons (list)
       ((consp obj)

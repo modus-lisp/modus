@@ -641,7 +641,9 @@
   (and (stringp x) (not (consp x))
        ;; a wide (#x31) or narrow (#x13) string object -- the representation is
        ;; storage only; to the type system both are (SIMPLE-ARRAY CHARACTER (n))
-       (or (= (obj-subtag x) #x31) (= (obj-subtag x) #x13) (= (obj-subtag x) #x15))))
+       (or (= (obj-subtag x) #x31) (= (obj-subtag x) #x13) (= (obj-subtag x) #x15)
+           ;; or a simple (VECTOR NIL)
+           (%simple-nil-vector-p x))))
 ;;; ============================================================
 ;;; SUBTYPEP — basic ANSI lattice support.
 ;;;
@@ -4911,7 +4913,10 @@
 (defvar *random-state* (list 7770005 12345))
 
 (defun random-state-p (x)
-  (and (consp x) (or (eql (car x) 7770005) (eq (car x) 'random-state))))
+  ;; (7770005 seed).  The old (RANDOM-STATE seed) shape is NOT accepted: it is
+  ;; also an ordinary list whose car is a CL symbol, so any such list read
+  ;; back from text was a random state (PRINT.BACKQUOTE.RANDOM.14).
+  (and (consp x) (eql (car x) 7770005)))
 
 (defun make-random-state (&optional state)
   "CLHS: NIL copies the CURRENT state, T makes a fresh randomly seeded one,
@@ -5445,6 +5450,10 @@
     ;; LENGTH (the fill pointer), so a dimension would not round-trip.  Not simple
     ;; either way: claiming SIMPLE-BASE-STRING made (coerce x (type-of x)) copy
     ;; a fill-pointer string (COERCE.1).
+    ((%nil-vector-p obj)
+     (if (%simple-nil-vector-p obj)
+         (list 'simple-array nil (list (length obj)))
+         (list 'vector nil '*)))
     ((stringp obj)
      (if (simple-string-p obj)
          (list 'simple-array 'character (list (length obj)))
@@ -5458,6 +5467,7 @@
     ((packagep obj) 'package)
     ((readtablep obj) 'readtable)
     ((random-state-p obj) 'random-state)
+    ((%standard-method-p obj) 'standard-method)
     ((streamp obj)
      (cond ((broadcast-stream-p obj) 'broadcast-stream)
            ((concatenated-stream-p obj) 'concatenated-stream)
@@ -5630,8 +5640,11 @@
          ((eq tn 'symbol) (or (null obj) (eq obj t) (symbolp obj)))
          ((eq tn 'string) (stringp obj))
          ((eq tn 'simple-string) (simple-string-p obj))
-         ((eq tn 'base-string) (stringp obj))
-         ((eq tn 'simple-base-string) (simple-string-p obj))
+         ;; every character is a base character, so every string is a
+         ;; base string -- except a (VECTOR NIL), whose element type is NIL
+         ((eq tn 'base-string) (and (stringp obj) (not (%nil-vector-p obj))))
+         ((eq tn 'simple-base-string)
+          (and (simple-string-p obj) (not (%nil-vector-p obj))))
          ((eq tn 'character) (characterp obj))
          ((eq tn 'base-char) (characterp obj))
          ;; the 96 standard characters only (STANDARD-CHAR.5)
@@ -5695,8 +5708,12 @@
          ((eq tn 'condition) (%condition-p obj))
          ;; A CLOS class object is itself an instance of STANDARD-OBJECT
          ;; (and CLASS / STANDARD-CLASS / METAOBJECT / T).  CLHS 4.3.7.
+         ;; So are methods and generic functions (CLHS 4.3.7's class table;
+         ;; upstream TYPES.9A).
          ((eq tn 'standard-object) (or (%clos-instance-p obj)
-                                       (%clos-class-p obj)))
+                                       (%clos-class-p obj)
+                                       (%standard-method-p obj)
+                                       (%generic-function-p obj)))
          ((eq tn 'structure-object) (%struct-instance-p obj))
          ;; A class PROXY (FIND-CLASS of a DEFSTRUCT or a built-in type) is
          ;; a class too, and its metaclass is STRUCTURE-CLASS or
@@ -5849,6 +5866,10 @@
          ((or (eq head 'string) (eq head 'simple-string)
               (eq head 'base-string) (eq head 'simple-base-string))
           (and (stringp obj)
+               ;; the SIMPLE- ones need a simple string, the BASE- ones
+               ;; exclude a (VECTOR NIL) -- as the bare names do above
+               (or (eq head 'string) (eq head 'base-string) (simple-string-p obj))
+               (or (eq head 'string) (eq head 'simple-string) (not (%nil-vector-p obj)))
                (let ((sz (and (cdr type) (cadr type))))
                  (or (null sz) (eq sz '*) (eq sz t)
                      (and (integerp sz) (= sz (array-length obj)))))))
@@ -5873,6 +5894,12 @@
              ;; otherwise element type is T.
              (let ((str (%mda-stringp obj)) (bitp (%mda-bit-p obj)))
                (cond
+                 ;; a (VECTOR NIL): element type exactly NIL.  A GIVEN element
+                 ;; type of NIL is not "unspecified" -- ET is NIL for both, so
+                 ;; ask (CDR TYPE).
+                 ((%nil-vector-p obj)
+                  (or (null (cdr type)) (eq et '*) (null et)))
+                 ((and (cdr type) (null et)) nil)
                  ;; a packed BIT array: element type exactly BIT, and simple
                  ;; only without a fill pointer or displacement
                  (bitp
@@ -5944,6 +5971,10 @@
                                        (bit-vector-p obj)))
                       (et-ok
                        (cond
+                         ;; A GIVEN element type NIL: only a (VECTOR NIL), which
+                         ;; is an MDA (the branch above).  ET is NIL for an
+                         ;; unspecified one too, so ask (CDR TYPE).
+                         ((and (cdr type) (null et)) nil)
                          ;; u8 vector: matches (unsigned-byte 8) and integer
                          ;; supertypes; NOT T / character / bit.
                          (is-u8

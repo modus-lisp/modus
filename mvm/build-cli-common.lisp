@@ -1495,6 +1495,13 @@
       "  (init-all-globals)
 ")
   (%cli-spin "km-after-globals")
+  ;; The standard GFs with system-supplied methods (PRINT-OBJECT,
+  ;; DESCRIBE-OBJECT, INITIALIZE-INSTANCE, ...): the CL REPL images always ran
+  ;; this, the CLI never did, so none of them was a GENERIC-FUNCTION here
+  ;; (upstream ALL-STANDARD-GENERIC-FUNCTIONS-ARE-INSTANCES-OF-THAT-CLASS).
+  ;; After the defvar thunks, which would reset its registries.
+  "  (%init-clos-protocol)
+"
   ;; ARCH SLOT: file-I/O scratch addresses, spliced HERE — after
   ;; (init-all-globals), deliberately.
   ;;

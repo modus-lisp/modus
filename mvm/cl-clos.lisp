@@ -2739,12 +2739,18 @@
                     (error 'unbound-slot :name slot-name :instance obj)))
               (error 'unbound-slot :name slot-name :instance obj)))))))
 
-(defun slot-unbound (class obj slot-name)
+(defun %slot-unbound-builtin (class obj slot-name)
   "Default slot-unbound: signals an unbound-slot condition with
    :instance OBJ and :name SLOT-NAME so handler-case can pull them
    back out via unbound-slot-instance / cell-error-name."
   (declare (ignore class))
   (error 'unbound-slot :name slot-name :instance obj))
+
+(defun slot-unbound (class obj slot-name)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'slot-unbound (list class obj slot-name))))
+    (if %r (car %r) (%slot-unbound-builtin class obj slot-name))))
 
 (defun class-name (cls)
   "Return the name of class CLS.
@@ -2756,12 +2762,10 @@
    The builtin behaviour (read slot-1 of a class / class-proxy) is the
    fallback when no user method applies, which is the common internal
    path and avoids dispatch overhead on every class-object call."
-  (let ((gf (%find-gf 'class-name)))
-    (when (and gf (%gf-p gf) (%gf-methods gf))
-      (let ((applicable (%collect-applicable-methods gf (list cls))))
-        (when applicable
-          (return-from class-name
-            (%gf-dispatch-standard gf (list cls) applicable))))))
+  (let ((%r (%builtin-gf-try 'class-name (list cls))))
+    (if %r (car %r) (%class-name-builtin cls))))
+
+(defun %class-name-builtin (cls)
   (if (%clos-class-p cls)
     (%class-visible-name cls)
     (if (%class-proxy-p cls)
@@ -2973,6 +2977,9 @@
 ;;     specializer-list: list of class-names (or (eql val) forms)
 ;;   combination: nil = standard, or method-combination name symbol
 
+(defvar *%gf-skip-stub* nil
+  "Bound true by %BUILTIN-DEFGENERIC: %MAKE-GF makes no dispatch stub.")
+
 (defun %make-gf (name)
   "Create a new generic function object.
    5-slot vector: #(%generic-function name methods combination lambda-list).
@@ -3005,7 +3012,7 @@
     ;; then jumped through garbage: 0, or a hang (DEFGENERIC.14/22/28/29).
     ;; %MAKE-GF-STUB still runs for its side effect, installing NAME's fast
     ;; native dispatcher; this closure is only the >4-arg FUNCALL entry.
-    (%make-gf-stub name)
+    (unless *%gf-skip-stub* (%make-gf-stub name))
     (aset gf 8 (%make-gf-rest-closure name gf))
     ;; Slot 9: the dispatch cache -- see THE DISPATCH CACHE.
     (aset gf 9 nil)
@@ -3993,21 +4000,35 @@
            (remhash name *e2-gf-name-memo*))
          gf)))))
 
-;; Make a method record: (qualifier specializer-list . fn)
+;; Make a method record: (7770007 qualifier specializer-list . fn).  A TAGGED
+;; cons like a package or a stream (%RT-CONSP), so to user code a method is
+;; not a CONS and TYPE-OF says STANDARD-METHOD (upstream TYPE-OF.1, TYPES.9A).
+;; It used to be (qualifier specializer-list . fn), which also made every list
+;; of that shape a method.
 (defun %make-method (qualifier specializers fn)
-  (cons qualifier (cons specializers fn)))
+  (cons 7770007 (cons qualifier (cons specializers fn))))
 
-(defun %method-qualifier (m)    (car m))
-(defun %method-specializers (m) (cadr m))
-(defun %method-fn (m)           (cddr m))
+(defun %method-qualifier (m)    (cadr m))
+(defun %method-specializers (m) (caddr m))
+(defun %method-fn (m)           (cdddr m))
+
+(defun %builtin-gf-registered-names ()
+  "Names whose BUILT-IN function %INIT-CLOS-PROTOCOL registers as a generic
+   function (so #'NAME is a GENERIC-FUNCTION) without making a GF object."
+  '(shared-initialize change-class reinitialize-instance))
 
 (defun %gf-existing-plain-function (gf-name)
-  "The ordinary (non-generic) function GF-NAME names right now, or NIL."
+  "The ordinary (non-generic) function GF-NAME names right now, or NIL.  A
+   built-in registered by %INIT-CLOS-PROTOCOL counts: it is the system's own
+   implementation, which the first DEFMETHOD must adopt, not drop."
   (and (symbolp gf-name) gf-name (not (eq gf-name t))
        (null (%find-gf gf-name))
        (fboundp gf-name)
        (let ((f (handler-case (fdefinition gf-name) (t (c) nil))))
-         (and (functionp f) (not (typep f 'generic-function)) f))))
+         (and (functionp f)
+              (or (not (typep f 'generic-function))
+                  (member gf-name (%builtin-gf-registered-names)))
+              f))))
 
 (defun %gf-adopt-plain-function (gf-name old n)
   "DEFMETHOD just turned GF-NAME, which named the ordinary function OLD,
@@ -4030,14 +4051,40 @@
 
 (defun %gf-self-dispatching-builtin-p (gf-name)
   "Built-ins whose body looks up their own generic function and dispatches
-   applicable user methods before falling back (grep: (%find-gf 'NAME))."
+   applicable user methods before falling back (grep: (%find-gf 'NAME) and
+   %BUILTIN-GF-TRY)."
   (dolist (n '("CLASS-NAME" "SLOT-UNBOUND" "SLOT-MISSING" "PRINT-OBJECT"
                "DESCRIBE-OBJECT" "SHARED-INITIALIZE" "CHANGE-CLASS"
                "INITIALIZE-INSTANCE" "NO-APPLICABLE-METHOD" "NO-NEXT-METHOD"
                "UPDATE-INSTANCE-FOR-DIFFERENT-CLASS"
-               "UPDATE-INSTANCE-FOR-REDEFINED-CLASS")
+               "UPDATE-INSTANCE-FOR-REDEFINED-CLASS"
+               "ADD-METHOD" "REMOVE-METHOD" "FIND-METHOD" "ALLOCATE-INSTANCE"
+               "COMPUTE-APPLICABLE-METHODS" "FUNCTION-KEYWORDS"
+               "MAKE-INSTANCES-OBSOLETE" "METHOD-QUALIFIERS")
            nil)
     (when (%gf-name-is-p gf-name nil n) (return t))))
+
+(defvar *%builtin-gf-default-fns* nil
+  "The function of each built-in GF's default T method (%INIT-CLOS-PROTOCOL).")
+
+(defun %builtin-gf-try (name args)
+  "For a standard generic function implemented as a built-in: when user
+   methods on NAME apply to ARGS, run them -- the built-in's own default T
+   method last, so CALL-NEXT-METHOD reaches it -- and return (LIST result).
+   NIL when only the default applies: the caller runs the built-in directly,
+   with no dispatch.  The default method exists because runtime-compiled
+   calls to a GF's name dispatch through the GF without calling this
+   function, so every argument must find an applicable method."
+  (let ((gf (%find-gf name)))
+    (when (and gf (%gf-p gf))
+      (let ((ms (%gf-methods gf)))
+        (when (and ms (cdr ms))
+          (let ((applicable (%collect-applicable-methods gf args)))
+            (when (and applicable
+                       (not (and (null (cdr applicable))
+                                 (member (%method-fn (car applicable))
+                                         *%builtin-gf-default-fns*))))
+              (list (%gf-dispatch-standard gf args applicable)))))))))
 
 (defun %defmethod (gf-name qualifier specializers fn)
   "Add or replace a method on a generic function.
@@ -6547,7 +6594,7 @@
             (= (aref na 0) (aref nb 0))) t)
       (t nil))))
 
-(defun find-method (gf qualifiers specializers &rest args)
+(defun %find-method-builtin (gf qualifiers specializers &rest args)
   "Find a method on GF.  ARGS is (errorp); when non-nil and no method
    matches, signal an error.  Accepts either the GF-array or the
    dispatch closure (#'name shape) — the latter resolves through
@@ -6600,7 +6647,13 @@
           result))
       (if errorp (error "find-method: not a generic function") nil))))
 
-(defun remove-method (gf method)
+(defun find-method (gf qualifiers specializers &rest args)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'find-method (list* gf qualifiers specializers args))))
+    (if %r (car %r) (apply (function %find-method-builtin) gf qualifiers specializers args))))
+
+(defun %remove-method-builtin (gf method)
   "Remove METHOD from GF.  Accepts either a GF-array or the dispatch
    closure / fn (#'name) via *gf-fn-to-name* reverse-lookup.  Returns
    the GF AS PASSED (CLHS: returns the generic function) — callers like
@@ -6621,6 +6674,12 @@
         (%gf-set-methods gf (nreverse new-methods))))
     orig))
 
+(defun remove-method (gf method)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'remove-method (list gf method))))
+    (if %r (car %r) (%remove-method-builtin gf method))))
+
 (defun %method-meta-anywhere (method)
   "Find the key-acceptance meta (has-key has-rest aok keynames) for
    METHOD on ANY registered GF (the method may have been REMOVE-METHOD'd
@@ -6634,7 +6693,7 @@
         (when meta (return meta)))
       (setq cur (cdr cur)))))
 
-(defun add-method (gf method)
+(defun %add-method-builtin (gf method)
   "Add METHOD to GF.  Accepts either a GF-array or the dispatch
    closure / fn (#'name) via *gf-fn-to-name* reverse-lookup.  Returns
    the GF AS PASSED (same contract as REMOVE-METHOD).
@@ -6680,6 +6739,12 @@
         (%gf-set-methods gf (cons method (nreverse kept)))))
     orig))
 
+(defun add-method (gf method)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'add-method (list gf method))))
+    (if %r (car %r) (%add-method-builtin gf method))))
+
 ;;; Generic-function metaobject accessors (AMOP).  The data has always been in
 ;;; the GF descriptor (%GF-NAME / %GF-METHODS / %GF-LAMBDA-LIST); these are the
 ;;; portable names for it.  Each accepts either the GF descriptor array, the
@@ -6706,10 +6771,16 @@
   "AMOP: the lambda list GF was declared with."
   (%gf-lambda-list (%gf-designator gf 'generic-function-lambda-list)))
 
-(defun method-qualifiers (m)
+(defun %method-qualifiers-builtin (m)
   "Return qualifiers of METHOD M."
   (let ((q (%method-qualifier m)))
     (if q (list q) nil)))
+
+(defun method-qualifiers (m)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'method-qualifiers (list m))))
+    (if %r (car %r) (%method-qualifiers-builtin m))))
 
 (defun method-specializers (m)
   "Return specializer class objects for METHOD M.
@@ -6761,7 +6832,7 @@
 ;;; compute-applicable-methods (public API)
 ;;; ============================================================
 
-(defun compute-applicable-methods (gf args)
+(defun %compute-applicable-methods-builtin (gf args)
   "Return applicable methods for GF called with ARGS.
    Accepts either the gf-array (4-slot %generic-function descriptor)
    or the dispatch closure (#'gf-name shape) — the latter is resolved
@@ -6772,6 +6843,12 @@
          (if real-gf
              (%collect-applicable-methods real-gf args)
              nil)))))
+
+(defun compute-applicable-methods (gf args)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'compute-applicable-methods (list gf args))))
+    (if %r (car %r) (%compute-applicable-methods-builtin gf args))))
 
 ;;; ============================================================
 ;;; typep support for generic-function / standard-method
@@ -6804,24 +6881,9 @@
     (t nil)))
 
 (defun %standard-method-p (x)
-  "True if X is a standard method.  Method records have shape
-   (qualifier specializers . fn) where fn is either a real function
-   (functionp returns T) or an interp-closure (cons-tagged with
-   car=%interp-closure — eval-defmethod produces these)."
-  (if (or (fixnump x) (null x)) nil
-    (if (consp x)
-      (let ((q (car x)))
-        (if (or (null q) (eq q :before) (eq q :after) (eq q :around)
-                (symbolp q))
-          (if (consp (cdr x))
-            (let ((fn (cddr x)))
-              (cond
-                ((and (consp fn) (eq (car fn) '%interp-closure)) t)
-                ((functionp fn) t)
-                (t nil)))
-            nil)
-          nil))
-      nil)))
+  "True if X is a method record, (7770007 qualifier specializers . fn) -- see
+   %MAKE-METHOD.  Raw CONSP: this is image code, which sees tagged conses."
+  (and (consp x) (eql (car x) 7770007)))
 
 ;;; ============================================================
 ;;; Method-combination API + error signalers
@@ -6893,12 +6955,18 @@
   (let ((fn (%method-fn method)))
     (funcall fn)))
 
-(defun function-keywords (method)
+(defun %function-keywords-builtin (method)
   "Return (values keywords allow-other-keys-p) for METHOD's
    keyword-arg signature.  We don't track per-method keyword
    signatures, so report empty + NIL."
   (declare (ignore method))
   (values nil nil))
+
+(defun function-keywords (method)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'function-keywords (list method))))
+    (if %r (car %r) (%function-keywords-builtin method))))
 
 ;;; MOP slot-access wrappers — read/write via class+slot-name.  Modus
 ;;; doesn't store slot-definition objects separately from slot-name
@@ -7108,6 +7176,15 @@
 (defun %mda-offset    (m) (%prim-aref m 4))
 (defun %mda-etype     (m) (%prim-aref m 5))
 (defun %mda-data      (m) (%prim-aref m 6))
+
+;;; A one-dimensional array of element type NIL (MAKE-ARRAY's NIL-ELT): an MDA
+;;; header with etype NIL over string storage.  SIMPLE when it has no fill
+;;; pointer and is neither displaced nor adjustable (offset slot :ADJUSTABLE).
+(defun %nil-vector-p (x)
+  (and (%mda-p x) (null (%mda-etype x)) (eql (%mda-rank x) 1)))
+(defun %simple-nil-vector-p (x)
+  (and (%nil-vector-p x) (null (%mda-fp x)) (null (%mda-displaced x))
+       (not (eq (%mda-offset x) :adjustable))))
 
 ;;; PACKED BIT ARRAYS.  An array of element type BIT is an MDA header (etype
 ;;; slot = the symbol BIT) whose data is a simple-vector of FIXNUMS each
@@ -8284,7 +8361,7 @@
 ;;; ============================================================
 ;;; CLOS MOP Stubs
 ;;; ============================================================
-(defun allocate-instance (class &rest initargs)
+(defun %allocate-instance-builtin (class &rest initargs)
   "Allocate a new instance of CLASS (a class object or class name).
    All slots are unbound; initforms are NOT applied (per ANSI: that
    happens in initialize-instance, not allocate-instance)."
@@ -8299,13 +8376,19 @@
       (let ((obj (make-array (+ 2 (length (aref sdesc 3))))))
         (aset obj 0 '%struct-instance)
         (aset obj 1 (aref sdesc 1))
-        (return-from allocate-instance obj))))
+        (return-from %allocate-instance-builtin obj))))
   (let ((class-name (cond
                       ((symbolp class) class)
                       ((%clos-class-p class) (aref class 1))
                       (t nil))))
-    (when (null class-name) (return-from allocate-instance nil))
+    (when (null class-name) (return-from %allocate-instance-builtin nil))
     (%make-instance class-name)))
+
+(defun allocate-instance (class &rest initargs)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'allocate-instance (cons class initargs))))
+    (if %r (car %r) (apply (function %allocate-instance-builtin) class initargs))))
 
 (defun %slot-name-member (nm slot-names)
   "Name-robust membership of slot-name NM in the list SLOT-NAMES.  Uses
@@ -8815,7 +8898,7 @@
               (cons (cons class-name new-val) *%class-stamps*))))
   new-val)
 
-(defun make-instances-obsolete (class)
+(defun %make-instances-obsolete-builtin (class)
   "Make every instance of CLASS (and of its subclasses) obsolete: each is
    updated through UPDATE-INSTANCE-FOR-REDEFINED-CLASS at its next slot
    access (see INSTANCES AND THEIR LAYOUT).  Returns CLASS."
@@ -8835,6 +8918,12 @@
             (aset c 5 (cons (aref c 2) t)))))
       (%clos-reg-memo-drop)))
   class)
+
+(defun make-instances-obsolete (class)
+  ;; A standard generic function: user methods first, then the built-in
+  ;; (%BUILTIN-GF-TRY; %INIT-CLOS-PROTOCOL makes the GF).
+  (let ((%r (%builtin-gf-try 'make-instances-obsolete (list class))))
+    (if %r (car %r) (%make-instances-obsolete-builtin class))))
 
 ;;; ============================================================
 ;;; MAKE-LOAD-FORM — GF with default error-signaling methods
@@ -8965,10 +9054,22 @@
 (defun set-class-name (cls new-name)
   "(setf (class-name CLS) NEW-NAME) per CLHS 4.3.6.  Mutate the class
    object's name slot in place and return NEW-NAME.  The SETF macro's
-   generic fallback rewrites (setf (class-name c) v) → (set-class-name c v)."
-  (when (%clos-class-p cls)
-    (%set-class-name cls new-name))
-  new-name)
+   generic fallback rewrites (setf (class-name c) v) → (set-class-name c v).
+   (SETF CLASS-NAME) is a standard generic function: user methods first."
+  (let ((%r (%builtin-gf-try '(setf class-name) (list new-name cls))))
+    (if %r
+        (car %r)
+        (progn
+          (when (%clos-class-p cls)
+            (%set-class-name cls new-name))
+          new-name))))
+
+;; #'(SETF CLASS-NAME) as a function object (upstream SETF-CLASS-NAME.1).
+;; Installed by %INIT-CLOS-PROTOCOL through SET-FDEFINITION, and made a generic
+;; function there: an image (DEFUN (SETF X) ...) is not in the runtime's
+;; function tables, so (FBOUNDP '(SETF X)) would still be NIL.
+(defun %setf-class-name-fn (new-name cls)
+  (set-class-name cls new-name))
 
 ;;; GET-INTERNAL-REAL-TIME lives with GET-INTERNAL-RUN-TIME and
 ;;; INTERNAL-TIME-UNITS-PER-SECOND, up at "THE INTERNAL CLOCKS ARE CLOCKS".
@@ -9328,6 +9429,38 @@
   (%dispatch-describe-object (list object stream)))
 
 ;;; ---- Initialization -----------------------------------------------
+;;; A standard GF whose built-in function already consults its own GF
+;;; (%GF-SELF-DISPATCHING-BUILTIN-P): make the GF object, but keep the
+;;; built-in as the function -- a plain dispatcher in its place would skip the
+;;; built-in's own work (CHANGE-CLASS's argument checks, the printer's
+;;; *PRINT-LEVEL*).
+(defun %builtin-defgeneric (name lambda-list)
+  ;; The function binding is never touched: with *%GF-SKIP-STUB* %MAKE-GF
+  ;; installs no stub (%MAKE-GF-STUB does it by EVAL of a DEFUN, and this runs
+  ;; in kernel-main, where EVAL is not safe -- the JS MVM image faulted), and
+  ;; nothing else in %DEFGENERIC sets it.  Nor may this restore it: at boot
+  ;; SET-SYMBOL-FUNCTION runs the JIT's invalidation hook before the kernel
+  ;; is up (the JS MVM faulted there too).
+  (unless (%find-gf name)
+    (let ((*%gf-skip-stub* t))
+      (declare (special *%gf-skip-stub*))
+      (%defgeneric name lambda-list nil))))
+
+;;; A system-supplied default method, recorded so the dispatchers can tell it
+;;; from a user's (%BUILTIN-GF-TRY, %USER-PRINT-OBJECT-P).
+(defun %builtin-default-method (name specializers fn)
+  (setq *%builtin-gf-default-fns* (cons fn *%builtin-gf-default-fns*))
+  (%defmethod name nil specializers fn))
+
+(defun %gf-applicable-non-default-p (gf args)
+  "Some method other than a system default (%BUILTIN-DEFAULT-METHOD) applies."
+  (let ((cur (%collect-applicable-methods gf args)) (found nil))
+    (loop
+      (when (or found (null cur)) (return found))
+      (unless (member (%method-fn (car cur)) *%builtin-gf-default-fns*)
+        (setq found t))
+      (setq cur (cdr cur)))))
+
 (defun %init-clos-protocol ()
   "Register the CLOS GFs that have system-supplied default methods.
    Called once from kernel-main after %init-make-load-form."
@@ -9337,32 +9470,32 @@
   ;; user-defined methods apply.  Installing a default method whose
   ;; body uses &rest+apply hits the funcall+&rest truncation that
   ;; loses trailing initargs.
-  (%defgeneric 'initialize-instance '(instance &rest initargs) nil)
+  (%builtin-defgeneric 'initialize-instance '(instance &rest initargs))
   ;; NO-APPLICABLE-METHOD / NO-NEXT-METHOD
-  (%defgeneric 'no-applicable-method '(gf &rest args) nil)
-  (%defmethod 'no-applicable-method nil '(t)
+  (%builtin-defgeneric 'no-applicable-method '(gf &rest args))
+  (%builtin-default-method 'no-applicable-method '(t)
               (lambda (&rest args) (apply #'%no-applicable-method-default args)))
-  (%defgeneric 'no-next-method '(gf method &rest args) nil)
-  (%defmethod 'no-next-method nil '(t)
+  (%builtin-defgeneric 'no-next-method '(gf method &rest args))
+  (%builtin-default-method 'no-next-method '(t)
               (lambda (&rest args) (apply #'%no-next-method-default args)))
   ;; SLOT-MISSING / SLOT-UNBOUND
-  (%defgeneric 'slot-missing '(class instance slot-name operation &optional new-value) nil)
-  (%defmethod 'slot-missing nil '(t)
+  (%builtin-defgeneric 'slot-missing '(class instance slot-name operation &optional new-value))
+  (%builtin-default-method 'slot-missing '(t)
               (lambda (&rest args) (apply #'%slot-missing-default args)))
   ;; UPDATE-INSTANCE-FOR-*
-  (%defgeneric 'update-instance-for-different-class '(previous current &rest initargs) nil)
-  (%defmethod 'update-instance-for-different-class nil '(standard-object standard-object)
+  (%builtin-defgeneric 'update-instance-for-different-class '(previous current &rest initargs))
+  (%builtin-default-method 'update-instance-for-different-class '(standard-object standard-object)
               (lambda (&rest args) (apply #'%uifdc-default args)))
-  (%defgeneric 'update-instance-for-redefined-class
-              '(instance added-slots discarded-slots plist &rest initargs) nil)
-  (%defmethod 'update-instance-for-redefined-class nil '(standard-object)
+  (%builtin-defgeneric 'update-instance-for-redefined-class
+              '(instance added-slots discarded-slots plist &rest initargs))
+  (%builtin-default-method 'update-instance-for-redefined-class '(standard-object)
               (lambda (&rest args) (apply #'%uifrc-default args)))
   ;; PRINT-OBJECT / DESCRIBE-OBJECT
-  (%defgeneric 'print-object '(object stream) nil)
-  (%defmethod 'print-object nil '(t)
+  (%builtin-defgeneric 'print-object '(object stream))
+  (%builtin-default-method 'print-object '(t)
               (lambda (obj s) (%print-object-default obj s)))
-  (%defgeneric 'describe-object '(object stream) nil)
-  (%defmethod 'describe-object nil '(t)
+  (%builtin-defgeneric 'describe-object '(object stream))
+  (%builtin-default-method 'describe-object '(t)
               (lambda (obj s) (%describe-object-default obj s)))
   ;; Register all fn-pointers for #'name → GF lookup.
   (handler-case (%register-gf-fn #'initialize-instance 'initialize-instance) (t (c) nil))
@@ -9380,6 +9513,43 @@
   (handler-case (%register-gf-fn #'shared-initialize 'shared-initialize) (t (c) nil))
   (handler-case (%register-gf-fn #'change-class 'change-class) (t (c) nil))
   (handler-case (%register-gf-fn #'reinitialize-instance 'reinitialize-instance) (t (c) nil))
+  ;; The standard GFs implemented as built-ins that consult their own GF
+  ;; (%BUILTIN-GF-TRY, CLASS-NAME): a GF object with NO default method, and the
+  ;; function registered, so each is a GENERIC-FUNCTION (upstream
+  ;; ALL-STANDARD-GENERIC-FUNCTIONS-ARE-INSTANCES-OF-THAT-CLASS).
+  ;; No lambda list, as when a first DEFMETHOD makes one: a declared list
+  ;; would hold user methods to congruence they were never checked for.
+  ;; Each gets a default T method that runs the built-in (see
+  ;; %BUILTIN-GF-TRY for why it must exist).
+  (handler-case (set-fdefinition '(setf class-name) #'%setf-class-name-fn)
+    (t (c) nil))
+  (dolist (e (list (list #'add-method 'add-method 2 (lambda (g m) (%add-method-builtin g m)))
+                   (list #'remove-method 'remove-method 2 (lambda (g m) (%remove-method-builtin g m)))
+                   (list #'find-method 'find-method 3
+                         (lambda (g q s &rest r) (apply #'%find-method-builtin g q s r)))
+                   (list #'allocate-instance 'allocate-instance 1
+                         (lambda (c &rest r) (apply #'%allocate-instance-builtin c r)))
+                   (list #'compute-applicable-methods 'compute-applicable-methods 2
+                         (lambda (g a) (%compute-applicable-methods-builtin g a)))
+                   (list #'function-keywords 'function-keywords 1 (lambda (m) (%function-keywords-builtin m)))
+                   (list #'make-instances-obsolete 'make-instances-obsolete 1
+                         (lambda (c) (%make-instances-obsolete-builtin c)))
+                   (list #'method-qualifiers 'method-qualifiers 1 (lambda (m) (%method-qualifiers-builtin m)))
+                   (list #'class-name 'class-name 1 (lambda (c) (%class-name-builtin c)))
+                   (list #'slot-unbound 'slot-unbound 3 (lambda (c o s) (%slot-unbound-builtin c o s)))
+                   (list #'%setf-class-name-fn '(setf class-name) 2
+                         (lambda (n c)
+                           (when (%clos-class-p c) (%set-class-name c n))
+                           n))))
+    (handler-case
+        ;; (#'NAME NAME N DEFAULT): the image's #'NAME is the object runtime
+        ;; code sees; FDEFINITION here, at boot, is not EQ to it.
+        (let ((name (cadr e)) (fn (cadddr e)) (specs nil))
+          (dotimes (i (caddr e)) (setq specs (cons t specs)))
+          (%builtin-defgeneric name nil)
+          (%builtin-default-method name specs fn)
+          (%register-gf-fn (car e) name))
+      (t (c) nil)))
   nil)
 
 ;; %EXPAND-DEFTYPE has NO definition in this file (WS3 STEP 4): the

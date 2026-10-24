@@ -5723,7 +5723,7 @@
     ;; tagged conses underneath, but as forms they are self-evaluating objects.
     ((consp form)
      (if (or (hash-table-p form) (packagep form) (readtablep form)
-             (random-state-p form) (streamp form))
+             (random-state-p form) (streamp form) (%standard-method-p form))
          t
          (eq (car form) 'quote)))
     ;; Every other object (a condition, an array, a function, ...) evaluates

@@ -1042,8 +1042,8 @@
 ;;; board cl-fileio.lisp's defvar thunks restore #x1DF00000 / #x1DE00000, which
 ;;; are outside the declared heap.  The rest of the block is the same class:
 ;;; globals whose init thunks either do not run (limitation #7) or run with a
-;;; hosted value, plus %init-clos-protocol, which every other build's kernel-main
-;;; calls and which must land after the thunks that would otherwise reset it.
+;;; hosted value.  (%init-clos-protocol used to be here too; the shared
+;;; kernel-main now calls it, just before this slot.)
 ;;;
 ;;; It also carries the #271 DTB REPORT — one line naming the device-tree
 ;;; pointer the firmware passed, the /chosen/bootargs string read out of it, and
@@ -1106,7 +1106,6 @@
   (setq most-negative-fixnum -4611686018427387904)
   (%init-standard-chars)
   (%init-boole-constants)
-  (%init-clos-protocol)
   (setq *serial-repl-buf* nil)
   (setq *serial-repl-len* 0)
   (setq *serial-repl-cap* 0)
@@ -1123,7 +1122,6 @@
   (setq most-negative-fixnum -4611686018427387904)
   (%init-standard-chars)
   (%init-boole-constants)
-  (%init-clos-protocol)
   (handler-case
       (progn
         (write-string-serial \"DTB ptr=\")

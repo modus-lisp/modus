@@ -73,6 +73,15 @@
   (%bare-clock-add (* ms 1000000))
   nil)
 
+;; CLHS SLEEP.  mvm/cl-fileio.lisp's is `(defun sleep (n) nil)', and on a board that is
+;; this file's to answer (net/hosted-sync.lisp does it hosted): a SLEEP that returns at
+;; once turns every `(loop (sleep 5))' into a spin -- with threads (net/bare-threads.lisp,
+;; whose %SLEEP-MS replaces the one above) one that holds its core and, on core 0, the
+;; main thread with it.
+(defun sleep (seconds)
+  (%sleep-ms (max 0 (round (* seconds 1000))))
+  nil)
+
 (defun %cond-wait-ms (cv mtx ms)
   (declare (ignore cv mtx))
   (if (> ms 0)

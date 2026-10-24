@@ -526,6 +526,12 @@
 (defun hid-serial-ready-p ()
   (zerop (logand (mem-ref #x3F201018 :u32) #x10)))
 
+;; WHILE IT WAITS: seams a threads layer (net/bare-threads.lisp, linked after this
+;; file) overrides by last-defun-wins -- poll rather than block, and run what may run
+;; on this core meanwhile.  Here: block, and nothing.
+(defun %console-wants-poll () nil)
+(defun %console-idle () nil)
+
 (defun hid-console-read-char ()
   ;; Serial first, so a serial-driven session is never held up by the
   ;; keyboard; then the keyboard.  Without a keyboard or mouse this is
@@ -533,7 +539,11 @@
   ;; With a hub, keep polling even when nothing is plugged in yet: that poll is
   ;; also how a keyboard plugged in later is found (HID-HOTPLUG-TICK).
   (if (or (not (hid-ready-p)) (zerop (hid-get #x00)))
-      (read-char-serial)
+      (if (%console-wants-poll)
+          (loop
+            (when (hid-serial-ready-p) (return (read-char-serial)))
+            (%console-idle))
+          (read-char-serial))
       (let ((c -1))
         (loop
           (when (>= c 0) (return c))
@@ -541,4 +551,5 @@
               (setq c (read-char-serial))
               (progn
                 (hid-split-poll)
+                (%console-idle)
                 (setq c (hid-ring-pop))))))))

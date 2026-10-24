@@ -188,8 +188,12 @@
   (eq thread *sb-main-thread*))
 
 (defun sb-thread::thread-yield ()
-  "sched_yield(2) — syscall 24 on x86-64."
-  (syscall3 24 0 0 0)
+  "sched_yield(2) -- syscall 24 on x86-64.  On bare metal there is no OS behind the
+   SVC (it halts the core): with threads (net/bare-threads.lisp) it is BT-YIELD, which
+   on the main thread runs core 0's ready threads; on a one-thread board, nothing."
+  (cond ((fboundp 'bt-yield) (bt-yield))
+        ((fboundp '%bare-sync-arena) nil)
+        (t (syscall3 24 0 0 0)))
   nil)
 
 ;;; Allocation in SHARED memory: BODY runs under the runtime lock, whose allocations land

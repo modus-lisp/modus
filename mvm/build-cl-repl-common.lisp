@@ -703,7 +703,18 @@
           (+ (* (floor ticks hz) 1000000)
              (floor (* (mod ticks hz) 1000000) hz)))
         0)))
-(defun get-universal-time () (%timer-universal-time))
+;;; THE DATE is not the machine's to know: no RTC, so the counter is seconds since boot.
+;;; SET-UNIVERSAL-TIME is how something that does know (an SNTP answer, net/bare-sockets.lisp
+;;; BARE-NTP-TIME) tells it; the offset is a global SET at run time (a DEFVAR initform does not
+;;; run here), unbound -- 0 -- in a core saved before anybody did, which is right: the counter
+;;; restarts with every boot.
+(defun get-universal-time ()
+  (+ (%timer-universal-time)
+     (if (boundp '*universal-time-offset*) (symbol-value '*universal-time-offset*) 0)))
+(defun set-universal-time (ut)
+  \"Tell a board with no clock that it is UT (seconds since 1900) now.  UT.\"
+  (setf (symbol-value '*universal-time-offset*) (- ut (%timer-universal-time)))
+  ut)
 ;;; ... and the nanosecond seams under them, which the hot-function JIT calls
 ;;; directly to time interpreted calls: cl-fileio.lisp's defaults are the same
 ;;; clock_gettime SVC, so the first DEFUN trampoline on the board faulted

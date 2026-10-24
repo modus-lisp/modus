@@ -270,6 +270,35 @@
                  (when ip (return ip))))))
       (setq *udp-ports* (remove lport *udp-ports* :key #'car)))))
 
+;;; THE DATE.  A board has no RTC: GET-UNIVERSAL-TIME counts from boot until something sets it
+;;; (SET-UNIVERSAL-TIME, mvm/build-cl-repl-common.lisp), and a TLS handshake, a Nostr event's
+;;; created_at or a login code's expiry all need the real one.  SNTP (RFC 4330): 48 bytes, LI 0
+;;; VN 4 mode 3; the server's transmit timestamp is seconds since 1900 at bytes 40..43 -- the
+;;; epoch GET-UNIVERSAL-TIME already counts from.
+
+(defun bare-ntp-time (&key (server "pool.ntp.org") (timeout-ms 3000) (tries 3))
+  "The server's idea of now, as universal time, or NIL."
+  (let ((ip (if (integerp server) server (bare-dns-lookup server))))
+    (when ip
+      (let ((lport (%ephemeral-port))
+            (q (make-array 48 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (setf (aref q 0) #x23)
+        (udp-open lport)
+        (unwind-protect
+             (dotimes (k tries nil)
+               (udp-send-to ip 123 lport q 48)
+               (let* ((r (udp-recv lport :timeout-ms timeout-ms)) (v (and r (third r))))
+                 (when (and v (>= (length v) 48) (= (logand (aref v 0) 7) 4))
+                   (let ((ut (logior (ash (aref v 40) 24) (ash (aref v 41) 16)
+                                     (ash (aref v 42) 8) (aref v 43))))
+                     (when (> ut 0) (return ut))))))
+          (setq *udp-ports* (remove lport *udp-ports* :key #'car)))))))
+
+(defun bare-set-clock (&rest args)
+  "Set the board's date from SNTP (BARE-NTP-TIME's arguments).  The universal time, or NIL."
+  (let ((ut (apply #'bare-ntp-time args)))
+    (when ut (set-universal-time ut))))
+
 (defun %dotted (ip)
   (format nil "~D.~D.~D.~D" (ldb (byte 8 24) ip) (ldb (byte 8 16) ip) (ldb (byte 8 8) ip) (ldb (byte 8 0) ip)))
 

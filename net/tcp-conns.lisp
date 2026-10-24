@@ -258,7 +258,14 @@
     (loop
       (let ((v (with-net-lock (funcall pred)))) (when v (return v)))
       (when (> (%now-ms) end) (return nil))
-      (when (zerop (net-pump)) (io-delay)))))
+      (when (zerop (net-pump)) (%net-idle)))))
+
+(defun %net-idle ()
+  "Nothing arrived: let this core's other threads run (net/bare-threads.lisp's BT-YIELD --
+   on the main thread, core 0's; the other end of a LOOPBACK pair is often one of them),
+   then give QEMU's event loop its moment."
+  (when (fboundp 'bt-yield) (bt-yield))
+  (io-delay))
 
 ;;; ---- the API ------------------------------------------------------------------------------
 

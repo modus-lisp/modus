@@ -174,10 +174,19 @@
       ((eq op :readdir) (progn (%cabfs-flush-all)
                                (handler-case (funcall *cf-readdir* *cabfs* a)
                                  (error () nil))))
-      ;; Cabinet keeps mtimes, but nothing on the quickload path compares
-      ;; them across a reboot (the FS is in RAM), so a constant is honest
-      ;; and avoids a stat round trip per PROBE-FILE.
-      ((eq op :mtime)  0)
+      ;; The inode's mtime (cabinet stamps *FS-CLOCK*, universal time) as the
+      ;; Unix seconds FILE-WRITE-DATE expects, or 0 (FILE-WRITE-DATE: NIL) for no
+      ;; file.  Only FILE-WRITE-DATE asks.  It was a constant 0, and a NIL date is
+      ;; not "unknown" to every caller: seal caches a parsed CA bundle only under
+      ;; its date, so on a board every TLS handshake re-parsed the whole bundle,
+      ;; and glass reloads a store whose date it cannot compare.
+      ((eq op :mtime)  (progn (%cabfs-flush-path a)
+                              (handler-case
+                                  (let ((m (funcall (symbol-function (%cabfs-sym "STAT-MTIME"))
+                                                    (funcall (symbol-function (%cabfs-sym "STAT"))
+                                                             *cabfs* a))))
+                                    (if (and (integerp m) (> m 0)) (- m 2208988800) 0))
+                                (error () 0))))
       ;; Is A a directory?  DIRECTORY's */ glob asks (EXISTS answers for files too).
       ((eq op :dir-p) (progn (%cabfs-flush-path a)
                              (handler-case

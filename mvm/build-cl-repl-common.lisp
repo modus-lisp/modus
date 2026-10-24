@@ -121,12 +121,13 @@
 ;; :I386 — the bare-metal 32-bit x86 QEMU-pc image (mvm/build-i386-cl-repl.lisp).
 ;; Same thin-head contract as :X64, and the same console: translate-i386's bare
 ;; path already emits COM1 port I/O for the serial traps (#x0300 write, #x0301
-;; read) whenever *I386-LINUX-MODE* is NIL, which is its default.  Networking is
-;; deliberately NOT wired up — DIVERGENCE 3/4/5 have no :I386 arm — so this
-;; image is the REPL and nothing else.
+;; read) whenever *I386-LINUX-MODE* is NIL, which is its default.  Networking
+;; (MODUS_NET_BUILD=1) is the NE2000 ISA card: net/ne2000.lisp + the adapter
+;; net/arch-i386-cl.lisp, run by the QEMU pipeline as on :X64.
 (defvar *cl-repl-i386-p* (eq *cl-repl-platform* :i386))
-(defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p*)
-  "T for the two QEMU machines (virt, pc): E1000 over PCI, user-mode net.")
+(defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p* *cl-repl-i386-p*)
+  "T for the QEMU machines (virt, pc, and pc on i386): user-mode net, a NIC
+   brought up by E1000-PROBE (the E1000 over PCI, or on i386 the NE2000).")
 
 ;;; MVM infrastructure, loaded HERE rather than only by build-cli-common: the
 ;;; board's USB/PCI net stack is READ into the *CLI-BARE-METAL-NET-SOURCE* slot
@@ -1490,6 +1491,12 @@
 (defvar *net-nic-source*
   (if (not *net-build-p*)
       ""
+      (if *cl-repl-i386-p*
+          (concatenate 'string
+            ;; NE2000 ISA (port I/O).  The adapter comes AFTER the driver: it
+            ;; moves the driver's host buffers out of the image (see its header).
+            (%rpi-net-text "ne2000.lisp")          (string #\Newline)
+            (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
             (%rpi-net-text "arch-x86-cl.lisp")     (string #\Newline)
@@ -1550,7 +1557,7 @@
             (%rpi-net-text "hdmi-audio.lisp")    (string #\Newline)
             ;; The boot SD card, read only (SDHOST, adopting U-Boot's setup):
             ;; the sector source for a pagetree/cabinet store on a partition.
-            (%rpi-net-text "sdhost.lisp")        (string #\Newline))))))
+            (%rpi-net-text "sdhost.lisp")        (string #\Newline)))))))
 
 ;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
 (when (and *cl-repl-x64-p* *pc-console-p*)
@@ -1607,6 +1614,12 @@
                 (or #+sbcl (let ((v (sb-ext:posix-getenv "MODUS_NET_BUFSZ")))
                              (and v (plusp (length v)) (parse-integer v)))
                     32768))
+        ;; Where a byte vector's byte 0 sits relative to its tagged word: the
+        ;; object tag is 9 and the payload follows a 16-byte header on a 64-bit
+        ;; target (+7) but a 4-byte header on i386 (+4 - 9 = -5).  TCP-RX-COPY's
+        ;; word copy writes there; a literal +7 put every i386 body 12 bytes
+        ;; late (and 12 bytes past the vector's end).
+        (format nil "~%(defun %u8-data-delta () ~D)~%" (if *cl-repl-i386-p* -5 7))
         "
 (defun tcp-rx-copy (dest dest-off)
   (let ((buf (e1000-rx-buf)))
@@ -1623,7 +1636,7 @@
         ;; words; DEST is ordinary memory and takes unaligned stores.
         (let* ((data-base (+ (+ buf 34) tcp-hdr-len))
                (n (max 0 (min data-len (- (length dest) dest-off))))
-               (da (+ (%val->word dest) 7 dest-off))
+               (da (+ (%val->word dest) (%u8-data-delta) dest-off))
                ;; The RTL8153's RX buffer is ordinary cacheable RAM: copy its
                ;; whole 64-byte chunks natively (net/r8152.lisp R8152-NCOPY).
                (i (if (eq (usb-netdev-get) 2) (r8152-ncopy da data-base n) 0)))

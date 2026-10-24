@@ -687,6 +687,47 @@ what kept i386 on its own build lineage — which is why the library ladder and
 alexandria's own test suite had never run on 32 bits at all. Recover from git
 history at `ba693fa`; the replacement gate is the ladder.
 
+### QEMU i386 — the bare-metal CL image (2026-10-24)
+
+```bash
+sbcl --dynamic-space-size 12288 --script mvm/build-i386-cl-repl.lisp   # -> /tmp/modus-i386-cl-repl.bin
+qemu-system-i386 -kernel /tmp/modus-i386-cl-repl.bin -m 1024 -display none -serial stdio -no-reboot
+MODUS_NET_BUILD=1 ...   # + NE2000: -device ne2k_isa,netdev=n0,iobase=0x300,irq=9 -netdev user,id=n0
+```
+
+The real CL stack on bare 32-bit x86, reaching its REPL in about two minutes
+under QEMU.  What it took, each a measured boot death first: NIL = `#xDEAD0001`
+(paging on, a page mapped for NIL's address); the heap above the runtime's
+fixed block at `#x10000000` (it ran across the globals and symbol tables); the
+handler-case block above the image (`*I386-BARE-HANDLER-BASE*`); the native
+Cheney collector on bare metal (`*I386-BARE-GC*`: the boot stub lays out two
+240 MB semispaces, both root bitmaps and region 0's block); RDTSC behind the
+clock traps (`*I386-BARE-CLOCK*`); and **function entries OR-3 tagged and
+16-byte aligned** (`*I386-FN-TAG-3*` / `*I386-FN-ALIGN*`, the boot stub padding
+native byte 0 to a 16-byte boundary).  Without the last, a function whose
+address happened to end in 1 was taken for a CONS by funcall dispatch — measured
+as `(mapcar (lambda (s) (normalize-name s)) names)` => `(NIL NIL)` and a
+TYPE-ERROR in DEFSTRUCT's keyword constructor during `%INSTALL-SB-SHIMS`.
+Every one of these is gated so the legacy images below stay byte-identical.
+
+**The NE2000 (`MODUS_NET_BUILD=1`) is `net/ne2000.lisp` + `net/arch-i386-cl.lisp`,
+spliced AFTER the driver** (it moves the driver's host buffers out of the
+image), run by the same QEMU pipeline as x64.  Measured: DHCP, TCP, a byte-exact
+HTTP fetch (FNV-1a matches the file), untar, load, `(sha1:sha1-hex "abc")`
+correct.  **No `net/32bit-overrides.lisp`**: it truncates 32-bit quantities to
+30 bits for the mini-Lisp; the CL runtime promotes `MEM-REF :U32` reads and
+writes to bignums.  **A byte vector's payload is NOT at word+7 on i386** — a
+4-byte header puts byte 0 at word−5; `tcp-rx-copy`'s literal 7 put every body
+12 bytes late (`%U8-DATA-DELTA` now).  Any `(+ (%val->word v) 7)` is that bug
+on 32 bits.
+
+Debugging it: `qemu -s -S` + gdb-multiarch with `hbreak` on an address from
+`MODUS_SYMMAP`, walking the EBP chain.  A CONDITIONAL hbreak on a hot function
+costs a gdb round trip per hit (a 10x slower boot); instead write a code cave
+into free RAM from gdb at the kernel entry (`0x100020` — the multiboot ROM
+copies the kernel after reset, so patch there, not at `0xfff0`) and patch the
+function to jump to it.
+
 ### QEMU i386 — LEGACY mini-Lisp (32-bit x86, Multiboot)
 
 The builds below run `mvm/repl-source.lisp`, a separate 708-line toy Lisp with

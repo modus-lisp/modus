@@ -25,6 +25,7 @@ web                | MODUS_WEB_OUT=/tmp/modus-web MODUS_NO_JIT=1       | mvm/bui
 x64-cl-repl        | -                                                 | mvm/build-x64-cl-repl.lisp
 x64-cl-repl-pc     | MODUS_PC_CONSOLE=1                                | mvm/build-x64-cl-repl.lisp
 i386-cl-repl       | -                                                 | mvm/build-i386-cl-repl.lisp
+i386-cl-repl-net   | MODUS_NET_BUILD=1                                 | mvm/build-i386-cl-repl.lisp
 uefi-cl-repl       | -                                                 | mvm/build-uefi-cl-repl.lisp
 aarch64-virt       | -                                                 | mvm/build-aarch64.lisp
 rpi-cl-repl        | -                                                 | mvm/build-rpi-cl-repl.lisp

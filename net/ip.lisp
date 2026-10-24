@@ -469,7 +469,7 @@
                           ;; bytes.
                           (let ((their-seq (buf-read-u32-mem buf 38))
                                 (expected (mem-ref (+ state #x40) :u32)))
-                            (if (eq their-seq expected)
+                            (if (eql their-seq expected)   ; EQL: a 32-bit seq is a BIGNUM on i386 (>= 2^29), EQ is false
                                 (progn
                                   (setf (mem-ref (+ state #x40) :u32) (+ their-seq data-len))
                                   ;; DELAYED ACK (RFC 9293 3.8.6.3): every
@@ -726,7 +726,7 @@
           ;; seq so the client resends the right bytes.
           (let ((their-seq (buf-read-u32-mem buf 38))
                 (expected (mem-ref (+ cb #x014) :u32)))
-            (if (eq their-seq expected)
+            (if (eql their-seq expected)   ; EQL: a 32-bit seq is a BIGNUM on i386 (>= 2^29), EQ is false
                 ;; Copy data BEFORE sending ACK — the ACK triggers DWC2 MMIO
                 ;; which can complete a pending bulk-IN on another channel,
                 ;; overwriting the receive buffer while we still read it.

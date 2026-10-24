@@ -721,6 +721,33 @@ writes to bignums.  **A byte vector's payload is NOT at word+7 on i386** — a
 12 bytes late (`%U8-DATA-DELTA` now).  Any `(+ (%val->word v) 7)` is that bug
 on 32 bits.
 
+**SSH (`MODUS_SSH_BUILD=1`, `(ssh-boot)` at the REPL) works: a real OpenSSH
+client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, ~60 s a
+connection (x64: ~50 s).  Three 32-bit facts it took:**
+- **crypto-fast's field arithmetic caches RAW limb addresses across
+  ALLOCATION.**  `(+ (ash (logand fe (- 0 4)) 1) 8)` is computed once per call;
+  on 30-bit fixnums the 26x26-bit limb products are bignums, so a collection
+  inside `fe-mul` moves the arrays under the cached address.  Measured:
+  `ed25519-public-key` right in every run with no collection, wrong in exactly
+  the run where `%GC-EPOCH` moved.  The i386 build splices
+  `net/crypto-32-fast.lisp` (cons-free, `MUL26LO`/`MUL26HI`, scratch at
+  `FE-SCRATCH-BASE`) after crypto-fast, its limb offset rewritten to
+  crypto-fast's.  **Any 32-bit CL target running crypto-fast has this bug** —
+  bare arm32 next.
+- **A 32-bit TCP sequence number is a bignum** (>= 2^29), so ip.lisp's
+  `(eq their-seq expected)` was false for most of them: `EQL` now.
+- `*CLI-ARCH*` was `:AARCH64` for this image (machine-type "aarch64", aarch64's
+  layout co-init); `:I386` now.  And a `:U64` store is ONE 32-bit store here,
+  so the net/SSH texts' 8-byte-stride zero loops are rewritten for i386.
+
+**OPEN: a reconnect can fail.**  The first connection after `(ssh-boot)`
+works in every run; a later one sometimes closes right after the client's
+KEXINIT, which run moves (2 failing, 3 failing, or both).  The server never
+sees the client's version-string segment (only pure ACKs reach
+NET-DELIVER-DATA).  Suspect, not finding: between sessions the server spends
+tens of seconds recomputing ephemeral keys while SYN retransmits fill the
+NE2000's 32 KB ring, and `ne2k-receive` has no ring-overflow (OVW) recovery.
+
 Debugging it: `qemu -s -S` + gdb-multiarch with `hbreak` on an address from
 `MODUS_SYMMAP`, walking the EBP chain.  A CONDITIONAL hbreak on a hot function
 costs a gdb round trip per hit (a 10x slower boot); instead write a code cave

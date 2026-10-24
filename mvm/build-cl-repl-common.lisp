@@ -125,6 +125,26 @@
 ;; (MODUS_NET_BUILD=1) is the NE2000 ISA card: net/ne2000.lisp + the adapter
 ;; net/arch-i386-cl.lisp, run by the QEMU pipeline as on :X64.
 (defvar *cl-repl-i386-p* (eq *cl-repl-platform* :i386))
+(defvar *cl-repl-pc-p* (or *cl-repl-x64-p* *cl-repl-i386-p*)
+  "T for the PC machines, 64- and 32-bit: no actor scheduler in the net image
+   (the SSH server is ip.lisp's synchronous poll loop) and no USB NIC.")
+;; A :U64 store is ONE 32-bit store on i386, so the net/SSH texts' 8-byte-stride
+;; zero loops would clear half of each block there.  Rewrite them for i386 as
+;; two :U32 stores; every other target's text is untouched.  (QEMU hands over
+;; zeroed RAM, which is why a half-cleared block works there; hardware does not.)
+(defun %replace-all (text old new)
+  (let ((out (make-string-output-stream)) (start 0))
+    (loop for at = (search old text :start2 start)
+          do (write-string text out :start start :end (or at (length text)))
+             (unless at (return))
+             (write-string new out)
+             (setq start (+ at (length old))))
+    (get-output-stream-string out)))
+(defun %pc32-zero-loops (text)
+  (if (not *cl-repl-i386-p*)
+      text
+      (%replace-all text "(setf (mem-ref (+ s (* i 8)) :u64) 0)"
+                    "(progn (setf (mem-ref (+ s (* i 8)) :u32) 0) (setf (mem-ref (+ s (* i 8) 4) :u32) 0))")))
 (defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p* *cl-repl-i386-p*)
   "T for the QEMU machines (virt, pc, and pc on i386): user-mode net, a NIC
    brought up by E1000-PROBE (the E1000 over PCI, or on i386 the NE2000).")
@@ -194,7 +214,10 @@
 ;;; ARCH SLOTS — bare-metal AArch64 (BCM2837 / BCM2710A1)
 ;;; ============================================================
 
-(defvar *cli-arch* (if *cl-repl-x64-p* :x64 :aarch64))
+;; :I386 is its own arch here, not :AARCH64.  It used to inherit :AARCH64, so
+;; (machine-type) answered "aarch64" and %JIT-BOOT-INIT carried aarch64's
+;; layout co-init (*conv-relative*, *a64-x18-base*) into a 32-bit x86 image.
+(defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386) (t :aarch64)))
 
 ;;; BARE-METAL SEAM.  No OS: no Linux syscalls, no fds, no argv, no
 ;;; cli-toplevel.  The tarball pipeline is kept (untar -> parse .asd ->
@@ -1221,7 +1244,24 @@
   (if *ssh-build-p*
       (concatenate 'string
         (%rpi-net-text "crypto.lisp")        (string #\Newline)
-        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline)
+        ;; :I386 -- crypto-fast's field arithmetic reaches a field element's
+        ;; limbs through a RAW address computed once per call, and on 30-bit
+        ;; fixnums its 26x26-bit limb products are BIGNUMS: an allocation, so a
+        ;; collection can move the arrays under the cached address.  Measured:
+        ;; ed25519-public-key correct in every run with no collection, wrong in
+        ;; exactly the run where %GC-EPOCH moved.  crypto-32-fast.lisp is the
+        ;; cons-free 32-bit field layer (MUL26LO/MUL26HI, intermediates in fixed
+        ;; scratch at FE-SCRATCH-BASE): nothing in a field operation allocates,
+        ;; so nothing moves.  Its limb offset is rewritten from the mini-Lisp's
+        ;; header (+4) to crypto-fast's (+8), so every field function in the
+        ;; image agrees on where limb 0 is (inside the 40-slot array either way).
+        (if *cl-repl-i386-p*
+            (concatenate 'string
+              (%replace-all (%rpi-net-text "crypto-32-fast.lisp")
+                            "(- 0 4)) 1) 4)" "(- 0 4)) 1) 8)")
+              (string #\Newline))
+            ""))
       ""))
 
 ;; Actor/SSH address map for the CL host image's memory layout.  The legacy
@@ -1245,7 +1285,9 @@
     ;; PRNG -- the last SSH secrets that were still in host-readable memory.
     ;; fe-scratch-base keeps its +0x900 relation to it.  ssh-ipc ends at
     ;; 0x0C280000 + 76800*8 = 0x0C316000.
-    (*cl-repl-x64-p*
+    ;; :I386 takes the same map: the same DRAM is free there (above its NE2000
+    ;; buffers at #x04000000, below its heap at #x10100000).
+    (*cl-repl-pc-p*
      "
 (defun ssh-conn-base ()      #x0C200000)
 (defun ssh-ipc-base ()       #x0C280000)
@@ -1310,7 +1352,7 @@
   (if *ssh-build-p*
       (concatenate 'string
         *ssh-addr-map-source*                     (string #\Newline)
-        (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
+        (if *cl-repl-pc-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
         ;; After ssh.lisp, by last-defun-wins -- :X64: TSC-timed waits and RDRAND for
         ;; SSH-RANDOM; :RPI: the BCM2835/2837 hardware RNG for SSH-RANDOM and
@@ -1422,15 +1464,15 @@
         ;; register listen port 22, crypto pre-compute, actor/mailbox init, then
         ;; the synchronous poll loop.  Called from the REPL; net-actor-main
         ;; blocks, serving inline (net-accept-connection -> ssh-handle-connection).
-        (if *cl-repl-x64-p*
-            ;; :X64 -- the NIC is already up from run-net-pipeline (PCI, E1000,
+        (if *cl-repl-pc-p*
+            ;; :X64 / :I386 -- the NIC is already up from run-net-pipeline (PCI, E1000,
             ;; DHCP into e1000-state-base +24/+28), so only the SSH state is
             ;; zeroed and seeded (state +0x600..+0x900 is the SSH-side part of
             ;; e1000-state: key-set flag, PRNG, host key; the NIC/DHCP words below
             ;; it stay).  No USB probe, no static address, no actors.
             ;; MODUS_LISP_SPIN_AT=ssh-zeroed|ssh-seeded|ssh-keyed|ssh-signed|
             ;; ssh-netup puts a spin point between the steps (nothing otherwise).
-            (concatenate 'string "(defun ssh-boot ()
+            (%pc32-zero-loops (concatenate 'string "(defun ssh-boot ()
   (let ((s (+ (e1000-state-base) #x600))) (dotimes (i 96) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1442,7 +1484,7 @@
 " (%lisp-spin-form "ssh-signed") "  (pre-compute-server-eph (conn-ssh 0))
   (write-string-serial \"NETUP\") (write-char-serial 10)
 " (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (e1000-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
-  (net-actor-main))")
+  (net-actor-main))"))
         "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1470,7 +1512,7 @@
         ;; :X64 has no USB NIC and no hot-plug: usb-netdev.lisp overrides E1000-RECEIVE,
         ;; E1000-SEND, E1000-RX-BUF and E1000-PROBE with USB-backed versions that probe
         ;; for a USB NIC on every poll (the "ND:0" stream) -- the E1000 never gets polled.
-        (if *cl-repl-x64-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline))
+        (if *cl-repl-pc-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline))
       ""))
 
 ;;; DIVERGENCE 3 — the arch adapter + the NIC driver.  Everything downstream of
@@ -2060,7 +2102,7 @@
 
 (defvar *net-pipeline-defun-source*
   (if *cl-repl-qemu-p*
-      (concatenate 'string ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
+      (%pc32-zero-loops (concatenate 'string ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
 ;; than 2500 of the x86 adapter's io-delays (DHCP:F five times, then the OFFERs
 ;; found queued in the RX ring).  Wait longer per attempt; the count only
 ;; matters when no answer comes.
@@ -2103,7 +2145,7 @@
           ;; run the baked sha1 self-test (evidence the install path works).
 " *net-x64-fetch-block* "
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
-")
+"))
       (format nil "(defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
   ;; 1. DWC2 host controller + USB enumeration + CDC Ethernet.

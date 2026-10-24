@@ -6057,6 +6057,7 @@
           (when (and *load-abort-on-error* *load-error-condition*)
             (return nil))
           (%maybe-run-pending-jit)
+          (%jit-drain-wanted)
           (when print
             (handler-case
                 (progn (write val :stream *standard-output*)

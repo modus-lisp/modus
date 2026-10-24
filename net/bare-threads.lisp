@@ -427,6 +427,7 @@
   "On the main thread: run the next ready core-0 thread until it blocks, yields, ends or
    its slice is up.  T when one ran."
   (when (and (%bt-up-p) (zerop (percpu-ref 16)))
+    (%jit-drain-wanted)                       ; what core 1..3 and core-0 threads found hot
     (let ((s (%bt-pick 0 (mem-ref (%bt-core0-cursor) :u32))))
       (when (>= s 0)
         (setf (mem-ref (%bt-core0-cursor) :u32) s)

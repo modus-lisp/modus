@@ -2303,6 +2303,8 @@
    the trampoline's own code, compiled.")
 
 (defun %jit-note-forward (name bc box)
+  (when (and (null *jit-want-flag*) (%mvm-on-main-thread-p))
+    (setq *jit-want-flag* (list nil)))
   (when (null *jit-trampoline-forwards*)
     (setq *jit-trampoline-forwards* (make-hash-table :test (function equal))))
   (puthash name *jit-trampoline-forwards* (cons bc box)))
@@ -2714,6 +2716,52 @@
            ;; calls SELF.  Forwarding to NAME's definition was the loop.
            nil)))
 
+;;; HOT ON A WORKER.  A build records into region-0 tables, so only the main
+;;; thread builds (%JIT-HOT-PROMOTE answers :RETRY anywhere else) -- and a DEFUN
+;;; that only workers call (glass's RFB sender, a gateway's crypto) used to be
+;;; retried forever and stay interpreted: a Pi Zero's ZRLE stream spent 6 s at
+;;; a time in the interpreter.  Now the worker RAISES the trampoline's WANTED
+;;; cell and one global flag -- both stores of T into conses the main thread
+;;; made, so legal from any core -- and the main thread builds what is wanted
+;;; the next time it idles (net/bare-threads.lisp %BT-MAIN-IDLE) or between two
+;;; toplevel forms of a load, through the same %JIT-HOT-BUILD a promotion uses.
+;;; WANTED goes T -> :DONE when the drain takes it, built or not, so a module
+;;; that will not translate is not retried every 64 calls.
+(defvar *jit-want-flag* nil "A cons made on the main thread; its CAR is T when some worker wants a build.")
+(defvar *jit-want-built* nil "CENSUS: modules the drain built for workers.")
+
+
+(defun %jit-want (fwd)
+  (let ((f *jit-want-flag*))
+    (when (and (consp f) (consp (cdr fwd)) (null (cadr fwd)))
+      (setf (cadr fwd) t)
+      (setf (car f) t))))
+
+(defun %jit-drain-wanted ()
+  "On the main thread: build every DEFUN a worker found hot.  The count taken."
+  (let ((f *jit-want-flag*))
+    (if (and (consp f) (car f) (%mvm-on-main-thread-p) *jit-trampoline-forwards*
+             (%jit-enabled-p) (%jit-active-p) (not *jit-hot-busy*))
+        (let ((names nil))
+          (setf (car f) nil)
+          (maphash (lambda (k v)
+                     (let ((box (cdr v)))
+                       (when (and (consp box) (consp (cdr box)) (eq (cadr box) t))
+                         (setf (cadr box) :done)
+                         (when (null (car box)) (setq names (cons k names))))))
+                   *jit-trampoline-forwards*)
+          (when names
+            (let ((before (or *jit-native-defun-count* 0)))
+              (setq *jit-hot-busy* t)
+              (unwind-protect
+                   (let ((skips (%jit-skip-list)) (seen (cons nil 64)))
+                     (dolist (n names) (%jit-hot-build n skips seen)))
+                (setq *jit-hot-busy* nil))
+              (setq *jit-want-built* (+ (or *jit-want-built* 0) (length names)))
+              (when (> (or *jit-native-defun-count* 0) before) (%jit-retry-drain))))
+          (length names))
+        0)))
+
 (defun %mvm-make-defun-trampoline (name bc ftab rt offset lam-offsets)
   "The interpreter trampoline for runtime DEFUN NAME (%MVM-MAKE-TRAMPOLINE),
    counting toward the hot-function JIT: NAME is built after *JIT-HOT-CALLS*
@@ -2729,7 +2777,9 @@
         ;; the native function this trampoline forwards to once there is one:
         ;; set by a promotion here or by its module being built from anywhere
         ;; (*JIT-TRAMPOLINE-FORWARDS*)
-        (fwd (list nil))
+        ;; (NATIVE WANTED): WANTED is raised by a worker that found NAME hot --
+        ;; only the main thread may build (%JIT-WANT, %JIT-DRAIN-WANTED)
+        (fwd (list nil nil))
         ;; ITSELF, through a box: a variable assigned only OUTSIDE the closure is
         ;; captured by value here, i.e. as NIL.
         (self (list nil)))
@@ -2745,7 +2795,8 @@
             (when (or (= left 0) (> spent (%jit-hot-ns)))
               (let ((r (%jit-hot-promote name (car self))))
                 (if (eq r :retry)
-                    (setq left (%jit-hot-call-threshold) spent 0)
+                    (progn (unless (%mvm-on-main-thread-p) (%jit-want fwd))
+                           (setq left (%jit-hot-call-threshold) spent 0))
                     (setq left 0))))
             (values-list vals)))))
     (%note-fn-name (car self) name)

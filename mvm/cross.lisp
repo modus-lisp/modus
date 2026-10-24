@@ -1788,6 +1788,8 @@
     ;; instructions instead of a literal pool), and it is what qemu-arm and any
     ;; ARM Linux worth targeting emulate.
     (:linux-arm32 :armv7)
+    ;; The bare ARMv7 CL image (QEMU virt, MMU-remapped): same translator.
+    (:armv7-cl :armv7)
     (:linux-i386 :i386)
     (:x64-console :x86-64)
     (:i386-console :i386)
@@ -1863,6 +1865,9 @@
     (:arm32   (arm32-boot-descriptor))
     (:armv7   (armv7-boot-descriptor))
     (:armv7-rpi (armv7-rpi-boot-descriptor))
+    ;; boot/boot-arm32-cl.lisp is loaded by its build (it needs the arm32
+    ;; translator and boot-linux-arm32's geometry), so resolve it by name.
+    (:armv7-cl (funcall 'armv7-cl-boot-descriptor))
     (:rpi     (rpi-boot-descriptor))
     (:fixpoint (aarch64-fixpoint-boot-descriptor))
     (:uefi-x64 (uefi-x64-boot-descriptor))

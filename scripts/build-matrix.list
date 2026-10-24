@@ -28,6 +28,7 @@ i386-cl-repl       | -                                                 | mvm/bui
 i386-cl-repl-net   | MODUS_NET_BUILD=1                                 | mvm/build-i386-cl-repl.lisp
 i386-cl-repl-ssh   | MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 | mvm/build-i386-cl-repl.lisp
 uefi-cl-repl       | -                                                 | mvm/build-uefi-cl-repl.lisp
+arm32-cl-repl      | -                                                 | mvm/build-arm32-cl-repl.lisp
 aarch64-virt       | -                                                 | mvm/build-aarch64.lisp
 rpi-cl-repl        | -                                                 | mvm/build-rpi-cl-repl.lisp
 rpi-cl-repl-board  | MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1 | mvm/build-rpi-cl-repl.lisp

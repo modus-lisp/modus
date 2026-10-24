@@ -1027,7 +1027,7 @@
 
 (defconstant +arm32-jmpbuf-words+ 7)
 (defparameter *arm32-hstack-max-depth* 21)
-(defun arm32-hbase ()           (if *arm32-linux-mode* #x10000000 *arm32-globals-base*))
+(defun arm32-hbase ()           (if (arm32-hosted-layout-p) #x10000000 *arm32-globals-base*))
 (defun arm32-jmpbuf-addr ()     (+ (arm32-hbase) #x180))
 (defun arm32-lj-scratch-addr () (+ (arm32-hbase) #x300))
 (defun arm32-hcapped-addr ()    (+ (arm32-hbase) #x360))
@@ -1374,6 +1374,23 @@
               (arm32-asr-imm buf +arm-r0+ +arm-r0+ 1)
               (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-exit+)
               (arm32-svc buf))
+             ((and (= code #x0310) *arm32-cl-bare*)
+              ;; BARE CLOCK: the generic timer's virtual count, CNTVCT >> 16, as a
+              ;; 30-bit fixnum, TAGGED in r0 (953 Hz on QEMU virt's 62.5 MHz).
+              ;; No division in a trap: #x0311 reports the matching rate.
+              (arm32-push buf (ash 1 +arm-r1+))
+              (arm32-emit buf #xEC510F1E)                    ; MRRC p15,1,r0,r1,c14 (CNTVCT)
+              (arm32-lsr-imm buf +arm-r0+ +arm-r0+ 16)
+              (arm32-dp-reg buf +arm-dp-orr+ +arm-r0+ +arm-r0+ +arm-r1+
+                            :shift-type +arm-shift-lsl+ :shift-amt 16)
+              (arm32-bic-imm buf +arm-r0+ +arm-r0+ 4 #xC0)   ; clear bits 31:30 (#xC0 ror 8)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1)
+              (arm32-pop buf (ash 1 +arm-r1+)))
+             ((and (= code #x0311) *arm32-cl-bare*)
+              ;; ... and its rate: CNTFRQ >> 16, TAGGED.
+              (arm32-emit buf #xEE1E0F10)                    ; MRC p15,0,r0,c14,c0,0 (CNTFRQ)
+              (arm32-lsr-imm buf +arm-r0+ +arm-r0+ 16)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))
              ((= code #x0300)
               ;; BARE METAL: serial write: V0 (r0) has tagged fixnum char
               ;; ASR r12, r0, #1  (untag)
@@ -1430,7 +1447,10 @@
                                       (ash (ldb (byte 12 4) code) 8)
                                       (ldb (byte 4 0) code))))
              (t
-              ;; Bare metal: SWI, for the machine-mode handler.
+              ;; Bare metal: SWI, for the machine-mode handler.  The CL image
+              ;; has none, so a trap that reaches here is a gap: count it for
+              ;; the build's census (it is otherwise a silent exception).
+              (when *arm32-cl-bare* (pushnew (+ #x10000 code) *arm32-unimpl-opcodes*))
               (arm32-swi buf code)))))
 
         ;;; --- Data Movement ---
@@ -3178,7 +3198,7 @@
   (setf *arm32-li-const-patches* nil
         *arm32-unimpl-opcodes* nil)
   (let* ((*arm32-v7* v7)
-         (*arm32-gc-label* (and *arm32-linux-mode* (mvm-make-label)))
+         (*arm32-gc-label* (and (arm32-hosted-layout-p) (mvm-make-label)))
          (buf (make-arm32-buffer))
          (label-map (make-hash-table :test 'eql))
          (bc bytecode)
@@ -3301,6 +3321,25 @@
 (defun arm32-svc (buf)
   "SVC #0 — the EABI syscall instruction (0xEF000000)."
   (arm32-emit buf #xEF000000))
+
+(defparameter *arm32-cl-bare* nil
+  "The bare-metal CL image (mvm/build-arm32-cl-repl.lisp, QEMU virt): BARE traps
+   (PL011 serial, no syscalls) over the HOSTED address conventions -- globals at
+   #x10000A00, the handler-case block at #x10000000, the native collector with
+   boot-linux-arm32's heap geometry -- because its boot stub
+   (boot/boot-arm32-cl.lisp) maps VA #x10000000.. to DRAM and lays the heap out
+   exactly where the hosted stub's mmap puts it.  Set with
+   ARM32-SET-CL-BARE-MODE.")
+
+(defun arm32-hosted-layout-p ()
+  "Hosted address conventions: a Linux image, or the bare CL image."
+  (or *arm32-linux-mode* *arm32-cl-bare*))
+
+(defun arm32-set-cl-bare-mode ()
+  "Bare traps, hosted layout (see *ARM32-CL-BARE*)."
+  (setf *arm32-linux-mode* nil
+        *arm32-cl-bare* t
+        *arm32-globals-base* #x10000A00))
 
 (defun arm32-set-linux-mode (on)
   "Turn hosted mode on or off, moving the convention slots with it.

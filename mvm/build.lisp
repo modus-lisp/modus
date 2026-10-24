@@ -83,6 +83,8 @@
 
     ("x64/bare/qemu/cl-repl"  :x64     :bare   :qemu :cl-repl
      :legacy nil :x64     "/tmp/modus-x64-cl-repl.bin"     "build-x64-cl-repl")
+    ("i386/bare/qemu/cl-repl" :i386    :bare   :qemu :cl-repl
+     :legacy nil :i386    "/tmp/modus-i386-cl-repl.bin"    "build-i386-cl-repl")
     ;; The five SSH/actors cells are MIGRATED — see *COMPOSITES* below.
     ("x64/bare/qemu/ssh"      :x64     :bare   :qemu :ssh
      :native :x86-64  :x64     "/tmp/modus-x64-ssh.bin"    "build-x64-ssh")
@@ -157,6 +159,7 @@
 ;;; reachable so nothing silently disappears, but listed apart.
 (defparameter *outside-matrix*
   '(("arm32/bare/qemu/repl" "build-arm32-repl"  "4th arch — not in the x64/aarch64/i386 matrix")
+    ("arm32/bare/qemu/cl-repl" "build-arm32-cl-repl" "4th arch — the CL image on QEMU virt (MMU-remapped)")
     ("aarch64/bare/rpi/uart-bootloader" "build-uart-bootloader" "deploy tool, not an image")
     ("aarch64/bare/rpi/pizero-hdmi"     "build-pizero2w-hdmi"   "board bring-up variant")))
 

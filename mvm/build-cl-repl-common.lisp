@@ -104,9 +104,9 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386))
+(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32))
   (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT, ~
-          :X64 or :I386."
+          :X64, :I386 or :ARM32."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
@@ -125,6 +125,13 @@
 ;; (MODUS_NET_BUILD=1) is the NE2000 ISA card: net/ne2000.lisp + the adapter
 ;; net/arch-i386-cl.lisp, run by the QEMU pipeline as on :X64.
 (defvar *cl-repl-i386-p* (eq *cl-repl-platform* :i386))
+;; :ARM32 — the bare-metal ARMv7 QEMU-virt image (mvm/build-arm32-cl-repl.lisp).
+;; Its boot stub (boot/boot-arm32-cl.lisp) maps the HOSTED arm32 address picture
+;; onto virt's RAM with the MMU, and the translator runs bare traps over the
+;; hosted layout (translate-arm32.lisp *ARM32-CL-BARE*).  Console: the PL011.
+(defvar *cl-repl-arm32-p* (eq *cl-repl-platform* :arm32))
+;; The two 32-bit images: 30-bit fixnums, 4-byte object headers.
+(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p*))
 (defvar *cl-repl-pc-p* (or *cl-repl-x64-p* *cl-repl-i386-p*)
   "T for the PC machines, 64- and 32-bit: no actor scheduler in the net image
    (the SSH server is ip.lisp's synchronous poll loop) and no USB NIC.")
@@ -217,7 +224,8 @@
 ;; :I386 is its own arch here, not :AARCH64.  It used to inherit :AARCH64, so
 ;; (machine-type) answered "aarch64" and %JIT-BOOT-INIT carried aarch64's
 ;; layout co-init (*conv-relative*, *a64-x18-base*) into a 32-bit x86 image.
-(defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386) (t :aarch64)))
+(defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386)
+                         (*cl-repl-arm32-p* :arm32) (t :aarch64)))
 
 ;;; BARE-METAL SEAM.  No OS: no Linux syscalls, no fds, no argv, no
 ;;; cli-toplevel.  The tarball pipeline is kept (untar -> parse .asd ->
@@ -302,6 +310,8 @@
     ;; :I386 — there is no i386 JIT at all, so this is not a default, it is the
     ;; only option.  Stated as its own arm rather than falling through.
     (*cl-repl-i386-p* nil)
+    ;; :ARM32 — no in-image JIT on 32-bit ARM either (build-cli-common).
+    (*cl-repl-arm32-p* nil)
     ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
     ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
     ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
@@ -942,7 +952,7 @@
 ;;; own BSS-equivalent slots need zeroing (the list the retired standalone
 ;;; build-x64-cl-repl.lisp driver zeroed).
 (defvar *cli-arch-kernel-prologue*
- (if *cl-repl-i386-p*
+ (if *cl-repl-32-p*
   *cl-repl-i386-kernel-prologue*
  (if *cl-repl-x64-p*
   *cl-repl-x64-kernel-prologue*
@@ -1137,13 +1147,16 @@
 ;;; its fixnum limits are 62-bit -- bignums on a 30-bit-fixnum target.  Moved
 ;;; below the heap (59 / 60 MB: above the page directory at 58 MB) and set to
 ;;; i386's fixnum range.
-(when *cl-repl-i386-p*
-  (dolist (pair '(("#x0FE00000" . "#x03B00000")
-                  ("#x0FF00000" . "#x03C00000")
-                  ("4611686018427387903" . "536870911")
-                  ("-4611686018427387904" . "-536870912")))
+(when *cl-repl-32-p*
+  (dolist (pair (append
+                 ;; :ARM32's scratch at #x0FE00000.. is mapped DRAM above its
+                 ;; stack and L1 table; only i386's heap covers those addresses.
+                 (if *cl-repl-i386-p* '(("#x0FE00000" . "#x03B00000")
+                                        ("#x0FF00000" . "#x03C00000")) nil)
+                 '(("4611686018427387903" . "536870911")
+                  ("-4611686018427387904" . "-536870912"))))
     (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
-      (unless at (error "i386: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+      (unless at (error "32-bit: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
       (setq *cli-arch-io-scratch-source*
             (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
                          (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
@@ -2720,6 +2733,21 @@
   (setf (symbol-value (intern "*I386-FN-ALIGN*" "MODUS.MVM.I386")) 16)
   (format t "~&;; CONSOLE: COM1 via port I/O (i386 QEMU-pc)~%"))
 
+;;; DIVERGENCE 6/7 (:ARM32 arm) — the ARMv7 QEMU-virt boot descriptor and console.
+;;;
+;;; boot/boot-arm32-cl.lisp needs the arm32 translator's emitters and
+;;; boot-linux-arm32.lisp's heap geometry (the collector reads the same
+;;; constants), so both load here rather than in lib/load-mvm.lisp.  The
+;;; console is translate-arm32's bare PL011 arm, at the VA the stub maps it to.
+(when cl-user::*cl-repl-arm32-p*
+  (cl-user::mvm-load "boot/boot-linux-arm32.lisp")
+  (cl-user::mvm-load "boot/boot-arm32-cl.lisp")
+  (funcall (intern "INSTALL-ARMV7-TRANSLATOR" "MODUS.MVM"))
+  (funcall (intern "ARM32-SET-CL-BARE-MODE" "MODUS.MVM"))
+  (setf (symbol-value (intern "*ARM32-UART-OVERRIDE*" "MODUS.MVM"))
+        (symbol-value (intern "+ARM32-CL-UART-VA+" "MODUS.MVM")))
+  (format t "~&;; CONSOLE: PL011 at VA 30000000 -> PA 09000000 (QEMU virt, arm32)~%"))
+
 ;;; DIVERGENCE 6/7 (:X64 arm) — the x86-64 boot descriptor and console.
 ;;; Verbatim from the retired standalone build-x64-cl-repl.lisp: the stack top
 ;;; moves to 512 MB (the 8 MB default sits inside a 60 MB image), data pages
@@ -2868,7 +2896,7 @@
 ;; BCM2835 mini-UART base on an x86 image.  The build printed both
 ;; "CONSOLE: COM1 via port I/O" and "CONSOLE: PL011 UART0 0x3F201000", which is
 ;; how it was caught — two consoles for one image is always a fall-through.
-(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p*)
+(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*)
     nil
  (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
@@ -3190,6 +3218,7 @@
                                         (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                                         (cl-user::*cl-repl-x64-p* :x86-64)
                                         (cl-user::*cl-repl-i386-p* :i386)
+                                        (cl-user::*cl-repl-arm32-p* :armv7-cl)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
@@ -3197,6 +3226,7 @@
                         (cl-user::*cl-repl-uefi-p* "/tmp/modus-uefi-cl.efi")
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (cl-user::*cl-repl-i386-p* "/tmp/modus-i386-cl-repl.bin")
+                        (cl-user::*cl-repl-arm32-p* "/tmp/modus-arm32-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output
@@ -3263,6 +3293,28 @@
            (error "i386 layout: stack top ~:D is not above the general heap ~:D; ~
                    the stack grows DOWN into it." stack-top general))))
       (cl-user::*cl-repl-x64-p* (%x64-memory-map-asserts image))
+      ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
+      ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
+      ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything
+      ;; lives in the low 256 MB section window (PA #x40000000..).
+      (cl-user::*cl-repl-arm32-p*
+       (let ((gaps (symbol-value (intern "*ARM32-UNIMPL-OPCODES*" "MODUS.MVM"))))
+         (if gaps
+             (format t "~&;; *** arm32 TRANSLATOR GAPS (bare SWI, no handler): ~{#x~X~^ ~} ***~%"
+                     (sort (copy-list gaps) #'<))
+             (format t "~&;; arm32: no unimplemented opcodes or traps.~%")))
+       (let* ((image-end (+ (symbol-value (intern "+ARM32-CL-LOAD-VA+" "MODUS.MVM"))
+                            (length (kernel-image-image-bytes image))))
+              (stack-top (symbol-value (intern "+ARM32-CL-STACK-TOP+" "MODUS.MVM")))
+              (l1 (symbol-value (intern "+ARM32-CL-L1-VA+" "MODUS.MVM"))))
+         (format t "~&;; arm32 map: image VA #x10000 .. #x~X (~,1F MB), stack top #x~X, ~
+                   L1 #x~X, heap #x10000000..~%"
+                 image-end (/ image-end 1048576.0) stack-top l1)
+         (when (> (+ image-end #x1000000) stack-top)
+           (error "arm32 layout: the image ends at #x~X, within 16 MB of the stack ~
+                   top #x~X; the stack would grow into native code." image-end stack-top))
+         (when (< l1 stack-top)
+           (error "arm32 layout: the L1 table #x~X is below the stack top #x~X." l1 stack-top))))
       (cl-user::*cl-repl-virt-p*
         ;; ---- QEMU virt (fixpoint MMU) ----------------------------------
         ;; Image loads at VA 0x80000 and grows UP; the stack grows DOWN from
@@ -3337,6 +3389,8 @@
       (t (%rpi-memory-map-asserts image)))
     (format t "~%Run: ~A~%"
             (cond
+              (cl-user::*cl-repl-arm32-p*
+                (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*
                 (format nil "qemu-system-x86_64 -m 512 -kernel ~A -display none -serial stdio -no-reboot~A"
                         path

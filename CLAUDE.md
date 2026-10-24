@@ -755,6 +755,40 @@ into free RAM from gdb at the kernel entry (`0x100020` — the multiboot ROM
 copies the kernel after reset, so patch there, not at `0xfff0`) and patch the
 function to jump to it.
 
+### QEMU arm32 (virt) — the bare-metal CL image (2026-10-24)
+
+```bash
+sbcl --dynamic-space-size 12288 --script mvm/build-arm32-cl-repl.lisp   # -> /tmp/modus-arm32-cl-repl.bin
+qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 \
+    -kernel /tmp/modus-arm32-cl-repl.bin -display none -serial stdio -no-reboot
+```
+
+The real CL stack on bare 32-bit ARM, at its REPL after ~7 minutes of TCG
+boot.  Measured: `(+ 1 2)`, `(expt 2 100)`, DEFSTRUCT, `(machine-type)` =>
+"armv7l", a working clock (482 s of wall time read as 482028331 us), and 960 MB
+of churn through 59 collections with a live 2000-element list intact.
+
+**It runs the HOSTED arm32 address picture, built with the MMU.**  QEMU virt
+has RAM only from `#x40000000` (above the 2^29 a tagged MEM-REF address can
+express) and PCIe MMIO across `#x10000000..`, so `boot/boot-arm32-cl.lisp`
+maps 1 MB sections: VA `#x0..#x0FFFFFFF` -> PA `#x40000000` (the image at VA
+`#x10000` is exactly where QEMU loads it), VA `#x10000000..#x2FFFFFFF` -> PA
+`#x50000000` (fixed block, heap, kind map at boot-linux-arm32's addresses), VA
+`#x30000000` -> the PL011, VA `#xDEA00000` -> NIL's page; then turns the MMU on
+and `SUB pc, pc, #0x40000000` into VA space.  The translator's
+`*ARM32-CL-BARE*` mode (`ARM32-SET-CL-BARE-MODE`) is BARE traps over the HOSTED
+layout — globals `#x10000A00`, handler block `#x10000000`, and the native
+collector with the hosted geometry — so nothing in the collector or the runtime
+needed a bare variant.  Bare clock: CNTVCT >> 16 (#x0310) and CNTFRQ >> 16
+(#x0311).
+
+**Gaps, from the build's own census** (`arm32 TRANSLATOR GAPS`): exit, the
+three syscall traps, signal-handler install and the four JIT/mmap traps are
+hosted-only and become an unhandled SWI on bare metal; nothing in boot or the
+REPL reaches them.  **The 32-bit lessons from i386 apply here unchanged before
+networking or SSH is added**: a byte vector's payload is at word−5, crypto-fast
+must be replaced by crypto-32-fast, and TCP sequence numbers are bignums.
+
 ### QEMU i386 — LEGACY mini-Lisp (32-bit x86, Multiboot)
 
 The builds below run `mvm/repl-source.lisp`, a separate 708-line toy Lisp with

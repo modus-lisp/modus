@@ -2644,6 +2644,8 @@
   (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x2EA00000) ; 746 MB
   ;; THE COLLECTOR, on bare metal: boot-i386 sets up what boot-linux-i386 does.
   (setf (symbol-value (intern "*I386-BARE-GC*" "MODUS.MVM.I386")) t)
+  ;; ... and a clock: RDTSC behind traps #x0310/#x0311.
+  (setf (symbol-value (intern "*I386-BARE-CLOCK*" "MODUS.MVM.I386")) t)
   (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x3C000000)    ; 960 MB
   ;; The handler-case block (jmp_buf + handler stack): its bare default,
   ;; #x5C0000, is inside this image.  56 MB: above the image, below the heap.

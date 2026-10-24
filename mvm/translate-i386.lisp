@@ -424,6 +424,11 @@
    same and sets this; every other bare image keeps `int $0x31' and is
    byte-identical.")
 
+(defparameter *i386-bare-clock* nil
+  "Emit the bare-metal clock traps (#x0310 RDTSC, #x0311 rate) instead of the
+   INT3 placeholder.  Set by the bare CL image; the legacy bare images keep the
+   placeholder and stay byte-identical.")
+
 (defun i386-gc-mode-p ()
   "Does this image run the native collector: hosted, or a bare image whose
    boot sets it up (*I386-BARE-GC*)?"
@@ -2513,7 +2518,7 @@
               ;; CNTFRQ: #x0310's rate, TAGGED, in VR.  mov eax, 2000.
               (i386-emit-byte buf #xB8) (i386-emit-u32 buf 2000))
 
-             ((= code #x0310)
+             ((and (= code #x0310) *i386-bare-clock*)
               ;; RDTSC, bare metal (no clock_gettime): bits 12..41 of the time
               ;; stamp counter -- a 30-bit fixnum, monotonic between wraps (2^42
               ;; cycles, about 20 minutes at 3.5 GHz) -- TAGGED in EAX.  Bare x64
@@ -2524,7 +2529,7 @@
               (i386-emit-byte buf #x25) (i386-emit-u32 buf #x3FFFFFFF) ; and eax, 2^30-1
               (i386-emit-byte buf #xD1) (i386-emit-byte buf #xE0))  ; shl eax,1 (tag)
 
-             ((= code #x0311)
+             ((and (= code #x0311) *i386-bare-clock*)
               ;; CNTFRQ, bare metal: the TSC's rate is not known, so 0 --
               ;; "frequency unknown", which callers handle (as bare x64).
               (i386-emit-byte buf #x31) (i386-emit-byte buf #xC0))  ; xor eax, eax

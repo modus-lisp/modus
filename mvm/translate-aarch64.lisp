@@ -3967,12 +3967,14 @@
                   (a64-emit buf 0)   ; B.LT placeholder
                   ;; cmp w9, #64  (CALL-ARGUMENTS-LIMIT; was 24 — 33..64 handled
                   ;; by emit-rest-prologue's variable-index :aref loop)
-                  (a64-cmp-imm buf 9 120)   ; 120 = +apply-spread-max+ (was 64)
+                  ;; 121 = +apply-spread-max+ positional + the tail-list word
+                  ;; of a +rest-tail-nargs+ (254) call
+                  (a64-cmp-imm buf 9 121)
                   ;; b.le nocap (skip "mov w9, 120")
                   (let ((ble-idx (a64-current-index buf)))
                     (a64-emit buf 0)   ; B.LE placeholder
-                    ;; movz w9, #120 — w9 = 120 (caps high nargs)
-                    (a64-movz buf 9 120 0)
+                    ;; movz w9, #121 — w9 = 121 (caps high nargs)
+                    (a64-movz buf 9 121 0)
                     ;; nocap:
                     (let ((nocap-idx (a64-current-index buf)))
                       ;; patch ble → nocap

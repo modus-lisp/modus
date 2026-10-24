@@ -1388,21 +1388,37 @@
            ((= code #x0530)
             ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
             ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
-            ;; do.  Unrolled -- for i = 4..31: stop once nargs <= i, else copy
-            ;; one word -- so it needs only the count and r0, no loop state.
-            ;; Argument i is at old-r1 + (i-4)*ws = VFP + fs + (i-4)*ws, which
-            ;; stays intact because LR no longer lives there (ppc-lr-slot).
-            ;; Capped at 32 arguments like the other back ends.
+            ;; do.  Argument i is at old-r1 + (i-4)*ws = VFP + fs + (i-4)*ws,
+            ;; which stays intact because LR no longer lives there
+            ;; (ppc-lr-slot), and slot i at VFP + slot-base + i*ws -- both
+            ;; linear in i, so ONE pointer X = VFP + i*ws addresses both by
+            ;; displacement.  A LOOP, capped at 121 arguments as on x64:
+            ;; +APPLY-SPREAD-MAX+ positional and the tail-list word of a
+            ;; +REST-TAIL-NARGS+ (254) call.  (It was unrolled to 32, so a
+            ;; 33..120-argument &rest call read slots nothing had copied.)
+            ;; r11 counts, r12 is X (never r0: r0 as a base is literal zero),
+            ;; r0 carries the word.
             (let ((done (mvm-make-label))
+                  (nocap (mvm-make-label))
+                  (top (mvm-make-label))
                   (ws (ppc-word-size))
                   (fs (ppc-frame-size)))
               (ppc-emit-load-abs buf +ppc-scratch1+ (ppc-nargs-addr))
-              (loop for i from 4 below 32
-                    do (ppc-emit-cmpi-word buf +ppc-scratch1+ i)
-                       (ppc-emit-ble buf done)
-                       (ppc-emit-load-word buf +ppc-r0+ +ppc-r31+ (+ fs (* (- i 4) ws)))
-                       (ppc-emit-store-word buf +ppc-r0+ +ppc-r31+
-                                            (+ (ppc-frame-slot-base) (* i ws))))
+              (ppc-emit-cmpi-word buf +ppc-scratch1+ 4)
+              (ppc-emit-ble buf done)
+              (ppc-emit-cmpi-word buf +ppc-scratch1+ 121)
+              (ppc-emit-ble buf nocap)
+              (ppc-emit-li buf +ppc-scratch1+ 121)
+              (ppc-emit-label buf nocap)
+              (ppc-emit-addi buf +ppc-scratch1+ +ppc-scratch1+ -4)     ; count = n - 4
+              (ppc-emit-addi buf +ppc-scratch2+ +ppc-r31+ (* 4 ws))    ; X at i = 4
+              (ppc-emit-label buf top)
+              (ppc-emit-load-word buf +ppc-r0+ +ppc-scratch2+ (- fs (* 4 ws)))
+              (ppc-emit-store-word buf +ppc-r0+ +ppc-scratch2+ (ppc-frame-slot-base))
+              (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ ws)
+              (ppc-emit-addi buf +ppc-scratch1+ +ppc-scratch1+ -1)
+              (ppc-emit-cmpi-word buf +ppc-scratch1+ 0)
+              (ppc-emit-bgt buf top)
               (ppc-emit-label buf done)))
            ((and (= code #x0300) *ppc-linux-mode*)
             ;; HOSTED: the serial write becomes write(1, &byte, 1).  The byte

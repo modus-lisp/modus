@@ -1296,7 +1296,15 @@
     ;; does (args in V0..V3 via push/pop, :set-nargs) so the callee's
     ;; frame-enter / &rest prologue see them.
     (when initial-args
-      (let ((i 0))
+      (let ((i 0) (tail-call nil))
+        ;; More than 120 (compiler.lisp's +APPLY-SPREAD-MAX+): 120 positional
+        ;; and the list of the rest as the 121st, nargs 254
+        ;; (+REST-TAIL-NARGS+) -- what a native APPLY passes, and what the
+        ;; callee's &rest prologue (and the #x0530 copy, capped at 121) take.
+        (when (nthcdr 120 initial-args)
+          (setq tail-call t)
+          (setq initial-args (append (subseq initial-args 0 120)
+                                     (list (nthcdr 120 initial-args)))))
         (dolist (a initial-args)
           ;; Args 0..3 go in V0..V3 — the MVM calling convention's register
           ;; window (4 = compiler.lisp's +max-reg-args+, hardcoded here for
@@ -1317,7 +1325,7 @@
               (setf (mvm-stack state)
                     (append (mvm-stack state) (list a))))
           (setf i (+ i 1)))
-        (setf (mvm-nargs state) i)))
+        (setf (mvm-nargs state) (if tail-call 254 i))))
     ;; The closure-env register is stored as a VALUE (op-set-cenv stores
     ;; `svref regs vs` directly; op-get-cenv stores it back into the dest
     ;; slot).  Storing the raw WORD here (the old `%val->word` round-trip)
@@ -1498,7 +1506,9 @@
                        ;; traps.  The ≤32 case is handled by the unrolled ladder;
                        ;; 33..64 by emit-rest-prologue's variable-index :aref loop,
                        ;; which reads exactly the frame slots this copy populates.
-                       (top (if (> nargs 120) 120 nargs))
+                       ;; 121: +apply-spread-max+ positional + the tail-list
+                       ;; word of a +rest-tail-nargs+ (254) call
+                       (top (if (> nargs 121) 121 nargs))
                        (s (mvm-stack state))
                        (i 4))
                   (loop

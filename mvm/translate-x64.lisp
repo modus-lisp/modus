@@ -2458,13 +2458,13 @@
                     (loop-label (make-label))
                     (nocap-label (make-label)))
                 (emit-jcc buf :l done-label)
-                ;; cmp eax, 120  (CALL-ARGUMENTS-LIMIT; was 64, 32 — see
-                ;; emit-rest-prologue's variable-index loop for 33..64)
-                (emit-bytes buf #x83 #xF8 #x78)   ; 120 = +apply-spread-max+
+                ;; cmp eax, 121: +APPLY-SPREAD-MAX+ positional arguments plus
+                ;; the tail-list word of a +REST-TAIL-NARGS+ call (nargs 254)
+                (emit-bytes buf #x83 #xF8 #x79)
                 ;; jle nocap
                 (emit-jcc buf :le nocap-label)
-                ;; mov eax, 120
-                (emit-bytes buf #xB8 #x78 #x00 #x00 #x00)
+                ;; mov eax, 121
+                (emit-bytes buf #xB8 #x79 #x00 #x00 #x00)
                 (emit-label buf nocap-label)
                 ;; sub eax, 4
                 (emit-bytes buf #x83 #xE8 #x04)

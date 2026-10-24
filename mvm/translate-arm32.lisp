@@ -1199,7 +1199,15 @@
            (cond
              ((frame-enter-code-p code)
               ;; Frame-enter: emit function prologue (push regs, allocate frame)
-              (setq *arm32-frame-bytes* (arm32-frame-bytes (frame-enter-slots code)))
+              ;; A frame SIZED to 128 slots is not the unsized one: 512 bytes
+              ;; hold slots 0..119 and the spill words sit at slot 120 -- the
+              ;; word the #x0530 copy now writes (the tail list of a
+              ;; +REST-TAIL-NARGS+ call), and 128 is the floor every function
+              ;; with that copy gets.
+              (setq *arm32-frame-bytes*
+                    (if (>= code +frame-enter-sized+)
+                        (* 64 (ash (+ (* 4 (frame-enter-slots code)) 32 63) -6))
+                        +arm32-frame-size+))
               (arm32-emit-prologue buf)
               ;; Copy overflow args (params 5+) from caller's stack to frame slots.
               ;; After prologue: PUSH 7 regs (28 bytes) + SUB SP 512.
@@ -1246,15 +1254,31 @@
               ;; it).  Addressed from VFP, which is SP-2 as the prologue left it,
               ;; so it stays right even if the body has pushed: argument k is at
               ;; [SP+540+4k] = [r11+542+4k] and slot i at [r11+2+4i] -- the layout
-              ;; the fixed-count copy above uses.  Unrolled to 32 arguments.
-              (let ((done (mvm-make-label)))
+              ;; the fixed-count copy above uses.  A LOOP, capped at 121
+              ;; arguments as on x64: +APPLY-SPREAD-MAX+ positional and the
+              ;; tail-list word of a +REST-TAIL-NARGS+ (254) call.  It was
+              ;; unrolled to 32, so a 33..120-argument &rest call read slots
+              ;; nothing had copied; unrolled to 121 it would be ~2 KB in every
+              ;; &rest function.  r12 counts, lr carries the word, and r0/r1 --
+              ;; V0/V1, still live -- are saved for the two pointers.
+              (let ((done (mvm-make-label)) (top (mvm-make-label)))
                 (arm32-emit-load-abs buf +arm-r12+ (arm32-nargs-addr))
-                (loop for i from 4 below 32
-                      do (arm32-cmp-imm buf +arm-r12+ 0 i)
-                         (arm32-b-cond buf +arm-cc-le+ done)
-                         (arm32-ldr buf +arm-lr+ +arm-r11+
-                                    (+ *arm32-frame-bytes* 30 (* 4 (- i 4))))
-                         (arm32-str buf +arm-lr+ +arm-r11+ (+ 2 (* 4 i))))
+                (arm32-cmp-imm buf +arm-r12+ 0 4)
+                (arm32-b-cond buf +arm-cc-le+ done)
+                (arm32-cmp-imm buf +arm-r12+ 0 121)
+                (arm32-mov-imm-cond buf +arm-cc-gt+ +arm-r12+ 0 121)
+                (arm32-sub-imm buf +arm-r12+ +arm-r12+ 0 4)        ; count = n - 4
+                (arm32-push buf #b11)                              ; {r0, r1}
+                (arm32-load-imm32 buf +arm-r0+ (+ *arm32-frame-bytes* 30))
+                (arm32-add buf +arm-r0+ +arm-r11+ +arm-r0+)         ; src = argument 4
+                (arm32-add-imm buf +arm-r1+ +arm-r11+ 0 18)         ; dst = slot 4
+                (arm32-emit-label buf top)
+                (arm32-ldr-post buf +arm-lr+ +arm-r0+ 4)
+                (arm32-str buf +arm-lr+ +arm-r1+ 0)
+                (arm32-add-imm buf +arm-r1+ +arm-r1+ 0 4)
+                (arm32-dp-imm buf +arm-dp-sub+ +arm-r12+ +arm-r12+ 0 1 :s 1)
+                (arm32-b-cond buf +arm-cc-ne+ top)
+                (arm32-pop buf #b11)
                 (arm32-emit-label buf done)))
              ((and (= code #x0300) *arm32-linux-mode*)
               ;; HOSTED: serial write becomes write(1, &byte, 1).  write(2)

@@ -1768,7 +1768,9 @@
   (setq array-total-size-limit  (ash 1 24))
   (setq array-dimension-limit   (ash 1 24))
   (setq array-rank-limit        256)
-  (setq call-arguments-limit    120)
+  ;; No fixed bound: past 120 a call passes the list of the rest (APPLY,
+  ;; +REST-TAIL-NARGS+ in compiler.lisp), as SBCL does
+  (setq call-arguments-limit    most-positive-fixnum)
   (setq lambda-parameters-limit 120)
   (setq pi 3.141592653589793d0)
   ;; AFTER init-all-globals — overrides defvar's init.  *write-object-

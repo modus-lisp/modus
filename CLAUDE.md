@@ -3837,6 +3837,26 @@ slots**: frame slots are the imm8 operand of OBJ-REF/OBJ-SET on VFP, and
 old fixed frames were smaller than the 120-binding guard suggested on two
 ports: i386's 296 bytes held 57 slots, aarch64's 1024 held 121.
 
+**CALL-ARGUMENTS-LIMIT is MOST-POSITIVE-FIXNUM (2026-10-24).**  A call passes
+at most 120 arguments positionally (`+APPLY-SPREAD-MAX+`); past that it passes
+120 and then ONE more word, the LIST of the rest, with nargs **254**
+(`+REST-TAIL-NARGS+`; 255 is the pre-packed sentinel).  The `&rest` prologue
+seeds its list with that tail (slot 120); a function with no `&rest` fails its
+arity check ("more than 120"), which is right since LAMBDA-PARAMETERS-LIMIT is
+120.  COMPILE-CALL / COMPILE-FUNCALL route a call with more than 120 argument
+forms through APPLY (emitted directly, the copy stopped at 121 words and the
+rest list read garbage -- inside a compiled function, silently).  The `#x0530`
+copy is capped at **121** on every back end, and it was 32 on i386, riscv,
+ppc, 68k and arm32 -- a 33..120-argument `&rest` call there built its list
+from uncopied slots.  Two frames were too small for 121 slots: i386 and arm32
+gave a frame SIZED to 128 the UNSIZED form's bytes (296 / 512), and 128 is the
+floor of every `#x0530` function -- on i386 every `&rest` call of ~31+
+arguments was wrong.  **Runtime-compiler paths must spell these as literals**
+(`120`, `254`): a DEFCONSTANT has no value in the image's own compiler, and
+`+APPLY-SPREAD-MAX+` there read NIL and killed boot.  Tests:
+`test/call-arguments-limit.lisp` (`CALL_LIMIT_REPS=2` on i386),
+`test/arch-rungs/r35-rest-hundred.lisp`.
+
 ## Known Bugs
 
 ### Mutable Closures — Global Cell Limitation (RESOLVED)

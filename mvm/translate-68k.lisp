@@ -1191,18 +1191,32 @@
            ((= code #x0530)
             ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
             ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
-            ;; do.  Unrolled -- for i = 4..31: stop once nargs <= i, else copy
-            ;; one longword -- so it needs only D0 (the count) and D1.  JSR
-            ;; pushed the return address and LINK the old A6, so argument i is
-            ;; at A6 + 8 + (i-4)*4.  Capped at 32 like the other back ends.
-            (let ((done (mvm-make-label)))
+            ;; do.  JSR pushed the return address and LINK the old A6, so
+            ;; argument i is at A6 + 8 + (i-4)*4, and slot i at
+            ;; A6 + slot-base - i*4.  A LOOP, capped at 121 arguments as on
+            ;; x64: +APPLY-SPREAD-MAX+ positional and the tail-list word of a
+            ;; +REST-TAIL-NARGS+ (254) call.  (It was unrolled to 32, so a
+            ;; 33..120-argument &rest call read slots nothing had copied.)  D0
+            ;; counts, D1 carries the word, A0 walks the arguments up and A1
+            ;; the slots down -- A0/A1 are translator scratch, not vregs.
+            (let ((done (mvm-make-label)) (nocap (mvm-make-label)) (top (mvm-make-label)))
               (m68k-emit-load-abs buf +68k-d0+ (m68k-nargs-addr))
-              (loop for i from 4 below 32
-                    do (m68k-emit-cmpi buf +68k-d0+ i)
-                       (m68k-emit-ble buf done)
-                       (m68k-emit-move-disp-dn buf +68k-a6+ (+ 8 (* (- i 4) 4)) +68k-d1+)
-                       (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a6+
-                                               (- +68k-frame-slot-base+ (* i 4))))
+              (m68k-emit-cmpi buf +68k-d0+ 4)
+              (m68k-emit-ble buf done)
+              (m68k-emit-cmpi buf +68k-d0+ 121)
+              (m68k-emit-ble buf nocap)
+              (m68k-emit-move-imm-dn buf 121 +68k-d0+)
+              (m68k-emit-label buf nocap)
+              (m68k-emit-subq buf +68k-d0+ 4)                        ; count = n - 4
+              (m68k-emit-lea-disp buf +68k-a6+ 8 +68k-a0+)            ; argument 4
+              (m68k-emit-lea-disp buf +68k-a6+ (- +68k-frame-slot-base+ 16) +68k-a1+) ; slot 4
+              (m68k-emit-label buf top)
+              (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d1+)
+              (m68k-emit-move-dn-an-ind buf +68k-d1+ +68k-a1+)
+              (m68k-emit-addq-an buf +68k-a0+ 4)
+              (m68k-emit-subq-an buf +68k-a1+ 4)
+              (m68k-emit-subq buf +68k-d0+ 1)
+              (m68k-emit-bne buf top)
               (m68k-emit-label buf done)))
            ((and (= code #x0300) *68k-linux-mode*)
             ;; HOSTED: the serial write becomes write(1, &byte, 1).

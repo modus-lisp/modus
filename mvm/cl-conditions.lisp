@@ -3215,11 +3215,13 @@
 
 (defun %wrong-nargs (name n)
   "A function compiled at runtime was called with N arguments its lambda list
-   does not accept (the entry check emit-arity-range-check-prologue emits)."
+   does not accept (the entry check emit-arity-range-check-prologue emits).
+   N = 254 is a call with more than 120 (+REST-TAIL-NARGS+, compiler.lisp)."
+  (when (eql n 254) (setq n "more than 120"))
   (if name
       (error 'simple-program-error
-             :format-control "invalid number of arguments to ~S: ~D"
+             :format-control "invalid number of arguments to ~S: ~A"
              :format-arguments (list name n))
       (error 'simple-program-error
-             :format-control "invalid number of arguments: ~D"
+             :format-control "invalid number of arguments: ~A"
              :format-arguments (list n))))

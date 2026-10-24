@@ -19591,6 +19591,12 @@
 
 (defun compile-funcall (args env dest)
   "Compile (funcall f arg1 arg2 ...) - indirect function call"
+  ;; More arguments than a call passes positionally: through APPLY (see
+  ;; COMPILE-CALL).
+  (when (> (length (cdr args)) 120)   ; +APPLY-SPREAD-MAX+, literal as there
+    (return-from compile-funcall
+      (compile-form (list 'apply (car args) (%over-limit-args-form (cdr args)))
+                    env dest)))
   (let ((fn-form (car args))
         (call-args (cdr args))
         (nargs (length (cdr args)))
@@ -21344,10 +21350,19 @@
                    (setq lw (%arith-chain-width trust)))))))))))
 
 (defconstant +apply-spread-max+ 120
-  "CALL-ARGUMENTS-LIMIT as every call shape honours it.  %APPLY-SPREAD's
-   SET-NARGS ladder runs to this, the #x0530 overflow-copy trap copies this
-   many caller-stack args into frame slots (interp, x64, aarch64, web), and
-   the frame has 128 slots.  CLHS requires >= 50.")
+  "The most arguments a call passes POSITIONALLY.  %APPLY-SPREAD's SET-NARGS
+   ladder runs to this, and the frame of a function with the #x0530 copy has
+   128 slots.  A call with MORE arguments passes this many and then ONE more
+   word, the list of the rest, with nargs = +REST-TAIL-NARGS+ -- so the copy
+   trap copies up to 121 words, and CALL-ARGUMENTS-LIMIT is not this number.")
+
+(defconstant +rest-tail-nargs+ 254
+  "Nargs of a call with more than +APPLY-SPREAD-MAX+ arguments: 120 positional
+   arguments then the list of the remaining ones (slot 120).  The &rest
+   prologue (EMIT-REST-PROLOGUE) seeds its list with that tail; a function
+   with no &rest fails its arity check, which is right -- no lambda list may
+   have more than LAMBDA-PARAMETERS-LIMIT (120) parameters.  255 is the
+   pre-packed sentinel; this is the other one.")
 
 (defun compile-apply-spread (args env dest)
   "(%APPLY-SPREAD FN RLIST N): call FN with the N arguments held in RLIST,
@@ -21423,7 +21438,8 @@
                    (emit-ir :set-nargs k)
                    (emit-ir :br setdone)
                    (emit-ir-label next)))
-        (emit-ir :set-nargs +apply-spread-max+)   ; unreachable: APPLY refuses larger N
+        ;; N = 121: APPLY's 120 positional arguments and the tail list
+        (emit-ir :set-nargs 254)   ; +REST-TAIL-NARGS+
         (emit-ir-label setdone))
       (emit-ir :call-indirect f-reg 0)
       (unless (= dest +vreg-vr+) (emit-ir :mov dest +vreg-vr+))
@@ -26218,6 +26234,11 @@
            (dolist (a args) (unless (%literal-arg-p a) (setq n (+ n 1))))
            (>= n 2)))))
 
+(defun %over-limit-args-form (args)
+  "ARGS as one list-building form, (CONS a1 (CONS a2 ... NIL)): evaluated left
+   to right, and no call in it has more than two arguments."
+  (if (null args) nil (list 'cons (car args) (%over-limit-args-form (cdr args)))))
+
 (defun compile-call (fn args env dest)
   "Compile a function call (fn arg1 arg2 ...).
    Register args are saved to the stack during evaluation to avoid
@@ -26226,6 +26247,14 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; More arguments than a call passes positionally: through APPLY, which
+  ;; passes the rest as a list (+REST-TAIL-NARGS+).  Emitted directly, the
+  ;; callee's #x0530 copy stops at 121 words and the rest list read garbage.
+  ;; 120 = +APPLY-SPREAD-MAX+, a literal: runtime compiler (see EMIT-REST-PROLOGUE)
+  (when (> (length args) 120)
+    (return-from compile-call
+      (compile-form (list 'apply (list 'function fn) (%over-limit-args-form args))
+                    env dest)))
   ;; (replace d s :start1 ..) / (fill v x :start ..) with LITERAL keywords: a call to
   ;; the positional %REPLACE-POS / %FILL-POS, so no &REST list of keyword arguments is
   ;; consed per call (one REPLACE a row is how glass copies a rectangle: 17 KB a
@@ -27564,10 +27593,26 @@
           ;; left byte-identical (no layout shift on the common path).
           (let ((loop-top (make-compiler-label))
                 (loop-end (make-compiler-label))
+                (tail-label (make-compiler-label))
+                (start-label (make-compiler-label))
                 (one-reg  (alloc-temp-reg)))
-            (emit-ir :mov list-reg +vreg-vn+)            ; list = NIL
             (emit-ir :li one-reg (ash 1 1))              ; tagged 1 (inline :shl)
+            ;; +REST-TAIL-NARGS+: 120 positional arguments, and slot 120 (the
+            ;; #x0530 copy's last word) is the list of the rest.  Seed the
+            ;; list with it and cons slots req..119 on.
+            ;; LITERALS on this path, not +REST-TAIL-NARGS+ / +APPLY-SPREAD-MAX+:
+            ;; it also runs in the image's runtime compiler, where a
+            ;; DEFCONSTANT's value is not there (NIL -> TYPE-ERROR at boot)
+            (emit-ir :li cmp-reg (ash 254 1))
+            (emit-ir :cmp nargs-reg cmp-reg)
+            (emit-ir :beq tail-label)
+            (emit-ir :mov list-reg +vreg-vn+)            ; list = NIL
             (emit-ir :sub nargs-reg nargs-reg one-reg)   ; idx = nargs - 1
+            (emit-ir :br start-label)
+            (emit-ir-label tail-label)
+            (emit-ir :stack-load list-reg 120)                       ; list = tail
+            (emit-ir :li nargs-reg (ash 119 1))                      ; idx = 119
+            (emit-ir-label start-label)
             (emit-ir :li cmp-reg (ash req 1))            ; tagged req bound
             (emit-ir-label loop-top)
             (emit-ir :cmp nargs-reg cmp-reg)             ; idx vs req

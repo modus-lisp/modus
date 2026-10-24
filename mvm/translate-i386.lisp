@@ -2294,15 +2294,30 @@
     (i386-emit-gcnative-copy buf copy-label)))
 
 (defun i386-frame-bytes (slots)
-  "Frame size below EBP for SLOTS frame slots.  The unsized frame keeps its
-   historical 296 bytes (room for 57 slots, not 128).  A sized frame is
-   72 + 4*SLOTS: slot N sits at EBP-68-4N, and 72+32k stays 8 mod 16 like 296,
-   so ESP alignment after CALL+PUSH EBP is unchanged."
-  (if (= slots +frame-legacy-slots+)
+  "Frame size below EBP for SLOTS frame slots.  The UNSIZED frame (:LEGACY)
+   keeps its historical 296 bytes (room for 57 slots, not 128).  A sized frame
+   is 72 + 4*SLOTS: slot N sits at EBP-68-4N, and 72+32k stays 8 mod 16 like
+   296, so ESP alignment after CALL+PUSH EBP is unchanged.
+
+   A frame SIZED to 128 slots is not the unsized one.  It used to get 296 bytes
+   too, because both read as 128 -- and 128 is the floor every function with
+   the #x0530 &rest copy gets, so the copy wrote slots 57.. below ESP, over the
+   registers the trap had pushed: every &rest call with ~57 arguments or more
+   built its list from garbage (and the copy's loop index was among them)."
+  (if (eq slots :legacy)
       +frame-size+
       (+ 72 (* 4 slots))))
 
-(defun i386-emit-prologue (buf &optional (slots +frame-legacy-slots+))
+(defun i386-function-frame-slots (bytecode offset)
+  "FUNCTION-FRAME-SLOTS, but :LEGACY for an unsized (or absent) FRAME-ENTER,
+   which that function reports as 128 like a sized 128."
+  (if (and (< (+ offset 2) (length bytecode))
+           (= (aref bytecode offset) +op-trap+)
+           (>= (modus.mvm::decode-u16 bytecode (1+ offset)) +frame-enter-sized+))
+      (function-frame-slots bytecode offset)
+      :legacy))
+
+(defun i386-emit-prologue (buf &optional (slots :legacy))
   "Emit i386 function prologue.
    PUSH EBP; MOV EBP, ESP; SUB ESP, frame_size;
    save callee-saved EBX, ESI, EDI;
@@ -3190,9 +3205,11 @@
               ;; Copying them there lets the ladder load args 0..3 and 4..N
               ;; through one addressing form.
               ;;
-              ;; Cap at 32 total args, as x64 does: the ladder is unrolled per
-              ;; defun, and raising x64's cap to 50 cost +30MB and regressed
-              ;; ANSI via layout shift.  A function with this copy gets >= 128 slots.
+              ;; Cap at 121 total args, as x64 does: +APPLY-SPREAD-MAX+ (120)
+              ;; positional arguments and the tail-list word of a
+              ;; +REST-TAIL-NARGS+ (254) call.  It was 32, so a 33..120-argument
+              ;; &rest call built its list from slots nothing had copied.  A
+              ;; function with this copy gets >= 128 slots.
               ;;
               ;; Registers: the whole :trap dispatch is already bracketed with
               ;; push/pop EAX, and this arm additionally saves ECX/EDX/ESI, so
@@ -3207,9 +3224,9 @@
                 (i386-emit-mov-reg-abs buf +scratch0+ *nargs-addr*)
                 (i386-emit-cmp-reg-imm buf +scratch0+ 5)
                 (i386-emit-jcc buf :l done)
-                (i386-emit-cmp-reg-imm buf +scratch0+ 32)
+                (i386-emit-cmp-reg-imm buf +scratch0+ 121)
                 (i386-emit-jcc buf :le nocap)
-                (i386-emit-mov-reg-imm buf +scratch0+ 32)
+                (i386-emit-mov-reg-imm buf +scratch0+ 121)
                 (i386-emit-label buf nocap)
                 ;; EDX = i, starting at +max-reg-args+
                 (i386-emit-mov-reg-imm buf +scratch1+ 4)
@@ -5086,7 +5103,7 @@
                  :mvm-length length
                  :mvm-offset offset)))
     ;; Emit prologue
-    (i386-emit-prologue buf (function-frame-slots bytecode offset))
+    (i386-emit-prologue buf (i386-function-frame-slots bytecode offset))
     ;; Pass 1: scan for branch targets
     (i386-scan-branch-targets state)
     ;; Pass 2: translate instructions
@@ -5201,8 +5218,8 @@
                (i386-emit-label buf fn-label)
                ;; Emit prologue
                (i386-emit-prologue buf (if (zerop fn-length)
-                                           +frame-legacy-slots+
-                                           (function-frame-slots bytecode fn-offset)))
+                                           :legacy
+                                           (i386-function-frame-slots bytecode fn-offset)))
                ;; Pass 1: scan branch targets
                (i386-scan-branch-targets state)
                ;; Pass 2: translate

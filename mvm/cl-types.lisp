@@ -4149,7 +4149,7 @@
 
 (defvar most-negative-fixnum +fixnum-neg-limit+)
 
-(defvar call-arguments-limit 120)
+(defvar call-arguments-limit +fixnum-max+)   ; see APPLY (cl-printer.lisp)
 
 (defvar lambda-parameters-limit 120)
 

@@ -1365,14 +1365,15 @@
             ;;
             ;; Layout as in the fixed-count copy on frame-enter: argument i is
             ;; at fp + (i-4)*8, slot i at fp + frame-slot-base - i*word.  Capped
-            ;; at 32 arguments, as x64 and i386 cap it (the ladder is unrolled to
-            ;; match).  Every branch skips a fixed run, so the arm is size-stable;
+            ;; at 121 arguments, as x64 and i386 cap it: +APPLY-SPREAD-MAX+
+            ;; positional and the tail-list word of a +REST-TAIL-NARGS+ (254)
+            ;; call.  Every branch skips a fixed run, so the arm is size-stable;
             ;; n < 5 falls straight out because i starts at 4.
             (rv-emit-li buf +rv-t3+ (rv-nargs-addr))
             (rv-emit-load-word buf +rv-t1+ +rv-t3+ 0)          ; n (raw)
-            (rv-emit-addi buf +rv-t2+ +rv-x0+ 32)
-            (rv-emit-bge buf +rv-t2+ +rv-t1+ 8)                ; n <= 32: keep
-            (rv-emit-mv buf +rv-t1+ +rv-t2+)                   ; n = 32
+            (rv-emit-addi buf +rv-t2+ +rv-x0+ 121)
+            (rv-emit-bge buf +rv-t2+ +rv-t1+ 8)                ; n <= 121: keep
+            (rv-emit-mv buf +rv-t1+ +rv-t2+)                   ; n = 121
             (rv-emit-addi buf +rv-t2+ +rv-x0+ 4)               ; i = 4
             (rv-emit-addi buf +rv-t3+ +rv-fp+ 0)               ; src = fp
             (rv-emit-addi buf +rv-t4+ +rv-fp+                  ; dst = slot 4

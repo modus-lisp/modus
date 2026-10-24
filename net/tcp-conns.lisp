@@ -263,9 +263,11 @@
 (defun %net-idle ()
   "Nothing arrived: let this core's other threads run (net/bare-threads.lisp's BT-YIELD --
    on the main thread, core 0's; the other end of a LOOPBACK pair is often one of them),
-   then give QEMU's event loop its moment."
-  (when (fboundp 'bt-yield) (bt-yield))
-  (io-delay))
+   and only when none could, wait (IO-DELAY: QEMU's event loop gets its moment, and it is
+   5000 device reads -- paid between every chunk of a loopback transfer, it was most of
+   the time an RFB frame took)."
+  (unless (and (fboundp 'bt-yield) (bt-yield))
+    (io-delay)))
 
 ;;; ---- the API ------------------------------------------------------------------------------
 
@@ -307,9 +309,15 @@
     (let ((p (tc-peer c)) (end (or end (length data))))
       (unless (and (eq (tc-state c) :established) (not (eq (tc-state p) :closed)))
         (return-from tcpc-write nil))
+      ;; One copy, not a VECTOR-PUSH-EXTEND per byte: grow the buffer once (keeping what
+      ;; ADJUST-ARRAY returns), then REPLACE the slice in.
       (with-net-lock
-        (let ((rx (tc-rx p)))
-          (do ((i start (+ i 1))) ((>= i end)) (vector-push-extend (aref data i) rx 4096))))
+        (let* ((rx (tc-rx p)) (fp (fill-pointer rx)) (need (+ fp (- end start))))
+          (when (> need (array-dimension rx 0))
+            (setf rx (adjust-array rx (max need (* 2 (array-dimension rx 0))))
+                  (tc-rx p) rx))
+          (setf (fill-pointer rx) need)
+          (replace rx data :start1 fp :start2 start :end2 end)))
       (return-from tcpc-write t)))
   (let ((end (or end (length data))) (pos start))
     (loop

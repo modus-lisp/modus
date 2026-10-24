@@ -476,13 +476,15 @@
 
 (defun bt-yield ()
   "Let the other ready slots on this core run.  On the main thread: the next ready
-   core-0 thread, if any."
+   core-0 thread, if any.  T when something else may have run (a slot always gives its
+   core up), NIL when the main thread found nothing ready -- a poll loop then has time to
+   wait (net/tcp-conns.lisp %NET-IDLE)."
   (if (%bt-slot-p)
       (let* ((i (percpu-ref 16)) (rec (%bt-rec i)))
         (setf (mem-ref (+ rec #x60) :u32) 1)
-        (%bt-switch i (mem-ref (+ rec #x20) :u32)))
-      (%bt-main-idle))
-  nil)
+        (%bt-switch i (mem-ref (+ rec #x20) :u32))
+        t)
+      (%bt-main-idle)))
 
 (defun %bt-encoder (name) (symbol-function (intern name "COMMON-LISP-USER")))
 

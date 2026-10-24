@@ -204,6 +204,20 @@
          (vector-push (first args) o)
          (when (>= (fill-pointer o) 1460) (%bs-flush b))
          1))
+      (:write-bytes                                  ; (seq start end): a byte vector's slice
+       (%bs-flush b)                                 ; what WRITE-BYTE buffered goes first
+       (let ((c (bs-conn b)))
+         (unless (typep c 'tcp-conn) (error "write-sequence: socket ~d is not connected" fd))
+         (unless (tcpc-write c (first args) :start (second args) :end (third args))
+           (error "write-sequence: the connection on socket ~d is gone" fd)))
+       t)
+      (:read-bytes                                   ; (seq start end): until full or EOF; the index
+       (let ((seq (first args)) (i (second args)) (end (third args)) (c (bs-conn b)))
+         (loop
+           (when (or (>= i end) (not (typep c 'tcp-conn))) (return i))
+           (let ((r (tcpc-read c :max (- end i) :timeout-ms 1000)))
+             (cond ((eq r :eof) (return i))
+                   ((> (length r) 0) (replace seq r :start1 i) (setq i (+ i (length r)))))))))
       (:read-into                                    ; (buf count): into the stream's string buffer
        (let* ((buf (first args)) (count (second args))
               (tmp (make-array count :element-type '(unsigned-byte 8)))

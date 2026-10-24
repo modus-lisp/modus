@@ -1051,8 +1051,17 @@
       ;; A host file: read(2) the rest a page at a time straight into SEQ.  The
       ;; stream's buffer is drained, so the next READ-BYTE refills from where
       ;; this leaves the descriptor.  It used to fall back to READ-BYTE per
-      ;; element -- ~186 ns a byte, 50 ms to read one 270 KB fasl.
-      (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)))
+      ;; element -- ~186 ns a byte, 50 ms to read one 270 KB fasl.  NOT a socket
+      ;; that *NET-FD-CALL* serves (bare metal): read(2) there is an SVC with no
+      ;; OS behind it, and the core halted on a board's first READ-SEQUENCE from
+      ;; a socket stream.  Those fall through to the byte loop, whose buffer
+      ;; refill (%SYS-READ-INTO-BUF) routes them -- or, here, in bulk: the rest of SEQ
+      ;; straight from the connection, until it is full or the peer has closed.
+      (when (and (< i end) (>= fd 0) (%net-fd-p fd))
+        (let ((j (funcall *net-fd-call* :read-bytes fd seq i end)))
+          (%fs-set-pos stream (+ (%fs-pos stream) (- j i)))
+          (setq i j)))
+      (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
         (loop
           (when (>= i end) (return nil))
           (let ((n (%sys-read-raw fd (%fs-io-page) (min 4096 (- end i)))))
@@ -1126,6 +1135,12 @@
 (defun %fs-write-bytes (stream seq start end)
   "Write SEQ[START,END) to the file stream in 4 KB system calls; T if done."
   (let ((fd (%fs-fd stream)))
+    ;; A socket *NET-FD-CALL* serves (bare metal): the whole slice in one call.  Through
+    ;; WRITE-BYTE it was a dispatch per byte -- a 1.2 MB RFB frame took minutes on a board.
+    (when (and (%fs-bulk-ok-p stream seq) (%net-fd-p fd))
+      (funcall *net-fd-call* :write-bytes fd seq start end)
+      (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
+      (return-from %fs-write-bytes t))
     (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
       (let ((page (%fs-io-page)) (i start))
         (loop

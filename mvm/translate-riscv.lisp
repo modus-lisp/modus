@@ -588,6 +588,27 @@
    shamt, so 40 is not merely wrong there — it is unencodable."
   (- (* 8 (rv-word-size)) 24))
 
+(defun rv-emit-alloc-zero-tail (buf)
+  "Zero an allocation's payload, then bump the allocation pointer: with S8 the
+   new object's base and T1 its granule-rounded size, store zero at every word
+   in [S8 + word, S8 + T1), then S8 += T1.  Uses T0 as the cursor and T1 as
+   the end.  The payload is at least one word (sizes are whole granules of two
+   words), so the loop runs at least once.
+
+   x64, aarch64 and i386 hand out zeroed arrays, and Lisp code relies on it:
+   the bignum kernel's digit vectors (8ce31cc, `(make-array n)' with no
+   :initial-element because 'the inline allocation is zeroed') and the
+   compact hash-table index (0 = empty slot).  Unzeroed, once a collection had
+   reused memory, every bignum on riscv read garbage digits and a fresh table
+   index had no empty slot -- the riscv32 CLI evaluated nothing from 10-15."
+  (rv-emit-add buf +rv-t1+ +rv-s8+ +rv-t1+)          ; end
+  (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-word-size))  ; cursor: past the header
+  (let ((top (rv-buffer-position buf)))
+    (rv-emit-store-word buf +rv-x0+ +rv-t0+ 0)
+    (rv-emit-addi buf +rv-t0+ +rv-t0+ (rv-word-size))
+    (rv-emit-bltu buf +rv-t0+ +rv-t1+ (- top (rv-buffer-position buf))))
+  (rv-emit-mv buf +rv-s8+ +rv-t1+))
+
 (defun rv-emit-store-word (buf rs2 rs1 imm12)
   "Store one Lisp word: SD on RV64, SW on RV32."
   (if *riscv-64-bit*
@@ -2775,10 +2796,11 @@
          (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
          (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
          ;; result = VA + 2 (VA stays granule-aligned -- 16 on RV64, 8 on RV32 --
-         ;; so (rv-object-tag) is exact at both widths)
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
-         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
-         (store-result vd +rv-t0+)))
+         ;; so (rv-object-tag) is exact at both widths); kept on the stack-free
+         ;; side: T2 holds it across the zero fill, which uses T0/T1
+         (rv-emit-addi buf +rv-t2+ +rv-s8+ (rv-object-tag))
+         (rv-emit-alloc-zero-tail buf)
+         (store-result vd +rv-t2+)))
 
       (#.+op-aref+
        (let* ((vd (vreg 0))
@@ -2842,9 +2864,9 @@
          (rv-emit-addi buf +rv-t1+ +rv-t2+ (rv-word-size))
          (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
          (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
-         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
-         (store-result vd +rv-t0+)))
+         (rv-emit-addi buf +rv-t2+ +rv-s8+ (rv-object-tag))
+         (rv-emit-alloc-zero-tail buf)                ; payload zeroed, s8 bumped
+         (store-result vd +rv-t2+)))
 
       ;; ---- Packed single-float vectors (subtag #x12) ----
       ;; Header (N << 8) | #x12 with N in LANES, then N 4-byte IEEE32 lanes

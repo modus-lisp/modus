@@ -192,6 +192,35 @@
     (setf (aref code pos) (logand word #xFFFFFFFF))
     (setf (arm32-buffer-position buf) (+ pos 1))))
 
+(defun arm32-emit-alloc-zero-tail (buf)
+  "Zero an allocation's payload, then bump the allocation pointer: with R9 the
+   new object's base and LR its 16-byte-rounded size, store zero at every word
+   in [R9 + 4, R9 + LR), then R9 += LR.  R12 is the cursor and LR becomes the
+   end; R0 supplies the zero and is saved around the loop, so a result already
+   stored to a vreg living in R0 survives.  The payload is at least three
+   words, so the loop runs at least once.
+
+   x64, aarch64 and i386 hand out zeroed arrays, and Lisp code relies on it:
+   the bignum kernel's digit vectors (8ce31cc, `(make-array n)' with no
+   :initial-element because 'the inline allocation is zeroed') and the
+   compact hash-table index (0 = empty slot).  Unzeroed, once a collection had
+   reused memory, every bignum on arm32 read garbage digits and a fresh table
+   index had no empty slot -- the arm32 CLI evaluated nothing from 10-15."
+  (arm32-push buf (ash 1 +arm-r0+))
+  (arm32-mov-imm buf +arm-r0+ 0 0)
+  (arm32-add buf +arm-lr+ +arm-r9+ +arm-lr+)        ; end
+  (arm32-add-imm buf +arm-r12+ +arm-r9+ 0 4)        ; cursor: past the header
+  (let ((top (arm32-current-index buf)))
+    (arm32-str buf +arm-r0+ +arm-r12+ 0)
+    (arm32-add-imm buf +arm-r12+ +arm-r12+ 0 4)
+    (arm32-cmp buf +arm-r12+ +arm-lr+)
+    ;; BCC top: offset in words from this branch's PC+8
+    (let ((off (- top (+ (arm32-current-index buf) 2))))
+      (arm32-emit buf (logior (ash +arm-cc-cc+ 28) (ash #b101 25)
+                              (logand off #xFFFFFF)))))
+  (arm32-mov buf +arm-r9+ +arm-lr+)
+  (arm32-pop buf (ash 1 +arm-r0+)))
+
 (defun arm32-current-index (buf)
   "Current instruction index (word count)."
   (arm32-buffer-position buf))
@@ -1953,8 +1982,8 @@
            (arm32-lsl-imm buf +arm-lr+ +arm-lr+ 2)     ; * 4
            (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 15)  ; + 15
            (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)  ; & ~15 (align to 16)
-           ;; Bump alloc pointer: R9 += LR
-           (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
+           ;; Zero the payload and bump the alloc pointer: R9 += LR
+           (arm32-emit-alloc-zero-tail buf)))
 
         (#.+op-obj-ref+
          ;; (obj-ref Vd Vobj idx)
@@ -2502,7 +2531,7 @@
            ;; bytes = align16(N + 4)
            (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 19)    ; N + 4 + 15
            (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)
-           (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
+           (arm32-emit-alloc-zero-tail buf)))
 
         (#.+op-alloc-string+
          (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR

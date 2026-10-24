@@ -1,5 +1,7 @@
 # Modus
 
+**Website: [modus-lisp.github.io](https://modus-lisp.github.io)**
+
 A bare-metal Lisp operating system. Boots directly on hardware (or QEMU) into an interactive Lisp REPL with networking, SSH, and cryptography — no underlying OS.
 
 A self-hosting system with a portable virtual machine (MVM) targeting 9 CPU architectures, an Erlang-style actor model, SMP multicore support, and per-actor garbage collection.

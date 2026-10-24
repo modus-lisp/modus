@@ -149,8 +149,8 @@
      :legacy nil :aarch64 "/tmp/piboot/kernel8.img"        "build-pizero2w-actors")
 
     ;; ---------------- bare / t420 (real hardware) ----------------
-    ("x64/bare/t420/uefi-repl" :x64    :bare   :t420 :uefi-repl
-     :legacy nil :x64     "/tmp/modus-uefi.efi"            "build-uefi-repl")))
+    ("x64/bare/t420/uefi-cl" :x64      :bare   :t420 :uefi-cl
+     :legacy nil :x64     "/tmp/modus-uefi-cl.efi"         "build-uefi-cl-repl")))
 
 ;;; Payloads that are NOT in the arch × mode × board matrix the project
 ;;; targets (arm32 is a 4th arch; fixpoint is superseded by #210).  Kept
@@ -158,8 +158,7 @@
 (defparameter *outside-matrix*
   '(("arm32/bare/qemu/repl" "build-arm32-repl"  "4th arch — not in the x64/aarch64/i386 matrix")
     ("aarch64/bare/rpi/uart-bootloader" "build-uart-bootloader" "deploy tool, not an image")
-    ("aarch64/bare/rpi/pizero-hdmi"     "build-pizero2w-hdmi"   "board bring-up variant")
-    ("x64/bare/qemu/console-repl"       "build-x64-console-repl" "second-Lisp variant; #204 retires it")))
+    ("aarch64/bare/rpi/pizero-hdmi"     "build-pizero2w-hdmi"   "board bring-up variant")))
 
 (defun row-key (r) (first r))
 (defun row-status (r) (sixth r))

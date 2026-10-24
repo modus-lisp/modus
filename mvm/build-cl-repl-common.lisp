@@ -150,6 +150,36 @@
     (modus.mvm::check-parses p)
     (read-file-text p)))
 
+(defvar *pc-console-p*
+  (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))
+    (cond ((and v (string= v "0")) nil)
+          ((and v (plusp (length v))) t)
+          ;; default: the UEFI image (the T420 boots it from USB and needs its
+          ;; screen and keyboard), but not in SEV-SNP mode, whose guest must
+          ;; not touch the PS/2 ports
+          (t (and *cl-repl-uefi-p*
+                  (let ((snp (sb-ext:posix-getenv "MODUS_UEFI_SNP")))
+                    (or (null snp) (string= snp "") (string= snp "0")))))))
+  "Bake net/pc-console.lisp into a bare x86-64 image: VGA text + (UEFI) GOP
+   output, PS/2 keyboard input, beside COM1.  MODUS_PC_CONSOLE=1 / =0
+   overrides the default (on for UEFI unless SEV-SNP).")
+
+(defun %pc-console-text ()
+  "net/pc-console.lisp with the data it reads: boot/boot-uefi-x64.lisp's 8x8
+   font and PS/2 scancode tables, and whether a GOP framebuffer may be used
+   (only a UEFI boot stub fills the #x1B000 words; under multiboot they are
+   whatever RAM held)."
+  (let ((bytes nil))
+    (dolist (qw (symbol-value (find-symbol "*FONT-8X8-QWORDS*" :modus.mvm)))
+      (dotimes (i 8) (push (ldb (byte 8 (* 8 i)) qw) bytes)))
+    (assert (= (length bytes) 760))
+    (format nil "~%(defun pcc-font-bytes () '~S)~%(defun pcc-scan-normal () '~S)~%(defun pcc-scan-shifted () '~S)~%(defun pcc-fb-enabled-p () ~A)~%~A~%"
+            (nreverse bytes)
+            (coerce (symbol-value (find-symbol "*PS2-SCANCODE-NORMAL*" :modus.mvm)) 'list)
+            (coerce (symbol-value (find-symbol "*PS2-SCANCODE-SHIFTED*" :modus.mvm)) 'list)
+            (if *cl-repl-uefi-p* "t" "nil")
+            (%rpi-net-text "pc-console.lisp"))))
+
 (defun %rpi-hcon-font-text ()
   "HCON-FONT-BYTES for net/hdmi-console.lisp: boot/boot-uefi-x64.lisp's 8x8
    font (95 glyphs, one little-endian qword each), as 760 row bytes."
@@ -388,6 +418,9 @@
     (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
         (mvm-text "net/bare-threads.lisp")
         "")
+    ;; The PC console (x86-64): after serial-repl, whose console seams it
+    ;; replaces by last-defun-wins.
+    (if (and *cl-repl-x64-p* *pc-console-p*) (%pc-console-text) "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
     ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
@@ -1502,6 +1535,12 @@
             ;; The boot SD card, read only (SDHOST, adopting U-Boot's setup):
             ;; the sector source for a pagetree/cabinet store on a partition.
             (%rpi-net-text "sdhost.lisp")        (string #\Newline))))))
+
+;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
+(when (and *cl-repl-x64-p* *pc-console-p*)
+  (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
+  (format t "~&;; CONSOLE: VGA text~A + PS/2 keyboard, beside COM1 (net/pc-console.lisp)~%"
+          (if *cl-repl-uefi-p* " + GOP framebuffer" "")))
 
 ;; The Zero board net build mirrors the serial console to HDMI: every
 ;; WRITE-CHAR-SERIAL compiled into the image calls net/hdmi-console.lisp's

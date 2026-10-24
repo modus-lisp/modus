@@ -49,7 +49,6 @@ SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
 # ---------------------------------------------------------------------------
 read -r -d '' TARGETS <<'EOF' || true
 x64-repl|repl|x64/bare/qemu/repl|/tmp/modus-x64.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
-x64-console-repl|repl|build-x64-console-repl|/tmp/modus-x64-console.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
 x64-cl-repl|repl|build-x64-cl-repl|/tmp/modus-x64-cl-repl.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
 x64-ssh|ssh|x64/bare/qemu/ssh|/tmp/modus-x64-ssh.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|x64
 aarch64-repl|repl|aarch64/bare/qemu/repl|/tmp/modus-aarch64.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|||aarch64

@@ -714,8 +714,17 @@ qemu-system-i386 -m 256 -nographic -no-reboot \
 
 ### UEFI x86-64 (OVMF, for real hardware)
 ```bash
-sbcl --script mvm/build-uefi-repl.lisp   # REPL (serial + framebuffer + PS/2 keyboard)
+sbcl --dynamic-space-size 12288 --script mvm/build-uefi-cl-repl.lisp   # the CL image
 ```
+
+The UEFI CL image carries `net/pc-console.lisp`: the REPL on COM1 **and** on the
+GOP framebuffer, reading the PS/2 keyboard or COM1, whichever has a character
+first (every `write-char-serial` reaches the screen through the compiler's
+write-char-serial hook, as on the Pi's HDMI console).  On by default for UEFI,
+off under SEV-SNP (its guest must not touch the PS/2 ports); `MODUS_PC_CONSOLE=1`
+puts it in the multiboot `build-x64-cl-repl` image too (VGA text mode), which is
+what `scripts/make-grub-usb.sh` boots.  Font and scancode tables are Lisp data
+copied to low RAM at #x1B100.. by `%console-init`, not written by the boot stub.
 
 QEMU launch (requires OVMF + mtools):
 ```bash

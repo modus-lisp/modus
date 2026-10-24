@@ -1108,6 +1108,22 @@
   (setq *serial-repl-cap* 0)
 "))
 
+;;; :I386: the shared text above is 64-bit.  Its two scratch buffers
+;;; (#x0FE00000 / #x0FF00000) fall INSIDE the i386 heap (64 MB .. 512 MB), and
+;;; its fixnum limits are 62-bit -- bignums on a 30-bit-fixnum target.  Moved
+;;; below the heap (59 / 60 MB: above the page directory at 58 MB) and set to
+;;; i386's fixnum range.
+(when *cl-repl-i386-p*
+  (dolist (pair '(("#x0FE00000" . "#x03B00000")
+                  ("#x0FF00000" . "#x03C00000")
+                  ("4611686018427387903" . "536870911")
+                  ("-4611686018427387904" . "-536870912")))
+    (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
+      (unless at (error "i386: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+      (setq *cli-arch-io-scratch-source*
+            (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
+                         (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
+
 ;;; ============================================================
 ;;; NET BUILD (MODUS_NET_BUILD=1) — #209 rung 2: HTTP over the board's NIC
 ;;; ============================================================
@@ -2615,12 +2631,36 @@
   ;; bare-metal addresses; (3) eventually the collector, for sustained use
   ;; rather than boot.  `strings' on the image lists every trap it still cannot
   ;; service: #x0310 #x0311 #x0500 #x0502 #x0510 #x0511 #x0512 #x0531.
-  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x04000000)    ;  64 MB
-  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x20000000) ; 512 MB
+  ;; THE HEAP STARTS ABOVE THE RUNTIME'S FIXED BLOCK at #x10000000.. (globals
+  ;; table, symbol table, MV buffer, the static-symbol root #x10000FB0, GC
+  ;; region words): it used to run from 64 MB to 512 MB, straight across it,
+  ;; and boot allocates more than the 192 MB below it -- the bump allocator
+  ;; wrote over those words, and the image died in a %STATIC-SYMBOL-REF /
+  ;; %AREF-INDEX-ERROR recursion that moved with every layout change.
+  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x10100000)    ; 257 MB
+  ;; The heap is two 240 MB semispaces from 257 MB with the collector's two
+  ;; bitmaps after them (boot-i386.lisp I386-CL-GC-LAYOUT); "general base"
+  ;; here is their end, which the layout asserts below hold under the stack.
+  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x2EA00000) ; 746 MB
+  ;; THE COLLECTOR, on bare metal: boot-i386 sets up what boot-linux-i386 does.
+  (setf (symbol-value (intern "*I386-BARE-GC*" "MODUS.MVM.I386")) t)
   (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x3C000000)    ; 960 MB
+  ;; The handler-case block (jmp_buf + handler stack): its bare default,
+  ;; #x5C0000, is inside this image.  56 MB: above the image, below the heap.
+  (setf (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386")) #x03800000)
+  ;; NIL = #xDEAD0001 (the CL runtime's), with paging so NIL's page is RAM.
+  ;; Needs -m 1024 (stack top 960 MB, NIL frame at 964 MB).
+  (setf (symbol-value (intern "*I386-CL-BOOT*" "MODUS.MVM")) t)
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
   (setf (symbol-value (intern "*I386-LINUX-MODE*" "MODUS.MVM.I386")) nil)
   (setf (symbol-value (intern "*I386-NATIVE-CODE-OFFSET*" "MODUS.MVM.I386")) 0)
+  ;; Function entries 16-byte aligned and OR-3 tagged, as in the hosted i386
+  ;; CLI: the CL runtime's funcall dispatch reads the low nibble.  Without it
+  ;; a function that happened to start at ...1 was taken for a cons --
+  ;; (mapcar (lambda (s) (normalize-name s)) names) returned (NIL NIL) and
+  ;; DEFSTRUCT's keyword constructor died in %INSTALL-SB-SHIMS.
+  (setf (symbol-value (intern "*I386-FN-TAG-3*" "MODUS.MVM.I386")) t)
+  (setf (symbol-value (intern "*I386-FN-ALIGN*" "MODUS.MVM.I386")) 16)
   (format t "~&;; CONSOLE: COM1 via port I/O (i386 QEMU-pc)~%"))
 
 ;;; DIVERGENCE 6/7 (:X64 arm) — the x86-64 boot descriptor and console.
@@ -3142,6 +3182,10 @@
                  (/ image-bytes 1048576.0) (/ image-end 1048576.0)
                  (/ cons-base 1048576.0) (/ general 1048576.0)
                  (/ stack-top 1048576.0))
+         (when (and (< cons-base #x10010000) (> general #x10000000))
+           (error "i386 layout: the heap ~:D..~:D covers the runtime's fixed block ~
+                   at #x10000000..#x1000FFFF (globals, symbol table, static-symbol ~
+                   root); the allocator would write over it." cons-base general))
          (when (< cons-base image-end)
            (error "i386 layout: cons base ~:D is INSIDE the image (1 MB .. ~:D). ~
                    The allocator would write over the running code.  Raise ~
@@ -3149,6 +3193,11 @@
          (when (< general cons-base)
            (error "i386 layout: general heap ~:D is below cons base ~:D."
                   general cons-base))
+         (let ((hb (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386"))))
+           (when (or (< hb image-end) (> (+ hb #x1000) cons-base))
+             (error "i386 layout: the handler-case block ~:D..~:D is not between the ~
+                     image end ~:D and the cons base ~:D.  Move ~
+                     *I386-BARE-HANDLER-BASE*." hb (+ hb #x1000) image-end cons-base)))
          (when (< stack-top image-end)
            (error "i386 layout: stack top ~:D is INSIDE the image (1 MB .. ~:D). ~
                    Pushes would shred native code.  Raise ~

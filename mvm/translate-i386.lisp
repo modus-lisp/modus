@@ -415,6 +415,20 @@
    if GENERIC-ADD etc. are present.  An A/B knob: it isolates the new checked
    ops from the rest of i386 codegen when triaging a miscompile.")
 
+(defparameter *i386-bare-gc* nil
+  "Enable the native collector (and its allocation-time bitmap bits) on BARE
+   METAL too.  It is the same collector; what hosted mode adds is boot-side
+   setup -- the region-0 control block, the bitmaps, VA/VL inside the
+   from-space -- which only boot/boot-linux-i386.lisp performed.  The bare CL
+   image (boot-i386.lisp *I386-CL-BOOT*, EMIT-I386-CL-GC-INIT) now does the
+   same and sets this; every other bare image keeps `int $0x31' and is
+   byte-identical.")
+
+(defun i386-gc-mode-p ()
+  "Does this image run the native collector: hosted, or a bare image whose
+   boot sets it up (*I386-BARE-GC*)?"
+  (or *i386-linux-mode* *i386-bare-gc*))
+
 (defparameter *i386-gc-bitmap-enabled* t
   "Emit the object-start / cons-kind bit-set at every allocation site.
    Must be ON whenever the collector is: without the bitmaps scan_word has no
@@ -561,6 +575,13 @@
 ;;; Scratch at 0x100003C0..0x100003F8 sits in the unused gap between the
 ;;; saved initial ESP (0x10000290) and the handler stack.
 
+(defparameter *i386-bare-handler-base* #x5C0000
+  "Bare-metal base of the handler-case block (jmp_buf, longjmp scratch,
+   handler stack).  The default suits the small bare images; the bare CL image
+   is ~40 MB at load address 1 MB, which puts #x5C0000 INSIDE its code -- the
+   first HANDLER-CASE wrote its jmp_buf over running code (#GP right after the
+   banner) -- so mvm/build-cl-repl-common.lisp moves it above the image.")
+
 (defun i386-set-handler-block ()
   "Place the handler-case block for the current mode.  Hosted: the shared
    contract addresses at the heap base (#x10000180 jmp_buf ... #x10000408
@@ -568,7 +589,7 @@
    the Multiboot board -- above the per-CPU block (#x5B0000), below the cons
    space (8 MB), clear of the stack (down from 4 MB).  #x10000180 is past the
    end of RAM on a `qemu-system-i386 -m 256' board."
-  (let ((base (if *i386-linux-mode* #x10000000 #x5C0000)))
+  (let ((base (if *i386-linux-mode* #x10000000 *i386-bare-handler-base*)))
     (setf *i386-jmpbuf-addr*          (+ base #x180)
           *i386-longjmp-scratch-addr* (+ base #x3C0)
           *i386-hstack-capcount-addr* (+ base #x3F0)
@@ -853,7 +874,7 @@
    VR-PRESERVING by construction (see the register invariant): computes in the
    ECX/EDX scratch pair, saved around the sequence so the caller's operands
    survive, and never touches EAX.  The build-time checker enforces this."
-  (when (and *i386-gc-bitmap-enabled* *i386-linux-mode*)
+  (when (and *i386-gc-bitmap-enabled* (i386-gc-mode-p))
     (i386-emit-push-reg buf +scratch0+)
     (i386-emit-push-reg buf +scratch1+)
     ;; ECX = granule index = (base - page_base) >> 4
@@ -2491,6 +2512,22 @@
              ((and (= code #x0311) *i386-linux-mode*)
               ;; CNTFRQ: #x0310's rate, TAGGED, in VR.  mov eax, 2000.
               (i386-emit-byte buf #xB8) (i386-emit-u32 buf 2000))
+
+             ((= code #x0310)
+              ;; RDTSC, bare metal (no clock_gettime): bits 12..41 of the time
+              ;; stamp counter -- a 30-bit fixnum, monotonic between wraps (2^42
+              ;; cycles, about 20 minutes at 3.5 GHz) -- TAGGED in EAX.  Bare x64
+              ;; reads the TSC the same way; EDX is scratch.
+              (i386-emit-byte buf #x0F) (i386-emit-byte buf #x31)  ; rdtsc
+              (i386-emit-byte buf #x0F) (i386-emit-byte buf #xAC)  ; shrd eax, edx, 12
+              (i386-emit-byte buf #xD0) (i386-emit-byte buf 12)
+              (i386-emit-byte buf #x25) (i386-emit-u32 buf #x3FFFFFFF) ; and eax, 2^30-1
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xE0))  ; shl eax,1 (tag)
+
+             ((= code #x0311)
+              ;; CNTFRQ, bare metal: the TSC's rate is not known, so 0 --
+              ;; "frequency unknown", which callers handle (as bare x64).
+              (i386-emit-byte buf #x31) (i386-emit-byte buf #xC0))  ; xor eax, eax
 
              ((and (= code #x050B) *i386-linux-mode*)
               ;; GENERIC 6-ARG SYSCALL: V0 = number, V1..V6 = args, all TAGGED;
@@ -5121,7 +5158,7 @@
     ;; byte-identical to a pre-collector build; wiring it up is a separate job
     ;; that starts with the boot-side init.
     (setf *i386-gc-collect-label*
-          (and *i386-gc-enabled* *i386-linux-mode* (i386-make-label)))
+          (and *i386-gc-enabled* (i386-gc-mode-p) (i386-make-label)))
     ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
     ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
     ;; (REPL/SSH, which have no handler-case) byte-identical; those images are

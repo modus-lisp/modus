@@ -586,6 +586,24 @@ sbcl --script mvm/build.lisp aarch64/bare/rpi/repl   # Serial REPL
 sbcl --script mvm/build-rpi-periph.lisp   # GPIO/SPI/I2C peripherals
 ```
 
+**ISOLATED SSH ON THE CL IMAGE (`MODUS_SSH_ISOLATED=1`, needs
+`MODUS_RPI_THREADS=1` + an SSH build; `net/isolated-cl.lisp`).**  The CL-image
+port of `isolated-net.lisp`, on bare-threads instead of the cooperative actor
+scheduler: the MAIN thread is the net domain and the only code that touches
+the NIC or TCP; each accepted connection gets a worker thread that runs the
+whole SSH protocol and crypto; bytes cross only by copy over
+`modus:make-channel` (`(:data v)`/`(:close)` to a session, `(:send conn v)`/
+`(:eval conn s)`/`(:close conn)` to the net domain).  Commands are EVALUATED in
+the net domain, because a worker may not intern or `setq` a global.  Test:
+`(ssh-boot)` under `-M raspi3b -device usb-net`, then 4 overlapping sessions
+each get their own answer and all exit 0.  Two server-wide words had to become
+per-session: SSH-PEER-CLOSED-P's flag (ssh-ipc+0x60458 -> ssh+0x3FC8) and
+SSH-MESSAGE-LOOP's "session over" flag (`(conn-ssh 3)`+0x700 -> ssh+0x3FCC) --
+with either one shared, the first client to hang up ended every other session.
+Still shared, by design: the ephemeral key slot and the line-edit buffer.
+`ssh.lisp` now answers CHANNEL_EOF (exit-status 0, EOF, CLOSE): before, every
+`echo EXPR | ssh` session on every image held open until the client timed out.
+
 ### Running i386 (hosted Linux/i386 — the REAL CL image)
 
 `mvm/build-i386-cli.lisp` is the hosted Modus CLI on 32 bits, built from the

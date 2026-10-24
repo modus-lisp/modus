@@ -1917,10 +1917,39 @@
                     (setf (mem-ref flag-addr :u32) 0)))))))))
     (when (eq msg-type 94)
       (ssh-handle-channel-data ssh payload plen))
+    ;; CHANNEL_EOF: the client's stdin ended (`echo EXPR | ssh ...`).  It now
+    ;; waits for the server to close the channel, so answer EOF + CLOSE and end
+    ;; the session -- ignoring it held every piped session open forever.
+    (when (eq msg-type 96)
+      (ssh-send-eof-close ssh)
+      (setf (mem-ref flag-addr :u32) 0))
     (when (eq msg-type 97)
       (setf (mem-ref flag-addr :u32) 0))
     (when (eq msg-type 1)
       (setf (mem-ref flag-addr :u32) 0))))
+
+(defun ssh-send-eof-close (ssh)
+  (let ((cli-chan (mem-ref (+ ssh #x18) :u32)))
+    ;; exit-status 0 first, or the client reports "Exit status -1" (rc 255)
+    (let ((xs (make-array 25)))
+      (aset xs 0 98)
+      (ssh-put-u32 xs 1 cli-chan)
+      (ssh-put-u32 xs 5 11)
+      (aset xs 9 101) (aset xs 10 120) (aset xs 11 105)
+      (aset xs 12 116) (aset xs 13 45) (aset xs 14 115)
+      (aset xs 15 116) (aset xs 16 97) (aset xs 17 116)
+      (aset xs 18 117) (aset xs 19 115)
+      (aset xs 20 0)
+      (ssh-put-u32 xs 21 0)
+      (ssh-send-payload ssh xs 25))
+    (let ((eof-msg (make-array 5)))
+      (aset eof-msg 0 96)
+      (ssh-put-u32 eof-msg 1 cli-chan)
+      (ssh-send-payload ssh eof-msg 5))
+    (let ((close-msg (make-array 5)))
+      (aset close-msg 0 97)
+      (ssh-put-u32 close-msg 1 cli-chan)
+      (ssh-send-payload ssh close-msg 5))))
 
 ;; Message loop — runs until the client disconnects; an authenticated session
 ;; never times out, an unauthenticated one does (see below).

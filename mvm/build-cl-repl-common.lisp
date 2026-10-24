@@ -1236,6 +1236,18 @@
 ;; kernel-main right after the net pipeline, instead of waiting for (ssh-boot) at
 ;; the REPL.  The server never returns, so the REPL is not reached.  Used by the
 ;; attested-SSH image: nothing is typed at a console that does not exist.
+;; MODUS_SSH_ISOLATED=1 (with MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1): the
+;; isolated server -- see net/isolated-cl.lisp.  Threads are the substrate, so
+;; it is refused without them rather than built half-working.
+(defvar *ssh-isolated-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_ISOLATED")))
+    (and v (string= v "1"))))
+(when (and *ssh-isolated-p*
+           (not (and *ssh-build-p* *cl-repl-rpi-p*
+                     (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
+                       (and v (plusp (length v)) (string/= v "0"))))))
+  (error "MODUS_SSH_ISOLATED=1 needs MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1 on the ~
+          :RPI platform: its sessions are bare-threads (net/bare-threads.lisp)."))
 (defvar *ssh-autostart-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_AUTOSTART")))
     (and *ssh-build-p* v (string= v "1"))))
@@ -1525,7 +1537,12 @@
         ;; :X64 has no USB NIC and no hot-plug: usb-netdev.lisp overrides E1000-RECEIVE,
         ;; E1000-SEND, E1000-RX-BUF and E1000-PROBE with USB-backed versions that probe
         ;; for a USB NIC on every poll (the "ND:0" stream) -- the E1000 never gets polled.
-        (if *cl-repl-pc-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline))
+        (if *cl-repl-pc-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline)
+        ;; MODUS_SSH_ISOLATED=1: the net domain and each SSH session are
+        ;; separate threads that exchange bytes only by copy (net/isolated-cl.lisp,
+        ;; the CL successor of isolated-net.lisp).  LAST: it replaces the accept,
+        ;; deliver, send, wait and eval seams above by last-defun-wins.
+        (if *ssh-isolated-p* (%rpi-net-text "isolated-cl.lisp") "")  (string #\Newline))
       ""))
 
 ;;; DIVERGENCE 3 — the arch adapter + the NIC driver.  Everything downstream of

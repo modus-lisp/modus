@@ -2485,3 +2485,137 @@
             (%gc-write64 (+ res 144) depth)
             (%gc-write64 (+ res 152) s)
             res)))))
+
+;;; ============================================================
+;;; HEAP CENSUS -- what is live in a region, by subtag (ROOM's engine)
+;;; ============================================================
+;;;
+;;; Walks a region's from-space object by object, [from, frontier), exactly as
+;;; the aarch64 collector walks to-space: the CONS-KIND bitmap says cons (16
+;;; bytes), otherwise the header gives subtag and count and the size is
+;;; u8-vector / narrow string 16+count, f32-vector / 32-bit string 16+4*count,
+;;; everything else 16+8*count, each rounded up to 16.  The walk ALLOCATES
+;;; NOTHING (headers are read as :u32, counters are fixnums in vectors made
+;;; before the frontier is read), so the frontier it read stays the end of
+;;; what it walks and no collection can move the heap under it.  What it
+;;; counts is everything between from and the frontier -- live data PLUS the
+;;; garbage made since the last collection; run (%gc-collect-here) first for
+;;; live data alone.  Needs the bitmaps; with none it answers NIL.
+;;; Index 256 of the result vectors is CONSES.
+
+(defun %census-size (subtag count)
+  (let ((n (cond ((or (= subtag #x11) (= subtag #x13)) (+ 16 count))
+                 ((or (= subtag #x12) (= subtag #x15)) (+ 16 (* 4 count)))
+                 (t (+ 16 (* 8 count))))))
+    (* 16 (ash (+ n 15) -4))))
+
+(defun %census-cons-bitmap ()
+  "Base of the cons-kind bitmap, or 0.  aarch64 and the Lisp collector publish it
+   at 0x10000E40; Linux x64 keeps it at the object-start bitmap plus a layout
+   constant the CLI bakes as %CORE-KINDBITMAP-DELTA.  Read through
+   %GC-META-READ: x64 stores these words raw, and a :u64 read halves them."
+  (let* ((k (%gc-meta-scale)) (c (%gc-meta-read #x10000E40 k)))
+    (if (and (= c 0) (fboundp '%core-kindbitmap-delta))
+        (let ((b (%gc-meta-read #x10000E18 k)))
+          (if (= b 0) 0 (+ b (%core-kindbitmap-delta))))
+        c)))
+
+(defun %census-cons-p (a page cbm)
+  "Whether the granule at raw address A is a cons start."
+  (let ((gran (ash (- a page) -4)))
+    (/= 0 (logand (mem-ref (+ cbm (ash gran -3)) :u8) (%gc-bit-mask (logand gran 7))))))
+
+(defun %census-span (rcb)
+  "(from . frontier) of region RCB, raw byte addresses.  The live allocation
+   pointer when RCB is this thread's region and the pointer reads as one
+   (runtime-compiled code reads GET-ALLOC-PTR as 0); for another thread's
+   region, the frontier it parked.  NIL when this is our region and the pointer
+   does not read: the parked frontier may predate the last flip, and walking it
+   reads the old semispace (measured: subtag-#x89 'objects' of 25 MB)."
+  (let* ((k (%gc-meta-scale)) (from (%gc-meta-read rcb k))
+         (size (%gc-meta-read (+ rcb #x10) k)))
+    (if (= rcb (%gc-region))
+        (let ((live (get-alloc-ptr)))
+          (when (and (> live from) (<= live (+ from size))) (cons from live)))
+        (cons from (%gc-meta-read (+ rcb #x30) k)))))
+
+(defun %heap-census (&optional (rcb (%gc-region-0)))
+  "Walk region RCB (default region 0).  Returns (counts bytes walked bad):
+   two 257-slot vectors indexed by subtag (256 = conses), the bytes walked,
+   and the address where a header made no sense (0 if none)."
+  (when (and (/= (%census-cons-bitmap) 0) (%census-span rcb))
+    (let* ((counts (make-array 257 :initial-element 0))
+           (bytes (make-array 257 :initial-element 0))
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+           (span (%census-span rcb))
+           (end (cdr span)) (a (car span)) (bad 0))
+      (loop
+        (when (>= a end) (return nil))
+        (if (%census-cons-p a page cbm)
+            (progn (setf (svref counts 256) (+ (svref counts 256) 1)
+                         (svref bytes 256) (+ (svref bytes 256) 16))
+                   (setq a (+ a 16)))
+            (let* ((h (mem-ref a :u32))
+                   (st (logand h 255))
+                   (sz (%census-size st (ash h -8))))
+              (when (> (+ a sz) end) (setq bad a) (return nil))
+              (setf (svref counts st) (+ (svref counts st) 1)
+                    (svref bytes st) (+ (svref bytes st) sz))
+              (setq a (+ a sz)))))
+      (list counts bytes (- a (car span)) bad))))
+
+(defun %heap-sample (subtag n &optional (rcb (%gc-region-0)) (min-bytes 0))
+  "Up to N objects of SUBTAG (256 = conses) in region RCB at least MIN-BYTES
+   long, as Lisp values, the largest first-found -- for looking at what a
+   census says is growing.  Allocates only after the walk."
+  (when (and (/= (%census-cons-bitmap) 0) (%census-span rcb))
+    (let* ((found (make-array n :initial-element 0)) (k 0)
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+           (span (%census-span rcb)) (end (cdr span)) (a (car span)))
+      (loop
+        (when (or (>= a end) (>= k n)) (return nil))
+        (if (%census-cons-p a page cbm)
+            (progn (when (and (= subtag 256) (>= 16 min-bytes))
+                     (setf (svref found k) (+ a 1)) (setq k (+ k 1)))
+                   (setq a (+ a 16)))
+            (let* ((h (mem-ref a :u32)) (st (logand h 255))
+                   (sz (%census-size st (ash h -8))))
+              (when (> (+ a sz) end) (return nil))
+              (when (and (= st subtag) (>= sz min-bytes))
+                (setf (svref found k) (+ a 9)) (setq k (+ k 1)))
+              (setq a (+ a sz)))))
+      (let ((r nil))
+        (dotimes (i k) (push (%word->val (svref found i)) r))
+        (nreverse r)))))
+
+(defun %subtag-name (st)
+  (case st
+    (256 "cons") (#x01 "simple-vector") (#x10 "string") (#x11 "u8-vector")
+    (#x12 "f32-vector") (#x13 "string-8") (#x14 "u64-vector") (#x15 "string-32")
+    (#x16 "sap") (#x30 "bignum") (#x31 "string-wide") (#x32 "array/struct/instance")
+    (#x33 "ratio") (#x40 "struct") (#x41 "hash-table") (#x50 "symbol")
+    (#x51 "function") (#x52 "closure") (#x53 "keyword") (#x60 "double-float")
+    (#x61 "mvm-module") (#x64 "single-float") (t nil)))
+
+(defun %room-report (verbosity)
+  "ROOM: region 0's census, largest first, on *standard-output*.  With
+   VERBOSITY :COLLECT (or T), collect first, so the numbers are live data."
+  (when (or (eq verbosity t) (eq verbosity :collect)) (%gc-collect-here))
+  (let ((c (%heap-census)))
+    (if (null c)
+        (format t "; ROOM: no census (no heap bitmaps, or this code cannot read its allocation pointer)~%")
+        (let* ((counts (first c)) (bytes (second c)) (rows nil)
+               (rcb (%gc-region-0)) (k (%gc-meta-scale))
+               (size (%gc-meta-read (+ rcb #x10) k)))
+          (dotimes (i 257)
+            (when (> (svref counts i) 0)
+              (push (list (svref bytes i) (svref counts i) i) rows)))
+          (setq rows (sort rows #'> :key #'first))
+          (format t "; region 0: ~,1F MB in use of a ~,1F MB semispace, ~D collections~a~%"
+                  (/ (third c) 1048576.0) (/ size 1048576.0)
+                  (%gc-meta-read (+ rcb #x20) k)
+                  (if (> (fourth c) 0) (format nil " (walk stopped at #x~X)" (fourth c)) ""))
+          (dolist (r rows)
+            (format t ";  ~10D bytes ~9D objects  #x~2,'0X ~a~%"
+                    (first r) (second r) (third r) (or (%subtag-name (third r)) "")))
+          nil))))

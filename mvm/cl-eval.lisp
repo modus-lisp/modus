@@ -5352,11 +5352,14 @@
 ;;; an error; compile-call's arity check fires once the defun is
 ;;; registered with required-count = 0 and 1 optional.
 (defun room (&optional verbosity)
-  "Stub: write one informational line to *standard-output* and return NIL."
-  (declare (ignore verbosity))
-  (write-string "; modus ROOM stub: alloc OK")
-  (write-char-to-stream (code-char 10) *standard-output*)
-  nil)
+  "Region 0's heap census, largest first (mvm/gc.lisp %ROOM-REPORT); VERBOSITY
+   T or :COLLECT collects first.  One line on an image without the collector."
+  (if (fboundp '%room-report)
+      (%room-report verbosity)
+      (progn
+        (write-string "; modus ROOM: no heap census in this image")
+        (write-char-to-stream (code-char 10) *standard-output*)
+        nil)))
 
 ;;; ============================================================
 ;;; INSPECT — CLHS §inspect: interactively inspect OBJECT (no return

@@ -1888,9 +1888,11 @@
                      (cons \"ACTORS-YIELD\" (function actors-yield))
                      (cons \"ACTORS-SELF\" (function actors-self))
                      (cons \"ACTORS-LINK\" (function actors-link))))
-      (set-symbol-function (intern (car e) pk) (cdr e))
-      (when (boundp (quote *symbol-function-table*))
-        (puthash (car e) *symbol-function-table* (cdr e))))
+      ;; 0: not linked into this image (the aarch64 CLI has no hosted actors)
+      (unless (eql (cdr e) 0)
+        (set-symbol-function (intern (car e) pk) (cdr e))
+        (when (boundp (quote *symbol-function-table*))
+          (puthash (car e) *symbol-function-table* (cdr e)))))
     t))
 
 ;; Baked functions are not in runtime EVAL's function table (this blob is kept

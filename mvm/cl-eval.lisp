@@ -170,6 +170,13 @@
      (cons "" (aref sym 0)))
     (t nil)))
 
+;;; A function-table entry of 0 is NO function: no function object or entry
+;;; address is 0, and the aarch64 CLI stores 0 for names whose definition is
+;;; not in that image (the hosted actors API) and for names that only appear in
+;;; quoted code -- FBOUNDP answered T for 32 such names, A and F among them, so
+;;; (fboundp (copy-symbol 'a)) was T (upstream COPY-SYMBOL.1-3).
+(defun %fn-entry (v) (if (eql v 0) nil v))
+
 (defun symbol-function (sym)
   "Return the function object for SYM, or signal undefined-function.
    Looks up by name in *symbol-function-table*; native MVM symbols
@@ -182,9 +189,9 @@
            (hash (cdr nh))
            (fn (or (and (> (length name) 0)
                         *symbol-function-table*
-                        (gethash name *symbol-function-table*))
+                        (%fn-entry (gethash name *symbol-function-table*)))
                    (and *native-sym-function-table*
-                        (gethash hash *native-sym-function-table*)))))
+                        (%fn-entry (gethash hash *native-sym-function-table*))))))
       (cond
         (fn fn)
         ;; CLHS SYMBOL-FUNCTION: a macro or special operator name is fbound,
@@ -280,9 +287,9 @@
       (cond
         ((and (> (length name) 0)
               *symbol-function-table*
-              (gethash name *symbol-function-table*)) t)
+              (%fn-entry (gethash name *symbol-function-table*))) t)
         ((and *native-sym-function-table*
-              (gethash hash *native-sym-function-table*)) t)
+              (%fn-entry (gethash hash *native-sym-function-table*))) t)
         ;; CLHS: fboundp is also true when SYM names a macro (DEFUN, WHEN,
         ;; COND, …) or a special operator (IF, SETQ, …) — not only an
         ;; ordinary function.  Without this, (fboundp 'defun) was NIL.

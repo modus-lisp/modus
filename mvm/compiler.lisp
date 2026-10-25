@@ -8592,6 +8592,12 @@
               (emit-ir :push +vreg-vr+)
               (%emit-uwp-unwind-to 0)
               (emit-ir :pop +vreg-vr+))
+            ;; The return label is AFTER the function's own SET-MV-COUNT 1, so
+            ;; this exit must reset the count itself: a single value left the
+            ;; LAST call's count behind -- (flet ((f () (+ b (return-from f 5))))
+            ;; (f)) came back as (5 NIL NIL) to MULTIPLE-VALUE-LIST.
+            (unless (tail-form-is-values-p (list (caddr form)))
+              (emit-ir :set-mv-count 1))
             (emit-ir :br *function-return-label*))
            (t (compile-return (caddr form) env dest)))))
       ;; VALUES — return multiple values
@@ -17773,6 +17779,8 @@
          (compile-form (list '%nlx-throw tag-val value) env dest)))
       (*function-return-label*
        (compile-form value env +vreg-vr+)
+       (unless (or (tail-form-is-values-p (list value)) (%mv-manual-fn-p))
+         (emit-ir :set-mv-count 1))
        ;; Function-level early return: unwind ALL u-ps active in this unit
        ;; (target-seq 0 — the cleanup stack is reset to nil at the
        ;; function boundary, so this runs only function-local u-ps).
@@ -17837,6 +17845,13 @@
                  (compile-form cf cl-env +vreg-vr+)))
              (setq cursor (cdr cursor)))))
 
+(defun %mv-manual-fn-p ()
+  "True while compiling a function that fills the MV buffer by hand, which
+   neither its epilogue nor its exits may reset to one value."
+  (and *current-function-name*
+       (member *current-function-name* '("VALUES" "VALUES-LIST" "%MV-RETURNING")
+               :test #'equal)))
+
 (defun %compile-lexical-exit (value-form value-dest target-seq exit-label env)
   "Compile a lexical non-local exit (RETURN-FROM / RETURN to a BLOCK whose
    exit-label is reachable in this unit):
@@ -17878,7 +17893,16 @@
         ;; %%LX-REG reads VALUE-DEST as the FIRST thing the expansion
         ;; evaluates, so nothing in between can clobber it.
         (compile-form `(values-list (%%lx-reg ,value-dest)) env value-dest))
-      (compile-form value-form env value-dest))
+      (progn
+        (compile-form value-form env value-dest)
+        ;; A single value sets the count itself: the exit may land on the
+        ;; function's return label, which is PAST the epilogue's count=1
+        ;; store, and an exit from a LET init or an argument is out of
+        ;; %MV-CLAMP-TAIL's reach.  (block b5 (let ((v (if a (return-from b5
+        ;; -1) 7))) (multiple-value-call ...))) returned -1 with a caller's
+        ;; stale count (upstream MISC.159A on aarch64).
+        (unless (or (tail-form-is-values-p (list value-form)) (%mv-manual-fn-p))
+          (emit-ir :set-mv-count 1))))
   (%emit-pop-to-label-depth exit-label)
   (emit-ir :br exit-label))
 
@@ -19245,6 +19269,17 @@
                    '("QUOTE" "FUNCTION" "SETQ" "PSETQ" "TAGBODY" "LAMBDA")
                    :test #'string=)
            nil)
+          ;; RETURN-FROM / RETURN carry their VALUE form's values.  As a named
+          ;; operator they read "possibly multi-valued", so a body like
+          ;; (block b (if a (return-from b -1) 7)) skipped the epilogue's
+          ;; count=1 store, the exit was threaded straight to the return
+          ;; label, and a caller's stale count leaked: (funcall (compile nil
+          ;; ...)) => -1, NIL, NIL with COMPILE's 3 still in the buffer
+          ;; (upstream MISC.159A/173/366 on aarch64).
+          ((string= (symbol-name op) "RETURN-FROM")
+           (tail-form-is-values-p (list (caddr form))))
+          ((string= (symbol-name op) "RETURN")
+           (tail-form-is-values-p (list (cadr form))))
           ;; THE and LOCALLY pass their body's values through.
           ((string= (symbol-name op) "THE") (tail-form-is-values-p (cddr form)))
           ((string= (symbol-name op) "LOCALLY") (tail-form-is-values-p (cdr form)))
@@ -19357,6 +19392,9 @@
                         (cdr form))))
          ((and (string= op "THE") (cddr form))
           (list (car form) (cadr form) (%mv-clamp-tail (caddr form))))
+         ;; An exit jumps, so a clamp wrapped around it would never run; the
+         ;; exit sets the count itself (%COMPILE-LEXICAL-EXIT).
+         ((or (string= op "RETURN-FROM") (string= op "RETURN")) form)
          ((and (string= op "LOCALLY") (cdr form))
           (cons (car form) (%mv-clamp-body (cdr form))))
          ((and (string= op "UNWIND-PROTECT") (cdr form))
@@ -21213,7 +21251,7 @@
       ;; temporaries instead of refusing to compile the program.
       (anf (compile-form anf env dest))
       (t
-       (let ((src1 (%first-operand-reg (car args) env dest)))
+       (let ((src1 (%first-operand-reg (car args) env dest (cdr args))))
          (unless src1 (compile-form (car args) env dest))
        ;; Typed-arithmetic fast path: track the running LHS width and bind
        ;; *arith-trust* per pair (see %expr-width / emit-arith-pair).
@@ -21236,12 +21274,22 @@
                    (free-temp-reg)))
              (setq lw (%arith-chain-width trust))))))))))
 
-(defun %first-operand-reg (form env dest)
+(defun %form-mentions-p (sym tree)
+  (cond ((eq tree sym) t)
+        ((consp tree) (or (%form-mentions-p sym (car tree))
+                          (%form-mentions-p sym (cdr tree))))
+        (t nil)))
+
+(defun %first-operand-reg (form env dest &optional later)
   "The register of a promoted local FORM when the pairwise emitter may read
    the left operand from it directly (runtime compile only — the build-time
    path still evaluates the left operand into DEST), else NIL.  DEST itself
-   returns NIL: that is the ordinary in-place case."
+   returns NIL: that is the ordinary in-place case.  NIL too when a LATER
+   operand names FORM: it is read AFTER them, so (+ a (setq a 5)) added the
+   new A to itself (upstream MISC.502 on aarch64).  A promoted local is never
+   closure-captured, so only a form that names it can assign it."
   (and *mvm-eval-runtime-p* form (symbolp form)
+       (not (%form-mentions-p form later))
        (let ((b (env-lookup env form)))
          (and b (eq (binding-location b) :reg) (/= (binding-reg b) dest)
               (binding-reg b)))))
@@ -21279,7 +21327,7 @@
      (let ((anf (anf-normalize-arith-args '- args env)))
        (if anf
            (compile-form anf env dest)
-           (let ((src1 (%first-operand-reg (car args) env dest)))
+           (let ((src1 (%first-operand-reg (car args) env dest (cdr args))))
              (unless src1 (compile-form (car args) env dest))
              ;; Typed-arithmetic fast path (see compile-plus).
              (let ((lw (%expr-width (car args) env)))
@@ -28959,7 +29007,18 @@
    is compiled again with promotion inhibited."
   (when (%conv-form-present-p form) (setq form (%conv-subst form)))
   (if (and (%promote-locals-p) (not *promote-inhibit*))
-      (handler-case (%mvm-compile-toplevel-1 form)
+      ;; Under runtime EVAL the attempt runs behind a HANDLER-CASE barrier
+      ;; (see %QUIET-MACROEXPAND-1): image HANDLER-CASEs push no frame, so a
+      ;; user's HANDLER-BIND outside the EVAL saw "out of temporary
+      ;; registers" -- an internal retry signal -- first, and rt's DO-ENTRY
+      ;; marked the test aborted on its first, uncached run (upstream /=.6,
+      ;; INTERSECTION.11, SUBTYPEP.INTEGER.REAL.4 ... on aarch64).  A real
+      ;; error is re-signalled below, after the barrier is gone.
+      (handler-case (if *mvm-eval-runtime-p*
+                        (let ((prev (funcall '%hc-barrier-push '(error))))
+                          (unwind-protect (%mvm-compile-toplevel-1 form)
+                            (funcall '%hc-barrier-pop prev)))
+                        (%mvm-compile-toplevel-1 form))
         (error (e)
           ;; The FORMAT CONTROL, not the printed text: printing the condition can
           ;; itself fail (a PRINT-OBJECT recursion once did, on every Pi image),

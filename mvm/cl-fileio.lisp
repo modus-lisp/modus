@@ -198,6 +198,16 @@
         ;; O_RDWR|O_CREAT = 2|0x40 = 66
         (syscall3 2 *cstr-scratch* 66 420))))
 
+(defun %sys-open-wronly-existing (path-str)
+  "Open an EXISTING file for writing, neither creating nor truncating it
+   (OPEN :IF-EXISTS :OVERWRITE).  Returns fd or negative errno."
+  (if (%cab-on)
+      (if (%cab :exists path-str) (%cab-fd-open path-str 0) -2)
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        ;; O_WRONLY = 1
+        (syscall3 2 *cstr-scratch* 1 0))))
+
 (defun %sys-open-create-excl (path-str)
   "Open/create file exclusively (error if exists). Returns fd or negative errno."
   (if (%cab-on)
@@ -632,7 +642,9 @@
                 ((eq if-exists :overwrite)
                  ;; :overwrite means open existing file without truncating.
                  ;; O_WRONLY only (no O_CREAT, no O_TRUNC).
-                 (let ((fd (handler-case (syscall3 2 (%string-to-cstr path *cstr-scratch*) 1 0)
+                 ;; Through the arch slot: syscall 2 is open(2) only on x86-64
+                 ;; (aarch64 has no open(2) at all; i386/arm32's 2 is fork).
+                 (let ((fd (handler-case (%sys-open-wronly-existing path)
                                          (t (c) -1))))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)

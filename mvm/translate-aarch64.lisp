@@ -2807,8 +2807,14 @@
    Note: x24/x25/x26 are NOT restored (global state).  x27 (CENV) IS
    restored — see prologue docstring."
   (a64-slot-cache-flush)
-  ;; Deallocate spill/frame-slot area
-  (a64-add-imm buf +a64-sp+ +a64-sp+ *a64-locals-bytes*)
+  ;; Deallocate spill/frame-slot area FROM X29, the frame bottom, not from SP:
+  ;; a RETURN-FROM out of a call's argument list (block exit to this
+  ;; epilogue) leaves the call's argument pushes on the stack, and SP-relative
+  ;; it restored the callee-saved registers and LR from the wrong words --
+  ;; (flet ((f () (rem b (return-from f 0)))) (f)) was a MEMORY-FAULT (upstream
+  ;; MISC.68/80/300).  x64's epilogue is MOV RSP, RBP for the same reason.
+  ;; One instruction either way.
+  (a64-add-imm buf +a64-sp+ +a64-x29+ *a64-locals-bytes*)
   ;; Restore callee-saved registers (x19-x23, x27, and x6/x7 = V9/V10)
   ;; x24/x25/x26 are global alloc/limit/nil — do NOT restore
   (a64-emit-local-regs-restore buf)

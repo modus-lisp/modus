@@ -787,6 +787,12 @@
       (progn
         (%string-to-cstr path-str *cstr-scratch*)
         (%aarch64-openat *cstr-scratch* 66 420))))
+(defun %sys-open-wronly-existing (path-str)
+  (if (%cab-on)
+      (if (%cab :exists path-str) (%cab-fd-open path-str 0) -2)
+      (progn
+        (%string-to-cstr path-str *cstr-scratch*)
+        (%aarch64-openat *cstr-scratch* 1 0))))
 (defun %sys-open-create-excl (path-str)
   (if (%cab-on)
       (if (%cab :exists path-str) -17

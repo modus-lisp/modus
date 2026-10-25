@@ -740,6 +740,13 @@
 (defun %cli-getenv (name) nil)
 " *cl-repl-rpi-core-source* "
 (defun %core-addr () #x20000000)
+;; The Pi's restore diagnostics do not apply here: its skip window is timed by
+;; the BCM2835 system timer at #x3F003004, which on x86 never advances (the
+;; wait never ends, and only a byte on serial -- which SKIPS the restore --
+;; leaves it), and its progress word #x111F1F00 is inside the bare x64 heap.
+;; Back to lib/save-image.lisp's defaults.  Last definition wins.
+(defun %core-progress (k) k)
+(defun %core-pre-restore () t)
 ")
       (concatenate 'string
         (string #\Newline)

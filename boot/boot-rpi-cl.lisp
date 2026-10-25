@@ -590,6 +590,39 @@
     (emit-aarch64-load-imm64 buf x16 +rpi-cl-dtb-ptr-slot+)
     (emit-aarch64-str-x buf x0 x16 0)
 
+    ;; --- 0b. ...AND THE TREE ITSELF, to 0x06F00000, before anything runs ----
+    ;; A pointer is not enough: QEMU puts the tree at 0x08000000, and something in
+    ;; the first half second of boot writes there (measured: the magic is gone
+    ;; before kernel-main's first form), and the threaded build's GC bitmaps live
+    ;; there too.  So the blob is copied to lib/fdt.lisp's %FDT-KEEP-ADDR -- free
+    ;; RAM below the main stack, above the thread stacks, written by nothing else
+    ;; -- and the slot repointed.  Only a tree that has the magic and a totalsize
+    ;; <= 1 MB is copied; otherwise the copy's magic is cleared, so a previous
+    ;; boot's tree left in DRAM is never read as this one's.  Caches are on and
+    ;; the map is identity here, so plain loads and stores do.  x16 = the slot.
+    (emit-aarch64-u32 buf #xD2A0DE11)              ; movz x17, #0x06F0, lsl 16  (dst)
+    (emit-aarch64-u32 buf #xB900023F)              ; str wzr, [x17]   (no stale magic)
+    (emit-aarch64-u32 buf #xB4000240)              ; cbz x0, +18 -> done
+    (emit-aarch64-u32 buf #xB9400009)              ; ldr w9, [x0]
+    (emit-aarch64-u32 buf #x5281BA0A)              ; movz w10, #0x0dd0
+    (emit-aarch64-u32 buf #x72BDBFCA)              ; movk w10, #0xedfe, lsl 16  (D00DFEED, LE)
+    (emit-aarch64-u32 buf #x6B0A013F)              ; cmp w9, w10
+    (emit-aarch64-u32 buf #x540001A1)              ; b.ne +13 -> done
+    (emit-aarch64-u32 buf #xB940040B)              ; ldr w11, [x0, #4]
+    (emit-aarch64-u32 buf #x5AC0096B)              ; rev w11, w11   (totalsize)
+    (emit-aarch64-u32 buf #xD2A0020F)              ; movz x15, #0x10, lsl 16  (1 MB)
+    (emit-aarch64-u32 buf #xEB0F017F)              ; cmp x11, x15
+    (emit-aarch64-u32 buf #x54000108)              ; b.hi +8 -> done
+    (emit-aarch64-u32 buf #xD280000D)              ; movz x13, #0   (offset)
+    ;; copy: [x17 + x13] = [x0 + x13], 4 bytes at a time, while x13 < x11
+    (emit-aarch64-u32 buf #xB86D6809)              ; ldr w9, [x0, x13]
+    (emit-aarch64-u32 buf #xB82D6A29)              ; str w9, [x17, x13]
+    (emit-aarch64-u32 buf #x910011AD)              ; add x13, x13, #4
+    (emit-aarch64-u32 buf #xEB0B01BF)              ; cmp x13, x11
+    (emit-aarch64-u32 buf #x54FFFF83)              ; b.lo -4 -> copy
+    (emit-aarch64-u32 buf #xF9000211)              ; str x17, [x16]   (slot -> the copy)
+    ;; done:
+
     ;; --- 1. Stack pointer -------------------------------------------------
     ;; 0x08000000, not boot-rpi.lisp's 0x00200000.  A CL image is tens of MB
     ;; and loads at 0x80000, so a 2 MB stack top sits INSIDE the image and

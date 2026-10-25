@@ -972,6 +972,9 @@
   ;; DRAM is not guaranteed zero at reset, so the regions are cleared explicitly
   ;; — a stale bit would validate a false root, which is the whole failure this
   ;; exists to prevent.  Non-allocating: raw mem-ref stores only.
+  ;; FIRST the firmware's device tree is moved out of their way (lib/fdt.lisp
+  ;; %FDT-KEEP): QEMU puts it where the threaded build's bitmaps go.
+  (%fdt-keep)
   (%rpi-gc-bitmap-init #x05000000 #x05100000 #xE0000)
 
   ;; NOTE: no (setup-irq) / (nic-irq-unmask) here.  Those program a GICv2,
@@ -2360,6 +2363,7 @@
     ;; a dead framebuffer -- the firmware's rainbow square -- on a cold boot.)
     (when (fboundp (quote hcon-init))
       (handler-case (hcon-init) (t (c) nil)))
+    (handler-case (%fdt-after-restore) (t (c) nil))   ; THIS boot's bootargs, not the builder's
     (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
     ;; ... and USB, for the same reason: boot init brings the keyboard and mouse
     ;; up (%CONSOLE-INIT), a restored core skips boot init, and the controller

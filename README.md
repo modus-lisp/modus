@@ -255,7 +255,31 @@ The chain does not currently complete from a clean checkout: step 0
 
 ## Building and running
 
-Requires SBCL and QEMU.
+Requires SBCL and QEMU (plus OVMF and mtools for the UEFI image).
+
+### Start here: the real CL on bare metal, via kiln
+
+The quickest bare-metal image that runs the actual Common Lisp is the one kiln
+builds, boots under QEMU and checks — from a kiln checkout beside this one
+(`bin/kiln sync`):
+
+```bash
+bin/kiln image x64-uefi --with=json-simple \
+  --probe='(json-simple:stringify (vector 1 2 (expt 2 70)))' \
+  --expect='[1,2,1180591620717411303424]'
+```
+
+It builds `generic.efi` from this tree, boots it under OVMF, installs the
+packages, saves a core, boots again from the core and requires the probe's
+answer (about five minutes under TCG, no KVM needed).  `scripts/run-uefi-cl.sh
+generic.efi` gets you its serial REPL.  The multiboot equivalent is
+`build-x64-cl-repl` (`./scripts/run.sh x64-cl-repl`).
+
+**The `x64-repl` / `aarch64-repl` configs below are NOT that image.**  They run
+the legacy `repl-source.lisp` mini-Lisp, which evaluates a bare symbol and
+nothing else — `(+ 1 2)` echoes and never returns (see "Payload" above; #204
+deletes it).  They boot, which makes them useful for QEMU plumbing and nothing
+more.
 
 ### Quick test (any architecture)
 
@@ -271,14 +295,15 @@ All SSH scripts support batch mode — pass an expression as the second argument
 ### x86-64
 
 ```bash
-./scripts/run.sh x64-repl      # boot to serial REPL
+./scripts/run.sh x64-cl-repl   # boot to serial REPL (the real CL)
+./scripts/run.sh x64-repl      # legacy mini-Lisp: boots, (+ 1 2) hangs
 ./scripts/run-x64-ssh.sh       # boot with SSH networking
 ```
 
 ### AArch64 (QEMU virt)
 
 ```bash
-./scripts/run.sh aarch64-repl  # AArch64 REPL on QEMU virt
+./scripts/run.sh aarch64-repl  # legacy mini-Lisp REPL on QEMU virt: (+ 1 2) hangs
 ./scripts/run-aarch64-ssh.sh   # AArch64 with SSH networking (E1000, port 2222)
 ```
 

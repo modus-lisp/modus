@@ -1124,18 +1124,25 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
 (defun bt-call (ex fn)
   "Run FN (no arguments) on executor EX and return its value, copied (see EXECUTORS)."
   (let* ((cell (first ex)) (idx (second ex)) (lk cell))
+    ;; ON THE MAIN THREAD, WAIT AS MAIN WAITS: run core 0's ready threads (%BT-MAIN-IDLE).
+    ;; A core-0 thread that holds this executor's lock -- glass's RFB sender grabbing the
+    ;; screen on core 2, say -- only gets core 0 back when main yields it, so a main that
+    ;; spun here (the desk, calling the same executor) never let it finish: a Zero gateway
+    ;; card (QEMU) stopped dead the moment a phone connected, main in BT-CALL, ICE gone.
     (if (%bt-slot-p)
         (loop (when (zerop (xchg-mem lk 1)) (return nil)) (bt-yield))
-        (loop (when (zerop (xchg-mem lk 1)) (return nil))))
+        (loop (when (zerop (xchg-mem lk 1)) (return nil)) (%bt-main-idle)))
     (setf (svref *bt-exec-fns* idx) fn)
     (let ((req (+ (%gc-read64 (+ cell #x08)) 1)))
       (mfence)
       (%gc-write64 (+ cell #x08) req)
       (if (%bt-slot-p)
           (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil)) (bt-yield))
-          (progn (%gc-safe-enter)
-                 (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil)))
-                 (%gc-safe-leave))))
+          (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil))
+                (unless (%bt-main-idle)
+                  (%gc-safe-enter)
+                  (dotimes (k 256) (when (= (%gc-read64 (+ cell #x10)) req) (return nil)))
+                  (%gc-safe-leave)))))
     (let ((kind (%gc-read64 (+ cell #x18))))
       (prog1
           (cond ((= kind 1) (mem-ref (+ cell #x20) :u64))

@@ -1542,7 +1542,21 @@
         (if (and c (not (eq (cdr c) (%word->val #x0BADB0B5))))
             (cdr c)
             (%e2-symbol-value-checked hash sym)))
-      (%e2-symbol-value-checked hash sym)))
+      (let ((c (car site)))
+        (if (and (consp c) (eq (car c) hash))
+            (%e2-symbol-value-cell hash sym c)
+            (%e2-symbol-value-checked hash sym)))))
+
+;;; The armed arm of a read whose cell is known (baked, or a filled site): this
+;;; thread's binding if it has one, else the cell, with no table probe.  Cells
+;;; are never replaced, so a found cell is the live one.  Unbound goes to
+;;; %E2-SYMBOL-VALUE-CHECKED, which signals.
+(defun %e2-symbol-value-cell (hash sym cell)
+  (let* ((a (%dynb-value-addr hash))
+         (v (if (eql a 0) (cdr cell) (mem-ref a :u64))))
+    (if (eq v (%word->val #x0BADB0B5))
+        (%e2-symbol-value-checked hash sym)
+        v)))
 
 (defun %gv-site-ref (hash site)
   "The LET-special save (%GV-SAVE semantics: the unbound marker when unbound)

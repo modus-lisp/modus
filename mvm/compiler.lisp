@@ -14125,9 +14125,13 @@
             (emit-ir :li-const +vreg-v2+ (%e2-const-register site))
             (when *mvm-emit-halves* (emit-ir :set-nargs 3))
             (emit-ir :call "%E2-SYMBOL-VALUE-SITE" 3))
+          ;; The cell is known: the armed read asks only for this thread's
+          ;; binding, not the table probe (%GV-CELL was 30% of a threaded
+          ;; board's samples).
           (progn
-            (when *mvm-emit-halves* (emit-ir :set-nargs 2))
-            (emit-ir :call "%E2-SYMBOL-VALUE-CHECKED" 2)))
+            (emit-ir :li-const +vreg-v2+ (%e2-const-register cell))
+            (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+            (emit-ir :call "%E2-SYMBOL-VALUE-CELL" 3)))
       (unless (= dest +vreg-vr+)
         (emit-ir :mov dest +vreg-vr+))
       (emit-ir-label done)

@@ -17483,11 +17483,17 @@
                          (let ((cmp (ecase (loop-iter-end-test iter)
                                       (:to '>) (:below '>=) (:downto '<) (:above '<=))))
                            `(if (,cmp ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (ecase (loop-iter-end-test iter)
-                       (:to    `(if (%loop-gt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (:below `(if (%loop-ge ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (:downto `(if (%loop-lt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (:above `(if (%loop-le ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))))
+                       ;; Untyped: fixnums compare inline and only anything else calls
+                       ;; the generic helper.  It was a call on every iteration of every
+                       ;; numeric LOOP without OF-TYPE -- most library code.
+                       (destructuring-bind (cmp helper)
+                           (ecase (loop-iter-end-test iter)
+                             (:to '(> %loop-gt)) (:below '(>= %loop-ge))
+                             (:downto '(< %loop-lt)) (:above '(<= %loop-le)))
+                         `(if (if (and (fixnump ,var) (fixnump ,end-var))
+                                  (,cmp ,var ,end-var)
+                                  (,helper ,var ,end-var))
+                              (progn ,back-out (return-from :%loop-exit nil)))))
                      test-forms)))
            (if (and (loop-iter-end-test iter)
                     (member (loop-iter-end-test iter) '(:downto :above)))
@@ -26740,6 +26746,7 @@
   (let* ((g-arr (%mvm-gensym "AREFA"))
          (g-idx (%mvm-gensym "AREFI"))
          (g-raw (%mvm-gensym "AREFR"))
+         (g-st (%mvm-gensym "AREFS"))
          ;; EVERY OTHER SHAPE OUT OF LINE (cl-clos.lisp %AREF-SLOW, the same
          ;; arms in the same order): inlined, they were most of every generic
          ;; AREF's native code.  Bound HERE as their own backquotes and
@@ -26782,7 +26789,15 @@
      ;; array is string-typed.  Non-string arrays keep returning the raw
      ;; element unchanged.  %prim-aref / %wrapper-aref / %aref-multi stay
      ;; raw — only this public front-end applies the code→char lift.
-     `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
+     `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form)
+             ;; ONE SUBTAG LOAD FOR THE WHOLE DISPATCH.  Each %PRIM-...-P below used to
+             ;; re-test the tag, compare against T and reload the header -- ~12
+             ;; instructions an arm on aarch64, four arms before the out-of-line call.
+             ;; :OBJ-SUBTAG is tag-safe on x64/aarch64/i386/arm32/riscv but not on 68k or
+             ;; PowerPC, hence the guard: T is the one immediate with the object tag.
+             (,g-st (if (and (eql (%lowtag ,g-arr) ,+tag-object+) (not (eq ,g-arr t)))
+                        (obj-subtag ,g-arr)
+                        0)))
         (cond
           ;; The two plain shapes FIRST, with the raw word load: a simple
           ;; string (#x31) or simple vector (#x32) took the MDA, cons and
@@ -26795,14 +26810,23 @@
           ;; #x31 is left to non-Latin-1 literals: #x15 takes #x31's inline arm,
           ;; and #x31 goes to the rest (%AREF-SLOW's first arm).
           ,(if (%string32-on-p)
-               `((%prim-string32-p ,g-arr) (code-char (%c32-ref ,g-arr ,g-idx)))
-               `((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx))))
-          ((%prim-simple-vector-p ,g-arr) (%word-aref ,g-arr ,g-idx))
+               `((eq ,g-st ,+subtag-string32+) (code-char (%c32-ref ,g-arr ,g-idx)))
+               `((eq ,g-st ,+subtag-string+) (code-char (%word-aref ,g-arr ,g-idx))))
+          ((eq ,g-st ,+subtag-array+) (%word-aref ,g-arr ,g-idx))
           ;; Byte-packed (unsigned-byte 8) vector: the interpreter's bytecode
           ;; (every FETCH-* reads it), octet buffers.
-          ((%prim-u8-vector-p ,g-arr) (%u8-ref ,g-arr ,g-idx))
+          ((eq ,g-st ,+subtag-u8-vector+) (%u8-ref ,g-arr ,g-idx))
           ;; narrow string (#x13): a byte per character
-          ((%prim-base-string-p ,g-arr) (code-char (%u8-ref ,g-arr ,g-idx)))
+          ((eq ,g-st ,+subtag-base-string+) (code-char (%u8-ref ,g-arr ,g-idx)))
+          ;; In code compiled in-image (libraries: cram, glass, the gateway) an
+          ;; undisplaced byte vector behind a header -- adjustable, fill-pointer --
+          ;; is read here too, not through a call: cram's LZ77 reads its window a
+          ;; byte at a time and the call was a third of DEFLATE.  The image's own
+          ;; sites leave it to %AREF-SLOW's first arm, to keep the kernel small.
+          ,@(when *mvm-eval-runtime-p*
+              `(((and (eq ,g-st ,+subtag-mda+) (null (%word-aref ,g-arr 3))
+                      (%prim-u8-vector-p (%word-aref ,g-arr 6)))
+                 (%u8-ref (%word-aref ,g-arr 6) ,g-idx))))
           ,@rest-arms))
      env dest)))
 

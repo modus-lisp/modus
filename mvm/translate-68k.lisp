@@ -3165,12 +3165,15 @@
 ;;; address is a shift.  Temporaries: D0, D1, A0, A1.
 ;;;
 ;;; WHERE: hosted, the shared contract block at the heap base (jmpbuf
-;;; #x10000180 ... frames from #x10000408; 21 frames end at #x100006A8, clear of
+;;; #x10000180 ... frames from #x10000408; 46 frames end at #x100009C8, clear of
 ;;; the globals at #x10000A00); bare, the same offsets in *68k-globals-base*'s
 ;;; block, which otherwise uses only #x00-#x0F.  Computed at translate time.
 
 (defconstant +68k-jmpbuf-words+ 7)
-(defparameter *68k-hstack-max-depth* 21)
+(defparameter *68k-hstack-max-depth* 46
+  "As many 32-byte frames as fit below the hosted globals at #x10000A00 (they
+   end at #x100009C8).  21 overflowed under a real library load on ARM32, the
+   same protocol -- see *ARM32-HSTACK-MAX-DEPTH*.")
 (defun m68k-hbase ()           (if *68k-linux-mode* #x10000000 *68k-globals-base*))
 (defun m68k-jmpbuf-addr ()     (+ (m68k-hbase) #x180))
 (defun m68k-lj-scratch-addr () (+ (m68k-hbase) #x300))

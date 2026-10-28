@@ -177,6 +177,10 @@
 (install-armv7-translator)
 (arm32-set-linux-mode t)
 
+(let ((v (sb-ext:posix-getenv "MODUS_ARM32_GC_POISON")))
+  (when (and v (plusp (length v)) (not (string= v "0")))
+    (setf modus.mvm::*arm32-gc-poison* t)
+    (format t "~&;; MODUS_ARM32_GC_POISON: collections poison the evacuated semispace~%")))
 (let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                 "/tmp/modus-arm32-cli"))
        (image (build-image :target :linux-arm32

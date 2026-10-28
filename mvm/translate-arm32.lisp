@@ -1011,8 +1011,8 @@
 ;;; ============================================================
 ;;;
 ;;; The protocol of translate-riscv / -ppc / -68k: one live jmpbuf, a stack of
-;;; saved outer jmpbufs so handler-cases nest, a depth cap of 21 past which a
-;;; push stores nothing and its pop is absorbed, LONGJMP copying the jmpbuf aside
+;;; saved outer jmpbufs so handler-cases nest, a depth cap (46 here) past which
+;;; a push stores nothing and its pop is absorbed, LONGJMP copying the jmpbuf aside
 ;;; before the pop.  JMPBUF = 7 words: sp, r11 (VFP), resume address, r4..r7
 ;;; (V4..V7, callee-saved).  VA/VL/VN (r9/r10/r8) deliberately absent.  Frames
 ;;; are 8 words (32 bytes) so a frame address is a shift.
@@ -1022,11 +1022,18 @@
 ;;; LONGJMP never returns, so it uses r1..r3 freely.
 ;;;
 ;;; WHERE: hosted, the shared contract block at the heap base (#x10000180 ...;
-;;; 21 frames end at #x100006A8, clear of the globals at #x10000A00); bare, the
+;;; 46 frames end at #x100009C8, clear of the globals at #x10000A00); bare, the
 ;;; same offsets in *arm32-globals-base*'s block, which otherwise uses #x00-#x0F.
 
 (defconstant +arm32-jmpbuf-words+ 7)
-(defparameter *arm32-hstack-max-depth* 21)
+(defparameter *arm32-hstack-max-depth* 46
+  "As many 32-byte frames as fit below the globals at #x10000A00.  It was 21,
+   and that was the whole of `fresh-FASL-cache loads are broken on arm32':
+   boot already holds 5 frames, a library load RECORDING the cache nests past
+   the other 16, the excess pushes are absorbed, and a throw then lands on the
+   wrong frame -- alexandria's first load failed all 30 probes with 57 throws
+   escaping as %THROW-IN-FLIGHT.  At 46: 30 of 30, no errors, recording and
+   replay alike.  x64 holds 64, i386 63.")
 (defun arm32-hbase ()           (if (arm32-hosted-layout-p) #x10000000 *arm32-globals-base*))
 (defun arm32-jmpbuf-addr ()     (+ (arm32-hbase) #x180))
 (defun arm32-lj-scratch-addr () (+ (arm32-hbase) #x300))
@@ -2934,6 +2941,17 @@
    whose size it does not know.  The collector uses min(this, a quarter of a
    semispace), so a small heap sized at startup is not all margin.")
 
+(defvar *arm32-gc-poison* nil
+  "DEBUG: when true, every collection overwrites the semispace it evacuated
+   with +ARM32-GC-POISON+, so a pointer the collector failed to update faults
+   on its first read instead of silently reading the stale copy -- which
+   otherwise stays intact until the next collection reuses that space.  Set by
+   build-arm32-cli.lisp from MODUS_ARM32_GC_POISON=1.  Off: byte-identical.")
+
+(defconstant +arm32-gc-poison+ #x00000BA9
+  "Tag 9 (an object) at address #xBA0, which is never mapped: as a value it
+   faults when dereferenced, as a header it is a nonsense subtag #xA9.")
+
 (defvar *arm32-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
    (then :gc-check is the old BKPT and no allocation marks are emitted).")
@@ -3106,6 +3124,18 @@
           (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 4)
           (arm32-b buf zl)
           (here zd))
+        ;; ---- DEBUG: poison the evacuated semispace [r4, r5) ----
+        (when *arm32-gc-poison*
+          (let ((pl (lbl)) (pd (lbl)))
+            (arm32-mov buf +arm-r0+ +arm-r4+)
+            (arm32-load-imm32 buf +arm-r2+ +arm32-gc-poison+)
+            (here pl)
+            (arm32-cmp buf +arm-r0+ +arm-r5+)
+            (arm32-b-cond buf +arm-cc-cs+ pd)
+            (arm32-str buf +arm-r2+ +arm-r0+ 0)
+            (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 4)
+            (arm32-b buf pl)
+            (here pd)))
         ;; ---- swap the semispaces, count the collection ----
         (arm32-load-imm32 buf +arm-r12+ meta)
         (arm32-str buf +arm-r6+ +arm-r12+ 0)

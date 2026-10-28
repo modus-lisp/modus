@@ -1064,13 +1064,18 @@
 ;;; WHERE IT LIVES.  Hosted: the shared contract block at the heap base --
 ;;; jmpbuf #x10000180, scratch #x10000300, capped #x10000360, depth #x10000400,
 ;;; frames from #x10000408 -- the same addresses as RISC-V.  With 8-word frames,
-;;; 21 of them end at #x10000948 (ppc64), clear of ppc's globals at #x10000A00.
+;;; 23 (ppc64) or 46 (ppc32) of them fit below ppc's globals at #x10000A00.
 ;;; Bare: the same offsets inside *ppc-globals-base*'s DRAM block, which uses
 ;;; only #x00-#x17.  Computed at translate time, after the installers and
 ;;; ppc-set-linux-mode have fixed the mode.
 
 (defconstant +ppc-jmpbuf-words+ 8)
-(defparameter *ppc-hstack-max-depth* 21)
+(defun ppc-hstack-max-depth ()
+  "As many 8-word frames as fit below ppc's globals at #x10000A00: 23 of 64
+   bytes on ppc64 (ending #x100009C8), 46 of 32 on ppc32.  It was 21 at both
+   widths, which overflowed under a real library load on ARM32, the same
+   protocol -- see *ARM32-HSTACK-MAX-DEPTH*."
+  (if *ppc-64-bit* 23 46))
 (defun ppc-hbase ()           (if *ppc-linux-mode* #x10000000 *ppc-globals-base*))
 (defun ppc-jmpbuf-addr ()     (+ (ppc-hbase) #x180))
 (defun ppc-lj-scratch-addr () (+ (ppc-hbase) #x300))
@@ -1104,7 +1109,7 @@
     (ppc-emit-li buf +ppc-r7+ (ppc-hdepth-addr))
     (ppc-emit-load-word buf +ppc-r8+ +ppc-r7+ 0)          ; r8 = depth
     (ppc-emit-li buf +ppc-r10+ 1)                         ; assume capped
-    (ppc-emit-cmpi-word buf +ppc-r8+ *ppc-hstack-max-depth*)
+    (ppc-emit-cmpi-word buf +ppc-r8+ (ppc-hstack-max-depth))
     (ppc-emit-bge buf capped)
     (ppc-emit-frame-addr buf +ppc-r9+ +ppc-r8+)
     (ppc-emit-li buf +ppc-r12+ (ppc-jmpbuf-addr))

@@ -569,7 +569,11 @@ runtime options (`--dynamic-space-size`, `--control-stack-size`,
 `--tls-limit`, `--end-runtime-options`, `--[no-]merge-core-pages`) instead
 of rejecting them; on a fixed-heap port they are accepted and do nothing.
 
-**A PRE-EXISTING ARM32 CL-IMAGE GC BUG, exposed by small heaps.**  With a heap
+**A PRE-EXISTING ARM32 CL-IMAGE GC BUG, exposed by small heaps** (still open
+after the handler-stack fix: at 16-32 MB, MEMORY-FAULT-ERRORs inside shim
+evaluation and cl-ppcre crashes; at 48 MB both libraries pass everything.
+`MODUS_ARM32_GC_POISON=1` builds an image whose collections overwrite the
+evacuated semispace, so a stale pointer faults at its first read).  With a heap
 small enough to collect DURING BOOT, about 1 boot in 6 prints `!! form eval
 error in sb-shims: #(MEMORY-FAULT-ERROR ...)` (once `asdf-interface`): a
 boot-evaluated source form faults across a collection, is skipped, and boot
@@ -604,10 +608,17 @@ Escape hatches unchanged: `MODUS_NO_GENERA` / `MODUS_NO_SB` / `MODUS_NO_ASDF`.
 x64 suite identical to the control (sb-thread 44, sockets 52, channel 61,
 thread-lisp 29, atomics 31, mutex 18, sleep 13, word-boundary 624).
 
-**FRESH-FASL-CACHE LOADS ON ARM32 ARE BROKEN, PRE-EXISTING.**  With an empty
-`MODUS_FASL_DIR`, the RECORDING run of alexandria fails all 30 probes (80
-errors) and cl-ppcre 5 of 6 on the unmodified image too; the REPLAY run then
-passes alexandria.  Test with a private `MODUS_FASL_DIR`, never the shared
+**FRESH-FASL-CACHE LOADS ON ARM32 FAILED -- THE HANDLER-FRAME STACK WAS 21
+DEEP.**  With an empty `MODUS_FASL_DIR`, the RECORDING run of alexandria failed
+all 30 probes (80 errors, 57 throws escaping as `%THROW-IN-FLIGHT`) on the
+unmodified image too, while x64 passed.  Boot already holds 5 handler frames; a
+load recording the cache nests past the other 16; pushes past the cap are
+ABSORBED and a throw then lands on the wrong frame.  `*arm32-hstack-max-depth*`
+is 46 now (as many 32-byte frames as fit below the globals at #x10000A00):
+30/30, no errors, recording and replay.  68k is 46 too, ppc 23 (ppc64) / 46
+(ppc32); x64 holds 64, i386 63.  **RISC-V is still 21** -- its frames are 96
+bytes and nothing larger fits below its next fixed slot, so it needs a move,
+not a constant.  Untested whether its CL images hit this.  Test with a private `MODUS_FASL_DIR`, never the shared
 `~/.cache/modus/fasl`: a run there REPLAYS whatever an earlier run recorded,
 and replay vs record is exactly the difference above.  (The key's compiler
 fingerprint hashes a fixed list of compiler and runtime files, BY DESIGN -- a

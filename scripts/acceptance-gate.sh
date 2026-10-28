@@ -15,12 +15,20 @@
 #    again fails the gate.  A shard that does not finish at FIX but did at
 #    BASE fails it too.
 #
-# Worktrees, images and transcripts go in WORKDIR (default /tmp/modus-gate),
+# Worktrees, images and transcripts go in WORKDIR (default /var/tmp/modus-gate),
 # which is left in place for inspection.  Exit 0 = PASS.
 set -u
 BASE_REF=${1:?usage: acceptance-gate.sh BASE-REF FIX-REF [WORKDIR]}
 FIX_REF=${2:?usage: acceptance-gate.sh BASE-REF FIX-REF [WORKDIR]}
-WORKDIR=${3:-/tmp/modus-gate}
+WORKDIR=${3:-/var/tmp/modus-gate}
+# NOT UNDER /tmp: build-matrix.sh runs each build in a namespace that
+# bind-mounts a private /tmp, which hides a worktree that lives under /tmp --
+# every build then fails in 0 s with "can't cd", at both refs, and the gate
+# reports "no x64 CLI at fix".
+case "$WORKDIR" in /tmp|/tmp/*)
+  echo "acceptance-gate: WORKDIR must not be under /tmp (build-matrix hides it); got $WORKDIR" >&2
+  exit 2 ;;
+esac
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$WORKDIR" || exit 2
 WORKDIR=$(cd "$WORKDIR" && pwd)

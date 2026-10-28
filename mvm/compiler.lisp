@@ -2873,6 +2873,9 @@
     ((integerp form) form)
     ((or (symbolp form) (stringp form))
      (let ((v (gethash (normalize-name form) *constants* :not-found)))
+       ;; ...and a runtime DEFCONSTANT's (%RUNTIME-FOLD-CONSTANT): a library's
+       ;; `(ash s (- +ecm-bits+))' is the same case as the build's +fixnum-shift+
+       (when (and (eq v :not-found) (symbolp form)) (setq v (%runtime-constant form)))
        (if (and (not (eq v :not-found)) (integerp v)) v nil)))
     ;; + - * ASH over constant integers fold too: `(ash 1 (- +fixnum-bits+ 24))'
     ;; in the interpreter's LI arm was a runtime BIGNUM-ASH call on EVERY
@@ -5135,6 +5138,8 @@
                   ;; Mark NAME a constant variable so (constantp 'name) is T
                   ;; (CLHS) — alexandria define-constant.1/.2 check this.
                   (list '%mark-constant-var (list 'quote (cadr form)))
+                  ;; ...and FOLD it in what is compiled after: see %RUNTIME-FOLD-CONSTANT.
+                  (list '%runtime-fold-constant (list 'quote (cadr form)))
                   ;; (defconstant name value doc): the documentation string
                   ;; (DEFCONSTANT.4).
                   (if (stringp (cadddr form))
@@ -7736,6 +7741,36 @@
 
 ;;; ------ Variable Reference ------
 
+(defun %runtime-fold-constant (name)
+  "After a RUNTIME DEFCONSTANT (a library loaded into the image): record NAME's value in
+   *CONSTANTS*, so code compiled from then on reads a literal -- COMPILE-VARIABLE-REF's
+   fold, which only build-time defconstants used to get.  Before this every use of a
+   library's constant was a checked global read: seal's ECM-MUL, the P-256 inner loop of
+   every TLS handshake, spent most of its time in %E2-SYMBOL-VALUE-CHECKED / %GV-CELL
+   reading +ECM-MASK+ and +ECM-BITS+ (sampled on a Pi Zero gateway, 2026-10-24).
+   Only values that are the SAME object wherever they appear are folded -- numbers,
+   characters, keywords, T and NIL; a string or list stays a read, because a literal
+   would be a copy and EQ to the constant's value would stop holding."
+  (let ((v (symbol-value name)))
+    (when (or (numberp v) (characterp v) (keywordp v) (eq v t) (null v))
+      (setf (gethash (normalize-name name) (%runtime-constants)) v))
+    name))
+
+;;; THE RUNTIME TABLE IS ITS OWN.  *CONSTANTS* is the build's table, and in the image a SETF
+;;; GETHASH on it does not stick (measured on the x64 CLI: store, read back NIL, count 0), so
+;;; runtime defconstants go here, made on first use -- through BOUNDP because a DEFVAR's
+;;; initform does not run in every image.
+(defvar *runtime-constants* nil)
+(defun %runtime-constants ()
+  (if (and (boundp '*runtime-constants*) (hash-table-p *runtime-constants*))
+      *runtime-constants*
+      (setq *runtime-constants* (make-hash-table :test 'eql))))
+(defun %runtime-constant (name)
+  "NAME's folded runtime-defconstant value, or :NOT-FOUND."
+  (if (and (boundp '*runtime-constants*) (hash-table-p *runtime-constants*))
+      (gethash (normalize-name name) *runtime-constants* :not-found)
+      :not-found))
+
 (defun compile-variable-ref (name env dest)
   "Compile a variable reference, placing result in DEST"
   (let ((binding (env-lookup env name)))
@@ -7766,8 +7801,9 @@
       ((and *global-symbol-macros*
             (nth-value 1 (gethash (normalize-name name) *global-symbol-macros*)))
        (compile-form (gethash (normalize-name name) *global-symbol-macros*) env dest))
-      ;; Compile-time constant: fold to literal
-      ((let ((const-val (gethash (normalize-name name) *constants* :not-found)))
+      ;; Compile-time constant: fold to literal -- the build's, or a runtime DEFCONSTANT's
+      ((let ((const-val (let ((c (gethash (normalize-name name) *constants* :not-found)))
+                          (if (eq c :not-found) (%runtime-constant name) c))))
          (unless (eq const-val :not-found)
            ;; Quote symbol constants to prevent them being treated as variables
            (if (and (symbolp const-val)

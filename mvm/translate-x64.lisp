@@ -3971,19 +3971,29 @@
            ;; not-yet-written word a fixnum 0 (nibble 0), which scan_word
            ;; ignores.  Header is at +0; the payload words are the +8 padding
            ;; word and the COUNT data words (offsets +16.. ) — COUNT+1 words.
-           ;; (The 16-byte alignment-tail word that exists for odd COUNT is
-           ;; deliberately left alone: zeroing it as well shifted code layout
-           ;; enough to re-expose a SEPARATE residual corruption site near the
-           ;; ASDF/BUNDLE forms — a contiguous define-package cascade returned
-           ;; — whereas zeroing exactly the logical payload broke the cascade
-           ;; cleanly.  The tail word is beyond the object's data and is a
-           ;; lower-risk follow-up; see the handoff.)  RAX (= +scratch-reg+)
-           ;; held the header and is free now; the LEA for d happens after.
+           ;;
+           ;; AND, for odd COUNT, the 16-byte ALIGNMENT-TAIL word after the
+           ;; data.  It is past the object's data but inside its ALLOC-BYTES,
+           ;; so the flat Cheney scan reads it like any other word and
+           ;; copy_object copies it with the object.  Left unwritten it holds
+           ;; whatever this memory held before -- and when that is a live-
+           ;; looking pointer, the collector forwards it, keeps its target, and
+           ;; carries the word along forever.  Every symbol is a 3-slot object:
+           ;; measured, a cortez corpus read kept whole file texts, their
+           ;; string streams and an old READ-CHAR &rest list alive through the
+           ;; tail word of the symbols interned after them (CLUEI::NEW-Y +40),
+           ;; ~0.2 MB per file until the heap ran out.  (This word was once
+           ;; left alone because zeroing it shifted code layout and re-exposed
+           ;; a separate define-package corruption; that cascade is gated.)
+           ;; RAX (= +scratch-reg+) held the header and is free now; the LEA
+           ;; for d happens after.
            (emit-bytes buf #x31 #xC0)               ; xor eax, eax  (rax = 0)
            (let ((off 8))
              (dotimes (i (+ count 1))
                (emit-mov-mem-reg buf 'r12 'rax off)  ; mov [r12+off], rax
-               (incf off 8)))
+               (incf off 8))
+             (when (oddp count)
+               (emit-mov-mem-reg buf 'r12 'rax off)))  ; the alignment tail
            ;; MCGC object-start bit (R12 still = object base).
            (emit-mcgc-set-start-bit buf 'r12)
            ;; Result = R12 | object-tag

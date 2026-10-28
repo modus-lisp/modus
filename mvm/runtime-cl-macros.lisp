@@ -197,7 +197,14 @@
                     ;; VAR is always a fixnum: it counts 0..COUNT one step per
                     ;; iteration, so exceeding a fixnum would take 2^62
                     ;; iterations.  N is NOT declared (a bignum count is legal).
-                    (list (list 'declare (list 'type 'fixnum var))))
+                    (if (and (consp count-form) (symbolp (car count-form))
+                             (string= (symbol-name (car count-form)) \"THE\")
+                             (consp (cdr count-form)))
+                        ;; (THE TYPE count) -- the compiler's typed-counter
+                        ;; rewrite says the count's width: N has that type
+                        (list (list 'declare (list 'type 'fixnum var)
+                                    (list 'type (cadr count-form) n)))
+                        (list (list 'declare (list 'type 'fixnum var)))))
                 ;; The body's own leading declarations belong on this LET too
                 ;; (inside the LOOP's PROGN they were silently dropped).
                 (let ((decls nil) (rest body))

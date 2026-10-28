@@ -7364,6 +7364,7 @@
                                   #.(compute-name-hash "SHIFTF")))
                         (%symbol-macro-places-rewrite form env))
                    form))
+         (form (or (%dotimes-typed-counter form env) form))
          (form (macroexpand-mvm form)))
    (%cf-trace-note form)
    (when %stmt-unused (%fp-diag-bump 3))
@@ -18615,6 +18616,33 @@
            (and w (>= w 1) (list 'integer 0 (- (ash 1 (- w 1)) 1)))))
         (t nil)))
 
+(defun %dotimes-typed-counter (form env)
+  "FORM with its counter's type declared, when FORM is a DOTIMES whose count
+   has a known width and whose body does not already type the counter; else
+   NIL.  The image's DOTIMES is a runtime macro (runtime-cl-macros.lisp), and a
+   macro cannot see the environment, so it declares every non-literal-count
+   counter a plain FIXNUM.  Here, before it expands, ENV is known: the
+   declaration goes at the head of the body, which the macro moves onto the
+   counter's LET after its own (declare (type fixnum var)).  The two types
+   intersect; the narrower one is what %EXPR-WIDTH then sees."
+  (and (consp form) (symbolp (car form)) (car form)
+       (= (normalize-name (car form)) #.(compute-name-hash "DOTIMES"))
+       (consp (cdr form)) (consp (cadr form))
+       (let* ((spec (cadr form)) (var (car spec)) (count (and (consp (cdr spec)) (cadr spec))))
+         (and (symbolp var) var
+              (not (integerp count))               ; the macro types a literal count itself
+              (let ((ty (%dotimes-counter-type count env)))
+                (and ty
+                     (not (some (lambda (d)
+                                  (and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "DECLARE")
+                                       (some (lambda (c)
+                                               (and (consp c) (member var (cdr c))))
+                                             (cdr d))))
+                                (cddr form)))
+                     (list* (car form) spec
+                            (list 'declare (list 'type ty var))
+                            (cddr form))))))))
+
 (defun compile-dotimes (spec body env dest)
   "Compile (dotimes (var count [result]) body...).
    Per CLHS, body is in an implicit TAGBODY (so GO/tags work) inside
@@ -24883,11 +24911,30 @@
              :test #'string=))
     (t nil)))
 
+(defun %intersect-declared-type (old new)
+  "One type for a variable declared twice.  CLHS 3.3.4: two type
+   declarations mean the intersection.  Of two integer types the narrower is
+   kept (it is the intersection's width); otherwise the later declaration.
+   The DOTIMES macro declares its counter FIXNUM and a body or the compiler
+   may add (INTEGER 0 N); before this, %APPLY-DECLARED-TYPES kept the FIRST
+   and FIND-based readers the LAST, so they disagreed, and a counter over a
+   declared count stayed a full fixnum."
+  (let ((wo (ignore-errors (%decl-int-width old)))
+        (wn (ignore-errors (%decl-int-width new))))
+    (if (and wo wn (< wo wn)) old new)))
+
 (defun %declared-types (body)
   "Alist (VAR . TYPE-FORM) from the leading (declare (type TYPE v1 v2 …) …)
    forms of BODY — the same forms strip-declares removes, including those
-   after a leading docstring.  Only the explicit TYPE spelling is read."
+   after a leading docstring.  Only the explicit TYPE spelling is read.
+   One entry per variable: a variable declared twice gets the intersection
+   (%INTERSECT-DECLARED-TYPE)."
   (let ((out nil) (b body) (seen-doc nil))
+    (flet ((note (v ty)
+             (let ((e (assoc v out)))
+               (if e
+                   (setf (cdr e) (%intersect-declared-type (cdr e) ty))
+                   (setq out (cons (cons v ty) out))))))
     (loop
       (cond
         ((not (consp b)) (return out))
@@ -24901,7 +24948,7 @@
                    (consp (cdr d)))
               (let ((ty (%resolve-declared-type (cadr d))))
                 (dolist (v (cddr d))
-                  (when (symbolp v) (setq out (cons (cons v ty) out))))))
+                  (when (symbolp v) (note v ty)))))
              ;; CLHS 3.3.3.1: (declare (SINGLE-FLOAT x y)) is (TYPE SINGLE-FLOAT
              ;; x y).  Only the TYPE spelling used to be read, so the shorthand
              ;; -- cl-bench FFT's (single-float ur ui wr wi tr ti) -- left every
@@ -24909,9 +24956,9 @@
              ((and (consp d) (%type-decl-shorthand-p (car d)))
               (let ((ty (%resolve-declared-type (car d))))
                 (dolist (v (cdr d))
-                  (when (symbolp v) (setq out (cons (cons v ty) out))))))))
+                  (when (symbolp v) (note v ty)))))))
          (setq b (cdr b)))
-        (t (return out))))))
+        (t (return out)))))))
 
 (defun %apply-declared-types (env body)
   "Stamp binding-dtype on the CURRENT frame's bindings named by BODY's

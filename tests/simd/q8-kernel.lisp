@@ -16,10 +16,9 @@
   (declare (type (simple-array (unsigned-byte 8) (*)) wq xq)
            (type (simple-array single-float (*)) ws4 xs out)
            (type (unsigned-byte 40) cols nb g xo xso oo) (optimize (speed 3) (safety 0)))
-  (let ((acc (%f32v-broadcast 0.0)) (p0 (* 4 g cols)) (s0 (* g nb)) (b 0))
-    (declare (type f32v-pack acc) (type (unsigned-byte 40) p0 s0 b))
-    (loop
-      (when (>= b nb) (return))
+  (let ((acc (%f32v-broadcast 0.0)) (p0 (* 4 g cols)) (s0 (* g nb)))
+    (declare (type f32v-pack acc) (type (unsigned-byte 40) p0 s0))
+    (dotimes (b nb)
       (let* ((w0 (+ p0 (* b 32))) (w1 (+ w0 cols)) (w2 (+ w1 cols)) (w3 (+ w2 cols))
              (xb (+ xo (* b 32))))
         (declare (type (unsigned-byte 40) w0 w1 w2 w3 xb))
@@ -33,8 +32,7 @@
                                               (%vi-sdot (%vi-sdot (%vi-movi8 0) (%vi-ld16 wq w1) xa) (%vi-ld16 wq (+ w1 16)) xc))
                                   (%vi-addp32 (%vi-sdot (%vi-sdot (%vi-movi8 0) (%vi-ld16 wq w2) xa) (%vi-ld16 wq (+ w2 16)) xc)
                                               (%vi-sdot (%vi-sdot (%vi-movi8 0) (%vi-ld16 wq w3) xa) (%vi-ld16 wq (+ w3 16)) xc))))
-                                (%f32v* (%f32v-ref ws4 (* 4 (+ s0 b))) (%f32v-broadcast-ref xs (+ xso b))))))))
-      (setq b (+ b 1)))
+                                (%f32v* (%f32v-ref ws4 (* 4 (+ s0 b))) (%f32v-broadcast-ref xs (+ xso b)))))))))
     (%f32v-set out oo acc)))
 
 (defun q8dot (wq ws row cols xq xs)   ; the scalar reference, one row

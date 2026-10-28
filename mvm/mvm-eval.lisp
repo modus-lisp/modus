@@ -2772,8 +2772,11 @@
 ;;; vector header, so it IS a (simple-array ...) to every array path (AREF,
 ;;; LENGTH, %vi-ld*, %f32v-ref, READ-SEQUENCE), and the collector leaves it
 ;;; alone: a slot is only rewritten when it points into this region's
-;;; from-space, and a byte/float vector's contents are never scanned.  It is
-;;; never freed.
+;;; from-space, and a byte/float vector's contents are never scanned.  It
+;;; lives until FREE-STATIC-VECTOR unmaps it (a model's KV cache goes with its
+;;; context).  After that nothing may use it, not even pass it to a function;
+;;; a reference left in a heap object is harmless, since the collector only
+;;; compares a slot's address with its own spaces.
 ;;;
 ;;; The header is written a byte at a time: a :u64 MEM-REF store writes a
 ;;; value's TAGGED form, so it cannot produce the (odd) header word
@@ -2789,6 +2792,10 @@
 (defun %store-word-bytes (raw w)
   (dotimes (i 8) (setf (mem-ref (+ raw i) :u8) (ldb (byte 8 (* 8 i)) w))))
 
+(defvar *static-vector-maps* nil
+  "(TAGGED-WORD . BYTES) for every live mapping MAKE-STATIC-VECTOR made: what
+   FREE-STATIC-VECTOR may unmap.")
+
 (defun make-static-vector (n &key (element-type '(unsigned-byte 8)))
   "An N-element (simple-array ELEMENT-TYPE (*)), zero-filled, outside the
    moving heap (see STATIC VECTORS above).  ELEMENT-TYPE is (UNSIGNED-BYTE 8)
@@ -2802,9 +2809,22 @@
           (progn
             (%store-word-bytes a (logior (ash n 8) subtag))
             (%store-word-bytes (+ a 8) 0)
+            (push (cons (+ a 9) bytes) *static-vector-maps*)
             (%word->val (+ a 9)))
           (make-array n :element-type element-type
                         :initial-element (if (= subtag #x12) 0.0 0))))))
+
+(defun free-static-vector (v)
+  "Unmap V, a vector MAKE-STATIC-VECTOR returned; T if it did.  A vector it
+   did not map (the in-heap fallback, anything else) is left to the
+   collector, and NIL returned."
+  (let* ((w (%val->word v))
+         (e (assoc w *static-vector-maps*)))
+    (when e
+      (setq *static-vector-maps* (remove e *static-vector-maps*))
+      ;; munmap(addr, bytes): x86-64 numbering, as every runtime syscall
+      (handler-case (syscall6 11 (- w 9) (cdr e) 0 0 0 0) (error () nil))
+      t)))
 
 (defun %init-modus-package ()
   "Bind the MODUS package's generic runtime functions.  Called from kernel-main
@@ -2814,7 +2834,7 @@
    symbol's function cell and the qualified SFT key are set."
   (let ((p (find-package "MODUS")))
     (when p
-      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE" "MAKE-STATIC-VECTOR"))
+      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE" "MAKE-STATIC-VECTOR" "FREE-STATIC-VECTOR"))
         (let ((fn (%mvm-resolve-runtime-fn nm)))
           (when fn
             (let ((dst (intern nm p)))

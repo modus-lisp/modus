@@ -176,4 +176,15 @@
 (check "14 inline f32 make-array" (t14)
        (list 7 '(0.0 0.0 0.0 0.0 0.0 0.0 2.5) 3 0.0 'single-float))
 
+;; 15. typed MAXIMIZE / MINIMIZE: a declared accumulator, the first value
+;;     taken by a flag (quantize's amax), with and without INTO
+(defun t15 (a) (declare (type (simple-array single-float (*)) a))
+  (list (loop for i of-type fixnum from 0 below (length a) maximize (abs (aref a i)) of-type single-float)
+        (loop for i of-type fixnum from 0 below (length a) minimize (aref a i) of-type single-float)
+        (loop for x in '(3 1 2) maximize x of-type fixnum)
+        (loop for x in '(1.5d0 -7.5d0) minimize x into m of-type double-float finally (return m))
+        (loop for x in '(-4.0 -9.0) maximize x of-type single-float)))
+(check "15 typed maximize/minimize" (t15 *a*)
+       (list (reduce #'max (mapcar #'abs *vals*)) (reduce #'min *vals*) 3 -7.5d0 -4.0))
+
 (format t "~%FP-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

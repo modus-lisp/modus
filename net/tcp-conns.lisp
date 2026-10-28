@@ -98,6 +98,17 @@
 (defun %put16 (v o x) (setf (aref v o) (ldb (byte 8 8) x) (aref v (+ o 1)) (ldb (byte 8 0) x)))
 (defun %put32 (v o x) (%put16 v o (ldb (byte 16 16) x)) (%put16 v (+ o 2) (ldb (byte 16 0) x)))
 
+;;; FLOW CONTROL.  The window advertised is what is left of a *TCP-RCV-BUF* receive buffer
+;;; after the bytes nobody has read yet.  It was a fixed 65535 whatever was unread, so a relay
+;;; replaying a backlog faster than the board parsed it grew RX without bound -- by doubling,
+;;; and an adjustable (UNSIGNED-BYTE 8) vector here is backed by a general vector, 8 bytes a
+;;; byte: three relay connections held 2-4 MB each, kept after draining, and pushed region 0 of
+;;; the Zero gateway core into collecting every few hundred ms.  TCPC-READ announces the window
+;;; again once a read has reopened it (the peer would otherwise wait for its persist timer).
+(defparameter *tcp-rcv-buf* 65536 "Bytes a connection buffers before its window closes.")
+(defun %rcv-window (c)
+  (max 0 (min 65535 (- *tcp-rcv-buf* (fill-pointer (tc-rx c))))))
+
 (defun %tcp-segment (c flags seq data start n)
   "Build and send one segment of C: FLAGS, sequence SEQ, N bytes of DATA from START."
   (let* ((syn (logbitp 1 flags)) (hdr (if syn 24 20)) (len (+ hdr n))
@@ -105,7 +116,7 @@
     (%put16 seg 0 (tc-lport c)) (%put16 seg 2 (tc-rport c))
     (%put32 seg 4 seq) (%put32 seg 8 (if (logbitp 4 flags) (tc-rcv-nxt c) 0))
     (setf (aref seg 12) (if syn #x60 #x50) (aref seg 13) flags)
-    (%put16 seg 14 65535)
+    (%put16 seg 14 (%rcv-window c))
     (when syn (setf (aref seg 20) 2 (aref seg 21) 4 (aref seg 22) #x05 (aref seg 23) #xB4))
     (dotimes (i n) (setf (aref seg (+ hdr i)) (aref data (+ start i))))
     (%put16 seg 16 (%l4-checksum 6 (%our-ip) (tc-rip c) seg len))
@@ -339,10 +350,19 @@
     (let* ((rx (tc-rx c)) (have (fill-pointer rx)))
       (if (and (zerop have) (tc-rx-eof c))
           :eof
-          (let* ((n (min max have)) (out (make-array n :element-type '(unsigned-byte 8))))
+          (let* ((n (min max have)) (out (make-array n :element-type '(unsigned-byte 8)))
+                 (was (%rcv-window c)))
             (dotimes (i n) (setf (aref out i) (aref rx i)))
             (replace rx rx :start2 n :end2 have)
             (setf (fill-pointer rx) (- have n))
+            ;; drained: give back a buffer a burst grew (it costs 8 bytes a byte)
+            (when (and (= have n) (> (array-dimension rx 0) 16384))
+              (setf (tc-rx c) (make-array 4096 :element-type '(unsigned-byte 8)
+                                               :adjustable t :fill-pointer 0)))
+            ;; window update, over the network only, once the read reopened a quarter of it
+            (when (and (null (tc-peer c)) (member (tc-state c) '(:established :fin-wait :fin-wait-2))
+                       (< was (ash *tcp-rcv-buf* -2)) (>= (%rcv-window c) (ash *tcp-rcv-buf* -2)))
+              (%tcp-ack c))
             out)))))
 
 (defun tcpc-close (c &key (timeout-ms 2000))

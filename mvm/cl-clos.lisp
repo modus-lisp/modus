@@ -7743,10 +7743,14 @@
            (old-len  (array-length old-data))
            (str-data (or (stringp old-data)
                          (and (%mda-displaced a) (stringp (%mda-displaced a)))))
-           ;; Allocate new data of exactly new-size (preserve elt type).
+           ;; Allocate new data of exactly new-size (preserve elt type).  A byte
+           ;; vector keeps a byte store: it used to get a word per element on its
+           ;; first grow, and then missed every byte fast path (cram's window).
            (new-data (cond
                        (displaced-to nil)
                        (str-data (%make-string-array new-size))
+                       ((%prim-u8-vector-p old-data)
+                        (make-array new-size :element-type '(unsigned-byte 8)))
                        (t (make-array new-size)))))
       (cond
         (displaced-to
@@ -7773,11 +7777,15 @@
          (%prim-aset a 6 (%adjust-new-data a new-data new-size))
          (%prim-aset a 3 nil) (%prim-aset a 4 0))
         (t
-         (let ((i 0))
-           (loop (when (>= i new-size) (return))
-             (when (< i old-dim0)
-               (aset new-data i (aref old-data (+ old-off i))))
-             (setq i (+ i 1))))
+         (let ((n (if (< old-dim0 new-size) old-dim0 new-size)))
+           (cond ((%bulk-copy-u8-ok-p new-data old-data)
+                  (%bulk-copy-u8 new-data 0 old-data old-off n))
+                 ((%bulk-copy-ok-p new-data old-data)
+                  (%bulk-copy new-data 0 old-data old-off n))
+                 (t (let ((i 0))
+                      (loop (when (>= i n) (return))
+                        (aset new-data i (aref old-data (+ old-off i)))
+                        (setq i (+ i 1)))))))
          (%prim-aset a 6 (%adjust-new-data a new-data new-size))
          (%prim-aset a 3 nil) (%prim-aset a 4 0)))
       ;; Update dims slot to reflect the new size (rank stays 1).
@@ -8149,6 +8157,13 @@
 ;;; here.  Written in primitives: an AREF in this body would call itself.
 (defun %aref-slow (a i)
   (cond
+    ;; AN UNDISPLACED BYTE VECTOR BEHIND A HEADER FIRST -- an adjustable or fill-pointer
+    ;; (unsigned-byte 8) vector, read a byte at a time by cram's LZ77 and every stream
+    ;; buffer -- before the five type tests the inline arms already failed.  The header
+    ;; words are read with %WORD-AREF: %PRIM-AREF is the whole generic dispatch again,
+    ;; ~40 instructions a slot.  Measured on a Pi 5: this read was 57% of DEFLATE.
+    ((and (%mda-p a) (null (%word-aref a 3)) (%prim-u8-vector-p (%word-aref a 6)))
+     (%u8-ref (%word-aref a 6) i))
     ((%prim-simple-string-p a) (code-char (%word-aref a i)))
     ((%prim-simple-vector-p a) (%word-aref a i))
     ((%prim-u8-vector-p a) (%u8-ref a i))
@@ -8175,6 +8190,8 @@
     (t (%prim-aref a i))))
 
 (defun %aset-slow (a i val)
+  (if (and (%mda-p a) (null (%word-aref a 3)) (%prim-u8-vector-p (%word-aref a 6)))
+      (progn (%u8-set (%word-aref a 6) i val) val)     ; as %AREF-SLOW's first arm
   (let ((sto (%aset-store-val a val)))
     (cond
       ;; A NARROW string holds a byte per character: a code that does not fit
@@ -8203,7 +8220,7 @@
        val)
       ((%raw-consp a) (%wrapper-aset a i sto) val)
       ((eq (obj-subtag a) #x12) (%f32-aset a i val))
-      (t (%prim-aset a i sto) val))))
+      (t (%prim-aset a i sto) val)))))
 
 ;;; %wrapper-array-length: ARRAY-LENGTH semantics — returns the underlying
 ;;; storage size (NOT the fill-pointer).  ARRAY-IN-BOUNDS-P relies on this

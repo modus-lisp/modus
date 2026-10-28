@@ -36,6 +36,16 @@
          (hi (if wanted 0 (parse-integer (sb-ext:posix-getenv "SHARD_HI"))))
          (lastf 0) (i 0))
     (format t "~&==SHARD ~d ~d~%" lo hi)
+    ;; sandbox/scratch/ is made by ENSURE-DIRECTORIES-EXIST.8 and then used by
+    ;; the stream tests (OPEN-STREAM-P.3, ...); git archive drops the empty
+    ;; directory.  A shard starts in the state a sequential run would have:
+    ;; the directory exists iff that test comes before this shard's tests.
+    (let* ((ede (intern "ENSURE-DIRECTORIES-EXIST.8" "CL-TEST"))
+           (pos (position ede (regression-test::pending-tests))))
+      (when (and pos (if wanted
+                         (not (member (symbol-name ede) wanted :test #'string=))
+                         (< pos lo)))
+        (ensure-directories-exist "sandbox/scratch/")))
     ;; Same dynamic context upstream's DO-TESTS gives every test (rt.lsp):
     ;; files resolve against sandbox/, and the package is CL-TEST.
     (let ((*default-pathname-defaults* (truename #p"sandbox/"))
@@ -47,9 +57,12 @@
           (format t "~&>>~a~%" n) (finish-output)
           (format t "~&~a ~a~%" (if (regression-test::do-test n) "PASS" "FAILX") n)
           (finish-output)
-          (let ((f (+ (%hc-fault-w 0 0) (* 4294967296 (%hc-fault-w 0 1)))))
-            (unless (eql f lastf)
-              (setq lastf f)
-              (format t "~&FAULT after ~a rip=~x~%" n f) (finish-output))))
+          ;; the recovered-fault record is x64's (%HC-FAULT-W); other
+          ;; targets have no such reader, and calling it ended the shard
+          (when (fboundp '%hc-fault-w)
+            (let ((f (+ (%hc-fault-w 0 0) (* 4294967296 (%hc-fault-w 0 1)))))
+              (unless (eql f lastf)
+                (setq lastf f)
+                (format t "~&FAULT after ~a rip=~x~%" n f) (finish-output)))))
         (setq i (+ i 1))))
     (format t "~&==SHARD-END~%")))

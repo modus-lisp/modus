@@ -793,7 +793,7 @@ class MVM {
       case 0x0530: {
         let n = this.ld32(A_NARGS);
         if (n < 5) return;
-        if (n > 120) n = 120;              // CALL-ARGUMENTS-LIMIT (+apply-spread-max+)
+        if (n > 121) n = 121;              // +apply-spread-max+ + the tail word of nargs 254
         for (let i = 4; i < n; i++) {
           const s = this.ebp + 16 + 8 * (i - 4), d = this.ebp + SLOT_BASE - 8 * i;
           this.st64(d, this.ldlo(s), this.ldhi(s));

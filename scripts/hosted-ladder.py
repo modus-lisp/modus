@@ -33,24 +33,25 @@ from concurrent.futures import ThreadPoolExecutor
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUNGS = os.path.join(REPO, "test", "arch-rungs")
 
-# arch -> (build script, output env var, qemu user-mode binary)
+# arch -> (output env var, qemu user-mode binary).  mvm/build-hosted.lisp
+# builds every one of them: `build-hosted.lisp ARCH SOURCE`.
 #
-# Only the ports with a build script that takes a SOURCE FILE are here.  The
+# Only the ports whose hosted image is built from a SOURCE FILE are here.  The
 # hosted x64/aarch64/i386 images are built by the CLI lineage
 # (build-cli-common.lisp) and bake a whole runtime rather than one file, so
 # grading them this way would measure a different thing; they have ./modus and
 # the ANSI gate instead.
 ARCHES = {
-  "riscv64": ("mvm/build-riscv-linux.lisp",   "MODUS_RISCV_LINUX_OUT",   "qemu-riscv64-static"),
-  "riscv32": ("mvm/build-riscv32-linux.lisp", "MODUS_RISCV32_LINUX_OUT", "qemu-riscv32-static"),
-  "arm32":   ("mvm/build-arm32-linux.lisp",   "MODUS_ARM32_LINUX_OUT",   "qemu-arm-static"),
+  "riscv64": ("MODUS_RISCV_LINUX_OUT",   "qemu-riscv64-static"),
+  "riscv32": ("MODUS_RISCV32_LINUX_OUT", "qemu-riscv32-static"),
+  "arm32":   ("MODUS_ARM32_LINUX_OUT",   "qemu-arm-static"),
   # BIG-ENDIAN.  The oracle is endian-NEUTRAL by construction: the payload emits
   # its four bytes one at a time, low byte first, through write-char-serial, so
   # nothing here depends on the target's byte order — which is the whole reason
   # these three could join without touching the harness.
-  "ppc64":   ("mvm/build-ppc64-linux.lisp",   "MODUS_PPC64_LINUX_OUT",   "qemu-ppc64-static"),
-  "ppc32":   ("mvm/build-ppc32-linux.lisp",   "MODUS_PPC32_LINUX_OUT",   "qemu-ppc-static"),
-  "68k":     ("mvm/build-68k-linux.lisp",     "MODUS_68K_LINUX_OUT",     "qemu-m68k-static"),
+  "ppc64":   ("MODUS_PPC64_LINUX_OUT",   "qemu-ppc64-static"),
+  "ppc32":   ("MODUS_PPC32_LINUX_OUT",   "qemu-ppc-static"),
+  "68k":     ("MODUS_68K_LINUX_OUT",     "qemu-m68k-static"),
 }
 
 
@@ -77,7 +78,7 @@ def expected_of(path):
 
 
 def run_cell(arch, rung_path, expect, keep=False):
-    script, out_env, qemu = ARCHES[arch]
+    out_env, qemu = ARCHES[arch]
     with open(rung_path) as f:
         src = f.read()
     tmpdir = tempfile.mkdtemp(prefix="hosted-ladder-")
@@ -87,7 +88,7 @@ def run_cell(arch, rung_path, expect, keep=False):
         f.write(payload(src))
     env = dict(os.environ, **{out_env: binfile})
     b = subprocess.run(["sbcl", "--dynamic-space-size", "4096", "--script",
-                        os.path.join(REPO, script), srcfile],
+                        os.path.join(REPO, "mvm/build-hosted.lisp"), arch, srcfile],
                        cwd=REPO, env=env, capture_output=True, text=True,
                        timeout=1800)
     if not os.path.exists(binfile):

@@ -8,7 +8,7 @@
 ARCH="$1"
 KERNEL="$2"
 EXPR="$3"
-TIMEOUT=${REPL_TIMEOUT:-60}
+TIMEOUT=${REPL_TIMEOUT:-300}   # a CL image takes a minute or more to reach its prompt under TCG
 SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Disable THP for x86 QEMU (avoids 30s hangs from THP compaction)
@@ -54,8 +54,9 @@ timeout "$TIMEOUT" $NO_THP $QEMU $ARGS < "$FIFO" > "$OUT" 2>/dev/null &
 QPID=$!
 exec 3>"$FIFO"  # hold FIFO open so QEMU doesn't get EOF
 
-# Wait for REPL prompt (poll output file)
-for i in $(seq 1 300); do
+# Wait for REPL prompt (poll output file) -- for as long as TIMEOUT allows: a
+# fixed 30 s here outlasted the mini-Lisp images and timed out the CL ones.
+for i in $(seq 1 $((TIMEOUT * 10))); do
     kill -0 $QPID 2>/dev/null || { echo "QEMU died" >&2; exit 1; }
     # Match "> " at start of line (the REPL prompt), not iPXE ">" in middle of line
     if tail -1 "$OUT" 2>/dev/null | grep -q '^> $'; then

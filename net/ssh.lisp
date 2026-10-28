@@ -773,16 +773,17 @@
   ;; Parse client's ephemeral public key at offset 1 (skip msg type)
   (let ((cli-eph (make-array 32)))
     (dotimes (i 32) (aset cli-eph i (aref kex-init-payload (+ 5 i))))
-    ;; Use pre-computed server ephemeral key pair (from state+0x6C4/0x6E4),
-    ;; and mark it spent so SSH-REFRESH-EPHEMERAL replaces it.
+    ;; Use pre-computed server ephemeral key pair (SSH-EPH-BASE: private key,
+    ;; then public key at +0x20), and mark it spent so SSH-REFRESH-EPHEMERAL
+    ;; replaces it.
     (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)
-    (let ((state (e1000-state-base)))
+    (let ((state (ssh-eph-base ssh)))
       (let ((srv-priv (make-array 32)))
         (dotimes (i 32)
-          (aset srv-priv i (mem-ref (+ state (+ #x6C4 i)) :u8)))
+          (aset srv-priv i (mem-ref (+ state i) :u8)))
         (let ((srv-eph (make-array 32)))
           (dotimes (i 32)
-            (aset srv-eph i (mem-ref (+ state (+ #x6E4 i)) :u8)))
+            (aset srv-eph i (mem-ref (+ state (+ #x20 i)) :u8)))
           (let ((shared (x25519 srv-priv cli-eph)))
             ;; USB keep-alive after first scalar mult
             (usb-keepalive)
@@ -1759,6 +1760,11 @@
     (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 0)
     (pre-compute-server-eph (conn-ssh 0))))
 
+;; Where SSH-HANDLE-KEX finds the server's ephemeral X25519 pair for SSH (the
+;; private key, the public key at +0x20): one slot for the server, refreshed
+;; after each key exchange.  net/isolated-cl.lisp gives every session its own.
+(defun ssh-eph-base (ssh) (+ (e1000-state-base) #x6C4))
+
 ;; Pre-compute X25519 server ephemeral key pair.
 ;; Stores private key at state+0x6C4, public key at state+0x6E4.
 (defun pre-compute-server-eph (ssh)
@@ -1917,10 +1923,39 @@
                     (setf (mem-ref flag-addr :u32) 0)))))))))
     (when (eq msg-type 94)
       (ssh-handle-channel-data ssh payload plen))
+    ;; CHANNEL_EOF: the client's stdin ended (`echo EXPR | ssh ...`).  It now
+    ;; waits for the server to close the channel, so answer EOF + CLOSE and end
+    ;; the session -- ignoring it held every piped session open forever.
+    (when (eq msg-type 96)
+      (ssh-send-eof-close ssh)
+      (setf (mem-ref flag-addr :u32) 0))
     (when (eq msg-type 97)
       (setf (mem-ref flag-addr :u32) 0))
     (when (eq msg-type 1)
       (setf (mem-ref flag-addr :u32) 0))))
+
+(defun ssh-send-eof-close (ssh)
+  (let ((cli-chan (mem-ref (+ ssh #x18) :u32)))
+    ;; exit-status 0 first, or the client reports "Exit status -1" (rc 255)
+    (let ((xs (make-array 25)))
+      (aset xs 0 98)
+      (ssh-put-u32 xs 1 cli-chan)
+      (ssh-put-u32 xs 5 11)
+      (aset xs 9 101) (aset xs 10 120) (aset xs 11 105)
+      (aset xs 12 116) (aset xs 13 45) (aset xs 14 115)
+      (aset xs 15 116) (aset xs 16 97) (aset xs 17 116)
+      (aset xs 18 117) (aset xs 19 115)
+      (aset xs 20 0)
+      (ssh-put-u32 xs 21 0)
+      (ssh-send-payload ssh xs 25))
+    (let ((eof-msg (make-array 5)))
+      (aset eof-msg 0 96)
+      (ssh-put-u32 eof-msg 1 cli-chan)
+      (ssh-send-payload ssh eof-msg 5))
+    (let ((close-msg (make-array 5)))
+      (aset close-msg 0 97)
+      (ssh-put-u32 close-msg 1 cli-chan)
+      (ssh-send-payload ssh close-msg 5))))
 
 ;; Message loop — runs until the client disconnects; an authenticated session
 ;; never times out, an unauthenticated one does (see below).

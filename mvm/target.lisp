@@ -753,6 +753,10 @@
 (defun set-target-fixnum-bits-for (target)
   "Derive the numeric width, endianness and MV-slot addresses from TARGET."
   (setf *target-big-endian-p* (eq (target-endianness target) :big))
+  ;; The fpd-* (unboxed double) ops exist in the interpreter and the x86-64 /
+  ;; aarch64 translators only; an image for one of those may use them in its
+  ;; BAKED code too, not just in code it compiles at runtime.
+  (setf *target-has-fpd-p* (and (member (target-name target) '(:x86-64 :aarch64)) t))
   (multiple-value-bind (mvc mvv) (mv-slot-addrs-for target)
     (setf +mv-count-addr+ mvc
           +mv-values-addr+ mvv))

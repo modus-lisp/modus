@@ -197,7 +197,14 @@
                     ;; VAR is always a fixnum: it counts 0..COUNT one step per
                     ;; iteration, so exceeding a fixnum would take 2^62
                     ;; iterations.  N is NOT declared (a bignum count is legal).
-                    (list (list 'declare (list 'type 'fixnum var))))
+                    (if (and (consp count-form) (symbolp (car count-form))
+                             (string= (symbol-name (car count-form)) \"THE\")
+                             (consp (cdr count-form)))
+                        ;; (THE TYPE count) -- the compiler's typed-counter
+                        ;; rewrite says the count's width: N has that type
+                        (list (list 'declare (list 'type 'fixnum var)
+                                    (list 'type (cadr count-form) n)))
+                        (list (list 'declare (list 'type 'fixnum var)))))
                 ;; The body's own leading declarations belong on this LET too
                 ;; (inside the LOOP's PROGN they were silently dropped).
                 (let ((decls nil) (rest body))
@@ -309,12 +316,23 @@
     "(defmacro return (&rest args)
        (list 'return-from nil (if args (car args) nil)))"
 
+    ;; LOOP-FINISH is a macro (CLHS 6.2), so MACRO-FUNCTION must answer for it
+    ;; inside a LOOP body (upstream LOOP-FINISH.ERROR.1).  LOOP itself rewrites
+    ;; every (LOOP-FINISH) in its clauses; this global definition is what any
+    ;; other occurrence reaches, and there is no loop for it to finish.
+    "(defmacro loop-finish ()
+       (list 'error \"LOOP-FINISH used outside a LOOP\"))"
+
     ;; (1+ / 1- are FUNCTIONS -- CL-TYPES defines them and the compiler
     ;; open-codes them; as runtime macros MACRO-FUNCTION answered true for
     ;; two standard functions, upstream MACRO-FUNCTION.5.)
 
     "(defmacro locally (&rest body) (cons 'progn body))"
-    "(defmacro the (type form) form)"
+    ;; THE is NOT a macro here: a (defmacro the (type form) form) used to drop
+    ;; the type before the compiler saw it, so every THE in runtime-compiled
+    ;; code was thrown away -- (the (signed-byte 8) ...) gave no width, and a
+    ;; (the fixnum ...) index stayed overflow-checked.  THE is a special
+    ;; operator (CLHS); the compiler's own THE clause compiles it.
     "(defmacro declare (&rest decls) nil)"
     ;; PROCLAIM is a real function (cl-eval.lisp): it validates the spec
     ;; and records INLINE / NOTINLINE.  A macro here shadowed it with NIL.
@@ -758,7 +776,7 @@
           ;; comment claimed :genera was unusable because it "reexports
           ;; FUTURE-COMMON-LISP, which Modus lacks".  Measured, that is
           ;; wrong: cl-ppcre's (:use :future-common-lisp) is satisfied by
-          ;; making FUTURE-COMMON-LISP a nickname of COMMON-LISP — on Modus
+          ;; a FUTURE-COMMON-LISP that re-exports all of COMMON-LISP — on Modus
           ;; the CL package IS the ANSI package — and cl-ppcre loads
           ;; bit-identically with :genera on.  Task #237.)
           (unless (member :modus *features*)

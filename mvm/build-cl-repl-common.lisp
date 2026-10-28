@@ -32,7 +32,9 @@
 ;;;;   4. run-net-pipeline           cdc-ether-init vs pci-assign-bars +
 ;;;;                                 e1000-probe.  (Everything else in
 ;;;;                                 *NET-DRIVER-SOURCE* is shared.)
-;;;;   5. MODUS_SSH_BUILD            :rpi only (its address map is Pi DRAM).
+;;;;   5. MODUS_SSH_BUILD            :rpi takes the Pi actor/SSH map; :virt (like the
+;;;;                                 PC images) the synchronous server, its SSH
+;;;;                                 state where net/arch-aarch64-cl.lisp puts it.
 ;;;;   6. boot descriptor            boot/boot-rpi-cl.lisp + (build-image
 ;;;;                                 :target :rpi)  vs  boot/boot-aarch64.lisp
 ;;;;                                 + :target :fixpoint + the fixpoint NIL
@@ -104,9 +106,9 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386))
+(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32))
   (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT, ~
-          :X64 or :I386."
+          :X64, :I386 or :ARM32."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
@@ -121,12 +123,40 @@
 ;; :I386 — the bare-metal 32-bit x86 QEMU-pc image (mvm/build-i386-cl-repl.lisp).
 ;; Same thin-head contract as :X64, and the same console: translate-i386's bare
 ;; path already emits COM1 port I/O for the serial traps (#x0300 write, #x0301
-;; read) whenever *I386-LINUX-MODE* is NIL, which is its default.  Networking is
-;; deliberately NOT wired up — DIVERGENCE 3/4/5 have no :I386 arm — so this
-;; image is the REPL and nothing else.
+;; read) whenever *I386-LINUX-MODE* is NIL, which is its default.  Networking
+;; (MODUS_NET_BUILD=1) is the NE2000 ISA card: net/ne2000.lisp + the adapter
+;; net/arch-i386-cl.lisp, run by the QEMU pipeline as on :X64.
 (defvar *cl-repl-i386-p* (eq *cl-repl-platform* :i386))
-(defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p*)
-  "T for the two QEMU machines (virt, pc): E1000 over PCI, user-mode net.")
+;; :ARM32 — the bare-metal ARMv7 QEMU-virt image (mvm/build-arm32-cl-repl.lisp).
+;; Its boot stub (boot/boot-arm32-cl.lisp) maps the HOSTED arm32 address picture
+;; onto virt's RAM with the MMU, and the translator runs bare traps over the
+;; hosted layout (translate-arm32.lisp *ARM32-CL-BARE*).  Console: the PL011.
+(defvar *cl-repl-arm32-p* (eq *cl-repl-platform* :arm32))
+;; The two 32-bit images: 30-bit fixnums, 4-byte object headers.
+(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p*))
+(defvar *cl-repl-pc-p* (or *cl-repl-x64-p* *cl-repl-i386-p*)
+  "T for the PC machines, 64- and 32-bit: no actor scheduler in the net image
+   (the SSH server is ip.lisp's synchronous poll loop) and no USB NIC.")
+;; A :U64 store is ONE 32-bit store on i386, so the net/SSH texts' 8-byte-stride
+;; zero loops would clear half of each block there.  Rewrite them for i386 as
+;; two :U32 stores; every other target's text is untouched.  (QEMU hands over
+;; zeroed RAM, which is why a half-cleared block works there; hardware does not.)
+(defun %replace-all (text old new)
+  (let ((out (make-string-output-stream)) (start 0))
+    (loop for at = (search old text :start2 start)
+          do (write-string text out :start start :end (or at (length text)))
+             (unless at (return))
+             (write-string new out)
+             (setq start (+ at (length old))))
+    (get-output-stream-string out)))
+(defun %pc32-zero-loops (text)
+  (if (not *cl-repl-i386-p*)
+      text
+      (%replace-all text "(setf (mem-ref (+ s (* i 8)) :u64) 0)"
+                    "(progn (setf (mem-ref (+ s (* i 8)) :u32) 0) (setf (mem-ref (+ s (* i 8) 4) :u32) 0))")))
+(defvar *cl-repl-qemu-p* (or *cl-repl-virt-p* *cl-repl-x64-p* *cl-repl-i386-p*)
+  "T for the QEMU machines (virt, pc, and pc on i386): user-mode net, a NIC
+   brought up by E1000-PROBE (the E1000 over PCI, or on i386 the NE2000).")
 
 ;;; MVM infrastructure, loaded HERE rather than only by build-cli-common: the
 ;;; board's USB/PCI net stack is READ into the *CLI-BARE-METAL-NET-SOURCE* slot
@@ -150,6 +180,36 @@
     (modus.mvm::check-parses p)
     (read-file-text p)))
 
+(defvar *pc-console-p*
+  (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))
+    (cond ((and v (string= v "0")) nil)
+          ((and v (plusp (length v))) t)
+          ;; default: the UEFI image (the T420 boots it from USB and needs its
+          ;; screen and keyboard), but not in SEV-SNP mode, whose guest must
+          ;; not touch the PS/2 ports
+          (t (and *cl-repl-uefi-p*
+                  (let ((snp (sb-ext:posix-getenv "MODUS_UEFI_SNP")))
+                    (or (null snp) (string= snp "") (string= snp "0")))))))
+  "Bake net/pc-console.lisp into a bare x86-64 image: VGA text + (UEFI) GOP
+   output, PS/2 keyboard input, beside COM1.  MODUS_PC_CONSOLE=1 / =0
+   overrides the default (on for UEFI unless SEV-SNP).")
+
+(defun %pc-console-text ()
+  "net/pc-console.lisp with the data it reads: boot/boot-uefi-x64.lisp's 8x8
+   font and PS/2 scancode tables, and whether a GOP framebuffer may be used
+   (only a UEFI boot stub fills the #x1B000 words; under multiboot they are
+   whatever RAM held)."
+  (let ((bytes nil))
+    (dolist (qw (symbol-value (find-symbol "*FONT-8X8-QWORDS*" :modus.mvm)))
+      (dotimes (i 8) (push (ldb (byte 8 (* 8 i)) qw) bytes)))
+    (assert (= (length bytes) 760))
+    (format nil "~%(defun pcc-font-bytes () '~S)~%(defun pcc-scan-normal () '~S)~%(defun pcc-scan-shifted () '~S)~%(defun pcc-fb-enabled-p () ~A)~%~A~%"
+            (nreverse bytes)
+            (coerce (symbol-value (find-symbol "*PS2-SCANCODE-NORMAL*" :modus.mvm)) 'list)
+            (coerce (symbol-value (find-symbol "*PS2-SCANCODE-SHIFTED*" :modus.mvm)) 'list)
+            (if *cl-repl-uefi-p* "t" "nil")
+            (%rpi-net-text "pc-console.lisp"))))
+
 (defun %rpi-hcon-font-text ()
   "HCON-FONT-BYTES for net/hdmi-console.lisp: boot/boot-uefi-x64.lisp's 8x8
    font (95 glyphs, one little-endian qword each), as 760 row bytes."
@@ -163,7 +223,11 @@
 ;;; ARCH SLOTS — bare-metal AArch64 (BCM2837 / BCM2710A1)
 ;;; ============================================================
 
-(defvar *cli-arch* (if *cl-repl-x64-p* :x64 :aarch64))
+;; :I386 is its own arch here, not :AARCH64.  It used to inherit :AARCH64, so
+;; (machine-type) answered "aarch64" and %JIT-BOOT-INIT carried aarch64's
+;; layout co-init (*conv-relative*, *a64-x18-base*) into a 32-bit x86 image.
+(defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386)
+                         (*cl-repl-arm32-p* :arm32) (t :aarch64)))
 
 ;;; BARE-METAL SEAM.  No OS: no Linux syscalls, no fds, no argv, no
 ;;; cli-toplevel.  The tarball pipeline is kept (untar -> parse .asd ->
@@ -248,6 +312,8 @@
     ;; :I386 — there is no i386 JIT at all, so this is not a default, it is the
     ;; only option.  Stated as its own arm rather than falling through.
     (*cl-repl-i386-p* nil)
+    ;; :ARM32 — no in-image JIT on 32-bit ARM either (build-cli-common).
+    (*cl-repl-arm32-p* nil)
     ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
     ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
     ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
@@ -385,9 +451,16 @@
     ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
     ;; (AFTER the arena line: its own %BARE-SYNC-ARENA is cacheable RAM, which the
     ;; SMP mutexes' LDAXR/STLXR need -- last-defun-wins).
-    (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
-        (mvm-text "net/bare-threads.lisp")
+    (if (and (or *cl-repl-rpi-p* *cl-repl-virt-p*)
+             (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
+        (concatenate 'string
+          (mvm-text "net/bare-threads.lisp")
+          ;; QEMU virt: EL1 and PSCI CPU_ON instead of EL2 and the spin table.
+          (if *cl-repl-virt-p* (mvm-text "net/bare-threads-virt.lisp") ""))
         "")
+    ;; The PC console (x86-64): after serial-repl, whose console seams it
+    ;; replaces by last-defun-wins.
+    (if (and *cl-repl-x64-p* *pc-console-p*) (%pc-console-text) "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
     ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
@@ -729,7 +802,9 @@
         0)))
 (defun %irun-ns () (%irt-ns))
 "
-        (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))
+        (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* "")
+        ;; GPIO / system timer / activity LED (what the mini-Lisp rpi-periph image had).
+        (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") ""))))
 
 
 
@@ -896,7 +971,7 @@
 ;;; own BSS-equivalent slots need zeroing (the list the retired standalone
 ;;; build-x64-cl-repl.lisp driver zeroed).
 (defvar *cli-arch-kernel-prologue*
- (if *cl-repl-i386-p*
+ (if *cl-repl-32-p*
   *cl-repl-i386-kernel-prologue*
  (if *cl-repl-x64-p*
   *cl-repl-x64-kernel-prologue*
@@ -989,8 +1064,8 @@
 ;;; board cl-fileio.lisp's defvar thunks restore #x1DF00000 / #x1DE00000, which
 ;;; are outside the declared heap.  The rest of the block is the same class:
 ;;; globals whose init thunks either do not run (limitation #7) or run with a
-;;; hosted value, plus %init-clos-protocol, which every other build's kernel-main
-;;; calls and which must land after the thunks that would otherwise reset it.
+;;; hosted value.  (%init-clos-protocol used to be here too; the shared
+;;; kernel-main now calls it, just before this slot.)
 ;;;
 ;;; It also carries the #271 DTB REPORT — one line naming the device-tree
 ;;; pointer the firmware passed, the /chosen/bootargs string read out of it, and
@@ -1009,7 +1084,7 @@
 ;; 0x1B000000: 0x240000 bytes each, at 0x08000000 / 0x08400000 (free RAM between the main
 ;; stack top and the heap; the restore header sits at 0x08FFFF00).
 (defvar cl-user::*rpi-threads-p*
-  (and *cl-repl-rpi-p*
+  (and (or *cl-repl-rpi-p* *cl-repl-virt-p*)
        (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
          (and v (> (length v) 0) (string/= v "0")))))
 (when cl-user::*rpi-threads-p*
@@ -1027,6 +1102,23 @@
 ;; garbage is a HELD lock, and its own allocation lock is at +0x10), and the JIT bump
 ;; word, which the restore reads before anything sets it.  A restore then brings the
 ;; saved arena back (%CORE-EXTRA-*).
+;; :VIRT has no such line (its prologue predates the threads layer): give it the
+;; Pi's zeroing first, after its handler-depth line, so the edit below applies.
+(when (and cl-user::*rpi-threads-p* *cl-repl-virt-p*)
+  (let* ((old "  (setf (mem-ref #x10010000 :u64) 0)")
+         (at (search old *cli-arch-kernel-prologue*)))
+    (unless at (error "SMP: the virt prologue's handler-depth line moved; update build-cl-repl-common"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 (+ at (length old)))
+                       "
+  ;; net/bare-threads.lisp's words outside its tables (see the :rpi prologue).
+  (setf (mem-ref #x10300000 :u32) 0)
+  (%gc-write64 #x10300008 0)
+  (%gc-write64 #x10083F00 0)
+  (%gc-write64 #x10213028 0)
+  (%gc-write64 #x10213030 0)
+  (%gc-write64 #x10005058 0)"
+                       (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
 (when cl-user::*rpi-threads-p*
   (let* ((old "  (%gc-write64 #x10005058 0)")
          (at (search old *cli-arch-kernel-prologue*))
@@ -1053,7 +1145,6 @@
   (setq most-negative-fixnum -4611686018427387904)
   (%init-standard-chars)
   (%init-boole-constants)
-  (%init-clos-protocol)
   (setq *serial-repl-buf* nil)
   (setq *serial-repl-len* 0)
   (setq *serial-repl-cap* 0)
@@ -1070,7 +1161,6 @@
   (setq most-negative-fixnum -4611686018427387904)
   (%init-standard-chars)
   (%init-boole-constants)
-  (%init-clos-protocol)
   (handler-case
       (progn
         (write-string-serial \"DTB ptr=\")
@@ -1088,6 +1178,25 @@
   (setq *serial-repl-len* 0)
   (setq *serial-repl-cap* 0)
 "))
+
+;;; :I386: the shared text above is 64-bit.  Its two scratch buffers
+;;; (#x0FE00000 / #x0FF00000) fall INSIDE the i386 heap (64 MB .. 512 MB), and
+;;; its fixnum limits are 62-bit -- bignums on a 30-bit-fixnum target.  Moved
+;;; below the heap (59 / 60 MB: above the page directory at 58 MB) and set to
+;;; i386's fixnum range.
+(when *cl-repl-32-p*
+  (dolist (pair (append
+                 ;; :ARM32's scratch at #x0FE00000.. is mapped DRAM above its
+                 ;; stack and L1 table; only i386's heap covers those addresses.
+                 (if *cl-repl-i386-p* '(("#x0FE00000" . "#x03B00000")
+                                        ("#x0FF00000" . "#x03C00000")) nil)
+                 '(("4611686018427387903" . "536870911")
+                  ("-4611686018427387904" . "-536870912"))))
+    (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
+      (unless at (error "32-bit: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+      (setq *cli-arch-io-scratch-source*
+            (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
+                         (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
 
 ;;; ============================================================
 ;;; NET BUILD (MODUS_NET_BUILD=1) — #209 rung 2: HTTP over the board's NIC
@@ -1156,14 +1265,28 @@
 (defvar *ssh-build-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_BUILD")))
     (and v (string= v "1"))))
-(when (and *ssh-build-p* *cl-repl-virt-p*)
-  (error "MODUS_SSH_BUILD=1 is :RPI or :X64 — the :VIRT actor/SSH address map ~
-          is not laid out.  See the DIVERGENCE 5 comment in build-cl-repl-common.lisp."))
+
+;; The SYNCHRONOUS server -- no actor scheduler, ip.lisp's poll loop serves each
+;; connection inline, the NIC already up from the pipeline -- on the PC images and
+;; on QEMU virt.  Only the Pi runs the actor/USB shape.
+(defvar *ssh-sync-p* (or *cl-repl-pc-p* *cl-repl-virt-p*))
 
 ;; MODUS_SSH_AUTOSTART=1 (with MODUS_SSH_BUILD=1) — start the SSH server from
 ;; kernel-main right after the net pipeline, instead of waiting for (ssh-boot) at
 ;; the REPL.  The server never returns, so the REPL is not reached.  Used by the
 ;; attested-SSH image: nothing is typed at a console that does not exist.
+;; MODUS_SSH_ISOLATED=1 (with MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1): the
+;; isolated server -- see net/isolated-cl.lisp.  Threads are the substrate, so
+;; it is refused without them rather than built half-working.
+(defvar *ssh-isolated-p*
+  (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_ISOLATED")))
+    (and v (string= v "1"))))
+(when (and *ssh-isolated-p*
+           (not (and *ssh-build-p* (or *cl-repl-rpi-p* *cl-repl-virt-p*)
+                     (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
+                       (and v (plusp (length v)) (string/= v "0"))))))
+  (error "MODUS_SSH_ISOLATED=1 needs MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1 on the ~
+          :RPI or :VIRT platform: its sessions are bare-threads (net/bare-threads.lisp)."))
 (defvar *ssh-autostart-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_AUTOSTART")))
     (and *ssh-build-p* v (string= v "1"))))
@@ -1185,7 +1308,24 @@
   (if *ssh-build-p*
       (concatenate 'string
         (%rpi-net-text "crypto.lisp")        (string #\Newline)
-        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline))
+        (%rpi-net-text "crypto-fast.lisp")   (string #\Newline)
+        ;; :I386 -- crypto-fast's field arithmetic reaches a field element's
+        ;; limbs through a RAW address computed once per call, and on 30-bit
+        ;; fixnums its 26x26-bit limb products are BIGNUMS: an allocation, so a
+        ;; collection can move the arrays under the cached address.  Measured:
+        ;; ed25519-public-key correct in every run with no collection, wrong in
+        ;; exactly the run where %GC-EPOCH moved.  crypto-32-fast.lisp is the
+        ;; cons-free 32-bit field layer (MUL26LO/MUL26HI, intermediates in fixed
+        ;; scratch at FE-SCRATCH-BASE): nothing in a field operation allocates,
+        ;; so nothing moves.  Its limb offset is rewritten from the mini-Lisp's
+        ;; header (+4) to crypto-fast's (+8), so every field function in the
+        ;; image agrees on where limb 0 is (inside the 40-slot array either way).
+        (if *cl-repl-i386-p*
+            (concatenate 'string
+              (%replace-all (%rpi-net-text "crypto-32-fast.lisp")
+                            "(- 0 4)) 1) 4)" "(- 0 4)) 1) 8)")
+              (string #\Newline))
+            ""))
       ""))
 
 ;; Actor/SSH address map for the CL host image's memory layout.  The legacy
@@ -1209,7 +1349,13 @@
     ;; PRNG -- the last SSH secrets that were still in host-readable memory.
     ;; fe-scratch-base keeps its +0x900 relation to it.  ssh-ipc ends at
     ;; 0x0C280000 + 76800*8 = 0x0C316000.
-    (*cl-repl-x64-p*
+    ;; :I386 takes the same map: the same DRAM is free there (above its NE2000
+    ;; buffers at #x04000000, below its heap at #x10100000).
+    ;; :VIRT: none -- net/arch-aarch64-cl.lisp already puts the NIC state, the
+    ;; per-connection block and ssh-ipc in DRAM (PA 0x50260000..0x50396000,
+    ;; identity-mapped by L1[1]), clear of the image, heap and DMA rings.
+    (*cl-repl-virt-p* "")
+    (*cl-repl-pc-p*
      "
 (defun ssh-conn-base ()      #x0C200000)
 (defun ssh-ipc-base ()       #x0C280000)
@@ -1274,7 +1420,7 @@
   (if *ssh-build-p*
       (concatenate 'string
         *ssh-addr-map-source*                     (string #\Newline)
-        (if *cl-repl-x64-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
+        (if *ssh-sync-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
         ;; After ssh.lisp, by last-defun-wins -- :X64: TSC-timed waits and RDRAND for
         ;; SSH-RANDOM; :RPI: the BCM2835/2837 hardware RNG for SSH-RANDOM and
@@ -1386,15 +1532,15 @@
         ;; register listen port 22, crypto pre-compute, actor/mailbox init, then
         ;; the synchronous poll loop.  Called from the REPL; net-actor-main
         ;; blocks, serving inline (net-accept-connection -> ssh-handle-connection).
-        (if *cl-repl-x64-p*
-            ;; :X64 -- the NIC is already up from run-net-pipeline (PCI, E1000,
+        (if *ssh-sync-p*
+            ;; :X64 / :I386 / :VIRT -- the NIC is already up from run-net-pipeline (PCI, E1000,
             ;; DHCP into e1000-state-base +24/+28), so only the SSH state is
             ;; zeroed and seeded (state +0x600..+0x900 is the SSH-side part of
             ;; e1000-state: key-set flag, PRNG, host key; the NIC/DHCP words below
             ;; it stay).  No USB probe, no static address, no actors.
             ;; MODUS_LISP_SPIN_AT=ssh-zeroed|ssh-seeded|ssh-keyed|ssh-signed|
             ;; ssh-netup puts a spin point between the steps (nothing otherwise).
-            (concatenate 'string "(defun ssh-boot ()
+            (%pc32-zero-loops (concatenate 'string "(defun ssh-boot ()
   (let ((s (+ (e1000-state-base) #x600))) (dotimes (i 96) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1406,7 +1552,7 @@
 " (%lisp-spin-form "ssh-signed") "  (pre-compute-server-eph (conn-ssh 0))
   (write-string-serial \"NETUP\") (write-char-serial 10)
 " (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (e1000-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
-  (net-actor-main))")
+  (net-actor-main))"))
         "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1434,7 +1580,16 @@
         ;; :X64 has no USB NIC and no hot-plug: usb-netdev.lisp overrides E1000-RECEIVE,
         ;; E1000-SEND, E1000-RX-BUF and E1000-PROBE with USB-backed versions that probe
         ;; for a USB NIC on every poll (the "ND:0" stream) -- the E1000 never gets polled.
-        (if *cl-repl-x64-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline))
+        (if *ssh-sync-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline)
+        ;; MODUS_SSH_ISOLATED=1: the net domain and each SSH session are
+        ;; separate threads that exchange bytes only by copy (net/isolated-cl.lisp,
+        ;; the CL successor of isolated-net.lisp).  LAST: it replaces the accept,
+        ;; deliver, send, wait and eval seams above by last-defun-wins.
+        (if *ssh-isolated-p* (%rpi-net-text "isolated-cl.lisp") "")  (string #\Newline)
+        ;; :VIRT has no USB host to hot-plug: each poll pass only steps the sessions.
+        (if (and *ssh-isolated-p* *cl-repl-virt-p*)
+            (format nil "~%(defun usb-netdev-hotplug-poll () (%iso-net-step))~%")
+            ""))
       ""))
 
 ;;; DIVERGENCE 3 — the arch adapter + the NIC driver.  Everything downstream of
@@ -1455,6 +1610,12 @@
 (defvar *net-nic-source*
   (if (not *net-build-p*)
       ""
+      (if *cl-repl-i386-p*
+          (concatenate 'string
+            ;; NE2000 ISA (port I/O).  The adapter comes AFTER the driver: it
+            ;; moves the driver's host buffers out of the image (see its header).
+            (%rpi-net-text "ne2000.lisp")          (string #\Newline)
+            (%rpi-net-text "arch-i386-cl.lisp")    (string #\Newline))
       (if *cl-repl-x64-p*
           (concatenate 'string
             (%rpi-net-text "arch-x86-cl.lisp")     (string #\Newline)
@@ -1515,7 +1676,13 @@
             (%rpi-net-text "hdmi-audio.lisp")    (string #\Newline)
             ;; The boot SD card, read only (SDHOST, adopting U-Boot's setup):
             ;; the sector source for a pagetree/cabinet store on a partition.
-            (%rpi-net-text "sdhost.lisp")        (string #\Newline))))))
+            (%rpi-net-text "sdhost.lisp")        (string #\Newline)))))))
+
+;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
+(when (and *cl-repl-x64-p* *pc-console-p*)
+  (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
+  (format t "~&;; CONSOLE: VGA text~A + PS/2 keyboard, beside COM1 (net/pc-console.lisp)~%"
+          (if *cl-repl-uefi-p* " + GOP framebuffer" "")))
 
 ;; The Zero board net build mirrors the serial console to HDMI: every
 ;; WRITE-CHAR-SERIAL compiled into the image calls net/hdmi-console.lisp's
@@ -1543,8 +1710,19 @@
         ;; crypto; here modus is the USB HOST and the RTL8153 queues what
         ;; arrives, so waiting buys nothing -- and the polls it made DROPPED
         ;; any TCP segment they read.  Spliced after the transport so it wins.
-        (if (and *ssh-build-p* *cl-repl-rpi-p*)
+        ;; EVERY CL image, not only the Pi: none of them is a USB gadget, and the
+        ;; stock keepalive is 100 x (IO-DELAY = 5000 console-register reads, plus
+        ;; a NIC poll that drops what it reads) per call -- 8 calls in every X25519
+        ;; ladder.  Under QEMU a register read is a trap: QEMU virt's X25519 took
+        ;; ~27 s with it and ~35 ms is the Pi's without; the PC images' ~50-60 s
+        ;; SSH connections were the same cost.
+        (if *ssh-build-p*
             (format nil "~%(defun usb-keepalive () 0)~%")
+            "")
+        ;; Threaded :VIRT maps VA 0x10200000-0x1FFFFFFF to DRAM, so the E1000's
+        ;; BARs go where the fixpoint map still has PCI identity space.
+        (if (and *cl-repl-virt-p* cl-user::*rpi-threads-p*)
+            (format nil "~%(defun %pci-bar-base () #x30000000)~%")
             "")
         ;; The Pi's TCP fast paths over the RTL8153 (net/r8152-post.lisp):
         ;; overrides of ip.lisp's seams, so spliced after it.
@@ -1566,6 +1744,12 @@
                 (or #+sbcl (let ((v (sb-ext:posix-getenv "MODUS_NET_BUFSZ")))
                              (and v (plusp (length v)) (parse-integer v)))
                     32768))
+        ;; Where a byte vector's byte 0 sits relative to its tagged word: the
+        ;; object tag is 9 and the payload follows a 16-byte header on a 64-bit
+        ;; target (+7) but a 4-byte header on i386 (+4 - 9 = -5).  TCP-RX-COPY's
+        ;; word copy writes there; a literal +7 put every i386 body 12 bytes
+        ;; late (and 12 bytes past the vector's end).
+        (format nil "~%(defun %u8-data-delta () ~D)~%" (if *cl-repl-i386-p* -5 7))
         "
 (defun tcp-rx-copy (dest dest-off)
   (let ((buf (e1000-rx-buf)))
@@ -1582,7 +1766,7 @@
         ;; words; DEST is ordinary memory and takes unaligned stores.
         (let* ((data-base (+ (+ buf 34) tcp-hdr-len))
                (n (max 0 (min data-len (- (length dest) dest-off))))
-               (da (+ (%val->word dest) 7 dest-off))
+               (da (+ (%val->word dest) (%u8-data-delta) dest-off))
                ;; The RTL8153's RX buffer is ordinary cacheable RAM: copy its
                ;; whole 64-byte chunks natively (net/r8152.lisp R8152-NCOPY).
                (i (if (eq (usb-netdev-get) 2) (r8152-ncopy da data-base n) 0)))
@@ -2006,7 +2190,7 @@
 
 (defvar *net-pipeline-defun-source*
   (if *cl-repl-qemu-p*
-      (concatenate 'string ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
+      (%pc32-zero-loops (concatenate 'string ";; QEMU user-mode net: slirp answers a DISCOVER in tens of ms, which is more
 ;; than 2500 of the x86 adapter's io-delays (DHCP:F five times, then the OFFERs
 ;; found queued in the RX ring).  Wait longer per attempt; the count only
 ;; matters when no answer comes.
@@ -2049,7 +2233,7 @@
           ;; run the baked sha1 self-test (evidence the install path works).
 " *net-x64-fetch-block* "
   (write-string-serial \"NET-PIPELINE-DONE\") (write-char-serial 10))
-")
+"))
       (format nil "(defun run-net-pipeline ()
   (write-string-serial \"NET-PIPELINE-START\") (write-char-serial 10)
   ;; 1. DWC2 host controller + USB enumeration + CDC Ethernet.
@@ -2591,13 +2775,54 @@
   ;; bare-metal addresses; (3) eventually the collector, for sustained use
   ;; rather than boot.  `strings' on the image lists every trap it still cannot
   ;; service: #x0310 #x0311 #x0500 #x0502 #x0510 #x0511 #x0512 #x0531.
-  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x04000000)    ;  64 MB
-  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x20000000) ; 512 MB
+  ;; THE HEAP STARTS ABOVE THE RUNTIME'S FIXED BLOCK at #x10000000.. (globals
+  ;; table, symbol table, MV buffer, the static-symbol root #x10000FB0, GC
+  ;; region words): it used to run from 64 MB to 512 MB, straight across it,
+  ;; and boot allocates more than the 192 MB below it -- the bump allocator
+  ;; wrote over those words, and the image died in a %STATIC-SYMBOL-REF /
+  ;; %AREF-INDEX-ERROR recursion that moved with every layout change.
+  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x10100000)    ; 257 MB
+  ;; The heap is two 240 MB semispaces from 257 MB with the collector's two
+  ;; bitmaps after them (boot-i386.lisp I386-CL-GC-LAYOUT); "general base"
+  ;; here is their end, which the layout asserts below hold under the stack.
+  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x2EA00000) ; 746 MB
+  ;; THE COLLECTOR, on bare metal: boot-i386 sets up what boot-linux-i386 does.
+  (setf (symbol-value (intern "*I386-BARE-GC*" "MODUS.MVM.I386")) t)
+  ;; ... and a clock: RDTSC behind traps #x0310/#x0311.
+  (setf (symbol-value (intern "*I386-BARE-CLOCK*" "MODUS.MVM.I386")) t)
   (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x3C000000)    ; 960 MB
+  ;; The handler-case block (jmp_buf + handler stack): its bare default,
+  ;; #x5C0000, is inside this image.  56 MB: above the image, below the heap.
+  (setf (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386")) #x03800000)
+  ;; NIL = #xDEAD0001 (the CL runtime's), with paging so NIL's page is RAM.
+  ;; Needs -m 1024 (stack top 960 MB, NIL frame at 964 MB).
+  (setf (symbol-value (intern "*I386-CL-BOOT*" "MODUS.MVM")) t)
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
   (setf (symbol-value (intern "*I386-LINUX-MODE*" "MODUS.MVM.I386")) nil)
   (setf (symbol-value (intern "*I386-NATIVE-CODE-OFFSET*" "MODUS.MVM.I386")) 0)
+  ;; Function entries 16-byte aligned and OR-3 tagged, as in the hosted i386
+  ;; CLI: the CL runtime's funcall dispatch reads the low nibble.  Without it
+  ;; a function that happened to start at ...1 was taken for a cons --
+  ;; (mapcar (lambda (s) (normalize-name s)) names) returned (NIL NIL) and
+  ;; DEFSTRUCT's keyword constructor died in %INSTALL-SB-SHIMS.
+  (setf (symbol-value (intern "*I386-FN-TAG-3*" "MODUS.MVM.I386")) t)
+  (setf (symbol-value (intern "*I386-FN-ALIGN*" "MODUS.MVM.I386")) 16)
   (format t "~&;; CONSOLE: COM1 via port I/O (i386 QEMU-pc)~%"))
+
+;;; DIVERGENCE 6/7 (:ARM32 arm) — the ARMv7 QEMU-virt boot descriptor and console.
+;;;
+;;; boot/boot-arm32-cl.lisp needs the arm32 translator's emitters and
+;;; boot-linux-arm32.lisp's heap geometry (the collector reads the same
+;;; constants), so both load here rather than in lib/load-mvm.lisp.  The
+;;; console is translate-arm32's bare PL011 arm, at the VA the stub maps it to.
+(when cl-user::*cl-repl-arm32-p*
+  (cl-user::mvm-load "boot/boot-linux-arm32.lisp")
+  (cl-user::mvm-load "boot/boot-arm32-cl.lisp")
+  (funcall (intern "INSTALL-ARMV7-TRANSLATOR" "MODUS.MVM"))
+  (funcall (intern "ARM32-SET-CL-BARE-MODE" "MODUS.MVM"))
+  (setf (symbol-value (intern "*ARM32-UART-OVERRIDE*" "MODUS.MVM"))
+        (symbol-value (intern "+ARM32-CL-UART-VA+" "MODUS.MVM")))
+  (format t "~&;; CONSOLE: PL011 at VA 30000000 -> PA 09000000 (QEMU virt, arm32)~%"))
 
 ;;; DIVERGENCE 6/7 (:X64 arm) — the x86-64 boot descriptor and console.
 ;;; Verbatim from the retired standalone build-x64-cl-repl.lisp: the stack top
@@ -2673,7 +2898,9 @@
 
 (when cl-user::*cl-repl-virt-p*
   (setf modus.mvm::*aarch64-fixpoint-nil-value* #xDEAD0001)
-  (setf modus.mvm::*aarch64-fixpoint-reentry-guard* t))
+  (setf modus.mvm::*aarch64-fixpoint-reentry-guard* t)
+  ;; MODUS_RPI_THREADS=1: DRAM behind the thread layer's VAs (needs -m 1024).
+  (setf modus.mvm::*aarch64-fixpoint-threads* cl-user::*rpi-threads-p*))
 
 ;;; :VIRT JIT EXEC WINDOW — THE HOST SIDE OF IT.  (#282 residual, 2026-08-31.)
 ;;;
@@ -2747,7 +2974,7 @@
 ;; BCM2835 mini-UART base on an x86 image.  The build printed both
 ;; "CONSOLE: COM1 via port I/O" and "CONSOLE: PL011 UART0 0x3F201000", which is
 ;; how it was caught — two consoles for one image is always a fall-through.
-(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p*)
+(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*)
     nil
  (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
@@ -2873,7 +3100,8 @@
 ;; (hosted-layout-env.lisp APPLY-LAYOUT-HOST), with the window delta in TPIDR_EL0.  The
 ;; :A64-THREADS layout key is what runtime source tests with %LAYOUT-IF; every other layout
 ;; lookup keeps its default, as before.  The in-image JIT gets the same flags below.
-(when (and cl-user::*cl-repl-rpi-p* (boundp (quote *rpi-cl-threads*)) *rpi-cl-threads*)
+(when (or (and cl-user::*cl-repl-rpi-p* (boundp (quote *rpi-cl-threads*)) *rpi-cl-threads*)
+          (and cl-user::*cl-repl-virt-p* cl-user::*rpi-threads-p*))
   (setf *a64-tls-window* t *tls-window* t *tls-window-a64* t *a64-tls-tsd-offset* nil)
   (setf *hosted-layout* (list* :a64-threads 1 *hosted-layout*))
   (format t "~%;; RPi CL: per-thread window ON (TPIDR_EL0 delta) -- SMP phase 2~%"))
@@ -3069,6 +3297,7 @@
                                         (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                                         (cl-user::*cl-repl-x64-p* :x86-64)
                                         (cl-user::*cl-repl-i386-p* :i386)
+                                        (cl-user::*cl-repl-arm32-p* :armv7-cl)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
@@ -3076,6 +3305,7 @@
                         (cl-user::*cl-repl-uefi-p* "/tmp/modus-uefi-cl.efi")
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (cl-user::*cl-repl-i386-p* "/tmp/modus-i386-cl-repl.bin")
+                        (cl-user::*cl-repl-arm32-p* "/tmp/modus-arm32-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output
@@ -3118,6 +3348,10 @@
                  (/ image-bytes 1048576.0) (/ image-end 1048576.0)
                  (/ cons-base 1048576.0) (/ general 1048576.0)
                  (/ stack-top 1048576.0))
+         (when (and (< cons-base #x10010000) (> general #x10000000))
+           (error "i386 layout: the heap ~:D..~:D covers the runtime's fixed block ~
+                   at #x10000000..#x1000FFFF (globals, symbol table, static-symbol ~
+                   root); the allocator would write over it." cons-base general))
          (when (< cons-base image-end)
            (error "i386 layout: cons base ~:D is INSIDE the image (1 MB .. ~:D). ~
                    The allocator would write over the running code.  Raise ~
@@ -3125,6 +3359,11 @@
          (when (< general cons-base)
            (error "i386 layout: general heap ~:D is below cons base ~:D."
                   general cons-base))
+         (let ((hb (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386"))))
+           (when (or (< hb image-end) (> (+ hb #x1000) cons-base))
+             (error "i386 layout: the handler-case block ~:D..~:D is not between the ~
+                     image end ~:D and the cons base ~:D.  Move ~
+                     *I386-BARE-HANDLER-BASE*." hb (+ hb #x1000) image-end cons-base)))
          (when (< stack-top image-end)
            (error "i386 layout: stack top ~:D is INSIDE the image (1 MB .. ~:D). ~
                    Pushes would shred native code.  Raise ~
@@ -3133,6 +3372,28 @@
            (error "i386 layout: stack top ~:D is not above the general heap ~:D; ~
                    the stack grows DOWN into it." stack-top general))))
       (cl-user::*cl-repl-x64-p* (%x64-memory-map-asserts image))
+      ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
+      ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
+      ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything
+      ;; lives in the low 256 MB section window (PA #x40000000..).
+      (cl-user::*cl-repl-arm32-p*
+       (let ((gaps (symbol-value (intern "*ARM32-UNIMPL-OPCODES*" "MODUS.MVM"))))
+         (if gaps
+             (format t "~&;; *** arm32 TRANSLATOR GAPS (bare SWI, no handler): ~{#x~X~^ ~} ***~%"
+                     (sort (copy-list gaps) #'<))
+             (format t "~&;; arm32: no unimplemented opcodes or traps.~%")))
+       (let* ((image-end (+ (symbol-value (intern "+ARM32-CL-LOAD-VA+" "MODUS.MVM"))
+                            (length (kernel-image-image-bytes image))))
+              (stack-top (symbol-value (intern "+ARM32-CL-STACK-TOP+" "MODUS.MVM")))
+              (l1 (symbol-value (intern "+ARM32-CL-L1-VA+" "MODUS.MVM"))))
+         (format t "~&;; arm32 map: image VA #x10000 .. #x~X (~,1F MB), stack top #x~X, ~
+                   L1 #x~X, heap #x10000000..~%"
+                 image-end (/ image-end 1048576.0) stack-top l1)
+         (when (> (+ image-end #x1000000) stack-top)
+           (error "arm32 layout: the image ends at #x~X, within 16 MB of the stack ~
+                   top #x~X; the stack would grow into native code." image-end stack-top))
+         (when (< l1 stack-top)
+           (error "arm32 layout: the L1 table #x~X is below the stack top #x~X." l1 stack-top))))
       (cl-user::*cl-repl-virt-p*
         ;; ---- QEMU virt (fixpoint MMU) ----------------------------------
         ;; Image loads at VA 0x80000 and grows UP; the stack grows DOWN from
@@ -3207,6 +3468,8 @@
       (t (%rpi-memory-map-asserts image)))
     (format t "~%Run: ~A~%"
             (cond
+              (cl-user::*cl-repl-arm32-p*
+                (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*
                 (format nil "qemu-system-x86_64 -m 512 -kernel ~A -display none -serial stdio -no-reboot~A"
                         path

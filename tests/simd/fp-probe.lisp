@@ -1,0 +1,190 @@
+;;; fp-probe.lisp — the FP-register ops (fp-op1 / fp-op2 / fp-cmp / fp-toi)
+;;; against the generic arithmetic they replace.
+;;; Run with the JIT on (native arms) and MODUS_NO_JIT=1 (interpreter arms).
+(setq *jit-hot-only* nil)
+(defvar *fails* 0)
+(defun check (name got want)
+  (if (equalp got want) (format t "PASS ~a~%" name)
+      (progn (setq *fails* (+ *fails* 1)) (format t "FAIL ~a~%  got  ~s~%  want ~s~%" name got want))))
+(defvar *vals* '(0.0 -0.0 0.5 -0.5 1.5 -1.5 2.5 -2.5 3.49 -3.51 7.0 1e6 -1e6 123456.7 0.1 -0.1 1e-30 -2.75))
+(defun fv (l) (make-array (length l) :element-type 'single-float :initial-contents l))
+(defun dv (l) (make-array (length l) :element-type 'double-float :initial-contents (mapcar (lambda (x) (float x 1d0)) l)))
+(defvar *a* (fv *vals*))
+(defvar *b* (fv (reverse *vals*)))
+(defvar *ad* (dv *vals*))
+(defvar *bd* (dv (reverse *vals*)))
+(defvar *n* (length *vals*))
+
+;; 1. abs, max, min in single trees (the tree result stored into an f32 array)
+(defun t1 (a b o) (declare (type (simple-array single-float (*)) a b o))
+  (dotimes (i (length a)) (setf (aref o i) (+ (abs (aref a i)) (* 2.0 (max (aref a i) (aref b i))) (* 4.0 (min (aref a i) (aref b i)))))))
+(let ((o (fv (make-list *n* :initial-element 0.0))))
+  (t1 *a* *b* o)
+  (check "1 abs/max/min single" (coerce o 'list)
+         (loop for x in *vals* for y in (reverse *vals*) collect (+ (abs x) (* 2.0 (max x y)) (* 4.0 (min x y))))))
+
+;; 2. single -> double in a double tree, double -> single back
+(defun t2 (a o) (declare (type (simple-array single-float (*)) a o))
+  (dotimes (i (length a))
+    (let ((d (* (coerce (aref a i) 'double-float) 3d0))) (declare (type double-float d))
+      (setf (aref o i) (coerce (+ d 0.1d0) 'single-float)))))
+(let ((o (fv (make-list *n* :initial-element 0.0))))
+  (t2 *a* o)
+  (check "2 coerce s->d->s" (coerce o 'list)
+         (loop for x in *vals* collect (coerce (+ (* (coerce x 'double-float) 3d0) 0.1d0) 'single-float))))
+
+;; 3. comparisons of single trees, including a register-resident accumulator
+(defun t3 (a) (declare (type (simple-array single-float (*)) a))
+  (let ((m 0.0) (lt 0) (le 0)) (declare (type single-float m))
+    (dotimes (i (length a))
+      (let ((x (abs (aref a i)))) (declare (type single-float x)) (when (> x m) (setq m x)))
+      (when (< (aref a i) 0.5) (incf lt))
+      (when (<= (aref a i) 0.5) (incf le)))
+    (list m lt le)))
+(check "3 compare (max-abs, <, <=)" (t3 *a*)
+       (list (reduce #'max (mapcar #'abs *vals*)) (count-if (lambda (x) (< x 0.5)) *vals*) (count-if (lambda (x) (<= x 0.5)) *vals*)))
+
+;; 4. (the <int> (round|truncate|floor|ceiling x)) on single and double trees
+(defun t4 (a ad) (declare (type (simple-array single-float (*)) a) (type (simple-array double-float (*)) ad))
+  (let ((r nil))
+    (dotimes (i (length a))
+      (push (list (the (signed-byte 32) (round (aref a i))) (the (signed-byte 32) (truncate (aref a i)))
+                  (the (signed-byte 32) (floor (aref a i))) (the (signed-byte 32) (ceiling (aref a i)))
+                  (the (signed-byte 32) (round (aref ad i))) (the (signed-byte 32) (floor (* (aref ad i) 2d0))))
+            r))
+    (nreverse r)))
+(check "4 round/truncate/floor/ceiling" (t4 *a* *ad*)
+       (loop for x in *vals* collect (list (round x) (truncate x) (floor x) (ceiling x)
+                                           (round (float x 1d0)) (floor (* (float x 1d0) 2d0)))))
+
+;; 5. abs/max/min in double trees
+(defun t5 (ad bd) (declare (type (simple-array double-float (*)) ad bd))
+  (let ((r nil))
+    (dotimes (i (length ad))
+      (let ((x (aref ad i)) (y (aref bd i))) (declare (type double-float x y))
+        (push (+ (abs x) (* 2d0 (max x y)) (* 4d0 (min x y))) r)))
+    (nreverse r)))
+(check "5 abs/max/min double" (t5 *ad* *bd*)
+       (loop for x in *vals* for y in (reverse *vals*)
+             collect (let ((x (float x 1d0)) (y (float y 1d0))) (+ (abs x) (* 2d0 (max x y)) (* 4d0 (min x y))))))
+
+;; 6. a register-resident DOUBLE accumulator (rmsnorm's sum of squares)
+(defun t6 (a) (declare (type (simple-array single-float (*)) a))
+  (let ((s 0d0)) (declare (type double-float s))
+    (dotimes (i (length a)) (setq s (+ s (coerce (* (aref a i) (aref a i)) 'double-float))))
+    s))
+(check "6 resident double accumulator" (t6 *a*)
+       (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ s (coerce (* x x) 'double-float))))))
+
+;; 7. an undeclared local with a single-float init is resident (inferred);
+;;    one that is reassigned to an integer must not be
+(defun t7 (a) (declare (type (simple-array single-float (*)) a))
+  (let ((m 0.0)) (declare (type single-float m))
+    (dotimes (i (length a)) (let ((x (abs (aref a i)))) (when (> x m) (setq m x))))
+    m))
+(defun t7b (a) (declare (type (simple-array single-float (*)) a))
+  (let ((r nil))
+    (dotimes (i (length a)) (let ((x (aref a i))) (when (< x 0.0) (setq x 7)) (push x r)))
+    (nreverse r)))
+(defun t7c (a) (declare (type (simple-array single-float (*)) a))
+  (let ((r nil))
+    (dotimes (i (length a)) (let ((x (aref a i))) (when (< x 0.0) (incf x 2)) (push x r)))
+    (nreverse r)))
+(check "7 inferred single local" (list (t7 *a*) (t7b *a*) (t7c *a*))
+       (list (reduce #'max (mapcar #'abs *vals*))
+             (mapcar (lambda (x) (if (< x 0.0) 7 x)) *vals*)
+             (mapcar (lambda (x) (if (< x 0.0) (+ x 2) x)) *vals*)))
+
+;; 8. integer -> single in register: rounded quantize, a typed counter, a literal
+(defun t8 (a o) (declare (type (simple-array single-float (*)) a o))
+  (dotimes (i (length a))
+    (setf (aref o i) (+ (float (the (signed-byte 8) (round (* (aref a i) 1e-6 127.0))) 1.0)
+                        (* 0.5 (float i 1.0)) (float 3 1.0)))))
+(let ((o (fv (make-list *n* :initial-element 0.0))))
+  (t8 *a* o)
+  (check "8 int -> single" (coerce o 'list)
+         (loop for x in *vals* for i from 0
+               collect (+ (float (round (* x 1e-6 127.0)) 1.0) (* 0.5 (float i 1.0)) (float 3 1.0)))))
+
+;; 9. DOTIMES over (length v), a typed count, an empty and a negative count
+(defun t9 (a n) (declare (type (simple-array single-float (*)) a) (fixnum n))
+  (let ((c 0) (d 0) (e 0))
+    (dotimes (i (length a)) (setf (aref a i) (aref a i)) (incf c))
+    (dotimes (i n) (incf d))
+    (dotimes (i (the fixnum (- n))) (incf e))
+    (list c d e)))
+(check "9 dotimes counts" (list (t9 *a* 5) (t9 *a* 0) (t9 *a* -3))
+       (list (list *n* 5 0) (list *n* 0 0) (list *n* 0 3)))
+
+;; 10. typed numeric LOOP: BELOW / BY / DOWNTO / ABOVE,
+;;     typed SUM / COUNT (an empty double sum is 0d0), a sum over a float tree
+(defun t10 (a) (declare (type (simple-array single-float (*)) a))
+  (list (loop for i of-type fixnum from 0 below 5 collect i)
+        (loop for i of-type fixnum from 10 downto 3 by 3 collect i)
+        (loop for i of-type (integer 0 100) from 20 above 15 collect i)
+        (loop for i of-type fixnum from 0 below 0 sum i of-type double-float)
+        (loop for i of-type fixnum from 0 below (length a) count (> (aref a i) 0.0) of-type fixnum)
+        (loop for i of-type fixnum from 0 below (length a)
+              sum (coerce (* (aref a i) (aref a i)) 'double-float) of-type double-float)
+        (let ((s 0d0)) (declare (type double-float s))
+          (loop for i fixnum from 0 below (length a) do (setq s (+ s (coerce (aref a i) 'double-float))))
+          s)))
+(check "10 typed LOOP" (t10 *a*)
+       (list '(0 1 2 3 4) '(10 7 4) '(20 19 18 17 16) 0d0
+             (count-if (lambda (x) (> x 0.0)) *vals*)
+             (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ s (coerce (* x x) 'double-float)))))
+             (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ s (coerce x 'double-float)))))))
+
+;; 11. &optional parameters keep the body's declarations (required and optional)
+(defun t11 (a o &optional (k 2.0) (n (length a)))
+  (declare (type (simple-array single-float (*)) a o) (type single-float k) (fixnum n))
+  (dotimes (i n o) (setf (aref o i) (* k (aref a i)))))
+(let ((o1 (fv (make-list *n* :initial-element 0.0))) (o2 (fv (make-list *n* :initial-element 0.0))))
+  (t11 *a* o1) (t11 *a* o2 0.5 3)
+  (check "11 &optional with declarations" (list (coerce o1 'list) (coerce o2 'list))
+         (list (mapcar (lambda (x) (* 2.0 x)) *vals*)
+               (append (mapcar (lambda (x) (* 0.5 x)) (subseq *vals* 0 3)) (make-list (- *n* 3) :initial-element 0.0)))))
+
+;; 12. EXP of a single tree compiles inline (fpd-scale, literal loads): the
+;;     generic EXP's bits, edges included (0, -0, overflow to infinity,
+;;     subnormal and zero results, the clamps)
+(defun gexp (x) (exp x))
+(defun t12 (a o) (declare (type (simple-array single-float (*)) a o))
+  (dotimes (i (length a) o) (setf (aref o i) (exp (* (aref a i) 1.0)))))
+(let* ((xs (list 0.0 -0.0 1.0 -1.0 0.5 10.0 -10.0 88.72283 88.72284 -87.33655 -103.27893
+                 -103.97208 -104.0 99.99 100.0 100.5 -110.0 -110.5 1e-30 3.3 -7.77))
+       (a (fv xs)) (o (fv (make-list (length xs) :initial-element 0.0))))
+  ;; SBCL traps overflow where modus returns infinity: mask it there
+  (flet ((run12 () (t12 a o) (check "12 inline exp = generic exp" (coerce o 'list) (mapcar #'gexp xs))))
+    #+sbcl (sb-int:with-float-traps-masked (:overflow :underflow :inexact) (run12))
+    #-sbcl (run12)))
+
+;; 13. float literals in single and double trees (fp-li / fpd-li)
+(defun t13 (a) (declare (type (simple-array single-float (*)) a))
+  (let ((s 0d0)) (declare (type double-float s))
+    (dotimes (i (length a)) (setq s (+ (* s 0.5d0) (coerce (+ (* (aref a i) -2.5) 1.25e-3) 'double-float) -0d0 1d-300)))
+    s))
+(check "13 float literals" (t13 *a*)
+       (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ (* s 0.5d0) (coerce (+ (* x -2.5) 1.25e-3) 'double-float) -0d0 1d-300)))))
+
+;; 14. (make-array N :element-type 'single-float [:initial-element 0.0]) inline
+(defun t14 ()
+  (let ((v (make-array 7 :element-type 'single-float :initial-element 0.0))
+        (w (make-array 3 :element-type 'single-float)))
+    (setf (aref v 6) 2.5)
+    (list (length v) (coerce v 'list) (length w) (aref w 2) (array-element-type v))))
+(check "14 inline f32 make-array" (t14)
+       (list 7 '(0.0 0.0 0.0 0.0 0.0 0.0 2.5) 3 0.0 'single-float))
+
+;; 15. typed MAXIMIZE / MINIMIZE: a declared accumulator, the first value
+;;     taken by a flag (quantize's amax), with and without INTO
+(defun t15 (a) (declare (type (simple-array single-float (*)) a))
+  (list (loop for i of-type fixnum from 0 below (length a) maximize (abs (aref a i)) of-type single-float)
+        (loop for i of-type fixnum from 0 below (length a) minimize (aref a i) of-type single-float)
+        (loop for x in '(3 1 2) maximize x of-type fixnum)
+        (loop for x in '(1.5d0 -7.5d0) minimize x into m of-type double-float finally (return m))
+        (loop for x in '(-4.0 -9.0) maximize x of-type single-float)))
+(check "15 typed maximize/minimize" (t15 *a*)
+       (list (reduce #'max (mapcar #'abs *vals*)) (reduce #'min *vals*) 3 -7.5d0 -4.0))
+
+(format t "~%FP-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

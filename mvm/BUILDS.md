@@ -1,15 +1,18 @@
 # Modus build scripts — the matrix
 
-28 scripts (was 36; 8 retired into `mvm/build.lisp`'s matrix). They are
-essentially **arch × (hosted | bare) × board**,
-plus a payload axis (repl / ssh / actors / CLI / ANSI-gate / self-host).
+> **2026-10-28:** the mini-Lisp (`repl-source.lisp`) builds below are gone —
+> ported to the CL images or archived (docs/mini-lisp-archive.md).  Rows and
+> notes about them are history.  `scripts/build-matrix.list` is the live list.
+
+Build scripts, essentially **arch × (hosted | bare) × board**,
+plus a payload axis (repl / ssh / CLI / self-host).
 
 ## Building them — one entry point
 
 ```bash
 sbcl --script mvm/build.lisp --list             # the build matrix
-sbcl --script mvm/build.lisp x64/bare/qemu/repl
-sbcl --script mvm/build.lisp build-x64-repl     # legacy name still resolves
+sbcl --script mvm/build.lisp x64/bare/qemu/cl-ssh
+sbcl --script mvm/build.lisp build-x64-cl-repl  # a script name resolves too
 ```
 
 `mvm/build.lisp` is the single build entry point.  The matrix is

@@ -2218,13 +2218,13 @@
 (defun %raw-consp (x) (consp x))   ; image code: CONSP is the raw tag test
 ;;; CL's CONSP for runtime-compiled code: not a hash table, nor a package
 ;;; (987654321 ...), stream (7770001 ...), readtable (7770003 ...) or random
-;;; state (7770005 ...).  Keep in step with %RT-CONSP-EXPANSION (compiler).
+;;; state (7770005 ...) or method (7770007 ...).  Keep in step with %RT-CONSP-EXPANSION (compiler).
 (defun %rt-consp (x)
   (and (consp x) (not (hash-table-p x))
        (let ((a (car x)))
          (not (and (fixnump a)
                    (or (eql a 987654321) (eql a 7770001)
-                       (eql a 7770003) (eql a 7770005)))))))
+                       (eql a 7770003) (eql a 7770005) (eql a 7770007)))))))
 (defun %rt-listp (x) (or (null x) (%rt-consp x)))
 (defun %rt-atom (x) (not (%rt-consp x)))
 

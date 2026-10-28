@@ -2807,8 +2807,14 @@
    Note: x24/x25/x26 are NOT restored (global state).  x27 (CENV) IS
    restored — see prologue docstring."
   (a64-slot-cache-flush)
-  ;; Deallocate spill/frame-slot area
-  (a64-add-imm buf +a64-sp+ +a64-sp+ *a64-locals-bytes*)
+  ;; Deallocate spill/frame-slot area FROM X29, the frame bottom, not from SP:
+  ;; a RETURN-FROM out of a call's argument list (block exit to this
+  ;; epilogue) leaves the call's argument pushes on the stack, and SP-relative
+  ;; it restored the callee-saved registers and LR from the wrong words --
+  ;; (flet ((f () (rem b (return-from f 0)))) (f)) was a MEMORY-FAULT (upstream
+  ;; MISC.68/80/300).  x64's epilogue is MOV RSP, RBP for the same reason.
+  ;; One instruction either way.
+  (a64-add-imm buf +a64-sp+ +a64-x29+ *a64-locals-bytes*)
   ;; Restore callee-saved registers (x19-x23, x27, and x6/x7 = V9/V10)
   ;; x24/x25/x26 are global alloc/limit/nil — do NOT restore
   (a64-emit-local-regs-restore buf)
@@ -2960,6 +2966,7 @@
                                   ( 5 . 80)    ; fstat
                                   ( 8 . 62)    ; lseek
                                   ( 9 . 222)   ; mmap
+                                  (11 . 215)   ; munmap (FREE-STATIC-VECTOR)
                                   (39 . 172)   ; getpid
                                   (41 . 198)   ; socket
                                   (42 . 203)   ; connect
@@ -3967,12 +3974,14 @@
                   (a64-emit buf 0)   ; B.LT placeholder
                   ;; cmp w9, #64  (CALL-ARGUMENTS-LIMIT; was 24 — 33..64 handled
                   ;; by emit-rest-prologue's variable-index :aref loop)
-                  (a64-cmp-imm buf 9 120)   ; 120 = +apply-spread-max+ (was 64)
+                  ;; 121 = +apply-spread-max+ positional + the tail-list word
+                  ;; of a +rest-tail-nargs+ (254) call
+                  (a64-cmp-imm buf 9 121)
                   ;; b.le nocap (skip "mov w9, 120")
                   (let ((ble-idx (a64-current-index buf)))
                     (a64-emit buf 0)   ; B.LE placeholder
-                    ;; movz w9, #120 — w9 = 120 (caps high nargs)
-                    (a64-movz buf 9 120 0)
+                    ;; movz w9, #121 — w9 = 121 (caps high nargs)
+                    (a64-movz buf 9 121 0)
                     ;; nocap:
                     (let ((nocap-idx (a64-current-index buf)))
                       ;; patch ble → nocap
@@ -5723,6 +5732,60 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ==== the FP-register ops a float tree was missing: one instruction each,
+          ;; encodings assembler-checked (as -arch arm64; objdump -d).
+          ;; ---- FP-OP1 Fd, Fs, sub ----  FABS Sd / FABS Dd / FCVT Dd,Sn / FCVT Sd,Dn
+          ((= op +op-fp-op1+)
+           (let* ((fd (fpp (vr 0))) (fs (fpp (vr 1))) (sub (vr 2))
+                  (base (case sub (0 #x1E20C000) (1 #x1E60C000) (2 #x1E22C000) (t #x1E624000))))
+             (a64-emit buf (logior base (ash fs 5) fd))))
+          ;; ---- FP-OP2 Fd, Fa, Fb, sub ----  FMAX/FMIN, S then D
+          ((= op +op-fp-op2+)
+           (let* ((fd (fpp (vr 0))) (fa (fpp (vr 1))) (fb (fpp (vr 2))) (sub (vr 3))
+                  (base (case sub (0 #x1E204800) (1 #x1E205800) (2 #x1E604800) (t #x1E605800))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+          ;; ---- FP-CMP Vd, Fa, Fb, sub ----  FCMP Sa, Sb; CSET x9, MI (lt) / LS (le); tag
+          ((= op +op-fp-cmp+)
+           (let* ((vd (vr 0)) (fa (fpp (vr 1))) (fb (fpp (vr 2))) (sub (vr 3))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-emit buf (logior #x1E202000 (ash fb 16) (ash fa 5)))      ; fcmp Sa, Sb
+             (a64-emit buf (logior #x9A9F07E0 (ash (if (= sub 0) 5 8) 12) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+          ;; ---- FP-TOI Vd, Fs, sub ----  FCVT{NS,ZS,MS,PS} x9, S/D; tag
+          ((= op +op-fp-toi+)
+           (let* ((vd (vr 0)) (fs (fpp (vr 1))) (sub (vr 2))
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (base (aref #(#x9E200000 #x9E380000 #x9E300000 #x9E280000
+                                #x9E600000 #x9E780000 #x9E700000 #x9E680000)
+                              sub)))
+             (a64-emit buf (logior base (ash fs 5) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FPD-LI / FP-LI Fd, hi, lo ----  x9 = hi:lo, FMOV Dd, x9;
+          ;; FP-LI then FCVT Sd, Dd (the double is exactly the single).
+          ((or (= op +op-fpd-li+) (= op +op-fp-li+))
+           (let ((fd (fpp (vr 0)))
+                 (bits (logior (ash (logand (vr 1) #xFFFFFFFF) 32) (logand (vr 2) #xFFFFFFFF))))
+             (a64-load-imm64 buf +a64-x9+ bits)
+             (a64-fmov-d-x buf fd +a64-x9+)
+             (when (= op +op-fp-li+)
+               (a64-emit buf (logior #x1E624000 (ash fd 5) fd)))))          ; fcvt Sd, Dd
+
+          ;; ---- FPD-SCALE Fd, Vk ----  Fd *= 2^k: the double 2^k from its
+          ;; exponent bits (k + 1023) << 52 in D0 (FP scratch), then FMUL.
+          ((= op +op-fpd-scale+)
+           (let* ((fd (fpp (vr 0)))
+                  (pk (ensure-src (vr 1) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pk 1)
+             (a64-add-imm buf +a64-x9+ +a64-x9+ 1023)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 52)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             (a64-emit buf (logior #x1E600800 (ash 0 16) (ash fd 5) fd))))   ; fmul Dd, Dd, D0
+
           ;; ---- FPD-ITOF Fd, Vsrc ----  ASR x9, src, 1 ; SCVTF Dd, x9 (no box)
           ((= op +op-fpd-itof+)
            (let* ((fd (fpp (vr 0)))
@@ -5854,6 +5917,7 @@
                    ((= sub 9) (a64-emit buf (logior #x4E614800 (ash fs 5) fd)))   ; SQXTN2 Vd.8H, Vs.4S
                    ((= sub 10) (a64-emit buf (logior #x0F08A400 (ash fs 5) fd)))  ; SXTL Vd.8H, Vs.8B (s8->s16)
                    ((= sub 11) (a64-emit buf (logior #x4E60B800 (ash fs 5) fd)))  ; ABS Vd.8H, Vs.8H
+                   ((= sub 12) (a64-emit buf (logior #x4E21D800 (ash fs 5) fd)))  ; SCVTF Vd.4S, Vs.4S
                    (t (unless (= fd fs)
                         (a64-emit buf (logior #x4EA01C00 (ash fs 16) (ash fs 5) fd)))))))
           ;; ---- VI-SHIFT Fd, Fs, sub, n ----  immediate shifts (immh:immb in bits 22:16)
@@ -5877,6 +5941,7 @@
                           (20 #x0E402800) (21 #x0E406800) (22 #x0E403800) (23 #x0E407800)
                           (24 #x4E606C00) (25 #x4E606400) (26 #x6E206C00) (27 #x6E206400)
                           (28 #x0E002800) (29 #x0E006800) (30 #x0E802800) (31 #x0E806800)   ; TRN1/TRN2 .8B, TRN1/TRN2 .2S
+                          (32 #x4E809400) (33 #x4EA0BC00)   ; SDOT .4S,.16B,.16B (accumulates into Vd); ADDP .4S
                           (t #x0E407800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
           ;; ---- VI-MOVI Fd, kind, val ----  MOVI Vd.16B / Vd.8H, #val  (abc:defgh split)

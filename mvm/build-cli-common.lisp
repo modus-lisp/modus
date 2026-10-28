@@ -132,7 +132,6 @@
 (unless (find-package "MODUS.MVM")
   (load (merge-pathnames "../lib/load-mvm.lisp"
                          (directory-namestring (truename *load-truename*)))))
-(mvm-load "mvm/repl-source.lisp")
 
 (format t "~%=== Building generic Modus image ===~%")
 
@@ -1495,6 +1494,13 @@
       "  (init-all-globals)
 ")
   (%cli-spin "km-after-globals")
+  ;; The standard GFs with system-supplied methods (PRINT-OBJECT,
+  ;; DESCRIBE-OBJECT, INITIALIZE-INSTANCE, ...): the CL REPL images always ran
+  ;; this, the CLI never did, so none of them was a GENERIC-FUNCTION here
+  ;; (upstream ALL-STANDARD-GENERIC-FUNCTIONS-ARE-INSTANCES-OF-THAT-CLASS).
+  ;; After the defvar thunks, which would reset its registries.
+  "  (%init-clos-protocol)
+"
   ;; ARCH SLOT: file-I/O scratch addresses, spliced HERE — after
   ;; (init-all-globals), deliberately.
   ;;
@@ -1522,7 +1528,9 @@
   (setq array-total-size-limit  (ash 1 24))
   (setq array-dimension-limit   (ash 1 24))
   (setq array-rank-limit        256)
-  (setq call-arguments-limit    120)
+  ;; No fixed bound: past 120 a call passes the list of the rest (APPLY,
+  ;; +REST-TAIL-NARGS+ in compiler.lisp), as SBCL does
+  (setq call-arguments-limit    most-positive-fixnum)
   (setq lambda-parameters-limit 120)
   ;; CHAR-CODE-LIMIT.  Modus characters are a 21-bit code field in the
   ;; character immediate (runtime/tags.lisp), and CODE-CHAR/CHAR-CODE
@@ -1879,9 +1887,11 @@
                      (cons \"ACTORS-YIELD\" (function actors-yield))
                      (cons \"ACTORS-SELF\" (function actors-self))
                      (cons \"ACTORS-LINK\" (function actors-link))))
-      (set-symbol-function (intern (car e) pk) (cdr e))
-      (when (boundp (quote *symbol-function-table*))
-        (puthash (car e) *symbol-function-table* (cdr e))))
+      ;; 0: not linked into this image (the aarch64 CLI has no hosted actors)
+      (unless (eql (cdr e) 0)
+        (set-symbol-function (intern (car e) pk) (cdr e))
+        (when (boundp (quote *symbol-function-table*))
+          (puthash (car e) *symbol-function-table* (cdr e)))))
     t))
 
 ;; Baked functions are not in runtime EVAL's function table (this blob is kept
@@ -1932,6 +1942,15 @@
 (format t "  asdf:    ~D chars (interface source baked for boot-time eval)~%"
         (length *asdf-interface-text*))
 
+(defun %extra-source-text ()
+  "MODUS_EXTRA_SOURCE=FILE: a file compiled INTO the image by the BUILD-TIME
+   compiler (not runtime EVAL), for probing what only baked code does -- e.g.
+   test/limitations.lisp.  Unset: \"\"."
+  (let ((f (sb-ext:posix-getenv "MODUS_EXTRA_SOURCE")))
+    (if (and f (plusp (length f)))
+        (concatenate 'string (string #\Newline) (read-file-text f) (string #\Newline))
+        "")))
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *gc-source*       (string #\Newline)
@@ -1979,6 +1998,7 @@
                        ;; their scanner input — and therefore SFT-AUTO and
                        ;; SYM-NAME-AUTO — is byte-identical.
                        *cli-bare-metal-net-source*
+                       (%extra-source-text)
                        *driver-source*))
 
 ;;; NOTE: *genera-source* is deliberately NOT part of *all-runtime-source*.
@@ -2299,6 +2319,7 @@
     ;; silently dropping ~200 functions from runtime EVAL's reach.
     *asdf-source*
     (string #\Newline)
+    (%extra-source-text)
     *driver-source*
     (string #\Newline)
     ;; WS5 rung 2: baked JIT boot hook + gate (LAST so %jit-enabled-p wins).

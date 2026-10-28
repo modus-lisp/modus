@@ -192,6 +192,35 @@
     (setf (aref code pos) (logand word #xFFFFFFFF))
     (setf (arm32-buffer-position buf) (+ pos 1))))
 
+(defun arm32-emit-alloc-zero-tail (buf)
+  "Zero an allocation's payload, then bump the allocation pointer: with R9 the
+   new object's base and LR its 16-byte-rounded size, store zero at every word
+   in [R9 + 4, R9 + LR), then R9 += LR.  R12 is the cursor and LR becomes the
+   end; R0 supplies the zero and is saved around the loop, so a result already
+   stored to a vreg living in R0 survives.  The payload is at least three
+   words, so the loop runs at least once.
+
+   x64, aarch64 and i386 hand out zeroed arrays, and Lisp code relies on it:
+   the bignum kernel's digit vectors (8ce31cc, `(make-array n)' with no
+   :initial-element because 'the inline allocation is zeroed') and the
+   compact hash-table index (0 = empty slot).  Unzeroed, once a collection had
+   reused memory, every bignum on arm32 read garbage digits and a fresh table
+   index had no empty slot -- the arm32 CLI evaluated nothing from 10-15."
+  (arm32-push buf (ash 1 +arm-r0+))
+  (arm32-mov-imm buf +arm-r0+ 0 0)
+  (arm32-add buf +arm-lr+ +arm-r9+ +arm-lr+)        ; end
+  (arm32-add-imm buf +arm-r12+ +arm-r9+ 0 4)        ; cursor: past the header
+  (let ((top (arm32-current-index buf)))
+    (arm32-str buf +arm-r0+ +arm-r12+ 0)
+    (arm32-add-imm buf +arm-r12+ +arm-r12+ 0 4)
+    (arm32-cmp buf +arm-r12+ +arm-lr+)
+    ;; BCC top: offset in words from this branch's PC+8
+    (let ((off (- top (+ (arm32-current-index buf) 2))))
+      (arm32-emit buf (logior (ash +arm-cc-cc+ 28) (ash #b101 25)
+                              (logand off #xFFFFFF)))))
+  (arm32-mov buf +arm-r9+ +arm-lr+)
+  (arm32-pop buf (ash 1 +arm-r0+)))
+
 (defun arm32-current-index (buf)
   "Current instruction index (word count)."
   (arm32-buffer-position buf))
@@ -998,7 +1027,7 @@
 
 (defconstant +arm32-jmpbuf-words+ 7)
 (defparameter *arm32-hstack-max-depth* 21)
-(defun arm32-hbase ()           (if *arm32-linux-mode* #x10000000 *arm32-globals-base*))
+(defun arm32-hbase ()           (if (arm32-hosted-layout-p) #x10000000 *arm32-globals-base*))
 (defun arm32-jmpbuf-addr ()     (+ (arm32-hbase) #x180))
 (defun arm32-lj-scratch-addr () (+ (arm32-hbase) #x300))
 (defun arm32-hcapped-addr ()    (+ (arm32-hbase) #x360))
@@ -1170,7 +1199,15 @@
            (cond
              ((frame-enter-code-p code)
               ;; Frame-enter: emit function prologue (push regs, allocate frame)
-              (setq *arm32-frame-bytes* (arm32-frame-bytes (frame-enter-slots code)))
+              ;; A frame SIZED to 128 slots is not the unsized one: 512 bytes
+              ;; hold slots 0..119 and the spill words sit at slot 120 -- the
+              ;; word the #x0530 copy now writes (the tail list of a
+              ;; +REST-TAIL-NARGS+ call), and 128 is the floor every function
+              ;; with that copy gets.
+              (setq *arm32-frame-bytes*
+                    (if (>= code +frame-enter-sized+)
+                        (* 64 (ash (+ (* 4 (frame-enter-slots code)) 32 63) -6))
+                        +arm32-frame-size+))
               (arm32-emit-prologue buf)
               ;; Copy overflow args (params 5+) from caller's stack to frame slots.
               ;; After prologue: PUSH 7 regs (28 bytes) + SUB SP 512.
@@ -1217,15 +1254,31 @@
               ;; it).  Addressed from VFP, which is SP-2 as the prologue left it,
               ;; so it stays right even if the body has pushed: argument k is at
               ;; [SP+540+4k] = [r11+542+4k] and slot i at [r11+2+4i] -- the layout
-              ;; the fixed-count copy above uses.  Unrolled to 32 arguments.
-              (let ((done (mvm-make-label)))
+              ;; the fixed-count copy above uses.  A LOOP, capped at 121
+              ;; arguments as on x64: +APPLY-SPREAD-MAX+ positional and the
+              ;; tail-list word of a +REST-TAIL-NARGS+ (254) call.  It was
+              ;; unrolled to 32, so a 33..120-argument &rest call read slots
+              ;; nothing had copied; unrolled to 121 it would be ~2 KB in every
+              ;; &rest function.  r12 counts, lr carries the word, and r0/r1 --
+              ;; V0/V1, still live -- are saved for the two pointers.
+              (let ((done (mvm-make-label)) (top (mvm-make-label)))
                 (arm32-emit-load-abs buf +arm-r12+ (arm32-nargs-addr))
-                (loop for i from 4 below 32
-                      do (arm32-cmp-imm buf +arm-r12+ 0 i)
-                         (arm32-b-cond buf +arm-cc-le+ done)
-                         (arm32-ldr buf +arm-lr+ +arm-r11+
-                                    (+ *arm32-frame-bytes* 30 (* 4 (- i 4))))
-                         (arm32-str buf +arm-lr+ +arm-r11+ (+ 2 (* 4 i))))
+                (arm32-cmp-imm buf +arm-r12+ 0 4)
+                (arm32-b-cond buf +arm-cc-le+ done)
+                (arm32-cmp-imm buf +arm-r12+ 0 121)
+                (arm32-mov-imm-cond buf +arm-cc-gt+ +arm-r12+ 0 121)
+                (arm32-sub-imm buf +arm-r12+ +arm-r12+ 0 4)        ; count = n - 4
+                (arm32-push buf #b11)                              ; {r0, r1}
+                (arm32-load-imm32 buf +arm-r0+ (+ *arm32-frame-bytes* 30))
+                (arm32-add buf +arm-r0+ +arm-r11+ +arm-r0+)         ; src = argument 4
+                (arm32-add-imm buf +arm-r1+ +arm-r11+ 0 18)         ; dst = slot 4
+                (arm32-emit-label buf top)
+                (arm32-ldr-post buf +arm-lr+ +arm-r0+ 4)
+                (arm32-str buf +arm-lr+ +arm-r1+ 0)
+                (arm32-add-imm buf +arm-r1+ +arm-r1+ 0 4)
+                (arm32-dp-imm buf +arm-dp-sub+ +arm-r12+ +arm-r12+ 0 1 :s 1)
+                (arm32-b-cond buf +arm-cc-ne+ top)
+                (arm32-pop buf #b11)
                 (arm32-emit-label buf done)))
              ((and (= code #x0300) *arm32-linux-mode*)
               ;; HOSTED: serial write becomes write(1, &byte, 1).  write(2)
@@ -1345,6 +1398,23 @@
               (arm32-asr-imm buf +arm-r0+ +arm-r0+ 1)
               (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-exit+)
               (arm32-svc buf))
+             ((and (= code #x0310) *arm32-cl-bare*)
+              ;; BARE CLOCK: the generic timer's virtual count, CNTVCT >> 16, as a
+              ;; 30-bit fixnum, TAGGED in r0 (953 Hz on QEMU virt's 62.5 MHz).
+              ;; No division in a trap: #x0311 reports the matching rate.
+              (arm32-push buf (ash 1 +arm-r1+))
+              (arm32-emit buf #xEC510F1E)                    ; MRRC p15,1,r0,r1,c14 (CNTVCT)
+              (arm32-lsr-imm buf +arm-r0+ +arm-r0+ 16)
+              (arm32-dp-reg buf +arm-dp-orr+ +arm-r0+ +arm-r0+ +arm-r1+
+                            :shift-type +arm-shift-lsl+ :shift-amt 16)
+              (arm32-bic-imm buf +arm-r0+ +arm-r0+ 4 #xC0)   ; clear bits 31:30 (#xC0 ror 8)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1)
+              (arm32-pop buf (ash 1 +arm-r1+)))
+             ((and (= code #x0311) *arm32-cl-bare*)
+              ;; ... and its rate: CNTFRQ >> 16, TAGGED.
+              (arm32-emit buf #xEE1E0F10)                    ; MRC p15,0,r0,c14,c0,0 (CNTFRQ)
+              (arm32-lsr-imm buf +arm-r0+ +arm-r0+ 16)
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))
              ((= code #x0300)
               ;; BARE METAL: serial write: V0 (r0) has tagged fixnum char
               ;; ASR r12, r0, #1  (untag)
@@ -1401,7 +1471,10 @@
                                       (ash (ldb (byte 12 4) code) 8)
                                       (ldb (byte 4 0) code))))
              (t
-              ;; Bare metal: SWI, for the machine-mode handler.
+              ;; Bare metal: SWI, for the machine-mode handler.  The CL image
+              ;; has none, so a trap that reaches here is a gap: count it for
+              ;; the build's census (it is otherwise a silent exception).
+              (when *arm32-cl-bare* (pushnew (+ #x10000 code) *arm32-unimpl-opcodes*))
               (arm32-swi buf code)))))
 
         ;;; --- Data Movement ---
@@ -1953,8 +2026,8 @@
            (arm32-lsl-imm buf +arm-lr+ +arm-lr+ 2)     ; * 4
            (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 15)  ; + 15
            (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)  ; & ~15 (align to 16)
-           ;; Bump alloc pointer: R9 += LR
-           (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
+           ;; Zero the payload and bump the alloc pointer: R9 += LR
+           (arm32-emit-alloc-zero-tail buf)))
 
         (#.+op-obj-ref+
          ;; (obj-ref Vd Vobj idx)
@@ -2502,7 +2575,7 @@
            ;; bytes = align16(N + 4)
            (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 19)    ; N + 4 + 15
            (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)
-           (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
+           (arm32-emit-alloc-zero-tail buf)))
 
         (#.+op-alloc-string+
          (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
@@ -3149,7 +3222,7 @@
   (setf *arm32-li-const-patches* nil
         *arm32-unimpl-opcodes* nil)
   (let* ((*arm32-v7* v7)
-         (*arm32-gc-label* (and *arm32-linux-mode* (mvm-make-label)))
+         (*arm32-gc-label* (and (arm32-hosted-layout-p) (mvm-make-label)))
          (buf (make-arm32-buffer))
          (label-map (make-hash-table :test 'eql))
          (bc bytecode)
@@ -3272,6 +3345,25 @@
 (defun arm32-svc (buf)
   "SVC #0 — the EABI syscall instruction (0xEF000000)."
   (arm32-emit buf #xEF000000))
+
+(defparameter *arm32-cl-bare* nil
+  "The bare-metal CL image (mvm/build-arm32-cl-repl.lisp, QEMU virt): BARE traps
+   (PL011 serial, no syscalls) over the HOSTED address conventions -- globals at
+   #x10000A00, the handler-case block at #x10000000, the native collector with
+   boot-linux-arm32's heap geometry -- because its boot stub
+   (boot/boot-arm32-cl.lisp) maps VA #x10000000.. to DRAM and lays the heap out
+   exactly where the hosted stub's mmap puts it.  Set with
+   ARM32-SET-CL-BARE-MODE.")
+
+(defun arm32-hosted-layout-p ()
+  "Hosted address conventions: a Linux image, or the bare CL image."
+  (or *arm32-linux-mode* *arm32-cl-bare*))
+
+(defun arm32-set-cl-bare-mode ()
+  "Bare traps, hosted layout (see *ARM32-CL-BARE*)."
+  (setf *arm32-linux-mode* nil
+        *arm32-cl-bare* t
+        *arm32-globals-base* #x10000A00))
 
 (defun arm32-set-linux-mode (on)
   "Turn hosted mode on or off, moving the convention slots with it.

@@ -3,7 +3,7 @@
 import subprocess, socket, sys, time, os, re
 img = sys.argv[1]; blob = None
 if sys.argv[2].startswith("--blob="): blob = sys.argv[2][7:]; sys.argv.pop(2)
-sock = "/tmp/claude-1001/qtest-%d.sock" % os.getpid()
+sock = os.environ.get("QTEST_SOCKDIR","/tmp/claude-1001")+"/qtest-%d.sock" % os.getpid()
 forms = sys.argv[2:]
 RAW = open(os.environ["QTEST_RAW"], "ab") if os.environ.get("QTEST_RAW") else None   # whole serial transcript
 q = subprocess.Popen(["qemu-system-aarch64", "-M", "raspi3b", "-kernel", img, "-serial", "null",

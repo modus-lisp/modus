@@ -2,6 +2,11 @@
 
 ## Overview
 
+> **Historical.**  The UART bootloader and USB-gadget SSH images this page
+> describes were mini-Lisp images, archived 2026-10-28 (docs/mini-lisp-archive.md,
+> tag `mini-lisp-final`).  The Zero now runs the CL board image
+> (`mvm/build-rpi-cl-repl.lisp`); the gadget port is still to do and needs the board.
+
 Modus runs bare-metal on the Pi Zero 2 W (BCM2710A1, Cortex-A53). The system boots from SD card into a UART bootloader that accepts kernel uploads over serial, eliminating SD card swapping during development. A built-in SSH server over USB CDC-ECM Ethernet provides remote Lisp evaluation.
 
 ```

@@ -608,6 +608,15 @@
       ((= sub 29) (dotimes (k 8) (setf (aref v k) (if (evenp k) (aref a (+ k 1)) (aref b k)))))      ; trn2 .8b
       ((= sub 30) (%vlane-set v 0 4 (%vlane-get a 0 4 nil)) (%vlane-set v 1 4 (%vlane-get b 0 4 nil)))  ; trn1 .2s
       ((= sub 31) (%vlane-set v 0 4 (%vlane-get a 1 4 nil)) (%vlane-set v 1 4 (%vlane-get b 1 4 nil)))  ; trn2 .2s
+      ((= sub 32) (dotimes (k 4)                                                              ; sdot .4s += .16b . .16b
+                    (let ((acc (%vlane-get d k 4 t)))
+                      (dotimes (j 4)
+                        (setq acc (+ acc (* (%vlane-get a (+ (* 4 k) j) 1 t) (%vlane-get b (+ (* 4 k) j) 1 t)))))
+                      (%vlane-set v k 4 acc))))
+      ((= sub 33) (%vlane-set v 0 4 (+ (%vlane-get a 0 4 t) (%vlane-get a 1 4 t)))              ; addp .4s
+                  (%vlane-set v 1 4 (+ (%vlane-get a 2 4 t) (%vlane-get a 3 4 t)))
+                  (%vlane-set v 2 4 (+ (%vlane-get b 0 4 t) (%vlane-get b 1 4 t)))
+                  (%vlane-set v 3 4 (+ (%vlane-get b 2 4 t) (%vlane-get b 3 4 t))))
       (t (dotimes (k 4)                                                                       ; trn1/trn2/zip1/zip2 .4h (low 8 bytes)
            (let ((x (cond ((= sub 20) (if (evenp k) (%vlane-get a k 2 nil) (%vlane-get b (- k 1) 2 nil)))
                           ((= sub 21) (if (evenp k) (%vlane-get a (+ k 1) 2 nil) (%vlane-get b k 2 nil)))
@@ -1296,7 +1305,15 @@
     ;; does (args in V0..V3 via push/pop, :set-nargs) so the callee's
     ;; frame-enter / &rest prologue see them.
     (when initial-args
-      (let ((i 0))
+      (let ((i 0) (tail-call nil))
+        ;; More than 120 (compiler.lisp's +APPLY-SPREAD-MAX+): 120 positional
+        ;; and the list of the rest as the 121st, nargs 254
+        ;; (+REST-TAIL-NARGS+) -- what a native APPLY passes, and what the
+        ;; callee's &rest prologue (and the #x0530 copy, capped at 121) take.
+        (when (nthcdr 120 initial-args)
+          (setq tail-call t)
+          (setq initial-args (append (subseq initial-args 0 120)
+                                     (list (nthcdr 120 initial-args)))))
         (dolist (a initial-args)
           ;; Args 0..3 go in V0..V3 — the MVM calling convention's register
           ;; window (4 = compiler.lisp's +max-reg-args+, hardcoded here for
@@ -1317,7 +1334,7 @@
               (setf (mvm-stack state)
                     (append (mvm-stack state) (list a))))
           (setf i (+ i 1)))
-        (setf (mvm-nargs state) i)))
+        (setf (mvm-nargs state) (if tail-call 254 i))))
     ;; The closure-env register is stored as a VALUE (op-set-cenv stores
     ;; `svref regs vs` directly; op-get-cenv stores it back into the dest
     ;; slot).  Storing the raw WORD here (the old `%val->word` round-trip)
@@ -1498,7 +1515,9 @@
                        ;; traps.  The ≤32 case is handled by the unrolled ladder;
                        ;; 33..64 by emit-rest-prologue's variable-index :aref loop,
                        ;; which reads exactly the frame slots this copy populates.
-                       (top (if (> nargs 120) 120 nargs))
+                       ;; 121: +apply-spread-max+ positional + the tail-list
+                       ;; word of a +rest-tail-nargs+ (254) call
+                       (top (if (> nargs 121) 121 nargs))
                        (s (mvm-stack state))
                        (i 4))
                   (loop
@@ -2504,6 +2523,59 @@
                        (%interp-fpd-cmp (= opcode #.+op-fpd-lt+)
                                         (svref fregs fa) (svref fregs fb)))
                  (setf pc npc3)))))
+          ;; ---- the FP-register ops a float tree was missing (reference arms):
+          ;; an FP slot holds a host single- or double-float.
+          (#.+op-fp-op1+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
+                 (let ((x (svref fregs fs)))
+                   (setf (svref fregs fd)
+                         (cond ((< sub 2) (abs x))                       ; fabs.s / fabs.d
+                               ((= sub 2) (coerce x 'double-float))      ; fcvt d<-s
+                               (t (coerce x 'single-float)))))           ; fcvt s<-d
+                 (setf pc npc3)))))
+          (#.+op-fp-op2+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (%ifetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (%ifetch-byte bc npc3)
+                   (let ((a (svref fregs fa)) (b (svref fregs fb)))
+                     (setf (svref fregs fd) (if (evenp sub)
+                                                (if (> b a) b a)        ; fmax
+                                                (if (< b a) b a))))     ; fmin
+                   (setf pc npc4))))))
+          (#.+op-fp-cmp+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (%ifetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (%ifetch-byte bc npc3)
+                   ;; through the same CALL as fpd-lt (see there)
+                   (setf (svref regs vd)
+                         (%interp-fpd-cmp (= sub 0) (svref fregs fa) (svref fregs fb)))
+                   (setf pc npc4))))))
+          (#.+op-fp-toi+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
+                 (let ((x (svref fregs fs)) (k (logand sub 3)))
+                   (setf (svref regs vd)
+                         (values (cond ((= k 0) (round x)) ((= k 1) (truncate x))
+                                       ((= k 2) (floor x)) (t (ceiling x))))))
+                 (setf pc npc3)))))
+          ((#.+op-fpd-li+ #.+op-fp-li+)
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (hi npc2) (%ifetch-u32 bc npc)
+               (multiple-value-bind (lo npc3) (%ifetch-u32 bc npc2)
+                 (let ((d (%dbl hi lo)))
+                   (setf (svref fregs fd) (if (= opcode +op-fp-li+) (coerce d 'single-float) d)))
+                 (setf pc npc3)))))
+          (#.+op-fpd-scale+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vk npc2) (%ifetch-reg bc npc)
+               ;; times the double 2^k (exact: a power of two in the normal range)
+               (setf (svref fregs fd) (* (svref fregs fd) (scale-float 1d0 (svref regs vk))))
+               (setf pc npc2))))
           (#.+op-fpd-itof+
            (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
@@ -2615,7 +2687,13 @@
              (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
                  (let ((s (svref fregs fs)) (v (%vlane-new)))
-                   (cond ((= sub 0) (dotimes (k 8) (%vlane-set v k 2 (aref s k))))                       ; uxtl 8b->8h
+                   ;; scvtf .4s: the result is an f32x4 register, which the
+                   ;; interpreter holds as 4 single-floats (the v4 arms' form)
+                   (when (= sub 12)
+                     (setq v (make-array 4))
+                     (dotimes (k 4) (setf (svref v k) (coerce (%vlane-get s k 4 t) 'single-float))))
+                   (cond ((= sub 12))
+                         ((= sub 0) (dotimes (k 8) (%vlane-set v k 2 (aref s k))))                       ; uxtl 8b->8h
                          ((= sub 1) (dotimes (k 8) (setf (aref v k) (%vlane-sat (%vlane-get s k 2 t) 0 255)))) ; sqxtun 8h->8b
                          ((= sub 2) (dotimes (k 4) (%vlane-set v k 4 (%vlane-get s k 2 t))))                 ; sxtl 4h->4s
                          ((= sub 3) (dotimes (k 4) (%vlane-set v k 2 (%vlane-get s k 4 t))))                 ; xtn 4s->4h

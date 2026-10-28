@@ -96,7 +96,10 @@
             ;; :ELEMENT-TYPE :DEFAULT opens a character stream
             ;; (STREAM-ELEMENT-TYPE.6)
             (if (and et (not (eq et :default))) et (quote character)))
-          (quote character))
+          (if (and (= (%stream-type s) 2)
+                   (eq (cdr (%stream-data s)) :nil-element))
+              nil
+              (quote character)))
       (quote character)))
 (defun stream-external-format (s) :default)
 (defun interactive-stream-p (s) nil)
@@ -203,7 +206,17 @@
             (%signal-program-error)
             (return)))
         (setq vp (cddr vp)))))
-  (%make-stream 2 (cons nil nil)))
+  ;; :ELEMENT-TYPE NIL is remembered in the (otherwise unused) cdr of the
+  ;; data cell: GET-OUTPUT-STREAM-STRING then returns a (VECTOR NIL)
+  ;; (MAKE-STRING-OUTPUT-STREAM.12).  Every other element type is CHARACTER.
+  (let ((et-nil nil) (vp args))
+    (loop
+      (when (or (null vp) (null (cdr vp))) (return))
+      (when (eq (car vp) :element-type)
+        (setq et-nil (null (cadr vp)))
+        (return))
+      (setq vp (cddr vp)))
+    (%make-stream 2 (cons nil (if et-nil :nil-element nil)))))
 
 (defun get-output-stream-string (stream)
   (let ((data (if (streamp stream) (%stream-data stream) stream)))
@@ -212,7 +225,10 @@
     (let ((chars (car data)))
       (set-car data nil)
       (let ((len (list-length chars)))
-        (if (null chars) (%make-string-array 0)
+        (if (null chars)
+            (if (eq (cdr data) :nil-element)
+                (make-array 0 :element-type nil)
+                (%make-string-array 0))
           (let ((s (%make-string-array len))
                 (cur chars)
                 (i (- len 1)))

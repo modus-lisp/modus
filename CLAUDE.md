@@ -38,46 +38,35 @@ mvm/            MVM compiler, translators, and build scripts
   compiler.lisp        3-phase compiler: Source → IR → MVM bytecode
   interp.lisp          MVM interpreter (bootstrapping)
   cross.lisp           Universal cross-compilation pipeline
-  repl-source.lisp     Embedded REPL source for bare-metal builds
   translate-*.lisp     Native code translators (x64, riscv, aarch64, ppc, i386, 68k, arm32)
   build-*.lisp         Build scripts (see Build Commands below)
 
 net/            Networking, crypto, USB, actor system
-  arch-aarch64.lisp    QEMU virt PCI/E1000 adapter + actor addresses
-  arch-raspi3b.lisp    RPi adapter (DMA addresses, actor addresses)
-  arch-x86.lisp        x86 adapter
+  arch-aarch64-cl.lisp QEMU virt PCI/E1000 adapter (the CL image)
+  arch-rpi-cl.lisp     RPi adapter (DMA addresses, actor addresses)
+  arch-x86-cl.lisp     x64 PC adapter (E1000);  arch-i386-cl.lisp: i386 (NE2000)
   actors.lisp          Cooperative actor system (spawn, yield, send/receive, scheduling)
-  actors-net-overrides.lisp   Actor-aware SSH overrides
-  isolated-net.lisp    Qubes-like isolation (net-domain owns all hardware)
+  isolated-cl.lisp     Qubes-like isolation: the net domain owns the NIC, SSH
+                       sessions are bare-threads (Pi and QEMU virt CL images)
   e1000.lisp           Intel E1000 NIC driver
   dwc2.lisp            DWC2 USB host controller (RPi 3B QEMU)
-  dwc2-device.lisp     DWC2 USB gadget + CDC-ECM (Pi Zero 2 W)
   usb.lisp             USB enumeration + hub support
   cdc-ether.lisp       USB CDC Ethernet
-  hid.lisp             USB HID (keyboard, mouse, tablet)
+  usb-hid-split.lisp   USB keyboard console (the Pi board image)
   ip.lisp              ARP/IP/TCP/UDP/DHCP/DNS
   crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
-  crypto-32.lisp       32-bit safe field/poly multiply (pair arithmetic)
-  crypto-w32.lisp      32-bit SHA-256/512, ChaCha20 (w32 pair arithmetic)
+  crypto-fast.lisp     limb-vector field arithmetic;  crypto-32-fast.lisp: 32-bit
   ssh.lisp             SSH-2 server (key exchange, auth, channels)
   ne2000.lisp          NE2000 ISA NIC driver (i386)
-  http.lisp            HTTP/1.0 server
   http-client.lisp     HTTP client (URL parsing, GET, fetch)
-  32bit-overrides.lisp     30-bit fixnum safety overrides (crypto, SSH)
-  arch-i386.lisp           i386 NE2000 adapter, NIC state, allocation
-  uefi-console.lisp        GOP framebuffer + PS/2 keyboard for UEFI x64
-  uart-bootloader.lisp     UART bootloader for rapid kernel redeploy
-  bcm2835-periph.lisp      BCM2835 GPIO, SPI, I2C, PWM
+  pc-console.lisp      VGA text / GOP framebuffer + PS/2 keyboard (x64 PC images)
+  bcm2835-gpio.lisp    BCM2835 GPIO, system timer, activity LED (every Pi CL image)
 
 scripts/        Deployment and boot scripts
   run.sh               ONE entry point for every QEMU run config (`run.sh list`)
   run-repl-eval.sh     shared helper: boot a REPL image, eval one expr, print
-  boot-pizero2w.sh     Build + boot + network + SSH (USB or SD card)
-  build-pizero2w.sh    Build kernel + SD card image
   fuse-pizero2w.sh     Program USB boot OTP fuse on Pi Zero 2 W
-  make-sdcard-bootloader.sh  Create SD card with UART bootloader
   make-uefi-usb.sh     Create bootable USB image for UEFI hardware
-  run-rpi-periph.sh    Launch RPi peripheral test in QEMU
 
 mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   cl-sequences.lisp    837L  find, search, sort, merge, map, reduce
@@ -558,33 +547,81 @@ Two kinds of build:
   conformance have no runner until the sweep runs there (the aarch64 CLI under
   qemu-user is the next candidate).
 
-### QEMU AArch64 (virt machine, E1000)
+### QEMU AArch64 (virt machine, E1000) — the CL image
 ```bash
-# SSH server (single-threaded)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/ssh
-# Actors (cooperative multi-connection SSH)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/actors
-# Isolated actors (Qubes-like, net-domain owns hardware)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/isolated
-# REPL only (serial)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/repl
+./scripts/run.sh aarch64-cl-repl "(+ 1 2)"     # REPL (build-aarch64.lisp)
+./scripts/run.sh aarch64-ssh "(+ 1 2)"         # SSH from boot (cell aarch64/bare/qemu/cl-ssh)
+# Threads + the isolated server (sessions on cores 1-3):
+MODUS_SSH_ISOLATED=1 MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 \
+  sbcl --dynamic-space-size 12288 --script mvm/build-aarch64.lisp
+qemu-system-aarch64 -machine virt -cpu cortex-a57 -smp 4 -m 1024 -nographic -no-reboot \
+  -kernel /tmp/modus-aarch64-cl-repl.bin \
+  -device 'e1000,netdev=net0,romfile=,rombar=0' -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
+# then at the prompt: (run-net-pipeline) (ssh-boot)
+```
+**There is no second Lisp any more.**  Every bare-metal image runs the CL
+stack; the mini-Lisp (`mvm/repl-source.lisp`) images were ported or archived
+2026-10-28 — docs/mini-lisp-archive.md maps each one to its replacement and
+names the tag (`mini-lisp-final`) that still holds them.
+
+### QEMU RPi 3B / real Pi boards (DWC2 USB host, CDC Ethernet)
+```bash
+./scripts/run.sh rpi-cl-repl "(+ 1 2)"                 # serial REPL (build-rpi-cl-repl.lisp)
+./scripts/run.sh rpi-cl-repl "(progn (led-init) (led-on))"   # GPIO: net/bcm2835-gpio.lisp
+# The board image (U-Boot chainload, USB NIC, HDMI + USB keyboard console, SSH):
+MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1 \
+  sbcl --dynamic-space-size 12288 --script mvm/build-rpi-cl-repl.lisp
 ```
 
-QEMU launch (actors example):
-```bash
-qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-  -kernel /tmp/modus-aarch64-actors.bin -nographic -semihosting \
-  -device 'e1000,netdev=net0,romfile=,rombar=0' \
-  -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
-```
+**ISOLATED SSH ON THE CL IMAGE (`MODUS_SSH_ISOLATED=1`, needs
+`MODUS_RPI_THREADS=1` + an SSH build; `net/isolated-cl.lisp`).**  The CL-image
+port of `isolated-net.lisp`, on bare-threads instead of the cooperative actor
+scheduler: the MAIN thread is the net domain and the only code that touches
+the NIC or TCP; each accepted connection gets a worker thread that runs the
+whole SSH protocol and crypto; bytes cross only by copy over
+`modus:make-channel` (`(:data v)`/`(:close)` to a session, `(:send conn v)`/
+`(:eval conn s)`/`(:close conn)` to the net domain).  Commands are EVALUATED in
+the net domain, because a worker may not intern or `setq` a global.  Test:
+`(ssh-boot)` under `-M raspi3b -device usb-net`, then 4 overlapping sessions
+each get their own answer and all exit 0.  Two server-wide words had to become
+per-session: SSH-PEER-CLOSED-P's flag (ssh-ipc+0x60458 -> ssh+0x3FC8) and
+SSH-MESSAGE-LOOP's "session over" flag (`(conn-ssh 3)`+0x700 -> ssh+0x3FCC) --
+with either one shared, the first client to hang up ended every other session.
+Still shared, by design: the ephemeral key slot and the line-edit buffer.
+`ssh.lisp` now answers CHANNEL_EOF (exit-status 0, EOF, CLOSE): before, every
+`echo EXPR | ssh` session on every image held open until the client timed out.
 
-### QEMU RPi 3B (DWC2 USB host, CDC Ethernet)
-```bash
-sbcl --script mvm/build-rpi-ssh.lisp      # SSH
-sbcl --script mvm/build-rpi-hid.lisp      # USB keyboard REPL
-sbcl --script mvm/build.lisp aarch64/bare/rpi/repl   # Serial REPL
-sbcl --script mvm/build-rpi-periph.lisp   # GPIO/SPI/I2C peripherals
-```
+**AND ON QEMU VIRT (2026-10-28): threads, SSH and the isolated server on the
+E1000.**  `build-aarch64.lisp` takes `MODUS_SSH_BUILD=1` now (the synchronous
+server, as on the PC images: `(run-net-pipeline)` then `(ssh-boot)`), and
+`MODUS_RPI_THREADS=1` (+ `MODUS_SSH_ISOLATED=1`) under `-smp 4 -m 1024`.  Two
+board facts differ from the Pi and live in `net/bare-threads-virt.lisp`: the
+image runs at **EL1** (the Pi's at EL2), so the core stub, register snapshot and
+TLB flush name EL1 registers (`test/rpi-smp/virt-*.s`); and a core starts by
+**PSCI CPU_ON over HVC** at a PHYSICAL address, MMU off.  The boot side is
+`*AARCH64-FIXPOINT-THREADS*`: VA `0x10200000..0x1FFFFFFF` -> DRAM at PA
+`+0x50000000` (not `+0x40000000`, which would alias the E1000's identity-mapped
+DMA at PA `0x502xxxxx`), BARs at `0x30000000`, L2[64] left DRAM for the GC
+bitmaps, the window zeroed with TPIDR_EL0 = 0, and vector entry 4 indexing its
+handler slots by TPIDR_EL0 so a worker's fault longjmps to ITS handler-case.
+Measured: every `test/rpi-smp/slots.lisp` check passes on virt (STW walks 0
+bad under 10 region-0 collections, sibling chains 40/40, sleep 300 ms,
+specials/intern on threads).  Each isolated session makes its OWN ephemeral
+X25519 key on its own core (`SSH-EPH-BASE`, ssh+0x3F80) instead of the net
+domain refreshing one server-wide key after every exchange.  Isolated SSH on
+virt: 4 overlapping sessions + 2 sequential, 18 of 18 answered over 3 runs,
+~77 s a run including boot.
+
+**`USB-KEEPALIVE` WAS 99.9% OF EVERY CL IMAGE'S CRYPTO but the Pi's.**  ssh.lisp's
+stock keepalive (for a USB GADGET whose host would drop the link) is 100 x
+(IO-DELAY = 5000 console-register reads + a NIC poll that DROPS what it reads)
+per call, 8 calls per X25519 ladder; under QEMU each register read is a trap.
+Only the Pi build stubbed it.  virt's X25519 went **27 s -> 32 ms** with the stub
+on every SSH build; the PC images' recorded ~50-60 s connections are probably
+the same cost (not re-measured).  **OPEN: INTERPRETED code on several threads at
+once is ~8x slower each** (an interpreted 3M-add loop: ~190 ms alone, ~1700 ms
+with three, on virt and on the Pi image under raspi3b, ~450 runtime-lock
+acquisitions); native code scales (20 x X25519: ~300 ms alone and with three).
 
 ### Running i386 (hosted Linux/i386 — the REAL CL image)
 
@@ -687,35 +724,134 @@ what kept i386 on its own build lineage — which is why the library ladder and
 alexandria's own test suite had never run on 32 bits at all. Recover from git
 history at `ba693fa`; the replacement gate is the ladder.
 
-### QEMU i386 — LEGACY mini-Lisp (32-bit x86, Multiboot)
-
-The builds below run `mvm/repl-source.lisp`, a separate 708-line toy Lisp with
-its own reader/printer/evaluator — **not** the CL stack above. Retiring this
-second Lisp is its own workstream.
+### QEMU i386 — the bare-metal CL image (2026-10-24)
 
 ```bash
-sbcl --script mvm/build-i386-repl.lisp    # Serial REPL
-sbcl --script mvm/build.lisp i386/bare/qemu/ssh   # SSH (NE2000 ISA NIC)
+sbcl --dynamic-space-size 12288 --script mvm/build-i386-cl-repl.lisp   # -> /tmp/modus-i386-cl-repl.bin
+qemu-system-i386 -kernel /tmp/modus-i386-cl-repl.bin -m 1024 -display none -serial stdio -no-reboot
+MODUS_NET_BUILD=1 ...   # + NE2000: -device ne2k_isa,netdev=n0,iobase=0x300,irq=9 -netdev user,id=n0
 ```
 
-QEMU launch (REPL):
+The real CL stack on bare 32-bit x86, reaching its REPL in about two minutes
+under QEMU.  What it took, each a measured boot death first: NIL = `#xDEAD0001`
+(paging on, a page mapped for NIL's address); the heap above the runtime's
+fixed block at `#x10000000` (it ran across the globals and symbol tables); the
+handler-case block above the image (`*I386-BARE-HANDLER-BASE*`); the native
+Cheney collector on bare metal (`*I386-BARE-GC*`: the boot stub lays out two
+240 MB semispaces, both root bitmaps and region 0's block); RDTSC behind the
+clock traps (`*I386-BARE-CLOCK*`); and **function entries OR-3 tagged and
+16-byte aligned** (`*I386-FN-TAG-3*` / `*I386-FN-ALIGN*`, the boot stub padding
+native byte 0 to a 16-byte boundary).  Without the last, a function whose
+address happened to end in 1 was taken for a CONS by funcall dispatch — measured
+as `(mapcar (lambda (s) (normalize-name s)) names)` => `(NIL NIL)` and a
+TYPE-ERROR in DEFSTRUCT's keyword constructor during `%INSTALL-SB-SHIMS`.
+Every one of these is gated so the legacy images below stay byte-identical.
+
+**The NE2000 (`MODUS_NET_BUILD=1`) is `net/ne2000.lisp` + `net/arch-i386-cl.lisp`,
+spliced AFTER the driver** (it moves the driver's host buffers out of the
+image), run by the same QEMU pipeline as x64.  Measured: DHCP, TCP, a byte-exact
+HTTP fetch (FNV-1a matches the file), untar, load, `(sha1:sha1-hex "abc")`
+correct.  **No `net/32bit-overrides.lisp`**: it truncates 32-bit quantities to
+30 bits for the mini-Lisp; the CL runtime promotes `MEM-REF :U32` reads and
+writes to bignums.  **A byte vector's payload is NOT at word+7 on i386** — a
+4-byte header puts byte 0 at word−5; `tcp-rx-copy`'s literal 7 put every body
+12 bytes late (`%U8-DATA-DELTA` now).  Any `(+ (%val->word v) 7)` is that bug
+on 32 bits.
+
+**SSH (`MODUS_SSH_BUILD=1`, `(ssh-boot)` at the REPL) works: a real OpenSSH
+client gets `= 3` over curve25519 / Ed25519 / ChaCha20-Poly1305, ~60 s a
+connection (x64: ~50 s).  Three 32-bit facts it took:**
+- **crypto-fast's field arithmetic caches RAW limb addresses across
+  ALLOCATION.**  `(+ (ash (logand fe (- 0 4)) 1) 8)` is computed once per call;
+  on 30-bit fixnums the 26x26-bit limb products are bignums, so a collection
+  inside `fe-mul` moves the arrays under the cached address.  Measured:
+  `ed25519-public-key` right in every run with no collection, wrong in exactly
+  the run where `%GC-EPOCH` moved.  The i386 build splices
+  `net/crypto-32-fast.lisp` (cons-free, `MUL26LO`/`MUL26HI`, scratch at
+  `FE-SCRATCH-BASE`) after crypto-fast, its limb offset rewritten to
+  crypto-fast's.  **Any 32-bit CL target running crypto-fast has this bug** —
+  bare arm32 next.
+- **A 32-bit TCP sequence number is a bignum** (>= 2^29), so ip.lisp's
+  `(eq their-seq expected)` was false for most of them: `EQL` now.
+- `*CLI-ARCH*` was `:AARCH64` for this image (machine-type "aarch64", aarch64's
+  layout co-init); `:I386` now.  And a `:U64` store is ONE 32-bit store here,
+  so the net/SSH texts' 8-byte-stride zero loops are rewritten for i386.
+
+**OPEN: a reconnect can fail.**  The first connection after `(ssh-boot)`
+works in every run; a later one sometimes closes right after the client's
+KEXINIT, which run moves (2 failing, 3 failing, or both).  The server never
+sees the client's version-string segment (only pure ACKs reach
+NET-DELIVER-DATA).  Suspect, not finding: between sessions the server spends
+tens of seconds recomputing ephemeral keys while SYN retransmits fill the
+NE2000's 32 KB ring, and `ne2k-receive` has no ring-overflow (OVW) recovery.
+
+Debugging it: `qemu -s -S` + gdb-multiarch with `hbreak` on an address from
+`MODUS_SYMMAP`, walking the EBP chain.  A CONDITIONAL hbreak on a hot function
+costs a gdb round trip per hit (a 10x slower boot); instead write a code cave
+into free RAM from gdb at the kernel entry (`0x100020` — the multiboot ROM
+copies the kernel after reset, so patch there, not at `0xfff0`) and patch the
+function to jump to it.
+
+### QEMU arm32 (virt) — the bare-metal CL image (2026-10-24)
+
 ```bash
-qemu-system-i386 -kernel /tmp/modus-i386.bin -m 256 \
-  -display none -serial stdio -no-reboot
+sbcl --dynamic-space-size 12288 --script mvm/build-arm32-cl-repl.lisp   # -> /tmp/modus-arm32-cl-repl.bin
+qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 \
+    -kernel /tmp/modus-arm32-cl-repl.bin -display none -serial stdio -no-reboot
 ```
 
-QEMU launch (SSH):
+The real CL stack on bare 32-bit ARM, at its REPL after ~7 minutes of TCG
+boot.  Measured: `(+ 1 2)`, `(expt 2 100)`, DEFSTRUCT, `(machine-type)` =>
+"armv7l", a working clock (482 s of wall time read as 482028331 us), and 960 MB
+of churn through 59 collections with a live 2000-element list intact.
+
+**It runs the HOSTED arm32 address picture, built with the MMU.**  QEMU virt
+has RAM only from `#x40000000` (above the 2^29 a tagged MEM-REF address can
+express) and PCIe MMIO across `#x10000000..`, so `boot/boot-arm32-cl.lisp`
+maps 1 MB sections: VA `#x0..#x0FFFFFFF` -> PA `#x40000000` (the image at VA
+`#x10000` is exactly where QEMU loads it), VA `#x10000000..#x2FFFFFFF` -> PA
+`#x50000000` (fixed block, heap, kind map at boot-linux-arm32's addresses), VA
+`#x30000000` -> the PL011, VA `#xDEA00000` -> NIL's page; then turns the MMU on
+and `SUB pc, pc, #0x40000000` into VA space.  The translator's
+`*ARM32-CL-BARE*` mode (`ARM32-SET-CL-BARE-MODE`) is BARE traps over the HOSTED
+layout — globals `#x10000A00`, handler block `#x10000000`, and the native
+collector with the hosted geometry — so nothing in the collector or the runtime
+needed a bare variant.  Bare clock: CNTVCT >> 16 (#x0310) and CNTFRQ >> 16
+(#x0311).
+
+**Gaps, from the build's own census** (`arm32 TRANSLATOR GAPS`): exit, the
+three syscall traps, signal-handler install and the four JIT/mmap traps are
+hosted-only and become an unhandled SWI on bare metal; nothing in boot or the
+REPL reaches them.  **The 32-bit lessons from i386 apply here unchanged before
+networking or SSH is added**: a byte vector's payload is at word−5, crypto-fast
+must be replaced by crypto-32-fast, and TCP sequence numbers are bignums.
+
+### QEMU x64 / i386 PC images (Multiboot) — SSH over E1000 / NE2000
 ```bash
-qemu-system-i386 -m 256 -nographic -no-reboot \
-  -kernel /tmp/modus-i386-ssh.bin \
-  -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
-  -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
+./scripts/run.sh x64-cl-repl "(+ 1 2)"     # build-x64-cl-repl.lisp
+./scripts/run.sh x64-ssh "(* 6 7)"         # cell x64/bare/qemu/cl-ssh (E1000)
+./scripts/run.sh i386-cl-repl "(+ 1 2)"    # build-i386-cl-repl.lisp
+./scripts/run.sh i386-ssh "(* 6 7)"        # cell i386/bare/qemu/cl-ssh (NE2000 ISA)
 ```
+The SSH cells are the CL image built with `MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1
+MODUS_SSH_AUTOSTART=1`: the net pipeline runs, then the synchronous server
+(`*ssh-sync-p*`) serves forever from kernel-main.  x64 draws host-key and
+ephemeral randomness from RDRAND (`-cpu max` in run.sh; without it the boot
+log says `SSH:WEAK-RNG`).
 
 ### UEFI x86-64 (OVMF, for real hardware)
 ```bash
-sbcl --script mvm/build-uefi-repl.lisp   # REPL (serial + framebuffer + PS/2 keyboard)
+sbcl --dynamic-space-size 12288 --script mvm/build-uefi-cl-repl.lisp   # the CL image
 ```
+
+The UEFI CL image carries `net/pc-console.lisp`: the REPL on COM1 **and** on the
+GOP framebuffer, reading the PS/2 keyboard or COM1, whichever has a character
+first (every `write-char-serial` reaches the screen through the compiler's
+write-char-serial hook, as on the Pi's HDMI console).  On by default for UEFI,
+off under SEV-SNP (its guest must not touch the PS/2 ports); `MODUS_PC_CONSOLE=1`
+puts it in the multiboot `build-x64-cl-repl` image too (VGA text mode), which is
+what `scripts/make-grub-usb.sh` boots.  Font and scancode tables are Lisp data
+copied to low RAM at #x1B100.. by `%console-init`, not written by the boot stub.
 
 QEMU launch (requires OVMF + mtools):
 ```bash
@@ -729,16 +865,12 @@ Bootable USB for real hardware (ThinkPad T420 etc.):
 sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M status=progress  # write to USB
 ```
 
-### Pi Zero 2 W (real hardware, DWC2 USB gadget, CDC-ECM)
-```bash
-sbcl --script mvm/build-pizero2w-ssh.lisp      # Single-threaded SSH
-sbcl --script mvm/build-pizero2w-actors.lisp   # Actor-based SSH
-```
-Output: `/tmp/piboot/kernel8.img`
-
-Deploy via rpiboot (USB boot): `sudo rpiboot -d /tmp/piboot`
-Deploy via UART bootloader: `sudo python3 ~/deploy-kernel.py ~/kernel8.img`
-Full workflow: `./scripts/boot-pizero2w.sh`
+### Pi Zero 2 W (real hardware)
+The Zero runs the same board image as above (USB host + a USB NIC, HDMI
+console).  The USB-**gadget** SSH image (`net/dwc2-device.lisp`, CDC-ECM over
+the OTG port) and the UART bootloader were mini-Lisp images and are ARCHIVED,
+not ported — both need the physical board; docs/mini-lisp-archive.md says how
+to bring them back.
 
 ## Tagged Value System
 
@@ -3656,46 +3788,30 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 ## MVM Compiler — Active Limitations
 
-1. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
-2. **Variable-index ASET bug**: When `(aset arr idx val)` with a variable `idx` is a non-last form (`dest=nil`), the value may not load correctly. **Workaround**: `(let ((dummy (aset arr idx val))) body)` forces `dest=frame-slot`.
-3. **Symbol identity — per-package (CLHS 11.1.2) via SYMBOLS_PLAN phase 1 (a1327d6)**: `%intern-symbol-pkg` and `intern` both key the global intern table by a composite of NAME-HASH and PKG-HASH.  Within-package `(eq 'foo 'foo)` holds (covers compile-time literal vs runtime READ vs the CL-symbol-wrapper / native-MVM-sym boundary within a single package).  Cross-package `(eq cl-test::x ds4::x)` returns **NIL** — CL-correct, was previously T under the daa0763 unified model.  See SYMBOLS_PLAN.md.
-4. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
-5. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
-6. **Funcall tag — RESOLVED via OR-3**: Function pointers are explicitly tagged in `mvm-fn-addr` (translate-x64.lisp ~line 2794): `LEA + OR-3`.  Raw fn-code is NOP-padded so the low nibble is 0; OR-3 yields tagged fn pointers with low nibble `0x3` always.  Tags `cons=0x1`, `fn=0x3`, `char=0x5`, `obj=0x9` are mutually disjoint in the low nibble, so the historic "funcall-tag-collision" / "fn-addrs at vaddr ???05" classes are STRUCTURALLY impossible.  When bytecode shifts move function addresses, the OR-3 still produces a clean tag — predicate flips don't happen via tag-nibble accident.  A change that appears to break something via "code movement" has a real semantic cause; bisect to it (see "Layout shift broke an unrelated test" below).
-7. **defvar init-thunks not run**: `(defvar *foo* 42)` declares `*foo*` but does NOT set it to 42 at boot — `init-all-globals` is skipped.
-   **"Present in the image" and "actually invoked" are different questions.** The COMPILER emits `init-all-globals` from whatever source it compiles, so it is in essentially every image — while nothing calls it. i386 hit this in a new place (WS5 layer 5): the symbol map showed `INIT-ALL-GLOBALS` present, yet every defparameter the compiler and `mvm-eval` depend on sat at NIL, so `(eval 42)` SIGSEGV'd with nothing to work with. Calling it is one line with a large blast radius. When a runtime table reads as empty, check whether its initialiser was ever CALLED before concluding it is missing.
+**RE-VERIFIED 2026-10-28** with `test/limitations.lisp`, which runs each one as
+a probe twice: BAKED into an image (`MODUS_EXTRA_SOURCE=test/limitations.lisp`,
+the build-time compiler) and at RUNTIME (`./modus --script`, mvm-eval + JIT).
+Measured on the x64 CLI (both ways) and the bare aarch64 virt CL image (baked).
+Most of the list below had been fixed without the list being updated.
 
-   **CORRECTED 2026-08-12 — "defvars default to NIL" was FALSE; they were UNBOUND.** A `(defvar *x* nil)` used to emit NO init thunk at all (compile-defvar skipped a NIL initform), so `*x*` was neither 42 nor NIL — reading it signalled `UNBOUND-VARIABLE`. That hit 167 defvars, `CL:*MODULES*` among them, which broke `PROVIDE`/`REQUIRE` and the trivial-indent ladder rung. Fixed at f8ec62b: a NIL initform now emits a thunk, guarded by the CLHS rule that DEFVAR assigns only if not already bound. That guard is load-bearing — boot steps that run BEFORE `(init-all-globals)` store into globals that also have a `(defvar *x* nil)` elsewhere (e.g. `(setq *macro-table* (make-hash-table))` at build-cli-common.lisp:882 — moved there from build-generic-cli:740 when the two CLI lineages were merged at f98bdef), and an unguarded store re-NILs them and breaks the reader. DEFPARAMETER is unchanged: CLHS makes it assign unconditionally, so a NIL-initform defparameter STILL emits no build-time thunk.
+| # | limitation | now |
+|---|---|---|
+| 1 | last-defun-wins | **STILL TRUE INSIDE AN IMAGE**: two DEFUNs of one name in baked source both resolve to the last, and a `#'NAME` taken between them is the last one too (the image is linked statically).  At RUNTIME it is CL: an old function object keeps its old code, as in SBCL. |
+| 2 | variable-index ASET as a non-last form | fixed (both ways) |
+| 3 | symbol identity per package | CL-correct, not a limitation |
+| 4 | YIELD at every loop back-edge | a description, not a defect (SEV+WFE on aarch64 bare metal; `MODUS_YIELD_NOP=1` for NOP) |
+| 5 | conses corrupted across actor context switches | mini-Lisp actor images only; not re-tested (no CL image runs `net/actors.lisp` on bare metal) |
+| 6 | funcall tag collision | resolved (OR-3) |
+| 7 | defvar initforms not run at boot | fixed in every CL image: `(defvar *x* 42)` is 42, a NIL initform binds NIL |
+| 8 | constant small `ash` of a bignum | fixed: `(ash (ash 1 200) -1)` and `-200` correct |
+| 8a | `(ash most-positive-fixnum 1)` wrapping | fixed: promotes to the bignum |
+| 8b | variable-count `bignum-ash` | fixed |
+| 8c | negative overflow in checked `*` / `+` | fixed: `(* most-negative-fixnum 2)` = -2^63 |
 
-   Initialize required values explicitly via setq in an init function (e.g. `*pkg-tag*`, `*sym-tag*` set in `%init-packages`). Predicates that compare against an uninitialized tag with `(eql (car x) *tag*)` will return T for *any* cons-with-NIL-car — see `%pkg-p` history.
-8. **`compile-ash` inlines `:shl`/`:sar` for small constant counts (≤30) WITHOUT a fixnum tag check — corrupts a BIGNUM value.** `(ash bignum-val small-const-count)` shifts the raw tagged word, which is right for a fixnum (low bit 0) but mangles a bignum pointer (tag 0x9): `(ash (ash 1 200) -1)` :sar's the heap address to garbage, `(ash 2^200 -200)` returns a bogus fixnum. Variable-count and large-constant-count ash already route to runtime `bignum-ash` (correct). The bignum-ash runtime fix (9463e26) makes `(ash 1 N)` produce a CORRECT big bignum, which then SURFACES this latent compiler bug in any code that shifts those bignums by a small constant — `%print-integer-in-base`-adjacent format-runtime paths (format-d/o/x/b chunk-crashes), `gcd.5`/`logcount.7-8` (`(ash 1 200/300)` bounds → big-bignum operands → `(ash x -1)`). **FIX IS A COMPILER CHANGE but every attempt so far BROKE the harness's SIGSEGV-handler longjmp recovery** (a previously-recoverable pre-existing crash in nunion/modules went fatal; the 4x code-size blowup of the source-expansion `(if (fixnump g) (%ash-fixnum-raw g k) (bignum-ash g k))` is the suspected trigger — possibly fn-table/branch-displacement). The individual ash results were CORRECT (probes 9920-9925 passed); only harness recovery regressed. A recovery-safe fix is the open follow-up. Workaround for now: route through `bignum-ash` explicitly when a value may be a bignum.
-
-   **Related open bignum bugs surfaced by the WS5 self-host (2026-07); ALL THREE
-   still need a root fix — they were WORKED AROUND, not fixed. See
-   [[reference_bignum_bug_cluster]] for repro cases.**
-   - **8a. `compile-ash` LEFT-shift overflow (the twin of #8).** `(ash <fixnum>
-     small-const)` inlines a raw `:shl` with NO overflow promotion, so
-     `(ash 4611686018427387903 1)` → **−2** (wraps) instead of the bignum
-     9223372036854775806. Broke compile-integer's own 2^62-1 boundary constant in
-     the self-compiled product. WS5 workaround: `emit-li-tagged` emits `:li value;
-     :shl` (untagged fixnum + runtime raw shift) for the tagged word — but any
-     USER `(ash big-fixnum small-const)` still silently wraps.
-   - **8b. `bignum-ash` with a VARIABLE count corrupts the count.** A runtime
-     `bignum-ash(n, count)` on the left-shift limb path passed a CLOBBERED count
-     to `%shl-limbs-mag` (gdb: count became a stack address) → SIGSEGV / runaway
-     bignum. Smells like the MVM caller-save hazard [[reference_mvm_caller_save_bug]]
-     on `count` across `%any-to-limbs`. WS5 workaround: `emit-rest-prologue` uses
-     literal shift counts `(ash X 1)` so it inlines `:shl` instead of calling
-     `bignum-ash`. Any code calling `bignum-ash` with a runtime count is exposed.
-   - **8c. `:mul-checked` / `:add-checked` overflow promotion fails for NEGATIVE
-     operands.** `(* -4611686018427387904 2)` and
-     `(+ -4611686018427387904 -4611686018427387904)` both return small positive
-     GARBAGE instead of −2^63 (positive overflow promotes fine). A real arithmetic
-     correctness bug. CAVEAT: observed only via the self-host binary's mvm-eval so
-     far — confirm it reproduces in the ANSI / build-generic path before treating
-     it as definitively core (this session mis-attributed several bugs; verify
-     first).
-
+Not in the old list and still worth knowing: an undeclared free variable is
+treated as a global (CL would make it special and warn; the same answer, but the
+boot-time `WARN: implicit global` lines are that), and `(eq #'f #'f)` is NIL at
+runtime (SBCL: T; CLHS does not require it).
 
 **Frame size is per function (2026-10-07).**  FRAME-ENTER is TRAP
 `#x8000 | units<<8 | nparams`: the function's highest addressed frame slot + 1
@@ -3707,6 +3823,26 @@ slots**: frame slots are the imm8 operand of OBJ-REF/OBJ-SET on VFP, and
 `%IR-FRAME-ENTER-CODES` errors past it (`*let-binding-limit*` is 248).  The
 old fixed frames were smaller than the 120-binding guard suggested on two
 ports: i386's 296 bytes held 57 slots, aarch64's 1024 held 121.
+
+**CALL-ARGUMENTS-LIMIT is MOST-POSITIVE-FIXNUM (2026-10-24).**  A call passes
+at most 120 arguments positionally (`+APPLY-SPREAD-MAX+`); past that it passes
+120 and then ONE more word, the LIST of the rest, with nargs **254**
+(`+REST-TAIL-NARGS+`; 255 is the pre-packed sentinel).  The `&rest` prologue
+seeds its list with that tail (slot 120); a function with no `&rest` fails its
+arity check ("more than 120"), which is right since LAMBDA-PARAMETERS-LIMIT is
+120.  COMPILE-CALL / COMPILE-FUNCALL route a call with more than 120 argument
+forms through APPLY (emitted directly, the copy stopped at 121 words and the
+rest list read garbage -- inside a compiled function, silently).  The `#x0530`
+copy is capped at **121** on every back end, and it was 32 on i386, riscv,
+ppc, 68k and arm32 -- a 33..120-argument `&rest` call there built its list
+from uncopied slots.  Two frames were too small for 121 slots: i386 and arm32
+gave a frame SIZED to 128 the UNSIZED form's bytes (296 / 512), and 128 is the
+floor of every `#x0530` function -- on i386 every `&rest` call of ~31+
+arguments was wrong.  **Runtime-compiler paths must spell these as literals**
+(`120`, `254`): a DEFCONSTANT has no value in the image's own compiler, and
+`+APPLY-SPREAD-MAX+` there read NIL and killed boot.  Tests:
+`test/call-arguments-limit.lisp` (`CALL_LIMIT_REPS=2` on i386),
+`test/arch-rungs/r35-rest-hundred.lisp`.
 
 ## Known Bugs
 
@@ -3832,7 +3968,7 @@ Per-platform adapters provide: `e1000-send`, `e1000-receive`, `e1000-state-base`
 Source load order matters — later files override earlier defuns:
 ```
 arch-* → [actors] → NIC driver → ip → crypto → ssh → http → http-client →
-[actors-net-overrides] → [isolated-net]
+[actors-net-overrides] → [isolated-cl]
 ```
 
 ## Testing

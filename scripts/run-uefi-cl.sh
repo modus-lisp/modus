@@ -1,5 +1,5 @@
 #!/bin/bash
-# run-uefi-cl.sh — boot a Modus PE32+ image (build-uefi-repl or build-uefi-cl-repl)
+# run-uefi-cl.sh — boot a Modus PE32+ image (build-uefi-cl-repl)
 # under OVMF and either evaluate expressions or attach interactively.
 #
 #   scripts/run-uefi-cl.sh IMAGE.efi                 interactive (Ctrl-A X quits)

@@ -345,6 +345,14 @@
 ;;; halves), built with %MAKE-TYPED-FLOAT rather than read as literals.
 (defun %dbl (hi lo) (%make-typed-float hi lo 'double-float))
 
+;; 2^k for k in [-1022, 1023], the exact doubles %EXP-F scales by.
+(defvar *exp2-table* nil)
+(defun %exp2-table ()
+  (or *exp2-table*
+      (setq *exp2-table*
+            (let ((v (make-array 2046)))
+              (dotimes (i 2046 v) (setf (svref v i) (%dbl (ash (+ (- i 1022) 1023) 20) 0)))))))
+
 (defun %exp-f (x)
   "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
    exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
@@ -358,28 +366,40 @@
        (if (and (= (logand hi #x000FFFFF) 0) (= (%float-lo32 x) 0))
            (if (= (logand hi #x80000000) 0) x (%fl 0))       ; exp(+inf)=inf, exp(-inf)=0
            x))                                                ; NaN
-      ((%float-lt-p (%dbl #x40862E42 #xFEFA39EF) x)            ; > 709.78...: overflow
+      ((let ((xd x)) (declare (type double-float xd))
+         (< 709.782712893384d0 xd))                             ; > #x40862E42FEFA39EF: overflow
        (%dbl #x7FF00000 0))
-      ((%float-lt-p x (%dbl #xC0874910 #xD52D3051))            ; < -745.13...: underflow
+      ((let ((xd x)) (declare (type double-float xd))
+         (< xd -745.1332191019411d0))                           ; < #xC0874910D52D3051: underflow
        (%fl 0))
       (t
-       (let* ((tq (%float-mul x (%dbl #x3FF71547 #x652B82FE)))   ; x / ln2
-              (k (%float-to-int (if (%float-lt-p tq (%fl 0))
-                                    (%float-sub tq (%dbl #x3FE00000 0))
-                                    (%float-add tq (%dbl #x3FE00000 0)))))
-              (fk (%fl k))
-              (r (%float-sub (%float-sub x (%float-mul fk (%dbl #x3FE62E42 #xFEE00000)))
-                             (%float-mul fk (%dbl #x3DEA39EF #x35793C76))))
-              (acc (%fl 1))
-              (n 13))
-         ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
-         (loop
-           (when (< n 1) (return nil))
-           (setq acc (%float-add (%fl 1) (%float-div (%float-mul r acc) (%fl n))))
-           (setq n (- n 1)))
-         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends
+       ;; The arithmetic is unboxed double trees (declared DOUBLE-FLOAT locals and
+       ;; literal constants), not %FLOAT-* calls: it was ~40 boxed operations an
+       ;; EXP, 0.8 us, and illatio's SwiGLU calls EXP 117k times a token.  The
+       ;; operations and their order are the old ones, so the bits are too: the
+       ;; series below is the old loop acc = 1 + (r*acc)/n, n = 13..1, unrolled,
+       ;; each step written deep-operand-first so the tree fits the FP pool
+       ;; (IEEE + and * are exactly commutative; r*1 = r and x/1 = x exactly).
+       ;; The literals are the old bit patterns: 1/ln2 #x3FF71547652B82FE,
+       ;; ln2_hi #x3FE62E42FEE00000, ln2_lo #x3DEA39EF35793C76.
+       (let* ((xd x)
+              (tq (* xd 1.4426950408889634d0))                   ; x / ln2
+              ;; k = truncate(tq +- 0.5): round half away from zero, as before
+              (k (if (< tq 0d0)
+                     (the (signed-byte 32) (truncate (- tq 0.5d0)))
+                     (the (signed-byte 32) (truncate (+ tq 0.5d0)))))
+              (r (- (- xd (* (float k 1d0) 0.6931471803691238d0))
+                    (* (float k 1d0) 1.9082149292705877d-10)))
+              ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
+              (acc (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ r 13d0) 1d0) r) 12d0) 1d0) r) 11d0) 1d0) r) 10d0) 1d0) r) 9d0) 1d0) r) 8d0) 1d0) r) 7d0) 1d0) r) 6d0) 1d0) r) 5d0) 1d0) r) 4d0) 1d0) r) 3d0) 1d0) r) 2d0) 1d0) r) 1d0) 1d0)))
+         (declare (type double-float xd tq r acc) (type (signed-byte 32) k))
+         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends.
+         ;; The normal-range 2^k are the same doubles as before, read from a table
+         ;; instead of built from their bits on every call.
          (cond ((and (>= k -1022) (<= k 1023))
-                (%float-mul acc (%dbl (ash (+ k 1023) 20) 0)))
+                (let ((p (svref (%exp2-table) (+ k 1022))))
+                  (declare (type double-float p))
+                  (* acc p)))
                ((> k 1023)
                 (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
                             (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
@@ -641,7 +661,9 @@
   (and (stringp x) (not (consp x))
        ;; a wide (#x31) or narrow (#x13) string object -- the representation is
        ;; storage only; to the type system both are (SIMPLE-ARRAY CHARACTER (n))
-       (or (= (obj-subtag x) #x31) (= (obj-subtag x) #x13) (= (obj-subtag x) #x15))))
+       (or (= (obj-subtag x) #x31) (= (obj-subtag x) #x13) (= (obj-subtag x) #x15)
+           ;; or a simple (VECTOR NIL)
+           (%simple-nil-vector-p x))))
 ;;; ============================================================
 ;;; SUBTYPEP — basic ANSI lattice support.
 ;;;
@@ -4147,7 +4169,7 @@
 
 (defvar most-negative-fixnum +fixnum-neg-limit+)
 
-(defvar call-arguments-limit 120)
+(defvar call-arguments-limit +fixnum-max+)   ; see APPLY (cl-printer.lisp)
 
 (defvar lambda-parameters-limit 120)
 
@@ -4911,7 +4933,10 @@
 (defvar *random-state* (list 7770005 12345))
 
 (defun random-state-p (x)
-  (and (consp x) (or (eql (car x) 7770005) (eq (car x) 'random-state))))
+  ;; (7770005 seed).  The old (RANDOM-STATE seed) shape is NOT accepted: it is
+  ;; also an ordinary list whose car is a CL symbol, so any such list read
+  ;; back from text was a random state (PRINT.BACKQUOTE.RANDOM.14).
+  (and (consp x) (eql (car x) 7770005)))
 
 (defun make-random-state (&optional state)
   "CLHS: NIL copies the CURRENT state, T makes a fresh randomly seeded one,
@@ -5445,6 +5470,10 @@
     ;; LENGTH (the fill pointer), so a dimension would not round-trip.  Not simple
     ;; either way: claiming SIMPLE-BASE-STRING made (coerce x (type-of x)) copy
     ;; a fill-pointer string (COERCE.1).
+    ((%nil-vector-p obj)
+     (if (%simple-nil-vector-p obj)
+         (list 'simple-array nil (list (length obj)))
+         (list 'vector nil '*)))
     ((stringp obj)
      (if (simple-string-p obj)
          (list 'simple-array 'character (list (length obj)))
@@ -5458,6 +5487,7 @@
     ((packagep obj) 'package)
     ((readtablep obj) 'readtable)
     ((random-state-p obj) 'random-state)
+    ((%standard-method-p obj) 'standard-method)
     ((streamp obj)
      (cond ((broadcast-stream-p obj) 'broadcast-stream)
            ((concatenated-stream-p obj) 'concatenated-stream)
@@ -5630,8 +5660,11 @@
          ((eq tn 'symbol) (or (null obj) (eq obj t) (symbolp obj)))
          ((eq tn 'string) (stringp obj))
          ((eq tn 'simple-string) (simple-string-p obj))
-         ((eq tn 'base-string) (stringp obj))
-         ((eq tn 'simple-base-string) (simple-string-p obj))
+         ;; every character is a base character, so every string is a
+         ;; base string -- except a (VECTOR NIL), whose element type is NIL
+         ((eq tn 'base-string) (and (stringp obj) (not (%nil-vector-p obj))))
+         ((eq tn 'simple-base-string)
+          (and (simple-string-p obj) (not (%nil-vector-p obj))))
          ((eq tn 'character) (characterp obj))
          ((eq tn 'base-char) (characterp obj))
          ;; the 96 standard characters only (STANDARD-CHAR.5)
@@ -5695,8 +5728,12 @@
          ((eq tn 'condition) (%condition-p obj))
          ;; A CLOS class object is itself an instance of STANDARD-OBJECT
          ;; (and CLASS / STANDARD-CLASS / METAOBJECT / T).  CLHS 4.3.7.
+         ;; So are methods and generic functions (CLHS 4.3.7's class table;
+         ;; upstream TYPES.9A).
          ((eq tn 'standard-object) (or (%clos-instance-p obj)
-                                       (%clos-class-p obj)))
+                                       (%clos-class-p obj)
+                                       (%standard-method-p obj)
+                                       (%generic-function-p obj)))
          ((eq tn 'structure-object) (%struct-instance-p obj))
          ;; A class PROXY (FIND-CLASS of a DEFSTRUCT or a built-in type) is
          ;; a class too, and its metaclass is STRUCTURE-CLASS or
@@ -5849,6 +5886,10 @@
          ((or (eq head 'string) (eq head 'simple-string)
               (eq head 'base-string) (eq head 'simple-base-string))
           (and (stringp obj)
+               ;; the SIMPLE- ones need a simple string, the BASE- ones
+               ;; exclude a (VECTOR NIL) -- as the bare names do above
+               (or (eq head 'string) (eq head 'base-string) (simple-string-p obj))
+               (or (eq head 'string) (eq head 'simple-string) (not (%nil-vector-p obj)))
                (let ((sz (and (cdr type) (cadr type))))
                  (or (null sz) (eq sz '*) (eq sz t)
                      (and (integerp sz) (= sz (array-length obj)))))))
@@ -5873,6 +5914,12 @@
              ;; otherwise element type is T.
              (let ((str (%mda-stringp obj)) (bitp (%mda-bit-p obj)))
                (cond
+                 ;; a (VECTOR NIL): element type exactly NIL.  A GIVEN element
+                 ;; type of NIL is not "unspecified" -- ET is NIL for both, so
+                 ;; ask (CDR TYPE).
+                 ((%nil-vector-p obj)
+                  (or (null (cdr type)) (eq et '*) (null et)))
+                 ((and (cdr type) (null et)) nil)
                  ;; a packed BIT array: element type exactly BIT, and simple
                  ;; only without a fill pointer or displacement
                  (bitp
@@ -5944,6 +5991,10 @@
                                        (bit-vector-p obj)))
                       (et-ok
                        (cond
+                         ;; A GIVEN element type NIL: only a (VECTOR NIL), which
+                         ;; is an MDA (the branch above).  ET is NIL for an
+                         ;; unspecified one too, so ask (CDR TYPE).
+                         ((and (cdr type) (null et)) nil)
                          ;; u8 vector: matches (unsigned-byte 8) and integer
                          ;; supertypes; NOT T / character / bit.
                          (is-u8

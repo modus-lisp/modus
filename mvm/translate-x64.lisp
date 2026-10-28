@@ -2458,13 +2458,13 @@
                     (loop-label (make-label))
                     (nocap-label (make-label)))
                 (emit-jcc buf :l done-label)
-                ;; cmp eax, 120  (CALL-ARGUMENTS-LIMIT; was 64, 32 — see
-                ;; emit-rest-prologue's variable-index loop for 33..64)
-                (emit-bytes buf #x83 #xF8 #x78)   ; 120 = +apply-spread-max+
+                ;; cmp eax, 121: +APPLY-SPREAD-MAX+ positional arguments plus
+                ;; the tail-list word of a +REST-TAIL-NARGS+ call (nargs 254)
+                (emit-bytes buf #x83 #xF8 #x79)
                 ;; jle nocap
                 (emit-jcc buf :le nocap-label)
-                ;; mov eax, 120
-                (emit-bytes buf #xB8 #x78 #x00 #x00 #x00)
+                ;; mov eax, 121
+                (emit-bytes buf #xB8 #x79 #x00 #x00 #x00)
                 (emit-label buf nocap-label)
                 ;; sub eax, 4
                 (emit-bytes buf #x83 #xE8 #x04)
@@ -4433,6 +4433,78 @@
            (let ((d (dest-phys-or-scratch vd)))
              (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
              (maybe-store-scratch buf vd))))
+
+        ;; ---- the FP-register ops a float tree was missing (see mvm.lisp).
+        ;; RAX/RCX/xmm0 are scratch, as in the ops above; x64-sse-rr carries the
+        ;; REX bits for xmm8..13.
+        ((op= +op-fp-op1+)
+         (let ((fd (x64-fpp (first operands))) (fs (x64-fpp (second operands)))
+               (sub (third operands)))
+           (case sub
+             (0 (x64-sse-rr buf #x66 nil #x7E fs 0)                ; movd eax, xmmS
+                (emit-bytes buf #x25 #xFF #xFF #xFF #x7F)          ; and eax, #x7FFFFFFF
+                (x64-sse-rr buf #x66 nil #x6E fd 0))               ; movd xmmD, eax
+             (1 (x64-sse-rr buf #x66 t #x7E fs 0)                  ; movq rax, xmmS
+                (emit-bytes buf #x48 #x0F #xBA #xF0 #x3F)          ; btr rax, 63
+                (x64-sse-rr buf #x66 t #x6E fd 0))                 ; movq xmmD, rax
+             (2 (x64-sse-rr buf #xF3 nil #x5A fd fs))              ; cvtss2sd xmmD, xmmS
+             (t (x64-sse-rr buf #xF2 nil #x5A fd fs)))))           ; cvtsd2ss xmmD, xmmS
+        ((op= +op-fp-op2+)
+         (let ((fd (x64-fpp (first operands))) (fa (x64-fpp (second operands)))
+               (fb (x64-fpp (third operands))) (sub (fourth operands)))
+           (x64-sse-rr buf nil nil #x28 0 fb)                      ; movaps xmm0, xmmB
+           (unless (= fd fa) (x64-sse-rr buf nil nil #x28 fd fa))  ; movaps xmmD, xmmA
+           (x64-sse-rr buf (if (< sub 2) #xF3 #xF2) nil (if (evenp sub) #x5F #x5D) fd 0)))   ; max/min ss/sd
+        ((op= +op-fp-cmp+)
+         ;; UCOMISS Fb, Fa: as fpd-lt/-le (unordered -> CF -> 0)
+         (let ((vd (first operands))
+               (fa (x64-fpp (second operands)))
+               (fb (x64-fpp (third operands)))
+               (sub (fourth operands)))
+           (x64-sse-rr buf nil nil #x2E fb fa)                     ; ucomiss xmmB, xmmA
+           (emit-bytes buf #x0F (if (= sub 0) #x97 #x93) #xC0)     ; seta / setae al
+           (emit-bytes buf #x0F #xB6 #xC0)                         ; movzx eax, al
+           (emit-shl-reg-imm buf 'rax 1)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+        ((op= +op-fp-toi+)
+         ;; round-even: CVTSS2SI under the default MXCSR (round to nearest
+         ;; even); truncate: CVTTSS2SI; floor/ceiling: ROUNDSS imm 1/2 into
+         ;; xmm0 (SSE4.1), then CVTTSS2SI.  Doubles: F2 / ROUNDSD.
+         (let* ((vd (first operands)) (fs (x64-fpp (second operands))) (sub (third operands))
+                (dbl (>= sub 4)) (k (logand sub 3)) (pre (if dbl #xF2 #xF3)))
+           (cond ((= k 0) (x64-sse-rr buf pre t #x2D 0 fs))        ; cvt(s|d)2si rax, xmmS
+                 ((= k 1) (x64-sse-rr buf pre t #x2C 0 fs))        ; cvtt(s|d)2si rax, xmmS
+                 (t (emit-bytes buf #x66)
+                    (when (>= fs 8) (emit-bytes buf #x41))
+                    (emit-bytes buf #x0F #x3A (if dbl #x0B #x0A) (logior #xC0 (logand fs 7))
+                                (if (= k 2) 1 2))                  ; round(s|d) xmm0, xmmS, floor|ceil
+                    (x64-sse-rr buf pre t #x2C 0 0)))              ; cvtt(s|d)2si rax, xmm0
+           (emit-shl-reg-imm buf 'rax 1)
+           (let ((d (dest-phys-or-scratch vd)))
+             (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
+             (maybe-store-scratch buf vd))))
+
+        ((or (op= +op-fpd-li+) (op= +op-fp-li+))
+         ;; MOV rax, hi:lo; MOVQ xmmD, rax; FP-LI then CVTSD2SS xmmD, xmmD.
+         (let ((fd (x64-fpp (first operands))))
+           (emit-mov-reg-imm buf 'rax (logior (ash (logand (second operands) #xFFFFFFFF) 32)
+                                              (logand (third operands) #xFFFFFFFF)))
+           (x64-sse-rr buf #x66 t #x6E fd 0)                    ; movq xmmD, rax
+           (when (op= +op-fp-li+)
+             (x64-sse-rr buf #xF2 nil #x5A fd fd))))            ; cvtsd2ss xmmD, xmmD
+
+        ((op= +op-fpd-scale+)
+         ;; (fpd-scale Fd Vk) -- Fd *= 2^k: rax = ((k >> 1) + 1023) << 52,
+         ;; MOVQ xmm0, rax (FP scratch), MULSD xmmD, xmm0.
+         (let ((fd (x64-fpp (first operands))))
+           (emit-load-vreg buf (second operands) 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           (emit-bytes buf #x48 #x05 #xFF #x03 #x00 #x00)       ; add rax, 1023
+           (emit-shl-reg-imm buf 'rax 52)
+           (x64-sse-rr buf #x66 t #x6E 0 0)                     ; movq xmm0, rax
+           (x64-sse-rr buf #xF2 nil #x59 fd 0)))                ; mulsd xmmD, xmm0
 
         ((op= +op-fpd-itof+)
          ;; (fpd-itof Fd Vs) -- SAR 1, CVTSI2SD xmmD, rax: a fixnum straight into

@@ -2363,7 +2363,7 @@
       ;; is NIL, which is what the BOUNDP guard here answered -- at 230 ns, a
       ;; third of every RANDOM (cl-bench MRG32K3A times RANDOM).
       (let* ((rs (if state (car state) *random-state*))
-             (cell (if (and (consp rs) (or (eql (car rs) 7770005) (eq (car rs) 'random-state))
+             (cell (if (and (consp rs) (eql (car rs) 7770005)
                             (consp (cdr rs)) (integerp (cadr rs)))
                        (cdr rs) nil))
              (seed (if cell (car cell) (mem-ref #x10000FD8 :u32)))
@@ -5659,7 +5659,7 @@
     ;; pair doesn't overwrite the first value.  (make-array.keywords.8)
     (let ((ie-p nil) (ie nil) (ic-p nil) (ic nil)
           (fp nil) (fp-set nil) (adj nil) (adj-set nil)
-          (etype t) (etype-set nil)
+          (etype t) (etype-set nil) (nil-elt nil)
           (disp nil) (disp-set nil) (off 0) (off-set nil)
           (rest kwargs))
       (loop (when (null rest) (return nil))
@@ -5683,11 +5683,14 @@
              (unless off-set (setq off-set t off v)))))
         (setq rest (cddr rest)))
       (when etype-set (setq etype (%element-type-expand etype)))
-      ;; A one-dimensional array of element type NIL holds no element: as in
-      ;; SBCL it is a STRING (NIL is a subtype of CHARACTER), so STRINGP,
-      ;; EQUAL "" and printing as "" hold (STRINGP.9/10, EQUAL.13/14,
-      ;; SXHASH.8, PRINT.STRING.NIL.1).  Stored as a string.
+      ;; A one-dimensional array of element type NIL holds no element: it is a
+      ;; STRING (NIL is a subtype of CHARACTER), so STRINGP, EQUAL "" and
+      ;; printing as "" hold (STRINGP.9/10, EQUAL.13/14, SXHASH.8,
+      ;; PRINT.STRING.NIL.1) -- but not a BASE-STRING, and its element type is
+      ;; NIL (SIMPLE-BASE-STRING.10/11).  Stored as a string under an MDA
+      ;; header whose etype slot is NIL (%NIL-VECTOR-P), below.
       (when (and etype-set (null etype) (= rank 1))
+        (setq nil-elt t)
         (setq etype 'character))
       ;; Allocate + fill the flat data vector.
       ;; :element-type 'character / 'base-char → underlying is a string
@@ -5796,6 +5799,11 @@
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) f32-elt)
            data)
+          ;; (VECTOR NIL): see NIL-ELT above.  Only the simple one; a fill
+          ;; pointer / adjustable / displaced one takes the general MDA arm
+          ;; with etype NIL anyway.
+          ((and nil-elt (not fp) (not adj) (not disp))
+           (%alloc-mda rank dim-list nil nil nil nil data))
           ;; '(n) is as one-dimensional as n: a wrapper here was a string
           ;; SIMPLE-STRING-P refused (MAKE-ARRAY.5A, SIMPLE-STRING.12)
           ((and (= rank 1)
@@ -5811,8 +5819,8 @@
           ;; type predicates (stringp / typep) and length helpers see
           ;; through to the underlying.  aref/aset still consult the
           ;; displaced+offset slots via the MDA fast path.
-          (disp (%alloc-mda rank dim-list fp disp off etype disp))
-          (t (%alloc-mda rank dim-list fp disp off etype data)))))))
+          (disp (%alloc-mda rank dim-list fp disp off (if nil-elt nil etype) disp))
+          (t (%alloc-mda rank dim-list fp disp off (if nil-elt nil etype) data)))))))
 
 (defun %mda-fill-contents-flat (data contents dims)
   "Fill DATA in row-major order from CONTENTS shaped against DIMS.

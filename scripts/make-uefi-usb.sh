@@ -14,12 +14,13 @@
 set -e
 cd "$(dirname "$0")/.."
 
-EFI=/tmp/modus-uefi.efi
+EFI=/tmp/modus-uefi-cl.efi
 IMG=/tmp/modus-usb.img
 
-# Build EFI binary
-echo "Building UEFI REPL..." >&2
-sbcl --script mvm/build-uefi-repl.lisp >&2
+# Build the EFI binary: the CL image, with its screen and keyboard console
+# (net/pc-console.lisp: GOP framebuffer + PS/2, beside COM1)
+echo "Building the UEFI CL image..." >&2
+MODUS_CL_REPL_OUT=$EFI sbcl --dynamic-space-size 12288 --script mvm/build-uefi-cl-repl.lisp >&2
 
 # Create 128MB GPT-partitioned image with EFI System Partition
 echo "Creating GPT image with EFI System Partition..." >&2

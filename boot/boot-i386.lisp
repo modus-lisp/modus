@@ -47,6 +47,30 @@
 (defvar *i386-cons-base-override* nil)
 (defvar *i386-general-base-override* nil)
 
+(defvar *i386-cl-boot* nil
+  "T for the bare-metal CL image (mvm/build-cl-repl-common.lisp :I386).  The
+   CL runtime's NIL is #xDEAD0001, as on every other CL image (its compiled
+   constants and the interpreter assume it); the small mini-Lisp images use
+   NIL = 0.  With the flag the stub sets VN = #xDEAD0001 and turns on paging so
+   that NIL's own address is RAM -- (car nil) and (cdr nil) are plain loads
+   from #xDEAD0000/#xDEAD0004 -- see EMIT-I386-CL-NIL-PAGE.  NIL leaves every
+   existing image byte-identical.")
+
+(defconstant +i386-cl-page-dir+ #x03A00000
+  "The CL image's page directory: 58 MB, above the ~40 MB image and the
+   handler-case block at 56 MB, below the heap at 64 MB.")
+(defconstant +i386-cl-nil-frame+ #x3C400000
+  "Physical 4 MB frame behind the virtual 4 MB page holding #xDEAD0000; just
+   above the CL image's stack top (960 MB), inside -m 1024.")
+
+(defconstant +i386-cl-semispace+ #x0F000000
+  "The CL image's semispace size (240 MB).  From-space starts at the cons
+   base (257 MB, above the runtime's fixed block at #x10000000) and to-space
+   follows it; the two bitmaps follow to-space.")
+(defconstant +i386-cl-bitmap-size+ #x400000
+  "Each GC bitmap: 1 bit per 16-byte granule over both semispaces (480 MB /
+   128 = 3.75 MB), rounded up.")
+
 (defun i386-stack-top ()   (or *i386-stack-top-override*   +i386-stack-top+))
 (defun i386-cons-base ()   (or *i386-cons-base-override*   +i386-cons-base+))
 (defun i386-general-base () (or *i386-general-base-override* +i386-general-base+))
@@ -72,6 +96,93 @@
 ;;; ============================================================
 ;;; i386 Multiboot1 Header
 ;;; ============================================================
+
+(defun emit-i386-cl-nil-page (buf)
+  "Paging for the CL image, whose NIL is #xDEAD0001: 4 MB pages (CR4.PSE), the
+   first 1 GB identity-mapped, and the 4 MB page holding #xDEAD0000 mapped to
+   +I386-CL-NIL-FRAME+, whose NIL page is filled with NIL -- so (car nil) and
+   (cdr nil) read NIL, as the hosted ports' mmap'd NIL page makes them.
+   Clobbers EAX, ECX, EDI (the stub sets what it needs afterwards)."
+  (flet ((b (&rest bytes) (dolist (x bytes) (mvm-emit-byte buf x)))
+         (u32 (v) (mvm-emit-u32 buf v)))
+    (b #xFC)                                     ; cld
+    ;; the NIL page: 1024 words of NIL at the physical address #xDEAD0000 maps to
+    (b #xBF) (u32 (+ +i386-cl-nil-frame+ (logand #xDEAD0000 #x3FFFFF)))  ; mov edi
+    (b #xB8) (u32 #xDEAD0001)                    ; mov eax, NIL
+    (b #xB9) (u32 1024)                          ; mov ecx, 1024
+    (b #xF3 #xAB)                                ; rep stosd
+    ;; the page directory: zero it, then 256 identity 4 MB entries (1 GB)
+    (b #xBF) (u32 +i386-cl-page-dir+)
+    (b #x31 #xC0)                                ; xor eax, eax
+    (b #xB9) (u32 1024)
+    (b #xF3 #xAB)                                ; rep stosd
+    (b #xBF) (u32 +i386-cl-page-dir+)
+    (b #xB8) (u32 #x83)                          ; present | rw | 4 MB page, frame 0
+    (b #xB9) (u32 256)
+    ;; loop: mov [edi], eax ; add eax, 4 MB ; add edi, 4 ; loop
+    (b #x89 #x07)
+    (b #x05) (u32 #x400000)
+    (b #x83 #xC7 #x04)
+    (b #xE2 #xF4)                                ; loop -12
+    ;; PDE for #xDEAD0000's 4 MB page -> the NIL frame
+    (b #xC7 #x05) (u32 (+ +i386-cl-page-dir+ (* 4 (ash #xDEAD0000 -22))))
+    (u32 (logior +i386-cl-nil-frame+ #x83))
+    ;; CR4.PSE, CR3, then CR0.PG
+    (b #x0F #x20 #xE0 #x83 #xC8 #x10 #x0F #x22 #xE0)   ; cr4 |= PSE
+    (b #xB8) (u32 +i386-cl-page-dir+)
+    (b #x0F #x22 #xD8)                           ; mov cr3, eax
+    (b #x0F #x20 #xC0 #x0D) (u32 #x80000000)     ; eax = cr0 | PG
+    (b #x0F #x22 #xC0)))                         ; mov cr0, eax
+
+(defun i386-cl-gc-layout ()
+  "(values FROM TO SIZE START-BITMAP CONS-BITMAP END) of the CL image's heap."
+  (let* ((from (i386-cons-base))
+         (size +i386-cl-semispace+)
+         (to (+ from size))
+         (sbm (+ to size))
+         (cbm (+ sbm +i386-cl-bitmap-size+)))
+    (values from to size sbm cbm (+ cbm +i386-cl-bitmap-size+))))
+
+(defun emit-i386-cl-gc-init (buf)
+  "Boot-side setup for the native i386 collector on bare metal -- what
+   boot/boot-linux-i386.lisp does for the hosted image: region 0's control
+   block (#x10000040: from / to / size / stack base, count and parked SP 0),
+   the active-region cell, VA/VL inside from-space (VL short of its end by the
+   collector's margin), page base and the two bitmap bases in the bare slot
+   block (#x618 / #x61C / #x620) with the copies gc.lisp reads
+   (#x10000E00 / #x10000E18 / #x10000E40), and both bitmaps zeroed -- real RAM
+   is not.  Values are raw words, as the hosted stub writes them."
+  (multiple-value-bind (from to size sbm cbm) (i386-cl-gc-layout)
+    (flet ((store (addr v)                       ; mov dword [addr], imm32
+             (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x05)
+             (mvm-emit-u32 buf addr) (mvm-emit-u32 buf v))
+           (zero (addr bytes)                    ; rep stosd of 0
+             (mvm-emit-byte buf #xFC)
+             (mvm-emit-byte buf #xBF) (mvm-emit-u32 buf addr)
+             (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)
+             (mvm-emit-byte buf #xB9) (mvm-emit-u32 buf (floor bytes 4))
+             (mvm-emit-byte buf #xF3) (mvm-emit-byte buf #xAB)))
+      (zero sbm +i386-cl-bitmap-size+)
+      (zero cbm +i386-cl-bitmap-size+)
+      ;; region 0: from, to, size, stack base, count, parked sp (8-byte stride)
+      (zero #x10000040 64)
+      (store #x10000040 from)
+      (store #x10000048 to)
+      (store #x10000050 size)
+      (store #x10000058 (i386-stack-top))
+      (store #x10000F08 0)                       ; active region: region 0
+      (zero #x100003C0 64)                       ; collector scratch words
+      ;; VA, VL
+      (store #x600 from)
+      (store #x604 (- (+ from size) (symbol-value
+                                     (find-symbol "*I386-GC-VL-MARGIN*" "MODUS.MVM.I386"))))
+      ;; page base and bitmaps, and gc.lisp's copies
+      (store #x618 from)
+      (store #x61C sbm)
+      (store #x620 cbm)
+      (store #x10000E00 from)
+      (store #x10000E18 sbm)
+      (store #x10000E40 cbm))))
 
 (defun emit-i386-multiboot-header (buf)
   "Emit Multiboot1 header with aout-kludge for QEMU -kernel loading.
@@ -201,17 +312,32 @@
   (mvm-emit-u32 buf #x604)
   (mvm-emit-u32 buf (i386-general-base))
   ;; mov [0x608], 0x00  (VN = NIL = 0, matching AArch64/RISC-V convention)
-  ;; NIL=0 ensures fixnum 0 is falsy, required by (when (logand ...)) idioms
+  ;; NIL=0 ensures fixnum 0 is falsy, required by (when (logand ...)) idioms.
+  ;; The CL image's NIL is #xDEAD0001 (*I386-CL-BOOT*).
   (mvm-emit-byte buf #xC7)
   (mvm-emit-byte buf #x05)
   (mvm-emit-u32 buf #x608)
-  (mvm-emit-u32 buf #x00)
+  (mvm-emit-u32 buf (if *i386-cl-boot* #xDEAD0001 #x00))
+  (when *i386-cl-boot*
+    (emit-i386-cl-nil-page buf)
+    (emit-i386-cl-gc-init buf))
 
   ;; --- Initialize serial port ---
   (i386-init-serial buf)
 
   ;; --- Set up timer interrupt for HLT-based io-delay ---
   (emit-i386-interrupt-setup buf)
+
+  ;; --- Alignment padding (CL image) ---
+  ;; Native code starts at load-addr (16-aligned; the multiboot header is at
+  ;; file offset 0) + this boot code + 5 (the JMP rel32 to kernel-main that
+  ;; cross.lisp appends).  The CL image OR-3 tags function addresses, so
+  ;; entries must be 16-aligned at the RUNTIME address and the translator
+  ;; pads relative to native byte 0: make byte 0 16-aligned, as
+  ;; boot-linux-i386 does, and *i386-native-code-offset* = 0 is right.
+  (when *i386-cl-boot*
+    (loop until (zerop (mod (+ (mvm-buffer-position buf) 5) 16))
+          do (mvm-emit-byte buf #x90)))                ; nop
 
   ;; --- Fall through to compiled native code ---
   ;; The image builder appends translated Lisp code immediately after.

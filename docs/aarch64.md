@@ -2,6 +2,10 @@
 
 ## Overview
 
+> **Historical.**  This page describes the mini-Lisp virt images, retired
+> 2026-10-28.  The CL image replaces them: `./scripts/run.sh aarch64-cl-repl`
+> and `./scripts/run.sh aarch64-ssh` (see CLAUDE.md, "QEMU AArch64").
+
 Modus runs on AArch64 QEMU `virt` with E1000 networking and an SSH server. The networking stack (~4800 lines) is shared between x86-64 and AArch64 via thin architecture adapters. The AArch64 build uses the MVM compiler pipeline (Source → MVM bytecode → AArch64 native) and runs single-threaded (no actor model, no runtime compiler).
 
 ```bash

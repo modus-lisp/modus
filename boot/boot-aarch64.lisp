@@ -261,6 +261,17 @@
 ;;     per file.  Continuation lives in the unused entry-8 slot.
 (defvar *aarch64-ansi-deadline-hardening* nil)
 
+(defvar *aarch64-fixpoint-threads* nil
+  "When T (the CL image built MODUS_RPI_THREADS=1, net/bare-threads.lisp): the
+   fixpoint entry maps VA 0x10200000-0x1FFFFFFF to DRAM at PA +0x50000000 (needs
+   QEMU -m 1024) instead of PCI identity, so the thread layer's tables, stacks'
+   page tables and per-core heaps are RAM -- the E1000's BARs move to 0x30000000;
+   keeps L2[64] DRAM (no GIC: the GC bitmaps live there); zeroes the per-thread
+   window's high slots, TPIDR_EL0 (the window delta, core 0's is 0) and publishes
+   the per-CPU pointer at window slot 0x1000FFE8, as boot-rpi-cl.lisp does; and
+   gives vector entry 4 the thread-aware prefix (see EMIT-AARCH64-EXCEPTION-
+   VECTORS).  NIL keeps every existing image byte-identical.")
+
 (defun emit-aarch64-exception-vectors (buf)
   "Emit AArch64 exception vector table.
    Must be aligned to 2KB (0x800).
@@ -499,6 +510,14 @@
        ;;  24.   MOVK x0, #0xDEAD, lsl #16
        ;;  25.   ERET
        ;;  26.   B .                          ; HALT
+       ;;
+       ;; THREADED (*AARCH64-FIXPOINT-THREADS*): first a branch to the thread
+       ;; prefix in entry 9 (the shared-store guard and the stack guard pages;
+       ;; it branches back here, to the MRS below, to report), and the handler
+       ;; slots are the FAULTING THREAD's: x16 += TPIDR_EL0, its window delta, so
+       ;; a fault on a worker core longjmps to that thread's own handler-case.
+       (when *aarch64-fixpoint-threads*
+         (emit-aarch64-u32 buf (logior #x14000000 (/ (- #x480 #x200) 4))))   ; B entry 9
        (emit-aarch64-u32 buf #xD5384030)        ; MRS x16, ELR_EL1
        (emit-aarch64-u32 buf #xD2818611)        ; MOVZ x17, #0x0c30
        (emit-aarch64-u32 buf #xF2A20011)        ; MOVK x17, #0x1000, lsl #16
@@ -508,6 +527,9 @@
        (emit-aarch64-u32 buf #xF9000E20)        ; STR x0,  [x17, #0x18]
        (emit-aarch64-u32 buf #xD2803010)        ; MOVZ x16, #0x0180
        (emit-aarch64-u32 buf #xF2A20010)        ; MOVK x16, #0x1000, lsl #16
+       (when *aarch64-fixpoint-threads*
+         (emit-aarch64-u32 buf #xD53BD04F)      ; MRS x15, TPIDR_EL0
+         (emit-aarch64-u32 buf #x8B0F0210))     ; ADD x16, x16, x15
        (emit-aarch64-u32 buf #xF9400211)        ; LDR x17, [x16]   (slot 180 SP)
        (emit-aarch64-u32 buf #xB5000091)        ; CBNZ x17, +4 → DO_LJ
        (emit-aarch64-u32 buf #x91010210)        ; ADD x16, x16, #0x40 (→ 0x1C0)
@@ -539,9 +561,26 @@
        (emit-aarch64-u32 buf #xD69F03E0)        ; ERET
        ;; HALT (instr 26):
        (emit-aarch64-u32 buf #x14000000)        ; B .
-       ;; Fill remaining 6 instructions with NOP
-       (dotimes (i 6)
+       ;; Fill remaining 6 instructions with NOP (3 when threaded)
+       (dotimes (i (if *aarch64-fixpoint-threads* 3 6))
          (emit-aarch64-u32 buf #xD503201F)))
+      ((and (= entry 9) *aarch64-fixpoint-threads*)
+       ;; THE THREAD PREFIX of entry 4 (test/rpi-smp/virt-vec.s, the EL1 twin of
+       ;; guardvec.s + stackvec.s): an undefined instruction with the faulting
+       ;; thread's shared-store-guard marker set resumes at the Lisp function at
+       ;; 0x10213028; a data abort in a thread stack's guard page resumes at the
+       ;; one at 0x10213030 (net/bare-threads.lisp).  Anything else: back to
+       ;; entry 4's ordinary recovery.  Lower-EL vectors: never taken here.
+       (dolist (w '(#xd538520a #xd35afd4a #xb50001ca #xd2a2042b #xf286050b #xf940016b
+                    #xb400032b #xd53bd04a #xd2a2000c #xf28a0b0c #x8b0a018c #xf940018c
+                    #xf100059f #x54000241 #xd518402b #xd69f03e0 #xf100955f #x540001c1
+                    #xd538600a #xd358fd4b #xf100157f #x54000141 #xd2a2042b #xf286060b
+                    #xf940016b #xb40000cb #x9274cd4a #x9140254a #x9100015f #xd518402b
+                    #xd69f03e0))
+         (emit-aarch64-u32 buf w))
+       ;; report: B entry 4 + 1 (word 31 of this slot)
+       (emit-aarch64-u32 buf (logior #x14000000
+                                     (logand (/ (- (+ #x200 4) (+ #x480 (* 31 4))) 4) #x3FFFFFF))))
       ((= entry 5)
        ;; Entry 5: IRQ handler for Current EL with SP_ELx.
        ;;
@@ -1136,6 +1175,20 @@
     (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 128 8)))
     (emit-aarch64-load-imm64 buf x1 #x50000701)
     (emit-aarch64-str-x buf x1 x0 0)
+    ;; 7d'. Threads: L2[129..255] = DRAM, VA 0x10200000-0x1FFFFFFF -> PA
+    ;;      0x60200000-0x6FFFFFFF (normal cacheable).  +0x50000000, not the
+    ;;      +0x40000000 of L2[0..128], so it does not alias the E1000's DMA
+    ;;      rings and SSH state, which sit at PA 0x502xxxxx identity-mapped.
+    (when *aarch64-fixpoint-threads*
+      (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 129 8)))
+      (emit-aarch64-load-imm64 buf x1 #x60200701)
+      (emit-aarch64-movz buf x2 127 0)
+      (let ((tl (a64-buffer-position buf)))
+        (emit-aarch64-u32 buf #xF8008401)          ; STR X1,[X0],#8
+        (emit-aarch64-u32 buf #x8B030021)          ; ADD X1,X1,X3 (2 MB)
+        (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
+        (let ((offset (- tl (a64-buffer-position buf))))
+          (emit-aarch64-u32 buf (logior (ash #b10110101 24) (ash (logand offset #x7FFFF) 5) x2)))))
 
     ;; 7e. Override L2[64] = GIC identity map, VA 0x08000000-0x081FFFFF
     ;;     → PA 0x08000000-0x081FFFFF (device memory).  Required for the
@@ -1155,7 +1208,7 @@
     ;; Gen2 into the image buffer at VA 0x08000000 (its first write, at
     ;; 0x08001000, faulted into the GIC) and takes no interrupts -- so the
     ;; override is skipped there and L2[64] stays DRAM.
-    (unless *aarch64-fixpoint-big-heap*
+    (unless (or *aarch64-fixpoint-big-heap* *aarch64-fixpoint-threads*)
       (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 64 8)))
       (emit-aarch64-load-imm64 buf x1 #x08000705)
       (emit-aarch64-str-x buf x1 x0 0))
@@ -1364,6 +1417,21 @@
     ;; 18. Set TPIDR_EL1 = per-CPU data VA
     (emit-aarch64-load-imm64 buf x16 +tdk-percpu-va+)
     (emit-aarch64-u32 buf #xD518D090)            ; MSR TPIDR_EL1, X16
+    ;; 18b. Threads: the per-thread window (boot-rpi-cl.lisp step 0/4).  Its high
+    ;;      slots 0x1000F000..0x10010000 start at zero, TPIDR_EL0 -- the window
+    ;;      delta -- is 0 for core 0, and A64-LOAD-PERCPU-BASE reads the per-CPU
+    ;;      pointer from window slot 0x1000FFE8 instead of TPIDR_EL1.
+    (when *aarch64-fixpoint-threads*
+      (emit-aarch64-load-imm64 buf x17 #x1000F000)
+      (emit-aarch64-load-imm64 buf x0 #x10010000)
+      (let ((zl (a64-current-index buf)))
+        (a64-stur buf +a64-xzr+ x17 0)
+        (a64-add-imm buf x17 x17 8)
+        (a64-cmp-reg buf x17 x0)
+        (a64-bcond buf #b0011 (- zl (a64-current-index buf))))
+      (emit-aarch64-u32 buf #xD51BD05F)          ; MSR TPIDR_EL0, XZR
+      (emit-aarch64-load-imm64 buf x17 #x1000FFE8)
+      (a64-stur buf x16 x17 0))
 
     ;; 19. Set VBAR_EL1 for exception vectors.  QEMU virt's `-kernel`
     ;; loads our binary at PA 0x40080000 (Linux Image convention).

@@ -415,6 +415,25 @@
    if GENERIC-ADD etc. are present.  An A/B knob: it isolates the new checked
    ops from the rest of i386 codegen when triaging a miscompile.")
 
+(defparameter *i386-bare-gc* nil
+  "Enable the native collector (and its allocation-time bitmap bits) on BARE
+   METAL too.  It is the same collector; what hosted mode adds is boot-side
+   setup -- the region-0 control block, the bitmaps, VA/VL inside the
+   from-space -- which only boot/boot-linux-i386.lisp performed.  The bare CL
+   image (boot-i386.lisp *I386-CL-BOOT*, EMIT-I386-CL-GC-INIT) now does the
+   same and sets this; every other bare image keeps `int $0x31' and is
+   byte-identical.")
+
+(defparameter *i386-bare-clock* nil
+  "Emit the bare-metal clock traps (#x0310 RDTSC, #x0311 rate) instead of the
+   INT3 placeholder.  Set by the bare CL image; the legacy bare images keep the
+   placeholder and stay byte-identical.")
+
+(defun i386-gc-mode-p ()
+  "Does this image run the native collector: hosted, or a bare image whose
+   boot sets it up (*I386-BARE-GC*)?"
+  (or *i386-linux-mode* *i386-bare-gc*))
+
 (defparameter *i386-gc-bitmap-enabled* t
   "Emit the object-start / cons-kind bit-set at every allocation site.
    Must be ON whenever the collector is: without the bitmaps scan_word has no
@@ -561,6 +580,13 @@
 ;;; Scratch at 0x100003C0..0x100003F8 sits in the unused gap between the
 ;;; saved initial ESP (0x10000290) and the handler stack.
 
+(defparameter *i386-bare-handler-base* #x5C0000
+  "Bare-metal base of the handler-case block (jmp_buf, longjmp scratch,
+   handler stack).  The default suits the small bare images; the bare CL image
+   is ~40 MB at load address 1 MB, which puts #x5C0000 INSIDE its code -- the
+   first HANDLER-CASE wrote its jmp_buf over running code (#GP right after the
+   banner) -- so mvm/build-cl-repl-common.lisp moves it above the image.")
+
 (defun i386-set-handler-block ()
   "Place the handler-case block for the current mode.  Hosted: the shared
    contract addresses at the heap base (#x10000180 jmp_buf ... #x10000408
@@ -568,7 +594,7 @@
    the Multiboot board -- above the per-CPU block (#x5B0000), below the cons
    space (8 MB), clear of the stack (down from 4 MB).  #x10000180 is past the
    end of RAM on a `qemu-system-i386 -m 256' board."
-  (let ((base (if *i386-linux-mode* #x10000000 #x5C0000)))
+  (let ((base (if *i386-linux-mode* #x10000000 *i386-bare-handler-base*)))
     (setf *i386-jmpbuf-addr*          (+ base #x180)
           *i386-longjmp-scratch-addr* (+ base #x3C0)
           *i386-hstack-capcount-addr* (+ base #x3F0)
@@ -853,7 +879,7 @@
    VR-PRESERVING by construction (see the register invariant): computes in the
    ECX/EDX scratch pair, saved around the sequence so the caller's operands
    survive, and never touches EAX.  The build-time checker enforces this."
-  (when (and *i386-gc-bitmap-enabled* *i386-linux-mode*)
+  (when (and *i386-gc-bitmap-enabled* (i386-gc-mode-p))
     (i386-emit-push-reg buf +scratch0+)
     (i386-emit-push-reg buf +scratch1+)
     ;; ECX = granule index = (base - page_base) >> 4
@@ -2268,15 +2294,30 @@
     (i386-emit-gcnative-copy buf copy-label)))
 
 (defun i386-frame-bytes (slots)
-  "Frame size below EBP for SLOTS frame slots.  The unsized frame keeps its
-   historical 296 bytes (room for 57 slots, not 128).  A sized frame is
-   72 + 4*SLOTS: slot N sits at EBP-68-4N, and 72+32k stays 8 mod 16 like 296,
-   so ESP alignment after CALL+PUSH EBP is unchanged."
-  (if (= slots +frame-legacy-slots+)
+  "Frame size below EBP for SLOTS frame slots.  The UNSIZED frame (:LEGACY)
+   keeps its historical 296 bytes (room for 57 slots, not 128).  A sized frame
+   is 72 + 4*SLOTS: slot N sits at EBP-68-4N, and 72+32k stays 8 mod 16 like
+   296, so ESP alignment after CALL+PUSH EBP is unchanged.
+
+   A frame SIZED to 128 slots is not the unsized one.  It used to get 296 bytes
+   too, because both read as 128 -- and 128 is the floor every function with
+   the #x0530 &rest copy gets, so the copy wrote slots 57.. below ESP, over the
+   registers the trap had pushed: every &rest call with ~57 arguments or more
+   built its list from garbage (and the copy's loop index was among them)."
+  (if (eq slots :legacy)
       +frame-size+
       (+ 72 (* 4 slots))))
 
-(defun i386-emit-prologue (buf &optional (slots +frame-legacy-slots+))
+(defun i386-function-frame-slots (bytecode offset)
+  "FUNCTION-FRAME-SLOTS, but :LEGACY for an unsized (or absent) FRAME-ENTER,
+   which that function reports as 128 like a sized 128."
+  (if (and (< (+ offset 2) (length bytecode))
+           (= (aref bytecode offset) +op-trap+)
+           (>= (modus.mvm::decode-u16 bytecode (1+ offset)) +frame-enter-sized+))
+      (function-frame-slots bytecode offset)
+      :legacy))
+
+(defun i386-emit-prologue (buf &optional (slots :legacy))
   "Emit i386 function prologue.
    PUSH EBP; MOV EBP, ESP; SUB ESP, frame_size;
    save callee-saved EBX, ESI, EDI;
@@ -2491,6 +2532,22 @@
              ((and (= code #x0311) *i386-linux-mode*)
               ;; CNTFRQ: #x0310's rate, TAGGED, in VR.  mov eax, 2000.
               (i386-emit-byte buf #xB8) (i386-emit-u32 buf 2000))
+
+             ((and (= code #x0310) *i386-bare-clock*)
+              ;; RDTSC, bare metal (no clock_gettime): bits 12..41 of the time
+              ;; stamp counter -- a 30-bit fixnum, monotonic between wraps (2^42
+              ;; cycles, about 20 minutes at 3.5 GHz) -- TAGGED in EAX.  Bare x64
+              ;; reads the TSC the same way; EDX is scratch.
+              (i386-emit-byte buf #x0F) (i386-emit-byte buf #x31)  ; rdtsc
+              (i386-emit-byte buf #x0F) (i386-emit-byte buf #xAC)  ; shrd eax, edx, 12
+              (i386-emit-byte buf #xD0) (i386-emit-byte buf 12)
+              (i386-emit-byte buf #x25) (i386-emit-u32 buf #x3FFFFFFF) ; and eax, 2^30-1
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xE0))  ; shl eax,1 (tag)
+
+             ((and (= code #x0311) *i386-bare-clock*)
+              ;; CNTFRQ, bare metal: the TSC's rate is not known, so 0 --
+              ;; "frequency unknown", which callers handle (as bare x64).
+              (i386-emit-byte buf #x31) (i386-emit-byte buf #xC0))  ; xor eax, eax
 
              ((and (= code #x050B) *i386-linux-mode*)
               ;; GENERIC 6-ARG SYSCALL: V0 = number, V1..V6 = args, all TAGGED;
@@ -3148,9 +3205,11 @@
               ;; Copying them there lets the ladder load args 0..3 and 4..N
               ;; through one addressing form.
               ;;
-              ;; Cap at 32 total args, as x64 does: the ladder is unrolled per
-              ;; defun, and raising x64's cap to 50 cost +30MB and regressed
-              ;; ANSI via layout shift.  A function with this copy gets >= 128 slots.
+              ;; Cap at 121 total args, as x64 does: +APPLY-SPREAD-MAX+ (120)
+              ;; positional arguments and the tail-list word of a
+              ;; +REST-TAIL-NARGS+ (254) call.  It was 32, so a 33..120-argument
+              ;; &rest call built its list from slots nothing had copied.  A
+              ;; function with this copy gets >= 128 slots.
               ;;
               ;; Registers: the whole :trap dispatch is already bracketed with
               ;; push/pop EAX, and this arm additionally saves ECX/EDX/ESI, so
@@ -3165,9 +3224,9 @@
                 (i386-emit-mov-reg-abs buf +scratch0+ *nargs-addr*)
                 (i386-emit-cmp-reg-imm buf +scratch0+ 5)
                 (i386-emit-jcc buf :l done)
-                (i386-emit-cmp-reg-imm buf +scratch0+ 32)
+                (i386-emit-cmp-reg-imm buf +scratch0+ 121)
                 (i386-emit-jcc buf :le nocap)
-                (i386-emit-mov-reg-imm buf +scratch0+ 32)
+                (i386-emit-mov-reg-imm buf +scratch0+ 121)
                 (i386-emit-label buf nocap)
                 ;; EDX = i, starting at +max-reg-args+
                 (i386-emit-mov-reg-imm buf +scratch1+ 4)
@@ -4108,9 +4167,23 @@
            ;; Load Vidx into scratch0, shift left 1 (Vidx*2 = real_idx*4)
            (i386-load-vreg buf +scratch0+ vidx)
            (i386-emit-shl-reg-imm buf +scratch0+ 1)
-           (i386-load-vreg buf +scratch1+ vobj)
-           (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ -5)
+           (if (= vobj +vreg-vfp+)
+               ;; VARIABLE-INDEX FRAME SLOT load: the &rest prologue's loop
+               ;; (emit-rest-prologue) walks frame slots with `aref VFP idx'.  The
+               ;; constant-index VFP case in OBJ-REF addresses frame slots, not an
+               ;; object; without the same arm here the loop read object-formula
+               ;; addresses off the frame pointer, and every &rest call with more
+               ;; than three rest arguments in an image built since adebd4f got a
+               ;; garbage list (x64 and aarch64 had this arm already).
+               ;; Slot N is at EBP + base - N*4.
+               (progn
+                 (i386-emit-neg-reg buf +scratch0+)
+                 (i386-emit-add-reg-reg buf +scratch0+ +i386-ebp+)
+                 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ +frame-slot-base+))
+               (progn
+                 (i386-load-vreg buf +scratch1+ vobj)
+                 (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)
+                 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ -5)))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-aset+)
@@ -5030,7 +5103,7 @@
                  :mvm-length length
                  :mvm-offset offset)))
     ;; Emit prologue
-    (i386-emit-prologue buf (function-frame-slots bytecode offset))
+    (i386-emit-prologue buf (i386-function-frame-slots bytecode offset))
     ;; Pass 1: scan for branch targets
     (i386-scan-branch-targets state)
     ;; Pass 2: translate instructions
@@ -5107,7 +5180,7 @@
     ;; byte-identical to a pre-collector build; wiring it up is a separate job
     ;; that starts with the boot-side init.
     (setf *i386-gc-collect-label*
-          (and *i386-gc-enabled* *i386-linux-mode* (i386-make-label)))
+          (and *i386-gc-enabled* (i386-gc-mode-p) (i386-make-label)))
     ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
     ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
     ;; (REPL/SSH, which have no handler-case) byte-identical; those images are
@@ -5145,8 +5218,8 @@
                (i386-emit-label buf fn-label)
                ;; Emit prologue
                (i386-emit-prologue buf (if (zerop fn-length)
-                                           +frame-legacy-slots+
-                                           (function-frame-slots bytecode fn-offset)))
+                                           :legacy
+                                           (i386-function-frame-slots bytecode fn-offset)))
                ;; Pass 1: scan branch targets
                (i386-scan-branch-targets state)
                ;; Pass 2: translate

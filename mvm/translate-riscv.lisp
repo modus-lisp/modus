@@ -588,6 +588,27 @@
    shamt, so 40 is not merely wrong there — it is unencodable."
   (- (* 8 (rv-word-size)) 24))
 
+(defun rv-emit-alloc-zero-tail (buf)
+  "Zero an allocation's payload, then bump the allocation pointer: with S8 the
+   new object's base and T1 its granule-rounded size, store zero at every word
+   in [S8 + word, S8 + T1), then S8 += T1.  Uses T0 as the cursor and T1 as
+   the end.  The payload is at least one word (sizes are whole granules of two
+   words), so the loop runs at least once.
+
+   x64, aarch64 and i386 hand out zeroed arrays, and Lisp code relies on it:
+   the bignum kernel's digit vectors (8ce31cc, `(make-array n)' with no
+   :initial-element because 'the inline allocation is zeroed') and the
+   compact hash-table index (0 = empty slot).  Unzeroed, once a collection had
+   reused memory, every bignum on riscv read garbage digits and a fresh table
+   index had no empty slot -- the riscv32 CLI evaluated nothing from 10-15."
+  (rv-emit-add buf +rv-t1+ +rv-s8+ +rv-t1+)          ; end
+  (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-word-size))  ; cursor: past the header
+  (let ((top (rv-buffer-position buf)))
+    (rv-emit-store-word buf +rv-x0+ +rv-t0+ 0)
+    (rv-emit-addi buf +rv-t0+ +rv-t0+ (rv-word-size))
+    (rv-emit-bltu buf +rv-t0+ +rv-t1+ (- top (rv-buffer-position buf))))
+  (rv-emit-mv buf +rv-s8+ +rv-t1+))
+
 (defun rv-emit-store-word (buf rs2 rs1 imm12)
   "Store one Lisp word: SD on RV64, SW on RV32."
   (if *riscv-64-bit*
@@ -1344,14 +1365,15 @@
             ;;
             ;; Layout as in the fixed-count copy on frame-enter: argument i is
             ;; at fp + (i-4)*8, slot i at fp + frame-slot-base - i*word.  Capped
-            ;; at 32 arguments, as x64 and i386 cap it (the ladder is unrolled to
-            ;; match).  Every branch skips a fixed run, so the arm is size-stable;
+            ;; at 121 arguments, as x64 and i386 cap it: +APPLY-SPREAD-MAX+
+            ;; positional and the tail-list word of a +REST-TAIL-NARGS+ (254)
+            ;; call.  Every branch skips a fixed run, so the arm is size-stable;
             ;; n < 5 falls straight out because i starts at 4.
             (rv-emit-li buf +rv-t3+ (rv-nargs-addr))
             (rv-emit-load-word buf +rv-t1+ +rv-t3+ 0)          ; n (raw)
-            (rv-emit-addi buf +rv-t2+ +rv-x0+ 32)
-            (rv-emit-bge buf +rv-t2+ +rv-t1+ 8)                ; n <= 32: keep
-            (rv-emit-mv buf +rv-t1+ +rv-t2+)                   ; n = 32
+            (rv-emit-addi buf +rv-t2+ +rv-x0+ 121)
+            (rv-emit-bge buf +rv-t2+ +rv-t1+ 8)                ; n <= 121: keep
+            (rv-emit-mv buf +rv-t1+ +rv-t2+)                   ; n = 121
             (rv-emit-addi buf +rv-t2+ +rv-x0+ 4)               ; i = 4
             (rv-emit-addi buf +rv-t3+ +rv-fp+ 0)               ; src = fp
             (rv-emit-addi buf +rv-t4+ +rv-fp+                  ; dst = slot 4
@@ -2775,18 +2797,32 @@
          (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
          (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
          ;; result = VA + 2 (VA stays granule-aligned -- 16 on RV64, 8 on RV32 --
-         ;; so (rv-object-tag) is exact at both widths)
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
-         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
-         (store-result vd +rv-t0+)))
+         ;; so (rv-object-tag) is exact at both widths); kept on the stack-free
+         ;; side: T2 holds it across the zero fill, which uses T0/T1
+         (rv-emit-addi buf +rv-t2+ +rv-s8+ (rv-object-tag))
+         (rv-emit-alloc-zero-tail buf)
+         (store-result vd +rv-t2+)))
 
       (#.+op-aref+
        (let* ((vd (vreg 0))
-              (robj (resolve (vreg 1)))
               (ridx (resolve2 (vreg 2))))
-         (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
-         (rv-emit-add buf +rv-t2+ +rv-t2+ robj)
-         (rv-emit-load-word buf +rv-t2+ +rv-t2+ (- (rv-word-size) (rv-object-tag)))
+         (if (= (vreg 1) +vreg-vfp+)
+             (progn
+               ;; VARIABLE-INDEX FRAME SLOT load: the &rest prologue's loop
+               ;; (emit-rest-prologue) walks frame slots with `aref VFP idx'.  The
+               ;; constant-index VFP case in OBJ-REF addresses frame slots, not an
+               ;; object; without the same arm here the loop read object-formula
+               ;; addresses off the frame pointer, and every &rest call with more
+               ;; than three rest arguments in an image built since adebd4f got a
+               ;; garbage list (x64 and aarch64 had this arm already).
+               ;; Slot N is at fp + base - N*word.
+               (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
+               (rv-emit-sub buf +rv-t2+ +rv-fp+ +rv-t2+)
+               (rv-emit-load-word buf +rv-t2+ +rv-t2+ +rv-frame-slot-base+))
+             (let ((robj (resolve (vreg 1))))
+               (rv-emit-slli buf +rv-t2+ ridx (rv-index-shift))
+               (rv-emit-add buf +rv-t2+ +rv-t2+ robj)
+               (rv-emit-load-word buf +rv-t2+ +rv-t2+ (- (rv-word-size) (rv-object-tag)))))
          (store-result vd +rv-t2+)))
 
       (#.+op-aset+
@@ -2829,9 +2865,9 @@
          (rv-emit-addi buf +rv-t1+ +rv-t2+ (rv-word-size))
          (rv-emit-addi buf +rv-t1+ +rv-t1+ (1- (rv-granule)))
          (rv-emit-andi buf +rv-t1+ +rv-t1+ (- (rv-granule)))
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
-         (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)
-         (store-result vd +rv-t0+)))
+         (rv-emit-addi buf +rv-t2+ +rv-s8+ (rv-object-tag))
+         (rv-emit-alloc-zero-tail buf)                ; payload zeroed, s8 bumped
+         (store-result vd +rv-t2+)))
 
       ;; ---- Packed single-float vectors (subtag #x12) ----
       ;; Header (N << 8) | #x12 with N in LANES, then N 4-byte IEEE32 lanes

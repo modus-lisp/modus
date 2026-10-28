@@ -1,5 +1,5 @@
 #!/bin/bash
-# make-grub-usb.sh — Create a bootable USB image with GRUB + Modus console REPL
+# make-grub-usb.sh — Create a bootable USB image with GRUB + the Modus CL image
 #
 # Usage:
 #   ./scripts/make-grub-usb.sh              # create /tmp/modus-grub-usb.iso
@@ -17,7 +17,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-BIN=/tmp/modus-x64-console.bin
+BIN=/tmp/modus-x64-cl-pc.bin
 IMG=/tmp/modus-grub-usb.iso
 STAGING=$(mktemp -d /tmp/modus-grub-staging.XXXXXX)
 trap 'rm -rf "$STAGING"' EXIT
@@ -25,13 +25,11 @@ trap 'rm -rf "$STAGING"' EXIT
 # Build kernel if needed
 NEED_BUILD=0
 if [ ! -f "$BIN" ]; then NEED_BUILD=1; fi
-for src in mvm/build-x64-console-repl.lisp mvm/repl-source.lisp net/uefi-console.lisp \
-           boot/boot-x64.lisp boot/boot-uefi-x64.lisp mvm/compiler.lisp mvm/translate-x64.lisp; do
-    [ -f "$src" ] && [ "$src" -nt "$BIN" ] && NEED_BUILD=1
-done
+[ -n "$(find mvm boot net lib runtime -name '*.lisp' -newer "$BIN" -print -quit 2>/dev/null)" ] && NEED_BUILD=1
 if [ "$NEED_BUILD" = 1 ]; then
-    echo "Building x64 console REPL..." >&2
-    sbcl --script mvm/build-x64-console-repl.lisp >&2
+    # the multiboot CL image with the PC console (VGA text + PS/2, beside COM1)
+    echo "Building the x64 CL image with its console..." >&2
+    MODUS_PC_CONSOLE=1 MODUS_CL_REPL_OUT=$BIN sbcl --dynamic-space-size 12288 --script mvm/build-x64-cl-repl.lisp >&2
 fi
 
 echo "Creating GRUB bootable image..." >&2

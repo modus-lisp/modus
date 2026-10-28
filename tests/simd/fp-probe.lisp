@@ -176,4 +176,29 @@
 (check "14 inline f32 make-array" (t14)
        (list 7 '(0.0 0.0 0.0 0.0 0.0 0.0 2.5) 3 0.0 'single-float))
 
+;; 15. typed MAXIMIZE / MINIMIZE: a declared accumulator, the first value
+;;     taken by a flag (quantize's amax), with and without INTO
+(defun t15 (a) (declare (type (simple-array single-float (*)) a))
+  (list (loop for i of-type fixnum from 0 below (length a) maximize (abs (aref a i)) of-type single-float)
+        (loop for i of-type fixnum from 0 below (length a) minimize (aref a i) of-type single-float)
+        (loop for x in '(3 1 2) maximize x of-type fixnum)
+        (loop for x in '(1.5d0 -7.5d0) minimize x into m of-type double-float finally (return m))
+        (loop for x in '(-4.0 -9.0) maximize x of-type single-float)))
+(check "15 typed maximize/minimize" (t15 *a*)
+       (list (reduce #'max (mapcar #'abs *vals*)) (reduce #'min *vals*) 3 -7.5d0 -4.0))
+
+;; 16. int -> single of call-free integer arithmetic, and a byte-array AREF
+;;     inside an FP-resident scope (a K-quant kernel's scales)
+(defun t16 (a sc) (declare (type (simple-array single-float (*)) a) (type (simple-array (unsigned-byte 8) (*)) sc))
+  (let ((s 0.0)) (declare (type single-float s))
+    (dotimes (i (length a) s)
+      (let ((k (aref sc (mod i 4))) (m (- i 3)))
+        (declare (type (unsigned-byte 8) k) (type (signed-byte 32) m))
+        (setq s (+ s (* (aref a i) (float (- (* 32 k) m) 1.0))))))))
+(let ((sc (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 200 3 255))))
+  (check "16 itof of arithmetic, u8 aref in scope" (t16 *a* sc)
+         (let ((s 0.0)) (loop for x in *vals* for i from 0
+                              do (setq s (+ s (* x (float (- (* 32 (aref sc (mod i 4))) (- i 3)) 1.0)))))
+           s)))
+
 (format t "~%FP-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

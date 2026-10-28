@@ -2966,6 +2966,7 @@
                                   ( 5 . 80)    ; fstat
                                   ( 8 . 62)    ; lseek
                                   ( 9 . 222)   ; mmap
+                                  (11 . 215)   ; munmap (FREE-STATIC-VECTOR)
                                   (39 . 172)   ; getpid
                                   (41 . 198)   ; socket
                                   (42 . 203)   ; connect

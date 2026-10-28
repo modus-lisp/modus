@@ -13079,7 +13079,10 @@
                (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                     (symbolp (cadr form))
                     (or (%declared-f32-array-var-p (cadr form) env)
-                        (%declared-generic-array-var-p (cadr form) env))
+                        (%declared-generic-array-var-p (cadr form) env)
+                        ;; a declared byte vector's AREF is one u8 load too (a
+                        ;; K-quant kernel reads its scales beside its lanes)
+                        (%declared-u8-array-var-p (cadr form) env))
                     (%simple-index-form-p (caddr form))))
               ((string= n "SETF")
                ;; (setf (aref A i) v): declared A, simple i; an f32 store needs
@@ -16889,30 +16892,40 @@
              (setf rest (cddr rest))
              ;; Optional type-spec (OF-TYPE x, or a bare simple-type-spec)
              ;; before and after INTO, exactly as SUM / COUNT take it.
-             (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
-               (when ot (setf rest (cdr ot))))
-             (let ((iv (%loop-try-into rest)))
-               (when iv
-                 (let ((ot2 (%loop-try-of-type (cddr iv))))
-                   (when ot2 (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
-               (when iv (setf rest (cddr iv)))
-               (push (if iv (list :maximize expr (car iv)) (list :maximize expr))
-                     (loop-state-accumulator state)))))
+             ;; The type is kept: a typed clause gets a declared accumulator
+             ;; (%LOOP-ACC-DECLARABLE-TYPE, %LOOP-MAXMIN-STMT).
+             (let ((type-spec nil))
+               (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
+                 (when ot (setf type-spec (car ot) rest (cdr ot))))
+               (let ((iv (%loop-try-into rest)))
+                 (when iv
+                   (let ((ot2 (%loop-try-of-type (cddr iv))))
+                     (when ot2
+                       (setf type-spec (car ot2))
+                       (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
+                 (when iv (setf rest (cddr iv)))
+                 (push (list :maximize expr (and iv (car iv)) type-spec)
+                       (loop-state-accumulator state))))))
 
           ((or (= kw 470771431) (= kw 18723802))  ; MINIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              ;; Optional type-spec (OF-TYPE x, or a bare simple-type-spec)
              ;; before and after INTO, exactly as SUM / COUNT take it.
-             (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
-               (when ot (setf rest (cdr ot))))
-             (let ((iv (%loop-try-into rest)))
-               (when iv
-                 (let ((ot2 (%loop-try-of-type (cddr iv))))
-                   (when ot2 (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
-               (when iv (setf rest (cddr iv)))
-               (push (if iv (list :minimize expr (car iv)) (list :minimize expr))
-                     (loop-state-accumulator state)))))
+             ;; The type is kept: a typed clause gets a declared accumulator
+             ;; (%LOOP-ACC-DECLARABLE-TYPE, %LOOP-MAXMIN-STMT).
+             (let ((type-spec nil))
+               (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
+                 (when ot (setf type-spec (car ot) rest (cdr ot))))
+               (let ((iv (%loop-try-into rest)))
+                 (when iv
+                   (let ((ot2 (%loop-try-of-type (cddr iv))))
+                     (when ot2
+                       (setf type-spec (car ot2))
+                       (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
+                 (when iv (setf rest (cddr iv)))
+                 (push (list :minimize expr (and iv (car iv)) type-spec)
+                       (loop-state-accumulator state))))))
 
           ;; WHEN/IF cond <clause> [AND <clause>]* [ELSE <clause> [AND <clause>]*] [END]
           ;;   <clause> = COLLECT/SUM/COUNT/APPEND/NCONC/MAXIMIZE/MINIMIZE expr [INTO var]
@@ -17109,7 +17122,7 @@
    fixnum (the accumulator starts at that type's zero and the user promised
    the sum stays in it)."
   (let ((ts (%loop-acc-type-spec acc-spec)))
-    (and (member (car acc-spec) '(:sum :count))
+    (and (member (car acc-spec) '(:sum :count :maximize :minimize))
          ts (symbolp ts)
          (cond ((string= (symbol-name ts) "SINGLE-FLOAT") 'single-float)
                ((string= (symbol-name ts) "DOUBLE-FLOAT") 'double-float)
@@ -17126,7 +17139,32 @@
         (when e (push (list 'type (cdr e) v) specs))))
     (and specs (list (cons 'declare (nreverse specs))))))
 
+(defun %loop-maxmin-stmt (max-p expr av flag)
+  "The statement a MAXIMIZE (MAX-P) / MINIMIZE clause adds to AV.  With FLAG
+   (a typed accumulator, see MAXMIN-FLAGS) a plain compare on a declared
+   variable; without, AV is NIL until the first value."
+  (if flag
+      `(let ((%acc-v ,expr))
+         (if ,flag
+             (progn (setq ,flag nil) (setq ,av %acc-v))
+             (when (,(if max-p '> '<) %acc-v ,av) (setq ,av %acc-v))))
+      `(let ((%acc-v ,expr))
+         (setq ,av
+               (if (null ,av)
+                   %acc-v
+                   (if (,(if max-p '%loop-gt '%loop-lt) %acc-v ,av) %acc-v ,av))))))
+
 (defun %loop-acc-typed-init-value (acc-spec)
+  (let ((ty (and (member (car acc-spec) '(:maximize :minimize))
+                 (%loop-acc-declarable-type acc-spec))))
+    (if ty
+        ;; a typed MAXIMIZE / MINIMIZE starts at its type's zero; a flag (see
+        ;; MAXMIN-FLAGS) takes the first value.  Never executed, the clause's
+        ;; value is unspecified (CLHS 6.1.3), so the zero is as good as NIL.
+        (cond ((eq ty 'single-float) 0.0) ((eq ty 'double-float) 0d0) (t 0))
+        (%loop-acc-typed-init-value-1 acc-spec))))
+
+(defun %loop-acc-typed-init-value-1 (acc-spec)
   "Like %loop-acc-init-value but honors the OF-TYPE typespec stashed in
    the acc-spec for SUM/COUNT: float types → 0.0, integer → 0, NIL."
   (let ((type-spec (%loop-acc-type-spec acc-spec))
@@ -17298,6 +17336,10 @@
          ;; numeric FOR's variable and temporaries, a typed SUM/COUNT.  The
          ;; LET* chunk that binds VAR carries the declaration.
          (typed nil)
+         ;; (ACC-VAR . FLAG) for a typed MAXIMIZE / MINIMIZE: the flag says no
+         ;; value has been taken yet, so the accumulator can start at its
+         ;; type's zero instead of NIL (and be declared)
+         (maxmin-flags nil)
          (pass-first nil)               ; the first-pass block (see below)
          (pass-next nil)                ; later passes, in clause order
          (firstv nil))
@@ -17340,7 +17382,12 @@
             (push (list av (%loop-acc-typed-init-value acc))
                   bindings)
             (let ((ty (%loop-acc-declarable-type acc)))
-              (when ty (push (cons av ty) typed)))
+              (when ty
+                (push (cons av ty) typed)
+                (when (member (car acc) '(:maximize :minimize))
+                  (let ((f (%mvm-gensym "FIRSTV")))
+                    (push (list f t) bindings)
+                    (push (cons av f) maxmin-flags)))))
             ;; tail pointer for the list category (see %LOOP-ACC-LIST-LINK).
             ;; BOUND-VARS is seeded with the cond-into vars, whose tails are
             ;; already bound above, so this cannot double-bind one.
@@ -17626,20 +17673,11 @@
              (push (%loop-acc-list-link :append (cadr acc) av) acc-body))
             (:nconc
              (push (%loop-acc-list-link :nconc (cadr acc) av) acc-body))
+            ;; (two single-key clauses: the in-image CASE takes no key lists)
             (:maximize
-             (push `(let ((%acc-v ,(cadr acc)))
-                      (setq ,av
-                            (if (null ,av)
-                                %acc-v
-                                (if (%loop-gt %acc-v ,av) %acc-v ,av))))
-                   acc-body))
+             (push (%loop-maxmin-stmt t (cadr acc) av (cdr (assoc av maxmin-flags))) acc-body))
             (:minimize
-             (push `(let ((%acc-v ,(cadr acc)))
-                      (setq ,av
-                            (if (null ,av)
-                                %acc-v
-                                (if (%loop-lt %acc-v ,av) %acc-v ,av))))
-                   acc-body))
+             (push (%loop-maxmin-stmt nil (cadr acc) av (cdr (assoc av maxmin-flags))) acc-body))
             (:always
              (setf has-always t)
              (push `(unless ,(cadr acc) (return-from :%loop-exit nil)) acc-body))
@@ -21355,12 +21393,18 @@
   "FP registers to convert the integer X to a single in register, or NIL.
    X must be at most 53 bits wide, so fixnum -> double (exact) -> single
    rounds once, like a direct conversion; and call-free: a literal, a
-   width-typed variable, or (THE <int> (ROUND tree)), which converts in
-   register itself (%FP-TOI-PLAN).  One register for the result, plus what
+   width-typed variable, + - * ASH ... of those (%SIMPLE-INDEX-FORM-P), or
+   (THE <int> (ROUND tree)), which converts in register itself
+   (%FP-TOI-PLAN).  One register for the result, plus what
    the rounding's own tree holds while it runs."
   (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
        (cond ((integerp x) (and (< (integer-length x) 53) 1))
              ((symbolp x) (let ((w (and x (%expr-width x env)))) (and w (<= w 53) 1)))
+             ;; call-free integer arithmetic of width-typed operands (the
+             ;; index-form shapes): (float (- isum (* 32 imins)) 1.0)
+             ((and (consp x) (%simple-index-form-p x)
+                   (let ((w (%expr-width x env))) (and w (<= w 53))))
+              1)
              (t (let ((plan (%fp-toi-plan x env))
                       (w (and (consp x) (consp (cdr x))
                               (ignore-errors (%decl-int-width (%resolve-declared-type (cadr x)))))))

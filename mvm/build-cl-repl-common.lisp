@@ -1694,7 +1694,13 @@
         ;; crypto; here modus is the USB HOST and the RTL8153 queues what
         ;; arrives, so waiting buys nothing -- and the polls it made DROPPED
         ;; any TCP segment they read.  Spliced after the transport so it wins.
-        (if (and *ssh-build-p* *cl-repl-rpi-p*)
+        ;; EVERY CL image, not only the Pi: none of them is a USB gadget, and the
+        ;; stock keepalive is 100 x (IO-DELAY = 5000 console-register reads, plus
+        ;; a NIC poll that drops what it reads) per call -- 8 calls in every X25519
+        ;; ladder.  Under QEMU a register read is a trap: QEMU virt's X25519 took
+        ;; ~27 s with it and ~35 ms is the Pi's without; the PC images' ~50-60 s
+        ;; SSH connections were the same cost.
+        (if *ssh-build-p*
             (format nil "~%(defun usb-keepalive () 0)~%")
             "")
         ;; Threaded :VIRT maps VA 0x10200000-0x1FFFFFFF to DRAM, so the E1000's

@@ -619,18 +619,22 @@ bitmaps, the window zeroed with TPIDR_EL0 = 0, and vector entry 4 indexing its
 handler slots by TPIDR_EL0 so a worker's fault longjmps to ITS handler-case.
 Measured: every `test/rpi-smp/slots.lisp` check passes on virt (STW walks 0
 bad under 10 region-0 collections, sibling chains 40/40, sleep 300 ms,
-specials/intern on threads).  Each isolated session now makes its OWN
-ephemeral X25519 key on its own core (`SSH-EPH-BASE`, ssh+0x3F80): the
-server-wide key was refreshed on the net domain after every exchange, and at
-virt's ~40 s per X25519 that blocked every accept for as long.  Isolated
-sessions answer sequentially and 2 of 3 overlapping ones completed; the third
-went unanswered while main stopped accepting for a minute after an accept --
-**suspected, not proven**: a region-0 stop-the-world waiting on a worker deep
-in crypto that seldom allocates (the documented "a thread that never allocates
-holds up a region-0 collection").  **OPEN, and NOT virt's: three threads run
-~8x slower EACH than one** (a 3M-iteration loop: 200 ms alone, ~1900 ms with
-three) -- measured identically on the Pi image under raspi3b, with only ~450
-runtime-lock acquisitions, so it is neither the port nor the lock.
+specials/intern on threads).  Each isolated session makes its OWN ephemeral
+X25519 key on its own core (`SSH-EPH-BASE`, ssh+0x3F80) instead of the net
+domain refreshing one server-wide key after every exchange.  Isolated SSH on
+virt: 4 overlapping sessions + 2 sequential, 18 of 18 answered over 3 runs,
+~77 s a run including boot.
+
+**`USB-KEEPALIVE` WAS 99.9% OF EVERY CL IMAGE'S CRYPTO but the Pi's.**  ssh.lisp's
+stock keepalive (for a USB GADGET whose host would drop the link) is 100 x
+(IO-DELAY = 5000 console-register reads + a NIC poll that DROPS what it reads)
+per call, 8 calls per X25519 ladder; under QEMU each register read is a trap.
+Only the Pi build stubbed it.  virt's X25519 went **27 s -> 32 ms** with the stub
+on every SSH build; the PC images' recorded ~50-60 s connections are probably
+the same cost (not re-measured).  **OPEN: INTERPRETED code on several threads at
+once is ~8x slower each** (an interpreted 3M-add loop: ~190 ms alone, ~1700 ms
+with three, on virt and on the Pi image under raspi3b, ~450 runtime-lock
+acquisitions); native code scales (20 x X25519: ~300 ms alone and with three).
 
 ### Running i386 (hosted Linux/i386 — the REAL CL image)
 

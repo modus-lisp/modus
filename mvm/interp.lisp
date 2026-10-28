@@ -226,7 +226,12 @@
                (when (and (char= (char name i) #\:) (char= (char name (+ i 1)) #\:))
                  (setq cut (+ i 2)) (return))
                (setq i (+ i 1)))
+             ;; Not for a name that shadows a CL external: its bare entry is
+             ;; CL's function, and P::LDB is not CL:LDB -- see %FN-INFO-FOR-KEY.
              (and cut (< cut n)
+                  (not (and (fboundp '%shadows-cl-name-p)
+                            (let ((s (find-symbol (subseq name cut) (subseq name 0 (- cut 2)))))
+                              (and s (funcall '%shadows-cl-name-p s)))))
                   (gethash (subseq name cut) *symbol-function-table*))))))
 
 (defun %rt-stub-count (runtime-table)

@@ -2406,6 +2406,11 @@
     ;; linear path for good: 4000 (list i j) inserts took 0.9 s (SBCL 1 ms).
     ;; EQ/EQL tables keep identity semantics, so conses stay :NOHASH there.
     ((and strcmp? (consp key)) (logand (%ht-cons-hash key 0) mask))
+    ;; A PATHNAME key in an EQUAL table hashes by its namestring, which is what
+    ;; EQUAL compares (%EQUAL-OTHER).  :NOHASH sent the table down the linear path
+    ;; for good, each probe a NAMESTRING pair per entry: 3000 pathname keys took
+    ;; 41 s, and cortez's per-file tables made a corpus load crawl.
+    ((and strcmp? (pathnamep key)) (%ht-hash (namestring key) strcmp? mask))
     (t (%ht-nohash))))
 
 ;;; Structural hash for cons keys of EQUAL tables.  It must give EQUAL keys
@@ -2665,8 +2670,8 @@
                  (when (let ((ek (car e))) (and (stringp ek) (string= ek key)))
                    (return e)))
                (setq cur (cdr cur))))
-            ((and strcmp? (consp key))
-             ;; a list key of an EQUAL table, by structure (%HT-HASH); under
+            ((and strcmp? (or (consp key) (pathnamep key)))
+             ;; a list or pathname key of an EQUAL table, as %HT-HASH hashes it; under
              ;; EQ/EQL a cons is an identity key (the ADDRESS INDEX)
              (loop
                (when (null cur) (return nil))
@@ -2693,7 +2698,7 @@
             (let* ((e (car cur)) (ek (car e)))
               (when (cond ((eq strcmp? :equalp) (equalp ek key))
                           ((and strcmp? (stringp key)) (and (stringp ek) (string= ek key)))
-                          ((and strcmp? (consp key)) (equal ek key))
+                          ((and strcmp? (or (consp key) (pathnamep key))) (equal ek key))
                           (t (eq ek key)))
                 (return cur)))
             (setq cur (cdr cur)))))))
@@ -2720,7 +2725,7 @@
             (unless (cond ((eq strcmp? :equalp) (equalp ek key))
                           ((and strcmp? (stringp key))
                            (and (stringp ek) (string= ek key)))
-                          ((and strcmp? (consp key)) (equal ek key))
+                          ((and strcmp? (or (consp key) (pathnamep key))) (equal ek key))
                           (t (eql ek key)))
               (setq result (cons (car cur) result))))
           (setq cur (cdr cur)))
@@ -2906,7 +2911,7 @@
   "KEY matches stored key K, as %HT-BUCKET-FIND matches."
   (cond ((eq strcmp? :equalp) (equalp k key))
         ((and strcmp? (stringp key)) (and (stringp k) (string= k key)))
-        ((and strcmp? (consp key)) (equal k key))
+        ((and strcmp? (or (consp key) (pathnamep key))) (equal k key))
         (t (eq k key))))
 
 (defun %htd-obj-key-p (ht key strcmp?)
@@ -2927,10 +2932,10 @@
                       (ash (%prim-array-length idx) -2))
                   1))
          (cap (ash (- elen 2) -1))
-         ;; EQ unless EQUALP (1 is EQUALP to 1.0), string content or a list
+         ;; EQ unless EQUALP (1 is EQUALP to 1.0), string content, a list or a pathname
          (ident (and (not (eq strcmp? :equalp))
                      (or (fixnump key)
-                         (not (and strcmp? (or (stringp key) (consp key)))))))
+                         (not (and strcmp? (or (stringp key) (consp key) (pathnamep key)))))))
          (strings (and (eq strcmp? t) (stringp key)))
          (i h))
     (loop

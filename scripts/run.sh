@@ -15,16 +15,16 @@
 #   ./scripts/run.sh list                    # show the matrix
 #   ./scripts/run.sh x64-repl                # interactive serial REPL
 #   ./scripts/run.sh x64-repl "(+ 1 2)"      # eval one expression, print, exit
-#   ./scripts/run.sh aarch64-ssh             # boot, wait for sshd, run a smoke test
+#   ./scripts/run.sh i386-ssh                # boot, wait for sshd, run a smoke test
 #   ./scripts/run.sh x64-ssh "(* 6 7)"       # boot, run THIS expression over ssh
-#   ./scripts/run.sh aarch64-ssh --keep      # ... and leave QEMU running
+#   ./scripts/run.sh i386-ssh --keep         # ... and leave QEMU running
 #   ./scripts/run.sh x64-ssh --serve         # boot and BLOCK, like run-x64-ssh.sh
 #   PORT=2223 ./scripts/run.sh x64-ssh       # override the forwarded port
 #
 # Environment:
 #   PORT                 forwarded ssh port (default 2222)
 #   SBCL_DYNAMIC_SPACE   MB for the build's SBCL heap (default 12288)
-#   REPL_TIMEOUT         see run-repl-eval.sh (default 60s)
+#   REPL_TIMEOUT         see run-repl-eval.sh (default 300s)
 #   MODUS_NO_REBUILD=1   never rebuild; boot the image already on disk
 #
 # Ctrl-A X quits QEMU in interactive mode.
@@ -51,10 +51,8 @@ read -r -d '' TARGETS <<'EOF' || true
 x64-repl|repl|x64/bare/qemu/repl|/tmp/modus-x64.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
 x64-cl-repl|repl|build-x64-cl-repl|/tmp/modus-x64-cl-repl.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
 x64-ssh|ssh|x64/bare/qemu/ssh|/tmp/modus-x64-ssh.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|x64
-aarch64-repl|repl|aarch64/bare/qemu/repl|/tmp/modus-aarch64.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|||aarch64
-aarch64-ssh|ssh|aarch64/bare/qemu/ssh|/tmp/modus-aarch64-ssh.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|aarch64
-aarch64-actors|ssh|aarch64/bare/qemu/actors|/tmp/modus-aarch64-actors.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|aarch64
-aarch64-isolated|ssh|aarch64/bare/qemu/isolated|/tmp/modus-aarch64-isolated.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|aarch64
+aarch64-cl-repl|repl|aarch64/bare/qemu/cl-repl|/tmp/modus-aarch64-cl-repl.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 1024 -nographic -no-reboot|||aarch64
+aarch64-ssh|ssh|aarch64/bare/qemu/cl-ssh|/tmp/modus-aarch64-cl-ssh.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 1024 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0|NETUP;1200;3|aarch64
 i386-cl-repl|repl|build-i386-cl-repl|/tmp/modus-i386-cl-repl.bin|qemu-system-i386|-m 1024 -display none -serial stdio -no-reboot|||i386
 i386-repl|repl|build-i386-repl|/tmp/modus-i386.bin|qemu-system-i386|-m 256 -display none -serial stdio -no-reboot|||i386
 i386-ssh|ssh|i386/bare/qemu/ssh|/tmp/modus-i386-ssh.bin|qemu-system-i386|-m 256 -nographic -no-reboot|-device ne2k_isa,netdev=net0,iobase=0x300,irq=9|DHCP:IP=;120;5|i386

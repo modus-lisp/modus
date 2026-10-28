@@ -292,9 +292,9 @@
     "net/e1000.lisp" "net/dwc2.lisp" "net/dwc2-device.lisp"
     "net/usb.lisp" "net/cdc-ether.lisp" "net/hid.lisp"
     "net/actors.lisp" "net/actors-net-overrides.lisp"
-    "net/isolated-net.lisp" "net/ne2000.lisp"
+    "net/ne2000.lisp"
     "net/32bit-overrides.lisp"
-    "net/arch-aarch64.lisp" "net/arch-raspi3b.lisp" "net/arch-x86.lisp"
+    "net/arch-raspi3b.lisp" "net/arch-x86.lisp"
     "net/arch-i386.lisp" "net/arch-arm32-rpi.lisp"
     "net/uart-bootloader.lisp"))
 

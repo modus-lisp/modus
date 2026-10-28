@@ -54,6 +54,10 @@
 ;;;              build-x64-repl, build-aarch64-repl, build-rpi-repl,
 ;;;              build-x64-ssh, build-aarch64-ssh, build-aarch64-actors,
 ;;;              build-aarch64-isolated, build-i386-ssh.   (36 -> 28)
+;;;              The QEMU-virt mini-Lisp cells (aarch64/bare/qemu/repl, ssh,
+;;;              actors, isolated) are GONE (2026-10-28), not aliased: the CL
+;;;              image (aarch64/bare/qemu/cl-repl, build-aarch64.lisp) has a
+;;;              REPL, SSH, threads and the isolated server.
 ;;; OUTPUT PATHS ARE TRANSCRIBED FROM THE SCRIPTS, not from the docs.  An
 ;;; audit of all 28 rows found SEVEN wrong — they had been written from
 ;;; BUILDS.md and the run scripts rather than from what each build actually
@@ -73,11 +77,9 @@
      :legacy nil :x64     "/tmp/modus-selfhost"            "build-modus-selfhost")
 
     ;; ---------------- bare / qemu ----------------
-    ;; The four REPL cells are MIGRATED: pure table data, no per-cell code.
+    ;; The REPL cells are MIGRATED: pure table data, no per-cell code.
     ("x64/bare/qemu/repl"     :x64     :bare   :qemu :repl
      :native :x86-64  :x64     "/tmp/modus-x64.bin"        "build-x64-repl")
-    ("aarch64/bare/qemu/repl" :aarch64 :bare   :qemu :repl
-     :native :aarch64 :aarch64 "/tmp/modus-aarch64.bin"    "build-aarch64-repl")
     ("i386/bare/qemu/repl"    :i386    :bare   :qemu :repl
      :legacy :i386    :i386    "/tmp/modus-i386.bin"       "build-i386-repl")
 
@@ -85,15 +87,9 @@
      :legacy nil :x64     "/tmp/modus-x64-cl-repl.bin"     "build-x64-cl-repl")
     ("i386/bare/qemu/cl-repl" :i386    :bare   :qemu :cl-repl
      :legacy nil :i386    "/tmp/modus-i386-cl-repl.bin"    "build-i386-cl-repl")
-    ;; The five SSH/actors cells are MIGRATED — see *COMPOSITES* below.
+    ;; The SSH cells are MIGRATED — see *COMPOSITES* below.
     ("x64/bare/qemu/ssh"      :x64     :bare   :qemu :ssh
      :native :x86-64  :x64     "/tmp/modus-x64-ssh.bin"    "build-x64-ssh")
-    ("aarch64/bare/qemu/ssh"  :aarch64 :bare   :qemu :ssh
-     :native :aarch64 :aarch64 "/tmp/modus-aarch64-ssh.bin" "build-aarch64-ssh")
-    ("aarch64/bare/qemu/actors" :aarch64 :bare :qemu :actors
-     :native :aarch64 :aarch64 "/tmp/modus-aarch64-actors.bin" "build-aarch64-actors")
-    ("aarch64/bare/qemu/isolated" :aarch64 :bare :qemu :isolated
-     :native :aarch64 :aarch64 "/tmp/modus-aarch64-isolated.bin" "build-aarch64-isolated")
     ("i386/bare/qemu/ssh"     :i386    :bare   :qemu :ssh
      :native :i386    :i386    "/tmp/modus-i386-ssh.bin"   "build-i386-ssh")
     ;; The CLEAN QEMU-virt counterpart of the cl-repl cell below: the SAME
@@ -107,6 +103,10 @@
     ;; aarch64/bare/rpi/cl-net comment for what the flag turns on.
     ("aarch64/bare/qemu/cl-net" :aarch64 :bare :qemu :cl-net
      :legacy nil :aarch64 "/tmp/modus-aarch64-cl-net.bin" "build-aarch64")
+    ;; The SSH server on the same image, started from kernel-main (*CELL-ENV*):
+    ;; what the retired mini-Lisp aarch64/bare/qemu/ssh cell was for.
+    ("aarch64/bare/qemu/cl-ssh" :aarch64 :bare :qemu :cl-ssh
+     :legacy nil :aarch64 "/tmp/modus-aarch64-cl-ssh.bin" "build-aarch64")
 
     ;; ---------------- bare / rpi ----------------
     ;; #209 rung 1 LANDED: the RPi family's migration onto the CL/mvm image.
@@ -230,7 +230,13 @@
     ("aarch64/bare/qemu/cl-net"
      ("MODUS_NET_BUILD"   . "1")
      ("MODUS_NET_BUFSZ"   . "400000")
-     ("MODUS_CL_REPL_OUT" . "/tmp/modus-aarch64-cl-net.bin"))))
+     ("MODUS_CL_REPL_OUT" . "/tmp/modus-aarch64-cl-net.bin"))
+    ;; SSH from boot: net pipeline (no library fetch), then (ssh-boot).
+    ("aarch64/bare/qemu/cl-ssh"
+     ("MODUS_NET_BUILD"     . "1")
+     ("MODUS_SSH_BUILD"     . "1")
+     ("MODUS_SSH_AUTOSTART" . "1")
+     ("MODUS_CL_REPL_OUT"   . "/tmp/modus-aarch64-cl-ssh.bin"))))
 
 (defun apply-cell-env (key)
   (let ((entry (assoc key *cell-env* :test #'string-equal)))
@@ -434,128 +440,6 @@
                          "  (pre-compute-host-sign)"
                          "  (pre-compute-server-eph (conn-ssh 0))"
                          "  (ssh-server 22))"
-    ))
-
-(defparameter *aarch64-ssh-main*
-  '(
-                         ;; Split kernel-main to stay under ~25 sequential forms per function
-                         "(defun km-init-crypto ()"
-                         "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93) (sha256-init)"
-                         "  (%serial-byte 91) (%serial-byte 50) (%serial-byte 93) (sha512-init)"
-                         "  (%serial-byte 91) (%serial-byte 51) (%serial-byte 93) (ed25519-init)"
-                         "  (%serial-byte 91) (%serial-byte 52) (%serial-byte 93) (ssh-seed-random) 0)"
-                         "(defun km-init-net ()"
-                         "  (%serial-byte 91) (%serial-byte 53) (%serial-byte 93) (dhcp-client)"
-                         "  (%serial-byte 91) (%serial-byte 54) (%serial-byte 93) (ssh-seed-random)"
-                         "  (ssh-init-strings) 0)"
-                         "(defun km-set-host-key ()"
-                         "  (let ((state (e1000-state-base)))"
-                         "    (setf (mem-ref (+ state #x710) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x718) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x720) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x728) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x730) :u32) #xBC276A3B)"
-                         "    (setf (mem-ref (+ state #x734) :u32) #x2DA4B6CE)"
-                         "    (setf (mem-ref (+ state #x738) :u32) #xD0A8A362)"
-                         "    (setf (mem-ref (+ state #x73C) :u32) #x730D6F2A)"
-                         "    (setf (mem-ref (+ state #x740) :u32) #x77153265)"
-                         "    (setf (mem-ref (+ state #x744) :u32) #xA643E21D)"
-                         "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
-                         "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
-                         "    (setf (mem-ref (+ state #x624) :u32) 1)) 0)"
-                         "(defun km-set-eph-priv ()"
-                         "  (let ((state (e1000-state-base)))"
-                         "    (setf (mem-ref (+ state #x6C4) :u8) #x00)"
-                         "    (dotimes (i 30)"
-                         "      (setf (mem-ref (+ state (+ #x6C5 i)) :u8) #x01))"
-                         "    (setf (mem-ref (+ state #x6E3) :u8) #x41)) 0)"
-                         ;; Use :u32 writes for ephemeral public key (8 writes instead of 32)
-                         "(defun km-set-eph-pub ()"
-                         "  (let ((state (e1000-state-base)))"
-                         "    (setf (mem-ref (+ state #x6E4) :u32) #x9292E0A4)"
-                         "    (setf (mem-ref (+ state #x6E8) :u32) #x78C251B6)"
-                         "    (setf (mem-ref (+ state #x6EC) :u32) #x562C77B9)"
-                         "    (setf (mem-ref (+ state #x6F0) :u32) #xBBA95F9F)"
-                         "    (setf (mem-ref (+ state #x6F4) :u32) #xB406D913)"
-                         "    (setf (mem-ref (+ state #x6F8) :u32) #x9D8CB66A)"
-                         "    (setf (mem-ref (+ state #x6FC) :u32) #x442BDCF9)"
-                         "    (setf (mem-ref (+ state #x700) :u32) #x09A2F809)) 0)"
-                         "(defun km-init-conns ()"
-                         "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
-                         "  (let ((i 0))"
-                         "    (loop"
-                         "      (when (>= i 4) (return 0))"
-                         "      (setf (mem-ref (conn-base i) :u32) 0)"
-                         "      (setq i (+ i 1)))) 0)"
-                         "(defun kernel-main ()"
-                         "  (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)"
-                         "  (pci-assign-bars)"
-                         "  (e1000-probe)"
-                         "  (km-init-crypto)"
-                         "  (km-init-net)"
-                         "  (km-set-host-key)"
-                         "  (pre-compute-host-sign)"
-                         "  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)"
-                         "  (%serial-byte 58) (print-dec 22) (%serial-byte 10)"
-                         "  (km-init-conns)"
-                         "  (km-set-eph-priv) (km-set-eph-pub)"
-                         "  (enable-gic-timer)"
-                         "  (net-actor-main))"
-    ))
-
-(defparameter *aarch64-actor-main*
-  '(
-                         "(defun kernel-main ()"
-                         "  (smp-init)"
-                         "  (actor-init)"
-                         ;; Clear eval globals pointer — uninitialized RAM causes hang
-                         "  (setf (mem-ref (+ (ssh-ipc-base) #x60000) :u64) 0)"
-                         "  (pci-assign-bars)"
-                         "  (e1000-probe)"
-                         "  (%serial-byte 91) (%serial-byte 49) (%serial-byte 93)"
-                         "  (sha256-init)"
-                         "  (%serial-byte 91) (%serial-byte 50) (%serial-byte 93)"
-                         "  (sha512-init)"
-                         "  (%serial-byte 91) (%serial-byte 51) (%serial-byte 93)"
-                         "  (ed25519-init)"
-                         "  (%serial-byte 91) (%serial-byte 52) (%serial-byte 93)"
-                         "  (ssh-seed-random)"
-                         "  (%serial-byte 91) (%serial-byte 53) (%serial-byte 93)"
-                         "  (dhcp-client)"
-                         "  (%serial-byte 91) (%serial-byte 54) (%serial-byte 93)"
-                         "  (ssh-seed-random)"
-                         "  (ssh-init-strings)"
-                         ;; Embed pre-computed Ed25519 host key
-                         "  (let ((state (e1000-state-base)))"
-                         "    (setf (mem-ref (+ state #x710) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x718) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x720) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x728) :u64) 0)"
-                         "    (setf (mem-ref (+ state #x730) :u32) #xBC276A3B)"
-                         "    (setf (mem-ref (+ state #x734) :u32) #x2DA4B6CE)"
-                         "    (setf (mem-ref (+ state #x738) :u32) #xD0A8A362)"
-                         "    (setf (mem-ref (+ state #x73C) :u32) #x730D6F2A)"
-                         "    (setf (mem-ref (+ state #x740) :u32) #x77153265)"
-                         "    (setf (mem-ref (+ state #x744) :u32) #xA643E21D)"
-                         "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
-                         "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
-                         "    (setf (mem-ref (+ state #x624) :u32) 1))"
-                         ;; Pre-compute ed25519 host key derivatives (s, prefix)
-                         "  (pre-compute-host-sign)"
-                         "  (%serial-byte 83) (%serial-byte 83) (%serial-byte 72)"
-                         "  (%serial-byte 58) (print-dec 22) (%serial-byte 10)"
-                         "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
-                         "  (let ((i 0))"
-                         "    (loop"
-                         "      (when (>= i 4) (return 0))"
-                         "      (setf (mem-ref (conn-base i) :u32) 0)"
-                         "      (setq i (+ i 1))))"
-                         ;; Pre-compute server ephemeral X25519 key pair
-                         "  (pre-compute-server-eph (conn-ssh 0))"
-                         ;; Spawn net-actor-main as actor 2
-                         "  (actor-spawn (fn-addr net-actor-main))"
-                         ;; Primordial actor: idle yield loop
-                         "  (loop (yield)))"
     ))
 
 (defparameter *i386-ssh-main*
@@ -800,37 +684,6 @@
      ;; *COMPILE-PLAIN-ARRAYS* in compiler.lisp.
      :flags (("*COMPILE-PLAIN-ARRAYS*" . t))
      :main ,*x64-ssh-main*)
-
-    ("aarch64/bare/qemu/ssh"
-     :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "e1000.lisp" "ip.lisp" "crypto.lisp"
-           "crypto-fast.lisp" "ssh.lisp" "ssh-profile.lisp")
-     :parts (:net :repl :main)
-     ;; GICv2 + virtual timer init for setup-irq
-     :flags (("*AARCH64-SETUP-IRQ-ENABLE*" . t)
-             ("*COMPILE-PLAIN-ARRAYS*" . t))
-     :main ,*aarch64-ssh-main*)
-
-    ;; actors and isolated share ONE kernel-main verbatim; isolated differs
-    ;; only by appending isolated-net.lisp (the Qubes-like overrides, LAST).
-    ("aarch64/bare/qemu/actors"
-     :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
-           "crypto.lisp" "crypto-fast.lisp" "ssh.lisp" "http.lisp"
-           "http-client.lisp"
-           "actors-net-overrides.lisp")
-     :parts (:main :net :repl)
-     :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200)
-             ("*COMPILE-PLAIN-ARRAYS*" . t))
-     :main ,*aarch64-actor-main*)
-
-    ("aarch64/bare/qemu/isolated"
-     :net ("bare-runtime-stubs.lisp" "arch-aarch64.lisp" "actors.lisp" "e1000.lisp" "ip.lisp"
-           "crypto.lisp" "crypto-fast.lisp" "ssh.lisp" "http.lisp"
-           "http-client.lisp"
-           "actors-net-overrides.lisp" "isolated-net.lisp")
-     :parts (:main :net :repl)
-     :flags (("*AARCH64-SCHED-LOCK-ADDR*" . #x41200200)
-             ("*COMPILE-PLAIN-ARRAYS*" . t))
-     :main ,*aarch64-actor-main*)
 
     ("i386/bare/qemu/ssh"
      ;; crypto-w32 MUST follow crypto + crypto-32: it overrides sha256 /

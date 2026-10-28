@@ -263,7 +263,7 @@ All SSH scripts support batch mode — pass an expression as the second argument
 
 ```bash
 ./scripts/run-x64-ssh.sh 2222 "(+ 1 2)"       # → = 3
-./scripts/run-aarch64-ssh.sh 2222 "(+ 1 2)"    # → = 3
+./scripts/run.sh aarch64-ssh "(+ 1 2)"        # → = 3
 ./scripts/run-i386-ssh.sh 2222 "(+ 1 2)"       # → = 3
 ./scripts/run-arm32-ssh.sh 2222 "(+ 1 2)"      # → = 3
 ```
@@ -278,8 +278,8 @@ All SSH scripts support batch mode — pass an expression as the second argument
 ### AArch64 (QEMU virt)
 
 ```bash
-./scripts/run.sh aarch64-repl  # AArch64 REPL on QEMU virt
-./scripts/run-aarch64-ssh.sh   # AArch64 with SSH networking (E1000, port 2222)
+./scripts/run.sh aarch64-cl-repl   # the CL REPL on QEMU virt
+./scripts/run.sh aarch64-ssh       # the same image with SSH over E1000 (port 2222)
 ```
 
 ### i386 (QEMU)

@@ -43,12 +43,13 @@ mvm/            MVM compiler, translators, and build scripts
   build-*.lisp         Build scripts (see Build Commands below)
 
 net/            Networking, crypto, USB, actor system
-  arch-aarch64.lisp    QEMU virt PCI/E1000 adapter + actor addresses
+  arch-aarch64-cl.lisp QEMU virt PCI/E1000 adapter (the CL image)
   arch-raspi3b.lisp    RPi adapter (DMA addresses, actor addresses)
   arch-x86.lisp        x86 adapter
   actors.lisp          Cooperative actor system (spawn, yield, send/receive, scheduling)
   actors-net-overrides.lisp   Actor-aware SSH overrides
-  isolated-net.lisp    Qubes-like isolation (net-domain owns all hardware)
+  isolated-cl.lisp     Qubes-like isolation: the net domain owns the NIC, SSH
+                       sessions are bare-threads (Pi and QEMU virt CL images)
   e1000.lisp           Intel E1000 NIC driver
   dwc2.lisp            DWC2 USB host controller (RPi 3B QEMU)
   dwc2-device.lisp     DWC2 USB gadget + CDC-ECM (Pi Zero 2 W)
@@ -558,25 +559,20 @@ Two kinds of build:
   conformance have no runner until the sweep runs there (the aarch64 CLI under
   qemu-user is the next candidate).
 
-### QEMU AArch64 (virt machine, E1000)
+### QEMU AArch64 (virt machine, E1000) — the CL image
 ```bash
-# SSH server (single-threaded)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/ssh
-# Actors (cooperative multi-connection SSH)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/actors
-# Isolated actors (Qubes-like, net-domain owns hardware)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/isolated
-# REPL only (serial)
-sbcl --script mvm/build.lisp aarch64/bare/qemu/repl
+./scripts/run.sh aarch64-cl-repl "(+ 1 2)"     # REPL (build-aarch64.lisp)
+./scripts/run.sh aarch64-ssh "(+ 1 2)"         # SSH from boot (cell aarch64/bare/qemu/cl-ssh)
+# Threads + the isolated server (sessions on cores 1-3):
+MODUS_SSH_ISOLATED=1 MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 \
+  sbcl --dynamic-space-size 12288 --script mvm/build-aarch64.lisp
+qemu-system-aarch64 -machine virt -cpu cortex-a57 -smp 4 -m 1024 -nographic -no-reboot \
+  -kernel /tmp/modus-aarch64-cl-repl.bin \
+  -device 'e1000,netdev=net0,romfile=,rombar=0' -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
+# then at the prompt: (run-net-pipeline) (ssh-boot)
 ```
-
-QEMU launch (actors example):
-```bash
-qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-  -kernel /tmp/modus-aarch64-actors.bin -nographic -semihosting \
-  -device 'e1000,netdev=net0,romfile=,rombar=0' \
-  -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
-```
+The mini-Lisp virt images (`aarch64/bare/qemu/{repl,ssh,actors,isolated}`,
+`net/isolated-net.lisp`, `net/arch-aarch64.lisp`) were retired 2026-10-28.
 
 ### QEMU RPi 3B (DWC2 USB host, CDC Ethernet)
 ```bash
@@ -4013,7 +4009,7 @@ Per-platform adapters provide: `e1000-send`, `e1000-receive`, `e1000-state-base`
 Source load order matters — later files override earlier defuns:
 ```
 arch-* → [actors] → NIC driver → ip → crypto → ssh → http → http-client →
-[actors-net-overrides] → [isolated-net]
+[actors-net-overrides] → [isolated-cl]
 ```
 
 ## Testing

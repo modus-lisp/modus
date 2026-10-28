@@ -47,12 +47,8 @@ riscv32-linux      | -                                                 | mvm/bui
 
 # ---- mini-Lisp (repl-source) images: build.lisp native cells ----
 x64-repl           | -                                                 | mvm/build.lisp x64/bare/qemu/repl
-aarch64-repl       | -                                                 | mvm/build.lisp aarch64/bare/qemu/repl
 rpi-repl           | -                                                 | mvm/build.lisp aarch64/bare/rpi/repl
 x64-ssh            | -                                                 | mvm/build.lisp x64/bare/qemu/ssh
-aarch64-ssh        | -                                                 | mvm/build.lisp aarch64/bare/qemu/ssh
-aarch64-actors     | -                                                 | mvm/build.lisp aarch64/bare/qemu/actors
-aarch64-isolated   | -                                                 | mvm/build.lisp aarch64/bare/qemu/isolated
 i386-ssh           | -                                                 | mvm/build.lisp i386/bare/qemu/ssh
 
 # ---- mini-Lisp images: standalone scripts ----

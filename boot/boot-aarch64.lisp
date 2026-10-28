@@ -261,6 +261,17 @@
 ;;     per file.  Continuation lives in the unused entry-8 slot.
 (defvar *aarch64-ansi-deadline-hardening* nil)
 
+(defvar *aarch64-fixpoint-threads* nil
+  "When T (the CL image built MODUS_RPI_THREADS=1, net/bare-threads.lisp): the
+   fixpoint entry maps VA 0x10200000-0x1FFFFFFF to DRAM at PA +0x50000000 (needs
+   QEMU -m 1024) instead of PCI identity, so the thread layer's tables, stacks'
+   page tables and per-core heaps are RAM -- the E1000's BARs move to 0x30000000;
+   keeps L2[64] DRAM (no GIC: the GC bitmaps live there); zeroes the per-thread
+   window's high slots, TPIDR_EL0 (the window delta, core 0's is 0) and publishes
+   the per-CPU pointer at window slot 0x1000FFE8, as boot-rpi-cl.lisp does; and
+   gives vector entry 4 the thread-aware prefix (see EMIT-AARCH64-EXCEPTION-
+   VECTORS).  NIL keeps every existing image byte-identical.")
+
 (defun emit-aarch64-exception-vectors (buf)
   "Emit AArch64 exception vector table.
    Must be aligned to 2KB (0x800).
@@ -872,17 +883,6 @@
 ;; which calls %gc-collect (gc.lisp).  After collection the trampoline
 ;; reloads x24/x25 from updated metadata slots.  See mvm/gc.lisp for
 ;; the algorithm and 0x10000040–0x10000078 metadata layout.
-(defvar *aarch64-fixpoint-threads* nil
-  "When T (the CL image built MODUS_RPI_THREADS=1, net/bare-threads.lisp): the
-   fixpoint entry maps VA 0x10200000-0x1FFFFFFF to DRAM at PA +0x50000000 (needs
-   QEMU -m 1024) instead of PCI identity, so the thread layer's tables, stacks'
-   page tables and per-core heaps are RAM -- the E1000's BARs move to 0x30000000;
-   keeps L2[64] DRAM (no GIC: the GC bitmaps live there); zeroes the per-thread
-   window's high slots, TPIDR_EL0 (the window delta, core 0's is 0) and publishes
-   the per-CPU pointer at window slot 0x1000FFE8, as boot-rpi-cl.lisp does; and
-   gives vector entry 4 the thread-aware prefix (see EMIT-AARCH64-EXCEPTION-
-   VECTORS).  NIL keeps every existing image byte-identical.")
-
 (defvar *aarch64-fixpoint-big-heap* nil
   "When T the fixpoint entry maps VA 0x10200000-0x3FFFFFFF to DRAM (+0x40000000,
    needs QEMU -m 1024) instead of PCI identity, and starts the bump allocator at

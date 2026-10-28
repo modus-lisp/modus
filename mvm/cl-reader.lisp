@@ -1382,14 +1382,21 @@
                  (%reader-error "dot at start of list"))
                (unread-char next stream)
                (let ((cdr-val (%read-internal stream t nil t)))
-                 ;; Skip whitespace and read closing paren
+                 ;; Skip to the closing paren.  Whitespace is not all that may
+                 ;; come between: a ; or #| |# comment or a false #+ reads as
+                 ;; nothing (CLHS 2.4.1), so read one item and go on if it is
+                 ;; the no-value sentinel.  `(a . ,b ; why\n)' was a reader-error.
                  (let ((close-ch nil))
                    (loop
                      (setq close-ch (read-char stream nil nil t))
                      (when (null close-ch) (%reader-error "end of file after dotted pair"))
-                     (unless (%rt-ws-p close-ch rt) (return nil)))
-                   (unless (eql close-ch #\))
-                     (%reader-error "more than one object after dot")))
+                     (cond ((%rt-ws-p close-ch rt) nil)
+                           ((eql close-ch #\)) (return nil))
+                           ((eq (%read-check-macro-rt close-ch rt) :semicolon)
+                            (%skip-line-comment stream))   ; as the element loop above
+                           (t (unread-char close-ch stream)
+                              (unless (eq (%read-internal stream t nil t) *rdr-no-value*)
+                                (%reader-error "more than one object after dot"))))))
                  ;; Set cdr of last cons
                  (if tail (set-cdr tail cdr-val) (setq result (list cdr-val)))
                  (setq dotted t)

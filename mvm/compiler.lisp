@@ -21124,9 +21124,29 @@
             (and a b (max a (1+ b)))))
          ((%fp-single-conversion-arg form)
           (let ((x (%fp-single-conversion-arg form)))
-            (or (%fp-tree-need x env) (%fpd-pure-need x env))))
+            (or (%fp-tree-need x env) (%fpd-pure-need x env)
+                (%fp-itof-need x env))))
          (t nil)))
       (t nil))))
+
+(defun %fp-itof-need (x env)
+  "FP registers to convert the integer X to a single in register, or NIL.
+   X must be at most 53 bits wide, so fixnum -> double (exact) -> single
+   rounds once, like a direct conversion; and call-free: a literal, a
+   width-typed variable, or (THE <int> (ROUND tree)), which converts in
+   register itself (%FP-TOI-PLAN).  One register for the result, plus what
+   the rounding's own tree holds while it runs."
+  (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+       (cond ((integerp x) (and (< (integer-length x) 53) 1))
+             ((symbolp x) (let ((w (and x (%expr-width x env)))) (and w (<= w 53) 1)))
+             (t (let ((plan (%fp-toi-plan x env))
+                      (w (and (consp x) (consp (cdr x))
+                              (ignore-errors (%decl-int-width (%resolve-declared-type (cadr x)))))))
+                  (and plan w (<= w 53)
+                       (let ((n (if (eq (car plan) :single)
+                                    (%fp-tree-need (caddr plan) env)
+                                    (%fpd-pure-need (caddr plan) env))))
+                         (and n (+ 1 n)))))))))
 
 (defun %fp-arith-op (name)
   (cond ((string= name "+") :fp-add)
@@ -21171,10 +21191,17 @@
          (free-fp-reg)))
       ((%fp-single-conversion-arg form)
        (let ((x (%fp-single-conversion-arg form)))
-         (if (%fp-tree-need x env)
-             (compile-float-unboxed x env fd)                    ; already single
-             (progn (compile-double-unboxed x env fd)
-                    (emit-ir :fp-op1 fd fd 3)))))                ; fcvt s<-d
+         (cond ((%fp-tree-need x env)
+                (compile-float-unboxed x env fd))                ; already single
+               ((%fpd-pure-need x env)
+                (compile-double-unboxed x env fd)
+                (emit-ir :fp-op1 fd fd 3))                       ; fcvt s<-d
+               (t                                                ; an integer (%fp-itof-need)
+                (let ((tmp (alloc-temp-reg)))
+                  (compile-form x env tmp)
+                  (emit-ir :fpd-itof fd tmp)
+                  (emit-ir :fp-op1 fd fd 3)
+                  (free-temp-reg))))))
       (t
        (let ((op (%fp-arith-op (symbol-name (car form)))))
          (compile-float-unboxed (cadr form) env fd)

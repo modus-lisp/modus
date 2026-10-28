@@ -68,4 +68,52 @@
        (loop for x in *vals* for y in (reverse *vals*)
              collect (let ((x (float x 1d0)) (y (float y 1d0))) (+ (abs x) (* 2d0 (max x y)) (* 4d0 (min x y))))))
 
+;; 6. a register-resident DOUBLE accumulator (rmsnorm's sum of squares)
+(defun t6 (a) (declare (type (simple-array single-float (*)) a))
+  (let ((s 0d0)) (declare (type double-float s))
+    (dotimes (i (length a)) (setq s (+ s (coerce (* (aref a i) (aref a i)) 'double-float))))
+    s))
+(check "6 resident double accumulator" (t6 *a*)
+       (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ s (coerce (* x x) 'double-float))))))
+
+;; 7. an undeclared local with a single-float init is resident (inferred);
+;;    one that is reassigned to an integer must not be
+(defun t7 (a) (declare (type (simple-array single-float (*)) a))
+  (let ((m 0.0)) (declare (type single-float m))
+    (dotimes (i (length a)) (let ((x (abs (aref a i)))) (when (> x m) (setq m x))))
+    m))
+(defun t7b (a) (declare (type (simple-array single-float (*)) a))
+  (let ((r nil))
+    (dotimes (i (length a)) (let ((x (aref a i))) (when (< x 0.0) (setq x 7)) (push x r)))
+    (nreverse r)))
+(defun t7c (a) (declare (type (simple-array single-float (*)) a))
+  (let ((r nil))
+    (dotimes (i (length a)) (let ((x (aref a i))) (when (< x 0.0) (incf x 2)) (push x r)))
+    (nreverse r)))
+(check "7 inferred single local" (list (t7 *a*) (t7b *a*) (t7c *a*))
+       (list (reduce #'max (mapcar #'abs *vals*))
+             (mapcar (lambda (x) (if (< x 0.0) 7 x)) *vals*)
+             (mapcar (lambda (x) (if (< x 0.0) (+ x 2) x)) *vals*)))
+
+;; 8. integer -> single in register: rounded quantize, a typed counter, a literal
+(defun t8 (a o) (declare (type (simple-array single-float (*)) a o))
+  (dotimes (i (length a))
+    (setf (aref o i) (+ (float (the (signed-byte 8) (round (* (aref a i) 1e-6 127.0))) 1.0)
+                        (* 0.5 (float i 1.0)) (float 3 1.0)))))
+(let ((o (fv (make-list *n* :initial-element 0.0))))
+  (t8 *a* o)
+  (check "8 int -> single" (coerce o 'list)
+         (loop for x in *vals* for i from 0
+               collect (+ (float (round (* x 1e-6 127.0)) 1.0) (* 0.5 (float i 1.0)) (float 3 1.0)))))
+
+;; 9. DOTIMES over (length v), a typed count, an empty and a negative count
+(defun t9 (a n) (declare (type (simple-array single-float (*)) a) (fixnum n))
+  (let ((c 0) (d 0) (e 0))
+    (dotimes (i (length a)) (setf (aref a i) (aref a i)) (incf c))
+    (dotimes (i n) (incf d))
+    (dotimes (i (the fixnum (- n))) (incf e))
+    (list c d e)))
+(check "9 dotimes counts" (list (t9 *a* 5) (t9 *a* 0) (t9 *a* -3))
+       (list (list *n* 5 0) (list *n* 0 0) (list *n* 0 3)))
+
 (format t "~%FP-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

@@ -579,6 +579,44 @@ the startup-sized image's 2 of 12.  At the old fixed 248 MB boot never
 collects, which is how it hid; a 6000-eval stress with 6 collections AFTER
 boot is clean on both.  Open.
 
+**THE BOOT-TIME SURFACES ARE INSTALLED ON DEMAND** (`*deferred-surfaces-source*`
+in `build-cli-common.lisp`).  The Genera layer, the SB-* shims and the ASDF
+interface were ~210 KB of source EVALUATED at every boot -- most of boot's
+time, all of its collections, and 4 MB of its smallest heap.  Boot now pushes
+their FEATURES, exports MODUS's shim-provided names behind autoload stubs, runs
+their compiled side effects, and evaluates the cooperative atomics (unqualified
+CL-USER macros, so they cannot wait for a package lookup); the source runs the
+first time anything looks up one of their PACKAGES (`%deferred-package-hook`,
+called on a `FIND-PACKAGE` miss), `INSTALL-TARBALL` starts, or
+`LIST-ALL-PACKAGES` is called.  Measured: x64 boot ~1.1-2.5 s -> 0.65-0.9 s;
+arm32 under qemu 16.0 s -> 5.4 s; arm32's smallest heap that boots 11 -> 7 MB.
+Three ways the first cut was wrong, each now a rule in that file:
+- **The first trigger installs EVERY pending surface, in boot order, with the
+  trigger off.**  Installing only the one asked for nested the SB shims inside
+  the ASDF install, and the Genera layer asks whether SB-THREAD exists (NIL at
+  boot, because it ran first).
+- **The install loads UNCACHED** (`*fasl-suspended*` in `fasl.lisp`).  A
+  trigger inside LOAD runs while that load is recording the FASL cache; the
+  shared per-form recording state broke the install (`%THROW-IN-FLIGHT`).
+- **`INSTALL-TARBALL` installs them first, outside any READ** -- it reads the
+  .asd in lenient missing-package mode.
+Escape hatches unchanged: `MODUS_NO_GENERA` / `MODUS_NO_SB` / `MODUS_NO_ASDF`.
+x64 suite identical to the control (sb-thread 44, sockets 52, channel 61,
+thread-lisp 29, atomics 31, mutex 18, sleep 13, word-boundary 624).
+
+**FRESH-FASL-CACHE LOADS ON ARM32 ARE BROKEN, PRE-EXISTING.**  With an empty
+`MODUS_FASL_DIR`, the RECORDING run of alexandria fails all 30 probes (80
+errors) and cl-ppcre 5 of 6 on the unmodified image too; the REPLAY run then
+passes alexandria.  Test with a private `MODUS_FASL_DIR`, never the shared
+`~/.cache/modus/fasl`: results there depend on what earlier builds recorded,
+and the fingerprint does not cover `build-cli-common.lisp`, so two builds that
+differ only there replay each other's entries.
+
+`MODUS_NO_SOURCE_BLOB=1` (any CLI build) drops the image's embedded copy of its
+own source: 34.9 -> 28.1 MB on arm32.  OFF by default -- carrying its own source
+is part of the image's legibility -- and on a hosted system it costs disk, not
+RAM (file-backed, never paged in).  It is for bare metal, which loads it all.
+
 **PowerPC bugs found on the way:**
 - **The MD-form encoder stored the 6-bit mask field unrotated**: it is
   `mb[0:4] || mb[5]`.  objdump: `rldicl r3,r4,60,4` assembled as `...,60,2`,

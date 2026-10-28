@@ -497,7 +497,23 @@
 
 
 
+(defun %deferred-package-hook (name-str)
+  "A FIND-PACKAGE miss on NAME-STR: install whatever DEFERS that package and
+   answer T, or answer NIL.  NIL here; the CLI image overrides it (last defun
+   wins -- build-cli-common.lisp's *DEFERRED-SURFACES-SOURCE*), so every other
+   image is unchanged."
+  (declare (ignore name-str))
+  nil)
+
+(defun %force-deferred-installs ()
+  "Install everything still deferred.  NIL here; see %DEFERRED-PACKAGE-HOOK."
+  nil)
+
 (defun list-all-packages ()
+  ;; A deferred surface's packages are part of the image's package set; they
+  ;; just have not been built yet.  LIST-ALL-PACKAGES must not be the one
+  ;; observer that can tell.
+  (%force-deferred-installs)
   *all-packages*)
 
 (defun %cl-test-alias-installed-p ()
@@ -569,7 +585,11 @@
                   (%cl-test-alias-installed-p))
          (let ((clu (find-package-1 "COMMON-LISP-USER")))
            (when clu (return-from %find-package-uncached clu))))
-       (find-package-1 name-str)))))
+       (or (find-package-1 name-str)
+           ;; A package whose defining surface is installed ON DEMAND (the
+           ;; CLI's SB-*, Genera and ASDF layers): the first lookup builds it.
+           (and name-str (%deferred-package-hook name-str)
+                (find-package-1 name-str)))))))
 
 (defun %pkg-name-or-nickname-p (pkg name-str)
   "T iff NAME-STR is PKG's primary name or one of its nicknames, under

@@ -692,6 +692,13 @@
    construction (lexical save + unwind-protect + setq), NOT (let ((*package*
    ...))) — see %it-eval-source's docstring for why that is not enough."
   (%it-reset-read-errors)   ; per-install; the final report reads this
+  ;; The boot-time surfaces (Genera / SB-* / ASDF interface) are installed on
+  ;; first use, and an install is about to read an .asd that asks for
+  ;; ASDF-USER.  Install them HERE, outside any READ: triggered from inside
+  ;; the .asd read -- lenient reader mode on, this file's load state bound --
+  ;; the ASDF interface died mid-install with %THROW-IN-FLIGHT.  A no-op when
+  ;; nothing is deferred (and in every image but the CLI).
+  (%force-deferred-installs)
   ;; Gray streams are installed on first use (net/sb-gray-shim.lisp), as
   ;; ASDF:LOAD-SYSTEM does -- a bare image installs through HERE, not ASDF,
   ;; so without this seal's TLS-STREAM got anonymous superclasses and every

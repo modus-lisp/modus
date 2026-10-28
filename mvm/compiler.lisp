@@ -3894,11 +3894,21 @@
   "The expander for OP, or NIL — the confirmed replacement for a bare
    (gethash hash *macro-table*).  A macro whose name shadows a CL external is
    found by the SYMBOL first (see %DEFINE-COMPILE-TIME-MACRO): its bare-name
-   entry, if any, is CL's, and using it compiled P::WHEN as CL:WHEN."
+   entry, if any, is CL's, and using it compiled P::WHEN as CL:WHEN.
+
+   And a shadowing symbol with NO macro of its own gets none: the bare-name
+   entry is still CL's.  cortez's GLOBAL::LDB is a FUNCTION taking the
+   machine's integer byte specifiers; the bare entry is CL's LDB macro, so
+   (LDB 6 X) expanded to CL:LDB's and died on 6 as a byte spec while
+   (FUNCALL #'LDB 6 X) answered.  FBOUNDP as in %DEFINE-COMPILE-TIME-MACRO."
   (or (and *shadowing-macro-table* (symbolp op)
            (gethash op *shadowing-macro-table*))
       (and (%macro-name-confirmed-p op hash)
-           (gethash hash *macro-table*))))
+           (let ((e (gethash hash *macro-table*)))
+             (and e
+                  (not (and (symbolp op) (fboundp '%shadows-cl-name-p)
+                            (funcall '%shadows-cl-name-p op)))
+                  e)))))
 
 ;;; A DEFMACRO's compile-time registration.  A name that SHADOWS a CL external -- P::IF,
 ;;; P::MULTIPLE-VALUE-BIND -- must not take the bare-name entry in *MACRO-TABLE*: that is the

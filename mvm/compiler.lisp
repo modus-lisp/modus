@@ -13079,7 +13079,10 @@
                (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                     (symbolp (cadr form))
                     (or (%declared-f32-array-var-p (cadr form) env)
-                        (%declared-generic-array-var-p (cadr form) env))
+                        (%declared-generic-array-var-p (cadr form) env)
+                        ;; a declared byte vector's AREF is one u8 load too (a
+                        ;; K-quant kernel reads its scales beside its lanes)
+                        (%declared-u8-array-var-p (cadr form) env))
                     (%simple-index-form-p (caddr form))))
               ((string= n "SETF")
                ;; (setf (aref A i) v): declared A, simple i; an f32 store needs
@@ -21390,12 +21393,18 @@
   "FP registers to convert the integer X to a single in register, or NIL.
    X must be at most 53 bits wide, so fixnum -> double (exact) -> single
    rounds once, like a direct conversion; and call-free: a literal, a
-   width-typed variable, or (THE <int> (ROUND tree)), which converts in
-   register itself (%FP-TOI-PLAN).  One register for the result, plus what
+   width-typed variable, + - * ASH ... of those (%SIMPLE-INDEX-FORM-P), or
+   (THE <int> (ROUND tree)), which converts in register itself
+   (%FP-TOI-PLAN).  One register for the result, plus what
    the rounding's own tree holds while it runs."
   (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
        (cond ((integerp x) (and (< (integer-length x) 53) 1))
              ((symbolp x) (let ((w (and x (%expr-width x env)))) (and w (<= w 53) 1)))
+             ;; call-free integer arithmetic of width-typed operands (the
+             ;; index-form shapes): (float (- isum (* 32 imins)) 1.0)
+             ((and (consp x) (%simple-index-form-p x)
+                   (let ((w (%expr-width x env))) (and w (<= w 53))))
+              1)
              (t (let ((plan (%fp-toi-plan x env))
                       (w (and (consp x) (consp (cdr x))
                               (ignore-errors (%decl-int-width (%resolve-declared-type (cadr x)))))))

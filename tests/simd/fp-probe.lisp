@@ -187,4 +187,18 @@
 (check "15 typed maximize/minimize" (t15 *a*)
        (list (reduce #'max (mapcar #'abs *vals*)) (reduce #'min *vals*) 3 -7.5d0 -4.0))
 
+;; 16. int -> single of call-free integer arithmetic, and a byte-array AREF
+;;     inside an FP-resident scope (a K-quant kernel's scales)
+(defun t16 (a sc) (declare (type (simple-array single-float (*)) a) (type (simple-array (unsigned-byte 8) (*)) sc))
+  (let ((s 0.0)) (declare (type single-float s))
+    (dotimes (i (length a) s)
+      (let ((k (aref sc (mod i 4))) (m (- i 3)))
+        (declare (type (unsigned-byte 8) k) (type (signed-byte 32) m))
+        (setq s (+ s (* (aref a i) (float (- (* 32 k) m) 1.0))))))))
+(let ((sc (make-array 4 :element-type '(unsigned-byte 8) :initial-contents '(1 200 3 255))))
+  (check "16 itof of arithmetic, u8 aref in scope" (t16 *a* sc)
+         (let ((s 0.0)) (loop for x in *vals* for i from 0
+                              do (setq s (+ s (* x (float (- (* 32 (aref sc (mod i 4))) (- i 3)) 1.0)))))
+           s)))
+
 (format t "~%FP-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

@@ -11388,11 +11388,12 @@
       ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
            (and (integerp op) (= op 338547669)))
        nil)
-      ;; a quasiquote: VARS-MUTATED-IN-LAMBDAS scans its expansion; at runtime
-      ;; VARS-READ-IN-LAMBDAS walks the raw template too, so look at both
+      ;; a quasiquote: both scans walk its EXPANSION, which is its code.  The
+      ;; template is data -- walked as code, its macro calls were expanded, and
+      ;; (DEFMACRO FCW (I) `(OR NIL (FCW ,I))) expanded FCW inside its own
+      ;; template until the stack was gone (SIGSEGV just DEFINING it).
       ((%bq-form-p form)
-       (or (%form-has-closure-p (expand-backquote (cadr form)))
-           (and *mvm-eval-runtime-p* (%form-has-closure-p-2 form))))
+       (%form-has-closure-p (expand-backquote (cadr form))))
       (t (%form-has-closure-p-2 form)))))
 
 (defun %form-has-closure-p-2 (form)
@@ -11665,6 +11666,11 @@
              (scan (form)
                (unless (consp form) (return-from scan))
                (unless (%form-has-closure-p form) (return-from scan))
+               ;; A quasiquote's code is its expansion, as VARS-MUTATED-IN-LAMBDAS
+               ;; scans it; its template is data (see %FORM-HAS-CLOSURE-P-1).
+               (when (%bq-form-p form)
+                 (scan (expand-backquote (cadr form)))
+                 (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
                  (when mx (setq form mx)))
                ;; Keep expanding, as the mutation scan does (runtime only).

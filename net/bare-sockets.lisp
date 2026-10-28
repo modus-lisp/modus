@@ -122,15 +122,22 @@
              len))))
 
 (defun %sbs-recvfrom (fd arr max)
+  ;; A BLOCKING READ OUTLIVES ITS SOCKET unless it looks: another thread's SOCKET-CLOSE drops
+  ;; the descriptor and the port, and a reader parked here for a day (as this was) never
+  ;; returned -- every WebRTC session's ICE thread stayed, and the board ran out of its 15
+  ;; thread slots after a few sessions.  So wait a second at a time and answer EBADF once the
+  ;; descriptor is gone, which is what a read on a closed socket gets on Linux.
   (let ((b (%bs fd)))
-    (cond ((null b) -9)
-          (t (let ((d (udp-recv (bs-lport b) :timeout-ms (if (bs-nonblocking b) 0 86400000))))
-               (if (null d)
-                   -11
-                   (let* ((v (third d)) (n (min max (length v))))
-                     (dotimes (i n) (setf (aref arr i) (aref v i)))
-                     (setq *sbs-from* (cons (first d) (second d)))
-                     n)))))))
+    (if (null b)
+        -9
+        (loop
+          (let ((d (udp-recv (bs-lport b) :timeout-ms (if (bs-nonblocking b) 0 1000))))
+            (cond (d (let* ((v (third d)) (n (min max (length v))))
+                       (dotimes (i n) (setf (aref arr i) (aref v i)))
+                       (setq *sbs-from* (cons (first d) (second d)))
+                       (return n)))
+                  ((bs-nonblocking b) (return -11))
+                  ((null (%bs fd)) (return -9))))))))
 (defun %sbs-from-ip () (car *sbs-from*))
 (defun %sbs-from-port () (cdr *sbs-from*))
 
@@ -156,7 +163,9 @@
                          ((> (length r) 0)
                           (dotimes (i (length r)) (setf (aref arr i) (aref r i)))
                           (return (length r)))
-                         ((bs-nonblocking b) (return -11))))))))))
+                         ((bs-nonblocking b) (return -11))
+                         ;; closed under us by another thread (see %SBS-RECVFROM): end of file
+                         ((null (%bs fd)) (return 0))))))))))
 
 (defun %sbs-poll-in (fd ms)
   "1 when a read on FD would not block, 0 when MS (-1: forever) passes first."

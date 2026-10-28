@@ -773,16 +773,17 @@
   ;; Parse client's ephemeral public key at offset 1 (skip msg type)
   (let ((cli-eph (make-array 32)))
     (dotimes (i 32) (aset cli-eph i (aref kex-init-payload (+ 5 i))))
-    ;; Use pre-computed server ephemeral key pair (from state+0x6C4/0x6E4),
-    ;; and mark it spent so SSH-REFRESH-EPHEMERAL replaces it.
+    ;; Use pre-computed server ephemeral key pair (SSH-EPH-BASE: private key,
+    ;; then public key at +0x20), and mark it spent so SSH-REFRESH-EPHEMERAL
+    ;; replaces it.
     (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)
-    (let ((state (e1000-state-base)))
+    (let ((state (ssh-eph-base ssh)))
       (let ((srv-priv (make-array 32)))
         (dotimes (i 32)
-          (aset srv-priv i (mem-ref (+ state (+ #x6C4 i)) :u8)))
+          (aset srv-priv i (mem-ref (+ state i) :u8)))
         (let ((srv-eph (make-array 32)))
           (dotimes (i 32)
-            (aset srv-eph i (mem-ref (+ state (+ #x6E4 i)) :u8)))
+            (aset srv-eph i (mem-ref (+ state (+ #x20 i)) :u8)))
           (let ((shared (x25519 srv-priv cli-eph)))
             ;; USB keep-alive after first scalar mult
             (usb-keepalive)
@@ -1758,6 +1759,11 @@
   (when (= (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)   ; only if a KEX used it
     (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 0)
     (pre-compute-server-eph (conn-ssh 0))))
+
+;; Where SSH-HANDLE-KEX finds the server's ephemeral X25519 pair for SSH (the
+;; private key, the public key at +0x20): one slot for the server, refreshed
+;; after each key exchange.  net/isolated-cl.lisp gives every session its own.
+(defun ssh-eph-base (ssh) (+ (e1000-state-base) #x6C4))
 
 ;; Pre-compute X25519 server ephemeral key pair.
 ;; Stores private key at state+0x6C4, public key at state+0x6E4.

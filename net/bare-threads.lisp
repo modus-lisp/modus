@@ -178,29 +178,57 @@
   (list (logior #xD2800000 (ash (logand a #xFFFF) 5))
         (logior #xF2A00000 (ash (logand (ash a -16) #xFFFF) 5))))
 
+;;; THE PLATFORM SEAMS.  What differs between boards is how a core is started and
+;;; at which exception level the image runs; everything else is shared.  These are
+;;; the Pi's (EL2, firmware spin table); net/bare-threads-virt.lisp replaces them for
+;;; QEMU virt (EL1, PSCI CPU_ON) by last-defun-wins.
+
+(defun %bt-stub-entry-words ()
+  "The core entry stub, at S (test/rpi-smp/stubs.s): EL2's translation registers."
+  (list #x10004000 #xf9400001 #xd51ca201 #xf9400401 #xd51c2041 #xf9400801
+        #xd51c2001 #xd50c871f #xd5033f9f #xd5033fdf #xd539f221 #xb27a0021
+        #xd519f221 #xf9401001 #xd51cc001 #xd518c001 #xd53c1141 #x9275f821
+        #xd51c1141 #xd2a00601 #xd5181041 #xd5033fdf #xf9400c01 #xd51c1001
+        #xd5033fdf #xf9401801 #x9100003f #xf9401c01 #xd518d081 #xf9402001
+        #xd51bd041 #xf940141c #xf9402418 #xf9402819 #xd2a20012 #xd280003a
+        #xf2bbd5ba #xd2800021 #xf9003001 #xf9402c09 #xd280001d #xd280001e
+        #xd63f0120 #x10003aa0 #xd2800041 #xf9003001 #xd503205f #x17ffffff))
+
+(defun %bt-stub-release-words (s)
+  "S+0x1000: clean the stub to the point of coherency, then SEV the spinning cores."
+  (append (%bt-movz-movk-x0 s)
+          (list #x91240002 #xd50b7e20 #x91010000 #xeb02001f #x54ffffa3
+                #xd2801800 #xd50b7e20 #xd5033f9f #xd503209f #xd65f03c0)))
+
+(defun %bt-stub-snapshot-words (p)
+  "S+0x1100: core 0's EL2 translation registers and x28 into the parameter block P."
+  (append (%bt-movz-movk-x0 p)
+          (list #xd53ca201 #xf9000001 #xd53c2041 #xf9000401 #xd53c2001
+                #xf9000801 #xd53c1001 #xf9000c01 #xd53cc001 #xf9001001
+                #xf900141c #xd65f03c0)))
+
+(defun %bt-stub-tlbi-words ()
+  "S+0x1500: TLBI ALLE2IS between barriers."
+  (list #xd5033a9f #xd50c831f #xd5033b9f #xd5033fdf #xd65f03c0))
+
+(defun %bt-release (c s)
+  "Start core C at the stub S: the firmware's spin table entry, then the release
+   routine's SEV."
+  (%gc-write64 (+ #xD8 (* 8 c)) s)
+  (%jit-call (+ s #x1000)))
+
+(defun %bt-l2-table () #x71000)       ; boot/boot-rpi-cl.lisp's L2 table
+(defun %bt-va->pa (a) a)              ; the Pi's DRAM is identity-mapped
+
 (defun %bt-stub-install ()
   "Write the core entry stub (S), its parameter block (S+0x800), the release routine
    (S+0x1000), core 0's register snapshot (S+0x1100) and the slot switch (S+0x1200);
    take the snapshot.  Sources: test/rpi-smp/stubs.s, test/rpi-smp/switch.s."
   (let* ((s (%mmap-exec-page 8192))
          (p (+ s #x800)))
-    (%bt-poke s (list #x10004000 #xf9400001 #xd51ca201 #xf9400401 #xd51c2041 #xf9400801
-                      #xd51c2001 #xd50c871f #xd5033f9f #xd5033fdf #xd539f221 #xb27a0021
-                      #xd519f221 #xf9401001 #xd51cc001 #xd518c001 #xd53c1141 #x9275f821
-                      #xd51c1141 #xd2a00601 #xd5181041 #xd5033fdf #xf9400c01 #xd51c1001
-                      #xd5033fdf #xf9401801 #x9100003f #xf9401c01 #xd518d081 #xf9402001
-                      #xd51bd041 #xf940141c #xf9402418 #xf9402819 #xd2a20012 #xd280003a
-                      #xf2bbd5ba #xd2800021 #xf9003001 #xf9402c09 #xd280001d #xd280001e
-                      #xd63f0120 #x10003aa0 #xd2800041 #xf9003001 #xd503205f #x17ffffff))
-    (%bt-poke (+ s #x1000)
-              (append (%bt-movz-movk-x0 s)
-                      (list #x91240002 #xd50b7e20 #x91010000 #xeb02001f #x54ffffa3
-                            #xd2801800 #xd50b7e20 #xd5033f9f #xd503209f #xd65f03c0)))
-    (%bt-poke (+ s #x1100)
-              (append (%bt-movz-movk-x0 p)
-                      (list #xd53ca201 #xf9000001 #xd53c2041 #xf9000401 #xd53c2001
-                            #xf9000801 #xd53c1001 #xf9000c01 #xd53cc001 #xf9001001
-                            #xf900141c #xd65f03c0)))
+    (%bt-poke s (%bt-stub-entry-words))
+    (%bt-poke (+ s #x1000) (%bt-stub-release-words s))
+    (%bt-poke (+ s #x1100) (%bt-stub-snapshot-words p))
     (%bt-poke (+ s #x1200)
               (list #xd10203ff #xa9000be1 #xa90113e3 #xa9021be5 #xa90323e7 #xa90453f3
                     #xa9055bf5 #xa9066ff7 #xa9077bfd #xd53800a9 #x92400529 #xd2a20c8a
@@ -228,7 +256,7 @@
     (%gc-write64 #x10213028 (%bt-entry '%bt-guard-trap))
     (%gc-write64 #x10213030 (%bt-entry '%bt-stack-trap))
     ;; TLBI ALLE2IS between barriers (S+0x1500), for the stack guard pages.
-    (%bt-poke (+ s #x1500) (list #xd5033a9f #xd50c831f #xd5033b9f #xd5033fdf #xd65f03c0))
+    (%bt-poke (+ s #x1500) (%bt-stub-tlbi-words))
     (%jit-icache-flush (+ s #x1500) 32)
     s))
 
@@ -311,8 +339,7 @@
                              (%bt-guard (%gc-meta-read (+ rcb #x10) 2))))
     (%gc-write64 (+ p 88) (%bt-entry '%bt-core-main))
     (%gc-write64 (+ p 96) 0)
-    (%gc-write64 (+ #xD8 (* 8 c)) s)
-    (%jit-call (+ s #x1000))
+    (%bt-release c s)
     (let ((st 0))
       (dotimes (k 20000000)
         (setq st (mem-ref (+ p 96) :u32))
@@ -949,8 +976,8 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
           (base (+ #x05200000 (* j #x200000))))
       (dotimes (k 512)
         (let ((pa (+ base (* k #x1000))))
-          (%gc-write64 (+ l3 (* k 8)) (if (%bt-guard-page-p pa) 0 (+ pa #x703)))))
-      (%gc-write64 (+ #x71000 (* (+ 41 j) 8)) (+ l3 3))))
+          (%gc-write64 (+ l3 (* k 8)) (if (%bt-guard-page-p pa) 0 (+ (%bt-va->pa pa) #x703)))))
+      (%gc-write64 (+ (%bt-l2-table) (* (+ 41 j) 8)) (+ (%bt-va->pa l3) 3))))
   (%jit-call (+ (%bt-stub) #x1500))
   1)
 

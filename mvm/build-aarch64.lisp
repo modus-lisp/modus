@@ -36,8 +36,15 @@
 ;;;;
 ;;;; Knobs (all read by the common file): MODUS_NET_BUILD, MODUS_NET_URL,
 ;;;; MODUS_NET_BUFSZ, MODUS_LIB_EXPR, MODUS_NET_NOAUTO, MODUS_RPI_NO_BLOB,
-;;;; MODUS_RPI_NO_TEST_AUX, MODUS_SYMMAP.  MODUS_SSH_BUILD is :RPI-only and
-;;;; errors here (its actor/SSH address map is Pi DRAM) — see DIVERGENCE 5.
+;;;; MODUS_RPI_NO_TEST_AUX, MODUS_SYMMAP.
+;;;; SSH: MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1, then at the
+;;;;   REPL (run-net-pipeline) and (ssh-boot) -- the synchronous server, as on
+;;;;   the PC images (DIVERGENCE 5).  QEMU: add hostfwd=tcp::2222-:22.
+;;;; THREADS: + MODUS_RPI_THREADS=1 -- net/bare-threads.lisp on cores 1..3,
+;;;;   started by PSCI CPU_ON (net/bare-threads-virt.lisp).  Needs QEMU -smp 4
+;;;;   -m 1024: the thread layer's VAs are DRAM at PA 0x60200000.. (boot-aarch64
+;;;;   *AARCH64-FIXPOINT-THREADS*).  + MODUS_SSH_ISOLATED=1 -- the isolated
+;;;;   server, sessions on worker threads (net/isolated-cl.lisp).
 
 (defvar *cl-repl-platform* :virt)
 

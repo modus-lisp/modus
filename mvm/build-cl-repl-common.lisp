@@ -32,7 +32,9 @@
 ;;;;   4. run-net-pipeline           cdc-ether-init vs pci-assign-bars +
 ;;;;                                 e1000-probe.  (Everything else in
 ;;;;                                 *NET-DRIVER-SOURCE* is shared.)
-;;;;   5. MODUS_SSH_BUILD            :rpi only (its address map is Pi DRAM).
+;;;;   5. MODUS_SSH_BUILD            :rpi takes the Pi actor/SSH map; :virt (like the
+;;;;                                 PC images) the synchronous server, its SSH
+;;;;                                 state where net/arch-aarch64-cl.lisp puts it.
 ;;;;   6. boot descriptor            boot/boot-rpi-cl.lisp + (build-image
 ;;;;                                 :target :rpi)  vs  boot/boot-aarch64.lisp
 ;;;;                                 + :target :fixpoint + the fixpoint NIL
@@ -449,8 +451,12 @@
     ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
     ;; (AFTER the arena line: its own %BARE-SYNC-ARENA is cacheable RAM, which the
     ;; SMP mutexes' LDAXR/STLXR need -- last-defun-wins).
-    (if (and *cl-repl-rpi-p* (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
-        (mvm-text "net/bare-threads.lisp")
+    (if (and (or *cl-repl-rpi-p* *cl-repl-virt-p*)
+             (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0"))))
+        (concatenate 'string
+          (mvm-text "net/bare-threads.lisp")
+          ;; QEMU virt: EL1 and PSCI CPU_ON instead of EL2 and the spin table.
+          (if *cl-repl-virt-p* (mvm-text "net/bare-threads-virt.lisp") ""))
         "")
     ;; The PC console (x86-64): after serial-repl, whose console seams it
     ;; replaces by last-defun-wins.
@@ -1062,7 +1068,7 @@
 ;; 0x1B000000: 0x240000 bytes each, at 0x08000000 / 0x08400000 (free RAM between the main
 ;; stack top and the heap; the restore header sits at 0x08FFFF00).
 (defvar cl-user::*rpi-threads-p*
-  (and *cl-repl-rpi-p*
+  (and (or *cl-repl-rpi-p* *cl-repl-virt-p*)
        (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
          (and v (> (length v) 0) (string/= v "0")))))
 (when cl-user::*rpi-threads-p*
@@ -1080,6 +1086,23 @@
 ;; garbage is a HELD lock, and its own allocation lock is at +0x10), and the JIT bump
 ;; word, which the restore reads before anything sets it.  A restore then brings the
 ;; saved arena back (%CORE-EXTRA-*).
+;; :VIRT has no such line (its prologue predates the threads layer): give it the
+;; Pi's zeroing first, after its handler-depth line, so the edit below applies.
+(when (and cl-user::*rpi-threads-p* *cl-repl-virt-p*)
+  (let* ((old "  (setf (mem-ref #x10010000 :u64) 0)")
+         (at (search old *cli-arch-kernel-prologue*)))
+    (unless at (error "SMP: the virt prologue's handler-depth line moved; update build-cl-repl-common"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 (+ at (length old)))
+                       "
+  ;; net/bare-threads.lisp's words outside its tables (see the :rpi prologue).
+  (setf (mem-ref #x10300000 :u32) 0)
+  (%gc-write64 #x10300008 0)
+  (%gc-write64 #x10083F00 0)
+  (%gc-write64 #x10213028 0)
+  (%gc-write64 #x10213030 0)
+  (%gc-write64 #x10005058 0)"
+                       (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
 (when cl-user::*rpi-threads-p*
   (let* ((old "  (%gc-write64 #x10005058 0)")
          (at (search old *cli-arch-kernel-prologue*))
@@ -1226,9 +1249,11 @@
 (defvar *ssh-build-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_BUILD")))
     (and v (string= v "1"))))
-(when (and *ssh-build-p* *cl-repl-virt-p*)
-  (error "MODUS_SSH_BUILD=1 is :RPI or :X64 — the :VIRT actor/SSH address map ~
-          is not laid out.  See the DIVERGENCE 5 comment in build-cl-repl-common.lisp."))
+
+;; The SYNCHRONOUS server -- no actor scheduler, ip.lisp's poll loop serves each
+;; connection inline, the NIC already up from the pipeline -- on the PC images and
+;; on QEMU virt.  Only the Pi runs the actor/USB shape.
+(defvar *ssh-sync-p* (or *cl-repl-pc-p* *cl-repl-virt-p*))
 
 ;; MODUS_SSH_AUTOSTART=1 (with MODUS_SSH_BUILD=1) — start the SSH server from
 ;; kernel-main right after the net pipeline, instead of waiting for (ssh-boot) at
@@ -1241,11 +1266,11 @@
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_ISOLATED")))
     (and v (string= v "1"))))
 (when (and *ssh-isolated-p*
-           (not (and *ssh-build-p* *cl-repl-rpi-p*
+           (not (and *ssh-build-p* (or *cl-repl-rpi-p* *cl-repl-virt-p*)
                      (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
                        (and v (plusp (length v)) (string/= v "0"))))))
   (error "MODUS_SSH_ISOLATED=1 needs MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1 on the ~
-          :RPI platform: its sessions are bare-threads (net/bare-threads.lisp)."))
+          :RPI or :VIRT platform: its sessions are bare-threads (net/bare-threads.lisp)."))
 (defvar *ssh-autostart-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_AUTOSTART")))
     (and *ssh-build-p* v (string= v "1"))))
@@ -1310,6 +1335,10 @@
     ;; 0x0C280000 + 76800*8 = 0x0C316000.
     ;; :I386 takes the same map: the same DRAM is free there (above its NE2000
     ;; buffers at #x04000000, below its heap at #x10100000).
+    ;; :VIRT: none -- net/arch-aarch64-cl.lisp already puts the NIC state, the
+    ;; per-connection block and ssh-ipc in DRAM (PA 0x50260000..0x50396000,
+    ;; identity-mapped by L1[1]), clear of the image, heap and DMA rings.
+    (*cl-repl-virt-p* "")
     (*cl-repl-pc-p*
      "
 (defun ssh-conn-base ()      #x0C200000)
@@ -1375,7 +1404,7 @@
   (if *ssh-build-p*
       (concatenate 'string
         *ssh-addr-map-source*                     (string #\Newline)
-        (if *cl-repl-pc-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
+        (if *ssh-sync-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
         ;; After ssh.lisp, by last-defun-wins -- :X64: TSC-timed waits and RDRAND for
         ;; SSH-RANDOM; :RPI: the BCM2835/2837 hardware RNG for SSH-RANDOM and
@@ -1487,8 +1516,8 @@
         ;; register listen port 22, crypto pre-compute, actor/mailbox init, then
         ;; the synchronous poll loop.  Called from the REPL; net-actor-main
         ;; blocks, serving inline (net-accept-connection -> ssh-handle-connection).
-        (if *cl-repl-pc-p*
-            ;; :X64 / :I386 -- the NIC is already up from run-net-pipeline (PCI, E1000,
+        (if *ssh-sync-p*
+            ;; :X64 / :I386 / :VIRT -- the NIC is already up from run-net-pipeline (PCI, E1000,
             ;; DHCP into e1000-state-base +24/+28), so only the SSH state is
             ;; zeroed and seeded (state +0x600..+0x900 is the SSH-side part of
             ;; e1000-state: key-set flag, PRNG, host key; the NIC/DHCP words below
@@ -1535,12 +1564,16 @@
         ;; :X64 has no USB NIC and no hot-plug: usb-netdev.lisp overrides E1000-RECEIVE,
         ;; E1000-SEND, E1000-RX-BUF and E1000-PROBE with USB-backed versions that probe
         ;; for a USB NIC on every poll (the "ND:0" stream) -- the E1000 never gets polled.
-        (if *cl-repl-pc-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline)
+        (if *ssh-sync-p* "" (%rpi-net-text "usb-netdev.lisp"))         (string #\Newline)
         ;; MODUS_SSH_ISOLATED=1: the net domain and each SSH session are
         ;; separate threads that exchange bytes only by copy (net/isolated-cl.lisp,
         ;; the CL successor of isolated-net.lisp).  LAST: it replaces the accept,
         ;; deliver, send, wait and eval seams above by last-defun-wins.
-        (if *ssh-isolated-p* (%rpi-net-text "isolated-cl.lisp") "")  (string #\Newline))
+        (if *ssh-isolated-p* (%rpi-net-text "isolated-cl.lisp") "")  (string #\Newline)
+        ;; :VIRT has no USB host to hot-plug: each poll pass only steps the sessions.
+        (if (and *ssh-isolated-p* *cl-repl-virt-p*)
+            (format nil "~%(defun usb-netdev-hotplug-poll () (%iso-net-step))~%")
+            ""))
       ""))
 
 ;;; DIVERGENCE 3 — the arch adapter + the NIC driver.  Everything downstream of
@@ -1663,6 +1696,11 @@
         ;; any TCP segment they read.  Spliced after the transport so it wins.
         (if (and *ssh-build-p* *cl-repl-rpi-p*)
             (format nil "~%(defun usb-keepalive () 0)~%")
+            "")
+        ;; Threaded :VIRT maps VA 0x10200000-0x1FFFFFFF to DRAM, so the E1000's
+        ;; BARs go where the fixpoint map still has PCI identity space.
+        (if (and *cl-repl-virt-p* cl-user::*rpi-threads-p*)
+            (format nil "~%(defun %pci-bar-base () #x30000000)~%")
             "")
         ;; The Pi's TCP fast paths over the RTL8153 (net/r8152-post.lisp):
         ;; overrides of ip.lisp's seams, so spliced after it.
@@ -2837,7 +2875,9 @@
 
 (when cl-user::*cl-repl-virt-p*
   (setf modus.mvm::*aarch64-fixpoint-nil-value* #xDEAD0001)
-  (setf modus.mvm::*aarch64-fixpoint-reentry-guard* t))
+  (setf modus.mvm::*aarch64-fixpoint-reentry-guard* t)
+  ;; MODUS_RPI_THREADS=1: DRAM behind the thread layer's VAs (needs -m 1024).
+  (setf modus.mvm::*aarch64-fixpoint-threads* cl-user::*rpi-threads-p*))
 
 ;;; :VIRT JIT EXEC WINDOW — THE HOST SIDE OF IT.  (#282 residual, 2026-08-31.)
 ;;;
@@ -3037,7 +3077,8 @@
 ;; (hosted-layout-env.lisp APPLY-LAYOUT-HOST), with the window delta in TPIDR_EL0.  The
 ;; :A64-THREADS layout key is what runtime source tests with %LAYOUT-IF; every other layout
 ;; lookup keeps its default, as before.  The in-image JIT gets the same flags below.
-(when (and cl-user::*cl-repl-rpi-p* (boundp (quote *rpi-cl-threads*)) *rpi-cl-threads*)
+(when (or (and cl-user::*cl-repl-rpi-p* (boundp (quote *rpi-cl-threads*)) *rpi-cl-threads*)
+          (and cl-user::*cl-repl-virt-p* cl-user::*rpi-threads-p*))
   (setf *a64-tls-window* t *tls-window* t *tls-window-a64* t *a64-tls-tsd-offset* nil)
   (setf *hosted-layout* (list* :a64-threads 1 *hosted-layout*))
   (format t "~%;; RPi CL: per-thread window ON (TPIDR_EL0 delta) -- SMP phase 2~%"))

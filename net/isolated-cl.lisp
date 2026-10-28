@@ -137,8 +137,26 @@
 
 ;; Accept spawns the session instead of running it inline: NET-ACCEPT-CONNECTION
 ;; (ip.lisp) calls this once the handshake is done, and returns to the poll loop.
+;; EACH SESSION HAS ITS OWN EPHEMERAL X25519 PAIR, in its SSH block at +0x3F80
+;; (the private key) / +0x3FA0 (the public key).  The server-wide slot was
+;; refreshed by the net domain after every key exchange: on a board where an
+;; X25519 takes seconds (QEMU virt: ~40 s) that held up every accept for as
+;; long, and it rewrote the key under any session still in its exchange.  The
+;; net domain draws the private key (the DRBG is its own); the session computes
+;; the public half on its own core before it speaks.
+(defun ssh-eph-base (ssh) (+ ssh #x3F80))
+(defun ssh-refresh-ephemeral () nil)
+
+(defun %iso-session-eph (ssh)
+  (let ((priv (make-array 32)))
+    (dotimes (i 32) (setf (aref priv i) (mem-ref (+ ssh #x3F80 i) :u8)))
+    (let ((pub (x25519-public-key priv)))
+      (dotimes (i 32) (setf (mem-ref (+ ssh #x3FA0 i) :u8) (aref pub i))))))
+
 (defun ssh-connection-handler (conn)
   (%iso-init)
+  (let ((ssh (conn-ssh conn)))
+    (dotimes (i 32) (setf (mem-ref (+ ssh #x3F80 i) :u8) (ssh-random ssh))))
   ;; a reused slot: drop whatever the last session left unread
   (let ((ch (aref *iso-to-session* conn)))
     (loop (when (null (funcall *iso-try* ch)) (return nil))))
@@ -212,7 +230,13 @@
 
 (defun %iso-session (conn)
   (setf (aref *iso-slot-conn* (percpu-ref 16)) conn)   ; a fixnum: no pointer
-  (handler-case (ssh-handle-connection (conn-ssh conn)) (t (c) nil))
+  (handler-case (progn (%iso-session-eph (conn-ssh conn))
+                       (ssh-handle-connection (conn-ssh conn)))
+    ;; Said on the console: the session just ends, and nothing else would show why.
+    (t (c) (handler-case (progn (write-string-serial "ISOLATED: session error: ")
+                                (write-string-serial (princ-to-string c))
+                                (write-char-serial 10))
+             (t (c2) nil))))
   (%iso-to-net (list :close conn))
   :done)
 

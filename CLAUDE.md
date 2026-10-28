@@ -604,6 +604,34 @@ Still shared, by design: the ephemeral key slot and the line-edit buffer.
 `ssh.lisp` now answers CHANNEL_EOF (exit-status 0, EOF, CLOSE): before, every
 `echo EXPR | ssh` session on every image held open until the client timed out.
 
+**AND ON QEMU VIRT (2026-10-28): threads, SSH and the isolated server on the
+E1000.**  `build-aarch64.lisp` takes `MODUS_SSH_BUILD=1` now (the synchronous
+server, as on the PC images: `(run-net-pipeline)` then `(ssh-boot)`), and
+`MODUS_RPI_THREADS=1` (+ `MODUS_SSH_ISOLATED=1`) under `-smp 4 -m 1024`.  Two
+board facts differ from the Pi and live in `net/bare-threads-virt.lisp`: the
+image runs at **EL1** (the Pi's at EL2), so the core stub, register snapshot and
+TLB flush name EL1 registers (`test/rpi-smp/virt-*.s`); and a core starts by
+**PSCI CPU_ON over HVC** at a PHYSICAL address, MMU off.  The boot side is
+`*AARCH64-FIXPOINT-THREADS*`: VA `0x10200000..0x1FFFFFFF` -> DRAM at PA
+`+0x50000000` (not `+0x40000000`, which would alias the E1000's identity-mapped
+DMA at PA `0x502xxxxx`), BARs at `0x30000000`, L2[64] left DRAM for the GC
+bitmaps, the window zeroed with TPIDR_EL0 = 0, and vector entry 4 indexing its
+handler slots by TPIDR_EL0 so a worker's fault longjmps to ITS handler-case.
+Measured: every `test/rpi-smp/slots.lisp` check passes on virt (STW walks 0
+bad under 10 region-0 collections, sibling chains 40/40, sleep 300 ms,
+specials/intern on threads).  Each isolated session now makes its OWN
+ephemeral X25519 key on its own core (`SSH-EPH-BASE`, ssh+0x3F80): the
+server-wide key was refreshed on the net domain after every exchange, and at
+virt's ~40 s per X25519 that blocked every accept for as long.  Isolated
+sessions answer sequentially and 2 of 3 overlapping ones completed; the third
+went unanswered while main stopped accepting for a minute after an accept --
+**suspected, not proven**: a region-0 stop-the-world waiting on a worker deep
+in crypto that seldom allocates (the documented "a thread that never allocates
+holds up a region-0 collection").  **OPEN, and NOT virt's: three threads run
+~8x slower EACH than one** (a 3M-iteration loop: 200 ms alone, ~1900 ms with
+three) -- measured identically on the Pi image under raspi3b, with only ~450
+runtime-lock acquisitions, so it is neither the port nor the lock.
+
 ### Running i386 (hosted Linux/i386 — the REAL CL image)
 
 `mvm/build-i386-cli.lisp` is the hosted Modus CLI on 32 bits, built from the

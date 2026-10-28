@@ -122,8 +122,12 @@
 ;; at PA 0x50000000 for the runtime's BSS-equivalent metadata.  A BAR placed
 ;; there would route every register access into DRAM and the NIC would never
 ;; respond.  Same override build-aarch64-ansi.lisp's net build applies.
+;; Where BARs start: 0x11000000, clear of L2[128].  A threaded image maps VA
+;; 0x10200000-0x1FFFFFFF to DRAM too (boot-aarch64 *AARCH64-FIXPOINT-THREADS*),
+;; and overrides this to 0x30000000, still inside QEMU virt's PCI MMIO window.
+(defun %pci-bar-base () #x11000000)
 (defun pci-assign-bars ()
-  (let ((next-addr #x11000000))
+  (let ((next-addr (%pci-bar-base)))
     (dotimes (dev 32)
       (let ((id (pci-config-read 0 dev 0 0)))
         (when (not (eq id #xFFFFFFFF))

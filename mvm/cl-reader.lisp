@@ -464,6 +464,14 @@
                          :format-arguments nil)))
 
 
+(defun %reader-eof (stream msg)
+  "The file ended inside an object: CLHS READ, an error of type END-OF-FILE,
+   whatever EOF-ERROR-P says -- not a READER-ERROR.  SBCL agrees; a cortez
+   corpus read reported 35 truncated files as READER-ERROR where SBCL said
+   END-OF-FILE.  MSG says where it ended, for the report."
+  (declare (ignore msg))
+  (error (make-condition 'end-of-file :stream stream)))
+
 (defun %read-skip-whitespace (stream)
   "Skip whitespace chars AND line comments (semicolon to newline).
    Returns first non-whitespace non-comment char or nil on EOF.
@@ -541,7 +549,7 @@
   (loop
     (let ((ch (%read-skip-whitespace stream)))
       (when (null ch)
-        (return (if eof-error-p (%reader-error "end of file during read") eof-value)))
+        (return (if eof-error-p (%reader-eof stream "end of file during read") eof-value)))
       ;; ONE *READTABLE* read per form, re-done on every iteration of this
       ;; loop: a reader macro is user code and may rebind or assign the
       ;; variable, so the value is not carried across a dispatch.
@@ -555,7 +563,7 @@
               (cond
                 ((null next)
                  (return (if eof-error-p
-                             (%reader-error "end of file during read")
+                             (%reader-eof stream "end of file during read")
                              eof-value)))
                 ((eql next #\))
                  (unread-char next stream)
@@ -713,7 +721,7 @@
     (let ((ch (%token-read-char stream)))
       (when (null ch)
         ;; Unterminated |...| → end-of-file.
-        (when (aref st 2) (%reader-error "end of file inside | ... |"))
+        (when (aref st 2) (%reader-eof stream "end of file inside | ... |"))
         (return st))
       (cond
         ;; Inside |...| — only multiple-escape closes it; single-escape
@@ -1351,7 +1359,7 @@
       (let ((ch nil))
         (loop
           (setq ch (read-char stream nil nil t))
-          (when (null ch) (%reader-error "end of file reading list"))
+          (when (null ch) (%reader-eof stream "end of file reading list"))
           (cond
             ((%rt-ws-p ch rt) nil)               ; keep skipping
             ((eq (%read-check-macro-rt ch rt) :semicolon)
@@ -1367,7 +1375,7 @@
           ;; Peek at next char to disambiguate dot from symbol starting with dot
           (let ((next (read-char stream nil nil t)))
             (cond
-              ((null next) (%reader-error "end of file after dot"))
+              ((null next) (%reader-eof stream "end of file after dot"))
               ((or (%rt-ws-p next rt) (eql next #\)) (%terminating-macro-p next rt))
                ;; It's the consing dot.  Under *read-suppress* the list
                ;; elements are NOT accumulated (result stays nil even
@@ -1389,7 +1397,7 @@
                  (let ((close-ch nil))
                    (loop
                      (setq close-ch (read-char stream nil nil t))
-                     (when (null close-ch) (%reader-error "end of file after dotted pair"))
+                     (when (null close-ch) (%reader-eof stream "end of file after dotted pair"))
                      (cond ((%rt-ws-p close-ch rt) nil)
                            ((eql close-ch #\)) (return nil))
                            ((eq (%read-check-macro-rt close-ch rt) :semicolon)
@@ -1440,7 +1448,7 @@
   (let ((chars nil))
     (loop
       (let ((ch (read-char stream nil nil t)))
-        (when (null ch) (%reader-error "end of file reading string"))
+        (when (null ch) (%reader-eof stream "end of file reading string"))
         (cond
           ((eql ch delim)
            ;; End of string
@@ -1894,7 +1902,7 @@
         ;; the last line before the ) left %read-internal facing the ) alone.
         (loop
           (setq ch (read-char stream nil nil t))
-          (when (null ch) (%reader-error "end of file reading vector"))
+          (when (null ch) (%reader-eof stream "end of file reading vector"))
           (cond ((%whitespace-char-p ch) nil)
                 ((eq (%read-check-macro-rt ch *readtable*) :semicolon) (%skip-line-comment stream))
                 (t (return nil))))
@@ -1982,7 +1990,12 @@
 (defun %read-uninterned-symbol (stream rt)
   "Read #:symbol — uninterned symbol."
   (let ((ch (read-char stream nil nil t)))
-    (when (null ch) (%reader-error "end of file reading #:"))
+    ;; #: at end of file: the token after it is empty, so the symbol is #:|| (SBCL too).
+    ;; Likewise when a delimiter ends it at once: "#: x" is #:|| and then X.
+    (when (null ch) (return-from %read-uninterned-symbol (if *read-suppress* nil (make-symbol ""))))
+    (when (or (%rt-ws-p ch rt) (%terminating-macro-p ch rt))
+      (unread-char ch stream)
+      (return-from %read-uninterned-symbol (if *read-suppress* nil (make-symbol ""))))
     ;; %read-token-from consumes CH as the first char and reads the REST
     ;; from the stream — do NOT unread CH, or it is processed twice and the
     ;; first char of the name is doubled (#:foo -> FFOO).
@@ -2009,7 +2022,7 @@
     (loop
       (when (= depth 0) (return nil))
       (let ((ch (read-char stream nil nil t)))
-        (when (null ch) (%reader-error "end of file in block comment"))
+        (when (null ch) (%reader-eof stream "end of file in block comment"))
         (cond
           ((eql ch #\#)
            (let ((next (read-char stream nil nil t)))
@@ -2303,7 +2316,7 @@
         (let ((ch nil))
           (loop
             (setq ch (read-char s nil nil t))
-            (when (null ch) (%reader-error "end of file in read-delimited-list"))
+            (when (null ch) (%reader-eof s "end of file in read-delimited-list"))
             (cond ((%whitespace-char-p ch) nil)
                   ((eq (%read-check-macro-rt ch *readtable*) :semicolon) (%skip-line-comment s))
                   (t (return nil))))

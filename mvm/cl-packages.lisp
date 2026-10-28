@@ -932,7 +932,15 @@
         (when (and (>= c 97) (<= c 122)) (setq lower t)))
       (setq i (+ i 1)))
     (if (not lower)
-        (compute-name-hash name-str)
+        ;; Record the name here too.  A keyword carries only its key, so without it
+        ;; SYMBOL-NAME of any keyword interned at run time walked every package's
+        ;; table -- (STRING :LISPM) in cortez's #+ test, on every conditional the
+        ;; corpus reads.  Never over an entry the table already has.
+        (let ((key (compute-name-hash name-str)))
+          (when (and (hash-table-p *sym-name-table*)
+                     (null (gethash key *sym-name-table*)))
+            (setf (gethash key *sym-name-table*) (%narrow-copy name-str)))
+          key)
         (let ((out (make-string-output-stream)) (j 0))
           (loop
             (when (>= j n) (return nil))

@@ -1994,17 +1994,19 @@
            ;; Header at alloc, slots at alloc+4+. OBJ-REF offset = 2 + idx*4.
            (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
            (arm32-store-vreg buf +arm-r12+ vd)
-           ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots)
-           ;; Align to 16 bytes to keep cons alloc pointer aligned
+           ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots),
+           ;; aligned to 16 -- AND ZERO THE SLOTS, as x64, aarch64 and i386
+           ;; do and as this file already did for arrays and byte vectors.
+           ;; Unzeroed, a fresh instance / struct / closure / condition held
+           ;; whatever an earlier collection left in reused memory until its
+           ;; slots were filled, and a small heap reuses memory constantly:
+           ;; 150 rounds of DEFCLASS / DEFGENERIC / DEFMETHOD /
+           ;; MAKE-INSTANCE in a 16 MB heap failed 22-36 rounds with
+           ;; MEMORY-FAULT-ERROR, and 0 when the collector overwrote reused
+           ;; memory with an inert value (MODUS_ARM32_GC_POISON) -- same tree.
            (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15))))
-             (let ((enc (arm32-encode-imm total)))
-               (if enc
-                   (let ((rot (car enc))
-                         (imm (cdr enc)))
-                     (arm32-add-imm buf +arm-r9+ +arm-r9+ rot imm))
-                   (progn
-                     (arm32-load-imm32 buf +arm-lr+ total)
-                     (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))))))
+             (arm32-load-imm32 buf +arm-lr+ total)
+             (arm32-emit-alloc-zero-tail buf))))
 
         (#.+op-alloc-array+
          (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
@@ -2304,6 +2306,42 @@
          ;; the reference back ends exactly.  What it replaces is worse than an
          ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
          ;; make-array emits :gc-check-n, so no array could be allocated at all.
+         ;; HOSTED + SIZED: test the POST-allocation pointer.  The unsized
+         ;; check below lets an allocation larger than the collector's margin
+         ;; (min 1 MB, a quarter of a semispace) run past VL into the conses
+         ;; the last collection copied to the top of the semispace -- live
+         ;; data.  A big heap seldom sits near its limit; a small one nearly
+         ;; always does, and cl-ppcre's 1.4 MB tarball vector is bigger than
+         ;; the margin of any heap under 8 MB of semispace.
+         (when (and *arm32-gc-label*
+                    (or (= opcode +op-gc-check-n+) (= opcode +op-gc-check-r+)))
+           (flet ((size+va ()
+                    ;; r12 = VA + an OVERestimate of the bytes about to be
+                    ;; allocated (the superset property: never under).
+                    (if (= opcode +op-gc-check-n+)
+                        (arm32-load-imm32 buf +arm-r12+ (vreg 0))
+                        (progn
+                          (arm32-load-vreg buf +arm-r12+ (vreg 0))
+                          (if (eql (vreg 1) 1)
+                              ;; KIND 1: TAGGED byte count -> n/... bytes + header
+                              (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+                              ;; KIND 0: UNTAGGED slot count -> 4 bytes a slot
+                              (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 2))
+                          (arm32-add-imm buf +arm-r12+ +arm-r12+ 0 32)))
+                    (arm32-add buf +arm-r12+ +arm-r12+ +arm-r9+)))
+             (let ((ok (mvm-make-label)))
+               (size+va)
+               (arm32-cmp buf +arm-r12+ +arm-r10+)
+               (arm32-b-cond buf +arm-cc-cc+ ok)          ; fits below VL
+               (arm32-bl buf *arm32-gc-label*)
+               (size+va)
+               (arm32-cmp buf +arm-r12+ +arm-r10+)
+               (arm32-b-cond buf +arm-cc-cc+ ok)
+               ;; Still does not fit after a collection: the heap is too small
+               ;; for this object.  The collector's own exhausted signal.
+               (arm32-emit-bkpt buf #xF0)
+               (arm32-emit-label buf ok))
+             (return-from arm32-translate-insn nil)))
          ;; CMP r9(VA), r10(VL); trap if VA >= VL
          (arm32-cmp buf +arm-r9+ +arm-r10+)
          ;; BKPTCS #1  (if unsigned >=)

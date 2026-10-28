@@ -569,67 +569,38 @@ runtime options (`--dynamic-space-size`, `--control-stack-size`,
 `--tls-limit`, `--end-runtime-options`, `--[no-]merge-core-pages`) instead
 of rejecting them; on a fixed-heap port they are accepted and do nothing.
 
-**A PRE-EXISTING ARM32 CL-IMAGE GC BUG, exposed by small heaps** (still open
-after the handler-stack fix: at 16-32 MB, MEMORY-FAULT-ERRORs inside shim
-evaluation and cl-ppcre crashes; at 48 MB both libraries pass everything.
-`MODUS_ARM32_GC_POISON=1` builds an image whose collections overwrite the
-evacuated semispace, so a stale pointer faults at its first read).  With a heap
-small enough to collect DURING BOOT, about 1 boot in 6 prints `!! form eval
-error in sb-shims: #(MEMORY-FAULT-ERROR ...)` (once `asdf-interface`): a
-boot-evaluated source form faults across a collection, is skipped, and boot
-carries on.  NOT this work: an unmodified `origin/main` arm32 CLI with only
-`+linux-arm32-heap-size+` shrunk to 24 MB faults 2 of 12 boots, the same as
-the startup-sized image's 2 of 12.  At the old fixed 248 MB boot never
-collects, which is how it hid; a 6000-eval stress with 6 collections AFTER
-boot is clean on both.  Open.
+**THE "ARM32 GC BUG" WAS UNZEROED `alloc-obj` -- FIXED.**  With a heap small
+enough to collect often, arm32 CL images failed intermittently: boot-form
+MEMORY-FAULT-ERRORs, functions vanishing mid-load, and an unmodified
+`origin/main` image with only a 24 MB heap constant did the same (2/12 boots).
+It was not the collector.  `+op-alloc-obj+` (instances, structs, closures,
+conditions) wrote the header and bumped VA without zeroing the slots, so a fresh
+object held whatever an earlier collection had left in reused memory until its
+slots were filled -- which is also why it was "non-deterministic": the garbage
+depended on the run.  Found with `MODUS_ARM32_GC_POISON=1`, which overwrites
+each evacuated semispace with an inert value: on ONE tree, 150 rounds of
+DEFCLASS / DEFGENERIC / DEFMETHOD / MAKE-INSTANCE in 16 MB failed 22-36 rounds
+plain and 0 poisoned -- poisoning makes a STALE pointer worse, so it had to be
+uninitialised memory.  Zeroed (as x64/aarch64/i386 always did): 0 failures at
+12/16/24 MB, 3 runs each, and the collection counts are now identical across
+runs.  68k and ppc had the same gap and zero now too.
 
-**THE BOOT-TIME SURFACES ARE INSTALLED ON DEMAND** (`*deferred-surfaces-source*`
-in `build-cli-common.lisp`).  The Genera layer, the SB-* shims and the ASDF
-interface were ~210 KB of source EVALUATED at every boot -- most of boot's
-time, all of its collections, and 4 MB of its smallest heap.  Boot now pushes
-their FEATURES, exports MODUS's shim-provided names behind autoload stubs, runs
-their compiled side effects, and evaluates the cooperative atomics (unqualified
-CL-USER macros, so they cannot wait for a package lookup); the source runs the
-first time anything looks up one of their PACKAGES (`%deferred-package-hook`,
-called on a `FIND-PACKAGE` miss), `INSTALL-TARBALL` starts, or
-`LIST-ALL-PACKAGES` is called.  Measured: x64 boot ~1.1-2.5 s -> 0.65-0.9 s;
-arm32 under qemu 16.0 s -> 5.4 s; arm32's smallest heap that boots 11 -> 7 MB.
-Three ways the first cut was wrong, each now a rule in that file:
-- **The first trigger installs EVERY pending surface, in boot order, with the
-  trigger off.**  Installing only the one asked for nested the SB shims inside
-  the ASDF install, and the Genera layer asks whether SB-THREAD exists (NIL at
-  boot, because it ran first).
-- **The install loads UNCACHED** (`*fasl-suspended*` in `fasl.lisp`).  A
-  trigger inside LOAD runs while that load is recording the FASL cache; the
-  shared per-form recording state broke the install (`%THROW-IN-FLIGHT`).
-- **`INSTALL-TARBALL` installs them first, outside any READ** -- it reads the
-  .asd in lenient missing-package mode.
-Escape hatches unchanged: `MODUS_NO_GENERA` / `MODUS_NO_SB` / `MODUS_NO_ASDF`.
-x64 suite identical to the control (sb-thread 44, sockets 52, channel 61,
-thread-lisp 29, atomics 31, mutex 18, sleep 13, word-boundary 624).
+**And arm32's `:gc-check-n` / `:gc-check-r` are SIZE-AWARE now** (hosted): they
+test VA + size against VL, collect, re-test, and take the exhausted exit if the
+object still does not fit.  The unsized check let an allocation bigger than the
+margin (min 1 MB, a quarter of a semispace) run into the conses the last
+collection copied to the top of the semispace -- cl-ppcre's 1.4 MB tarball
+vector in a 16-24 MB heap segfaulted.
 
-**FRESH-FASL-CACHE LOADS ON ARM32 FAILED -- THE HANDLER-FRAME STACK WAS 21
-DEEP.**  With an empty `MODUS_FASL_DIR`, the RECORDING run of alexandria failed
-all 30 probes (80 errors, 57 throws escaping as `%THROW-IN-FLIGHT`) on the
-unmodified image too, while x64 passed.  Boot already holds 5 handler frames; a
-load recording the cache nests past the other 16; pushes past the cap are
-ABSORBED and a throw then lands on the wrong frame.  `*arm32-hstack-max-depth*`
-is 46 now (as many 32-byte frames as fit below the globals at #x10000A00):
-30/30, no errors, recording and replay.  68k is 46 too, ppc 23 (ppc64) / 46
-(ppc32); x64 holds 64, i386 63.  **RISC-V is still 21** -- its frames are 96
-bytes and nothing larger fits below its next fixed slot, so it needs a move,
-not a constant.  Untested whether its CL images hit this.  Test with a private `MODUS_FASL_DIR`, never the shared
-`~/.cache/modus/fasl`: a run there REPLAYS whatever an earlier run recorded,
-and replay vs record is exactly the difference above.  (The key's compiler
-fingerprint hashes a fixed list of compiler and runtime files, BY DESIGN -- a
-cache written by one image serves another with the same compiler, which is how
-kiln feeds a board -- so builds that differ only elsewhere share keys.  No
-failure has been traced to that; a hash of the whole image would break kiln.)
+**Measured arm32 footprint after all of the above** (fresh FASL cache, 0
+errors anywhere; below these the process exits cleanly as heap-exhausted):
 
-`MODUS_NO_SOURCE_BLOB=1` (any CLI build) drops the image's embedded copy of its
-own source: 34.9 -> 28.1 MB on arm32.  OFF by default -- carrying its own source
-is part of the image's legibility -- and on a hosted system it costs disk, not
-RAM (file-backed, never paged in).  It is for bare metal, which loads it all.
+| workload | smallest heap |
+|---|---|
+| boot | 7 MB |
+| boot + first use of the SB-* / ASDF surfaces | 12 MB |
+| load alexandria, 30 probes | 24 MB |
+| load cl-ppcre, 6 probes | 48 MB |
 
 **PowerPC bugs found on the way:**
 - **The MD-form encoder stored the 6-bit mask field unrotated**: it is

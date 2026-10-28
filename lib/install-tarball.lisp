@@ -391,7 +391,18 @@
             (write-string-serial "  !! form eval error in ")
             (write-string-serial tag) (write-string-serial ": ")
             (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
-            (write-char-serial 10)))))))
+            (write-char-serial 10)
+            ;; NAME THE FORM, as LOAD's swallow does: a condition TYPE alone
+            ;; does not say which of a file's forms failed.
+            (handler-case
+                (progn
+                  (write-string-serial "     in form: ")
+                  (write-object (if (consp form)
+                                    (list (car form)
+                                          (if (consp (cdr form)) (cadr form) '|...|))
+                                    form))
+                  (write-char-serial 10))
+              (t (c2) nil))))))))
 
 ;;; --- .asd parsing -----------------------------------------------------------
 ;;;

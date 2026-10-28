@@ -2095,6 +2095,21 @@
              (ppc-emit-li buf +ppc-r0+ (logior (ash size 8) subtag))
              (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
              (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
+             ;; ZERO every word past the header before the bump, as x64,
+             ;; aarch64, i386, arm32 and 68k do: unzeroed, a fresh object holds
+             ;; whatever an earlier collection left in reused memory until its
+             ;; slots are filled (ARM32: 22-36 of 150 DEFCLASS/MAKE-INSTANCE
+             ;; rounds failed in a 16 MB heap).  CTR counts, r12 is the cursor
+             ;; (PD may be r11, never r12), r0 supplies the zero as DATA only.
+             (let ((zl (mvm-make-label)))
+               (ppc-emit-li buf +ppc-r0+ (1- (floor total-bytes ws)))
+               (ppc-emit-mtctr buf +ppc-r0+)
+               (ppc-emit-addi buf +ppc-scratch2+ +ppc-r19+ ws)
+               (ppc-emit-li buf +ppc-r0+ 0)
+               (ppc-emit-label buf zl)
+               (ppc-emit-store-word buf +ppc-r0+ +ppc-scratch2+ 0)
+               (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ ws)
+               (ppc-emit-bc buf 16 0 zl))                 ; bdnz
              ;; ADDI's immediate is 16 bits SIGNED; the compiler inlines constant
              ;; sizes up to 65535 slots, so a large object's bump wrapped and the
              ;; next allocations landed inside it (the RV32 stream-buffer bug).

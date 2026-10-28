@@ -1921,8 +1921,22 @@
            ;; Tag the pointer
            (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
            (m68k-emit-ori buf +68k-d0+ +tag-object+)
-           ;; Bump alloc: (1+size)*4 bytes, aligned to 16 bytes to keep cons alloc pointer aligned
-           (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15))))
+           ;; Bump alloc: (1+size)*4 bytes, aligned to 16 bytes to keep cons
+           ;; alloc pointer aligned -- after ZEROING every word past the
+           ;; header.  Unzeroed, a fresh object held whatever an earlier
+           ;; collection left in reused memory until its slots were filled:
+           ;; on ARM32's identical collector that failed 22-36 of 150
+           ;; DEFCLASS/MAKE-INSTANCE rounds in a 16 MB heap (see
+           ;; translate-arm32's +op-alloc-obj+).  x64, aarch64, i386 and arm32
+           ;; all zero here.
+           (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15)))
+                 (zl (mvm-make-label)))
+             (m68k-emit-lea-disp buf +68k-a2+ 4 +68k-a0+)
+             (m68k-emit-move-imm-dn buf (1- (floor total 4)) +68k-d1+)
+             (m68k-emit-label buf zl)
+             (m68k-emit-word buf #x4298)                  ; CLR.L (A0)+
+             (m68k-emit-subq buf +68k-d1+ 1)
+             (m68k-emit-bne buf zl)
              (if (<= total 8)
                  (m68k-emit-addq-an buf +68k-a2+ total)
                  (progn

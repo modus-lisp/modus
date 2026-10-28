@@ -2542,12 +2542,14 @@
 ;;;
 ;;;   #x10000040 + 0x00  from_start      + 0x08  to_start    + 0x10  space_size
 ;;;              + 0x18  stack_base      + 0x20  gc_count
-;;;   +68K-GC-KIND-BIAS-ADDR+  K, where the kind byte of address A is K + (A >> 4)
-;;;   +68K-GC-MARGIN-ADDR+     bytes kept free below VL after a collection
 ;;;
 ;;; Same offsets as mvm/compiler.lisp's +GC-OFF-*+, so the block reads the way
-;;; every other port's does.  The collector reads all of it at entry, and every
-;;; allocation site reads K, so one binary runs in a 2 MB heap or a 512 MB one.
+;;; every other port's does.  The collector reads it at entry, the overshoot
+;;; margin is computed from space_size, and the kind map sits at a fixed address
+;;; past the largest heap (+68K-GC-KIND-MAP+), so the stub has to store NOTHING
+;;; else and one binary runs in a 1 MB heap or a 248 MB one.  (A first cut kept
+;;; the bias and margin at #x10000F90/F98 -- which are aarch64's handler-helper
+;;; slots, read by every CLI image.)
 ;;;
 ;;; Allocation marks are a KIND BYTE per 16-byte granule (1 = object start,
 ;;; 2 = cons), as on ARM32.  A conservative root must name an address in
@@ -2574,13 +2576,16 @@
 ;;; the new frontier in them.
 
 (defconstant +68k-gc-meta+ #x10000040)
-(defconstant +68k-gc-kind-bias-addr+ #x10000F90
-  "K for the allocation-mark arithmetic.  In the BSS gap mvm/compiler.lisp
-   documents as free (between the per-region table and the scheduler words).
-   Inside the collector's low-block root range, which is harmless: K is
-   16-aligned, so its low nibble is 0 and it can never read as a tagged root.")
-(defconstant +68k-gc-margin-addr+ #x10000F98
-  "The overshoot margin the stub chose for this heap.  16-aligned, as above.")
+(defconstant +68k-gc-kind-map+ #x1FC00000
+  "The kind map's FIXED address: just past the largest heap the stub will
+   choose (#x10000000 + 248 MB + 4 MB guard), where ARM32's has always been.
+   The stub maps only the S/16 bytes a heap of size S needs, so a small heap
+   costs a small map, and the bias below stays a translate-time constant.")
+(defconstant +68k-gc-kind-bias+ (- +68k-gc-kind-map+ (ash #x10000000 -4))
+  "K: the kind byte of address A is at K + (A >> 4).")
+(defconstant +68k-gc-margin-max+ #x100000
+  "The collector leaves min(1 MB, a quarter of a semispace) free below VL --
+   COMPUTED from space_size at each collection, so it needs no stored word.")
 
 (defvar *68k-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
@@ -2623,8 +2628,7 @@
   (when *68k-gc-label*
     (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
     (m68k-emit-lsr-imm buf +68k-d0+ 4)
-    (m68k-emit-move-imm-an buf +68k-gc-kind-bias-addr+ +68k-a0+)
-    (m68k-emit-move-disp-an buf +68k-a0+ 0 +68k-a0+)        ; A0 = K
+    (m68k-emit-move-imm-an buf +68k-gc-kind-bias+ +68k-a0+) ; A0 = K
     (m68k-emit-adda-dn buf +68k-d0+ +68k-a0+)
     (m68k-emit-moveq buf +68k-d0+ kind)
     (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+)))
@@ -2726,8 +2730,7 @@
       (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d1+)
       (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
       (m68k-emit-move-dn-an buf +68k-d1+ +68k-a3+)               ; cons low = to_end
-      (m68k-emit-move-imm-an buf +68k-gc-kind-bias-addr+ +68k-a0+)
-      (m68k-emit-move-disp-dn buf +68k-a0+ 0 +68k-d6+)           ; K
+      (m68k-emit-move-imm-dn buf +68k-gc-kind-bias+ +68k-d6+)    ; K
       ;; ---- roots: the stack from the save frame, then the low block ----
       (m68k-emit-move-an-an buf +68k-a7+ +68k-a5+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x18 +68k-d7+)        ; stack_base
@@ -2822,9 +2825,16 @@
       (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ #x20)
       ;; ---- new VA = object free, VL = cons low - margin, into the frame ----
       (let ((exhausted (lbl)))
-        (m68k-emit-move-imm-an buf +68k-gc-margin-addr+ +68k-a0+)
+        ;; margin = min(1 MB, space_size / 4), 16-aligned -- the stub's rule
+        (let ((small (lbl)))
+          (m68k-emit-move-disp-dn buf +68k-a1+ #x10 +68k-d0+)
+          (m68k-emit-lsr-imm buf +68k-d0+ 2)
+          (m68k-emit-andi buf +68k-d0+ (logand (lognot 15) #xFFFFFFFF))
+          (m68k-emit-cmpi buf +68k-d0+ +68k-gc-margin-max+)
+          (m68k-emit-bcc-word buf +68k-cc-ls+ small)
+          (m68k-emit-move-imm-dn buf +68k-gc-margin-max+ +68k-d0+)
+          (here small))
         (m68k-emit-move-an-dn buf +68k-a3+ +68k-d1+)
-        (m68k-emit-move-disp-dn buf +68k-a0+ 0 +68k-d0+)
         (m68k-emit-sub-dn-dn buf +68k-d0+ +68k-d1+)              ; D1 = VL
         (m68k-emit-cmpa buf +68k-a2+ +68k-d1+)                   ; A2 - VL
         (m68k-emit-bcc-word buf +68k-cc-cc+ exhausted)

@@ -2777,9 +2777,9 @@
 ;;;
 ;;;   #x10000040 + 0x00  from_start      + 0x08  to_start    + 0x10  space_size
 ;;;              + 0x18  stack_base      + 0x20  gc_count
-;;;   +PPC-GC-KIND-BIAS-ADDR+  K, where the kind byte of address A is K + (A >> 4)
-;;;   +PPC-GC-MARGIN-ADDR+     bytes kept free below VL after a collection
 ;;;
+;;; The overshoot margin is computed from space_size and the kind map sits at a
+;;; fixed address (+PPC-GC-KIND-MAP+), so the stub stores nothing else.
 ;;; mvm/compiler.lisp's +GC-OFF-*+ offsets at BOTH widths (ppc32 stores a
 ;;; 32-bit word at each), so the block reads the way every other port's does.
 ;;;
@@ -2804,12 +2804,15 @@
 (defconstant +ppc-r24+ 24)
 (defconstant +ppc-r25+ 25)
 (defconstant +ppc-gc-meta+ #x10000040)
-(defconstant +ppc-gc-kind-bias-addr+ #x10000F90
-  "K for the allocation-mark arithmetic, written by the boot stub.  16-aligned,
-   so although it sits inside the low-block root range it can never read as a
-   tagged root.  Same address 68k uses.")
-(defconstant +ppc-gc-margin-addr+ #x10000F98
-  "The overshoot margin the stub chose for this heap.  16-aligned, as above.")
+(defconstant +ppc-gc-kind-map+ #x1FC00000
+  "The kind map's FIXED address, past the largest heap the stub will choose
+   (#x10000000 + 248 MB + 4 MB guard) -- 68k's and ARM32's.  The stub maps only
+   the S/16 bytes a heap of size S needs; the bias stays a constant.")
+(defconstant +ppc-gc-kind-bias+ (- +ppc-gc-kind-map+ (ash #x10000000 -4))
+  "K: the kind byte of address A is at K + (A >> 4).")
+(defconstant +ppc-gc-margin-max+ #x100000
+  "min(1 MB, a quarter of a semispace) is left free below VL -- computed from
+   space_size at each collection, so it needs no stored word.")
 
 (defvar *ppc-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
@@ -2841,8 +2844,7 @@
    Hosted with a collector only.  Clobbers r11/r12, so it is emitted FIRST in
    every allocation arm, before either can hold an operand."
   (when *ppc-gc-label*
-    (ppc-emit-li buf +ppc-r12+ +ppc-gc-kind-bias-addr+)
-    (ppc-emit-load-word buf +ppc-r12+ +ppc-r12+ 0)
+    (ppc-emit-li buf +ppc-r12+ +ppc-gc-kind-bias+)
     (ppc-emit-srli buf +ppc-r11+ +ppc-r19+ 4)
     (ppc-emit-add buf +ppc-r12+ +ppc-r12+ +ppc-r11+)
     (ppc-emit-li buf +ppc-r11+ kind)
@@ -2952,8 +2954,7 @@
       (ppc-emit-add buf +ppc-r15+ +ppc-r14+ +ppc-r12+)           ; from_end
       (ppc-emit-load-word buf +ppc-r19+ +ppc-r24+ #x08)          ; object free = to_start
       (ppc-emit-add buf +ppc-r20+ +ppc-r19+ +ppc-r12+)           ; cons low = to_end
-      (ppc-emit-li buf +ppc-r16+ +ppc-gc-kind-bias-addr+)
-      (ppc-emit-load-word buf +ppc-r16+ +ppc-r16+ 0)             ; K
+      (ppc-emit-li buf +ppc-r16+ +ppc-gc-kind-bias+)             ; K
       ;; ---- roots: the stack from this frame, then the low block ----
       (ppc-emit-mr buf +ppc-r22+ +ppc-r1+)
       (ppc-emit-load-word buf +ppc-r23+ +ppc-r24+ #x18)          ; stack_base
@@ -3037,8 +3038,16 @@
       (ppc-emit-store-word buf +ppc-r7+ +ppc-r24+ #x20)
       ;; ---- VA = object free (already r19), VL = cons low - margin ----
       (let ((exhausted (lbl)))
-        (ppc-emit-li buf +ppc-r7+ +ppc-gc-margin-addr+)
-        (ppc-emit-load-word buf +ppc-r7+ +ppc-r7+ 0)
+        ;; margin = min(1 MB, space_size / 4), 16-aligned -- the stub's rule
+        (let ((small (lbl)))
+          (ppc-emit-load-word buf +ppc-r7+ +ppc-r24+ #x10)
+          (ppc-emit-srli buf +ppc-r7+ +ppc-r7+ 2)
+          (ppc-emit-clear-low4 buf +ppc-r7+ +ppc-r7+)
+          (ppc-emit-li buf +ppc-r8+ +ppc-gc-margin-max+)
+          (ppc-emit-cmpl-word buf +ppc-r7+ +ppc-r8+)
+          (ppc-emit-ble buf small)
+          (ppc-emit-mr buf +ppc-r7+ +ppc-r8+)
+          (here small))
         (ppc-emit-subf buf +ppc-r20+ +ppc-r7+ +ppc-r20+)         ; r20 -= margin
         (ppc-emit-cmpl-word buf +ppc-r19+ +ppc-r20+)
         (ppc-emit-bge buf exhausted)

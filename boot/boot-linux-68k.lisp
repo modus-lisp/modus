@@ -44,10 +44,10 @@
    from.  Nothing in the translator depends on it: the collector and every
    allocation site read the geometry the stub leaves in memory.")
 (defconstant +linux-68k-heap-min+ #x100000 "1 MB: two 512 KB semispaces.")
-(defconstant +linux-68k-heap-max+ #x20000000
-  "512 MB.  The heap is at #x10000000 and its kind map follows it, so this keeps
-   the whole mapping below 2^30 -- the ceiling a tagged MEM-REF address can
-   express on a 4-byte word.")
+(defconstant +linux-68k-heap-max+ #x0F800000
+  "248 MB, ARM32's geometry: heap + guard end at #x1FC00000, where the kind map
+   starts (+68K-GC-KIND-MAP+), and everything stays below #x20000000, which a
+   tagged MEM-REF address can still express on a 4-byte word.")
 (defconstant +linux-68k-gc-guard+ #x400000
   "4 MB past the second semispace: :gc-check tests the alloc pointer without
    knowing the size of the allocation that follows, so a big object can overshoot.
@@ -202,13 +202,14 @@
    valid.
 
    THE HEAP IS SIZED HERE, AT RUN TIME (EMIT-LINUX-68K-CHOOSE-HEAP-SIZE), and
-   everything that depends on the size is written to memory for the collector
-   and the allocation sites to read: the Cheney block at #x10000040, the
-   kind-map bias and the overshoot margin.  Layout, S = the chosen size:
-     [base, base+S)            two S/2 semispaces (the first starts past the
-                               fixed low block, at base + alloc-start)
-     [base+S, base+S+guard)    overshoot guard
-     [base+S+guard, +S/16)     kind map, one byte per 16-byte granule
+   the geometry is written to the Cheney block at #x10000040 for the collector
+   to read.  Layout, S = the chosen size:
+     [base, base+S)              two S/2 semispaces (the first starts past the
+                                 fixed low block, at base + alloc-start)
+     [base+S, base+S+guard)      overshoot guard
+     [+68K-GC-KIND-MAP+, +S/16)  kind map, one byte per 16-byte granule, at a
+                                 FIXED address past the largest heap, so the
+                                 allocation sites can bake its bias in
 
    No signal handlers and no JIT arena: a fault is a clean SIGSEGV rather than a
    longjmp into handler-case, and there is no m68k JIT.  Deliberate omissions."
@@ -217,12 +218,9 @@
     (emit-linux-68k-choose-heap-size buf)
     ;; --- mmap2 FIRST: the argc slot is INSIDE this mapping, and this port asks
     ;;     for no BSS, so writing it beforehand is an immediate SIGSEGV.
-    ;;     mmap2(addr, S + guard + S/16, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
+    ;;     mmap2(addr, S + guard, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
     (m68k-emit-move-imm-dn buf +linux-68k-heap-addr+ +68k-d1+)
     (m68k-emit-move-an-dn buf +68k-a5+ +68k-d2+)
-    (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
-    (m68k-emit-lsr-imm buf +68k-d0+ 4)
-    (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d2+)
     (m68k-emit-addi buf +68k-d2+ +linux-68k-gc-guard+)
     (m68k-emit-move-imm-dn buf 3 +68k-d3+)                ; PROT_READ|PROT_WRITE
     (m68k-emit-move-imm-dn buf #x32 +68k-d4+)             ; PRIVATE|ANON|FIXED
@@ -234,6 +232,18 @@
     ;; using the return value keeps a failed mapping visible as a wild pointer
     ;; rather than as silent writes to an address nobody mapped.
     (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)          ; a1 = heap base
+    ;; --- the kind map, at its FIXED address, only as long as THIS heap needs:
+    ;;     mmap2(+68K-GC-KIND-MAP+, S/16, ...)
+    (m68k-emit-move-imm-dn buf +68k-gc-kind-map+ +68k-d1+)
+    (m68k-emit-move-an-dn buf +68k-a5+ +68k-d2+)
+    (m68k-emit-lsr-imm buf +68k-d2+ 4)
+    (m68k-emit-move-imm-dn buf 3 +68k-d3+)
+    (m68k-emit-move-imm-dn buf #x32 +68k-d4+)
+    (m68k-emit-move-imm-dn buf -1 +68k-d5+)
+    (m68k-emit-move-imm-an buf 0 +68k-a0+)
+    (m68k-emit-move-imm-dn buf +68k-linux-sys-mmap2+ +68k-d0+)
+    (m68k-emit-trap buf 0)
+    (m68k-emit-move-an-dn buf +68k-a1+ +68k-d0+)          ; d0 = heap base again
     ;; --- argc, now inside the mapping
     (m68k-emit-move-disp-dn buf +68k-a7+ 0 +68k-d6+)
     (m68k-emit-move-imm-an buf (+ +linux-68k-heap-addr+ #x200) +68k-a0+)
@@ -274,16 +284,6 @@
     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x18)   ; stack_base
     (m68k-emit-moveq buf +68k-d1+ 0)
     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x20)   ; gc_count
-    ;; --- kind-map bias K = base + S + guard - (base >> 4), and the margin
-    (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
-    (m68k-emit-move-an-dn buf +68k-a5+ +68k-d2+)
-    (m68k-emit-add-dn-dn buf +68k-d2+ +68k-d1+)
-    (m68k-emit-addi buf +68k-d1+ +linux-68k-gc-guard+)
-    (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
-    (m68k-emit-lsr-imm buf +68k-d2+ 4)
-    (m68k-emit-sub-dn-dn buf +68k-d2+ +68k-d1+)
-    (m68k-emit-store-abs buf +68k-d1+ +68k-gc-kind-bias-addr+)
-    (m68k-emit-store-abs buf +68k-d5+ +68k-gc-margin-addr+)
     ;; --- VFP must point at a frame before the first prologue runs
     (m68k-emit-move-an-an buf +68k-a7+ +68k-a6+)
     ;; --- fall through to translated native code

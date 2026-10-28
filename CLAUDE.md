@@ -527,19 +527,24 @@ purpose: bare targets have no collector, so it cannot be an arch-ladder rung.
 
 `m68k-emit-gc-collector` in `translate-68k.lisp` is arm32's Cheney collector
 (kind byte per 16-byte granule, objects up / conses down, all registers +
-stack + low block as roots) with one change: **no heap geometry is a
-translate-time constant.**  The boot stub picks the size when the process
-starts and leaves everything in memory (Cheney block at `#x10000040` with the
-`+GC-OFF-*+` offsets, kind-map bias at `#x10000F90`, overshoot margin at
-`#x10000F98`); the collector reads it at entry and every allocation site reads
-the bias.  One binary runs in 1 MB or 512 MB:
+stack + low block as roots) with one change: **the heap's size is not a
+translate-time constant.**  The boot stub picks it when the process starts and
+writes the Cheney block at `#x10000040` (`+GC-OFF-*+` offsets); the collector
+reads it at entry and COMPUTES the overshoot margin from `space_size`.  The
+kind map sits at a FIXED address past the largest heap (`#x1FC00000`, where
+arm32's always was) and only its first S/16 bytes are mapped, so the
+allocation-site bias stays a constant.  (A first cut stored the bias and margin
+at `#x10000F90/F98` -- aarch64's handler-helper slots, read by every CLI
+image.  That BSS gap is full: F90/F98 aarch64, FA0/FA8 the global-cell cache,
+FB0 static symbols, FB8 the JIT bump word, FC0+ scheduler and atomics.)
+One binary runs in 1 MB or 248 MB:
 
 ```
 qemu-m68k-static ./image                           # half of RAM (sysinfo), capped at 128 MB
 qemu-m68k-static ./image --dynamic-space-size 16   # SBCL's flag: MB, or 512KB / 2MB / 1GB
 ```
 
-Clamped to [1 MB, 512 MB] (the mapping must stay below 2^30), rounded to
+Clamped to [1 MB, 248 MB] (everything stays below #x20000000), rounded to
 128 KB; the margin is min(1 MB, a quarter of a semispace).  Live data larger
 than the heap exits **3** with `modus: heap exhausted (raise
 --dynamic-space-size)` on stderr, not a SIGILL.  Before this, `:gc-check` was
@@ -548,7 +553,7 @@ than the heap exits **3** with `modus: heap exhausted (raise
 **PowerPC, both widths** (`ppc-emit-gc-collector` in `translate-ppc.lisp`,
 stub in `boot-linux-ppc.lisp`) is the same collector and the same startup
 sizing, one routine for ppc32 and ppc64 (width from `ppc-word-size`), at the
-same `#x10000F90`/`#x10000F98` words; the Cheney block now uses the
+same fixed kind map; the Cheney block now uses the
 `+GC-OFF-*+` 8-byte stride at both widths (ppc32 stores 32-bit values there).
 Its `:gc-check` was `tw 31,0,0`, the same lifetime cap.  `:gc-check` reaches
 the collector with `BL`: LR is free in a body because every prologue saves it.
@@ -556,6 +561,23 @@ Measured: h01 42 at 128/8/1 MB on both widths; 16 collections at the default
 size, 1560 (ppc32) / 1724 (ppc64) at 2 MB; the 200,000-cons probe survives at
 16 MB and exits 3 at 8 MB.  Hosted ladder 35/35 -> 35/35 + h01 on both;
 bare ppc32/ppc64 arch-ladder identical before and after (70/70 with the gate fix).
+
+**ARM32 sizes its heap at startup too** (`emit-linux-arm32-choose-heap-size`),
+and it is the only one of the three with a full CL image, so it is where the
+CL runtime's footprint can be measured.  The CLI toplevel now accepts SBCL's
+runtime options (`--dynamic-space-size`, `--control-stack-size`,
+`--tls-limit`, `--end-runtime-options`, `--[no-]merge-core-pages`) instead
+of rejecting them; on a fixed-heap port they are accepted and do nothing.
+
+**A PRE-EXISTING ARM32 CL-IMAGE GC BUG, exposed by small heaps.**  With a heap
+small enough to collect DURING BOOT, about 1 boot in 6 prints `!! form eval
+error in sb-shims: #(MEMORY-FAULT-ERROR ...)` (once `asdf-interface`): a
+boot-evaluated source form faults across a collection, is skipped, and boot
+carries on.  NOT this work: an unmodified `origin/main` arm32 CLI with only
+`+linux-arm32-heap-size+` shrunk to 24 MB faults 2 of 12 boots, the same as
+the startup-sized image's 2 of 12.  At the old fixed 248 MB boot never
+collects, which is how it hid; a 6000-eval stress with 6 collections AFTER
+boot is clean on both.  Open.
 
 **PowerPC bugs found on the way:**
 - **The MD-form encoder stored the 6-bit mask field unrotated**: it is

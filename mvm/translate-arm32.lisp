@@ -2930,8 +2930,9 @@
 ;;; preserves r4-r11, and returns with BX LR.
 
 (defconstant +arm32-gc-overshoot-margin+ #x100000
-  "Bytes kept free below VL: :gc-check tests VA < VL before an allocation whose
-   size it does not know.  1 MB, as on RISC-V.")
+  "The MOST kept free below VL: :gc-check tests VA < VL before an allocation
+   whose size it does not know.  The collector uses min(this, a quarter of a
+   semispace), so a small heap sized at startup is not all margin.")
 
 (defvar *arm32-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
@@ -3114,7 +3115,15 @@
         (arm32-str buf +arm-r0+ +arm-r12+ 32)
         ;; ---- new VA = object free, VL = cons low - margin, into the frame ----
         (let ((exhausted (lbl)))
-          (arm32-load-imm32 buf +arm-r0+ +arm32-gc-overshoot-margin+)
+          ;; margin = min(1 MB, space_size / 4), 16-aligned -- computed, so a
+          ;; heap sized at startup (boot-linux-arm32's stub) needs no stored
+          ;; margin.  At the shipping 124 MB semispace this is the old constant.
+          (arm32-ldr buf +arm-r0+ +arm-r12+ 16)
+          (arm32-lsr-imm buf +arm-r0+ +arm-r0+ 2)
+          (arm32-bic-imm buf +arm-r0+ +arm-r0+ 0 15)
+          (arm32-load-imm32 buf +arm-r1+ +arm32-gc-overshoot-margin+)
+          (arm32-cmp buf +arm-r0+ +arm-r1+)
+          (arm32-mov-cond buf +arm-cc-hi+ +arm-r0+ +arm-r1+)
           (arm32-sub buf +arm-r1+ +arm-r9+ +arm-r0+)
           (arm32-cmp buf +arm-r8+ +arm-r1+)
           (arm32-b-cond buf +arm-cc-cs+ exhausted)

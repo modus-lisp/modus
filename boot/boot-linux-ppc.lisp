@@ -45,9 +45,10 @@
    collector and every allocation site read the geometry the stub leaves in
    memory.  Same policy as boot-linux-68k.lisp.")
 (defconstant +linux-ppc-heap-min+ #x100000 "1 MB: two 512 KB semispaces.")
-(defconstant +linux-ppc-heap-max+ #x20000000
-  "512 MB: heap at #x10000000 plus its kind map stays below 2^30, the ceiling a
-   tagged MEM-REF address can express on the 32-bit port.")
+(defconstant +linux-ppc-heap-max+ #x0F800000
+  "248 MB: heap + guard end at #x1FC00000, where the kind map starts
+   (+PPC-GC-KIND-MAP+), and everything stays below #x20000000 -- ARM32's and
+   68k's geometry.")
 (defconstant +linux-ppc-gc-guard+ #x400000
   "4 MB past the second semispace.  :gc-check tests the alloc pointer without
    knowing the size of the allocation that follows, so a large object can
@@ -208,13 +209,13 @@
    On entry Linux has r1 pointing at argc, with argv immediately above it.
 
    THE HEAP IS SIZED HERE, AT RUN TIME, and everything that depends on the size
-   is written to memory for the collector and the allocation sites: the Cheney
-   block at #x10000040 (+GC-OFF-*+ offsets at both widths), the kind-map bias
-   and the overshoot margin.  Layout, S = the chosen size:
-     [base, base+S)            two S/2 semispaces (the first starts past the
-                               fixed low block, at base + alloc-start)
-     [base+S, base+S+guard)    overshoot guard
-     [base+S+guard, +S/16)     kind map, one byte per 16-byte granule
+   goes into the Cheney block at #x10000040 (+GC-OFF-*+ offsets at both
+   widths).  Layout, S = the chosen size:
+     [base, base+S)              two S/2 semispaces (the first starts past the
+                                 fixed low block, at base + alloc-start)
+     [base+S, base+S+guard)      overshoot guard
+     [+PPC-GC-KIND-MAP+, +S/16)  kind map, one byte per 16-byte granule, at a
+                                 FIXED address past the largest heap
 
    It installs NO signal handlers (a fault is a clean SIGSEGV, not a longjmp
    into handler-case) and sets up no JIT arena -- there is no PPC JIT."
@@ -226,10 +227,18 @@
     (emit-linux-ppc-choose-heap-size buf ws)
     ;; --- mmap FIRST.  The argc slot below is INSIDE this mapping and this port
     ;;     asks for no BSS, so writing it before the mmap is an immediate SIGSEGV.
-    ;;     mmap(addr, S + S/16 + guard, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
-    (ppc-emit-li buf +ppc-r3+ +linux-ppc-heap-addr+)
+    ;;     mmap(addr, S + guard, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
+    ;;     then the kind map at its FIXED address, only S/16 long
+    (ppc-emit-li buf +ppc-r3+ +ppc-gc-kind-map+)
     (ppc-emit-srli buf +ppc-r4+ +ppc-r17+ 4)
-    (ppc-emit-add buf +ppc-r4+ +ppc-r4+ +ppc-r17+)
+    (ppc-emit-li buf +ppc-r5+ 3)
+    (ppc-emit-li buf +ppc-r6+ #x32)
+    (ppc-emit-li buf +ppc-r7+ -1)
+    (ppc-emit-li buf +ppc-r8+ 0)
+    (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-mmap+)
+    (ppc-emit-sc buf)
+    (ppc-emit-li buf +ppc-r3+ +linux-ppc-heap-addr+)
+    (ppc-emit-mr buf +ppc-r4+ +ppc-r17+)
     (ppc-emit-li buf +ppc-r12+ +linux-ppc-gc-guard+)
     (ppc-emit-add buf +ppc-r4+ +ppc-r4+ +ppc-r12+)
     (ppc-emit-li buf +ppc-r5+ 3)                 ; PROT_READ|PROT_WRITE
@@ -272,16 +281,6 @@
     (ppc-emit-store-word buf +ppc-r1+  +ppc-r11+ #x18)          ; stack_base
     (ppc-emit-li buf +ppc-r12+ 0)
     (ppc-emit-store-word buf +ppc-r12+ +ppc-r11+ #x20)          ; gc_count
-    ;; --- kind-map bias K = base + S + guard - (base >> 4), and the margin
-    (ppc-emit-add buf +ppc-r12+ +ppc-r16+ +ppc-r17+)
-    (ppc-emit-li buf +ppc-r11+ +linux-ppc-gc-guard+)
-    (ppc-emit-add buf +ppc-r12+ +ppc-r12+ +ppc-r11+)
-    (ppc-emit-srli buf +ppc-r11+ +ppc-r16+ 4)
-    (ppc-emit-subf buf +ppc-r12+ +ppc-r11+ +ppc-r12+)
-    (ppc-emit-li buf +ppc-r11+ +ppc-gc-kind-bias-addr+)
-    (ppc-emit-store-word buf +ppc-r12+ +ppc-r11+ 0)
-    (ppc-emit-li buf +ppc-r11+ +ppc-gc-margin-addr+)
-    (ppc-emit-store-word buf +ppc-r15+ +ppc-r11+ 0)
     ;; --- VFP (r31) needs to point at a frame before the first prologue runs.
     (ppc-emit-mr buf +ppc-r31+ +ppc-r1+)
     ;; --- fall through to translated native code

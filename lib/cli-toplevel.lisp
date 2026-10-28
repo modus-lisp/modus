@@ -343,6 +343,19 @@
              (%cli-line "Modus: --core must be the first argument")
              (%cli-exit 1))
            (setq args (cddr args)))
+          ;; SBCL RUNTIME options, which SBCL's C runtime consumes before
+          ;; Lisp starts.  --dynamic-space-size is read by the boot stub of
+          ;; the ports that size their heap at startup (68k, PowerPC, ARM32);
+          ;; elsewhere the heap is fixed and the option is accepted and has
+          ;; no effect.  Either way it is not a toplevel option to reject.
+          ((or (%cli-flag-p arg "--dynamic-space-size")
+               (%cli-flag-p arg "--control-stack-size")
+               (%cli-flag-p arg "--tls-limit"))
+           (setq args (if (cdr args) (cddr args) nil)))
+          ((or (%cli-flag-p arg "--end-runtime-options")
+               (%cli-flag-p arg "--merge-core-pages")
+               (%cli-flag-p arg "--no-merge-core-pages"))
+           (setq args (cdr args)))
           ;; --eval / -e FORM
           ((or (%cli-flag-p arg "--eval") (%cli-flag-p arg "-e"))
            (setq args (cdr args))

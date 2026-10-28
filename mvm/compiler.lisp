@@ -20664,6 +20664,13 @@
 (defvar *fpd-hoisted* nil
   "Alist (conversion-form . temp vreg) of a double tree's hoisted operands.")
 
+(defvar *target-has-fpd-p* nil
+  "T when the image being built runs only where the fpd-* ops exist (the
+   interpreter and the x86-64 / aarch64 translators), so its baked code may
+   use unboxed double trees too.  Set by SET-TARGET-FIXNUM-BITS-FOR.  Before
+   it, only runtime-compiled code did, and the runtime's own double math --
+   EXP, LOG, SIN -- was ~40 boxed operations a call.")
+
 (defun %fpd-tree-need (form env)
   "FP registers needed to evaluate FORM as an unboxed double tree, or NIL."
   (cond
@@ -20743,7 +20750,7 @@
    each result a boxed double.  Every operand double-float (caller-checked).
    A whole call-free tree goes through the FP pool unboxed instead."
   (let ((tree (cons (%float-op-symbol op-name) args)))
-    (when *mvm-eval-runtime-p*
+    (when (or *mvm-eval-runtime-p* *target-has-fpd-p*)
       ;; Conversion operands are calls, and FP registers are caller-clobbered:
       ;; evaluate them first, left to right, into boxed temps (the tree's
       ;; other leaves are variables and literals, so the order is unchanged).

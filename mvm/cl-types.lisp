@@ -363,20 +363,25 @@
       ((%float-lt-p x (%dbl #xC0874910 #xD52D3051))            ; < -745.13...: underflow
        (%fl 0))
       (t
-       (let* ((tq (%float-mul x (%dbl #x3FF71547 #x652B82FE)))   ; x / ln2
+       ;; The arithmetic is unboxed double trees (declared DOUBLE-FLOAT locals and
+       ;; literal constants), not %FLOAT-* calls: it was ~40 boxed operations an
+       ;; EXP, 0.8 us, and illatio's SwiGLU calls EXP 117k times a token.  The
+       ;; operations and their order are the old ones, so the bits are too: the
+       ;; series below is the old loop acc = 1 + (r*acc)/n, n = 13..1, unrolled,
+       ;; each step written deep-operand-first so the tree fits the FP pool
+       ;; (IEEE + and * are exactly commutative; r*1 = r and x/1 = x exactly).
+       ;; The literals are the old bit patterns: 1/ln2 #x3FF71547652B82FE,
+       ;; ln2_hi #x3FE62E42FEE00000, ln2_lo #x3DEA39EF35793C76.
+       (let* ((xd x)
+              (tq (* xd 1.4426950408889634d0))                   ; x / ln2
               (k (%float-to-int (if (%float-lt-p tq (%fl 0))
                                     (%float-sub tq (%dbl #x3FE00000 0))
                                     (%float-add tq (%dbl #x3FE00000 0)))))
               (fk (%fl k))
-              (r (%float-sub (%float-sub x (%float-mul fk (%dbl #x3FE62E42 #xFEE00000)))
-                             (%float-mul fk (%dbl #x3DEA39EF #x35793C76))))
-              (acc (%fl 1))
-              (n 13))
-         ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
-         (loop
-           (when (< n 1) (return nil))
-           (setq acc (%float-add (%fl 1) (%float-div (%float-mul r acc) (%fl n))))
-           (setq n (- n 1)))
+              (r (- (- xd (* fk 0.6931471803691238d0)) (* fk 1.9082149292705877d-10)))
+              ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
+              (acc (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ r 13d0) 1d0) r) 12d0) 1d0) r) 11d0) 1d0) r) 10d0) 1d0) r) 9d0) 1d0) r) 8d0) 1d0) r) 7d0) 1d0) r) 6d0) 1d0) r) 5d0) 1d0) r) 4d0) 1d0) r) 3d0) 1d0) r) 2d0) 1d0) r) 1d0) 1d0)))
+         (declare (type double-float xd tq fk r acc))
          ;; times 2^k: one exponent-bits scale in the normal range, two near the ends
          (cond ((and (>= k -1022) (<= k 1023))
                 (%float-mul acc (%dbl (ash (+ k 1023) 20) 0)))

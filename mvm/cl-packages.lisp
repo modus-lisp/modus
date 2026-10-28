@@ -897,7 +897,24 @@
                           ((null loose) (setq loose (car entry))))))
                 (setq c2 (cdr c2)))))))
       (setq cur (cdr cur)))
-    (or exact loose)))
+    (values (or exact loose) (and exact t))))
+
+;; *SYM-NAME-MEMO* — hash -> ((sym . name) ...) for names the walk above found EXACTLY.  A
+;; keyword interned at run time is in no build-time table, so every SYMBOL-NAME of it -- every
+;; time FORMAT printed it -- walked every package hashing every name: 2-3 s to save a small
+;; plist file on a Pi.  Keyed on the hash, matched by EQ, so the case-folding rule above holds.
+(defvar *sym-name-memo* nil)
+
+(defun %sym-name-memo-get (h sym)
+  (let ((tab *sym-name-memo*))
+    (and tab (cdr (assoc sym (gethash h tab) :test #'eq)))))
+
+(defun %sym-name-memo-put (h sym name)
+  (%rt-enter)
+  (unless *sym-name-memo* (setq *sym-name-memo* (make-hash-table :test 'eql)))
+  (setf (gethash h *sym-name-memo*) (acons sym name (gethash h *sym-name-memo*)))
+  (%rt-leave)
+  name)
 
 ;; *sym-name-table* — hash → name string, populated at boot by
 ;; %init-sym-name-auto.  Lets symbol-name recover names for native MVM
@@ -962,8 +979,11 @@
            (t
             ;; Fall back to walking package symtabs (for runtime-interned
             ;; symbols whose name was registered via package machinery).
-            (let ((pn (%native-mvm-sym-name-lookup h sym)))
-              (if pn pn "")))))))
+            (or (%sym-name-memo-get h sym)
+                (multiple-value-bind (pn exact) (%native-mvm-sym-name-lookup h sym)
+                  (cond ((null pn) "")
+                        (exact (%sym-name-memo-put h sym pn))
+                        (t pn)))))))))
     (t "")))
 
 (defun symbol-package (sym)

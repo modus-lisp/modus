@@ -5553,7 +5553,16 @@
              (gethash (aref head 0) nh)))
        (let ((nm (%eval-sym-name head)))
          (and nm (or (%deftype-pkg-get head nm)
-                     (gethash nm *%runtime-deftype-table*))))))
+                     ;; The bare entry only when NO package registered this name:
+                     ;; every runtime DEFTYPE writes both, so a name some package
+                     ;; did register is that package's type, and a symbol of another
+                     ;; package taking it is the alias the per-package table exists
+                     ;; to stop.  cortez's (DEFTYPE CORTEZ.GLOBAL::CHARACTER ()
+                     ;; 'CL:CHARACTER) made CL:CHARACTER expand to itself, and
+                     ;; (SUBTYPEP T 'CHARACTER) recursed until the stack was gone.
+                     (and (not (and *%runtime-deftype-pkg-table*
+                                    (gethash nm *%runtime-deftype-pkg-table*)))
+                          (gethash nm *%runtime-deftype-table*)))))))
 
 (defun %subtypep-deftype-head-p (type)
   "True iff TYPE's head (the symbol itself when atomic, or (car TYPE)

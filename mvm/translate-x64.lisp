@@ -7125,6 +7125,43 @@
   (unless *x64-jit-mode*
     (format *error-output* "~&  Handler-stack helpers emitted (push/pop)~%")))
 
+;;; ------------------------------------------------------------------
+;;; GC WATCH (build knob MODUS_GC_WATCH; default off, collector byte-identical).
+;;; Answers "which word made the collector copy THIS object?".  The raw I/O
+;;; staging page (#x1DE00000, file I/O scratch -- idle during a collection) is
+;;; the log:  +0 = watched raw address (0 = off), +8 = hits, +16.. = the
+;;; ADDRESS of each scanned word whose value, tag stripped, is the watched
+;;; address (first 500).  Set +0 to an object's from-space address just before
+;;; a collection and read the log after: a to-space slot is a heap referrer, a
+;;; stack address is a root-window word, a #x1000xxxx address a fixed root.
+(defvar *x64-gc-watch* nil)
+(defconstant +x64-gc-watch-page+ #x1DE00000)
+
+(defun emit-gc-watch-probe (buf)
+  "At scan_word after RSI = the value and [RSP] = the word's address.
+   Clobbers RAX and RDX only (scan_word saved RDX; RAX is recomputed)."
+  (when *x64-gc-watch*
+    (let ((skip (make-label)))
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-and-reg-imm buf 'rax -16)
+      (emit-cmp-reg-imm buf 'rax 0)
+      (emit-jcc buf :e skip)
+      (emit-mov-reg-imm buf 'rdx +x64-gc-watch-page+)
+      (emit-mov-reg-mem buf 'rdx 'rdx 0)             ; rdx = watched address
+      (emit-cmp-reg-reg buf 'rax 'rdx)
+      (emit-jcc buf :ne skip)
+      (emit-mov-reg-imm buf 'rdx +x64-gc-watch-page+)
+      (emit-mov-reg-mem buf 'rax 'rdx 8)
+      (emit-add-reg-imm buf 'rax 1)
+      (emit-mov-mem-reg buf 'rdx 'rax 8)             ; hits++ (rax = new count)
+      (emit-cmp-reg-imm buf 'rax 500)
+      (emit-jcc buf :a skip)
+      (emit-shl-reg-imm buf 'rax 3)
+      (emit-add-reg-reg buf 'rax 'rdx)               ; rax = page + count*8
+      (emit-mov-reg-mem buf 'rdx 'rsp 0)             ; rdx = the word's address
+      (emit-mov-mem-reg buf 'rax 'rdx 8)             ; entry[count-1] at page+16+(count-1)*8
+      (emit-label buf skip))))
+
 (defun emit-gc-dbg-char (buf ch)
   "DEBUG (gated by *x64-gc-debug*): write byte CH to fd 1, preserving all
    registers used by the GC trampoline.  syscall clobbers RCX/R11 plus the
@@ -8651,6 +8688,7 @@
           (sw-is-obj (make-label)))
       ;; Load the actual value at [rax]
       (emit-mov-reg-mem buf 'rsi 'rax 0)          ; rsi = [rax] = the value
+      (emit-gc-watch-probe buf)
       ;; Check tag: low 4 bits
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-and-reg-imm buf 'rax #x0F)           ; rax = tag
@@ -9724,6 +9762,7 @@
     (let ((sw-not-ptr (make-label)) (sw-done (make-label))
           (sw-is-cons (make-label)) (sw-is-obj (make-label)))
       (emit-mov-reg-mem buf 'rsi 'rax 0)
+      (emit-gc-watch-probe buf)
       (emit-mov-reg-reg buf 'rax 'rsi)
       (emit-and-reg-imm buf 'rax #x0F)
       (emit-cmp-reg-imm buf 'rax 1)

@@ -312,6 +312,10 @@
       (setf modus.mvm::*linux-x64-r14-offset* v)
       (format t "~%[DEBUG] R14 offset forced to ~X (GC fires early)~%" v))))
 #+sbcl
+(when (let ((d (sb-ext:posix-getenv "MODUS_GC_WATCH"))) (and d (> (length d) 0)))
+  (setf modus.mvm.x64::*x64-gc-watch* t)
+  (format t "~%[DEBUG] GC watch log at #x1DE00000 enabled~%"))
+#+sbcl
 (when (let ((d (sb-ext:posix-getenv "MODUS_GC_DEBUG"))) (and d (> (length d) 0)))
   (setf modus.mvm.x64::*x64-gc-debug* t)
   (format t "~%[DEBUG] GC trampoline debug bytes enabled~%"))

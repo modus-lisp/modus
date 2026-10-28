@@ -456,7 +456,12 @@
   "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table.
    The key is the symbol's own name when they match -- one string per symbol
    however many packages it is present in -- and narrow when it fits."
-  (let ((sn (symbol-name symbol)))
+  ;; Only a symbol that CARRIES its name: a hash-only one's SYMBOL-NAME walks
+  ;; every package's table to find it, and a keyword being interned for the
+  ;; first time is in none yet -- so the reader paid that walk, for "", on
+  ;; every new keyword it met.  On a corpus read with ~100 packages that was
+  ;; nearly all of the time.  Such a symbol's key is NAME-STRING regardless.
+  (let ((sn (and (%cl-sym-p symbol) (%cl-sym-name symbol))))
     (cons (cons (%narrow-copy (if (and (stringp sn) (string= sn name-string))
                                   sn
                                   name-string))

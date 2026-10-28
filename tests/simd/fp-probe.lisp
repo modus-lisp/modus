@@ -116,4 +116,33 @@
 (check "9 dotimes counts" (list (t9 *a* 5) (t9 *a* 0) (t9 *a* -3))
        (list (list *n* 5 0) (list *n* 0 0) (list *n* 0 3)))
 
+;; 10. typed numeric LOOP: BELOW / BY / DOWNTO / ABOVE,
+;;     typed SUM / COUNT (an empty double sum is 0d0), a sum over a float tree
+(defun t10 (a) (declare (type (simple-array single-float (*)) a))
+  (list (loop for i of-type fixnum from 0 below 5 collect i)
+        (loop for i of-type fixnum from 10 downto 3 by 3 collect i)
+        (loop for i of-type (integer 0 100) from 20 above 15 collect i)
+        (loop for i of-type fixnum from 0 below 0 sum i of-type double-float)
+        (loop for i of-type fixnum from 0 below (length a) count (> (aref a i) 0.0) of-type fixnum)
+        (loop for i of-type fixnum from 0 below (length a)
+              sum (coerce (* (aref a i) (aref a i)) 'double-float) of-type double-float)
+        (let ((s 0d0)) (declare (type double-float s))
+          (loop for i fixnum from 0 below (length a) do (setq s (+ s (coerce (aref a i) 'double-float))))
+          s)))
+(check "10 typed LOOP" (t10 *a*)
+       (list '(0 1 2 3 4) '(10 7 4) '(20 19 18 17 16) 0d0
+             (count-if (lambda (x) (> x 0.0)) *vals*)
+             (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ s (coerce (* x x) 'double-float)))))
+             (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ s (coerce x 'double-float)))))))
+
+;; 11. &optional parameters keep the body's declarations (required and optional)
+(defun t11 (a o &optional (k 2.0) (n (length a)))
+  (declare (type (simple-array single-float (*)) a o) (type single-float k) (fixnum n))
+  (dotimes (i n o) (setf (aref o i) (* k (aref a i)))))
+(let ((o1 (fv (make-list *n* :initial-element 0.0))) (o2 (fv (make-list *n* :initial-element 0.0))))
+  (t11 *a* o1) (t11 *a* o2 0.5 3)
+  (check "11 &optional with declarations" (list (coerce o1 'list) (coerce o2 'list))
+         (list (mapcar (lambda (x) (* 2.0 x)) *vals*)
+               (append (mapcar (lambda (x) (* 0.5 x)) (subseq *vals* 0 3)) (make-list (- *n* 3) :initial-element 0.0)))))
+
 (format t "~%FP-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

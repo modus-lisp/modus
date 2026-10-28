@@ -12991,10 +12991,12 @@
                                   (strip-declares (cddr form)))))))
               ;; The simple LOOP (every subform a cons — no loop keywords) is
               ;; compiled natively; walk its body.  An extended LOOP (for /
-              ;; collect …) has symbol subforms and is rejected.
+              ;; sum …) is judged by its expansion, which is what compiles.
               ((string= n "LOOP")
-               (and (every #'consp (cdr form))
-                    (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form))))
+               (if (every #'consp (cdr form))
+                   (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form))
+                   (let ((x (handler-case (expand-cl-loop (cdr form)) (error () nil))))
+                     (and x (%fp-scope-call-free-p x env (1+ depth))))))
               ;; INCF / DECF of a lexical width-typed variable by an integer or
               ;; width-typed delta compiles inline.
               ((or (string= n "INCF") (string= n "DECF"))
@@ -13022,6 +13024,19 @@
                                     (and ty (list (list 'declare (list 'type ty (caadr form)))))))))
                       (every (lambda (f) (%fp-scope-call-free-p f inner (1+ depth)))
                              (append (cddadr form) (strip-declares (cddr form)))))))
+              ;; (LENGTH v) of a declared simple array is one ARRAY-LEN (a
+              ;; LOOP's BELOW (LENGTH v) sits inside any scope around the LOOP)
+              ((string= n "LENGTH")
+               (and (consp (cdr form)) (null (cddr form)) (symbolp (cadr form))
+                    (or (%declared-f32-array-var-p (cadr form) env)
+                        (%declared-u8-array-var-p (cadr form) env)
+                        (%declared-generic-array-var-p (cadr form) env))
+                    t))
+              ;; (VALUES x): one value is X itself (LOOP returns a SUM's
+              ;; accumulator through it, so every typed LOOP SUM was boxed)
+              ((string= n "VALUES")
+               (and (consp (cdr form)) (null (cddr form))
+                    (%fp-scope-call-free-p (cadr form) env (1+ depth))))
               ((string= n "SETQ")
                (and (consp (cdr form)) (symbolp (cadr form))
                     (env-lookup env (cadr form))            ; lexical only (a global setq calls)
@@ -15706,7 +15721,8 @@
   by-form         ; step amount (for :from)
   list-var        ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
   and-p           ; introduced by AND: steps in PARALLEL with its group
-  pre-binds)      ; :from temps bound just before VAR (sequential clauses)
+  pre-binds       ; :from temps bound just before VAR (sequential clauses)
+  type)           ; the variable's OF-TYPE (or bare) type spec, or NIL
 
 (defun %loop-try-of-type (rest)
   "If REST starts with OF-TYPE typespec, return (typespec . new-rest).
@@ -16198,6 +16214,7 @@
           ((or (= kw 111940908) (= kw 252922277)  ; FOR AS
                (= kw 460426964))  ; AND
            (let ((var (cadr rest))
+                 (for-type nil)          ; OF-TYPE / bare type of a simple VAR
                  (destr-pairs nil))      ; list of (component . accessor-on-gensym)
              (setf rest (cddr rest))
              ;; FOR NIL is the "dummy iterator" — discard value via gensym
@@ -16284,9 +16301,11 @@
                       (setf destr-pairs (%loop-destr-pairs components g))
                       (setf var g))))))
              (when (and var (not (consp var)) rest)
-             ;; Skip OF-TYPE type-spec — we ignore type declarations.
+             ;; OF-TYPE type-spec: kept for a numeric FOR (see the :FROM
+             ;; emission), otherwise ignored.
              (when (and (symbolp (car rest))
                         (= (normalize-name (car rest)) 490334619))  ; OF-TYPE
+               (setf for-type (cadr rest))
                (setf rest (cddr rest)))
              ;; Skip BARE type symbol (FIXNUM, T, FLOAT, STRING, ...) —
              ;; CLHS bare-type shorthand for OF-TYPE.  Two triggers:
@@ -16316,6 +16335,7 @@
                                  (not (cl-loop-keyword-p (car rest)))
                                  (symbolp (cadr rest))
                                  (cl-loop-keyword-p (cadr rest)))))
+               (setf for-type (car rest))
                (setf rest (cdr rest)))
              (when (and var (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))
@@ -16432,7 +16452,8 @@
                                             :end-form end-form
                                             :end-test end-test
                                             :by-form by-form
-                                            :pre-binds (if seq binds nil))
+                                            :pre-binds (if seq binds nil)
+                                            :type for-type)
                             (loop-state-iterations state)))))
 
                  ;; FOR var IN list [BY step-fn]
@@ -17073,6 +17094,29 @@
              (>= (length acc-spec) 4))
     (cadddr acc-spec)))
 
+(defun %loop-acc-declarable-type (acc-spec)
+  "The type a SUM / COUNT accumulator is declared with, or NIL: its OF-TYPE
+   when that is SINGLE-FLOAT, DOUBLE-FLOAT or an integer type within a
+   fixnum (the accumulator starts at that type's zero and the user promised
+   the sum stays in it)."
+  (let ((ts (%loop-acc-type-spec acc-spec)))
+    (and (member (car acc-spec) '(:sum :count))
+         ts (symbolp ts)
+         (cond ((string= (symbol-name ts) "SINGLE-FLOAT") 'single-float)
+               ((string= (symbol-name ts) "DOUBLE-FLOAT") 'double-float)
+               ((ignore-errors (%decl-int-width (%resolve-declared-type ts))) 'fixnum)
+               (t nil)))))
+
+(defun %loop-chunk-declares (chunk typed)
+  "A one-element list holding the DECLARE for CHUNK's variables named in
+   TYPED ((VAR . TYPE) pairs), or NIL."
+  (let ((specs nil))
+    (dolist (b chunk)
+      (let* ((v (if (consp b) (car b) b))
+             (e (and v (symbolp v) (assoc v typed))))
+        (when e (push (list 'type (cdr e) v) specs))))
+    (and specs (list (cons 'declare (nreverse specs))))))
+
 (defun %loop-acc-typed-init-value (acc-spec)
   "Like %loop-acc-init-value but honors the OF-TYPE typespec stashed in
    the acc-spec for SUM/COUNT: float types → 0.0, integer → 0, NIL."
@@ -17080,11 +17124,13 @@
         (kind (car acc-spec)))
     (cond
       ((and (member kind '(:sum :count)) (symbolp type-spec)
+            (or (eq type-spec 'double-float)
+                (eq type-spec 'long-float)))
+       0d0)
+      ((and (member kind '(:sum :count)) (symbolp type-spec)
             (or (eq type-spec 'float)
                 (eq type-spec 'short-float)
-                (eq type-spec 'single-float)
-                (eq type-spec 'double-float)
-                (eq type-spec 'long-float)))
+                (eq type-spec 'single-float)))
        0.0)
       (t (%loop-acc-init-value kind)))))
 
@@ -17239,6 +17285,10 @@
          (anon-acc (when anon-acc-idx (nth anon-acc-idx accs)))
          (anon-acc-var (when anon-acc-idx (nth anon-acc-idx acc-vars)))
          (bindings nil)
+         ;; (VAR . TYPE) for bindings the expansion declares: an integer-typed
+         ;; numeric FOR's variable and temporaries, a typed SUM/COUNT.  The
+         ;; LET* chunk that binds VAR carries the declaration.
+         (typed nil)
          (pass-first nil)               ; the first-pass block (see below)
          (pass-next nil)                ; later passes, in clause order
          (firstv nil))
@@ -17280,6 +17330,8 @@
             (push av bound-vars)
             (push (list av (%loop-acc-typed-init-value acc))
                   bindings)
+            (let ((ty (%loop-acc-declarable-type acc)))
+              (when ty (push (cons av ty) typed)))
             ;; tail pointer for the list category (see %LOOP-ACC-LIST-LINK).
             ;; BOUND-VARS is seeded with the cond-into vars, whose tails are
             ;; already bound above, so this cannot double-bind one.
@@ -17298,11 +17350,28 @@
            (c-ufirst nil) (c-unext nil))
       (ecase (loop-iter-kind iter)
         (:from
-         (let ((var (loop-iter-var iter))
-               (by (or (loop-iter-by-form iter) 1)))
+         (let* ((var (loop-iter-var iter))
+                (by (or (loop-iter-by-form iter) 1))
+                ;; OF-TYPE an integer type within a fixnum: VAR, its FROM /
+                ;; BY temporaries and its end are fixnums (the values VAR
+                ;; takes, the one past the end included, are within one step
+                ;; of the declared range), so they are declared FIXNUM and
+                ;; the end test is a plain compare.  Without it every
+                ;; numeric LOOP stepped and tested generically (%LOOP-GE is
+                ;; a call), and a body of float math could not stay unboxed.
+                (int-p (and (loop-iter-type iter)
+                            (ignore-errors
+                             (%decl-int-width (%resolve-declared-type (loop-iter-type iter))))
+                            t)))
            (dolist (b (loop-iter-pre-binds iter))
              (push b bindings))
            (push (list var (loop-iter-init-form iter)) bindings)
+           (when int-p
+             (push (cons var 'fixnum) typed)
+             (let ((f (loop-iter-init-form iter)))
+               (when (and f (symbolp f)) (push (cons f 'fixnum) typed)))
+             (when (and (loop-iter-by-form iter) (symbolp (loop-iter-by-form iter)))
+               (push (cons (loop-iter-by-form iter) 'fixnum) typed)))
            (when (loop-iter-end-form iter)
              (let* ((end-var (%mvm-gensym "END"))
                     (down-p (member (loop-iter-end-test iter) '(:downto :above)))
@@ -17317,14 +17386,19 @@
                                   `(setq ,var (+ ,var ,by))
                                   `(setq ,var (- ,var ,by)))))
                (push (list end-var (loop-iter-end-form iter)) bindings)
+               (when int-p (push (cons end-var 'fixnum) typed))
                ;; Use %loop-cmp helper so float/ratio end-forms work too —
                ;; raw `>` is fixnum-only and silently mis-compares with a
                ;; boxed-float pointer, hanging the loop.
-               (push (ecase (loop-iter-end-test iter)
+               (push (if int-p
+                         (let ((cmp (ecase (loop-iter-end-test iter)
+                                      (:to '>) (:below '>=) (:downto '<) (:above '<=))))
+                           `(if (,cmp ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
+                       (ecase (loop-iter-end-test iter)
                        (:to    `(if (%loop-gt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
                        (:below `(if (%loop-ge ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
                        (:downto `(if (%loop-lt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (:above `(if (%loop-le ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil)))))
+                       (:above `(if (%loop-le ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))))
                      test-forms)))
            (if (and (loop-iter-end-test iter)
                     (member (loop-iter-end-test iter) '(:downto :above)))
@@ -17792,13 +17866,17 @@
              ;; and-group, nesting outer to inner.
              (with-bindings-form
                (if bindings
-                   (labels ((wrap (binds inner)
+                   ;; TYPED is passed, not closed over: WRAP referencing it
+                   ;; freely made it a closure, and the in-image compile of
+                   ;; that closure returned NIL for INNER (every expansion
+                   ;; lost its body; ANSI LOOP.8.4 and friends).
+                   (labels ((wrap (binds inner typed)
                               (cond
                                 ((null binds) inner)
                                 ((and (consp (car binds))
                                       (eq (car (car binds)) :and-group))
                                  `(let ,(cdr (car binds))
-                                    ,(wrap (cdr binds) inner)))
+                                    ,(wrap (cdr binds) inner typed)))
                                 (t
                                  ;; Collect consecutive simple bindings
                                  ;; into one LET*.
@@ -17809,9 +17887,11 @@
                                            (return nil))
                                          (push (car cur) chunk)
                                          (setq cur (cdr cur)))
-                                   `(let* ,(nreverse chunk)
-                                      ,(wrap cur inner)))))))
-                     (wrap (nreverse bindings) with-init))
+                                   (let* ((ordered (nreverse chunk))
+                                          (decls (%loop-chunk-declares ordered typed))
+                                          (inside (wrap cur inner typed)))
+                                     (list* 'let* ordered (append decls (list inside)))))))))
+                     (wrap (nreverse bindings) with-init typed))
                    with-init))
              (finally-has-return
               (labels ((rec (f)
@@ -27869,14 +27949,21 @@
               ;; clobbered the nargs convention slot -- so
               ;; (defun f (&optional (*x* 7)) ...) called as (f) took the
               ;; "supplied" arm and bound *X* to the empty slot (NIL).
+              ;; The body's declarations stay LEADING, on the LET* (which
+              ;; binds the optionals; a type for a required parameter is a
+              ;; free declaration there).  Behind the nargs touch below they
+              ;; were plain forms: every declaration of an &optional
+              ;; function was dropped, its arrays and floats went generic
+              ;; (illatio's kernels, 50x slower than with required args).
               (setf new-body
                     `((let ((,nargs-var (%get-nargs)))
                         (let* (,@(nreverse opt-bindings))
+                          ,@(%leading-declares new-body)
                           ;; touch nargs-var so it isn't dead-stripped when no
                           ;; default/supplied references it.
                           ,nargs-var
                           ,@(nreverse key-defaults)
-                          ,@new-body))))))
+                          ,@(%strip-leading-declares new-body)))))))
            ;; --- no &optional: legacy null-check path for &key fallback ---
            (t
             (let ((defaults nil))

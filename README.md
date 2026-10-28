@@ -131,15 +131,13 @@ as source it LOADs at runtime. `build-generic` is that shape hosted (boot, LOAD
 `argv[1]`, exit); `build-x64-cl-repl` is that shape on bare metal, a multiboot
 image whose REPL is the actual CL — reader, `eval` = mvm-eval, printer — over
 COM1 via `lib/serial-repl.lisp`. It evaluates `(+ 1 2)` to `3`, and it is the
-declared replacement for `build-x64-repl` and `build-x64-console-repl`.
+replacement for the retired `build-x64-repl` and `build-x64-console-repl`.
 
 Read the state of the old payloads in that light:
 
-- **The legacy `repl-source.lisp` REPL evaluates a bare symbol and nothing
-  else** — `(+ 1 2)` echoes and never returns, on x86-64 and AArch64 alike.
-  That is the second Lisp rotting, and #204 deletes it rather than repairing
-  it. The broken RPi family builds `*repl-source*` too; the second Lisp and the
-  broken cell overlap heavily.
+- **The legacy `repl-source.lisp` mini-Lisp is gone** (2026-10-28): every
+  image that ran it was ported to the CL image or archived under the
+  `mini-lisp-final` tag — docs/mini-lisp-archive.md.
 - **The baked SSH payload is unproven everywhere** (`GATE-RESULT-run-cells.md`
   marks all six ssh cells CANNOT PROVE). Under this strategy that matters much
   less than it looks: a baked SSH image is the thing being retired, not the
@@ -257,83 +255,40 @@ The chain does not currently complete from a clean checkout: step 0
 
 Requires SBCL and QEMU.
 
-### Quick test (any architecture)
+### Quick test
 
-All SSH scripts support batch mode — pass an expression as the second argument:
-
-```bash
-./scripts/run-x64-ssh.sh 2222 "(+ 1 2)"       # → = 3
-./scripts/run.sh aarch64-ssh "(+ 1 2)"        # → = 3
-./scripts/run-i386-ssh.sh 2222 "(+ 1 2)"       # → = 3
-./scripts/run-arm32-ssh.sh 2222 "(+ 1 2)"      # → = 3
-```
-
-### x86-64
+`./scripts/run.sh list` shows every QEMU configuration.  Each builds its image if
+any source is newer, boots it and evaluates one expression, at a serial REPL or
+over SSH:
 
 ```bash
-./scripts/run.sh x64-repl      # boot to serial REPL
-./scripts/run-x64-ssh.sh       # boot with SSH networking
+./scripts/run.sh x64-cl-repl "(+ 1 2)"     # x86-64 multiboot, serial REPL
+./scripts/run.sh x64-ssh "(+ 1 2)"         # ... with SSH over E1000      → = 3
+./scripts/run.sh i386-cl-repl "(+ 1 2)"    # 32-bit x86
+./scripts/run.sh i386-ssh "(+ 1 2)"        # ... with SSH over NE2000     → = 3
+./scripts/run.sh aarch64-cl-repl "(+ 1 2)" # AArch64, QEMU virt
+./scripts/run.sh aarch64-ssh "(+ 1 2)"     # ... with SSH over E1000      → = 3
+./scripts/run.sh arm32-cl-repl "(+ 1 2)"   # ARMv7, QEMU virt
+./scripts/run.sh rpi-cl-repl "(+ 1 2)"     # Raspberry Pi 3B (QEMU raspi3b)
 ```
 
-### AArch64 (QEMU virt)
-
-```bash
-./scripts/run.sh aarch64-cl-repl   # the CL REPL on QEMU virt
-./scripts/run.sh aarch64-ssh       # the same image with SSH over E1000 (port 2222)
-```
-
-### i386 (QEMU)
-
-```bash
-./scripts/run.sh i386-repl     # 32-bit x86 REPL on QEMU
-./scripts/run-i386-ssh.sh      # i386 SSH over NE2000 NIC (port 2222)
-```
-
-### ARM32 (QEMU raspi2b)
-
-```bash
-./scripts/run-arm32-ssh.sh     # ARM32 SSH over DWC2 USB CDC (port 2222)
-./scripts/run.sh arm32-repl    # ARM32 serial REPL
-```
-
-### Raspberry Pi (QEMU raspi3b)
-
-```bash
-./scripts/run-rpi-repl.sh      # AArch64 REPL on emulated raspi3b
-./scripts/run-rpi-ssh.sh       # SSH over USB CDC Ethernet (port 2222)
-./scripts/run-rpi-hid.sh       # USB keyboard-driven REPL
-```
+Every one of these is the same Common Lisp — reader, `eval`, printer, CLOS,
+conditions.  The old per-image mini-Lisp is gone (docs/mini-lisp-archive.md).
 
 ### UEFI x86-64 (real hardware)
 
 ```bash
-sbcl --script mvm/build-uefi-repl.lisp   # build UEFI EFI application
-./scripts/run-uefi-repl.sh               # test in QEMU with OVMF
-./scripts/run-uefi-repl.sh "(+ 1 2)"     # eval expression
+sbcl --dynamic-space-size 12288 --script mvm/build-uefi-cl-repl.lisp
+./scripts/run-uefi-repl.sh "(+ 1 2)"     # test in QEMU with OVMF
 ./scripts/make-uefi-usb.sh               # create bootable USB image
 sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M  # write to USB stick
 ```
 
-### Raspberry Pi Zero 2 W (real hardware)
+### Raspberry Pi boards (real hardware)
 
-The Pi Zero 2 W boots via USB (no SD card needed) using rpiboot, with SSH over USB CDC-ECM Ethernet.
-
-```bash
-# One-time: program USB boot OTP fuse (irreversible, requires SD card)
-bash scripts/fuse-pizero2w.sh
-
-# Build and deploy
-sbcl --script mvm/build-pizero2w-actors.lisp   # actor-based SSH + HTTP
-bash scripts/boot-pizero2w.sh                   # full workflow
-```
-
-### Self-hosted x86-64
-
-SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-64 native). Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source (~558KB), and Gen1 is extracted via QMP. Gen1 can repeat the process indefinitely.
-
-```bash
-./scripts/run-x64-gen1-ssh.sh          # Gen0 → Gen1, boot Gen1 with SSH
-```
+`mvm/build-rpi-cl-repl.lisp` builds the board image: U-Boot chainload, a USB
+NIC, HDMI + USB-keyboard console, SSH, threads on all four cores.  See CLAUDE.md
+"QEMU RPi 3B / real Pi boards" and docs/quickload-on-rpi.md.
 
 Connect to any SSH server: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 
@@ -348,7 +303,6 @@ mvm/                   Modus Virtual Machine
   interp.lisp          MVM interpreter (bootstrapping)
   target.lisp          Architecture descriptors (9 targets)
   cross.lisp           Universal cross-compilation pipeline
-  repl-source.lisp     Embedded REPL source for bare-metal builds
   build-*.lisp         Build scripts for all platforms
 boot/                  Per-architecture boot sequences (9 targets + UEFI)
 net/                   Networking, crypto, SSH, USB, actors
@@ -358,18 +312,16 @@ net/                   Networking, crypto, SSH, USB, actors
   e1000.lisp           Intel E1000 NIC driver
   ne2000.lisp          NE2000 ISA NIC driver
   dwc2.lisp            DWC2 USB host controller (RPi 3B QEMU)
-  dwc2-device.lisp     DWC2 USB gadget + CDC-ECM (Pi Zero 2 W)
   usb.lisp             USB enumeration + hub support
+  cdc-ether.lisp       USB CDC Ethernet;  r8152.lisp: RTL8152/8153 USB NICs
   actors.lisp          Actor system (spawn, yield, send, receive)
-  i386-ehci.lisp       EHCI USB host controller (T420)
-  i386-e1000-raw.lisp  E1000 82579LM driver (T420)
-  i386-console.lisp    VGA console + PS/2 keyboard (T420)
-  http.lisp            HTTP/1.0 server
+  bare-threads.lisp    Native threads on bare metal (Pi spin tables, virt PSCI)
+  isolated-cl.lisp     Isolated SSH: net domain + one thread per session
   http-client.lisp     HTTP client with URL parsing
-  hid.lisp             USB HID keyboard/mouse/tablet
-  uefi-console.lisp    UEFI GOP framebuffer + PS/2 keyboard
-  bcm2835-periph.lisp  GPIO, SPI, I2C, system timer
-  uart-bootloader.lisp UART bootloader for rapid kernel redeploy
+  pc-console.lisp      VGA text / UEFI GOP framebuffer + PS/2 keyboard
+  hdmi-console.lisp    Pi HDMI console;  usb-hid-split.lisp: its USB keyboard
+  bcm2835-gpio.lisp    Pi GPIO, system timer, activity LED
+  arch-*-cl.lisp       per-platform adapters (x86, i386, aarch64 virt, rpi)
 cross/                 x64 assembler (used by MVM)
 runtime/               Tags, subtags, package definitions
 scripts/               Build, run, test, and deployment scripts

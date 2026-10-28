@@ -2,6 +2,12 @@
 
 ## Overview
 
+> **Note (2026-10-28).**  Every bare-metal network image is now the CL image.
+> Adapters named here without a `-cl` suffix (`arch-x86`, `arch-i386`,
+> `arch-raspi3b`, `arch-arm32*`), `hid.lisp`, `http.lisp`, `dwc2-device.lisp` and
+> the 32-bit crypto overrides went with the mini-Lisp images
+> (docs/mini-lisp-archive.md); their CL counterparts are `arch-*-cl.lisp`.
+
 Modus implements a full networking stack — from NIC drivers through IP/TCP to SSH and HTTP — running on bare metal across 6 CPU architectures. The design principle is **shared protocol code with thin architecture adapters**: the ~12,000 lines of ip.lisp, crypto.lisp, and ssh.lisp run identically on x64, AArch64, i386, ARM32, RPi 3B, and Pi Zero 2W. Each platform provides a ~200-line adapter defining hardware addresses, PCI access, and I/O primitives.
 
 Three NIC driver classes cover all platforms: Intel E1000 (PCI Gigabit Ethernet), NE2000 (ISA 10Mbps), and DWC2 USB (host and gadget modes with CDC-ECM). All expose the same `e1000-send`/`e1000-receive`/`e1000-rx-buf` API so ip.lisp doesn't know which hardware is underneath.

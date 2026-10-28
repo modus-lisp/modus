@@ -4,10 +4,8 @@
 # This is the REAL Common Lisp image on 32 bits: the same shared assembly
 # (mvm/build-cli-common.lisp) x64's ./modus and the aarch64 CLI are built from —
 # CL bridge, in-image MVM compiler, RTEST, tar/install-tarball, the ASDF and
-# :GENERA surfaces, and the SBCL-faithful toplevel.  It is NOT the legacy
-# mini-Lisp (mvm/build-i386-{repl,ssh,diag-ssh}.lisp run mvm/repl-source.lisp,
-# a separate 708-line toy Lisp with its own reader and evaluator; those are
-# ./scripts/run.sh i386-repl and scripts/run-i386-ssh.sh).
+# :GENERA surfaces, and the SBCL-faithful toplevel.  (The BARE-METAL i386 image
+# is ./scripts/run.sh i386-cl-repl / i386-ssh.)
 #
 # WHY THIS SCRIPT EXISTS: binfmt_misc is NOT registered for i386 here, so
 # running a 32-bit ELF directly does not fail loudly — it silently fails to

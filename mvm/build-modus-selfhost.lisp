@@ -30,7 +30,6 @@
 
 (load (merge-pathnames "../lib/load-mvm.lisp"
                        (directory-namestring (truename *load-truename*))))
-(mvm-load "mvm/repl-source.lisp")
 
 (format t "~%=== Building generic Modus image ===~%")
 

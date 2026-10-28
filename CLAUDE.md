@@ -38,47 +38,35 @@ mvm/            MVM compiler, translators, and build scripts
   compiler.lisp        3-phase compiler: Source → IR → MVM bytecode
   interp.lisp          MVM interpreter (bootstrapping)
   cross.lisp           Universal cross-compilation pipeline
-  repl-source.lisp     Embedded REPL source for bare-metal builds
   translate-*.lisp     Native code translators (x64, riscv, aarch64, ppc, i386, 68k, arm32)
   build-*.lisp         Build scripts (see Build Commands below)
 
 net/            Networking, crypto, USB, actor system
   arch-aarch64-cl.lisp QEMU virt PCI/E1000 adapter (the CL image)
-  arch-raspi3b.lisp    RPi adapter (DMA addresses, actor addresses)
-  arch-x86.lisp        x86 adapter
+  arch-rpi-cl.lisp     RPi adapter (DMA addresses, actor addresses)
+  arch-x86-cl.lisp     x64 PC adapter (E1000);  arch-i386-cl.lisp: i386 (NE2000)
   actors.lisp          Cooperative actor system (spawn, yield, send/receive, scheduling)
-  actors-net-overrides.lisp   Actor-aware SSH overrides
   isolated-cl.lisp     Qubes-like isolation: the net domain owns the NIC, SSH
                        sessions are bare-threads (Pi and QEMU virt CL images)
   e1000.lisp           Intel E1000 NIC driver
   dwc2.lisp            DWC2 USB host controller (RPi 3B QEMU)
-  dwc2-device.lisp     DWC2 USB gadget + CDC-ECM (Pi Zero 2 W)
   usb.lisp             USB enumeration + hub support
   cdc-ether.lisp       USB CDC Ethernet
-  hid.lisp             USB HID (keyboard, mouse, tablet)
+  usb-hid-split.lisp   USB keyboard console (the Pi board image)
   ip.lisp              ARP/IP/TCP/UDP/DHCP/DNS
   crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
-  crypto-32.lisp       32-bit safe field/poly multiply (pair arithmetic)
-  crypto-w32.lisp      32-bit SHA-256/512, ChaCha20 (w32 pair arithmetic)
+  crypto-fast.lisp     limb-vector field arithmetic;  crypto-32-fast.lisp: 32-bit
   ssh.lisp             SSH-2 server (key exchange, auth, channels)
   ne2000.lisp          NE2000 ISA NIC driver (i386)
-  http.lisp            HTTP/1.0 server
   http-client.lisp     HTTP client (URL parsing, GET, fetch)
-  32bit-overrides.lisp     30-bit fixnum safety overrides (crypto, SSH)
-  arch-i386.lisp           i386 NE2000 adapter, NIC state, allocation
-  uefi-console.lisp        GOP framebuffer + PS/2 keyboard for UEFI x64
-  uart-bootloader.lisp     UART bootloader for rapid kernel redeploy
-  bcm2835-periph.lisp      BCM2835 GPIO, SPI, I2C, PWM
+  pc-console.lisp      VGA text / GOP framebuffer + PS/2 keyboard (x64 PC images)
+  bcm2835-gpio.lisp    BCM2835 GPIO, system timer, activity LED (every Pi CL image)
 
 scripts/        Deployment and boot scripts
   run.sh               ONE entry point for every QEMU run config (`run.sh list`)
   run-repl-eval.sh     shared helper: boot a REPL image, eval one expr, print
-  boot-pizero2w.sh     Build + boot + network + SSH (USB or SD card)
-  build-pizero2w.sh    Build kernel + SD card image
   fuse-pizero2w.sh     Program USB boot OTP fuse on Pi Zero 2 W
-  make-sdcard-bootloader.sh  Create SD card with UART bootloader
   make-uefi-usb.sh     Create bootable USB image for UEFI hardware
-  run-rpi-periph.sh    Launch RPi peripheral test in QEMU
 
 mvm/cl-*.lisp   Common Lisp runtime implementation (10 modules)
   cl-sequences.lisp    837L  find, search, sort, merge, map, reduce
@@ -571,15 +559,18 @@ qemu-system-aarch64 -machine virt -cpu cortex-a57 -smp 4 -m 1024 -nographic -no-
   -device 'e1000,netdev=net0,romfile=,rombar=0' -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
 # then at the prompt: (run-net-pipeline) (ssh-boot)
 ```
-The mini-Lisp virt images (`aarch64/bare/qemu/{repl,ssh,actors,isolated}`,
-`net/isolated-net.lisp`, `net/arch-aarch64.lisp`) were retired 2026-10-28.
+**There is no second Lisp any more.**  Every bare-metal image runs the CL
+stack; the mini-Lisp (`mvm/repl-source.lisp`) images were ported or archived
+2026-10-28 — docs/mini-lisp-archive.md maps each one to its replacement and
+names the tag (`mini-lisp-final`) that still holds them.
 
-### QEMU RPi 3B (DWC2 USB host, CDC Ethernet)
+### QEMU RPi 3B / real Pi boards (DWC2 USB host, CDC Ethernet)
 ```bash
-sbcl --script mvm/build-rpi-ssh.lisp      # SSH
-sbcl --script mvm/build-rpi-hid.lisp      # USB keyboard REPL
-sbcl --script mvm/build.lisp aarch64/bare/rpi/repl   # Serial REPL
-sbcl --script mvm/build-rpi-periph.lisp   # GPIO/SPI/I2C peripherals
+./scripts/run.sh rpi-cl-repl "(+ 1 2)"                 # serial REPL (build-rpi-cl-repl.lisp)
+./scripts/run.sh rpi-cl-repl "(progn (led-init) (led-on))"   # GPIO: net/bcm2835-gpio.lisp
+# The board image (U-Boot chainload, USB NIC, HDMI + USB keyboard console, SSH):
+MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1 \
+  sbcl --dynamic-space-size 12288 --script mvm/build-rpi-cl-repl.lisp
 ```
 
 **ISOLATED SSH ON THE CL IMAGE (`MODUS_SSH_ISOLATED=1`, needs
@@ -835,30 +826,18 @@ REPL reaches them.  **The 32-bit lessons from i386 apply here unchanged before
 networking or SSH is added**: a byte vector's payload is at word−5, crypto-fast
 must be replaced by crypto-32-fast, and TCP sequence numbers are bignums.
 
-### QEMU i386 — LEGACY mini-Lisp (32-bit x86, Multiboot)
-
-The builds below run `mvm/repl-source.lisp`, a separate 708-line toy Lisp with
-its own reader/printer/evaluator — **not** the CL stack above. Retiring this
-second Lisp is its own workstream.
-
+### QEMU x64 / i386 PC images (Multiboot) — SSH over E1000 / NE2000
 ```bash
-sbcl --script mvm/build-i386-repl.lisp    # Serial REPL
-sbcl --script mvm/build.lisp i386/bare/qemu/ssh   # SSH (NE2000 ISA NIC)
+./scripts/run.sh x64-cl-repl "(+ 1 2)"     # build-x64-cl-repl.lisp
+./scripts/run.sh x64-ssh "(* 6 7)"         # cell x64/bare/qemu/cl-ssh (E1000)
+./scripts/run.sh i386-cl-repl "(+ 1 2)"    # build-i386-cl-repl.lisp
+./scripts/run.sh i386-ssh "(* 6 7)"        # cell i386/bare/qemu/cl-ssh (NE2000 ISA)
 ```
-
-QEMU launch (REPL):
-```bash
-qemu-system-i386 -kernel /tmp/modus-i386.bin -m 256 \
-  -display none -serial stdio -no-reboot
-```
-
-QEMU launch (SSH):
-```bash
-qemu-system-i386 -m 256 -nographic -no-reboot \
-  -kernel /tmp/modus-i386-ssh.bin \
-  -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
-  -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
-```
+The SSH cells are the CL image built with `MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1
+MODUS_SSH_AUTOSTART=1`: the net pipeline runs, then the synchronous server
+(`*ssh-sync-p*`) serves forever from kernel-main.  x64 draws host-key and
+ephemeral randomness from RDRAND (`-cpu max` in run.sh; without it the boot
+log says `SSH:WEAK-RNG`).
 
 ### UEFI x86-64 (OVMF, for real hardware)
 ```bash
@@ -886,16 +865,12 @@ Bootable USB for real hardware (ThinkPad T420 etc.):
 sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M status=progress  # write to USB
 ```
 
-### Pi Zero 2 W (real hardware, DWC2 USB gadget, CDC-ECM)
-```bash
-sbcl --script mvm/build-pizero2w-ssh.lisp      # Single-threaded SSH
-sbcl --script mvm/build-pizero2w-actors.lisp   # Actor-based SSH
-```
-Output: `/tmp/piboot/kernel8.img`
-
-Deploy via rpiboot (USB boot): `sudo rpiboot -d /tmp/piboot`
-Deploy via UART bootloader: `sudo python3 ~/deploy-kernel.py ~/kernel8.img`
-Full workflow: `./scripts/boot-pizero2w.sh`
+### Pi Zero 2 W (real hardware)
+The Zero runs the same board image as above (USB host + a USB NIC, HDMI
+console).  The USB-**gadget** SSH image (`net/dwc2-device.lisp`, CDC-ECM over
+the OTG port) and the UART bootloader were mini-Lisp images and are ARCHIVED,
+not ported — both need the physical board; docs/mini-lisp-archive.md says how
+to bring them back.
 
 ## Tagged Value System
 

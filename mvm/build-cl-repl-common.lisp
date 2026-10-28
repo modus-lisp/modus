@@ -791,7 +791,9 @@
         0)))
 (defun %irun-ns () (%irt-ns))
 "
-        (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))
+        (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* "")
+        ;; GPIO / system timer / activity LED (what the mini-Lisp rpi-periph image had).
+        (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") ""))))
 
 
 

@@ -287,16 +287,13 @@
 
 ;; Net source files that run on bare metal (most important to check)
 (defparameter *net-files*
-  '("net/ip.lisp" "net/crypto.lisp" "net/crypto-32.lisp" "net/crypto-w32.lisp"
-    "net/ssh.lisp" "net/http.lisp" "net/http-client.lisp"
-    "net/e1000.lisp" "net/dwc2.lisp" "net/dwc2-device.lisp"
-    "net/usb.lisp" "net/cdc-ether.lisp" "net/hid.lisp"
-    "net/actors.lisp" "net/actors-net-overrides.lisp"
-    "net/ne2000.lisp"
-    "net/32bit-overrides.lisp"
-    "net/arch-raspi3b.lisp" "net/arch-x86.lisp"
-    "net/arch-i386.lisp" "net/arch-arm32-rpi.lisp"
-    "net/uart-bootloader.lisp"))
+  '("net/ip.lisp" "net/crypto.lisp" "net/crypto-fast.lisp" "net/crypto-32-fast.lisp"
+    "net/ssh.lisp" "net/http-client.lisp"
+    "net/e1000.lisp" "net/dwc2.lisp" "net/usb.lisp" "net/cdc-ether.lisp"
+    "net/actors.lisp" "net/ne2000.lisp"
+    "net/arch-rpi-cl.lisp" "net/arch-x86-cl.lisp"
+    "net/arch-i386-cl.lisp" "net/arch-aarch64-cl.lisp"
+    "net/bcm2835-gpio.lisp"))
 
 (defun all-source-files ()
   "Return list of all Lisp source files."

@@ -523,6 +523,57 @@ test/hosted-rungs/h01-gc-survive.lisp`) churns 1 GB past a live chain, array and
 the first (frontier-only) cut failed it after 8 collections.  Hosted-only on
 purpose: bare targets have no collector, so it cannot be an arch-ladder rung.
 
+### Hosted 68k has a collector, and its heap is sized AT STARTUP
+
+`m68k-emit-gc-collector` in `translate-68k.lisp` is arm32's Cheney collector
+(kind byte per 16-byte granule, objects up / conses down, all registers +
+stack + low block as roots) with one change: **no heap geometry is a
+translate-time constant.**  The boot stub picks the size when the process
+starts and leaves everything in memory (Cheney block at `#x10000040` with the
+`+GC-OFF-*+` offsets, kind-map bias at `#x10000F90`, overshoot margin at
+`#x10000F98`); the collector reads it at entry and every allocation site reads
+the bias.  One binary runs in 1 MB or 512 MB:
+
+```
+qemu-m68k-static ./image                           # half of RAM (sysinfo), capped at 128 MB
+qemu-m68k-static ./image --dynamic-space-size 16   # SBCL's flag: MB, or 512KB / 2MB / 1GB
+```
+
+Clamped to [1 MB, 512 MB] (the mapping must stay below 2^30), rounded to
+128 KB; the margin is min(1 MB, a quarter of a semispace).  Live data larger
+than the heap exits **3** with `modus: heap exhausted (raise
+--dynamic-space-size)` on stderr, not a SIGILL.  Before this, `:gc-check` was
+`ILLEGAL`: a hosted 68k process could allocate 128 MB in its lifetime, total.
+**ppc32/ppc64 are still like that** (`tw 31,0,0`) and are the next port.
+
+Verified: `h01-gc-survive` answers 42 at the default size and at 8/2/1 MB
+(16 collections at 128 MB, ~1500 at 2 MB); 200,000 live conses (3.2 MB)
+survive 4M churned conses at 16 MB and exit 3 at 8 MB and below.  NOT
+verified: the RAM/2 branch with RAM below the cap.  qemu-user reports the
+host's RAM, so the cap always wins here; a 36 MB machine is the real test.
+
+**Three 68k code-generation bugs found on the way, all in bare images too:**
+- **Every MOVEM was MOVEM.W.**  The encoders OR'd MOVE's size code 2 into bit
+  6, which is MOVEM's size bit, so it stayed clear.  Every prologue saved
+  D4-D7 as their low 16 bits and every epilogue restored them sign-extended:
+  any callee-saved value above 32767 was destroyed across any call.  This is
+  what r26/r28/r30/r31/r33 were failing on (SIGSEGV) on the hosted ladder.
+- **The tail-call epilogue restored A2/A3/A4** (VA/VL/VN), which the prologue
+  never saved: every tail call loaded the allocation pointer, limit and NIL
+  from the frame below the saved registers.
+- **`alloc-obj` wrote `(subtag << 8) | 9` and `obj-subtag` read byte 1** to
+  match: a private header layout, so every array and string reported the low
+  byte of its LENGTH as its subtag.  Now `(size << 8) | subtag`, like every
+  other 32-bit port.
+And function entries are 16-aligned now (they were 4-aligned, which tags a
+`#'f` at 4/8/12 mod 16 as 7/B/F; r16-funcall passed by layout luck).
+
+Hosted 68k ladder: 28/35 on `origin/main` -> **35/35 + h01**.  Bare 68k
+arch-ladder: identical before and after.  (`arch-ladder-gate.sh` used to grade
+every rung but r07 against 42, so r35 -- expect 5050 -- "failed" on every
+architecture that got it right; it now reads the rung's header like
+`hosted-ladder.py` does.)
+
 ## Build Commands
 
 All builds: `sbcl --script <build-script>`

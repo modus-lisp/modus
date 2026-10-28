@@ -873,8 +873,12 @@
    Note: For predecrement mode, bits are reversed! bit 0=A7, bit 15=D0."
   ;; Format: 0100 1000 10 mode reg, then register mask word
   ;; -(A7): mode 4, reg 7
-  (m68k-emit-word buf (logior (ash #b01001000 8)
-                              (ash +68k-size-long+ 6)
+  ;; Bit 7 is fixed 1 and bit 6 is the SIZE (1 = .L).  This used to OR in
+  ;; (ash +68k-size-long+ 6) -- MOVE's size code, 2, which sets bit 7 and
+  ;; leaves bit 6 clear -- so every MOVEM was MOVEM.W: the prologue saved
+  ;; D4-D7 as their low 16 bits and the epilogue restored them SIGN-EXTENDED.
+  ;; Every callee-saved value above 32767 was destroyed across every call.
+  (m68k-emit-word buf (logior #x48C0
                               (ash +ea-mode-an-predec+ 3)
                               +68k-a7+))
   (m68k-emit-word buf register-mask))
@@ -884,8 +888,8 @@
    REGISTER-MASK: bit 0=D0, ..., bit 7=D7, bit 8=A0, ..., bit 15=A7."
   ;; Format: 0100 1100 10 mode reg, then mask
   ;; (A7)+: mode 3, reg 7
-  (m68k-emit-word buf (logior (ash #b01001100 8)
-                              (ash +68k-size-long+ 6)
+  ;; .L -- see M68K-EMIT-MOVEM-TO-PREDEC.
+  (m68k-emit-word buf (logior #x4CC0
                               (ash +ea-mode-an-postinc+ 3)
                               +68k-a7+))
   (m68k-emit-word buf register-mask))
@@ -1804,6 +1808,7 @@
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
+         (m68k-emit-alloc-mark buf 2)   ; FIRST: clobbers D0/A0
          ;; Bump allocator using A2 (VA)
          ;; Store car at (A2)
          (m68k-load-vreg buf +68k-d0+ va)
@@ -1902,8 +1907,14 @@
        (let ((vd (first operands))
              (size (second operands))
              (subtag (third operands)))
-         ;; Build header: (subtag << 8) | +tag-object+
-         (let ((header (logior (ash subtag 8) +tag-object+)))
+         (m68k-emit-alloc-mark buf 1)   ; FIRST: clobbers D0/A0
+         ;; Header: (size << 8) | subtag -- the one 32-bit header layout every
+         ;; other allocation site here, ARM32 and i386 write, and the one the
+         ;; collector sizes objects by.  This arm used to write
+         ;; (subtag << 8) | 9, and OBJ-SUBTAG read byte 1 to match it -- a
+         ;; private convention that made every ARRAY and STRING report the low
+         ;; byte of its LENGTH as its subtag.
+         (let ((header (logior (ash size 8) subtag)))
            ;; Store header at (A2)
            (m68k-emit-move-imm-dn buf header +68k-d0+)
            (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
@@ -1979,10 +1990,8 @@
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-subi buf +68k-d0+ +tag-object+)
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-         ;; Load header
+         ;; Load header; the subtag is its LOW byte, (count << 8) | subtag
          (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
-         ;; Extract subtag
-         (m68k-emit-lsr-imm buf +68k-d0+ 8)
          (m68k-emit-andi buf +68k-d0+ #xFF)
          ;; Tag as fixnum
          (m68k-emit-lsl-imm buf +68k-d0+ 1)
@@ -2140,9 +2149,12 @@
        (let* ((target-offset (first operands))
               (label (gethash target-offset label-map)))
          ;; Tear down frame, then jump
-         ;; Restore callee-saved regs
-         (let ((mask (logior (ash 1 4) (ash 1 5) (ash 1 6) (ash 1 7)
-                             (ash 1 10) (ash 1 11) (ash 1 12))))
+         ;; Restore callee-saved regs -- EXACTLY the epilogue's mask.  This
+         ;; one also restored A2/A3/A4 (bits 10-12), which the prologue never
+         ;; saved, so every tail call loaded VA/VL/VN from the frame below the
+         ;; saved D4-D7: the allocation pointer, limit and NIL replaced with
+         ;; whatever the frame held.
+         (let ((mask (logior (ash 1 4) (ash 1 5) (ash 1 6) (ash 1 7))))
            (m68k-emit-movem-from-postinc buf mask))
          (m68k-emit-unlk buf +68k-a6+)
          ;; Branch to target (BRA, not BSR — this is a tail call)
@@ -2151,6 +2163,7 @@
       ;;; --- GC / Allocation ---
       (#.+op-alloc-cons+
        (let ((vd (first operands)))
+         (m68k-emit-alloc-mark buf 2)   ; FIRST: clobbers D0/A0
          ;; Tag A2 (VA) as cons pointer
          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-cons+)
@@ -2178,12 +2191,9 @@
        ;; ILLEGAL instead: `(cons 42 0)` trapped on the first cons, which is
        ;; why 68k passed arithmetic and recursion but could not build a pair.
        ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
-       (m68k-emit-cmpa-an buf +68k-a3+ +68k-a2+)
-       (let ((ok-label (mvm-make-label)))
-         (m68k-emit-bcc-word buf +68k-cc-cs+ ok-label)  ; CS = VA < VL = room
-         ;; GC needed: trap
-         (m68k-emit-illegal buf)
-         (m68k-emit-label buf ok-label)))
+       ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
+       ;; Hosted, a full heap calls the collector; bare, it is still ILLEGAL.
+       (m68k-emit-gc-check buf))
 
       (#.+op-write-barrier+
        (let ((vobj (first operands)))
@@ -2304,6 +2314,7 @@
        ;; (alloc-array Vd Vcount) — Vcount is UNTAGGED (the compiler SAR'd it).
        (let ((vd (first operands))
              (vcount (second operands)))
+         (m68k-emit-alloc-mark buf 1)   ; FIRST: clobbers D0/A0
          ;; D1 = count (kept); D0 = header, stored at (A2).
          (m68k-load-vreg buf +68k-d1+ vcount)
          (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
@@ -2385,6 +2396,7 @@
       (#.+op-alloc-u8+
        (let ((vd (first operands))
              (vcount (second operands)))
+         (m68k-emit-alloc-mark buf 1)   ; FIRST: clobbers D0/A0
          (m68k-load-vreg buf +68k-d1+ vcount)
          (m68k-emit-asr-imm buf +68k-d1+ 1)              ; N = count >> 1
          (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
@@ -2406,6 +2418,7 @@
        ;; One character CODE per WORD; count already UNTAGGED by the compiler.
        (let ((vd (first operands))
              (vcount (second operands)))
+         (m68k-emit-alloc-mark buf 1)   ; FIRST: clobbers D0/A0
          (m68k-load-vreg buf +68k-d1+ vcount)
          (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
          (m68k-emit-lsl-imm buf +68k-d0+ 8)
@@ -2459,6 +2472,7 @@
       (#.+op-sap-new+
        (let ((vd (first operands))
              (vaddr (second operands)))
+         (m68k-emit-alloc-mark buf 1)   ; FIRST: clobbers D0/A0
          ;; Payload first — the allocation sequence below owns D0.
          (m68k-load-vreg buf +68k-d1+ vaddr)
          (m68k-emit-move-imm-dn buf #x116 +68k-d0+)
@@ -2517,6 +2531,412 @@
        (m68k-emit-illegal buf)))))
 
 ;;; ============================================================
+;;; Hosted collector
+;;; ============================================================
+;;;
+;;; A Cheney copying collector in native 68k, the port of translate-arm32's
+;;; ARM32-EMIT-GC-COLLECTOR (itself translate-riscv's), with ONE design change:
+;;; NOTHING ABOUT THE HEAP'S SIZE IS A TRANSLATE-TIME CONSTANT.  The boot stub
+;;; chooses the size when the process starts (--dynamic-space-size, else half
+;;; of physical RAM, capped) and leaves the geometry in memory:
+;;;
+;;;   #x10000040 + 0x00  from_start      + 0x08  to_start    + 0x10  space_size
+;;;              + 0x18  stack_base      + 0x20  gc_count
+;;;   +68K-GC-KIND-BIAS-ADDR+  K, where the kind byte of address A is K + (A >> 4)
+;;;   +68K-GC-MARGIN-ADDR+     bytes kept free below VL after a collection
+;;;
+;;; Same offsets as mvm/compiler.lisp's +GC-OFF-*+, so the block reads the way
+;;; every other port's does.  The collector reads all of it at entry, and every
+;;; allocation site reads K, so one binary runs in a 2 MB heap or a 512 MB one.
+;;;
+;;; Allocation marks are a KIND BYTE per 16-byte granule (1 = object start,
+;;; 2 = cons), as on ARM32.  A conservative root must name an address in
+;;; from-space whose kind byte matches its tag (cons tag 1 <-> 2, object tag 9
+;;; <-> 1), or it is left alone.
+;;;
+;;; ROOTS: every register (the entry MOVEMs D0-D7/A0-A6 and the stack scan
+;;; starts at that save frame, so a register holding a pointer is updated in
+;;; place and restored updated), the stack up to stack_base, and the whole low
+;;; block [#x10000000, from-space) -- globals, MV values, jmpbuf and handler
+;;; frames -- so a slot added later is covered by construction.
+;;;
+;;; TO-SPACE IS SPLIT BY SHAPE: objects copied UP from to_start, conses DOWN
+;;; from to_end, so the Cheney scan always knows what it is looking at and can
+;;; skip leaf payloads.  The mutator then allocates in the gap.  Failure is
+;;; loud: a message on stderr and exit status 3 (heap still full after a
+;;; collection, or to-space overflow) -- not a SIGILL.
+;;;
+;;; Register plan inside the collector:  D4 from_start  D5 from_end
+;;; D6 kind bias  A2 object free (up)  A3 cons low (down)  A5/A6 scan cursors,
+;;; A4/D7 loop bounds.  SCAN (A0 = slot address) uses D0-D3 and A1 only,
+;;; advances A2/A3 as it copies, preserves everything else, and returns RTS.
+;;; A2/A3 are the mutator's VA/VL, which is why the collector can simply leave
+;;; the new frontier in them.
+
+(defconstant +68k-gc-meta+ #x10000040)
+(defconstant +68k-gc-kind-bias-addr+ #x10000F90
+  "K for the allocation-mark arithmetic.  In the BSS gap mvm/compiler.lisp
+   documents as free (between the per-region table and the scheduler words).
+   Inside the collector's low-block root range, which is harmless: K is
+   16-aligned, so its low nibble is 0 and it can never read as a tagged root.")
+(defconstant +68k-gc-margin-addr+ #x10000F98
+  "The overshoot margin the stub chose for this heap.  16-aligned, as above.")
+
+(defvar *68k-gc-label* nil
+  "Label of the hosted collector while translating a hosted module, else NIL
+   (then :gc-check is the old ILLEGAL and no allocation marks are emitted).")
+
+(defun m68k-emit-adda-dn (buf dn an)
+  "ADDA.L Dn, An"
+  (m68k-emit-word buf (logior (ash #b1101 12) (ash (logand an 7) 9)
+                              (ash #b111 6) (ash +ea-mode-dn+ 3) (logand dn 7))))
+
+(defun m68k-emit-move-postinc-postinc (buf src-an dst-an)
+  "MOVE.L (As)+, (Ad)+"
+  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-postinc+ dst-an
+                                             +ea-mode-an-postinc+ src-an)))
+
+(defun m68k-emit-move-byte-postinc-dn (buf an dn)
+  "MOVE.B (An)+, Dd"
+  (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn +ea-mode-an-postinc+ an)))
+
+(defun m68k-emit-cmpi-byte (buf dn imm8)
+  "CMPI.B #imm8, Dn"
+  (m68k-emit-word buf (logior (ash #b00001100 8) (ash 0 6)
+                              (ash +ea-mode-dn+ 3) (logand dn 7)))
+  (m68k-emit-word buf (logand imm8 #xFF)))
+
+(defun m68k-emit-bsr-long (buf label-id)
+  "BSR.L target -- 68020+, 32-bit displacement, so a gc-check anywhere in an
+   image of any size reaches the collector emitted after the last function."
+  (m68k-emit-word buf #x61FF)
+  (let ((disp-pos (m68k-buffer-position buf)))
+    (m68k-emit-word buf 0)
+    (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2))
+          (m68k-buffer-fixups buf))
+    (m68k-emit-word buf 0)))
+
+(defun m68k-emit-alloc-mark (buf kind)
+  "Mark the allocation about to start at VA (A2): KIND 1 = object, 2 = cons.
+   Hosted with a collector only.  Clobbers D0 and A0, so it is emitted FIRST in
+   every allocation arm, before either holds an operand."
+  (when *68k-gc-label*
+    (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+    (m68k-emit-lsr-imm buf +68k-d0+ 4)
+    (m68k-emit-move-imm-an buf +68k-gc-kind-bias-addr+ +68k-a0+)
+    (m68k-emit-move-disp-an buf +68k-a0+ 0 +68k-a0+)        ; A0 = K
+    (m68k-emit-adda-dn buf +68k-d0+ +68k-a0+)
+    (m68k-emit-moveq buf +68k-d0+ kind)
+    (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+)))
+
+(defun m68k-emit-gc-check (buf)
+  "Room while VA (A2) < VL (A3); else call the collector (hosted) or ILLEGAL."
+  (let ((ok-label (mvm-make-label)))
+    (m68k-emit-cmpa-an buf +68k-a3+ +68k-a2+)              ; A2 - A3
+    (m68k-emit-bcc-word buf +68k-cc-cs+ ok-label)           ; CS = VA < VL
+    (if *68k-gc-label*
+        (m68k-emit-bsr-long buf *68k-gc-label*)
+        (m68k-emit-illegal buf))
+    (m68k-emit-label buf ok-label)))
+
+(defun m68k-emit-die (buf message status)
+  "write(2, MESSAGE) then exit(STATUS).  The text is pushed onto the stack a
+   longword at a time, so it needs no data section and no PC-relative address.
+   Does not return."
+  (let* ((bytes (map 'list #'char-code message))
+         (padded (append bytes (make-list (mod (- (length bytes)) 4) :initial-element 0))))
+    (loop for i from (- (length padded) 4) downto 0 by 4
+          do (m68k-emit-move-imm-dn buf (logior (ash (nth i padded) 24)
+                                                (ash (nth (+ i 1) padded) 16)
+                                                (ash (nth (+ i 2) padded) 8)
+                                                (nth (+ i 3) padded))
+                                    +68k-d0+)
+             (m68k-emit-push-dn buf +68k-d0+))
+    (m68k-emit-moveq buf +68k-d1+ 2)                        ; fd
+    (m68k-emit-move-an-dn buf +68k-a7+ +68k-d2+)            ; buf
+    (m68k-emit-move-imm-dn buf (length bytes) +68k-d3+)     ; len
+    (m68k-emit-move-imm-dn buf +68k-linux-sys-write+ +68k-d0+)
+    (m68k-emit-trap buf 0)
+    (m68k-emit-moveq buf +68k-d1+ status)
+    (m68k-emit-move-imm-dn buf +68k-linux-sys-exit+ +68k-d0+)
+    (m68k-emit-trap buf 0)))
+
+(defun m68k-emit-kind-addr (buf dst-dn addr-dn)
+  "DST-DN = the kind-byte address of the granule at ADDR-DN; K is in D6."
+  (unless (= dst-dn addr-dn) (m68k-emit-move-dn-dn buf addr-dn dst-dn))
+  (m68k-emit-lsr-imm buf dst-dn 4)
+  (m68k-emit-add-dn-dn buf +68k-d6+ dst-dn))
+
+(defun m68k-emit-object-size (buf dst hdr)
+  "DST = the byte size of the object whose header word is in HDR, aligned to
+   16.  Mirrors every 68k allocation site: a u8 vector (#x11) counts bytes
+   after its 4-byte header, everything else (count + 1) longwords.  Clobbers
+   only DST."
+  (let ((words (mvm-make-label)) (al (mvm-make-label)))
+    (m68k-emit-move-dn-dn buf hdr dst)
+    (m68k-emit-andi buf dst #xFF)
+    (m68k-emit-cmpi buf dst +subtag-u8-vector+)
+    (m68k-emit-bne buf words)
+    (m68k-emit-move-dn-dn buf hdr dst)
+    (m68k-emit-lsr-imm buf dst 8)
+    (m68k-emit-addq buf dst 4)
+    (m68k-emit-bra buf al)
+    (m68k-emit-label buf words)
+    (m68k-emit-move-dn-dn buf hdr dst)
+    (m68k-emit-lsr-imm buf dst 8)
+    (m68k-emit-addq buf dst 1)
+    (m68k-emit-lsl-imm buf dst 2)
+    (m68k-emit-label buf al)
+    (m68k-emit-addi buf dst 15)
+    (m68k-emit-andi buf dst (logand (lognot 15) #xFFFFFFFF))))
+
+(defparameter *68k-gc-leaf-subtags* '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66)
+  "Objects whose payload holds no pointers: copied, never scanned.  ARM32's
+   list exactly.")
+
+(defun m68k-emit-gc-collector (buf)
+  "Emit the hosted collector at *68K-GC-LABEL*.  Entered by BSR.L from
+   :gc-check; every register is preserved except the new VA/VL it installs."
+  (let ((scan (mvm-make-label))
+        (meta +68k-gc-meta+)
+        (save #xFFFE)                     ; D0-D7/A0-A6, predecrement order
+        (restore #x7FFF))
+    (flet ((lbl () (mvm-make-label))
+           (here (l) (m68k-emit-label buf l))
+           (root-range ()
+             ;; for (A5 = A5; A5 < D7; A5 += 4) scan(A5)
+             (let ((top (mvm-make-label)) (out (mvm-make-label)))
+               (m68k-emit-label buf top)
+               (m68k-emit-cmpa buf +68k-a5+ +68k-d7+)              ; A5 - D7
+               (m68k-emit-bcc-word buf +68k-cc-cc+ out)
+               (m68k-emit-move-an-an buf +68k-a5+ +68k-a0+)
+               (m68k-emit-bsr buf scan)
+               (m68k-emit-addq-an buf +68k-a5+ 4)
+               (m68k-emit-bra buf top)
+               (m68k-emit-label buf out))))
+      (here *68k-gc-label*)
+      (m68k-emit-movem-to-predec buf save)
+      ;; ---- geometry, all of it read from memory ----
+      (m68k-emit-move-imm-an buf meta +68k-a1+)
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x00 +68k-d4+)        ; from_start
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x10 +68k-d0+)        ; space_size
+      (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d5+)
+      (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d5+)                ; from_end
+      (m68k-emit-move-disp-an buf +68k-a1+ #x08 +68k-a2+)        ; object free = to_start
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d1+)
+      (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
+      (m68k-emit-move-dn-an buf +68k-d1+ +68k-a3+)               ; cons low = to_end
+      (m68k-emit-move-imm-an buf +68k-gc-kind-bias-addr+ +68k-a0+)
+      (m68k-emit-move-disp-dn buf +68k-a0+ 0 +68k-d6+)           ; K
+      ;; ---- roots: the stack from the save frame, then the low block ----
+      (m68k-emit-move-an-an buf +68k-a7+ +68k-a5+)
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x18 +68k-d7+)        ; stack_base
+      (root-range)
+      (m68k-emit-move-imm-an buf #x10000000 +68k-a5+)
+      ;; the low block ends where the FIRST semispace starts, whichever one is
+      ;; from-space now: min(from_start, to_start)
+      (let ((have (lbl)))
+        (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d7+)
+        (m68k-emit-cmpa buf +68k-a2+ +68k-d7+)                   ; to_start - from_start
+        (m68k-emit-bcc-word buf +68k-cc-cc+ have)
+        (m68k-emit-move-an-dn buf +68k-a2+ +68k-d7+)
+        (here have))
+      (root-range)
+      ;; ---- Cheney: A5 = object scan (up), A6 = cons scan (down) ----
+      (m68k-emit-move-imm-an buf meta +68k-a1+)
+      (m68k-emit-move-disp-an buf +68k-a1+ #x08 +68k-a5+)          ; to_start
+      ;; A6 = to_end, NOT the current A3: the roots have already copied conses
+      ;; down from to_end, and those need their cars and cdrs scanned too.
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x10 +68k-d1+)
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d0+)
+      (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a6+)
+      (let ((ch (lbl)) (obj (lbl)) (cons (lbl)) (cdone (lbl))
+            (leaf (lbl)) (sl (lbl)) (tst-cons (lbl)))
+        (here ch)
+        (m68k-emit-cmpa-an buf +68k-a2+ +68k-a5+)                ; A5 - A2
+        (m68k-emit-bcc-word buf +68k-cc-cc+ tst-cons)
+        (m68k-emit-bra buf obj)
+        (here tst-cons)
+        (m68k-emit-cmpa-an buf +68k-a6+ +68k-a3+)                ; A3 - A6
+        (m68k-emit-bcc-word buf +68k-cc-cs+ cons)
+        (m68k-emit-bra buf cdone)
+        ;; -- one object at A5 --
+        (here obj)
+        (m68k-emit-move-an-ind-dn buf +68k-a5+ +68k-d3+)         ; header
+        (m68k-emit-object-size buf +68k-d0+ +68k-d3+)
+        (m68k-emit-move-an-dn buf +68k-a5+ +68k-d7+)
+        (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d7+)              ; D7 = next
+        (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+        (m68k-emit-andi buf +68k-d1+ #xFF)
+        (dolist (st *68k-gc-leaf-subtags*)
+          (m68k-emit-cmpi buf +68k-d1+ st)
+          (m68k-emit-beq buf leaf))
+        (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+        (m68k-emit-lsr-imm buf +68k-d1+ 8)                       ; count
+        (m68k-emit-lsl-imm buf +68k-d1+ 2)
+        (m68k-emit-addq buf +68k-d1+ 4)
+        (m68k-emit-move-an-dn buf +68k-a5+ +68k-d0+)
+        (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
+        (m68k-emit-move-dn-an buf +68k-d1+ +68k-a4+)             ; A4 = slot end
+        (m68k-emit-addq-an buf +68k-a5+ 4)
+        (here sl)
+        (m68k-emit-cmpa-an buf +68k-a4+ +68k-a5+)                ; A5 - A4
+        (m68k-emit-bcc-word buf +68k-cc-cc+ leaf)
+        (m68k-emit-move-an-an buf +68k-a5+ +68k-a0+)
+        (m68k-emit-bsr buf scan)
+        (m68k-emit-addq-an buf +68k-a5+ 4)
+        (m68k-emit-bra buf sl)
+        (here leaf)
+        (m68k-emit-move-dn-an buf +68k-d7+ +68k-a5+)             ; A5 = next
+        (m68k-emit-bra buf ch)
+        ;; -- one cons below A6 --
+        (here cons)
+        (m68k-emit-lea-disp buf +68k-a6+ -16 +68k-a6+)
+        (m68k-emit-move-an-an buf +68k-a6+ +68k-a0+)
+        (m68k-emit-bsr buf scan)
+        (m68k-emit-lea-disp buf +68k-a6+ 4 +68k-a0+)
+        (m68k-emit-bsr buf scan)
+        (m68k-emit-bra buf ch)
+        (here cdone))
+      ;; ---- clear the kind bytes of the evacuated semispace [D4, D5) ----
+      (let ((zl (lbl)) (zd (lbl)))
+        (m68k-emit-kind-addr buf +68k-d0+ +68k-d4+)
+        (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+        (m68k-emit-kind-addr buf +68k-d1+ +68k-d5+)
+        (m68k-emit-moveq buf +68k-d2+ 0)
+        (here zl)
+        (m68k-emit-cmpa buf +68k-a0+ +68k-d1+)                   ; A0 - D1
+        (m68k-emit-bcc-word buf +68k-cc-cc+ zd)
+        (m68k-emit-move-dn-an-ind buf +68k-d2+ +68k-a0+)
+        (m68k-emit-addq-an buf +68k-a0+ 4)
+        (m68k-emit-bra buf zl)
+        (here zd))
+      ;; ---- swap the semispaces, count the collection ----
+      (m68k-emit-move-imm-an buf meta +68k-a1+)
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d0+)
+      (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ #x00)        ; from = old to
+      (m68k-emit-move-dn-disp buf +68k-d4+ +68k-a1+ #x08)        ; to = old from
+      (m68k-emit-move-disp-dn buf +68k-a1+ #x20 +68k-d0+)
+      (m68k-emit-addq buf +68k-d0+ 1)
+      (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ #x20)
+      ;; ---- new VA = object free, VL = cons low - margin, into the frame ----
+      (let ((exhausted (lbl)))
+        (m68k-emit-move-imm-an buf +68k-gc-margin-addr+ +68k-a0+)
+        (m68k-emit-move-an-dn buf +68k-a3+ +68k-d1+)
+        (m68k-emit-move-disp-dn buf +68k-a0+ 0 +68k-d0+)
+        (m68k-emit-sub-dn-dn buf +68k-d0+ +68k-d1+)              ; D1 = VL
+        (m68k-emit-cmpa buf +68k-a2+ +68k-d1+)                   ; A2 - VL
+        (m68k-emit-bcc-word buf +68k-cc-cc+ exhausted)
+        (m68k-emit-move-an-disp buf +68k-a2+ +68k-a7+ 40)        ; saved A2 (VA)
+        (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a7+ 44)        ; saved A3 (VL)
+        (m68k-emit-movem-from-postinc buf restore)
+        (m68k-emit-rts buf)
+        (here exhausted)
+        (m68k-emit-die buf (format nil "modus: heap exhausted (raise --dynamic-space-size)~%") 3))
+      ;; ================= SCAN (A0 = slot address) =================
+      (let ((ret (lbl)) (isptr (lbl)) (kobj (lbl)) (kok (lbl)) (notfwd (lbl))
+            (obj (lbl)) (ovf (lbl)) (cl (lbl)))
+        (here scan)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
+        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+        (m68k-emit-andi buf +68k-d1+ 15)                         ; tag
+        (m68k-emit-cmpi buf +68k-d1+ 1)
+        (m68k-emit-beq buf isptr)
+        (m68k-emit-cmpi buf +68k-d1+ 9)
+        (m68k-emit-bne buf ret)
+        (here isptr)
+        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+        (m68k-emit-andi buf +68k-d2+ (logand (lognot 15) #xFFFFFFFF)) ; address
+        (m68k-emit-cmp-dn-dn buf +68k-d4+ +68k-d2+)               ; D2 - from_start
+        (m68k-emit-bcc-word buf +68k-cc-cs+ ret)
+        (m68k-emit-cmp-dn-dn buf +68k-d5+ +68k-d2+)               ; D2 - from_end
+        (m68k-emit-bcc-word buf +68k-cc-cc+ ret)
+        ;; a real start of the right kind, or not a root at all
+        (m68k-emit-kind-addr buf +68k-d3+ +68k-d2+)
+        (m68k-emit-move-dn-an buf +68k-d3+ +68k-a1+)
+        (m68k-emit-moveq buf +68k-d3+ 0)
+        (m68k-emit-move-byte-an-ind-dn buf +68k-a1+ +68k-d3+)
+        (m68k-emit-cmpi buf +68k-d1+ 1)
+        (m68k-emit-bne buf kobj)
+        (m68k-emit-cmpi buf +68k-d3+ 2)
+        (m68k-emit-bne buf ret)
+        (m68k-emit-bra buf kok)
+        (here kobj)
+        (m68k-emit-cmpi buf +68k-d3+ 1)
+        (m68k-emit-bne buf ret)
+        (here kok)
+        (m68k-emit-move-dn-an buf +68k-d2+ +68k-a1+)              ; A1 = old base
+        (m68k-emit-move-an-ind-dn buf +68k-a1+ +68k-d3+)          ; first word
+        (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
+        (m68k-emit-andi buf +68k-d0+ 15)
+        (m68k-emit-cmpi buf +68k-d0+ 15)
+        (m68k-emit-bne buf notfwd)
+        ;; already forwarded: (fwd & ~15) | tag
+        (m68k-emit-andi buf +68k-d3+ (logand (lognot 15) #xFFFFFFFF))
+        (m68k-emit-or-dn-dn buf +68k-d1+ +68k-d3+)
+        (m68k-emit-move-dn-an-ind buf +68k-d3+ +68k-a0+)
+        (m68k-emit-rts buf)
+        (here notfwd)
+        (m68k-emit-cmpi buf +68k-d1+ 1)
+        (m68k-emit-bne buf obj)
+        ;; -- cons: 16 bytes down from A3 --
+        (m68k-emit-lea-disp buf +68k-a3+ -16 +68k-a3+)
+        (m68k-emit-cmpa-an buf +68k-a2+ +68k-a3+)                 ; A3 - A2
+        (m68k-emit-bcc-word buf +68k-cc-cs+ ovf)
+        (m68k-emit-move-dn-disp buf +68k-d3+ +68k-a3+ 0)          ; car
+        (m68k-emit-move-disp-dn buf +68k-a1+ 4 +68k-d0+)
+        (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a3+ 4)          ; cdr
+        (m68k-emit-move-an-dn buf +68k-a3+ +68k-d0+)
+        (m68k-emit-ori buf +68k-d0+ 15)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)          ; forward
+        (m68k-emit-move-an-dn buf +68k-a3+ +68k-d0+)
+        (m68k-emit-ori buf +68k-d0+ 1)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)          ; update slot
+        (m68k-emit-move-an-dn buf +68k-a3+ +68k-d0+)
+        (m68k-emit-kind-addr buf +68k-d0+ +68k-d0+)
+        (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)
+        (m68k-emit-moveq buf +68k-d0+ 2)
+        (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a1+)
+        (m68k-emit-rts buf)
+        ;; -- object: header in D3, old base in A1 and D2 --
+        (here obj)
+        (m68k-emit-object-size buf +68k-d0+ +68k-d3+)
+        ;; a header whose object cannot lie inside from-space is a false root
+        (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)
+        (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
+        (m68k-emit-cmp-dn-dn buf +68k-d5+ +68k-d1+)               ; end - from_end
+        (m68k-emit-bcc-word buf +68k-cc-hi+ ret)
+        (m68k-emit-cmp-dn-dn buf +68k-d2+ +68k-d1+)               ; end - base
+        (m68k-emit-bcc-word buf +68k-cc-cs+ ret)                  ; wrapped
+        ;; room below the cons frontier, else to-space overflow
+        (m68k-emit-move-an-dn buf +68k-a2+ +68k-d1+)
+        (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
+        (m68k-emit-cmpa buf +68k-a3+ +68k-d1+)                    ; A3 - (A2 + size)
+        (m68k-emit-bcc-word buf +68k-cc-cs+ ovf)
+        (m68k-emit-move-an-dn buf +68k-a2+ +68k-d3+)              ; D3 = new base
+        (m68k-emit-lsr-imm buf +68k-d0+ 2)                        ; longwords (>= 4)
+        (here cl)
+        (m68k-emit-move-postinc-postinc buf +68k-a1+ +68k-a2+)    ; A2 advances
+        (m68k-emit-subq buf +68k-d0+ 1)
+        (m68k-emit-bne buf cl)
+        (m68k-emit-move-dn-an buf +68k-d2+ +68k-a1+)
+        (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
+        (m68k-emit-ori buf +68k-d0+ 15)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)          ; forward
+        (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
+        (m68k-emit-ori buf +68k-d0+ 9)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)          ; update slot
+        (m68k-emit-kind-addr buf +68k-d0+ +68k-d3+)
+        (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)
+        (m68k-emit-moveq buf +68k-d0+ 1)
+        (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a1+)
+        (here ret)
+        (m68k-emit-rts buf)
+        (here ovf)
+        (m68k-emit-die buf (format nil "modus: collector to-space overflow~%") 3)))))
+
+;;; ============================================================
 ;;; Main Translation Entry Point
 ;;; ============================================================
 
@@ -2529,7 +2949,8 @@
    BYTECODE is a (vector (unsigned-byte 8)).
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
-  (let* ((buf (make-m68k-buffer))
+  (let* ((*68k-gc-label* (and *68k-linux-mode* (mvm-make-label)))
+         (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
          (fn-entries nil)
          (bc bytecode)
@@ -2585,13 +3006,17 @@
     (setf pc 0)
     (loop while (< pc len)
           do (progn
-               ;; FUNCTION ENTRIES ARE 4-ALIGNED.  +op-fn-addr+ ORs the function
-               ;; tag 3 into an entry address, which needs its low two bits free;
-               ;; 68k instructions are 2-byte multiples, so an entry can land at
-               ;; 2 mod 4.  Pad with NOP -- harmless if the previous function
-               ;; could ever fall through, and it cannot (it ends in RTS/branch).
+               ;; FUNCTION ENTRIES ARE 16-ALIGNED.  +op-fn-addr+ ORs the function
+               ;; tag 3 into an entry address, and everything that classifies a
+               ;; value reads the low FOUR bits: an entry at 4/8/12 mod 16 tags
+               ;; as 7/B/F -- not a function, and F is the collector's
+               ;; forwarding tag.  This was 4-aligned, which passed r16-funcall
+               ;; only while ADD2 happened to land on a 16-byte boundary; adding
+               ;; allocation marks moved it and FUNCALL took an ILLEGAL.  ARM32,
+               ;; x64, i386 and RISC-V align to 16 for the same reason.  Pad with
+               ;; NOP -- harmless, a function never falls through (RTS/branch).
                (when (and function-table (gethash pc fn-entries))
-                 (loop while (/= 0 (mod (m68k-buffer-position buf) 4))
+                 (loop while (/= 0 (mod (m68k-buffer-position buf) 16))
                        do (m68k-emit-nop buf)))
                ;; Emit label at current PC before translating
                (let ((label (gethash pc label-map)))
@@ -2603,6 +3028,9 @@
                       (new-pc (cddr decoded)))
                  (m68k-translate-insn buf opcode operands new-pc label-map function-table)
                  (setf pc new-pc))))
+
+    (when *68k-gc-label*
+      (m68k-emit-gc-collector buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)
@@ -2696,6 +3124,7 @@
   "Box FPn as a fresh four-chunk double; its TAGGED pointer lands in D0.
    Header (4<<8)|#x60, five longwords rounded to 32 bytes (16-aligned heap).
    Clobbers D1."
+  (m68k-emit-alloc-mark buf 1)          ; FIRST: clobbers D0/A0
   (m68k-emit-lea-disp buf +68k-a7+ -16 +68k-a7+)
   (m68k-emit-fmove-d-to-sp buf fpn)
   (m68k-emit-move-imm-dn buf (logior #x60 (ash 4 8)) +68k-d1+)

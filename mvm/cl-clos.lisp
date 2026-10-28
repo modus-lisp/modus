@@ -8155,14 +8155,18 @@
     ((%prim-base-string-p a) (code-char (%u8-ref a i)))
     ((%prim-string32-p a) (code-char (%c32-ref a i)))
     ((%mda-p a)
-     (let ((disp (%mda-displaced a)))
+     ;; the store first: an adjustable byte vector (cram's window, a stream buffer) is
+     ;; read here on every element, and the general arm below costs five calls a read
+     (let ((disp (%prim-aref a 3)) (d (%prim-aref a 6)))
+       (if (and (null disp) (%prim-u8-vector-p d))
+           (%u8-ref d i)
        (let ((raw (if disp
                       (%aref-multi a i)
                       ;; a BIT array's data is a packed byte store
                       (if (%mda-bit-p a)
                           (%bit-store-ref (%mda-data a) i)
                           (%prim-aref (%mda-data a) i)))))
-         (if (%prim-stringp (%mda-data a)) (code-char raw) raw))))
+         (if (%prim-stringp (%mda-data a)) (code-char raw) raw)))))
     ((%raw-consp a)
      (let ((raw (%wrapper-aref a i)))
        (if (%wrapper-stringp a) (code-char raw) raw)))
@@ -8188,12 +8192,14 @@
              (progn (%c32-set a i c) val)
              (error 'type-error :datum val :expected-type 'character))))
       ((%mda-p a)
-       (let ((disp (%mda-displaced a)))
+       (let ((disp (%prim-aref a 3)) (d (%prim-aref a 6)))
          (if disp
              (%aset-multi a sto i)
+           (if (%prim-u8-vector-p d)
+               (%prim-aset d i sto)
              (if (%mda-bit-p a)
                  (%bit-store-set (%mda-data a) i sto)
-                 (%prim-aset (%mda-data a) i sto))))
+                 (%prim-aset (%mda-data a) i sto)))))
        val)
       ((%raw-consp a) (%wrapper-aset a i sto) val)
       ((eq (obj-subtag a) #x12) (%f32-aset a i val))

@@ -4872,6 +4872,14 @@
         (setq cur (cddr cur))))
     (%replace-pos seq1 seq2 start1 end1 start2 end2)))
 
+(defun %replace-store (v)
+  "V's store when V is a one-dimensional MDA header that is neither displaced nor a packed
+   bit array -- element I of V is element I of the store -- else V itself."
+  (if (and (%mda-p v) (eql (%prim-aref v 0) 1) (null (%prim-aref v 3))
+           (not (eq (%prim-aref v 5) 'bit)))
+      (%prim-aref v 6)
+      v))
+
 (defun %replace-pos (seq1 seq2 start1 end1 start2 end2)
   "REPLACE with its bounds as positional arguments (END1 / END2 NIL = the length).
    The compiler turns a REPLACE call with literal keywords into this, so the call
@@ -4896,6 +4904,18 @@
         (when (%bulk-copy-ok-p seq1 seq2)
           (%bulk-copy seq1 start1 seq2 start2 count)
           (return-from %replace-pos seq1))
+        ;; An adjustable or fill-pointer vector is an MDA header over one plain store, its
+        ;; element I at the store's I: copy between the stores.  Without this every byte of
+        ;; a REPLACE into cram's window took the general path below -- a cons per byte, then
+        ;; a generic ASET -- and that was 8% of a frame on the Zero, plus the GC it caused.
+        (let ((d1 (%replace-store seq1)) (d2 (%replace-store seq2)))
+          (unless (and (eq d1 seq1) (eq d2 seq2))
+            (when (%bulk-copy-u8-ok-p d1 d2)
+              (%bulk-copy-u8 d1 start1 d2 start2 count)
+              (return-from %replace-pos seq1))
+            (when (%bulk-copy-ok-p d1 d2)
+              (%bulk-copy d1 start1 d2 start2 count)
+              (return-from %replace-pos seq1))))
         ;; CLHS REPLACE: when SEQ1 and SEQ2 are the same object and the
         ;; source/destination regions overlap, the result is as if the
         ;; whole source window were copied to a temporary first.  We always

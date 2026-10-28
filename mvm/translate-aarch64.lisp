@@ -5764,6 +5764,27 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ---- FPD-LI / FP-LI Fd, hi, lo ----  x9 = hi:lo, FMOV Dd, x9;
+          ;; FP-LI then FCVT Sd, Dd (the double is exactly the single).
+          ((or (= op +op-fpd-li+) (= op +op-fp-li+))
+           (let ((fd (fpp (vr 0)))
+                 (bits (logior (ash (logand (vr 1) #xFFFFFFFF) 32) (logand (vr 2) #xFFFFFFFF))))
+             (a64-load-imm64 buf +a64-x9+ bits)
+             (a64-fmov-d-x buf fd +a64-x9+)
+             (when (= op +op-fp-li+)
+               (a64-emit buf (logior #x1E624000 (ash fd 5) fd)))))          ; fcvt Sd, Dd
+
+          ;; ---- FPD-SCALE Fd, Vk ----  Fd *= 2^k: the double 2^k from its
+          ;; exponent bits (k + 1023) << 52 in D0 (FP scratch), then FMUL.
+          ((= op +op-fpd-scale+)
+           (let* ((fd (fpp (vr 0)))
+                  (pk (ensure-src (vr 1) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pk 1)
+             (a64-add-imm buf +a64-x9+ +a64-x9+ 1023)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 52)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             (a64-emit buf (logior #x1E600800 (ash 0 16) (ash fd 5) fd))))   ; fmul Dd, Dd, D0
+
           ;; ---- FPD-ITOF Fd, Vsrc ----  ASR x9, src, 1 ; SCVTF Dd, x9 (no box)
           ((= op +op-fpd-itof+)
            (let* ((fd (fpp (vr 0)))

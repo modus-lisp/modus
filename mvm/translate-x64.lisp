@@ -4486,6 +4486,26 @@
              (unless (eq d 'rax) (emit-mov-reg-reg buf d 'rax))
              (maybe-store-scratch buf vd))))
 
+        ((or (op= +op-fpd-li+) (op= +op-fp-li+))
+         ;; MOV rax, hi:lo; MOVQ xmmD, rax; FP-LI then CVTSD2SS xmmD, xmmD.
+         (let ((fd (x64-fpp (first operands))))
+           (emit-mov-reg-imm buf 'rax (logior (ash (logand (second operands) #xFFFFFFFF) 32)
+                                              (logand (third operands) #xFFFFFFFF)))
+           (x64-sse-rr buf #x66 t #x6E fd 0)                    ; movq xmmD, rax
+           (when (op= +op-fp-li+)
+             (x64-sse-rr buf #xF2 nil #x5A fd fd))))            ; cvtsd2ss xmmD, xmmD
+
+        ((op= +op-fpd-scale+)
+         ;; (fpd-scale Fd Vk) -- Fd *= 2^k: rax = ((k >> 1) + 1023) << 52,
+         ;; MOVQ xmm0, rax (FP scratch), MULSD xmmD, xmm0.
+         (let ((fd (x64-fpp (first operands))))
+           (emit-load-vreg buf (second operands) 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           (emit-bytes buf #x48 #x05 #xFF #x03 #x00 #x00)       ; add rax, 1023
+           (emit-shl-reg-imm buf 'rax 52)
+           (x64-sse-rr buf #x66 t #x6E 0 0)                     ; movq xmm0, rax
+           (x64-sse-rr buf #xF2 nil #x59 fd 0)))                ; mulsd xmmD, xmm0
+
         ((op= +op-fpd-itof+)
          ;; (fpd-itof Fd Vs) -- SAR 1, CVTSI2SD xmmD, rax: a fixnum straight into
          ;; the FP register, with no box.

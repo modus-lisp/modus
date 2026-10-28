@@ -103,7 +103,7 @@
    #:mvm-alloc-f32 #:mvm-f32-ref #:mvm-f32-set
    #:+op-f32-load+ #:+op-f32-store+ #:+op-fround32+ #:+op-fsqrt+ #:mvm-fsqrt
    #:+op-fp-op1+ #:+op-fp-op2+ #:+op-fp-cmp+ #:+op-fp-toi+
-   #:mvm-fp-op1 #:mvm-fp-op2 #:mvm-fp-cmp #:mvm-fp-toi
+   #:mvm-fp-op1 #:mvm-fp-op2 #:mvm-fp-cmp #:mvm-fp-toi #:+op-fpd-scale+ #:mvm-fpd-scale #:+op-fpd-li+ #:+op-fp-li+ #:mvm-fpd-li #:mvm-fp-li
    #:mvm-f32-load #:mvm-f32-store #:mvm-fround32
    #:+op-fp-unbox+ #:+op-fp-box+ #:+op-fp-lane-load+ #:+op-fp-lane-store+
    #:+op-fp-add+ #:+op-fp-sub+ #:+op-fp-mul+ #:+op-fp-div+
@@ -552,6 +552,9 @@
 (defconstant +op-fp-op1+    #xF5) ; (fp-op1 Fd Fs sub)     0 fabs.s 1 fabs.d 2 fcvt d<-s 3 fcvt s<-d
 (defconstant +op-fp-op2+    #xF6) ; (fp-op2 Fd Fa Fb sub)  0 fmax.s 1 fmin.s 2 fmax.d 3 fmin.d
 (defconstant +op-fp-cmp+    #xF7) ; (fp-cmp Vd Fa Fb sub)  fixnum 1 when 0: Fa < Fb  1: Fa <= Fb (singles; NaN -> 0)
+(defconstant +op-fpd-li+    #xFA) ; (fpd-li Fd hi lo)    Fd <- the double with IEEE bits hi:lo
+(defconstant +op-fp-li+     #xFB) ; (fp-li Fd hi lo)     Fd <- that double (exactly a single) as a single
+(defconstant +op-fpd-scale+ #xF9) ; (fpd-scale Fd Vk)    Fd <- Fd * 2^k, k a fixnum in [-1022, 1023]
 (defconstant +op-fp-toi+    #xF8) ; (fp-toi Vd Fs sub)     -> fixnum: 0 round-even 1 truncate 2 floor 3 ceiling (single); +4 double
 ;; INTEGER LANE class (SIMD plan, layer 2b — reel's kernels): the same F vregs
 ;; hold 16 bytes read as u8x16 / s8x16 / s16x8 / s32x4 depending on the op.  No
@@ -778,6 +781,9 @@
 (defopcode :fp-op2    #xF6 (:reg :reg :reg :imm8)  "FP binary: fmax/fmin, single and double")
 (defopcode :fp-cmp    #xF7 (:reg :reg :reg :imm8)  "single compare -> fixnum 1/0 (lt, le; NaN unordered)")
 (defopcode :fp-toi    #xF8 (:reg :reg :imm8)       "FP -> tagged fixnum: round-even / truncate / floor / ceiling")
+(defopcode :fpd-scale #xF9 (:reg :reg)             "Double times 2^k, k a fixnum in the normal exponent range")
+(defopcode :fpd-li    #xFA (:reg :imm32 :imm32)    "FP vreg <- double literal from its IEEE bits (hi, lo)")
+(defopcode :fp-li     #xFB (:reg :imm32 :imm32)    "FP vreg <- single literal, given as its (exact) double's bits")
 (defopcode :fp-unbox      #xD1 (:reg :reg)      "Boxed float → unboxed single in FP vreg")
 (defopcode :fp-box        #xD2 (:reg :reg)      "Unboxed single in FP vreg → fresh boxed single-float (allocates)")
 (defopcode :fp-lane-load  #xD3 (:reg :reg :reg) "Packed f32 lane → FP vreg")
@@ -1407,6 +1413,9 @@
 (defun mvm-fp-op2 (buf fd fa fb sub) (encode-instruction buf +op-fp-op2+ fd fa fb sub))
 (defun mvm-fp-cmp (buf vd fa fb sub) (encode-instruction buf +op-fp-cmp+ vd fa fb sub))
 (defun mvm-fp-toi (buf vd fs sub) (encode-instruction buf +op-fp-toi+ vd fs sub))
+(defun mvm-fpd-scale (buf fd vk) (encode-instruction buf +op-fpd-scale+ fd vk))
+(defun mvm-fpd-li (buf fd hi lo) (encode-instruction buf +op-fpd-li+ fd hi lo))
+(defun mvm-fp-li (buf fd hi lo) (encode-instruction buf +op-fp-li+ fd hi lo))
 
 (defun mvm-v4-lane-load (buf fd varr vidx) (encode-instruction buf +op-v4-lane-load+ fd varr vidx))
 (defun mvm-v4-lane-store (buf varr vidx fs) (encode-instruction buf +op-v4-lane-store+ varr vidx fs))

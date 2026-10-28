@@ -3614,6 +3614,9 @@
         (let ((ty (list 'simple-array et (list '*))))
           (cond ((%u8-simple-array-decl-p ty) ty)
                 ((%generic-element-type-p et) ty)
+                ;; the packed single-float vector a declared f32 array is
+                ;; (illatio's f32-dot16 accumulator: every AREF was generic)
+                ((%f32-simple-array-decl-p ty) ty)
                 (t nil)))))))
 
 (defun %expr-dtype (form env)
@@ -9315,6 +9318,12 @@
          (compile-make-closure (cadr form) (caddr form) env dest)))
 
       ;; --- Array Operations ---
+      ;; (MAKE-ARRAY N :ELEMENT-TYPE 'SINGLE-FLOAT [:INITIAL-ELEMENT 0.0]),
+      ;; N a literal: the zero-filled packed vector inline (zero bits are
+      ;; 0.0), not the runtime MAKE-ARRAY call -- a kernel's small scratch
+      ;; array cost more than its loop
+      ((and (= op-name 17023737) (%f32-make-array-count form))
+       (compile-alloc-f32 (%f32-make-array-count form) env dest))
       ((= op-name 17023737)       (compile-make-array form env dest))  ; MAKE-ARRAY
       ;; %MAKE-STRING-ARRAY — like make-array but with string subtag
       ((= op-name #.(compute-name-hash "%MAKE-STRING-ARRAY"))
@@ -20740,6 +20749,8 @@
          ((%fp-minmax-op form)
           (and (%expr-single-float-p (cadr form) env) (%expr-single-float-p (caddr form) env)))
          ((%fp-single-conversion-arg form) t)
+         ;; EXP of a single is a single
+         ((%fp-exp-arg form) (%expr-single-float-p (%fp-exp-arg form) env))
          ;; struct accessor whose slot type is single-float
          (t (let ((ty (%expr-dtype form env)))
               (and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")))))))
@@ -20993,11 +21004,16 @@
         (if (and b (eq (binding-location b) :fpdreg))
             ;; an FP-resident double local: a register move, no unbox
             (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))
-            ;; a leaf: its boxed value, unboxed once
-            (let ((tmp (alloc-temp-reg)))
-              (compile-form form env tmp)
-              (emit-ir :fpd-unbox fd tmp)
-              (free-temp-reg))))))
+            (let ((bits (let ((v (%fp-literal-value form)))
+                          (and v (typep v 'double-float) (%fp-literal-double-bits v)))))
+              (if bits
+                  ;; a literal: its bits straight into the register
+                  (emit-ir :fpd-li fd (car bits) (cdr bits))
+                  ;; a leaf: its boxed value, unboxed once
+                  (let ((tmp (alloc-temp-reg)))
+                    (compile-form form env tmp)
+                    (emit-ir :fpd-unbox fd tmp)
+                    (free-temp-reg))))))))
 
 (defun %compile-double-float-arith (op-name args env dest)
   "Left-fold ARGS with the double-float op OP-NAME (a string): :f<op> per pair,
@@ -21206,8 +21222,134 @@
           (let ((x (%fp-single-conversion-arg form)))
             (or (%fp-tree-need x env) (%fpd-pure-need x env)
                 (%fp-itof-need x env))))
+         ((%fp-exp-arg form)
+          (let ((n (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+                        (%fp-tree-need (%fp-exp-arg form) env))))
+            ;; 7: what %COMPILE-EXP-SINGLE holds at its peak, result included
+            (and n (max n 7))))
          (t nil)))
       (t nil))))
+
+(defun %fp-literal-double-bits (x)
+  "(HI . LO), the IEEE bits of the finite float X as a double (exact for a
+   single), or NIL.  INTEGER-DECODE-FLOAT, so it is the same on the host
+   that builds the image and in the image itself."
+  (and (floatp x)
+       (let ((d (coerce x 'double-float)))
+         (multiple-value-bind (m e sgn) (integer-decode-float d)
+           (let* ((neg (or (minusp sgn) (minusp (float-sign d))))
+                  (bits (cond ((zerop m) 0)
+                              ;; normal: m in [2^52, 2^53), value m * 2^e
+                              ((>= m (ash 1 52))
+                               (let ((be (+ e 1075)))
+                                 (and (< 0 be 2047)
+                                      (logior (ash be 52) (- m (ash 1 52))))))
+                              ;; subnormal: e = -1074, biased exponent 0
+                              ((= e -1074) m)
+                              (t nil))))
+             (and bits
+                  (let ((b (if neg (logior bits (ash 1 63)) bits)))
+                    (cons (ash b -32) (logand b #xFFFFFFFF)))))))))
+
+(defun %fp-literal-value (form)
+  "The float FORM denotes when it is a float literal (or quoted one), else NIL."
+  (cond ((floatp form) form)
+        ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
+              (floatp (cadr form)))
+         (cadr form))
+        (t nil)))
+
+(defun %fp-exp-arg (form)
+  "X when FORM is (EXP X)."
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "EXP")
+       (consp (cdr form)) (null (cddr form))
+       (cadr form)))
+
+(defun %fp-env-with-fpd (env names regs)
+  "ENV with each of NAMES an FP-resident double local in the matching REGS."
+  (let ((bs (compile-env-bindings env)))
+    (loop for n in names for r in regs
+          do (setq bs (cons (make-binding :name n :location :fpdreg :reg r
+                                          :dtype 'double-float)
+                            bs)))
+    (make-compile-env :bindings bs
+                      :stack-depth (compile-env-stack-depth env)
+                      :parent (compile-env-parent env)
+                      :fn-names (compile-env-fn-names env))))
+
+(defun %emit-fpd-select-if-lt (fa fb fd fs)
+  "When Fa < Fb (ordered: not for a NaN), Fd <- Fs."
+  (let ((b (alloc-temp-reg)) (z (alloc-temp-reg)) (skip (make-compiler-label)))
+    (emit-ir :fpd-lt b fa fb)
+    (emit-ir :li z 0)
+    (emit-ir :cmp b z)
+    (emit-ir :beq skip)
+    (emit-ir :fp-mov fd fs)
+    (emit-ir-label skip)
+    (free-temp-reg) (free-temp-reg)))
+
+(defun %compile-exp-single (x env fd)
+  "(EXP X) of the single tree X into FD, in registers, with no call.  The
+   same double arithmetic in the same order as %EXP-F's normal path (whose
+   result EXP rounds to single), so the bits are EXP's:
+     xd = X widened, clamped to [-110, 100] -- beyond those the single result
+          is already 0 or infinity, and inside them 2^k is a normal double,
+          so %EXP-F's two-step scales never apply; a NaN passes the clamps
+          and stays NaN;
+     k  = truncate(xd/ln2 +- 0.5), r = (xd - k ln2_hi) - k ln2_lo,
+     exp(r) by the degree-13 Horner series, times 2^k (fpd-scale), rounded
+     to single.
+   SwiGLU and softmax call EXP per element; through the generic function it
+   was ~250 ns."
+  (compile-float-unboxed x env fd)
+  (emit-ir :fp-op1 fd fd 2)                                       ; xd
+  (let ((c (alloc-fp-reg)))
+    (compile-double-unboxed 100d0 env c)
+    (%emit-fpd-select-if-lt c fd fd c)                            ; 100 < xd: xd = 100
+    (compile-double-unboxed -110d0 env c)
+    (%emit-fpd-select-if-lt fd c fd c)                            ; xd < -110: xd = -110
+    (free-fp-reg))
+  (let* ((xd (%mvm-gensym "XD")) (tq (%mvm-gensym "TQ")) (kd (%mvm-gensym "KD")) (r (%mvm-gensym "R"))
+         (ft (alloc-fp-reg))
+         (e1 (%fp-env-with-fpd env (list xd) (list fd)))
+         (kreg (alloc-temp-reg)))
+    ;; tq = xd / ln2;  k = truncate(tq - 0.5) if tq < 0, else truncate(tq + 0.5)
+    (compile-double-unboxed (list '* xd 1.4426950408889634d0) e1 ft)
+    (let ((e2 (%fp-env-with-fpd e1 (list tq) (list ft)))
+          (fu (alloc-fp-reg)) (fz (alloc-fp-reg))
+          (b (alloc-temp-reg)) (z (alloc-temp-reg))
+          (neg (make-compiler-label)) (done (make-compiler-label)))
+      (compile-double-unboxed 0d0 e2 fz)
+      (emit-ir :fpd-lt b ft fz)
+      (emit-ir :li z 0)
+      (emit-ir :cmp b z)
+      (emit-ir :bne neg)
+      (compile-double-unboxed (list '+ tq 0.5d0) e2 fu)
+      (emit-ir :br done)
+      (emit-ir-label neg)
+      (compile-double-unboxed (list '- tq 0.5d0) e2 fu)
+      (emit-ir-label done)
+      (emit-ir :fp-toi kreg fu 5)                                 ; truncate, double
+      (free-temp-reg) (free-temp-reg)
+      (free-fp-reg) (free-fp-reg))
+    ;; kd = k as a double (FT, tq is dead); r = (xd - kd ln2_hi) - kd ln2_lo
+    (emit-ir :fpd-itof ft kreg)
+    (let ((fr (alloc-fp-reg))
+          (e3 (%fp-env-with-fpd e1 (list kd) (list ft))))
+      (compile-double-unboxed (list '- (list '- xd (list '* kd 0.6931471803691238d0))
+                                    (list '* kd 1.9082149292705877d-10))
+                              e3 fr)
+      ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...))), %EXP-F's tree, into FD (xd is dead)
+      (let ((series 1d0))
+        (setq series (list '+ (list '/ r 13d0) 1d0))
+        (loop for n from 12 downto 1
+              do (setq series (list '+ (list '/ (list '* series r) (float n 1d0)) 1d0)))
+        (compile-double-unboxed series (%fp-env-with-fpd env (list r) (list fr)) fd))
+      (free-fp-reg))
+    (emit-ir :fpd-scale fd kreg)
+    (emit-ir :fp-op1 fd fd 3)                                     ; to single
+    (free-temp-reg)
+    (free-fp-reg)))
 
 (defun %fp-itof-need (x env)
   "FP registers to convert the integer X to a single in register, or NIL.
@@ -21244,6 +21386,11 @@
             (let ((b (env-lookup env form))) (and b (eq (binding-location b) :fpreg))))
        (let ((b (env-lookup env form)))
          (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))))
+      ;; a single literal: its bits straight into the register
+      ((let ((v (%fp-literal-value form)))
+         (and v (typep v 'single-float) (%fp-literal-double-bits v)))
+       (let ((bits (%fp-literal-double-bits (%fp-literal-value form))))
+         (emit-ir :fp-li fd (car bits) (cdr bits))))
       ;; leaf literal / variable: the boxed value, unboxed once
       ((or (typep form 'single-float) (symbolp form)
            (and (consp form) (name-eq (car form) "QUOTE")))
@@ -21269,6 +21416,8 @@
          (compile-float-unboxed (caddr form) env ft)
          (emit-ir :fp-op2 fd fd ft (if (eq (%fp-minmax-op form) :max) 0 1))
          (free-fp-reg)))
+      ((%fp-exp-arg form)
+       (%compile-exp-single (%fp-exp-arg form) env fd))
       ((%fp-single-conversion-arg form)
        (let ((x (%fp-single-conversion-arg form)))
          (cond ((%fp-tree-need x env)
@@ -21418,7 +21567,9 @@
 (defun compile-v4-form (form env dest)
   "A %f32v-* call: unboxed when it is (or stores) a fitting vector tree,
    otherwise the ordinary call to the prelude definition."
-  (let ((n (symbol-name (car form))))
+  (let ((n (symbol-name (car form)))
+        ;; a discarded store statement: its vector is not boxed
+        (unused (eq form *unused-value-form*)))
     (cond
       ((string= n "%F32V-SET")                    ; (%f32v-set A i tree)
        (if (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
@@ -21440,7 +21591,7 @@
                      (emit-ir :v4-lane-store ta ti fd)
                      (free-temp-reg))
                    (free-temp-reg))
-                 (when dest (%emit-v4-box dest fd))
+                 (when (and dest (not unused)) (%emit-v4-box dest fd))
                  (free-fp-reg))
                ;; a possibly-calling index: evaluate it (and the array) before
                ;; any FP register is live, as before
@@ -21450,7 +21601,7 @@
                  (let ((fd (alloc-fp-reg)))
                    (compile-v4-unboxed (cadddr form) env fd)
                    (emit-ir :v4-lane-store ta ti fd)
-                   (when dest (%emit-v4-box dest fd))
+                   (when (and dest (not unused)) (%emit-v4-box dest fd))
                    (free-fp-reg))
                  (free-temp-reg) (free-temp-reg)))
            (compile-call (car form) (cdr form) env dest)))
@@ -26198,6 +26349,30 @@
 ;;; the u8 vector, one 32-bit lane per element.  %F32-BITS-REF / -SET move
 ;;; the raw IEEE32 bits as a tagged fixnum; %f32-aref / %f32-aset (prelude)
 ;;; box and unbox them until floats are unboxed (docs/simd-plan.md, layer 1b).
+(defun %f32-make-array-count (form)
+  "N when FORM is (MAKE-ARRAY N :ELEMENT-TYPE 'SINGLE-FLOAT) with N a
+   non-negative integer literal and nothing else but :INITIAL-ELEMENT 0.0
+   (positive zero: the allocation's zero bits), else NIL."
+  (and (consp form) (consp (cdr form))
+       (let ((n (cadr form)) (keys (cddr form)) (et nil) (ok t))
+         (and (integerp n) (>= n 0) (< n 1000000)
+              (progn
+                (loop (when (or (not ok) (null keys)) (return))
+                  (if (and (consp keys) (consp (cdr keys)) (keywordp (car keys)))
+                      (let ((k (symbol-name (car keys))) (v (cadr keys)))
+                        (cond ((string= k "ELEMENT-TYPE")
+                               (setq et (and (consp v) (name-eq (car v) "QUOTE") (consp (cdr v))
+                                             (symbolp (cadr v)) (cadr v)
+                                             (string= (symbol-name (cadr v)) "SINGLE-FLOAT"))))
+                              ((string= k "INITIAL-ELEMENT")
+                               (let ((x (%fp-literal-value v)))
+                                 (unless (and x (eql x 0.0)) (setq ok nil))))
+                              (t (setq ok nil)))
+                        (setq keys (cddr keys)))
+                      (setq ok nil)))
+                (and ok et))
+              n))))
+
 (defun compile-alloc-f32 (count-form env dest)
   "Compile (%alloc-f32 N) — allocate a packed single-float vector of N lanes."
   (let ((cnt-reg (alloc-temp-reg)))
@@ -28733,6 +28908,9 @@
       (:fp-op2 5)
       (:fp-cmp 5)
       (:fp-toi 4)
+      (:fpd-scale 3)
+      (:fpd-li 10)
+      (:fp-li 10)
       (:fpd-add 4)
       (:fpd-sub 4)
       (:fpd-mul 4)
@@ -29093,6 +29271,9 @@
           (:fp-op2 (mvm-fp-op2 buf (second insn) (third insn) (fourth insn) (fifth insn)))
           (:fp-cmp (mvm-fp-cmp buf (second insn) (third insn) (fourth insn) (fifth insn)))
           (:fp-toi (mvm-fp-toi buf (second insn) (third insn) (fourth insn)))
+          (:fpd-scale (mvm-fpd-scale buf (second insn) (third insn)))
+          (:fpd-li (mvm-fpd-li buf (second insn) (third insn) (fourth insn)))
+          (:fp-li (mvm-fp-li buf (second insn) (third insn) (fourth insn)))
           (:fpd-add (mvm-fpd-add buf (second insn) (third insn) (fourth insn)))
           (:fpd-sub (mvm-fpd-sub buf (second insn) (third insn) (fourth insn)))
           (:fpd-mul (mvm-fpd-mul buf (second insn) (third insn) (fourth insn)))

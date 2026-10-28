@@ -145,4 +145,35 @@
          (list (mapcar (lambda (x) (* 2.0 x)) *vals*)
                (append (mapcar (lambda (x) (* 0.5 x)) (subseq *vals* 0 3)) (make-list (- *n* 3) :initial-element 0.0)))))
 
+;; 12. EXP of a single tree compiles inline (fpd-scale, literal loads): the
+;;     generic EXP's bits, edges included (0, -0, overflow to infinity,
+;;     subnormal and zero results, the clamps)
+(defun gexp (x) (exp x))
+(defun t12 (a o) (declare (type (simple-array single-float (*)) a o))
+  (dotimes (i (length a) o) (setf (aref o i) (exp (* (aref a i) 1.0)))))
+(let* ((xs (list 0.0 -0.0 1.0 -1.0 0.5 10.0 -10.0 88.72283 88.72284 -87.33655 -103.27893
+                 -103.97208 -104.0 99.99 100.0 100.5 -110.0 -110.5 1e-30 3.3 -7.77))
+       (a (fv xs)) (o (fv (make-list (length xs) :initial-element 0.0))))
+  ;; SBCL traps overflow where modus returns infinity: mask it there
+  (flet ((run12 () (t12 a o) (check "12 inline exp = generic exp" (coerce o 'list) (mapcar #'gexp xs))))
+    #+sbcl (sb-int:with-float-traps-masked (:overflow :underflow :inexact) (run12))
+    #-sbcl (run12)))
+
+;; 13. float literals in single and double trees (fp-li / fpd-li)
+(defun t13 (a) (declare (type (simple-array single-float (*)) a))
+  (let ((s 0d0)) (declare (type double-float s))
+    (dotimes (i (length a)) (setq s (+ (* s 0.5d0) (coerce (+ (* (aref a i) -2.5) 1.25e-3) 'double-float) -0d0 1d-300)))
+    s))
+(check "13 float literals" (t13 *a*)
+       (let ((s 0d0)) (dolist (x *vals* s) (setq s (+ (* s 0.5d0) (coerce (+ (* x -2.5) 1.25e-3) 'double-float) -0d0 1d-300)))))
+
+;; 14. (make-array N :element-type 'single-float [:initial-element 0.0]) inline
+(defun t14 ()
+  (let ((v (make-array 7 :element-type 'single-float :initial-element 0.0))
+        (w (make-array 3 :element-type 'single-float)))
+    (setf (aref v 6) 2.5)
+    (list (length v) (coerce v 'list) (length w) (aref w 2) (array-element-type v))))
+(check "14 inline f32 make-array" (t14)
+       (list 7 '(0.0 0.0 0.0 0.0 0.0 0.0 2.5) 3 0.0 'single-float))
+
 (format t "~%FP-PROBE ~a~%" (if (zerop *fails*) "ALL PASS" (format nil "~a FAILURES" *fails*)))

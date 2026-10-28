@@ -2937,6 +2937,7 @@
   (export (intern "JIT-EAGER" (find-package "MODUS")) (find-package "MODUS"))
   (export (intern "JIT-PRUNE" (find-package "MODUS")) (find-package "MODUS"))
   (export (intern "JIT-SOURCE" (find-package "MODUS")) (find-package "MODUS"))
+  (export (intern "MAKE-STATIC-VECTOR" (find-package "MODUS")) (find-package "MODUS"))
   (setq *package* (find-package "CL-USER"))
   ;; The runtime DEFPACKAGE macro.  It used to be installed only as a side
   ;; effect of SET-UP-PACKAGES (which also makes test packages A/B/Q), and

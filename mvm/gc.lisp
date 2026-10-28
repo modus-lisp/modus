@@ -745,7 +745,7 @@
 
 (defun %gc-leaf-subtag-p (subtag)
   "T if an object of SUBTAG has a RAW-DATA payload (no Lisp pointers) — the
-   to-space scan must NOT forward its slots.  Enumerated leaves: string #x10,
+   to-space scan must NOT forward its slots.  Enumerated leaves: string #x10 and #x31,
    u8-vector #x11, u64-vector #x14, sap #x16, and every float (NOT bignum
    #x30: a big bignum's slot 1 is its limb-array pointer)
    flavor (#x60 double / #x64 single / #x65 short / #x66 long; #x60 also =
@@ -754,6 +754,8 @@
    See compiler.lisp's float-subtag note: floats live at #x60/#x64..#x66 and
    #x61..#x63 are NON-float pointer-bearing objects, so they are NOT leaves."
   (if (= subtag #x10) t
+   ;; the wide string: character codes only (see translate-x64's leaf skip)
+   (if (= subtag #x31) t
    (if (= subtag #x11) t
    (if (= subtag #x13) t
    (if (= subtag #x15) t
@@ -768,7 +770,7 @@
         (if (= subtag #x64) t
          (if (= subtag #x65) t
           (if (= subtag #x66) t
-           nil)))))))))))))
+           nil))))))))))))))
 
 (defun %gc-clear-bitmap-range (range-start size)
   "Zero the object-start AND cons-kind bitmap bits for [RANGE-START,

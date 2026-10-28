@@ -8173,7 +8173,14 @@
         ;; left that pointer un-forwarded, and modus-sh --compile-uefi then read
         ;; a stale threshold and compiled 2^130 as a small bignum (the UEFI DDC
         ;; caught it).  Only pointer-free layouts may be skipped.
-        (dolist (st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x60 #x64 #x65 #x66))
+        ;; The wide string #x31 too: its payload is character codes, never a
+        ;; pointer, and +op-alloc-string+ deliberately leaves the +8 pad, the
+        ;; alignment tail and any unwritten characters as whatever the memory
+        ;; held.  Scanned, a stale word there kept its target alive and was
+        ;; carried with the string forever -- measured on a cortez corpus read,
+        ;; symbol NAMES ("TYPE-LIST" +8) held old READ-CHAR &rest lists, their
+        ;; string streams and whole file texts.
+        (dolist (st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66))
           (emit-cmp-reg-imm buf 'r8 st)
           (emit-jcc buf :e leaf))
         (emit-jmp buf scan-it)

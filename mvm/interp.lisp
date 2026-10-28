@@ -2523,6 +2523,46 @@
                        (%interp-fpd-cmp (= opcode #.+op-fpd-lt+)
                                         (svref fregs fa) (svref fregs fb)))
                  (setf pc npc3)))))
+          ;; ---- the FP-register ops a float tree was missing (reference arms):
+          ;; an FP slot holds a host single- or double-float.
+          (#.+op-fp-op1+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
+                 (let ((x (svref fregs fs)))
+                   (setf (svref fregs fd)
+                         (cond ((< sub 2) (abs x))                       ; fabs.s / fabs.d
+                               ((= sub 2) (coerce x 'double-float))      ; fcvt d<-s
+                               (t (coerce x 'single-float)))))           ; fcvt s<-d
+                 (setf pc npc3)))))
+          (#.+op-fp-op2+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (%ifetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (%ifetch-byte bc npc3)
+                   (let ((a (svref fregs fa)) (b (svref fregs fb)))
+                     (setf (svref fregs fd) (if (evenp sub)
+                                                (if (> b a) b a)        ; fmax
+                                                (if (< b a) b a))))     ; fmin
+                   (setf pc npc4))))))
+          (#.+op-fp-cmp+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (%ifetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (%ifetch-byte bc npc3)
+                   ;; through the same CALL as fpd-lt (see there)
+                   (setf (svref regs vd)
+                         (%interp-fpd-cmp (= sub 0) (svref fregs fa) (svref fregs fb)))
+                   (setf pc npc4))))))
+          (#.+op-fp-toi+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
+                 (let ((x (svref fregs fs)) (k (logand sub 3)))
+                   (setf (svref regs vd)
+                         (values (cond ((= k 0) (round x)) ((= k 1) (truncate x))
+                                       ((= k 2) (floor x)) (t (ceiling x))))))
+                 (setf pc npc3)))))
           (#.+op-fpd-itof+
            (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)

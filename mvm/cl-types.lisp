@@ -345,6 +345,14 @@
 ;;; halves), built with %MAKE-TYPED-FLOAT rather than read as literals.
 (defun %dbl (hi lo) (%make-typed-float hi lo 'double-float))
 
+;; 2^k for k in [-1022, 1023], the exact doubles %EXP-F scales by.
+(defvar *exp2-table* nil)
+(defun %exp2-table ()
+  (or *exp2-table*
+      (setq *exp2-table*
+            (let ((v (make-array 2046)))
+              (dotimes (i 2046 v) (setf (svref v i) (%dbl (ash (+ (- i 1022) 1023) 20) 0)))))))
+
 (defun %exp-f (x)
   "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
    exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
@@ -358,9 +366,11 @@
        (if (and (= (logand hi #x000FFFFF) 0) (= (%float-lo32 x) 0))
            (if (= (logand hi #x80000000) 0) x (%fl 0))       ; exp(+inf)=inf, exp(-inf)=0
            x))                                                ; NaN
-      ((%float-lt-p (%dbl #x40862E42 #xFEFA39EF) x)            ; > 709.78...: overflow
+      ((let ((xd x)) (declare (type double-float xd))
+         (< 709.782712893384d0 xd))                             ; > #x40862E42FEFA39EF: overflow
        (%dbl #x7FF00000 0))
-      ((%float-lt-p x (%dbl #xC0874910 #xD52D3051))            ; < -745.13...: underflow
+      ((let ((xd x)) (declare (type double-float xd))
+         (< xd -745.1332191019411d0))                           ; < #xC0874910D52D3051: underflow
        (%fl 0))
       (t
        ;; The arithmetic is unboxed double trees (declared DOUBLE-FLOAT locals and
@@ -374,17 +384,22 @@
        ;; ln2_hi #x3FE62E42FEE00000, ln2_lo #x3DEA39EF35793C76.
        (let* ((xd x)
               (tq (* xd 1.4426950408889634d0))                   ; x / ln2
-              (k (%float-to-int (if (%float-lt-p tq (%fl 0))
-                                    (%float-sub tq (%dbl #x3FE00000 0))
-                                    (%float-add tq (%dbl #x3FE00000 0)))))
-              (fk (%fl k))
-              (r (- (- xd (* fk 0.6931471803691238d0)) (* fk 1.9082149292705877d-10)))
+              ;; k = truncate(tq +- 0.5): round half away from zero, as before
+              (k (if (< tq 0d0)
+                     (the (signed-byte 32) (truncate (- tq 0.5d0)))
+                     (the (signed-byte 32) (truncate (+ tq 0.5d0)))))
+              (r (- (- xd (* (float k 1d0) 0.6931471803691238d0))
+                    (* (float k 1d0) 1.9082149292705877d-10)))
               ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
               (acc (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ r 13d0) 1d0) r) 12d0) 1d0) r) 11d0) 1d0) r) 10d0) 1d0) r) 9d0) 1d0) r) 8d0) 1d0) r) 7d0) 1d0) r) 6d0) 1d0) r) 5d0) 1d0) r) 4d0) 1d0) r) 3d0) 1d0) r) 2d0) 1d0) r) 1d0) 1d0)))
-         (declare (type double-float xd tq fk r acc))
-         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends
+         (declare (type double-float xd tq r acc) (type (signed-byte 32) k))
+         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends.
+         ;; The normal-range 2^k are the same doubles as before, read from a table
+         ;; instead of built from their bits on every call.
          (cond ((and (>= k -1022) (<= k 1023))
-                (%float-mul acc (%dbl (ash (+ k 1023) 20) 0)))
+                (let ((p (svref (%exp2-table) (+ k 1022))))
+                  (declare (type double-float p))
+                  (* acc p)))
                ((> k 1023)
                 (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
                             (%dbl (ash (+ (- k 1023) 1023) 20) 0)))

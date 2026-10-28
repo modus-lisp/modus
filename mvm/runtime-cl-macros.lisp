@@ -321,7 +321,11 @@
     ;; two standard functions, upstream MACRO-FUNCTION.5.)
 
     "(defmacro locally (&rest body) (cons 'progn body))"
-    "(defmacro the (type form) form)"
+    ;; THE is NOT a macro here: a (defmacro the (type form) form) used to drop
+    ;; the type before the compiler saw it, so every THE in runtime-compiled
+    ;; code was thrown away -- (the (signed-byte 8) ...) gave no width, and a
+    ;; (the fixnum ...) index stayed overflow-checked.  THE is a special
+    ;; operator (CLHS); the compiler's own THE clause compiles it.
     "(defmacro declare (&rest decls) nil)"
     ;; PROCLAIM is a real function (cl-eval.lisp): it validates the spec
     ;; and records INLINE / NOTINLINE.  A macro here shadowed it with NIL.

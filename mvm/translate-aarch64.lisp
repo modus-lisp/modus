@@ -5731,6 +5731,39 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ==== the FP-register ops a float tree was missing: one instruction each,
+          ;; encodings assembler-checked (as -arch arm64; objdump -d).
+          ;; ---- FP-OP1 Fd, Fs, sub ----  FABS Sd / FABS Dd / FCVT Dd,Sn / FCVT Sd,Dn
+          ((= op +op-fp-op1+)
+           (let* ((fd (fpp (vr 0))) (fs (fpp (vr 1))) (sub (vr 2))
+                  (base (case sub (0 #x1E20C000) (1 #x1E60C000) (2 #x1E22C000) (t #x1E624000))))
+             (a64-emit buf (logior base (ash fs 5) fd))))
+          ;; ---- FP-OP2 Fd, Fa, Fb, sub ----  FMAX/FMIN, S then D
+          ((= op +op-fp-op2+)
+           (let* ((fd (fpp (vr 0))) (fa (fpp (vr 1))) (fb (fpp (vr 2))) (sub (vr 3))
+                  (base (case sub (0 #x1E204800) (1 #x1E205800) (2 #x1E604800) (t #x1E605800))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+          ;; ---- FP-CMP Vd, Fa, Fb, sub ----  FCMP Sa, Sb; CSET x9, MI (lt) / LS (le); tag
+          ((= op +op-fp-cmp+)
+           (let* ((vd (vr 0)) (fa (fpp (vr 1))) (fb (fpp (vr 2))) (sub (vr 3))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-emit buf (logior #x1E202000 (ash fb 16) (ash fa 5)))      ; fcmp Sa, Sb
+             (a64-emit buf (logior #x9A9F07E0 (ash (if (= sub 0) 5 8) 12) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+          ;; ---- FP-TOI Vd, Fs, sub ----  FCVT{NS,ZS,MS,PS} x9, S/D; tag
+          ((= op +op-fp-toi+)
+           (let* ((vd (vr 0)) (fs (fpp (vr 1))) (sub (vr 2))
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (base (aref #(#x9E200000 #x9E380000 #x9E300000 #x9E280000
+                                #x9E600000 #x9E780000 #x9E700000 #x9E680000)
+                              sub)))
+             (a64-emit buf (logior base (ash fs 5) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
           ;; ---- FPD-ITOF Fd, Vsrc ----  ASR x9, src, 1 ; SCVTF Dd, x9 (no box)
           ((= op +op-fpd-itof+)
            (let* ((fd (fpp (vr 0)))

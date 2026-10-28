@@ -753,7 +753,13 @@
              (%sys-close fd)
              ;; Mark as closed by setting fd to -1
              (set-car (%stream-data stream) -1)
-             (%fs-set-closed stream t))))
+             (%fs-set-closed stream t)
+             ;; ...and drop its 4 KB buffer (32 KB at 8 bytes a character).  OPEN's
+             ;; *%FILE-STREAM-PATHS* keeps up to 256 closed streams reachable so
+             ;; PATHNAME of one still answers; their buffers were ~8 MB of live
+             ;; heap that nothing could ever read again.
+             (%fs-set-blen stream 0)
+             (set-car (cdr (cddr (%stream-data stream))) (%make-string-array 0)))))
         (t
          (%mark-stream-closed stream)))))
   t)

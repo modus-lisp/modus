@@ -523,7 +523,7 @@ test/hosted-rungs/h01-gc-survive.lisp`) churns 1 GB past a live chain, array and
 the first (frontier-only) cut failed it after 8 collections.  Hosted-only on
 purpose: bare targets have no collector, so it cannot be an arch-ladder rung.
 
-### Hosted 68k has a collector, and its heap is sized AT STARTUP
+### Hosted 68k and PowerPC have collectors, and their heaps are sized AT STARTUP
 
 `m68k-emit-gc-collector` in `translate-68k.lisp` is arm32's Cheney collector
 (kind byte per 16-byte granule, objects up / conses down, all registers +
@@ -544,7 +544,30 @@ Clamped to [1 MB, 512 MB] (the mapping must stay below 2^30), rounded to
 than the heap exits **3** with `modus: heap exhausted (raise
 --dynamic-space-size)` on stderr, not a SIGILL.  Before this, `:gc-check` was
 `ILLEGAL`: a hosted 68k process could allocate 128 MB in its lifetime, total.
-**ppc32/ppc64 are still like that** (`tw 31,0,0`) and are the next port.
+
+**PowerPC, both widths** (`ppc-emit-gc-collector` in `translate-ppc.lisp`,
+stub in `boot-linux-ppc.lisp`) is the same collector and the same startup
+sizing, one routine for ppc32 and ppc64 (width from `ppc-word-size`), at the
+same `#x10000F90`/`#x10000F98` words; the Cheney block now uses the
+`+GC-OFF-*+` 8-byte stride at both widths (ppc32 stores 32-bit values there).
+Its `:gc-check` was `tw 31,0,0`, the same lifetime cap.  `:gc-check` reaches
+the collector with `BL`: LR is free in a body because every prologue saves it.
+Measured: h01 42 at 128/8/1 MB on both widths; 16 collections at the default
+size, 1560 (ppc32) / 1724 (ppc64) at 2 MB; the 200,000-cons probe survives at
+16 MB and exits 3 at 8 MB.  Hosted ladder 35/35 -> 35/35 + h01 on both;
+bare ppc32/ppc64 arch-ladder identical before and after (70/70 with the gate fix).
+
+**PowerPC bugs found on the way:**
+- **The MD-form encoder stored the 6-bit mask field unrotated**: it is
+  `mb[0:4] || mb[5]`.  objdump: `rldicl r3,r4,60,4` assembled as `...,60,2`,
+  and `ppc-emit-li`'s 64-bit `rldicr ...,32,31` as `...,32,47`, so every
+  ppc64 immediate wider than 32 bits was built wrong.
+- **`alloc-array`/`alloc-u8`/`alloc-string` rounded with `andi. #xFFF0`**,
+  which zero-extends its immediate: an object of 64 KB or more bumped the
+  allocator by its size mod 64 KB, and the next allocations landed inside it.
+- **The same private header layout as 68k** (`(subtag << 8) | 9` written,
+  byte 1 read as the subtag) -- now `(size << 8) | subtag`.
+- **No function-entry alignment at all** -- now 16, as everywhere else.
 
 Verified: `h01-gc-survive` answers 42 at the default size and at 8/2/1 MB
 (16 collections at 128 MB, ~1500 at 2 MB); 200,000 live conses (3.2 MB)

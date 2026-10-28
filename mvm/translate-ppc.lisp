@@ -367,7 +367,11 @@
             (ash (logand rs #x1F) 21)
             (ash (logand ra #x1F) 16)
             (ash sh-lo 11)
-            (ash (logand mb #x3F) 5)    ; 6-bit mask begin
+            ;; The 6-bit mask field is stored ROTATED: mb[0:4] then mb[5]
+            ;; (IBM numbering), i.e. ((mb & 31) << 1) | (mb >> 5).  It was
+            ;; stored straight, so rldicl r3,r4,60,4 assembled as ...,60,2 and
+            ;; ppc-emit-li's 64-bit rldicr ...,32,31 as ...,32,47 (objdump).
+            (ash (logior (ash (logand mb #x1F) 1) (logand (ash mb -5) 1)) 5)
             (ash (logand xo #x7) 2)
             (ash sh-hi 1)
             (logand rc 1))))
@@ -984,6 +988,7 @@
   "Box the SPE double in GPR RS; TAGGED pointer to OUT.  As ppc-float-box."
   (let* ((ws (ppc-word-size))
          (bytes (logand (+ (* 5 ws) 15) (lognot 15))))
+    (ppc-emit-alloc-mark buf 1)          ; FIRST: clobbers r11/r12
     (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
     (ppc-emit-evx buf #x321 rs +ppc-r1+ 0)                  ; evstdd rs,0(r1)
     (ppc-emit-li buf +ppc-r0+ (logior #x60 (ash 4 8)))
@@ -1028,6 +1033,7 @@
    the heap pointer stays 16-aligned for the tag scheme."
   (let* ((ws (ppc-word-size))
          (bytes (logand (+ (* 5 ws) 15) (lognot 15))))
+    (ppc-emit-alloc-mark buf 1)          ; FIRST: clobbers r11/r12
     (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ -16)
     (ppc-emit-stfd buf fs +ppc-r1+ 0)
     (ppc-emit-li buf +ppc-r0+ (logior #x60 (ash 4 8)))
@@ -1958,6 +1964,7 @@
                (ppc-store-vreg buf vd pd))))))
 
       (#.+op-cons+
+       (ppc-emit-alloc-mark buf 2)   ; FIRST: clobbers r11/r12, before any operand loads
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
@@ -2069,6 +2076,7 @@
 
       ;;; --- Object Operations ---
       (#.+op-alloc-obj+
+       (ppc-emit-alloc-mark buf 1)   ; FIRST: clobbers r11/r12, before any operand loads
        (let ((vd (first operands))
              (size (second operands))
              (subtag (third operands)))
@@ -2076,8 +2084,10 @@
                (ws (ppc-word-size)))
            ;; Align to 16 bytes to keep cons alloc pointer aligned
           (let ((total-bytes (logand (+ (* (1+ size) ws) 15) (lognot 15))))
-             ;; Build header: (subtag << 8) | +tag-object+
-             (ppc-emit-addi buf +ppc-r0+ 0 (logior (ash subtag 8) +tag-object+))
+             ;; Header: (size << 8) | subtag, the layout every other 32-bit
+             ;; allocation site and port writes and the collector sizes
+             ;; objects by.  This wrote (subtag << 8) | 9.
+             (ppc-emit-li buf +ppc-r0+ (logior (ash size 8) subtag))
              (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
              (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
              ;; ADDI's immediate is 16 bits SIGNED; the compiler inlines constant
@@ -2160,7 +2170,10 @@
              ;; why the tag-shift below may reuse scratch2.
              (ppc-emit-addi buf +ppc-scratch2+ ps (logand (- +tag-object+) #xFFFF))
              (ppc-emit-load-word buf pd +ppc-scratch2+ 0)   ; load header
-             (ppc-emit-shift-right-arith-imm buf pd pd 8)  ; shift right 8
+             ;; The subtag is the header's LOW byte: (count << 8) | subtag.
+             ;; This shifted right 8 first, to match an ALLOC-OBJ that wrote
+             ;; (subtag << 8) | 9 -- so every array and string reported the
+             ;; low byte of its LENGTH as its subtag.
              (ppc-emit-andi-dot buf pd pd #xFF)             ; mask 8 bits
              ;; Tag as fixnum
              (ppc-emit-addi buf +ppc-scratch2+ 0 1)
@@ -2387,6 +2400,7 @@
 
       ;;; --- GC / Allocation ---
       (#.+op-alloc-cons+
+       (ppc-emit-alloc-mark buf 2)   ; FIRST: clobbers r11/r12, before any operand loads
        (let ((vd (first operands)))
          (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+))
                (ws (ppc-word-size)))
@@ -2405,13 +2419,8 @@
        ;; the reference back ends exactly.  What it replaces is worse than an
        ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
        ;; make-array emits :gc-check-n, so no array could be allocated at all.
-       (let ((gc-label (mvm-make-label))
-             (ok-label (mvm-make-label)))
-         (ppc-emit-cmpl-word buf +ppc-r19+ +ppc-r20+)
-         (ppc-emit-blt buf ok-label)
-         (ppc-emit-label buf gc-label)
-         (ppc-emit-tw buf 31 0 0)
-         (ppc-emit-label buf ok-label)))
+       ;; Hosted, a full heap calls the collector; bare, it is still a trap.
+       (ppc-emit-gc-check buf))
 
       (#.+op-write-barrier+
        (let ((vobj (first operands)))
@@ -2515,6 +2524,7 @@
       ;; The index arrives TAGGED (2k), so k*ws == tagged*(ws/2) and the
       ;; element sits at obj + tagged*(ws/2) + ws - 9.
       (#.+op-alloc-array+
+       (ppc-emit-alloc-mark buf 1)   ; FIRST: clobbers r11/r12, before any operand loads
        ;; (alloc-array Vd Vcount) — Vcount is UNTAGGED (the compiler SAR'd it).
        (let* ((vd (first operands))
               (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
@@ -2530,7 +2540,7 @@
          (ppc-emit-addi buf +ppc-scratch2+ 0 (if (= ws 8) 3 2))
          (ppc-emit-shift-left buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)
          (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
-         (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ #xFFF0)
+         (ppc-emit-clear-low4 buf +ppc-r0+ +ppc-r0+)   ; NOT andi. #xFFF0, which drops bits 16+
          ;; result = VA | 9, then bump VA (order matters: VA is still the base)
          (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
          (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
@@ -2616,6 +2626,7 @@
       ;; TAGGED: :alloc-u8 untags its count here, :alloc-string's has already
       ;; been SAR'd by the compiler.
       (#.+op-alloc-u8+
+       (ppc-emit-alloc-mark buf 1)   ; FIRST: clobbers r11/r12, before any operand loads
        (let* ((vd (first operands))
               (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
               (ws (ppc-word-size))
@@ -2628,13 +2639,14 @@
          ;; bytes = align16(N + ws)
          (ppc-emit-addi buf +ppc-r0+ +ppc-scratch2+ ws)
          (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
-         (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ #xFFF0)
+         (ppc-emit-clear-low4 buf +ppc-r0+ +ppc-r0+)   ; NOT andi. #xFFF0, which drops bits 16+
          (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
          (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 
       (#.+op-alloc-string+
+       (ppc-emit-alloc-mark buf 1)   ; FIRST: clobbers r11/r12, before any operand loads
        ;; One character CODE per WORD.
        (let* ((vd (first operands))
               (pc (vreg-or-scratch (second operands) +ppc-scratch1+))
@@ -2648,7 +2660,7 @@
          (ppc-emit-addi buf +ppc-scratch2+ 0 (if (= ws 8) 3 2))
          (ppc-emit-shift-left buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)
          (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
-         (ppc-emit-andi-dot buf +ppc-r0+ +ppc-r0+ #xFFF0)
+         (ppc-emit-clear-low4 buf +ppc-r0+ +ppc-r0+)   ; NOT andi. #xFFF0, which drops bits 16+
          (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
          (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
          (unless (ppc-vreg-phys vd)
@@ -2688,6 +2700,7 @@
       ;;; --- System area pointers ---
       ;; One-slot object, subtag #x16: header (1<<8)|#x16 then the raw address.
       (#.+op-sap-new+
+       (ppc-emit-alloc-mark buf 1)   ; FIRST: clobbers r11/r12, before any operand loads
        (let* ((vd (first operands))
               (pa (vreg-or-scratch (second operands) +ppc-scratch1+))
               (ws (ppc-word-size))
@@ -2753,6 +2766,380 @@
        (ppc-emit-tw buf 31 0 0)))))
 
 ;;; ============================================================
+;;; Hosted collector (both widths)
+;;; ============================================================
+;;;
+;;; The port of translate-68k's M68K-EMIT-GC-COLLECTOR (itself arm32's, itself
+;;; RISC-V's), one routine for ppc32 and ppc64 -- every width-dependent value
+;;; comes from PPC-WORD-SIZE.  NOTHING ABOUT THE HEAP'S SIZE IS A
+;;; TRANSLATE-TIME CONSTANT: boot-linux-ppc.lisp's stub chooses it when the
+;;; process starts and leaves the geometry in memory:
+;;;
+;;;   #x10000040 + 0x00  from_start      + 0x08  to_start    + 0x10  space_size
+;;;              + 0x18  stack_base      + 0x20  gc_count
+;;;   +PPC-GC-KIND-BIAS-ADDR+  K, where the kind byte of address A is K + (A >> 4)
+;;;   +PPC-GC-MARGIN-ADDR+     bytes kept free below VL after a collection
+;;;
+;;; mvm/compiler.lisp's +GC-OFF-*+ offsets at BOTH widths (ppc32 stores a
+;;; 32-bit word at each), so the block reads the way every other port's does.
+;;;
+;;; Allocation marks are a KIND BYTE per 16-byte granule (1 = object start,
+;;; 2 = cons).  A conservative root must name an address in from-space whose
+;;; kind byte matches its tag, or it is left alone.  ROOTS: every register (the
+;;; entry saves r0 and r2..r31 into its own frame and the stack scan starts at
+;;; that frame), the stack up to stack_base, and the whole low block
+;;; [#x10000000, first semispace).  TO-SPACE IS SPLIT BY SHAPE: objects up from
+;;; to_start, conses down from to_end, so the scan knows what it is looking at
+;;; and skips leaf payloads.  A full heap prints a message and exits 3.
+;;;
+;;; Registers inside the collector:  r14 from_start  r15 from_end  r16 K
+;;; r19 object free (up)  r20 cons low (down) -- the mutator's VA/VL, so the
+;;; new frontier is simply left in them -- r22/r23 cursors, r24/r25 bounds.
+;;; SCAN (r3 = slot address) uses r4..r12 only, advances r19/r20 as it copies,
+;;; and returns with BLR (it calls nothing).  :gc-check reaches the collector
+;;; with BL; LR is free there because every prologue has already saved it.
+
+(defconstant +ppc-r22+ 22)
+(defconstant +ppc-r23+ 23)
+(defconstant +ppc-r24+ 24)
+(defconstant +ppc-r25+ 25)
+(defconstant +ppc-gc-meta+ #x10000040)
+(defconstant +ppc-gc-kind-bias-addr+ #x10000F90
+  "K for the allocation-mark arithmetic, written by the boot stub.  16-aligned,
+   so although it sits inside the low-block root range it can never read as a
+   tagged root.  Same address 68k uses.")
+(defconstant +ppc-gc-margin-addr+ #x10000F98
+  "The overshoot margin the stub chose for this heap.  16-aligned, as above.")
+
+(defvar *ppc-gc-label* nil
+  "Label of the hosted collector while translating a hosted module, else NIL
+   (then :gc-check is the old TW trap and no allocation marks are emitted).")
+
+(defun ppc-log2-ws () (if *ppc-64-bit* 3 2))
+
+(defun ppc-emit-srli (buf ra rs n)
+  "RA = RS >> N, logical.  rldicl ra,rs,64-n,n / rlwinm ra,rs,32-n,n,31."
+  (if *ppc-64-bit*
+      (ppc-emit-rldicl buf ra rs (- 64 n) n)
+      (ppc-emit-rlwinm buf ra rs (- 32 n) n 31)))
+
+(defun ppc-emit-slli (buf ra rs n)
+  "RA = RS << N.  rldicr ra,rs,n,63-n / rlwinm ra,rs,n,0,31-n."
+  (if *ppc-64-bit*
+      (ppc-emit-word buf (ppc-md-form 30 rs ra n (- 63 n) 1))
+      (ppc-emit-rlwinm buf ra rs n 0 (- 31 n))))
+
+(defun ppc-emit-clear-low4 (buf ra rs)
+  "RA = RS & ~15 at the full register width.  NOT `andi. ra,rs,#xFFF0': ANDI.
+   zero-extends its immediate, so it also clears every bit above 15."
+  (if *ppc-64-bit*
+      (ppc-emit-word buf (ppc-md-form 30 rs ra 0 59 1))   ; rldicr ra,rs,0,59
+      (ppc-emit-rlwinm buf ra rs 0 0 27)))
+
+(defun ppc-emit-alloc-mark (buf kind)
+  "Mark the allocation about to start at VA (r19): KIND 1 = object, 2 = cons.
+   Hosted with a collector only.  Clobbers r11/r12, so it is emitted FIRST in
+   every allocation arm, before either can hold an operand."
+  (when *ppc-gc-label*
+    (ppc-emit-li buf +ppc-r12+ +ppc-gc-kind-bias-addr+)
+    (ppc-emit-load-word buf +ppc-r12+ +ppc-r12+ 0)
+    (ppc-emit-srli buf +ppc-r11+ +ppc-r19+ 4)
+    (ppc-emit-add buf +ppc-r12+ +ppc-r12+ +ppc-r11+)
+    (ppc-emit-li buf +ppc-r11+ kind)
+    (ppc-emit-stb buf +ppc-r11+ +ppc-r12+ 0)))
+
+(defun ppc-emit-gc-check (buf)
+  "Room while VA (r19) < VL (r20); else BL the collector (hosted) or trap."
+  (let ((ok-label (mvm-make-label)))
+    (ppc-emit-cmpl-word buf +ppc-r19+ +ppc-r20+)
+    (ppc-emit-blt buf ok-label)
+    (if *ppc-gc-label*
+        (ppc-emit-bl buf *ppc-gc-label*)
+        (ppc-emit-tw buf 31 0 0))
+    (ppc-emit-label buf ok-label)))
+
+(defun ppc-emit-die (buf message status)
+  "write(2, MESSAGE) then exit(STATUS).  The text is stored on the stack a word
+   at a time, so it needs no data section.  Does not return."
+  (let* ((bytes (map 'list #'char-code message))
+         (padded (append bytes (make-list (mod (- (length bytes)) 4) :initial-element 0)))
+         (room (logand (+ (length padded) 31) (lognot 15))))
+    (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ (- room))
+    (loop for i from 0 below (length padded) by 4
+          do (ppc-emit-li buf +ppc-r4+ (logior (ash (nth i padded) 24)
+                                               (ash (nth (+ i 1) padded) 16)
+                                               (ash (nth (+ i 2) padded) 8)
+                                               (nth (+ i 3) padded)))
+             (ppc-emit-stw buf +ppc-r4+ +ppc-r1+ (+ 16 i)))
+    (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-write+)
+    (ppc-emit-li buf +ppc-r3+ 2)
+    (ppc-emit-addi buf +ppc-r4+ +ppc-r1+ 16)
+    (ppc-emit-li buf +ppc-r5+ (length bytes))
+    (ppc-emit-sc buf)
+    (ppc-emit-li buf +ppc-r0+ +ppc-linux-sys-exit+)
+    (ppc-emit-li buf +ppc-r3+ status)
+    (ppc-emit-sc buf)))
+
+(defun ppc-emit-kind-addr (buf dst addr)
+  "DST = the kind-byte address of the granule at ADDR; K is in r16."
+  (ppc-emit-srli buf dst addr 4)
+  (ppc-emit-add buf dst dst +ppc-r16+))
+
+(defun ppc-emit-object-size (buf dst hdr tmp)
+  "DST = the byte size of the object whose header word is HDR, aligned to 16.
+   A u8 vector (#x11) is its byte count after a one-word header; everything
+   else is (count + 1) words.  Mirrors every PPC allocation site.  Clobbers TMP."
+  (let ((words (mvm-make-label)) (al (mvm-make-label)))
+    (ppc-emit-andi-dot buf tmp hdr #xFF)
+    (ppc-emit-cmpi-word buf tmp +subtag-u8-vector+)
+    (ppc-emit-bne buf words)
+    (ppc-emit-srli buf dst hdr 8)
+    (ppc-emit-addi buf dst dst (ppc-word-size))
+    (ppc-emit-b buf al)
+    (ppc-emit-label buf words)
+    (ppc-emit-srli buf dst hdr 8)
+    (ppc-emit-addi buf dst dst 1)
+    (ppc-emit-slli buf dst dst (ppc-log2-ws))
+    (ppc-emit-label buf al)
+    (ppc-emit-addi buf dst dst 15)
+    (ppc-emit-clear-low4 buf dst dst)))
+
+(defparameter *ppc-gc-leaf-subtags* '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66)
+  "Objects whose payload holds no pointers: copied, never scanned.")
+
+(defun ppc-gc-frame-size ()
+  "Back chain + LR + 32 register slots, rounded to 16."
+  (logand (+ (* 34 (ppc-word-size)) 15) (lognot 15)))
+
+(defun ppc-gc-reg-slot (r) (* (+ 2 r) (ppc-word-size)))
+
+(defun ppc-emit-gc-collector (buf)
+  "Emit the hosted collector at *PPC-GC-LABEL*.  Entered by BL from :gc-check;
+   every register is preserved except the new VA/VL it installs."
+  (let* ((ws (ppc-word-size))
+         (fs (ppc-gc-frame-size))
+         (scan (mvm-make-label))
+         (saved (remove +ppc-r1+ (loop for r from 0 to 31 collect r)))
+         (restored (set-difference saved (list +ppc-r19+ +ppc-r20+))))
+    (flet ((lbl () (mvm-make-label))
+           (here (l) (ppc-emit-label buf l))
+           (root-range ()
+             ;; for (r22 = r22; r22 < r23; r22 += ws) scan(r22)
+             (let ((top (mvm-make-label)) (out (mvm-make-label)))
+               (ppc-emit-label buf top)
+               (ppc-emit-cmpl-word buf +ppc-r22+ +ppc-r23+)
+               (ppc-emit-bge buf out)
+               (ppc-emit-mr buf +ppc-r3+ +ppc-r22+)
+               (ppc-emit-bl buf scan)
+               (ppc-emit-addi buf +ppc-r22+ +ppc-r22+ ws)
+               (ppc-emit-b buf top)
+               (ppc-emit-label buf out)))
+           (meta (reg) (ppc-emit-li buf reg +ppc-gc-meta+)))
+      (here *ppc-gc-label*)
+      ;; ---- frame: back chain, LR, every register but r1 ----
+      (if *ppc-64-bit*
+          (ppc-emit-word buf (ppc-ds-form 62 +ppc-r1+ +ppc-r1+ (logand (- fs) #xFFFC) 1))
+          (ppc-emit-stwu buf +ppc-r1+ +ppc-r1+ (- fs)))
+      (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ (ppc-gc-reg-slot 0))
+      (ppc-emit-mflr buf +ppc-r0+)
+      (ppc-emit-store-word buf +ppc-r0+ +ppc-r1+ ws)
+      (dolist (r (remove +ppc-r0+ saved))
+        (ppc-emit-store-word buf r +ppc-r1+ (ppc-gc-reg-slot r)))
+      ;; ---- geometry, all of it read from memory ----
+      (meta +ppc-r24+)
+      (ppc-emit-load-word buf +ppc-r14+ +ppc-r24+ #x00)          ; from_start
+      (ppc-emit-load-word buf +ppc-r12+ +ppc-r24+ #x10)          ; space_size
+      (ppc-emit-add buf +ppc-r15+ +ppc-r14+ +ppc-r12+)           ; from_end
+      (ppc-emit-load-word buf +ppc-r19+ +ppc-r24+ #x08)          ; object free = to_start
+      (ppc-emit-add buf +ppc-r20+ +ppc-r19+ +ppc-r12+)           ; cons low = to_end
+      (ppc-emit-li buf +ppc-r16+ +ppc-gc-kind-bias-addr+)
+      (ppc-emit-load-word buf +ppc-r16+ +ppc-r16+ 0)             ; K
+      ;; ---- roots: the stack from this frame, then the low block ----
+      (ppc-emit-mr buf +ppc-r22+ +ppc-r1+)
+      (ppc-emit-load-word buf +ppc-r23+ +ppc-r24+ #x18)          ; stack_base
+      (root-range)
+      (ppc-emit-li buf +ppc-r22+ #x10000000)
+      ;; the low block ends where the FIRST semispace starts: min(from, to)
+      (let ((have (lbl)))
+        (ppc-emit-mr buf +ppc-r23+ +ppc-r14+)
+        (ppc-emit-cmpl-word buf +ppc-r19+ +ppc-r23+)
+        (ppc-emit-bge buf have)
+        (ppc-emit-mr buf +ppc-r23+ +ppc-r19+)
+        (here have))
+      (root-range)
+      ;; ---- Cheney: r22 = object scan (up), r23 = cons scan (down) from to_end
+      (meta +ppc-r24+)
+      (ppc-emit-load-word buf +ppc-r22+ +ppc-r24+ #x08)
+      (ppc-emit-load-word buf +ppc-r12+ +ppc-r24+ #x10)
+      (ppc-emit-add buf +ppc-r23+ +ppc-r22+ +ppc-r12+)
+      (let ((ch (lbl)) (obj (lbl)) (cons (lbl)) (cdone (lbl))
+            (leaf (lbl)) (sl (lbl)) (tst-cons (lbl)))
+        (here ch)
+        (ppc-emit-cmpl-word buf +ppc-r22+ +ppc-r19+)
+        (ppc-emit-bge buf tst-cons)
+        (ppc-emit-b buf obj)
+        (here tst-cons)
+        (ppc-emit-cmpl-word buf +ppc-r20+ +ppc-r23+)
+        (ppc-emit-blt buf cons)
+        (ppc-emit-b buf cdone)
+        ;; -- one object at r22 --
+        (here obj)
+        (ppc-emit-load-word buf +ppc-r4+ +ppc-r22+ 0)            ; header
+        (ppc-emit-object-size buf +ppc-r5+ +ppc-r4+ +ppc-r6+)
+        (ppc-emit-add buf +ppc-r25+ +ppc-r22+ +ppc-r5+)          ; next
+        (ppc-emit-andi-dot buf +ppc-r6+ +ppc-r4+ #xFF)
+        (dolist (st *ppc-gc-leaf-subtags*)
+          (ppc-emit-cmpi-word buf +ppc-r6+ st)
+          (ppc-emit-beq buf leaf))
+        (ppc-emit-srli buf +ppc-r7+ +ppc-r4+ 8)                  ; count
+        (ppc-emit-slli buf +ppc-r7+ +ppc-r7+ (ppc-log2-ws))
+        (ppc-emit-add buf +ppc-r7+ +ppc-r7+ +ppc-r22+)
+        (ppc-emit-addi buf +ppc-r24+ +ppc-r7+ ws)                ; slot end
+        (ppc-emit-addi buf +ppc-r22+ +ppc-r22+ ws)
+        (here sl)
+        (ppc-emit-cmpl-word buf +ppc-r22+ +ppc-r24+)
+        (ppc-emit-bge buf leaf)
+        (ppc-emit-mr buf +ppc-r3+ +ppc-r22+)
+        (ppc-emit-bl buf scan)
+        (ppc-emit-addi buf +ppc-r22+ +ppc-r22+ ws)
+        (ppc-emit-b buf sl)
+        (here leaf)
+        (ppc-emit-mr buf +ppc-r22+ +ppc-r25+)
+        (ppc-emit-b buf ch)
+        ;; -- one cons below r23 --
+        (here cons)
+        (ppc-emit-addi buf +ppc-r23+ +ppc-r23+ -16)
+        (ppc-emit-mr buf +ppc-r3+ +ppc-r23+)
+        (ppc-emit-bl buf scan)
+        (ppc-emit-addi buf +ppc-r3+ +ppc-r23+ ws)
+        (ppc-emit-bl buf scan)
+        (ppc-emit-b buf ch)
+        (here cdone))
+      ;; ---- clear the kind bytes of the evacuated semispace [r14, r15) ----
+      (let ((zl (lbl)) (zd (lbl)))
+        (ppc-emit-kind-addr buf +ppc-r7+ +ppc-r14+)
+        (ppc-emit-kind-addr buf +ppc-r8+ +ppc-r15+)
+        (ppc-emit-li buf +ppc-r9+ 0)
+        (here zl)
+        (ppc-emit-cmpl-word buf +ppc-r7+ +ppc-r8+)
+        (ppc-emit-bge buf zd)
+        (ppc-emit-stw buf +ppc-r9+ +ppc-r7+ 0)
+        (ppc-emit-addi buf +ppc-r7+ +ppc-r7+ 4)
+        (ppc-emit-b buf zl)
+        (here zd))
+      ;; ---- swap the semispaces, count the collection ----
+      (meta +ppc-r24+)
+      (ppc-emit-load-word buf +ppc-r7+ +ppc-r24+ #x08)
+      (ppc-emit-store-word buf +ppc-r7+ +ppc-r24+ #x00)          ; from = old to
+      (ppc-emit-store-word buf +ppc-r14+ +ppc-r24+ #x08)         ; to = old from
+      (ppc-emit-load-word buf +ppc-r7+ +ppc-r24+ #x20)
+      (ppc-emit-addi buf +ppc-r7+ +ppc-r7+ 1)
+      (ppc-emit-store-word buf +ppc-r7+ +ppc-r24+ #x20)
+      ;; ---- VA = object free (already r19), VL = cons low - margin ----
+      (let ((exhausted (lbl)))
+        (ppc-emit-li buf +ppc-r7+ +ppc-gc-margin-addr+)
+        (ppc-emit-load-word buf +ppc-r7+ +ppc-r7+ 0)
+        (ppc-emit-subf buf +ppc-r20+ +ppc-r7+ +ppc-r20+)         ; r20 -= margin
+        (ppc-emit-cmpl-word buf +ppc-r19+ +ppc-r20+)
+        (ppc-emit-bge buf exhausted)
+        (ppc-emit-load-word buf +ppc-r0+ +ppc-r1+ ws)
+        (ppc-emit-mtlr buf +ppc-r0+)
+        (dolist (r restored)
+          (ppc-emit-load-word buf r +ppc-r1+ (ppc-gc-reg-slot r)))
+        (ppc-emit-addi buf +ppc-r1+ +ppc-r1+ fs)
+        (ppc-emit-blr buf)
+        (here exhausted)
+        (ppc-emit-die buf (format nil "modus: heap exhausted (raise --dynamic-space-size)~%") 3))
+      ;; ================= SCAN (r3 = slot address) =================
+      (let ((ret (lbl)) (isptr (lbl)) (kobj (lbl)) (kok (lbl)) (notfwd (lbl))
+            (obj (lbl)) (ovf (lbl)) (cl (lbl)))
+        (here scan)
+        (ppc-emit-load-word buf +ppc-r4+ +ppc-r3+ 0)
+        (ppc-emit-andi-dot buf +ppc-r5+ +ppc-r4+ 15)              ; tag
+        (ppc-emit-cmpi-word buf +ppc-r5+ 1)
+        (ppc-emit-beq buf isptr)
+        (ppc-emit-cmpi-word buf +ppc-r5+ 9)
+        (ppc-emit-bne buf ret)
+        (here isptr)
+        (ppc-emit-clear-low4 buf +ppc-r6+ +ppc-r4+)               ; address
+        (ppc-emit-cmpl-word buf +ppc-r6+ +ppc-r14+)
+        (ppc-emit-blt buf ret)
+        (ppc-emit-cmpl-word buf +ppc-r6+ +ppc-r15+)
+        (ppc-emit-bge buf ret)
+        ;; a real start of the right kind, or not a root at all
+        (ppc-emit-kind-addr buf +ppc-r7+ +ppc-r6+)
+        (ppc-emit-lbz buf +ppc-r7+ +ppc-r7+ 0)
+        (ppc-emit-cmpi-word buf +ppc-r5+ 1)
+        (ppc-emit-bne buf kobj)
+        (ppc-emit-cmpi-word buf +ppc-r7+ 2)
+        (ppc-emit-bne buf ret)
+        (ppc-emit-b buf kok)
+        (here kobj)
+        (ppc-emit-cmpi-word buf +ppc-r7+ 1)
+        (ppc-emit-bne buf ret)
+        (here kok)
+        (ppc-emit-load-word buf +ppc-r8+ +ppc-r6+ 0)              ; first word
+        (ppc-emit-andi-dot buf +ppc-r9+ +ppc-r8+ 15)
+        (ppc-emit-cmpi-word buf +ppc-r9+ 15)
+        (ppc-emit-bne buf notfwd)
+        ;; already forwarded: (fwd & ~15) | tag
+        (ppc-emit-clear-low4 buf +ppc-r8+ +ppc-r8+)
+        (ppc-emit-or buf +ppc-r8+ +ppc-r8+ +ppc-r5+)
+        (ppc-emit-store-word buf +ppc-r8+ +ppc-r3+ 0)
+        (ppc-emit-blr buf)
+        (here notfwd)
+        (ppc-emit-cmpi-word buf +ppc-r5+ 1)
+        (ppc-emit-bne buf obj)
+        ;; -- cons: 16 bytes down from r20 --
+        (ppc-emit-addi buf +ppc-r20+ +ppc-r20+ -16)
+        (ppc-emit-cmpl-word buf +ppc-r20+ +ppc-r19+)
+        (ppc-emit-blt buf ovf)
+        (ppc-emit-store-word buf +ppc-r8+ +ppc-r20+ 0)            ; car
+        (ppc-emit-load-word buf +ppc-r9+ +ppc-r6+ ws)
+        (ppc-emit-store-word buf +ppc-r9+ +ppc-r20+ ws)           ; cdr
+        (ppc-emit-ori buf +ppc-r9+ +ppc-r20+ 15)
+        (ppc-emit-store-word buf +ppc-r9+ +ppc-r6+ 0)             ; forward
+        (ppc-emit-ori buf +ppc-r9+ +ppc-r20+ 1)
+        (ppc-emit-store-word buf +ppc-r9+ +ppc-r3+ 0)             ; update slot
+        (ppc-emit-kind-addr buf +ppc-r9+ +ppc-r20+)
+        (ppc-emit-li buf +ppc-r10+ 2)
+        (ppc-emit-stb buf +ppc-r10+ +ppc-r9+ 0)
+        (ppc-emit-blr buf)
+        ;; -- object: header in r8, old base in r6 --
+        (here obj)
+        (ppc-emit-object-size buf +ppc-r9+ +ppc-r8+ +ppc-r10+)
+        ;; a header whose object cannot lie inside from-space is a false root
+        (ppc-emit-add buf +ppc-r10+ +ppc-r6+ +ppc-r9+)
+        (ppc-emit-cmpl-word buf +ppc-r10+ +ppc-r15+)
+        (ppc-emit-bgt buf ret)
+        (ppc-emit-cmpl-word buf +ppc-r10+ +ppc-r6+)
+        (ppc-emit-blt buf ret)                                    ; wrapped
+        ;; room below the cons frontier, else to-space overflow
+        (ppc-emit-add buf +ppc-r11+ +ppc-r19+ +ppc-r9+)
+        (ppc-emit-cmpl-word buf +ppc-r11+ +ppc-r20+)
+        (ppc-emit-bgt buf ovf)
+        (ppc-emit-mr buf +ppc-r7+ +ppc-r19+)                      ; new base
+        (ppc-emit-mr buf +ppc-r11+ +ppc-r6+)
+        (here cl)
+        (ppc-emit-load-word buf +ppc-r4+ +ppc-r11+ 0)
+        (ppc-emit-store-word buf +ppc-r4+ +ppc-r19+ 0)
+        (ppc-emit-addi buf +ppc-r11+ +ppc-r11+ ws)
+        (ppc-emit-addi buf +ppc-r19+ +ppc-r19+ ws)
+        (ppc-emit-cmpl-word buf +ppc-r11+ +ppc-r10+)
+        (ppc-emit-blt buf cl)
+        (ppc-emit-ori buf +ppc-r4+ +ppc-r7+ 15)
+        (ppc-emit-store-word buf +ppc-r4+ +ppc-r6+ 0)             ; forward
+        (ppc-emit-ori buf +ppc-r4+ +ppc-r7+ 9)
+        (ppc-emit-store-word buf +ppc-r4+ +ppc-r3+ 0)             ; update slot
+        (ppc-emit-kind-addr buf +ppc-r4+ +ppc-r7+)
+        (ppc-emit-li buf +ppc-r10+ 1)
+        (ppc-emit-stb buf +ppc-r10+ +ppc-r4+ 0)
+        (here ret)
+        (ppc-emit-blr buf)
+        (here ovf)
+        (ppc-emit-die buf (format nil "modus: collector to-space overflow~%") 3)))))
+
+;;; ============================================================
 ;;; Main Translation Entry Point
 ;;; ============================================================
 
@@ -2765,6 +3152,8 @@
    Returns a PPC buffer (convert with ppc-buffer-to-bytes)."
   (setf *ppc-li-const-patches* nil)
   (let* ((*ppc-64-bit* 64-bit)
+         (*ppc-gc-label* (and *ppc-linux-mode* (mvm-make-label)))
+         (fn-entries (make-hash-table :test 'eql))
          (buf (make-ppc-buffer))
          (label-map (make-hash-table :test 'eql))
          (bc bytecode)
@@ -2811,11 +3200,25 @@
     ;; Emit prologue
     (ppc-emit-prologue buf)
 
-    ;; Second pass: translate instructions
+    (when function-table
+      (maphash (lambda (idx mvm-offset)
+                 (declare (ignore idx))
+                 (setf (gethash mvm-offset fn-entries) t))
+               function-table))
+
     ;; Second pass: translate instructions
     (setf pc 0)
     (loop while (< pc len)
           do (progn
+               ;; FUNCTION ENTRIES ARE 16-ALIGNED.  +op-fn-addr+ ORs the tag 3
+               ;; into an entry address and everything that classifies a value
+               ;; reads the low FOUR bits, so an entry at 4/8/12 mod 16 tags as
+               ;; 7/B/F -- F being the collector's forwarding tag.  This port
+               ;; did not align at all.  NOP padding is harmless: a function
+               ;; never falls through (it ends in BLR or a branch).
+               (when (gethash pc fn-entries)
+                 (loop while (/= 0 (mod (* 4 (ppc-buffer-word-count buf)) 16))
+                       do (ppc-emit-nop buf)))
                ;; Emit label at current PC before translating
                (let ((label (gethash pc label-map)))
                  (when label
@@ -2827,6 +3230,9 @@
                  ;; Compute branch target PCs relative to end of instruction
                  (ppc-translate-insn buf opcode operands new-pc label-map function-table)
                  (setf pc new-pc))))
+
+    (when *ppc-gc-label*
+      (ppc-emit-gc-collector buf))
 
     ;; Resolve label fixups
     (ppc-fixup-labels buf)

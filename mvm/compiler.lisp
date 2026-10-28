@@ -1139,22 +1139,44 @@
                       (list* (car slot) `(funcall (symbol-value ',sym)) (cddr slot))))))
             (cddr form)))))
 
-(defun %defsetf-long-expander (vars store-vars fn)
-  "The setf expander of a long DEFSETF whose body is the closure FN over
-   (VARS... STORE-VARS...): it is called on gensyms and its value is the
-   expansion, wrapped so the place arguments and the value form are evaluated
-   once, left to right."
-  (lambda (place-args value-form)
-    (let* ((var-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) vars))
-           (store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-vars))
-           (expansion (apply fn (append var-gensyms store-gensyms))))
+(defun %defsetf-arg-items (vars place-args)
+  "The temporaries a long DEFSETF's body sees for PLACE-ARGS, and their LET*
+   bindings.  One per place ARGUMENT, not per parameter: a defsetf lambda
+   list may take &OPTIONAL, &REST and &KEY (CLHS 3.4.7), so the two counts
+   differ.  A constant argument -- a keyword above all -- is passed as
+   itself, so &KEY can parse it.  With a plain lambda list the temporaries
+   are named after the parameters, as before."
+  (let ((plain (notany (lambda (v) (and (symbolp v) (member v lambda-list-keywords))) vars))
+        (items nil) (bindings nil))
+    (dolist (a place-args)
+      (if (and (constantp a) (not plain))
+          (push a items)
+          (let ((g (%mvm-gensym (if (and plain vars) (symbol-name (car vars)) "DSA"))))
+            (push g items)
+            (push (list g a) bindings)))
+      (when plain (setq vars (cdr vars))))
+    (values (nreverse items) (nreverse bindings))))
+
+(defun %defsetf-expand (vars store-vars fn place-args value-form)
+  "Expand a long DEFSETF place: call FN, the body over (STORE-VARS... . VARS),
+   on temporaries, and wrap its expansion so the place arguments and the
+   value form are evaluated once, left to right."
+  (multiple-value-bind (items bindings) (%defsetf-arg-items vars place-args)
+    (let* ((store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-vars))
+           (expansion (apply fn (append store-gensyms items))))
+      ;; several store variables take the value form's several values (DEFSETF.7A)
       (if (cdr store-gensyms)
-          `(let* (,@(mapcar #'list var-gensyms place-args))
+          `(let* (,@bindings)
              (multiple-value-bind ,store-gensyms ,value-form
                ,expansion))
-          `(let* (,@(mapcar #'list var-gensyms place-args)
+          `(let* (,@bindings
                   ,@(mapcar #'list store-gensyms (list value-form)))
              ,expansion)))))
+
+(defun %defsetf-long-expander (vars store-vars fn)
+  "The setf expander of a long DEFSETF whose body is the closure FN."
+  (lambda (place-args value-form)
+    (%defsetf-expand vars store-vars fn place-args value-form)))
 
 (defun %eval-expander-runtime (lambda-form)
   "Evaluate LAMBDA-FORM (a `(lambda …)` macro-expander) into a CALLABLE, in
@@ -5547,47 +5569,25 @@
              ;; Strip docstring if first body element is a string
              (when (and (stringp (car body)) (cdr body))
                (setq body (cdr body)))
-             (when (some (lambda (v)
-                           (and (symbolp v) (member v lambda-list-keywords)))
-                         vars)
-               (error "MVM compiler defsetf long form: lambda-list keywords (~S) not yet supported"
-                      (remove-if-not (lambda (v)
-                                       (and (symbolp v)
-                                            (member v lambda-list-keywords)))
-                                     vars)))
+             (when (some (lambda (v) (member v '(&environment &whole &aux))) vars)
+               (error "MVM compiler defsetf long form: ~S not supported"
+                      (remove-if-not (lambda (v) (member v '(&environment &whole &aux))) vars)))
              (mvm-define-setf-expander
                accessor
                (let ((vars-list vars)
                      (store-list store-vars)
                      (body-forms body))
                  (lambda (place-args value-form)
-                   (let* ((var-gensyms   (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) vars-list))
-                          (store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-list))
-                          ;; Compile a one-shot lambda whose params are
-                          ;; the original var/store-var names; calling
-                          ;; it with the gensyms makes every reference
-                          ;; in body resolve to a gensym, so a
-                          ;; backquoted body returns a real expansion
-                          ;; form rather than a runtime list-builder.
-                          ;; CLHS 5.1.1.2 / DEFSETF: the long-form body is
-                          ;; enclosed in an implicit BLOCK named ACCESSOR —
-                          ;; defsetf.5's (return-from defsetf.5-accessor …)
-                          ;; body errored the host EVAL ('return for unknown
-                          ;; block'), which SKIPped the whole chunk defun.
-                          (expansion
-                            (apply (%eval-expander-runtime
-                                    `(lambda ,(append vars-list store-list)
-                                       (block ,accessor ,@body-forms)))
-                                   (append var-gensyms store-gensyms))))
-                     ;; several store variables take the value form's
-                     ;; several values (DEFSETF.7A)
-                     (if (cdr store-gensyms)
-                         `(let* (,@(mapcar #'list var-gensyms place-args))
-                            (multiple-value-bind ,store-gensyms ,value-form
-                              ,expansion))
-                         `(let* (,@(mapcar #'list var-gensyms place-args)
-                                 ,@(mapcar #'list store-gensyms (list value-form)))
-                            ,expansion))))))
+                   ;; CLHS 5.1.1.2 / DEFSETF: the long-form body is enclosed in
+                   ;; an implicit BLOCK named ACCESSOR (defsetf.5's RETURN-FROM).
+                   ;; Compiled at each expansion, so a backquoted body returns a
+                   ;; real expansion rather than a runtime list-builder.
+                   (%defsetf-expand
+                    vars-list store-list
+                    (%eval-expander-runtime
+                     `(lambda (,@store-list ,@vars-list)
+                        (block ,accessor ,@body-forms)))
+                    place-args value-form))))
              ;; Under runtime EVAL the body is also compiled where the DEFSETF
              ;; is, as a closure, and that expander replaces the one above when
              ;; the form runs: a DEFSETF inside a LET sees the LET's variables
@@ -5598,7 +5598,7 @@
                      ',accessor
                      (%defsetf-long-expander
                       ',vars ',store-vars
-                      (function (lambda ,(append vars store-vars)
+                      (function (lambda (,@store-vars ,@vars)
                                   (block ,accessor ,@body)))))
                     (quote ,accessor))
                  `(quote ,accessor))))

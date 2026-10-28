@@ -3813,46 +3813,30 @@ at the end of the image must not overlap the globals or stack. Build scripts ass
 
 ## MVM Compiler — Active Limitations
 
-1. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
-2. **Variable-index ASET bug**: When `(aset arr idx val)` with a variable `idx` is a non-last form (`dest=nil`), the value may not load correctly. **Workaround**: `(let ((dummy (aset arr idx val))) body)` forces `dest=frame-slot`.
-3. **Symbol identity — per-package (CLHS 11.1.2) via SYMBOLS_PLAN phase 1 (a1327d6)**: `%intern-symbol-pkg` and `intern` both key the global intern table by a composite of NAME-HASH and PKG-HASH.  Within-package `(eq 'foo 'foo)` holds (covers compile-time literal vs runtime READ vs the CL-symbol-wrapper / native-MVM-sym boundary within a single package).  Cross-package `(eq cl-test::x ds4::x)` returns **NIL** — CL-correct, was previously T under the daa0763 unified model.  See SYMBOLS_PLAN.md.
-4. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
-5. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
-6. **Funcall tag — RESOLVED via OR-3**: Function pointers are explicitly tagged in `mvm-fn-addr` (translate-x64.lisp ~line 2794): `LEA + OR-3`.  Raw fn-code is NOP-padded so the low nibble is 0; OR-3 yields tagged fn pointers with low nibble `0x3` always.  Tags `cons=0x1`, `fn=0x3`, `char=0x5`, `obj=0x9` are mutually disjoint in the low nibble, so the historic "funcall-tag-collision" / "fn-addrs at vaddr ???05" classes are STRUCTURALLY impossible.  When bytecode shifts move function addresses, the OR-3 still produces a clean tag — predicate flips don't happen via tag-nibble accident.  A change that appears to break something via "code movement" has a real semantic cause; bisect to it (see "Layout shift broke an unrelated test" below).
-7. **defvar init-thunks not run**: `(defvar *foo* 42)` declares `*foo*` but does NOT set it to 42 at boot — `init-all-globals` is skipped.
-   **"Present in the image" and "actually invoked" are different questions.** The COMPILER emits `init-all-globals` from whatever source it compiles, so it is in essentially every image — while nothing calls it. i386 hit this in a new place (WS5 layer 5): the symbol map showed `INIT-ALL-GLOBALS` present, yet every defparameter the compiler and `mvm-eval` depend on sat at NIL, so `(eval 42)` SIGSEGV'd with nothing to work with. Calling it is one line with a large blast radius. When a runtime table reads as empty, check whether its initialiser was ever CALLED before concluding it is missing.
+**RE-VERIFIED 2026-10-28** with `test/limitations.lisp`, which runs each one as
+a probe twice: BAKED into an image (`MODUS_EXTRA_SOURCE=test/limitations.lisp`,
+the build-time compiler) and at RUNTIME (`./modus --script`, mvm-eval + JIT).
+Measured on the x64 CLI (both ways) and the bare aarch64 virt CL image (baked).
+Most of the list below had been fixed without the list being updated.
 
-   **CORRECTED 2026-08-12 — "defvars default to NIL" was FALSE; they were UNBOUND.** A `(defvar *x* nil)` used to emit NO init thunk at all (compile-defvar skipped a NIL initform), so `*x*` was neither 42 nor NIL — reading it signalled `UNBOUND-VARIABLE`. That hit 167 defvars, `CL:*MODULES*` among them, which broke `PROVIDE`/`REQUIRE` and the trivial-indent ladder rung. Fixed at f8ec62b: a NIL initform now emits a thunk, guarded by the CLHS rule that DEFVAR assigns only if not already bound. That guard is load-bearing — boot steps that run BEFORE `(init-all-globals)` store into globals that also have a `(defvar *x* nil)` elsewhere (e.g. `(setq *macro-table* (make-hash-table))` at build-cli-common.lisp:882 — moved there from build-generic-cli:740 when the two CLI lineages were merged at f98bdef), and an unguarded store re-NILs them and breaks the reader. DEFPARAMETER is unchanged: CLHS makes it assign unconditionally, so a NIL-initform defparameter STILL emits no build-time thunk.
+| # | limitation | now |
+|---|---|---|
+| 1 | last-defun-wins | **STILL TRUE INSIDE AN IMAGE**: two DEFUNs of one name in baked source both resolve to the last, and a `#'NAME` taken between them is the last one too (the image is linked statically).  At RUNTIME it is CL: an old function object keeps its old code, as in SBCL. |
+| 2 | variable-index ASET as a non-last form | fixed (both ways) |
+| 3 | symbol identity per package | CL-correct, not a limitation |
+| 4 | YIELD at every loop back-edge | a description, not a defect (SEV+WFE on aarch64 bare metal; `MODUS_YIELD_NOP=1` for NOP) |
+| 5 | conses corrupted across actor context switches | mini-Lisp actor images only; not re-tested (no CL image runs `net/actors.lisp` on bare metal) |
+| 6 | funcall tag collision | resolved (OR-3) |
+| 7 | defvar initforms not run at boot | fixed in every CL image: `(defvar *x* 42)` is 42, a NIL initform binds NIL |
+| 8 | constant small `ash` of a bignum | fixed: `(ash (ash 1 200) -1)` and `-200` correct |
+| 8a | `(ash most-positive-fixnum 1)` wrapping | fixed: promotes to the bignum |
+| 8b | variable-count `bignum-ash` | fixed |
+| 8c | negative overflow in checked `*` / `+` | fixed: `(* most-negative-fixnum 2)` = -2^63 |
 
-   Initialize required values explicitly via setq in an init function (e.g. `*pkg-tag*`, `*sym-tag*` set in `%init-packages`). Predicates that compare against an uninitialized tag with `(eql (car x) *tag*)` will return T for *any* cons-with-NIL-car — see `%pkg-p` history.
-8. **`compile-ash` inlines `:shl`/`:sar` for small constant counts (≤30) WITHOUT a fixnum tag check — corrupts a BIGNUM value.** `(ash bignum-val small-const-count)` shifts the raw tagged word, which is right for a fixnum (low bit 0) but mangles a bignum pointer (tag 0x9): `(ash (ash 1 200) -1)` :sar's the heap address to garbage, `(ash 2^200 -200)` returns a bogus fixnum. Variable-count and large-constant-count ash already route to runtime `bignum-ash` (correct). The bignum-ash runtime fix (9463e26) makes `(ash 1 N)` produce a CORRECT big bignum, which then SURFACES this latent compiler bug in any code that shifts those bignums by a small constant — `%print-integer-in-base`-adjacent format-runtime paths (format-d/o/x/b chunk-crashes), `gcd.5`/`logcount.7-8` (`(ash 1 200/300)` bounds → big-bignum operands → `(ash x -1)`). **FIX IS A COMPILER CHANGE but every attempt so far BROKE the harness's SIGSEGV-handler longjmp recovery** (a previously-recoverable pre-existing crash in nunion/modules went fatal; the 4x code-size blowup of the source-expansion `(if (fixnump g) (%ash-fixnum-raw g k) (bignum-ash g k))` is the suspected trigger — possibly fn-table/branch-displacement). The individual ash results were CORRECT (probes 9920-9925 passed); only harness recovery regressed. A recovery-safe fix is the open follow-up. Workaround for now: route through `bignum-ash` explicitly when a value may be a bignum.
-
-   **Related open bignum bugs surfaced by the WS5 self-host (2026-07); ALL THREE
-   still need a root fix — they were WORKED AROUND, not fixed. See
-   [[reference_bignum_bug_cluster]] for repro cases.**
-   - **8a. `compile-ash` LEFT-shift overflow (the twin of #8).** `(ash <fixnum>
-     small-const)` inlines a raw `:shl` with NO overflow promotion, so
-     `(ash 4611686018427387903 1)` → **−2** (wraps) instead of the bignum
-     9223372036854775806. Broke compile-integer's own 2^62-1 boundary constant in
-     the self-compiled product. WS5 workaround: `emit-li-tagged` emits `:li value;
-     :shl` (untagged fixnum + runtime raw shift) for the tagged word — but any
-     USER `(ash big-fixnum small-const)` still silently wraps.
-   - **8b. `bignum-ash` with a VARIABLE count corrupts the count.** A runtime
-     `bignum-ash(n, count)` on the left-shift limb path passed a CLOBBERED count
-     to `%shl-limbs-mag` (gdb: count became a stack address) → SIGSEGV / runaway
-     bignum. Smells like the MVM caller-save hazard [[reference_mvm_caller_save_bug]]
-     on `count` across `%any-to-limbs`. WS5 workaround: `emit-rest-prologue` uses
-     literal shift counts `(ash X 1)` so it inlines `:shl` instead of calling
-     `bignum-ash`. Any code calling `bignum-ash` with a runtime count is exposed.
-   - **8c. `:mul-checked` / `:add-checked` overflow promotion fails for NEGATIVE
-     operands.** `(* -4611686018427387904 2)` and
-     `(+ -4611686018427387904 -4611686018427387904)` both return small positive
-     GARBAGE instead of −2^63 (positive overflow promotes fine). A real arithmetic
-     correctness bug. CAVEAT: observed only via the self-host binary's mvm-eval so
-     far — confirm it reproduces in the ANSI / build-generic path before treating
-     it as definitively core (this session mis-attributed several bugs; verify
-     first).
-
+Not in the old list and still worth knowing: an undeclared free variable is
+treated as a global (CL would make it special and warn; the same answer, but the
+boot-time `WARN: implicit global` lines are that), and `(eq #'f #'f)` is NIL at
+runtime (SBCL: T; CLHS does not require it).
 
 **Frame size is per function (2026-10-07).**  FRAME-ENTER is TRAP
 `#x8000 | units<<8 | nparams`: the function's highest addressed frame slot + 1

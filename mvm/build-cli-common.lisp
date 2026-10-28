@@ -1943,6 +1943,15 @@
 (format t "  asdf:    ~D chars (interface source baked for boot-time eval)~%"
         (length *asdf-interface-text*))
 
+(defun %extra-source-text ()
+  "MODUS_EXTRA_SOURCE=FILE: a file compiled INTO the image by the BUILD-TIME
+   compiler (not runtime EVAL), for probing what only baked code does -- e.g.
+   test/limitations.lisp.  Unset: \"\"."
+  (let ((f (sb-ext:posix-getenv "MODUS_EXTRA_SOURCE")))
+    (if (and f (plusp (length f)))
+        (concatenate 'string (string #\Newline) (read-file-text f) (string #\Newline))
+        "")))
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *gc-source*       (string #\Newline)
@@ -1990,6 +1999,7 @@
                        ;; their scanner input — and therefore SFT-AUTO and
                        ;; SYM-NAME-AUTO — is byte-identical.
                        *cli-bare-metal-net-source*
+                       (%extra-source-text)
                        *driver-source*))
 
 ;;; NOTE: *genera-source* is deliberately NOT part of *all-runtime-source*.
@@ -2310,6 +2320,7 @@
     ;; silently dropping ~200 functions from runtime EVAL's reach.
     *asdf-source*
     (string #\Newline)
+    (%extra-source-text)
     *driver-source*
     (string #\Newline)
     ;; WS5 rung 2: baked JIT boot hook + gate (LAST so %jit-enabled-p wins).

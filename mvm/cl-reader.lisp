@@ -574,6 +574,15 @@
                    (%read-internal stream eof-error-p eof-value nil))
             (%read-macro-dispatch-simple macro-fn ch stream rt)))))
 
+(defun %call-reader-macro (fn stream ch &rest arg)
+  "Call a reader macro function the program installed.  CLHS 2.2 step 4: one that
+   returns ZERO values read nothing -- a comment, a false #+ -- and the reader goes on
+   to the next object.  Taking its primary value instead made every such call an
+   object: a readtable whose #+ is the program's own read each false conditional as
+   NIL (a cortez corpus read gained 2525 NIL forms, and a NIL in a list)."
+  (let ((vals (multiple-value-list (if arg (funcall fn stream ch (car arg)) (funcall fn stream ch)))))
+    (if vals (car vals) *rdr-no-value*)))
+
 (defun %read-macro-dispatch-simple (fn ch stream rt)
   "Handle common macro character types."
   (cond
@@ -593,8 +602,8 @@
     ((eq fn :semicolon) (%skip-line-comment stream) *rdr-no-value*)
     ((eq fn :dispatch) (%read-user-dispatch ch stream rt))
     ((or (functionp fn) (%cl-sym-p fn))
-     (let ((result (funcall fn stream ch)))
-       (if *read-suppress* nil result)))
+     (let ((result (%call-reader-macro fn stream ch)))
+       (if (or (eq result *rdr-no-value*) (not *read-suppress*)) result nil)))
     (t nil)))
 
 ;;; --- Token reader ---
@@ -1699,7 +1708,7 @@
                           (upper-code (if (and (>= code 97) (<= code 122)) (- code 32) code)))
                       (and sub-table (< upper-code 128) (aref sub-table upper-code)))))
       (cond
-        (user-fn (funcall user-fn stream sub-ch arg))
+        (user-fn (%call-reader-macro user-fn stream sub-ch arg))
         ;; #' — function
         ((= code 39)  ; '
          (let ((obj (%read-internal stream t nil t)))
@@ -1861,7 +1870,7 @@
                                      (- code 32) code)))
                  (let ((fn (if (< upper-code 128) (aref sub-table upper-code) nil)))
                    (if fn
-                       (funcall fn stream sub-ch arg)
+                       (%call-reader-macro fn stream sub-ch arg)
                        (if *read-suppress* nil
                            (%reader-error "unknown # dispatch character")))))
                (if *read-suppress* nil
@@ -2221,7 +2230,7 @@
           (let ((code (if (characterp sub-ch) (char-code (char-upcase sub-ch)) 0)))
             (let ((fn (if (< code 128) (aref sub-table code) nil)))
               (if fn
-                  (funcall fn stream sub-ch arg)
+                  (%call-reader-macro fn stream sub-ch arg)
                   (%reader-error "unknown dispatch sub-character"))))
           (%reader-error "not a dispatch macro character")))))
 

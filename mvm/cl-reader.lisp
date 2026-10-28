@@ -1890,11 +1890,14 @@
   (let ((elements nil))
     (loop
       (let ((ch nil))
-        ;; Skip whitespace
+        ;; Skip whitespace AND ; comments, as %read-list does: a comment ending
+        ;; the last line before the ) left %read-internal facing the ) alone.
         (loop
           (setq ch (read-char stream nil nil t))
           (when (null ch) (%reader-error "end of file reading vector"))
-          (unless (%whitespace-char-p ch) (return nil)))
+          (cond ((%whitespace-char-p ch) nil)
+                ((eq (%read-check-macro-rt ch *readtable*) :semicolon) (%skip-line-comment stream))
+                (t (return nil))))
         (when (eql ch #\))
           ;; End of vector
           (if *read-suppress* (return nil)
@@ -2296,12 +2299,14 @@
     (let ((s (%resolve-input-stream stream))
           (result nil))
       (loop
-        ;; Skip whitespace
+        ;; Skip whitespace AND ; comments (see %read-vector)
         (let ((ch nil))
           (loop
             (setq ch (read-char s nil nil t))
             (when (null ch) (%reader-error "end of file in read-delimited-list"))
-            (unless (%whitespace-char-p ch) (return nil)))
+            (cond ((%whitespace-char-p ch) nil)
+                  ((eq (%read-check-macro-rt ch *readtable*) :semicolon) (%skip-line-comment s))
+                  (t (return nil))))
           (when (eql ch char)
             (return (nreverse result)))
           ;; Read an object — drop *rdr-no-value* sentinel elements

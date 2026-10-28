@@ -608,9 +608,12 @@ thread-lisp 29, atomics 31, mutex 18, sleep 13, word-boundary 624).
 `MODUS_FASL_DIR`, the RECORDING run of alexandria fails all 30 probes (80
 errors) and cl-ppcre 5 of 6 on the unmodified image too; the REPLAY run then
 passes alexandria.  Test with a private `MODUS_FASL_DIR`, never the shared
-`~/.cache/modus/fasl`: results there depend on what earlier builds recorded,
-and the fingerprint does not cover `build-cli-common.lisp`, so two builds that
-differ only there replay each other's entries.
+`~/.cache/modus/fasl`: a run there REPLAYS whatever an earlier run recorded,
+and replay vs record is exactly the difference above.  (The key's compiler
+fingerprint hashes a fixed list of compiler and runtime files, BY DESIGN -- a
+cache written by one image serves another with the same compiler, which is how
+kiln feeds a board -- so builds that differ only elsewhere share keys.  No
+failure has been traced to that; a hash of the whole image would break kiln.)
 
 `MODUS_NO_SOURCE_BLOB=1` (any CLI build) drops the image's embedded copy of its
 own source: 34.9 -> 28.1 MB on arm32.  OFF by default -- carrying its own source

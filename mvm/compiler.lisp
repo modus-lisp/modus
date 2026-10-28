@@ -8069,7 +8069,14 @@
            (compile-progn (cdr form) env dest)))
       ((= op-name 536263002)  ; LET
        (let* ((bindings (cadr form))
-              (body (cddr form))
+              ;; A LET that is itself a discarded statement discards its last
+              ;; form too: a trailing NIL makes that form an ordinary non-last
+              ;; one, which compile-progn marks unused (so a SETQ of an
+              ;; FP-resident local there stops boxing a value nobody reads --
+              ;; a 4-lane vector per pass of illatio's Q8_0 kernel loop).
+              (body (if (and (cddr form) (eq form *unused-value-form*))
+                        (append (cddr form) (list nil))
+                        (cddr form)))
               (declared (extract-special-vars body))
               (implicit
                 (if *let-skip-implicit-specials* nil
@@ -8095,7 +8102,14 @@
              (compile-let bindings body env dest))))
       ((= op-name 431241200)  ; LET*
        (let* ((bindings (cadr form))
-              (body (cddr form))
+              ;; A LET* that is itself a discarded statement discards its last
+              ;; form too: a trailing NIL makes that form an ordinary non-last
+              ;; one, which compile-progn marks unused (so a SETQ of an
+              ;; FP-resident local there stops boxing a value nobody reads --
+              ;; a 4-lane vector per pass of illatio's Q8_0 kernel loop).
+              (body (if (and (cddr form) (eq form *unused-value-form*))
+                        (append (cddr form) (list nil))
+                        (cddr form)))
               (declared (extract-special-vars body))
               (implicit
                 (if *let-skip-implicit-specials* nil
@@ -12972,7 +12986,11 @@
                       (or (integerp count)
                           (and (or (and count (symbolp count)) (consp count))
                                (%expr-width count env))))
-                    (let ((inner (%fp-scope-extend-let env (list (list (caadr form) 0)) nil)))
+                    (let ((inner (%fp-scope-extend-let
+                                  env (list (list (caadr form) 0))
+                                  ;; the counter's width is the count's (see compile-dotimes)
+                                  (let ((ty (%dotimes-counter-type (cadadr form) env)))
+                                    (and ty (list (list 'declare (list 'type ty (caadr form)))))))))
                       (every (lambda (f) (%fp-scope-call-free-p f inner (1+ depth)))
                              (append (cddadr form) (strip-declares (cddr form)))))))
               ((string= n "SETQ")
@@ -18582,6 +18600,21 @@
 ;;; Dotimes
 ;;; ============================================================
 
+(defun %dotimes-counter-type (count-form env)
+  "The type a DOTIMES counter provably has, or NIL.  It runs from 0 up to the
+   count and stops there, so it is never wider than the count: a literal N
+   gives (INTEGER 0 N); a count of known signed width W (a variable declared
+   (UNSIGNED-BYTE 32), say) gives (INTEGER 0 2^(W-1)-1).  Without the second
+   case a counter over a declared count was a full fixnum, and every index
+   computed from it -- (* i 32) -- lost its width: the arithmetic stayed
+   overflow-checked, and a scope containing it was not call-free, so its FP
+   locals were boxed (illatio's Q8_0 kernel allocated a vector per block)."
+  (cond ((integerp count-form) (and (>= count-form 0) (list 'integer 0 count-form)))
+        ((or (and count-form (symbolp count-form)) (consp count-form))
+         (let ((w (%expr-width count-form env)))
+           (and w (>= w 1) (list 'integer 0 (- (ash 1 (- w 1)) 1)))))
+        (t nil)))
+
 (defun compile-dotimes (spec body env dest)
   "Compile (dotimes (var count [result]) body...).
    Per CLHS, body is in an implicit TAGBODY (so GO/tags work) inside
@@ -18611,8 +18644,8 @@
                  ;; take the typed fast path (the width estimator reads the
                  ;; (integer 0 N) declaration; see %decl-int-width).
                  (append
-                  (when (and (integerp count-form) (>= count-form 0))
-                    (list (list 'declare (list 'type (list 'integer 0 count-form) var))))
+                  (let ((ty (%dotimes-counter-type count-form env)))
+                    (when ty (list (list 'declare (list 'type ty var)))))
                   ;; The body's own leading declarations (e.g. a type for VAR
                   ;; when the count is not a literal) belong on this LET too;
                   ;; inside the TAGBODY they were silently dropped.
@@ -21038,6 +21071,8 @@
 ;;;   shifts        (%vi-sqrshrun q n) (%vi-sshr16 q n) (%vi-shl16 q n) (%vi-sshr8 q n) (%vi-sshr32 q n)
 ;;;   binary        (%vi-add16 a b) … see *vi-bin-ops*
 ;;;   accumulate    (%vi-mla16 acc a b) (%vi-mls16 acc a b) (%vi-bsl mask a b)
+;;;                 (%vi-sdot acc a b)  s32 lanes += four s8 x s8 products each
+;;;   to floats     (%vi-scvtf32 q)  s32x4 -> f32x4, usable as a leaf of an %f32v tree
 ;;;   by-element    (%vi-mla16l acc a b lane) (%vi-mls16l acc a b lane)
 ;;;                 (%vi-mul16l a b lane) (%vi-sqdmulh16l a b lane) (%vi-sqrdmulh16l a b lane)
 ;;;   extract       (%vi-umov8 q lane) (%vi-umov16 q lane) (%vi-umov32 q lane) -> fixnum (unsigned)
@@ -21049,12 +21084,18 @@
     ("%VI-ADD32" . 17) ("%VI-SUB32" . 18) ("%VI-MUL32" . 19)
     ("%VI-TRN1" . 20) ("%VI-TRN2" . 21) ("%VI-ZIP1" . 22) ("%VI-ZIP2" . 23)
     ("%VI-SMIN16" . 24) ("%VI-SMAX16" . 25) ("%VI-UMIN8" . 26) ("%VI-UMAX8" . 27)
-    ("%VI-TRN1-8" . 28) ("%VI-TRN2-8" . 29) ("%VI-TRN1-32" . 30) ("%VI-TRN2-32" . 31)))   ; 64-bit forms .8B / .2S (byte / word transposes)
-(defparameter *vi-acc-ops* '(("%VI-MLA16" . 3) ("%VI-MLS16" . 4) ("%VI-BSL" . 12)))
+    ("%VI-TRN1-8" . 28) ("%VI-TRN2-8" . 29) ("%VI-TRN1-32" . 30) ("%VI-TRN2-32" . 31)   ; 64-bit forms .8B / .2S (byte / word transposes)
+    ("%VI-ADDP32" . 33)))   ; ADDP .4S: (a0+a1, a2+a3, b0+b1, b2+b3) -- folds int32 lanes pairwise
+;; %VI-SDOT (acc a b): each s32 lane of ACC += the dot product of the matching
+;; four s8 lanes of A and B (SDOT .4S, FEAT_DotProd) -- illatio's Q8_0 kernel.
+(defparameter *vi-acc-ops* '(("%VI-MLA16" . 3) ("%VI-MLS16" . 4) ("%VI-BSL" . 12) ("%VI-SDOT" . 32)))
 (defparameter *vi-lane-acc-ops* '(("%VI-MLA16L" . 0) ("%VI-MLS16L" . 1)))
 (defparameter *vi-lane-ops* '(("%VI-MUL16L" . 2) ("%VI-SQDMULH16L" . 3) ("%VI-SQRDMULH16L" . 4)))
 (defparameter *vi-un-ops* '(("%VI-UXTL" . 0) ("%VI-SQXTUN" . 1) ("%VI-SXTL" . 2) ("%VI-XTN" . 3)
-                            ("%VI-SXTL2" . 5) ("%VI-UXTL2" . 6) ("%VI-SQXTN" . 8) ("%VI-SXTL8" . 10) ("%VI-ABS16" . 11)))
+                            ("%VI-SXTL2" . 5) ("%VI-UXTL2" . 6) ("%VI-SQXTN" . 8) ("%VI-SXTL8" . 10) ("%VI-ABS16" . 11)
+                            ;; SCVTF .4S: s32 lanes -> single-float lanes.  The one bridge from
+                            ;; integer lanes into an f32x4 tree (the bits are the same register)
+                            ("%VI-SCVTF32" . 12)))
 ;; the "2" narrows keep Fd's low half: (op low-tree high-tree) — see *vi-un2-ops*
 (defparameter *vi-un2-ops* '(("%VI-XTN2" . 7) ("%VI-SQXTN2" . 9)))
 (defparameter *vi-shift-ops* '(("%VI-SQRSHRUN" . 0) ("%VI-SSHR16" . 1) ("%VI-SHL16" . 2) ("%VI-SSHR8" . 3) ("%VI-SSHR32" . 4)
@@ -21120,6 +21161,17 @@
            (t nil))))
       (t nil))))
 
+(defun %resident-vreg-of (form env)
+  "The FP vreg of FORM when it is a register-resident vector variable (a
+   VI-PACK or F32V-PACK LET binding kept :fpvreg), else NIL.  A read-only
+   operand of a lane op can then be used where it lives instead of being
+   copied into a scratch register first (one MOV per use: eight per block
+   of illatio's Q8_0 kernel, whose activations are two such variables)."
+  (let ((form (%tree-expand form)))
+    (and (symbolp form)
+         (let ((b (env-lookup env form)))
+           (and b (eq (binding-location b) :fpvreg) (binding-reg b))))))
+
 (defun compile-vi-unboxed (form env fd)
   "Compile the integer-lane tree FORM (caller checked %vil-tree-need) into FP vreg FD."
   (let ((form (%tree-expand form)))
@@ -21164,19 +21216,24 @@
             (compile-vi-unboxed (car a) env fd) (emit-ir :vi-shift fd fd k (cadr a)))
            ((setq k (%vil-lookup n *vi-bin-ops*))
             (compile-vi-unboxed (car a) env fd)
-            (let ((ft (alloc-fp-reg)))
-              (compile-vi-unboxed (cadr a) env ft)
-              (emit-ir :vi-bin fd fd ft k)
-              (free-fp-reg)))
+            (let ((rb (%resident-vreg-of (cadr a) env)))
+              (if rb
+                  (emit-ir :vi-bin fd fd rb k)
+                  (let ((ft (alloc-fp-reg)))
+                    (compile-vi-unboxed (cadr a) env ft)
+                    (emit-ir :vi-bin fd fd ft k)
+                    (free-fp-reg)))))
            ((setq k (%vil-lookup n *vi-acc-ops*))     ; Fd = acc; Fd op= a, b
+            ;; A and B are only read, so a register-resident variable is used
+            ;; where it lives; the accumulator (Fd) is always our own register.
             (compile-vi-unboxed (car a) env fd)
-            (let ((f1 (alloc-fp-reg)))
-              (compile-vi-unboxed (cadr a) env f1)
-              (let ((f2 (alloc-fp-reg)))
-                (compile-vi-unboxed (caddr a) env f2)
-                (emit-ir :vi-bin fd f1 f2 k)
-                (free-fp-reg))
-              (free-fp-reg)))
+            (let* ((r1 (%resident-vreg-of (cadr a) env))
+                   (f1 (or r1 (let ((r (alloc-fp-reg))) (compile-vi-unboxed (cadr a) env r) r)))
+                   (r2 (%resident-vreg-of (caddr a) env))
+                   (f2 (or r2 (let ((r (alloc-fp-reg))) (compile-vi-unboxed (caddr a) env r) r))))
+              (emit-ir :vi-bin fd f1 f2 k)
+              (unless r2 (free-fp-reg))
+              (unless r1 (free-fp-reg))))
            ((setq k (%vil-lookup n *vi-lane-acc-ops*))
             (compile-vi-unboxed (car a) env fd)
             (let ((f1 (alloc-fp-reg)))

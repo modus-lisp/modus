@@ -5862,6 +5862,7 @@
                    ((= sub 9) (a64-emit buf (logior #x4E614800 (ash fs 5) fd)))   ; SQXTN2 Vd.8H, Vs.4S
                    ((= sub 10) (a64-emit buf (logior #x0F08A400 (ash fs 5) fd)))  ; SXTL Vd.8H, Vs.8B (s8->s16)
                    ((= sub 11) (a64-emit buf (logior #x4E60B800 (ash fs 5) fd)))  ; ABS Vd.8H, Vs.8H
+                   ((= sub 12) (a64-emit buf (logior #x4E21D800 (ash fs 5) fd)))  ; SCVTF Vd.4S, Vs.4S
                    (t (unless (= fd fs)
                         (a64-emit buf (logior #x4EA01C00 (ash fs 16) (ash fs 5) fd)))))))
           ;; ---- VI-SHIFT Fd, Fs, sub, n ----  immediate shifts (immh:immb in bits 22:16)
@@ -5885,6 +5886,7 @@
                           (20 #x0E402800) (21 #x0E406800) (22 #x0E403800) (23 #x0E407800)
                           (24 #x4E606C00) (25 #x4E606400) (26 #x6E206C00) (27 #x6E206400)
                           (28 #x0E002800) (29 #x0E006800) (30 #x0E802800) (31 #x0E806800)   ; TRN1/TRN2 .8B, TRN1/TRN2 .2S
+                          (32 #x4E809400) (33 #x4EA0BC00)   ; SDOT .4S,.16B,.16B (accumulates into Vd); ADDP .4S
                           (t #x0E407800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
           ;; ---- VI-MOVI Fd, kind, val ----  MOVI Vd.16B / Vd.8H, #val  (abc:defgh split)

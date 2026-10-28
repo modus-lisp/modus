@@ -608,6 +608,15 @@
       ((= sub 29) (dotimes (k 8) (setf (aref v k) (if (evenp k) (aref a (+ k 1)) (aref b k)))))      ; trn2 .8b
       ((= sub 30) (%vlane-set v 0 4 (%vlane-get a 0 4 nil)) (%vlane-set v 1 4 (%vlane-get b 0 4 nil)))  ; trn1 .2s
       ((= sub 31) (%vlane-set v 0 4 (%vlane-get a 1 4 nil)) (%vlane-set v 1 4 (%vlane-get b 1 4 nil)))  ; trn2 .2s
+      ((= sub 32) (dotimes (k 4)                                                              ; sdot .4s += .16b . .16b
+                    (let ((acc (%vlane-get d k 4 t)))
+                      (dotimes (j 4)
+                        (setq acc (+ acc (* (%vlane-get a (+ (* 4 k) j) 1 t) (%vlane-get b (+ (* 4 k) j) 1 t)))))
+                      (%vlane-set v k 4 acc))))
+      ((= sub 33) (%vlane-set v 0 4 (+ (%vlane-get a 0 4 t) (%vlane-get a 1 4 t)))              ; addp .4s
+                  (%vlane-set v 1 4 (+ (%vlane-get a 2 4 t) (%vlane-get a 3 4 t)))
+                  (%vlane-set v 2 4 (+ (%vlane-get b 0 4 t) (%vlane-get b 1 4 t)))
+                  (%vlane-set v 3 4 (+ (%vlane-get b 2 4 t) (%vlane-get b 3 4 t))))
       (t (dotimes (k 4)                                                                       ; trn1/trn2/zip1/zip2 .4h (low 8 bytes)
            (let ((x (cond ((= sub 20) (if (evenp k) (%vlane-get a k 2 nil) (%vlane-get b (- k 1) 2 nil)))
                           ((= sub 21) (if (evenp k) (%vlane-get a (+ k 1) 2 nil) (%vlane-get b k 2 nil)))
@@ -2625,7 +2634,13 @@
              (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
                  (let ((s (svref fregs fs)) (v (%vlane-new)))
-                   (cond ((= sub 0) (dotimes (k 8) (%vlane-set v k 2 (aref s k))))                       ; uxtl 8b->8h
+                   ;; scvtf .4s: the result is an f32x4 register, which the
+                   ;; interpreter holds as 4 single-floats (the v4 arms' form)
+                   (when (= sub 12)
+                     (setq v (make-array 4))
+                     (dotimes (k 4) (setf (svref v k) (coerce (%vlane-get s k 4 t) 'single-float))))
+                   (cond ((= sub 12))
+                         ((= sub 0) (dotimes (k 8) (%vlane-set v k 2 (aref s k))))                       ; uxtl 8b->8h
                          ((= sub 1) (dotimes (k 8) (setf (aref v k) (%vlane-sat (%vlane-get s k 2 t) 0 255)))) ; sqxtun 8h->8b
                          ((= sub 2) (dotimes (k 4) (%vlane-set v k 4 (%vlane-get s k 2 t))))                 ; sxtl 4h->4s
                          ((= sub 3) (dotimes (k 4) (%vlane-set v k 2 (%vlane-get s k 4 t))))                 ; xtn 4s->4h

@@ -208,6 +208,40 @@ into the old area instead of copying it back into young.  One word of state, no 
   about 4 times and promoted 0 bytes.  `:young` is the stress knob that makes it real: alexandria
   then promotes 5.6 MB, and with the reserve it runs a major.  Both audits read 0 afterwards.
 
+### On the board: tenure at boot (kiln boot/zero.lisp, cards #9-#11)
+
+`kz-gen-gc-start` tenures once the threads are up (`GC=plain` on the card's command line skips
+it).  Serial says `KZ:gc generational, old 32142 KB, young 2 x 25600 KB`.
+
+| QEMU test board, per 25 s drag | collections | paused | share |
+|---|---|---|---|
+| plain collector (card #8 before tenure) | 5 | 242 ms | 4.9% |
+| stage 1, tenure only (card #8) | 2 | 129 ms | 1.0% |
+| **stages 1-3 from boot (card #10)** | **1-2** | **5-12 ms** | **0.0%** |
+
+Majors run on their own: one during a drag, another live via `gc-major` (old 44.3 -> 37.6 MB, 0
+failures).  They are now the longest pause (~285 ms, about one old plain collection), and they
+are rare.  The drag frame rate did not move (2.1-3.0 updates/s), because the event loop sets
+it, not GC.  The typed audits read 0 after drags and after majors.
+
+**Card #9 found two real bugs and one false alarm:**
+
+- **The old space ran into the I/O staging pages.**  The board keeps `*CSTR-SCRATCH*`
+  (`0x0FE00000`) and `*IO-BUF-ADDR*` (`0x0FF00000`) at the top of the upper semispace, where the
+  mutator's 8 MB limit guard always kept allocation away.  Promotion fills the old area up to a
+  bound instead, and `old_hi` reached `0x0FE6B260`.  Fix: a CEILING word (meta +72, the lowest
+  staging page inside region 0's span, 0 hosted).  It stops promotion, a major's phase-2
+  destination and `%gc-old-room`.  The test plants one: `old_hi` stops exactly there, and the
+  control promotes past it.
+- **The lock arena was carved after tenure.**  Starting the threads shrinks region 0, which left
+  a carved gap inside the young pair, and a major's phase 2 copies straight across the pair.  It
+  happened to be refused for size there.  Now `%gc-region-shrink` of region 0 errors once an old
+  space exists, and the board tenures after `kz-usb-start`.
+- **"Dangling" slots (36-139 per audit) were the AUDIT's own fault.**  Its `%gc-old-leaf-p` was
+  `(member st '(...))`, which conses the list on every call: about 48 bytes per object, so every
+  walk triggered a collection halfway through and then judged the rest of the heap against
+  pre-flip bounds.  The audits now allocate nothing and re-run until no collection overlaps.
+
 ### Stage 4 — the rest of the tree
 
 - Carved thread regions and the lock arena.  Those are scanned, not copied, under STW today, so

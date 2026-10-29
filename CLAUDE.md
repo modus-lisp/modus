@@ -1013,6 +1013,12 @@ exactly as before, apart from the barrier's 2 instructions per heap store.
   space; a word count sees leaf payload and lies), `%gc-card-audit`, and
   `test/gc-tenure.lisp` (19 checks; `*gen-control*` `:walk` / `:barrier` must
   FAIL).
+- **Two layout rules learned on the board:** promotion and a major's copy stop at the
+  meta's CEILING (+72), the lowest I/O staging page (`*CSTR-SCRATCH*` 0x0FE00000) inside
+  region 0's span; and **region 0 cannot be carved after tenure** (`%gc-region-shrink`
+  errors), so the board tenures after its threads carve the lock arena.
+- **The board tenures at boot** (kiln `kz-gen-gc-start`; card arg `GC=plain` skips it): a
+  drag's GC pause went from 242 ms (4.9%) to 5-12 ms (0.0%).  Majors (~285 ms) are rare.
 - **x64, i386, riscv, arm32: not ported.**  `gc-tenure` refuses loudly there.
 
 ### Per-region GC, stage 1: the metadata block is a REGION CONTROL BLOCK

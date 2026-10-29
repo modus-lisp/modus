@@ -8449,7 +8449,14 @@
     (a64-set-label buf all)                                  ; phase 1 of a major
     (a64-add-imm buf +a64-x14+ +a64-x14+ 6)
     (a64-str-unsigned buf +a64-x14+ +a64-x12+ 24)
-    (a64-mov-reg buf +a64-x3+ +a64-x20+)                     ; everything
+    ;; EVERYTHING: the mark is all ones, not from_end.  A threaded stop-the-world
+    ;; collection also evacuates the LOCK ARENA, which sits at the top of a
+    ;; semispace -- above from_end when that is the lower one -- and phase 2
+    ;; copies the old area over the whole young semispace, so anything phase 1
+    ;; left young is overwritten.  Measured: majors with two live threads lost
+    ;; data 3 runs of 3 (a 5000-entry list came back 454 long; a worker's
+    ;; TYPE-ERROR); with no threads, or minors with threads, 0 of 6.
+    (a64-emit buf #xAA3F03E3)                                ; MVN x3, xzr
     (a64-set-label buf bump)
     (a64-load-word buf +a64-x8+ +gc-old-hi-addr+)
     (a64-asr-imm buf +a64-x8+ +a64-x8+ 1)

@@ -662,9 +662,17 @@ Two kinds of build:
   `scripts/ansi-sweep.sh`, comparing pass sets by test name and re-running lost
   tests to separate flakes.  The four corpus-baking runners it replaced
   (`build-x64-linux`, `build-x64`, `build-aarch64-linux`, `build-aarch64-ansi`
-  and their `build-ansi-common.lisp`) are retired; bare-metal and aarch64
-  conformance have no runner until the sweep runs there (the aarch64 CLI under
-  qemu-user is the next candidate).
+  and their `build-ansi-common.lisp`) are retired.
+- **The gate stays under half an hour** (user rule, 2026-10-29), so it sweeps
+  x64 only.  The other five hosted CLIs (aarch64, i386, arm32, riscv32,
+  riscv64) take 1-2 hours each under qemu-user, interpreting everything the
+  suite loads, and run in the SECONDARY suite `scripts/allarch-ansi.sh
+  [WORKDIR] [ARCH...]`: builds each from this tree, sweeps them in parallel,
+  one line per port, exit 0 only if all pass.  Run it before merging anything
+  that touches a translator, the runtime or the compiler.  A port moves into
+  the gate when a JIT brings its sweep under the budget.  All six CLIs were
+  21681/21681 on 2026-10-29 (cee4ad26).  Bare-metal conformance still has no
+  runner.
 
 ### QEMU AArch64 (virt machine, E1000) — the CL image
 ```bash

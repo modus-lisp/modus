@@ -852,7 +852,7 @@
               (ssh-connection-handler conn)
               ;; The server's X25519 key is pre-computed (slow boards); never
               ;; let a second connection reuse it.
-              (ssh-refresh-ephemeral)))))))
+              (modus.ssh:ssh-refresh-ephemeral)))))))
 
 (defun conn-handler-fn (conn)
   (if (eq conn 0) (hash-of "ssh-handler-0")
@@ -865,9 +865,9 @@
 (defun ssh-connection-handler (conn)
   (let ((ssh (conn-ssh conn))
         (cb (conn-base conn)))
-    (ssh-handle-connection ssh)
+    (modus.ssh:ssh-handle-connection ssh)
     ;; Regenerate server ephemeral X25519 key pair for next connection
-    (pre-compute-server-eph ssh)
+    (modus.ssh:pre-compute-server-eph ssh)
     (tcp-close-conn cb)
     (conn-free conn)))
 

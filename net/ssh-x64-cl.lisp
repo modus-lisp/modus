@@ -9,15 +9,15 @@
 ;;; and the server closed every connection right after the client's KEXINIT.
 ;;; Bare x64 has no counter rate (CNTFRQ is 0 there), hence a cycle budget.
 ;;; ------------------------------------------------------------------
-(defun ssh-preauth-clock () (rdtsc))
-(defun ssh-wait-expired-p (count limit since)
-  (or (ssh-peer-closed-p)
+(defun modus.ssh::ssh-preauth-clock () (rdtsc))
+(defun modus.ssh::ssh-wait-expired-p (count limit since)
+  (or (modus.ssh:ssh-peer-closed-p)
       (and (> count limit) (> (- (rdtsc) since) 34359738368))))
 ;; The client sends its version as soon as TCP connects, so ~1-2 s (2^32
 ;; cycles) is generous; it bounds what a dead client costs when its RST never
 ;; comes back (a NAT that has forgotten the mapping drops our SYN-ACK).
-(defun ssh-version-wait-expired-p (count since)
-  (or (ssh-peer-closed-p)
+(defun modus.ssh::ssh-version-wait-expired-p (count since)
+  (or (modus.ssh:ssh-peer-closed-p)
       (and (> count 50) (> (- (rdtsc) since) 4294967296))))
 
 ;;; ------------------------------------------------------------------
@@ -32,7 +32,7 @@
       (funcall (mem-ref #x1D100 :u64))
       nil))
 
-(defun arch-hw-random-fill (addr n)
+(defun modus.ssh::arch-hw-random-fill (addr n)
   (let ((ok 1) (i 0))
     (loop
       (when (or (>= i n) (zerop ok)) (return ok))
@@ -44,7 +44,7 @@
                 (setf (mem-ref (+ addr i k) :u8) (logand (ash w (* -8 k)) 255))))))
       (setq i (+ i 4)))))
 
-(defun ssh-no-hw-rng (b)
+(defun modus.ssh::ssh-no-hw-rng (b)
   (if (snp-active-p)
       (error "SSH: no RDRAND in an SEV-SNP guest; refusing to make keys")
-      (%drbg-weak-key b)))
+      (modus.ssh:%drbg-weak-key b)))

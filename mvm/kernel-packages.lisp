@@ -38,7 +38,17 @@
       "CHACHA-BLOCK" "CHACHA20-CRYPT" "POLY1305" "X25519" "X25519-PUBLIC-KEY"
       "ED25519-PUBLIC-KEY" "ED25519-VERIFY" "ED-BASE-MULT" "ED-ENCODE-POINT"
       "ED-REDUCE-SCALAR" "ED-SCALAR-ADD" "ED-SCALAR-MULT-MOD-L"
-      "CONCAT-BYTES" "CONCAT3-BYTES")))))
+      "CONCAT-BYTES" "CONCAT3-BYTES"))
+    ;; the SSH-2 server (net/ssh.lisp): what the images' boot text, the
+    ;; adapters (hosted-ssh, isolated-cl, ssh-x64-cl) and ip.lisp call
+    ("MODUS.SSH" ("COMMON-LISP" "MODUS-INT" "MODUS.CRYPTO")
+     ("SSH-SERVER" "SSH-HANDLE-CONNECTION" "SSH-HANDLE-KEX" "SSH-DISPATCH-MSG"
+      "SSH-RECEIVE-PACKET" "SSH-NET-POLL" "SSH-SEND-STRING" "SSH-SEND-PROMPT"
+      "SSH-GET-U32" "SSH-INIT-STRINGS" "SSH-SEED-RANDOM" "SSH-RANDOM"
+      "SSH-SET-HOST-KEY" "SSH-USE-DEFAULT-KEY" "SSH-AUTH-KEY-ADDR"
+      "SSH-MEM-STORE" "SSH-REFRESH-EPHEMERAL" "SSH-PEER-CLOSED-P"
+      "SSH-PREAUTH-CLOCK" "SSH-PREAUTH-IDLE-LIMIT" "SSH-WAIT-EXPIRED-P"
+      "PRE-COMPUTE-HOST-SIGN" "PRE-COMPUTE-SERVER-EPH" "%DRBG-WEAK-KEY")))))
 
 (defun %modus-int-driver-exports ()
   "What MODUS-INT exports to the step-3 packages: the console
@@ -55,7 +65,17 @@
           "SNP-MMIO-P" "SNP-MMIO-REAL-P" "SNP-MMIO-READ" "SNP-MMIO-WRITE"
           ;; for MODUS.CRYPTO: byte-buffer access, its scratch, and the
           ;; keep-alive a long computation calls (a seam the images rebind)
-          "BUF-READ-U32" "BUF-WRITE-U32" "FE-SCRATCH-BASE" "USB-KEEPALIVE")))
+          "BUF-READ-U32" "BUF-WRITE-U32" "FE-SCRATCH-BASE" "USB-KEEPALIVE"
+          ;; for MODUS.SSH: the TCP/IP stack it rides on, its connection and
+          ;; IPC blocks, the REPL's line editor and the shell hooks the image
+          ;; supplies (SSH-EVAL-LINE and friends: build text or an adapter)
+          "ARCH-SEED-RANDOM" "ARP-REPLY" "ICMP-HANDLE" "NET-HANDLE-TCP"
+          "NET-ACTOR-MAIN" "TCP-SEND-CONN" "BUF-READ-U16-MEM" "CONN-BASE"
+          "CONN-SSH" "SSH-CONN-BASE" "SSH-IPC-BASE" "FIXNUMP"
+          "EDIT-CURSOR-POS" "EDIT-LINE-LEN" "EDIT-SET-CURSOR-POS"
+          "EDIT-SET-LINE-LEN" "EMIT-PROMPT" "EVAL-LINE-EXPR" "PRINT-OBJ"
+          "HASH-OF" "NFN-LOOKUP" "RT-COMPILE-DEFUN" "SSH-EVAL-LINE"
+          "SSH-DO-EVAL-EXPR" "SSH-HANDLE-CHANNEL-DATA")))
 
 (defun %kernel-package-name-p (name)
   "True when NAME is one of %KERNEL-PACKAGE-SPECS' packages."

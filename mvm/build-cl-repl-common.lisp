@@ -1471,7 +1471,7 @@
             (aset arr ol 61) (aset arr (+ ol 1) 32)
             (dotimes (i rl) (aset arr (+ ol 2 i) (char-code (aref rs i))))
             (aset arr (+ ol 2 rl) 10)
-            (ssh-send-string ssh arr (+ ol rl 3))))))))"
+            (modus.ssh:ssh-send-string ssh arr (+ ol rl 3))))))))"
         (string #\Newline)
         ;; SHELL-path fix (completes the interactive SSH loop): the active
         ;; ssh-do-eval-expr (net/ssh.lisp) used eval-sexp (the
@@ -1499,7 +1499,7 @@
         ;; on CR/LF, eval the line through the SAME proven CL path as exec
         ;; (ssh-eval-line) and reprompt.  EXEC is untouched (it never calls this).
         "(defun ssh-handle-channel-data (ssh payload plen)
-    (let ((data-len (ssh-get-u32 payload 5))
+    (let ((data-len (modus.ssh:ssh-get-u32 payload 5))
           (naddr (+ (ssh-ipc-base) #x60500))
           (baddr (+ (ssh-ipc-base) #x60510)))
       (let ((i 0))
@@ -1513,7 +1513,7 @@
                       (dotimes (k n) (aset cmd k (mem-ref (+ baddr k) :u8)))
                       (ssh-eval-line ssh cmd n)))
                   (setf (mem-ref naddr :u32) 0)
-                  (ssh-send-prompt ssh))
+                  (modus.ssh:ssh-send-prompt ssh))
                 (let ((n (mem-ref naddr :u32)))
                   (when (< n 4000)
                     (setf (mem-ref (+ baddr n) :u8) b)
@@ -1538,11 +1538,11 @@
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
-" (%lisp-spin-form "ssh-zeroed") "  (ssh-seed-random)
-  (ssh-init-strings)
-" (%lisp-spin-form "ssh-seeded") "  (ssh-use-default-key)
-" (%lisp-spin-form "ssh-keyed") "  (pre-compute-host-sign)
-" (%lisp-spin-form "ssh-signed") "  (pre-compute-server-eph (conn-ssh 0))
+" (%lisp-spin-form "ssh-zeroed") "  (modus.ssh:ssh-seed-random)
+  (modus.ssh:ssh-init-strings)
+" (%lisp-spin-form "ssh-seeded") "  (modus.ssh:ssh-use-default-key)
+" (%lisp-spin-form "ssh-keyed") "  (modus.ssh:pre-compute-host-sign)
+" (%lisp-spin-form "ssh-signed") "  (modus.ssh:pre-compute-server-eph (conn-ssh 0))
   (write-string-serial \"NETUP\") (write-char-serial 10)
 " (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (modus.net:nic-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
   (net-actor-main))"))
@@ -1554,11 +1554,11 @@
   (setf (mem-ref (+ (e1000-state-base) 24) :u32) 33554442)
   (setf (mem-ref (+ (e1000-state-base) 28) :u32) 16777226)
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
-  (ssh-seed-random)
-  (ssh-init-strings)
-  (ssh-use-default-key)
-  (pre-compute-host-sign)
-  (pre-compute-server-eph (conn-ssh 0))
+  (modus.ssh:ssh-seed-random)
+  (modus.ssh:ssh-init-strings)
+  (modus.ssh:ssh-use-default-key)
+  (modus.ssh:pre-compute-host-sign)
+  (modus.ssh:pre-compute-server-eph (conn-ssh 0))
   (smp-init)
   (actor-init)
   (write-string-serial \"NETUP\") (write-char-serial 10)
@@ -2560,7 +2560,7 @@
                      (format s " (aset k ~D #x~2,'0X)" i
                              (parse-integer hex :start (* i 2) :end (+ (* i 2) 2) :radix 16)))
                    (format s " k)"))))
-          (format nil "~%(defun ssh-use-default-key ()~%  (ssh-set-host-key ~A)~%  (ssh-mem-store (ssh-auth-key-addr) ~A 32)~%  (setf (mem-ref (+ (e1000-state-base) #x770) :u32) 1))~%"
+          (format nil "~%(defun modus.ssh::ssh-use-default-key ()~%  (modus.ssh:ssh-set-host-key ~A)~%  (modus.ssh:ssh-mem-store (modus.ssh:ssh-auth-key-addr) ~A 32)~%  (setf (mem-ref (+ (e1000-state-base) #x770) :u32) 1))~%"
                   (bytes-form host) (bytes-form auth)))
         "")))
 

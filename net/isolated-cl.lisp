@@ -144,8 +144,8 @@
 ;; long, and it rewrote the key under any session still in its exchange.  The
 ;; net domain draws the private key (the DRBG is its own); the session computes
 ;; the public half on its own core before it speaks.
-(defun ssh-eph-base (ssh) (+ ssh #x3F80))
-(defun ssh-refresh-ephemeral () nil)
+(defun modus.ssh::ssh-eph-base (ssh) (+ ssh #x3F80))
+(defun modus.ssh::ssh-refresh-ephemeral () nil)
 
 (defun %iso-session-eph (ssh)
   (let ((priv (make-array 32)))
@@ -156,7 +156,7 @@
 (defun ssh-connection-handler (conn)
   (%iso-init)
   (let ((ssh (conn-ssh conn)))
-    (dotimes (i 32) (setf (mem-ref (+ ssh #x3F80 i) :u8) (ssh-random ssh))))
+    (dotimes (i 32) (setf (mem-ref (+ ssh #x3F80 i) :u8) (modus.ssh:ssh-random ssh))))
   ;; a reused slot: drop whatever the last session left unread
   (let ((ch (aref *iso-to-session* conn)))
     (loop (when (null (funcall *iso-try* ch)) (return nil))))
@@ -208,7 +208,7 @@
                  (when th
                    (setf (aref *iso-threads* conn) nil)
                    (handler-case (funcall *iso-join* th) (t (c) nil))))
-               (ssh-refresh-ephemeral)))))))))
+               (modus.ssh:ssh-refresh-ephemeral)))))))))
 
 ;; NET-ACTOR-MAIN calls this on every pass of its poll loop: the hot-plug check
 ;; it always was (usb-netdev.lisp, verbatim), then the sessions' traffic.
@@ -232,7 +232,7 @@
 (defun %iso-session (conn)
   (setf (aref *iso-slot-conn* (percpu-ref 16)) conn)   ; a fixnum: no pointer
   (handler-case (progn (%iso-session-eph (conn-ssh conn))
-                       (ssh-handle-connection (conn-ssh conn)))
+                       (modus.ssh:ssh-handle-connection (conn-ssh conn)))
     ;; Said on the console: the session just ends, and nothing else would show why.
     (t (c) (handler-case (progn (write-string-serial "ISOLATED: session error: ")
                                 (write-string-serial (princ-to-string c))
@@ -260,36 +260,36 @@
 ;; ssh.lisp's SSH-MESSAGE-LOOP, verbatim but for FLAG-ADDR: its "session over"
 ;; word was one for the server (conn 3's struct +0x700), so the first session to
 ;; finish ended every other one.  Here each session has its own.
-(defun ssh-message-loop (ssh)
+(defun modus.ssh::ssh-message-loop (ssh)
   (let ((flag-addr (+ ssh #x3FCC))
         (idle 0)
-        (since (ssh-preauth-clock)))
+        (since (modus.ssh:ssh-preauth-clock)))
     (setf (mem-ref flag-addr :u32) 1)
     (loop
       (when (zerop (mem-ref flag-addr :u32)) (return ()))
-      (when (ssh-peer-closed-p) (return ()))
+      (when (modus.ssh:ssh-peer-closed-p) (return ()))
       (when (and (zerop (mem-ref (+ ssh #x10) :u32))
-                 (ssh-wait-expired-p idle (ssh-preauth-idle-limit) since))
+                 (modus.ssh:ssh-wait-expired-p idle (modus.ssh:ssh-preauth-idle-limit) since))
         (return ()))
-      (let ((pkt (ssh-receive-packet ssh 50000)))
+      (let ((pkt (modus.ssh:ssh-receive-packet ssh 50000)))
         (if pkt
             (progn
               (setq idle 0)
-              (setq since (ssh-preauth-clock))
-              (ssh-dispatch-msg ssh (car pkt) (cdr pkt) flag-addr))
+              (setq since (modus.ssh:ssh-preauth-clock))
+              (modus.ssh:ssh-dispatch-msg ssh (car pkt) (cdr pkt) flag-addr))
             (setq idle (+ idle 1)))))))
 
 ;; A session asks about ITS peer; the net domain keeps ip.lisp's word.
-(defun ssh-peer-closed-p ()
+(defun modus.ssh::ssh-peer-closed-p ()
   (if (%iso-main-p)
       (= (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1)
       (let ((c (aref *iso-slot-conn* (percpu-ref 16))))
         (and (>= c 0) (= (mem-ref (%iso-closed-addr c) :u32) 1)))))
 
 ;; SSH-RECEIVE-PACKET's wait: the session's channel, never the NIC.
-(defun ssh-wait-data (ssh)
+(defun modus.ssh::ssh-wait-data (ssh)
   (if (%iso-main-p)
-      (ssh-net-poll)
+      (modus.ssh:ssh-net-poll)
       (let ((m (funcall *iso-recv* (aref *iso-to-session* (%iso-conn-of-ssh ssh)) :timeout 0.01)))
         (if (null m) 1 (%iso-take ssh m)))))
 
@@ -307,4 +307,4 @@
             (if (eq (car m) :result)
                 (setq reply (cadr m))
                 (%iso-take ssh m)))))
-      (ssh-send-string ssh reply (length reply)))))
+      (modus.ssh:ssh-send-string ssh reply (length reply)))))

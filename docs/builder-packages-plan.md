@@ -224,6 +224,18 @@ i386, x64 and aarch64 SSH images log in (key exchange, signing and cipher all
 through MODUS.CRYPTO), test/crypto-sha-vectors.lisp 14/14 and
 test/run-hosted-ssh.sh PASS on the hosted CLI.
 
+**Cycle 4, 2026-10-29: MODUS.SSH.**  net/ssh.lisp reads into MODUS.SSH, which
+:uses MODUS.CRYPTO (so its modus.crypto: prefixes are gone) and MODUS-INT.
+MODUS-INT exports to it the TCP/IP stack it rides on, the connection and IPC
+blocks, the line editor, and the shell hooks the image supplies (SSH-EVAL-LINE,
+SSH-DO-EVAL-EXPR, SSH-HANDLE-CHANNEL-DATA -- build text or an adapter defines
+them).  MODUS.SSH exports the 24 functions the boot text, ip.lisp and the
+adapters call.  Its 16 declared seams are still replaced by later DEFUNs, now
+written modus.ssh::NAME in net/hosted-ssh.lisp, isolated-cl.lisp,
+ssh-x64-cl.lisp, hwrng-bcm2835.lisp and the build text: explicit, and checked
+(redef-check 0), but not yet (setf fdefinition) interfaces.  Measured: the
+i386, x64 and aarch64 SSH images and test/run-hosted-ssh.sh pass.
+
 ### 4. Runtime identity: every baked symbol keeps its home package
 
 - Create the step-2 package graph in the image at boot, from data the build

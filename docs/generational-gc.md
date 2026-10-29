@@ -219,12 +219,13 @@ it).  Serial says `KZ:gc generational, old 32142 KB, young 2 x 25600 KB`.
 | stage 1, tenure only (card #8) | 2 | 129 ms | 1.0% |
 | **stages 1-3 from boot (card #10)** | **1-2** | **5-12 ms** | **0.0%** |
 
-Majors run on their own: one during a drag, another live via `gc-major` (old 44.3 -> 37.6 MB, 0
-failures).  They are now the longest pause (~285 ms, about one old plain collection), and they
+Card #12 (all fixes below): 9 majors in one session (4 live, 5 automatic, about one per
+session start), ~255 ms each, 0 failures.  A keyword held across each live major stayed EQ, and
+every audit read 0.  The old space settles at ~44 MB of its 50 MB area.  They are now the longest pause (~285 ms, about one old plain collection), and they
 are rare.  The drag frame rate did not move (2.1-3.0 updates/s), because the event loop sets
 it, not GC.  The typed audits read 0 after drags and after majors.
 
-**Card #9 found two real bugs and one false alarm:**
+**Cards #9 and #11 found three real bugs and one false alarm:**
 
 - **The old space ran into the I/O staging pages.**  The board keeps `*CSTR-SCRATCH*`
   (`0x0FE00000`) and `*IO-BUF-ADDR*` (`0x0FF00000`) at the top of the upper semispace, where the
@@ -237,6 +238,14 @@ it, not GC.  The typed audits read 0 after drags and after majors.
   a carved gap inside the young pair, and a major's phase 2 copies straight across the pair.  It
   happened to be refused for size there.  Now `%gc-region-shrink` of region 0 errors once an old
   space exists, and the board tenures after `kz-usb-start`.
+- **(card #11) A major with live threads lost data.**  After a live `gc-major`, the keyword
+  `:US` in the calling form came back as a closure, and the board faulted at NIL-9.  A threaded
+  STW collection also EVACUATES THE LOCK ARENA.  Phase 1 promoted only what lay below from_end,
+  and the arena (at the top of a semispace) can lie above it, so its objects stayed young.
+  Phase 2 then copied the old area over the whole young semispace.  The hosted tests had no
+  threads, so they could never see it.  `test/gc-major-threads.lisp` (2 interning threads, 40
+  majors) lost data 3 of 3 times, with clean controls (minors with threads, majors without, 0 of
+  6).  Phase 1's mark is now all ones, and the test runs 5 of 5 clean.
 - **"Dangling" slots (36-139 per audit) were the AUDIT's own fault.**  Its `%gc-old-leaf-p` was
   `(member st '(...))`, which conses the list on every call: about 48 bytes per object, so every
   walk triggered a collection halfway through and then judged the rest of the heap against

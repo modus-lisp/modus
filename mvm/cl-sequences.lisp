@@ -2734,11 +2734,13 @@
             (loop
               (cond ((null a) (return (nreconc r b)))
                     ((null b) (return (nreconc r a)))
+                    ;; CLHS MERGE: on a tie S1's element comes first, so take
+                    ;; S2's only when it is strictly less (as %MERGE-LISTS does).
                     ((funcall pred-fn
-                              (if kfn (funcall kfn (car a)) (car a))
-                              (if kfn (funcall kfn (car b)) (car b)))
-                     (setq r (cons (car a) r)) (setq a (cdr a)))
-                    (t (setq r (cons (car b) r)) (setq b (cdr b))))))
+                              (if kfn (funcall kfn (car b)) (car b))
+                              (if kfn (funcall kfn (car a)) (car a)))
+                     (setq r (cons (car b) r)) (setq b (cdr b)))
+                    (t (setq r (cons (car a) r)) (setq a (cdr a))))))
           (kind (%concat-result-kind result-type)))
       (cond
         ((eq kind :list) merged)

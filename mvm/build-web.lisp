@@ -420,5 +420,10 @@
   ;; file: the first FPD-UNBOX stopped module relocation and the image did not
   ;; boot.  The JS engine models x86-64's words and syscalls, not its FPU.
   (setf *target-has-fpd-p* nil)
+  ;; The web image never calls BUILD-IMAGE, so build-checks' wrapper does not
+  ;; see it: run the redefinition check around the compile directly.
+  (setf *undeclared-redefinitions* nil)
+  (clrhash *overridable-names*)
   (let ((module (compile-source-to-module cl-user::*full-source*)))
+    (check-undeclared-redefinitions)
     (web-write-module module target *web-image-path*)))

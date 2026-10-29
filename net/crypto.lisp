@@ -597,6 +597,7 @@
 ;; Field element: 40-byte array (10 x 4 bytes), total 255 bits
 ;; p = 2^255 - 19, wrap factor = 19
 
+(declaim (overridable fe-sq-iter))
 (defun fe-sq-iter (dst n)
   ;; Square dst n times in-place
   (dotimes (i n)
@@ -604,6 +605,7 @@
     ;; Poll USB every 16 squarings to prevent host watchdog timeout
     (when (zerop (logand i 15)) (usb-keepalive))))
 
+(declaim (overridable fe-invert))
 (defun fe-invert (z)
   ;; z^(p-2) = z^(2^255-21) via addition chain
   (let ((z2 (make-array 40))

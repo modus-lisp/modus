@@ -212,6 +212,7 @@
 
 ;; NET-ACTOR-MAIN calls this on every pass of its poll loop: the hot-plug check
 ;; it always was (usb-netdev.lisp, verbatim), then the sessions' traffic.
+(declaim (overridable usb-netdev-hotplug-poll))
 (defun usb-netdev-hotplug-poll ()
   (let ((hprt (dwc2-read (dwc2-hprt0))))
     (when (not (zerop (logand hprt (hprt0-prtconndet))))

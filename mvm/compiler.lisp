@@ -23,6 +23,13 @@
 
 (in-package :modus.mvm)
 
+;;; (declaim (overridable NAME ...)) marks NAME's DEFUN as a default that a
+;;; later file in the same image may replace -- a seam.  The image build
+;;; records it (%DECLAIM-NOTE-OVERRIDABLE) and reports any other redefinition
+;;; (mvm/build-checks.lisp).  SBCL only needs to know it is a declaration, for
+;;; this file and the translators that load after it.
+(declaim (declaration overridable))
+
 ;;; ============================================================
 ;;; Tagging Constants (mirror cross-compile.lisp)
 ;;; ============================================================
@@ -1872,6 +1879,29 @@
    emitted code is byte-identical to before, so the ANSI images are
    untouched.")
 
+(defvar *overridable-names* (make-hash-table :test (function equal))
+  "Names a build has declared replaceable with (DECLAIM (OVERRIDABLE NAME ...)),
+   keyed by symbol name.  The declaration goes in the file that defines the
+   DEFAULT; a later DEFUN of the same name in the same image is then a seam
+   and not an accident.  Build-time only: runtime DECLAIM never records here.")
+
+(defparameter *undeclared-redefinitions* nil
+  "(name old-loc new-loc) for each redefinition in this build whose name was
+   not declared OVERRIDABLE first.  mvm/build-checks.lisp reports it and, under
+   MODUS_REDEF_CHECK=error, fails the build.")
+
+(defun %declaim-note-overridable (form)
+  "Record the names of every (OVERRIDABLE name ...) spec of a toplevel
+   DECLAIM.  Emits nothing."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)) (name-eq (car s) "OVERRIDABLE"))
+        (dolist (n (cdr s))
+          (when (and n (symbolp n))
+            (setf (gethash (symbol-name n) *overridable-names*) t)))))))
+
 (defparameter *redefinition-log* nil
   "List of (name old-loc new-loc) triples, one per silently-redefined
    defun.  Pushed by mvm-compile-function.  Build scripts should print
@@ -2782,6 +2812,7 @@
 ;;; Cross-package compatibility: we compare operator names as
 ;;; name hashes (dual FNV-1a), matching cross.lisp's compute-name-hash.
 
+(declaim (overridable compute-name-hash))
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a name string. 60-bit collision-resistant."
   ;; CHAR-UPCASE per character, not STRING-UPCASE of the whole name: the same
@@ -2800,6 +2831,7 @@
                             (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))
 
+(declaim (overridable ieee-float-bits))
 (defun ieee-float-bits (f)
   "Convert a double-float to its IEEE 754 bit pattern as an integer."
   (let ((hi (sb-kernel:double-float-high-bits f))
@@ -2814,8 +2846,10 @@
 ;; well inside fixnum range.  Host versions use sb-kernel; the in-image
 ;; overrides (build-generic.lisp *stage2-float-override*) read the boxed
 ;; float's slots directly via %prim-aref.
+(declaim (overridable ieee-float-hi32))
 (defun ieee-float-hi32 (f)
   (logand (sb-kernel:double-float-high-bits (float f 1.0d0)) #xFFFFFFFF))
+(declaim (overridable ieee-float-lo32))
 (defun ieee-float-lo32 (f)
   (logand (sb-kernel:double-float-low-bits (float f 1.0d0)) #xFFFFFFFF))
 
@@ -2828,24 +2862,31 @@
 ;; unreliable into bignum range.  On the host these primitives work on real
 ;; bignums, so the host versions keep computing.  See ieee-float-hi32 for the
 ;; sibling float case.
+(declaim (overridable %lit-bignum-big-p))
 (defun %lit-bignum-big-p (value)
   "T if VALUE needs the limbs-array (big) bignum shape rather than 2-slot."
   (> (integer-length (abs value)) +small-bignum-bits+))
+(declaim (overridable %lit-bn-lo))
 (defun %lit-bn-lo (value)
   "Low 62-bit limb (slot 0) of a small bignum VALUE."
   (logand value +fixnum-max+))
+(declaim (overridable %lit-bn-hi))
 (defun %lit-bn-hi (value)
   "High signed part (slot 1) of a small bignum VALUE."
   (ash value +neg-limb-bits+))
+(declaim (overridable %lit-bb-sign))
 (defun %lit-bb-sign (value) (if (< value 0) -1 1))
+(declaim (overridable %lit-bb-nlimbs))
 (defun %lit-bb-nlimbs (value)
   (let ((mag (abs value)) (n 0))
     (loop (when (= mag 0) (return n))
           (setf mag (ash mag +neg-limb-bits+)) (incf n))))
+(declaim (overridable %lit-bb-limb))
 (defun %lit-bb-limb (value k)
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
   (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
 
+(declaim (overridable normalize-name))
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
    Returns 0 for non-symbol, non-integer inputs."
@@ -3644,6 +3685,7 @@
                 (%resolve-declared-type (fifth info)))))
         (t nil)))
 
+(declaim (overridable name-eq))
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -3707,6 +3749,7 @@
 ;;; Re-key the live entries whenever the collection count changes.
 (defvar *mexp-memo-gc* -1
   "The %GC-COUNT at which *MEXP-MEMO* was last (re)keyed.")
+(declaim (overridable %mexp-memo-epoch))
 (defun %mexp-memo-epoch ()
   ;; %GC-EPOCH, not %GC-COUNT: see its docstring in gc.lisp -- an odd raw count
   ;; read as a tagged pointer killed every i386 image at its ninth collection.
@@ -3735,6 +3778,7 @@
       (when *mexp-memo* (%mexp-memo-rekey))
       (setq *mexp-memo-gc* g))))
 
+(declaim (overridable %form-key))
 (defun %form-key (form)
   "HOST stub: structural hash (collisions only cost a miss — entries are
    EQ-validated).  mvm-eval.lisp overrides with the object's address."
@@ -5848,12 +5892,6 @@
 
   ;; DO/DO*/DOTIMES body declarations: CLHS puts them on the implicit
   ;; binding form, so they must be hoisted above the loop's TAGBODY.
-  (defun %leading-declares (body)
-    (let ((out nil))
-      (loop while (and body (consp (car body)) (symbolp (caar body))
-                       (string= (symbol-name (caar body)) "DECLARE"))
-            do (push (car body) out) (setq body (cdr body)))
-      (nreverse out)))
   (defun %special-only-declares (body)
     "BODY's leading SPECIAL declarations, as a list of zero or one DECLARE
      form.  Only SPECIAL can move onto a binding whose initial value is a
@@ -13154,11 +13192,14 @@
                  (t (some (lambda (f) (%form-setqs-var-p var f (1+ depth)))
                           (cdr form))))))))
 
-(defun %form-mentions-p (syms form)
-  "T when any symbol of SYMS occurs anywhere in FORM."
+(defun %form-mentions-any-p (syms form)
+  "T when any symbol of SYMS occurs anywhere in FORM.  (It was named
+   %FORM-MENTIONS-P, as is the one-symbol test %FIRST-OPERAND-REG uses; that
+   later DEFUN won, so this guard compared INIT's subforms to the list itself
+   and never fired.)"
   (cond ((symbolp form) (and form (member form syms) t))
-        ((consp form) (or (%form-mentions-p syms (car form))
-                          (%form-mentions-p syms (cdr form))))
+        ((consp form) (or (%form-mentions-any-p syms (car form))
+                          (%form-mentions-any-p syms (cdr form))))
         (t nil)))
 
 (defun %inferred-single-local-p (var init bindings body env)
@@ -13171,7 +13212,7 @@
   (and init (consp init)
        (%expr-single-float-p init env)
        (%fp-tree-need init env)
-       (not (%form-mentions-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
+       (not (%form-mentions-any-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
                               init))
        (notany (lambda (f) (%form-setqs-var-p var f 0)) body)))
 
@@ -29712,6 +29753,9 @@
                 (new-loc (or *current-source-location* "?")))
             (format t "  NOTE: redefining ~A  (old: ~A, new: ~A)~%"
                     (function-info-name info) old-loc new-loc)
+            (unless (gethash (function-info-name info) *overridable-names*)
+              (push (list (function-info-name info) old-loc new-loc)
+                    *undeclared-redefinitions*))
             (push (list (function-info-name info) old-loc new-loc)
                   *redefinition-log*))))
       ;; Register in function table
@@ -30026,6 +30070,8 @@
      (%declaim-note-optimize form)
      (when (and *aot-inline* (not *mvm-eval-runtime-p*))
        (%declaim-note-inline form))
+     (unless *mvm-eval-runtime-p*
+       (%declaim-note-overridable form))
      (when *mvm-eval-runtime-p*
        (%declaim-note-inline form)
        (%declaim-note-type form)

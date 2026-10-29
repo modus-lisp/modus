@@ -40,6 +40,7 @@
 ;;   +0x00 key (64)   +0x40 block counter   +0x44 pool index (64 = empty)
 ;;   +0x48 pool (64)  +0x88 seeded flag
 ;; ------------------------------------------------------------------
+(declaim (overridable arch-hw-random-fill))
 (defun arch-hw-random-fill (addr n) 0)       ; 1 = filled N bytes at ADDR from hardware
 
 (defun %drbg-base () (+ (e1000-state-base) #x1800))
@@ -57,6 +58,7 @@
 
 ;; No hardware RNG answered: the weak key, announced.  The x64 CL image
 ;; overrides this to refuse instead inside an SEV-SNP guest.
+(declaim (overridable ssh-no-hw-rng))
 (defun ssh-no-hw-rng (b) (%drbg-weak-key b))
 
 (defun ssh-seed-random ()
@@ -90,6 +92,7 @@
     (setf (mem-ref (+ b #x44) :u32) 0)))
 
 ;; A random byte.  SSH is the per-connection state base, kept for the callers.
+(declaim (overridable ssh-random))
 (defun ssh-random (ssh)
   (let ((b (%drbg-base)))
     (when (not (= (mem-ref (+ b #x88) :u32) 1))
@@ -495,6 +498,7 @@
 ;; (or the inline poll loop that stands in for it) fills the buffer and this is
 ;; the actor RECEIVE it always was.  A hosted image overrides it with a read(2)
 ;; on the connection's socket (net/hosted-ssh.lisp).
+(declaim (overridable ssh-wait-data))
 (defun ssh-wait-data (ssh) (ssh-net-poll))
 
 (defun ssh-receive-packet (ssh timeout)
@@ -1267,6 +1271,7 @@
 ;; then stores its address at 0x395000 so cross-compiled make-array
 ;; and make-string can call it on OOM.
 ;; Must be called before any actors that need GC in cross-compiled allocators.
+(declaim (overridable init-gc-helper))
 (defun init-gc-helper ()
   ;; Build args for rt-compile-defun: (name params body)
   ;; params = nil (0)
@@ -1373,6 +1378,7 @@
 
 ;; Process a single byte of input for line editing
 ;; Returns: 1 = enter pressed, 2 = ctrl-d, nil = continue
+(declaim (overridable handle-edit-byte))
 (defun handle-edit-byte (b)
   (let ((esc (mem-ref (+ (ssh-ipc-base) #x12810) :u64)))
     (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 0)
@@ -1617,6 +1623,7 @@
 ;; Pre-compute Ed25519 host key derivatives for fast signing.
 ;; Stores clamped scalar s at state+0x680, prefix at state+0x6A0.
 ;; Must be called AFTER ed25519-init and host key setup.
+(declaim (overridable pre-compute-host-sign))
 (defun pre-compute-host-sign ()
   (let ((state (e1000-state-base)))
     (sha512-init)
@@ -1643,6 +1650,7 @@
 ;; A fresh server ephemeral key for the NEXT connection.  It is pre-computed so
 ;; a slow board does not pay for it inside a handshake, but reusing one key for
 ;; every connection gives up forward secrecy, so each connection retires it.
+(declaim (overridable ssh-refresh-ephemeral))
 (defun ssh-refresh-ephemeral ()
   (when (= (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)   ; only if a KEX used it
     (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 0)
@@ -1651,10 +1659,12 @@
 ;; Where SSH-HANDLE-KEX finds the server's ephemeral X25519 pair for SSH (the
 ;; private key, the public key at +0x20): one slot for the server, refreshed
 ;; after each key exchange.  net/isolated-cl.lisp gives every session its own.
+(declaim (overridable ssh-eph-base))
 (defun ssh-eph-base (ssh) (+ (e1000-state-base) #x6C4))
 
 ;; Pre-compute X25519 server ephemeral key pair.
 ;; Stores private key at state+0x6C4, public key at state+0x6E4.
+(declaim (overridable pre-compute-server-eph))
 (defun pre-compute-server-eph (ssh)
   (let ((state (e1000-state-base)))
     ;; Generate random private key
@@ -1670,6 +1680,7 @@
 
 ;; Fast Ed25519 sign using pre-computed s, prefix, and host public key.
 ;; Saves one ed-base-mult and one SHA-512 compared to ed25519-sign.
+(declaim (overridable ed25519-sign-fast))
 (defun ed25519-sign-fast (message msg-len)
   (let ((state (e1000-state-base)))
     ;; Load pre-computed s and prefix
@@ -1827,6 +1838,7 @@
 
 ;; Message loop — runs until the client disconnects; an authenticated session
 ;; never times out, an unauthenticated one does (see below).
+(declaim (overridable ssh-message-loop))
 (defun ssh-message-loop (ssh)
   (let ((flag-addr (+ (conn-ssh 3) #x700))
         (idle 0)
@@ -1863,11 +1875,15 @@
 ;; SSH-WAIT-EXPIRED-P is the one policy: COUNT polls against LIMIT, SINCE = the
 ;; clock at the start of the wait.  The default is the count alone (unchanged);
 ;; a target with a usable counter overrides both (the x64 CL image: TSC).
+(declaim (overridable ssh-preauth-clock))
 (defun ssh-preauth-clock () 0)
+(declaim (overridable ssh-peer-closed-p))
 (defun ssh-peer-closed-p () (= (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1))
+(declaim (overridable ssh-wait-expired-p))
 (defun ssh-wait-expired-p (count limit since)
   (or (ssh-peer-closed-p) (> count limit)))
 ;; The wait for the client's version string, the first thing it sends.
+(declaim (overridable ssh-version-wait-expired-p))
 (defun ssh-version-wait-expired-p (count since) (ssh-wait-expired-p count 50 since))
 
 ;; The next packet, waiting as long as SSH-WAIT-EXPIRED-P allows; NIL on timeout.

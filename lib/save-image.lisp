@@ -62,29 +62,34 @@
    host/macos/image-segments.sh hard-codes the same number."
   192)
 
+(declaim (overridable %core-jit-arena-lo))
 (defun %core-jit-arena-lo ()
   "Base of the fixed JIT exec arena (boot-linux-aarch64.lisp
    +linux-aarch64-jit-arena-base+, overridable per build as the hosted
    layout's :JIT-ARENA-BASE).  Arch builds without one override to 0."
   (%layout :jit-arena-base #x3000000000))
 
+(declaim (overridable %core-jit-arena-hi))
 (defun %core-jit-arena-hi ()
   "End of the JIT exec arena: code grows up from its base, data pages
    (mvm-eval.lisp %JIT-DATA-PAGE) down from here.  Hosted reserves 512 MB;
    a board's arena is the fixed region it has (the Pi overrides)."
   (+ (%core-jit-arena-lo) #x20000000))
 
+(declaim (overridable %core-jit-bump-slot))
 (defun %core-jit-bump-slot ()
   "Address of the arena's RAW bump word (the trap reads it).  Hosted aarch64:
    0x10000F58 (0x1000FF38 with threads: translate-aarch64 A64-GC-STAT-ADDR);
    the Pi overrides to its own (%jit-exec-bump)."
   (%layout-if :a64-threads (%conv-addr #x1000FF38) (%conv-addr #x10000F58)))
 
+(declaim (overridable %core-jit-arena-bump))
 (defun %core-jit-arena-bump ()
   "Current bump pointer of the arena, or 0 when this process has none.  The
    bump word is RAW, so the :u64 load is halved."
   (* 2 (mem-ref (%core-jit-bump-slot) :u64)))
 
+(declaim (overridable %core-jit-lossy-p))
 (defun %core-jit-lossy-p ()
   "True when a snapshot would silently drop live JIT code pages: the JIT is on
    and produced pages the core cannot carry.  Hosted aarch64 carries them in
@@ -100,12 +105,19 @@
 ;;; block and the MCGC config words RAW, so a :u64 load halves them; its build
 ;;; overrides these with %gc-read64 (build-generic-cli.lisp).
 
+(declaim (overridable %core-from-start))
 (defun %core-from-start () (%gc-from-start))
+(declaim (overridable %core-to-start))
 (defun %core-to-start () (%gc-to-start))
+(declaim (overridable %core-space-size))
 (defun %core-space-size () (%gc-space-size))
+(declaim (overridable %core-page-base))
 (defun %core-page-base () (%gc-bitmap-page-base))
+(declaim (overridable %core-bitmap-base))
 (defun %core-bitmap-base () (%gc-bitmap-base))
+(declaim (overridable %core-cons-bitmap-base))
 (defun %core-cons-bitmap-base () (%gc-cons-bitmap-base))
+(declaim (overridable %core-heap-base))
 (defun %core-heap-base (from)
   "The heap mapping's base: from_start less the heap-alloc-start padding, where
    the stub left argc/argv."
@@ -116,18 +128,23 @@
 ;;; band, which the first bordeaux-threads lock carves off region 0's top and
 ;;; which holds the sync-cell control words, region control blocks and actor
 ;;; table.  0 / 0 = none (the default).
+(declaim (overridable %core-extra-addr))
 (defun %core-extra-addr () 0)
+(declaim (overridable %core-extra-len))
 (defun %core-extra-len () 0)
+(declaim (overridable %core-extra-ok-p))
 (defun %core-extra-ok-p (addr len)
   "True when [ADDR, ADDR+LEN) is memory THIS process has mapped and that the
    restore may overwrite."
   nil)
 
+(declaim (overridable %core-geometry-ok-p))
 (defun %core-geometry-ok-p (saved-size)
   "True when a core whose region 0 had SAVED-SIZE semispaces can restore here.
    A carve (above) shrinks region 0, so the saved size may be smaller than a
    fresh boot's; the arch that carves overrides this and %CORE-ADOPT-GEOMETRY."
   (= saved-size (%core-space-size)))
+(declaim (overridable %core-adopt-geometry))
 (defun %core-adopt-geometry (saved-size)
   "Make region 0 the size it had when saved.  Runs after the heap is in and
    the allocation pointer is published.  Default: nothing (sizes are equal)."
@@ -137,10 +154,12 @@
 ;;; `fd' is opaque to the shared code: a Linux descriptor here, the address of
 ;;; a cursor word in the bare-metal overrides (build-cl-repl-common.lisp).
 
+(declaim (overridable %core-open-out))
 (defun %core-open-out (path)
   "Create the core sink for PATH; negative on failure."
   (%sys-open-wronly path))
 
+(declaim (overridable %core-open-in))
 (defun %core-open-in ()
   "Open the core source for restore: argv[2], read through the raw pointer
    the stub stored at heap-base+32 (STR x21,[x22,#32]) -- no string exists yet.
@@ -157,15 +176,18 @@
     ;; may allocate yet.
     (%core-open-path-at (if (= hi 0) lo (+ lo (* 4294967296 hi))))))
 
+(declaim (overridable %core-close))
 (defun %core-close (fd)
   (syscall3 3 fd 0 0))
 
+(declaim (overridable %core-open-path-at))
 (defun %core-open-path-at (addr)
   "Open the NUL-terminated path at raw address ADDR for reading.  x86-64
    syscall numbering; the aarch64 image overrides this with openat (its ABI
    has no open)."
   (syscall3 2 addr 0 0))
 
+(declaim (overridable %core-read-all))
 (defun %core-read-all (fd addr len)
   "read(2) LEN bytes into ADDR, looping over short reads.  Returns bytes read."
   (let ((got 0))
@@ -175,6 +197,7 @@
         (when (<= n 0) (return got))
         (setq got (+ got n))))))
 
+(declaim (overridable %core-write-all))
 (defun %core-write-all (fd addr len)
   "write(2) LEN bytes from ADDR, looping over short writes.  Returns bytes written."
   (let ((done 0))
@@ -269,6 +292,7 @@
     (%core-close fd)
     (- free from)))
 
+(declaim (overridable save-and-die))
 (defun save-and-die (path)
   "Snapshot this process to PATH and exit.  Restart it with: modus --core PATH."
   (%save-image path)
@@ -276,6 +300,7 @@
 
 ;;; ---- restore: runs in kernel-main before any boot init ---------------------
 
+(declaim (overridable %core-requested-p))
 (defun %core-requested-p ()
   "True when argv[1] is --core.  The boot stub copies argv[1] to 0x10000208
    and argc to 0x10000200."
@@ -288,6 +313,7 @@
        (= (mem-ref #x1000020D :u8) 101)     ; e
        (= (mem-ref #x1000020E :u8) 0)))
 
+(declaim (overridable %core-die))
 (defun %core-die (msg)
   (write-string-serial msg)
   (write-char-serial 10)
@@ -298,6 +324,7 @@
   (when (< (%core-read-all fd dst len) len)
     (%core-die "core: short read")))
 
+(declaim (overridable %core-restore-window))
 (defun %core-restore-window (fd stage)
   "Read the snapshot's 4 KB metadata window.  The collector's fixed roots land
    in place; every other word is per-process and goes to STAGE.  x86-64
@@ -341,10 +368,12 @@
 ;; no delay is enough -- so most likely code that depends on a register or word
 ;; the firmware path leaves different.  OPEN: find it, then this is diagnostics
 ;; again and nothing else.
+(declaim (overridable %core-progress))
 (defun %core-progress (k) k)
 ;; Before a bare-metal restore: T to go ahead.  The Raspberry Pi image replaces
 ;; it (build-cl-repl-common.lisp) to report how far the PREVIOUS boot's restore
 ;; got and to offer a way past a restore that hangs.
+(declaim (overridable %core-pre-restore))
 (defun %core-pre-restore () t)
 
 (defun %restore-image ()
@@ -549,6 +578,7 @@
   (setq *layout-slide* (+ (%layout-slide) d))
   (%jit-after-relocate l0 l1 d))
 
+(declaim (overridable %core-post-restore))
 (defun %core-post-restore ()
   "Per-process state a snapshot cannot carry: signal handlers, and whether
    this process may compile to native code.  An iOS app cannot write code at

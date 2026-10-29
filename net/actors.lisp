@@ -298,6 +298,7 @@
 ;;; ============================================================
 
 (defun send-ipi-to-idle (target-cpu) 0)
+(declaim (overridable wake-idle-ap))
 (defun wake-idle-ap () 0)
 
 ;;; ============================================================
@@ -536,10 +537,12 @@
 ;; +OP-RESTORE-CTX+ zeroes the lock word after the stack switch and before the
 ;; jump.  That is why RECEIVE now calls this instead of unlocking itself: an
 ;; override cannot re-acquire a lock it was not handed.
+(declaim (overridable ap-scheduler-blocked))
 (defun ap-scheduler-blocked ()
   (spin-unlock (sched-lock-addr))
   (ap-scheduler))
 
+(declaim (overridable ap-scheduler))
 (defun ap-scheduler ()
   ;; Switch to per-CPU idle stack
   (switch-idle-stack)

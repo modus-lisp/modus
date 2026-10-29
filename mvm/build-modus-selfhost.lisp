@@ -563,6 +563,7 @@
       (write-string-serial \" first-bad=\") (print-dec bad)
       (write-char-serial 10))
     bad))
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   ;; (a) vreg -> AArch64 physical register number.  Mirrors the
   ;; *a64-vreg-to-phys* defparameter AND *target-aarch64*'s :reg-map:
@@ -2134,10 +2135,6 @@
     (string #\Newline)
     *stage2-test-source*
     (string #\Newline)
-    ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
-    ;; defvar; runtime macroexpand-1 references it).
-    "(defvar *sym-name-table* nil)
-"
     (string #\Newline)
     *sft-auto-source*
     (string #\Newline)

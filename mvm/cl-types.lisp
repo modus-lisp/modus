@@ -1913,6 +1913,7 @@
 ;; equal IS wrappped via compile-li-func to %EQUAL-FN already; no defun
 ;; needed (and recursive (defun equal (a b) (equal a b)) infinite-loops).
 (defun eq (a b) (eq a b))
+(declaim (overridable eql))
 (defun eql (a b)
   "EQL — same as EQ for non-numbers/non-chars; for numbers, equal in
    type AND value.  Boxed numerics (IEEE floats subtag #x60, ratios

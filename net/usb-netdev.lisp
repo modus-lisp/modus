@@ -94,6 +94,7 @@
 ;; re-probe and re-bind; gone -> unbind.  Clear the edge by writing prtconndet
 ;; back with the OTHER W1C bits masked off (dwc2-hprt0-mask), so this poll does
 ;; not accidentally clear port-enable/enable-change.  Read RAW to test the bits.
+(declaim (overridable usb-netdev-hotplug-poll))
 (defun usb-netdev-hotplug-poll ()
   (let ((hprt (dwc2-read (dwc2-hprt0))))
     (when (not (zerop (logand hprt (hprt0-prtconndet))))

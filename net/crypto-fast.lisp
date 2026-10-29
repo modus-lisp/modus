@@ -12,6 +12,7 @@
 ;; ================================================================
 ;; fe-from-bytes: Convert 32 LE bytes to field element (10 limbs)
 ;; ================================================================
+(declaim (overridable fe-from-bytes))
 (defun fe-from-bytes (bytes)
   (let ((fe (make-array 40)))
     (let ((fb (+ (ash (logand fe (- 0 4)) 1) 8)))
@@ -30,6 +31,7 @@
 ;; ================================================================
 ;; fe-from-int: Convert integer to field element
 ;; ================================================================
+(declaim (overridable fe-from-int))
 (defun fe-from-int (n)
   (let ((fe (make-array 40)))
     (dotimes (i 40) (aset fe i 0))
@@ -41,6 +43,7 @@
 ;; ================================================================
 ;; fe-copy: Copy field element limbs
 ;; ================================================================
+(declaim (overridable fe-copy))
 (defun fe-copy (dst src)
   (let ((db (+ (ash (logand dst (- 0 4)) 1) 8)))
     (let ((sb (+ (ash (logand src (- 0 4)) 1) 8)))
@@ -59,6 +62,7 @@
 ;; ================================================================
 ;; fe-add: Add two field elements
 ;; ================================================================
+(declaim (overridable fe-add))
 (defun fe-add (dst a b)
   (let ((db (+ (ash (logand dst (- 0 4)) 1) 8)))
     (let ((ab (+ (ash (logand a (- 0 4)) 1) 8)))
@@ -78,6 +82,7 @@
 ;; ================================================================
 ;; fe-sub: Subtract field elements, add 2p to keep non-negative
 ;; ================================================================
+(declaim (overridable fe-sub))
 (defun fe-sub (dst a b)
   (let ((db (+ (ash (logand dst (- 0 4)) 1) 8)))
     (let ((ab (+ (ash (logand a (- 0 4)) 1) 8)))
@@ -97,6 +102,7 @@
 ;; ================================================================
 ;; fe-carry: Carry propagation (even limbs 26 bits, odd 25 bits)
 ;; ================================================================
+(declaim (overridable fe-carry))
 (defun fe-carry (h)
   (let ((hb (+ (ash (logand h (- 0 4)) 1) 8)))
     (let* ((v0 (mem-ref hb :u32))
@@ -148,6 +154,7 @@
 ;; ================================================================
 ;; fe-reduce: Full reduction mod p = 2^255 - 19
 ;; ================================================================
+(declaim (overridable fe-reduce))
 (defun fe-reduce (h)
   (fe-carry h)
   (fe-carry h)
@@ -198,6 +205,7 @@
 ;; ================================================================
 ;; fe-to-bytes: Convert field element to 32 LE bytes
 ;; ================================================================
+(declaim (overridable fe-to-bytes))
 (defun fe-to-bytes (fe)
   (fe-reduce fe)
   (let ((fb (+ (ash (logand fe (- 0 4)) 1) 8)))
@@ -249,6 +257,7 @@
 ;; ================================================================
 ;; fe-store-fixed / fe-load-fixed
 ;; ================================================================
+(declaim (overridable fe-store-fixed))
 (defun fe-store-fixed (fe addr)
   (let ((fb (+ (ash (logand fe (- 0 4)) 1) 8)))
     (let ((off 0))
@@ -256,6 +265,7 @@
         (setf (mem-ref (+ addr off) :u32) (mem-ref (+ fb off) :u32))
         (setq off (+ off 4))))))
 
+(declaim (overridable fe-load-fixed))
 (defun fe-load-fixed (dst addr)
   (let ((db (+ (ash (logand dst (- 0 4)) 1) 8)))
     (let ((off 0))
@@ -272,6 +282,7 @@
 ;;     → let* (50+ products/carry) → 10 writes
 ;; Total ~90 frame slots, well within 120 limit.
 
+(declaim (overridable fe-mul))
 (defun fe-mul (dst f g)
   (let ((db (+ (ash (logand dst (- 0 4)) 1) 8))
         (fb (+ (ash (logand f (- 0 4)) 1) 8))
@@ -366,6 +377,7 @@
           (setf (mem-ref (+ db 36) :u32) r9)))))
   dst)
 
+(declaim (overridable fe-sq))
 (defun fe-sq (dst f)
   (fe-mul dst f f))
 
@@ -391,6 +403,7 @@
     (setf (mem-ref (+ db 36) :u32) 0))
   dst)
 
+(declaim (overridable x25519))
 (defun x25519 (k u)
   (let ((kc (make-array 32))
         (x1 (make-array 40))

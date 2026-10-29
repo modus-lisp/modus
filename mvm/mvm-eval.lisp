@@ -127,6 +127,7 @@
    its translate-mvm-to-aarch64 / a64-* references resolve to unused sentinels,
    symmetric to the x64 image's existing dead translate-mvm-to-x64 ref).")
 
+(declaim (overridable %jit-enabled-p))
 (defun %jit-enabled-p ()
   "WS4-S5b JIT gate.  The build OVERRIDES this defun (build-x64-linux.lisp,
    baked from MODUS_USE_JIT) to return T or NIL — last-defun-wins.  This base
@@ -2184,6 +2185,7 @@
   "DIAGNOSTIC: how many runtime-defined functions have been installed as real
    native code by %jit-install-native-fns.  NIL on a JIT-off image.")
 
+(declaim (overridable %jit-install-native-fns))
 (defun %jit-install-native-fns (base fnoffs names)
   "Publish each function of FNOFFS whose NAME is in NAMES (the top-level DEFUNs
    of this module) as a REAL NATIVE function at BASE+offset, in both global
@@ -2903,6 +2905,7 @@
 (defvar *x64-jit-shared-gc-tramp*)
 (defvar *x64-last-gc-tramp-label*)
 
+(declaim (overridable %jit-translate-page-1))
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -5411,6 +5414,7 @@
 ;;; ~650k calls per alexandria quickload; STRING-UPCASE was 29% of the PC
 ;;; profile.  This override (spliced after compiler.lisp) restores the raw
 ;;; %PRIM-AREF loop with inline ASCII upcasing.  Bit-identical result.
+(declaim (overridable compute-name-hash))
 (defun compute-name-hash (name-string)
   ;; A wrapped (multi-dimensional / adjustable / base-char) string stores its
   ;; characters behind a #x34 header: %PRIM-AREF would read the wrapper's

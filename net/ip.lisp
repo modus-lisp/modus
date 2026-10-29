@@ -320,7 +320,9 @@
 ;; Seams a board may override (net/r8152-post.lisp): a bare ACK built without
 ;; the general path's allocations (NIL = not available here), and the
 ;; advertised receive window.
+(declaim (overridable tcp-send-ack-fast))
 (defun tcp-send-ack-fast () nil)
+(declaim (overridable tcp-rx-window))
 (defun tcp-rx-window () 8192)
 
 (defun tcp-send-segment (flags data data-len)
@@ -430,6 +432,7 @@
 ;; units) while a busy stream is never made to sit out a whole delay.
 ;; Returns true when it knows a frame is ready; NIL when it timed out (or,
 ;; here, cannot tell).
+(declaim (overridable net-rx-idle))
 (defun net-rx-idle () (io-delay) nil)
 
 (defun tcp-receive (timeout)
@@ -669,6 +672,7 @@
 ;; 1480-byte array and hands it to the NIC whole, so a longer payload overran
 ;; both (an SSH reply over ~1400 bytes never arrived).  Split at 1360 bytes,
 ;; which also stays under the MSS of tunnelled paths.
+(declaim (overridable tcp-send-conn))
 (defun tcp-send-conn (cb data len)
   (if (<= len 1360)
       (tcp-send-segment-conn cb 24 data len)
@@ -703,6 +707,7 @@
                 (return found))))))
       (setq i (+ i 1)))))
 
+(declaim (overridable net-deliver-data))
 (defun net-deliver-data (conn buf pkt-len tcp-flags)
   ;; RST or FIN from the client of the connection being served: it is gone (or
   ;; sends nothing more), so the SSH waits stop waiting (SSH-PEER-CLOSED-P).
@@ -856,6 +861,7 @@
               (hash-of "ssh-handler-3")))))
 
 ;; Override ssh-connection-handler for single-threaded operation
+(declaim (overridable ssh-connection-handler))
 (defun ssh-connection-handler (conn)
   (let ((ssh (conn-ssh conn))
         (cb (conn-base conn)))
@@ -870,6 +876,7 @@
 (defun ssh-handler-2 () (ssh-connection-handler 2))
 (defun ssh-handler-3 () (ssh-connection-handler 3))
 
+(declaim (overridable net-handle-tcp))
 (defun net-handle-tcp (buf pkt-len)
   (let ((src-ip (buf-read-u32-mem buf 26))
         (src-port (buf-read-u16-mem buf 34))
@@ -888,6 +895,7 @@
 ;; Hot-plug hook: no-op by default so every net image compiles and runs
 ;; unchanged.  net/usb-netdev.lisp overrides it (loaded later, last-defun-wins)
 ;; to re-bind the USB NIC driver on a connect/disconnect edge.
+(declaim (overridable usb-netdev-hotplug-poll))
 (defun usb-netdev-hotplug-poll () nil)
 
 (defun net-actor-main ()
@@ -1410,6 +1418,7 @@
                           (setq opt-offset (+ opt-offset 2 opt-len))))))))))
       yiaddr)))
 
+(declaim (overridable dhcp-wait-tries))
 (defun dhcp-wait-tries ()
   "Polls per DHCP wait (OFFER, then ACK).  2500 is the historic value, sized by
    the aarch64 boards' io-delay; the x86 CL adapter's io-delay is far shorter

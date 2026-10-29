@@ -629,6 +629,7 @@
 
 (defvar *aarch64-jit-coinit-source*
   (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
@@ -2521,10 +2522,6 @@
     ;; WRITE-BYTE), and BEFORE *driver-source*, whose kernel-main calls
     ;; run-net-pipeline.
     *cli-bare-metal-net-source*
-    ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
-    ;; defvar; runtime macroexpand-1 references it).
-    "(defvar *sym-name-table* nil)
-"
     (string #\Newline)
     *sft-auto-source*
     (string #\Newline)

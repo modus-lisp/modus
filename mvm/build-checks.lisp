@@ -1445,6 +1445,30 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                     (and nm (gethash (cdr r) nm))))))
       (format t ";; gv-cache: slot table written to ~A~%" dump))))
 
+(defun %gck-redef-mode ()
+  "MODUS_REDEF_CHECK: unset or error = an undeclared redefinition fails the
+   build; warn = report it and build anyway; 0 = say nothing."
+  (let ((v (sb-ext:posix-getenv "MODUS_REDEF_CHECK")))
+    (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
+
+(defun check-undeclared-redefinitions ()
+  "Step 1 of docs/builder-packages-plan.md.  Every DEFUN that replaces an
+   earlier one in the same image must be a declared seam: the file holding the
+   default says (DECLAIM (OVERRIDABLE NAME)).  Anything else is an accident
+   that last-defun-wins resolves silently -- this names both source lines."
+  (let ((mode (%gck-redef-mode))
+        (u (reverse *undeclared-redefinitions*)))
+    (unless (eq mode :off)
+      (format t ";; redef-check: ~D undeclared redefinition~:P~%" (length u))
+      (dolist (r u)
+        (format t ";;   UNDECLARED-REDEFINITION ~A  (old: ~A, new: ~A)~%"
+                (first r) (second r) (third r)))
+      (when (and (eq mode :error) u)
+        (error "redef-check: ~D undeclared redefinition~:P (first: ~A).  Declare ~
+                the seam with (declaim (overridable NAME)) in the file that ~
+                defines the default, or delete the copy that is never used."
+               (length u) (first (first u)))))))
+
 (defvar *gck-defun-log* nil
   "(NAME . FILE:LINE) for every function MVM-COMPILE-FUNCTION compiled in the
    current BUILD-IMAGE, newest first.  Host-side only (see below).")
@@ -1473,11 +1497,21 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
       (push (cons name *current-source-location*) *gck-defun-log*)
       (apply f name args))))
 
-(unless *build-image-unwrapped*
+(defvar *build-image-wrapper* nil
+  "The wrapper this file installs as BUILD-IMAGE.  Re-installed whenever
+   BUILD-IMAGE is anything else: a build that loads lib/load-mvm.lisp TWICE
+   (build-uefi-cl-repl, then build-cl-repl-common) reloads cross.lisp, whose
+   DEFUN replaces the wrapper -- and a guard on *BUILD-IMAGE-UNWRAPPED* alone
+   then declined to wrap again, so that image ran no build check at all.")
+
+(unless (and *build-image-wrapper*
+             (eq (fdefinition 'build-image) *build-image-wrapper*))
   (setf *build-image-unwrapped* #'build-image)
-  (setf (fdefinition 'build-image)
+  (setf *build-image-wrapper*
         (lambda (&rest args)
           (setf *gck-defun-log* nil)
+          (setf *undeclared-redefinitions* nil)
+          (clrhash *overridable-names*)
           (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
                             (when forms
@@ -1511,7 +1545,9 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
               (check-compiler-warns hist (nreverse unknown)))
             (%gck-guard "gv-cache-report" (%gck-gv-cache-report))
             (%gck-guard "defun-inventory" (%gck-defun-inventory))
-            result))))
+            (check-undeclared-redefinitions)
+            result)))
+  (setf (fdefinition 'build-image) *build-image-wrapper*))
 
 
 ;;; ------------------------------------------------------------------

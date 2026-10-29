@@ -6,6 +6,7 @@
 ;;;; on net/hosted-sockets.lisp (socket-connect/send/recv/close + dns-lookup).
 
 ;;; --- host string -> host-order IPv4 int (dotted literal or DNS A lookup) ---
+(declaim (overridable %host-string-to-ip))
 (defun %host-string-to-ip (host)
   (let ((n (length host)) (dots 0) (alldigit t) (i 0))
     (loop

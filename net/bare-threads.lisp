@@ -183,6 +183,7 @@
 ;;; the Pi's (EL2, firmware spin table); net/bare-threads-virt.lisp replaces them for
 ;;; QEMU virt (EL1, PSCI CPU_ON) by last-defun-wins.
 
+(declaim (overridable %bt-stub-entry-words))
 (defun %bt-stub-entry-words ()
   "The core entry stub, at S (test/rpi-smp/stubs.s): EL2's translation registers."
   (list #x10004000 #xf9400001 #xd51ca201 #xf9400401 #xd51c2041 #xf9400801
@@ -194,12 +195,14 @@
         #xf2bbd5ba #xd2800021 #xf9003001 #xf9402c09 #xd280001d #xd280001e
         #xd63f0120 #x10003aa0 #xd2800041 #xf9003001 #xd503205f #x17ffffff))
 
+(declaim (overridable %bt-stub-release-words))
 (defun %bt-stub-release-words (s)
   "S+0x1000: clean the stub to the point of coherency, then SEV the spinning cores."
   (append (%bt-movz-movk-x0 s)
           (list #x91240002 #xd50b7e20 #x91010000 #xeb02001f #x54ffffa3
                 #xd2801800 #xd50b7e20 #xd5033f9f #xd503209f #xd65f03c0)))
 
+(declaim (overridable %bt-stub-snapshot-words))
 (defun %bt-stub-snapshot-words (p)
   "S+0x1100: core 0's EL2 translation registers and x28 into the parameter block P."
   (append (%bt-movz-movk-x0 p)
@@ -207,17 +210,21 @@
                 #xf9000801 #xd53c1001 #xf9000c01 #xd53cc001 #xf9001001
                 #xf900141c #xd65f03c0)))
 
+(declaim (overridable %bt-stub-tlbi-words))
 (defun %bt-stub-tlbi-words ()
   "S+0x1500: TLBI ALLE2IS between barriers."
   (list #xd5033a9f #xd50c831f #xd5033b9f #xd5033fdf #xd65f03c0))
 
+(declaim (overridable %bt-release))
 (defun %bt-release (c s)
   "Start core C at the stub S: the firmware's spin table entry, then the release
    routine's SEV."
   (%gc-write64 (+ #xD8 (* 8 c)) s)
   (%jit-call (+ s #x1000)))
 
+(declaim (overridable %bt-l2-table))
 (defun %bt-l2-table () #x71000)       ; boot/boot-rpi-cl.lisp's L2 table
+(declaim (overridable %bt-va->pa))
 (defun %bt-va->pa (a) a)              ; the Pi's DRAM is identity-mapped
 
 (defun %bt-stub-install ()

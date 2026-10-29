@@ -88,6 +88,7 @@
   "The process argc, stored by the boot stub at 0x10000200."
   (mem-ref #x10000200 :u32))
 
+(declaim (overridable %cli-argv-base))
 (defun %cli-argv-base ()
   "Real byte address of argv[0]'s slot = initial-RSP + 8 (RSP holds argc).
    %gc-stack-base returns the raw RSP right-shifted by one (a u64 load stores
@@ -99,6 +100,7 @@
    is the actor's, and getenv from an actor walked its stack as envp."
   (+ (* 2 (%gc-stack-base-0)) 8))
 
+(declaim (overridable %cli-collect-argv))
 (defun %cli-collect-argv ()
   "Return the process arguments as a list of strings — element 0 is the
    program name (argv[0]), like SBCL's *posix-argv*.  Reads every argv[i]
@@ -118,6 +120,7 @@
             (push (%cli-cstr-at ptr) acc)))
       (setq i (+ i 1)))))
 
+(declaim (overridable %cli-getenv))
 (defun %cli-getenv (name)
   "Look up environment variable NAME on the initial stack's envp vector
    (which immediately follows argv's NULL terminator).  Returns the value
@@ -234,6 +237,7 @@
 ;;; the REPL (moved here from ql-shim's %ql-repl so it is shared)
 ;;; ===========================================================================
 
+(declaim (overridable %cli-repl))
 (defun %cli-repl (banner-p)
   "Interactive read-eval-print loop over stdin (fd 0).  When BANNER-P, print
    the startup banner first.  Ctrl-D (EOF) exits."

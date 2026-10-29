@@ -3923,7 +3923,7 @@ Most of the list below had been fixed without the list being updated.
 
 | # | limitation | now |
 |---|---|---|
-| 1 | last-defun-wins | **STILL TRUE INSIDE AN IMAGE**: two DEFUNs of one name in baked source both resolve to the last, and a `#'NAME` taken between them is the last one too (the image is linked statically).  At RUNTIME it is CL: an old function object keeps its old code, as in SBCL. |
+| 1 | last-defun-wins | **STILL TRUE INSIDE AN IMAGE**: two DEFUNs of one name in baked source both resolve to the last, and a `#'NAME` taken between them is the last one too (the image is linked statically).  At RUNTIME it is CL: an old function object keeps its old code, as in SBCL.  **But it is no longer silent (2026-10-29):** a redefinition is a build error unless the file holding the default says `(declaim (overridable NAME))` -- see "Redefinition is declared" below. |
 | 2 | variable-index ASET as a non-last form | fixed (both ways) |
 | 3 | symbol identity per package | CL-correct, not a limitation |
 | 4 | YIELD at every loop back-edge | a description, not a defect (SEV+WFE on aarch64 bare metal; `MODUS_YIELD_NOP=1` for NOP) |
@@ -3934,6 +3934,31 @@ Most of the list below had been fixed without the list being updated.
 | 8a | `(ash most-positive-fixnum 1)` wrapping | fixed: promotes to the bignum |
 | 8b | variable-count `bignum-ash` | fixed |
 | 8c | negative overflow in checked `*` / `+` | fixed: `(* most-negative-fixnum 2)` = -2^63 |
+
+### Redefinition is declared (builder packages step 1, 2026-10-29)
+
+Every image's DEFUNs live in one namespace and the last wins, so a platform
+seam (`%SYS-OPEN-RDONLY` in cl-fileio, replaced per arch by cli-toplevel's
+text; `E1000-SEND` replaced by every NIC driver) looks exactly like an
+accident.  Now they differ: the file that holds the DEFAULT says
+`(declaim (overridable NAME ...))` directly above it, and any other
+redefinition fails the build, naming both source lines.
+`MODUS_REDEF_CHECK=warn` reports instead; `0` says nothing.  The declaration
+emits nothing (a toplevel DECLAIM), and SBCL is told it is a declaration at the
+top of compiler.lisp.  Every build log reports locations as `FILE:LINE`; text a
+build script appends without a file of its own reads `after:FILE:LINE`.
+
+Measured with `MODUS_DEFUN_INVENTORY=FILE` (every DEFUN an image compiles,
+written host-side) over all 31 matrix images: 92 definitions no image ever
+reached were deleted (prelude's minimal FORMAT/INTERN/TYPEP/REDUCE under the
+cl-*.lisp versions, crypto.lisp's field arithmetic under crypto-fast, ...), and
+186 seams were declared.  Two were bugs: `%FORM-MENTIONS-P` was defined twice
+with different signatures, so `%INFERRED-SINGLE-LOCAL-P`'s guard never fired
+(now `%FORM-MENTIONS-ANY-P`); and `build-uefi-cl-repl` had never run ANY build
+check, because loading `lib/load-mvm.lisp` twice replaced the `BUILD-IMAGE`
+wrapper (it re-installs itself now).  A dead-looking definition in a file the
+SBCL host also loads (compiler, translators, boot, x64-asm) is NOT dead: it can
+be the host compiler's own.
 
 Not in the old list and still worth knowing: an undeclared free variable is
 treated as a global (CL would make it special and warn; the same answer, but the

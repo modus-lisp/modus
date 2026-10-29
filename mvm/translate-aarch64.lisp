@@ -1460,15 +1460,6 @@
 ;;; sf|0|0|11010110|Rm|001001|Rn|Rd  = LSRV
 ;;; sf|0|0|11010110|Rm|001010|Rn|Rd  = ASRV
 
-(defun a64-lslv (buf rd rn rm)
-  "LSL Xd, Xn, Xm  (variable shift left)"
-  (a64-emit buf (logior (ash 1 31)
-                        (ash #b0011010110 21)
-                        (ash rm 16)
-                        (ash #b001000 10)
-                        (ash rn 5)
-                        rd)))
-
 (defun a64-lsrv (buf rd rn rm)
   "LSR Xd, Xn, Xm  (variable logical shift right)"
   (a64-emit buf (logior (ash 1 31)
@@ -2449,8 +2440,11 @@
 ;;; identity DEVICE memory (PCI MMIO), so JIT pages written at 0x14000000 would
 ;;; land in unbacked MMIO and %jit-call would branch into zeros.  The virt build
 ;;; overrides these with a real DRAM window.
+(declaim (overridable %jit-exec-bump))
 (defun %jit-exec-bump () #x13FFFFF0)
+(declaim (overridable %jit-exec-lo))
 (defun %jit-exec-lo   () #x14000000)
+(declaim (overridable %jit-exec-hi))
 (defun %jit-exec-hi   () #x18000000)
 
 (defconstant +sysreg-cntpct-el0+ #xDF01 "CNTPCT_EL0: S3_3_C14_C0_1")

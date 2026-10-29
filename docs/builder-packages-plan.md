@@ -62,6 +62,16 @@ home package it was read in.
 
 ### 1. Make every redefinition explicit (no packages yet)
 
+**DONE 2026-10-29.**  Measured first: `MODUS_DEFUN_INVENTORY` lists every DEFUN
+each image compiles, and build logs now say `FILE:LINE` (`after:FILE:LINE` for
+text a build script appends).  Across the 31 matrix images 92 definitions were
+unreachable everywhere and are deleted; 186 seams carry `(declaim (overridable
+NAME))`; the check is fatal by default (`MODUS_REDEF_CHECK=warn|0` to relax),
+and a baked duplicate `STRING-UPCASE` fails the build naming both lines.  The
+declaration is plain `overridable`, not `modus:overridable`: there is no MODUS
+package in the image yet (step 4).  Found on the way: `%FORM-MENTIONS-P` was
+two functions with one name, and the UEFI image had never run a build check.
+
 The cheapest step, and the one that removes the silent half of the problem
 without moving anything.
 

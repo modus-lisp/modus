@@ -496,6 +496,7 @@
 ;;; collectors of the 64-bit targets size #x13 as bytes, and those builds
 ;;; override it to T (last definition wins).  Everything READS both kinds
 ;;; regardless.
+(declaim (overridable %narrow-strings-p))
 (defun %narrow-strings-p () nil)
 
 (defun %make-base-string (n)
@@ -571,6 +572,7 @@
    element loop — a bordered 320x180 frame copy took 16 ms that way)."
   (and (%u8-bare-p dst) (%u8-bare-p src)))
 
+(declaim (overridable %bulk-copy-u8))
 (defun %bulk-copy-u8 (dst dstart src sstart n)
   "Byte copy SRC[sstart…] → DST[dstart…], memmove semantics like %bulk-copy:
    a same-object copy that moves UP runs from the top.  A byte at a time; the
@@ -592,6 +594,7 @@
           (%u8-set dst (+ dstart i) (%u8-ref src (+ sstart i)))
           (setq i (+ i 1))))))
 
+(declaim (overridable %bulk-copy))
 (defun %bulk-copy (dst dstart src sstart n)
   "Copy N elements SRC[sstart…] → DST[dstart…] by raw word slots.
    Caller must have checked %bulk-copy-ok-p and the bounds.
@@ -613,6 +616,7 @@
           (%word-aset dst (+ dstart i) (%word-aref src (+ sstart i)))
           (setq i (+ i 1))))))
 
+(declaim (overridable %fill-u8))
 (defun %fill-u8 (seq start end item)
   "SEQ[START..END) := the low byte of ITEM, SEQ a plain u8 vector, END within it.
    A byte at a time; the aarch64 and x64 images replace this with one BULK-FILL
@@ -623,6 +627,7 @@
       (%u8-set seq i item)
       (setq i (+ i 1)))))
 
+(declaim (overridable %fill-words))
 (defun %fill-words (seq start end item)
   "SEQ[START..END) := ITEM in raw word slots (%BULK-COPY-OK-P SEQ SEQ, END within
    it).  The aarch64 and x64 images replace this with one BULK-FILL."
@@ -820,6 +825,7 @@
 ;;; Format stub (for self-compilation — writes string to serial)
 ;;; ============================================================
 
+(declaim (overridable write-string-serial))
 (defun write-string-serial (str)
   "Write a string to serial output, character by character."
   (let ((len (array-length str))
@@ -1349,6 +1355,7 @@
             ((eq tn 'equalp)  (function equalp))
             (t                (function %equal-fn))))))
 
+(declaim (overridable %publish-fence))
 (defun %publish-fence ()
   "Order this thread's earlier stores before the next one.  A no-op here; the
    hosted threaded runtime (net/hosted-sync.lisp) redefines it to a barrier
@@ -2380,6 +2387,7 @@
           (setq cur (cdr cur)))
         (%ht-vec-set vec h (nreverse result))))))
 
+(declaim (overridable %rt-reserve))
 (defun %rt-reserve (bytes)
   "Room for BYTES of allocation in the current locked section.  A no-op here;
    the hosted threaded runtime (net/hosted-sync.lisp) redefines it to refill
@@ -2387,12 +2395,14 @@
   bytes
   0)
 
+(declaim (overridable %rt-own-alloc-begin))
 (defun %rt-own-alloc-begin ()
   "Allocate from this thread's OWN region until %RT-OWN-ALLOC-END, even inside
    a locked section.  Returns the token %RT-OWN-ALLOC-END takes.  A no-op
    here; the hosted threaded runtime (net/hosted-sync.lisp) redefines it."
   0)
 
+(declaim (overridable %rt-own-alloc-end))
 (defun %rt-own-alloc-end (token)
   "Undo %RT-OWN-ALLOC-BEGIN.  A no-op here, like it."
   token
@@ -3012,7 +3022,9 @@
    runtime tables.  Zero — the BSS default — everywhere else."
   (mem-ref #x10000DB8 :u32))
 
+(declaim (overridable %rt-enter-locked))
 (defun %rt-enter-locked () 0)
+(declaim (overridable %rt-leave-locked))
 (defun %rt-leave-locked () 0)
 
 (defun %rt-enter ()

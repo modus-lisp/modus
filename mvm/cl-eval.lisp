@@ -1075,9 +1075,26 @@
           ;; Compiled lambda from mvm-define-macro: (lambda (form) ...).
           ;; Try single-arg first; fall back to (form nil) for CL macros
           ;; that want both form and env.
-          (let ((expanded (handler-case (funcall mf form)
-                            (t (c) (funcall mf form nil)))))
-            (values expanded t))))))
+          ;;
+          ;; Only a PROGRAM-ERROR says the one-argument call was the wrong
+          ;; shape.  Anything else was signalled by the expander itself, which
+          ;; therefore took the one argument and ran: it goes out from where
+          ;; it was signalled, as it would from a call.  The fallback used to
+          ;; catch every condition, so an expander that met an undefined
+          ;; function was called again with two arguments and reported
+          ;; "invalid number of arguments: 2" -- TI's LIST-MATCH-P reaching
+          ;; CIRCULAR-LIST, which an outer handler could have supplied had it
+          ;; been told the name.  HANDLER-BIND, not HANDLER-CASE, so a handler
+          ;; outside still sees it before anything unwinds.
+          (block expand
+            (let ((expanded (handler-bind
+                                ((program-error
+                                   (lambda (c)
+                                     (declare (ignore c))
+                                     (return-from expand
+                                       (values (funcall mf form nil) t)))))
+                              (funcall mf form))))
+              (values expanded t)))))))
     (t (values form nil))))
 
 (defun macroexpand (form &rest env-arg)

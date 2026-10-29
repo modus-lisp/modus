@@ -32,7 +32,7 @@
 
 ;;; ---- SHA-384 (SHA-512 with its own IV, truncated) ----
 (defun %sv-sha384 (msg)
-  (sha512-init)
+  (modus-int::sha512-init)
   (let* ((msg-len (length msg))
          (full (* 128 (floor msg-len 128)))
          (rem (- msg-len full))

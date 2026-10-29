@@ -122,7 +122,7 @@
 (unless *interp*
   (dolist (nm (list "LO51" "HI51" "MAC51" "VAR-ASH"))
     (chk (format nil "~a is native" nm)
-         (or (%jit-fn-native-p nm) (%jit-fn-native-p (concatenate (quote string) "COMMON-LISP-USER::" nm)))
+         (or (modus-int::%jit-fn-native-p nm) (modus-int::%jit-fn-native-p (concatenate (quote string) "COMMON-LISP-USER::" nm)))
          t)))
 (setq *result* (list *checks* *fails*))
 (format t "~&MUL-SPLIT ~a: ~a checks, ~a failed  (jit-fallbacks ~a)~%"

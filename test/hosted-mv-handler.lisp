@@ -60,7 +60,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(defun w (base off) (%gc-read64 (+ base off)))
+(defun w (base off) (modus-int::%gc-read64 (+ base off)))
 
 (format t "~%=== MULTIPLE VALUES AND HANDLER-CASE ON TWO THREADS =======~%")
 (format t "  ~D iterations per thread, a forced collection every ~D.~%"
@@ -70,7 +70,7 @@
 (format t "  handler-case, a NESTED unwind whose inner handler itself~%")
 (format t "  unwinds, and a three-value return ACROSS an armed handler-case.~%")
 
-(let ((ctl (%mvhc-selftest 0 *n* *gcevery*)))
+(let ((ctl (modus-int::%mvhc-selftest 0 *n* *gcevery*)))
   (if (zerop ctl)
       (progn (format t "~%  FAIL: the selftest could not start (carve/mmap).~%")
              (setq *fail* (+ *fail* 1)))

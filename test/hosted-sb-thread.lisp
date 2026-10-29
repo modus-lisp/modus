@@ -36,7 +36,7 @@
 ;;;; What works, repeatedly and exactly:
 ;;;;
 ;;;;   * 8 threads x 20 000 locked increments through the AOT primitives
-;;;;     (%MUTEX-LOCK on a raw cell): counter EXACT, 160 000 of 160 000.
+;;;;     (modus-int::%MUTEX-LOCK on a raw cell): counter EXACT, 160 000 of 160 000.
 ;;;;   * FIVE successive batches of 8 threads doing that: all exact.  Thread
 ;;;;     slots and GC regions are reused correctly.
 ;;;;   * 8 threads x 1000 iterations of WITH-MUTEX — i.e. through the
@@ -88,7 +88,7 @@
 ;;; lives in the runtime tables, whose every access takes the runtime lock — so
 ;;; a "lock-free" arm over a global would be serialised by a DIFFERENT lock and
 ;;; could not lose an increment, which would make the negative control vacuous.
-(defun ctr () (+ (%thr-scratch) #xE00))
+(defun ctr () (+ (modus-int::%thr-scratch) #xE00))
 
 (format t "~%=== THE SB-THREAD SURFACE ================================~%")
 
@@ -157,21 +157,21 @@
 ;;; IDENTICAL except for the lock, which is what a control has to be.
 (defun spin (n) (let ((i 0) (s 0)) (loop (when (>= i n) (return s)) (setq s (+ s i)) (setq i (+ i 1)))))
 
-(defun rmw (c) (let ((v (%gc-read64 c))) (spin 300) (%gc-write64 c (+ v 1))))
+(defun rmw (c) (let ((v (modus-int::%gc-read64 c))) (spin 300) (modus-int::%gc-write64 c (+ v 1))))
 
 ;;; AND THEY MUST ALL BE INSIDE THE LOOP AT ONCE.  Eight threads spawned one at
 ;;; a time can finish one at a time, and a control whose threads never overlap
 ;;; cannot lose an increment however wide the window is — measured, twice: the
 ;;; unlocked arm came back 2000 of 2000 because it had run sequentially.  Every
 ;;; worker arrives at this raw-word barrier and spins until all eight have.
-(defun barrier-word () (+ (%thr-scratch) #xE18))
+(defun barrier-word () (+ (modus-int::%thr-scratch) #xE18))
 (defun arrive (want)
-  (%mutex-lock (+ (%thr-scratch) #xE20))
-  (%gc-write64 (barrier-word) (+ (%gc-read64 (barrier-word)) 1))
-  (%mutex-unlock (+ (%thr-scratch) #xE20))
+  (modus-int::%mutex-lock (+ (modus-int::%thr-scratch) #xE20))
+  (modus-int::%gc-write64 (barrier-word) (+ (modus-int::%gc-read64 (barrier-word)) 1))
+  (modus-int::%mutex-unlock (+ (modus-int::%thr-scratch) #xE20))
   (let ((i 0))
     (loop
-      (when (>= (%gc-read64 (barrier-word)) want) (return 0))
+      (when (>= (modus-int::%gc-read64 (barrier-word)) want) (return 0))
       (when (>= i 200000000) (return 1))
       (setq i (+ i 1)))))
 
@@ -196,9 +196,9 @@
   (chk "mutex-name" (sb-thread:mutex-name m) "counter")
   (chk "an idle mutex has no owner" (sb-thread:mutex-owner m) nil)
   ;; ---- NEGATIVE CONTROL ----
-  (%gc-write64 (ctr) 0)
-  (%gc-write64 (barrier-word) 0)
-  (%mutex-init (+ (%thr-scratch) #xE20))
+  (modus-int::%gc-write64 (ctr) 0)
+  (modus-int::%gc-write64 (barrier-word) 0)
+  (modus-int::%mutex-init (+ (modus-int::%thr-scratch) #xE20))
   (let ((ths nil) (i 0))
     (loop
       (when (>= i *n*) (return nil))
@@ -207,15 +207,15 @@
                       ths))
       (setq i (+ i 1)))
     (dolist (th ths) (sb-thread:join-thread th)))
-  (let ((unlocked (%gc-read64 (ctr))))
+  (let ((unlocked (modus-int::%gc-read64 (ctr))))
     (format t "  ... unlocked: ~D of ~D survived (~D LOST)~%"
             unlocked (* *n* *iters*) (- (* *n* *iters*) unlocked))
     (chk-true "NEGATIVE CONTROL: increments were lost without the mutex"
               (< unlocked (* *n* *iters*))))
   ;; ---- THE SAME WORK UNDER THE MUTEX ----
-  (%gc-write64 (ctr) 0)
-  (%gc-write64 (barrier-word) 0)
-  (%mutex-init (+ (%thr-scratch) #xE20))
+  (modus-int::%gc-write64 (ctr) 0)
+  (modus-int::%gc-write64 (barrier-word) 0)
+  (modus-int::%mutex-init (+ (modus-int::%thr-scratch) #xE20))
   (let ((ths nil) (i 0))
     (loop
       (when (>= i *n*) (return nil))
@@ -224,7 +224,7 @@
                       ths))
       (setq i (+ i 1)))
     (dolist (th ths) (sb-thread:join-thread th)))
-  (chk "under WITH-MUTEX every increment survives" (%gc-read64 (ctr))
+  (chk "under WITH-MUTEX every increment survives" (modus-int::%gc-read64 (ctr))
        (* *n* *iters*))
   (chk "the mutex is free afterwards" (sb-thread:mutex-owner m) nil)
   ;; ---- grab/release, wait-p, holding-mutex-p ----
@@ -242,15 +242,15 @@
 (format t "~%-- CONDITION VARIABLES: A REAL PARK, NOT A SPIN ----------~%")
 (let ((m (sb-thread:make-mutex :name "cv-lock"))
       (q (sb-thread:make-waitqueue :name "cv"))
-      (flag (+ (%thr-scratch) #xE08)))
-  (%gc-write64 flag 0)
+      (flag (+ (modus-int::%thr-scratch) #xE08)))
+  (modus-int::%gc-write64 flag 0)
   ;; A timed wait that MUST expire: nobody notifies.
-  (let ((w0 (%monotonic-ns)) (c0 (%thread-cpu-ns)))
+  (let ((w0 (modus-int::%monotonic-ns)) (c0 (modus-int::%thread-cpu-ns)))
     (sb-thread:with-mutex (m)
       (chk "condition-wait returns NIL on timeout"
            (sb-thread:condition-wait q m :timeout 3/10) nil))
-    (let ((wall (truncate (- (%monotonic-ns) w0) 1000000))
-          (cpu (truncate (- (%thread-cpu-ns) c0) 1000000)))
+    (let ((wall (truncate (- (modus-int::%monotonic-ns) w0) 1000000))
+          (cpu (truncate (- (modus-int::%thread-cpu-ns) c0) 1000000)))
       (format t "  ... waiting 300 ms: wall ~D ms, this thread's CPU ~D ms~%"
               wall cpu)
       (chk-true "it really waited (wall >= 250 ms)" (>= wall 250))
@@ -258,42 +258,42 @@
   ;; A notify that must be seen.
   (let ((th (sb-thread:make-thread
              (lambda ()
-               (%sleep-ms 60)
+               (modus-int::%sleep-ms 60)
                (sb-thread:with-mutex (m)
-                 (%gc-write64 flag 1)
+                 (modus-int::%gc-write64 flag 1)
                  (sb-thread:condition-notify q))
                77))))
     (sb-thread:with-mutex (m)
       (let ((woke nil))
         (loop
-          (when (= (%gc-read64 flag) 1) (setq woke t) (return nil))
+          (when (= (modus-int::%gc-read64 flag) 1) (setq woke t) (return nil))
           (when (not (sb-thread:condition-wait q m :timeout 5)) (return nil)))
         (chk-true "condition-notify woke the waiter" woke)))
     (chk "the notifier's own return value" (sb-thread:join-thread th) 77))
   ;; Broadcast: three waiters, one wake.
-  (%gc-write64 flag 0)
-  (let ((woken (+ (%thr-scratch) #xE10))
+  (modus-int::%gc-write64 flag 0)
+  (let ((woken (+ (modus-int::%thr-scratch) #xE10))
         (ths nil) (i 0))
-    (%gc-write64 woken 0)
+    (modus-int::%gc-write64 woken 0)
     (loop
       (when (>= i 3) (return nil))
       (setq ths (cons (sb-thread:make-thread
                        (lambda ()
                          (sb-thread:with-mutex (m)
                            (loop
-                             (when (= (%gc-read64 flag) 1) (return nil))
+                             (when (= (modus-int::%gc-read64 flag) 1) (return nil))
                              (when (not (sb-thread:condition-wait q m :timeout 5))
                                (return nil)))
-                           (%gc-write64 woken (+ (%gc-read64 woken) 1)))
+                           (modus-int::%gc-write64 woken (+ (modus-int::%gc-read64 woken) 1)))
                          0))
                       ths))
       (setq i (+ i 1)))
-    (%sleep-ms 120)
+    (modus-int::%sleep-ms 120)
     (sb-thread:with-mutex (m)
-      (%gc-write64 flag 1)
+      (modus-int::%gc-write64 flag 1)
       (sb-thread:condition-broadcast q))
     (dolist (th ths) (sb-thread:join-thread th))
-    (chk "condition-broadcast woke all three" (%gc-read64 woken) 3)))
+    (chk "condition-broadcast woke all three" (modus-int::%gc-read64 woken) 3)))
 
 (format t "~%-- SEMAPHORES -------------------------------------------~%")
 (let ((s (sb-thread:make-semaphore :name "sem" :count 2)))
@@ -329,14 +329,14 @@
           (handler-case (values 1 2 3) (error (e) e (values 0 0 0)))
         (if (= (+ a (+ b c)) 6) nil (setq bad (+ bad 1))))
       (setq i (+ i 1)))
-    (%gc-write64 out bad)
+    (modus-int::%gc-write64 out bad)
     bad))
 
-(let ((ths nil) (i 0) (base (+ (%thr-scratch) #xE20)))
+(let ((ths nil) (i 0) (base (+ (modus-int::%thr-scratch) #xE20)))
   (loop
     (when (>= i 4) (return nil))
     (let ((out (+ base (* i 8))) (k (+ i 1)))
-      (%gc-write64 out 999)
+      (modus-int::%gc-write64 out 999)
       (setq ths (cons (sb-thread:make-thread
                        (lambda () (unwind-worker k 250 out)))
                       ths)))
@@ -365,12 +365,12 @@
 
 (format t "~%-- the arena, and the process afterwards ----------------~%")
 (format t "  ... synchronisation cells handed out: ~D, refusals: ~D~%"
-        (%sync-cells-handed-out) (%sync-cells-exhausted))
-(chk "no cell request was refused" (%sync-cells-exhausted) 0)
+        (modus-int::%sync-cells-handed-out) (modus-int::%sync-cells-exhausted))
+(chk "no cell request was refused" (modus-int::%sync-cells-exhausted) 0)
 (chk "region 0 is still the main thread's active region"
-     (%gc-region) (%gc-region-0))
+     (modus-int::%gc-region) (modus-int::%gc-region-0))
 (chk-true "the main thread can still cons" (consp (cons 1 2)))
-(format t "  ... futex waits that expired on their own: ~D~%" (%futex-timeouts))
+(format t "  ... futex waits that expired on their own: ~D~%" (modus-int::%futex-timeouts))
 (format t "      (NOT asserted zero here: this test deliberately runs two waits~%")
 (format t "       that MUST expire — a 300 ms condition-wait nobody notifies and~%")
 (format t "       an empty semaphore.  Elsewhere in the tree zero is the bar.)~%")

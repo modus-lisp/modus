@@ -54,7 +54,7 @@
 ;;;; NOT A RACE WITH MAIN.  GLASS_TX_MAINMODE=join parks main in JOIN-THREAD
 ;;;; instead of READ-BYTE, so main runs no reader and touches no stream:
 ;;;; `both' then fails IDENTICALLY — 32785 bytes, `c=CONS/NOTINT:CHARACTER'.
-;;;; The worker is overwriting its OWN earlier allocation, and (%GC-REGION) on
+;;;; The worker is overwriting its OWN earlier allocation, and (modus-int::%GC-REGION) on
 ;;;; the worker reads its own region block, not region 0's.
 ;;;;
 ;;;; NOT RECLAMATION OF AN UNROOTED OBJECT.  LOCKALLOC-KEEP holds the very same
@@ -237,16 +237,16 @@
   (sys-exit 2))
 
 (format t "~&main: PRE-LOAD gate=~s mode=~s flag=~s~%"
-        (%rt-threads-live-p) (%ha-percpu-mode) *sb-threads-up*)
+        (modus-int::%rt-threads-live-p) (modus-int::%ha-percpu-mode) *sb-threads-up*)
 (finish-output)
 (dolist (entry *glass-files*) (load (first entry)))
 (format t "~&main: POST-LOAD gate=~s mode=~s flag=~s~%"
-        (%rt-threads-live-p) (%ha-percpu-mode) *sb-threads-up*)
+        (modus-int::%rt-threads-live-p) (modus-int::%ha-percpu-mode) *sb-threads-up*)
 (format t "~&=== loaded ===~%")
 (force-output)
 
 (defun getenv-or (name default)
-  (let ((s (%cli-getenv name)))
+  (let ((s (modus-int::%cli-getenv name)))
     (if (or (null s) (= (length s) 0)) default s)))
 
 (defvar *mode* (getenv-or "GLASS_TX_MODE" "both"))
@@ -288,21 +288,21 @@
 ;;; WRITE-STRING-SERIAL, not FORMAT: this runs on the worker at the exact
 ;;; moment under test, and the point is to disturb it as little as a print can.
 (defun chk (tag)
-  (write-string-serial tag)
+  (modus-int::write-string-serial tag)
   (if (null glass::*tx*)
       ;; The arms that never install a counter (plain / lock / bothnil /
       ;; othersp) legitimately read NIL.  That is OFF, not BROKEN — the runner
       ;; greps for BROKEN, so the two must not share a word.
-      (write-string-serial "=OFF")
+      (modus-int::write-string-serial "=OFF")
   (if (consp glass::*tx*)
       (progn
-        (write-string-serial "=CONS/")
+        (modus-int::write-string-serial "=CONS/")
         (if (integerp (car glass::*tx*))
-            (write-string-serial (princ-to-string (car glass::*tx*)))
-            (progn (write-string-serial "NOTINT:")
-                   (write-string-serial (princ-to-string (type-of (car glass::*tx*)))))))
-      (write-string-serial "=BROKEN")))
-  (write-string-serial " "))
+            (modus-int::write-string-serial (princ-to-string (car glass::*tx*)))
+            (progn (modus-int::write-string-serial "NOTINT:")
+                   (modus-int::write-string-serial (princ-to-string (type-of (car glass::*tx*)))))))
+      (modus-int::write-string-serial "=BROKEN")))
+  (modus-int::write-string-serial " "))
 
 ;;; SEND-RECTS' own body, opened up so the counter can be graded BETWEEN the
 ;;; two rectangles.  Identical calls, identical order — GLASS:SEND-RECTS is
@@ -347,20 +347,20 @@
 (defvar *mono-expect* 49180)
 
 (defun chk-mono (tag)
-  (write-string-serial tag)
+  (modus-int::write-string-serial tag)
   (if (consp glass::*tx*)
       (let ((v (car glass::*tx*)))
         (setq *mono-seen* (cons v *mono-seen*))
-        (write-string-serial "=CONS/")
+        (modus-int::write-string-serial "=CONS/")
         ;; SAME MARKER THE SHIPPED GRADE USES, so the runner's NOTINT: grep
         ;; still sees this arm.  A character printed bare reads as "S".
         (if (integerp v)
-            (write-string-serial (princ-to-string v))
-            (progn (write-string-serial "NOTINT:")
-                   (write-string-serial (princ-to-string (type-of v))))))
+            (modus-int::write-string-serial (princ-to-string v))
+            (progn (modus-int::write-string-serial "NOTINT:")
+                   (modus-int::write-string-serial (princ-to-string (type-of v))))))
       (progn (setq *mono-seen* (cons :broken *mono-seen*))
-             (write-string-serial "=BROKEN")))
-  (write-string-serial " "))
+             (modus-int::write-string-serial "=BROKEN")))
+  (modus-int::write-string-serial " "))
 
 (defun body-mono (s fb)
   (let ((w-u8 (find-symbol "W-U8" "GLASS"))
@@ -476,37 +476,37 @@
    flip the worker's live data is in the other one, and scanning only from-space
    would return a FALSE ZERO — which is the failure mode this whole campaign is
    about.  Returns (count region0-span worker-span worker-gc-count)."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (wto (%gc-meta-read (+ rw #x08) k))
-         (wsize (%gc-meta-read (+ rw #x10) k))
-         (wgc (%gc-meta-read (+ rw #x20) k))
-         (r0 (%gc-region-0))
-         (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0alloc (%gc-meta-read (+ r0 #x30) k))
-         (ab (%rt-arena-base))
-         (aa (%rt-arena-alloc)))
-    (list (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
-             (%gc-count-foreign-refs r0from r0alloc wto wsize)
-             (if (> aa ab) (%gc-count-foreign-refs ab aa wfrom wsize) 0)
-             (if (> aa ab) (%gc-count-foreign-refs ab aa wto wsize) 0))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (wto (modus-int::%gc-meta-read (+ rw #x08) k))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) k))
+         (wgc (modus-int::%gc-meta-read (+ rw #x20) k))
+         (r0 (modus-int::%gc-region-0))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) k))
+         (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) k))
+         (ab (modus-int::%rt-arena-base))
+         (aa (modus-int::%rt-arena-alloc)))
+    (list (+ (modus-int::%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+             (modus-int::%gc-count-foreign-refs r0from r0alloc wto wsize)
+             (if (> aa ab) (modus-int::%gc-count-foreign-refs ab aa wfrom wsize) 0)
+             (if (> aa ab) (modus-int::%gc-count-foreign-refs ab aa wto wsize) 0))
           (- r0alloc r0from)
           wsize
           wgc)))
 
 (defun fr-report (tag)
   (let ((r (fr-fwd)))
-    (write-string-serial " FR[")
-    (write-string-serial tag)
-    (write-string-serial "]=")
-    (write-string-serial (princ-to-string (first r)))
-    (write-string-serial " r0span=")
-    (write-string-serial (princ-to-string (second r)))
-    (write-string-serial " wspan=")
-    (write-string-serial (princ-to-string (third r)))
-    (write-string-serial " wgc=")
-    (write-string-serial (princ-to-string (fourth r)))
-    (write-string-serial " ")))
+    (modus-int::write-string-serial " FR[")
+    (modus-int::write-string-serial tag)
+    (modus-int::write-string-serial "]=")
+    (modus-int::write-string-serial (princ-to-string (first r)))
+    (modus-int::write-string-serial " r0span=")
+    (modus-int::write-string-serial (princ-to-string (second r)))
+    (modus-int::write-string-serial " wspan=")
+    (modus-int::write-string-serial (princ-to-string (third r)))
+    (modus-int::write-string-serial " wgc=")
+    (modus-int::write-string-serial (princ-to-string (fourth r)))
+    (modus-int::write-string-serial " ")))
 
 (defun do-send (s fb mode)
   (cond
@@ -562,7 +562,7 @@
        (let ((keep (list 0)))
          (setq glass::*tx* keep)
          (body s fb)
-         (write-string-serial (if (consp keep) "keep=CONS " "keep=BROKEN "))
+         (modus-int::write-string-serial (if (consp keep) "keep=CONS " "keep=BROKEN "))
          keep)))
     ;; ---- is it the counter, or is it ANY object allocated there? ----
     ;; CANARY conses a 3-element list next to the counter, hands it to nobody,
@@ -574,7 +574,7 @@
        (let ((canary (list 0 1 2)))
          (setq glass::*tx* (list 0))
          (body s fb)
-         (write-string-serial
+         (modus-int::write-string-serial
           (if (and (consp canary) (equal canary '(0 1 2)))
               "canary=INTACT "
               (concatenate 'string "canary=ROTTED:" (princ-to-string canary) " ")))
@@ -607,18 +607,18 @@
     ;; reported as the longjmp line, losing its identity; with one, the arm
     ;; reports what actually signalled.
     (format t "~&main: PRE-THREAD gate=~s mode=~s flag=~s~%"
-            (%rt-threads-live-p) (%ha-percpu-mode) *sb-threads-up*)
+            (modus-int::%rt-threads-live-p) (modus-int::%ha-percpu-mode) *sb-threads-up*)
     (finish-output)
     (let ((th (sb-thread:make-thread
                (lambda ()
-                 (write-string-serial "worker: sending ")
+                 (modus-int::write-string-serial "worker: sending ")
                  (handler-case (progn (do-send s fb *mode*)
-                                      (write-string-serial "worker: sent ")
+                                      (modus-int::write-string-serial "worker: sent ")
                                       :ok)
                    (error (e)
-                     (write-string-serial "worker: CAUGHT ")
-                     (write-string-serial (princ-to-string e))
-                     (write-string-serial " ")
+                     (modus-int::write-string-serial "worker: CAUGHT ")
+                     (modus-int::write-string-serial (princ-to-string e))
+                     (modus-int::write-string-serial " ")
                      :err)))
                :name "glass-tx-cell")))
       ;; MAIN PARKS READING, as glass's reader thread does — or, with

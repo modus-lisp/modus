@@ -36,7 +36,7 @@
 (defvar *fail* 0)
 (defvar *checks* 0)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -50,7 +50,7 @@
   (chk (format nil "  and the word at base+~D is 2x that" off)
        memword (* 2 (+ 700000 idx))))
 
-(let ((res (%ha-percpu-selftest)))
+(let ((res (modus-int::%ha-percpu-selftest)))
   (if (= res 0)
       (format t "~%SKIP: the active region is too small to carve an actor band from.~%")
       (let* ((rc      (w res #x00))

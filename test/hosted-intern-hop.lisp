@@ -19,7 +19,7 @@
 ;;;; per call here and once per ITERATION there; and AOT versus runtime-compiled
 ;;;; code.  Three arms, one worker, one loop shape, one process per run:
 ;;;;
-;;;;   hop      K x (%rt-enter %rt-leave), no intern at all
+;;;;   hop      K x (modus-int::%rt-enter %rt-leave), no intern at all
 ;;;;   percall  K x %intern-symbol-pkg — each call hops in and out (today's low)
 ;;;;   perloop  ONE %rt-enter, K x %intern-symbol-pkg, ONE %rt-leave.  The inner
 ;;;;            enters are recursive depth bumps, so the region is hopped ONCE.
@@ -103,22 +103,22 @@
 ;;;;
 ;;;;   ONE RUN IS NOT A RESULT.  Read rates, and bound every run: see the hang.
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
-(defvar *arm* (let ((s (%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "percall")))
-(defvar *k* (let ((s (%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
+(defvar *arm* (let ((s (modus-int::%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "percall")))
+(defvar *k* (let ((s (modus-int::%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
 
 (defun ih-count () (hash-table-count (mem-ref #x10000088 :u64)))
 
 (defun ih-hop (k)
   (let ((i 0))
-    (loop (when (>= i k) (return 0)) (%rt-enter) (%rt-leave) (setq i (+ i 1)))
+    (loop (when (>= i k) (return 0)) (modus-int::%rt-enter) (modus-int::%rt-leave) (setq i (+ i 1)))
     k))
 
 (defun ih-percall (k base)
   (let ((i 0) (last nil))
     (loop (when (>= i k) (return 0))
-      (setq last (%intern-symbol-pkg (+ base i) 0))
+      (setq last (modus-int::%intern-symbol-pkg (+ base i) 0))
       (setq i (+ i 1)))
     (if last k 0)))
 
@@ -126,12 +126,12 @@
   ;; ONE hop for the whole loop.  The %RT-ENTER inside each %INTERN-SYMBOL-PKG
   ;; sees this thread as the owner already and only bumps the depth, so no
   ;; region is entered or left between iterations.
-  (%rt-enter)
+  (modus-int::%rt-enter)
   (let ((i 0) (last nil))
     (loop (when (>= i k) (return 0))
-      (setq last (%intern-symbol-pkg (+ base i) 0))
+      (setq last (modus-int::%intern-symbol-pkg (+ base i) 0))
       (setq i (+ i 1)))
-    (%rt-leave)
+    (modus-int::%rt-leave)
     (if last k 0)))
 
 (defvar *c0* 0) (setq *c0* (ih-count))

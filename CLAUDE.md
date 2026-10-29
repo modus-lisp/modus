@@ -306,10 +306,19 @@ Three things that are easy to get wrong:
   `build-cli-common` calls `%KERNEL-REDIRECTS-REAPPLY` -- not
   `%CORE-POST-RESTORE`, which net/hosted-ssh.lisp REPLACES by last-defun-wins
   (it also drops save-image's `MODUS_NO_RUNTIME_JIT` check: pre-existing).
-- **Kernel names are CL-USER names.**  A script's CL-USER `(defun fe-sq ...)`
-  now replaces the kernel's own FE-SQ for its kernel callers too -- the same
-  rule that makes a REPL fix work.  A defun in a library's own package is keyed
-  `PKG::NAME` and touches nothing.
+- **Kernel names are NOT CL-USER names any more (2026-10-29).**  Internals
+  are homed in `MODUS-INT` (SB-INT's role); the public API is re-exported from
+  `MODUS` (SB-EXT's role), which CL-USER uses.  A CL-USER `(defun fe-sq ...)`
+  defines CL-USER's own FE-SQ (keyed `COMMON-LISP-USER::FE-SQ`) and the kernel
+  keeps calling its own; to fix the kernel's function from a REPL, redefine
+  `modus-int::fe-sq`, which reaches its kernel callers as before.  A CL symbol
+  (`(setf (fdefinition 'close) …)`) is the kernel's own and still redirects.
+  Calling an internal from CL-USER takes the prefix: `(modus-int::%gc-read64 …)`;
+  a bare `(%gc-read64 …)` there is an UNDEFINED-FUNCTION, as in CL.  The
+  transitional fallback that made it read the kernel's function is OFF since
+  every test says `modus-int::`; `(setq modus-int::*kernel-name-fallback-p* t)`
+  turns it back on and `*kernel-name-fallbacks*` counts its hits.
+  `test/kernel-shadow.lisp`.
 
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 

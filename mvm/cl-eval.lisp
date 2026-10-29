@@ -94,6 +94,65 @@
     (puthash sym *sym-qn-memo* (cons (%cl-sym-package sym) pair)))
   pair)
 
+(defvar *kernel-fn-names* nil
+  "The names of the image's own non-CL functions (EQUAL hash), snapshotted by
+   %SNAPSHOT-KERNEL-FN-NAMES at the end of boot's function-table seeding.  A
+   symbol that is NOT the kernel's own but has one of these names -- a
+   CL-USER::%FORMAT-IMPL -- gets its own key, \"PKG::NAME\", so defining it
+   cannot replace the kernel's function (builder packages step 4, phase B).")
+
+(defvar *kernel-name-fallbacks* nil
+  "Census: names read through a non-kernel symbol that had no function of its
+   own and resolved to the kernel's (the transitional read fallback).  EQUAL
+   hash name -> count.  Drive to zero, then the fallback goes.")
+
+(defvar *kernel-name-fallback-p* nil
+  "T turns the transitional read fallback back on: a non-kernel symbol named
+   like a kernel function with no function of its own then reads the kernel's
+   (counted in *KERNEL-NAME-FALLBACKS*).  NIL, the default since 2026-10-29,
+   is CL: that symbol is simply undefined.")
+
+(defun %snapshot-kernel-fn-names ()
+  (let ((h (make-hash-table :test (function equal))))
+    (when *symbol-function-table*
+      (maphash (lambda (k v)
+                 (declare (ignore v))
+                 (when (and (stringp k) (> (length k) 0) (not (search "::" k))
+                            (not (eq (nth-value 1 (find-symbol k "COMMON-LISP"))
+                                     :external)))
+                   (puthash k h t)))
+               *symbol-function-table*))
+    (setq *kernel-fn-names* h)))
+
+(defun %kernel-home-pkg-name-p (pn)
+  "The packages the image itself defines functions in."
+  (and pn (member pn (quote ("MODUS-INT" "COMMON-LISP" "MODUS.ASM" "MODUS.RUNTIME"
+                             "MODUS.MVM.X64" "MODUS.MVM.I386"))
+                  :test (function string=))
+       t))
+
+(defun %kernel-shadow-key (pkg nm)
+  "\"PKG::NM\" when a symbol of PKG named NM must not share the kernel's
+   function cell: PKG is not a kernel package and NM is a kernel function's
+   name.  NIL otherwise (the bare key is right)."
+  (let ((pn (and pkg (%pkg-name pkg))))
+    (and pn *kernel-fn-names* (gethash nm *kernel-fn-names*)
+         (not (%kernel-home-pkg-name-p pn))
+         (concatenate 'string pn "::" nm))))
+
+(defun %kernel-shadow-fallback (name)
+  "The transitional READ fallback: NAME is a shadow key \"PKG::NM\" with no
+   function of its own; answer NM, the kernel function's key, and count it."
+  (let ((p (and *kernel-name-fallback-p* (search "::" name))))
+    (when p
+      (let ((nm (subseq name (+ p 2))))
+        (when (and *kernel-fn-names* (gethash nm *kernel-fn-names*))
+          (when (null *kernel-name-fallbacks*)
+            (setq *kernel-name-fallbacks* (make-hash-table :test (function equal))))
+          (puthash nm *kernel-name-fallbacks*
+                   (+ 1 (or (gethash nm *kernel-name-fallbacks*) 0)))
+          nm)))))
+
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:
    - CL-symbol wrapper:    (NAME . HASH-of-NAME)
@@ -161,8 +220,13 @@
                ;; Bare key (system / build-baked package) — byte-identical
                ;; to the historical behavior; keeps CL functions reachable
                ;; through both native #x50 syms (boot) and COMMON-LISP
-               ;; wrappers (user code).
-               (%sym-qn-remember sym (cons nm (compute-name-hash nm))))))))
+               ;; wrappers (user code) -- unless this symbol only SHARES a
+               ;; kernel function's name (%KERNEL-SHADOW-KEY).
+               (let ((sk (%kernel-shadow-key pkg nm)))
+                 (%sym-qn-remember sym
+                   (if sk
+                       (cons sk (compute-name-hash sk))
+                       (cons nm (compute-name-hash nm))))))))))
     ((stringp sym)
      (cons sym (compute-name-hash sym)))
     ((and (not (consp sym)) (not (fixnump sym)) (not (characterp sym))
@@ -191,7 +255,9 @@
                         *symbol-function-table*
                         (%fn-entry (gethash name *symbol-function-table*)))
                    (and *native-sym-function-table*
-                        (%fn-entry (gethash hash *native-sym-function-table*))))))
+                        (%fn-entry (gethash hash *native-sym-function-table*)))
+                   (let ((b (and *symbol-function-table* (%kernel-shadow-fallback name))))
+                     (and b (%fn-entry (gethash b *symbol-function-table*)))))))
       (cond
         (fn fn)
         ;; CLHS SYMBOL-FUNCTION: a macro or special operator name is fbound,
@@ -290,6 +356,8 @@
               (%fn-entry (gethash name *symbol-function-table*))) t)
         ((and *native-sym-function-table*
               (%fn-entry (gethash hash *native-sym-function-table*))) t)
+        ((let ((b (and *symbol-function-table* (%kernel-shadow-fallback name))))
+           (and b (%fn-entry (gethash b *symbol-function-table*)))) t)
         ;; CLHS: fboundp is also true when SYM names a macro (DEFUN, WHEN,
         ;; COND, …) or a special operator (IF, SETQ, …) — not only an
         ;; ordinary function.  Without this, (fboundp 'defun) was NIL.

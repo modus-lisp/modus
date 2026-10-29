@@ -13,7 +13,7 @@
 (jit-eager)
 ;; Three forced collections: at least one starts from an ODD count, which x64
 ;; stores raw -- %gc-force's counter read used to fault there.
-(%gc-force) (%gc-force) (%gc-force)
-(unless (%jit-fn-native-p "COMMON-LISP-USER::SAD-LOOP")
+(modus-int::%gc-force) (modus-int::%gc-force) (modus-int::%gc-force)
+(unless (modus-int::%jit-fn-native-p "COMMON-LISP-USER::SAD-LOOP")
   (format t "SAD: FAIL sad-loop not native before save~%") (sys-exit 3))
 (save-and-die *core*)

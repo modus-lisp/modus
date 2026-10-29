@@ -93,7 +93,7 @@
 ;;;;   ONE RUN IS NOT A RESULT.  test/run-mainhop-probe.sh runs this N times
 ;;;;   and classifies survived / died / hung per phase reached.
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
 ;;; THE ATTRIBUTION CONTROL.  MAINHOP_CONTROL=1 runs the IDENTICAL script with
 ;;; the hop skipped and the forced collection skipped: main stays in region 0,
@@ -101,23 +101,23 @@
 ;;; form still runs.  If the control survives where the hopped run dies, the
 ;;; deaths are chargeable to "main's region collected", not to the workload.
 (defvar *ctl* 0)
-(setq *ctl* (let ((s (%cli-getenv "MAINHOP_CONTROL")))
+(setq *ctl* (let ((s (modus-int::%cli-getenv "MAINHOP_CONTROL")))
               (if (and s (string= s "1")) 1 0)))
 
-(defvar *r0* 0)  (setq *r0* (%gc-region-0))
-(defvar *scr* 0) (setq *scr* (%thr-scratch))
-(defvar *ms* 0)  (setq *ms* (%gc-meta-scale))
+(defvar *r0* 0)  (setq *r0* (modus-int::%gc-region-0))
+(defvar *scr* 0) (setq *scr* (modus-int::%thr-scratch))
+(defvar *ms* 0)  (setq *ms* (modus-int::%gc-meta-scale))
 
 ;;; ---- INSTRUMENTS, all compiled pre-hop, all state passed as arguments ----
 
 (defun mh-where (x scr r0 ms)
   "0 = region 0's live semispace, 1 = either semispace of slot 0's region
    (main's, post-hop), 2 = anywhere else."
-  (let ((w (%gc-word-of x (+ scr 512)))
-        (r0from (%gc-meta-read (+ r0 #x00) ms))
-        (r0size (%gc-meta-read (+ r0 #x10) ms))
-        (mfrom (%ha-region-from 0))
-        (mto (%ha-region-to 0))
+  (let ((w (modus-int::%gc-word-of x (+ scr 512)))
+        (r0from (modus-int::%gc-meta-read (+ r0 #x00) ms))
+        (r0size (modus-int::%gc-meta-read (+ r0 #x10) ms))
+        (mfrom (modus-int::%ha-region-from 0))
+        (mto (modus-int::%ha-region-to 0))
         (msz *ha-rsize*))
     (cond ((and (>= w r0from) (< w (+ r0from r0size))) 0)
           ((and (>= w mfrom) (< w (+ mfrom msz))) 1)
@@ -127,21 +127,21 @@
 (defun mh-fwd (r0 ms)
   "region 0's live span -> EITHER semispace of slot 0's region.  The direction
    that dangles when main's region collects."
-  (let ((r0from (%gc-meta-read (+ r0 #x00) ms))
-        (r0alloc (%gc-meta-read (+ r0 #x30) ms)))
-    (+ (%gc-count-foreign-refs r0from r0alloc (%ha-region-from 0) *ha-rsize*)
-       (%gc-count-foreign-refs r0from r0alloc (%ha-region-to 0) *ha-rsize*))))
+  (let ((r0from (modus-int::%gc-meta-read (+ r0 #x00) ms))
+        (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) ms)))
+    (+ (modus-int::%gc-count-foreign-refs r0from r0alloc (modus-int::%ha-region-from 0) *ha-rsize*)
+       (modus-int::%gc-count-foreign-refs r0from r0alloc (modus-int::%ha-region-to 0) *ha-rsize*))))
 
-(defun mh-parked (r0 ms) (%gc-meta-read (+ r0 #x30) ms))
+(defun mh-parked (r0 ms) (modus-int::%gc-meta-read (+ r0 #x30) ms))
 
 (defun mh-hop (r0 ms)
   "THE FIX'S GESTURE, MADE BY HAND: main enters slot 0's carved region — the
    region the carve has always reserved for it — with the process stack base
    as its root window, exactly the stack top %TL-SELFTEST hands main's region."
-  (let ((rcb (%ha-rcb 0)))
-    (%gc-region-init rcb (%ha-region-from 0) (%ha-region-to 0) *ha-rsize*
-                     (%gc-meta-read (+ r0 #x18) ms) ms)
-    (%gc-region-enter rcb)
+  (let ((rcb (modus-int::%ha-rcb 0)))
+    (modus-int::%gc-region-init rcb (modus-int::%ha-region-from 0) (modus-int::%ha-region-to 0) *ha-rsize*
+                     (modus-int::%gc-meta-read (+ r0 #x18) ms) ms)
+    (modus-int::%gc-region-enter rcb)
     rcb))
 
 (defun mh-consing (k)
@@ -199,10 +199,10 @@
   "Force one collection of the ACTIVE region — main's, post-hop — from
    compiled code, holding CHAIN in an argument so the conservative stack scan
    roots it.  Returns the chain's post-collection checksum."
-  (%ha-collect-here)
+  (modus-int::%ha-collect-here)
   (mh-chain-sum chain))
 
-(defun mh-gc-count () (%ha-my-gc-count))
+(defun mh-gc-count () (modus-int::%ha-my-gc-count))
 
 ;;; ---- verdict plumbing (pre-hop, region 0) ------------------------------
 
@@ -225,8 +225,8 @@
               (sb-thread:make-thread (lambda () 1) :name "warm")))
 
 (mh-note "~&region 0: size ~d bytes, live ~d bytes at probe start~%"
-         (%gc-meta-read (+ *r0* #x10) *ms*)
-         (- (mh-parked *r0* *ms*) (%gc-meta-read (+ *r0* #x00) *ms*)))
+         (modus-int::%gc-meta-read (+ *r0* #x10) *ms*)
+         (- (mh-parked *r0* *ms*) (modus-int::%gc-meta-read (+ *r0* #x00) *ms*)))
 (format t "~&=== P1: WHERE ALLOCATION LANDS ===========================~%")
 (chk "P1 pre-hop: a cons lands in REGION 0"
      (mh-where (cons 1 2) *scr* *r0* *ms*) 0)
@@ -240,7 +240,7 @@
 (chk "P1 post-hop: a cons lands in MAIN'S region (control: region 0)"
      (mh-where (cons 3 4) *scr* *r0* *ms*) (if (= *ctl* 1) 0 1))
 (chk "P1 post-hop: a fresh %INTERN-SYMBOL-PKG symbol STILL lands in region 0"
-     (mh-where (%intern-symbol-pkg 1800000001 0) *scr* *r0* *ms*) 0)
+     (mh-where (modus-int::%intern-symbol-pkg 1800000001 0) *scr* *r0* *ms*) 0)
 (chk "P1 post-hop: FORMAT still answers"
      (length (format nil "mh-~d" 42)) 5)
 

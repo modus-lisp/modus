@@ -60,8 +60,8 @@
       (let ((j (+ i 1)))
         (loop
           (when (>= j n) (return 0))
-          (when (= (%gc-read64 (+ (%thr-report i) off))
-                   (%gc-read64 (+ (%thr-report j) off)))
+          (when (= (modus-int::%gc-read64 (+ (modus-int::%thr-report i) off))
+                   (modus-int::%gc-read64 (+ (modus-int::%thr-report j) off)))
             (setq ok nil))
           (setq j (+ j 1))))
       (setq i (+ i 1)))
@@ -69,7 +69,7 @@
 
 (format t "~%=== EIGHT THREADS, EACH FROM A CLOSURE ===================~%")
 
-(if (zerop (%thr-reset-table))
+(if (zerop (modus-int::%thr-reset-table))
     (progn (format t "  SKIP: the thread page could not be mapped.~%")
            (setq *fail* (+ *fail* 1)))
     (let ((handles (make-array *nthreads*))
@@ -80,8 +80,8 @@
       ;; Spawn: each closure captures a DIFFERENT k and a DIFFERENT report block.
       (loop
         (when (>= i *nthreads*) (return 0))
-        (let ((h (%make-native-thread
-                  (%thr-make-counter (+ i 1) (%thr-report i)
+        (let ((h (modus-int::%make-native-thread
+                  (modus-int::%thr-make-counter (+ i 1) (modus-int::%thr-report i)
                                      *nthreads* *budget*))))
           (aset handles i h)
           (if (> h 0) (setq spawned (+ spawned 1)) 0))
@@ -96,7 +96,7 @@
         (loop
           (when (>= i *nthreads*) (return 0))
           (if (> (aref handles i) 0)
-              (if (zerop (%join-native-thread (aref handles i) *budget*))
+              (if (zerop (modus-int::%join-native-thread (aref handles i) *budget*))
                   (setq joined (+ joined 1))
                   0)
               0)
@@ -110,7 +110,7 @@
       (let ((timeouts 0))
         (loop
           (when (>= i *nthreads*) (return 0))
-          (if (zerop (%gc-read64 (+ (%thr-report i) #x00)))
+          (if (zerop (modus-int::%gc-read64 (+ (modus-int::%thr-report i) #x00)))
               0 (setq timeouts (+ timeouts 1)))
           (setq i (+ i 1)))
         (chk "workers that spun their barrier budget out alone" timeouts 0))
@@ -119,21 +119,21 @@
       (setq i 0)
       (loop
         (when (>= i *nthreads*) (return 0))
-        (let ((r (%thr-report i)))
+        (let ((r (modus-int::%thr-report i)))
           (format t "  worker ~D: k=~D  sum=~D  tid=~D  cpu=~D  window=~D~%"
-                  i (%gc-read64 (+ r #x08)) (%gc-read64 (+ r #x10))
-                  (%gc-read64 (+ r #x18)) (%gc-read64 (+ r #x20))
-                  (%gc-read64 (+ r #x28))))
+                  i (modus-int::%gc-read64 (+ r #x08)) (modus-int::%gc-read64 (+ r #x10))
+                  (modus-int::%gc-read64 (+ r #x18)) (modus-int::%gc-read64 (+ r #x20))
+                  (modus-int::%gc-read64 (+ r #x28))))
         (setq i (+ i 1)))
       (setq i 0)
       (let ((wrongk 0) (wrongsum 0) (unfinished 0))
         (loop
           (when (>= i *nthreads*) (return 0))
-          (let ((r (%thr-report i)))
-            (if (= (%gc-read64 (+ r #x08)) (+ i 1)) 0 (setq wrongk (+ wrongk 1)))
-            (if (= (%gc-read64 (+ r #x10)) (* (+ i 1) *iters*))
+          (let ((r (modus-int::%thr-report i)))
+            (if (= (modus-int::%gc-read64 (+ r #x08)) (+ i 1)) 0 (setq wrongk (+ wrongk 1)))
+            (if (= (modus-int::%gc-read64 (+ r #x10)) (* (+ i 1) *iters*))
                 0 (setq wrongsum (+ wrongsum 1)))
-            (if (= (%gc-read64 (+ r #x30)) 99) 0 (setq unfinished (+ unfinished 1))))
+            (if (= (modus-int::%gc-read64 (+ r #x30)) 99) 0 (setq unfinished (+ unfinished 1))))
           (setq i (+ i 1)))
         (chk "workers that ran the wrong closure (wrong captured K)" wrongk 0)
         (chk "workers whose arithmetic did not match their own K" wrongsum 0)
@@ -148,14 +148,14 @@
       (let ((asdriver 0) (zerowin 0))
         (loop
           (when (>= i *nthreads*) (return 0))
-          (let ((r (%thr-report i)))
-            (if (= (%gc-read64 (+ r #x18)) mytid) (setq asdriver (+ asdriver 1)) 0)
-            (if (zerop (%gc-read64 (+ r #x28))) (setq zerowin (+ zerowin 1)) 0))
+          (let ((r (modus-int::%thr-report i)))
+            (if (= (modus-int::%gc-read64 (+ r #x18)) mytid) (setq asdriver (+ asdriver 1)) 0)
+            (if (zerop (modus-int::%gc-read64 (+ r #x28))) (setq zerowin (+ zerowin 1)) 0))
           (setq i (+ i 1)))
         (chk "workers reporting the DRIVER's tid" asdriver 0)
         (chk "workers still on the process-wide window (base 0)" zerowin 0))
 
-      (chk "threads the table counted as started" (%gc-read64 (%thr-started))
+      (chk "threads the table counted as started" (modus-int::%gc-read64 (modus-int::%thr-started))
            *nthreads*)))
 
 (format t "~%=== VERDICT ==============================================~%")

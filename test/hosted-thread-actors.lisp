@@ -56,7 +56,7 @@
 (defvar *nmsg* 64)
 (defvar *budget* 200000000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -72,7 +72,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(let ((res (%ha-mt-selftest *nmsg* *budget* 0)))
+(let ((res (modus-int::%ha-mt-selftest *nmsg* *budget* 0)))
   (if (= res 0)
       (format t "~%SKIP: no actor band, or the thread stack could not be mapped.~%")
       (let* ((join    (w res #x00))
@@ -172,10 +172,10 @@
           (loop
             (when (> i *nmsg*) (return 0))
             (let ((e (+ logbase (* (- i 1) 32))))
-              (if (= (%gc-read64 (+ e 24)) 1) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 e) i) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 (+ e 8)) (* i 7)) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 (+ e 16)) (+ i 1000)) 0 (setq bad (+ bad 1))))
+              (if (= (modus-int::%gc-read64 (+ e 24)) 1) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 e) i) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 (+ e 8)) (* i 7)) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 (+ e 16)) (+ i 1000)) 0 (setq bad (+ bad 1))))
             (setq i (+ i 1)))
           (format t "  actor 3's log, read straight out of the band: message i~%")
           (format t "  must carry (i . (7i . i+1000)) after TWO round trips.~%")
@@ -208,7 +208,7 @@
         (chk "thread 2's scheduler ran to the end" clean 1)
         (chk "the join saw the kernel clear the TID word (0 = joined)" join 0)
         (format t "  thread 2 idle spins while the queue was empty: ~D~%" idlesp)
-        (chk "and the mode word is back where it was" (%ha-percpu-mode) 0)
+        (chk "and the mode word is back where it was" (modus-int::%ha-percpu-mode) 0)
 
         (format t "~%=== VERDICT ==============================================~%")
         (if (= *fail* 0)

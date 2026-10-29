@@ -88,88 +88,88 @@
 ;;; for the per-worker reports.
 ;;; ------------------------------------------------------------------
 
-(defun shared-word () (%thr-region-report 12))
+(defun shared-word () (modus-int::%thr-region-report 12))
 
 (defun read-shared () (mem-ref (shared-word) :u64))
 (defun write-shared (v) (setf (mem-ref (shared-word) :u64) v))
 
-(defun report-barrier (i) (%gc-read64 (+ (%thr-report i) #x00)))
-(defun report-iters (i)   (%gc-read64 (+ (%thr-report i) #x08)))
-(defun report-done (i)    (%gc-read64 (+ (%thr-report i) #x30)))
+(defun report-barrier (i) (modus-int::%gc-read64 (+ (modus-int::%thr-report i) #x00)))
+(defun report-iters (i)   (modus-int::%gc-read64 (+ (modus-int::%thr-report i) #x08)))
+(defun report-done (i)    (modus-int::%gc-read64 (+ (modus-int::%thr-report i) #x30)))
 
 ;;; The four worker bodies.  Each is returned by a function so the capture is
 ;;; real rather than a reference to a global the driver could change underneath.
 
 (defun mk-incf (out addr k want budget)
   (lambda ()
-    (%gc-write64 (+ out #x00) (%thr-arrive-and-wait want budget))
+    (modus-int::%gc-write64 (+ out #x00) (modus-int::%thr-arrive-and-wait want budget))
     (let ((i 0))
       (loop
         (when (>= i k) (return 0))
         (%atomic-incf (mem-ref addr :u64) 1)
         (setq i (+ i 1)))
-      (%gc-write64 (+ out #x08) i))
-    (%gc-write64 (+ out #x30) 99)
+      (modus-int::%gc-write64 (+ out #x08) i))
+    (modus-int::%gc-write64 (+ out #x30) 99)
     0))
 
 (defun mk-decf (out addr k want budget)
   (lambda ()
-    (%gc-write64 (+ out #x00) (%thr-arrive-and-wait want budget))
+    (modus-int::%gc-write64 (+ out #x00) (modus-int::%thr-arrive-and-wait want budget))
     (let ((i 0))
       (loop
         (when (>= i k) (return 0))
         (%atomic-decf (mem-ref addr :u64) 1)
         (setq i (+ i 1)))
-      (%gc-write64 (+ out #x08) i))
-    (%gc-write64 (+ out #x30) 99)
+      (modus-int::%gc-write64 (+ out #x08) i))
+    (modus-int::%gc-write64 (+ out #x30) 99)
     0))
 
 (defun mk-mixed (out addr k want budget)
   "+3 then -2 per iteration, so the net is +K and neither operation alone can
    produce the answer."
   (lambda ()
-    (%gc-write64 (+ out #x00) (%thr-arrive-and-wait want budget))
+    (modus-int::%gc-write64 (+ out #x00) (modus-int::%thr-arrive-and-wait want budget))
     (let ((i 0))
       (loop
         (when (>= i k) (return 0))
         (%atomic-incf (mem-ref addr :u64) 3)
         (%atomic-decf (mem-ref addr :u64) 2)
         (setq i (+ i 1)))
-      (%gc-write64 (+ out #x08) i))
-    (%gc-write64 (+ out #x30) 99)
+      (modus-int::%gc-write64 (+ out #x08) i))
+    (modus-int::%gc-write64 (+ out #x30) 99)
     0))
 
 (defun mk-unprotected (out addr k want budget)
   "THE NEGATIVE CONTROL.  The body is character-for-character what
    %ATOMIC-INCF expanded to before the fix."
   (lambda ()
-    (%gc-write64 (+ out #x00) (%thr-arrive-and-wait want budget))
+    (modus-int::%gc-write64 (+ out #x00) (modus-int::%thr-arrive-and-wait want budget))
     (let ((i 0))
       (loop
         (when (>= i k) (return 0))
         (setf (mem-ref addr :u64) (+ (mem-ref addr :u64) 1))
         (setq i (+ i 1)))
-      (%gc-write64 (+ out #x08) i))
-    (%gc-write64 (+ out #x30) 99)
+      (modus-int::%gc-write64 (+ out #x08) i))
+    (modus-int::%gc-write64 (+ out #x30) 99)
     0))
 
 (defun run-arm (maker start)
   "Reset, seed the shared word, spawn N workers on MAKER, join them all.
    Returns the number of threads the kernel confirmed had exited."
-  (%thr-reset-table)
+  (modus-int::%thr-reset-table)
   (write-shared start)
   (let ((h (make-array *nthreads*)) (i 0) (joined 0))
     (loop
       (when (>= i *nthreads*) (return 0))
-      (aset h i (%make-native-thread
-                 (funcall maker (%thr-report i) (shared-word)
+      (aset h i (modus-int::%make-native-thread
+                 (funcall maker (modus-int::%thr-report i) (shared-word)
                           *k* *nthreads* *budget*)))
       (setq i (+ i 1)))
     (setq i 0)
     (loop
       (when (>= i *nthreads*) (return 0))
       (if (> (aref h i) 0)
-          (if (zerop (%join-native-thread (aref h i) *budget*))
+          (if (zerop (modus-int::%join-native-thread (aref h i) *budget*))
               (setq joined (+ joined 1))
               0)
           0)
@@ -206,15 +206,15 @@
 (format t "~%=== 0. THE UNARMED PATH IS THE OLD CODE =================~%")
 (format t "  Before any bringup the gate word #x10000DB8 reads BSS zero, so~%")
 (format t "  the macro's then-branch runs: the pre-SMP body, verbatim.~%")
-(chk "the threads-live gate before bringup" (%rt-threads-live-p) 0)
+(chk "the threads-live gate before bringup" (modus-int::%rt-threads-live-p) 0)
 (format t "  lock word   #x~X~%" (%atomics-lock-addr))
 (format t "  acquisitions #x~X~%" (%atomics-acquisitions-addr))
 
 ;; A SENTINEL, not a zero.  If the unarmed path took the lock, %ATOMICS-RELEASE
 ;; would leave this word at 0 and the sentinel would be gone; a zero-vs-zero
 ;; check could not tell the two apart.
-(%gc-write64 (%atomics-acquisitions-addr) 0)
-(%gc-write64 (%atomics-lock-addr) 90)
+(modus-int::%gc-write64 (%atomics-acquisitions-addr) 0)
+(modus-int::%gc-write64 (%atomics-lock-addr) 90)
 (setq *counter* 0)
 (let ((i 0))
   (loop
@@ -227,9 +227,9 @@
     (%atomic-decf *counter* 1)
     (setq i (+ i 1))))
 (chk "1000 unarmed INCFs then 400 unarmed DECFs" *counter* 600)
-(chk "the sentinel in the lock word is UNTOUCHED" (%gc-read64 (%atomics-lock-addr)) 90)
+(chk "the sentinel in the lock word is UNTOUCHED" (modus-int::%gc-read64 (%atomics-lock-addr)) 90)
 (chk "the acquisition counter never moved" (%atomics-acquisitions) 0)
-(%gc-write64 (%atomics-lock-addr) 0)
+(modus-int::%gc-write64 (%atomics-lock-addr) 0)
 
 (format t "~%  DELTA arguments and non-fixnum places still work:~%")
 (setq *cell* (cons 5 nil))
@@ -257,19 +257,19 @@
     (progn
       (if (equal *mode* "unsync")
           (progn
-            (%rt-threads-off)
+            (modus-int::%rt-threads-off)
             (format t "~%  *** MODE=unsync: THE GATE IS CLEARED ON PURPOSE. ***~%")
             (format t "  Same binary, same macro, same workload, one BSS word~%")
             (format t "  apart.  Every arm below is EXPECTED to lose updates.~%"))
           0)
       (format t "  threads-live gate ~D   per-CPU active-region mode ~D~%"
-              (%rt-threads-live-p) (%ha-percpu-mode))
+              (modus-int::%rt-threads-live-p) (modus-int::%ha-percpu-mode))
       (if (equal *mode* "unsync")
-          (chk "the gate is OFF (this is the control)" (%rt-threads-live-p) 0)
-          (chk "the gate is ARMED" (%rt-threads-live-p) 1))
+          (chk "the gate is OFF (this is the control)" (modus-int::%rt-threads-live-p) 0)
+          (chk "the gate is ARMED" (modus-int::%rt-threads-live-p) 1))
 
       (format t "~%=== 2. FOUR THREADS, ~D INCFs EACH ====================~%" *k*)
-      (%gc-write64 (%atomics-acquisitions-addr) 0)
+      (modus-int::%gc-write64 (%atomics-acquisitions-addr) 0)
       (chk "threads the kernel confirmed had exited"
            (run-arm #'mk-incf 0) *nthreads*)
       (if (equal *mode* "unsync")
@@ -284,7 +284,7 @@
                  (%atomics-acquisitions) (* *nthreads* *k*))))
 
       (format t "~%=== 3. FOUR THREADS, ~D DECFs EACH ====================~%" *k*)
-      (%gc-write64 (%atomics-acquisitions-addr) 0)
+      (modus-int::%gc-write64 (%atomics-acquisitions-addr) 0)
       (chk "threads the kernel confirmed had exited"
            (run-arm #'mk-decf (* *nthreads* *k*)) *nthreads*)
       (if (equal *mode* "unsync")
@@ -301,7 +301,7 @@
       (format t "  Each thread does (+3) then (-2), ~D times.  Net +~D each,~%"
               *k* *k*)
       (format t "  so the answer is one NEITHER operation alone produces.~%")
-      (%gc-write64 (%atomics-acquisitions-addr) 0)
+      (modus-int::%gc-write64 (%atomics-acquisitions-addr) 0)
       (chk "threads the kernel confirmed had exited"
            (run-arm #'mk-mixed 0) *nthreads*)
       (if (equal *mode* "unsync")
@@ -329,7 +329,7 @@
                 (< (read-shared) (* *nthreads* *k*)))
 
       (format t "~%=== 6. THE LOCK IS FREE AGAIN ===========================~%")
-      (chk "the lock word after every arm" (%gc-read64 (%atomics-lock-addr)) 0)))
+      (chk "the lock word after every arm" (modus-int::%gc-read64 (%atomics-lock-addr)) 0)))
 
 (format t "~%=== VERDICT ==============================================~%")
 (if (= *fail* 0)

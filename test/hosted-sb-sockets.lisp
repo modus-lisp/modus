@@ -125,7 +125,7 @@
           (write-byte 65 cs)
           (write-byte 66 cs)
           (force-output cs)
-          (%sleep-ms 50)
+          (modus-int::%sleep-ms 50)
           (chk-true "LISTEN with data waiting is T" (listen ss))
           (chk "read-byte" (read-byte ss) 65)
           (chk-true "LISTEN is still T with one byte left" (listen ss))
@@ -245,7 +245,7 @@
 (chk "socket-listen-port refuses port 0" (socket-listen-port 0) -2)
 (chk "socket-listen-port refuses port 70000" (socket-listen-port 70000) -2)
 (chk "socket-listen-port-on-address refuses port 0"
-     (socket-listen-port-on-address (%sock-loopback) 0) -2)
+     (modus-int::socket-listen-port-on-address (modus-int::%sock-loopback) 0) -2)
 
 (format t "~%=== VERDICT ==============================================~%")
 (if (zerop *fail*)

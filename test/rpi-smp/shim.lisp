@@ -18,18 +18,18 @@
 
 (defvar *m* nil)
 
-(defun s-mutex () (setq *m* (sb-thread:make-mutex :name "ctr")) (setf (mem-ref #x10380800 :u32) 0) (let ((ths (loop for k below 6 collect (sb-thread:make-thread (lambda () (dotimes (i 1000) (sb-thread:with-mutex (*m*) (let ((v (mem-ref #x10380800 :u32))) (bt-yield) (setf (mem-ref #x10380800 :u32) (+ v 1))))) :done))))) (list (mapcar (function sb-thread:join-thread) ths) (mem-ref #x10380800 :u32))))
+(defun s-mutex () (setq *m* (sb-thread:make-mutex :name "ctr")) (setf (mem-ref #x10380800 :u32) 0) (let ((ths (loop for k below 6 collect (sb-thread:make-thread (lambda () (dotimes (i 1000) (sb-thread:with-mutex (*m*) (let ((v (mem-ref #x10380800 :u32))) (modus-int::bt-yield) (setf (mem-ref #x10380800 :u32) (+ v 1))))) :done))))) (list (mapcar (function sb-thread:join-thread) ths) (mem-ref #x10380800 :u32))))
 
-(defun s-nested () (let ((ths (loop repeat 3 collect (bt-spawn (function t-sum))))) (mapcar (function bt-join) ths)))
+(defun s-nested () (let ((ths (loop repeat 3 collect (modus-int::bt-spawn (function t-sum))))) (mapcar (function bt-join) ths)))
 
 (defun s-nested2 () (sb-thread:join-thread (sb-thread:make-thread (function t-list2))))
 
-(defun s-badclosure () (let ((x (list 1 2))) (handler-case (progn (bt-spawn (lambda () x)) :started) (error () :refused))))
+(defun s-badclosure () (let ((x (list 1 2))) (handler-case (progn (modus-int::bt-spawn (lambda () x)) :started) (error () :refused))))
 
 (defun stop-word () (mem-ref #x10380900 :u32))
 (defun t-hog () (let ((n 0)) (loop (setq n (+ n 1)) (cons n nil) (unless (zerop (stop-word)) (return n)))))
-(defun t-work () (let ((t0 (%irt-ns))) (list :sum (t-sum) :ms (floor (- (%irt-ns) t0) 1000000))))
-(defun preempt-run (no-preempt) (setf (mem-ref #x10380900 :u32) 0) (setf (mem-ref (+ (%bt-table) #x20) :u32) (if no-preempt 1 0)) (let* ((hogs (spawn-n 3 (function t-hog))) (work (spawn-n 3 (function t-work))) (t0 (%irt-ns)) (done 0)) (loop (setq done (count-if (lambda (i) (zerop (%native-thread-alive-p i))) work)) (when (or (= done 3) (> (- (%irt-ns) t0) 20000000000)) (return nil)) (%sleep-ms 50)) (let ((wait-ms (floor (- (%irt-ns) t0) 1000000))) (setf (mem-ref #x10380900 :u32) 1) (list :workers-done done :after-ms wait-ms :work (if (= done 3) (mapcar (function bt-join) work) :stuck) :hogs (mapcar (function bt-join) hogs)))))
+(defun t-work () (let ((t0 (modus-int::%irt-ns))) (list :sum (t-sum) :ms (floor (- (modus-int::%irt-ns) t0) 1000000))))
+(defun preempt-run (no-preempt) (setf (mem-ref #x10380900 :u32) 0) (setf (mem-ref (+ (modus-int::%bt-table) #x20) :u32) (if no-preempt 1 0)) (let* ((hogs (spawn-n 3 (function t-hog))) (work (spawn-n 3 (function t-work))) (t0 (modus-int::%irt-ns)) (done 0)) (loop (setq done (count-if (lambda (i) (zerop (modus-int::%native-thread-alive-p i))) work)) (when (or (= done 3) (> (- (modus-int::%irt-ns) t0) 20000000000)) (return nil)) (modus-int::%sleep-ms 50)) (let ((wait-ms (floor (- (modus-int::%irt-ns) t0) 1000000))) (setf (mem-ref #x10380900 :u32) 1) (list :workers-done done :after-ms wait-ms :work (if (= done 3) (mapcar (function bt-join) work) :stuck) :hogs (mapcar (function bt-join) hogs)))))
 
 (defvar *shared-box* nil)
 (defun s-guard-setup () (setq *shared-box* (list :empty)) :ok)
@@ -43,5 +43,5 @@
 
 (defvar *ex* nil)
 (defun ex-idle () (setf (mem-ref #x10380A00 :u32) (+ 1 (mem-ref #x10380A00 :u32))))
-(defun ex-test () (setf (mem-ref #x10380A00 :u32) 0) (setq *ex* (bt-start-executor 1 (function ex-idle))) (let ((a (bt-call *ex* (lambda () (+ 1 2)))) (b (bt-call *ex* (lambda () (list (percpu-ref 16) "str" (> (mem-ref #x10380A00 :u32) 0))))) (buf (make-array 10 :element-type '(unsigned-byte 8)))) (bt-call *ex* (lambda () (dotimes (i 10) (setf (aref buf i) (* i 3))) :filled)) (list a b (coerce buf 'list) (handler-case (bt-call *ex* (lambda () (error "boom"))) (error () :call-error)) (let ((n0 (mem-ref #x10380A00 :u32))) (%sleep-ms 100) (> (mem-ref #x10380A00 :u32) n0)))))
-(defun ex-many () (let ((s 0)) (dotimes (i 200) (setq s (+ s (bt-call *ex* (lambda () i))))) s))
+(defun ex-test () (setf (mem-ref #x10380A00 :u32) 0) (setq *ex* (modus-int::bt-start-executor 1 (function ex-idle))) (let ((a (modus-int::bt-call *ex* (lambda () (+ 1 2)))) (b (modus-int::bt-call *ex* (lambda () (list (percpu-ref 16) "str" (> (mem-ref #x10380A00 :u32) 0))))) (buf (make-array 10 :element-type '(unsigned-byte 8)))) (modus-int::bt-call *ex* (lambda () (dotimes (i 10) (setf (aref buf i) (* i 3))) :filled)) (list a b (coerce buf 'list) (handler-case (modus-int::bt-call *ex* (lambda () (error "boom"))) (error () :call-error)) (let ((n0 (mem-ref #x10380A00 :u32))) (modus-int::%sleep-ms 100) (> (mem-ref #x10380A00 :u32) n0)))))
+(defun ex-many () (let ((s 0)) (dotimes (i 200) (setq s (+ s (modus-int::bt-call *ex* (lambda () i))))) s))

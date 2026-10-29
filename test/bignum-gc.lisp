@@ -11,8 +11,8 @@
 (defparameter *bg-list* (list (ash 3 200) (- (ash 1 300)) (* 7 (ash 1 130))))
 ;; churn 1.2 semispaces a round: the stale limb array survives until allocation
 ;; reaches its address, so a small churn passes on a broken collector (it did)
-(defun bg-churn () (dotimes (k (floor (* 6 (%core-space-size)) (* 5 144))) (make-array 16)))
-(dotimes (i 4) (bg-churn) (%gc-force))
+(defun bg-churn () (dotimes (k (floor (* 6 (modus-int::%core-space-size)) (* 5 144))) (make-array 16)))
+(dotimes (i 4) (bg-churn) (modus-int::%gc-force))
 (let ((ok (and (integerp *bg-p*)
                (= (integer-length *bg-p*) 255)
                (= (logcount *bg-p*) 253)                ; 2^255-19 = 0b111..1101101
@@ -20,4 +20,4 @@
                (= (integer-length (first *bg-list*)) 202)
                (= (integer-length (second *bg-list*)) 300)
                (= (third *bg-list*) (* 7 (ash 1 130))))))
-  (format t "~&BIGNUM-GC ~:[FAIL~;PASS~] (epoch ~a)~%" ok (%gc-epoch)))
+  (format t "~&BIGNUM-GC ~:[FAIL~;PASS~] (epoch ~a)~%" ok (modus-int::%gc-epoch)))

@@ -23,7 +23,7 @@ W=$(mktemp -d /tmp/modus-uefi-core.XXXXXX)
 ( cd "$TARS" && exec python3 -m http.server 8086 --bind 127.0.0.1 > $W/http.log 2>&1 ) & HP=$!
 trap 'kill $HP 2>/dev/null; [ -n "${QP:-}" ] && kill $QP 2>/dev/null' EXIT
 sleep 0.5
-forms=("(list (%gc-from-start) (%gc-bitmap-page-base) (%gc-bitmap-base) (%gc-cons-bitmap-base) (%core-addr))")
+forms=("(list (modus-int::%gc-from-start) (modus-int::%gc-bitmap-page-base) (modus-int::%gc-bitmap-base) (modus-int::%gc-cons-bitmap-base) (modus-int::%core-addr))")
 for l in "${loads[@]}"; do forms+=("(ql:quickload \"$l\")"); done
 [ -n "$probe" ] && forms+=("$probe")
 forms+=("(save-and-die \"core\")")

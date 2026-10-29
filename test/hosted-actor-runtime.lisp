@@ -175,11 +175,11 @@
     (unless (equal (actors-receive) (list 2000 0 5997)) (setq ok nil)))
   (chk "a parked actor's region-0 reference survives region-0 collections" ok)
   (actors-send a :stop))
-(let ((c0 (%gc-meta-read (+ (%gc-region-0) #x20) (%gc-meta-scale))))
+(let ((c0 (modus-int::%gc-meta-read (+ (modus-int::%gc-region-0) #x20) (modus-int::%gc-meta-scale))))
   (dotimes (i 4) (actors-spawn 'busy))
   (churn-main 60000)
   (let ((bad (loop repeat 4 sum (actors-receive)))
-        (ncoll (- (%gc-meta-read (+ (%gc-region-0) #x20) (%gc-meta-scale)) c0)))
+        (ncoll (- (modus-int::%gc-meta-read (+ (modus-int::%gc-region-0) #x20) (modus-int::%gc-meta-scale)) c0)))
     (chk "running actors' region-0 references survive region-0 collections"
          (and (zerop bad) (> ncoll 0)) (list :bad bad :collections ncoll))))
 

@@ -54,15 +54,15 @@
 ;;;;   failure and not a pass.
 
 (defvar *k*
-  (let ((s (%cli-getenv "WORKER_K")))
+  (let ((s (modus-int::%cli-getenv "WORKER_K")))
     (if (and s (> (length s) 0)) (parse-integer s) 6000)))
 
 (defvar *main-rounds*
-  (let ((s (%cli-getenv "MAIN_ROUNDS")))
+  (let ((s (modus-int::%cli-getenv "MAIN_ROUNDS")))
     (if (and s (> (length s) 0)) (parse-integer s) 0)))
 
 (defvar *arm*
-  (let ((s (%cli-getenv "WORKER_ARM")))
+  (let ((s (modus-int::%cli-getenv "WORKER_ARM")))
     (if (and s (> (length s) 0)) s "intern-fresh")))
 
 (defvar *chain-n* 20000)

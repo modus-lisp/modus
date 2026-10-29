@@ -51,23 +51,23 @@
 ;;;;   ONE RUN IS NOT A RESULT.  The pre-fix failure was 3 of 3 but the whole
 ;;;;   class is layout-sensitive; the runner reports a rate.
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
 (defvar *k*
-  (let ((s (%cli-getenv "INTC_K")))
+  (let ((s (modus-int::%cli-getenv "INTC_K")))
     (if (and s (> (length s) 0)) (parse-integer s) 200)))
 
 (defun ic-fwd (r0)
   "region 0's live span AND the lock arena -> this worker's region."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (wsize (%gc-meta-read (+ rw #x10) k))
-         (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0alloc (%gc-meta-read (+ r0 #x30) k))
-         (ab (%rt-arena-base))
-         (aa (%rt-arena-alloc)))
-    (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
-       (if (> aa ab) (%gc-count-foreign-refs ab aa wfrom wsize) 0))))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) k))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) k))
+         (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) k))
+         (ab (modus-int::%rt-arena-base))
+         (aa (modus-int::%rt-arena-alloc)))
+    (+ (modus-int::%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+       (if (> aa ab) (modus-int::%gc-count-foreign-refs ab aa wfrom wsize) 0))))
 
 (defun ic-chain (n)
   (let ((c nil) (i 0))
@@ -106,15 +106,15 @@
     ;; not this subject; see test/hosted-intern-layers.lisp.
     (setq *mvm-last-mv* nil)
     (let ((f-pre (ic-fwd r0))
-          (gc0 (%ha-my-gc-count))
+          (gc0 (modus-int::%ha-my-gc-count))
           (chain (ic-chain 500)))          ; sum 0..499 = 124750
-      (%ha-collect-here)
+      (modus-int::%ha-collect-here)
       (let ((sum1 (ic-chain-sum chain))
             (eq1 (ic-reintern-all-eq held))
             (f1 (ic-fwd r0)))
-        (%ha-collect-here)
+        (modus-int::%ha-collect-here)
         (list f-pre
-              (- (%ha-my-gc-count) gc0)
+              (- (modus-int::%ha-my-gc-count) gc0)
               sum1 eq1 f1
               (ic-chain-sum chain)
               (ic-reintern-all-eq held)
@@ -122,7 +122,7 @@
 
 (defvar *res* nil)
 (setq *res*
-      (let ((r0 (%gc-region-0)) (k *k*))
+      (let ((r0 (modus-int::%gc-region-0)) (k *k*))
         (sb-thread:join-thread
          (sb-thread:make-thread (lambda () (ic-worker r0 k)) :name "intc"))))
 

@@ -247,6 +247,55 @@ leave `CL-USER`, and what goes in the exported `MODUS` API?
   `modus:make-channel` already live there).  A REPL or script reaching an
   internal writes `modus-int::name`, as an SBCL user writes `sb-int:...`.
 
+## Step 4 phase B: kernel names stop being CL-USER names
+
+**LANDED 2026-10-29 (functions; MODUS exports).**  As built, kernel functions
+keep their BARE keys (every internal by-name lookup -- compiler-emitted
+runtime calls, the JIT/kernel-redirect tables, the boot-evaluated shim texts --
+keeps working unchanged); instead a NON-kernel symbol whose name collides with
+a kernel function (snapshot of the function table at boot,
+`*KERNEL-FN-NAMES*`) is keyed `PKG::NAME`, so defining it creates its own
+function.  Reads of such a symbol with no function of its own fall back to the
+kernel's and are counted (`*KERNEL-NAME-FALLBACKS*`).  The design notes below
+are the plan as first written.
+
+Phase A (53772220) made the build packages exist in the image; every baked
+internal symbol's home is MODUS-INT.  But the RUNTIME function table is keyed
+by bare name, so a CL-USER `(defun e1000-send ...)` still replaces the kernel's
+function.  Phase B:
+
+1. Key image functions whose symbol is homed in a build package as
+   `"MODUS-INT::NAME"` (SFT seeding, %SYM-NAME-OR-HASH, runtime compiles); CL
+   functions stay bare.  A transitional read fallback (bare miss -> the
+   MODUS-INT key) keeps unqualified callers working while a census counts them;
+   it is removed once the count is zero, as step 2's fallback was.
+2. `MODUS` (SB-EXT's role) exports the public API and CL-USER uses it.
+   Proposed exports, from the census of what tests/scripts/docs call (to be
+   revised by the user):
+   - process/image: sys-exit, save-and-die, install-tarball (+ the existing
+     jit-eager, jit-prune, jit-source, make-/free-static-vector)
+   - actors: actors-spawn, actors-send, actors-receive, actors-receive-if,
+     actors-self, actors-yield, actors-start, actors-stop, spawn-link, link
+   - sockets: socket-connect, socket-listen, socket-listen-on,
+     socket-listen-port, socket-accept, socket-send, socket-send-from,
+     socket-recv, socket-recv-fully, socket-close, socket-local-port
+   - servers/net: ssh-serve-tcp, ssh-serve-tcp-on, ssh-serve-vsock, ssh-boot,
+     run-net-pipeline, http-fetch
+   - profiling: pmu-start, pmu-stop, pmu-read, pmu-measure, pmu-profile,
+     pmu-annotate
+   Everything else (GC probes, console primitives, crypto, the compiler) stays
+   in MODUS-INT and is reached as `modus-int::name`, as SBCL code reaches
+   sb-int / sb-impl.
+3. Qualify the remaining internal calls in test/, scripts/ and docs/ (218
+   names, 163 files measured), then drop the fallback.
+   **DONE for test/ and scripts/ (f785daa0):** every test/*.lisp gives the same
+   exit status with the fallback on and off, and strict mode logs no hits.
+   The fallback is OFF by default since; `*kernel-name-fallback-p*` T turns it
+   back on.  Deleting it outright waits on docs/ (prose examples still call
+   internals bare).
+4. Globals and specials: the same, later (they are stored by name hash in
+   compiled code, so this one moves bytes).
+
 ## Open questions
 
 1. **What exactly does `MODUS` export** beyond today's thread/channel API?

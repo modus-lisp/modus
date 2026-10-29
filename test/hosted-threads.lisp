@@ -51,7 +51,7 @@
 (defvar *budget* 200000000)
 (defvar *work* 4000000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -67,7 +67,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(let ((res (%ha-threads-selftest *budget* *work*)))
+(let ((res (modus-int::%ha-threads-selftest *budget* *work*)))
   (if (= res 0)
       (format t "~%SKIP: no actor band, or the thread stack could not be mapped.~%")
       (let* ((tid     (w res #x00))

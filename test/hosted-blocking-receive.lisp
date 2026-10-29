@@ -55,7 +55,7 @@
 (defvar *gap* 100)
 (defvar *idle* 1000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -102,7 +102,7 @@
   (format t "~%=== ARM 1: RECEIVE BLOCKS ================================~%")
   (format t "  ~D messages, one every ~Dms, then a ~Dms idle window.~%"
           *n* *gap* *idle*)
-  (setq bres (%br-selftest 0 *n* *gap* *idle*))
+  (setq bres (modus-int::%br-selftest 0 *n* *gap* *idle*))
   (if (= bres 0)
       (format t "~%SKIP: no actor band, no thread page, or the thread would not spawn.~%")
       (progn
@@ -124,7 +124,7 @@
         (format t "~%=== ARM 2: THE NEGATIVE CONTROL — TRY-RECEIVE + YIELD ====~%")
         (format t "  The same idle window, the same binary, one flag apart.~%")
         (format t "  This is what every threaded selftest in this tree does.~%")
-        (setq pres (%br-selftest 1 *pn* *gap* *idle*))
+        (setq pres (modus-int::%br-selftest 1 *pn* *gap* *idle*))
         (if (= pres 0)
             (progn (setq *fail* (+ *fail* 1))
                    (format t "  FAIL the polling arm did not run~%"))

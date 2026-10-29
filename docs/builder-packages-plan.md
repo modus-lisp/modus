@@ -211,6 +211,17 @@ system; `build-cl-repl-common.lisp`'s `%rpi-net-text` splices and the
 shape for the "suite as a `--load`-able script on a clean image" end state, and
 for the gadget/bootloader ports, which become one more driver package.
 
+## Order, revised 2026-10-29
+
+Step 2 found that image source cannot name a symbol of another build package
+(`modus.asm:x` is a reader error in a running image, and the self-host image
+re-reads its source), so every cross-package fix had to be a host-side import.
+Step 3 done in that state would push all of net/crypto/ssh/board through the
+same workaround.  **So the core of step 4 comes next** -- the build's packages
+exist in the image at boot, internals live in MODUS-INT, the public API in
+MODUS -- and step 3 follows, written with real qualified names and interfaces.
+(User, 2026-10-29: "that sounds better than the previous plan".)
+
 ## Order and size
 
 | step | changes emitted code? | rough size | blocks |

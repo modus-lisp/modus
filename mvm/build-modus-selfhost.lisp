@@ -250,6 +250,12 @@
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
     (setq *vreg-to-x64* v))
+  ;; Before LINUX-X64-NATIVE-CODE-OFFSET: it runs the boot-stub emitter, which
+  ;; compares this numerically (fcb5a4a2), and a defvar's value never reaches
+  ;; the image (limitation #7) -- NIL there killed modus-sh at boot.  A
+  ;; literal: +LINUX-X64-GC-MIDPOINT+ is MODUS-INT's and this text is read in
+  ;; MODUS.ASM, so naming it is a cross-package global the build rejects.
+  (setq *linux-x64-r14-offset* #x38000000)
   (setq *x64-native-code-offset* (linux-x64-native-code-offset))  ; WS5 modus3 FIX: linux-x64 boot preamble
   ;; is 397 bytes; install-x64-translator runs IN-IMAGE and is the authoritative
   ;; runtime setter (the host-only (setf … 397) at file tail doesn't persist —
@@ -1604,6 +1610,14 @@
         ;; or the DDC diverges -- it did, by 61,440 bytes, when SBCL emitted the
         ;; reject and this still forced it off.
         (setq *ws5-force-no-kindcheck* nil)
+        ;; THE CONSOLE HOOK, the same class: build-cl-repl-common sets
+        ;; *WRITE-CHAR-SERIAL-HOOK* to %CONSOLE-WRITE-CHAR at HOST build time
+        ;; (the PC console mirrors COM1 to the screen), so SBCL emitted a CALL
+        ;; for every WRITE-CHAR-SERIAL where this emitted the raw trap -- 223
+        ;; inlined serial writes against SBCL's 2, the image 512 bytes longer.
+        ;; The console source is in the image exactly when that hook is set.
+        (when (search \"(defun %console-write-char\" src)
+          (setq *write-char-serial-hook* (quote %console-write-char)))
         (setq *x64-native-code-offset* (+ 5 (uefi-cl-preamble-length)))
         (write-string-serial \"modus --compile-uefi: snp-mode \")
         (write-object *x64-snp-mode*)
@@ -1792,13 +1806,19 @@
   ;; so in-image --compile aligns entries to nibble 0, matching the seed's own
   ;; build.  Proof: nm seed = all fns nibble 0; nm modus2-v2 = all nibble d.
   ;; See reference_modus3_optional_lambda_miscompile.
-  (setq *x64-native-code-offset* (linux-x64-native-code-offset))
+  ;; The emitter that measures the stub compares *LINUX-X64-R14-OFFSET* with
+  ;; +LINUX-X64-GC-MIDPOINT+ (fcb5a4a2), and a defvar's value never reaches
+  ;; the image (limitation #7): NIL there killed modus-sh at boot with a
+  ;; TYPE-ERROR in %CHECKED-EQ.  The literal, as the co-init writes it: the
+  ;; constant itself is MODUS-INT's, and this source is not.
   (%install-deftest-macro)
   ;; Run all built-in defvar init thunks.  Each is wrapped in
   ;; handler-case at compile time so a thunk that references a not-yet-
   ;; bound symbol can't kill the chain — see CLAUDE.md known limitation
   ;; #7 history.  Most thunks succeed and we get init values for free.
   (init-all-globals)
+  (setq *linux-x64-r14-offset* #x38000000)
+  (setq *x64-native-code-offset* (linux-x64-native-code-offset))
   ;; ANSI numeric/array constants whose DEFCONSTANT init thunks don't run
   ;; at boot (limitation #7).  The x64-linux gate image sets these in its
   ;; own kernel-main; build-generic relied only on init-all-globals, so
@@ -2282,6 +2302,21 @@
 (mvm-load "boot/boot-linux-x64.lisp")
 
 (in-package :modus.mvm)
+;; HOST SHIM for the image reader.  The image source is read by modus's own
+;; reader, which drops SBCL package prefixes: `#+sbcl (sb-ext:posix-getenv V)'
+;; in a DEFCONSTANT initform -- boot-linux-x64's +LINUX-X64-GC-MIDPOINT+ (the
+;; MODUS_X64_MIDPOINT knob) -- arrives as MODUS-INT::POSIX-GETENV, the host EVAL
+;; that folds a DEFCONSTANT failed, the form was SKIPPED, and the constant was a
+;; NIL global in modus-sh: its boot-stub emitter died comparing it (and would
+;; have baked NIL into every stub it emitted).  Host-only; the image gains
+;; nothing.
+(dolist (pkg '("MODUS-INT" "MODUS.MVM.X64" "MODUS.MVM"))
+  (let ((p (find-package pkg)))
+    (when p
+      (let ((sym (intern "POSIX-GETENV" p)))
+        (unless (fboundp sym)
+          (setf (symbol-function sym)
+                (lambda (name) (sb-ext:posix-getenv name))))))))
 
 (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)

@@ -4017,6 +4017,36 @@ found it in 20 minutes: run the DDC at three commits concurrently in worktrees;
 `cmp` the pair; the first diff past the preamble JMP is a call displacement, so
 scan for the first difference WIDER than 8 bytes and disassemble both sides there.
 
+### THE UEFI DDC WAS DEAD FROM 2026-10-13 TO 2026-10-29 — four defects, none of them in the comparison
+
+`modus-sh` (build-modus-selfhost) did not BOOT, so test/run-uefi-ddc.sh could not
+even start its in-image compile.  Fixed on m68k-gc; the DDC is a byte-identical
+FIXPOINT again (UEFI image md5 `0f5380c2…`, reproducible run to run).  In the order
+they were peeled off, each found from a core dump (ptrace is blocked here; patch
+`#xCC` over the first byte of ERROR in a COPY of the binary and read the core):
+1. **Stack overflow at boot** (65bc8ab2, 10-15): the hash-table core tested
+   `(eq strcmp? :equalp)` first, and in an image WITHOUT static keywords (modus-sh;
+   only the CLI builds set `*static-keywords-p*`) `:equalp` is a call to
+   %INTERN-KEYWORD, whose own table lookup comes back to the same test -- 44,900
+   frames.  Every such test in prelude now rules out NIL and T first.
+2. **`*LINUX-X64-R14-OFFSET*` NIL** (fcb5a4a2, 10-13): the stub emitter compares
+   it, and modus-sh's KERNEL-MAIN measured the stub before the defvar thunks ran.
+   Set it (as a LITERAL -- the constant is MODUS-INT's, and naming it from the
+   MODUS.ASM co-init text is a cross-package global the build rejects) after
+   INIT-ALL-GLOBALS.
+3. **`+LINUX-X64-GC-MIDPOINT+` NIL in modus-sh**: modus's image reader drops SBCL
+   package prefixes, so the defconstant's `#+sbcl (sb-ext:posix-getenv …)` arrived
+   as MODUS-INT::POSIX-GETENV, the host EVAL that folds a defconstant failed, and
+   the form was SKIPPED (`SKIP form#… boot/boot-linux-x64.lisp:44` in the build
+   log).  A host-only POSIX-GETENV shim in those packages lets it fold.
+4. **The DDC rule again** (a host-set flag the in-image compile never sees):
+   `*WRITE-CHAR-SERIAL-HOOK*` (the PC console mirrors COM1 to the screen) was not
+   set by `--compile-uefi`, so modus-sh inlined 223 raw serial writes where SBCL
+   called %CONSOLE-WRITE-CHAR -- 512 bytes longer.  Set when the source defines it.
+All four are on pristine main (4d1a94b5 overflows at boot exactly as above, and
+with only these fixes applied gives the same 512-byte divergence).  **A `SKIP form` line in a self-host build log is a constant or
+function the image does not have** -- read the build log before the binary.
+
 ### AWS NITRO ENCLAVES — the hosted route (2026-10-06, docs/nitro-enclaves.md)
 
 **RAN FOR REAL 2026-10-07 — VERDICT PASS** on an m5.xlarge in us-east-2, non-debug

@@ -1459,7 +1459,7 @@
         (when (consp vec)
           ;; COMPACT DICT (see %HTD-FIND)
           (setq use-linear nil)
-          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp))
+          (if (and (fixnump key) (not (and (cdr (cdr holder)) (not (eq (cdr (cdr holder)) t)) (eq (cdr (cdr holder)) :equalp)))
                    (< (%prim-array-length (cdr vec)) 131070))
               ;; FIXNUM FAST PATH, inline like the bucket path's: %HTD-PROBE
               ;; for a 2-byte index and an EQ key, without the calls
@@ -1486,7 +1486,7 @@
                         (setq dict-hit t)
                         (setq dict-val (%word-aref (cdr vec) (+ 3 (+ n n))))))))))
         (when (and vec (not (consp vec)) (not (eq vec -424242001)))
-          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
+          (if (and (fixnump key) (not (and (cdr (cdr holder)) (not (eq (cdr (cdr holder)) t)) (eq (cdr (cdr holder)) :equalp))))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
               ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
               ;; keyword literal and every name-hash keyed compiler table.
@@ -1571,7 +1571,7 @@
           (%htd-to-alist ht holder nil)
           (return-from %gethash-pair (%gethash-pair key ht)))
         (when (and vec (not (eq vec -424242001)))
-          (if (and (fixnump key) (not (eq (cdr (cdr holder)) :equalp)))
+          (if (and (fixnump key) (not (and (cdr (cdr holder)) (not (eq (cdr (cdr holder)) t)) (eq (cdr (cdr holder)) :equalp))))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
               ;; every SYMBOL-VALUE / SET-SYMBOL-VALUE of a special, every
               ;; keyword literal and every name-hash keyed compiler table.
@@ -1637,7 +1637,7 @@
          (strcmp? (and vec (%ht-h-strcmp holder)))
          (addr? nil)
          (existing (and vec
-                        (if (and (fixnump key) (not (eq strcmp? :equalp)))
+                        (if (and (fixnump key) (not (and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp))))
                             ;; fixnum fast path (mirrors GETHASH)
                             (let* ((k (if (< key 0) (- key) key))
                                    (h (logand (logxor k (logxor (ash k -8) (ash k -16)))
@@ -1990,7 +1990,12 @@
    String hash is CASE-SENSITIVE.  MASK = bucket-count minus one (the
    bucket vector is a power of two in length and GROWS with the table)."
   (cond
-    ((eq strcmp? :equalp) (logand (%ht-equalp-hash key 0) mask))
+    ;; STRCMP? is NIL (EQ/EQL), T (EQUAL) or :EQUALP, and every test of it in
+    ;; this file rules out NIL and T BEFORE it evaluates the keyword: in an
+    ;; image without static keywords (modus-sh) `:equalp' is a call to
+    ;; %INTERN-KEYWORD, whose own table lookup comes back here -- the
+    ;; recursion that overflowed modus-sh's stack at boot from 65bc8ab2 on.
+    ((and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp)) (logand (%ht-equalp-hash key 0) mask))
     ;; FIXNUM FIRST: every special-variable read and write probes the globals
     ;; table with one (%GV-CELL), and it used to pass two string tests to get
     ;; here.  The mix is the one documented at the fixnum clause below.
@@ -2331,7 +2336,7 @@
         (%ht-nohash)
         (let ((cur (%word-aref vec h)))
           (cond
-            ((eq strcmp? :equalp)
+            ((and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp))
              (loop
                (when (null cur) (return nil))
                (let ((e (car cur)))
@@ -2371,7 +2376,7 @@
           (loop
             (when (null cur) (return nil))
             (let* ((e (car cur)) (ek (car e)))
-              (when (cond ((eq strcmp? :equalp) (equalp ek key))
+              (when (cond ((and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp)) (equalp ek key))
                           ((and strcmp? (stringp key)) (and (stringp ek) (string= ek key)))
                           ((and strcmp? (consp key)) (equal ek key))
                           (t (eq ek key)))
@@ -2397,7 +2402,7 @@
         (loop
           (when (null cur) (return nil))
           (let ((ek (car (car cur))))
-            (unless (cond ((eq strcmp? :equalp) (equalp ek key))
+            (unless (cond ((and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp)) (equalp ek key))
                           ((and strcmp? (stringp key))
                            (and (stringp ek) (string= ek key)))
                           ((and strcmp? (consp key)) (equal ek key))
@@ -2587,7 +2592,7 @@
 
 (defun %htd-key= (k key strcmp?)
   "KEY matches stored key K, as %HT-BUCKET-FIND matches."
-  (cond ((eq strcmp? :equalp) (equalp k key))
+  (cond ((and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp)) (equalp k key))
         ((and strcmp? (stringp key)) (and (stringp k) (string= k key)))
         ((and strcmp? (consp key)) (equal k key))
         (t (eq k key))))
@@ -2611,7 +2616,7 @@
                   1))
          (cap (ash (- elen 2) -1))
          ;; EQ unless EQUALP (1 is EQUALP to 1.0), string content or a list
-         (ident (and (not (eq strcmp? :equalp))
+         (ident (and (not (and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp)))
                      (or (fixnump key)
                          (not (and strcmp? (or (stringp key) (consp key)))))))
          (strings (and (eq strcmp? t) (stringp key)))
@@ -2706,7 +2711,7 @@
 (defun %htd-find (ht dict key strcmp?)
   "Entry number of KEY in DICT, NIL if absent, or %HT-NOHASH for a key the dict
    cannot hold (the caller turns the table back into an alist)."
-  (let ((h (if (and (fixnump key) (not (eq strcmp? :equalp)))
+  (let ((h (if (and (fixnump key) (not (and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp))))
                (let ((k (if (< key 0) (- key) key)))
                  (logand (logxor k (logxor (ash k -8) (ash k -16))) (%htd-mask dict)))
                (%ht-hash key strcmp? (%htd-mask dict)))))
@@ -2763,7 +2768,7 @@
             (%htd-place-at dict used (%ht-addr-hash key (%htd-mask dict)))
             (%ht-addr-stale ht))
         (%htd-place-at dict used
-                       (if (and (fixnump key) (not (eq strcmp? :equalp)))
+                       (if (and (fixnump key) (not (and strcmp? (not (eq strcmp? t)) (eq strcmp? :equalp))))
                            (let ((k (if (< key 0) (- key) key)))
                              (logand (logxor k (logxor (ash k -8) (ash k -16))) (%htd-mask dict)))
                            (%ht-hash key strcmp? (%htd-mask dict)))))

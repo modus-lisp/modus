@@ -80,6 +80,13 @@
   (when v (setq *pkg-any-local-nicknames* t))
   (aset (%pkg-data pkg) 9 v))
 
+(defun %pln-free-p ()
+  "Does a lookup from here mean the GLOBAL name?  Yes unless *PACKAGE* has local nicknames --
+   so FIND-PACKAGE's memo serves any package without them.  It used to turn off for everyone
+   once any package had one, and with cl-nostr loaded a board's every FIND-PACKAGE walked."
+  (or (not *pkg-any-local-nicknames*)
+      (let ((p *package*)) (and (%pkg-p p) (null (%pkg-local-nicknames p))))))
+
 (defun %pkg-lookup-local-nickname (name-str pkg)
   "Resolve NAME-STR against PKG's package-local nicknames.  Returns the target
    package, or NIL.  Case-sensitive on the nickname STRING the way every other
@@ -534,7 +541,7 @@
    which would regress if we polluted the nicknames slot."
   (cond
     ((%pkg-p name) name)
-    ((and name (or (symbolp name) (stringp name)) (not *pkg-any-local-nicknames*))
+    ((and name (or (symbolp name) (stringp name)) (%pln-free-p))
      (let ((c *%find-package-cache*) (cell nil) (str (stringp name)))
        (loop (unless (consp c) (return))
          (let ((k (car (car c))))

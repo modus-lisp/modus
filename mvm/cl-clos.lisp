@@ -597,23 +597,18 @@
   "EQ hash: symbol class NAME -> what %FIND-CLOS-CLASS-SCAN answered.  %OBJ-CPL
    asks on every SLOT-VALUE and every class TYPEP, and the scan walks every
    class in the image.  Dropped wherever *CLOS-CLASSES* is set; main thread
-   only, as *GF-FIND-MEMO*.")
+   or under the runtime lock, as *GF-FIND-MEMO* (%CLOS-MEMO-PUT).")
 
 (defun %find-clos-class (name)
   "Return class descriptor for NAME, or nil -- through *CLOS-FIND-MEMO*.
    A class object is its own descriptor (an instance's class slot holds one)."
   (when (%clos-class-p name) (return-from %find-clos-class name))
-  (if (and (symbolp name) name (%gf-cache-writable-p))
-      (let ((memo *clos-find-memo*))
-        (when (null memo)
-          (setq memo (make-hash-table :test (quote eq)))
-          (setq *clos-find-memo* memo))
-        (let ((hit (gethash name memo)))
-          (if hit
-              hit
-              (let ((c (%find-clos-class-scan name)))
-                (when c (puthash name memo c))
-                c))))
+  (if (and (symbolp name) name)
+      (let* ((memo *clos-find-memo*) (hit (and memo (gethash name memo))))
+        (or hit
+            (let* ((head *clos-classes*) (c (%find-clos-class-scan name)))
+              (when c (%clos-memo-put 2 name c head))
+              c)))
       (%find-clos-class-scan name)))
 
 (defun %find-clos-class-scan (name)
@@ -3821,23 +3816,47 @@
             (setq *%gf-dm* dm))
           (setf (svref dm (logand h 255)) (cons name gf)))))))
 
+(defun %clos-memo-put (which key val head)
+  "KEY -> VAL into memo WHICH (0 *GF-FIND-MEMO*, 1 *GF-FIND-SETF-MEMO*, 2 *CLOS-FIND-MEMO*),
+   made if absent -- and only while the list the answer was scanned from still starts at HEAD:
+   a GF or class defined since would make a stored miss permanent.  ANY THREAD.  A worker takes
+   the runtime lock, which also makes the shared heap the active one, so the table and its
+   growth are not worker-region objects held by a global (the rule the dispatch caches keep by
+   being main-only).  Before this a worker never stored, so every generic call the gateway's
+   own thread made that main had not made first scanned every GF -- twice for a miss."
+  (let ((w (%gf-cache-writable-p)))
+    (unless w (%rt-enter))
+    (when (eq head (if (= which 2) *clos-classes* *generic-functions*))
+      (let ((memo (cond ((= which 0) *gf-find-memo*) ((= which 1) *gf-find-setf-memo*)
+                        (t *clos-find-memo*))))
+        (when (null memo)
+          (setq memo (make-hash-table :test (quote eq)))
+          (cond ((= which 0) (setq *gf-find-memo* memo))
+                ((= which 1) (setq *gf-find-setf-memo* memo))
+                (t (setq *clos-find-memo* memo))))
+        (puthash key memo val)))
+    (unless w (%rt-leave))
+    val))
+
+(defun %gf-dm-fill-any (name gf)
+  "%GF-DM-FILL from any thread: a worker's under the runtime lock (see %CLOS-MEMO-PUT)."
+  (if (%gf-cache-writable-p)
+      (%gf-dm-fill name gf)
+      (progn (%rt-enter) (%gf-dm-fill name gf) (%rt-leave))))
+
 (defun %find-gf (name)
   "Find generic function by name -- through *GF-FIND-MEMO* for a symbol, and
    *GF-FIND-SETF-MEMO* for a (SETF symbol) name."
   (when (and (consp name) (symbolp (car name))
              (or (eq (car name) (quote setf)) (%clos-sym-name-eq (car name) (quote setf)))
              (consp (cdr name)) (symbolp (car (cdr name))) (car (cdr name))
-             (null (cdr (cdr name))) (%gf-cache-writable-p))
-    (let ((memo *gf-find-setf-memo*) (sym (car (cdr name))))
-      (when (null memo)
-        (setq memo (make-hash-table :test (quote eq)))
-        (setq *gf-find-setf-memo* memo))
-      (let ((hit (gethash sym memo)))
-        (cond ((eq hit :%no-gf) (return-from %find-gf nil))
-              (hit (return-from %find-gf hit))
-              (t (let ((gf (%find-gf-scan name)))
-                   (puthash sym memo (if gf gf :%no-gf))
-                   (return-from %find-gf gf)))))))
+             (null (cdr (cdr name))))
+    (let* ((memo *gf-find-setf-memo*) (sym (car (cdr name))) (hit (and memo (gethash sym memo))))
+      (cond ((eq hit :%no-gf) (return-from %find-gf nil))
+            (hit (return-from %find-gf hit))
+            (t (let* ((head *generic-functions*) (gf (%find-gf-scan name)))
+                 (%clos-memo-put 1 sym (if gf gf :%no-gf) head)
+                 (return-from %find-gf gf))))))
   ;; DIRECT-MAPPED FRONT: 256 (symbol . gf) cells indexed by the symbol's
   ;; name hash, read before the EQ table (whose GETHASH was a tenth of every
   ;; generic call).  Filled from the table's hits, dropped with it.
@@ -3849,24 +3868,20 @@
             (let ((e (svref dm (logand h 255))))
               (when (and (consp e) (eq (car e) name))
                 (return-from %find-gf (cdr e)))))))))
-  (if (and (symbolp name) name (%gf-cache-writable-p))
+  (if (and (symbolp name) name)
       ;; No BOUNDP (1 us here): an absent global reads as NIL (%GV-REF).
-      (let ((memo *gf-find-memo*))
-        (when (null memo)
-          (setq memo (make-hash-table :test (quote eq)))
-          (setq *gf-find-memo* memo))
-        (let ((hit (gethash name memo)))
-          (cond
-            ((eq hit :%no-gf) nil)
-            (hit (%gf-dm-fill name hit) hit)
-            (t
-             ;; A MISS is memoised too: MAKE-INSTANCE asks for GFs that
-             ;; usually do not exist (no user INITIALIZE-INSTANCE method),
-             ;; and each miss rescanned every GF, twice.  The one push onto
-             ;; *GENERIC-FUNCTIONS* drops the memo, misses included.
-             (let ((gf (%find-gf-scan name)))
-               (puthash name memo (if gf gf :%no-gf))
-               gf)))))
+      (let* ((memo *gf-find-memo*) (hit (and memo (gethash name memo))))
+        (cond
+          ((eq hit :%no-gf) nil)
+          (hit (%gf-dm-fill-any name hit) hit)
+          (t
+           ;; A MISS is memoised too: MAKE-INSTANCE asks for GFs that
+           ;; usually do not exist (no user INITIALIZE-INSTANCE method),
+           ;; and each miss rescanned every GF, twice.  The one push onto
+           ;; *GENERIC-FUNCTIONS* drops the memo, misses included.
+           (let* ((head *generic-functions*) (gf (%find-gf-scan name)))
+             (%clos-memo-put 0 name (if gf gf :%no-gf) head)
+             gf))))
       (%find-gf-scan name)))
 
 (defun %find-gf-scan (name)

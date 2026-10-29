@@ -898,6 +898,9 @@
       ((%macro-pkg-get sym key))
       ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
       ((%macro-pkg-foreign-p sym key) nil)
+      ;; A symbol shadowing a CL name with no macro of its own has none: every
+      ;; bare-name entry below is CL's (see MACRO-FUNCTION).
+      ((%shadows-cl-name-p sym) nil)
       ((and *macro-function-table* (gethash key *macro-function-table*)))
       ((%macro-table-visible-expander key))
       ((and (stringp key) (%compiler-macro-p key)) t)
@@ -938,6 +941,14 @@
                           (and p (string= (package-name p) "COMMON-LISP"))))
                    (%macro-pkg-foreign-p sym key))
               nil)
+             ;; A symbol that SHADOWS a CL name and has no macro of its own has
+             ;; none: the bare-name entries below are CL's.  Read through them,
+             ;; cortez's CORTEZ.GLOBAL:LOOP -- TI's LOOP, not yet loaded --
+             ;; answered with CL's LOOP expander, so the loader thought the cell
+             ;; full and never fetched theirs, and (LOOP FOR ...) then compiled as
+             ;; a call: "The variable FOR is unbound".  The compiler's
+             ;; %MACRO-EXPANDER already says this (d329695).
+             ((%shadows-cl-name-p sym) nil)
              ((and *macro-function-table* (gethash key *macro-function-table*)))
              ;; Compiler inlining macros over standard CL FUNCTIONS are
              ;; filtered here — see %MACRO-TABLE-VISIBLE-EXPANDER.

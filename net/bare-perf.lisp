@@ -218,15 +218,17 @@
    With ALLOC, a sample's weight is not 1 but the BYTES its core allocated since the core's
    previous sample (each record carries the allocation pointer, x24 -- which holds the address
    HALVED, a fixnum): an allocation profile on the same samples, read by the same host script.
-   On core 0 a step counts only when both samples lie in the same semispace of region 0 and
-   it goes up: a collection between them moves the pointer to the other space, and the first
-   attempt, which only capped the step, charged those jumps to whatever ran next (the
+   A step is from the previous sample in the same heap -- region 0's semispace 0 or 1, or
+   anywhere else (a slot thread's region, which shares core 0 with the main thread) -- and
+      counts when it goes up (elsewhere: by at most ALLOC-MAX).  A collection moves region 0's
+   pointer to the other space; the first attempt, which only capped the step, charged those jumps to whatever ran next (the
    collector's caller) -- most of the total.  Elsewhere a step must be under ALLOC-MAX.  So the
    bytes are a sample of what was allocated, not all of it."
   (let ((stacks (make-hash-table :test 'equal)) (flat (make-hash-table)) (n 0))
     (dolist (core cores)
       (let* ((c (%perf-ctl core)) (base (%perf-u64 c)) (wp (%perf-u64 (+ c 16)))
-             (depth (%perf-u64 (+ c 32))) (rec (* 8 (+ 3 depth))) (prev nil)
+             (depth (%perf-u64 (+ c 32))) (rec (* 8 (+ 3 depth)))
+             (prevs (list nil nil nil))                  ; per heap: semispace 0, 1, elsewhere
              (rcb (and alloc (= core 0) (%conv-addr #x10000040)))
              (sz (and rcb (%gc-read64 (+ rcb 16))))
              (spaces (and rcb (list (%gc-read64 rcb) (%gc-read64 (+ rcb 8))))))
@@ -234,13 +236,20 @@
           (loop for r from base below wp by rec
                 do (let* ((pc (%perf-u64 (+ r 8)))
                           (ap (* 2 (ash (%perf-u64 r) -16)))
+                          ;; which heap the pointer is in: a slot thread on the same core
+                          ;; allocates in its own region, and a step between two threads'
+                          ;; samples measures nothing -- so a step is from the previous sample
+                          ;; IN THE SAME HEAP (region 0's semispace 0 or 1, or elsewhere)
+                          (hi (or (and spaces (position-if (lambda (s) (and (<= s ap) (< ap (+ s sz))))
+                                                           spaces))
+                                  2))
+                          ;; a flip: the other semispace's last sample is a cycle old
+                          (prev (progn (when (< hi 2) (setf (nth (- 1 hi) prevs) nil))
+                                       (nth hi prevs)))
                           (w (if alloc
                                  (let ((d (and prev (- ap prev))))
                                    (cond ((or (null d) (< d 0)) 0)
-                                         (spaces
-                                          (if (find-if (lambda (s) (and (<= s prev) (< ap (+ s sz))))
-                                                       spaces)
-                                              d 0))
+                                         ((< hi 2) d)
                                          ((<= d alloc-max) d)
                                          (t 0)))
                                  1))
@@ -248,7 +257,7 @@
                                         for f = (%perf-u64 (+ r 24 (* 8 i)))
                                         until (zerop f) collect f))
                           (key (format nil "~x;~x~{;~x~}" pc (%perf-u64 (+ r 16)) frames)))
-                     (setq prev ap)
+                     (setf (nth hi prevs) ap)
                      (when (plusp w)
                        (incf n w)
                        (incf (gethash pc flat 0) w)

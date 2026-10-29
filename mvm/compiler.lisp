@@ -11427,6 +11427,13 @@
           ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
                (and (integerp op) (= op 338547669)))
            nil)
+          ;; #'X is a closure exactly when X is a LAMBDA; any other X names a
+          ;; function and is not a form -- walked as one it is macroexpanded,
+          ;; and TI's MACRO writes #'(MACRO NAMED-LAMBDA ...), which expands to
+          ;; another #'(MACRO ...) without end (SIGSEGV).
+          ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+               (and (integerp op) (= op 402801909)))
+           (and (consp (cadr form)) (%form-op-is (cadr form) 80380232 "LAMBDA")))
           ((and (consp op) (%form-has-closure-p op)) t)
           (t
            (let ((rest (cdr form)) (found nil))
@@ -11505,10 +11512,13 @@
                       ;; Also recurse into lambda body for nested lambdas with shadowing
                       (dolist (f (cddr form))
                         (scan f t))))
-                   ;; function literal — same as lambda
+                   ;; function literal — same as lambda.  Only a LAMBDA: any
+                   ;; other #'X names a function (see %FORM-HAS-CLOSURE-P-2).
                    ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
                         (and (integerp op) (= op 402801909)))  ; FUNCTION
-                    (scan (cadr form) in-lambda))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (scan (cadr form) in-lambda)))
                    ;; FLET / LABELS — each function body is a separate
                    ;; function (compiled by mvm-compile-function-internal)
                    ;; whose body can mutate enclosing let-vars exactly as a
@@ -11709,7 +11719,10 @@
                         (note (collect-var-refs f let-vars params)))))
                    ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
                         (and (integerp op) (= op 402801909)))  ; FUNCTION
-                    (scan (cadr form)))
+                    ;; Only a LAMBDA (see %FORM-HAS-CLOSURE-P-2).
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (scan (cadr form))))
                    ((or (and (symbolp op)
                              (or (string= (symbol-name op) "FLET")
                                  (string= (symbol-name op) "LABELS")))
@@ -18102,8 +18115,14 @@
                         (walk (car cur) xl sh)
                         (setq cur (cdr cur)))))
                    ;; (function (lambda ...)) — recurse with the lambda case
+                   ;; Only a LAMBDA inside #' is code.  Anything else names a
+                   ;; function, and walked as a form it is macroexpanded: TI's
+                   ;; MACRO writes #'(MACRO NAMED-LAMBDA ...), which expands to
+                   ;; another #'(MACRO ...) -- unbounded walk, a SIGSEGV.
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) xl sh))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) xl sh)))
                    ;; RETURN-FROM <name> — check target + lambda boundary
                    ((%form-op-is form 164933334 "RETURN-FROM")
                     (when (and xl (not sh)
@@ -18191,8 +18210,12 @@
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
+                   ;; Only a LAMBDA inside #' is code (see
+                   ;; %RETURN-FROM-ESCAPES-BLOCK-P).
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) in-fn))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) in-fn)))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
                               (setq cur (cdr cur)))))))))
@@ -18335,8 +18358,12 @@
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
+                   ;; Only a LAMBDA inside #' is code (see
+                   ;; %RETURN-FROM-ESCAPES-BLOCK-P).
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) in-fn))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) in-fn)))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
                               (setq cur (cdr cur))))))))
@@ -18390,8 +18417,12 @@
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
+                   ;; Only a LAMBDA inside #' is code (see
+                   ;; %RETURN-FROM-ESCAPES-BLOCK-P).
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) in-fn))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) in-fn)))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
                               (setq cur (cdr cur)))))))))

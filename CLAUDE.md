@@ -777,6 +777,23 @@ against SBCL) is 3000/3000 on the soft image, the hard image and x64.  SBCL's ow
 reader misrounds some subnormals (`1e-39`, `-2.5d-310`, `1.4e-45` -> 0.0); modus is
 right there, so check a disagreement exactly before believing SBCL.
 
+### Soft-float i386 (Pentium / PII / PIII, 486, 386): `MODUS_I386_SOFT_FLOAT=1`
+
+The SAME lowering as 68k (`build-i386-cli.lisp` sets `*CLI-SOFT-FLOAT*`; the i386
+translator records any float opcode that still arrives, `fcmp` included, as a gap
+and INT3s).  Why it matters on x86: the hard image's floats are **SSE2**, i.e.
+Pentium 4+, so the soft image is what runs on a Pentium-class machine, not just
+on an FPU-less one.  **QEMU's `-cpu 486`, `pentium` and `pentium2` TRAP SSE2**
+(SIGILL; `pentium3` does NOT, it executes them), so this one is tested for real:
+the soft image runs under `-cpu 486`, the hard one dies at its first float op with
+`ILLEGAL-INSTRUCTION-ERROR`.  x87 still executes on those models (no FPU-less x86
+model), so `test/run-i386-fpu-scan.sh` (in_asm, count `f*` / `xmm` mnemonics)
+covers it: soft 0.  Under `-cpu 486`: the 3000-op battery 3000/3000 vs SBCL, the
+float battery identical to the hard image and x64, alexandria / cl-ppcre /
+ieee-floats with probe results identical to the hard image.  A div+sqrt-heavy
+interpreted loop costs 2.8x.  Bare-metal i386 is unaffected (it writes CR4, which
+a 386/486 does not have, and emits no float code).
+
 **FIXED (was open): single-float vectors on 30-bit towers.**  Three defects, the
 first found here:
 - the lane helpers (`%F32-BITS-REF/-SET-NARROW`, softfloat's lane load/store) read

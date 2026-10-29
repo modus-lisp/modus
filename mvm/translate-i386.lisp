@@ -2395,6 +2395,17 @@
                 (eql (first operands) +vreg-vr+))))
     (macrolet ((op= (sym) `(= opcode ,sym)))
       (cond
+        ;; NO SSE2: the compiler lowers every float op to mvm/softfloat.lisp, so
+        ;; one reaching here is a gap -- recorded and INT3, never an SSE2
+        ;; instruction a pre-Pentium-4 CPU would fault on.
+        ((and (eql modus.mvm::+target-soft-float+ 1)
+              (member opcode (list +op-fadd+ +op-fsub+ +op-fmul+ +op-fdiv+ +op-fsqrt+
+                                   +op-fround32+ +op-itof+ +op-ftoi+ +op-fcmp+
+                                   +op-f32-load+ +op-f32-store+)))
+         (let ((tbl (or *i386-unimpl-ops*
+                        (setf *i386-unimpl-ops* (make-hash-table :test 'eql)))))
+           (incf (gethash opcode tbl 0)))
+         (i386-emit-int3 buf))
         ;; ============================================
         ;; NOP / BREAK / TRAP
         ;; ============================================

@@ -49,6 +49,12 @@
 ;;; ============================================================
 
 (defvar *cli-arch* :i386)
+;; MODUS_I386_SOFT_FLOAT=1: no SSE2 (or x87) instructions at all -- floats go
+;; through mvm/softfloat.lisp (see build-cli-common), so the image runs on a
+;; Pentium / PII / PIII (x87 but no SSE2) and an FPU-less 386 / 486SX.
+(defvar *cli-soft-float*
+  (let ((v (sb-ext:posix-getenv "MODUS_I386_SOFT_FLOAT")))
+    (and v (plusp (length v)) (not (string= v "0")))))
 
 ;;; ABI FACT: the i386 int-0x80 table is its own numbering.  exit is 1 (60 on
 ;;; x86-64, 93 on the AArch64 generic ABI); exit_group is 252 (231 / 94).

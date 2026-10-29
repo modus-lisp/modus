@@ -139,4 +139,4 @@
    concatenated build blob (#211, modus.mvm::*build-package-reset-text*)."
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (modus.mvm::%build-package-scoped-source (read-file-text path))))
+    (modus.mvm::%build-package-scoped-source (read-file-text path) relative-path)))

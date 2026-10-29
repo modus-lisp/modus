@@ -229,7 +229,10 @@
   ;; string.
   (let ((p (merge-pathnames "mvm/float-slot-overrides.lisp" *modus-base*)))
     (modus.mvm::check-parses p)
-    (concatenate 'string (string #\Newline) (read-file-text p))))
+    (concatenate 'string (string #\Newline)
+                 (modus.mvm::%source-file-marker "mvm/float-slot-overrides.lisp")
+                 (read-file-text p) (string #\Newline)
+                 (modus.mvm::%source-file-trailer "mvm/float-slot-overrides.lisp"))))
 ;; STAGE 2 probe: mvm-eval = compile form to MVM bytecode + interpret it.
 ;; Closed-world (calls only resolve within the compiled module) — fine for
 ;; pure-arithmetic forms whose ops inline to MVM opcodes.
@@ -391,7 +394,8 @@
         ;; tail, so re-append it — the next chunk concatenated after this one
         ;; (*jit-coinit-source*) must not read in MODUS.MVM.X64.
         (concatenate 'string (subseq src 0 pos)
-                     modus.mvm::*build-package-reset-text*)))))
+                     modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-x64.lisp"))))))
 ;; Co-init that populates the translator's defvar lookup tables at boot AND sets
 ;; the runtime JIT globals.  Byte-for-byte the same table data the ANSI gate
 ;; installs (build-ansi-common.lisp *x64-translator-coinit-source*), plus a
@@ -607,7 +611,8 @@
         (let ((pos (search marker src)))
           (unless pos (error "CLI-JIT: could not find install-aarch64-translator strip marker"))
           (concatenate 'string (subseq src 0 pos)
-                       modus.mvm::*build-package-reset-text*))))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-aarch64.lisp")))))))
 
 ;; AArch64 co-init.  Same role as %init-x64-translator: populate the tables the
 ;; translator's defvar init-thunks would have filled (limitation #7).  Verbatim
@@ -1094,8 +1099,11 @@
     ;; `chipz:' before we strip it.
     (mvm-text "lib/tar.lisp")
     (string #\Newline)
+    (modus.mvm::%source-file-marker "lib/install-tarball.lisp")
     (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
                                                        *modus-base*)))
+    (string #\Newline)
+    (modus.mvm::%source-file-trailer "lib/install-tarball.lisp")
     (string #\Newline)
     ;; SAVE-AND-DIE: heap snapshot (save-and-die PATH) and the restore that
     ;; kernel-main runs before boot init.  Lives here, not in the hosted layer,
@@ -2180,7 +2188,9 @@
    test/limitations.lisp.  Unset: \"\"."
   (let ((f (sb-ext:posix-getenv "MODUS_EXTRA_SOURCE")))
     (if (and f (plusp (length f)))
-        (concatenate 'string (string #\Newline) (read-file-text f) (string #\Newline))
+        (concatenate 'string (string #\Newline) (modus.mvm::%source-file-marker f)
+                     (read-file-text f) (string #\Newline)
+                     (modus.mvm::%source-file-trailer f) (string #\Newline))
         "")))
 
 (defvar *all-runtime-source*
@@ -2363,7 +2373,12 @@
              (let ((token (string-upcase (subseq text start pos))))
                (unless (or (gethash token seen)
                            (zerop (length token))
-                           (every #'digit-char-p token))
+                           (every #'digit-char-p token)
+                           ;; the build's per-file marker (cross.lisp
+                           ;; %SOURCE-FILE-MARKER) compiles to nothing and is
+                           ;; not a runtime symbol; counting it renumbered the
+                           ;; whole symbol-name table
+                           (string= token "%SOURCE-FILE"))
                  (setf (gethash token seen) t)
                  (push token result))
                ;; Also register a keyword token's bare name (without the

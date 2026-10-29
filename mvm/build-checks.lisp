@@ -1445,10 +1445,39 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                     (and nm (gethash (cdr r) nm))))))
       (format t ";; gv-cache: slot table written to ~A~%" dump))))
 
+(defvar *gck-defun-log* nil
+  "(NAME . FILE:LINE) for every function MVM-COMPILE-FUNCTION compiled in the
+   current BUILD-IMAGE, newest first.  Host-side only (see below).")
+
+(defun %gck-defun-inventory-path ()
+  (let ((path (sb-ext:posix-getenv "MODUS_DEFUN_INVENTORY")))
+    (and path (plusp (length path)) path)))
+
+(defun %gck-defun-inventory ()
+  "With MODUS_DEFUN_INVENTORY=FILE, write one line per DEFUN this image
+   compiled -- NAME, TAB, FILE:LINE -- superseded ones included, in compile
+   order.  This is what tells a dead duplicate (every image that has the old
+   definition also overrides it) from a seam (some image keeps the default):
+   the redefinition NOTEs only show the images that override.
+   MVM-COMPILE-ALL let-binds *FUNCTION-TABLE*, so the table is gone by the
+   time BUILD-IMAGE returns; the log is filled by an encapsulation instead."
+  (let ((path (%gck-defun-inventory-path)))
+    (when path
+      (with-open-file (o path :direction :output :if-exists :supersede)
+        (dolist (e (reverse *gck-defun-log*))
+          (format o "~A~C~A~%" (car e) #\Tab (or (cdr e) "?")))))))
+
+(when (%gck-defun-inventory-path)
+  (sb-int:encapsulate 'mvm-compile-function 'defun-inventory
+    (lambda (f name &rest args)
+      (push (cons name *current-source-location*) *gck-defun-log*)
+      (apply f name args))))
+
 (unless *build-image-unwrapped*
   (setf *build-image-unwrapped* #'build-image)
   (setf (fdefinition 'build-image)
         (lambda (&rest args)
+          (setf *gck-defun-log* nil)
           (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
                             (when forms
@@ -1481,6 +1510,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (%gck-guard "check-compiler-warns"
               (check-compiler-warns hist (nreverse unknown)))
             (%gck-guard "gv-cache-report" (%gck-gv-cache-report))
+            (%gck-guard "defun-inventory" (%gck-defun-inventory))
             result))))
 
 

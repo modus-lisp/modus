@@ -1938,6 +1938,13 @@
 (defvar *current-source-location* nil
   "Current source location string, set by mvm-compile-all for each form.")
 
+(defvar *current-source-file* nil
+  "The first-party file the forms being compiled came from, set by a toplevel
+   (%SOURCE-FILE PATH) -- the build's per-file marker (cross.lisp
+   %SOURCE-FILE-MARKER) -- with *CURRENT-SOURCE-FILE-LINE* the blob line it
+   started on.  Locations, and so every redefinition report, are FILE:LINE.")
+(defvar *current-source-file-line* 0)
+
 (defvar *arity-audit-log* nil
   "Audit trail of compile-time arity errors emitted by compile-call.
    Each entry is a list (CALLER CALLEE NARGS REQ PARAM-COUNT HAS-REST
@@ -30000,6 +30007,11 @@
     ((and (consp form) (name-eq (car form) "IN-PACKAGE"))
      nil)
 
+    ;; (%source-file PATH) — the build's per-file marker: mvm-compile-all reads
+    ;; it for locations; it compiles to nothing.
+    ((and (consp form) (name-eq (car form) "%SOURCE-FILE"))
+     nil)
+
     ;; Package operations — no-op (flat namespace via name hashes)
     ((and (consp form) (member (normalize-name (car form))
                                '(260674786    ; MAKE-PACKAGE
@@ -30986,10 +30998,19 @@
       (handler-case
        (progn
         (setf *pending-flet-ir* nil)
-        (setf *current-source-location*
-              (if (and source-lines (< form-index (length source-lines)))
-                  (format nil "line ~D" (aref source-lines form-index))
-                  (format nil "form#~D" form-index)))
+        (let ((line (and source-lines (< form-index (length source-lines))
+                         (aref source-lines form-index))))
+          (when (and (consp form) (symbolp (car form))
+                     (string= (symbol-name (car form)) "%SOURCE-FILE")
+                     (consp (cdr form)) (stringp (cadr form)))
+            (setf *current-source-file* (cadr form)
+                  *current-source-file-line* (or line 1)))
+          (setf *current-source-location*
+                (cond ((and line *current-source-file*)
+                       (format nil "~A:~D" *current-source-file*
+                               (+ 1 (- line *current-source-file-line*))))
+                      (line (format nil "line ~D" line))
+                      (t (format nil "form#~D" form-index)))))
         (when *compile-trace*
           (format t ";; compile ~A: ~A~%"
                   *current-source-location*

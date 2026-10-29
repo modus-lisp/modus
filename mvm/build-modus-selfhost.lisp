@@ -178,7 +178,8 @@
     (setf *translate-x64-source*
           ;; #211: re-append the package reset the trim just cut off.
           (concatenate 'string (subseq *translate-x64-source* 0 pos)
-                       modus.mvm::*build-package-reset-text*))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-x64.lisp")))))
 
 ;; Translator co-init: defvar/defparameter init-thunks do NOT run at boot
 ;; (CLAUDE.md item 7), so the translator's three lookup tables (*registers*,
@@ -446,7 +447,8 @@
     (setf *translate-aa64-source*
           ;; #211: re-append the package reset the trim just cut off.
           (concatenate 'string (subseq *translate-aa64-source* 0 pos)
-                       modus.mvm::*build-package-reset-text*))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-aarch64.lisp")))))
 
 ;;; --- The 4-function AArch64 encoder closure the Linux boot entry needs ---
 ;; EMIT-LINUX-AARCH64-ENTRY calls EMIT-AARCH64-U32 and EMIT-AARCH64-LOAD-IMM64,
@@ -2006,7 +2008,12 @@
              (let ((token (string-upcase (subseq text start pos))))
                (unless (or (gethash token seen)
                            (zerop (length token))
-                           (every #'digit-char-p token))
+                           (every #'digit-char-p token)
+                           ;; the build's per-file marker (cross.lisp
+                           ;; %SOURCE-FILE-MARKER) compiles to nothing and is
+                           ;; not a runtime symbol; counting it renumbered the
+                           ;; whole symbol-name table
+                           (string= token "%SOURCE-FILE"))
                  (setf (gethash token seen) t)
                  (push token result))
                ;; Also register a keyword token's bare name (without the

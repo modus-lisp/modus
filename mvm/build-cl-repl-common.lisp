@@ -178,7 +178,10 @@
 (defun %rpi-net-text (rel)
   (let ((p (merge-pathnames rel (merge-pathnames "net/" *modus-base*))))
     (modus.mvm::check-parses p)
-    (read-file-text p)))
+    (let ((name (concatenate 'string "net/" rel)))
+      (concatenate 'string (modus.mvm::%source-file-marker name)
+                   (read-file-text p)
+                   (string #\Newline) (modus.mvm::%source-file-trailer name)))))
 
 (defvar *pc-console-p*
   (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))

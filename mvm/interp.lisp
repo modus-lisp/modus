@@ -227,7 +227,14 @@
                  (setq cut (+ i 2)) (return))
                (setq i (+ i 1)))
              (and cut (< cut n)
-                  (gethash (subseq name cut) *symbol-function-table*))))))
+                  (let ((nm (subseq name cut)))
+                    (if (and (not (%kernel-home-pkg-name-p (subseq name 0 (- cut 2))))
+                             *kernel-fn-names* (gethash nm *kernel-fn-names*))
+                        ;; a non-kernel symbol named like a kernel function:
+                        ;; the counted, transitional read fallback (cl-eval.lisp)
+                        (let ((b (%kernel-shadow-fallback name)))
+                          (and b (gethash b *symbol-function-table*)))
+                        (gethash nm *symbol-function-table*))))))))
 
 (defun %rt-stub-count (runtime-table)
   "Number of runtime stubs in RUNTIME-TABLE: keys #x40000000, +1, ... are

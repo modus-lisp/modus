@@ -17,7 +17,7 @@
 ;;;; tried; the others are harmless with zero arguments (writev(0,NULL,0),
 ;;;; mkdir(NULL), iopl(0) / prctl(0)).  Exactly one must return the pid.
 
-(let* ((pid (%sys-getpid))
+(let* ((pid (modus-int::%sys-getpid))
        (got (list (syscall3 39 0 0 0) (syscall3 20 0 0 0) (syscall3 172 0 0 0)))
        (hits (count pid got)))
   (format t "~&syscall-clobber: pid ~D, candidates ~S -> ~D match~%" pid got hits)

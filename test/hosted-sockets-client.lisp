@@ -53,7 +53,7 @@
              (format t "  FAIL ~A~%" name))))
 
 (defun envint (name dflt)
-  (let ((s (%cli-getenv name)))
+  (let ((s (modus-int::%cli-getenv name)))
     (if (null s)
         dflt
         (if (= (length s) 0)
@@ -113,7 +113,7 @@
             (opened 0) (k 0) (r 0))
         (loop
           (when (>= k *nconn*) (return nil))
-          (let ((fd (socket-connect (%sock-loopback) *port* t)))
+          (let ((fd (socket-connect (modus-int::%sock-loopback) *port* t)))
             (aset fds k fd)
             (when (> fd 0) (setq opened (+ opened 1))))
           (setq k (+ k 1)))
@@ -183,11 +183,11 @@
       ;; ---- PHASE B: one transfer bigger than the staging buffer ---------
       (format t "~%=== ONE SEND LARGER THAN THE STAGING BUFFER ==============~%")
       (format t "  ~D bytes in a SINGLE socket-send-from, against a ~D-byte~%"
-              *big* (%sock-io-cap))
+              *big* (modus-int::%sock-io-cap))
       (format t "  staging buffer.  The old layer wrote LEN bytes out of a~%")
       (format t "  4096-byte page and issued one write(2); anything past 4096~%")
       (format t "  was somebody else's memory.~%")
-      (let ((fd (socket-connect (%sock-loopback) *port* t)))
+      (let ((fd (socket-connect (modus-int::%sock-loopback) *port* t)))
         (chk-true "connected" (> fd 0))
         (when (> fd 0)
           (let ((sb (make-array *big*)) (rb (make-array *big*)))

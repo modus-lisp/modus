@@ -79,7 +79,7 @@
              (format t "  FAIL ~A = ~D  (want >= ~D)~%" name got lo))))
 
 (defun envint (name dflt)
-  (let ((s (%cli-getenv name)))
+  (let ((s (modus-int::%cli-getenv name)))
     (if (null s)
         dflt
         (if (= (length s) 0)
@@ -101,41 +101,41 @@
 (defvar *bytes*  (envint "MODUS_SK_BYTES" 0))     ; what the client will send, per conn
 
 (format t "~%=== THE STAGING BUFFERS ==================================~%")
-(let ((p (%sk-page)))
+(let ((p (modus-int::%sk-page)))
   (chk-true "the socket page mapped" (> p 0))
   (if (zerop p)
       (format t "~%SKIP: no socket page.~%")
       (progn
-        (format t "  page base            ~X  (~D bytes)~%" p (%sk-page-bytes))
-        (format t "  this CPU's staging   ~X~%" (%sock-io-buf))
+        (format t "  page base            ~X  (~D bytes)~%" p (modus-int::%sk-page-bytes))
+        (format t "  this CPU's staging   ~X~%" (modus-int::%sock-io-buf))
         (format t "  CPU 1's staging      ~X~%"
-                (+ p (+ (%sk-data-off) (%sk-buf-bytes))))
+                (+ p (+ (modus-int::%sk-data-off) (modus-int::%sk-buf-bytes))))
         (format t "  file I/O's page      ~X   (mvm/cl-fileio.lisp)~%" *io-buf-addr*)
         (chk-true "socket staging is NOT the file-I/O page any more"
-                  (not (= (%sock-io-buf) *io-buf-addr*)))
+                  (not (= (modus-int::%sock-io-buf) *io-buf-addr*)))
         (chk-true "CPU 0's and CPU 1's staging buffers do not overlap"
-                  (>= (- (+ p (+ (%sk-data-off) (%sk-buf-bytes))) (%sock-io-buf))
-                      (%sk-buf-bytes)))
+                  (>= (- (+ p (+ (modus-int::%sk-data-off) (modus-int::%sk-buf-bytes))) (modus-int::%sock-io-buf))
+                      (modus-int::%sk-buf-bytes)))
         (chk-true "the sockaddr scratch is NOT the cstr page any more"
-                  (not (= (%sock-addr-buf) (+ *cstr-scratch* 3072))))
-        (chk "and the transfer capacity is the staging size" (%sock-io-cap)
-             (%sk-buf-bytes)))))
+                  (not (= (modus-int::%sock-addr-buf) (+ *cstr-scratch* 3072))))
+        (chk "and the transfer capacity is the staging size" (modus-int::%sock-io-cap)
+             (modus-int::%sk-buf-bytes)))))
 
 ;;; ---- open the listener, announce the port, then serve -------------------
 ;;;
 ;;; PORT 0: the kernel picks, and getsockname(2) reads back what it picked, so
 ;;; nothing here ever guesses a port number or races another process for one.
-;;; The address is (%SOCK-LOOPBACK) written out in full, and SOCKET-LISTEN-ON
+;;; The address is (modus-int::%SOCK-LOOPBACK) written out in full, and SOCKET-LISTEN-ON
 ;;; is the spelling that takes an address at all — this test can only ever bind
 ;;; 127.0.0.1 and a reader can see that without running it.
 
-(defvar *fd0* (%sk-fd-probe))
-(defvar *bound* (%sk-server-open (%sock-loopback) 0 16 *secs* *conns* *ncpu* *spin*))
+(defvar *fd0* (modus-int::%sk-fd-probe))
+(defvar *bound* (modus-int::%sk-server-open (modus-int::%sock-loopback) 0 16 *secs* *conns* *ncpu* *spin*))
 
 (if (< *bound* 0)
     (format t "~%SKIP: could not open the listener.~%")
     (progn
-      (%sk-set-shared-mode *shared*)
+      (modus-int::%sk-set-shared-mode *shared*)
       (format t "~%=== THE SERVER ===========================================~%")
       (format t "  bound 127.0.0.1:~D   (asked for port 0; the kernel chose)~%" *bound*)
       (format t "  serving CPUs ~D   expect ~D connections   deadline ~Ds~%"
@@ -147,37 +147,37 @@
 
       ;; ---- run --------------------------------------------------------
       (if (< *ncpu* 2)
-          (%sk-serve 0)
-          (%sk-run-two-threads 800000000))
-      (let ((fdsclosed (%sk-server-close))
-            (fd1 (%sk-fd-probe)))
+          (modus-int::%sk-serve 0)
+          (modus-int::%sk-run-two-threads 800000000))
+      (let ((fdsclosed (modus-int::%sk-server-close))
+            (fd1 (modus-int::%sk-fd-probe)))
 
         (format t "~%=== IT ACCEPTED, AND IT CLOSED ===========================~%")
-        (chk "connections accepted" (%sk-stat #x18) *conns*)
-        (chk "connections retired"  (%sk-stat #x20) *conns*)
-        (chk "still open at the end" (%sk-stat #x108) 0)
-        (chk-ge "the most it ever held at once" (%sk-stat #xD8) 2)
-        (chk "accept errors" (%sk-stat #x58) 0)
-        (chk "poll errors"   (%sk-stat #x110) 0)
-        (chk "echo write errors" (%sk-stat #xD0) 0)
-        (format t "  short writes (send queue filled mid-message)  ~D~%" (%sk-stat #x80))
-        (format t "  POLLOUT waits (send queue was full)           ~D~%" (%sk-stat #x130))
-        (format t "  EAGAIN reads (poll said ready, nothing there) ~D~%" (%sk-stat #x128))
+        (chk "connections accepted" (modus-int::%sk-stat #x18) *conns*)
+        (chk "connections retired"  (modus-int::%sk-stat #x20) *conns*)
+        (chk "still open at the end" (modus-int::%sk-stat #x108) 0)
+        (chk-ge "the most it ever held at once" (modus-int::%sk-stat #xD8) 2)
+        (chk "accept errors" (modus-int::%sk-stat #x58) 0)
+        (chk "poll errors"   (modus-int::%sk-stat #x110) 0)
+        (chk "echo write errors" (modus-int::%sk-stat #xD0) 0)
+        (format t "  short writes (modus-int::send queue filled mid-message)  ~D~%" (modus-int::%sk-stat #x80))
+        (format t "  POLLOUT waits (modus-int::send queue was full)           ~D~%" (modus-int::%sk-stat #x130))
+        (format t "  EAGAIN reads (poll said ready, nothing there) ~D~%" (modus-int::%sk-stat #x128))
 
         (format t "~%=== MORE THAN A PAGE, IN BOTH DIRECTIONS =================~%")
         (format t "  CPU 0 echoed ~D bytes over ~D read events~%"
-                (%sk-stat #xA8) (%sk-stat #x98))
+                (modus-int::%sk-stat #xA8) (modus-int::%sk-stat #x98))
         (format t "  CPU 1 echoed ~D bytes over ~D read events~%"
-                (%sk-stat #xB0) (%sk-stat #xA0))
-        (format t "  total        ~D bytes~%" (+ (%sk-stat #xA8) (%sk-stat #xB0)))
+                (modus-int::%sk-stat #xB0) (modus-int::%sk-stat #xA0))
+        (format t "  total        ~D bytes~%" (+ (modus-int::%sk-stat #xA8) (modus-int::%sk-stat #xB0)))
         (chk-ge "a connection's worth is more than one 4096-byte page"
                 (if (> *conns* 0)
-                    (floor (+ (%sk-stat #xA8) (%sk-stat #xB0)) *conns*)
+                    (floor (+ (modus-int::%sk-stat #xA8) (modus-int::%sk-stat #xB0)) *conns*)
                     0)
                 4097)
         (if (> *bytes* 0)
             (chk "and it is exactly what the client sent"
-                 (+ (%sk-stat #xA8) (%sk-stat #xB0)) (* *bytes* *conns*))
+                 (+ (modus-int::%sk-stat #xA8) (modus-int::%sk-stat #xB0)) (* *bytes* *conns*))
             (format t "  (MODUS_SK_BYTES unset — the client checks the total)~%"))
 
         (format t "~%=== TWO THREADS, AT THE SAME INSTANT =====================~%")
@@ -186,43 +186,43 @@
         (format t "  2 means two handlers were inside AT ONCE.  One CPU cannot~%")
         (format t "  produce it; the number would be exactly 1.~%")
         (format t "  thread 2 started ~D   finished ~D   its CPU id ~D~%"
-                (%sk-stat #x60) (%sk-stat #x68) (%sk-stat #xE0))
+                (modus-int::%sk-stat #x60) (modus-int::%sk-stat #x68) (modus-int::%sk-stat #xE0))
         (format t "  poll returns: CPU 0 ~D   CPU 1 ~D~%"
-                (%sk-stat #x88) (%sk-stat #x90))
-        (format t "  max handlers inside at once  ~D~%" (%sk-stat #x38))
-        (format t "  overlap witnesses            ~D~%" (%sk-stat #x40))
+                (modus-int::%sk-stat #x88) (modus-int::%sk-stat #x90))
+        (format t "  max handlers inside at once  ~D~%" (modus-int::%sk-stat #x38))
+        (format t "  overlap witnesses            ~D~%" (modus-int::%sk-stat #x40))
         (if (< *ncpu* 2)
             (progn
-              (chk "one serving CPU: max handlers at once" (%sk-stat #x38) 1)
-              (chk "one serving CPU: overlap witnesses"    (%sk-stat #x40) 0))
+              (chk "one serving CPU: max handlers at once" (modus-int::%sk-stat #x38) 1)
+              (chk "one serving CPU: overlap witnesses"    (modus-int::%sk-stat #x40) 0))
             (progn
-              (chk "thread 2 ran its serving loop" (%sk-stat #x60) 1)
-              (chk "thread 2 finished cleanly"     (%sk-stat #x68) 1)
-              (chk "thread 2's CPU id"             (%sk-stat #xE0) 1)
+              (chk "thread 2 ran its serving loop" (modus-int::%sk-stat #x60) 1)
+              (chk "thread 2 finished cleanly"     (modus-int::%sk-stat #x68) 1)
+              (chk "thread 2's CPU id"             (modus-int::%sk-stat #xE0) 1)
               (chk "the join saw the kernel clear the TID (0 = yes)"
-                   (%sk-stat #xC8) 0)
-              (chk-ge "max handlers inside at once" (%sk-stat #x38) 2)
-              (chk-ge "overlap witnesses"           (%sk-stat #x40) 1)
-              (chk-ge "CPU 0 serviced read events"  (%sk-stat #x98) 1)
-              (chk-ge "CPU 1 serviced read events"  (%sk-stat #xA0) 1)
-              (chk-ge "CPU 0 echoed bytes"          (%sk-stat #xA8) 1)
-              (chk-ge "CPU 1 echoed bytes"          (%sk-stat #xB0) 1)
-              (chk-ge "CPU 0 retired connections"   (%sk-stat #xB8) 1)
-              (chk-ge "CPU 1 retired connections"   (%sk-stat #xC0) 1)))
+                   (modus-int::%sk-stat #xC8) 0)
+              (chk-ge "max handlers inside at once" (modus-int::%sk-stat #x38) 2)
+              (chk-ge "overlap witnesses"           (modus-int::%sk-stat #x40) 1)
+              (chk-ge "CPU 0 serviced read events"  (modus-int::%sk-stat #x98) 1)
+              (chk-ge "CPU 1 serviced read events"  (modus-int::%sk-stat #xA0) 1)
+              (chk-ge "CPU 0 echoed bytes"          (modus-int::%sk-stat #xA8) 1)
+              (chk-ge "CPU 1 echoed bytes"          (modus-int::%sk-stat #xB0) 1)
+              (chk-ge "CPU 0 retired connections"   (modus-int::%sk-stat #xB8) 1)
+              (chk-ge "CPU 1 retired connections"   (modus-int::%sk-stat #xC0) 1)))
         (chk "a connection was never serviced by a CPU that did not own it"
-             (%sk-stat #x118) 0)
+             (modus-int::%sk-stat #x118) 0)
 
         (format t "~%=== AND THE HANDLING INTERLEAVES =========================~%")
         (format t "  Every service event appends (cpu, connection) to a log.~%")
         (format t "  A HANDOFF is two adjacent entries written by different~%")
         (format t "  CPUs — so the two threads were not merely both busy at~%")
         (format t "  some point, they were taking turns inside the same run.~%")
-        (let ((n (%sk-stat #x50)) (handoffs 0) (i 0)
+        (let ((n (modus-int::%sk-stat #x50)) (handoffs 0) (i 0)
               (n0 0) (n1 0) (prev -1) (slots1 0) (mask1 0))
           (loop
             (when (>= i n) (return nil))
-            (let ((cpu (- (%gc-read64 (%sk-log i)) 1))
-                  (slot (%gc-read64 (+ (%sk-log i) 8))))
+            (let ((cpu (- (modus-int::%gc-read64 (modus-int::%sk-log i)) 1))
+                  (slot (modus-int::%gc-read64 (+ (modus-int::%sk-log i) 8))))
               (if (zerop cpu) (setq n0 (+ n0 1)) (setq n1 (+ n1 1)))
               (when (= cpu 1)
                 (when (zerop (logand mask1 (ash 1 slot)))
@@ -233,7 +233,7 @@
               (setq prev cpu))
             (setq i (+ i 1)))
           (format t "  log entries ~D  (cap ~D)   CPU 0 ~D   CPU 1 ~D~%"
-                  n (%sk-log-cap) n0 n1)
+                  n (modus-int::%sk-log-cap) n0 n1)
           (format t "  distinct connections CPU 1 touched  ~D~%" slots1)
           (format t "  handoffs between the two CPUs       ~D~%" handoffs)
           (if (< *ncpu* 2)
@@ -249,11 +249,11 @@
         (format t "  fd probe before ~D   after ~D~%" *fd0* fd1)
         (chk "the fd probe is unchanged" fd1 *fd0*)
         (chk-ge "teardown closed the listener" fdsclosed 1)
-        (chk "the listening fd slot is cleared" (%sk-stat 0) 0)
+        (chk "the listening fd slot is cleared" (modus-int::%sk-stat 0) 0)
         (let ((busy 0) (i 0))
           (loop
-            (when (>= i (%sk-slots)) (return nil))
-            (when (> (%gc-read64 (%sk-slot i)) 0) (setq busy (+ busy 1)))
+            (when (>= i (modus-int::%sk-slots)) (return nil))
+            (when (> (modus-int::%gc-read64 (modus-int::%sk-slot i)) 0) (setq busy (+ busy 1)))
             (setq i (+ i 1)))
           (chk "connection slots still holding an fd" busy 0)))))
 

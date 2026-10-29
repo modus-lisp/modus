@@ -31,7 +31,7 @@
 ;;;; It is not about arming and not about %SB-THREADS-UP.  A form whose only
 ;;;; shim call is `(sb-thread:threadp 5)' — which arms nothing and does nothing
 ;;;; — misreads an ALREADY-armed gate the same way, in the same argument list
-;;;; in which (%RT-THREADS-LIVE-P) correctly answers 1.  The same expression
+;;;; in which (modus-int::%RT-THREADS-LIVE-P) correctly answers 1.  The same expression
 ;;;; inside an ordinary compiled DEFUN is honest; so is the same expression in a
 ;;;; toplevel form with no shim call in it.  That is why the "shape dependence"
 ;;;; looked inexplicable: the two shapes differed in whether the READ was in the
@@ -87,32 +87,32 @@
 ;;; ---- BEFORE BRINGUP: the lock must be INERT ---------------------------------
 ;;; This is also the positive control for the oracle: if the counter moved here,
 ;;; something armed the seam before we did and every number below is meaningless.
-(defvar *bb-acq0* (%rt-acquisitions))
+(defvar *bb-acq0* (modus-int::%rt-acquisitions))
 (defvar *bb-spin0* (bb-spin))
-(defvar *bb-acq1* (%rt-acquisitions))
+(defvar *bb-acq1* (modus-int::%rt-acquisitions))
 
 (format t "~&-- before bringup --~%")
 (bb-check "spin result" *bb-spin0* 1000)
 (bb-check "acquisitions before any bringup" *bb-acq0* 0)
 (bb-check "acquisitions unmoved by 200 SYMBOL-VALUEs" *bb-acq1* 0)
-(bb-check "gate reads 0 (%RT-THREADS-LIVE-P)" (%rt-threads-live-p) 0)
-(bb-check "mode reads 0 (%HA-PERCPU-MODE)" (%ha-percpu-mode) 0)
+(bb-check "gate reads 0 (modus-int::%RT-THREADS-LIVE-P)" (modus-int::%rt-threads-live-p) 0)
+(bb-check "mode reads 0 (modus-int::%HA-PERCPU-MODE)" (modus-int::%ha-percpu-mode) 0)
 (bb-check "flag not latched" *sb-threads-up* nil)
 (finish-output)
 
 ;;; ---- BRINGUP ----------------------------------------------------------------
 (defvar *bb-ret* (%sb-threads-up))
-(defvar *bb-acq2* (%rt-acquisitions))
+(defvar *bb-acq2* (modus-int::%rt-acquisitions))
 (defvar *bb-spin1* (bb-spin))
-(defvar *bb-acq3* (%rt-acquisitions))
+(defvar *bb-acq3* (modus-int::%rt-acquisitions))
 
 (format t "~&-- after bringup --~%")
 (bb-check "%SB-THREADS-UP returned" *bb-ret* t)
 (bb-check "flag latched" *sb-threads-up* t)
 
 ;;; The words, read HONESTLY — through the compiled accessors.
-(bb-check "gate armed (%RT-THREADS-LIVE-P)" (%rt-threads-live-p) 1)
-(bb-check "mode armed (%HA-PERCPU-MODE)" (%ha-percpu-mode) 1)
+(bb-check "gate armed (modus-int::%RT-THREADS-LIVE-P)" (modus-int::%rt-threads-live-p) 1)
+(bb-check "mode armed (modus-int::%HA-PERCPU-MODE)" (modus-int::%ha-percpu-mode) 1)
 
 ;;; The FUNCTIONAL oracle: the lock is not merely flagged on, it is engaging.
 (bb-check-true "acquisitions non-zero right after bringup" (> *bb-acq2* 0))
@@ -132,7 +132,7 @@
 (format t "~&-- the inline-MEM-REF read artifact (reported, not asserted) --~%")
 (let ((r (sb-thread:threadp 5)))
   (format t "~&  shim-form: threadp=~s fn-gate=~s fn-mode=~s inline-gate=~s inline-mode=~s~%"
-          r (%rt-threads-live-p) (%ha-percpu-mode)
+          r (modus-int::%rt-threads-live-p) (modus-int::%ha-percpu-mode)
           (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32)))
 (format t "~&  (a form with NO shim call in it reads inline gate=~s mode=~s)~%"
         (mem-ref #x10000DB8 :u32) (mem-ref #x10000FF8 :u32))
@@ -142,8 +142,8 @@
 ;;; call — that is the property the shim's own bringup guard depends on.
 (let ((r (sb-thread:threadp 5)))
   (bb-check "threadp of a non-thread" r nil)
-  (bb-check "fn-gate inside a shim-calling form" (%rt-threads-live-p) 1)
-  (bb-check "fn-mode inside a shim-calling form" (%ha-percpu-mode) 1))
+  (bb-check "fn-gate inside a shim-calling form" (modus-int::%rt-threads-live-p) 1)
+  (bb-check "fn-mode inside a shim-calling form" (modus-int::%ha-percpu-mode) 1))
 
 (format t "~&=== hosted-bringup-bare: ~d checks, ~d failed ===~%"
         *bb-checks* *bb-fail*)

@@ -38,9 +38,9 @@
     keep))
 
 (fg-check 0)
-(let ((e0 (%gc-epoch)))
+(let ((e0 (modus-int::%gc-epoch)))
   (dotimes (r 3) (fg-churn) (fg-check (+ r 1)))
-  (format t "~&float-gc: collections ~D~%" (- (%gc-epoch) e0))
-  (fg 'collected (> (%gc-epoch) e0) t))
+  (format t "~&float-gc: collections ~D~%" (- (modus-int::%gc-epoch) e0))
+  (fg 'collected (> (modus-int::%gc-epoch) e0) t))
 (format t "~&float-gc: ~D failure(s)~%" *fg-fail*)
 (when (> *fg-fail* 0) (error "float-gc: ~D failure(s)" *fg-fail*))

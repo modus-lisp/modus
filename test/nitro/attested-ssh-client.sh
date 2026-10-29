@@ -16,7 +16,7 @@ HOST=${1:?}; PORT=${2:?}; shift 2
 W=$(mktemp -d /tmp/attested-ssh.XXXXXX); ASK=$W/askpass.sh; printf '#!/bin/sh\necho x\n' > $ASK; chmod +x $ASK
 cd "$(dirname "$0")/../.."
 NONCE=$(python3 -c "import os;print(os.urandom(16).hex())")
-raw=$(echo "(nitro-attest-ssh \"$NONCE\")" | SSH_ASKPASS=$ASK SSH_ASKPASS_REQUIRE=force DISPLAY=:0 setsid -w timeout 90 \
+raw=$(echo "(modus-int::nitro-attest-ssh \"$NONCE\")" | SSH_ASKPASS=$ASK SSH_ASKPASS_REQUIRE=force DISPLAY=:0 setsid -w timeout 90 \
         ssh -p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=$W/known_hosts -o LogLevel=ERROR \
             -o HostKeyAlgorithms=ssh-ed25519 -o PreferredAuthentications=none,password -o NumberOfPasswordPrompts=1 \
             test@$HOST 2>&1 | tr -d '\r')

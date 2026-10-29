@@ -165,7 +165,7 @@
    it is somebody killing the process.  setsockopt is a 5-argument syscall, so
    it rides syscall6 exactly as SO_REUSEADDR does.  Level SOL_SOCKET = 1,
    SO_RCVTIMEO = 20, and the value is a 16-byte struct timeval."
-  (let ((tv (+ (%sock-addr-buf) 32)))
+  (let ((tv (+ (modus-int::%sock-addr-buf) 32)))
     (setf (mem-ref tv :u64) secs)
     (setf (mem-ref (+ tv 8) :u64) 0)
     (syscall6 54 fd 1 20 tv 16 0)))

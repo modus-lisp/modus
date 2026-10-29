@@ -72,11 +72,11 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(defun w (a off) (%gc-read64 (+ a off)))
+(defun w (a off) (modus-int::%gc-read64 (+ a off)))
 
 (format t "~%=== EIGHT THREADS, EIGHT HEAPS ===========================~%")
 
-(let ((res (%thr-nregion-selftest *nthreads* *nlinks* *ngc* *budget*)))
+(let ((res (modus-int::%thr-nregion-selftest *nthreads* *nlinks* *ngc* *budget*)))
   (if (zerop res)
       (progn (format t "  SKIP: the band could not be carved.~%")
              (setq *fail* (+ *fail* 1)))
@@ -91,8 +91,8 @@
         (chk "region-alignment violations" (w res #x30) 0)
         (chk "last violation mask" (w res #x38) 0)
         (format t "  ... region i's from-space = 0x~X + i * 0x~X~%"
-                (%ha-region-from 0) *ha-rsize*)
-        (format t "  ... region i's control block = 0x~X + i * 0x40~%" (%ha-rcb 0))
+                (modus-int::%ha-region-from 0) *ha-rsize*)
+        (format t "  ... region i's control block = 0x~X + i * 0x40~%" (modus-int::%ha-rcb 0))
 
         (format t "~%-- spawning and joining ---------------------------------~%")
         (chk "spawn failures" (w res #x10) 0)
@@ -102,7 +102,7 @@
         (let ((i 0))
           (loop
             (when (>= i *nthreads*) (return 0))
-            (let ((rp (%thr-region-report (+ i 1))))
+            (let ((rp (modus-int::%thr-region-report (+ i 1))))
               (chk (format nil "worker ~A reached the end" i) (w rp #x60) 99))
             (setq i (+ i 1))))
 
@@ -111,7 +111,7 @@
           (loop
             (when (>= i *nthreads*) (return 0))
             (chk (format nil "worker ~A barrier" i)
-                 (w (%thr-region-report (+ i 1)) #x00) 0)
+                 (w (modus-int::%thr-region-report (+ i 1)) #x00) 0)
             (setq i (+ i 1))))
 
         (format t "~%-- each thread landed in ITS OWN region -----------------~%")
@@ -123,7 +123,7 @@
           (loop
             (when (>= i *nthreads*) (return 0))
             (chk (format nil "worker ~A region" i)
-                 (w (%thr-region-report (+ i 1)) #x08) (%ha-rcb (+ i 1)))
+                 (w (modus-int::%thr-region-report (+ i 1)) #x08) (modus-int::%ha-rcb (+ i 1)))
             (setq i (+ i 1))))
 
         (format t "~%-- EACH COLLECTED ITS OWN REGION, AND THE COUNTS ROSE ---~%")
@@ -131,7 +131,7 @@
         (let ((i 0))
           (loop
             (when (>= i *nthreads*) (return 0))
-            (let* ((rp (%thr-region-report (+ i 1)))
+            (let* ((rp (modus-int::%thr-region-report (+ i 1)))
                    (before (w rp #x28))
                    (after (w rp #x30)))
               (chk (format nil "worker ~A started at 0 collections" i) before 0)
@@ -144,7 +144,7 @@
         (let ((i 0))
           (loop
             (when (>= i *nthreads*) (return 0))
-            (let* ((rp (%thr-region-report (+ i 1)))
+            (let* ((rp (modus-int::%thr-region-report (+ i 1)))
                    (m (+ *nlinks* (* i 7)))
                    (want (+ 1 (ash (* m (- m 1)) -1))))
               (chk (format nil "worker ~A broken walks mid-run" i) (w rp #x38) 0)
@@ -183,13 +183,13 @@
         (format t "~%-- REGION 0 DID NOT COLLECT, AND THE DRIVER CAME BACK ---~%")
         (chk "region 0 collections" (w res #x28) (w res #x20))
         (chk "collectors still inside at the end" (w res #xB0) 0)
-        (chk "per-CPU mode restored" (%ha-percpu-mode) (w res #xC0))
+        (chk "per-CPU mode restored" (modus-int::%ha-percpu-mode) (w res #xC0))
         (format t "  ... collectors that entered while another was inside: ~A~%"
                 (w res #xA8))
 
         (format t "~%-- the toplevel is still alive and can still allocate ---~%")
         (chk-true "a fresh cons in region 0" (consp (cons 1 2)))
-        (chk "region 0 is the active region" (%gc-region) (%gc-region-0)))))
+        (chk "region 0 is the active region" (modus-int::%gc-region) (modus-int::%gc-region-0)))))
 
 (format t "~%=== VERDICT ==============================================~%")
 (if (zerop *fail*)

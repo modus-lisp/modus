@@ -27,7 +27,7 @@
 (defvar *fail* 0)
 (defvar *checks* 0)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -45,7 +45,7 @@
 
 (defvar *rounds* 200)
 
-(let ((res (%ha-ctx-selftest *rounds*)))
+(let ((res (modus-int::%ha-ctx-selftest *rounds*)))
   (if (= res 0)
       (format t "~%SKIP: the active region is too small to carve an actor band from.~%")
       (let* ((n         (w res #x00))

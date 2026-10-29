@@ -27,7 +27,7 @@
              (format t "  FAIL ~A: got ~A want ~A~%" name got want))))
 
 (%sb-threads-up)
-(defun own-gcs () (%gc-meta-read (+ (%gc-region) #x20) (%gc-meta-scale)))
+(defun own-gcs () (modus-int::%gc-meta-read (+ (modus-int::%gc-region) #x20) (modus-int::%gc-meta-scale)))
 
 (defun churn (target)
   "Allocate until this thread's region has collected TARGET times (bounded),
@@ -40,7 +40,7 @@
       (when (or (>= (own-gcs) target) (> i 20000000)) (return nil))
       (setq keep (cons (make-list 8) (if (> (length keep) 50) nil keep)))
       (setq i (+ i 1)))
-    (+ (* (%thr-cpu) 1000000) (own-gcs))))
+    (+ (* (modus-int::%thr-cpu) 1000000) (own-gcs))))
 
 (defun count-to (n)
   (let ((c 0)) (dotimes (i n) (setq c (+ c 1))) c))
@@ -53,10 +53,10 @@
     (let* ((n (+ 3 round))
            (r (sb-thread:join-thread
                (sb-thread:make-thread
-                (lambda () (handler-case (churn n) (error (e) (list :err (%escape-describe e))))))))
+                (lambda () (handler-case (churn n) (error (e) (list :err (modus-int::%escape-describe e))))))))
            (c (sb-thread:join-thread
                (sb-thread:make-thread
-                (lambda () (handler-case (count-to 60000) (error (e) (list :err (%escape-describe e)))))))))
+                (lambda () (handler-case (count-to 60000) (error (e) (list :err (modus-int::%escape-describe e)))))))))
       (format t "  round ~D: churn ~S, then a loop -> ~S~%" round r c)
       (when (integerp r)
         (unless slot0 (setq slot0 (floor r 1000000)))

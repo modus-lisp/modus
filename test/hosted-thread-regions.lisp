@@ -59,7 +59,7 @@
 (defvar *budget* 200000000)
 (defvar *work* 2000000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -75,7 +75,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(let ((res (%ha-regions-percpu-selftest *budget* *work*)))
+(let ((res (modus-int::%ha-regions-percpu-selftest *budget* *work*)))
   (if (= res 0)
       (format t "~%SKIP: no actor band, or the thread stack could not be mapped.~%")
       (let* ((rc1     (w res #x00))
@@ -134,7 +134,7 @@
         (chk "thread 1 reads CPU id" cpu1 0)
         (chk "thread 2 reads CPU id" cpu2 1)
         (chk "thread 1's cell is +GC-REGION-ADDR+ (the historic word)"
-             cell1 (%conv-addr #x10000F08))
+             cell1 (modus-int::%conv-addr #x10000F08))
         (chk "thread 2's cell is the next table entry" cell2 (+ cell1 8))
         (chk "and the driver computed the same address for CPU 1's cell"
              cell2b cell2)
@@ -206,7 +206,7 @@
         (chk "thread 2 reached the end of its entry function" clean 1)
         (chk "the join saw the kernel clear the TID word (0 = joined)" join 0)
         (chk "the driver is back in region 0" t1end r0)
-        (chk "and the mode word is back where it was" (%ha-percpu-mode) mode0)
+        (chk "and the mode word is back where it was" (modus-int::%ha-percpu-mode) mode0)
 
         (format t "~%=== VERDICT ==============================================~%")
         (if (= *fail* 0)

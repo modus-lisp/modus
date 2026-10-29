@@ -43,14 +43,14 @@
 (defun ms-of (ns) (floor ns 1000000))
 
 (defun timed-sleep-ms (ms)
-  "Wall milliseconds actually consumed by (%SLEEP-MS MS)."
-  (let ((t0 (%monotonic-ns)))
-    (%sleep-ms ms)
-    (ms-of (- (%monotonic-ns) t0))))
+  "Wall milliseconds actually consumed by (modus-int::%SLEEP-MS MS)."
+  (let ((t0 (modus-int::%monotonic-ns)))
+    (modus-int::%sleep-ms ms)
+    (ms-of (- (modus-int::%monotonic-ns) t0))))
 
 (format t "~%=== THE CLOCK ITSELF =====================================~%")
-(let ((a (%monotonic-ns))
-      (b (%monotonic-ns)))
+(let ((a (modus-int::%monotonic-ns))
+      (b (modus-int::%monotonic-ns)))
   (chk-true "CLOCK_MONOTONIC reads non-zero" (> a 0))
   (chk-true "and is monotonic across two reads" (>= b a)))
 
@@ -65,40 +65,40 @@
   (chk-range "sleep 500ms measured" c 495 1200))
 
 (format t "~%=== SLEEP, THE CL FUNCTION, ON EACH NUMERIC TOWER ========~%")
-(let ((a (let ((t0 (%monotonic-ns))) (sleep 1) (ms-of (- (%monotonic-ns) t0)))))
+(let ((a (let ((t0 (modus-int::%monotonic-ns))) (sleep 1) (ms-of (- (modus-int::%monotonic-ns) t0)))))
   (chk-range "(sleep 1)     — integer seconds" a 995 1600))
-(let ((b (let ((t0 (%monotonic-ns))) (sleep 0.25) (ms-of (- (%monotonic-ns) t0)))))
+(let ((b (let ((t0 (modus-int::%monotonic-ns))) (sleep 0.25) (ms-of (- (modus-int::%monotonic-ns) t0)))))
   (chk-range "(sleep 0.25)  — float seconds" b 240 800))
-(let ((c (let ((t0 (%monotonic-ns))) (sleep 1/10) (ms-of (- (%monotonic-ns) t0)))))
+(let ((c (let ((t0 (modus-int::%monotonic-ns))) (sleep 1/10) (ms-of (- (modus-int::%monotonic-ns) t0)))))
   (chk-range "(sleep 1/10)  — ratio seconds" c 95 600))
-(let ((d (let ((t0 (%monotonic-ns))) (sleep 0) (ms-of (- (%monotonic-ns) t0)))))
+(let ((d (let ((t0 (modus-int::%monotonic-ns))) (sleep 0) (ms-of (- (modus-int::%monotonic-ns) t0)))))
   (chk-range "(sleep 0)     — returns at once" d 0 50))
-(let ((e (let ((t0 (%monotonic-ns))) (sleep -5) (ms-of (- (%monotonic-ns) t0)))))
+(let ((e (let ((t0 (modus-int::%monotonic-ns))) (sleep -5) (ms-of (- (modus-int::%monotonic-ns) t0)))))
   (chk-range "(sleep -5)    — negative is not a hang" e 0 50))
 
 (format t "~%=== SLEEPING IS NOT SPINNING =============================~%")
 (format t "  The same wall interval, measured twice: once on the wall~%")
 (format t "  clock and once on CLOCK_PROCESS_CPUTIME_ID, which only~%")
 (format t "  advances while a thread is ON A CORE.~%")
-(let* ((w0 (%monotonic-ns))
-       (c0 (%cpu-ns)))
-  (%sleep-ms 400)
-  (let ((wall (ms-of (- (%monotonic-ns) w0)))
-        (cpu  (ms-of (- (%cpu-ns) c0))))
+(let* ((w0 (modus-int::%monotonic-ns))
+       (c0 (modus-int::%cpu-ns)))
+  (modus-int::%sleep-ms 400)
+  (let ((wall (ms-of (- (modus-int::%monotonic-ns) w0)))
+        (cpu  (ms-of (- (modus-int::%cpu-ns) c0))))
     (format t "  sleeping 400ms:  wall ~Dms   cpu ~Dms~%" wall cpu)
     (chk-range "wall time passed" wall 395 1200)
     (chk-range "and CPU time did NOT" cpu 0 60)))
 
-(let* ((w0 (%monotonic-ns))
-       (c0 (%cpu-ns))
+(let* ((w0 (modus-int::%monotonic-ns))
+       (c0 (modus-int::%cpu-ns))
        (n 0))
   ;; A spin of comparable duration, for the contrast.  The bound is wall-clock
   ;; driven so the comparison holds on a slow box as well as a fast one.
   (loop
     (setq n (+ n 1))
-    (when (>= (- (%monotonic-ns) w0) 400000000) (return 0)))
-  (let ((wall (ms-of (- (%monotonic-ns) w0)))
-        (cpu  (ms-of (- (%cpu-ns) c0))))
+    (when (>= (- (modus-int::%monotonic-ns) w0) 400000000) (return 0)))
+  (let ((wall (ms-of (- (modus-int::%monotonic-ns) w0)))
+        (cpu  (ms-of (- (modus-int::%cpu-ns) c0))))
     (format t "  spinning 400ms:  wall ~Dms   cpu ~Dms  (~D iterations)~%"
             wall cpu n)
     (chk-true "a spin of the same wall length burns the CPU time a sleep did not"

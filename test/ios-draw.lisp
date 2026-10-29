@@ -9,7 +9,7 @@
 ;;;; %GC-SAFE-BLOCK-6, a compiled image function a script can call.  Runs until
 ;;;; the app is closed.
 
-(defun sys (n a b c) (%gc-safe-block-6 n a b c 0))
+(defun sys (n a b c) (modus-int::%gc-safe-block-6 n a b c 0))
 (defvar *w* (sys 1001 0 0 0))
 (defvar *h* (sys 1001 1 0 0))
 (defun fill-rect (x y w h rgb)
@@ -55,7 +55,7 @@
   (loop
     (let ((e (next-event)))
       (if (zerop e)
-          (%sleep-ms 8)
+          (modus-int::%sleep-ms 8)
           (let ((type (floor e 1099511627776))                 ; >> 40
                 (y (logand (floor e 1048576) #xFFFFF))          ; >> 20
                 (x (logand e #xFFFFF)))

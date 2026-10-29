@@ -1786,7 +1786,7 @@
   (let ((off (%cli-getenv \"MODUS_NO_GENERA\")))
     (if (and off (> (length off) 0) (not (string= off \"0\")))
         nil
-        (progn (%it-eval-source (%genera-compat-source) \"genera-compat\") t))))
+        (progn (%it-eval-kernel-source (%genera-compat-source) \"genera-compat\") t))))
 "))
 
 (format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
@@ -1856,7 +1856,7 @@
   (let ((off (%cli-getenv \"MODUS_NO_SB\")))
     (if (and off (> (length off) 0) (not (string= off \"0\")))
         nil
-        (progn (%it-eval-source (%sb-shim-source) \"sb-shims\")
+        (progn (%it-eval-kernel-source (%sb-shim-source) \"sb-shims\")
                (%publish-ensure-gray-streams)
                (%publish-runtime-api)
                (%ignore-sigpipe)
@@ -1924,7 +1924,7 @@
               ;; SETQ + restore, not a LET of the special (unreliable in
               ;; image code).
               (let ((%pkg *package*))
-                (setq *package* (find-package \"COMMON-LISP-USER\"))
+                (setq *package* (find-package \"MODUS-INT\"))
                 (unwind-protect (%it-eval-source (%sb-gray-source) \"sb-gray\")
                   (setq *package* %pkg))
                 t))))))
@@ -2006,7 +2006,7 @@
   (let ((off (%cli-getenv \"MODUS_NO_ASDF\")))
     (if (and off (> (length off) 0) (not (string= off \"0\")))
         nil
-        (progn (%it-eval-source (%asdf-interface-source) \"asdf-interface\") t))))
+        (progn (%it-eval-kernel-source (%asdf-interface-source) \"asdf-interface\") t))))
 "))
 
 (format t "  asdf:    ~D chars (interface source baked for boot-time eval)~%"
@@ -2118,8 +2118,18 @@
   (when (consp (handler-case *%deferred-order* (t (c) nil)))
     (%run-deferred-installs)))
 
+;; The image's own boot-evaluated source (shims, compat layers, the ASDF
+;; interface) is KERNEL code: read it in MODUS-INT, where the internals it
+;; calls unqualified live, not in CL-USER (builder packages step 4).  Its
+;; public names are package-qualified (sb-thread:..., asdf:..., modus::...).
+(defun %it-eval-kernel-source (text name)
+  (let ((%kpkg *package*))
+    (setq *package* (or (find-package \"MODUS-INT\") *package*))
+    (unwind-protect (%it-eval-source text name)
+      (setq *package* %kpkg))))
+
 (defun %install-sb-shims-source ()
-  (%it-eval-source (%sb-shim-source) \"sb-shims\")
+  (%it-eval-kernel-source (%sb-shim-source) \"sb-shims\")
   t)
 
 (defun %sb-autoload (sym args)
@@ -2152,7 +2162,7 @@
       (%push-feature (intern (if (> most-positive-fixnum #xFFFFFFFF) \"64-BIT\" \"32-BIT\")
                              \"KEYWORD\")))
     (%push-feature :genera)
-    (%it-eval-source (%cooperative-atomics-source) \"cooperative-atomics\")
+    (%it-eval-kernel-source (%cooperative-atomics-source) \"cooperative-atomics\")
     (%defer-packages (function %install-genera-compat)
                      (list \"SCL\" \"SYS\" \"SI\" \"PROCESS\" \"CLI\"
                            \"FUTURE-COMMON-LISP\" \"GRAY-STREAMS\")))
@@ -2187,7 +2197,7 @@
     ;; no package lookup can trigger them: export them now, as stubs that
     ;; install the shims and call the real definition.
     (%publish-sb-autoload)
-    (%it-eval-source (%modus-autoload-source) \"modus-autoload\")
+    (%it-eval-kernel-source (%modus-autoload-source) \"modus-autoload\")
     (%publish-ensure-gray-streams)
     (%publish-runtime-api)
     (%ignore-sigpipe))

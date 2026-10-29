@@ -16,7 +16,7 @@
 ;;;; anything, so that is asserted too.
 
 (defun gee-burn (n) (let ((x nil)) (dotimes (i n) (setq x (make-array 1000))) (length x)))
-(defun gee-count () (%gc-read64 (+ (%gc-region) #x20)))
+(defun gee-count () (modus-int::%gc-read64 (+ (modus-int::%gc-region) #x20)))
 
 (defvar *gee-fails* 0)
 (dotimes (k 16)

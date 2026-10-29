@@ -53,7 +53,7 @@
 (defvar *checks* 0)
 (defvar *n* 1000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -62,7 +62,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A = ~D (expected ~D)~%" name got want))))
 
-(let ((res (%ha-lock-selftest *n*)))
+(let ((res (modus-int::%ha-lock-selftest *n*)))
   (if (= res 0)
       (format t "~%SKIP: the active region is too small to carve an actor band from.~%")
       (let* ((w0    (w res #x00))
@@ -80,7 +80,7 @@
         (format t "~%=== THE LOCK IS A FIXED BSS WORD =========================~%")
         (format t "  scheduler lock address ~X~%" addr)
         (chk "and it is +HOSTED-SCHED-LOCK-ADDR+, the word translate-x64 bakes in"
-             addr (%conv-addr #x10000FC0))
+             addr (modus-int::%conv-addr #x10000FC0))
         (chk "BSS zero-fill left it UNLOCKED" w0 0)
 
         (format t "~%=== ACQUIRE AND RELEASE ==================================~%")

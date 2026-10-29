@@ -56,7 +56,7 @@
 ;;;; SCOPE.  The actors do arithmetic, raw memory access and message passing.
 ;;;; No FORMAT, no INTERN, no EVAL, no symbol or keyword literal — the runtime's
 ;;;; shared mutable tables are unsynchronised and are NOT exercised here.  What
-;;;; they do allocate is conses (TERM-DECODE-STEP builds each message in the
+;;;; they do allocate is conses (modus-int::TERM-DECODE-STEP builds each message in the
 ;;;; receiver's heap, and %GC-CHAIN-BUILD builds the live chains), which is
 ;;;; exactly what the per-thread regions are for.
 
@@ -66,7 +66,7 @@
 (defvar *nlinks* 300)
 (defvar *budget* 200000000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -82,7 +82,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(let ((res (%ha-mt-selftest *nmsg* *budget* *nlinks*)))
+(let ((res (modus-int::%ha-mt-selftest *nmsg* *budget* *nlinks*)))
   (if (= res 0)
       (format t "~%SKIP: no actor band, or the thread stack could not be mapped.~%")
       (let* ((join    (w res #x00))
@@ -174,10 +174,10 @@
           (loop
             (when (> i *nmsg*) (return 0))
             (let ((e (+ logbase (* (- i 1) 32))))
-              (if (= (%gc-read64 (+ e 24)) 1) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 e) i) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 (+ e 8)) (* i 7)) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 (+ e 16)) (+ i 1000)) 0 (setq bad (+ bad 1))))
+              (if (= (modus-int::%gc-read64 (+ e 24)) 1) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 e) i) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 (+ e 8)) (* i 7)) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 (+ e 16)) (+ i 1000)) 0 (setq bad (+ bad 1))))
             (setq i (+ i 1)))
           (chk "log entries wrong in any field, after all that collecting" bad 0))
 
@@ -211,8 +211,8 @@
         (chk "the join saw the kernel clear the TID word (0 = joined)" join 0)
         (format t "  driver alloc ptr before ~X, after ~X~%" a0 a1)
         (chk "%GC-REGION-ENTER put the driver's region-0 frontier back" (- a1 a0) 0)
-        (chk "and the driver is back in region 0" endreg (%gc-region-0))
-        (chk "the per-CPU mode word is back where it was" (%ha-percpu-mode) 0)
+        (chk "and the driver is back in region 0" endreg (modus-int::%gc-region-0))
+        (chk "the per-CPU mode word is back where it was" (modus-int::%ha-percpu-mode) 0)
 
         (format t "~%=== VERDICT ==============================================~%")
         (if (= *fail* 0)

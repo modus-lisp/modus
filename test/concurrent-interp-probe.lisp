@@ -112,9 +112,9 @@
     ;; %MAKE-NATIVE-THREAD: the arm that does NOT fault.
     (let ((hs nil) (i 0))
       (loop (when (>= i *nt*) (return 0))
-        (setq hs (cons (%make-native-thread (lambda () (ci-work *k*) 0)) hs))
+        (setq hs (cons (modus-int::%make-native-thread (lambda () (ci-work *k*) 0)) hs))
         (setq i (+ i 1)))
-      (dolist (h hs) (%join-native-thread h 400000000)))
+      (dolist (h hs) (modus-int::%join-native-thread h 400000000)))
     ;; SB-THREAD:MAKE-THREAD: the arm that does.
     (let ((ths nil) (i 0))
       (loop (when (>= i *nt*) (return 0))

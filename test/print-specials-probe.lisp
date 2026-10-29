@@ -38,7 +38,7 @@
 
 (defun ps-setcase (rt v)
   #+sbcl (setf (readtable-case rt) v)
-  #-sbcl (%set-readtable-case rt v))
+  #-sbcl (modus-int::%set-readtable-case rt v))
 
 ;;; ---- A. round trip: (equal x (read-from-string (prin1-to-string x))) ----
 

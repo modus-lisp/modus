@@ -2946,11 +2946,17 @@
   ;; build-time nickname MODUS.MVM is the name image source still writes).
   ;; Created at boot, before any eval, so none is runtime-born: function and
   ;; variable keys of their symbols stay BARE, as the boot tables are.
-  (make-package "MODUS-INT" :nicknames (list "MODUS.MVM") :use (list "CL"))
-  (make-package "MODUS.ASM" :use (list "CL"))
-  (make-package "MODUS.RUNTIME" :use (list "CL"))
-  (make-package "MODUS.MVM.X64" :use (list "CL" "MODUS-INT" "MODUS.ASM"))
-  (make-package "MODUS.MVM.I386" :use (list "CL" "MODUS-INT"))
+  ;; Registered by hash AT ONCE, like the packages above: a quoted symbol
+  ;; filled between here and the loop at the end of this function (the
+  ;; DEFPACKAGE macro's '%DEFPACKAGE-IMPL, below) would otherwise find no
+  ;; package for its hash, fall back to CL-USER, and stay cached that way.
+  (%register-pkg-by-hash
+   (make-package "MODUS-INT" :nicknames (list "MODUS.MVM") :use (list "CL")))
+  (%register-pkg-by-hash (make-package "MODUS.ASM" :use (list "CL")))
+  (%register-pkg-by-hash (make-package "MODUS.RUNTIME" :use (list "CL")))
+  (%register-pkg-by-hash
+   (make-package "MODUS.MVM.X64" :use (list "CL" "MODUS-INT" "MODUS.ASM")))
+  (%register-pkg-by-hash (make-package "MODUS.MVM.I386" :use (list "CL" "MODUS-INT")))
   ;; MODUS's public API (SB-EXT's role): image functions a program is meant to
   ;; call, re-exported from MODUS-INT where they are defined, so MODUS:SYS-EXIT
   ;; IS the kernel's symbol.  CL-USER uses MODUS, as SBCL's CL-USER uses SB-EXT.

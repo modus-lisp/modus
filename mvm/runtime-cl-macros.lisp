@@ -589,8 +589,14 @@
    triggered a stability bug where installs 3+ stopped registering.
    A NIL SRC (unrolled (nth k) past the list end) is a no-op so the
    unroll can safely overshoot the current entry count."
+  ;; Read in MODUS-INT: the internals these expansions call (%PUSH-RESTARTS,
+  ;; %WITH-CONDITION-RESTARTS ...) are the kernel's, and the macro names are
+  ;; all COMMON-LISP's, inherited there (builder packages step 4).
   (when src
-    (eval (read-from-string src))))
+    (let ((%kpkg *package*))
+      (setq *package* (or (find-package "MODUS-INT") *package*))
+      (unwind-protect (eval (read-from-string src))
+        (setq *package* %kpkg)))))
 
 
 (defun %install-runtime-cl-macros ()

@@ -11,7 +11,7 @@
 ;;;;
 ;;;; SO THIS TEST'S SUBJECT IS THE OVERLAP ITSELF, and it is measured where a
 ;;;; collection actually begins and ends: inside translate-x64's GC trampoline,
-;;;; which is what a forced collection runs on hosted x86-64 (%GC-COLLECT-HERE
+;;;; which is what a forced collection runs on hosted x86-64 (modus-int::%GC-COLLECT-HERE
 ;;;; only pulls the allocation limit down so the next :gc-check calls it).  The
 ;;;; trampoline maintains four words with LOCKed instructions:
 ;;;;
@@ -77,7 +77,7 @@
 ;; on instead of hanging.
 (defvar *barrier* 20000000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -99,7 +99,7 @@
 ;; untouched" checksum fell into once already.  So prove it can answer
 ;; non-zero, and with the right bit, before believing its zeros.
 (format t "~%THE ALIGNMENT ORACLE CAN ANSWER NON-ZERO~%")
-(let ((c (%ha-align-control)))
+(let ((c (modus-int::%ha-align-control)))
   (if (zerop c)
       (format t "SKIP: the actor band could not be carved.~%")
       (progn
@@ -116,7 +116,7 @@
 (format t "  a forced collection per message on each thread, NO LOCK.~%~%")
 
 ;; ================= ARM 1: CONCURRENT (the shipping path) ==================
-(let ((out (%ha-mt-conc-selftest *nmsg* *budget* *nlinks* 0 *barrier*)))
+(let ((out (modus-int::%ha-mt-conc-selftest *nmsg* *budget* *nlinks* 0 *barrier*)))
   (if (zerop out)
       (format t "SKIP: the actor band could not be carved.~%")
       (let ((res (w out #x28)))
@@ -219,7 +219,7 @@
 (format t "~%~%NEGATIVE CONTROL: THE SAME RUN WITH THE OLD LOCK BACK ON~%")
 (format t "  If the collections were serialized, the overlap evidence must~%")
 (format t "  VANISH.  If it does not, the evidence proves nothing.~%~%")
-(let ((out (%ha-mt-conc-selftest *nmsg* *budget* *nlinks* 1 *barrier*)))
+(let ((out (modus-int::%ha-mt-conc-selftest *nmsg* *budget* *nlinks* 1 *barrier*)))
   (if (zerop out)
       (format t "SKIP: the actor band could not be carved.~%")
       (let ((res (w out #x28)))

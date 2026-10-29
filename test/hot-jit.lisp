@@ -22,8 +22,8 @@
     (format t "~&FAIL ~a~%   got  ~s~%   want ~s~%" name got want)))
 
 (defun native-p (nm)
-  (if (or (%jit-fn-native-p nm)
-          (%jit-fn-native-p (concatenate 'string "COMMON-LISP-USER::" nm)))
+  (if (or (modus-int::%jit-fn-native-p nm)
+          (modus-int::%jit-fn-native-p (concatenate 'string "COMMON-LISP-USER::" nm)))
       t nil))
 
 ;;; 1. multiple values, every call around the threshold

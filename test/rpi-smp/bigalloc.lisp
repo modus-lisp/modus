@@ -25,8 +25,8 @@
 
 (defun ba-run (rounds)
   (let ((keep (ba-chain 2000))
-        (size0 (%gc-read64 #x10000050))
-        (gc0 (%gc-epoch))
+        (size0 (modus-int::%gc-read64 #x10000050))
+        (gc0 (modus-int::%gc-epoch))
         (bad 0))
     (dotimes (r rounds)
       (ba-churn 700000)
@@ -34,5 +34,5 @@
       (ba-churn 3000000)
       (ba-churn 6000000)
       (unless (= (ba-sum keep) 1999000) (setq bad (+ bad 1)))
-      (unless (= (%gc-read64 #x10000050) size0) (setq bad (+ bad 1000))))
-    (list :bad bad :gcs (- (%gc-epoch) gc0) :size (%gc-read64 #x10000050))))
+      (unless (= (modus-int::%gc-read64 #x10000050) size0) (setq bad (+ bad 1000))))
+    (list :bad bad :gcs (- (modus-int::%gc-epoch) gc0) :size (modus-int::%gc-read64 #x10000050))))

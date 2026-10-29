@@ -106,6 +106,11 @@
    own and resolved to the kernel's (the transitional read fallback).  EQUAL
    hash name -> count.  Drive to zero, then the fallback goes.")
 
+(defvar *kernel-name-fallback-p* t
+  "NIL turns the transitional read fallback off: a non-kernel symbol named like
+   a kernel function is then simply undefined, as in CL.  For finding the
+   callers that still rely on it.")
+
 (defun %snapshot-kernel-fn-names ()
   (let ((h (make-hash-table :test (function equal))))
     (when *symbol-function-table*
@@ -137,7 +142,7 @@
 (defun %kernel-shadow-fallback (name)
   "The transitional READ fallback: NAME is a shadow key \"PKG::NM\" with no
    function of its own; answer NM, the kernel function's key, and count it."
-  (let ((p (search "::" name)))
+  (let ((p (and *kernel-name-fallback-p* (search "::" name))))
     (when p
       (let ((nm (subseq name (+ p 2))))
         (when (and *kernel-fn-names* (gethash nm *kernel-fn-names*))

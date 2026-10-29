@@ -3340,6 +3340,33 @@
    %gf-check-arity + %gf-check-keys run on EVERY generic call and each re-parsed
    the lambda-list (string= over the LL keywords) -- ~4 us/call on the Pi Zero
    2 W, a big slice of the residual %gf-dispatch cost.")
+(defvar *%ll-shape-dm* nil
+  "Direct-mapped front for %GF-LL-SHAPE: 256 (lambda-list . shape) cells by the GF name's hash.")
+
+(defun %gf-ll-shape (gf ll)
+  "GF's lambda-list LL parsed, as %LAMBDA-LIST-SHAPE-CACHED -- through a front keyed by GF's
+   NAME, since the memo behind it is an EQ table on conses, which only a thread in region 0
+   can hash by address: anywhere else every generic call's arity check scanned every lambda
+   list in it.  A hit must be LL itself (EQ), so a redefined GF misses.  Filled under the
+   runtime lock (the shape is already a shared-heap copy)."
+  (let ((name (%gf-name gf)))
+    (if (and name (let ((st (obj-subtag name))) (or (eq st #x50) (eq st #x53)))
+             (fixnump (%slot-ref name 0)))
+        (let* ((i (logand (the fixnum (%slot-ref name 0)) 255)) (dm *%ll-shape-dm*)
+               (e (and (%prim-simple-vector-p dm) (svref dm i))))
+          (if (and (consp e) (eq (%ucar e) ll))
+              (%ucdr e)
+              (let ((sh (%lambda-list-shape-cached ll)))
+                (%rt-enter)
+                (let ((dm *%ll-shape-dm*))
+                  (unless (%prim-simple-vector-p dm)
+                    (setq dm (make-array 256))
+                    (setq *%ll-shape-dm* dm))
+                  (setf (svref dm i) (cons ll sh)))
+                (%rt-leave)
+                sh)))
+        (%lambda-list-shape-cached ll))))
+
 (defun %lambda-list-shape-cached (ll)
   "LOCKED, like every shared runtime table (see %RT-ENTER, mvm/prelude.lisp).
    The memo is filled lazily by WHICHEVER thread first calls a generic
@@ -5607,7 +5634,7 @@
    (defgeneric.error.20/21)."
   (let ((ll (%gf-lambda-list gf)))
     (when ll
-      (let ((shape (%lambda-list-shape-cached ll)))
+      (let ((shape (%gf-ll-shape gf ll)))
         (when (and (nth 3 shape) (not (nth 4 shape)))
           ;; Skip required + optional args to reach the keyword portion.
           (let ((skip (+ (nth 0 shape) (nth 1 shape)))
@@ -5734,7 +5761,7 @@
    unknown)."
   (let ((ll (%gf-lambda-list gf)))
     (when ll
-      (let* ((sh (%lambda-list-shape-cached ll))
+      (let* ((sh (%gf-ll-shape gf ll))
              (req (nth 0 sh))
              ;; variadic = &optional / &rest / &key present (matches the old
              ;; %lambda-list-has-rest-or-key, which also returns T for &optional)
@@ -5785,7 +5812,7 @@
     ((or (not (consp applicable)) (%gf-combination gf)) :general)
     ((%has-default-primary-p (%gf-name gf)) :general)
     ((let ((ll (%gf-lambda-list gf)))
-       (and ll (nth 3 (%lambda-list-shape-cached ll))))
+       (and ll (nth 3 (%gf-ll-shape gf ll))))
      :general)
     ((let ((m applicable) (q nil))
        (loop (when (null m) (return q))

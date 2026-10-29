@@ -37,7 +37,7 @@
       nil))
 
 (defun %pkg-data (pkg) (cdr pkg))
-;; FIND-PACKAGE's memo for SYMBOL designators: ((symbol . package) ...),
+;; FIND-PACKAGE's memo for SYMBOL and STRING designators: ((name . package) ...),
 ;; dropped whenever any package's name or nicknames change.  (:KEYWORD-style
 ;; designators are the common case, and each lookup paid STRING-EQUAL against
 ;; "CL-TEST", a name hash and a verifying STRING-EQUAL: 1.7 us per
@@ -534,21 +534,35 @@
    which would regress if we polluted the nicknames slot."
   (cond
     ((%pkg-p name) name)
-    ((and name (symbolp name) (not *pkg-any-local-nicknames*)
-          (let ((c *%find-package-cache*) (hit nil))
+    ((and name (or (symbolp name) (stringp name)) (not *pkg-any-local-nicknames*)
+          (let ((c *%find-package-cache*) (hit nil) (str (stringp name)))
             (loop (unless (consp c) (return))
-              (when (eq (car (car c)) name) (setq hit (cdr (car c))) (return))
+              (let ((k (car (car c))))
+                (when (if str (and (stringp k) (string= k name)) (eq k name))
+                  (setq hit (cdr (car c))) (return)))
               (setq c (cdr c)))
             hit)))
-    ((and name (symbolp name) (not *pkg-any-local-nicknames*))
+    ((and name (or (symbolp name) (stringp name)) (not *pkg-any-local-nicknames*))
      (let ((p (%find-package-uncached name)))
        ;; Not CL-TEST: the gate image's alias for it is spliced in later.
        (when (and p (< (%cache-length *%find-package-cache*) 64)
-                  (not (string-equal (symbol-name name) "CL-TEST")))
-         (setq *%find-package-cache*
-               (cons (cons name p) (if (consp *%find-package-cache*) *%find-package-cache* nil))))
+                  (not (string-equal (if (stringp name) name (symbol-name name)) "CL-TEST")))
+         (%find-package-cache-add name p))
        p))
     (t (%find-package-uncached name))))
+
+(defun %find-package-cache-add (name p)
+  "Remember NAME -> P.  A STRING name too, matched by STRING= -- a subset of the walk's
+   STRING-EQUAL, so a hit is the walk's answer: a run-time package (SB-SYS, made by a shim) is
+   in no build-time index, and seal asked for it by string on every poll of a relay, walking
+   every package.  The string is copied: the caller's may be mutated.  Under the runtime lock,
+   which makes the shared heap the active one: a worker thread's conses must not be what a
+   global holds."
+  (%rt-enter)
+  (setq *%find-package-cache*
+        (cons (cons (if (stringp name) (copy-seq name) name) p)
+              (if (consp *%find-package-cache*) *%find-package-cache* nil)))
+  (%rt-leave))
 
 (defun %cache-length (c)
   (let ((n 0)) (loop (unless (consp c) (return n)) (setq n (+ n 1)) (setq c (cdr c)))))

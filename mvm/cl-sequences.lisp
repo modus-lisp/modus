@@ -2718,13 +2718,12 @@
                    (loop (when (or (null cur) (null (cdr cur))) (return k))
                      (when (eq (car cur) :key) (setq k (cadr cur)))
                      (setq cur (cddr cur)))))
-         (pred-fn (cond
-                    ((functionp pred) pred)
-                    ((symbolp pred) (symbol-function pred))
-                    (t pred)))
+         ;; SYMBOLP, not FUNCTIONP: FUNCTIONP of a closure asks whether it is a
+         ;; registered GF stub, a MEMBER over all of them -- per MERGE, and
+         ;; cl-transport merges on every timer it schedules.
+         (pred-fn (if (and pred (symbolp pred)) (symbol-function pred) pred))
          (kfn (cond
                 ((null key-fn) nil)
-                ((functionp key-fn) key-fn)
                 ((symbolp key-fn) (symbol-function key-fn))
                 (t key-fn)))
          (r nil)

@@ -1,6 +1,8 @@
 # Generational GC — design and staging
 
-Status: **stages 1 and 2 built on the AArch64 native collector** (`gc-tenure`, test/gc-tenure.lisp); stages 3-4 in progress.  This document came out of a measurement on the Pi Zero
+Status: **stages 1-3 built on the AArch64 native collector and ported to the hosted x86-64
+collector** (`gc-tenure`, test/gc-tenure.lisp, test/gc-major-threads.lisp); i386 / riscv / arm32
+not ported.  This document came out of a measurement on the Pi Zero
 board image (2026-10-29), so the board is the first target and the reasons are the board's.
 
 ## Why
@@ -258,6 +260,35 @@ it, not GC.  The typed audits read 0 after drags and after majors.
 - The other back ends (x64 first, hosted, where the thread tests live), then i386 / riscv /
   arm32.
 - `CLAUDE.md`'s GC sections ("there is no write barrier") are updated as each lands.
+
+**x64 built (2026-10-29), the hosted `./modus`.**  Same words, meta layout and state machine
+as AArch64, so `mvm/gc.lisp` is shared unchanged; only `translate-x64.lisp` ("GENERATIONAL GC")
+is new.  `*x64-gen-gc*` turns it on (build-generic-cli, and the JIT co-init in
+build-cli-common, which must agree); `MODUS_X64_GEN=0` builds the control.
+
+- **Barrier:** each unit (the image, each JIT page) gets a `card_mark` subroutine (RAX = slot,
+  preserves every register) and a range form for word `bulk-move`/`bulk-fill`.  A site is
+  `push rax; lea rax,[slot]; call; pop rax`, before the store.  Cost: +7.4 MB native (+14%);
+  1.8x on a loop that does nothing but store, cards on or off (the call is the cost, not the
+  mark); +1-6% user CPU loading cl-ppcre / babel / md5.  Inlining the "cards off" test at the
+  site would make an untenured image nearly free, at ~11 bytes a site.
+- **Collector:** R12 = the old area's bump, R14 = the survivor mark (all ones in a major's
+  phase 1), meta+80 = the promotion bound (area end, clipped by the ceiling).  `copy_object`
+  sizes first, then picks R12 or R13.  The old space is a root through a typed dirty-card scan
+  (crossing table, cons-kind bitmap), or a flat walk without cards.  Cheney runs two cursors
+  (to-space to R13, promotions to R12; the second at [rsp]).  The bitmap clears move BEFORE the
+  swap, then promo-finish, tenure and the major step, which set the to_start/RBX/R13 the swap
+  installs or jump back to the root scan for phase 2.  The card vector's root `#x10000D88` is
+  a global root.
+- **Results (hosted x64):** test/gc-tenure.lisp 21/21, a dirty-card minor 0.26-0.28 ms against
+  5.4 ms walking the whole old space; `:walk` control SIGSEGV, `:barrier` control aborts.
+  test/gc-major-threads.lisp 5/5 (40 majors each, two interning threads).  18 GC/thread
+  regression tests: same results as the control build.  22-library ladder: control, untenured,
+  `:young` 32 MB (359 collections) and `:young` + a huge reserve all 20/22 clean, 104 probes,
+  the same 8 failures.  The control build's code is base's modulo relocation: the one function
+  that changed size is the translate-state constructor (two slots).
+- **Not done:** tenure with `:cards nil` cannot be untenured (gc-untenure is a major, which
+  needs the card meta), on both back ends.
 
 ## Risks named up front
 

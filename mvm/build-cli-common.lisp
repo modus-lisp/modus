@@ -465,6 +465,10 @@
   ;; Match the values the host baked into the image's fixed code so the JIT emits
   ;; consistent gc-check/trampoline code.
   (setq *x64-gc-enabled* t)
+  ;; GENERATIONAL GC: the card barrier and the collector arms, as the host
+  ;; baked them (build-generic-cli, MODUS_X64_GEN).  A JIT page without the
+  ;; barrier would hide its heap stores from the card scan.
+  (setq *x64-gen-gc* " (if (equal (sb-ext:posix-getenv "MODUS_X64_GEN") "0") "nil" "t") ")
   (setq *linux-x64-r14-offset* #x38000000)
   ;; THE PER-THREAD WINDOW must match what the host baked into the image's
   ;; fixed code, for the same reason *x64-gc-enabled* must: a JIT page that

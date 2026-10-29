@@ -266,6 +266,13 @@
 ;; sessions.  build-x64-linux / build-x64 set this; we
 ;; need it too so the generic image survives ANSI sweeps.
 (setf modus.mvm.x64::*x64-gc-enabled* t)
+;; GENERATIONAL GC (docs/generational-gc.md): the card barrier at every heap
+;; store, and the tenure / promotion / major arms of the collector.  Inert
+;; until something calls (GC-TENURE).  MODUS_X64_GEN=0 builds without it (the
+;; control).  The JIT co-init (build-cli-common) must agree, or a JIT page's
+;; stores would hide from the card scan.
+(setf modus.mvm.x64::*x64-gen-gc*
+      (not (equal (sb-ext:posix-getenv "MODUS_X64_GEN") "0")))
 ;; WS5 #223 / #278: this IMAGE's collector must scan the JIT constant-vector
 ;; root (BSS 0x10000F00), or a const the JIT mirrored into the vector dangles
 ;; after the first collection.  Gated on *jit-on* so a MODUS_NO_JIT build's

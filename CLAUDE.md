@@ -985,11 +985,12 @@ Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd hea
 
 `scan_word` saves/restores RDX (stack_base) around copy_object calls.
 
-### Generational GC (aarch64 only, 2026-10-29) — docs/generational-gc.md
+### Generational GC (aarch64 + hosted x64, 2026-10-29) — docs/generational-gc.md
 
-Region 0 on aarch64 can be split into an OLD space plus a young semispace pair.
-**Off until something calls `(gc-tenure)`**: an image that never does behaves
-exactly as before, apart from the barrier's 2 instructions per heap store.
+Region 0 on aarch64 and on hosted x86-64 (`./modus`) can be split into an OLD
+space plus a young semispace pair.  **Off until something calls `(gc-tenure)`**:
+an image that never does behaves exactly as before, apart from the barrier's cost
+per heap store (aarch64: 2 instructions; x64: a call, see below).
 
 - **`(gc-tenure)`** turns region 0's survivors into the old space
   (`#x10000CC0/CC8` = old_lo/old_hi, stored <<1).  The old space is SCANNED, never
@@ -1011,15 +1012,26 @@ exactly as before, apart from the barrier's 2 instructions per heap store.
   untenures first**, so a saved core is single-range.
 - **Oracles, each with a control:** `%gc-old-audit` (a TYPED walk of the old
   space; a word count sees leaf payload and lies), `%gc-card-audit`, and
-  `test/gc-tenure.lisp` (19 checks; `*gen-control*` `:walk` / `:barrier` must
-  FAIL).
+  `test/gc-tenure.lisp` (21 checks; `*gen-control*` `:walk` / `:barrier` must
+  FAIL), `test/gc-major-threads.lisp` (40 majors under two interning threads).
 - **Two layout rules learned on the board:** promotion and a major's copy stop at the
   meta's CEILING (+72), the lowest I/O staging page (`*CSTR-SCRATCH*` 0x0FE00000) inside
   region 0's span; and **region 0 cannot be carved after tenure** (`%gc-region-shrink`
   errors), so the board tenures after its threads carve the lock arena.
 - **The board tenures at boot** (kiln `kz-gen-gc-start`; card arg `GC=plain` skips it): a
   drag's GC pause went from 242 ms (4.9%) to 5-12 ms (0.0%).  Majors (~285 ms) are rare.
-- **x64, i386, riscv, arm32: not ported.**  `gc-tenure` refuses loudly there.
+- **x64 (`build-generic-cli`) is the same design, words and state machine**, in
+  `translate-x64.lisp` ("GENERATIONAL GC").  The barrier is a per-unit
+  `card_mark` subroutine called from each store site (`push rax; lea rax,[slot];
+  call; pop rax`) -- +7.4 MB native (+14%), +1-6% CPU on library loads, 1.8x on a
+  loop that only stores.  Collector registers for a region-0 collection: R12 = old
+  bump, R14 = survivor mark, meta+80 = promotion bound; the bitmap clears move
+  BEFORE the swap (tenure and the major steps change what the swap installs).
+  `MODUS_X64_GEN=0` builds without it: same code as before modulo relocation.
+  The JIT co-init must agree (`*x64-gen-gc*`), or a JIT page's stores skip the cards.
+- **i386, riscv, arm32: not ported.**  `gc-tenure` refuses loudly there.
+- **Tenure without cards (`:cards nil`) cannot be untenured**, so save-image after it
+  errors: `gc-untenure` runs a major, which needs the card vector's meta.
 
 ### Per-region GC, stage 1: the metadata block is a REGION CONTROL BLOCK
 

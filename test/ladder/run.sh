@@ -18,6 +18,9 @@
 # error.  Override the emulator with QEMU_I386 / QEMU_AARCH64 / QEMU_ARM /
 # QEMU_RISCV64 / QEMU_RISCV32.
 #
+# LADDER_EVAL, when set, is evaluated before each driver (an ARM of the same
+# binary, e.g. LADDER_EVAL='(gc-tenure :young (* 32 1048576))').
+#
 # Compare against a run of the SAME tree on another arch -- never a stale binary.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -68,7 +71,7 @@ echo "ladder: $BIN${EMU:+ (via $EMU)} -> $D"
 run_one() {
   lib="$1"
   s=$(date +%s)
-  timeout "$TMO" "$SHIM" --load "$D/drivers/$lib.lisp" --quit > "$D/$lib.log" 2>&1
+  timeout "$TMO" "$SHIM" ${LADDER_EVAL:+--eval "$LADDER_EVAL"} --load "$D/drivers/$lib.lisp" --quit > "$D/$lib.log" 2>&1
   rc=$?
   e=$(date +%s)
   echo "EXIT=$rc SECS=$((e-s))" >> "$D/$lib.log"

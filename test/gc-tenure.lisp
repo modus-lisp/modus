@@ -19,7 +19,7 @@
 ;;;; value, a dangling count, or a crash.  A control that passes means the test
 ;;;; is not exercising that piece.
 ;;;;
-;;;; AArch64 native collector only (the only one that tenures).
+;;;; The AArch64 and hosted x86-64 native collectors (the ones that tenure).
 
 (defvar *gen-control* nil)
 (defvar *gen-cards* t)
@@ -257,14 +257,17 @@
                  (* 20 internal-time-units-per-second)))))
   ;; the old space really is not copied: a collection's survivor count is
   ;; the young live set, not the old one
+  ;; (measured as the young semispace's fill right after a collection, not by
+  ;; the collector's byte counters, which x64 does not keep at those words)
   (unless *gen-control*
-    (let ((n (%gc-stat-count)) (b0 (%gc-stat-total-bytes)))
+    (let ((e (%gc-epoch)))
       (gen-collect)
-      (let ((young (- (%gc-stat-total-bytes) b0))
-            (old (- (%gc-old-hi) (%gc-old-lo))))
+      (let* ((k (%gc-meta-scale))
+             (young (- (get-alloc-ptr) (%gc-meta-read (%gc-region-0) k)))
+             (old (- (%gc-old-hi) (%gc-old-lo))))
         (gen-check "a collection copies the young survivors, not the old space"
-                   (and (> (%gc-stat-count) n) (< young (floor old 4)))
-                   (format nil "~,2f MB copied vs ~,1f MB old"
+                   (and (/= e (%gc-epoch)) (< young (floor old 4)))
+                   (format nil "~,2f MB young after it vs ~,1f MB old"
                            (/ young 1048576.0) (/ old 1048576.0))))))
   (when (and *gen-cards* (not *gen-control*))
     (gen-stage3)

@@ -1,4 +1,4 @@
-;;;; test/gc-major-threads.lisp -- generational GC majors with LIVE THREADS (aarch64).
+;;;; test/gc-major-threads.lisp -- generational GC majors with LIVE THREADS (aarch64, x64).
 ;;;;
 ;;;;   modus --load test/gc-major-threads.lisp                       ; 40 majors, 2 threads
 ;;;;   modus --eval '(defvar *op* :minor)' --load ...                ; control: minors

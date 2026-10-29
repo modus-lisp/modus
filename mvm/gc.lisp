@@ -1985,7 +1985,7 @@
         (%gc-write64 req 0)
         (setq tries (+ tries 1))
         (when (>= tries 3)
-          (error "GC-TENURE: the collector did not take the request (only the AArch64 native collector tenures)"))))))
+          (error "GC-TENURE: the collector did not take the request (only the AArch64 and hosted x86-64 native collectors tenure)"))))))
 
 (defun %gc-gen-request (state what)
   "Post major STATE (1 major, 4 un-tenure), force collections until the

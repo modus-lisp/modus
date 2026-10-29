@@ -346,6 +346,145 @@
         (emit-pop buf 'rax)
         (emit-label buf skip)))))
 
+;;; ============================================================
+;;; GENERATIONAL GC: THE CARD BARRIER (docs/generational-gc.md, x64 port)
+;;; ============================================================
+;;; The words are the AArch64 port's, shared with mvm/gc.lisp: #x10000CE0
+;;; card bytes (0 = cards off), +8 the old AREA, +16 ncards, +24 crossing.
+;;; A card covers 512 bytes of the area; byte 0 = DIRTY.  Every pointer store
+;;; into a heap object (SETCAR, SETCDR, OBJ-SET, ASET, word BULK-MOVE/FILL)
+;;; marks the card of the slot it writes, BEFORE the store: nothing between
+;;; the mark and the store allocates, so no collection can see one without
+;;; the other.  Off (no old space, or no card table) a site costs the call and
+;;; one compare.
+
+(defvar *x64-gen-gc* nil
+  "Generational GC on x64: the card barrier at every heap store and the
+   tenure / old-space / promotion / major arms of the collector.  Set by the
+   hosted CLI build (and its runtime JIT co-init, which must agree: a JIT page
+   without the barrier would hide its stores from the card scan).  Default
+   NIL, so every other build emits exactly what it did.")
+
+(defun x64-gen-gc-p ()
+  "Generational GC is emitted: hosted Linux, the collector on, BOTH bitmaps
+   (the old-space walks parse objects with them), and the flag."
+  (and *x64-gen-gc* *x64-linux-mode* *x64-gc-enabled* (mcgc-kind-bitmap-on-p) t))
+
+(defconstant +x64-gen-cards-addr+    #x10000CE0)
+(defconstant +x64-gen-area-addr+     #x10000CE8)
+(defconstant +x64-gen-ncards-addr+   #x10000CF0)
+(defconstant +x64-gen-crossing-addr+ #x10000CF8)
+(defconstant +x64-gen-old-lo-addr+   #x10000CC0)   ; stored <<1
+(defconstant +x64-gen-old-hi-addr+   #x10000CC8)   ; stored <<1
+(defconstant +x64-gen-tenure-req+    #x10000C88)   ; young from/to/size, <<1
+(defconstant +x64-gen-card-root+     #x10000D88)   ; the card vector, TAGGED
+
+(defun %gen-abs-op (buf opcode reg addr)
+  "OPCODE REG, qword [ADDR] (absolute disp32): 8B mov, 2B sub, 3B cmp, 03 add."
+  (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+  (emit-byte buf opcode)
+  (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+  (emit-byte buf #x25)
+  (emit-u32 buf addr))
+
+(defun emit-x64-card-mark-sub (buf label)
+  "MARK: RAX = the raw address of the slot about to be stored.  Preserves
+   every register (flags excepted)."
+  (let ((out (make-label)) (skip (make-label)))
+    (emit-label buf label)
+    (emit-push buf 'rcx)
+    (%gen-abs-op buf #x8B 'rcx +x64-gen-cards-addr+)
+    (emit-test-reg-reg buf 'rcx 'rcx)
+    (emit-jcc buf :e out)
+    (emit-push buf 'rax)
+    (%gen-abs-op buf #x2B 'rax +x64-gen-area-addr+)
+    (emit-shr-reg-imm buf 'rax 9)
+    (%gen-abs-op buf #x3B 'rax +x64-gen-ncards-addr+)
+    (emit-jcc buf :ae skip)                          ; unsigned: also below the area
+    (emit-bytes buf #xC6 #x04 #x01 #x00)             ; mov byte [rcx+rax], 0
+    (emit-label buf skip)
+    (emit-pop buf 'rax)
+    (emit-label buf out)
+    (emit-pop buf 'rcx)
+    (emit-ret buf)))
+
+(defun emit-x64-card-range-sub (buf label)
+  "MARK RANGE: RAX = first byte, RDX = length in bytes.  Every card the range
+   overlaps inside the area.  Preserves every register (flags excepted)."
+  (let ((out (make-label)) (ret0 (make-label)) (s1 (make-label))
+        (s2 (make-label)) (lp (make-label)))
+    (emit-label buf label)
+    (emit-test-reg-reg buf 'rdx 'rdx)
+    (emit-jcc buf :e ret0)
+    (dolist (r '(rcx rax rdx rdi)) (emit-push buf r))
+    (%gen-abs-op buf #x8B 'rcx +x64-gen-cards-addr+)
+    (emit-test-reg-reg buf 'rcx 'rcx)
+    (emit-jcc buf :e out)
+    (emit-mov-reg-reg buf 'rdi 'rax)
+    (emit-add-reg-reg buf 'rdi 'rdx)                 ; rdi = end
+    (%gen-abs-op buf #x8B 'rdx +x64-gen-area-addr+)  ; rdx = area
+    (emit-cmp-reg-reg buf 'rdi 'rdx)
+    (emit-jcc buf :be out)                           ; ends at or below the area
+    (emit-cmp-reg-reg buf 'rax 'rdx)
+    (emit-jcc buf :ae s1)
+    (emit-mov-reg-reg buf 'rax 'rdx)                 ; clip the start
+    (emit-label buf s1)
+    (emit-sub-reg-imm buf 'rdi 1)
+    (emit-sub-reg-reg buf 'rdi 'rdx)
+    (emit-shr-reg-imm buf 'rdi 9)                    ; last card
+    (emit-sub-reg-reg buf 'rax 'rdx)
+    (emit-shr-reg-imm buf 'rax 9)                    ; first card
+    (%gen-abs-op buf #x8B 'rdx +x64-gen-ncards-addr+)
+    (emit-test-reg-reg buf 'rdx 'rdx)
+    (emit-jcc buf :e out)
+    (emit-sub-reg-imm buf 'rdx 1)
+    (emit-cmp-reg-reg buf 'rdi 'rdx)
+    (emit-jcc buf :be s2)
+    (emit-mov-reg-reg buf 'rdi 'rdx)                 ; clip the end
+    (emit-label buf s2)
+    (emit-label buf lp)
+    (emit-cmp-reg-reg buf 'rax 'rdi)
+    (emit-jcc buf :a out)
+    (emit-bytes buf #xC6 #x04 #x01 #x00)             ; mov byte [rcx+rax], 0
+    (emit-add-reg-imm buf 'rax 1)
+    (emit-jmp buf lp)
+    (emit-label buf out)
+    (dolist (r '(rdi rdx rax rcx)) (emit-pop buf r))
+    (emit-label buf ret0)
+    (emit-ret buf)))
+
+(defun %gen-load (buf vreg target saved)
+  "TARGET := VREG, where SAVED is an alist (phys-reg . rsp-displacement) of
+   registers whose caller values were pushed (they may hold scratch now)."
+  (let* ((ph (vreg-phys vreg)) (hit (and ph (assoc ph saved))))
+    (if hit
+        (emit-mov-reg-mem buf target 'rsp (cdr hit))
+        (emit-load-vreg buf vreg target))))
+
+(defun emit-x64-card-barrier (buf state vobj disp &optional vidx)
+  "Mark the card of the slot at VOBJ + DISP (+ VIDX*4 when VIDX: a tagged
+   fixnum index of word elements) -- before the store it guards."
+  (let ((g (translate-state-card-label state)))
+    (when g
+      (if vidx
+          (progn
+            (emit-push buf 'rax)
+            (emit-push buf 'rcx)
+            (%gen-load buf vidx 'rcx '((rax . 8) (rcx . 0)))
+            (%gen-load buf vobj 'rax '((rax . 8) (rcx . 0)))
+            (emit-shl-reg-imm buf 'rcx 2)
+            (emit-add-reg-reg buf 'rax 'rcx)
+            (emit-add-reg-imm buf 'rax disp)
+            (emit-call buf g)
+            (emit-pop buf 'rcx)
+            (emit-pop buf 'rax))
+          (progn
+            (emit-push buf 'rax)
+            (%gen-load buf vobj 'rax '((rax . 0)))
+            (emit-add-reg-imm buf 'rax disp)
+            (emit-call buf g)
+            (emit-pop buf 'rax))))))
+
 (defun emit-syscall-gc-safe (buf park-label)
   "A `syscall' that a stop-the-world collection can see past.  Without
    PARK-LABEL (every image but the hosted threaded one) it is the bare
@@ -1424,7 +1563,11 @@
   ;; region-0 collection has the world stopped.  NIL everywhere else.
   (park-label nil)
   ;; HOSTED THREADED IMAGE: this unit's SHARED-STORE GUARD subroutine.
-  (ssg-label nil))
+  (ssg-label nil)
+  ;; GENERATIONAL GC: this unit's card-barrier subroutines (mark one slot,
+  ;; mark a range).  NIL unless (x64-gen-gc-p).
+  (card-label nil)
+  (card-range-label nil))
 
 (defun ensure-label-at (state mvm-pos)
   "Ensure a label exists for MVM bytecode position MVM-POS.
@@ -3829,6 +3972,7 @@
                 (pd (vreg-phys vd))
                 (ps (vreg-phys vs)))
            (emit-shared-store-guard buf state vd vs)
+           (emit-x64-card-barrier buf state vd -1)
            (cond
              ((and pd ps)
               (emit-mov-mem-reg buf pd ps -1))
@@ -3858,6 +4002,7 @@
                 (pd (vreg-phys vd))
                 (ps (vreg-phys vs)))
            (emit-shared-store-guard buf state vd vs)
+           (emit-x64-card-barrier buf state vd 7)
            (cond
              ((and pd ps)
               (emit-mov-mem-reg buf pd ps 7))
@@ -4941,7 +5086,8 @@
                 (idx (second operands))
                 (vs (third operands)))
            (unless (= vobj +vreg-vfp+)
-             (emit-shared-store-guard buf state vobj vs))
+             (emit-shared-store-guard buf state vobj vs)
+             (emit-x64-card-barrier buf state vobj (+ (* idx 8) 7)))
            (if (= vobj +vreg-vfp+)
                ;; Frame slot store: use safe RBP-relative offset below spill area
                (let ((ps (vreg-phys vs)))
@@ -5135,6 +5281,13 @@
                    (emit-load-vreg buf vobj 'r13)
                    (emit-add-reg-reg buf +scratch-reg+ 'r13)
                    (emit-pop buf 'r13))))
+           ;; GENERATIONAL GC: mark the slot's card (RAX = scratch + 7).
+           (let ((g (translate-state-card-label state)))
+             (when g
+               (emit-push buf 'rax)
+               (emit-lea buf 'rax +scratch-reg+ 7)
+               (emit-call buf g)
+               (emit-pop buf 'rax)))
            ;; Store Vs at [scratch + 7]
            (let ((ps (vreg-phys vs)))
              (if ps
@@ -6011,7 +6164,12 @@
                      (emit-label buf done)
                      (emit-bytes buf #x5E #x59)                         ; pop rsi; pop rcx
                      (emit-label buf novalid)))
-                 (emit-bytes buf #x48 #x8D #x7C #x97 #x07 #x48 #xC1 #xE1 #x02))) ; lea rdi,[rdi+rdx*4+7]; shl rcx,2
+                 (emit-bytes buf #x48 #x8D #x7C #x97 #x07 #x48 #xC1 #xE1 #x02) ; lea rdi,[rdi+rdx*4+7]; shl rcx,2
+                 (let ((c (translate-state-card-range-label state)))
+                   (when c                                     ; cards of [rdi, rdi+rcx)
+                     (emit-bytes buf #x50 #x52 #x48 #x89 #xF8 #x48 #x89 #xCA) ; push rax; push rdx; mov rax,rdi; mov rdx,rcx
+                     (emit-call buf c)
+                     (emit-bytes buf #x5A #x58)))))           ; pop rdx; pop rax
            ;; memmove: backward (STD) only when dst lies inside (src, src+n)
            (emit-bytes buf #x48 #x39 #xF7 #x76 #x19 #x48 #x8D #x04 #x0E #x48 #x39 #xC7 #x73 #x10
                            #x48 #x8D #x74 #x0E #xFF #x48 #x8D #x7C #x0F #xFF #xFD #xF3 #xA4 #xFC
@@ -6034,7 +6192,14 @@
                      (emit-call buf g)
                      (emit-bytes buf #x48 #x83 #xC4 #x10)          ; add rsp,16
                      (emit-label buf skip)))
-                 (emit-bytes buf #x48 #x8D #x7C #x97 #x07 #x48 #xD1 #xF9 #xF3 #x48 #xAB))) ; lea; sar rcx,1; rep stosq
+                 (emit-bytes buf #x48 #x8D #x7C #x97 #x07 #x48 #xD1 #xF9) ; lea rdi,[rdi+rdx*4+7]; sar rcx,1
+                 (let ((c (translate-state-card-range-label state)))
+                   (when c                                     ; cards of [rdi, rdi+8*rcx)
+                     (emit-bytes buf #x50 #x52 #x48 #x89 #xF8          ; push rax; push rdx; mov rax,rdi
+                                     #x48 #x8D #x14 #xCD #x00 #x00 #x00 #x00) ; lea rdx,[rcx*8]
+                     (emit-call buf c)
+                     (emit-bytes buf #x5A #x58)))              ; pop rdx; pop rax
+                 (emit-bytes buf #xF3 #x48 #xAB)))             ; rep stosq
            (emit-bytes buf #x5F #x5A #x59 #x58)))                  ; pop rdi/rdx/rcx/rax
 
         ;; ---- INTEGER LANE class (SIMD 2b): no SSE arm yet.  SIGNAL, so the
@@ -8299,6 +8464,753 @@
    boot-x64 / boot-linux-x64 apply the same margin to the boot-time R14."
   #x1000000)
 
+;;; ============================================================
+;;; GENERATIONAL GC: THE COLLECTOR ARMS (docs/generational-gc.md, x64 port)
+;;; ============================================================
+;;; The AArch64 design, the AArch64 words, the AArch64 state machine; only the
+;;; registers differ.  For the whole of a REGION-0 collection with promotion:
+;;;   R12 = the old area's bump pointer (0 = this collection promotes nothing)
+;;;   R14 = the SURVIVOR MARK: a from-space object below it is promoted
+;;;         (0 = none, all ones = everything: a major's phase 1)
+;;;   meta+80 = the promotion BOUND (the area's end, clipped by the ceiling)
+;;; R12/R14 are the collector's own until the swap (EMIT-GC-TRAMPOLINE's
+;;; register note); scan_word and copy_object preserve both.  Every arm is a
+;;; no-op unless (X64-GEN-GC-P), so other builds emit what they always did.
+
+(defun %gen-meta (buf reg skip)
+  "REG := the card vector's meta (its data), or jump to SKIP when there is none."
+  (emit-mov-reg-abs buf reg +x64-gen-card-root+)
+  (emit-test-reg-reg buf reg reg)
+  (emit-jcc buf :e skip)
+  (emit-add-reg-imm buf reg 7))
+
+(defun %gen-unless-region-0 (buf reg skip)
+  "REG := the active region's block; jump to SKIP unless it is region 0's."
+  (emit-load-gc-region buf reg)
+  (emit-cmp-reg-imm buf reg modus.mvm::+gc-region-0-base+)
+  (emit-jcc buf :ne skip))
+
+(defun %gen-load-shr1 (buf reg addr)
+  "REG := [ADDR] >> 1 (an old-space / request word, stored <<1)."
+  (emit-mov-reg-abs buf reg addr)
+  (emit-sar-reg-imm buf reg 1))
+
+(defun %gen-store-shl1 (buf addr reg scratch)
+  "[ADDR] := REG << 1."
+  (emit-mov-reg-reg buf scratch reg)
+  (emit-shl-reg-imm buf scratch 1)
+  (emit-mov-abs-reg buf addr scratch))
+
+(defun %gen-clip-ceiling (buf reg base meta scratch)
+  "REG := the meta's CEILING (+72) when it lies inside (BASE, REG)."
+  (let ((skip (make-label)))
+    (emit-mov-reg-mem buf scratch meta 72)
+    (emit-cmp-reg-reg buf scratch base)
+    (emit-jcc buf :be skip)                       ; 0, or at/below the base
+    (emit-cmp-reg-reg buf reg scratch)
+    (emit-jcc buf :be skip)
+    (emit-mov-reg-reg buf reg scratch)
+    (emit-label buf skip)))
+
+(defun emit-x64-promo-setup (buf)
+  "R12 / R14 / meta+80 for this collection (above).  RAX, RSI, RDI, RDX."
+  (when (x64-gen-gc-p)
+    (let ((done (make-label)) (all (make-label)) (bump (make-label)))
+      (emit-bytes buf #x4D #x31 #xE4)                 ; xor r12, r12
+      (emit-bytes buf #x4D #x31 #xF6)                 ; xor r14, r14
+      (%gen-unless-region-0 buf 'rax done)
+      (%gen-meta buf 'rsi done)
+      (emit-mov-reg-abs buf 'rax +x64-gen-cards-addr+)
+      (emit-test-reg-reg buf 'rax 'rax)
+      (emit-jcc buf :e done)
+      (emit-mov-reg-mem buf 'rax 'rsi 24)             ; major state
+      (emit-cmp-reg-imm buf 'rax 1)
+      (emit-jcc buf :e all)
+      (emit-cmp-reg-imm buf 'rax 4)
+      (emit-jcc buf :e all)
+      (emit-mov-reg-mem buf 'rax 'rsi 56)             ; promotion on?
+      (emit-test-reg-reg buf 'rax 'rax)
+      (emit-jcc buf :e done)
+      (emit-mov-reg-mem buf 'r14 'rsi 16)             ; the survivor mark
+      (emit-jmp buf bump)
+      (emit-label buf all)                            ; a major's phase 1
+      (emit-add-reg-imm buf 'rax 6)
+      (emit-mov-mem-reg buf 'rsi 'rax 24)
+      ;; EVERYTHING, the lock arena included (it can lie above from_end):
+      ;; translate-aarch64's EMIT-AARCH64-PROMO-SETUP has the measurement.
+      (emit-bytes buf #x49 #xC7 #xC6 #xFF #xFF #xFF #xFF) ; mov r14, -1
+      (emit-label buf bump)
+      (%gen-load-shr1 buf 'r12 +x64-gen-old-hi-addr+)
+      (emit-mov-reg-abs buf 'rax +x64-gen-area-addr+)
+      (emit-mov-reg-mem buf 'rdi 'rsi 8)              ; area size
+      (emit-add-reg-reg buf 'rdi 'rax)
+      (%gen-clip-ceiling buf 'rdi 'rax 'rsi 'rdx)
+      (emit-mov-mem-reg buf 'rsi 'rdi 80)             ; the bound
+      (emit-label buf done))))
+
+(defun emit-x64-promo-fail (buf)
+  "copy_object found no room in the old area: promote nothing more this
+   collection, count a failure, and ask for a major (or abort phase 1: 7 -> 3,
+   10 -> 6).  RAX and R9 only -- the caller's RDX/RSI/R8 are live."
+  (let ((out (make-label)) (abort (make-label)) (store (make-label)))
+    (emit-bytes buf #x4D #x31 #xF6)                   ; xor r14, r14
+    (%gen-meta buf 'r9 out)
+    (emit-bytes buf #x49 #xFF #x41 #x20)              ; inc qword [r9+32]
+    (emit-mov-reg-mem buf 'rax 'r9 24)
+    (emit-cmp-reg-imm buf 'rax 7)
+    (emit-jcc buf :e abort)
+    (emit-cmp-reg-imm buf 'rax 10)
+    (emit-jcc buf :e abort)
+    (emit-test-reg-reg buf 'rax 'rax)
+    (emit-jcc buf :ne out)
+    (emit-mov-reg-imm buf 'rax 1)
+    (emit-jmp buf store)
+    (emit-label buf abort)
+    (emit-sub-reg-imm buf 'rax 4)
+    (emit-label buf store)
+    (emit-mov-mem-reg buf 'r9 'rax 24)
+    (emit-label buf out)))
+
+(defun emit-x64-gen-copy-object (buf copy-label)
+  "copy_object for a build with generational GC: the SIZE first, then the
+   destination -- the old area's bump R12 when the source lies below the
+   survivor mark R14 and the object fits under the bound, else to-space R13 --
+   then one copy.  Same contract as the plain one: RAX = tagged from-space
+   pointer in, the new tagged pointer out; clobbers RAX, RSI, RDX, R8, R9;
+   preserves RBX, RCX, RDI, R10, R11, RBP (and advances R12 or R13)."
+  (let ((is-obj (make-label)) (sized (make-label)) (fwd (make-label))
+        (bogus (make-label)) (done (make-label)) (young (make-label))
+        (chosen (make-label)) (fail (make-label)) (copy-obj (make-label))
+        (u8 (make-label)) (f32 (make-label)) (gen-size (make-label)))
+    (emit-label buf copy-label)
+    (emit-mov-reg-reg buf 'rdx 'rax)                  ; rdx = tagged source
+    (emit-mov-reg-reg buf 'rsi 'rdx)
+    (emit-and-reg-imm buf 'rsi -16)                   ; rsi = raw source
+    (emit-mov-reg-mem buf 'rax 'rsi 0)
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-and-reg-imm buf 'r8 #x0F)
+    (emit-cmp-reg-imm buf 'r8 #x0F)
+    (emit-jcc buf :e fwd)                             ; already forwarded
+    (emit-mov-reg-reg buf 'r8 'rdx)
+    (emit-and-reg-imm buf 'r8 #x0F)
+    (emit-cmp-reg-imm buf 'r8 1)
+    (emit-jcc buf :ne is-obj)
+    (emit-mov-reg-imm buf 'r8 16)                     ; a cons
+    (emit-jmp buf sized)
+    ;; ---- an object: copy_object's size rules ----
+    (emit-label buf is-obj)
+    (emit-mov-reg-reg buf 'r8 'rax)
+    (emit-shr-reg-imm buf 'r8 8)                      ; count
+    (emit-mov-reg-reg buf 'r9 'rax)
+    (emit-and-reg-imm buf 'r9 #xFF)                   ; subtag
+    (emit-cmp-reg-imm buf 'r9 #x11)
+    (emit-jcc buf :e u8)
+    (emit-cmp-reg-imm buf 'r9 #x13)
+    (emit-jcc buf :e u8)
+    (emit-cmp-reg-imm buf 'r9 #x12)
+    (emit-jcc buf :e f32)
+    (emit-cmp-reg-imm buf 'r9 #x15)
+    (emit-jcc buf :e f32)
+    (emit-add-reg-imm buf 'r8 2)
+    (emit-shl-reg-imm buf 'r8 3)
+    (emit-jmp buf gen-size)
+    (emit-label buf f32)
+    (emit-shl-reg-imm buf 'r8 2)
+    (emit-label buf u8)
+    (emit-add-reg-imm buf 'r8 16)
+    (emit-label buf gen-size)
+    (emit-add-reg-imm buf 'r8 15)
+    (emit-and-reg-imm buf 'r8 -16)
+    ;; the conservative-scan sanity guard (see the plain copy_object)
+    (let ((ok (make-label)))
+      (when *x64-stw*
+        (emit-cmp-reg-reg buf 'rsi 'rbx)
+        (emit-jcc buf :b ok)
+        (emit-cmp-reg-reg buf 'rsi 'rcx)
+        (emit-jcc buf :ae ok))
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-add-reg-reg buf 'rax 'r8)
+      (emit-cmp-reg-reg buf 'rax 'rcx)
+      (emit-jcc buf :a bogus)
+      (emit-label buf ok))
+    ;; ---- the destination: R9 ----
+    (emit-label buf sized)
+    (emit-cmp-reg-reg buf 'rsi 'r14)
+    (emit-jcc buf :ae young)                          ; at/above the mark (or none)
+    (emit-mov-reg-abs buf 'rax +x64-gen-card-root+)
+    (emit-mov-reg-mem buf 'rax 'rax 87)               ; meta+80: the bound
+    (emit-sub-reg-reg buf 'rax 'r12)                  ; room
+    (emit-cmp-reg-reg buf 'rax 'r8)
+    (emit-jcc buf :b fail)
+    (emit-mov-reg-reg buf 'r9 'r12)
+    (emit-add-reg-reg buf 'r12 'r8)
+    (emit-jmp buf chosen)
+    (emit-label buf fail)
+    (emit-x64-promo-fail buf)
+    (emit-label buf young)
+    (emit-mov-reg-reg buf 'r9 'r13)
+    (emit-add-reg-reg buf 'r13 'r8)
+    (emit-label buf chosen)
+    (when (mcgc-collector-on-p)
+      (emit-mcgc-set-copy-bit buf 'r9))
+    (emit-mov-reg-reg buf 'rax 'rdx)
+    (emit-and-reg-imm buf 'rax #x0F)
+    (emit-cmp-reg-imm buf 'rax 1)
+    (emit-jcc buf :ne copy-obj)
+    ;; ---- a cons ----
+    (emit-mcgc-set-cons-bit-copy buf 'r9)
+    (emit-mov-reg-mem buf 'rax 'rsi 0)
+    (emit-mov-mem-reg buf 'r9 'rax 0)
+    (emit-mov-reg-mem buf 'rax 'rsi 8)
+    (emit-mov-mem-reg buf 'r9 'rax 8)
+    (emit-mov-reg-reg buf 'rdx 'r9)
+    (emit-or-reg-imm buf 'rdx #x0F)
+    (emit-mov-mem-reg buf 'rsi 'rdx 0)                ; forward
+    (emit-mov-reg-reg buf 'rax 'r9)
+    (emit-or-reg-imm buf 'rax 1)
+    (emit-jmp buf done)
+    ;; ---- an object: REP MOVSQ ----
+    (emit-label buf copy-obj)
+    (emit-push buf 'rdi)
+    (emit-push buf 'rcx)
+    (emit-mov-reg-reg buf 'rdi 'r9)
+    (emit-mov-reg-reg buf 'rcx 'r8)
+    (emit-shr-reg-imm buf 'rcx 3)
+    (emit-bytes buf #xF3 #x48 #xA5)                   ; rep movsq
+    (emit-pop buf 'rcx)
+    (emit-pop buf 'rdi)
+    (emit-mov-reg-reg buf 'rsi 'rdx)
+    (emit-and-reg-imm buf 'rsi -16)
+    (emit-mov-reg-reg buf 'rdx 'r9)
+    (emit-or-reg-imm buf 'rdx #x0F)
+    (emit-mov-mem-reg buf 'rsi 'rdx 0)                ; forward
+    (emit-mov-reg-reg buf 'rax 'r9)
+    (emit-or-reg-imm buf 'rax 9)
+    (emit-jmp buf done)
+    ;; ---- already forwarded: the new address, the original tag ----
+    (emit-label buf fwd)
+    (emit-and-reg-imm buf 'rax -16)
+    (emit-mov-reg-reg buf 'r8 'rdx)
+    (emit-and-reg-imm buf 'r8 #x0F)
+    (emit-or-reg-reg buf 'rax 'r8)
+    (emit-jmp buf done)
+    (emit-label buf bogus)
+    (emit-mov-reg-reg buf 'rax 'rdx)
+    (emit-label buf done)
+    (emit-ret buf)))
+
+(defun %gen-kind-test (buf cons-label)
+  "Jump to CONS-LABEL if the object start at RDI carries the CONS-KIND bit.
+   RAX, RSI."
+  (emit-mov-reg-reg buf 'rax 'rdi)
+  (emit-bytes buf #x48 #x2B #x04 #x25)                ; sub rax, [page_base]
+  (emit-u32 buf +mcgc-cfg-page-base-addr+)
+  (emit-shr-reg-imm buf 'rax 4)
+  (emit-mov-reg-abs buf 'rsi +mcgc-cfg-bitmap-addr+)
+  (emit-bytes buf #x48 #x81 #xC6)                     ; add rsi, imm32
+  (emit-u32 buf *mcgc-kindbitmap-delta*)
+  (emit-bytes buf #x48 #x0F #xA3 #x06)                ; bt [rsi], rax
+  (emit-jcc buf :c cons-label))
+
+(defun %gen-header-size (buf)
+  "The header at [RDI]: RSI := subtag, RAX := the object's aligned size.  RDX."
+  (let ((u8 (make-label)) (f32 (make-label)) (have (make-label)))
+    (emit-mov-reg-mem buf 'rdx 'rdi 0)
+    (emit-bytes buf #x0F #xB6 #xF2)                   ; movzx esi, dl
+    (emit-shr-reg-imm buf 'rdx 8)
+    (emit-cmp-reg-imm buf 'rsi #x11)
+    (emit-jcc buf :e u8)
+    (emit-cmp-reg-imm buf 'rsi #x13)
+    (emit-jcc buf :e u8)
+    (emit-cmp-reg-imm buf 'rsi #x12)
+    (emit-jcc buf :e f32)
+    (emit-cmp-reg-imm buf 'rsi #x15)
+    (emit-jcc buf :e f32)
+    (emit-bytes buf #x48 #x8D #x04 #xD5 #x10 #x00 #x00 #x00) ; lea rax, [rdx*8+16]
+    (emit-jmp buf have)
+    (emit-label buf f32)
+    (emit-shl-reg-imm buf 'rdx 2)
+    (emit-label buf u8)
+    (emit-bytes buf #x48 #x8D #x42 #x10)              ; lea rax, [rdx+16]
+    (emit-label buf have)
+    (emit-add-reg-imm buf 'rax 15)
+    (emit-and-reg-imm buf 'rax -16)))
+
+(defun %gen-obj-size (buf)
+  "RAX := the aligned size of the object at RDI (16 for a cons).  RSI, RDX."
+  (let ((cons (make-label)) (done (make-label)))
+    (%gen-kind-test buf cons)
+    (%gen-header-size buf)
+    (emit-jmp buf done)
+    (emit-label buf cons)
+    (emit-mov-reg-imm buf 'rax 16)
+    (emit-label buf done)))
+
+(defun emit-x64-crossing-fill (buf dirty)
+  "For the objects in [RDI, R11): their crossing entries, and their cards --
+   DIRTY (0) every card an object overlaps, or CLEAN (1) every card whose
+   first byte one covers.  R8 cards, R9 crossing, R10 area (kept).
+   Clobbers RAX, RCX, RDX, RSI, RDI."
+  (let ((l (make-label)) (done (make-label)) (kl (make-label)) (kdone (make-label))
+        (cl (make-label)) (cdone (make-label)))
+    (emit-label buf l)
+    (emit-cmp-reg-reg buf 'rdi 'r11)
+    (emit-jcc buf :ae done)
+    (%gen-obj-size buf)
+    (emit-mov-reg-reg buf 'rdx 'rdi)
+    (emit-sub-reg-reg buf 'rdx 'r10)                  ; offset in the area
+    (emit-add-reg-reg buf 'rdi 'rax)                  ; next object
+    (emit-mov-reg-reg buf 'rsi 'rdx)
+    (emit-add-reg-reg buf 'rsi 'rax)
+    (emit-sub-reg-imm buf 'rsi 1)
+    (emit-shr-reg-imm buf 'rsi 9)                     ; last card
+    (emit-mov-reg-reg buf 'rcx 'rdx)
+    (unless dirty (emit-add-reg-imm buf 'rcx 511))
+    (emit-shr-reg-imm buf 'rcx 9)                     ; first card to mark
+    (emit-label buf kl)
+    (emit-cmp-reg-reg buf 'rcx 'rsi)
+    (emit-jcc buf :a kdone)
+    (emit-bytes buf #x41 #xC6 #x04 #x08 (if dirty 0 1)) ; mov byte [r8+rcx], 0/1
+    (emit-add-reg-imm buf 'rcx 1)
+    (emit-jmp buf kl)
+    (emit-label buf kdone)
+    (emit-mov-reg-reg buf 'rax 'rdx)
+    (emit-shr-reg-imm buf 'rax 4)                     ; the crossing value
+    (emit-mov-reg-reg buf 'rcx 'rdx)
+    (emit-add-reg-imm buf 'rcx 511)
+    (emit-shr-reg-imm buf 'rcx 9)                     ; first card it starts
+    (emit-label buf cl)
+    (emit-cmp-reg-reg buf 'rcx 'rsi)
+    (emit-jcc buf :a cdone)
+    (emit-bytes buf #x41 #x89 #x04 #x89)              ; mov [r9+rcx*4], eax
+    (emit-add-reg-imm buf 'rcx 1)
+    (emit-jmp buf cl)
+    (emit-label buf cdone)
+    (emit-jmp buf l)
+    (emit-label buf done)))
+
+(defun emit-x64-old-card-scan (buf scan-word-label)
+  "Scan the old space's DIRTY cards (R11 = old_hi on entry): for each, start
+   at the object the crossing table says covers its first byte, walk objects to
+   the card's end, and SCAN_WORD only the pointer slots inside the card.  A card
+   none of whose slots then points into to-space is cleaned.  R11 is the card,
+   RDI the object, R10 the slot; RDX (stack_base) is saved around it.  Frame:
+   [0] card start [8] card end [16] slot limit [24] old_hi [32] cards in use
+   [40] area [48] crossing [56] next object [64] young flag [72] card bytes
+   [80] to_start [88] to-space size."
+  (let ((l-card (make-label)) (single (make-label)) (next (make-label))
+        (done (make-label)) (endok (make-label)) (l-obj (make-label))
+        (objdone (make-label)) (is-cons (make-label)) (cskip (make-label))
+        (nextobj (make-label)) (lo-ok (make-label)) (hi-ok (make-label))
+        (sloop (make-label)) (leaf (make-label)))
+    (flet ((ld (reg off) (emit-mov-reg-mem buf reg 'rsp off))
+           (st (off reg) (emit-mov-mem-reg buf 'rsp reg off))
+           (scan-slot ()
+             ;; SCAN_WORD [R10] if it can hold a pointer; then the young check
+             (let ((skip (make-label)))
+               (emit-mov-reg-mem buf 'rax 'r10 0)
+               (emit-and-reg-imm buf 'rax 7)
+               (emit-cmp-reg-imm buf 'rax 1)
+               (emit-jcc buf :ne skip)
+               (emit-mov-reg-reg buf 'rax 'r10)
+               (emit-call buf scan-word-label)
+               (emit-mov-reg-mem buf 'rax 'r10 0)
+               (emit-mov-reg-reg buf 'rsi 'rax)
+               (emit-and-reg-imm buf 'rsi 7)
+               (emit-cmp-reg-imm buf 'rsi 1)
+               (emit-jcc buf :ne skip)
+               (emit-mov-reg-mem buf 'rsi 'rsp 80)
+               (emit-sub-reg-reg buf 'rax 'rsi)
+               (emit-mov-reg-mem buf 'rsi 'rsp 88)
+               (emit-cmp-reg-reg buf 'rax 'rsi)
+               (emit-jcc buf :ae skip)
+               (emit-mov-reg-imm buf 'rax 1)
+               (emit-mov-mem-reg buf 'rsp 'rax 64)
+               (emit-label buf skip))))
+      (emit-push buf 'rdx)
+      (emit-sub-reg-imm buf 'rsp 96)
+      (st 24 'r11)
+      (emit-mov-reg-abs buf 'rax +x64-gen-cards-addr+)  (st 72 'rax)
+      (emit-mov-reg-abs buf 'rax +x64-gen-area-addr+)   (st 40 'rax)
+      (emit-mov-reg-abs buf 'rsi +x64-gen-crossing-addr+) (st 48 'rsi)
+      (emit-mov-reg-reg buf 'rsi 'r11)
+      (emit-sub-reg-reg buf 'rsi 'rax)
+      (emit-add-reg-imm buf 'rsi 511)
+      (emit-shr-reg-imm buf 'rsi 9)
+      (st 32 'rsi)                                    ; cards in use
+      (emit-load-gc-region buf 'rax)
+      (emit-mov-reg-mem buf 'rsi 'rax modus.mvm::+gc-off-to-start+) (st 80 'rsi)
+      (emit-mov-reg-mem buf 'rsi 'rax modus.mvm::+gc-off-space-size+) (st 88 'rsi)
+      (emit-bytes buf #x4D #x31 #xDB)                 ; xor r11, r11
+      (emit-label buf l-card)
+      (ld 'rax 32)
+      (emit-cmp-reg-reg buf 'r11 'rax)
+      (emit-jcc buf :ae done)
+      ;; eight clean cards at once
+      (emit-mov-reg-reg buf 'rsi 'r11)
+      (emit-add-reg-imm buf 'rsi 8)
+      (emit-cmp-reg-reg buf 'rsi 'rax)
+      (emit-jcc buf :a single)
+      (ld 'rax 72)
+      (emit-bytes buf #x4A #x8B #x04 #x18)            ; mov rax, [rax+r11]
+      (emit-mov-reg-imm buf 'rsi #x0101010101010101)
+      (emit-cmp-reg-reg buf 'rax 'rsi)
+      (emit-jcc buf :ne single)
+      (emit-add-reg-imm buf 'r11 8)
+      (emit-jmp buf l-card)
+      (emit-label buf single)
+      (ld 'rax 72)
+      (emit-bytes buf #x42 #x0F #xB6 #x04 #x18)       ; movzx eax, byte [rax+r11]
+      (emit-test-reg-reg buf 'rax 'rax)
+      (emit-jcc buf :ne next)
+      ;; ---- a dirty card ----
+      (emit-mov-reg-reg buf 'rax 'r11)
+      (emit-shl-reg-imm buf 'rax 9)
+      (ld 'rsi 40)
+      (emit-add-reg-reg buf 'rax 'rsi)
+      (st 0 'rax)                                     ; card start
+      (emit-add-reg-imm buf 'rax 512)
+      (ld 'rsi 24)
+      (emit-cmp-reg-reg buf 'rax 'rsi)
+      (emit-jcc buf :be endok)
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-label buf endok)
+      (st 8 'rax)                                     ; card end (<= old_hi)
+      (emit-mov-reg-imm buf 'rax 0)
+      (st 64 'rax)
+      (ld 'rax 48)
+      (emit-bytes buf #x42 #x8B #x04 #x98)            ; mov eax, [rax+r11*4]
+      (emit-shl-reg-imm buf 'rax 4)
+      (ld 'rsi 40)
+      (emit-add-reg-reg buf 'rax 'rsi)
+      (emit-mov-reg-reg buf 'rdi 'rax)                ; the covering object
+      (emit-label buf l-obj)
+      (ld 'rax 8)
+      (emit-cmp-reg-reg buf 'rdi 'rax)
+      (emit-jcc buf :ae objdone)
+      (%gen-kind-test buf is-cons)
+      (%gen-header-size buf)
+      (emit-add-reg-reg buf 'rax 'rdi)
+      (st 56 'rax)                                    ; next object
+      (dolist (s '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66))
+        (emit-cmp-reg-imm buf 'rsi s)
+        (emit-jcc buf :e leaf))
+      ;; slots [max(obj+16, card start), min(obj+16+count*8, card end))
+      (emit-mov-reg-mem buf 'rdx 'rdi 0)
+      (emit-shr-reg-imm buf 'rdx 8)
+      (emit-lea buf 'r10 'rdi 16)
+      (ld 'rax 0)
+      (emit-cmp-reg-reg buf 'r10 'rax)
+      (emit-jcc buf :ae lo-ok)
+      (emit-mov-reg-reg buf 'r10 'rax)
+      (emit-label buf lo-ok)
+      (emit-bytes buf #x48 #x8D #x44 #xD7 #x10)       ; lea rax, [rdi+rdx*8+16]
+      (ld 'rsi 8)
+      (emit-cmp-reg-reg buf 'rax 'rsi)
+      (emit-jcc buf :be hi-ok)
+      (emit-mov-reg-reg buf 'rax 'rsi)
+      (emit-label buf hi-ok)
+      (st 16 'rax)
+      (emit-label buf sloop)
+      (ld 'rax 16)
+      (emit-cmp-reg-reg buf 'r10 'rax)
+      (emit-jcc buf :ae nextobj)
+      (scan-slot)
+      (emit-add-reg-imm buf 'r10 8)
+      (emit-jmp buf sloop)
+      (emit-label buf leaf)
+      (emit-label buf nextobj)
+      (ld 'rdi 56)
+      (emit-jmp buf l-obj)
+      ;; a cons: 16 bytes inside one card, so in this card or wholly before it
+      (emit-label buf is-cons)
+      (ld 'rax 0)
+      (emit-cmp-reg-reg buf 'rdi 'rax)
+      (emit-jcc buf :b cskip)
+      (emit-mov-reg-reg buf 'r10 'rdi)
+      (scan-slot)
+      (emit-lea buf 'r10 'rdi 8)
+      (scan-slot)
+      (emit-label buf cskip)
+      (emit-add-reg-imm buf 'rdi 16)
+      (emit-jmp buf l-obj)
+      ;; clean unless a slot still points at a young object
+      (emit-label buf objdone)
+      (ld 'rax 64)
+      (emit-test-reg-reg buf 'rax 'rax)
+      (emit-jcc buf :ne next)
+      (ld 'rax 72)
+      (emit-bytes buf #x42 #xC6 #x04 #x18 #x01)       ; mov byte [rax+r11], 1
+      (emit-label buf next)
+      (emit-add-reg-imm buf 'r11 1)
+      (emit-jmp buf l-card)
+      (emit-label buf done)
+      (emit-add-reg-imm buf 'rsp 96)
+      (emit-pop buf 'rdx))))
+
+(defun emit-x64-old-space-walk (buf scan-word-label)
+  "Region 0 with an old space: scan its dirty cards, or with no card table
+   walk all of [old_lo, old_hi) as roots.  R10/R11 are the walk's."
+  (when (x64-gen-gc-p)
+    (let ((skip (make-label)) (cards (make-label)))
+      (%gen-unless-region-0 buf 'rax skip)
+      (%gen-load-shr1 buf 'r11 +x64-gen-old-hi-addr+)
+      (emit-test-reg-reg buf 'r11 'r11)
+      (emit-jcc buf :e skip)
+      (emit-mov-reg-abs buf 'rax +x64-gen-cards-addr+)
+      (emit-test-reg-reg buf 'rax 'rax)
+      (emit-jcc buf :ne cards)
+      (%gen-load-shr1 buf 'r10 +x64-gen-old-lo-addr+)
+      (emit-x64-flat-walk buf scan-word-label 'r11)
+      (emit-jmp buf skip)
+      (emit-label buf cards)
+      (emit-x64-old-card-scan buf scan-word-label)
+      (emit-label buf skip))))
+
+(defun emit-x64-gen-cheney (buf scan-word-label)
+  "The Cheney scan over BOTH destinations: to-space from R10 to R13, and what
+   was promoted this collection, from old_hi at entry to R12, until neither
+   grows.  The promotion cursor lives at [rsp]."
+  (let ((l (make-label)) (k (make-label)) (chk (make-label)) (out (make-label)))
+    (%gen-load-shr1 buf 'rax +x64-gen-old-hi-addr+)
+    (emit-test-reg-reg buf 'r12 'r12)
+    (emit-jcc buf :ne k)
+    (emit-mov-reg-imm buf 'rax 0)
+    (emit-label buf k)
+    (emit-push buf 'rax)
+    (emit-label buf l)
+    (emit-x64-flat-walk buf scan-word-label 'r13)
+    (emit-test-reg-reg buf 'r12 'r12)
+    (emit-jcc buf :e chk)
+    (emit-bytes buf #x4C #x87 #x14 #x24)              ; xchg r10, [rsp]
+    (emit-x64-flat-walk buf scan-word-label 'r12)
+    (emit-bytes buf #x4C #x87 #x14 #x24)              ; xchg r10, [rsp]
+    (emit-label buf chk)
+    (emit-cmp-reg-reg buf 'r10 'r13)
+    (emit-jcc buf :b l)
+    (emit-test-reg-reg buf 'r12 'r12)
+    (emit-jcc buf :e out)
+    (emit-mov-reg-mem buf 'rax 'rsp 0)
+    (emit-cmp-reg-reg buf 'rax 'r12)
+    (emit-jcc buf :b l)
+    (emit-label buf out)
+    (emit-add-reg-imm buf 'rsp 8)))
+
+(defun emit-x64-gen-bitmap-clear (buf)
+  "Before the swap (a generational build clears here, not after it): both
+   bitmaps over the reclaimed from-space [RBX, +count), count the region's
+   space_size -- or, in a major's phase 2 (state 2 / 5), the old area's size,
+   since the from-space was the whole old area.  RAX, RCX, RDX, RSI, RDI."
+  (let ((go (make-label)) (big (make-label)))
+    (emit-load-gc-region buf 'rsi)
+    (emit-mov-reg-mem buf 'rcx 'rsi modus.mvm::+gc-off-space-size+)
+    (emit-cmp-reg-imm buf 'rsi modus.mvm::+gc-region-0-base+)
+    (emit-jcc buf :ne go)
+    (%gen-meta buf 'rax go)
+    (emit-mov-reg-mem buf 'rdx 'rax 24)
+    (emit-cmp-reg-imm buf 'rdx 2)
+    (emit-jcc buf :e big)
+    (emit-cmp-reg-imm buf 'rdx 5)
+    (emit-jcc buf :ne go)
+    (emit-label buf big)
+    (emit-mov-reg-mem buf 'rcx 'rax 8)
+    (emit-label buf go)
+    (emit-shr-reg-imm buf 'rcx 7)                     ; bitmap bytes
+    (emit-mov-reg-reg buf 'rdx 'rcx)
+    (dolist (kind '(nil t))
+      (emit-bytes buf #xFC)                           ; cld
+      (emit-mov-reg-reg buf 'rax 'rbx)
+      (emit-bytes buf #x48 #x2B #x04 #x25)            ; sub rax, [page_base]
+      (emit-u32 buf +mcgc-cfg-page-base-addr+)
+      (emit-shr-reg-imm buf 'rax 7)
+      (emit-mov-reg-abs buf 'rdi +mcgc-cfg-bitmap-addr+)
+      (when kind
+        (emit-bytes buf #x48 #x81 #xC7)               ; add rdi, imm32
+        (emit-u32 buf *mcgc-kindbitmap-delta*))
+      (emit-add-reg-reg buf 'rdi 'rax)
+      (emit-mov-reg-reg buf 'rcx 'rdx)
+      (emit-bytes buf #x31 #xC0)                      ; xor eax, eax
+      (emit-bytes buf #xF3 #xAA))))                   ; rep stosb
+
+(defun emit-x64-promo-finish (buf)
+  "After a collection that could promote (R12 /= 0): the promoted objects
+   [old_hi at entry, R12) get crossing entries and DIRTY cards, old_hi := R12,
+   the survivor mark := R13, and a major is requested when the old area's room
+   is below max(reserve, 2 x this collection's young survivors)."
+  (let ((skip (make-label)) (nomajor (make-label)) (big (make-label))
+        (have (make-label)))
+    (emit-test-reg-reg buf 'r12 'r12)
+    (emit-jcc buf :e skip)
+    (%gen-load-shr1 buf 'rdi +x64-gen-old-hi-addr+)
+    (emit-mov-reg-reg buf 'rax 'r12)
+    (emit-sub-reg-reg buf 'rax 'rdi)
+    (emit-push buf 'rax)                              ; bytes promoted
+    (emit-mov-reg-reg buf 'r11 'r12)
+    (emit-mov-reg-abs buf 'r8 +x64-gen-cards-addr+)
+    (emit-mov-reg-abs buf 'r9 +x64-gen-crossing-addr+)
+    (emit-mov-reg-abs buf 'r10 +x64-gen-area-addr+)
+    (emit-x64-crossing-fill buf t)
+    (%gen-store-shl1 buf +x64-gen-old-hi-addr+ 'r12 'rax)
+    (emit-pop buf 'rax)
+    (%gen-meta buf 'rsi skip)
+    (emit-mov-reg-mem buf 'rdx 'rsi 48)
+    (emit-add-reg-reg buf 'rdx 'rax)
+    (emit-mov-mem-reg buf 'rsi 'rdx 48)
+    (emit-mov-mem-reg buf 'rsi 'r13 16)               ; the survivor mark
+    (emit-mov-reg-mem buf 'rax 'rsi 24)
+    (emit-test-reg-reg buf 'rax 'rax)
+    (emit-jcc buf :ne nomajor)
+    (emit-load-gc-region buf 'rdx)
+    (emit-mov-reg-reg buf 'rax 'r13)
+    (emit-bytes buf #x48 #x2B #x42)                   ; sub rax, [rdx+to_start]
+    (emit-byte buf modus.mvm::+gc-off-to-start+)
+    (emit-shl-reg-imm buf 'rax 1)                     ; 2 x survivors
+    (emit-mov-reg-mem buf 'rdx 'rsi 64)               ; reserve
+    (emit-test-reg-reg buf 'rdx 'rdx)
+    (emit-jcc buf :ne have)
+    (emit-mov-reg-imm buf 'rdx #x400000)
+    (emit-label buf have)
+    (emit-cmp-reg-reg buf 'rax 'rdx)
+    (emit-jcc buf :ae big)
+    (emit-mov-reg-reg buf 'rax 'rdx)
+    (emit-label buf big)
+    (emit-mov-reg-mem buf 'rdx 'rsi 80)
+    (emit-sub-reg-reg buf 'rdx 'r12)                  ; room
+    (emit-cmp-reg-reg buf 'rdx 'rax)
+    (emit-jcc buf :ae nomajor)
+    (emit-mov-reg-imm buf 'rax 1)
+    (emit-mov-mem-reg buf 'rsi 'rax 24)
+    (emit-label buf nomajor)
+    (emit-label buf skip)))
+
+(defun emit-x64-tenure (buf)
+  "Region 0 with a TENURE REQUEST naming the from-space this collection
+   reclaims (RBX; a request computed before some other collection flipped the
+   semispaces is stale, and GC-TENURE retries): the survivors [to_start, R13)
+   become the old space, and region 0 continues on the requested young pair,
+   cut from the semispace just reclaimed (its bitmaps already cleared).  Sets
+   what the swap reads: to_start := young from, RBX := young to, R13 := young
+   from, and the SIZE field, which no swap ever writes."
+  (let ((no (make-label)))
+    (%gen-unless-region-0 buf 'rax no)
+    (%gen-load-shr1 buf 'rdi +x64-gen-tenure-req+)
+    (emit-cmp-reg-reg buf 'rdi 'rbx)
+    (emit-jcc buf :ne no)
+    (%gen-load-shr1 buf 'rsi (+ +x64-gen-tenure-req+ 8))   ; young to
+    (%gen-load-shr1 buf 'rdx (+ +x64-gen-tenure-req+ 16))  ; young size
+    (emit-mov-abs-imm32 buf +x64-gen-tenure-req+ 0)
+    (emit-mov-mem-reg buf 'rax 'rdx modus.mvm::+gc-off-space-size+)
+    (emit-mov-reg-mem buf 'r8 'rax modus.mvm::+gc-off-to-start+)
+    (%gen-store-shl1 buf +x64-gen-old-lo-addr+ 'r8 'r9)
+    (%gen-store-shl1 buf +x64-gen-old-hi-addr+ 'r13 'r9)
+    (emit-mov-mem-reg buf 'rax 'rdi modus.mvm::+gc-off-to-start+)
+    (emit-mov-reg-reg buf 'rbx 'rsi)
+    (emit-mov-reg-reg buf 'r13 'rdi)
+    (emit-label buf no)))
+
+(defun emit-x64-major-step (buf reenter)
+  "End of a region-0 collection: advance the major state (translate-aarch64's
+   table).  Phase 1 done -> phase 2 from REENTER: from = the old area, to = the
+   whole young semispace.  Phase 2 done -> re-tenure (2) or un-tenure (5)."
+  (let ((skip (make-label)) (retry (make-label)) (ph2 (make-label))
+        (fin (make-label)) (finun (make-label)) (ylo (make-label))
+        (fits (make-label)))
+    (%gen-unless-region-0 buf 'rax skip)
+    (%gen-meta buf 'rsi skip)
+    (emit-mov-reg-mem buf 'rdx 'rsi 24)
+    (dolist (c (list (cons 3 retry) (cons 6 retry) (cons 7 ph2) (cons 10 ph2)
+                     (cons 2 fin) (cons 5 finun)))
+      (emit-cmp-reg-imm buf 'rdx (car c))
+      (emit-jcc buf :e (cdr c)))
+    (emit-jmp buf skip)
+    (emit-label buf retry)
+    (emit-sub-reg-imm buf 'rdx 2)
+    (emit-mov-mem-reg buf 'rsi 'rdx 24)
+    (emit-jmp buf skip)
+    ;; ---- phase 2, if the whole old space fits both young halves ----
+    (emit-label buf ph2)
+    (%gen-load-shr1 buf 'rdi +x64-gen-old-hi-addr+)
+    (emit-mov-reg-abs buf 'r9 +x64-gen-area-addr+)
+    (emit-sub-reg-reg buf 'rdi 'r9)                   ; old bytes
+    (emit-mov-reg-mem buf 'r8 'rax modus.mvm::+gc-off-to-start+)
+    (emit-cmp-reg-reg buf 'rbx 'r8)
+    (emit-jcc buf :ae ylo)
+    (emit-mov-reg-reg buf 'r8 'rbx)
+    (emit-label buf ylo)                              ; r8 = Ylo
+    (emit-mov-reg-mem buf 'r9 'rax modus.mvm::+gc-off-space-size+)
+    (emit-shl-reg-imm buf 'r9 1)
+    (emit-add-reg-reg buf 'r9 'r8)
+    (%gen-clip-ceiling buf 'r9 'r8 'rsi 'r10)
+    (emit-sub-reg-reg buf 'r9 'r8)                    ; room
+    (emit-cmp-reg-reg buf 'rdi 'r9)
+    (emit-jcc buf :be fits)
+    (emit-mov-reg-imm buf 'rdx 0)                     ; refused: one more failure
+    (emit-mov-mem-reg buf 'rsi 'rdx 24)
+    (emit-bytes buf #x48 #xFF #x46 #x20)              ; inc qword [rsi+32]
+    (emit-jmp buf skip)
+    (emit-label buf fits)
+    (emit-sub-reg-imm buf 'rdx 5)
+    (emit-mov-mem-reg buf 'rsi 'rdx 24)
+    (emit-mov-reg-abs buf 'rbx +x64-gen-area-addr+)  ; from = the old area
+    (emit-mov-reg-mem buf 'rcx 'rsi 8)
+    (emit-add-reg-reg buf 'rcx 'rbx)                  ; from_end
+    (emit-mov-mem-reg buf 'rax 'rbx modus.mvm::+gc-off-from-start+)
+    (emit-mov-mem-reg buf 'rax 'r8 modus.mvm::+gc-off-to-start+)
+    (emit-mov-reg-reg buf 'r13 'r8)
+    (emit-mov-abs-imm32 buf +x64-gen-cards-addr+ 0)   ; cards off
+    (emit-mov-abs-imm32 buf +x64-gen-old-hi-addr+ 0)  ; no old walk
+    (emit-bytes buf #x4D #x31 #xE4)                   ; xor r12, r12
+    (emit-bytes buf #x4D #x31 #xF6)                   ; xor r14, r14
+    (emit-jmp buf reenter)
+    ;; ---- phase 2 done, MAJOR: [to_start, R13) is the new old space ----
+    (emit-label buf fin)
+    (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-space-size+)
+    (emit-shl-reg-imm buf 'rdx 1)                     ; new area size
+    (emit-mov-reg-mem buf 'rdi 'rsi 8)
+    (emit-shr-reg-imm buf 'rdi 13)
+    (emit-shl-reg-imm buf 'rdi 12)                    ; new young half
+    (emit-mov-mem-reg buf 'rsi 'rdx 8)
+    (emit-mov-mem-reg buf 'rsi 'rbx 16)               ; mark: nothing young
+    (emit-mov-reg-imm buf 'rcx 0)
+    (emit-mov-mem-reg buf 'rsi 'rcx 24)
+    (emit-bytes buf #x48 #xFF #x46 #x28)              ; inc qword [rsi+40]: majors
+    (emit-lea buf 'r8 'rsi 128)                       ; card bytes
+    (emit-mov-reg-mem buf 'r9 'rsi 0)
+    (emit-add-reg-reg buf 'r9 'r8)                    ; crossing
+    (emit-mov-reg-mem buf 'r10 'rax modus.mvm::+gc-off-to-start+) ; the new area
+    (emit-mov-abs-reg buf +x64-gen-area-addr+ 'r10)
+    (emit-mov-reg-reg buf 'rcx 'rdx)
+    (emit-shr-reg-imm buf 'rcx 9)
+    (emit-mov-abs-reg buf +x64-gen-ncards-addr+ 'rcx)
+    (emit-mov-abs-reg buf +x64-gen-crossing-addr+ 'r9)
+    (%gen-store-shl1 buf +x64-gen-old-lo-addr+ 'r10 'rcx)
+    (%gen-store-shl1 buf +x64-gen-old-hi-addr+ 'r13 'rcx)
+    (emit-push buf 'rax)
+    (emit-push buf 'rdi)
+    (emit-mov-reg-reg buf 'rdi 'r10)
+    (emit-mov-reg-reg buf 'r11 'r13)
+    (emit-x64-crossing-fill buf nil)
+    (emit-pop buf 'rdi)
+    (emit-pop buf 'rax)
+    (emit-mov-abs-reg buf +x64-gen-cards-addr+ 'r8)   ; cards on
+    (emit-mov-mem-reg buf 'rax 'rbx modus.mvm::+gc-off-to-start+) ; young from
+    (emit-mov-reg-reg buf 'r13 'rbx)
+    (emit-add-reg-reg buf 'rbx 'rdi)                  ; young to
+    (emit-mov-mem-reg buf 'rax 'rdi modus.mvm::+gc-off-space-size+)
+    (emit-jmp buf skip)
+    ;; ---- phase 2 done, UN-TENURE: one ordinary semispace pair ----
+    (emit-label buf finun)
+    (emit-mov-reg-imm buf 'rdx 0)
+    (emit-mov-mem-reg buf 'rsi 'rdx 24)
+    (emit-mov-abs-imm32 buf +x64-gen-old-lo-addr+ 0)
+    (emit-mov-abs-imm32 buf +x64-gen-old-hi-addr+ 0)
+    (emit-mov-abs-imm32 buf +x64-gen-cards-addr+ 0)
+    (emit-mov-abs-imm32 buf +x64-gen-card-root+ 0)
+    (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-space-size+)
+    (emit-shl-reg-imm buf 'rdx 1)
+    (emit-mov-mem-reg buf 'rax 'rdx modus.mvm::+gc-off-space-size+)
+    (emit-label buf skip)))
+
 (defun emit-gc-trampoline (buf gc-trampoline-label gc-collect-label)
   "Emit a complete Cheney copying GC in native x64 assembly.
 
@@ -8321,7 +9233,8 @@
         (scan-word-label (make-label))  ; scan_word(RAX=addr of word) -> update word, R13
         (restore-label (make-label))
         (park-label (make-label))       ; stop-the-world: park this thread
-        (verify-label (make-label)))    ; stop-the-world diagnostic
+        (verify-label (make-label))     ; stop-the-world diagnostic
+        (reenter (make-label)))         ; generational: a major's phase 2
 
     (emit-label buf gc-trampoline-label)
     (unless *x64-linux-mode*
@@ -8385,6 +9298,14 @@
     ;; share this one load of the region base; scan_word pushes/pops RDX, so it
     ;; survives the whole scan exactly as before.
     (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+)
+    ;; GENERATIONAL: R12/R14 for this collection, and the point a major's phase
+    ;; 2 runs the collection again from, with new geometry (RBX/RCX/R13 and the
+    ;; block's to_start set by EMIT-X64-MAJOR-STEP).
+    (when (x64-gen-gc-p)
+      (emit-x64-promo-setup buf)
+      (emit-label buf reenter)
+      (emit-load-gc-region buf 'rax)
+      (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+))
     (emit-x64-stw-own-window-top buf)
 
     (emit-gc-dbg-char buf #x70)          ; 'p' — pushed regs + metadata loaded, about to scan stack
@@ -8458,6 +9379,10 @@
     ;; symbols THROUGH this word.  0 until the first such load allocates it.
     (emit-mov-reg-imm buf 'rax #x10000FB0)
     (emit-call buf scan-word-label)
+    ;; GENERATIONAL: the card vector (tagged; a major moves it).
+    (when (x64-gen-gc-p)
+      (emit-mov-reg-imm buf 'rax +x64-gen-card-root+)
+      (emit-call buf scan-word-label))
     ;; Globals alist at 0x10000080
     (emit-mov-reg-imm buf 'rax #x10000080)
     (emit-call buf scan-word-label)
@@ -8546,6 +9471,8 @@
     ;; that can point into region 0 — before the scan, which walks whatever
     ;; they forward.
     (emit-x64-stw-extra-roots buf scan-word-label)
+    ;; GENERATIONAL: the old space's dirty cards (or all of it) are roots.
+    (emit-x64-old-space-walk buf scan-word-label)
     (emit-gc-dbg-char buf #x72)          ; 'r' — roots scan done (globals+kw+pkg+mv+dynbind)
 
     ;; ---- Cheney scan loop ----
@@ -8554,7 +9481,17 @@
     (emit-load-gc-region buf 'rax)
     (emit-mov-reg-mem buf 'r10 'rax modus.mvm::+gc-off-to-start+)   ; r10 = to_start
 
-    (emit-x64-flat-walk buf scan-word-label 'r13)
+    (if (x64-gen-gc-p)
+        (progn
+          ;; to-space AND this collection's promotions; then, before the swap,
+          ;; the bitmap clears and the generational bookkeeping, which may
+          ;; change what the swap installs (or run phase 2 from REENTER).
+          (emit-x64-gen-cheney buf scan-word-label)
+          (emit-x64-gen-bitmap-clear buf)
+          (emit-x64-promo-finish buf)
+          (emit-x64-tenure buf)
+          (emit-x64-major-step buf reenter))
+        (emit-x64-flat-walk buf scan-word-label 'r13))
     (emit-gc-dbg-char buf #x63)          ; 'c' — cheney scan done
 
     ;; ---- Swap THIS REGION's semispaces ----
@@ -8636,7 +9573,7 @@
     ;;   dest  = bitmap_base + (rbx - page_base) >> 7
     ;;   count = space_size >> 7  bytes   (1 bit / 16-byte granule, /8 = /128)
     ;; RAX/RCX/RDI were all pushed at trampoline entry and are restored below.
-    (when (mcgc-collector-on-p)
+    (when (and (mcgc-collector-on-p) (not (x64-gen-gc-p)))   ; gen: cleared before the swap
       (emit-bytes buf #xFC)                          ; cld (forward STOS)
       (emit-mov-reg-reg buf 'rax 'rbx)               ; rax = old from_start
       (emit-bytes buf #x48 #x2B #x04 #x25)           ; sub rax, [page_base]
@@ -8656,7 +9593,7 @@
     ;; (kind=cons mismatch) → dangling.  Separately gated (Linux-x64 only)
     ;; from the start-bitmap clear above.  dest = bitmap_base + kind_delta +
     ;; (rbx-page_base)>>7.
-    (when (mcgc-kind-bitmap-on-p)
+    (when (and (mcgc-kind-bitmap-on-p) (not (x64-gen-gc-p)))
       (emit-bytes buf #xFC)                          ; cld
       (emit-mov-reg-reg buf 'rax 'rbx)               ; rax = old from_start
       (emit-bytes buf #x48 #x2B #x04 #x25)           ; sub rax, [page_base]
@@ -8787,6 +9724,9 @@
     ;; Preserves: RBX, RCX, RDI, R10, RBP
     ;; Clobbers: RAX, RSI, RDX, R8
     ;; ===========================================================
+    (if (x64-gen-gc-p)
+        (emit-x64-gen-copy-object buf copy-label)
+      (progn
     (emit-label buf copy-label)
     (let ((copy-cons (make-label))
           (copy-obj (make-label))
@@ -8988,7 +9928,7 @@
       (emit-mov-reg-reg buf 'rax 'rdx)            ; rax = original tagged ptr
       (emit-label buf copy-done)
       ;; RAX = new tagged pointer
-      (emit-ret buf))
+      (emit-ret buf))))
 
     ;; ---- Restore label ----
     (emit-label buf restore-label)
@@ -10207,6 +11147,8 @@
          (yield-longjmp-lbl (unless *x64-linux-mode* (make-label)))
          (park-lbl (when (x64-stw-p) (make-label)))
          (ssg-lbl (when (x64-ssg-p) (make-label)))
+         (card-lbl (when (x64-gen-gc-p) (make-label)))
+         (card-range-lbl (when (x64-gen-gc-p) (make-label)))
          ;; Find %GC-COLLECT function in the table (if present)
          (gc-collect-entry (when *x64-gc-enabled*
                              (find "%GC-COLLECT" function-table
@@ -10267,7 +11209,9 @@
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl
                               :park-label park-lbl
-                              :ssg-label ssg-lbl)))
+                              :ssg-label ssg-lbl
+                              :card-label card-lbl
+                              :card-range-label card-range-lbl)))
                  ;; Align THIS function's entry.  The tail alignment below only
                  ;; aligns SUBSEQUENT functions; without a head alignment the
                  ;; FIRST emitted function starts at whatever code-position the
@@ -10411,7 +11355,10 @@
       (when park-lbl
         (emit-park-stub buf park-lbl))
       (when ssg-lbl
-        (emit-shared-store-guard-sub buf ssg-lbl)))
+        (emit-shared-store-guard-sub buf ssg-lbl))
+      (when card-lbl
+        (emit-x64-card-mark-sub buf card-lbl)
+        (emit-x64-card-range-sub buf card-range-lbl)))
 
     ;; Resolve all label fixups
     (fixup-labels buf)

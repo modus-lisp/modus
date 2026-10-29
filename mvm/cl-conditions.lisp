@@ -2939,6 +2939,18 @@
   (export (intern "JIT-SOURCE" (find-package "MODUS")) (find-package "MODUS"))
   (export (intern "MAKE-STATIC-VECTOR" (find-package "MODUS")) (find-package "MODUS"))
   (export (intern "FREE-STATIC-VECTOR" (find-package "MODUS")) (find-package "MODUS"))
+  ;; The BUILD packages, so a baked symbol has a real home (builder packages
+  ;; step 4): compile-quote records each symbol's host home package by name
+  ;; hash, and %INTERN-SYMBOL-PKG used to find no such package here and file
+  ;; it as CL-USER's.  MODUS-INT is the internal package (SB-INT's role; its
+  ;; build-time nickname MODUS.MVM is the name image source still writes).
+  ;; Created at boot, before any eval, so none is runtime-born: function and
+  ;; variable keys of their symbols stay BARE, as the boot tables are.
+  (make-package "MODUS-INT" :nicknames (list "MODUS.MVM") :use (list "CL"))
+  (make-package "MODUS.ASM" :use (list "CL"))
+  (make-package "MODUS.RUNTIME" :use (list "CL"))
+  (make-package "MODUS.MVM.X64" :use (list "CL" "MODUS-INT" "MODUS.ASM"))
+  (make-package "MODUS.MVM.I386" :use (list "CL" "MODUS-INT"))
   (setq *package* (find-package "CL-USER"))
   ;; The runtime DEFPACKAGE macro.  It used to be installed only as a side
   ;; effect of SET-UP-PACKAGES (which also makes test packages A/B/Q), and

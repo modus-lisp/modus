@@ -30,7 +30,7 @@ Verified under TCG:
 | NIC | E1000 found at BAR0 FEBC0000, MAC read, RX/TX rings programmed |
 | DHCP TX | DISCOVER on the wire; slirp answers with an OFFER 100 µs later (pcap) |
 | DHCP RX | OFFER lands in RX descriptor 0, RDH advances to 1 |
-| DHCP parse | `(dhcp-client)` from the REPL, with the offer queued, gets 10.0.2.15 |
+| DHCP parse | `(modus-int::dhcp-client)` from the REPL, with the offer queued, gets 10.0.2.15 |
 | Pipeline | **`(run-net-pipeline)` gets `IP=10.0.2.15` / `GW=10.0.2.2`** (fixed 2026-09-03) |
 
 ## DHCP: SOLVED (2026-09-03)
@@ -163,15 +163,15 @@ Useful REPL probes (all worked in the runs above):
 
 ```lisp
 (run-net-pipeline)                                   ; the whole thing, prints DHCP:D / DHCP:F
-(list :rdh (e1000-read-reg #x2810) :rdt (e1000-read-reg #x2818)
-      :status (e1000-read-reg 8) :rctl (e1000-read-reg #x100))
-(e1000-receive)                                       ; length of the next RX packet, 0 if none
-(let ((h0 (e1000-read-reg #x2810)) (n -1))            ; iterations until a reply lands
-  (dhcp-discover)
+(list :rdh (modus-int::e1000-read-reg #x2810) :rdt (modus-int::e1000-read-reg #x2818)
+      :status (modus-int::e1000-read-reg 8) :rctl (modus-int::e1000-read-reg #x100))
+(modus-int::e1000-receive)                                       ; length of the next RX packet, 0 if none
+(let ((h0 (modus-int::e1000-read-reg #x2810)) (n -1))            ; iterations until a reply lands
+  (modus-int::dhcp-discover)
   (dotimes (i 20000)
-    (when (and (< n 0) (not (eq (e1000-read-reg #x2810) h0))) (setq n i)))
+    (when (and (< n 0) (not (eq (modus-int::e1000-read-reg #x2810) h0))) (setq n i)))
   n)
-(dhcp-client)                                         ; the baked client; works once an offer is queued
+(modus-int::dhcp-client)                                         ; the baked client; works once an offer is queued
 ```
 
 Note `mem-ref :u64` results print halved at the REPL (raw bits shown as a

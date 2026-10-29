@@ -101,17 +101,6 @@
    CL-USER::%FORMAT-IMPL -- gets its own key, \"PKG::NAME\", so defining it
    cannot replace the kernel's function (builder packages step 4, phase B).")
 
-(defvar *kernel-name-fallbacks* nil
-  "Census: names read through a non-kernel symbol that had no function of its
-   own and resolved to the kernel's (the transitional read fallback).  EQUAL
-   hash name -> count.  Drive to zero, then the fallback goes.")
-
-(defvar *kernel-name-fallback-p* nil
-  "T turns the transitional read fallback back on: a non-kernel symbol named
-   like a kernel function with no function of its own then reads the kernel's
-   (counted in *KERNEL-NAME-FALLBACKS*).  NIL, the default since 2026-10-29,
-   is CL: that symbol is simply undefined.")
-
 (defun %snapshot-kernel-fn-names ()
   (let ((h (make-hash-table :test (function equal))))
     (when *symbol-function-table*
@@ -139,19 +128,6 @@
     (and pn *kernel-fn-names* (gethash nm *kernel-fn-names*)
          (not (%kernel-home-pkg-name-p pn))
          (concatenate 'string pn "::" nm))))
-
-(defun %kernel-shadow-fallback (name)
-  "The transitional READ fallback: NAME is a shadow key \"PKG::NM\" with no
-   function of its own; answer NM, the kernel function's key, and count it."
-  (let ((p (and *kernel-name-fallback-p* (search "::" name))))
-    (when p
-      (let ((nm (subseq name (+ p 2))))
-        (when (and *kernel-fn-names* (gethash nm *kernel-fn-names*))
-          (when (null *kernel-name-fallbacks*)
-            (setq *kernel-name-fallbacks* (make-hash-table :test (function equal))))
-          (puthash nm *kernel-name-fallbacks*
-                   (+ 1 (or (gethash nm *kernel-name-fallbacks*) 0)))
-          nm)))))
 
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:
@@ -255,9 +231,7 @@
                         *symbol-function-table*
                         (%fn-entry (gethash name *symbol-function-table*)))
                    (and *native-sym-function-table*
-                        (%fn-entry (gethash hash *native-sym-function-table*)))
-                   (let ((b (and *symbol-function-table* (%kernel-shadow-fallback name))))
-                     (and b (%fn-entry (gethash b *symbol-function-table*)))))))
+                        (%fn-entry (gethash hash *native-sym-function-table*))))))
       (cond
         (fn fn)
         ;; CLHS SYMBOL-FUNCTION: a macro or special operator name is fbound,
@@ -356,8 +330,6 @@
               (%fn-entry (gethash name *symbol-function-table*))) t)
         ((and *native-sym-function-table*
               (%fn-entry (gethash hash *native-sym-function-table*))) t)
-        ((let ((b (and *symbol-function-table* (%kernel-shadow-fallback name))))
-           (and b (%fn-entry (gethash b *symbol-function-table*)))) t)
         ;; CLHS: fboundp is also true when SYM names a macro (DEFUN, WHEN,
         ;; COND, …) or a special operator (IF, SETQ, …) — not only an
         ;; ordinary function.  Without this, (fboundp 'defun) was NIL.

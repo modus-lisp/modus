@@ -30,7 +30,7 @@ def raw(t,settle):
 rd_until(r"never",2.0)
 ev("(progn (in-package :cl-user) (package-name *package*))")
 ev("(setq *jit-hot-only* nil)")
-ev("(list :armclk (hdmi-arm-clock-max))",30.0)
+ev("(list :armclk (modus-int::hdmi-arm-clock-max))",30.0)
 ev("(init)",180.0)
 ev("(list :eager (jit-eager))",900.0)   # re-link the restored core (the working session always ran it)   # HDMI framebuffer: play-ivf draws; without it a restored core faults silently on the first pass
 ev("(list :base (reel-demo-pass 1))",120.0)

@@ -314,11 +314,9 @@ Three things that are easy to get wrong:
   `modus-int::fe-sq`, which reaches its kernel callers as before.  A CL symbol
   (`(setf (fdefinition 'close) …)`) is the kernel's own and still redirects.
   Calling an internal from CL-USER takes the prefix: `(modus-int::%gc-read64 …)`;
-  a bare `(%gc-read64 …)` there is an UNDEFINED-FUNCTION, as in CL.  The
-  transitional fallback that made it read the kernel's function is OFF since
-  every test says `modus-int::`; `(setq modus-int::*kernel-name-fallback-p* t)`
-  turns it back on and `*kernel-name-fallbacks*` counts its hits.
-  `test/kernel-shadow.lisp`.
+  a bare `(%gc-read64 …)` there is an UNDEFINED-FUNCTION, as in CL.  (Phase B's
+  transitional fallback, which made it read the kernel's function, is deleted;
+  tests, scripts and docs say `modus-int::`.)  `test/kernel-shadow.lisp`.
 
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 
@@ -703,7 +701,7 @@ names the tag (`mini-lisp-final`) that still holds them.
 ### QEMU RPi 3B / real Pi boards (DWC2 USB host, CDC Ethernet)
 ```bash
 ./scripts/run.sh rpi-cl-repl "(+ 1 2)"                 # serial REPL (build-rpi-cl-repl.lisp)
-./scripts/run.sh rpi-cl-repl "(progn (led-init) (led-on))"   # GPIO: net/bcm2835-gpio.lisp
+./scripts/run.sh rpi-cl-repl "(progn (modus-int::led-init) (modus-int::led-on))"   # GPIO: net/bcm2835-gpio.lisp
 # The board image (U-Boot chainload, USB NIC, HDMI + USB keyboard console, SSH):
 MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1 \
   sbcl --dynamic-space-size 12288 --script mvm/build-rpi-cl-repl.lisp
@@ -1356,7 +1354,7 @@ collector can be booted here.  With that, stages 1, 2 AND 3 all RUN on the
 region-aware **aarch64 native collector** under `qemu-system-aarch64 -M raspi3b`,
 including the brand-new parked-window branch (chain A, rooted only from the
 parked window, survives; chain B, rooted only from the live stack, does not).
-`(%gc-forced-stress 2000 5)` there is `(1 6 2000 1999000 0 5)`.
+`(modus-int::%gc-forced-stress 2000 5)` there is `(1 6 2000 1999000 0 5)`.
 
 **`net/cooperative-atomics.lisp` was reconciled, not silently invalidated.**  Its
 three checked facts all still hold and for the same reasons — stage 3 added no
@@ -1582,8 +1580,8 @@ arm is driven on the one bootable target that can:
 `MODUS_RPI_GC_SHIM=1 sbcl --script mvm/build-rpi-cl-repl.lisp` turns the native
 aarch64 collector off so every gc-check lands in the shim, which CALLs
 `%GC-COLLECT`.  Under `qemu-system-aarch64 -M raspi3b`:
-`(%gc-forced-stress 2000 5)` → `(1 6 2000 1999000 0 5)` (the value documented
-for that image on its *native* arm) and `(%gc-forced-stress 500 3)` →
+`(modus-int::%gc-forced-stress 2000 5)` → `(1 6 2000 1999000 0 5)` (the value documented
+for that image on its *native* arm) and `(modus-int::%gc-forced-stress 500 3)` →
 `(6 9 500 124750 0 3)`; violations 0.  Default OFF — the shipping image is
 byte-identical.  The per-CPU **addressing** is separately exercised on the
 threaded target: thread 1 gets scratch entry 0, thread 2 entry 1, +32 bytes.
@@ -1773,9 +1771,9 @@ Localised by varying only `*gcevery*` from the script, which needs no rebuild:
 
 | arm | forced collections | result |
 |---|---|---|
-| `(%tl-selftest 0 300 100000)` | none — `since` never reaches the threshold | **60 of 60 clean** |
-| `(%tl-selftest 0 300 25)` | 12 per thread (the shipping test) | **54 of 60** |
-| `(%tl-selftest 0 50 25)` | 2 per thread | 25 of 25 clean |
+| `(modus-int::%tl-selftest 0 300 100000)` | none — `since` never reaches the threshold | **60 of 60 clean** |
+| `(modus-int::%tl-selftest 0 300 25)` | 12 per thread (the shipping test) | **54 of 60** |
+| `(modus-int::%tl-selftest 0 50 25)` | 2 per thread | 25 of 25 clean |
 
 Remove the collections and the failure disappears entirely.  The fault itself is
 a **corrupted control transfer on the MAIN thread**: with a temporary dump wired
@@ -1788,7 +1786,7 @@ return address or handler frame that is no longer valid.  `RAX` reads
 the thread had just come back from a timed-out futex park.
 
 **Serializing the collections does NOT fix it**, and that is the useful negative:
-with `(%ha-set-collect-serialized 1)` — the flag that exists in-tree for exactly
+with `(modus-int::%ha-set-collect-serialized 1)` — the flag that exists in-tree for exactly
 this bisect — the rate is unchanged at **54 of 60**.  So this is not two
 collectors overlapping with each other; it is what a collection does with
 respect to the OTHER thread's Lisp work.  The standing suspects are the two
@@ -3354,7 +3352,7 @@ units, over `(sleep 1)` 30 units.
 field is stored raw there and `mem-ref :u64` halves it, so a count of 1 reads
 back as a value whose bit pattern is a CONS tag and prints as garbage.  That
 looked exactly like heap corruption after a forced collection and cost a
-detour.  Read it with `%GC-META-READ`, or `(%gc-read64 (+ (%gc-region) #x20))`.
+detour.  Read it with `%GC-META-READ`, or `(modus-int::%gc-read64 (+ (modus-int::%gc-region) #x20))`.
 This is already written down under "Two traps this cost time on"; it is written
 down again here because it was still walked into.
 
@@ -3473,7 +3471,7 @@ are idempotent `DEFUN`s and the load completes correctly) and pre-existing — i
 is the same shape as the documented "`%GC-COLLECT-HERE` at an interpreted
 `--script` toplevel breaks the next `(format t …)`" — but the carve is now a
 place that *reaches* it, so it is on the critical path and it was not before.
-`(%gc-count)` read from an interpreted toplevel after such a collection also
+`(modus-int::%gc-count)` read from an interpreted toplevel after such a collection also
 misbehaves.  Both are the same unfixed defect and both are one level below this
 one.
 

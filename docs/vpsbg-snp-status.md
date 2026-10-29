@@ -27,7 +27,7 @@ OpenSSH recorded in the handshake == the key the server printed;
 `report_data` == SHA-512 of it; measurement
 `f29c4eb4...c13205` == `sev-snp-measure` offline; VCEK signature valid and
 chained to ARK-Milan.  The whole report comes back in ONE exec reply.  On that
-boot `(snp-active-p)` = T and `(%hw-random32)` returns RDRAND values.  Evidence
+boot `(modus-int::snp-active-p)` = T and `(modus-int::%hw-random32)` returns RDRAND values.  Evidence
 in `tmp/vpsbg/2026-10-10/attested-ssh-*`.  What it took, after the first report:
 
 8. **TCP segmentation** (`net/ip.lisp`, `tcp-send-conn`): payloads are split
@@ -146,7 +146,7 @@ one-shot, evaluates FORMs over SSH, and returns to Ubuntu (`EVAL_TIMEOUT`,
 **Measured on the VPS, in order:** zero-page + core-p + net-state fixes:
 `pre-ssh` and `ssh-netup` REACHED, but idle afterwards, no TCP -> + no STI:
 `tcp/22 connects`, banner `SSH-2.0-Modus_1.0`, connection closed after
-`KEXINIT` -> + timed waits + RDTSC: `(+ 1 2) = 3`, `(snp-active-p) = T`,
+`KEXINIT` -> + timed waits + RDTSC: `(+ 1 2) = 3`, `(modus-int::snp-active-p) = T`,
 `(snp-secrets-gpa) = 114688`, report 1184 bytes, verified (disk boot, firmware
 digest `78dc3011...`, not reproducible: unknown Proxmox build) -> measured boot:
 verified with the matching digest above.
@@ -162,7 +162,7 @@ verified with the matching digest above.
   it, and the client checks it (section above).
 * The first `snp-attestation-report` on one boot took more than 60 s, on
   another 2 s.  Not investigated.
-* `(%snp-build-mode)` gives no reply when evaluated over SSH.
+* `(modus-int::%snp-build-mode)` gives no reply when evaluated over SSH.
 
 ## The box
 

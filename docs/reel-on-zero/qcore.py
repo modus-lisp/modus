@@ -29,7 +29,7 @@ s.sendall(b"(defun ramv (a n) (let ((v (make-array n :element-type (quote (unsig
 q("(progn (setq *rh-tarv* (ramv 436207616 163840)) (length *rh-tarv*))",300.0)
 q("(list (aref *rh-tarv* 0) (aref *rh-tarv* 1) (aref *rh-tarv* 2))")   # 114 101 101 = 'ree'
 print("=== install (TCG, minutes) ===",flush=True); t0=time.time()
-q("(install-tarball-from-bytes *rh-tarv*)",5400.0); print("  install %.0fs"%(time.time()-t0),flush=True)
+q("(modus-int::install-tarball-from-bytes *rh-tarv*)",5400.0); print("  install %.0fs"%(time.time()-t0),flush=True)
 q('(if (find-package "REEL") 1 0)'); q("(if (fboundp (quote reel::make-decoder)) 1 0)"); q("(if (fboundp (quote reel.decode::%edge-sub-h8)) 1 0)")
 push(S+"/demo-forms.txt"); push(S+"/hvs-all-forms.txt"); push(S+"/reel-hvs-forms.txt")
 q("(if (fboundp (quote reel-demo-pass)) 1 0)"); q("(if (fboundp (quote rh-play)) 1 0)")
@@ -37,9 +37,9 @@ q("(progn (setq *rh-ivf* (ramv 452984832 151295) *rh-len* 151295 *demo-ivf* *rh-
 q("(list (aref *rh-ivf* 0) (aref *rh-ivf* 1) (aref *rh-ivf* 2) (aref *rh-ivf* 3))")   # 68 75 73 70 = DKIF
 q("(setq *rh-tarv* nil)")
 print("=== jit-eager ===",flush=True); t0=time.time(); q("(setq *jit-hot-only* nil)"); q("(jit-eager)",3600.0); print("  jit-eager %.0fs"%(time.time()-t0),flush=True)
-q("(list *jit-native-defun-count* (%jit-fn-native-p \"DECODE-FRAME\") (%jit-fn-native-p \"MC-FILTER\"))")
+q("(list *jit-native-defun-count* (modus-int::%jit-fn-native-p \"DECODE-FRAME\") (modus-int::%jit-fn-native-p \"MC-FILTER\"))")
 print("=== save ===",flush=True)
-s.sendall(b'(%save-image "reel-lc.core")\r\n'); out=rd_until(r"CORE-END=\d+[^0-9]",1800.0)
+s.sendall(b'(modus-int::%save-image "reel-lc.core")\r\n'); out=rd_until(r"CORE-END=\d+[^0-9]",1800.0)
 m=re.search(r"CORE-END=(\d+)",out)
 if not m: print("NO CORE-END:",out[-300:]); sys.exit(1)
 end=int(m.group(1))

@@ -990,7 +990,7 @@ Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd hea
 Region 0 on aarch64 and on hosted x86-64 (`./modus`) can be split into an OLD
 space plus a young semispace pair.  **Off until something calls `(gc-tenure)`**:
 an image that never does behaves exactly as before, apart from the barrier's cost
-per heap store (aarch64: 2 instructions; x64: a call, see below).
+per heap store (aarch64: 2 instructions; x64: an inline mark, see below).
 
 - **`(gc-tenure)`** turns region 0's survivors into the old space
   (`#x10000CC0/CC8` = old_lo/old_hi, stored <<1).  The old space is SCANNED, never
@@ -1021,14 +1021,29 @@ per heap store (aarch64: 2 instructions; x64: a call, see below).
 - **The board tenures at boot** (kiln `kz-gen-gc-start`; card arg `GC=plain` skips it): a
   drag's GC pause went from 242 ms (4.9%) to 5-12 ms (0.0%).  Majors (~285 ms) are rare.
 - **x64 (`build-generic-cli`) is the same design, words and state machine**, in
-  `translate-x64.lisp` ("GENERATIONAL GC").  The barrier is a per-unit
-  `card_mark` subroutine called from each store site (`push rax; lea rax,[slot];
-  call; pop rax`) -- +7.4 MB native (+14%), +1-6% CPU on library loads, 1.8x on a
-  loop that only stores.  Collector registers for a region-0 collection: R12 = old
+  `translate-x64.lisp` ("GENERATIONAL GC").  The barrier is INLINE at each
+  store site: slot address, `sub`/`shr`/`cmp` against the area and the card
+  COUNT, `jae`, then the byte store.  **The card count is the switch** (0 = off),
+  so it must never be non-zero while the card base is 0: `%gc-cards-build` writes
+  it last, the collector zeroes it with the base.  The generated boot-table
+  fillers (`%INIT-SYM-NAME-AUTO-N`, `%INIT-SFT-AUTO-N`) get no barrier
+  (`x64-barrier-exempt-fn-p`; +9 MB otherwise).  Cost: +4.0 MB native (+8%),
+  +2-4% CPU on library loads, 1.2x on a loop that only stores (a call per site
+  was 1.8x and +7.4 MB).  Collector registers for a region-0 collection: R12 = old
   bump, R14 = survivor mark, meta+80 = promotion bound; the bitmap clears move
   BEFORE the swap (tenure and the major steps change what the swap installs).
   `MODUS_X64_GEN=0` builds without it: same code as before modulo relocation.
   The JIT co-init must agree (`*x64-gen-gc*`), or a JIT page's stores skip the cards.
+- **A slot naming a LOCK-ARENA object is young** (x64; aarch64 still OPEN).  A
+  threaded STW collection evacuates the arena only when the runtime lock is free,
+  so arena pointers can outlive a collection.  Three rules follow: the card scan
+  keeps such a card dirty; a major that did not evacuate leaves every card dirty,
+  not clean; and in a major's phase 2 a forward that lands in the from-space (a
+  phase-1 promotion) is chased.  Without them,
+  `gc-major-threads` showed young pointers on clean cards in 1 run in 4 when audited
+  after every major, and a TYPE-ERROR in 1 in 75.  The refresh after a park, safe
+  trap or blocking syscall compares region 0's collection COUNT (`fs:0x10005010`),
+  not R12's range: after two flips a stale R12 is back in from-space.
 - **i386, riscv, arm32: not ported.**  `gc-tenure` refuses loudly there.
 - **Tenure without cards (`:cards nil`) cannot be untenured**, so save-image after it
   errors: `gc-untenure` runs a major, which needs the card vector's meta.

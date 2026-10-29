@@ -266,12 +266,17 @@ as AArch64, so `mvm/gc.lisp` is shared unchanged; only `translate-x64.lisp` ("GE
 is new.  `*x64-gen-gc*` turns it on (build-generic-cli, and the JIT co-init in
 build-cli-common, which must agree); `MODUS_X64_GEN=0` builds the control.
 
-- **Barrier:** each unit (the image, each JIT page) gets a `card_mark` subroutine (RAX = slot,
-  preserves every register) and a range form for word `bulk-move`/`bulk-fill`.  A site is
-  `push rax; lea rax,[slot]; call; pop rax`, before the store.  Cost: +7.4 MB native (+14%);
-  1.8x on a loop that does nothing but store, cards on or off (the call is the cost, not the
-  mark); +1-6% user CPU loading cl-ppcre / babel / md5.  Inlining the "cards off" test at the
-  site would make an untenured image nearly free, at ~11 bytes a site.
+- **Barrier:** INLINE before every store: `push rax`, the slot address, `sub rax,[area]; shr
+  rax,9; cmp rax,[ncards]; jae skip; add rax,[cards]; mov byte [rax],0`, `pop rax` (31 bytes
+  of mark).  The card COUNT is the on/off switch -- 0 with no card table and under
+  `%gc-card-barrier-off` -- so `%gc-cards-build` writes it after the card base and the
+  collector zeroes it with the base.  Word `bulk-move`/`bulk-fill` call a range subroutine,
+  one per unit (the image, each JIT page).  The generated boot-table fillers
+  (`%INIT-SYM-NAME-AUTO-N`, `%INIT-SFT-AUTO-N`, run once before anything can tenure) are
+  exempt: their thousands of inlined table stores cost +9 MB with the barrier.
+- **Cost:** +4.0 MB native (+8%); 1.2x on a loop that does nothing but store, cards on or
+  off; +2-4% user CPU loading cl-ppcre / babel / md5.  The first cut CALLED a `card_mark`
+  subroutine per site: 1.8x and +7.4 MB.
 - **Collector:** R12 = the old area's bump, R14 = the survivor mark (all ones in a major's
   phase 1), meta+80 = the promotion bound (area end, clipped by the ceiling).  `copy_object`
   sizes first, then picks R12 or R13.  The old space is a root through a typed dirty-card scan
@@ -282,11 +287,40 @@ build-cli-common, which must agree); `MODUS_X64_GEN=0` builds the control.
   a global root.
 - **Results (hosted x64):** test/gc-tenure.lisp 21/21, a dirty-card minor 0.26-0.28 ms against
   5.4 ms walking the whole old space; `:walk` control SIGSEGV, `:barrier` control aborts.
-  test/gc-major-threads.lisp 5/5 (40 majors each, two interning threads).  18 GC/thread
+  test/gc-major-threads.lisp 600/600 after the lock-arena fixes below (40 majors each, two
+  interning threads; it had passed 5/5 and 225/225 while failing 1 run in 75).  18 GC/thread
   regression tests: same results as the control build.  22-library ladder: control, untenured,
   `:young` 32 MB (359 collections) and `:young` + a huge reserve all 20/22 clean, 104 probes,
   the same 8 failures.  The control build's code is base's modulo relocation: the one function
   that changed size is the translate-state constructor (two slots).
+- **Threads + majors: the lock arena.**  `test/gc-major-threads.lisp` failed about 1 run
+  in 75 (a TYPE-ERROR, or `*STOP*` no longer special) on the call barrier and the inline one
+  alike.  Auditing the cards after EVERY major (`*audit-each*`) raised that to 1 run in 4,
+  with every bad slot in a package table's value slots or a promoted cons, pointing at
+  young-from + ~14.4 MB.  That is the end of the old area as it was before the major, where
+  phase 1 promotes.  Minors with threads and majors without threads were 0 in 150 each.
+  The chain: a worker interns into the lock arena and stores the symbol into an old table,
+  and the card is marked.  A major runs while some thread holds the runtime lock, so it does
+  not evacuate the arena, and `fin` marked every card CLEAN, this one included.  The next
+  major does evacuate.  Phase 1 skips the clean card, but promotes the symbol through
+  another root, leaving a forward in the arena.  Phase 2's from-space is the old area, and
+  copy_object returned that forward, an old-area address, without copying it.  Phase 2 then
+  handed the old area to the young pair.  Three fixes, all in `translate-x64.lisp`:
+  - the card scan counts a slot pointing into the arena as young (keeps the card dirty);
+  - `fin` fills the cards DIRTY when an arena is live and was not evacuated;
+  - copy_object chases a forward that lands inside the current from-space, which happens
+    only in phase 2 (the chase alone took the audited run from 67/300 bad to 0/300).
+  With all three, 600/600 runs were clean (300 audited, 300 plain).  The same three apply to
+  aarch64's collector, which has the same shapes; it is NOT fixed there yet.
+- **The STW refresh counts collections.**  A thread that parks, enters a safe region, or
+  blocks in a syscall snapshots region 0's collection count (`fs:0x10005010`).  On the way
+  out, a different count reloads R12/R14 from region 0's block.  The old test was "R12
+  outside [from, from+size]", which a stale R12 passes again after two flips.  The safe
+  trap's leave path and the gc-safe syscall had no refresh at all: main's frontier was in
+  to-space right after its `(sleep 1)`.  The park subroutine no longer publishes R12 into
+  region 0's block, because a thread back from a syscall mid-collection would overwrite
+  the collector's new frontier.  This did not move the gc-major-threads rate (the arena
+  was the cause), but the stale frontier is wrong as written.
 - **Not done:** tenure with `:cards nil` cannot be untenured (gc-untenure is a major, which
   needs the card meta), on both back ends.
 

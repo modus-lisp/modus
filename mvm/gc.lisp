@@ -1860,9 +1860,10 @@
 (defun %gc-cards-build (vec area ncards area-size promote &optional (ceiling 0))
   "Point the card words at VEC (now in the old space): cards at its data,
    all DIRTY (the vector is zeroed), crossing after them, filled by one walk
-   of [old_lo, old_hi).  The card base is written LAST: it switches on both
-   the barrier and the collector's card scan, and every card being dirty
-   makes the first card-scanning collection as complete as a full walk."
+   of [old_lo, old_hi).  The card base switches on the collector's card scan
+   and the card COUNT the barrier, so the count is written after the base;
+   every card being dirty makes the first card-scanning collection as complete
+   as a full walk."
   (let* ((w (%gc-card-words))
          (meta (let ((scratch (%conv-addr #x10000C88)))   ; not w: a card base
                  (prog1 (+ (%gc-word-of vec scratch) 7)  ; of a tagged word would
@@ -1873,6 +1874,7 @@
          (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
          (a (%gc-old-lo)) (end (%gc-old-hi)))
     (%gc-write64 w 0)
+    (%gc-write64 (+ w 16) 0)
     (%gc-write64 meta ncards)
     (%gc-write64 (+ meta 8) area-size)
     (%gc-write64 (+ meta 16) 0)
@@ -1891,9 +1893,13 @@
           (setq c (+ c 1)))
         (setq a (+ a size))))
     (%gc-write64 (+ w 8) area)
-    (%gc-write64 (+ w 16) ncards)
     (%gc-write64 (+ w 24) cross)
     (%gc-write64 w data)
+    ;; NCARDS LAST: x64's inline barrier tests only the card count (0 = off)
+    ;; and then stores through the card base, so the count must never be
+    ;; non-zero while the base is 0.  Stores before this mark nothing, which is
+    ;; safe: every card starts dirty.
+    (%gc-write64 (+ w 16) ncards)
     ncards))
 
 (defun %gc-card-audit ()

@@ -133,6 +133,40 @@
   "FS-relative per-thread word: 0 running, 1 in a syscall, 2 parked.")
 (defconstant +stw-rsp-addr+ #x10005008
   "FS-relative per-thread word: the RSP a parked / in-syscall thread published.")
+(defconstant +stw-r0-count-addr+ #x10005010
+  "FS-relative per-thread word: region 0's collection count (its block's
+   +GC-OFF-COUNT+) when this thread last STOPPED -- parked, went safe, or
+   entered a blocking syscall.  On the way out a different count means another
+   thread collected region 0 meanwhile, and a thread allocating in region 0
+   must take the new frontier (EMIT-X64-STW-REFRESH).  A count and not an
+   address test: after an EVEN number of flips a stale R12 is back inside the
+   from-space and looks current.")
+
+(defun emit-fs-store-reg (buf addr reg)
+  "mov fs:[ADDR], REG"
+  (emit-byte buf #x64)
+  (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+  (emit-byte buf #x89)
+  (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+  (emit-byte buf #x25)
+  (emit-abs32 buf addr))
+
+(defun emit-fs-cmp-reg (buf reg addr)
+  "cmp REG, fs:[ADDR]"
+  (emit-byte buf #x64)
+  (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
+  (emit-byte buf #x3B)
+  (emit-byte buf (logior #x04 (ash (logand (reg-code reg) 7) 3)))
+  (emit-byte buf #x25)
+  (emit-abs32 buf addr))
+
+(defun emit-x64-r0-count-snapshot (buf scratch)
+  "fs:[r0 count] := region 0's collection count.  Taken while this thread is
+   still RUNNING, before it publishes that it has stopped: a region-0
+   collection cannot begin before then, so none can be missed."
+  (emit-mov-reg-abs buf scratch (+ modus.mvm::+gc-region-0-base+ modus.mvm::+gc-off-count+))
+  (emit-fs-store-reg buf +stw-r0-count-addr+ scratch))
+
 (defconstant +stw-clone-tls-addr+ #x10005020
   "ABSOLUTE global word: the FS base the next cloned thread is born with (the
    spawner writes it under the spawn lock), 0 = none.")
@@ -355,8 +389,10 @@
 ;;; into a heap object (SETCAR, SETCDR, OBJ-SET, ASET, word BULK-MOVE/FILL)
 ;;; marks the card of the slot it writes, BEFORE the store: nothing between
 ;;; the mark and the store allocates, so no collection can see one without
-;;; the other.  Off (no old space, or no card table) a site costs the call and
-;;; one compare.
+;;; the other.  The mark is INLINE (EMIT-X64-CARD-MARK-INLINE): push rax, the
+;;; slot address, sub/shr/cmp/jae against the area and the card COUNT, and the
+;;; byte store only when the slot is in the area.  Off (no card table) the
+;;; count is 0 and the jae skips.  Word bulk-move/fill call a range subroutine.
 
 (defvar *x64-gen-gc* nil
   "Generational GC on x64: the card barrier at every heap store and the
@@ -387,26 +423,28 @@
   (emit-byte buf #x25)
   (emit-u32 buf addr))
 
-(defun emit-x64-card-mark-sub (buf label)
-  "MARK: RAX = the raw address of the slot about to be stored.  Preserves
-   every register (flags excepted)."
-  (let ((out (make-label)) (skip (make-label)))
-    (emit-label buf label)
-    (emit-push buf 'rcx)
-    (%gen-abs-op buf #x8B 'rcx +x64-gen-cards-addr+)
-    (emit-test-reg-reg buf 'rcx 'rcx)
-    (emit-jcc buf :e out)
-    (emit-push buf 'rax)
-    (%gen-abs-op buf #x2B 'rax +x64-gen-area-addr+)
-    (emit-shr-reg-imm buf 'rax 9)
-    (%gen-abs-op buf #x3B 'rax +x64-gen-ncards-addr+)
-    (emit-jcc buf :ae skip)                          ; unsigned: also below the area
-    (emit-bytes buf #xC6 #x04 #x01 #x00)             ; mov byte [rcx+rax], 0
-    (emit-label buf skip)
-    (emit-pop buf 'rax)
-    (emit-label buf out)
-    (emit-pop buf 'rcx)
-    (emit-ret buf)))
+(defun x64-barrier-exempt-fn-p (name)
+  "The generated BOOT-TABLE fillers (build-cli-common's %INIT-SYM-NAME-AUTO-N and
+   %INIT-SFT-AUTO-N): thousands of inlined table stores each, run once at boot,
+   before anything can tenure -- and a tenure starts with every card dirty.  A
+   barrier there marks nothing and cost +9 MB of native code inline."
+  (and (stringp name)
+       (or (and (>= (length name) 19) (string-equal name "%INIT-SYM-NAME-AUTO" :end1 19))
+           (and (>= (length name) 14) (string-equal name "%INIT-SFT-AUTO" :end1 14)))))
+
+(defun emit-x64-card-mark-inline (buf)
+  "MARK, INLINE at the store site: RAX = the raw address of the slot about to
+   be stored (the site has pushed RAX and pops it after).  The card COUNT is
+   the switch -- 0 with no card table, and with %GC-CARD-BARRIER-OFF -- so one
+   unsigned compare skips both an address outside the area and a barrier that
+   is off; the collector and GC.LISP keep the count 0 whenever the card base is
+   0.  Clobbers RAX and the flags.  31 bytes."
+  (%gen-abs-op buf #x2B 'rax +x64-gen-area-addr+)    ; sub rax, [area]
+  (emit-shr-reg-imm buf 'rax 9)                      ; card index
+  (%gen-abs-op buf #x3B 'rax +x64-gen-ncards-addr+)  ; cmp rax, [ncards]
+  (emit-bytes buf #x73 #x0B)                         ; jae +11 (past the mark)
+  (%gen-abs-op buf #x03 'rax +x64-gen-cards-addr+)   ; add rax, [cards]
+  (emit-bytes buf #xC6 #x00 #x00))                   ; mov byte [rax], 0
 
 (defun emit-x64-card-range-sub (buf label)
   "MARK RANGE: RAX = first byte, RDX = length in bytes.  Every card the range
@@ -475,14 +513,14 @@
             (emit-shl-reg-imm buf 'rcx 2)
             (emit-add-reg-reg buf 'rax 'rcx)
             (emit-add-reg-imm buf 'rax disp)
-            (emit-call buf g)
             (emit-pop buf 'rcx)
+            (emit-x64-card-mark-inline buf)
             (emit-pop buf 'rax))
           (progn
             (emit-push buf 'rax)
             (%gen-load buf vobj 'rax '((rax . 0)))
             (emit-add-reg-imm buf 'rax disp)
-            (emit-call buf g)
+            (emit-x64-card-mark-inline buf)
             (emit-pop buf 'rax))))))
 
 (defun emit-syscall-gc-safe (buf park-label)
@@ -497,6 +535,7 @@
       (emit-bytes buf #x0F #x05)
       (let ((done (make-label)))
         (dolist (r '(rbx rbp r12 r13 r14 r15)) (emit-push buf r))
+        (emit-x64-r0-count-snapshot buf 'rcx)             ; RCX: SYSCALL destroys it
         (emit-fs-store-rsp buf +stw-rsp-addr+)
         (emit-bytes buf #x41 #xBB #x01 #x00 #x00 #x00)  ; mov r11d, 1
         (emit-fs-xchg-abs-r11 buf +stw-state-addr+)
@@ -509,7 +548,17 @@
         (emit-call buf park-label)
         (dolist (r (reverse '(rax rdi rsi rdx r8 r9 r10))) (emit-pop buf r))
         (emit-label buf done)
-        (dolist (r (reverse '(rbx rbp r12 r13 r14 r15))) (emit-pop buf r)))))
+        (dolist (r (reverse '(rbx rbp r12 r13 r14 r15))) (emit-pop buf r))
+        ;; The R12/R14 just popped are from BEFORE the syscall; another thread
+        ;; may have collected region 0 during it (see EMIT-X64-GC-SAFE-TRAP).
+        ;; RAX is the result; RCX is dead (SYSCALL destroyed it); RDX is saved.
+        (let ((back (make-label)))
+          (emit-push buf 'rax)
+          (emit-push buf 'rdx)
+          (emit-x64-stw-refresh buf back)
+          (emit-label buf back)
+          (emit-pop buf 'rdx)
+          (emit-pop buf 'rax)))))
 
 ;;; The thread table (net/hosted-sync.lisp): its page's RAW address in BSS
 ;;; 0x10000DA8, the table at +0x13000, 16 records of 0x80 from +0x100:
@@ -5286,7 +5335,7 @@
              (when g
                (emit-push buf 'rax)
                (emit-lea buf 'rax +scratch-reg+ 7)
-               (emit-call buf g)
+               (emit-x64-card-mark-inline buf)
                (emit-pop buf 'rax)))
            ;; Store Vs at [scratch + 7]
            (let ((ps (vreg-phys vs)))
@@ -7706,7 +7755,15 @@
     (emit-label buf park)
     (emit-mov-mem-reg buf 'r9 'rsp #x70)
     (emit-load-gc-region buf 'r8)
-    (emit-mov-mem-reg buf 'r8 'r12 modus.mvm::+gc-off-saved-alloc+)
+    ;; Not into REGION 0's block: its collector never reads it there, and a
+    ;; thread back from a syscall mid-collection parks here AFTER the world
+    ;; stopped -- possibly after the collector wrote region 0's new frontier
+    ;; (EMIT-X64-STW-RELEASE), which this stale R12 would overwrite.
+    (let ((r0 (make-label)))
+      (emit-cmp-reg-imm buf 'r8 modus.mvm::+gc-region-0-base+)
+      (emit-jcc buf :e r0)
+      (emit-mov-mem-reg buf 'r8 'r12 modus.mvm::+gc-off-saved-alloc+)
+      (emit-label buf r0))
     (x64-stw-store-imm buf 'r9 #x68 1)            ; x86 stores are ordered
     (emit-label buf spin)
     (x64-stw-flag-test buf)
@@ -7719,22 +7776,30 @@
     (emit-ret buf)))
 
 (defun emit-x64-stw-refresh (buf changed)
-  "Region 0 active and R12 outside [from, from+size]?  Another thread
-   collected region 0 (the lock-arena refill); reload R12/R14 from region 0's
-   block and jump to CHANGED.  RAX, RCX, RDX scratch (see translate-aarch64's
-   EMIT-AARCH64-STW-REFRESH)."
-  (let ((same (make-label)) (stale (make-label)))
+  "Region 0 active and collected since this thread stopped (its collection
+   count differs from the snapshot, +STW-R0-COUNT-ADDR+)?  Another thread
+   collected it (the lock-arena refill, a worker's %GC-COLLECT-REGION-0):
+   reload R12/R14 from region 0's block, take the count as seen, and jump to
+   CHANGED.  RAX, RCX, RDX scratch (see translate-aarch64's
+   EMIT-AARCH64-STW-REFRESH).
+
+   It used to ask whether R12 lay outside [from, from+size]: right after one
+   flip, but after TWO (main asleep, or waiting on the runtime lock while
+   workers refill the arena) the stale R12 is inside the from-space again, and
+   main went on allocating from an old frontier, OVER the objects those
+   collections had copied above it.  A slot naming one then pointed into the
+   middle of main's new objects, the next collection took it for no object at
+   all (copy-bogus) and cleaned its card (gc-major-threads, audited after
+   every major: young pointers on clean cards in 1 run in 4; a TYPE-ERROR in
+   1 in 75)."
+  (let ((same (make-label)))
     (emit-load-gc-region buf 'rax)
     (emit-cmp-reg-imm buf 'rax modus.mvm::+gc-region-0-base+)
     (emit-jcc buf :ne same)
-    (emit-mov-reg-mem buf 'rcx 'rax modus.mvm::+gc-off-from-start+)
-    (emit-cmp-reg-reg buf 'r12 'rcx)
-    (emit-jcc buf :b stale)
-    (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-space-size+)
-    (emit-add-reg-reg buf 'rdx 'rcx)
-    (emit-cmp-reg-reg buf 'r12 'rdx)
-    (emit-jcc buf :be same)
-    (emit-label buf stale)
+    (emit-mov-reg-mem buf 'rcx 'rax modus.mvm::+gc-off-count+)
+    (emit-fs-cmp-reg buf 'rcx +stw-r0-count-addr+)
+    (emit-jcc buf :e same)
+    (emit-fs-store-reg buf +stw-r0-count-addr+ 'rcx)
     (emit-mov-reg-mem buf 'r12 'rax modus.mvm::+gc-off-saved-alloc+)
     (emit-mov-reg-mem buf 'r14 'rax modus.mvm::+gc-off-saved-limit+)
     (emit-jmp buf changed)
@@ -7757,6 +7822,7 @@
       (emit-cmp-reg-reg buf 'rcx 'r8)
       (emit-jcc buf :e no-park)
       (emit-mov-reg-reg buf 'r10 'r12)            ; R12 before the park
+      (emit-x64-r0-count-snapshot buf 'rcx)
       (emit-call buf park)
       (emit-x64-stw-refresh buf reloaded)
       (emit-label buf no-park)
@@ -8280,6 +8346,8 @@
       (emit-mov-reg-imm buf 'rax modus.mvm::+gc-region-0-base+)
       (emit-mov-mem-reg buf 'rax 'r12 modus.mvm::+gc-off-saved-alloc+)
       (emit-mov-mem-reg buf 'rax 'r14 modus.mvm::+gc-off-saved-limit+)
+      ;; The collector's own R12 is the new frontier: nothing to reload.
+      (emit-x64-r0-count-snapshot buf 'rax)
       (emit-mov-abs-imm32 buf +x64-stw-flag-addr+ 0)
       (emit-label buf skip))))
 
@@ -8316,13 +8384,14 @@
           (emit-mov-mem-reg buf 'r9 'rsp #x70)
           (emit-load-gc-region buf 'rdx)
           (emit-mov-mem-reg buf 'rdx 'r12 modus.mvm::+gc-off-saved-alloc+)
+          (emit-x64-r0-count-snapshot buf 'rcx)
           (x64-stw-store-imm buf 'r9 #x68 2))
-        (let ((again (make-label)) (spin (make-label)))
+        (let ((again (make-label)) (spin (make-label)) (running (make-label)))
           (emit-label buf again)
           (x64-stw-store-imm buf 'r9 #x68 3)
           (x64-stw-mfence buf)
           (x64-stw-flag-test buf)
-          (emit-jcc buf :e skip)
+          (emit-jcc buf :e running)
           (x64-stw-store-imm buf 'r9 #x68 2)
           (emit-label buf spin)
           (x64-stw-sched-yield buf)
@@ -8332,7 +8401,16 @@
           (let ((back (make-label)))
             (emit-x64-stw-refresh buf back)
             (emit-label buf back))
-          (emit-jmp buf again)))
+          (emit-jmp buf again)
+          ;; RUNNING, and the flag is clear -- but a WHOLE collection may have
+          ;; come and gone while this thread was safe (a SLEEP), and nothing
+          ;; else reloads its R12/R14: it went on allocating in the semispace
+          ;; that collection vacated (found by gc-major-threads' card audit:
+          ;; main's frontier in to-space right after its (sleep 1)).
+          (emit-label buf running)
+          (let ((back (make-label)))
+            (emit-x64-stw-refresh buf back)
+            (emit-label buf back))))
     (emit-label buf skip)
     (dolist (r '(r11 r10 r9 r8 rdi rsi rdx rcx rbx rax)) (emit-pop buf r))
     (emit-mov-reg-reg buf 'rsi 'r15)))
@@ -8690,6 +8768,25 @@
     ;; ---- already forwarded: the new address, the original tag ----
     (emit-label buf fwd)
     (emit-and-reg-imm buf 'rax -16)
+    ;; A forward INTO THIS COLLECTION'S FROM-SPACE is a major's phase-1
+    ;; promotion seen from phase 2, whose from-space is the old area: a lock-
+    ;; arena object phase 1 evacuated into the old area, named by a slot phase
+    ;; 1 did not visit.  That address is about to be vacated too, so chase it
+    ;; (it is copied now, or its own phase-2 forward taken).  Returning it
+    ;; left the slot in the old area that phase 2 hands to the young pair
+    ;; (gc-major-threads: young pointers on clean cards, all at the old
+    ;; area's end -- where phase 1 promotes).  Never true outside phase 2: a
+    ;; forward otherwise points into to-space or the old area, never from.
+    (let ((settled (make-label)))
+      (emit-cmp-reg-reg buf 'rax 'rbx)
+      (emit-jcc buf :b settled)
+      (emit-cmp-reg-reg buf 'rax 'rcx)
+      (emit-jcc buf :ae settled)
+      (emit-mov-reg-reg buf 'r8 'rdx)
+      (emit-and-reg-imm buf 'r8 #x0F)
+      (emit-or-reg-reg buf 'rax 'r8)
+      (emit-jmp buf copy-label)
+      (emit-label buf settled))
     (emit-mov-reg-reg buf 'r8 'rdx)
     (emit-and-reg-imm buf 'r8 #x0F)
     (emit-or-reg-reg buf 'rax 'r8)
@@ -8819,11 +8916,25 @@
                (emit-and-reg-imm buf 'rsi 7)
                (emit-cmp-reg-imm buf 'rsi 1)
                (emit-jcc buf :ne skip)
-               (emit-mov-reg-mem buf 'rsi 'rsp 80)
-               (emit-sub-reg-reg buf 'rax 'rsi)
-               (emit-mov-reg-mem buf 'rsi 'rsp 88)
-               (emit-cmp-reg-reg buf 'rax 'rsi)
-               (emit-jcc buf :ae skip)
+               (let ((young (make-label)))
+                 (emit-mov-reg-reg buf 'rsi 'rax)
+                 (x64-stw-rm buf '(#x2B) 6 'rsp 80)           ; sub rsi, [to_start]
+                 (x64-stw-rm buf '(#x3B) 6 'rsp 88)           ; cmp rsi, [size]
+                 (emit-jcc buf :b young)
+                 ;; A pointer into the LOCK ARENA is young too: a collection
+                 ;; that found the runtime lock held did not evacuate it, and
+                 ;; the next one that does moves the object -- through this
+                 ;; slot only if its card is still dirty.  Cleaned, the slot
+                 ;; was left at the rewound arena (gc-major-threads' card
+                 ;; audit, ~1 run in 75 with two interning workers).
+                 (emit-mov-reg-abs buf 'rsi +x64-lock-arena-words-slot+)
+                 (emit-test-reg-reg buf 'rsi 'rsi)
+                 (emit-jcc buf :e skip)
+                 (x64-stw-rm buf '(#x3B) 0 'rsi 0)            ; cmp rax, [arena base]
+                 (emit-jcc buf :b skip)
+                 (x64-stw-rm buf '(#x3B) 0 'rsi #x10)         ; cmp rax, [arena end]
+                 (emit-jcc buf :ae skip)
+                 (emit-label buf young))
                (emit-mov-reg-imm buf 'rax 1)
                (emit-mov-mem-reg buf 'rsp 'rax 64)
                (emit-label buf skip))))
@@ -9157,6 +9268,7 @@
     (emit-mov-mem-reg buf 'rax 'rbx modus.mvm::+gc-off-from-start+)
     (emit-mov-mem-reg buf 'rax 'r8 modus.mvm::+gc-off-to-start+)
     (emit-mov-reg-reg buf 'r13 'r8)
+    (emit-mov-abs-imm32 buf +x64-gen-ncards-addr+ 0)  ; barrier off (count first)
     (emit-mov-abs-imm32 buf +x64-gen-cards-addr+ 0)   ; cards off
     (emit-mov-abs-imm32 buf +x64-gen-old-hi-addr+ 0)  ; no old walk
     (emit-bytes buf #x4D #x31 #xE4)                   ; xor r12, r12
@@ -9189,7 +9301,28 @@
     (emit-push buf 'rdi)
     (emit-mov-reg-reg buf 'rdi 'r10)
     (emit-mov-reg-reg buf 'r11 'r13)
-    (emit-x64-crossing-fill buf nil)
+    ;; CLEAN, unless a lock arena is live and this collection did NOT evacuate
+    ;; it (the runtime lock was held): then old slots still name arena objects,
+    ;; which the next evacuating collection moves -- through those slots only
+    ;; if their cards are dirty.  Cleaned here, the next major's phase 1
+    ;; skipped them and its phase 2 met a stale forward (EMIT-X64-GEN-COPY-
+    ;; OBJECT); a minor would leave them in the rewound arena.  So: all dirty,
+    ;; and the next collection's card scan cleans what it can.
+    (let ((clean (make-label)) (filled (make-label)))
+      (emit-mov-reg-abs buf 'rax +x64-lock-arena-words-slot+)
+      (emit-test-reg-reg buf 'rax 'rax)
+      (emit-jcc buf :e clean)
+      (emit-mov-reg-abs buf 'rax #x10000DA8)
+      (emit-test-reg-reg buf 'rax 'rax)
+      (emit-jcc buf :e clean)
+      (emit-add-reg-imm buf 'rax #x13000)
+      (x64-stw-cmp-imm buf 'rax #x88 0)
+      (emit-jcc buf :ne clean)                        ; evacuated: no arena pointers left
+      (emit-x64-crossing-fill buf t)
+      (emit-jmp buf filled)
+      (emit-label buf clean)
+      (emit-x64-crossing-fill buf nil)
+      (emit-label buf filled))
     (emit-pop buf 'rdi)
     (emit-pop buf 'rax)
     (emit-mov-abs-reg buf +x64-gen-cards-addr+ 'r8)   ; cards on
@@ -9204,6 +9337,7 @@
     (emit-mov-mem-reg buf 'rsi 'rdx 24)
     (emit-mov-abs-imm32 buf +x64-gen-old-lo-addr+ 0)
     (emit-mov-abs-imm32 buf +x64-gen-old-hi-addr+ 0)
+    (emit-mov-abs-imm32 buf +x64-gen-ncards-addr+ 0)  ; the inline barrier's switch
     (emit-mov-abs-imm32 buf +x64-gen-cards-addr+ 0)
     (emit-mov-abs-imm32 buf +x64-gen-card-root+ 0)
     (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-space-size+)
@@ -11210,8 +11344,10 @@
                               :yield-longjmp-label yield-longjmp-lbl
                               :park-label park-lbl
                               :ssg-label ssg-lbl
-                              :card-label card-lbl
-                              :card-range-label card-range-lbl)))
+                              :card-label (and card-lbl (not (x64-barrier-exempt-fn-p name))
+                                               card-lbl)
+                              :card-range-label (and card-lbl (not (x64-barrier-exempt-fn-p name))
+                                                     card-range-lbl))))
                  ;; Align THIS function's entry.  The tail alignment below only
                  ;; aligns SUBSEQUENT functions; without a head alignment the
                  ;; FIRST emitted function starts at whatever code-position the
@@ -11357,7 +11493,6 @@
       (when ssg-lbl
         (emit-shared-store-guard-sub buf ssg-lbl))
       (when card-lbl
-        (emit-x64-card-mark-sub buf card-lbl)
         (emit-x64-card-range-sub buf card-range-lbl)))
 
     ;; Resolve all label fixups

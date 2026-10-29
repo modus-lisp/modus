@@ -1710,6 +1710,12 @@
    mutator's allocation limit moves with it in the same breath: a limit outside
    the region it is supposed to bound is a :gc-check that fires in the wrong
    place, or not at all.  Returns NEW-SIZE."
+  (when (and (= rcb (%gc-region-0)) (%gc-old-space-p))
+    ;; The young pair, the old area and a major's phase-2 destination are all
+    ;; laid out inside [base, base+size) of region 0's semispaces at GC-TENURE
+    ;; time; shrinking afterwards leaves a carved gap INSIDE that layout, and a
+    ;; major copies straight over it.  Carve first (the lock arena), then tenure.
+    (error "%GC-REGION-SHRINK: region 0 has an old space; carve before GC-TENURE"))
   (%gc-meta-write (+ rcb #x10) new-size k)
   (if (= rcb (%gc-region))
       (set-alloc-limit (+ (%gc-meta-read rcb k) new-size))
@@ -1761,7 +1767,21 @@
   "The subtags the AArch64 collector's object walk does not scan (raw payload)."
   (member st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66)))
 
+(defun %gc-audit-stable (fn what)
+  "Run FN, an audit walk, until no collection happened inside it; its result.  A
+   walk that allocates can trigger a collection halfway, and it then judges the
+   rest of the heap against semispace bounds it read before the flip (measured
+   on the board: 36-139 'dangling' slots per audit, every one an artifact,
+   0 once bracketed).  Signals when 20 tries all overlapped one."
+  (dotimes (i 20 (error "~A: a collection overlapped every one of 20 walks" what))
+    (let* ((e (%gc-epoch)) (r (funcall fn)))
+      (when (= e (%gc-epoch)) (return r)))))
+
 (defun %gc-old-audit ()
+  "%GC-OLD-AUDIT-1, retried until no collection overlaps the walk."
+  (%gc-audit-stable #'%gc-old-audit-1 "%GC-OLD-AUDIT"))
+
+(defun %gc-old-audit-1 ()
   "Walk the old space object by object, as the collector does, and count the
    POINTER SLOTS (cons car/cdr, non-leaf object slots) that point into region
    0's TO-space -- the semispace the last collection vacated, where nothing is
@@ -1819,7 +1839,21 @@
       (let ((h (mem-ref a :u32)))
         (%census-size (logand h 255) (ash h -8)))))
 
-(defun %gc-cards-build (vec area ncards area-size promote)
+(defun %gc-gen-ceiling (lo hi)
+  "The lowest staging page (*CSTR-SCRATCH*, *IO-BUF-ADDR*) inside [LO, HI), or 0.
+   The board keeps both at the top of region 0's UPPER semispace, where the
+   mutator's 8 MB limit guard has always kept allocation away from them; the old
+   space is filled by promotion up to a bound instead, so that bound must stop
+   here (measured: card #9's old space ran 430 KB into *CSTR-SCRATCH*'s page)."
+  (let ((c 0))
+    (dolist (v '(*cstr-scratch* *io-buf-addr*))
+      (when (boundp v)
+        (let ((a (symbol-value v)))
+          (when (and (integerp a) (>= a lo) (< a hi) (or (= c 0) (< a c)))
+            (setq c a)))))
+    c))
+
+(defun %gc-cards-build (vec area ncards area-size promote &optional (ceiling 0))
   "Point the card words at VEC (now in the old space): cards at its data,
    all DIRTY (the vector is zeroed), crossing after them, filled by one walk
    of [old_lo, old_hi).  The card base is written LAST: it switches on both
@@ -1839,6 +1873,7 @@
     (%gc-write64 (+ meta 8) area-size)
     (%gc-write64 (+ meta 16) 0)
     (%gc-write64 (+ meta 56) (if promote 1 0))
+    (%gc-write64 (+ meta 72) ceiling)
     (setf (mem-ref (%gc-card-root) :u64) vec)
     (loop
       (when (>= a end) (return nil))
@@ -1858,6 +1893,10 @@
     ncards))
 
 (defun %gc-card-audit ()
+  "%GC-CARD-AUDIT-1, retried until no collection overlaps the walk."
+  (%gc-audit-stable #'%gc-card-audit-1 "%GC-CARD-AUDIT"))
+
+(defun %gc-card-audit-1 ()
   "Every POINTER SLOT of the old space that points into region 0's young
    semispaces must sit on a DIRTY card -- the invariant the barrier and the
    card scan keep, at any moment, not only after a collection.  Returns
@@ -1935,7 +1974,9 @@
           (when cards
             (unless (= (%gc-old-lo) area)
               (error "GC-TENURE: the old space is not where the card table was sized for"))
-            (%gc-cards-build vec area ncards size promote))
+            (%gc-cards-build vec area ncards size promote
+                             (let ((to (%gc-meta-read (+ r 8) k)))
+                               (%gc-gen-ceiling (min from to) (+ (max from to) size)))))
           (return (list (%gc-old-lo) (%gc-old-hi) half ncards)))
         (%gc-write64 req 0)
         (setq tries (+ tries 1))
@@ -1987,8 +2028,10 @@
   bytes)
 
 (defun %gc-old-room ()
-  "Bytes the old area can still take by promotion."
-  (- (+ (%gc-read64 (+ (%gc-card-words) 8)) (%gc-gen-meta-ref 1)) (%gc-old-hi)))
+  "Bytes the old area can still take by promotion (up to the ceiling, if any)."
+  (let ((end (+ (%gc-read64 (+ (%gc-card-words) 8)) (%gc-gen-meta-ref 1)))
+        (ceiling (%gc-gen-meta-ref 9)))
+    (- (if (and (> ceiling (%gc-old-lo)) (< ceiling end)) ceiling end) (%gc-old-hi))))
 
 (defun gc-gen-report ()
   "(:old MB :promoted MB :majors N :failures N :state S), or NIL."

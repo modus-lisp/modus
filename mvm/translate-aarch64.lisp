@@ -8405,6 +8405,24 @@
   (a64-load-real-addr buf rd (conv-real addr))
   (a64-ldr-unsigned buf rd rd 0))
 
+(defun a64-clip-to-gen-ceiling (buf reg base meta scratch)
+  "REG := the meta's CEILING word (+72) when that lies inside (BASE, REG): the
+   end of a range starting at BASE, clipped.  A ceiling of 0, or one at or below
+   BASE (the staging page is not inside this range), changes nothing.  The
+   ceiling is the lowest address of something region 0's span holds that is NOT
+   heap -- the board's I/O staging pages at the top of the upper semispace,
+   which the mutator's limit guard has always kept allocation below.  Promotion
+   and a major's phase 2 copy UP TO a bound rather than behind an allocation, so
+   they need the ceiling stated (GC-TENURE sets it).  SCRATCH is clobbered."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf scratch meta 72)
+    (a64-cmp-reg buf scratch base)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i skip :bcond)) ; LS: 0 or <= base
+    (a64-cmp-reg buf reg scratch)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i skip :bcond)) ; LS
+    (a64-mov-reg buf reg scratch)
+    (a64-set-label buf skip)))
+
 (defun emit-aarch64-promo-setup (buf)
   "x3 / x8 / x2 for this collection (see above); all 0 unless region 0 has a
    card table and promotion is on, or a major is requested."
@@ -8439,6 +8457,7 @@
     (a64-ldr-unsigned buf +a64-x13+ +a64-x13+ 8)             ; area
     (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 8)             ; area size
     (a64-add-reg buf +a64-x2+ +a64-x13+ +a64-x15+ 0 0)
+    (a64-clip-to-gen-ceiling buf +a64-x2+ +a64-x13+ +a64-x12+ +a64-x16+)
     (a64-set-label buf done)
     ;; x17 is the ACTIVE REGION's base for the root window code that follows;
     ;; the region test above used it as scratch.
@@ -8678,7 +8697,17 @@
     (a64-load-real-addr buf +a64-x11+ (conv-real +gc-card-base-addr+))
     (a64-ldr-unsigned buf +a64-x11+ +a64-x11+ 8)
     (a64-sub-reg buf +a64-x10+ +a64-x10+ +a64-x11+ 0 0)       ; old bytes
+    ;; room = min(Ylo + both halves, ceiling) - Ylo, Ylo = min(x19, x22)
+    (let ((lo (incf *mvm-label-counter*)))
+      (a64-mov-reg buf +a64-x15+ +a64-x19+)
+      (a64-cmp-reg buf +a64-x22+ +a64-x19+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i lo :bcond))
+      (a64-mov-reg buf +a64-x15+ +a64-x22+)
+      (a64-set-label buf lo))
     (a64-lsl-imm buf +a64-x11+ +a64-x25+ 1)                  ; both halves
+    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x15+ 0 0)
+    (a64-clip-to-gen-ceiling buf +a64-x11+ +a64-x15+ +a64-x12+ +a64-x16+)
+    (a64-sub-reg buf +a64-x11+ +a64-x11+ +a64-x15+ 0 0)
     (a64-cmp-reg buf +a64-x10+ +a64-x11+)
     (let ((fits (incf *mvm-label-counter*)))
       (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i fits :bcond)) ; LS

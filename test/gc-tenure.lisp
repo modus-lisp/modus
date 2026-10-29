@@ -182,6 +182,27 @@
                       (gen-verify *gen-rounds*) (= 0 (first r)) (= 0 (second r)))
                  (format nil "~s" (gc-gen-report))))))
 
+(defun gen-ceiling ()
+  "The meta's CEILING (+72): promotion never goes above it.  On the board it is
+   the I/O staging page at the top of the upper semispace; here one is planted
+   64 KB above old_hi, then removed for the control."
+  (gc-gen-reserve 0)
+  (let* ((ceil (+ (%gc-old-hi) 65536)) (p0 (%gc-gen-meta-ref 6)) (f0 (%gc-gen-meta-ref 4)))
+    (%gc-write64 (+ (%gc-gen-meta) 72) ceil)
+    (let* ((r (gen-churn-rounds *gen-rounds* (+ *gen-rounds* 10)))
+           (hi (%gc-old-hi)) (dp (- (%gc-gen-meta-ref 6) p0)) (df (- (%gc-gen-meta-ref 4) f0)))
+      (%gc-write64 (+ (%gc-gen-meta) 72) 0)
+      (gen-check "promotion stops at the ceiling (the board's I/O staging pages)"
+                 (and (<= hi ceil) (<= dp 65536) (> df 0)
+                      (gen-verify *gen-rounds*) (= 0 (first r)) (= 0 (second r)))
+                 (format nil "old_hi ~x, ceiling ~x, ~d bytes promoted, ~d failures" hi ceil dp df)))
+    (let* ((p1 (%gc-gen-meta-ref 6))
+           (r (gen-churn-rounds *gen-rounds* (+ *gen-rounds* 10)))
+           (dp (- (%gc-gen-meta-ref 6) p1)))
+      (gen-check "CONTROL: without it the same churn promotes past that much"
+                 (and (> dp 65536) (gen-verify *gen-rounds*) (= 0 (first r)) (= 0 (second r)))
+                 (format nil "~d bytes promoted ~s" dp (gc-gen-report))))))
+
 (defun gen-run ()
   (gen-build-old)
   (gen-check "no old space before tenure" (not (%gc-old-space-p)))
@@ -246,7 +267,8 @@
                    (format nil "~,2f MB copied vs ~,1f MB old"
                            (/ young 1048576.0) (/ old 1048576.0))))))
   (when (and *gen-cards* (not *gen-control*))
-    (gen-stage3))
+    (gen-stage3)
+    (gen-ceiling))
   (gen-check "save-image first puts the old space back into one semispace"
              (progn (handler-case (%save-image "/nonexistent/x.core") (error () nil))
                     (and (not (%gc-old-space-p)) (not (%gc-cards-on-p))

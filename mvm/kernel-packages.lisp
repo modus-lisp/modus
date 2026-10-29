@@ -30,10 +30,18 @@
       "E1000-READ-REG" "E1000-WRITE-REG"))
     ("MODUS.NET.VIRTIO" ("COMMON-LISP" "MODUS-INT")
      ("VIRTIO-NET-PROBE" "VIRTIO-NET-SEND" "VIRTIO-NET-RECEIVE"
-      "VIRTIO-NET-RX-BUF" "VIRTIO-NET-ACTIVE-P" "VIRTIO-NET-STATS")))))
+      "VIRTIO-NET-RX-BUF" "VIRTIO-NET-ACTIVE-P" "VIRTIO-NET-STATS"))
+    ;; SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519 (net/crypto*.lisp):
+    ;; what SSH, the SNP attestation and the isolated net domain call
+    ("MODUS.CRYPTO" ("COMMON-LISP" "MODUS-INT")
+     ("SHA256-INIT" "SHA256" "SHA512-INIT" "SHA512" "SHA512-BLOCK"
+      "CHACHA-BLOCK" "CHACHA20-CRYPT" "POLY1305" "X25519" "X25519-PUBLIC-KEY"
+      "ED25519-PUBLIC-KEY" "ED25519-VERIFY" "ED-BASE-MULT" "ED-ENCODE-POINT"
+      "ED-REDUCE-SCALAR" "ED-SCALAR-ADD" "ED-SCALAR-MULT-MOD-L"
+      "CONCAT-BYTES" "CONCAT3-BYTES")))))
 
 (defun %modus-int-driver-exports ()
-  "What MODUS-INT exports to the step-3 driver packages: the console
+  "What MODUS-INT exports to the step-3 packages: the console
    printers, PCI configuration access and the BOARD's address hooks (each
    arch-*-cl.lisp defines these for its machine).  The board hooks move to a
    MODUS.BOARD package when the boards get one.  Exported on the build host
@@ -44,7 +52,10 @@
           "E1000-STATE-BASE" "E1000-RX-DESC-BASE" "E1000-RX-BUF-BASE"
           "E1000-TX-DESC-BASE" "E1000-TX-BUF-BASE" "NE2K-RX-HOST"
           "VIRTIO-NET-RING-BASE" "VIRTIO-NET-STATE-BASE" "VIRTIO-NET-PT-PAGE"
-          "SNP-MMIO-P" "SNP-MMIO-REAL-P" "SNP-MMIO-READ" "SNP-MMIO-WRITE")))
+          "SNP-MMIO-P" "SNP-MMIO-REAL-P" "SNP-MMIO-READ" "SNP-MMIO-WRITE"
+          ;; for MODUS.CRYPTO: byte-buffer access, its scratch, and the
+          ;; keep-alive a long computation calls (a seam the images rebind)
+          "BUF-READ-U32" "BUF-WRITE-U32" "FE-SCRATCH-BASE" "USB-KEEPALIVE")))
 
 (defun %kernel-package-name-p (name)
   "True when NAME is one of %KERNEL-PACKAGE-SPECS' packages."

@@ -1,6 +1,10 @@
 ;;;; crypto.lisp — SHA-256, ChaCha20, Poly1305, X25519, SHA-512, Ed25519
 ;;;; Shared between x86-64 and AArch64 builds.
 ;;;; All arch-specific functions (e1000-state-base etc.) defined in arch-*.lisp
+;;;; Package MODUS.CRYPTO (builder packages step 3); its exports, and what it
+;;;; uses from MODUS-INT, are listed in mvm/kernel-packages.lisp.
+
+(in-package :modus.crypto)
 
 ;; Phase 7.5: SHA-256
 ;; ================================================================

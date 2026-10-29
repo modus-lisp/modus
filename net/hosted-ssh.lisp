@@ -135,10 +135,10 @@
       (setf (mem-ref (+ ssh #x130 i) :u8) (mem-ref (+ state #x730 i) :u8)))))
 (defun pre-compute-host-sign ()
   (let ((state (e1000-state-base)))
-    (sha512-init)
+    (modus.crypto:sha512-init)
     (let ((privkey (make-array 32)))
       (dotimes (i 32) (aset privkey i (mem-ref (+ state (+ #x710 i)) :u8)))
-      (let ((hash (sha512 privkey)))
+      (let ((hash (modus.crypto:sha512 privkey)))
         (dotimes (i 32) (setf (mem-ref (+ state (+ #x680 i)) :u8) (aref hash i)))
         (setf (mem-ref (+ state #x680) :u8) (logand (mem-ref (+ state #x680) :u8) #xF8))
         (let ((b31 (mem-ref (+ state #x69F) :u8)))
@@ -150,7 +150,7 @@
   (let ((state (e1000-state-base)) (priv (make-array 32)))
     (dotimes (i 32) (aset priv i (ssh-random ssh)))
     (dotimes (i 32) (setf (mem-ref (+ state (+ #x6C4 i)) :u8) (aref priv i)))
-    (let ((pub (x25519-public-key priv)))
+    (let ((pub (modus.crypto:x25519-public-key priv)))
       (dotimes (i 32) (setf (mem-ref (+ state (+ #x6E4 i)) :u8) (aref pub i))))))
 (defun ed25519-sign-fast (message msg-len)
   (let ((state (e1000-state-base)) (s (make-array 32)) (prefix (make-array 32)) (a-enc (make-array 32)))
@@ -158,11 +158,11 @@
       (aset s i (mem-ref (+ state (+ #x680 i)) :u8))
       (aset prefix i (mem-ref (+ state (+ #x6A0 i)) :u8))
       (aset a-enc i (mem-ref (+ state (+ #x730 i)) :u8)))
-    (let* ((r (ed-reduce-scalar (sha512 (concat-bytes prefix 32 message msg-len))))
-           (r-enc (ed-encode-point (ed-base-mult r)))
-           (k (ed-reduce-scalar (sha512 (concat3-bytes r-enc 32 a-enc 32 message msg-len))))
-           (sig-s (ed-scalar-add r (ed-scalar-mult-mod-l k s))))
-      (concat-bytes r-enc 32 sig-s 32))))
+    (let* ((r (modus.crypto:ed-reduce-scalar (modus.crypto:sha512 (modus.crypto:concat-bytes prefix 32 message msg-len))))
+           (r-enc (modus.crypto:ed-encode-point (modus.crypto:ed-base-mult r)))
+           (k (modus.crypto:ed-reduce-scalar (modus.crypto:sha512 (modus.crypto:concat3-bytes r-enc 32 a-enc 32 message msg-len))))
+           (sig-s (modus.crypto:ed-scalar-add r (modus.crypto:ed-scalar-mult-mod-l k s))))
+      (modus.crypto:concat-bytes r-enc 32 sig-s 32))))
 
 ;;; ---- the shell: what a client's exec line or typed line does.  Same as the
 ;;; bare x64 CL image (mvm/build-cl-repl-common.lisp): read -> eval -> prin1,
@@ -297,7 +297,7 @@
   "SHA-512 of the raw host public key, 64 bytes -- the attestation's user_data."
   (let ((k (nitro-ssh-host-pubkey)))
     (when k
-      (let ((h (sha512 k)) (v (make-array 64 :element-type '(unsigned-byte 8))))
+      (let ((h (modus.crypto:sha512 k)) (v (make-array 64 :element-type '(unsigned-byte 8))))
         (dotimes (i 64 v) (setf (aref v i) (aref h i)))))))
 (defun %nitro-hex-lines (tag v)
   (let ((n (length v)) (i 0))

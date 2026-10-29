@@ -78,7 +78,7 @@
       (let ((rk (make-array 68)))
         (dotimes (k 64) (aset rk k (mem-ref (+ b k) :u8)))
         (dotimes (k 4) (aset rk (+ 64 k) 255))
-        (let ((h (sha512 rk))) (dotimes (k 64) (setf (mem-ref (+ b k) :u8) (aref h k)))))
+        (let ((h (modus.crypto:sha512 rk))) (dotimes (k 64) (setf (mem-ref (+ b k) :u8) (aref h k)))))
       (setq c 0))
     (let ((in (make-array 68)))
       (dotimes (k 64) (aset in k (mem-ref (+ b k) :u8)))
@@ -87,7 +87,7 @@
       (aset in 66 (logand (ash c -16) 255))
       (aset in 67 0)
       (setf (mem-ref (+ b #x40) :u32) (+ c 1))
-      (let ((h (sha512 in)))
+      (let ((h (modus.crypto:sha512 in)))
         (dotimes (k 64) (setf (mem-ref (+ b #x48 k) :u8) (aref h k)))))
     (setf (mem-ref (+ b #x44) :u32) 0)))
 
@@ -364,7 +364,7 @@
           (dotimes (i payload-len) (aset plain (+ 1 i) (aref payload i)))
           (dotimes (i pad-len) (aset plain (+ 1 payload-len i) (ssh-random ssh)))
           ;; 1. Encrypt length with K2, counter=0
-          (let ((len-ks (chacha-block k2 nonce 0))
+          (let ((len-ks (modus.crypto:chacha-block k2 nonce 0))
                 (enc-len (make-array 4))
                 (len-bytes (make-array 4)))
             (ssh-put-u32 len-bytes 0 packet-len)
@@ -373,17 +373,17 @@
                     (lk (aref len-ks i)))
                 (aset enc-len i (logxor lb lk))))
             ;; 2. Poly1305 key from K1, counter=0
-            (let ((poly-ks (chacha-block k1 nonce 0))
+            (let ((poly-ks (modus.crypto:chacha-block k1 nonce 0))
                   (poly-key (make-array 32)))
               (dotimes (i 32) (aset poly-key i (aref poly-ks i)))
               ;; 3. Encrypt data with K1, counter=1
-              (let ((enc-data (chacha20-crypt k1 nonce plain packet-len 1)))
+              (let ((enc-data (modus.crypto:chacha20-crypt k1 nonce plain packet-len 1)))
                 ;; 4. MAC = poly1305(enc-len || enc-data)
                 (let ((mac-input (make-array (+ 4 packet-len))))
                   (dotimes (i 4) (aset mac-input i (aref enc-len i)))
                   (dotimes (i packet-len)
                     (aset mac-input (+ 4 i) (aref enc-data i)))
-                  (let ((tag (poly1305 poly-key mac-input (+ 4 packet-len))))
+                  (let ((tag (modus.crypto:poly1305 poly-key mac-input (+ 4 packet-len))))
                     ;; Result: enc-len(4) + enc-data(packet-len) + tag(16)
                     (let ((total (+ 4 packet-len 16))
                           (result (make-array (+ 4 packet-len 16))))
@@ -411,7 +411,7 @@
       (aset k1 i (mem-ref (+ ssh #x090 i) :u8))
       (aset k2 i (mem-ref (+ ssh #x0B0 i) :u8)))
     ;; 1. Decrypt length with K2, counter=0
-    (let ((len-ks (chacha-block k2 nonce 0))
+    (let ((len-ks (modus.crypto:chacha-block k2 nonce 0))
           (packet-len 0))
       (dotimes (i 4)
         (let ((di (aref data i))
@@ -422,13 +422,13 @@
       (when (< data-len (+ 4 packet-len 16))
         (return ()))
       ;; 2. Verify MAC
-      (let ((poly-ks (chacha-block k1 nonce 0))
+      (let ((poly-ks (modus.crypto:chacha-block k1 nonce 0))
             (poly-key (make-array 32)))
         (dotimes (i 32) (aset poly-key i (aref poly-ks i)))
         (let ((mac-input (make-array (+ 4 packet-len))))
           (dotimes (i (+ 4 packet-len))
             (aset mac-input i (aref data i)))
-          (let ((expected (poly1305 poly-key mac-input (+ 4 packet-len)))
+          (let ((expected (modus.crypto:poly1305 poly-key mac-input (+ 4 packet-len)))
                 (tag-ok 1))
             (dotimes (i 16)
               (unless (eq (aref data (+ 4 packet-len i)) (aref expected i))
@@ -439,7 +439,7 @@
             (let ((enc-data (make-array packet-len)))
               (dotimes (i packet-len)
                 (aset enc-data i (aref data (+ 4 i))))
-              (let ((plain (chacha20-crypt k1 nonce enc-data packet-len 1)))
+              (let ((plain (modus.crypto:chacha20-crypt k1 nonce enc-data packet-len 1)))
                 (let* ((pad-len (aref plain 0))
                        (payload-len (- packet-len pad-len 1)))
                   (let ((payload (make-array payload-len)))
@@ -628,7 +628,7 @@
 ;; All as SSH strings (4-byte len prefix)
 ;; ssh = per-connection SSH state base
 (defun ssh-compute-exchange-hash (ssh cli-eph srv-eph shared-secret)
-  (sha256-init)
+  (modus.crypto:sha256-init)
   (let ((cb (- ssh #x20)))
     ;; Build hash input by concatenating all fields
     ;; V_C = client version as SSH string
@@ -677,7 +677,7 @@
                                                                     qs-str (array-length qs-str))))
                                               (let ((hash-input (ssh-concat2 p6 (array-length p6)
                                                                               k-mpint (array-length k-mpint))))
-                                                (sha256 hash-input))))))))))))))))))))))))))
+                                                (modus.crypto:sha256 hash-input))))))))))))))))))))))))))
 
 ;; Encode host public key in SSH format: string("ssh-ed25519") + string(pubkey)
 ;; ssh = per-connection SSH state base
@@ -717,13 +717,13 @@
                                     h 32)))
               (let ((p2 (ssh-concat2 p1 (array-length p1) id 1)))
                 (let ((p3 (ssh-concat2 p2 (array-length p2) sid 32)))
-                  (let ((k1 (sha256 p3)))
+                  (let ((k1 (modus.crypto:sha256 p3)))
                     ;; If needed > 32, compute K2 = SHA256(K || H || K1)
                     (if (> needed-len 32)
                         (let ((p4 (ssh-concat2 k-mpint (array-length k-mpint)
                                                 h 32)))
                           (let ((p5 (ssh-concat2 p4 (array-length p4) k1 32)))
-                            (let ((k2 (sha256 p5)))
+                            (let ((k2 (modus.crypto:sha256 p5)))
                               (ssh-concat2 k1 32 k2 32))))
                         k1)))))))))))
 
@@ -788,7 +788,7 @@
         (let ((srv-eph (make-array 32)))
           (dotimes (i 32)
             (aset srv-eph i (mem-ref (+ state (+ #x20 i)) :u8)))
-          (let ((shared (x25519 srv-priv cli-eph)))
+          (let ((shared (modus.crypto:x25519 srv-priv cli-eph)))
             ;; USB keep-alive after first scalar mult
             (usb-keepalive)
             (ssh-mem-store (+ ssh #x070) shared 32)
@@ -983,7 +983,7 @@
 (defun ssh-set-host-key (privkey)
   (ssh-mem-store (+ (e1000-state-base) #x710) privkey 32)
   ;; Compute public key
-  (let ((pubkey (ed25519-public-key privkey)))
+  (let ((pubkey (modus.crypto:ed25519-public-key privkey)))
     (ssh-mem-store (+ (e1000-state-base) #x730) pubkey 32))
   (setf (mem-ref (+ (e1000-state-base) #x624) :u32) 1))
 
@@ -1037,7 +1037,7 @@
           (let ((signed (ssh-build-userauth-signed ssh user ulen svc slen algo alen pk-blob pklen))
                 (authkey (make-array 32)))
             (ssh-mem-load authkey (ssh-auth-key-addr) 32)
-            (if (ed25519-verify authkey sig signed (array-length signed))
+            (if (modus.crypto:ed25519-verify authkey sig signed (array-length signed))
                 (progn
                   (ssh-send-auth-success ssh)
                   (setf (mem-ref (+ ssh #x10) :u32) 1))
@@ -1626,13 +1626,13 @@
 (declaim (overridable pre-compute-host-sign))
 (defun pre-compute-host-sign ()
   (let ((state (e1000-state-base)))
-    (sha512-init)
+    (modus.crypto:sha512-init)
     ;; Load host private key from state+0x710
     (let ((privkey (make-array 32)))
       (dotimes (i 32)
         (aset privkey i (mem-ref (+ state (+ #x710 i)) :u8)))
       ;; SHA-512(privkey) → 64-byte hash
-      (let ((hash (sha512 privkey)))
+      (let ((hash (modus.crypto:sha512 privkey)))
         ;; Clamp first 32 bytes → scalar s → store at state+0x680
         (dotimes (i 32)
           (setf (mem-ref (+ state (+ #x680 i)) :u8) (aref hash i)))
@@ -1674,7 +1674,7 @@
       (dotimes (i 32)
         (setf (mem-ref (+ state (+ #x6C4 i)) :u8) (aref priv i)))
       ;; Compute and store public key at state+0x6E4
-      (let ((pub (x25519-public-key priv)))
+      (let ((pub (modus.crypto:x25519-public-key priv)))
         (dotimes (i 32)
           (setf (mem-ref (+ state (+ #x6E4 i)) :u8) (aref pub i)))))))
 
@@ -1695,17 +1695,17 @@
           (dotimes (i 32)
             (aset a-enc i (mem-ref (+ state (+ #x730 i)) :u8)))
           ;; r = SHA-512(prefix || message) mod L
-          (let ((r-input (concat-bytes prefix 32 message msg-len)))
-            (let ((r (ed-reduce-scalar (sha512 r-input))))
+          (let ((r-input (modus.crypto:concat-bytes prefix 32 message msg-len)))
+            (let ((r (modus.crypto:ed-reduce-scalar (modus.crypto:sha512 r-input))))
               ;; R = r*B (the one remaining expensive operation)
-              (let ((r-enc (ed-encode-point (ed-base-mult r))))
+              (let ((r-enc (modus.crypto:ed-encode-point (modus.crypto:ed-base-mult r))))
                 ;; k = SHA-512(R || A || message) mod L
-                (let ((k-input (concat3-bytes r-enc 32 a-enc 32 message msg-len)))
-                  (let ((k (ed-reduce-scalar (sha512 k-input))))
+                (let ((k-input (modus.crypto:concat3-bytes r-enc 32 a-enc 32 message msg-len)))
+                  (let ((k (modus.crypto:ed-reduce-scalar (modus.crypto:sha512 k-input))))
                     ;; S = (r + k*s) mod L
-                    (let ((ks (ed-scalar-mult-mod-l k s)))
-                      (let ((sig-s (ed-scalar-add r ks)))
-                        (concat-bytes r-enc 32 sig-s 32)))))))))))))
+                    (let ((ks (modus.crypto:ed-scalar-mult-mod-l k s)))
+                      (let ((sig-s (modus.crypto:ed-scalar-add r ks)))
+                        (modus.crypto:concat-bytes r-enc 32 sig-s 32)))))))))))))
 
 ;;; ============================================================
 ;;; Network: the single-threaded server loop

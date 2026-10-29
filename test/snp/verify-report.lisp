@@ -32,7 +32,7 @@
   (format t "reported_tcb ~A~%" (%hex rep #x180 8))
   (format t "measurement ~A~%" (%hex rep #x90 48))
   (let* ((rd (subseq rep #x50 (+ #x50 64)))
-         (want (progn (sha512-init) (modus-int::sha512 hostkey)))
+         (want (progn (modus.crypto:sha512-init) (modus.crypto:sha512 hostkey)))
          (ok (%same-bytes rd want)))
     (format t "report_data == SHA-512(hostkey): ~A~%" ok)
     ok))

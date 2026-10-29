@@ -1,6 +1,6 @@
 ;;;; crypto-fast.lisp — Fast field element ops for little-endian 64-bit targets
 ;;;;
-;;;; Load AFTER crypto.lisp (last-defun-wins).
+;;;; Load AFTER crypto.lisp (last-defun-wins), in its package.
 ;;;;
 ;;;; Replaces ALL fe-* functions with versions using mem-ref :u32 on raw array
 ;;;; addresses instead of buf-read-u32 (which does 4 aref + 3 ash + 3 logior).
@@ -8,6 +8,8 @@
 ;;;;
 ;;;; NOTE: We do NOT override buf-read-u32 globally because ip.lisp needs
 ;;;; the big-endian version for network packet parsing.
+
+(in-package :modus.crypto)
 
 ;; ================================================================
 ;; fe-from-bytes: Convert 32 LE bytes to field element (10 limbs)

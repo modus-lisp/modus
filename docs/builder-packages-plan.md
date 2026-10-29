@@ -213,6 +213,17 @@ answer over ssh, each with NIC-SEND bound to its driver.  Left in MODUS-INT:
 the boards' USB NICs (cdc-ether, r8152, usb-netdev), which only the Pi
 board image can run.
 
+**Cycle 3, 2026-10-29: MODUS.CRYPTO.**  net/crypto.lisp, crypto-fast.lisp and
+crypto-32-fast.lisp (the overrides stay in the package they override) read
+into MODUS.CRYPTO, which :uses MODUS-INT for its byte-buffer helpers, its
+scratch and the keep-alive seam.  It exports the 19 names anything outside
+calls (SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519's pieces); ssh.lisp,
+hosted-ssh.lisp, isolated-cl.lisp, snp-ssh-attest.lisp and the tests name them
+modus.crypto:..., until SSH gets a package that :uses it.  Measured: the
+i386, x64 and aarch64 SSH images log in (key exchange, signing and cipher all
+through MODUS.CRYPTO), test/crypto-sha-vectors.lisp 14/14 and
+test/run-hosted-ssh.sh PASS on the hosted CLI.
+
 ### 4. Runtime identity: every baked symbol keeps its home package
 
 - Create the step-2 package graph in the image at boot, from data the build

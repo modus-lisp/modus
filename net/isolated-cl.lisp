@@ -150,7 +150,7 @@
 (defun %iso-session-eph (ssh)
   (let ((priv (make-array 32)))
     (dotimes (i 32) (setf (aref priv i) (mem-ref (+ ssh #x3F80 i) :u8)))
-    (let ((pub (x25519-public-key priv)))
+    (let ((pub (modus.crypto:x25519-public-key priv)))
       (dotimes (i 32) (setf (mem-ref (+ ssh #x3FA0 i) :u8) (aref pub i))))))
 
 (defun ssh-connection-handler (conn)

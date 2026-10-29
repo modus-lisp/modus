@@ -225,7 +225,7 @@ SSH="ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
      -o PreferredAuthentications=password -o PubkeyAuthentication=no test@10.0.0.2"
 $SSH '(+ 2 3)'                                                    # sanity
 $SSH '(setq *jit-hot-only* nil)'                                  # every defun goes native on load
-$SSH '(net-install-and-call "http://10.0.0.1:8099/reel-neon.tar")' # minutes; blocks net-actor-main
+$SSH '(modus-int::net-install-and-call "http://10.0.0.1:8099/reel-neon.tar")' # minutes; blocks net-actor-main
 $SSH '(if (find-package "REEL") 1 0)'
 while IFS= read -r f; do [ -n "$f" ] && $SSH "$f"; done < /home/modus/demo-forms.txt
 $SSH '(init)'                                                     # HDMI mailbox framebuffer
@@ -346,7 +346,7 @@ qemu-system-aarch64 -M raspi3b -kernel kernel8.img \
   session can hold :1234 (`ss -ltnp | grep 1234`).
 - Tar and clip are read out of RAM with `ramv` (`(ramv #x1a000000 <bytes>)`),
   installed with `install-tarball-from-bytes`; then `jit-eager`,
-  `(%save-image "x.core")` → `CORE-END=<end>`, and
+  `(modus-int::%save-image "x.core")` → `CORE-END=<end>`, and
   `gdb … dump binary memory x.core 0x18000000 <end>`. Netboot with
   `netboot-core-gz.py --img <image>.gz --core x.core` (core in `/srv/tftp`).
   `qcore.py` is the whole thing (2026-09-17: install ≈ minutes, `jit-eager`
@@ -521,7 +521,7 @@ with `pi5-decode-only.lisp`, never with the MD5 harness's clock.
 
 **RESOLVED 2026-10-09 -- event counters COUNT on metal; use `lib/a64-pmu.lisp`, baked
 into the board image:** `(pmu-measure (lambda () ...))` prints cycles, IPC and six
-events (`:summary`, `:stalls`, `:memory` presets, or names from `(pmu-events)`);
+events (`:summary`, `:stalls`, `:memory` presets, or names from `(modus-int::pmu-events)`);
 `pmu-start` / `pmu-read` / `pmu-stop` by hand.  How it was settled: a system-register
 dump from inside Modus (`mrs` stubs, values stored to memory) against the counting
 399-byte payload matched in every PMU-relevant register -- EL2 controls, debug and
@@ -1304,7 +1304,7 @@ branchy, call-heavy decode code, vs ~2.5× on straight loops.
 **A core-restore boot skips kernel-main's init** (`*cli-arch-core-resume*`
 runs instead), so cores built against images before the resume-path fix come
 up at 600 MHz even though the image prints `ARMCLK=` on a fresh boot — the
-serial driver must send `(hdmi-arm-clock-max)` before timing (`serial-measure2.py`
+serial driver must send `(modus-int::hdmi-arm-clock-max)` before timing (`serial-measure2.py`
 does). Verified 2026-09-17: `reel-clk.core` (all cuts: typed reconstruct,
 packed-s16 IDCT + NEON adders, NEON %edge-mb) on the Zero **at 600 MHz =
 126.5 ms/frame** (3 passes: 11471/11384/11389 ms per 90), vs 208.6 this

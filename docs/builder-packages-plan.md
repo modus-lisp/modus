@@ -290,9 +290,9 @@ function.  Phase B:
    names, 163 files measured), then drop the fallback.
    **DONE for test/ and scripts/ (f785daa0):** every test/*.lisp gives the same
    exit status with the fallback on and off, and strict mode logs no hits.
-   The fallback is OFF by default since; `*kernel-name-fallback-p*` T turns it
-   back on.  Deleting it outright waits on docs/ (prose examples still call
-   internals bare).
+   **And for docs/ and the helper scripts that send forms to a REPL; the
+   fallback is deleted.**  Prose about kernel source keeps bare names: that
+   source is read in MODUS-INT.
 4. Globals and specials: the same, later (they are stored by name hash in
    compiled code, so this one moves bytes).
 

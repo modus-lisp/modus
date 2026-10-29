@@ -70,7 +70,7 @@ for spec in a.tar:
     addr, ln, name = spec.split(":"); t0 = time.time()
     v = q("(progn (setq *kt* (ramv %d %d)) (length *kt*))" % (int(addr, 0), int(ln)), 600)
     say("RAMV %s %s bytes -> %s" % (name, ln, v))
-    s.sendall(('(install-tarball-from-bytes *kt* "%s")\r\n' % name).encode())
+    s.sendall(('(modus-int::install-tarball-from-bytes *kt* "%s")\r\n' % name).encode())
     out = rd_until(r"install-tarball: done|INCOMPLETE|!! form eval error in [^\n]*\n[^\n]*\n> ", a.install_wait)
     ok = "install-tarball: done" in out
     say("INSTALL %s %s %.0fs" % (name, "ok" if ok else "FAILED", time.time() - t0))

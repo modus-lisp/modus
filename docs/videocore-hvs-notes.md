@@ -128,7 +128,7 @@ net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only).
   ssh-ipc/conn regions, priming with 600 receive polls, cdc-ether-init vs
   net-usb-probe (cdc "succeeds" but is the wrong driver; net-usb-probe only
   exists in MODUS_SSH_BUILD=1 images), a second net-usb-probe (→ NOTFOUND: the
-  device is already claimed; `(usb-netdev-set 2)` restores the binding).  Still
+  device is already claimed; `(modus-int::usb-netdev-set 2)` restores the binding).  Still
   unknown what in ssh-boot/net-actor-main enables TX — chase with tcpdump +
   bisecting ssh-boot's body next time.  Build knobs added: MODUS_NET_STATIC=1
   (pipeline uses 10.0.0.2/10.0.0.1 instead of DHCP) and the pipeline adopts via
@@ -151,7 +151,7 @@ net/hdmi-hvs.lisp (hand-assembled words, exec-page vehicle, X0-X3 + Q0/Q1 only).
   D2A00601 D61F0020), drive the SECOND serial over the unix socket
   (scratchpad qinstall.py/qsave.py): ramv the tarball from RAM,
   install-tarball-from-bytes, push the 71 HVS/demo forms, ramv the clip into
-  *rh-ivf*, `(%save-image "x")`, then gdb-multiarch `dump binary memory` of
+  *rh-ivf*, `(modus-int::%save-image "x")`, then gdb-multiarch `dump binary memory` of
   [0x18000000, +size).  Netboot with netboot-core-gz.py (--core: tftp the core
   to 0x18000000 instead of the `mw.q` clear) → `CORE-RESTORED` in ~2 s, REEL +
   forms + clip present at a serial REPL, NO network at all.  Gotchas:
@@ -849,7 +849,7 @@ with the firmware FB plane + a scaled YUV plane (format 8, BT.601 CSC
   the module registry the trampoline installer now keeps, without re-evaluating
   anything.  Recipe: install reel at the DEFAULT *jit-hot-only* T (4 min under
   QEMU instead of 16-min-class eager loading), push the forms, `(jit-eager)`
-  -> 633 native defuns (4.25 MB of code), `(%save-image …)` -> 12.1 MB core
+  -> 633 native defuns (4.25 MB of code), `(modus-int::%save-image …)` -> 12.1 MB core
   (reel-eager.core; the CORE-END print showed "4" — read the cursor slot
   0x10000F60 / dump-and-trim instead).  On the Zero (demo12 + reel-eager.core):
     (rh-first-frame) -> (320 180 384 192 0), on screen

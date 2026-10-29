@@ -158,11 +158,10 @@
           (t (%bs-flush b)
              (let ((c (bs-conn b)))
                (loop
-                 (let ((r (tcpc-read c :max max :timeout-ms (if (bs-nonblocking b) 0 1000))))
+                 (let ((r (tcpc-read c :max (min max (length arr)) :into arr
+                                       :timeout-ms (if (bs-nonblocking b) 0 1000))))
                    (cond ((eq r :eof) (return 0))
-                         ((> (length r) 0)
-                          (dotimes (i (length r)) (setf (aref arr i) (aref r i)))
-                          (return (length r)))
+                         ((> r 0) (return r))
                          ((bs-nonblocking b) (return -11))
                          ;; closed under us by another thread (see %SBS-RECVFROM): end of file
                          ((null (%bs fd)) (return 0))))))))))

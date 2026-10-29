@@ -342,28 +342,31 @@
         (with-net-lock (%tcp-emit c #x18 data pos n))
         (setq pos (+ pos n))))))
 
-(defun tcpc-read (c &key (max 65536) (timeout-ms 5000))
+(defun tcpc-read (c &key (max 65536) (timeout-ms 5000) into)
   "Up to MAX bytes C has received, waiting up to TIMEOUT-MS for any; :EOF once the peer
-   has closed and everything is read; an empty vector on timeout."
+   has closed and everything is read; an empty vector on timeout.  With INTO, an octet
+   vector of at least MAX, the bytes go there and the answer is their count (0 on timeout):
+   a socket read then allocates nothing."
   (%pump-until (lambda () (or (> (fill-pointer (tc-rx c)) 0) (tc-rx-eof c))) timeout-ms)
   (with-net-lock
     (let* ((rx (tc-rx c)) (have (fill-pointer rx)))
       (if (and (zerop have) (tc-rx-eof c))
           :eof
-          (let* ((n (min max have)) (out (make-array n :element-type '(unsigned-byte 8)))
+          (let* ((n (min max have)) (out (or into (make-array n :element-type '(unsigned-byte 8))))
                  (was (%rcv-window c)))
-            (dotimes (i n) (setf (aref out i) (aref rx i)))
+            (replace out rx :end2 n)
             (replace rx rx :start2 n :end2 have)
             (setf (fill-pointer rx) (- have n))
-            ;; drained: give back a buffer a burst grew (it costs 8 bytes a byte)
-            (when (and (= have n) (> (array-dimension rx 0) 16384))
+            ;; drained: give back a buffer a burst grew (it costs 8 bytes a byte) -- a big one
+            ;; only: below that, a desk's every update grew it again and it churned
+            (when (and (= have n) (> (array-dimension rx 0) 262144))
               (setf (tc-rx c) (make-array 4096 :element-type '(unsigned-byte 8)
                                                :adjustable t :fill-pointer 0)))
             ;; window update, over the network only, once the read reopened a quarter of it
             (when (and (null (tc-peer c)) (member (tc-state c) '(:established :fin-wait :fin-wait-2))
                        (< was (ash *tcp-rcv-buf* -2)) (>= (%rcv-window c) (ash *tcp-rcv-buf* -2)))
               (%tcp-ack c))
-            out)))))
+            (if into n out))))))
 
 (defun tcpc-close (c &key (timeout-ms 2000))
   "Send FIN and wait (briefly) for it to be acknowledged."

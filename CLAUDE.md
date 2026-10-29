@@ -1034,7 +1034,7 @@ per heap store (aarch64: 2 instructions; x64: an inline mark, see below).
   BEFORE the swap (tenure and the major steps change what the swap installs).
   `MODUS_X64_GEN=0` builds without it: same code as before modulo relocation.
   The JIT co-init must agree (`*x64-gen-gc*`), or a JIT page's stores skip the cards.
-- **A slot naming a LOCK-ARENA object is young** (x64; aarch64 still OPEN).  A
+- **A slot naming a LOCK-ARENA object is young** (x64 and aarch64).  A
   threaded STW collection evacuates the arena only when the runtime lock is free,
   so arena pointers can outlive a collection.  Three rules follow: the card scan
   keeps such a card dirty; a major that did not evacuate leaves every card dirty,
@@ -1043,10 +1043,11 @@ per heap store (aarch64: 2 instructions; x64: an inline mark, see below).
   `gc-major-threads` showed young pointers on clean cards in 1 run in 4 when audited
   after every major, and a TYPE-ERROR in 1 in 75.  The refresh after a park, safe
   trap or blocking syscall compares region 0's collection COUNT (`fs:0x10005010`),
-  not R12's range: after two flips a stale R12 is back in from-space.
+  not R12's range: after two flips a stale R12 is back in from-space (x64 only;
+  aarch64 still uses the range test).
 - **i386, riscv, arm32: not ported.**  `gc-tenure` refuses loudly there.
-- **Tenure without cards (`:cards nil`) cannot be untenured**, so save-image after it
-  errors: `gc-untenure` runs a major, which needs the card vector's meta.
+- **Tenure without cards (`:cards nil`)** still makes the card vector, so it is old,
+  and `gc-untenure` switches the cards on before its major (`*gc-cards-pending*`).
 
 ### Per-region GC, stage 1: the metadata block is a REGION CONTROL BLOCK
 

@@ -310,8 +310,13 @@ build-cli-common, which must agree); `MODUS_X64_GEN=0` builds the control.
   - `fin` fills the cards DIRTY when an arena is live and was not evacuated;
   - copy_object chases a forward that lands inside the current from-space, which happens
     only in phase 2 (the chase alone took the audited run from 67/300 bad to 0/300).
-  With all three, 600/600 runs were clean (300 audited, 300 plain).  The same three apply to
-  aarch64's collector, which has the same shapes; it is NOT fixed there yet.
+  With all three, 600/600 runs were clean (300 audited, 300 plain).  **aarch64 had the same
+  three shapes, and it was worse:** on the Pi 5 the audited control showed violations in 14
+  of 58 runs and failed 9 at the end.  Ported to `translate-aarch64.lisp`
+  (`a64-card-young-check`, the major step's fin, copy_object's `co-fwd`), all gated on
+  `*a64-tls-window*`: 337/337 audited runs clean.  The count-based refresh below is x64 only.
+  aarch64's safe-leave path still refreshes only after a spin, and that code also runs on
+  the bare-metal board, which this round did not test.
 - **The STW refresh counts collections.**  A thread that parks, enters a safe region, or
   blocks in a syscall snapshots region 0's collection count (`fs:0x10005010`).  On the way
   out, a different count reloads R12/R14 from region 0's block.  The old test was "R12
@@ -321,8 +326,11 @@ build-cli-common, which must agree); `MODUS_X64_GEN=0` builds the control.
   region 0's block, because a thread back from a syscall mid-collection would overwrite
   the collector's new frontier.  This did not move the gc-major-threads rate (the arena
   was the cause), but the stale frontier is wrong as written.
-- **Not done:** tenure with `:cards nil` cannot be untenured (gc-untenure is a major, which
-  needs the card meta), on both back ends.
+- **`:cards nil` un-tenures.**  `gc-tenure` makes the card vector either way, before the
+  tenure collection, so the vector is old and never moves.  Without cards it keeps the build
+  arguments in `*gc-cards-pending*`, and `gc-untenure` switches the cards on first (every card
+  starts dirty) and then runs its major.  The test's save-image check went 9/10 -> 10/10 on
+  both x64 and the Pi 5, with cards mode unchanged at 21/21.
 
 ## Risks named up front
 

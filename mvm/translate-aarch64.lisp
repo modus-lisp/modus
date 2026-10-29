@@ -8168,8 +8168,9 @@
 
 (defun a64-card-young-check (buf)
   "After SCAN_WORD on the slot at x23: x4 := 1 if the slot now holds a
-   pointer into to-space [x22, x22+x25) -- the young survivors -- so its card
-   must stay dirty.  Clobbers x10/x11."
+   pointer into to-space [x22, x22+x25) -- the young survivors -- or, threaded,
+   into the lock arena, so its card must stay dirty.  Clobbers x10/x11, and
+   x16/x17 threaded."
   (let ((no (incf *mvm-label-counter*)))
     (a64-ldr-unsigned buf +a64-x10+ +a64-x23+ 0)
     (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
@@ -8177,7 +8178,26 @@
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i no :bcond))
     (a64-sub-reg buf +a64-x11+ +a64-x10+ +a64-x22+ 0 0)
     (a64-cmp-reg buf +a64-x11+ +a64-x25+)
-    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i no :bcond))
+    (if (not *a64-tls-window*)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i no :bcond))
+        ;; A pointer into the LOCK ARENA is young too: a collection that found
+        ;; the runtime lock held did not evacuate it, and the next one that
+        ;; does moves the object -- through this slot only if its card is
+        ;; still dirty (translate-x64's EMIT-X64-OLD-CARD-SCAN).  Arena words:
+        ;; base +0, end +0x10, their raw address at 0x10000D98 (0 = none).
+        (let ((young (incf *mvm-label-counter*)))
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i young :bcond))
+          (a64-load-real-addr buf +a64-x16+ (conv-real #x10000D98))
+          (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ 0)
+          (a64-cmp-imm buf +a64-x16+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no :bcond))
+          (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)
+          (a64-cmp-reg buf +a64-x10+ +a64-x17+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i no :bcond))
+          (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x10)
+          (a64-cmp-reg buf +a64-x10+ +a64-x17+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i no :bcond))
+          (a64-set-label buf young)))
     (a64-movz buf +a64-x4+ 1 0)
     (a64-set-label buf no)))
 
@@ -8778,7 +8798,30 @@
     (a64-mov-reg buf +a64-x2+ +a64-x11+)                     ; keep the half
     (a64-mov-reg buf +a64-x26+ +a64-x22+)
     (a64-mov-reg buf +a64-x23+ +a64-x21+)
-    (emit-aarch64-crossing-fill buf nil)
+    ;; CLEAN, unless a lock arena is live and this collection did NOT evacuate
+    ;; it (the runtime lock was held): old slots still name arena objects, and
+    ;; the next evacuating collection must visit them (translate-x64's
+    ;; EMIT-X64-MAJOR-STEP has the chain).  x9/x10 scratch.
+    (if (not *a64-tls-window*)
+        (emit-aarch64-crossing-fill buf nil)
+        (let ((clean (incf *mvm-label-counter*)) (filled (incf *mvm-label-counter*)))
+          (a64-load-real-addr buf +a64-x9+ (conv-real #x10000D98))
+          (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0)
+          (a64-cmp-imm buf +a64-x9+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i clean :bcond))
+          (a64-load-real-addr buf +a64-x9+ (conv-real #x10000DA8))
+          (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0)
+          (a64-cmp-imm buf +a64-x9+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i clean :bcond))
+          (a64-add-imm-lsl12 buf +a64-x9+ +a64-x9+ #x13)
+          (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ #x88)
+          (a64-cmp-imm buf +a64-x10+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i clean :bcond))
+          (emit-aarch64-crossing-fill buf t)
+          (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i filled :b))
+          (a64-set-label buf clean)
+          (emit-aarch64-crossing-fill buf nil)
+          (a64-set-label buf filled)))
     (a64-store-word buf +gc-card-base-addr+ +a64-x0+ +a64-x13+) ; cards on
     (a64-mov-reg buf +a64-x22+ +a64-x19+)                    ; young from = old area
     (a64-add-reg buf +a64-x19+ +a64-x19+ +a64-x2+ 0 0)       ; young to
@@ -9196,6 +9239,16 @@
       (a64-set-label buf co-fwd)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 4) (a64-lsl-imm buf +a64-x14+ +a64-x14+ 4) ; new addr
       (a64-add-reg buf +a64-x10+ +a64-x14+ +a64-x12+ 0 0) ; new | orig tag
+      ;; A forward INTO THIS COLLECTION'S FROM-SPACE [x19, x20) is a major's
+      ;; phase-1 promotion seen from phase 2 (from = the old area): chase it,
+      ;; or the slot keeps an address phase 2 hands to the young pair
+      ;; (translate-x64's EMIT-X64-GEN-COPY-OBJECT).  Never true otherwise.
+      (when *a64-tls-window*
+        (a64-cmp-reg buf +a64-x14+ +a64-x19+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i co-done :bcond))
+        (a64-cmp-reg buf +a64-x14+ +a64-x20+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i co-done :bcond))
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i copy-obj :b)))
       (a64-set-label buf co-done)
       (a64-ret buf)
       (a64-set-label buf co-full)

@@ -1940,6 +1940,13 @@
    collector keeps scanning only dirty cards."
   (%gc-write64 (+ (%gc-card-words) 16) 0))
 
+(defvar *gc-cards-pending* nil
+  "After (GC-TENURE :CARDS NIL): the arguments %GC-CARDS-BUILD would have had,
+   so GC-UNTENURE can switch the cards on first -- the un-tenure is a major,
+   and a major runs on the card meta.  The vector itself was allocated BEFORE
+   the tenure collection, so it is old and never moves under the raw card
+   words; one made at un-tenure time would be young and would.")
+
 (defun gc-tenure (&key (cards t) (promote t) young)
   "Make everything live in region 0 now an OLD SPACE that collections scan and
    never copy, and continue on two young semispaces of half the old size, cut
@@ -1966,8 +1973,9 @@
              (before 0))
         (when young
           (setq half (max 1048576 (min half (* 4096 (floor young 4096))))))
-        ;; the survivors land in the CURRENT to-space: that is the old area
-        (when cards
+        ;; the survivors land in the CURRENT to-space: that is the old area.
+        ;; The vector is made with or without CARDS (see *GC-CARDS-PENDING*).
+        (progn
           (setq area (%gc-meta-read (+ r 8) k)
                 ncards (* 16 (ceiling size 8192))
                 vec (make-array (+ 128 (* 5 ncards)) :element-type '(unsigned-byte 8)))
@@ -1981,12 +1989,13 @@
           (let ((probe (cons 1 2)))
             (when (/= (%gc-epoch) before) (return (car probe)))))
         (when (%gc-old-space-p)
-          (when cards
-            (unless (= (%gc-old-lo) area)
-              (error "GC-TENURE: the old space is not where the card table was sized for"))
-            (%gc-cards-build vec area ncards size promote
-                             (let ((to (%gc-meta-read (+ r 8) k)))
-                               (%gc-gen-ceiling (min from to) (+ (max from to) size)))))
+          (unless (= (%gc-old-lo) area)
+            (error "GC-TENURE: the old space is not where the card table was sized for"))
+          (let ((ceiling (let ((to (%gc-meta-read (+ r 8) k)))
+                           (%gc-gen-ceiling (min from to) (+ (max from to) size)))))
+            (if cards
+                (%gc-cards-build vec area ncards size promote ceiling)
+                (setq *gc-cards-pending* (list vec area ncards size ceiling))))
           (return (list (%gc-old-lo) (%gc-old-hi) half ncards)))
         (%gc-write64 req 0)
         (setq tries (+ tries 1))
@@ -2024,6 +2033,12 @@
 (defun gc-untenure ()
   "Back to one ordinary semispace pair (what SAVE-IMAGE needs): a major that
    ends with no old space and no card table."
+  (when (and (%gc-old-space-p) (null (%gc-gen-meta)) *gc-cards-pending*)
+    ;; tenured :CARDS NIL: cards on now (every card starts dirty, so the first
+    ;; card scan is a full walk and nothing stored since is missed)
+    (destructuring-bind (vec area ncards size ceiling) *gc-cards-pending*
+      (%gc-cards-build vec area ncards size nil ceiling))
+    (setq *gc-cards-pending* nil))
   (when (%gc-old-space-p)
     (%gc-gen-request 4 "GC-UNTENURE"))
   (when (%gc-old-space-p)

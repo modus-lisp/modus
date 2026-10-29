@@ -211,57 +211,59 @@
           for c = (%perf-ctl core)
           collect (list core (%perf-u64 (+ c 40)) (%perf-u64 (+ c 48))))))
 
+;;; ---- reading the rings ---------------------------------------------------------------------
+
+(defun %perf-each (cores alloc alloc-max fn)
+  "Call FN with (PC X30 FRAMES WEIGHT) for every sample in CORES' rings.  WEIGHT is 1, or with
+   ALLOC the BYTES the core allocated since its previous sample (each record carries the
+   allocation pointer, x24 -- which holds the address HALVED, a fixnum).  A step is from the
+   previous sample IN THE SAME HEAP: region 0's semispace 0 or 1 (the other one's last sample is
+   forgotten at a flip -- it is a cycle old), or anywhere else, where it counts only under
+   ALLOC-MAX.  A step that goes down is a collection, not allocation.  So the bytes are a sample of
+   what was allocated, not all of it."
+  (dolist (core cores)
+    (let* ((c (%perf-ctl core)) (base (%perf-u64 c)) (wp (%perf-u64 (+ c 16)))
+           (depth (%perf-u64 (+ c 32))) (rec (* 8 (+ 3 depth)))
+           (prevs (list nil nil nil))
+           (rcb (and alloc (%gc-region-0)))
+           (k (and rcb (%gc-meta-scale)))
+           (sz (and rcb (%gc-meta-read (+ rcb 16) k)))
+           (spaces (and rcb (list (%gc-meta-read rcb k) (%gc-meta-read (+ rcb 8) k)))))
+      (when (plusp base)
+        (loop for r from base below wp by rec
+              do (let* ((pc (%perf-u64 (+ r 8)))
+                        (ap (* 2 (ash (%perf-u64 r) -16)))
+                        (hi (or (and spaces (position-if (lambda (s) (and (<= s ap) (< ap (+ s sz))))
+                                                         spaces))
+                                2))
+                        (prev (progn (when (< hi 2) (setf (nth (- 1 hi) prevs) nil))
+                                     (nth hi prevs)))
+                        (w (if alloc
+                               (let ((d (and prev (- ap prev))))
+                                 (cond ((or (null d) (< d 0)) 0)
+                                       ((< hi 2) d)
+                                       ((<= d alloc-max) d)
+                                       (t 0)))
+                               1)))
+                   (setf (nth hi prevs) ap)
+                   (when (plusp w)
+                     (funcall fn pc (%perf-u64 (+ r 16))
+                              (loop for i from 0 below depth
+                                    for f = (%perf-u64 (+ r 24 (* 8 i)))
+                                    until (zerop f) collect f)
+                              w))))))))
+
 (defun perf-report (&key (cores '(0 1 2 3)) (top 40) (stream *standard-output*) alloc
-                        (alloc-max #x4000000))
+                        (alloc-max #x400000))
   "Fold the rings into stacks and print the TOP: `count pc;x30;ret0;ret1...' in hex, leaf
-   first.  Also a flat top by PC.  The host symbolizes (net/bare-perf-report.py).
-   With ALLOC, a sample's weight is not 1 but the BYTES its core allocated since the core's
-   previous sample (each record carries the allocation pointer, x24 -- which holds the address
-   HALVED, a fixnum): an allocation profile on the same samples, read by the same host script.
-   A step is from the previous sample in the same heap -- region 0's semispace 0 or 1, or
-   anywhere else (a slot thread's region, which shares core 0 with the main thread) -- and
-      counts when it goes up (elsewhere: by at most ALLOC-MAX).  A collection moves region 0's
-   pointer to the other space; the first attempt, which only capped the step, charged those jumps to whatever ran next (the
-   collector's caller) -- most of the total.  Elsewhere a step must be under ALLOC-MAX.  So the
-   bytes are a sample of what was allocated, not all of it."
+   first.  Also a flat top by PC.  The host symbolizes (net/bare-perf-report.py); PERF-TOP and
+   ALLOC-TOP name them on the board.  ALLOC weighs each sample by bytes (%PERF-EACH)."
   (let ((stacks (make-hash-table :test 'equal)) (flat (make-hash-table)) (n 0))
-    (dolist (core cores)
-      (let* ((c (%perf-ctl core)) (base (%perf-u64 c)) (wp (%perf-u64 (+ c 16)))
-             (depth (%perf-u64 (+ c 32))) (rec (* 8 (+ 3 depth)))
-             (prevs (list nil nil nil))                  ; per heap: semispace 0, 1, elsewhere
-             (rcb (and alloc (= core 0) (%conv-addr #x10000040)))
-             (sz (and rcb (%gc-read64 (+ rcb 16))))
-             (spaces (and rcb (list (%gc-read64 rcb) (%gc-read64 (+ rcb 8))))))
-        (when (plusp base)
-          (loop for r from base below wp by rec
-                do (let* ((pc (%perf-u64 (+ r 8)))
-                          (ap (* 2 (ash (%perf-u64 r) -16)))
-                          ;; which heap the pointer is in: a slot thread on the same core
-                          ;; allocates in its own region, and a step between two threads'
-                          ;; samples measures nothing -- so a step is from the previous sample
-                          ;; IN THE SAME HEAP (region 0's semispace 0 or 1, or elsewhere)
-                          (hi (or (and spaces (position-if (lambda (s) (and (<= s ap) (< ap (+ s sz))))
-                                                           spaces))
-                                  2))
-                          ;; a flip: the other semispace's last sample is a cycle old
-                          (prev (progn (when (< hi 2) (setf (nth (- 1 hi) prevs) nil))
-                                       (nth hi prevs)))
-                          (w (if alloc
-                                 (let ((d (and prev (- ap prev))))
-                                   (cond ((or (null d) (< d 0)) 0)
-                                         ((< hi 2) d)
-                                         ((<= d alloc-max) d)
-                                         (t 0)))
-                                 1))
-                          (frames (loop for i from 0 below depth
-                                        for f = (%perf-u64 (+ r 24 (* 8 i)))
-                                        until (zerop f) collect f))
-                          (key (format nil "~x;~x~{;~x~}" pc (%perf-u64 (+ r 16)) frames)))
-                     (setf (nth hi prevs) ap)
-                     (when (plusp w)
-                       (incf n w)
-                       (incf (gethash pc flat 0) w)
-                       (incf (gethash key stacks 0) w)))))))
+    (%perf-each cores alloc alloc-max
+                (lambda (pc x30 frames w)
+                  (incf n w)
+                  (incf (gethash pc flat 0) w)
+                  (incf (gethash (format nil "~x;~x~{;~x~}" pc x30 frames) stacks 0) w)))
     (flet ((top-of (h)
              (let ((l '())) (maphash (lambda (k v) (push (cons v k) l)) h)
                (subseq (sort l #'> :key #'car) 0 (min top (length l))))))
@@ -270,3 +272,196 @@
       (dolist (e (top-of stacks)) (format stream "PERF-STACK ~d ~a~%" (car e) (cdr e)))
       (finish-output stream)
       n)))
+
+;;; ---- names, on the board -----------------------------------------------------------------
+;;; A running image answers "where" itself: no host, no symbol map, no restart.  Every fbound
+;;; symbol's function is an entry address; a PC belongs to the nearest entry at or below it.
+;;; Code with no symbol of its own (closures, the collector, JIT pages) is charged to whatever
+;;; precedes it, so a name more than *PERF-NAME-REACH* bytes below the PC is shown as "?NAME+off".
+
+(defvar *perf-names* nil "(STARTS . NAMES): sorted entry addresses and their names, or NIL.")
+(defvar *perf-name-reach* #x20000)
+
+(defun perf-names (&key refresh)
+  "The entry-address table, built on first use (or with REFRESH, after new DEFUNs)."
+  (when (or refresh (null *perf-names*))
+    (let ((l '()))
+      (dolist (p (list-all-packages))
+        (%do-symbols-fn
+         (lambda (s)
+           (let ((f (and (fboundp s) (not (special-operator-p s)) (not (macro-function s))
+                         (ignore-errors (symbol-function s)))))
+             (when f
+               (let ((w (%val->word f)))
+                 (when (eql (logand w 15) 3)
+                   (push (cons (- w 3) s) l))))))
+         p))
+      (setq l (sort l #'< :key #'car))
+      (let ((starts (make-array (length l))) (names (make-array (length l))))
+        (loop for e in l for i from 0 do (setf (svref starts i) (car e) (svref names i) (cdr e)))
+        (setq *perf-names* (cons starts names)))))
+  *perf-names*)
+
+(defvar *perf-image-names* nil
+  "(STARTS ENDS NAMES) for the KERNEL's own functions, from the build's symbol map: they are
+   reached by direct calls, and the symbol table names their thunks, not their code.")
+
+(defvar *perf-image-pending* nil)
+
+(defun perf-image-names (base &rest chunks)
+  "Install the kernel's names.  Each chunk is a vector VA SIZE NAME VA SIZE NAME ... from the
+   build's MODUS_SYMMAP, BASE what is added to a VA where the kernel runs.  A host writes the
+   file of calls (net/bare-perf-names.py) and sends it to the running image: (perf-image-names
+   BASE :begin), then (perf-image-names BASE chunk) a form at a time, then (perf-image-names
+   BASE :end) installs them."
+  (cond
+    ((eq (first chunks) :begin) (setq *perf-image-pending* nil) 0)
+    ((eq (first chunks) :end)
+     (let* ((l (sort *perf-image-pending* #'< :key #'car)) (n (length l))
+            (starts (make-array n)) (ends (make-array n)) (names (make-array n)))
+       (loop for e in l for j from 0
+             do (setf (svref starts j) (+ base (first e)) (svref ends j) (+ base (first e) (second e))
+                      (svref names j) (third e)))
+       (setq *perf-image-names* (list starts ends names) *perf-image-pending* nil)
+       n))
+    (t (dolist (v chunks (length *perf-image-pending*))
+         (loop for i from 0 below (- (length v) 2) by 3
+               do (push (list (svref v i) (svref v (+ i 1)) (svref v (+ i 2))) *perf-image-pending*))))))
+
+(defun %perf-image-name (pc)
+  (let ((tab *perf-image-names*))
+    (when tab
+      (let* ((starts (first tab)) (lo 0) (hi (1- (length starts))))
+        (when (and (>= hi 0) (>= pc (svref starts 0)))
+          (loop while (< lo hi)
+                do (let ((mid (ash (+ lo hi 1) -1)))
+                     (if (<= (svref starts mid) pc) (setq lo mid) (setq hi (1- mid)))))
+          (and (< pc (svref (second tab) lo)) (svref (third tab) lo)))))))
+
+(defun perf-name (pc)
+  "The function PC is in, as a string: the kernel's map first (exact), then the symbols."
+  (let ((k (%perf-image-name pc)))
+    (when k (return-from perf-name k)))
+  (let* ((tab (perf-names)) (starts (car tab)) (lo 0) (hi (1- (length starts))))
+    (if (or (< hi 0) (< pc (svref starts 0)))
+        (format nil "?~x" pc)
+        (progn
+          (loop while (< lo hi)
+                do (let ((mid (ash (+ lo hi 1) -1)))
+                     (if (<= (svref starts mid) pc) (setq lo mid) (setq hi (1- mid)))))
+          (let ((s (svref (cdr tab) lo)) (off (- pc (svref starts lo))))
+            (if (> off *perf-name-reach*)
+                (format nil "?~a+~x" s off)
+                (let ((p (symbol-package s)))
+                  (if (or (null p) (eq p (find-package "COMMON-LISP-USER")))
+                      (symbol-name s)
+                      (format nil "~a::~a" (package-name p) (symbol-name s))))))))))
+
+(defun perf-top (&key (cores '(0)) alloc (alloc-max #x400000) (top 25) (stream *standard-output*))
+  "The rings as a table, named here: SELF (the sampled function) and TOTAL (anywhere on the
+   stack), in samples -- or with ALLOC, in bytes."
+  (let ((self (make-hash-table :test 'equal)) (total (make-hash-table :test 'equal)) (n 0)
+        (memo (make-hash-table)))
+    (flet ((nm (pc) (or (gethash pc memo) (setf (gethash pc memo) (perf-name pc)))))
+      (%perf-each cores alloc alloc-max
+                  (lambda (pc x30 frames w)
+                    (declare (ignore x30))
+                    (incf n w)
+                    (incf (gethash (nm pc) self 0) w)
+                    (let ((seen (list (nm pc))))
+                      (incf (gethash (nm pc) total 0) w)
+                      (dolist (f frames)
+                        (let ((name (nm (- f 4))))
+                          (unless (member name seen :test #'string=)
+                            (push name seen)
+                            (incf (gethash name total 0) w))))))))
+    (flet ((ranked (h) (let ((l '())) (maphash (lambda (k v) (push (cons v k) l)) h)
+                         (sort l #'> :key #'car)))
+           (amount (v) (if alloc (format nil "~8,1f MB" (/ v 1048576.0)) (format nil "~8d" v))))
+      (format stream "~&~a: ~a~%" (if alloc "allocated" "samples") (amount n))
+      (format stream "~&-- self~%")
+      (loop for (v . k) in (ranked self) repeat top
+            do (format stream "~5,1f% ~a  ~a~%" (/ (* 100.0 v) (max n 1)) (amount v) k))
+      (format stream "~&-- total~%")
+      (loop for (v . k) in (ranked total) repeat top
+            do (format stream "~5,1f% ~a  ~a~%" (/ (* 100.0 v) (max n 1)) (amount v) k))
+      (finish-output stream)
+      n)))
+
+(defvar *perf-began* nil "(TICKS . CORES) when ALLOC-BEGIN / CPU-BEGIN started sampling.")
+
+(defun alloc-begin (&key (cores '(0)) (hz 500))
+  "Start sampling CORES and return at once: what runs meanwhile is what ALLOC-TOP or CPU-TOP
+   will report.  Returning matters -- a board's REPL is its desk's thread, and a REPL that slept
+   through the measurement would measure a stopped desk."
+  (perf-start :hz hz :depth 24 :cores cores :ring-kb 2048)
+  (setq *perf-began* (cons (%bt-ticks) cores))
+  :sampling)
+
+(defun cpu-begin (&rest args) (apply #'alloc-begin args))
+
+(defun %perf-end ()
+  "Stop what *-BEGIN started: (values CORES SECONDS)."
+  (let ((cores (or (cdr *perf-began*) '(0))))
+    (perf-stop cores)
+    (values cores (if *perf-began*
+                      (/ (- (%bt-ticks) (car *perf-began*)) (%bt-ms-ticks 1) 1000.0)
+                      0))))
+
+(defun alloc-top (&key (top 25) (stream *standard-output*))
+  "Who allocated since ALLOC-BEGIN, named, and the rate.  Opt-in and live: load this file into
+   a running image, (alloc-begin), let it work, (alloc-top) -- nothing to rebuild or restart."
+  (multiple-value-bind (cores secs) (%perf-end)
+    (let ((n (perf-top :cores cores :alloc t :top top :stream stream)))
+      (format stream "~&~,1f MB in ~,1f s = ~,1f MB/s~%" (/ n 1048576.0) secs
+              (if (plusp secs) (/ n 1048576.0 secs) 0))
+      (finish-output stream)
+      (values))))
+
+(defun cpu-top (&key (top 25) (stream *standard-output*))
+  "Where the time went since CPU-BEGIN (the same sampler, counted in samples)."
+  (let ((cores (%perf-end)))
+    (perf-top :cores cores :top top :stream stream)
+    (values)))
+
+;;; ---- the collector, in numbers -----------------------------------------------------------
+;;; GC-REPORT reads what the image already keeps -- each region's collection count (its control
+;;; block, +0x20) and the collector's running totals (pause ticks, survivor bytes) -- and prints
+;;; the change since the last call, so (gc-report) twice, a while apart, is a rate.  The pause
+;;; and survivor totals are for every region together: the collector keeps one set.
+
+(defvar *gc-report-last* nil)
+
+(defun %gc-regions ()
+  "(NAME . RCB) for region 0 and each core's heap that has a control block."
+  (cons (cons "region 0" (%gc-region-0))
+        (loop for c from 1 below (%bt-ncores)
+              for rcb = (%bt-rcb c)
+              when (plusp (%gc-meta-read (+ rcb #x10) (%gc-meta-scale)))
+                collect (cons (format nil "core ~d heap" c) rcb))))
+
+(defun gc-report (&key (stream *standard-output*))
+  "Collections per region, and pause time and survivor bytes, since the last GC-REPORT."
+  (let* ((k (%gc-meta-scale))
+         (now (list :t (%bt-ticks)
+                    :counts (mapcar (lambda (r) (%gc-meta-read (+ (cdr r) #x20) k)) (%gc-regions))
+                    :ticks (%gc-stat-total-ticks) :bytes (%gc-stat-total-bytes)
+                    :n (%gc-stat-count)))
+         (was (or *gc-report-last* (list :t 0 :counts nil :ticks 0 :bytes 0 :n 0)))
+         (tpm (%bt-ms-ticks 1))
+         (dt (/ (- (getf now :t) (getf was :t)) tpm 1000.0))
+         (dn (- (getf now :n) (getf was :n)))
+         (pause (/ (- (getf now :ticks) (getf was :ticks)) tpm 1.0)))
+    (setq *gc-report-last* now)
+    (format stream "~&over ~,1f s: ~d collections, ~,0f ms paused (~,1f%), mean ~,1f ms, max ever ~,1f ms~%"
+            dt dn pause (if (plusp dt) (/ pause dt 10.0) 0)
+            (if (plusp dn) (/ pause dn) 0) (/ (%gc-stat-max-ticks) tpm 1.0))
+    (format stream "survivors: ~,1f MB copied, last ~,1f MB~%"
+            (/ (- (getf now :bytes) (getf was :bytes)) 1048576.0) (/ (%gc-stat-last-bytes) 1048576.0))
+    (loop for r in (%gc-regions) for i from 0
+          for c = (nth i (getf now :counts))
+          for c0 = (or (nth i (getf was :counts)) 0)
+          do (format stream "  ~12a ~6d collections (+~d), semispace ~,1f MB~%"
+                     (car r) c (- c c0) (/ (%gc-meta-read (+ (cdr r) #x10) k) 1048576.0)))
+    (finish-output stream)
+    (values)))

@@ -1741,24 +1741,30 @@
                          0))
          (nio (or (kernel-image-native-image-offset image) 0))
          (ncl (length (kernel-image-native-code image)))
-         (sorted (stable-sort (copy-list function-table)
-                              #'< :key #'mvm-function-info-native-offset)))
+         ;; (native-offset . name): the functions, and the unnamed runtime code a translator
+         ;; appended after them (aarch64's *A64-RUNTIME-MARKS*), so a PC in the collector is
+         ;; not charged to the last function
+         (marks (let ((sym (find-symbol "*A64-RUNTIME-MARKS*" "MODUS.MVM")))
+                  (and sym (boundp sym)
+                       (prog1 (mapcar (lambda (m) (cons (cdr m) (car m))) (symbol-value sym))
+                         (setf (symbol-value sym) nil)))))
+         (sorted (stable-sort (append (mapcar (lambda (fi)
+                                                (cons (or (mvm-function-info-native-offset fi) 0)
+                                                      (string (mvm-function-info-name fi))))
+                                              function-table)
+                                      marks)
+                              #'< :key #'car)))
     (with-open-file (out path :direction :output :if-exists :supersede
                               :if-does-not-exist :create)
       (format out "# virtual-addr~Csize~Cnative-offset~Cname~%"
               #\Tab #\Tab #\Tab)
-      (loop for fi in sorted
-            for i from 0
-            for nat-off = (or (mvm-function-info-native-offset fi) 0)
-            for next-off = (if (< (1+ i) (length sorted))
-                               (mvm-function-info-native-offset
-                                 (nth (1+ i) sorted))
-                               ncl)
+      (loop for (nat-off . name) in sorted
+            for rest = (cdr sorted) then (cdr rest)
+            for next-off = (if rest (car (first rest)) ncl)
             for size = (max 0 (- next-off nat-off))
             for vaddr = (+ load-addr elf-header nio nat-off)
             do (format out "~16,'0X~C~D~C~D~C~A~%"
-                       vaddr #\Tab size #\Tab nat-off #\Tab
-                       (string (mvm-function-info-name fi))))
+                       vaddr #\Tab size #\Tab nat-off #\Tab name))
       (format t "  Wrote symbol map: ~A~%" path))))
 
 ;;; ============================================================

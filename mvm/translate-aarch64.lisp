@@ -1123,7 +1123,18 @@
     (a64-emit-call-label buf (cadr e) t)                     ; B stub
     (a64-slot-cache-flush)))
 
+(defvar *a64-runtime-marks* nil
+  "(NAME . native byte offset) of the unnamed runtime code a whole-image translation appends
+   after the last function -- the handler helpers, the native collector, the store guard, the
+   cold stubs, the bitmap marks -- newest first.  WRITE-SYMMAP names them; without it a profiler
+   charged all of it (the collector included) to whichever function happened to be last.")
+
+(defun a64-runtime-mark (buf name)
+  (when (and *aarch64-translate-into-buf* (not *aarch64-jit-mode*))
+    (push (cons name (* 4 (a64-current-index buf))) *a64-runtime-marks*)))
+
 (defun a64-emit-cold-stubs (buf)
+  (when *a64-cold-stubs* (a64-runtime-mark buf "<runtime: cold-call stubs>"))
   (dolist (e (reverse *a64-cold-stubs*))
     (a64-slot-cache-flush)
     (a64-set-label buf (cadr e))
@@ -1139,11 +1150,13 @@
    cold-call stubs."
   (a64-emit-cold-stubs buf)
   (when *a64-mark-start-label*
+    (a64-runtime-mark buf "<runtime: gc mark start bit>")
     (a64-set-label buf *a64-mark-start-label*)
     (emit-aarch64-gc-set-bit buf #x10000E18)
     (a64-br buf +a64-x15+)
     (setq *a64-mark-start-label* nil))
   (when *a64-mark-cons-label*
+    (a64-runtime-mark buf "<runtime: gc mark cons bit>")
     (a64-set-label buf *a64-mark-cons-label*)
     (emit-aarch64-gc-set-bit buf #x10000E40)
     (a64-br buf +a64-x15+)
@@ -8837,6 +8850,7 @@
   (when (and *aarch64-gc-native-mcgc* *aarch64-gc-trampoline-label*
              (not (and *aarch64-jit-mode*
                        (not *aarch64-gc-trampoline-call-via-bl*))))
+    (a64-runtime-mark buf "<runtime: native collector>")
     (emit-aarch64-native-gc-trampoline buf))
   (when (and (not *aarch64-gc-native-mcgc*)
              *aarch64-gc-trampoline-label*
@@ -9231,10 +9245,12 @@
     ;; defun) so adding them doesn't shift any fn-entry-offset.  At
     ;; Phase 3(a) these are dead code — no trap BLs to them yet.
     (when *aarch64-translate-into-buf*
+      (a64-runtime-mark buf "<runtime: handler helpers>")
       (emit-aarch64-handler-helpers buf))
 
     ;; The shared-store guard, when a store in this unit called it.
     (when *a64-ssg-label*
+      (a64-runtime-mark buf "<runtime: shared-store guard>")
       (a64-emit-shared-store-guard-sub buf *a64-ssg-label*)
       (setq *a64-ssg-label* nil))
     ;; The GC bitmap marks, when an allocation in this unit called them.

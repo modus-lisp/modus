@@ -3457,6 +3457,69 @@
              (setq *compile-safety* 3))
             (t nil)))))))
 
+;;; ---- (declare (optimize (safety N))) — honoured per body -------------------
+;;; A function body, LET, LET* or LOCALLY (which expands to (LET () …)) whose
+;;; leading declarations name a SAFETY level compiles at that level, so the
+;;; checks gated on *COMPILE-SAFETY* (array bounds above all) follow the
+;;; standard local declaration, not only a global DECLAIM -- mill writes
+;;; (optimize (speed 3) (safety 0)) on its hot loops.  Scope: the whole form,
+;;; LET inits included (CLHS scopes an OPTIMIZE declaration to the body; the
+;;; inits only lose checks they would otherwise have).  Each binding is the
+;;; ONLY special bound in its function (a special LET nested under another in
+;;; one function was invisible to callees in the build-time self-compile), and
+;;; is DECLAREd special: the image's compiler does not otherwise know
+;;; *COMPILE-SAFETY* is special, and would bind it lexically (build-checks
+;;; check-let-of-unregistered-special caught exactly that).
+(defun %body-safety (body)
+  "The SAFETY level BODY's leading declarations name, or NIL."
+  (let ((level nil))
+    (loop
+      (cond ((and (consp body) (stringp (car body)) (consp (cdr body)))
+             (setq body (cdr body)))
+            ((and (consp body) (consp (car body)) (symbolp (caar body))
+                  (name-eq (caar body) "DECLARE"))
+             (dolist (spec (cdar body))
+               (when (and (consp spec) (symbolp (car spec)) (name-eq (car spec) "OPTIMIZE"))
+                 (dolist (q (cdr spec))
+                   (cond ((and (consp q) (symbolp (car q)) (name-eq (car q) "SAFETY")
+                               (consp (cdr q)) (integerp (cadr q)))
+                          (setq level (cadr q)))
+                         ((and (symbolp q) (name-eq q "SAFETY")) (setq level 3))))))
+             (setq body (cdr body)))
+            (t (return level))))))
+
+(defun %compile-let-at-safety (level bindings body env dest)
+  (let ((*compile-safety* level)) (declare (special *compile-safety*)) (%compile-let-1 bindings body env dest)))
+(defun compile-let (bindings body env dest)
+  "Compile (let ((var val)*) body*).
+   All values are evaluated in the outer environment, then bound."
+  (let ((level (%body-safety body)))
+    (if level
+        (%compile-let-at-safety level bindings body env dest)
+        (%compile-let-1 bindings body env dest))))
+
+(defun %compile-let*-at-safety (level bindings body env dest)
+  (let ((*compile-safety* level)) (declare (special *compile-safety*)) (%compile-let*-1 bindings body env dest)))
+(defun compile-let* (bindings body env dest)
+  "Compile (let* ((var val)*) body*).
+   Values are evaluated sequentially; each can see earlier bindings."
+  (let ((level (%body-safety body)))
+    (if level
+        (%compile-let*-at-safety level bindings body env dest)
+        (%compile-let*-1 bindings body env dest))))
+
+(defun %mvm-compile-function-at-safety (level name params body parent-env rest-slot opt-start opt-count)
+  (let ((*compile-safety* level))
+    (declare (special *compile-safety*))
+    (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count)))
+(defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
+  "Compile a single function into IR (%MVM-COMPILE-FUNCTION-INTERNAL-2), at
+   the SAFETY level its body declares, if any."
+  (let ((level (%body-safety body)))
+    (if level
+        (%mvm-compile-function-at-safety level name params body parent-env rest-slot opt-start opt-count)
+        (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count))))
+
 ;;; ---- (declaim (inline f)) — honoured at runtime (mvm-eval) -----------------
 ;;;
 ;;; A name declaimed INLINE whose later DEFUN has only required parameters is
@@ -13390,7 +13453,7 @@
     (t (emit-ir :gc-check)
        (emit-ir :fp-box dest (binding-reg binding)))))
 
-(defun compile-let (bindings body env dest)
+(defun %compile-let-1 (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
   ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
@@ -13441,7 +13504,7 @@
              ;; captured local as before.
              (sm (mapcar (lambda (c) `(,(car c) (car ,(cdr c)))) cells))
              (combined-bindings (append non-boxed-bindings cell-bindings)))
-        (return-from compile-let
+        (return-from %compile-let-1
           (compile-form `(let ,combined-bindings (symbol-macrolet ,sm ,@body-stripped))
                         env dest)))))
   (check-frame-overflow (length bindings) "let" env)
@@ -13567,7 +13630,7 @@
     (when (> n-bindings 0)
       (emit-ir :frame-free n-bindings))))
 
-(defun compile-let* (bindings body env dest)
+(defun %compile-let*-1 (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
   ;; Cell-boxing: detect variables that are mutated inside lambdas in
@@ -13601,7 +13664,7 @@
                         `(progn ,@body-stripped)))
              ;; A fresh cell symbol: see compile-let.
              (cell (%mvm-gensym (symbol-name (cell-var-name var)))))
-        (return-from compile-let*
+        (return-from %compile-let*-1
           (compile-form `(let* (,@before (,cell (cons ,init nil)))
                            (symbol-macrolet ((,var (car ,cell)))
                              ,inner))
@@ -28759,7 +28822,7 @@
                   (list (cons 'let (cons (mapcar (lambda (v) (list v v)) boxed)
                                          rest))))))))
 
-(defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
+(defun %mvm-compile-function-internal-2 (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR. Returns function-info.
    Does NOT produce bytecode; that happens in phase 3.
    PARENT-ENV, if provided, allows closure variable references.

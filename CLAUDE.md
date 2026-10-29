@@ -831,6 +831,18 @@ first found here:
   for a declared or `make-array`-inferred single-float vector) had NO bounds check:
   on x64 `(setf (aref v 4) 1.0)` and `(setf (aref v -1) 1.0)` on a 4-lane vector
   silently wrote outside it.  `%LANE-INDEX-CHECK-BEGIN/-END` wrap both now.
+  **That check costs 40-50% on a lane-bound loop** (x64, JIT'd saxpy / 3-tap /
+  dot over 4096 lanes: main 37/66/19 ms, checked 56/93/29), the same price every
+  other checked array path pays.  The opt-out is the standard one, and it now
+  WORKS LOCALLY: `(declare (optimize (safety 0)))` in a function body, LET, LET*
+  or LOCALLY compiles that form at safety 0 (`%BODY-SAFETY`, compiler.lisp) --
+  before, only a global DECLAIM was read, so mill's per-function
+  `(optimize (speed 3) (safety 0))` did nothing.  Measured: local safety 0 is
+  back at main's speed; the default and an explicit `(safety 1)` still check;
+  the declaration does not leak past its form.  The wrappers that bind
+  `*COMPILE-SAFETY*` DECLARE it special: the image's own compiler does not
+  otherwise know it is, and `check-let-of-unregistered-special` (build-checks)
+  failed the UEFI build on exactly that.
 And `INTEGER-DECODE-FLOAT` / `DECODE-FLOAT` of a SINGLE returned the boxed double
 payload's 53-bit decoding (`7e30` -> `(6217249165672448 50 1)`, SBCL
 `(11580529 79 1)`), and `FLOAT-PRECISION` of a subnormal said 24.

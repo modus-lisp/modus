@@ -3853,8 +3853,18 @@
                 (let ((result (%call-interp-closure mf (cdr form))))
                   (if (eq result form) (cons form nil) (cons result t))))
                (t
-                (let ((result (handler-case (funcall mf form)
-                                (t (c) (funcall mf form nil)))))
+                ;; Only a PROGRAM-ERROR means (form) was the wrong shape; any
+                ;; other condition came from the expander running, and goes out
+                ;; from there -- the same narrowing as cl-eval's MACROEXPAND-1,
+                ;; where catching everything turned TI's LIST-MATCH-P reaching an
+                ;; undefined CIRCULAR-LIST into "invalid number of arguments: 2".
+                (let ((result (block expand
+                                (handler-bind
+                                    ((program-error
+                                       (lambda (c)
+                                         (declare (ignore c))
+                                         (return-from expand (funcall mf form nil)))))
+                                  (funcall mf form)))))
                   (when (%expander-has-env-p mf) (setq *%mexp-impure* t))
                   (if (eq result form) (cons form nil) (cons result t)))))))
           (t (cons form nil))))

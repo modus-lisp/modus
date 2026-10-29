@@ -1764,8 +1764,12 @@
   (%gc-write64 (%conv-addr #x10000CC8) 0))
 
 (defun %gc-old-leaf-p (st)
-  "The subtags the AArch64 collector's object walk does not scan (raw payload)."
-  (member st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66)))
+  "The subtags the AArch64 collector's object walk does not scan (raw payload).
+   Compares, not (MEMBER ST '(...)): that conses its list on every call here,
+   ~48 bytes an object, enough for every audit walk on the board to trigger a
+   collection of a 25 MB young space halfway through."
+  (or (and (>= st #x10) (<= st #x16)) (= st #x31) (= st #x60)
+      (and (>= st #x64) (<= st #x66))))
 
 (defun %gc-audit-stable (fn what)
   "Run FN, an audit walk, until no collection happened inside it; its result.  A

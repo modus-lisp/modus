@@ -1218,13 +1218,6 @@
       (%deftype-warm tname)))
   tname)
 
-(defun %deftype-warm (tname)
-  "Prepare TNAME's expander where it is defined.  A no-op here; mvm-eval
-   images compile and cache it (mvm-eval.lisp), so that a later expansion on
-   an actor only READS the cache -- an actor may not write shared tables, nor
-   compile."
-  tname)
-
 ;;; COMPILER-MACRO per-package side table — same defect, same shape:
 ;;; *COMPILER-MACRO-FUNCTION-TABLE* is keyed by %MACRO-SYM-KEY, which is the
 ;;; bare name string, so (define-compiler-macro da::cm …) and
@@ -5082,33 +5075,6 @@
   (set-macro-function sym fn))
 (defun setf-fdefinition (sym fn)
   (set-fdefinition sym fn))
-
-;;; ============================================================
-;;; DISASSEMBLE — CLHS §disassemble: write a textual representation
-;;; of FN to *standard-output* and return NIL.  The ANSI test
-;;; disassemble.lsp's DISASSEMBLE-IT wrapper captures *standard-output*
-;;; into a string stream and checks (NOTNOT (STRINGP captured-string))
-;;; — so any non-empty write satisfies the test.  Tests also check the
-;;; ARITY contract: (DISASSEMBLE) and (DISASSEMBLE x y) must error.
-;;; With this defun, compile-call's arity check fires on those forms.
-(defun disassemble (fn)
-  "FALLBACK DISASSEMBLE for images that do NOT bake the MVM compiler.
-   Writes one line to *standard-output* and returns NIL, which is all CLHS
-   requires (output format is implementation-defined).
-
-   Compiler-bearing images (the CLI, and anything assembling
-   *mvm-eval-canonical-source*) OVERRIDE this with the real disassembler
-   via last-defun-wins -- see mvm/mvm-eval.lisp.  It has to live there,
-   not here: source is assembled bridge -> mvm.lisp -> compiler.lisp ->
-   mvm-eval.lisp, calls are resolved BY NAME AT BUILD TIME, and cl-eval.lisp
-   is inside the bridge -- so a call to make-mvm-buffer or
-   mvm-compile-toplevel from this file binds to %%unresolved-fn (returns
-   NIL) and the disassembler dies with a TYPE-ERROR on the NIL buffer.
-   Measured, not theorised: that is exactly what the first attempt did."
-  (declare (ignore fn))
-  (write-string "; modus: no disassembler in this image (compiler not baked)")
-  (write-char-to-stream (code-char 10) *standard-output*)
-  nil)
 
 ;;; ============================================================
 ;;; COMPILE-FILE — CLHS 3.2.4 / compile-file.

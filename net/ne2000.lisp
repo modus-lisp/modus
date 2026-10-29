@@ -19,10 +19,6 @@
 (defun ne2k-rx-start () #x46)
 (defun ne2k-rx-stop ()  #xC0)
 
-;; Host memory buffers (below 8MB cons space)
-(defun ne2k-rx-host ()  #x780000)
-(defun ne2k-tx-host ()  #x781000)
-
 ;; ================================================================
 ;; Register read/write with constant port numbers
 ;; ================================================================

@@ -130,10 +130,7 @@
 (defun e1000-rx-buf-base ()  #x11001000)
 (defun e1000-tx-desc-base () #x11041000)
 (defun e1000-tx-buf-base ()  #x11041400)
-(defun e1000-state-base ()   #x11060000)
-(defun ssh-conn-base ()      #x11080000)
 (defun usb-ring-base ()      #x11090000)
-(defun ssh-ipc-base ()       #x11100000)  ; shifted with the block (was 0x20100000)
 
 ;; ============================================================
 ;; Single-threaded stubs
@@ -143,17 +140,5 @@
 ;; shared net sources' references resolve rather than becoming NIL fn sentinels.
 (defun enable-rpi-timer () nil)
 (defun dwc2-enable-host-irq () nil)
-(defun spin-lock (addr) nil)
-(defun spin-unlock (addr) nil)
-;; `yield' is NOT a compiler primop (the MVM YIELD opcode is emitted implicitly
-;; at the end of every LOOP iteration, there is no source-level form for it), so
-;; ip.lisp's net-actor-main reference would otherwise resolve to a NIL function
-;; sentinel.  Nothing here calls net-actor-main, but leaving a live NIL fn in
-;; the table is the :li-func offset-0 garbage-execution shape — define it.
-(defun yield () (io-delay))
-(defun receive () (e1000-receive) nil)
-(defun actor-spawn (fn) 0)
-(defun actor-exit () nil)
 (defun nfn-lookup (hash) 0)
 (defun hash-of (name) 0)
-(defun init-gc-helper () nil)

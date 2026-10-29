@@ -213,8 +213,5 @@
 ;; sentinel.
 (defun yield () (io-delay))
 (defun receive () (e1000-receive) nil)
-(defun actor-spawn (fn) 0)
-(defun actor-exit () nil)
 (defun nfn-lookup (hash) 0)
 (defun hash-of (name) 0)
-(defun init-gc-helper () nil)

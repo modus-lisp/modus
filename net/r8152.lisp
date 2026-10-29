@@ -220,14 +220,6 @@
 ;; Probe: adopt U-Boot's running device (no init, no enumerate)
 ;; ============================================================
 
-;; Thin e1000-* forwarders (see net/cdc-ether.lisp): keep last-defun-wins
-;; behaviour for images without net/usb-netdev.lisp; shadowed by the dispatcher
-;; where usb-netdev.lisp is loaded.
-(defun e1000-send (buf len) (r8152-send buf len))
-(defun e1000-receive () (r8152-receive))
-(defun e1000-rx-buf () (r8152-rx-buf))
-(defun e1000-probe () (r8152-probe))
-
 (defun r8152-probe ()
   (let ((addr (r8152-find-addr)))
     (if (zerop addr)

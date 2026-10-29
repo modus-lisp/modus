@@ -19,10 +19,6 @@
 ;;; List Utilities
 ;;; ============================================================
 
-(defun not (x)
-  "Logical negation — same as null."
-  (null x))
-
 ;;; ============================================================
 ;;; Function-cell wrappers for primitive ops
 ;;; ============================================================
@@ -51,19 +47,6 @@
     (loop
       (when (null cur) (return nil))
       (when (= i n) (return (car cur)))
-      (setq i (+ i 1))
-      (setq cur (cdr cur)))))
-
-(defun nthcdr (n list)
-  "Return the Nth cdr of LIST. Signals TYPE-ERROR on negative or
-   non-fixnum N."
-  (when (or (not (fixnump n)) (< n 0))
-    (%signal-type-error))
-  (let ((i 0)
-        (cur list))
-    (loop
-      (when (= i n) (return cur))
-      (when (null cur) (return nil))
       (setq i (+ i 1))
       (setq cur (cdr cur)))))
 
@@ -98,26 +81,6 @@
                   (when (= skip 0) (return cur))
                   (setq skip (- skip 1))
                   (setq cur (cdr cur)))))))))
-
-(defun nreverse (list)
-  "Destructively reverse LIST in place."
-  (let ((prev nil)
-        (cur list))
-    (loop
-      (when (null cur) (return prev))
-      (let ((next (cdr cur)))
-        (set-cdr cur prev)
-        (setq prev cur)
-        (setq cur next)))))
-
-(defun reverse (list)
-  "Return a new list that is the reverse of LIST."
-  (let ((result nil)
-        (cur list))
-    (loop
-      (when (null cur) (return result))
-      (setq result (cons (car cur) result))
-      (setq cur (cdr cur)))))
 
 (defun append2 (list1 list2)
   "Append two lists non-destructively."
@@ -279,91 +242,6 @@
       (setq idx (+ idx 1))
       (setq cur (cdr cur)))))
 
-(defun position (item seq &rest options)
-  "Return the index of ITEM in SEQ (list or array). Honors :TEST, :KEY,
-   :START, :END, :FROM-END. Default test is inline `eql`."
-  (let ((test nil) (key nil) (start 0) (end nil) (from-end nil)
-        (a options))
-    (loop (when (null a) (return))
-      (cond ((eq (car a) :test) (setq test (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :key)  (setq key  (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end)  (setq end  (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :test-not)
-             (let ((f (cadr a)))
-               (setq test (lambda (x y) (not (funcall f x y)))))
-             (setq a (cddr a)))
-            (t (setq a (cdr a)))))
-    (cond
-      ((null seq) nil)
-      ((consp seq)
-       ;; Walk to start, then iterate to end (or list end)
-       (let ((cur seq) (i 0) (result nil))
-         (loop (when (or (null cur) (= i start)) (return nil))
-           (setq cur (cdr cur)) (setq i (+ i 1)))
-         (loop
-           (when (null cur) (return result))
-           (when (and end (= i end)) (return result))
-           (let ((v (if key (funcall key (car cur)) (car cur))))
-             (when (if test (funcall test item v) (eql item v))
-               (if from-end (setq result i) (return i))))
-           (setq cur (cdr cur)) (setq i (+ i 1)))))
-      (t  ;; vector
-       (let ((len (array-length seq))
-             (result nil))
-         (when (null end) (setq end len))
-         (let ((i start))
-           (loop (when (= i end) (return result))
-             (let ((v (if key (funcall key (aref seq i)) (aref seq i))))
-               (when (if test (funcall test item v) (eql item v))
-                 (if from-end (setq result i) (return i))))
-             (setq i (+ i 1)))))))))
-
-(defun remove-if (pred seq)
-  "Return a new sequence with elements for which PRED returns non-nil removed.
-   Polymorphic over list / string / plain array — returns the same shape.
-   Note: this short form ignores keyword args; the keyword-aware version
-   in cl-sequences.lisp shadows this for callers via apply."
-  (cond
-    ((or (null seq) (consp seq))
-     (let ((result nil)
-           (cur seq))
-       (loop
-         (when (null cur) (return (nreverse result)))
-         (unless (funcall pred (car cur))
-           (setq result (cons (car cur) result)))
-         (setq cur (cdr cur)))))
-    ((stringp seq)
-     ;; Count kept, allocate sized string, copy slot-wise (slots are fixnums).
-     (let ((len (array-length seq))
-           (kept 0))
-       (let ((i 0))
-         (loop (when (= i len) (return nil))
-           (unless (funcall pred (aref seq i))
-             (setq kept (+ kept 1)))
-           (setq i (+ i 1))))
-       (let ((out (%make-string-array kept)) (i 0) (j 0))
-         (loop (when (= i len) (return out))
-           (unless (funcall pred (aref seq i))
-             (aset out j (aref seq i))
-             (setq j (+ j 1)))
-           (setq i (+ i 1))))))
-    (t
-     (let ((len (array-length seq))
-           (kept 0))
-       (let ((i 0))
-         (loop (when (= i len) (return nil))
-           (unless (funcall pred (aref seq i))
-             (setq kept (+ kept 1)))
-           (setq i (+ i 1))))
-       (let ((out (make-array kept)) (i 0) (j 0))
-         (loop (when (= i len) (return out))
-           (unless (funcall pred (aref seq i))
-             (aset out j (aref seq i))
-             (setq j (+ j 1)))
-           (setq i (+ i 1))))))))
-
 ;;; ============================================================
 ;;; Higher-Order Functions
 ;;; ============================================================
@@ -401,108 +279,6 @@
            (setq result (cons (apply fn (mapcar1 #'car lists)) result))
            (setq lists (mapcar1 #'cdr lists)))))))
 
-(defun some (fn list)
-  "Return the first non-nil result of applying FN to elements of LIST."
-  (let ((cur list))
-    (loop
-      (when (null cur) (return nil))
-      (let ((result (funcall fn (car cur))))
-        (when result (return result)))
-      (setq cur (cdr cur)))))
-
-(defun every (fn list &rest more-lists)
-  "Return T if FN returns non-nil for all elements."
-  (if (null more-lists)
-      ;; Single list
-      (let ((cur list))
-        (loop
-          (when (null cur) (return t))
-          (when (null (funcall fn (car cur))) (return nil))
-          (setq cur (cdr cur))))
-      ;; Two lists
-      (let ((a list) (b (car more-lists)))
-        (loop
-          (when (or (null a) (null b)) (return t))
-          (when (null (funcall fn (car a) (car b))) (return nil))
-          (setq a (cdr a))
-          (setq b (cdr b))))))
-
-(defun reduce (fn seq &rest args)
-  "Fold FN over SEQ (list or vector). Honors :initial-value, :from-end,
-   :start, :end, :key.  Without :initial-value:
-     - empty seq: return (funcall fn) with no args
-     - single elt: return that element unchanged
-     - else: starts with the first element"
-  (%check-kw-allowed args '(:initial-value :from-end :start :end :key))
-  (let ((init :no-init) (init-given nil)
-        (from-end nil) (start 0) (end nil) (key nil)
-        (a args))
-    (loop (when (null a) (return))
-      (cond ((eq (car a) :initial-value)
-             (setq init (cadr a)) (setq init-given t) (setq a (cddr a)))
-            ((eq (car a) :from-end) (setq from-end (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :start) (setq start (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :end)   (setq end   (cadr a)) (setq a (cddr a)))
-            ((eq (car a) :key)   (setq key   (cadr a)) (setq a (cddr a)))
-            (t (setq a (cdr a)))))
-    ;; Materialise as a list slice [start..end). Cheap conversion: walk
-    ;; the original sequence (works for lists, vectors, fill-pointer
-    ;; arrays via aref/length), collect the elements we'll fold.
-    (let* ((elts (let ((lst nil) (i 0) (n (if seq (length seq) 0))
-                       (eff-end (if end end (if seq (length seq) 0))))
-                   (cond
-                     ;; Wrapper cons — index via elt (wrapper-aware)
-                     ((and (consp seq) (array-wrapper-p seq))
-                      (loop (when (>= i eff-end) (return nil))
-                        (when (>= i start)
-                          (let ((v (if key (funcall key (elt seq i)) (elt seq i))))
-                            (setq lst (cons v lst))))
-                        (setq i (+ i 1))))
-                     ((or (null seq) (consp seq))
-                      ;; Walk list once
-                      (let ((cur seq))
-                        (loop (when (null cur) (return nil))
-                          (when (and (>= i start) (< i eff-end))
-                            (let ((v (if key (funcall key (car cur)) (car cur))))
-                              (setq lst (cons v lst))))
-                          (setq cur (cdr cur))
-                          (setq i (+ i 1)))))
-                     (t
-                      ;; Vector/string indexing
-                      (loop (when (>= i eff-end) (return nil))
-                        (when (>= i start)
-                          (let ((v (if key (funcall key (elt seq i)) (elt seq i))))
-                            (setq lst (cons v lst))))
-                        (setq i (+ i 1)))))
-                   (nreverse lst))))
-      (cond
-        ((and (null elts) init-given) init)
-        ((null elts) (funcall fn))
-        ((and (null (cdr elts)) (not init-given)) (car elts))
-        (from-end
-         ;; Right-fold: (fn e1 (fn e2 (fn e3 init)))
-         (let* ((rev (reverse elts))
-                (acc (if init-given init (car rev)))
-                (cur (if init-given rev (cdr rev))))
-           (loop (when (null cur) (return acc))
-             (setq acc (funcall fn (car cur) acc))
-             (setq cur (cdr cur)))))
-        (t
-         ;; Left-fold: (fn (fn (fn init e1) e2) e3)
-         (let* ((acc (if init-given init (car elts)))
-                (cur (if init-given elts (cdr elts))))
-           (loop (when (null cur) (return acc))
-             (setq acc (funcall fn acc (car cur)))
-             (setq cur (cdr cur)))))))))
-
-(defun mapc (fn list)
-  "Apply FN to each element of LIST for side effects. Return LIST."
-  (let ((cur list))
-    (loop
-      (when (null cur) (return list))
-      (funcall fn (car cur))
-      (setq cur (cdr cur)))))
-
 ;;; ============================================================
 ;;; Length and Counting
 ;;; ============================================================
@@ -534,17 +310,6 @@
       (setq slow (cdr slow))
       ;; If they meet, it's circular
       (when (eq fast slow) (return nil)))))
-
-(defun cddddr (x) (cdr (cdddr x)))
-(defun 1+ (x) (+ x 1))
-(defun 1- (x) (- x 1))
-
-(defun copy-tree (tree)
-  "Return a fresh copy of TREE (all conses copied recursively).  A hash table
-   is a tagged cons but a LEAF here, as the runtime CONSP says (%RT-CONSP)."
-  (if (%rt-consp tree)
-      (cons (copy-tree (car tree)) (copy-tree (cdr tree)))
-      tree))
 
 (defvar *%no-cons-array-wrappers* nil
   "T in an image whose arrays are never CONS-based wrappers -- the CLI, where
@@ -866,40 +631,9 @@
       (%word-aset seq i item)
       (setq i (+ i 1)))))
 
-(defun copy-seq (array)
-  "Copy an array, returning a new array with the same elements."
-  (let* ((len (array-length array))
-         ;; a packed single-float vector copies to a packed one
-         (result (if (and array (not (consp array)) (not (%mda-p array))
-                          (eq (obj-subtag array) #x12))
-                     (%make-f32-vector len)
-                     (make-array (array-length array)))))
-    (if (%bulk-copy-ok-p result array)
-        (%bulk-copy result 0 array 0 len)
-        (let ((i 0))
-          (loop
-            (when (= i len) (return result))
-            (aset result i (aref array i))
-            (setq i (+ i 1)))))
-    result))
-
 ;;; ============================================================
 ;;; String Utilities
 ;;; ============================================================
-
-(defun char-upcase (ch)
-  "Return uppercase version of character CH."
-  (let ((code (char-code ch)))
-    (if (if (>= code 97) (<= code 122) nil)
-        (code-char (- code 32))
-        ch)))
-
-(defun char-downcase (ch)
-  "Return lowercase version of character CH."
-  (let ((code (char-code ch)))
-    (if (if (>= code 65) (<= code 90) nil)
-        (code-char (+ code 32))
-        ch)))
 
 (defun %flat-string (s)
   "A plain #x31 copy of string S (S may be a wrapped/MDA string), char codes
@@ -909,40 +643,6 @@
       (when (>= i len) (return flat))
       (%prim-aset flat i (%ensure-char-code (aref s i)))
       (setq i (+ i 1)))))
-
-(defun string-upcase (str)
-  "Return a new string with all characters uppercased.
-   Uses %make-string-array so the result is actually a string (subtag),
-   and converts char-upcase's returned character back to a fixnum char-code
-   to match the convention that string slots hold fixnum char-codes."
-  (when (%mda-p str) (setq str (%flat-string str)))
-  (let ((len (array-length str))
-        (result (%make-string-array (array-length str))))
-    (let ((i 0))
-      (loop
-        (when (= i len) (return result))
-        ;; Raw slot access: ASCII letters upcase inline; anything else goes
-        ;; through CHAR-UPCASE (the generic AREF path was ~125 ns per char).
-        (let ((c (%ensure-char-code (%prim-aref str i))))
-          (if (and (>= c 97) (<= c 122))
-              (%prim-aset result i (- c 32))
-              (if (< c 128)
-                  (%prim-aset result i c)
-                  (let ((up (char-upcase (code-char c))))
-                    (%prim-aset result i (if (characterp up) (char-code up) up))))))
-        (setq i (+ i 1))))))
-
-(defun string-downcase (str)
-  "Return a new string with all characters lowercased."
-  (let ((len (array-length str))
-        (result (%make-string-array (array-length str))))
-    (let ((i 0))
-      (loop
-        (when (= i len) (return result))
-        (let ((ch (aref str i)))
-          (let ((dn (char-downcase ch)))
-            (aset result i (if (characterp dn) (char-code dn) dn))))
-        (setq i (+ i 1))))))
 
 ;;; ============================================================
 ;;; Equality
@@ -1570,52 +1270,6 @@
 ;;; ============================================================
 ;;; Format
 ;;; ============================================================
-
-(defun format (stream control &rest args)
-  "Basic format: supports ~A ~S ~D ~% ~X ~B directives.
-   STREAM: t = serial output, nil = not yet supported.
-   Returns nil."
-  (let ((len (array-length control))
-        (i 0)
-        (arg-rest args))
-    (loop
-      (when (>= i len) (return nil))
-      (let ((ch (aref control i)))
-        (if (= ch 126)  ; ~
-            (progn
-              (setq i (+ i 1))
-              (when (>= i len) (return nil))
-              (let ((directive (aref control i)))
-                (cond
-                  ;; ~A — aesthetic (princ)
-                  ((or (= directive 65) (= directive 97))  ; A or a
-                   (princ-object (car arg-rest))
-                   (setq arg-rest (cdr arg-rest)))
-                  ;; ~S — standard (prin1)
-                  ((or (= directive 83) (= directive 115))  ; S or s
-                   (write-object (car arg-rest))
-                   (setq arg-rest (cdr arg-rest)))
-                  ;; ~D — decimal
-                  ((or (= directive 68) (= directive 100))  ; D or d
-                   (print-dec (car arg-rest))
-                   (setq arg-rest (cdr arg-rest)))
-                  ;; ~X — hexadecimal
-                  ((or (= directive 88) (= directive 120))  ; X or x
-                   (print-hex (car arg-rest))
-                   (setq arg-rest (cdr arg-rest)))
-                  ;; ~% — newline
-                  ((= directive 37)  ; %
-                   (write-char-serial 10))
-                  ;; ~~ — literal tilde
-                  ((= directive 126)  ; ~
-                   (write-char-serial 126))
-                  ;; Unknown directive — print as-is
-                  (t
-                   (write-char-serial 126)
-                   (write-char-serial directive)))))
-            (write-char-serial ch)))
-      (setq i (+ i 1))))
-  nil)
 
 ;;; ============================================================
 ;;; Hash Tables (cons-cell alist, no arrays needed)
@@ -3268,26 +2922,9 @@
 
 (defvar *gensym-counter* 0)
 
-(defun gensym (&optional prefix)
-  "Generate a unique integer ID. PREFIX is ignored on bare metal.
-   ANSI gensym takes &optional prefix; making this an &optional matches
-   that and lets compile-call's arity check distinguish (gensym) (valid)
-   from (gensym 1 2 3) (invalid)."
-  (let ((n *gensym-counter*))
-    (setq *gensym-counter* (+ *gensym-counter* 1))
-    n))
-
 ;;; ============================================================
 ;;; String construction (for format replacement)
 ;;; ============================================================
-
-(defun princ-to-string (obj)
-  "Identity — on bare metal, values are used as-is."
-  obj)
-
-(defun string (x)
-  "Identity — on bare metal, symbols are already name-hashes or strings."
-  x)
 
 ;;; ============================================================
 ;;; Multiple Values (bare-metal stub)
@@ -3699,49 +3336,6 @@
                   saved
                   (progn (%dynb-unwind blk key (- (%dynb-next blk) 16) (- d 1))
                          saved)))))))
-
-(defun symbol-value (name-or-hash)
-  "Look up a global variable by name hash or symbol object.
-   O(1) via the globals hash table at #x10000080."
-  ;; CLHS: (symbol-value nil) ≡ nil, (symbol-value 't) ≡ t — constants
-  ;; with no table entry needed.  Without this, (aref nil 0) would fault.
-  (when (null name-or-hash) (return-from symbol-value nil))
-  (when (eq name-or-hash t) (return-from symbol-value t))
-  (let ((key (if (integerp name-or-hash) name-or-hash
-                 (aref name-or-hash 0))))
-    ;; THIS THREAD'S OWN DYNAMIC BINDINGS COME FIRST — see PER-THREAD DYNAMIC
-    ;; BINDINGS above.  The gate is the word %RT-ENTER already tests, so an
-    ;; image that never declared itself threaded pays one 32-bit load and a
-    ;; branch and reaches the identical code below; the main thread of a
-    ;; threaded image pays two more and reaches it too, because its window
-    ;; base is zero.  A binding found here needs NO LOCK and no region hop:
-    ;; the storage is this thread's and nothing else can be in it.
-    (unless (eql (mem-ref #x10000DB8 :u32) 0)
-      (let ((blk (%dynb-block)))
-        (unless (eql blk 0)
-          (let ((a (%dynb-lookup blk key)))
-            (unless (eql a 0)
-              (let ((v (mem-ref a :u64)))
-                (return-from symbol-value
-                  (values (if (eq v (%word->val #x0BADB0B5)) nil v)))))))))
-    ;; THE READ IS LOCKED TOO, and not out of caution: PUTHASH grows and
-    ;; REHASHES this table, and a reader walking it mid-rehash sees a structure
-    ;; that is momentarily neither the old one nor the new one.  Under a single
-    ;; thread %RT-ENTER is a load and a branch.
-    (%rt-enter)
-    (let ((tbl (%globals-table)))
-    ;; GETHASH returns (VALUES value present-p) — TWO values.  Returning it
-    ;; directly in tail position PROPAGATES both, leaving MV-COUNT=2 for the
-    ;; caller.  The old linear-alist SYMBOL-VALUE returned exactly one value,
-    ;; and callers depend on that: e.g. BOOLE reads its BOOLE-* op constants
-    ;; (globals) via SYMBOL-VALUE inside its COND, then returns a bare value —
-    ;; the leaked MV-COUNT=2 survives to `(multiple-value-list (boole …))`,
-    ;; which then reports length 2 (boole.2 collected spuriously) or corrupts
-    ;; the funcall MV path into a wild call (boole.1/.3 → RIP=0xDEAD0004).
-    ;; Truncate to a single value with (VALUES …), which forces MV-COUNT=1.
-      (let ((v (if tbl (gethash key tbl) nil)))
-        (%rt-leave)
-        (values (if (eq v (%word->val #x0BADB0B5)) nil v))))))
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash.  O(1) via the globals
@@ -4318,26 +3912,6 @@
 ;;; On bare metal, errors halt the system. MVM-compiled code calls
 ;;; these with variable arity — extra args are silently ignored.
 
-(defun error (msg &rest args)
-  "Signal an error. If handler-case is active, longjmp to it.
-   Otherwise print error indicator and halt.
-   ANSI's error is (datum &rest args); we mirror that signature here
-   in prelude so all later callers see the &rest version even if
-   compiled before cl-conditions.lisp redefines this function."
-  (declare (ignore args))
-  (if (%error-handler-active-p)
-      (%hc-longjmp)
-      (progn
-        (write-string-serial "ERR:")
-        (write-char-serial 10)
-        (halt))))
-
-(defun warn (msg &rest args)
-  "Print warning indicator. Extra args ignored on bare metal."
-  (declare (ignore args))
-  (write-string-serial "WARN:")
-  (write-char-serial 10))
-
 ;; FORMAT lives in cl-printer.lisp.  A nil-stub at this location used
 ;; to mask the real prelude FORMAT above (L1010); both are then masked
 ;; in turn by cl-printer's.  Removed 2026-06-01 as part of the
@@ -4347,100 +3921,9 @@
 ;;; Type checking stubs
 ;;; ============================================================
 
-(defun typep (obj type)
-  "Type checking stub — returns nil on bare metal."
-  nil)
-
-(defun type-of (obj)
-  "Type-of stub — returns nil on bare metal."
-  nil)
-
 ;;; ============================================================
 ;;; Hash / symbol stubs
 ;;; ============================================================
-
-;; Dual-FNV-1a 60-bit hash. Must match the build-time definition in
-;; cross.lisp so that a symbol's stored hash (set by the compiler at
-;; compile-quote time) matches what (compute-name-hash "NAME") yields
-;; at runtime — used by the package hash→name map to round-trip
-;; native MVM symbols back to their name string.
-(defun compute-name-hash (name-string)
-  "Dual-FNV-1a hash for a name string. 60-bit collision-resistant."
-  ;; 16-BIT STATE, bit-identical to the 32-bit FNV form — see the note on
-  ;; COMPUTE-NAME-HASH in mvm/compiler.lisp.  This matters most HERE: a 32-bit
-  ;; state is a BIGNUM on i386's 30-bit tower, so the old form allocated
-  ;; through the generic bignum engine once per character of every name
-  ;; hashed at runtime.  The largest intermediate below is 2^25.
-  (let ((h1 40389) (h2 48879)          ; #x9DC5 / #xBEEF
-        (len (array-length name-string))
-        (i 0))
-    (loop
-      (when (>= i len) (return nil))
-      (let ((c (%prim-aref name-string i)))   ; raw char-CODE for arithmetic hash
-        ;; Uppercase if lowercase ASCII letter (matches string-upcase
-        ;; path in build-time version).
-        (when (and (>= c 97) (<= c 122))
-          (setq c (- c 32)))
-        (setq c (logand c 65535))
-        ;; %FIXNUM-* (raw): every product here is below 2^25 (16-bit state
-        ;; times a 9-bit prime), so the raw op is exact.  Plain * cannot prove
-        ;; that -- h1/h2 are loop variables of unknown width -- and on a 30-bit
-        ;; build would route each character through GENERIC-MULTIPLY.
-        (setq h1 (logand (%fixnum-* (logxor h1 c) 403) 65535))
-        (setq h2 (logand (%fixnum-* (logxor h2 c) 89) 65535)))
-      (setq i (+ i 1)))
-    (let ((combined (logior (ash (logand h1 +name-hash-hi-mask+) +name-hash-shift+)
-                            (logand h2 +name-hash-lo-mask+))))
-      (if (zerop combined) 1 combined))))
-
-(defun name-eq (sym name-string)
-  "Runtime version of MODUS.HASH:NAME-EQ — true iff SYM's name matches
-   NAME-STRING (case-insensitively, via the dual-FNV-1a hash).
-
-   This MUST exist at runtime: the compiler's SETF macro expander
-   (compiler.lisp ~1707) — which is extracted and compiled into the
-   image so runtime EVAL can macroexpand SETF — dispatches every place
-   type with `(name-eq (car place) \"CAR\"/\"GETHASH\"/...)`.  Without a
-   runtime NAME-EQ the call resolved to %UNRESOLVED-FN (→ NIL), so NO
-   place branch matched and `(setf (gethash k h) v)` fell through to the
-   broken generic `SET-<accessor>` fallback (which errored), making
-   runtime-EVAL `(setf (gethash k h) v)` signal instead of storing.
-
-   Mirrors %EVAL-SYM-EQ: native MVM symbols (subtag #x50, single hash
-   slot) carry only a hash — SYMBOL-NAME may return \"\" for them — so we
-   compare the stored hash slot DIRECTLY to (compute-name-hash NAME-STRING).
-   CL symbols (3-slot) and the gensym/string cases go through SYMBOL-NAME."
-  (cond
-    ((null sym) nil)
-    ((eq sym t) nil)
-    ((consp sym) nil)
-    ((characterp sym) nil)
-    ((%cl-sym-p sym)
-     (let ((n (symbol-name sym)))
-       (and n (eql (compute-name-hash n) (compute-name-hash name-string)))))
-    ((%native-mvm-sym-p sym)
-     (eql (aref sym 0) (compute-name-hash name-string)))
-    ((integerp sym) nil)
-    (t nil)))
-
-(defun intern (name &rest pkg-arg)
-  "Intern stub — returns the name hash on bare metal.
-   ANSI's intern is (string &optional package). Use &rest here so the
-   prelude version's signature matches cl-packages.lisp's later
-   redefinition (and so callers compiled before that redefinition still
-   pass arity check)."
-  (declare (ignore pkg-arg))
-  (if (integerp name)
-      name
-      (compute-name-hash name)))
-
-(defun find-package (name)
-  "Find-package stub — returns nil."
-  nil)
-
-(defun find-symbol (name)
-  "Find-symbol stub — returns nil."
-  nil)
 
 ;;; ============================================================
 ;;; Sequence utilities
@@ -4527,32 +4010,6 @@
                 (when (= i len) (return result))
                 (aset result i (aref seq (+ start i)))
                 (setq i (+ i 1))))))))))
-
-(defun concatenate-strings (s1 s2)
-  "Concatenate two strings (arrays of chars)."
-  (let ((l1 (array-length s1))
-        (l2 (array-length s2)))
-    (let ((result (make-array (+ l1 l2)))
-          (i 0))
-      (loop
-        (when (= i l1) (return nil))
-        (aset result i (aref s1 i))
-        (setq i (+ i 1)))
-      (setq i 0)
-      (loop
-        (when (= i l2) (return nil))
-        (aset result (+ l1 i) (aref s2 i))
-        (setq i (+ i 1)))
-      result)))
-
-(defun make-list (n initial-element)
-  "Create a list of N elements, each set to INITIAL-ELEMENT."
-  (let ((result nil)
-        (i 0))
-    (loop
-      (when (= i n) (return result))
-      (setq result (cons initial-element result))
-      (setq i (+ i 1)))))
 
 ;;; UIOP/OS environment-variable helpers.
 ;;;

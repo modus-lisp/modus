@@ -62,11 +62,6 @@
    host/macos/image-segments.sh hard-codes the same number."
   192)
 
-(defun %core-build-id ()
-  "Identity of the binary that writes or restores a core.  The build splices a
-   fresh value after this file (build-cli-common.lisp); 0 = unchecked."
-  0)
-
 (defun %core-jit-arena-lo ()
   "Base of the fixed JIT exec arena (boot-linux-aarch64.lisp
    +linux-aarch64-jit-arena-base+, overridable per build as the hosted

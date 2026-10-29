@@ -1154,67 +1154,6 @@
         (ssh-send-string ssh out out-len))
       (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0))))
 
-;; Handle CHANNEL_DATA - unified REPL with full line editing
-;; Uses handle-edit-byte + capture/flush for SSH output routing
-(defun ssh-handle-channel-data (ssh payload plen)
-  (let ((data-len (ssh-get-u32 payload 5)))
-    ;; Load per-connection state into shared edit state
-    (ssh-load-edit-state ssh)
-    ;; Set prompt mode to SSH
-    (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 1)
-    ;; Enable capture -- accumulate ALL output for the batch
-    (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-    (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-    ;; Process each byte through the shared line editor
-    (let ((i 0))
-      (loop
-        (if (< i data-len)
-            (progn
-              (let ((rc (handle-edit-byte (aref payload (+ 9 i)))))
-                (if (eq rc 1)
-                    ;; Enter: flush batch, eval, prompt
-                    (progn
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                      (ssh-flush-output ssh)
-                      (ssh-save-edit-state ssh)
-                      ;; Newline echo
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-                      (%serial-byte 10)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                      (ssh-flush-output ssh)
-                      ;; Evaluate
-                      (ssh-do-eval ssh)
-                      ;; Prompt
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-                      (emit-prompt)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                      (ssh-flush-output ssh)
-                      ;; Reinit and re-enable capture for rest of batch
-                      (edit-set-line-len 0)
-                      (edit-set-cursor-pos 0)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0))
-                    (if (eq rc 2)
-                        ;; Ctrl-D: flush + disconnect
-                        (progn
-                          (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                          (ssh-flush-output ssh)
-                          (ssh-save-edit-state ssh)
-                          (ssh-handle-ctrl-d ssh)
-                          (setq i data-len))
-                        ())))
-              (setq i (+ i 1)))
-            (return 0))))
-    ;; Flush remaining batched output
-    (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-    (ssh-flush-output ssh)
-    ;; Save state back to per-connection
-    (ssh-save-edit-state ssh)
-    (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 0)))
-
 ;; Evaluate current line buffer for SSH (dispatch on content)
 (defun ssh-do-eval (ssh)
   (let ((len (edit-line-len)))
@@ -1231,53 +1170,6 @@
                 (ssh-do-eval-expr ssh))
             ())))))
 
-;; Override ssh-do-eval-expr: use buffer reader instead of read-list
-(defun ssh-do-eval-expr (ssh)
-  (let ((len (edit-line-len)))
-    ;; Set up FIFO read position past '(' and length
-    (setf (mem-ref (+ (ssh-ipc-base) #x20) :u32) 1)
-    (setf (mem-ref (+ (ssh-ipc-base) #x24) :u32) len)
-    ;; Parse from line buffer
-    (let ((lst (buf-read-list)))
-      ;; Evaluate
-      (let ((globals (ssh-get-globals)))
-        (let ((result (eval-sexp lst nil globals)))
-          ;; Enable capture for output
-          (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-          (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-          (%serial-byte 10)
-          (%serial-byte 61) (%serial-byte 32)
-          (ssh-print-sexp result)
-          (%serial-byte 10)
-          ;; Flush captured output
-          (let ((out-len (mem-ref (+ (ssh-ipc-base) #x18) :u32)))
-            (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-            (when (> out-len 0)
-              (let ((out (make-array out-len)))
-                (dotimes (i out-len)
-                  (aset out i (mem-ref (+ (+ (ssh-ipc-base) #x100) i) :u8)))
-                (ssh-send-string ssh out out-len)))))))))
-
-
-;; Evaluate command line from SSH exec request
-;; Copies command into shared line buffer, evaluates, flushes output to SSH
-;; ssh = per-connection SSH state base, cmd = byte array, cmd-len = length
-(defun ssh-eval-line (ssh cmd cmd-len)
-  ;; Copy command into shared line buffer at 0x300028
-  (dotimes (i cmd-len) (setf (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8) (aref cmd i)))
-  ;; Set line length
-  (edit-set-line-len cmd-len)
-  ;; Set prompt mode to SSH
-  (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 1)
-  ;; Enable output capture (bit0=capture, bit1=suppress serial)
-  (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-  (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-  ;; Evaluate (dispatches based on first char)
-  (ssh-do-eval ssh)
-  ;; Flush captured output
-  (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-  (ssh-flush-output ssh)
-  (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 0))
 
 ;; Evaluate expression from SSH (alias for ssh-eval-line)
 (defun ssh-eval-expr (ssh cmd cmd-len)
@@ -1718,10 +1610,6 @@
     (%serial-byte (car chars))
     (ssh-print-chars (cdr chars))))
 
-;; Override native-eval to use the REPL interpreter
-(defun native-eval (form)
-  (eval-sexp form nil (ssh-get-globals)))
-
 ;;; ============================================================
 ;;; Pre-computed crypto (avoid >5s USB polling gap)
 ;;; ============================================================
@@ -1807,26 +1695,6 @@
                     (let ((ks (ed-scalar-mult-mod-l k s)))
                       (let ((sig-s (ed-scalar-add r ks)))
                         (concat-bytes r-enc 32 sig-s 32)))))))))))))
-
-;; USB keep-alive: poll USB to prevent host NETDEV WATCHDOG timeout
-(defun usb-keepalive ()
-  (let ((i 0))
-    (loop
-      (when (>= i 100) (return 0))
-      (io-delay)
-      (let ((pkt-len (e1000-receive)))
-        (when (not (zerop pkt-len))
-          (let ((buf (e1000-rx-buf)))
-            (let ((et-hi (mem-ref (+ buf 12) :u8)))
-              (when (eq et-hi #x08)
-                (let ((et-lo (mem-ref (+ buf 13) :u8)))
-                  (if (eq et-lo #x06)
-                      (let ((arp-op (buf-read-u16-mem buf 20)))
-                        (when (eq arp-op 1) (arp-reply buf)))
-                      (when (eq et-lo 0)
-                        (let ((proto (mem-ref (+ buf 23) :u8)))
-                          (when (eq proto 1) (icmp-handle buf 14)))))))))))
-      (setq i (+ i 1)))))
 
 ;;; ============================================================
 ;;; Network: the single-threaded server loop

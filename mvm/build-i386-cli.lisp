@@ -55,6 +55,13 @@
 (defvar *cli-soft-float*
   (let ((v (sb-ext:posix-getenv "MODUS_I386_SOFT_FLOAT")))
     (and v (plusp (length v)) (not (string= v "0")))))
+;; MODUS_I386_FP=x87: floats on the x87 FPU instead of SSE2 (486DX, Pentium ..
+;; Pentium III), bit-exact against SSE2 -- see translate-i386's x87 arms.
+(defvar *cli-i386-fp*
+  (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
+    (cond ((or (null v) (string= v "") (string-equal v "sse2")) :sse2)
+          ((string-equal v "x87") :x87)
+          (t (error "MODUS_I386_FP=~A: expected sse2 or x87" v)))))
 
 ;;; ABI FACT: the i386 int-0x80 table is its own numbering.  exit is 1 (60 on
 ;;; x86-64, 93 on the AArch64 generic ABI); exit_group is 252 (231 / 94).
@@ -357,6 +364,13 @@
 ;; On a target this young a SILENT int3 is the most expensive possible failure
 ;; mode, so the unimplemented-opcode report is always collected and printed.
 (setf modus.mvm.i386::*i386-record-unimpl* t)
+(setf modus.mvm.i386::*i386-x87* (eq cl-user::*cli-i386-fp* :x87))
+(let ((v (sb-ext:posix-getenv "MODUS_I386_X87_NOSCALE")))
+  (when (and v (plusp (length v)) (not (string= v "0")))
+    (setf modus.mvm.i386::*i386-x87-scale* nil)
+    (format t "~&;; FLOAT: x87 * and / UNSCALED -- negative control, not for use~%")))
+(when modus.mvm.i386::*i386-x87*
+  (format t "~&;; FLOAT: x87 (control word #x027F), no SSE2~%"))
 (setf modus.mvm.i386::*i386-unimpl-ops* nil)
 
 ;;; The symmap follows the IMAGE path (or MODUS_I386_SYMMAP).  It used to be a

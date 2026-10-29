@@ -794,6 +794,29 @@ ieee-floats with probe results identical to the hard image.  A div+sqrt-heavy
 interpreted loop costs 2.8x.  Bare-metal i386 is unaffected (it writes CR4, which
 a 386/486 does not have, and emits no float code).
 
+### x87 i386 (486DX, Pentium .. Pentium III): `MODUS_I386_FP=x87`
+
+Hardware floats with no SSE2, **bit-exact against SSE2**, at SSE2's speed (a
+div+sqrt loop: SSE2 14.1 s, x87 14.0 s, soft-float 40.1 s under qemu).  How
+x87 is made exact (translate-i386, `I386-TRANSLATE-X87-FLOAT`):
+- the boot stub loads control word `#x027F` -- 53-bit PRECISION, nearest-even,
+  exceptions masked.  Linux starts a process at `#x037F` (64-bit), under which
+  `1 + (2^-53 + 2^-105)` double-rounds to 1.0 -- that is the canary;
+- the x87 still has a 15-bit exponent, so a double-DENORMAL result rounds twice.
+  Only `*` and `/` can make one inexactly (a denormal sum of doubles is exact;
+  sqrt never lands there), so those scale an operand by 2^-15360 and the result
+  by 2^+15360 (FSCALE): the x87's denormal threshold then IS the double's, and
+  the one rounding is at the right bit (JVM strictfp's trick);
+- float->integer swaps in a round-toward-zero control word around FISTP (FISTTP
+  is SSE3); `fcmp` is FUCOMPP + FNSTSW + SAHF (UCOMISD's flags; FUCOMIP is P6).
+Tested under `-cpu pentium` (SSE2 traps there): the 3000-op battery 3000/3000,
+`test/float-denormal-gen.lisp`'s 2000 denormal * and / 2000/2000, libraries
+identical; 0 SSE instructions executed.  **The negative control is a build knob**:
+`MODUS_I386_X87_NOSCALE=1` drops the scaling and fails EXACTLY the 17 cases exact
+rational arithmetic predicts.  QEMU does model precision control (checked with
+the canary under both control words), but it is QEMU, not silicon.  The default
+SSE2 image is unchanged: identical code apart from `%CORE-BUILD-ID`.
+
 **FIXED (was open): single-float vectors on 30-bit towers.**  Three defects, the
 first found here:
 - the lane helpers (`%F32-BITS-REF/-SET-NARROW`, softfloat's lane load/store) read

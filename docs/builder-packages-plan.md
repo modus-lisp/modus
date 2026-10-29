@@ -92,6 +92,26 @@ duplicate `defun` fails the build (the negative control).  This alone answers
 
 ### 2. A real package graph at build time
 
+**PART DONE 2026-10-29: no call relies on the bare-name fallback.**  Measured
+with a host-side census (every *FUNCTIONS* lookup that missed its qualified key
+and resolved by bare name): **866** distinct pairs in the x64 CLI.  Nearly all
+were the build compiler's OWN doing -- the generated SFT seeding read every
+`#'NAME` in MODUS.MVM, DEFVAR init thunks were compiled under bare strings but
+called as MODUS.MVM symbols, DEFSTRUCT and the SETF-writer / EMIT-BYTES
+expansions interned their generated names in MODUS.MVM whatever package the
+form was read in.  The rest were the x64 JIT glue calling across MODUS.MVM /
+MODUS.ASM / MODUS.MVM.X64, fixed on the HOST side (an export, imports in
+lib/load-mvm.lisp) because image source cannot write `modus.asm:x` until the
+packages exist in the image (step 4; the self-host image re-reads its source).
+All 31 images: 0.  The census is now `CHECK-CROSS-PACKAGE-CALLS`
+(mvm/build-checks.lisp), fatal by default (`MODUS_PKG_CHECK=warn|0`); a
+MODUS.ASM-read call to a MODUS.MVM function fails the build.  The fallback
+itself stays for FORWARD references (the caller's own package defines the name
+later), which the check allows.  Emitted code: only the changed compiler
+functions and the generated tables moved (function sizes compared; the SFT
+tables +0.06%).  Still to do in this step: record defpackage / in-package at
+build time, and key globals and constants by (package, name).
+
 Make the packages that the reader already honours mean something to the
 compiler.
 

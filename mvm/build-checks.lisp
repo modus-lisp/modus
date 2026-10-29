@@ -1497,6 +1497,86 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
       (push (cons name *current-source-location*) *gck-defun-log*)
       (apply f name args))))
 
+(defvar *gck-fallback-census* nil
+  "Hash (caller-key . callee-qualified-name) -> count for every *FUNCTIONS*
+   lookup that missed its package-qualified key and resolved only through the
+   bare-name fallback in %FN-INFO-FOR-KEY.  Builder packages step 2 drives this
+   to zero: each hit is a call that crosses packages without naming the symbol
+   it means.  Filled only under MODUS_FN_FALLBACK_CENSUS=FILE.")
+
+(defun %gck-fallback-census-path ()
+  (let ((p (sb-ext:posix-getenv "MODUS_FN_FALLBACK_CENSUS")))
+    (and p (plusp (length p)) p)))
+
+(defvar *gck-registered-keys* (make-hash-table :test 'equal)
+  "Every package-qualified key %FN-REGISTER-INFO registered in this build, so
+   the census can tell a FORWARD reference (the caller's key is defined later
+   in the same build; the compile-time lookup borrowed a same-named function
+   from another package) from a CROSS-PACKAGE call (the key never exists).")
+
+(progn
+  ;; Always on: the census is also the enforcement (CHECK-CROSS-PACKAGE-CALLS).
+  (setf *gck-fallback-census* (make-hash-table :test 'equal))
+  (sb-int:encapsulate '%fn-register-info 'fallback-census
+    (lambda (f info)
+      (let ((q (function-info-qualified-name info)))
+        (when q (setf (gethash q *gck-registered-keys*) t)))
+      (funcall f info)))
+  (sb-int:encapsulate '%fn-info-for-key 'fallback-census
+    (lambda (f key)
+      (let ((r (funcall f key)))
+        (when (and r *functions* (not (gethash key *functions*)))
+          (let* ((k (cons key (or (function-info-qualified-name r)
+                                  (function-info-name r))))
+                 (e (or (gethash k *gck-fallback-census*)
+                        (setf (gethash k *gck-fallback-census*)
+                              (list 0 *current-source-location*)))))
+            (incf (first e))))
+        r))))
+
+(defun %gck-pkg-check-mode ()
+  "MODUS_PKG_CHECK: unset or error = a cross-package call that resolved only
+   through the bare-name fallback fails the build; warn = report; 0 = silent."
+  (let ((v (sb-ext:posix-getenv "MODUS_PKG_CHECK")))
+    (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
+
+(defun check-cross-package-calls ()
+  "Builder packages step 2.  A call names the symbol it was READ as; when that
+   symbol's package defines no such function, the build compiler used to fall
+   back to whatever function had the same BARE name -- in any package.  That is
+   not CL: the call must name the symbol it means (qualify it, :USE the
+   package, or import the symbol).  A FORWARD reference (the caller's own
+   package defines the name later in the image) is not this, and is allowed."
+  (let ((mode (%gck-pkg-check-mode))
+        (bad nil))
+    (when *gck-fallback-census*
+      (maphash (lambda (k e)
+                 (unless (gethash (car k) *gck-registered-keys*)
+                   (push (list (car k) (cdr k) (second e) (first e)) bad)))
+               *gck-fallback-census*))
+    (unless (eq mode :off)
+      (format t ";; pkg-check: ~D cross-package call~:P resolved by bare name~%"
+              (length bad))
+      (dolist (b bad)
+        (format t ";;   CROSS-PACKAGE-CALL ~A -> ~A  (first at ~A, ~D call~:P)~%"
+                (first b) (second b) (or (third b) "?") (fourth b)))
+      (when (and (eq mode :error) bad)
+        (error "pkg-check: ~D cross-package call~:P (first: ~A -> ~A).  Name the ~
+                symbol the call means: qualify it, :USE its package, or import it."
+               (length bad) (first (first bad)) (second (first bad)))))))
+
+(defun %gck-fallback-census-dump ()
+  (let ((path (%gck-fallback-census-path)))
+    (when (and path *gck-fallback-census*)
+      (with-open-file (o path :direction :output :if-exists :supersede)
+        (maphash (lambda (k e) (format o "~D~C~A~C~A~C~A~C~A~%" (first e) #\Tab (car k)
+                                       #\Tab (cdr k) #\Tab (or (second e) "?")
+                                       #\Tab (if (gethash (car k) *gck-registered-keys*)
+                                                 "forward" "cross")))
+                 *gck-fallback-census*))
+      (format t ";; fn-fallback census: ~D distinct (key -> definition) pairs -> ~A~%"
+              (hash-table-count *gck-fallback-census*) path))))
+
 (defvar *build-image-wrapper* nil
   "The wrapper this file installs as BUILD-IMAGE.  Re-installed whenever
    BUILD-IMAGE is anything else: a build that loads lib/load-mvm.lisp TWICE
@@ -1511,6 +1591,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
         (lambda (&rest args)
           (setf *gck-defun-log* nil)
           (setf *undeclared-redefinitions* nil)
+          (when *gck-fallback-census* (clrhash *gck-fallback-census*))
+          (clrhash *gck-registered-keys*)
           (clrhash *overridable-names*)
           (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
@@ -1545,7 +1627,9 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
               (check-compiler-warns hist (nreverse unknown)))
             (%gck-guard "gv-cache-report" (%gck-gv-cache-report))
             (%gck-guard "defun-inventory" (%gck-defun-inventory))
+            (%gck-guard "fn-fallback-census" (%gck-fallback-census-dump))
             (check-undeclared-redefinitions)
+            (check-cross-package-calls)
             result)))
   (setf (fdefinition 'build-image) *build-image-wrapper*))
 

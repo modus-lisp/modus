@@ -62,6 +62,29 @@
 (mvm-load "mvm/translate-68k.lisp")
 (mvm-load "mvm/translate-arm32.lisp")
 
+;; The image code that runs the x64 JIT is read in MODUS.MVM (mvm-eval.lisp's
+;; page translator, the %JIT-BOOT-INIT glue) and calls the assembler and the
+;; translator.  Make the names it writes unqualified READ as the symbols those
+;; packages define, so each call names the function it means and none relies
+;; on the build compiler's bare-name fallback (builder packages step 2).  Host-
+;; only: image text cannot say MODUS.ASM:LABEL-POSITION, because no build
+;; package exists in a running image yet (step 4), and the self-host image
+;; re-reads this text.  %INIT-X64-TRANSLATOR is interned here, before the
+;; co-init text that defines it is read in MODUS.ASM.
+(let ((mvm (find-package "MODUS.MVM")))
+  (dolist (s (list (find-symbol "LABEL-POSITION" "MODUS.ASM")
+                   (find-symbol "CODE-BUFFER-POSITION" "MODUS.ASM")
+                   (find-symbol "CODE-BUFFER-BYTES" "MODUS.ASM")
+                   (intern "%INIT-X64-TRANSLATOR" "MODUS.ASM")
+                   (find-symbol "TRANSLATE-MVM-TO-X64" "MODUS.MVM.X64")
+                   ;; the cross-compiling images' x86-64 target descriptor
+                   (find-symbol "EMIT-FUNCTION-PROLOGUE" "MODUS.MVM.X64")
+                   (find-symbol "EMIT-FUNCTION-EPILOGUE" "MODUS.MVM.X64")))
+    (import s mvm))
+  ;; ...and the x64 co-init, read in MODUS.ASM, asks boot-linux-x64 (MODUS.MVM)
+  ;; for the native code offset.
+  (import (intern "LINUX-X64-NATIVE-CODE-OFFSET" mvm) (find-package "MODUS.ASM")))
+
 ;; Cross-compilation pipeline
 (mvm-load "mvm/cross.lisp")
 

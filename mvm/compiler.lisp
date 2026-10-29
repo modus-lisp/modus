@@ -1661,6 +1661,17 @@
    module being compiled (one object per keyword, or EQ breaks).  Reset per
    module by MVM-COMPILE-ALL with SETQ for the reason *INIT-THUNK-NAMES* is.")
 
+(defun %init-thunk-fn-name (thunk-name)
+  "The name a DEFVAR's init thunk is COMPILED under.  At build time it is the
+   MODUS.MVM symbol INIT-ALL-GLOBALS calls it by, so the definition and the
+   call agree on the package-qualified key; as a bare string the call resolved
+   only through %FN-INFO-FOR-KEY's bare-name fallback (builder packages step 2
+   drives that fallback to zero).  Runtime mvm-eval keeps the string: its
+   thunks are called by name in the user's package."
+  (if *mvm-eval-runtime-p*
+      thunk-name
+      (intern thunk-name (or (find-package :modus.mvm) *package*))))
+
 (defvar *init-nil-thunk-names* nil
   "The subset of *INIT-THUNK-NAMES* that are a NIL-initform DEFVAR's thunk,
    which assigns only when the variable is unbound -- so calling all of them
@@ -5527,10 +5538,7 @@
                  ;; Ordered MODUS.MVM-first so the HOST build is unchanged (and
                  ;; so SBCL is never asked to intern into its locked CL package).
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
-                                       (or (find-package "MODUS.MVM")
-                                           (and (symbolp (car place))
-                                                (symbol-package (car place)))
-                                           *package*))))
+                                       (%setter-pkg (car place)))))
                    `(,setter ,@(cdr place) ,value)))))))))
 
   ;; DEFSETF — register a setf expander.
@@ -5689,8 +5697,7 @@
                     ;; In-image-safe package (see cell-var-name): hardcoded
                     ;; :modus.mvm interns into NIL under mvm-eval → NIL head.
                     (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
-                                          (or (find-package "MODUS.MVM")
-                                              *package*))))
+                                          (%setter-pkg acc))))
                       `(,setter ,@place-args ,value-form)))))))
         `(quote ,accessor))))
 
@@ -5752,7 +5759,12 @@
     (lambda (form)
       (let ((buf (cadr form))
             (bytes (cddr form)))
-        `(progn ,@(mapcar (lambda (b) `(emit-byte ,buf ,b)) bytes)))))
+        ;; EMIT-BYTE of the package EMIT-BYTES was read in (the assembler's,
+        ;; MODUS.ASM), not this file's: builder packages step 2.
+        (let ((eb (if (and (symbolp (car form)) (symbol-package (car form)))
+                      (intern "EMIT-BYTE" (symbol-package (car form)))
+                      'emit-byte)))
+          `(progn ,@(mapcar (lambda (b) `(,eb ,buf ,b)) bytes))))))
 
   ;; LIST — expand to nested cons (MVM has no &rest)
   ;; (list) → nil, (list a) → (cons a nil), (list a b c) → (cons a (cons b (cons c nil)))
@@ -11807,6 +11819,37 @@
     (intern (concatenate 'string "%CELL-" base)
             (or (find-package "MODUS.MVM") *package*))))
 
+(defun %setter-pkg (acc)
+  "Package a generated SET-<ACC> writer name is interned in.  At build time,
+   ACC's own home when that is an ordinary package -- where DEFSTRUCT now puts
+   the writer it defines (*DEFSTRUCT-HOME*) -- so (setf (code-buffer-bytes b) x)
+   read in MODUS.ASM calls MODUS.ASM::SET-CODE-BUFFER-BYTES directly instead of
+   reaching it through the bare-name fallback.  A CL accessor (CHAR, AREF) and
+   all runtime compiles keep the historic order, MODUS.MVM first."
+  (let* ((p (and (symbolp acc) (symbol-package acc)))
+         (pn (and p (package-name p))))
+    (if (and (not *mvm-eval-runtime-p*) pn (not (%fn-key-ansi-pkg-p pn)))
+        p
+        (or (find-package "MODUS.MVM")
+            (and (symbolp acc) (symbol-package acc))
+            *package*))))
+
+(defvar *defstruct-home* nil
+  "Build time: the package a DEFSTRUCT being expanded was READ in, i.e. its
+   name's home package, or NIL.  The host compiles every form with *PACKAGE*
+   = MODUS.MVM, so without this a struct read in MODUS.ASM got MODUS.MVM
+   accessors and the assembler's own calls to them resolved only through the
+   bare-name fallback (builder packages step 2).")
+
+(defun %defstruct-home-pkg (name-and-options)
+  "The package DEFSTRUCT's generated names belong in at build time: the struct
+   name's home, unless that is a standard package (a struct named by a CL
+   symbol must not intern new names into COMMON-LISP)."
+  (let* ((sym (if (consp name-and-options) (car name-and-options) name-and-options))
+         (p (and (symbolp sym) (symbol-package sym)))
+         (pn (and p (package-name p))))
+    (and pn (not (%fn-key-ansi-pkg-p pn)) p)))
+
 (defun %defstruct-intern (name)
   "Intern NAME for a DEFSTRUCT-generated symbol (constructor / accessor /
    setter / predicate names AND the synthetic P-<slot> constructor params).
@@ -11827,7 +11870,7 @@
    decoder got an FFV1 struct."
   (intern name (if *mvm-eval-runtime-p*
                    *package*
-                   (or (find-package "MODUS.MVM") *package*))))
+                   (or *defstruct-home* (find-package "MODUS.MVM") *package*))))
 
 ;;; ------------------------------------------------------------
 ;;; DEFSTRUCT (:TYPE LIST) / (:TYPE VECTOR) / (:TYPE (VECTOR elt)) -- CLHS 3.4.6
@@ -29998,7 +30041,7 @@
            (push thunk-name *init-thunk-names*)
            (when (null value) (push thunk-name *init-nil-thunk-names*))
            (mvm-compile-function
-            thunk-name nil
+            (%init-thunk-fn-name thunk-name) nil
             ;; A NIL initform is the case this arm was widened to cover, and
             ;; it is the only one that can DESTROY state: several boot steps
             ;; run BEFORE (init-all-globals) and store into a global that also
@@ -30035,7 +30078,7 @@
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
            (push thunk-name *init-thunk-names*)
            (mvm-compile-function
-            thunk-name nil
+            (%init-thunk-fn-name thunk-name) nil
             (list `(let ((,tmp-var ,value))
                      ,(%init-thunk-store name name-hash tmp-var))))))))
 
@@ -30141,7 +30184,7 @@
                    (name-hash (normalize-name name)))
                (push thunk-name *init-thunk-names*)
                (mvm-compile-function
-                thunk-name nil
+                (%init-thunk-fn-name thunk-name) nil
                 (list `(let ((,tmp-var ',value))
                          ,(%init-thunk-store name name-hash tmp-var)))))))))
      nil)
@@ -30166,8 +30209,12 @@
     ;; list or vector: expand it (see %DS-TYPED-EXPANSION) and compile that.
     ((and (consp form) (name-eq (car form) "DEFSTRUCT")
           (consp (cadr form)) (%ds-type-option (cdr (cadr form))))
-     (mvm-compile-toplevel (cons 'progn (%ds-typed-expansion form))))
+     (let ((*defstruct-home* (%defstruct-home-pkg (cadr form))))
+       (declare (special *defstruct-home*))
+     (mvm-compile-toplevel (cons 'progn (%ds-typed-expansion form)))))
     ((and (consp form) (name-eq (car form) "DEFSTRUCT"))
+     (let ((*defstruct-home* (%defstruct-home-pkg (cadr form))))
+       (declare (special *defstruct-home*))
      (let* ((name-and-options (cadr form))
             ;; Parse struct name and options
             (struct-name (if (consp name-and-options) (car name-and-options) name-and-options))
@@ -30950,7 +30997,7 @@
          (dolist (gen-form (nreverse forms-to-compile))
            (let ((result (mvm-compile-toplevel gen-form)))
              (when result (push result results))))
-         (cons :multi-result (nreverse results))))))
+         (cons :multi-result (nreverse results)))))))
 
     ;; Other top-level forms: wrap in anonymous function
     (t

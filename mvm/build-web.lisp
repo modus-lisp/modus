@@ -424,6 +424,9 @@
   ;; see it: run the redefinition check around the compile directly.
   (setf *undeclared-redefinitions* nil)
   (clrhash *overridable-names*)
+  (clrhash *gck-fallback-census*)
+  (clrhash *gck-registered-keys*)
   (let ((module (compile-source-to-module cl-user::*full-source*)))
     (check-undeclared-redefinitions)
+    (check-cross-package-calls)
     (web-write-module module target *web-image-path*)))

@@ -101,6 +101,19 @@ control (`%gc-old-space-forget`, same binary) fails every run: one memory fault,
 The first cut forgot the region's SIZE field.  The next collection's from_end then reached over
 the old space and copied it, which the audit showed at once.
 
+**On the board (card #8, QEMU raspi3b, one browser drag of 25 s each, `gc-tenure` called live
+from the REPL):** 42.7 MB tenured (581,022 objects, parsed end to end, 0 dangling before and
+after).  Region 0 went from 50 MB to 2 x 25 MB young.
+
+| | collections in the drag | mean pause | paused | copied per collection |
+|---|---|---|---|---|
+| before tenure | 5 | 242 ms | 4.9% | 40.8 MB |
+| after tenure | 2 | 129 ms | 1.0% | 3.7 MB |
+
+The frame rate did not move (~2.7 updates/s both times), so GC was not what limits a drag; the
+event loop's ~0.75 s turn is.  The remaining ~125 ms pause is the walk of 42 MB of old space,
+not copying.  That is what stage 2's card table removes.
+
 ### Stage 2 — a card table, so a minor collection scans only what changed
 
 - One byte per 512 bytes of old space (the existing design doc's figure; 40 MB = 80 KB of

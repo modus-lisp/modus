@@ -1891,7 +1891,7 @@
    collector keeps scanning only dirty cards."
   (%gc-write64 (+ (%gc-card-words) 16) 0))
 
-(defun gc-tenure (&key (cards t) (promote t))
+(defun gc-tenure (&key (cards t) (promote t) young)
   "Make everything live in region 0 now an OLD SPACE that collections scan and
    never copy, and continue on two young semispaces of half the old size, cut
    from the semispace this collection reclaims.  Call it once, after boot.
@@ -1900,6 +1900,8 @@
    without, every collection walks the whole old space.  With PROMOTE (needs
    CARDS) an object surviving two collections joins the old space, and a MAJOR
    collection reclaims old garbage when the old area runs short of room.
+   YOUNG caps each young semispace at that many bytes (a stress knob: small
+   young halves collect, promote and run majors often).
    Returns (OLD-LO OLD-HI YOUNG-SIZE NCARDS).  Region 0 must be the active region."
   (when (%gc-old-space-p)
     (error "GC-TENURE: region 0 already has an old space [~X, ~X)"
@@ -1913,6 +1915,8 @@
              (size (%gc-meta-read (+ r #x10) k))
              (half (* 4096 (floor size 8192)))
              (before 0))
+        (when young
+          (setq half (max 1048576 (min half (* 4096 (floor young 4096))))))
         ;; the survivors land in the CURRENT to-space: that is the old area
         (when cards
           (setq area (%gc-meta-read (+ r 8) k)

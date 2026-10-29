@@ -985,6 +985,36 @@ Cheney semi-space copying collector. Two ~469MB semispaces within the mmap'd hea
 
 `scan_word` saves/restores RDX (stack_base) around copy_object calls.
 
+### Generational GC (aarch64 only, 2026-10-29) — docs/generational-gc.md
+
+Region 0 on aarch64 can be split into an OLD space plus a young semispace pair.
+**Off until something calls `(gc-tenure)`**: an image that never does behaves
+exactly as before, apart from the barrier's 2 instructions per heap store.
+
+- **`(gc-tenure)`** turns region 0's survivors into the old space
+  (`#x10000CC0/CC8` = old_lo/old_hi, stored <<1).  The old space is SCANNED, never
+  copied.  Tenure must write the region's SIZE field, because the collector's swap
+  never does.
+- **The card table + write barrier.**  Every `setcar`/`setcdr`/`obj-set`/`aset` and
+  word `bulk-move`/`bulk-fill` ends in `ADR x9; B entry`, which branches to one
+  image-wide subroutine (the JIT gets its own copy).  A minor collection scans
+  dirty 512-byte cards only, starting each one at its crossing object.  The words
+  are at `#x10000CE0..CF8`, and the vector's root is at `#x10000D88`.  **Raw
+  stores ((setf mem-ref), %gc-write64) are NOT barriered.**  `%gc-card-audit`
+  finds one that matters.
+- **Promotion and the major collection.**  An object below the previous
+  collection's survivor mark is promoted into the old area.  A major is
+  promote-all, then copy old into young, then re-tenure: two ordinary
+  collections driven by a state word in the card vector's meta.  It is requested
+  automatically when the old area's room < max(reserve, 2 x survivors).
+  `gc-major`, `gc-untenure`, `gc-gen-reserve`, `gc-gen-report`.  **save-image
+  untenures first**, so a saved core is single-range.
+- **Oracles, each with a control:** `%gc-old-audit` (a TYPED walk of the old
+  space; a word count sees leaf payload and lies), `%gc-card-audit`, and
+  `test/gc-tenure.lisp` (19 checks; `*gen-control*` `:walk` / `:barrier` must
+  FAIL).
+- **x64, i386, riscv, arm32: not ported.**  `gc-tenure` refuses loudly there.
+
 ### Per-region GC, stage 1: the metadata block is a REGION CONTROL BLOCK
 
 The GC metadata is no longer global.  `mvm/compiler.lisp` owns the layout:

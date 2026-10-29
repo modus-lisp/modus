@@ -166,6 +166,48 @@ area, ncards, crossing.  The tenure request moved to `#x10000C88/C90/C98`.
 - save-image learns the two-range layout, so a core saved after tenure restores with its old
   space intact.
 
+**Built (2026-10-29), aarch64.**  Promotion is by SURVIVOR MARK rather than a per-object age:
+at the end of every region-0 collection the to-space frontier is recorded, and the next
+collection promotes any from-space object below that mark (it has now survived twice) straight
+into the old area instead of copying it back into young.  One word of state, no header bits.
+
+- **Card vector meta.**  The card vector now starts with 128 bytes of raw words: capacity, area
+  size, survivor mark, major state, promotion failures, majors, bytes promoted, promote-on, and
+  reserve (0 = 4 MB).  Cards start at meta+128 and the crossing table at cards+capacity.  The
+  vector's tagged pointer lives at `#x10000D88`, a fixed root every collector scans.
+- **Registers for the whole collection:** x3 = survivor mark, x8 = old bump pointer, x2 = area
+  end.  The card scan's own state moved into a 64-byte frame to free them.  `copy_object` was
+  rewritten to compute the size FIRST, then choose the destination (old area or to-space), then
+  run one 16-byte copy loop.
+- **Cheney with two cursors** (`emit-aarch64-cheney`): x0 over to-space and x1 over the newly
+  promoted part of the old area, until both are caught up.  Promoted objects are scanned like any
+  copied object, and their crossing entries are filled as they land (`emit-aarch64-crossing-fill`).
+- **Promotion failure** (old area full) falls back to copying into young for the rest of the
+  collection and counts a failure; nothing is lost.
+- **The major collection** is a state machine in the card meta, run across two ordinary
+  collections so it reuses the copying collector instead of a second algorithm:
+  - phase 1 (state 7, or 10 for untenure) promotes EVERYTHING young into the old area;
+  - phase 2 (state 2 / 5) copies the whole old area into the young semispace, which collects old
+    garbage, and then re-tenures it (2) or leaves it young (5 = untenure).  Phase 2 does not start
+    unless old bytes <= 2 x half, otherwise state returns to 0 and a failure is counted.
+  - a major is requested automatically when room < max(reserve, 2 x survivors).
+  Lisp: `gc-major`, `gc-untenure`, `gc-gen-reserve`, `gc-gen-report`.
+- **save-image** calls `gc-untenure` first, so a saved core has the plain single-range layout
+  and restores on any image.  Measured: a core saved after tenure + a major restores with its
+  data intact.
+- **Two bugs found on the way.**  The cons check in the new `copy_object` used `tag & 7`, and an
+  object pointer's tag 9 & 7 = 1 = cons: it compares `tag & 15` now.  The promotion setup
+  clobbered x17, the region base the root-window code reads after it; it is restored, also on
+  the phase-2 re-entry.
+- **Pi 5 hosted CLI:** test/gc-tenure.lisp 19/19 (promotion, an explicit major 20.5 -> 17.4 MB in
+  15 ms, automatic majors under a huge reserve, untenure).  GC regression tests at baseline.
+- **The 22-library ladder (Pi 5), five arms, identical per library** (104 probes ok; the same 8
+  failures as base, all from before this work): base, tenured, tenured with a huge reserve,
+  `(gc-tenure :young 32MB)`, and the same plus a huge reserve.  **The first two tenured arms proved
+  less than they look:** the hosted young space is hundreds of MB, so a library load collects
+  about 4 times and promoted 0 bytes.  `:young` is the stress knob that makes it real: alexandria
+  then promotes 5.6 MB, and with the reserve it runs a major.  Both audits read 0 afterwards.
+
 ### Stage 4 — the rest of the tree
 
 - Carved thread regions and the lock arena.  Those are scanned, not copied, under STW today, so

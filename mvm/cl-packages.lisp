@@ -534,33 +534,50 @@
    which would regress if we polluted the nicknames slot."
   (cond
     ((%pkg-p name) name)
-    ((and name (or (symbolp name) (stringp name)) (not *pkg-any-local-nicknames*)
-          (let ((c *%find-package-cache*) (hit nil) (str (stringp name)))
-            (loop (unless (consp c) (return))
-              (let ((k (car (car c))))
-                (when (if str (and (stringp k) (string= k name)) (eq k name))
-                  (setq hit (cdr (car c))) (return)))
-              (setq c (cdr c)))
-            hit)))
     ((and name (or (symbolp name) (stringp name)) (not *pkg-any-local-nicknames*))
-     (let ((p (%find-package-uncached name)))
-       ;; Not CL-TEST: the gate image's alias for it is spliced in later.
-       (when (and p (< (%cache-length *%find-package-cache*) 64)
-                  (not (string-equal (if (stringp name) name (symbol-name name)) "CL-TEST")))
-         (%find-package-cache-add name p))
-       p))
+     (let ((c *%find-package-cache*) (cell nil) (str (stringp name)))
+       (loop (unless (consp c) (return))
+         (let ((k (car (car c))))
+           (when (if str (and (stringp k) (string= k name)) (eq k name))
+             (setq cell (car c)) (return)))
+         (setq c (cdr c)))
+       (let ((hit (and cell (cdr cell))))
+         (cond
+           ;; A remembered MISS, (:MISS . the *ALL-PACKAGES* it missed against): a package made
+           ;; since conses a new head (renames drop the whole memo), so the same head = still
+           ;; none.  The gateway asks on every input for a package a lean build does not have.
+           ((and (consp hit) (eq (car hit) :miss))
+            (if (eq (cdr hit) *all-packages*) nil (%find-package-fill name cell)))
+           (hit hit)
+           (t (%find-package-fill name nil))))))
     (t (%find-package-uncached name))))
+
+(defun %find-package-fill (name cell)
+  "The walk's answer for NAME, remembered.  CELL is NAME's stale miss entry, if any: it is
+   updated in place, so a DEFPACKAGE's miss-then-make does not use up the memo's 64 entries."
+  (let ((p (%find-package-uncached name)))
+    (cond
+      (cell
+       (%rt-enter)                     ; the miss cons belongs in the shared heap
+       (rplacd cell (or p (cons :miss *all-packages*)))
+       (%rt-leave))
+      ;; Not CL-TEST: the gate image's alias for it is spliced in later.
+      ((and (< (%cache-length *%find-package-cache*) 64)
+            (not (string-equal (if (stringp name) name (symbol-name name)) "CL-TEST")))
+       (%find-package-cache-add name p)))
+    p))
 
 (defun %find-package-cache-add (name p)
   "Remember NAME -> P.  A STRING name too, matched by STRING= -- a subset of the walk's
    STRING-EQUAL, so a hit is the walk's answer: a run-time package (SB-SYS, made by a shim) is
    in no build-time index, and seal asked for it by string on every poll of a relay, walking
-   every package.  The string is copied: the caller's may be mutated.  Under the runtime lock,
+   every package.  P NIL remembers a miss.  The string is copied: the caller's may be mutated.
+   Under the runtime lock,
    which makes the shared heap the active one: a worker thread's conses must not be what a
    global holds."
   (%rt-enter)
   (setq *%find-package-cache*
-        (cons (cons (if (stringp name) (copy-seq name) name) p)
+        (cons (cons (if (stringp name) (copy-seq name) name) (or p (cons :miss *all-packages*)))
               (if (consp *%find-package-cache*) *%find-package-cache* nil)))
   (%rt-leave))
 

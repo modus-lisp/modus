@@ -5235,6 +5235,12 @@
    everything else upgrades to T (Modus stores general elements as tagged
    words)."
   (declare (ignore environment))
+  ;; The byte vector and T, without a DEFTYPE lookup: every crypto and network buffer is
+  ;; (UNSIGNED-BYTE 8), and CL symbols cannot name a user DEFTYPE.
+  (cond ((eq type t) (return-from upgraded-array-element-type t))
+        ((and (consp type) (eq (car type) 'unsigned-byte) (consp (cdr type))
+              (eql (cadr type) 8) (null (cddr type)))
+         (return-from upgraded-array-element-type '(unsigned-byte 8))))
   (setq type (%element-type-expand type))
   (cond
     ;; NIL element type — array that can hold no objects.

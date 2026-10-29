@@ -20,9 +20,31 @@
   (quote
    (("MODUS.NET" ("COMMON-LISP")
      ;; the NIC interface: every driver implements it, ip.lisp calls it
-     ("NIC-SEND" "NIC-RECEIVE" "NIC-RX-BUF" "NIC-PROBE"))
-    ("MODUS.NET.NE2000" ("COMMON-LISP")
-     ("NE2K-SEND" "NE2K-RECEIVE" "NE2K-RX-BUF" "NE2K-PROBE")))))
+     ("NIC-SEND" "NIC-RECEIVE" "NIC-RX-BUF" "NIC-PROBE" "NIC-READ-REG"))
+    ;; the drivers.  They use MODUS-INT for the board and console functions
+    ;; it exports to them (%MODUS-INT-DRIVER-EXPORTS).
+    ("MODUS.NET.NE2000" ("COMMON-LISP" "MODUS-INT")
+     ("NE2K-SEND" "NE2K-RECEIVE" "NE2K-RX-BUF" "NE2K-PROBE"))
+    ("MODUS.NET.E1000" ("COMMON-LISP" "MODUS-INT")
+     ("E1000-HW-SEND" "E1000-HW-RECEIVE" "E1000-HW-RX-BUF" "E1000-HW-PROBE"
+      "E1000-READ-REG" "E1000-WRITE-REG"))
+    ("MODUS.NET.VIRTIO" ("COMMON-LISP" "MODUS-INT")
+     ("VIRTIO-NET-PROBE" "VIRTIO-NET-SEND" "VIRTIO-NET-RECEIVE"
+      "VIRTIO-NET-RX-BUF" "VIRTIO-NET-ACTIVE-P" "VIRTIO-NET-STATS")))))
+
+(defun %modus-int-driver-exports ()
+  "What MODUS-INT exports to the step-3 driver packages: the console
+   printers, PCI configuration access and the BOARD's address hooks (each
+   arch-*-cl.lisp defines these for its machine).  The board hooks move to a
+   MODUS.BOARD package when the boards get one.  Exported on the build host
+   and in the image alike (%ENSURE-KERNEL-PACKAGES), so the image reads
+   driver source as the host did."
+  (quote ("PRINT-DEC" "PRINT-HEX-BYTE" "PRINT-HEX32" "WRITE-STRING-SERIAL"
+          "%SERIAL-BYTE" "IO-DELAY" "PCI-CONFIG-READ" "PCI-CONFIG-WRITE"
+          "E1000-STATE-BASE" "E1000-RX-DESC-BASE" "E1000-RX-BUF-BASE"
+          "E1000-TX-DESC-BASE" "E1000-TX-BUF-BASE" "NE2K-RX-HOST"
+          "VIRTIO-NET-RING-BASE" "VIRTIO-NET-STATE-BASE" "VIRTIO-NET-PT-PAGE"
+          "SNP-MMIO-P" "SNP-MMIO-REAL-P" "SNP-MMIO-READ" "SNP-MMIO-WRITE")))
 
 (defun %kernel-package-name-p (name)
   "True when NAME is one of %KERNEL-PACKAGE-SPECS' packages."
@@ -35,7 +57,10 @@
 (defun %ensure-kernel-packages ()
   "Make every package in %KERNEL-PACKAGE-SPECS that does not exist yet, and
    export its names.  Answers the list of packages."
-  (let ((out nil))
+  (let ((out nil)
+        (int (find-package "MODUS-INT")))
+    (dolist (n (%modus-int-driver-exports))
+      (export (intern n int) int))
     (dolist (s (%kernel-package-specs))
       (let ((p (or (find-package (car s))
                    (make-package (car s) :use (cadr s)))))

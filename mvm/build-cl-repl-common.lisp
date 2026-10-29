@@ -1675,22 +1675,59 @@
 ;; NIC-SEND / -RECEIVE / -RX-BUF / -PROBE, which ip.lisp, ssh.lisp and
 ;; tcp-conns.lisp call, go BEFORE the drivers; after them, %BIND-NIC-SEAMS binds
 ;; the interface to this image's driver with (setf fdefinition), and kernel-main
-;; calls it right after INIT-ALL-GLOBALS (the arch slot below).  The NE2000 is
-;; the first driver in a package of its own; the others still implement the
-;; interface as the MODUS-INT E1000-* functions (and pick between NICs there).
+;; calls it right after INIT-ALL-GLOBALS (the arch slot below).  The NE2000,
+;; E1000 and virtio drivers have packages of their own; the boards' USB NICs
+;; still implement the interface as the MODUS-INT E1000-* functions.
 (defun %nic-binding-text ()
-  (let ((impl (if *cl-repl-i386-p*
-                  '("modus.net.ne2000:ne2k-send" "modus.net.ne2000:ne2k-receive"
-                    "modus.net.ne2000:ne2k-rx-buf" "modus.net.ne2000:ne2k-probe")
-                  '("modus-int::e1000-send" "modus-int::e1000-receive"
-                    "modus-int::e1000-rx-buf" "modus-int::e1000-probe"))))
-    (format nil "~%(defun %bind-nic-seams ()
-  (modus.net::%define-nic-seams)
-  (setf (fdefinition 'modus.net:nic-send) (function ~A))
+  (flet ((bind (send receive rx-buf probe read-reg)
+           (format nil "  (setf (fdefinition 'modus.net:nic-send) (function ~A))
   (setf (fdefinition 'modus.net:nic-receive) (function ~A))
   (setf (fdefinition 'modus.net:nic-rx-buf) (function ~A))
-  (setf (fdefinition 'modus.net:nic-probe) (function ~A)))~%"
-            (first impl) (second impl) (third impl) (fourth impl))))
+  (setf (fdefinition 'modus.net:nic-probe) (function ~A))
+  (setf (fdefinition 'modus.net:nic-read-reg) (function ~A))"
+                   send receive rx-buf probe read-reg)))
+    (cond
+      (*cl-repl-i386-p*
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.ne2000:ne2k-send" "modus.net.ne2000:ne2k-receive"
+                     "modus.net.ne2000:ne2k-rx-buf" "modus.net.ne2000:ne2k-probe"
+                     "modus.net::no-read-reg")))
+      (*cl-repl-x64-p*
+       ;; virtio or E1000, decided when NIC-PROBE runs: it probes virtio, and
+       ;; rebinds the interface to whichever NIC answered.
+       (format nil "~%(defun %pick-virtio-or-e1000 ()
+  (if (= (modus.net.virtio:virtio-net-probe) 1)
+      (progn
+        (setf (fdefinition 'modus.net:nic-send) (function modus.net.virtio:virtio-net-send))
+        (setf (fdefinition 'modus.net:nic-receive) (function modus.net.virtio:virtio-net-receive))
+        (setf (fdefinition 'modus.net:nic-rx-buf) (function modus.net.virtio:virtio-net-rx-buf))
+        (setf (fdefinition 'modus.net:nic-read-reg) (function modus.net::no-read-reg))
+        1)
+      (modus.net.e1000:e1000-hw-probe)))
+(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.e1000:e1000-hw-send" "modus.net.e1000:e1000-hw-receive"
+                     "modus.net.e1000:e1000-hw-rx-buf" "%pick-virtio-or-e1000"
+                     "modus.net.e1000:e1000-read-reg")))
+      (*cl-repl-virt-p*
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.e1000:e1000-hw-send" "modus.net.e1000:e1000-hw-receive"
+                     "modus.net.e1000:e1000-hw-rx-buf" "modus.net.e1000:e1000-hw-probe"
+                     "modus.net.e1000:e1000-read-reg")))
+      (t
+       ;; the boards: CDC-ECM / RTL8153 behind usb-netdev's dispatch, still
+       ;; the MODUS-INT E1000-* functions
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus-int::e1000-send" "modus-int::e1000-receive"
+                     "modus-int::e1000-rx-buf" "modus-int::e1000-probe"
+                     "modus-int::e1000-read-reg"))))))
 
 (when *net-build-p*
   (setq *net-nic-source*

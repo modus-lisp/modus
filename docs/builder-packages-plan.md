@@ -199,6 +199,20 @@ packages.
 - Measured: x64, aarch64 and i386 SSH images answer `(* 6 7)` with the
   interface bound to the expected driver; build checks unchanged.
 
+**Cycle 2, 2026-10-29: the E1000 and virtio drivers.**  `net/e1000.lisp` is
+MODUS.NET.E1000 and `net/virtio-net.lisp` MODUS.NET.VIRTIO.  The drivers
+`:use` MODUS-INT, which exports to them the console printers, PCI config
+access and the board's address hooks (%MODUS-INT-DRIVER-EXPORTS, on host
+and image alike) -- those move to MODUS.BOARD with the boards.  Virtio's
+"wrap the E1000 functions by last-defun-wins and dispatch per call" is
+gone: the x64 image binds NIC-PROBE to %PICK-VIRTIO-OR-E1000, which rebinds
+the other seams to the virtio functions when the device answers.
+ip.lisp's register dump calls the new NIC-READ-REG.  Measured: i386
+(NE2000), x64 with an E1000, x64 with virtio-net-pci and aarch64 (E1000)
+answer over ssh, each with NIC-SEND bound to its driver.  Left in MODUS-INT:
+the boards' USB NICs (cdc-ether, r8152, usb-netdev), which only the Pi
+board image can run.
+
 ### 4. Runtime identity: every baked symbol keeps its home package
 
 - Create the step-2 package graph in the image at boot, from data the build

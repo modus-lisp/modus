@@ -13,17 +13,18 @@
 ;;;; (net/snp-ghcb.lisp).  The rings and buffers it DMAs are already in the
 ;;;; shared (C=0) region (net/arch-x86-cl.lisp).
 ;;;;
-;;;; Same contract as net/e1000.lisp, because net/ip.lisp, http-client.lisp and
-;;;; the SSH server only ever call these four names:
-;;;;   e1000-probe     find + initialise a NIC
-;;;;   e1000-send      (buf len)  BUF a Lisp array of byte values, LEN bytes
-;;;;   e1000-receive   -> frame length, or 0 when nothing is pending
-;;;;   e1000-rx-buf    -> raw address of the frame just returned by
-;;;;                      e1000-receive, Ethernet header at offset 0
+;;;; Package MODUS.NET.VIRTIO (builder packages step 3).  It implements
+;;;; MODUS.NET's NIC interface (net/nic.lisp), the contract net/ip.lisp,
+;;;; http-client.lisp and the SSH server call:
+;;;;   virtio-net-probe    find + initialise the device; 1 when found
+;;;;   virtio-net-send     (buf len)  BUF a Lisp array of byte values, LEN bytes
+;;;;   virtio-net-receive  -> frame length, or 0 when nothing is pending
+;;;;   virtio-net-rx-buf   -> raw address of the frame just returned by
+;;;;                          virtio-net-receive, Ethernet header at offset 0
 ;;;; and the MAC goes where e1000-init puts it, (e1000-state-base)+0x08, which
-;;;; is where ip.lisp reads it.  The wrappers at the END of this file replace
-;;;; e1000.lisp's by last-defun-wins and dispatch on the probe's verdict, so
-;;;; the E1000 path is untouched: virtio when the PCI scan finds one, else E1000.
+;;;; is where ip.lisp reads it.  The x64 image's NIC-PROBE probes virtio first
+;;;; and binds the interface to whichever NIC it found (build-cl-repl-common's
+;;;; %BIND-NIC-SEAMS): virtio when the PCI scan finds one, else the E1000.
 ;;;;
 ;;;; Requires from the arch adapter (net/arch-x86-cl.lisp):
 ;;;;   pci-config-read / pci-config-write, print-hex32 / print-hex-byte,
@@ -57,6 +58,8 @@
 ;;;;
 ;;;; Ring indices are free-running 16-bit counters (spec 2.7.6/2.7.8); the slot
 ;;;; is idx AND (qsize-1), qsize a power of two.  No MOD (see e1000-hw-send).
+
+(in-package :modus.net.virtio)
 
 ;; ------------------------------------------------------------------
 ;; Sizes and layout
@@ -523,15 +526,3 @@
   (write-string-serial " tx-used=") (print-dec (mem-ref (+ (vnet-tx-used) 2) :u16))
   (write-string-serial " status=") (print-hex-byte (vnet-status))
   (write-char-serial 10))
-
-;; ------------------------------------------------------------------
-;; The API wrappers — replace e1000.lisp's by last-defun-wins.
-;; ------------------------------------------------------------------
-(defun e1000-probe ()
-  (if (= (virtio-net-probe) 1) 1 (e1000-hw-probe)))
-(defun e1000-send (buf len)
-  (if (virtio-net-active-p) (virtio-net-send buf len) (e1000-hw-send buf len)))
-(defun e1000-receive ()
-  (if (virtio-net-active-p) (virtio-net-receive) (e1000-hw-receive)))
-(defun e1000-rx-buf ()
-  (if (virtio-net-active-p) (virtio-net-rx-buf) (e1000-hw-rx-buf)))

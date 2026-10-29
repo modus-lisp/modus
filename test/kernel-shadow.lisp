@@ -32,7 +32,11 @@
 (check "MODUS-INT::NAME reaches the kernel's callers" (> *hits* 0) t)
 (check "restored" (format nil "~a" 42) "42")
 
-;; 3. the public API is MODUS's, and MODUS:NAME is the kernel's symbol
+;; 3. an internal NOT redefined here is undefined under its bare name, as in CL
+(check "a bare kernel internal is not CL-USER's" (fboundp (quote %gc-read64)) nil)
+(check "MODUS-INT::NAME is" (fboundp (quote modus-int::%gc-read64)) t)
+
+;; 4. the public API is MODUS's, and MODUS:NAME is the kernel's symbol
 (check "CL-USER uses MODUS" (eq (quote sys-exit) (quote modus:sys-exit)) t)
 (check "MODUS:SYS-EXIT is the kernel's"
        (eq (quote modus:sys-exit) (find-symbol "SYS-EXIT" "MODUS-INT")) t)

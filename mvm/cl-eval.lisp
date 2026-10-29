@@ -106,10 +106,11 @@
    own and resolved to the kernel's (the transitional read fallback).  EQUAL
    hash name -> count.  Drive to zero, then the fallback goes.")
 
-(defvar *kernel-name-fallback-p* t
-  "NIL turns the transitional read fallback off: a non-kernel symbol named like
-   a kernel function is then simply undefined, as in CL.  For finding the
-   callers that still rely on it.")
+(defvar *kernel-name-fallback-p* nil
+  "T turns the transitional read fallback back on: a non-kernel symbol named
+   like a kernel function with no function of its own then reads the kernel's
+   (counted in *KERNEL-NAME-FALLBACKS*).  NIL, the default since 2026-10-29,
+   is CL: that symbol is simply undefined.")
 
 (defun %snapshot-kernel-fn-names ()
   (let ((h (make-hash-table :test (function equal))))

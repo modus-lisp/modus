@@ -313,10 +313,12 @@ Three things that are easy to get wrong:
   keeps calling its own; to fix the kernel's function from a REPL, redefine
   `modus-int::fe-sq`, which reaches its kernel callers as before.  A CL symbol
   (`(setf (fdefinition 'close) …)`) is the kernel's own and still redirects.
-  TRANSITIONAL: a non-kernel symbol with no function of its own, named like a
-  kernel internal, still READS the kernel's (so `(%gc-read64 …)` typed in
-  CL-USER works); `*kernel-name-fallbacks*` counts those reads, and the
-  fallback goes once tests and docs say `modus-int::`.  `test/kernel-shadow.lisp`.
+  Calling an internal from CL-USER takes the prefix: `(modus-int::%gc-read64 …)`;
+  a bare `(%gc-read64 …)` there is an UNDEFINED-FUNCTION, as in CL.  The
+  transitional fallback that made it read the kernel's function is OFF since
+  every test says `modus-int::`; `(setq modus-int::*kernel-name-fallback-p* t)`
+  turns it back on and `*kernel-name-fallbacks*` counts its hits.
+  `test/kernel-shadow.lisp`.
 
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 

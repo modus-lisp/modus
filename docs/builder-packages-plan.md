@@ -288,6 +288,11 @@ function.  Phase B:
    sb-int / sb-impl.
 3. Qualify the remaining internal calls in test/, scripts/ and docs/ (218
    names, 163 files measured), then drop the fallback.
+   **DONE for test/ and scripts/ (f785daa0):** every test/*.lisp gives the same
+   exit status with the fallback on and off, and strict mode logs no hits.
+   The fallback is OFF by default since; `*kernel-name-fallback-p*` T turns it
+   back on.  Deleting it outright waits on docs/ (prose examples still call
+   internals bare).
 4. Globals and specials: the same, later (they are stored by name hash in
    compiled code, so this one moves bytes).
 

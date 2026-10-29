@@ -109,8 +109,20 @@ MODUS.ASM-read call to a MODUS.MVM function fails the build.  The fallback
 itself stays for FORWARD references (the caller's own package defines the name
 later), which the check allows.  Emitted code: only the changed compiler
 functions and the generated tables moved (function sizes compared; the SFT
-tables +0.06%).  Still to do in this step: record defpackage / in-package at
-build time, and key globals and constants by (package, name).
+tables +0.06%).
+
+**GLOBALS DONE 2026-10-29.**  Globals and constants are still STORED by name
+hash (in the compiler and at runtime), so true per-package storage is step 4's
+runtime identity; what step 2 needed was that no reference crosses packages by
+accident.  `CHECK-CROSS-PACKAGE-GLOBALS` records every global/constant
+definition and reference as (package, name): the x64 CLI had 18 cross-package
+references and 2 names defined in two packages, all the x64 JIT glue (the
+co-init, read in MODUS.ASM, setting translator variables; mvm-eval's bare
+DEFVARs of two translator variables).  Host imports fixed them; all 31 images:
+0 and 0, fatal by default (`MODUS_GLOBAL_PKG_CHECK=warn`), and a MODUS.ASM-read
+reference to `*MACRO-TABLE*` fails the build.  **Recording defpackage /
+in-package moved to step 4**, where creating the packages in the image is its
+consumer; recorded now it would be data nothing reads.
 
 Make the packages that the reader already honours mean something to the
 compiler.

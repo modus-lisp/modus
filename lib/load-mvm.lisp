@@ -83,7 +83,31 @@
     (import s mvm))
   ;; ...and the x64 co-init, read in MODUS.ASM, asks boot-linux-x64 (MODUS.MVM)
   ;; for the native code offset.
-  (import (intern "LINUX-X64-NATIVE-CODE-OFFSET" mvm) (find-package "MODUS.ASM")))
+  (import (intern "LINUX-X64-NATIVE-CODE-OFFSET" mvm) (find-package "MODUS.ASM"))
+  ;; GLOBALS likewise.  The build compiler keys globals by name hash, so these
+  ;; cross-package references worked by accident (and mvm-eval's bare DEFVARs
+  ;; of two translator variables were, by accident, the translator's).  Make
+  ;; each read name the variable it means (CHECK-CROSS-PACKAGE-GLOBALS).
+  (let ((x64 (find-package "MODUS.MVM.X64")) (asm (find-package "MODUS.ASM")))
+    ;; the co-init (read in MODUS.ASM) sets the translator's configuration
+    (dolist (n '("*X64-GC-REGION-PERCPU*" "*X64-NATIVE-CODE-OFFSET*" "*X64-GC-ENABLED*"
+                 "*X64-STW*" "*VREG-TO-X64*" "*JIT-XLATE-ERR-INFO*" "*X64-JIT-CONSTVEC-P*"
+                 "*X64-JIT-CONSTVEC-FULL-P*" "*X64-SCHED-LOCK-ADDR*" "*X64-TLS-WINDOW*"
+                 "*X64-LINUX-MODE*" "*WS5-FORCE-NO-KINDCHECK*" "*MCGC-KIND-BITMAP-ENABLED*"))
+      (import (find-symbol n x64) asm))
+    (dolist (n '("*HC-FAULT-FIXUP*" "*TLS-WINDOW*" "*LINUX-X64-R14-OFFSET*"))
+      (import (intern n mvm) asm))
+    ;; the cross-compiling images (aarch64 CLI, self-host) configure the x86-64
+    ;; translator from text read in MODUS.MVM
+    (dolist (n '("*X64-TLS-WINDOW*" "*X64-NATIVE-CODE-OFFSET*" "*X64-LINUX-MODE*"
+                 "*X64-JIT-CONSTVEC-P*" "*X64-JIT-CONSTVEC-FULL-P*" "*X64-GC-ENABLED*"
+                 "*WS5-FORCE-NO-KINDCHECK*" "*JIT-XLATE-ERR-INFO*"))
+      (import (find-symbol n x64) mvm))
+    ;; mvm-eval (MODUS.MVM) reads the translator's relocation lists and state
+    (dolist (n '("*X64-FN-ADDR-RELOCS*" "*X64-CALL-RELOCS*" "*X64-LI-CONST-PATCHES*"
+                 "*X64-JIT-MODE*" "*X64-CALL-RELOC-NARGS*" "*X64-LAST-GC-TRAMP-LABEL*"
+                 "*X64-JIT-SHARED-GC-TRAMP*"))
+      (import (find-symbol n x64) mvm))))
 
 ;; Cross-compilation pipeline
 (mvm-load "mvm/cross.lisp")

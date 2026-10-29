@@ -1565,6 +1565,44 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                 symbol the call means: qualify it, :USE its package, or import it."
                (length bad) (first (first bad)) (second (first bad)))))))
 
+(defun check-cross-package-globals ()
+  "Builder packages step 2, globals.  The build compiler keys globals and
+   constants by NAME HASH, so a read of P::*X* silently finds Q::*X*, and two
+   packages that each DEFVAR *X* share one variable.  Report both: a
+   CROSS-PACKAGE-GLOBAL is a reference from a package that defines no such
+   global to one another package defines; a GLOBAL-COLLISION is one name
+   defined in two packages.  Fatal by default; MODUS_GLOBAL_PKG_CHECK=warn
+   reports instead."
+  (when *global-uses*
+    (let ((by-name (make-hash-table :test 'equal))
+          (cross nil) (coll nil))
+      (maphash (lambda (k kinds)
+                 (push (cons (car k) kinds) (gethash (cdr k) by-name)))
+               *global-uses*)
+      (maphash
+       (lambda (name entries)
+         (let ((defp (loop for (p . kinds) in entries
+                           when (member :def kinds) collect p)))
+           (when (> (length defp) 1)
+             (push (list name defp) coll))
+           (when defp
+             (loop for (p . kinds) in entries
+                   when (and (member :ref kinds) (not (member p defp :test 'equal)))
+                     do (push (list name p defp) cross)))))
+       by-name)
+      (format t ";; global-pkg-check: ~D cross-package global reference~:P, ~
+                 ~D name~:P defined in two packages~%" (length cross) (length coll))
+      (dolist (c cross)
+        (format t ";;   CROSS-PACKAGE-GLOBAL ~A::~A -> defined in ~{~A~^, ~}~%"
+                (second c) (first c) (third c)))
+      (dolist (c coll)
+        (format t ";;   GLOBAL-COLLISION ~A defined in ~{~A~^, ~}~%" (first c) (second c)))
+      (when (and (not (member (sb-ext:posix-getenv "MODUS_GLOBAL_PKG_CHECK")
+                              '("warn" "0") :test 'equal))
+                 (or cross coll))
+        (error "global-pkg-check: ~D cross-package global reference~:P, ~D collision~:P"
+               (length cross) (length coll))))))
+
 (defun %gck-fallback-census-dump ()
   (let ((path (%gck-fallback-census-path)))
     (when (and path *gck-fallback-census*)
@@ -1593,6 +1631,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
           (setf *undeclared-redefinitions* nil)
           (when *gck-fallback-census* (clrhash *gck-fallback-census*))
           (clrhash *gck-registered-keys*)
+          (setf *global-uses* (make-hash-table :test 'equal))
           (clrhash *overridable-names*)
           (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
@@ -1630,6 +1669,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (%gck-guard "fn-fallback-census" (%gck-fallback-census-dump))
             (check-undeclared-redefinitions)
             (check-cross-package-calls)
+            (check-cross-package-globals)
             result)))
   (setf (fdefinition 'build-image) *build-image-wrapper*))
 

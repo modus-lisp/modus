@@ -1436,6 +1436,19 @@
 (defvar *unresolved-calls* (make-hash-table :test 'equal)
   "Tracks unresolved function calls: name-string -> count")
 
+(defvar *global-uses* nil
+  "Host-side census, NIL unless mvm/build-checks.lisp installs a hash: for each
+   global or constant the build compiles, (PACKAGE-NAME . SYMBOL-NAME) -> the
+   kinds seen (:DEF, :REF).  *GLOBALS* and *CONSTANTS* key by name hash alone,
+   so a read of MODUS.MVM::*X* finds MODUS.MVM.X64::*X* -- builder packages
+   step 2 makes those cross-package references visible.  Emits nothing.")
+
+(defun %note-global (sym kind)
+  (when (and *global-uses* (symbolp sym) sym (not *mvm-eval-runtime-p*))
+    (let* ((p (symbol-package sym))
+           (k (cons (if p (package-name p) "") (symbol-name sym))))
+      (pushnew kind (gethash k *global-uses*)))))
+
 (defvar *globals* (make-hash-table :test 'eql)
   "Set of known global variable names (hash -> t)")
 
@@ -7843,6 +7856,7 @@
       ;; Compile-time constant: fold to literal
       ((let ((const-val (gethash (normalize-name name) *constants* :not-found)))
          (unless (eq const-val :not-found)
+           (%note-global name :ref)
            ;; Quote symbol constants to prevent them being treated as variables
            (if (and (symbolp const-val)
                     (not (null const-val))
@@ -7853,6 +7867,7 @@
            t)))
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
+       (%note-global name :ref)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; mvm-eval production-eval semantics (WS3 flip): a global READ of a
            ;; name with NO binding in the symbol-value alist must signal
@@ -7878,6 +7893,7 @@
        ;; host *error-output* is stderr; in-image %init-streams now makes it a
        ;; real fd-2 stream (it used to be the stdout stream object itself).
        (format *error-output* "~&  WARN: implicit global ~A~%" name)
+       (%note-global name :ref)
        (setf (gethash (normalize-name name) *globals*) t)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
@@ -8557,6 +8573,7 @@
               ;; …)`).  Test initform PRESENCE via (cddr form), not its value.
               (has-initform (consp (cddr form)))
               (name-hash (normalize-name var-name)))
+         (%note-global var-name :def)
          (setf (gethash name-hash *globals*) t)
          (%note-runtime-special name-hash)
          (when has-initform
@@ -13740,11 +13757,13 @@
           (compile-form `(setf ,(binding-expansion binding) ,val) env dest))))
       ;; Global variable: emit call to set-symbol-value
       ((gethash (normalize-name var) *globals*)
+       (%note-global var :ref)
        (%compile-setq-global var dest))
       (t
        ;; Implicit global for setq
        ;; See the companion note at the implicit-global read site above.
        (format *error-output* "~&  WARN: implicit global setq ~A~%" var)
+       (%note-global var :ref)
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
 
@@ -30025,6 +30044,7 @@
             (has-initform (consp (cddr form)))
             (name-hash (normalize-name name)))
        ;; Register as global variable
+       (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
        ;; Compile as a thunk that initializes the variable
@@ -30071,6 +30091,7 @@
             (has-initform (if *mvm-eval-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable
+       (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
        (when has-initform
@@ -30159,6 +30180,7 @@
                               (eq value-form t) (null value-form))
                           value-form
                           (eval value-form))))
+           (%note-global name :def)
            (setf (gethash (normalize-name name) *constants*) value)
            ;; Make available for subsequent eval calls (skip if already a constant)
            (when (and (symbolp name)

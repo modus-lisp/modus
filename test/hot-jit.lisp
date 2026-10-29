@@ -11,7 +11,7 @@
 
 ;; This file tests the HOT promotion itself, so its DEFUNs must start
 ;; interpreted: no batch JIT of the script's own DEFUNs (cl-eval.lisp).
-(setq *jit-script-defs* nil)
+(setq modus-int::*jit-script-defs* nil)
 
 (defvar *checks* 0)
 (defvar *fails* 0)
@@ -121,8 +121,8 @@
 ;;; forwarded BY NAME (that is the wrapper: a loop) -- but it must still go
 ;;; native, to its OWN code: it used to stay interpreted forever.
 (defun forwarded-p (nm)
-  (let ((f (or (gethash nm *jit-trampoline-forwards*)
-               (gethash (concatenate 'string "COMMON-LISP-USER::" nm) *jit-trampoline-forwards*))))
+  (let ((f (or (gethash nm modus-int::*jit-trampoline-forwards*)
+               (gethash (concatenate 'string "COMMON-LISP-USER::" nm) modus-int::*jit-trampoline-forwards*))))
     (and f (car (cdr f)) (eql (logand (%val->word (car (cdr f))) 15) 3))))
 (defun wrapped (x) (* x 3))
 (defvar *wrapper-calls* 0)
@@ -148,5 +148,5 @@
 (setq *jit-hot-calls* nil)
 
 (format t "~&HOT-JIT: ~a checks, ~a failed  (promoted ~a, failed ~a)~%"
-        *checks* *fails* *jit-hot-promoted* *jit-hot-failed*)
+        *checks* *fails* modus-int::*jit-hot-promoted* modus-int::*jit-hot-failed*)
 (sys-exit (if (zerop *fails*) 0 1))

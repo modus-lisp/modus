@@ -91,7 +91,7 @@
         (chk "region-alignment violations" (w res #x30) 0)
         (chk "last violation mask" (w res #x38) 0)
         (format t "  ... region i's from-space = 0x~X + i * 0x~X~%"
-                (modus-int::%ha-region-from 0) *ha-rsize*)
+                (modus-int::%ha-region-from 0) modus-int::*ha-rsize*)
         (format t "  ... region i's control block = 0x~X + i * 0x40~%" (modus-int::%ha-rcb 0))
 
         (format t "~%-- spawning and joining ---------------------------------~%")

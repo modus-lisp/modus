@@ -105,12 +105,12 @@ Attribution by reason (all pre-fix):
 
 ### Name the referents (census)
 
-Set `*jit-census-on*` **before** loading; the `frel` reject path then records
+Set `modus-int::*jit-census-on*` **before** loading; the `frel` reject path then records
 `(name . count)` into `*jit-blocked-fnaddrs*` (a bounded 96-entry alist —
 plain `write` chokes on it mid-form; print it with `dolist`):
 
 ```lisp
-(setq *jit-census-on* t)
+(setq modus-int::*jit-census-on* t)
 ;; … load reel as above …
 (dolist (e *jit-blocked-fnaddrs*) (format t "~a x~a~%" (car e) (cdr e)))
 ;; MAKE-ARRAY x118      <- keyword make-array expansion

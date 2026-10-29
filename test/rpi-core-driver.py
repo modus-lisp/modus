@@ -58,7 +58,7 @@ if a.expect_restored and "CORE-RESTORED" not in banner:
 time.sleep(2); rd_until(r"never", 1.0)
 say("WARMUP", q("(+ 20 22)"))
 if a.tar:
-    q("(setq *tar-block-size* 512)")
+    q("(setq modus-int::*tar-block-size* 512)")
     # RAMV NATIVE: under the default hot-only JIT the defun stays interpreted, and
     # copying a 1.3 MB tarball out of RAM took ~10 min under TCG (native: seconds).
     hot = q("*jit-hot-only*")

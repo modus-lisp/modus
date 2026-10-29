@@ -295,6 +295,13 @@ function.  Phase B:
    source is read in MODUS-INT.
 4. Globals and specials: the same, later (they are stored by name hash in
    compiled code, so this one moves bytes).
+   **DONE without moving bytes:** baked code keeps its bare keys.  The build
+   emits the kernel's global names (SCAN-GLOBAL-NAMES, beside the function
+   table), and a non-kernel symbol with one of those names gets the
+   package-qualified key the runtime already used for runtime-born packages
+   (task #241's %SYM-GLOBAL-PKG-KEY / %GLOBAL-VAR-PKG-KEY).  The census
+   (*KERNEL-GLOBAL-SHADOW-P* NIL) found 9 tests, the Pi core driver and the
+   board helpers; MODUS exports *JIT-ON*, *JIT-HOT-ONLY*, *JIT-HOT-CALLS*.
 
 ## Open questions
 

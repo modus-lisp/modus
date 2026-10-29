@@ -11,7 +11,7 @@
 ;;;; third opinion that shares no code with either.
 
 (defvar *interp* (equal (sb-ext:posix-getenv "MUL_SPLIT_MODE") "interp"))
-(when *interp* (setq *jit-inhibit* t))
+(when *interp* (setq modus-int::*jit-inhibit* t))
 
 (defvar *checks* 0)
 (defvar *fails* 0)
@@ -127,5 +127,5 @@
 (setq *result* (list *checks* *fails*))
 (format t "~&MUL-SPLIT ~a: ~a checks, ~a failed  (jit-fallbacks ~a)~%"
         (if *interp* "interp" "jit") (car *result*) (cadr *result*)
-        (handler-case *jit-fallback-count* (error () :unbound)))
+        (handler-case modus-int::*jit-fallback-count* (error () :unbound)))
 (sys-exit (if (zerop (cadr *result*)) 0 1))

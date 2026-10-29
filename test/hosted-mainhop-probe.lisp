@@ -118,7 +118,7 @@
         (r0size (modus-int::%gc-meta-read (+ r0 #x10) ms))
         (mfrom (modus-int::%ha-region-from 0))
         (mto (modus-int::%ha-region-to 0))
-        (msz *ha-rsize*))
+        (msz modus-int::*ha-rsize*))
     (cond ((and (>= w r0from) (< w (+ r0from r0size))) 0)
           ((and (>= w mfrom) (< w (+ mfrom msz))) 1)
           ((and (>= w mto) (< w (+ mto msz))) 1)
@@ -129,8 +129,8 @@
    that dangles when main's region collects."
   (let ((r0from (modus-int::%gc-meta-read (+ r0 #x00) ms))
         (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) ms)))
-    (+ (modus-int::%gc-count-foreign-refs r0from r0alloc (modus-int::%ha-region-from 0) *ha-rsize*)
-       (modus-int::%gc-count-foreign-refs r0from r0alloc (modus-int::%ha-region-to 0) *ha-rsize*))))
+    (+ (modus-int::%gc-count-foreign-refs r0from r0alloc (modus-int::%ha-region-from 0) modus-int::*ha-rsize*)
+       (modus-int::%gc-count-foreign-refs r0from r0alloc (modus-int::%ha-region-to 0) modus-int::*ha-rsize*))))
 
 (defun mh-parked (r0 ms) (modus-int::%gc-meta-read (+ r0 #x30) ms))
 
@@ -139,7 +139,7 @@
    region the carve has always reserved for it — with the process stack base
    as its root window, exactly the stack top %TL-SELFTEST hands main's region."
   (let ((rcb (modus-int::%ha-rcb 0)))
-    (modus-int::%gc-region-init rcb (modus-int::%ha-region-from 0) (modus-int::%ha-region-to 0) *ha-rsize*
+    (modus-int::%gc-region-init rcb (modus-int::%ha-region-from 0) (modus-int::%ha-region-to 0) modus-int::*ha-rsize*
                      (modus-int::%gc-meta-read (+ r0 #x18) ms) ms)
     (modus-int::%gc-region-enter rcb)
     rcb))

@@ -317,6 +317,18 @@ Three things that are easy to get wrong:
   a bare `(%gc-read64 …)` there is an UNDEFINED-FUNCTION, as in CL.  (Phase B's
   transitional fallback, which made it read the kernel's function, is deleted;
   tests, scripts and docs say `modus-int::`.)  `test/kernel-shadow.lisp`.
+- **Kernel GLOBALS are not CL-USER globals either.**  The build lists every
+  name its source defines with DEFVAR / DEFPARAMETER / DEFCONSTANT
+  (`*kernel-global-names*`, 1021 in the x64 CLI); a symbol of a non-kernel
+  package with one of those names gets its own cell, keyed `PKG::NAME`.  So a
+  script's `(defvar *ha-rsize* :mine)` no longer overwrites the kernel's, and
+  setting a kernel variable from CL-USER takes the prefix:
+  `(setq modus-int::*tar-block-size* 512)`.  MODUS exports the JIT's settings
+  (`*jit-on*`, `*jit-hot-only*`, `*jit-hot-calls*`), so those stay bare.
+  Unlike a function, a missed caller does not fail -- it quietly sets its own
+  variable -- so the census came first: `*kernel-global-shadow-p*` NIL shares
+  cells again and counts each such reference in `*kernel-global-shadow-hits*`.
+  `test/kernel-global-shadow.lisp`.
 
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 

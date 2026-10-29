@@ -2974,7 +2974,9 @@
                        "SSH-SERVE-TCP" "SSH-SERVE-TCP-ON" "SSH-SERVE-VSOCK" "SSH-BOOT"
                        "RUN-NET-PIPELINE" "HTTP-FETCH"
                        "PMU-START" "PMU-STOP" "PMU-READ" "PMU-MEASURE" "PMU-PROFILE"
-                       "PMU-ANNOTATE")))
+                       "PMU-ANNOTATE"
+                       ;; the JIT's documented settings (as SB-EXT:*EVALUATOR-MODE*)
+                       "*JIT-ON*" "*JIT-HOT-ONLY*" "*JIT-HOT-CALLS*")))
       (let ((sym (intern n int)))
         (import sym modus)
         (export sym modus)))

@@ -2332,6 +2332,38 @@
 
 (format t "  defuns found: ~D~%" (length *all-defun-names*))
 
+(defun scan-global-names (text)
+  "Names (upcased strings, sorted, unique) that TEXT defines with DEFVAR,
+   DEFPARAMETER or DEFCONSTANT: the kernel's globals.  A runtime symbol in a
+   non-kernel package with one of these names gets its own global cell
+   (builder packages, globals by package).  Textual, like SCAN-DEFUNS: a name
+   inside a string literal is collected too, which only gives CL-USER's
+   same-named variable its own cell as well."
+  (let ((names (make-hash-table :test (function equal))))
+    (dolist (head (list "(defvar " "(defparameter " "(defconstant "))
+      (let ((pos 0))
+        (loop
+          (let ((p (search head text :start2 pos)))
+            (unless p (return))
+            (let* ((start (+ p (length head)))
+                   (end (or (position-if (lambda (c) (find c '(#\Space #\Newline #\Tab #\( #\))))
+                                         text :start start)
+                            (length text)))
+                   (name (string-upcase (subseq text start end))))
+              (when (and (> (length name) 0)
+                         (every (lambda (c) (or (alphanumericp c) (find c "+-*/<=>?!@$%^&_.~")))
+                                name)
+                         ;; not on a commented-out line
+                         (not (find #\; text :start (let ((nl (position #\Newline text :end p :from-end t)))
+                                                      (if nl (+ nl 1) 0))
+                                             :end p)))
+                (setf (gethash name names) t))
+              (setq pos end))))))
+    (sort (loop for k being the hash-keys of names collect k) (function string<))))
+
+(defvar *all-global-names* (scan-global-names *all-runtime-source*))
+(format t "  kernel globals found: ~D~%" (length *all-global-names*))
+
 ;; Emit %init-sft-auto in chunks of ~200 to avoid the compiler's
 ;; function-size limits.
 
@@ -2355,7 +2387,11 @@
       (dotimes (c n-chunks)
         (format out "  (%init-sft-auto-~D)~%" c))
       ;; the kernel's own function names, for %KERNEL-SHADOW-KEY (phase B)
-      (format out "  (%snapshot-kernel-fn-names))~%"))))
+      (format out "  (%snapshot-kernel-fn-names)~%")
+      ;; and its global names, for %KERNEL-GLOBAL-SHADOW-P
+      (format out "  (%snapshot-kernel-global-names (%kernel-global-names-text)))~%")
+      (format out "(defun %kernel-global-names-text () ~S)~%"
+              (format nil "~{~A~^ ~}" *all-global-names*)))))
 
 (defvar *sft-auto-source* (emit-sft-auto *all-defun-names* 200))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))

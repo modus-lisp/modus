@@ -167,8 +167,8 @@
     ;; intern path — the per-thread-window campaign explicitly deferred the
     ;; interpreter's simulated state — so it is counted on its own line and
     ;; removed, and the audit below then measures INTERNING and nothing else.
-    (let ((mvheld (il-in-worker (modus-int::%gc-word-of *mvm-last-mv* (+ scr 512)))))
-      (setq *mvm-last-mv* nil)
+    (let ((mvheld (il-in-worker (modus-int::%gc-word-of modus-int::*mvm-last-mv* (+ scr 512)))))
+      (setq modus-int::*mvm-last-mv* nil)
       (list c0 (il-count) f0 (il-fwd r0)
             (il-in-worker (modus-int::%gc-word-of last (+ scr 512)))
             (if last 1 0)

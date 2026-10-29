@@ -19,7 +19,7 @@ q("(+ 20 22)")
 q("(setq *jit-on* t)"); v=q("*jit-on*")
 if v!="T": print("JIT NOT ON — abort"); raise SystemExit(1)
 q("*jit-hot-only*")
-q("(setq *tar-block-size* 512)")
+q("(setq modus-int::*tar-block-size* 512)")
 if q('(if (find-package "REEL") 1 0)')!="1":
     q("(if (fboundp (quote ramv)) 1 0)")
     s.sendall(b"(defun ramv (a n) (let ((v (make-array n :element-type (quote (unsigned-byte 8))))) (dotimes (i n) (setf (aref v i) (mem-ref (+ a i) :u8))) v))\r\n"); rd_until(r"never",2.0)

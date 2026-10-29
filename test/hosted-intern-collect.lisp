@@ -104,7 +104,7 @@
       (setq i (+ i 1)))
     ;; The known, separately-documented interpreter MV hand-off residual —
     ;; not this subject; see test/hosted-intern-layers.lisp.
-    (setq *mvm-last-mv* nil)
+    (setq modus-int::*mvm-last-mv* nil)
     (let ((f-pre (ic-fwd r0))
           (gc0 (modus-int::%ha-my-gc-count))
           (chain (ic-chain 500)))          ; sum 0..499 = 124750

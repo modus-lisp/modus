@@ -24,7 +24,7 @@ def push(path,to=60.0):
 print("banner:", "Modus CL REPL" in rd_until(r"Modus CL REPL",1500.0), flush=True); time.sleep(2)
 rd_until(r"never",1.5); s.sendall(b")))))))))\r\n(+ 0 0)\r\n"); rd_until(r"never",1.5)
 q("(+ 20 22)"); q("(setq *jit-on* t)"); q("*jit-hot-only*"); q("*jit-linkage-cells*")
-q("(setq *tar-block-size* 512)")
+q("(setq modus-int::*tar-block-size* 512)")
 s.sendall(b"(defun ramv (a n) (let ((v (make-array n :element-type (quote (unsigned-byte 8))))) (dotimes (i n) (setf (aref v i) (mem-ref (+ a i) :u8))) v))\r\n"); rd_until(r"never",2.0)
 q("(progn (setq *rh-tarv* (ramv 436207616 163840)) (length *rh-tarv*))",300.0)
 q("(list (aref *rh-tarv* 0) (aref *rh-tarv* 1) (aref *rh-tarv* 2))")   # 114 101 101 = 'ree'

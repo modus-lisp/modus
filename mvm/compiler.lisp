@@ -3369,19 +3369,27 @@
    discover there are no runtime-born packages to fold into.  Same
    re-entrancy reasoning as the runtime side (see cl-packages.lisp)."
   (and *mvm-eval-runtime-p*
-       (%any-runtime-born-pkg-p)
+       (or (%any-runtime-born-pkg-p) *kernel-global-names*)
        sym
        (%cl-sym-p sym)
        (let ((p (%cl-sym-package sym)))
          (and p
               (%pkg-p p)
-              (let ((pn (%pkg-name p)))
-                (and pn
-                     (%runtime-born-pkg-p pn)
-                     (let ((nm (%cl-sym-name sym)))
-                       (and nm (> (length nm) 0)
-                            (compute-name-hash
-                             (%maybe-narrow (concatenate 'string pn "::" nm)))))))))))
+              (let* ((pn (%pkg-name p))
+                     ;; a runtime-born package's own special (task #241), or a
+                     ;; non-kernel symbol named like a kernel global (globals
+                     ;; by package) -- %SYM-GLOBAL-PKG-KEY's same two tests,
+                     ;; the second on the RAW name slot as there
+                     (nm (and pn
+                              (if (and (%any-runtime-born-pkg-p) (%runtime-born-pkg-p pn))
+                                  (%cl-sym-name sym)
+                                  (let ((raw (aref sym 2)))
+                                    (and (stringp raw)
+                                         (%kernel-global-shadow-p pn raw)
+                                         raw))))))
+                (and nm (> (length nm) 0)
+                     (compute-name-hash
+                      (%maybe-narrow (concatenate 'string pn "::" nm)))))))))
 
 (defun %global-var-bind-key (sym)
   "Store key for a global-variable WRITE site: DEFVAR/DEFPARAMETER's initform

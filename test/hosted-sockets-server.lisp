@@ -110,14 +110,14 @@
         (format t "  this CPU's staging   ~X~%" (modus-int::%sock-io-buf))
         (format t "  CPU 1's staging      ~X~%"
                 (+ p (+ (modus-int::%sk-data-off) (modus-int::%sk-buf-bytes))))
-        (format t "  file I/O's page      ~X   (mvm/cl-fileio.lisp)~%" *io-buf-addr*)
+        (format t "  file I/O's page      ~X   (mvm/cl-fileio.lisp)~%" modus-int::*io-buf-addr*)
         (chk-true "socket staging is NOT the file-I/O page any more"
-                  (not (= (modus-int::%sock-io-buf) *io-buf-addr*)))
+                  (not (= (modus-int::%sock-io-buf) modus-int::*io-buf-addr*)))
         (chk-true "CPU 0's and CPU 1's staging buffers do not overlap"
                   (>= (- (+ p (+ (modus-int::%sk-data-off) (modus-int::%sk-buf-bytes))) (modus-int::%sock-io-buf))
                       (modus-int::%sk-buf-bytes)))
         (chk-true "the sockaddr scratch is NOT the cstr page any more"
-                  (not (= (modus-int::%sock-addr-buf) (+ *cstr-scratch* 3072))))
+                  (not (= (modus-int::%sock-addr-buf) (+ modus-int::*cstr-scratch* 3072))))
         (chk "and the transfer capacity is the staging size" (modus-int::%sock-io-cap)
              (modus-int::%sk-buf-bytes)))))
 

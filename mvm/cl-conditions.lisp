@@ -2957,6 +2957,9 @@
   (%register-pkg-by-hash
    (make-package "MODUS.MVM.X64" :use (list "CL" "MODUS-INT" "MODUS.ASM")))
   (%register-pkg-by-hash (make-package "MODUS.MVM.I386" :use (list "CL" "MODUS-INT")))
+  ;; and the step-3 packages (net/crypto/ssh/boards), from the one list the
+  ;; build host also reads (mvm/kernel-packages.lisp)
+  (dolist (p (%ensure-kernel-packages)) (%register-pkg-by-hash p))
   ;; MODUS's public API (SB-EXT's role): image functions a program is meant to
   ;; call, re-exported from MODUS-INT where they are defined, so MODUS:SYS-EXIT
   ;; IS the kernel's symbol.  CL-USER uses MODUS, as SBCL's CL-USER uses SB-EXT.

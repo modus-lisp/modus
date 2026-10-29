@@ -177,6 +177,28 @@ package.
 `aarch64-ssh` answer; the Pi board image boots on hardware for the board
 packages.
 
+**Cycle 1, 2026-10-29: the NIC interface and the NE2000.**
+- `mvm/kernel-packages.lisp` is the one list of step-3 packages: the build host
+  loads it, and %INIT-PACKAGES makes the same packages in every image (and
+  %KERNEL-HOME-PKG-NAME-P counts them as the kernel's).
+- `MODUS.NET` (`net/nic.lisp`) holds the NIC interface; ip.lisp, ssh.lisp,
+  tcp-conns.lisp and the pipeline call `modus.net:nic-*`.  The seam mechanism
+  is %DEFINE-SEAM (cl-eval.lisp): the interface function calls through a
+  cell, and SET-SYMBOL-FUNCTION / FDEFINITION / SYMBOL-FUNCTION treat a seam
+  name as that cell, so the user's (setf fdefinition) binding reaches
+  ahead-of-time callers on targets with no entry pad to patch.
+- `net/ne2000.lisp` is package `MODUS.NET.NE2000`, exporting NE2K-SEND,
+  -RECEIVE, -RX-BUF, -PROBE; the i386 image binds the interface to them.  Its
+  board hooks (NE2K-RX-HOST, E1000-STATE-BASE) stay MODUS-INT until the board
+  package exists.  The other images bind the interface to the MODUS-INT
+  E1000-* functions their drivers still define.
+- Exported names keep their driver prefix (NE2K-SEND, not SEND): every kernel
+  package still registers its functions under the BARE name too, so two
+  packages' SEND would collide.  Per-package function identity for the
+  kernel's sub-packages is its own piece of work.
+- Measured: x64, aarch64 and i386 SSH images answer `(* 6 7)` with the
+  interface bound to the expected driver; build checks unchanged.
+
 ### 4. Runtime identity: every baked symbol keeps its home package
 
 - Create the step-2 package graph in the image at boot, from data the build
@@ -246,6 +268,15 @@ leave `CL-USER`, and what goes in the exported `MODUS` API?
   the public extension package, `SB-EXT`'s analog (`modus:share`,
   `modus:make-channel` already live there).  A REPL or script reaching an
   internal writes `modus-int::name`, as an SBCL user writes `sb-int:...`.
+
+- **Seams are bound by `(setf fdefinition)` at boot (user, 2026-10-29),** not
+  by a compiler feature: `modus.net:nic-send` is an ordinary function whose
+  definition the image's composition sets from the driver's.  (Open question
+  2, closed.)
+- **The runtime gets its own package, MODUS.RUNTIME (user, 2026-10-29)**:
+  prelude and the cl-* files, the implementation of COMMON-LISP, with an
+  export list of what the rest of the kernel calls.  (Open question 3,
+  closed.)
 
 ## Step 4 phase B: kernel names stop being CL-USER names
 

@@ -1196,6 +1196,8 @@
     (string #\Newline)
     (mvm-text "mvm/cl-packages.lisp")
     (string #\Newline)
+    (mvm-text "mvm/kernel-packages.lisp")
+    (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
     (if *cli-omit-ansi-test-aux* "" (mvm-text "mvm/ansi-test-aux.lisp"))

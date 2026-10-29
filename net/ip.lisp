@@ -1,6 +1,6 @@
 ;;;; ip.lisp - ARP, IP, UDP, TCP, ICMP, DHCP, DNS (shared, arch-independent)
 ;;;;
-;;;; Requires: e1000.lisp (e1000-send, e1000-receive, e1000-rx-buf)
+;;;; Requires: nic.lisp (MODUS.NET:NIC-SEND, NIC-RECEIVE, NIC-RX-BUF) and a driver bound to it
 ;;;; Requires arch adapter: io-delay, e1000-state-base
 
 ;; Network state layout (relative to e1000-state-base):
@@ -125,7 +125,7 @@
       (aset pkt 39 (logand (ash tip -8) #xFF))
       (aset pkt 40 (logand (ash tip -16) #xFF))
       (aset pkt 41 (logand (ash tip -24) #xFF)))
-    (e1000-send pkt 42)))
+    (modus.net:nic-send pkt 42)))
 
 (defun arp-resolve ()
   (let ((state (e1000-state-base)))
@@ -138,9 +138,9 @@
       (dotimes (round 200)
         (when (zerop found)
           (io-delay)
-          (let ((pkt-len (e1000-receive)))
+          (let ((pkt-len (modus.net:nic-receive)))
             (when (not (zerop pkt-len))
-              (let ((buf (e1000-rx-buf)))
+              (let ((buf (modus.net:nic-rx-buf)))
                 (when (eq (mem-ref (+ buf 12) :u8) #x08)
                   (when (eq (mem-ref (+ buf 13) :u8) #x06)
                     (when (eq (mem-ref (+ buf 21) :u8) 2)
@@ -170,7 +170,7 @@
     (dotimes (i 4) (aset pkt (+ 28 i) (mem-ref (+ state #x18 i) :u8)))
     (dotimes (i 6) (aset pkt (+ 32 i) (mem-ref (+ req-buf 22 i) :u8)))
     (dotimes (i 4) (aset pkt (+ 38 i) (mem-ref (+ req-buf 28 i) :u8)))
-    (e1000-send pkt 42)))
+    (modus.net:nic-send pkt 42)))
 
 ;; ================================================================
 ;; IP
@@ -221,7 +221,7 @@
     ;; Copy payload
     (dotimes (i payload-len)
       (aset pkt (+ 34 i) (aref payload-buf i)))
-    (e1000-send pkt (+ 14 total-len))))
+    (modus.net:nic-send pkt (+ 14 total-len))))
 
 ;; ================================================================
 ;; UDP
@@ -269,9 +269,9 @@
       (dotimes (try timeout)
         (when (zerop received)
           (io-delay)
-          (let ((pkt-len (e1000-receive)))
+          (let ((pkt-len (modus.net:nic-receive)))
             (when (not (zerop pkt-len))
-              (let ((buf (e1000-rx-buf)))
+              (let ((buf (modus.net:nic-rx-buf)))
                 (when (eq (mem-ref (+ buf 12) :u8) #x08)
                   (when (eq (mem-ref (+ buf 13) :u8) 0)
                     (when (eq (mem-ref (+ buf 23) :u8) 17)
@@ -395,9 +395,9 @@
       (dotimes (try 500)
         (when (zerop connected)
           (io-delay)
-          (let ((pkt-len (e1000-receive)))
+          (let ((pkt-len (modus.net:nic-receive)))
             (when (not (zerop pkt-len))
-              (let ((buf (e1000-rx-buf)))
+              (let ((buf (modus.net:nic-rx-buf)))
                 (when (eq (mem-ref (+ buf 12) :u8) #x08)
                   (when (eq (mem-ref (+ buf 13) :u8) 0)
                     (when (eq (mem-ref (+ buf 23) :u8) 6)
@@ -444,14 +444,14 @@
     ;; capped an HTTP fetch at ~115 KB/s however fast the peer sent.
     (dotimes (try timeout)
       (when (zerop received)
-        (let ((pkt-len (e1000-receive)))
+        (let ((pkt-len (modus.net:nic-receive)))
           ;; Flush a delayed ACK only when the wait ends with NOTHING ready:
           ;; with one frame per USB transfer the poll right after a frame is
           ;; always empty, so flushing there ACKed every segment again.
           (when (zerop pkt-len)
             (when (not (net-rx-idle)) (tcp-flush-ack)))
           (when (not (zerop pkt-len))
-            (let ((buf (e1000-rx-buf)))
+            (let ((buf (modus.net:nic-rx-buf)))
               (when (eq (mem-ref (+ buf 12) :u8) #x08)
                 (when (eq (mem-ref (+ buf 13) :u8) 0)
                   (when (eq (mem-ref (+ buf 23) :u8) 6)
@@ -542,9 +542,9 @@
     (dotimes (try timeout)
       (when (zerop accepted)
         (io-delay)
-        (let ((pkt-len (e1000-receive)))
+        (let ((pkt-len (modus.net:nic-receive)))
           (when (not (zerop pkt-len))
-            (let ((buf (e1000-rx-buf)))
+            (let ((buf (modus.net:nic-rx-buf)))
               (when (eq (mem-ref (+ buf 12) :u8) #x08)
                 (when (eq (mem-ref (+ buf 13) :u8) 0)
                   (when (eq (mem-ref (+ buf 23) :u8) 6)
@@ -563,9 +563,9 @@
                             (dotimes (d2 500)
                               (when (zerop ack-done)
                                 (io-delay)
-                                (let ((pkt-len2 (e1000-receive)))
+                                (let ((pkt-len2 (modus.net:nic-receive)))
                                   (when (not (zerop pkt-len2))
-                                    (let ((b2 (e1000-rx-buf)))
+                                    (let ((b2 (modus.net:nic-rx-buf)))
                                       (when (eq (mem-ref (+ b2 12) :u8) #x08)
                                         (when (eq (mem-ref (+ b2 13) :u8) 0)
                                           (when (eq (mem-ref (+ b2 23) :u8) 6)
@@ -769,9 +769,9 @@
         (setf (mem-ref (+ cb #x010) :u32) isn)
         (tcp-send-segment-conn cb 18 (make-array 0) 0))
       (io-delay)
-      (let ((pkt-len (e1000-receive)))
+      (let ((pkt-len (modus.net:nic-receive)))
         (when (not (zerop pkt-len))
-          (let ((b2 (e1000-rx-buf)))
+          (let ((b2 (modus.net:nic-rx-buf)))
             (when (eq (mem-ref (+ b2 12) :u8) #x08)
               (when (eq (mem-ref (+ b2 13) :u8) 0)
                 (when (eq (mem-ref (+ b2 23) :u8) 6)
@@ -902,10 +902,10 @@
   (loop
     (io-delay)
     (usb-netdev-hotplug-poll)
-    (let ((pkt-len (e1000-receive)))
+    (let ((pkt-len (modus.net:nic-receive)))
       (if (zerop pkt-len)
           (yield)
-          (let ((buf (e1000-rx-buf)))
+          (let ((buf (modus.net:nic-rx-buf)))
             (let ((et-hi (mem-ref (+ buf 12) :u8))
                   (et-lo (mem-ref (+ buf 13) :u8)))
               (if (eq et-hi #x08)
@@ -933,7 +933,7 @@
 ;; ================================================================
 
 (defun net-init ()
-  (e1000-probe)
+  (modus.net:nic-probe)
   (arp-resolve))
 
 (defun net-state ()
@@ -1004,7 +1004,7 @@
   (let ((data-len (tcp-receive 3000)))
     (when (> data-len 0)
       (let ((buf (make-array data-len))
-            (rx (e1000-rx-buf)))
+            (rx (modus.net:nic-rx-buf)))
         (dotimes (i data-len)
           (aset buf i (mem-ref (+ rx 54 i) :u8)))
         (tcp-send buf data-len)))
@@ -1057,7 +1057,7 @@
               (let ((icsum (icmp-checksum pkt 34 icmp-len)))
                 (aset pkt 36 (logand (ash icsum -8) #xFF))
                 (aset pkt 37 (logand icsum #xFF)))
-              (e1000-send pkt (+ 14 ip-total))))
+              (modus.net:nic-send pkt (+ 14 ip-total))))
           (when (eq icmp-type 0)
             (%serial-byte 80) (%serial-byte 111) (%serial-byte 110)
             (%serial-byte 103) (%serial-byte 58)
@@ -1090,9 +1090,9 @@
     (dotimes (try 300)
       (when (zerop got-reply)
         (io-delay)
-        (let ((pkt-len (e1000-receive)))
+        (let ((pkt-len (modus.net:nic-receive)))
           (when (not (zerop pkt-len))
-            (let ((buf (e1000-rx-buf)))
+            (let ((buf (modus.net:nic-rx-buf)))
               (when (eq (mem-ref (+ buf 12) :u8) #x08)
                 (when (eq (mem-ref (+ buf 13) :u8) 0)
                   (when (eq (mem-ref (+ buf 23) :u8) 1)
@@ -1262,10 +1262,10 @@
 
 (defun net-receive ()
   (let ((state (e1000-state-base))
-        (pkt-len (e1000-receive)))
+        (pkt-len (modus.net:nic-receive)))
     (if (zerop pkt-len)
         0
-        (let ((buf (e1000-rx-buf)))
+        (let ((buf (modus.net:nic-rx-buf)))
           (let ((et-hi (mem-ref (+ buf 12) :u8))
                 (et-lo (mem-ref (+ buf 13) :u8)))
             (if (eq et-hi #x08)
@@ -1325,7 +1325,7 @@
       (aset pkt 25 (logand csum #xFF)))
     (dotimes (i payload-len)
       (aset pkt (+ 34 i) (aref payload-buf i)))
-    (e1000-send pkt (+ 14 total-len))))
+    (modus.net:nic-send pkt (+ 14 total-len))))
 
 (defun udp-send-broadcast (dst-port src-port data len)
   (let ((udp-len (+ 8 len))
@@ -1442,9 +1442,9 @@
       (dotimes (try (dhcp-wait-tries))
         (when (zerop got-offer)
           (io-delay)
-          (let ((pkt-len (e1000-receive)))
+          (let ((pkt-len (modus.net:nic-receive)))
             (when (not (zerop pkt-len))
-              (let ((buf (e1000-rx-buf)))
+              (let ((buf (modus.net:nic-rx-buf)))
                 (when (eq (mem-ref (+ buf 12) :u8) #x08)
                   (when (eq (mem-ref (+ buf 13) :u8) 0)
                     (when (eq (mem-ref (+ buf 23) :u8) 17)
@@ -1472,9 +1472,9 @@
               (dotimes (try (dhcp-wait-tries))
                 (when (zerop got-ack)
                   (io-delay)
-                  (let ((pkt-len (e1000-receive)))
+                  (let ((pkt-len (modus.net:nic-receive)))
                     (when (not (zerop pkt-len))
-                      (let ((buf (e1000-rx-buf)))
+                      (let ((buf (modus.net:nic-rx-buf)))
                         (when (eq (mem-ref (+ buf 12) :u8) #x08)
                           (when (eq (mem-ref (+ buf 13) :u8) 0)
                             (when (eq (mem-ref (+ buf 23) :u8) 17)
@@ -1515,9 +1515,9 @@
                         (dotimes (try 200)
                           (when (zerop arp-done)
                             (io-delay)
-                            (let ((pkt-len (e1000-receive)))
+                            (let ((pkt-len (modus.net:nic-receive)))
                               (when (not (zerop pkt-len))
-                                (let ((buf (e1000-rx-buf)))
+                                (let ((buf (modus.net:nic-rx-buf)))
                                   (when (eq (mem-ref (+ buf 12) :u8) #x08)
                                     (when (eq (mem-ref (+ buf 13) :u8) #x06)
                                       (when (eq (mem-ref (+ buf 21) :u8) 2)
@@ -1528,7 +1528,7 @@
                         arp-done))))))))))
 
 (defun net-init-dhcp ()
-  (e1000-probe)
+  (modus.net:nic-probe)
   (dhcp-client))
 
 ;; ================================================================

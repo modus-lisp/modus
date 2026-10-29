@@ -36,6 +36,10 @@
 
 ;; MVM core
 (mvm-load "mvm/mvm.lisp")
+;; the kernel's packages beyond MODUS-INT (builder packages step 3), made now
+;; so the build can read source into them
+(mvm-load "mvm/kernel-packages.lisp")
+(funcall (find-symbol "%ENSURE-KERNEL-PACKAGES" "MODUS.MVM"))
 (mvm-load "mvm/target.lisp")
 (mvm-load "mvm/compiler.lisp")
 (mvm-load "mvm/interp.lisp")

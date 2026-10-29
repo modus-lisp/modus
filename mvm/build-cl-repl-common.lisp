@@ -178,10 +178,11 @@
 (defun %rpi-net-text (rel)
   (let ((p (merge-pathnames rel (merge-pathnames "net/" *modus-base*))))
     (modus.mvm::check-parses p)
-    (let ((name (concatenate 'string "net/" rel)))
-      (concatenate 'string (modus.mvm::%source-file-marker name)
-                   (read-file-text p)
-                   (string #\Newline) (modus.mvm::%source-file-trailer name)))))
+    ;; Scoped like MVM-TEXT: a driver's own (in-package ...) (builder
+    ;; packages step 3) must not leak into the next spliced file.
+    (modus.mvm::%build-package-scoped-source
+     (concatenate 'string (read-file-text p) (string #\Newline))
+     (concatenate 'string "net/" rel))))
 
 (defvar *pc-console-p*
   (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))
@@ -1543,7 +1544,7 @@
 " (%lisp-spin-form "ssh-keyed") "  (pre-compute-host-sign)
 " (%lisp-spin-form "ssh-signed") "  (pre-compute-server-eph (conn-ssh 0))
   (write-string-serial \"NETUP\") (write-char-serial 10)
-" (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (e1000-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
+" (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (modus.net:nic-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
   (net-actor-main))"))
         "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1670,6 +1671,35 @@
             ;; the sector source for a pagetree/cabinet store on a partition.
             (%rpi-net-text "sdhost.lisp")        (string #\Newline)))))))
 
+;; THE NIC INTERFACE (builder packages step 3): net/nic.lisp's MODUS.NET
+;; NIC-SEND / -RECEIVE / -RX-BUF / -PROBE, which ip.lisp, ssh.lisp and
+;; tcp-conns.lisp call, go BEFORE the drivers; after them, %BIND-NIC-SEAMS binds
+;; the interface to this image's driver with (setf fdefinition), and kernel-main
+;; calls it right after INIT-ALL-GLOBALS (the arch slot below).  The NE2000 is
+;; the first driver in a package of its own; the others still implement the
+;; interface as the MODUS-INT E1000-* functions (and pick between NICs there).
+(defun %nic-binding-text ()
+  (let ((impl (if *cl-repl-i386-p*
+                  '("modus.net.ne2000:ne2k-send" "modus.net.ne2000:ne2k-receive"
+                    "modus.net.ne2000:ne2k-rx-buf" "modus.net.ne2000:ne2k-probe")
+                  '("modus-int::e1000-send" "modus-int::e1000-receive"
+                    "modus-int::e1000-rx-buf" "modus-int::e1000-probe"))))
+    (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+  (setf (fdefinition 'modus.net:nic-send) (function ~A))
+  (setf (fdefinition 'modus.net:nic-receive) (function ~A))
+  (setf (fdefinition 'modus.net:nic-rx-buf) (function ~A))
+  (setf (fdefinition 'modus.net:nic-probe) (function ~A)))~%"
+            (first impl) (second impl) (third impl) (fourth impl))))
+
+(when *net-build-p*
+  (setq *net-nic-source*
+        (concatenate 'string (%rpi-net-text "nic.lisp") (string #\Newline)
+                     *net-nic-source* (%nic-binding-text)))
+  (setq *cli-arch-io-scratch-source*
+        (concatenate 'string *cli-arch-io-scratch-source*
+                     (format nil "~%  (%bind-nic-seams)~%"))))
+
 ;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
 (when (and *cl-repl-x64-p* *pc-console-p*)
   (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
@@ -1744,7 +1774,7 @@
         (format nil "~%(defun %u8-data-delta () ~D)~%" (if *cl-repl-i386-p* -5 7))
         "
 (defun tcp-rx-copy (dest dest-off)
-  (let ((buf (e1000-rx-buf)))
+  (let ((buf (modus.net:nic-rx-buf)))
     (let ((ip-total (buf-read-u16-mem buf 16))
           (tcp-hdr-len (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
       (let ((data-len (- ip-total (+ 20 tcp-hdr-len))))
@@ -2200,7 +2230,7 @@
   ;; 1. PCI bring-up: assign BARs (no firmware did it), then probe the E1000.
   ;;    e1000-probe prints its own MAC / link diagnostics.
   (handler-case (pci-assign-bars) (t (c) nil))
-  (handler-case (e1000-probe) (t (c) nil))
+  (handler-case (modus.net:nic-probe) (t (c) nil))
   ;; 2. DHCP.  Prints DHCP:D / DHCP:O / DHCP:R / DHCP:A itself.
   ;;    Retry: on QEMU's e1000 model the first DISCOVER after a NIC reset draws
   ;;    a reply only after a fixed post-reset settle (STATUS.LU is already up),

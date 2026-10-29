@@ -115,9 +115,10 @@
 
 (defun %kernel-home-pkg-name-p (pn)
   "The packages the image itself defines functions in."
-  (and pn (member pn (quote ("MODUS-INT" "COMMON-LISP" "MODUS.ASM" "MODUS.RUNTIME"
-                             "MODUS.MVM.X64" "MODUS.MVM.I386"))
-                  :test (function string=))
+  (and pn (or (member pn (quote ("MODUS-INT" "COMMON-LISP" "MODUS.ASM" "MODUS.RUNTIME"
+                                 "MODUS.MVM.X64" "MODUS.MVM.I386"))
+                     :test (function string=))
+              (%kernel-package-name-p pn))
        t))
 
 (defun %kernel-shadow-key (pkg nm)
@@ -227,7 +228,9 @@
       (error "symbol-function: not a symbol"))
     (let* ((name (car nh))
            (hash (cdr nh))
-           (fn (or (and (> (length name) 0)
+           (cell (and (> (length name) 0) (%seam-cell name)))
+           (fn (or (and cell (symbol-value cell))   ; a bound seam: its binding
+                   (and (> (length name) 0)
                         *symbol-function-table*
                         (%fn-entry (gethash name *symbol-function-table*)))
                    (and *native-sym-function-table*
@@ -276,6 +279,24 @@
    holding at top level (user report, 2026-10-20)."
   (and *%e2-set-function-names* (gethash name *%e2-set-function-names*) t))
 
+(defvar *seams* nil
+  "Interface functions bound per image (builder packages step 3): EQUAL hash,
+   function key -> the global symbol holding the function the interface
+   calls.  See %DEFINE-SEAM.")
+
+(defun %define-seam (name cell)
+  "Make NAME a seam whose definition lives in the global CELL.  NAME's own
+   DEFUN must call through CELL, (funcall CELL ...); from then on
+   (setf (fdefinition NAME) fn) stores FN in CELL, so every caller --
+   compiled ahead of time on any target, or at runtime -- reaches FN
+   without patching a call site."
+  (unless *seams* (setq *seams* (make-hash-table :test (function equal))))
+  (puthash (car (%sym-name-or-hash name)) *seams* cell)
+  name)
+
+(defun %seam-cell (key)
+  (and *seams* (gethash key *seams*)))
+
 (defun set-symbol-function (sym fn)
   "Set the function cell of SYM to FN.  Updates both the name-keyed
    table (CL-symbol path) and the hash-keyed table (native MVM symbol
@@ -291,6 +312,11 @@
       (error "set-symbol-function: not a symbol"))
     (let ((name (car nh))
           (hash (cdr nh)))
+      (let ((cell (and (> (length name) 0) (%seam-cell name))))
+        (when cell
+          ;; a seam: bind the interface, keep its function
+          (set cell fn)
+          (return-from set-symbol-function fn)))
       (unless *symbol-function-table*
         (%sft-init))
       (when (> (length name) 0)
@@ -422,7 +448,9 @@
     (when nh
       (let* ((name (car nh))
              (hash (cdr nh))
-             (fn (or (and (> (length name) 0)
+             (cell (and (> (length name) 0) (%seam-cell name)))
+             (fn (or (and cell (symbol-value cell))   ; a bound seam: its binding
+                     (and (> (length name) 0)
                           *symbol-function-table*
                           (gethash name *symbol-function-table*))
                      (and *native-sym-function-table*

@@ -208,10 +208,10 @@
   (let ((n 0) (me (%our-ip)))
     (loop
       (when (>= n max) (return))
-      (let ((len (e1000-receive)))
+      (let ((len (modus.net:nic-receive)))
         (when (zerop len) (return))
         (setq n (+ n 1))
-        (let ((buf (e1000-rx-buf)))
+        (let ((buf (modus.net:nic-rx-buf)))
           (if (and (= (mem-ref (+ buf 12) :u8) #x08) (= (mem-ref (+ buf 13) :u8) 0))
               (let* ((ihl (* 4 (logand (mem-ref (+ buf 14) :u8) 15)))
                      (proto (mem-ref (+ buf 23) :u8))

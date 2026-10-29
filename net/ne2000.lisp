@@ -4,10 +4,16 @@
 ;;;; QEMU: -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 ;;;;       -netdev user,id=net0,hostfwd=tcp::2222-:22
 ;;;;
-;;;; Provides e1000-send/e1000-receive/e1000-rx-buf API for shared ip/ssh code.
+;;;; Package MODUS.NET.NE2000 (builder packages step 3).  It implements
+;;;; MODUS.NET's NIC interface -- NE2K-SEND / -RECEIVE / -RX-BUF / -PROBE --
+;;;; and the i386 image binds the interface to them at boot (net/nic.lisp).
+;;;; Its host buffers and state block are the BOARD's (net/arch-i386-cl.lisp,
+;;;; in MODUS-INT): NE2K-RX-HOST and E1000-STATE-BASE.
 ;;;;
 ;;;; NOTE: MVM requires io-in-byte/io-out-byte ports to be compile-time constants.
 ;;;; All register accesses use literal port numbers (base 0x300 + register offset).
+
+(in-package :modus.net.ne2000)
 
 ;; ================================================================
 ;; NE2000 Constants
@@ -124,16 +130,16 @@
   ;; Read MAC from NE2000 PROM via remote DMA
   ;; PROM is at NIC address 0x0000, 32 bytes. In byte mode, each MAC byte
   ;; is duplicated: [MAC0,MAC0,MAC1,MAC1,...]. Read 12 bytes, use even offsets.
-  (ne2k-dma-read 0 12 (ne2k-rx-host))
+  (ne2k-dma-read 0 12 (modus-int::ne2k-rx-host))
   ;; Switch to page 1 for MAC and CURR
   (ne2k-page1-start)
   ;; Set MAC from PROM (even offsets: 0,2,4,6,8,10)
-  (io-out-byte #x301 (mem-ref (ne2k-rx-host) :u8))         ;; PAR0
-  (io-out-byte #x302 (mem-ref (+ (ne2k-rx-host) 2) :u8))   ;; PAR1
-  (io-out-byte #x303 (mem-ref (+ (ne2k-rx-host) 4) :u8))   ;; PAR2
-  (io-out-byte #x304 (mem-ref (+ (ne2k-rx-host) 6) :u8))   ;; PAR3
-  (io-out-byte #x305 (mem-ref (+ (ne2k-rx-host) 8) :u8))   ;; PAR4
-  (io-out-byte #x306 (mem-ref (+ (ne2k-rx-host) 10) :u8))  ;; PAR5
+  (io-out-byte #x301 (mem-ref (modus-int::ne2k-rx-host) :u8))         ;; PAR0
+  (io-out-byte #x302 (mem-ref (+ (modus-int::ne2k-rx-host) 2) :u8))   ;; PAR1
+  (io-out-byte #x303 (mem-ref (+ (modus-int::ne2k-rx-host) 4) :u8))   ;; PAR2
+  (io-out-byte #x304 (mem-ref (+ (modus-int::ne2k-rx-host) 6) :u8))   ;; PAR3
+  (io-out-byte #x305 (mem-ref (+ (modus-int::ne2k-rx-host) 8) :u8))   ;; PAR4
+  (io-out-byte #x306 (mem-ref (+ (modus-int::ne2k-rx-host) 10) :u8))  ;; PAR5
   ;; CURR = rx_start + 1 (first free page for NIC to write)
   (io-out-byte #x307 (+ (ne2k-rx-start) 1))
   ;; Accept all multicast
@@ -150,8 +156,8 @@
   ;; TCR: normal transmit (no loopback)
   (io-out-byte #x30D #x00)
   ;; Store MAC in state area for networking code (from PROM)
-  (let ((sb (e1000-state-base))
-        (rx (ne2k-rx-host)))
+  (let ((sb (modus-int::e1000-state-base))
+        (rx (modus-int::ne2k-rx-host)))
     (setf (mem-ref (+ sb 8) :u8) (mem-ref rx :u8))
     (setf (mem-ref (+ sb 9) :u8) (mem-ref (+ rx 2) :u8))
     (setf (mem-ref (+ sb 10) :u8) (mem-ref (+ rx 4) :u8))
@@ -271,7 +277,7 @@
           0  ;; No packet
           ;; Read 4-byte NE2000 header from ring buffer
           (let ((hdr-addr (* next 256))
-                (hdr-buf (ne2k-rx-host)))
+                (hdr-buf (modus-int::ne2k-rx-host)))
             ;; Read 4-byte NIC header: status, next_page, len_lo, len_hi
             (ne2k-dma-read hdr-addr 4 hdr-buf)
             (let ((status (mem-ref hdr-buf :u8))
@@ -290,7 +296,7 @@
                     ;; Read packet data (skip 4-byte NIC header)
                     (let ((data-len (- pkt-len 4))
                           (data-addr (+ hdr-addr 4))
-                          (rx-buf (ne2k-rx-host)))
+                          (rx-buf (modus-int::ne2k-rx-host)))
                       ;; Check if packet wraps around ring buffer
                       (let ((end-addr (+ data-addr data-len))
                             (ring-end (* (ne2k-rx-stop) 256))
@@ -310,12 +316,9 @@
                       data-len)))))))))
 
 ;; ================================================================
-;; API wrappers (compatible with shared ip.lisp / ssh.lisp)
-;; Override e1000-* via last-defun-wins to route to NE2000 driver.
-;; For dual-driver builds, a dispatch layer replaces these.
+;; The NIC interface (net/nic.lisp): NE2K-SEND and NE2K-RECEIVE above, and
+;; these two.
 ;; ================================================================
 
-(defun e1000-send (buf len) (ne2k-send buf len))
-(defun e1000-receive () (ne2k-receive))
-(defun e1000-rx-buf () (ne2k-rx-host))
-(defun e1000-probe () (ne2k-reset) (ne2k-init))
+(defun ne2k-rx-buf () (modus-int::ne2k-rx-host))
+(defun ne2k-probe () (ne2k-reset) (ne2k-init))

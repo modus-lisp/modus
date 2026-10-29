@@ -1722,10 +1722,10 @@
 ;; the fixpoint stubs) point SSH-NET-POLL at their own.
 (defun ssh-net-poll ()
   (io-delay)
-  (let ((pkt-len (e1000-receive)))
+  (let ((pkt-len (modus.net:nic-receive)))
     (if (zerop pkt-len)
         1
-        (let ((buf (e1000-rx-buf)))
+        (let ((buf (modus.net:nic-rx-buf)))
           (let ((et-hi (mem-ref (+ buf 12) :u8))
                 (et-lo (mem-ref (+ buf 13) :u8)))
             (if (eq et-hi #x08)

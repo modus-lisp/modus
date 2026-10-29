@@ -125,6 +125,6 @@
 (defun spin-lock (addr) nil)
 (defun spin-unlock (addr) nil)
 (defun yield () (io-delay))
-(defun receive () (e1000-receive) nil)
+(defun receive () (modus.net:nic-receive) nil)
 (defun nfn-lookup (hash) 0)
 (defun hash-of (name) 0)

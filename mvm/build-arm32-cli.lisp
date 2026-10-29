@@ -87,6 +87,8 @@
   (syscall3 5 *cstr-scratch* 193 420))
 (defun %sys-close (fd) (syscall3 6 fd 0 0))
 (defun %sys-getpid () (syscall3 20 0 0 0))
+;; getcwd(2) is syscall 183 here (cl-fileio's %sys-getcwd asks this).
+(defun %sys-getcwd-nr () 183)
 (defun %sys-read-raw (fd buf-addr count) (syscall3 3 fd buf-addr count))
 (defun %sys-write-raw (fd buf-addr count) (syscall3 4 fd buf-addr count))
 (defun %sys-lseek (fd offset whence) (syscall3 19 fd offset whence))

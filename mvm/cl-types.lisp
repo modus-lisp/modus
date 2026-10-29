@@ -4228,7 +4228,11 @@
            (logand (logxor (+ (* h1 31) h2) 12345) most-positive-fixnum))))
     (t 42)))
 
-(defun sxhash (object) (%sxhash-1 object 0))
+;; CLHS: a non-negative FIXNUM.  The hash is computed in 32 unsigned bits, which
+;; on a 32-bit port (fixnums are 30 bits) is a bignum about three times in four
+;; -- upstream SXHASH.1/.13/.15 on i386, arm32 and riscv32.  On the 64-bit ports
+;; every value already fits and the mask changes nothing.
+(defun sxhash (object) (logand (%sxhash-1 object 0) most-positive-fixnum))
 
 ;;; ============================================================
 ;;; float-radix — IEEE floats always use base 2

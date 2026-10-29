@@ -2140,13 +2140,18 @@
     (if (%sys-stat-exists path) (truename x) nil)))
 
 ;;; --- truename ---
+(defun %sys-getcwd-nr ()
+  "getcwd(2)'s syscall number: 79 on x86-64.  Each other CLI's arch slot
+   overrides it (183 i386 and arm32, 17 on the generic ABI: aarch64, RISC-V).
+   A port that forgets gets syscall 79 of ITS table -- fstatat on RISC-V,
+   fstatfs on arm32 -- and every relative pathname then resolves against /."
+  79)
 (defun %sys-getcwd ()
-  "The process's current directory as a string, or NIL.  getcwd(2) is
-   syscall 79 on x86-64; the i386 and aarch64 CLIs override this."
+  "The process's current directory as a string, or NIL."
   (if (%cab-on)
       "/"
       (let* ((buf (%fs-io-page))
-             (ret (syscall3 79 buf 4000 0)))
+             (ret (syscall3 (%sys-getcwd-nr) buf 4000 0)))
         (if (<= ret 0)
             nil
             (let ((out (make-string-output-stream)) (i 0))

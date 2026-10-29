@@ -7872,7 +7872,7 @@
     "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
     "ARRAY-IN-BOUNDS-P" "FUNCALL" "%SETF-MEM-REF" "%IDIV-TRUNC"
     "IO-IN-BYTE" "XCHG-MEM" "WBINVD" "SWITCH-IDLE-STACK"
-    "MULTIPLE-VALUE-LIST" "%MAKE-CLOSURE" "SYSCALL3-RAW" "PROGN"
+    "MULTIPLE-VALUE-LIST" "%MAKE-CLOSURE" "%MAKE-CLOSURE3" "SYSCALL3-RAW" "PROGN"
     "WHEN" "DECLAIM" "LOGXOR" "RETURN-FROM"
     "ATOM" "%FLOAT-MUL" "RATIOP" "FUNCTION"
     "LET*" "UNLESS" "SAP-ADDRESS" "B"
@@ -9316,6 +9316,13 @@
       ((= op-name 142644612)  ; %MAKE-CLOSURE
        (when (arity-ok-p form 2 2 env dest)
          (compile-make-closure (cadr form) (caddr form) env dest)))
+      ;; (%make-closure3 fn env): the same closure plus a THIRD slot, NIL, that
+      ;; the interpreter uses to cache the closure's native trampoline (see
+      ;; %MVM-WRAP-ESCAPING in interp.lisp).  Native code reads slots 0 and 1
+      ;; only, and every collector sizes an object by its header.
+      ((= op-name #.(compute-name-hash "%MAKE-CLOSURE3"))
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-make-closure (cadr form) (caddr form) env dest 3)))
 
       ;; --- Array Operations ---
       ;; (MAKE-ARRAY N :ELEMENT-TYPE 'SINGLE-FLOAT [:INITIAL-ELEMENT 0.0]),
@@ -25179,7 +25186,7 @@
   (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 7 +subtag-mda+))
 
-(defun compile-make-closure (fn-form env-form env dest)
+(defun compile-make-closure (fn-form env-form env dest &optional (nslots 2))
   "Compile (%make-closure fn env) — allocate a 2-slot object with
    closure subtag (#x52). Slot 0 = fn-addr (native code pointer),
    slot 1 = env (arbitrary Lisp object, usually a list of captured
@@ -25211,8 +25218,11 @@
   ;; later return whatever the kernel reused that memory for (often
   ;; another heap address — see DGMC.AND.4 SEGV trace).
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 2 +subtag-closure+)
+  (emit-ir :alloc-obj dest nslots +subtag-closure+)
   (let ((slot-temp (alloc-temp-reg)))
+    (when (> nslots 2)
+      (compile-form nil env slot-temp)
+      (emit-ir :obj-set dest 2 slot-temp))
     (emit-ir :pop slot-temp)                  ; env
     (emit-ir :obj-set dest 1 slot-temp)
     (emit-ir :pop slot-temp)                  ; fn

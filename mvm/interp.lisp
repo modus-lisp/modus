@@ -517,7 +517,10 @@
         ;; #x52) → empty/NIL result (WS4 oracle).  The placeholder slots are
         ;; overwritten by the following obj-sets; %prim-aset is uniform across
         ;; object types.
-        ((= subtag #x52) (%make-closure 0 nil))
+        ;; THREE slots: the third caches this closure's native trampoline, so
+        ;; the closure keeps ONE identity however often it escapes to native
+        ;; code (%MVM-ESCAPE-TRAMPOLINE).
+        ((= subtag #x52) (%make-closure3 0 nil))
         (t (make-array size :initial-element 0))))
 ;; Slot ref/set/len via the NATIVE primitives.  %prim-aref returns the raw slot
 ;; (char CODE for a string), %prim-aset stores it; uniform across object types.
@@ -983,14 +986,34 @@
        (if (and (null (%prim-aref v 1)) tag (symbolp tag) (not (keywordp tag))
                 (fboundp tag))
            (symbol-function tag)
-           (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))))
+           (%mvm-escape-trampoline v bc ftab rt lam-offsets))))
     ;; (No bare-integer branch — see the docstring.)
     (t v)))
+
+(defun %mvm-escape-trampoline (v bc ftab rt lam-offsets)
+  "The native trampoline for the in-module closure V, made ONCE and kept in V's
+   third slot.  A fresh trampoline per escape made every interpreted lambda a
+   different object each time it was passed to a function or returned:
+   (let ((f (lambda () 1))) (eq (identity f) f)) was NIL on every port that
+   interprets (i386, arm32, RISC-V), and with it (setf (symbol-function s) f)'s
+   value, *DEBUGGER-HOOK*'s argument and #'F of a LABELS function (upstream
+   SYMBOL-FUNCTION.1, INVOKE-DEBUGGER.1, LABELS.37-40).  A closure made before
+   the interpreter allocated three slots (two-slot) still gets a fresh one."
+  (if (>= (%prim-array-length v) 3)
+      (let ((cached (%prim-aref v 2)))
+        (if cached
+            cached
+            (let ((tr (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
+                                            lam-offsets)))
+              (%prim-aset v 2 tr)
+              tr)))
+      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets)))
 
 (defun %mvm-wrap-escaping-result (v bc ftab rt lam-offsets)
   "Wrap an mvm-eval RESULT value (the thunk's return) that is an in-module
    #x52 lambda closure in a re-entrant trampoline, so the value production
-   EVAL hands back is natively funcallable and IDENTITY-DISTINCT per call.
+   EVAL hands back is natively funcallable -- one trampoline per closure, so
+   the value keeps its identity (%MVM-ESCAPE-TRAMPOLINE).
    Unlike the bridge-arg wrapper (%mvm-wrap-escaping), a BARE integer is
    NEVER wrapped here: eval results are ordinary data far more often than
    captureless-lambda offsets, and under *mvm-eval-runtime-p* compile-lambda
@@ -1000,8 +1023,7 @@
   (if (and v (not (consp v)) (not (integerp v))
            (= (obj-subtag v) #x52)
            (%mvm-module-fn-offset-p (%prim-aref v 0) lam-offsets))
-      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
-                            lam-offsets)
+      (%mvm-escape-trampoline v bc ftab rt lam-offsets)
       v))
 
 ;;; ============================================================

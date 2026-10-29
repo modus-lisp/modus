@@ -600,7 +600,19 @@
           *i386-hstack-capcount-addr* (+ base #x3F0)
           *i386-hstack-overflow-addr* (+ base #x3F8)
           *i386-hstack-depth-addr*    (+ base #x400)
-          *i386-hstack-base-addr*     (+ base #x408))))
+          ;; HOSTED: the frames get their own room (see *I386-HOSTED-HSTACK-BASE*).
+          *i386-hstack-base-addr*     (if *i386-linux-mode* *i386-hosted-hstack-base* (+ base #x408))
+          *i386-hstack-max-depth*     (if *i386-linux-mode* 127 63))))
+
+(defparameter *i386-hosted-hstack-base* #x1001E100
+  "Hosted handler frames: the free tail of the demand-zeroed BSS, past
+   *I386-GCDBG-BASE*'s 32 counter bytes, 127 frames x 24 = #x17E8 ending at
+   #x1001F8E8 < +LINUX-I386-BSS-END+.  63 frames below the global slot block at
+   #xA00 were too few: a CATCH past the cap stores no frame and the LONGJMP out
+   of an inner HANDLER-CASE skips it -- the upstream suite's
+   (compile-and-load \"roman-numerals.lsp\") lost its fasl cache's %FASL-REJECT
+   that way and every ~R test with it.  The collector's handler-stack root loop
+   reads this base and the depth, so the frames stay roots.")
 
 (defparameter *i386-jmpbuf-addr* #x10000180
   "Base of the six-word jmp_buf (ESP/EBP/IP/EBX/ESI/EDI).")

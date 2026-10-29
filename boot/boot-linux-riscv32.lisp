@@ -63,12 +63,13 @@
 (defconstant +linux-riscv32-argv-arena+      #x1000A000)
 (defconstant +linux-riscv32-argv-arena-end+  #x1001E000)
 
-(defconstant +linux-riscv32-heap-alloc-start+ #x20000
-  "Where the bump allocator starts, as an offset into the heap.  #x20000, above
-   the fixed runtime block (#x0000-#x0FFF), the CLI scratch pages (#x1000-#x2FFF)
-   and the staged argv (#x9000-#x1DFFF) -- everything below it is owned by
+(defconstant +linux-riscv32-heap-alloc-start+ #x28000
+  "Where the bump allocator starts, as an offset into the heap.  #x28000, above
+   the fixed runtime block (#x0000-#x0FFF), the CLI scratch pages (#x1000-#x2FFF),
+   the staged argv (#x9000-#x1DFFF) and the handler-frame stack (#x20000-#x25FFF,
+   +RV-HOSTED-HSTACK-FRAMES-OFFSET+) -- everything below it is owned by
    something other than the allocator.  (It was #x2000, which was right until
-   the CLI needed a staged argv.)")
+   the CLI needed a staged argv, then #x20000 until the frames moved.)")
 (defconstant +linux-riscv32-gc-midpoint+ #x7C00000)   ; half the heap
 (defconstant +linux-riscv32-alloc-limit+
   (- +linux-riscv32-gc-midpoint+ +rv-gc-overshoot-margin+)

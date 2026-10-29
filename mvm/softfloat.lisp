@@ -409,17 +409,16 @@
                  ((%sfv-zerop s) (%sf-zero sa t))
                  (t (%sf-pack sa s e3 t))))))))
 
-;;; Packed single-float lanes: raw IEEE32 bits, little-endian bytes from
+;;; Packed single-float lanes: raw IEEE32 bits in the CPU's byte order from
 ;;; byte 4i of the payload -- the layout %F32-BITS-REF-NARROW reads.
-(defun %sf-lane-check (arr i)
-  (unless (and (>= i 0) (< i (%prim-array-length arr)))
-    (error "index ~D out of bounds for a ~D-lane single-float vector" i (%prim-array-length arr))))
+(defun %sf-lane-check (arr i) (%f32-lane-check arr i))
 
 (defun %sf-f32-load (arr i)
   (%sf-lane-check arr i)
-  (let* ((b (* 4 i))
-         (b0 (%u8-ref arr b)) (b1 (%u8-ref arr (+ b 1)))
-         (b2 (%u8-ref arr (+ b 2))) (b3 (%u8-ref arr (+ b 3)))
+  (let* ((b0 (%u8-ref-unchecked arr (%f32-lane-byte i 0)))
+         (b1 (%u8-ref-unchecked arr (%f32-lane-byte i 1)))
+         (b2 (%u8-ref-unchecked arr (%f32-lane-byte i 2)))
+         (b3 (%u8-ref-unchecked arr (%f32-lane-byte i 3)))
          (sign (ash b3 -7))
          (e8 (+ (* (logand b3 127) 2) (ash b2 -7)))
          (m23 (+ (* (logand b2 127) 65536) (* b1 256) b0)))
@@ -444,9 +443,8 @@
                         (if (< q 8388608)
                             (setq m23 q)                         ; subnormal
                             (setq e8 (+ e3 23 127) m23 (- q 8388608))))))))))
-    (let ((b (* 4 i)))
-      (%u8-set arr b (logand m23 255))
-      (%u8-set arr (+ b 1) (logand (ash m23 -8) 255))
-      (%u8-set arr (+ b 2) (+ (logand (ash m23 -16) 127) (* (logand e8 1) 128)))
-      (%u8-set arr (+ b 3) (+ (* sign 128) (ash e8 -1))))
+    (%u8-set-unchecked arr (%f32-lane-byte i 0) (logand m23 255))
+    (%u8-set-unchecked arr (%f32-lane-byte i 1) (logand (ash m23 -8) 255))
+    (%u8-set-unchecked arr (%f32-lane-byte i 2) (+ (logand (ash m23 -16) 127) (* (logand e8 1) 128)))
+    (%u8-set-unchecked arr (%f32-lane-byte i 3) (+ (* sign 128) (ash e8 -1)))
     x))

@@ -9462,6 +9462,13 @@
        (compile-u8-ref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%U8-SET"))
        (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest))
+      ;; Byte access to a vector whose LENGTH is not counted in bytes (the
+      ;; 32-bit f32 lane helpers address byte 4I+k of an N-lane vector), so
+      ;; the element bounds check would reject every lane past 0.
+      ((= op-name #.(compute-name-hash "%U8-REF-UNCHECKED"))
+       (compile-u8-ref (cadr form) (caddr form) env dest nil))
+      ((= op-name #.(compute-name-hash "%U8-SET-UNCHECKED"))
+       (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest nil))
       ((= op-name #.(compute-name-hash "%C32-REF"))
        (compile-c32-ref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%C32-SET"))
@@ -21490,7 +21497,7 @@
          (compile-form (caddr form) env ti)
          (setq ta (alloc-temp-reg))
          (compile-form (cadr form) env ta)
-         (emit-ir :fp-lane-load fd ta ti)
+         (let ((lk (%lane-index-check-begin ta ti))) (emit-ir :fp-lane-load fd ta ti) (%lane-index-check-end lk))
          (free-temp-reg) (free-temp-reg)))
       ((%fp-abs-p form)
        (compile-float-unboxed (cadr form) env fd)
@@ -26171,6 +26178,20 @@
 (defun %bounds-check-p ()
   (and (>= *compile-safety* 1) (%cg-on-p (quote *cg-bounds-check*))))
 
+;; The unboxed lane ops (:FP-LANE-LOAD / :FP-LANE-STORE) carry the same check
+;; as every boxed access; a failing index skips the access.  BEGIN returns the
+;; skip label and the length scratch, which stays allocated until END places
+;; the label, since the cold arm writes it.  NIL when checks are off.
+(defun %lane-index-check-begin (arr-reg idx-reg)
+  (when (%bounds-check-p)
+    (let ((skip (make-compiler-label)) (tl (alloc-temp-reg)))
+      (%emit-index-check arr-reg idx-reg tl skip)
+      skip)))
+(defun %lane-index-check-end (skip)
+  (when skip
+    (emit-ir-label skip)
+    (free-temp-reg)))
+
 (defun %emit-index-check (arr-reg idx-reg dest skip)
   "Emit the bounds check described above.  ARR-REG and IDX-REG hold the array
    and the tagged index; on failure branch to SKIP with %AREF-INDEX-ERROR's
@@ -26578,14 +26599,15 @@
   (emit-ir :gc-check)
   (emit-ir :fround32 dest dest))
 
-(defun compile-u8-ref (arr-form idx-form env dest)
-  "Compile (%u8-ref arr idx) — load a byte (tagged fixnum) from a u8 vector."
+(defun compile-u8-ref (arr-form idx-form env dest &optional (checked t))
+  "Compile (%u8-ref arr idx) — load a byte (tagged fixnum) from a u8 vector.
+   CHECKED nil (%U8-REF-UNCHECKED) omits the bounds check."
   (let ((arr-reg (alloc-temp-reg))
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
     (compile-form idx-form env idx-reg)
     (let ((skip (make-compiler-label)))
-      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (when (and checked (%bounds-check-p)) (%emit-index-check arr-reg idx-reg dest skip))
       (emit-ir :u8-ref dest arr-reg idx-reg)
       (emit-ir-label skip))
     (free-temp-reg)
@@ -26624,8 +26646,9 @@
               val-form
               (remove-if-not #'symbolp (list arr-form idx-form))))))
 
-(defun compile-u8-set (arr-form idx-form val-form env dest)
+(defun compile-u8-set (arr-form idx-form val-form env dest &optional (checked t))
   "Compile (%u8-set arr idx val) — store VAL's low byte into a u8 vector.
+   CHECKED nil (%U8-SET-UNCHECKED) omits the bounds check.
    Returns VAL (like aset).  When ARR and IDX are lexical leaves the VALUE
    is compiled first, straight into DEST, so its expression starts with
    every physical temp free: with array and index temps allocated first,
@@ -26644,7 +26667,7 @@
           (compile-form arr-form env arr-reg)
           (compile-form idx-form env idx-reg)
           (let ((skip (make-compiler-label)))
-            (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+            (when (and checked (%bounds-check-p)) (%emit-index-check arr-reg idx-reg dest skip))
             (emit-ir :u8-set arr-reg idx-reg val-reg)
             (emit-ir :mov dest val-reg)
             (emit-ir-label skip))
@@ -26658,7 +26681,7 @@
         (compile-form idx-form env idx-reg)
         (compile-form val-form env val-reg)
         (let ((skip (make-compiler-label)))
-          (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+          (when (and checked (%bounds-check-p)) (%emit-index-check arr-reg idx-reg dest skip))
           (emit-ir :u8-set arr-reg idx-reg val-reg)
           (emit-ir :mov dest val-reg)
           (emit-ir-label skip))
@@ -26925,7 +26948,7 @@
               (compile-form idx-form env ti)
               (let ((ta (alloc-temp-reg)))
                 (compile-form arr-form env ta)
-                (emit-ir :fp-lane-store ta ti fd)
+                (let ((lk (%lane-index-check-begin ta ti))) (emit-ir :fp-lane-store ta ti fd) (%lane-index-check-end lk))
                 (free-temp-reg))
               (free-temp-reg))
             (when (and dest (not unused))
@@ -26937,7 +26960,7 @@
             (compile-form idx-form env ti)
             (let ((fd (alloc-fp-reg)))
               (compile-float-unboxed val-form env fd)
-              (emit-ir :fp-lane-store ta ti fd)
+              (let ((lk (%lane-index-check-begin ta ti))) (emit-ir :fp-lane-store ta ti fd) (%lane-index-check-end lk))
               (when (and dest (not unused))
                 (emit-ir :gc-check)
                 (emit-ir :fp-box dest fd))

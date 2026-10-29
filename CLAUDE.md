@@ -765,9 +765,35 @@ trig, FORMAT, decode) is line-for-line identical to the FPU image on qemu's 6804
 alexandria and cl-ppcre load with identical probe results; an interpreted float
 loop costs 1.6x the FPU one.
 
-Open, pre-existing and NOT soft-float: `(setf (aref v 3) x)` on a 4-lane
-`(simple-array single-float)` signals `(INTEGER 0 3)` on the 32-bit CLIs (arm32 and
-68k, hard or soft); x64 is fine.
+**QEMU HAS NO FPU-LESS 68020+ MODEL** (7.2: m68020..m68060 and `any` all execute
+F-line FPU opcodes), so "no FPU instructions" is checked two ways: statically by
+disassembly, and DYNAMICALLY with `qemu-m68k-static -d in_asm -D /dev/stderr`, which
+logs every block the CPU translates -- count mnemonics starting with `f`.  Soft image:
+**0** over the float battery and the alexandria / cl-ppcre / ieee-floats loads; the
+hard image's same runs execute 480 / 63, so the instrument answers both ways.  A
+3000-op random battery (+ - * / sqrt, single<->double, subnormals, inputs as
+literals so the reader is in the loop, results compared as INTEGER-DECODE-FLOAT
+against SBCL) is 3000/3000 on the soft image, the hard image and x64.  SBCL's own
+reader misrounds some subnormals (`1e-39`, `-2.5d-310`, `1.4e-45` -> 0.0); modus is
+right there, so check a disagreement exactly before believing SBCL.
+
+**FIXED (was open): single-float vectors on 30-bit towers.**  Three defects, the
+first found here:
+- the lane helpers (`%F32-BITS-REF/-SET-NARROW`, softfloat's lane load/store) read
+  bytes with `%U8-REF`, whose bounds check counts the vector's length in LANES, so
+  byte 4I+k of lane I >= 1 signalled `(INTEGER 0 3)`.  They use
+  `%U8-REF-UNCHECKED` / `%U8-SET-UNCHECKED` (compiler intrinsics, no check) and
+  check the LANE index themselves (`%F32-LANE-CHECK`, the compiled check's error);
+- they wrote lanes LITTLE-endian while the 68k's native `FMOVE.S` reads them in CPU
+  order, so a stored 3.0 read back 2.3e-41.  `%F32-LANE-BYTE` follows
+  `+TARGET-BIG-ENDIAN+` (68k and ppc32);
+- on EVERY target, `:FP-LANE-STORE` / `:FP-LANE-LOAD` (the unboxed FP-tree paths
+  for a declared or `make-array`-inferred single-float vector) had NO bounds check:
+  on x64 `(setf (aref v 4) 1.0)` and `(setf (aref v -1) 1.0)` on a 4-lane vector
+  silently wrote outside it.  `%LANE-INDEX-CHECK-BEGIN/-END` wrap both now.
+And `INTEGER-DECODE-FLOAT` / `DECODE-FLOAT` of a SINGLE returned the boxed double
+payload's 53-bit decoding (`7e30` -> `(6217249165672448 50 1)`, SBCL
+`(11580529 79 1)`), and `FLOAT-PRECISION` of a subnormal said 24.
 
 Debugging recipe that worked: `qemu-m68k-static -g PORT` + `gdb-multiarch`
 (`file` the image first, never `set architecture`), a breakpoint on

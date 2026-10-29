@@ -23,9 +23,14 @@
 (defun %make-single2 () (vector 0 0 0 0 :single))
 (defun %prim-aref (f k) (svref f k))
 (defun %prim-aset (f k v) (setf (svref f k) v))
-(defun %u8-ref (a i) (aref a i))
-(defun %u8-set (a i v) (setf (aref a i) v))
+(defun %u8-ref-unchecked (a i) (aref a i))
+(defun %u8-set-unchecked (a i v) (setf (aref a i) v))
 (defun %prim-array-length (a) (floor (length a) 4))
+;; prelude's lane helpers, little-endian layout (the big-endian arm only
+;; permutes the four byte offsets)
+(defun %f32-lane-check (a i)
+  (unless (and (integerp i) (>= i 0) (< i (%prim-array-length a))) (error "lane ~D" i)))
+(defun %f32-lane-byte (i k) (+ (* 4 i) k))
 (load (merge-pathnames "../mvm/softfloat.lisp" (directory-namestring *load-truename*)))
 
 (defun box (d) (let* ((hi (cl:logand (sb-kernel:double-float-high-bits d) #xFFFFFFFF))

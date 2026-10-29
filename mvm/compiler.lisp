@@ -8779,9 +8779,16 @@
                     (list rname '() :report rfmt '(values nil t))
                     (list rname '() '(values nil t))))
           env dest)))
-      ;; IGNORE-ERRORS — compile body only
+      ;; IGNORE-ERRORS — CLHS: (handler-case (progn . body) (error (c) (values nil c))).
+      ;; This arm used to compile the body only, so in every AOT-compiled
+      ;; function IGNORE-ERRORS caught nothing: an unwritable FASL directory's
+      ;; FILE-ERROR escaped %FASL-PUT and aborted %DEFER-BOOT-SURFACES (no
+      ;; SB-EXT, no SB-THREAD) and every LOAD.
       ((= op-name 97207481)  ; IGNORE-ERRORS
-       (compile-progn (cdr form) env dest))
+       (let ((c (%mvm-gensym "IEC")))
+         (compile-form `(handler-case (progn ,@(cdr form))
+                          (error (,c) (values nil ,c)))
+                       env dest)))
       ;; UNWIND-PROTECT — protected form + cleanup, preserving MV state
       ;; (unwind-protect protected cleanup...)
       ;; Evaluates protected, saves MV state, runs cleanup forms,

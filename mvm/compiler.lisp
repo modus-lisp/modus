@@ -24279,10 +24279,13 @@
   ;; no wide multiply, and neither does this.
   (let* ((wt0 (memory-width-code type-form))
          (w0 (car wt0)))
-    (when (and (%mem-width-promotes-p w0 (cdr wt0))
-               ;; +TARGET-BIG-ENDIAN+ (folded), not the special: this also runs
-               ;; IN the image, whose compiler must know its own byte order.
-               (not (eql +target-big-endian+ 1)))
+    ;; THE SPLIT IS NOT OPTIONAL ON A BIG-ENDIAN TARGET, ONLY ITS OFFSETS
+    ;; ARE.  Skipping it there (it once read the halves little-endian) made a
+    ;; 68k :u32 load of a word >= 2^30 a BIGNUM in the interpreter, whose
+    ;; %WORD->VAL then shifted the bignum's POINTER: a garbage register, and
+    ;; after it misdecoded bytecode.  +TARGET-BIG-ENDIAN+ is folded, so this
+    ;; also holds for the image's own compiler.
+    (when (%mem-width-promotes-p w0 (cdr wt0))
       ;; ONLY PROMOTE WHEN THE VALUE CAN ACTUALLY LEAVE FIXNUM RANGE.  With
       ;; hi16 below 2^(fixnum-bits - 17) the result, hi16*2^16 + lo16, is an
       ;; ordinary fixnum, and an inline constant ASH of that small hi16 is
@@ -24292,16 +24295,20 @@
       ;; limb list) to produce a small integer.  On the hosted RV32 CL image,
       ;; which has no collector yet, that garbage alone exhausted the 64 MB
       ;; semispace during boot.  Values that really are >= 2^29 still promote.
-      (let ((asym (%mvm-gensym "MRA"))
-            (hsym (%mvm-gensym "MRH")))
+      (let* ((asym (%mvm-gensym "MRA"))
+             (hsym (%mvm-gensym "MRH"))
+             (be (eql +target-big-endian+ 1))
+             (hi-off (if be 0 2))
+             (lo-off (if be 2 0)))
         (return-from compile-mem-ref
           (compile-form
             (list 'let (list (list asym addr-form))
-                  (list 'let (list (list hsym (list 'mem-ref (list '+ asym 2) :u16)))
+                  (list 'let (list (list hsym (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)))
                         (list 'if (list '< hsym (ash 1 (- +fixnum-bits+ 17)))
-                              (list '+ (list 'ash hsym 16) (list 'mem-ref asym :u16))
+                              (list '+ (list 'ash hsym 16)
+                                       (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16))
                               (list '+ (list 'bignum-ash hsym 16)
-                                       (list 'mem-ref asym :u16)))))
+                                       (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16)))))
             env dest)))))
   (compile-form (%conv-addr-form addr-form) env dest)
   ;; Untag address: logical shift right by 1
@@ -24338,19 +24345,19 @@
          ;; inlines :sar for small constant counts, which mangles a bignum
          ;; pointer — Active Limitation #8, fixed separately.
          ;;
-         ;; LITTLE-ENDIAN: halves are placed lo-at-+0, hi-at-+2.  Promotion can
-         ;; only trigger on a 32-bit target, and the only 32-bit target running
-         ;; this runtime is i386; a big-endian 32-bit target would need the two
-         ;; offsets swapped.  Stated rather than silently assumed.
-         (when (and (%mem-width-promotes-p width needs-untag)
-                    (not (eql +target-big-endian+ 1)))
-           (let ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV")))
+         ;; The halves go where the target's byte order puts them: low half at
+         ;; +0 little-endian, at +2 big-endian (68k, PowerPC).
+         (when (%mem-width-promotes-p width needs-untag)
+           (let* ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV"))
+                  (be (eql +target-big-endian+ 1))
+                  (hi-off (if be 0 2))
+                  (lo-off (if be 2 0)))
              (return-from compile-setf
                (compile-form
                  (list 'let (list (list asym addr-form) (list vsym value-form))
-                       (list 'setf (list 'mem-ref asym :u16)
+                       (list 'setf (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16)
                              (list 'logand vsym 65535))
-                       (list 'setf (list 'mem-ref (list '+ asym 2) :u16)
+                       (list 'setf (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)
                              (list 'logand (list 'bignum-ash vsym -16) 65535))
                        vsym)
                  env dest))))

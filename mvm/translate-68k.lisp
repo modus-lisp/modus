@@ -2552,9 +2552,7 @@
          (m68k-emit-lsl-imm buf +68k-d1+ 2)
          (m68k-emit-addi buf +68k-d1+ 15)
          (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
-         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
-         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+         (m68k-emit-zero-and-bump buf)))
 
       (#.+op-aref+
        (let ((vd (first operands))
@@ -2632,9 +2630,7 @@
          ;; bytes = align16(N + 4)
          (m68k-emit-addi buf +68k-d1+ 19)                ; N + 4 + 15
          (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
-         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
-         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+         (m68k-emit-zero-and-bump buf)))
 
       (#.+op-alloc-string+
        ;; One character CODE per WORD; count already UNTAGGED by the compiler.
@@ -2654,9 +2650,7 @@
          (m68k-emit-lsl-imm buf +68k-d1+ 2)
          (m68k-emit-addi buf +68k-d1+ 15)
          (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
-         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
-         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+         (m68k-emit-zero-and-bump buf)))
 
       (#.+op-u8-ref+
        (let ((vd (first operands))
@@ -2851,6 +2845,26 @@
           (m68k-buffer-fixups buf))
     (m68k-emit-word buf 0)))
 
+(defun m68k-emit-zero-and-bump (buf)
+  "ZERO the D1 bytes (16-aligned, >= 16) of the object at VA past its header,
+   then VA += D1.  Clobbers D0 and A0.  Every allocation site zeroes (the alloc
+   zeroing contract): alloc-array, alloc-u8 and alloc-string here did not, and
+   the bignum kernel's (MAKE-ARRAY N) digit vectors then read whatever an
+   earlier collection had left in reused memory -- harmless until the second
+   collection, the first to allocate over used space, after which BIGNUM-ASH
+   of #xFF by 24 came back with junk low bits, odd words reached conses, and
+   the collector took them for forwarding pointers."
+  (let ((zl (mvm-make-label)))
+    (m68k-emit-lea-disp buf +68k-a2+ 4 +68k-a0+)
+    (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+    (m68k-emit-lsr-imm buf +68k-d0+ 2)
+    (m68k-emit-subq buf +68k-d0+ 1)                       ; longwords past header
+    (m68k-emit-label buf zl)
+    (m68k-emit-word buf #x4298)                           ; CLR.L (A0)+
+    (m68k-emit-subq buf +68k-d0+ 1)
+    (m68k-emit-bne buf zl)
+    (m68k-emit-adda-dn buf +68k-d1+ +68k-a2+)))
+
 (defun m68k-emit-alloc-mark (buf kind)
   "Mark the allocation about to start at VA (A2): KIND 1 = object, 2 = cons.
    Hosted with a collector only.  Clobbers D0 and A0, so it is emitted FIRST in
@@ -2967,12 +2981,21 @@
       (root-range)
       (m68k-emit-move-imm-an buf #x10000000 +68k-a5+)
       ;; the low block ends where the FIRST semispace starts, whichever one is
-      ;; from-space now: min(from_start, to_start)
+      ;; from-space now: min(from_start, to_start).  TO_START FROM THE BLOCK,
+      ;; NOT A2: the stack roots above have already copied objects, so A2 is
+      ;; the to-space FREE pointer by now.  Using it made the range run into
+      ;; to-space at every collection whose to-space is the LOW semispace (the
+      ;; second, fourth...), scanning the objects just copied -- byte-vector
+      ;; payloads included -- as conservative roots: a bytecode word that
+      ;; happened to spell a live from-space cons was "forwarded" in place, and
+      ;; the interpreter then decoded garbage.
       (let ((have (lbl)))
         (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d7+)
-        (m68k-emit-cmpa buf +68k-a2+ +68k-d7+)                   ; to_start - from_start
-        (m68k-emit-bcc-word buf +68k-cc-cc+ have)
-        (m68k-emit-move-an-dn buf +68k-a2+ +68k-d7+)
+        (m68k-emit-move-imm-an buf meta +68k-a0+)
+        (m68k-emit-move-disp-dn buf +68k-a0+ #x08 +68k-d0+)       ; to_start
+        (m68k-emit-cmp-dn-dn buf +68k-d0+ +68k-d7+)               ; from_start - to_start
+        (m68k-emit-bcc-word buf +68k-cc-cs+ have)
+        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d7+)
         (here have))
       (root-range)
       ;; ---- Cheney: A5 = object scan (up), A6 = cons scan (down) ----

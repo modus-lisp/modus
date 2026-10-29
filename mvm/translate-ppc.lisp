@@ -2567,15 +2567,19 @@
          (ppc-emit-shift-left buf +ppc-r0+ pc +ppc-scratch2+)
          (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x32)
          (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
-         ;; bytes = align16((count + 1) * ws), computed in r0
-         (ppc-emit-addi buf +ppc-r0+ pc 1)
-         (ppc-emit-addi buf +ppc-scratch2+ 0 (if (= ws 8) 3 2))
-         (ppc-emit-shift-left buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)
-         (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
-         (ppc-emit-clear-low4 buf +ppc-r0+ +ppc-r0+)   ; NOT andi. #xFFF0, which drops bits 16+
+         ;; bytes = align16((count + 1) * ws), computed in r12.  NOT IN r0:
+         ;; `addi r0,r0,15' is `li r0,15' -- ADDI reads rA=0 as the literal
+         ;; zero -- so the size came out 0 and VA was never bumped past the
+         ;; array: every later allocation overlapped it.
+         (ppc-emit-addi buf +ppc-scratch2+ pc 1)
+         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 3 2))
+         (ppc-emit-shift-left buf +ppc-scratch2+ +ppc-scratch2+ +ppc-r0+)
+         (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ 15)
+         (ppc-emit-clear-low4 buf +ppc-scratch2+ +ppc-scratch2+)
          ;; result = VA | 9, then bump VA (order matters: VA is still the base)
          (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
-         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
+         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-scratch2+)
+         (ppc-emit-zero-tail buf pd ws)
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 
@@ -2668,12 +2672,13 @@
          (ppc-emit-shift-left buf +ppc-r0+ +ppc-scratch2+ +ppc-r0+)
          (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x11)                  ; u8 subtag
          (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
-         ;; bytes = align16(N + ws)
-         (ppc-emit-addi buf +ppc-r0+ +ppc-scratch2+ ws)
-         (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
-         (ppc-emit-clear-low4 buf +ppc-r0+ +ppc-r0+)   ; NOT andi. #xFFF0, which drops bits 16+
+         ;; bytes = align16(N + ws), in r12 (N is already there).  Not r0: see
+         ;; :alloc-array -- `addi r0,r0,15' is `li r0,15'.
+         (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ (+ ws 15))
+         (ppc-emit-clear-low4 buf +ppc-scratch2+ +ppc-scratch2+)
          (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
-         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
+         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-scratch2+)
+         (ppc-emit-zero-tail buf pd ws)
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 
@@ -2688,13 +2693,15 @@
          (ppc-emit-shift-left buf +ppc-r0+ pc +ppc-scratch2+)
          (ppc-emit-ori buf +ppc-r0+ +ppc-r0+ #x31)                  ; string subtag
          (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)
-         (ppc-emit-addi buf +ppc-r0+ pc 1)
-         (ppc-emit-addi buf +ppc-scratch2+ 0 (if (= ws 8) 3 2))
-         (ppc-emit-shift-left buf +ppc-r0+ +ppc-r0+ +ppc-scratch2+)
-         (ppc-emit-addi buf +ppc-r0+ +ppc-r0+ 15)
-         (ppc-emit-clear-low4 buf +ppc-r0+ +ppc-r0+)   ; NOT andi. #xFFF0, which drops bits 16+
+         ;; bytes = align16((count + 1) * ws), in r12 -- not r0 (see :alloc-array)
+         (ppc-emit-addi buf +ppc-scratch2+ pc 1)
+         (ppc-emit-addi buf +ppc-r0+ 0 (if (= ws 8) 3 2))
+         (ppc-emit-shift-left buf +ppc-scratch2+ +ppc-scratch2+ +ppc-r0+)
+         (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ 15)
+         (ppc-emit-clear-low4 buf +ppc-scratch2+ +ppc-scratch2+)
          (ppc-emit-ori buf pd +ppc-r19+ +tag-object+)
-         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-r0+)
+         (ppc-emit-add buf +ppc-r19+ +ppc-r19+ +ppc-scratch2+)
+         (ppc-emit-zero-tail buf pd ws)
          (unless (ppc-vreg-phys vd)
            (ppc-store-vreg buf vd pd))))
 
@@ -2871,6 +2878,25 @@
       (ppc-emit-word buf (ppc-md-form 30 rs ra 0 59 1))   ; rldicr ra,rs,0,59
       (ppc-emit-rlwinm buf ra rs 0 0 27)))
 
+(defun ppc-emit-zero-tail (buf pd ws)
+  "ZERO the object PD (tagged) just allocated, past its header; R12 holds its
+   byte size (16-aligned, >= 16) and VA has already been bumped past it.  The
+   alloc zeroing contract: alloc-array / alloc-u8 / alloc-string did not zero,
+   so a fresh vector read whatever a collection left in reused memory -- on
+   68k's identical sites that gave the bignum kernel junk digits after the
+   SECOND collection.  CTR counts, r12 becomes the cursor (PD is never r0 or
+   r12), r0 is the zero DATA only (never a base or an ADDI source)."
+  (let ((zl (mvm-make-label)))
+    (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ +ppc-scratch2+ (if (= ws 8) 3 2))
+    (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ -1)   ; words past the header
+    (ppc-emit-mtctr buf +ppc-scratch2+)
+    (ppc-emit-addi buf +ppc-scratch2+ pd (- ws +tag-object+))
+    (ppc-emit-li buf +ppc-r0+ 0)
+    (ppc-emit-label buf zl)
+    (ppc-emit-store-word buf +ppc-r0+ +ppc-scratch2+ 0)
+    (ppc-emit-addi buf +ppc-scratch2+ +ppc-scratch2+ ws)
+    (ppc-emit-bc buf 16 0 zl)))                            ; bdnz
+
 (defun ppc-emit-alloc-mark (buf kind)
   "Mark the allocation about to start at VA (r19): KIND 1 = object, 2 = cons.
    Hosted with a collector only.  Clobbers r11/r12, so it is emitted FIRST in
@@ -2992,12 +3018,19 @@
       (ppc-emit-load-word buf +ppc-r23+ +ppc-r24+ #x18)          ; stack_base
       (root-range)
       (ppc-emit-li buf +ppc-r22+ #x10000000)
-      ;; the low block ends where the FIRST semispace starts: min(from, to)
+      ;; the low block ends where the FIRST semispace starts: min(from, to).
+      ;; TO_START FROM THE BLOCK, NOT r19: the stack roots have already copied
+      ;; objects, so r19 is the to-space FREE pointer, and at every collection
+      ;; whose to-space is the low semispace the range ran into the objects
+      ;; just copied and scanned their payloads as roots (68k's identical bug
+      ;; rewrote a bytecode word that spelled a live cons).
       (let ((have (lbl)))
+        (meta +ppc-r24+)
+        (ppc-emit-load-word buf +ppc-r12+ +ppc-r24+ #x08)        ; to_start
         (ppc-emit-mr buf +ppc-r23+ +ppc-r14+)
-        (ppc-emit-cmpl-word buf +ppc-r19+ +ppc-r23+)
+        (ppc-emit-cmpl-word buf +ppc-r12+ +ppc-r23+)
         (ppc-emit-bge buf have)
-        (ppc-emit-mr buf +ppc-r23+ +ppc-r19+)
+        (ppc-emit-mr buf +ppc-r23+ +ppc-r12+)
         (here have))
       (root-range)
       ;; ---- Cheney: r22 = object scan (up), r23 = cons scan (down) from to_end

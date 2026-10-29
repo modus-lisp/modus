@@ -697,18 +697,50 @@ facts measured with `qemu -strace`: `exit_group` 247, `clock_gettime` 260,
   low block.  (i386 calls syscall 217 there -- `pivot_root` -- so its
   `DIRECTORY` returns nothing rather than corrupting; separate bug, open.)
 
-**STILL OPEN -- the 68k CL image breaks after its SECOND collection.**  Boot
-collects once; the first collection after it (into the LOW semispace again)
-leaves a heap my gdb verifiers find fully consistent -- every slot, cons and
-stack word, kind bytes matching tags, nothing pointing at the evacuated space
--- and soon after, small bignums appear whose `lo` slot is a tagged fixnum
-with bit 0 SET (`#x7FFFFFFF`, `#x93FFFFFF`), consed into lists, and the
-program faults or hangs.  arm32's identical collector survives 68 collections
-on the same script; `test/hosted-rungs/h01-gc-survive.lisp` passes on 68k.
-Ruled out, each measured: GC poison (`MODUS_68K_GC_POISON=1`, failure point
-unchanged), FASL (`MODUS_FASL=0`), interpreter byte order, `make-bignum` (never
-called with an odd `lo`), stack alignment, unscanned image words, `%GC-EPOCH`.
-Symptom check: `--dynamic-space-size 16MB --eval 1` hangs (arm32 boots there).
+**The "breaks after its SECOND collection" bug was three defects, all fixed.**
+Every one bites only once a collection has reused memory, which is why the
+first collection always looked clean and why gdb verifiers of the heap after
+each collection found nothing:
+
+1. **The low-block root range ran into to-space.**  The collector scans
+   `[#x10000000, min(from_start, to_start))` as roots and took `to_start` from
+   A2 -- but the stack roots have already copied objects by then, so A2 is the
+   to-space FREE pointer.  At every collection whose to-space is the LOW
+   semispace (the 2nd, 4th ...) the range covered the objects just copied and
+   scanned their payloads as conservative roots: a bytecode word that happened
+   to spell a live from-space cons (`13 04 02 01`) was "forwarded" in place,
+   and the interpreter then decoded garbage -- `fsqrt` on a fixnum, a register
+   index of 31.  translate-ppc had the identical bug (r19); translate-arm32
+   uses the constant `heap + alloc-start` and never did.  Caught by a
+   conditional breakpoint on the collector's SCAN entry, `*(int*)$a0 == word`,
+   which reported the caller: the low-block loop, A5 inside the vector.
+2. **alloc-array / alloc-u8 / alloc-string did not zero** (68k and ppc), so
+   the bignum kernel's `(make-array n)` digit vectors read leftovers and
+   `(ash #xFF 24)` came back with junk low bits -- odd words in conses, which
+   the collector reads as forwarding pointers.  `MODUS_68K_GC_POISON=1` cannot
+   show this class: poison is not zero.
+3. **The big-endian `:u32` access was not split.**  A promoting width is read
+   as two `:u16` halves so a word >= 2^30 becomes a bignum, not a wrapped
+   value; the split was skipped on big-endian instead of having its offsets
+   swapped, and in the interpreter `%WORD->VAL` then shifted the bignum's
+   POINTER into a register.
+
+**And one PowerPC defect the zeroing exposed:** the three sites computed their
+size with `addi r0,r0,15`, which is `li r0,15` (ADDI reads `rA = 0` as the
+literal zero), so every byte vector, string and array had size 0 and VA was
+never bumped past it.  The new zero loop counted -1 and ran off the heap.
+
+**HOW TO DEBUG A PLACEMENT-SENSITIVE CORRUPTION HERE:** set `*jit-hot-calls*`
+to 0 and `MODUS_FASL=0`.  Both consult the clock, so gdb's slowdown moves every
+collection and the failure moves with it.  With both off, the bignum loop in
+the ANSI-free reproducer (`(logior (ash b0 24) ...)` over a byte sweep) failed
+deterministically at `--dynamic-space-size 56MB`.  And **use a private
+`MODUS_FASL_DIR` for every 68k test**: the shared cache replays FASLs recorded
+by earlier, broken binaries (its key covers compiler and runtime source, not
+the translator), which produced one entire false lead here.
+
+Measured after all four: alexandria and cl-ppcre load with 0 probe errors; the
+16 MB boot runs the churn script through 68 collections (arm32's count, exact).
 
 Debugging recipe that worked: `qemu-m68k-static -g PORT` + `gdb-multiarch`
 (`file` the image first, never `set architecture`), a breakpoint on

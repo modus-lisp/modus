@@ -8969,6 +8969,9 @@
       ;; %FLOAT-ADD / -SUB / -MUL / -DIV: 2-arg, both already IEEE-float
       ;; objects; emit the IR op which the per-arch translator implements
       ;; (SSE2 on x64, FPU on AArch64, soft-float helper on others).
+      ((and (= op-name 504441494) (eql +target-soft-float+ 1))  ; %FLOAT-ADD, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-add (cadr form) (caddr form)) env dest)))
       ((= op-name 504441494)  ; %FLOAT-ADD
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -8979,6 +8982,9 @@
            (emit-ir :gc-check)
            (emit-ir :fadd dest dest temp)
            (free-temp-reg))))
+      ((and (= op-name 99178435) (eql +target-soft-float+ 1))  ; %FLOAT-SUB, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-sub (cadr form) (caddr form)) env dest)))
       ((= op-name 99178435)  ; %FLOAT-SUB
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -8989,6 +8995,9 @@
            (emit-ir :gc-check)
            (emit-ir :fsub dest dest temp)
            (free-temp-reg))))
+      ((and (= op-name 241991203) (eql +target-soft-float+ 1))  ; %FLOAT-MUL, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-mul (cadr form) (caddr form)) env dest)))
       ((= op-name 241991203)  ; %FLOAT-MUL
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -8999,6 +9008,9 @@
            (emit-ir :gc-check)
            (emit-ir :fmul dest dest temp)
            (free-temp-reg))))
+      ((and (= op-name 503197892) (eql +target-soft-float+ 1))  ; %FLOAT-DIV, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-div (cadr form) (caddr form)) env dest)))
       ((= op-name 503197892)  ; %FLOAT-DIV
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -9010,6 +9022,12 @@
            (emit-ir :fdiv dest dest temp)
            (free-temp-reg))))
       ;; %FLOAT-FROM-INT — tagged integer → fresh float object.
+      ((and (= op-name 345394287) (eql +target-soft-float+ 1))  ; %FLOAT-FROM-INT, no FPU
+       (when (arity-ok-p form 1 1 env dest)
+         (compile-form (list '%sf-itof (cadr form)) env dest)))
+      ((and (= op-name 458033090) (eql +target-soft-float+ 1))  ; %FLOAT-TO-INT, no FPU
+       (when (arity-ok-p form 1 1 env dest)
+         (compile-form (list '%sf-ftoi (cadr form)) env dest)))
       ((= op-name 345394287)  ; %FLOAT-FROM-INT
        (when (arity-ok-p form 1 1 env dest)
          (compile-form (cadr form) env dest)
@@ -20806,6 +20824,15 @@
    operand single-float (caller-checked)."
   ;; Unboxed tree (part 2b): the whole expression in FP registers, boxed
   ;; ONCE at the end instead of twice per pair.
+  (when (eql +target-soft-float+ 1)
+    ;; no FPU: each pair through the soft-float op, then rounded to single
+    (let ((fn (cond ((string= op-name "+") '%sf-add) ((string= op-name "-") '%sf-sub)
+                    ((string= op-name "*") '%sf-mul) (t '%sf-div)))
+          (acc (car args)))
+      (dolist (arg (cdr args))
+        (setq acc (list '%sf-round32 (list fn acc arg))))
+      (compile-form acc env dest)
+      (return-from %compile-single-float-arith nil)))
   (let ((tree (cons (%float-op-symbol op-name) args)))
     (when (%fp-tree-fits-p tree env)
       (let ((fd (alloc-fp-reg)))
@@ -20877,6 +20904,11 @@
             (cadr form))
            ((and (name-eq (car form) "%TO-DOUBLE") (null rest)) (cadr form))
            (t nil)))))
+
+(defun %soft-double-operand (form)
+  "The source form %COMPILE-DOUBLE-OPERAND compiles for FORM."
+  (let ((x (%double-conversion-arg form)))
+    (if x (list '%to-double x) form)))
 
 (defun %compile-double-operand (form env dest)
   "Compile a double-float fast-path operand; a conversion goes to %TO-DOUBLE."
@@ -21090,6 +21122,15 @@
           (dolist (h *fpd-hoisted*) (declare (ignore h)) (free-temp-reg))
           (return-from %compile-double-float-arith nil)))
         (setq *fpd-hoisted* saved)))))
+  (when (eql +target-soft-float+ 1)
+    ;; no FPU: each pair through the soft-float op
+    (let ((fn (cond ((string= op-name "+") '%sf-add) ((string= op-name "-") '%sf-sub)
+                    ((string= op-name "*") '%sf-mul) (t '%sf-div)))
+          (acc (%soft-double-operand (car args))))
+      (dolist (arg (cdr args))
+        (setq acc (list fn acc (%soft-double-operand arg))))
+      (compile-form acc env dest)
+      (return-from %compile-double-float-arith nil)))
   (let ((firop (%float-arith-op op-name)))
     (%compile-double-operand (car args) env dest)
     (dolist (arg (cdr args))
@@ -21487,8 +21528,10 @@
 (defun %fp-tree-fits-p (form env)
   "True when FORM is an unboxable tree that fits the FP pool from the
    current allocation point."
-  (let ((need (%fp-tree-need form env)))
-    (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))))
+  ;; no FPU: there are no FP registers to evaluate a tree in
+  (unless (eql +target-soft-float+ 1)
+    (let ((need (%fp-tree-need form env)))
+      (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+)))))
 
 ;;; ------------------------------------------------------------
 ;;; f32x4 vector trees (SIMD plan, layer 2a)
@@ -26479,6 +26522,9 @@
 (defun compile-f32-load (arr-form idx-form env dest)
   "Compile (%f32-load arr idx) — the lane as a fresh boxed single-float
    (native fcvt; allocates the 4-slot box)."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-f32-load
+      (compile-form (list '%sf-f32-load arr-form idx-form) env dest)))
   (let ((arr-reg (alloc-temp-reg))
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
@@ -26494,6 +26540,9 @@
 (defun compile-f32-store (arr-form idx-form val-form env dest)
   "Compile (%f32-store arr idx float) — narrow the boxed float's payload to
    single precision and store the lane.  Returns FLOAT."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-f32-store
+      (compile-form (list '%sf-f32-store arr-form idx-form val-form) env dest)))
   (let ((val-reg (alloc-temp-reg)))
     (compile-form val-form env val-reg)
     (let ((arr-reg (alloc-temp-reg))
@@ -26513,6 +26562,8 @@
   "Compile (%fsqrt float) -- a fresh DOUBLE-float box holding the correctly
    rounded square root of the payload (sqrtsd / fsqrt / fsqrt.d / vsqrt).
    The software Newton in %SQRT-F was ~1.1 us a call."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-fsqrt (compile-form (list '%sf-sqrt val-form) env dest)))
   (compile-form val-form env dest)
   (emit-ir :gc-check)
   (emit-ir :fsqrt dest dest))
@@ -26521,6 +26572,8 @@
   "Compile (%fround32 float) — a fresh single-float box holding the payload
    rounded to single precision (cvtsd2ss / fcvt), replacing the Lisp-side
    %round-to-single that every float result went through."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-fround32 (compile-form (list '%sf-round32 val-form) env dest)))
   (compile-form val-form env dest)
   (emit-ir :gc-check)
   (emit-ir :fround32 dest dest))

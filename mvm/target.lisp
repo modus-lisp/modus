@@ -584,6 +584,13 @@
   "Endianness of the target being compiled FOR.  Set by BUILD-IMAGE from the
    target descriptor, alongside the numeric width.")
 
+(defparameter +target-soft-float+ 0
+  "1 when the target has NO FPU (68LC040, 68EC0x0): the compiler lowers every
+   float intrinsic to a call into mvm/softfloat.lisp instead of an FPU opcode.
+   Set by the build (MODUS_68K_SOFT_FLOAT=1); folded and injected like
+   +TARGET-BIG-ENDIAN+ so the image's own compiler does the same.  An integer
+   for the same reason: a NIL-valued constant never folds.")
+
 (defparameter +target-big-endian+ 0
   "1 on a big-endian target, else 0: *TARGET-BIG-ENDIAN-P* as a FOLDED constant, for code that must know the
    target's byte order AFTER the image is built -- the in-image compiler.
@@ -897,7 +904,8 @@
      (defconstant +name-hash-lo-mask+ ~D)~%~
      (defconstant +mv-count-addr+ ~D)~%~
      (defconstant +mv-values-addr+ ~D)~%~
-     (defconstant +target-big-endian+ ~D)~%"
+     (defconstant +target-big-endian+ ~D)~%~
+     (defconstant +target-soft-float+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
     +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+
     +fixnum-signed-bits+ +fixnum-bits-1+ +limb-bits+ +limb-bits-1+
@@ -905,4 +913,4 @@
     +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
     +half-limb-mask+
     +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+
-    +mv-count-addr+ +mv-values-addr+ +target-big-endian+))
+    +mv-count-addr+ +mv-values-addr+ +target-big-endian+ +target-soft-float+))

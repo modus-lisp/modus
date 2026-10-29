@@ -21,6 +21,12 @@
 ;;;; service traps it has no arm for.
 (defvar *cli-arch* :68k)
 
+;; MODUS_68K_SOFT_FLOAT=1: no FPU instructions at all, for the 68LC040 and the
+;; 68EC0x0 -- floats go through mvm/softfloat.lisp (see build-cli-common).
+(defvar *cli-soft-float*
+  (let ((v (sb-ext:posix-getenv "MODUS_68K_SOFT_FLOAT")))
+    (and v (plusp (length v)) (not (string= v "0")))))
+
 (defvar *cli-arch-syscall-source* "
 (defun sys-exit (code)
   (let ((c code))

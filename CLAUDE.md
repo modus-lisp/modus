@@ -742,6 +742,33 @@ the translator), which produced one entire false lead here.
 Measured after all four: alexandria and cl-ppcre load with 0 probe errors; the
 16 MB boot runs the churn script through 68 collections (arm32's count, exact).
 
+### Soft-float 68k (68LC040 / 68EC0x0): `MODUS_68K_SOFT_FLOAT=1`
+
+`MODUS_68K_SOFT_FLOAT=1 sbcl --dynamic-space-size 12288 --script
+mvm/build-68k-cli.lisp` builds an image with **no FPU instructions**: disassembled,
+its code holds 0 (the hard-float image, 1125).  `+TARGET-SOFT-FLOAT+` (folded, 0/1,
+injected with the width constants, so the image's own compiler does the same) makes
+the compiler lower `%FLOAT-ADD/-SUB/-MUL/-DIV`, `%FSQRT`, `%FROUND32`,
+`%FLOAT-FROM-INT`, `%FLOAT-TO-INT`, `%F32-LOAD/-STORE` and both float-arith folds to
+calls into `mvm/softfloat.lisp`, and turns the FP-register tree paths off; the 68k
+translator records any FPU op that still arrives as a gap (ILLEGAL) instead of
+emitting it.
+
+`mvm/softfloat.lisp` is IEEE binary64, round-to-nearest-even, subnormals, signed
+zeros, infinities, in **fixnum-only Lisp**: 13-bit limbs in a 10-limb vector, no
+bignum, no variable `ASH` -- on this tower checked arithmetic WRAPS, so a bignum
+intermediate would be wrong, not just slow.  `sbcl --script
+test/softfloat-sbcl.lisp N` checks it bit-for-bit against SBCL with every
+intermediate asserted inside the 30-bit fixnum range: 400,000 cases x 10 ops, 0
+failures.  On the image: a float battery (arithmetic, printing, reading, exp/log/
+trig, FORMAT, decode) is line-for-line identical to the FPU image on qemu's 68040;
+alexandria and cl-ppcre load with identical probe results; an interpreted float
+loop costs 1.6x the FPU one.
+
+Open, pre-existing and NOT soft-float: `(setf (aref v 3) x)` on a 4-lane
+`(simple-array single-float)` signals `(INTEGER 0 3)` on the 32-bit CLIs (arm32 and
+68k, hard or soft); x64 is fine.
+
 Debugging recipe that worked: `qemu-m68k-static -g PORT` + `gdb-multiarch`
 (`file` the image first, never `set architecture`), a breakpoint on
 `%SIGNAL-TYPE-ERROR`, and a frame walk over A6 (`[fp]` = previous fp, `[fp+4]`

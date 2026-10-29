@@ -158,6 +158,16 @@
 
 (format t "Reading source files...~%")
 
+;; NO FPU (a wrapper sets *CLI-SOFT-FLOAT*, e.g. build-68k-cli from
+;; MODUS_68K_SOFT_FLOAT=1): every float intrinsic lowers to a call into
+;; mvm/softfloat.lisp (+TARGET-SOFT-FLOAT+, compiler.lisp), which is then baked
+;; in.  Off -- every other image -- the source is not read and nothing changes.
+(when (and (boundp 'cl-user::*cli-soft-float*) (symbol-value 'cl-user::*cli-soft-float*))
+  (setf modus.mvm::+target-soft-float+ 1)
+  (format t "~&;; SOFT-FLOAT: no FPU instructions; floats via mvm/softfloat.lisp~%"))
+(defvar *softfloat-source*
+  (if (eql modus.mvm::+target-soft-float+ 1) (mvm-text "mvm/softfloat.lisp") ""))
+
 (defvar *prelude-source*  (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
 ;;; NATIVE BULK MEMORY (mvm/native-bulk.lisp): REPLACE / FILL's four inner loops
@@ -2185,6 +2195,7 @@
 
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
+                       *softfloat-source* (string #\Newline)
                        *gc-source*       (string #\Newline)
                        *mcgc-pin-source*
                        *rt-source*       (string #\Newline)
@@ -2458,6 +2469,8 @@
 (defvar *full-source*
   (concatenate 'string
     *prelude-source*
+    (string #\Newline)
+    *softfloat-source*
     (string #\Newline)
     *gc-source*
     (string #\Newline)

@@ -1124,6 +1124,17 @@
                  (setf (gethash target-pc label-map) l)
                  l))))
 
+    ;; NO FPU: the compiler lowers every float op to mvm/softfloat.lisp, so one
+    ;; reaching here is a gap -- recorded and ILLEGAL, never an FPU instruction
+    ;; a 68LC040 would trap on.
+    (when (and (eql +target-soft-float+ 1)
+               (member opcode (list +op-fadd+ +op-fsub+ +op-fmul+ +op-fdiv+ +op-fsqrt+
+                                    +op-fround32+ +op-itof+ +op-ftoi+
+                                    +op-f32-load+ +op-f32-store+)))
+      (pushnew opcode *68k-unimpl-opcodes*)
+      (m68k-emit-illegal buf)
+      (return-from m68k-translate-insn nil))
+
     (case opcode
       ;;; --- NOP / BREAK / TRAP ---
       (#.+op-nop+

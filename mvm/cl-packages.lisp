@@ -1043,6 +1043,22 @@
 
 ;;; --- find-symbol / intern ---
 
+(defun %find-symbol-baked (pkg name-str)
+  "A symbol baked into the image -- a quoted literal compiled in a build
+   package such as MODUS-INT -- lives in the global intern table under its
+   (name, package) key and is not in PKG's own symbol tables until something
+   INTERNs it.  It is PRESENT in its home package all the same, so answer it
+   :INTERNAL here.  Same key, same case-sensitive name check and same home
+   check as %CL-INTERN-IN; reads only, so no lock."
+  (let* ((g (mem-ref #x10000088 :u64))
+         (e (and g (gethash (%symbol-pkg-key (compute-name-hash name-str)
+                                             (compute-name-hash (%pkg-name pkg)))
+                            g))))
+    (if (and e (symbolp e) (string= (symbol-name e) name-str)
+             (eq (symbol-package e) pkg))
+        (values e :internal)
+        (values nil nil))))
+
 (defun find-symbol (name &rest pkg-arg)
   "Find symbol named NAME in package PKG.
    Returns (values symbol status) or (values nil nil).
@@ -1090,7 +1106,7 @@
                         (setq use (cdr use)))
                       (if found-p
                           (values found :inherited)
-                          (values nil nil))))))))))))
+                          (%find-symbol-baked pkg name-str))))))))))))
 
 (defun %cl-intern-in (pkg name-str)
   "The body of CL:INTERN, run UNDER THE RUNTIME-TABLE LOCK by the wrapper

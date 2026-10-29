@@ -1674,6 +1674,15 @@
    module being compiled (one object per keyword, or EQ breaks).  Reset per
    module by MVM-COMPILE-ALL with SETQ for the reason *INIT-THUNK-NAMES* is.")
 
+(defun %build-mvm-package ()
+  "The build package MODUS-INT (nickname MODUS.MVM) when compiling an IMAGE --
+   on the SBCL host, or in the self-host image's own --compile -- and NIL
+   under runtime mvm-eval.  Runtime compiles have always interned their
+   generated names in *PACKAGE*, because no build package existed in a running
+   image; now that %INIT-PACKAGES creates MODUS-INT at boot, asking FIND-PACKAGE
+   directly would silently move them there."
+  (and (not *mvm-eval-runtime-p*) (find-package "MODUS.MVM")))
+
 (defun %init-thunk-fn-name (thunk-name)
   "The name a DEFVAR's init thunk is COMPILED under.  At build time it is the
    MODUS.MVM symbol INIT-ALL-GLOBALS calls it by, so the definition and the
@@ -1683,7 +1692,7 @@
    thunks are called by name in the user's package."
   (if *mvm-eval-runtime-p*
       thunk-name
-      (intern thunk-name (or (find-package :modus.mvm) *package*))))
+      (intern thunk-name (or (%build-mvm-package) *package*))))
 
 (defvar *init-nil-thunk-names* nil
   "The subset of *INIT-THUNK-NAMES* that are a NIL-initform DEFVAR's thunk,
@@ -3253,7 +3262,7 @@
       (intern (concatenate 'string "SETF-" (symbol-name name))
               (%cl-sym-package name))
       (intern (concatenate 'string "SETF-" (symbol-name name))
-              (or (find-package "MODUS.MVM")
+              (or (%build-mvm-package)
                   (find-package "COMMON-LISP-USER")
                   *package*))))
 
@@ -6743,7 +6752,7 @@
           (when (and has-key (not has-aok))
             (setq lambda-params
                   (append params (list (intern "&ALLOW-OTHER-KEYS"
-                                               (or (find-package "MODUS.MVM")
+                                               (or (%build-mvm-package)
                                                    *package*)))))))
         (if *mvm-eval-runtime-p*
             ;; mvm-eval (in-image runtime compile) ONLY: route through
@@ -7024,7 +7033,7 @@
                      ;; that compile point.  Forward to the (SETF NAME) GF.
                      (let ((set-name (intern (concatenate 'string "SET-"
                                                           (symbol-name val))
-                                             (or (find-package "MODUS.MVM") *package*))))
+                                             (or (%build-mvm-package) *package*))))
                        (setq extra-defuns
                              (cons (if *mvm-eval-runtime-p*
                                        `(%install-accessor-dispatcher ',set-name ':setter ',val)
@@ -11826,7 +11835,7 @@
     ;; Intern into MODUS.MVM when that package is resolvable (build-time
     ;; SBCL host), else fall back to *package* — which IS MODUS.MVM during
     ;; a normal compile.  CRITICAL for self-hosted / in-image eval (mvm-eval):
-    ;; there `(find-package "MODUS.MVM")` returns NIL (the package table
+    ;; there `(%build-mvm-package)` returns NIL (the package table
     ;; isn't populated in-image), so the old `(intern name :modus.mvm)`
     ;; returned NIL — the cell-rewrite then produced `(car NIL)` / `(set-car
     ;; NIL …)`, compile-lambda saw NO captured var (NIL isn't a variable),
@@ -11834,7 +11843,7 @@
     ;; NIL "cell" SIGSEGV'd.  The fallback keeps the binding symbol and every
     ;; reference EQ within one compile, which is all cell indirection needs."
     (intern (concatenate 'string "%CELL-" base)
-            (or (find-package "MODUS.MVM") *package*))))
+            (or (%build-mvm-package) *package*))))
 
 (defun %setter-pkg (acc)
   "Package a generated SET-<ACC> writer name is interned in.  At build time,
@@ -11847,7 +11856,7 @@
          (pn (and p (package-name p))))
     (if (and (not *mvm-eval-runtime-p*) pn (not (%fn-key-ansi-pkg-p pn)))
         p
-        (or (find-package "MODUS.MVM")
+        (or (%build-mvm-package)
             (and (symbolp acc) (symbol-package acc))
             *package*))))
 
@@ -11887,7 +11896,7 @@
    decoder got an FFV1 struct."
   (intern name (if *mvm-eval-runtime-p*
                    *package*
-                   (or *defstruct-home* (find-package "MODUS.MVM") *package*))))
+                   (or *defstruct-home* (%build-mvm-package) *package*))))
 
 ;;; ------------------------------------------------------------
 ;;; DEFSTRUCT (:TYPE LIST) / (:TYPE VECTOR) / (:TYPE (VECTOR elt)) -- CLHS 3.4.6
@@ -15453,7 +15462,7 @@
                  ;; asdf gauntlet form 52; any capturing flet under eval).
                  (cell-sym (intern (format nil "%FLETCELL-~A$$~D"
                                            base-name (make-compiler-label))
-                                   (or (find-package "MODUS.MVM") *package*))))
+                                   (or (%build-mvm-package) *package*))))
             (push name local-names)
             (push cell-sym cell-names)
             (push (list name (cadr def) (cddr def) cell-sym) defs-data))))
@@ -16036,7 +16045,7 @@
    caller gets one object for one accumulator.  The suffix carries a `%\' for
    the same reason %MVM-GENSYM\'s does: it cannot collide with a source name."
   (intern (concatenate 'string (symbol-name v) "%LTAIL")
-          (or (find-package "MODUS.MVM")
+          (or (%build-mvm-package)
               (find-package "COMMON-LISP-USER")
               *package*)))
 
@@ -28074,7 +28083,7 @@
       ((and allow-key-transform has-key)
        (let* ((kw-rest (intern (format nil "%KW-REST-~D"
                                         (incf *kw-rest-counter*))
-                               ;; (or (find-package "MODUS.MVM") *package*), NOT
+                               ;; (or (%build-mvm-package) *package*), NOT
                                ;; the hardcoded :modus.mvm keyword: in mvm-eval
                                ;; (in-image self-host) the package table has no
                                ;; MODUS.MVM, so `(intern name :modus.mvm)`
@@ -28086,7 +28095,7 @@
                                ;; lambda &key cluster, lambda.34-47).  Same in-image
                                ;; intern-into-NIL bug already fixed for cell-var-name
                                ;; / defstruct-intern / setf-place setters.
-                               (or (find-package "MODUS.MVM") *package*)))
+                               (or (%build-mvm-package) *package*)))
               (req-count (length required))
               ;; &optional params get GENSYM slot names (same CLHS-scope
               ;; trick as the fallback path at #142 below): the caller
@@ -28150,7 +28159,7 @@
                                               (symbol-name var)
                                               (incf *kw-rest-counter*))
                                      ;; in-image-safe package (see kw-rest above)
-                                     (or (find-package "MODUS.MVM") *package*))))
+                                     (or (%build-mvm-package) *package*))))
              (push (list found-var (list '%key-present-p kw-rest (list 'quote kw))) bindings)
              (push (list var (list 'if found-var
                                      (list '%key-lookup kw-rest (list 'quote kw) nil)
@@ -29815,7 +29824,13 @@
                 (new-loc (or *current-source-location* "?")))
             (format t "  NOTE: redefining ~A  (old: ~A, new: ~A)~%"
                     (function-info-name info) old-loc new-loc)
-            (unless (gethash (function-info-name info) *overridable-names*)
+            ;; A DEFVAR / DEFPARAMETER / DEFCONSTANT's generated INIT- thunk is
+            ;; not a function seam: defining a variable twice is legal CL (the
+            ;; static self-host configuration compiles every DEFCONSTANT this
+            ;; way, and several are repeated across texts).
+            (unless (or (gethash (function-info-name info) *overridable-names*)
+                        (member (function-info-name info) *init-thunk-names*
+                                :test (function equal)))
               (push (list (function-info-name info) old-loc new-loc)
                     *undeclared-redefinitions*))
             (push (list (function-info-name info) old-loc new-loc)
@@ -31214,7 +31229,7 @@
       ;; modus-sh — so every thunk call became a call to NIL (936 of them, the
       ;; self-compiled image died at boot in INIT-ALL-GLOBALS).  Fall back to
       ;; the current package, which is MODUS.MVM at build time anyway.
-      (let ((pkg (or (find-package :modus.mvm) *package*)))
+      (let ((pkg (or (%build-mvm-package) *package*)))
         (dolist (thunk-name (nreverse *init-thunk-names*))
           (push `(handler-case (,(intern thunk-name pkg))
                    (t (c) nil))
@@ -31229,7 +31244,7 @@
       ;; %RUN-NIL-DEFVAR-INITS: the NIL-initform DEFVARs alone (see
       ;; *INIT-NIL-THUNK-NAMES*).  Always generated, as INIT-ALL-GLOBALS is.
       (let ((nil-calls nil)
-            (pkg (or (find-package :modus.mvm) *package*)))
+            (pkg (or (%build-mvm-package) *package*)))
         (dolist (thunk-name (reverse *init-nil-thunk-names*))
           (push `(handler-case (,(intern thunk-name pkg)) (t (c) nil)) nil-calls))
         (let* ((result (mvm-compile-toplevel

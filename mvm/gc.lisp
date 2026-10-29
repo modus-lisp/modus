@@ -1731,6 +1731,96 @@
     (%gc-count)))
 
 ;;; ============================================================
+;;; Generational GC, stage 1: an OLD SPACE (docs/generational-gc.md)
+;;; ============================================================
+;;; What survived one collection of the board's boot heap survives all of them
+;;; (~40 of 50 MB, copied on every collection).  GC-TENURE makes the current
+;;; survivors an OLD SPACE that every later region-0 collection walks as roots
+;;; and never copies; region 0 continues on a young pair carved out of the
+;;; semispace that collection reclaimed.  No barrier (everything old is looked
+;;; at), no promotion and no major collection yet: old garbage stays.  The
+;;; collector does the switch (translate-aarch64's EMIT-AARCH64-TENURE), so the
+;;; AArch64 NATIVE collector is the only one that tenures; anywhere else the
+;;; request is never taken and GC-TENURE says so.  The words are the
+;;; translator's +GC-OLD-LO-ADDR+ / +GC-OLD-HI-ADDR+ / +GC-TENURE-REQ-ADDR+,
+;;; stored <<1 on every target.
+
+(defun %gc-old-lo () (ash (%gc-read64 (%conv-addr #x10000CC0)) -1))
+(defun %gc-old-hi () (ash (%gc-read64 (%conv-addr #x10000CC8)) -1))
+(defun %gc-old-space-p () (/= 0 (%gc-old-hi)))
+
+(defun %gc-old-space-forget ()
+  "NEGATIVE CONTROL ONLY: stop walking the old space (the collector skips the
+   walk when old_hi is 0) while its objects stay where they are.  An old
+   object's young referents are then neither kept alive nor updated, and the
+   next collection must break something; a test that survives this is not
+   testing the walk."
+  (%gc-write64 (%conv-addr #x10000CC8) 0))
+
+(defun %gc-old-leaf-p (st)
+  "The subtags the AArch64 collector's object walk does not scan (raw payload)."
+  (member st '(#x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66)))
+
+(defun %gc-old-audit ()
+  "Walk the old space object by object, as the collector does, and count the
+   POINTER SLOTS (cons car/cdr, non-leaf object slots) that point into region
+   0's TO-space -- the semispace the last collection vacated, where nothing is
+   live.  Zero after every collection is the invariant; a missed old->young
+   pointer is exactly such a slot.  Returns (OBJECTS DANGLING BAD): BAD is the
+   address where a header ran past old_hi (0 if the whole space parsed), which
+   is also the walk's own precondition."
+  (let* ((r (%gc-region-0)) (k (%gc-meta-scale))
+         (ts (%gc-meta-read (+ r #x08) k)) (sz (%gc-meta-read (+ r #x10) k))
+         (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+         (a (%gc-old-lo)) (end (%gc-old-hi)) (objs 0) (dang 0) (bad 0))
+    (flet ((slot (w) (when (%gc-cand-addr (%gc-word-lo w) (%gc-word-hi w) ts sz)
+                       (setq dang (+ dang 1)))))
+      (loop
+        (when (>= a end) (return nil))
+        (setq objs (+ objs 1))
+        (if (%census-cons-p a page cbm)
+            (progn (slot a) (slot (+ a 8)) (setq a (+ a 16)))
+            (let* ((h (mem-ref a :u32)) (st (logand h 255)) (n (ash h -8))
+                   (size (%census-size st n)))
+              (when (or (> (+ a size) end) (< size 16)) (setq bad a) (return nil))
+              (unless (%gc-old-leaf-p st)
+                (dotimes (i n) (slot (+ a 16 (* 8 i)))))
+              (setq a (+ a size))))))
+    (list objs dang bad)))
+
+(defun %gc-old-dangling () (second (%gc-old-audit)))
+
+(defun gc-tenure ()
+  "Make everything live in region 0 now an OLD SPACE that collections scan and
+   never copy, and continue on two young semispaces of half the old size, cut
+   from the semispace this collection reclaims.  Call it once, after boot.
+   Returns (OLD-LO OLD-HI YOUNG-SIZE).  Region 0 must be the active region."
+  (when (%gc-old-space-p)
+    (error "GC-TENURE: region 0 already has an old space [~X, ~X)"
+           (%gc-old-lo) (%gc-old-hi)))
+  (unless (= (%gc-region) (%gc-region-0))
+    (error "GC-TENURE: region 0 is not the active region"))
+  (let ((req (%conv-addr #x10000CE0)) (tries 0))
+    (loop
+      (let* ((k (%gc-meta-scale)) (r (%gc-region-0))
+             (from (%gc-meta-read r k))
+             (half (* 4096 (floor (%gc-meta-read (+ r #x10) k) 8192)))
+             (before (%gc-epoch)))
+        (%gc-write64 (+ req 8) (* 2 (+ from half)))
+        (%gc-write64 (+ req 16) (* 2 half))
+        (%gc-write64 req (* 2 from))
+        (loop
+          (set-alloc-limit (get-alloc-ptr))
+          (let ((probe (cons 1 2)))
+            (when (/= (%gc-epoch) before) (return (car probe)))))
+        (when (%gc-old-space-p)
+          (return (list (%gc-old-lo) (%gc-old-hi) half)))
+        (%gc-write64 req 0)
+        (setq tries (+ tries 1))
+        (when (>= tries 3)
+          (error "GC-TENURE: the collector did not take the request (only the AArch64 native collector tenures)"))))))
+
+;;; ============================================================
 ;;; Per-region acceptance harness
 ;;; ============================================================
 

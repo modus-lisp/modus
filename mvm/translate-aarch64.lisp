@@ -7965,6 +7965,89 @@
       (a64-set-label buf adone)
       (a64-set-label buf skip))))
 
+;;; GENERATIONAL GC, STAGE 1 (docs/generational-gc.md): an OLD SPACE that every
+;;; region-0 collection SCANS and never COPIES.  Five low-block words, stored
+;;; <<1 like the region fields (so a conservative scan reads even fixnums):
+;;;   #x10000CC0 old_lo, #x10000CC8 old_hi -- [old_lo, old_hi) is old; old_hi 0
+;;;              means there is none (every image until (GC-TENURE) runs);
+;;;   #x10000CE0/CE8/CF0 a TENURE REQUEST: the young from/to/size region 0 takes
+;;;              once this collection's survivors have become the old space.
+;;; Only region 0 has an old space: a core heap or carved region never tenures.
+(defconstant +gc-old-lo-addr+ #x10000CC0)
+(defconstant +gc-old-hi-addr+ #x10000CC8)
+(defconstant +gc-tenure-req-addr+ #x10000CE0)
+
+(defun emit-aarch64-old-space-walk (buf scan-word)
+  "Region 0 only, and only once (GC-TENURE) has made an old space: walk
+   [old_lo, old_hi) object by object and SCAN_WORD every pointer slot, so an
+   old object that points at a young one keeps it alive and is updated when it
+   moves.  That is the whole correctness argument without a write barrier:
+   everything old is looked at.  scan_word leaves an old pointer alone because
+   it is outside from-space.  The fixed end lives in a 16-byte frame of its
+   own, below the STW frame -- nothing in the walk addresses that frame."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-load-gc-region buf +a64-x16+ +a64-x17+)
+    (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
+    (a64-cmp-reg buf +a64-x16+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-hi-addr+))
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
+    (a64-cmp-imm buf +a64-x9+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-lo-addr+))
+    (a64-ldr-unsigned buf +a64-x26+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-sub-imm buf +a64-sp+ +a64-sp+ 16)
+    (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
+    (emit-aarch64-object-walk buf scan-word (list :sp 0))
+    (a64-add-imm buf +a64-sp+ +a64-sp+ 16)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-tenure (buf)
+  "Region 0 only, when a TENURE REQUEST is pending and names the from-space
+   this collection is reclaiming (x19) -- a request computed before some other
+   collection flipped the semispaces is stale and ignored, GC-TENURE retries.
+   The survivors just copied, [to_start x22, free x21), become the old space;
+   region 0 continues with the requested young pair, which GC-TENURE carved
+   out of the semispace this collection just reclaimed (its bitmaps already
+   cleared above).  Done HERE, not from Lisp, so the new frontier reaches every
+   other region-0 thread through the STW release like any collection's."
+  (let ((no (incf *mvm-label-counter*)))
+    (a64-load-gc-region buf +a64-x16+ +a64-x17+)
+    (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
+    (a64-cmp-reg buf +a64-x16+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i no :bcond))
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-tenure-req-addr+))
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)              ; x9 = young from
+    (a64-cmp-reg buf +a64-x9+ +a64-x19+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i no :bcond))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 8)
+    (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)            ; x10 = young to
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x16+ 16)
+    (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)            ; x11 = young size
+    (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0)       ; request taken
+    ;; the SIZE field: the swap writes from and to but never the size (an
+    ;; ordinary collection does not change it).  Left at the old size, the
+    ;; next collection's from_end reached over the old space and copied it.
+    (a64-load-real-addr buf +a64-x16+ (conv-real #x10000040))
+    (a64-lsl-imm buf +a64-x12+ +a64-x11+ 1)
+    (a64-str-unsigned buf +a64-x12+ +a64-x16+ +gc-off-space-size+)
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-lo-addr+))
+    (a64-lsl-imm buf +a64-x12+ +a64-x22+ 1)
+    (a64-str-unsigned buf +a64-x12+ +a64-x16+ 0)
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-hi-addr+))
+    (a64-lsl-imm buf +a64-x12+ +a64-x21+ 1)
+    (a64-str-unsigned buf +a64-x12+ +a64-x16+ 0)
+    ;; the swap below writes from := x22, to := x19, and builds the limit from
+    ;; x22 + x25; the mutator's frontier is x21.
+    (a64-mov-reg buf +a64-x22+ +a64-x9+)
+    (a64-mov-reg buf +a64-x19+ +a64-x10+)
+    (a64-mov-reg buf +a64-x25+ +a64-x11+)
+    (a64-mov-reg buf +a64-x21+ +a64-x9+)
+    (a64-set-label buf no)))
+
 (defun emit-aarch64-stw-release (buf)
   "End of a collection: a STW collector clears the stop flag (released);
    the frame goes either way."
@@ -8495,6 +8578,7 @@
     ;; heap that can point into region 0 — before the walk, which scans
     ;; whatever they forward.
     (emit-aarch64-stw-extra-roots buf scan-word)
+    (emit-aarch64-old-space-walk buf scan-word)
     (a64-mov-reg buf +a64-x26+ +a64-x22+)               ; walk cursor = to_start
     (emit-aarch64-object-walk buf scan-word +a64-x21+)
     (a64-tramp-mark 8)
@@ -8556,6 +8640,7 @@
       (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte2 :b))
       (a64-set-label buf zdone2b))
+    (emit-aarch64-tenure buf)
     (a64-tramp-mark 10)
     ;; ---- swap metadata (store <<1), IN THE ACTIVE REGION'S BLOCK ----
     ;; x17 was the region base at entry but the scan subroutines use it as

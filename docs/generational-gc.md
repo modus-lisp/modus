@@ -1,6 +1,6 @@
 # Generational GC — design and staging
 
-Status: **design, nothing built.**  This document came out of a measurement on the Pi Zero
+Status: **stage 1 built on the AArch64 native collector** (`gc-tenure`, test/gc-tenure.lisp); stages 2-4 are design.  This document came out of a measurement on the Pi Zero
 board image (2026-10-29), so the board is the first target and the reasons are the board's.
 
 ## Why
@@ -86,6 +86,20 @@ core is restored and initialised, region 0's `[from_start, free)` is exactly tha
   list).  It walks every structure intact, and `%gc-count-foreign-refs` shows nothing dangling.
 - The **negative control** in the same binary skips the old-space walk and must fail.
 - On the board, a drag run reports `(gc-report)` pause % before and after.
+
+**Built (2026-10-29).**  `(gc-tenure)` (mvm/gc.lisp) posts a request and forces a collection;
+`emit-aarch64-tenure` takes it at the swap: the survivors `[to_start, free)` become the old space
+and region 0 continues on two halves of the semispace it just reclaimed, size field included.
+Every later region-0 collection runs `emit-aarch64-old-space-walk` before the Cheney walk.
+Words: `#x10000CC0/CC8` old bounds, `#x10000CE0/CE8/CF0` the request (free on HEAD and
+origin/main).  `%gc-old-audit` walks the old space typed and counts pointer slots into the
+vacated semispace.  A conservative word count is NOT the oracle: it also sees raw leaf payload.
+On the Pi 5 hosted CLI: 8 MB tenured, 125,111 objects parse end to end, 80 forced collections
+with old->young stores into a vector, a list tail, a growing hash table and globals, every
+structure intact, 0 dangling slots, and one collection copies 0.75 MB, not 8 MB.  The negative
+control (`%gc-old-space-forget`, same binary) fails every run: one memory fault, three hangs.
+The first cut forgot the region's SIZE field.  The next collection's from_end then reached over
+the old space and copied it, which the audit showed at once.
 
 ### Stage 2 — a card table, so a minor collection scans only what changed
 

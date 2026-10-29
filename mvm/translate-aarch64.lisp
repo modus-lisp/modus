@@ -2265,6 +2265,19 @@
       (a64-add-reg buf rd rd pidx 2 1)                  ; ASR #1
       (a64-add-reg buf rd rd pidx 0 2)))                ; LSL #2
 
+(defun a64-emit-bulk-card-mark (buf pobj pidx pn)
+  "After a word BULK-MOVE/BULK-FILL: mark the cards of elements [idx, idx+n)
+   of POBJ (registers holding tagged object, index and count).  Nothing when
+   n is 0.  Clobbers x9-x15."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-cmp-imm buf pn 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-bulk-elt-addr buf +a64-x10+ pobj pidx nil)          ; first element
+    (a64-add-reg buf +a64-x11+ +a64-x10+ pn 0 2)             ; + n*8
+    (a64-sub-imm buf +a64-x11+ +a64-x11+ 1)                  ; last byte
+    (a64-emit-card-mark-range buf +a64-x10+ +a64-x11+)
+    (a64-set-label buf skip)))
+
 (defun a64-bulk-guard-pass (buf)
   "Before a word BULK-MOVE with threads live: every source word through the
    shared-store guard, against the destination object in x17 -- the per-element
@@ -2372,6 +2385,131 @@
     (a64-str-unsigned buf +a64-x13+ +a64-x12+ 24)       ; +0x5058
     (a64-emit buf #x00000000)                           ; UDF #0
     (dolist (idx rets) (a64-ssg-branch-here buf idx))
+    (a64-br buf +a64-x9+)))
+
+;;; CARD-MARKING WRITE BARRIER (generational GC stage 2, docs/generational-gc.md).
+;;; After a heap store, the card (512 bytes) holding the stored-to slot is
+;;; marked DIRTY (byte 0) so a minor collection scans only dirty cards of the
+;;; old space instead of all of it.  The table covers [area, area+512*ncards),
+;;; the semispace that holds the old space; a slot outside it marks nothing.
+;;; Four words, RAW (never scanned): +0 card bytes (0 = no table, the barrier
+;;; and the collector's card scan are off), +8 area base, +16 ncards, +24 the
+;;; crossing table (u32 per card: (object covering the card's first byte -
+;;; area) >> 4), all written by GC-TENURE.  Same out-of-line shape as the
+;;; shared-store guard: a site is x10/x11 = first/last byte stored, ADR x9, B;
+;;; the subroutine uses x9-x15 only.  Raw (setf mem-ref) stores are NOT
+;;; covered; %GC-CARD-AUDIT is the check that nothing relies on them.
+(defconstant +gc-card-base-addr+ #x10000CE0)
+
+(defvar *a64-card-barrier* t
+  "Whether heap stores call the card-marking barrier.  Correct while the
+   table is off (one load and a branch per store), so it is on everywhere.")
+
+(defvar *a64-card-label* nil
+  "The barrier subroutine's labels (see A64-CARD-LABELS).  Per unit for a
+   runtime (JIT) translation; ONE set for the whole image when translating
+   into the shared image buffer, whose branch fixups resolve across units --
+   one copy per function was 1.8 MB of a 57 MB image.  SETQ'd, never bound
+   (see *A64-SSG-LABEL*).")
+
+(defvar *a64-card-image-label* nil
+  "The image-wide barrier labels, and whether that copy is emitted yet:
+   (LABELS . EMITTED-P).  Reset by each image build.")
+
+(defun a64-card-new-labels ()
+  "A vector: [0] the x10 entry, [1] the x10..x11 range entry, then per
+   register R: [2+2R] `x10 := R', [3+2R] `x10..x11 := R..R+263'."
+  (let ((v (make-array 66)))
+    (dotimes (i 66) (setf (aref v i) (incf *mvm-label-counter*)))
+    v))
+
+(defun a64-card-labels ()
+  (cond (*a64-card-label*)
+        ((and *aarch64-translate-into-buf* (not *aarch64-jit-mode*))
+         (unless *a64-card-image-label*
+           (setq *a64-card-image-label* (cons (a64-card-new-labels) nil)))
+         (setq *a64-card-label* (car *a64-card-image-label*)))
+        (t (setq *a64-card-label* (a64-card-new-labels)))))
+
+(defun a64-card-reg-entry-p (r)
+  "Registers with their own barrier entries: everything but the barrier's own
+   scratch x9-x15, x18 (the convention base) and sp/xzr."
+  (and (<= 0 r 30) (not (<= +a64-x9+ r +a64-x15+)) (/= r 18)))
+
+(defun a64-emit-card-call (buf label)
+  "ADR x9, <return>; B LABEL."
+  (let ((adr (a64-current-index buf)))
+    (a64-emit buf (logior #x10000000 +a64-x9+))       ; ADR x9, <return>
+    (a64-emit-call-label buf label t)                 ; B barrier
+    (setf (aref (a64-buffer-code buf) adr)
+          (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
+                  +a64-x9+))))
+
+(defun a64-emit-card-mark-range (buf first last)
+  "Mark the cards of the bytes FIRST..LAST (registers, inclusive) dirty.
+   Clobbers x9-x15.  FIRST/LAST may be x10/x11 themselves."
+  (let ((labels (a64-card-labels)))
+    (unless (= first +a64-x10+) (a64-mov-reg buf +a64-x10+ first))
+    (unless (= last +a64-x11+) (a64-mov-reg buf +a64-x11+ last))
+    (a64-emit-card-call buf (aref labels 1))))
+
+(defun a64-emit-card-mark (buf addr offset)
+  "Mark the card of the slot at ADDR+OFFSET (ADDR a register; a tagged object
+   is fine, the tag never crosses a card).  TWO instructions for the common
+   shapes -- a per-register entry does the move -- and an offset up to 255
+   marks the one or two cards the slot can be in (over-marking only costs a
+   card scan).  Clobbers x9-x15."
+  (when *a64-card-barrier*
+    (let ((labels (a64-card-labels)))
+      (cond ((and (= offset 0) (a64-card-reg-entry-p addr))
+             (a64-emit-card-call buf (aref labels (+ 2 (* 2 addr)))))
+            ((and (<= 0 offset 255) (a64-card-reg-entry-p addr))
+             (a64-emit-card-call buf (aref labels (+ 3 (* 2 addr)))))
+            (t
+             (if (> offset 0)
+                 (a64-add-imm buf +a64-x10+ addr offset)
+                 (a64-mov-reg buf +a64-x10+ addr))
+             (a64-emit-card-call buf (aref labels 0)))))))
+
+(defun a64-emit-card-mark-sub (buf labels)
+  "The barrier (see A64-CARD-NEW-LABELS for its entries).  x9 = return."
+  (let ((ret (incf *mvm-label-counter*))
+        (inrange (incf *mvm-label-counter*))
+        (loop-l (incf *mvm-label-counter*)))
+    (dotimes (r 31)
+      (when (a64-card-reg-entry-p r)
+        (a64-set-label buf (aref labels (+ 2 (* 2 r))))
+        (a64-mov-reg buf +a64-x10+ r)
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i (aref labels 0) :b))
+        (a64-set-label buf (aref labels (+ 3 (* 2 r))))
+        (a64-add-imm buf +a64-x11+ r 263)
+        (a64-mov-reg buf +a64-x10+ r)
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i (aref labels 1) :b))))
+    (a64-set-label buf (aref labels 0))
+    (a64-mov-reg buf +a64-x11+ +a64-x10+)
+    (a64-set-label buf (aref labels 1))
+    (a64-load-conv-addr buf +a64-x12+ +gc-card-base-addr+)
+    (a64-ldp-offset buf +a64-x13+ +a64-x14+ +a64-x12+ 0)   ; card bytes, area
+    (a64-cmp-imm buf +a64-x13+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i ret :bcond))
+    (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 16)          ; ncards
+    (a64-sub-reg buf +a64-x10+ +a64-x10+ +a64-x14+ 0 0)
+    (a64-lsr-imm buf +a64-x10+ +a64-x10+ 9)                ; first card
+    (a64-cmp-reg buf +a64-x10+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i ret :bcond))
+    (a64-sub-reg buf +a64-x11+ +a64-x11+ +a64-x14+ 0 0)
+    (a64-lsr-imm buf +a64-x11+ +a64-x11+ 9)                ; last card
+    (a64-cmp-reg buf +a64-x11+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i inrange :bcond))
+    (a64-sub-imm buf +a64-x11+ +a64-x15+ 1)
+    (a64-set-label buf inrange)
+    (a64-set-label buf loop-l)
+    (a64-add-reg buf +a64-x12+ +a64-x13+ +a64-x10+ 0 0)
+    (a64-strb buf +a64-xzr+ +a64-x12+)                     ; dirty
+    (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i loop-l :bcond)) ; LS
+    (a64-set-label buf ret)
     (a64-br buf +a64-x9+)))
 
 (defconstant +a64-darwin-sys-set-thread-delta+ 1000
@@ -5043,7 +5181,8 @@
                                           (ensure-src (vr 0) +a64-x16+)))
            (let ((pd (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+)))
-             (a64-stur buf ps pd -1)))
+             (a64-stur buf ps pd -1)
+             (a64-emit-card-mark buf pd 0)))
 
           ;; ---- SETCDR Vd, Vs ----
           ;; STUR Vs, [Vd, #7]  (untag + skip car)
@@ -5053,7 +5192,8 @@
                                           (ensure-src (vr 0) +a64-x16+)))
            (let ((pd (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+)))
-             (a64-stur buf ps pd 7)))
+             (a64-stur buf ps pd 7)
+             (a64-emit-card-mark buf pd 0)))
 
           ;; ---- CONSP Vd, Vs ----
           ;; (consp NIL) MUST return NIL even though NIL=#xDEAD0001 has
@@ -5316,11 +5456,13 @@
                                 (ensure-src vobj +a64-x16+)))
                         (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
-                       (a64-stur buf ps pobj offset)
+                       (progn (a64-stur buf ps pobj offset)
+                              (a64-emit-card-mark buf pobj offset))
                        (progn
                          (a64-load-imm64 buf +a64-x9+ offset)
                          (a64-add-reg buf +a64-x9+ pobj +a64-x9+ 0 0)
-                         (a64-stur buf ps +a64-x9+ 0)))))))
+                         (a64-stur buf ps +a64-x9+ 0)
+                         (a64-emit-card-mark buf +a64-x9+ 0)))))))
 
           ;; ---- OBJ-TAG Vd, Vs ----
           ;; Extract low 4 bits, then fixnum-tag (SHL 1) — matches x64.
@@ -5421,7 +5563,8 @@
              (a64-add-imm buf +a64-x16+ pobj 7)
              (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
              (let ((ps (ensure-src (vr 2) +a64-x17+)))
-               (a64-stur buf ps +a64-x16+ 0))))
+               (a64-stur buf ps +a64-x16+ 0))
+             (a64-emit-card-mark buf +a64-x16+ 0)))
 
           ;; ---- ARRAY-LEN Vd, Vobj ----
           ;; Extract element count from header at raw = tagged-9.
@@ -6000,7 +6143,11 @@
                    (a64-lsl-imm buf +a64-x11+ pn 2)))      ; n words * 8
              (when (and (a64-ssg-p) (not bytes))
                (a64-bulk-guard-pass buf))
-             (dolist (w *a64-bulk-move-words*) (a64-emit buf w))))
+             (dolist (w *a64-bulk-move-words*) (a64-emit buf w))
+             (when (and *a64-card-barrier* (not bytes))
+               (a64-emit-bulk-card-mark buf (ensure-src (vr 0) +a64-x12+)
+                                        (ensure-src (vr 1) +a64-x13+)
+                                        (ensure-src (vr 4) +a64-x14+)))))
           ;; ---- BULK-FILL Varr, Vi, Vn, Vval, kind ----
           ((= op +op-bulk-fill+)
            (let ((bytes (= (vr 4) 1)))
@@ -6018,7 +6165,11 @@
                           (a64-lsr-imm buf +a64-x11+ +a64-x11+ 56)       ; the untagged value
                           (dolist (w *a64-bulk-fill-bytes-words*) (a64-emit buf w)))
                    (progn (a64-mov-reg buf +a64-x11+ pv)                   ; the tagged word
-                          (dolist (w *a64-bulk-fill-words-words*) (a64-emit buf w)))))))
+                          (dolist (w *a64-bulk-fill-words-words*) (a64-emit buf w))
+                          (when *a64-card-barrier*
+                            (a64-emit-bulk-card-mark buf (ensure-src (vr 0) +a64-x12+)
+                                                     (ensure-src (vr 1) +a64-x13+)
+                                                     (ensure-src (vr 2) +a64-x14+))))))))
 
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
@@ -7970,22 +8121,25 @@
 ;;; <<1 like the region fields (so a conservative scan reads even fixnums):
 ;;;   #x10000CC0 old_lo, #x10000CC8 old_hi -- [old_lo, old_hi) is old; old_hi 0
 ;;;              means there is none (every image until (GC-TENURE) runs);
-;;;   #x10000CE0/CE8/CF0 a TENURE REQUEST: the young from/to/size region 0 takes
-;;;              once this collection's survivors have become the old space.
+;;;   #x10000C88/C90/C98 a TENURE REQUEST: the young from/to/size region 0
+;;;              takes once this collection's survivors have become the old
+;;;              space.  (#x10000CE0.. is the card table, +GC-CARD-BASE-ADDR+.)
 ;;; Only region 0 has an old space: a core heap or carved region never tenures.
 (defconstant +gc-old-lo-addr+ #x10000CC0)
 (defconstant +gc-old-hi-addr+ #x10000CC8)
-(defconstant +gc-tenure-req-addr+ #x10000CE0)
+(defconstant +gc-tenure-req-addr+ #x10000C88)
 
 (defun emit-aarch64-old-space-walk (buf scan-word)
-  "Region 0 only, and only once (GC-TENURE) has made an old space: walk
-   [old_lo, old_hi) object by object and SCAN_WORD every pointer slot, so an
-   old object that points at a young one keeps it alive and is updated when it
-   moves.  That is the whole correctness argument without a write barrier:
-   everything old is looked at.  scan_word leaves an old pointer alone because
-   it is outside from-space.  The fixed end lives in a 16-byte frame of its
-   own, below the STW frame -- nothing in the walk addresses that frame."
-  (let ((skip (incf *mvm-label-counter*)))
+  "Region 0 only, and only once (GC-TENURE) has made an old space.  With a
+   card table (+GC-CARD-BASE-ADDR+ non-zero): scan the DIRTY cards only
+   (EMIT-AARCH64-OLD-CARD-SCAN).  Without one: walk all of [old_lo, old_hi)
+   object by object and SCAN_WORD every pointer slot -- correct with no
+   barrier at all, because everything old is looked at.  scan_word leaves an
+   old pointer alone because it is outside from-space.  Either way the state
+   lives in a frame of its own below the STW frame; nothing here addresses
+   that frame."
+  (let ((skip (incf *mvm-label-counter*))
+        (cards (incf *mvm-label-counter*)))
     (a64-load-gc-region buf +a64-x16+ +a64-x17+)
     (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
     (a64-cmp-reg buf +a64-x16+ +a64-x10+)
@@ -7995,6 +8149,11 @@
     (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
     (a64-cmp-imm buf +a64-x9+ 0)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-card-base-addr+))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i cards :bcond))
+    ;; no card table: the whole old space
     (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-lo-addr+))
     (a64-ldr-unsigned buf +a64-x26+ +a64-x16+ 0)
     (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
@@ -8002,7 +8161,187 @@
     (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
     (emit-aarch64-object-walk buf scan-word (list :sp 0))
     (a64-add-imm buf +a64-sp+ +a64-sp+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i skip :b))
+    (a64-set-label buf cards)
+    (emit-aarch64-old-card-scan buf scan-word)
     (a64-set-label buf skip)))
+
+(defun a64-card-young-check (buf)
+  "After SCAN_WORD on the slot at x23: x4 := 1 if the slot now holds a
+   pointer into to-space [x22, x22+x25) -- the young survivors -- so its card
+   must stay dirty.  Clobbers x10/x11."
+  (let ((no (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x23+ 0)
+    (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+    (a64-cmp-imm buf +a64-x11+ 1)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i no :bcond))
+    (a64-sub-reg buf +a64-x11+ +a64-x10+ +a64-x22+ 0 0)
+    (a64-cmp-reg buf +a64-x11+ +a64-x25+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i no :bcond))
+    (a64-movz buf +a64-x4+ 1 0)
+    (a64-set-label buf no)))
+
+(defun a64-card-scan-slot (buf scan-word)
+  "SCAN_WORD the slot at x23 if it can hold a pointer, then the young check."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x23+ 0)
+    (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+    (a64-cmp-imm buf +a64-x11+ 1)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-mov-reg buf +a64-x9+ +a64-x23+)
+    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (a64-card-young-check buf)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-old-card-scan (buf scan-word)
+  "Scan the old space's DIRTY cards (x9 = old_hi on entry).  For each dirty
+   card: start at the object the crossing table says covers its first byte,
+   walk objects up to the card's end, and SCAN_WORD only the pointer slots
+   that lie INSIDE the card (a big vector with one dirty card costs one card).
+   A card none of whose slots points into to-space afterwards is cleaned.
+   x0 card bytes, x1 card, x2 cards in use, x3 area, x4 young flag, x8
+   crossing -- saved at entry, untouched by scan_word/copy_object.  Frame:
+   [sp] card start, [sp+8] card end, [sp+16] slot limit, [sp+24] old_hi."
+  (let ((l-card (incf *mvm-label-counter*)) (single (incf *mvm-label-counter*))
+        (endok (incf *mvm-label-counter*)) (l-obj (incf *mvm-label-counter*))
+        (objdone (incf *mvm-label-counter*)) (next (incf *mvm-label-counter*))
+        (done (incf *mvm-label-counter*)) (is-cons (incf *mvm-label-counter*))
+        (cskip (incf *mvm-label-counter*)) (nextobj (incf *mvm-label-counter*))
+        (u8sz (incf *mvm-label-counter*)) (f32sz (incf *mvm-label-counter*))
+        (havesz (incf *mvm-label-counter*)) (lo-ok (incf *mvm-label-counter*))
+        (hi-ok (incf *mvm-label-counter*)) (sloop (incf *mvm-label-counter*)))
+    (a64-sub-imm buf +a64-sp+ +a64-sp+ 32)
+    (a64-str-unsigned buf +a64-x9+ +a64-sp+ 24)
+    (a64-load-real-addr buf +a64-x12+ (conv-real +gc-card-base-addr+))
+    (a64-ldp-offset buf +a64-x0+ +a64-x3+ +a64-x12+ 0)      ; card bytes, area
+    (a64-ldr-unsigned buf +a64-x8+ +a64-x12+ 24)             ; crossing
+    (a64-sub-reg buf +a64-x2+ +a64-x9+ +a64-x3+ 0 0)
+    (a64-add-imm buf +a64-x2+ +a64-x2+ 511)
+    (a64-lsr-imm buf +a64-x2+ +a64-x2+ 9)                    ; cards in use
+    (a64-movz buf +a64-x1+ 0 0)
+    (a64-set-label buf l-card)
+    (a64-cmp-reg buf +a64-x1+ +a64-x2+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i done :bcond))
+    ;; eight clean cards at once
+    (a64-add-imm buf +a64-x10+ +a64-x1+ 8)
+    (a64-cmp-reg buf +a64-x10+ +a64-x2+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i single :bcond)) ; HI
+    (a64-add-reg buf +a64-x11+ +a64-x0+ +a64-x1+ 0 0)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x11+ 0)
+    (a64-load-imm64 buf +a64-x12+ #x0101010101010101)
+    (a64-cmp-reg buf +a64-x10+ +a64-x12+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i single :bcond))
+    (a64-add-imm buf +a64-x1+ +a64-x1+ 8)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-card :b))
+    (a64-set-label buf single)
+    (a64-add-reg buf +a64-x11+ +a64-x0+ +a64-x1+ 0 0)
+    (a64-ldrb buf +a64-x10+ +a64-x11+)
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i next :bcond))
+    ;; ---- a dirty card ----
+    (a64-lsl-imm buf +a64-x10+ +a64-x1+ 9)
+    (a64-add-reg buf +a64-x10+ +a64-x3+ +a64-x10+ 0 0)       ; card start
+    (a64-str-unsigned buf +a64-x10+ +a64-sp+ 0)
+    (a64-add-imm buf +a64-x11+ +a64-x10+ 512)
+    (a64-ldr-unsigned buf +a64-x12+ +a64-sp+ 24)
+    (a64-cmp-reg buf +a64-x11+ +a64-x12+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i endok :bcond)) ; LS
+    (a64-mov-reg buf +a64-x11+ +a64-x12+)
+    (a64-set-label buf endok)
+    (a64-str-unsigned buf +a64-x11+ +a64-sp+ 8)              ; card end (<= old_hi)
+    (a64-movz buf +a64-x4+ 0 0)
+    (a64-lsl-imm buf +a64-x12+ +a64-x1+ 2)
+    (a64-add-reg buf +a64-x12+ +a64-x8+ +a64-x12+ 0 0)
+    (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ 0)
+    (a64-lsl-imm buf +a64-x12+ +a64-x12+ 4)
+    (a64-add-reg buf +a64-x26+ +a64-x3+ +a64-x12+ 0 0)       ; covering object
+    (a64-set-label buf l-obj)
+    (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 8)
+    (a64-cmp-reg buf +a64-x26+ +a64-x9+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i objdone :bcond))
+    ;; cons?  (the object walk's test)
+    (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)
+    (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x7+ +a64-x12+ 0 0)
+    (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)
+    (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x5+)
+    (a64-ldrb buf +a64-x14+ +a64-x12+)
+    (a64-lslv buf +a64-x15+ +a64-x6+ +a64-x11+)
+    (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i is-cons :bcond))
+    ;; headered object: its size (the object walk's arithmetic)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x26+ 0)
+    (a64-lsl-imm buf +a64-x14+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x14+ +a64-x14+ 56)
+    (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)
+    (a64-lsl-imm buf +a64-x16+ +a64-x15+ 3)
+    (a64-cmp-imm buf +a64-x14+ #x11)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x13)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x12)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x15)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-add-imm buf +a64-x9+ +a64-x16+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i havesz :b))
+    (a64-set-label buf f32sz)
+    (a64-lsl-imm buf +a64-x15+ +a64-x15+ 2)
+    (a64-set-label buf u8sz)
+    (a64-add-imm buf +a64-x9+ +a64-x15+ 16)
+    (a64-set-label buf havesz)
+    (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4)
+    (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)       ; next object
+    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66))
+      (a64-cmp-imm buf +a64-x14+ st)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i nextobj :bcond)))
+    ;; slots [max(obj+16, card start), min(obj+16+count*8, card end))
+    (a64-add-imm buf +a64-x23+ +a64-x26+ 16)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 0)
+    (a64-cmp-reg buf +a64-x23+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i lo-ok :bcond))
+    (a64-mov-reg buf +a64-x23+ +a64-x10+)
+    (a64-set-label buf lo-ok)
+    (a64-add-imm buf +a64-x17+ +a64-x26+ 16)
+    (a64-add-reg buf +a64-x17+ +a64-x17+ +a64-x16+ 0 0)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 8)
+    (a64-cmp-reg buf +a64-x17+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i hi-ok :bcond)) ; LS
+    (a64-mov-reg buf +a64-x17+ +a64-x10+)
+    (a64-set-label buf hi-ok)
+    (a64-str-unsigned buf +a64-x17+ +a64-sp+ 16)
+    (a64-set-label buf sloop)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+    (a64-cmp-reg buf +a64-x23+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i nextobj :bcond))
+    (a64-card-scan-slot buf scan-word)
+    (a64-add-imm buf +a64-x23+ +a64-x23+ 8)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
+    (a64-set-label buf nextobj)
+    (a64-mov-reg buf +a64-x26+ +a64-x24+)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-obj :b))
+    ;; a cons: 16 bytes inside one card, so it is in this card or wholly before it
+    (a64-set-label buf is-cons)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 0)
+    (a64-cmp-reg buf +a64-x26+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i cskip :bcond))
+    (a64-mov-reg buf +a64-x23+ +a64-x26+)
+    (a64-card-scan-slot buf scan-word)
+    (a64-add-imm buf +a64-x23+ +a64-x26+ 8)
+    (a64-card-scan-slot buf scan-word)
+    (a64-set-label buf cskip)
+    (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-obj :b))
+    ;; the card is clean unless a slot still points at a young object
+    (a64-set-label buf objdone)
+    (a64-cmp-imm buf +a64-x4+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i next :bcond))
+    (a64-movz buf +a64-x10+ 1 0)
+    (a64-add-reg buf +a64-x11+ +a64-x0+ +a64-x1+ 0 0)
+    (a64-strb buf +a64-x10+ +a64-x11+)
+    (a64-set-label buf next)
+    (a64-add-imm buf +a64-x1+ +a64-x1+ 1)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-card :b))
+    (a64-set-label buf done)
+    (a64-add-imm buf +a64-sp+ +a64-sp+ 32)))
 
 (defun emit-aarch64-tenure (buf)
   "Region 0 only, when a TENURE REQUEST is pending and names the from-space
@@ -9175,7 +9514,7 @@
   (setf *aarch64-fn-addr-relocs* nil)
   (setf *aarch64-fn-addr-local-relocs* nil)
   (a64-slot-cache-flush)   ; never inherit a previous translation's state
-  (setq *a64-ssg-label* nil)
+  (setq *a64-ssg-label* nil *a64-card-label* nil)
   (setq *a64-mark-start-label* nil *a64-mark-cons-label* nil *a64-cold-stubs* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
@@ -9338,6 +9677,15 @@
       (a64-runtime-mark buf "<runtime: shared-store guard>")
       (a64-emit-shared-store-guard-sub buf *a64-ssg-label*)
       (setq *a64-ssg-label* nil))
+    ;; The card-marking barrier, when a store in this unit called it.
+    (when *a64-card-label*
+      (if (and *aarch64-translate-into-buf* (not *aarch64-jit-mode*))
+          (unless (cdr *a64-card-image-label*)         ; the image's one copy
+            (a64-runtime-mark buf "<runtime: card barrier>")
+            (a64-emit-card-mark-sub buf *a64-card-label*)
+            (setf (cdr *a64-card-image-label*) t))
+          (a64-emit-card-mark-sub buf *a64-card-label*))
+      (setq *a64-card-label* nil))
     ;; The GC bitmap marks, when an allocation in this unit called them.
     (a64-emit-mark-subs buf)
 

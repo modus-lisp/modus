@@ -1,6 +1,6 @@
 # Generational GC — design and staging
 
-Status: **stage 1 built on the AArch64 native collector** (`gc-tenure`, test/gc-tenure.lisp); stages 2-4 are design.  This document came out of a measurement on the Pi Zero
+Status: **stages 1 and 2 built on the AArch64 native collector** (`gc-tenure`, test/gc-tenure.lisp); stages 3-4 in progress.  This document came out of a measurement on the Pi Zero
 board image (2026-10-29), so the board is the first target and the reasons are the board's.
 
 ## Why
@@ -130,6 +130,31 @@ not copying.  That is what stage 2's card table removes.
   explicitly or is documented as never doing so.  An audit (`%gc-count-foreign-refs`-style:
   old→young pointers on CLEAN cards must be zero) is the acceptance test, with a positive
   control.
+
+**Built (2026-10-29).**  The table is one `(unsigned-byte 8)` vector made by `gc-tenure` just
+before the tenure collection, so it is tenured with everything else.  It holds a card byte per
+512 bytes of the old space's semispace (0 = dirty; zeroed means all dirty, so the first card
+collection is a full walk), then a u32 CROSSING entry per card: the object covering the card's
+first byte, which is where a card scan starts.  Four raw words at `#x10000CE0`: cards (0 = off),
+area, ncards, crossing.  The tenure request moved to `#x10000C88/C90/C98`.
+
+- **Barrier:** every `setcar`/`setcdr`/`obj-set`/`aset`, and word `bulk-move`/`bulk-fill` (range
+  form), ends in `ADR x9; B entry`.  There is one image-wide subroutine with a per-register entry,
+  so a site costs 2 instructions, and the JIT gets its own per unit.  `obj-set` with offset 0..255
+  marks the one or two cards the slot can fall in.  Image cost: +4.0 MB on the 50 MB aarch64 CLI
+  (8%).  A per-function copy of the subroutine had been +1.8 MB, and 3-instruction sites +1.8 MB more.
+- **Collector:** `emit-aarch64-old-card-scan` skips clean cards 8 at a time.  For a dirty card it
+  starts at its crossing object and scans only the pointer slots inside the card.  The card is
+  cleaned unless a slot now points into to-space.  It uses x0-x4/x8, which the collector saves
+  and scan_word/copy_object never touch.
+- **Oracle:** `%gc-card-audit`: every old pointer slot that points into young must sit on a dirty
+  card, at any moment.  Its positive control is a raw `(setf mem-ref)` of a young cons into an
+  old car, which the audit catches (1), then the same store through `setf car` (0).
+- **Pi 5 hosted CLI, test/gc-tenure.lisp 11/11:** a minor collection takes 1.20 ms with cards
+  against 3.58 ms walking an 8 MB old space.  Controls in the same binary: `:barrier` (barrier off,
+  card scan on) fails 3/3 and `:walk` fails 3/3.
+- Raw stores (`(setf mem-ref)`, `%gc-write64`) are not covered.  The audit is how to find one
+  that matters.
 
 ### Stage 3 — promotion and a major collection
 

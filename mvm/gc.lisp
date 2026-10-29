@@ -1790,22 +1790,114 @@
 
 (defun %gc-old-dangling () (second (%gc-old-audit)))
 
-(defun gc-tenure ()
+(defvar *gc-card-vector* nil
+  "The card table + crossing table, one (unsigned-byte 8) vector made just
+   before the tenure collection so that it is tenured with everything else and
+   never moves.  Kept here so it stays live.")
+
+(defun %gc-card-words () (%conv-addr #x10000CE0))
+(defun %gc-cards-on-p () (/= 0 (%gc-read64 (%gc-card-words))))
+
+(defun %gc-old-object-size (a page cbm)
+  "Size in bytes of the old-space object at A (16 for a cons)."
+  (if (%census-cons-p a page cbm)
+      16
+      (let ((h (mem-ref a :u32)))
+        (%census-size (logand h 255) (ash h -8)))))
+
+(defun %gc-cards-build (vec area ncards)
+  "Point the card words at VEC (now in the old space): cards at its data,
+   all DIRTY (the vector is zeroed), crossing after them, filled by one walk
+   of [old_lo, old_hi).  The card base is written LAST: it switches on both
+   the barrier and the collector's card scan, and every card being dirty
+   makes the first card-scanning collection as complete as a full walk."
+  (let* ((w (%gc-card-words))
+         (data (let ((scratch (%conv-addr #x10000C88)))   ; not w: a card base
+                 (prog1 (+ (%gc-word-of vec scratch) 7)  ; of a tagged word would
+                   (%gc-write64 scratch 0))))             ; switch the scan on
+         (cross (+ data ncards))
+         (k (%gc-meta-scale))
+         (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+         (a (%gc-old-lo)) (end (%gc-old-hi)))
+    (%gc-write64 w 0)
+    (loop
+      (when (>= a end) (return nil))
+      (let* ((size (%gc-old-object-size a page cbm))
+             (c (ash (+ (- a area) 511) -9))
+             (last (ash (- (+ a size -1) area) -9))
+             (g (ash (- a area) -4)))
+        (loop
+          (when (> c last) (return nil))
+          (setf (mem-ref (+ cross (* 4 c)) :u32) g)
+          (setq c (+ c 1)))
+        (setq a (+ a size))))
+    (%gc-write64 (+ w 8) area)
+    (%gc-write64 (+ w 16) ncards)
+    (%gc-write64 (+ w 24) cross)
+    (%gc-write64 w data)
+    ncards))
+
+(defun %gc-card-audit ()
+  "Every POINTER SLOT of the old space that points into region 0's young
+   semispaces must sit on a DIRTY card -- the invariant the barrier and the
+   card scan keep, at any moment, not only after a collection.  Returns
+   (YOUNG-SLOTS VIOLATIONS): a violation is such a slot on a clean card,
+   i.e. a store the barrier never saw.  NIL when there is no card table."
+  (when (%gc-cards-on-p)
+    (let* ((w (%gc-card-words)) (cards (%gc-read64 w)) (area (%gc-read64 (+ w 8)))
+           (r (%gc-region-0)) (k (%gc-meta-scale))
+           (f (%gc-meta-read r k)) (tt (%gc-meta-read (+ r 8) k))
+           (sz (%gc-meta-read (+ r 16) k))
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+           (a (%gc-old-lo)) (end (%gc-old-hi)) (young 0) (bad 0))
+      (flet ((slot (x)
+               (when (or (%gc-cand-addr (%gc-word-lo x) (%gc-word-hi x) f sz)
+                         (%gc-cand-addr (%gc-word-lo x) (%gc-word-hi x) tt sz))
+                 (setq young (+ young 1))
+                 (unless (= 0 (mem-ref (+ cards (ash (- x area) -9)) :u8))
+                   (setq bad (+ bad 1))))))
+        (loop
+          (when (>= a end) (return nil))
+          (if (%census-cons-p a page cbm)
+              (progn (slot a) (slot (+ a 8)) (setq a (+ a 16)))
+              (let* ((h (mem-ref a :u32)) (st (logand h 255)) (n (ash h -8)))
+                (unless (%gc-old-leaf-p st)
+                  (dotimes (i n) (slot (+ a 16 (* 8 i)))))
+                (setq a (+ a (%census-size st n)))))))
+      (list young bad))))
+
+(defun %gc-card-barrier-off ()
+  "NEGATIVE CONTROL ONLY: the barrier marks nothing (ncards 0) while the
+   collector keeps scanning only dirty cards."
+  (%gc-write64 (+ (%gc-card-words) 16) 0))
+
+(defun gc-tenure (&key (cards t))
   "Make everything live in region 0 now an OLD SPACE that collections scan and
    never copy, and continue on two young semispaces of half the old size, cut
    from the semispace this collection reclaims.  Call it once, after boot.
-   Returns (OLD-LO OLD-HI YOUNG-SIZE).  Region 0 must be the active region."
+   With CARDS (the default) old objects are tracked by a card table and a
+   write barrier, so a collection scans only the old cards stored into since;
+   without, every collection walks the whole old space.
+   Returns (OLD-LO OLD-HI YOUNG-SIZE NCARDS).  Region 0 must be the active region."
   (when (%gc-old-space-p)
     (error "GC-TENURE: region 0 already has an old space [~X, ~X)"
            (%gc-old-lo) (%gc-old-hi)))
   (unless (= (%gc-region) (%gc-region-0))
     (error "GC-TENURE: region 0 is not the active region"))
-  (let ((req (%conv-addr #x10000CE0)) (tries 0))
+  (let ((req (%conv-addr #x10000C88)) (tries 0) (vec nil) (area 0) (ncards 0))
     (loop
       (let* ((k (%gc-meta-scale)) (r (%gc-region-0))
              (from (%gc-meta-read r k))
-             (half (* 4096 (floor (%gc-meta-read (+ r #x10) k) 8192)))
-             (before (%gc-epoch)))
+             (size (%gc-meta-read (+ r #x10) k))
+             (half (* 4096 (floor size 8192)))
+             (before 0))
+        ;; the survivors land in the CURRENT to-space: that is the old area
+        (when cards
+          (setq area (%gc-meta-read (+ r 8) k)
+                ncards (* 16 (ceiling size 8192))
+                vec (make-array (* 5 ncards) :element-type '(unsigned-byte 8)))
+          (setq *gc-card-vector* vec))
+        (setq before (%gc-epoch))
         (%gc-write64 (+ req 8) (* 2 (+ from half)))
         (%gc-write64 (+ req 16) (* 2 half))
         (%gc-write64 req (* 2 from))
@@ -1814,7 +1906,11 @@
           (let ((probe (cons 1 2)))
             (when (/= (%gc-epoch) before) (return (car probe)))))
         (when (%gc-old-space-p)
-          (return (list (%gc-old-lo) (%gc-old-hi) half)))
+          (when cards
+            (unless (= (%gc-old-lo) area)
+              (error "GC-TENURE: the old space is not where the card table was sized for"))
+            (%gc-cards-build vec area ncards))
+          (return (list (%gc-old-lo) (%gc-old-hi) half ncards)))
         (%gc-write64 req 0)
         (setq tries (+ tries 1))
         (when (>= tries 3)

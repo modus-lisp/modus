@@ -194,11 +194,20 @@ one unsafe property, silent replacement, into a build error.  Steps 2-4 are
 what make it CL, and step 4 needs a decision first: should kernel internals
 leave `CL-USER`, and what goes in the exported `MODUS` API?
 
+## Decided
+
+- **Kernel internals get their own package, an `SB-INT` analog (user,
+  2026-10-29: "we should have our own sb-int analog").**  `MODUS-INT` holds the
+  runtime's internal names that other Modus code shares (the %-functions, the
+  seams, the board/net/thread plumbing); they leave `CL-USER`.  `MODUS` stays
+  the public extension package, `SB-EXT`'s analog (`modus:share`,
+  `modus:make-channel` already live there).  A REPL or script reaching an
+  internal writes `modus-int::name`, as an SBCL user writes `sb-int:...`.
+
 ## Open questions
 
-1. **Is `MODUS` the right user-facing package?**  What belongs in it: the
-   board, net and thread APIs?  SBCL's analogue is `SB-EXT`, which modus
-   already shims.
+1. **What exactly does `MODUS` export** beyond today's thread/channel API?
+   (Its role is settled above: the `SB-EXT` analog.)
 2. Should **step 3 static seam bindings** be a compiler feature (a direct call,
    zero cost) or plain `(setf (fdefinition …))` at boot (simple, one indirect
    call)?  Hardware drivers argue for static.

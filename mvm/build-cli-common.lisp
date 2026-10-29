@@ -239,7 +239,10 @@
   ;; string.
   (let ((p (merge-pathnames "mvm/float-slot-overrides.lisp" *modus-base*)))
     (modus.mvm::check-parses p)
-    (concatenate 'string (string #\Newline) (read-file-text p))))
+    (concatenate 'string (string #\Newline)
+                 (modus.mvm::%source-file-marker "mvm/float-slot-overrides.lisp")
+                 (read-file-text p) (string #\Newline)
+                 (modus.mvm::%source-file-trailer "mvm/float-slot-overrides.lisp"))))
 ;; STAGE 2 probe: mvm-eval = compile form to MVM bytecode + interpret it.
 ;; Closed-world (calls only resolve within the compiled module) — fine for
 ;; pure-arithmetic forms whose ops inline to MVM opcodes.
@@ -401,7 +404,8 @@
         ;; tail, so re-append it — the next chunk concatenated after this one
         ;; (*jit-coinit-source*) must not read in MODUS.MVM.X64.
         (concatenate 'string (subseq src 0 pos)
-                     modus.mvm::*build-package-reset-text*)))))
+                     modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-x64.lisp"))))))
 ;; Co-init that populates the translator's defvar lookup tables at boot AND sets
 ;; the runtime JIT globals.  Byte-for-byte the same table data the ANSI gate
 ;; installs (build-ansi-common.lisp *x64-translator-coinit-source*), plus a
@@ -617,7 +621,8 @@
         (let ((pos (search marker src)))
           (unless pos (error "CLI-JIT: could not find install-aarch64-translator strip marker"))
           (concatenate 'string (subseq src 0 pos)
-                       modus.mvm::*build-package-reset-text*))))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-aarch64.lisp")))))))
 
 ;; AArch64 co-init.  Same role as %init-x64-translator: populate the tables the
 ;; translator's defvar init-thunks would have filled (limitation #7).  Verbatim
@@ -634,6 +639,7 @@
 
 (defvar *aarch64-jit-coinit-source*
   (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
@@ -1104,8 +1110,11 @@
     ;; `chipz:' before we strip it.
     (mvm-text "lib/tar.lisp")
     (string #\Newline)
+    (modus.mvm::%source-file-marker "lib/install-tarball.lisp")
     (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
                                                        *modus-base*)))
+    (string #\Newline)
+    (modus.mvm::%source-file-trailer "lib/install-tarball.lisp")
     (string #\Newline)
     ;; SAVE-AND-DIE: heap snapshot (save-and-die PATH) and the restore that
     ;; kernel-main runs before boot init.  Lives here, not in the hosted layer,
@@ -1358,13 +1367,43 @@
 ;; runtime source and emit (puthash "NAME" *symbol-function-table*
 ;; #'NAME) calls so the runtime can resolve any defun by name.
 
+(defun %scan-in-packages (text)
+  "Positions of the (in-package X) forms that start a line in TEXT, as
+   (position . PACKAGE-NAME), in order.  Every MVM-TEXT file is wrapped in the
+   MODUS.MVM reset, so this sees each file's own package and the reset after it."
+  (let ((out nil) (pos 0))
+    (loop
+      (let ((p (search "(in-package " text :start2 pos)))
+        (unless p (return (nreverse out)))
+        (when (or (= p 0) (char= (char text (1- p)) #\Newline)
+                  (char= (char text (1- p)) #\)))
+          (let* ((s (+ p 12))
+                 (e (or (position #\) text :start s) (length text)))
+                 (tok (string-trim " \"" (subseq text s e))))
+            (when (and (> (length tok) 1) (char= (char tok 0) #\#)) (setq tok (subseq tok 1)))
+            (when (and (> (length tok) 0) (char= (char tok 0) #\:)) (setq tok (subseq tok 1)))
+            (push (cons p (string-upcase tok)) out)))
+        (setq pos (+ p 12))))))
+
+(defvar *scan-defuns-qualified* (make-hash-table :test 'equal)
+  "The \"PKG::NAME\" strings SCAN-DEFUNS produced itself.  EMIT-SFT-AUTO keys
+   those by the bare NAME, as before; a name written qualified in the source
+   (MODUS::SHARE) keeps its qualified key.")
+
 (defun scan-defuns (text)
-  "Return list of defun names (strings) found in TEXT."
+  "Return list of defun names (strings) found in TEXT.  A defun read in a
+   package other than MODUS.MVM comes back as \"PKG::NAME\", so the generated
+   #'NAME in EMIT-SFT-AUTO names the symbol the defun defined (builder packages
+   step 2: no call may rely on the bare-name fallback)."
   (let ((names nil)
-        (pos 0))
+        (pos 0)
+        (pkgs (%scan-in-packages text))
+        (pkg "MODUS.MVM"))
     (loop
       (let ((p (search "(defun " text :start2 pos)))
         (unless p (return (nreverse names)))
+        (loop while (and pkgs (< (car (first pkgs)) p))
+              do (setq pkg (cdr (pop pkgs))))
         (let* ((start (+ p 7))
                (end (or (position-if (lambda (c)
                                        (or (char= c #\Space)
@@ -1372,8 +1411,17 @@
                                            (char= c #\()
                                            (char= c #\)))) text
                                      :start start)
-                        (length text))))
-          (push (string-upcase (subseq text start end)) names)
+                        (length text)))
+               (name (string-upcase (subseq text start end))))
+          ;; A package the HOST lacks means the (in-package ...) was text
+          ;; inside a string (embedded test source), not the reader's state.
+          (push (if (or (string= pkg "MODUS.MVM") (find #\: name)
+                        (not (find-package pkg)))
+                    name
+                    (let ((q (concatenate 'string pkg "::" name)))
+                      (setf (gethash q *scan-defuns-qualified*) name)
+                      q))
+                names)
           (setq pos end))))))
 
 ;; Driver source is concatenated into the image AND scanned for
@@ -2190,7 +2238,9 @@
    test/limitations.lisp.  Unset: \"\"."
   (let ((f (sb-ext:posix-getenv "MODUS_EXTRA_SOURCE")))
     (if (and f (plusp (length f)))
-        (concatenate 'string (string #\Newline) (read-file-text f) (string #\Newline))
+        (concatenate 'string (string #\Newline) (modus.mvm::%source-file-marker f)
+                     (read-file-text f) (string #\Newline)
+                     (modus.mvm::%source-file-trailer f) (string #\Newline))
         "")))
 
 (defvar *all-runtime-source*
@@ -2283,8 +2333,13 @@
         (let ((start (* c chunk-size))
               (end (min (* (1+ c) chunk-size) (length names))))
           (loop for i from start below end
-                do (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
-                          (nth i names) (nth i names))))
+                do (let* ((n (nth i names))
+                          (bare (gethash n *scan-defuns-qualified*)))
+                     ;; The table key stays BARE (runtime lookup is by bare
+                     ;; name until builder-packages step 4); the #' names the
+                     ;; defun's own symbol.
+                     (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
+                             (or bare n) n))))
         (format out ")~%"))
       (format out "(defun %init-sft-auto ()~%")
       (dotimes (c n-chunks)
@@ -2374,7 +2429,12 @@
              (let ((token (string-upcase (subseq text start pos))))
                (unless (or (gethash token seen)
                            (zerop (length token))
-                           (every #'digit-char-p token))
+                           (every #'digit-char-p token)
+                           ;; the build's per-file marker (cross.lisp
+                           ;; %SOURCE-FILE-MARKER) compiles to nothing and is
+                           ;; not a runtime symbol; counting it renumbered the
+                           ;; whole symbol-name table
+                           (string= token "%SOURCE-FILE"))
                  (setf (gethash token seen) t)
                  (push token result))
                ;; Also register a keyword token's bare name (without the
@@ -2530,10 +2590,6 @@
     ;; WRITE-BYTE), and BEFORE *driver-source*, whose kernel-main calls
     ;; run-net-pipeline.
     *cli-bare-metal-net-source*
-    ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
-    ;; defvar; runtime macroexpand-1 references it).
-    "(defvar *sym-name-table* nil)
-"
     (string #\Newline)
     *sft-auto-source*
     (string #\Newline)

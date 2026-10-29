@@ -62,6 +62,53 @@
 (mvm-load "mvm/translate-68k.lisp")
 (mvm-load "mvm/translate-arm32.lisp")
 
+;; The image code that runs the x64 JIT is read in MODUS.MVM (mvm-eval.lisp's
+;; page translator, the %JIT-BOOT-INIT glue) and calls the assembler and the
+;; translator.  Make the names it writes unqualified READ as the symbols those
+;; packages define, so each call names the function it means and none relies
+;; on the build compiler's bare-name fallback (builder packages step 2).  Host-
+;; only: image text cannot say MODUS.ASM:LABEL-POSITION, because no build
+;; package exists in a running image yet (step 4), and the self-host image
+;; re-reads this text.  %INIT-X64-TRANSLATOR is interned here, before the
+;; co-init text that defines it is read in MODUS.ASM.
+(let ((mvm (find-package "MODUS.MVM")))
+  (dolist (s (list (find-symbol "LABEL-POSITION" "MODUS.ASM")
+                   (find-symbol "CODE-BUFFER-POSITION" "MODUS.ASM")
+                   (find-symbol "CODE-BUFFER-BYTES" "MODUS.ASM")
+                   (intern "%INIT-X64-TRANSLATOR" "MODUS.ASM")
+                   (find-symbol "TRANSLATE-MVM-TO-X64" "MODUS.MVM.X64")
+                   ;; the cross-compiling images' x86-64 target descriptor
+                   (find-symbol "EMIT-FUNCTION-PROLOGUE" "MODUS.MVM.X64")
+                   (find-symbol "EMIT-FUNCTION-EPILOGUE" "MODUS.MVM.X64")))
+    (import s mvm))
+  ;; ...and the x64 co-init, read in MODUS.ASM, asks boot-linux-x64 (MODUS.MVM)
+  ;; for the native code offset.
+  (import (intern "LINUX-X64-NATIVE-CODE-OFFSET" mvm) (find-package "MODUS.ASM"))
+  ;; GLOBALS likewise.  The build compiler keys globals by name hash, so these
+  ;; cross-package references worked by accident (and mvm-eval's bare DEFVARs
+  ;; of two translator variables were, by accident, the translator's).  Make
+  ;; each read name the variable it means (CHECK-CROSS-PACKAGE-GLOBALS).
+  (let ((x64 (find-package "MODUS.MVM.X64")) (asm (find-package "MODUS.ASM")))
+    ;; the co-init (read in MODUS.ASM) sets the translator's configuration
+    (dolist (n '("*X64-GC-REGION-PERCPU*" "*X64-NATIVE-CODE-OFFSET*" "*X64-GC-ENABLED*"
+                 "*X64-STW*" "*VREG-TO-X64*" "*JIT-XLATE-ERR-INFO*" "*X64-JIT-CONSTVEC-P*"
+                 "*X64-JIT-CONSTVEC-FULL-P*" "*X64-SCHED-LOCK-ADDR*" "*X64-TLS-WINDOW*"
+                 "*X64-LINUX-MODE*" "*WS5-FORCE-NO-KINDCHECK*" "*MCGC-KIND-BITMAP-ENABLED*"))
+      (import (find-symbol n x64) asm))
+    (dolist (n '("*HC-FAULT-FIXUP*" "*TLS-WINDOW*" "*LINUX-X64-R14-OFFSET*"))
+      (import (intern n mvm) asm))
+    ;; the cross-compiling images (aarch64 CLI, self-host) configure the x86-64
+    ;; translator from text read in MODUS.MVM
+    (dolist (n '("*X64-TLS-WINDOW*" "*X64-NATIVE-CODE-OFFSET*" "*X64-LINUX-MODE*"
+                 "*X64-JIT-CONSTVEC-P*" "*X64-JIT-CONSTVEC-FULL-P*" "*X64-GC-ENABLED*"
+                 "*WS5-FORCE-NO-KINDCHECK*" "*JIT-XLATE-ERR-INFO*"))
+      (import (find-symbol n x64) mvm))
+    ;; mvm-eval (MODUS.MVM) reads the translator's relocation lists and state
+    (dolist (n '("*X64-FN-ADDR-RELOCS*" "*X64-CALL-RELOCS*" "*X64-LI-CONST-PATCHES*"
+                 "*X64-JIT-MODE*" "*X64-CALL-RELOC-NARGS*" "*X64-LAST-GC-TRAMP-LABEL*"
+                 "*X64-JIT-SHARED-GC-TRAMP*"))
+      (import (find-symbol n x64) mvm))))
+
 ;; Cross-compilation pipeline
 (mvm-load "mvm/cross.lisp")
 
@@ -139,4 +186,4 @@
    concatenated build blob (#211, modus.mvm::*build-package-reset-text*)."
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (modus.mvm::check-parses path)
-    (modus.mvm::%build-package-scoped-source (read-file-text path))))
+    (modus.mvm::%build-package-scoped-source (read-file-text path) relative-path)))

@@ -792,8 +792,18 @@
     ((and (>= imm64 -2048) (<= imm64 2047))
      (rv-emit-addi buf rd +rv-x0+ (logand imm64 #xFFF)))
 
-    ;; Case 2: fits in signed 32-bit
-    ((and (>= imm64 (- (ash 1 31))) (<= imm64 (1- (ash 1 31))))
+    ;; Case 2: fits in signed 32-bit -- AND, on RV64, so does the LUI part
+    ;; after ADDI's rounding.  #x7FFFF800..#x7FFFFFFF round UP to LUI #x80000,
+    ;; which RV64 sign-extends to #xFFFFFFFF80000000, and the ADDI then leaves
+    ;; #xFFFFFFFF7FFFFxxx.  That is the tagged #x3FFFFFFF: RANDOM's
+    ;; (LOGAND ... #x3FFFFFFF) kept every bit above 31, the seed grew by the
+    ;; multiplier on every call, and every random float ran off past its limit
+    ;; (upstream FLOOR.3-6, SIN.2, RATIONAL.3 ... on riscv64).  Those take case 3.
+    ((and (>= imm64 (- (ash 1 31))) (<= imm64 (1- (ash 1 31)))
+          (or (not *riscv-64-bit*)
+              (let* ((lo12 (logand imm64 #xFFF))
+                     (lo12-sext (if (>= lo12 #x800) (- lo12 #x1000) lo12)))
+                (<= (- imm64 lo12-sext) (1- (ash 1 31))))))
      (let* ((lo12 (logand imm64 #xFFF))
             (lo12-sext (if (>= lo12 #x800) (- lo12 #x1000) lo12))
             (hi20 (ash (- imm64 lo12-sext) -12)))
@@ -2167,18 +2177,22 @@
          ;; Build and store header
          (rv-emit-li buf +rv-t0+ (logior (ash size-words 8) subtag))
          (rv-emit-store-word buf +rv-t0+ +rv-s8+ 0)
-         ;; Tag pointer: (rv-object-tag) -- 9 on RV64, 2 on RV32
-         (rv-emit-addi buf +rv-t0+ +rv-s8+ (rv-object-tag))
-         ;; Bump alloc pointer.  ADDI's immediate is 12 bits SIGNED, and the
-         ;; compiler inlines constant sizes up to 65535 slots: a 4096-char
-         ;; stream buffer is 16400 bytes, which ADDI silently wrapped to 16 --
-         ;; so the stream's own conses were allocated INSIDE its buffer, and
-         ;; every refill's byte count landed on character 7.
-         (if (<= total-bytes 2047)
-             (rv-emit-addi buf +rv-s8+ +rv-s8+ total-bytes)
-             (progn (rv-emit-li buf +rv-t1+ total-bytes)
-                    (rv-emit-add buf +rv-s8+ +rv-s8+ +rv-t1+)))
-         (store-result vd +rv-t0+)))
+         ;; Tag pointer: (rv-object-tag) -- 9 on RV64, 2 on RV32.  In T2: the
+         ;; zero fill below uses T0/T1.
+         (rv-emit-addi buf +rv-t2+ +rv-s8+ (rv-object-tag))
+         ;; ZERO THE PAYLOAD, then bump.  The compiler inlines (MAKE-ARRAY
+         ;; <constant>) as ALLOC-OBJ, and Lisp code relies on that array being
+         ;; zero (81c5271 zeroed ALLOC-ARRAY / ALLOC-U8 and missed this one):
+         ;; once a collection reused memory, CLOS's 256-entry generic-function
+         ;; cache (%GF-DM-FILL) came back holding stale words, one with a cons
+         ;; tag, and %FIND-GF took its CAR -- a memory fault in DEFMETHOD while
+         ;; loading the upstream suite on riscv64, riscv32 and arm32.
+         ;; T1 = the size; RV-EMIT-ALLOC-ZERO-TAIL loads it with LI, which
+         ;; covers sizes past ADDI's 12-bit immediate (a 4096-char stream
+         ;; buffer is 16400 bytes, and ADDI once wrapped it to 16).
+         (rv-emit-li buf +rv-t1+ total-bytes)
+         (rv-emit-alloc-zero-tail buf)
+         (store-result vd +rv-t2+)))
 
       (#.+op-obj-ref+
        ;; Load object slot: untag (-2), offset by (1+idx)*8 to skip header
@@ -3130,7 +3144,25 @@
 (defparameter *rv-hstack-max-depth* 21
   "Frames that fit between the stack base and #x10000C10, which is where the
    shared low-memory map puts the longjmp scratch.  21 nested handler-cases; a
-   deeper one is CAPPED (see below) rather than allowed to run off the end.")
+   deeper one is CAPPED (see below) rather than allowed to run off the end.
+   HOSTED mode moves the frames to their own region and raises this to
+   +RV-HOSTED-HSTACK-MAX-DEPTH+ (RISCV-SET-LINUX-MODE).")
+
+;;; 21 IS NOT ENOUGH FOR A HOSTED CL IMAGE.  A CATCH or HANDLER-CASE past the cap
+;;; stores no frame, and a LONGJMP discards every capped frame at once -- so a
+;;; THROW that an inner capped HANDLER-CASE passes on goes straight to the 21st
+;;; stored frame and skips its own capped CATCH.  A LOAD from inside a LOAD,
+;;; with the fasl cache recording, is deeper than 21: the cache's
+;;; %FASL-REJECT (every EVAL-WHEN, every DEFMACRO) escaped to LOAD's catch-all,
+;;; and the upstream ANSI suite could not even load its own aux files.  x86-64
+;;; holds 64 frames, i386 63, aarch64 its own page.
+(defconstant +rv-hosted-hstack-frames-offset+ #x20000
+  "Hosted: the frame area, as an offset from the heap base.  Its own region,
+   above everything the low block already holds (RV32's staged argv ends at
+   #x1E000), and below the allocator's start, so the collector's scan of the
+   whole low block still covers every saved frame.")
+(defconstant +rv-hosted-hstack-max-depth+ 256
+  "Hosted nesting depth: 256 frames x 96 bytes = #x6000, ending at #x26000.")
 
 (defparameter *rv-longjmp-scratch-addr* #x80700300  ; BARE default; riscv-set-linux-mode moves it
   "Twelve words.  LONGJMP copies the jmpbuf here BEFORE the pop overwrites it --
@@ -3148,7 +3180,7 @@
 ;;; The hosted convention slots must lie OUTSIDE the handler stack: a frame
 ;;; push writes over them silently, and they write over a live frame.
 (assert (let ((stack-lo #x10000400)
-              (stack-hi (+ #x10000408 (* +rv-jmpbuf-size+ *rv-hstack-max-depth*)))
+              (stack-hi #x10000408)
               (g *rv-hosted-globals-base*))
           (or (>= g stack-hi) (<= (+ g 16) stack-lo)))
         () "riscv: hosted globals #x~X overlap the handler stack" *rv-hosted-globals-base*)
@@ -4055,7 +4087,10 @@
           *rv-longjmp-scratch-addr* (+ base #x300)
           *rv-hstack-capped-addr*   (+ base #x360)
           *rv-hstack-depth-addr*    (+ base #x400)
-          *rv-hstack-base-addr*     (+ base #x408))))
+          *rv-hstack-base-addr*     (if on
+                                        (+ base +rv-hosted-hstack-frames-offset+)
+                                        (+ base #x408))
+          *rv-hstack-max-depth*     (if on +rv-hosted-hstack-max-depth+ 21))))
 
 (defun install-riscv-translator ()
   "Install the RISC-V translator into the target descriptor.

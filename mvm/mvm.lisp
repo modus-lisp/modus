@@ -21,6 +21,8 @@
 (defpackage :modus.mvm
   (:use :cl)
   (:export
+   ;; Called by the x64 translator (MODUS.MVM.X64, which uses this package)
+   #:%mvm-resolve-runtime-fn
    ;; Virtual registers
    #:+vreg-v0+ #:+vreg-v1+ #:+vreg-v2+ #:+vreg-v3+
    #:+vreg-v4+ #:+vreg-v5+ #:+vreg-v6+ #:+vreg-v7+

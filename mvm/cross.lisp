@@ -1942,6 +1942,23 @@
           until (eq form :eof)
           collect form)))
 
+(defun %skip-blank-and-comments (text pos)
+  "The index of the first character at or after POS in TEXT that is not
+   whitespace, a ; comment or a #| |# block -- where the next form starts."
+  (let ((n (length text)))
+    (loop
+      (cond ((>= pos n) (return pos))
+            ((member (char text pos) '(#\Space #\Tab #\Newline #\Return #\Page))
+             (incf pos))
+            ((char= (char text pos) #\;)
+             (let ((nl (position #\Newline text :start pos)))
+               (setq pos (if nl (1+ nl) n))))
+            ((and (char= (char text pos) #\#) (< (1+ pos) n)
+                  (char= (char text (1+ pos)) #\|))
+             (let ((end (search "|#" text :start2 (+ pos 2))))
+               (setq pos (if end (+ end 2) n))))
+            (t (return pos))))))
+
 (defun read-all-forms-with-locations (source-text)
   "Read all Lisp forms from SOURCE-TEXT, tracking line numbers.
    Returns (forms . line-numbers) where line-numbers is a vector
@@ -1993,7 +2010,10 @@
         (*package* (or (find-package :modus.mvm) *package*)))
     (with-input-from-string (stream source-text)
       (loop
-        (let ((pos (file-position stream)))
+        (let ((pos (%skip-blank-and-comments source-text (file-position stream))))
+          ;; The line of the form ITSELF, not of the whitespace and comments
+          ;; the reader is about to skip: a DEFUN under a header comment was
+          ;; reported at the comment's first line.
           (incf line-count (count #\Newline source-text :start prev-pos :end pos))
           (setf prev-pos pos)
           (let ((form (handler-case (read stream nil :eof)
@@ -2051,11 +2071,28 @@
    install-x64-translator tail strip, etc.): the trailing reset is cut off
    with the tail, so re-append this after the SUBSEQ.")
 
-(defun %build-package-scoped-source (text)
-  "Wrap TEXT so it reads hermetically in :MODUS.MVM.  See
-   *BUILD-PACKAGE-RESET-TEXT*.  MVM-TEXT (seven build scripts) is the only
-   caller; keep them identical."
-  (concatenate 'string *build-package-reset-text* text *build-package-reset-text*))
+(defun %source-file-marker (path)
+  "The toplevel form that tells the build compiler which file the forms after
+   it came from: %SOURCE-FILE, a no-op that only sets the file a definition and
+   a redefinition are reported against.  No newline, so it shares the file's
+   first line and every blob line number is unchanged."
+  (if path (format nil "(%source-file ~S)" (namestring path)) ""))
+
+(defun %source-file-trailer (path)
+  "The marker that closes PATH's text: whatever the blob carries next WITHOUT a
+   marker of its own (a string built in a build script, an appended override)
+   is reported as \"after:PATH:N\", N counted from here.  Without it such text
+   inherited PATH's name and reported lines past PATH's end."
+  (if path (format nil "(%source-file ~S)"
+                   (concatenate 'string "after:" (namestring path)))
+      ""))
+
+(defun %build-package-scoped-source (text &optional path)
+  "Wrap TEXT so it reads hermetically in :MODUS.MVM, marked as coming from PATH.
+   See *BUILD-PACKAGE-RESET-TEXT* and %SOURCE-FILE-MARKER.  MVM-TEXT is the
+   only caller; keep them identical."
+  (concatenate 'string *build-package-reset-text* (%source-file-marker path)
+               text *build-package-reset-text* (%source-file-trailer path)))
 
 (defun check-parses (path)
   "Verify PATH reads cleanly with SBCL's reader — errors loudly otherwise.

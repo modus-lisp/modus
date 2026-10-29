@@ -332,7 +332,11 @@
           (e1000-init)))))
 
 ;;; Default API wrappers — override these via last-defun-wins for other drivers
+(declaim (overridable e1000-send))
 (defun e1000-send (buf len) (e1000-hw-send buf len))
+(declaim (overridable e1000-receive))
 (defun e1000-receive () (e1000-hw-receive))
+(declaim (overridable e1000-rx-buf))
 (defun e1000-rx-buf () (e1000-hw-rx-buf))
+(declaim (overridable e1000-probe))
 (defun e1000-probe () (e1000-hw-probe))

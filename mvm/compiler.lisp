@@ -23,6 +23,13 @@
 
 (in-package :modus.mvm)
 
+;;; (declaim (overridable NAME ...)) marks NAME's DEFUN as a default that a
+;;; later file in the same image may replace -- a seam.  The image build
+;;; records it (%DECLAIM-NOTE-OVERRIDABLE) and reports any other redefinition
+;;; (mvm/build-checks.lisp).  SBCL only needs to know it is a declaration, for
+;;; this file and the translators that load after it.
+(declaim (declaration overridable))
+
 ;;; ============================================================
 ;;; Tagging Constants (mirror cross-compile.lisp)
 ;;; ============================================================
@@ -1429,6 +1436,19 @@
 (defvar *unresolved-calls* (make-hash-table :test 'equal)
   "Tracks unresolved function calls: name-string -> count")
 
+(defvar *global-uses* nil
+  "Host-side census, NIL unless mvm/build-checks.lisp installs a hash: for each
+   global or constant the build compiles, (PACKAGE-NAME . SYMBOL-NAME) -> the
+   kinds seen (:DEF, :REF).  *GLOBALS* and *CONSTANTS* key by name hash alone,
+   so a read of MODUS.MVM::*X* finds MODUS.MVM.X64::*X* -- builder packages
+   step 2 makes those cross-package references visible.  Emits nothing.")
+
+(defun %note-global (sym kind)
+  (when (and *global-uses* (symbolp sym) sym (not *mvm-eval-runtime-p*))
+    (let* ((p (symbol-package sym))
+           (k (cons (if p (package-name p) "") (symbol-name sym))))
+      (pushnew kind (gethash k *global-uses*)))))
+
 (defvar *globals* (make-hash-table :test 'eql)
   "Set of known global variable names (hash -> t)")
 
@@ -1654,6 +1674,17 @@
    module being compiled (one object per keyword, or EQ breaks).  Reset per
    module by MVM-COMPILE-ALL with SETQ for the reason *INIT-THUNK-NAMES* is.")
 
+(defun %init-thunk-fn-name (thunk-name)
+  "The name a DEFVAR's init thunk is COMPILED under.  At build time it is the
+   MODUS.MVM symbol INIT-ALL-GLOBALS calls it by, so the definition and the
+   call agree on the package-qualified key; as a bare string the call resolved
+   only through %FN-INFO-FOR-KEY's bare-name fallback (builder packages step 2
+   drives that fallback to zero).  Runtime mvm-eval keeps the string: its
+   thunks are called by name in the user's package."
+  (if *mvm-eval-runtime-p*
+      thunk-name
+      (intern thunk-name (or (find-package :modus.mvm) *package*))))
+
 (defvar *init-nil-thunk-names* nil
   "The subset of *INIT-THUNK-NAMES* that are a NIL-initform DEFVAR's thunk,
    which assigns only when the variable is unbound -- so calling all of them
@@ -1872,6 +1903,29 @@
    emitted code is byte-identical to before, so the ANSI images are
    untouched.")
 
+(defvar *overridable-names* (make-hash-table :test (function equal))
+  "Names a build has declared replaceable with (DECLAIM (OVERRIDABLE NAME ...)),
+   keyed by symbol name.  The declaration goes in the file that defines the
+   DEFAULT; a later DEFUN of the same name in the same image is then a seam
+   and not an accident.  Build-time only: runtime DECLAIM never records here.")
+
+(defparameter *undeclared-redefinitions* nil
+  "(name old-loc new-loc) for each redefinition in this build whose name was
+   not declared OVERRIDABLE first.  mvm/build-checks.lisp reports it and, under
+   MODUS_REDEF_CHECK=error, fails the build.")
+
+(defun %declaim-note-overridable (form)
+  "Record the names of every (OVERRIDABLE name ...) spec of a toplevel
+   DECLAIM.  Emits nothing."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)) (name-eq (car s) "OVERRIDABLE"))
+        (dolist (n (cdr s))
+          (when (and n (symbolp n))
+            (setf (gethash (symbol-name n) *overridable-names*) t)))))))
+
 (defparameter *redefinition-log* nil
   "List of (name old-loc new-loc) triples, one per silently-redefined
    defun.  Pushed by mvm-compile-function.  Build scripts should print
@@ -1937,6 +1991,13 @@
 
 (defvar *current-source-location* nil
   "Current source location string, set by mvm-compile-all for each form.")
+
+(defvar *current-source-file* nil
+  "The first-party file the forms being compiled came from, set by a toplevel
+   (%SOURCE-FILE PATH) -- the build's per-file marker (cross.lisp
+   %SOURCE-FILE-MARKER) -- with *CURRENT-SOURCE-FILE-LINE* the blob line it
+   started on.  Locations, and so every redefinition report, are FILE:LINE.")
+(defvar *current-source-file-line* 0)
 
 (defvar *arity-audit-log* nil
   "Audit trail of compile-time arity errors emitted by compile-call.
@@ -2775,6 +2836,7 @@
 ;;; Cross-package compatibility: we compare operator names as
 ;;; name hashes (dual FNV-1a), matching cross.lisp's compute-name-hash.
 
+(declaim (overridable compute-name-hash))
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a name string. 60-bit collision-resistant."
   ;; CHAR-UPCASE per character, not STRING-UPCASE of the whole name: the same
@@ -2793,6 +2855,7 @@
                             (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))
 
+(declaim (overridable ieee-float-bits))
 (defun ieee-float-bits (f)
   "Convert a double-float to its IEEE 754 bit pattern as an integer."
   (let ((hi (sb-kernel:double-float-high-bits f))
@@ -2807,8 +2870,10 @@
 ;; well inside fixnum range.  Host versions use sb-kernel; the in-image
 ;; overrides (build-generic.lisp *stage2-float-override*) read the boxed
 ;; float's slots directly via %prim-aref.
+(declaim (overridable ieee-float-hi32))
 (defun ieee-float-hi32 (f)
   (logand (sb-kernel:double-float-high-bits (float f 1.0d0)) #xFFFFFFFF))
+(declaim (overridable ieee-float-lo32))
 (defun ieee-float-lo32 (f)
   (logand (sb-kernel:double-float-low-bits (float f 1.0d0)) #xFFFFFFFF))
 
@@ -2821,24 +2886,31 @@
 ;; unreliable into bignum range.  On the host these primitives work on real
 ;; bignums, so the host versions keep computing.  See ieee-float-hi32 for the
 ;; sibling float case.
+(declaim (overridable %lit-bignum-big-p))
 (defun %lit-bignum-big-p (value)
   "T if VALUE needs the limbs-array (big) bignum shape rather than 2-slot."
   (> (integer-length (abs value)) +small-bignum-bits+))
+(declaim (overridable %lit-bn-lo))
 (defun %lit-bn-lo (value)
   "Low 62-bit limb (slot 0) of a small bignum VALUE."
   (logand value +fixnum-max+))
+(declaim (overridable %lit-bn-hi))
 (defun %lit-bn-hi (value)
   "High signed part (slot 1) of a small bignum VALUE."
   (ash value +neg-limb-bits+))
+(declaim (overridable %lit-bb-sign))
 (defun %lit-bb-sign (value) (if (< value 0) -1 1))
+(declaim (overridable %lit-bb-nlimbs))
 (defun %lit-bb-nlimbs (value)
   (let ((mag (abs value)) (n 0))
     (loop (when (= mag 0) (return n))
           (setf mag (ash mag +neg-limb-bits+)) (incf n))))
+(declaim (overridable %lit-bb-limb))
 (defun %lit-bb-limb (value k)
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
   (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
 
+(declaim (overridable normalize-name))
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
    Returns 0 for non-symbol, non-integer inputs."
@@ -3637,6 +3709,7 @@
                 (%resolve-declared-type (fifth info)))))
         (t nil)))
 
+(declaim (overridable name-eq))
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -3700,6 +3773,7 @@
 ;;; Re-key the live entries whenever the collection count changes.
 (defvar *mexp-memo-gc* -1
   "The %GC-COUNT at which *MEXP-MEMO* was last (re)keyed.")
+(declaim (overridable %mexp-memo-epoch))
 (defun %mexp-memo-epoch ()
   ;; %GC-EPOCH, not %GC-COUNT: see its docstring in gc.lisp -- an odd raw count
   ;; read as a tagged pointer killed every i386 image at its ninth collection.
@@ -3728,6 +3802,7 @@
       (when *mexp-memo* (%mexp-memo-rekey))
       (setq *mexp-memo-gc* g))))
 
+(declaim (overridable %form-key))
 (defun %form-key (form)
   "HOST stub: structural hash (collisions only cost a miss — entries are
    EQ-validated).  mvm-eval.lisp overrides with the object's address."
@@ -5476,10 +5551,7 @@
                  ;; Ordered MODUS.MVM-first so the HOST build is unchanged (and
                  ;; so SBCL is never asked to intern into its locked CL package).
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
-                                       (or (find-package "MODUS.MVM")
-                                           (and (symbolp (car place))
-                                                (symbol-package (car place)))
-                                           *package*))))
+                                       (%setter-pkg (car place)))))
                    `(,setter ,@(cdr place) ,value)))))))))
 
   ;; DEFSETF — register a setf expander.
@@ -5638,8 +5710,7 @@
                     ;; In-image-safe package (see cell-var-name): hardcoded
                     ;; :modus.mvm interns into NIL under mvm-eval → NIL head.
                     (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
-                                          (or (find-package "MODUS.MVM")
-                                              *package*))))
+                                          (%setter-pkg acc))))
                       `(,setter ,@place-args ,value-form)))))))
         `(quote ,accessor))))
 
@@ -5701,7 +5772,12 @@
     (lambda (form)
       (let ((buf (cadr form))
             (bytes (cddr form)))
-        `(progn ,@(mapcar (lambda (b) `(emit-byte ,buf ,b)) bytes)))))
+        ;; EMIT-BYTE of the package EMIT-BYTES was read in (the assembler's,
+        ;; MODUS.ASM), not this file's: builder packages step 2.
+        (let ((eb (if (and (symbolp (car form)) (symbol-package (car form)))
+                      (intern "EMIT-BYTE" (symbol-package (car form)))
+                      'emit-byte)))
+          `(progn ,@(mapcar (lambda (b) `(,eb ,buf ,b)) bytes))))))
 
   ;; LIST — expand to nested cons (MVM has no &rest)
   ;; (list) → nil, (list a) → (cons a nil), (list a b c) → (cons a (cons b (cons c nil)))
@@ -5841,12 +5917,6 @@
 
   ;; DO/DO*/DOTIMES body declarations: CLHS puts them on the implicit
   ;; binding form, so they must be hoisted above the loop's TAGBODY.
-  (defun %leading-declares (body)
-    (let ((out nil))
-      (loop while (and body (consp (car body)) (symbolp (caar body))
-                       (string= (symbol-name (caar body)) "DECLARE"))
-            do (push (car body) out) (setq body (cdr body)))
-      (nreverse out)))
   (defun %special-only-declares (body)
     "BODY's leading SPECIAL declarations, as a list of zero or one DECLARE
      form.  Only SPECIAL can move onto a binding whose initial value is a
@@ -7786,6 +7856,7 @@
       ;; Compile-time constant: fold to literal
       ((let ((const-val (gethash (normalize-name name) *constants* :not-found)))
          (unless (eq const-val :not-found)
+           (%note-global name :ref)
            ;; Quote symbol constants to prevent them being treated as variables
            (if (and (symbolp const-val)
                     (not (null const-val))
@@ -7796,6 +7867,7 @@
            t)))
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
+       (%note-global name :ref)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; mvm-eval production-eval semantics (WS3 flip): a global READ of a
            ;; name with NO binding in the symbol-value alist must signal
@@ -7821,6 +7893,7 @@
        ;; host *error-output* is stderr; in-image %init-streams now makes it a
        ;; real fd-2 stream (it used to be the stdout stream object itself).
        (format *error-output* "~&  WARN: implicit global ~A~%" name)
+       (%note-global name :ref)
        (setf (gethash (normalize-name name) *globals*) t)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
@@ -7872,7 +7945,7 @@
     "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
     "ARRAY-IN-BOUNDS-P" "FUNCALL" "%SETF-MEM-REF" "%IDIV-TRUNC"
     "IO-IN-BYTE" "XCHG-MEM" "WBINVD" "SWITCH-IDLE-STACK"
-    "MULTIPLE-VALUE-LIST" "%MAKE-CLOSURE" "SYSCALL3-RAW" "PROGN"
+    "MULTIPLE-VALUE-LIST" "%MAKE-CLOSURE" "%MAKE-CLOSURE3" "SYSCALL3-RAW" "PROGN"
     "WHEN" "DECLAIM" "LOGXOR" "RETURN-FROM"
     "ATOM" "%FLOAT-MUL" "RATIOP" "FUNCTION"
     "LET*" "UNLESS" "SAP-ADDRESS" "B"
@@ -8500,6 +8573,7 @@
               ;; …)`).  Test initform PRESENCE via (cddr form), not its value.
               (has-initform (consp (cddr form)))
               (name-hash (normalize-name var-name)))
+         (%note-global var-name :def)
          (setf (gethash name-hash *globals*) t)
          (%note-runtime-special name-hash)
          (when has-initform
@@ -9334,6 +9408,13 @@
       ((= op-name 142644612)  ; %MAKE-CLOSURE
        (when (arity-ok-p form 2 2 env dest)
          (compile-make-closure (cadr form) (caddr form) env dest)))
+      ;; (%make-closure3 fn env): the same closure plus a THIRD slot, NIL, that
+      ;; the interpreter uses to cache the closure's native trampoline (see
+      ;; %MVM-WRAP-ESCAPING in interp.lisp).  Native code reads slots 0 and 1
+      ;; only, and every collector sizes an object by its header.
+      ((= op-name #.(compute-name-hash "%MAKE-CLOSURE3"))
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-make-closure (cadr form) (caddr form) env dest 3)))
 
       ;; --- Array Operations ---
       ;; (MAKE-ARRAY N :ELEMENT-TYPE 'SINGLE-FLOAT [:INITIAL-ELEMENT 0.0]),
@@ -11780,6 +11861,37 @@
     (intern (concatenate 'string "%CELL-" base)
             (or (find-package "MODUS.MVM") *package*))))
 
+(defun %setter-pkg (acc)
+  "Package a generated SET-<ACC> writer name is interned in.  At build time,
+   ACC's own home when that is an ordinary package -- where DEFSTRUCT now puts
+   the writer it defines (*DEFSTRUCT-HOME*) -- so (setf (code-buffer-bytes b) x)
+   read in MODUS.ASM calls MODUS.ASM::SET-CODE-BUFFER-BYTES directly instead of
+   reaching it through the bare-name fallback.  A CL accessor (CHAR, AREF) and
+   all runtime compiles keep the historic order, MODUS.MVM first."
+  (let* ((p (and (symbolp acc) (symbol-package acc)))
+         (pn (and p (package-name p))))
+    (if (and (not *mvm-eval-runtime-p*) pn (not (%fn-key-ansi-pkg-p pn)))
+        p
+        (or (find-package "MODUS.MVM")
+            (and (symbolp acc) (symbol-package acc))
+            *package*))))
+
+(defvar *defstruct-home* nil
+  "Build time: the package a DEFSTRUCT being expanded was READ in, i.e. its
+   name's home package, or NIL.  The host compiles every form with *PACKAGE*
+   = MODUS.MVM, so without this a struct read in MODUS.ASM got MODUS.MVM
+   accessors and the assembler's own calls to them resolved only through the
+   bare-name fallback (builder packages step 2).")
+
+(defun %defstruct-home-pkg (name-and-options)
+  "The package DEFSTRUCT's generated names belong in at build time: the struct
+   name's home, unless that is a standard package (a struct named by a CL
+   symbol must not intern new names into COMMON-LISP)."
+  (let* ((sym (if (consp name-and-options) (car name-and-options) name-and-options))
+         (p (and (symbolp sym) (symbol-package sym)))
+         (pn (and p (package-name p))))
+    (and pn (not (%fn-key-ansi-pkg-p pn)) p)))
+
 (defun %defstruct-intern (name)
   "Intern NAME for a DEFSTRUCT-generated symbol (constructor / accessor /
    setter / predicate names AND the synthetic P-<slot> constructor params).
@@ -11800,7 +11912,7 @@
    decoder got an FFV1 struct."
   (intern name (if *mvm-eval-runtime-p*
                    *package*
-                   (or (find-package "MODUS.MVM") *package*))))
+                   (or *defstruct-home* (find-package "MODUS.MVM") *package*))))
 
 ;;; ------------------------------------------------------------
 ;;; DEFSTRUCT (:TYPE LIST) / (:TYPE VECTOR) / (:TYPE (VECTOR elt)) -- CLHS 3.4.6
@@ -13165,11 +13277,14 @@
                  (t (some (lambda (f) (%form-setqs-var-p var f (1+ depth)))
                           (cdr form))))))))
 
-(defun %form-mentions-p (syms form)
-  "T when any symbol of SYMS occurs anywhere in FORM."
+(defun %form-mentions-any-p (syms form)
+  "T when any symbol of SYMS occurs anywhere in FORM.  (It was named
+   %FORM-MENTIONS-P, as is the one-symbol test %FIRST-OPERAND-REG uses; that
+   later DEFUN won, so this guard compared INIT's subforms to the list itself
+   and never fired.)"
   (cond ((symbolp form) (and form (member form syms) t))
-        ((consp form) (or (%form-mentions-p syms (car form))
-                          (%form-mentions-p syms (cdr form))))
+        ((consp form) (or (%form-mentions-any-p syms (car form))
+                          (%form-mentions-any-p syms (cdr form))))
         (t nil)))
 
 (defun %inferred-single-local-p (var init bindings body env)
@@ -13182,7 +13297,7 @@
   (and init (consp init)
        (%expr-single-float-p init env)
        (%fp-tree-need init env)
-       (not (%form-mentions-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
+       (not (%form-mentions-any-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
                               init))
        (notany (lambda (f) (%form-setqs-var-p var f 0)) body)))
 
@@ -13667,11 +13782,13 @@
           (compile-form `(setf ,(binding-expansion binding) ,val) env dest))))
       ;; Global variable: emit call to set-symbol-value
       ((gethash (normalize-name var) *globals*)
+       (%note-global var :ref)
        (%compile-setq-global var dest))
       (t
        ;; Implicit global for setq
        ;; See the companion note at the implicit-global read site above.
        (format *error-output* "~&  WARN: implicit global setq ~A~%" var)
+       (%note-global var :ref)
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
 
@@ -25238,7 +25355,7 @@
   (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 7 +subtag-mda+))
 
-(defun compile-make-closure (fn-form env-form env dest)
+(defun compile-make-closure (fn-form env-form env dest &optional (nslots 2))
   "Compile (%make-closure fn env) — allocate a 2-slot object with
    closure subtag (#x52). Slot 0 = fn-addr (native code pointer),
    slot 1 = env (arbitrary Lisp object, usually a list of captured
@@ -25270,8 +25387,11 @@
   ;; later return whatever the kernel reused that memory for (often
   ;; another heap address — see DGMC.AND.4 SEGV trace).
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 2 +subtag-closure+)
+  (emit-ir :alloc-obj dest nslots +subtag-closure+)
   (let ((slot-temp (alloc-temp-reg)))
+    (when (> nslots 2)
+      (compile-form nil env slot-temp)
+      (emit-ir :obj-set dest 2 slot-temp))
     (emit-ir :pop slot-temp)                  ; env
     (emit-ir :obj-set dest 1 slot-temp)
     (emit-ir :pop slot-temp)                  ; fn
@@ -29780,6 +29900,9 @@
                 (new-loc (or *current-source-location* "?")))
             (format t "  NOTE: redefining ~A  (old: ~A, new: ~A)~%"
                     (function-info-name info) old-loc new-loc)
+            (unless (gethash (function-info-name info) *overridable-names*)
+              (push (list (function-info-name info) old-loc new-loc)
+                    *undeclared-redefinitions*))
             (push (list (function-info-name info) old-loc new-loc)
                   *redefinition-log*))))
       ;; Register in function table
@@ -30006,6 +30129,7 @@
             (has-initform (consp (cddr form)))
             (name-hash (normalize-name name)))
        ;; Register as global variable
+       (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
        ;; Compile as a thunk that initializes the variable
@@ -30022,7 +30146,7 @@
            (push thunk-name *init-thunk-names*)
            (when (null value) (push thunk-name *init-nil-thunk-names*))
            (mvm-compile-function
-            thunk-name nil
+            (%init-thunk-fn-name thunk-name) nil
             ;; A NIL initform is the case this arm was widened to cover, and
             ;; it is the only one that can DESTROY state: several boot steps
             ;; run BEFORE (init-all-globals) and store into a global that also
@@ -30052,6 +30176,7 @@
             (has-initform (if *mvm-eval-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable
+       (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
        (when has-initform
@@ -30059,7 +30184,7 @@
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
            (push thunk-name *init-thunk-names*)
            (mvm-compile-function
-            thunk-name nil
+            (%init-thunk-fn-name thunk-name) nil
             (list `(let ((,tmp-var ,value))
                      ,(%init-thunk-store name name-hash tmp-var))))))))
 
@@ -30073,6 +30198,11 @@
 
     ;; (in-package ...) — skip, package system is SBCL-side only
     ((and (consp form) (name-eq (car form) "IN-PACKAGE"))
+     nil)
+
+    ;; (%source-file PATH) — the build's per-file marker: mvm-compile-all reads
+    ;; it for locations; it compiles to nothing.
+    ((and (consp form) (name-eq (car form) "%SOURCE-FILE"))
      nil)
 
     ;; Package operations — no-op (flat namespace via name hashes)
@@ -30089,6 +30219,8 @@
      (%declaim-note-optimize form)
      (when (and *aot-inline* (not *mvm-eval-runtime-p*))
        (%declaim-note-inline form))
+     (unless *mvm-eval-runtime-p*
+       (%declaim-note-overridable form))
      (when *mvm-eval-runtime-p*
        (%declaim-note-inline form)
        (%declaim-note-type form)
@@ -30133,6 +30265,7 @@
                               (eq value-form t) (null value-form))
                           value-form
                           (eval value-form))))
+           (%note-global name :def)
            (setf (gethash (normalize-name name) *constants*) value)
            ;; Make available for subsequent eval calls (skip if already a constant)
            (when (and (symbolp name)
@@ -30158,7 +30291,7 @@
                    (name-hash (normalize-name name)))
                (push thunk-name *init-thunk-names*)
                (mvm-compile-function
-                thunk-name nil
+                (%init-thunk-fn-name thunk-name) nil
                 (list `(let ((,tmp-var ',value))
                          ,(%init-thunk-store name name-hash tmp-var)))))))))
      nil)
@@ -30183,8 +30316,12 @@
     ;; list or vector: expand it (see %DS-TYPED-EXPANSION) and compile that.
     ((and (consp form) (name-eq (car form) "DEFSTRUCT")
           (consp (cadr form)) (%ds-type-option (cdr (cadr form))))
-     (mvm-compile-toplevel (cons 'progn (%ds-typed-expansion form))))
+     (let ((*defstruct-home* (%defstruct-home-pkg (cadr form))))
+       (declare (special *defstruct-home*))
+     (mvm-compile-toplevel (cons 'progn (%ds-typed-expansion form)))))
     ((and (consp form) (name-eq (car form) "DEFSTRUCT"))
+     (let ((*defstruct-home* (%defstruct-home-pkg (cadr form))))
+       (declare (special *defstruct-home*))
      (let* ((name-and-options (cadr form))
             ;; Parse struct name and options
             (struct-name (if (consp name-and-options) (car name-and-options) name-and-options))
@@ -30967,7 +31104,7 @@
          (dolist (gen-form (nreverse forms-to-compile))
            (let ((result (mvm-compile-toplevel gen-form)))
              (when result (push result results))))
-         (cons :multi-result (nreverse results))))))
+         (cons :multi-result (nreverse results)))))))
 
     ;; Other top-level forms: wrap in anonymous function
     (t
@@ -31061,10 +31198,19 @@
       (handler-case
        (progn
         (setf *pending-flet-ir* nil)
-        (setf *current-source-location*
-              (if (and source-lines (< form-index (length source-lines)))
-                  (format nil "line ~D" (aref source-lines form-index))
-                  (format nil "form#~D" form-index)))
+        (let ((line (and source-lines (< form-index (length source-lines))
+                         (aref source-lines form-index))))
+          (when (and (consp form) (symbolp (car form))
+                     (string= (symbol-name (car form)) "%SOURCE-FILE")
+                     (consp (cdr form)) (stringp (cadr form)))
+            (setf *current-source-file* (cadr form)
+                  *current-source-file-line* (or line 1)))
+          (setf *current-source-location*
+                (cond ((and line *current-source-file*)
+                       (format nil "~A:~D" *current-source-file*
+                               (+ 1 (- line *current-source-file-line*))))
+                      (line (format nil "line ~D" line))
+                      (t (format nil "form#~D" form-index)))))
         (when *compile-trace*
           (format t ";; compile ~A: ~A~%"
                   *current-source-location*

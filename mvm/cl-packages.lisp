@@ -497,6 +497,7 @@
 
 
 
+(declaim (overridable %deferred-package-hook))
 (defun %deferred-package-hook (name-str)
   "A FIND-PACKAGE miss on NAME-STR: install whatever DEFERS that package and
    answer T, or answer NIL.  NIL here; the CLI image overrides it (last defun
@@ -505,6 +506,7 @@
   (declare (ignore name-str))
   nil)
 
+(declaim (overridable %force-deferred-installs))
 (defun %force-deferred-installs ()
   "Install everything still deferred.  NIL here; see %DEFERRED-PACKAGE-HOOK."
   nil)

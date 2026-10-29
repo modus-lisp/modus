@@ -523,6 +523,7 @@
 ;; PL011 flag register: RXFE (bit 4) set while the receive FIFO is empty.
 ;; A mini-UART console build replaces this (build-cl-repl-common binds it with
 ;; the console seams): checking the wrong UART never sees serial input.
+(declaim (overridable hid-serial-ready-p))
 (defun hid-serial-ready-p ()
   (zerop (logand (mem-ref #x3F201018 :u32) #x10)))
 

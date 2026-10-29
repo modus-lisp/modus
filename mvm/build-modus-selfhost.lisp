@@ -178,7 +178,8 @@
     (setf *translate-x64-source*
           ;; #211: re-append the package reset the trim just cut off.
           (concatenate 'string (subseq *translate-x64-source* 0 pos)
-                       modus.mvm::*build-package-reset-text*))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-x64.lisp")))))
 
 ;; Translator co-init: defvar/defparameter init-thunks do NOT run at boot
 ;; (CLAUDE.md item 7), so the translator's three lookup tables (*registers*,
@@ -446,7 +447,8 @@
     (setf *translate-aa64-source*
           ;; #211: re-append the package reset the trim just cut off.
           (concatenate 'string (subseq *translate-aa64-source* 0 pos)
-                       modus.mvm::*build-package-reset-text*))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-aarch64.lisp")))))
 
 ;;; --- The 4-function AArch64 encoder closure the Linux boot entry needs ---
 ;; EMIT-LINUX-AARCH64-ENTRY calls EMIT-AARCH64-U32 and EMIT-AARCH64-LOAD-IMM64,
@@ -561,6 +563,7 @@
       (write-string-serial \" first-bad=\") (print-dec bad)
       (write-char-serial 10))
     bad))
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   ;; (a) vreg -> AArch64 physical register number.  Mirrors the
   ;; *a64-vreg-to-phys* defparameter AND *target-aarch64*'s :reg-map:
@@ -1143,13 +1146,43 @@
 ;; runtime source and emit (puthash "NAME" *symbol-function-table*
 ;; #'NAME) calls so the runtime can resolve any defun by name.
 
+(defun %scan-in-packages (text)
+  "Positions of the (in-package X) forms that start a line in TEXT, as
+   (position . PACKAGE-NAME), in order.  Every MVM-TEXT file is wrapped in the
+   MODUS.MVM reset, so this sees each file's own package and the reset after it."
+  (let ((out nil) (pos 0))
+    (loop
+      (let ((p (search "(in-package " text :start2 pos)))
+        (unless p (return (nreverse out)))
+        (when (or (= p 0) (char= (char text (1- p)) #\Newline)
+                  (char= (char text (1- p)) #\)))
+          (let* ((s (+ p 12))
+                 (e (or (position #\) text :start s) (length text)))
+                 (tok (string-trim " \"" (subseq text s e))))
+            (when (and (> (length tok) 1) (char= (char tok 0) #\#)) (setq tok (subseq tok 1)))
+            (when (and (> (length tok) 0) (char= (char tok 0) #\:)) (setq tok (subseq tok 1)))
+            (push (cons p (string-upcase tok)) out)))
+        (setq pos (+ p 12))))))
+
+(defvar *scan-defuns-qualified* (make-hash-table :test 'equal)
+  "The \"PKG::NAME\" strings SCAN-DEFUNS produced itself.  EMIT-SFT-AUTO keys
+   those by the bare NAME, as before; a name written qualified in the source
+   (MODUS::SHARE) keeps its qualified key.")
+
 (defun scan-defuns (text)
-  "Return list of defun names (strings) found in TEXT."
+  "Return list of defun names (strings) found in TEXT.  A defun read in a
+   package other than MODUS.MVM comes back as \"PKG::NAME\", so the generated
+   #'NAME in EMIT-SFT-AUTO names the symbol the defun defined (builder packages
+   step 2: no call may rely on the bare-name fallback)."
   (let ((names nil)
-        (pos 0))
+        (pos 0)
+        (pkgs (%scan-in-packages text))
+        (pkg "MODUS.MVM"))
     (loop
       (let ((p (search "(defun " text :start2 pos)))
         (unless p (return (nreverse names)))
+        (loop while (and pkgs (< (car (first pkgs)) p))
+              do (setq pkg (cdr (pop pkgs))))
         (let* ((start (+ p 7))
                (end (or (position-if (lambda (c)
                                        (or (char= c #\Space)
@@ -1157,8 +1190,17 @@
                                            (char= c #\()
                                            (char= c #\)))) text
                                      :start start)
-                        (length text))))
-          (push (string-upcase (subseq text start end)) names)
+                        (length text)))
+               (name (string-upcase (subseq text start end))))
+          ;; A package the HOST lacks means the (in-package ...) was text
+          ;; inside a string (embedded test source), not the reader's state.
+          (push (if (or (string= pkg "MODUS.MVM") (find #\: name)
+                        (not (find-package pkg)))
+                    name
+                    (let ((q (concatenate 'string pkg "::" name)))
+                      (setf (gethash q *scan-defuns-qualified*) name)
+                      q))
+                names)
           (setq pos end))))))
 
 ;; Driver source is concatenated into the image AND scanned for
@@ -1915,8 +1957,13 @@
         (let ((start (* c chunk-size))
               (end (min (* (1+ c) chunk-size) (length names))))
           (loop for i from start below end
-                do (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
-                          (nth i names) (nth i names))))
+                do (let* ((n (nth i names))
+                          (bare (gethash n *scan-defuns-qualified*)))
+                     ;; The table key stays BARE (runtime lookup is by bare
+                     ;; name until builder-packages step 4); the #' names the
+                     ;; defun's own symbol.
+                     (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
+                             (or bare n) n))))
         (format out ")~%"))
       (format out "(defun %init-sft-auto ()~%")
       (dotimes (c n-chunks)
@@ -2006,7 +2053,12 @@
              (let ((token (string-upcase (subseq text start pos))))
                (unless (or (gethash token seen)
                            (zerop (length token))
-                           (every #'digit-char-p token))
+                           (every #'digit-char-p token)
+                           ;; the build's per-file marker (cross.lisp
+                           ;; %SOURCE-FILE-MARKER) compiles to nothing and is
+                           ;; not a runtime symbol; counting it renumbered the
+                           ;; whole symbol-name table
+                           (string= token "%SOURCE-FILE"))
                  (setf (gethash token seen) t)
                  (push token result))
                ;; Also register a keyword token's bare name (without the
@@ -2127,10 +2179,6 @@
     (string #\Newline)
     *stage2-test-source*
     (string #\Newline)
-    ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
-    ;; defvar; runtime macroexpand-1 references it).
-    "(defvar *sym-name-table* nil)
-"
     (string #\Newline)
     *sft-auto-source*
     (string #\Newline)

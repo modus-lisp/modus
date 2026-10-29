@@ -369,6 +369,7 @@
           (write-object expecteds))
         (write-char-serial 10))))
 
+(declaim (overridable do-tests))
 (defun do-tests ()
   "Print test summary. Returns fail count (0 = all pass)."
   (write-char-serial 10)

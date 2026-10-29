@@ -178,7 +178,10 @@
 (defun %rpi-net-text (rel)
   (let ((p (merge-pathnames rel (merge-pathnames "net/" *modus-base*))))
     (modus.mvm::check-parses p)
-    (read-file-text p)))
+    (let ((name (concatenate 'string "net/" rel)))
+      (concatenate 'string (modus.mvm::%source-file-marker name)
+                   (read-file-text p)
+                   (string #\Newline) (modus.mvm::%source-file-trailer name)))))
 
 (defvar *pc-console-p*
   (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))
@@ -445,6 +448,7 @@
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     (if *cl-repl-rpi-p*
         "
+(declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
 "
         "")
@@ -559,6 +563,7 @@
 ;; What a restored core runs before the REPL (see *cli-arch-core-resume*): a
 ;; function designator, set just before SAVE-AND-DIE so the heap carries it.
 (defvar *core-restart-hook* nil)
+(declaim (overridable %core-addr))
 (defun %core-addr () #x18000000)
 ;; NARROW STRINGS ON (prelude.lisp %NARROW-STRINGS-P): the aarch64 collector
 ;; sizes #x13 as bytes, so the reader makes them.  Last definition wins.
@@ -1447,7 +1452,8 @@
         ;; `= VALUE' line, so a client can read lines a function writes (the
         ;; attestation report from SNP-ATTEST-SSH is 19 of them) and not only
         ;; the value.  Serial no longer sees that output; it is the session's.
-        "(defun ssh-eval-line (ssh cmd cmd-len)
+        "(declaim (overridable ssh-eval-line))
+(defun ssh-eval-line (ssh cmd cmd-len)
   (let ((s (make-string cmd-len)) (out nil))
     (dotimes (i cmd-len) (aset s i (code-char (aref cmd i))))
     (let ((result (handler-case
@@ -2332,6 +2338,7 @@
                               (not (string= v "0"))
                               chain)))))
         (format nil "
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)

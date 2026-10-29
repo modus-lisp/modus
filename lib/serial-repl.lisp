@@ -81,7 +81,9 @@
 
 ;; Console seams.  A board with another input device (net/usb-hid-split.lisp)
 ;; overrides these by last-defun-wins; everywhere else input is the serial port.
+(declaim (overridable %console-init))
 (defun %console-init () nil)
+(declaim (overridable %console-read-char))
 (defun %console-read-char () (read-char-serial))
 
 (defun %srepl-read-form-text ()

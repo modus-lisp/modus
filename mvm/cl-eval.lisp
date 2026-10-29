@@ -56,30 +56,44 @@
    ran before this branch handled CL syms — preserves crash-or-recovery
    behavior for unbound symbols).
 
-   Tries the hash-keyed *native-sym-function-table* first, then falls
-   back to the NAME-keyed *symbol-function-table* via %sym-name-or-hash
-   — the same tier order symbol-function uses.  Opcode-backed functions
+   Tries the NAME-keyed *symbol-function-table* (via %sym-name-or-hash)
+   first, then the hash-keyed *native-sym-function-table* — the tier order
+   symbol-function uses.  Opcode-backed functions
    like < / > / = are registered by NAME only, so without the fallback
    (funcall '< 1 2) fell through to CALL-INDIRECT on the symbol itself:
    \"MVM: CALL-IND with non-callable target\" — uiop's lexicographic<
    (funcall element< …) with element< = '< , i.e. version<= /
    version-deprecation, asdf gauntlet forms 112/233/236."
-  (let ((h (aref sym 0)))
-    (let ((fn (if *native-sym-function-table*
-                  (gethash h *native-sym-function-table*)
-                  nil)))
-      (if fn
-          fn
-          (let ((nh (%sym-name-or-hash sym)))
-            (let ((nfn (and nh
-                            (> (length (car nh)) 0)
-                            *symbol-function-table*
-                            (gethash (car nh) *symbol-function-table*))))
-              ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
-              ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here
-              ;; made (funcall 'undefined ...) call the symbol itself and
-              ;; fault -- a MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
-              (if nfn nfn (symbol-function sym))))))))
+  ;; NAME FIRST, as SYMBOL-FUNCTION does.  Slot 0 is the hash of the bare
+  ;; NAME, so the hash table answers for every symbol so spelled: a package
+  ;; that shadows STRING-EQUAL and DEFUNs its own got CL's from (funcall 'its
+  ;; ...) while (its ...) and (apply 'its ...) reached its own -- TI's
+  ;; Explorer source, whose ZLC:STRING-EQUAL takes positional indices, saw
+  ;; CL's signal a type error at every call by symbol.  A runtime-born
+  ;; package's symbol keys the name table by PKG::NAME (memoised), so the
+  ;; name lookup is the one that tells the two apart.
+  ;; A native symbol (hash only) and a symbol of COMMON-LISP itself are the
+  ;; ones the bare hash names exactly, and (funcall '+ ...) is hot: those keep
+  ;; the hash-first order, which skips building the name.
+  (let* ((by-hash (and *native-sym-function-table*
+                       (or (not (%cl-sym-p sym))
+                           ;; CAR's home, read off a literal: FIND-PACKAGE per
+                           ;; call cost more than the name lookup it saves.
+                           (eq (%cl-sym-package sym) (%cl-sym-package 'car)))
+                       (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))
+         (nh (and (not by-hash) (%sym-name-or-hash sym)))
+         (fn (or by-hash
+                 (and nh
+                      (> (length (car nh)) 0)
+                      *symbol-function-table*
+                      (%fn-entry (gethash (car nh) *symbol-function-table*)))
+                 (and *native-sym-function-table*
+                      (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))))
+    ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
+    ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here made
+    ;; (funcall 'undefined ...) call the symbol itself and fault -- a
+    ;; MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
+    (if fn fn (symbol-function sym))))
 
 ;;; A runtime-born package's symbol keys the function tables by its
 ;;; package-qualified name; building and hashing that string was most of a

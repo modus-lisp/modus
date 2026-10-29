@@ -131,6 +131,57 @@
                    (and (>= caught 1) (= after 0))
                    (format nil "raw store: ~d, barriered store: ~d" caught after))))))
 
+(defvar *gen-rounds* 60)
+
+(defun gen-churn-rounds (from to)
+  (let ((dmax 0) (cbad 0))
+    (loop for round from from below to
+          do (gen-store-young round)
+             (gen-churn 20000)
+             (gen-collect)
+             (setq dmax (max dmax (%gc-old-dangling))
+                   cbad (max cbad (second (%gc-card-audit)))))
+    (setq *gen-rounds* to)
+    (list dmax cbad)))
+
+(defun gen-stage3 ()
+  "Promotion and the major collection."
+  (let ((rep (gc-gen-report)))
+    (gen-check "survivors were PROMOTED into the old space"
+               (> (getf rep :promoted) 0.0) (format nil "~s" rep)))
+  (let* ((old0 (- (%gc-old-hi) (%gc-old-lo)))
+         (t0 (get-internal-real-time))
+         (old1 (gc-major))
+         (ms (/ (* 1000.0 (- (get-internal-real-time) t0)) internal-time-units-per-second))
+         (au (%gc-old-audit)))
+    (gen-check "a major collection reclaimed old garbage"
+               (and (= 1 (getf (gc-gen-report) :majors)) (< old1 old0))
+               (format nil "old ~,1f -> ~,1f MB in ~,1f ms" (/ old0 1048576.0) (/ old1 1048576.0) ms))
+    (gen-check "after the major: the old space parses, nothing dangles, cards hold"
+               (and (= 0 (third au)) (= 0 (second au)) (= 0 (second (%gc-card-audit))))
+               (format nil "~d objects" (first au)))
+    (gen-check "after the major: every structure intact" (gen-verify *gen-rounds*)))
+  (let ((r (gen-churn-rounds *gen-rounds* (+ *gen-rounds* 60))))
+    (gen-check "60 more rounds after the major: intact, nothing dangling, cards hold"
+               (and (gen-verify *gen-rounds*) (= 0 (first r)) (= 0 (second r)))
+               (format nil "~s ~s" r (gc-gen-report))))
+  (let ((r (gen-churn-rounds *gen-rounds* (+ *gen-rounds* 3))))
+    (gc-major)
+    (gen-check "a second major, then everything again"
+               (and (gen-verify *gen-rounds*) (= 0 (first r)) (= 0 (second (%gc-card-audit)))
+                    (= 2 (getf (gc-gen-report) :majors)))
+               (format nil "~s" (gc-gen-report))))
+  ;; AUTOMATIC majors: a reserve just above the room left, so the next
+  ;; collection that promotes must ask for a major and do it, without GC-MAJOR.
+  (let ((majors (getf (gc-gen-report) :majors)))
+    (gc-gen-reserve (+ (%gc-old-room) 1))
+    (let ((r (gen-churn-rounds *gen-rounds* (+ *gen-rounds* 10))))
+      (gc-gen-reserve 0)
+      (gen-check "running short of old room triggers a major by itself"
+                 (and (> (getf (gc-gen-report) :majors) majors)
+                      (gen-verify *gen-rounds*) (= 0 (first r)) (= 0 (second r)))
+                 (format nil "~s" (gc-gen-report))))))
+
 (defun gen-run ()
   (gen-build-old)
   (gen-check "no old space before tenure" (not (%gc-old-space-p)))
@@ -138,9 +189,10 @@
          (r (gc-tenure :cards *gen-cards*))
          (ms (- (get-internal-real-time) t0)))
     (gen-check "gc-tenure made an old space" (%gc-old-space-p)
-               (format nil "old [~x, ~x) = ~,1f MB, young 2 x ~,1f MB, ~d ms"
+               (format nil "old [~x, ~x) = ~,1f MB, young 2 x ~,1f MB, ~,1f ms"
                        (first r) (second r) (/ (- (second r) (first r)) 1048576.0)
-                       (/ (third r) 1048576.0) ms))
+                       (/ (third r) 1048576.0)
+                       (/ (* 1000.0 ms) internal-time-units-per-second)))
     (let ((au (%gc-old-audit)))
       (gen-check "the old space parses object by object, end to end"
                  (= 0 (third au)) (format nil "~d objects, bad at ~x" (first au) (third au))))
@@ -193,9 +245,16 @@
                    (and (> (%gc-stat-count) n) (< young (floor old 4)))
                    (format nil "~,2f MB copied vs ~,1f MB old"
                            (/ young 1048576.0) (/ old 1048576.0))))))
-  (gen-check "save-image refuses while there is an old space"
-             (handler-case (progn (%save-image "/nonexistent/x.core") nil)
-               (error (e) (search "OLD SPACE" (princ-to-string e)))))
+  (when (and *gen-cards* (not *gen-control*))
+    (gen-stage3))
+  (gen-check "save-image first puts the old space back into one semispace"
+             (progn (handler-case (%save-image "/nonexistent/x.core") (error () nil))
+                    (and (not (%gc-old-space-p)) (not (%gc-cards-on-p))
+                         (gen-verify *gen-rounds*)))
+             "(the write itself fails: the path does not exist)")
+  (gen-collect) (gen-collect)
+  (gen-check "after un-tenure, ordinary collections keep everything"
+             (gen-verify *gen-rounds*))
   (format t "~a: ~d checks, ~d failed~%"
           (if *gen-control* "CONTROL" "GC-TENURE") *gen-checks* *gen-fails*))
 

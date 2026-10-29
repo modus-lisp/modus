@@ -1796,6 +1796,20 @@
    never moves.  Kept here so it stays live.")
 
 (defun %gc-card-words () (%conv-addr #x10000CE0))
+(defun %gc-card-root () (%conv-addr #x10000D88))
+
+;;; The card vector's first 128 bytes are the generational META (raw words;
+;;; see translate-aarch64's STAGE 3 note): capacity, area size, survivor mark,
+;;; major state, promotion failures, majors done, bytes promoted, promotion
+;;; on, reserve.
+(defun %gc-gen-meta ()
+  "Raw address of the meta words, or NIL without a card vector.  Found through
+   the root word every time: a major collection moves the vector."
+  (let ((v (%gc-read64 (%gc-card-root))))
+    (if (= 0 v) nil (+ v 7))))
+
+(defun %gc-gen-meta-ref (i)
+  (let ((m (%gc-gen-meta))) (if m (%gc-read64 (+ m (* 8 i))) 0)))
 (defun %gc-cards-on-p () (/= 0 (%gc-read64 (%gc-card-words))))
 
 (defun %gc-old-object-size (a page cbm)
@@ -1805,21 +1819,27 @@
       (let ((h (mem-ref a :u32)))
         (%census-size (logand h 255) (ash h -8)))))
 
-(defun %gc-cards-build (vec area ncards)
+(defun %gc-cards-build (vec area ncards area-size promote)
   "Point the card words at VEC (now in the old space): cards at its data,
    all DIRTY (the vector is zeroed), crossing after them, filled by one walk
    of [old_lo, old_hi).  The card base is written LAST: it switches on both
    the barrier and the collector's card scan, and every card being dirty
    makes the first card-scanning collection as complete as a full walk."
   (let* ((w (%gc-card-words))
-         (data (let ((scratch (%conv-addr #x10000C88)))   ; not w: a card base
+         (meta (let ((scratch (%conv-addr #x10000C88)))   ; not w: a card base
                  (prog1 (+ (%gc-word-of vec scratch) 7)  ; of a tagged word would
                    (%gc-write64 scratch 0))))             ; switch the scan on
+         (data (+ meta 128))
          (cross (+ data ncards))
          (k (%gc-meta-scale))
          (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
          (a (%gc-old-lo)) (end (%gc-old-hi)))
     (%gc-write64 w 0)
+    (%gc-write64 meta ncards)
+    (%gc-write64 (+ meta 8) area-size)
+    (%gc-write64 (+ meta 16) 0)
+    (%gc-write64 (+ meta 56) (if promote 1 0))
+    (setf (mem-ref (%gc-card-root) :u64) vec)
     (loop
       (when (>= a end) (return nil))
       (let* ((size (%gc-old-object-size a page cbm))
@@ -1871,13 +1891,15 @@
    collector keeps scanning only dirty cards."
   (%gc-write64 (+ (%gc-card-words) 16) 0))
 
-(defun gc-tenure (&key (cards t))
+(defun gc-tenure (&key (cards t) (promote t))
   "Make everything live in region 0 now an OLD SPACE that collections scan and
    never copy, and continue on two young semispaces of half the old size, cut
    from the semispace this collection reclaims.  Call it once, after boot.
    With CARDS (the default) old objects are tracked by a card table and a
    write barrier, so a collection scans only the old cards stored into since;
-   without, every collection walks the whole old space.
+   without, every collection walks the whole old space.  With PROMOTE (needs
+   CARDS) an object surviving two collections joins the old space, and a MAJOR
+   collection reclaims old garbage when the old area runs short of room.
    Returns (OLD-LO OLD-HI YOUNG-SIZE NCARDS).  Region 0 must be the active region."
   (when (%gc-old-space-p)
     (error "GC-TENURE: region 0 already has an old space [~X, ~X)"
@@ -1895,7 +1917,7 @@
         (when cards
           (setq area (%gc-meta-read (+ r 8) k)
                 ncards (* 16 (ceiling size 8192))
-                vec (make-array (* 5 ncards) :element-type '(unsigned-byte 8)))
+                vec (make-array (+ 128 (* 5 ncards)) :element-type '(unsigned-byte 8)))
           (setq *gc-card-vector* vec))
         (setq before (%gc-epoch))
         (%gc-write64 (+ req 8) (* 2 (+ from half)))
@@ -1909,12 +1931,68 @@
           (when cards
             (unless (= (%gc-old-lo) area)
               (error "GC-TENURE: the old space is not where the card table was sized for"))
-            (%gc-cards-build vec area ncards))
+            (%gc-cards-build vec area ncards size promote))
           (return (list (%gc-old-lo) (%gc-old-hi) half ncards)))
         (%gc-write64 req 0)
         (setq tries (+ tries 1))
         (when (>= tries 3)
           (error "GC-TENURE: the collector did not take the request (only the AArch64 native collector tenures)"))))))
+
+(defun %gc-gen-request (state what)
+  "Post major STATE (1 major, 4 un-tenure), force collections until the
+   collector has finished it (state back to 0), and return the meta."
+  (unless (%gc-gen-meta)
+    (error "~A: region 0 has no card table (GC-TENURE first)" what))
+  (unless (= (%gc-region) (%gc-region-0))
+    (error "~A: region 0 is not the active region" what))
+  (%gc-write64 (+ (%gc-gen-meta) 24) state)
+  (let ((tries 0))
+    (loop
+      (let ((before (%gc-epoch)))
+        (loop
+          (set-alloc-limit (get-alloc-ptr))
+          (let ((probe (cons 1 2)))
+            (when (/= (%gc-epoch) before) (return (car probe))))))
+      (when (or (null (%gc-gen-meta)) (= 0 (%gc-gen-meta-ref 3)))
+        (return t))      ; done -- or refused for room; the caller checks which
+      (setq tries (+ tries 1))
+      (when (>= tries 8)
+        (error "~A: the collector did not finish it (state ~D)" what (%gc-gen-meta-ref 3))))))
+
+(defun gc-major ()
+  "Collect the OLD space too: promote everything young, then copy the whole
+   old area into the young semispace and tenure it there.  Returns the old
+   space's size after.  Needs one semispace of room, like any full collection."
+  (%gc-gen-request 1 "GC-MAJOR")
+  (- (%gc-old-hi) (%gc-old-lo)))
+
+(defun gc-untenure ()
+  "Back to one ordinary semispace pair (what SAVE-IMAGE needs): a major that
+   ends with no old space and no card table."
+  (when (%gc-old-space-p)
+    (%gc-gen-request 4 "GC-UNTENURE"))
+  (when (%gc-old-space-p)
+    (error "GC-UNTENURE: the old space does not fit in the young semispace"))
+  (setq *gc-card-vector* nil)         ; or a saved core carries the dead table
+  t)
+
+(defun gc-gen-reserve (bytes)
+  "A major is due when the old area's free room falls below max(BYTES, twice a
+   collection's young survivors).  0 restores the default, 4 MB."
+  (%gc-write64 (+ (%gc-gen-meta) 64) bytes)
+  bytes)
+
+(defun %gc-old-room ()
+  "Bytes the old area can still take by promotion."
+  (- (+ (%gc-read64 (+ (%gc-card-words) 8)) (%gc-gen-meta-ref 1)) (%gc-old-hi)))
+
+(defun gc-gen-report ()
+  "(:old MB :promoted MB :majors N :failures N :state S), or NIL."
+  (when (%gc-gen-meta)
+    (list :old (/ (- (%gc-old-hi) (%gc-old-lo)) 1048576.0)
+          :promoted (/ (%gc-gen-meta-ref 6) 1048576.0)
+          :majors (%gc-gen-meta-ref 5) :failures (%gc-gen-meta-ref 4)
+          :state (%gc-gen-meta-ref 3))))
 
 ;;; ============================================================
 ;;; Per-region acceptance harness

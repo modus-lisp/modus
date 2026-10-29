@@ -223,8 +223,9 @@
    the 4 KB metadata window, the live heap range and the two bitmap slices.
    Returns the number of live heap bytes saved.  Refuses while the JIT is on
    (see the file header)."
-  (when (%gc-old-space-p)
-    (error "save-image: region 0 has an OLD SPACE (GC-TENURE); a core is one contiguous range and would lose it"))
+  ;; A core is ONE contiguous range: an old space (GC-TENURE) goes back into an
+  ;; ordinary semispace first.
+  (when (%gc-old-space-p) (gc-untenure))
   (when (%core-jit-lossy-p)
     (error "save-image: the JIT produced code pages this process cannot snapshot (no fixed exec arena); (setq *use-jit* nil) before loading what you want baked"))
   (finish-output)

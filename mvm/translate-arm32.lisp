@@ -1039,7 +1039,17 @@
 (defun arm32-lj-scratch-addr () (+ (arm32-hbase) #x300))
 (defun arm32-hcapped-addr ()    (+ (arm32-hbase) #x360))
 (defun arm32-hdepth-addr ()     (+ (arm32-hbase) #x400))
-(defun arm32-hframes-addr ()    (+ (arm32-hbase) #x408))
+;;; HOSTED, 46 was not enough either: the upstream ANSI suite's own loader
+;;; (COMPILE-AND-LOAD* of each aux file, inside LOAD inside LOAD) nests deeper,
+;;; and every aux file's %FASL-REJECT / COMPILE-FILE throw escaped as
+;;; %THROW-IN-FLIGHT -- the suite never finished loading on arm32 (all 28
+;;; shards timed out with zero tests run).  The hosted layout keeps its frames
+;;; in their own region at heap+#x20000, below the allocator's start (#x28000,
+;;; boot-linux-arm32), so the collector's scan of the low block still covers
+;;; them -- RISC-V's layout.  255 because the depth compare takes an 8-bit
+;;; immediate.  Bare (*arm32-globals-base*) keeps the 46 above.
+(defun arm32-hstack-max-depth () (if (arm32-hosted-layout-p) 255 *arm32-hstack-max-depth*))
+(defun arm32-hframes-addr ()    (+ (arm32-hbase) (if (arm32-hosted-layout-p) #x20000 #x408)))
 (defconstant +arm32-r1-r3+ (logior (ash 1 1) (ash 1 2) (ash 1 3)))
 
 (defun arm32-emit-copy-words (buf from to)
@@ -1060,7 +1070,7 @@
     (arm32-push buf +arm32-r1-r3+)
     (arm32-load-imm32 buf +arm-r3+ (arm32-hdepth-addr))
     (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
-    (arm32-cmp-imm buf +arm-r2+ 0 *arm32-hstack-max-depth*)
+    (arm32-cmp-imm buf +arm-r2+ 0 (arm32-hstack-max-depth))
     (arm32-b-cond buf +arm-cc-ge+ capped)
     (arm32-emit-frame-addr buf +arm-r1+ +arm-r2+)
     (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))

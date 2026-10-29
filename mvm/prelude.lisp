@@ -2586,6 +2586,13 @@
 ;;; as slow as before.  So does every image whose %GC-REGION is unresolved.
 ;;; Numbers stay :NOHASH: EQL compares them by value.
 
+(defun %target-big-endian-p ()
+  "T on a big-endian target (68k, PowerPC).  For code compiled without the
+   constant preamble (runtime-cl-macros.lisp), which cannot name the folded
+   +TARGET-BIG-ENDIAN+ itself.  Here, first in every blob, so no caller is a
+   forward reference."
+  (eql +target-big-endian+ 1))
+
 (defun %ht-addr-cell (ht)
   "The (EPOCH) cell of a MAKE-HASH-TABLE-ARGS table, or NIL for any other."
   (let ((r (cdr (cdr (cdr (cdr (cdr (cdr (cdr ht)))))))))

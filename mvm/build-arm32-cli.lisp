@@ -57,6 +57,12 @@
 ;;; Scratch pages below the allocator (heap+#x20000): cstr at #x10001000
 ;;; (rename uses +2048), the 4 KB I/O page at #x10002000 -- RV32's layout.
 (defvar *cli-arch-io-scratch-source* "  (setq *cstr-scratch* #x10001000)
+  ;; getdents64 scratch: cl-fileio's default is a fixed #x1DD00000, which on
+  ;; this layout is INSIDE the heap (it starts at #x10000000 and reaches
+  ;; #x1F800000), so listing a directory wrote dirents over live objects --
+  ;; found when the 68k CLI died in install-tarball, in a directory with a
+  ;; thousand entries.  4 KB is all it uses.
+  (setq *%dirent-buf-addr* #x10003000)
   (setq *io-buf-addr*  #x10002000)
   (setq *scratch-mmapped* t)
 ")

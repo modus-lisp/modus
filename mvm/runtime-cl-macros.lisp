@@ -750,13 +750,17 @@
           ;; encodings.  (:utf-8 / :utf-8b have no reader conditionals and
           ;; were the two that survived.)
           ;;
-          ;; Every consumer of this file is little-endian: x86-64 (generic,
-          ;; generic-cli, x64-cl-repl, modus-selfhost) and i386 (i386-cli).
-          ;; A big-endian target (ppc/ppc32/68k) must push :BIG-ENDIAN in
-          ;; its own boot path instead of loading this default.
+          ;; %TARGET-BIG-ENDIAN-P (interp.lisp) answers from the folded
+          ;; +TARGET-BIG-ENDIAN+, so the 68k and PowerPC CLIs say :BIG-ENDIAN
+          ;; (this used to assume every consumer was little-endian, and 68k
+          ;; advertised the wrong byte order to every #+big-endian in every
+          ;; library).  A FUNCTION, not the constant: this file is compiled
+          ;; without the width/endianness preamble, where the constant is an
+          ;; unbound global.
           (unless (or (member :little-endian *features*)
                       (member :big-endian *features*))
-            (setq *features* (cons :little-endian *features*)))
+            (setq *features* (cons (if (%target-big-endian-p) :big-endian :little-endian)
+                                   *features*)))
           ;; Advertise :modus so UIOP recognises this implementation.  The
           ;; vendored asdf.lisp guards its "ASDF is not supported on your
           ;; implementation" hard error with

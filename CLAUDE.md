@@ -646,6 +646,76 @@ architecture that got it right; it now reads the rung's header like
 
 All builds: `sbcl --script <build-script>`
 
+### The 68k FULL CL image runs (`mvm/build-68k-cli.lisp`) — the first big-endian CL
+
+`sbcl --dynamic-space-size 12288 --script mvm/build-68k-cli.lisp` (output
+`MODUS_CLI_OUT`, default `/tmp/modus-68k-cli`; run with `qemu-m68k-static`, JIT
+off).  It is cut from `build-arm32-cli.lisp`; the arch slots are the Linux/m68k
+facts measured with `qemu -strace`: `exit_group` 247, `clock_gettime` 260,
+`getdents64` 220, `stat64` 195 / `fstat64` 197 with `st_size` low word at +44 and
+`st_mtime` at +68.  Bringing it up found five defects that every big-endian or
+68k image had and nothing had executed before:
+
+- **The INTERPRETER assembled `mem-ref` little-endian** (`mvm/interp.lisp`'s
+  `mem-read`/`mem-write`), and so did the in-image compiler's `:u32` split: an
+  interpreted `(setf (mem-ref a :u32) #x12345678)` wrote `78 56 34 12`.
+  `*TARGET-BIG-ENDIAN-P*` is a host special -- the image inherits its NIL
+  default (the DDC rule) -- so byte order is now also the folded
+  `+TARGET-BIG-ENDIAN+`, injected with the fixnum widths
+  (`target.lisp`'s constant preamble).  **A `setq` of the special from the build
+  script does not reach the image's compiler; a folded constant does.**  It is
+  **0 or 1, never NIL/T**: the constant table cannot tell a NIL-valued constant
+  from an absent one, so a NIL constant silently compiles as an (unbound)
+  global read -- measured, it was an implicit-global warning on every x64 build.
+  Code compiled without the preamble (runtime-cl-macros) asks
+  `%TARGET-BIG-ENDIAN-P` (prelude) instead.
+- **`*features*` said `:LITTLE-ENDIAN`** on every big-endian CLI
+  (`runtime-cl-macros.lisp` assumed every consumer was little-endian).
+- **Function entries were 12 mod 16 in memory.**  translate-68k pads entries to
+  16 relative to its BUFFER; the entry `BRA.L` in `cross.lisp` did not pad the
+  buffer's start, and the CL image's larger boot stub left it at 12.  So every
+  `#'NAME` tagged as `#x...F` -- **the forwarding tag** -- and the first
+  collection read the car of a cons holding one as a forwarding pointer.
+  `*GF-STUB-CLOSURES*` became a pointer into code, after which every
+  `FUNCTIONP` (so every `DOLIST`, every printed list of two) signalled
+  `TYPE-ERROR #<?0>`.  The jump now pads with NOPs to a 16-byte VIRTUAL
+  boundary, as RISC-V's does.  Found by watching the 24 registrations go in as
+  `#x...CF` with gdb, then the one collection.
+- `obj-subtag` must answer 0 for a non-object (GENERIC-ADD asks it of fixnums),
+  and the float group (`fsqrt`, `fround32`, `alloc-f32`, `f32-load/store`) was
+  missing; the long-branch forms (`BRA.L`/`BSR.L`/`Bcc.L`) replace 16-bit
+  displacements, which a 42 MB image overflows.
+- **Not 68k at all: the deferred surfaces' keywords had no names.**
+  `*deferred-surfaces-source*` is outside `*all-runtime-source*` so the defun
+  scanner does not mine it, and so `scan-symbol-names` never saw `:GENERA`,
+  `:SB-THREAD` &c.: eleven features printed as `:||` on arm32 too.  It is now
+  scanned for names only.
+
+- **`*%DIRENT-BUF-ADDR*` was a fixed `#x1DD00000`**, inside the heap on the
+  32-bit layouts (68k and arm32 heaps reach `#x1F800000`): every `DIRECTORY`
+  wrote dirents over live objects.  68k and arm32 now use `#x10003000` in the
+  low block.  (i386 calls syscall 217 there -- `pivot_root` -- so its
+  `DIRECTORY` returns nothing rather than corrupting; separate bug, open.)
+
+**STILL OPEN -- the 68k CL image breaks after its SECOND collection.**  Boot
+collects once; the first collection after it (into the LOW semispace again)
+leaves a heap my gdb verifiers find fully consistent -- every slot, cons and
+stack word, kind bytes matching tags, nothing pointing at the evacuated space
+-- and soon after, small bignums appear whose `lo` slot is a tagged fixnum
+with bit 0 SET (`#x7FFFFFFF`, `#x93FFFFFF`), consed into lists, and the
+program faults or hangs.  arm32's identical collector survives 68 collections
+on the same script; `test/hosted-rungs/h01-gc-survive.lisp` passes on 68k.
+Ruled out, each measured: GC poison (`MODUS_68K_GC_POISON=1`, failure point
+unchanged), FASL (`MODUS_FASL=0`), interpreter byte order, `make-bignum` (never
+called with an odd `lo`), stack alignment, unscanned image words, `%GC-EPOCH`.
+Symptom check: `--dynamic-space-size 16MB --eval 1` hangs (arm32 boots there).
+
+Debugging recipe that worked: `qemu-m68k-static -g PORT` + `gdb-multiarch`
+(`file` the image first, never `set architecture`), a breakpoint on
+`%SIGNAL-TYPE-ERROR`, and a frame walk over A6 (`[fp]` = previous fp, `[fp+4]`
+= return address) mapped through `MODUS_SYMMAP`.  The symbol map can be off for
+late functions -- confirm an address against its `linkw`.
+
 ### Build taxonomy — clean images vs ANSI gate runners
 
 Two kinds of build:

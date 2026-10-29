@@ -24280,7 +24280,9 @@
   (let* ((wt0 (memory-width-code type-form))
          (w0 (car wt0)))
     (when (and (%mem-width-promotes-p w0 (cdr wt0))
-               (not *target-big-endian-p*))
+               ;; +TARGET-BIG-ENDIAN+ (folded), not the special: this also runs
+               ;; IN the image, whose compiler must know its own byte order.
+               (not (eql +target-big-endian+ 1)))
       ;; ONLY PROMOTE WHEN THE VALUE CAN ACTUALLY LEAVE FIXNUM RANGE.  With
       ;; hi16 below 2^(fixnum-bits - 17) the result, hi16*2^16 + lo16, is an
       ;; ordinary fixnum, and an inline constant ASH of that small hi16 is
@@ -24341,7 +24343,7 @@
          ;; this runtime is i386; a big-endian 32-bit target would need the two
          ;; offsets swapped.  Stated rather than silently assumed.
          (when (and (%mem-width-promotes-p width needs-untag)
-                    (not *target-big-endian-p*))
+                    (not (eql +target-big-endian+ 1)))
            (let ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV")))
              (return-from compile-setf
                (compile-form

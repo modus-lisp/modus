@@ -111,7 +111,7 @@
 ;;; and converts to big-endian bytes at the end.
 
 (defstruct m68k-buffer
-  (words (make-array 65536))            ; fixed-size, position tracks fill
+  (words (make-array 65536))            ; GROWS (m68k-emit-word); position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)      ; list of (word-index label-id fixup-type)
   (position 0)      ; byte position
@@ -126,6 +126,12 @@
 (defun m68k-emit-word (buf word)
   "Emit a 16-bit instruction word."
   (let ((idx (m68k-buffer-word-count buf)))
+    ;; Grow by doubling.  The buffer was a fixed 64K words (128 KB), which no
+    ;; single-file image ever reached and the CL image exceeds many times over.
+    (when (>= idx (length (m68k-buffer-words buf)))
+      (let ((new (make-array (* 2 (length (m68k-buffer-words buf))))))
+        (replace new (m68k-buffer-words buf))
+        (setf (m68k-buffer-words buf) new)))
     (setf (aref (m68k-buffer-words buf) idx) (logand word #xFFFF))
     (setf (m68k-buffer-word-count buf) (+ idx 1))
     (incf (m68k-buffer-position buf) 2)))
@@ -728,27 +734,27 @@
 ;;; --- Branch ---
 
 (defun m68k-emit-bra (buf &optional label-id)
-  "BRA.W target (unconditional branch, 16-bit displacement)"
-  ;; Format: 0110 0000 00000000 disp16
-  (m68k-emit-word buf #x6000)    ; BRA with 0 byte displacement = use word extension
-  (if label-id
-      (progn
-        (m68k-emit-word buf 0)   ; placeholder (must emit BEFORE fixup)
-        (m68k-emit-fixup buf label-id :disp16))
-      (m68k-emit-word buf 0)))
+  "BRA.L target -- 68020+, 32-bit displacement.  Every branch is long: the CL
+   image is megabytes of native code, and a 16-bit displacement reaches 32 KB."
+  (m68k-emit-word buf #x60FF)
+  (let ((disp-pos (m68k-buffer-position buf)))
+    (m68k-emit-word buf 0)
+    (when label-id
+      (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2))
+            (m68k-buffer-fixups buf)))
+    (m68k-emit-word buf 0)))
 
 (defun m68k-emit-bcc-word (buf cc &optional label-id)
-  "Bcc.W target - conditional branch with 16-bit displacement.
-   CC is the 4-bit condition code."
-  ;; Format: 0110 cc(4) 00000000 disp16
-  (m68k-emit-word buf (logior (ash #b0110 12)
-                              (ash (logand cc #xF) 8)
-                              0))  ; 0 byte disp = use extension word
-  (if label-id
-      (progn
-        (m68k-emit-word buf 0)   ; placeholder (must emit BEFORE fixup)
-        (m68k-emit-fixup buf label-id :disp16))
-      (m68k-emit-word buf 0)))
+  "Bcc.L target -- 68020+, 32-bit displacement (the name is historical).  CC is
+   the 4-bit condition code.  See M68K-EMIT-BRA for why every branch is long."
+  ;; Format: 0110 cc(4) 11111111, then disp32
+  (m68k-emit-word buf (logior (ash #b0110 12) (ash (logand cc #xF) 8) #xFF))
+  (let ((disp-pos (m68k-buffer-position buf)))
+    (m68k-emit-word buf 0)
+    (when label-id
+      (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2))
+            (m68k-buffer-fixups buf)))
+    (m68k-emit-word buf 0)))
 
 ;; 68k condition codes
 (defconstant +68k-cc-t+   0)  ; True (always)
@@ -797,14 +803,15 @@
                               (logand an 7))))
 
 (defun m68k-emit-bsr (buf &optional label-id)
-  "BSR.W target (branch to subroutine, 16-bit displacement)"
-  ;; Format: 0110 0001 00000000 disp16
-  (m68k-emit-word buf #x6100)    ; BSR with 0 byte displacement = use word extension
-  (if label-id
-      (progn
-        (m68k-emit-word buf 0)   ; placeholder (must emit BEFORE fixup)
-        (m68k-emit-fixup buf label-id :disp16))
-      (m68k-emit-word buf 0)))
+  "BSR.L target -- 68020+, 32-bit displacement.  Every branch is long: the CL
+   image is megabytes of native code, and a 16-bit displacement reaches 32 KB."
+  (m68k-emit-word buf #x61FF)
+  (let ((disp-pos (m68k-buffer-position buf)))
+    (m68k-emit-word buf 0)
+    (when label-id
+      (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2))
+            (m68k-buffer-fixups buf)))
+    (m68k-emit-word buf 0)))
 
 (defun m68k-emit-rts (buf)
   "RTS - return from subroutine"
@@ -1256,6 +1263,98 @@
             (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d2+)
             (m68k-emit-addq-an buf +68k-a7+ 4)
             (m68k-emit-lsl-imm buf +68k-d2+ 1))            ; tag as fixnum
+           ;; --- HOSTED SERVICE TRAPS (the CL image's syscall layer) -------
+           ;; Linux/m68k: number in d0, arguments d1..d5 then a0, result d0.
+           ;; V0..V5 are D2..D7, so each argument is read before its register
+           ;; is overwritten; V4/V5 (D6/D7) are only read.  A trap is not a
+           ;; call, but V0..V3 are argument registers and dead after it.
+           ((and (= code #x0502) *68k-linux-mode*)
+            ;; GENERIC 3-ARG SYSCALL: V0 = number, V1..V3 args, all TAGGED;
+            ;; result TAGGED in V0.
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+            (m68k-emit-asr-imm buf +68k-d0+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+            (m68k-emit-asr-imm buf +68k-d1+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d2+)
+            (m68k-emit-asr-imm buf +68k-d2+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d3+)
+            (m68k-emit-asr-imm buf +68k-d3+ 1)
+            (m68k-emit-trap buf 0)
+            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))
+           ((and (= code #x0503) *68k-linux-mode*)
+            ;; RAW 3-ARG SYSCALL: number TAGGED, arguments and result RAW.
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+            (m68k-emit-asr-imm buf +68k-d0+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+            (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d2+)
+            (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d3+)
+            (m68k-emit-trap buf 0)
+            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+))
+           ((and (= code #x050B) *68k-linux-mode*)
+            ;; GENERIC 6-ARG SYSCALL: V0 = number, V1..V6 args, TAGGED.  V6 is
+            ;; a frame slot (spilled), so it goes first, through d0, to a0.
+            (m68k-load-vreg buf +68k-d0+ 6)
+            (m68k-emit-asr-imm buf +68k-d0+ 1)
+            (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+            (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+            (m68k-emit-asr-imm buf +68k-d1+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+            (m68k-emit-asr-imm buf +68k-d0+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d2+)
+            (m68k-emit-asr-imm buf +68k-d2+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d3+)
+            (m68k-emit-asr-imm buf +68k-d3+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d6+ +68k-d4+)
+            (m68k-emit-asr-imm buf +68k-d4+ 1)
+            (m68k-emit-move-dn-dn buf +68k-d7+ +68k-d5+)
+            (m68k-emit-asr-imm buf +68k-d5+ 1)
+            (m68k-emit-trap buf 0)
+            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))
+           ((and (= code #x0310) *68k-linux-mode*)
+            ;; RDTSC, hosted: MILLISECONDS SINCE THE FIRST READ, TAGGED, in V0;
+            ;; rate 1000 Hz (#x0311) -- ARM32's and RV32's answer, because a
+            ;; 30-bit fixnum holds 12.4 days of this and no absolute counter.
+            ;; clock_gettime(CLOCK_MONOTONIC) is 260 on m68k.  The first read's
+            ;; seconds are kept TAGGED, +1 so 0 means unset, at #x10000FB8.
+            (let ((have (mvm-make-label)))
+              (m68k-emit-lea-disp buf +68k-a7+ -8 +68k-a7+)
+              (m68k-emit-moveq buf +68k-d1+ 1)                     ; CLOCK_MONOTONIC
+              (m68k-emit-move-an-dn buf +68k-a7+ +68k-d2+)
+              (m68k-emit-move-imm-dn buf 260 +68k-d0+)
+              (m68k-emit-trap buf 0)
+              (m68k-emit-move-disp-dn buf +68k-a7+ 0 +68k-d0+)     ; tv_sec
+              (m68k-emit-move-disp-dn buf +68k-a7+ 4 +68k-d1+)     ; tv_nsec
+              (m68k-emit-lea-disp buf +68k-a7+ 8 +68k-a7+)
+              (m68k-emit-move-imm-an buf #x10000FB8 +68k-a1+)
+              (m68k-emit-move-an-ind-dn buf +68k-a1+ +68k-d2+)
+              (m68k-emit-tst buf +68k-d2+)
+              (m68k-emit-bne buf have)
+              (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+              (m68k-emit-addq buf +68k-d2+ 1)
+              (m68k-emit-lsl-imm buf +68k-d2+ 1)
+              (m68k-emit-move-dn-an-ind buf +68k-d2+ +68k-a1+)
+              (m68k-emit-label buf have)
+              (m68k-emit-asr-imm buf +68k-d2+ 1)
+              (m68k-emit-subq buf +68k-d2+ 1)                      ; first second
+              (m68k-emit-sub-dn-dn buf +68k-d2+ +68k-d0+)          ; elapsed seconds
+              (m68k-emit-move-imm-dn buf 1000 +68k-d2+)
+              (m68k-emit-muls buf +68k-d2+ +68k-d0+)
+              (m68k-emit-move-imm-dn buf 1000000 +68k-d2+)
+              (m68k-emit-divs buf +68k-d2+ +68k-d1+)               ; nsec -> ms
+              (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+              (m68k-emit-lsl-imm buf +68k-d0+ 1)
+              (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)))
+           ((and (= code #x0520) *68k-linux-mode*)
+            ;; INSTALL SIGNAL HANDLERS (faults as conditions): NOT YET on 68k.
+            ;; An explicit no-op, so a fault ends the process with the kernel's
+            ;; own signal rather than the fallback below issuing #x520 as a
+            ;; syscall number and pushing a word nobody pops.  BRING-UP GAP.
+            nil)
+           ((and (= code #x0311) *68k-linux-mode*)
+            ;; CNTFRQ: #x0310's rate, TAGGED (1000 Hz: milliseconds).
+            (m68k-emit-move-imm-dn buf 2000 +68k-d2+))
            ((and (= code #x0500) *68k-linux-mode*)
             ;; HOSTED: exit(status), status arriving TAGGED in V0 (d2).
             (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d1+)
@@ -1277,7 +1376,10 @@
             ;; move.l d1, (a0) (write to UART — Goldfish TTY needs 32-bit write)
             (m68k-emit-move-dn-an-ind buf +68k-d1+ +68k-a0+))
            (t
-            ;; Real CPU trap
+            ;; Real CPU trap -- hosted, an MVM service trap with no arm here,
+            ;; recorded as #x1xxxx in the census.
+            (when (and *68k-linux-mode* (> code 15))
+              (pushnew (+ #x10000 code) *68k-unimpl-opcodes*))
             (if (<= code 15)
                 (m68k-emit-trap buf code)
                 (progn
@@ -2001,15 +2103,33 @@
       (#.+op-obj-subtag+
        (let ((vd (first operands))
              (vs (second operands)))
-         (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-subi buf +68k-d0+ +tag-object+)
-         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-         ;; Load header; the subtag is its LOW byte, (count << 8) | subtag
-         (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
-         (m68k-emit-andi buf +68k-d0+ #xFF)
-         ;; Tag as fixnum
-         (m68k-emit-lsl-imm buf +68k-d0+ 1)
-         (m68k-store-vreg buf vd +68k-d0+)))
+         ;; translate-x64's CONTRACT, which the compiler and the runtime are
+         ;; written against: the header's low byte, TAGGED, for a real heap
+         ;; object -- and 0 FOR ANYTHING ELSE.  GENERIC-ADD reads both its
+         ;; arguments' subtags before looking at either ("OBJ-SUBTAG is safe on
+         ;; any value"), and this arm dereferenced a fixnum: the first 68k CL
+         ;; image faulted at address -1 on its first addition.  T is excluded
+         ;; explicitly: +T-VALUE+ carries the object nibble but is an immediate.
+         (let ((zero (mvm-make-label)) (done (mvm-make-label)))
+           (m68k-load-vreg buf +68k-d0+ vs)
+           (m68k-emit-cmpi buf +68k-d0+ +t-value+)
+           (m68k-emit-beq buf zero)
+           (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+           (m68k-emit-andi buf +68k-d1+ #xF)
+           (m68k-emit-cmpi buf +68k-d1+ +tag-object+)
+           (m68k-emit-bne buf zero)
+           (m68k-emit-subi buf +68k-d0+ +tag-object+)
+           (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+           ;; Load header; the subtag is its LOW byte, (count << 8) | subtag
+           (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
+           (m68k-emit-andi buf +68k-d0+ #xFF)
+           ;; Tag as fixnum
+           (m68k-emit-lsl-imm buf +68k-d0+ 1)
+           (m68k-emit-bra buf done)
+           (m68k-emit-label buf zero)
+           (m68k-emit-moveq buf +68k-d0+ 0)
+           (m68k-emit-label buf done)
+           (m68k-store-vreg buf vd +68k-d0+))))
 
       ;;; --- Memory (raw) ---
       (#.+op-load+
@@ -2068,6 +2188,94 @@
                         1 0)                                  ; FP0 op= FP1
          (m68k-float-box buf 0)
          (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-fsqrt+
+       ;; (fsqrt Vd Vs): FSQRT of the payload, boxed as a DOUBLE.  The 68040
+       ;; implements FSQRT in hardware (unlike FSIN & co, which trap to FPSP).
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 0)
+         (m68k-emit-fop buf #x04 0 0)                           ; FSQRT FP0,FP0
+         (m68k-float-box buf 0)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-fround32+
+       ;; (fround32 Vd Vs): the payload rounded to single precision, boxed as a
+       ;; SINGLE-FLOAT (#x464).  Through memory as FMOVE.S, not the 68040's
+       ;; FSMOVE, so a 68020/030 with a 6888x runs it too.
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (second operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 0)
+         (m68k-emit-lea-disp buf +68k-a7+ -4 +68k-a7+)
+         (m68k-emit-move-an-an buf +68k-a7+ +68k-a0+)
+         (m68k-emit-fmove-s-to-an-ind buf 0 +68k-a0+)
+         (m68k-emit-fmove-s-from-an-ind buf +68k-a0+ 0)
+         (m68k-emit-lea-disp buf +68k-a7+ 4 +68k-a7+)
+         (m68k-float-box buf 0 (logior #x64 (ash 4 8)))
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      ;; ---- Packed single-float vectors (subtag #x12) ----
+      ;; Header (N << 8) | #x12, N 4-byte IEEE lanes at +4: lane i at
+      ;; tagged + 4i - 5 = tagged + 2*(tagged index) - 5.  The collector sizes
+      ;; it 4N + 4 (and treats it as a leaf).
+      (#.+op-alloc-f32+
+       (let ((vd (first operands)) (zl (mvm-make-label)))
+         (m68k-emit-alloc-mark buf 1)   ; FIRST: clobbers D0/A0
+         (m68k-load-vreg buf +68k-d1+ (second operands))
+         (m68k-emit-asr-imm buf +68k-d1+ 1)                     ; N
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsl-imm buf +68k-d0+ 8)
+         (m68k-emit-ori buf +68k-d0+ #x12)
+         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-ori buf +68k-d0+ +tag-object+)
+         (m68k-store-vreg buf vd +68k-d0+)
+         ;; bytes = align16(4N + 4); ZERO everything past the header (a new
+         ;; vector reads 0.0f0), then VA += bytes.
+         (m68k-emit-lsl-imm buf +68k-d1+ 2)
+         (m68k-emit-addi buf +68k-d1+ 19)
+         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-lea-disp buf +68k-a2+ 4 +68k-a0+)
+         (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-lsr-imm buf +68k-d0+ 2)
+         (m68k-emit-subq buf +68k-d0+ 1)                        ; words past header
+         (m68k-emit-label buf zl)
+         (m68k-emit-word buf #x4298)                            ; CLR.L (A0)+
+         (m68k-emit-subq buf +68k-d0+ 1)
+         (m68k-emit-bne buf zl)
+         (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a2+)))
+
+      (#.+op-f32-load+
+       ;; (f32-load Vd Varr Vidx): lane -> FMOVE.S (widen) -> fresh boxed single.
+       (let ((vd (first operands)))
+         (m68k-load-vreg buf +68k-d0+ (third operands))         ; tagged index
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)                     ; 4i
+         (m68k-load-vreg buf +68k-d1+ (second operands))
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-subi buf +68k-d0+ 5)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-fmove-s-from-an-ind buf +68k-a0+ 0)
+         (m68k-float-box buf 0 (logior #x64 (ash 4 8)))
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-f32-store+
+       ;; (f32-store Varr Vidx Vval): payload -> FMOVE.S (round) -> lane.
+       ;; Unbox FIRST (it uses A0 and D1), then form the lane address.
+       (progn
+         (m68k-load-vreg buf +68k-d0+ (third operands))
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-float-unbox buf 0)
+         (m68k-load-vreg buf +68k-d0+ (second operands))        ; tagged index
+         (m68k-emit-lsl-imm buf +68k-d0+ 1)
+         (m68k-load-vreg buf +68k-d1+ (first operands))
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+         (m68k-emit-subi buf +68k-d0+ 5)
+         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+         (m68k-emit-fmove-s-to-an-ind buf 0 +68k-a0+)))
 
       (#.+op-itof+
        ;; Tagged fixnum -> double: untag, FMOVE.L Dn,FP0 (exact for 32 bits).
@@ -2541,7 +2749,9 @@
          (m68k-emit-store-abs buf +68k-d0+ (m68k-mvcount-addr))))
 
       (otherwise
-       ;; Unknown opcode: ILLEGAL
+       ;; Unknown opcode: ILLEGAL -- and RECORDED, so a build can say what is
+       ;; missing instead of shipping an image that dies at the first one.
+       (pushnew opcode *68k-unimpl-opcodes*)
        (m68k-emit-illegal buf)))))
 
 ;;; ============================================================
@@ -2600,6 +2810,12 @@
 (defconstant +68k-gc-margin-max+ #x100000
   "The collector leaves min(1 MB, a quarter of a semispace) free below VL --
    COMPUTED from space_size at each collection, so it needs no stored word.")
+
+(defvar *68k-gc-poison* nil
+  "DEBUG, as *ARM32-GC-POISON*: every collection overwrites the semispace it
+   evacuated with #x00000BA9, so a pointer the collector failed to update
+   faults on its first read instead of reading the stale copy.  Set by
+   build-68k-cli.lisp from MODUS_68K_GC_POISON=1.  Off: byte-identical.")
 
 (defvar *68k-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
@@ -2829,6 +3045,17 @@
         (m68k-emit-addq-an buf +68k-a0+ 4)
         (m68k-emit-bra buf zl)
         (here zd))
+      (when *68k-gc-poison*
+        (let ((pl (lbl)) (pd (lbl)))
+          (m68k-emit-move-dn-an buf +68k-d4+ +68k-a0+)
+          (m68k-emit-move-imm-dn buf #x00000BA9 +68k-d2+)
+          (here pl)
+          (m68k-emit-cmpa buf +68k-a0+ +68k-d5+)                 ; A0 - D5
+          (m68k-emit-bcc-word buf +68k-cc-cc+ pd)
+          (m68k-emit-move-dn-an-ind buf +68k-d2+ +68k-a0+)
+          (m68k-emit-addq-an buf +68k-a0+ 4)
+          (m68k-emit-bra buf pl)
+          (here pd)))
       ;; ---- swap the semispaces, count the collection ----
       (m68k-emit-move-imm-an buf meta +68k-a1+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d0+)
@@ -2964,8 +3191,20 @@
 ;;; Main Translation Entry Point
 ;;; ============================================================
 
+(defvar *68k-unimpl-opcodes* nil
+  "Opcodes (and, as #x1xxxx, hosted service traps) the last 68k translation had
+   no arm for: each became an ILLEGAL.  Reset per translation.")
+
+(defun m68k-unimplemented-report ()
+  "Print, and return, what the last 68k translation could not translate."
+  (when *68k-unimpl-opcodes*
+    (format t "~&  *** 68k translator gaps (ILLEGAL emitted; #x1xxxx = trap xxxx): ~{#x~2,'0X~^ ~} ***~%"
+            (sort (copy-list *68k-unimpl-opcodes*) #'<)))
+  *68k-unimpl-opcodes*)
+
 (defun translate-mvm-to-68k (bytecode function-table)
-  (setf *68k-li-const-patches* nil)
+  (setf *68k-li-const-patches* nil
+        *68k-unimpl-opcodes* nil)
   (translate-mvm-to-68k-1 bytecode function-table))
 
 (defun translate-mvm-to-68k-1 (bytecode function-table)
@@ -3058,6 +3297,7 @@
 
     ;; Resolve labels
     (m68k-fixup-labels buf)
+    (m68k-unimplemented-report)
 
     ;; Report where each function actually LANDED — see the same change in
     ;; translate-ppc.lisp.  Without it cross.lisp guesses proportionally and
@@ -3134,6 +3374,16 @@
   (m68k-emit-word buf (logior #xF200 (logand dn 7)))
   (m68k-emit-word buf (logior #x6000 (ash fpn 7))))
 
+(defun m68k-emit-fmove-s-from-an-ind (buf an fpn)
+  "FMOVE.S (An), FPn -- a 4-byte IEEE single from memory, widened."
+  (m68k-emit-word buf (logior #xF210 (logand an 7)))
+  (m68k-emit-word buf (logior #x4400 (ash fpn 7))))
+
+(defun m68k-emit-fmove-s-to-an-ind (buf fpn an)
+  "FMOVE.S FPn, (An) -- rounded to single precision (FPCR's mode: nearest)."
+  (m68k-emit-word buf (logior #xF210 (logand an 7)))
+  (m68k-emit-word buf (logior #x6400 (ash fpn 7))))
+
 (defun m68k-float-unbox (buf fpn)
   "Load the double whose TAGGED pointer is in A0 into FPn.  Clobbers D1."
   (m68k-emit-lea-disp buf +68k-a7+ -16 +68k-a7+)
@@ -3144,14 +3394,16 @@
   (m68k-emit-fmove-d-from-sp buf fpn)
   (m68k-emit-lea-disp buf +68k-a7+ 16 +68k-a7+))
 
-(defun m68k-float-box (buf fpn)
-  "Box FPn as a fresh four-chunk double; its TAGGED pointer lands in D0.
-   Header (4<<8)|#x60, five longwords rounded to 32 bytes (16-aligned heap).
-   Clobbers D1."
+(defun m68k-float-box (buf fpn &optional (header (logior #x60 (ash 4 8))))
+  "Box FPn as a fresh four-chunk float; its TAGGED pointer lands in D0.
+   HEADER is (4<<8)|#x60 for a double (the default) or (4<<8)|#x64 for a
+   single-float, whose payload is the double value already rounded to single
+   (ARM32's representation).  Five longwords rounded to 32 bytes (16-aligned
+   heap).  Clobbers D1."
   (m68k-emit-alloc-mark buf 1)          ; FIRST: clobbers D0/A0
   (m68k-emit-lea-disp buf +68k-a7+ -16 +68k-a7+)
   (m68k-emit-fmove-d-to-sp buf fpn)
-  (m68k-emit-move-imm-dn buf (logior #x60 (ash 4 8)) +68k-d1+)
+  (m68k-emit-move-imm-dn buf header +68k-d1+)
   (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ 0)            ; header at VA
   (loop for k from 0 to 3
         do (m68k-emit-move-imm-dn buf 0 +68k-d1+)

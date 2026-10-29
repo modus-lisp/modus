@@ -307,7 +307,7 @@
           ;; a megabyte of dead code.  mvm-eval's JIT seam falls back cleanly, so
           ;; the image is CORRECT, just slower.  Removing this line is the whole
           ;; change when a RISC-V JIT arm lands.
-          ((member *cli-arch* '(:riscv64 :riscv32 :arm32)) nil)
+          ((member *cli-arch* '(:riscv64 :riscv32 :arm32 :68k)) nil)
           ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
           ;; WS5 #206: DEFAULT is ON again.  It was turned OFF in 2d95d3e
@@ -674,9 +674,9 @@
        (or *aarch64-jit-coinit-source* "") (string #\Newline)))
     ;; i386: no in-image JIT translator — see the *JIT-ON* comment above.
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
-    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32)) "")
+    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
-               (want :x64, :aarch64, :i386, :riscv64, :riscv32 or :arm32)"
+               (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"
               *cli-arch*))))
 
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins
@@ -1386,7 +1386,7 @@
 (defun %machine-type-source ()
   (let ((m (ecase *cli-arch*
              (:x64 "x86_64") (:aarch64 "aarch64") (:i386 "i386")
-             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l"))))
+             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l") (:68k "m68k"))))
     (format nil "~%(defun machine-type () ~S)~%(defun machine-version () ~S)~%" m m)))
 
 ;; MODUS_LISP_SPIN_AT spin points inside kernel-main (see %LISP-SPIN-FORM in
@@ -1840,7 +1840,7 @@
   (when (and (boundp '*cli-bare-metal*) *cli-bare-metal*)
     (return-from %ignore-sigpipe-source "(defun %ignore-sigpipe () 0)"))
   (let ((nr (ecase *cli-arch*
-              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32) 174))))
+              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174))))
     (if (member *cli-arch* '(:x64 :aarch64))
         (format nil "(defun %ignore-sigpipe ()
   (let ((sa (%mmap-shared-page 4096)))
@@ -2380,7 +2380,18 @@
                      (setf (gethash bare seen) t)
                      (push bare result))))))))))))
 
-(defvar *all-symbol-names* (scan-symbol-names *all-runtime-source*))
+;;; PLUS the deferred-surfaces source, for NAMES only.  It is compiled into the
+;;; image (below, in *full-source*) but kept out of *all-runtime-source* so the
+;;; defun scanner does not mine it; the price was that its own keyword literals
+;;; -- :GENERA, :SB-THREAD, :SB-BSD-SOCKETS, :MODUS-CHANNEL, :SB-MOP ... -- got no
+;;; *SYM-NAME-TABLE* entry, so the image pushed them onto *FEATURES* and printed
+;;; eleven of them as :||, and `#+genera' read them by hash while
+;;; (symbol-name :genera) said "".
+(defvar *all-symbol-names*
+  (let ((names (scan-symbol-names *all-runtime-source*)))
+    (append names
+            (remove-if (lambda (n) (member n names :test #'string=))
+                       (scan-symbol-names *deferred-surfaces-source*)))))
 
 (format t "  symbol names found: ~D~%" (length *all-symbol-names*))
 

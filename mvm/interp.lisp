@@ -407,8 +407,11 @@
 ;; traces them, and they are intercepted before any of this runs.
 ;;
 ;; Byte order follows the machine: MEM-READ/MEM-WRITE assemble little-endian,
-;; which is what every target that runs this interpreter (x64, aarch64, i386)
-;; actually is.  A big-endian host would need the loop order flipped.
+;; except on a big-endian target (+TARGET-BIG-ENDIAN+, folded at build time),
+;; where byte I of an N-byte access is the value's byte N-1-I.  68k was the first
+;; big-endian image to run this interpreter, and before the flip every
+;; interpreted (setf (mem-ref a :u32) #x12345678) wrote 78 56 34 12 -- which
+;; native code then read back as a different number.
 (defun mem-read-byte (state addr)
   (declare (ignore state))
   (mem-ref addr :u8))
@@ -438,15 +441,26 @@
     (if mv
         (%val->word (svref (mvm-mv-vals state) mv))
         (let ((val 0))
+          ;; Byte I is shifted by 8I and read from the address holding the
+          ;; value's I-th least significant byte -- so the accumulation is
+          ;; low byte first in BOTH orders.  High byte first made every step
+          ;; after the first a bignum LOGIOR on a 32-bit target.
           (dotimes (i (ash 1 width) val)
-            (setf val (logior val (ash (mem-read-byte state (+ addr i)) (* i 8)))))))))
+            (setf val (logior val (ash (mem-read-byte state
+                                                      (+ addr (if (eql +target-big-endian+ 1)
+                                                                  (- (ash 1 width) 1 i)
+                                                                  i)))
+                                       (* i 8)))))))))
 
 (defun mem-write (state addr val width)
   (let ((mv (%mv-slot-index addr width)))
     (if mv
         (setf (svref (mvm-mv-vals state) mv) (%word->val val))
         (dotimes (i (ash 1 width))
-          (mem-write-byte state (+ addr i) (logand (ash val (* i -8)) #xFF))))))
+          (mem-write-byte state (+ addr (if (eql +target-big-endian+ 1)
+                                            (- (ash 1 width) 1 i)
+                                            i))
+                          (logand (ash val (* i -8)) #xFF))))))
 
 ;; VALUE-domain load/store — what OP-LOAD and OP-STORE actually need.
 ;;

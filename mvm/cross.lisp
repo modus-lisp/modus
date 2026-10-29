@@ -1422,15 +1422,31 @@
               ((eq arch :68k)
                ;; BRA.L (0x60FF + 32-bit displacement, 68020+/ColdFire).
                ;; The displacement is measured from the EXTENSION WORD at
-               ;; +2, and native code starts at +6, so it is offset + 4.
-               (let ((disp (+ entry-native-offset 4)))
+               ;; +2, and native code starts at +6+PAD, so it is offset+4+PAD.
+               ;;
+               ;; PAD (NOPs) puts native code on a 16-byte VIRTUAL boundary.
+               ;; translate-68k pads every function entry to 16 relative to
+               ;; ITS buffer, which is 16 in memory only if the buffer starts
+               ;; on one.  The hosted CL image's larger boot stub left it at 12
+               ;; mod 16, so every #'NAME tagged as #x...F -- the FORWARDING
+               ;; tag -- and the first collection took the car of a cons
+               ;; holding one for a forwarding pointer: *GF-STUB-CLOSURES*
+               ;; became a pointer into code and every FUNCTIONP after it
+               ;; signalled.  Same fix as RISC-V's above.
+               (let* ((base (+ (or (getf boot-descriptor :load-addr) 0)
+                               (wrap-header-size-for-boot boot-descriptor)))
+                      (pad (mod (- 16 (mod (+ base (mvm-buffer-position final-buf) 6) 16)) 16))
+                      (disp (+ entry-native-offset 4 pad)))
                  (mvm-emit-byte final-buf #x60)
                  (mvm-emit-byte final-buf #xFF)
                  (mvm-emit-byte final-buf (logand (ash disp -24) #xFF))
                  (mvm-emit-byte final-buf (logand (ash disp -16) #xFF))
                  (mvm-emit-byte final-buf (logand (ash disp -8) #xFF))
                  (mvm-emit-byte final-buf (logand disp #xFF))
-                 (setq jmp-size 6))))))
+                 (dotimes (i (floor pad 2))
+                   (mvm-emit-byte final-buf #x4E)
+                   (mvm-emit-byte final-buf #x71))
+                 (setq jmp-size (+ 6 pad)))))))
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (setf (kernel-image-native-image-offset image) code-offset)

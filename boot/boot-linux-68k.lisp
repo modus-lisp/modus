@@ -56,9 +56,20 @@
   "The collector keeps up to 1 MB free below VL (as RISC-V and ARM32 do), but
    never more than a quarter of a semispace, or a small heap would be all margin.")
 (defconstant +linux-68k-sys-sysinfo+ 116)
-(defconstant +linux-68k-heap-alloc-start+ #x2000
-  "Clear of the whole fixed low block the shared runtime owns — metadata #x40,
-   globals #x80, MV #x90..#x138, argc #x200, handler frames #x400..#xC2F.")
+(defconstant +linux-68k-heap-alloc-start+ #x20000
+  "Past the fixed runtime block (#x0000-#x0FFF: metadata #x40, globals #x80,
+   MV #x90..#x138, argc #x200, handler frames #x400..), the CLI scratch pages
+   (#x1000-#x8FFF) and the staged argv (#x9000-#x1DFFF) -- ARM32's and RV32's
+   layout, so the CL image's slots are where the shared runtime expects.  It
+   was #x2000, enough for a single-file image and nothing more.")
+
+;;; Staged argv/envp, below 2^29 -- ARM32's addresses.  qemu-m68k puts the
+;;; initial stack near #x40800000, which a tagged MEM-REF address cannot
+;;; express, so the stub copies the vectors down (EMIT-LINUX-68K-STAGE-ARGV).
+(defconstant +linux-68k-argv-ptrs+       #x10009000)
+(defconstant +linux-68k-argv-ptrs-end+   #x1000A000)
+(defconstant +linux-68k-argv-arena+      #x1000A000)
+(defconstant +linux-68k-argv-arena-end+  #x1001E000)
 
 (defconstant +linux-68k-page-shift+ 12
   "mmap2 takes its file offset in pages.  We pass 0, so this is documentation of
@@ -190,6 +201,77 @@
     (m68k-emit-lsl-dn buf +68k-d1+ +68k-d7+)
     (m68k-emit-move-dn-an buf +68k-d7+ +68k-a5+)))
 
+(defun emit-linux-68k-stage-argv (buf)
+  "Copy argv[] and envp[] (pointer vectors AND strings) from the initial stack
+   to +LINUX-68K-ARGV-PTRS+ / -ARENA+, each vector NULL-terminated, as ARM32's
+   stub does.  Stops early -- both vectors still terminated -- rather than
+   overrun either region.  A7 still points at argc.  Clobbers D0, D3, A0, A1,
+   A3, A4; must run after the heap is mapped (both regions are inside it)."
+  (let ((top (mvm-make-label)) (copy (mvm-make-label)) (cloop (mvm-make-label))
+        (full (mvm-make-label)) (done (mvm-make-label)))
+    (m68k-emit-lea-disp buf +68k-a7+ 4 +68k-a0+)                 ; &argv[0]
+    (m68k-emit-move-imm-an buf +linux-68k-argv-ptrs+ +68k-a1+)
+    (m68k-emit-move-imm-an buf +linux-68k-argv-arena+ +68k-a3+)
+    (m68k-emit-moveq buf +68k-d3+ 2)                             ; NULLs to copy
+    (m68k-emit-label buf top)
+    ;; MOVEA.L (A0)+, A4
+    (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an+ +68k-a4+
+                                               +ea-mode-an-postinc+ +68k-a0+))
+    (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-bne buf copy)
+    ;; a NULL: copy it; stop after the second
+    (m68k-emit-moveq buf +68k-d0+ 0)
+    (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-postinc+ +68k-a1+
+                                               +ea-mode-dn+ +68k-d0+))   ; MOVE.L D0,(A1)+
+    (m68k-emit-subq buf +68k-d3+ 1)
+    (m68k-emit-bne buf top)
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf copy)
+    ;; room for this pointer plus a terminator, and a string's worth of arena?
+    (m68k-emit-word buf (logior #xB1FC (ash +68k-a1+ 9)))       ; CMPA.L #imm,A1
+    (m68k-emit-long buf (- +linux-68k-argv-ptrs-end+ 8))
+    (m68k-emit-bcc-word buf +68k-cc-cc+ full)
+    (m68k-emit-word buf (logior #xB1FC (ash +68k-a3+ 9)))       ; CMPA.L #imm,A3
+    (m68k-emit-long buf (- +linux-68k-argv-arena-end+ 4096))
+    (m68k-emit-bcc-word buf +68k-cc-cc+ full)
+    (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-postinc+ +68k-a1+
+                                               +ea-mode-an+ +68k-a3+))   ; MOVE.L A3,(A1)+
+    (m68k-emit-label buf cloop)
+    (m68k-emit-move-byte-postinc-dn buf +68k-a4+ +68k-d0+)       ; MOVE.B (A4)+,D0
+    (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-an-postinc+ +68k-a3+
+                                               +ea-mode-dn+ +68k-d0+))   ; MOVE.B D0,(A3)+
+    (m68k-emit-word buf #x4A00)                                  ; TST.B D0
+    (m68k-emit-bne buf cloop)
+    (m68k-emit-bra buf top)
+    (m68k-emit-label buf full)
+    (m68k-emit-moveq buf +68k-d0+ 0)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 4)
+    (m68k-emit-label buf done)))
+
+(defun emit-linux-68k-nil-page (buf)
+  "Map the page at #xDEAD0000 and fill it with NIL: (car nil) and (cdr nil) are
+   plain loads from NIL's own address, as on ARM32 / RV32 / RV64.  Clobbers
+   D0-D5 and A0 (the syscall), and D1/D2/A0 for the fill."
+  (let ((fill (mvm-make-label)))
+    (m68k-emit-move-imm-dn buf #xDEAD0000 +68k-d1+)
+    (m68k-emit-move-imm-dn buf 4096 +68k-d2+)
+    (m68k-emit-move-imm-dn buf 3 +68k-d3+)
+    (m68k-emit-move-imm-dn buf #x32 +68k-d4+)
+    (m68k-emit-move-imm-dn buf -1 +68k-d5+)
+    (m68k-emit-move-imm-an buf 0 +68k-a0+)
+    (m68k-emit-move-imm-dn buf +68k-linux-sys-mmap2+ +68k-d0+)
+    (m68k-emit-trap buf 0)
+    (m68k-emit-move-imm-an buf #xDEAD0000 +68k-a0+)
+    (m68k-emit-move-imm-dn buf +nil-value+ +68k-d1+)
+    (m68k-emit-move-imm-dn buf 1024 +68k-d2+)
+    (m68k-emit-label buf fill)
+    (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-postinc+ +68k-a0+
+                                               +ea-mode-dn+ +68k-d1+))   ; MOVE.L D1,(A0)+
+    (m68k-emit-subq buf +68k-d2+ 1)
+    (m68k-emit-bne buf fill)))
+
 (defun emit-linux-68k-entry (mbuf)
   "Emit the Linux/m68k userspace entry into MBUF (cross.lisp's mvm-buffer).
 
@@ -243,7 +325,11 @@
     (m68k-emit-move-imm-an buf 0 +68k-a0+)
     (m68k-emit-move-imm-dn buf +68k-linux-sys-mmap2+ +68k-d0+)
     (m68k-emit-trap buf 0)
-    (m68k-emit-move-an-dn buf +68k-a1+ +68k-d0+)          ; d0 = heap base again
+    ;; --- the NIL page and the staged argv (both CL-image requirements)
+    (emit-linux-68k-nil-page buf)
+    (emit-linux-68k-stage-argv buf)
+    (m68k-emit-move-imm-dn buf +linux-68k-heap-addr+ +68k-d0+)   ; d0 = heap base again (MAP_FIXED)
+    (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)
     ;; --- argc, now inside the mapping
     (m68k-emit-move-disp-dn buf +68k-a7+ 0 +68k-d6+)
     (m68k-emit-move-imm-an buf (+ +linux-68k-heap-addr+ #x200) +68k-a0+)

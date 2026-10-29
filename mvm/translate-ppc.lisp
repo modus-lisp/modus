@@ -2188,16 +2188,28 @@
              ;; scratch1-or-a-vreg and PD is scratch1-or-a-vreg, so neither can
              ;; be scratch2, and the address is dead after the load -- which is
              ;; why the tag-shift below may reuse scratch2.
-             (ppc-emit-addi buf +ppc-scratch2+ ps (logand (- +tag-object+) #xFFFF))
-             (ppc-emit-load-word buf pd +ppc-scratch2+ 0)   ; load header
-             ;; The subtag is the header's LOW byte: (count << 8) | subtag.
-             ;; This shifted right 8 first, to match an ALLOC-OBJ that wrote
-             ;; (subtag << 8) | 9 -- so every array and string reported the
-             ;; low byte of its LENGTH as its subtag.
-             (ppc-emit-andi-dot buf pd pd #xFF)             ; mask 8 bits
-             ;; Tag as fixnum
-             (ppc-emit-addi buf +ppc-scratch2+ 0 1)
-             (ppc-emit-shift-left buf pd pd +ppc-scratch2+)
+             ;; 0 FOR ANYTHING BUT A HEAP OBJECT -- translate-x64's contract,
+             ;; which the runtime relies on (GENERIC-ADD reads both arguments'
+             ;; subtags first; see the 68k arm).  T is excluded explicitly: its
+             ;; immediate carries the object nibble.
+             (let ((zero (mvm-make-label)) (done (mvm-make-label)))
+               (ppc-emit-li buf +ppc-scratch2+ +t-value+)
+               (ppc-emit-cmp-word buf ps +ppc-scratch2+)
+               (ppc-emit-beq buf zero)
+               (ppc-emit-andi-dot buf +ppc-scratch2+ ps 15)
+               (ppc-emit-cmpi-word buf +ppc-scratch2+ +tag-object+)
+               (ppc-emit-bne buf zero)
+               (ppc-emit-addi buf +ppc-scratch2+ ps (logand (- +tag-object+) #xFFFF))
+               (ppc-emit-load-word buf pd +ppc-scratch2+ 0)   ; load header
+               ;; The subtag is the header's LOW byte: (count << 8) | subtag.
+               (ppc-emit-andi-dot buf pd pd #xFF)             ; mask 8 bits
+               ;; Tag as fixnum
+               (ppc-emit-addi buf +ppc-scratch2+ 0 1)
+               (ppc-emit-shift-left buf pd pd +ppc-scratch2+)
+               (ppc-emit-b buf done)
+               (ppc-emit-label buf zero)
+               (ppc-emit-li buf pd 0)
+               (ppc-emit-label buf done))
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 

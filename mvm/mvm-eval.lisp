@@ -379,6 +379,21 @@
                   (string-equal n "EVAL-WHEN"))
           (return-from %mvm-eval-cacheable-p nil))))))
 
+(defun %e2-defun-head-p (head)
+  "T if HEAD names DEFUN as a definition of the function its second element names:
+   CL's DEFUN, or a symbol spelled DEFUN that is no macro of its own.  A package that
+   shadows DEFUN with its own macro (cortez's floor: a Zetalisp DEFUN whose &QUOTE
+   arguments make it a macro on the name plus a NAME/&quote function) defines what its
+   EXPANSION defines.  Read by name, such a form registered NAME for persistence and
+   the install that followed left NAME with neither the macro its expansion had just
+   installed nor any function -- DEFPROP, a fexpr, was then compiled as a call, and
+   (DEFPROP AREF ALOC LOCF-METHOD) died on the variable AREF.  Not CL's and a macro
+   goes to the expansion branch of %E2-SCAN-PERSIST, which sees the real definitions."
+  (and (symbolp head)
+       (string-equal (symbol-name head) "DEFUN")
+       (or (eq (symbol-package head) (find-package "COMMON-LISP"))
+           (not (macro-function head)))))
+
 (defun %e2-scan-persist (f acc depth)
   "WS3 def persistence pre-scan (see persist-names in mvm-eval-forms): return ACC
    extended with the names (strings) of every toplevel-context DEFUN in form F.
@@ -399,7 +414,7 @@
       acc
       (let ((hn (symbol-name (car f))))
         (cond
-          ((and (string-equal hn "DEFUN") (symbolp (cadr f)))
+          ((and (%e2-defun-head-p (car f)) (symbolp (cadr f)))
            ;; Key the persist name by the SAME string the compiler uses for
            ;; function-info-name (%rt-fn-name): package-qualified PKG::NAME
            ;; for a runtime-born library's symbols, bare otherwise.  If this
@@ -4108,8 +4123,7 @@
     (register-mvm-bootstrap-macros)
     (let* ((rforms (reverse forms))
            (last-form (car rforms))
-           (last-defun-p (and (consp last-form) (symbolp (car last-form))
-                              (string-equal (symbol-name (car last-form)) "DEFUN")
+           (last-defun-p (and (consp last-form) (%e2-defun-head-p (car last-form))
                               (symbolp (cadr last-form))))
            (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
            (defs (if last-defun-p forms (reverse (cdr rforms))))
@@ -4663,8 +4677,7 @@
     ;; as a nested defun that compiles in-module and yields NIL.
     (let* ((rforms (reverse forms))
            (last-form (car rforms))
-           (last-defun-p (and (consp last-form) (symbolp (car last-form))
-                              (string-equal (symbol-name (car last-form)) "DEFUN")
+           (last-defun-p (and (consp last-form) (%e2-defun-head-p (car last-form))
                               (symbolp (cadr last-form))))
            (expr (if last-defun-p (list (quote quote) (cadr last-form)) last-form))
            (defs (if last-defun-p forms (reverse (cdr rforms))))

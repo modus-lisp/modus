@@ -2951,6 +2951,28 @@
   (make-package "MODUS.RUNTIME" :use (list "CL"))
   (make-package "MODUS.MVM.X64" :use (list "CL" "MODUS-INT" "MODUS.ASM"))
   (make-package "MODUS.MVM.I386" :use (list "CL" "MODUS-INT"))
+  ;; MODUS's public API (SB-EXT's role): image functions a program is meant to
+  ;; call, re-exported from MODUS-INT where they are defined, so MODUS:SYS-EXIT
+  ;; IS the kernel's symbol.  CL-USER uses MODUS, as SBCL's CL-USER uses SB-EXT.
+  ;; Names an image does not define are exported anyway (an undefined function
+  ;; if called), so the list is the same in every image.
+  (let ((modus (find-package "MODUS")) (int (find-package "MODUS-INT")))
+    (dolist (n (quote ("SYS-EXIT" "SAVE-AND-DIE" "INSTALL-TARBALL"
+                       "ACTORS-SPAWN" "ACTORS-SEND" "ACTORS-RECEIVE" "ACTORS-RECEIVE-IF"
+                       "ACTORS-SELF" "ACTORS-YIELD" "ACTORS-START" "ACTORS-STOP"
+                       "SPAWN-LINK" "LINK"
+                       "SOCKET-CONNECT" "SOCKET-LISTEN" "SOCKET-LISTEN-ON"
+                       "SOCKET-LISTEN-PORT" "SOCKET-ACCEPT" "SOCKET-SEND"
+                       "SOCKET-SEND-FROM" "SOCKET-RECV" "SOCKET-RECV-FULLY"
+                       "SOCKET-CLOSE" "SOCKET-LOCAL-PORT"
+                       "SSH-SERVE-TCP" "SSH-SERVE-TCP-ON" "SSH-SERVE-VSOCK" "SSH-BOOT"
+                       "RUN-NET-PIPELINE" "HTTP-FETCH"
+                       "PMU-START" "PMU-STOP" "PMU-READ" "PMU-MEASURE" "PMU-PROFILE"
+                       "PMU-ANNOTATE")))
+      (let ((sym (intern n int)))
+        (import sym modus)
+        (export sym modus)))
+    (use-package modus (find-package "COMMON-LISP-USER")))
   (setq *package* (find-package "CL-USER"))
   ;; The runtime DEFPACKAGE macro.  It used to be installed only as a side
   ;; effect of SET-UP-PACKAGES (which also makes test packages A/B/Q), and

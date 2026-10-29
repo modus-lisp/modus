@@ -2994,7 +2994,11 @@
       (let ((pkg (%cl-sym-package fn)))
         (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
             (%maybe-narrow (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn)))
-            (symbol-name fn)))
+            ;; A symbol that only SHARES a kernel function's name keys its own
+            ;; cell (cl-eval.lisp %KERNEL-SHADOW-KEY): a CL-USER DEFUN of
+            ;; %FORMAT-IMPL must not replace the kernel's.
+            (or (%kernel-shadow-key pkg (symbol-name fn))
+                (symbol-name fn))))
       (symbol-name fn)))
 
 (defun %local-fn-key (fn)

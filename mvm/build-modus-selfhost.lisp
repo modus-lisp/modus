@@ -1968,7 +1968,8 @@
       (format out "(defun %init-sft-auto ()~%")
       (dotimes (c n-chunks)
         (format out "  (%init-sft-auto-~D)~%" c))
-      (format out ")~%"))))
+      ;; the kernel's own function names, for %KERNEL-SHADOW-KEY (phase B)
+      (format out "  (%snapshot-kernel-fn-names))~%"))))
 
 (defvar *sft-auto-source* (emit-sft-auto *all-defun-names* 200))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))

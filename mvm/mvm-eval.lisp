@@ -2841,6 +2841,20 @@
 (defvar *x64-jit-shared-gc-tramp*)
 (defvar *x64-last-gc-tramp-label*)
 
+(defun %jit-arena-room-p (size)
+  "True unless the JIT arena has no room for a SIZE-byte code page.  Code is
+   bump-allocated UP from the arena's base and data pages (%JIT-DATA-PAGE, the
+   linkage cells) are taken DOWN from its top, and the trap that bumps checks
+   neither: past the lowest data page a code page overwrote live linkage cells,
+   and past the top it was unmapped memory.  Either way the next store faulted
+   and the load hung with no message -- cortez's kernel, ~100000 JIT pages in.
+   With no room the page is not taken and the form interprets, as when mmap
+   fails.  No arena (bump word 0): mmap(NULL) pages, no limit here."
+  (let ((bump (%core-jit-arena-bump)))
+    (or (= bump 0)
+        (<= (+ bump size 16384)
+            (or *jit-data-next* (%core-jit-arena-hi))))))
+
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -3007,7 +3021,7 @@
            ;; tail / alignment) so the full native module fits.
            (npages (+ 1 (ash nlen -12)))
            (psize (ash npages 12))
-           (page (%mmap-exec-page psize))
+           (page (if (%jit-arena-room-p psize) (%mmap-exec-page psize) 0))
            (base (sap-address (make-sap page))))
       ;; SAFE-FLIP GUARD (x64 parity with the aarch64 sibling): mmap failure
       ;; returns -errno, a small/negative integer.  Writing to it would fault;

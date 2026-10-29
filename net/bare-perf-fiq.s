@@ -5,7 +5,7 @@
 //   +32 depth (frames)       +40 samples taken
 //   +48 samples dropped      +56 stop flag (nonzero: disarm on next tick)
 // Frame bounds (shared, after the 4 core blocks, at CTL+256): +0 lo  +8 hi
-// Record: [header = core | depth<<8 | n<<16] [pc] [x30] [ret0..ret(depth-1)]  (zeros past the chain)
+// Record: [header = core | depth<<8 | x24<<16] [pc] [x30] [ret0..ret(depth-1)]  (zeros past the chain)
 stub:
   stp x0, x1, [sp, #-16]!
   ldr x0, stub_lit
@@ -32,7 +32,9 @@ handler:
   ldr x6, [x3, #8]               // ring end
   cmp x5, x6
   b.hi full
-  orr x6, x0, x4, lsl #8         // header: core | depth<<8 (n filled below)
+  orr x6, x0, x4, lsl #8         // header: core | depth<<8 | x24<<16
+  orr x6, x6, x24, lsl #16       // the allocation pointer (aarch64 modus keeps it in x24): the
+                                 // bytes between two samples are what PERF-REPORT :ALLOC weighs
   mrs x1, elr_el2
   str x1, [x2, #8]               // pc
   str x30, [x2, #16]             // interrupted lr

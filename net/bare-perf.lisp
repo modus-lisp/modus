@@ -34,15 +34,15 @@
 (defparameter *perf-fiq-words*
   #(
     #xA9BF07E0 #x58000060 #xD61F0000 #xD503201F #x00000000 #x00000000 #xA9BF0FE2 #xA9BF17E4
-    #xA9BF1FE6 #x580008A3 #xD53800A0 #x92400400 #x8B001863 #xF9401C61 #xB5000721 #xF9400C61
-    #xD51CE201 #xF9400862 #xF9401064 #x8B040C45 #x910060A5 #xF9400466 #xEB0600BF #x54000588
-    #xAA042006 #xD53C4021 #xF9000441 #xF900085E #x91006047 #xAA1D03E1 #x58000600 #xF9408005
-    #xF9408400 #xD2800004 #xF9401062 #xEB02009F #x540001E2 #xF240083F #x540001A1 #xEB05003F
-    #x54000163 #xEB00003F #x54000122 #xF9400422 #xF80084E2 #x91000484 #xF9400022 #xEB01005F
-    #x54000069 #xAA0203E1 #x17FFFFF0 #xF9401062 #xEB02009F #x54000082 #xF80084FF #x91000484
-    #x17FFFFFC #xF9400862 #xF9000046 #xF9401064 #x8B040C42 #x91006042 #xF9000862 #xF9401461
-    #x91000421 #xF9001461 #x14000006 #xF9401861 #x91000421 #xF9001861 #x14000002 #xD51CE23F
-    #xA8C11FE6 #xA8C117E4 #xA8C10FE2 #xA8C107E0 #xD69F03E0 #xD503201F #x00000000 #x00000000
+    #xA9BF1FE6 #x580008A3 #xD53800A0 #x92400400 #x8B001863 #xF9401C61 #xB5000741 #xF9400C61
+    #xD51CE201 #xF9400862 #xF9401064 #x8B040C45 #x910060A5 #xF9400466 #xEB0600BF #x540005A8
+    #xAA042006 #xAA1840C6 #xD53C4021 #xF9000441 #xF900085E #x91006047 #xAA1D03E1 #x580005E0
+    #xF9408005 #xF9408400 #xD2800004 #xF9401062 #xEB02009F #x540001E2 #xF240083F #x540001A1
+    #xEB05003F #x54000163 #xEB00003F #x54000122 #xF9400422 #xF80084E2 #x91000484 #xF9400022
+    #xEB01005F #x54000069 #xAA0203E1 #x17FFFFF0 #xF9401062 #xEB02009F #x54000082 #xF80084FF
+    #x91000484 #x17FFFFFC #xF9400862 #xF9000046 #xF9401064 #x8B040C42 #x91006042 #xF9000862
+    #xF9401461 #x91000421 #xF9001461 #x14000006 #xF9401861 #x91000421 #xF9001861 #x14000002
+    #xD51CE23F #xA8C11FE6 #xA8C117E4 #xA8C10FE2 #xA8C107E0 #xD69F03E0 #x00000000 #x00000000
     #x58FFFFC3 #xD53800A0 #x92400400 #x8B001863 #xF9400C60 #xD51CE200 #xD53800A0 #x92400400
     #xD2A80001 #x91010021 #x8B000821 #xB9400022 #x321A0042 #xB9000022 #xD5033F9F #xD53C1100
     #xB27D0000 #xD51C1100 #xD5033FDF #xD2800020 #xD51CE220 #xD50341FF #xD5033FDF #xD65F03C0
@@ -211,23 +211,48 @@
           for c = (%perf-ctl core)
           collect (list core (%perf-u64 (+ c 40)) (%perf-u64 (+ c 48))))))
 
-(defun perf-report (&key (cores '(0 1 2 3)) (top 40) (stream *standard-output*))
+(defun perf-report (&key (cores '(0 1 2 3)) (top 40) (stream *standard-output*) alloc
+                        (alloc-max #x4000000))
   "Fold the rings into stacks and print the TOP: `count pc;x30;ret0;ret1...' in hex, leaf
-   first.  Also a flat top by PC.  The host symbolizes (net/bare-perf-report.py)."
+   first.  Also a flat top by PC.  The host symbolizes (net/bare-perf-report.py).
+   With ALLOC, a sample's weight is not 1 but the BYTES its core allocated since the core's
+   previous sample (each record carries the allocation pointer, x24 -- which holds the address
+   HALVED, a fixnum): an allocation profile on the same samples, read by the same host script.
+   On core 0 a step counts only when both samples lie in the same semispace of region 0 and
+   it goes up: a collection between them moves the pointer to the other space, and the first
+   attempt, which only capped the step, charged those jumps to whatever ran next (the
+   collector's caller) -- most of the total.  Elsewhere a step must be under ALLOC-MAX.  So the
+   bytes are a sample of what was allocated, not all of it."
   (let ((stacks (make-hash-table :test 'equal)) (flat (make-hash-table)) (n 0))
     (dolist (core cores)
       (let* ((c (%perf-ctl core)) (base (%perf-u64 c)) (wp (%perf-u64 (+ c 16)))
-             (depth (%perf-u64 (+ c 32))) (rec (* 8 (+ 3 depth))))
+             (depth (%perf-u64 (+ c 32))) (rec (* 8 (+ 3 depth))) (prev nil)
+             (rcb (and alloc (= core 0) (%conv-addr #x10000040)))
+             (sz (and rcb (%gc-read64 (+ rcb 16))))
+             (spaces (and rcb (list (%gc-read64 rcb) (%gc-read64 (+ rcb 8))))))
         (when (plusp base)
           (loop for r from base below wp by rec
                 do (let* ((pc (%perf-u64 (+ r 8)))
+                          (ap (* 2 (ash (%perf-u64 r) -16)))
+                          (w (if alloc
+                                 (let ((d (and prev (- ap prev))))
+                                   (cond ((or (null d) (< d 0)) 0)
+                                         (spaces
+                                          (if (find-if (lambda (s) (and (<= s prev) (< ap (+ s sz))))
+                                                       spaces)
+                                              d 0))
+                                         ((<= d alloc-max) d)
+                                         (t 0)))
+                                 1))
                           (frames (loop for i from 0 below depth
                                         for f = (%perf-u64 (+ r 24 (* 8 i)))
                                         until (zerop f) collect f))
                           (key (format nil "~x;~x~{;~x~}" pc (%perf-u64 (+ r 16)) frames)))
-                     (incf n)
-                     (incf (gethash pc flat 0))
-                     (incf (gethash key stacks 0)))))))
+                     (setq prev ap)
+                     (when (plusp w)
+                       (incf n w)
+                       (incf (gethash pc flat 0) w)
+                       (incf (gethash key stacks 0) w)))))))
     (flet ((top-of (h)
              (let ((l '())) (maphash (lambda (k v) (push (cons v k) l)) h)
                (subseq (sort l #'> :key #'car) 0 (min top (length l))))))

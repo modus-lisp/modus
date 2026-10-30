@@ -4276,6 +4276,16 @@ wrapper (it re-installs itself now).  A dead-looking definition in a file the
 SBCL host also loads (compiler, translators, boot, x64-asm) is NOT dead: it can
 be the host compiler's own.
 
+**DEFVAR proclaims its variable special (2026-10-30), as in CL.**  The compiler
+used to make a LET dynamic only for the CLHS-standard variables or under a
+`(declare (special ...))`, so a LET of any other DEFVAR'd name -- a kernel
+global from user code, or one of the kernel's own -- bound it lexically and
+callees read the old value.  Now every DEFVAR / DEFPARAMETER / DECLAIM SPECIAL
+in the image is proclaimed before any of it compiles, and at runtime a LET of a
+kernel global (`(let ((modus-int::*x* ...)) ...)`) or of a script's own DEFVAR
+binds dynamically.  `test/defvar-special.lisp`; build check C now fails only a
+LET of an earmuffed name nothing proclaims but other code reads as a global.
+
 Not in the old list and still worth knowing: an undeclared free variable is
 treated as a global (CL would make it special and warn; the same answer, but the
 boot-time `WARN: implicit global` lines are that), and `(eq #'f #'f)` is NIL at

@@ -645,81 +645,35 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
         findings)))))
 
 ;;; ============================================================
-;;; CHECK C (task #248) — LET of an UNREGISTERED special is a silent no-op
+;;; CHECK C (task #248) — LET of an earmuffed name NOTHING proclaims special
 ;;; ============================================================
 ;;;
-;;; compile-form's LET / LET* dispatch (mvm/compiler.lisp ~5153 and ~5180)
-;;; turns `(let ((*x* v)) …)` into a real dynamic binding — the
-;;; save / set-symbol-value / restore triple of COMPILE-LET-WITH-SPECIALS —
-;;; only when *X* is
+;;; CL: DEFVAR / DEFPARAMETER / (DECLAIM (SPECIAL ...)) proclaim the symbol
+;;; special, so a LET of it binds dynamically.  Until 2026-10-30 the MVM
+;;; compiler honoured that only for the CLHS-standard variables, so a LET of
+;;; any of the kernel's own specials bound LEXICALLY and callees read the
+;;; unchanged global (`(:default-initargs ...)' was never gated by
+;;; *CLOS-APPLYING-DEFAULTS* for exactly that reason).  This check existed to
+;;; find those LETs.  Now every symbol the image DEFVARs is proclaimed before
+;;; any of it compiles (%COLLECT-BLOB-SPECIAL-SYMBOLS), so a LET of a
+;;; DEFVAR'd name is dynamic and is not reported.
 ;;;
-;;;   (a) in the CLHS-standard specials table (%ENSURE-CLHS-SPECIALS-TABLE),
-;;;   (b) in *CLHS-EXTRA-SPECIALS* (build-ansi-common's per-file `declaim
-;;;       (special …)` allowlist), or
-;;;   (c) in *RUNTIME-SPECIAL-NAMES* — which is populated ONLY under
-;;;       *MVM-EVAL-RUNTIME-P*, i.e. never during a host build, or
-;;;   (d) named in a `(declare (special *x*))` in the LET's own body.
+;;; What is left is a LET of an earmuffed name that NO form of the image
+;;; proclaims, and that compiles as an ordinary lexical variable:
 ;;;
-;;; A name in none of those compiles as a PLAIN LEXICAL LET.  The special is
-;;; never bound; a callee — or the same function's own free reference from a
-;;; different lexical scope — reads the UNCHANGED global.  Nothing warns.
+;;;   DYNAMIC-INTENT  other top-level forms mention the name too: it reads as
+;;;                   a global meant to be bound, but nothing DEFVARs it.
+;;;                   These fail the build.  The fix is a DEFVAR.
+;;;   LEXICAL-ONLY    nothing outside the binding form mentions it: a lexical
+;;;                   variable that happens to wear earmuffs.  Reported only.
 ;;;
-;;; MEASURED, not inferred (scratch/probe-a.lisp, real compiler, this tree):
-;;;
-;;;   (defvar *clos-applying-defaults* nil)
-;;;   (defun rdr () *clos-applying-defaults*)
-;;;   (defun kernel-main () (let ((*clos-applying-defaults* t)) (rdr)))
-;;;        => 20 IR ops, zero symbol-value/set-symbol-value ops
-;;;
-;;;   (defun kernel-main () (let ((*print-base* 16)) (rdr2)))
-;;;        => 90 IR ops (the save/set/restore triple)
-;;;
-;;;   ... (let ((*my-flag* t)) (declare (special *my-flag*)) (rdr3))
-;;;        => 90 IR ops        <- the escape hatch, and the recommended fix
-;;;
-;;; Note the DEFVAR in probe 1: declaring the variable in the SAME blob does
-;;; NOT help.  That is the whole trap — the source reads as obviously dynamic.
-;;;
-;;; Real damage already done: `(:default-initargs …)` had never actually been
-;;; gated by *CLOS-APPLYING-DEFAULTS* because %MAKE-INSTANCE-LIST bound it with
-;;; a LET.  It surfaced only during c2896ac, when the spread call moved out of
-;;; the caller's frame, and was fixed at that one site with SETQ +
-;;; UNWIND-PROTECT.  The general hazard is live, hence this check.  It is the
-;;; THIRD distinct silent failure mode for LET-of-a-special, after a311671
-;;; fixed (1) leaking the binding on a non-local exit and (2) save/restoring a
-;;; CLHS 3.3.4 FREE declaration that establishes no binding at all.
-;;;
-;;; SEVERITY CLASSIFICATION.  Not every hit is a bug.  A LET of an earmuffed
-;;; name that nothing outside the binding form ever reads is legal, if ugly:
-;;; the lexical binding is exactly what the code gets and exactly what it uses.
-;;; So each finding is graded:
-;;;
-;;;   DYNAMIC-INTENT  the name is DEFVAR/DEFPARAMETER'd in this blob AND is
-;;;                   read or written free by at least one OTHER top-level
-;;;                   form.  The binding is meant to be seen through a call.
-;;;                   These are the true positives.
-;;;   LEXICAL-ONLY    no other top-level form mentions the name.  Deliberate
-;;;                   (or at least harmless) lexical use of an earmuffed name.
-;;;
-;;; Only DYNAMIC-INTENT findings are eligible to fail the build.
-;;;
-;;; KNOWN BLIND SPOTS, stated rather than discovered later:
-;;;   * A LET inside a DEFMACRO template that expands at RUNTIME may be fine
-;;;     even when reported: mvm-eval's compiler consults *RUNTIME-SPECIAL-NAMES*
-;;;     (populated by runtime DEFVAR), which a host build cannot see.  None of
-;;;     the findings measured at 6de6fc3 are of that shape — all are direct
-;;;     DEFUN bodies — but a future one might be, and the fix
-;;;     (`(declare (special *X*))') is correct either way.
-;;;   * Only EARMUFFED names are scanned.  A special without earmuffs has the
-;;;     same hazard and is invisible here; the convention is the signal.
-;;;   * A blob over *GLOBAL-CHECK-MAX-BLOB-CHARS* is skipped along with checks
-;;;     A and B — i.e. the four ANSI gate runners, which are not shipped.
+;;; Only EARMUFFED names are scanned; the convention is the signal.
 
 (defvar *global-check-let-special-allowlist*
   '(;; -- add entries as "NAME"  ; reason
     )
-  "Upcased names exempt from check C.  Prefer `(declare (special *X*))' at the
-   LET — that FIXES the code instead of silencing the report.  This list means
+  "Upcased names exempt from check C.  Prefer a DEFVAR of the name -- that
+   FIXES the code instead of silencing the report.  This list means
    \"not a bug\"; use *GLOBAL-CHECK-LET-SPECIAL-BASELINE* for \"a bug we have
    not fixed yet\".")
 
@@ -851,12 +805,14 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
           (destructuring-bind (name kind tl line) h
             (let* ((declaredp (gethash name declared-vars))
                    (mentioned (gethash name mentions 0))
-                   (dynamicp (and declaredp (> mentioned 1)))
+                   (dynamicp (and (not declaredp) (> mentioned 1)))
                    (s (format nil "LET-OF-UNREGISTERED-SPECIAL ~A in ~A~@[ (blob line ~D)~] — ~
-the ~A binds it LEXICALLY; the global is never set, so callees read the old ~
-value.~:[~; The name is DEFVAR'd here and mentioned by ~:*~D top-level forms.~]"
+the ~A binds it LEXICALLY: no DEFVAR, DEFPARAMETER or DECLAIM SPECIAL in the ~
+image proclaims it.~:[~; ~:*~D top-level forms mention it, so it reads as a ~
+global meant to be bound dynamically: DEFVAR it.~]"
                                name tl line kind (and dynamicp mentioned))))
-              (cond ((not dynamicp) (push s lexical))
+              (cond (declaredp nil)   ; proclaimed: the LET binds it dynamically
+                    ((not dynamicp) (push s lexical))
                     ((assoc name *global-check-let-special-baseline* :test #'equal)
                      (push s baselined))
                     (t (push s dynamic))))))
@@ -865,7 +821,7 @@ value.~:[~; The name is DEFVAR'd here and mentioned by ~:*~D top-level forms.~]"
               baselined (nreverse baselined))
         (format t "~&;; check-let-of-unregistered-special (~A): ~D LET/LET* of an ~
 unregistered earmuffed name — ~D DYNAMIC-INTENT (~D baselined), ~D LEXICAL-ONLY~%"
-                label (length hits) (+ (length dynamic) (length baselined))
+                label (+ (length dynamic) (length baselined) (length lexical)) (+ (length dynamic) (length baselined))
                 (length baselined) (length lexical))
         (when lexical
           (format t "~{;;   [lexical-only] ~A~%~}"

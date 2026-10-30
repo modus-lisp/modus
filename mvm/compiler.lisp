@@ -1524,6 +1524,50 @@
        (symbolp var)
        (gethash (normalize-name var) *runtime-special-names*)))
 
+(defvar *build-special-symbols* nil
+  "Build time: the SYMBOLS proclaimed special (EQ hash) -- every DEFVAR,
+   DEFPARAMETER and (DECLAIM (SPECIAL ...)) of the image, collected by
+   MVM-COMPILE-ALL before it compiles anything, plus any compiled later.  CLHS: DEFVAR proclaims its symbol special, so a later
+   LET of it binds dynamically.  This compiler used to honour that only for
+   the CLHS-standard variables, so a LET of the kernel's own specials bound
+   LEXICALLY (#248).  By SYMBOL, not by name: an earlier attempt keyed by name
+   made every package's *X* special the moment any package DEFVARed one.")
+
+(defun %note-build-special (sym)
+  (when (and (not *mvm-eval-runtime-p*) (symbolp sym) sym)
+    (unless *build-special-symbols*
+      (setq *build-special-symbols* (make-hash-table :test 'eq)))
+    (setf (gethash sym *build-special-symbols*) t)))
+
+(defun %declaim-note-special-build (form)
+  "Build time: (DECLAIM (SPECIAL v ...)) proclaims each V (see %NOTE-BUILD-SPECIAL)."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)) (name-eq (car s) "SPECIAL"))
+        (dolist (v (cdr s)) (%note-build-special v))))))
+
+(defun %kernel-special-symbol-p (var)
+  "Runtime compile: VAR is one of the kernel's own globals -- homed in a kernel
+   package and named in the build's list of them -- which the image's code
+   (compiled ahead of time) treats as special."
+  (and *mvm-eval-runtime-p* (symbolp var) var
+       (boundp '*kernel-global-names*) *kernel-global-names*
+       (gethash (symbol-name var) *kernel-global-names*)
+       (let ((p (symbol-package var)))
+         (and p (fboundp '%kernel-home-pkg-name-p)
+              (funcall '%kernel-home-pkg-name-p (package-name p))))))
+
+(defun %proclaimed-special-p (var)
+  "VAR is proclaimed special: by a DEFVAR / DEFPARAMETER / DECLAIM compiled
+   earlier (at build time by symbol, at runtime by name), or as one of the
+   kernel's globals."
+  (or (%runtime-special-p var)
+      (and (not *mvm-eval-runtime-p*) *build-special-symbols* (symbolp var)
+           (gethash var *build-special-symbols*))
+      (%kernel-special-symbol-p var)))
+
 ;;; (*LET-SKIP-IMPLICIT-SPECIALS*, a recursion guard COMPILE-LET-WITH-SPECIALS
 ;;; bound around its re-compile, is gone: the forms it re-compiles bind no
 ;;; special by name -- the specials are renamed to temporaries, or filtered
@@ -8355,7 +8399,7 @@
                                                  :test #'string=)
                                          ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
-                                         (%runtime-special-p var))
+                                         (%proclaimed-special-p var))
                                      (not (member (normalize-name var) declared
                                                   :key #'normalize-name)))
                             (push var acc))))
@@ -8387,7 +8431,7 @@
                                                  :test #'string=)
                                          ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
-                                         (%runtime-special-p var))
+                                         (%proclaimed-special-p var))
                                      (not (member (normalize-name var) declared
                                                   :key #'normalize-name)))
                             (push var acc))))
@@ -8761,6 +8805,7 @@
          (%note-global var-name :def)
          (setf (gethash name-hash *globals*) t)
          (%note-runtime-special name-hash)
+         (%note-build-special var-name)
          (when has-initform
            ;; %GLOBAL-NAME-KEY, not NAME-HASH: the STORE key must match what
            ;; a later read emits (task #241 -- a runtime-born package's
@@ -10144,6 +10189,7 @@
        ;; Still a runtime no-op, but DECLAIM/PROCLAIM carry the optimize
        ;; policy, so read the level out on the way past.
        (%declaim-note-optimize form)
+       (unless *mvm-eval-runtime-p* (%declaim-note-special-build form))
        (when *mvm-eval-runtime-p*
          (%declaim-note-inline form)
          (%declaim-note-type form)
@@ -23511,6 +23557,33 @@
       (dolist (f forms) (walk f)))
     h))
 
+(defun %collect-blob-special-symbols (forms)
+  "The symbols the blob's toplevel DEFVAR / DEFPARAMETER / (DECLAIM (SPECIAL
+   ...)) proclaim special (EQ hash).  Proclaimed for the WHOLE image before any
+   of it compiles: the kernel is one program, and a DEFVAR placed after a LET of
+   its variable must not make that LET lexical."
+  (let ((h (make-hash-table :test 'eq)))
+    (labels ((walk (f)
+               (when (and (consp f) (symbolp (car f)))
+                 (let ((s (symbol-name (car f))))
+                   (cond
+                     ((or (string= s "PROGN") (string= s "EVAL-WHEN"))
+                      (dolist (g (if (string= s "EVAL-WHEN") (cddr f) (cdr f)))
+                        (walk g)))
+                     ((and (or (string= s "DEFVAR") (string= s "DEFPARAMETER"))
+                           (consp (cdr f)) (symbolp (cadr f)) (cadr f))
+                      (setf (gethash (cadr f) h) t))
+                     ((or (string= s "DECLAIM") (string= s "PROCLAIM"))
+                      (dolist (spec (cdr f))
+                        (let ((sp (if (and (consp spec) (eq (car spec) 'quote))
+                                      (cadr spec) spec)))
+                          (when (and (consp sp) (symbolp (car sp))
+                                     (string= (symbol-name (car sp)) "SPECIAL"))
+                            (dolist (v (cdr sp))
+                              (when (and v (symbolp v)) (setf (gethash v h) t))))))))))))
+      (dolist (f forms) (walk f)))
+    h))
+
 (defun %blob-defines-global-p (name)
   (and *blob-global-names* (gethash (normalize-name name) *blob-global-names*)))
 
@@ -28971,7 +29044,7 @@
               (and (> (length n) 0) (char= (char n 0) #\&))))
        (or (gethash (normalize-name var) (%ensure-clhs-specials-table))
            (member (symbol-name var) *clhs-extra-specials* :test #'string=)
-           (%runtime-special-p var)
+           (%proclaimed-special-p var)
            ;; by NORMALIZE-NAME, not SYMBOL-NAME: in an image whose name
            ;; table lacks a symbol, SYMBOL-NAME is "" for every such symbol, so
            ;; (declare (special *f*)) made an unrelated *x* parameter special
@@ -30415,6 +30488,7 @@
        (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
+       (%note-build-special name)
        ;; Compile as a thunk that initializes the variable
        ;; IMPORTANT: 1) Use raw name-hash (NOT pre-shifted), because
        ;; compile-integer will apply fixnum-shift. Pre-shifting causes
@@ -30462,6 +30536,7 @@
        (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
+       (%note-build-special name)
        (when has-initform
          (let ((tmp-var (%mvm-gensym "INIT-TMP"))
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
@@ -30503,7 +30578,8 @@
      (when (and *aot-inline* (not *mvm-eval-runtime-p*))
        (%declaim-note-inline form))
      (unless *mvm-eval-runtime-p*
-       (%declaim-note-overridable form))
+       (%declaim-note-overridable form)
+       (%declaim-note-special-build form))
      (when *mvm-eval-runtime-p*
        (%declaim-note-inline form)
        (%declaim-note-type form)
@@ -31468,6 +31544,8 @@
     ;; *MVM-GENSYM-COUNTER* above.
     (setq *multi-shape-defuns* (%collect-multi-shape-defuns forms))
     (setq *blob-global-names* (%collect-blob-global-names forms))
+    (unless *mvm-eval-runtime-p*
+      (setq *build-special-symbols* (%collect-blob-special-symbols forms)))
     ;; Diagnostic dump behind a plain special (set it by hand), not #+sbcl +
     ;; posix-getenv + a LAMBDA: a feature conditional reads differently under
     ;; SBCL's reader and Modus's own, and the closure it hid was the one

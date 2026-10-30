@@ -7820,8 +7820,13 @@
          (form (if (and *mvm-eval-runtime-p* (consp form))
                    (let ((*%macroexpand-env* env))
                      (declare (special *%macroexpand-env*))
+                     ;; Impure: the error was a fact about the image at THIS
+                     ;; compile (an unbound variable, a function not yet
+                     ;; defined), so EVAL must not cache the compiled form.
                      (handler-case (macroexpand-mvm form)
-                       (error (c) (list 'error (list 'quote c)))))
+                       (error (c)
+                         (setq *%mexp-impure* t)
+                         (list 'error (list 'quote c)))))
                    (macroexpand-mvm form))))
    (%cf-trace-note form)
    (when %stmt-unused (%fp-diag-bump 3))

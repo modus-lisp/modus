@@ -8473,11 +8473,17 @@
                         (%symbol-macro-places-rewrite form env))
                    form))
          (form (or (%dotimes-typed-counter form env) form))
-         ;; Expanders see ENV (*%MACROEXPAND-ENV*, image only).
+         ;; Expanders see ENV (*%MACROEXPAND-ENV*, image only).  An ERROR from an
+         ;; expander becomes the form's run-time behaviour: the same condition is
+         ;; signalled when the form runs, and the function around it is still
+         ;; defined -- SBCL's rule.  Before, one bad subform lost the whole DEFUN
+         ;; (TI's SELECT-MATCH-MATCHITEMS, whose one LOOP does not expand, and every
+         ;; STRING-EQUAL caller with it).
          (form (if (and *mvm-eval-runtime-p* (consp form))
                    (let ((*%macroexpand-env* env))
                      (declare (special *%macroexpand-env*))
-                     (macroexpand-mvm form))
+                     (handler-case (macroexpand-mvm form)
+                       (error (c) (list 'error (list 'quote c)))))
                    (macroexpand-mvm form))))
    (%cf-trace-note form)
    (when %stmt-unused (%fp-diag-bump 3))
@@ -12056,7 +12062,7 @@
              (setq r (cdr r)))
            (emit-ir-label through))))
     ((and (consp test) (symbolp (car test)) (not (keywordp (car test)))
-          (let ((x (macroexpand-mvm test))) (and (not (eq x test)) (setq test x))))
+          (let ((x (%quiet-macroexpand test))) (and (not (eq x test)) (setq test x))))
      (%compile-test-branch test env dest false-label))
     ((%compile-predicate-branch test env dest false-label) nil)
     (t
@@ -19831,6 +19837,15 @@
           (funcall '%hc-barrier-pop prev)))
       (handler-case (macroexpand-1-mvm form) (t (c) (progn c nil)))))
 
+;; A look through macros that must not fail the compile: on an expander error
+;; the form stays as written, and COMPILE-FORM meets the error where it makes
+;; the form's run-time signal.
+(defun %quiet-macroexpand (form)
+  (loop
+    (let ((r (%quiet-macroexpand-1 form)))
+      (unless (and r (cdr r)) (return form))
+      (setq form (car r)))))
+
 (defun %walker-macroexpand (form)
   "Bounded, error-safe full macroexpansion for the escape/unsafe walkers
    (%return-from-escapes-block-p / %block-runtime-catch-unsafe-p).
@@ -21316,7 +21331,7 @@
           ;; call: judge its expansion (CASE, PROG1, SETF ... were all
           ;; "possibly multi-valued" by name alone).  Deciding only -- the
           ;; form itself is not rewritten here.
-          (t (let ((r (macroexpand-1-mvm form)))
+          (t (let ((r (%quiet-macroexpand-1 form)))
                (if (and (cdr r) (not (equal (car r) form)))
                    (tail-form-is-values-p (list (car r)))
                    t))))))))
@@ -21418,7 +21433,7 @@
                             "ETYPECASE" "CTYPECASE" "PROG1" "PROG2")
                        :test #'string=)
                (tail-form-is-values-p (list form)))
-          (let ((r (macroexpand-1-mvm form)))
+          (let ((r (%quiet-macroexpand-1 form)))
             (if (and (cdr r) (not (equal (car r) form)))
                 (%mv-clamp-tail (car r))
                 form)))
@@ -22888,7 +22903,7 @@
    that finds them on non-float operands rejects the tree, and the ordinary
    compile expands them as before."
   (if (and (consp form) (not (%fp-abs-p form)) (not (%fp-minmax-op form)))
-      (macroexpand-mvm form)
+      (%quiet-macroexpand form)
       form))
 
 ;;; The FP-register ops a float tree was missing (mvm.lisp +op-fp-op1+ ..

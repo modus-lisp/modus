@@ -530,7 +530,9 @@
 ;; WHILE IT WAITS: seams a threads layer (net/bare-threads.lisp, linked after this
 ;; file) overrides by last-defun-wins -- poll rather than block, and run what may run
 ;; on this core meanwhile.  Here: block, and nothing.
+(declaim (overridable %console-wants-poll))
 (defun %console-wants-poll () nil)
+(declaim (overridable %console-idle))
 (defun %console-idle () nil)
 
 (defun hid-console-read-char ()

@@ -314,9 +314,12 @@ build-cli-common, which must agree); `MODUS_X64_GEN=0` builds the control.
   three shapes, and it was worse:** on the Pi 5 the audited control showed violations in 14
   of 58 runs and failed 9 at the end.  Ported to `translate-aarch64.lisp`
   (`a64-card-young-check`, the major step's fin, copy_object's `co-fwd`), all gated on
-  `*a64-tls-window*`: 337/337 audited runs clean.  The count-based refresh below is x64 only.
-  aarch64's safe-leave path still refreshes only after a spin, and that code also runs on
-  the bare-metal board, which this round did not test.
+  `*a64-tls-window*`: 337/337 audited runs clean.  The count-based refresh below is ported
+  to HOSTED aarch64 (`*aarch64-linux-mode*`): the snapshot is in the window word at
+  0x10005010, taken before a park and at safe-enter, and also refreshed on safe-leave's
+  direct path.  The bare-metal board keeps the range test, because there a sibling
+  collection does not write region 0's block (release writes it only as the STW
+  collector), so a reload triggered by the count would read a stale frontier.
 - **The STW refresh counts collections.**  A thread that parks, enters a safe region, or
   blocks in a syscall snapshots region 0's collection count (`fs:0x10005010`).  On the way
   out, a different count reloads R12/R14 from region 0's block.  The old test was "R12

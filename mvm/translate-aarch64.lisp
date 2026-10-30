@@ -3584,6 +3584,8 @@
                   (let ((skip (incf *mvm-label-counter*)))
                     (a64-stw-table buf +a64-x9+ skip)
                     (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+                    (when *aarch64-linux-mode*
+                      (a64-r0-count-snapshot buf +a64-x10+ +a64-x11+ +a64-x12+))
                     (a64-stw-publish buf +a64-x14+ 2)
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
@@ -3603,9 +3605,14 @@
                 ;; which has not changed since %GC-SAFE-ENTER published it —
                 ;; wait for the flag to clear, and try again.  Returns NIL.
                 (when *a64-tls-window*
-                  (let ((skip (incf *mvm-label-counter*))
-                        (again (incf *mvm-label-counter*))
-                        (spin (incf *mvm-label-counter*)))
+                  (let* ((skip (incf *mvm-label-counter*))
+                         (again (incf *mvm-label-counter*))
+                         (spin (incf *mvm-label-counter*))
+                         ;; RUNNING with the flag clear -- but a WHOLE region-0
+                         ;; collection may have come and gone while this thread
+                         ;; was safe (a sleep), and nothing else reloads x24/x25
+                         ;; (translate-x64's EMIT-X64-GC-SAFE-TRAP).  Hosted.
+                         (running (if *aarch64-linux-mode* (incf *mvm-label-counter*) skip)))
                     (a64-stw-table buf +a64-x9+ skip)
                     (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
                     (a64-set-label buf again)
@@ -3616,7 +3623,7 @@
                     (a64-ldar buf +a64-x12+ +a64-x11+)
                     (a64-cmp-imm buf +a64-x12+ 0)
                     (let ((i (a64-current-index buf)))
-                      (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+                      (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i running :bcond))
                     (a64-movz buf +a64-x10+ 2 0)                    ; safe again
                     (a64-dmb buf #xB)
                     (a64-str-unsigned buf +a64-x10+ +a64-x14+ #x68)
@@ -3635,6 +3642,11 @@
                       (a64-set-label buf back))
                     (let ((i (a64-current-index buf)))
                       (a64-b buf 0) (a64-add-fixup buf i again :b))
+                    (when *aarch64-linux-mode*
+                      (a64-set-label buf running)
+                      (let ((back (incf *mvm-label-counter*)))
+                        (emit-aarch64-stw-refresh buf back)
+                        (a64-set-label buf back)))
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
                ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0541))
@@ -7647,30 +7659,62 @@
     (a64-movz buf +a64-x25+ 0 0)
     (a64-set-label buf skip)))
 
+(defconstant +a64-stw-r0-count-addr+ #x10005010
+  "Per-thread window word: region 0's collection count (its block's
+   +GC-OFF-COUNT+) when this thread last STOPPED -- parked or went safe
+   (translate-x64's +STW-R0-COUNT-ADDR+, the same window word).  Hosted only.")
+
+(defun a64-r0-count-snapshot (buf v a s)
+  "This thread's window word +A64-STW-R0-COUNT-ADDR+ := region 0's collection
+   count.  Taken while the thread is still RUNNING, before it publishes that it
+   has stopped, so no region-0 collection can come in between.  V, A, S are
+   distinct scratch registers."
+  (a64-load-real-addr buf v (conv-real #x10000040))
+  (a64-ldr-unsigned buf v v +gc-off-count+)
+  (a64-load-tls-addr buf a +a64-stw-r0-count-addr+ s)
+  (a64-str-unsigned buf v a 0))
+
 (defun emit-aarch64-stw-refresh (buf changed)
   "REGION 0 CAN BE COLLECTED BY ANOTHER THREAD (a worker refilling the lock
    arena, EVACUATING THE LOCK ARENA), which leaves this thread's x24/x25 —
    if region 0 is its active region — in the evacuated semispace.  That
    collector left the new frontier and limit in region 0's block (+0x30/
-   +0x38).  So: region 0 active and x24 outside [from, from+size]?  Reload
-   both and branch to CHANGED.  Uses x10-x12, x15, x16."
+   +0x38).  Region 0 active and collected since this thread stopped?  Reload
+   both and branch to CHANGED.  Uses x10-x12, x15, x16.
+
+   HOSTED: \"collected since\" is region 0's collection count against the
+   snapshot this thread took when it stopped (A64-R0-COUNT-SNAPSHOT).  It used
+   to be \"x24 outside [from, from+size]\", which a stale x24 passes again
+   after TWO flips (translate-x64's EMIT-X64-STW-REFRESH).  BARE METAL keeps
+   the range test: a sibling collection there does not write region 0's
+   block (EMIT-AARCH64-STW-RELEASE writes it only as the STW collector), so a
+   count-triggered reload would read a stale frontier."
   (let ((same (incf *mvm-label-counter*)))
     (a64-load-gc-region buf +a64-x15+ +a64-x16+)
     (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
     (a64-cmp-reg buf +a64-x15+ +a64-x10+)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i same :bcond))
-    (a64-ldr-unsigned buf +a64-x11+ +a64-x15+ +gc-off-from-start+)
-    (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)
-    (a64-ldr-unsigned buf +a64-x12+ +a64-x15+ +gc-off-space-size+)
-    (a64-asr-imm buf +a64-x12+ +a64-x12+ 1)
-    (a64-add-reg buf +a64-x12+ +a64-x12+ +a64-x11+ 0 0)
-    (let ((stale (incf *mvm-label-counter*)))
-      (a64-cmp-reg buf +a64-x24+ +a64-x11+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i stale :bcond))
-      (a64-cmp-reg buf +a64-x24+ +a64-x12+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i same :bcond))
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i same :bcond))
-      (a64-set-label buf stale))
+    (if *aarch64-linux-mode*
+        (progn
+          (a64-ldr-unsigned buf +a64-x11+ +a64-x15+ +gc-off-count+)
+          (a64-load-tls-addr buf +a64-x12+ +a64-stw-r0-count-addr+ +a64-x16+)
+          (a64-ldr-unsigned buf +a64-x10+ +a64-x12+ 0)
+          (a64-cmp-reg buf +a64-x11+ +a64-x10+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i same :bcond))
+          (a64-str-unsigned buf +a64-x11+ +a64-x12+ 0))
+        (progn
+          (a64-ldr-unsigned buf +a64-x11+ +a64-x15+ +gc-off-from-start+)
+          (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)
+          (a64-ldr-unsigned buf +a64-x12+ +a64-x15+ +gc-off-space-size+)
+          (a64-asr-imm buf +a64-x12+ +a64-x12+ 1)
+          (a64-add-reg buf +a64-x12+ +a64-x12+ +a64-x11+ 0 0)
+          (let ((stale (incf *mvm-label-counter*)))
+            (a64-cmp-reg buf +a64-x24+ +a64-x11+)
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i stale :bcond))
+            (a64-cmp-reg buf +a64-x24+ +a64-x12+)
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i same :bcond))
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i same :bcond))
+            (a64-set-label buf stale))))
     (a64-ldr-unsigned buf +a64-x24+ +a64-x15+ +gc-off-saved-alloc+)
     (a64-asr-imm buf +a64-x24+ +a64-x24+ 1)
     (a64-ldr-unsigned buf +a64-x25+ +a64-x15+ +gc-off-saved-limit+)
@@ -7700,6 +7744,8 @@
       (a64-cmp-reg buf +a64-x12+ +a64-x13+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no-park :bcond))
       (a64-mov-reg buf +a64-x13+ +a64-x24+)                           ; x24 before the park
+      (when *aarch64-linux-mode*                  ; park clobbers x15-x17 anyway
+        (a64-r0-count-snapshot buf +a64-x15+ +a64-x17+ +a64-x16+))
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i park :bl))
       (emit-aarch64-stw-refresh buf reloaded)
       (a64-set-label buf no-park)
@@ -8907,6 +8953,9 @@
       (a64-str-unsigned buf +a64-x12+ +a64-x11+ +gc-off-saved-alloc+)
       (a64-lsl-imm buf +a64-x12+ +a64-x25+ 1)
       (a64-str-unsigned buf +a64-x12+ +a64-x11+ +gc-off-saved-limit+)
+      ;; The collector's own x24 IS the new frontier: nothing to reload.
+      (when *aarch64-linux-mode*
+        (a64-r0-count-snapshot buf +a64-x12+ +a64-x11+ +a64-x10+))
       (a64-load-real-addr buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
       (a64-dmb buf #xB)
       (a64-str-unsigned buf +a64-xzr+ +a64-x11+ 0)

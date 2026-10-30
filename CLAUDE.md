@@ -1043,8 +1043,8 @@ per heap store (aarch64: 2 instructions; x64: an inline mark, see below).
   `gc-major-threads` showed young pointers on clean cards in 1 run in 4 when audited
   after every major, and a TYPE-ERROR in 1 in 75.  The refresh after a park, safe
   trap or blocking syscall compares region 0's collection COUNT (`fs:0x10005010`),
-  not R12's range: after two flips a stale R12 is back in from-space (x64 only;
-  aarch64 still uses the range test).
+  not R12's range: after two flips a stale R12 is back in from-space (x64 and
+  hosted aarch64; the bare-metal board keeps the range test).
 - **i386, riscv, arm32: not ported.**  `gc-tenure` refuses loudly there.
 - **Tenure without cards (`:cards nil`)** still makes the card vector, so it is old,
   and `gc-untenure` switches the cards on before its major (`*gc-cards-pending*`).

@@ -21,7 +21,7 @@
 ;;;; IT USES THE REAL STAGING BUFFER
 ;;;; ============================================================
 ;;;;
-;;;; (STAGING-BASE-ADDR) after %HA-ACTORS-BRINGUP — the same memory the live
+;;;; (modus-int::STAGING-BASE-ADDR) after %HA-ACTORS-BRINGUP — the same memory the live
 ;;;; actor path encodes into.  An earlier harness used a private
 ;;;; %MMAP-SHARED-PAGE and faulted on CONS, a path nobody had touched, which
 ;;;; sent a whole diagnostic down the wrong hole.  Use the buffer the system
@@ -61,14 +61,14 @@
              (format t "FAIL ~a: got ~s want ~s~%" name got want))))
 
 ;; The actor band has to exist before there is a staging buffer to encode into.
-(%ha-actors-bringup 16 0)
+(modus-int::%ha-actors-bringup 16 0)
 
 (defun rt (v)
   "Encode V into the real staging buffer and decode it straight back."
-  (let ((buf (staging-base-addr)))
-    (term-encode v buf)
-    (setf (mem-ref (decode-ptr-addr) :u64) buf)
-    (term-decode-step)))
+  (let ((buf (modus-int::staging-base-addr)))
+    (modus-int::term-encode v buf)
+    (setf (mem-ref (modus-int::decode-ptr-addr) :u64) buf)
+    (modus-int::term-decode-step)))
 
 (format t "~&=== THE GUARD: a shape the serialiser has always handled ===~%")
 (let* ((c (cons 11 22))
@@ -151,7 +151,7 @@
 
 (format t "~&~%=== THROUGH THE REAL MAILBOX (SEND / RECEIVE) ===~%")
 
-(defun via-mailbox (v) (send 1 v) (receive))
+(defun via-mailbox (v) (modus-int::send 1 v) (modus-int::receive))
 
 (chk "a fixnum survives the mailbox" (via-mailbox 42) 42)
 (chk "a cons survives the mailbox" (via-mailbox (cons 1 2)) (cons 1 2))

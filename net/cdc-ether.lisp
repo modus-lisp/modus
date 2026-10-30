@@ -229,14 +229,6 @@
 (defun cdcether-probe ()
   (cdc-ether-init))
 
-;; Thin e1000-* forwarders: images WITHOUT net/usb-netdev.lisp keep today's
-;; behaviour (cdc-ether IS the NIC).  Where usb-netdev.lisp is loaded (LAST),
-;; its dispatchers win last-defun-wins and these are shadowed.
-(defun e1000-send (buf len) (cdcether-send buf len))
-(defun e1000-receive () (cdcether-receive))
-(defun e1000-rx-buf () (cdcether-rx-buf))
-(defun e1000-probe () (cdcether-probe))
-
 ;; ============================================================
 ;; E1000 register stubs (called by ip.lisp init functions)
 ;; These are no-ops since we don't have E1000 hardware.

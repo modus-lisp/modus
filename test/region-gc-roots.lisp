@@ -37,7 +37,7 @@
 (defvar *nlinks* 4000)
 (defvar *fail* 0)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (if (= got want)
@@ -57,7 +57,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A ~X is NOT inside [~X,~X)~%" name addr lo (+ lo len)))))
 
-(let ((res (%gc-region-roots-selftest *nlinks*)))
+(let ((res (modus-int::%gc-region-roots-selftest *nlinks*)))
   (if (= res 0)
       (format t "~%SKIP: the active region is too small to carve two regions from.~%")
       (let* ((rcb1 (w res 0))    (rcb2 (w res 8))    (r0 (w res 16))

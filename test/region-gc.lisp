@@ -21,7 +21,7 @@
 (defvar *nlinks* 4000)
 (defvar *fail* 0)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (if (= got want)
@@ -41,7 +41,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A ~X is NOT inside [~X,~X)~%" name addr lo (+ lo len)))))
 
-(let ((res (%gc-region-selftest *nlinks*)))
+(let ((res (modus-int::%gc-region-selftest *nlinks*)))
   (if (= res 0)
       (format t "~%SKIP: the active region is too small to carve two regions from.~%")
       (let* ((rcb1 (w res 0))   (rcb2  (w res 8))   (r0    (w res 16))
@@ -109,13 +109,13 @@
         ;; a collector that never ran would pass.  So collect region 0 (which
         ;; is active again) and watch all three counts.
         (format t "~%=== AND THE OTHER WAY ROUND: COLLECT REGION 0 ============~%")
-        (let ((p0 (%gc-read64 (+ r0 32)))
-              (p1 (%gc-read64 (+ rcb1 32)))
-              (p2 (%gc-read64 (+ rcb2 32))))
-          (%gc-collect-here)
-          (let ((q0 (%gc-read64 (+ r0 32)))
-                (q1 (%gc-read64 (+ rcb1 32)))
-                (q2 (%gc-read64 (+ rcb2 32))))
+        (let ((p0 (modus-int::%gc-read64 (+ r0 32)))
+              (p1 (modus-int::%gc-read64 (+ rcb1 32)))
+              (p2 (modus-int::%gc-read64 (+ rcb2 32))))
+          (modus-int::%gc-collect-here)
+          (let ((q0 (modus-int::%gc-read64 (+ r0 32)))
+                (q1 (modus-int::%gc-read64 (+ rcb1 32)))
+                (q2 (modus-int::%gc-read64 (+ rcb2 32))))
             (chk "region 0 collections rose" q0 (+ p0 1))
             (chk "region 1 collections unchanged" q1 p1)
             (chk "region 2 collections unchanged" q2 p2)))

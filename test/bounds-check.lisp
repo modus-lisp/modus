@@ -12,7 +12,7 @@
 ;;;; must still return the right values.
 
 (defvar *interp* (equal (sb-ext:posix-getenv "BOUNDS_MODE") "interp"))
-(when *interp* (setq *jit-inhibit* t))
+(when *interp* (setq modus-int::*jit-inhibit* t))
 
 (defvar *checks* 0)
 (defvar *fails* 0)

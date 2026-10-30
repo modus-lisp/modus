@@ -32,7 +32,7 @@
           (setq n (+ n 1))
           (setq w (mem-ref (+ b 8) :u32))))))
 
-(defun arch-hw-random-fill (addr n)
+(defun modus.ssh::arch-hw-random-fill (addr n)
   (%bcm-rng-init)
   (let ((ok 1) (i 0))
     (loop

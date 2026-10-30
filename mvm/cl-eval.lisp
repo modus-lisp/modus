@@ -94,6 +94,42 @@
     (puthash sym *sym-qn-memo* (cons (%cl-sym-package sym) pair)))
   pair)
 
+(defvar *kernel-fn-names* nil
+  "The names of the image's own non-CL functions (EQUAL hash), snapshotted by
+   %SNAPSHOT-KERNEL-FN-NAMES at the end of boot's function-table seeding.  A
+   symbol that is NOT the kernel's own but has one of these names -- a
+   CL-USER::%FORMAT-IMPL -- gets its own key, \"PKG::NAME\", so defining it
+   cannot replace the kernel's function (builder packages step 4, phase B).")
+
+(defun %snapshot-kernel-fn-names ()
+  (let ((h (make-hash-table :test (function equal))))
+    (when *symbol-function-table*
+      (maphash (lambda (k v)
+                 (declare (ignore v))
+                 (when (and (stringp k) (> (length k) 0) (not (search "::" k))
+                            (not (eq (nth-value 1 (find-symbol k "COMMON-LISP"))
+                                     :external)))
+                   (puthash k h t)))
+               *symbol-function-table*))
+    (setq *kernel-fn-names* h)))
+
+(defun %kernel-home-pkg-name-p (pn)
+  "The packages the image itself defines functions in."
+  (and pn (or (member pn (quote ("MODUS-INT" "COMMON-LISP" "MODUS.ASM" "MODUS.RUNTIME"
+                                 "MODUS.MVM.X64" "MODUS.MVM.I386"))
+                     :test (function string=))
+              (%kernel-package-name-p pn))
+       t))
+
+(defun %kernel-shadow-key (pkg nm)
+  "\"PKG::NM\" when a symbol of PKG named NM must not share the kernel's
+   function cell: PKG is not a kernel package and NM is a kernel function's
+   name.  NIL otherwise (the bare key is right)."
+  (let ((pn (and pkg (%pkg-name pkg))))
+    (and pn *kernel-fn-names* (gethash nm *kernel-fn-names*)
+         (not (%kernel-home-pkg-name-p pn))
+         (concatenate 'string pn "::" nm))))
+
 (defun %sym-name-or-hash (sym)
   "Return (cons NAME-STR HASH) for SYM if it's any flavor of symbol:
    - CL-symbol wrapper:    (NAME . HASH-of-NAME)
@@ -161,8 +197,13 @@
                ;; Bare key (system / build-baked package) — byte-identical
                ;; to the historical behavior; keeps CL functions reachable
                ;; through both native #x50 syms (boot) and COMMON-LISP
-               ;; wrappers (user code).
-               (%sym-qn-remember sym (cons nm (compute-name-hash nm))))))))
+               ;; wrappers (user code) -- unless this symbol only SHARES a
+               ;; kernel function's name (%KERNEL-SHADOW-KEY).
+               (let ((sk (%kernel-shadow-key pkg nm)))
+                 (%sym-qn-remember sym
+                   (if sk
+                       (cons sk (compute-name-hash sk))
+                       (cons nm (compute-name-hash nm))))))))))
     ((stringp sym)
      (cons sym (compute-name-hash sym)))
     ((and (not (consp sym)) (not (fixnump sym)) (not (characterp sym))
@@ -187,7 +228,9 @@
       (error "symbol-function: not a symbol"))
     (let* ((name (car nh))
            (hash (cdr nh))
-           (fn (or (and (> (length name) 0)
+           (cell (and (> (length name) 0) (%seam-cell name)))
+           (fn (or (and cell (symbol-value cell))   ; a bound seam: its binding
+                   (and (> (length name) 0)
                         *symbol-function-table*
                         (%fn-entry (gethash name *symbol-function-table*)))
                    (and *native-sym-function-table*
@@ -236,6 +279,24 @@
    holding at top level (user report, 2026-10-20)."
   (and *%e2-set-function-names* (gethash name *%e2-set-function-names*) t))
 
+(defvar *seams* nil
+  "Interface functions bound per image (builder packages step 3): EQUAL hash,
+   function key -> the global symbol holding the function the interface
+   calls.  See %DEFINE-SEAM.")
+
+(defun %define-seam (name cell)
+  "Make NAME a seam whose definition lives in the global CELL.  NAME's own
+   DEFUN must call through CELL, (funcall CELL ...); from then on
+   (setf (fdefinition NAME) fn) stores FN in CELL, so every caller --
+   compiled ahead of time on any target, or at runtime -- reaches FN
+   without patching a call site."
+  (unless *seams* (setq *seams* (make-hash-table :test (function equal))))
+  (puthash (car (%sym-name-or-hash name)) *seams* cell)
+  name)
+
+(defun %seam-cell (key)
+  (and *seams* (gethash key *seams*)))
+
 (defun set-symbol-function (sym fn)
   "Set the function cell of SYM to FN.  Updates both the name-keyed
    table (CL-symbol path) and the hash-keyed table (native MVM symbol
@@ -251,6 +312,11 @@
       (error "set-symbol-function: not a symbol"))
     (let ((name (car nh))
           (hash (cdr nh)))
+      (let ((cell (and (> (length name) 0) (%seam-cell name))))
+        (when cell
+          ;; a seam: bind the interface, keep its function
+          (set cell fn)
+          (return-from set-symbol-function fn)))
       (unless *symbol-function-table*
         (%sft-init))
       (when (> (length name) 0)
@@ -382,7 +448,9 @@
     (when nh
       (let* ((name (car nh))
              (hash (cdr nh))
-             (fn (or (and (> (length name) 0)
+             (cell (and (> (length name) 0) (%seam-cell name)))
+             (fn (or (and cell (symbol-value cell))   ; a bound seam: its binding
+                     (and (> (length name) 0)
                           *symbol-function-table*
                           (gethash name *symbol-function-table*))
                      (and *native-sym-function-table*
@@ -1216,13 +1284,6 @@
       (when (and (symbolp tname) tname (not (eq tname t)))
         (puthash (aref tname 0) *%deftype-name-hashes* t))
       (%deftype-warm tname)))
-  tname)
-
-(defun %deftype-warm (tname)
-  "Prepare TNAME's expander where it is defined.  A no-op here; mvm-eval
-   images compile and cache it (mvm-eval.lisp), so that a later expansion on
-   an actor only READS the cache -- an actor may not write shared tables, nor
-   compile."
   tname)
 
 ;;; COMPILER-MACRO per-package side table — same defect, same shape:
@@ -5116,33 +5177,6 @@
   (set-macro-function sym fn))
 (defun setf-fdefinition (sym fn)
   (set-fdefinition sym fn))
-
-;;; ============================================================
-;;; DISASSEMBLE — CLHS §disassemble: write a textual representation
-;;; of FN to *standard-output* and return NIL.  The ANSI test
-;;; disassemble.lsp's DISASSEMBLE-IT wrapper captures *standard-output*
-;;; into a string stream and checks (NOTNOT (STRINGP captured-string))
-;;; — so any non-empty write satisfies the test.  Tests also check the
-;;; ARITY contract: (DISASSEMBLE) and (DISASSEMBLE x y) must error.
-;;; With this defun, compile-call's arity check fires on those forms.
-(defun disassemble (fn)
-  "FALLBACK DISASSEMBLE for images that do NOT bake the MVM compiler.
-   Writes one line to *standard-output* and returns NIL, which is all CLHS
-   requires (output format is implementation-defined).
-
-   Compiler-bearing images (the CLI, and anything assembling
-   *mvm-eval-canonical-source*) OVERRIDE this with the real disassembler
-   via last-defun-wins -- see mvm/mvm-eval.lisp.  It has to live there,
-   not here: source is assembled bridge -> mvm.lisp -> compiler.lisp ->
-   mvm-eval.lisp, calls are resolved BY NAME AT BUILD TIME, and cl-eval.lisp
-   is inside the bridge -- so a call to make-mvm-buffer or
-   mvm-compile-toplevel from this file binds to %%unresolved-fn (returns
-   NIL) and the disassembler dies with a TYPE-ERROR on the NIL buffer.
-   Measured, not theorised: that is exactly what the first attempt did."
-  (declare (ignore fn))
-  (write-string "; modus: no disassembler in this image (compiler not baked)")
-  (write-char-to-stream (code-char 10) *standard-output*)
-  nil)
 
 ;;; ============================================================
 ;;; COMPILE-FILE — CLHS 3.2.4 / compile-file.

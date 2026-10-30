@@ -58,13 +58,13 @@
       (handler-case
           (progn (setf (aref *depth-reached* id) (max (aref *depth-reached* id) (- 21 d)))
                  (nest id (- d 1)))
-        (error (e) (list :err (%escape-describe e))))))
+        (error (e) (list :err (modus-int::%escape-describe e))))))
 
 (format t "~%=== TWO WORKERS, HANDLER-CASE 20 DEEP EACH ===============~%")
 (let ((ths nil))
   (dotimes (w 2)
     (let ((id w)) (setq ths (cons (sb-thread:make-thread (lambda () (nest id 20))) ths))))
-  (%sleep-ms 15000)
+  (modus-int::%sleep-ms 15000)
   (setq *stop* t)
   (let ((rs (reverse (mapcar (function sb-thread:join-thread) ths))))
     (format t "  worker results (checks bad): ~S~%" rs)

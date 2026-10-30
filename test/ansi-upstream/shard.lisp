@@ -57,10 +57,10 @@
           (format t "~&>>~a~%" n) (finish-output)
           (format t "~&~a ~a~%" (if (regression-test::do-test n) "PASS" "FAILX") n)
           (finish-output)
-          ;; the recovered-fault record is x64's (%HC-FAULT-W); other
+          ;; the recovered-fault record is x64's (modus-int::%HC-FAULT-W); other
           ;; targets have no such reader, and calling it ended the shard
-          (when (fboundp '%hc-fault-w)
-            (let ((f (+ (%hc-fault-w 0 0) (* 4294967296 (%hc-fault-w 0 1)))))
+          (when (fboundp 'modus-int::%hc-fault-w)
+            (let ((f (+ (modus-int::%hc-fault-w 0 0) (* 4294967296 (modus-int::%hc-fault-w 0 1)))))
               (unless (eql f lastf)
                 (setq lastf f)
                 (format t "~&FAULT after ~a rip=~x~%" n f) (finish-output)))))

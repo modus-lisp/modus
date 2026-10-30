@@ -3,10 +3,10 @@
 ;;; silently dropped (PPRINT-LOGICAL-BLOCK, PPRINT-POP, DO-ALL-SYMBOLS ...).
 (defparameter *missing*
   (let ((acc nil))
-    (dolist (src *modus-runtime-macros* (nreverse acc))
+    (dolist (src modus-int::*modus-runtime-macros* (nreverse acc))
       (let ((name (cadr (read-from-string src))))
         (unless (macro-function name) (push name acc))))))
 (format t "~&runtime-macros-installed: ~a of ~a missing ~s~%"
-        (length *missing*) (length *modus-runtime-macros*) *missing*)
+        (length *missing*) (length modus-int::*modus-runtime-macros*) *missing*)
 (format t "~&runtime-macros-installed: ~a~%" (if *missing* "FAIL" "PASS"))
 (sys-exit (if *missing* 1 0))

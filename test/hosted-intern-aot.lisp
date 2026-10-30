@@ -67,17 +67,17 @@
 ;;;;   survived / died / HUNG separately — hangs are a distinct class here (a
 ;;;;   lost wakeup or a held lock), not a flavour of fault.
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
 (defvar *mode*
-  (let ((s (%cli-getenv "MODE"))) (if (and s (> (length s) 0)) s "rt")))
+  (let ((s (modus-int::%cli-getenv "MODE"))) (if (and s (> (length s) 0)) s "rt")))
 (defvar *arm*
-  (let ((s (%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "low")))
+  (let ((s (modus-int::%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "low")))
 (defvar *k*
-  (let ((s (%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
+  (let ((s (modus-int::%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
 
-(defvar *r0* 0) (setq *r0* (%gc-region-0))
-(defvar *scr* 0) (setq *scr* (%thr-scratch))
+(defvar *r0* 0) (setq *r0* (modus-int::%gc-region-0))
+(defvar *scr* 0) (setq *scr* (modus-int::%thr-scratch))
 
 ;;; ---- THE SCRIPT-SIDE COPY (runtime-compiled) --------------------------
 ;;; Line for line the same source as net/hosted-intern-probe.lisp's %ip-*.
@@ -86,22 +86,22 @@
 
 (defun il-fwd (r0)
   "region 0's LIVE span -> this worker's region.  The forbidden direction."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (wsize (%gc-meta-read (+ rw #x10) k))
-         (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0alloc (%gc-meta-read (+ r0 #x30) k)))
-    (%gc-count-foreign-refs r0from r0alloc wfrom wsize)))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) k))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) k))
+         (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) k)))
+    (modus-int::%gc-count-foreign-refs r0from r0alloc wfrom wsize)))
 
 (defun il-in-worker (w)
   "1 when machine word W points inside THIS worker's region, 0 otherwise."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (from (%gc-meta-read (+ rw #x00) k))
-         (size (%gc-meta-read (+ rw #x10) k)))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (from (modus-int::%gc-meta-read (+ rw #x00) k))
+         (size (modus-int::%gc-meta-read (+ rw #x10) k)))
     (if (and (>= w from) (< w (+ from size))) 1 0)))
 
 (defun il-body-str (i) (concatenate 'string "ILS-" (write-to-string i)))
-(defun il-body-low (i) (%intern-symbol-pkg (+ 900000000 i) 0))
+(defun il-body-low (i) (modus-int::%intern-symbol-pkg (+ 900000000 i) 0))
 (defun il-body-cl  (i)
   (intern (concatenate 'string "ILC-" (write-to-string i)) "COMMON-LISP-USER"))
 
@@ -117,7 +117,7 @@
                        (t                   (il-body-cl i))))
       (setq i (+ i 1)))
     (list c0 (il-count) f0 (il-fwd r0)
-          (il-in-worker (%gc-word-of last (+ scr 512)))
+          (il-in-worker (modus-int::%gc-word-of last (+ scr 512)))
           (if last 1 0))))
 
 ;;; ---- THE GATE ---------------------------------------------------------
@@ -125,7 +125,7 @@
 ;;; would be indistinguishable from the fault this test exists to look for.
 
 (defvar *have-aot* 0)
-(setq *have-aot* (if (fboundp '%ip-worker) 1 0))
+(setq *have-aot* (if (fboundp 'modus-int::%ip-worker) 1 0))
 
 (format t "~&=== MODE ~a  ARM ~a  K=~d ===~%" *mode* *arm* *k*)
 (if (and (string= *mode* "aot") (= *have-aot* 0))
@@ -146,7 +146,7 @@
              (sb-thread:make-thread
               (lambda ()
                 (if (string= mode "aot")
-                    (%ip-worker arm r0 scr k)
+                    (modus-int::%ip-worker arm r0 scr k)
                     (il-worker arm r0 scr k)))
               :name "ia")))))
 

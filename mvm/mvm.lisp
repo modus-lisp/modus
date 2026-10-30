@@ -18,9 +18,18 @@
 
 (in-package :cl-user)
 
-(defpackage :modus.mvm
+;;; MODUS-INT: the image's internal package, SB-INT's role (user decision
+;;; 2026-10-29).  Its old name MODUS.MVM stays as a nickname, so every
+;;; MODUS.MVM:: reference and (in-package :modus.mvm) keeps reading here.  The
+;;; PRIMARY name is what a baked symbol records as its home (compile-quote
+;;; hashes PACKAGE-NAME), so a running image -- where %INIT-PACKAGES creates
+;;; MODUS-INT -- gives every baked internal symbol a real home package.
+(defpackage :modus-int
+  (:nicknames :modus.mvm)
   (:use :cl)
   (:export
+   ;; Called by the x64 translator (MODUS.MVM.X64, which uses this package)
+   #:%mvm-resolve-runtime-fn
    ;; Virtual registers
    #:+vreg-v0+ #:+vreg-v1+ #:+vreg-v2+ #:+vreg-v3+
    #:+vreg-v4+ #:+vreg-v5+ #:+vreg-v6+ #:+vreg-v7+

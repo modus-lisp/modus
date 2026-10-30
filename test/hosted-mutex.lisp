@@ -38,7 +38,7 @@
 (defvar *checks* 0)
 (defvar *n* 300000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -54,7 +54,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(let ((res (%sync-selftest *n*)))
+(let ((res (modus-int::%sync-selftest *n*)))
   (if (= res 0)
       (format t "~%SKIP: no actor band, no thread page, or the thread would not spawn.~%")
       (let* ((tid    (w res #x00))

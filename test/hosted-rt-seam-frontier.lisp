@@ -108,8 +108,8 @@
         (return (list bad worst n neutral f0 (get-alloc-ptr) (length chain))))
       (setq chain (cons i chain))
       (let ((before (get-alloc-ptr)))
-        (%rt-enter)
-        (%rt-leave)
+        (modus-int::%rt-enter)
+        (modus-int::%rt-leave)
         (let* ((after (get-alloc-ptr))
                (d (check-pair before after)))
           (if (> d 0)
@@ -147,12 +147,12 @@
 
 ;;; ---- the worker ------------------------------------------------------------
 (defun worker-body ()
-  (list :gate (%rt-threads-live-p)
-        :mode (%ha-percpu-mode)
-        :acq-at-entry (%rt-acquisitions)
+  (list :gate (modus-int::%rt-threads-live-p)
+        :mode (modus-int::%ha-percpu-mode)
+        :acq-at-entry (modus-int::%rt-acquisitions)
         :explicit (probe-explicit 20000)
         :symval (probe-symbol-value 20000)
-        :acq-at-exit (%rt-acquisitions)))
+        :acq-at-exit (modus-int::%rt-acquisitions)))
 
 (format t "~&=== hosted-rt-seam-frontier ===~%")
 

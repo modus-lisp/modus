@@ -69,7 +69,11 @@
 ;; ============================================================
 (defun ne2k-rx-host ()       #x04000000)
 (defun ne2k-tx-host ()       #x04001000)
+(declaim (overridable e1000-state-base))
 (defun e1000-state-base ()   #x04060000)
+(declaim (overridable fe-scratch-base))
 (defun fe-scratch-base ()    #x04060900)
+(declaim (overridable ssh-conn-base))
 (defun ssh-conn-base ()      #x04080000)
+(declaim (overridable ssh-ipc-base))
 (defun ssh-ipc-base ()       #x04100000)

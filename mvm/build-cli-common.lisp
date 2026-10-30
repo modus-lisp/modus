@@ -158,6 +158,16 @@
 
 (format t "Reading source files...~%")
 
+;; NO FPU (a wrapper sets *CLI-SOFT-FLOAT*, e.g. build-68k-cli from
+;; MODUS_68K_SOFT_FLOAT=1): every float intrinsic lowers to a call into
+;; mvm/softfloat.lisp (+TARGET-SOFT-FLOAT+, compiler.lisp), which is then baked
+;; in.  Off -- every other image -- the source is not read and nothing changes.
+(when (and (boundp 'cl-user::*cli-soft-float*) (symbol-value 'cl-user::*cli-soft-float*))
+  (setf modus.mvm::+target-soft-float+ 1)
+  (format t "~&;; SOFT-FLOAT: no FPU instructions; floats via mvm/softfloat.lisp~%"))
+(defvar *softfloat-source*
+  (if (eql modus.mvm::+target-soft-float+ 1) (mvm-text "mvm/softfloat.lisp") ""))
+
 (defvar *prelude-source*  (mvm-text "mvm/prelude.lisp"))
 (defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
 ;;; NATIVE BULK MEMORY (mvm/native-bulk.lisp): REPLACE / FILL's four inner loops
@@ -170,6 +180,18 @@
                      (symbol-value 'cl-user::*cl-repl-i386-p*))))
       (mvm-text "mvm/native-bulk.lisp")
       ""))
+;; MODUS_NO_SOURCE_BLOB=1: leave out the image's copy of its own source (the
+;; "MVMS" blob, ~6.7 MB of a 35 MB image).  OFF by default and deliberately:
+;; an image that carries its own source is part of what makes it legible (see
+;; README "carries its own source").  Nothing in the image READS it at run time
+;; -- self-hosting reads the source files -- and on a hosted system it costs
+;; DISK, not RAM: it sits in the file-backed segment and is never paged in.  It
+;; costs RAM wherever the whole image is loaded, i.e. bare metal, which is what
+;; this switch is for.  The Pi's MODUS_RPI_NO_BLOB is the same switch.
+(when (let ((v (sb-ext:posix-getenv "MODUS_NO_SOURCE_BLOB")))
+        (and v (plusp (length v)) (not (string= v "0"))))
+  (setf modus.mvm::*embed-source-blob* nil)
+  (format t "~&;; MODUS_NO_SOURCE_BLOB: embedded source blob dropped~%"))
 ;; MCGC stage-4d pin API + pin-stress probe.  Included ONLY when
 ;; MODUS_MCGC_PINNING=1; flag-off omits it (byte-identical to canonical).
 (defvar *mcgc-pin-source*
@@ -217,7 +239,10 @@
   ;; string.
   (let ((p (merge-pathnames "mvm/float-slot-overrides.lisp" *modus-base*)))
     (modus.mvm::check-parses p)
-    (concatenate 'string (string #\Newline) (read-file-text p))))
+    (concatenate 'string (string #\Newline)
+                 (modus.mvm::%source-file-marker "mvm/float-slot-overrides.lisp")
+                 (read-file-text p) (string #\Newline)
+                 (modus.mvm::%source-file-trailer "mvm/float-slot-overrides.lisp"))))
 ;; STAGE 2 probe: mvm-eval = compile form to MVM bytecode + interpret it.
 ;; Closed-world (calls only resolve within the compiled module) — fine for
 ;; pure-arithmetic forms whose ops inline to MVM opcodes.
@@ -295,7 +320,7 @@
           ;; a megabyte of dead code.  mvm-eval's JIT seam falls back cleanly, so
           ;; the image is CORRECT, just slower.  Removing this line is the whole
           ;; change when a RISC-V JIT arm lands.
-          ((member *cli-arch* '(:riscv64 :riscv32 :arm32)) nil)
+          ((member *cli-arch* '(:riscv64 :riscv32 :arm32 :68k)) nil)
           ((and no (> (length no) 0)) nil)           ; MODUS_NO_JIT → rollback to interpret
           (v (or (string= v "1") (string-equal v "t") (string-equal v "yes")))  ; explicit
           ;; WS5 #206: DEFAULT is ON again.  It was turned OFF in 2d95d3e
@@ -379,7 +404,8 @@
         ;; tail, so re-append it — the next chunk concatenated after this one
         ;; (*jit-coinit-source*) must not read in MODUS.MVM.X64.
         (concatenate 'string (subseq src 0 pos)
-                     modus.mvm::*build-package-reset-text*)))))
+                     modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-x64.lisp"))))))
 ;; Co-init that populates the translator's defvar lookup tables at boot AND sets
 ;; the runtime JIT globals.  Byte-for-byte the same table data the ANSI gate
 ;; installs (build-ansi-common.lisp *x64-translator-coinit-source*), plus a
@@ -599,7 +625,8 @@
         (let ((pos (search marker src)))
           (unless pos (error "CLI-JIT: could not find install-aarch64-translator strip marker"))
           (concatenate 'string (subseq src 0 pos)
-                       modus.mvm::*build-package-reset-text*))))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-aarch64.lisp")))))))
 
 ;; AArch64 co-init.  Same role as %init-x64-translator: populate the tables the
 ;; translator's defvar init-thunks would have filled (limitation #7).  Verbatim
@@ -616,6 +643,7 @@
 
 (defvar *aarch64-jit-coinit-source*
   (when (and *jit-on* (eq *cli-arch* :aarch64)) (concatenate 'string "
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
@@ -666,9 +694,9 @@
        (or *aarch64-jit-coinit-source* "") (string #\Newline)))
     ;; i386: no in-image JIT translator — see the *JIT-ON* comment above.
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
-    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32)) "")
+    ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
-               (want :x64, :aarch64, :i386, :riscv64, :riscv32 or :arm32)"
+               (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"
               *cli-arch*))))
 
 ;;; ARCH SLOT — boot hook + JIT gate.  Appended LAST so its %jit-enabled-p wins
@@ -1086,8 +1114,11 @@
     ;; `chipz:' before we strip it.
     (mvm-text "lib/tar.lisp")
     (string #\Newline)
+    (modus.mvm::%source-file-marker "lib/install-tarball.lisp")
     (%cli-strip-chipz (read-file-text (merge-pathnames "lib/install-tarball.lisp"
                                                        *modus-base*)))
+    (string #\Newline)
+    (modus.mvm::%source-file-trailer "lib/install-tarball.lisp")
     (string #\Newline)
     ;; SAVE-AND-DIE: heap snapshot (save-and-die PATH) and the restore that
     ;; kernel-main runs before boot init.  Lives here, not in the hosted layer,
@@ -1168,6 +1199,8 @@
     (mvm-text "mvm/cl-types.lisp")
     (string #\Newline)
     (mvm-text "mvm/cl-packages.lisp")
+    (string #\Newline)
+    (mvm-text "mvm/kernel-packages.lisp")
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
@@ -1340,13 +1373,43 @@
 ;; runtime source and emit (puthash "NAME" *symbol-function-table*
 ;; #'NAME) calls so the runtime can resolve any defun by name.
 
+(defun %scan-in-packages (text)
+  "Positions of the (in-package X) forms that start a line in TEXT, as
+   (position . PACKAGE-NAME), in order.  Every MVM-TEXT file is wrapped in the
+   MODUS.MVM reset, so this sees each file's own package and the reset after it."
+  (let ((out nil) (pos 0))
+    (loop
+      (let ((p (search "(in-package " text :start2 pos)))
+        (unless p (return (nreverse out)))
+        (when (or (= p 0) (char= (char text (1- p)) #\Newline)
+                  (char= (char text (1- p)) #\)))
+          (let* ((s (+ p 12))
+                 (e (or (position #\) text :start s) (length text)))
+                 (tok (string-trim " \"" (subseq text s e))))
+            (when (and (> (length tok) 1) (char= (char tok 0) #\#)) (setq tok (subseq tok 1)))
+            (when (and (> (length tok) 0) (char= (char tok 0) #\:)) (setq tok (subseq tok 1)))
+            (push (cons p (string-upcase tok)) out)))
+        (setq pos (+ p 12))))))
+
+(defvar *scan-defuns-qualified* (make-hash-table :test 'equal)
+  "The \"PKG::NAME\" strings SCAN-DEFUNS produced itself.  EMIT-SFT-AUTO keys
+   those by the bare NAME, as before; a name written qualified in the source
+   (MODUS::SHARE) keeps its qualified key.")
+
 (defun scan-defuns (text)
-  "Return list of defun names (strings) found in TEXT."
+  "Return list of defun names (strings) found in TEXT.  A defun read in a
+   package other than MODUS.MVM comes back as \"PKG::NAME\", so the generated
+   #'NAME in EMIT-SFT-AUTO names the symbol the defun defined (builder packages
+   step 2: no call may rely on the bare-name fallback)."
   (let ((names nil)
-        (pos 0))
+        (pos 0)
+        (pkgs (%scan-in-packages text))
+        (pkg "MODUS.MVM"))
     (loop
       (let ((p (search "(defun " text :start2 pos)))
         (unless p (return (nreverse names)))
+        (loop while (and pkgs (< (car (first pkgs)) p))
+              do (setq pkg (cdr (pop pkgs))))
         (let* ((start (+ p 7))
                (end (or (position-if (lambda (c)
                                        (or (char= c #\Space)
@@ -1354,8 +1417,17 @@
                                            (char= c #\()
                                            (char= c #\)))) text
                                      :start start)
-                        (length text))))
-          (push (string-upcase (subseq text start end)) names)
+                        (length text)))
+               (name (string-upcase (subseq text start end))))
+          ;; A package the HOST lacks means the (in-package ...) was text
+          ;; inside a string (embedded test source), not the reader's state.
+          (push (if (or (string= pkg "MODUS.MVM") (find #\: name)
+                        (not (find-package pkg)))
+                    name
+                    (let ((q (concatenate 'string pkg "::" name)))
+                      (setf (gethash q *scan-defuns-qualified*) name)
+                      q))
+                names)
           (setq pos end))))))
 
 ;; Driver source is concatenated into the image AND scanned for
@@ -1378,7 +1450,7 @@
 (defun %machine-type-source ()
   (let ((m (ecase *cli-arch*
              (:x64 "x86_64") (:aarch64 "aarch64") (:i386 "i386")
-             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l"))))
+             (:riscv64 "riscv64") (:riscv32 "riscv32") (:arm32 "armv7l") (:68k "m68k"))))
     (format nil "~%(defun machine-type () ~S)~%(defun machine-version () ~S)~%" m m)))
 
 ;; MODUS_LISP_SPIN_AT spin points inside kernel-main (see %LISP-SPIN-FORM in
@@ -1612,7 +1684,9 @@
   ;; Wrapped: a failure here must never take down a normal boot — it just
   ;; leaves Modus unrecognised, which is the pre-#237 status quo.
   ;; MODUS_NO_GENERA=1 skips it (see %install-genera-compat).
-  (handler-case (%install-genera-compat) (t (c) nil))
+  ;; ON DEMAND since 2026-10: see *DEFERRED-SURFACES-SOURCE*.  Features now,
+  ;; packages at first lookup.
+  (handler-case (%defer-boot-surfaces) (t (c) nil))
   ;; THE SBCL COMPATIBILITY SURFACE — SB-THREAD, SB-BSD-SOCKETS, SB-POSIX,
   ;; SB-SYS, SB-ALIEN.  MUST come after %install-runtime-cl-macros (the source
   ;; uses DEFCLASS / DOLIST / WHEN / UNLESS / LOOP) and BEFORE cli-toplevel, so
@@ -1622,7 +1696,7 @@
   ;; script saying `sb-thread:make-thread' does not fail at the call, it fails
   ;; at the read.  Wrapped: a failure here must never take down a normal boot.
   ;; MODUS_NO_SB=1 skips it.
-  (handler-case (%install-sb-shims) (t (c) nil))
+  ;; (%install-sb-shims: deferred, see %DEFER-BOOT-SURFACES above.)
   ;; RTEST — the RT regression tester package (mvm/rtest.lisp).  MUST be
   ;; created HERE, at boot, from image code: a package born at runtime is
   ;; marked runtime-born and its symbols get package-folded function-table
@@ -1640,7 +1714,7 @@
   ;; :asdf* features and can (install-tarball) a system whose .asd opens with
   ;; a read-time `#.(version<= \"3.1\" (asdf-version))' guard.  Wrapped: a
   ;; failure here must never take down a normal boot.  MODUS_NO_ASDF=1 skips.
-  (handler-case (%install-asdf-interface) (t (c) nil))
+  ;; (%install-asdf-interface: deferred, see %DEFER-BOOT-SURFACES above.)
 "
   (%cli-spin "km-pre-epilogue")
   ;; ARCH SLOT: the toplevel entry / probe program.
@@ -1701,15 +1775,23 @@
                    (t (write-char c out))))))
 
 (defvar *genera-compat-text*
-  (concatenate 'string
-               (read-file-text (merge-pathnames "net/cooperative-atomics.lisp"
-                                                *modus-base*))
-               (string #\Newline)
-               (read-file-text (merge-pathnames "net/genera-compat.lisp"
-                                                *modus-base*))))
+  (read-file-text (merge-pathnames "net/genera-compat.lisp" *modus-base*)))
+
+;;; The cooperative atomics are installed EAGERLY even though the Genera layer
+;;; is installed on demand (*DEFERRED-SURFACES-SOURCE*): %ATOMIC-INCF and
+;;; friends are unqualified CL-USER MACROS, so code reaches them without
+;;; looking up any package, and a function compiled before they exist compiles
+;;; them as calls to undefined functions -- test/hosted-atomics.lisp's workers
+;;; did exactly that (9 of 31).  They were always evaluated first, ahead of
+;;; genera-compat.lisp; they still are, just at boot and on their own.
+(defvar *cooperative-atomics-text*
+  (read-file-text (merge-pathnames "net/cooperative-atomics.lisp" *modus-base*)))
 
 (defvar *genera-source*
   (concatenate 'string "
+(defun %cooperative-atomics-source ()
+  \"" (%escape-lisp-string *cooperative-atomics-text*) "\")
+
 (defun %genera-compat-source ()
   \"" (%escape-lisp-string *genera-compat-text*) "\")
 
@@ -1720,7 +1802,7 @@
   (let ((off (%cli-getenv \"MODUS_NO_GENERA\")))
     (if (and off (> (length off) 0) (not (string= off \"0\")))
         nil
-        (progn (%it-eval-source (%genera-compat-source) \"genera-compat\") t))))
+        (progn (%it-eval-kernel-source (%genera-compat-source) \"genera-compat\") t))))
 "))
 
 (format t "  genera:  ~D chars (compat source baked for boot-time eval)~%"
@@ -1790,7 +1872,7 @@
   (let ((off (%cli-getenv \"MODUS_NO_SB\")))
     (if (and off (> (length off) 0) (not (string= off \"0\")))
         nil
-        (progn (%it-eval-source (%sb-shim-source) \"sb-shims\")
+        (progn (%it-eval-kernel-source (%sb-shim-source) \"sb-shims\")
                (%publish-ensure-gray-streams)
                (%publish-runtime-api)
                (%ignore-sigpipe)
@@ -1822,7 +1904,7 @@
   (when (and (boundp '*cli-bare-metal*) *cli-bare-metal*)
     (return-from %ignore-sigpipe-source "(defun %ignore-sigpipe () 0)"))
   (let ((nr (ecase *cli-arch*
-              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32) 174))))
+              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174))))
     (if (member *cli-arch* '(:x64 :aarch64))
         (format nil "(defun %ignore-sigpipe ()
   (let ((sa (%mmap-shared-page 4096)))
@@ -1858,7 +1940,7 @@
               ;; SETQ + restore, not a LET of the special (unreliable in
               ;; image code).
               (let ((%pkg *package*))
-                (setq *package* (find-package \"COMMON-LISP-USER\"))
+                (setq *package* (find-package \"MODUS-INT\"))
                 (unwind-protect (%it-eval-source (%sb-gray-source) \"sb-gray\")
                   (setq *package* %pkg))
                 t))))))
@@ -1940,11 +2022,231 @@
   (let ((off (%cli-getenv \"MODUS_NO_ASDF\")))
     (if (and off (> (length off) 0) (not (string= off \"0\")))
         nil
-        (progn (%it-eval-source (%asdf-interface-source) \"asdf-interface\") t))))
+        (progn (%it-eval-kernel-source (%asdf-interface-source) \"asdf-interface\") t))))
 "))
 
 (format t "  asdf:    ~D chars (interface source baked for boot-time eval)~%"
         (length *asdf-interface-text*))
+
+
+;;; ============================================================
+;;; THE BOOT-TIME SURFACES ARE INSTALLED ON DEMAND
+;;;
+;;; The Genera compat layer, the SBCL compatibility shims and the ASDF
+;;; interface are ~210 KB of SOURCE evaluated by runtime EVAL.  At every boot
+;;; that was most of the cost: measured on the arm32 CLI under qemu, 16.5 s and
+;;; 5 collections with them, 5.1 s and none without, and the smallest heap that
+;;; boots went from 11 MB to 8 MB -- and most programs touch none of them.
+;;;
+;;; So boot now does what is cheap and observable -- pushes each surface's
+;;; FEATURES, exports MODUS's shim-provided names behind autoload stubs, and
+;;; runs the compiled side effects (%PUBLISH-*, %IGNORE-SIGPIPE) -- and the
+;;; source is evaluated the first time anything looks up one of the surface's
+;;; PACKAGES: the reader on `sb-thread:make-thread', a FIND-PACKAGE,
+;;; INSTALL-TARBALL reading an .asd (it asks for ASDF-USER), or
+;;; LIST-ALL-PACKAGES (which installs everything, so it stays complete).
+;;;
+;;; THE ESCAPE HATCHES ARE UNCHANGED: MODUS_NO_GENERA / MODUS_NO_SB /
+;;; MODUS_NO_ASDF skip a surface entirely -- features, packages and all.
+;;; An installer runs at most once, in CL-USER with the standard readtable (the
+;;; context boot gave it), and its entries are removed BEFORE it runs, so its
+;;; own FIND-PACKAGE calls cannot re-enter it.
+;;; ============================================================
+(defvar *deferred-surfaces-source* "
+(defvar *%deferred-packages* nil)
+(defvar *%deferred-order* nil)
+(defvar *%deferred-installing* nil)
+
+(defun %surface-off-p (var)
+  (let ((off (%cli-getenv var)))
+    (and off (> (length off) 0) (not (string= off \"0\")))))
+
+(defun %push-feature (f)
+  (unless (member f *features*) (setq *features* (cons f *features*))))
+
+(defun %defer-packages (installer names)
+  (setq *%deferred-order* (append *%deferred-order* (list installer)))
+  (dolist (n names)
+    (setq *%deferred-packages* (cons (cons n installer) *%deferred-packages*))))
+
+(defun %run-deferred-installs ()
+  \"Install EVERY pending surface, in boot order, exactly as boot used to: one
+   after another, nothing nested.  While it runs the hook answers NIL, so a
+   surface that asks whether a LATER one exists (Genera checks SB-THREAD) gets
+   the answer it got at boot.\"
+  (unless *%deferred-installing*
+    (let ((order *%deferred-order*))
+      (setq *%deferred-order* nil)
+      (setq *%deferred-packages* nil)
+      (setq *%deferred-installing* t)
+      ;; Boot's context, whatever the trigger's was: CL-USER, the standard
+      ;; readtable, and strict package lookup (INSTALL-TARBALL reads .asd
+      ;; files with the lenient missing-package mode on).
+      ;;
+      ;; AND NO FASL CACHE.  A trigger inside LOAD runs while that load may be
+      ;; RECORDING the current toplevel form, and the shim's own
+      ;; %IT-EVAL-SOURCE would record or replay through the same per-form
+      ;; state: its compiles took the outer form's slot, its definitions became
+      ;; that form's effects, and a %FASL-REJECT escaped as %THROW-IN-FLIGHT.
+      ;; Saving the slot and effects was not enough (cl-ppcre, fresh cache, 3
+      ;; of 3); resetting the depth counters too broke every shim.  So the
+      ;; install loads UNCACHED (*FASL-SUSPENDED*), with the outer form's slot
+      ;; and effects parked, and the triggering form is TAINTED so it is kept
+      ;; as source rather than cached as if the install were its own.
+      (let ((pk *package*) (rt *readtable*) (lenient *reader-missing-package-lenient*)
+            (fslot *fasl-slot*) (feff *fasl-effects*) (fco *fasl-compile-only*)
+            (fsusp *fasl-suspended*))
+        (setq *fasl-taint* (if (integerp *fasl-taint*) (+ *fasl-taint* 1) 1))
+        (unwind-protect
+             (progn
+               (setq *fasl-suspended* t)
+               (setq *fasl-slot* nil)
+               (setq *fasl-effects* nil)
+               (setq *fasl-compile-only* nil)
+               (dolist (installer order)
+                 (setq *package* (find-package \"COMMON-LISP-USER\"))
+                 (when *standard-readtable* (setq *readtable* *standard-readtable*))
+                 (setq *reader-missing-package-lenient* nil)
+                 (handler-case (funcall installer) (t (c) nil))))
+          (setq *%deferred-installing* nil)
+          (setq *fasl-suspended* fsusp)
+          (setq *fasl-slot* fslot)
+          (setq *fasl-effects* feff)
+          (setq *fasl-compile-only* fco)
+          (setq *package* pk)
+          (setq *readtable* rt)
+          (setq *reader-missing-package-lenient* lenient)))
+      t)))
+
+(defun %deferred-package-hook (name-str)
+  (unless (handler-case *%deferred-installing* (t (c) t))
+    (let ((al (handler-case *%deferred-packages* (t (c) nil)))
+          (hit nil))
+      (loop
+        (unless (consp al) (return))
+        (when (string-equal (car (car al)) name-str)
+          (setq hit t)
+          (return))
+        (setq al (cdr al)))
+      (when hit (%run-deferred-installs)))))
+
+(defun %force-deferred-installs ()
+  (when (consp (handler-case *%deferred-order* (t (c) nil)))
+    (%run-deferred-installs)))
+
+;; The image's own boot-evaluated source (shims, compat layers, the ASDF
+;; interface) is KERNEL code: read it in MODUS-INT, where the internals it
+;; calls unqualified live, not in CL-USER (builder packages step 4).  Its
+;; public names are package-qualified (sb-thread:..., asdf:..., modus::...).
+(defun %it-eval-kernel-source (text name)
+  (let ((%kpkg *package*))
+    (setq *package* (or (find-package \"MODUS-INT\") *package*))
+    (unwind-protect (%it-eval-source text name)
+      (setq *package* %kpkg))))
+
+(defun %install-sb-shims-source ()
+  (%it-eval-kernel-source (%sb-shim-source) \"sb-shims\")
+  t)
+
+(defun %sb-autoload (sym args)
+  (if (and (null *%deferred-order*) (not *%deferred-installing*))
+      ;; Everything is installed and SYM is still this stub.
+      (error \"modus: ~A was not defined when the SB shims were installed\" sym)
+      (progn (%run-deferred-installs)
+             (apply sym args))))
+
+;; Baked functions are not in runtime EVAL's function table, and the MODUS
+;; stubs are EVALUATED, so publish %SB-AUTOLOAD the way
+;; %PUBLISH-ENSURE-GRAY-STREAMS publishes its installer.
+(defun %publish-sb-autoload ()
+  (let ((f (function %sb-autoload))
+        (dst (intern \"%SB-AUTOLOAD\" (find-package \"COMMON-LISP-USER\"))))
+    (set-symbol-function dst f)
+    (when (boundp (quote *symbol-function-table*))
+      (puthash \"%SB-AUTOLOAD\" *symbol-function-table* f))
+    t))
+
+(defun %defer-boot-surfaces ()
+  (setq *%deferred-packages* nil)
+  (setq *%deferred-order* nil)
+  (setq *%deferred-installing* nil)
+  ;; Genera: the word-size feature and :GENERA, as %GENERA-INSTALL-FEATURES.
+  (unless (%surface-off-p \"MODUS_NO_GENERA\")
+    (unless (or (member :64-bit *features*) (member :32-bit *features*))
+      ;; Interned from a string: a :32-BIT literal compiled AOT came out as
+      ;; :|| (the name starts with a digit), measured.
+      (%push-feature (intern (if (> most-positive-fixnum #xFFFFFFFF) \"64-BIT\" \"32-BIT\")
+                             \"KEYWORD\")))
+    (%push-feature :genera)
+    (%it-eval-kernel-source (%cooperative-atomics-source) \"cooperative-atomics\")
+    (%defer-packages (function %install-genera-compat)
+                     (list \"SCL\" \"SYS\" \"SI\" \"PROCESS\" \"CLI\"
+                           \"FUTURE-COMMON-LISP\" \"GRAY-STREAMS\")))
+  ;; SBCL surface.  The compiled side effects run now, as they did.
+  (unless (%surface-off-p \"MODUS_NO_SB\")
+    (%push-feature :sb-thread)
+    (%push-feature :modus-channel)
+    (%push-feature :sb-bsd-sockets)
+    ;; :SB-MOP only if every MOP function the shim re-exports exists -- the
+    ;; shim's own condition, checked here so the feature is not a promise the
+    ;; deferred install would then refuse to keep.
+    (when (every (function fboundp)
+                 (list 'class-slots 'class-direct-slots 'class-precedence-list
+                       'class-direct-superclasses 'class-finalized-p 'finalize-inheritance
+                       'validate-superclass 'class-default-initargs
+                       'slot-definition-name 'slot-definition-allocation
+                       'slot-definition-initargs 'slot-definition-initform
+                       'slot-definition-initfunction 'slot-definition-type
+                       'slot-definition-readers 'slot-definition-writers
+                       'slot-definition-location
+                       'generic-function-name 'generic-function-methods
+                       'generic-function-lambda-list
+                       'method-qualifiers 'method-specializers 'method-function
+                       'method-generic-function
+                       'compute-applicable-methods 'compute-applicable-methods-using-classes
+                       'compute-class-precedence-list 'standard-instance-access))
+      (%push-feature :sb-mop))
+    (%defer-packages (function %install-sb-shims-source)
+                     (list \"SB-THREAD\" \"SB-POSIX\" \"SB-SYS\" \"SB-ALIEN\" \"SB-EXT\"
+                           \"SB-KERNEL\" \"SB-INT\" \"SB-DEBUG\" \"SB-BSD-SOCKETS\" \"SB-MOP\"))
+    ;; MODUS's shim-provided names live in a package that already exists, so
+    ;; no package lookup can trigger them: export them now, as stubs that
+    ;; install the shims and call the real definition.
+    (%publish-sb-autoload)
+    (%it-eval-kernel-source (%modus-autoload-source) \"modus-autoload\")
+    (%publish-ensure-gray-streams)
+    (%publish-runtime-api)
+    (%ignore-sigpipe))
+  ;; ASDF interface: the features are load-bearing on their own (the
+  ;; #+asdf3.1 guards in split-sequence.asd and bordeaux-threads.asd).
+  (unless (%surface-off-p \"MODUS_NO_ASDF\")
+    (dolist (f (list :asdf :asdf2 :asdf3 :asdf3.1 :asdf3.2 :asdf3.3))
+      (%push-feature f))
+    (%defer-packages (function %install-asdf-interface)
+                     (list \"UIOP\" \"ASDF\" \"ASDF-USER\")))
+  t)
+
+(defun %modus-autoload-source ()
+  \"(dolist (n (list \\\"SHARE\\\" \\\"MAKE-SHARED-ARRAY\\\" \\\"CHANNEL\\\" \\\"CHANNEL-P\\\"
+                \\\"MAKE-CHANNEL\\\" \\\"CHANNEL-SEND\\\" \\\"CHANNEL-RECEIVE\\\"
+                \\\"CHANNEL-TRY-RECEIVE\\\" \\\"BACKTRACE\\\" \\\"CONDITION-BACKTRACE\\\"
+                \\\"CONDITION-BACKTRACE-LIST\\\"))
+  (export (intern n \\\"MODUS\\\") \\\"MODUS\\\"))
+(when (find-symbol \\\"*CAPTURE-BACKTRACES*\\\" (symbol-package '%backtrace-list))
+  (import (find-symbol \\\"*CAPTURE-BACKTRACES*\\\" (symbol-package '%backtrace-list)) \\\"MODUS\\\")
+  (export (find-symbol \\\"*CAPTURE-BACKTRACES*\\\" (symbol-package '%backtrace-list)) \\\"MODUS\\\"))
+(defun modus::share (&rest a) (%sb-autoload 'modus::share a))
+(defun modus::make-shared-array (&rest a) (%sb-autoload 'modus::make-shared-array a))
+(defun modus::channel-p (&rest a) (%sb-autoload 'modus::channel-p a))
+(defun modus::make-channel (&rest a) (%sb-autoload 'modus::make-channel a))
+(defun modus::channel-send (&rest a) (%sb-autoload 'modus::channel-send a))
+(defun modus::channel-receive (&rest a) (%sb-autoload 'modus::channel-receive a))
+(defun modus::channel-try-receive (&rest a) (%sb-autoload 'modus::channel-try-receive a))
+(defun modus::backtrace (&rest a) (%sb-autoload 'modus::backtrace a))
+(defun modus::condition-backtrace (&rest a) (%sb-autoload 'modus::condition-backtrace a))
+(defun modus::condition-backtrace-list (&rest a) (%sb-autoload 'modus::condition-backtrace-list a))
+\")
+")
 
 (defun %extra-source-text ()
   "MODUS_EXTRA_SOURCE=FILE: a file compiled INTO the image by the BUILD-TIME
@@ -1952,11 +2254,14 @@
    test/limitations.lisp.  Unset: \"\"."
   (let ((f (sb-ext:posix-getenv "MODUS_EXTRA_SOURCE")))
     (if (and f (plusp (length f)))
-        (concatenate 'string (string #\Newline) (read-file-text f) (string #\Newline))
+        (concatenate 'string (string #\Newline) (modus.mvm::%source-file-marker f)
+                     (read-file-text f) (string #\Newline)
+                     (modus.mvm::%source-file-trailer f) (string #\Newline))
         "")))
 
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
+                       *softfloat-source* (string #\Newline)
                        *gc-source*       (string #\Newline)
                        *mcgc-pin-source*
                        *rt-source*       (string #\Newline)
@@ -2033,6 +2338,38 @@
 
 (format t "  defuns found: ~D~%" (length *all-defun-names*))
 
+(defun scan-global-names (text)
+  "Names (upcased strings, sorted, unique) that TEXT defines with DEFVAR,
+   DEFPARAMETER or DEFCONSTANT: the kernel's globals.  A runtime symbol in a
+   non-kernel package with one of these names gets its own global cell
+   (builder packages, globals by package).  Textual, like SCAN-DEFUNS: a name
+   inside a string literal is collected too, which only gives CL-USER's
+   same-named variable its own cell as well."
+  (let ((names (make-hash-table :test (function equal))))
+    (dolist (head (list "(defvar " "(defparameter " "(defconstant "))
+      (let ((pos 0))
+        (loop
+          (let ((p (search head text :start2 pos)))
+            (unless p (return))
+            (let* ((start (+ p (length head)))
+                   (end (or (position-if (lambda (c) (find c '(#\Space #\Newline #\Tab #\( #\))))
+                                         text :start start)
+                            (length text)))
+                   (name (string-upcase (subseq text start end))))
+              (when (and (> (length name) 0)
+                         (every (lambda (c) (or (alphanumericp c) (find c "+-*/<=>?!@$%^&_.~")))
+                                name)
+                         ;; not on a commented-out line
+                         (not (find #\; text :start (let ((nl (position #\Newline text :end p :from-end t)))
+                                                      (if nl (+ nl 1) 0))
+                                             :end p)))
+                (setf (gethash name names) t))
+              (setq pos end))))))
+    (sort (loop for k being the hash-keys of names collect k) (function string<))))
+
+(defvar *all-global-names* (scan-global-names *all-runtime-source*))
+(format t "  kernel globals found: ~D~%" (length *all-global-names*))
+
 ;; Emit %init-sft-auto in chunks of ~200 to avoid the compiler's
 ;; function-size limits.
 
@@ -2044,13 +2381,23 @@
         (let ((start (* c chunk-size))
               (end (min (* (1+ c) chunk-size) (length names))))
           (loop for i from start below end
-                do (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
-                          (nth i names) (nth i names))))
+                do (let* ((n (nth i names))
+                          (bare (gethash n *scan-defuns-qualified*)))
+                     ;; The table key stays BARE (runtime lookup is by bare
+                     ;; name until builder-packages step 4); the #' names the
+                     ;; defun's own symbol.
+                     (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
+                             (or bare n) n))))
         (format out ")~%"))
       (format out "(defun %init-sft-auto ()~%")
       (dotimes (c n-chunks)
         (format out "  (%init-sft-auto-~D)~%" c))
-      (format out ")~%"))))
+      ;; the kernel's own function names, for %KERNEL-SHADOW-KEY (phase B)
+      (format out "  (%snapshot-kernel-fn-names)~%")
+      ;; and its global names, for %KERNEL-GLOBAL-SHADOW-P
+      (format out "  (%snapshot-kernel-global-names (%kernel-global-names-text)))~%")
+      (format out "(defun %kernel-global-names-text () ~S)~%"
+              (format nil "~{~A~^ ~}" *all-global-names*)))))
 
 (defvar *sft-auto-source* (emit-sft-auto *all-defun-names* 200))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
@@ -2135,7 +2482,12 @@
              (let ((token (string-upcase (subseq text start pos))))
                (unless (or (gethash token seen)
                            (zerop (length token))
-                           (every #'digit-char-p token))
+                           (every #'digit-char-p token)
+                           ;; the build's per-file marker (cross.lisp
+                           ;; %SOURCE-FILE-MARKER) compiles to nothing and is
+                           ;; not a runtime symbol; counting it renumbered the
+                           ;; whole symbol-name table
+                           (string= token "%SOURCE-FILE"))
                  (setf (gethash token seen) t)
                  (push token result))
                ;; Also register a keyword token's bare name (without the
@@ -2152,7 +2504,18 @@
                      (setf (gethash bare seen) t)
                      (push bare result))))))))))))
 
-(defvar *all-symbol-names* (scan-symbol-names *all-runtime-source*))
+;;; PLUS the deferred-surfaces source, for NAMES only.  It is compiled into the
+;;; image (below, in *full-source*) but kept out of *all-runtime-source* so the
+;;; defun scanner does not mine it; the price was that its own keyword literals
+;;; -- :GENERA, :SB-THREAD, :SB-BSD-SOCKETS, :MODUS-CHANNEL, :SB-MOP ... -- got no
+;;; *SYM-NAME-TABLE* entry, so the image pushed them onto *FEATURES* and printed
+;;; eleven of them as :||, and `#+genera' read them by hash while
+;;; (symbol-name :genera) said "".
+(defvar *all-symbol-names*
+  (let ((names (scan-symbol-names *all-runtime-source*)))
+    (append names
+            (remove-if (lambda (n) (member n names :test #'string=))
+                       (scan-symbol-names *deferred-surfaces-source*)))))
 
 (format t "  symbol names found: ~D~%" (length *all-symbol-names*))
 
@@ -2220,6 +2583,8 @@
   (concatenate 'string
     *prelude-source*
     (string #\Newline)
+    *softfloat-source*
+    (string #\Newline)
     *gc-source*
     (string #\Newline)
     *mcgc-pin-source*
@@ -2278,10 +2643,6 @@
     ;; WRITE-BYTE), and BEFORE *driver-source*, whose kernel-main calls
     ;; run-net-pipeline.
     *cli-bare-metal-net-source*
-    ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
-    ;; defvar; runtime macroexpand-1 references it).
-    "(defvar *sym-name-table* nil)
-"
     (string #\Newline)
     *sft-auto-source*
     (string #\Newline)
@@ -2322,6 +2683,11 @@
     ;; `#'asdf::load-system' into a sft-auto chunk that cannot compile,
     ;; silently dropping ~200 functions from runtime EVAL's reach.
     *asdf-source*
+    (string #\Newline)
+    ;; On-demand installation of the three surfaces above.  BEFORE the driver
+    ;; (kernel-main calls %DEFER-BOOT-SURFACES) and AFTER all three (it names
+    ;; their installers), for the forward-reference reason given there.
+    *deferred-surfaces-source*
     (string #\Newline)
     (%extra-source-text)
     *driver-source*

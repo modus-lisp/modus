@@ -306,10 +306,29 @@ Three things that are easy to get wrong:
   `build-cli-common` calls `%KERNEL-REDIRECTS-REAPPLY` -- not
   `%CORE-POST-RESTORE`, which net/hosted-ssh.lisp REPLACES by last-defun-wins
   (it also drops save-image's `MODUS_NO_RUNTIME_JIT` check: pre-existing).
-- **Kernel names are CL-USER names.**  A script's CL-USER `(defun fe-sq ...)`
-  now replaces the kernel's own FE-SQ for its kernel callers too -- the same
-  rule that makes a REPL fix work.  A defun in a library's own package is keyed
-  `PKG::NAME` and touches nothing.
+- **Kernel names are NOT CL-USER names any more (2026-10-29).**  Internals
+  are homed in `MODUS-INT` (SB-INT's role); the public API is re-exported from
+  `MODUS` (SB-EXT's role), which CL-USER uses.  A CL-USER `(defun fe-sq ...)`
+  defines CL-USER's own FE-SQ (keyed `COMMON-LISP-USER::FE-SQ`) and the kernel
+  keeps calling its own; to fix the kernel's function from a REPL, redefine
+  `modus-int::fe-sq`, which reaches its kernel callers as before.  A CL symbol
+  (`(setf (fdefinition 'close) …)`) is the kernel's own and still redirects.
+  Calling an internal from CL-USER takes the prefix: `(modus-int::%gc-read64 …)`;
+  a bare `(%gc-read64 …)` there is an UNDEFINED-FUNCTION, as in CL.  (Phase B's
+  transitional fallback, which made it read the kernel's function, is deleted;
+  tests, scripts and docs say `modus-int::`.)  `test/kernel-shadow.lisp`.
+- **Kernel GLOBALS are not CL-USER globals either.**  The build lists every
+  name its source defines with DEFVAR / DEFPARAMETER / DEFCONSTANT
+  (`*kernel-global-names*`, 1021 in the x64 CLI); a symbol of a non-kernel
+  package with one of those names gets its own cell, keyed `PKG::NAME`.  So a
+  script's `(defvar *ha-rsize* :mine)` no longer overwrites the kernel's, and
+  setting a kernel variable from CL-USER takes the prefix:
+  `(setq modus-int::*tar-block-size* 512)`.  MODUS exports the JIT's settings
+  (`*jit-on*`, `*jit-hot-only*`, `*jit-hot-calls*`), so those stay bare.
+  Unlike a function, a missed caller does not fail -- it quietly sets its own
+  variable -- so the census came first: `*kernel-global-shadow-p*` NIL shares
+  cells again and counts each such reference in `*kernel-global-shadow-hits*`.
+  `test/kernel-global-shadow.lisp`.
 
 ### `check-compiler-warns` baselines are STALE, and that is a hazard
 
@@ -523,9 +542,335 @@ test/hosted-rungs/h01-gc-survive.lisp`) churns 1 GB past a live chain, array and
 the first (frontier-only) cut failed it after 8 collections.  Hosted-only on
 purpose: bare targets have no collector, so it cannot be an arch-ladder rung.
 
+### Hosted 68k and PowerPC have collectors, and their heaps are sized AT STARTUP
+
+`m68k-emit-gc-collector` in `translate-68k.lisp` is arm32's Cheney collector
+(kind byte per 16-byte granule, objects up / conses down, all registers +
+stack + low block as roots) with one change: **the heap's size is not a
+translate-time constant.**  The boot stub picks it when the process starts and
+writes the Cheney block at `#x10000040` (`+GC-OFF-*+` offsets); the collector
+reads it at entry and COMPUTES the overshoot margin from `space_size`.  The
+kind map sits at a FIXED address past the largest heap (`#x1FC00000`, where
+arm32's always was) and only its first S/16 bytes are mapped, so the
+allocation-site bias stays a constant.  (A first cut stored the bias and margin
+at `#x10000F90/F98` -- aarch64's handler-helper slots, read by every CLI
+image.  That BSS gap is full: F90/F98 aarch64, FA0/FA8 the global-cell cache,
+FB0 static symbols, FB8 the JIT bump word, FC0+ scheduler and atomics.)
+One binary runs in 1 MB or 248 MB:
+
+```
+qemu-m68k-static ./image                           # half of RAM (sysinfo), capped at 128 MB
+qemu-m68k-static ./image --dynamic-space-size 16   # SBCL's flag: MB, or 512KB / 2MB / 1GB
+```
+
+Clamped to [1 MB, 248 MB] (everything stays below #x20000000), rounded to
+128 KB; the margin is min(1 MB, a quarter of a semispace).  Live data larger
+than the heap exits **3** with `modus: heap exhausted (raise
+--dynamic-space-size)` on stderr, not a SIGILL.  Before this, `:gc-check` was
+`ILLEGAL`: a hosted 68k process could allocate 128 MB in its lifetime, total.
+
+**PowerPC, both widths** (`ppc-emit-gc-collector` in `translate-ppc.lisp`,
+stub in `boot-linux-ppc.lisp`) is the same collector and the same startup
+sizing, one routine for ppc32 and ppc64 (width from `ppc-word-size`), at the
+same fixed kind map; the Cheney block now uses the
+`+GC-OFF-*+` 8-byte stride at both widths (ppc32 stores 32-bit values there).
+Its `:gc-check` was `tw 31,0,0`, the same lifetime cap.  `:gc-check` reaches
+the collector with `BL`: LR is free in a body because every prologue saves it.
+Measured: h01 42 at 128/8/1 MB on both widths; 16 collections at the default
+size, 1560 (ppc32) / 1724 (ppc64) at 2 MB; the 200,000-cons probe survives at
+16 MB and exits 3 at 8 MB.  Hosted ladder 35/35 -> 35/35 + h01 on both;
+bare ppc32/ppc64 arch-ladder identical before and after (70/70 with the gate fix).
+
+**ARM32 sizes its heap at startup too** (`emit-linux-arm32-choose-heap-size`),
+and it is the only one of the three with a full CL image, so it is where the
+CL runtime's footprint can be measured.  The CLI toplevel now accepts SBCL's
+runtime options (`--dynamic-space-size`, `--control-stack-size`,
+`--tls-limit`, `--end-runtime-options`, `--[no-]merge-core-pages`) instead
+of rejecting them; on a fixed-heap port they are accepted and do nothing.
+
+**THE "ARM32 GC BUG" WAS UNZEROED `alloc-obj` -- FIXED.**  With a heap small
+enough to collect often, arm32 CL images failed intermittently: boot-form
+MEMORY-FAULT-ERRORs, functions vanishing mid-load, and an unmodified
+`origin/main` image with only a 24 MB heap constant did the same (2/12 boots).
+It was not the collector.  `+op-alloc-obj+` (instances, structs, closures,
+conditions) wrote the header and bumped VA without zeroing the slots, so a fresh
+object held whatever an earlier collection had left in reused memory until its
+slots were filled -- which is also why it was "non-deterministic": the garbage
+depended on the run.  Found with `MODUS_ARM32_GC_POISON=1`, which overwrites
+each evacuated semispace with an inert value: on ONE tree, 150 rounds of
+DEFCLASS / DEFGENERIC / DEFMETHOD / MAKE-INSTANCE in 16 MB failed 22-36 rounds
+plain and 0 poisoned -- poisoning makes a STALE pointer worse, so it had to be
+uninitialised memory.  Zeroed (as x64/aarch64/i386 always did): 0 failures at
+12/16/24 MB, 3 runs each, and the collection counts are now identical across
+runs.  68k and ppc had the same gap and zero now too.
+
+**And arm32's `:gc-check-n` / `:gc-check-r` are SIZE-AWARE now** (hosted): they
+test VA + size against VL, collect, re-test, and take the exhausted exit if the
+object still does not fit.  The unsized check let an allocation bigger than the
+margin (min 1 MB, a quarter of a semispace) run into the conses the last
+collection copied to the top of the semispace -- cl-ppcre's 1.4 MB tarball
+vector in a 16-24 MB heap segfaulted.
+
+**Measured arm32 footprint after all of the above** (fresh FASL cache, 0
+errors anywhere; below these the process exits cleanly as heap-exhausted):
+
+| workload | smallest heap |
+|---|---|
+| boot | 7 MB |
+| boot + first use of the SB-* / ASDF surfaces | 12 MB |
+| load alexandria, 30 probes | 24 MB |
+| load cl-ppcre, 6 probes | 48 MB |
+
+**PowerPC bugs found on the way:**
+- **The MD-form encoder stored the 6-bit mask field unrotated**: it is
+  `mb[0:4] || mb[5]`.  objdump: `rldicl r3,r4,60,4` assembled as `...,60,2`,
+  and `ppc-emit-li`'s 64-bit `rldicr ...,32,31` as `...,32,47`, so every
+  ppc64 immediate wider than 32 bits was built wrong.
+- **`alloc-array`/`alloc-u8`/`alloc-string` rounded with `andi. #xFFF0`**,
+  which zero-extends its immediate: an object of 64 KB or more bumped the
+  allocator by its size mod 64 KB, and the next allocations landed inside it.
+- **The same private header layout as 68k** (`(subtag << 8) | 9` written,
+  byte 1 read as the subtag) -- now `(size << 8) | subtag`.
+- **No function-entry alignment at all** -- now 16, as everywhere else.
+
+Verified: `h01-gc-survive` answers 42 at the default size and at 8/2/1 MB
+(16 collections at 128 MB, ~1500 at 2 MB); 200,000 live conses (3.2 MB)
+survive 4M churned conses at 16 MB and exit 3 at 8 MB and below.  NOT
+verified: the RAM/2 branch with RAM below the cap.  qemu-user reports the
+host's RAM, so the cap always wins here; a 36 MB machine is the real test.
+
+**Three 68k code-generation bugs found on the way, all in bare images too:**
+- **Every MOVEM was MOVEM.W.**  The encoders OR'd MOVE's size code 2 into bit
+  6, which is MOVEM's size bit, so it stayed clear.  Every prologue saved
+  D4-D7 as their low 16 bits and every epilogue restored them sign-extended:
+  any callee-saved value above 32767 was destroyed across any call.  This is
+  what r26/r28/r30/r31/r33 were failing on (SIGSEGV) on the hosted ladder.
+- **The tail-call epilogue restored A2/A3/A4** (VA/VL/VN), which the prologue
+  never saved: every tail call loaded the allocation pointer, limit and NIL
+  from the frame below the saved registers.
+- **`alloc-obj` wrote `(subtag << 8) | 9` and `obj-subtag` read byte 1** to
+  match: a private header layout, so every array and string reported the low
+  byte of its LENGTH as its subtag.  Now `(size << 8) | subtag`, like every
+  other 32-bit port.
+And function entries are 16-aligned now (they were 4-aligned, which tags a
+`#'f` at 4/8/12 mod 16 as 7/B/F; r16-funcall passed by layout luck).
+
+Hosted 68k ladder: 28/35 on `origin/main` -> **35/35 + h01**.  Bare 68k
+arch-ladder: identical before and after.  (`arch-ladder-gate.sh` used to grade
+every rung but r07 against 42, so r35 -- expect 5050 -- "failed" on every
+architecture that got it right; it now reads the rung's header like
+`hosted-ladder.py` does.)
+
 ## Build Commands
 
 All builds: `sbcl --script <build-script>`
+
+### The 68k FULL CL image runs (`mvm/build-68k-cli.lisp`) — the first big-endian CL
+
+`sbcl --dynamic-space-size 12288 --script mvm/build-68k-cli.lisp` (output
+`MODUS_CLI_OUT`, default `/tmp/modus-68k-cli`; run with `qemu-m68k-static`, JIT
+off).  It is cut from `build-arm32-cli.lisp`; the arch slots are the Linux/m68k
+facts measured with `qemu -strace`: `exit_group` 247, `clock_gettime` 260,
+`getdents64` 220, `stat64` 195 / `fstat64` 197 with `st_size` low word at +44 and
+`st_mtime` at +68.  Bringing it up found five defects that every big-endian or
+68k image had and nothing had executed before:
+
+- **The INTERPRETER assembled `mem-ref` little-endian** (`mvm/interp.lisp`'s
+  `mem-read`/`mem-write`), and so did the in-image compiler's `:u32` split: an
+  interpreted `(setf (mem-ref a :u32) #x12345678)` wrote `78 56 34 12`.
+  `*TARGET-BIG-ENDIAN-P*` is a host special -- the image inherits its NIL
+  default (the DDC rule) -- so byte order is now also the folded
+  `+TARGET-BIG-ENDIAN+`, injected with the fixnum widths
+  (`target.lisp`'s constant preamble).  **A `setq` of the special from the build
+  script does not reach the image's compiler; a folded constant does.**  It is
+  **0 or 1, never NIL/T**: the constant table cannot tell a NIL-valued constant
+  from an absent one, so a NIL constant silently compiles as an (unbound)
+  global read -- measured, it was an implicit-global warning on every x64 build.
+  Code compiled without the preamble (runtime-cl-macros) asks
+  `%TARGET-BIG-ENDIAN-P` (prelude) instead.
+- **`*features*` said `:LITTLE-ENDIAN`** on every big-endian CLI
+  (`runtime-cl-macros.lisp` assumed every consumer was little-endian).
+- **Function entries were 12 mod 16 in memory.**  translate-68k pads entries to
+  16 relative to its BUFFER; the entry `BRA.L` in `cross.lisp` did not pad the
+  buffer's start, and the CL image's larger boot stub left it at 12.  So every
+  `#'NAME` tagged as `#x...F` -- **the forwarding tag** -- and the first
+  collection read the car of a cons holding one as a forwarding pointer.
+  `*GF-STUB-CLOSURES*` became a pointer into code, after which every
+  `FUNCTIONP` (so every `DOLIST`, every printed list of two) signalled
+  `TYPE-ERROR #<?0>`.  The jump now pads with NOPs to a 16-byte VIRTUAL
+  boundary, as RISC-V's does.  Found by watching the 24 registrations go in as
+  `#x...CF` with gdb, then the one collection.
+- `obj-subtag` must answer 0 for a non-object (GENERIC-ADD asks it of fixnums),
+  and the float group (`fsqrt`, `fround32`, `alloc-f32`, `f32-load/store`) was
+  missing; the long-branch forms (`BRA.L`/`BSR.L`/`Bcc.L`) replace 16-bit
+  displacements, which a 42 MB image overflows.
+- **Not 68k at all: the deferred surfaces' keywords had no names.**
+  `*deferred-surfaces-source*` is outside `*all-runtime-source*` so the defun
+  scanner does not mine it, and so `scan-symbol-names` never saw `:GENERA`,
+  `:SB-THREAD` &c.: eleven features printed as `:||` on arm32 too.  It is now
+  scanned for names only.
+
+- **`*%DIRENT-BUF-ADDR*` was a fixed `#x1DD00000`**, inside the heap on the
+  32-bit layouts (68k and arm32 heaps reach `#x1F800000`): every `DIRECTORY`
+  wrote dirents over live objects.  68k and arm32 now use `#x10003000` in the
+  low block.  (i386 calls syscall 217 there -- `pivot_root` -- so its
+  `DIRECTORY` returns nothing rather than corrupting; separate bug, open.)
+
+**The "breaks after its SECOND collection" bug was three defects, all fixed.**
+Every one bites only once a collection has reused memory, which is why the
+first collection always looked clean and why gdb verifiers of the heap after
+each collection found nothing:
+
+1. **The low-block root range ran into to-space.**  The collector scans
+   `[#x10000000, min(from_start, to_start))` as roots and took `to_start` from
+   A2 -- but the stack roots have already copied objects by then, so A2 is the
+   to-space FREE pointer.  At every collection whose to-space is the LOW
+   semispace (the 2nd, 4th ...) the range covered the objects just copied and
+   scanned their payloads as conservative roots: a bytecode word that happened
+   to spell a live from-space cons (`13 04 02 01`) was "forwarded" in place,
+   and the interpreter then decoded garbage -- `fsqrt` on a fixnum, a register
+   index of 31.  translate-ppc had the identical bug (r19); translate-arm32
+   uses the constant `heap + alloc-start` and never did.  Caught by a
+   conditional breakpoint on the collector's SCAN entry, `*(int*)$a0 == word`,
+   which reported the caller: the low-block loop, A5 inside the vector.
+2. **alloc-array / alloc-u8 / alloc-string did not zero** (68k and ppc), so
+   the bignum kernel's `(make-array n)` digit vectors read leftovers and
+   `(ash #xFF 24)` came back with junk low bits -- odd words in conses, which
+   the collector reads as forwarding pointers.  `MODUS_68K_GC_POISON=1` cannot
+   show this class: poison is not zero.
+3. **The big-endian `:u32` access was not split.**  A promoting width is read
+   as two `:u16` halves so a word >= 2^30 becomes a bignum, not a wrapped
+   value; the split was skipped on big-endian instead of having its offsets
+   swapped, and in the interpreter `%WORD->VAL` then shifted the bignum's
+   POINTER into a register.
+
+**And one PowerPC defect the zeroing exposed:** the three sites computed their
+size with `addi r0,r0,15`, which is `li r0,15` (ADDI reads `rA = 0` as the
+literal zero), so every byte vector, string and array had size 0 and VA was
+never bumped past it.  The new zero loop counted -1 and ran off the heap.
+
+**HOW TO DEBUG A PLACEMENT-SENSITIVE CORRUPTION HERE:** set `*jit-hot-calls*`
+to 0 and `MODUS_FASL=0`.  Both consult the clock, so gdb's slowdown moves every
+collection and the failure moves with it.  With both off, the bignum loop in
+the ANSI-free reproducer (`(logior (ash b0 24) ...)` over a byte sweep) failed
+deterministically at `--dynamic-space-size 56MB`.  And **use a private
+`MODUS_FASL_DIR` for every 68k test**: the shared cache replays FASLs recorded
+by earlier, broken binaries (its key covers compiler and runtime source, not
+the translator), which produced one entire false lead here.
+
+Measured after all four: alexandria and cl-ppcre load with 0 probe errors; the
+16 MB boot runs the churn script through 68 collections (arm32's count, exact).
+
+### Soft-float 68k (68LC040 / 68EC0x0): `MODUS_68K_SOFT_FLOAT=1`
+
+`MODUS_68K_SOFT_FLOAT=1 sbcl --dynamic-space-size 12288 --script
+mvm/build-68k-cli.lisp` builds an image with **no FPU instructions**: disassembled,
+its code holds 0 (the hard-float image, 1125).  `+TARGET-SOFT-FLOAT+` (folded, 0/1,
+injected with the width constants, so the image's own compiler does the same) makes
+the compiler lower `%FLOAT-ADD/-SUB/-MUL/-DIV`, `%FSQRT`, `%FROUND32`,
+`%FLOAT-FROM-INT`, `%FLOAT-TO-INT`, `%F32-LOAD/-STORE` and both float-arith folds to
+calls into `mvm/softfloat.lisp`, and turns the FP-register tree paths off; the 68k
+translator records any FPU op that still arrives as a gap (ILLEGAL) instead of
+emitting it.
+
+`mvm/softfloat.lisp` is IEEE binary64, round-to-nearest-even, subnormals, signed
+zeros, infinities, in **fixnum-only Lisp**: 13-bit limbs in a 10-limb vector, no
+bignum, no variable `ASH` -- on this tower checked arithmetic WRAPS, so a bignum
+intermediate would be wrong, not just slow.  `sbcl --script
+test/softfloat-sbcl.lisp N` checks it bit-for-bit against SBCL with every
+intermediate asserted inside the 30-bit fixnum range: 400,000 cases x 10 ops, 0
+failures.  On the image: a float battery (arithmetic, printing, reading, exp/log/
+trig, FORMAT, decode) is line-for-line identical to the FPU image on qemu's 68040;
+alexandria and cl-ppcre load with identical probe results; an interpreted float
+loop costs 1.6x the FPU one.
+
+**QEMU HAS NO FPU-LESS 68020+ MODEL** (7.2: m68020..m68060 and `any` all execute
+F-line FPU opcodes), so "no FPU instructions" is checked two ways: statically by
+disassembly, and DYNAMICALLY with `qemu-m68k-static -d in_asm -D /dev/stderr`, which
+logs every block the CPU translates -- count mnemonics starting with `f`.  Soft image:
+**0** over the float battery and the alexandria / cl-ppcre / ieee-floats loads; the
+hard image's same runs execute 480 / 63, so the instrument answers both ways.  A
+3000-op random battery (+ - * / sqrt, single<->double, subnormals, inputs as
+literals so the reader is in the loop, results compared as INTEGER-DECODE-FLOAT
+against SBCL) is 3000/3000 on the soft image, the hard image and x64.  SBCL's own
+reader misrounds some subnormals (`1e-39`, `-2.5d-310`, `1.4e-45` -> 0.0); modus is
+right there, so check a disagreement exactly before believing SBCL.
+
+### Soft-float i386 (Pentium / PII / PIII, 486, 386): `MODUS_I386_SOFT_FLOAT=1`
+
+The SAME lowering as 68k (`build-i386-cli.lisp` sets `*CLI-SOFT-FLOAT*`; the i386
+translator records any float opcode that still arrives, `fcmp` included, as a gap
+and INT3s).  Why it matters on x86: the hard image's floats are **SSE2**, i.e.
+Pentium 4+, so the soft image is what runs on a Pentium-class machine, not just
+on an FPU-less one.  **QEMU's `-cpu 486`, `pentium` and `pentium2` TRAP SSE2**
+(SIGILL; `pentium3` does NOT, it executes them), so this one is tested for real:
+the soft image runs under `-cpu 486`, the hard one dies at its first float op with
+`ILLEGAL-INSTRUCTION-ERROR`.  x87 still executes on those models (no FPU-less x86
+model), so `test/run-i386-fpu-scan.sh` (in_asm, count `f*` / `xmm` mnemonics)
+covers it: soft 0.  Under `-cpu 486`: the 3000-op battery 3000/3000 vs SBCL, the
+float battery identical to the hard image and x64, alexandria / cl-ppcre /
+ieee-floats with probe results identical to the hard image.  A div+sqrt-heavy
+interpreted loop costs 2.8x.  Bare-metal i386 is unaffected (it writes CR4, which
+a 386/486 does not have, and emits no float code).
+
+### x87 i386 (486DX, Pentium .. Pentium III): `MODUS_I386_FP=x87`
+
+Hardware floats with no SSE2, **bit-exact against SSE2**, at SSE2's speed (a
+div+sqrt loop: SSE2 14.1 s, x87 14.0 s, soft-float 40.1 s under qemu).  How
+x87 is made exact (translate-i386, `I386-TRANSLATE-X87-FLOAT`):
+- the boot stub loads control word `#x027F` -- 53-bit PRECISION, nearest-even,
+  exceptions masked.  Linux starts a process at `#x037F` (64-bit), under which
+  `1 + (2^-53 + 2^-105)` double-rounds to 1.0 -- that is the canary;
+- the x87 still has a 15-bit exponent, so a double-DENORMAL result rounds twice.
+  Only `*` and `/` can make one inexactly (a denormal sum of doubles is exact;
+  sqrt never lands there), so those scale an operand by 2^-15360 and the result
+  by 2^+15360 (FSCALE): the x87's denormal threshold then IS the double's, and
+  the one rounding is at the right bit (JVM strictfp's trick);
+- float->integer swaps in a round-toward-zero control word around FISTP (FISTTP
+  is SSE3); `fcmp` is FUCOMPP + FNSTSW + SAHF (UCOMISD's flags; FUCOMIP is P6).
+Tested under `-cpu pentium` (SSE2 traps there): the 3000-op battery 3000/3000,
+`test/float-denormal-gen.lisp`'s 2000 denormal * and / 2000/2000, libraries
+identical; 0 SSE instructions executed.  **The negative control is a build knob**:
+`MODUS_I386_X87_NOSCALE=1` drops the scaling and fails EXACTLY the 17 cases exact
+rational arithmetic predicts.  QEMU does model precision control (checked with
+the canary under both control words), but it is QEMU, not silicon.  The default
+SSE2 image is unchanged: identical code apart from `%CORE-BUILD-ID`.
+
+**FIXED (was open): single-float vectors on 30-bit towers.**  Three defects, the
+first found here:
+- the lane helpers (`%F32-BITS-REF/-SET-NARROW`, softfloat's lane load/store) read
+  bytes with `%U8-REF`, whose bounds check counts the vector's length in LANES, so
+  byte 4I+k of lane I >= 1 signalled `(INTEGER 0 3)`.  They use
+  `%U8-REF-UNCHECKED` / `%U8-SET-UNCHECKED` (compiler intrinsics, no check) and
+  check the LANE index themselves (`%F32-LANE-CHECK`, the compiled check's error);
+- they wrote lanes LITTLE-endian while the 68k's native `FMOVE.S` reads them in CPU
+  order, so a stored 3.0 read back 2.3e-41.  `%F32-LANE-BYTE` follows
+  `+TARGET-BIG-ENDIAN+` (68k and ppc32);
+- on EVERY target, `:FP-LANE-STORE` / `:FP-LANE-LOAD` (the unboxed FP-tree paths
+  for a declared or `make-array`-inferred single-float vector) had NO bounds check:
+  on x64 `(setf (aref v 4) 1.0)` and `(setf (aref v -1) 1.0)` on a 4-lane vector
+  silently wrote outside it.  `%LANE-INDEX-CHECK-BEGIN/-END` wrap both now.
+  **That check costs 40-50% on a lane-bound loop** (x64, JIT'd saxpy / 3-tap /
+  dot over 4096 lanes: main 37/66/19 ms, checked 56/93/29), the same price every
+  other checked array path pays.  The opt-out is the standard one, and it now
+  WORKS LOCALLY: `(declare (optimize (safety 0)))` in a function body, LET, LET*
+  or LOCALLY compiles that form at safety 0 (`%BODY-SAFETY`, compiler.lisp) --
+  before, only a global DECLAIM was read, so mill's per-function
+  `(optimize (speed 3) (safety 0))` did nothing.  Measured: local safety 0 is
+  back at main's speed; the default and an explicit `(safety 1)` still check;
+  the declaration does not leak past its form.  The wrappers that bind
+  `*COMPILE-SAFETY*` DECLARE it special: the image's own compiler does not
+  otherwise know it is, and `check-let-of-unregistered-special` (build-checks)
+  failed the UEFI build on exactly that.
+And `INTEGER-DECODE-FLOAT` / `DECODE-FLOAT` of a SINGLE returned the boxed double
+payload's 53-bit decoding (`7e30` -> `(6217249165672448 50 1)`, SBCL
+`(11580529 79 1)`), and `FLOAT-PRECISION` of a subnormal said 24.
+
+Debugging recipe that worked: `qemu-m68k-static -g PORT` + `gdb-multiarch`
+(`file` the image first, never `set architecture`), a breakpoint on
+`%SIGNAL-TYPE-ERROR`, and a frame walk over A6 (`[fp]` = previous fp, `[fp+4]`
+= return address) mapped through `MODUS_SYMMAP`.  The symbol map can be off for
+late functions -- confirm an address against its `linkw`.
 
 ### Build taxonomy — clean images vs ANSI gate runners
 
@@ -543,9 +888,17 @@ Two kinds of build:
   `scripts/ansi-sweep.sh`, comparing pass sets by test name and re-running lost
   tests to separate flakes.  The four corpus-baking runners it replaced
   (`build-x64-linux`, `build-x64`, `build-aarch64-linux`, `build-aarch64-ansi`
-  and their `build-ansi-common.lisp`) are retired; bare-metal and aarch64
-  conformance have no runner until the sweep runs there (the aarch64 CLI under
-  qemu-user is the next candidate).
+  and their `build-ansi-common.lisp`) are retired.
+- **The gate stays under half an hour** (user rule, 2026-10-29), so it sweeps
+  x64 only.  The other five hosted CLIs (aarch64, i386, arm32, riscv32,
+  riscv64) take 1-2 hours each under qemu-user, interpreting everything the
+  suite loads, and run in the SECONDARY suite `scripts/allarch-ansi.sh
+  [WORKDIR] [ARCH...]`: builds each from this tree, sweeps them in parallel,
+  one line per port, exit 0 only if all pass.  Run it before merging anything
+  that touches a translator, the runtime or the compiler.  A port moves into
+  the gate when a JIT brings its sweep under the budget.  All six CLIs were
+  21681/21681 on 2026-10-29 (cee4ad26).  Bare-metal conformance still has no
+  runner.
 
 ### QEMU AArch64 (virt machine, E1000) — the CL image
 ```bash
@@ -567,7 +920,7 @@ names the tag (`mini-lisp-final`) that still holds them.
 ### QEMU RPi 3B / real Pi boards (DWC2 USB host, CDC Ethernet)
 ```bash
 ./scripts/run.sh rpi-cl-repl "(+ 1 2)"                 # serial REPL (build-rpi-cl-repl.lisp)
-./scripts/run.sh rpi-cl-repl "(progn (led-init) (led-on))"   # GPIO: net/bcm2835-gpio.lisp
+./scripts/run.sh rpi-cl-repl "(progn (modus-int::led-init) (modus-int::led-on))"   # GPIO: net/bcm2835-gpio.lisp
 # The board image (U-Boot chainload, USB NIC, HDMI + USB keyboard console, SSH):
 MODUS_RPI_THREADS=1 MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 MODUS_RPI_CHAINLOAD=1 \
   sbcl --dynamic-space-size 12288 --script mvm/build-rpi-cl-repl.lisp
@@ -1284,7 +1637,7 @@ collector can be booted here.  With that, stages 1, 2 AND 3 all RUN on the
 region-aware **aarch64 native collector** under `qemu-system-aarch64 -M raspi3b`,
 including the brand-new parked-window branch (chain A, rooted only from the
 parked window, survives; chain B, rooted only from the live stack, does not).
-`(%gc-forced-stress 2000 5)` there is `(1 6 2000 1999000 0 5)`.
+`(modus-int::%gc-forced-stress 2000 5)` there is `(1 6 2000 1999000 0 5)`.
 
 **`net/cooperative-atomics.lisp` was reconciled, not silently invalidated.**  Its
 three checked facts all still hold and for the same reasons — stage 3 added no
@@ -1510,8 +1863,8 @@ arm is driven on the one bootable target that can:
 `MODUS_RPI_GC_SHIM=1 sbcl --script mvm/build-rpi-cl-repl.lisp` turns the native
 aarch64 collector off so every gc-check lands in the shim, which CALLs
 `%GC-COLLECT`.  Under `qemu-system-aarch64 -M raspi3b`:
-`(%gc-forced-stress 2000 5)` → `(1 6 2000 1999000 0 5)` (the value documented
-for that image on its *native* arm) and `(%gc-forced-stress 500 3)` →
+`(modus-int::%gc-forced-stress 2000 5)` → `(1 6 2000 1999000 0 5)` (the value documented
+for that image on its *native* arm) and `(modus-int::%gc-forced-stress 500 3)` →
 `(6 9 500 124750 0 3)`; violations 0.  Default OFF — the shipping image is
 byte-identical.  The per-CPU **addressing** is separately exercised on the
 threaded target: thread 1 gets scratch entry 0, thread 2 entry 1, +32 bytes.
@@ -1701,9 +2054,9 @@ Localised by varying only `*gcevery*` from the script, which needs no rebuild:
 
 | arm | forced collections | result |
 |---|---|---|
-| `(%tl-selftest 0 300 100000)` | none — `since` never reaches the threshold | **60 of 60 clean** |
-| `(%tl-selftest 0 300 25)` | 12 per thread (the shipping test) | **54 of 60** |
-| `(%tl-selftest 0 50 25)` | 2 per thread | 25 of 25 clean |
+| `(modus-int::%tl-selftest 0 300 100000)` | none — `since` never reaches the threshold | **60 of 60 clean** |
+| `(modus-int::%tl-selftest 0 300 25)` | 12 per thread (the shipping test) | **54 of 60** |
+| `(modus-int::%tl-selftest 0 50 25)` | 2 per thread | 25 of 25 clean |
 
 Remove the collections and the failure disappears entirely.  The fault itself is
 a **corrupted control transfer on the MAIN thread**: with a temporary dump wired
@@ -1716,7 +2069,7 @@ return address or handler frame that is no longer valid.  `RAX` reads
 the thread had just come back from a timed-out futex park.
 
 **Serializing the collections does NOT fix it**, and that is the useful negative:
-with `(%ha-set-collect-serialized 1)` — the flag that exists in-tree for exactly
+with `(modus-int::%ha-set-collect-serialized 1)` — the flag that exists in-tree for exactly
 this bisect — the rate is unchanged at **54 of 60**.  So this is not two
 collectors overlapping with each other; it is what a collection does with
 respect to the OTHER thread's Lisp work.  The standing suspects are the two
@@ -3282,7 +3635,7 @@ units, over `(sleep 1)` 30 units.
 field is stored raw there and `mem-ref :u64` halves it, so a count of 1 reads
 back as a value whose bit pattern is a CONS tag and prints as garbage.  That
 looked exactly like heap corruption after a forced collection and cost a
-detour.  Read it with `%GC-META-READ`, or `(%gc-read64 (+ (%gc-region) #x20))`.
+detour.  Read it with `%GC-META-READ`, or `(modus-int::%gc-read64 (+ (modus-int::%gc-region) #x20))`.
 This is already written down under "Two traps this cost time on"; it is written
 down again here because it was still walked into.
 
@@ -3401,7 +3754,7 @@ are idempotent `DEFUN`s and the load completes correctly) and pre-existing — i
 is the same shape as the documented "`%GC-COLLECT-HERE` at an interpreted
 `--script` toplevel breaks the next `(format t …)`" — but the carve is now a
 place that *reaches* it, so it is on the critical path and it was not before.
-`(%gc-count)` read from an interpreted toplevel after such a collection also
+`(modus-int::%gc-count)` read from an interpreted toplevel after such a collection also
 misbehaves.  Both are the same unfixed defect and both are one level below this
 one.
 
@@ -3747,6 +4100,36 @@ found it in 20 minutes: run the DDC at three commits concurrently in worktrees;
 `cmp` the pair; the first diff past the preamble JMP is a call displacement, so
 scan for the first difference WIDER than 8 bytes and disassemble both sides there.
 
+### THE UEFI DDC WAS DEAD FROM 2026-10-13 TO 2026-10-29 — four defects, none of them in the comparison
+
+`modus-sh` (build-modus-selfhost) did not BOOT, so test/run-uefi-ddc.sh could not
+even start its in-image compile.  Fixed on m68k-gc; the DDC is a byte-identical
+FIXPOINT again (UEFI image md5 `0f5380c2…`, reproducible run to run).  In the order
+they were peeled off, each found from a core dump (ptrace is blocked here; patch
+`#xCC` over the first byte of ERROR in a COPY of the binary and read the core):
+1. **Stack overflow at boot** (65bc8ab2, 10-15): the hash-table core tested
+   `(eq strcmp? :equalp)` first, and in an image WITHOUT static keywords (modus-sh;
+   only the CLI builds set `*static-keywords-p*`) `:equalp` is a call to
+   %INTERN-KEYWORD, whose own table lookup comes back to the same test -- 44,900
+   frames.  Every such test in prelude now rules out NIL and T first.
+2. **`*LINUX-X64-R14-OFFSET*` NIL** (fcb5a4a2, 10-13): the stub emitter compares
+   it, and modus-sh's KERNEL-MAIN measured the stub before the defvar thunks ran.
+   Set it (as a LITERAL -- the constant is MODUS-INT's, and naming it from the
+   MODUS.ASM co-init text is a cross-package global the build rejects) after
+   INIT-ALL-GLOBALS.
+3. **`+LINUX-X64-GC-MIDPOINT+` NIL in modus-sh**: modus's image reader drops SBCL
+   package prefixes, so the defconstant's `#+sbcl (sb-ext:posix-getenv …)` arrived
+   as MODUS-INT::POSIX-GETENV, the host EVAL that folds a defconstant failed, and
+   the form was SKIPPED (`SKIP form#… boot/boot-linux-x64.lisp:44` in the build
+   log).  A host-only POSIX-GETENV shim in those packages lets it fold.
+4. **The DDC rule again** (a host-set flag the in-image compile never sees):
+   `*WRITE-CHAR-SERIAL-HOOK*` (the PC console mirrors COM1 to the screen) was not
+   set by `--compile-uefi`, so modus-sh inlined 223 raw serial writes where SBCL
+   called %CONSOLE-WRITE-CHAR -- 512 bytes longer.  Set when the source defines it.
+All four are on pristine main (4d1a94b5 overflows at boot exactly as above, and
+with only these fixes applied gives the same 512-byte divergence).  **A `SKIP form` line in a self-host build log is a constant or
+function the image does not have** -- read the build log before the binary.
+
 ### AWS NITRO ENCLAVES — the hosted route (2026-10-06, docs/nitro-enclaves.md)
 
 **RAN FOR REAL 2026-10-07 — VERDICT PASS** on an m5.xlarge in us-east-2, non-debug
@@ -3860,7 +4243,7 @@ Most of the list below had been fixed without the list being updated.
 
 | # | limitation | now |
 |---|---|---|
-| 1 | last-defun-wins | **STILL TRUE INSIDE AN IMAGE**: two DEFUNs of one name in baked source both resolve to the last, and a `#'NAME` taken between them is the last one too (the image is linked statically).  At RUNTIME it is CL: an old function object keeps its old code, as in SBCL. |
+| 1 | last-defun-wins | **STILL TRUE INSIDE AN IMAGE**: two DEFUNs of one name in baked source both resolve to the last, and a `#'NAME` taken between them is the last one too (the image is linked statically).  At RUNTIME it is CL: an old function object keeps its old code, as in SBCL.  **But it is no longer silent (2026-10-29):** a redefinition is a build error unless the file holding the default says `(declaim (overridable NAME))` -- see "Redefinition is declared" below. |
 | 2 | variable-index ASET as a non-last form | fixed (both ways) |
 | 3 | symbol identity per package | CL-correct, not a limitation |
 | 4 | YIELD at every loop back-edge | a description, not a defect (SEV+WFE on aarch64 bare metal; `MODUS_YIELD_NOP=1` for NOP) |
@@ -3871,6 +4254,31 @@ Most of the list below had been fixed without the list being updated.
 | 8a | `(ash most-positive-fixnum 1)` wrapping | fixed: promotes to the bignum |
 | 8b | variable-count `bignum-ash` | fixed |
 | 8c | negative overflow in checked `*` / `+` | fixed: `(* most-negative-fixnum 2)` = -2^63 |
+
+### Redefinition is declared (builder packages step 1, 2026-10-29)
+
+Every image's DEFUNs live in one namespace and the last wins, so a platform
+seam (`%SYS-OPEN-RDONLY` in cl-fileio, replaced per arch by cli-toplevel's
+text; `E1000-SEND` replaced by every NIC driver) looks exactly like an
+accident.  Now they differ: the file that holds the DEFAULT says
+`(declaim (overridable NAME ...))` directly above it, and any other
+redefinition fails the build, naming both source lines.
+`MODUS_REDEF_CHECK=warn` reports instead; `0` says nothing.  The declaration
+emits nothing (a toplevel DECLAIM), and SBCL is told it is a declaration at the
+top of compiler.lisp.  Every build log reports locations as `FILE:LINE`; text a
+build script appends without a file of its own reads `after:FILE:LINE`.
+
+Measured with `MODUS_DEFUN_INVENTORY=FILE` (every DEFUN an image compiles,
+written host-side) over all 31 matrix images: 92 definitions no image ever
+reached were deleted (prelude's minimal FORMAT/INTERN/TYPEP/REDUCE under the
+cl-*.lisp versions, crypto.lisp's field arithmetic under crypto-fast, ...), and
+186 seams were declared.  Two were bugs: `%FORM-MENTIONS-P` was defined twice
+with different signatures, so `%INFERRED-SINGLE-LOCAL-P`'s guard never fired
+(now `%FORM-MENTIONS-ANY-P`); and `build-uefi-cl-repl` had never run ANY build
+check, because loading `lib/load-mvm.lisp` twice replaced the `BUILD-IMAGE`
+wrapper (it re-installs itself now).  A dead-looking definition in a file the
+SBCL host also loads (compiler, translators, boot, x64-asm) is NOT dead: it can
+be the host compiler's own.
 
 Not in the old list and still worth knowing: an undeclared free variable is
 treated as a global (CL would make it special and warn; the same answer, but the
@@ -4027,7 +4435,21 @@ Key globals for translator:
 Shared source files between QEMU virt (E1000) and RPi (DWC2 CDC-ECM):
 - `ip.lisp`, `crypto.lisp`, `ssh.lisp`, `http.lisp`, `http-client.lisp`
 
-Per-platform adapters provide: `e1000-send`, `e1000-receive`, `e1000-state-base`, `ssh-ipc-base`, allocation primitives (`make-array`, `aref`, `aset`), and actor address hooks.
+The net stack reaches the NIC through **`MODUS.NET`'s interface** (`net/nic.lisp`):
+`nic-send`, `nic-receive`, `nic-rx-buf`, `nic-probe`, `nic-read-reg`.  Each image binds it to its
+driver at boot with `(setf (fdefinition 'modus.net:nic-send) #'…)` --
+`%BIND-NIC-SEAMS`, generated by `build-cl-repl-common.lisp` and called right
+after `init-all-globals`.  A seam (`%DEFINE-SEAM`) calls through a cell, so the
+rebinding reaches ahead-of-time callers on every target.  The NE2000, E1000 and
+virtio drivers are packages `MODUS.NET.NE2000` / `.E1000` / `.VIRTIO` (they
+`:use` MODUS-INT for the board hooks and printers it exports to drivers); the
+x64 image's `nic-probe` probes virtio and rebinds the interface to whichever
+NIC answered.  The boards' USB NICs still implement it as the MODUS-INT
+`e1000-*` functions.  The kernel's packages beyond MODUS-INT are
+listed once, in `mvm/kernel-packages.lisp`, which the build host and every
+image both read.
+
+Per-platform adapters provide: `e1000-state-base`, `ssh-ipc-base`, allocation primitives (`make-array`, `aref`, `aset`), and actor address hooks.
 
 Source load order matters — later files override earlier defuns:
 ```

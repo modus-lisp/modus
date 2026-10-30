@@ -108,7 +108,7 @@
      (dotimes (i n)
        (modus:channel-send ch (list i (make-string 1000 :initial-element (code-char (+ 65 (mod i 26)))))))
      0)))
-(let* ((n 20000) (th (send-many *big* n)) (a0 (%rt-arena-alloc)) (bad 0) (t0 (now-ms)))
+(let* ((n 20000) (th (send-many *big* n)) (a0 (modus-int::%rt-arena-alloc)) (bad 0) (t0 (now-ms)))
   (modus:channel-send *go* :go)
   (dotimes (i n)
     (let ((m (modus:channel-receive *big* :timeout 30)))
@@ -117,14 +117,14 @@
         (setq bad (+ bad 1)))))
   (sb-thread:join-thread th)
   (format t "~&  20000 x 1 KB worker -> main in ~,1f s; arena moved ~a bytes~%"
-          (/ (- (now-ms) t0) 1000.0) (- (%rt-arena-alloc) a0))
+          (/ (- (now-ms) t0) 1000.0) (- (modus-int::%rt-arena-alloc) a0))
   (chk "20000 messages, every one intact and in order" bad 0)
-  (chk "and the arena did not move" (- (%rt-arena-alloc) a0) 0))
+  (chk "and the arena did not move" (- (modus-int::%rt-arena-alloc) a0) 0))
 
 ;; the positive control: MODUS:SHARE moves the meter
-(let ((a0 (%rt-arena-alloc)))
+(let ((a0 (modus-int::%rt-arena-alloc)))
   (share-burn 300)
-  (chk "control: 300 MODUS:SHARE copies use the arena" (> (- (%rt-arena-alloc) a0) 1000000) t))
+  (chk "control: 300 MODUS:SHARE copies use the arena" (> (- (modus-int::%rt-arena-alloc) a0) 1000000) t))
 
 ;;; 5. back-pressure and wrap-around: a 4 KB ring, 5000 messages of ~300 bytes
 (defvar *small* (modus:make-channel :capacity 4096))

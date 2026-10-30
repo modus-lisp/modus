@@ -135,7 +135,7 @@
 ;;; ---- serve -----------------------------------------------------------------
 
 (defvar *clients* 1)
-(let ((s (%cli-getenv "GLASS_SERVE_CLIENTS")))
+(let ((s (modus-int::%cli-getenv "GLASS_SERVE_CLIENTS")))
   (when (and s (> (length s) 0))
     (setq *clients* (parse-integer s))))
 
@@ -240,7 +240,7 @@
                          (let ((waited 0))
                            (loop
                              (when (or done (> waited 120000)) (return nil))
-                             (%sleep-ms 50)
+                             (modus-int::%sleep-ms 50)
                              (setq waited (+ waited 50)))
                            ;; Closing the listening socket is how glass itself
                            ;; cancels a parked accept (src/socket.lisp:420-440).

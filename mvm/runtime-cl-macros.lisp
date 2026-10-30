@@ -589,8 +589,14 @@
    triggered a stability bug where installs 3+ stopped registering.
    A NIL SRC (unrolled (nth k) past the list end) is a no-op so the
    unroll can safely overshoot the current entry count."
+  ;; Read in MODUS-INT: the internals these expansions call (%PUSH-RESTARTS,
+  ;; %WITH-CONDITION-RESTARTS ...) are the kernel's, and the macro names are
+  ;; all COMMON-LISP's, inherited there (builder packages step 4).
   (when src
-    (eval (read-from-string src))))
+    (let ((%kpkg *package*))
+      (setq *package* (or (find-package "MODUS-INT") *package*))
+      (unwind-protect (eval (read-from-string src))
+        (setq *package* %kpkg)))))
 
 
 (defun %install-runtime-cl-macros ()
@@ -750,13 +756,17 @@
           ;; encodings.  (:utf-8 / :utf-8b have no reader conditionals and
           ;; were the two that survived.)
           ;;
-          ;; Every consumer of this file is little-endian: x86-64 (generic,
-          ;; generic-cli, x64-cl-repl, modus-selfhost) and i386 (i386-cli).
-          ;; A big-endian target (ppc/ppc32/68k) must push :BIG-ENDIAN in
-          ;; its own boot path instead of loading this default.
+          ;; %TARGET-BIG-ENDIAN-P (interp.lisp) answers from the folded
+          ;; +TARGET-BIG-ENDIAN+, so the 68k and PowerPC CLIs say :BIG-ENDIAN
+          ;; (this used to assume every consumer was little-endian, and 68k
+          ;; advertised the wrong byte order to every #+big-endian in every
+          ;; library).  A FUNCTION, not the constant: this file is compiled
+          ;; without the width/endianness preamble, where the constant is an
+          ;; unbound global.
           (unless (or (member :little-endian *features*)
                       (member :big-endian *features*))
-            (setq *features* (cons :little-endian *features*)))
+            (setq *features* (cons (if (%target-big-endian-p) :big-endian :little-endian)
+                                   *features*)))
           ;; Advertise :modus so UIOP recognises this implementation.  The
           ;; vendored asdf.lisp guards its "ASDF is not supported on your
           ;; implementation" hard error with

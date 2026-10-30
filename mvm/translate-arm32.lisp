@@ -1011,8 +1011,8 @@
 ;;; ============================================================
 ;;;
 ;;; The protocol of translate-riscv / -ppc / -68k: one live jmpbuf, a stack of
-;;; saved outer jmpbufs so handler-cases nest, a depth cap of 21 past which a
-;;; push stores nothing and its pop is absorbed, LONGJMP copying the jmpbuf aside
+;;; saved outer jmpbufs so handler-cases nest, a depth cap (46 here) past which
+;;; a push stores nothing and its pop is absorbed, LONGJMP copying the jmpbuf aside
 ;;; before the pop.  JMPBUF = 7 words: sp, r11 (VFP), resume address, r4..r7
 ;;; (V4..V7, callee-saved).  VA/VL/VN (r9/r10/r8) deliberately absent.  Frames
 ;;; are 8 words (32 bytes) so a frame address is a shift.
@@ -1022,17 +1022,34 @@
 ;;; LONGJMP never returns, so it uses r1..r3 freely.
 ;;;
 ;;; WHERE: hosted, the shared contract block at the heap base (#x10000180 ...;
-;;; 21 frames end at #x100006A8, clear of the globals at #x10000A00); bare, the
+;;; 46 frames end at #x100009C8, clear of the globals at #x10000A00); bare, the
 ;;; same offsets in *arm32-globals-base*'s block, which otherwise uses #x00-#x0F.
 
 (defconstant +arm32-jmpbuf-words+ 7)
-(defparameter *arm32-hstack-max-depth* 21)
+(defparameter *arm32-hstack-max-depth* 46
+  "As many 32-byte frames as fit below the globals at #x10000A00.  It was 21,
+   and that was the whole of `fresh-FASL-cache loads are broken on arm32':
+   boot already holds 5 frames, a library load RECORDING the cache nests past
+   the other 16, the excess pushes are absorbed, and a throw then lands on the
+   wrong frame -- alexandria's first load failed all 30 probes with 57 throws
+   escaping as %THROW-IN-FLIGHT.  At 46: 30 of 30, no errors, recording and
+   replay alike.  x64 holds 64, i386 63.")
 (defun arm32-hbase ()           (if (arm32-hosted-layout-p) #x10000000 *arm32-globals-base*))
 (defun arm32-jmpbuf-addr ()     (+ (arm32-hbase) #x180))
 (defun arm32-lj-scratch-addr () (+ (arm32-hbase) #x300))
 (defun arm32-hcapped-addr ()    (+ (arm32-hbase) #x360))
 (defun arm32-hdepth-addr ()     (+ (arm32-hbase) #x400))
-(defun arm32-hframes-addr ()    (+ (arm32-hbase) #x408))
+;;; HOSTED, 46 was not enough either: the upstream ANSI suite's own loader
+;;; (COMPILE-AND-LOAD* of each aux file, inside LOAD inside LOAD) nests deeper,
+;;; and every aux file's %FASL-REJECT / COMPILE-FILE throw escaped as
+;;; %THROW-IN-FLIGHT -- the suite never finished loading on arm32 (all 28
+;;; shards timed out with zero tests run).  The hosted layout keeps its frames
+;;; in their own region at heap+#x20000, below the allocator's start (#x28000,
+;;; boot-linux-arm32), so the collector's scan of the low block still covers
+;;; them -- RISC-V's layout.  255 because the depth compare takes an 8-bit
+;;; immediate.  Bare (*arm32-globals-base*) keeps the 46 above.
+(defun arm32-hstack-max-depth () (if (arm32-hosted-layout-p) 255 *arm32-hstack-max-depth*))
+(defun arm32-hframes-addr ()    (+ (arm32-hbase) (if (arm32-hosted-layout-p) #x20000 #x408)))
 (defconstant +arm32-r1-r3+ (logior (ash 1 1) (ash 1 2) (ash 1 3)))
 
 (defun arm32-emit-copy-words (buf from to)
@@ -1053,7 +1070,7 @@
     (arm32-push buf +arm32-r1-r3+)
     (arm32-load-imm32 buf +arm-r3+ (arm32-hdepth-addr))
     (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
-    (arm32-cmp-imm buf +arm-r2+ 0 *arm32-hstack-max-depth*)
+    (arm32-cmp-imm buf +arm-r2+ 0 (arm32-hstack-max-depth))
     (arm32-b-cond buf +arm-cc-ge+ capped)
     (arm32-emit-frame-addr buf +arm-r1+ +arm-r2+)
     (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
@@ -1987,17 +2004,19 @@
            ;; Header at alloc, slots at alloc+4+. OBJ-REF offset = 2 + idx*4.
            (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 +arm32-object-tag+)
            (arm32-store-vreg buf +arm-r12+ vd)
-           ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots)
-           ;; Align to 16 bytes to keep cons alloc pointer aligned
+           ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots),
+           ;; aligned to 16 -- AND ZERO THE SLOTS, as x64, aarch64 and i386
+           ;; do and as this file already did for arrays and byte vectors.
+           ;; Unzeroed, a fresh instance / struct / closure / condition held
+           ;; whatever an earlier collection left in reused memory until its
+           ;; slots were filled, and a small heap reuses memory constantly:
+           ;; 150 rounds of DEFCLASS / DEFGENERIC / DEFMETHOD /
+           ;; MAKE-INSTANCE in a 16 MB heap failed 22-36 rounds with
+           ;; MEMORY-FAULT-ERROR, and 0 when the collector overwrote reused
+           ;; memory with an inert value (MODUS_ARM32_GC_POISON) -- same tree.
            (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15))))
-             (let ((enc (arm32-encode-imm total)))
-               (if enc
-                   (let ((rot (car enc))
-                         (imm (cdr enc)))
-                     (arm32-add-imm buf +arm-r9+ +arm-r9+ rot imm))
-                   (progn
-                     (arm32-load-imm32 buf +arm-lr+ total)
-                     (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))))))
+             (arm32-load-imm32 buf +arm-lr+ total)
+             (arm32-emit-alloc-zero-tail buf))))
 
         (#.+op-alloc-array+
          (arm32-emit-alloc-mark buf 1)   ; FIRST: clobbers r12/LR
@@ -2297,6 +2316,42 @@
          ;; the reference back ends exactly.  What it replaces is worse than an
          ;; imprecise check: RISC-V/PPC/68k TRAPPED on these opcodes, and
          ;; make-array emits :gc-check-n, so no array could be allocated at all.
+         ;; HOSTED + SIZED: test the POST-allocation pointer.  The unsized
+         ;; check below lets an allocation larger than the collector's margin
+         ;; (min 1 MB, a quarter of a semispace) run past VL into the conses
+         ;; the last collection copied to the top of the semispace -- live
+         ;; data.  A big heap seldom sits near its limit; a small one nearly
+         ;; always does, and cl-ppcre's 1.4 MB tarball vector is bigger than
+         ;; the margin of any heap under 8 MB of semispace.
+         (when (and *arm32-gc-label*
+                    (or (= opcode +op-gc-check-n+) (= opcode +op-gc-check-r+)))
+           (flet ((size+va ()
+                    ;; r12 = VA + an OVERestimate of the bytes about to be
+                    ;; allocated (the superset property: never under).
+                    (if (= opcode +op-gc-check-n+)
+                        (arm32-load-imm32 buf +arm-r12+ (vreg 0))
+                        (progn
+                          (arm32-load-vreg buf +arm-r12+ (vreg 0))
+                          (if (eql (vreg 1) 1)
+                              ;; KIND 1: TAGGED byte count -> n/... bytes + header
+                              (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+                              ;; KIND 0: UNTAGGED slot count -> 4 bytes a slot
+                              (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 2))
+                          (arm32-add-imm buf +arm-r12+ +arm-r12+ 0 32)))
+                    (arm32-add buf +arm-r12+ +arm-r12+ +arm-r9+)))
+             (let ((ok (mvm-make-label)))
+               (size+va)
+               (arm32-cmp buf +arm-r12+ +arm-r10+)
+               (arm32-b-cond buf +arm-cc-cc+ ok)          ; fits below VL
+               (arm32-bl buf *arm32-gc-label*)
+               (size+va)
+               (arm32-cmp buf +arm-r12+ +arm-r10+)
+               (arm32-b-cond buf +arm-cc-cc+ ok)
+               ;; Still does not fit after a collection: the heap is too small
+               ;; for this object.  The collector's own exhausted signal.
+               (arm32-emit-bkpt buf #xF0)
+               (arm32-emit-label buf ok))
+             (return-from arm32-translate-insn nil)))
          ;; CMP r9(VA), r10(VL); trap if VA >= VL
          (arm32-cmp buf +arm-r9+ +arm-r10+)
          ;; BKPTCS #1  (if unsigned >=)
@@ -2930,8 +2985,20 @@
 ;;; preserves r4-r11, and returns with BX LR.
 
 (defconstant +arm32-gc-overshoot-margin+ #x100000
-  "Bytes kept free below VL: :gc-check tests VA < VL before an allocation whose
-   size it does not know.  1 MB, as on RISC-V.")
+  "The MOST kept free below VL: :gc-check tests VA < VL before an allocation
+   whose size it does not know.  The collector uses min(this, a quarter of a
+   semispace), so a small heap sized at startup is not all margin.")
+
+(defvar *arm32-gc-poison* nil
+  "DEBUG: when true, every collection overwrites the semispace it evacuated
+   with +ARM32-GC-POISON+, so a pointer the collector failed to update faults
+   on its first read instead of silently reading the stale copy -- which
+   otherwise stays intact until the next collection reuses that space.  Set by
+   build-arm32-cli.lisp from MODUS_ARM32_GC_POISON=1.  Off: byte-identical.")
+
+(defconstant +arm32-gc-poison+ #x00000BA9
+  "Tag 9 (an object) at address #xBA0, which is never mapped: as a value it
+   faults when dereferenced, as a header it is a nonsense subtag #xA9.")
 
 (defvar *arm32-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
@@ -3105,6 +3172,18 @@
           (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 4)
           (arm32-b buf zl)
           (here zd))
+        ;; ---- DEBUG: poison the evacuated semispace [r4, r5) ----
+        (when *arm32-gc-poison*
+          (let ((pl (lbl)) (pd (lbl)))
+            (arm32-mov buf +arm-r0+ +arm-r4+)
+            (arm32-load-imm32 buf +arm-r2+ +arm32-gc-poison+)
+            (here pl)
+            (arm32-cmp buf +arm-r0+ +arm-r5+)
+            (arm32-b-cond buf +arm-cc-cs+ pd)
+            (arm32-str buf +arm-r2+ +arm-r0+ 0)
+            (arm32-add-imm buf +arm-r0+ +arm-r0+ 0 4)
+            (arm32-b buf pl)
+            (here pd)))
         ;; ---- swap the semispaces, count the collection ----
         (arm32-load-imm32 buf +arm-r12+ meta)
         (arm32-str buf +arm-r6+ +arm-r12+ 0)
@@ -3114,7 +3193,15 @@
         (arm32-str buf +arm-r0+ +arm-r12+ 32)
         ;; ---- new VA = object free, VL = cons low - margin, into the frame ----
         (let ((exhausted (lbl)))
-          (arm32-load-imm32 buf +arm-r0+ +arm32-gc-overshoot-margin+)
+          ;; margin = min(1 MB, space_size / 4), 16-aligned -- computed, so a
+          ;; heap sized at startup (boot-linux-arm32's stub) needs no stored
+          ;; margin.  At the shipping 124 MB semispace this is the old constant.
+          (arm32-ldr buf +arm-r0+ +arm-r12+ 16)
+          (arm32-lsr-imm buf +arm-r0+ +arm-r0+ 2)
+          (arm32-bic-imm buf +arm-r0+ +arm-r0+ 0 15)
+          (arm32-load-imm32 buf +arm-r1+ +arm32-gc-overshoot-margin+)
+          (arm32-cmp buf +arm-r0+ +arm-r1+)
+          (arm32-mov-cond buf +arm-cc-hi+ +arm-r0+ +arm-r1+)
           (arm32-sub buf +arm-r1+ +arm-r9+ +arm-r0+)
           (arm32-cmp buf +arm-r8+ +arm-r1+)
           (arm32-b-cond buf +arm-cc-cs+ exhausted)

@@ -36,8 +36,12 @@
    under Linux that window is not mapped into our address space at all.")
 
 (defconstant +linux-riscv-heap-size+ #x38000000)   ; 896 MB
-(defconstant +linux-riscv-heap-alloc-start+ #x3000
+(defconstant +linux-riscv-heap-alloc-start+ #x28000
   "Where the bump allocator starts, as an offset into the heap.
+
+   #x28000 since the handler-frame stack moved to its own region at
+   #x20000..#x25FFF (translate-riscv.lisp, +RV-HOSTED-HSTACK-FRAMES-OFFSET+):
+   21 frames in the fixed block were too few for a nested LOAD.  It was #x3000.
 
    #x200 WAS WRONG AND IT COST A DAY.  That is exactly where this stub writes
    ARGC, and it is inside the whole fixed block the shared runtime owns: metadata

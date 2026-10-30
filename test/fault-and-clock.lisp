@@ -25,7 +25,7 @@
 (fc 'still-alive (list 1 2 (+ 3 4)) '(1 2 7))
 
 ;; The caught fault IS a condition of its own: the stub cannot allocate one,
-;; so the handler-case dispatch builds it (%TAKE-PENDING-FAULT).  Before, the
+;; so the handler-case dispatch builds it (modus-int::%TAKE-PENDING-FAULT).  Before, the
 ;; clauses matched whatever was signalled LAST -- here the SIMPLE-ERROR.
 ;; By NAME: the runtime's type symbol is homed in its build-host package,
 ;; so it is not EQ to the MEMORY-FAULT-ERROR this file reads into CL-USER

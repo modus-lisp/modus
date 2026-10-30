@@ -583,9 +583,17 @@
                  (if tn (namestring tn) ""))
                ""))))
 
+(defvar *fasl-suspended* nil
+  "T while the CLI installs a deferred boot surface (build-cli-common.lisp's
+   *DEFERRED-SURFACES-SOURCE*).  That install can start in the middle of a
+   LOAD that is recording this very cache, and the two loads' per-form
+   recording state is shared, so the install loads uncached -- as an uncached
+   boot would.")
+
 (defun %fasl-active-p ()
-  "The cache is in use for this load: switched on, main thread, runtime eval."
-  (and (%fasl-mode) (%mvm-on-main-thread-p) (not *static-build-p*)))
+  "The cache is in use for this load: switched on, main thread, runtime eval,
+   and no deferred surface being installed."
+  (and (not *fasl-suspended*) (%fasl-mode) (%mvm-on-main-thread-p) (not *static-build-p*)))
 
 (defun %fasl-stream-text (stream)
   "STREAM's whole remaining text when it is a FILE being LOADed and the cache is

@@ -41,7 +41,7 @@
 (defvar *tot-met* 0)
 (defvar *tot-collections* 0)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -65,7 +65,7 @@
 (let ((r 1))
   (loop
     (when (> r *rounds*) (return 0))
-    (let ((out (%ha-mt-conc-selftest *nmsg* *budget* *nlinks* 0 *barrier*)))
+    (let ((out (modus-int::%ha-mt-conc-selftest *nmsg* *budget* *nlinks* 0 *barrier*)))
       (if (zerop out)
           (progn (setq *fail* (+ *fail* 1))
                  (format t "FAIL round ~D: no band~%" r))

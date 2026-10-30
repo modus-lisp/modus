@@ -58,7 +58,7 @@ if a.expect_restored and "CORE-RESTORED" not in banner:
 time.sleep(2); rd_until(r"never", 1.0)
 say("WARMUP", q("(+ 20 22)"))
 if a.tar:
-    q("(setq *tar-block-size* 512)")
+    q("(setq modus-int::*tar-block-size* 512)")
     # RAMV NATIVE: under the default hot-only JIT the defun stays interpreted, and
     # copying a 1.3 MB tarball out of RAM took ~10 min under TCG (native: seconds).
     hot = q("*jit-hot-only*")
@@ -70,7 +70,7 @@ for spec in a.tar:
     addr, ln, name = spec.split(":"); t0 = time.time()
     v = q("(progn (setq *kt* (ramv %d %d)) (length *kt*))" % (int(addr, 0), int(ln)), 600)
     say("RAMV %s %s bytes -> %s" % (name, ln, v))
-    s.sendall(('(install-tarball-from-bytes *kt* "%s")\r\n' % name).encode())
+    s.sendall(('(modus-int::install-tarball-from-bytes *kt* "%s")\r\n' % name).encode())
     out = rd_until(r"install-tarball: done|INCOMPLETE|!! form eval error in [^\n]*\n[^\n]*\n> ", a.install_wait)
     ok = "install-tarball: done" in out
     say("INSTALL %s %s %.0fs" % (name, "ok" if ok else "FAILED", time.time() - t0))

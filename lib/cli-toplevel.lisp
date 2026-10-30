@@ -88,6 +88,7 @@
   "The process argc, stored by the boot stub at 0x10000200."
   (mem-ref #x10000200 :u32))
 
+(declaim (overridable %cli-argv-base))
 (defun %cli-argv-base ()
   "Real byte address of argv[0]'s slot = initial-RSP + 8 (RSP holds argc).
    %gc-stack-base returns the raw RSP right-shifted by one (a u64 load stores
@@ -99,6 +100,7 @@
    is the actor's, and getenv from an actor walked its stack as envp."
   (+ (* 2 (%gc-stack-base-0)) 8))
 
+(declaim (overridable %cli-collect-argv))
 (defun %cli-collect-argv ()
   "Return the process arguments as a list of strings — element 0 is the
    program name (argv[0]), like SBCL's *posix-argv*.  Reads every argv[i]
@@ -118,6 +120,7 @@
             (push (%cli-cstr-at ptr) acc)))
       (setq i (+ i 1)))))
 
+(declaim (overridable %cli-getenv))
 (defun %cli-getenv (name)
   "Look up environment variable NAME on the initial stack's envp vector
    (which immediately follows argv's NULL terminator).  Returns the value
@@ -234,6 +237,7 @@
 ;;; the REPL (moved here from ql-shim's %ql-repl so it is shared)
 ;;; ===========================================================================
 
+(declaim (overridable %cli-repl))
 (defun %cli-repl (banner-p)
   "Interactive read-eval-print loop over stdin (fd 0).  When BANNER-P, print
    the startup banner first.  Ctrl-D (EOF) exits."
@@ -343,6 +347,19 @@
              (%cli-line "Modus: --core must be the first argument")
              (%cli-exit 1))
            (setq args (cddr args)))
+          ;; SBCL RUNTIME options, which SBCL's C runtime consumes before
+          ;; Lisp starts.  --dynamic-space-size is read by the boot stub of
+          ;; the ports that size their heap at startup (68k, PowerPC, ARM32);
+          ;; elsewhere the heap is fixed and the option is accepted and has
+          ;; no effect.  Either way it is not a toplevel option to reject.
+          ((or (%cli-flag-p arg "--dynamic-space-size")
+               (%cli-flag-p arg "--control-stack-size")
+               (%cli-flag-p arg "--tls-limit"))
+           (setq args (if (cdr args) (cddr args) nil)))
+          ((or (%cli-flag-p arg "--end-runtime-options")
+               (%cli-flag-p arg "--merge-core-pages")
+               (%cli-flag-p arg "--no-merge-core-pages"))
+           (setq args (cdr args)))
           ;; --eval / -e FORM
           ((or (%cli-flag-p arg "--eval") (%cli-flag-p arg "-e"))
            (setq args (cdr args))

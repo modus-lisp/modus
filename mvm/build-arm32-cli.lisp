@@ -57,6 +57,12 @@
 ;;; Scratch pages below the allocator (heap+#x20000): cstr at #x10001000
 ;;; (rename uses +2048), the 4 KB I/O page at #x10002000 -- RV32's layout.
 (defvar *cli-arch-io-scratch-source* "  (setq *cstr-scratch* #x10001000)
+  ;; getdents64 scratch: cl-fileio's default is a fixed #x1DD00000, which on
+  ;; this layout is INSIDE the heap (it starts at #x10000000 and reaches
+  ;; #x1F800000), so listing a directory wrote dirents over live objects --
+  ;; found when the 68k CLI died in install-tarball, in a directory with a
+  ;; thousand entries.  4 KB is all it uses.
+  (setq *%dirent-buf-addr* #x10003000)
   (setq *io-buf-addr*  #x10002000)
   (setq *scratch-mmapped* t)
 ")
@@ -87,6 +93,8 @@
   (syscall3 5 *cstr-scratch* 193 420))
 (defun %sys-close (fd) (syscall3 6 fd 0 0))
 (defun %sys-getpid () (syscall3 20 0 0 0))
+;; getcwd(2) is syscall 183 here (cl-fileio's %sys-getcwd asks this).
+(defun %sys-getcwd-nr () 183)
 (defun %sys-read-raw (fd buf-addr count) (syscall3 3 fd buf-addr count))
 (defun %sys-write-raw (fd buf-addr count) (syscall3 4 fd buf-addr count))
 (defun %sys-lseek (fd offset whence) (syscall3 19 fd offset whence))
@@ -177,6 +185,10 @@
 (install-armv7-translator)
 (arm32-set-linux-mode t)
 
+(let ((v (sb-ext:posix-getenv "MODUS_ARM32_GC_POISON")))
+  (when (and v (plusp (length v)) (not (string= v "0")))
+    (setf modus.mvm::*arm32-gc-poison* t)
+    (format t "~&;; MODUS_ARM32_GC_POISON: collections poison the evacuated semispace~%")))
 (let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                 "/tmp/modus-arm32-cli"))
        (image (build-image :target :linux-arm32

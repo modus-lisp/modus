@@ -20,7 +20,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A = ~D (expected ~D)~%" name got want))))
 
-(let ((r (%gc-forced-stress 20000 20)))
+(let ((r (modus-int::%gc-forced-stress 20000 20)))
   (let ((g0 (car r)) (g1 (car (cdr r)))
         (n (car (cdr (cdr r))))
         (sum (car (cdr (cdr (cdr r)))))

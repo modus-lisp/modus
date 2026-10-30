@@ -1771,6 +1771,29 @@
     (when (/= rex 0) (emit-bytes buf (logior #x40 rex))))
   (emit-bytes buf #x0F op (logior #xC0 (ash (logand reg 7) 3) (logand rm 7))))
 
+;;; ============================================================
+;;; x86-64 Encoding Helpers (ahead of TRANSLATE-INSTRUCTION, their first
+;;; caller, so the build compiler finds THIS package's definitions there
+;;; rather than borrowing x64-asm's same-named ones)
+;;; ============================================================
+
+(defun rex-prefix (w r x b)
+  "Build a REX prefix byte.  W=64-bit operand, R=ModRM reg ext,
+   X=SIB index ext, B=ModRM r/m or SIB base ext.
+   Each argument is a generalized boolean."
+  (logior #x40
+          (if w 8 0)
+          (if r 4 0)
+          (if x 2 0)
+          (if b 1 0)))
+
+(defun modrm (mod reg rm)
+  "Build a ModR/M byte.  MOD=2-bit, REG=3-bit, RM=3-bit.
+   REG and RM should already be masked to low 3 bits."
+  (logior (ash (logand mod #b11) 6)
+          (ash (logand reg #b111) 3)
+          (logand rm #b111)))
+
 (defun translate-instruction (state opcode operands mvm-next-pos)
   "Translate a single MVM instruction into x86-64 code.
    OPCODE is the numeric MVM opcode.
@@ -6264,27 +6287,6 @@
          ;; Emit a trap for unrecognised MVM instructions
          (emit-int buf #x30)
          (emit-byte buf opcode))))))
-
-;;; ============================================================
-;;; x86-64 Encoding Helpers
-;;; ============================================================
-
-(defun rex-prefix (w r x b)
-  "Build a REX prefix byte.  W=64-bit operand, R=ModRM reg ext,
-   X=SIB index ext, B=ModRM r/m or SIB base ext.
-   Each argument is a generalized boolean."
-  (logior #x40
-          (if w 8 0)
-          (if r 4 0)
-          (if x 2 0)
-          (if b 1 0)))
-
-(defun modrm (mod reg rm)
-  "Build a ModR/M byte.  MOD=2-bit, REG=3-bit, RM=3-bit.
-   REG and RM should already be masked to low 3 bits."
-  (logior (ash (logand mod #b11) 6)
-          (ash (logand reg #b111) 3)
-          (logand rm #b111)))
 
 ;;; ============================================================
 ;;; Additional x86-64 Instruction Emitters

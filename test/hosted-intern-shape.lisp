@@ -58,14 +58,14 @@
 ;;;;   that moves between two adjacent arms is that difference and nothing
 ;;;;   else.
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
 (defvar *arm*
-  (let ((s (%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "bare")))
+  (let ((s (modus-int::%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "bare")))
 (defvar *k*
-  (let ((s (%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
+  (let ((s (modus-int::%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
 
-(defvar *r0* 0) (setq *r0* (%gc-region-0))
+(defvar *r0* 0) (setq *r0* (modus-int::%gc-region-0))
 
 ;;; DISJOINT HASH RANGES, one per arm, so no arm can find another's symbols.
 (defun ish-base (arm)
@@ -81,12 +81,12 @@
 
 (defun ish-fwd (r0)
   "region 0's LIVE span -> this worker's region.  The forbidden direction."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (wsize (%gc-meta-read (+ rw #x10) k))
-         (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0alloc (%gc-meta-read (+ r0 #x30) k)))
-    (%gc-count-foreign-refs r0from r0alloc wfrom wsize)))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) k))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) k))
+         (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) k)))
+    (modus-int::%gc-count-foreign-refs r0from r0alloc wfrom wsize)))
 
 ;;; ---- THE ARMS.  One loop shape; one named difference each. -------------
 
@@ -94,7 +94,7 @@
   (let ((i 0) (last nil))
     (loop
       (when (>= i k) (return 0))
-      (setq last (%intern-symbol-pkg (+ base i) 0))
+      (setq last (modus-int::%intern-symbol-pkg (+ base i) 0))
       (setq i (+ i 1)))
     (if last k 0)))
 
@@ -123,16 +123,16 @@
   (let ((i 0) (acc nil) (last nil))
     (loop
       (when (>= i k) (return 0))
-      (setq last (%intern-symbol-pkg (+ base i) 0))
+      (setq last (modus-int::%intern-symbol-pkg (+ base i) 0))
       (setq acc (cons i acc))
       (setq i (+ i 1)))
     (if last acc nil)))
 
 (defun ish-outer-arm (base k)
   "The %TL-RUN shape: ONE region hop for the whole loop, interns at depth 2."
-  (%rt-enter)
+  (modus-int::%rt-enter)
   (let ((r (ish-bare base k)))
-    (%rt-leave)
+    (modus-int::%rt-leave)
     r))
 
 ;;; ---- THE RUN ----------------------------------------------------------

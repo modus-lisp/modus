@@ -504,7 +504,25 @@
 
 
 
+(declaim (overridable %deferred-package-hook))
+(defun %deferred-package-hook (name-str)
+  "A FIND-PACKAGE miss on NAME-STR: install whatever DEFERS that package and
+   answer T, or answer NIL.  NIL here; the CLI image overrides it (last defun
+   wins -- build-cli-common.lisp's *DEFERRED-SURFACES-SOURCE*), so every other
+   image is unchanged."
+  (declare (ignore name-str))
+  nil)
+
+(declaim (overridable %force-deferred-installs))
+(defun %force-deferred-installs ()
+  "Install everything still deferred.  NIL here; see %DEFERRED-PACKAGE-HOOK."
+  nil)
+
 (defun list-all-packages ()
+  ;; A deferred surface's packages are part of the image's package set; they
+  ;; just have not been built yet.  LIST-ALL-PACKAGES must not be the one
+  ;; observer that can tell.
+  (%force-deferred-installs)
   *all-packages*)
 
 (defun %cl-test-alias-installed-p ()
@@ -607,7 +625,11 @@
                   (%cl-test-alias-installed-p))
          (let ((clu (find-package-1 "COMMON-LISP-USER")))
            (when clu (return-from %find-package-uncached clu))))
-       (find-package-1 name-str)))))
+       (or (find-package-1 name-str)
+           ;; A package whose defining surface is installed ON DEMAND (the
+           ;; CLI's SB-*, Genera and ASDF layers): the first lookup builds it.
+           (and name-str (%deferred-package-hook name-str)
+                (find-package-1 name-str)))))))
 
 (defun %pkg-name-or-nickname-p (pkg name-str)
   "T iff NAME-STR is PKG's primary name or one of its nicknames, under
@@ -1079,6 +1101,22 @@
 
 ;;; --- find-symbol / intern ---
 
+(defun %find-symbol-baked (pkg name-str)
+  "A symbol baked into the image -- a quoted literal compiled in a build
+   package such as MODUS-INT -- lives in the global intern table under its
+   (name, package) key and is not in PKG's own symbol tables until something
+   INTERNs it.  It is PRESENT in its home package all the same, so answer it
+   :INTERNAL here.  Same key, same case-sensitive name check and same home
+   check as %CL-INTERN-IN; reads only, so no lock."
+  (let* ((g (mem-ref #x10000088 :u64))
+         (e (and g (gethash (%symbol-pkg-key (compute-name-hash name-str)
+                                             (compute-name-hash (%pkg-name pkg)))
+                            g))))
+    (if (and e (symbolp e) (string= (symbol-name e) name-str)
+             (eq (symbol-package e) pkg))
+        (values e :internal)
+        (values nil nil))))
+
 (defun find-symbol (name &rest pkg-arg)
   "Find symbol named NAME in package PKG.
    Returns (values symbol status) or (values nil nil).
@@ -1126,7 +1164,7 @@
                         (setq use (cdr use)))
                       (if found-p
                           (values found :inherited)
-                          (values nil nil))))))))))))
+                          (%find-symbol-baked pkg name-str))))))))))))
 
 (defun %cl-intern-in (pkg name-str)
   "The body of CL:INTERN, run UNDER THE RUNTIME-TABLE LOCK by the wrapper
@@ -2068,12 +2106,57 @@
 ;;; library has actually created a package.
 ;;; ------------------------------------------------------------------
 
+(defvar *kernel-global-names* nil
+  "The names the image's own source defines with DEFVAR / DEFPARAMETER /
+   DEFCONSTANT (EQUAL hash), from the build's SCAN-GLOBAL-NAMES.  A symbol of a
+   non-kernel package with one of these names -- CL-USER::*JIT-HOT-ONLY* --
+   gets its own global cell, keyed \"PKG::NAME\", so setting or binding it
+   cannot change the kernel's variable (builder packages, globals by package).")
+
+(defvar *kernel-global-shadow-p* t
+  "T (the default): such a symbol gets its own cell.  NIL: it shares the
+   kernel's again, as before globals had packages, and each reference is
+   counted in *KERNEL-GLOBAL-SHADOW-HITS* -- the census that found the
+   callers to qualify.")
+
+(defvar *kernel-global-shadow-hits* nil
+  "Census: \"PKG::NAME\" -> references that share a kernel global's cell
+   through a non-kernel symbol (EQUAL hash).")
+
+(defun %snapshot-kernel-global-names (text)
+  (let ((h (make-hash-table :test (function equal)))
+        (n (length text))
+        (i 0))
+    (loop
+      (when (>= i n) (return))
+      (let ((j (or (position #\Space text :start i) n)))
+        (when (> j i) (puthash (subseq text i j) h t))
+        (setq i (+ j 1))))
+    (setq *kernel-global-names* h)))
+
+(defun %kernel-global-shadow-p (pn nm)
+  "True when the global named NM of a symbol homed in package PN must not
+   share the kernel's cell: NM is a kernel global's name and PN is neither a
+   kernel package nor KEYWORD.  In the census stage it answers NIL and counts."
+  (and *kernel-global-names* pn nm
+       (gethash nm *kernel-global-names*)
+       (not (%kernel-home-pkg-name-p pn))
+       (not (string= pn "KEYWORD"))
+       (if *kernel-global-shadow-p*
+           t
+           (let ((k (concatenate 'string pn "::" nm)))
+             (when (null *kernel-global-shadow-hits*)
+               (setq *kernel-global-shadow-hits* (make-hash-table :test (function equal))))
+             (puthash k *kernel-global-shadow-hits*
+                      (+ 1 (or (gethash k *kernel-global-shadow-hits*) 0)))
+             nil))))
+
 (defun %sym-global-pkg-key (sym)
   "Package-qualified global-value key for SYM, or NIL meaning 'use the
    historic bare key'.  NIL — with no package deref at all — whenever the
    image has no runtime-born packages.  The runtime-side twin of
    compiler.lisp's %GLOBAL-VAR-PKG-KEY; the two must stay in lockstep."
-  (and *runtime-born-pkgs*
+  (and (or *runtime-born-pkgs* *kernel-global-names*)
        sym
        (%cl-sym-p sym)
        (let ((p (%cl-sym-package sym)))
@@ -2082,8 +2165,18 @@
               (let ((pn (%pkg-name p)))
                 (and pn
                      (stringp pn)
-                     (%runtime-born-pkg-p pn)
-                     (let ((nm (%cl-sym-name sym)))
+                     ;; a runtime-born package's own special (task #241), or a
+                     ;; non-kernel symbol named like a kernel global (globals
+                     ;; by package).  The second test reads the RAW name slot:
+                     ;; %CL-SYM-NAME's lazy fill calls BOUNDP, which is here
+                     ;; again.  A symbol the reader made has its name; one
+                     ;; without is a baked kernel literal, never shadowed.
+                     (let ((nm (if (%runtime-born-pkg-p pn)
+                                   (%cl-sym-name sym)
+                                   (let ((raw (aref sym 2)))
+                                     (and (stringp raw)
+                                          (%kernel-global-shadow-p pn raw)
+                                          raw)))))
                        (and nm (stringp nm) (> (length nm) 0)
                             (compute-name-hash
                              (%narrow-copy (concatenate 'string pn "::" nm)))))))))))

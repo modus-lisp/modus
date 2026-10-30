@@ -168,25 +168,6 @@
 ;;; TCP client helpers
 ;;; ============================================================
 
-;; Copy TCP payload from RX buffer into dest array at dest-off.
-;; Call immediately after tcp-receive returns > 0.
-;; Returns number of bytes copied.
-(defun tcp-rx-copy (dest dest-off)
-  (let ((buf (e1000-rx-buf)))
-    (let ((ip-total (buf-read-u16-mem buf 16))
-          (tcp-hdr-len (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
-      (let ((data-len (- ip-total (+ 20 tcp-hdr-len))))
-        (let ((data-base (+ (+ buf 34) tcp-hdr-len)))
-          (let ((i 0))
-            (loop
-              (when (>= i data-len) (return data-len))
-              (let ((src (+ data-base i))
-                    (dst-idx (+ dest-off i)))
-                (when (< dst-idx 4096)
-                  (aset dest dst-idx (mem-ref src :u8))))
-              (setq i (+ i 1))))
-          data-len)))))
-
 ;; Global outbound TCP connection state
 (defun tcp-state ()
   (mem-ref (+ (e1000-state-base) #x30) :u32))
@@ -214,55 +195,6 @@
                       (setq found (+ pos 4))))))))))
       (setq pos (+ pos 1)))
     found))
-
-;; Core fetch: parse URL, resolve, connect, GET, receive, return response.
-;; Returns (cons response-array response-length) or 0 on failure.
-(defun http-fetch-impl (url url-len)
-  ;; Parse URL
-  (let ((scheme-end (url-skip-http url url-len)))
-    (let ((host-end (url-host-end url scheme-end url-len)))
-      (let ((port (url-parse-port url host-end url-len))
-            (path-start (url-path-off url scheme-end url-len)))
-        ;; host-len: distance from scheme-end to first : or /
-        (let ((host-len (- host-end scheme-end))
-              (path-len (- url-len path-start)))
-          ;; Resolve hostname
-          (let ((ip (resolve-host url scheme-end host-end)))
-            (when (zerop ip)
-              ;; "DNS:0\n"
-              (%serial-byte 68) (%serial-byte 78) (%serial-byte 83)
-              (%serial-byte 58) (%serial-byte 48) (%serial-byte 10)
-              (return 0))
-            ;; Connect
-            (when (zerop (tcp-connect ip port))
-              ;; "TCP:F\n"
-              (%serial-byte 84) (%serial-byte 67) (%serial-byte 80)
-              (%serial-byte 58) (%serial-byte 70) (%serial-byte 10)
-              (return 0))
-            ;; Build and send GET request
-            (let ((req-buf (make-array 512)))
-              (let ((req-len (http-build-get url scheme-end host-len
-                                              path-start path-len req-buf)))
-                (tcp-send req-buf req-len)))
-            ;; Receive response
-            (let ((resp (make-array 4096))
-                  (resp-len 0)
-                  (done 0)
-                  (idle 0))
-              (loop
-                (when (not (zerop done)) (return 0))
-                (let ((n (tcp-receive 300)))
-                  (if (> n 0)
-                      (progn
-                        (let ((copied (tcp-rx-copy resp resp-len)))
-                          (setq resp-len (+ resp-len copied)))
-                        (setq idle 0))
-                      (setq idle (+ idle 1))))
-                (when (zerop (tcp-state)) (setq done 1))
-                (when (> idle 5) (setq done 1)))
-              ;; Close
-              (tcp-close)
-              (cons resp resp-len))))))))
 
 ;;; ============================================================
 ;;; Response printing and default http-fetch

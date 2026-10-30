@@ -27,7 +27,7 @@ def raw(t,settle):
     s.reset_input_buffer()
     for ch in t+"\r\n": s.write(ch.encode()); time.sleep(0.006)
     return rd_until(r"never",settle)
-ev("(setq *jit-hot-only* nil)"); ev("*jit-linkage-cells*"); ev("(jit-eager)",2400.0)
+ev("(setq *jit-hot-only* nil)"); ev("modus-int::*jit-linkage-cells*"); ev("(jit-eager)",2400.0)
 raw('(defun rh-yuv-plane (pic buf dx dy dw dh) (let* ((sw (reel.decode::picture-width pic)) (sh (reel.decode::picture-height pic)) (ys (reel.decode::picture-y-stride pic)) (cs (reel.decode::picture-uv-stride pic)) (ptrs (rh-copy-planes pic buf)) (ks *hvs-kernel-slot*) (ppf (lambda (s d) (logior (ash 1 30) (ash (floor (* 65536 s) d) 8)))) (words (list (logior (ash 1 30) (ash 28 24) 8) (logior #xFF000000 (ash dy 12) dx) (logior (ash dh 16) dw) (logior (ash 1 30) (ash sh 16) sw) #xC0C0C0C0 (logior #xC0000000 (first ptrs)) (logior #xC0000000 (second ptrs)) (logior #xC0000000 (third ptrs)) #xC0C0C0C0 #xC0C0C0C0 #xC0C0C0C0 ys cs cs #x00f00000 #xe73304a8 #x00066604 0 (funcall ppf (ash sw -1) dw) (funcall ppf (ash sh -1) dh) #xC0C0C0C0 (funcall ppf sw dw) (funcall ppf sh dh) #xC0C0C0C0 ks ks ks ks #x80000000)) (i 0)) (hvs-window-nc t) (hvs-upload-kernel) (dolist (w words) (hvs-slot-wr32 (+ *rh-plane* i) w) (setq i (+ i 1))) (setf (mem-ref (+ (hvs-base) #x24) :u32) *rh-plane*) (hvs-window-nc nil) (list sw sh ys cs 0)))', 4.0)
 ev("(rh-init)",120.0); ev("(rh-first-frame)",600.0)
 ev("(list *rh-plane* *hvs-kernel-slot* (hvs-displist) (hvs-active-channel))",30.0)

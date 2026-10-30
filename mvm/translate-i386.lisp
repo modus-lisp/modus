@@ -600,7 +600,19 @@
           *i386-hstack-capcount-addr* (+ base #x3F0)
           *i386-hstack-overflow-addr* (+ base #x3F8)
           *i386-hstack-depth-addr*    (+ base #x400)
-          *i386-hstack-base-addr*     (+ base #x408))))
+          ;; HOSTED: the frames get their own room (see *I386-HOSTED-HSTACK-BASE*).
+          *i386-hstack-base-addr*     (if *i386-linux-mode* *i386-hosted-hstack-base* (+ base #x408))
+          *i386-hstack-max-depth*     (if *i386-linux-mode* 127 63))))
+
+(defparameter *i386-hosted-hstack-base* #x1001E100
+  "Hosted handler frames: the free tail of the demand-zeroed BSS, past
+   *I386-GCDBG-BASE*'s 32 counter bytes, 127 frames x 24 = #x17E8 ending at
+   #x1001F8E8 < +LINUX-I386-BSS-END+.  63 frames below the global slot block at
+   #xA00 were too few: a CATCH past the cap stores no frame and the LONGJMP out
+   of an inner HANDLER-CASE skips it -- the upstream suite's
+   (compile-and-load \"roman-numerals.lsp\") lost its fasl cache's %FASL-REJECT
+   that way and every ~R test with it.  The collector's handler-stack root loop
+   reads this base and the depth, so the frames stay roots.")
 
 (defparameter *i386-jmpbuf-addr* #x10000180
   "Base of the six-word jmp_buf (ESP/EBP/IP/EBX/ESI/EDI).")
@@ -1359,6 +1371,8 @@
 ;;; deliberately: x87 computes in 80-bit extended precision and storing back
 ;;; to a double DOUBLE-ROUNDS, which can differ from x64 in the last bit.
 ;;; SSE2 is bit-exact against x64, and bit-exactness is the requirement.
+;;; (MODUS_I386_FP=x87 gets the x87 exact too -- 53-bit precision control plus
+;;; denormal scaling; see the x87 arms below.)
 
 (defconstant +i386-xmm0+ 0)
 (defconstant +i386-xmm1+ 1)
@@ -1407,6 +1421,166 @@
   (i386-check-eax-write gpr)
   (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x2C)
   (i386-emit-byte buf (i386-modrm #b11 gpr xmm)))
+
+;;; ---- x87 float arms (MODUS_I386_FP=x87: 486DX, Pentium .. Pentium III) ----
+;;;
+;;; The same chunk <-> [ESP] staging as the SSE2 arms, with the x87 stack in
+;;; place of XMM0/XMM1; every arm leaves the x87 stack EMPTY.  BIT-EXACTNESS,
+;;; which is why SSE2 was the default (see above):
+;;;  * the boot stub loads control word #x027F -- 53-bit precision, round to
+;;;    nearest even, every exception masked -- so +, -, *, /, sqrt round the
+;;;    significand once, to a double's 53 bits;
+;;;  * the x87 keeps its 15-bit EXPONENT, so a result in the double DENORMAL
+;;;    range is rounded at 53 bits and again when FSTP narrows it.  Only * and
+;;;    / can produce such a result inexactly (a denormal sum or difference of
+;;;    two doubles is exact; sqrt never lands there), and for those the
+;;;    operand is scaled by 2^-15360 first and the result by 2^+15360 after --
+;;;    the x87's own denormal threshold (2^-16382) is then exactly the
+;;;    double's (2^-1022) scaled, so the one rounding happens at the right bit
+;;;    (the JVM strictfp technique).  The rescale is exact, and FSTP of an
+;;;    already-representable value is exact (or overflows to infinity, which
+;;;    is the correct rounding).
+;;;  * float -> integer truncation swaps in a round-toward-zero control word
+;;;    around FISTP (FISTTP is SSE3).
+
+(defvar *i386-x87* nil
+  "T: float opcodes emit x87 instead of SSE2 (MODUS_I386_FP=x87).  The boot
+   stub must then load control word #x027F (boot-linux-i386.lisp).")
+
+(defvar *i386-x87-scale* t
+  "NIL drops the 2^-15360 / 2^15360 scaling around x87 * and / -- a NEGATIVE
+   CONTROL only (MODUS_I386_X87_NOSCALE=1): denormal results then round twice,
+   which the denormal battery (test/float-denormal-gen.lisp) must catch.")
+
+(defun i386-emit-x87-mem (buf opcode regfield base offset)
+  "OPCODE /REGFIELD with a [BASE+OFFSET] memory operand."
+  (i386-emit-byte buf opcode)
+  (i386-emit-modrm-mem buf regfield base offset))
+
+(defun i386-emit-x87-fld-float (buf vreg)
+  "Push the boxed float in VREG onto the x87 stack (st0).  Clobbers
+   +scratch0+/+scratch1+; ESP is back where it was."
+  (i386-load-vreg buf +scratch0+ vreg)
+  (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+  (i386-emit-x87-mem buf #xDD 0 +i386-esp+ 0)          ; fld qword [esp]
+  (i386-emit-add-reg-imm buf +i386-esp+ 8))
+
+(defun i386-emit-x87-op-float (buf regfield vreg)
+  "st0 = st0 <op> (boxed float in VREG); REGFIELD of DC /r: 0 fadd, 1 fmul,
+   4 fsub, 6 fdiv."
+  (i386-load-vreg buf +scratch0+ vreg)
+  (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+  (i386-emit-x87-mem buf #xDC regfield +i386-esp+ 0)   ; fop qword [esp]
+  (i386-emit-add-reg-imm buf +i386-esp+ 8))
+
+(defun i386-emit-x87-scale (buf k)
+  "st0 = st0 * 2^K, exactly (FSCALE by an integer loaded with FILD)."
+  (i386-emit-sub-reg-imm buf +i386-esp+ 4)
+  (i386-emit-mov-mem-imm buf +i386-esp+ 0 k)
+  (i386-emit-x87-mem buf #xDB 0 +i386-esp+ 0)          ; fild dword [esp]
+  (i386-emit-add-reg-imm buf +i386-esp+ 4)
+  (i386-emit-byte buf #xD9) (i386-emit-byte buf #xC9)  ; fxch st1
+  (i386-emit-byte buf #xD9) (i386-emit-byte buf #xFD)  ; fscale
+  (i386-emit-byte buf #xDD) (i386-emit-byte buf #xD9)) ; fstp st1
+
+(defun i386-emit-x87-box-st0 (buf vd header)
+  "Pop st0 into a fresh boxed float with HEADER (#x460 double, #x464 single)
+   and store the tagged pointer in VD."
+  (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+  (unless (= header +i386-float-header+)
+    (i386-emit-mov-mem-imm buf +scratch1+ 0 header))
+  (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+  (i386-emit-x87-mem buf #xDD 3 +i386-esp+ 0)          ; fstp qword [esp]
+  (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+  (i386-emit-add-reg-imm buf +i386-esp+ 8)
+  (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+  (i386-store-vreg buf vd +scratch1+))
+
+(defun i386-emit-x87-lane-addr (buf varr vidx)
+  "+scratch0+ = Varr + 4*idx, so the lane is at [+scratch0+ - 5]."
+  (i386-load-vreg buf +scratch0+ vidx)
+  (i386-load-vreg buf +scratch1+ varr)
+  (i386-emit-sar-reg-imm buf +scratch0+ 1)
+  (i386-emit-shl-reg-imm buf +scratch0+ 2)
+  (i386-emit-add-reg-reg buf +scratch0+ +scratch1+))
+
+(defun i386-translate-x87-float (buf opcode operands)
+  "The x87 arm of every float opcode; NIL if OPCODE is not one."
+  (macrolet ((op= (sym) `(= opcode ,sym)))
+    (cond
+      ((or (op= +op-fadd+) (op= +op-fsub+) (op= +op-fmul+) (op= +op-fdiv+))
+       (let ((scale (and *i386-x87-scale* (or (op= +op-fmul+) (op= +op-fdiv+)))))
+         (i386-emit-x87-fld-float buf (second operands))
+         (when scale (i386-emit-x87-scale buf -15360))
+         (i386-emit-x87-op-float buf (cond ((op= +op-fadd+) 0) ((op= +op-fmul+) 1)
+                                           ((op= +op-fsub+) 4) (t 6))
+                                 (third operands))
+         (when scale (i386-emit-x87-scale buf 15360))
+         (i386-emit-x87-box-st0 buf (first operands) +i386-float-header+))
+       t)
+      ((op= +op-fsqrt+)
+       (i386-emit-x87-fld-float buf (second operands))
+       (i386-emit-byte buf #xD9) (i386-emit-byte buf #xFA)        ; fsqrt
+       (i386-emit-x87-box-st0 buf (first operands) #x460)
+       t)
+      ((op= +op-fround32+)
+       ;; double -> single: one rounding (the register holds the double
+       ;; exactly), via a 4-byte store and reload
+       (i386-emit-x87-fld-float buf (second operands))
+       (i386-emit-sub-reg-imm buf +i386-esp+ 4)
+       (i386-emit-x87-mem buf #xD9 3 +i386-esp+ 0)               ; fstp dword [esp]
+       (i386-emit-x87-mem buf #xD9 0 +i386-esp+ 0)               ; fld dword [esp]
+       (i386-emit-add-reg-imm buf +i386-esp+ 4)
+       (i386-emit-x87-box-st0 buf (first operands) #x464)
+       t)
+      ((op= +op-itof+)
+       (i386-load-vreg buf +scratch0+ (second operands))
+       (i386-emit-sar-reg-imm buf +scratch0+ 1)                  ; untag (signed)
+       (i386-emit-push-reg buf +scratch0+)
+       (i386-emit-x87-mem buf #xDB 0 +i386-esp+ 0)               ; fild dword [esp]
+       (i386-emit-add-reg-imm buf +i386-esp+ 4)
+       (i386-emit-x87-box-st0 buf (first operands) +i386-float-header+)
+       t)
+      ((op= +op-ftoi+)
+       ;; [esp+0] result, [esp+4] saved control word, [esp+6] chop word.  Out
+       ;; of range gives the integer-indefinite value, the SSE2 arm's gap.
+       (i386-emit-x87-fld-float buf (second operands))
+       (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+       (i386-emit-x87-mem buf #xD9 7 +i386-esp+ 4)               ; fnstcw [esp+4]
+       (i386-emit-movzx-word buf +scratch0+ +i386-esp+ 4)
+       (i386-emit-or-reg-imm buf +scratch0+ #x0C00)              ; RC = toward zero
+       (i386-emit-mov-mem16-reg buf +i386-esp+ 6 +scratch0+)
+       (i386-emit-x87-mem buf #xD9 5 +i386-esp+ 6)               ; fldcw [esp+6]
+       (i386-emit-x87-mem buf #xDB 3 +i386-esp+ 0)               ; fistp dword [esp]
+       (i386-emit-x87-mem buf #xD9 5 +i386-esp+ 4)               ; fldcw [esp+4]
+       (i386-emit-mov-reg-mem buf +scratch0+ +i386-esp+ 0)
+       (i386-emit-add-reg-imm buf +i386-esp+ 8)
+       (i386-emit-shl-reg-imm buf +scratch0+ 1)                  ; tag as fixnum
+       (i386-store-vreg buf (first operands) +scratch0+)
+       t)
+      ((op= +op-fcmp+)
+       ;; st0 = Va, st1 = Vb; FUCOMPP + FNSTSW AX + SAHF leaves C0/C2/C3 in
+       ;; CF/PF/ZF -- UCOMISD's flags, unordered included.  EAX (VR) is saved
+       ;; around FNSTSW with raw PUSH/POP, which leave the flags alone.
+       (i386-emit-x87-fld-float buf (second operands))
+       (i386-emit-x87-fld-float buf (first operands))
+       (i386-emit-byte buf #xDA) (i386-emit-byte buf #xE9)        ; fucompp
+       (i386-emit-byte buf #x50)                                  ; push eax
+       (i386-emit-byte buf #xDF) (i386-emit-byte buf #xE0)        ; fnstsw ax
+       (i386-emit-byte buf #x9E)                                  ; sahf
+       (i386-emit-byte buf #x58)                                  ; pop eax
+       t)
+      ((op= +op-f32-load+)
+       (i386-emit-x87-lane-addr buf (second operands) (third operands))
+       (i386-emit-x87-mem buf #xD9 0 +scratch0+ -5)              ; fld dword [ecx-5]
+       (i386-emit-x87-box-st0 buf (first operands) #x464)
+       t)
+      ((op= +op-f32-store+)
+       (i386-emit-x87-fld-float buf (third operands))
+       (i386-emit-x87-lane-addr buf (first operands) (second operands))
+       (i386-emit-x87-mem buf #xD9 3 +scratch0+ -5)              ; fstp dword [ecx-5]
+       t)
+      (t nil))))
 
 (defun i386-emit-float-bits-to-stack (buf ptr-reg tmp-reg)
   "PTR-REG holds the TAGGED pointer to a float object.  Push 8 bytes and fill
@@ -2395,6 +2569,18 @@
                 (eql (first operands) +vreg-vr+))))
     (macrolet ((op= (sym) `(= opcode ,sym)))
       (cond
+        ((and *i386-x87* (i386-translate-x87-float buf opcode operands)) nil)
+        ;; NO SSE2: the compiler lowers every float op to mvm/softfloat.lisp, so
+        ;; one reaching here is a gap -- recorded and INT3, never an SSE2
+        ;; instruction a pre-Pentium-4 CPU would fault on.
+        ((and (eql modus.mvm::+target-soft-float+ 1)
+              (member opcode (list +op-fadd+ +op-fsub+ +op-fmul+ +op-fdiv+ +op-fsqrt+
+                                   +op-fround32+ +op-itof+ +op-ftoi+ +op-fcmp+
+                                   +op-f32-load+ +op-f32-store+)))
+         (let ((tbl (or *i386-unimpl-ops*
+                        (setf *i386-unimpl-ops* (make-hash-table :test 'eql)))))
+           (incf (gethash opcode tbl 0)))
+         (i386-emit-int3 buf))
         ;; ============================================
         ;; NOP / BREAK / TRAP
         ;; ============================================

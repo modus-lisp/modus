@@ -34,26 +34,26 @@
 (format t "  (A crash here is a PASS for this script's purpose — it is~%")
 (format t "   evidence the shared window is what the real test's fix fixes.)~%")
 
-(let ((ctl (%mvhc-selftest 1 *n* *gcevery*)))
+(let ((ctl (modus-int::%mvhc-selftest 1 *n* *gcevery*)))
   (if (zerop ctl)
       (format t "  the selftest could not start (carve/mmap) — inconclusive~%")
       (let* ((s0 (+ ctl #x100))
              (s1 (+ ctl #x140))
-             (bad (+ (+ (%gc-read64 (+ s0 #x08)) (%gc-read64 (+ s1 #x08)))
-                     (+ (+ (%gc-read64 (+ s0 #x10)) (%gc-read64 (+ s1 #x10)))
-                        (+ (%gc-read64 (+ s0 #x18)) (%gc-read64 (+ s1 #x18))))))
-             (depth (+ (%gc-read64 (+ s0 #x30)) (%gc-read64 (+ s1 #x30))))
-             (iters (+ (%gc-read64 s0) (%gc-read64 s1))))
+             (bad (+ (+ (modus-int::%gc-read64 (+ s0 #x08)) (modus-int::%gc-read64 (+ s1 #x08)))
+                     (+ (+ (modus-int::%gc-read64 (+ s0 #x10)) (modus-int::%gc-read64 (+ s1 #x10)))
+                        (+ (modus-int::%gc-read64 (+ s0 #x18)) (modus-int::%gc-read64 (+ s1 #x18))))))
+             (depth (+ (modus-int::%gc-read64 (+ s0 #x30)) (modus-int::%gc-read64 (+ s1 #x30))))
+             (iters (+ (modus-int::%gc-read64 s0) (modus-int::%gc-read64 s1))))
         (format t "~%  thread 1 iterations ~D, thread 2 iterations ~D (of ~D each)~%"
-                (%gc-read64 s0) (%gc-read64 s1) *n*)
+                (modus-int::%gc-read64 s0) (modus-int::%gc-read64 s1) *n*)
         (format t "  multiple-value failures  t1 ~D  t2 ~D~%"
-                (%gc-read64 (+ s0 #x08)) (%gc-read64 (+ s1 #x08)))
+                (modus-int::%gc-read64 (+ s0 #x08)) (modus-int::%gc-read64 (+ s1 #x08)))
         (format t "  handler-case failures    t1 ~D  t2 ~D~%"
-                (%gc-read64 (+ s0 #x10)) (%gc-read64 (+ s1 #x10)))
+                (modus-int::%gc-read64 (+ s0 #x10)) (modus-int::%gc-read64 (+ s1 #x10)))
         (format t "  nested-handler failures  t1 ~D  t2 ~D~%"
-                (%gc-read64 (+ s0 #x18)) (%gc-read64 (+ s1 #x18)))
+                (modus-int::%gc-read64 (+ s0 #x18)) (modus-int::%gc-read64 (+ s1 #x18)))
         (format t "  net handler-stack depth change    t1 ~D  t2 ~D~%"
-                (%gc-read64 (+ s0 #x30)) (%gc-read64 (+ s1 #x30)))
+                (modus-int::%gc-read64 (+ s0 #x30)) (modus-int::%gc-read64 (+ s1 #x30)))
         (format t "~%=== VERDICT ==============================================~%")
         (if (or (> bad 0) (> depth 0) (< iters (* 2 *n*)))
             (format t "THE CONTROL FAILED, AS IT MUST: PASS~%")

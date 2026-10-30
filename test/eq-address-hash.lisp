@@ -14,7 +14,7 @@
 (defun chk (name ok)
   (format t "~&  ~a ~a~%" (if ok "ok  " "FAIL") name)
   (unless ok (setq *fails* (+ *fails* 1))))
-(defun epoch () (%gc-epoch))
+(defun epoch () (modus-int::%gc-epoch))
 (defun collect () (let ((e (epoch))) (sb-ext:gc :full t) (/= e (epoch))))
 (defstruct pt x y)
 

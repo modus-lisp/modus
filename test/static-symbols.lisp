@@ -69,13 +69,13 @@
 ;; allocation fast paths it allocated too little to, and every check passed
 ;; vacuously).  At least three rounds, each ending past a collection.
 (ss-check 0)
-(let ((e0 (%gc-epoch)))
+(let ((e0 (modus-int::%gc-epoch)))
   (dotimes (r 3)
-    (let ((e (%gc-epoch)) (n 0))
+    (let ((e (modus-int::%gc-epoch)) (n 0))
       (loop (ss-churn) (setq n (+ n 1))
-            (when (or (/= (%gc-epoch) e) (> n 200)) (return))))
+            (when (or (/= (modus-int::%gc-epoch) e) (> n 200)) (return))))
     (ss-check (+ r 1)))
-  (format t "~&static-symbols: collections ~D~%" (- (%gc-epoch) e0))
-  (ss 'collected (> (%gc-epoch) e0) t))
+  (format t "~&static-symbols: collections ~D~%" (- (modus-int::%gc-epoch) e0))
+  (ss 'collected (> (modus-int::%gc-epoch) e0) t))
 (format t "~&static-symbols: ~D failure(s)~%" *ss-fail*)
 (when (> *ss-fail* 0) (error "static-symbols: ~D failure(s)" *ss-fail*))

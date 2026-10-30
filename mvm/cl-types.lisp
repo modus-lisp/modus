@@ -1913,6 +1913,7 @@
 ;; equal IS wrappped via compile-li-func to %EQUAL-FN already; no defun
 ;; needed (and recursive (defun equal (a b) (equal a b)) infinite-loops).
 (defun eq (a b) (eq a b))
+(declaim (overridable eql))
 (defun eql (a b)
   "EQL — same as EQ for non-numbers/non-chars; for numbers, equal in
    type AND value.  Boxed numerics (IEEE floats subtag #x60, ratios
@@ -4228,7 +4229,11 @@
            (logand (logxor (+ (* h1 31) h2) 12345) most-positive-fixnum))))
     (t 42)))
 
-(defun sxhash (object) (%sxhash-1 object 0))
+;; CLHS: a non-negative FIXNUM.  The hash is computed in 32 unsigned bits, which
+;; on a 32-bit port (fixnums are 30 bits) is a bignum about three times in four
+;; -- upstream SXHASH.1/.13/.15 on i386, arm32 and riscv32.  On the 64-bit ports
+;; every value already fits and the mask changes nothing.
+(defun sxhash (object) (logand (%sxhash-1 object 0) most-positive-fixnum))
 
 ;;; ============================================================
 ;;; float-radix — IEEE floats always use base 2
@@ -4257,9 +4262,13 @@
   (if (%single-typed-p float) 24 53))
 
 (defun float-precision (float)
-  "Precision (significant bits) of FLOAT: 0 for a zero, else 24/53 by type."
-  (if (= float 0.0d0) 0
-      (if (%single-typed-p float) 24 53)))
+  "Significant bits of FLOAT: 0 for a zero, the mantissa's length for a
+   subnormal, else 24/53 by type."
+  (multiple-value-bind (m e) (integer-decode-float float)
+    (declare (ignore e))
+    (cond ((= m 0) 0)
+          ((%single-typed-p float) (min 24 (integer-length m)))
+          (t (min 53 (integer-length m))))))
 
 (defun float-sign (float &rest float2-arg)
   "Return a float with the magnitude of FLOAT2 (default (FLOAT 1 FLOAT)) and the
@@ -4292,35 +4301,38 @@
         (/ r (float (expt 2 (- k)) one)))))
 
 (defun decode-float (float)
-  "Decode float into (significand exponent sign).
-   Bails on non-floats (e.g. NIL from an uninitialized
-   *-float-epsilon defvar) so the caller sees a TYPE-ERROR
-   instead of looping forever in the normalize loop below."
+  "Decode FLOAT into (significand exponent sign), significand in [0.5, 1)
+   and sign +-1, both in FLOAT's own format.  Exact: the integer significand
+   is shifted up to full precision, then divided by 2^precision."
   (unless (floatp float)
     (error "decode-float: not a float ~S" float))
-  ;; Stub: return approximate values
-  (if (= float 0.0d0)
-      (values 0.0d0 0 1.0d0)
-      (let ((sign (if (< float 0.0d0) -1.0d0 1.0d0))
-            (abs-f (if (< float 0.0d0) (- 0.0d0 float) float)))
-        ;; Find exponent such that 0.5 <= sig < 1.0. Safety cap so a
-        ;; pathological input (denormal, ±inf, or a value the comparisons
-        ;; never converge on) can't loop indefinitely.
-        (let ((exp 0) (sig abs-f) (iter 0))
-          (loop
-            (when (and (>= sig 0.5d0) (< sig 1.0d0)) (return))
-            (when (> iter 4096) (return))
-            (setq iter (+ iter 1))
-            (if (>= sig 1.0d0)
-                (progn (setq sig (/ sig 2.0d0)) (setq exp (+ exp 1)))
-                (progn (setq sig (* sig 2.0d0)) (setq exp (- exp 1)))))
-          (values sig exp sign)))))
+  (multiple-value-bind (m e s) (integer-decode-float float)
+    (let ((one (float 1 float)))
+      (if (= m 0)
+          (values (float 0 float) 0 (if (< s 0) (- one) one))
+          (let* ((p (float-digits float))
+                 (shift (- p (integer-length m))))
+            (values (float (/ (ash m shift) (ash 1 p)) float)
+                    (+ e p (- shift))
+                    (if (< s 0) (- one) one)))))))
 
 (defun integer-decode-float (float)
   "Decode IEEE 64-bit float to (significand exponent sign) — three integers.
    Returns 0, 0, 1 for ±0.  For non-IEEE (modus rational-form floats or
    non-floats) falls back to a coarse mantissa*2^exp split."
   (cond
+    ((and (%ieee-float-p float) (%single-typed-p float))
+     ;; A single's significand is 24 bits: decode its IEEE32 pattern, not the
+     ;; double payload it is boxed with.
+     (let* ((bits (%single->bits float))
+            (sign (if (= (logand (ash bits -31) 1) 1) -1 1))
+            (e8 (logand (ash bits -23) 255))
+            (m23 (logand bits 8388607)))
+       (cond
+         ((and (= e8 0) (= m23 0)) (values 0 0 sign))
+         ((= e8 255) (values m23 0 sign))               ; inf/nan
+         ((= e8 0) (values m23 -149 sign))              ; subnormal
+         (t (values (logior 8388608 m23) (- e8 150) sign)))))
     ((%ieee-float-p float)
      (let* ((hi-u32 (%float-hi32 float))
             (lo (%float-lo32 float))

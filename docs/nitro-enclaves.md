@@ -155,7 +155,7 @@ turns TCP 127.0.0.1:2222 into vsock 16:22, so a plain `ssh -p 2222 test@127.0.0.
 **The binding.**  The host key is 32 bytes of getrandom(2) per process (the
 bare images use an all-zero default key and a 32-bit PRNG — fine for a demo,
 unacceptable for anything attested: a known private key is a man in the middle
-for free), and `(nitro-attest-ssh "NONCE-HEX")` prints `NITRO-HOSTKEY`,
+for free), and `(modus-int::nitro-attest-ssh "NONCE-HEX")` prints `NITRO-HOSTKEY`,
 `NITRO-USER-DATA` (= SHA-512 of the key) and `NITRO-DOC` (the attestation
 document with that user_data and the caller's nonce).
 `test/nitro/attested-ssh-client.sh HOST PORT --pcr0 … --pcr1 … --pcr2 …` is the

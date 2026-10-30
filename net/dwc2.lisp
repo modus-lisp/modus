@@ -229,13 +229,6 @@
 ;; on QEMU. For real hardware, calibrate against system timer.
 ;; ============================================================
 
-(defun dwc2-delay-ms (ms)
-  (let ((i 0))
-    (loop
-      (when (>= i ms) (return nil))
-      (io-delay)
-      (setq i (+ i 1)))))
-
 ;; ============================================================
 ;; Core initialization
 ;; ============================================================

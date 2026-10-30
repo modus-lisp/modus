@@ -433,15 +433,6 @@
   (setf (mem-ref #x10000FF8 :u32) v)
   v)
 
-(defun %ha-percpu-init-cpu (base cpu)
-  "Point THIS THREAD's GS base at BASE (arch_prctl ARCH_SET_GS, syscall 158)
-   and stamp CPU into the :CPU-ID slot at +GC-PERCPU-CPU-ID-OFF+ = 16.  The
-   order matters: PERCPU-SET is a GS-relative store, so it can only be issued
-   after the base is set.  Returns the kernel's return value (0 = success)."
-  (let ((r (%arch-set-percpu-base base)))
-    (if (zerop r) (percpu-set 16 cpu) 0)
-    r))
-
 (defun %ha-thread-park-region (rcb k)
   "Record THIS thread's allocation pointer and limit in RCB — the PARK half of
    %GC-REGION-ENTER without the load half, for a thread that is about to exit or

@@ -2939,6 +2939,51 @@
   (export (intern "JIT-SOURCE" (find-package "MODUS")) (find-package "MODUS"))
   (export (intern "MAKE-STATIC-VECTOR" (find-package "MODUS")) (find-package "MODUS"))
   (export (intern "FREE-STATIC-VECTOR" (find-package "MODUS")) (find-package "MODUS"))
+  ;; The BUILD packages, so a baked symbol has a real home (builder packages
+  ;; step 4): compile-quote records each symbol's host home package by name
+  ;; hash, and %INTERN-SYMBOL-PKG used to find no such package here and file
+  ;; it as CL-USER's.  MODUS-INT is the internal package (SB-INT's role; its
+  ;; build-time nickname MODUS.MVM is the name image source still writes).
+  ;; Created at boot, before any eval, so none is runtime-born: function and
+  ;; variable keys of their symbols stay BARE, as the boot tables are.
+  ;; Registered by hash AT ONCE, like the packages above: a quoted symbol
+  ;; filled between here and the loop at the end of this function (the
+  ;; DEFPACKAGE macro's '%DEFPACKAGE-IMPL, below) would otherwise find no
+  ;; package for its hash, fall back to CL-USER, and stay cached that way.
+  (%register-pkg-by-hash
+   (make-package "MODUS-INT" :nicknames (list "MODUS.MVM") :use (list "CL")))
+  (%register-pkg-by-hash (make-package "MODUS.ASM" :use (list "CL")))
+  (%register-pkg-by-hash (make-package "MODUS.RUNTIME" :use (list "CL")))
+  (%register-pkg-by-hash
+   (make-package "MODUS.MVM.X64" :use (list "CL" "MODUS-INT" "MODUS.ASM")))
+  (%register-pkg-by-hash (make-package "MODUS.MVM.I386" :use (list "CL" "MODUS-INT")))
+  ;; and the step-3 packages (net/crypto/ssh/boards), from the one list the
+  ;; build host also reads (mvm/kernel-packages.lisp)
+  (dolist (p (%ensure-kernel-packages)) (%register-pkg-by-hash p))
+  ;; MODUS's public API (SB-EXT's role): image functions a program is meant to
+  ;; call, re-exported from MODUS-INT where they are defined, so MODUS:SYS-EXIT
+  ;; IS the kernel's symbol.  CL-USER uses MODUS, as SBCL's CL-USER uses SB-EXT.
+  ;; Names an image does not define are exported anyway (an undefined function
+  ;; if called), so the list is the same in every image.
+  (let ((modus (find-package "MODUS")) (int (find-package "MODUS-INT")))
+    (dolist (n (quote ("SYS-EXIT" "SAVE-AND-DIE" "INSTALL-TARBALL"
+                       "ACTORS-SPAWN" "ACTORS-SEND" "ACTORS-RECEIVE" "ACTORS-RECEIVE-IF"
+                       "ACTORS-SELF" "ACTORS-YIELD" "ACTORS-START" "ACTORS-STOP"
+                       "SPAWN-LINK" "LINK"
+                       "SOCKET-CONNECT" "SOCKET-LISTEN" "SOCKET-LISTEN-ON"
+                       "SOCKET-LISTEN-PORT" "SOCKET-ACCEPT" "SOCKET-SEND"
+                       "SOCKET-SEND-FROM" "SOCKET-RECV" "SOCKET-RECV-FULLY"
+                       "SOCKET-CLOSE" "SOCKET-LOCAL-PORT"
+                       "SSH-SERVE-TCP" "SSH-SERVE-TCP-ON" "SSH-SERVE-VSOCK" "SSH-BOOT"
+                       "RUN-NET-PIPELINE" "HTTP-FETCH"
+                       "PMU-START" "PMU-STOP" "PMU-READ" "PMU-MEASURE" "PMU-PROFILE"
+                       "PMU-ANNOTATE"
+                       ;; the JIT's documented settings (as SB-EXT:*EVALUATOR-MODE*)
+                       "*JIT-ON*" "*JIT-HOT-ONLY*" "*JIT-HOT-CALLS*")))
+      (let ((sym (intern n int)))
+        (import sym modus)
+        (export sym modus)))
+    (use-package modus (find-package "COMMON-LISP-USER")))
   (setq *package* (find-package "CL-USER"))
   ;; The runtime DEFPACKAGE macro.  It used to be installed only as a side
   ;; effect of SET-UP-PACKAGES (which also makes test packages A/B/Q), and

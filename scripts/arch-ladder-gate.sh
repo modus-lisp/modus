@@ -43,11 +43,12 @@ OUT=$(mktemp -d)/results
 : > "$OUT"
 
 # rung -> expected value.  Everything answers 42 except the factorial.
+# Each rung's header names its answer (`-- expect 5050'), exactly as
+# scripts/hosted-ladder.py reads it.  This used to be a case statement that knew
+# only r07, so r35-rest-hundred -- whose answer is 5050 -- was graded against 42
+# and reported WRONG on every architecture that got it RIGHT.
 expected_for() {
-  case "$(basename "$1")" in
-    r07-factorial.lisp) echo 3628800 ;;
-    *)                  echo 42 ;;
-  esac
+  sed -n 's/.*expect[[:space:]]\{1,\}\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' "$1" | head -1
 }
 
 # ---- positive control: the gate must be able to fail -----------------------

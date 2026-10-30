@@ -73,15 +73,15 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "FAIL ~a: got ~s want ~s~%" name got want))))
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
 ;;; --- the three things a worker does, kept as separate small functions -------
 ;;; Everything is passed in: reading a global on the worker would take the
 ;;; runtime lock and hop the active region, which is a mechanism under test.
 
 (defun xr-decode (buf)
-  (setf (mem-ref (decode-ptr-addr) :u64) buf)
-  (term-decode-step))
+  (setf (mem-ref (modus-int::decode-ptr-addr) :u64) buf)
+  (modus-int::term-decode-step))
 
 (defun xr-fwd (r0)
   "region 0's live span AND the lock arena -> this worker's region.  MUST be
@@ -91,28 +91,28 @@
    moved into a span it never looked at, which is exactly the wrong reason to
    go green.  %RT-ARENA-* answer 0 on a pre-arena binary, so there this sweep
    is byte-for-byte the old one."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (wsize (%gc-meta-read (+ rw #x10) k))
-         (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0alloc (%gc-meta-read (+ r0 #x30) k))
-         (ab (%rt-arena-base))
-         (aa (%rt-arena-alloc)))
-    (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
-       (if (> aa ab) (%gc-count-foreign-refs ab aa wfrom wsize) 0))))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) k))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) k))
+         (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) k))
+         (ab (modus-int::%rt-arena-base))
+         (aa (modus-int::%rt-arena-alloc)))
+    (+ (modus-int::%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+       (if (> aa ab) (modus-int::%gc-count-foreign-refs ab aa wfrom wsize) 0))))
 
 (defun xr-bwd (r0)
   "This worker's live span -> region 0.  Expected non-zero; reported, not asserted."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (walloc (%gc-meta-read (+ rw #x30) k))
-         (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0size (%gc-meta-read (+ r0 #x10) k)))
-    (%gc-count-foreign-refs wfrom walloc r0from r0size)))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (walloc (modus-int::%gc-meta-read (+ rw #x30) k))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) k))
+         (r0size (modus-int::%gc-meta-read (+ r0 #x10) k)))
+    (modus-int::%gc-count-foreign-refs wfrom walloc r0from r0size)))
 
 (defun xr-worker (buf r0)
   (let ((got (xr-decode buf)))
-    (list got (xr-fwd r0) (xr-bwd r0) (%gc-region))))
+    (list got (xr-fwd r0) (xr-bwd r0) (modus-int::%gc-region))))
 
 (defun xr-planted-control (r0 scr)
   "THE INSTRUMENT'S POSITIVE CONTROL, run ON THE WORKER: plant exactly one
@@ -123,18 +123,18 @@
    string and the symbol case to 0, which retires the old two-case
    non-blindness argument this file used to make."
   r0
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (wsize (%gc-meta-read (+ rw #x10) k))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) k))
          (c (cons 11 22))
-         (w (%gc-word-of c (+ scr 512))))
-    (%gc-write64 (+ scr 520) w)
-    (let ((hit (%gc-count-foreign-refs (+ scr 520) (+ scr 528) wfrom wsize)))
-      (%gc-write64 (+ scr 520) 0)
-      (list hit (%gc-count-foreign-refs (+ scr 520) (+ scr 528) wfrom wsize)))))
+         (w (modus-int::%gc-word-of c (+ scr 512))))
+    (modus-int::%gc-write64 (+ scr 520) w)
+    (let ((hit (modus-int::%gc-count-foreign-refs (+ scr 520) (+ scr 528) wfrom wsize)))
+      (modus-int::%gc-write64 (+ scr 520) 0)
+      (list hit (modus-int::%gc-count-foreign-refs (+ scr 520) (+ scr 528) wfrom wsize)))))
 
 (defvar *r0* 0)
-(setq *r0* (%gc-region-0))
+(setq *r0* (modus-int::%gc-region-0))
 
 ;;; ============================================================
 ;;; ONE CASE PER PROCESS — because the AUDIT SWEEPS GARBAGE TOO
@@ -164,19 +164,19 @@
 ;;;     in-vivo control that the audit can answer non-zero.
 
 (defvar *case*
-  (let ((s (%cli-getenv "XREGION_CASE")))
+  (let ((s (modus-int::%cli-getenv "XREGION_CASE")))
     (if (and s (> (length s) 0)) s "symbol")))
 
 (defun xr-audit-only (r0)
   "A worker that decodes NOTHING: whatever it counts was already dangling
    over its span when it was born."
-  (list nil (xr-fwd r0) (xr-bwd r0) (%gc-region)))
+  (list nil (xr-fwd r0) (xr-bwd r0) (modus-int::%gc-region)))
 
 (when (or (string= *case* "string") (string= *case* "joinshare"))
   (format t "~&=== A STRING: encoded in region 0, decoded in a worker's region ===~%")
-  (let* ((buf (staging-base-addr))
+  (let* ((buf (modus-int::staging-base-addr))
          (r0 *r0*))
-    (term-encode "hello cross region" buf)
+    (modus-int::term-encode "hello cross region" buf)
     (let* ((res (sb-thread:join-thread
                  (sb-thread:make-thread (lambda () (xr-worker buf r0)) :name "xr-str")))
            (got (nth 0 res)) (fwd (nth 1 res)) (bwd (nth 2 res)) (rw (nth 3 res)))
@@ -189,9 +189,9 @@
 
 (when (string= *case* "symbol")
   (format t "~&=== A SYMBOL: encoded in region 0, decoded in a worker's region ===~%")
-  (let* ((buf (staging-base-addr))
+  (let* ((buf (modus-int::staging-base-addr))
          (r0 *r0*))
-    (term-encode (intern "XRT-DEMO-SYMBOL" "COMMON-LISP-USER") buf)
+    (modus-int::term-encode (intern "XRT-DEMO-SYMBOL" "COMMON-LISP-USER") buf)
     (let* ((res (sb-thread:join-thread
                  (sb-thread:make-thread (lambda () (xr-worker buf r0)) :name "xr-sym")))
            (got (nth 0 res)) (fwd (nth 1 res)) (bwd (nth 2 res)))
@@ -228,7 +228,7 @@
 (format t "~&same target span as the assertions — then clear it and count again.~%")
 (let ((ctl (sb-thread:join-thread
             (sb-thread:make-thread
-             (let ((r0 *r0*) (scr (%thr-scratch)))
+             (let ((r0 *r0*) (scr (modus-int::%thr-scratch)))
                (lambda () (xr-planted-control r0 scr)))
              :name "xr-ctl"))))
   (chk "the planted forbidden pointer is COUNTED" (nth 0 ctl) 1)

@@ -38,7 +38,7 @@
 ;;;; the main thread) 10 of 10, `bare' (a worker interning, i.e. allocating in
 ;;;; region 0 under the lock) 3 of 10 — and it is what separates the GREEN test
 ;;;; from the red ones: `%TL-SELFTEST' puts the MAIN thread in a carved region
-;;;; of its own (`(%gc-region-enter rcb2)' before it spawns), so region 0 there
+;;;; of its own (`(modus-int::%gc-region-enter rcb2)' before it spawns), so region 0 there
 ;;;; is nobody's mutator heap and its parked frontier is only ever moved by
 ;;;; lock holders.
 ;;;;
@@ -75,11 +75,11 @@
 ;;;;   has allocated since its last hop, so it MOVES between runs.  What must
 ;;;;   not move is its sign.
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
-(defvar *r0* 0)  (setq *r0* (%gc-region-0))
-(defvar *scr* 0) (setq *scr* (%thr-scratch))
-(defvar *ms* 0)  (setq *ms* (%gc-meta-scale))
+(defvar *r0* 0)  (setq *r0* (modus-int::%gc-region-0))
+(defvar *scr* 0) (setq *scr* (modus-int::%thr-scratch))
+(defvar *ms* 0)  (setq *ms* (modus-int::%gc-meta-scale))
 
 ;;; ---- THE PROBES.  Everything is an ARGUMENT: an implicit global here would
 ;;; ---- be a SYMBOL-VALUE, which takes the lock, which republishes the field.
@@ -87,14 +87,14 @@
 (defun gap-probe (r0 ms scr)
   "(live-frontier-proxy parked-frontier), read with nothing in between."
   (let* ((c (cons 7 8))
-         (a (%gc-word-of c (+ scr 512)))
-         (p (%gc-meta-read (+ r0 #x30) ms)))
+         (a (modus-int::%gc-word-of c (+ scr 512)))
+         (p (modus-int::%gc-meta-read (+ r0 #x30) ms)))
     (list a p)))
 
 (defun live-probe (scr)
   "Main's live frontier, as the address of a cons allocated on the spot."
   (let ((c (cons 1 2)))
-    (%gc-word-of c (+ scr 512))))
+    (modus-int::%gc-word-of c (+ scr 512))))
 
 (defun w-probe (r0 ms scr)
   "ON THE WORKER.  Region 0's parked frontier as the worker sees it on the way
@@ -111,16 +111,16 @@
    reads both back AFTER the join.  If `hot' comes back changed and `own' does
    not, the difference is the region and not the worker, not the thread and not
    the timing."
-  (let ((p (%gc-meta-read (+ r0 #x30) ms)))
+  (let ((p (modus-int::%gc-meta-read (+ r0 #x30) ms)))
     (let ((s nil) (hot nil) (own nil))
-      (%rt-enter)
-      (setq s (%intern-symbol-pkg 1700000001 0))
+      (modus-int::%rt-enter)
+      (setq s (modus-int::%intern-symbol-pkg 1700000001 0))
       (setq hot (cons 123456789 987654321))
-      (%rt-leave)
+      (modus-int::%rt-leave)
       (setq own (cons 123456789 987654321))
-      (list p (%gc-word-of s (+ scr 512)) hot own
-            (%gc-word-of hot (+ scr 512))
-            (%gc-word-of own (+ scr 512))))))
+      (list p (modus-int::%gc-word-of s (+ scr 512)) hot own
+            (modus-int::%gc-word-of hot (+ scr 512))
+            (modus-int::%gc-word-of own (+ scr 512))))))
 
 ;;; ---- 0. SWITCH THE PROCESS TO THE MULTITHREADED CONFIGURATION ----------
 
@@ -128,7 +128,7 @@
 (setq *warm* (sb-thread:join-thread
               (sb-thread:make-thread (lambda () 1) :name "warm")))
 
-(defvar *acq0* 0) (setq *acq0* (%rt-acquisitions))
+(defvar *acq0* 0) (setq *acq0* (modus-int::%rt-acquisitions))
 
 ;;; ---- 1. MAIN'S LIVE FRONTIER versus REGION 0'S PARKED ONE --------------
 
@@ -139,9 +139,9 @@
 ;;; this reading must come back in step.
 
 (defvar *g2* nil)
-(setq *g2* (progn (%rt-enter) (%rt-leave) (gap-probe *r0* *ms* *scr*)))
+(setq *g2* (progn (modus-int::%rt-enter) (modus-int::%rt-leave) (gap-probe *r0* *ms* *scr*)))
 
-(defvar *acq1* 0) (setq *acq1* (%rt-acquisitions))
+(defvar *acq1* 0) (setq *acq1* (modus-int::%rt-acquisitions))
 
 ;;; ---- 3. WHERE A WORKER'S FRESH SYMBOL LANDS ---------------------------
 

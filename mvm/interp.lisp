@@ -227,7 +227,12 @@
                  (setq cut (+ i 2)) (return))
                (setq i (+ i 1)))
              (and cut (< cut n)
-                  (gethash (subseq name cut) *symbol-function-table*))))))
+                  (let ((nm (subseq name cut)))
+                    ;; a non-kernel symbol named like a kernel function is
+                    ;; its own symbol: never the kernel's (cl-eval.lisp)
+                    (unless (and (not (%kernel-home-pkg-name-p (subseq name 0 (- cut 2))))
+                                 *kernel-fn-names* (gethash nm *kernel-fn-names*))
+                      (gethash nm *symbol-function-table*))))))))
 
 (defun %rt-stub-count (runtime-table)
   "Number of runtime stubs in RUNTIME-TABLE: keys #x40000000, +1, ... are
@@ -407,8 +412,11 @@
 ;; traces them, and they are intercepted before any of this runs.
 ;;
 ;; Byte order follows the machine: MEM-READ/MEM-WRITE assemble little-endian,
-;; which is what every target that runs this interpreter (x64, aarch64, i386)
-;; actually is.  A big-endian host would need the loop order flipped.
+;; except on a big-endian target (+TARGET-BIG-ENDIAN+, folded at build time),
+;; where byte I of an N-byte access is the value's byte N-1-I.  68k was the first
+;; big-endian image to run this interpreter, and before the flip every
+;; interpreted (setf (mem-ref a :u32) #x12345678) wrote 78 56 34 12 -- which
+;; native code then read back as a different number.
 (defun mem-read-byte (state addr)
   (declare (ignore state))
   (mem-ref addr :u8))
@@ -438,15 +446,26 @@
     (if mv
         (%val->word (svref (mvm-mv-vals state) mv))
         (let ((val 0))
+          ;; Byte I is shifted by 8I and read from the address holding the
+          ;; value's I-th least significant byte -- so the accumulation is
+          ;; low byte first in BOTH orders.  High byte first made every step
+          ;; after the first a bignum LOGIOR on a 32-bit target.
           (dotimes (i (ash 1 width) val)
-            (setf val (logior val (ash (mem-read-byte state (+ addr i)) (* i 8)))))))))
+            (setf val (logior val (ash (mem-read-byte state
+                                                      (+ addr (if (eql +target-big-endian+ 1)
+                                                                  (- (ash 1 width) 1 i)
+                                                                  i)))
+                                       (* i 8)))))))))
 
 (defun mem-write (state addr val width)
   (let ((mv (%mv-slot-index addr width)))
     (if mv
         (setf (svref (mvm-mv-vals state) mv) (%word->val val))
         (dotimes (i (ash 1 width))
-          (mem-write-byte state (+ addr i) (logand (ash val (* i -8)) #xFF))))))
+          (mem-write-byte state (+ addr (if (eql +target-big-endian+ 1)
+                                            (- (ash 1 width) 1 i)
+                                            i))
+                          (logand (ash val (* i -8)) #xFF))))))
 
 ;; VALUE-domain load/store — what OP-LOAD and OP-STORE actually need.
 ;;
@@ -517,7 +536,10 @@
         ;; #x52) → empty/NIL result (WS4 oracle).  The placeholder slots are
         ;; overwritten by the following obj-sets; %prim-aset is uniform across
         ;; object types.
-        ((= subtag #x52) (%make-closure 0 nil))
+        ;; THREE slots: the third caches this closure's native trampoline, so
+        ;; the closure keeps ONE identity however often it escapes to native
+        ;; code (%MVM-ESCAPE-TRAMPOLINE).
+        ((= subtag #x52) (%make-closure3 0 nil))
         (t (make-array size :initial-element 0))))
 ;; Slot ref/set/len via the NATIVE primitives.  %prim-aref returns the raw slot
 ;; (char CODE for a string), %prim-aset stores it; uniform across object types.
@@ -983,14 +1005,34 @@
        (if (and (null (%prim-aref v 1)) tag (symbolp tag) (not (keywordp tag))
                 (fboundp tag))
            (symbol-function tag)
-           (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))))
+           (%mvm-escape-trampoline v bc ftab rt lam-offsets))))
     ;; (No bare-integer branch — see the docstring.)
     (t v)))
+
+(defun %mvm-escape-trampoline (v bc ftab rt lam-offsets)
+  "The native trampoline for the in-module closure V, made ONCE and kept in V's
+   third slot.  A fresh trampoline per escape made every interpreted lambda a
+   different object each time it was passed to a function or returned:
+   (let ((f (lambda () 1))) (eq (identity f) f)) was NIL on every port that
+   interprets (i386, arm32, RISC-V), and with it (setf (symbol-function s) f)'s
+   value, *DEBUGGER-HOOK*'s argument and #'F of a LABELS function (upstream
+   SYMBOL-FUNCTION.1, INVOKE-DEBUGGER.1, LABELS.37-40).  A closure made before
+   the interpreter allocated three slots (two-slot) still gets a fresh one."
+  (if (>= (%prim-array-length v) 3)
+      (let ((cached (%prim-aref v 2)))
+        (if cached
+            cached
+            (let ((tr (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
+                                            lam-offsets)))
+              (%prim-aset v 2 tr)
+              tr)))
+      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets)))
 
 (defun %mvm-wrap-escaping-result (v bc ftab rt lam-offsets)
   "Wrap an mvm-eval RESULT value (the thunk's return) that is an in-module
    #x52 lambda closure in a re-entrant trampoline, so the value production
-   EVAL hands back is natively funcallable and IDENTITY-DISTINCT per call.
+   EVAL hands back is natively funcallable -- one trampoline per closure, so
+   the value keeps its identity (%MVM-ESCAPE-TRAMPOLINE).
    Unlike the bridge-arg wrapper (%mvm-wrap-escaping), a BARE integer is
    NEVER wrapped here: eval results are ordinary data far more often than
    captureless-lambda offsets, and under *mvm-eval-runtime-p* compile-lambda
@@ -1000,8 +1042,7 @@
   (if (and v (not (consp v)) (not (integerp v))
            (= (obj-subtag v) #x52)
            (%mvm-module-fn-offset-p (%prim-aref v 0) lam-offsets))
-      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
-                            lam-offsets)
+      (%mvm-escape-trampoline v bc ftab rt lam-offsets)
       v))
 
 ;;; ============================================================

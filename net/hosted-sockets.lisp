@@ -47,8 +47,11 @@
 ;;;   3. IT IS ONE PAGE.  %SOCK-IO-CAP names that limit instead of leaving it
 ;;;      implicit, and the transfer loops below CHUNK against it — so a
 ;;;      transfer is bounded by nothing at all, whatever the buffer's size.
+(declaim (overridable %sock-addr-buf))
 (defun %sock-addr-buf () (+ *cstr-scratch* 3072))   ; >= 64 bytes of address scratch
+(declaim (overridable %sock-io-buf))
 (defun %sock-io-buf   () *io-buf-addr*)             ; the data staging buffer
+(declaim (overridable %sock-io-cap))
 (defun %sock-io-cap   () 4096)                      ; ... and how big it is
 
 ;;; Build sockaddr_in(AF_INET, port, ip) at the addr buffer; return its addr.

@@ -174,8 +174,9 @@ in the next pass.
   situations.
 - `load-time-value` — not implemented.
 - `progv` — partial.
-- Macro `&environment` — not parsed in `defmacro`/`macrolet`
-  lambda-lists.
+- Macro `&environment` — in the image an expander receives the compiler's
+  COMPILE-ENV (MACROEXPAND-1/MACROEXPAND accept one; `%variable-information`,
+  `%macroexpand-all`).  Host-built expanders still receive NIL.
 - `compiler-macro-function` — registry added by MACRO agent (`75089fa`
   neutral; needs follow-up to actually dispatch compiler macros).
 

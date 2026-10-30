@@ -19828,7 +19828,10 @@
                         ((and (consp name) (eq (car name) 'setf))
                          (%setf-fn-name (cadr name)))
                         ((stringp name) name)
-                        (t "UNKNOWN")))
+                        ;; Neither a name nor a lambda expression: (FUNCTION
+                        ;; (MACRO NAMED-LAMBDA ...)) was NIL, and TI's MACRO
+                        ;; FDEFINEd that NIL over cortez's DEFSUBST macro.
+                        (t (error "~S is not a legal function name." name))))
              ;; Check if this name is a flet/labels local name — use the unique name
              (unique-name (env-lookup-fn env (if (symbolp name) (%local-fn-key name) fn-name)))
              ;; Primitive-op names → corresponding %*-fn wrapper.

@@ -490,6 +490,20 @@
         (return (%substring path (+ i 1) len)))
       (setq i (+ i 1)))))
 
+;; A leading ~/ is the home directory, expanded where a namestring is parsed
+;; and where a string is opened, as CCL does (SBCL keeps :HOME and expands at
+;; the file system; the files reached are the same).  Every Quicklisp-era
+;; script starts (load "~/quicklisp/setup.lisp").
+(defun %expand-home (s)
+  (let ((home (and (>= (length s) 2) (char= (char s 0) #\~) (char= (char s 1) #\/)
+                   (%cli-getenv "HOME"))))
+    (if (and (stringp home) (> (length home) 0))
+        (concatenate 'string
+                     (if (char= (char home (- (length home) 1)) #\/) home
+                         (concatenate 'string home "/"))
+                     (%substring s 2 (length s)))
+        s)))
+
 (defun %resolve-path (filespec)
   "Convert filespec to a path string, prepending *default-pathname-defaults* if relative.
    Accepts strings, pathname objects, and streams."
@@ -497,7 +511,7 @@
   (when (and (%lp-hosts-p) (not (streamp filespec)) (%lp-designator filespec))
     (setq filespec (namestring (translate-logical-pathname filespec))))
   (let ((path (cond
-                ((stringp filespec) (%strip-logical-host filespec))
+                ((stringp filespec) (%strip-logical-host (%expand-home filespec)))
                 ;; %pathname-obj-p is defined later in this file but the
                 ;; compiler resolves the call at runtime via the symbol-
                 ;; function table.  When filespec is a pathname object,
@@ -1433,6 +1447,7 @@
   "Parse a namestring S into a pathname object.  Strips logical host prefix
    (anything up to and including the first colon).  Splits directory parts
    on '/', then the basename into name + type at the last '.'."
+  (setq s (%expand-home s))
   (let ((h (%lp-string-host s)))
     (when h
       (return-from %parse-pathname-string

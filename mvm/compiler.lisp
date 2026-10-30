@@ -19818,6 +19818,20 @@
    Primitive operator names (EQL, EQ, =, <, >, <=, >=, EQUAL, /=) are
    inline opcodes with no callable entry, so we redirect to wrapper
    functions defined in prelude.lisp (e.g. EQL → %eql-fn)."
+  ;; Neither a name nor a lambda expression: (FUNCTION (MACRO NAMED-LAMBDA ...))
+  ;; compiled to NIL, and TI's MACRO FDEFINEd that NIL over cortez's DEFSUBST
+  ;; macro.  An error -- under EVAL the form's own run-time error, SBCL's rule,
+  ;; so the function around it is still defined.
+  (unless (or (symbolp name) (stringp name)
+              (and (consp name) (symbolp (car name))
+                   (or (string= (symbol-name (car name)) "LAMBDA")
+                       (eq (car name) 'setf))))
+    (if *mvm-eval-runtime-p*
+        (return-from compile-function-ref
+          (compile-form (list 'error "~S is not a legal function name."
+                              (list 'quote name))
+                        env dest))
+        (error "~S is not a legal function name." name)))
   (if (and (consp name) (symbolp (car name))
            (string= (symbol-name (car name)) "LAMBDA"))
       ;; #'(lambda (params) body...) → compile as lambda
@@ -19827,11 +19841,7 @@
                         ((symbolp name) (%rt-fn-name name))
                         ((and (consp name) (eq (car name) 'setf))
                          (%setf-fn-name (cadr name)))
-                        ((stringp name) name)
-                        ;; Neither a name nor a lambda expression: (FUNCTION
-                        ;; (MACRO NAMED-LAMBDA ...)) was NIL, and TI's MACRO
-                        ;; FDEFINEd that NIL over cortez's DEFSUBST macro.
-                        (t (error "~S is not a legal function name." name))))
+                        ((stringp name) name)))
              ;; Check if this name is a flet/labels local name — use the unique name
              (unique-name (env-lookup-fn env (if (symbolp name) (%local-fn-key name) fn-name)))
              ;; Primitive-op names → corresponding %*-fn wrapper.

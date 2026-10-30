@@ -162,6 +162,12 @@
   (let ((ch (aref *iso-to-session* conn)))
     (loop (when (null (funcall *iso-try* ch)) (return nil))))
   (setf (mem-ref (%iso-closed-addr conn) :u32) 0)
+  ;; On cores 1..3, with a heap of its own: an unpinned MAKE-THREAD starts a
+  ;; thread on core 0 (bare-threads.lisp, since 73225738), and core 0's threads
+  ;; run only when the main thread blocks or yields -- which the net domain,
+  ;; polling the NIC, never does.  Every session sat there and no client got a
+  ;; banner.
+  (bt-pin-next (%bt-least-loaded-core))
   (let ((c conn))
     (setf (aref *iso-threads* conn)
           (funcall *iso-spawn* (lambda () (%iso-session c)) :name "ssh session"))))

@@ -104,7 +104,7 @@ Every bare-metal image runs the same Common Lisp REPL.
 | Network          | E1000, virtio | E1000 | USB CDC-ECM, RTL8152/8153 | NE2000 | - |
 | SSH server       | Y | Y | Y | Y | - |
 | Threads          | - | 4 cores | 4 cores | - | - |
-| Isolated SSH (session per thread) | - | regressed on main, being bisected | not rechecked since | - | - |
+| Isolated SSH (session per thread) | - | Y | Y | - | - |
 | Generational GC  | - | - | Y | - | - |
 | Saved cores      | Y | - | Y | - | - |
 

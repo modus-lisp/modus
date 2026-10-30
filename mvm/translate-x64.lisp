@@ -875,32 +875,44 @@
   "Scan every PARKED actor: an actor that is ready or blocked is on no
    thread, so no thread's scan reaches its stack, its window's handler frames
    and bindings, or its region -- and each can hold region-0 objects.  Runs at
-   the end of the STW scan (so only when this collection took the world);
-   R12/R14 are free by then and survive scan_word."
-  (let ((lp (make-label)) (next (make-label)) (done (make-label))
+   the end of the STW scan (so only when this collection took the world).
+
+   The table cursor and its end live on the MACHINE STACK ([rsp], [rsp+8]),
+   not in registers: R12/R14 are not free here in a generational build --
+   copy_object reads them as the promotion bump and survivor mark.  Holding the
+   cursor in R12 and the end in R14 sent every from-space object below the
+   actor table's end down the promotion path, which read its bound through the
+   card root -- 0 with nothing tenured -- and faulted at address 87
+   (test/hosted-actor-runtime.lisp, every run, from f23954e)."
+  (let ((lp (make-label)) (next (make-label)) (done (make-label)) (none (make-label))
         (noreg (make-label)) (rok (make-label)) (dbl (make-label))
         (dbd (make-label)) (dbin (make-label)) (dbgo (make-label)))
     ;; No +STW-STOP-ADDR+ gate: the caller (emit-x64-stw-extra-roots, the
     ;; live protocol) has already established that this collection took the
     ;; world; operandi's STOP word is never set in this tree.
-    (emit-mov-reg-imm buf 'r12 +stw-actor-table-addr+)
-    (emit-mov-reg-mem buf 'r12 'r12 0)
-    (emit-cmp-reg-imm buf 'r12 0)
-    (emit-jcc buf :e done)
-    (emit-mov-reg-reg buf 'r14 'r12)
-    (emit-add-reg-imm buf 'r14 (* 64 48))
-    (emit-label buf lp)
-    (emit-cmp-reg-reg buf 'r12 'r14)
-    (emit-jcc buf :ae done)
-    (emit-mov-reg-mem buf 'rax 'r12 0)
+    (emit-mov-reg-imm buf 'rax +stw-actor-table-addr+)
+    (emit-mov-reg-mem buf 'rax 'rax 0)
     (emit-cmp-reg-imm buf 'rax 0)
+    (emit-jcc buf :e none)
+    (emit-mov-reg-reg buf 'rsi 'rax)
+    (emit-add-reg-imm buf 'rsi (* 64 48))
+    (emit-push buf 'rsi)                              ; [rsp+8] = end
+    (emit-push buf 'rax)                              ; [rsp]   = cursor
+    (emit-label buf lp)
+    (emit-mov-reg-mem buf 'rax 'rsp 0)
+    (emit-mov-reg-mem buf 'rsi 'rsp 8)
+    (emit-cmp-reg-reg buf 'rax 'rsi)
+    (emit-jcc buf :ae done)
+    (emit-mov-reg-mem buf 'rsi 'rax 0)
+    (emit-cmp-reg-imm buf 'rsi 0)
     (emit-jcc buf :e next)
     ;; its stack [saved SP, stack top)
-    (emit-mov-reg-mem buf 'rdi 'r12 8)
-    (emit-mov-reg-mem buf 'r10 'r12 16)
+    (emit-mov-reg-mem buf 'rdi 'rax 8)
+    (emit-mov-reg-mem buf 'r10 'rax 16)
     (emit-stw-scan-range buf scan-word-label)
     ;; its region's live part [from, parked alloc), clamped to the semispace
-    (emit-mov-reg-mem buf 'rsi 'r12 32)
+    (emit-mov-reg-mem buf 'rax 'rsp 0)
+    (emit-mov-reg-mem buf 'rsi 'rax 32)
     (emit-cmp-reg-imm buf 'rsi 0)
     (emit-jcc buf :e noreg)
     (emit-mov-reg-mem buf 'rdi 'rsi modus.mvm::+gc-off-from-start+)
@@ -918,9 +930,11 @@
     (emit-stw-scan-range buf scan-word-label)
     (emit-label buf noreg)
     ;; its window's handler frames' saved RBX, and its dynamic bindings
-    (emit-mov-reg-mem buf 'rsi 'r12 24)
+    (emit-mov-reg-mem buf 'rax 'rsp 0)
+    (emit-mov-reg-mem buf 'rsi 'rax 24)
     (emit-stw-scan-handler-rbx buf 'rsi scan-word-label)
-    (emit-mov-reg-mem buf 'rsi 'r12 24)
+    (emit-mov-reg-mem buf 'rax 'rsp 0)
+    (emit-mov-reg-mem buf 'rsi 'rax 24)
     (emit-mov-reg-mem buf 'r10 'rsi #x10000C58)
     (emit-shr-reg-imm buf 'r10 1)
     (emit-cmp-reg-imm buf 'r10 0)
@@ -945,9 +959,13 @@
     (emit-jcc buf :g dbl)
     (emit-label buf dbd)
     (emit-label buf next)
-    (emit-add-reg-imm buf 'r12 48)
+    (emit-mov-reg-mem buf 'rax 'rsp 0)
+    (emit-add-reg-imm buf 'rax 48)
+    (emit-mov-mem-reg buf 'rsp 'rax 0)
     (emit-jmp buf lp)
-    (emit-label buf done)))
+    (emit-label buf done)
+    (emit-add-reg-imm buf 'rsp 16)
+    (emit-label buf none)))
 
 (defun emit-stw-resume-subroutine (buf label)
   "Give the world back: STOP := 0 and wake every parked thread.  Preserves
@@ -8232,8 +8250,9 @@
       ;; region above reaches its stack, its window segment or its region.
       ;; Its scan lived in operandi's own STW scan subroutine, which this
       ;; tree does not emit (X64-STW-P is NIL); it runs here, inside this
-      ;; collection's took-the-world gate.  R12/R14 (and R9/R10) are its
-      ;; scratch and are still live at this point of the trampoline.
+      ;; collection's took-the-world gate.  R9/R10 are its scratch; R12/R14
+      ;; are saved too, though it no longer uses them (it must not: a gen
+      ;; build's copy_object reads them).
       (emit-push buf 'r9) (emit-push buf 'r10) (emit-push buf 'r12) (emit-push buf 'r14)
       (emit-stw-scan-parked-actors buf scan-word-label)
       (emit-pop buf 'r14) (emit-pop buf 'r12) (emit-pop buf 'r10) (emit-pop buf 'r9)

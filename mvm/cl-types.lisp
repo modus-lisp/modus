@@ -5760,7 +5760,11 @@
               ;; TN: the compile-time defstruct registration thunk may not
               ;; have run at boot, but the instance still carries its type.
               ;; structure-1-1 / structure-1-4 depend on this.
-              ((%struct-instance-p obj) (%struct-instance-named-p obj tn))
+              ;; A NO is final only when TN is not a DEFTYPE: (deftype p () 'pt)
+              ;; named no struct, so (typep (make-pt) 'p) answered NIL without
+              ;; ever expanding P -- the DEFTYPE clause below.
+              ((and (%struct-instance-p obj) (%struct-instance-named-p obj tn)) t)
+              ((and (%struct-instance-p obj) (not (%deftype-lookup tn))) nil)
               ;; Registered struct type — fall back to the registry walk
               ;; (covers (typep non-struct 'struct-type) → NIL too).
               ((%find-struct-type tn) (%struct-instance-typep obj tn))

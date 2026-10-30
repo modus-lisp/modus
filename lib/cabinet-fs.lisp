@@ -12,6 +12,10 @@
 ;;;; dispatch function rather than a vtable of typed callbacks: nothing in
 ;;;; the baked image may name a CABINET symbol.
 
+;;; Kernel code loaded at runtime (kiln zero carries it), so read in the kernel's
+;;; package: the internals it calls and defines are MODUS-INT's, not CL-USER's.
+(in-package :modus-int)
+
 (defvar *cabfs* nil)              ; the mounted cabinet FS object
 
 ;;; Cabinet deals in (unsigned-byte 8) vectors; the stream layer deals in

@@ -15,6 +15,10 @@
 ;;;; Unix-domain sockets and the stat/chmod/credentials primitives signal: nothing here has a
 ;;;; filesystem namespace for them.
 
+;;; Kernel code loaded at runtime (kiln zero carries it), so read in the kernel's
+;;; package: the internals it calls and defines are MODUS-INT's, not CL-USER's.
+(in-package :modus-int)
+
 (defvar *bsocks* (make-hash-table) "fd -> BSOCK.")
 (defvar *bsock-next* 2000)
 (defvar *sbs-from* (cons 0 0) "(ip . port) of the last datagram RECVFROM returned.")

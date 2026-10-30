@@ -30,6 +30,10 @@
 ;;;; to the connection it names whichever thread happened to pump it.  On an image without
 ;;;; threads the lock is modus's single-threaded flag.
 
+;;; Kernel code loaded at runtime (kiln zero carries it), so read in the kernel's
+;;; package: the internals it calls and defines are MODUS-INT's, not CL-USER's.
+(in-package :modus-int)
+
 (defvar *tcp-conns* nil "Every connection the pump knows, most recent first.")
 (defvar *tcp-listeners* nil)
 (defvar *udp-ports* nil "Alist port -> list of (ip port bytes), oldest first.")

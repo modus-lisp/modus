@@ -3003,7 +3003,11 @@
                        ;; the generational collector (docs/generational-gc.md), as SB-EXT:GC
                        "GC-TENURE" "GC-UNTENURE" "GC-MAJOR" "GC-GEN-RESERVE" "GC-GEN-REPORT"
                        ;; the JIT's documented settings (as SB-EXT:*EVALUATOR-MODE*)
-                       "*JIT-ON*" "*JIT-HOT-ONLY*" "*JIT-HOT-CALLS*")))
+                       "*JIT-ON*" "*JIT-HOT-ONLY*" "*JIT-HOT-CALLS*"
+                       ;; what org libraries (cl-transport, natrium, operandi, seal)
+                       ;; look up by name: their thread-local specials, and the
+                       ;; hardware entropy source
+                       "REGISTER-PER-COMPUTATION-SPECIAL" "%MODUS-HARDWARE-ENTROPY")))
       (let ((sym (intern n int)))
         (import sym modus)
         (export sym modus)))

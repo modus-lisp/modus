@@ -7,6 +7,10 @@
 ;;;; (net/hosted-sockets*.lisp), net/bare-sockets.lisp over net/tcp-conns.lisp on bare metal.
 ;;;; The notes on each function, and on what is PARTIAL, are the ones it had in sb-sys-shim.
 
+;;; Kernel code loaded at runtime (kiln zero carries it), so read in the kernel's
+;;; package: the internals it calls and defines are MODUS-INT's, not CL-USER's.
+(in-package :modus-int)
+
 (defpackage "SB-BSD-SOCKETS"
   (:use)
   (:export "SOCKET" "INET-SOCKET" "INET6-SOCKET" "LOCAL-SOCKET"

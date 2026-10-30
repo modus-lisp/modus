@@ -14,6 +14,11 @@
 #    time is reported as a flake; one that passes on BASE and fails on FIX
 #    again fails the gate.  A shard that does not finish at FIX but did at
 #    BASE fails it too.
+# 4. DDC.  test/run-uefi-ddc.sh at both refs, in the background from the
+#    start (about 10 minutes, so it overlaps 1-3): the self-hosted compiler
+#    must rebuild the UEFI image byte-for-byte as SBCL built it.  Failing at
+#    FIX fails the gate unless it also fails at BASE (reported, as a build
+#    that fails at both refs is).  MODUS_GATE_NO_DDC=1 skips it.
 #
 # Worktrees, images and transcripts go in WORKDIR (default /var/tmp/modus-gate),
 # which is left in place for inspection.  Exit 0 = PASS.
@@ -54,12 +59,25 @@ BASE_WT=$(wt_for "$BASE_REF") || exit 2
 FIX_WT=$(wt_for "$FIX_REF") || exit 2
 FAIL=0
 
+# ---- 4. DDC, started first: it needs only the two trees --------------------
+ddc_start() { # side worktree
+  if [ -n "${MODUS_GATE_NO_DDC:-}" ] || [ ! -x "$2/test/run-uefi-ddc.sh" ]; then
+    echo "skipped" > "$WORKDIR/ddc-$1.verdict"; return
+  fi
+  ( MODUS_DDC_WORK=$WORKDIR/ddc-$1 "$2/test/run-uefi-ddc.sh" > "$WORKDIR/ddc-$1.log" 2>&1
+    echo $? > "$WORKDIR/ddc-$1.verdict" ) &
+  echo $! > "$WORKDIR/ddc-$1.pid"
+}
+rm -f "$WORKDIR"/ddc-*.verdict
+ddc_start base "$BASE_WT"
+ddc_start fix "$FIX_WT"
+
 # ---- 1. builds --------------------------------------------------------------
 # FIX's harness and list drive both sides: the list names what must build.
 echo "-- building every image at both refs --"
-"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$BASE_WT" "$WORKDIR/mx-base" > "$WORKDIR/mx-base.log" 2>&1 &
-"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$FIX_WT" "$WORKDIR/mx-fix" > "$WORKDIR/mx-fix.log" 2>&1 &
-wait
+"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$BASE_WT" "$WORKDIR/mx-base" > "$WORKDIR/mx-base.log" 2>&1 & w1=$!
+"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$FIX_WT" "$WORKDIR/mx-fix" > "$WORKDIR/mx-fix.log" 2>&1 & w2=$!
+wait $w1 $w2
 nb=0 nbad=0
 for d in "$WORKDIR"/mx-fix/*/; do
   n=$(basename "$d"); rf=$(cat "$d/rc" 2>/dev/null || echo X)
@@ -106,9 +124,9 @@ fi
 # ---- 3. conformance -----------------------------------------------------------
 echo "-- upstream ansi-test sweep on both CLIs --"
 SWEEP=$FIX_WT/scripts/ansi-sweep.sh
-"$SWEEP" "$CLI_BASE" "$WORKDIR/sw-base" > /dev/null 2>&1 &
-"$SWEEP" "$CLI_FIX" "$WORKDIR/sw-fix" > /dev/null 2>&1 &
-wait
+"$SWEEP" "$CLI_BASE" "$WORKDIR/sw-base" > /dev/null 2>&1 & w1=$!
+"$SWEEP" "$CLI_FIX" "$WORKDIR/sw-fix" > /dev/null 2>&1 & w2=$!
+wait $w1 $w2
 for side in base fix; do
   if [ ! -s "$WORKDIR/sw-$side/summary" ] || [ ! -s "$WORKDIR/sw-$side/pass" ]; then
     echo "VERDICT: FAIL (the $side sweep produced no results; see $WORKDIR/sw-$side)"; exit 1
@@ -135,9 +153,9 @@ comm -13 "$WORKDIR/sw-base/pass" "$WORKDIR/sw-fix/pass" > "$WORKDIR/gained"
 echo "lost=$(wc -l < "$WORKDIR/lost") gained=$(wc -l < "$WORKDIR/gained")"
 if [ -s "$WORKDIR/lost" ]; then
   echo "-- re-running the lost tests alone on both CLIs --"
-  "$SWEEP" "$CLI_BASE" "$WORKDIR/re-base" "$WORKDIR/lost" > /dev/null 2>&1 &
-  "$SWEEP" "$CLI_FIX" "$WORKDIR/re-fix" "$WORKDIR/lost" > /dev/null 2>&1 &
-  wait
+  "$SWEEP" "$CLI_BASE" "$WORKDIR/re-base" "$WORKDIR/lost" > /dev/null 2>&1 & w1=$!
+  "$SWEEP" "$CLI_FIX" "$WORKDIR/re-fix" "$WORKDIR/lost" > /dev/null 2>&1 & w2=$!
+  wait $w1 $w2
   # lost for real: passes on base again and fails on fix again
   comm -12 "$WORKDIR/re-base/pass" "$WORKDIR/re-fix/fail" > "$WORKDIR/lost-real"
   comm -23 "$WORKDIR/lost" "$WORKDIR/lost-real" > "$WORKDIR/lost-flaky"
@@ -147,5 +165,22 @@ if [ -s "$WORKDIR/lost" ]; then
   fi
 fi
 [ -s "$WORKDIR/gained" ] && echo "gained: $(tr '\n' ' ' < "$WORKDIR/gained" | cut -c1-600)"
+
+# ---- 4. DDC verdicts --------------------------------------------------------
+for side in base fix; do
+  [ -s "$WORKDIR/ddc-$side.pid" ] && while kill -0 "$(cat "$WORKDIR/ddc-$side.pid")" 2>/dev/null; do sleep 5; done
+done
+db=$(cat "$WORKDIR/ddc-base.verdict" 2>/dev/null || echo X)
+df=$(cat "$WORKDIR/ddc-fix.verdict" 2>/dev/null || echo X)
+if [ "$df" = skipped ]; then
+  echo "ddc: skipped"
+elif [ "$df" = 0 ]; then
+  echo "ddc: PASS (the self-hosted compiler rebuilds the UEFI image byte-for-byte)"
+elif [ "$db" = 0 ]; then
+  echo "ddc: FAIL at fix, PASS at base (see $WORKDIR/ddc-fix.log)"; FAIL=1
+  grep -a "DIFF\|FAIL" "$WORKDIR/ddc-fix.log" | head -3
+else
+  echo "ddc: fails at both refs (base $db / fix $df; see $WORKDIR/ddc-fix.log)"
+fi
 
 if [ $FAIL -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL"; exit 1; fi

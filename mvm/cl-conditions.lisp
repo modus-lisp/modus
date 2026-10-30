@@ -2907,9 +2907,14 @@
 ;;; COMMON-LISP-USER but no package held them, so FIND-SYMBOL could not name them, they printed
 ;;; as a bare COMMA that read back as a different symbol, and a program walking forms could only
 ;;; recognise them by name -- which also matches a variable that happens to be called COMMA
-;;; (TI's window/wholin.lisp has one).  Seated and exported here they are MODUS:BACKQUOTE,
+;;; (TI's window/wholin.lisp has one).  Exported here they are MODUS:BACKQUOTE,
 ;;; MODUS:COMMA and the rest: findable, EQ-testable, and they print as what reads back.  The
 ;;; runtime's own by-name checks are unaffected.
+;;;
+;;; They stay HOMED in MODUS-INT, which exports them to the runtime (%MODUS-INT-RUNTIME-EXPORTS),
+;;; as SB-IMPL::BACKQUOTE is SBCL's: MODUS imports them, like the rest of its API.  Re-homing them
+;;; into MODUS made the self-hosted compiler bake MODUS's package hash into every quoted marker
+;;; where the SBCL build bakes MODUS-INT's -- the UEFI DDC's 21 differing words.
 ;;;
 ;;; Called from kernel-main next to %INSTALL-RUNTIME-BACKQUOTE, NOT from %INIT-PACKAGES: IMPORT
 ;;; keys the package table by SYMBOL-NAME, and before %INIT-SYM-NAME-AUTO fills
@@ -2920,7 +2925,6 @@
     (when modus
       (dolist (sym (list 'backquote 'comma 'comma-at 'comma-dot))
         (import sym modus)
-        (%cl-sym-set-package sym modus)
         (export sym modus)))))
 
 (defun %init-packages ()

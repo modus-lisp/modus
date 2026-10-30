@@ -7823,8 +7823,14 @@
                      ;; Impure: the error was a fact about the image at THIS
                      ;; compile (an unbound variable, a function not yet
                      ;; defined), so EVAL must not cache the compiled form.
+                     ;; Not a CELL-ERROR: a missing global name goes on to EVAL's
+                     ;; caller, who can supply it and retry -- compiled into a
+                     ;; function, it would be re-signalled by every later call,
+                     ;; long after the name was defined (cortez fetched TI's
+                     ;; LOOP-FOR-KEYWORD-ALIST and the same condition came back).
                      (handler-case (macroexpand-mvm form)
                        (error (c)
+                         (when (typep c 'cell-error) (error c))
                          (setq *%mexp-impure* t)
                          (list 'error (list 'quote c)))))
                    (macroexpand-mvm form))))

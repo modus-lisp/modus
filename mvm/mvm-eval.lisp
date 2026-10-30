@@ -1144,7 +1144,12 @@
                           ;; the same call: a site whose callee did not exist
                           ;; when its page was built is bridged too
                           ;; (%JIT-RELOC-CALLS).
-                          (error (quote undefined-function) :name nm))))))))))
+                          (error (quote undefined-function)
+                                 ;; the SYMBOL, as the interpreter's NAME is:
+                                 ;; a handler asking CELL-ERROR-NAME which
+                                 ;; function to supply can do nothing with the
+                                 ;; table key string "PKG::SYM"
+                                 :name (%runtime-fn-name-symbol nm)))))))))))
 ;; THE BRIDGE'S HIT, INLINE: a cached pair whose site is settled (patched, or
 ;; retired because the callee is a closure -- every runtime DEFCLASS accessor)
 ;; is the callee itself; anything else asks %JIT-BRIDGE-RESOLVE.

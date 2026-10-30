@@ -387,6 +387,8 @@
        (format stream "The slot ~S is unbound in the object ~S." (slot 'name) (slot 'instance)) t)
       ;; A native fault knows nothing about the operation or its operands:
       ;; say what it is instead of a TYPE-ERROR message with NILs in it.
+      ((typep c 'stack-exhausted)
+       (write-string "Control stack exhausted: the recursion went deeper than the stack." stream) t)
       ((typep c 'memory-fault-error)
        (write-string "Memory fault in compiled code: an operation was applied to an object of the wrong type (no further detail is recorded)." stream) t)
       ((typep c 'mvm-type-error)
@@ -598,6 +600,11 @@
     nil nil)
   ;; storage-condition
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
+  ;; stack-exhausted -- the control stack ran out: a SIGSEGV just below the
+  ;; stack pointer, which the hosted x64 stub takes on its alternate stack
+  ;; (see %TAKE-PENDING-FAULT).  A STORAGE-CONDITION, not an ERROR, as SBCL's
+  ;; is: deep recursion is a resource running out, not a wrong operation.
+  (%define-condition 'stack-exhausted '(storage-condition) nil nil nil)
   ;; memory-fault-error -- SIGSEGV/SIGBUS caught by a handler-case (see
   ;; %TAKE-PENDING-FAULT).  A TYPE-ERROR because in compiled code a fault is
   ;; how a type check fails: (car 5) faults, and ANSI says it signals
@@ -796,7 +803,8 @@
    the word at #x10000CB0 and no condition, since it cannot allocate; build
    the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
    is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
-   MEMORY-FAULT-ERROR.
+   MEMORY-FAULT-ERROR -- or STACK-EXHAUSTED when the stub found the fault
+   just below the stack pointer and recorded #x0B0B instead of 11.
 
    A SIGILL may be THE SHARED-STORE GUARD's refusal, which says more than the
    signal does: %HC-FAULT-FIXUP claims it (and clears the signal) when it is.
@@ -809,7 +817,8 @@
       (setf (mem-ref #x10000CB0 :u32) 0)
       (setq *current-condition*
             (%attach-fault-frames
-             (cond ((eql sig 8) (make-condition 'division-by-zero
+             (cond ((eql sig #x0B0B) (make-condition 'stack-exhausted))
+                   ((eql sig 8) (make-condition 'division-by-zero
                                                 :operation nil :operands nil))
                    ((eql sig 4) (make-condition 'illegal-instruction-error))
                    (t (make-condition 'memory-fault-error

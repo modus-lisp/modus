@@ -2682,6 +2682,23 @@
                 ;; 2026-09-30 merge found the collision.
                 (emit-bytes buf #x89 #x3C #x25)           ; mov [disp32], edi
                 (emit-u32 buf #x10000CB0)
+                ;; A STACK OVERFLOW: the fault address (si_addr, saved at
+                ;; 0x10000C50 above) lies within 64 KB of the faulting RSP
+                ;; (0x10000C38) -- below it for a PUSH or CALL, above it for a
+                ;; prologue's store after SUB RSP.  The stack around RSP is
+                ;; mapped, so a fault there is the stack's end and nothing else.
+                ;; Record #x0B0B in place of the signal so %TAKE-PENDING-FAULT
+                ;; makes STACK-EXHAUSTED.  This stub can only be running at all
+                ;; because it is on the alternate stack the install below gives
+                ;; it (SA_ONSTACK).
+                (let ((not-overflow (make-label)))
+                  (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000C50) ; mov rax, [si_addr slot]
+                  (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf #x10000C38) ; sub rax, [RSP slot]
+                  (emit-bytes buf #x48 #x05) (emit-u32 buf #x10000)             ; add rax, 64 KB
+                  (emit-bytes buf #x48 #x3D) (emit-u32 buf #x20000)             ; cmp rax, 128 KB
+                  (emit-jcc buf :ae not-overflow)                              ; unsigned: outside = not ours
+                  (emit-bytes buf #xC7 #x04 #x25) (emit-u32 buf #x10000CB0) (emit-u32 buf #x0B0B)
+                  (emit-label buf not-overflow))
                 ;; --- Active handler-case: do the longjmp ---
                 ;; Save OUR state to scratch (#x10000C10..) before the pop
                 ;; helper overwrites [180].
@@ -2815,7 +2832,11 @@
                 ;; on handler entry — without it, RDX is unspecified and our
                 ;; ucontext-relative reads (uc_mcontext.gregs[…]) read
                 ;; garbage from wherever RDX happened to point.
-                (emit-bytes buf #x48 #xC7 #x44 #x24 #x08 #x04 #x00 #x00 #x44)
+                ;; | SA_ONSTACK (0x08000000): the handler runs on the alternate
+                ;; stack installed below, so a fault that IS the stack running
+                ;; out can still be handled (STACK-EXHAUSTED) instead of the
+                ;; kernel killing the process for want of a frame to push.
+                (emit-bytes buf #x48 #xC7 #x44 #x24 #x08 #x04 #x00 #x00 #x4C)
                 ;; [rsp+16] = sa_restorer = restorer-label.
                 (emit-lea-label buf 'rax restorer-label)
                 (emit-bytes buf #x48 #x89 #x44 #x24 #x10)  ; mov [rsp+16], rax
@@ -2830,6 +2851,36 @@
                   (emit-bytes buf #x49 #xC7 #xC2 #x08 #x00 #x00 #x00) ; mov r10, 8
                   (emit-bytes buf #x48 #xC7 #xC0 #x0D #x00 #x00 #x00) ; mov rax, 13 (rt_sigaction)
                   (emit-syscall-saving-rcx-r11 buf))     ; syscall (RCX/R11 preserved)
+
+                ;; THE ALTERNATE SIGNAL STACK, for SA_ONSTACK: 64 KB from mmap,
+                ;; handed to sigaltstack(2) as a stack_t built in the struct
+                ;; area (ss_sp, ss_flags, ss_size).  Per thread in Linux, and
+                ;; cleared for a CLONE_VM thread -- so this covers the thread
+                ;; that installs the handlers; a worker's overflow still ends
+                ;; the process.  An mmap failure skips it and changes nothing.
+                (let ((no-alt (make-label)))
+                  ;; r9 is kept in the struct's last word (sa_mask, done with):
+                  ;; a PUSH would move RSP under the stack_t built at [rsp].
+                  (emit-bytes buf #x4C #x89 #x4C #x24 #x18)         ; mov [rsp+24], r9
+                  (emit-bytes buf #x31 #xFF)                        ; xor edi, edi
+                  (emit-bytes buf #xBE) (emit-u32 buf #x10000)      ; mov esi, 64 KB
+                  (emit-bytes buf #xBA #x03 #x00 #x00 #x00)         ; mov edx, PROT_READ|PROT_WRITE
+                  (emit-bytes buf #x41 #xBA #x22 #x00 #x00 #x00)    ; mov r10d, MAP_PRIVATE|MAP_ANONYMOUS
+                  (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1
+                  (emit-bytes buf #x45 #x31 #xC9)                   ; xor r9d, r9d
+                  (emit-bytes buf #xB8 #x09 #x00 #x00 #x00)         ; mov eax, 9 (mmap)
+                  (emit-syscall-saving-rcx-r11 buf)
+                  (emit-bytes buf #x48 #x3D #x00 #xF0 #xFF #xFF)    ; cmp rax, -4096
+                  (emit-jcc buf :ae no-alt)                         ; an errno: no alternate stack
+                  (emit-bytes buf #x48 #x89 #x04 #x24)              ; mov [rsp], rax      ss_sp
+                  (emit-bytes buf #x48 #xC7 #x44 #x24 #x08 #x00 #x00 #x00 #x00) ; ss_flags = 0
+                  (emit-bytes buf #x48 #xC7 #x44 #x24 #x10) (emit-u32 buf #x10000) ; ss_size
+                  (emit-bytes buf #x48 #x89 #xE7)                   ; mov rdi, rsp
+                  (emit-bytes buf #x31 #xF6)                        ; xor esi, esi
+                  (emit-bytes buf #xB8 #x83 #x00 #x00 #x00)         ; mov eax, 131 (sigaltstack)
+                  (emit-syscall-saving-rcx-r11 buf)
+                  (emit-label buf no-alt)
+                  (emit-bytes buf #x4C #x8B #x4C #x24 #x18))        ; mov r9, [rsp+24]
 
                 ;; Free struct
                 (emit-bytes buf #x48 #x83 #xC4 #x20)  ; add rsp, 32

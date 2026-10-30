@@ -1163,6 +1163,16 @@
                     genmul-bc-offset)
                    (modus.mvm::*aarch64-gensub-bytecode-offset*
                     gensub-bc-offset))
+               ;; #248: dynamic in the self-host image too, where a DEFVAR
+               ;; alone leaves a LET lexical -- the translator, a different
+               ;; function, reads these globals
+               (declare (special modus.mvm::*aarch64-handler-push-label*
+                                 modus.mvm::*aarch64-handler-pop-label*
+                                 modus.mvm::*aarch64-gc-trampoline-label*
+                                 modus.mvm::*aarch64-gc-collect-bytecode-offset*
+                                 modus.mvm::*aarch64-genadd-bytecode-offset*
+                                 modus.mvm::*aarch64-genmul-bytecode-offset*
+                                 modus.mvm::*aarch64-gensub-bytecode-offset*))
                ;; Phase A: emit boot preamble into the unified buffer first.
                (let ((entry-fn (getf boot-descriptor :entry-fn)))
                  (when entry-fn (funcall entry-fn aarch64-unified-buf)))
@@ -1862,6 +1872,7 @@
                (serial-base (getf boot-desc :serial-base)))
           ;; Serial base priority: explicit setf > boot descriptor > QEMU virt default
           (let ((*aarch64-serial-base* (or *aarch64-serial-base* serial-base #x09000000)))
+            (declare (special *aarch64-serial-base*))   ; #248: the translator reads it
             ;; Assemble image
             (let ((%img (assemble-kernel-image module target-desc
                                                :boot-descriptor boot-desc)))

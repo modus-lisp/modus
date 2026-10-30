@@ -338,31 +338,17 @@ Three things that are easy to get wrong:
   cells again and counts each such reference in `*kernel-global-shadow-hits*`.
   `test/kernel-global-shadow.lisp`.
 
-### `check-compiler-warns` baselines are STALE, and that is a hazard
+### `check-compiler-warns` baselines are CURRENT (2026-10-30)
 
-`build-generic-cli` currently reports, on every build:
-
-```
-implicit-global=41  implicit-global-setq=124  unresolved-function=45
-  - implicit-global-setq = 124 (baseline 123) — 1 NEW instance
-  - unresolved-function  = 45  (baseline 40)  — 5 NEW instances
-```
-
-**Both overages are pre-existing at HEAD** — established by building a control
-with the change under test reverted and getting an identical census, twice, in
-different rounds. The five unresolved names are `F1`–`F4` and
-`IS-EXTERNAL-SYMBOL-OF`: `#'NAME` sentinels with no definition in the blob,
-benign by the check's own definition.
-
-The hazard is not the five. It is that **a check which always cries wolf is a
-check nobody reads**, so a genuine sixth would be invisible — the same
-"unsafe state indistinguishable from a safe one" pattern that cost this
-campaign several rounds elsewhere.
-
-Fixing it means *deciding*, not silencing: either resolve the five, or move the
-baselines in `mvm/build-checks.lisp` (`:unresolved-function . 40`, line ~1069)
-**with a comment naming what was absorbed and why**. Bumping a baseline without
-naming its contents just relocates the problem.
+`build-generic-cli` reports `implicit-global=12 implicit-global-setq=8
+unresolved-function=0`, exactly its baselines in `mvm/build-checks.lisp`, whose
+comment names every instance.  It used to report 81 / 31 / 55 against stale
+baselines, so a genuine new instance was invisible.  The cleanup that fixed it:
+forward references to a global the blob defines later are not reported
+(`*BLOB-GLOBAL-NAMES*`), `scan-defuns` skips comments and strings
+(`%CODE-MASK`) instead of harvesting `#'FIB` out of a comment, and an unescaped
+`"OPTIMISE"` in a docstring that was compiling as a variable read is fixed.
+**A count above baseline now means a new instance: read it, do not bump it.**
 
 ## The architecture ladder — does every back end still run code?
 

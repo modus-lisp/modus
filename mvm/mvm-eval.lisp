@@ -3221,6 +3221,13 @@
     (setf (mem-ref (%core-jit-bump-slot) :u64) (ash b0 -1))
     t))
 
+(defvar *jit-reclaim-on* nil
+  "Reclaim JIT pages (STEP-A).  Off unless set; its readers also guard with BOUNDP.")
+(defvar *jit-fallback-names* nil
+  "The DEFUNs whose forms last fell back to interpretation (a diagnostic).")
+(defvar *jit-last-condition* nil
+  "The condition the last JIT fallback caught (a diagnostic).")
+
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
   "WS4-S5 (aarch64) sibling of %jit-translate-page-1.  translate-mvm-to-aarch64
    wants an eql-keyed func-idx→MVM-offset HASH (not x64's (name offset length)
@@ -4238,6 +4245,7 @@
         (entry nil)
         (rt-table (make-hash-table))
         (rt-next #x40000000))
+    (declare (special *init-thunk-names*))   ; #248: per unit in-image too
     (register-mvm-bootstrap-macros)
     (let* ((rforms (reverse forms))
            (last-form (car rforms))
@@ -4781,6 +4789,7 @@
         ;; %e2-scan-persist, which sees through EVAL-WHEN / PROGN / LOCALLY
         ;; AND macro wrappers (with-upgradability) — see its docstring.
         (persist-names nil))
+    (declare (special *init-thunk-names*))   ; #248: per unit in-image too
     (register-mvm-bootstrap-macros)
     ;; WS3 def persistence pre-scan.  Runs with *macro-table* freshly populated
     ;; (bootstrap macros) so %e2-scan-persist's macroexpand-1-mvm sees the same

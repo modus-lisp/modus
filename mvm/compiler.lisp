@@ -769,19 +769,6 @@
    list; see *E2-PERSIST-DEFUNS* for the same pattern and why a compiled LET
    of a special is not used in-image.")
 
-;;; Set by compile-form's %NAMED-LOOP dispatch so the inner SIMPLE-LOOP
-;;; doesn't establish an implicit (block nil …).  Per CLHS 6.1.2.2 a
-;;; NAMED LOOP's implicit block IS the named block — RETURN in the body
-;;; should fall through to whatever outer block-nil the caller has, NOT
-;;; be intercepted by the inner simple-loop.
-;;;
-;;; Declared HERE (before compile-form) so SBCL treats subsequent `(let
-;;; ((*suppress-loop-block-nil* t)) …)` as a true dynamic binding —
-;;; with the defvar farther down, SBCL compiled compile-form before
-;;; seeing the special declaration, treating the let as lexical, and
-;;; the binding silently never reached compile-loop.
-(defvar *suppress-loop-block-nil* nil)
-
 (defvar *macro-table* (make-hash-table :test 'eql)
   "Hash table of macro-name (hash integer) -> expander function")
 
@@ -1537,12 +1524,12 @@
        (symbolp var)
        (gethash (normalize-name var) *runtime-special-names*)))
 
-(defvar *let-skip-implicit-specials* nil
-  "When T, compile-form's let/let* dispatch skips the implicit-special
-   detection for CLHS-standard earmuffs.  compile-let-with-specials
-   binds this to T around the recursive compile-form on its emitted
-   let* — otherwise the dispatch re-detects the same names and recurses
-   forever.")
+;;; (*LET-SKIP-IMPLICIT-SPECIALS*, a recursion guard COMPILE-LET-WITH-SPECIALS
+;;; bound around its re-compile, is gone: the forms it re-compiles bind no
+;;; special by name -- the specials are renamed to temporaries, or filtered
+;;; out -- so there is nothing to re-detect.  Where the guard was dynamic (the
+;;; host build, which honours its DEFVAR) it stayed T through the BODY too, so
+;;; a LET of a special nested inside another one compiled LEXICAL.)
 
 (defvar *clhs-standard-specials-hashes* nil
   "Allowlist of CLHS-standard special-variable names (by name-hash).
@@ -8082,7 +8069,8 @@
        ;; twice, on the same fix, for two different readers.  On the SBCL build
        ;; host *error-output* is stderr; in-image %init-streams now makes it a
        ;; real fd-2 stream (it used to be the stdout stream object itself).
-       (format *error-output* "~&  WARN: implicit global ~A~%" name)
+       (unless (%blob-defines-global-p name)   ; a forward reference, not a typo
+         (format *error-output* "~&  WARN: implicit global ~A~%" name))
        (%note-global name :ref)
        (setf (gethash (normalize-name name) *globals*) t)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
@@ -8356,7 +8344,6 @@
                         (cddr form)))
               (declared (extract-special-vars body))
               (implicit
-                (if *let-skip-implicit-specials* nil
                     (let ((acc nil))
                       (dolist (b bindings)
                         (let ((var (if (consp b) (car b) b)))
@@ -8372,7 +8359,7 @@
                                      (not (member (normalize-name var) declared
                                                   :key #'normalize-name)))
                             (push var acc))))
-                      (nreverse acc))))
+                      (nreverse acc)))
               (specials (append declared implicit)))
          (if specials
              (compile-let-with-specials bindings body specials env dest)
@@ -8389,7 +8376,6 @@
                         (cddr form)))
               (declared (extract-special-vars body))
               (implicit
-                (if *let-skip-implicit-specials* nil
                     (let ((acc nil))
                       (dolist (b bindings)
                         (let ((var (if (consp b) (car b) b)))
@@ -8405,7 +8391,7 @@
                                      (not (member (normalize-name var) declared
                                                   :key #'normalize-name)))
                             (push var acc))))
-                      (nreverse acc))))
+                      (nreverse acc)))
               (specials (append declared implicit)))
          (if specials
              (compile-let-with-specials bindings body specials env dest t)
@@ -8442,17 +8428,17 @@
            (compile-unless (cdr form) env dest)))
       ((= op-name 521850251)     (compile-loop (cdr form) env dest))  ; LOOP
       ;; %NAMED-LOOP — expand-cl-loop wraps NAMED LOOPs as
-      ;; (%NAMED-LOOP NAME BODY).  Establishes (block NAME …) AND binds
-      ;; *suppress-loop-block-nil* = t for the body so the inner simple-
-      ;; loop doesn't establish an implicit (block nil …) of its own —
-      ;; per CLHS 6.1.2.2, a NAMED LOOP's implicit block IS the named
-      ;; block, not nil.  Internal `(return nil)` from test-form exits
-      ;; still works via *loop-exit-label* fallback in compile-return.
+      ;; (%NAMED-LOOP NAME BODY) and establishes (block NAME …).  The inner
+      ;; simple loop does not establish its own (block nil …) -- per CLHS
+      ;; 6.1.2.2 a NAMED LOOP's implicit block IS the named block -- because
+      ;; GENERATE-LOOP-CODE puts the (%LOOP-NONIL) marker at its head, which
+      ;; scopes that to exactly the one loop.  (A *SUPPRESS-LOOP-BLOCK-NIL*
+      ;; special used to be bound here too: lexical, so inert, in the image;
+      ;; dynamic on the host, where it leaked to every LOOP nested inside.)
+      ;; Internal `(return nil)` from test-form exits still works via the
+      ;; *loop-exit-label* fallback in compile-return.
       ((= op-name 374453720)  ; %NAMED-LOOP
-       (let ((nl-name (cadr form))
-             (nl-body (cddr form)))
-         (let ((*suppress-loop-block-nil* t))
-           (compile-block nl-name nl-body env dest))))
+       (compile-block (cadr form) (cddr form) env dest))
       ((= op-name 232767877)   (compile-return (cadr form) env dest))  ; RETURN
       ((= op-name 372279278)    (compile-block (cadr form) (cddr form) env dest))  ; BLOCK
       ((= op-name 495377437)  (compile-tagbody (cdr form) env dest))  ; TAGBODY
@@ -12871,16 +12857,15 @@
   ;; ordinary lexical LET/LET*.  (References to the free-declared specials
   ;; already compile as global accesses: they are not let variables.)
   (when (null specials)
-    (let ((*let-skip-implicit-specials* t))
-      (return-from compile-let-with-specials
-        (compile-form (if sequential
-                          `(let* ,bindings ,@(%special-shadow-body
-                                              %all-declared-specials env
-                                              (or (strip-declares body) (list nil))))
-                          `(let ,bindings ,@(%special-shadow-body
-                                             %all-declared-specials env
-                                             (or (strip-declares body) (list nil)))))
-                      env dest))))
+    (return-from compile-let-with-specials
+      (compile-form (if sequential
+                        `(let* ,bindings ,@(%special-shadow-body
+                                            %all-declared-specials env
+                                            (or (strip-declares body) (list nil))))
+                        `(let ,bindings ,@(%special-shadow-body
+                                           %all-declared-specials env
+                                           (or (strip-declares body) (list nil)))))
+                    env dest)))
   (let* ((special-names (mapcar (lambda (s) (normalize-name s)) specials))
          (save-vars (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))
@@ -12994,8 +12979,7 @@
             ;; binding must be visible to LATER inits (CLHS let*), so
             ;; each special's set-symbol-value is interleaved right
             ;; after its temp via a dummy binding.
-            (let ((*let-skip-implicit-specials* t)
-                  (seq-bindings
+            (let ((seq-bindings
                     (mapcan (lambda (b rb)
                               (let ((var (if (consp b) (car b) b)))
                                 (let ((pos (position (normalize-name var) special-names)))
@@ -13016,8 +13000,7 @@
             ;; let context: combine renamed bindings + save bindings into a
             ;; single let* (inits can't see each other — temps are gensyms),
             ;; then set the globals, run body, restore.
-            (let ((all-bindings (append renamed-bindings save-bindings))
-                  (*let-skip-implicit-specials* t))
+            (let ((all-bindings (append renamed-bindings save-bindings)))
               (compile-form
                 `(let* ,all-bindings
                    ;; EMPTY BODY: the protected PROGN must still yield NIL, not
@@ -14014,7 +13997,8 @@
       (t
        ;; Implicit global for setq
        ;; See the companion note at the implicit-global read site above.
-       (format *error-output* "~&  WARN: implicit global setq ~A~%" var)
+       (unless (%blob-defines-global-p var)    ; a forward reference, not a typo
+         (format *error-output* "~&  WARN: implicit global setq ~A~%" var))
        (%note-global var :ref)
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
@@ -15900,12 +15884,6 @@
                  262800624))))  ; BEING
 
 
-;;; (defvar *suppress-loop-block-nil*) — declared near top of file
-;;; before compile-form so SBCL treats `(let ((*suppress-loop-block-nil*
-;;; t)) …)` as a dynamic binding.  Used here by compile-loop's
-;;; simple-loop branch to skip the implicit (nil exit dest) push when a
-;;; NAMED LOOP is wrapping us.
-
 (defun compile-loop (body env dest)
   "Simple LOOP: tracks the loop nesting depth for register promotion of
    LET variables bound inside the body (see %let-promotion-plan)."
@@ -15937,7 +15915,7 @@
    nested in the body still gets its own BLOCK NIL."
   (let ((nonil (and (consp body) (%loop-nonil-marker-p (car body)))))
     (when nonil (setq body (cdr body)))
-    (%compile-loop-2 body env dest (or nonil *suppress-loop-block-nil*))))
+    (%compile-loop-2 body env dest nonil)))
 
 (defun %compile-loop-2 (body env dest suppress-nil)
   "Body of %COMPILE-LOOP-1; SUPPRESS-NIL says whether to skip the implicit
@@ -19473,7 +19451,7 @@
    regression -- a Pi 5 A/B was within 1% -- but it is still wrong to put one
    on this path.)
 
-   DO NOT "OPTIMISE" THIS TO %GF-P -- TRIED, IT BREAKS THE FIX.  What
+   DO NOT `OPTIMISE' THIS TO %GF-P -- TRIED, IT BREAKS THE FIX.  What
    SYMBOL-FUNCTION returns for a generic function is NOT a gf-object; %gf-p
    answers NIL on it and the whole fix silently stops working (measured:
    quickload back to SIMPLE-ERROR, ALEXANDRIA:FLATTEN undefined).  It is
@@ -23509,6 +23487,32 @@
           ((eq mode :opt) (setq opt (+ opt 1)))
           (t nil))))
     (list req opt rest-p key-p)))
+
+(defvar *blob-global-names* nil
+  "Name hashes of every global the forms being compiled define with DEFVAR,
+   DEFPARAMETER or DEFCONSTANT (%COLLECT-BLOB-GLOBAL-NAMES), so a read or SETQ
+   of one compiled BEFORE its definition -- COMPILER.LISP reading *PRINT-BASE*,
+   which cl-printer.lisp defines later in the blob -- is not reported as an
+   implicit global.  Warnings only: the code compiled is the same.")
+
+(defun %collect-blob-global-names (forms)
+  (let ((h (make-hash-table :test 'eql)))
+    (labels ((walk (f)
+               (when (and (consp f) (symbolp (car f)))
+                 (let ((s (symbol-name (car f))))
+                   (cond
+                     ((or (string= s "PROGN") (string= s "EVAL-WHEN"))
+                      (dolist (g (if (string= s "EVAL-WHEN") (cddr f) (cdr f)))
+                        (walk g)))
+                     ((and (or (string= s "DEFVAR") (string= s "DEFPARAMETER")
+                               (string= s "DEFCONSTANT"))
+                           (consp (cdr f)) (symbolp (cadr f)))
+                      (setf (gethash (normalize-name (cadr f)) h) t)))))))
+      (dolist (f forms) (walk f)))
+    h))
+
+(defun %blob-defines-global-p (name)
+  (and *blob-global-names* (gethash (normalize-name name) *blob-global-names*)))
 
 (defun %collect-multi-shape-defuns (forms)
   (let ((seen (make-hash-table :test 'equal))
@@ -31429,6 +31433,7 @@
         (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)
         (all-ir nil))
+    (declare (special *uwp-seq-counter*))   ; #248: reset per unit in-image too
     ;; REPRODUCIBLE BUILDS: reset the compiler's own gensym counter so the
     ;; names macro expansion bakes into this module depend only on the FORMS
     ;; being compiled and the order they are compiled in — never on whatever
@@ -31462,6 +31467,7 @@
     ;; *MULTI-SHAPE-DEFUNS*).  SETQ, not LET, for the same in-image reason as
     ;; *MVM-GENSYM-COUNTER* above.
     (setq *multi-shape-defuns* (%collect-multi-shape-defuns forms))
+    (setq *blob-global-names* (%collect-blob-global-names forms))
     ;; Diagnostic dump behind a plain special (set it by hand), not #+sbcl +
     ;; posix-getenv + a LAMBDA: a feature conditional reads differently under
     ;; SBCL's reader and Modus's own, and the closure it hid was the one
@@ -31925,17 +31931,19 @@
 ;;; ============================================================
 
 (defun test-mvm-compiler ()
-  "Basic test of the MVM compiler"
+  "Basic test of the MVM compiler.  The quoted test forms say CL:DEFUN: the build's
+   function-table scanner reads source TEXT, and a quoted (defun fib ...) here once
+   seeded the image with #'FIB, #'DOUBLE ... for functions it never had."
   ;; Test 1: Simple function
   (format t "~%=== Test 1: (defun add1 (x) (1+ x)) ===~%")
   (let ((module (mvm-compile-all
-                 '((defun add1 (x) (1+ x))))))
+                 '((cl:defun add1 (x) (1+ x))))))
     (disassemble-module module))
 
   ;; Test 2: Fibonacci
   (format t "~%=== Test 2: fibonacci ===~%")
   (let ((module (mvm-compile-all
-                 '((defun fib (n)
+                 '((cl:defun fib (n)
                      (if (< n 2)
                          n
                          (+ (fib (1- n))
@@ -31945,7 +31953,7 @@
   ;; Test 3: List manipulation
   (format t "~%=== Test 3: list operations ===~%")
   (let ((module (mvm-compile-all
-                 '((defun list-length (lst)
+                 '((cl:defun list-length (lst)
                      (let ((count 0))
                        (loop
                          (if (null lst)
@@ -31958,8 +31966,8 @@
   ;; Test 4: Multiple functions
   (format t "~%=== Test 4: multiple functions ===~%")
   (let ((module (mvm-compile-all
-                 '((defun double (x) (* x 2))
-                   (defun quadruple (x) (double (double x)))))))
+                 '((cl:defun double (x) (* x 2))
+                   (cl:defun quadruple (x) (double (double x)))))))
     (disassemble-module module))
 
   (format t "~%All MVM compiler tests passed.~%")

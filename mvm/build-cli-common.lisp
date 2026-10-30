@@ -1396,6 +1396,41 @@
    those by the bare NAME, as before; a name written qualified in the source
    (MODUS::SHARE) keeps its qualified key.")
 
+;;; Which characters of TEXT are CODE: not inside a ; comment, a #|...|# block or a
+;;; string literal (#\X character literals are code and skipped as a pair).  The scanners
+;;; below search the TEXT, and a "(defun NAME" in a comment or a docstring is not a
+;;; definition -- harvesting one emitted #'NAME for a function the image never had (the
+;;; li-func "unresolved function" warnings: F, FIB, SQ, ADD3, MAKE-LEXER ...).
+(defun %code-mask (text)
+  (let* ((n (length text))
+         (mask (make-array n :element-type 'bit :initial-element 0))
+         (i 0))
+    (loop while (< i n) do
+      (let ((c (char text i)))
+        (cond
+          ((char= c #\;)
+           (loop while (and (< i n) (char/= (char text i) #\Newline)) do (incf i)))
+          ((and (char= c #\#) (< (1+ i) n) (char= (char text (1+ i)) #\|))
+           (let ((depth 1)) (incf i 2)
+             (loop while (and (< i n) (> depth 0)) do
+               (cond ((and (char= (char text i) #\|) (< (1+ i) n) (char= (char text (1+ i)) #\#))
+                      (decf depth) (incf i 2))
+                     ((and (char= (char text i) #\#) (< (1+ i) n) (char= (char text (1+ i)) #\|))
+                      (incf depth) (incf i 2))
+                     (t (incf i))))))
+          ((char= c #\")
+           (incf i)
+           (loop while (and (< i n) (char/= (char text i) #\")) do
+             (when (char= (char text i) #\\) (incf i))
+             (incf i))
+           (incf i))
+          ((and (char= c #\#) (< (1+ i) n) (char= (char text (1+ i)) #\\))
+           (setf (sbit mask i) 1) (incf i)
+           (when (< i n) (setf (sbit mask i) 1) (incf i))
+           (when (< i n) (setf (sbit mask i) 1) (incf i)))
+          (t (setf (sbit mask i) 1) (incf i)))))
+    mask))
+
 (defun scan-defuns (text)
   "Return list of defun names (strings) found in TEXT.  A defun read in a
    package other than MODUS.MVM comes back as \"PKG::NAME\", so the generated
@@ -1404,9 +1439,12 @@
   (let ((names nil)
         (pos 0)
         (pkgs (%scan-in-packages text))
-        (pkg "MODUS.MVM"))
+        (pkg "MODUS.MVM")
+        (code (%code-mask text)))
     (loop
-      (let ((p (search "(defun " text :start2 pos)))
+      (let ((p (loop (let ((q (search "(defun " text :start2 pos)))
+                       (when (or (null q) (= 1 (sbit code q))) (return q))
+                       (setq pos (1+ q))))))
         (unless p (return (nreverse names)))
         (loop while (and pkgs (< (car (first pkgs)) p))
               do (setq pkg (cdr (pop pkgs))))
@@ -2355,11 +2393,14 @@
    (builder packages, globals by package).  Textual, like SCAN-DEFUNS: a name
    inside a string literal is collected too, which only gives CL-USER's
    same-named variable its own cell as well."
-  (let ((names (make-hash-table :test (function equal))))
+  (let ((names (make-hash-table :test (function equal)))
+        (code (%code-mask text)))
     (dolist (head (list "(defvar " "(defparameter " "(defconstant "))
       (let ((pos 0))
         (loop
-          (let ((p (search head text :start2 pos)))
+          (let ((p (loop (let ((q (search head text :start2 pos)))
+                           (when (or (null q) (= 1 (sbit code q))) (return q))
+                           (setq pos (1+ q))))))
             (unless p (return))
             (let* ((start (+ p (length head)))
                    (end (or (position-if (lambda (c) (find c '(#\Space #\Newline #\Tab #\( #\))))
@@ -2368,11 +2409,7 @@
                    (name (string-upcase (subseq text start end))))
               (when (and (> (length name) 0)
                          (every (lambda (c) (or (alphanumericp c) (find c "+-*/<=>?!@$%^&_.~")))
-                                name)
-                         ;; not on a commented-out line
-                         (not (find #\; text :start (let ((nl (position #\Newline text :end p :from-end t)))
-                                                      (if nl (+ nl 1) 0))
-                                             :end p)))
+                                name))
                 (setf (gethash name names) t))
               (setq pos end))))))
     (sort (loop for k being the hash-keys of names collect k) (function string<))))

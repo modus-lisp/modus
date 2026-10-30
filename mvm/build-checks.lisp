@@ -183,21 +183,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
 ;;; SHRINK THIS TABLE.  It is a debt register, not a config knob.
 
 (defvar *global-check-baseline*
-  '(("build-aarch64-cli" :suppress-check-a :suppress-check-b
-     "#243 FINDING 1 (unfixed, filed): the shipping AArch64 CLI's KERNEL-MAIN
-      never calls (INIT-ALL-GLOBALS), while its x64 twin build-generic-cli
-      does.  85 defvars read back NIL there — including *SETF-EXPANDERS*,
-      *RANDOM-STATE*, INTERNAL-TIME-UNITS-PER-SECOND, the *%TRIG-* constants
-      and the whole MOST-POSITIVE-*-FLOAT family — and the two belt-and-braces
-      initialisers that exist for exactly this case, %INIT-BOOLE-CONSTANTS and
-      %INIT-STANDARD-CHARS, are not called either, so BOOLE-AND and friends are
-      NIL too (check B).  One root cause, one fix.  Exactly the #242 shape:
-      correct source, one build script that does not call the initialiser.
-      VERIFIED ON THE BINARY, not inferred: under qemu-aarch64-static the
-      shipping /home/claude/modus-aa64-cli signals UNBOUND-VARIABLE for
-      BOOLE-AND, INTERNAL-TIME-UNITS-PER-SECOND, DOUBLE-FLOAT-EPSILON,
-      MOST-POSITIVE-DOUBLE-FLOAT and *RANDOM-STATE*, where the x64 CLI built
-      from the same sources returns 6 / 1000 / 2.22d-16 / ... correctly."))
+  '()
   "Alist (build-script-basename . entries) of KNOWN, FILED, UNFIXED findings.")
 
 (defun %gck-baseline-entry (label)
@@ -467,7 +453,16 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
 ;;; *MCGC-COLLECTOR-ENABLED* / *MCGC-KIND-CHECK-ENABLED* are bug 5 of the list
 ;;; at the top of this file, still live.  Filed as #243 FINDING 3 and
 ;;; baselined below, so =force is honest too.
-(defvar *global-check-max-blob-chars* (* 8 1024 1024))
+(defvar *global-check-corpus-labels*
+  '("build-x64-linux" "build-x64" "build-aarch64-ansi" "build-aarch64-linux")
+  "The ANSI gate runners: their blob holds the test corpus, re-reading it costs
+   ~20 min, and the check is structurally quiet there, so it is skipped unless
+   MODUS_GLOBAL_CHECK=force.  BY NAME: the cut used to be a blob SIZE (8 MB),
+   and the shipping x64 CLI outgrew it (8.2 MB, 2026-10) -- so the check had
+   silently stopped running on the image it most mattered for.")
+
+(defun %gck-corpus-label-p (label)
+  (member label *global-check-corpus-labels* :test #'string=))
 
 (defun %gck-build-label ()
   "Basename of the build script SBCL was handed, e.g. \"build-generic-cli\".
@@ -505,14 +500,11 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
                 (length source-text) out)
         (finish-output)
         (sb-ext:exit :code 0)))
-    (when (and (not (eq mode :force))
-               (> (length source-text) *global-check-max-blob-chars*))
-      (format t "~&;; check-global-inits (~A): blob is ~,1F MB (> ~,1F MB) — SKIPPED. ~
-This is an ANSI gate runner with the test corpus baked in; re-reading it costs ~
-~~20 min for a check that is structurally quiet there.  MODUS_GLOBAL_CHECK=force ~
-runs it anyway.~%"
-              label (/ (length source-text) 1048576.0)
-              (/ *global-check-max-blob-chars* 1048576.0))
+    (when (and (not (eq mode :force)) (%gck-corpus-label-p label))
+      (format t "~&;; check-global-inits (~A): an ANSI gate runner (~,1F MB, the test ~
+corpus baked in) — SKIPPED; re-reading it costs ~~20 min for a check that is ~
+structurally quiet there.  MODUS_GLOBAL_CHECK=force runs it anyway.~%"
+              label (/ (length source-text) 1048576.0))
       (finish-output)
       (return-from check-global-inits nil))
     (let* ((forms (or pre-read
@@ -741,60 +733,16 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
 ;;; is filed as task #248 and is fixed the same way: add
 ;;; `(declare (special *X*))' to the LET body.
 (defvar *global-check-let-special-baseline*
-  '(("*SUPPRESS-LOOP-BLOCK-NIL*"
-     "#248 FINDING 2 (unfixed, filed) — mvm/compiler.lisp COMPILE-COMPOUND's
-      %NAMED-LOOP arm binds it so the inner simple-LOOP does not establish its
-      own (block nil …) (CLHS 6.1.2.2).  Lexical in-image ⇒ the self-hosted /
-      eval2 compiler gives a NAMED loop a spurious extra NIL block.")
-    ("*LET-SKIP-IMPLICIT-SPECIALS*"
-     "#248 FINDING 3 (unfixed, filed) — mvm/compiler.lisp
-      COMPILE-LET-WITH-SPECIALS' own recursion guard.  Its docstring says
-      `otherwise the dispatch re-detects the same names and recurses forever'.
-      Lexical in-image ⇒ the guard is INERT in every self-hosted compiler.
-      Ironic and self-referential: the LET-of-a-special machinery is itself a
-      victim of the LET-of-a-special hazard.")
-    ("*UWP-SEQ-COUNTER*"
-     "#248 FINDING 4 (unfixed, filed) — mvm/compiler.lisp MVM-COMPILE-ALL
-      resets it per compilation unit.  Lexical in-image ⇒ never reset, so the
-      counter runs monotonically across every eval2 compile in the image.
-      VERIFIED ON THE BINARY: in the shipping x64 CLI, two successive
-      `(defun f (x) (unwind-protect (+ x 1) nil))' forms leave
-      *UWP-SEQ-COUNTER* reading 2 then 3, where MVM-COMPILE-ALL's
-      `(let ((*uwp-seq-counter* 0)) …)' should have reset it to 0 each time.")
-    ("*INIT-THUNK-NAMES*"
-     "#248 FINDING 5 (unfixed, filed) — mvm/cl-eval.lisp
-      %MVM-EVAL-COMPILE-TUPLE and MVM-EVAL-FORMS both bind it around a compile.
-      Lexical in-image ⇒ the eval2 path accumulates init-thunk names globally
-      instead of per-unit.")
-    ("*AARCH64-TRANSLATED-START-IDX*"
-     "#248 FINDING 6 (unfixed, filed) — mvm/translate-aarch64.lisp
-      TRANSLATE-MVM-TO-AARCH64 let*-binds it, and its own docstring says
-      `Expose to trap-time code (e.g. fn-addr patch site recorder) via dynamic
-      variable'.  Lexical in-image ⇒ the seven `(or *aarch64-translated-start-
-      idx* 0)' readers all see 0, so a self-hosted AArch64 build appending into
-      a pre-filled boot buffer computes native offsets against the wrong base.
-      Present in build-aarch64-cli / -linux / -ssh etc., absent from x64.")
-    ;; ---- FINDING 7: one cluster, mvm/cross.lisp, build-modus-selfhost only.
-    ;; ASSEMBLE-KERNEL-IMAGE binds seven translator hand-off variables in one
-    ;; LET and BUILD-IMAGE binds *AARCH64-SERIAL-BASE*; every consumer is in
-    ;; translate-aarch64.lisp, i.e. a DIFFERENT function reading the GLOBAL.
-    ;; Lexical in-image ⇒ MODUS BUILDING AN IMAGE FROM INSIDE MODUS (the WS5
-    ;; self-host path, and only that path — the host SBCL build is fine
-    ;; because SBCL honours the DEFVARs) hands the AArch64 translator NIL for
-    ;; the GC trampoline label, the handler push/pop labels, the generic
-    ;; arithmetic bytecode offsets and the UART base.
-    ("*AARCH64-GENSUB-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GENMUL-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GENADD-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GC-COLLECT-BYTECODE-OFFSET*" "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GC-TRAMPOLINE-LABEL*"      "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-HANDLER-POP-LABEL*"        "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-HANDLER-PUSH-LABEL*"       "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-SERIAL-BASE*"
-     "#248 FINDING 7 (unfixed, filed) — cross.lisp BUILD-IMAGE's
-      `(let ((*aarch64-serial-base* (or *aarch64-serial-base* serial-base
-      #x09000000))) …)'.  The whole point of that LET is that the translator,
-      a different function, reads the global; lexical in-image it reads NIL."))
+  ;; Emptied 2026-10-30: every #248 finding had `(declare (special *X*))' added
+  ;; at its LET (compiler.lisp *LET-SKIP-IMPLICIT-SPECIALS*, *UWP-SEQ-COUNTER*; mvm-eval.lisp *INIT-THUNK-NAMES*; cross.lisp's
+  ;; translator hand-off cluster and *AARCH64-SERIAL-BASE*), FINDING 2's
+  ;; *SUPPRESS-LOOP-BLOCK-NIL* was REMOVED (the (%LOOP-NONIL) marker had
+  ;; replaced it; made dynamic it leaked into nested LOOPs), and FINDING 6
+  ;; (*AARCH64-TRANSLATED-START-IDX*) had already become a SETQ.  The root cause
+  ;; is still there: the MVM compiler does not treat a name DEFVAR'd in the blob
+  ;; as special, so a new LET of one is lexical again -- which this check
+  ;; catches, now with nothing to hide it behind.
+  '()
   "Alist (NAME . reason) of KNOWN, FILED, UNFIXED check-C findings.  Still
    PRINTED every build; they just do not fail it.")
 
@@ -1021,10 +969,26 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
    whether it is acceptable.")
 
 (defvar *global-check-warn-baseline*
+  ;; build-generic-cli, re-measured 2026-10-30 after the cleanup that took it from
+  ;; 81 / 31 / 55: forward references to a global the blob defines later are no
+  ;; longer reported (*BLOB-GLOBAL-NAMES*), the function-table scanner no longer
+  ;; harvests DEFUNs out of comments and strings (%CODE-MASK), and a docstring's
+  ;; unescaped "OPTIMISE" stopped being a variable read.  What remains, by name:
+  ;;   :implicit-global 12 -- the aarch64 translator's specials, which the shared
+  ;;     JIT code mentions in the x64 image too (*A64-PCREL* *A64-TLS-TSD-OFFSET*
+  ;;     *A64-TLS-WINDOW* *AARCH64-CALL-RELOC-NARGS* *AARCH64-CALL-RELOCS*
+  ;;     *AARCH64-FN-ADDR-LOCAL-RELOCS* *AARCH64-FN-ADDR-RELOCS*
+  ;;     *AARCH64-JIT-ADRP-FIXUPS* *AARCH64-LI-CONST-PATCHES*), the host's
+  ;;     *FN-PREPACK-REQ*, and PI / LAMBDA-LIST-KEYWORDS (set at init, per target).
+  ;;   :implicit-global-setq 8 -- *A64-JIT-PAGE-REJECT* *AARCH64-FN-ALIGN-OFFSET*
+  ;;     *AARCH64-JIT-MODE* *LINUX-X64-R14-OFFSET* (build-host variables the driver
+  ;;     text sets too) and ARRAY-DIMENSION-LIMIT ARRAY-RANK-LIMIT
+  ;;     ARRAY-TOTAL-SIZE-LIMIT CHAR-CODE-LIMIT (per-target values, set at init).
+  ;;   :unresolved-function 0.
   '(("build-generic-cli"
-     (:implicit-global . 41)
-     (:implicit-global-setq . 123)
-     (:unresolved-function . 40)))
+     (:implicit-global . 12)
+     (:implicit-global-setq . 8)
+     (:unresolved-function . 0)))
   "Per-build-script (LABEL . ((SHAPE . COUNT) …)).
 
    A FATAL shape (today only :CANNOT-COMPILE) ratchets at its baseline — 0 when
@@ -1404,7 +1368,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   (let ((mode (%gck-mode)))
     (when (eq mode :off) (return-from %gck-pre-checks nil))
     ;; E is tree-wide and blob-independent, so it runs first and unconditionally
-    ;; (the size cap below is about re-reading a 17 MB blob, not about E).
+    ;; (the corpus-runner skip below is about re-reading a 17 MB blob, not E).
     (%gck-guard "check-source-parses" (check-source-parses))
     ;; F is tree-wide too, and costs one 1 MB file read once per process.
     (%gck-guard "check-no-host-gensym" (check-no-host-gensym))
@@ -1412,7 +1376,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     ;; and only pre-read when it would not have skipped anyway.
     (if (or (eq mode :dump)
             (and (not (eq mode :force))
-                 (> (length src) *global-check-max-blob-chars*)))
+                 (%gck-corpus-label-p (%gck-build-label))))
         (%gck-guard "check-global-inits" (check-global-inits src))
         (let ((fl (handler-case (read-all-forms-with-locations src)
                     (error (e)

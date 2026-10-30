@@ -1294,6 +1294,19 @@
 
 (defvar *fasl-taint* nil)
 
+(defvar *%macroexpand-env* nil
+  "The environment the macro expander running now was called in; NIL is
+   global.  See %MACRO-ENV-READ.")
+
+(defvar *%mexp-env-read* nil
+  "Set when an expansion running now has read its environment
+   (%MACRO-ENV-READ).  The same form can then expand differently in two
+   places -- the escape and closure walkers pre-expand a body under the
+   enclosing env -- so MACROEXPAND-1-MVM does not memoise it.")
+
+(defvar *%mxa-local-fns* nil
+  "Names an enclosing FLET / LABELS binds in the walk: calls, not macros.")
+
 (defvar *%mexp-impure* nil
   "Set when this compile expanded a runtime macro whose expander closes over
    a lexical environment: its expansion can depend on state that changes, so
@@ -3777,11 +3790,17 @@
              (e (gethash k memo)))
         (if (and e (eq (car e) form))
             (values (cdr e) t)
-            (multiple-value-bind (x p) (%macroexpand-1-mvm-raw form)
+            (let ((outer-read *%mexp-env-read*) (read nil) (x nil) (p nil))
+              (setq *%mexp-env-read* nil)
+              (multiple-value-setq (x p) (%macroexpand-1-mvm-raw form))
+              (setq read *%mexp-env-read*)
+              (setq *%mexp-env-read* (or outer-read read))
               ;; The in-image return path drops the raw function's second
               ;; value (callers compare with EQ anyway), so key the memo on
-              ;; "expansion is a different object" rather than on P.
-              (unless (eq x form) (setf (gethash k memo) (cons form x)))
+              ;; "expansion is a different object" rather than on P.  An
+              ;; expansion that read its environment is not memoised: the
+              ;; same form can be expanded under another env (*%MEXP-ENV-READ*).
+              (unless (or read (eq x form)) (setf (gethash k memo) (cons form x)))
               (values x p))))))
 (defun %macroexpand-1-mvm-raw (form)
   "Expand one level of macro in FORM, using the MVM macro table.
@@ -3997,6 +4016,339 @@
       (setq e (compile-env-parent e)))
     (nreverse out)))
 
+;;; ------------------------------------------------------------------
+;;; The macro environment (image only).
+;;;
+;;; An expander's &ENVIRONMENT parameter used to be bound to NIL everywhere
+;;; (DIVERGENCE.md: "Macro &environment -- not parsed"), so no macro could
+;;; ask what a name means where it is used: lexical variable, SYMBOL-MACROLET
+;;; binding, or special.  The compiler knows -- it is COMPILE-ENV -- and now
+;;; says so: COMPILE-FORM binds *%MACROEXPAND-ENV* to the env it compiles in
+;;; while it expands, MACROEXPAND-1 / MACROEXPAND bind it to the env they are
+;;; given, and every &ENVIRONMENT parameter is bound to it (%MACRO-ENV-READ).
+;;; An environment is NIL (global), a COMPILE-ENV, or the older
+;;; (:%SYMBOL-MACRO-ENV (name expansion) ...) a MACROLET expander gets.
+;;; The host build never binds it: SBCL's MACROEXPAND would not take one.
+;;; ------------------------------------------------------------------
+
+(defun %macro-env-read ()
+  "The value of an &ENVIRONMENT parameter: *%MACROEXPAND-ENV*, noting that
+   the expansion depends on it."
+  (setq *%mexp-env-read* t)
+  (setq *%mexp-impure* t)
+  *%macroexpand-env*)
+
+(defun %macro-env-symbol-macro (sym env)
+  "(SYM EXPANSION) when SYM names a symbol macro in ENV that no inner binding
+   of SYM as a variable shadows, else NIL."
+  (cond
+    ((null env) nil)
+    ((consp env)
+     (and (eq (car env) :%symbol-macro-env)
+          (assoc sym (cdr env))))
+    (t
+     (let ((b (env-lookup env sym)))
+       (and b (eq (binding-location b) :symbol-macro)
+            (list sym (binding-expansion b)))))))
+
+(defun %global-symbol-macro (sym)
+  "(SYM EXPANSION) when SYM is a DEFINE-SYMBOL-MACRO, else NIL."
+  (let ((e (%gsm-pkg-get sym (normalize-name sym))))
+    (cond (e (list sym (car e)))
+          ((and *global-symbol-macros*
+                (nth-value 1 (gethash (normalize-name sym) *global-symbol-macros*)))
+           (list sym (gethash (normalize-name sym) *global-symbol-macros*))))))
+
+(defun %variable-information (sym &optional env)
+  "What SYM names as a variable in ENV -- SB-CLTL2 VARIABLE-INFORMATION's
+   first value: :LEXICAL, :SYMBOL-MACRO, :SPECIAL, :CONSTANT or NIL.  A
+   special is what the LET and lambda-list compilers treat as one
+   (%RUNTIME-SPECIAL-P and the CLHS list), so the answer is what modus does
+   with the name."
+  (let ((b (and env (not (consp env)) (symbolp sym) (env-lookup env sym))))
+    (cond
+      (b (if (eq (binding-location b) :symbol-macro) :symbol-macro :lexical))
+      ((not (and (symbolp sym) sym)) (if (null sym) :constant nil))
+      ((%macro-env-symbol-macro sym env) :symbol-macro)
+      ((or (keywordp sym) (eq sym t) (constantp sym)) :constant)
+      ((%global-symbol-macro sym) :symbol-macro)
+      ((or (%runtime-special-p sym)
+           (gethash (normalize-name sym) (%ensure-clhs-specials-table)))
+       :special)
+      (t nil))))
+
+;;; MACROEXPAND-ALL: FORM with every macro call in it expanded, in ENV, the
+;;; walk extending ENV as it passes LET, LAMBDA, SYMBOL-MACROLET and the rest,
+;;; so an expander deep inside sees the bindings around it.  CL's operators are
+;;; walked by their shape -- only the CL symbol itself, a package's own LET is
+;;; whatever that package made it.  So are the CL macros the compiler
+;;; implements with no runtime expander (HANDLER-CASE, MULTIPLE-VALUE-BIND, the
+;;; WITH- family ...).  LOOP, DEFSTRUCT, FORMATTER, STEP, DEFMACRO and MACROLET
+;;; come back as they are, unexpanded: their insides are not forms in any way a
+;;; walker can know without their own parser.  Lambda-list default forms are
+;;; not walked.
+
+(defun %mxa-cl-op (op)
+  "OP's name when OP is the COMMON-LISP symbol, else NIL."
+  (and (symbolp op) op
+       (multiple-value-bind (s st) (find-symbol (symbol-name op) "COMMON-LISP")
+         (and st (eq s op) (symbol-name op)))))
+
+(defun %mxa-env (env)
+  "ENV as a COMPILE-ENV a walk can extend."
+  (if (consp env)
+      (make-compile-env
+       :bindings (let ((bs nil))
+                   (dolist (e (cdr env) (nreverse bs))
+                     (push (make-binding :name (car e) :location :symbol-macro
+                                         :expansion (cadr e))
+                           bs))))
+      env))
+
+(defun %mxa-body-specials (body)
+  "Names BODY's leading declarations declare SPECIAL."
+  (let ((out nil))
+    (dolist (f body out)
+      (cond ((stringp f))
+            ((and (consp f) (%mxa-cl-op (car f)) (string= (symbol-name (car f)) "DECLARE"))
+             (dolist (d (cdr f))
+               (when (and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "SPECIAL"))
+                 (dolist (v (cdr d)) (push v out)))))
+            (t (return out))))))
+
+(defun %mxa-extend (env vars body)
+  "ENV with VARS bound as lexical variables -- except those that are special,
+   globally or by BODY's declarations, which bind dynamically."
+  (let ((specials (%mxa-body-specials body))
+        (bs nil))
+    (dolist (v vars)
+      (when (and (symbolp v) v
+                 (not (member v specials))
+                 (not (eq (%variable-information v nil) :special)))
+        (push (make-binding :name v :location :reg :reg 0) bs)))
+    (if bs
+        (make-compile-env :bindings bs :parent (%mxa-env env))
+        env)))
+
+(defun %mxa-symbol-macros (env bindings)
+  "ENV with BINDINGS, ((name expansion) ...), as symbol macros."
+  (let ((bs nil))
+    (dolist (b bindings)
+      (when (consp b)
+        (push (make-binding :name (car b) :location :symbol-macro :expansion (cadr b)) bs)))
+    (make-compile-env :bindings bs :parent (%mxa-env env))))
+
+(defun %mxa-lambda-vars (ll)
+  "The variables an ordinary lambda list LL binds."
+  (let ((out nil))
+    (loop while (consp ll) do
+      (let ((p (car ll)))
+        (cond ((and (symbolp p) p
+                    (let ((n (symbol-name p))) (and (> (length n) 0) (char= (char n 0) #\&)))))
+              ((symbolp p) (when p (push p out)))
+              ((consp p)
+               (let ((v (car p)))
+                 (cond ((symbolp v) (push v out))
+                       ((and (consp v) (consp (cdr v))) (push (cadr v) out))))
+               (when (and (consp (cdr p)) (consp (cddr p)) (symbolp (caddr p)))
+                 (push (caddr p) out)))))
+      (setq ll (cdr ll)))
+    (when (and ll (symbolp ll)) (push ll out))
+    (nreverse out)))
+
+(defun %mxa-forms (forms env)
+  "Each form of FORMS walked; a dotted tail is kept."
+  (let ((out nil) (cur forms))
+    (loop while (consp cur) do
+      (push (%mxa (car cur) env) out)
+      (setq cur (cdr cur)))
+    (let ((r (nreverse out)))
+      (cond ((null cur) r)
+            ((null r) cur)
+            (t (setf (cdr (last r)) cur) r)))))
+
+(defun %mxa-body (body env)
+  "A body walked: doc strings and declarations kept as they are."
+  (let ((out nil) (cur body))
+    (loop while (and (consp cur)
+                     (or (and (stringp (car cur)) (consp (cdr cur)))
+                         (and (consp (car cur)) (%mxa-cl-op (caar cur))
+                              (string= (symbol-name (caar cur)) "DECLARE"))))
+          do (push (car cur) out) (setq cur (cdr cur)))
+    (append (nreverse out) (%mxa-forms cur env))))
+
+(defun %mxa-lambda (ll body env)
+  "(LL . BODY) with BODY walked in ENV extended by LL's variables."
+  (cons ll (%mxa-body body (%mxa-extend env (%mxa-lambda-vars ll) body))))
+
+(defun %mxa-let (form env sequential)
+  "LET / LET* / PROG / PROG*: init forms in the env they see, body in the rest."
+  (let ((benv env) (bs nil) (vars nil))
+    (dolist (b (cadr form))
+      (let ((v (if (consp b) (car b) b)))
+        (push (if (and (consp b) (consp (cdr b)))
+                  (list* v (%mxa (cadr b) (if sequential benv env)) (cddr b))
+                  b)
+              bs)
+        (push v vars)
+        (when sequential (setq benv (%mxa-extend benv (list v) (cddr form))))))
+    (list* (car form) (nreverse bs)
+           (%mxa-body (cddr form) (if sequential benv (%mxa-extend env vars (cddr form)))))))
+
+(defun %mxa-tagbody (stmts env)
+  (mapcar (lambda (s) (if (consp s) (%mxa s env) s)) stmts))
+
+(defun %mxa-var-binder (form env)
+  "(OP (VAR . ARGS) . BODY) -- WITH-OPEN-FILE and its kin."
+  (let ((spec (cadr form)))
+    (if (consp spec)
+        (list* (car form)
+               (cons (car spec) (%mxa-forms (cdr spec) env))
+               (%mxa-body (cddr form) (%mxa-extend env (list (car spec)) (cddr form))))
+        form)))
+
+(defun %mxa-cl (name form env)
+  "FORM headed by the CL operator NAME, walked by its shape; :MACRO when NAME
+   is an ordinary macro to expand instead."
+  (cond
+    ((member name '("QUOTE" "GO" "DECLARE" "LOOP" "DEFSTRUCT" "FORMATTER" "STEP"
+                    "DEFMACRO" "MACROLET" "LOAD-TIME-VALUE") :test #'string=)
+     form)
+    ((string= name "FUNCTION")
+     (let ((f (cadr form)))
+       (if (and (consp f) (%mxa-cl-op (car f)) (string= (symbol-name (car f)) "LAMBDA"))
+           (list (car form) (cons (car f) (%mxa-lambda (cadr f) (cddr f) env)))
+           form)))
+    ((string= name "LAMBDA") (cons (car form) (%mxa-lambda (cadr form) (cddr form) env)))
+    ((member name '("BLOCK" "RETURN-FROM" "THE" "EVAL-WHEN") :test #'string=)
+     (list* (car form) (cadr form) (%mxa-forms (cddr form) env)))
+    ((string= name "LOCALLY") (cons (car form) (%mxa-body (cdr form) env)))
+    ((string= name "TAGBODY") (cons (car form) (%mxa-tagbody (cdr form) env)))
+    ((string= name "SETQ")
+     (let ((pairs (cdr form)) (sm nil))
+       (loop while (consp pairs) do
+         (when (eq (%variable-information (car pairs) env) :symbol-macro) (setq sm t))
+         (setq pairs (cddr pairs)))
+       ;; SETQ of a symbol macro is SETF of its expansion (CLHS SETQ).  The
+       ;; expansion is substituted here: SETF of the symbol would only come
+       ;; back as this SETQ, its expander not knowing the walk's env.
+       (if sm
+           (let ((out nil) (p (cdr form)))
+             (loop while (consp p) do
+               (let ((e (and (symbolp (car p)) (%macro-env-symbol-macro (car p) env))))
+                 (push (if e
+                           (list 'setf (cadr e) (cadr p))
+                           (list (car form) (car p) (cadr p)))
+                       out))
+               (setq p (cddr p)))
+             (%mxa (if (cdr out) (cons 'progn (nreverse out)) (car out)) env))
+           (let ((out nil) (p (cdr form)))
+             (loop while (consp p) do
+               (push (car p) out)
+               (push (%mxa (cadr p) env) out)
+               (setq p (cddr p)))
+             (cons (car form) (nreverse out))))))
+    ((string= name "LET") (%mxa-let form env nil))
+    ((string= name "LET*") (%mxa-let form env t))
+    ((string= name "PROG")
+     (let ((w (%mxa-let (list* 'let (cadr form) nil) env nil)))
+       (list* (car form) (cadr w)
+              (%mxa-tagbody (cddr form) (%mxa-extend env (%mxa-lambda-vars (mapcar (lambda (b) (if (consp b) (car b) b)) (cadr form))) nil)))))
+    ((string= name "PROG*")
+     (let ((w (%mxa-let (list* 'let* (cadr form) nil) env t)))
+       (list* (car form) (cadr w)
+              (%mxa-tagbody (cddr form) (%mxa-extend env (%mxa-lambda-vars (mapcar (lambda (b) (if (consp b) (car b) b)) (cadr form))) nil)))))
+    ((or (string= name "FLET") (string= name "LABELS"))
+     (let* ((names (mapcar (lambda (d) (if (consp d) (car d) d)) (cadr form)))
+            (defs (let ((*%mxa-local-fns* (if (string= name "LABELS")
+                                               (append names *%mxa-local-fns*)
+                                               *%mxa-local-fns*)))
+                    (declare (special *%mxa-local-fns*))
+                    (mapcar (lambda (d)
+                              (if (consp d)
+                                  (cons (car d) (%mxa-lambda (cadr d) (cddr d) env))
+                                  d))
+                            (cadr form)))))
+       (let ((*%mxa-local-fns* (append names *%mxa-local-fns*)))
+         (declare (special *%mxa-local-fns*))
+         (list* (car form) defs (%mxa-body (cddr form) env)))))
+    ((string= name "SYMBOL-MACROLET")
+     (list* (car form) (cadr form)
+            (%mxa-body (cddr form) (%mxa-symbol-macros env (cadr form)))))
+    ((string= name "MULTIPLE-VALUE-BIND")
+     (list* (car form) (cadr form) (%mxa (caddr form) env)
+            (%mxa-body (cdddr form) (%mxa-extend env (cadr form) (cdddr form)))))
+    ((string= name "DEFUN")
+     (list* (car form) (cadr form) (%mxa-lambda (caddr form) (cdddr form) env)))
+    ((string= name "DEFVAR")
+     (if (consp (cddr form))
+         (list* (car form) (cadr form) (%mxa (caddr form) env) (cdddr form))
+         form))
+    ((string= name "HANDLER-BIND")
+     (list* (car form)
+            (mapcar (lambda (b) (if (consp b) (list* (car b) (%mxa-forms (cdr b) env)) b))
+                    (cadr form))
+            (%mxa-body (cddr form) env)))
+    ((or (string= name "HANDLER-CASE") (string= name "RESTART-CASE"))
+     (list* (car form) (%mxa (cadr form) env)
+            (mapcar (lambda (c)
+                      (if (and (consp c) (consp (cdr c)) (listp (cadr c)))
+                          (let ((rest (cddr c)) (opts nil))
+                            (when (string= name "RESTART-CASE")
+                              (loop while (and (consp rest) (keywordp (car rest)) (consp (cdr rest)))
+                                    do (push (car rest) opts) (push (cadr rest) opts)
+                                       (setq rest (cddr rest))))
+                            (list* (car c) (cadr c)
+                                   (append (nreverse opts)
+                                           (%mxa-body rest (%mxa-extend env (%mxa-lambda-vars (cadr c)) rest)))))
+                          c))
+                    (cddr form))))
+    ((string= name "WITH-SIMPLE-RESTART")
+     (list* (car form)
+            (if (consp (cadr form)) (cons (car (cadr form)) (%mxa-forms (cdr (cadr form)) env)) (cadr form))
+            (%mxa-body (cddr form) env)))
+    ((member name '("WITH-INPUT-FROM-STRING" "WITH-OPEN-FILE" "WITH-OPEN-STREAM"
+                    "WITH-OUTPUT-TO-STRING") :test #'string=)
+     (%mxa-var-binder form env))
+    ((member name '("IF" "PROGN" "PROGV" "UNWIND-PROTECT" "MULTIPLE-VALUE-CALL"
+                    "MULTIPLE-VALUE-PROG1" "MULTIPLE-VALUE-LIST" "CATCH" "THROW")
+             :test #'string=)
+     (cons (car form) (%mxa-forms (cdr form) env)))
+    (t :macro)))
+
+(defun %mxa (form env)
+  (cond
+    ((and (symbolp form) form)
+     (let ((sm (or (%macro-env-symbol-macro form env)
+                   (and (not (eq (%variable-information form env) :lexical))
+                        (%global-symbol-macro form)))))
+       (if sm (%mxa (cadr sm) env) form)))
+    ((atom form) form)
+    (t
+     (let ((op (car form)))
+       (cond
+         ((consp op)
+          (if (and (%mxa-cl-op (car op)) (string= (symbol-name (car op)) "LAMBDA"))
+              (cons (cons (car op) (%mxa-lambda (cadr op) (cddr op) env))
+                    (%mxa-forms (cdr form) env))
+              form))
+         ((not (symbolp op)) form)
+         ((member op *%mxa-local-fns*) (cons op (%mxa-forms (cdr form) env)))
+         (t
+          (let ((w (let ((name (%mxa-cl-op op))) (if name (%mxa-cl name form env) :macro))))
+            (if (not (eq w :macro))
+                w
+                (multiple-value-bind (x p) (macroexpand-1 form env)
+                  (if (and p (not (eq x form)))
+                      (%mxa x env)
+                      (cons op (%mxa-forms (cdr form) env))))))))))))
+
+(defun %macroexpand-all (form &optional env)
+  "FORM with every macro call in it expanded, in ENV (SB-CLTL2 MACROEXPAND-ALL)."
+  (let ((*%mxa-local-fns* nil))
+    (declare (special *%mxa-local-fns*))
+    (%mxa form env)))
+
 (defun %split-body-decls (body)
   "Split BODY into (values leading-declarations-and-docstring rest)."
   (let ((head nil))
@@ -4061,11 +4413,16 @@
                       ;; SYMBOL-MACROLET bindings, so MACROEXPAND with it
                       ;; expands them (MACROLET.13/14).  The host build keeps
                       ;; NIL: SBCL's MACROEXPAND would not take this object.
+                      ;; Now the env the expander is called in (%MACRO-ENV-READ),
+                      ;; falling back to those bindings when it is called with none.
                       (when env-var
                         (list (list env-var
-                                    (if (and sym-macros *mvm-eval-runtime-p*)
-                                        (list 'quote (cons :%symbol-macro-env sym-macros))
-                                        nil))))))
+                                    (cond
+                                      ((not *mvm-eval-runtime-p*) nil)
+                                      (sym-macros
+                                       (list 'or '(%macro-env-read)
+                                             (list 'quote (cons :%symbol-macro-env sym-macros))))
+                                      (t '(%macro-env-read))))))))
            (db-form `(destructuring-bind (,@rest-params) (cdr form)
                        ,@mbody)))
       ;; &WHOLE destructuring pattern: bind the pattern against the whole
@@ -7411,7 +7768,12 @@
                                   #.(compute-name-hash "SHIFTF")))
                         (%symbol-macro-places-rewrite form env))
                    form))
-         (form (macroexpand-mvm form)))
+         ;; Expanders see ENV (*%MACROEXPAND-ENV*, image only).
+         (form (if (and *mvm-eval-runtime-p* (consp form))
+                   (let ((*%macroexpand-env* env))
+                     (declare (special *%macroexpand-env*))
+                     (macroexpand-mvm form))
+                   (macroexpand-mvm form))))
    (%cf-trace-note form)
    (when %stmt-unused (%fp-diag-bump 3))
    (let ((*unused-value-form* (if %stmt-unused form *unused-value-form*)))
@@ -8408,7 +8770,7 @@
                   (%eval-expander-runtime
                    `(lambda (form)
                       (let* (,@(when whole-var `((,whole-var form)))
-                             ,@(when env-var `((,env-var nil))))
+                             ,@(when env-var `((,env-var ,(and *mvm-eval-runtime-p* '(%macro-env-read))))))
                         (declare (ignorable ,@(when whole-var (list whole-var))
                                             ,@(when env-var (list env-var))))
                         (destructuring-bind (,@d-params) (cdr form)
@@ -8461,7 +8823,7 @@
                                    (function
                                     (lambda (mform)
                                       (let* (,@(when whole-var `((,whole-var mform)))
-                                             ,@(when env-var `((,env-var nil))))
+                                             ,@(when env-var `((,env-var ,(and *mvm-eval-runtime-p* '(%macro-env-read))))))
                                         (destructuring-bind (,@d-params) (cdr mform)
                                           ,@body)))))
                ',name)
@@ -14741,7 +15103,8 @@
                                          (list (list whole-var args-var))
                                          nil)
                                      (if env-var
-                                         (list (list env-var nil))
+                                         (list (list env-var (and *mvm-eval-runtime-p*
+                                                                  '(%macro-env-read))))
                                          nil))
                                     inner)))))
           (cons (list '&rest args-var) inner))))))

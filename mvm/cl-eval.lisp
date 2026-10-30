@@ -1056,13 +1056,24 @@
    (form nil).
 
    CLHS §macroexpand-1: `(macroexpand-1 form &optional env)`.  Calls
-   with 3+ args must signal program-error (macroexpand-1.error.2)."
+   with 3+ args must signal program-error (macroexpand-1.error.2).
+
+   ENV, when given, is what the expander's &ENVIRONMENT parameter receives
+   (*%MACROEXPAND-ENV*, see %MACRO-ENV-READ in compiler.lisp)."
   (when (and env-arg (cdr env-arg))
     (%signal-program-error))
+  (if env-arg
+      (let ((*%macroexpand-env* (car env-arg)))
+        (declare (special *%macroexpand-env*))
+        (%macroexpand-1-in form (car env-arg)))
+      (%macroexpand-1-in form nil)))
+
+(defun %macroexpand-1-in (form env)
+  "MACROEXPAND-1 of FORM in ENV, *%MACROEXPAND-ENV* already bound."
   (cond
-    ;; A symbol macro of the environment a MACROLET expander was handed.
-    ((and (symbolp form) form (%symbol-macro-env-lookup form (car env-arg)))
-     (values (cadr (%symbol-macro-env-lookup form (car env-arg))) t))
+    ;; A symbol macro of ENV.
+    ((and (symbolp form) form (%symbol-macro-env-lookup form env))
+     (values (cadr (%symbol-macro-env-lookup form env)) t))
     ;; Recognise CL syms AND native MVM #x50 syms as macro heads.
     ((and (consp form)
           (or (%cl-sym-p (car form))
@@ -1114,6 +1125,14 @@
    3+ args must signal program-error (macroexpand.error.2)."
   (when (and env-arg (cdr env-arg))
     (%signal-program-error))
+  (if env-arg
+      (let ((*%macroexpand-env* (car env-arg)))
+        (declare (special *%macroexpand-env*))
+        (%macroexpand-in form env-arg))
+      (%macroexpand-in form nil)))
+
+(defun %macroexpand-in (form env-arg)
+  "MACROEXPAND of FORM; ENV-ARG is MACROEXPAND's optional-argument list."
   (let ((any nil))
     (let ((cur form))
       (loop
@@ -1133,13 +1152,18 @@
               (return (values cur any)))))))))
 
 (defun %symbol-macro-env-lookup (sym env)
-  "The (NAME EXPANSION) entry for SYM in ENV when ENV is the environment a
-   MACROLET expander received inside SYMBOL-MACROLET, else NIL."
-  (and (consp env) (eq (car env) :%symbol-macro-env)
-       (let ((hit nil))
-         (dolist (b (cdr env) hit)
-           (when (and (null hit) (consp b) (eq (car b) sym))
-             (setq hit b))))))
+  "The (NAME EXPANSION) entry for SYM in ENV: the environment a MACROLET
+   expander received inside SYMBOL-MACROLET, or a compiler COMPILE-ENV
+   (%MACRO-ENV-SYMBOL-MACRO), else NIL."
+  (cond
+    ((null env) nil)
+    ((consp env)
+     (and (eq (car env) :%symbol-macro-env)
+          (let ((hit nil))
+            (dolist (b (cdr env) hit)
+              (when (and (null hit) (consp b) (eq (car b) sym))
+                (setq hit b))))))
+    (t (funcall '%macro-env-symbol-macro sym env))))
 
 ;;; ============================================================
 ;;; Eval global variable table

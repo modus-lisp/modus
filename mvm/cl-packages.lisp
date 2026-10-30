@@ -518,6 +518,11 @@
   "Install everything still deferred.  NIL here; see %DEFERRED-PACKAGE-HOOK."
   nil)
 
+(declaim (overridable %deferred-pending-p))
+(defun %deferred-pending-p ()
+  "Is any surface still deferred?  NIL here; see %DEFERRED-PACKAGE-HOOK."
+  nil)
+
 (defun list-all-packages ()
   ;; A deferred surface's packages are part of the image's package set; they
   ;; just have not been built yet.  LIST-ALL-PACKAGES must not be the one

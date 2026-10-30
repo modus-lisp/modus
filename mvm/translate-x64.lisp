@@ -401,10 +401,8 @@
    without the barrier would hide its stores from the card scan).  Default
    NIL, so every other build emits exactly what it did.")
 
-(defun x64-gen-gc-p ()
-  "Generational GC is emitted: hosted Linux, the collector on, BOTH bitmaps
-   (the old-space walks parse objects with them), and the flag."
-  (and *x64-gen-gc* *x64-linux-mode* *x64-gc-enabled* (mcgc-kind-bitmap-on-p) t))
+;;; X64-GEN-GC-P is defined after *X64-GC-ENABLED* (Full Bytecode Translation):
+;;; read before its DEFVAR, the image compiler takes that global as implicit.
 
 (defconstant +x64-gen-cards-addr+    #x10000CE0)
 (defconstant +x64-gen-area-addr+     #x10000CE8)
@@ -6641,6 +6639,11 @@
 (defvar *x64-gc-enabled* nil
   "When non-nil, emit GC trampoline and wire gc-check to call it.
    Set by Linux x64 builds that include gc.lisp.")
+
+(defun x64-gen-gc-p ()
+  "Generational GC is emitted: hosted Linux, the collector on, BOTH bitmaps
+   (the old-space walks parse objects with them), and the flag."
+  (and *x64-gen-gc* *x64-linux-mode* *x64-gc-enabled* (mcgc-kind-bitmap-on-p) t))
 
 (defvar *x64-gc-debug* nil
   "When non-nil, the native GC trampoline writes diagnostic bytes to fd 1

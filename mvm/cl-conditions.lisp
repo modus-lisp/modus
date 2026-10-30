@@ -2978,6 +2978,8 @@
                        "RUN-NET-PIPELINE" "HTTP-FETCH"
                        "PMU-START" "PMU-STOP" "PMU-READ" "PMU-MEASURE" "PMU-PROFILE"
                        "PMU-ANNOTATE"
+                       ;; the generational collector (docs/generational-gc.md), as SB-EXT:GC
+                       "GC-TENURE" "GC-UNTENURE" "GC-MAJOR" "GC-GEN-RESERVE" "GC-GEN-REPORT"
                        ;; the JIT's documented settings (as SB-EXT:*EVALUATOR-MODE*)
                        "*JIT-ON*" "*JIT-HOT-ONLY*" "*JIT-HOT-CALLS*")))
       (let ((sym (intern n int)))

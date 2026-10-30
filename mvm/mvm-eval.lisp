@@ -2304,6 +2304,9 @@
    %JIT-HOT-PROMOTE describes: the box is never NAME's current definition, only
    the trampoline's own code, compiled.")
 
+;; Read here, so defined here; the drain that consumes it is further down.
+(defvar *jit-want-flag* nil "A cons made on the main thread; its CAR is T when some worker wants a build.")
+
 (defun %jit-note-forward (name bc box)
   (when (and (null *jit-want-flag*) (%mvm-on-main-thread-p))
     (setq *jit-want-flag* (list nil)))
@@ -2729,7 +2732,6 @@
 ;;; toplevel forms of a load, through the same %JIT-HOT-BUILD a promotion uses.
 ;;; WANTED goes T -> :DONE when the drain takes it, built or not, so a module
 ;;; that will not translate is not retried every 64 calls.
-(defvar *jit-want-flag* nil "A cons made on the main thread; its CAR is T when some worker wants a build.")
 (defvar *jit-want-built* nil "CENSUS: modules the drain built for workers.")
 
 

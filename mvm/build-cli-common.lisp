@@ -494,7 +494,7 @@
   ;; GENERATIONAL GC: the card barrier and the collector arms, as the host
   ;; baked them (build-generic-cli, MODUS_X64_GEN).  A JIT page without the
   ;; barrier would hide its heap stores from the card scan.
-  (setq *x64-gen-gc* " (if (equal (sb-ext:posix-getenv "MODUS_X64_GEN") "0") "nil" "t") ")
+  (setq modus.mvm.x64::*x64-gen-gc* " (if (equal (sb-ext:posix-getenv "MODUS_X64_GEN") "0") "nil" "t") ")
   (setq *linux-x64-r14-offset* #x38000000)
   ;; THE PER-THREAD WINDOW must match what the host baked into the image's
   ;; fixed code, for the same reason *x64-gc-enabled* must: a JIT page that
@@ -2133,6 +2133,12 @@
 (defun %force-deferred-installs ()
   (when (consp (handler-case *%deferred-order* (t (c) nil)))
     (%run-deferred-installs)))
+
+;; Asked by the FASL cache (mvm/fasl.lisp %FASL-READ): a READ that installs
+;; the surfaces is recorded, so its replay -- which reads nothing -- installs
+;; them too before running code that calls into them.
+(defun %deferred-pending-p ()
+  (consp (handler-case *%deferred-order* (t (c) nil))))
 
 ;; The image's own boot-evaluated source (shims, compat layers, the ASDF
 ;; interface) is KERNEL code: read it in MODUS-INT, where the internals it

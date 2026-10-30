@@ -11,7 +11,7 @@
 ;;;; whenever it idles).  The CONTROL arm, in the same binary, disables the flag
 ;;;; the worker raises: the same calls must then leave the DEFUN interpreted.
 
-(setq *jit-script-defs* nil)          ; the DEFUNs here must start interpreted
+(setq modus-int::*jit-script-defs* nil)          ; the DEFUNs here must start interpreted
 
 (defvar *checks* 0)
 (defvar *fails* 0)
@@ -22,15 +22,15 @@
     (format t "~&FAIL ~a~%   got  ~s~%   want ~s~%" name got want)))
 
 (defun native-p (nm)
-  (if (or (%jit-fn-native-p nm)
-          (%jit-fn-native-p (concatenate 'string "COMMON-LISP-USER::" nm)))
+  (if (or (modus-int::%jit-fn-native-p nm)
+          (modus-int::%jit-fn-native-p (concatenate 'string "COMMON-LISP-USER::" nm)))
       t nil))
 
 (defun on-worker (fn)
   (sb-thread:join-thread (sb-thread:make-thread fn)))
 
 ;;; CONTROL: the flag is not a cons, so a worker's want is dropped.
-(setq *jit-want-flag* :off)
+(setq modus-int::*jit-want-flag* :off)
 (defun ctl-fn (x) (values (+ x 1) (* x 2)))
 (chk "control: worker sees both values"
      (on-worker (lambda () (let ((r nil)) (dotimes (i 200) (setq r (multiple-value-list (ctl-fn i)))) r)))
@@ -46,8 +46,8 @@
   (chk "control: worker-only DEFUN stays interpreted" (native-p "CTL-FN") nil))
 
 ;;; THE FIX: the flag back, a fresh DEFUN, the same calls.
-(setq *jit-want-flag* (list nil))
-(defvar *built-before* (or *jit-want-built* 0))
+(setq modus-int::*jit-want-flag* (list nil))
+(defvar *built-before* (or modus-int::*jit-want-built* 0))
 (defun wk-fn (x) (values (+ x 1) (* x 2)))
 (chk "worker sees both values"
      (on-worker (lambda () (let ((r nil)) (dotimes (i 200) (setq r (multiple-value-list (wk-fn i)))) r)))
@@ -55,7 +55,7 @@
 (chk "the worker raised the flag, main drained it at this form" t t)
 (chk "worker-only DEFUN is native" (native-p "WK-FN") t)
 (unless *workers-build*
-  (chk "the drain counted it" (> (or *jit-want-built* 0) *built-before*) t))
+  (chk "the drain counted it" (> (or modus-int::*jit-want-built* 0) *built-before*) t))
 (chk "native answers on the worker, both values"
      (on-worker (lambda () (multiple-value-list (wk-fn 41)))) (list 42 82))
 (chk "and on main" (multiple-value-list (wk-fn 9)) (list 10 18))

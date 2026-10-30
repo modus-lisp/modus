@@ -56,30 +56,44 @@
    ran before this branch handled CL syms — preserves crash-or-recovery
    behavior for unbound symbols).
 
-   Tries the hash-keyed *native-sym-function-table* first, then falls
-   back to the NAME-keyed *symbol-function-table* via %sym-name-or-hash
-   — the same tier order symbol-function uses.  Opcode-backed functions
+   Tries the NAME-keyed *symbol-function-table* (via %sym-name-or-hash)
+   first, then the hash-keyed *native-sym-function-table* — the tier order
+   symbol-function uses.  Opcode-backed functions
    like < / > / = are registered by NAME only, so without the fallback
    (funcall '< 1 2) fell through to CALL-INDIRECT on the symbol itself:
    \"MVM: CALL-IND with non-callable target\" — uiop's lexicographic<
    (funcall element< …) with element< = '< , i.e. version<= /
    version-deprecation, asdf gauntlet forms 112/233/236."
-  (let ((h (aref sym 0)))
-    (let ((fn (if *native-sym-function-table*
-                  (gethash h *native-sym-function-table*)
-                  nil)))
-      (if fn
-          fn
-          (let ((nh (%sym-name-or-hash sym)))
-            (let ((nfn (and nh
-                            (> (length (car nh)) 0)
-                            *symbol-function-table*
-                            (gethash (car nh) *symbol-function-table*))))
-              ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
-              ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here
-              ;; made (funcall 'undefined ...) call the symbol itself and
-              ;; fault -- a MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
-              (if nfn nfn (symbol-function sym))))))))
+  ;; NAME FIRST, as SYMBOL-FUNCTION does.  Slot 0 is the hash of the bare
+  ;; NAME, so the hash table answers for every symbol so spelled: a package
+  ;; that shadows STRING-EQUAL and DEFUNs its own got CL's from (funcall 'its
+  ;; ...) while (its ...) and (apply 'its ...) reached its own -- TI's
+  ;; Explorer source, whose ZLC:STRING-EQUAL takes positional indices, saw
+  ;; CL's signal a type error at every call by symbol.  A runtime-born
+  ;; package's symbol keys the name table by PKG::NAME (memoised), so the
+  ;; name lookup is the one that tells the two apart.
+  ;; A native symbol (hash only) and a symbol of COMMON-LISP itself are the
+  ;; ones the bare hash names exactly, and (funcall '+ ...) is hot: those keep
+  ;; the hash-first order, which skips building the name.
+  (let* ((by-hash (and *native-sym-function-table*
+                       (or (not (%cl-sym-p sym))
+                           ;; CAR's home, read off a literal: FIND-PACKAGE per
+                           ;; call cost more than the name lookup it saves.
+                           (eq (%cl-sym-package sym) (%cl-sym-package 'car)))
+                       (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))
+         (nh (and (not by-hash) (%sym-name-or-hash sym)))
+         (fn (or by-hash
+                 (and nh
+                      (> (length (car nh)) 0)
+                      *symbol-function-table*
+                      (%fn-entry (gethash (car nh) *symbol-function-table*)))
+                 (and *native-sym-function-table*
+                      (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))))
+    ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
+    ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here made
+    ;; (funcall 'undefined ...) call the symbol itself and fault -- a
+    ;; MEMORY-FAULT-ERROR instead of UNDEFINED-FUNCTION.
+    (if fn fn (symbol-function sym))))
 
 ;;; A runtime-born package's symbol keys the function tables by its
 ;;; package-qualified name; building and hashing that string was most of a
@@ -952,6 +966,9 @@
       ((%macro-pkg-get sym key))
       ;; ...and another package's is not SYM's (%MACRO-PKG-FOREIGN-P).
       ((%macro-pkg-foreign-p sym key) nil)
+      ;; A symbol shadowing a CL name with no macro of its own has none: every
+      ;; bare-name entry below is CL's (see MACRO-FUNCTION).
+      ((%shadows-cl-name-p sym) nil)
       ((and *macro-function-table* (gethash key *macro-function-table*)))
       ((%macro-table-visible-expander key))
       ((and (stringp key) (%compiler-macro-p key)) t)
@@ -992,6 +1009,14 @@
                           (and p (string= (package-name p) "COMMON-LISP"))))
                    (%macro-pkg-foreign-p sym key))
               nil)
+             ;; A symbol that SHADOWS a CL name and has no macro of its own has
+             ;; none: the bare-name entries below are CL's.  Read through them,
+             ;; cortez's CORTEZ.GLOBAL:LOOP -- TI's LOOP, not yet loaded --
+             ;; answered with CL's LOOP expander, so the loader thought the cell
+             ;; full and never fetched theirs, and (LOOP FOR ...) then compiled as
+             ;; a call: "The variable FOR is unbound".  The compiler's
+             ;; %MACRO-EXPANDER already says this (d329695).
+             ((%shadows-cl-name-p sym) nil)
              ((and *macro-function-table* (gethash key *macro-function-table*)))
              ;; Compiler inlining macros over standard CL FUNCTIONS are
              ;; filtered here — see %MACRO-TABLE-VISIBLE-EXPANDER.
@@ -1129,9 +1154,26 @@
           ;; Compiled lambda from mvm-define-macro: (lambda (form) ...).
           ;; Try single-arg first; fall back to (form nil) for CL macros
           ;; that want both form and env.
-          (let ((expanded (handler-case (funcall mf form)
-                            (t (c) (funcall mf form nil)))))
-            (values expanded t))))))
+          ;;
+          ;; Only a PROGRAM-ERROR says the one-argument call was the wrong
+          ;; shape.  Anything else was signalled by the expander itself, which
+          ;; therefore took the one argument and ran: it goes out from where
+          ;; it was signalled, as it would from a call.  The fallback used to
+          ;; catch every condition, so an expander that met an undefined
+          ;; function was called again with two arguments and reported
+          ;; "invalid number of arguments: 2" -- TI's LIST-MATCH-P reaching
+          ;; CIRCULAR-LIST, which an outer handler could have supplied had it
+          ;; been told the name.  HANDLER-BIND, not HANDLER-CASE, so a handler
+          ;; outside still sees it before anything unwinds.
+          (block expand
+            (let ((expanded (handler-bind
+                                ((program-error
+                                   (lambda (c)
+                                     (declare (ignore c))
+                                     (return-from expand
+                                       (values (funcall mf form nil) t)))))
+                              (funcall mf form))))
+              (values expanded t)))))))
     (t (values form nil))))
 
 (defun macroexpand (form &rest env-arg)

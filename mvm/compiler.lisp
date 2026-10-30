@@ -1146,22 +1146,44 @@
                       (list* (car slot) `(funcall (symbol-value ',sym)) (cddr slot))))))
             (cddr form)))))
 
-(defun %defsetf-long-expander (vars store-vars fn)
-  "The setf expander of a long DEFSETF whose body is the closure FN over
-   (VARS... STORE-VARS...): it is called on gensyms and its value is the
-   expansion, wrapped so the place arguments and the value form are evaluated
-   once, left to right."
-  (lambda (place-args value-form)
-    (let* ((var-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) vars))
-           (store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-vars))
-           (expansion (apply fn (append var-gensyms store-gensyms))))
+(defun %defsetf-arg-items (vars place-args)
+  "The temporaries a long DEFSETF's body sees for PLACE-ARGS, and their LET*
+   bindings.  One per place ARGUMENT, not per parameter: a defsetf lambda
+   list may take &OPTIONAL, &REST and &KEY (CLHS 3.4.7), so the two counts
+   differ.  A constant argument -- a keyword above all -- is passed as
+   itself, so &KEY can parse it.  With a plain lambda list the temporaries
+   are named after the parameters, as before."
+  (let ((plain (notany (lambda (v) (and (symbolp v) (member v lambda-list-keywords))) vars))
+        (items nil) (bindings nil))
+    (dolist (a place-args)
+      (if (and (constantp a) (not plain))
+          (push a items)
+          (let ((g (%mvm-gensym (if (and plain vars) (symbol-name (car vars)) "DSA"))))
+            (push g items)
+            (push (list g a) bindings)))
+      (when plain (setq vars (cdr vars))))
+    (values (nreverse items) (nreverse bindings))))
+
+(defun %defsetf-expand (vars store-vars fn place-args value-form)
+  "Expand a long DEFSETF place: call FN, the body over (STORE-VARS... . VARS),
+   on temporaries, and wrap its expansion so the place arguments and the
+   value form are evaluated once, left to right."
+  (multiple-value-bind (items bindings) (%defsetf-arg-items vars place-args)
+    (let* ((store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-vars))
+           (expansion (apply fn (append store-gensyms items))))
+      ;; several store variables take the value form's several values (DEFSETF.7A)
       (if (cdr store-gensyms)
-          `(let* (,@(mapcar #'list var-gensyms place-args))
+          `(let* (,@bindings)
              (multiple-value-bind ,store-gensyms ,value-form
                ,expansion))
-          `(let* (,@(mapcar #'list var-gensyms place-args)
+          `(let* (,@bindings
                   ,@(mapcar #'list store-gensyms (list value-form)))
              ,expansion)))))
+
+(defun %defsetf-long-expander (vars store-vars fn)
+  "The setf expander of a long DEFSETF whose body is the closure FN."
+  (lambda (place-args value-form)
+    (%defsetf-expand vars store-vars fn place-args value-form)))
 
 (defun %eval-expander-runtime (lambda-form)
   "Evaluate LAMBDA-FORM (a `(lambda …)` macro-expander) into a CALLABLE, in
@@ -3996,8 +4018,18 @@
                 (let ((result (%call-interp-closure mf (cdr form))))
                   (if (eq result form) (cons form nil) (cons result t))))
                (t
-                (let ((result (handler-case (funcall mf form)
-                                (t (c) (funcall mf form nil)))))
+                ;; Only a PROGRAM-ERROR means (form) was the wrong shape; any
+                ;; other condition came from the expander running, and goes out
+                ;; from there -- the same narrowing as cl-eval's MACROEXPAND-1,
+                ;; where catching everything turned TI's LIST-MATCH-P reaching an
+                ;; undefined CIRCULAR-LIST into "invalid number of arguments: 2".
+                (let ((result (block expand
+                                (handler-bind
+                                    ((program-error
+                                       (lambda (c)
+                                         (declare (ignore c))
+                                         (return-from expand (funcall mf form nil)))))
+                                  (funcall mf form)))))
                   (when (%expander-has-env-p mf) (setq *%mexp-impure* t))
                   (if (eq result form) (cons form nil) (cons result t)))))))
           (t (cons form nil))))
@@ -4051,11 +4083,48 @@
       (t (let ((n (symbol-name op)))
            (or (null n) (zerop (length n)) (string-equal n registered)))))))
 
+;;; Macros whose names shadow a CL external, keyed by the symbol.  See
+;;; %DEFINE-COMPILE-TIME-MACRO.
+(defvar *shadowing-macro-table* nil)
+
 (defun %macro-expander (op hash)
   "The expander for OP, or NIL — the confirmed replacement for a bare
-   (gethash hash *macro-table*)."
-  (and (%macro-name-confirmed-p op hash)
-       (gethash hash *macro-table*)))
+   (gethash hash *macro-table*).  A macro whose name shadows a CL external is
+   found by the SYMBOL first (see %DEFINE-COMPILE-TIME-MACRO): its bare-name
+   entry, if any, is CL's, and using it compiled P::WHEN as CL:WHEN.
+
+   And a shadowing symbol with NO macro of its own gets none: the bare-name
+   entry is still CL's.  cortez's GLOBAL::LDB is a FUNCTION taking the
+   machine's integer byte specifiers; the bare entry is CL's LDB macro, so
+   (LDB 6 X) expanded to CL:LDB's and died on 6 as a byte spec while
+   (FUNCALL #'LDB 6 X) answered.  FBOUNDP as in %DEFINE-COMPILE-TIME-MACRO."
+  (or (and *shadowing-macro-table* (symbolp op)
+           (gethash op *shadowing-macro-table*))
+      (and (%macro-name-confirmed-p op hash)
+           (let ((e (gethash hash *macro-table*)))
+             (and e
+                  (not (and (symbolp op) (fboundp '%shadows-cl-name-p)
+                            (funcall '%shadows-cl-name-p op)))
+                  e)))))
+
+;;; A DEFMACRO's compile-time registration.  A name that SHADOWS a CL external -- P::IF,
+;;; P::MULTIPLE-VALUE-BIND -- must not take the bare-name entry in *MACRO-TABLE*: that is the
+;;; entry every CL:IF lands on, so P::IF's expander became CL:IF's, its own (CL:IF ...)
+;;; expansion expanded through it again, and the stack overflowed (SIGSEGV, or a hang).
+;;; SET-MACRO-FUNCTION files such a name per package only, under the same test,
+;;; %SHADOWS-CL-NAME-P.  The compiler then finds it by the symbol, in *SHADOWING-MACRO-TABLE*,
+;;; ahead of the bare entry -- otherwise (P::WHEN ...) compiled as CL's WHEN and the user's
+;;; macro never ran.  FBOUNDP because the compiler also runs in the build host, where the
+;;; runtime's function does not exist and no source shadows CL.
+(defun %define-compile-time-macro (name expander)
+  (if (and (fboundp '%shadows-cl-name-p) (funcall '%shadows-cl-name-p name))
+      (progn
+        (unless *shadowing-macro-table*
+          (setq *shadowing-macro-table* (make-hash-table :test 'eq)))
+        (setf (gethash name *shadowing-macro-table*) expander)
+        (%mexp-memo-invalidate)
+        (set-macro-function name expander))
+      (mvm-define-macro (normalize-name name) expander)))
 
 (defun mvm-define-macro (name expander)
   "Register a macro with NAME (string or hash) and EXPANDER function.
@@ -5674,47 +5743,25 @@
              ;; Strip docstring if first body element is a string
              (when (and (stringp (car body)) (cdr body))
                (setq body (cdr body)))
-             (when (some (lambda (v)
-                           (and (symbolp v) (member v lambda-list-keywords)))
-                         vars)
-               (error "MVM compiler defsetf long form: lambda-list keywords (~S) not yet supported"
-                      (remove-if-not (lambda (v)
-                                       (and (symbolp v)
-                                            (member v lambda-list-keywords)))
-                                     vars)))
+             (when (some (lambda (v) (member v '(&environment &whole &aux))) vars)
+               (error "MVM compiler defsetf long form: ~S not supported"
+                      (remove-if-not (lambda (v) (member v '(&environment &whole &aux))) vars)))
              (mvm-define-setf-expander
                accessor
                (let ((vars-list vars)
                      (store-list store-vars)
                      (body-forms body))
                  (lambda (place-args value-form)
-                   (let* ((var-gensyms   (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) vars-list))
-                          (store-gensyms (mapcar (lambda (v) (%mvm-gensym (symbol-name v))) store-list))
-                          ;; Compile a one-shot lambda whose params are
-                          ;; the original var/store-var names; calling
-                          ;; it with the gensyms makes every reference
-                          ;; in body resolve to a gensym, so a
-                          ;; backquoted body returns a real expansion
-                          ;; form rather than a runtime list-builder.
-                          ;; CLHS 5.1.1.2 / DEFSETF: the long-form body is
-                          ;; enclosed in an implicit BLOCK named ACCESSOR —
-                          ;; defsetf.5's (return-from defsetf.5-accessor …)
-                          ;; body errored the host EVAL ('return for unknown
-                          ;; block'), which SKIPped the whole chunk defun.
-                          (expansion
-                            (apply (%eval-expander-runtime
-                                    `(lambda ,(append vars-list store-list)
-                                       (block ,accessor ,@body-forms)))
-                                   (append var-gensyms store-gensyms))))
-                     ;; several store variables take the value form's
-                     ;; several values (DEFSETF.7A)
-                     (if (cdr store-gensyms)
-                         `(let* (,@(mapcar #'list var-gensyms place-args))
-                            (multiple-value-bind ,store-gensyms ,value-form
-                              ,expansion))
-                         `(let* (,@(mapcar #'list var-gensyms place-args)
-                                 ,@(mapcar #'list store-gensyms (list value-form)))
-                            ,expansion))))))
+                   ;; CLHS 5.1.1.2 / DEFSETF: the long-form body is enclosed in
+                   ;; an implicit BLOCK named ACCESSOR (defsetf.5's RETURN-FROM).
+                   ;; Compiled at each expansion, so a backquoted body returns a
+                   ;; real expansion rather than a runtime list-builder.
+                   (%defsetf-expand
+                    vars-list store-list
+                    (%eval-expander-runtime
+                     `(lambda (,@store-list ,@vars-list)
+                        (block ,accessor ,@body-forms)))
+                    place-args value-form))))
              ;; Under runtime EVAL the body is also compiled where the DEFSETF
              ;; is, as a closure, and that expander replaces the one above when
              ;; the form runs: a DEFSETF inside a LET sees the LET's variables
@@ -5725,7 +5772,7 @@
                      ',accessor
                      (%defsetf-long-expander
                       ',vars ',store-vars
-                      (function (lambda ,(append vars store-vars)
+                      (function (lambda (,@store-vars ,@vars)
                                   (block ,accessor ,@body)))))
                     (quote ,accessor))
                  `(quote ,accessor))))
@@ -8224,6 +8271,15 @@
       ;; %OP-NAME-CONFIRMED-P.
       ((and op-name (symbolp op) (not (%op-name-confirmed-p op op-name)))
        (compile-call op (cdr form) env dest))
+      ;; SHADOWING GUARD -- the same reasoning, by package rather than by hash.
+      ;; Every dispatch below matches the operator's NAME, so P::MAKE-ARRAY (P
+      ;; shadowing CL's) compiled as CL's MAKE-ARRAY and P::AREF / P::CAR as CL's
+      ;; primops: the program's own function never ran, or a primop ran on its
+      ;; arguments and faulted.  A head that shadows a CL external and was not
+      ;; macroexpanded above is a call to that package's function, as in SBCL.
+      ;; FBOUNDP: the build host has no %SHADOWS-CL-NAME-P and no source shadows CL.
+      ((and (symbolp op) (fboundp '%shadows-cl-name-p) (funcall '%shadows-cl-name-p op))
+       (compile-call op (cdr form) env dest))
       ;; Non-symbol operator (immediately-applied lambda, etc.).  Route
       ;; through compile-funcall, NOT compile-call: compile-call's
       ;; indirect path emits a bare :call-indirect with no closure
@@ -8569,7 +8625,7 @@
                                             ,@(when env-var (list env-var))))
                         (destructuring-bind (,@d-params) (cdr form)
                           ,@body))))))
-             (mvm-define-macro (normalize-name name) expander)
+             (%define-compile-time-macro name expander)
              ;; (1b) …and, under runtime EVAL, make that registration
              ;; TRUTHFUL to the running program.  *MACRO-TABLE* is rebound
              ;; per mvm-eval call, but FBOUNDP / MACRO-FUNCTION consult it
@@ -11608,11 +11664,12 @@
       ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
            (and (integerp op) (= op 338547669)))
        nil)
-      ;; a quasiquote: VARS-MUTATED-IN-LAMBDAS scans its expansion; at runtime
-      ;; VARS-READ-IN-LAMBDAS walks the raw template too, so look at both
+      ;; a quasiquote: both scans walk its EXPANSION, which is its code.  The
+      ;; template is data -- walked as code, its macro calls were expanded, and
+      ;; (DEFMACRO FCW (I) `(OR NIL (FCW ,I))) expanded FCW inside its own
+      ;; template until the stack was gone (SIGSEGV just DEFINING it).
       ((%bq-form-p form)
-       (or (%form-has-closure-p (expand-backquote (cadr form)))
-           (and *mvm-eval-runtime-p* (%form-has-closure-p-2 form))))
+       (%form-has-closure-p (expand-backquote (cadr form))))
       (t (%form-has-closure-p-2 form)))))
 
 (defun %form-has-closure-p-2 (form)
@@ -11636,6 +11693,13 @@
           ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
                (and (integerp op) (= op 338547669)))
            nil)
+          ;; #'X is a closure exactly when X is a LAMBDA; any other X names a
+          ;; function and is not a form -- walked as one it is macroexpanded,
+          ;; and TI's MACRO writes #'(MACRO NAMED-LAMBDA ...), which expands to
+          ;; another #'(MACRO ...) without end (SIGSEGV).
+          ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+               (and (integerp op) (= op 402801909)))
+           (and (consp (cadr form)) (%form-op-is (cadr form) 80380232 "LAMBDA")))
           ((and (consp op) (%form-has-closure-p op)) t)
           (t
            (let ((rest (cdr form)) (found nil))
@@ -11714,10 +11778,13 @@
                       ;; Also recurse into lambda body for nested lambdas with shadowing
                       (dolist (f (cddr form))
                         (scan f t))))
-                   ;; function literal — same as lambda
+                   ;; function literal — same as lambda.  Only a LAMBDA: any
+                   ;; other #'X names a function (see %FORM-HAS-CLOSURE-P-2).
                    ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
                         (and (integerp op) (= op 402801909)))  ; FUNCTION
-                    (scan (cadr form) in-lambda))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (scan (cadr form) in-lambda)))
                    ;; FLET / LABELS — each function body is a separate
                    ;; function (compiled by mvm-compile-function-internal)
                    ;; whose body can mutate enclosing let-vars exactly as a
@@ -11885,6 +11952,11 @@
              (scan (form)
                (unless (consp form) (return-from scan))
                (unless (%form-has-closure-p form) (return-from scan))
+               ;; A quasiquote's code is its expansion, as VARS-MUTATED-IN-LAMBDAS
+               ;; scans it; its template is data (see %FORM-HAS-CLOSURE-P-1).
+               (when (%bq-form-p form)
+                 (scan (expand-backquote (cadr form)))
+                 (return-from scan))
                (let ((mx (%cfv-macroexpand form)))
                  (when mx (setq form mx)))
                ;; Keep expanding, as the mutation scan does (runtime only).
@@ -11913,7 +11985,10 @@
                         (note (collect-var-refs f let-vars params)))))
                    ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
                         (and (integerp op) (= op 402801909)))  ; FUNCTION
-                    (scan (cadr form)))
+                    ;; Only a LAMBDA (see %FORM-HAS-CLOSURE-P-2).
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (scan (cadr form))))
                    ((or (and (symbolp op)
                              (or (string= (symbol-name op) "FLET")
                                  (string= (symbol-name op) "LABELS")))
@@ -18577,8 +18652,14 @@
                         (walk (car cur) xl sh)
                         (setq cur (cdr cur)))))
                    ;; (function (lambda ...)) — recurse with the lambda case
+                   ;; Only a LAMBDA inside #' is code.  Anything else names a
+                   ;; function, and walked as a form it is macroexpanded: TI's
+                   ;; MACRO writes #'(MACRO NAMED-LAMBDA ...), which expands to
+                   ;; another #'(MACRO ...) -- unbounded walk, a SIGSEGV.
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) xl sh))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) xl sh)))
                    ;; RETURN-FROM <name> — check target + lambda boundary
                    ((%form-op-is form 164933334 "RETURN-FROM")
                     (when (and xl (not sh)
@@ -18666,8 +18747,12 @@
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
+                   ;; Only a LAMBDA inside #' is code (see
+                   ;; %RETURN-FROM-ESCAPES-BLOCK-P).
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) in-fn))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) in-fn)))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
                               (setq cur (cdr cur)))))))))
@@ -18810,8 +18895,12 @@
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
+                   ;; Only a LAMBDA inside #' is code (see
+                   ;; %RETURN-FROM-ESCAPES-BLOCK-P).
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) in-fn))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) in-fn)))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
                               (setq cur (cdr cur))))))))
@@ -18865,8 +18954,12 @@
                     (let ((cur (cddr form)))
                       (loop while (consp cur) do (walk (car cur) in-fn)
                             (setq cur (cdr cur)))))
+                   ;; Only a LAMBDA inside #' is code (see
+                   ;; %RETURN-FROM-ESCAPES-BLOCK-P).
                    ((%form-op-is form 402801909 "FUNCTION")
-                    (walk (cadr form) in-fn))
+                    (when (and (consp (cadr form))
+                               (%form-op-is (cadr form) 80380232 "LAMBDA"))
+                      (walk (cadr form) in-fn)))
                    (t (let ((cur form))
                         (loop while (consp cur) do (walk (car cur) in-fn)
                               (setq cur (cdr cur)))))))))
@@ -30468,7 +30561,7 @@
                         `(lambda (form)
                            (destructuring-bind (,@params) (cdr form)
                              ,@body)))))
-         (mvm-define-macro (normalize-name name) expander))
+         (%define-compile-time-macro name expander))
        nil))
 
     ;; (defstruct name slot1 slot2 ...)

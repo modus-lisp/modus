@@ -464,6 +464,14 @@
                          :format-arguments nil)))
 
 
+(defun %reader-eof (stream msg)
+  "The file ended inside an object: CLHS READ, an error of type END-OF-FILE,
+   whatever EOF-ERROR-P says -- not a READER-ERROR.  SBCL agrees; a cortez
+   corpus read reported 35 truncated files as READER-ERROR where SBCL said
+   END-OF-FILE.  MSG says where it ended, for the report."
+  (declare (ignore msg))
+  (error (make-condition 'end-of-file :stream stream)))
+
 (defun %read-skip-whitespace (stream)
   "Skip whitespace chars AND line comments (semicolon to newline).
    Returns first non-whitespace non-comment char or nil on EOF.
@@ -487,20 +495,15 @@
         (t (return ch))))))
 
 (defun %invalid-constituent-p (ch)
-  "Per CLHS 2.4.4.4: #\\Backspace, #\\Tab (when not whitespace),
-   #\\Linefeed, #\\Page, #\\Return, #\\Rubout have constituent trait
-   :invalid in standard syntax — using them in a token is a reader
-   error.  Modus's whitespace set already includes Tab/Newline/Page/CR,
-   so the only chars left here are Backspace (8) and Rubout (127).
-   Plus all OTHER control chars below 32 that aren't in the whitespace
-   set — they're also :invalid by analogy."
+  "Per CLHS 2.1.4 (Figure 2-7): in standard syntax only #\\Backspace and
+   #\\Rubout have the constituent trait :invalid -- using one in a token is a
+   reader error.  Tab, Linefeed, Page and Return are whitespace here.  Every
+   OTHER control character is an ordinary constituent, as in SBCL: a Lisp
+   Machine's font had a glyph for every code, and TI's sources write them in
+   symbol names (the ^Z of kernel/initial-zlc-symbols.lisp; 163 of them across
+   118 files).  Refusing them \"by analogy\" made those files unreadable."
   (let ((code (char-code ch)))
-    (and (or (= code 8) (= code 127)
-             (and (< code 32)
-                  (not (= code 9))   ; tab
-                  (not (= code 10))  ; newline
-                  (not (= code 12))  ; page
-                  (not (= code 13))))  ; return
+    (and (or (= code 8) (= code 127))
          t)))
 
 (defun %read-as-token (ch stream rt)
@@ -546,7 +549,7 @@
   (loop
     (let ((ch (%read-skip-whitespace stream)))
       (when (null ch)
-        (return (if eof-error-p (%reader-error "end of file during read") eof-value)))
+        (return (if eof-error-p (%reader-eof stream "end of file during read") eof-value)))
       ;; ONE *READTABLE* read per form, re-done on every iteration of this
       ;; loop: a reader macro is user code and may rebind or assign the
       ;; variable, so the value is not carried across a dispatch.
@@ -560,7 +563,7 @@
               (cond
                 ((null next)
                  (return (if eof-error-p
-                             (%reader-error "end of file during read")
+                             (%reader-eof stream "end of file during read")
                              eof-value)))
                 ((eql next #\))
                  (unread-char next stream)
@@ -578,6 +581,15 @@
             (progn (%skip-line-comment stream)
                    (%read-internal stream eof-error-p eof-value nil))
             (%read-macro-dispatch-simple macro-fn ch stream rt)))))
+
+(defun %call-reader-macro (fn stream ch &rest arg)
+  "Call a reader macro function the program installed.  CLHS 2.2 step 4: one that
+   returns ZERO values read nothing -- a comment, a false #+ -- and the reader goes on
+   to the next object.  Taking its primary value instead made every such call an
+   object: a readtable whose #+ is the program's own read each false conditional as
+   NIL (a cortez corpus read gained 2525 NIL forms, and a NIL in a list)."
+  (let ((vals (multiple-value-list (if arg (funcall fn stream ch (car arg)) (funcall fn stream ch)))))
+    (if vals (car vals) *rdr-no-value*)))
 
 (defun %read-macro-dispatch-simple (fn ch stream rt)
   "Handle common macro character types."
@@ -598,8 +610,8 @@
     ((eq fn :semicolon) (%skip-line-comment stream) *rdr-no-value*)
     ((eq fn :dispatch) (%read-user-dispatch ch stream rt))
     ((or (functionp fn) (%cl-sym-p fn))
-     (let ((result (funcall fn stream ch)))
-       (if *read-suppress* nil result)))
+     (let ((result (%call-reader-macro fn stream ch)))
+       (if (or (eq result *rdr-no-value*) (not *read-suppress*)) result nil)))
     (t nil)))
 
 ;;; --- Token reader ---
@@ -709,7 +721,7 @@
     (let ((ch (%token-read-char stream)))
       (when (null ch)
         ;; Unterminated |...| → end-of-file.
-        (when (aref st 2) (%reader-error "end of file inside | ... |"))
+        (when (aref st 2) (%reader-eof stream "end of file inside | ... |"))
         (return st))
       (cond
         ;; Inside |...| — only multiple-escape closes it; single-escape
@@ -870,6 +882,11 @@
 (defun %try-parse-integer (codes base)
   "Try to parse char codes as an integer in BASE. Returns (value . t) or nil."
   (if (null codes) nil
+      ;; A token ending in "." is decimal whatever BASE is (CLHS 2.3.1.1), so it is
+      ;; decided before the digits are checked against BASE -- checked after, "8." in
+      ;; base 8 stopped at the 8, never reached the dot, and fell through to a float.
+      (if (and (/= base 10) (= (car (last codes)) 46))
+          (%try-parse-integer (%codes-drop-last codes) 10)
       (let ((sign 1) (cur codes) (n 0) (got-digit nil))
         ;; Check sign
         (when (= (car cur) 43) (setq cur (cdr cur)))    ; +
@@ -915,7 +932,7 @@
                   (if (and (= code 46) (null (cdr cur)) got-digit)
                       (return-from %try-parse-integer
                         (%try-parse-integer (%codes-drop-last codes) 10))
-                      (return-from %try-parse-integer nil)))))))))
+                      (return-from %try-parse-integer nil))))))))))
 
 (defun %codes-drop-last (codes)
   "Return a fresh list of CODES with its final element removed.
@@ -1342,7 +1359,7 @@
       (let ((ch nil))
         (loop
           (setq ch (read-char stream nil nil t))
-          (when (null ch) (%reader-error "end of file reading list"))
+          (when (null ch) (%reader-eof stream "end of file reading list"))
           (cond
             ((%rt-ws-p ch rt) nil)               ; keep skipping
             ((eq (%read-check-macro-rt ch rt) :semicolon)
@@ -1358,7 +1375,7 @@
           ;; Peek at next char to disambiguate dot from symbol starting with dot
           (let ((next (read-char stream nil nil t)))
             (cond
-              ((null next) (%reader-error "end of file after dot"))
+              ((null next) (%reader-eof stream "end of file after dot"))
               ((or (%rt-ws-p next rt) (eql next #\)) (%terminating-macro-p next rt))
                ;; It's the consing dot.  Under *read-suppress* the list
                ;; elements are NOT accumulated (result stays nil even
@@ -1373,14 +1390,21 @@
                  (%reader-error "dot at start of list"))
                (unread-char next stream)
                (let ((cdr-val (%read-internal stream t nil t)))
-                 ;; Skip whitespace and read closing paren
+                 ;; Skip to the closing paren.  Whitespace is not all that may
+                 ;; come between: a ; or #| |# comment or a false #+ reads as
+                 ;; nothing (CLHS 2.4.1), so read one item and go on if it is
+                 ;; the no-value sentinel.  `(a . ,b ; why\n)' was a reader-error.
                  (let ((close-ch nil))
                    (loop
                      (setq close-ch (read-char stream nil nil t))
-                     (when (null close-ch) (%reader-error "end of file after dotted pair"))
-                     (unless (%rt-ws-p close-ch rt) (return nil)))
-                   (unless (eql close-ch #\))
-                     (%reader-error "more than one object after dot")))
+                     (when (null close-ch) (%reader-eof stream "end of file after dotted pair"))
+                     (cond ((%rt-ws-p close-ch rt) nil)
+                           ((eql close-ch #\)) (return nil))
+                           ((eq (%read-check-macro-rt close-ch rt) :semicolon)
+                            (%skip-line-comment stream))   ; as the element loop above
+                           (t (unread-char close-ch stream)
+                              (unless (eq (%read-internal stream t nil t) *rdr-no-value*)
+                                (%reader-error "more than one object after dot"))))))
                  ;; Set cdr of last cons
                  (if tail (set-cdr tail cdr-val) (setq result (list cdr-val)))
                  (setq dotted t)
@@ -1424,7 +1448,7 @@
   (let ((chars nil))
     (loop
       (let ((ch (read-char stream nil nil t)))
-        (when (null ch) (%reader-error "end of file reading string"))
+        (when (null ch) (%reader-eof stream "end of file reading string"))
         (cond
           ((eql ch delim)
            ;; End of string
@@ -1689,8 +1713,17 @@
                      (setq sub-ch (read-char stream t nil t)))
               (return nil)))))
     ;; Dispatch on sub-char
-    (let ((code (if (characterp sub-ch) (char-code sub-ch) 0)))
+    (let* ((code (if (characterp sub-ch) (char-code sub-ch) 0))
+           ;; A function the PROGRAM installed for this sub-char comes first.  The built-ins
+           ;; below are the standard syntax, and the standard readtable's dispatch table is
+           ;; empty, so an entry there was put there by SET-DISPATCH-MACRO-CHARACTER -- and
+           ;; CLHS says it is what #<sub-char> means in RT.  Consulted only after the built-ins,
+           ;; a program's own #. #\ #+ #R ... was silently ignored.
+           (user-fn (let ((sub-table (%get-dispatch-table #\# rt))
+                          (upper-code (if (and (>= code 97) (<= code 122)) (- code 32) code)))
+                      (and sub-table (< upper-code 128) (aref sub-table upper-code)))))
       (cond
+        (user-fn (%call-reader-macro user-fn stream sub-ch arg))
         ;; #' — function
         ((= code 39)  ; '
          (let ((obj (%read-internal stream t nil t)))
@@ -1852,7 +1885,7 @@
                                      (- code 32) code)))
                  (let ((fn (if (< upper-code 128) (aref sub-table upper-code) nil)))
                    (if fn
-                       (funcall fn stream sub-ch arg)
+                       (%call-reader-macro fn stream sub-ch arg)
                        (if *read-suppress* nil
                            (%reader-error "unknown # dispatch character")))))
                (if *read-suppress* nil
@@ -1865,11 +1898,14 @@
   (let ((elements nil))
     (loop
       (let ((ch nil))
-        ;; Skip whitespace
+        ;; Skip whitespace AND ; comments, as %read-list does: a comment ending
+        ;; the last line before the ) left %read-internal facing the ) alone.
         (loop
           (setq ch (read-char stream nil nil t))
-          (when (null ch) (%reader-error "end of file reading vector"))
-          (unless (%whitespace-char-p ch) (return nil)))
+          (when (null ch) (%reader-eof stream "end of file reading vector"))
+          (cond ((%whitespace-char-p ch) nil)
+                ((eq (%read-check-macro-rt ch *readtable*) :semicolon) (%skip-line-comment stream))
+                (t (return nil))))
         (when (eql ch #\))
           ;; End of vector
           (if *read-suppress* (return nil)
@@ -1953,7 +1989,12 @@
    an earlier #:NAME had touched then signalled a conflict -- glass's transports.lisp lists the
    names it imports as #:NAMEs, and on modus the import failed for every one."
   (let ((ch (read-char stream nil nil t)))
-    (when (null ch) (%reader-error "end of file reading #:"))
+    ;; #: at end of file: the token after it is empty, so the symbol is #:|| (SBCL too).
+    ;; Likewise when a delimiter ends it at once: "#: x" is #:|| and then X.
+    (when (null ch) (return-from %read-uninterned-symbol (if *read-suppress* nil (make-symbol ""))))
+    (when (or (%rt-ws-p ch rt) (%terminating-macro-p ch rt))
+      (unread-char ch stream)
+      (return-from %read-uninterned-symbol (if *read-suppress* nil (make-symbol ""))))
     ;; %token-process-first consumes CH as the first char and the loop reads the REST from the
     ;; stream -- do NOT unread CH, or the first char of the name is doubled (#:foo -> FFOO).
     ;; HAS-ESCAPE T: what follows #: is a symbol name even when it would read as a number or
@@ -1972,7 +2013,7 @@
     (loop
       (when (= depth 0) (return nil))
       (let ((ch (read-char stream nil nil t)))
-        (when (null ch) (%reader-error "end of file in block comment"))
+        (when (null ch) (%reader-eof stream "end of file in block comment"))
         (cond
           ((eql ch #\#)
            (let ((next (read-char stream nil nil t)))
@@ -2203,7 +2244,7 @@
           (let ((code (if (characterp sub-ch) (char-code (char-upcase sub-ch)) 0)))
             (let ((fn (if (< code 128) (aref sub-table code) nil)))
               (if fn
-                  (funcall fn stream sub-ch arg)
+                  (%call-reader-macro fn stream sub-ch arg)
                   (%reader-error "unknown dispatch sub-character"))))
           (%reader-error "not a dispatch macro character")))))
 
@@ -2262,12 +2303,14 @@
     (let ((s (%resolve-input-stream stream))
           (result nil))
       (loop
-        ;; Skip whitespace
+        ;; Skip whitespace AND ; comments (see %read-vector)
         (let ((ch nil))
           (loop
             (setq ch (read-char s nil nil t))
-            (when (null ch) (%reader-error "end of file in read-delimited-list"))
-            (unless (%whitespace-char-p ch) (return nil)))
+            (when (null ch) (%reader-eof s "end of file in read-delimited-list"))
+            (cond ((%whitespace-char-p ch) nil)
+                  ((eq (%read-check-macro-rt ch *readtable*) :semicolon) (%skip-line-comment s))
+                  (t (return nil))))
           (when (eql ch char)
             (return (nreverse result)))
           ;; Read an object — drop *rdr-no-value* sentinel elements

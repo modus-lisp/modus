@@ -2900,6 +2900,27 @@
         (when (and nick (stringp nick) (> (length nick) 0))
           (puthash (compute-name-hash nick) tab pkg))))))
 
+;;; The reader's backquote markers -- `X reads as (BACKQUOTE X), ,X as (COMMA X), ,@X and ,.X as
+;;; COMMA-AT and COMMA-DOT -- are the runtime's own symbol literals.  Their home slot said
+;;; COMMON-LISP-USER but no package held them, so FIND-SYMBOL could not name them, they printed
+;;; as a bare COMMA that read back as a different symbol, and a program walking forms could only
+;;; recognise them by name -- which also matches a variable that happens to be called COMMA
+;;; (TI's window/wholin.lisp has one).  Seated and exported here they are MODUS:BACKQUOTE,
+;;; MODUS:COMMA and the rest: findable, EQ-testable, and they print as what reads back.  The
+;;; runtime's own by-name checks are unaffected.
+;;;
+;;; Called from kernel-main next to %INSTALL-RUNTIME-BACKQUOTE, NOT from %INIT-PACKAGES: IMPORT
+;;; keys the package table by SYMBOL-NAME, and before %INIT-SYM-NAME-AUTO fills
+;;; *SYM-NAME-TABLE* a runtime literal's name comes back "" -- the first marker was filed
+;;; under the empty name and the rest were skipped as already present.
+(defun %seat-backquote-markers ()
+  (let ((modus (find-package "MODUS")))
+    (when modus
+      (dolist (sym (list 'backquote 'comma 'comma-at 'comma-dot))
+        (import sym modus)
+        (%cl-sym-set-package sym modus)
+        (export sym modus)))))
+
 (defun %init-packages ()
   "Create standard CL packages."
   (setq *pkg-tag* 987654321)
@@ -3222,6 +3243,13 @@
    compile-quote (no defvar init-thunks run at boot)."
   (let ((pkg (find-package "COMMON-LISP")))
     (when pkg
+      ;; T and NIL FIRST, and as themselves.  The reader turns the tokens into the
+      ;; runtime's own T and NIL, but INTERN below would have minted a fresh symbol
+      ;; under each name, so (FIND-SYMBOL "T" "CL") and (INTERN "T" ...) answered a
+      ;; T that is not EQ to T -- a type specifier SUBTYPEP then faulted on.  Seated
+      ;; here, INTERN finds them.  (EXPORT of NIL is the empty list: already external.)
+      (%pkg-set-external pkg (%symtab-add (%pkg-external pkg) "NIL" nil))
+      (%pkg-set-external pkg (%symtab-add (%pkg-external pkg) "T" t))
       (dolist (n (%standard-cl-symbol-names))
         (let ((sym (intern n pkg)))
           (export sym pkg)))

@@ -245,6 +245,12 @@
        (aset s 0 (char-code x))
        s))
     ((%cl-sym-p x) (%cl-sym-name x))
+    ;; T and NIL are symbols, and as string designators they name themselves.  They
+    ;; fell to "" below, which was harmless only while the CL package held separate
+    ;; symbols under those names; with the real T and NIL there, (FIND-ALL-SYMBOLS T)
+    ;; asked for "" (find-all-symbols.1).
+    ((null x) "NIL")
+    ((eq x t) "T")
     ;; Native MVM sym (#x50) or keyword (#x53), 1-slot hash-only.
     ;; Defer to SYMBOL-NAME which knows how to reverse-lookup the hash
     ;; through *sym-name-table* and the package symtabs.
@@ -457,7 +463,12 @@
   "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table.
    The key is the symbol's own name when they match -- one string per symbol
    however many packages it is present in -- and narrow when it fits."
-  (let ((sn (symbol-name symbol)))
+  ;; Only a symbol that CARRIES its name: a hash-only one's SYMBOL-NAME walks
+  ;; every package's table to find it, and a keyword being interned for the
+  ;; first time is in none yet -- so the reader paid that walk, for "", on
+  ;; every new keyword it met.  On a corpus read with ~100 packages that was
+  ;; nearly all of the time.  Such a symbol's key is NAME-STRING regardless.
+  (let ((sn (and (%cl-sym-p symbol) (%cl-sym-name symbol))))
     (cons (cons (%narrow-copy (if (and (stringp sn) (string= sn name-string))
                                   sn
                                   name-string))
@@ -1003,7 +1014,15 @@
         (when (and (>= c 97) (<= c 122)) (setq lower t)))
       (setq i (+ i 1)))
     (if (not lower)
-        (compute-name-hash name-str)
+        ;; Record the name here too.  A keyword carries only its key, so without it
+        ;; SYMBOL-NAME of any keyword interned at run time walked every package's
+        ;; table -- (STRING :LISPM) in cortez's #+ test, on every conditional the
+        ;; corpus reads.  Never over an entry the table already has.
+        (let ((key (compute-name-hash name-str)))
+          (when (and (hash-table-p *sym-name-table*)
+                     (null (gethash key *sym-name-table*)))
+            (setf (gethash key *sym-name-table*) (%narrow-copy name-str)))
+          key)
         (let ((out (make-string-output-stream)) (j 0))
           (loop
             (when (>= j n) (return nil))

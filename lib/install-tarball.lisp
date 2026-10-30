@@ -391,7 +391,18 @@
             (write-string-serial "  !! form eval error in ")
             (write-string-serial tag) (write-string-serial ": ")
             (handler-case (write-object c) (t (c2) (write-string-serial "<err>")))
-            (write-char-serial 10)))))))
+            (write-char-serial 10)
+            ;; NAME THE FORM, as LOAD's swallow does: a condition TYPE alone
+            ;; does not say which of a file's forms failed.
+            (handler-case
+                (progn
+                  (write-string-serial "     in form: ")
+                  (write-object (if (consp form)
+                                    (list (car form)
+                                          (if (consp (cdr form)) (cadr form) '|...|))
+                                    form))
+                  (write-char-serial 10))
+              (t (c2) nil))))))))
 
 ;;; --- .asd parsing -----------------------------------------------------------
 ;;;
@@ -692,6 +703,13 @@
    construction (lexical save + unwind-protect + setq), NOT (let ((*package*
    ...))) — see %it-eval-source's docstring for why that is not enough."
   (%it-reset-read-errors)   ; per-install; the final report reads this
+  ;; The boot-time surfaces (Genera / SB-* / ASDF interface) are installed on
+  ;; first use, and an install is about to read an .asd that asks for
+  ;; ASDF-USER.  Install them HERE, outside any READ: triggered from inside
+  ;; the .asd read -- lenient reader mode on, this file's load state bound --
+  ;; the ASDF interface died mid-install with %THROW-IN-FLIGHT.  A no-op when
+  ;; nothing is deferred (and in every image but the CLI).
+  (%force-deferred-installs)
   ;; Gray streams are installed on first use (net/sb-gray-shim.lisp), as
   ;; ASDF:LOAD-SYSTEM does -- a bare image installs through HERE, not ASDF,
   ;; so without this seal's TLS-STREAM got anonymous superclasses and every

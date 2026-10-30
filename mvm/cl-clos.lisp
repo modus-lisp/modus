@@ -1,6 +1,8 @@
 ;;;; cl-clos.lisp — Minimal CLOS implementation
 ;;;; Part of the Modus CL runtime. Depends on cl-eval.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ===================================================
 ;;; Minimal CLOS implementation for ANSI test suite
 ;;; ===================================================
@@ -597,23 +599,18 @@
   "EQ hash: symbol class NAME -> what %FIND-CLOS-CLASS-SCAN answered.  %OBJ-CPL
    asks on every SLOT-VALUE and every class TYPEP, and the scan walks every
    class in the image.  Dropped wherever *CLOS-CLASSES* is set; main thread
-   only, as *GF-FIND-MEMO*.")
+   or under the runtime lock, as *GF-FIND-MEMO* (%CLOS-MEMO-PUT).")
 
 (defun %find-clos-class (name)
   "Return class descriptor for NAME, or nil -- through *CLOS-FIND-MEMO*.
    A class object is its own descriptor (an instance's class slot holds one)."
   (when (%clos-class-p name) (return-from %find-clos-class name))
-  (if (and (symbolp name) name (%gf-cache-writable-p))
-      (let ((memo *clos-find-memo*))
-        (when (null memo)
-          (setq memo (make-hash-table :test (quote eq)))
-          (setq *clos-find-memo* memo))
-        (let ((hit (gethash name memo)))
-          (if hit
-              hit
-              (let ((c (%find-clos-class-scan name)))
-                (when c (puthash name memo c))
-                c))))
+  (if (and (symbolp name) name)
+      (let* ((memo *clos-find-memo*) (hit (and memo (gethash name memo))))
+        (or hit
+            (let* ((head *clos-classes*) (c (%find-clos-class-scan name)))
+              (when c (%clos-memo-put 2 name c head))
+              c)))
       (%find-clos-class-scan name)))
 
 (defun %find-clos-class-scan (name)
@@ -3345,6 +3342,33 @@
    %gf-check-arity + %gf-check-keys run on EVERY generic call and each re-parsed
    the lambda-list (string= over the LL keywords) -- ~4 us/call on the Pi Zero
    2 W, a big slice of the residual %gf-dispatch cost.")
+(defvar *%ll-shape-dm* nil
+  "Direct-mapped front for %GF-LL-SHAPE: 256 (lambda-list . shape) cells by the GF name's hash.")
+
+(defun %gf-ll-shape (gf ll)
+  "GF's lambda-list LL parsed, as %LAMBDA-LIST-SHAPE-CACHED -- through a front keyed by GF's
+   NAME, since the memo behind it is an EQ table on conses, which only a thread in region 0
+   can hash by address: anywhere else every generic call's arity check scanned every lambda
+   list in it.  A hit must be LL itself (EQ), so a redefined GF misses.  Filled under the
+   runtime lock (the shape is already a shared-heap copy)."
+  (let ((name (%gf-name gf)))
+    (if (and name (let ((st (obj-subtag name))) (or (eq st #x50) (eq st #x53)))
+             (fixnump (%slot-ref name 0)))
+        (let* ((i (logand (the fixnum (%slot-ref name 0)) 255)) (dm *%ll-shape-dm*)
+               (e (and (%prim-simple-vector-p dm) (svref dm i))))
+          (if (and (consp e) (eq (%ucar e) ll))
+              (%ucdr e)
+              (let ((sh (%lambda-list-shape-cached ll)))
+                (%rt-enter)
+                (let ((dm *%ll-shape-dm*))
+                  (unless (%prim-simple-vector-p dm)
+                    (setq dm (make-array 256))
+                    (setq *%ll-shape-dm* dm))
+                  (setf (svref dm i) (cons ll sh)))
+                (%rt-leave)
+                sh)))
+        (%lambda-list-shape-cached ll))))
+
 (defun %lambda-list-shape-cached (ll)
   "LOCKED, like every shared runtime table (see %RT-ENTER, mvm/prelude.lisp).
    The memo is filled lazily by WHICHEVER thread first calls a generic
@@ -3821,23 +3845,47 @@
             (setq *%gf-dm* dm))
           (setf (svref dm (logand h 255)) (cons name gf)))))))
 
+(defun %clos-memo-put (which key val head)
+  "KEY -> VAL into memo WHICH (0 *GF-FIND-MEMO*, 1 *GF-FIND-SETF-MEMO*, 2 *CLOS-FIND-MEMO*),
+   made if absent -- and only while the list the answer was scanned from still starts at HEAD:
+   a GF or class defined since would make a stored miss permanent.  ANY THREAD.  A worker takes
+   the runtime lock, which also makes the shared heap the active one, so the table and its
+   growth are not worker-region objects held by a global (the rule the dispatch caches keep by
+   being main-only).  Before this a worker never stored, so every generic call the gateway's
+   own thread made that main had not made first scanned every GF -- twice for a miss."
+  (let ((w (%gf-cache-writable-p)))
+    (unless w (%rt-enter))
+    (when (eq head (if (= which 2) *clos-classes* *generic-functions*))
+      (let ((memo (cond ((= which 0) *gf-find-memo*) ((= which 1) *gf-find-setf-memo*)
+                        (t *clos-find-memo*))))
+        (when (null memo)
+          (setq memo (make-hash-table :test (quote eq)))
+          (cond ((= which 0) (setq *gf-find-memo* memo))
+                ((= which 1) (setq *gf-find-setf-memo* memo))
+                (t (setq *clos-find-memo* memo))))
+        (puthash key memo val)))
+    (unless w (%rt-leave))
+    val))
+
+(defun %gf-dm-fill-any (name gf)
+  "%GF-DM-FILL from any thread: a worker's under the runtime lock (see %CLOS-MEMO-PUT)."
+  (if (%gf-cache-writable-p)
+      (%gf-dm-fill name gf)
+      (progn (%rt-enter) (%gf-dm-fill name gf) (%rt-leave))))
+
 (defun %find-gf (name)
   "Find generic function by name -- through *GF-FIND-MEMO* for a symbol, and
    *GF-FIND-SETF-MEMO* for a (SETF symbol) name."
   (when (and (consp name) (symbolp (car name))
              (or (eq (car name) (quote setf)) (%clos-sym-name-eq (car name) (quote setf)))
              (consp (cdr name)) (symbolp (car (cdr name))) (car (cdr name))
-             (null (cdr (cdr name))) (%gf-cache-writable-p))
-    (let ((memo *gf-find-setf-memo*) (sym (car (cdr name))))
-      (when (null memo)
-        (setq memo (make-hash-table :test (quote eq)))
-        (setq *gf-find-setf-memo* memo))
-      (let ((hit (gethash sym memo)))
-        (cond ((eq hit :%no-gf) (return-from %find-gf nil))
-              (hit (return-from %find-gf hit))
-              (t (let ((gf (%find-gf-scan name)))
-                   (puthash sym memo (if gf gf :%no-gf))
-                   (return-from %find-gf gf)))))))
+             (null (cdr (cdr name))))
+    (let* ((memo *gf-find-setf-memo*) (sym (car (cdr name))) (hit (and memo (gethash sym memo))))
+      (cond ((eq hit :%no-gf) (return-from %find-gf nil))
+            (hit (return-from %find-gf hit))
+            (t (let* ((head *generic-functions*) (gf (%find-gf-scan name)))
+                 (%clos-memo-put 1 sym (if gf gf :%no-gf) head)
+                 (return-from %find-gf gf))))))
   ;; DIRECT-MAPPED FRONT: 256 (symbol . gf) cells indexed by the symbol's
   ;; name hash, read before the EQ table (whose GETHASH was a tenth of every
   ;; generic call).  Filled from the table's hits, dropped with it.
@@ -3849,24 +3897,20 @@
             (let ((e (svref dm (logand h 255))))
               (when (and (consp e) (eq (car e) name))
                 (return-from %find-gf (cdr e)))))))))
-  (if (and (symbolp name) name (%gf-cache-writable-p))
+  (if (and (symbolp name) name)
       ;; No BOUNDP (1 us here): an absent global reads as NIL (%GV-REF).
-      (let ((memo *gf-find-memo*))
-        (when (null memo)
-          (setq memo (make-hash-table :test (quote eq)))
-          (setq *gf-find-memo* memo))
-        (let ((hit (gethash name memo)))
-          (cond
-            ((eq hit :%no-gf) nil)
-            (hit (%gf-dm-fill name hit) hit)
-            (t
-             ;; A MISS is memoised too: MAKE-INSTANCE asks for GFs that
-             ;; usually do not exist (no user INITIALIZE-INSTANCE method),
-             ;; and each miss rescanned every GF, twice.  The one push onto
-             ;; *GENERIC-FUNCTIONS* drops the memo, misses included.
-             (let ((gf (%find-gf-scan name)))
-               (puthash name memo (if gf gf :%no-gf))
-               gf)))))
+      (let* ((memo *gf-find-memo*) (hit (and memo (gethash name memo))))
+        (cond
+          ((eq hit :%no-gf) nil)
+          (hit (%gf-dm-fill-any name hit) hit)
+          (t
+           ;; A MISS is memoised too: MAKE-INSTANCE asks for GFs that
+           ;; usually do not exist (no user INITIALIZE-INSTANCE method),
+           ;; and each miss rescanned every GF, twice.  The one push onto
+           ;; *GENERIC-FUNCTIONS* drops the memo, misses included.
+           (let* ((head *generic-functions*) (gf (%find-gf-scan name)))
+             (%clos-memo-put 0 name (if gf gf :%no-gf) head)
+             gf))))
       (%find-gf-scan name)))
 
 (defun %find-gf-scan (name)
@@ -5592,7 +5636,7 @@
    (defgeneric.error.20/21)."
   (let ((ll (%gf-lambda-list gf)))
     (when ll
-      (let ((shape (%lambda-list-shape-cached ll)))
+      (let ((shape (%gf-ll-shape gf ll)))
         (when (and (nth 3 shape) (not (nth 4 shape)))
           ;; Skip required + optional args to reach the keyword portion.
           (let ((skip (+ (nth 0 shape) (nth 1 shape)))
@@ -5719,7 +5763,7 @@
    unknown)."
   (let ((ll (%gf-lambda-list gf)))
     (when ll
-      (let* ((sh (%lambda-list-shape-cached ll))
+      (let* ((sh (%gf-ll-shape gf ll))
              (req (nth 0 sh))
              ;; variadic = &optional / &rest / &key present (matches the old
              ;; %lambda-list-has-rest-or-key, which also returns T for &optional)
@@ -5770,7 +5814,7 @@
     ((or (not (consp applicable)) (%gf-combination gf)) :general)
     ((%has-default-primary-p (%gf-name gf)) :general)
     ((let ((ll (%gf-lambda-list gf)))
-       (and ll (nth 3 (%lambda-list-shape-cached ll))))
+       (and ll (nth 3 (%gf-ll-shape gf ll))))
      :general)
     ((let ((m applicable) (q nil))
        (loop (when (null m) (return q))
@@ -7743,10 +7787,14 @@
            (old-len  (array-length old-data))
            (str-data (or (stringp old-data)
                          (and (%mda-displaced a) (stringp (%mda-displaced a)))))
-           ;; Allocate new data of exactly new-size (preserve elt type).
+           ;; Allocate new data of exactly new-size (preserve elt type).  A byte
+           ;; vector keeps a byte store: it used to get a word per element on its
+           ;; first grow, and then missed every byte fast path (cram's window).
            (new-data (cond
                        (displaced-to nil)
                        (str-data (%make-string-array new-size))
+                       ((%prim-u8-vector-p old-data)
+                        (make-array new-size :element-type '(unsigned-byte 8)))
                        (t (make-array new-size)))))
       (cond
         (displaced-to
@@ -7773,11 +7821,15 @@
          (%prim-aset a 6 (%adjust-new-data a new-data new-size))
          (%prim-aset a 3 nil) (%prim-aset a 4 0))
         (t
-         (let ((i 0))
-           (loop (when (>= i new-size) (return))
-             (when (< i old-dim0)
-               (aset new-data i (aref old-data (+ old-off i))))
-             (setq i (+ i 1))))
+         (let ((n (if (< old-dim0 new-size) old-dim0 new-size)))
+           (cond ((%bulk-copy-u8-ok-p new-data old-data)
+                  (%bulk-copy-u8 new-data 0 old-data old-off n))
+                 ((%bulk-copy-ok-p new-data old-data)
+                  (%bulk-copy new-data 0 old-data old-off n))
+                 (t (let ((i 0))
+                      (loop (when (>= i n) (return))
+                        (aset new-data i (aref old-data (+ old-off i)))
+                        (setq i (+ i 1)))))))
          (%prim-aset a 6 (%adjust-new-data a new-data new-size))
          (%prim-aset a 3 nil) (%prim-aset a 4 0)))
       ;; Update dims slot to reflect the new size (rank stays 1).
@@ -8149,20 +8201,31 @@
 ;;; here.  Written in primitives: an AREF in this body would call itself.
 (defun %aref-slow (a i)
   (cond
+    ;; AN UNDISPLACED BYTE VECTOR BEHIND A HEADER FIRST -- an adjustable or fill-pointer
+    ;; (unsigned-byte 8) vector, read a byte at a time by cram's LZ77 and every stream
+    ;; buffer -- before the five type tests the inline arms already failed.  The header
+    ;; words are read with %WORD-AREF: %PRIM-AREF is the whole generic dispatch again,
+    ;; ~40 instructions a slot.  Measured on a Pi 5: this read was 57% of DEFLATE.
+    ((and (%mda-p a) (null (%word-aref a 3)) (%prim-u8-vector-p (%word-aref a 6)))
+     (%u8-ref (%word-aref a 6) i))
     ((%prim-simple-string-p a) (code-char (%word-aref a i)))
     ((%prim-simple-vector-p a) (%word-aref a i))
     ((%prim-u8-vector-p a) (%u8-ref a i))
     ((%prim-base-string-p a) (code-char (%u8-ref a i)))
     ((%prim-string32-p a) (code-char (%c32-ref a i)))
     ((%mda-p a)
-     (let ((disp (%mda-displaced a)))
+     ;; the store first: an adjustable byte vector (cram's window, a stream buffer) is
+     ;; read here on every element, and the general arm below costs five calls a read
+     (let ((disp (%prim-aref a 3)) (d (%prim-aref a 6)))
+       (if (and (null disp) (%prim-u8-vector-p d))
+           (%u8-ref d i)
        (let ((raw (if disp
                       (%aref-multi a i)
                       ;; a BIT array's data is a packed byte store
                       (if (%mda-bit-p a)
                           (%bit-store-ref (%mda-data a) i)
                           (%prim-aref (%mda-data a) i)))))
-         (if (%prim-stringp (%mda-data a)) (code-char raw) raw))))
+         (if (%prim-stringp (%mda-data a)) (code-char raw) raw)))))
     ((%raw-consp a)
      (let ((raw (%wrapper-aref a i)))
        (if (%wrapper-stringp a) (code-char raw) raw)))
@@ -8171,6 +8234,8 @@
     (t (%prim-aref a i))))
 
 (defun %aset-slow (a i val)
+  (if (and (%mda-p a) (null (%word-aref a 3)) (%prim-u8-vector-p (%word-aref a 6)))
+      (progn (%u8-set (%word-aref a 6) i val) val)     ; as %AREF-SLOW's first arm
   (let ((sto (%aset-store-val a val)))
     (cond
       ;; A NARROW string holds a byte per character: a code that does not fit
@@ -8188,16 +8253,18 @@
              (progn (%c32-set a i c) val)
              (error 'type-error :datum val :expected-type 'character))))
       ((%mda-p a)
-       (let ((disp (%mda-displaced a)))
+       (let ((disp (%prim-aref a 3)) (d (%prim-aref a 6)))
          (if disp
              (%aset-multi a sto i)
+           (if (%prim-u8-vector-p d)
+               (%prim-aset d i sto)
              (if (%mda-bit-p a)
                  (%bit-store-set (%mda-data a) i sto)
-                 (%prim-aset (%mda-data a) i sto))))
+                 (%prim-aset (%mda-data a) i sto)))))
        val)
       ((%raw-consp a) (%wrapper-aset a i sto) val)
       ((eq (obj-subtag a) #x12) (%f32-aset a i val))
-      (t (%prim-aset a i sto) val))))
+      (t (%prim-aset a i sto) val)))))
 
 ;;; %wrapper-array-length: ARRAY-LENGTH semantics — returns the underlying
 ;;; storage size (NOT the fill-pointer).  ARRAY-IN-BOUNDS-P relies on this

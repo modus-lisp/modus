@@ -62,11 +62,11 @@
 ;;;;   BEFORE anything has had a chance to dangle.
 
 (defvar *k*
-  (let ((s (%cli-getenv "XREGION_K")))
+  (let ((s (modus-int::%cli-getenv "XREGION_K")))
     (if (and s (> (length s) 0)) (parse-integer s) 1500)))
 
 (defvar *arm*
-  (let ((s (%cli-getenv "XREGION_ARM")))
+  (let ((s (modus-int::%cli-getenv "XREGION_ARM")))
     (if (and s (> (length s) 0)) s "intern")))
 
 (defvar *scratch* 0)
@@ -85,13 +85,13 @@
 ;;; global here would take the runtime lock and hop regions — which is the
 ;;; mechanism under test and has no business being in the instrument.
 (defun xr-probe (scratch k r0 intern-p)
-  (let* ((kk (%gc-meta-scale))
-         (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) kk))
-         (wto   (%gc-meta-read (+ rw #x08) kk))
-         (wsize (%gc-meta-read (+ rw #x10) kk))
-         (r0from (%gc-meta-read (+ r0 #x00) kk))
-         (r0size (%gc-meta-read (+ r0 #x10) kk))
+  (let* ((kk (modus-int::%gc-meta-scale))
+         (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) kk))
+         (wto   (modus-int::%gc-meta-read (+ rw #x08) kk))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) kk))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) kk))
+         (r0size (modus-int::%gc-meta-read (+ r0 #x10) kk))
          (held nil)
          (i 0))
     (loop
@@ -100,21 +100,21 @@
         (setq held (cons (if intern-p (intern name "COMMON-LISP-USER") name) held)))
       (setq i (+ i 1)))
     (let* ((obj (car held))
-           (aobj (%gc-word-of obj scratch))
-           (aname (%gc-word-of (if intern-p (symbol-name obj) obj) scratch))
-           (r0alloc (%gc-meta-read (+ r0 #x30) kk))
+           (aobj (modus-int::%gc-word-of obj scratch))
+           (aname (modus-int::%gc-word-of (if intern-p (symbol-name obj) obj) scratch))
+           (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) kk))
            ;; The lock arena is region-0 address space and is where every
            ;; locked-section allocation lands since B-LITE — sweep it too, or
            ;; a green here means only "the audit stopped looking".  %RT-ARENA-*
            ;; answer 0 on a pre-arena binary (historic sweep, unchanged).
-           (ab (%rt-arena-base))
-           (aa (%rt-arena-alloc))
-           (foreign (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+           (ab (modus-int::%rt-arena-base))
+           (aa (modus-int::%rt-arena-alloc))
+           (foreign (+ (modus-int::%gc-count-foreign-refs r0from r0alloc wfrom wsize)
                        (if (> aa ab)
-                           (%gc-count-foreign-refs ab aa wfrom wsize)
+                           (modus-int::%gc-count-foreign-refs ab aa wfrom wsize)
                            0))))
       (list rw wfrom wto wsize r0from r0size aobj aname foreign
-            (%gc-meta-read (+ rw #x20) kk)))))
+            (modus-int::%gc-meta-read (+ rw #x20) kk)))))
 
 (sb-thread:join-thread (sb-thread:make-thread (lambda () 1) :name "xr-gate"))
 (setq *scratch* (%mmap-shared-page 4096))
@@ -123,7 +123,7 @@
        (k *k*)
        (arm *arm*)
        (intern-p (string= arm "intern"))
-       (r0 (%gc-region-0))
+       (r0 (modus-int::%gc-region-0))
        (res (sb-thread:join-thread
              (sb-thread:make-thread (lambda () (xr-probe scratch k r0 intern-p))
                                     :name "xr-worker"))))

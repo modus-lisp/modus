@@ -11,6 +11,10 @@
 ;;; 8-byte words alike.  Then:  (sum 1..1000 - 500500) + 35 + 7 = 42.
 ;;;
 ;;; Run with:  scripts/hosted-ladder.py riscv32 test/hosted-rungs/h01-gc-survive.lisp
+;;;
+;;; On 68k the heap is sized at startup, so the same image is also the check
+;;; for that: it must answer 42 with no flag (128 MB) and with
+;;; `--dynamic-space-size 1' (the 1 MB floor: ~1500 collections).
 
 (defun build (n acc) (if (= n 0) acc (build (- n 1) (cons n acc))))
 (defun sum-list (l acc) (if (consp l) (sum-list (cdr l) (+ acc (car l))) acc))

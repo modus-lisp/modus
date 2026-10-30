@@ -1,8 +1,9 @@
 ;;;; cdc-ether.lisp - USB CDC Ethernet driver
 ;;;;
-;;;; Replaces e1000.lisp for USB-based networking (Raspberry Pi, QEMU usb-net).
-;;;; Provides the same NIC interface expected by ip.lisp:
-;;;;   e1000-send, e1000-receive, e1000-rx-buf, e1000-probe
+;;;; USB-based networking (Raspberry Pi, QEMU usb-net).  Package MODUS.NET.CDC
+;;;; (builder packages step 3): it implements MODUS.NET's NIC interface
+;;;; (net/nic.lisp) with CDCETHER-SEND / -RECEIVE / -RX-BUF / -PROBE, which an
+;;;; image binds at boot, or net/usb-netdev.lisp when it picks this NIC.
 ;;;;
 ;;;; CDC Ethernet uses raw Ethernet frames over USB bulk endpoints:
 ;;;;   Bulk OUT = send Ethernet frame
@@ -10,6 +11,8 @@
 ;;;; No extra framing headers (unlike RNDIS or LAN9514).
 ;;;;
 ;;;; Depends on: dwc2.lisp, usb.lisp, arch adapter (e1000-state-base, etc.)
+
+(in-package :modus.net.cdc)
 
 ;; ============================================================
 ;; Buffer layout
@@ -228,19 +231,3 @@
 ;; Find NIC and initialize. On RPi this initializes USB + CDC Ethernet.
 (defun cdcether-probe ()
   (cdc-ether-init))
-
-;; Thin e1000-* forwarders: images WITHOUT net/usb-netdev.lisp keep today's
-;; behaviour (cdc-ether IS the NIC).  Where usb-netdev.lisp is loaded (LAST),
-;; its dispatchers win last-defun-wins and these are shadowed.
-(defun e1000-send (buf len) (cdcether-send buf len))
-(defun e1000-receive () (cdcether-receive))
-(defun e1000-rx-buf () (cdcether-rx-buf))
-(defun e1000-probe () (cdcether-probe))
-
-;; ============================================================
-;; E1000 register stubs (called by ip.lisp init functions)
-;; These are no-ops since we don't have E1000 hardware.
-;; ============================================================
-
-(defun e1000-write-reg (reg val) nil)
-(defun e1000-read-reg (reg) 0)

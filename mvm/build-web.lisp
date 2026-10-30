@@ -415,5 +415,20 @@
         (length cl-user::*full-source*))
 (let ((target (find-target :x86-64)))
   (set-target-fixnum-bits-for target)
+  ;; The x86-64 TARGET turns on *TARGET-HAS-FPD-P* (unboxed double trees in
+  ;; baked code), but this module runs on web/mvm.js, which has no FP register
+  ;; file: the first FPD-UNBOX stopped module relocation and the image did not
+  ;; boot.  The JS engine models x86-64's words and syscalls, not its FPU.
+  (setf *target-has-fpd-p* nil)
+  ;; The web image never calls BUILD-IMAGE, so build-checks' wrapper does not
+  ;; see it: run the redefinition check around the compile directly.
+  (setf *undeclared-redefinitions* nil)
+  (clrhash *overridable-names*)
+  (clrhash *gck-fallback-census*)
+  (clrhash *gck-registered-keys*)
+  (setf *global-uses* (make-hash-table :test 'equal))
   (let ((module (compile-source-to-module cl-user::*full-source*)))
+    (check-undeclared-redefinitions)
+    (check-cross-package-calls)
+    (check-cross-package-globals)
     (web-write-module module target *web-image-path*)))

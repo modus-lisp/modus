@@ -183,21 +183,7 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
 ;;; SHRINK THIS TABLE.  It is a debt register, not a config knob.
 
 (defvar *global-check-baseline*
-  '(("build-aarch64-cli" :suppress-check-a :suppress-check-b
-     "#243 FINDING 1 (unfixed, filed): the shipping AArch64 CLI's KERNEL-MAIN
-      never calls (INIT-ALL-GLOBALS), while its x64 twin build-generic-cli
-      does.  85 defvars read back NIL there — including *SETF-EXPANDERS*,
-      *RANDOM-STATE*, INTERNAL-TIME-UNITS-PER-SECOND, the *%TRIG-* constants
-      and the whole MOST-POSITIVE-*-FLOAT family — and the two belt-and-braces
-      initialisers that exist for exactly this case, %INIT-BOOLE-CONSTANTS and
-      %INIT-STANDARD-CHARS, are not called either, so BOOLE-AND and friends are
-      NIL too (check B).  One root cause, one fix.  Exactly the #242 shape:
-      correct source, one build script that does not call the initialiser.
-      VERIFIED ON THE BINARY, not inferred: under qemu-aarch64-static the
-      shipping /home/claude/modus-aa64-cli signals UNBOUND-VARIABLE for
-      BOOLE-AND, INTERNAL-TIME-UNITS-PER-SECOND, DOUBLE-FLOAT-EPSILON,
-      MOST-POSITIVE-DOUBLE-FLOAT and *RANDOM-STATE*, where the x64 CLI built
-      from the same sources returns 6 / 1000 / 2.22d-16 / ... correctly."))
+  '()
   "Alist (build-script-basename . entries) of KNOWN, FILED, UNFIXED findings.")
 
 (defun %gck-baseline-entry (label)
@@ -467,7 +453,16 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
 ;;; *MCGC-COLLECTOR-ENABLED* / *MCGC-KIND-CHECK-ENABLED* are bug 5 of the list
 ;;; at the top of this file, still live.  Filed as #243 FINDING 3 and
 ;;; baselined below, so =force is honest too.
-(defvar *global-check-max-blob-chars* (* 8 1024 1024))
+(defvar *global-check-corpus-labels*
+  '("build-x64-linux" "build-x64" "build-aarch64-ansi" "build-aarch64-linux")
+  "The ANSI gate runners: their blob holds the test corpus, re-reading it costs
+   ~20 min, and the check is structurally quiet there, so it is skipped unless
+   MODUS_GLOBAL_CHECK=force.  BY NAME: the cut used to be a blob SIZE (8 MB),
+   and the shipping x64 CLI outgrew it (8.2 MB, 2026-10) -- so the check had
+   silently stopped running on the image it most mattered for.")
+
+(defun %gck-corpus-label-p (label)
+  (member label *global-check-corpus-labels* :test #'string=))
 
 (defun %gck-build-label ()
   "Basename of the build script SBCL was handed, e.g. \"build-generic-cli\".
@@ -505,14 +500,11 @@ failure.  Please fix mvm/build-checks.lisp.~%" ,name c)
                 (length source-text) out)
         (finish-output)
         (sb-ext:exit :code 0)))
-    (when (and (not (eq mode :force))
-               (> (length source-text) *global-check-max-blob-chars*))
-      (format t "~&;; check-global-inits (~A): blob is ~,1F MB (> ~,1F MB) — SKIPPED. ~
-This is an ANSI gate runner with the test corpus baked in; re-reading it costs ~
-~~20 min for a check that is structurally quiet there.  MODUS_GLOBAL_CHECK=force ~
-runs it anyway.~%"
-              label (/ (length source-text) 1048576.0)
-              (/ *global-check-max-blob-chars* 1048576.0))
+    (when (and (not (eq mode :force)) (%gck-corpus-label-p label))
+      (format t "~&;; check-global-inits (~A): an ANSI gate runner (~,1F MB, the test ~
+corpus baked in) — SKIPPED; re-reading it costs ~~20 min for a check that is ~
+structurally quiet there.  MODUS_GLOBAL_CHECK=force runs it anyway.~%"
+              label (/ (length source-text) 1048576.0))
       (finish-output)
       (return-from check-global-inits nil))
     (let* ((forms (or pre-read
@@ -653,81 +645,35 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
         findings)))))
 
 ;;; ============================================================
-;;; CHECK C (task #248) — LET of an UNREGISTERED special is a silent no-op
+;;; CHECK C (task #248) — LET of an earmuffed name NOTHING proclaims special
 ;;; ============================================================
 ;;;
-;;; compile-form's LET / LET* dispatch (mvm/compiler.lisp ~5153 and ~5180)
-;;; turns `(let ((*x* v)) …)` into a real dynamic binding — the
-;;; save / set-symbol-value / restore triple of COMPILE-LET-WITH-SPECIALS —
-;;; only when *X* is
+;;; CL: DEFVAR / DEFPARAMETER / (DECLAIM (SPECIAL ...)) proclaim the symbol
+;;; special, so a LET of it binds dynamically.  Until 2026-10-30 the MVM
+;;; compiler honoured that only for the CLHS-standard variables, so a LET of
+;;; any of the kernel's own specials bound LEXICALLY and callees read the
+;;; unchanged global (`(:default-initargs ...)' was never gated by
+;;; *CLOS-APPLYING-DEFAULTS* for exactly that reason).  This check existed to
+;;; find those LETs.  Now every symbol the image DEFVARs is proclaimed before
+;;; any of it compiles (%COLLECT-BLOB-SPECIAL-SYMBOLS), so a LET of a
+;;; DEFVAR'd name is dynamic and is not reported.
 ;;;
-;;;   (a) in the CLHS-standard specials table (%ENSURE-CLHS-SPECIALS-TABLE),
-;;;   (b) in *CLHS-EXTRA-SPECIALS* (build-ansi-common's per-file `declaim
-;;;       (special …)` allowlist), or
-;;;   (c) in *RUNTIME-SPECIAL-NAMES* — which is populated ONLY under
-;;;       *MVM-EVAL-RUNTIME-P*, i.e. never during a host build, or
-;;;   (d) named in a `(declare (special *x*))` in the LET's own body.
+;;; What is left is a LET of an earmuffed name that NO form of the image
+;;; proclaims, and that compiles as an ordinary lexical variable:
 ;;;
-;;; A name in none of those compiles as a PLAIN LEXICAL LET.  The special is
-;;; never bound; a callee — or the same function's own free reference from a
-;;; different lexical scope — reads the UNCHANGED global.  Nothing warns.
+;;;   DYNAMIC-INTENT  other top-level forms mention the name too: it reads as
+;;;                   a global meant to be bound, but nothing DEFVARs it.
+;;;                   These fail the build.  The fix is a DEFVAR.
+;;;   LEXICAL-ONLY    nothing outside the binding form mentions it: a lexical
+;;;                   variable that happens to wear earmuffs.  Reported only.
 ;;;
-;;; MEASURED, not inferred (scratch/probe-a.lisp, real compiler, this tree):
-;;;
-;;;   (defvar *clos-applying-defaults* nil)
-;;;   (defun rdr () *clos-applying-defaults*)
-;;;   (defun kernel-main () (let ((*clos-applying-defaults* t)) (rdr)))
-;;;        => 20 IR ops, zero symbol-value/set-symbol-value ops
-;;;
-;;;   (defun kernel-main () (let ((*print-base* 16)) (rdr2)))
-;;;        => 90 IR ops (the save/set/restore triple)
-;;;
-;;;   ... (let ((*my-flag* t)) (declare (special *my-flag*)) (rdr3))
-;;;        => 90 IR ops        <- the escape hatch, and the recommended fix
-;;;
-;;; Note the DEFVAR in probe 1: declaring the variable in the SAME blob does
-;;; NOT help.  That is the whole trap — the source reads as obviously dynamic.
-;;;
-;;; Real damage already done: `(:default-initargs …)` had never actually been
-;;; gated by *CLOS-APPLYING-DEFAULTS* because %MAKE-INSTANCE-LIST bound it with
-;;; a LET.  It surfaced only during c2896ac, when the spread call moved out of
-;;; the caller's frame, and was fixed at that one site with SETQ +
-;;; UNWIND-PROTECT.  The general hazard is live, hence this check.  It is the
-;;; THIRD distinct silent failure mode for LET-of-a-special, after a311671
-;;; fixed (1) leaking the binding on a non-local exit and (2) save/restoring a
-;;; CLHS 3.3.4 FREE declaration that establishes no binding at all.
-;;;
-;;; SEVERITY CLASSIFICATION.  Not every hit is a bug.  A LET of an earmuffed
-;;; name that nothing outside the binding form ever reads is legal, if ugly:
-;;; the lexical binding is exactly what the code gets and exactly what it uses.
-;;; So each finding is graded:
-;;;
-;;;   DYNAMIC-INTENT  the name is DEFVAR/DEFPARAMETER'd in this blob AND is
-;;;                   read or written free by at least one OTHER top-level
-;;;                   form.  The binding is meant to be seen through a call.
-;;;                   These are the true positives.
-;;;   LEXICAL-ONLY    no other top-level form mentions the name.  Deliberate
-;;;                   (or at least harmless) lexical use of an earmuffed name.
-;;;
-;;; Only DYNAMIC-INTENT findings are eligible to fail the build.
-;;;
-;;; KNOWN BLIND SPOTS, stated rather than discovered later:
-;;;   * A LET inside a DEFMACRO template that expands at RUNTIME may be fine
-;;;     even when reported: mvm-eval's compiler consults *RUNTIME-SPECIAL-NAMES*
-;;;     (populated by runtime DEFVAR), which a host build cannot see.  None of
-;;;     the findings measured at 6de6fc3 are of that shape — all are direct
-;;;     DEFUN bodies — but a future one might be, and the fix
-;;;     (`(declare (special *X*))') is correct either way.
-;;;   * Only EARMUFFED names are scanned.  A special without earmuffs has the
-;;;     same hazard and is invisible here; the convention is the signal.
-;;;   * A blob over *GLOBAL-CHECK-MAX-BLOB-CHARS* is skipped along with checks
-;;;     A and B — i.e. the four ANSI gate runners, which are not shipped.
+;;; Only EARMUFFED names are scanned; the convention is the signal.
 
 (defvar *global-check-let-special-allowlist*
   '(;; -- add entries as "NAME"  ; reason
     )
-  "Upcased names exempt from check C.  Prefer `(declare (special *X*))' at the
-   LET — that FIXES the code instead of silencing the report.  This list means
+  "Upcased names exempt from check C.  Prefer a DEFVAR of the name -- that
+   FIXES the code instead of silencing the report.  This list means
    \"not a bug\"; use *GLOBAL-CHECK-LET-SPECIAL-BASELINE* for \"a bug we have
    not fixed yet\".")
 
@@ -741,60 +687,16 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
 ;;; is filed as task #248 and is fixed the same way: add
 ;;; `(declare (special *X*))' to the LET body.
 (defvar *global-check-let-special-baseline*
-  '(("*SUPPRESS-LOOP-BLOCK-NIL*"
-     "#248 FINDING 2 (unfixed, filed) — mvm/compiler.lisp COMPILE-COMPOUND's
-      %NAMED-LOOP arm binds it so the inner simple-LOOP does not establish its
-      own (block nil …) (CLHS 6.1.2.2).  Lexical in-image ⇒ the self-hosted /
-      eval2 compiler gives a NAMED loop a spurious extra NIL block.")
-    ("*LET-SKIP-IMPLICIT-SPECIALS*"
-     "#248 FINDING 3 (unfixed, filed) — mvm/compiler.lisp
-      COMPILE-LET-WITH-SPECIALS' own recursion guard.  Its docstring says
-      `otherwise the dispatch re-detects the same names and recurses forever'.
-      Lexical in-image ⇒ the guard is INERT in every self-hosted compiler.
-      Ironic and self-referential: the LET-of-a-special machinery is itself a
-      victim of the LET-of-a-special hazard.")
-    ("*UWP-SEQ-COUNTER*"
-     "#248 FINDING 4 (unfixed, filed) — mvm/compiler.lisp MVM-COMPILE-ALL
-      resets it per compilation unit.  Lexical in-image ⇒ never reset, so the
-      counter runs monotonically across every eval2 compile in the image.
-      VERIFIED ON THE BINARY: in the shipping x64 CLI, two successive
-      `(defun f (x) (unwind-protect (+ x 1) nil))' forms leave
-      *UWP-SEQ-COUNTER* reading 2 then 3, where MVM-COMPILE-ALL's
-      `(let ((*uwp-seq-counter* 0)) …)' should have reset it to 0 each time.")
-    ("*INIT-THUNK-NAMES*"
-     "#248 FINDING 5 (unfixed, filed) — mvm/cl-eval.lisp
-      %MVM-EVAL-COMPILE-TUPLE and MVM-EVAL-FORMS both bind it around a compile.
-      Lexical in-image ⇒ the eval2 path accumulates init-thunk names globally
-      instead of per-unit.")
-    ("*AARCH64-TRANSLATED-START-IDX*"
-     "#248 FINDING 6 (unfixed, filed) — mvm/translate-aarch64.lisp
-      TRANSLATE-MVM-TO-AARCH64 let*-binds it, and its own docstring says
-      `Expose to trap-time code (e.g. fn-addr patch site recorder) via dynamic
-      variable'.  Lexical in-image ⇒ the seven `(or *aarch64-translated-start-
-      idx* 0)' readers all see 0, so a self-hosted AArch64 build appending into
-      a pre-filled boot buffer computes native offsets against the wrong base.
-      Present in build-aarch64-cli / -linux / -ssh etc., absent from x64.")
-    ;; ---- FINDING 7: one cluster, mvm/cross.lisp, build-modus-selfhost only.
-    ;; ASSEMBLE-KERNEL-IMAGE binds seven translator hand-off variables in one
-    ;; LET and BUILD-IMAGE binds *AARCH64-SERIAL-BASE*; every consumer is in
-    ;; translate-aarch64.lisp, i.e. a DIFFERENT function reading the GLOBAL.
-    ;; Lexical in-image ⇒ MODUS BUILDING AN IMAGE FROM INSIDE MODUS (the WS5
-    ;; self-host path, and only that path — the host SBCL build is fine
-    ;; because SBCL honours the DEFVARs) hands the AArch64 translator NIL for
-    ;; the GC trampoline label, the handler push/pop labels, the generic
-    ;; arithmetic bytecode offsets and the UART base.
-    ("*AARCH64-GENSUB-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GENMUL-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GENADD-BYTECODE-OFFSET*"   "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GC-COLLECT-BYTECODE-OFFSET*" "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-GC-TRAMPOLINE-LABEL*"      "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-HANDLER-POP-LABEL*"        "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-HANDLER-PUSH-LABEL*"       "#248 FINDING 7 (unfixed, filed) — cross.lisp ASSEMBLE-KERNEL-IMAGE cluster.")
-    ("*AARCH64-SERIAL-BASE*"
-     "#248 FINDING 7 (unfixed, filed) — cross.lisp BUILD-IMAGE's
-      `(let ((*aarch64-serial-base* (or *aarch64-serial-base* serial-base
-      #x09000000))) …)'.  The whole point of that LET is that the translator,
-      a different function, reads the global; lexical in-image it reads NIL."))
+  ;; Emptied 2026-10-30: every #248 finding had `(declare (special *X*))' added
+  ;; at its LET (compiler.lisp *LET-SKIP-IMPLICIT-SPECIALS*, *UWP-SEQ-COUNTER*; mvm-eval.lisp *INIT-THUNK-NAMES*; cross.lisp's
+  ;; translator hand-off cluster and *AARCH64-SERIAL-BASE*), FINDING 2's
+  ;; *SUPPRESS-LOOP-BLOCK-NIL* was REMOVED (the (%LOOP-NONIL) marker had
+  ;; replaced it; made dynamic it leaked into nested LOOPs), and FINDING 6
+  ;; (*AARCH64-TRANSLATED-START-IDX*) had already become a SETQ.  The root cause
+  ;; is still there: the MVM compiler does not treat a name DEFVAR'd in the blob
+  ;; as special, so a new LET of one is lexical again -- which this check
+  ;; catches, now with nothing to hide it behind.
+  '()
   "Alist (NAME . reason) of KNOWN, FILED, UNFIXED check-C findings.  Still
    PRINTED every build; they just do not fail it.")
 
@@ -903,12 +805,14 @@ WITH A REASON.  Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~
           (destructuring-bind (name kind tl line) h
             (let* ((declaredp (gethash name declared-vars))
                    (mentioned (gethash name mentions 0))
-                   (dynamicp (and declaredp (> mentioned 1)))
+                   (dynamicp (and (not declaredp) (> mentioned 1)))
                    (s (format nil "LET-OF-UNREGISTERED-SPECIAL ~A in ~A~@[ (blob line ~D)~] — ~
-the ~A binds it LEXICALLY; the global is never set, so callees read the old ~
-value.~:[~; The name is DEFVAR'd here and mentioned by ~:*~D top-level forms.~]"
+the ~A binds it LEXICALLY: no DEFVAR, DEFPARAMETER or DECLAIM SPECIAL in the ~
+image proclaims it.~:[~; ~:*~D top-level forms mention it, so it reads as a ~
+global meant to be bound dynamically: DEFVAR it.~]"
                                name tl line kind (and dynamicp mentioned))))
-              (cond ((not dynamicp) (push s lexical))
+              (cond (declaredp nil)   ; proclaimed: the LET binds it dynamically
+                    ((not dynamicp) (push s lexical))
                     ((assoc name *global-check-let-special-baseline* :test #'equal)
                      (push s baselined))
                     (t (push s dynamic))))))
@@ -917,7 +821,7 @@ value.~:[~; The name is DEFVAR'd here and mentioned by ~:*~D top-level forms.~]"
               baselined (nreverse baselined))
         (format t "~&;; check-let-of-unregistered-special (~A): ~D LET/LET* of an ~
 unregistered earmuffed name — ~D DYNAMIC-INTENT (~D baselined), ~D LEXICAL-ONLY~%"
-                label (length hits) (+ (length dynamic) (length baselined))
+                label (+ (length dynamic) (length baselined) (length lexical)) (+ (length dynamic) (length baselined))
                 (length baselined) (length lexical))
         (when lexical
           (format t "~{;;   [lexical-only] ~A~%~}"
@@ -1021,10 +925,26 @@ finding~:P, baselined:~%~{;;   - ~A~%~}"
    whether it is acceptable.")
 
 (defvar *global-check-warn-baseline*
+  ;; build-generic-cli, re-measured 2026-10-30 after the cleanup that took it from
+  ;; 81 / 31 / 55: forward references to a global the blob defines later are no
+  ;; longer reported (*BLOB-GLOBAL-NAMES*), the function-table scanner no longer
+  ;; harvests DEFUNs out of comments and strings (%CODE-MASK), and a docstring's
+  ;; unescaped "OPTIMISE" stopped being a variable read.  What remains, by name:
+  ;;   :implicit-global 12 -- the aarch64 translator's specials, which the shared
+  ;;     JIT code mentions in the x64 image too (*A64-PCREL* *A64-TLS-TSD-OFFSET*
+  ;;     *A64-TLS-WINDOW* *AARCH64-CALL-RELOC-NARGS* *AARCH64-CALL-RELOCS*
+  ;;     *AARCH64-FN-ADDR-LOCAL-RELOCS* *AARCH64-FN-ADDR-RELOCS*
+  ;;     *AARCH64-JIT-ADRP-FIXUPS* *AARCH64-LI-CONST-PATCHES*), the host's
+  ;;     *FN-PREPACK-REQ*, and PI / LAMBDA-LIST-KEYWORDS (set at init, per target).
+  ;;   :implicit-global-setq 8 -- *A64-JIT-PAGE-REJECT* *AARCH64-FN-ALIGN-OFFSET*
+  ;;     *AARCH64-JIT-MODE* *LINUX-X64-R14-OFFSET* (build-host variables the driver
+  ;;     text sets too) and ARRAY-DIMENSION-LIMIT ARRAY-RANK-LIMIT
+  ;;     ARRAY-TOTAL-SIZE-LIMIT CHAR-CODE-LIMIT (per-target values, set at init).
+  ;;   :unresolved-function 0.
   '(("build-generic-cli"
-     (:implicit-global . 41)
-     (:implicit-global-setq . 123)
-     (:unresolved-function . 40)))
+     (:implicit-global . 12)
+     (:implicit-global-setq . 8)
+     (:unresolved-function . 0)))
   "Per-build-script (LABEL . ((SHAPE . COUNT) …)).
 
    A FATAL shape (today only :CANNOT-COMPILE) ratchets at its baseline — 0 when
@@ -1404,7 +1324,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   (let ((mode (%gck-mode)))
     (when (eq mode :off) (return-from %gck-pre-checks nil))
     ;; E is tree-wide and blob-independent, so it runs first and unconditionally
-    ;; (the size cap below is about re-reading a 17 MB blob, not about E).
+    ;; (the corpus-runner skip below is about re-reading a 17 MB blob, not E).
     (%gck-guard "check-source-parses" (check-source-parses))
     ;; F is tree-wide too, and costs one 1 MB file read once per process.
     (%gck-guard "check-no-host-gensym" (check-no-host-gensym))
@@ -1412,7 +1332,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     ;; and only pre-read when it would not have skipped anyway.
     (if (or (eq mode :dump)
             (and (not (eq mode :force))
-                 (> (length src) *global-check-max-blob-chars*)))
+                 (%gck-corpus-label-p (%gck-build-label))))
         (%gck-guard "check-global-inits" (check-global-inits src))
         (let ((fl (handler-case (read-all-forms-with-locations src)
                     (error (e)
@@ -1445,10 +1365,265 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                     (and nm (gethash (cdr r) nm))))))
       (format t ";; gv-cache: slot table written to ~A~%" dump))))
 
-(unless *build-image-unwrapped*
+(defun %gck-redef-mode ()
+  "MODUS_REDEF_CHECK: unset or error = an undeclared redefinition fails the
+   build; warn = report it and build anyway; 0 = say nothing."
+  (let ((v (sb-ext:posix-getenv "MODUS_REDEF_CHECK")))
+    (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
+
+(defun check-undeclared-redefinitions ()
+  "Step 1 of docs/builder-packages-plan.md.  Every DEFUN that replaces an
+   earlier one in the same image must be a declared seam: the file holding the
+   default says (DECLAIM (OVERRIDABLE NAME)).  Anything else is an accident
+   that last-defun-wins resolves silently -- this names both source lines."
+  (let ((mode (%gck-redef-mode))
+        (u (reverse *undeclared-redefinitions*)))
+    (unless (eq mode :off)
+      (format t ";; redef-check: ~D undeclared redefinition~:P~%" (length u))
+      (dolist (r u)
+        (format t ";;   UNDECLARED-REDEFINITION ~A  (old: ~A, new: ~A)~%"
+                (first r) (second r) (third r)))
+      (when (and (eq mode :error) u)
+        (error "redef-check: ~D undeclared redefinition~:P (first: ~A).  Declare ~
+                the seam with (declaim (overridable NAME)) in the file that ~
+                defines the default, or delete the copy that is never used."
+               (length u) (first (first u)))))))
+
+(defvar *gck-defun-log* nil
+  "(NAME . FILE:LINE) for every function MVM-COMPILE-FUNCTION compiled in the
+   current BUILD-IMAGE, newest first.  Host-side only (see below).")
+
+(defun %gck-defun-inventory-path ()
+  (let ((path (sb-ext:posix-getenv "MODUS_DEFUN_INVENTORY")))
+    (and path (plusp (length path)) path)))
+
+(defun %gck-defun-inventory ()
+  "With MODUS_DEFUN_INVENTORY=FILE, write one line per DEFUN this image
+   compiled -- NAME, TAB, FILE:LINE -- superseded ones included, in compile
+   order.  This is what tells a dead duplicate (every image that has the old
+   definition also overrides it) from a seam (some image keeps the default):
+   the redefinition NOTEs only show the images that override.
+   MVM-COMPILE-ALL let-binds *FUNCTION-TABLE*, so the table is gone by the
+   time BUILD-IMAGE returns; the log is filled by an encapsulation instead."
+  (let ((path (%gck-defun-inventory-path)))
+    (when path
+      (with-open-file (o path :direction :output :if-exists :supersede)
+        (dolist (e (reverse *gck-defun-log*))
+          (format o "~A~C~A~%" (car e) #\Tab (or (cdr e) "?")))))))
+
+(when (%gck-defun-inventory-path)
+  (sb-int:encapsulate 'mvm-compile-function 'defun-inventory
+    (lambda (f name &rest args)
+      (push (cons name *current-source-location*) *gck-defun-log*)
+      (apply f name args))))
+
+(defvar *gck-fallback-census* nil
+  "Hash (caller-key . callee-qualified-name) -> count for every *FUNCTIONS*
+   lookup that missed its package-qualified key and resolved only through the
+   bare-name fallback in %FN-INFO-FOR-KEY.  Builder packages step 2 drives this
+   to zero: each hit is a call that crosses packages without naming the symbol
+   it means.  Filled only under MODUS_FN_FALLBACK_CENSUS=FILE.")
+
+(defun %gck-fallback-census-path ()
+  (let ((p (sb-ext:posix-getenv "MODUS_FN_FALLBACK_CENSUS")))
+    (and p (plusp (length p)) p)))
+
+(defvar *gck-registered-keys* (make-hash-table :test 'equal)
+  "Every package-qualified key %FN-REGISTER-INFO registered in this build, so
+   the census can tell a FORWARD reference (the caller's key is defined later
+   in the same build; the compile-time lookup borrowed a same-named function
+   from another package) from a CROSS-PACKAGE call (the key never exists).")
+
+(progn
+  ;; Always on: the census is also the enforcement (CHECK-CROSS-PACKAGE-CALLS).
+  (setf *gck-fallback-census* (make-hash-table :test 'equal))
+  (sb-int:encapsulate '%fn-register-info 'fallback-census
+    (lambda (f info)
+      (let ((q (function-info-qualified-name info)))
+        (when q (setf (gethash q *gck-registered-keys*) t)))
+      (funcall f info)))
+  (sb-int:encapsulate '%fn-info-for-key 'fallback-census
+    (lambda (f key)
+      (let ((r (funcall f key)))
+        (when (and r *functions* (not (gethash key *functions*)))
+          (let* ((k (cons key (or (function-info-qualified-name r)
+                                  (function-info-name r))))
+                 (e (or (gethash k *gck-fallback-census*)
+                        (setf (gethash k *gck-fallback-census*)
+                              (list 0 *current-source-location*)))))
+            (incf (first e))))
+        r))))
+
+(defun %gck-pkg-check-mode ()
+  "MODUS_PKG_CHECK: unset or error = a cross-package call that resolved only
+   through the bare-name fallback fails the build; warn = report; 0 = silent."
+  (let ((v (sb-ext:posix-getenv "MODUS_PKG_CHECK")))
+    (cond ((equal v "warn") :warn) ((equal v "0") :off) (t :error))))
+
+(defun check-cross-package-calls ()
+  "Builder packages step 2.  A call names the symbol it was READ as; when that
+   symbol's package defines no such function, the build compiler used to fall
+   back to whatever function had the same BARE name -- in any package.  That is
+   not CL: the call must name the symbol it means (qualify it, :USE the
+   package, or import the symbol).  A FORWARD reference (the caller's own
+   package defines the name later in the image) is not this, and is allowed."
+  (let ((mode (%gck-pkg-check-mode))
+        (bad nil))
+    (when *gck-fallback-census*
+      (maphash (lambda (k e)
+                 (unless (gethash (car k) *gck-registered-keys*)
+                   (push (list (car k) (cdr k) (second e) (first e)) bad)))
+               *gck-fallback-census*))
+    (unless (eq mode :off)
+      (format t ";; pkg-check: ~D cross-package call~:P resolved by bare name~%"
+              (length bad))
+      (dolist (b bad)
+        (format t ";;   CROSS-PACKAGE-CALL ~A -> ~A  (first at ~A, ~D call~:P)~%"
+                (first b) (second b) (or (third b) "?") (fourth b)))
+      (when (and (eq mode :error) bad)
+        (error "pkg-check: ~D cross-package call~:P (first: ~A -> ~A).  Name the ~
+                symbol the call means: qualify it, :USE its package, or import it."
+               (length bad) (first (first bad)) (second (first bad)))))))
+
+(defun check-cross-package-globals ()
+  "Builder packages step 2, globals.  The build compiler keys globals and
+   constants by NAME HASH, so a read of P::*X* silently finds Q::*X*, and two
+   packages that each DEFVAR *X* share one variable.  Report both: a
+   CROSS-PACKAGE-GLOBAL is a reference from a package that defines no such
+   global to one another package defines; a GLOBAL-COLLISION is one name
+   defined in two packages.  Fatal by default; MODUS_GLOBAL_PKG_CHECK=warn
+   reports instead."
+  (when *global-uses*
+    (let ((by-name (make-hash-table :test 'equal))
+          (cross nil) (coll nil))
+      (maphash (lambda (k kinds)
+                 (push (cons (car k) kinds) (gethash (cdr k) by-name)))
+               *global-uses*)
+      (maphash
+       (lambda (name entries)
+         (let ((defp (loop for (p . kinds) in entries
+                           when (member :def kinds) collect p)))
+           (when (> (length defp) 1)
+             (push (list name defp) coll))
+           (when defp
+             (loop for (p . kinds) in entries
+                   when (and (member :ref kinds) (not (member p defp :test 'equal)))
+                     do (push (list name p defp) cross)))))
+       by-name)
+      (format t ";; global-pkg-check: ~D cross-package global reference~:P, ~
+                 ~D name~:P defined in two packages~%" (length cross) (length coll))
+      (dolist (c cross)
+        (format t ";;   CROSS-PACKAGE-GLOBAL ~A::~A -> defined in ~{~A~^, ~}~%"
+                (second c) (first c) (third c)))
+      (dolist (c coll)
+        (format t ";;   GLOBAL-COLLISION ~A defined in ~{~A~^, ~}~%" (first c) (second c)))
+      (when (and (not (member (sb-ext:posix-getenv "MODUS_GLOBAL_PKG_CHECK")
+                              '("warn" "0") :test 'equal))
+                 (or cross coll))
+        (error "global-pkg-check: ~D cross-package global reference~:P, ~D collision~:P"
+               (length cross) (length coll))))))
+
+(defun %kernel-package-name-for-check-p (pn)
+  (or (member pn '("MODUS-INT" "MODUS.ASM" "MODUS.MVM.X64" "MODUS.MVM.I386")
+              :test 'string=)
+      (and (> (length pn) 6) (string= "MODUS." pn :end2 6))))
+
+(defun check-cross-package-quotes ()
+  "Builder packages step 3.  A quoted symbol keeps its home package in the
+   image, so one name quoted in two KERNEL packages is two symbols, and code
+   that compares them with EQ -- a marker one file conses and another tests
+   for -- quietly stops matching.  Report each such name; fatal unless
+   MODUS_QUOTE_PKG_CHECK=warn.  Only kernel packages count: a library's or
+   the ANSI corpus's own symbols are expected to differ by package."
+  (when *quote-uses*
+    (let ((by-name (make-hash-table :test 'equal)) (split nil))
+      (maphash (lambda (k v) (declare (ignore v))
+                 (when (%kernel-package-name-for-check-p (car k))
+                   (pushnew (car k) (gethash (cdr k) by-name) :test 'string=)))
+               *quote-uses*)
+      (maphash (lambda (name pkgs) (when (> (length pkgs) 1) (push (list name pkgs) split)))
+               by-name)
+      (setf split (sort split #'string< :key #'first))
+      (format t ";; quote-pkg-check: ~D name~:P quoted in two kernel packages (of ~D quoted symbols)~%"
+              (length split) (hash-table-count *quote-uses*))
+      (dolist (s split)
+        (format t ";;   QUOTE-SPLIT ~A in ~{~A~^, ~}~%" (first s) (second s)))
+      (when (and split
+                 (not (member (sb-ext:posix-getenv "MODUS_QUOTE_PKG_CHECK")
+                              '("warn" "0") :test 'equal)))
+        (error "quote-pkg-check: ~D name~:P quoted in two kernel packages (first: ~A in ~{~A~^, ~})"
+               (length split) (first (first split)) (second (first split)))))))
+
+(defparameter *fn-collision-baseline* '()
+  "Collisions known and accepted.  Empty: the one there was -- the x64
+   assembler's and translator's identical MODRM / REX-PREFIX -- was renamed
+   (the assembler's are ASM-MODRM / ASM-REX-PREFIX).")
+
+(defun check-cross-package-function-collisions ()
+  "Builder packages step 3.  One function NAME defined in two kernel packages
+   is two functions at build time but ONE entry in the image's runtime
+   function table (kernel packages share bare keys), and a seam whose default
+   and override land in different packages silently stops being a seam: the
+   default's callers keep calling the default (the MODUS.RUNTIME split's
+   %DEFERRED-PACKAGE-HOOK was exactly that).  Report each such name; fatal
+   unless MODUS_FN_COLLISION_CHECK=warn."
+  (let ((by (make-hash-table :test 'equal)) (coll nil))
+    (maphash (lambda (k info)
+               (declare (ignore k))
+               (let* ((q (function-info-qualified-name info))
+                      (bare (let ((n (function-info-name info)))
+                              (if (symbolp n) (symbol-name n) (princ-to-string n))))
+                      (pkg (if q (subseq q 0 (search "::" q)) "MODUS-INT")))
+                 (when (%kernel-package-name-for-check-p pkg)
+                   (pushnew pkg (gethash bare by) :test 'string=))))
+             (or *last-compiled-functions* (make-hash-table)))
+    (maphash (lambda (n pkgs)
+               (when (and (> (length pkgs) 1)
+                          (not (member n *fn-collision-baseline* :test 'string=)))
+                 (push (list n pkgs) coll)))
+             by)
+    (setf coll (sort coll #'string< :key #'first))
+    (format t ";; fn-collision-check: ~D function name~:P defined in two kernel packages (of ~D)~%"
+            (length coll) (hash-table-count by))
+    (dolist (c coll)
+      (format t ";;   FUNCTION-COLLISION ~A in ~{~A~^, ~}~%" (first c) (second c)))
+    (when (and coll
+               (not (member (sb-ext:posix-getenv "MODUS_FN_COLLISION_CHECK")
+                            '("warn" "0") :test 'equal)))
+      (error "fn-collision-check: ~D function name~:P defined in two kernel packages (first: ~A in ~{~A~^, ~})"
+             (length coll) (first (first coll)) (second (first coll))))))
+
+(defun %gck-fallback-census-dump ()
+  (let ((path (%gck-fallback-census-path)))
+    (when (and path *gck-fallback-census*)
+      (with-open-file (o path :direction :output :if-exists :supersede)
+        (maphash (lambda (k e) (format o "~D~C~A~C~A~C~A~C~A~%" (first e) #\Tab (car k)
+                                       #\Tab (cdr k) #\Tab (or (second e) "?")
+                                       #\Tab (if (gethash (car k) *gck-registered-keys*)
+                                                 "forward" "cross")))
+                 *gck-fallback-census*))
+      (format t ";; fn-fallback census: ~D distinct (key -> definition) pairs -> ~A~%"
+              (hash-table-count *gck-fallback-census*) path))))
+
+(defvar *build-image-wrapper* nil
+  "The wrapper this file installs as BUILD-IMAGE.  Re-installed whenever
+   BUILD-IMAGE is anything else: a build that loads lib/load-mvm.lisp TWICE
+   (build-uefi-cl-repl, then build-cl-repl-common) reloads cross.lisp, whose
+   DEFUN replaces the wrapper -- and a guard on *BUILD-IMAGE-UNWRAPPED* alone
+   then declined to wrap again, so that image ran no build check at all.")
+
+(unless (and *build-image-wrapper*
+             (eq (fdefinition 'build-image) *build-image-wrapper*))
   (setf *build-image-unwrapped* #'build-image)
-  (setf (fdefinition 'build-image)
+  (setf *build-image-wrapper*
         (lambda (&rest args)
+          (setf *gck-defun-log* nil)
+          (setf *undeclared-redefinitions* nil)
+          (when *gck-fallback-census* (clrhash *gck-fallback-census*))
+          (clrhash *gck-registered-keys*)
+          (setf *global-uses* (make-hash-table :test 'equal))
+          (setf *quote-uses* (make-hash-table :test 'equal))
+          (clrhash *overridable-names*)
           (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
                             (when forms
@@ -1481,7 +1656,15 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (%gck-guard "check-compiler-warns"
               (check-compiler-warns hist (nreverse unknown)))
             (%gck-guard "gv-cache-report" (%gck-gv-cache-report))
-            result))))
+            (%gck-guard "defun-inventory" (%gck-defun-inventory))
+            (%gck-guard "fn-fallback-census" (%gck-fallback-census-dump))
+            (check-undeclared-redefinitions)
+            (check-cross-package-calls)
+            (check-cross-package-globals)
+            (check-cross-package-quotes)
+            (check-cross-package-function-collisions)
+            result)))
+  (setf (fdefinition 'build-image) *build-image-wrapper*))
 
 
 ;;; ------------------------------------------------------------------

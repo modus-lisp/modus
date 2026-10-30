@@ -56,7 +56,7 @@
 (defvar *nmsg* 16)
 (defvar *nlinks* 2000)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -79,7 +79,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(let ((res (%ha-regions-selftest *nmsg* *nlinks*)))
+(let ((res (modus-int::%ha-regions-selftest *nmsg* *nlinks*)))
   (if (= res 0)
       (format t "~%SKIP: the active region is too small to carve an actor band from.~%")
       (let* ((n       (w res #x00))
@@ -189,10 +189,10 @@
           (loop
             (when (> i *nmsg*) (return 0))
             (let ((e (+ logbase (* (- i 1) 32))))
-              (if (= (%gc-read64 (+ e 24)) 1) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 e) i) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 (+ e 8)) (* i 7)) 0 (setq bad (+ bad 1)))
-              (if (= (%gc-read64 (+ e 16)) (+ i 1000)) 0 (setq bad (+ bad 1))))
+              (if (= (modus-int::%gc-read64 (+ e 24)) 1) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 e) i) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 (+ e 8)) (* i 7)) 0 (setq bad (+ bad 1)))
+              (if (= (modus-int::%gc-read64 (+ e 16)) (+ i 1000)) 0 (setq bad (+ bad 1))))
             (setq i (+ i 1)))
           (chk "log fields wrong after TWO serialisation round trips" bad 0))
 

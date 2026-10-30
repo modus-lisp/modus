@@ -137,7 +137,7 @@
 ;;; and passes WITH it, that is itself the finding, and the knob is how you
 ;;; establish it in one command instead of one edit.
 (defun gsw-selfcheck-on-p ()
-  (let ((s (%cli-getenv "GLASS_SEND_SELFCHECK")))
+  (let ((s (modus-int::%cli-getenv "GLASS_SEND_SELFCHECK")))
     (not (and s (string= s "0")))))
 
 (defun gsw-check-fb (fb tag)
@@ -167,7 +167,7 @@
     bad))
 
 (defvar *mode*
-  (let ((s (%cli-getenv "GLASS_SEND_MODE")))
+  (let ((s (modus-int::%cli-getenv "GLASS_SEND_MODE")))
     (cond ((null s) "both")
           ((= (length s) 0) "both")
           (t s))))
@@ -220,10 +220,10 @@
     ;; thread completes in every mode.
     (let ((th (sb-thread:make-thread
                (lambda ()
-                 (write-string-serial "worker: sending")
+                 (modus-int::write-string-serial "worker: sending")
                  (write-char-serial 10)
                  (gsw-send send-rects s fb *mode*)
-                 (write-string-serial "worker: sent")
+                 (modus-int::write-string-serial "worker: sent")
                  (write-char-serial 10)
                  t)
                :name "gsw-sender")))

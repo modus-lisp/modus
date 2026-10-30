@@ -20,8 +20,10 @@
 ;;;;   - Time is approximate: a busy-wait millisecond and a call-counting
 ;;;;     monotonic clock, enough for the shim's timeout loops to terminate.
 
+(declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values 0 0))
 
+(declaim (overridable %sync-cell))
 (defun %sync-cell ()
   "A zeroed 64-byte cell at a fixed address, or 0 when the arena is full."
   (multiple-value-bind (start end) (%bare-sync-arena)
@@ -42,12 +44,17 @@
     (if (zerop start) 0 (mem-ref start :u32))))
 (defun %sync-cells-exhausted () 0)
 
+(declaim (overridable %thr-cpu))
 (defun %thr-cpu () 0)
+(declaim (overridable %tls-self-base))
 (defun %tls-self-base () 0)
 
+(declaim (overridable %mutex-trylock))
 (defun %mutex-trylock (cell)
   (if (zerop (%gc-read64 cell)) (progn (%gc-write64 cell 1) 1) 0))
+(declaim (overridable %mutex-lock))
 (defun %mutex-lock (cell) (%gc-write64 cell 1) 1)
+(declaim (overridable %mutex-unlock))
 (defun %mutex-unlock (cell) (%gc-write64 cell 0) 0)
 
 ;; The clock is the arena's second word (a Lisp global's DEFVAR value is not
@@ -62,28 +69,45 @@
           (%gc-write64 (+ start 8) v)
           v))))
 
+(declaim (overridable %monotonic-ns))
 (defun %monotonic-ns ()
   ;; Each call is a microsecond, so a deadline loop that calls this and
   ;; %SLEEP-MS 1 per iteration expires.
   (%bare-clock-add 1000))
 
+(declaim (overridable %sleep-ms))
 (defun %sleep-ms (ms)
   (let ((i 0) (n (* ms 20000)))
     (loop (when (>= i n) (return nil)) (setq i (+ i 1))))
   (%bare-clock-add (* ms 1000000))
   nil)
 
+;; CLHS SLEEP.  mvm/cl-fileio.lisp's is `(defun sleep (n) nil)', and on a board that is
+;; this file's to answer (net/hosted-sync.lisp does it hosted): a SLEEP that returns at
+;; once turns every `(loop (sleep 5))' into a spin -- with threads (net/bare-threads.lisp,
+;; whose %SLEEP-MS replaces the one above) one that holds its core and, on core 0, the
+;; main thread with it.
+(defun sleep (seconds)
+  (%sleep-ms (max 0 (round (* seconds 1000))))
+  nil)
+
+(declaim (overridable %cond-wait-ms))
 (defun %cond-wait-ms (cv mtx ms)
   (declare (ignore cv mtx))
   (if (> ms 0)
       (progn (%sleep-ms ms) 1)
       (error "condition-wait with no timeout on a single-threaded bare-metal image: ~
               nothing could ever wake it")))
+(declaim (overridable %cond-bump))
 (defun %cond-bump (cv) (declare (ignore cv)) 0)
+(declaim (overridable %futex-wake))
 (defun %futex-wake (addr n) (declare (ignore addr n)) 0)
 
+(declaim (overridable %make-native-thread))
 (defun %make-native-thread (fn &rest args)
   (declare (ignore fn args))
   (error "make-thread: a bare-metal image has no threads"))
+(declaim (overridable %native-thread-alive-p))
 (defun %native-thread-alive-p (h) (declare (ignore h)) nil)
+(declaim (overridable %join-native-thread))
 (defun %join-native-thread (h) (declare (ignore h)) nil)

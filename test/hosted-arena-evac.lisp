@@ -9,7 +9,7 @@
 ;;;; memory on the fallback path.  Now a stop-the-world region-0 collection
 ;;;; EVACUATES it (translate-aarch64 / translate-x64, EVACUATING THE LOCK
 ;;;; ARENA), and a worker that finds it low collects region 0 on main's behalf
-;;;; (%GC-COLLECT-REGION-0) — main picks up its new frontier when it wakes.
+;;;; (modus-int::%GC-COLLECT-REGION-0) — main picks up its new frontier when it wakes.
 ;;;;
 ;;;; WHAT WOULD MAKE A PASS MEANINGLESS, AND WHAT STOPS IT.
 ;;;;   - No evacuation happened: every collection is checked to have REWOUND
@@ -35,8 +35,8 @@
       (progn (setq *fail* (+ *fail* 1)) (format t "  FAIL ~A~%" name))))
 
 (%sb-threads-up)
-(defun r0gcs () (%gc-meta-read (+ (%gc-region-0) #x20) (%gc-meta-scale)))
-(defun arena-used () (- (%rt-arena-alloc) (%rt-arena-base)))
+(defun r0gcs () (modus-int::%gc-meta-read (+ (modus-int::%gc-region-0) #x20) (modus-int::%gc-meta-scale)))
+(defun arena-used () (- (modus-int::%rt-arena-alloc) (modus-int::%rt-arena-base)))
 (defun list-sum (l) (let ((s 0)) (dolist (x l s) (setq s (+ s x)))))
 
 (defvar *worker-syms* nil)
@@ -49,7 +49,7 @@
       (setq mine (cons (intern (format nil "AEV-S~D" i) :cl-user) mine))
       (when (zerop (mod (+ i 1) 1000))
         (let ((before (arena-used)))
-          (%gc-collect-region-0)
+          (modus-int::%gc-collect-region-0)
           (setq log (cons (list before (arena-used)) log)))
         (dolist (s mine)
           (unless (eq (intern (symbol-name s) :cl-user) s) (setq bad (+ bad 1))))))
@@ -62,7 +62,7 @@
 (let ((keep (let ((l nil)) (dotimes (i 500) (setq l (cons i l))) l))
       (g0 (r0gcs))
       (th (sb-thread:make-thread
-            (lambda () (handler-case (worker) (error (e) (list :err (%escape-describe e))))))))
+            (lambda () (handler-case (worker) (error (e) (list :err (modus-int::%escape-describe e))))))))
   ;; main allocates in region 0 all the while
   (loop
     (when (not (sb-thread:thread-alive-p th)) (return nil))
@@ -82,9 +82,9 @@
               (every (lambda (s) (eq (intern (symbol-name s) :cl-user) s)) *worker-syms*))))
 
 (format t "~%=== THE ARENA REFILLS ITSELF UNDER A WORKER'S INTERNS ===~%")
-;; No explicit collection: the lock's own refill check (%RT-ARENA-REFILL-CHECK)
+;; No explicit collection: the lock's own refill check (modus-int::%RT-ARENA-REFILL-CHECK)
 ;; must keep a long run of locked interns off the fallback path.
-(let ((fb0 (%rt-arena-fallbacks))
+(let ((fb0 (modus-int::%rt-arena-fallbacks))
       (th (sb-thread:make-thread
             (lambda ()
               (let ((bad 0) (last nil))
@@ -98,8 +98,8 @@
     (when (not (sb-thread:thread-alive-p th)) (return nil))
     (let ((junk nil)) (dotimes (j 200) (setq junk (cons j junk)))))
   (chk "bad lookups over 60000 locked interns" (sb-thread:join-thread th) 0)
-  (chk "arena fallbacks (the corrupting path)" (- (%rt-arena-fallbacks) fb0) 0)
-  (chk-true "the arena is not full" (< (arena-used) (- (%rt-arena-end) (%rt-arena-base)))))
+  (chk "arena fallbacks (the corrupting path)" (- (modus-int::%rt-arena-fallbacks) fb0) 0)
+  (chk-true "the arena is not full" (< (arena-used) (- (modus-int::%rt-arena-end) (modus-int::%rt-arena-base)))))
 
 (format t "~%~D checks, ~D failed~%" *checks* *fail*)
 (format t "~A~%" (if (zerop *fail*) "LOCK ARENA EVACUATION: PASS" "LOCK ARENA EVACUATION: FAIL"))

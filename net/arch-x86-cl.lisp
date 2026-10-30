@@ -95,10 +95,6 @@
 (defun e1000-rx-buf-base ()  #x0C001000)
 (defun e1000-tx-desc-base () #x0C041000)
 (defun e1000-tx-buf-base ()  #x0C041400)
-(defun e1000-state-base ()   #x0C060000)
-(defun fe-scratch-base ()    #x0C060900)
-(defun ssh-conn-base ()      #x0C080000)
-(defun ssh-ipc-base ()       #x0C100000)
 
 ;; ============================================================
 ;; virtio-net (net/virtio-net.lisp) — used INSTEAD of the E1000 rings when the
@@ -129,9 +125,6 @@
 (defun spin-lock (addr) nil)
 (defun spin-unlock (addr) nil)
 (defun yield () (io-delay))
-(defun receive () (e1000-receive) nil)
-(defun actor-spawn (fn) 0)
-(defun actor-exit () nil)
+(defun receive () (modus.net:nic-receive) nil)
 (defun nfn-lookup (hash) 0)
 (defun hash-of (name) 0)
-(defun init-gc-helper () nil)

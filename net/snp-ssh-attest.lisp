@@ -25,7 +25,7 @@
   "SHA-512 of the raw host public key as a 64-byte vector, or NIL."
   (let ((k (snp-ssh-host-pubkey)))
     (when k
-      (let ((h (sha512 k)) (v (make-array 64 :element-type '(unsigned-byte 8))))
+      (let ((h (modus.crypto:sha512 k)) (v (make-array 64 :element-type '(unsigned-byte 8))))
         (dotimes (i 64 v) (setf (aref v i) (aref h i)))))))
 
 (defun %snp-print-hex-lines (tag v)

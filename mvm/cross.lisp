@@ -1163,6 +1163,16 @@
                     genmul-bc-offset)
                    (modus.mvm::*aarch64-gensub-bytecode-offset*
                     gensub-bc-offset))
+               ;; #248: dynamic in the self-host image too, where a DEFVAR
+               ;; alone leaves a LET lexical -- the translator, a different
+               ;; function, reads these globals
+               (declare (special modus.mvm::*aarch64-handler-push-label*
+                                 modus.mvm::*aarch64-handler-pop-label*
+                                 modus.mvm::*aarch64-gc-trampoline-label*
+                                 modus.mvm::*aarch64-gc-collect-bytecode-offset*
+                                 modus.mvm::*aarch64-genadd-bytecode-offset*
+                                 modus.mvm::*aarch64-genmul-bytecode-offset*
+                                 modus.mvm::*aarch64-gensub-bytecode-offset*))
                ;; Phase A: emit boot preamble into the unified buffer first.
                (let ((entry-fn (getf boot-descriptor :entry-fn)))
                  (when entry-fn (funcall entry-fn aarch64-unified-buf)))
@@ -1422,15 +1432,31 @@
               ((eq arch :68k)
                ;; BRA.L (0x60FF + 32-bit displacement, 68020+/ColdFire).
                ;; The displacement is measured from the EXTENSION WORD at
-               ;; +2, and native code starts at +6, so it is offset + 4.
-               (let ((disp (+ entry-native-offset 4)))
+               ;; +2, and native code starts at +6+PAD, so it is offset+4+PAD.
+               ;;
+               ;; PAD (NOPs) puts native code on a 16-byte VIRTUAL boundary.
+               ;; translate-68k pads every function entry to 16 relative to
+               ;; ITS buffer, which is 16 in memory only if the buffer starts
+               ;; on one.  The hosted CL image's larger boot stub left it at 12
+               ;; mod 16, so every #'NAME tagged as #x...F -- the FORWARDING
+               ;; tag -- and the first collection took the car of a cons
+               ;; holding one for a forwarding pointer: *GF-STUB-CLOSURES*
+               ;; became a pointer into code and every FUNCTIONP after it
+               ;; signalled.  Same fix as RISC-V's above.
+               (let* ((base (+ (or (getf boot-descriptor :load-addr) 0)
+                               (wrap-header-size-for-boot boot-descriptor)))
+                      (pad (mod (- 16 (mod (+ base (mvm-buffer-position final-buf) 6) 16)) 16))
+                      (disp (+ entry-native-offset 4 pad)))
                  (mvm-emit-byte final-buf #x60)
                  (mvm-emit-byte final-buf #xFF)
                  (mvm-emit-byte final-buf (logand (ash disp -24) #xFF))
                  (mvm-emit-byte final-buf (logand (ash disp -16) #xFF))
                  (mvm-emit-byte final-buf (logand (ash disp -8) #xFF))
                  (mvm-emit-byte final-buf (logand disp #xFF))
-                 (setq jmp-size 6))))))
+                 (dotimes (i (floor pad 2))
+                   (mvm-emit-byte final-buf #x4E)
+                   (mvm-emit-byte final-buf #x71))
+                 (setq jmp-size (+ 6 pad)))))))
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (setf (kernel-image-native-image-offset image) code-offset)
@@ -1741,24 +1767,30 @@
                          0))
          (nio (or (kernel-image-native-image-offset image) 0))
          (ncl (length (kernel-image-native-code image)))
-         (sorted (stable-sort (copy-list function-table)
-                              #'< :key #'mvm-function-info-native-offset)))
+         ;; (native-offset . name): the functions, and the unnamed runtime code a translator
+         ;; appended after them (aarch64's *A64-RUNTIME-MARKS*), so a PC in the collector is
+         ;; not charged to the last function
+         (marks (let ((sym (find-symbol "*A64-RUNTIME-MARKS*" "MODUS.MVM")))
+                  (and sym (boundp sym)
+                       (prog1 (mapcar (lambda (m) (cons (cdr m) (car m))) (symbol-value sym))
+                         (setf (symbol-value sym) nil)))))
+         (sorted (stable-sort (append (mapcar (lambda (fi)
+                                                (cons (or (mvm-function-info-native-offset fi) 0)
+                                                      (string (mvm-function-info-name fi))))
+                                              function-table)
+                                      marks)
+                              #'< :key #'car)))
     (with-open-file (out path :direction :output :if-exists :supersede
                               :if-does-not-exist :create)
       (format out "# virtual-addr~Csize~Cnative-offset~Cname~%"
               #\Tab #\Tab #\Tab)
-      (loop for fi in sorted
-            for i from 0
-            for nat-off = (or (mvm-function-info-native-offset fi) 0)
-            for next-off = (if (< (1+ i) (length sorted))
-                               (mvm-function-info-native-offset
-                                 (nth (1+ i) sorted))
-                               ncl)
+      (loop for (nat-off . name) in sorted
+            for rest = (cdr sorted) then (cdr rest)
+            for next-off = (if rest (car (first rest)) ncl)
             for size = (max 0 (- next-off nat-off))
             for vaddr = (+ load-addr elf-header nio nat-off)
             do (format out "~16,'0X~C~D~C~D~C~A~%"
-                       vaddr #\Tab size #\Tab nat-off #\Tab
-                       (string (mvm-function-info-name fi))))
+                       vaddr #\Tab size #\Tab nat-off #\Tab name))
       (format t "  Wrote symbol map: ~A~%" path))))
 
 ;;; ============================================================
@@ -1840,6 +1872,7 @@
                (serial-base (getf boot-desc :serial-base)))
           ;; Serial base priority: explicit setf > boot descriptor > QEMU virt default
           (let ((*aarch64-serial-base* (or *aarch64-serial-base* serial-base #x09000000)))
+            (declare (special *aarch64-serial-base*))   ; #248: the translator reads it
             ;; Assemble image
             (let ((%img (assemble-kernel-image module target-desc
                                                :boot-descriptor boot-desc)))
@@ -1926,6 +1959,23 @@
           until (eq form :eof)
           collect form)))
 
+(defun %skip-blank-and-comments (text pos)
+  "The index of the first character at or after POS in TEXT that is not
+   whitespace, a ; comment or a #| |# block -- where the next form starts."
+  (let ((n (length text)))
+    (loop
+      (cond ((>= pos n) (return pos))
+            ((member (char text pos) '(#\Space #\Tab #\Newline #\Return #\Page))
+             (incf pos))
+            ((char= (char text pos) #\;)
+             (let ((nl (position #\Newline text :start pos)))
+               (setq pos (if nl (1+ nl) n))))
+            ((and (char= (char text pos) #\#) (< (1+ pos) n)
+                  (char= (char text (1+ pos)) #\|))
+             (let ((end (search "|#" text :start2 (+ pos 2))))
+               (setq pos (if end (+ end 2) n))))
+            (t (return pos))))))
+
 (defun read-all-forms-with-locations (source-text)
   "Read all Lisp forms from SOURCE-TEXT, tracking line numbers.
    Returns (forms . line-numbers) where line-numbers is a vector
@@ -1977,7 +2027,10 @@
         (*package* (or (find-package :modus.mvm) *package*)))
     (with-input-from-string (stream source-text)
       (loop
-        (let ((pos (file-position stream)))
+        (let ((pos (%skip-blank-and-comments source-text (file-position stream))))
+          ;; The line of the form ITSELF, not of the whitespace and comments
+          ;; the reader is about to skip: a DEFUN under a header comment was
+          ;; reported at the comment's first line.
           (incf line-count (count #\Newline source-text :start prev-pos :end pos))
           (setf prev-pos pos)
           (let ((form (handler-case (read stream nil :eof)
@@ -2035,11 +2088,28 @@
    install-x64-translator tail strip, etc.): the trailing reset is cut off
    with the tail, so re-append this after the SUBSEQ.")
 
-(defun %build-package-scoped-source (text)
-  "Wrap TEXT so it reads hermetically in :MODUS.MVM.  See
-   *BUILD-PACKAGE-RESET-TEXT*.  MVM-TEXT (seven build scripts) is the only
-   caller; keep them identical."
-  (concatenate 'string *build-package-reset-text* text *build-package-reset-text*))
+(defun %source-file-marker (path)
+  "The toplevel form that tells the build compiler which file the forms after
+   it came from: %SOURCE-FILE, a no-op that only sets the file a definition and
+   a redefinition are reported against.  No newline, so it shares the file's
+   first line and every blob line number is unchanged."
+  (if path (format nil "(%source-file ~S)" (namestring path)) ""))
+
+(defun %source-file-trailer (path)
+  "The marker that closes PATH's text: whatever the blob carries next WITHOUT a
+   marker of its own (a string built in a build script, an appended override)
+   is reported as \"after:PATH:N\", N counted from here.  Without it such text
+   inherited PATH's name and reported lines past PATH's end."
+  (if path (format nil "(%source-file ~S)"
+                   (concatenate 'string "after:" (namestring path)))
+      ""))
+
+(defun %build-package-scoped-source (text &optional path)
+  "Wrap TEXT so it reads hermetically in :MODUS.MVM, marked as coming from PATH.
+   See *BUILD-PACKAGE-RESET-TEXT* and %SOURCE-FILE-MARKER.  MVM-TEXT is the
+   only caller; keep them identical."
+  (concatenate 'string *build-package-reset-text* (%source-file-marker path)
+               text *build-package-reset-text* (%source-file-trailer path)))
 
 (defun check-parses (path)
   "Verify PATH reads cleanly with SBCL's reader — errors loudly otherwise.

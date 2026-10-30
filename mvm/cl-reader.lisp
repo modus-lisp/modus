@@ -1,6 +1,8 @@
 ;;;; cl-reader.lisp — Reader, readtable, eval infrastructure
 ;;;; Part of the Modus CL runtime. Depends on cl-printer.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Common Lisp Reader (Layer 2)
 ;;; ============================================================
@@ -1982,13 +1984,12 @@
                     ((name-char name-str))
                     (t (%reader-error "unknown character name"))))))))))
 
-(defun %sharp-colon-plain-p (ch)
-  "CH starts a #: token that needs no forcing to a symbol: a letter."
-  (let ((c (char-code ch)))
-    (or (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122)))))
-
 (defun %read-uninterned-symbol (stream rt)
-  "Read #:symbol — uninterned symbol."
+  "Read #:symbol — uninterned symbol.
+   The NAME is taken from the token's characters, never by reading the token as a symbol and
+   copying that one's name: that INTERNED it in *PACKAGE* on the way.  `(import ..)' of a name
+   an earlier #:NAME had touched then signalled a conflict -- glass's transports.lisp lists the
+   names it imports as #:NAMEs, and on modus the import failed for every one."
   (let ((ch (read-char stream nil nil t)))
     ;; #: at end of file: the token after it is empty, so the symbol is #:|| (SBCL too).
     ;; Likewise when a delimiter ends it at once: "#: x" is #:|| and then X.
@@ -1996,25 +1997,17 @@
     (when (or (%rt-ws-p ch rt) (%terminating-macro-p ch rt))
       (unread-char ch stream)
       (return-from %read-uninterned-symbol (if *read-suppress* nil (make-symbol ""))))
-    ;; %read-token-from consumes CH as the first char and reads the REST
-    ;; from the stream — do NOT unread CH, or it is processed twice and the
-    ;; first char of the name is doubled (#:foo -> FFOO).
-    ;; HAS-ESCAPE T: what follows #: is a symbol name even when it would
-    ;; read as a number or the consing dot (#:. is the symbol named ".",
-    ;; SYNTAX.SHARP-COLON.7).
-    (let ((obj (%read-token-from stream ch rt (not (%sharp-colon-plain-p ch)))))
-      ;; obj would be interned — we need to make uninterned version
-      ;; Extract name from the interned result
-      (if *read-suppress* nil
-          (let ((name (cond
-                        ((null obj) "NIL")
-                        ((eq obj t) "T")
-                        ((%cl-sym-p obj) (%cl-sym-name obj))
-                        ((stringp obj) obj)
-                        (t ""))))
-            ;; Re-read: we need raw chars for the name
-            ;; Actually, let's read the token properly
-            (make-symbol name))))))
+    ;; %token-process-first consumes CH as the first char and the loop reads the REST from the
+    ;; stream -- do NOT unread CH, or the first char of the name is doubled (#:foo -> FFOO).
+    ;; HAS-ESCAPE T: what follows #: is a symbol name even when it would read as a number or
+    ;; the consing dot (#:. is the symbol named ".", SYNTAX.SHARP-COLON.7).
+    (let* ((first (%token-process-first ch stream rt))
+           (st (%token-read-loop stream rt (%token-state-new (car first) (cadr first)
+                                                              (caddr first) t))))
+      (if *read-suppress*
+          nil
+          (make-symbol (%codes-to-string
+                        (%apply-readtable-case (nreverse (aref st 0)) (nreverse (aref st 1)) rt)))))))
 
 (defun %skip-block-comment (stream)
   "Skip #| ... |# block comment, handling nesting."

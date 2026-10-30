@@ -14,13 +14,29 @@
 #    time is reported as a flake; one that passes on BASE and fails on FIX
 #    again fails the gate.  A shard that does not finish at FIX but did at
 #    BASE fails it too.
+# 4. DDC, one x64 and one AArch64, at both refs, in the background from the
+#    start (about 14 minutes, so it overlaps 1-3): the self-hosted compiler
+#    must rebuild the UEFI x64 image byte-for-byte as SBCL built it
+#    (test/run-uefi-ddc.sh), and emit the same Linux/AArch64 image as SBCL
+#    from that source (test/run-aarch64-ddc.sh, reusing its modus-sh).
+#    Either failing at FIX fails the gate unless it also fails at BASE
+#    (reported, as a build that fails at both refs is).  MODUS_GATE_NO_DDC=1
+#    skips both.
 #
-# Worktrees, images and transcripts go in WORKDIR (default /tmp/modus-gate),
+# Worktrees, images and transcripts go in WORKDIR (default /var/tmp/modus-gate),
 # which is left in place for inspection.  Exit 0 = PASS.
 set -u
 BASE_REF=${1:?usage: acceptance-gate.sh BASE-REF FIX-REF [WORKDIR]}
 FIX_REF=${2:?usage: acceptance-gate.sh BASE-REF FIX-REF [WORKDIR]}
-WORKDIR=${3:-/tmp/modus-gate}
+WORKDIR=${3:-/var/tmp/modus-gate}
+# NOT UNDER /tmp: build-matrix.sh runs each build in a namespace that
+# bind-mounts a private /tmp, which hides a worktree that lives under /tmp --
+# every build then fails in 0 s with "can't cd", at both refs, and the gate
+# reports "no x64 CLI at fix".
+case "$WORKDIR" in /tmp|/tmp/*)
+  echo "acceptance-gate: WORKDIR must not be under /tmp (build-matrix hides it); got $WORKDIR" >&2
+  exit 2 ;;
+esac
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$WORKDIR" || exit 2
 WORKDIR=$(cd "$WORKDIR" && pwd)
@@ -46,12 +62,31 @@ BASE_WT=$(wt_for "$BASE_REF") || exit 2
 FIX_WT=$(wt_for "$FIX_REF") || exit 2
 FAIL=0
 
+# ---- 4. DDC, started first: it needs only the two trees --------------------
+ddc_start() { # side worktree
+  if [ -n "${MODUS_GATE_NO_DDC:-}" ] || [ ! -x "$2/test/run-uefi-ddc.sh" ]; then
+    echo "skipped" > "$WORKDIR/ddc-$1.verdict"; echo "skipped" > "$WORKDIR/aa64-$1.verdict"; return
+  fi
+  ( MODUS_DDC_WORK=$WORKDIR/ddc-$1 "$2/test/run-uefi-ddc.sh" > "$WORKDIR/ddc-$1.log" 2>&1
+    echo $? > "$WORKDIR/ddc-$1.verdict"
+    if [ -x "$2/test/run-aarch64-ddc.sh" ]; then
+      "$2/test/run-aarch64-ddc.sh" "$WORKDIR/ddc-$1" > "$WORKDIR/aa64-$1.log" 2>&1
+      echo $? > "$WORKDIR/aa64-$1.verdict"
+    else
+      echo "skipped" > "$WORKDIR/aa64-$1.verdict"
+    fi ) &
+  echo $! > "$WORKDIR/ddc-$1.pid"
+}
+rm -f "$WORKDIR"/ddc-*.verdict "$WORKDIR"/aa64-*.verdict
+ddc_start base "$BASE_WT"
+ddc_start fix "$FIX_WT"
+
 # ---- 1. builds --------------------------------------------------------------
 # FIX's harness and list drive both sides: the list names what must build.
 echo "-- building every image at both refs --"
-"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$BASE_WT" "$WORKDIR/mx-base" > "$WORKDIR/mx-base.log" 2>&1 &
-"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$FIX_WT" "$WORKDIR/mx-fix" > "$WORKDIR/mx-fix.log" 2>&1 &
-wait
+"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$BASE_WT" "$WORKDIR/mx-base" > "$WORKDIR/mx-base.log" 2>&1 & w1=$!
+"$FIX_WT/scripts/build-matrix.sh" -j "$JOBS" -t "$FIX_WT" "$WORKDIR/mx-fix" > "$WORKDIR/mx-fix.log" 2>&1 & w2=$!
+wait $w1 $w2
 nb=0 nbad=0
 for d in "$WORKDIR"/mx-fix/*/; do
   n=$(basename "$d"); rf=$(cat "$d/rc" 2>/dev/null || echo X)
@@ -98,9 +133,9 @@ fi
 # ---- 3. conformance -----------------------------------------------------------
 echo "-- upstream ansi-test sweep on both CLIs --"
 SWEEP=$FIX_WT/scripts/ansi-sweep.sh
-"$SWEEP" "$CLI_BASE" "$WORKDIR/sw-base" > /dev/null 2>&1 &
-"$SWEEP" "$CLI_FIX" "$WORKDIR/sw-fix" > /dev/null 2>&1 &
-wait
+"$SWEEP" "$CLI_BASE" "$WORKDIR/sw-base" > /dev/null 2>&1 & w1=$!
+"$SWEEP" "$CLI_FIX" "$WORKDIR/sw-fix" > /dev/null 2>&1 & w2=$!
+wait $w1 $w2
 for side in base fix; do
   if [ ! -s "$WORKDIR/sw-$side/summary" ] || [ ! -s "$WORKDIR/sw-$side/pass" ]; then
     echo "VERDICT: FAIL (the $side sweep produced no results; see $WORKDIR/sw-$side)"; exit 1
@@ -127,9 +162,9 @@ comm -13 "$WORKDIR/sw-base/pass" "$WORKDIR/sw-fix/pass" > "$WORKDIR/gained"
 echo "lost=$(wc -l < "$WORKDIR/lost") gained=$(wc -l < "$WORKDIR/gained")"
 if [ -s "$WORKDIR/lost" ]; then
   echo "-- re-running the lost tests alone on both CLIs --"
-  "$SWEEP" "$CLI_BASE" "$WORKDIR/re-base" "$WORKDIR/lost" > /dev/null 2>&1 &
-  "$SWEEP" "$CLI_FIX" "$WORKDIR/re-fix" "$WORKDIR/lost" > /dev/null 2>&1 &
-  wait
+  "$SWEEP" "$CLI_BASE" "$WORKDIR/re-base" "$WORKDIR/lost" > /dev/null 2>&1 & w1=$!
+  "$SWEEP" "$CLI_FIX" "$WORKDIR/re-fix" "$WORKDIR/lost" > /dev/null 2>&1 & w2=$!
+  wait $w1 $w2
   # lost for real: passes on base again and fails on fix again
   comm -12 "$WORKDIR/re-base/pass" "$WORKDIR/re-fix/fail" > "$WORKDIR/lost-real"
   comm -23 "$WORKDIR/lost" "$WORKDIR/lost-real" > "$WORKDIR/lost-flaky"
@@ -139,5 +174,27 @@ if [ -s "$WORKDIR/lost" ]; then
   fi
 fi
 [ -s "$WORKDIR/gained" ] && echo "gained: $(tr '\n' ' ' < "$WORKDIR/gained" | cut -c1-600)"
+
+# ---- 4. DDC verdicts --------------------------------------------------------
+for side in base fix; do
+  [ -s "$WORKDIR/ddc-$side.pid" ] && while kill -0 "$(cat "$WORKDIR/ddc-$side.pid")" 2>/dev/null; do sleep 5; done
+done
+ddc_verdict() { # kind label
+  local b f
+  b=$(cat "$WORKDIR/$1-base.verdict" 2>/dev/null || echo X)
+  f=$(cat "$WORKDIR/$1-fix.verdict" 2>/dev/null || echo X)
+  if [ "$f" = skipped ]; then
+    echo "$2: skipped"
+  elif [ "$f" = 0 ]; then
+    echo "$2: PASS"
+  elif [ "$b" = 0 ] || [ "$b" = skipped ]; then
+    echo "$2: FAIL at fix, $([ "$b" = 0 ] && echo PASS || echo not run) at base (see $WORKDIR/$1-fix.log)"; FAIL=1
+    grep -a "DIFF\|FAIL" "$WORKDIR/$1-fix.log" | head -3
+  else
+    echo "$2: fails at both refs (base $b / fix $f; see $WORKDIR/$1-fix.log)"
+  fi
+}
+ddc_verdict ddc "ddc x64 (UEFI image)"
+ddc_verdict aa64 "ddc aarch64 (Linux image)"
 
 if [ $FAIL -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL"; exit 1; fi

@@ -30,7 +30,6 @@
 
 (load (merge-pathnames "../lib/load-mvm.lisp"
                        (directory-namestring (truename *load-truename*))))
-(mvm-load "mvm/repl-source.lisp")
 
 (format t "~%=== Building generic Modus image ===~%")
 
@@ -179,7 +178,8 @@
     (setf *translate-x64-source*
           ;; #211: re-append the package reset the trim just cut off.
           (concatenate 'string (subseq *translate-x64-source* 0 pos)
-                       modus.mvm::*build-package-reset-text*))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-x64.lisp")))))
 
 ;; Translator co-init: defvar/defparameter init-thunks do NOT run at boot
 ;; (CLAUDE.md item 7), so the translator's three lookup tables (*registers*,
@@ -250,6 +250,12 @@
     (aset v 18 (quote r14)) (aset v 19 (quote r15))
     (aset v 20 (quote rsp)) (aset v 21 (quote rbp))
     (setq *vreg-to-x64* v))
+  ;; Before LINUX-X64-NATIVE-CODE-OFFSET: it runs the boot-stub emitter, which
+  ;; compares this numerically (fcb5a4a2), and a defvar's value never reaches
+  ;; the image (limitation #7) -- NIL there killed modus-sh at boot.  A
+  ;; literal: +LINUX-X64-GC-MIDPOINT+ is MODUS-INT's and this text is read in
+  ;; MODUS.ASM, so naming it is a cross-package global the build rejects.
+  (setq *linux-x64-r14-offset* #x38000000)
   (setq *x64-native-code-offset* (linux-x64-native-code-offset))  ; WS5 modus3 FIX: linux-x64 boot preamble
   ;; is 397 bytes; install-x64-translator runs IN-IMAGE and is the authoritative
   ;; runtime setter (the host-only (setf … 397) at file tail doesn't persist —
@@ -447,7 +453,8 @@
     (setf *translate-aa64-source*
           ;; #211: re-append the package reset the trim just cut off.
           (concatenate 'string (subseq *translate-aa64-source* 0 pos)
-                       modus.mvm::*build-package-reset-text*))))
+                       modus.mvm::*build-package-reset-text*
+                     (modus.mvm::%source-file-trailer "mvm/translate-aarch64.lisp")))))
 
 ;;; --- The 4-function AArch64 encoder closure the Linux boot entry needs ---
 ;; EMIT-LINUX-AARCH64-ENTRY calls EMIT-AARCH64-U32 and EMIT-AARCH64-LOAD-IMM64,
@@ -562,6 +569,7 @@
       (write-string-serial \" first-bad=\") (print-dec bad)
       (write-char-serial 10))
     bad))
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   ;; (a) vreg -> AArch64 physical register number.  Mirrors the
   ;; *a64-vreg-to-phys* defparameter AND *target-aarch64*'s :reg-map:
@@ -1080,6 +1088,8 @@
     (string #\Newline)
     (mvm-text "mvm/cl-packages.lisp")
     (string #\Newline)
+    (mvm-text "mvm/kernel-packages.lisp")
+    (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
     (string #\Newline)
     (mvm-text "mvm/ansi-test-aux.lisp")
@@ -1144,13 +1154,81 @@
 ;; runtime source and emit (puthash "NAME" *symbol-function-table*
 ;; #'NAME) calls so the runtime can resolve any defun by name.
 
-(defun scan-defuns (text)
-  "Return list of defun names (strings) found in TEXT."
-  (let ((names nil)
-        (pos 0))
+(defun %scan-in-packages (text)
+  "Positions of the (in-package X) forms that start a line in TEXT, as
+   (position . PACKAGE-NAME), in order.  Every MVM-TEXT file is wrapped in the
+   MODUS.MVM reset, so this sees each file's own package and the reset after it."
+  (let ((out nil) (pos 0))
     (loop
-      (let ((p (search "(defun " text :start2 pos)))
+      (let ((p (search "(in-package " text :start2 pos)))
+        (unless p (return (nreverse out)))
+        (when (or (= p 0) (char= (char text (1- p)) #\Newline)
+                  (char= (char text (1- p)) #\)))
+          (let* ((s (+ p 12))
+                 (e (or (position #\) text :start s) (length text)))
+                 (tok (string-trim " \"" (subseq text s e))))
+            (when (and (> (length tok) 1) (char= (char tok 0) #\#)) (setq tok (subseq tok 1)))
+            (when (and (> (length tok) 0) (char= (char tok 0) #\:)) (setq tok (subseq tok 1)))
+            (push (cons p (string-upcase tok)) out)))
+        (setq pos (+ p 12))))))
+
+(defvar *scan-defuns-qualified* (make-hash-table :test 'equal)
+  "The \"PKG::NAME\" strings SCAN-DEFUNS produced itself.  EMIT-SFT-AUTO keys
+   those by the bare NAME, as before; a name written qualified in the source
+   (MODUS::SHARE) keeps its qualified key.")
+
+;;; Which characters of TEXT are CODE: not inside a ; comment, a #|...|# block or a
+;;; string literal (#\X character literals are code and skipped as a pair).  The scanners
+;;; below search the TEXT, and a "(defun NAME" in a comment or a docstring is not a
+;;; definition -- harvesting one emitted #'NAME for a function the image never had (the
+;;; li-func "unresolved function" warnings: F, FIB, SQ, ADD3, MAKE-LEXER ...).
+(defun %code-mask (text)
+  (let* ((n (length text))
+         (mask (make-array n :element-type 'bit :initial-element 0))
+         (i 0))
+    (loop while (< i n) do
+      (let ((c (char text i)))
+        (cond
+          ((char= c #\;)
+           (loop while (and (< i n) (char/= (char text i) #\Newline)) do (incf i)))
+          ((and (char= c #\#) (< (1+ i) n) (char= (char text (1+ i)) #\|))
+           (let ((depth 1)) (incf i 2)
+             (loop while (and (< i n) (> depth 0)) do
+               (cond ((and (char= (char text i) #\|) (< (1+ i) n) (char= (char text (1+ i)) #\#))
+                      (decf depth) (incf i 2))
+                     ((and (char= (char text i) #\#) (< (1+ i) n) (char= (char text (1+ i)) #\|))
+                      (incf depth) (incf i 2))
+                     (t (incf i))))))
+          ((char= c #\")
+           (incf i)
+           (loop while (and (< i n) (char/= (char text i) #\")) do
+             (when (char= (char text i) #\\) (incf i))
+             (incf i))
+           (incf i))
+          ((and (char= c #\#) (< (1+ i) n) (char= (char text (1+ i)) #\\))
+           (setf (sbit mask i) 1) (incf i)
+           (when (< i n) (setf (sbit mask i) 1) (incf i))
+           (when (< i n) (setf (sbit mask i) 1) (incf i)))
+          (t (setf (sbit mask i) 1) (incf i)))))
+    mask))
+
+(defun scan-defuns (text)
+  "Return list of defun names (strings) found in TEXT.  A defun read in a
+   package other than MODUS.MVM comes back as \"PKG::NAME\", so the generated
+   #'NAME in EMIT-SFT-AUTO names the symbol the defun defined (builder packages
+   step 2: no call may rely on the bare-name fallback)."
+  (let ((names nil)
+        (pos 0)
+        (pkgs (%scan-in-packages text))
+        (pkg "MODUS.MVM")
+        (code (%code-mask text)))
+    (loop
+      (let ((p (loop (let ((q (search "(defun " text :start2 pos)))
+                       (when (or (null q) (= 1 (sbit code q))) (return q))
+                       (setq pos (1+ q))))))
         (unless p (return (nreverse names)))
+        (loop while (and pkgs (< (car (first pkgs)) p))
+              do (setq pkg (cdr (pop pkgs))))
         (let* ((start (+ p 7))
                (end (or (position-if (lambda (c)
                                        (or (char= c #\Space)
@@ -1158,8 +1236,20 @@
                                            (char= c #\()
                                            (char= c #\)))) text
                                      :start start)
-                        (length text))))
-          (push (string-upcase (subseq text start end)) names)
+                        (length text)))
+               (name (string-upcase (subseq text start end))))
+          ;; A package the HOST lacks means the (in-package ...) was text
+          ;; inside a string (embedded test source), not the reader's state.
+          (push (if (or (string= pkg "MODUS.MVM") (find #\: name)
+                        ;; (defun (setf X) ...): no name here; the filter in
+                        ;; *ALL-DEFUN-NAMES* drops "" but not "PKG::"
+                        (zerop (length name))
+                        (not (find-package pkg)))
+                    name
+                    (let ((q (concatenate 'string pkg "::" name)))
+                      (setf (gethash q *scan-defuns-qualified*) name)
+                      q))
+                names)
           (setq pos end))))))
 
 ;; Driver source is concatenated into the image AND scanned for
@@ -1563,6 +1653,14 @@
         ;; or the DDC diverges -- it did, by 61,440 bytes, when SBCL emitted the
         ;; reject and this still forced it off.
         (setq *ws5-force-no-kindcheck* nil)
+        ;; THE CONSOLE HOOK, the same class: build-cl-repl-common sets
+        ;; *WRITE-CHAR-SERIAL-HOOK* to %CONSOLE-WRITE-CHAR at HOST build time
+        ;; (the PC console mirrors COM1 to the screen), so SBCL emitted a CALL
+        ;; for every WRITE-CHAR-SERIAL where this emitted the raw trap -- 223
+        ;; inlined serial writes against SBCL's 2, the image 512 bytes longer.
+        ;; The console source is in the image exactly when that hook is set.
+        (when (search \"(defun %console-write-char\" src)
+          (setq *write-char-serial-hook* (quote %console-write-char)))
         (setq *x64-native-code-offset* (+ 5 (uefi-cl-preamble-length)))
         (write-string-serial \"modus --compile-uefi: snp-mode \")
         (write-object *x64-snp-mode*)
@@ -1626,9 +1724,22 @@
         (progn (write-string-serial \"modus --compile-aarch64: cannot read \")
                (write-string-serial in) (write-char-serial 10) (sys-exit 1))
        (progn
+        ;; The fast AArch64 DDC (test/run-aarch64-ddc.sh) compiles the same
+        ;; dump as the UEFI one, so it needs the same preparation: the host's
+        ;; packages, its defconstants bound before READING, and the compiler's
+        ;; own state tables empty instead of this image's live runtime ones.
+        (%selfhost-mirror-host-packages)
+        (%selfhost-prebind-constants src)
+        (%selfhost-reset-jit-knobs)
         ;; (Re)assert the aarch64 emitter config right before the emit, so a
         ;; prior in-process --compile (x64) can't leave a stale knob behind.
         (%init-aarch64-translator)
+        ;; static literals and the console hook, as --compile-uefi sets them
+        ;; and test/ddc-aarch64-host.lisp sets them on the SBCL side
+        (setq *static-keywords-p* t)
+        (setq *static-symbols-p* t)
+        (when (search \"(defun %console-write-char\" src)
+          (setq *write-char-serial-hook* (quote %console-write-char)))
         ;; Same three codegen knobs the x64 self-compile path uses; they are
         ;; ARCH-INDEPENDENT compiler settings (static literal baking, no
         ;; :li-halves, no runtime-eval variable reads), not translator state.
@@ -1752,13 +1863,19 @@
   ;; so in-image --compile aligns entries to nibble 0, matching the seed's own
   ;; build.  Proof: nm seed = all fns nibble 0; nm modus2-v2 = all nibble d.
   ;; See reference_modus3_optional_lambda_miscompile.
-  (setq *x64-native-code-offset* (linux-x64-native-code-offset))
+  ;; The emitter that measures the stub compares *LINUX-X64-R14-OFFSET* with
+  ;; +LINUX-X64-GC-MIDPOINT+ (fcb5a4a2), and a defvar's value never reaches
+  ;; the image (limitation #7): NIL there killed modus-sh at boot with a
+  ;; TYPE-ERROR in %CHECKED-EQ.  The literal, as the co-init writes it: the
+  ;; constant itself is MODUS-INT's, and this source is not.
   (%install-deftest-macro)
   ;; Run all built-in defvar init thunks.  Each is wrapped in
   ;; handler-case at compile time so a thunk that references a not-yet-
   ;; bound symbol can't kill the chain — see CLAUDE.md known limitation
   ;; #7 history.  Most thunks succeed and we get init values for free.
   (init-all-globals)
+  (setq *linux-x64-r14-offset* #x38000000)
+  (setq *x64-native-code-offset* (linux-x64-native-code-offset))
   ;; ANSI numeric/array constants whose DEFCONSTANT init thunks don't run
   ;; at boot (limitation #7).  The x64-linux gate image sets these in its
   ;; own kernel-main; build-generic relied only on init-all-globals, so
@@ -1906,6 +2023,37 @@
 
 (format t "  defuns found: ~D~%" (length *all-defun-names*))
 
+(defun scan-global-names (text)
+  "Names (upcased strings, sorted, unique) that TEXT defines with DEFVAR,
+   DEFPARAMETER or DEFCONSTANT: the kernel's globals.  A runtime symbol in a
+   non-kernel package with one of these names gets its own global cell
+   (builder packages, globals by package).  Textual, like SCAN-DEFUNS: a name
+   inside a string literal is collected too, which only gives CL-USER's
+   same-named variable its own cell as well."
+  (let ((names (make-hash-table :test (function equal)))
+        (code (%code-mask text)))
+    (dolist (head (list "(defvar " "(defparameter " "(defconstant "))
+      (let ((pos 0))
+        (loop
+          (let ((p (loop (let ((q (search head text :start2 pos)))
+                           (when (or (null q) (= 1 (sbit code q))) (return q))
+                           (setq pos (1+ q))))))
+            (unless p (return))
+            (let* ((start (+ p (length head)))
+                   (end (or (position-if (lambda (c) (find c '(#\Space #\Newline #\Tab #\( #\))))
+                                         text :start start)
+                            (length text)))
+                   (name (string-upcase (subseq text start end))))
+              (when (and (> (length name) 0)
+                         (every (lambda (c) (or (alphanumericp c) (find c "+-*/<=>?!@$%^&_.~")))
+                                name))
+                (setf (gethash name names) t))
+              (setq pos end))))))
+    (sort (loop for k being the hash-keys of names collect k) (function string<))))
+
+(defvar *all-global-names* (scan-global-names *all-runtime-source*))
+(format t "  kernel globals found: ~D~%" (length *all-global-names*))
+
 ;; Emit %init-sft-auto in chunks of ~200 to avoid the compiler's
 ;; function-size limits.
 
@@ -1917,13 +2065,23 @@
         (let ((start (* c chunk-size))
               (end (min (* (1+ c) chunk-size) (length names))))
           (loop for i from start below end
-                do (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
-                          (nth i names) (nth i names))))
+                do (let* ((n (nth i names))
+                          (bare (gethash n *scan-defuns-qualified*)))
+                     ;; The table key stays BARE (runtime lookup is by bare
+                     ;; name until builder-packages step 4); the #' names the
+                     ;; defun's own symbol.
+                     (format out "  (puthash ~S *symbol-function-table* #'~A)~%"
+                             (or bare n) n))))
         (format out ")~%"))
       (format out "(defun %init-sft-auto ()~%")
       (dotimes (c n-chunks)
         (format out "  (%init-sft-auto-~D)~%" c))
-      (format out ")~%"))))
+      ;; the kernel's own function names, for %KERNEL-SHADOW-KEY (phase B)
+      (format out "  (%snapshot-kernel-fn-names)~%")
+      ;; and its global names, for %KERNEL-GLOBAL-SHADOW-P
+      (format out "  (%snapshot-kernel-global-names (%kernel-global-names-text)))~%")
+      (format out "(defun %kernel-global-names-text () ~S)~%"
+              (format nil "~{~A~^ ~}" *all-global-names*)))))
 
 (defvar *sft-auto-source* (emit-sft-auto *all-defun-names* 200))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
@@ -2008,7 +2166,12 @@
              (let ((token (string-upcase (subseq text start pos))))
                (unless (or (gethash token seen)
                            (zerop (length token))
-                           (every #'digit-char-p token))
+                           (every #'digit-char-p token)
+                           ;; the build's per-file marker (cross.lisp
+                           ;; %SOURCE-FILE-MARKER) compiles to nothing and is
+                           ;; not a runtime symbol; counting it renumbered the
+                           ;; whole symbol-name table
+                           (string= token "%SOURCE-FILE"))
                  (setf (gethash token seen) t)
                  (push token result))
                ;; Also register a keyword token's bare name (without the
@@ -2129,10 +2292,6 @@
     (string #\Newline)
     *stage2-test-source*
     (string #\Newline)
-    ;; Defvar for *sym-name-table* (compiler.lisp now supplies *macro-table*'s
-    ;; defvar; runtime macroexpand-1 references it).
-    "(defvar *sym-name-table* nil)
-"
     (string #\Newline)
     *sft-auto-source*
     (string #\Newline)
@@ -2236,6 +2395,21 @@
 (mvm-load "boot/boot-linux-x64.lisp")
 
 (in-package :modus.mvm)
+;; HOST SHIM for the image reader.  The image source is read by modus's own
+;; reader, which drops SBCL package prefixes: `#+sbcl (sb-ext:posix-getenv V)'
+;; in a DEFCONSTANT initform -- boot-linux-x64's +LINUX-X64-GC-MIDPOINT+ (the
+;; MODUS_X64_MIDPOINT knob) -- arrives as MODUS-INT::POSIX-GETENV, the host EVAL
+;; that folds a DEFCONSTANT failed, the form was SKIPPED, and the constant was a
+;; NIL global in modus-sh: its boot-stub emitter died comparing it (and would
+;; have baked NIL into every stub it emitted).  Host-only; the image gains
+;; nothing.
+(dolist (pkg '("MODUS-INT" "MODUS.MVM.X64" "MODUS.MVM"))
+  (let ((p (find-package pkg)))
+    (when p
+      (let ((sym (intern "POSIX-GETENV" p)))
+        (unless (fboundp sym)
+          (setf (symbol-function sym)
+                (lambda (name) (sb-ext:posix-getenv name))))))))
 
 (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
 (setf modus.mvm.x64::*x64-linux-mode* t)

@@ -125,6 +125,7 @@
 ;; Where BARs start: 0x11000000, clear of L2[128].  A threaded image maps VA
 ;; 0x10200000-0x1FFFFFFF to DRAM too (boot-aarch64 *AARCH64-FIXPOINT-THREADS*),
 ;; and overrides this to 0x30000000, still inside QEMU virt's PCI MMIO window.
+(declaim (overridable %pci-bar-base))
 (defun %pci-bar-base () #x11000000)
 (defun pci-assign-bars ()
   (let ((next-addr (%pci-bar-base)))
@@ -212,9 +213,6 @@
 ;; ip.lisp's net-actor-main reference would otherwise resolve to a NIL function
 ;; sentinel.
 (defun yield () (io-delay))
-(defun receive () (e1000-receive) nil)
-(defun actor-spawn (fn) 0)
-(defun actor-exit () nil)
+(defun receive () (modus.net:nic-receive) nil)
 (defun nfn-lookup (hash) 0)
 (defun hash-of (name) 0)
-(defun init-gc-helper () nil)

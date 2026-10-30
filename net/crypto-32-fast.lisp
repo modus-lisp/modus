@@ -1,6 +1,6 @@
 ;;;; crypto-32-fast.lisp — Cons-free fe-mul/fe-sq for 32-bit targets
 ;;;;
-;;;; Load AFTER crypto-32.lisp (last-defun-wins).
+;;;; Load AFTER crypto-32.lisp (last-defun-wins), in MODUS.CRYPTO.
 ;;;;
 ;;;; Replaces pair-arithmetic fe-mul/fe-sq with memory-based versions.
 ;;;; Uses MVM mul26lo/mul26hi opcodes for hardware wide multiply.
@@ -16,6 +16,8 @@
 ;;;; Each h[k] word is kept < 2^26 via immediate carry propagation.
 ;;;;
 ;;;; fe-scratch-base is defined per architecture in arch-*.lisp
+
+(in-package :modus.crypto)
 
 ;; ================================================================
 ;; Read inputs to scratch memory

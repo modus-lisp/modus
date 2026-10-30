@@ -1,10 +1,10 @@
-;;; mda-probe.lisp -- what a compiled (%MDA-P x) must still answer, and what
+;;; mda-probe.lisp -- what a compiled (modus-int::%MDA-P x) must still answer, and what
 ;;; the operators built on it must still do.  Run on main's binary, on the
 ;;; inlined binary, and on SBCL (the last only for the CL-level half).
 (defun p (label v) (format t "~a ~s~%" label v))
 
 ;; --- the predicate's own truth table, through the compiled call site ---
-(defun mdap (x) (%mda-p x))
+(defun mdap (x) (modus-int::%mda-p x))
 (p "nil"       (mdap nil))
 (p "t"         (mdap t))
 (p "fixnum"    (mdap 7))

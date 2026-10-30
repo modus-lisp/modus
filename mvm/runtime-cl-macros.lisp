@@ -197,7 +197,14 @@
                     ;; VAR is always a fixnum: it counts 0..COUNT one step per
                     ;; iteration, so exceeding a fixnum would take 2^62
                     ;; iterations.  N is NOT declared (a bignum count is legal).
-                    (list (list 'declare (list 'type 'fixnum var))))
+                    (if (and (consp count-form) (symbolp (car count-form))
+                             (string= (symbol-name (car count-form)) \"THE\")
+                             (consp (cdr count-form)))
+                        ;; (THE TYPE count) -- the compiler's typed-counter
+                        ;; rewrite says the count's width: N has that type
+                        (list (list 'declare (list 'type 'fixnum var)
+                                    (list 'type (cadr count-form) n)))
+                        (list (list 'declare (list 'type 'fixnum var)))))
                 ;; The body's own leading declarations belong on this LET too
                 ;; (inside the LOOP's PROGN they were silently dropped).
                 (let ((decls nil) (rest body))
@@ -321,7 +328,11 @@
     ;; two standard functions, upstream MACRO-FUNCTION.5.)
 
     "(defmacro locally (&rest body) (cons 'progn body))"
-    "(defmacro the (type form) form)"
+    ;; THE is NOT a macro here: a (defmacro the (type form) form) used to drop
+    ;; the type before the compiler saw it, so every THE in runtime-compiled
+    ;; code was thrown away -- (the (signed-byte 8) ...) gave no width, and a
+    ;; (the fixnum ...) index stayed overflow-checked.  THE is a special
+    ;; operator (CLHS); the compiler's own THE clause compiles it.
     "(defmacro declare (&rest decls) nil)"
     ;; PROCLAIM is a real function (cl-eval.lisp): it validates the spec
     ;; and records INLINE / NOTINLINE.  A macro here shadowed it with NIL.
@@ -578,8 +589,14 @@
    triggered a stability bug where installs 3+ stopped registering.
    A NIL SRC (unrolled (nth k) past the list end) is a no-op so the
    unroll can safely overshoot the current entry count."
+  ;; Read in MODUS-INT: the internals these expansions call (%PUSH-RESTARTS,
+  ;; %WITH-CONDITION-RESTARTS ...) are the kernel's, and the macro names are
+  ;; all COMMON-LISP's, inherited there (builder packages step 4).
   (when src
-    (eval (read-from-string src))))
+    (let ((%kpkg *package*))
+      (setq *package* (or (find-package "MODUS-INT") *package*))
+      (unwind-protect (eval (read-from-string src))
+        (setq *package* %kpkg)))))
 
 
 (defun %install-runtime-cl-macros ()
@@ -739,13 +756,17 @@
           ;; encodings.  (:utf-8 / :utf-8b have no reader conditionals and
           ;; were the two that survived.)
           ;;
-          ;; Every consumer of this file is little-endian: x86-64 (generic,
-          ;; generic-cli, x64-cl-repl, modus-selfhost) and i386 (i386-cli).
-          ;; A big-endian target (ppc/ppc32/68k) must push :BIG-ENDIAN in
-          ;; its own boot path instead of loading this default.
+          ;; %TARGET-BIG-ENDIAN-P (interp.lisp) answers from the folded
+          ;; +TARGET-BIG-ENDIAN+, so the 68k and PowerPC CLIs say :BIG-ENDIAN
+          ;; (this used to assume every consumer was little-endian, and 68k
+          ;; advertised the wrong byte order to every #+big-endian in every
+          ;; library).  A FUNCTION, not the constant: this file is compiled
+          ;; without the width/endianness preamble, where the constant is an
+          ;; unbound global.
           (unless (or (member :little-endian *features*)
                       (member :big-endian *features*))
-            (setq *features* (cons :little-endian *features*)))
+            (setq *features* (cons (if (%target-big-endian-p) :big-endian :little-endian)
+                                   *features*)))
           ;; Advertise :modus so UIOP recognises this implementation.  The
           ;; vendored asdf.lisp guards its "ASDF is not supported on your
           ;; implementation" hard error with

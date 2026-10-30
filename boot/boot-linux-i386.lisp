@@ -449,6 +449,15 @@
 
    Ends with NOP padding chosen so that native code byte 0 lands on a
    16-byte VIRTUAL boundary — see the comment at the padding site."
+  ;; --- x87 float arms (translate-i386 *I386-X87*): 53-bit precision, round
+  ;; to nearest even, all exceptions masked.  Linux starts a process at
+  ;; #x037F (64-bit precision), under which every double result rounds twice.
+  (let ((sym (find-symbol "*I386-X87*" "MODUS.MVM.I386")))
+    (when (and sym (boundp sym) (symbol-value sym))
+      (i386l-bytes buf #xDB #xE3)                   ; fninit
+      (i386l-bytes buf #x68 #x7F #x02 #x00 #x00)    ; push #x027F
+      (i386l-bytes buf #xD9 #x2C #x24)              ; fldcw [esp]
+      (i386l-bytes buf #x83 #xC4 #x04)))            ; add esp, 4
   ;; --- argc / argv[1] / argv[2] off the incoming stack ---
   (i386l-bytes buf #x8B #x1C #x24)              ; mov ebx, [esp]      (argc)
   (i386l-bytes buf #x8B #x44 #x24 #x08)         ; mov eax, [esp+8]    (argv[1])

@@ -287,16 +287,13 @@
 
 ;; Net source files that run on bare metal (most important to check)
 (defparameter *net-files*
-  '("net/ip.lisp" "net/crypto.lisp" "net/crypto-32.lisp" "net/crypto-w32.lisp"
-    "net/ssh.lisp" "net/http.lisp" "net/http-client.lisp"
-    "net/e1000.lisp" "net/dwc2.lisp" "net/dwc2-device.lisp"
-    "net/usb.lisp" "net/cdc-ether.lisp" "net/hid.lisp"
-    "net/actors.lisp" "net/actors-net-overrides.lisp"
-    "net/isolated-net.lisp" "net/ne2000.lisp"
-    "net/32bit-overrides.lisp"
-    "net/arch-aarch64.lisp" "net/arch-raspi3b.lisp" "net/arch-x86.lisp"
-    "net/arch-i386.lisp" "net/arch-arm32-rpi.lisp"
-    "net/uart-bootloader.lisp"))
+  '("net/ip.lisp" "net/crypto.lisp" "net/crypto-fast.lisp" "net/crypto-32-fast.lisp"
+    "net/ssh.lisp" "net/http-client.lisp"
+    "net/e1000.lisp" "net/dwc2.lisp" "net/usb.lisp" "net/cdc-ether.lisp"
+    "net/actors.lisp" "net/ne2000.lisp"
+    "net/arch-rpi-cl.lisp" "net/arch-x86-cl.lisp"
+    "net/arch-i386-cl.lisp" "net/arch-aarch64-cl.lisp"
+    "net/bcm2835-gpio.lisp"))
 
 (defun all-source-files ()
   "Return list of all Lisp source files."
@@ -308,12 +305,18 @@
 
 (defun ensure-dummy-packages ()
   "Create dummy packages so source files can be read."
+  (unless (find-package "MODUS-INT")
+    (make-package "MODUS-INT" :nicknames '("MODUS.MVM") :use '(:cl)))
   (dolist (pkg '(:modus.mvm :modus.mvm.x64 :modus.mvm.aarch64
                  :modus.mvm.riscv :modus.mvm.ppc :modus.mvm.i386
                  :modus.mvm.68k :modus.mvm.arm32
                  :modus.asm :modus.tags :modus.runtime))
     (unless (find-package pkg)
-      (make-package pkg :use '(:cl)))))
+      (make-package pkg :use '(:cl))))
+  ;; and the kernel's step-3 packages with their exports, from the one list
+  ;; (net/ sources read MODUS.NET:NIC-SEND and friends)
+  (load (merge-pathnames "kernel-packages.lisp" (directory-namestring *load-truename*)))
+  (funcall (find-symbol "%ENSURE-KERNEL-PACKAGES" "MODUS.MVM")))
 
 (defun main ()
   (ensure-dummy-packages)

@@ -1,6 +1,8 @@
 ;;;; cl-streams.lisp — Stream type system
 ;;;; Part of the Modus CL runtime.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; String stream / printer support
 ;;; ============================================================

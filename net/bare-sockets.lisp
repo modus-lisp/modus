@@ -15,6 +15,10 @@
 ;;;; Unix-domain sockets and the stat/chmod/credentials primitives signal: nothing here has a
 ;;;; filesystem namespace for them.
 
+;;; Kernel code loaded at runtime (kiln zero carries it), so read in the kernel's
+;;; package: the internals it calls and defines are MODUS-INT's, not CL-USER's.
+(in-package :modus-int)
+
 (defvar *bsocks* (make-hash-table) "fd -> BSOCK.")
 (defvar *bsock-next* 2000)
 (defvar *sbs-from* (cons 0 0) "(ip . port) of the last datagram RECVFROM returned.")
@@ -28,12 +32,14 @@
    (out :initform (make-array 1460 :element-type '(unsigned-byte 8) :fill-pointer 0)
         :accessor bs-out)))
 
-(defun %bs (fd) (gethash fd *bsocks*))
+(defun %bs (fd) (with-net-lock (gethash fd *bsocks*)))
 (defun %bs-new (kind)
-  (let ((fd *bsock-next*))
-    (setq *bsock-next* (+ fd 1))
-    (setf (gethash fd *bsocks*) (make-instance 'bsock :kind kind))
-    fd))
+  ;; the descriptor table is shared by every thread that opens sockets (tcp-conns.lisp)
+  (with-net-lock
+    (let ((fd *bsock-next*))
+      (setq *bsock-next* (+ fd 1))
+      (setf (gethash fd *bsocks*) (make-instance 'bsock :kind kind))
+      fd)))
 (defun %ephemeral-port () (+ 49152 (setq *tcp-port-next* (logand (+ *tcp-port-next* 1) #x3FFF))))
 
 ;;; ---- the primitives the shim calls -----------------------------------------------------
@@ -92,7 +98,7 @@
       (let ((c (bs-conn b))) (when (typep c 'tcp-conn) (tcpc-close c)))
       (when (bs-listener b) (setq *tcp-listeners* (remove (bs-listener b) *tcp-listeners*)))
       (when (eq (bs-kind b) :datagram) (setq *udp-ports* (remove (bs-lport b) *udp-ports* :key #'car)))
-      (remhash fd *bsocks*))
+      (with-net-lock (remhash fd *bsocks*)))
     0))
 
 (defun %sbs-shutdown (fd how)
@@ -120,15 +126,22 @@
              len))))
 
 (defun %sbs-recvfrom (fd arr max)
+  ;; A BLOCKING READ OUTLIVES ITS SOCKET unless it looks: another thread's SOCKET-CLOSE drops
+  ;; the descriptor and the port, and a reader parked here for a day (as this was) never
+  ;; returned -- every WebRTC session's ICE thread stayed, and the board ran out of its 15
+  ;; thread slots after a few sessions.  So wait a second at a time and answer EBADF once the
+  ;; descriptor is gone, which is what a read on a closed socket gets on Linux.
   (let ((b (%bs fd)))
-    (cond ((null b) -9)
-          (t (let ((d (udp-recv (bs-lport b) :timeout-ms (if (bs-nonblocking b) 0 86400000))))
-               (if (null d)
-                   -11
-                   (let* ((v (third d)) (n (min max (length v))))
-                     (dotimes (i n) (setf (aref arr i) (aref v i)))
-                     (setq *sbs-from* (cons (first d) (second d)))
-                     n)))))))
+    (if (null b)
+        -9
+        (loop
+          (let ((d (udp-recv (bs-lport b) :timeout-ms (if (bs-nonblocking b) 0 1000))))
+            (cond (d (let* ((v (third d)) (n (min max (length v))))
+                       (dotimes (i n) (setf (aref arr i) (aref v i)))
+                       (setq *sbs-from* (cons (first d) (second d)))
+                       (return n)))
+                  ((bs-nonblocking b) (return -11))
+                  ((null (%bs fd)) (return -9))))))))
 (defun %sbs-from-ip () (car *sbs-from*))
 (defun %sbs-from-port () (cdr *sbs-from*))
 
@@ -149,12 +162,13 @@
           (t (%bs-flush b)
              (let ((c (bs-conn b)))
                (loop
-                 (let ((r (tcpc-read c :max max :timeout-ms (if (bs-nonblocking b) 0 1000))))
+                 (let ((r (tcpc-read c :max (min max (length arr)) :into arr
+                                       :timeout-ms (if (bs-nonblocking b) 0 1000))))
                    (cond ((eq r :eof) (return 0))
-                         ((> (length r) 0)
-                          (dotimes (i (length r)) (setf (aref arr i) (aref r i)))
-                          (return (length r)))
-                         ((bs-nonblocking b) (return -11))))))))))
+                         ((> r 0) (return r))
+                         ((bs-nonblocking b) (return -11))
+                         ;; closed under us by another thread (see %SBS-RECVFROM): end of file
+                         ((null (%bs fd)) (return 0))))))))))
 
 (defun %sbs-poll-in (fd ms)
   "1 when a read on FD would not block, 0 when MS (-1: forever) passes first."
@@ -202,6 +216,20 @@
          (vector-push (first args) o)
          (when (>= (fill-pointer o) 1460) (%bs-flush b))
          1))
+      (:write-bytes                                  ; (seq start end): a byte vector's slice
+       (%bs-flush b)                                 ; what WRITE-BYTE buffered goes first
+       (let ((c (bs-conn b)))
+         (unless (typep c 'tcp-conn) (error "write-sequence: socket ~d is not connected" fd))
+         (unless (tcpc-write c (first args) :start (second args) :end (third args))
+           (error "write-sequence: the connection on socket ~d is gone" fd)))
+       t)
+      (:read-bytes                                   ; (seq start end): until full or EOF; the index
+       (let ((seq (first args)) (i (second args)) (end (third args)) (c (bs-conn b)))
+         (loop
+           (when (or (>= i end) (not (typep c 'tcp-conn))) (return i))
+           (let ((r (tcpc-read c :max (- end i) :timeout-ms 1000)))
+             (cond ((eq r :eof) (return i))
+                   ((> (length r) 0) (replace seq r :start1 i) (setq i (+ i (length r)))))))))
       (:read-into                                    ; (buf count): into the stream's string buffer
        (let* ((buf (first args)) (count (second args))
               (tmp (make-array count :element-type '(unsigned-byte 8)))
@@ -267,6 +295,35 @@
                (let ((ip (ignore-errors (%dns-first-a (third r)))))
                  (when ip (return ip))))))
       (setq *udp-ports* (remove lport *udp-ports* :key #'car)))))
+
+;;; THE DATE.  A board has no RTC: GET-UNIVERSAL-TIME counts from boot until something sets it
+;;; (SET-UNIVERSAL-TIME, mvm/build-cl-repl-common.lisp), and a TLS handshake, a Nostr event's
+;;; created_at or a login code's expiry all need the real one.  SNTP (RFC 4330): 48 bytes, LI 0
+;;; VN 4 mode 3; the server's transmit timestamp is seconds since 1900 at bytes 40..43 -- the
+;;; epoch GET-UNIVERSAL-TIME already counts from.
+
+(defun bare-ntp-time (&key (server "pool.ntp.org") (timeout-ms 3000) (tries 3))
+  "The server's idea of now, as universal time, or NIL."
+  (let ((ip (if (integerp server) server (bare-dns-lookup server))))
+    (when ip
+      (let ((lport (%ephemeral-port))
+            (q (make-array 48 :element-type '(unsigned-byte 8) :initial-element 0)))
+        (setf (aref q 0) #x23)
+        (udp-open lport)
+        (unwind-protect
+             (dotimes (k tries nil)
+               (udp-send-to ip 123 lport q 48)
+               (let* ((r (udp-recv lport :timeout-ms timeout-ms)) (v (and r (third r))))
+                 (when (and v (>= (length v) 48) (= (logand (aref v 0) 7) 4))
+                   (let ((ut (logior (ash (aref v 40) 24) (ash (aref v 41) 16)
+                                     (ash (aref v 42) 8) (aref v 43))))
+                     (when (> ut 0) (return ut))))))
+          (setq *udp-ports* (remove lport *udp-ports* :key #'car)))))))
+
+(defun bare-set-clock (&rest args)
+  "Set the board's date from SNTP (BARE-NTP-TIME's arguments).  The universal time, or NIL."
+  (let ((ut (apply #'bare-ntp-time args)))
+    (when ut (set-universal-time ut))))
 
 (defun %dotted (ip)
   (format nil "~D.~D.~D.~D" (ldb (byte 8 24) ip) (ldb (byte 8 16) ip) (ldb (byte 8 8) ip) (ldb (byte 8 0) ip)))

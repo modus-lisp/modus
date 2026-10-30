@@ -1712,6 +1712,12 @@
    mutator's allocation limit moves with it in the same breath: a limit outside
    the region it is supposed to bound is a :gc-check that fires in the wrong
    place, or not at all.  Returns NEW-SIZE."
+  (when (and (= rcb (%gc-region-0)) (%gc-old-space-p))
+    ;; The young pair, the old area and a major's phase-2 destination are all
+    ;; laid out inside [base, base+size) of region 0's semispaces at GC-TENURE
+    ;; time; shrinking afterwards leaves a carved gap INSIDE that layout, and a
+    ;; major copies straight over it.  Carve first (the lock arena), then tenure.
+    (error "%GC-REGION-SHRINK: region 0 has an old space; carve before GC-TENURE"))
   (%gc-meta-write (+ rcb #x10) new-size k)
   (if (= rcb (%gc-region))
       (set-alloc-limit (+ (%gc-meta-read rcb k) new-size))
@@ -1731,6 +1737,336 @@
     (setq junk (cons 0 0))
     (setq junk (cdr junk))
     (%gc-count)))
+
+;;; ============================================================
+;;; Generational GC, stage 1: an OLD SPACE (docs/generational-gc.md)
+;;; ============================================================
+;;; What survived one collection of the board's boot heap survives all of them
+;;; (~40 of 50 MB, copied on every collection).  GC-TENURE makes the current
+;;; survivors an OLD SPACE that every later region-0 collection walks as roots
+;;; and never copies; region 0 continues on a young pair carved out of the
+;;; semispace that collection reclaimed.  No barrier (everything old is looked
+;;; at), no promotion and no major collection yet: old garbage stays.  The
+;;; collector does the switch (translate-aarch64's EMIT-AARCH64-TENURE), so the
+;;; AArch64 NATIVE collector is the only one that tenures; anywhere else the
+;;; request is never taken and GC-TENURE says so.  The words are the
+;;; translator's +GC-OLD-LO-ADDR+ / +GC-OLD-HI-ADDR+ / +GC-TENURE-REQ-ADDR+,
+;;; stored <<1 on every target.
+
+(defun %gc-old-lo () (ash (%gc-read64 (%conv-addr #x10000CC0)) -1))
+(defun %gc-old-hi () (ash (%gc-read64 (%conv-addr #x10000CC8)) -1))
+(defun %gc-old-space-p () (/= 0 (%gc-old-hi)))
+
+(defun %gc-old-space-forget ()
+  "NEGATIVE CONTROL ONLY: stop walking the old space (the collector skips the
+   walk when old_hi is 0) while its objects stay where they are.  An old
+   object's young referents are then neither kept alive nor updated, and the
+   next collection must break something; a test that survives this is not
+   testing the walk."
+  (%gc-write64 (%conv-addr #x10000CC8) 0))
+
+(defun %gc-old-leaf-p (st)
+  "The subtags the AArch64 collector's object walk does not scan (raw payload).
+   Compares, not (MEMBER ST '(...)): that conses its list on every call here,
+   ~48 bytes an object, enough for every audit walk on the board to trigger a
+   collection of a 25 MB young space halfway through."
+  (or (and (>= st #x10) (<= st #x16)) (= st #x31) (= st #x60)
+      (and (>= st #x64) (<= st #x66))))
+
+(defun %gc-audit-stable (fn what)
+  "Run FN, an audit walk, until no collection happened inside it; its result.  A
+   walk that allocates can trigger a collection halfway, and it then judges the
+   rest of the heap against semispace bounds it read before the flip (measured
+   on the board: 36-139 'dangling' slots per audit, every one an artifact,
+   0 once bracketed).  Signals when 20 tries all overlapped one."
+  (dotimes (i 20 (error "~A: a collection overlapped every one of 20 walks" what))
+    (let* ((e (%gc-epoch)) (r (funcall fn)))
+      (when (= e (%gc-epoch)) (return r)))))
+
+(defun %gc-old-audit ()
+  "%GC-OLD-AUDIT-1, retried until no collection overlaps the walk."
+  (%gc-audit-stable #'%gc-old-audit-1 "%GC-OLD-AUDIT"))
+
+(defun %gc-old-audit-1 ()
+  "Walk the old space object by object, as the collector does, and count the
+   POINTER SLOTS (cons car/cdr, non-leaf object slots) that point into region
+   0's TO-space -- the semispace the last collection vacated, where nothing is
+   live.  Zero after every collection is the invariant; a missed old->young
+   pointer is exactly such a slot.  Returns (OBJECTS DANGLING BAD): BAD is the
+   address where a header ran past old_hi (0 if the whole space parsed), which
+   is also the walk's own precondition."
+  (let* ((r (%gc-region-0)) (k (%gc-meta-scale))
+         (ts (%gc-meta-read (+ r #x08) k)) (sz (%gc-meta-read (+ r #x10) k))
+         (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+         (a (%gc-old-lo)) (end (%gc-old-hi)) (objs 0) (dang 0) (bad 0))
+    (flet ((slot (w) (when (%gc-cand-addr (%gc-word-lo w) (%gc-word-hi w) ts sz)
+                       (setq dang (+ dang 1)))))
+      (loop
+        (when (>= a end) (return nil))
+        (setq objs (+ objs 1))
+        (if (%census-cons-p a page cbm)
+            (progn (slot a) (slot (+ a 8)) (setq a (+ a 16)))
+            (let* ((h (mem-ref a :u32)) (st (logand h 255)) (n (ash h -8))
+                   (size (%census-size st n)))
+              (when (or (> (+ a size) end) (< size 16)) (setq bad a) (return nil))
+              (unless (%gc-old-leaf-p st)
+                (dotimes (i n) (slot (+ a 16 (* 8 i)))))
+              (setq a (+ a size))))))
+    (list objs dang bad)))
+
+(defun %gc-old-dangling () (second (%gc-old-audit)))
+
+(defvar *gc-card-vector* nil
+  "The card table + crossing table, one (unsigned-byte 8) vector made just
+   before the tenure collection so that it is tenured with everything else and
+   never moves.  Kept here so it stays live.")
+
+(defun %gc-card-words () (%conv-addr #x10000CE0))
+(defun %gc-card-root () (%conv-addr #x10000D88))
+
+;;; The card vector's first 128 bytes are the generational META (raw words;
+;;; see translate-aarch64's STAGE 3 note): capacity, area size, survivor mark,
+;;; major state, promotion failures, majors done, bytes promoted, promotion
+;;; on, reserve.
+(defun %gc-gen-meta ()
+  "Raw address of the meta words, or NIL without a card vector.  Found through
+   the root word every time: a major collection moves the vector."
+  (let ((v (%gc-read64 (%gc-card-root))))
+    (if (= 0 v) nil (+ v 7))))
+
+(defun %gc-gen-meta-ref (i)
+  (let ((m (%gc-gen-meta))) (if m (%gc-read64 (+ m (* 8 i))) 0)))
+(defun %gc-cards-on-p () (/= 0 (%gc-read64 (%gc-card-words))))
+
+(defun %gc-old-object-size (a page cbm)
+  "Size in bytes of the old-space object at A (16 for a cons)."
+  (if (%census-cons-p a page cbm)
+      16
+      (let ((h (mem-ref a :u32)))
+        (%census-size (logand h 255) (ash h -8)))))
+
+(defun %gc-gen-ceiling (lo hi)
+  "The lowest staging page (*CSTR-SCRATCH*, *IO-BUF-ADDR*) inside [LO, HI), or 0.
+   The board keeps both at the top of region 0's UPPER semispace, where the
+   mutator's 8 MB limit guard has always kept allocation away from them; the old
+   space is filled by promotion up to a bound instead, so that bound must stop
+   here (measured: card #9's old space ran 430 KB into *CSTR-SCRATCH*'s page)."
+  (let ((c 0))
+    (dolist (v '(*cstr-scratch* *io-buf-addr*))
+      (when (boundp v)
+        (let ((a (symbol-value v)))
+          (when (and (integerp a) (>= a lo) (< a hi) (or (= c 0) (< a c)))
+            (setq c a)))))
+    c))
+
+(defun %gc-cards-build (vec area ncards area-size promote &optional (ceiling 0))
+  "Point the card words at VEC (now in the old space): cards at its data,
+   all DIRTY (the vector is zeroed), crossing after them, filled by one walk
+   of [old_lo, old_hi).  The card base switches on the collector's card scan
+   and the card COUNT the barrier, so the count is written after the base;
+   every card being dirty makes the first card-scanning collection as complete
+   as a full walk."
+  (let* ((w (%gc-card-words))
+         (meta (let ((scratch (%conv-addr #x10000C88)))   ; not w: a card base
+                 (prog1 (+ (%gc-word-of vec scratch) 7)  ; of a tagged word would
+                   (%gc-write64 scratch 0))))             ; switch the scan on
+         (data (+ meta 128))
+         (cross (+ data ncards))
+         (k (%gc-meta-scale))
+         (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+         (a (%gc-old-lo)) (end (%gc-old-hi)))
+    (%gc-write64 w 0)
+    (%gc-write64 (+ w 16) 0)
+    (%gc-write64 meta ncards)
+    (%gc-write64 (+ meta 8) area-size)
+    (%gc-write64 (+ meta 16) 0)
+    (%gc-write64 (+ meta 56) (if promote 1 0))
+    (%gc-write64 (+ meta 72) ceiling)
+    (setf (mem-ref (%gc-card-root) :u64) vec)
+    (loop
+      (when (>= a end) (return nil))
+      (let* ((size (%gc-old-object-size a page cbm))
+             (c (ash (+ (- a area) 511) -9))
+             (last (ash (- (+ a size -1) area) -9))
+             (g (ash (- a area) -4)))
+        (loop
+          (when (> c last) (return nil))
+          (setf (mem-ref (+ cross (* 4 c)) :u32) g)
+          (setq c (+ c 1)))
+        (setq a (+ a size))))
+    (%gc-write64 (+ w 8) area)
+    (%gc-write64 (+ w 24) cross)
+    (%gc-write64 w data)
+    ;; NCARDS LAST: x64's inline barrier tests only the card count (0 = off)
+    ;; and then stores through the card base, so the count must never be
+    ;; non-zero while the base is 0.  Stores before this mark nothing, which is
+    ;; safe: every card starts dirty.
+    (%gc-write64 (+ w 16) ncards)
+    ncards))
+
+(defun %gc-card-audit ()
+  "%GC-CARD-AUDIT-1, retried until no collection overlaps the walk."
+  (%gc-audit-stable #'%gc-card-audit-1 "%GC-CARD-AUDIT"))
+
+(defun %gc-card-audit-1 ()
+  "Every POINTER SLOT of the old space that points into region 0's young
+   semispaces must sit on a DIRTY card -- the invariant the barrier and the
+   card scan keep, at any moment, not only after a collection.  Returns
+   (YOUNG-SLOTS VIOLATIONS): a violation is such a slot on a clean card,
+   i.e. a store the barrier never saw.  NIL when there is no card table."
+  (when (%gc-cards-on-p)
+    (let* ((w (%gc-card-words)) (cards (%gc-read64 w)) (area (%gc-read64 (+ w 8)))
+           (r (%gc-region-0)) (k (%gc-meta-scale))
+           (f (%gc-meta-read r k)) (tt (%gc-meta-read (+ r 8) k))
+           (sz (%gc-meta-read (+ r 16) k))
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+           (a (%gc-old-lo)) (end (%gc-old-hi)) (young 0) (bad 0))
+      (flet ((slot (x)
+               (when (or (%gc-cand-addr (%gc-word-lo x) (%gc-word-hi x) f sz)
+                         (%gc-cand-addr (%gc-word-lo x) (%gc-word-hi x) tt sz))
+                 (setq young (+ young 1))
+                 (unless (= 0 (mem-ref (+ cards (ash (- x area) -9)) :u8))
+                   (setq bad (+ bad 1))))))
+        (loop
+          (when (>= a end) (return nil))
+          (if (%census-cons-p a page cbm)
+              (progn (slot a) (slot (+ a 8)) (setq a (+ a 16)))
+              (let* ((h (mem-ref a :u32)) (st (logand h 255)) (n (ash h -8)))
+                (unless (%gc-old-leaf-p st)
+                  (dotimes (i n) (slot (+ a 16 (* 8 i)))))
+                (setq a (+ a (%census-size st n)))))))
+      (list young bad))))
+
+(defun %gc-card-barrier-off ()
+  "NEGATIVE CONTROL ONLY: the barrier marks nothing (ncards 0) while the
+   collector keeps scanning only dirty cards."
+  (%gc-write64 (+ (%gc-card-words) 16) 0))
+
+(defvar *gc-cards-pending* nil
+  "After (GC-TENURE :CARDS NIL): the arguments %GC-CARDS-BUILD would have had,
+   so GC-UNTENURE can switch the cards on first -- the un-tenure is a major,
+   and a major runs on the card meta.  The vector itself was allocated BEFORE
+   the tenure collection, so it is old and never moves under the raw card
+   words; one made at un-tenure time would be young and would.")
+
+(defun gc-tenure (&key (cards t) (promote t) young)
+  "Make everything live in region 0 now an OLD SPACE that collections scan and
+   never copy, and continue on two young semispaces of half the old size, cut
+   from the semispace this collection reclaims.  Call it once, after boot.
+   With CARDS (the default) old objects are tracked by a card table and a
+   write barrier, so a collection scans only the old cards stored into since;
+   without, every collection walks the whole old space.  With PROMOTE (needs
+   CARDS) an object surviving two collections joins the old space, and a MAJOR
+   collection reclaims old garbage when the old area runs short of room.
+   YOUNG caps each young semispace at that many bytes (a stress knob: small
+   young halves collect, promote and run majors often).
+   Returns (OLD-LO OLD-HI YOUNG-SIZE NCARDS).  Region 0 must be the active region."
+  (when (%gc-old-space-p)
+    (error "GC-TENURE: region 0 already has an old space [~X, ~X)"
+           (%gc-old-lo) (%gc-old-hi)))
+  (unless (= (%gc-region) (%gc-region-0))
+    (error "GC-TENURE: region 0 is not the active region"))
+  (let ((req (%conv-addr #x10000C88)) (tries 0) (vec nil) (area 0) (ncards 0))
+    (loop
+      (let* ((k (%gc-meta-scale)) (r (%gc-region-0))
+             (from (%gc-meta-read r k))
+             (size (%gc-meta-read (+ r #x10) k))
+             (half (* 4096 (floor size 8192)))
+             (before 0))
+        (when young
+          (setq half (max 1048576 (min half (* 4096 (floor young 4096))))))
+        ;; the survivors land in the CURRENT to-space: that is the old area.
+        ;; The vector is made with or without CARDS (see *GC-CARDS-PENDING*).
+        (progn
+          (setq area (%gc-meta-read (+ r 8) k)
+                ncards (* 16 (ceiling size 8192))
+                vec (make-array (+ 128 (* 5 ncards)) :element-type '(unsigned-byte 8)))
+          (setq *gc-card-vector* vec))
+        (setq before (%gc-epoch))
+        (%gc-write64 (+ req 8) (* 2 (+ from half)))
+        (%gc-write64 (+ req 16) (* 2 half))
+        (%gc-write64 req (* 2 from))
+        (loop
+          (set-alloc-limit (get-alloc-ptr))
+          (let ((probe (cons 1 2)))
+            (when (/= (%gc-epoch) before) (return (car probe)))))
+        (when (%gc-old-space-p)
+          (unless (= (%gc-old-lo) area)
+            (error "GC-TENURE: the old space is not where the card table was sized for"))
+          (let ((ceiling (let ((to (%gc-meta-read (+ r 8) k)))
+                           (%gc-gen-ceiling (min from to) (+ (max from to) size)))))
+            (if cards
+                (%gc-cards-build vec area ncards size promote ceiling)
+                (setq *gc-cards-pending* (list vec area ncards size ceiling))))
+          (return (list (%gc-old-lo) (%gc-old-hi) half ncards)))
+        (%gc-write64 req 0)
+        (setq tries (+ tries 1))
+        (when (>= tries 3)
+          (error "GC-TENURE: the collector did not take the request (only the AArch64 and hosted x86-64 native collectors tenure)"))))))
+
+(defun %gc-gen-request (state what)
+  "Post major STATE (1 major, 4 un-tenure), force collections until the
+   collector has finished it (state back to 0), and return the meta."
+  (unless (%gc-gen-meta)
+    (error "~A: region 0 has no card table (GC-TENURE first)" what))
+  (unless (= (%gc-region) (%gc-region-0))
+    (error "~A: region 0 is not the active region" what))
+  (%gc-write64 (+ (%gc-gen-meta) 24) state)
+  (let ((tries 0))
+    (loop
+      (let ((before (%gc-epoch)))
+        (loop
+          (set-alloc-limit (get-alloc-ptr))
+          (let ((probe (cons 1 2)))
+            (when (/= (%gc-epoch) before) (return (car probe))))))
+      (when (or (null (%gc-gen-meta)) (= 0 (%gc-gen-meta-ref 3)))
+        (return t))      ; done -- or refused for room; the caller checks which
+      (setq tries (+ tries 1))
+      (when (>= tries 8)
+        (error "~A: the collector did not finish it (state ~D)" what (%gc-gen-meta-ref 3))))))
+
+(defun gc-major ()
+  "Collect the OLD space too: promote everything young, then copy the whole
+   old area into the young semispace and tenure it there.  Returns the old
+   space's size after.  Needs one semispace of room, like any full collection."
+  (%gc-gen-request 1 "GC-MAJOR")
+  (- (%gc-old-hi) (%gc-old-lo)))
+
+(defun gc-untenure ()
+  "Back to one ordinary semispace pair (what SAVE-IMAGE needs): a major that
+   ends with no old space and no card table."
+  (when (and (%gc-old-space-p) (null (%gc-gen-meta)) *gc-cards-pending*)
+    ;; tenured :CARDS NIL: cards on now (every card starts dirty, so the first
+    ;; card scan is a full walk and nothing stored since is missed)
+    (destructuring-bind (vec area ncards size ceiling) *gc-cards-pending*
+      (%gc-cards-build vec area ncards size nil ceiling))
+    (setq *gc-cards-pending* nil))
+  (when (%gc-old-space-p)
+    (%gc-gen-request 4 "GC-UNTENURE"))
+  (when (%gc-old-space-p)
+    (error "GC-UNTENURE: the old space does not fit in the young semispace"))
+  (setq *gc-card-vector* nil)         ; or a saved core carries the dead table
+  t)
+
+(defun gc-gen-reserve (bytes)
+  "A major is due when the old area's free room falls below max(BYTES, twice a
+   collection's young survivors).  0 restores the default, 4 MB."
+  (%gc-write64 (+ (%gc-gen-meta) 64) bytes)
+  bytes)
+
+(defun %gc-old-room ()
+  "Bytes the old area can still take by promotion (up to the ceiling, if any)."
+  (let ((end (+ (%gc-read64 (+ (%gc-card-words) 8)) (%gc-gen-meta-ref 1)))
+        (ceiling (%gc-gen-meta-ref 9)))
+    (- (if (and (> ceiling (%gc-old-lo)) (< ceiling end)) ceiling end) (%gc-old-hi))))
+
+(defun gc-gen-report ()
+  "(:old MB :promoted MB :majors N :failures N :state S), or NIL."
+  (when (%gc-gen-meta)
+    (list :old (/ (- (%gc-old-hi) (%gc-old-lo)) 1048576.0)
+          :promoted (/ (%gc-gen-meta-ref 6) 1048576.0)
+          :majors (%gc-gen-meta-ref 5) :failures (%gc-gen-meta-ref 4)
+          :state (%gc-gen-meta-ref 3))))
 
 ;;; ============================================================
 ;;; Per-region acceptance harness
@@ -2487,3 +2823,137 @@
             (%gc-write64 (+ res 144) depth)
             (%gc-write64 (+ res 152) s)
             res)))))
+
+;;; ============================================================
+;;; HEAP CENSUS -- what is live in a region, by subtag (ROOM's engine)
+;;; ============================================================
+;;;
+;;; Walks a region's from-space object by object, [from, frontier), exactly as
+;;; the aarch64 collector walks to-space: the CONS-KIND bitmap says cons (16
+;;; bytes), otherwise the header gives subtag and count and the size is
+;;; u8-vector / narrow string 16+count, f32-vector / 32-bit string 16+4*count,
+;;; everything else 16+8*count, each rounded up to 16.  The walk ALLOCATES
+;;; NOTHING (headers are read as :u32, counters are fixnums in vectors made
+;;; before the frontier is read), so the frontier it read stays the end of
+;;; what it walks and no collection can move the heap under it.  What it
+;;; counts is everything between from and the frontier -- live data PLUS the
+;;; garbage made since the last collection; run (%gc-collect-here) first for
+;;; live data alone.  Needs the bitmaps; with none it answers NIL.
+;;; Index 256 of the result vectors is CONSES.
+
+(defun %census-size (subtag count)
+  (let ((n (cond ((or (= subtag #x11) (= subtag #x13)) (+ 16 count))
+                 ((or (= subtag #x12) (= subtag #x15)) (+ 16 (* 4 count)))
+                 (t (+ 16 (* 8 count))))))
+    (* 16 (ash (+ n 15) -4))))
+
+(defun %census-cons-bitmap ()
+  "Base of the cons-kind bitmap, or 0.  aarch64 and the Lisp collector publish it
+   at 0x10000E40; Linux x64 keeps it at the object-start bitmap plus a layout
+   constant the CLI bakes as %CORE-KINDBITMAP-DELTA.  Read through
+   %GC-META-READ: x64 stores these words raw, and a :u64 read halves them."
+  (let* ((k (%gc-meta-scale)) (c (%gc-meta-read #x10000E40 k)))
+    (if (and (= c 0) (fboundp '%core-kindbitmap-delta))
+        (let ((b (%gc-meta-read #x10000E18 k)))
+          (if (= b 0) 0 (+ b (%core-kindbitmap-delta))))
+        c)))
+
+(defun %census-cons-p (a page cbm)
+  "Whether the granule at raw address A is a cons start."
+  (let ((gran (ash (- a page) -4)))
+    (/= 0 (logand (mem-ref (+ cbm (ash gran -3)) :u8) (%gc-bit-mask (logand gran 7))))))
+
+(defun %census-span (rcb)
+  "(from . frontier) of region RCB, raw byte addresses.  The live allocation
+   pointer when RCB is this thread's region and the pointer reads as one
+   (runtime-compiled code reads GET-ALLOC-PTR as 0); for another thread's
+   region, the frontier it parked.  NIL when this is our region and the pointer
+   does not read: the parked frontier may predate the last flip, and walking it
+   reads the old semispace (measured: subtag-#x89 'objects' of 25 MB)."
+  (let* ((k (%gc-meta-scale)) (from (%gc-meta-read rcb k))
+         (size (%gc-meta-read (+ rcb #x10) k)))
+    (if (= rcb (%gc-region))
+        (let ((live (get-alloc-ptr)))
+          (when (and (> live from) (<= live (+ from size))) (cons from live)))
+        (cons from (%gc-meta-read (+ rcb #x30) k)))))
+
+(defun %heap-census (&optional (rcb (%gc-region-0)))
+  "Walk region RCB (default region 0).  Returns (counts bytes walked bad):
+   two 257-slot vectors indexed by subtag (256 = conses), the bytes walked,
+   and the address where a header made no sense (0 if none)."
+  (when (and (/= (%census-cons-bitmap) 0) (%census-span rcb))
+    (let* ((counts (make-array 257 :initial-element 0))
+           (bytes (make-array 257 :initial-element 0))
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+           (span (%census-span rcb))
+           (end (cdr span)) (a (car span)) (bad 0))
+      (loop
+        (when (>= a end) (return nil))
+        (if (%census-cons-p a page cbm)
+            (progn (setf (svref counts 256) (+ (svref counts 256) 1)
+                         (svref bytes 256) (+ (svref bytes 256) 16))
+                   (setq a (+ a 16)))
+            (let* ((h (mem-ref a :u32))
+                   (st (logand h 255))
+                   (sz (%census-size st (ash h -8))))
+              (when (> (+ a sz) end) (setq bad a) (return nil))
+              (setf (svref counts st) (+ (svref counts st) 1)
+                    (svref bytes st) (+ (svref bytes st) sz))
+              (setq a (+ a sz)))))
+      (list counts bytes (- a (car span)) bad))))
+
+(defun %heap-sample (subtag n &optional (rcb (%gc-region-0)) (min-bytes 0))
+  "Up to N objects of SUBTAG (256 = conses) in region RCB at least MIN-BYTES
+   long, as Lisp values, the largest first-found -- for looking at what a
+   census says is growing.  Allocates only after the walk."
+  (when (and (/= (%census-cons-bitmap) 0) (%census-span rcb))
+    (let* ((found (make-array n :initial-element 0)) (k 0)
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+           (span (%census-span rcb)) (end (cdr span)) (a (car span)))
+      (loop
+        (when (or (>= a end) (>= k n)) (return nil))
+        (if (%census-cons-p a page cbm)
+            (progn (when (and (= subtag 256) (>= 16 min-bytes))
+                     (setf (svref found k) (+ a 1)) (setq k (+ k 1)))
+                   (setq a (+ a 16)))
+            (let* ((h (mem-ref a :u32)) (st (logand h 255))
+                   (sz (%census-size st (ash h -8))))
+              (when (> (+ a sz) end) (return nil))
+              (when (and (= st subtag) (>= sz min-bytes))
+                (setf (svref found k) (+ a 9)) (setq k (+ k 1)))
+              (setq a (+ a sz)))))
+      (let ((r nil))
+        (dotimes (i k) (push (%word->val (svref found i)) r))
+        (nreverse r)))))
+
+(defun %subtag-name (st)
+  (case st
+    (256 "cons") (#x01 "simple-vector") (#x10 "string") (#x11 "u8-vector")
+    (#x12 "f32-vector") (#x13 "string-8") (#x14 "u64-vector") (#x15 "string-32")
+    (#x16 "sap") (#x30 "bignum") (#x31 "string-wide") (#x32 "array/struct/instance")
+    (#x33 "ratio") (#x40 "struct") (#x41 "hash-table") (#x50 "symbol")
+    (#x51 "function") (#x52 "closure") (#x53 "keyword") (#x60 "double-float")
+    (#x61 "mvm-module") (#x64 "single-float") (t nil)))
+
+(defun %room-report (verbosity)
+  "ROOM: region 0's census, largest first, on *standard-output*.  With
+   VERBOSITY :COLLECT (or T), collect first, so the numbers are live data."
+  (when (or (eq verbosity t) (eq verbosity :collect)) (%gc-collect-here))
+  (let ((c (%heap-census)))
+    (if (null c)
+        (format t "; ROOM: no census (no heap bitmaps, or this code cannot read its allocation pointer)~%")
+        (let* ((counts (first c)) (bytes (second c)) (rows nil)
+               (rcb (%gc-region-0)) (k (%gc-meta-scale))
+               (size (%gc-meta-read (+ rcb #x10) k)))
+          (dotimes (i 257)
+            (when (> (svref counts i) 0)
+              (push (list (svref bytes i) (svref counts i) i) rows)))
+          (setq rows (sort rows #'> :key #'first))
+          (format t "; region 0: ~,1F MB in use of a ~,1F MB semispace, ~D collections~a~%"
+                  (/ (third c) 1048576.0) (/ size 1048576.0)
+                  (%gc-meta-read (+ rcb #x20) k)
+                  (if (> (fourth c) 0) (format nil " (walk stopped at #x~X)" (fourth c)) ""))
+          (dolist (r rows)
+            (format t ";  ~10D bytes ~9D objects  #x~2,'0X ~a~%"
+                    (first r) (second r) (third r) (or (%subtag-name (third r)) "")))
+          nil))))

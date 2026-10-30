@@ -226,6 +226,54 @@
 ;;; every lookup.  Both default to NIL, which is also what MVM active
 ;;; limitation #7 leaves them as, so no init-form has to run.
 
+;;; ------------------------------------------------------------------
+;;; Keeping the tree alive until it is read
+;;; ------------------------------------------------------------------
+;;;
+;;; LAZY HAS TWO ENEMIES ON A THREADED PI IMAGE, and both lost the bootargs
+;;; (measured, QEMU raspi3b -dtb/-append, MODUS_RPI_THREADS=1):
+;;;   1. QEMU puts the tree at 0x08000000, where the threaded build keeps its GC
+;;;      bitmaps -- %RPI-GC-BITMAP-INIT zeroes them in kernel-main, before the
+;;;      first read, so the tree was gone and every bootarg read as unset.
+;;;   2. A saved core carries *FDT-SCANNED* = T and the BUILD machine's answer,
+;;;      so a restored card (kiln zero --sd-image) never read its cmdline.txt.
+;;; So kernel-main copies the tree to +FDT-KEEP+ before the bitmaps are cleared
+;;; (%FDT-KEEP, allocation-free, header-checked), and a restore points the slot
+;;; at the copy again and forgets the cached answer (%FDT-AFTER-RESTORE).
+;;; 0x06F00000: free RAM below the main stack (top 0x08000000, the main thread
+;;; never uses 16 MB of it) and above the thread stacks (0x05200000..0x05E00000);
+;;; neither the bitmaps nor a core restore write there.
+(defun %fdt-keep-addr () #x06F00000)
+
+(defun %fdt-set-ptr (a)
+  (setf (mem-ref (%fdt-ptr-slot) :u32) (logand a #xFFFFFFFF))
+  (setf (mem-ref (+ (%fdt-ptr-slot) 4) :u32) (floor a 4294967296))
+  a)
+
+(defun %fdt-keep ()
+  "Copy the firmware's tree to %FDT-KEEP-ADDR and point the slot at it.  T when
+   copied; otherwise the copy's magic is cleared, so a previous boot's tree left
+   in DRAM is never mistaken for this one's."
+  (let ((src (%fdt-base)) (dst (%fdt-keep-addr)))
+    (if (= src dst)
+        (return-from %fdt-keep t))         ; the boot preamble already moved it (boot-rpi-cl 0b)
+    (setf (mem-ref dst :u32) 0)
+    (if (and (%fdt-header-ok src) (<= (%fdt-u32 (+ src 4)) #x100000))
+        (let ((n (%fdt-u32 (+ src 4))) (i 0))
+          (loop (when (>= i n) (return nil))
+                (setf (mem-ref (+ dst i) :u8) (mem-ref (+ src i) :u8))
+                (setq i (+ i 1)))
+          (%fdt-set-ptr dst)
+          t)
+        nil)))
+
+(defun %fdt-after-restore ()
+  "A restored core holds the builder's answer: forget it, and read the copy this
+   boot made."
+  (when (%fdt-header-ok (%fdt-keep-addr)) (%fdt-set-ptr (%fdt-keep-addr)))
+  (setq *fdt-scanned* nil *fdt-bootargs* nil)
+  t)
+
 (defvar *fdt-bootargs* nil)
 (defvar *fdt-scanned* nil)
 

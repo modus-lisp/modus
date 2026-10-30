@@ -584,6 +584,26 @@
   "Endianness of the target being compiled FOR.  Set by BUILD-IMAGE from the
    target descriptor, alongside the numeric width.")
 
+(defparameter +target-soft-float+ 0
+  "1 when the target has NO FPU (68LC040, 68EC0x0): the compiler lowers every
+   float intrinsic to a call into mvm/softfloat.lisp instead of an FPU opcode.
+   Set by the build (MODUS_68K_SOFT_FLOAT=1); folded and injected like
+   +TARGET-BIG-ENDIAN+ so the image's own compiler does the same.  An integer
+   for the same reason: a NIL-valued constant never folds.")
+
+(defparameter +target-big-endian+ 0
+  "1 on a big-endian target, else 0: *TARGET-BIG-ENDIAN-P* as a FOLDED constant, for code that must know the
+   target's byte order AFTER the image is built -- the in-image compiler.
+   Set with it by SET-TARGET-FIXNUM-BITS-FOR, and spelled with pluses for the
+   same reason +FIXNUM-BITS+ is: the host folds the value into the code it
+   compiles, so an image's own compiler carries its target's answer.
+   *TARGET-BIG-ENDIAN-P* is a special; the image inherits only its NIL
+   default, so on the first big-endian CL image (68k) every runtime-compiled
+   :u32 MEM-REF split little-endian -- a store of #x12345678 read back as the
+   bytes 78 56 34 12.  An INTEGER, not T/NIL: the compiler's constant table
+   cannot tell a NIL-valued constant from an absent one, so NIL never folded
+   and every little-endian image read it as an (unbound) global instead.")
+
 (defparameter *target-fixnum-bits* 62
   "Magnitude bits in a tagged fixnum on the target being compiled FOR.
    Set by BUILD-IMAGE from the target's word size; 62 for 64-bit, 30 for
@@ -752,7 +772,12 @@
 
 (defun set-target-fixnum-bits-for (target)
   "Derive the numeric width, endianness and MV-slot addresses from TARGET."
-  (setf *target-big-endian-p* (eq (target-endianness target) :big))
+  (setf *target-big-endian-p* (eq (target-endianness target) :big)
+        +target-big-endian+   (if *target-big-endian-p* 1 0))
+  ;; The fpd-* (unboxed double) ops exist in the interpreter and the x86-64 /
+  ;; aarch64 translators only; an image for one of those may use them in its
+  ;; BAKED code too, not just in code it compiles at runtime.
+  (setf *target-has-fpd-p* (and (member (target-name target) '(:x86-64 :aarch64)) t))
   (multiple-value-bind (mvc mvv) (mv-slot-addrs-for target)
     (setf +mv-count-addr+ mvc
           +mv-values-addr+ mvv))
@@ -878,7 +903,9 @@
      (defconstant +name-hash-hi-mask+ ~D)~%~
      (defconstant +name-hash-lo-mask+ ~D)~%~
      (defconstant +mv-count-addr+ ~D)~%~
-     (defconstant +mv-values-addr+ ~D)~%"
+     (defconstant +mv-values-addr+ ~D)~%~
+     (defconstant +target-big-endian+ ~D)~%~
+     (defconstant +target-soft-float+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
     +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+
     +fixnum-signed-bits+ +fixnum-bits-1+ +limb-bits+ +limb-bits-1+
@@ -886,4 +913,4 @@
     +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
     +half-limb-mask+
     +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+
-    +mv-count-addr+ +mv-values-addr+))
+    +mv-count-addr+ +mv-values-addr+ +target-big-endian+ +target-soft-float+))

@@ -49,6 +49,19 @@
 ;;; ============================================================
 
 (defvar *cli-arch* :i386)
+;; MODUS_I386_SOFT_FLOAT=1: no SSE2 (or x87) instructions at all -- floats go
+;; through mvm/softfloat.lisp (see build-cli-common), so the image runs on a
+;; Pentium / PII / PIII (x87 but no SSE2) and an FPU-less 386 / 486SX.
+(defvar *cli-soft-float*
+  (let ((v (sb-ext:posix-getenv "MODUS_I386_SOFT_FLOAT")))
+    (and v (plusp (length v)) (not (string= v "0")))))
+;; MODUS_I386_FP=x87: floats on the x87 FPU instead of SSE2 (486DX, Pentium ..
+;; Pentium III), bit-exact against SSE2 -- see translate-i386's x87 arms.
+(defvar *cli-i386-fp*
+  (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
+    (cond ((or (null v) (string= v "") (string-equal v "sse2")) :sse2)
+          ((string-equal v "x87") :x87)
+          (t (error "MODUS_I386_FP=~A: expected sse2 or x87" v)))))
 
 ;;; ABI FACT: the i386 int-0x80 table is its own numbering.  exit is 1 (60 on
 ;;; x86-64, 93 on the AArch64 generic ABI); exit_group is 252 (231 / 94).
@@ -192,19 +205,8 @@
 (defun %sys-read-raw (fd buf-addr count) (syscall3 3 fd buf-addr count))
 (defun %sys-write-raw (fd buf-addr count) (syscall3 4 fd buf-addr count))
 (defun %sys-lseek (fd offset whence) (syscall3 19 fd offset whence))
-;; getcwd(2) is syscall 183 here (cl-fileio's default is x86-64's 79).
-(defun %sys-getcwd ()
-  (let* ((buf *io-buf-addr*)
-         (ret (syscall3 183 buf 1000 0)))
-    (if (<= ret 0)
-        nil
-        (let ((out (make-string-output-stream)) (i 0))
-          (loop
-            (let ((c (mem-ref (+ buf i) :u8)))
-              (when (or (= c 0) (>= i 1000)) (return nil))
-              (%print-char c out))
-            (setq i (+ i 1)))
-          (get-output-stream-string out)))))
+;; getcwd(2) is syscall 183 here (cl-fileio's %sys-getcwd asks this).
+(defun %sys-getcwd-nr () 183)
 (defun %sys-unlink (path-str)
   (%string-to-cstr path-str *cstr-scratch*)
   (syscall3 10 *cstr-scratch* 0 0))
@@ -351,6 +353,13 @@
 ;; On a target this young a SILENT int3 is the most expensive possible failure
 ;; mode, so the unimplemented-opcode report is always collected and printed.
 (setf modus.mvm.i386::*i386-record-unimpl* t)
+(setf modus.mvm.i386::*i386-x87* (eq cl-user::*cli-i386-fp* :x87))
+(let ((v (sb-ext:posix-getenv "MODUS_I386_X87_NOSCALE")))
+  (when (and v (plusp (length v)) (not (string= v "0")))
+    (setf modus.mvm.i386::*i386-x87-scale* nil)
+    (format t "~&;; FLOAT: x87 * and / UNSCALED -- negative control, not for use~%")))
+(when modus.mvm.i386::*i386-x87*
+  (format t "~&;; FLOAT: x87 (control word #x027F), no SSE2~%"))
 (setf modus.mvm.i386::*i386-unimpl-ops* nil)
 
 ;;; The symmap follows the IMAGE path (or MODUS_I386_SYMMAP).  It used to be a

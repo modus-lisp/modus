@@ -127,6 +127,7 @@
    its translate-mvm-to-aarch64 / a64-* references resolve to unused sentinels,
    symmetric to the x64 image's existing dead translate-mvm-to-x64 ref).")
 
+(declaim (overridable %jit-enabled-p))
 (defun %jit-enabled-p ()
   "WS4-S5b JIT gate.  The build OVERRIDES this defun (build-x64-linux.lisp,
    baked from MODUS_USE_JIT) to return T or NIL — last-defun-wins.  This base
@@ -2203,6 +2204,7 @@
   "DIAGNOSTIC: how many runtime-defined functions have been installed as real
    native code by %jit-install-native-fns.  NIL on a JIT-off image.")
 
+(declaim (overridable %jit-install-native-fns))
 (defun %jit-install-native-fns (base fnoffs names)
   "Publish each function of FNOFFS whose NAME is in NAMES (the top-level DEFUNs
    of this module) as a REAL NATIVE function at BASE+offset, in both global
@@ -2321,7 +2323,12 @@
    %JIT-HOT-PROMOTE describes: the box is never NAME's current definition, only
    the trampoline's own code, compiled.")
 
+;; Read here, so defined here; the drain that consumes it is further down.
+(defvar *jit-want-flag* nil "A cons made on the main thread; its CAR is T when some worker wants a build.")
+
 (defun %jit-note-forward (name bc box)
+  (when (and (null *jit-want-flag*) (%mvm-on-main-thread-p))
+    (setq *jit-want-flag* (list nil)))
   (when (null *jit-trampoline-forwards*)
     (setq *jit-trampoline-forwards* (make-hash-table :test (function equal))))
   (puthash name *jit-trampoline-forwards* (cons bc box)))
@@ -2733,6 +2740,51 @@
            ;; calls SELF.  Forwarding to NAME's definition was the loop.
            nil)))
 
+;;; HOT ON A WORKER.  A build records into region-0 tables, so only the main
+;;; thread builds (%JIT-HOT-PROMOTE answers :RETRY anywhere else) -- and a DEFUN
+;;; that only workers call (glass's RFB sender, a gateway's crypto) used to be
+;;; retried forever and stay interpreted: a Pi Zero's ZRLE stream spent 6 s at
+;;; a time in the interpreter.  Now the worker RAISES the trampoline's WANTED
+;;; cell and one global flag -- both stores of T into conses the main thread
+;;; made, so legal from any core -- and the main thread builds what is wanted
+;;; the next time it idles (net/bare-threads.lisp %BT-MAIN-IDLE) or between two
+;;; toplevel forms of a load, through the same %JIT-HOT-BUILD a promotion uses.
+;;; WANTED goes T -> :DONE when the drain takes it, built or not, so a module
+;;; that will not translate is not retried every 64 calls.
+(defvar *jit-want-built* nil "CENSUS: modules the drain built for workers.")
+
+
+(defun %jit-want (fwd)
+  (let ((f *jit-want-flag*))
+    (when (and (consp f) (consp (cdr fwd)) (null (cadr fwd)))
+      (setf (cadr fwd) t)
+      (setf (car f) t))))
+
+(defun %jit-drain-wanted ()
+  "On the main thread: build every DEFUN a worker found hot.  The count taken."
+  (let ((f *jit-want-flag*))
+    (if (and (consp f) (car f) (%mvm-on-main-thread-p) *jit-trampoline-forwards*
+             (%jit-enabled-p) (%jit-active-p) (not *jit-hot-busy*))
+        (let ((names nil))
+          (setf (car f) nil)
+          (maphash (lambda (k v)
+                     (let ((box (cdr v)))
+                       (when (and (consp box) (consp (cdr box)) (eq (cadr box) t))
+                         (setf (cadr box) :done)
+                         (when (null (car box)) (setq names (cons k names))))))
+                   *jit-trampoline-forwards*)
+          (when names
+            (let ((before (or *jit-native-defun-count* 0)))
+              (setq *jit-hot-busy* t)
+              (unwind-protect
+                   (let ((skips (%jit-skip-list)) (seen (cons nil 64)))
+                     (dolist (n names) (%jit-hot-build n skips seen)))
+                (setq *jit-hot-busy* nil))
+              (setq *jit-want-built* (+ (or *jit-want-built* 0) (length names)))
+              (when (> (or *jit-native-defun-count* 0) before) (%jit-retry-drain))))
+          (length names))
+        0)))
+
 (defun %mvm-make-defun-trampoline (name bc ftab rt offset lam-offsets)
   "The interpreter trampoline for runtime DEFUN NAME (%MVM-MAKE-TRAMPOLINE),
    counting toward the hot-function JIT: NAME is built after *JIT-HOT-CALLS*
@@ -2748,7 +2800,9 @@
         ;; the native function this trampoline forwards to once there is one:
         ;; set by a promotion here or by its module being built from anywhere
         ;; (*JIT-TRAMPOLINE-FORWARDS*)
-        (fwd (list nil))
+        ;; (NATIVE WANTED): WANTED is raised by a worker that found NAME hot --
+        ;; only the main thread may build (%JIT-WANT, %JIT-DRAIN-WANTED)
+        (fwd (list nil nil))
         ;; ITSELF, through a box: a variable assigned only OUTSIDE the closure is
         ;; captured by value here, i.e. as NIL.
         (self (list nil)))
@@ -2764,7 +2818,8 @@
             (when (or (= left 0) (> spent (%jit-hot-ns)))
               (let ((r (%jit-hot-promote name (car self))))
                 (if (eq r :retry)
-                    (setq left (%jit-hot-call-threshold) spent 0)
+                    (progn (unless (%mvm-on-main-thread-p) (%jit-want fwd))
+                           (setq left (%jit-hot-call-threshold) spent 0))
                     (setq left 0))))
             (values-list vals)))))
     (%note-fn-name (car self) name)
@@ -2783,6 +2838,68 @@
       (setq *%fn-names* (make-hash-table :test (quote eq))))
     (setf (gethash fn *%fn-names*) (if (symbolp name) (symbol-name name) name))))
 
+;;; STATIC VECTORS.  A large array that lives for the rest of the process --
+;;; a model's weights -- does not belong in the copying heap: every collection
+;;; would copy it, and the hosted heap's semispaces (~900 MB in a 1808 MB
+;;; mapping) cannot hold one the size of a 0.5B-parameter model anyway.
+;;; MAKE-STATIC-VECTOR puts it in its own anonymous mmap with an ordinary
+;;; vector header, so it IS a (simple-array ...) to every array path (AREF,
+;;; LENGTH, %vi-ld*, %f32v-ref, READ-SEQUENCE), and the collector leaves it
+;;; alone: a slot is only rewritten when it points into this region's
+;;; from-space, and a byte/float vector's contents are never scanned.  It
+;;; lives until FREE-STATIC-VECTOR unmaps it (a model's KV cache goes with its
+;;; context).  After that nothing may use it, not even pass it to a function;
+;;; a reference left in a heap object is harmless, since the collector only
+;;; compares a slot's address with its own spaces.
+;;;
+;;; The header is written a byte at a time: a :u64 MEM-REF store writes a
+;;; value's TAGGED form, so it cannot produce the (odd) header word
+;;; (length << 8) | subtag.  Where there is no mmap -- bare metal, or a failed
+;;; call -- the result is an ordinary MAKE-ARRAY: same type, same contents,
+;;; just in the heap.
+(defun %static-vector-subtag (element-type)
+  (cond ((equal element-type '(unsigned-byte 8)) (values #x11 1))
+        ((member element-type '(single-float short-float)) (values #x12 4))
+        (t (error "MAKE-STATIC-VECTOR: element type ~S is not (UNSIGNED-BYTE 8) or SINGLE-FLOAT"
+                  element-type))))
+
+(defun %store-word-bytes (raw w)
+  (dotimes (i 8) (setf (mem-ref (+ raw i) :u8) (ldb (byte 8 (* 8 i)) w))))
+
+(defvar *static-vector-maps* nil
+  "(TAGGED-WORD . BYTES) for every live mapping MAKE-STATIC-VECTOR made: what
+   FREE-STATIC-VECTOR may unmap.")
+
+(defun make-static-vector (n &key (element-type '(unsigned-byte 8)))
+  "An N-element (simple-array ELEMENT-TYPE (*)), zero-filled, outside the
+   moving heap (see STATIC VECTORS above).  ELEMENT-TYPE is (UNSIGNED-BYTE 8)
+   or SINGLE-FLOAT."
+  (multiple-value-bind (subtag width) (%static-vector-subtag element-type)
+    (let* ((bytes (+ 16 (* 16 (ceiling (* n width) 16))))
+           ;; mmap(NULL, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS):
+           ;; x86-64 numbering, as every runtime syscall; each target remaps.
+           (a (handler-case (syscall6 9 0 bytes 3 #x22 -1 0) (error () nil))))
+      (if (and (integerp a) (> a 4096))
+          (progn
+            (%store-word-bytes a (logior (ash n 8) subtag))
+            (%store-word-bytes (+ a 8) 0)
+            (push (cons (+ a 9) bytes) *static-vector-maps*)
+            (%word->val (+ a 9)))
+          (make-array n :element-type element-type
+                        :initial-element (if (= subtag #x12) 0.0 0))))))
+
+(defun free-static-vector (v)
+  "Unmap V, a vector MAKE-STATIC-VECTOR returned; T if it did.  A vector it
+   did not map (the in-heap fallback, anything else) is left to the
+   collector, and NIL returned."
+  (let* ((w (%val->word v))
+         (e (assoc w *static-vector-maps*)))
+    (when e
+      (setq *static-vector-maps* (remove e *static-vector-maps*))
+      ;; munmap(addr, bytes): x86-64 numbering, as every runtime syscall
+      (handler-case (syscall6 11 (- w 9) (cdr e) 0 0 0 0) (error () nil))
+      t)))
+
 (defun %init-modus-package ()
   "Bind the MODUS package's generic runtime functions.  Called from kernel-main
    AFTER the symbol-function table is populated (the package itself is created
@@ -2791,7 +2908,7 @@
    symbol's function cell and the qualified SFT key are set."
   (let ((p (find-package "MODUS")))
     (when p
-      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE"))
+      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE" "MAKE-STATIC-VECTOR" "FREE-STATIC-VECTOR"))
         (let ((fn (%mvm-resolve-runtime-fn nm)))
           (when fn
             (let ((dst (intern nm p)))
@@ -2874,6 +2991,7 @@
         (<= (+ bump size 16384)
             (or *jit-data-next* (%core-jit-arena-hi))))))
 
+(declaim (overridable %jit-translate-page-1))
 (defun %jit-translate-page-1 (bc ft-list rt-table)
   "Inner: translate BC → native x64, mmap an exec page, copy bytes, relocate
    calls + patch consts.  Returns a jit-entry list (base eoff cpatches
@@ -3106,6 +3224,13 @@
   (when (and (> b0 0) (> b1 b0) (= (%core-jit-arena-bump) b1))
     (setf (mem-ref (%core-jit-bump-slot) :u64) (ash b0 -1))
     t))
+
+(defvar *jit-reclaim-on* nil
+  "Reclaim JIT pages (STEP-A).  Off unless set; its readers also guard with BOUNDP.")
+(defvar *jit-fallback-names* nil
+  "The DEFUNs whose forms last fell back to interpretation (a diagnostic).")
+(defvar *jit-last-condition* nil
+  "The condition the last JIT fallback caught (a diagnostic).")
 
 (defun %jit-translate-page-1-aarch64 (bc mvm-entry ft-list rt-table)
   "WS4-S5 (aarch64) sibling of %jit-translate-page-1.  translate-mvm-to-aarch64
@@ -4124,6 +4249,7 @@
         (entry nil)
         (rt-table (make-hash-table))
         (rt-next #x40000000))
+    (declare (special *init-thunk-names*))   ; #248: per unit in-image too
     (register-mvm-bootstrap-macros)
     (let* ((rforms (reverse forms))
            (last-form (car rforms))
@@ -4667,6 +4793,7 @@
         ;; %e2-scan-persist, which sees through EVAL-WHEN / PROGN / LOCALLY
         ;; AND macro wrappers (with-upgradability) — see its docstring.
         (persist-names nil))
+    (declare (special *init-thunk-names*))   ; #248: per unit in-image too
     (register-mvm-bootstrap-macros)
     ;; WS3 def persistence pre-scan.  Runs with *macro-table* freshly populated
     ;; (bootstrap macros) so %e2-scan-persist's macroexpand-1-mvm sees the same
@@ -5380,6 +5507,7 @@
 ;;; ~650k calls per alexandria quickload; STRING-UPCASE was 29% of the PC
 ;;; profile.  This override (spliced after compiler.lisp) restores the raw
 ;;; %PRIM-AREF loop with inline ASCII upcasing.  Bit-identical result.
+(declaim (overridable compute-name-hash))
 (defun compute-name-hash (name-string)
   ;; A wrapped (multi-dimensional / adjustable / base-char) string stores its
   ;; characters behind a #x34 header: %PRIM-AREF would read the wrapper's

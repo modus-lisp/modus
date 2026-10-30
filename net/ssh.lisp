@@ -1,6 +1,12 @@
 ;;;; ssh.lisp — SSH server (single-threaded, multi-connection)
 ;;;; Shared between x86-64 and AArch64 builds.
 ;;;; All arch-specific functions (e1000-state-base, ssh-conn-base etc.) defined in arch-*.lisp
+;;;; Package MODUS.SSH (builder packages step 3): it uses MODUS.CRYPTO and what
+;;;; MODUS-INT exports to it (mvm/kernel-packages.lisp).  The functions it
+;;;; declares OVERRIDABLE are the image adapters' to replace, and they name them
+;;;; modus.ssh::NAME (net/hosted-ssh.lisp, isolated-cl.lisp, ssh-x64-cl.lisp).
+
+(in-package :modus.ssh)
 
 ;; ================================================================
 ;; SSH Server
@@ -40,6 +46,7 @@
 ;;   +0x00 key (64)   +0x40 block counter   +0x44 pool index (64 = empty)
 ;;   +0x48 pool (64)  +0x88 seeded flag
 ;; ------------------------------------------------------------------
+(declaim (overridable arch-hw-random-fill))
 (defun arch-hw-random-fill (addr n) 0)       ; 1 = filled N bytes at ADDR from hardware
 
 (defun %drbg-base () (+ (e1000-state-base) #x1800))
@@ -57,6 +64,7 @@
 
 ;; No hardware RNG answered: the weak key, announced.  The x64 CL image
 ;; overrides this to refuse instead inside an SEV-SNP guest.
+(declaim (overridable ssh-no-hw-rng))
 (defun ssh-no-hw-rng (b) (%drbg-weak-key b))
 
 (defun ssh-seed-random ()
@@ -90,6 +98,7 @@
     (setf (mem-ref (+ b #x44) :u32) 0)))
 
 ;; A random byte.  SSH is the per-connection state base, kept for the callers.
+(declaim (overridable ssh-random))
 (defun ssh-random (ssh)
   (let ((b (%drbg-base)))
     (when (not (= (mem-ref (+ b #x88) :u32) 1))
@@ -495,6 +504,7 @@
 ;; (or the inline poll loop that stands in for it) fills the buffer and this is
 ;; the actor RECEIVE it always was.  A hosted image overrides it with a read(2)
 ;; on the connection's socket (net/hosted-ssh.lisp).
+(declaim (overridable ssh-wait-data))
 (defun ssh-wait-data (ssh) (ssh-net-poll))
 
 (defun ssh-receive-packet (ssh timeout)
@@ -1154,67 +1164,6 @@
         (ssh-send-string ssh out out-len))
       (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0))))
 
-;; Handle CHANNEL_DATA - unified REPL with full line editing
-;; Uses handle-edit-byte + capture/flush for SSH output routing
-(defun ssh-handle-channel-data (ssh payload plen)
-  (let ((data-len (ssh-get-u32 payload 5)))
-    ;; Load per-connection state into shared edit state
-    (ssh-load-edit-state ssh)
-    ;; Set prompt mode to SSH
-    (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 1)
-    ;; Enable capture -- accumulate ALL output for the batch
-    (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-    (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-    ;; Process each byte through the shared line editor
-    (let ((i 0))
-      (loop
-        (if (< i data-len)
-            (progn
-              (let ((rc (handle-edit-byte (aref payload (+ 9 i)))))
-                (if (eq rc 1)
-                    ;; Enter: flush batch, eval, prompt
-                    (progn
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                      (ssh-flush-output ssh)
-                      (ssh-save-edit-state ssh)
-                      ;; Newline echo
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-                      (%serial-byte 10)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                      (ssh-flush-output ssh)
-                      ;; Evaluate
-                      (ssh-do-eval ssh)
-                      ;; Prompt
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-                      (emit-prompt)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                      (ssh-flush-output ssh)
-                      ;; Reinit and re-enable capture for rest of batch
-                      (edit-set-line-len 0)
-                      (edit-set-cursor-pos 0)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-                      (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0))
-                    (if (eq rc 2)
-                        ;; Ctrl-D: flush + disconnect
-                        (progn
-                          (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-                          (ssh-flush-output ssh)
-                          (ssh-save-edit-state ssh)
-                          (ssh-handle-ctrl-d ssh)
-                          (setq i data-len))
-                        ())))
-              (setq i (+ i 1)))
-            (return 0))))
-    ;; Flush remaining batched output
-    (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-    (ssh-flush-output ssh)
-    ;; Save state back to per-connection
-    (ssh-save-edit-state ssh)
-    (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 0)))
-
 ;; Evaluate current line buffer for SSH (dispatch on content)
 (defun ssh-do-eval (ssh)
   (let ((len (edit-line-len)))
@@ -1231,53 +1180,6 @@
                 (ssh-do-eval-expr ssh))
             ())))))
 
-;; Override ssh-do-eval-expr: use buffer reader instead of read-list
-(defun ssh-do-eval-expr (ssh)
-  (let ((len (edit-line-len)))
-    ;; Set up FIFO read position past '(' and length
-    (setf (mem-ref (+ (ssh-ipc-base) #x20) :u32) 1)
-    (setf (mem-ref (+ (ssh-ipc-base) #x24) :u32) len)
-    ;; Parse from line buffer
-    (let ((lst (buf-read-list)))
-      ;; Evaluate
-      (let ((globals (ssh-get-globals)))
-        (let ((result (eval-sexp lst nil globals)))
-          ;; Enable capture for output
-          (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-          (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-          (%serial-byte 10)
-          (%serial-byte 61) (%serial-byte 32)
-          (ssh-print-sexp result)
-          (%serial-byte 10)
-          ;; Flush captured output
-          (let ((out-len (mem-ref (+ (ssh-ipc-base) #x18) :u32)))
-            (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-            (when (> out-len 0)
-              (let ((out (make-array out-len)))
-                (dotimes (i out-len)
-                  (aset out i (mem-ref (+ (+ (ssh-ipc-base) #x100) i) :u8)))
-                (ssh-send-string ssh out out-len)))))))))
-
-
-;; Evaluate command line from SSH exec request
-;; Copies command into shared line buffer, evaluates, flushes output to SSH
-;; ssh = per-connection SSH state base, cmd = byte array, cmd-len = length
-(defun ssh-eval-line (ssh cmd cmd-len)
-  ;; Copy command into shared line buffer at 0x300028
-  (dotimes (i cmd-len) (setf (mem-ref (+ (+ (ssh-ipc-base) #x28) i) :u8) (aref cmd i)))
-  ;; Set line length
-  (edit-set-line-len cmd-len)
-  ;; Set prompt mode to SSH
-  (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 1)
-  ;; Enable output capture (bit0=capture, bit1=suppress serial)
-  (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 3)
-  (setf (mem-ref (+ (ssh-ipc-base) #x18) :u32) 0)
-  ;; Evaluate (dispatches based on first char)
-  (ssh-do-eval ssh)
-  ;; Flush captured output
-  (setf (mem-ref (+ (ssh-ipc-base) #x14) :u32) 0)
-  (ssh-flush-output ssh)
-  (setf (mem-ref (+ (ssh-ipc-base) #x12A00) :u64) 0))
 
 ;; Evaluate expression from SSH (alias for ssh-eval-line)
 (defun ssh-eval-expr (ssh cmd cmd-len)
@@ -1375,6 +1277,7 @@
 ;; then stores its address at 0x395000 so cross-compiled make-array
 ;; and make-string can call it on OOM.
 ;; Must be called before any actors that need GC in cross-compiled allocators.
+(declaim (overridable init-gc-helper))
 (defun init-gc-helper ()
   ;; Build args for rt-compile-defun: (name params body)
   ;; params = nil (0)
@@ -1481,6 +1384,7 @@
 
 ;; Process a single byte of input for line editing
 ;; Returns: 1 = enter pressed, 2 = ctrl-d, nil = continue
+(declaim (overridable handle-edit-byte))
 (defun handle-edit-byte (b)
   (let ((esc (mem-ref (+ (ssh-ipc-base) #x12810) :u64)))
     (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 0)
@@ -1718,10 +1622,6 @@
     (%serial-byte (car chars))
     (ssh-print-chars (cdr chars))))
 
-;; Override native-eval to use the REPL interpreter
-(defun native-eval (form)
-  (eval-sexp form nil (ssh-get-globals)))
-
 ;;; ============================================================
 ;;; Pre-computed crypto (avoid >5s USB polling gap)
 ;;; ============================================================
@@ -1729,6 +1629,7 @@
 ;; Pre-compute Ed25519 host key derivatives for fast signing.
 ;; Stores clamped scalar s at state+0x680, prefix at state+0x6A0.
 ;; Must be called AFTER ed25519-init and host key setup.
+(declaim (overridable pre-compute-host-sign))
 (defun pre-compute-host-sign ()
   (let ((state (e1000-state-base)))
     (sha512-init)
@@ -1755,6 +1656,7 @@
 ;; A fresh server ephemeral key for the NEXT connection.  It is pre-computed so
 ;; a slow board does not pay for it inside a handshake, but reusing one key for
 ;; every connection gives up forward secrecy, so each connection retires it.
+(declaim (overridable ssh-refresh-ephemeral))
 (defun ssh-refresh-ephemeral ()
   (when (= (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)   ; only if a KEX used it
     (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 0)
@@ -1763,10 +1665,12 @@
 ;; Where SSH-HANDLE-KEX finds the server's ephemeral X25519 pair for SSH (the
 ;; private key, the public key at +0x20): one slot for the server, refreshed
 ;; after each key exchange.  net/isolated-cl.lisp gives every session its own.
+(declaim (overridable ssh-eph-base))
 (defun ssh-eph-base (ssh) (+ (e1000-state-base) #x6C4))
 
 ;; Pre-compute X25519 server ephemeral key pair.
 ;; Stores private key at state+0x6C4, public key at state+0x6E4.
+(declaim (overridable pre-compute-server-eph))
 (defun pre-compute-server-eph (ssh)
   (let ((state (e1000-state-base)))
     ;; Generate random private key
@@ -1782,6 +1686,7 @@
 
 ;; Fast Ed25519 sign using pre-computed s, prefix, and host public key.
 ;; Saves one ed-base-mult and one SHA-512 compared to ed25519-sign.
+(declaim (overridable ed25519-sign-fast))
 (defun ed25519-sign-fast (message msg-len)
   (let ((state (e1000-state-base)))
     ;; Load pre-computed s and prefix
@@ -1808,26 +1713,6 @@
                       (let ((sig-s (ed-scalar-add r ks)))
                         (concat-bytes r-enc 32 sig-s 32)))))))))))))
 
-;; USB keep-alive: poll USB to prevent host NETDEV WATCHDOG timeout
-(defun usb-keepalive ()
-  (let ((i 0))
-    (loop
-      (when (>= i 100) (return 0))
-      (io-delay)
-      (let ((pkt-len (e1000-receive)))
-        (when (not (zerop pkt-len))
-          (let ((buf (e1000-rx-buf)))
-            (let ((et-hi (mem-ref (+ buf 12) :u8)))
-              (when (eq et-hi #x08)
-                (let ((et-lo (mem-ref (+ buf 13) :u8)))
-                  (if (eq et-lo #x06)
-                      (let ((arp-op (buf-read-u16-mem buf 20)))
-                        (when (eq arp-op 1) (arp-reply buf)))
-                      (when (eq et-lo 0)
-                        (let ((proto (mem-ref (+ buf 23) :u8)))
-                          (when (eq proto 1) (icmp-handle buf 14)))))))))))
-      (setq i (+ i 1)))))
-
 ;;; ============================================================
 ;;; Network: the single-threaded server loop
 ;;; ============================================================
@@ -1843,10 +1728,10 @@
 ;; the fixpoint stubs) point SSH-NET-POLL at their own.
 (defun ssh-net-poll ()
   (io-delay)
-  (let ((pkt-len (e1000-receive)))
+  (let ((pkt-len (modus.net:nic-receive)))
     (if (zerop pkt-len)
         1
-        (let ((buf (e1000-rx-buf)))
+        (let ((buf (modus.net:nic-rx-buf)))
           (let ((et-hi (mem-ref (+ buf 12) :u8))
                 (et-lo (mem-ref (+ buf 13) :u8)))
             (if (eq et-hi #x08)
@@ -1959,6 +1844,7 @@
 
 ;; Message loop — runs until the client disconnects; an authenticated session
 ;; never times out, an unauthenticated one does (see below).
+(declaim (overridable ssh-message-loop))
 (defun ssh-message-loop (ssh)
   (let ((flag-addr (+ (conn-ssh 3) #x700))
         (idle 0)
@@ -1995,11 +1881,15 @@
 ;; SSH-WAIT-EXPIRED-P is the one policy: COUNT polls against LIMIT, SINCE = the
 ;; clock at the start of the wait.  The default is the count alone (unchanged);
 ;; a target with a usable counter overrides both (the x64 CL image: TSC).
+(declaim (overridable ssh-preauth-clock))
 (defun ssh-preauth-clock () 0)
+(declaim (overridable ssh-peer-closed-p))
 (defun ssh-peer-closed-p () (= (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1))
+(declaim (overridable ssh-wait-expired-p))
 (defun ssh-wait-expired-p (count limit since)
   (or (ssh-peer-closed-p) (> count limit)))
 ;; The wait for the client's version string, the first thing it sends.
+(declaim (overridable ssh-version-wait-expired-p))
 (defun ssh-version-wait-expired-p (count since) (ssh-wait-expired-p count 50 since))
 
 ;; The next packet, waiting as long as SSH-WAIT-EXPIRED-P allows; NIL on timeout.

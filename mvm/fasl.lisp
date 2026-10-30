@@ -583,9 +583,17 @@
                  (if tn (namestring tn) ""))
                ""))))
 
+(defvar *fasl-suspended* nil
+  "T while the CLI installs a deferred boot surface (build-cli-common.lisp's
+   *DEFERRED-SURFACES-SOURCE*).  That install can start in the middle of a
+   LOAD that is recording this very cache, and the two loads' per-form
+   recording state is shared, so the install loads uncached -- as an uncached
+   boot would.")
+
 (defun %fasl-active-p ()
-  "The cache is in use for this load: switched on, main thread, runtime eval."
-  (and (%fasl-mode) (%mvm-on-main-thread-p) (not *static-build-p*)))
+  "The cache is in use for this load: switched on, main thread, runtime eval,
+   and no deferred surface being installed."
+  (and (not *fasl-suspended*) (%fasl-mode) (%mvm-on-main-thread-p) (not *static-build-p*)))
 
 (defun %fasl-stream-text (stream)
   "STREAM's whole remaining text when it is a FILE being LOADed and the cache is
@@ -630,6 +638,7 @@
               eof
               (progn
                 (setf (nth 5 fx) (cdr (nth 5 fx)))
+                (%fasl-replay-surfaces e)
                 (if (nth 2 e)
                     (list '%fasl-module-marker (nth 2 e) (nth 0 e) (nth 1 e) (nth 3 e))
                     (progn (%fasl-stat 3)
@@ -638,12 +647,32 @@
                            (if (nth 3 e)
                                (nth 3 e)
                                (values (read-from-string text t nil :start (nth 0 e)))))))))
-        (let ((start (nth 3 fx)))
+        (let ((start (nth 3 fx)) (pending (%fasl-surfaces-pending-p)))
           (multiple-value-bind (form end) (read-from-string text nil eof :start start)
             (setf (nth 3 fx) end)
             (unless (eq form eof)
-              (setf (nth 4 fx) (cons (list start end nil) (nth 4 fx))))
+              (setf (nth 4 fx) (cons (list start end nil nil
+                                           (and pending (not (%fasl-surfaces-pending-p))))
+                                     (nth 4 fx))))
             form)))))
+
+;;; THE DEFERRED SURFACES (SB-*, Genera, ASDF; build-cli-common.lisp) are
+;;; installed when the READER first meets one of their packages.  A replay
+;;; reads nothing, so a module that calls `sb-thread:make-thread' ran before
+;;; anything installed SB-THREAD and died UNDEFINED-FUNCTION on every load after
+;;; the first (measured on origin/main 38ea4f0, a three-line file).  Tainting
+;;; the triggering form does not help: the read happens before its compile.
+;;; So an entry records that ITS read installed them (element 4), and replaying
+;;; that entry installs them first.
+;;; Called directly, not through FUNCALL of a symbol: the deferred-surfaces
+;;; code is baked but outside runtime EVAL's function table, so (FUNCALL
+;;; '%FORCE-...) answered UNDEFINED-FUNCTION.  Both have NIL defaults beside
+;;; %DEFERRED-PACKAGE-HOOK (cl-packages.lisp) for images without surfaces.
+(defun %fasl-surfaces-pending-p () (%deferred-pending-p))
+
+(defun %fasl-replay-surfaces (e)
+  (when (and (nth 4 e) (%deferred-pending-p))
+    (%force-deferred-installs)))
 
 (defun %fasl-eval (fx form)
   "EVAL FORM as the load loop would, recording or replaying through FX."
@@ -1056,7 +1085,8 @@
                                               (nth 4 fx)))
                        (handler-case (%fasl-eval fx pre) (error (c) nil)))
                      (setq form (cdr ext))
-                     (setf (nth 4 fx) (cons (list (nth 0 own) (nth 1 own) nil form)
+                     (setf (nth 4 fx) (cons (list (nth 0 own) (nth 1 own) nil form
+                                                  (nth 4 own))
                                             (nth 4 fx))))))
                ;; A form that does not compile is left as source: LOAD meets
                ;; the error where the source-copying COMPILE-FILE let it.

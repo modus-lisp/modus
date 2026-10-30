@@ -13,11 +13,34 @@
 ;;;; Deliberately small: in-order receive (an out-of-order segment is dropped and the ACK
 ;;;; repeated, the peer retransmits), immediate ACKs, a fixed 32 KB send window over the
 ;;;; peer's, retransmission with doubling timeout, no SACK, no window scaling.
+;;;;
+;;;; LOOPBACK: a connection to 127.x.x.x, or to this board's own address, on a port something
+;;;; here listens on is a PAIR of connections joined to each other, no frames at all: a write
+;;;; appends to the peer's receive buffer, a close is the peer's EOF.  Reads, polls and accepts
+;;;; are the network ones unchanged (they look only at the receive buffer, its EOF and the
+;;;; listener's ready list), so an image can talk to itself over TCP -- a gateway to the desktop
+;;;; it serves, an admission client to the admission service beside it.  Both ends belong to the
+;;;; one thread that owns every connection (above), so nothing here races.
+;;;;
+;;;; ANY THREAD MAY RUN THE NETWORK, ONE STEP AT A TIME.  The connection table, the UDP queues,
+;;;; the receive buffers and the NIC's receive ring (one consumer) are guarded by *NET-LOCK*, a
+;;;; recursive lock taken for one pump step or one connection operation; a blocking wait
+;;;; (%PUMP-UNTIL) releases it between steps, so a gateway's relay pool, its ICE checks and its
+;;;; sessions -- each on a thread of its own -- interleave on the one network, and a frame goes
+;;;; to the connection it names whichever thread happened to pump it.  On an image without
+;;;; threads the lock is modus's single-threaded flag.
+
+;;; Kernel code loaded at runtime (kiln zero carries it), so read in the kernel's
+;;; package: the internals it calls and defines are MODUS-INT's, not CL-USER's.
+(in-package :modus-int)
 
 (defvar *tcp-conns* nil "Every connection the pump knows, most recent first.")
 (defvar *tcp-listeners* nil)
 (defvar *udp-ports* nil "Alist port -> list of (ip port bytes), oldest first.")
 (defvar *tcp-port-next* 0)
+(defvar *net-lock* (sb-thread:make-mutex :name "net") "See ANY THREAD MAY RUN THE NETWORK above.")
+(defmacro with-net-lock (&body body)
+  `(sb-thread:with-recursive-lock (*net-lock*) ,@body))
 (defvar *net-pump-other* nil "Called with (buf len) for frames that are not TCP/UDP for us (ARP).")
 
 (defclass tcp-conn ()
@@ -33,7 +56,9 @@
    (rx-eof :initform nil :accessor tc-rx-eof)
    (unacked :initform nil :accessor tc-unacked)   ; list of #(seq bytes flags sent-at rto tries)
    (peer-window :initform 65535 :accessor tc-peer-window)
-   (listener :initform nil :initarg :listener :accessor tc-listener)))
+   (listener :initform nil :initarg :listener :accessor tc-listener)
+   ;; the other end of a LOOPBACK connection (above), or NIL for one over the network
+   (peer :initform nil :accessor tc-peer)))
 
 (defclass tcp-listener ()
   ((port :initarg :port :accessor tl-port)
@@ -77,6 +102,17 @@
 (defun %put16 (v o x) (setf (aref v o) (ldb (byte 8 8) x) (aref v (+ o 1)) (ldb (byte 8 0) x)))
 (defun %put32 (v o x) (%put16 v o (ldb (byte 16 16) x)) (%put16 v (+ o 2) (ldb (byte 16 0) x)))
 
+;;; FLOW CONTROL.  The window advertised is what is left of a *TCP-RCV-BUF* receive buffer
+;;; after the bytes nobody has read yet.  It was a fixed 65535 whatever was unread, so a relay
+;;; replaying a backlog faster than the board parsed it grew RX without bound -- by doubling,
+;;; and an adjustable (UNSIGNED-BYTE 8) vector here is backed by a general vector, 8 bytes a
+;;; byte: three relay connections held 2-4 MB each, kept after draining, and pushed region 0 of
+;;; the Zero gateway core into collecting every few hundred ms.  TCPC-READ announces the window
+;;; again once a read has reopened it (the peer would otherwise wait for its persist timer).
+(defparameter *tcp-rcv-buf* 65536 "Bytes a connection buffers before its window closes.")
+(defun %rcv-window (c)
+  (max 0 (min 65535 (- *tcp-rcv-buf* (fill-pointer (tc-rx c))))))
+
 (defun %tcp-segment (c flags seq data start n)
   "Build and send one segment of C: FLAGS, sequence SEQ, N bytes of DATA from START."
   (let* ((syn (logbitp 1 flags)) (hdr (if syn 24 20)) (len (+ hdr n))
@@ -84,7 +120,7 @@
     (%put16 seg 0 (tc-lport c)) (%put16 seg 2 (tc-rport c))
     (%put32 seg 4 seq) (%put32 seg 8 (if (logbitp 4 flags) (tc-rcv-nxt c) 0))
     (setf (aref seg 12) (if syn #x60 #x50) (aref seg 13) flags)
-    (%put16 seg 14 65535)
+    (%put16 seg 14 (%rcv-window c))
     (when syn (setf (aref seg 20) 2 (aref seg 21) 4 (aref seg 22) #x05 (aref seg 23) #xB4))
     (dotimes (i n) (setf (aref seg (+ hdr i)) (aref data (+ start i))))
     (%put16 seg 16 (%l4-checksum 6 (%our-ip) (tc-rip c) seg len))
@@ -205,13 +241,16 @@
 (defun net-pump (&optional (max 64))
   "Take up to MAX frames off the NIC and give each to its connection or port; then
    retransmit what is overdue.  The number of frames taken."
+  (with-net-lock (%net-pump-1 max)))
+
+(defun %net-pump-1 (max)
   (let ((n 0) (me (%our-ip)))
     (loop
       (when (>= n max) (return))
-      (let ((len (e1000-receive)))
+      (let ((len (modus.net:nic-receive)))
         (when (zerop len) (return))
         (setq n (+ n 1))
-        (let ((buf (e1000-rx-buf)))
+        (let ((buf (modus.net:nic-rx-buf)))
           (if (and (= (mem-ref (+ buf 12) :u8) #x08) (= (mem-ref (+ buf 13) :u8) 0))
               (let* ((ihl (* 4 (logand (mem-ref (+ buf 14) :u8) 15)))
                      (proto (mem-ref (+ buf 23) :u8))
@@ -228,28 +267,73 @@
     n))
 
 (defun %pump-until (pred timeout-ms)
-  "Pump until PRED is true or TIMEOUT-MS pass; PRED's last value."
+  "Pump until PRED is true or TIMEOUT-MS pass; PRED's last value.  The network lock is held
+   for each test and pump step and released between them (see the top of the file)."
   (let ((end (+ (%now-ms) timeout-ms)))
     (loop
-      (let ((v (funcall pred))) (when v (return v)))
+      (let ((v (with-net-lock (funcall pred)))) (when v (return v)))
       (when (> (%now-ms) end) (return nil))
-      (when (zerop (net-pump)) (io-delay)))))
+      (when (zerop (net-pump)) (%net-idle)))))
+
+(defun %net-idle ()
+  "Nothing arrived: let this core's other threads run (net/bare-threads.lisp's BT-YIELD --
+   on the main thread, core 0's; the other end of a LOOPBACK pair is often one of them),
+   and only when none could, wait (IO-DELAY: QEMU's event loop gets its moment, and it is
+   5000 device reads -- paid between every chunk of a loopback transfer, it was most of
+   the time an RFB frame took)."
+  (unless (and (fboundp 'bt-yield) (bt-yield))
+    (io-delay)))
 
 ;;; ---- the API ------------------------------------------------------------------------------
 
+(defun %loopback-ip-p (ip)
+  "127.0.0.0/8, or this board's own address."
+  (or (= (ldb (byte 8 24) ip) 127) (= ip (%our-ip))))
+
+(defun %tcpc-open-loopback (ip port)
+  "A LOOPBACK pair to local listener PORT (see the top of the file): the client end, with
+   the server end on the listener's ready list.  NIL when nothing here listens on PORT."
+  (with-net-lock
+  (let ((l (find port *tcp-listeners* :key #'tl-port)))
+    (when l
+      (let* ((lport (+ 49152 (setq *tcp-port-next* (logand (+ *tcp-port-next* 1) #x3FFF))))
+             (client (make-instance 'tcp-conn :lport lport :rip ip :rport port
+                                              :state :established :snd-nxt 0))
+             (server (make-instance 'tcp-conn :lport port :rip ip :rport lport
+                                              :state :established :snd-nxt 0 :listener l)))
+        (setf (tc-peer client) server (tc-peer server) client)
+        (setf (tl-ready l) (append (tl-ready l) (list server)))
+        client)))))
+
 (defun tcpc-open (ip port &key (timeout-ms 3000))
   "A connection to IP:PORT, established, or NIL."
+  (when (%loopback-ip-p ip)
+    (return-from tcpc-open (%tcpc-open-loopback ip port)))
   (let ((c (make-instance 'tcp-conn :lport (+ 49152 (setq *tcp-port-next* (logand (+ *tcp-port-next* 1) #x3FFF)))
                           :rip ip :rport port :state :syn-sent
                           :snd-nxt (logand (* 2654435761 (+ (%now-ms) *tcp-port-next*)) #xFFFFFFFF))))
-    (push c *tcp-conns*)
-    (%tcp-emit c #x02)
+    (with-net-lock (push c *tcp-conns*) (%tcp-emit c #x02))
     (if (%pump-until (lambda () (member (tc-state c) '(:established :closed))) timeout-ms)
         (if (eq (tc-state c) :established) c (progn (setf (tc-state c) :closed) nil))
         (progn (setf (tc-state c) :closed) nil))))
 
 (defun tcpc-write (c data &key (start 0) end (timeout-ms 10000))
   "Send DATA[START, END) on C, segment by segment, keeping at most 32 KB unacknowledged."
+  (when (tc-peer c)
+    ;; LOOPBACK: straight into the other end's receive buffer
+    (let ((p (tc-peer c)) (end (or end (length data))))
+      (unless (and (eq (tc-state c) :established) (not (eq (tc-state p) :closed)))
+        (return-from tcpc-write nil))
+      ;; One copy, not a VECTOR-PUSH-EXTEND per byte: grow the buffer once (keeping what
+      ;; ADJUST-ARRAY returns), then REPLACE the slice in.
+      (with-net-lock
+        (let* ((rx (tc-rx p)) (fp (fill-pointer rx)) (need (+ fp (- end start))))
+          (when (> need (array-dimension rx 0))
+            (setf rx (adjust-array rx (max need (* 2 (array-dimension rx 0))))
+                  (tc-rx p) rx))
+          (setf (fill-pointer rx) need)
+          (replace rx data :start1 fp :start2 start :end2 end)))
+      (return-from tcpc-write t)))
   (let ((end (or end (length data))) (pos start))
     (loop
       (when (>= pos end) (return t))
@@ -259,51 +343,73 @@
                            timeout-ms)
         (return nil))
       (let ((n (min 1460 (- end pos))))
-        (%tcp-emit c #x18 data pos n)
+        (with-net-lock (%tcp-emit c #x18 data pos n))
         (setq pos (+ pos n))))))
 
-(defun tcpc-read (c &key (max 65536) (timeout-ms 5000))
+(defun tcpc-read (c &key (max 65536) (timeout-ms 5000) into)
   "Up to MAX bytes C has received, waiting up to TIMEOUT-MS for any; :EOF once the peer
-   has closed and everything is read; an empty vector on timeout."
+   has closed and everything is read; an empty vector on timeout.  With INTO, an octet
+   vector of at least MAX, the bytes go there and the answer is their count (0 on timeout):
+   a socket read then allocates nothing."
   (%pump-until (lambda () (or (> (fill-pointer (tc-rx c)) 0) (tc-rx-eof c))) timeout-ms)
-  (let* ((rx (tc-rx c)) (have (fill-pointer rx)))
-    (if (and (zerop have) (tc-rx-eof c))
-        :eof
-        (let* ((n (min max have)) (out (make-array n :element-type '(unsigned-byte 8))))
-          (dotimes (i n) (setf (aref out i) (aref rx i)))
-          (replace rx rx :start2 n :end2 have)
-          (setf (fill-pointer rx) (- have n))
-          out))))
+  (with-net-lock
+    (let* ((rx (tc-rx c)) (have (fill-pointer rx)))
+      (if (and (zerop have) (tc-rx-eof c))
+          :eof
+          (let* ((n (min max have)) (out (or into (make-array n :element-type '(unsigned-byte 8))))
+                 (was (%rcv-window c)))
+            (replace out rx :end2 n)
+            (replace rx rx :start2 n :end2 have)
+            (setf (fill-pointer rx) (- have n))
+            ;; drained: give back a buffer a burst grew (it costs 8 bytes a byte) -- a big one
+            ;; only: below that, a desk's every update grew it again and it churned
+            (when (and (= have n) (> (array-dimension rx 0) 262144))
+              (setf (tc-rx c) (make-array 4096 :element-type '(unsigned-byte 8)
+                                               :adjustable t :fill-pointer 0)))
+            ;; window update, over the network only, once the read reopened a quarter of it
+            (when (and (null (tc-peer c)) (member (tc-state c) '(:established :fin-wait :fin-wait-2))
+                       (< was (ash *tcp-rcv-buf* -2)) (>= (%rcv-window c) (ash *tcp-rcv-buf* -2)))
+              (%tcp-ack c))
+            (if into n out))))))
 
 (defun tcpc-close (c &key (timeout-ms 2000))
   "Send FIN and wait (briefly) for it to be acknowledged."
-  (case (tc-state c)
-    (:established (%tcp-emit c #x11) (setf (tc-state c) :fin-wait))
-    (:close-wait (%tcp-emit c #x11) (setf (tc-state c) :last-ack)))
+  (when (tc-peer c)
+    ;; LOOPBACK: the other end reads EOF once it has read what was written
+    (with-net-lock (setf (tc-rx-eof (tc-peer c)) t (tc-state c) :closed))
+    (return-from tcpc-close t))
+  (with-net-lock
+    (case (tc-state c)
+      (:established (%tcp-emit c #x11) (setf (tc-state c) :fin-wait))
+      (:close-wait (%tcp-emit c #x11) (setf (tc-state c) :last-ack))))
   (%pump-until (lambda () (null (tc-unacked c))) timeout-ms)
   (when (member (tc-state c) '(:fin-wait-2 :last-ack :fin-wait)) (setf (tc-state c) :closed))
   t)
 
 (defun tcpc-listen (port)
+  (with-net-lock
   (or (find port *tcp-listeners* :key #'tl-port)
-      (let ((l (make-instance 'tcp-listener :port port))) (push l *tcp-listeners*) l)))
+      (let ((l (make-instance 'tcp-listener :port port))) (push l *tcp-listeners*) l))))
 
 (defun tcpc-accept (l &key (timeout-ms 5000))
   "The next established connection to listener L, or NIL."
   (when (%pump-until (lambda () (tl-ready l)) timeout-ms)
-    (pop (tl-ready l))))
+    (with-net-lock (pop (tl-ready l)))))
 
-(defun udp-open (port) (or (assoc port *udp-ports*) (car (push (list port) *udp-ports*))) port)
+(defun udp-open (port)
+  (with-net-lock (or (assoc port *udp-ports*) (car (push (list port) *udp-ports*))))
+  port)
 
 (defun udp-send-to (ip port lport data &optional (n (length data)))
+  (with-net-lock
   (let* ((len (+ 8 n)) (seg (make-array len :initial-element 0)))
     (%put16 seg 0 lport) (%put16 seg 2 port) (%put16 seg 4 len)
     (dotimes (i n) (setf (aref seg (+ 8 i)) (aref data i)))
     (%put16 seg 6 (%l4-checksum 17 (%our-ip) ip seg len))
-    (ip-send ip 17 seg len)))
+    (ip-send ip 17 seg len))))
 
 (defun udp-recv (port &key (timeout-ms 1000))
   "(ip port bytes) for the oldest datagram to PORT, or NIL."
   (let ((q (assoc port *udp-ports*)))
     (when (%pump-until (lambda () (cdr q)) timeout-ms)
-      (pop (cdr q)))))
+      (with-net-lock (pop (cdr q))))))

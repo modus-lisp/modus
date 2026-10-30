@@ -1,6 +1,8 @@
 ;;;; cl-types.lisp — Type system: typep, numeric types, float operations
 ;;;; Part of the Modus CL runtime. Depends on cl-clos.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Trig / transcendental functions (stub implementations)
 ;;; These return values in the correct range for ANSI conformance tests:
@@ -345,6 +347,14 @@
 ;;; halves), built with %MAKE-TYPED-FLOAT rather than read as literals.
 (defun %dbl (hi lo) (%make-typed-float hi lo 'double-float))
 
+;; 2^k for k in [-1022, 1023], the exact doubles %EXP-F scales by.
+(defvar *exp2-table* nil)
+(defun %exp2-table ()
+  (or *exp2-table*
+      (setq *exp2-table*
+            (let ((v (make-array 2046)))
+              (dotimes (i 2046 v) (setf (svref v i) (%dbl (ash (+ (- i 1022) 1023) 20) 0)))))))
+
 (defun %exp-f (x)
   "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
    exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
@@ -358,28 +368,40 @@
        (if (and (= (logand hi #x000FFFFF) 0) (= (%float-lo32 x) 0))
            (if (= (logand hi #x80000000) 0) x (%fl 0))       ; exp(+inf)=inf, exp(-inf)=0
            x))                                                ; NaN
-      ((%float-lt-p (%dbl #x40862E42 #xFEFA39EF) x)            ; > 709.78...: overflow
+      ((let ((xd x)) (declare (type double-float xd))
+         (< 709.782712893384d0 xd))                             ; > #x40862E42FEFA39EF: overflow
        (%dbl #x7FF00000 0))
-      ((%float-lt-p x (%dbl #xC0874910 #xD52D3051))            ; < -745.13...: underflow
+      ((let ((xd x)) (declare (type double-float xd))
+         (< xd -745.1332191019411d0))                           ; < #xC0874910D52D3051: underflow
        (%fl 0))
       (t
-       (let* ((tq (%float-mul x (%dbl #x3FF71547 #x652B82FE)))   ; x / ln2
-              (k (%float-to-int (if (%float-lt-p tq (%fl 0))
-                                    (%float-sub tq (%dbl #x3FE00000 0))
-                                    (%float-add tq (%dbl #x3FE00000 0)))))
-              (fk (%fl k))
-              (r (%float-sub (%float-sub x (%float-mul fk (%dbl #x3FE62E42 #xFEE00000)))
-                             (%float-mul fk (%dbl #x3DEA39EF #x35793C76))))
-              (acc (%fl 1))
-              (n 13))
-         ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
-         (loop
-           (when (< n 1) (return nil))
-           (setq acc (%float-add (%fl 1) (%float-div (%float-mul r acc) (%fl n))))
-           (setq n (- n 1)))
-         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends
+       ;; The arithmetic is unboxed double trees (declared DOUBLE-FLOAT locals and
+       ;; literal constants), not %FLOAT-* calls: it was ~40 boxed operations an
+       ;; EXP, 0.8 us, and illatio's SwiGLU calls EXP 117k times a token.  The
+       ;; operations and their order are the old ones, so the bits are too: the
+       ;; series below is the old loop acc = 1 + (r*acc)/n, n = 13..1, unrolled,
+       ;; each step written deep-operand-first so the tree fits the FP pool
+       ;; (IEEE + and * are exactly commutative; r*1 = r and x/1 = x exactly).
+       ;; The literals are the old bit patterns: 1/ln2 #x3FF71547652B82FE,
+       ;; ln2_hi #x3FE62E42FEE00000, ln2_lo #x3DEA39EF35793C76.
+       (let* ((xd x)
+              (tq (* xd 1.4426950408889634d0))                   ; x / ln2
+              ;; k = truncate(tq +- 0.5): round half away from zero, as before
+              (k (if (< tq 0d0)
+                     (the (signed-byte 32) (truncate (- tq 0.5d0)))
+                     (the (signed-byte 32) (truncate (+ tq 0.5d0)))))
+              (r (- (- xd (* (float k 1d0) 0.6931471803691238d0))
+                    (* (float k 1d0) 1.9082149292705877d-10)))
+              ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
+              (acc (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ r 13d0) 1d0) r) 12d0) 1d0) r) 11d0) 1d0) r) 10d0) 1d0) r) 9d0) 1d0) r) 8d0) 1d0) r) 7d0) 1d0) r) 6d0) 1d0) r) 5d0) 1d0) r) 4d0) 1d0) r) 3d0) 1d0) r) 2d0) 1d0) r) 1d0) 1d0)))
+         (declare (type double-float xd tq r acc) (type (signed-byte 32) k))
+         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends.
+         ;; The normal-range 2^k are the same doubles as before, read from a table
+         ;; instead of built from their bits on every call.
          (cond ((and (>= k -1022) (<= k 1023))
-                (%float-mul acc (%dbl (ash (+ k 1023) 20) 0)))
+                (let ((p (svref (%exp2-table) (+ k 1022))))
+                  (declare (type double-float p))
+                  (* acc p)))
                ((> k 1023)
                 (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
                             (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
@@ -1893,6 +1915,7 @@
 ;; equal IS wrappped via compile-li-func to %EQUAL-FN already; no defun
 ;; needed (and recursive (defun equal (a b) (equal a b)) infinite-loops).
 (defun eq (a b) (eq a b))
+(declaim (overridable eql))
 (defun eql (a b)
   "EQL — same as EQ for non-numbers/non-chars; for numbers, equal in
    type AND value.  Boxed numerics (IEEE floats subtag #x60, ratios
@@ -4208,7 +4231,11 @@
            (logand (logxor (+ (* h1 31) h2) 12345) most-positive-fixnum))))
     (t 42)))
 
-(defun sxhash (object) (%sxhash-1 object 0))
+;; CLHS: a non-negative FIXNUM.  The hash is computed in 32 unsigned bits, which
+;; on a 32-bit port (fixnums are 30 bits) is a bignum about three times in four
+;; -- upstream SXHASH.1/.13/.15 on i386, arm32 and riscv32.  On the 64-bit ports
+;; every value already fits and the mask changes nothing.
+(defun sxhash (object) (logand (%sxhash-1 object 0) most-positive-fixnum))
 
 ;;; ============================================================
 ;;; float-radix — IEEE floats always use base 2
@@ -4237,9 +4264,13 @@
   (if (%single-typed-p float) 24 53))
 
 (defun float-precision (float)
-  "Precision (significant bits) of FLOAT: 0 for a zero, else 24/53 by type."
-  (if (= float 0.0d0) 0
-      (if (%single-typed-p float) 24 53)))
+  "Significant bits of FLOAT: 0 for a zero, the mantissa's length for a
+   subnormal, else 24/53 by type."
+  (multiple-value-bind (m e) (integer-decode-float float)
+    (declare (ignore e))
+    (cond ((= m 0) 0)
+          ((%single-typed-p float) (min 24 (integer-length m)))
+          (t (min 53 (integer-length m))))))
 
 (defun float-sign (float &rest float2-arg)
   "Return a float with the magnitude of FLOAT2 (default (FLOAT 1 FLOAT)) and the
@@ -4272,35 +4303,38 @@
         (/ r (float (expt 2 (- k)) one)))))
 
 (defun decode-float (float)
-  "Decode float into (significand exponent sign).
-   Bails on non-floats (e.g. NIL from an uninitialized
-   *-float-epsilon defvar) so the caller sees a TYPE-ERROR
-   instead of looping forever in the normalize loop below."
+  "Decode FLOAT into (significand exponent sign), significand in [0.5, 1)
+   and sign +-1, both in FLOAT's own format.  Exact: the integer significand
+   is shifted up to full precision, then divided by 2^precision."
   (unless (floatp float)
     (error "decode-float: not a float ~S" float))
-  ;; Stub: return approximate values
-  (if (= float 0.0d0)
-      (values 0.0d0 0 1.0d0)
-      (let ((sign (if (< float 0.0d0) -1.0d0 1.0d0))
-            (abs-f (if (< float 0.0d0) (- 0.0d0 float) float)))
-        ;; Find exponent such that 0.5 <= sig < 1.0. Safety cap so a
-        ;; pathological input (denormal, ±inf, or a value the comparisons
-        ;; never converge on) can't loop indefinitely.
-        (let ((exp 0) (sig abs-f) (iter 0))
-          (loop
-            (when (and (>= sig 0.5d0) (< sig 1.0d0)) (return))
-            (when (> iter 4096) (return))
-            (setq iter (+ iter 1))
-            (if (>= sig 1.0d0)
-                (progn (setq sig (/ sig 2.0d0)) (setq exp (+ exp 1)))
-                (progn (setq sig (* sig 2.0d0)) (setq exp (- exp 1)))))
-          (values sig exp sign)))))
+  (multiple-value-bind (m e s) (integer-decode-float float)
+    (let ((one (float 1 float)))
+      (if (= m 0)
+          (values (float 0 float) 0 (if (< s 0) (- one) one))
+          (let* ((p (float-digits float))
+                 (shift (- p (integer-length m))))
+            (values (float (/ (ash m shift) (ash 1 p)) float)
+                    (+ e p (- shift))
+                    (if (< s 0) (- one) one)))))))
 
 (defun integer-decode-float (float)
   "Decode IEEE 64-bit float to (significand exponent sign) — three integers.
    Returns 0, 0, 1 for ±0.  For non-IEEE (modus rational-form floats or
    non-floats) falls back to a coarse mantissa*2^exp split."
   (cond
+    ((and (%ieee-float-p float) (%single-typed-p float))
+     ;; A single's significand is 24 bits: decode its IEEE32 pattern, not the
+     ;; double payload it is boxed with.
+     (let* ((bits (%single->bits float))
+            (sign (if (= (logand (ash bits -31) 1) 1) -1 1))
+            (e8 (logand (ash bits -23) 255))
+            (m23 (logand bits 8388607)))
+       (cond
+         ((and (= e8 0) (= m23 0)) (values 0 0 sign))
+         ((= e8 255) (values m23 0 sign))               ; inf/nan
+         ((= e8 0) (values m23 -149 sign))              ; subnormal
+         (t (values (logior 8388608 m23) (- e8 150) sign)))))
     ((%ieee-float-p float)
      (let* ((hi-u32 (%float-hi32 float))
             (lo (%float-lo32 float))

@@ -1123,7 +1123,18 @@
     (a64-emit-call-label buf (cadr e) t)                     ; B stub
     (a64-slot-cache-flush)))
 
+(defvar *a64-runtime-marks* nil
+  "(NAME . native byte offset) of the unnamed runtime code a whole-image translation appends
+   after the last function -- the handler helpers, the native collector, the store guard, the
+   cold stubs, the bitmap marks -- newest first.  WRITE-SYMMAP names them; without it a profiler
+   charged all of it (the collector included) to whichever function happened to be last.")
+
+(defun a64-runtime-mark (buf name)
+  (when (and *aarch64-translate-into-buf* (not *aarch64-jit-mode*))
+    (push (cons name (* 4 (a64-current-index buf))) *a64-runtime-marks*)))
+
 (defun a64-emit-cold-stubs (buf)
+  (when *a64-cold-stubs* (a64-runtime-mark buf "<runtime: cold-call stubs>"))
   (dolist (e (reverse *a64-cold-stubs*))
     (a64-slot-cache-flush)
     (a64-set-label buf (cadr e))
@@ -1139,11 +1150,13 @@
    cold-call stubs."
   (a64-emit-cold-stubs buf)
   (when *a64-mark-start-label*
+    (a64-runtime-mark buf "<runtime: gc mark start bit>")
     (a64-set-label buf *a64-mark-start-label*)
     (emit-aarch64-gc-set-bit buf #x10000E18)
     (a64-br buf +a64-x15+)
     (setq *a64-mark-start-label* nil))
   (when *a64-mark-cons-label*
+    (a64-runtime-mark buf "<runtime: gc mark cons bit>")
     (a64-set-label buf *a64-mark-cons-label*)
     (emit-aarch64-gc-set-bit buf #x10000E40)
     (a64-br buf +a64-x15+)
@@ -1459,15 +1472,6 @@
 ;;; sf|0|0|11010110|Rm|001000|Rn|Rd  = LSLV
 ;;; sf|0|0|11010110|Rm|001001|Rn|Rd  = LSRV
 ;;; sf|0|0|11010110|Rm|001010|Rn|Rd  = ASRV
-
-(defun a64-lslv (buf rd rn rm)
-  "LSL Xd, Xn, Xm  (variable shift left)"
-  (a64-emit buf (logior (ash 1 31)
-                        (ash #b0011010110 21)
-                        (ash rm 16)
-                        (ash #b001000 10)
-                        (ash rn 5)
-                        rd)))
 
 (defun a64-lsrv (buf rd rn rm)
   "LSR Xd, Xn, Xm  (variable logical shift right)"
@@ -2252,6 +2256,19 @@
       (a64-add-reg buf rd rd pidx 2 1)                  ; ASR #1
       (a64-add-reg buf rd rd pidx 0 2)))                ; LSL #2
 
+(defun a64-emit-bulk-card-mark (buf pobj pidx pn)
+  "After a word BULK-MOVE/BULK-FILL: mark the cards of elements [idx, idx+n)
+   of POBJ (registers holding tagged object, index and count).  Nothing when
+   n is 0.  Clobbers x9-x15."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-cmp-imm buf pn 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-le+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-bulk-elt-addr buf +a64-x10+ pobj pidx nil)          ; first element
+    (a64-add-reg buf +a64-x11+ +a64-x10+ pn 0 2)             ; + n*8
+    (a64-sub-imm buf +a64-x11+ +a64-x11+ 1)                  ; last byte
+    (a64-emit-card-mark-range buf +a64-x10+ +a64-x11+)
+    (a64-set-label buf skip)))
+
 (defun a64-bulk-guard-pass (buf)
   "Before a word BULK-MOVE with threads live: every source word through the
    shared-store guard, against the destination object in x17 -- the per-element
@@ -2361,6 +2378,131 @@
     (dolist (idx rets) (a64-ssg-branch-here buf idx))
     (a64-br buf +a64-x9+)))
 
+;;; CARD-MARKING WRITE BARRIER (generational GC stage 2, docs/generational-gc.md).
+;;; After a heap store, the card (512 bytes) holding the stored-to slot is
+;;; marked DIRTY (byte 0) so a minor collection scans only dirty cards of the
+;;; old space instead of all of it.  The table covers [area, area+512*ncards),
+;;; the semispace that holds the old space; a slot outside it marks nothing.
+;;; Four words, RAW (never scanned): +0 card bytes (0 = no table, the barrier
+;;; and the collector's card scan are off), +8 area base, +16 ncards, +24 the
+;;; crossing table (u32 per card: (object covering the card's first byte -
+;;; area) >> 4), all written by GC-TENURE.  Same out-of-line shape as the
+;;; shared-store guard: a site is x10/x11 = first/last byte stored, ADR x9, B;
+;;; the subroutine uses x9-x15 only.  Raw (setf mem-ref) stores are NOT
+;;; covered; %GC-CARD-AUDIT is the check that nothing relies on them.
+(defconstant +gc-card-base-addr+ #x10000CE0)
+
+(defvar *a64-card-barrier* t
+  "Whether heap stores call the card-marking barrier.  Correct while the
+   table is off (one load and a branch per store), so it is on everywhere.")
+
+(defvar *a64-card-label* nil
+  "The barrier subroutine's labels (see A64-CARD-LABELS).  Per unit for a
+   runtime (JIT) translation; ONE set for the whole image when translating
+   into the shared image buffer, whose branch fixups resolve across units --
+   one copy per function was 1.8 MB of a 57 MB image.  SETQ'd, never bound
+   (see *A64-SSG-LABEL*).")
+
+(defvar *a64-card-image-label* nil
+  "The image-wide barrier labels, and whether that copy is emitted yet:
+   (LABELS . EMITTED-P).  Reset by each image build.")
+
+(defun a64-card-new-labels ()
+  "A vector: [0] the x10 entry, [1] the x10..x11 range entry, then per
+   register R: [2+2R] `x10 := R', [3+2R] `x10..x11 := R..R+263'."
+  (let ((v (make-array 66)))
+    (dotimes (i 66) (setf (aref v i) (incf *mvm-label-counter*)))
+    v))
+
+(defun a64-card-labels ()
+  (cond (*a64-card-label*)
+        ((and *aarch64-translate-into-buf* (not *aarch64-jit-mode*))
+         (unless *a64-card-image-label*
+           (setq *a64-card-image-label* (cons (a64-card-new-labels) nil)))
+         (setq *a64-card-label* (car *a64-card-image-label*)))
+        (t (setq *a64-card-label* (a64-card-new-labels)))))
+
+(defun a64-card-reg-entry-p (r)
+  "Registers with their own barrier entries: everything but the barrier's own
+   scratch x9-x15, x18 (the convention base) and sp/xzr."
+  (and (<= 0 r 30) (not (<= +a64-x9+ r +a64-x15+)) (/= r 18)))
+
+(defun a64-emit-card-call (buf label)
+  "ADR x9, <return>; B LABEL."
+  (let ((adr (a64-current-index buf)))
+    (a64-emit buf (logior #x10000000 +a64-x9+))       ; ADR x9, <return>
+    (a64-emit-call-label buf label t)                 ; B barrier
+    (setf (aref (a64-buffer-code buf) adr)
+          (logior #x10000000 (ash (logand (- (a64-current-index buf) adr) #x7FFFF) 5)
+                  +a64-x9+))))
+
+(defun a64-emit-card-mark-range (buf first last)
+  "Mark the cards of the bytes FIRST..LAST (registers, inclusive) dirty.
+   Clobbers x9-x15.  FIRST/LAST may be x10/x11 themselves."
+  (let ((labels (a64-card-labels)))
+    (unless (= first +a64-x10+) (a64-mov-reg buf +a64-x10+ first))
+    (unless (= last +a64-x11+) (a64-mov-reg buf +a64-x11+ last))
+    (a64-emit-card-call buf (aref labels 1))))
+
+(defun a64-emit-card-mark (buf addr offset)
+  "Mark the card of the slot at ADDR+OFFSET (ADDR a register; a tagged object
+   is fine, the tag never crosses a card).  TWO instructions for the common
+   shapes -- a per-register entry does the move -- and an offset up to 255
+   marks the one or two cards the slot can be in (over-marking only costs a
+   card scan).  Clobbers x9-x15."
+  (when *a64-card-barrier*
+    (let ((labels (a64-card-labels)))
+      (cond ((and (= offset 0) (a64-card-reg-entry-p addr))
+             (a64-emit-card-call buf (aref labels (+ 2 (* 2 addr)))))
+            ((and (<= 0 offset 255) (a64-card-reg-entry-p addr))
+             (a64-emit-card-call buf (aref labels (+ 3 (* 2 addr)))))
+            (t
+             (if (> offset 0)
+                 (a64-add-imm buf +a64-x10+ addr offset)
+                 (a64-mov-reg buf +a64-x10+ addr))
+             (a64-emit-card-call buf (aref labels 0)))))))
+
+(defun a64-emit-card-mark-sub (buf labels)
+  "The barrier (see A64-CARD-NEW-LABELS for its entries).  x9 = return."
+  (let ((ret (incf *mvm-label-counter*))
+        (inrange (incf *mvm-label-counter*))
+        (loop-l (incf *mvm-label-counter*)))
+    (dotimes (r 31)
+      (when (a64-card-reg-entry-p r)
+        (a64-set-label buf (aref labels (+ 2 (* 2 r))))
+        (a64-mov-reg buf +a64-x10+ r)
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i (aref labels 0) :b))
+        (a64-set-label buf (aref labels (+ 3 (* 2 r))))
+        (a64-add-imm buf +a64-x11+ r 263)
+        (a64-mov-reg buf +a64-x10+ r)
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i (aref labels 1) :b))))
+    (a64-set-label buf (aref labels 0))
+    (a64-mov-reg buf +a64-x11+ +a64-x10+)
+    (a64-set-label buf (aref labels 1))
+    (a64-load-conv-addr buf +a64-x12+ +gc-card-base-addr+)
+    (a64-ldp-offset buf +a64-x13+ +a64-x14+ +a64-x12+ 0)   ; card bytes, area
+    (a64-cmp-imm buf +a64-x13+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i ret :bcond))
+    (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 16)          ; ncards
+    (a64-sub-reg buf +a64-x10+ +a64-x10+ +a64-x14+ 0 0)
+    (a64-lsr-imm buf +a64-x10+ +a64-x10+ 9)                ; first card
+    (a64-cmp-reg buf +a64-x10+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i ret :bcond))
+    (a64-sub-reg buf +a64-x11+ +a64-x11+ +a64-x14+ 0 0)
+    (a64-lsr-imm buf +a64-x11+ +a64-x11+ 9)                ; last card
+    (a64-cmp-reg buf +a64-x11+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i inrange :bcond))
+    (a64-sub-imm buf +a64-x11+ +a64-x15+ 1)
+    (a64-set-label buf inrange)
+    (a64-set-label buf loop-l)
+    (a64-add-reg buf +a64-x12+ +a64-x13+ +a64-x10+ 0 0)
+    (a64-strb buf +a64-xzr+ +a64-x12+)                     ; dirty
+    (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i loop-l :bcond)) ; LS
+    (a64-set-label buf ret)
+    (a64-br buf +a64-x9+)))
+
 (defconstant +a64-darwin-sys-set-thread-delta+ 1000
   "Pseudo-syscall number the Darwin host shim answers by storing x0 in the
    reserved pthread key (host/macos/modus-shim.c).  Past every Linux number.")
@@ -2449,8 +2591,11 @@
 ;;; identity DEVICE memory (PCI MMIO), so JIT pages written at 0x14000000 would
 ;;; land in unbacked MMIO and %jit-call would branch into zeros.  The virt build
 ;;; overrides these with a real DRAM window.
+(declaim (overridable %jit-exec-bump))
 (defun %jit-exec-bump () #x13FFFFF0)
+(declaim (overridable %jit-exec-lo))
 (defun %jit-exec-lo   () #x14000000)
+(declaim (overridable %jit-exec-hi))
 (defun %jit-exec-hi   () #x18000000)
 
 (defconstant +sysreg-cntpct-el0+ #xDF01 "CNTPCT_EL0: S3_3_C14_C0_1")
@@ -2966,6 +3111,7 @@
                                   ( 5 . 80)    ; fstat
                                   ( 8 . 62)    ; lseek
                                   ( 9 . 222)   ; mmap
+                                  (11 . 215)   ; munmap (FREE-STATIC-VECTOR)
                                   (39 . 172)   ; getpid
                                   (41 . 198)   ; socket
                                   (42 . 203)   ; connect
@@ -3432,6 +3578,8 @@
                   (let ((skip (incf *mvm-label-counter*)))
                     (a64-stw-table buf +a64-x9+ skip)
                     (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
+                    (when *aarch64-linux-mode*
+                      (a64-r0-count-snapshot buf +a64-x10+ +a64-x11+ +a64-x12+))
                     (a64-stw-publish buf +a64-x14+ 2)
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
@@ -3451,9 +3599,14 @@
                 ;; which has not changed since %GC-SAFE-ENTER published it —
                 ;; wait for the flag to clear, and try again.  Returns NIL.
                 (when *a64-tls-window*
-                  (let ((skip (incf *mvm-label-counter*))
-                        (again (incf *mvm-label-counter*))
-                        (spin (incf *mvm-label-counter*)))
+                  (let* ((skip (incf *mvm-label-counter*))
+                         (again (incf *mvm-label-counter*))
+                         (spin (incf *mvm-label-counter*))
+                         ;; RUNNING with the flag clear -- but a WHOLE region-0
+                         ;; collection may have come and gone while this thread
+                         ;; was safe (a sleep), and nothing else reloads x24/x25
+                         ;; (translate-x64's EMIT-X64-GC-SAFE-TRAP).  Hosted.
+                         (running (if *aarch64-linux-mode* (incf *mvm-label-counter*) skip)))
                     (a64-stw-table buf +a64-x9+ skip)
                     (a64-stw-token-and-rec buf +a64-x9+ +a64-x13+ +a64-x14+)
                     (a64-set-label buf again)
@@ -3464,7 +3617,7 @@
                     (a64-ldar buf +a64-x12+ +a64-x11+)
                     (a64-cmp-imm buf +a64-x12+ 0)
                     (let ((i (a64-current-index buf)))
-                      (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+                      (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i running :bcond))
                     (a64-movz buf +a64-x10+ 2 0)                    ; safe again
                     (a64-dmb buf #xB)
                     (a64-str-unsigned buf +a64-x10+ +a64-x14+ #x68)
@@ -3483,6 +3636,11 @@
                       (a64-set-label buf back))
                     (let ((i (a64-current-index buf)))
                       (a64-b buf 0) (a64-add-fixup buf i again :b))
+                    (when *aarch64-linux-mode*
+                      (a64-set-label buf running)
+                      (let ((back (incf *mvm-label-counter*)))
+                        (emit-aarch64-stw-refresh buf back)
+                        (a64-set-label buf back)))
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
                ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0541))
@@ -5029,7 +5187,8 @@
                                           (ensure-src (vr 0) +a64-x16+)))
            (let ((pd (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+)))
-             (a64-stur buf ps pd -1)))
+             (a64-stur buf ps pd -1)
+             (a64-emit-card-mark buf pd 0)))
 
           ;; ---- SETCDR Vd, Vs ----
           ;; STUR Vs, [Vd, #7]  (untag + skip car)
@@ -5039,7 +5198,8 @@
                                           (ensure-src (vr 0) +a64-x16+)))
            (let ((pd (ensure-src (vr 0) +a64-x16+))
                  (ps (ensure-src (vr 1) +a64-x17+)))
-             (a64-stur buf ps pd 7)))
+             (a64-stur buf ps pd 7)
+             (a64-emit-card-mark buf pd 0)))
 
           ;; ---- CONSP Vd, Vs ----
           ;; (consp NIL) MUST return NIL even though NIL=#xDEAD0001 has
@@ -5302,11 +5462,13 @@
                                 (ensure-src vobj +a64-x16+)))
                         (offset (+ (* idx 8) 7)))
                    (if (and (>= offset -256) (<= offset 255))
-                       (a64-stur buf ps pobj offset)
+                       (progn (a64-stur buf ps pobj offset)
+                              (a64-emit-card-mark buf pobj offset))
                        (progn
                          (a64-load-imm64 buf +a64-x9+ offset)
                          (a64-add-reg buf +a64-x9+ pobj +a64-x9+ 0 0)
-                         (a64-stur buf ps +a64-x9+ 0)))))))
+                         (a64-stur buf ps +a64-x9+ 0)
+                         (a64-emit-card-mark buf +a64-x9+ 0)))))))
 
           ;; ---- OBJ-TAG Vd, Vs ----
           ;; Extract low 4 bits, then fixnum-tag (SHL 1) — matches x64.
@@ -5407,7 +5569,8 @@
              (a64-add-imm buf +a64-x16+ pobj 7)
              (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
              (let ((ps (ensure-src (vr 2) +a64-x17+)))
-               (a64-stur buf ps +a64-x16+ 0))))
+               (a64-stur buf ps +a64-x16+ 0))
+             (a64-emit-card-mark buf +a64-x16+ 0)))
 
           ;; ---- ARRAY-LEN Vd, Vobj ----
           ;; Extract element count from header at raw = tagged-9.
@@ -5731,6 +5894,60 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
+          ;; ==== the FP-register ops a float tree was missing: one instruction each,
+          ;; encodings assembler-checked (as -arch arm64; objdump -d).
+          ;; ---- FP-OP1 Fd, Fs, sub ----  FABS Sd / FABS Dd / FCVT Dd,Sn / FCVT Sd,Dn
+          ((= op +op-fp-op1+)
+           (let* ((fd (fpp (vr 0))) (fs (fpp (vr 1))) (sub (vr 2))
+                  (base (case sub (0 #x1E20C000) (1 #x1E60C000) (2 #x1E22C000) (t #x1E624000))))
+             (a64-emit buf (logior base (ash fs 5) fd))))
+          ;; ---- FP-OP2 Fd, Fa, Fb, sub ----  FMAX/FMIN, S then D
+          ((= op +op-fp-op2+)
+           (let* ((fd (fpp (vr 0))) (fa (fpp (vr 1))) (fb (fpp (vr 2))) (sub (vr 3))
+                  (base (case sub (0 #x1E204800) (1 #x1E205800) (2 #x1E604800) (t #x1E605800))))
+             (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
+          ;; ---- FP-CMP Vd, Fa, Fb, sub ----  FCMP Sa, Sb; CSET x9, MI (lt) / LS (le); tag
+          ((= op +op-fp-cmp+)
+           (let* ((vd (vr 0)) (fa (fpp (vr 1))) (fb (fpp (vr 2))) (sub (vr 3))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-emit buf (logior #x1E202000 (ash fb 16) (ash fa 5)))      ; fcmp Sa, Sb
+             (a64-emit buf (logior #x9A9F07E0 (ash (if (= sub 0) 5 8) 12) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+          ;; ---- FP-TOI Vd, Fs, sub ----  FCVT{NS,ZS,MS,PS} x9, S/D; tag
+          ((= op +op-fp-toi+)
+           (let* ((vd (vr 0)) (fs (fpp (vr 1))) (sub (vr 2))
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (base (aref #(#x9E200000 #x9E380000 #x9E300000 #x9E280000
+                                #x9E600000 #x9E780000 #x9E700000 #x9E680000)
+                              sub)))
+             (a64-emit buf (logior base (ash fs 5) +a64-x9+))
+             (a64-lsl-imm buf pd +a64-x9+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- FPD-LI / FP-LI Fd, hi, lo ----  x9 = hi:lo, FMOV Dd, x9;
+          ;; FP-LI then FCVT Sd, Dd (the double is exactly the single).
+          ((or (= op +op-fpd-li+) (= op +op-fp-li+))
+           (let ((fd (fpp (vr 0)))
+                 (bits (logior (ash (logand (vr 1) #xFFFFFFFF) 32) (logand (vr 2) #xFFFFFFFF))))
+             (a64-load-imm64 buf +a64-x9+ bits)
+             (a64-fmov-d-x buf fd +a64-x9+)
+             (when (= op +op-fp-li+)
+               (a64-emit buf (logior #x1E624000 (ash fd 5) fd)))))          ; fcvt Sd, Dd
+
+          ;; ---- FPD-SCALE Fd, Vk ----  Fd *= 2^k: the double 2^k from its
+          ;; exponent bits (k + 1023) << 52 in D0 (FP scratch), then FMUL.
+          ((= op +op-fpd-scale+)
+           (let* ((fd (fpp (vr 0)))
+                  (pk (ensure-src (vr 1) +a64-x16+)))
+             (a64-asr-imm buf +a64-x9+ pk 1)
+             (a64-add-imm buf +a64-x9+ +a64-x9+ 1023)
+             (a64-lsl-imm buf +a64-x9+ +a64-x9+ 52)
+             (a64-fmov-d-x buf 0 +a64-x9+)
+             (a64-emit buf (logior #x1E600800 (ash 0 16) (ash fd 5) fd))))   ; fmul Dd, Dd, D0
+
           ;; ---- FPD-ITOF Fd, Vsrc ----  ASR x9, src, 1 ; SCVTF Dd, x9 (no box)
           ((= op +op-fpd-itof+)
            (let* ((fd (fpp (vr 0)))
@@ -5862,6 +6079,7 @@
                    ((= sub 9) (a64-emit buf (logior #x4E614800 (ash fs 5) fd)))   ; SQXTN2 Vd.8H, Vs.4S
                    ((= sub 10) (a64-emit buf (logior #x0F08A400 (ash fs 5) fd)))  ; SXTL Vd.8H, Vs.8B (s8->s16)
                    ((= sub 11) (a64-emit buf (logior #x4E60B800 (ash fs 5) fd)))  ; ABS Vd.8H, Vs.8H
+                   ((= sub 12) (a64-emit buf (logior #x4E21D800 (ash fs 5) fd)))  ; SCVTF Vd.4S, Vs.4S
                    (t (unless (= fd fs)
                         (a64-emit buf (logior #x4EA01C00 (ash fs 16) (ash fs 5) fd)))))))
           ;; ---- VI-SHIFT Fd, Fs, sub, n ----  immediate shifts (immh:immb in bits 22:16)
@@ -5885,6 +6103,7 @@
                           (20 #x0E402800) (21 #x0E406800) (22 #x0E403800) (23 #x0E407800)
                           (24 #x4E606C00) (25 #x4E606400) (26 #x6E206C00) (27 #x6E206400)
                           (28 #x0E002800) (29 #x0E006800) (30 #x0E802800) (31 #x0E806800)   ; TRN1/TRN2 .8B, TRN1/TRN2 .2S
+                          (32 #x4E809400) (33 #x4EA0BC00)   ; SDOT .4S,.16B,.16B (accumulates into Vd); ADDP .4S
                           (t #x0E407800))))
              (a64-emit buf (logior base (ash fb 16) (ash fa 5) fd))))
           ;; ---- VI-MOVI Fd, kind, val ----  MOVI Vd.16B / Vd.8H, #val  (abc:defgh split)
@@ -5930,7 +6149,11 @@
                    (a64-lsl-imm buf +a64-x11+ pn 2)))      ; n words * 8
              (when (and (a64-ssg-p) (not bytes))
                (a64-bulk-guard-pass buf))
-             (dolist (w *a64-bulk-move-words*) (a64-emit buf w))))
+             (dolist (w *a64-bulk-move-words*) (a64-emit buf w))
+             (when (and *a64-card-barrier* (not bytes))
+               (a64-emit-bulk-card-mark buf (ensure-src (vr 0) +a64-x12+)
+                                        (ensure-src (vr 1) +a64-x13+)
+                                        (ensure-src (vr 4) +a64-x14+)))))
           ;; ---- BULK-FILL Varr, Vi, Vn, Vval, kind ----
           ((= op +op-bulk-fill+)
            (let ((bytes (= (vr 4) 1)))
@@ -5948,7 +6171,11 @@
                           (a64-lsr-imm buf +a64-x11+ +a64-x11+ 56)       ; the untagged value
                           (dolist (w *a64-bulk-fill-bytes-words*) (a64-emit buf w)))
                    (progn (a64-mov-reg buf +a64-x11+ pv)                   ; the tagged word
-                          (dolist (w *a64-bulk-fill-words-words*) (a64-emit buf w)))))))
+                          (dolist (w *a64-bulk-fill-words-words*) (a64-emit buf w))
+                          (when *a64-card-barrier*
+                            (a64-emit-bulk-card-mark buf (ensure-src (vr 0) +a64-x12+)
+                                                     (ensure-src (vr 1) +a64-x13+)
+                                                     (ensure-src (vr 2) +a64-x14+))))))))
 
           ;; ---- U8-REF Vd, Varr, Vidx ----  (load one byte from a u8 vector)
           ;; Byte address = (Varr - 9) + 16 + real_idx = Varr + 7 + real_idx.
@@ -7426,30 +7653,62 @@
     (a64-movz buf +a64-x25+ 0 0)
     (a64-set-label buf skip)))
 
+(defconstant +a64-stw-r0-count-addr+ #x10005010
+  "Per-thread window word: region 0's collection count (its block's
+   +GC-OFF-COUNT+) when this thread last STOPPED -- parked or went safe
+   (translate-x64's +STW-R0-COUNT-ADDR+, the same window word).  Hosted only.")
+
+(defun a64-r0-count-snapshot (buf v a s)
+  "This thread's window word +A64-STW-R0-COUNT-ADDR+ := region 0's collection
+   count.  Taken while the thread is still RUNNING, before it publishes that it
+   has stopped, so no region-0 collection can come in between.  V, A, S are
+   distinct scratch registers."
+  (a64-load-real-addr buf v (conv-real #x10000040))
+  (a64-ldr-unsigned buf v v +gc-off-count+)
+  (a64-load-tls-addr buf a +a64-stw-r0-count-addr+ s)
+  (a64-str-unsigned buf v a 0))
+
 (defun emit-aarch64-stw-refresh (buf changed)
   "REGION 0 CAN BE COLLECTED BY ANOTHER THREAD (a worker refilling the lock
    arena, EVACUATING THE LOCK ARENA), which leaves this thread's x24/x25 —
    if region 0 is its active region — in the evacuated semispace.  That
    collector left the new frontier and limit in region 0's block (+0x30/
-   +0x38).  So: region 0 active and x24 outside [from, from+size]?  Reload
-   both and branch to CHANGED.  Uses x10-x12, x15, x16."
+   +0x38).  Region 0 active and collected since this thread stopped?  Reload
+   both and branch to CHANGED.  Uses x10-x12, x15, x16.
+
+   HOSTED: \"collected since\" is region 0's collection count against the
+   snapshot this thread took when it stopped (A64-R0-COUNT-SNAPSHOT).  It used
+   to be \"x24 outside [from, from+size]\", which a stale x24 passes again
+   after TWO flips (translate-x64's EMIT-X64-STW-REFRESH).  BARE METAL keeps
+   the range test: a sibling collection there does not write region 0's
+   block (EMIT-AARCH64-STW-RELEASE writes it only as the STW collector), so a
+   count-triggered reload would read a stale frontier."
   (let ((same (incf *mvm-label-counter*)))
     (a64-load-gc-region buf +a64-x15+ +a64-x16+)
     (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
     (a64-cmp-reg buf +a64-x15+ +a64-x10+)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i same :bcond))
-    (a64-ldr-unsigned buf +a64-x11+ +a64-x15+ +gc-off-from-start+)
-    (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)
-    (a64-ldr-unsigned buf +a64-x12+ +a64-x15+ +gc-off-space-size+)
-    (a64-asr-imm buf +a64-x12+ +a64-x12+ 1)
-    (a64-add-reg buf +a64-x12+ +a64-x12+ +a64-x11+ 0 0)
-    (let ((stale (incf *mvm-label-counter*)))
-      (a64-cmp-reg buf +a64-x24+ +a64-x11+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i stale :bcond))
-      (a64-cmp-reg buf +a64-x24+ +a64-x12+)
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i same :bcond))
-      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i same :bcond))
-      (a64-set-label buf stale))
+    (if *aarch64-linux-mode*
+        (progn
+          (a64-ldr-unsigned buf +a64-x11+ +a64-x15+ +gc-off-count+)
+          (a64-load-tls-addr buf +a64-x12+ +a64-stw-r0-count-addr+ +a64-x16+)
+          (a64-ldr-unsigned buf +a64-x10+ +a64-x12+ 0)
+          (a64-cmp-reg buf +a64-x11+ +a64-x10+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i same :bcond))
+          (a64-str-unsigned buf +a64-x11+ +a64-x12+ 0))
+        (progn
+          (a64-ldr-unsigned buf +a64-x11+ +a64-x15+ +gc-off-from-start+)
+          (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)
+          (a64-ldr-unsigned buf +a64-x12+ +a64-x15+ +gc-off-space-size+)
+          (a64-asr-imm buf +a64-x12+ +a64-x12+ 1)
+          (a64-add-reg buf +a64-x12+ +a64-x12+ +a64-x11+ 0 0)
+          (let ((stale (incf *mvm-label-counter*)))
+            (a64-cmp-reg buf +a64-x24+ +a64-x11+)
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i stale :bcond))
+            (a64-cmp-reg buf +a64-x24+ +a64-x12+)
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i same :bcond))
+            (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i same :bcond))
+            (a64-set-label buf stale))))
     (a64-ldr-unsigned buf +a64-x24+ +a64-x15+ +gc-off-saved-alloc+)
     (a64-asr-imm buf +a64-x24+ +a64-x24+ 1)
     (a64-ldr-unsigned buf +a64-x25+ +a64-x15+ +gc-off-saved-limit+)
@@ -7479,6 +7738,8 @@
       (a64-cmp-reg buf +a64-x12+ +a64-x13+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no-park :bcond))
       (a64-mov-reg buf +a64-x13+ +a64-x24+)                           ; x24 before the park
+      (when *aarch64-linux-mode*                  ; park clobbers x15-x17 anyway
+        (a64-r0-count-snapshot buf +a64-x15+ +a64-x17+ +a64-x16+))
       (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i park :bl))
       (emit-aarch64-stw-refresh buf reloaded)
       (a64-set-label buf no-park)
@@ -7895,6 +8156,781 @@
       (a64-set-label buf adone)
       (a64-set-label buf skip))))
 
+;;; GENERATIONAL GC, STAGE 1 (docs/generational-gc.md): an OLD SPACE that every
+;;; region-0 collection SCANS and never COPIES.  Five low-block words, stored
+;;; <<1 like the region fields (so a conservative scan reads even fixnums):
+;;;   #x10000CC0 old_lo, #x10000CC8 old_hi -- [old_lo, old_hi) is old; old_hi 0
+;;;              means there is none (every image until (GC-TENURE) runs);
+;;;   #x10000C88/C90/C98 a TENURE REQUEST: the young from/to/size region 0
+;;;              takes once this collection's survivors have become the old
+;;;              space.  (#x10000CE0.. is the card table, +GC-CARD-BASE-ADDR+.)
+;;; Only region 0 has an old space: a core heap or carved region never tenures.
+(defconstant +gc-old-lo-addr+ #x10000CC0)
+(defconstant +gc-old-hi-addr+ #x10000CC8)
+(defconstant +gc-tenure-req-addr+ #x10000C88)
+
+(defun emit-aarch64-old-space-walk (buf scan-word)
+  "Region 0 only, and only once (GC-TENURE) has made an old space.  With a
+   card table (+GC-CARD-BASE-ADDR+ non-zero): scan the DIRTY cards only
+   (EMIT-AARCH64-OLD-CARD-SCAN).  Without one: walk all of [old_lo, old_hi)
+   object by object and SCAN_WORD every pointer slot -- correct with no
+   barrier at all, because everything old is looked at.  scan_word leaves an
+   old pointer alone because it is outside from-space.  Either way the state
+   lives in a frame of its own below the STW frame; nothing here addresses
+   that frame."
+  (let ((skip (incf *mvm-label-counter*))
+        (cards (incf *mvm-label-counter*)))
+    (a64-load-gc-region buf +a64-x16+ +a64-x17+)
+    (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
+    (a64-cmp-reg buf +a64-x16+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-hi-addr+))
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)
+    (a64-cmp-imm buf +a64-x9+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-card-base-addr+))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 0)
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i cards :bcond))
+    ;; no card table: the whole old space
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-lo-addr+))
+    (a64-ldr-unsigned buf +a64-x26+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-sub-imm buf +a64-sp+ +a64-sp+ 16)
+    (a64-str-unsigned buf +a64-x9+ +a64-sp+ 0)
+    (emit-aarch64-object-walk buf scan-word (list :sp 0))
+    (a64-add-imm buf +a64-sp+ +a64-sp+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i skip :b))
+    (a64-set-label buf cards)
+    (emit-aarch64-old-card-scan buf scan-word)
+    (a64-set-label buf skip)))
+
+(defun a64-card-young-check (buf)
+  "After SCAN_WORD on the slot at x23: x4 := 1 if the slot now holds a
+   pointer into to-space [x22, x22+x25) -- the young survivors -- or, threaded,
+   into the lock arena, so its card must stay dirty.  Clobbers x10/x11, and
+   x16/x17 threaded."
+  (let ((no (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x23+ 0)
+    (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+    (a64-cmp-imm buf +a64-x11+ 1)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i no :bcond))
+    (a64-sub-reg buf +a64-x11+ +a64-x10+ +a64-x22+ 0 0)
+    (a64-cmp-reg buf +a64-x11+ +a64-x25+)
+    (if (not *a64-tls-window*)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i no :bcond))
+        ;; A pointer into the LOCK ARENA is young too: a collection that found
+        ;; the runtime lock held did not evacuate it, and the next one that
+        ;; does moves the object -- through this slot only if its card is
+        ;; still dirty (translate-x64's EMIT-X64-OLD-CARD-SCAN).  Arena words:
+        ;; base +0, end +0x10, their raw address at 0x10000D98 (0 = none).
+        (let ((young (incf *mvm-label-counter*)))
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i young :bcond))
+          (a64-load-real-addr buf +a64-x16+ (conv-real #x10000D98))
+          (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ 0)
+          (a64-cmp-imm buf +a64-x16+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i no :bcond))
+          (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 0)
+          (a64-cmp-reg buf +a64-x10+ +a64-x17+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i no :bcond))
+          (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x10)
+          (a64-cmp-reg buf +a64-x10+ +a64-x17+)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i no :bcond))
+          (a64-set-label buf young)))
+    (a64-movz buf +a64-x4+ 1 0)
+    (a64-set-label buf no)))
+
+(defun a64-card-scan-slot (buf scan-word)
+  "SCAN_WORD the slot at x23 if it can hold a pointer, then the young check."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x23+ 0)
+    (a64-and-reg buf +a64-x11+ +a64-x10+ +a64-x5+)
+    (a64-cmp-imm buf +a64-x11+ 1)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-mov-reg buf +a64-x9+ +a64-x23+)
+    (let ((i (a64-current-index buf))) (a64-bl buf 0) (a64-add-fixup buf i scan-word :bl))
+    (a64-card-young-check buf)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-old-card-scan (buf scan-word)
+  "Scan the old space's DIRTY cards (x9 = old_hi on entry).  For each dirty
+   card: start at the object the crossing table says covers its first byte,
+   walk objects up to the card's end, and SCAN_WORD only the pointer slots
+   that lie INSIDE the card (a big vector with one dirty card costs one card).
+   A card none of whose slots points into to-space afterwards is cleaned.
+   x0 card bytes, x1 card, x4 young flag -- saved at entry, untouched by
+   scan_word/copy_object (x2/x3/x8 are promotion's, see
+   EMIT-AARCH64-PROMO-SETUP).  Frame: [sp] card start, [sp+8] card end,
+   [sp+16] slot limit, [sp+24] old_hi, [sp+32] cards in use, [sp+40] area,
+   [sp+48] crossing."
+  (let ((l-card (incf *mvm-label-counter*)) (single (incf *mvm-label-counter*))
+        (endok (incf *mvm-label-counter*)) (l-obj (incf *mvm-label-counter*))
+        (objdone (incf *mvm-label-counter*)) (next (incf *mvm-label-counter*))
+        (done (incf *mvm-label-counter*)) (is-cons (incf *mvm-label-counter*))
+        (cskip (incf *mvm-label-counter*)) (nextobj (incf *mvm-label-counter*))
+        (u8sz (incf *mvm-label-counter*)) (f32sz (incf *mvm-label-counter*))
+        (havesz (incf *mvm-label-counter*)) (lo-ok (incf *mvm-label-counter*))
+        (hi-ok (incf *mvm-label-counter*)) (sloop (incf *mvm-label-counter*)))
+    (a64-sub-imm buf +a64-sp+ +a64-sp+ 64)
+    (a64-str-unsigned buf +a64-x9+ +a64-sp+ 24)
+    (a64-load-real-addr buf +a64-x12+ (conv-real +gc-card-base-addr+))
+    (a64-ldp-offset buf +a64-x0+ +a64-x13+ +a64-x12+ 0)     ; card bytes, area
+    (a64-str-unsigned buf +a64-x13+ +a64-sp+ 40)
+    (a64-ldr-unsigned buf +a64-x14+ +a64-x12+ 24)            ; crossing
+    (a64-str-unsigned buf +a64-x14+ +a64-sp+ 48)
+    (a64-sub-reg buf +a64-x14+ +a64-x9+ +a64-x13+ 0 0)
+    (a64-add-imm buf +a64-x14+ +a64-x14+ 511)
+    (a64-lsr-imm buf +a64-x14+ +a64-x14+ 9)                  ; cards in use
+    (a64-str-unsigned buf +a64-x14+ +a64-sp+ 32)
+    (a64-movz buf +a64-x1+ 0 0)
+    (a64-set-label buf l-card)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-sp+ 32)
+    (a64-cmp-reg buf +a64-x1+ +a64-x13+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i done :bcond))
+    ;; eight clean cards at once
+    (a64-add-imm buf +a64-x10+ +a64-x1+ 8)
+    (a64-cmp-reg buf +a64-x10+ +a64-x13+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i single :bcond)) ; HI
+    (a64-add-reg buf +a64-x11+ +a64-x0+ +a64-x1+ 0 0)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x11+ 0)
+    (a64-load-imm64 buf +a64-x12+ #x0101010101010101)
+    (a64-cmp-reg buf +a64-x10+ +a64-x12+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i single :bcond))
+    (a64-add-imm buf +a64-x1+ +a64-x1+ 8)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-card :b))
+    (a64-set-label buf single)
+    (a64-add-reg buf +a64-x11+ +a64-x0+ +a64-x1+ 0 0)
+    (a64-ldrb buf +a64-x10+ +a64-x11+)
+    (a64-cmp-imm buf +a64-x10+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i next :bcond))
+    ;; ---- a dirty card ----
+    (a64-lsl-imm buf +a64-x10+ +a64-x1+ 9)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-sp+ 40)
+    (a64-add-reg buf +a64-x10+ +a64-x13+ +a64-x10+ 0 0)      ; card start
+    (a64-str-unsigned buf +a64-x10+ +a64-sp+ 0)
+    (a64-add-imm buf +a64-x11+ +a64-x10+ 512)
+    (a64-ldr-unsigned buf +a64-x12+ +a64-sp+ 24)
+    (a64-cmp-reg buf +a64-x11+ +a64-x12+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i endok :bcond)) ; LS
+    (a64-mov-reg buf +a64-x11+ +a64-x12+)
+    (a64-set-label buf endok)
+    (a64-str-unsigned buf +a64-x11+ +a64-sp+ 8)              ; card end (<= old_hi)
+    (a64-movz buf +a64-x4+ 0 0)
+    (a64-lsl-imm buf +a64-x12+ +a64-x1+ 2)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-sp+ 48)
+    (a64-add-reg buf +a64-x12+ +a64-x13+ +a64-x12+ 0 0)
+    (a64-ldr32-unsigned buf +a64-x12+ +a64-x12+ 0)
+    (a64-lsl-imm buf +a64-x12+ +a64-x12+ 4)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-sp+ 40)
+    (a64-add-reg buf +a64-x26+ +a64-x13+ +a64-x12+ 0 0)      ; covering object
+    (a64-set-label buf l-obj)
+    (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 8)
+    (a64-cmp-reg buf +a64-x26+ +a64-x9+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i objdone :bcond))
+    ;; cons?  (the object walk's test)
+    (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)
+    (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x7+ +a64-x12+ 0 0)
+    (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)
+    (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x5+)
+    (a64-ldrb buf +a64-x14+ +a64-x12+)
+    (a64-lslv buf +a64-x15+ +a64-x6+ +a64-x11+)
+    (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i is-cons :bcond))
+    ;; headered object: its size (the object walk's arithmetic)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x26+ 0)
+    (a64-lsl-imm buf +a64-x14+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x14+ +a64-x14+ 56)
+    (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)
+    (a64-lsl-imm buf +a64-x16+ +a64-x15+ 3)
+    (a64-cmp-imm buf +a64-x14+ #x11)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x13)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x12)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x15)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-add-imm buf +a64-x9+ +a64-x16+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i havesz :b))
+    (a64-set-label buf f32sz)
+    (a64-lsl-imm buf +a64-x15+ +a64-x15+ 2)
+    (a64-set-label buf u8sz)
+    (a64-add-imm buf +a64-x9+ +a64-x15+ 16)
+    (a64-set-label buf havesz)
+    (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4)
+    (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)       ; next object
+    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66))
+      (a64-cmp-imm buf +a64-x14+ st)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i nextobj :bcond)))
+    ;; slots [max(obj+16, card start), min(obj+16+count*8, card end))
+    (a64-add-imm buf +a64-x23+ +a64-x26+ 16)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 0)
+    (a64-cmp-reg buf +a64-x23+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i lo-ok :bcond))
+    (a64-mov-reg buf +a64-x23+ +a64-x10+)
+    (a64-set-label buf lo-ok)
+    (a64-add-imm buf +a64-x17+ +a64-x26+ 16)
+    (a64-add-reg buf +a64-x17+ +a64-x17+ +a64-x16+ 0 0)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 8)
+    (a64-cmp-reg buf +a64-x17+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i hi-ok :bcond)) ; LS
+    (a64-mov-reg buf +a64-x17+ +a64-x10+)
+    (a64-set-label buf hi-ok)
+    (a64-str-unsigned buf +a64-x17+ +a64-sp+ 16)
+    (a64-set-label buf sloop)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 16)
+    (a64-cmp-reg buf +a64-x23+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i nextobj :bcond))
+    (a64-card-scan-slot buf scan-word)
+    (a64-add-imm buf +a64-x23+ +a64-x23+ 8)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i sloop :b))
+    (a64-set-label buf nextobj)
+    (a64-mov-reg buf +a64-x26+ +a64-x24+)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-obj :b))
+    ;; a cons: 16 bytes inside one card, so it is in this card or wholly before it
+    (a64-set-label buf is-cons)
+    (a64-ldr-unsigned buf +a64-x10+ +a64-sp+ 0)
+    (a64-cmp-reg buf +a64-x26+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i cskip :bcond))
+    (a64-mov-reg buf +a64-x23+ +a64-x26+)
+    (a64-card-scan-slot buf scan-word)
+    (a64-add-imm buf +a64-x23+ +a64-x26+ 8)
+    (a64-card-scan-slot buf scan-word)
+    (a64-set-label buf cskip)
+    (a64-add-imm buf +a64-x26+ +a64-x26+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-obj :b))
+    ;; the card is clean unless a slot still points at a young object
+    (a64-set-label buf objdone)
+    (a64-cmp-imm buf +a64-x4+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i next :bcond))
+    (a64-movz buf +a64-x10+ 1 0)
+    (a64-add-reg buf +a64-x11+ +a64-x0+ +a64-x1+ 0 0)
+    (a64-strb buf +a64-x10+ +a64-x11+)
+    (a64-set-label buf next)
+    (a64-add-imm buf +a64-x1+ +a64-x1+ 1)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l-card :b))
+    (a64-set-label buf done)
+    (a64-add-imm buf +a64-sp+ +a64-sp+ 64)))
+
+;;; ---- STAGE 3: PROMOTION AND THE MAJOR COLLECTION ----
+;;; The card vector (GC-TENURE) starts with 128 bytes of META, RAW words, then
+;;; the card bytes (+GC-CARD-BASE-ADDR+ points there) and the crossing table:
+;;;   +0  capacity (cards)          +32 promotion failures
+;;;   +8  area size (bytes)         +40 major collections done
+;;;   +16 survivor mark             +48 bytes promoted
+;;;   +24 major state               +56 promotion on (0/1)
+;;;   +64 RESERVE: a major is due when the old area's room falls below
+;;;       max(reserve, 2 x a collection's young survivors); 0 = 4 MB
+;;; The vector is old, so a MAJOR moves it: #x10000D88 holds it TAGGED and is a
+;;; fixed root, and the meta is found through it, never through a raw address.
+;;;
+;;; PROMOTION BY AGE.  A from-space object below the SURVIVOR MARK (the end of
+;;; what the previous collection copied into this semispace) has survived once;
+;;; surviving again, it is copied to the old space's bump pointer instead of
+;;; to-space.  Registers for the whole collection: x3 = the mark (0 = promote
+;;; nothing), x8 = old bump, x2 = the old area's end.  No room -> it stays young
+;;; and a major is requested.
+;;;
+;;; MAJOR STATE: 0 idle; 1 major requested; 4 un-tenure requested (the same
+;;; collection, ending without an old space: save-image).  At entry 1 -> 7 and
+;;; 4 -> 10, and phase 1 promotes EVERYTHING young (x3 = from_end).  If that runs
+;;; out of room: 7 -> 3, 10 -> 6, and the next collection retries (3 -> 1,
+;;; 6 -> 4).  Otherwise phase 2 (7 -> 2, 10 -> 5): the roots again, and the whole
+;;; old area copied into the young semispace, now empty -- one semispace's room,
+;;; the limit the collector always had.  Then 2: re-tenure there, young cut from
+;;; the old area; 5: no old space at all.
+(defconstant +gc-card-root-addr+ #x10000D88)
+
+(defun a64-load-gen-meta (buf rd skip)
+  "RD := the card vector's meta (its data), or branch to SKIP when there is none."
+  (a64-load-real-addr buf rd (conv-real +gc-card-root-addr+))
+  (a64-ldr-unsigned buf rd rd 0)
+  (a64-cmp-imm buf rd 0)
+  (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+  (a64-add-imm buf rd rd 7))
+
+(defun a64-branch-unless-region-0 (buf skip)
+  "Clobbers x10, x16, x17."
+  (a64-load-gc-region buf +a64-x16+ +a64-x17+)
+  (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
+  (a64-cmp-reg buf +a64-x16+ +a64-x10+)
+  (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond)))
+
+(defun a64-store-word (buf addr val-reg scratch)
+  "[ADDR] := VAL-REG (raw), ADDR a low-block constant."
+  (a64-load-real-addr buf scratch (conv-real addr))
+  (a64-str-unsigned buf val-reg scratch 0))
+
+(defun a64-load-word (buf rd addr)
+  (a64-load-real-addr buf rd (conv-real addr))
+  (a64-ldr-unsigned buf rd rd 0))
+
+(defun a64-clip-to-gen-ceiling (buf reg base meta scratch)
+  "REG := the meta's CEILING word (+72) when that lies inside (BASE, REG): the
+   end of a range starting at BASE, clipped.  A ceiling of 0, or one at or below
+   BASE (the staging page is not inside this range), changes nothing.  The
+   ceiling is the lowest address of something region 0's span holds that is NOT
+   heap -- the board's I/O staging pages at the top of the upper semispace,
+   which the mutator's limit guard has always kept allocation below.  Promotion
+   and a major's phase 2 copy UP TO a bound rather than behind an allocation, so
+   they need the ceiling stated (GC-TENURE sets it).  SCRATCH is clobbered."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-ldr-unsigned buf scratch meta 72)
+    (a64-cmp-reg buf scratch base)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i skip :bcond)) ; LS: 0 or <= base
+    (a64-cmp-reg buf reg scratch)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i skip :bcond)) ; LS
+    (a64-mov-reg buf reg scratch)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-promo-setup (buf)
+  "x3 / x8 / x2 for this collection (see above); all 0 unless region 0 has a
+   card table and promotion is on, or a major is requested."
+  (let ((done (incf *mvm-label-counter*)) (all (incf *mvm-label-counter*))
+        (bump (incf *mvm-label-counter*)))
+    (a64-movz buf +a64-x3+ 0 0)
+    (a64-movz buf +a64-x8+ 0 0)
+    (a64-movz buf +a64-x2+ 0 0)
+    (a64-branch-unless-region-0 buf done)
+    (a64-load-gen-meta buf +a64-x12+ done)
+    (a64-load-word buf +a64-x13+ +gc-card-base-addr+)
+    (a64-cmp-imm buf +a64-x13+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i done :bcond))
+    (a64-ldr-unsigned buf +a64-x14+ +a64-x12+ 24)            ; major state
+    (a64-cmp-imm buf +a64-x14+ 1)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i all :bcond))
+    (a64-cmp-imm buf +a64-x14+ 4)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i all :bcond))
+    (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 56)            ; promotion on?
+    (a64-cmp-imm buf +a64-x15+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i done :bcond))
+    (a64-ldr-unsigned buf +a64-x3+ +a64-x12+ 16)             ; survivor mark
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i bump :b))
+    (a64-set-label buf all)                                  ; phase 1 of a major
+    (a64-add-imm buf +a64-x14+ +a64-x14+ 6)
+    (a64-str-unsigned buf +a64-x14+ +a64-x12+ 24)
+    ;; EVERYTHING: the mark is all ones, not from_end.  A threaded stop-the-world
+    ;; collection also evacuates the LOCK ARENA, which sits at the top of a
+    ;; semispace -- above from_end when that is the lower one -- and phase 2
+    ;; copies the old area over the whole young semispace, so anything phase 1
+    ;; left young is overwritten.  Measured: majors with two live threads lost
+    ;; data 3 runs of 3 (a 5000-entry list came back 454 long; a worker's
+    ;; TYPE-ERROR); with no threads, or minors with threads, 0 of 6.
+    (a64-emit buf #xAA3F03E3)                                ; MVN x3, xzr
+    (a64-set-label buf bump)
+    (a64-load-word buf +a64-x8+ +gc-old-hi-addr+)
+    (a64-asr-imm buf +a64-x8+ +a64-x8+ 1)
+    (a64-load-real-addr buf +a64-x13+ (conv-real +gc-card-base-addr+))
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x13+ 8)             ; area
+    (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 8)             ; area size
+    (a64-add-reg buf +a64-x2+ +a64-x13+ +a64-x15+ 0 0)
+    (a64-clip-to-gen-ceiling buf +a64-x2+ +a64-x13+ +a64-x12+ +a64-x16+)
+    (a64-set-label buf done)
+    ;; x17 is the ACTIVE REGION's base for the root window code that follows;
+    ;; the region test above used it as scratch.
+    (a64-load-gc-region buf +a64-x17+ +a64-x16+)))
+
+(defun emit-aarch64-promo-fail (buf)
+  "copy_object found no room in the old area: promote nothing more this
+   collection, and ask for a major (or abort the one in phase 1).  x16/x17."
+  (let ((out (incf *mvm-label-counter*)) (abort (incf *mvm-label-counter*))
+        (store (incf *mvm-label-counter*)))
+    (a64-movz buf +a64-x3+ 0 0)
+    (a64-load-gen-meta buf +a64-x16+ out)
+    (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 32)
+    (a64-add-imm buf +a64-x17+ +a64-x17+ 1)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 32)            ; failures
+    (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ 24)
+    (a64-cmp-imm buf +a64-x17+ 7)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i abort :bcond))
+    (a64-cmp-imm buf +a64-x17+ 10)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i abort :bcond))
+    (a64-cmp-imm buf +a64-x17+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i out :bcond))
+    (a64-movz buf +a64-x17+ 1 0)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i store :b))
+    (a64-set-label buf abort)
+    (a64-sub-imm buf +a64-x17+ +a64-x17+ 4)
+    (a64-set-label buf store)
+    (a64-str-unsigned buf +a64-x17+ +a64-x16+ 24)
+    (a64-set-label buf out)))
+
+(defun emit-aarch64-cheney (buf scan-word)
+  "The Cheney scan over BOTH destinations: to-space [x22, x21) and what was
+   promoted this collection [old_hi at entry, x8), until neither grows.
+   Cursors x0 / x1."
+  (let ((l (incf *mvm-label-counter*)) (nopromo (incf *mvm-label-counter*))
+        (go-on (incf *mvm-label-counter*)))
+    (a64-mov-reg buf +a64-x0+ +a64-x22+)
+    (a64-movz buf +a64-x1+ 0 0)
+    (a64-cmp-imm buf +a64-x8+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i nopromo :bcond))
+    (a64-load-word buf +a64-x1+ +gc-old-hi-addr+)
+    (a64-asr-imm buf +a64-x1+ +a64-x1+ 1)
+    (a64-set-label buf nopromo)
+    (a64-set-label buf l)
+    (a64-mov-reg buf +a64-x26+ +a64-x0+)
+    (emit-aarch64-object-walk buf scan-word +a64-x21+)
+    (a64-mov-reg buf +a64-x0+ +a64-x26+)
+    (a64-mov-reg buf +a64-x26+ +a64-x1+)
+    (emit-aarch64-object-walk buf scan-word +a64-x8+)
+    (a64-mov-reg buf +a64-x1+ +a64-x26+)
+    (a64-cmp-reg buf +a64-x0+ +a64-x21+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i l :bcond))
+    (a64-cmp-reg buf +a64-x1+ +a64-x8+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i l :bcond))
+    (a64-set-label buf go-on)))
+
+(defun emit-aarch64-obj-size-at-x26 (buf)
+  "x9 := the aligned size of the object at x26 (16 for a cons).  x10-x16."
+  (let ((cons (incf *mvm-label-counter*)) (u8sz (incf *mvm-label-counter*))
+        (f32sz (incf *mvm-label-counter*)) (havesz (incf *mvm-label-counter*))
+        (done (incf *mvm-label-counter*)))
+    (a64-sub-reg buf +a64-x11+ +a64-x26+ +a64-x27+ 0 0)
+    (a64-lsr-imm buf +a64-x12+ +a64-x11+ 7) (a64-add-reg buf +a64-x12+ +a64-x7+ +a64-x12+ 0 0)
+    (a64-lsr-imm buf +a64-x11+ +a64-x11+ 4)
+    (a64-and-reg buf +a64-x11+ +a64-x11+ +a64-x5+)
+    (a64-ldrb buf +a64-x14+ +a64-x12+)
+    (a64-lslv buf +a64-x15+ +a64-x6+ +a64-x11+)
+    (a64-ands-reg buf +a64-xzr+ +a64-x14+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i cons :bcond))
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x26+ 0)
+    (a64-lsl-imm buf +a64-x14+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x14+ +a64-x14+ 56)
+    (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)
+    (a64-lsl-imm buf +a64-x16+ +a64-x15+ 3)
+    (a64-cmp-imm buf +a64-x14+ #x11)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x13)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i u8sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x12)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x15)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-add-imm buf +a64-x9+ +a64-x16+ 16)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i havesz :b))
+    (a64-set-label buf f32sz)
+    (a64-lsl-imm buf +a64-x15+ +a64-x15+ 2)
+    (a64-set-label buf u8sz)
+    (a64-add-imm buf +a64-x9+ +a64-x15+ 16)
+    (a64-set-label buf havesz)
+    (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i done :b))
+    (a64-set-label buf cons)
+    (a64-movz buf +a64-x9+ 16 0)
+    (a64-set-label buf done)))
+
+(defun emit-aarch64-crossing-fill (buf dirty)
+  "For the objects in [x26, x23): their crossing entries, and their cards --
+   DIRTY (0) every card an object overlaps, or CLEAN (1) every card whose
+   first byte one covers.  x0 cards, x1 crossing, x4 area.  x9-x16, x24."
+  (let ((l (incf *mvm-label-counter*)) (done (incf *mvm-label-counter*))
+        (cl (incf *mvm-label-counter*)) (cdone (incf *mvm-label-counter*))
+        (kl (incf *mvm-label-counter*)) (kdone (incf *mvm-label-counter*)))
+    (a64-set-label buf l)
+    (a64-cmp-reg buf +a64-x26+ +a64-x23+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i done :bcond))
+    (emit-aarch64-obj-size-at-x26 buf)
+    (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)       ; next
+    (a64-sub-reg buf +a64-x10+ +a64-x26+ +a64-x4+ 0 0)       ; offset in area
+    (a64-lsr-imm buf +a64-x11+ +a64-x10+ 4)                  ; crossing value
+    (a64-add-reg buf +a64-x12+ +a64-x10+ +a64-x9+ 0 0)
+    (a64-sub-imm buf +a64-x12+ +a64-x12+ 1)
+    (a64-lsr-imm buf +a64-x12+ +a64-x12+ 9)                  ; last card
+    ;; cards
+    (if dirty
+        (a64-lsr-imm buf +a64-x13+ +a64-x10+ 9)              ; first overlapped
+        (progn (a64-add-imm buf +a64-x13+ +a64-x10+ 511)
+               (a64-lsr-imm buf +a64-x13+ +a64-x13+ 9)))     ; first covered start
+    (a64-movz buf +a64-x16+ (if dirty 0 1) 0)
+    (a64-set-label buf kl)
+    (a64-cmp-reg buf +a64-x13+ +a64-x12+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i kdone :bcond)) ; HI
+    (a64-add-reg buf +a64-x14+ +a64-x0+ +a64-x13+ 0 0)
+    (a64-strb buf +a64-x16+ +a64-x14+)
+    (a64-add-imm buf +a64-x13+ +a64-x13+ 1)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i kl :b))
+    (a64-set-label buf kdone)
+    ;; crossing: every card whose first byte this object covers
+    (a64-add-imm buf +a64-x13+ +a64-x10+ 511)
+    (a64-lsr-imm buf +a64-x13+ +a64-x13+ 9)
+    (a64-set-label buf cl)
+    (a64-cmp-reg buf +a64-x13+ +a64-x12+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i cdone :bcond)) ; HI
+    (a64-lsl-imm buf +a64-x14+ +a64-x13+ 2)
+    (a64-add-reg buf +a64-x14+ +a64-x1+ +a64-x14+ 0 0)
+    (a64-str32-unsigned buf +a64-x11+ +a64-x14+ 0)
+    (a64-add-imm buf +a64-x13+ +a64-x13+ 1)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i cl :b))
+    (a64-set-label buf cdone)
+    (a64-mov-reg buf +a64-x26+ +a64-x24+)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i l :b))
+    (a64-set-label buf done)))
+
+(defun a64-load-card-words (buf)
+  "x0 := card bytes, x4 := area, x1 := crossing (from +GC-CARD-BASE-ADDR+)."
+  (a64-load-real-addr buf +a64-x13+ (conv-real +gc-card-base-addr+))
+  (a64-ldr-unsigned buf +a64-x0+ +a64-x13+ 0)
+  (a64-ldr-unsigned buf +a64-x4+ +a64-x13+ 8)
+  (a64-ldr-unsigned buf +a64-x1+ +a64-x13+ 24))
+
+(defun emit-aarch64-promo-finish (buf)
+  "After a collection that could promote (x8 /= 0): the promoted objects
+   [old_hi at entry, x8) get crossing entries and DIRTY cards (they were
+   scanned, but whether they still point at young objects is the next
+   collection's question), old_hi := x8, the survivor mark := x21, and a major
+   is requested when the old area's room is below max(reserve, 2 x this
+   collection's young survivors)."
+  (let ((skip (incf *mvm-label-counter*)) (nomajor (incf *mvm-label-counter*))
+        (big (incf *mvm-label-counter*)))
+    (a64-cmp-imm buf +a64-x8+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-load-card-words buf)
+    (a64-load-word buf +a64-x26+ +gc-old-hi-addr+)
+    (a64-asr-imm buf +a64-x26+ +a64-x26+ 1)
+    (a64-sub-reg buf +a64-x17+ +a64-x8+ +a64-x26+ 0 0)       ; bytes promoted
+    (a64-mov-reg buf +a64-x23+ +a64-x8+)
+    (emit-aarch64-crossing-fill buf t)
+    (a64-lsl-imm buf +a64-x12+ +a64-x8+ 1)
+    (a64-store-word buf +gc-old-hi-addr+ +a64-x12+ +a64-x13+)
+    (a64-load-gen-meta buf +a64-x12+ skip)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 48)
+    (a64-add-reg buf +a64-x13+ +a64-x13+ +a64-x17+ 0 0)
+    (a64-str-unsigned buf +a64-x13+ +a64-x12+ 48)
+    (a64-str-unsigned buf +a64-x21+ +a64-x12+ 16)            ; survivor mark
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 24)
+    (a64-cmp-imm buf +a64-x13+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i nomajor :bcond))
+    (a64-sub-reg buf +a64-x14+ +a64-x21+ +a64-x22+ 0 0)
+    (a64-lsl-imm buf +a64-x14+ +a64-x14+ 1)                  ; 2 x survivors
+    (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 64)            ; reserve
+    (let ((have (incf *mvm-label-counter*)))
+      (a64-cmp-imm buf +a64-x15+ 0)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i have :bcond))
+      (a64-load-imm64 buf +a64-x15+ #x400000)
+      (a64-set-label buf have))
+    (a64-cmp-reg buf +a64-x14+ +a64-x15+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i big :bcond))
+    (a64-mov-reg buf +a64-x14+ +a64-x15+)
+    (a64-set-label buf big)
+    (a64-sub-reg buf +a64-x15+ +a64-x2+ +a64-x8+ 0 0)        ; room
+    (a64-cmp-reg buf +a64-x15+ +a64-x14+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i nomajor :bcond))
+    (a64-movz buf +a64-x13+ 1 0)
+    (a64-str-unsigned buf +a64-x13+ +a64-x12+ 24)
+    (a64-set-label buf nomajor)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-major-clear-size (buf)
+  "In phase 2 the from-space is the whole old area: the bitmap clear after it
+   must cover the area's size, not the young semispace's."
+  (let ((skip (incf *mvm-label-counter*)) (yes (incf *mvm-label-counter*)))
+    (a64-branch-unless-region-0 buf skip)
+    (a64-load-gen-meta buf +a64-x12+ skip)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 24)
+    (a64-cmp-imm buf +a64-x13+ 2)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i yes :bcond))
+    (a64-cmp-imm buf +a64-x13+ 5)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-set-label buf yes)
+    (a64-ldr-unsigned buf +a64-x25+ +a64-x12+ 8)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-major-step (buf reenter)
+  "End of a region-0 collection: advance the major state (see above).
+   Phase 1 done -> set up phase 2 and run the collection again from REENTER.
+   Phase 2 done -> re-tenure (or un-tenure) and set the young pair."
+  (let ((skip (incf *mvm-label-counter*)) (retry (incf *mvm-label-counter*))
+        (ph2 (incf *mvm-label-counter*)) (fin (incf *mvm-label-counter*))
+        (finun (incf *mvm-label-counter*)) (ylo (incf *mvm-label-counter*)))
+    (a64-branch-unless-region-0 buf skip)
+    (a64-load-gen-meta buf +a64-x12+ skip)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 24)
+    (dolist (c (list (cons 3 retry) (cons 6 retry) (cons 7 ph2) (cons 10 ph2)
+                     (cons 2 fin) (cons 5 finun)))
+      (a64-cmp-imm buf +a64-x13+ (car c))
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i (cdr c) :bcond)))
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i skip :b))
+    (a64-set-label buf retry)
+    (a64-sub-imm buf +a64-x13+ +a64-x13+ 2)
+    (a64-str-unsigned buf +a64-x13+ +a64-x12+ 24)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i skip :b))
+    ;; ---- phase 2: from = the old area, to = the whole young semispace ----
+    (a64-set-label buf ph2)
+    ;; It must FIT: the old space (all of it may be live) into both young
+    ;; halves.  Running out of room halfway through a copy cannot be undone, so
+    ;; a major that might not fit is not started: state 0, one more failure.
+    (a64-load-word buf +a64-x10+ +gc-old-hi-addr+)
+    (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-load-real-addr buf +a64-x11+ (conv-real +gc-card-base-addr+))
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x11+ 8)
+    (a64-sub-reg buf +a64-x10+ +a64-x10+ +a64-x11+ 0 0)       ; old bytes
+    ;; room = min(Ylo + both halves, ceiling) - Ylo, Ylo = min(x19, x22)
+    (let ((lo (incf *mvm-label-counter*)))
+      (a64-mov-reg buf +a64-x15+ +a64-x19+)
+      (a64-cmp-reg buf +a64-x22+ +a64-x19+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i lo :bcond))
+      (a64-mov-reg buf +a64-x15+ +a64-x22+)
+      (a64-set-label buf lo))
+    (a64-lsl-imm buf +a64-x11+ +a64-x25+ 1)                  ; both halves
+    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x15+ 0 0)
+    (a64-clip-to-gen-ceiling buf +a64-x11+ +a64-x15+ +a64-x12+ +a64-x16+)
+    (a64-sub-reg buf +a64-x11+ +a64-x11+ +a64-x15+ 0 0)
+    (a64-cmp-reg buf +a64-x10+ +a64-x11+)
+    (let ((fits (incf *mvm-label-counter*)))
+      (let ((i (a64-current-index buf))) (a64-bcond buf #x9 0) (a64-add-fixup buf i fits :bcond)) ; LS
+      (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 24)
+      (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 32)
+      (a64-add-imm buf +a64-x13+ +a64-x13+ 1)
+      (a64-str-unsigned buf +a64-x13+ +a64-x12+ 32)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i skip :b))
+      (a64-set-label buf fits))
+    (a64-sub-imm buf +a64-x13+ +a64-x13+ 5)
+    (a64-str-unsigned buf +a64-x13+ +a64-x12+ 24)
+    (a64-mov-reg buf +a64-x14+ +a64-x19+)                    ; Ylo = min(x19, x22)
+    (a64-cmp-reg buf +a64-x22+ +a64-x19+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i ylo :bcond))
+    (a64-mov-reg buf +a64-x14+ +a64-x22+)
+    (a64-set-label buf ylo)
+    (a64-load-real-addr buf +a64-x13+ (conv-real +gc-card-base-addr+))
+    (a64-ldr-unsigned buf +a64-x19+ +a64-x13+ 8)             ; from = area
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x12+ 8)
+    (a64-add-reg buf +a64-x20+ +a64-x19+ +a64-x10+ 0 0)      ; area end
+    (a64-mov-reg buf +a64-x22+ +a64-x14+)
+    (a64-mov-reg buf +a64-x21+ +a64-x14+)
+    (a64-lsl-imm buf +a64-x25+ +a64-x25+ 1)                  ; both young halves
+    (a64-str-unsigned buf +a64-xzr+ +a64-x13+ 0)             ; cards off
+    (a64-store-word buf +gc-old-hi-addr+ +a64-xzr+ +a64-x13+) ; no old walk
+    (a64-movz buf +a64-x3+ 0 0)
+    (a64-movz buf +a64-x8+ 0 0)
+    (a64-movz buf +a64-x2+ 0 0)
+    (a64-load-gc-region buf +a64-x17+ +a64-x16+)            ; x17: the region, as at entry
+    (a64-ldr-unsigned buf +a64-x23+ +a64-x17+ +gc-off-stack-base+)
+    (a64-asr-imm buf +a64-x23+ +a64-x23+ 1)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i reenter :b))
+    ;; ---- phase 2 done, MAJOR: [x22, x21) is the new old space ----
+    (a64-set-label buf fin)
+    (a64-load-real-addr buf +a64-x16+ (conv-real #x10000040))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ +gc-off-space-size+)
+    (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)                  ; old young half
+    (a64-lsl-imm buf +a64-x10+ +a64-x10+ 1)                  ; new area size
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x12+ 8)             ; old area size
+    (a64-lsr-imm buf +a64-x11+ +a64-x11+ 13)
+    (a64-lsl-imm buf +a64-x11+ +a64-x11+ 12)                 ; new young half
+    (a64-str-unsigned buf +a64-x10+ +a64-x12+ 8)
+    (a64-str-unsigned buf +a64-x19+ +a64-x12+ 16)            ; mark: nothing young
+    (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 24)
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 40)
+    (a64-add-imm buf +a64-x13+ +a64-x13+ 1)
+    (a64-str-unsigned buf +a64-x13+ +a64-x12+ 40)            ; majors
+    (a64-add-imm buf +a64-x0+ +a64-x12+ 128)                 ; card bytes
+    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 0)
+    (a64-add-reg buf +a64-x1+ +a64-x0+ +a64-x13+ 0 0)        ; crossing
+    (a64-mov-reg buf +a64-x4+ +a64-x22+)                     ; area
+    (a64-load-real-addr buf +a64-x13+ (conv-real +gc-card-base-addr+))
+    (a64-str-unsigned buf +a64-x22+ +a64-x13+ 8)
+    (a64-lsr-imm buf +a64-x14+ +a64-x10+ 9)
+    (a64-str-unsigned buf +a64-x14+ +a64-x13+ 16)
+    (a64-str-unsigned buf +a64-x1+ +a64-x13+ 24)
+    (a64-lsl-imm buf +a64-x14+ +a64-x22+ 1)
+    (a64-store-word buf +gc-old-lo-addr+ +a64-x14+ +a64-x13+)
+    (a64-lsl-imm buf +a64-x14+ +a64-x21+ 1)
+    (a64-store-word buf +gc-old-hi-addr+ +a64-x14+ +a64-x13+)
+    (a64-mov-reg buf +a64-x2+ +a64-x11+)                     ; keep the half
+    (a64-mov-reg buf +a64-x26+ +a64-x22+)
+    (a64-mov-reg buf +a64-x23+ +a64-x21+)
+    ;; CLEAN, unless a lock arena is live and this collection did NOT evacuate
+    ;; it (the runtime lock was held): old slots still name arena objects, and
+    ;; the next evacuating collection must visit them (translate-x64's
+    ;; EMIT-X64-MAJOR-STEP has the chain).  x9/x10 scratch.
+    (if (not *a64-tls-window*)
+        (emit-aarch64-crossing-fill buf nil)
+        (let ((clean (incf *mvm-label-counter*)) (filled (incf *mvm-label-counter*)))
+          (a64-load-real-addr buf +a64-x9+ (conv-real #x10000D98))
+          (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0)
+          (a64-cmp-imm buf +a64-x9+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i clean :bcond))
+          (a64-load-real-addr buf +a64-x9+ (conv-real #x10000DA8))
+          (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0)
+          (a64-cmp-imm buf +a64-x9+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i clean :bcond))
+          (a64-add-imm-lsl12 buf +a64-x9+ +a64-x9+ #x13)
+          (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ #x88)
+          (a64-cmp-imm buf +a64-x10+ 0)
+          (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i clean :bcond))
+          (emit-aarch64-crossing-fill buf t)
+          (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i filled :b))
+          (a64-set-label buf clean)
+          (emit-aarch64-crossing-fill buf nil)
+          (a64-set-label buf filled)))
+    (a64-store-word buf +gc-card-base-addr+ +a64-x0+ +a64-x13+) ; cards on
+    (a64-mov-reg buf +a64-x22+ +a64-x19+)                    ; young from = old area
+    (a64-add-reg buf +a64-x19+ +a64-x19+ +a64-x2+ 0 0)       ; young to
+    (a64-mov-reg buf +a64-x25+ +a64-x2+)
+    (a64-mov-reg buf +a64-x21+ +a64-x22+)
+    (a64-load-real-addr buf +a64-x16+ (conv-real #x10000040))
+    (a64-lsl-imm buf +a64-x14+ +a64-x2+ 1)
+    (a64-str-unsigned buf +a64-x14+ +a64-x16+ +gc-off-space-size+)
+    (a64-movz buf +a64-x2+ 0 0)
+    (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i skip :b))
+    ;; ---- phase 2 done, UN-TENURE: one ordinary semispace pair again ----
+    (a64-set-label buf finun)
+    (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 24)
+    (a64-store-word buf +gc-old-lo-addr+ +a64-xzr+ +a64-x13+)
+    (a64-store-word buf +gc-old-hi-addr+ +a64-xzr+ +a64-x13+)
+    (a64-store-word buf +gc-card-base-addr+ +a64-xzr+ +a64-x13+)
+    (a64-store-word buf +gc-card-root-addr+ +a64-xzr+ +a64-x13+)
+    (a64-load-real-addr buf +a64-x16+ (conv-real #x10000040))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ +gc-off-space-size+)
+    (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-lsl-imm buf +a64-x25+ +a64-x10+ 1)                  ; size = both halves
+    (a64-lsl-imm buf +a64-x14+ +a64-x25+ 1)
+    (a64-str-unsigned buf +a64-x14+ +a64-x16+ +gc-off-space-size+)
+    (a64-set-label buf skip)))
+
+(defun emit-aarch64-tenure (buf)
+  "Region 0 only, when a TENURE REQUEST is pending and names the from-space
+   this collection is reclaiming (x19) -- a request computed before some other
+   collection flipped the semispaces is stale and ignored, GC-TENURE retries.
+   The survivors just copied, [to_start x22, free x21), become the old space;
+   region 0 continues with the requested young pair, which GC-TENURE carved
+   out of the semispace this collection just reclaimed (its bitmaps already
+   cleared above).  Done HERE, not from Lisp, so the new frontier reaches every
+   other region-0 thread through the STW release like any collection's."
+  (let ((no (incf *mvm-label-counter*)))
+    (a64-load-gc-region buf +a64-x16+ +a64-x17+)
+    (a64-load-real-addr buf +a64-x10+ (conv-real #x10000040))
+    (a64-cmp-reg buf +a64-x16+ +a64-x10+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i no :bcond))
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-tenure-req-addr+))
+    (a64-ldr-unsigned buf +a64-x9+ +a64-x16+ 0)
+    (a64-asr-imm buf +a64-x9+ +a64-x9+ 1)              ; x9 = young from
+    (a64-cmp-reg buf +a64-x9+ +a64-x19+)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i no :bcond))
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x16+ 8)
+    (a64-asr-imm buf +a64-x10+ +a64-x10+ 1)            ; x10 = young to
+    (a64-ldr-unsigned buf +a64-x11+ +a64-x16+ 16)
+    (a64-asr-imm buf +a64-x11+ +a64-x11+ 1)            ; x11 = young size
+    (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0)       ; request taken
+    ;; the SIZE field: the swap writes from and to but never the size (an
+    ;; ordinary collection does not change it).  Left at the old size, the
+    ;; next collection's from_end reached over the old space and copied it.
+    (a64-load-real-addr buf +a64-x16+ (conv-real #x10000040))
+    (a64-lsl-imm buf +a64-x12+ +a64-x11+ 1)
+    (a64-str-unsigned buf +a64-x12+ +a64-x16+ +gc-off-space-size+)
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-lo-addr+))
+    (a64-lsl-imm buf +a64-x12+ +a64-x22+ 1)
+    (a64-str-unsigned buf +a64-x12+ +a64-x16+ 0)
+    (a64-load-real-addr buf +a64-x16+ (conv-real +gc-old-hi-addr+))
+    (a64-lsl-imm buf +a64-x12+ +a64-x21+ 1)
+    (a64-str-unsigned buf +a64-x12+ +a64-x16+ 0)
+    ;; the swap below writes from := x22, to := x19, and builds the limit from
+    ;; x22 + x25; the mutator's frontier is x21.
+    (a64-mov-reg buf +a64-x22+ +a64-x9+)
+    (a64-mov-reg buf +a64-x19+ +a64-x10+)
+    (a64-mov-reg buf +a64-x25+ +a64-x11+)
+    (a64-mov-reg buf +a64-x21+ +a64-x9+)
+    (a64-set-label buf no)))
+
 (defun emit-aarch64-stw-release (buf)
   "End of a collection: a STW collector clears the stop flag (released);
    the frame goes either way."
@@ -7911,6 +8947,9 @@
       (a64-str-unsigned buf +a64-x12+ +a64-x11+ +gc-off-saved-alloc+)
       (a64-lsl-imm buf +a64-x12+ +a64-x25+ 1)
       (a64-str-unsigned buf +a64-x12+ +a64-x11+ +gc-off-saved-limit+)
+      ;; The collector's own x24 IS the new frontier: nothing to reload.
+      (when *aarch64-linux-mode*
+        (a64-r0-count-snapshot buf +a64-x12+ +a64-x11+ +a64-x10+))
       (a64-load-real-addr buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
       (a64-dmb buf #xB)
       (a64-str-unsigned buf +a64-xzr+ +a64-x11+ 0)
@@ -8032,6 +9071,7 @@
         (copy-obj  (incf *mvm-label-counter*))
         (main      (incf *mvm-label-counter*))
         (park      (incf *mvm-label-counter*))
+        (reenter   (incf *mvm-label-counter*))
         (early-return (incf *mvm-label-counter*)))
     ;; entry: jump over the subroutines to main
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i main :b))
@@ -8127,6 +9167,9 @@
 
     (a64-tramp-mark 2)
     ;; ============ SUBROUTINE copy_object (x10 = tagged; → x10 = new; advances x21) ============
+    ;; STAGE 3: the size first, THEN the destination -- the old space's bump
+    ;; pointer x8 when the object is below the survivor mark x3 and fits before
+    ;; x2 (PROMOTION), else to-space at x21 -- then one copy loop for both.
     (a64-set-label buf copy-obj)
     (a64-lsr-imm buf +a64-x11+ +a64-x10+ 4)
     (a64-lsl-imm buf +a64-x11+ +a64-x11+ 4)              ; x11 = raw src
@@ -8140,14 +9183,19 @@
           (co-done (incf *mvm-label-counter*))
           (oloop   (incf *mvm-label-counter*))
           (odone   (incf *mvm-label-counter*))
-          (co-full (incf *mvm-label-counter*)))
+          (co-full (incf *mvm-label-counter*))
+          (havesize (incf *mvm-label-counter*))
+          (young   (incf *mvm-label-counter*))
+          (pfail   (incf *mvm-label-counter*))
+          (chosen  (incf *mvm-label-counter*))
+          (notcons (incf *mvm-label-counter*)))
       (a64-cmp-imm buf +a64-x14+ 15)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-fwd :bcond))
+      (a64-mov-reg buf +a64-x14+ +a64-x12+)              ; x14 = tag, kept to the end
       (a64-cmp-imm buf +a64-x12+ 1)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i co-cons :bcond))
       ;; ---- object: size = align16((count+2)*8), EXCEPT u8-vector (#x11) whose
       ;;      header count is in BYTES → size = align16(16 + count). ----
-      (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; x12 = dest_start
       (a64-lsr-imm buf +a64-x15+ +a64-x13+ 8)            ; x15 = count
       (a64-lsl-imm buf +a64-x9+ +a64-x13+ 56) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 56) ; x9 = subtag
       (a64-cmp-imm buf +a64-x9+ #x11)
@@ -8170,19 +9218,40 @@
       (a64-add-imm buf +a64-x15+ +a64-x15+ 15)
       (a64-lsr-imm buf +a64-x15+ +a64-x15+ 4)
       (a64-lsl-imm buf +a64-x15+ +a64-x15+ 4)            ; size aligned16
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i havesize :b))
+      (a64-set-label buf co-cons)
+      (a64-movz buf +a64-x15+ 16 0)
+      (a64-set-label buf havesize)
+      ;; ---- the destination: x12 := dest_start, bump the one chosen ----
+      (a64-cmp-reg buf +a64-x11+ +a64-x3+)               ; below the survivor mark?
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i young :bcond))
+      (a64-add-reg buf +a64-x16+ +a64-x8+ +a64-x15+ 0 0)
+      (a64-cmp-reg buf +a64-x16+ +a64-x2+)
+      (let ((i (a64-current-index buf))) (a64-bcond buf #x8 0) (a64-add-fixup buf i pfail :bcond)) ; HI
+      (a64-mov-reg buf +a64-x12+ +a64-x8+)               ; PROMOTE
+      (a64-mov-reg buf +a64-x8+ +a64-x16+)
+      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i chosen :b))
+      (a64-set-label buf pfail)
+      (emit-aarch64-promo-fail buf)
+      (a64-set-label buf young)
       (emit-aarch64-gc-room-check buf +a64-x15+ co-full)
+      (a64-mov-reg buf +a64-x12+ +a64-x21+)
+      (a64-add-reg buf +a64-x21+ +a64-x21+ +a64-x15+ 0 0)
+      (a64-set-label buf chosen)
+      ;; ---- copy x15 bytes, 16 a step (every object is 16-aligned and a
+      ;;      multiple of 16 long) ----
       (a64-add-reg buf +a64-x9+ +a64-x11+ +a64-x15+ 0 0) ; x9 = src end
       (a64-mov-reg buf +a64-x16+ +a64-x11+)              ; x16 = src ptr
+      (a64-mov-reg buf +a64-x13+ +a64-x12+)              ; x13 = dest ptr
       (a64-set-label buf oloop)
       (a64-cmp-reg buf +a64-x16+ +a64-x9+)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i odone :bcond))
-      ;; 16 bytes a step: every object is 16-aligned and a multiple of 16 long
       (a64-ldp-post buf +a64-x15+ +a64-x17+ +a64-x16+ 16)                ; LDP x15,x17,[x16],#16
-      (a64-emit buf (logior #xA8800000 (ash 2 15) (ash +a64-x17+ 10) (ash +a64-x21+ 5) +a64-x15+)) ; STP x15,x17,[x21],#16
+      (a64-emit buf (logior #xA8800000 (ash 2 15) (ash +a64-x17+ 10) (ash +a64-x13+ 5) +a64-x15+)) ; STP x15,x17,[x13],#16
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i oloop :b))
       (a64-set-label buf odone)
       (a64-add-imm buf +a64-x17+ +a64-x12+ 15) (a64-str-unsigned buf +a64-x17+ +a64-x11+ 0) ; fwd ptr
-      (a64-add-imm buf +a64-x10+ +a64-x12+ 9)            ; new tagged = dest|9
+      (a64-add-reg buf +a64-x10+ +a64-x12+ +a64-x14+ 0 0) ; new tagged = dest | tag
       ;; set object-start bit for dest_start (x12), scratch x13..x17
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
@@ -8191,28 +9260,14 @@
       (a64-ldrb buf +a64-x15+ +a64-x14+)
       (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
-      (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
-      ;; ---- cons: 16 bytes ----
-      (a64-set-label buf co-cons)
-      (a64-movz buf +a64-x15+ 16 0)
-      (emit-aarch64-gc-room-check buf +a64-x15+ co-full)
-      (a64-mov-reg buf +a64-x12+ +a64-x21+)              ; dest_start
-      (a64-str-unsigned buf +a64-x13+ +a64-x21+ 0)       ; car (x13 = first word)
-      (a64-ldr-unsigned buf +a64-x14+ +a64-x11+ 8)       ; cdr = [src+8] (imm=BYTE offset, scaled /8)
-      (a64-str-unsigned buf +a64-x14+ +a64-x21+ 8)       ; [dest+8] = cdr
-      (a64-add-imm buf +a64-x17+ +a64-x12+ 15) (a64-str-unsigned buf +a64-x17+ +a64-x11+ 0) ; fwd
-      (a64-add-imm buf +a64-x10+ +a64-x12+ 1)            ; new tagged = dest|1
-      (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
-      (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x28+ +a64-x14+ 0 0)
-      (a64-lsr-imm buf +a64-x13+ +a64-x13+ 4)
-      (a64-and-reg buf +a64-x13+ +a64-x13+ +a64-x5+)
-      (a64-ldrb buf +a64-x15+ +a64-x14+)
-      (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
-      (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
-      ;; ALSO set the CONS-KIND bit for dest (x12) so the type-aware to-space
-      ;; scan classifies this copy as a cons.  conskind base @0x10000E40 (<<1).
-      ;; NB: x10 holds the RETURN value (dest|1) — must NOT clobber it; use x9
-      ;; for the base and x13..x17 for the bit math.
+      ;; a cons: ALSO the CONS-KIND bit, so the type-aware scans classify the
+      ;; copy as a cons.  x10 holds the RETURN value -- not clobbered; x9 is the
+      ;; base and x13..x17 the bit math.
+      (a64-lsr-imm buf +a64-x13+ +a64-x10+ 4)            ; tag = x10 & 15 (not & 7:
+      (a64-lsl-imm buf +a64-x13+ +a64-x13+ 4)            ; an object's 9 is 1 there)
+      (a64-sub-reg buf +a64-x13+ +a64-x10+ +a64-x13+ 0 0)
+      (a64-cmp-imm buf +a64-x13+ 1)
+      (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i notcons :bcond))
       (a64-mov-reg buf +a64-x9+ +a64-x7+)
       (a64-sub-reg buf +a64-x13+ +a64-x12+ +a64-x27+ 0 0)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 7) (a64-add-reg buf +a64-x14+ +a64-x9+ +a64-x14+ 0 0)
@@ -8221,12 +9276,22 @@
       (a64-ldrb buf +a64-x15+ +a64-x14+)
       (a64-lslv buf +a64-x16+ +a64-x6+ +a64-x13+)
       (a64-orr-reg buf +a64-x15+ +a64-x15+ +a64-x16+) (a64-strb buf +a64-x15+ +a64-x14+)
-      (a64-add-imm buf +a64-x21+ +a64-x21+ 16)           ; advance free_ptr
+      (a64-set-label buf notcons)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i co-done :b))
       ;; ---- already forwarded: x13 = new|15 ----
       (a64-set-label buf co-fwd)
       (a64-lsr-imm buf +a64-x14+ +a64-x13+ 4) (a64-lsl-imm buf +a64-x14+ +a64-x14+ 4) ; new addr
       (a64-add-reg buf +a64-x10+ +a64-x14+ +a64-x12+ 0 0) ; new | orig tag
+      ;; A forward INTO THIS COLLECTION'S FROM-SPACE [x19, x20) is a major's
+      ;; phase-1 promotion seen from phase 2 (from = the old area): chase it,
+      ;; or the slot keeps an address phase 2 hands to the young pair
+      ;; (translate-x64's EMIT-X64-GEN-COPY-OBJECT).  Never true otherwise.
+      (when *a64-tls-window*
+        (a64-cmp-reg buf +a64-x14+ +a64-x19+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cc+ 0) (a64-add-fixup buf i co-done :bcond))
+        (a64-cmp-reg buf +a64-x14+ +a64-x20+)
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-cs+ 0) (a64-add-fixup buf i co-done :bcond))
+        (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i copy-obj :b)))
       (a64-set-label buf co-done)
       (a64-ret buf)
       (a64-set-label buf co-full)
@@ -8314,6 +9379,11 @@
     (a64-load-real-addr buf +a64-x7+ (conv-real #x10000E40))
     (a64-ldr-unsigned buf +a64-x7+ +a64-x7+ 0)
     (a64-asr-imm buf +a64-x7+ +a64-x7+ 1)
+    ;; GENERATIONAL STAGE 3: promotion registers x3/x8/x2 for this collection.
+    (emit-aarch64-promo-setup buf)
+    ;; A major's phase 2 runs the collection again from here, with new
+    ;; geometry (EMIT-AARCH64-MAJOR-STEP).
+    (a64-set-label buf reenter)
     (emit-aarch64-stw-own-window-top buf)
     (a64-tramp-mark 4)
     ;; ---- scan THIS REGION'S ROOT WINDOW: [x26, stack_base) ----
@@ -8374,7 +9444,9 @@
       ;; unconditionally: an unset root reads 0, whose tag is neither 1 nor 9,
       ;; so scan_word returns immediately.  Keep in lock-step with the emit
       ;; site's *aarch64-jit-constvec-root*.
-      (scan-fixed #x10000FD0))
+      (scan-fixed #x10000FD0)
+      ;; The generational card vector (GC-TENURE): old, so a MAJOR moves it.
+      (scan-fixed +gc-card-root-addr+))
     (a64-tramp-mark 6)
     ;; ---- MV region: count-1 extras from 0x98 (only when 2<=count<=16) ----
     ;; count = [0x90]>>1; extras = count-1.  Guards (both SIGNED, mirroring x64's
@@ -8425,9 +9497,11 @@
     ;; heap that can point into region 0 — before the walk, which scans
     ;; whatever they forward.
     (emit-aarch64-stw-extra-roots buf scan-word)
-    (a64-mov-reg buf +a64-x26+ +a64-x22+)               ; walk cursor = to_start
-    (emit-aarch64-object-walk buf scan-word +a64-x21+)
+    (emit-aarch64-old-space-walk buf scan-word)
+    ;; to-space AND this collection's promotions (stage 3)
+    (emit-aarch64-cheney buf scan-word)
     (a64-tramp-mark 8)
+    (emit-aarch64-major-clear-size buf)
     ;; ---- clear reclaimed (old from_start = x19) object-start bitmap range ----
     ;; dest = obj_bitmap(x28) + (x19-page_base)>>7 ; count = space_size(x25)>>7 bytes.
     ;; #160 FIX: the per-semispace byte count is NOT 8-aligned — space_size =
@@ -8486,6 +9560,9 @@
       (a64-add-imm buf +a64-x9+ +a64-x9+ 1)
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i zbyte2 :b))
       (a64-set-label buf zdone2b))
+    (emit-aarch64-promo-finish buf)
+    (emit-aarch64-tenure buf)
+    (emit-aarch64-major-step buf reenter)
     (a64-tramp-mark 10)
     ;; ---- swap metadata (store <<1), IN THE ACTIVE REGION'S BLOCK ----
     ;; x17 was the region base at entry but the scan subroutines use it as
@@ -8780,6 +9857,7 @@
   (when (and *aarch64-gc-native-mcgc* *aarch64-gc-trampoline-label*
              (not (and *aarch64-jit-mode*
                        (not *aarch64-gc-trampoline-call-via-bl*))))
+    (a64-runtime-mark buf "<runtime: native collector>")
     (emit-aarch64-native-gc-trampoline buf))
   (when (and (not *aarch64-gc-native-mcgc*)
              *aarch64-gc-trampoline-label*
@@ -9019,7 +10097,7 @@
   (setf *aarch64-fn-addr-relocs* nil)
   (setf *aarch64-fn-addr-local-relocs* nil)
   (a64-slot-cache-flush)   ; never inherit a previous translation's state
-  (setq *a64-ssg-label* nil)
+  (setq *a64-ssg-label* nil *a64-card-label* nil)
   (setq *a64-mark-start-label* nil *a64-mark-cons-label* nil *a64-cold-stubs* nil)
   (let* ((buf (or *aarch64-translate-into-buf* (make-a64-buffer)))
          ;; Index (instruction units) where translated code starts within
@@ -9174,12 +10252,23 @@
     ;; defun) so adding them doesn't shift any fn-entry-offset.  At
     ;; Phase 3(a) these are dead code — no trap BLs to them yet.
     (when *aarch64-translate-into-buf*
+      (a64-runtime-mark buf "<runtime: handler helpers>")
       (emit-aarch64-handler-helpers buf))
 
     ;; The shared-store guard, when a store in this unit called it.
     (when *a64-ssg-label*
+      (a64-runtime-mark buf "<runtime: shared-store guard>")
       (a64-emit-shared-store-guard-sub buf *a64-ssg-label*)
       (setq *a64-ssg-label* nil))
+    ;; The card-marking barrier, when a store in this unit called it.
+    (when *a64-card-label*
+      (if (and *aarch64-translate-into-buf* (not *aarch64-jit-mode*))
+          (unless (cdr *a64-card-image-label*)         ; the image's one copy
+            (a64-runtime-mark buf "<runtime: card barrier>")
+            (a64-emit-card-mark-sub buf *a64-card-label*)
+            (setf (cdr *a64-card-image-label*) t))
+          (a64-emit-card-mark-sub buf *a64-card-label*))
+      (setq *a64-card-label* nil))
     ;; The GC bitmap marks, when an allocation in this unit called them.
     (a64-emit-mark-subs buf)
 

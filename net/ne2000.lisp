@@ -4,10 +4,16 @@
 ;;;; QEMU: -device ne2k_isa,netdev=net0,iobase=0x300,irq=9
 ;;;;       -netdev user,id=net0,hostfwd=tcp::2222-:22
 ;;;;
-;;;; Provides e1000-send/e1000-receive/e1000-rx-buf API for shared ip/ssh code.
+;;;; Package MODUS.NET.NE2000 (builder packages step 3).  It implements
+;;;; MODUS.NET's NIC interface -- NE2K-SEND / -RECEIVE / -RX-BUF / -PROBE --
+;;;; and the i386 image binds the interface to them at boot (net/nic.lisp).
+;;;; Its host buffers and state block are the BOARD's (net/arch-i386-cl.lisp):
+;;;; NE2K-RX-HOST and E1000-STATE-BASE, which MODUS-INT exports to drivers.
 ;;;;
 ;;;; NOTE: MVM requires io-in-byte/io-out-byte ports to be compile-time constants.
 ;;;; All register accesses use literal port numbers (base 0x300 + register offset).
+
+(in-package :modus.net.ne2000)
 
 ;; ================================================================
 ;; NE2000 Constants
@@ -18,10 +24,6 @@
 (defun ne2k-tx-start () #x40)
 (defun ne2k-rx-start () #x46)
 (defun ne2k-rx-stop ()  #xC0)
-
-;; Host memory buffers (below 8MB cons space)
-(defun ne2k-rx-host ()  #x780000)
-(defun ne2k-tx-host ()  #x781000)
 
 ;; ================================================================
 ;; Register read/write with constant port numbers
@@ -314,12 +316,9 @@
                       data-len)))))))))
 
 ;; ================================================================
-;; API wrappers (compatible with shared ip.lisp / ssh.lisp)
-;; Override e1000-* via last-defun-wins to route to NE2000 driver.
-;; For dual-driver builds, a dispatch layer replaces these.
+;; The NIC interface (net/nic.lisp): NE2K-SEND and NE2K-RECEIVE above, and
+;; these two.
 ;; ================================================================
 
-(defun e1000-send (buf len) (ne2k-send buf len))
-(defun e1000-receive () (ne2k-receive))
-(defun e1000-rx-buf () (ne2k-rx-host))
-(defun e1000-probe () (ne2k-reset) (ne2k-init))
+(defun ne2k-rx-buf () (ne2k-rx-host))
+(defun ne2k-probe () (ne2k-reset) (ne2k-init))

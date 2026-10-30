@@ -166,7 +166,7 @@ PRELUDE = r'''
    library's package and every harness call is UNDEFINED-FUNCTION."
   (let ((p *package*) (r nil))
     (setq r (handler-case
-                (%it-eval-source (tar-bytes-to-string (%it-slurp-bytes path)) path)
+                (modus-int::%it-eval-source (modus-int::tar-bytes-to-string (modus-int::%it-slurp-bytes path)) path)
               (t (c) (list :FILE-ABORT (handler-case (type-of c) (t (c2) :UNKNOWN))))))
     (setq *package* p)
     r))

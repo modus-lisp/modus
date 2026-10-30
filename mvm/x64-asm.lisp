@@ -266,7 +266,7 @@
 ;;; REX Prefix
 ;;; ============================================================
 
-(defun rex-prefix (w r x b)
+(defun asm-rex-prefix (w r x b)
   "Build REX prefix byte.
    W = 64-bit operand size
    R = ModR/M reg field extension
@@ -287,13 +287,13 @@
     (when (or w r b
               (and reg1 (reg-needs-rex-p reg1))
               (and reg2 (reg-needs-rex-p reg2)))
-      (emit-byte buf (rex-prefix w r nil b)))))
+      (emit-byte buf (asm-rex-prefix w r nil b)))))
 
 ;;; ============================================================
 ;;; ModR/M and SIB
 ;;; ============================================================
 
-(defun modrm (mod reg rm)
+(defun asm-modrm (mod reg rm)
   "Build ModR/M byte"
   (logior (ash (logand mod #x3) 6)
           (ash (logand reg #x7) 3)
@@ -301,7 +301,7 @@
 
 (defun emit-modrm-reg-reg (buf reg rm)
   "Emit ModR/M for register-to-register"
-  (emit-byte buf (modrm #b11 (reg-code reg) (reg-code rm))))
+  (emit-byte buf (asm-modrm #b11 (reg-code reg) (reg-code rm))))
 
 ;;; ============================================================
 ;;; Instructions
@@ -322,12 +322,12 @@
 
 (defun emit-push (buf reg)
   (when (reg-extended-p reg)
-    (emit-byte buf (rex-prefix nil nil nil t)))
+    (emit-byte buf (asm-rex-prefix nil nil nil t)))
   (emit-byte buf (+ #x50 (reg-code reg))))
 
 (defun emit-pop (buf reg)
   (when (reg-extended-p reg)
-    (emit-byte buf (rex-prefix nil nil nil t)))
+    (emit-byte buf (asm-rex-prefix nil nil nil t)))
   (emit-byte buf (+ #x58 (reg-code reg))))
 
 ;;; MOV
@@ -344,19 +344,19 @@
     (cond
       ;; 64-bit immediate
       ((= size 64)
-       (emit-byte buf (rex-prefix t nil nil (reg-extended-p reg)))
+       (emit-byte buf (asm-rex-prefix t nil nil (reg-extended-p reg)))
        (emit-byte buf (+ #xB8 (reg-code reg)))
        (emit-u64 buf imm))
       ;; 32-bit
       ((= size 32)
        (when (reg-extended-p reg)
-         (emit-byte buf (rex-prefix nil nil nil t)))
+         (emit-byte buf (asm-rex-prefix nil nil nil t)))
        (emit-byte buf (+ #xB8 (reg-code reg)))
        (emit-u32 buf imm))
       ;; 8-bit
       ((= size 8)
        (when (reg-needs-rex-p reg)
-         (emit-byte buf (rex-prefix nil nil nil (reg-extended-p reg))))
+         (emit-byte buf (asm-rex-prefix nil nil nil (reg-extended-p reg))))
        (emit-byte buf (+ #xB0 (reg-code reg)))
        (emit-byte buf imm)))))
 
@@ -370,20 +370,20 @@
       ((zerop offset)
        (cond
          ((= (reg-code base) 5)  ; RBP/R13 need disp8
-          (emit-byte buf (modrm #b01 (reg-code reg) (reg-code base)))
+          (emit-byte buf (asm-modrm #b01 (reg-code reg) (reg-code base)))
           (emit-byte buf 0))
          (needs-sib
-          (emit-byte buf (modrm #b00 (reg-code reg) 4))  ; r/m=4 means SIB
+          (emit-byte buf (asm-modrm #b00 (reg-code reg) 4))  ; r/m=4 means SIB
           (emit-byte buf #x24))  ; SIB: scale=0, index=4(none), base=4(RSP)
          (t
-          (emit-byte buf (modrm #b00 (reg-code reg) (reg-code base))))))
+          (emit-byte buf (asm-modrm #b00 (reg-code reg) (reg-code base))))))
       ((<= -128 offset 127)
-       (emit-byte buf (modrm #b01 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (emit-byte buf (asm-modrm #b01 (reg-code reg) (if needs-sib 4 (reg-code base))))
        (when needs-sib
          (emit-byte buf #x24))  ; SIB
        (emit-byte buf (logand offset #xFF)))
       (t
-       (emit-byte buf (modrm #b10 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (emit-byte buf (asm-modrm #b10 (reg-code reg) (if needs-sib 4 (reg-code base))))
        (when needs-sib
          (emit-byte buf #x24))  ; SIB
        (emit-s32 buf offset)))))
@@ -398,20 +398,20 @@
       ((zerop offset)
        (cond
          ((= (reg-code base) 5)  ; RBP/R13 need disp8
-          (emit-byte buf (modrm #b01 (reg-code reg) (reg-code base)))
+          (emit-byte buf (asm-modrm #b01 (reg-code reg) (reg-code base)))
           (emit-byte buf 0))
          (needs-sib
-          (emit-byte buf (modrm #b00 (reg-code reg) 4))  ; r/m=4 means SIB
+          (emit-byte buf (asm-modrm #b00 (reg-code reg) 4))  ; r/m=4 means SIB
           (emit-byte buf #x24))  ; SIB: scale=0, index=4(none), base=4(RSP)
          (t
-          (emit-byte buf (modrm #b00 (reg-code reg) (reg-code base))))))
+          (emit-byte buf (asm-modrm #b00 (reg-code reg) (reg-code base))))))
       ((<= -128 offset 127)
-       (emit-byte buf (modrm #b01 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (emit-byte buf (asm-modrm #b01 (reg-code reg) (if needs-sib 4 (reg-code base))))
        (when needs-sib
          (emit-byte buf #x24))  ; SIB
        (emit-byte buf (logand offset #xFF)))
       (t
-       (emit-byte buf (modrm #b10 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (emit-byte buf (asm-modrm #b10 (reg-code reg) (if needs-sib 4 (reg-code base))))
        (when needs-sib
          (emit-byte buf #x24))  ; SIB
        (emit-s32 buf offset)))))
@@ -431,7 +431,7 @@
      (cond
        ((<= -128 imm 127)
         (emit-byte buf #x83)  ; sign-extended imm8
-        (emit-byte buf (modrm #b11 ,modrm-reg (reg-code reg)))
+        (emit-byte buf (asm-modrm #b11 ,modrm-reg (reg-code reg)))
         (emit-byte buf (logand imm #xFF)))
        (t
         (if (eq reg 'rax)
@@ -440,7 +440,7 @@
               (emit-s32 buf imm))
             (progn
               (emit-byte buf #x81)
-              (emit-byte buf (modrm #b11 ,modrm-reg (reg-code reg)))
+              (emit-byte buf (asm-modrm #b11 ,modrm-reg (reg-code reg)))
               (emit-s32 buf imm)))))))
 
 (define-alu-reg-reg emit-add-reg-reg #x01)
@@ -470,7 +470,7 @@
     (t
      (emit-rex-if-needed buf nil reg t)  ; REX.W for 64-bit
      (emit-byte buf #xF7)
-     (emit-byte buf (modrm #b11 0 (reg-code reg)))
+     (emit-byte buf (asm-modrm #b11 0 (reg-code reg)))
      (emit-s32 buf imm))))
 
 ;;; Shifts
@@ -481,10 +481,10 @@
   (if (= count 1)
       (progn
         (emit-byte buf #xD1)
-        (emit-byte buf (modrm #b11 4 (reg-code reg))))
+        (emit-byte buf (asm-modrm #b11 4 (reg-code reg))))
       (progn
         (emit-byte buf #xC1)
-        (emit-byte buf (modrm #b11 4 (reg-code reg)))
+        (emit-byte buf (asm-modrm #b11 4 (reg-code reg)))
         (emit-byte buf count))))
 
 (defun emit-shr-reg-imm (buf reg count)
@@ -493,10 +493,10 @@
   (if (= count 1)
       (progn
         (emit-byte buf #xD1)
-        (emit-byte buf (modrm #b11 5 (reg-code reg))))
+        (emit-byte buf (asm-modrm #b11 5 (reg-code reg))))
       (progn
         (emit-byte buf #xC1)
-        (emit-byte buf (modrm #b11 5 (reg-code reg)))
+        (emit-byte buf (asm-modrm #b11 5 (reg-code reg)))
         (emit-byte buf count))))
 
 (defun emit-sar-reg-imm (buf reg count)
@@ -505,10 +505,10 @@
   (if (= count 1)
       (progn
         (emit-byte buf #xD1)
-        (emit-byte buf (modrm #b11 7 (reg-code reg))))
+        (emit-byte buf (asm-modrm #b11 7 (reg-code reg))))
       (progn
         (emit-byte buf #xC1)
-        (emit-byte buf (modrm #b11 7 (reg-code reg)))
+        (emit-byte buf (asm-modrm #b11 7 (reg-code reg)))
         (emit-byte buf count))))
 
 (defun emit-shl-reg-cl (buf reg)
@@ -516,21 +516,21 @@
   ;; Register is in r/m field, so REX.B extends it
   (emit-rex-if-needed buf nil reg)
   (emit-byte buf #xD3)
-  (emit-byte buf (modrm #b11 4 (reg-code reg))))
+  (emit-byte buf (asm-modrm #b11 4 (reg-code reg))))
 
 (defun emit-shr-reg-cl (buf reg)
   "SHR reg, CL — logical shift right by count in CL register."
   ;; Register is in r/m field, so REX.B extends it
   (emit-rex-if-needed buf nil reg)
   (emit-byte buf #xD3)
-  (emit-byte buf (modrm #b11 5 (reg-code reg))))
+  (emit-byte buf (asm-modrm #b11 5 (reg-code reg))))
 
 (defun emit-sar-reg-cl (buf reg)
   "SAR reg, CL — arithmetic shift right by count in CL register."
   ;; Register is in r/m field, so REX.B extends it
   (emit-rex-if-needed buf nil reg)
   (emit-byte buf #xD3)
-  (emit-byte buf (modrm #b11 7 (reg-code reg))))
+  (emit-byte buf (asm-modrm #b11 7 (reg-code reg))))
 
 ;;; Jumps and Calls
 
@@ -552,9 +552,9 @@
 (defun emit-jmp-reg (buf reg)
   "JMP reg (indirect)"
   (when (reg-extended-p reg)
-    (emit-byte buf (rex-prefix nil nil nil t)))
+    (emit-byte buf (asm-rex-prefix nil nil nil t)))
   (emit-byte buf #xFF)
-  (emit-byte buf (modrm #b11 4 (reg-code reg))))
+  (emit-byte buf (asm-modrm #b11 4 (reg-code reg))))
 
 (defun emit-call (buf target)
   "CALL rel32 to label or offset.  Dispatch on INTEGERP (see emit-jmp)."
@@ -570,9 +570,9 @@
 (defun emit-call-reg (buf reg)
   "CALL reg (indirect)"
   (when (reg-extended-p reg)
-    (emit-byte buf (rex-prefix nil nil nil t)))
+    (emit-byte buf (asm-rex-prefix nil nil nil t)))
   (emit-byte buf #xFF)
-  (emit-byte buf (modrm #b11 2 (reg-code reg))))
+  (emit-byte buf (asm-modrm #b11 2 (reg-code reg))))
 
 ;;; Conditional jumps
 
@@ -612,20 +612,20 @@
       ((zerop offset)
        (cond
          ((= (reg-code base) 5)  ; RBP/R13 need disp8
-          (emit-byte buf (modrm #b01 (reg-code dst) (reg-code base)))
+          (emit-byte buf (asm-modrm #b01 (reg-code dst) (reg-code base)))
           (emit-byte buf 0))
          (needs-sib
-          (emit-byte buf (modrm #b00 (reg-code dst) 4))  ; r/m=4 means SIB
+          (emit-byte buf (asm-modrm #b00 (reg-code dst) 4))  ; r/m=4 means SIB
           (emit-byte buf #x24))  ; SIB: scale=0, index=4(none), base=4
          (t
-          (emit-byte buf (modrm #b00 (reg-code dst) (reg-code base))))))
+          (emit-byte buf (asm-modrm #b00 (reg-code dst) (reg-code base))))))
       ((<= -128 offset 127)
-       (emit-byte buf (modrm #b01 (reg-code dst) (if needs-sib 4 (reg-code base))))
+       (emit-byte buf (asm-modrm #b01 (reg-code dst) (if needs-sib 4 (reg-code base))))
        (when needs-sib
          (emit-byte buf #x24))  ; SIB
        (emit-byte buf (logand offset #xFF)))
       (t
-       (emit-byte buf (modrm #b10 (reg-code dst) (if needs-sib 4 (reg-code base))))
+       (emit-byte buf (asm-modrm #b10 (reg-code dst) (if needs-sib 4 (reg-code base))))
        (when needs-sib
          (emit-byte buf #x24))  ; SIB
        (emit-s32 buf offset)))))

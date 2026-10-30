@@ -23,6 +23,13 @@
 
 (in-package :modus.mvm)
 
+;;; (declaim (overridable NAME ...)) marks NAME's DEFUN as a default that a
+;;; later file in the same image may replace -- a seam.  The image build
+;;; records it (%DECLAIM-NOTE-OVERRIDABLE) and reports any other redefinition
+;;; (mvm/build-checks.lisp).  SBCL only needs to know it is a declaration, for
+;;; this file and the translators that load after it.
+(declaim (declaration overridable))
+
 ;;; ============================================================
 ;;; Tagging Constants (mirror cross-compile.lisp)
 ;;; ============================================================
@@ -762,19 +769,6 @@
    list; see *E2-PERSIST-DEFUNS* for the same pattern and why a compiled LET
    of a special is not used in-image.")
 
-;;; Set by compile-form's %NAMED-LOOP dispatch so the inner SIMPLE-LOOP
-;;; doesn't establish an implicit (block nil …).  Per CLHS 6.1.2.2 a
-;;; NAMED LOOP's implicit block IS the named block — RETURN in the body
-;;; should fall through to whatever outer block-nil the caller has, NOT
-;;; be intercepted by the inner simple-loop.
-;;;
-;;; Declared HERE (before compile-form) so SBCL treats subsequent `(let
-;;; ((*suppress-loop-block-nil* t)) …)` as a true dynamic binding —
-;;; with the defvar farther down, SBCL compiled compile-form before
-;;; seeing the special declaration, treating the let as lexical, and
-;;; the binding silently never reached compile-loop.
-(defvar *suppress-loop-block-nil* nil)
-
 (defvar *macro-table* (make-hash-table :test 'eql)
   "Hash table of macro-name (hash integer) -> expander function")
 
@@ -1475,6 +1469,42 @@
 (defvar *unresolved-calls* (make-hash-table :test 'equal)
   "Tracks unresolved function calls: name-string -> count")
 
+(defvar *global-uses* nil
+  "Host-side census, NIL unless mvm/build-checks.lisp installs a hash: for each
+   global or constant the build compiles, (PACKAGE-NAME . SYMBOL-NAME) -> the
+   kinds seen (:DEF, :REF).  *GLOBALS* and *CONSTANTS* key by name hash alone,
+   so a read of MODUS.MVM::*X* finds MODUS.MVM.X64::*X* -- builder packages
+   step 2 makes those cross-package references visible.  Emits nothing.")
+
+(defvar *quote-uses* nil
+  "Host-side census, NIL unless mvm/build-checks.lisp installs a hash: every
+   symbol a QUOTE the build compiles contains, as (PACKAGE-NAME . SYMBOL-NAME)
+   -> T.  A quoted symbol keeps its home package in the image (phase A), so
+   the same name quoted in two kernel packages is two symbols: an EQ between
+   them is false.  CHECK-CROSS-PACKAGE-QUOTES reports such names.  Emits
+   nothing.")
+
+(defun %note-quoted (value depth)
+  (cond
+    ((> depth 6) nil)
+    ((and (symbolp value) value (not (keywordp value)) (not (eq value t)))
+     (let ((p (symbol-package value)))
+       (when p
+         (setf (gethash (cons (package-name p) (symbol-name value)) *quote-uses*) t))))
+    ((consp value)
+     (let ((n 0))
+       (loop
+         (when (or (not (consp value)) (> n 64)) (return))
+         (%note-quoted (car value) (+ depth 1))
+         (setq value (cdr value) n (+ n 1)))
+       (when value (%note-quoted value (+ depth 1)))))))
+
+(defun %note-global (sym kind)
+  (when (and *global-uses* (symbolp sym) sym (not *mvm-eval-runtime-p*))
+    (let* ((p (symbol-package sym))
+           (k (cons (if p (package-name p) "") (symbol-name sym))))
+      (pushnew kind (gethash k *global-uses*)))))
+
 (defvar *globals* (make-hash-table :test 'eql)
   "Set of known global variable names (hash -> t)")
 
@@ -1518,12 +1548,56 @@
        (symbolp var)
        (gethash (normalize-name var) *runtime-special-names*)))
 
-(defvar *let-skip-implicit-specials* nil
-  "When T, compile-form's let/let* dispatch skips the implicit-special
-   detection for CLHS-standard earmuffs.  compile-let-with-specials
-   binds this to T around the recursive compile-form on its emitted
-   let* — otherwise the dispatch re-detects the same names and recurses
-   forever.")
+(defvar *build-special-symbols* nil
+  "Build time: the SYMBOLS proclaimed special (EQ hash) -- every DEFVAR,
+   DEFPARAMETER and (DECLAIM (SPECIAL ...)) of the image, collected by
+   MVM-COMPILE-ALL before it compiles anything, plus any compiled later.  CLHS: DEFVAR proclaims its symbol special, so a later
+   LET of it binds dynamically.  This compiler used to honour that only for
+   the CLHS-standard variables, so a LET of the kernel's own specials bound
+   LEXICALLY (#248).  By SYMBOL, not by name: an earlier attempt keyed by name
+   made every package's *X* special the moment any package DEFVARed one.")
+
+(defun %note-build-special (sym)
+  (when (and (not *mvm-eval-runtime-p*) (symbolp sym) sym)
+    (unless *build-special-symbols*
+      (setq *build-special-symbols* (make-hash-table :test 'eq)))
+    (setf (gethash sym *build-special-symbols*) t)))
+
+(defun %declaim-note-special-build (form)
+  "Build time: (DECLAIM (SPECIAL v ...)) proclaims each V (see %NOTE-BUILD-SPECIAL)."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)) (name-eq (car s) "SPECIAL"))
+        (dolist (v (cdr s)) (%note-build-special v))))))
+
+(defun %kernel-special-symbol-p (var)
+  "Runtime compile: VAR is one of the kernel's own globals -- homed in a kernel
+   package and named in the build's list of them -- which the image's code
+   (compiled ahead of time) treats as special."
+  (and *mvm-eval-runtime-p* (symbolp var) var
+       (boundp '*kernel-global-names*) *kernel-global-names*
+       (gethash (symbol-name var) *kernel-global-names*)
+       (let ((p (symbol-package var)))
+         (and p (fboundp '%kernel-home-pkg-name-p)
+              (funcall '%kernel-home-pkg-name-p (package-name p))))))
+
+(defun %proclaimed-special-p (var)
+  "VAR is proclaimed special: by a DEFVAR / DEFPARAMETER / DECLAIM compiled
+   earlier (at build time by symbol, at runtime by name), or as one of the
+   kernel's globals."
+  (or (%runtime-special-p var)
+      (and (not *mvm-eval-runtime-p*) *build-special-symbols* (symbolp var)
+           (gethash var *build-special-symbols*))
+      (%kernel-special-symbol-p var)))
+
+;;; (*LET-SKIP-IMPLICIT-SPECIALS*, a recursion guard COMPILE-LET-WITH-SPECIALS
+;;; bound around its re-compile, is gone: the forms it re-compiles bind no
+;;; special by name -- the specials are renamed to temporaries, or filtered
+;;; out -- so there is nothing to re-detect.  Where the guard was dynamic (the
+;;; host build, which honours its DEFVAR) it stayed T through the BODY too, so
+;;; a LET of a special nested inside another one compiled LEXICAL.)
 
 (defvar *clhs-standard-specials-hashes* nil
   "Allowlist of CLHS-standard special-variable names (by name-hash).
@@ -1699,6 +1773,26 @@
   "name-hash -> constant-table index of that keyword's static object, for the
    module being compiled (one object per keyword, or EQ breaks).  Reset per
    module by MVM-COMPILE-ALL with SETQ for the reason *INIT-THUNK-NAMES* is.")
+
+(defun %build-mvm-package ()
+  "The build package MODUS-INT (nickname MODUS.MVM) when compiling an IMAGE --
+   on the SBCL host, or in the self-host image's own --compile -- and NIL
+   under runtime mvm-eval.  Runtime compiles have always interned their
+   generated names in *PACKAGE*, because no build package existed in a running
+   image; now that %INIT-PACKAGES creates MODUS-INT at boot, asking FIND-PACKAGE
+   directly would silently move them there."
+  (and (not *mvm-eval-runtime-p*) (find-package "MODUS.MVM")))
+
+(defun %init-thunk-fn-name (thunk-name)
+  "The name a DEFVAR's init thunk is COMPILED under.  At build time it is the
+   MODUS.MVM symbol INIT-ALL-GLOBALS calls it by, so the definition and the
+   call agree on the package-qualified key; as a bare string the call resolved
+   only through %FN-INFO-FOR-KEY's bare-name fallback (builder packages step 2
+   drives that fallback to zero).  Runtime mvm-eval keeps the string: its
+   thunks are called by name in the user's package."
+  (if *mvm-eval-runtime-p*
+      thunk-name
+      (intern thunk-name (or (%build-mvm-package) *package*))))
 
 (defvar *init-nil-thunk-names* nil
   "The subset of *INIT-THUNK-NAMES* that are a NIL-initform DEFVAR's thunk,
@@ -1918,6 +2012,29 @@
    emitted code is byte-identical to before, so the ANSI images are
    untouched.")
 
+(defvar *overridable-names* (make-hash-table :test (function equal))
+  "Names a build has declared replaceable with (DECLAIM (OVERRIDABLE NAME ...)),
+   keyed by symbol name.  The declaration goes in the file that defines the
+   DEFAULT; a later DEFUN of the same name in the same image is then a seam
+   and not an accident.  Build-time only: runtime DECLAIM never records here.")
+
+(defparameter *undeclared-redefinitions* nil
+  "(name old-loc new-loc) for each redefinition in this build whose name was
+   not declared OVERRIDABLE first.  mvm/build-checks.lisp reports it and, under
+   MODUS_REDEF_CHECK=error, fails the build.")
+
+(defun %declaim-note-overridable (form)
+  "Record the names of every (OVERRIDABLE name ...) spec of a toplevel
+   DECLAIM.  Emits nothing."
+  (dolist (spec (cdr form))
+    (let ((s (if (and (consp spec) (name-eq (car spec) "QUOTE") (consp (cdr spec)))
+                 (cadr spec)
+                 spec)))
+      (when (and (consp s) (symbolp (car s)) (name-eq (car s) "OVERRIDABLE"))
+        (dolist (n (cdr s))
+          (when (and n (symbolp n))
+            (setf (gethash (symbol-name n) *overridable-names*) t)))))))
+
 (defparameter *redefinition-log* nil
   "List of (name old-loc new-loc) triples, one per silently-redefined
    defun.  Pushed by mvm-compile-function.  Build scripts should print
@@ -1983,6 +2100,13 @@
 
 (defvar *current-source-location* nil
   "Current source location string, set by mvm-compile-all for each form.")
+
+(defvar *current-source-file* nil
+  "The first-party file the forms being compiled came from, set by a toplevel
+   (%SOURCE-FILE PATH) -- the build's per-file marker (cross.lisp
+   %SOURCE-FILE-MARKER) -- with *CURRENT-SOURCE-FILE-LINE* the blob line it
+   started on.  Locations, and so every redefinition report, are FILE:LINE.")
+(defvar *current-source-file-line* 0)
 
 (defvar *arity-audit-log* nil
   "Audit trail of compile-time arity errors emitted by compile-call.
@@ -2821,6 +2945,7 @@
 ;;; Cross-package compatibility: we compare operator names as
 ;;; name hashes (dual FNV-1a), matching cross.lisp's compute-name-hash.
 
+(declaim (overridable compute-name-hash))
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a name string. 60-bit collision-resistant."
   ;; CHAR-UPCASE per character, not STRING-UPCASE of the whole name: the same
@@ -2839,6 +2964,7 @@
                             (logand h2 +name-hash-lo-mask+))))
       (if (zerop combined) 1 combined))))
 
+(declaim (overridable ieee-float-bits))
 (defun ieee-float-bits (f)
   "Convert a double-float to its IEEE 754 bit pattern as an integer."
   (let ((hi (sb-kernel:double-float-high-bits f))
@@ -2853,8 +2979,10 @@
 ;; well inside fixnum range.  Host versions use sb-kernel; the in-image
 ;; overrides (build-generic.lisp *stage2-float-override*) read the boxed
 ;; float's slots directly via %prim-aref.
+(declaim (overridable ieee-float-hi32))
 (defun ieee-float-hi32 (f)
   (logand (sb-kernel:double-float-high-bits (float f 1.0d0)) #xFFFFFFFF))
+(declaim (overridable ieee-float-lo32))
 (defun ieee-float-lo32 (f)
   (logand (sb-kernel:double-float-low-bits (float f 1.0d0)) #xFFFFFFFF))
 
@@ -2867,24 +2995,31 @@
 ;; unreliable into bignum range.  On the host these primitives work on real
 ;; bignums, so the host versions keep computing.  See ieee-float-hi32 for the
 ;; sibling float case.
+(declaim (overridable %lit-bignum-big-p))
 (defun %lit-bignum-big-p (value)
   "T if VALUE needs the limbs-array (big) bignum shape rather than 2-slot."
   (> (integer-length (abs value)) +small-bignum-bits+))
+(declaim (overridable %lit-bn-lo))
 (defun %lit-bn-lo (value)
   "Low 62-bit limb (slot 0) of a small bignum VALUE."
   (logand value +fixnum-max+))
+(declaim (overridable %lit-bn-hi))
 (defun %lit-bn-hi (value)
   "High signed part (slot 1) of a small bignum VALUE."
   (ash value +neg-limb-bits+))
+(declaim (overridable %lit-bb-sign))
 (defun %lit-bb-sign (value) (if (< value 0) -1 1))
+(declaim (overridable %lit-bb-nlimbs))
 (defun %lit-bb-nlimbs (value)
   (let ((mag (abs value)) (n 0))
     (loop (when (= mag 0) (return n))
           (setf mag (ash mag +neg-limb-bits+)) (incf n))))
+(declaim (overridable %lit-bb-limb))
 (defun %lit-bb-limb (value k)
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
   (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
 
+(declaim (overridable normalize-name))
 (defun normalize-name (sym)
   "Convert a symbol to its name hash for comparison.
    Returns 0 for non-symbol, non-integer inputs."
@@ -2919,6 +3054,9 @@
     ((integerp form) form)
     ((or (symbolp form) (stringp form))
      (let ((v (gethash (normalize-name form) *constants* :not-found)))
+       ;; ...and a runtime DEFCONSTANT's (%RUNTIME-FOLD-CONSTANT): a library's
+       ;; `(ash s (- +ecm-bits+))' is the same case as the build's +fixnum-shift+
+       (when (and (eq v :not-found) (symbolp form)) (setq v (%runtime-constant form)))
        (if (and (not (eq v :not-found)) (integerp v)) v nil)))
     ;; + - * ASH over constant integers fold too: `(ash 1 (- +fixnum-bits+ 24))'
     ;; in the interpreter's LI arm was a runtime BIGNUM-ASH call on EVERY
@@ -2959,7 +3097,11 @@
       (let ((pkg (%cl-sym-package fn)))
         (if (and pkg (%runtime-born-pkg-p (%pkg-name pkg)))
             (%maybe-narrow (concatenate 'string (%pkg-name pkg) "::" (%cl-sym-name fn)))
-            (symbol-name fn)))
+            ;; A symbol that only SHARES a kernel function's name keys its own
+            ;; cell (cl-eval.lisp %KERNEL-SHADOW-KEY): a CL-USER DEFUN of
+            ;; %FORMAT-IMPL must not replace the kernel's.
+            (or (%kernel-shadow-key pkg (symbol-name fn))
+                (symbol-name fn))))
       (symbol-name fn)))
 
 (defun %local-fn-key (fn)
@@ -3227,7 +3369,7 @@
       (intern (concatenate 'string "SETF-" (symbol-name name))
               (%cl-sym-package name))
       (intern (concatenate 'string "SETF-" (symbol-name name))
-              (or (find-package "MODUS.MVM")
+              (or (%build-mvm-package)
                   (find-package "COMMON-LISP-USER")
                   *package*))))
 
@@ -3330,19 +3472,27 @@
    discover there are no runtime-born packages to fold into.  Same
    re-entrancy reasoning as the runtime side (see cl-packages.lisp)."
   (and *mvm-eval-runtime-p*
-       (%any-runtime-born-pkg-p)
+       (or (%any-runtime-born-pkg-p) *kernel-global-names*)
        sym
        (%cl-sym-p sym)
        (let ((p (%cl-sym-package sym)))
          (and p
               (%pkg-p p)
-              (let ((pn (%pkg-name p)))
-                (and pn
-                     (%runtime-born-pkg-p pn)
-                     (let ((nm (%cl-sym-name sym)))
-                       (and nm (> (length nm) 0)
-                            (compute-name-hash
-                             (%maybe-narrow (concatenate 'string pn "::" nm)))))))))))
+              (let* ((pn (%pkg-name p))
+                     ;; a runtime-born package's own special (task #241), or a
+                     ;; non-kernel symbol named like a kernel global (globals
+                     ;; by package) -- %SYM-GLOBAL-PKG-KEY's same two tests,
+                     ;; the second on the RAW name slot as there
+                     (nm (and pn
+                              (if (and (%any-runtime-born-pkg-p) (%runtime-born-pkg-p pn))
+                                  (%cl-sym-name sym)
+                                  (let ((raw (aref sym 2)))
+                                    (and (stringp raw)
+                                         (%kernel-global-shadow-p pn raw)
+                                         raw))))))
+                (and nm (> (length nm) 0)
+                     (compute-name-hash
+                      (%maybe-narrow (concatenate 'string pn "::" nm)))))))))
 
 (defun %global-var-bind-key (sym)
   "Store key for a global-variable WRITE site: DEFVAR/DEFPARAMETER's initform
@@ -3421,6 +3571,69 @@
             ((and (symbolp q) (name-eq q "SAFETY"))
              (setq *compile-safety* 3))
             (t nil)))))))
+
+;;; ---- (declare (optimize (safety N))) — honoured per body -------------------
+;;; A function body, LET, LET* or LOCALLY (which expands to (LET () …)) whose
+;;; leading declarations name a SAFETY level compiles at that level, so the
+;;; checks gated on *COMPILE-SAFETY* (array bounds above all) follow the
+;;; standard local declaration, not only a global DECLAIM -- mill writes
+;;; (optimize (speed 3) (safety 0)) on its hot loops.  Scope: the whole form,
+;;; LET inits included (CLHS scopes an OPTIMIZE declaration to the body; the
+;;; inits only lose checks they would otherwise have).  Each binding is the
+;;; ONLY special bound in its function (a special LET nested under another in
+;;; one function was invisible to callees in the build-time self-compile), and
+;;; is DECLAREd special: the image's compiler does not otherwise know
+;;; *COMPILE-SAFETY* is special, and would bind it lexically (build-checks
+;;; check-let-of-unregistered-special caught exactly that).
+(defun %body-safety (body)
+  "The SAFETY level BODY's leading declarations name, or NIL."
+  (let ((level nil))
+    (loop
+      (cond ((and (consp body) (stringp (car body)) (consp (cdr body)))
+             (setq body (cdr body)))
+            ((and (consp body) (consp (car body)) (symbolp (caar body))
+                  (name-eq (caar body) "DECLARE"))
+             (dolist (spec (cdar body))
+               (when (and (consp spec) (symbolp (car spec)) (name-eq (car spec) "OPTIMIZE"))
+                 (dolist (q (cdr spec))
+                   (cond ((and (consp q) (symbolp (car q)) (name-eq (car q) "SAFETY")
+                               (consp (cdr q)) (integerp (cadr q)))
+                          (setq level (cadr q)))
+                         ((and (symbolp q) (name-eq q "SAFETY")) (setq level 3))))))
+             (setq body (cdr body)))
+            (t (return level))))))
+
+(defun %compile-let-at-safety (level bindings body env dest)
+  (let ((*compile-safety* level)) (declare (special *compile-safety*)) (%compile-let-1 bindings body env dest)))
+(defun compile-let (bindings body env dest)
+  "Compile (let ((var val)*) body*).
+   All values are evaluated in the outer environment, then bound."
+  (let ((level (%body-safety body)))
+    (if level
+        (%compile-let-at-safety level bindings body env dest)
+        (%compile-let-1 bindings body env dest))))
+
+(defun %compile-let*-at-safety (level bindings body env dest)
+  (let ((*compile-safety* level)) (declare (special *compile-safety*)) (%compile-let*-1 bindings body env dest)))
+(defun compile-let* (bindings body env dest)
+  "Compile (let* ((var val)*) body*).
+   Values are evaluated sequentially; each can see earlier bindings."
+  (let ((level (%body-safety body)))
+    (if level
+        (%compile-let*-at-safety level bindings body env dest)
+        (%compile-let*-1 bindings body env dest))))
+
+(defun %mvm-compile-function-at-safety (level name params body parent-env rest-slot opt-start opt-count)
+  (let ((*compile-safety* level))
+    (declare (special *compile-safety*))
+    (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count)))
+(defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
+  "Compile a single function into IR (%MVM-COMPILE-FUNCTION-INTERNAL-2), at
+   the SAFETY level its body declares, if any."
+  (let ((level (%body-safety body)))
+    (if level
+        (%mvm-compile-function-at-safety level name params body parent-env rest-slot opt-start opt-count)
+        (%mvm-compile-function-internal-2 name params body parent-env rest-slot opt-start opt-count))))
 
 ;;; ---- (declaim (inline f)) — honoured at runtime (mvm-eval) -----------------
 ;;;
@@ -3660,6 +3873,9 @@
         (let ((ty (list 'simple-array et (list '*))))
           (cond ((%u8-simple-array-decl-p ty) ty)
                 ((%generic-element-type-p et) ty)
+                ;; the packed single-float vector a declared f32 array is
+                ;; (illatio's f32-dot16 accumulator: every AREF was generic)
+                ((%f32-simple-array-decl-p ty) ty)
                 (t nil)))))))
 
 (defun %expr-dtype (form env)
@@ -3680,6 +3896,7 @@
                 (%resolve-declared-type (fifth info)))))
         (t nil)))
 
+(declaim (overridable name-eq))
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
@@ -3743,6 +3960,7 @@
 ;;; Re-key the live entries whenever the collection count changes.
 (defvar *mexp-memo-gc* -1
   "The %GC-COUNT at which *MEXP-MEMO* was last (re)keyed.")
+(declaim (overridable %mexp-memo-epoch))
 (defun %mexp-memo-epoch ()
   ;; %GC-EPOCH, not %GC-COUNT: see its docstring in gc.lisp -- an odd raw count
   ;; read as a tagged pointer killed every i386 image at its ninth collection.
@@ -3771,6 +3989,7 @@
       (when *mexp-memo* (%mexp-memo-rekey))
       (setq *mexp-memo-gc* g))))
 
+(declaim (overridable %form-key))
 (defun %form-key (form)
   "HOST stub: structural hash (collisions only cost a miss — entries are
    EQ-validated).  mvm-eval.lisp overrides with the object's address."
@@ -5604,6 +5823,8 @@
                   ;; Mark NAME a constant variable so (constantp 'name) is T
                   ;; (CLHS) — alexandria define-constant.1/.2 check this.
                   (list '%mark-constant-var (list 'quote (cadr form)))
+                  ;; ...and FOLD it in what is compiled after: see %RUNTIME-FOLD-CONSTANT.
+                  (list '%runtime-fold-constant (list 'quote (cadr form)))
                   ;; (defconstant name value doc): the documentation string
                   ;; (DEFCONSTANT.4).
                   (if (stringp (cadddr form))
@@ -5942,10 +6163,7 @@
                  ;; Ordered MODUS.MVM-first so the HOST build is unchanged (and
                  ;; so SBCL is never asked to intern into its locked CL package).
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
-                                       (or (find-package "MODUS.MVM")
-                                           (and (symbolp (car place))
-                                                (symbol-package (car place)))
-                                           *package*))))
+                                       (%setter-pkg (car place)))))
                    `(,setter ,@(cdr place) ,value)))))))))
 
   ;; DEFSETF — register a setf expander.
@@ -6082,8 +6300,7 @@
                     ;; In-image-safe package (see cell-var-name): hardcoded
                     ;; :modus.mvm interns into NIL under mvm-eval → NIL head.
                     (let ((setter (intern (format nil "SET-~A" (symbol-name acc))
-                                          (or (find-package "MODUS.MVM")
-                                              *package*))))
+                                          (%setter-pkg acc))))
                       `(,setter ,@place-args ,value-form)))))))
         `(quote ,accessor))))
 
@@ -6145,7 +6362,12 @@
     (lambda (form)
       (let ((buf (cadr form))
             (bytes (cddr form)))
-        `(progn ,@(mapcar (lambda (b) `(emit-byte ,buf ,b)) bytes)))))
+        ;; EMIT-BYTE of the package EMIT-BYTES was read in (the assembler's,
+        ;; MODUS.ASM), not this file's: builder packages step 2.
+        (let ((eb (if (and (symbolp (car form)) (symbol-package (car form)))
+                      (intern "EMIT-BYTE" (symbol-package (car form)))
+                      'emit-byte)))
+          `(progn ,@(mapcar (lambda (b) `(,eb ,buf ,b)) bytes))))))
 
   ;; LIST — expand to nested cons (MVM has no &rest)
   ;; (list) → nil, (list a) → (cons a nil), (list a b c) → (cons a (cons b (cons c nil)))
@@ -6285,12 +6507,6 @@
 
   ;; DO/DO*/DOTIMES body declarations: CLHS puts them on the implicit
   ;; binding form, so they must be hoisted above the loop's TAGBODY.
-  (defun %leading-declares (body)
-    (let ((out nil))
-      (loop while (and body (consp (car body)) (symbolp (caar body))
-                       (string= (symbol-name (caar body)) "DECLARE"))
-            do (push (car body) out) (setq body (cdr body)))
-      (nreverse out)))
   (defun %special-only-declares (body)
     "BODY's leading SPECIAL declarations, as a list of zero or one DECLARE
      form.  Only SPECIAL can move onto a binding whose initial value is a
@@ -7117,7 +7333,7 @@
           (when (and has-key (not has-aok))
             (setq lambda-params
                   (append params (list (intern "&ALLOW-OTHER-KEYS"
-                                               (or (find-package "MODUS.MVM")
+                                               (or (%build-mvm-package)
                                                    *package*)))))))
         (if *mvm-eval-runtime-p*
             ;; mvm-eval (in-image runtime compile) ONLY: route through
@@ -7398,7 +7614,7 @@
                      ;; that compile point.  Forward to the (SETF NAME) GF.
                      (let ((set-name (intern (concatenate 'string "SET-"
                                                           (symbol-name val))
-                                             (or (find-package "MODUS.MVM") *package*))))
+                                             (or (%build-mvm-package) *package*))))
                        (setq extra-defuns
                              (cons (if *mvm-eval-runtime-p*
                                        `(%install-accessor-dispatcher ',set-name ':setter ',val)
@@ -7811,6 +8027,7 @@
                                   #.(compute-name-hash "SHIFTF")))
                         (%symbol-macro-places-rewrite form env))
                    form))
+         (form (or (%dotimes-typed-counter form env) form))
          ;; Expanders see ENV (*%MACROEXPAND-ENV*, image only).  An ERROR from an
          ;; expander becomes the form's run-time behaviour: the same condition is
          ;; signalled when the form runs, and the function around it is still
@@ -8217,6 +8434,36 @@
 
 ;;; ------ Variable Reference ------
 
+(defun %runtime-fold-constant (name)
+  "After a RUNTIME DEFCONSTANT (a library loaded into the image): record NAME's value in
+   *CONSTANTS*, so code compiled from then on reads a literal -- COMPILE-VARIABLE-REF's
+   fold, which only build-time defconstants used to get.  Before this every use of a
+   library's constant was a checked global read: seal's ECM-MUL, the P-256 inner loop of
+   every TLS handshake, spent most of its time in %E2-SYMBOL-VALUE-CHECKED / %GV-CELL
+   reading +ECM-MASK+ and +ECM-BITS+ (sampled on a Pi Zero gateway, 2026-10-24).
+   Only values that are the SAME object wherever they appear are folded -- numbers,
+   characters, keywords, T and NIL; a string or list stays a read, because a literal
+   would be a copy and EQ to the constant's value would stop holding."
+  (let ((v (symbol-value name)))
+    (when (or (numberp v) (characterp v) (keywordp v) (eq v t) (null v))
+      (setf (gethash (normalize-name name) (%runtime-constants)) v))
+    name))
+
+;;; THE RUNTIME TABLE IS ITS OWN.  *CONSTANTS* is the build's table, and in the image a SETF
+;;; GETHASH on it does not stick (measured on the x64 CLI: store, read back NIL, count 0), so
+;;; runtime defconstants go here, made on first use -- through BOUNDP because a DEFVAR's
+;;; initform does not run in every image.
+(defvar *runtime-constants* nil)
+(defun %runtime-constants ()
+  (if (and (boundp '*runtime-constants*) (hash-table-p *runtime-constants*))
+      *runtime-constants*
+      (setq *runtime-constants* (make-hash-table :test 'eql))))
+(defun %runtime-constant (name)
+  "NAME's folded runtime-defconstant value, or :NOT-FOUND."
+  (if (and (boundp '*runtime-constants*) (hash-table-p *runtime-constants*))
+      (gethash (normalize-name name) *runtime-constants* :not-found)
+      :not-found))
+
 (defun compile-variable-ref (name env dest)
   "Compile a variable reference, placing result in DEST"
   (let ((binding (env-lookup env name)))
@@ -8230,6 +8477,7 @@
          ;; FP-resident local read in an untyped context: box it.  (Two
          ;; single-key clauses: the in-image ECASE does not take key lists.)
          (:fpreg (%emit-fpreg-box dest binding))
+         (:fpdreg (%emit-fpreg-box dest binding))
          (:fpvreg (%emit-fpreg-box dest binding))
          (:stack
           ;; Load from stack slot: load [VFP - (slot+1)*8]
@@ -8247,9 +8495,11 @@
       ((and *global-symbol-macros*
             (nth-value 1 (gethash (normalize-name name) *global-symbol-macros*)))
        (compile-form (gethash (normalize-name name) *global-symbol-macros*) env dest))
-      ;; Compile-time constant: fold to literal
-      ((let ((const-val (gethash (normalize-name name) *constants* :not-found)))
+      ;; Compile-time constant: fold to literal -- the build's, or a runtime DEFCONSTANT's
+      ((let ((const-val (let ((c (gethash (normalize-name name) *constants* :not-found)))
+                          (if (eq c :not-found) (%runtime-constant name) c))))
          (unless (eq const-val :not-found)
+           (%note-global name :ref)
            ;; Quote symbol constants to prevent them being treated as variables
            (if (and (symbolp const-val)
                     (not (null const-val))
@@ -8260,6 +8510,7 @@
            t)))
       ;; Global variable: emit call to symbol-value with name hash
       ((gethash (normalize-name name) *globals*)
+       (%note-global name :ref)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; mvm-eval production-eval semantics (WS3 flip): a global READ of a
            ;; name with NO binding in the symbol-value alist must signal
@@ -8284,7 +8535,9 @@
        ;; twice, on the same fix, for two different readers.  On the SBCL build
        ;; host *error-output* is stderr; in-image %init-streams now makes it a
        ;; real fd-2 stream (it used to be the stdout stream object itself).
-       (format *error-output* "~&  WARN: implicit global ~A~%" name)
+       (unless (%blob-defines-global-p name)   ; a forward reference, not a typo
+         (format *error-output* "~&  WARN: implicit global ~A~%" name))
+       (%note-global name :ref)
        (setf (gethash (normalize-name name) *globals*) t)
        (if (and *mvm-eval-runtime-p* (not *static-build-p*))  ; WS5: reproduce modus2-sb (static reads) for FNMAP crash-mapping
            ;; Same checked read as the registered-global branch above.
@@ -8336,7 +8589,7 @@
     "PRESENT-SYMBOL" "%MAKE-SYMBOL" "CCASE" "TAGBODY"
     "ARRAY-IN-BOUNDS-P" "FUNCALL" "%SETF-MEM-REF" "%IDIV-TRUNC"
     "IO-IN-BYTE" "XCHG-MEM" "WBINVD" "SWITCH-IDLE-STACK"
-    "MULTIPLE-VALUE-LIST" "%MAKE-CLOSURE" "SYSCALL3-RAW" "PROGN"
+    "MULTIPLE-VALUE-LIST" "%MAKE-CLOSURE" "%MAKE-CLOSURE3" "SYSCALL3-RAW" "PROGN"
     "WHEN" "DECLAIM" "LOGXOR" "RETURN-FROM"
     "ATOM" "%FLOAT-MUL" "RATIOP" "FUNCTION"
     "LET*" "UNLESS" "SAP-ADDRESS" "B"
@@ -8547,10 +8800,16 @@
            (compile-progn (cdr form) env dest)))
       ((= op-name 536263002)  ; LET
        (let* ((bindings (cadr form))
-              (body (cddr form))
+              ;; A LET that is itself a discarded statement discards its last
+              ;; form too: a trailing NIL makes that form an ordinary non-last
+              ;; one, which compile-progn marks unused (so a SETQ of an
+              ;; FP-resident local there stops boxing a value nobody reads --
+              ;; a 4-lane vector per pass of illatio's Q8_0 kernel loop).
+              (body (if (and (cddr form) (eq form *unused-value-form*))
+                        (append (cddr form) (list nil))
+                        (cddr form)))
               (declared (extract-special-vars body))
               (implicit
-                (if *let-skip-implicit-specials* nil
                     (let ((acc nil))
                       (dolist (b bindings)
                         (let ((var (if (consp b) (car b) b)))
@@ -8562,21 +8821,27 @@
                                                  :test #'string=)
                                          ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
-                                         (%runtime-special-p var))
+                                         (%proclaimed-special-p var))
                                      (not (member (normalize-name var) declared
                                                   :key #'normalize-name)))
                             (push var acc))))
-                      (nreverse acc))))
+                      (nreverse acc)))
               (specials (append declared implicit)))
          (if specials
              (compile-let-with-specials bindings body specials env dest)
              (compile-let bindings body env dest))))
       ((= op-name 431241200)  ; LET*
        (let* ((bindings (cadr form))
-              (body (cddr form))
+              ;; A LET* that is itself a discarded statement discards its last
+              ;; form too: a trailing NIL makes that form an ordinary non-last
+              ;; one, which compile-progn marks unused (so a SETQ of an
+              ;; FP-resident local there stops boxing a value nobody reads --
+              ;; a 4-lane vector per pass of illatio's Q8_0 kernel loop).
+              (body (if (and (cddr form) (eq form *unused-value-form*))
+                        (append (cddr form) (list nil))
+                        (cddr form)))
               (declared (extract-special-vars body))
               (implicit
-                (if *let-skip-implicit-specials* nil
                     (let ((acc nil))
                       (dolist (b bindings)
                         (let ((var (if (consp b) (car b) b)))
@@ -8588,11 +8853,11 @@
                                                  :test #'string=)
                                          ;; runtime defvar'd names (mvm-eval) —
                                          ;; see *runtime-special-names*
-                                         (%runtime-special-p var))
+                                         (%proclaimed-special-p var))
                                      (not (member (normalize-name var) declared
                                                   :key #'normalize-name)))
                             (push var acc))))
-                      (nreverse acc))))
+                      (nreverse acc)))
               (specials (append declared implicit)))
          (if specials
              (compile-let-with-specials bindings body specials env dest t)
@@ -8629,17 +8894,17 @@
            (compile-unless (cdr form) env dest)))
       ((= op-name 521850251)     (compile-loop (cdr form) env dest))  ; LOOP
       ;; %NAMED-LOOP — expand-cl-loop wraps NAMED LOOPs as
-      ;; (%NAMED-LOOP NAME BODY).  Establishes (block NAME …) AND binds
-      ;; *suppress-loop-block-nil* = t for the body so the inner simple-
-      ;; loop doesn't establish an implicit (block nil …) of its own —
-      ;; per CLHS 6.1.2.2, a NAMED LOOP's implicit block IS the named
-      ;; block, not nil.  Internal `(return nil)` from test-form exits
-      ;; still works via *loop-exit-label* fallback in compile-return.
+      ;; (%NAMED-LOOP NAME BODY) and establishes (block NAME …).  The inner
+      ;; simple loop does not establish its own (block nil …) -- per CLHS
+      ;; 6.1.2.2 a NAMED LOOP's implicit block IS the named block -- because
+      ;; GENERATE-LOOP-CODE puts the (%LOOP-NONIL) marker at its head, which
+      ;; scopes that to exactly the one loop.  (A *SUPPRESS-LOOP-BLOCK-NIL*
+      ;; special used to be bound here too: lexical, so inert, in the image;
+      ;; dynamic on the host, where it leaked to every LOOP nested inside.)
+      ;; Internal `(return nil)` from test-form exits still works via the
+      ;; *loop-exit-label* fallback in compile-return.
       ((= op-name 374453720)  ; %NAMED-LOOP
-       (let ((nl-name (cadr form))
-             (nl-body (cddr form)))
-         (let ((*suppress-loop-block-nil* t))
-           (compile-block nl-name nl-body env dest))))
+       (compile-block (cadr form) (cddr form) env dest))
       ((= op-name 232767877)   (compile-return (cadr form) env dest))  ; RETURN
       ((= op-name 372279278)    (compile-block (cadr form) (cddr form) env dest))  ; BLOCK
       ((= op-name 495377437)  (compile-tagbody (cdr form) env dest))  ; TAGBODY
@@ -8964,8 +9229,10 @@
               ;; …)`).  Test initform PRESENCE via (cddr form), not its value.
               (has-initform (consp (cddr form)))
               (name-hash (normalize-name var-name)))
+         (%note-global var-name :def)
          (setf (gethash name-hash *globals*) t)
          (%note-runtime-special name-hash)
+         (%note-build-special var-name)
          (when has-initform
            ;; %GLOBAL-NAME-KEY, not NAME-HASH: the STORE key must match what
            ;; a later read emits (task #241 -- a runtime-born package's
@@ -9156,9 +9423,16 @@
                     (list rname '() :report rfmt '(values nil t))
                     (list rname '() '(values nil t))))
           env dest)))
-      ;; IGNORE-ERRORS — compile body only
+      ;; IGNORE-ERRORS — CLHS: (handler-case (progn . body) (error (c) (values nil c))).
+      ;; This arm used to compile the body only, so in every AOT-compiled
+      ;; function IGNORE-ERRORS caught nothing: an unwritable FASL directory's
+      ;; FILE-ERROR escaped %FASL-PUT and aborted %DEFER-BOOT-SURFACES (no
+      ;; SB-EXT, no SB-THREAD) and every LOAD.
       ((= op-name 97207481)  ; IGNORE-ERRORS
-       (compile-progn (cdr form) env dest))
+       (let ((c (%mvm-gensym "IEC")))
+         (compile-form `(handler-case (progn ,@(cdr form))
+                          (error (,c) (values nil ,c)))
+                       env dest)))
       ;; UNWIND-PROTECT — protected form + cleanup, preserving MV state
       ;; (unwind-protect protected cleanup...)
       ;; Evaluates protected, saves MV state, runs cleanup forms,
@@ -9433,6 +9707,9 @@
       ;; %FLOAT-ADD / -SUB / -MUL / -DIV: 2-arg, both already IEEE-float
       ;; objects; emit the IR op which the per-arch translator implements
       ;; (SSE2 on x64, FPU on AArch64, soft-float helper on others).
+      ((and (= op-name 504441494) (eql +target-soft-float+ 1))  ; %FLOAT-ADD, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-add (cadr form) (caddr form)) env dest)))
       ((= op-name 504441494)  ; %FLOAT-ADD
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -9443,6 +9720,9 @@
            (emit-ir :gc-check)
            (emit-ir :fadd dest dest temp)
            (free-temp-reg))))
+      ((and (= op-name 99178435) (eql +target-soft-float+ 1))  ; %FLOAT-SUB, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-sub (cadr form) (caddr form)) env dest)))
       ((= op-name 99178435)  ; %FLOAT-SUB
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -9453,6 +9733,9 @@
            (emit-ir :gc-check)
            (emit-ir :fsub dest dest temp)
            (free-temp-reg))))
+      ((and (= op-name 241991203) (eql +target-soft-float+ 1))  ; %FLOAT-MUL, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-mul (cadr form) (caddr form)) env dest)))
       ((= op-name 241991203)  ; %FLOAT-MUL
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -9463,6 +9746,9 @@
            (emit-ir :gc-check)
            (emit-ir :fmul dest dest temp)
            (free-temp-reg))))
+      ((and (= op-name 503197892) (eql +target-soft-float+ 1))  ; %FLOAT-DIV, no FPU
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-form (list '%sf-div (cadr form) (caddr form)) env dest)))
       ((= op-name 503197892)  ; %FLOAT-DIV
        (when (arity-ok-p form 2 2 env dest)
          (let ((a (cadr form)) (b (caddr form)) (temp (alloc-temp-reg)))
@@ -9474,6 +9760,12 @@
            (emit-ir :fdiv dest dest temp)
            (free-temp-reg))))
       ;; %FLOAT-FROM-INT — tagged integer → fresh float object.
+      ((and (= op-name 345394287) (eql +target-soft-float+ 1))  ; %FLOAT-FROM-INT, no FPU
+       (when (arity-ok-p form 1 1 env dest)
+         (compile-form (list '%sf-itof (cadr form)) env dest)))
+      ((and (= op-name 458033090) (eql +target-soft-float+ 1))  ; %FLOAT-TO-INT, no FPU
+       (when (arity-ok-p form 1 1 env dest)
+         (compile-form (list '%sf-ftoi (cadr form)) env dest)))
       ((= op-name 345394287)  ; %FLOAT-FROM-INT
        (when (arity-ok-p form 1 1 env dest)
          (compile-form (cadr form) env dest)
@@ -9780,8 +10072,21 @@
       ((= op-name 142644612)  ; %MAKE-CLOSURE
        (when (arity-ok-p form 2 2 env dest)
          (compile-make-closure (cadr form) (caddr form) env dest)))
+      ;; (%make-closure3 fn env): the same closure plus a THIRD slot, NIL, that
+      ;; the interpreter uses to cache the closure's native trampoline (see
+      ;; %MVM-WRAP-ESCAPING in interp.lisp).  Native code reads slots 0 and 1
+      ;; only, and every collector sizes an object by its header.
+      ((= op-name #.(compute-name-hash "%MAKE-CLOSURE3"))
+       (when (arity-ok-p form 2 2 env dest)
+         (compile-make-closure (cadr form) (caddr form) env dest 3)))
 
       ;; --- Array Operations ---
+      ;; (MAKE-ARRAY N :ELEMENT-TYPE 'SINGLE-FLOAT [:INITIAL-ELEMENT 0.0]),
+      ;; N a literal: the zero-filled packed vector inline (zero bits are
+      ;; 0.0), not the runtime MAKE-ARRAY call -- a kernel's small scratch
+      ;; array cost more than its loop
+      ((and (= op-name 17023737) (%f32-make-array-count form))
+       (compile-alloc-f32 (%f32-make-array-count form) env dest))
       ((= op-name 17023737)       (compile-make-array form env dest))  ; MAKE-ARRAY
       ;; %MAKE-STRING-ARRAY — like make-array but with string subtag
       ((= op-name #.(compute-name-hash "%MAKE-STRING-ARRAY"))
@@ -9902,6 +10207,13 @@
        (compile-u8-ref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%U8-SET"))
        (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest))
+      ;; Byte access to a vector whose LENGTH is not counted in bytes (the
+      ;; 32-bit f32 lane helpers address byte 4I+k of an N-lane vector), so
+      ;; the element bounds check would reject every lane past 0.
+      ((= op-name #.(compute-name-hash "%U8-REF-UNCHECKED"))
+       (compile-u8-ref (cadr form) (caddr form) env dest nil))
+      ((= op-name #.(compute-name-hash "%U8-SET-UNCHECKED"))
+       (compile-u8-set (cadr form) (caddr form) (cadddr form) env dest nil))
       ((= op-name #.(compute-name-hash "%C32-REF"))
        (compile-c32-ref (cadr form) (caddr form) env dest))
       ((= op-name #.(compute-name-hash "%C32-SET"))
@@ -10070,7 +10382,15 @@
 
       ;; THE — (the type form) → compile form, ignore type declaration
       ((= op-name 425658086)  ; THE
-       (compile-form (caddr form) env dest))
+       (let ((plan (%fp-toi-plan form env)))
+         (if plan
+             ;; (the <int of <= 62 bits> (round x)): FCVTNS & co. on the tree
+             (destructuring-bind (kind sub x) plan
+               (let ((fd (alloc-fp-reg)))
+                 (if (eq kind :single) (compile-float-unboxed x env fd) (compile-double-unboxed x env fd))
+                 (emit-ir :fp-toi dest fd (if (eq kind :single) sub (+ sub 4)))
+                 (free-fp-reg)))
+             (compile-form (caddr form) env dest))))
 
       ;; DECLARE — skip when found in non-declaration position
       ((= op-name 133791479)  ; DECLARE
@@ -10296,6 +10616,7 @@
        ;; Still a runtime no-op, but DECLAIM/PROCLAIM carry the optimize
        ;; policy, so read the level out on the way past.
        (%declaim-note-optimize form)
+       (unless *mvm-eval-runtime-p* (%declaim-note-special-build form))
        (when *mvm-eval-runtime-p*
          (%declaim-note-inline form)
          (%declaim-note-type form)
@@ -10314,6 +10635,8 @@
 
 (defun compile-quote (value dest)
   "Compile (quote VALUE)."
+  (when (and *quote-uses* (not *mvm-eval-runtime-p*))
+    (%note-quoted value 0))
   (cond
     ((null value)
      (compile-nil dest))
@@ -12214,7 +12537,7 @@
     ;; Intern into MODUS.MVM when that package is resolvable (build-time
     ;; SBCL host), else fall back to *package* — which IS MODUS.MVM during
     ;; a normal compile.  CRITICAL for self-hosted / in-image eval (mvm-eval):
-    ;; there `(find-package "MODUS.MVM")` returns NIL (the package table
+    ;; there `(%build-mvm-package)` returns NIL (the package table
     ;; isn't populated in-image), so the old `(intern name :modus.mvm)`
     ;; returned NIL — the cell-rewrite then produced `(car NIL)` / `(set-car
     ;; NIL …)`, compile-lambda saw NO captured var (NIL isn't a variable),
@@ -12222,7 +12545,38 @@
     ;; NIL "cell" SIGSEGV'd.  The fallback keeps the binding symbol and every
     ;; reference EQ within one compile, which is all cell indirection needs."
     (intern (concatenate 'string "%CELL-" base)
-            (or (find-package "MODUS.MVM") *package*))))
+            (or (%build-mvm-package) *package*))))
+
+(defun %setter-pkg (acc)
+  "Package a generated SET-<ACC> writer name is interned in.  At build time,
+   ACC's own home when that is an ordinary package -- where DEFSTRUCT now puts
+   the writer it defines (*DEFSTRUCT-HOME*) -- so (setf (code-buffer-bytes b) x)
+   read in MODUS.ASM calls MODUS.ASM::SET-CODE-BUFFER-BYTES directly instead of
+   reaching it through the bare-name fallback.  A CL accessor (CHAR, AREF) and
+   all runtime compiles keep the historic order, MODUS.MVM first."
+  (let* ((p (and (symbolp acc) (symbol-package acc)))
+         (pn (and p (package-name p))))
+    (if (and (not *mvm-eval-runtime-p*) pn (not (%fn-key-ansi-pkg-p pn)))
+        p
+        (or (%build-mvm-package)
+            (and (symbolp acc) (symbol-package acc))
+            *package*))))
+
+(defvar *defstruct-home* nil
+  "Build time: the package a DEFSTRUCT being expanded was READ in, i.e. its
+   name's home package, or NIL.  The host compiles every form with *PACKAGE*
+   = MODUS.MVM, so without this a struct read in MODUS.ASM got MODUS.MVM
+   accessors and the assembler's own calls to them resolved only through the
+   bare-name fallback (builder packages step 2).")
+
+(defun %defstruct-home-pkg (name-and-options)
+  "The package DEFSTRUCT's generated names belong in at build time: the struct
+   name's home, unless that is a standard package (a struct named by a CL
+   symbol must not intern new names into COMMON-LISP)."
+  (let* ((sym (if (consp name-and-options) (car name-and-options) name-and-options))
+         (p (and (symbolp sym) (symbol-package sym)))
+         (pn (and p (package-name p))))
+    (and pn (not (%fn-key-ansi-pkg-p pn)) p)))
 
 (defun %defstruct-intern (name)
   "Intern NAME for a DEFSTRUCT-generated symbol (constructor / accessor /
@@ -12244,7 +12598,7 @@
    decoder got an FFV1 struct."
   (let ((sym (intern name (if *mvm-eval-runtime-p*
                               *package*
-                              (or (find-package "MODUS.MVM") *package*)))))
+                              (or *defstruct-home* (%build-mvm-package) *package*)))))
     ;; A generated accessor, constructor or predicate that is COMMON-LISP's
     ;; own function -- (:CONC-NAME NIL) over a slot named HASH-TABLE-SIZE.
     (%check-package-lock sym "a structure's function")
@@ -12980,16 +13334,15 @@
   ;; ordinary lexical LET/LET*.  (References to the free-declared specials
   ;; already compile as global accesses: they are not let variables.)
   (when (null specials)
-    (let ((*let-skip-implicit-specials* t))
-      (return-from compile-let-with-specials
-        (compile-form (if sequential
-                          `(let* ,bindings ,@(%special-shadow-body
-                                              %all-declared-specials env
-                                              (or (strip-declares body) (list nil))))
-                          `(let ,bindings ,@(%special-shadow-body
-                                             %all-declared-specials env
-                                             (or (strip-declares body) (list nil)))))
-                      env dest))))
+    (return-from compile-let-with-specials
+      (compile-form (if sequential
+                        `(let* ,bindings ,@(%special-shadow-body
+                                            %all-declared-specials env
+                                            (or (strip-declares body) (list nil))))
+                        `(let ,bindings ,@(%special-shadow-body
+                                           %all-declared-specials env
+                                           (or (strip-declares body) (list nil)))))
+                    env dest)))
   (let* ((special-names (mapcar (lambda (s) (normalize-name s)) specials))
          (save-vars (mapcar (lambda (s) (%mvm-gensym (concatenate 'string "SAVE-" (symbol-name s)))) specials))
          (special-bindings nil))
@@ -13103,8 +13456,7 @@
             ;; binding must be visible to LATER inits (CLHS let*), so
             ;; each special's set-symbol-value is interleaved right
             ;; after its temp via a dummy binding.
-            (let ((*let-skip-implicit-specials* t)
-                  (seq-bindings
+            (let ((seq-bindings
                     (mapcan (lambda (b rb)
                               (let ((var (if (consp b) (car b) b)))
                                 (let ((pos (position (normalize-name var) special-names)))
@@ -13125,8 +13477,7 @@
             ;; let context: combine renamed bindings + save bindings into a
             ;; single let* (inits can't see each other — temps are gensyms),
             ;; then set the globals, run body, restore.
-            (let ((all-bindings (append renamed-bindings save-bindings))
-                  (*let-skip-implicit-specials* t))
+            (let ((all-bindings (append renamed-bindings save-bindings)))
               (compile-form
                 `(let* ,all-bindings
                    ;; EMPTY BODY: the protected PROGN must still yield NIL, not
@@ -13384,10 +13735,15 @@
 ;;; emits FP-pool code, so the pool survives a collection by construction.
 
 (defun %fp-type-kind (ty)
-  ":scalar for SINGLE-FLOAT, :vector for F32V-PACK / (simple-array
-   single-float (4)), else NIL."
+  ":scalar for SINGLE-FLOAT, :dscalar for DOUBLE-FLOAT, :vector for
+   F32V-PACK / (simple-array single-float (4)), else NIL."
   (let ((ty (%resolve-declared-type ty)))
     (cond ((and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")) :scalar)
+          ;; a double in the same FP register (its D view): the targets with
+          ;; the FPD ops only, like every unboxed double tree
+          ((and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")
+                (or *mvm-eval-runtime-p* *target-has-fpd-p*))
+           :dscalar)
           ((and (symbolp ty) ty (string= (symbol-name ty) "F32V-PACK")) :vector)
           ((and (symbolp ty) ty (string= (symbol-name ty) "VI-PACK")) :ivector)   ; integer lanes (2b)
           ((and (consp ty) (symbolp (car ty))
@@ -13419,11 +13775,14 @@
         (let ((r (env-extend-stack new var)))
           (setq new (car r))
           ;; %expr-width is only defined on symbols / compound forms
-          (when (or (integerp init)
-                    (and (or (and init (symbolp init)) (consp init))
-                         (%expr-width init env)))
-            (let ((bb (car (compile-env-bindings new))))
-              (setf (binding-dtype bb) 'fixnum))))))
+          (cond ((or (integerp init)
+                     (and (or (and init (symbolp init)) (consp init))
+                          (%expr-width init env)))
+                 (let ((bb (car (compile-env-bindings new))))
+                   (setf (binding-dtype bb) 'fixnum)))
+                ((%inferred-single-local-p var init bindings (strip-declares body) env)
+                 (let ((bb (car (compile-env-bindings new))))
+                   (setf (binding-dtype bb) 'single-float)))))))
     (%apply-declared-types new body)
     new))
 
@@ -13441,6 +13800,17 @@
           (let ((n (symbol-name op)))
             (cond
               ((string= n "QUOTE") t)
+              ;; THE: the TYPE is not code; (the <int> (round x)) of a tree is fp-toi
+              ((string= n "THE")
+               (and (consp (cdr form)) (consp (cddr form))
+                    (or (%fp-toi-plan form env)
+                        (%fp-scope-call-free-p (caddr form) env (1+ depth)))))
+              ;; a comparison of two float trees compiles to fp-cmp / fpd-lt
+              ((and (member n '("<" ">" "<=" ">=") :test #'string=)
+                    (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+                    (or (and (%fp-tree-need (cadr form) env) (%fp-tree-need (caddr form) env))
+                        (and (%fpd-pure-need (cadr form) env) (%fpd-pure-need (caddr form) env))))
+               t)
               ((member n *fp-scope-transparent-ops* :test #'string=)
                (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form)))
               ((or (string= n "LET") (string= n "LET*"))
@@ -13454,10 +13824,12 @@
                                   (strip-declares (cddr form)))))))
               ;; The simple LOOP (every subform a cons — no loop keywords) is
               ;; compiled natively; walk its body.  An extended LOOP (for /
-              ;; collect …) has symbol subforms and is rejected.
+              ;; sum …) is judged by its expansion, which is what compiles.
               ((string= n "LOOP")
-               (and (every #'consp (cdr form))
-                    (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form))))
+               (if (every #'consp (cdr form))
+                   (every (lambda (f) (%fp-scope-call-free-p f env (1+ depth))) (cdr form))
+                   (let ((x (handler-case (expand-cl-loop (cdr form)) (error () nil))))
+                     (and x (%fp-scope-call-free-p x env (1+ depth))))))
               ;; INCF / DECF of a lexical width-typed variable by an integer or
               ;; width-typed delta compiles inline.
               ((or (string= n "INCF") (string= n "DECF"))
@@ -13478,9 +13850,26 @@
                       (or (integerp count)
                           (and (or (and count (symbolp count)) (consp count))
                                (%expr-width count env))))
-                    (let ((inner (%fp-scope-extend-let env (list (list (caadr form) 0)) nil)))
+                    (let ((inner (%fp-scope-extend-let
+                                  env (list (list (caadr form) 0))
+                                  ;; the counter's width is the count's (see compile-dotimes)
+                                  (let ((ty (%dotimes-counter-type (cadadr form) env)))
+                                    (and ty (list (list 'declare (list 'type ty (caadr form)))))))))
                       (every (lambda (f) (%fp-scope-call-free-p f inner (1+ depth)))
                              (append (cddadr form) (strip-declares (cddr form)))))))
+              ;; (LENGTH v) of a declared simple array is one ARRAY-LEN (a
+              ;; LOOP's BELOW (LENGTH v) sits inside any scope around the LOOP)
+              ((string= n "LENGTH")
+               (and (consp (cdr form)) (null (cddr form)) (symbolp (cadr form))
+                    (or (%declared-f32-array-var-p (cadr form) env)
+                        (%declared-u8-array-var-p (cadr form) env)
+                        (%declared-generic-array-var-p (cadr form) env))
+                    t))
+              ;; (VALUES x): one value is X itself (LOOP returns a SUM's
+              ;; accumulator through it, so every typed LOOP SUM was boxed)
+              ((string= n "VALUES")
+               (and (consp (cdr form)) (null (cddr form))
+                    (%fp-scope-call-free-p (cadr form) env (1+ depth))))
               ((string= n "SETQ")
                (and (consp (cdr form)) (symbolp (cadr form))
                     (env-lookup env (cadr form))            ; lexical only (a global setq calls)
@@ -13488,6 +13877,11 @@
                     (%fp-scope-call-free-p (caddr form) env (1+ depth))))
               ;; float / vector trees compile inline (all-float operands)
               ((%fp-tree-need form env) t)
+              ;; a double tree too, where the FPD ops exist (no conversion
+              ;; calls: %FPD-PURE-NEED hoists nothing)
+              ((and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+                    (%fpd-pure-need form env))
+               t)
               ((%v4-tree-need form env) t)
               ((string= n "%F32V-SET")
                (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
@@ -13509,7 +13903,10 @@
                (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                     (symbolp (cadr form))
                     (or (%declared-f32-array-var-p (cadr form) env)
-                        (%declared-generic-array-var-p (cadr form) env))
+                        (%declared-generic-array-var-p (cadr form) env)
+                        ;; a declared byte vector's AREF is one u8 load too (a
+                        ;; K-quant kernel reads its scales beside its lanes)
+                        (%declared-u8-array-var-p (cadr form) env))
                     (%simple-index-form-p (caddr form))))
               ((string= n "SETF")
                ;; (setf (aref A i) v): declared A, simple i; an f32 store needs
@@ -13543,18 +13940,70 @@
 ;; be DEFVAR'd before its first LET in file order, or the host compile binds
 ;; it lexically and the value never reaches the reader.
 
+(defun %form-setqs-var-p (var form depth)
+  "T when FORM, macroexpanded the way the FP-scope walker does, may contain a
+   (SETQ VAR ...).  SETF / INCF / PSETQ of a variable all expand to SETQ, and
+   a call-free scope holds nothing else that assigns.  Conservative: too
+   deep, or a macro that does not expand, counts as an assignment."
+  (cond ((> depth 80) t)
+        ((atom form) nil)
+        ((not (symbolp (car form)))
+         (some (lambda (f) (%form-setqs-var-p var f (1+ depth))) form))
+        ((name-eq (car form) "QUOTE") nil)
+        ((name-eq (car form) "SETQ")
+         (let ((cur (cdr form)) (hit nil))
+           (loop (when (or hit (not (consp cur))) (return hit))
+             (when (eq (car cur) var) (setq hit t))
+             (when (and (consp (cdr cur)) (%form-setqs-var-p var (cadr cur) (1+ depth)))
+               (setq hit t))
+             (setq cur (cddr cur)))))
+        (t
+         (let ((r (handler-case (%macroexpand-1-mvm-raw form) (error () :fail))))
+           (cond ((eq r :fail) t)
+                 ((and (consp r) (cdr r)) (%form-setqs-var-p var (car r) (1+ depth)))
+                 (t (some (lambda (f) (%form-setqs-var-p var f (1+ depth)))
+                          (cdr form))))))))
+
+(defun %form-mentions-any-p (syms form)
+  "T when any symbol of SYMS occurs anywhere in FORM.  (It was named
+   %FORM-MENTIONS-P, as is the one-symbol test %FIRST-OPERAND-REG uses; that
+   later DEFUN won, so this guard compared INIT's subforms to the list itself
+   and never fired.)"
+  (cond ((symbolp form) (and form (member form syms) t))
+        ((consp form) (or (%form-mentions-any-p syms (car form))
+                          (%form-mentions-any-p syms (cdr form))))
+        (t nil)))
+
+(defun %inferred-single-local-p (var init bindings body env)
+  "T when an UNDECLARED LET variable VAR is provably a single-float for its
+   whole scope: INIT is a single-float tree (evaluated in ENV, so it may not
+   mention the LET's own variables, which a LET* would rebind first) and
+   nothing in BODY assigns VAR.  Such a variable is FP-resident like a
+   declared one: (let ((x (abs (aref a i)))) (when (> x m) ...)) needed a
+   declaration to stay unboxed."
+  (and init (consp init)
+       (%expr-single-float-p init env)
+       (%fp-tree-need init env)
+       (not (%form-mentions-any-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
+                              init))
+       (notany (lambda (f) (%form-setqs-var-p var f 0)) body)))
+
 (defun %let-fp-kinds (bindings decl-body body env)
   "For a LET: an array of :scalar / :vector / NIL per binding when at least
    one variable is a declared float/vector local AND the body is call-free
    AND *mvm-eval-runtime-p*; else NIL."
-  (when (and (or *mvm-eval-runtime-p* *fp-locals-force*) (consp bindings))
+  (when (and (or *mvm-eval-runtime-p* *fp-locals-force* *target-has-fpd-p*) (consp bindings))
     (let* ((pairs (%declared-types decl-body))
            (kinds (make-array (length bindings) :initial-element nil))
            (any nil) (i 0))
       (dolist (b bindings)
         (let* ((var (if (consp b) (car b) b))
                (pair (find var pairs :key #'car :test #'equal))
-               (k (and pair (%fp-type-kind (cdr pair)))))
+               (k (if pair
+                      (%fp-type-kind (cdr pair))
+                      (and (consp b) (consp (cdr b))
+                           (%inferred-single-local-p var (cadr b) bindings body env)
+                           :scalar))))
           (when k (setf (aref kinds i) k) (setq any t)))
         (setq i (+ i 1)))
       (and any
@@ -13565,10 +14014,36 @@
              (error () nil))
            kinds))))
 
+(defun %fp-kind-dtype (kind)
+  "The binding dtype of an FP-resident local of KIND."
+  (cond ((eq kind :ivector) 'vi-pack)
+        ((eq kind :vector) 'f32v-pack)
+        ((eq kind :dscalar) 'double-float)
+        (t 'single-float)))
+
+(defun %fp-kind-location (kind)
+  "The binding location of an FP-resident local of KIND."
+  (cond ((or (eq kind :vector) (eq kind :ivector)) :fpvreg)
+        ((eq kind :dscalar) :fpdreg)
+        (t :fpreg)))
+
+(defun %compile-double-into-fpreg (val env f)
+  "Land the double VAL in FP vreg F: a pure double tree (no conversion calls,
+   which would clobber FP registers) directly, anything else boxed by the
+   generic path and unboxed."
+  (if (%fpd-pure-need val env)
+      (compile-double-unboxed val env f)
+      (let ((tmp (alloc-temp-reg)))
+        (compile-form val env tmp)
+        (emit-ir :fpd-unbox f tmp)
+        (free-temp-reg))))
+
 (defun %compile-init-into-fpreg (val env f kind)
   "Land VAL (evaluated in ENV) in FP vreg F as an unboxed KIND value."
   (when (eq kind :ivector)
     (return-from %compile-init-into-fpreg (compile-vi-unboxed val env f)))
+  (when (eq kind :dscalar)
+    (return-from %compile-init-into-fpreg (%compile-double-into-fpreg val env f)))
   (if (eq kind :scalar)
       (if (%fp-tree-fits-p val env)
           (compile-float-unboxed val env f)
@@ -13586,12 +14061,14 @@
 
 (defun %emit-fpreg-box (dest binding)
   "DEST ← the boxed value of the FP-resident BINDING."
-  (if (eq (binding-location binding) :fpvreg)
-      (%emit-v4-box dest (binding-reg binding))
-      (progn (emit-ir :gc-check)
-             (emit-ir :fp-box dest (binding-reg binding)))))
+  (case (binding-location binding)
+    (:fpvreg (%emit-v4-box dest (binding-reg binding)))
+    (:fpdreg (emit-ir :gc-check)
+             (emit-ir :fpd-box dest (binding-reg binding)))
+    (t (emit-ir :gc-check)
+       (emit-ir :fp-box dest (binding-reg binding)))))
 
-(defun compile-let (bindings body env dest)
+(defun %compile-let-1 (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
   ;; Cell-boxing: detect variables that are mutated inside lambdas in body.
@@ -13642,7 +14119,7 @@
              ;; captured local as before.
              (sm (mapcar (lambda (c) `(,(car c) (car ,(cdr c)))) cells))
              (combined-bindings (append non-boxed-bindings cell-bindings)))
-        (return-from compile-let
+        (return-from %compile-let-1
           (compile-form `(let ,combined-bindings (symbol-macrolet ,sm ,@body-stripped))
                         env dest)))))
   (check-frame-overflow (length bindings) "let" env)
@@ -13736,8 +14213,9 @@
                  :bindings (cons (cond
                                    ((aref fp-regs i)
                                     (make-binding :name var
-                                                  :location (if (member (aref fp-kinds i) '(:vector :ivector)) :fpvreg :fpreg)
-                                                  :reg (aref fp-regs i)))
+                                                  :location (%fp-kind-location (aref fp-kinds i))
+                                                  :reg (aref fp-regs i)
+                                                  :dtype (%fp-kind-dtype (aref fp-kinds i))))
                                    (reg
                                     (make-binding :name var :location :reg :reg reg))
                                    (t
@@ -13767,7 +14245,7 @@
     (when (> n-bindings 0)
       (emit-ir :frame-free n-bindings))))
 
-(defun compile-let* (bindings body env dest)
+(defun %compile-let*-1 (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
   ;; Cell-boxing: detect variables that are mutated inside lambdas in
@@ -13801,7 +14279,7 @@
                         `(progn ,@body-stripped)))
              ;; A fresh cell symbol: see compile-let.
              (cell (%mvm-gensym (symbol-name (cell-var-name var)))))
-        (return-from compile-let*
+        (return-from %compile-let*-1
           (compile-form `(let* (,@before (,cell (cons ,init nil)))
                            (symbol-macrolet ((,var (car ,cell)))
                              ,inner))
@@ -13847,14 +14325,14 @@
             ((and fp-kinds (aref fp-kinds i) (< *fp-reg-counter* +fp-reg-max+))
              (let* ((kind (aref fp-kinds i))
                     (f (alloc-fp-reg))
-                    (dty (case kind (:ivector 'vi-pack) (:vector 'f32v-pack) (t 'single-float))))
+                    (dty (%fp-kind-dtype kind)))
                (%compile-init-into-fpreg val new-env f kind)
                (setq n-fp (+ n-fp 1))
                (setq new-env
                      (make-compile-env
                       :bindings (cons (make-binding
                                        :name var
-                                       :location (if (member kind '(:vector :ivector)) :fpvreg :fpreg)
+                                       :location (%fp-kind-location kind)
                                        :reg f :dtype dty)
                                       (compile-env-bindings new-env))
                       :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
@@ -13951,9 +14429,10 @@
   ;; directly; a non-tree value is boxed then unboxed; DEST (the setq
   ;; value) is boxed only when wanted.
   (let ((fb (env-lookup env var)))
-    (when (and fb (member (binding-location fb) '(:fpreg :fpvreg)))
+    (when (and fb (member (binding-location fb) '(:fpreg :fpdreg :fpvreg)))
       (%compile-init-into-fpreg val env (binding-reg fb)
-                                (if (eq (binding-location fb) :fpvreg) :vector :scalar))
+                                (case (binding-location fb)
+                                  (:fpvreg :vector) (:fpdreg :dscalar) (t :scalar)))
       ;; box the assignment's value only when some consumer will read DEST
       (if (and dest (not *setq-value-unused*))
           (%emit-fpreg-box dest fb)
@@ -13990,11 +14469,14 @@
           (compile-form `(setf ,(binding-expansion binding) ,val) env dest))))
       ;; Global variable: emit call to set-symbol-value
       ((gethash (normalize-name var) *globals*)
+       (%note-global var :ref)
        (%compile-setq-global var dest))
       (t
        ;; Implicit global for setq
        ;; See the companion note at the implicit-global read site above.
-       (format *error-output* "~&  WARN: implicit global setq ~A~%" var)
+       (unless (%blob-defines-global-p var)    ; a forward reference, not a typo
+         (format *error-output* "~&  WARN: implicit global setq ~A~%" var))
+       (%note-global var :ref)
        (setf (gethash (normalize-name var) *globals*) t)
        (%compile-setq-global var dest)))))
 
@@ -14440,9 +14922,13 @@
             (emit-ir :li-const +vreg-v2+ (%e2-const-register site))
             (when *mvm-emit-halves* (emit-ir :set-nargs 3))
             (emit-ir :call "%E2-SYMBOL-VALUE-SITE" 3))
+          ;; The cell is known: the armed read asks only for this thread's
+          ;; binding, not the table probe (%GV-CELL was 30% of a threaded
+          ;; board's samples).
           (progn
-            (when *mvm-emit-halves* (emit-ir :set-nargs 2))
-            (emit-ir :call "%E2-SYMBOL-VALUE-CHECKED" 2)))
+            (emit-ir :li-const +vreg-v2+ (%e2-const-register cell))
+            (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+            (emit-ir :call "%E2-SYMBOL-VALUE-CELL" 3)))
       (unless (= dest +vreg-vr+)
         (emit-ir :mov dest +vreg-vr+))
       (emit-ir-label done)
@@ -15685,7 +16171,7 @@
                  ;; asdf gauntlet form 52; any capturing flet under eval).
                  (cell-sym (intern (format nil "%FLETCELL-~A$$~D"
                                            base-name (make-compiler-label))
-                                   (or (find-package "MODUS.MVM") *package*))))
+                                   (or (%build-mvm-package) *package*))))
             (push name local-names)
             (push cell-sym cell-names)
             (push (list name (cadr def) (cddr def) cell-sym) defs-data))))
@@ -15876,12 +16362,6 @@
                  262800624))))  ; BEING
 
 
-;;; (defvar *suppress-loop-block-nil*) — declared near top of file
-;;; before compile-form so SBCL treats `(let ((*suppress-loop-block-nil*
-;;; t)) …)` as a dynamic binding.  Used here by compile-loop's
-;;; simple-loop branch to skip the implicit (nil exit dest) push when a
-;;; NAMED LOOP is wrapping us.
-
 (defun compile-loop (body env dest)
   "Simple LOOP: tracks the loop nesting depth for register promotion of
    LET variables bound inside the body (see %let-promotion-plan)."
@@ -15913,7 +16393,7 @@
    nested in the body still gets its own BLOCK NIL."
   (let ((nonil (and (consp body) (%loop-nonil-marker-p (car body)))))
     (when nonil (setq body (cdr body)))
-    (%compile-loop-2 body env dest (or nonil *suppress-loop-block-nil*))))
+    (%compile-loop-2 body env dest nonil)))
 
 (defun %compile-loop-2 (body env dest suppress-nil)
   "Body of %COMPILE-LOOP-1; SUPPRESS-NIL says whether to skip the implicit
@@ -16082,7 +16562,8 @@
   by-form         ; step amount (for :from)
   list-var        ; internal temp var (for :in, :on, :across, :hash-*, :pkg-*)
   and-p           ; introduced by AND: steps in PARALLEL with its group
-  pre-binds)      ; :from temps bound just before VAR (sequential clauses)
+  pre-binds       ; :from temps bound just before VAR (sequential clauses)
+  type)           ; the variable's OF-TYPE (or bare) type spec, or NIL
 
 (defun %loop-try-of-type (rest)
   "If REST starts with OF-TYPE typespec, return (typespec . new-rest).
@@ -16267,7 +16748,7 @@
    caller gets one object for one accumulator.  The suffix carries a `%\' for
    the same reason %MVM-GENSYM\'s does: it cannot collide with a source name."
   (intern (concatenate 'string (symbol-name v) "%LTAIL")
-          (or (find-package "MODUS.MVM")
+          (or (%build-mvm-package)
               (find-package "COMMON-LISP-USER")
               *package*)))
 
@@ -16574,6 +17055,7 @@
           ((or (= kw 111940908) (= kw 252922277)  ; FOR AS
                (= kw 460426964))  ; AND
            (let ((var (cadr rest))
+                 (for-type nil)          ; OF-TYPE / bare type of a simple VAR
                  (destr-pairs nil))      ; list of (component . accessor-on-gensym)
              (setf rest (cddr rest))
              ;; FOR NIL is the "dummy iterator" — discard value via gensym
@@ -16660,9 +17142,11 @@
                       (setf destr-pairs (%loop-destr-pairs components g))
                       (setf var g))))))
              (when (and var (not (consp var)) rest)
-             ;; Skip OF-TYPE type-spec — we ignore type declarations.
+             ;; OF-TYPE type-spec: kept for a numeric FOR (see the :FROM
+             ;; emission), otherwise ignored.
              (when (and (symbolp (car rest))
                         (= (normalize-name (car rest)) 490334619))  ; OF-TYPE
+               (setf for-type (cadr rest))
                (setf rest (cddr rest)))
              ;; Skip BARE type symbol (FIXNUM, T, FLOAT, STRING, ...) —
              ;; CLHS bare-type shorthand for OF-TYPE.  Two triggers:
@@ -16692,6 +17176,7 @@
                                  (not (cl-loop-keyword-p (car rest)))
                                  (symbolp (cadr rest))
                                  (cl-loop-keyword-p (cadr rest)))))
+               (setf for-type (car rest))
                (setf rest (cdr rest)))
              (when (and var (not (consp var)) rest)
              (let ((iter-kw (normalize-name (car rest))))
@@ -16808,7 +17293,8 @@
                                             :end-form end-form
                                             :end-test end-test
                                             :by-form by-form
-                                            :pre-binds (if seq binds nil))
+                                            :pre-binds (if seq binds nil)
+                                            :type for-type)
                             (loop-state-iterations state)))))
 
                  ;; FOR var IN list [BY step-fn]
@@ -17235,30 +17721,40 @@
              (setf rest (cddr rest))
              ;; Optional type-spec (OF-TYPE x, or a bare simple-type-spec)
              ;; before and after INTO, exactly as SUM / COUNT take it.
-             (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
-               (when ot (setf rest (cdr ot))))
-             (let ((iv (%loop-try-into rest)))
-               (when iv
-                 (let ((ot2 (%loop-try-of-type (cddr iv))))
-                   (when ot2 (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
-               (when iv (setf rest (cddr iv)))
-               (push (if iv (list :maximize expr (car iv)) (list :maximize expr))
-                     (loop-state-accumulator state)))))
+             ;; The type is kept: a typed clause gets a declared accumulator
+             ;; (%LOOP-ACC-DECLARABLE-TYPE, %LOOP-MAXMIN-STMT).
+             (let ((type-spec nil))
+               (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
+                 (when ot (setf type-spec (car ot) rest (cdr ot))))
+               (let ((iv (%loop-try-into rest)))
+                 (when iv
+                   (let ((ot2 (%loop-try-of-type (cddr iv))))
+                     (when ot2
+                       (setf type-spec (car ot2))
+                       (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
+                 (when iv (setf rest (cddr iv)))
+                 (push (list :maximize expr (and iv (car iv)) type-spec)
+                       (loop-state-accumulator state))))))
 
           ((or (= kw 470771431) (= kw 18723802))  ; MINIMIZE
            (let ((expr (cadr rest)))
              (setf rest (cddr rest))
              ;; Optional type-spec (OF-TYPE x, or a bare simple-type-spec)
              ;; before and after INTO, exactly as SUM / COUNT take it.
-             (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
-               (when ot (setf rest (cdr ot))))
-             (let ((iv (%loop-try-into rest)))
-               (when iv
-                 (let ((ot2 (%loop-try-of-type (cddr iv))))
-                   (when ot2 (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
-               (when iv (setf rest (cddr iv)))
-               (push (if iv (list :minimize expr (car iv)) (list :minimize expr))
-                     (loop-state-accumulator state)))))
+             ;; The type is kept: a typed clause gets a declared accumulator
+             ;; (%LOOP-ACC-DECLARABLE-TYPE, %LOOP-MAXMIN-STMT).
+             (let ((type-spec nil))
+               (let ((ot (or (%loop-try-of-type rest) (%loop-try-bare-type rest))))
+                 (when ot (setf type-spec (car ot) rest (cdr ot))))
+               (let ((iv (%loop-try-into rest)))
+                 (when iv
+                   (let ((ot2 (%loop-try-of-type (cddr iv))))
+                     (when ot2
+                       (setf type-spec (car ot2))
+                       (setf iv (list* (car iv) (cadr iv) (cdr ot2))))))
+                 (when iv (setf rest (cddr iv)))
+                 (push (list :minimize expr (and iv (car iv)) type-spec)
+                       (loop-state-accumulator state))))))
 
           ;; WHEN/IF cond <clause> [AND <clause>]* [ELSE <clause> [AND <clause>]*] [END]
           ;;   <clause> = COLLECT/SUM/COUNT/APPEND/NCONC/MAXIMIZE/MINIMIZE expr [INTO var]
@@ -17449,18 +17945,68 @@
              (>= (length acc-spec) 4))
     (cadddr acc-spec)))
 
+(defun %loop-acc-declarable-type (acc-spec)
+  "The type a SUM / COUNT accumulator is declared with, or NIL: its OF-TYPE
+   when that is SINGLE-FLOAT, DOUBLE-FLOAT or an integer type within a
+   fixnum (the accumulator starts at that type's zero and the user promised
+   the sum stays in it)."
+  (let ((ts (%loop-acc-type-spec acc-spec)))
+    (and (member (car acc-spec) '(:sum :count :maximize :minimize))
+         ts (symbolp ts)
+         (cond ((string= (symbol-name ts) "SINGLE-FLOAT") 'single-float)
+               ((string= (symbol-name ts) "DOUBLE-FLOAT") 'double-float)
+               ((ignore-errors (%decl-int-width (%resolve-declared-type ts))) 'fixnum)
+               (t nil)))))
+
+(defun %loop-chunk-declares (chunk typed)
+  "A one-element list holding the DECLARE for CHUNK's variables named in
+   TYPED ((VAR . TYPE) pairs), or NIL."
+  (let ((specs nil))
+    (dolist (b chunk)
+      (let* ((v (if (consp b) (car b) b))
+             (e (and v (symbolp v) (assoc v typed))))
+        (when e (push (list 'type (cdr e) v) specs))))
+    (and specs (list (cons 'declare (nreverse specs))))))
+
+(defun %loop-maxmin-stmt (max-p expr av flag)
+  "The statement a MAXIMIZE (MAX-P) / MINIMIZE clause adds to AV.  With FLAG
+   (a typed accumulator, see MAXMIN-FLAGS) a plain compare on a declared
+   variable; without, AV is NIL until the first value."
+  (if flag
+      `(let ((%acc-v ,expr))
+         (if ,flag
+             (progn (setq ,flag nil) (setq ,av %acc-v))
+             (when (,(if max-p '> '<) %acc-v ,av) (setq ,av %acc-v))))
+      `(let ((%acc-v ,expr))
+         (setq ,av
+               (if (null ,av)
+                   %acc-v
+                   (if (,(if max-p '%loop-gt '%loop-lt) %acc-v ,av) %acc-v ,av))))))
+
 (defun %loop-acc-typed-init-value (acc-spec)
+  (let ((ty (and (member (car acc-spec) '(:maximize :minimize))
+                 (%loop-acc-declarable-type acc-spec))))
+    (if ty
+        ;; a typed MAXIMIZE / MINIMIZE starts at its type's zero; a flag (see
+        ;; MAXMIN-FLAGS) takes the first value.  Never executed, the clause's
+        ;; value is unspecified (CLHS 6.1.3), so the zero is as good as NIL.
+        (cond ((eq ty 'single-float) 0.0) ((eq ty 'double-float) 0d0) (t 0))
+        (%loop-acc-typed-init-value-1 acc-spec))))
+
+(defun %loop-acc-typed-init-value-1 (acc-spec)
   "Like %loop-acc-init-value but honors the OF-TYPE typespec stashed in
    the acc-spec for SUM/COUNT: float types → 0.0, integer → 0, NIL."
   (let ((type-spec (%loop-acc-type-spec acc-spec))
         (kind (car acc-spec)))
     (cond
       ((and (member kind '(:sum :count)) (symbolp type-spec)
+            (or (eq type-spec 'double-float)
+                (eq type-spec 'long-float)))
+       0d0)
+      ((and (member kind '(:sum :count)) (symbolp type-spec)
             (or (eq type-spec 'float)
                 (eq type-spec 'short-float)
-                (eq type-spec 'single-float)
-                (eq type-spec 'double-float)
-                (eq type-spec 'long-float)))
+                (eq type-spec 'single-float)))
        0.0)
       (t (%loop-acc-init-value kind)))))
 
@@ -17615,6 +18161,14 @@
          (anon-acc (when anon-acc-idx (nth anon-acc-idx accs)))
          (anon-acc-var (when anon-acc-idx (nth anon-acc-idx acc-vars)))
          (bindings nil)
+         ;; (VAR . TYPE) for bindings the expansion declares: an integer-typed
+         ;; numeric FOR's variable and temporaries, a typed SUM/COUNT.  The
+         ;; LET* chunk that binds VAR carries the declaration.
+         (typed nil)
+         ;; (ACC-VAR . FLAG) for a typed MAXIMIZE / MINIMIZE: the flag says no
+         ;; value has been taken yet, so the accumulator can start at its
+         ;; type's zero instead of NIL (and be declared)
+         (maxmin-flags nil)
          (pass-first nil)               ; the first-pass block (see below)
          (pass-next nil)                ; later passes, in clause order
          (firstv nil))
@@ -17656,6 +18210,13 @@
             (push av bound-vars)
             (push (list av (%loop-acc-typed-init-value acc))
                   bindings)
+            (let ((ty (%loop-acc-declarable-type acc)))
+              (when ty
+                (push (cons av ty) typed)
+                (when (member (car acc) '(:maximize :minimize))
+                  (let ((f (%mvm-gensym "FIRSTV")))
+                    (push (list f t) bindings)
+                    (push (cons av f) maxmin-flags)))))
             ;; tail pointer for the list category (see %LOOP-ACC-LIST-LINK).
             ;; BOUND-VARS is seeded with the cond-into vars, whose tails are
             ;; already bound above, so this cannot double-bind one.
@@ -17674,11 +18235,28 @@
            (c-ufirst nil) (c-unext nil))
       (ecase (loop-iter-kind iter)
         (:from
-         (let ((var (loop-iter-var iter))
-               (by (or (loop-iter-by-form iter) 1)))
+         (let* ((var (loop-iter-var iter))
+                (by (or (loop-iter-by-form iter) 1))
+                ;; OF-TYPE an integer type within a fixnum: VAR, its FROM /
+                ;; BY temporaries and its end are fixnums (the values VAR
+                ;; takes, the one past the end included, are within one step
+                ;; of the declared range), so they are declared FIXNUM and
+                ;; the end test is a plain compare.  Without it every
+                ;; numeric LOOP stepped and tested generically (%LOOP-GE is
+                ;; a call), and a body of float math could not stay unboxed.
+                (int-p (and (loop-iter-type iter)
+                            (ignore-errors
+                             (%decl-int-width (%resolve-declared-type (loop-iter-type iter))))
+                            t)))
            (dolist (b (loop-iter-pre-binds iter))
              (push b bindings))
            (push (list var (loop-iter-init-form iter)) bindings)
+           (when int-p
+             (push (cons var 'fixnum) typed)
+             (let ((f (loop-iter-init-form iter)))
+               (when (and f (symbolp f)) (push (cons f 'fixnum) typed)))
+             (when (and (loop-iter-by-form iter) (symbolp (loop-iter-by-form iter)))
+               (push (cons (loop-iter-by-form iter) 'fixnum) typed)))
            (when (loop-iter-end-form iter)
              (let* ((end-var (%mvm-gensym "END"))
                     (down-p (member (loop-iter-end-test iter) '(:downto :above)))
@@ -17693,14 +18271,25 @@
                                   `(setq ,var (+ ,var ,by))
                                   `(setq ,var (- ,var ,by)))))
                (push (list end-var (loop-iter-end-form iter)) bindings)
+               (when int-p (push (cons end-var 'fixnum) typed))
                ;; Use %loop-cmp helper so float/ratio end-forms work too —
                ;; raw `>` is fixnum-only and silently mis-compares with a
                ;; boxed-float pointer, hanging the loop.
-               (push (ecase (loop-iter-end-test iter)
-                       (:to    `(if (%loop-gt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (:below `(if (%loop-ge ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (:downto `(if (%loop-lt ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
-                       (:above `(if (%loop-le ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil)))))
+               (push (if int-p
+                         (let ((cmp (ecase (loop-iter-end-test iter)
+                                      (:to '>) (:below '>=) (:downto '<) (:above '<=))))
+                           `(if (,cmp ,var ,end-var) (progn ,back-out (return-from :%loop-exit nil))))
+                       ;; Untyped: fixnums compare inline and only anything else calls
+                       ;; the generic helper.  It was a call on every iteration of every
+                       ;; numeric LOOP without OF-TYPE -- most library code.
+                       (destructuring-bind (cmp helper)
+                           (ecase (loop-iter-end-test iter)
+                             (:to '(> %loop-gt)) (:below '(>= %loop-ge))
+                             (:downto '(< %loop-lt)) (:above '(<= %loop-le)))
+                         `(if (if (and (fixnump ,var) (fixnump ,end-var))
+                                  (,cmp ,var ,end-var)
+                                  (,helper ,var ,end-var))
+                              (progn ,back-out (return-from :%loop-exit nil)))))
                      test-forms)))
            (if (and (loop-iter-end-test iter)
                     (member (loop-iter-end-test iter) '(:downto :above)))
@@ -17919,20 +18508,11 @@
              (push (%loop-acc-list-link :append (cadr acc) av) acc-body))
             (:nconc
              (push (%loop-acc-list-link :nconc (cadr acc) av) acc-body))
+            ;; (two single-key clauses: the in-image CASE takes no key lists)
             (:maximize
-             (push `(let ((%acc-v ,(cadr acc)))
-                      (setq ,av
-                            (if (null ,av)
-                                %acc-v
-                                (if (%loop-gt %acc-v ,av) %acc-v ,av))))
-                   acc-body))
+             (push (%loop-maxmin-stmt t (cadr acc) av (cdr (assoc av maxmin-flags))) acc-body))
             (:minimize
-             (push `(let ((%acc-v ,(cadr acc)))
-                      (setq ,av
-                            (if (null ,av)
-                                %acc-v
-                                (if (%loop-lt %acc-v ,av) %acc-v ,av))))
-                   acc-body))
+             (push (%loop-maxmin-stmt nil (cadr acc) av (cdr (assoc av maxmin-flags))) acc-body))
             (:always
              (setf has-always t)
              (push `(unless ,(cadr acc) (return-from :%loop-exit nil)) acc-body))
@@ -18168,13 +18748,17 @@
              ;; and-group, nesting outer to inner.
              (with-bindings-form
                (if bindings
-                   (labels ((wrap (binds inner)
+                   ;; TYPED is passed, not closed over: WRAP referencing it
+                   ;; freely made it a closure, and the in-image compile of
+                   ;; that closure returned NIL for INNER (every expansion
+                   ;; lost its body; ANSI LOOP.8.4 and friends).
+                   (labels ((wrap (binds inner typed)
                               (cond
                                 ((null binds) inner)
                                 ((and (consp (car binds))
                                       (eq (car (car binds)) :and-group))
                                  `(let ,(cdr (car binds))
-                                    ,(wrap (cdr binds) inner)))
+                                    ,(wrap (cdr binds) inner typed)))
                                 (t
                                  ;; Collect consecutive simple bindings
                                  ;; into one LET*.
@@ -18185,9 +18769,11 @@
                                            (return nil))
                                          (push (car cur) chunk)
                                          (setq cur (cdr cur)))
-                                   `(let* ,(nreverse chunk)
-                                      ,(wrap cur inner)))))))
-                     (wrap (nreverse bindings) with-init))
+                                   (let* ((ordered (nreverse chunk))
+                                          (decls (%loop-chunk-declares ordered typed))
+                                          (inside (wrap cur inner typed)))
+                                     (list* 'let* ordered (append decls (list inside)))))))))
+                     (wrap (nreverse bindings) with-init typed))
                    with-init))
              (finally-has-return
               (labels ((rec (f)
@@ -19116,6 +19702,65 @@
 ;;; Dotimes
 ;;; ============================================================
 
+(defun %width-int-type (w)
+  "A declarable type for an integer of signed width W (an %EXPR-WIDTH
+   result): (SIGNED-BYTE W) below a fixnum's full width, FIXNUM at it.
+   %DECL-INT-WIDTH reads (SIGNED-BYTE 63) as no fixnum at all, so a full-width
+   count declared that way was untyped."
+  (if (>= w +fixnum-signed-bits+) 'fixnum (list 'signed-byte w)))
+
+(defun %dotimes-counter-type (count-form env)
+  "The type a DOTIMES counter provably has, or NIL.  It runs from 0 up to the
+   count and stops there, so it is never wider than the count: a literal N
+   gives (INTEGER 0 N); a count of known signed width W (a variable declared
+   (UNSIGNED-BYTE 32), say) gives (INTEGER 0 2^(W-1)-1).  Without the second
+   case a counter over a declared count was a full fixnum, and every index
+   computed from it -- (* i 32) -- lost its width: the arithmetic stayed
+   overflow-checked, and a scope containing it was not call-free, so its FP
+   locals were boxed (illatio's Q8_0 kernel allocated a vector per block)."
+  (cond ((integerp count-form) (and (>= count-form 0) (list 'integer 0 count-form)))
+        ((or (and count-form (symbolp count-form)) (consp count-form))
+         ;; at a fixnum's full width the (INTEGER 0 2^62-1) bound is wider
+         ;; than %DECL-INT-WIDTH accepts: FIXNUM says the same, usably
+         (let ((w (%expr-width count-form env)))
+           (cond ((null w) nil)
+                 ((>= w +fixnum-signed-bits+) 'fixnum)
+                 ((>= w 1) (list 'integer 0 (- (ash 1 (- w 1)) 1)))
+                 (t nil))))
+        (t nil)))
+
+(defun %dotimes-typed-counter (form env)
+  "FORM with its counter's type declared, when FORM is a DOTIMES whose count
+   has a known width and whose body does not already type the counter; else
+   NIL.  The image's DOTIMES is a runtime macro (runtime-cl-macros.lisp), and a
+   macro cannot see the environment, so it declares every non-literal-count
+   counter a plain FIXNUM.  Here, before it expands, ENV is known: the
+   declaration goes at the head of the body, which the macro moves onto the
+   counter's LET after its own (declare (type fixnum var)).  The two types
+   intersect; the narrower one is what %EXPR-WIDTH then sees."
+  (and (consp form) (symbolp (car form)) (car form)
+       (= (normalize-name (car form)) #.(compute-name-hash "DOTIMES"))
+       (consp (cdr form)) (consp (cadr form))
+       (let* ((spec (cadr form)) (var (car spec)) (count (and (consp (cdr spec)) (cadr spec))))
+         (and (symbolp var) var
+              (not (integerp count))               ; the macro types a literal count itself
+              (let ((ty (%dotimes-counter-type count env)))
+                (and ty
+                     (not (some (lambda (d)
+                                  (and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "DECLARE")
+                                       (some (lambda (c)
+                                               (and (consp c) (member var (cdr c))))
+                                             (cdr d))))
+                                (cddr form)))
+                     ;; the count as (THE (SIGNED-BYTE W) count): the runtime
+                     ;; macro declares its count temporary with that type, so
+                     ;; the per-iteration (>= var n) needs no tag test
+                     (list* (car form)
+                            (list* var (list 'the (%width-int-type (%expr-width count env)) count)
+                                   (cddr spec))
+                            (list 'declare (list 'type ty var))
+                            (cddr form))))))))
+
 (defun compile-dotimes (spec body env dest)
   "Compile (dotimes (var count [result]) body...).
    Per CLHS, body is in an implicit TAGBODY (so GO/tags work) inside
@@ -19137,7 +19782,14 @@
          (limit (or cnt count-form)))
     (compile-form
      (list 'block nil
-       (list 'let (if cnt (list (list cnt count-form)) nil)
+       (list* 'let (if cnt (list (list cnt count-form)) nil)
+         (append
+           (let ((w (and cnt (%expr-width count-form env))))
+             ;; the count's own width types CNT too, so the per-iteration
+             ;; (< var cnt) is an untagged compare
+             (when (and w (>= w 1))
+               (list (list 'declare (list 'type (%width-int-type w) cnt)))))
+         (list
            (list* 'let
                  (list (list var 0))
                  ;; A literal count bounds VAR at compile time: declare it so
@@ -19145,8 +19797,8 @@
                  ;; take the typed fast path (the width estimator reads the
                  ;; (integer 0 N) declaration; see %decl-int-width).
                  (append
-                  (when (and (integerp count-form) (>= count-form 0))
-                    (list (list 'declare (list 'type (list 'integer 0 count-form) var))))
+                  (let ((ty (%dotimes-counter-type count-form env)))
+                    (when ty (list (list 'declare (list 'type ty var)))))
                   ;; The body's own leading declarations (e.g. a type for VAR
                   ;; when the count is not a literal) belong on this LET too;
                   ;; inside the TAGBODY they were silently dropped.
@@ -19157,7 +19809,7 @@
                              (list 'progn
                                    (cons 'tagbody (%strip-leading-declares body))
                                    (list 'setq var (list '1+ var)))
-                             (list 'return (or result-form nil)))))))))
+                             (list 'return (or result-form nil)))))))))))
      env dest)))
 
 ;;; ============================================================
@@ -19286,7 +19938,7 @@
    regression -- a Pi 5 A/B was within 1% -- but it is still wrong to put one
    on this path.)
 
-   DO NOT "OPTIMISE" THIS TO %GF-P -- TRIED, IT BREAKS THE FIX.  What
+   DO NOT `OPTIMISE' THIS TO %GF-P -- TRIED, IT BREAKS THE FIX.  What
    SYMBOL-FUNCTION returns for a generic function is NOT a gf-object; %gf-p
    answers NIL on it and the whole fix silently stops working (measured:
    quickload back to SIMPLE-ERROR, ALEXANDRIA:FLATTEN undefined).  It is
@@ -20992,6 +21644,13 @@
          ((and (member (symbol-name op) '("+" "-" "*" "/") :test #'string=)
                (consp (cdr form)))
           (every (lambda (a) (%expr-single-float-p a env)) (cdr form)))
+         ;; ABS / two-argument MAX, MIN of singles; a conversion to single
+         ((%fp-abs-p form) (%expr-single-float-p (cadr form) env))
+         ((%fp-minmax-op form)
+          (and (%expr-single-float-p (cadr form) env) (%expr-single-float-p (caddr form) env)))
+         ((%fp-single-conversion-arg form) t)
+         ;; EXP of a single is a single
+         ((%fp-exp-arg form) (%expr-single-float-p (%fp-exp-arg form) env))
          ;; struct accessor whose slot type is single-float
          (t (let ((ty (%expr-dtype form env)))
               (and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")))))))
@@ -21009,6 +21668,15 @@
    operand single-float (caller-checked)."
   ;; Unboxed tree (part 2b): the whole expression in FP registers, boxed
   ;; ONCE at the end instead of twice per pair.
+  (when (eql +target-soft-float+ 1)
+    ;; no FPU: each pair through the soft-float op, then rounded to single
+    (let ((fn (cond ((string= op-name "+") '%sf-add) ((string= op-name "-") '%sf-sub)
+                    ((string= op-name "*") '%sf-mul) (t '%sf-div)))
+          (acc (car args)))
+      (dolist (arg (cdr args))
+        (setq acc (list '%sf-round32 (list fn acc arg))))
+      (compile-form acc env dest)
+      (return-from %compile-single-float-arith nil)))
   (let ((tree (cons (%float-op-symbol op-name) args)))
     (when (%fp-tree-fits-p tree env)
       (let ((fd (alloc-fp-reg)))
@@ -21081,6 +21749,11 @@
            ((and (name-eq (car form) "%TO-DOUBLE") (null rest)) (cadr form))
            (t nil)))))
 
+(defun %soft-double-operand (form)
+  "The source form %COMPILE-DOUBLE-OPERAND compiles for FORM."
+  (let ((x (%double-conversion-arg form)))
+    (if x (list '%to-double x) form)))
+
 (defun %compile-double-operand (form env dest)
   "Compile a double-float fast-path operand; a conversion goes to %TO-DOUBLE."
   (let ((x (%double-conversion-arg form)))
@@ -21113,6 +21786,9 @@
          ((and (or (string= (symbol-name op) "-") (string= (symbol-name op) "ABS"))
                (consp (cdr form)) (null (cddr form)))
           (%expr-double-float-p (cadr form) env))
+         ;; two-argument MAX / MIN of doubles
+         ((%fp-minmax-op form)
+          (and (%expr-double-float-p (cadr form) env) (%expr-double-float-p (caddr form) env)))
          (t (let ((ty (%expr-dtype form env)))
               (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")))))))
     (t nil)))
@@ -21137,6 +21813,13 @@
 (defvar *fpd-hoisted* nil
   "Alist (conversion-form . temp vreg) of a double tree's hoisted operands.")
 
+(defvar *target-has-fpd-p* nil
+  "T when the image being built runs only where the fpd-* ops exist (the
+   interpreter and the x86-64 / aarch64 translators), so its baked code may
+   use unboxed double trees too.  Set by SET-TARGET-FIXNUM-BITS-FOR.  Before
+   it, only runtime-compiled code did, and the runtime's own double math --
+   EXP, LOG, SIN -- was ~40 boxed operations a call.")
+
 (defun %fpd-tree-need (form env)
   "FP registers needed to evaluate FORM as an unboxed double tree, or NIL."
   (cond
@@ -21158,6 +21841,13 @@
               (let ((n (%fpd-tree-need a env)))
                 (unless n (return nil))
                 (setq worst (max worst (1+ n))))))))
+    ((%fp-abs-p form) (%fpd-tree-need (cadr form) env))
+    ((%fp-minmax-op form)
+     (let ((a (%fpd-tree-need (cadr form) env)) (b (%fpd-tree-need (caddr form) env)))
+       (and a b (max a (1+ b)))))
+    ;; a single-float tree widened in register (fcvt d<-s), not a hoisted call
+    ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
+     (%fp-tree-need (%double-conversion-arg form) env))
     (t nil)))
 
 (defun %fpd-arith-op (name)
@@ -21166,14 +21856,18 @@
         ((string= name "*") :fpd-mul)
         (t :fpd-div)))
 
-(defun %fpd-collect-conversions (form)
+(defun %fpd-collect-conversions (form &optional env)
   "The conversion operands (see %DOUBLE-CONVERSION-ARG) of the + - * / tree
-   FORM, left to right, or :NONE when a non-tree call stands in it."
+   FORM, left to right, or :NONE when a non-tree call stands in it.  A
+   conversion of a single-float tree is not one: it widens in register."
   (let ((acc nil))
     (labels ((walk (f)
-               (cond ((%double-conversion-arg f) (push f acc))
+               (cond ((%double-conversion-arg f)
+                      (unless (and env (%fp-tree-need (%double-conversion-arg f) env))
+                        (push f acc)))
                      ((and (consp f) (symbolp (car f))
-                           (member (symbol-name (car f)) '("+" "-" "*" "/") :test #'string=))
+                           (or (member (symbol-name (car f)) '("+" "-" "*" "/") :test #'string=)
+                               (%fp-abs-p f) (%fp-minmax-op f)))
                       (dolist (a (cdr f)) (walk a))))))
       (walk form))
     (nreverse acc)))
@@ -21197,6 +21891,21 @@
   (when (%fpd-unary-minus-p form)
     (return-from compile-double-unboxed
       (compile-double-unboxed (list '* -1.0d0 (cadr form)) env fd)))
+  (cond ((%fp-abs-p form)
+         (compile-double-unboxed (cadr form) env fd)
+         (emit-ir :fp-op1 fd fd 1)                               ; fabs.d
+         (return-from compile-double-unboxed nil))
+        ((%fp-minmax-op form)
+         (compile-double-unboxed (cadr form) env fd)
+         (let ((ft (alloc-fp-reg)))
+           (compile-double-unboxed (caddr form) env ft)
+           (emit-ir :fp-op2 fd fd ft (if (eq (%fp-minmax-op form) :max) 2 3))
+           (free-fp-reg))
+         (return-from compile-double-unboxed nil))
+        ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
+         (compile-float-unboxed (%double-conversion-arg form) env fd)
+         (emit-ir :fp-op1 fd fd 2)                               ; fcvt d<-s
+         (return-from compile-double-unboxed nil)))
   (if (and (consp form) (not (name-eq (car form) "QUOTE")))
       (let ((op (%fpd-arith-op (symbol-name (car form)))))
         (compile-double-unboxed (cadr form) env fd)
@@ -21205,22 +21914,31 @@
             (compile-double-unboxed arg env ft)
             (emit-ir op fd fd ft)
             (free-fp-reg))))
-      ;; a leaf: its boxed value, unboxed once
-      (let ((tmp (alloc-temp-reg)))
-        (compile-form form env tmp)
-        (emit-ir :fpd-unbox fd tmp)
-        (free-temp-reg))))
+      (let ((b (and (symbolp form) form (env-lookup env form))))
+        (if (and b (eq (binding-location b) :fpdreg))
+            ;; an FP-resident double local: a register move, no unbox
+            (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))
+            (let ((bits (let ((v (%fp-literal-value form)))
+                          (and v (typep v 'double-float) (%fp-literal-double-bits v)))))
+              (if bits
+                  ;; a literal: its bits straight into the register
+                  (emit-ir :fpd-li fd (car bits) (cdr bits))
+                  ;; a leaf: its boxed value, unboxed once
+                  (let ((tmp (alloc-temp-reg)))
+                    (compile-form form env tmp)
+                    (emit-ir :fpd-unbox fd tmp)
+                    (free-temp-reg))))))))
 
 (defun %compile-double-float-arith (op-name args env dest)
   "Left-fold ARGS with the double-float op OP-NAME (a string): :f<op> per pair,
    each result a boxed double.  Every operand double-float (caller-checked).
    A whole call-free tree goes through the FP pool unboxed instead."
   (let ((tree (cons (%float-op-symbol op-name) args)))
-    (when *mvm-eval-runtime-p*
+    (when (or *mvm-eval-runtime-p* *target-has-fpd-p*)
       ;; Conversion operands are calls, and FP registers are caller-clobbered:
       ;; evaluate them first, left to right, into boxed temps (the tree's
       ;; other leaves are variables and literals, so the order is unchanged).
-      (let* ((convs (%fpd-collect-conversions tree))
+      (let* ((convs (%fpd-collect-conversions tree env))
              (saved *fpd-hoisted*)
              (hoisted (and (<= (length convs) 3)
                            (mapcar (lambda (c) (cons c nil)) convs)))
@@ -21248,6 +21966,15 @@
           (dolist (h *fpd-hoisted*) (declare (ignore h)) (free-temp-reg))
           (return-from %compile-double-float-arith nil)))
         (setq *fpd-hoisted* saved)))))
+  (when (eql +target-soft-float+ 1)
+    ;; no FPU: each pair through the soft-float op
+    (let ((fn (cond ((string= op-name "+") '%sf-add) ((string= op-name "-") '%sf-sub)
+                    ((string= op-name "*") '%sf-mul) (t '%sf-div)))
+          (acc (%soft-double-operand (car args))))
+      (dolist (arg (cdr args))
+        (setq acc (list fn acc (%soft-double-operand arg))))
+      (compile-form acc env dest)
+      (return-from %compile-double-float-arith nil)))
   (let ((firop (%float-arith-op op-name)))
     (%compile-double-operand (car args) env dest)
     (dolist (arg (cdr args))
@@ -21313,8 +22040,78 @@
    %F32V-* primitives, and a walker that only looked at the raw head never
    recognised such a subtree — every mill vector expression silently took
    the BOXED generic-call path (and a 6-deep chain then overflowed the temp
-   registers inside a loop).  Memoised (%mexp-memo), so this is cheap."
-  (if (consp form) (%quiet-macroexpand form) form))
+   registers inside a loop).  Memoised (%mexp-memo), so this is cheap.
+
+   ABS and two-argument MAX / MIN are left as written: they are compiler
+   macros (generic IF / fixnum-test expansions), and expanded the trees could
+   never see them as the single FP instructions they are on floats.  A walker
+   that finds them on non-float operands rejects the tree, and the ordinary
+   compile expands them as before."
+  (if (and (consp form) (not (%fp-abs-p form)) (not (%fp-minmax-op form)))
+      (%quiet-macroexpand form)
+      form))
+
+;;; The FP-register ops a float tree was missing (mvm.lisp +op-fp-op1+ ..
+;;; +op-fp-toi+): ABS, two-argument MAX / MIN, and a conversion between
+;;; single and double, in single and in double trees; a float comparison of
+;;; two trees (COMPILE-COMPARE-2); and (THE <integer type> (ROUND x)) and its
+;;; TRUNCATE / FLOOR / CEILING siblings.  Each was a generic call before, and a
+;;; call anywhere in a scope boxes every FP local in it -- an element of
+;;; illatio's activation quantizer was 200 ns, the arithmetic around it 5.
+
+(defun %fp-toi-plan (form env)
+  "(KIND SUB X) when FORM is (THE <integer type of at most 62 bits> (OP X))
+   with OP one of ROUND TRUNCATE FLOOR CEILING (no divisor) and X a single
+   (KIND :SINGLE) or double (:DOUBLE) tree that fits; SUB 0..3 in that order.
+   The declared width is the promise that makes the conversion's 64-bit
+   result a fixnum, with no bignum path."
+  (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+       (consp form) (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
+       (let ((w (ignore-errors (%decl-int-width (%resolve-declared-type (cadr form)))))
+             (v (caddr form)))
+         (and w (<= w 62)
+              (consp v) (symbolp (car v)) (consp (cdr v)) (null (cddr v))
+              (let ((sub (cond ((name-eq (car v) "ROUND") 0) ((name-eq (car v) "TRUNCATE") 1)
+                               ((name-eq (car v) "FLOOR") 2) ((name-eq (car v) "CEILING") 3)))
+                    (x (cadr v)))
+                (and sub
+                     (let ((ns (%fp-tree-need x env)) (nd (and (not (%fp-tree-need x env)) (%fpd-pure-need x env))))
+                       (cond ((and ns (<= (+ *fp-reg-counter* ns) +fp-reg-max+)) (list :single sub x))
+                             ((and nd (<= (+ *fp-reg-counter* nd) +fp-reg-max+)) (list :double sub x))))))))))
+
+(defun %fp-abs-p (form)
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "ABS")
+       (consp (cdr form)) (null (cddr form))))
+
+(defun %fp-minmax-op (form)
+  ":MAX / :MIN for a two-argument MAX / MIN, else NIL."
+  (and (consp form) (symbolp (car form)) (consp (cdr form)) (consp (cddr form))
+       (null (cdddr form))
+       (cond ((name-eq (car form) "MAX") :max)
+             ((name-eq (car form) "MIN") :min))))
+
+(defun %fp-single-conversion-arg (form)
+  "X when FORM is (COERCE X 'SINGLE-FLOAT) or (FLOAT X <single literal>)."
+  (and (consp form) (symbolp (car form)) (consp (cdr form)) (consp (cddr form))
+       (null (cdddr form))
+       (let ((p (caddr form)))
+         (cond ((and (name-eq (car form) "COERCE")
+                     (consp p) (name-eq (car p) "QUOTE") (consp (cdr p))
+                     (symbolp (cadr p)) (cadr p)
+                     (string= (symbol-name (cadr p)) "SINGLE-FLOAT"))
+                (cadr form))
+               ((and (name-eq (car form) "FLOAT") (typep p 'single-float))
+                (cadr form))))))
+
+(defun %fpd-pure-need (form env)
+  "%FPD-TREE-NEED of FORM with nothing hoisted: a double tree of variables,
+   literals and the ops above only (no conversion calls).  Saved and restored
+   by SETQ, not bound: a compiled LET of a special binds it lexically in the
+   image (the build's check-let-of-unregistered-special catches that)."
+  (let ((saved *fpd-hoisted*))
+    (setq *fpd-hoisted* nil)
+    (unwind-protect (%fpd-tree-need form env)
+      (setq *fpd-hoisted* saved))))
 
 (defun %fp-tree-need (form env)
   "FP registers needed to evaluate FORM unboxed, or NIL when FORM is not a
@@ -21340,8 +22137,167 @@
                    (let ((n (%fp-tree-need a env)))
                      (unless n (return nil))
                      (setq worst (max worst (1+ n))))))))
+         ((%fp-abs-p form) (%fp-tree-need (cadr form) env))
+         ((%fp-minmax-op form)
+          (let ((a (%fp-tree-need (cadr form) env)) (b (%fp-tree-need (caddr form) env)))
+            (and a b (max a (1+ b)))))
+         ((%fp-single-conversion-arg form)
+          (let ((x (%fp-single-conversion-arg form)))
+            (or (%fp-tree-need x env) (%fpd-pure-need x env)
+                (%fp-itof-need x env))))
+         ((%fp-exp-arg form)
+          (let ((n (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+                        (%fp-tree-need (%fp-exp-arg form) env))))
+            ;; 7: what %COMPILE-EXP-SINGLE holds at its peak, result included
+            (and n (max n 7))))
          (t nil)))
       (t nil))))
+
+(defun %fp-literal-double-bits (x)
+  "(HI . LO), the IEEE bits of the finite float X as a double (exact for a
+   single), or NIL.  INTEGER-DECODE-FLOAT, so it is the same on the host
+   that builds the image and in the image itself."
+  (and (floatp x)
+       (let ((d (coerce x 'double-float)))
+         (multiple-value-bind (m e sgn) (integer-decode-float d)
+           (let* ((neg (or (minusp sgn) (minusp (float-sign d))))
+                  (bits (cond ((zerop m) 0)
+                              ;; normal: m in [2^52, 2^53), value m * 2^e
+                              ((>= m (ash 1 52))
+                               (let ((be (+ e 1075)))
+                                 (and (< 0 be 2047)
+                                      (logior (ash be 52) (- m (ash 1 52))))))
+                              ;; subnormal: e = -1074, biased exponent 0
+                              ((= e -1074) m)
+                              (t nil))))
+             (and bits
+                  (let ((b (if neg (logior bits (ash 1 63)) bits)))
+                    (cons (ash b -32) (logand b #xFFFFFFFF)))))))))
+
+(defun %fp-literal-value (form)
+  "The float FORM denotes when it is a float literal (or quoted one), else NIL."
+  (cond ((floatp form) form)
+        ((and (consp form) (name-eq (car form) "QUOTE") (consp (cdr form))
+              (floatp (cadr form)))
+         (cadr form))
+        (t nil)))
+
+(defun %fp-exp-arg (form)
+  "X when FORM is (EXP X)."
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "EXP")
+       (consp (cdr form)) (null (cddr form))
+       (cadr form)))
+
+(defun %fp-env-with-fpd (env names regs)
+  "ENV with each of NAMES an FP-resident double local in the matching REGS."
+  (let ((bs (compile-env-bindings env)))
+    (loop for n in names for r in regs
+          do (setq bs (cons (make-binding :name n :location :fpdreg :reg r
+                                          :dtype 'double-float)
+                            bs)))
+    (make-compile-env :bindings bs
+                      :stack-depth (compile-env-stack-depth env)
+                      :parent (compile-env-parent env)
+                      :fn-names (compile-env-fn-names env))))
+
+(defun %emit-fpd-select-if-lt (fa fb fd fs)
+  "When Fa < Fb (ordered: not for a NaN), Fd <- Fs."
+  (let ((b (alloc-temp-reg)) (z (alloc-temp-reg)) (skip (make-compiler-label)))
+    (emit-ir :fpd-lt b fa fb)
+    (emit-ir :li z 0)
+    (emit-ir :cmp b z)
+    (emit-ir :beq skip)
+    (emit-ir :fp-mov fd fs)
+    (emit-ir-label skip)
+    (free-temp-reg) (free-temp-reg)))
+
+(defun %compile-exp-single (x env fd)
+  "(EXP X) of the single tree X into FD, in registers, with no call.  The
+   same double arithmetic in the same order as %EXP-F's normal path (whose
+   result EXP rounds to single), so the bits are EXP's:
+     xd = X widened, clamped to [-110, 100] -- beyond those the single result
+          is already 0 or infinity, and inside them 2^k is a normal double,
+          so %EXP-F's two-step scales never apply; a NaN passes the clamps
+          and stays NaN;
+     k  = truncate(xd/ln2 +- 0.5), r = (xd - k ln2_hi) - k ln2_lo,
+     exp(r) by the degree-13 Horner series, times 2^k (fpd-scale), rounded
+     to single.
+   SwiGLU and softmax call EXP per element; through the generic function it
+   was ~250 ns."
+  (compile-float-unboxed x env fd)
+  (emit-ir :fp-op1 fd fd 2)                                       ; xd
+  (let ((c (alloc-fp-reg)))
+    (compile-double-unboxed 100d0 env c)
+    (%emit-fpd-select-if-lt c fd fd c)                            ; 100 < xd: xd = 100
+    (compile-double-unboxed -110d0 env c)
+    (%emit-fpd-select-if-lt fd c fd c)                            ; xd < -110: xd = -110
+    (free-fp-reg))
+  (let* ((xd (%mvm-gensym "XD")) (tq (%mvm-gensym "TQ")) (kd (%mvm-gensym "KD")) (r (%mvm-gensym "R"))
+         (ft (alloc-fp-reg))
+         (e1 (%fp-env-with-fpd env (list xd) (list fd)))
+         (kreg (alloc-temp-reg)))
+    ;; tq = xd / ln2;  k = truncate(tq - 0.5) if tq < 0, else truncate(tq + 0.5)
+    (compile-double-unboxed (list '* xd 1.4426950408889634d0) e1 ft)
+    (let ((e2 (%fp-env-with-fpd e1 (list tq) (list ft)))
+          (fu (alloc-fp-reg)) (fz (alloc-fp-reg))
+          (b (alloc-temp-reg)) (z (alloc-temp-reg))
+          (neg (make-compiler-label)) (done (make-compiler-label)))
+      (compile-double-unboxed 0d0 e2 fz)
+      (emit-ir :fpd-lt b ft fz)
+      (emit-ir :li z 0)
+      (emit-ir :cmp b z)
+      (emit-ir :bne neg)
+      (compile-double-unboxed (list '+ tq 0.5d0) e2 fu)
+      (emit-ir :br done)
+      (emit-ir-label neg)
+      (compile-double-unboxed (list '- tq 0.5d0) e2 fu)
+      (emit-ir-label done)
+      (emit-ir :fp-toi kreg fu 5)                                 ; truncate, double
+      (free-temp-reg) (free-temp-reg)
+      (free-fp-reg) (free-fp-reg))
+    ;; kd = k as a double (FT, tq is dead); r = (xd - kd ln2_hi) - kd ln2_lo
+    (emit-ir :fpd-itof ft kreg)
+    (let ((fr (alloc-fp-reg))
+          (e3 (%fp-env-with-fpd e1 (list kd) (list ft))))
+      (compile-double-unboxed (list '- (list '- xd (list '* kd 0.6931471803691238d0))
+                                    (list '* kd 1.9082149292705877d-10))
+                              e3 fr)
+      ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...))), %EXP-F's tree, into FD (xd is dead)
+      (let ((series 1d0))
+        (setq series (list '+ (list '/ r 13d0) 1d0))
+        (loop for n from 12 downto 1
+              do (setq series (list '+ (list '/ (list '* series r) (float n 1d0)) 1d0)))
+        (compile-double-unboxed series (%fp-env-with-fpd env (list r) (list fr)) fd))
+      (free-fp-reg))
+    (emit-ir :fpd-scale fd kreg)
+    (emit-ir :fp-op1 fd fd 3)                                     ; to single
+    (free-temp-reg)
+    (free-fp-reg)))
+
+(defun %fp-itof-need (x env)
+  "FP registers to convert the integer X to a single in register, or NIL.
+   X must be at most 53 bits wide, so fixnum -> double (exact) -> single
+   rounds once, like a direct conversion; and call-free: a literal, a
+   width-typed variable, + - * ASH ... of those (%SIMPLE-INDEX-FORM-P), or
+   (THE <int> (ROUND tree)), which converts in register itself
+   (%FP-TOI-PLAN).  One register for the result, plus what
+   the rounding's own tree holds while it runs."
+  (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+       (cond ((integerp x) (and (< (integer-length x) 53) 1))
+             ((symbolp x) (let ((w (and x (%expr-width x env)))) (and w (<= w 53) 1)))
+             ;; call-free integer arithmetic of width-typed operands (the
+             ;; index-form shapes): (float (- isum (* 32 imins)) 1.0)
+             ((and (consp x) (%simple-index-form-p x)
+                   (let ((w (%expr-width x env))) (and w (<= w 53))))
+              1)
+             (t (let ((plan (%fp-toi-plan x env))
+                      (w (and (consp x) (consp (cdr x))
+                              (ignore-errors (%decl-int-width (%resolve-declared-type (cadr x)))))))
+                  (and plan w (<= w 53)
+                       (let ((n (if (eq (car plan) :single)
+                                    (%fp-tree-need (caddr plan) env)
+                                    (%fpd-pure-need (caddr plan) env))))
+                         (and n (+ 1 n)))))))))
 
 (defun %fp-arith-op (name)
   (cond ((string= name "+") :fp-add)
@@ -21359,6 +22315,11 @@
             (let ((b (env-lookup env form))) (and b (eq (binding-location b) :fpreg))))
        (let ((b (env-lookup env form)))
          (unless (= (binding-reg b) fd) (emit-ir :fp-mov fd (binding-reg b)))))
+      ;; a single literal: its bits straight into the register
+      ((let ((v (%fp-literal-value form)))
+         (and v (typep v 'single-float) (%fp-literal-double-bits v)))
+       (let ((bits (%fp-literal-double-bits (%fp-literal-value form))))
+         (emit-ir :fp-li fd (car bits) (cdr bits))))
       ;; leaf literal / variable: the boxed value, unboxed once
       ((or (typep form 'single-float) (symbolp form)
            (and (consp form) (name-eq (car form) "QUOTE")))
@@ -21373,8 +22334,32 @@
          (compile-form (caddr form) env ti)
          (setq ta (alloc-temp-reg))
          (compile-form (cadr form) env ta)
-         (emit-ir :fp-lane-load fd ta ti)
+         (let ((lk (%lane-index-check-begin ta ti))) (emit-ir :fp-lane-load fd ta ti) (%lane-index-check-end lk))
          (free-temp-reg) (free-temp-reg)))
+      ((%fp-abs-p form)
+       (compile-float-unboxed (cadr form) env fd)
+       (emit-ir :fp-op1 fd fd 0))                                ; fabs.s
+      ((%fp-minmax-op form)
+       (compile-float-unboxed (cadr form) env fd)
+       (let ((ft (alloc-fp-reg)))
+         (compile-float-unboxed (caddr form) env ft)
+         (emit-ir :fp-op2 fd fd ft (if (eq (%fp-minmax-op form) :max) 0 1))
+         (free-fp-reg)))
+      ((%fp-exp-arg form)
+       (%compile-exp-single (%fp-exp-arg form) env fd))
+      ((%fp-single-conversion-arg form)
+       (let ((x (%fp-single-conversion-arg form)))
+         (cond ((%fp-tree-need x env)
+                (compile-float-unboxed x env fd))                ; already single
+               ((%fpd-pure-need x env)
+                (compile-double-unboxed x env fd)
+                (emit-ir :fp-op1 fd fd 3))                       ; fcvt s<-d
+               (t                                                ; an integer (%fp-itof-need)
+                (let ((tmp (alloc-temp-reg)))
+                  (compile-form x env tmp)
+                  (emit-ir :fpd-itof fd tmp)
+                  (emit-ir :fp-op1 fd fd 3)
+                  (free-temp-reg))))))
       (t
        (let ((op (%fp-arith-op (symbol-name (car form)))))
          (compile-float-unboxed (cadr form) env fd)
@@ -21387,8 +22372,10 @@
 (defun %fp-tree-fits-p (form env)
   "True when FORM is an unboxable tree that fits the FP pool from the
    current allocation point."
-  (let ((need (%fp-tree-need form env)))
-    (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+))))
+  ;; no FPU: there are no FP registers to evaluate a tree in
+  (unless (eql +target-soft-float+ 1)
+    (let ((need (%fp-tree-need form env)))
+      (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+)))))
 
 ;;; ------------------------------------------------------------
 ;;; f32x4 vector trees (SIMD plan, layer 2a)
@@ -21511,7 +22498,9 @@
 (defun compile-v4-form (form env dest)
   "A %f32v-* call: unboxed when it is (or stores) a fitting vector tree,
    otherwise the ordinary call to the prelude definition."
-  (let ((n (symbol-name (car form))))
+  (let ((n (symbol-name (car form)))
+        ;; a discarded store statement: its vector is not boxed
+        (unused (eq form *unused-value-form*)))
     (cond
       ((string= n "%F32V-SET")                    ; (%f32v-set A i tree)
        (if (and (consp (cdr form)) (consp (cddr form)) (consp (cdddr form))
@@ -21533,7 +22522,7 @@
                      (emit-ir :v4-lane-store ta ti fd)
                      (free-temp-reg))
                    (free-temp-reg))
-                 (when dest (%emit-v4-box dest fd))
+                 (when (and dest (not unused)) (%emit-v4-box dest fd))
                  (free-fp-reg))
                ;; a possibly-calling index: evaluate it (and the array) before
                ;; any FP register is live, as before
@@ -21543,7 +22532,7 @@
                  (let ((fd (alloc-fp-reg)))
                    (compile-v4-unboxed (cadddr form) env fd)
                    (emit-ir :v4-lane-store ta ti fd)
-                   (when dest (%emit-v4-box dest fd))
+                   (when (and dest (not unused)) (%emit-v4-box dest fd))
                    (free-fp-reg))
                  (free-temp-reg) (free-temp-reg)))
            (compile-call (car form) (cdr form) env dest)))
@@ -21572,6 +22561,8 @@
 ;;;   shifts        (%vi-sqrshrun q n) (%vi-sshr16 q n) (%vi-shl16 q n) (%vi-sshr8 q n) (%vi-sshr32 q n)
 ;;;   binary        (%vi-add16 a b) … see *vi-bin-ops*
 ;;;   accumulate    (%vi-mla16 acc a b) (%vi-mls16 acc a b) (%vi-bsl mask a b)
+;;;                 (%vi-sdot acc a b)  s32 lanes += four s8 x s8 products each
+;;;   to floats     (%vi-scvtf32 q)  s32x4 -> f32x4, usable as a leaf of an %f32v tree
 ;;;   by-element    (%vi-mla16l acc a b lane) (%vi-mls16l acc a b lane)
 ;;;                 (%vi-mul16l a b lane) (%vi-sqdmulh16l a b lane) (%vi-sqrdmulh16l a b lane)
 ;;;   extract       (%vi-umov8 q lane) (%vi-umov16 q lane) (%vi-umov32 q lane) -> fixnum (unsigned)
@@ -21583,12 +22574,18 @@
     ("%VI-ADD32" . 17) ("%VI-SUB32" . 18) ("%VI-MUL32" . 19)
     ("%VI-TRN1" . 20) ("%VI-TRN2" . 21) ("%VI-ZIP1" . 22) ("%VI-ZIP2" . 23)
     ("%VI-SMIN16" . 24) ("%VI-SMAX16" . 25) ("%VI-UMIN8" . 26) ("%VI-UMAX8" . 27)
-    ("%VI-TRN1-8" . 28) ("%VI-TRN2-8" . 29) ("%VI-TRN1-32" . 30) ("%VI-TRN2-32" . 31)))   ; 64-bit forms .8B / .2S (byte / word transposes)
-(defparameter *vi-acc-ops* '(("%VI-MLA16" . 3) ("%VI-MLS16" . 4) ("%VI-BSL" . 12)))
+    ("%VI-TRN1-8" . 28) ("%VI-TRN2-8" . 29) ("%VI-TRN1-32" . 30) ("%VI-TRN2-32" . 31)   ; 64-bit forms .8B / .2S (byte / word transposes)
+    ("%VI-ADDP32" . 33)))   ; ADDP .4S: (a0+a1, a2+a3, b0+b1, b2+b3) -- folds int32 lanes pairwise
+;; %VI-SDOT (acc a b): each s32 lane of ACC += the dot product of the matching
+;; four s8 lanes of A and B (SDOT .4S, FEAT_DotProd) -- illatio's Q8_0 kernel.
+(defparameter *vi-acc-ops* '(("%VI-MLA16" . 3) ("%VI-MLS16" . 4) ("%VI-BSL" . 12) ("%VI-SDOT" . 32)))
 (defparameter *vi-lane-acc-ops* '(("%VI-MLA16L" . 0) ("%VI-MLS16L" . 1)))
 (defparameter *vi-lane-ops* '(("%VI-MUL16L" . 2) ("%VI-SQDMULH16L" . 3) ("%VI-SQRDMULH16L" . 4)))
 (defparameter *vi-un-ops* '(("%VI-UXTL" . 0) ("%VI-SQXTUN" . 1) ("%VI-SXTL" . 2) ("%VI-XTN" . 3)
-                            ("%VI-SXTL2" . 5) ("%VI-UXTL2" . 6) ("%VI-SQXTN" . 8) ("%VI-SXTL8" . 10) ("%VI-ABS16" . 11)))
+                            ("%VI-SXTL2" . 5) ("%VI-UXTL2" . 6) ("%VI-SQXTN" . 8) ("%VI-SXTL8" . 10) ("%VI-ABS16" . 11)
+                            ;; SCVTF .4S: s32 lanes -> single-float lanes.  The one bridge from
+                            ;; integer lanes into an f32x4 tree (the bits are the same register)
+                            ("%VI-SCVTF32" . 12)))
 ;; the "2" narrows keep Fd's low half: (op low-tree high-tree) — see *vi-un2-ops*
 (defparameter *vi-un2-ops* '(("%VI-XTN2" . 7) ("%VI-SQXTN2" . 9)))
 (defparameter *vi-shift-ops* '(("%VI-SQRSHRUN" . 0) ("%VI-SSHR16" . 1) ("%VI-SHL16" . 2) ("%VI-SSHR8" . 3) ("%VI-SSHR32" . 4)
@@ -21654,6 +22651,17 @@
            (t nil))))
       (t nil))))
 
+(defun %resident-vreg-of (form env)
+  "The FP vreg of FORM when it is a register-resident vector variable (a
+   VI-PACK or F32V-PACK LET binding kept :fpvreg), else NIL.  A read-only
+   operand of a lane op can then be used where it lives instead of being
+   copied into a scratch register first (one MOV per use: eight per block
+   of illatio's Q8_0 kernel, whose activations are two such variables)."
+  (let ((form (%tree-expand form)))
+    (and (symbolp form)
+         (let ((b (env-lookup env form)))
+           (and b (eq (binding-location b) :fpvreg) (binding-reg b))))))
+
 (defun compile-vi-unboxed (form env fd)
   "Compile the integer-lane tree FORM (caller checked %vil-tree-need) into FP vreg FD."
   (let ((form (%tree-expand form)))
@@ -21698,19 +22706,24 @@
             (compile-vi-unboxed (car a) env fd) (emit-ir :vi-shift fd fd k (cadr a)))
            ((setq k (%vil-lookup n *vi-bin-ops*))
             (compile-vi-unboxed (car a) env fd)
-            (let ((ft (alloc-fp-reg)))
-              (compile-vi-unboxed (cadr a) env ft)
-              (emit-ir :vi-bin fd fd ft k)
-              (free-fp-reg)))
+            (let ((rb (%resident-vreg-of (cadr a) env)))
+              (if rb
+                  (emit-ir :vi-bin fd fd rb k)
+                  (let ((ft (alloc-fp-reg)))
+                    (compile-vi-unboxed (cadr a) env ft)
+                    (emit-ir :vi-bin fd fd ft k)
+                    (free-fp-reg)))))
            ((setq k (%vil-lookup n *vi-acc-ops*))     ; Fd = acc; Fd op= a, b
+            ;; A and B are only read, so a register-resident variable is used
+            ;; where it lives; the accumulator (Fd) is always our own register.
             (compile-vi-unboxed (car a) env fd)
-            (let ((f1 (alloc-fp-reg)))
-              (compile-vi-unboxed (cadr a) env f1)
-              (let ((f2 (alloc-fp-reg)))
-                (compile-vi-unboxed (caddr a) env f2)
-                (emit-ir :vi-bin fd f1 f2 k)
-                (free-fp-reg))
-              (free-fp-reg)))
+            (let* ((r1 (%resident-vreg-of (cadr a) env))
+                   (f1 (or r1 (let ((r (alloc-fp-reg))) (compile-vi-unboxed (cadr a) env r) r)))
+                   (r2 (%resident-vreg-of (caddr a) env))
+                   (f2 (or r2 (let ((r (alloc-fp-reg))) (compile-vi-unboxed (caddr a) env r) r))))
+              (emit-ir :vi-bin fd f1 f2 k)
+              (unless r2 (free-fp-reg))
+              (unless r1 (free-fp-reg))))
            ((setq k (%vil-lookup n *vi-lane-acc-ops*))
             (compile-vi-unboxed (car a) env fd)
             (let ((f1 (alloc-fp-reg)))
@@ -22514,6 +23527,35 @@
 ;;; Comparison Operations
 ;;; ============================================================
 
+(defun %compile-fp-tree-compare (kind branch-op a b env dest)
+  "A < > <= >= of two float trees of KIND (:single or :double), evaluated in
+   FP registers; T or NIL into DEST.  > and >= swap the operands."
+  (let ((true-label (make-compiler-label))
+        (end-label (make-compiler-label))
+        (fa (alloc-fp-reg)))
+    (if (eq kind :single) (compile-float-unboxed a env fa) (compile-double-unboxed a env fa))
+    (let ((fb (alloc-fp-reg)) (tmp (alloc-temp-reg)))
+      (if (eq kind :single) (compile-float-unboxed b env fb) (compile-double-unboxed b env fb))
+      (multiple-value-bind (x y lt) (case branch-op
+                                      (:blt (values fa fb t)) (:bgt (values fb fa t))
+                                      (:ble (values fa fb nil)) (t (values fb fa nil)))
+        (if (eq kind :single)
+            (emit-ir :fp-cmp tmp x y (if lt 0 1))
+            (emit-ir (if lt :fpd-lt :fpd-le) tmp x y)))
+      (let ((zero (alloc-temp-reg)))
+        (emit-ir :li zero 0)
+        (emit-ir :cmp tmp zero)
+        (free-temp-reg))
+      (free-temp-reg)
+      (free-fp-reg))
+    (free-fp-reg)
+    (emit-ir :bne true-label)
+    (compile-nil dest)
+    (emit-ir :br end-label)
+    (emit-ir-label true-label)
+    (compile-t dest)
+    (emit-ir-label end-label)))
+
 (defun %compile-float-compare (branch-op a b env dest)
   "COMPILE-COMPARE-2 for two provably-float operands (see there)."
   (let ((tmp (alloc-temp-reg))
@@ -22563,7 +23605,19 @@
   ;; unordered) instead of the fixnum tag test and the %CHECKED- helper's
   ;; generic dispatch and boxed subtraction.  Every boxed float's payload is
   ;; a double, so single, double and mixed compare exactly.
-  (when (and *mvm-eval-runtime-p*
+  ;; TWO FLOAT TREES: compare in FP registers straight from the trees -- no
+  ;; box for an FP-resident local, no unbox (fp-cmp for singles, fpd-lt/-le
+  ;; for doubles).
+  (when (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+             (member branch-op '(:blt :bgt :ble :bge)))
+    (let ((kind (cond ((and (%fp-tree-need a env) (%fp-tree-need b env)) :single)
+                      ((and (%fpd-pure-need a env) (%fpd-pure-need b env)) :double))))
+      (when (and kind
+                 (let ((na (if (eq kind :single) (%fp-tree-need a env) (%fpd-pure-need a env)))
+                       (nb (if (eq kind :single) (%fp-tree-need b env) (%fpd-pure-need b env))))
+                   (<= (+ *fp-reg-counter* (max na (1+ nb))) +fp-reg-max+)))
+        (return-from compile-compare-2 (%compile-fp-tree-compare kind branch-op a b env dest)))))
+  (when (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
              (member branch-op '(:blt :bgt :ble :bge))
              (or (%expr-double-float-p a env) (%expr-single-float-p a env))
              (or (%expr-double-float-p b env) (%expr-single-float-p b env))
@@ -22920,6 +23974,59 @@
           ((eq mode :opt) (setq opt (+ opt 1)))
           (t nil))))
     (list req opt rest-p key-p)))
+
+(defvar *blob-global-names* nil
+  "Name hashes of every global the forms being compiled define with DEFVAR,
+   DEFPARAMETER or DEFCONSTANT (%COLLECT-BLOB-GLOBAL-NAMES), so a read or SETQ
+   of one compiled BEFORE its definition -- COMPILER.LISP reading *PRINT-BASE*,
+   which cl-printer.lisp defines later in the blob -- is not reported as an
+   implicit global.  Warnings only: the code compiled is the same.")
+
+(defun %collect-blob-global-names (forms)
+  (let ((h (make-hash-table :test 'eql)))
+    (labels ((walk (f)
+               (when (and (consp f) (symbolp (car f)))
+                 (let ((s (symbol-name (car f))))
+                   (cond
+                     ((or (string= s "PROGN") (string= s "EVAL-WHEN"))
+                      (dolist (g (if (string= s "EVAL-WHEN") (cddr f) (cdr f)))
+                        (walk g)))
+                     ((and (or (string= s "DEFVAR") (string= s "DEFPARAMETER")
+                               (string= s "DEFCONSTANT"))
+                           (consp (cdr f)) (symbolp (cadr f)))
+                      (setf (gethash (normalize-name (cadr f)) h) t)))))))
+      (dolist (f forms) (walk f)))
+    h))
+
+(defun %collect-blob-special-symbols (forms)
+  "The symbols the blob's toplevel DEFVAR / DEFPARAMETER / (DECLAIM (SPECIAL
+   ...)) proclaim special (EQ hash).  Proclaimed for the WHOLE image before any
+   of it compiles: the kernel is one program, and a DEFVAR placed after a LET of
+   its variable must not make that LET lexical."
+  (let ((h (make-hash-table :test 'eq)))
+    (labels ((walk (f)
+               (when (and (consp f) (symbolp (car f)))
+                 (let ((s (symbol-name (car f))))
+                   (cond
+                     ((or (string= s "PROGN") (string= s "EVAL-WHEN"))
+                      (dolist (g (if (string= s "EVAL-WHEN") (cddr f) (cdr f)))
+                        (walk g)))
+                     ((and (or (string= s "DEFVAR") (string= s "DEFPARAMETER"))
+                           (consp (cdr f)) (symbolp (cadr f)) (cadr f))
+                      (setf (gethash (cadr f) h) t))
+                     ((or (string= s "DECLAIM") (string= s "PROCLAIM"))
+                      (dolist (spec (cdr f))
+                        (let ((sp (if (and (consp spec) (eq (car spec) 'quote))
+                                      (cadr spec) spec)))
+                          (when (and (consp sp) (symbolp (car sp))
+                                     (string= (symbol-name (car sp)) "SPECIAL"))
+                            (dolist (v (cdr sp))
+                              (when (and v (symbolp v)) (setf (gethash v h) t))))))))))))
+      (dolist (f forms) (walk f)))
+    h))
+
+(defun %blob-defines-global-p (name)
+  (and *blob-global-names* (gethash (normalize-name name) *blob-global-names*)))
 
 (defun %collect-multi-shape-defuns (forms)
   (let ((seen (make-hash-table :test 'equal))
@@ -24112,8 +25219,13 @@
   ;; no wide multiply, and neither does this.
   (let* ((wt0 (memory-width-code type-form))
          (w0 (car wt0)))
-    (when (and (%mem-width-promotes-p w0 (cdr wt0))
-               (not *target-big-endian-p*))
+    ;; THE SPLIT IS NOT OPTIONAL ON A BIG-ENDIAN TARGET, ONLY ITS OFFSETS
+    ;; ARE.  Skipping it there (it once read the halves little-endian) made a
+    ;; 68k :u32 load of a word >= 2^30 a BIGNUM in the interpreter, whose
+    ;; %WORD->VAL then shifted the bignum's POINTER: a garbage register, and
+    ;; after it misdecoded bytecode.  +TARGET-BIG-ENDIAN+ is folded, so this
+    ;; also holds for the image's own compiler.
+    (when (%mem-width-promotes-p w0 (cdr wt0))
       ;; ONLY PROMOTE WHEN THE VALUE CAN ACTUALLY LEAVE FIXNUM RANGE.  With
       ;; hi16 below 2^(fixnum-bits - 17) the result, hi16*2^16 + lo16, is an
       ;; ordinary fixnum, and an inline constant ASH of that small hi16 is
@@ -24123,16 +25235,20 @@
       ;; limb list) to produce a small integer.  On the hosted RV32 CL image,
       ;; which has no collector yet, that garbage alone exhausted the 64 MB
       ;; semispace during boot.  Values that really are >= 2^29 still promote.
-      (let ((asym (%mvm-gensym "MRA"))
-            (hsym (%mvm-gensym "MRH")))
+      (let* ((asym (%mvm-gensym "MRA"))
+             (hsym (%mvm-gensym "MRH"))
+             (be (eql +target-big-endian+ 1))
+             (hi-off (if be 0 2))
+             (lo-off (if be 2 0)))
         (return-from compile-mem-ref
           (compile-form
             (list 'let (list (list asym addr-form))
-                  (list 'let (list (list hsym (list 'mem-ref (list '+ asym 2) :u16)))
+                  (list 'let (list (list hsym (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)))
                         (list 'if (list '< hsym (ash 1 (- +fixnum-bits+ 17)))
-                              (list '+ (list 'ash hsym 16) (list 'mem-ref asym :u16))
+                              (list '+ (list 'ash hsym 16)
+                                       (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16))
                               (list '+ (list 'bignum-ash hsym 16)
-                                       (list 'mem-ref asym :u16)))))
+                                       (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16)))))
             env dest)))))
   (compile-form (%conv-addr-form addr-form) env dest)
   ;; Untag address: logical shift right by 1
@@ -24169,19 +25285,19 @@
          ;; inlines :sar for small constant counts, which mangles a bignum
          ;; pointer — Active Limitation #8, fixed separately.
          ;;
-         ;; LITTLE-ENDIAN: halves are placed lo-at-+0, hi-at-+2.  Promotion can
-         ;; only trigger on a 32-bit target, and the only 32-bit target running
-         ;; this runtime is i386; a big-endian 32-bit target would need the two
-         ;; offsets swapped.  Stated rather than silently assumed.
-         (when (and (%mem-width-promotes-p width needs-untag)
-                    (not *target-big-endian-p*))
-           (let ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV")))
+         ;; The halves go where the target's byte order puts them: low half at
+         ;; +0 little-endian, at +2 big-endian (68k, PowerPC).
+         (when (%mem-width-promotes-p width needs-untag)
+           (let* ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV"))
+                  (be (eql +target-big-endian+ 1))
+                  (hi-off (if be 0 2))
+                  (lo-off (if be 2 0)))
              (return-from compile-setf
                (compile-form
                  (list 'let (list (list asym addr-form) (list vsym value-form))
-                       (list 'setf (list 'mem-ref asym :u16)
+                       (list 'setf (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16)
                              (list 'logand vsym 65535))
-                       (list 'setf (list 'mem-ref (list '+ asym 2) :u16)
+                       (list 'setf (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)
                              (list 'logand (list 'bignum-ash vsym -16) 65535))
                        vsym)
                  env dest))))
@@ -25012,7 +26128,7 @@
   (emit-ir :gc-check)
   (emit-ir :alloc-obj dest 7 +subtag-mda+))
 
-(defun compile-make-closure (fn-form env-form env dest)
+(defun compile-make-closure (fn-form env-form env dest &optional (nslots 2))
   "Compile (%make-closure fn env) — allocate a 2-slot object with
    closure subtag (#x52). Slot 0 = fn-addr (native code pointer),
    slot 1 = env (arbitrary Lisp object, usually a list of captured
@@ -25044,8 +26160,11 @@
   ;; later return whatever the kernel reused that memory for (often
   ;; another heap address — see DGMC.AND.4 SEGV trace).
   (emit-ir :gc-check)
-  (emit-ir :alloc-obj dest 2 +subtag-closure+)
+  (emit-ir :alloc-obj dest nslots +subtag-closure+)
   (let ((slot-temp (alloc-temp-reg)))
+    (when (> nslots 2)
+      (compile-form nil env slot-temp)
+      (emit-ir :obj-set dest 2 slot-temp))
     (emit-ir :pop slot-temp)                  ; env
     (emit-ir :obj-set dest 1 slot-temp)
     (emit-ir :pop slot-temp)                  ; fn
@@ -25360,11 +26479,30 @@
              :test #'string=))
     (t nil)))
 
+(defun %intersect-declared-type (old new)
+  "One type for a variable declared twice.  CLHS 3.3.4: two type
+   declarations mean the intersection.  Of two integer types the narrower is
+   kept (it is the intersection's width); otherwise the later declaration.
+   The DOTIMES macro declares its counter FIXNUM and a body or the compiler
+   may add (INTEGER 0 N); before this, %APPLY-DECLARED-TYPES kept the FIRST
+   and FIND-based readers the LAST, so they disagreed, and a counter over a
+   declared count stayed a full fixnum."
+  (let ((wo (ignore-errors (%decl-int-width old)))
+        (wn (ignore-errors (%decl-int-width new))))
+    (if (and wo wn (< wo wn)) old new)))
+
 (defun %declared-types (body)
   "Alist (VAR . TYPE-FORM) from the leading (declare (type TYPE v1 v2 …) …)
    forms of BODY — the same forms strip-declares removes, including those
-   after a leading docstring.  Only the explicit TYPE spelling is read."
+   after a leading docstring.  Only the explicit TYPE spelling is read.
+   One entry per variable: a variable declared twice gets the intersection
+   (%INTERSECT-DECLARED-TYPE)."
   (let ((out nil) (b body) (seen-doc nil))
+    (flet ((note (v ty)
+             (let ((e (assoc v out)))
+               (if e
+                   (setf (cdr e) (%intersect-declared-type (cdr e) ty))
+                   (setq out (cons (cons v ty) out))))))
     (loop
       (cond
         ((not (consp b)) (return out))
@@ -25378,7 +26516,7 @@
                    (consp (cdr d)))
               (let ((ty (%resolve-declared-type (cadr d))))
                 (dolist (v (cddr d))
-                  (when (symbolp v) (setq out (cons (cons v ty) out))))))
+                  (when (symbolp v) (note v ty)))))
              ;; CLHS 3.3.3.1: (declare (SINGLE-FLOAT x y)) is (TYPE SINGLE-FLOAT
              ;; x y).  Only the TYPE spelling used to be read, so the shorthand
              ;; -- cl-bench FFT's (single-float ur ui wr wi tr ti) -- left every
@@ -25386,9 +26524,9 @@
              ((and (consp d) (%type-decl-shorthand-p (car d)))
               (let ((ty (%resolve-declared-type (car d))))
                 (dolist (v (cdr d))
-                  (when (symbolp v) (setq out (cons (cons v ty) out))))))))
+                  (when (symbolp v) (note v ty)))))))
          (setq b (cdr b)))
-        (t (return out))))))
+        (t (return out)))))))
 
 (defun %apply-declared-types (env body)
   "Stamp binding-dtype on the CURRENT frame's bindings named by BODY's
@@ -25602,6 +26740,12 @@
                             (and w wc (max w wc))))))))
          ((string= op "THE")
           (and (consp args) (consp (cdr args)) (%decl-int-width (car args))))
+         ;; LENGTH returns a fixnum or does not return (a dotted or circular
+         ;; list signals): tag-safe at the full width, which is what a
+         ;; (dotimes (i (length v))) count needs for an untagged compare
+         ((and (or (string= op "LENGTH") (string= op "ARRAY-LENGTH"))
+               (consp args) (null (cdr args)))
+          +fixnum-signed-bits+)
          ;; The raw fixnum ops: a tagged-word add/sub/mul of fixnums yields a
          ;; tagged word -- a fixnum, whatever it wrapped to.  Tag-safe, at
          ;; the full width (so never trusted not to overflow further).
@@ -25927,6 +27071,20 @@
 (defun %bounds-check-p ()
   (and (>= *compile-safety* 1) (%cg-on-p (quote *cg-bounds-check*))))
 
+;; The unboxed lane ops (:FP-LANE-LOAD / :FP-LANE-STORE) carry the same check
+;; as every boxed access; a failing index skips the access.  BEGIN returns the
+;; skip label and the length scratch, which stays allocated until END places
+;; the label, since the cold arm writes it.  NIL when checks are off.
+(defun %lane-index-check-begin (arr-reg idx-reg)
+  (when (%bounds-check-p)
+    (let ((skip (make-compiler-label)) (tl (alloc-temp-reg)))
+      (%emit-index-check arr-reg idx-reg tl skip)
+      skip)))
+(defun %lane-index-check-end (skip)
+  (when skip
+    (emit-ir-label skip)
+    (free-temp-reg)))
+
 (defun %emit-index-check (arr-reg idx-reg dest skip)
   "Emit the bounds check described above.  ARR-REG and IDX-REG hold the array
    and the tagged index; on failure branch to SKIP with %AREF-INDEX-ERROR's
@@ -26201,6 +27359,30 @@
 ;;; the u8 vector, one 32-bit lane per element.  %F32-BITS-REF / -SET move
 ;;; the raw IEEE32 bits as a tagged fixnum; %f32-aref / %f32-aset (prelude)
 ;;; box and unbox them until floats are unboxed (docs/simd-plan.md, layer 1b).
+(defun %f32-make-array-count (form)
+  "N when FORM is (MAKE-ARRAY N :ELEMENT-TYPE 'SINGLE-FLOAT) with N a
+   non-negative integer literal and nothing else but :INITIAL-ELEMENT 0.0
+   (positive zero: the allocation's zero bits), else NIL."
+  (and (consp form) (consp (cdr form))
+       (let ((n (cadr form)) (keys (cddr form)) (et nil) (ok t))
+         (and (integerp n) (>= n 0) (< n 1000000)
+              (progn
+                (loop (when (or (not ok) (null keys)) (return))
+                  (if (and (consp keys) (consp (cdr keys)) (keywordp (car keys)))
+                      (let ((k (symbol-name (car keys))) (v (cadr keys)))
+                        (cond ((string= k "ELEMENT-TYPE")
+                               (setq et (and (consp v) (name-eq (car v) "QUOTE") (consp (cdr v))
+                                             (symbolp (cadr v)) (cadr v)
+                                             (string= (symbol-name (cadr v)) "SINGLE-FLOAT"))))
+                              ((string= k "INITIAL-ELEMENT")
+                               (let ((x (%fp-literal-value v)))
+                                 (unless (and x (eql x 0.0)) (setq ok nil))))
+                              (t (setq ok nil)))
+                        (setq keys (cddr keys)))
+                      (setq ok nil)))
+                (and ok et))
+              n))))
+
 (defun compile-alloc-f32 (count-form env dest)
   "Compile (%alloc-f32 N) — allocate a packed single-float vector of N lanes."
   (let ((cnt-reg (alloc-temp-reg)))
@@ -26254,6 +27436,9 @@
 (defun compile-f32-load (arr-form idx-form env dest)
   "Compile (%f32-load arr idx) — the lane as a fresh boxed single-float
    (native fcvt; allocates the 4-slot box)."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-f32-load
+      (compile-form (list '%sf-f32-load arr-form idx-form) env dest)))
   (let ((arr-reg (alloc-temp-reg))
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
@@ -26269,6 +27454,9 @@
 (defun compile-f32-store (arr-form idx-form val-form env dest)
   "Compile (%f32-store arr idx float) — narrow the boxed float's payload to
    single precision and store the lane.  Returns FLOAT."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-f32-store
+      (compile-form (list '%sf-f32-store arr-form idx-form val-form) env dest)))
   (let ((val-reg (alloc-temp-reg)))
     (compile-form val-form env val-reg)
     (let ((arr-reg (alloc-temp-reg))
@@ -26288,6 +27476,8 @@
   "Compile (%fsqrt float) -- a fresh DOUBLE-float box holding the correctly
    rounded square root of the payload (sqrtsd / fsqrt / fsqrt.d / vsqrt).
    The software Newton in %SQRT-F was ~1.1 us a call."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-fsqrt (compile-form (list '%sf-sqrt val-form) env dest)))
   (compile-form val-form env dest)
   (emit-ir :gc-check)
   (emit-ir :fsqrt dest dest))
@@ -26296,18 +27486,21 @@
   "Compile (%fround32 float) — a fresh single-float box holding the payload
    rounded to single precision (cvtsd2ss / fcvt), replacing the Lisp-side
    %round-to-single that every float result went through."
+  (when (eql +target-soft-float+ 1)
+    (return-from compile-fround32 (compile-form (list '%sf-round32 val-form) env dest)))
   (compile-form val-form env dest)
   (emit-ir :gc-check)
   (emit-ir :fround32 dest dest))
 
-(defun compile-u8-ref (arr-form idx-form env dest)
-  "Compile (%u8-ref arr idx) — load a byte (tagged fixnum) from a u8 vector."
+(defun compile-u8-ref (arr-form idx-form env dest &optional (checked t))
+  "Compile (%u8-ref arr idx) — load a byte (tagged fixnum) from a u8 vector.
+   CHECKED nil (%U8-REF-UNCHECKED) omits the bounds check."
   (let ((arr-reg (alloc-temp-reg))
         (idx-reg (alloc-temp-reg)))
     (compile-form arr-form env arr-reg)
     (compile-form idx-form env idx-reg)
     (let ((skip (make-compiler-label)))
-      (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+      (when (and checked (%bounds-check-p)) (%emit-index-check arr-reg idx-reg dest skip))
       (emit-ir :u8-ref dest arr-reg idx-reg)
       (emit-ir-label skip))
     (free-temp-reg)
@@ -26346,8 +27539,9 @@
               val-form
               (remove-if-not #'symbolp (list arr-form idx-form))))))
 
-(defun compile-u8-set (arr-form idx-form val-form env dest)
+(defun compile-u8-set (arr-form idx-form val-form env dest &optional (checked t))
   "Compile (%u8-set arr idx val) — store VAL's low byte into a u8 vector.
+   CHECKED nil (%U8-SET-UNCHECKED) omits the bounds check.
    Returns VAL (like aset).  When ARR and IDX are lexical leaves the VALUE
    is compiled first, straight into DEST, so its expression starts with
    every physical temp free: with array and index temps allocated first,
@@ -26366,7 +27560,7 @@
           (compile-form arr-form env arr-reg)
           (compile-form idx-form env idx-reg)
           (let ((skip (make-compiler-label)))
-            (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+            (when (and checked (%bounds-check-p)) (%emit-index-check arr-reg idx-reg dest skip))
             (emit-ir :u8-set arr-reg idx-reg val-reg)
             (emit-ir :mov dest val-reg)
             (emit-ir-label skip))
@@ -26380,7 +27574,7 @@
         (compile-form idx-form env idx-reg)
         (compile-form val-form env val-reg)
         (let ((skip (make-compiler-label)))
-          (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
+          (when (and checked (%bounds-check-p)) (%emit-index-check arr-reg idx-reg dest skip))
           (emit-ir :u8-set arr-reg idx-reg val-reg)
           (emit-ir :mov dest val-reg)
           (emit-ir-label skip))
@@ -26497,6 +27691,7 @@
   (let* ((g-arr (%mvm-gensym "AREFA"))
          (g-idx (%mvm-gensym "AREFI"))
          (g-raw (%mvm-gensym "AREFR"))
+         (g-st (%mvm-gensym "AREFS"))
          ;; EVERY OTHER SHAPE OUT OF LINE (cl-clos.lisp %AREF-SLOW, the same
          ;; arms in the same order): inlined, they were most of every generic
          ;; AREF's native code.  Bound HERE as their own backquotes and
@@ -26539,7 +27734,15 @@
      ;; array is string-typed.  Non-string arrays keep returning the raw
      ;; element unchanged.  %prim-aref / %wrapper-aref / %aref-multi stay
      ;; raw — only this public front-end applies the code→char lift.
-     `(let ((,g-arr ,arr-form) (,g-idx ,idx-form))
+     `(let* ((,g-arr ,arr-form) (,g-idx ,idx-form)
+             ;; ONE SUBTAG LOAD FOR THE WHOLE DISPATCH.  Each %PRIM-...-P below used to
+             ;; re-test the tag, compare against T and reload the header -- ~12
+             ;; instructions an arm on aarch64, four arms before the out-of-line call.
+             ;; :OBJ-SUBTAG is tag-safe on x64/aarch64/i386/arm32/riscv but not on 68k or
+             ;; PowerPC, hence the guard: T is the one immediate with the object tag.
+             (,g-st (if (and (eql (%lowtag ,g-arr) ,+tag-object+) (not (eq ,g-arr t)))
+                        (obj-subtag ,g-arr)
+                        0)))
         (cond
           ;; The two plain shapes FIRST, with the raw word load: a simple
           ;; string (#x31) or simple vector (#x32) took the MDA, cons and
@@ -26552,14 +27755,23 @@
           ;; #x31 is left to non-Latin-1 literals: #x15 takes #x31's inline arm,
           ;; and #x31 goes to the rest (%AREF-SLOW's first arm).
           ,(if (%string32-on-p)
-               `((%prim-string32-p ,g-arr) (code-char (%c32-ref ,g-arr ,g-idx)))
-               `((%prim-simple-string-p ,g-arr) (code-char (%word-aref ,g-arr ,g-idx))))
-          ((%prim-simple-vector-p ,g-arr) (%word-aref ,g-arr ,g-idx))
+               `((eq ,g-st ,+subtag-string32+) (code-char (%c32-ref ,g-arr ,g-idx)))
+               `((eq ,g-st ,+subtag-string+) (code-char (%word-aref ,g-arr ,g-idx))))
+          ((eq ,g-st ,+subtag-array+) (%word-aref ,g-arr ,g-idx))
           ;; Byte-packed (unsigned-byte 8) vector: the interpreter's bytecode
           ;; (every FETCH-* reads it), octet buffers.
-          ((%prim-u8-vector-p ,g-arr) (%u8-ref ,g-arr ,g-idx))
+          ((eq ,g-st ,+subtag-u8-vector+) (%u8-ref ,g-arr ,g-idx))
           ;; narrow string (#x13): a byte per character
-          ((%prim-base-string-p ,g-arr) (code-char (%u8-ref ,g-arr ,g-idx)))
+          ((eq ,g-st ,+subtag-base-string+) (code-char (%u8-ref ,g-arr ,g-idx)))
+          ;; In code compiled in-image (libraries: cram, glass, the gateway) an
+          ;; undisplaced byte vector behind a header -- adjustable, fill-pointer --
+          ;; is read here too, not through a call: cram's LZ77 reads its window a
+          ;; byte at a time and the call was a third of DEFLATE.  The image's own
+          ;; sites leave it to %AREF-SLOW's first arm, to keep the kernel small.
+          ,@(when *mvm-eval-runtime-p*
+              `(((and (eq ,g-st ,+subtag-mda+) (null (%word-aref ,g-arr 3))
+                      (%prim-u8-vector-p (%word-aref ,g-arr 6)))
+                 (%u8-ref (%word-aref ,g-arr 6) ,g-idx))))
           ,@rest-arms))
      env dest)))
 
@@ -26610,10 +27822,12 @@
       (t
        (compile-form `(%aref-multi-public ,arr ,@subs) env dest)))))
 
-(defun compile-aset (arr-form idx-form val-form env dest)
+(defun compile-aset (arr-form idx-form val-form env dest &optional unused)
   "Compile (aset array index value) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aset.  Multi-subscript
-   forms go via compile-aset-form below."
+   forms go via compile-aset-form below.  UNUSED: the store is a discarded
+   statement (see *unused-value-form*), so an unboxed value is not boxed
+   into DEST."
   (when *compile-plain-arrays*
     (return-from compile-aset
       (compile-word-aset arr-form idx-form val-form env dest)))
@@ -26645,10 +27859,10 @@
               (compile-form idx-form env ti)
               (let ((ta (alloc-temp-reg)))
                 (compile-form arr-form env ta)
-                (emit-ir :fp-lane-store ta ti fd)
+                (let ((lk (%lane-index-check-begin ta ti))) (emit-ir :fp-lane-store ta ti fd) (%lane-index-check-end lk))
                 (free-temp-reg))
               (free-temp-reg))
-            (when dest
+            (when (and dest (not unused))
               (emit-ir :gc-check)
               (emit-ir :fp-box dest fd))
             (free-fp-reg))
@@ -26657,8 +27871,8 @@
             (compile-form idx-form env ti)
             (let ((fd (alloc-fp-reg)))
               (compile-float-unboxed val-form env fd)
-              (emit-ir :fp-lane-store ta ti fd)
-              (when dest
+              (let ((lk (%lane-index-check-begin ta ti))) (emit-ir :fp-lane-store ta ti fd) (%lane-index-check-end lk))
+              (when (and dest (not unused))
                 (emit-ir :gc-check)
                 (emit-ir :fp-box dest fd))
               (free-fp-reg))
@@ -26740,7 +27954,8 @@
        (compile-form `(%aset-multi ,arr ,(car rest)) env dest))
       ;; (aset arr sub val) — single-sub fast path.
       ((null (cddr rest))
-       (compile-aset arr (car rest) (cadr rest) env dest))
+       (compile-aset arr (car rest) (cadr rest) env dest
+                     (eq form *unused-value-form*)))
       ;; (aset arr sub1 sub2 … val) — multi-sub.  Extract val (last)
       ;; from subs (everything before).
       (t
@@ -27735,7 +28950,7 @@
       ((and allow-key-transform has-key)
        (let* ((kw-rest (intern (format nil "%KW-REST-~D"
                                         (incf *kw-rest-counter*))
-                               ;; (or (find-package "MODUS.MVM") *package*), NOT
+                               ;; (or (%build-mvm-package) *package*), NOT
                                ;; the hardcoded :modus.mvm keyword: in mvm-eval
                                ;; (in-image self-host) the package table has no
                                ;; MODUS.MVM, so `(intern name :modus.mvm)`
@@ -27747,7 +28962,7 @@
                                ;; lambda &key cluster, lambda.34-47).  Same in-image
                                ;; intern-into-NIL bug already fixed for cell-var-name
                                ;; / defstruct-intern / setf-place setters.
-                               (or (find-package "MODUS.MVM") *package*)))
+                               (or (%build-mvm-package) *package*)))
               (req-count (length required))
               ;; &optional params get GENSYM slot names (same CLHS-scope
               ;; trick as the fallback path at #142 below): the caller
@@ -27811,7 +29026,7 @@
                                               (symbol-name var)
                                               (incf *kw-rest-counter*))
                                      ;; in-image-safe package (see kw-rest above)
-                                     (or (find-package "MODUS.MVM") *package*))))
+                                     (or (%build-mvm-package) *package*))))
              (push (list found-var (list '%key-present-p kw-rest (list 'quote kw))) bindings)
              (push (list var (list 'if found-var
                                      (list '%key-lookup kw-rest (list 'quote kw) nil)
@@ -27949,14 +29164,21 @@
               ;; clobbered the nargs convention slot -- so
               ;; (defun f (&optional (*x* 7)) ...) called as (f) took the
               ;; "supplied" arm and bound *X* to the empty slot (NIL).
+              ;; The body's declarations stay LEADING, on the LET* (which
+              ;; binds the optionals; a type for a required parameter is a
+              ;; free declaration there).  Behind the nargs touch below they
+              ;; were plain forms: every declaration of an &optional
+              ;; function was dropped, its arrays and floats went generic
+              ;; (illatio's kernels, 50x slower than with required args).
               (setf new-body
                     `((let ((,nargs-var (%get-nargs)))
                         (let* (,@(nreverse opt-bindings))
+                          ,@(%leading-declares new-body)
                           ;; touch nargs-var so it isn't dead-stripped when no
                           ;; default/supplied references it.
                           ,nargs-var
                           ,@(nreverse key-defaults)
-                          ,@new-body))))))
+                          ,@(%strip-leading-declares new-body)))))))
            ;; --- no &optional: legacy null-check path for &key fallback ---
            (t
             (let ((defaults nil))
@@ -28263,7 +29485,7 @@
               (and (> (length n) 0) (char= (char n 0) #\&))))
        (or (gethash (normalize-name var) (%ensure-clhs-specials-table))
            (member (symbol-name var) *clhs-extra-specials* :test #'string=)
-           (%runtime-special-p var)
+           (%proclaimed-special-p var)
            ;; by NORMALIZE-NAME, not SYMBOL-NAME: in an image whose name
            ;; table lacks a symbol, SYMBOL-NAME is "" for every such symbol, so
            ;; (declare (special *f*)) made an unrelated *x* parameter special
@@ -28319,7 +29541,7 @@
                   (list (cons 'let (cons (mapcar (lambda (v) (list v v)) boxed)
                                          rest))))))))
 
-(defun mvm-compile-function-internal-1 (name params body &optional parent-env rest-slot opt-start opt-count)
+(defun %mvm-compile-function-internal-2 (name params body &optional parent-env rest-slot opt-start opt-count)
   "Compile a single function into IR. Returns function-info.
    Does NOT produce bytecode; that happens in phase 3.
    PARENT-ENV, if provided, allows closure variable references.
@@ -28722,6 +29944,13 @@
       (:fpd-itof 3)
       (:fpd-lt 4)
       (:fpd-le 4)
+      (:fp-op1 4)
+      (:fp-op2 5)
+      (:fp-cmp 5)
+      (:fp-toi 4)
+      (:fpd-scale 3)
+      (:fpd-li 10)
+      (:fp-li 10)
       (:fpd-add 4)
       (:fpd-sub 4)
       (:fpd-mul 4)
@@ -29078,6 +30307,13 @@
           (:fpd-itof (mvm-fpd-itof buf (second insn) (third insn)))
           (:fpd-lt (mvm-fpd-lt buf (second insn) (third insn) (fourth insn)))
           (:fpd-le (mvm-fpd-le buf (second insn) (third insn) (fourth insn)))
+          (:fp-op1 (mvm-fp-op1 buf (second insn) (third insn) (fourth insn)))
+          (:fp-op2 (mvm-fp-op2 buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:fp-cmp (mvm-fp-cmp buf (second insn) (third insn) (fourth insn) (fifth insn)))
+          (:fp-toi (mvm-fp-toi buf (second insn) (third insn) (fourth insn)))
+          (:fpd-scale (mvm-fpd-scale buf (second insn) (third insn)))
+          (:fpd-li (mvm-fpd-li buf (second insn) (third insn) (fourth insn)))
+          (:fp-li (mvm-fp-li buf (second insn) (third insn) (fourth insn)))
           (:fpd-add (mvm-fpd-add buf (second insn) (third insn) (fourth insn)))
           (:fpd-sub (mvm-fpd-sub buf (second insn) (third insn) (fourth insn)))
           (:fpd-mul (mvm-fpd-mul buf (second insn) (third insn) (fourth insn)))
@@ -29455,6 +30691,15 @@
                 (new-loc (or *current-source-location* "?")))
             (format t "  NOTE: redefining ~A  (old: ~A, new: ~A)~%"
                     (function-info-name info) old-loc new-loc)
+            ;; A DEFVAR / DEFPARAMETER / DEFCONSTANT's generated INIT- thunk is
+            ;; not a function seam: defining a variable twice is legal CL (the
+            ;; static self-host configuration compiles every DEFCONSTANT this
+            ;; way, and several are repeated across texts).
+            (unless (or (gethash (function-info-name info) *overridable-names*)
+                        (member (function-info-name info) *init-thunk-names*
+                                :test (function equal)))
+              (push (list (function-info-name info) old-loc new-loc)
+                    *undeclared-redefinitions*))
             (push (list (function-info-name info) old-loc new-loc)
                   *redefinition-log*))))
       ;; Register in function table
@@ -29682,8 +30927,10 @@
             (has-initform (consp (cddr form)))
             (name-hash (normalize-name name)))
        ;; Register as global variable
+       (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
+       (%note-build-special name)
        ;; Compile as a thunk that initializes the variable
        ;; IMPORTANT: 1) Use raw name-hash (NOT pre-shifted), because
        ;; compile-integer will apply fixnum-shift. Pre-shifting causes
@@ -29698,7 +30945,7 @@
            (push thunk-name *init-thunk-names*)
            (when (null value) (push thunk-name *init-nil-thunk-names*))
            (mvm-compile-function
-            thunk-name nil
+            (%init-thunk-fn-name thunk-name) nil
             ;; A NIL initform is the case this arm was widened to cover, and
             ;; it is the only one that can DESTROY state: several boot steps
             ;; run BEFORE (init-all-globals) and store into a global that also
@@ -29728,14 +30975,16 @@
             (has-initform (if *mvm-eval-runtime-p* (consp (cddr form)) value))
             (name-hash (normalize-name name)))
        ;; Register as global variable
+       (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
        (%note-runtime-special name-hash)
+       (%note-build-special name)
        (when has-initform
          (let ((tmp-var (%mvm-gensym "INIT-TMP"))
                (thunk-name (format nil "INIT-~A" (symbol-name name))))
            (push thunk-name *init-thunk-names*)
            (mvm-compile-function
-            thunk-name nil
+            (%init-thunk-fn-name thunk-name) nil
             (list `(let ((,tmp-var ,value))
                      ,(%init-thunk-store name name-hash tmp-var))))))))
 
@@ -29749,6 +30998,11 @@
 
     ;; (in-package ...) — skip, package system is SBCL-side only
     ((and (consp form) (name-eq (car form) "IN-PACKAGE"))
+     nil)
+
+    ;; (%source-file PATH) — the build's per-file marker: mvm-compile-all reads
+    ;; it for locations; it compiles to nothing.
+    ((and (consp form) (name-eq (car form) "%SOURCE-FILE"))
      nil)
 
     ;; Package operations — no-op (flat namespace via name hashes)
@@ -29765,6 +31019,9 @@
      (%declaim-note-optimize form)
      (when (and *aot-inline* (not *mvm-eval-runtime-p*))
        (%declaim-note-inline form))
+     (unless *mvm-eval-runtime-p*
+       (%declaim-note-overridable form)
+       (%declaim-note-special-build form))
      (when *mvm-eval-runtime-p*
        (%declaim-note-inline form)
        (%declaim-note-type form)
@@ -29809,6 +31066,7 @@
                               (eq value-form t) (null value-form))
                           value-form
                           (eval value-form))))
+           (%note-global name :def)
            (setf (gethash (normalize-name name) *constants*) value)
            ;; Make available for subsequent eval calls (skip if already a constant)
            (when (and (symbolp name)
@@ -29834,7 +31092,7 @@
                    (name-hash (normalize-name name)))
                (push thunk-name *init-thunk-names*)
                (mvm-compile-function
-                thunk-name nil
+                (%init-thunk-fn-name thunk-name) nil
                 (list `(let ((,tmp-var ',value))
                          ,(%init-thunk-store name name-hash tmp-var)))))))))
      nil)
@@ -29859,8 +31117,12 @@
     ;; list or vector: expand it (see %DS-TYPED-EXPANSION) and compile that.
     ((and (consp form) (name-eq (car form) "DEFSTRUCT")
           (consp (cadr form)) (%ds-type-option (cdr (cadr form))))
-     (mvm-compile-toplevel (cons 'progn (%ds-typed-expansion form))))
+     (let ((*defstruct-home* (%defstruct-home-pkg (cadr form))))
+       (declare (special *defstruct-home*))
+     (mvm-compile-toplevel (cons 'progn (%ds-typed-expansion form)))))
     ((and (consp form) (name-eq (car form) "DEFSTRUCT"))
+     (let ((*defstruct-home* (%defstruct-home-pkg (cadr form))))
+       (declare (special *defstruct-home*))
      (let* ((name-and-options (cadr form))
             ;; Parse struct name and options
             (struct-name (if (consp name-and-options) (car name-and-options) name-and-options))
@@ -30647,12 +31909,15 @@
          (dolist (gen-form (nreverse forms-to-compile))
            (let ((result (mvm-compile-toplevel gen-form)))
              (when result (push result results))))
-         (cons :multi-result (nreverse results))))))
+         (cons :multi-result (nreverse results)))))))
 
     ;; Other top-level forms: wrap in anonymous function
     (t
      (let ((thunk-name (format nil "TOPLEVEL-~D" (make-compiler-label))))
        (mvm-compile-function thunk-name nil (list form))))))
+
+(defvar *last-compiled-functions* nil
+  "*FUNCTIONS* of the last host-side MVM-COMPILE-ALL, for the build checks.")
 
 (defvar *fail-on-compile-skip* nil
   "When true, MVM-COMPILE-ALL fails after compiling every form if any form
@@ -30690,6 +31955,7 @@
         (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)
         (all-ir nil))
+    (declare (special *uwp-seq-counter*))   ; #248: reset per unit in-image too
     ;; REPRODUCIBLE BUILDS: reset the compiler's own gensym counter so the
     ;; names macro expansion bakes into this module depend only on the FORMS
     ;; being compiled and the order they are compiled in — never on whatever
@@ -30700,6 +31966,9 @@
     ;; (Same reason *init-thunk-names* is not let-bound — see the note below.)
     (setq *mvm-gensym-counter* 0)
     (setq *%defun-deferred* nil)
+    ;; the build checks read this module's function registry afterwards
+    ;; (mvm/build-checks.lisp); host builds only, so no image retains it
+    (unless *mvm-eval-runtime-p* (setq *last-compiled-functions* *functions*))
     ;; NOTE: *init-thunk-names* is intentionally NOT let-bound here.  It is
     ;; PUSH-mutated from the defvar/defparameter handler in mvm-compile-toplevel
     ;; (a DIFFERENT function called during phase 1) and read back below to
@@ -30720,6 +31989,9 @@
     ;; *MULTI-SHAPE-DEFUNS*).  SETQ, not LET, for the same in-image reason as
     ;; *MVM-GENSYM-COUNTER* above.
     (setq *multi-shape-defuns* (%collect-multi-shape-defuns forms))
+    (setq *blob-global-names* (%collect-blob-global-names forms))
+    (unless *mvm-eval-runtime-p*
+      (setq *build-special-symbols* (%collect-blob-special-symbols forms)))
     ;; Diagnostic dump behind a plain special (set it by hand), not #+sbcl +
     ;; posix-getenv + a LAMBDA: a feature conditional reads differently under
     ;; SBCL's reader and Modus's own, and the closure it hid was the one
@@ -30741,10 +32013,19 @@
       (handler-case
        (progn
         (setf *pending-flet-ir* nil)
-        (setf *current-source-location*
-              (if (and source-lines (< form-index (length source-lines)))
-                  (format nil "line ~D" (aref source-lines form-index))
-                  (format nil "form#~D" form-index)))
+        (let ((line (and source-lines (< form-index (length source-lines))
+                         (aref source-lines form-index))))
+          (when (and (consp form) (symbolp (car form))
+                     (string= (symbol-name (car form)) "%SOURCE-FILE")
+                     (consp (cdr form)) (stringp (cadr form)))
+            (setf *current-source-file* (cadr form)
+                  *current-source-file-line* (or line 1)))
+          (setf *current-source-location*
+                (cond ((and line *current-source-file*)
+                       (format nil "~A:~D" *current-source-file*
+                               (+ 1 (- line *current-source-file-line*))))
+                      (line (format nil "line ~D" line))
+                      (t (format nil "form#~D" form-index)))))
         (when *compile-trace*
           (format t ";; compile ~A: ~A~%"
                   *current-source-location*
@@ -30833,7 +32114,7 @@
       ;; modus-sh — so every thunk call became a call to NIL (936 of them, the
       ;; self-compiled image died at boot in INIT-ALL-GLOBALS).  Fall back to
       ;; the current package, which is MODUS.MVM at build time anyway.
-      (let ((pkg (or (find-package :modus.mvm) *package*)))
+      (let ((pkg (or (%build-mvm-package) *package*)))
         (dolist (thunk-name (nreverse *init-thunk-names*))
           (push `(handler-case (,(intern thunk-name pkg))
                    (t (c) nil))
@@ -30848,7 +32129,7 @@
       ;; %RUN-NIL-DEFVAR-INITS: the NIL-initform DEFVARs alone (see
       ;; *INIT-NIL-THUNK-NAMES*).  Always generated, as INIT-ALL-GLOBALS is.
       (let ((nil-calls nil)
-            (pkg (or (find-package :modus.mvm) *package*)))
+            (pkg (or (%build-mvm-package) *package*)))
         (dolist (thunk-name (reverse *init-nil-thunk-names*))
           (push `(handler-case (,(intern thunk-name pkg)) (t (c) nil)) nil-calls))
         (let* ((result (mvm-compile-toplevel
@@ -31174,17 +32455,19 @@
 ;;; ============================================================
 
 (defun test-mvm-compiler ()
-  "Basic test of the MVM compiler"
+  "Basic test of the MVM compiler.  The quoted test forms say CL:DEFUN: the build's
+   function-table scanner reads source TEXT, and a quoted (defun fib ...) here once
+   seeded the image with #'FIB, #'DOUBLE ... for functions it never had."
   ;; Test 1: Simple function
   (format t "~%=== Test 1: (defun add1 (x) (1+ x)) ===~%")
   (let ((module (mvm-compile-all
-                 '((defun add1 (x) (1+ x))))))
+                 '((cl:defun add1 (x) (1+ x))))))
     (disassemble-module module))
 
   ;; Test 2: Fibonacci
   (format t "~%=== Test 2: fibonacci ===~%")
   (let ((module (mvm-compile-all
-                 '((defun fib (n)
+                 '((cl:defun fib (n)
                      (if (< n 2)
                          n
                          (+ (fib (1- n))
@@ -31194,7 +32477,7 @@
   ;; Test 3: List manipulation
   (format t "~%=== Test 3: list operations ===~%")
   (let ((module (mvm-compile-all
-                 '((defun list-length (lst)
+                 '((cl:defun list-length (lst)
                      (let ((count 0))
                        (loop
                          (if (null lst)
@@ -31207,8 +32490,8 @@
   ;; Test 4: Multiple functions
   (format t "~%=== Test 4: multiple functions ===~%")
   (let ((module (mvm-compile-all
-                 '((defun double (x) (* x 2))
-                   (defun quadruple (x) (double (double x)))))))
+                 '((cl:defun double (x) (* x 2))
+                   (cl:defun quadruple (x) (double (double x)))))))
     (disassemble-module module))
 
   (format t "~%All MVM compiler tests passed.~%")

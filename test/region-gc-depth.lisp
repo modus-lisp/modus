@@ -42,7 +42,7 @@
 (defvar *fail* 0)
 (defvar *checks* 0)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -58,7 +58,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A = ~D (expected it in [~D,~D))~%" name got lo hi))))
 
-(let ((res (%gc-region-depth-selftest *nlinks* *depth*)))
+(let ((res (modus-int::%gc-region-depth-selftest *nlinks* *depth*)))
   (if (= res 0)
       (format t "~%SKIP: the active region is too small to carve a region from.~%")
       (let* ((rcb (w res 0))   (r0 (w res 8))    (k (w res 16))

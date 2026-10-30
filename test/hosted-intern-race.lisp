@@ -55,8 +55,8 @@
   "How many of the hashes the lock-free probe already finds.  Must be 0."
   (let ((n 0))
     (dotimes (i *n*)
-      (when (%ht-get-ro (key-of i) (mem-ref #x10000148 :u64)) (setq n (+ n 1)))
-      (when (%ht-get-ro (%symbol-pkg-key (sym-key-of i) *spkg*) (mem-ref #x10000088 :u64))
+      (when (modus-int::%ht-get-ro (key-of i) (mem-ref #x10000148 :u64)) (setq n (+ n 1)))
+      (when (modus-int::%ht-get-ro (modus-int::%symbol-pkg-key (sym-key-of i) *spkg*) (mem-ref #x10000088 :u64))
         (setq n (+ n 1))))
     n))
 
@@ -65,12 +65,12 @@
    meet each other at different points."
   (let ((kv (aref *kres* id)) (sv (aref *sres* id))
         (stride (aref #(1 7919 104729 1299709) id)) (j (* id 5003)))
-    (setf (aref *times* (* 2 id)) (%monotonic-ns))
+    (setf (aref *times* (* 2 id)) (modus-int::%monotonic-ns))
     (dotimes (k *n*)
       (setq j (mod (+ j stride) *n*))
-      (setf (aref kv j) (%intern-keyword (key-of j)))
-      (setf (aref sv j) (%intern-symbol-pkg (sym-key-of j) *spkg*)))
-    (setf (aref *times* (+ 1 (* 2 id))) (%monotonic-ns))
+      (setf (aref kv j) (modus-int::%intern-keyword (key-of j)))
+      (setf (aref sv j) (modus-int::%intern-symbol-pkg (sym-key-of j) *spkg*)))
+    (setf (aref *times* (+ 1 (* 2 id))) (modus-int::%monotonic-ns))
     0))
 
 (format t "~%=== ~D THREADS INTERN THE SAME ~D KEYWORDS AND SYMBOLS ===~%" *nthreads* *n*)
@@ -79,7 +79,7 @@
   (dotimes (w *nthreads*)
     (let ((id w))
       (setq ths (cons (sb-thread:make-thread
-                       (lambda () (handler-case (racer id) (error (e) (list :err (%escape-describe e))))))
+                       (lambda () (handler-case (racer id) (error (e) (list :err (modus-int::%escape-describe e))))))
                       ths))))
   (let ((rs (mapcar (function sb-thread:join-thread) (reverse ths))))
     (chk "every thread finished" rs (make-list *nthreads* :initial-element 0))))
@@ -98,8 +98,8 @@
       (dotimes (w *nthreads*)
         (unless (eq (aref (aref *kres* w) i) k0) (setq kdiff (+ kdiff 1)))
         (unless (eq (aref (aref *sres* w) i) s0) (setq sdiff (+ sdiff 1))))
-      (unless (eq (%intern-keyword (key-of i)) k0) (setq kafter (+ kafter 1)))
-      (unless (eq (%intern-symbol-pkg (sym-key-of i) *spkg*) s0) (setq safter (+ safter 1)))))
+      (unless (eq (modus-int::%intern-keyword (key-of i)) k0) (setq kafter (+ kafter 1)))
+      (unless (eq (modus-int::%intern-symbol-pkg (sym-key-of i) *spkg*) s0) (setq safter (+ safter 1)))))
   (chk "keywords that differ between threads" kdiff 0)
   (chk "symbols that differ between threads" sdiff 0)
   (chk "results that are not keywords" knotkw 0)
@@ -135,7 +135,7 @@
   (dotimes (w *nthreads*)
     (let ((id w))
       (setq ths (cons (sb-thread:make-thread
-                       (lambda () (handler-case (string-racer id) (error (e) (list :err (%escape-describe e))))))
+                       (lambda () (handler-case (string-racer id) (error (e) (list :err (modus-int::%escape-describe e))))))
                       ths))))
   (chk "every string thread finished" (mapcar (function sb-thread:join-thread) (reverse ths))
        (make-list *nthreads* :initial-element 0)))

@@ -1,6 +1,8 @@
 ;;;; cl-fileio.lisp — File I/O: Linux syscalls, file streams, open/close, pathnames
 ;;;; Part of the Modus CL runtime. Depends on cl-streams.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Layer 7: File I/O — Linux syscall backend
 ;;; ============================================================
@@ -51,6 +53,7 @@
 ;;; names the question instead, and net/hosted-sockets-post.lisp answers it by
 ;;; last-defun-wins — exactly what that file already does for %SOCK-IO-BUF, and
 ;;; for the same reason.  Alone, this defun is the historic behaviour verbatim.
+(declaim (overridable %fs-io-page))
 (defun %fs-io-page ()
   "The address of THIS THREAD's raw I/O staging page, 4096 bytes.
    Overridden in net/hosted-sockets-post.lisp once per-CPU blocks exist."
@@ -160,6 +163,7 @@
 ;;; BUT: addresses like 0x1DF00000 when tagged (SHL 1) = 0x3BE00000 which is a valid fixnum.
 ;;; syscall3 untags: 0x3BE00000 SHR 1 = 0x1DF00000. Correct!
 
+(declaim (overridable %sys-open-rdonly))
 (defun %sys-open-rdonly (path-str)
   "Open file for reading. Returns fd (fixnum) or negative errno."
   (if (%cab-on)
@@ -169,6 +173,7 @@
         ;; syscall3: num=2(open), arg1=path-ptr(tagged addr), arg2=flags=0(O_RDONLY), arg3=0
         (syscall3 2 *cstr-scratch* 0 0))))
 
+(declaim (overridable %sys-open-wronly))
 (defun %sys-open-wronly (path-str)
   "Open file for writing (create/truncate). Returns fd or negative errno."
   (if (%cab-on)
@@ -178,6 +183,7 @@
         ;; O_WRONLY|O_CREAT|O_TRUNC = 1|0x40|0x200 = 0x241 = 577
         (syscall3 2 *cstr-scratch* 577 420))))  ; 420 = 0644 octal
 
+(declaim (overridable %sys-open-append))
 (defun %sys-open-append (path-str)
   "Open file for appending. Returns fd or negative errno."
   (if (%cab-on)
@@ -188,6 +194,7 @@
         ;; O_WRONLY|O_CREAT|O_APPEND = 1|0x40|0x400 = 0x441 = 1089
         (syscall3 2 *cstr-scratch* 1089 420))))
 
+(declaim (overridable %sys-open-rdwr))
 (defun %sys-open-rdwr (path-str)
   "Open file for read+write. Returns fd or negative errno."
   (if (%cab-on)
@@ -198,6 +205,7 @@
         ;; O_RDWR|O_CREAT = 2|0x40 = 66
         (syscall3 2 *cstr-scratch* 66 420))))
 
+(declaim (overridable %sys-open-wronly-existing))
 (defun %sys-open-wronly-existing (path-str)
   "Open an EXISTING file for writing, neither creating nor truncating it
    (OPEN :IF-EXISTS :OVERWRITE).  Returns fd or negative errno."
@@ -208,6 +216,7 @@
         ;; O_WRONLY = 1
         (syscall3 2 *cstr-scratch* 1 0))))
 
+(declaim (overridable %sys-open-create-excl))
 (defun %sys-open-create-excl (path-str)
   "Open/create file exclusively (error if exists). Returns fd or negative errno."
   (if (%cab-on)
@@ -218,17 +227,20 @@
         ;; O_WRONLY|O_CREAT|O_EXCL = 1|0x40|0x80 = 0xC1 = 193
         (syscall3 2 *cstr-scratch* 193 420))))
 
+(declaim (overridable %sys-close))
 (defun %sys-close (fd)
   "Close file descriptor."
   (cond ((%cab-fd-p fd) (%cab-fd-close fd))
         ((%net-fd-p fd) (funcall *net-fd-call* :close fd))
         (t (syscall3 3 fd 0 0))))
 
+(declaim (overridable %sys-getpid))
 (defun %sys-getpid ()
   "Linux x64 syscall 39 (getpid).  Used to disambiguate per-process
    temp file paths so parallel shards don't race on a shared name."
   (syscall3 39 0 0 0))
 
+(declaim (overridable %sys-read-raw))
 (defun %sys-read-raw (fd buf-addr count)
   "Read COUNT bytes from FD into buf at BUF-ADDR. Returns bytes read or negative.
    EINTR (-4) is retried: it means a signal arrived before any byte moved, and with
@@ -239,6 +251,7 @@
     (let ((n (syscall3 0 fd buf-addr count)))
       (unless (= n -4) (return n)))))
 
+(declaim (overridable %sys-write-raw))
 (defun %sys-write-raw (fd buf-addr count)
   "Write COUNT bytes from buf at BUF-ADDR to FD. Returns bytes written or negative.
    EINTR is retried, as for %SYS-READ-RAW."
@@ -302,6 +315,7 @@
         (setf (mem-ref page :u8) code)
         (%sys-write-raw fd page 1))))
 
+(declaim (overridable %sys-lseek))
 (defun %sys-lseek (fd offset whence)
   "Seek FD. whence: 0=SEEK_SET, 1=SEEK_CUR, 2=SEEK_END."
   (if (%cab-fd-p fd)
@@ -313,6 +327,7 @@
         new)
       (syscall3 8 fd offset whence)))
 
+(declaim (overridable %sys-unlink))
 (defun %sys-unlink (path-str)
   "Delete a file."
   (if (%cab-on)
@@ -320,6 +335,7 @@
       (progn (%string-to-cstr path-str *cstr-scratch*)
              (syscall3 87 *cstr-scratch* 0 0))))
 
+(declaim (overridable %sys-rename))
 (defun %sys-rename (old-str new-str)
   "Rename a file."
   (if (%cab-on)
@@ -331,6 +347,7 @@
           (%string-to-cstr new-str new-addr)
           (syscall3 82 *cstr-scratch* new-addr 0)))))
 
+(declaim (overridable %sys-mkdir))
 (defun %sys-mkdir (path-str mode)
   "Create a directory."
   (if (%cab-on)
@@ -341,6 +358,7 @@
 ;;; stat(2) on Linux x64: syscall 4, fills struct stat (144 bytes)
 ;;; We only need st_size at offset 48 and st_mtime at offset 88.
 ;;; Use :u32 loads (tagged) for values that fit in 32 bits.
+(declaim (overridable %sys-stat-size))
 (defun %sys-stat-size (path-str)
   "Return file size in bytes (lower 32 bits), or -1 if not found."
   (when (%cab-on)
@@ -358,6 +376,7 @@
           ;; st_size is at offset 48 in struct stat (little-endian, lower 32 bits)
           (mem-ref (+ buf-addr 48) :u32)))))
 
+(declaim (overridable %sys-stat-exists))
 (defun %sys-stat-exists (path-str)
   "Return t if file exists, nil otherwise."
   (when (%cab-on) (return-from %sys-stat-exists (if (%cab :exists path-str) t nil)))
@@ -366,6 +385,7 @@
     (let ((ret (syscall3 4 path-addr buf-addr 0)))
       (if (< ret 0) nil t))))
 
+(declaim (overridable %sys-stat-mtime))
 (defun %sys-stat-mtime (path-str)
   "Return file modification time (lower 32 bits of seconds since epoch), or 0."
   (when (%cab-on) (return-from %sys-stat-mtime (%cab :mtime path-str)))
@@ -378,6 +398,7 @@
           (mem-ref (+ buf-addr 88) :u32)))))
 
 ;;; fstat(2) on Linux x64: syscall 5, fills struct stat
+(declaim (overridable %sys-fstat-size))
 (defun %sys-fstat-size (fd)
   "Return file size for open fd (lower 32 bits), or -1."
   (when (%cab-fd-p fd)
@@ -406,6 +427,7 @@
     (%make-stream 9
       (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons nil elt-type))))))))))
 
+(declaim (overridable %fd-input-ready-p))
 (defun %fd-input-ready-p (fd)
   "T when a read on FD would not block.  THE CONSERVATIVE ANSWER IS T, and this
    is the conservative definition: a plain file always has something to read (or
@@ -1069,8 +1091,17 @@
       ;; A host file: read(2) the rest a page at a time straight into SEQ.  The
       ;; stream's buffer is drained, so the next READ-BYTE refills from where
       ;; this leaves the descriptor.  It used to fall back to READ-BYTE per
-      ;; element -- ~186 ns a byte, 50 ms to read one 270 KB fasl.
-      (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)))
+      ;; element -- ~186 ns a byte, 50 ms to read one 270 KB fasl.  NOT a socket
+      ;; that *NET-FD-CALL* serves (bare metal): read(2) there is an SVC with no
+      ;; OS behind it, and the core halted on a board's first READ-SEQUENCE from
+      ;; a socket stream.  Those fall through to the byte loop, whose buffer
+      ;; refill (%SYS-READ-INTO-BUF) routes them -- or, here, in bulk: the rest of SEQ
+      ;; straight from the connection, until it is full or the peer has closed.
+      (when (and (< i end) (>= fd 0) (%net-fd-p fd))
+        (let ((j (funcall *net-fd-call* :read-bytes fd seq i end)))
+          (%fs-set-pos stream (+ (%fs-pos stream) (- j i)))
+          (setq i j)))
+      (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
         (loop
           (when (>= i end) (return nil))
           (let ((n (%sys-read-raw fd (%fs-io-page) (min 4096 (- end i)))))
@@ -1144,6 +1175,12 @@
 (defun %fs-write-bytes (stream seq start end)
   "Write SEQ[START,END) to the file stream in 4 KB system calls; T if done."
   (let ((fd (%fs-fd stream)))
+    ;; A socket *NET-FD-CALL* serves (bare metal): the whole slice in one call.  Through
+    ;; WRITE-BYTE it was a dispatch per byte -- a 1.2 MB RFB frame took minutes on a board.
+    (when (and (%fs-bulk-ok-p stream seq) (%net-fd-p fd))
+      (funcall *net-fd-call* :write-bytes fd seq start end)
+      (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
+      (return-from %fs-write-bytes t))
     (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
       (let ((page (%fs-io-page)) (i start))
         (loop
@@ -2153,13 +2190,19 @@
     (if (%sys-stat-exists path) (truename x) nil)))
 
 ;;; --- truename ---
+(declaim (overridable %sys-getcwd-nr))
+(defun %sys-getcwd-nr ()
+  "getcwd(2)'s syscall number: 79 on x86-64.  Each other CLI's arch slot
+   overrides it (183 i386 and arm32, 17 on the generic ABI: aarch64, RISC-V).
+   A port that forgets gets syscall 79 of ITS table -- fstatat on RISC-V,
+   fstatfs on arm32 -- and every relative pathname then resolves against /."
+  79)
 (defun %sys-getcwd ()
-  "The process's current directory as a string, or NIL.  getcwd(2) is
-   syscall 79 on x86-64; the i386 and aarch64 CLIs override this."
+  "The process's current directory as a string, or NIL."
   (if (%cab-on)
       "/"
       (let* ((buf (%fs-io-page))
-             (ret (syscall3 79 buf 4000 0)))
+             (ret (syscall3 (%sys-getcwd-nr) buf 4000 0)))
         (if (<= ret 0)
             nil
             (let ((out (make-string-output-stream)) (i 0))
@@ -2188,6 +2231,7 @@
                                "" "/")
                            rel))))))
 
+(declaim (overridable %sys-readlink))
 (defun %sys-readlink (path-str)
   "The target of the symbolic link PATH-STR as a string, or NIL when it is not one (or
    cannot be read).  readlink(2) is syscall 89 on x86-64; other CLIs override this."
@@ -2328,6 +2372,7 @@
 (defvar *%dirent-buf-addr* (%conv-addr #x1DD00000))  ; 1MB scratch for getdents
 (defvar *%dirent-buf-size* 4096)
 
+(declaim (overridable %sys-getdents64))
 (defun %sys-getdents64 (fd buf-addr buf-size)
   "Linux SYS_getdents64 (217) — returns bytes read (≤ size) or -1."
   (handler-case (syscall3 217 fd buf-addr buf-size) (t (c) -1)))
@@ -3091,6 +3136,7 @@
 ;;; ============================================================
 ;;; Sleep (stub)
 ;;; ============================================================
+(declaim (overridable sleep))
 (defun sleep (n) nil)
 
 ;;; ============================================================
@@ -3102,8 +3148,10 @@
 
 (defun machine-instance ()            "modus")
 
+(declaim (overridable machine-type))
 (defun machine-type ()                "x86_64")
 
+(declaim (overridable machine-version))
 (defun machine-version ()             "x86_64")
 
 (defun software-type ()               "Modus")
@@ -3117,6 +3165,7 @@
 ;;; ============================================================
 ;;; Time Functions (stubs)
 ;;; ============================================================
+(declaim (overridable get-universal-time))
 (defun get-universal-time ()
   "Return seconds since 1900-01-01: CLOCK_REALTIME (Unix epoch) plus the
    70-year offset 2208988800.  Through %CLOCK-GETTIME-NS, the one per-arch
@@ -3226,6 +3275,7 @@
 
 (defconstant +clock-process-cputime+ 2)
 
+(declaim (overridable %clock-gettime-ns))
 (defun %clock-gettime-ns (clk)
   "clock_gettime(2) CLK as whole nanoseconds, or 0 where the syscall is not
    there (bare metal, where the handler-case catches the trap).
@@ -3246,10 +3296,12 @@
           (+ (* sec 1000000000) nsec))
         0)))
 
+(declaim (overridable %irt-ns))
 (defun %irt-ns ()
   "Monotonic elapsed nanoseconds, or 0 if this target has no clock."
   (%clock-gettime-ns +clock-monotonic+))
 
+(declaim (overridable %irun-ns))
 (defun %irun-ns ()
   "Consumed CPU nanoseconds, or 0 if this target has no clock."
   (%clock-gettime-ns +clock-process-cputime+))
@@ -3278,6 +3330,7 @@
          (* ns (floor per 1000000000))
          (floor ns (floor 1000000000 per))))))
 
+(declaim (overridable get-internal-real-time))
 (defun get-internal-real-time ()
   "CLHS GET-INTERNAL-REAL-TIME: elapsed time in INTERNAL-TIME-UNITS from an
    arbitrary origin.  A monotonic clock where there is one; a call counter

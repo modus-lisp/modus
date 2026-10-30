@@ -68,14 +68,14 @@
       (setq n (+ n 1)))
     (list bad n (length junk))))
 
-(defun region0-gcs () (%gc-meta-read (+ (%gc-region-0) #x20) (%gc-meta-scale)))
+(defun region0-gcs () (modus-int::%gc-meta-read (+ (modus-int::%gc-region-0) #x20) (modus-int::%gc-meta-scale)))
 
 (format t "~%=== REGION 0 COLLECTS UNDER RUNNING WORKERS ==============~%")
 (let ((ths nil) (g0 0) (g1 0) (i 0))
   (dotimes (w *nworkers*)
     (let ((id w))
       (setq ths (cons (sb-thread:make-thread (lambda () (worker id))) ths))))
-  (%sleep-ms 50)
+  (modus-int::%sleep-ms 50)
   (setq g0 (region0-gcs))
   ;; Churn region 0 until it has collected *MIN-GCS* times (bounded).  In
   ;; ARRAYS, about 8 MB a round: region 0 is ~600 MB once the lock arena is

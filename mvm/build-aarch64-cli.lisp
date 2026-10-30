@@ -800,19 +800,8 @@
       (progn
         (%string-to-cstr path-str *cstr-scratch*)
         (%aarch64-openat *cstr-scratch* 193 420))))
-;; getcwd(2) is syscall 17 here (cl-fileio's default is x86-64's 79).
-(defun %sys-getcwd ()
-  (let* ((buf *io-buf-addr*)
-         (ret (syscall3 17 buf 1000 0)))
-    (if (<= ret 0)
-        nil
-        (let ((out (make-string-output-stream)) (i 0))
-          (loop
-            (let ((c (mem-ref (+ buf i) :u8)))
-              (when (or (= c 0) (>= i 1000)) (return nil))
-              (%print-char c out))
-            (setq i (+ i 1)))
-          (get-output-stream-string out)))))
+;; getcwd(2) is syscall 17 here (cl-fileio's %sys-getcwd asks this).
+(defun %sys-getcwd-nr () 17)
 (defun %sys-unlink (path-str)
   (if (%cab-on)
       (progn (%cab :unlink path-str) 0)

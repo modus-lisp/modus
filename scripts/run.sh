@@ -13,18 +13,18 @@
 #
 # Usage:
 #   ./scripts/run.sh list                    # show the matrix
-#   ./scripts/run.sh x64-repl                # interactive serial REPL
-#   ./scripts/run.sh x64-repl "(+ 1 2)"      # eval one expression, print, exit
-#   ./scripts/run.sh aarch64-ssh             # boot, wait for sshd, run a smoke test
+#   ./scripts/run.sh x64-cl-repl             # interactive serial REPL
+#   ./scripts/run.sh x64-cl-repl "(+ 1 2)"   # eval one expression, print, exit
+#   ./scripts/run.sh i386-ssh                # boot, wait for sshd, run a smoke test
 #   ./scripts/run.sh x64-ssh "(* 6 7)"       # boot, run THIS expression over ssh
-#   ./scripts/run.sh aarch64-ssh --keep      # ... and leave QEMU running
-#   ./scripts/run.sh x64-ssh --serve         # boot and BLOCK, like run-x64-ssh.sh
+#   ./scripts/run.sh i386-ssh --keep         # ... and leave QEMU running
+#   ./scripts/run.sh x64-ssh --serve         # boot and BLOCK
 #   PORT=2223 ./scripts/run.sh x64-ssh       # override the forwarded port
 #
 # Environment:
 #   PORT                 forwarded ssh port (default 2222)
 #   SBCL_DYNAMIC_SPACE   MB for the build's SBCL heap (default 12288)
-#   REPL_TIMEOUT         see run-repl-eval.sh (default 60s)
+#   REPL_TIMEOUT         see run-repl-eval.sh (default 300s)
 #   MODUS_NO_REBUILD=1   never rebuild; boot the image already on disk
 #
 # Ctrl-A X quits QEMU in interactive mode.
@@ -48,30 +48,15 @@ SCRIPTDIR="$(cd "$(dirname "$0")" && pwd)"
 # Machine flags are transcribed VERBATIM from the script each row replaces.
 # ---------------------------------------------------------------------------
 read -r -d '' TARGETS <<'EOF' || true
-x64-repl|repl|x64/bare/qemu/repl|/tmp/modus-x64.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
-x64-cl-repl|repl|build-x64-cl-repl|/tmp/modus-x64-cl-repl.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
-x64-ssh|ssh|x64/bare/qemu/ssh|/tmp/modus-x64-ssh.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|x64
-aarch64-repl|repl|aarch64/bare/qemu/repl|/tmp/modus-aarch64.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|||aarch64
-aarch64-ssh|ssh|aarch64/bare/qemu/ssh|/tmp/modus-aarch64-ssh.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|aarch64
-aarch64-actors|ssh|aarch64/bare/qemu/actors|/tmp/modus-aarch64-actors.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|aarch64
-aarch64-isolated|ssh|aarch64/bare/qemu/isolated|/tmp/modus-aarch64-isolated.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 512 -nographic -semihosting|-device e1000,netdev=net0,romfile=,rombar=0|SSH:;120;5|aarch64
-i386-cl-repl|repl|build-i386-cl-repl|/tmp/modus-i386-cl-repl.bin|qemu-system-i386|-m 1024 -display none -serial stdio -no-reboot|||i386
-i386-repl|repl|build-i386-repl|/tmp/modus-i386.bin|qemu-system-i386|-m 256 -display none -serial stdio -no-reboot|||i386
-i386-ssh|ssh|i386/bare/qemu/ssh|/tmp/modus-i386-ssh.bin|qemu-system-i386|-m 256 -nographic -no-reboot|-device ne2k_isa,netdev=net0,iobase=0x300,irq=9|DHCP:IP=;120;5|i386
-arm32-cl-repl|repl|build-arm32-cl-repl|/tmp/modus-arm32-cl-repl.bin|qemu-system-arm|-M virt,highmem=off -cpu cortex-a15 -m 1024 -display none -serial stdio -no-reboot|||arm32
-arm32-repl|repl|build-arm32-repl|/tmp/modus-arm32.bin|qemu-system-arm|-M virt,highmem=off -cpu cortex-a15 -m 256 -nographic|||arm32
-rpi-repl|repl|aarch64/bare/rpi/repl|/tmp/kernel8.img|qemu-system-aarch64|-machine raspi3b -display none -serial stdio -semihosting|||rpi
-rpi-ssh|ssh|build-rpi-ssh|/tmp/kernel8-ssh.img|qemu-system-aarch64|-machine raspi3b -display none -serial stdio|-device usb-net,netdev=net0|SSH:;180;15|rpi
-rpi-hid|repl|build-rpi-hid|/tmp/kernel8-hid.img|qemu-system-aarch64|-machine raspi3b -display none -serial stdio -device usb-kbd|||rpi
-rpi-periph|repl|build-rpi-periph|/tmp/piboot/kernel8.img|qemu-system-aarch64|-M raspi3b -serial null -serial stdio -display gtk|||rpi
+x64-cl-repl|repl|x64/bare/qemu/cl-repl|/tmp/modus-x64-cl-repl.bin|qemu-system-x86_64|-m 512 -nographic -no-reboot|||x64
+x64-ssh|ssh|x64/bare/qemu/cl-ssh|/tmp/modus-x64-cl-ssh.bin|qemu-system-x86_64|-cpu max -m 512 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0|NETUP;1200;3|x64
+aarch64-cl-repl|repl|aarch64/bare/qemu/cl-repl|/tmp/modus-aarch64-cl-repl.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 1024 -nographic -no-reboot|||aarch64
+aarch64-ssh|ssh|aarch64/bare/qemu/cl-ssh|/tmp/modus-aarch64-cl-ssh.bin|qemu-system-aarch64|-machine virt -cpu cortex-a57 -m 1024 -nographic -no-reboot|-device e1000,netdev=net0,romfile=,rombar=0|NETUP;1200;3|aarch64
+i386-cl-repl|repl|i386/bare/qemu/cl-repl|/tmp/modus-i386-cl-repl.bin|qemu-system-i386|-m 1024 -display none -serial stdio -no-reboot|||i386
+i386-ssh|ssh|i386/bare/qemu/cl-ssh|/tmp/modus-i386-cl-ssh.bin|qemu-system-i386|-m 1024 -nographic -no-reboot|-device ne2k_isa,netdev=net0,iobase=0x300,irq=9|NETUP;1200;3|i386
+arm32-cl-repl|repl|arm32/bare/qemu/cl-repl|/tmp/modus-arm32-cl-repl.bin|qemu-system-arm|-M virt,highmem=off -cpu cortex-a15 -m 1024 -display none -serial stdio -no-reboot|||arm32
+rpi-cl-repl|repl|aarch64/bare/rpi/cl-repl|/tmp/piboot/kernel8.img|qemu-system-aarch64|-machine raspi3b -display none -serial stdio -semihosting|||rpi
 EOF
-
-# Targets whose BUILD is known broken (mvm/BUILDS.md, verified 2026-08-02).
-# Listed rather than hidden: the runner should tell you WHY, not fail obscurely.
-KNOWN_BROKEN="rpi-repl rpi-ssh rpi-hid rpi-periph"
-BROKEN_NOTE="RPi/PiZero builds are broken (A64-BUFFER/MVM-BUFFER type error).
-The plan is to MIGRATE this family to the CL/mvm image (task #209), not to
-repair the legacy :RPI path — so this target is expected to fail at build."
 
 # Targets that are NOT plain qemu boots and keep their own scripts.
 declare -A SPECIAL=(
@@ -89,8 +74,7 @@ do_list() {
   while IFS='|' read -r t mode build bin qemu flags net ready arch; do
     [ -z "$t" ] && continue
     local note=""
-    case " $KNOWN_BROKEN " in *" $t "*) note="BUILD BROKEN (see #209)";; esac
-    [ -n "$net" ] && [ -z "$note" ] && note="net"
+    [ -n "$net" ] && note="net"
     printf "  %-18s %-5s %-26s %s\n" "$t" "$mode" "$bin" "$note"
   done <<< "$TARGETS"
   echo
@@ -126,10 +110,6 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-
-case " $KNOWN_BROKEN " in
-  *" $TARGET "*) echo "run.sh: NOTE — $BROKEN_NOTE" >&2; echo >&2 ;;
-esac
 
 # --- build if the image is missing or ANY first-party source is newer -------
 # The *-repl.sh scripts compared the image against ONE build script;

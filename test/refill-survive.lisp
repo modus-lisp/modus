@@ -18,8 +18,8 @@
       (setq sum (+ sum (car p)))
       (setq cnt (+ cnt 1))
       (setq p (cdr p)))
-    (write-string-serial "COUNT=") (print-dec cnt) (terpri)
-    (write-string-serial "SUM=")   (print-dec sum) (terpri)
+    (modus-int::write-string-serial "COUNT=") (modus-int::print-dec cnt) (terpri)
+    (modus-int::write-string-serial "SUM=")   (modus-int::print-dec sum) (terpri)
     ;; 0+1+...+1999 = 1999000
-    (write-string-serial "OK=")
-    (print-dec (if (and (= cnt 2000) (= sum 1999000)) 1 0)) (terpri)))
+    (modus-int::write-string-serial "OK=")
+    (modus-int::print-dec (if (and (= cnt 2000) (= sum 1999000)) 1 0)) (terpri)))

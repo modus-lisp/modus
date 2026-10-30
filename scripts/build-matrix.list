@@ -24,9 +24,11 @@ web                | MODUS_WEB_OUT=/tmp/modus-web MODUS_NO_JIT=1       | mvm/bui
 # ---- bare-metal CL images (build-cl-repl-common) ----
 x64-cl-repl        | -                                                 | mvm/build-x64-cl-repl.lisp
 x64-cl-repl-pc     | MODUS_PC_CONSOLE=1                                | mvm/build-x64-cl-repl.lisp
+x64-cl-ssh         | MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_SSH_AUTOSTART=1 MODUS_CL_REPL_OUT=/tmp/modus-x64-cl-ssh.bin | mvm/build-x64-cl-repl.lisp
 i386-cl-repl       | -                                                 | mvm/build-i386-cl-repl.lisp
 i386-cl-repl-net   | MODUS_NET_BUILD=1                                 | mvm/build-i386-cl-repl.lisp
 i386-cl-repl-ssh   | MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1 | mvm/build-i386-cl-repl.lisp
+i386-cl-ssh        | MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_SSH_AUTOSTART=1 MODUS_CL_REPL_OUT=/tmp/modus-i386-cl-ssh.bin | mvm/build-i386-cl-repl.lisp
 uefi-cl-repl       | -                                                 | mvm/build-uefi-cl-repl.lisp
 arm32-cl-repl      | -                                                 | mvm/build-arm32-cl-repl.lisp
 aarch64-virt       | -                                                 | mvm/build-aarch64.lisp
@@ -44,26 +46,5 @@ ppc32-linux        | -                                                 | mvm/bui
 ppc64-linux        | -                                                 | mvm/build-hosted.lisp ppc64 test/arch-rungs/r08-cons.lisp
 riscv-linux        | -                                                 | mvm/build-hosted.lisp riscv64 test/arch-rungs/r08-cons.lisp
 riscv32-linux      | -                                                 | mvm/build-hosted.lisp riscv32 test/arch-rungs/r08-cons.lisp
-
-# ---- mini-Lisp (repl-source) images: build.lisp native cells ----
-x64-repl           | -                                                 | mvm/build.lisp x64/bare/qemu/repl
-aarch64-repl       | -                                                 | mvm/build.lisp aarch64/bare/qemu/repl
-rpi-repl           | -                                                 | mvm/build.lisp aarch64/bare/rpi/repl
-x64-ssh            | -                                                 | mvm/build.lisp x64/bare/qemu/ssh
-aarch64-ssh        | -                                                 | mvm/build.lisp aarch64/bare/qemu/ssh
-aarch64-actors     | -                                                 | mvm/build.lisp aarch64/bare/qemu/actors
-aarch64-isolated   | -                                                 | mvm/build.lisp aarch64/bare/qemu/isolated
-i386-ssh           | -                                                 | mvm/build.lisp i386/bare/qemu/ssh
-
-# ---- mini-Lisp images: standalone scripts ----
-i386-repl          | -                                                 | mvm/build-i386-repl.lisp
-arm32-repl         | -                                                 | mvm/build-arm32-repl.lisp
-rpi-ssh            | -                                                 | mvm/build-rpi-ssh.lisp
-rpi-hid            | -                                                 | mvm/build-rpi-hid.lisp
-rpi-periph         | -                                                 | mvm/build-rpi-periph.lisp
-pizero2w-ssh       | -                                                 | mvm/build-pizero2w-ssh.lisp
-pizero2w-actors    | -                                                 | mvm/build-pizero2w-actors.lisp
-pizero2w-hdmi      | -                                                 | mvm/build-pizero2w-hdmi.lisp
-uart-bootloader    | -                                                 | mvm/build-uart-bootloader.lisp
 
 # ---- tools and harnesses ----

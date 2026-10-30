@@ -183,6 +183,7 @@
 ;;; the Pi's (EL2, firmware spin table); net/bare-threads-virt.lisp replaces them for
 ;;; QEMU virt (EL1, PSCI CPU_ON) by last-defun-wins.
 
+(declaim (overridable %bt-stub-entry-words))
 (defun %bt-stub-entry-words ()
   "The core entry stub, at S (test/rpi-smp/stubs.s): EL2's translation registers."
   (list #x10004000 #xf9400001 #xd51ca201 #xf9400401 #xd51c2041 #xf9400801
@@ -194,12 +195,14 @@
         #xf2bbd5ba #xd2800021 #xf9003001 #xf9402c09 #xd280001d #xd280001e
         #xd63f0120 #x10003aa0 #xd2800041 #xf9003001 #xd503205f #x17ffffff))
 
+(declaim (overridable %bt-stub-release-words))
 (defun %bt-stub-release-words (s)
   "S+0x1000: clean the stub to the point of coherency, then SEV the spinning cores."
   (append (%bt-movz-movk-x0 s)
           (list #x91240002 #xd50b7e20 #x91010000 #xeb02001f #x54ffffa3
                 #xd2801800 #xd50b7e20 #xd5033f9f #xd503209f #xd65f03c0)))
 
+(declaim (overridable %bt-stub-snapshot-words))
 (defun %bt-stub-snapshot-words (p)
   "S+0x1100: core 0's EL2 translation registers and x28 into the parameter block P."
   (append (%bt-movz-movk-x0 p)
@@ -207,17 +210,21 @@
                 #xf9000801 #xd53c1001 #xf9000c01 #xd53cc001 #xf9001001
                 #xf900141c #xd65f03c0)))
 
+(declaim (overridable %bt-stub-tlbi-words))
 (defun %bt-stub-tlbi-words ()
   "S+0x1500: TLBI ALLE2IS between barriers."
   (list #xd5033a9f #xd50c831f #xd5033b9f #xd5033fdf #xd65f03c0))
 
+(declaim (overridable %bt-release))
 (defun %bt-release (c s)
   "Start core C at the stub S: the firmware's spin table entry, then the release
    routine's SEV."
   (%gc-write64 (+ #xD8 (* 8 c)) s)
   (%jit-call (+ s #x1000)))
 
+(declaim (overridable %bt-l2-table))
 (defun %bt-l2-table () #x71000)       ; boot/boot-rpi-cl.lisp's L2 table
+(declaim (overridable %bt-va->pa))
 (defun %bt-va->pa (a) a)              ; the Pi's DRAM is identity-mapped
 
 (defun %bt-stub-install ()
@@ -286,7 +293,7 @@
    switch's RET will land on -- its stack gets the switch's 128-byte frame with x30
    = that address."
   (let ((w (%bt-window i)) (pc (%bt-percpu i)) (rec (%bt-rec i))
-        (top (%bt-stack-top i)) (rcb (%bt-rcb core)))
+        (top (%bt-stack-top i)) (rcb (if (= core 0) (%gc-region-0) (%bt-rcb core))))
     (dotimes (k 8704) (%gc-write64 (+ w (* k 8)) 0))
     (dotimes (k 2048) (%gc-write64 (+ pc (* k 8)) 0))
     (%gc-write64 (+ w #xFFE8) pc)
@@ -297,10 +304,14 @@
     ;; a store of one of its objects anywhere else traps (on bare metal: !!FAULT and
     ;; the core halts -- loud, not a silent dangling pointer), and the SB-THREAD shim's
     ;; %SB-WORKER-OBJECT-P knows what to copy when a value leaves the thread.
-    (let ((a (+ (%bt-arena) (* (- core 1) 2 (%bt-region-size)))))
-      (%gc-write64 (+ w #x5040) a)
-      (%gc-write64 (+ w #x5048) (+ a (%bt-region-size)))
-      (%gc-write64 (+ w #x5050) (%bt-region-size)))
+    ;; A thread on CORE 0 allocates in REGION 0 with the main thread (see CORE 0
+    ;; below): its objects are everybody's, so it has no range to guard (size 0 = no
+    ;; region, left by the zeroing above) and nothing it hands out is copied.
+    (unless (= core 0)
+      (let ((a (+ (%bt-arena) (* (- core 1) 2 (%bt-region-size)))))
+        (%gc-write64 (+ w #x5040) a)
+        (%gc-write64 (+ w #x5048) (+ a (%bt-region-size)))
+        (%gc-write64 (+ w #x5050) (%bt-region-size))))
     (setf (mem-ref (+ w #xC60) :u64) (+ #x10740000 (* i #x4000)))
     (setf (mem-ref (+ pc 16) :u64) i)                 ; CPU id = record index
     (%gc-write64 (+ #x10000F08 (* 8 i)) rcb)          ; its active region: the core's
@@ -429,6 +440,59 @@
                          0))
         (%bt-switch c s)))))
 
+;;; CORE 0: THREADS THAT SHARE THE MAIN THREAD'S HEAP.  A slot whose home core is 0
+;;; runs on the main thread's core, as a coroutine of it, and allocates in REGION 0
+;;; with it: the switch parks the outgoing allocation pointer in its active region
+;;; block and loads the incoming one from its own, and both name region 0's block, so
+;;; there is one frontier and it is always in memory when it changes hands.  Such a
+;;; thread may store anything anywhere -- what libraries written for threads that
+;;; share memory (cl-nostr's relay pool, ICE, a WebRTC gateway) do all the time, and
+;;; what a thread on cores 1..3 may not.  A region-0 collection it starts is the
+;;; ordinary stop-the-world one (its window ends at its own stack top; main, switched
+;;; out, is SAFE with its SP published), and one main starts scans it the same way.
+;;; THE MAIN THREAD IS CORE 0'S SCHEDULER: a core-0 thread that blocks, yields, ends
+;;; or uses up its slice switches to record 0, which is main; and main runs the ready
+;;; ones wherever it would otherwise wait (a mutex, a condition, SLEEP, a join,
+;;; BT-YIELD, the console).  Main itself is never preempted, so a main that computes
+;;; without waiting holds core 0's threads up until it does.
+(defun %bt-core0-cursor () (+ (%bt-table) #x40))   ; u32: the last core-0 slot run
+
+(defun %bt-main-idle ()
+  "On the main thread: run the next ready core-0 thread until it blocks, yields, ends or
+   its slice is up.  T when one ran."
+  (when (and (%bt-up-p) (zerop (percpu-ref 16)))
+    (%jit-drain-wanted)                       ; what core 1..3 and core-0 threads found hot
+    (let ((s (%bt-pick 0 (mem-ref (%bt-core0-cursor) :u32))))
+      (when (>= s 0)
+        (setf (mem-ref (%bt-core0-cursor) :u32) s)
+        ;; the switch parks main's frontier through its active-region cell: "zero means
+        ;; region 0" is not an address it can store through
+        (when (zerop (%gc-read64 #x10000F08)) (%gc-write64 #x10000F08 (%gc-region-0)))
+        (setf (mem-ref (+ (%bt-rec s) #x60) :u32) 2)
+        (%gc-write64 (+ (%bt-percpu s) #x3F00)
+                     (if (zerop (mem-ref (%bt-no-preempt-addr) :u32))
+                         (+ (%bt-ticks) (%bt-quantum))
+                         0))
+        (%bt-switch 0 s)
+        t))))
+
+(defun %bt-wait-over-p (addr val dl)
+  (or (and (> addr 0) (/= (mem-ref addr :u32) val))
+      (and (> dl 0) (>= (%bt-ticks) dl))
+      (and (zerop addr) (zerop dl))))
+
+(defun %bt-main-wait (addr val dl)
+  "On the main thread: wait until the u32 at ADDR is not VAL (ADDR 0: no condition) or
+   the CNTVCT deadline DL passes (0: none), running core 0's ready threads meanwhile and
+   SAFE while there are none."
+  (loop
+    (when (%bt-wait-over-p addr val dl) (return nil))
+    (unless (%bt-main-idle)
+      (%gc-safe-enter)
+      (dotimes (k 256) (when (%bt-wait-over-p addr val dl) (return nil)))
+      (%gc-safe-leave)))
+  0)
+
 (defun %bt-quantum () (floor (cntfrq) 100))   ; 10 ms
 (defun %bt-no-preempt-addr () (+ (%bt-table) #x20))  ; non-zero: slices never end (tests)
 
@@ -446,12 +510,16 @@
     0))
 
 (defun bt-yield ()
-  "Let the other ready slots on this core run.  A no-op off a slot."
-  (when (%bt-slot-p)
-    (let* ((i (percpu-ref 16)) (rec (%bt-rec i)))
-      (setf (mem-ref (+ rec #x60) :u32) 1)
-      (%bt-switch i (mem-ref (+ rec #x20) :u32))))
-  nil)
+  "Let the other ready slots on this core run.  On the main thread: the next ready
+   core-0 thread, if any.  T when something else may have run (a slot always gives its
+   core up), NIL when the main thread found nothing ready -- a poll loop then has time to
+   wait (net/tcp-conns.lisp %NET-IDLE)."
+  (if (%bt-slot-p)
+      (let* ((i (percpu-ref 16)) (rec (%bt-rec i)))
+        (setf (mem-ref (+ rec #x60) :u32) 1)
+        (%bt-switch i (mem-ref (+ rec #x20) :u32))
+        t)
+      (%bt-main-idle)))
 
 (defun %bt-encoder (name) (symbol-function (intern name "COMMON-LISP-USER")))
 
@@ -530,15 +598,17 @@
 (defun %bt-pin-next-addr () (+ (%bt-table) #x24))   ; u32: core for the next start, 0 = any
 
 (defun bt-pin-next (core)
-  "Place the next thread started (by BT-SPAWN or SB-THREAD:MAKE-THREAD) on CORE (1..3);
-   NIL = the least-loaded core.  For a thread that should have a core to itself: a
-   device owner that polls, a compositor, an audio feeder."
+  "Place the next thread started (by BT-SPAWN or SB-THREAD:MAKE-THREAD) on CORE (1..3),
+   with a heap of its own and nothing shared; NIL = core 0, sharing the main thread's
+   heap (the default).  For a thread that should have a core to itself: a device owner
+   that polls, a compositor, an audio feeder."
   (%bt-init)                                  ; it zeroes the table this word is in
   (setf (mem-ref (%bt-pin-next-addr) :u32) (if core core 0))
   core)
 
 (defun %make-native-thread (fn &rest args)
-  "Start FN (no arguments) as a thread on the least-loaded core.  Its record number
+  "Start FN (no arguments) as a thread: on the core BT-PIN-NEXT named, else on core 0,
+   sharing the main thread's heap (CORE 0 above).  Its record number
    (4..15), or -1 when every slot is in use, -2 when the cores did not start, -7 when
    a thread passes a function object made in its own heap (it cannot outlive that
    heap's next collection in a shared table: pass #'NAME, or let SB-THREAD:MAKE-THREAD
@@ -559,7 +629,7 @@
                  (let ((c (let ((pin (mem-ref (%bt-pin-next-addr) :u32)))
                             (if (and (> pin 0) (< pin (%bt-ncores)))
                                 (progn (setf (mem-ref (%bt-pin-next-addr) :u32) 0) pin)
-                                (%bt-least-loaded-core)))))
+                                0))))
                    (setf (svref *bt-funs* i) fn)
                    (let ((rec (%bt-prepare-record i c (%bt-entry '%bt-slot-main))))
                      (setf (mem-ref (+ rec #x08) :u32) 1)
@@ -576,11 +646,14 @@
   (let ((r 1) (k 0))
     ;; Off a slot the wait is SAFE: a region-0 collection started by a thread (the
     ;; lock arena running low) must not wait for a joiner that never allocates.
+    ;; (Main, between polls, runs core 0's ready threads -- outside the safe region.)
     (unless (%bt-slot-p) (%gc-safe-enter))
     (loop
       (when (zerop (mem-ref (+ (%bt-rec i) #x08) :u32)) (setq r 0) (return nil))
       (when (>= k budget) (return nil))
-      (if (%bt-slot-p) (bt-yield) nil)
+      (if (%bt-slot-p)
+          (bt-yield)
+          (progn (%gc-safe-leave) (%bt-main-idle) (%gc-safe-enter)))
       (setq k (+ k 1)))
     (unless (%bt-slot-p) (%gc-safe-leave))
     (when (zerop r) (setf (mem-ref (+ (%bt-rec i) #x10) :u32) 1))
@@ -603,9 +676,10 @@
 ;;; ------------------------------------------------------------------ public
 
 (defun bt-spawn (fn &optional core)
-  "Start FN (a function of no arguments) as a thread -- on CORE (1..3) when given,
-   else the least-loaded core; its handle."
-  (when core (bt-pin-next core))
+  "Start FN (a function of no arguments) as a thread with a heap of its own -- on CORE
+   (1..3) when given, else the least-loaded of them; its handle.  (SB-THREAD:MAKE-THREAD
+   starts one on core 0, sharing the main thread's heap.)"
+  (bt-pin-next (or core (%bt-least-loaded-core)))
   (let ((i (%make-native-thread fn)))
     (if (< i 0) (error "bt-spawn: no thread could be started (~D)" i) i)))
 
@@ -633,9 +707,7 @@
     (when (zerop (xchg-mem cell 1)) (return 1))
     (if (%bt-slot-p)
         (%bt-block cell 1 0)
-        (progn (%gc-safe-enter)
-               (loop (when (zerop (mem-ref cell :u32)) (return nil)))
-               (%gc-safe-leave)))))
+        (%bt-main-wait cell 1 0))))
 
 (defun %mutex-unlock (cell) (mfence) (xchg-mem cell 0) 0)
 
@@ -643,9 +715,7 @@
   (let ((dl (+ (%bt-ticks) (%bt-ms-ticks ms))))
     (if (%bt-slot-p)
         (%bt-block 0 0 dl)
-        (progn (%gc-safe-enter)
-               (loop (when (>= (%bt-ticks) dl) (return nil)))
-               (%gc-safe-leave))))
+        (%bt-main-wait 0 0 dl)))
   nil)
 
 (defun %monotonic-ns () (%irt-ns))
@@ -666,10 +736,7 @@
     (%mutex-unlock mtx)
     (if (%bt-slot-p)
         (%bt-block cv seq dl)
-        (progn (%gc-safe-enter)
-               (loop (when (/= (mem-ref cv :u32) seq) (return nil))
-                     (when (and (> dl 0) (>= (%bt-ticks) dl)) (return nil)))
-               (%gc-safe-leave)))
+        (%bt-main-wait cv seq dl))
     (when (= (mem-ref cv :u32) seq) (setq r 1))
     (%mutex-lock mtx)
     r))
@@ -1091,18 +1158,25 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
 (defun bt-call (ex fn)
   "Run FN (no arguments) on executor EX and return its value, copied (see EXECUTORS)."
   (let* ((cell (first ex)) (idx (second ex)) (lk cell))
+    ;; ON THE MAIN THREAD, WAIT AS MAIN WAITS: run core 0's ready threads (%BT-MAIN-IDLE).
+    ;; A core-0 thread that holds this executor's lock -- glass's RFB sender grabbing the
+    ;; screen on core 2, say -- only gets core 0 back when main yields it, so a main that
+    ;; spun here (the desk, calling the same executor) never let it finish: a Zero gateway
+    ;; card (QEMU) stopped dead the moment a phone connected, main in BT-CALL, ICE gone.
     (if (%bt-slot-p)
         (loop (when (zerop (xchg-mem lk 1)) (return nil)) (bt-yield))
-        (loop (when (zerop (xchg-mem lk 1)) (return nil))))
+        (loop (when (zerop (xchg-mem lk 1)) (return nil)) (%bt-main-idle)))
     (setf (svref *bt-exec-fns* idx) fn)
     (let ((req (+ (%gc-read64 (+ cell #x08)) 1)))
       (mfence)
       (%gc-write64 (+ cell #x08) req)
       (if (%bt-slot-p)
           (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil)) (bt-yield))
-          (progn (%gc-safe-enter)
-                 (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil)))
-                 (%gc-safe-leave))))
+          (loop (when (= (%gc-read64 (+ cell #x10)) req) (return nil))
+                (unless (%bt-main-idle)
+                  (%gc-safe-enter)
+                  (dotimes (k 256) (when (= (%gc-read64 (+ cell #x10)) req) (return nil)))
+                  (%gc-safe-leave)))))
     (let ((kind (%gc-read64 (+ cell #x18))))
       (prog1
           (cond ((= kind 1) (mem-ref (+ cell #x20) :u64))
@@ -1123,3 +1197,9 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
                      (error "on the executor: ~a" msg))))
                 (t (%mutex-unlock lk) (error "bt-call: the value cannot be copied back")))
         (%mutex-unlock lk)))))
+
+;;; ------------------------------------------------------------------ the console
+;;; The REPL waits for a key in the console seams (net/usb-hid-split.lisp): with the
+;;; layer up, that wait runs core 0's threads.
+(defun %console-wants-poll () (%bt-up-p))
+(defun %console-idle () (%bt-main-idle))

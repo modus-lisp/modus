@@ -1,14 +1,17 @@
 ;;;; e1000.lisp - Intel E1000 NIC driver (shared, arch-independent)
 ;;;;
-;;;; Internal functions use e1000-hw-* names to allow driver dispatch.
-;;;; Default wrappers at the end provide the e1000-* API.
-;;;; For dual-driver builds, a dispatch layer loaded after this file
-;;;; overrides the wrappers via last-defun-wins.
+;;;; Package MODUS.NET.E1000 (builder packages step 3).  It implements
+;;;; MODUS.NET's NIC interface with E1000-HW-SEND / -RECEIVE / -RX-BUF /
+;;;; -PROBE and E1000-READ-REG; an image binds the interface to them at boot
+;;;; (net/nic.lisp, build-cl-repl-common's %BIND-NIC-SEAMS).
 ;;;;
 ;;;; Requires arch adapter defining:
 ;;;;   pci-config-read, pci-config-write, io-delay
 ;;;;   e1000-state-base, e1000-rx-desc-base, e1000-rx-buf-base
 ;;;;   e1000-tx-desc-base, e1000-tx-buf-base
+;;;; (exported by MODUS-INT to the driver packages: mvm/kernel-packages.lisp)
+
+(in-package :modus.net.e1000)
 
 ;; Scan PCI bus 0 for E1000 (vendor=8086 device=100E).
 ;; Store MMIO base at state-base+0. Returns MMIO base or 0.
@@ -330,9 +333,3 @@
           (print-hex32 (logand mmio #xFFFFFFFF))
           (%serial-byte 10)
           (e1000-init)))))
-
-;;; Default API wrappers — override these via last-defun-wins for other drivers
-(defun e1000-send (buf len) (e1000-hw-send buf len))
-(defun e1000-receive () (e1000-hw-receive))
-(defun e1000-rx-buf () (e1000-hw-rx-buf))
-(defun e1000-probe () (e1000-hw-probe))

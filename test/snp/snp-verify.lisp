@@ -32,7 +32,7 @@
 
 ;;; ---- SHA-384 (SHA-512 with its own IV, truncated) ----
 (defun %sv-sha384 (msg)
-  (sha512-init)
+  (modus.crypto:sha512-init)
   (let* ((msg-len (length msg))
          (full (* 128 (floor msg-len 128)))
          (rem (- msg-len full))
@@ -48,7 +48,7 @@
           (setq i (+ i 1)))))
     (let ((offset 0))
       (loop (when (not (< offset full)) (return ()))
-            (sha512-block msg offset h w)
+            (modus.crypto:sha512-block msg offset h w)
             (setq offset (+ offset 128))))
     (dotimes (i rem) (setf (aref tail i) (aref msg (+ full i))))
     (setf (aref tail rem) #x80)
@@ -56,8 +56,8 @@
       (dotimes (k 8)
         (setf (aref tail (- tlen 1 k)) (ldb (byte 8 (* 8 k)) bits))
         (setf (aref tail (- tlen 9 k)) (ldb (byte 8 (* 8 k)) hi))))
-    (sha512-block tail 0 h w)
-    (when (= tlen 256) (sha512-block tail 128 h w))
+    (modus.crypto:sha512-block tail 0 h w)
+    (when (= tlen 256) (modus.crypto:sha512-block tail 128 h w))
     (%sv-slice h 0 48)))
 
 ;;; ---- DER ----

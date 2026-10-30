@@ -1,6 +1,8 @@
 ;;;; r8152.lisp - Realtek RTL8153 driver, ADOPT + vendor-descriptor framing
 ;;;;
-;;;; Loaded AFTER cdc-ether.lisp; overrides e1000-probe/send/receive/rx-buf.
+;;;; Package MODUS.NET.R8152 (builder packages step 3).  net/usb-netdev.lisp
+;;;; binds MODUS.NET's NIC interface to R8152-SEND / -RECEIVE / -RX-BUF when the
+;;;; probe finds the RTL8153.
 ;;;;
 ;;;; DESIGN: on this bare-metal RPi the netboot loader (U-Boot) drives the
 ;;;; SAME DWC2 host controller and the SAME RTL8153 to fetch the kernel over
@@ -29,6 +31,8 @@
 ;;;; (seen at 3 and 5), so e1000-probe SCANS for VID 0x0BDA PID 0x8153 rather
 ;;;; than hard-coding it.  Endpoints are fixed by the vendor config: bulk-IN
 ;;;; ep1, bulk-OUT ep2, interrupt-IN ep3, all mps 512.
+
+(in-package :modus.net.r8152)
 
 ;; ============================================================
 ;; Vendor register access (MCU_TYPE_PLA) — used for the MAC read and an
@@ -219,14 +223,6 @@
 ;; ============================================================
 ;; Probe: adopt U-Boot's running device (no init, no enumerate)
 ;; ============================================================
-
-;; Thin e1000-* forwarders (see net/cdc-ether.lisp): keep last-defun-wins
-;; behaviour for images without net/usb-netdev.lisp; shadowed by the dispatcher
-;; where usb-netdev.lisp is loaded.
-(defun e1000-send (buf len) (r8152-send buf len))
-(defun e1000-receive () (r8152-receive))
-(defun e1000-rx-buf () (r8152-rx-buf))
-(defun e1000-probe () (r8152-probe))
 
 (defun r8152-probe ()
   (let ((addr (r8152-find-addr)))

@@ -229,10 +229,15 @@
              ;; Not for a name that shadows a CL external: its bare entry is
              ;; CL's function, and P::LDB is not CL:LDB -- see %FN-INFO-FOR-KEY.
              (and cut (< cut n)
+                  ;; nor for a non-kernel symbol named like a kernel function:
+                  ;; it is its own symbol, never the kernel's (cl-eval.lisp)
                   (not (and (fboundp '%shadows-cl-name-p)
                             (let ((s (find-symbol (subseq name cut) (subseq name 0 (- cut 2)))))
                               (and s (funcall '%shadows-cl-name-p s)))))
-                  (gethash (subseq name cut) *symbol-function-table*))))))
+                  (let ((nm (subseq name cut)))
+                    (unless (and (not (%kernel-home-pkg-name-p (subseq name 0 (- cut 2))))
+                                 *kernel-fn-names* (gethash nm *kernel-fn-names*))
+                      (gethash nm *symbol-function-table*))))))))
 
 (defun %rt-stub-count (runtime-table)
   "Number of runtime stubs in RUNTIME-TABLE: keys #x40000000, +1, ... are
@@ -412,8 +417,11 @@
 ;; traces them, and they are intercepted before any of this runs.
 ;;
 ;; Byte order follows the machine: MEM-READ/MEM-WRITE assemble little-endian,
-;; which is what every target that runs this interpreter (x64, aarch64, i386)
-;; actually is.  A big-endian host would need the loop order flipped.
+;; except on a big-endian target (+TARGET-BIG-ENDIAN+, folded at build time),
+;; where byte I of an N-byte access is the value's byte N-1-I.  68k was the first
+;; big-endian image to run this interpreter, and before the flip every
+;; interpreted (setf (mem-ref a :u32) #x12345678) wrote 78 56 34 12 -- which
+;; native code then read back as a different number.
 (defun mem-read-byte (state addr)
   (declare (ignore state))
   (mem-ref addr :u8))
@@ -443,15 +451,26 @@
     (if mv
         (%val->word (svref (mvm-mv-vals state) mv))
         (let ((val 0))
+          ;; Byte I is shifted by 8I and read from the address holding the
+          ;; value's I-th least significant byte -- so the accumulation is
+          ;; low byte first in BOTH orders.  High byte first made every step
+          ;; after the first a bignum LOGIOR on a 32-bit target.
           (dotimes (i (ash 1 width) val)
-            (setf val (logior val (ash (mem-read-byte state (+ addr i)) (* i 8)))))))))
+            (setf val (logior val (ash (mem-read-byte state
+                                                      (+ addr (if (eql +target-big-endian+ 1)
+                                                                  (- (ash 1 width) 1 i)
+                                                                  i)))
+                                       (* i 8)))))))))
 
 (defun mem-write (state addr val width)
   (let ((mv (%mv-slot-index addr width)))
     (if mv
         (setf (svref (mvm-mv-vals state) mv) (%word->val val))
         (dotimes (i (ash 1 width))
-          (mem-write-byte state (+ addr i) (logand (ash val (* i -8)) #xFF))))))
+          (mem-write-byte state (+ addr (if (eql +target-big-endian+ 1)
+                                            (- (ash 1 width) 1 i)
+                                            i))
+                          (logand (ash val (* i -8)) #xFF))))))
 
 ;; VALUE-domain load/store — what OP-LOAD and OP-STORE actually need.
 ;;
@@ -522,7 +541,10 @@
         ;; #x52) → empty/NIL result (WS4 oracle).  The placeholder slots are
         ;; overwritten by the following obj-sets; %prim-aset is uniform across
         ;; object types.
-        ((= subtag #x52) (%make-closure 0 nil))
+        ;; THREE slots: the third caches this closure's native trampoline, so
+        ;; the closure keeps ONE identity however often it escapes to native
+        ;; code (%MVM-ESCAPE-TRAMPOLINE).
+        ((= subtag #x52) (%make-closure3 0 nil))
         (t (make-array size :initial-element 0))))
 ;; Slot ref/set/len via the NATIVE primitives.  %prim-aref returns the raw slot
 ;; (char CODE for a string), %prim-aset stores it; uniform across object types.
@@ -613,6 +635,15 @@
       ((= sub 29) (dotimes (k 8) (setf (aref v k) (if (evenp k) (aref a (+ k 1)) (aref b k)))))      ; trn2 .8b
       ((= sub 30) (%vlane-set v 0 4 (%vlane-get a 0 4 nil)) (%vlane-set v 1 4 (%vlane-get b 0 4 nil)))  ; trn1 .2s
       ((= sub 31) (%vlane-set v 0 4 (%vlane-get a 1 4 nil)) (%vlane-set v 1 4 (%vlane-get b 1 4 nil)))  ; trn2 .2s
+      ((= sub 32) (dotimes (k 4)                                                              ; sdot .4s += .16b . .16b
+                    (let ((acc (%vlane-get d k 4 t)))
+                      (dotimes (j 4)
+                        (setq acc (+ acc (* (%vlane-get a (+ (* 4 k) j) 1 t) (%vlane-get b (+ (* 4 k) j) 1 t)))))
+                      (%vlane-set v k 4 acc))))
+      ((= sub 33) (%vlane-set v 0 4 (+ (%vlane-get a 0 4 t) (%vlane-get a 1 4 t)))              ; addp .4s
+                  (%vlane-set v 1 4 (+ (%vlane-get a 2 4 t) (%vlane-get a 3 4 t)))
+                  (%vlane-set v 2 4 (+ (%vlane-get b 0 4 t) (%vlane-get b 1 4 t)))
+                  (%vlane-set v 3 4 (+ (%vlane-get b 2 4 t) (%vlane-get b 3 4 t))))
       (t (dotimes (k 4)                                                                       ; trn1/trn2/zip1/zip2 .4h (low 8 bytes)
            (let ((x (cond ((= sub 20) (if (evenp k) (%vlane-get a k 2 nil) (%vlane-get b (- k 1) 2 nil)))
                           ((= sub 21) (if (evenp k) (%vlane-get a (+ k 1) 2 nil) (%vlane-get b k 2 nil)))
@@ -979,14 +1010,34 @@
        (if (and (null (%prim-aref v 1)) tag (symbolp tag) (not (keywordp tag))
                 (fboundp tag))
            (symbol-function tag)
-           (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets))))
+           (%mvm-escape-trampoline v bc ftab rt lam-offsets))))
     ;; (No bare-integer branch — see the docstring.)
     (t v)))
+
+(defun %mvm-escape-trampoline (v bc ftab rt lam-offsets)
+  "The native trampoline for the in-module closure V, made ONCE and kept in V's
+   third slot.  A fresh trampoline per escape made every interpreted lambda a
+   different object each time it was passed to a function or returned:
+   (let ((f (lambda () 1))) (eq (identity f) f)) was NIL on every port that
+   interprets (i386, arm32, RISC-V), and with it (setf (symbol-function s) f)'s
+   value, *DEBUGGER-HOOK*'s argument and #'F of a LABELS function (upstream
+   SYMBOL-FUNCTION.1, INVOKE-DEBUGGER.1, LABELS.37-40).  A closure made before
+   the interpreter allocated three slots (two-slot) still gets a fresh one."
+  (if (>= (%prim-array-length v) 3)
+      (let ((cached (%prim-aref v 2)))
+        (if cached
+            cached
+            (let ((tr (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
+                                            lam-offsets)))
+              (%prim-aset v 2 tr)
+              tr)))
+      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1) lam-offsets)))
 
 (defun %mvm-wrap-escaping-result (v bc ftab rt lam-offsets)
   "Wrap an mvm-eval RESULT value (the thunk's return) that is an in-module
    #x52 lambda closure in a re-entrant trampoline, so the value production
-   EVAL hands back is natively funcallable and IDENTITY-DISTINCT per call.
+   EVAL hands back is natively funcallable -- one trampoline per closure, so
+   the value keeps its identity (%MVM-ESCAPE-TRAMPOLINE).
    Unlike the bridge-arg wrapper (%mvm-wrap-escaping), a BARE integer is
    NEVER wrapped here: eval results are ordinary data far more often than
    captureless-lambda offsets, and under *mvm-eval-runtime-p* compile-lambda
@@ -996,8 +1047,7 @@
   (if (and v (not (consp v)) (not (integerp v))
            (= (obj-subtag v) #x52)
            (%mvm-module-fn-offset-p (%prim-aref v 0) lam-offsets))
-      (%mvm-make-trampoline bc ftab rt (%prim-aref v 0) (%prim-aref v 1)
-                            lam-offsets)
+      (%mvm-escape-trampoline v bc ftab rt lam-offsets)
       v))
 
 ;;; ============================================================
@@ -2519,6 +2569,59 @@
                        (%interp-fpd-cmp (= opcode #.+op-fpd-lt+)
                                         (svref fregs fa) (svref fregs fb)))
                  (setf pc npc3)))))
+          ;; ---- the FP-register ops a float tree was missing (reference arms):
+          ;; an FP slot holds a host single- or double-float.
+          (#.+op-fp-op1+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
+                 (let ((x (svref fregs fs)))
+                   (setf (svref fregs fd)
+                         (cond ((< sub 2) (abs x))                       ; fabs.s / fabs.d
+                               ((= sub 2) (coerce x 'double-float))      ; fcvt d<-s
+                               (t (coerce x 'single-float)))))           ; fcvt s<-d
+                 (setf pc npc3)))))
+          (#.+op-fp-op2+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (%ifetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (%ifetch-byte bc npc3)
+                   (let ((a (svref fregs fa)) (b (svref fregs fb)))
+                     (setf (svref fregs fd) (if (evenp sub)
+                                                (if (> b a) b a)        ; fmax
+                                                (if (< b a) b a))))     ; fmin
+                   (setf pc npc4))))))
+          (#.+op-fp-cmp+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fa npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (fb npc3) (%ifetch-reg bc npc2)
+                 (multiple-value-bind (sub npc4) (%ifetch-byte bc npc3)
+                   ;; through the same CALL as fpd-lt (see there)
+                   (setf (svref regs vd)
+                         (%interp-fpd-cmp (= sub 0) (svref fregs fa) (svref fregs fb)))
+                   (setf pc npc4))))))
+          (#.+op-fp-toi+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
+                 (let ((x (svref fregs fs)) (k (logand sub 3)))
+                   (setf (svref regs vd)
+                         (values (cond ((= k 0) (round x)) ((= k 1) (truncate x))
+                                       ((= k 2) (floor x)) (t (ceiling x))))))
+                 (setf pc npc3)))))
+          ((#.+op-fpd-li+ #.+op-fp-li+)
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (hi npc2) (%ifetch-u32 bc npc)
+               (multiple-value-bind (lo npc3) (%ifetch-u32 bc npc2)
+                 (let ((d (%dbl hi lo)))
+                   (setf (svref fregs fd) (if (= opcode +op-fp-li+) (coerce d 'single-float) d)))
+                 (setf pc npc3)))))
+          (#.+op-fpd-scale+
+           (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vk npc2) (%ifetch-reg bc npc)
+               ;; times the double 2^k (exact: a power of two in the normal range)
+               (setf (svref fregs fd) (* (svref fregs fd) (scale-float 1d0 (svref regs vk))))
+               (setf pc npc2))))
           (#.+op-fpd-itof+
            (multiple-value-bind (fd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
@@ -2630,7 +2733,13 @@
              (multiple-value-bind (fs npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (sub npc3) (%ifetch-byte bc npc2)
                  (let ((s (svref fregs fs)) (v (%vlane-new)))
-                   (cond ((= sub 0) (dotimes (k 8) (%vlane-set v k 2 (aref s k))))                       ; uxtl 8b->8h
+                   ;; scvtf .4s: the result is an f32x4 register, which the
+                   ;; interpreter holds as 4 single-floats (the v4 arms' form)
+                   (when (= sub 12)
+                     (setq v (make-array 4))
+                     (dotimes (k 4) (setf (svref v k) (coerce (%vlane-get s k 4 t) 'single-float))))
+                   (cond ((= sub 12))
+                         ((= sub 0) (dotimes (k 8) (%vlane-set v k 2 (aref s k))))                       ; uxtl 8b->8h
                          ((= sub 1) (dotimes (k 8) (setf (aref v k) (%vlane-sat (%vlane-get s k 2 t) 0 255)))) ; sqxtun 8h->8b
                          ((= sub 2) (dotimes (k 4) (%vlane-set v k 4 (%vlane-get s k 2 t))))                 ; sxtl 4h->4s
                          ((= sub 3) (dotimes (k 4) (%vlane-set v k 2 (%vlane-get s k 4 t))))                 ; xtn 4s->4h

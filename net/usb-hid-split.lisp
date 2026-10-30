@@ -523,8 +523,17 @@
 ;; PL011 flag register: RXFE (bit 4) set while the receive FIFO is empty.
 ;; A mini-UART console build replaces this (build-cl-repl-common binds it with
 ;; the console seams): checking the wrong UART never sees serial input.
+(declaim (overridable hid-serial-ready-p))
 (defun hid-serial-ready-p ()
   (zerop (logand (mem-ref #x3F201018 :u32) #x10)))
+
+;; WHILE IT WAITS: seams a threads layer (net/bare-threads.lisp, linked after this
+;; file) overrides by last-defun-wins -- poll rather than block, and run what may run
+;; on this core meanwhile.  Here: block, and nothing.
+(declaim (overridable %console-wants-poll))
+(defun %console-wants-poll () nil)
+(declaim (overridable %console-idle))
+(defun %console-idle () nil)
 
 (defun hid-console-read-char ()
   ;; Serial first, so a serial-driven session is never held up by the
@@ -533,7 +542,11 @@
   ;; With a hub, keep polling even when nothing is plugged in yet: that poll is
   ;; also how a keyboard plugged in later is found (HID-HOTPLUG-TICK).
   (if (or (not (hid-ready-p)) (zerop (hid-get #x00)))
-      (read-char-serial)
+      (if (%console-wants-poll)
+          (loop
+            (when (hid-serial-ready-p) (return (read-char-serial)))
+            (%console-idle))
+          (read-char-serial))
       (let ((c -1))
         (loop
           (when (>= c 0) (return c))
@@ -541,4 +554,5 @@
               (setq c (read-char-serial))
               (progn
                 (hid-split-poll)
+                (%console-idle)
                 (setq c (hid-ring-pop))))))))

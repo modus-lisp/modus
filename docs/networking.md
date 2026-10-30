@@ -2,6 +2,12 @@
 
 ## Overview
 
+> **Note (2026-10-28).**  Every bare-metal network image is now the CL image.
+> Adapters named here without a `-cl` suffix (`arch-x86`, `arch-i386`,
+> `arch-raspi3b`, `arch-arm32*`), `hid.lisp`, `http.lisp`, `dwc2-device.lisp` and
+> the 32-bit crypto overrides went with the mini-Lisp images
+> (docs/mini-lisp-archive.md); their CL counterparts are `arch-*-cl.lisp`.
+
 Modus implements a full networking stack — from NIC drivers through IP/TCP to SSH and HTTP — running on bare metal across 6 CPU architectures. The design principle is **shared protocol code with thin architecture adapters**: the ~12,000 lines of ip.lisp, crypto.lisp, and ssh.lisp run identically on x64, AArch64, i386, ARM32, RPi 3B, and Pi Zero 2W. Each platform provides a ~200-line adapter defining hardware addresses, PCI access, and I/O primitives.
 
 Three NIC driver classes cover all platforms: Intel E1000 (PCI Gigabit Ethernet), NE2000 (ISA 10Mbps), and DWC2 USB (host and gadget modes with CDC-ECM). All expose the same `e1000-send`/`e1000-receive`/`e1000-rx-buf` API so ip.lisp doesn't know which hardware is underneath.
@@ -23,9 +29,8 @@ Three NIC driver classes cover all platforms: Intel E1000 (PCI Gigabit Ethernet)
 
 | Build | Script | Features |
 |---|---|---|
-| AArch64 SSH | `build.lisp aarch64/bare/qemu/ssh` | Single-threaded SSH |
-| AArch64 actors | `build.lisp aarch64/bare/qemu/actors` | Multi-connection SSH + HTTP, cooperative actors |
-| AArch64 isolated | `build.lisp aarch64/bare/qemu/isolated` | Qubes-like isolation, net-domain owns hardware |
+| AArch64 SSH | `run.sh aarch64-ssh` (build-aarch64.lisp, `MODUS_SSH_BUILD=1`) | The CL image's single-threaded SSH |
+| AArch64 isolated | build-aarch64.lisp `MODUS_SSH_ISOLATED=1 MODUS_RPI_THREADS=1` | net domain owns the NIC, sessions on cores 1-3 (`net/isolated-cl.lisp`) |
 | RPi 3B SSH | `build-rpi-ssh.lisp` | Single-threaded SSH over USB |
 | RPi 3B HID | `build-rpi-hid.lisp` | USB keyboard/mouse/tablet (no networking) |
 | i386 SSH | `build.lisp i386/bare/qemu/ssh` | Single-threaded SSH, 32-bit crypto |
@@ -372,7 +377,7 @@ Source load order determines which `defun` wins (last-defun-wins):
 ```
 arch-* → [actors] → NIC driver → ip → crypto → [crypto-32] → [crypto-w32] →
 ssh → [http] → [http-client] → [actors-net-overrides] →
-[32bit-overrides] → [crypto-fast] → [crypto-32-fast] → [isolated-net]
+[32bit-overrides] → [crypto-fast] → [crypto-32-fast] → [isolated-cl]
 ```
 
 Files in brackets are loaded only for specific builds. Later files override earlier defuns of the same name. This is how 32-bit crypto, actor-aware I/O, and isolation are layered without modifying shared code.
@@ -390,7 +395,7 @@ Cooperative scheduling on a single core. Actors communicate via mailbox messages
 
 **Per-actor heaps**: 4MB each, starting at `actor-heap-base + (id-1) << 22`.
 
-**Isolated mode** (`net/isolated-net.lisp`): Qubes-like architecture where SSH handler actors cannot access hardware directly. All NIC operations are proxied through the net-domain actor via mailbox messages. This prevents a compromised SSH session from accessing raw network hardware.
+**Isolated mode** (`net/isolated-cl.lisp`, CL images on the Pi and QEMU virt): Qubes-like architecture where SSH sessions cannot access hardware directly. The main thread is the net domain and alone touches the NIC and TCP; each session runs on its own bare-threads worker, and bytes cross only by copy over `modus:make-channel`. This prevents a compromised SSH session from accessing raw network hardware. (The mini-Lisp `net/isolated-net.lisp`, on cooperative actors, was retired 2026-10-28.)
 
 ---
 
@@ -430,17 +435,8 @@ Cooperative scheduling on a single core. Actors communicate via mailbox messages
 ### Quick test (any SSH build)
 
 ```bash
-# Build
-sbcl --script mvm/build.lisp aarch64/bare/qemu/ssh
-
-# Run
-qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-  -kernel /tmp/modus-aarch64-ssh.bin -nographic -semihosting \
-  -device 'e1000,netdev=net0,romfile=,rombar=0' \
-  -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
-
-# Test
-echo '(+ 1 2)' | ssh -p 2222 -o StrictHostKeyChecking=no test@localhost
+# Build, boot, and run one expression over ssh
+./scripts/run.sh aarch64-ssh "(+ 1 2)"
 # → = 3
 ```
 

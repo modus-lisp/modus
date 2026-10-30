@@ -102,7 +102,7 @@
 ;;; PROBE G's NEUTERING MUST HAPPEN AT TOPLEVEL, BEFORE THE PROBE FORM, and it
 ;;; must not be evaluated for any other probe — redefining %RT-THREADS-ON is
 ;;; precisely the thing that makes bringup fail, so it is gated hard.
-(when (let ((w (%cli-getenv "MODUS_BRINGUP_PROBE"))) (and w (string= w "G")))
+(when (let ((w (modus-int::%cli-getenv "MODUS_BRINGUP_PROBE"))) (and w (string= w "G")))
   (eval '(defun %rt-threads-on () 0)))
 
 (format t "~&=== hosted-bringup-gate ===~%")
@@ -114,7 +114,7 @@
 ;;; ARMS the gate for the rest of the process, so running A first made B, C, D
 ;;; and E all report a healthy, already-armed system and answer nothing.  That
 ;;; is the harness invalidating its own experiment — one process, one probe.
-(when (let ((w (%cli-getenv "MODUS_BRINGUP_PROBE"))) (or (null w) (string= w "A")))
+(when (let ((w (modus-int::%cli-getenv "MODUS_BRINGUP_PROBE"))) (or (null w) (string= w "A")))
   (let ((th (sb-thread:make-thread
              (lambda () (list :gate (bg-gate) :mode (bg-mode)))
              :name "bringup-probe")))
@@ -125,7 +125,7 @@
 (format t "~&~%--- the probes below need a FRESH process each; run with~%~
              --- MODUS_BRINGUP_PROBE=B|C|D|E to pick one.  Default: report only.~%")
 
-(let ((which (%cli-getenv "MODUS_BRINGUP_PROBE")))
+(let ((which (modus-int::%cli-getenv "MODUS_BRINGUP_PROBE")))
   (cond
     ;; ---- B: %SB-THREADS-UP alone ------------------------------------------
     ((and which (string= which "B"))
@@ -137,18 +137,18 @@
     ;; ---- C: the four steps, by hand ---------------------------------------
     ((and which (string= which "C"))
      (format t "~&C0 mode=~s gate=~s~%" (bg-mode) (bg-gate))
-     (format t "~&C1 carve=~s mode=~s~%" (%ha-carve) (bg-mode))
+     (format t "~&C1 carve=~s mode=~s~%" (modus-int::%ha-carve) (bg-mode))
      (format t "~&C2 percpu-init=~s mode=~s~%"
-             (%ha-percpu-init-cpu (%ha-percpu-base) 0) (bg-mode))
-     (format t "~&C3 set-mode=~s mode=~s~%" (%ha-set-percpu-mode 1) (bg-mode))
+             (modus-int::%ha-percpu-init-cpu (modus-int::%ha-percpu-base) 0) (bg-mode))
+     (format t "~&C3 set-mode=~s mode=~s~%" (modus-int::%ha-set-percpu-mode 1) (bg-mode))
      (format t "~&C4 rt-threads-on=~s mode=~s gate=~s~%"
              (%rt-threads-on) (bg-mode) (bg-gate)))
 
     ;; ---- D: THE FINDING — mode 1 in, mode 0 out ---------------------------
     ((and which (string= which "D"))
-     (%ha-carve)
-     (%ha-percpu-init-cpu (%ha-percpu-base) 0)
-     (%ha-set-percpu-mode 1)
+     (modus-int::%ha-carve)
+     (modus-int::%ha-percpu-init-cpu (modus-int::%ha-percpu-base) 0)
+     (modus-int::%ha-set-percpu-mode 1)
      (format t "~&D PRE  mode=~s gate=~s flag=~s~%" (bg-mode) (bg-gate) *sb-threads-up*)
      (let ((r (%sb-threads-up)))
        (format t "~&D POST sb-threads-up=~s mode=~s gate=~s flag=~s~%"
@@ -160,12 +160,12 @@
 
     ;; ---- E: which call clears it? -----------------------------------------
     ((and which (string= which "E"))
-     (%ha-carve)
-     (%ha-set-percpu-mode 1)
+     (modus-int::%ha-carve)
+     (modus-int::%ha-set-percpu-mode 1)
      (format t "~&E pre-percpu-init      mode=~s~%" (bg-mode))
-     (let ((r (%ha-percpu-init-cpu (%ha-percpu-base) 0)))
+     (let ((r (modus-int::%ha-percpu-init-cpu (modus-int::%ha-percpu-base) 0)))
        (format t "~&E percpu-init=~s      mode=~s~%" r (bg-mode)))
-     (%ha-set-percpu-mode 1)
+     (modus-int::%ha-set-percpu-mode 1)
      (format t "~&E re-set               mode=~s~%" (bg-mode))
      (let ((r (%rt-threads-on)))
        (format t "~&E rt-threads-on=~s    mode=~s gate=~s~%" r (bg-mode) (bg-gate)))
@@ -187,7 +187,7 @@
            (im (mem-ref #x10000FF8 :u32))
            (fg (bg-gate))
            (fm (bg-mode))
-           (acq (%rt-acquisitions)))
+           (acq (modus-int::%rt-acquisitions)))
        (format t "~&F fn-gate=~s fn-mode=~s inline-gate=~s inline-mode=~s acquisitions=~s~%"
                fg fm ig im acq)
        (format t "~&F VERDICT: ~a~%"

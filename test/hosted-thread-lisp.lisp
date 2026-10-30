@@ -58,7 +58,7 @@
 (defvar *n* 300)
 (defvar *gcevery* 25)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (defun chk (name got want)
   (setq *checks* (+ *checks* 1))
@@ -74,7 +74,7 @@
       (progn (setq *fail* (+ *fail* 1))
              (format t "  FAIL ~A~%" name))))
 
-(let ((res (%tl-selftest 0 *n* *gcevery*)))
+(let ((res (modus-int::%tl-selftest 0 *n* *gcevery*)))
   (if (= res 0)
       (format t "~%SKIP: no actor band, no thread page, or the arrays would not map.~%")
       (progn

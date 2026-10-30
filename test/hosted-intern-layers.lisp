@@ -22,7 +22,7 @@
 ;;;;
 ;;;; THE OPERATION AT FAULT IS `CL:INTERN' (mvm/cl-packages.lisp), WHICH IS NOT
 ;;;; UNDER THE LOCK AT ALL.  Its create-new-symbol branch allocates the CL
-;;;; symbol (%MAKE-CL-SYMBOL), its name string and the package symtab entry in
+;;;; symbol (modus-int::%MAKE-CL-SYMBOL), its name string and the package symtab entry in
 ;;;; the CALLING thread's region, and then links all three into structures that
 ;;;; live in region 0 — the shared intern table at 0x10000088 AND the package
 ;;;; object's own internal symtab.  That is what the `cl' arm measures, and it
@@ -56,7 +56,7 @@
 ;;;; So a fresh %INTERN-SYMBOL-PKG on a worker leaves no forbidden pointer and
 ;;;; still takes the process down half the time.  `str' at 10 of 10 rules out
 ;;;; "any loop on a worker dies".  What `low' does that `str' does not is take
-;;;; the runtime lock and hop the active region to region 0 (%RT-ENTER); that is
+;;;; the runtime lock and hop the active region to region 0 (modus-int::%RT-ENTER); that is
 ;;;; the suspect, and it is NOT established here.
 ;;;;
 ;;;; AND IT IS NOT THE JIT.  `low' with MODUS_NO_JIT=1 is 3 of 6 — the same rate
@@ -84,7 +84,7 @@
 ;;;; ============================================================
 ;;;;
 ;;;;   THE AUDIT MUST BE ABLE TO ANSWER NON-ZERO.  The `low' arm and the `cl'
-;;;;   arm are the SAME audit (%GC-COUNT-FOREIGN-REFS), over the SAME two spans,
+;;;;   arm are the SAME audit (modus-int::%GC-COUNT-FOREIGN-REFS), over the SAME two spans,
 ;;;;   in the SAME direction, on the SAME worker, differing only in which intern
 ;;;;   is called.  They disagree.  An instrument that distinguishes them is not
 ;;;;   reporting 0 because it is looking at nothing.
@@ -101,15 +101,15 @@
 ;;;;   ONE RUN IS NOT A RESULT.  Everything in this campaign is layout-sensitive.
 ;;;;   The runner does RUNS passes per arm and reports the rate; read that.
 
-(%ha-actors-bringup 4 0)
+(modus-int::%ha-actors-bringup 4 0)
 
 (defvar *arm*
-  (let ((s (%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "cl")))
+  (let ((s (modus-int::%cli-getenv "ARM"))) (if (and s (> (length s) 0)) s "cl")))
 (defvar *k*
-  (let ((s (%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
+  (let ((s (modus-int::%cli-getenv "K"))) (if (and s (> (length s) 0)) (parse-integer s) 20)))
 
-(defvar *r0* 0) (setq *r0* (%gc-region-0))
-(defvar *scr* 0) (setq *scr* (%thr-scratch))
+(defvar *r0* 0) (setq *r0* (modus-int::%gc-region-0))
+(defvar *scr* 0) (setq *scr* (modus-int::%thr-scratch))
 
 (defun il-count () (hash-table-count (mem-ref #x10000088 :u64)))
 
@@ -120,27 +120,27 @@
    audit that skipped it would go green for the wrong reason the moment the
    objects moved there.  %RT-ARENA-* answer 0 on a pre-arena binary, so this
    degrades to the historic sweep."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (wfrom (%gc-meta-read (+ rw #x00) k))
-         (wsize (%gc-meta-read (+ rw #x10) k))
-         (r0from (%gc-meta-read (+ r0 #x00) k))
-         (r0alloc (%gc-meta-read (+ r0 #x30) k))
-         (ab (%rt-arena-base))
-         (aa (%rt-arena-alloc)))
-    (+ (%gc-count-foreign-refs r0from r0alloc wfrom wsize)
-       (if (> aa ab) (%gc-count-foreign-refs ab aa wfrom wsize) 0))))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (wfrom (modus-int::%gc-meta-read (+ rw #x00) k))
+         (wsize (modus-int::%gc-meta-read (+ rw #x10) k))
+         (r0from (modus-int::%gc-meta-read (+ r0 #x00) k))
+         (r0alloc (modus-int::%gc-meta-read (+ r0 #x30) k))
+         (ab (modus-int::%rt-arena-base))
+         (aa (modus-int::%rt-arena-alloc)))
+    (+ (modus-int::%gc-count-foreign-refs r0from r0alloc wfrom wsize)
+       (if (> aa ab) (modus-int::%gc-count-foreign-refs ab aa wfrom wsize) 0))))
 
 (defun il-in-worker (w)
   "1 when machine word W points inside THIS worker's region, 0 otherwise."
-  (let* ((k (%gc-meta-scale)) (rw (%gc-region))
-         (from (%gc-meta-read (+ rw #x00) k))
-         (size (%gc-meta-read (+ rw #x10) k)))
+  (let* ((k (modus-int::%gc-meta-scale)) (rw (modus-int::%gc-region))
+         (from (modus-int::%gc-meta-read (+ rw #x00) k))
+         (size (modus-int::%gc-meta-read (+ rw #x10) k)))
     (if (and (>= w from) (< w (+ from size))) 1 0)))
 
 ;;; The three arms.  ONE loop shape; only the body differs.
 
 (defun il-body-str (i) (concatenate 'string "ILS-" (write-to-string i)))
-(defun il-body-low (i) (%intern-symbol-pkg (+ 900000000 i) 0))
+(defun il-body-low (i) (modus-int::%intern-symbol-pkg (+ 900000000 i) 0))
 (defun il-body-cl  (i)
   (intern (concatenate 'string "ILC-" (write-to-string i)) "COMMON-LISP-USER"))
 
@@ -167,10 +167,10 @@
     ;; intern path — the per-thread-window campaign explicitly deferred the
     ;; interpreter's simulated state — so it is counted on its own line and
     ;; removed, and the audit below then measures INTERNING and nothing else.
-    (let ((mvheld (il-in-worker (%gc-word-of *mvm-last-mv* (+ scr 512)))))
-      (setq *mvm-last-mv* nil)
+    (let ((mvheld (il-in-worker (modus-int::%gc-word-of modus-int::*mvm-last-mv* (+ scr 512)))))
+      (setq modus-int::*mvm-last-mv* nil)
       (list c0 (il-count) f0 (il-fwd r0)
-            (il-in-worker (%gc-word-of last (+ scr 512)))
+            (il-in-worker (modus-int::%gc-word-of last (+ scr 512)))
             (if last 1 0)
             mvheld))))
 

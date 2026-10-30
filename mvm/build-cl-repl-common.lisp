@@ -178,7 +178,11 @@
 (defun %rpi-net-text (rel)
   (let ((p (merge-pathnames rel (merge-pathnames "net/" *modus-base*))))
     (modus.mvm::check-parses p)
-    (read-file-text p)))
+    ;; Scoped like MVM-TEXT: a driver's own (in-package ...) (builder
+    ;; packages step 3) must not leak into the next spliced file.
+    (modus.mvm::%build-package-scoped-source
+     (concatenate 'string (read-file-text p) (string #\Newline))
+     (concatenate 'string "net/" rel))))
 
 (defvar *pc-console-p*
   (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))
@@ -445,6 +449,7 @@
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     (if *cl-repl-rpi-p*
         "
+(declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
 "
         "")
@@ -559,6 +564,7 @@
 ;; What a restored core runs before the REPL (see *cli-arch-core-resume*): a
 ;; function designator, set just before SAVE-AND-DIE so the heap carries it.
 (defvar *core-restart-hook* nil)
+(declaim (overridable %core-addr))
 (defun %core-addr () #x18000000)
 ;; NARROW STRINGS ON (prelude.lisp %NARROW-STRINGS-P): the aarch64 collector
 ;; sizes #x13 as bytes, so the reader makes them.  Last definition wins.
@@ -776,7 +782,18 @@
           (+ (* (floor ticks hz) 1000000)
              (floor (* (mod ticks hz) 1000000) hz)))
         0)))
-(defun get-universal-time () (%timer-universal-time))
+;;; THE DATE is not the machine's to know: no RTC, so the counter is seconds since boot.
+;;; SET-UNIVERSAL-TIME is how something that does know (an SNTP answer, net/bare-sockets.lisp
+;;; BARE-NTP-TIME) tells it; the offset is a global SET at run time (a DEFVAR initform does not
+;;; run here), unbound -- 0 -- in a core saved before anybody did, which is right: the counter
+;;; restarts with every boot.
+(defun get-universal-time ()
+  (+ (%timer-universal-time)
+     (if (boundp '*universal-time-offset*) (symbol-value '*universal-time-offset*) 0)))
+(defun set-universal-time (ut)
+  \"Tell a board with no clock that it is UT (seconds since 1900) now.  UT.\"
+  (setf (symbol-value '*universal-time-offset*) (- ut (%timer-universal-time)))
+  ut)
 ;;; ... and the nanosecond seams under them, which the hot-function JIT calls
 ;;; directly to time interpreted calls: cl-fileio.lisp's defaults are the same
 ;;; clock_gettime SVC, so the first DEFUN trampoline on the board faulted
@@ -791,7 +808,9 @@
         0)))
 (defun %irun-ns () (%irt-ns))
 "
-        (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* ""))))
+        (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* "")
+        ;; GPIO / system timer / activity LED (what the mini-Lisp rpi-periph image had).
+        (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") ""))))
 
 
 
@@ -1034,6 +1053,9 @@
   ;; DRAM is not guaranteed zero at reset, so the regions are cleared explicitly
   ;; — a stale bit would validate a false root, which is the whole failure this
   ;; exists to prevent.  Non-allocating: raw mem-ref stores only.
+  ;; FIRST the firmware's device tree is moved out of their way (lib/fdt.lisp
+  ;; %FDT-KEEP): QEMU puts it where the threaded build's bitmaps go.
+  (%fdt-keep)
   (%rpi-gc-bitmap-init #x05000000 #x05100000 #xE0000)
 
   ;; NOTE: no (setup-irq) / (nic-irq-unmask) here.  Those program a GICv2,
@@ -1445,7 +1467,8 @@
         ;; `= VALUE' line, so a client can read lines a function writes (the
         ;; attestation report from SNP-ATTEST-SSH is 19 of them) and not only
         ;; the value.  Serial no longer sees that output; it is the session's.
-        "(defun ssh-eval-line (ssh cmd cmd-len)
+        "(declaim (overridable ssh-eval-line))
+(defun ssh-eval-line (ssh cmd cmd-len)
   (let ((s (make-string cmd-len)) (out nil))
     (dotimes (i cmd-len) (aset s i (code-char (aref cmd i))))
     (let ((result (handler-case
@@ -1462,7 +1485,7 @@
             (aset arr ol 61) (aset arr (+ ol 1) 32)
             (dotimes (i rl) (aset arr (+ ol 2 i) (char-code (aref rs i))))
             (aset arr (+ ol 2 rl) 10)
-            (ssh-send-string ssh arr (+ ol rl 3))))))))"
+            (modus.ssh:ssh-send-string ssh arr (+ ol rl 3))))))))"
         (string #\Newline)
         ;; SHELL-path fix (completes the interactive SSH loop): the active
         ;; ssh-do-eval-expr (net/ssh.lisp) used eval-sexp (the
@@ -1490,7 +1513,7 @@
         ;; on CR/LF, eval the line through the SAME proven CL path as exec
         ;; (ssh-eval-line) and reprompt.  EXEC is untouched (it never calls this).
         "(defun ssh-handle-channel-data (ssh payload plen)
-    (let ((data-len (ssh-get-u32 payload 5))
+    (let ((data-len (modus.ssh:ssh-get-u32 payload 5))
           (naddr (+ (ssh-ipc-base) #x60500))
           (baddr (+ (ssh-ipc-base) #x60510)))
       (let ((i 0))
@@ -1504,7 +1527,7 @@
                       (dotimes (k n) (aset cmd k (mem-ref (+ baddr k) :u8)))
                       (ssh-eval-line ssh cmd n)))
                   (setf (mem-ref naddr :u32) 0)
-                  (ssh-send-prompt ssh))
+                  (modus.ssh:ssh-send-prompt ssh))
                 (let ((n (mem-ref naddr :u32)))
                   (when (< n 4000)
                     (setf (mem-ref (+ baddr n) :u8) b)
@@ -1529,13 +1552,13 @@
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
-" (%lisp-spin-form "ssh-zeroed") "  (ssh-seed-random)
-  (ssh-init-strings)
-" (%lisp-spin-form "ssh-seeded") "  (ssh-use-default-key)
-" (%lisp-spin-form "ssh-keyed") "  (pre-compute-host-sign)
-" (%lisp-spin-form "ssh-signed") "  (pre-compute-server-eph (conn-ssh 0))
+" (%lisp-spin-form "ssh-zeroed") "  (modus.ssh:ssh-seed-random)
+  (modus.ssh:ssh-init-strings)
+" (%lisp-spin-form "ssh-seeded") "  (modus.ssh:ssh-use-default-key)
+" (%lisp-spin-form "ssh-keyed") "  (modus.ssh:pre-compute-host-sign)
+" (%lisp-spin-form "ssh-signed") "  (modus.ssh:pre-compute-server-eph (conn-ssh 0))
   (write-string-serial \"NETUP\") (write-char-serial 10)
-" (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (e1000-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
+" (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (modus.net:nic-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
   (net-actor-main))"))
         "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1545,11 +1568,11 @@
   (setf (mem-ref (+ (e1000-state-base) 24) :u32) 33554442)
   (setf (mem-ref (+ (e1000-state-base) 28) :u32) 16777226)
   (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)
-  (ssh-seed-random)
-  (ssh-init-strings)
-  (ssh-use-default-key)
-  (pre-compute-host-sign)
-  (pre-compute-server-eph (conn-ssh 0))
+  (modus.ssh:ssh-seed-random)
+  (modus.ssh:ssh-init-strings)
+  (modus.ssh:ssh-use-default-key)
+  (modus.ssh:pre-compute-host-sign)
+  (modus.ssh:pre-compute-server-eph (conn-ssh 0))
   (smp-init)
   (actor-init)
   (write-string-serial \"NETUP\") (write-char-serial 10)
@@ -1662,6 +1685,80 @@
             ;; the sector source for a pagetree/cabinet store on a partition.
             (%rpi-net-text "sdhost.lisp")        (string #\Newline)))))))
 
+;; THE NIC INTERFACE (builder packages step 3): net/nic.lisp's MODUS.NET
+;; NIC-SEND / -RECEIVE / -RX-BUF / -PROBE, which ip.lisp, ssh.lisp and
+;; tcp-conns.lisp call, go BEFORE the drivers; after them, %BIND-NIC-SEAMS binds
+;; the interface to this image's driver with (setf fdefinition), and kernel-main
+;; calls it right after INIT-ALL-GLOBALS (the arch slot below).  The NE2000,
+;; E1000, virtio, CDC-ECM and RTL8153 drivers have packages of their own.
+(defun %nic-binding-text ()
+  (flet ((bind (send receive rx-buf probe read-reg)
+           (format nil "  (setf (fdefinition 'modus.net:nic-send) (function ~A))
+  (setf (fdefinition 'modus.net:nic-receive) (function ~A))
+  (setf (fdefinition 'modus.net:nic-rx-buf) (function ~A))
+  (setf (fdefinition 'modus.net:nic-probe) (function ~A))
+  (setf (fdefinition 'modus.net:nic-read-reg) (function ~A))"
+                   send receive rx-buf probe read-reg)))
+    (cond
+      (*cl-repl-i386-p*
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.ne2000:ne2k-send" "modus.net.ne2000:ne2k-receive"
+                     "modus.net.ne2000:ne2k-rx-buf" "modus.net.ne2000:ne2k-probe"
+                     "modus.net::no-read-reg")))
+      (*cl-repl-x64-p*
+       ;; virtio or E1000, decided when NIC-PROBE runs: it probes virtio, and
+       ;; rebinds the interface to whichever NIC answered.
+       (format nil "~%(defun %pick-virtio-or-e1000 ()
+  (if (= (modus.net.virtio:virtio-net-probe) 1)
+      (progn
+        (setf (fdefinition 'modus.net:nic-send) (function modus.net.virtio:virtio-net-send))
+        (setf (fdefinition 'modus.net:nic-receive) (function modus.net.virtio:virtio-net-receive))
+        (setf (fdefinition 'modus.net:nic-rx-buf) (function modus.net.virtio:virtio-net-rx-buf))
+        (setf (fdefinition 'modus.net:nic-read-reg) (function modus.net::no-read-reg))
+        1)
+      (modus.net.e1000:e1000-hw-probe)))
+(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.e1000:e1000-hw-send" "modus.net.e1000:e1000-hw-receive"
+                     "modus.net.e1000:e1000-hw-rx-buf" "%pick-virtio-or-e1000"
+                     "modus.net.e1000:e1000-read-reg")))
+      (*cl-repl-virt-p*
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.e1000:e1000-hw-send" "modus.net.e1000:e1000-hw-receive"
+                     "modus.net.e1000:e1000-hw-rx-buf" "modus.net.e1000:e1000-hw-probe"
+                     "modus.net.e1000:e1000-read-reg")))
+      ;; the boards with usb-netdev (the SSH builds): NIC-PROBE picks the
+      ;; RTL8153 or CDC-ECM, as does a hot-plug edge, and the rest dispatch
+      ;; on that choice
+      (*ssh-build-p*
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "usb-nic-send" "usb-nic-receive"
+                     "usb-nic-rx-buf" "net-usb-probe"
+                     "modus.net::no-read-reg")))
+      (t
+       ;; the other board builds: CDC-ECM only
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.cdc:cdcether-send" "modus.net.cdc:cdcether-receive"
+                     "modus.net.cdc:cdcether-rx-buf" "modus.net.cdc:cdcether-probe"
+                     "modus.net::no-read-reg"))))))
+
+(when *net-build-p*
+  (setq *net-nic-source*
+        (concatenate 'string (%rpi-net-text "nic.lisp") (string #\Newline)
+                     *net-nic-source* (%nic-binding-text)))
+  (setq *cli-arch-io-scratch-source*
+        (concatenate 'string *cli-arch-io-scratch-source*
+                     (format nil "~%  (%bind-nic-seams)~%"))))
+
 ;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
 (when (and *cl-repl-x64-p* *pc-console-p*)
   (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
@@ -1694,7 +1791,13 @@
         ;; crypto; here modus is the USB HOST and the RTL8153 queues what
         ;; arrives, so waiting buys nothing -- and the polls it made DROPPED
         ;; any TCP segment they read.  Spliced after the transport so it wins.
-        (if (and *ssh-build-p* *cl-repl-rpi-p*)
+        ;; EVERY CL image, not only the Pi: none of them is a USB gadget, and the
+        ;; stock keepalive is 100 x (IO-DELAY = 5000 console-register reads, plus
+        ;; a NIC poll that drops what it reads) per call -- 8 calls in every X25519
+        ;; ladder.  Under QEMU a register read is a trap: QEMU virt's X25519 took
+        ;; ~27 s with it and ~35 ms is the Pi's without; the PC images' ~50-60 s
+        ;; SSH connections were the same cost.
+        (if *ssh-build-p*
             (format nil "~%(defun usb-keepalive () 0)~%")
             "")
         ;; Threaded :VIRT maps VA 0x10200000-0x1FFFFFFF to DRAM, so the E1000's
@@ -1730,7 +1833,7 @@
         (format nil "~%(defun %u8-data-delta () ~D)~%" (if *cl-repl-i386-p* -5 7))
         "
 (defun tcp-rx-copy (dest dest-off)
-  (let ((buf (e1000-rx-buf)))
+  (let ((buf (modus.net:nic-rx-buf)))
     (let ((ip-total (buf-read-u16-mem buf 16))
           (tcp-hdr-len (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
       (let ((data-len (- ip-total (+ 20 tcp-hdr-len))))
@@ -1747,7 +1850,7 @@
                (da (+ (%val->word dest) (%u8-data-delta) dest-off))
                ;; The RTL8153's RX buffer is ordinary cacheable RAM: copy its
                ;; whole 64-byte chunks natively (net/r8152.lisp R8152-NCOPY).
-               (i (if (eq (usb-netdev-get) 2) (r8152-ncopy da data-base n) 0)))
+               (i (if (eq (usb-netdev-get) 2) (modus.net.r8152:r8152-ncopy da data-base n) 0)))
           (loop
             (when (or (>= i n) (zerop (logand (+ data-base i) 3))) (return nil))
             (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))
@@ -2117,7 +2220,7 @@
   (if *ssh-build-p*
       "(progn (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
                         (net-usb-probe) 1)"
-      "(cdc-ether-init)"))
+      "(modus.net.cdc:cdc-ether-init)"))
 
 ;; MODUS_NET_IP + MODUS_NET_GW (dotted quads) -- a STATIC address for the x64
 ;; pipeline instead of DHCP.  A provider whose network has no DHCP server
@@ -2186,7 +2289,7 @@
   ;; 1. PCI bring-up: assign BARs (no firmware did it), then probe the E1000.
   ;;    e1000-probe prints its own MAC / link diagnostics.
   (handler-case (pci-assign-bars) (t (c) nil))
-  (handler-case (e1000-probe) (t (c) nil))
+  (handler-case (modus.net:nic-probe) (t (c) nil))
   ;; 2. DHCP.  Prints DHCP:D / DHCP:O / DHCP:R / DHCP:A itself.
   ;;    Retry: on QEMU's e1000 model the first DISCOVER after a NIC reset draws
   ;;    a reply only after a fixed post-reset settle (STATUS.LU is already up),
@@ -2324,6 +2427,7 @@
                               (not (string= v "0"))
                               chain)))))
         (format nil "
+(declaim (overridable %init-aarch64-translator))
 (defun %init-aarch64-translator ()
   (let ((map (make-array 23)))
     (aset map 0 0) (aset map 1 1) (aset map 2 2) (aset map 3 3)
@@ -2478,7 +2582,7 @@
                      (format s " (aset k ~D #x~2,'0X)" i
                              (parse-integer hex :start (* i 2) :end (+ (* i 2) 2) :radix 16)))
                    (format s " k)"))))
-          (format nil "~%(defun ssh-use-default-key ()~%  (ssh-set-host-key ~A)~%  (ssh-mem-store (ssh-auth-key-addr) ~A 32)~%  (setf (mem-ref (+ (e1000-state-base) #x770) :u32) 1))~%"
+          (format nil "~%(defun modus.ssh::ssh-use-default-key ()~%  (modus.ssh:ssh-set-host-key ~A)~%  (modus.ssh:ssh-mem-store (modus.ssh:ssh-auth-key-addr) ~A 32)~%  (setf (mem-ref (+ (e1000-state-base) #x770) :u32) 1))~%"
                   (bytes-form host) (bytes-form auth)))
         "")))
 
@@ -2525,6 +2629,7 @@
     ;; a dead framebuffer -- the firmware's rainbow square -- on a cold boot.)
     (when (fboundp (quote hcon-init))
       (handler-case (hcon-init) (t (c) nil)))
+    (handler-case (%fdt-after-restore) (t (c) nil))   ; THIS boot's bootargs, not the builder's
     (write-string-serial \"CORE-RESTORED\") (write-char-serial 10)
     ;; ... and USB, for the same reason: boot init brings the keyboard and mouse
     ;; up (%CONSOLE-INIT), a restored core skips boot init, and the controller

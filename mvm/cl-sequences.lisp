@@ -1,6 +1,8 @@
 ;;;; cl-sequences.lisp — Sequence, list, and collection functions
 ;;;; Part of the Modus CL runtime. Load after cl-types.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Additional missing functions
 ;;; ============================================================
@@ -2718,13 +2720,12 @@
                    (loop (when (or (null cur) (null (cdr cur))) (return k))
                      (when (eq (car cur) :key) (setq k (cadr cur)))
                      (setq cur (cddr cur)))))
-         (pred-fn (cond
-                    ((functionp pred) pred)
-                    ((symbolp pred) (symbol-function pred))
-                    (t pred)))
+         ;; SYMBOLP, not FUNCTIONP: FUNCTIONP of a closure asks whether it is a
+         ;; registered GF stub, a MEMBER over all of them -- per MERGE, and
+         ;; cl-transport merges on every timer it schedules.
+         (pred-fn (if (and pred (symbolp pred)) (symbol-function pred) pred))
          (kfn (cond
                 ((null key-fn) nil)
-                ((functionp key-fn) key-fn)
                 ((symbolp key-fn) (symbol-function key-fn))
                 (t key-fn)))
          (r nil)
@@ -2734,11 +2735,13 @@
             (loop
               (cond ((null a) (return (nreconc r b)))
                     ((null b) (return (nreconc r a)))
+                    ;; CLHS MERGE: on a tie S1's element comes first, so take
+                    ;; S2's only when it is strictly less (as %MERGE-LISTS does).
                     ((funcall pred-fn
-                              (if kfn (funcall kfn (car a)) (car a))
-                              (if kfn (funcall kfn (car b)) (car b)))
-                     (setq r (cons (car a) r)) (setq a (cdr a)))
-                    (t (setq r (cons (car b) r)) (setq b (cdr b))))))
+                              (if kfn (funcall kfn (car b)) (car b))
+                              (if kfn (funcall kfn (car a)) (car a)))
+                     (setq r (cons (car b) r)) (setq b (cdr b)))
+                    (t (setq r (cons (car a) r)) (setq a (cdr a))))))
           (kind (%concat-result-kind result-type)))
       (cond
         ((eq kind :list) merged)
@@ -5234,6 +5237,12 @@
    everything else upgrades to T (Modus stores general elements as tagged
    words)."
   (declare (ignore environment))
+  ;; The byte vector and T, without a DEFTYPE lookup: every crypto and network buffer is
+  ;; (UNSIGNED-BYTE 8), and CL symbols cannot name a user DEFTYPE.
+  (cond ((eq type t) (return-from upgraded-array-element-type t))
+        ((and (consp type) (eq (car type) 'unsigned-byte) (consp (cdr type))
+              (eql (cadr type) 8) (null (cddr type)))
+         (return-from upgraded-array-element-type '(unsigned-byte 8))))
   (setq type (%element-type-expand type))
   (cond
     ;; NIL element type — array that can hold no objects.

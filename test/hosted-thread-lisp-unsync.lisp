@@ -29,12 +29,12 @@
 (defvar *n* 300)
 (defvar *gcevery* 25)
 
-(defun w (res off) (%gc-read64 (+ res off)))
+(defun w (res off) (modus-int::%gc-read64 (+ res off)))
 
 (format t "~%=== THE SAME WORKLOAD WITH THE LOCK GATE OFF =============~%")
 (format t "  If this reaches the end at all, these are the numbers.~%")
 
-(let ((res (%tl-selftest 1 *n* *gcevery*)))
+(let ((res (modus-int::%tl-selftest 1 *n* *gcevery*)))
   (if (= res 0)
       (format t "~%SKIP: no actor band, no thread page, or the arrays would not map.~%")
       (let ((bad  (w res #x30))

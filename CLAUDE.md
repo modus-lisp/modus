@@ -1361,7 +1361,9 @@ per heap store (aarch64: 2 instructions; x64: an inline mark, see below).
   promote-all, then copy old into young, then re-tenure: two ordinary
   collections driven by a state word in the card vector's meta.  It is requested
   automatically when the old area's room < max(reserve, 2 x survivors).
-  `gc-major`, `gc-untenure`, `gc-gen-reserve`, `gc-gen-report`.  **save-image
+  `gc-major`, `gc-untenure`, `gc-gen-reserve`, `gc-gen-report` -- these five and
+  `gc-tenure` are exported from MODUS (as SB-EXT exports GC), so CL-USER calls
+  them bare; the `%gc-*` oracles are `modus-int::`.  **save-image
   untenures first**, so a saved core is single-range.
 - **Oracles, each with a control:** `%gc-old-audit` (a TYPED walk of the old
   space; a word count sees leaf payload and lies), `%gc-card-audit`, and

@@ -236,6 +236,27 @@ ssh-x64-cl.lisp, hwrng-bcm2835.lisp and the build text: explicit, and checked
 (redef-check 0), but not yet (setf fdefinition) interfaces.  Measured: the
 i386, x64 and aarch64 SSH images and test/run-hosted-ssh.sh pass.
 
+**Cycle 6, 2026-10-30: MODUS.RUNTIME.**  mvm/prelude.lisp and the ten
+mvm/cl-*.lisp files read into MODUS.RUNTIME, which :uses MODUS-INT -- SB-IMPL
+to MODUS-INT's SB-INT.  What the runtime and the rest of the kernel share stays
+homed in MODUS-INT and is exported (%MODUS-INT-RUNTIME-EXPORTS, 352 names);
+the runtime's other ~1300 functions are its own.  The list was not written by
+hand: every image the gate builds was built with the package checks in warn
+mode and the list is the union of what they named.  Two checks were added for
+this, because the existing ones could not see the failures it produced:
+- CHECK-CROSS-PACKAGE-QUOTES (QUOTE-SPLIT): a name quoted in two kernel
+  packages is two symbols in the image, so an EQ between them is false.
+- CHECK-CROSS-PACKAGE-FUNCTION-COLLISIONS (FUNCTION-COLLISION): one function
+  name defined in two kernel packages.  The first build of the split had 16:
+  every runtime seam whose default is in a cl-* file and whose override is in
+  a hosted file (%DEFERRED-PACKAGE-HOOK, %FS-IO-PAGE, %RT-ENTER-LOCKED, ...),
+  so the runtime kept calling its defaults -- SB-EXT never installed, and 30
+  tests failed.  Each was exported.  The x64 assembler's and translator's own
+  MODRM / REX-PREFIX are a baselined, pre-existing collision.
+Measured: all 31 images build with the checks fatal; every test/*.lisp exits
+as on main; the x64, i386 and aarch64 SSH images log in; the aarch64 and i386
+CLIs evaluate.
+
 ### 4. Runtime identity: every baked symbol keeps its home package
 
 - Create the step-2 package graph in the image at boot, from data the build

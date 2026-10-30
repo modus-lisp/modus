@@ -1203,6 +1203,9 @@
           ;; A package the HOST lacks means the (in-package ...) was text
           ;; inside a string (embedded test source), not the reader's state.
           (push (if (or (string= pkg "MODUS.MVM") (find #\: name)
+                        ;; (defun (setf X) ...): no name here; the filter in
+                        ;; *ALL-DEFUN-NAMES* drops "" but not "PKG::"
+                        (zerop (length name))
                         (not (find-package pkg)))
                     name
                     (let ((q (concatenate 'string pkg "::" name)))

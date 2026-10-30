@@ -13,7 +13,7 @@
 ;;;; - %serial-byte, mem-ref
 
 
-(in-package :modus.mvm)
+(in-package :modus.runtime)
 
 ;;; ============================================================
 ;;; List Utilities

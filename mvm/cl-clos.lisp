@@ -1,6 +1,8 @@
 ;;;; cl-clos.lisp — Minimal CLOS implementation
 ;;;; Part of the Modus CL runtime. Depends on cl-eval.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ===================================================
 ;;; Minimal CLOS implementation for ANSI test suite
 ;;; ===================================================

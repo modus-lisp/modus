@@ -1,6 +1,8 @@
 ;;;; cl-eval.lisp — Eval, compile, load, symbol-function table
 ;;;; Part of the Modus CL runtime. Depends on cl-reader.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Layer 8: Eval / Compile / Load
 ;;; ============================================================

@@ -1,6 +1,8 @@
 ;;;; cl-types.lisp — Type system: typep, numeric types, float operations
 ;;;; Part of the Modus CL runtime. Depends on cl-clos.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Trig / transcendental functions (stub implementations)
 ;;; These return values in the correct range for ANSI conformance tests:

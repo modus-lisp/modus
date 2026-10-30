@@ -1,6 +1,8 @@
 ;;;; cl-reader.lisp — Reader, readtable, eval infrastructure
 ;;;; Part of the Modus CL runtime. Depends on cl-printer.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Common Lisp Reader (Layer 2)
 ;;; ============================================================

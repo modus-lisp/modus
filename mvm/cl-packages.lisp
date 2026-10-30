@@ -1,6 +1,8 @@
 ;;;; cl-packages.lisp — Package system
 ;;;; Part of the Modus CL runtime. Depends on cl-types.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Common Lisp Package System — Runtime Implementation
 ;;; ============================================================

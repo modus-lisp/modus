@@ -1,6 +1,8 @@
 ;;;; cl-fileio.lisp — File I/O: Linux syscalls, file streams, open/close, pathnames
 ;;;; Part of the Modus CL runtime. Depends on cl-streams.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Layer 7: File I/O — Linux syscall backend
 ;;; ============================================================

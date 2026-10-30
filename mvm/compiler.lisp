@@ -31390,6 +31390,9 @@
      (let ((thunk-name (format nil "TOPLEVEL-~D" (make-compiler-label))))
        (mvm-compile-function thunk-name nil (list form))))))
 
+(defvar *last-compiled-functions* nil
+  "*FUNCTIONS* of the last host-side MVM-COMPILE-ALL, for the build checks.")
+
 (defvar *fail-on-compile-skip* nil
   "When true, MVM-COMPILE-ALL fails after compiling every form if any form
    was SKIPPED for a compile error.  The CLI builds set it (build-cli-common):
@@ -31436,6 +31439,9 @@
     ;; (Same reason *init-thunk-names* is not let-bound — see the note below.)
     (setq *mvm-gensym-counter* 0)
     (setq *%defun-deferred* nil)
+    ;; the build checks read this module's function registry afterwards
+    ;; (mvm/build-checks.lisp); host builds only, so no image retains it
+    (unless *mvm-eval-runtime-p* (setq *last-compiled-functions* *functions*))
     ;; NOTE: *init-thunk-names* is intentionally NOT let-bound here.  It is
     ;; PUSH-mutated from the defvar/defparameter handler in mvm-compile-toplevel
     ;; (a DIFFERENT function called during phase 1) and read back below to

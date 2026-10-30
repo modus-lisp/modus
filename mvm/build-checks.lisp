@@ -1634,6 +1634,47 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
         (error "quote-pkg-check: ~D name~:P quoted in two kernel packages (first: ~A in ~{~A~^, ~})"
                (length split) (first (first split)) (second (first split)))))))
 
+(defparameter *fn-collision-baseline* '("MODRM" "REX-PREFIX")
+  "Collisions this check found when it was written, and kept visible here
+   rather than fatal: the x64 assembler (MODUS.ASM) and the x64 translator
+   (MODUS.MVM.X64) each define their own MODRM and REX-PREFIX.  Different
+   functions under one bare name in the image's runtime table; resolving that
+   is the translator's own cleanup, not this check's.")
+
+(defun check-cross-package-function-collisions ()
+  "Builder packages step 3.  One function NAME defined in two kernel packages
+   is two functions at build time but ONE entry in the image's runtime
+   function table (kernel packages share bare keys), and a seam whose default
+   and override land in different packages silently stops being a seam: the
+   default's callers keep calling the default (the MODUS.RUNTIME split's
+   %DEFERRED-PACKAGE-HOOK was exactly that).  Report each such name; fatal
+   unless MODUS_FN_COLLISION_CHECK=warn."
+  (let ((by (make-hash-table :test 'equal)) (coll nil))
+    (maphash (lambda (k info)
+               (declare (ignore k))
+               (let* ((q (function-info-qualified-name info))
+                      (bare (let ((n (function-info-name info)))
+                              (if (symbolp n) (symbol-name n) (princ-to-string n))))
+                      (pkg (if q (subseq q 0 (search "::" q)) "MODUS-INT")))
+                 (when (%kernel-package-name-for-check-p pkg)
+                   (pushnew pkg (gethash bare by) :test 'string=))))
+             (or *last-compiled-functions* (make-hash-table)))
+    (maphash (lambda (n pkgs)
+               (when (and (> (length pkgs) 1)
+                          (not (member n *fn-collision-baseline* :test 'string=)))
+                 (push (list n pkgs) coll)))
+             by)
+    (setf coll (sort coll #'string< :key #'first))
+    (format t ";; fn-collision-check: ~D function name~:P defined in two kernel packages (of ~D)~%"
+            (length coll) (hash-table-count by))
+    (dolist (c coll)
+      (format t ";;   FUNCTION-COLLISION ~A in ~{~A~^, ~}~%" (first c) (second c)))
+    (when (and coll
+               (not (member (sb-ext:posix-getenv "MODUS_FN_COLLISION_CHECK")
+                            '("warn" "0") :test 'equal)))
+      (error "fn-collision-check: ~D function name~:P defined in two kernel packages (first: ~A in ~{~A~^, ~})"
+             (length coll) (first (first coll)) (second (first coll))))))
+
 (defun %gck-fallback-census-dump ()
   (let ((path (%gck-fallback-census-path)))
     (when (and path *gck-fallback-census*)
@@ -1703,6 +1744,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (check-cross-package-calls)
             (check-cross-package-globals)
             (check-cross-package-quotes)
+            (check-cross-package-function-collisions)
             result)))
   (setf (fdefinition 'build-image) *build-image-wrapper*))
 

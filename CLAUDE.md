@@ -317,6 +317,14 @@ Three things that are easy to get wrong:
   a bare `(%gc-read64 …)` there is an UNDEFINED-FUNCTION, as in CL.  (Phase B's
   transitional fallback, which made it read the kernel's function, is deleted;
   tests, scripts and docs say `modus-int::`.)  `test/kernel-shadow.lisp`.
+- **The runtime is package MODUS.RUNTIME** (`mvm/prelude.lisp`, `mvm/cl-*.lisp`;
+  builder packages step 3).  It uses MODUS-INT; the names the two share are
+  homed in MODUS-INT and listed in `mvm/kernel-packages.lisp`.  If a build
+  fails on CROSS-PACKAGE-CALL / -GLOBAL, QUOTE-SPLIT or FUNCTION-COLLISION
+  between them, add the name to `%MODUS-INT-RUNTIME-EXPORTS`.  A
+  FUNCTION-COLLISION is the dangerous one: a seam whose default and override
+  are in different packages is two functions, and the default's callers never
+  see the override.
 - **Kernel GLOBALS are not CL-USER globals either.**  The build lists every
   name its source defines with DEFVAR / DEFPARAMETER / DEFCONSTANT
   (`*kernel-global-names*`, 1021 in the x64 CLI); a symbol of a non-kernel

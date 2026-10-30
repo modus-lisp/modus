@@ -1,6 +1,8 @@
 ;;;; cl-conditions.lisp — Condition system
 ;;;; Part of the Modus CL runtime. Depends on cl-packages.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Condition System
 ;;; ============================================================
@@ -2974,7 +2976,6 @@
   (%register-pkg-by-hash
    (make-package "MODUS-INT" :nicknames (list "MODUS.MVM") :use (list "CL")))
   (%register-pkg-by-hash (make-package "MODUS.ASM" :use (list "CL")))
-  (%register-pkg-by-hash (make-package "MODUS.RUNTIME" :use (list "CL")))
   (%register-pkg-by-hash
    (make-package "MODUS.MVM.X64" :use (list "CL" "MODUS-INT" "MODUS.ASM")))
   (%register-pkg-by-hash (make-package "MODUS.MVM.I386" :use (list "CL" "MODUS-INT")))

@@ -1,6 +1,8 @@
 ;;;; cl-printer.lisp — Printer and format
 ;;;; Part of the Modus CL runtime. Depends on cl-streams.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Layer 3: Printer — respects *print-* variables
 ;;; ============================================================

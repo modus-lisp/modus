@@ -1,6 +1,8 @@
 ;;;; cl-sequences.lisp — Sequence, list, and collection functions
 ;;;; Part of the Modus CL runtime. Load after cl-types.lisp.
 
+(in-package :modus.runtime)
+
 ;;; ============================================================
 ;;; Additional missing functions
 ;;; ============================================================

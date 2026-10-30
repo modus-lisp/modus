@@ -1422,6 +1422,9 @@
           ;; A package the HOST lacks means the (in-package ...) was text
           ;; inside a string (embedded test source), not the reader's state.
           (push (if (or (string= pkg "MODUS.MVM") (find #\: name)
+                        ;; (defun (setf X) ...): no name here; the filter in
+                        ;; *ALL-DEFUN-NAMES* drops "" but not "PKG::"
+                        (zerop (length name))
                         (not (find-package pkg)))
                     name
                     (let ((q (concatenate 'string pkg "::" name)))
@@ -2704,6 +2707,23 @@
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 
+;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP, without
+;;; building an image.  This is the refactor gate: the blob is the ONLY thing a
+;;; wrapper contributes to the emitted binary, so a wrapper refactor that leaves
+;;; it byte-identical is behaviour-preserving by construction, and proving that
+;;; takes ~20s instead of a ~10min image build.  Placed AFTER assembly and
+;;; BEFORE build-image so it cannot perturb what it measures -- and before the
+;;; blob read check, so a blob that does not read can still be dumped and read.
+#+sbcl
+(let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
+  (when (and p (plusp (length p)))
+    (with-open-file (o p :direction :output :if-exists :supersede
+                         :external-format :utf-8)
+      (write-string *full-source* o))
+    (format t "Dumped *full-source* to ~A (~D chars); skipping image build.~%"
+            p (length *full-source*))
+    (sb-ext:exit :code 0)))
+
 ;;; ============================================================
 ;;; BLOB READ CHECK — the assembled source must READ CLEANLY
 ;;; ============================================================
@@ -2749,19 +2769,5 @@
 ;;; BUILD-IMAGE, for the reason the read check gives.
 (setf modus.mvm::*fail-on-compile-skip* t)
 
-;;; MODUS_DUMP_FULL_SOURCE=<path> — write the assembled blob and STOP, without
-;;; building an image.  This is the refactor gate: the blob is the ONLY thing a
-;;; wrapper contributes to the emitted binary, so a wrapper refactor that leaves
-;;; it byte-identical is behaviour-preserving by construction, and proving that
-;;; takes ~20s instead of a ~10min image build.  Placed AFTER assembly and
-;;; BEFORE build-image so it cannot perturb what it measures.
-#+sbcl
-(let ((p (sb-ext:posix-getenv "MODUS_DUMP_FULL_SOURCE")))
-  (when (and p (plusp (length p)))
-    (with-open-file (o p :direction :output :if-exists :supersede
-                         :external-format :utf-8)
-      (write-string *full-source* o))
-    (format t "Dumped *full-source* to ~A (~D chars); skipping image build.~%"
-            p (length *full-source*))
-    (sb-ext:exit :code 0)))
+
 

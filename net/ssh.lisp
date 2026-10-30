@@ -8,6 +8,81 @@
 
 (in-package :modus.ssh)
 
+;;; ------------------------------------------------------------------
+;;; THE SSH INTERFACE.  What an image or an adapter may supply in place of
+;;; this file's default -- the entropy source, the transport's wait and
+;;; peer-closed test, the pre-auth clock, the ephemeral and host keys, the
+;;; session loop.  Each is a seam (as MODUS.NET's NIC interface is): the
+;;; function calls through a cell, %BIND-SSH-SEAMS puts this file's
+;;; %NAME-DEFAULT in every cell, and an image's adapter rebinds what it
+;;; replaces with (setf (fdefinition 'modus.ssh:NAME) ...) at boot
+;;; (net/ssh-x64-cl.lisp, net/hwrng-bcm2835.lisp, net/hosted-ssh.lisp,
+;;; net/isolated-cl.lisp).  This replaces "the adapter redefines NAME and
+;;; the last DEFUN wins".
+
+(defvar *arch-hw-random-fill* nil)
+(defvar *ssh-no-hw-rng* nil)
+(defvar *ssh-random* nil)
+(defvar *ssh-wait-data* nil)
+(defvar *pre-compute-host-sign* nil)
+(defvar *ssh-refresh-ephemeral* nil)
+(defvar *ssh-eph-base* nil)
+(defvar *pre-compute-server-eph* nil)
+(defvar *ed25519-sign-fast* nil)
+(defvar *ssh-message-loop* nil)
+(defvar *ssh-preauth-clock* nil)
+(defvar *ssh-peer-closed-p* nil)
+(defvar *ssh-wait-expired-p* nil)
+(defvar *ssh-version-wait-expired-p* nil)
+
+(defun arch-hw-random-fill (addr n) (funcall *arch-hw-random-fill* addr n))
+(defun ssh-no-hw-rng (b) (funcall *ssh-no-hw-rng* b))
+(defun ssh-random (ssh) (funcall *ssh-random* ssh))
+(defun ssh-wait-data (ssh) (funcall *ssh-wait-data* ssh))
+(defun pre-compute-host-sign () (funcall *pre-compute-host-sign*))
+(defun ssh-refresh-ephemeral () (funcall *ssh-refresh-ephemeral*))
+(defun ssh-eph-base (ssh) (funcall *ssh-eph-base* ssh))
+(defun pre-compute-server-eph (ssh) (funcall *pre-compute-server-eph* ssh))
+(defun ed25519-sign-fast (message msg-len) (funcall *ed25519-sign-fast* message msg-len))
+(defun ssh-message-loop (ssh) (funcall *ssh-message-loop* ssh))
+(defun ssh-preauth-clock () (funcall *ssh-preauth-clock*))
+(defun ssh-peer-closed-p () (funcall *ssh-peer-closed-p*))
+(defun ssh-wait-expired-p (count limit since) (funcall *ssh-wait-expired-p* count limit since))
+(defun ssh-version-wait-expired-p (count since) (funcall *ssh-version-wait-expired-p* count since))
+
+(defun %bind-ssh-seams ()
+  "Register the SSH interface's seams and bind each to this file's default.
+   Every image with SSH calls it at boot, before its adapters' binders."
+  (modus-int::%define-seam 'arch-hw-random-fill '*arch-hw-random-fill*)
+  (modus-int::%define-seam 'ssh-no-hw-rng '*ssh-no-hw-rng*)
+  (modus-int::%define-seam 'ssh-random '*ssh-random*)
+  (modus-int::%define-seam 'ssh-wait-data '*ssh-wait-data*)
+  (modus-int::%define-seam 'pre-compute-host-sign '*pre-compute-host-sign*)
+  (modus-int::%define-seam 'ssh-refresh-ephemeral '*ssh-refresh-ephemeral*)
+  (modus-int::%define-seam 'ssh-eph-base '*ssh-eph-base*)
+  (modus-int::%define-seam 'pre-compute-server-eph '*pre-compute-server-eph*)
+  (modus-int::%define-seam 'ed25519-sign-fast '*ed25519-sign-fast*)
+  (modus-int::%define-seam 'ssh-message-loop '*ssh-message-loop*)
+  (modus-int::%define-seam 'ssh-preauth-clock '*ssh-preauth-clock*)
+  (modus-int::%define-seam 'ssh-peer-closed-p '*ssh-peer-closed-p*)
+  (modus-int::%define-seam 'ssh-wait-expired-p '*ssh-wait-expired-p*)
+  (modus-int::%define-seam 'ssh-version-wait-expired-p '*ssh-version-wait-expired-p*)
+  (setq *arch-hw-random-fill* (function %arch-hw-random-fill-default))
+  (setq *ssh-no-hw-rng* (function %ssh-no-hw-rng-default))
+  (setq *ssh-random* (function %ssh-random-default))
+  (setq *ssh-wait-data* (function %ssh-wait-data-default))
+  (setq *pre-compute-host-sign* (function %pre-compute-host-sign-default))
+  (setq *ssh-refresh-ephemeral* (function %ssh-refresh-ephemeral-default))
+  (setq *ssh-eph-base* (function %ssh-eph-base-default))
+  (setq *pre-compute-server-eph* (function %pre-compute-server-eph-default))
+  (setq *ed25519-sign-fast* (function %ed25519-sign-fast-default))
+  (setq *ssh-message-loop* (function %ssh-message-loop-default))
+  (setq *ssh-preauth-clock* (function %ssh-preauth-clock-default))
+  (setq *ssh-peer-closed-p* (function %ssh-peer-closed-p-default))
+  (setq *ssh-wait-expired-p* (function %ssh-wait-expired-p-default))
+  (setq *ssh-version-wait-expired-p* (function %ssh-version-wait-expired-p-default)))
+
+
 ;; ================================================================
 ;; SSH Server
 ;; ================================================================
@@ -46,8 +121,7 @@
 ;;   +0x00 key (64)   +0x40 block counter   +0x44 pool index (64 = empty)
 ;;   +0x48 pool (64)  +0x88 seeded flag
 ;; ------------------------------------------------------------------
-(declaim (overridable arch-hw-random-fill))
-(defun arch-hw-random-fill (addr n) 0)       ; 1 = filled N bytes at ADDR from hardware
+(defun %arch-hw-random-fill-default (addr n) 0)       ; 1 = filled N bytes at ADDR from hardware
 
 (defun %drbg-base () (+ (e1000-state-base) #x1800))
 
@@ -64,8 +138,7 @@
 
 ;; No hardware RNG answered: the weak key, announced.  The x64 CL image
 ;; overrides this to refuse instead inside an SEV-SNP guest.
-(declaim (overridable ssh-no-hw-rng))
-(defun ssh-no-hw-rng (b) (%drbg-weak-key b))
+(defun %ssh-no-hw-rng-default (b) (%drbg-weak-key b))
 
 (defun ssh-seed-random ()
   (let ((b (%drbg-base)))
@@ -98,8 +171,7 @@
     (setf (mem-ref (+ b #x44) :u32) 0)))
 
 ;; A random byte.  SSH is the per-connection state base, kept for the callers.
-(declaim (overridable ssh-random))
-(defun ssh-random (ssh)
+(defun %ssh-random-default (ssh)
   (let ((b (%drbg-base)))
     (when (not (= (mem-ref (+ b #x88) :u32) 1))
       (ssh-seed-random))
@@ -504,8 +576,7 @@
 ;; (or the inline poll loop that stands in for it) fills the buffer and this is
 ;; the actor RECEIVE it always was.  A hosted image overrides it with a read(2)
 ;; on the connection's socket (net/hosted-ssh.lisp).
-(declaim (overridable ssh-wait-data))
-(defun ssh-wait-data (ssh) (ssh-net-poll))
+(defun %ssh-wait-data-default (ssh) (ssh-net-poll))
 
 (defun ssh-receive-packet (ssh timeout)
   (let ((encrypted (mem-ref (+ ssh #x0C) :u32))
@@ -1277,16 +1348,6 @@
 ;; then stores its address at 0x395000 so cross-compiled make-array
 ;; and make-string can call it on OOM.
 ;; Must be called before any actors that need GC in cross-compiled allocators.
-(declaim (overridable init-gc-helper))
-(defun init-gc-helper ()
-  ;; Build args for rt-compile-defun: (name params body)
-  ;; params = nil (0)
-  ;; body = (gc) = (sym-gc . nil) = (67 . 0)
-  (let ((gc-form (cons 67 0)))
-    (let ((defun-args (cons (hash-of "do-gc") (cons 0 (cons gc-form 0)))))
-      (rt-compile-defun defun-args)
-      ;; Store the function address at fixed location 0x395000
-      (setf (mem-ref (+ (ssh-ipc-base) #x95000) :u64) (nfn-lookup (hash-of "do-gc"))))))
 
 ;; Override ssh-server for single-threaded AArch64
 ;; No GC helper, no actor-spawn. Runs network loop directly.
@@ -1384,69 +1445,6 @@
 
 ;; Process a single byte of input for line editing
 ;; Returns: 1 = enter pressed, 2 = ctrl-d, nil = continue
-(declaim (overridable handle-edit-byte))
-(defun handle-edit-byte (b)
-  (let ((esc (mem-ref (+ (ssh-ipc-base) #x12810) :u64)))
-    (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 0)
-    (if (eq esc 1)
-        ;; Got ESC: '[' -> state 2, else reset
-        (if (eq b 91)
-            (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 2)
-            (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0))
-        (if (eq esc 2)
-            ;; Got ESC[: handle arrow keys or extended sequence
-            (progn
-              (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0)
-              (if (eq b 67)  ; right arrow
-                  (when (< (edit-cursor-pos) (edit-line-len))
-                    (edit-set-cursor-pos (+ (edit-cursor-pos) 1))
-                    (%serial-byte 27) (%serial-byte 91) (%serial-byte 67))
-                  (when (eq b 68)  ; left arrow
-                    (when (> (edit-cursor-pos) 0)
-                      (edit-set-cursor-pos (- (edit-cursor-pos) 1))
-                      (%serial-byte 27) (%serial-byte 91) (%serial-byte 68)))))
-            (if (> esc 2)
-                ;; Absorb extended escape sequences
-                (if (>= b 64)
-                    (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 0)
-                    (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) (+ esc 1)))
-                ;; Normal state (esc=0)
-                (if (eq b 27)
-                    (setf (mem-ref (+ (ssh-ipc-base) #x12810) :u64) 1)
-                    (if (if (eq b 127) 1 (eq b 8))
-                        (line-delete-back)
-                        (if (if (eq b 10) 1 (eq b 13))
-                            ;; Enter
-                            (progn
-                              (setf (mem-ref (+ (ssh-ipc-base) #x24) :u32) (edit-line-len))
-                              (setf (mem-ref (+ (ssh-ipc-base) #x20) :u32) 0)
-                              (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 1))
-                            (if (eq b 4)
-                                ;; Ctrl-D on empty line
-                                (when (zerop (edit-line-len))
-                                  (setf (mem-ref (+ (ssh-ipc-base) #x12A08) :u64) 2))
-                                (if (eq b 3)
-                                    ;; Ctrl-C: cancel line
-                                    (progn
-                                      (%serial-byte 94) (%serial-byte 67) (%serial-byte 10)
-                                      (edit-set-line-len 0)
-                                      (edit-set-cursor-pos 0)
-                                      (emit-prompt))
-                                    (if (eq b 21)
-                                        ;; Ctrl-U: clear line
-                                        (progn
-                                          (when (> (edit-cursor-pos) 0)
-                                            (%serial-byte 27) (%serial-byte 91)
-                                            (print-dec (edit-cursor-pos))
-                                            (%serial-byte 68))
-                                          (%serial-byte 27) (%serial-byte 91) (%serial-byte 75)
-                                          (edit-set-line-len 0)
-                                          (edit-set-cursor-pos 0))
-                                        ;; Printable character
-                                        (when (> b 31)
-                                          (when (< b 127)
-                                            (line-insert-byte b))))))))))))
-    (mem-ref (+ (ssh-ipc-base) #x12A08) :u64)))
 
 ;;; ============================================================
 ;;; Buffer-based s-expression reader (reads from line buffer, not UART)
@@ -1629,8 +1627,7 @@
 ;; Pre-compute Ed25519 host key derivatives for fast signing.
 ;; Stores clamped scalar s at state+0x680, prefix at state+0x6A0.
 ;; Must be called AFTER ed25519-init and host key setup.
-(declaim (overridable pre-compute-host-sign))
-(defun pre-compute-host-sign ()
+(defun %pre-compute-host-sign-default ()
   (let ((state (e1000-state-base)))
     (sha512-init)
     ;; Load host private key from state+0x710
@@ -1656,8 +1653,7 @@
 ;; A fresh server ephemeral key for the NEXT connection.  It is pre-computed so
 ;; a slow board does not pay for it inside a handshake, but reusing one key for
 ;; every connection gives up forward secrecy, so each connection retires it.
-(declaim (overridable ssh-refresh-ephemeral))
-(defun ssh-refresh-ephemeral ()
+(defun %ssh-refresh-ephemeral-default ()
   (when (= (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 1)   ; only if a KEX used it
     (setf (mem-ref (+ (ssh-ipc-base) #x6045C) :u32) 0)
     (pre-compute-server-eph (conn-ssh 0))))
@@ -1665,13 +1661,11 @@
 ;; Where SSH-HANDLE-KEX finds the server's ephemeral X25519 pair for SSH (the
 ;; private key, the public key at +0x20): one slot for the server, refreshed
 ;; after each key exchange.  net/isolated-cl.lisp gives every session its own.
-(declaim (overridable ssh-eph-base))
-(defun ssh-eph-base (ssh) (+ (e1000-state-base) #x6C4))
+(defun %ssh-eph-base-default (ssh) (+ (e1000-state-base) #x6C4))
 
 ;; Pre-compute X25519 server ephemeral key pair.
 ;; Stores private key at state+0x6C4, public key at state+0x6E4.
-(declaim (overridable pre-compute-server-eph))
-(defun pre-compute-server-eph (ssh)
+(defun %pre-compute-server-eph-default (ssh)
   (let ((state (e1000-state-base)))
     ;; Generate random private key
     (let ((priv (make-array 32)))
@@ -1686,8 +1680,7 @@
 
 ;; Fast Ed25519 sign using pre-computed s, prefix, and host public key.
 ;; Saves one ed-base-mult and one SHA-512 compared to ed25519-sign.
-(declaim (overridable ed25519-sign-fast))
-(defun ed25519-sign-fast (message msg-len)
+(defun %ed25519-sign-fast-default (message msg-len)
   (let ((state (e1000-state-base)))
     ;; Load pre-computed s and prefix
     (let ((s (make-array 32)))
@@ -1844,8 +1837,7 @@
 
 ;; Message loop — runs until the client disconnects; an authenticated session
 ;; never times out, an unauthenticated one does (see below).
-(declaim (overridable ssh-message-loop))
-(defun ssh-message-loop (ssh)
+(defun %ssh-message-loop-default (ssh)
   (let ((flag-addr (+ (conn-ssh 3) #x700))
         (idle 0)
         (since (ssh-preauth-clock)))
@@ -1881,16 +1873,12 @@
 ;; SSH-WAIT-EXPIRED-P is the one policy: COUNT polls against LIMIT, SINCE = the
 ;; clock at the start of the wait.  The default is the count alone (unchanged);
 ;; a target with a usable counter overrides both (the x64 CL image: TSC).
-(declaim (overridable ssh-preauth-clock))
-(defun ssh-preauth-clock () 0)
-(declaim (overridable ssh-peer-closed-p))
-(defun ssh-peer-closed-p () (= (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1))
-(declaim (overridable ssh-wait-expired-p))
-(defun ssh-wait-expired-p (count limit since)
+(defun %ssh-preauth-clock-default () 0)
+(defun %ssh-peer-closed-p-default () (= (mem-ref (+ (ssh-ipc-base) #x60458) :u32) 1))
+(defun %ssh-wait-expired-p-default (count limit since)
   (or (ssh-peer-closed-p) (> count limit)))
 ;; The wait for the client's version string, the first thing it sends.
-(declaim (overridable ssh-version-wait-expired-p))
-(defun ssh-version-wait-expired-p (count since) (ssh-wait-expired-p count 50 since))
+(defun %ssh-version-wait-expired-p-default (count since) (ssh-wait-expired-p count 50 since))
 
 ;; The next packet, waiting as long as SSH-WAIT-EXPIRED-P allows; NIL on timeout.
 (defun ssh-await-packet (ssh)

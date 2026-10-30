@@ -24,6 +24,12 @@
     ;; (%MODUS-INT-RUNTIME-EXPORTS), as SB-IMPL uses SB-INT; everything else
     ;; in it is its own.
     ("MODUS.RUNTIME" ("COMMON-LISP" "MODUS-INT") ())
+    ;; the board adapter an image bakes (net/arch-*-cl.lisp) and its hardware
+    ;; bits for SSH (net/ssh-x64-cl.lisp, net/hwrng-bcm2835.lisp).  The hooks
+    ;; it supplies to the rest of the kernel are MODUS-INT's, exported to it
+    ;; (%MODUS-INT-BOARD-EXPORTS); its helpers are its own.  One package for
+    ;; every board: an image bakes exactly one.
+    ("MODUS.BOARD" ("COMMON-LISP" "MODUS-INT") ())
     ("MODUS.NET" ("COMMON-LISP")
      ;; the NIC interface: every driver implements it, ip.lisp calls it
      ("NIC-SEND" "NIC-RECEIVE" "NIC-RX-BUF" "NIC-PROBE" "NIC-READ-REG"))
@@ -62,13 +68,16 @@
       "SSH-SET-HOST-KEY" "SSH-USE-DEFAULT-KEY" "SSH-AUTH-KEY-ADDR"
       "SSH-MEM-STORE" "SSH-REFRESH-EPHEMERAL" "SSH-PEER-CLOSED-P"
       "SSH-PREAUTH-CLOCK" "SSH-PREAUTH-IDLE-LIMIT" "SSH-WAIT-EXPIRED-P"
-      "PRE-COMPUTE-HOST-SIGN" "PRE-COMPUTE-SERVER-EPH" "%DRBG-WEAK-KEY")))))
+      "PRE-COMPUTE-HOST-SIGN" "PRE-COMPUTE-SERVER-EPH" "%DRBG-WEAK-KEY"
+      ;; the rest of its interface (the seams at the top of ssh.lisp)
+      "ARCH-HW-RANDOM-FILL" "SSH-NO-HW-RNG" "SSH-WAIT-DATA" "SSH-EPH-BASE"
+      "ED25519-SIGN-FAST" "SSH-MESSAGE-LOOP" "SSH-VERSION-WAIT-EXPIRED-P")))))
 
 (defun %modus-int-driver-exports ()
   "What MODUS-INT exports to the step-3 packages: the console
    printers, PCI configuration access and the BOARD's address hooks (each
-   arch-*-cl.lisp defines these for its machine).  The board hooks move to a
-   MODUS.BOARD package when the boards get one.  Exported on the build host
+   arch-*-cl.lisp, read in MODUS.BOARD, defines these for its machine; the
+   rest of the board interface is %MODUS-INT-BOARD-EXPORTS).  Exported on the build host
    and in the image alike (%ENSURE-KERNEL-PACKAGES), so the image reads
    driver source as the host did."
   (quote ("PRINT-DEC" "PRINT-HEX-BYTE" "PRINT-HEX32" "WRITE-STRING-SERIAL"
@@ -104,6 +113,17 @@
           "USB-SET-BULK-OUT-TOGGLE" "USB-SET-BULK-IN-TOGGLE"
           "USB-SET-BULK-OUT-MPS" "USB-SET-BULK-IN-MPS" "USB-SET-BULK-OUT-EP"
           "USB-SET-BULK-IN-EP" "USB-SET-DEV-ADDR")))
+
+(defun %modus-int-board-exports ()
+  "The board hooks MODUS-INT exports beyond %MODUS-INT-DRIVER-EXPORTS (whose
+   console printers, PCI access and buffer bases the boards implement too):
+   what the rest of the kernel calls on the board adapter (MODUS.BOARD), and
+   what the adapter calls back.  Measured by the build's package checks over
+   every image (scripts/build-matrix.sh, checks in warn mode)."
+  (quote ("PCI-ASSIGN-BARS" "%PCI-BAR-BASE" "DWC2-BASE"
+          ;; the actor scheduler's stubs, on boards that run no actors
+          "YIELD" "SPIN-LOCK" "SPIN-UNLOCK"
+          "SNP-ACTIVE-P")))
 
 (defun %kernel-package-name-p (name)
   "True when NAME is one of %KERNEL-PACKAGE-SPECS' packages."
@@ -236,6 +256,8 @@
     (dolist (n (%modus-int-driver-exports))
       (export (intern n int) int))
     (dolist (n (%modus-int-runtime-exports))
+      (export (intern n int) int))
+    (dolist (n (%modus-int-board-exports))
       (export (intern n int) int))
     (dolist (s (%kernel-package-specs))
       (let ((p (or (find-package (car s))

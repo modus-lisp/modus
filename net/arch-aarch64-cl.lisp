@@ -48,6 +48,8 @@
 ;; PCI configuration space via ECAM MMIO.  QEMU virt (highmem) places ECAM at
 ;; PA 0x40_10000000, which boot-aarch64.lisp's fixpoint L1[256] maps as a 1 GB
 ;; device block.
+(in-package :modus.board)
+
 (defun pci-config-read (bus dev fn reg)
   (let ((addr (+ #x4010000000
                  (logior (ash bus 20)

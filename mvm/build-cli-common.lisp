@@ -1705,7 +1705,15 @@
   ;; Bind the MODUS package's generic runtime functions (jit-eager…).  After
   ;; init-all-globals and function install, so the symbol-function table has them.
   (handler-case (%init-modus-package) (t (c) nil))
-  ;; WS5 rung 2: initialize the native JIT if it was baked (MODUS_USE_JIT=1).
+"
+  ;; the SSH interface (net/ssh.lisp): its defaults, then hosted-ssh.lisp's
+  ;; transport, entropy and keys.  Only the hosted x64 CLI bakes SSH.
+  (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+      "  (modus.ssh::%bind-ssh-seams)
+  (%bind-hosted-ssh-seams)
+"
+      "")
+  "  ;; WS5 rung 2: initialize the native JIT if it was baked (MODUS_USE_JIT=1).
   ;; %jit-boot-init is baked to a no-op when JIT is off, or to the translator
   ;; table co-init + (setq *use-jit* t) when JIT is on.  Wrapped so a JIT-init
   ;; crash can never take down a normal boot.

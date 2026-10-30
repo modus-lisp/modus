@@ -1428,7 +1428,8 @@
         *ssh-addr-map-source*                     (string #\Newline)
         (if *ssh-sync-p* *ssh-x64-actor-stubs* (%rpi-net-text "actors.lisp")) (string #\Newline)
         (%rpi-net-text "ssh.lisp")                (string #\Newline)
-        ;; After ssh.lisp, by last-defun-wins -- :X64: TSC-timed waits and RDRAND for
+        ;; The board's part of the SSH interface, bound at boot by
+        ;; %BIND-BOARD-SSH-SEAMS -- :X64: TSC-timed waits and RDRAND for
         ;; SSH-RANDOM; :RPI: the BCM2835/2837 hardware RNG for SSH-RANDOM and
         ;; natrium's entropy (%MODUS-HARDWARE-ENTROPY).
         (cond (*cl-repl-x64-p* (%rpi-net-text "ssh-x64-cl.lisp"))
@@ -1757,7 +1758,16 @@
                      *net-nic-source* (%nic-binding-text)))
   (setq *cli-arch-io-scratch-source*
         (concatenate 'string *cli-arch-io-scratch-source*
-                     (format nil "~%  (%bind-nic-seams)~%"))))
+                     (format nil "~%  (%bind-nic-seams)~%")
+                     ;; the SSH interface (net/ssh.lisp): its defaults, then
+                     ;; what this image's adapters replace
+                     (if *ssh-build-p*
+                         (format nil "  (modus.ssh::%bind-ssh-seams)~%~A~A"
+                                 (if (or *cl-repl-x64-p* *cl-repl-rpi-p*)
+                                     (format nil "  (modus.board::%bind-board-ssh-seams)~%") "")
+                                 (if *ssh-isolated-p*
+                                     (format nil "  (%bind-isolated-ssh-seams)~%") ""))
+                         ""))))
 
 ;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
 (when (and *cl-repl-x64-p* *pc-console-p*)

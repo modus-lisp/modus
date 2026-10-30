@@ -25,6 +25,8 @@
 ;; ============================================================
 ;; PCI configuration space (legacy port I/O)
 ;; ============================================================
+(in-package :modus.board)
+
 (defun pci-config-read (bus dev fn reg)
   (io-out-dword #xCF8
     (logior #x80000000

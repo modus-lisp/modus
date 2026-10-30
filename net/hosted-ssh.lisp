@@ -3,8 +3,9 @@
 ;;;; and a vsock listener for a Nitro enclave, whose only network is vsock to
 ;;;; its parent.  Baked after crypto.lisp, crypto-fast.lisp and ssh.lisp, which
 ;;;; this file gives their arch adapter (the address map, the two transport
-;;;; touch points, entropy, the shell) -- last-defun-wins, so every override
-;;;; here replaces a bare-metal definition of the same name.
+;;;; touch points, entropy, the shell).  Its parts of the SSH interface are
+;;;; bound at boot by %BIND-HOSTED-SSH-SEAMS (end of file); the board hooks it
+;;;; supplies replace the bare-metal definitions of the same names.
 ;;;;
 ;;;; The server's state is RAW MEMORY at addresses the arch adapter hands out
 ;;;; (ssh.lisp's header: per-connection block at conn-base+0x20, host key and
@@ -56,12 +57,10 @@
 (defun %serial-byte (b) (write-char-serial b))
 (defun hash-of (name) 0)
 (defun nfn-lookup (hash) 0)
-(defun modus.ssh::init-gc-helper () nil)
 (defun net-init-dhcp () 0)
 (defun edit-line-len () 0)
 (defun edit-set-line-len (n) 0)
 (defun edit-set-cursor-pos (n) 0)
-(defun modus.ssh::handle-edit-byte (ssh b) 0)
 (defun native-eval (form) nil)
 (defun print-obj (x) nil)
 (defun rt-compile-defun (form) nil)
@@ -98,7 +97,7 @@
     (logior (ash (aref v 0) 24) (ash (aref v 1) 16) (ash (aref v 2) 8) (aref v 3))))
 ;;; SSH-RANDOM (one byte; the ephemeral key, padding, nonces) -- a 256-byte
 ;;; getrandom buffer at rand-page+0x100, index at rand-page+0x200.
-(defun modus.ssh::ssh-random (ssh)
+(defun %hosted-ssh-random (ssh)
   (let* ((pg (%hssh-rand-page)) (buf (+ pg #x100)) (ix (mem-ref (+ pg #x200) :u32)))
     (when (or (zerop ix) (>= ix 256))
       (%hssh-getrandom buf 256)
@@ -114,7 +113,7 @@
 (defun tcp-send-conn (cb data len)
   (when (> len 0) (socket-send-from (%hssh-fd cb) data 0 len))
   0)
-(defun modus.ssh::ssh-wait-data (ssh)
+(defun %hosted-ssh-wait-data (ssh)
   "Append whatever read(2) gives to this connection's recv buffer; 0 = gone."
   (let* ((cb (- ssh #x20))
          (blen (mem-ref (+ ssh #x6D4) :u32))
@@ -133,7 +132,7 @@
     (dotimes (i 32)
       (setf (mem-ref (+ ssh #x110 i) :u8) (mem-ref (+ state #x710 i) :u8))
       (setf (mem-ref (+ ssh #x130 i) :u8) (mem-ref (+ state #x730 i) :u8)))))
-(defun modus.ssh::pre-compute-host-sign ()
+(defun %hosted-pre-compute-host-sign ()
   (let ((state (e1000-state-base)))
     (modus.crypto:sha512-init)
     (let ((privkey (make-array 32)))
@@ -145,14 +144,14 @@
           (setf (mem-ref (+ state #x69F) :u8) (logior (logand b31 #x7F) #x40)))
         (dotimes (i 32) (setf (mem-ref (+ state (+ #x6A0 i)) :u8) (aref hash (+ i 32))))
         (setf (mem-ref (+ state #x6C0) :u32) 1)))))
-(defun modus.ssh::pre-compute-server-eph (ssh)
+(defun %hosted-pre-compute-server-eph (ssh)
   "A FRESH X25519 ephemeral for this connection at state+0x6C4 / +0x6E4 (modus.ssh:ssh-handle-kex reads it there)."
   (let ((state (e1000-state-base)) (priv (make-array 32)))
     (dotimes (i 32) (aset priv i (modus.ssh:ssh-random ssh)))
     (dotimes (i 32) (setf (mem-ref (+ state (+ #x6C4 i)) :u8) (aref priv i)))
     (let ((pub (modus.crypto:x25519-public-key priv)))
       (dotimes (i 32) (setf (mem-ref (+ state (+ #x6E4 i)) :u8) (aref pub i))))))
-(defun modus.ssh::ed25519-sign-fast (message msg-len)
+(defun %hosted-ed25519-sign-fast (message msg-len)
   (let ((state (e1000-state-base)) (s (make-array 32)) (prefix (make-array 32)) (a-enc (make-array 32)))
     (dotimes (i 32)
       (aset s i (mem-ref (+ state (+ #x680 i)) :u8))
@@ -322,3 +321,12 @@
          (let ((d (nsm-attestation-document ud nonce)))
            (cond (d (%nitro-hex-lines "NITRO-DOC" d) :document)
                  (t (format t "NITRO-STATUS ~A~%" *nsm-last-status*) *nsm-last-status*))))))))
+
+(defun %bind-hosted-ssh-seams ()
+  "Bind the SSH interface functions this file implements (modus.ssh's
+   seams; MODUS.SSH::%BIND-SSH-SEAMS runs first)."
+  (setf (fdefinition 'modus.ssh:ssh-random) (function %hosted-ssh-random))
+  (setf (fdefinition 'modus.ssh:ssh-wait-data) (function %hosted-ssh-wait-data))
+  (setf (fdefinition 'modus.ssh:pre-compute-host-sign) (function %hosted-pre-compute-host-sign))
+  (setf (fdefinition 'modus.ssh:pre-compute-server-eph) (function %hosted-pre-compute-server-eph))
+  (setf (fdefinition 'modus.ssh:ed25519-sign-fast) (function %hosted-ed25519-sign-fast)))

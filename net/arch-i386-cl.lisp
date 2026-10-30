@@ -24,6 +24,8 @@
 ;; ============================================================
 ;; No PCI: the NE2000 is an ISA card at I/O base #x300.
 ;; ============================================================
+(in-package :modus.board)
+
 (defun pci-config-read (bus dev fn reg) 0)
 (defun pci-config-write (bus dev fn reg val) nil)
 (defun pci-assign-bars () nil)

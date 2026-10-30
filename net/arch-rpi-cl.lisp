@@ -44,6 +44,8 @@
 ;;;; file descriptors for anyway.
 
 ;; No PCI bus on a BCM2837 — stubs for shared code that calls these.
+(in-package :modus.board)
+
 (defun pci-config-read (bus dev fn reg) 0)
 (defun pci-config-write (bus dev fn reg val) nil)
 (defun pci-assign-bars () nil)

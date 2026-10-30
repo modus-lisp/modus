@@ -1,7 +1,7 @@
 ;;;; hwrng-bcm2835.lisp -- the BCM2835/2837 hardware random number generator
 ;;;; (Pi 3, Pi Zero 2 W; QEMU raspi3b models it), as net/ssh.lisp's
-;;;; ARCH-HW-RANDOM-FILL.  Spliced AFTER ssh.lisp in the Pi SSH builds so it
-;;;; replaces the no-hardware default by last-defun-wins.
+;;;; ARCH-HW-RANDOM-FILL.  Baked in the Pi SSH builds; %BIND-BOARD-SSH-SEAMS,
+;;;; at the end, binds it in place of the no-hardware default at boot.
 ;;;;
 ;;;; Registers, as Linux's bcm2835-rng drives them:
 ;;;;   +0x00 CTRL      bit 0 RBGEN: generator on
@@ -10,6 +10,8 @@
 ;;;;   +0x10 INT_MASK  bit 0: mask its interrupt (we poll)
 ;;;; Peripheral base 0x3F000000 (BCM2837).  A Pi 4/5 RNG is elsewhere and
 ;;;; different; this image does not run there.
+
+(in-package :modus.board)
 
 (defun %bcm-rng-base () #x3F104000)
 
@@ -32,7 +34,7 @@
           (setq n (+ n 1))
           (setq w (mem-ref (+ b 8) :u32))))))
 
-(defun modus.ssh::arch-hw-random-fill (addr n)
+(defun %board-arch-hw-random-fill (addr n)
   (%bcm-rng-init)
   (let ((ok 1) (i 0))
     (loop
@@ -63,3 +65,8 @@
           (when (< (+ i k) n)
             (setf (aref out (+ i k)) (logand (ash w (* -8 k)) 255)))))
       (setq i (+ i 4)))))
+
+(defun %bind-board-ssh-seams ()
+  "Bind the SSH interface functions this file implements (modus.ssh's
+   seams; MODUS.SSH::%BIND-SSH-SEAMS runs first)."
+  (setf (fdefinition 'modus.ssh:arch-hw-random-fill) (function %board-arch-hw-random-fill)))

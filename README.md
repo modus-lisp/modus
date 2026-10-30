@@ -2,9 +2,11 @@
 
 **Website: [modus-lisp.github.io](https://modus-lisp.github.io)**
 
-A bare-metal Lisp operating system. Boots directly on hardware (or QEMU) into an interactive Lisp REPL with networking, SSH, and cryptography — no underlying OS.
-
-A self-hosting system with a portable virtual machine (MVM) targeting 9 CPU architectures, an Erlang-style actor model, SMP multicore support, and per-actor garbage collection.
+A self-hosting Common Lisp that boots on bare metal — directly on hardware or in
+QEMU, into a Lisp REPL with networking, SSH and cryptography and no OS
+underneath — and runs hosted on Linux as an SBCL-compatible `modus` command.
+Its compiler targets a portable virtual machine (MVM) with native translators
+for nine CPU architectures.
 
 ## Start here: kiln
 
@@ -27,68 +29,96 @@ This repository is Modus itself — the compiler, the runtime and the ports. Wor
 here directly when you are changing those; [Building and running](#building-and-running)
 below covers that.
 
-## Recent work
+## What Modus is now
 
-Over ~1500 commits (April–July 2026) Modus grew from a bare-metal Lisp with
-networking into a largely self-hosting ANSI Common Lisp:
+A Common Lisp that compiles itself, runs hosted on Linux under six CPU
+architectures and on bare metal on four, and is checked against SBCL byte for
+byte.
 
-- **ANSI Common Lisp (~94% per-file conformance).** Full condition system
-  (handler-case/bind, restarts, `signal`/`warn`/`cerror`), CLOS with standard
-  method combination and `call-next-method`, the reader and printer with
-  `format` (50+ directives), pathnames and file I/O, a numeric tower (bignums,
-  ratios, single/double floats, complex), and ~400 standard functions.
-- **One evaluator (WS3).** Production `eval` and `load` compile each form to MVM
-  bytecode and run it — the self-hosted MVM compiler runs *inside* the image,
-  and the original tree-walking interpreter has been deleted. The vendored ASDF
-  driver evaluates end-to-end on this path.
-- **Runtime JIT (WS4).** MVM bytecode is translated to native code at runtime
-  (executable memory + call relocation) behind the same evaluator seam.
-- **Full self-reproduction (WS5).** A Modus binary compiles its own source to a
-  native ELF and reproduces itself (modus → modus2 → modus3) with SBCL out of
-  the loop.
-- **GC hardening.** Conservative-root validation via an object-start bitmap, a
-  heap guard band, zero-initialized allocation, and optional Bartlett
-  page-pinning — closing a class of heap-corruption crashes.
-- **SBCL drop-in compatibility (in progress).** Unmodified pure-Common-Lisp
-  libraries load and run from source — e.g. natrium (SHA-256 FIPS-exact) and
-  alexandria — with the `bordeaux-threads` dependency tree loading unmodified.
-- **New platforms and features.** Bare-metal ThinkPad T420 (E1000 SSH, EHCI USB,
-  VGA + PS/2 console), UEFI x86-64, ARM32, byte-packed `(unsigned-byte 8)`
-  arrays, and a hosted `modus` CLI with SBCL-faithful flags.
+- **ANSI Common Lisp: the whole upstream suite.** The pinned
+  [ansi-test](https://gitlab.common-lisp.net/ansi-test/ansi-test) suite passes
+  **21,681 of 21,681** on all six hosted CLIs (x86-64, AArch64, i386, ARM32,
+  RV32, RV64), and every merge is gated on the x86-64 run: CLOS with method
+  combination, the condition system and restarts, the pretty printer,
+  pathnames, `compile-file` with real FASLs, and the full numeric tower, IEEE
+  floats included.
+- **An SBCL drop-in, as far as libraries can tell.**  `./modus` takes SBCL's
+  flags (`--eval`, `--load`, `--script`, `~/.modusrc`), ASDF is built in, and
+  `SB-EXT`, `SB-THREAD`, `SB-BSD-SOCKETS`, `SB-POSIX` and `SB-SYS` are there
+  for the code that asks for them.  Unmodified Quicklisp installs and loads
+  libraries, including on bare metal.
+- **Packages like SBCL's.**  Internals live in `MODUS-INT` (SB-INT's role),
+  the public API in `MODUS` (SB-EXT's), the runtime in `MODUS.RUNTIME`, and the
+  network stack, drivers, crypto, SSH and board adapters in packages of their
+  own.  A script's `(defun print-dec ...)` or `(defvar *tar-block-size* ...)`
+  makes its own function or variable instead of replacing the kernel's;
+  `modus-int::print-dec` reaches the kernel's on purpose.
+- **Native code at runtime.**  `eval` and `load` compile to MVM bytecode, and a
+  hot-function JIT turns it into native x86-64 or AArch64.  Redefining a
+  function reaches every caller already compiled against it, the kernel's own
+  included.
+- **Threads.**  Hosted x86-64 has native OS threads, each with its own GC
+  region, dynamic bindings and handler stack: the [glass](https://github.com/modus-lisp/glass)
+  compositor serves VNC clients from its own threads, unmodified.  On bare
+  metal the Pi and QEMU virt images run threads on all four cores.
+- **Garbage collection.**  A Cheney collector in every CL image and every
+  hosted port (hosted 68k and PowerPC size their heap at startup), per-region
+  collection for threads, and a generational collector with a card-marking
+  write barrier on AArch64 and hosted x86-64.
+- **Self-hosting, checked against SBCL.**  The self-hosted compiler rebuilds
+  the UEFI x86-64 image byte-for-byte as SBCL builds it, and emits the same
+  Linux/AArch64 image from the same source; the acceptance gate runs both
+  checks on every merge.  The bootstrap also runs under CCL and ABCL.
+- **Attested.**  Modus runs as an AWS Nitro enclave and as an AMD SEV-SNP guest,
+  serving SSH whose host key is bound into the attestation document
+  (docs/nitro-enclaves.md, docs/vpsbg-snp-status.md).
+- **Everywhere else.**  A saved core boots in seconds (`save-and-die`,
+  docs/save-and-die.md); `web/mvm.js` runs Modus in a browser; the 68k image is
+  the first big-endian full CL, and 68k and i386 build soft-float images for
+  FPU-less CPUs.
 
-## Feature matrix
+## Platforms
 
-### Platforms
+### Hosted (Linux)
 
-|                    | x86-64 QEMU | AArch64 QEMU virt | RPi 3B QEMU | Pi Zero 2 W | i386 QEMU | ARM32 QEMU | ThinkPad T420 |
-|--------------------|:-----------:|:-----------------:|:-----------:|:-----------:|:---------:|:----------:|:-------------:|
-| Serial REPL        | Y | Y | Y | Y | Y | Y | - |
-| VGA + PS/2 REPL    | - | - | - | - | - | - | Y |
-| E1000 networking   | Y | Y | - | - | - | - | Y |
-| NE2000 networking  | - | - | - | - | Y | - | - |
-| USB CDC networking | - | - | Y | Y | - | Y | - |
-| SSH server         | Y | Y | Y | Y | Y | Y | Y |
-| HTTP server/client | - | Y | - | Y | - | - | - |
-| Actors             | Y | Y | - | Y | - | - | - |
-| Actor isolation    | - | Y | - | - | - | - | - |
-| SMP (multi-core)   | Y | - | - | - | - | - | - |
-| Self-hosting       | Y | Y | - | - | Y | - | - |
-| USB HID            | - | - | Y | - | - | - | - |
-| GPIO/SPI/I2C       | - | - | Y | - | - | - | - |
-| GPU framebuffer    | - | - | Y | Y | - | - | Y (UEFI) |
-| UART bootloader    | - | - | - | Y | - | - | - |
-| EHCI USB (WIP)     | - | - | - | - | - | - | Y |
+| CLI | Build | ANSI suite |
+|-----|-------|:----------:|
+| x86-64  | `mvm/build-generic-cli.lisp` (JIT, threads, sockets, SSH) | 21,681 / 21,681 (gated) |
+| AArch64 | `mvm/build-aarch64-cli.lisp` (JIT)                         | 21,681 / 21,681 |
+| i386    | `mvm/build-i386-cli.lisp` (SSE2, x87 or soft-float)        | 21,681 / 21,681 |
+| ARM32   | `mvm/build-arm32-cli.lisp`                                 | 21,681 / 21,681 |
+| RV32 / RV64 | `mvm/build-riscv32-cli.lisp`, `mvm/build-riscv64-cli.lisp` | 21,681 / 21,681 |
+| 68k     | `mvm/build-68k-cli.lisp` (FPU or soft-float)               | loads alexandria, cl-ppcre |
 
-NIC driver: x86-64 and AArch64 virt use Intel E1000 (PCI). RPi uses DWC2 USB — host mode (CDC Ethernet) on QEMU raspi3b, device/gadget mode (CDC-ECM) on Pi Zero 2 W. i386 uses NE2000 ISA NIC (port I/O). ARM32 uses DWC2 USB gadget (CDC-ECM) on QEMU raspi2b. T420 uses E1000 82579LM with BIOS-preserving init.
+The non-x86-64 ports run under `qemu-*-static`; `scripts/allarch-ansi.sh` sweeps
+them (one to two hours each, so outside the half-hour gate).
+
+### Bare metal
+
+Every bare-metal image runs the same Common Lisp REPL.
+
+|                  | x86-64 (multiboot, UEFI) | AArch64 QEMU virt | Raspberry Pi 3B / Zero 2 W | i386 | ARM32 QEMU virt |
+|------------------|:---:|:---:|:---:|:---:|:---:|
+| Serial REPL      | Y | Y | Y | Y | Y |
+| Screen + keyboard | VGA / GOP + PS/2 | - | HDMI + USB | - | - |
+| Network          | E1000, virtio | E1000 | USB CDC-ECM, RTL8152/8153 | NE2000 | - |
+| SSH server       | Y | Y | Y | Y | - |
+| Threads          | - | 4 cores | 4 cores | - | - |
+| Isolated SSH (session per thread) | - | regressed on main, being bisected | not rechecked since | - | - |
+| Generational GC  | - | - | Y | - | - |
+| Saved cores      | Y | - | Y | - | - |
+
+The Pi Zero 2 W image is the one [kiln](https://github.com/modus-lisp/kiln)
+deploys to a board (`kiln zero`): netboot, SSH, a desktop on HDMI.  The UEFI image
+boots real PCs from a USB stick and is the one the SEV-SNP guest measures.
 
 ### MVM architectures
 
-**Eight of the nine run compiled Lisp in QEMU, verified.** The ninth, AArch64
-RPi, shares AArch64's translator and is blocked by the RPi family's build
-failure (#209), not by its back end. What none of them has yet is a payload
-worth booting into — the two sections below are kept apart deliberately,
-because conflating "the code generator works" with "the system works" is how
-the claims in this file went wrong before.
+**Eight of the nine run compiled Lisp in QEMU, verified by the ladder below.**
+The ninth, AArch64 RPi, shares AArch64's translator and runs the full CL image
+on real boards; it is simply not a ladder target.  The ladder measures the code
+generator, not the system: the platform tables above say which images run the
+full Common Lisp.
 
 #### Back end — measured
 
@@ -122,31 +152,15 @@ than merely unwritten (floats need the FPU enabled in each boot stub, which
 i386 itself does not do; `:li-const` is only ever emitted by the in-image
 compiler; `:bvs` is a design question on RISC-V, which has no condition flags).
 
-#### Payload — one generic image, everything else loaded
+#### Payload — one image per platform, everything else loaded
 
-A back end that computes correctly is not a system. The direction is **not** a
-per-feature image per architecture; it is one generic image per architecture
-running the real CL, with everything else — SSH, test runners, tools — arriving
-as source it LOADs at runtime. `build-generic` is that shape hosted (boot, LOAD
-`argv[1]`, exit); `build-x64-cl-repl` is that shape on bare metal, a multiboot
-image whose REPL is the actual CL — reader, `eval` = mvm-eval, printer — over
-COM1 via `lib/serial-repl.lisp`. It evaluates `(+ 1 2)` to `3`, and it is the
-replacement for the retired `build-x64-repl` and `build-x64-console-repl`.
-
-Read the state of the old payloads in that light:
-
-- **The legacy `repl-source.lisp` mini-Lisp is gone** (2026-10-28): every
-  image that ran it was ported to the CL image or archived under the
-  `mini-lisp-final` tag — docs/mini-lisp-archive.md.
-- **The baked SSH payload is unproven everywhere** (`GATE-RESULT-run-cells.md`
-  marks all six ssh cells CANNOT PROVE). Under this strategy that matters much
-  less than it looks: a baked SSH image is the thing being retired, not the
-  thing being fixed. SSH becomes source the generic image loads.
-
-So the remaining work is to bring the CL image up on the other seven
-architectures, not to port seven payloads. The back-end work was its
-prerequisite — the real CL cannot run on 68k until 68k can allocate a cons,
-which it could not until 5b187e4.
+The direction held: one Common Lisp image per platform, and everything else
+arriving as source it loads.  x86-64, AArch64, i386 and ARM32 run the full CL
+on bare metal, and six architectures run it hosted; SSH, Quicklisp and the
+board's desktop are code the image loads or bakes from the same sources.  The
+mini-Lisp that the early images ran is retired (docs/mini-lisp-archive.md,
+tag `mini-lisp-final`).  RISC-V, PowerPC and 68k bare metal pass the ladder but
+have no CL image yet.
 
 #### What is and is not gated
 
@@ -232,30 +246,35 @@ indistinguishable from "file not found". The builds write mode 644, so a first
 run looks like a broken image. Same shape as the i386 `binfmt_misc` trap
 documented in CLAUDE.md.
 
-### Cross-architecture fixpoint
+### Self-hosting checks
 
-The fixpoint proof verifies that the MVM compiler produces identical output
-regardless of which architecture runs it. The chain
-(`scripts/run-fixpoint-i386.sh`) runs 8 QEMU steps across **three**
-architectures — x64, AArch64 and i386 — verifying SHA256 equalities, and
-includes i386 self-hosting (i386 compiles itself) plus cross-compilation among
-those three.
+The self-hosted compiler is checked against SBCL on every merge
+(`scripts/acceptance-gate.sh`, step 4):
 
-Two corrections to what this section used to say. **ARM32 is not in that
-chain**: it appears only in `scripts/run-fixpoint-ssh.sh`, which drives real
-boards over SSH and does not run here. And there is no "SSH over the fixpoint
-chain" — `run-fixpoint-i386.sh` extracts each generation over QMP `pmemsave`,
-never over the network.
+- `test/run-uefi-ddc.sh` — SBCL builds the UEFI x86-64 CL image and dumps the
+  source it compiled; `modus-sh` (the self-hosting image) compiles that source
+  in-image, twice.  All three images must be byte-identical.
+- `test/run-aarch64-ddc.sh` — the same source, compiled to Linux/AArch64 by SBCL
+  and by `modus-sh --compile-aarch64`, must be byte-identical.
 
-The chain does not currently complete from a clean checkout: step 0
-(`mvm/build-fixpoint.lisp`) heap-exhausts under SBCL's default dynamic space.
-`build.lisp` lists the `multi/fixpoint` cell as BROKEN for this reason.
+`scripts/run-fixpoint-hosts.sh` builds `modus-sh` under SBCL, CCL and ABCL and
+requires the programs each compiles to be byte-identical: the host Lisp washes
+out once Modus is compiling.
 
 ## Building and running
 
 Requires SBCL and QEMU.
 
-### Quick test
+### The hosted CLI
+
+```bash
+sbcl --dynamic-space-size 12288 --script mvm/build-generic-cli.lisp   # -> /tmp/modus
+/tmp/modus --eval '(print (expt 2 100))' --quit
+/tmp/modus --script my-program.lisp
+scripts/ansi-sweep.sh /tmp/modus /path/to/outdir                    # the upstream suite
+```
+
+### Quick test (QEMU)
 
 `./scripts/run.sh list` shows every QEMU configuration.  Each builds its image if
 any source is newer, boots it and evaluates one expression, at a serial REPL or
@@ -295,48 +314,40 @@ Connect to any SSH server: `ssh -p 2222 -o StrictHostKeyChecking=no test@localho
 ## Project structure
 
 ```
-mvm/                   Modus Virtual Machine
-  mvm.lisp             ISA definition (~50 opcodes, encoding/decoding)
-  compiler.lisp        3-phase compiler (Source → IR → MVM bytecode)
-  prelude.lisp         MVM-compilable CL library (hash tables, sort, mapcar)
-  translate-*.lisp     Native code translators (9 architectures)
-  interp.lisp          MVM interpreter (bootstrapping)
-  target.lisp          Architecture descriptors (9 targets)
-  cross.lisp           Universal cross-compilation pipeline
-  build-*.lisp         Build scripts for all platforms
-boot/                  Per-architecture boot sequences (9 targets + UEFI)
-net/                   Networking, crypto, SSH, USB, actors
-  ip.lisp              ARP, IP, UDP, TCP, DHCP, DNS, ICMP
-  crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
-  ssh.lisp             SSH-2 server (key exchange, auth, channels)
-  e1000.lisp           Intel E1000 NIC driver
-  ne2000.lisp          NE2000 ISA NIC driver
-  dwc2.lisp            DWC2 USB host controller (RPi 3B QEMU)
-  usb.lisp             USB enumeration + hub support
-  cdc-ether.lisp       USB CDC Ethernet;  r8152.lisp: RTL8152/8153 USB NICs
-  actors.lisp          Actor system (spawn, yield, send, receive)
-  bare-threads.lisp    Native threads on bare metal (Pi spin tables, virt PSCI)
-  isolated-cl.lisp     Isolated SSH: net domain + one thread per session
-  http-client.lisp     HTTP client with URL parsing
-  pc-console.lisp      VGA text / UEFI GOP framebuffer + PS/2 keyboard
-  hdmi-console.lisp    Pi HDMI console;  usb-hid-split.lisp: its USB keyboard
-  bcm2835-gpio.lisp    Pi GPIO, system timer, activity LED
-  arch-*-cl.lisp       per-platform adapters (x86, i386, aarch64 virt, rpi)
-cross/                 x64 assembler (used by MVM)
-runtime/               Tags, subtags, package definitions
-scripts/               Build, run, test, and deployment scripts
-tests/                 QEMU integration tests + SSH oracle
-docs/                  Design documents
-lib/                   Shared utilities (MVM loader, hash functions)
-crypto/                CL reference crypto implementations
-proto/                 CL reference protocol implementations (TLS 1.3, WebSocket, Nostr)
+mvm/                   The compiler, runtime and build scripts
+  compiler.lisp        Source -> IR -> MVM bytecode (runs on the host and in the image)
+  translate-*.lisp     Native translators: x64, aarch64, i386, arm32, riscv, ppc, 68k
+  x64-asm.lisp         x86-64 assembler
+  cross.lisp           Image assembly for every target
+  prelude.lisp, cl-*.lisp   The Common Lisp runtime (package MODUS.RUNTIME)
+  mvm-eval.lisp        eval/load: compile to bytecode, interpret or JIT
+  gc.lisp              Collector support shared by the ports
+  kernel-packages.lisp The kernel's packages and what each exports
+  build-*.lisp         Build scripts; build-checks.lisp the checks every build runs
+boot/                  Boot stubs: bare metal per architecture, Linux per architecture
+net/                   Networking, drivers, crypto, SSH, threads, boards
+  ip.lisp, tcp-conns.lisp   ARP, IP, TCP, UDP, DHCP, DNS
+  nic.lisp             The NIC interface the drivers implement
+  e1000.lisp, ne2000.lisp, virtio-net.lisp, dwc2.lisp, usb.lisp, cdc-ether.lisp, r8152.lisp
+  crypto*.lisp         SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
+  ssh.lisp             SSH-2 server; hosted-ssh.lisp, isolated-cl.lisp its other shapes
+  arch-*-cl.lisp       Board adapters (package MODUS.BOARD)
+  bare-threads*.lisp   Threads on bare metal;  hosted-*.lisp: threads, sockets on Linux
+  pc-console.lisp, hdmi-console.lisp   Screen and keyboard consoles
+lib/                   Loader, hashing, save-and-die, ASDF/Quicklisp support
+runtime/               Tags and subtags
+web/                   The browser build (mvm.js)
+test/                  Tests: test/*.lisp run under ./modus; ladders, DDCs, harnesses
+scripts/               run.sh, the acceptance gate, build matrix, ladders, deployment
+docs/                  Design notes and campaign write-ups
+crypto/, proto/        Reference implementations (crypto, TLS 1.3, WebSocket, Nostr)
 ```
 
 ## Design
 
 ### MVM: the Modus Virtual Machine
 
-MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the Lisp compiler from target architectures. The compiler is a 3-phase pipeline: Source → IR (virtual register operations) → MVM bytecode. Thin per-architecture translators (~1300-1900 lines each) convert MVM bytecode to native code.
+MVM is a portable register-based bytecode ISA that decouples the Lisp compiler from target architectures. The compiler is a 3-phase pipeline: Source → IR (virtual register operations) → MVM bytecode. A translator per architecture (3,400 to 11,600 lines; x86-64 and AArch64 also translate at runtime, for the JIT) converts MVM bytecode to native code.
 
 ### Tagged objects
 
@@ -344,11 +355,17 @@ MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the L
 
 ### Self-hosting
 
-The kernel carries its own source (~558KB, plain s-expressions with symbol names replaced by integer hashes) and includes a native compiler that rebuilds the entire kernel from it. Each generation copies the source blob into the next, so SBCL is only needed for the initial bootstrap.
+The image carries its compiler, so `eval`, `load` and `compile-file` compile
+in-image, and `modus-sh --compile` / `--compile-uefi` / `--compile-aarch64`
+build whole images with no SBCL in the loop.  SBCL (or CCL, or ABCL) is needed
+only for the first bootstrap.
 
-### Actors and SMP
+### Concurrency
 
-Erlang-style actor model with per-actor heaps, so garbage collection never stops the world. Preemption uses reduction counting with LAPIC timer backup. SMP distributes actors across cores with per-CPU run queues and IPI wakeup.
+Hosted x86-64 runs native OS threads with per-thread GC regions; the bare-metal
+Pi and QEMU virt images run threads on every core; and a cooperative actor
+scheduler (spawn, send, receive, with per-actor heaps and copied messages) runs
+on top of either.
 
 See `docs/` for detailed design documents.
 

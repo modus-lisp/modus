@@ -1724,9 +1724,22 @@
         (progn (write-string-serial \"modus --compile-aarch64: cannot read \")
                (write-string-serial in) (write-char-serial 10) (sys-exit 1))
        (progn
+        ;; The fast AArch64 DDC (test/run-aarch64-ddc.sh) compiles the same
+        ;; dump as the UEFI one, so it needs the same preparation: the host's
+        ;; packages, its defconstants bound before READING, and the compiler's
+        ;; own state tables empty instead of this image's live runtime ones.
+        (%selfhost-mirror-host-packages)
+        (%selfhost-prebind-constants src)
+        (%selfhost-reset-jit-knobs)
         ;; (Re)assert the aarch64 emitter config right before the emit, so a
         ;; prior in-process --compile (x64) can't leave a stale knob behind.
         (%init-aarch64-translator)
+        ;; static literals and the console hook, as --compile-uefi sets them
+        ;; and test/ddc-aarch64-host.lisp sets them on the SBCL side
+        (setq *static-keywords-p* t)
+        (setq *static-symbols-p* t)
+        (when (search \"(defun %console-write-char\" src)
+          (setq *write-char-serial-hook* (quote %console-write-char)))
         ;; Same three codegen knobs the x64 self-compile path uses; they are
         ;; ARCH-INDEPENDENT compiler settings (static literal baking, no
         ;; :li-halves, no runtime-eval variable reads), not translator state.

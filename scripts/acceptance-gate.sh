@@ -14,11 +14,14 @@
 #    time is reported as a flake; one that passes on BASE and fails on FIX
 #    again fails the gate.  A shard that does not finish at FIX but did at
 #    BASE fails it too.
-# 4. DDC.  test/run-uefi-ddc.sh at both refs, in the background from the
-#    start (about 10 minutes, so it overlaps 1-3): the self-hosted compiler
-#    must rebuild the UEFI image byte-for-byte as SBCL built it.  Failing at
-#    FIX fails the gate unless it also fails at BASE (reported, as a build
-#    that fails at both refs is).  MODUS_GATE_NO_DDC=1 skips it.
+# 4. DDC, one x64 and one AArch64, at both refs, in the background from the
+#    start (about 14 minutes, so it overlaps 1-3): the self-hosted compiler
+#    must rebuild the UEFI x64 image byte-for-byte as SBCL built it
+#    (test/run-uefi-ddc.sh), and emit the same Linux/AArch64 image as SBCL
+#    from that source (test/run-aarch64-ddc.sh, reusing its modus-sh).
+#    Either failing at FIX fails the gate unless it also fails at BASE
+#    (reported, as a build that fails at both refs is).  MODUS_GATE_NO_DDC=1
+#    skips both.
 #
 # Worktrees, images and transcripts go in WORKDIR (default /var/tmp/modus-gate),
 # which is left in place for inspection.  Exit 0 = PASS.
@@ -62,13 +65,19 @@ FAIL=0
 # ---- 4. DDC, started first: it needs only the two trees --------------------
 ddc_start() { # side worktree
   if [ -n "${MODUS_GATE_NO_DDC:-}" ] || [ ! -x "$2/test/run-uefi-ddc.sh" ]; then
-    echo "skipped" > "$WORKDIR/ddc-$1.verdict"; return
+    echo "skipped" > "$WORKDIR/ddc-$1.verdict"; echo "skipped" > "$WORKDIR/aa64-$1.verdict"; return
   fi
   ( MODUS_DDC_WORK=$WORKDIR/ddc-$1 "$2/test/run-uefi-ddc.sh" > "$WORKDIR/ddc-$1.log" 2>&1
-    echo $? > "$WORKDIR/ddc-$1.verdict" ) &
+    echo $? > "$WORKDIR/ddc-$1.verdict"
+    if [ -x "$2/test/run-aarch64-ddc.sh" ]; then
+      "$2/test/run-aarch64-ddc.sh" "$WORKDIR/ddc-$1" > "$WORKDIR/aa64-$1.log" 2>&1
+      echo $? > "$WORKDIR/aa64-$1.verdict"
+    else
+      echo "skipped" > "$WORKDIR/aa64-$1.verdict"
+    fi ) &
   echo $! > "$WORKDIR/ddc-$1.pid"
 }
-rm -f "$WORKDIR"/ddc-*.verdict
+rm -f "$WORKDIR"/ddc-*.verdict "$WORKDIR"/aa64-*.verdict
 ddc_start base "$BASE_WT"
 ddc_start fix "$FIX_WT"
 
@@ -170,17 +179,22 @@ fi
 for side in base fix; do
   [ -s "$WORKDIR/ddc-$side.pid" ] && while kill -0 "$(cat "$WORKDIR/ddc-$side.pid")" 2>/dev/null; do sleep 5; done
 done
-db=$(cat "$WORKDIR/ddc-base.verdict" 2>/dev/null || echo X)
-df=$(cat "$WORKDIR/ddc-fix.verdict" 2>/dev/null || echo X)
-if [ "$df" = skipped ]; then
-  echo "ddc: skipped"
-elif [ "$df" = 0 ]; then
-  echo "ddc: PASS (the self-hosted compiler rebuilds the UEFI image byte-for-byte)"
-elif [ "$db" = 0 ]; then
-  echo "ddc: FAIL at fix, PASS at base (see $WORKDIR/ddc-fix.log)"; FAIL=1
-  grep -a "DIFF\|FAIL" "$WORKDIR/ddc-fix.log" | head -3
-else
-  echo "ddc: fails at both refs (base $db / fix $df; see $WORKDIR/ddc-fix.log)"
-fi
+ddc_verdict() { # kind label
+  local b f
+  b=$(cat "$WORKDIR/$1-base.verdict" 2>/dev/null || echo X)
+  f=$(cat "$WORKDIR/$1-fix.verdict" 2>/dev/null || echo X)
+  if [ "$f" = skipped ]; then
+    echo "$2: skipped"
+  elif [ "$f" = 0 ]; then
+    echo "$2: PASS"
+  elif [ "$b" = 0 ] || [ "$b" = skipped ]; then
+    echo "$2: FAIL at fix, $([ "$b" = 0 ] && echo PASS || echo not run) at base (see $WORKDIR/$1-fix.log)"; FAIL=1
+    grep -a "DIFF\|FAIL" "$WORKDIR/$1-fix.log" | head -3
+  else
+    echo "$2: fails at both refs (base $b / fix $f; see $WORKDIR/$1-fix.log)"
+  fi
+}
+ddc_verdict ddc "ddc x64 (UEFI image)"
+ddc_verdict aa64 "ddc aarch64 (Linux image)"
 
 if [ $FAIL -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL"; exit 1; fi

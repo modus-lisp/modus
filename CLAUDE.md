@@ -880,10 +880,12 @@ Two kinds of build:
   that breaks fails the gate), boots the web image, and runs the upstream
   ansi-test suite (pinned, 21,676 tests) on both refs' plain x64 CLI with
   `scripts/ansi-sweep.sh`, comparing pass sets by test name and re-running lost
-  tests to separate flakes.  It also runs the UEFI DDC (`test/run-uefi-ddc.sh`)
-  at both refs alongside the rest (2026-10-30): FIX fails if the self-hosted
-  compiler no longer rebuilds the UEFI image byte-for-byte, unless BASE fails
-  too.  The four corpus-baking runners it replaced
+  tests to separate flakes.  It also runs two fast DDCs at both refs alongside
+  the rest (2026-10-30): the UEFI x64 image (`test/run-uefi-ddc.sh`) and a
+  Linux/AArch64 image from the same source (`test/run-aarch64-ddc.sh`, SBCL's
+  `test/ddc-aarch64-host.lisp` against `modus-sh --compile-aarch64`).  FIX
+  fails if the self-hosted compiler's output differs from SBCL's, unless BASE
+  fails too.  Both caught the runtime split's backquote re-homing.  The four corpus-baking runners it replaced
   (`build-x64-linux`, `build-x64`, `build-aarch64-linux`, `build-aarch64-ansi`
   and their `build-ansi-common.lisp`) are retired.
 - **The gate stays under half an hour** (user rule, 2026-10-29), so it sweeps

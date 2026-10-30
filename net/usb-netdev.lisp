@@ -6,12 +6,12 @@
 ;;;;   - r8152.lisp    scans the bus for the RTL8153 (VID 0x0BDA / PID 0x8153);
 ;;;;   - cdc-ether.lisp cold-enumerates a CDC-ECM device.
 ;;;; This file expresses the driver REGISTRY as a priority probe over those,
-;;;; latches the winner in a state slot, and dispatches the NIC seam
-;;;; (e1000-send / e1000-receive / e1000-rx-buf) to the bound driver.
+;;;; latches the winner in a state slot, and implements MODUS.NET's NIC
+;;;; interface (net/nic.lisp) by dispatching on that latch.  The image binds the
+;;;; interface to USB-NIC-SEND / -RECEIVE / -RX-BUF and NET-USB-PROBE at boot.
 ;;;;
-;;;; MUST be loaded LAST among the net files so its e1000-* dispatchers win
-;;;; last-defun-wins over each driver's thin e1000-* forwarder, and so its real
-;;;; usb-netdev-hotplug-poll overrides the no-op default in ip.lisp.
+;;;; MUST be loaded LAST among the net files so its real usb-netdev-hotplug-poll
+;;;; overrides the no-op default in ip.lisp.
 ;;;;
 ;;;; BOARD-OWED (hardware only): cold host-mode enumeration of the RTL8153 is
 ;;;; the flaky path the r8152 "adopt" model was written to avoid, and the live
@@ -47,12 +47,35 @@
 ;; otherwise                   -> bind cdc-ether (id 1), the incumbent NIC, so
 ;;                                images with no dongle behave exactly as today.
 ;; Returns 1 if a driver was bound, 0 if none.
+;; --- the NIC interface's implementation: dispatch on the latched driver ------
+;; The image binds MODUS.NET's NIC-SEND / -RECEIVE / -RX-BUF to these ONCE, at
+;; boot; probing and hot-plug only move the latch.  Rebinding the interface on
+;; every probe would undo whatever a layer above wrapped around it (kiln's
+;; board network hands its own connections' frames out of NIC-RECEIVE).
+(defun usb-nic-send (buf len)
+  (let ((d (usb-netdev-get)))
+    (if (eq d 2)
+        (modus.net.r8152:r8152-send buf len)
+        (if (eq d 1) (modus.net.cdc:cdcether-send buf len) 0))))
+
+(defun usb-nic-receive ()
+  (let ((d (usb-netdev-get)))
+    (if (eq d 2)
+        (modus.net.r8152:r8152-receive)
+        (if (eq d 1) (modus.net.cdc:cdcether-receive) 0))))
+
+(defun usb-nic-rx-buf ()
+  (let ((d (usb-netdev-get)))
+    (if (eq d 2)
+        (modus.net.r8152:r8152-rx-buf)
+        (if (eq d 1) (modus.net.cdc:cdcether-rx-buf) (modus.net.cdc:cdc-rx-buf-addr)))))
+
 (defun net-usb-probe ()
   (usb-netdev-set 0)
   ;; Bind markers use %serial-byte (proven in kernel-main), not
   ;; write-string-serial: "ND:R"=r8152, "ND:C"=cdc-ecm, "ND:0"=none.
-  (if (not (zerop (r8152-find-addr)))
-      (let ((r (r8152-probe)))
+  (if (not (zerop (modus.net.r8152:r8152-find-addr)))
+      (let ((r (modus.net.r8152:r8152-probe)))
         (if (> r 0)
             (progn (usb-netdev-set 2)
                    (%serial-byte 78) (%serial-byte 68) (%serial-byte 58)
@@ -61,32 +84,11 @@
             (progn (%serial-byte 78) (%serial-byte 68) (%serial-byte 58)
                    (%serial-byte 48) (%serial-byte 10)
                    0)))
-      (progn (cdcether-probe)
+      (progn (modus.net.cdc:cdcether-probe)
              (usb-netdev-set 1)
              (%serial-byte 78) (%serial-byte 68) (%serial-byte 58)
              (%serial-byte 67) (%serial-byte 10)
              1)))
-
-;; --- NIC seam dispatchers (win last-defun-wins over the e1000-* forwarders) --
-(defun e1000-send (buf len)
-  (let ((d (usb-netdev-get)))
-    (if (eq d 2)
-        (r8152-send buf len)
-        (if (eq d 1) (cdcether-send buf len) 0))))
-
-(defun e1000-receive ()
-  (let ((d (usb-netdev-get)))
-    (if (eq d 2)
-        (r8152-receive)
-        (if (eq d 1) (cdcether-receive) 0))))
-
-(defun e1000-rx-buf ()
-  (let ((d (usb-netdev-get)))
-    (if (eq d 2)
-        (r8152-rx-buf)
-        (if (eq d 1) (cdcether-rx-buf) (cdc-rx-buf-addr)))))
-
-(defun e1000-probe () (net-usb-probe))
 
 ;; --- live hot-plug ----------------------------------------------------------
 ;; HPRT0.prtconndet (bit 1, write-1-clear) latches a connect/disconnect edge;

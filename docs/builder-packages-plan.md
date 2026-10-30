@@ -236,6 +236,18 @@ ssh-x64-cl.lisp, hwrng-bcm2835.lisp and the build text: explicit, and checked
 (redef-check 0), but not yet (setf fdefinition) interfaces.  Measured: the
 i386, x64 and aarch64 SSH images and test/run-hosted-ssh.sh pass.
 
+**Cycle 5, 2026-10-30: the Pi's USB NICs.**  net/cdc-ether.lisp is
+MODUS.NET.CDC and net/r8152.lisp MODUS.NET.R8152; the DWC2 host and USB core
+stay in MODUS-INT and export what the drivers call (the package check found
+16 the first list missed).  net/usb-netdev.lisp's per-call dispatch on its
+driver latch now IS the interface's implementation: the image binds
+NIC-SEND / -RECEIVE / -RX-BUF to USB-NIC-*, which dispatch on the latch, and
+NIC-PROBE to NET-USB-PROBE; probing and hot-plug only move the latch.  (A
+first cut rebound the interface on every probe instead, which would have
+undone kiln's wrappers around NIC-RECEIVE / -SEND at the first replug.)  The
+other board builds bind CDC-ECM.  cdc-ether.lisp's E1000-READ-REG stubs are gone (NIC-READ-REG).
+Builds clean; QEMU raspi3b with usb-net faults after enumeration at main and
+before step 3 alike, so the hardware run is the acceptance.
 **Cycle 6, 2026-10-30: MODUS.RUNTIME.**  mvm/prelude.lisp and the ten
 mvm/cl-*.lisp files read into MODUS.RUNTIME, which :uses MODUS-INT -- SB-IMPL
 to MODUS-INT's SB-INT.  What the runtime and the rest of the kernel share stays

@@ -1690,8 +1690,7 @@
 ;; tcp-conns.lisp call, go BEFORE the drivers; after them, %BIND-NIC-SEAMS binds
 ;; the interface to this image's driver with (setf fdefinition), and kernel-main
 ;; calls it right after INIT-ALL-GLOBALS (the arch slot below).  The NE2000,
-;; E1000 and virtio drivers have packages of their own; the boards' USB NICs
-;; still implement the interface as the MODUS-INT E1000-* functions.
+;; E1000, virtio, CDC-ECM and RTL8153 drivers have packages of their own.
 (defun %nic-binding-text ()
   (flet ((bind (send receive rx-buf probe read-reg)
            (format nil "  (setf (fdefinition 'modus.net:nic-send) (function ~A))
@@ -1733,15 +1732,24 @@
                (bind "modus.net.e1000:e1000-hw-send" "modus.net.e1000:e1000-hw-receive"
                      "modus.net.e1000:e1000-hw-rx-buf" "modus.net.e1000:e1000-hw-probe"
                      "modus.net.e1000:e1000-read-reg")))
-      (t
-       ;; the boards: CDC-ECM / RTL8153 behind usb-netdev's dispatch, still
-       ;; the MODUS-INT E1000-* functions
+      ;; the boards with usb-netdev (the SSH builds): NIC-PROBE picks the
+      ;; RTL8153 or CDC-ECM, as does a hot-plug edge, and the rest dispatch
+      ;; on that choice
+      (*ssh-build-p*
        (format nil "~%(defun %bind-nic-seams ()
   (modus.net::%define-nic-seams)
 ~A)~%"
-               (bind "modus-int::e1000-send" "modus-int::e1000-receive"
-                     "modus-int::e1000-rx-buf" "modus-int::e1000-probe"
-                     "modus-int::e1000-read-reg"))))))
+               (bind "usb-nic-send" "usb-nic-receive"
+                     "usb-nic-rx-buf" "net-usb-probe"
+                     "modus.net::no-read-reg")))
+      (t
+       ;; the other board builds: CDC-ECM only
+       (format nil "~%(defun %bind-nic-seams ()
+  (modus.net::%define-nic-seams)
+~A)~%"
+               (bind "modus.net.cdc:cdcether-send" "modus.net.cdc:cdcether-receive"
+                     "modus.net.cdc:cdcether-rx-buf" "modus.net.cdc:cdcether-probe"
+                     "modus.net::no-read-reg"))))))
 
 (when *net-build-p*
   (setq *net-nic-source*
@@ -1842,7 +1850,7 @@
                (da (+ (%val->word dest) (%u8-data-delta) dest-off))
                ;; The RTL8153's RX buffer is ordinary cacheable RAM: copy its
                ;; whole 64-byte chunks natively (net/r8152.lisp R8152-NCOPY).
-               (i (if (eq (usb-netdev-get) 2) (r8152-ncopy da data-base n) 0)))
+               (i (if (eq (usb-netdev-get) 2) (modus.net.r8152:r8152-ncopy da data-base n) 0)))
           (loop
             (when (or (>= i n) (zerop (logand (+ data-base i) 3))) (return nil))
             (setf (aref dest (+ dest-off i)) (mem-ref (+ data-base i) :u8))
@@ -2212,7 +2220,7 @@
   (if *ssh-build-p*
       "(progn (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
                         (net-usb-probe) 1)"
-      "(cdc-ether-init)"))
+      "(modus.net.cdc:cdc-ether-init)"))
 
 ;; MODUS_NET_IP + MODUS_NET_GW (dotted quads) -- a STATIC address for the x64
 ;; pipeline instead of DHCP.  A provider whose network has no DHCP server

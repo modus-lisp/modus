@@ -20,7 +20,7 @@
 ;; measured within 2% of each other on a 4 MB fetch, and 64 KB collapsed to
 ;; ~1 MB/s (the RTL8153's RX FIFO overflows and segments are lost).
 (defun tcp-rx-window ()
-  (let ((w (mem-ref (+ (r8152-meta) 8) :u32)))
+  (let ((w (mem-ref (+ (modus.net.r8152:r8152-meta) 8) :u32)))
     (if (and (> w 0) (< w 65536)) w 16384)))
 
 (defun %ack-be16 (b i v)
@@ -49,7 +49,7 @@
       nil
       (let ((st (e1000-state-base))
             (b (make-array 56 :element-type (quote (unsigned-byte 8)) :initial-element 0))
-            (tx (r8152-ack-buf)))
+            (tx (modus.net.r8152:r8152-ack-buf)))
         (dotimes (i 6)
           (setf (aref b i) (mem-ref (+ st #x28 i) :u8))
           (setf (aref b (+ 6 i)) (mem-ref (+ st #x08 i) :u8)))
@@ -71,11 +71,11 @@
         (%ack-be16 b 50 (%ack-fold (%ack-sum16 b 34 20 (+ (%ack-sum16 b 26 8 0) 6 20))))
         (setf (mem-ref tx :u32) (logior 54 #xC0000000))
         (setf (mem-ref (+ tx 4) :u32) 0)
-        (r8152-tx-async-wait)                 ; the ACK buffer may still be in flight
+        (modus.net.r8152:r8152-tx-async-wait)                 ; the ACK buffer may still be in flight
         (let ((src (+ (%val->word b) 7)) (i 0))
           (loop
             (when (>= i 56) (return nil))
             (setf (mem-ref (+ tx 8 i) :u32) (mem-ref (+ src i) :u32))
             (setq i (+ i 4))))
-        (r8152-tx-async-start tx 62)
+        (modus.net.r8152:r8152-tx-async-start tx 62)
         t)))

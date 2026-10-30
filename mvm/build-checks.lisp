@@ -1634,12 +1634,10 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
         (error "quote-pkg-check: ~D name~:P quoted in two kernel packages (first: ~A in ~{~A~^, ~})"
                (length split) (first (first split)) (second (first split)))))))
 
-(defparameter *fn-collision-baseline* '("MODRM" "REX-PREFIX")
-  "Collisions this check found when it was written, and kept visible here
-   rather than fatal: the x64 assembler (MODUS.ASM) and the x64 translator
-   (MODUS.MVM.X64) each define their own MODRM and REX-PREFIX.  Different
-   functions under one bare name in the image's runtime table; resolving that
-   is the translator's own cleanup, not this check's.")
+(defparameter *fn-collision-baseline* '()
+  "Collisions known and accepted.  Empty: the one there was -- the x64
+   assembler's and translator's identical MODRM / REX-PREFIX -- was renamed
+   (the assembler's are ASM-MODRM / ASM-REX-PREFIX).")
 
 (defun check-cross-package-function-collisions ()
   "Builder packages step 3.  One function NAME defined in two kernel packages

@@ -1110,8 +1110,12 @@
                 (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
                   ;; UNDEFINED-FUNCTION, as the interpreter signals for the
                   ;; same call: a site whose callee did not exist when its
-                  ;; page was built is bridged too (%JIT-RELOC-CALLS).
-                  (if f f (error (quote undefined-function) :name nm)))))))))
+                  ;; page was built is bridged too (%JIT-RELOC-CALLS).  The NAME
+                  ;; is the symbol, as the interpreter's is: NM is the table key
+                  ;; "PKG::SYM", and a handler asking CELL-ERROR-NAME which
+                  ;; function to supply can do nothing with a string.
+                  (if f f (error (quote undefined-function)
+                                 :name (%runtime-fn-name-symbol nm))))))))))
 ;; THE BRIDGE'S HIT, INLINE: a cached pair whose site is settled (patched, or
 ;; retired because the callee is a closure -- every runtime DEFCLASS accessor)
 ;; is the callee itself; anything else asks %JIT-BRIDGE-RESOLVE.

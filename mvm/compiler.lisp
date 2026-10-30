@@ -1465,6 +1465,29 @@
    so a read of MODUS.MVM::*X* finds MODUS.MVM.X64::*X* -- builder packages
    step 2 makes those cross-package references visible.  Emits nothing.")
 
+(defvar *quote-uses* nil
+  "Host-side census, NIL unless mvm/build-checks.lisp installs a hash: every
+   symbol a QUOTE the build compiles contains, as (PACKAGE-NAME . SYMBOL-NAME)
+   -> T.  A quoted symbol keeps its home package in the image (phase A), so
+   the same name quoted in two kernel packages is two symbols: an EQ between
+   them is false.  CHECK-CROSS-PACKAGE-QUOTES reports such names.  Emits
+   nothing.")
+
+(defun %note-quoted (value depth)
+  (cond
+    ((> depth 6) nil)
+    ((and (symbolp value) value (not (keywordp value)) (not (eq value t)))
+     (let ((p (symbol-package value)))
+       (when p
+         (setf (gethash (cons (package-name p) (symbol-name value)) *quote-uses*) t))))
+    ((consp value)
+     (let ((n 0))
+       (loop
+         (when (or (not (consp value)) (> n 64)) (return))
+         (%note-quoted (car value) (+ depth 1))
+         (setq value (cdr value) n (+ n 1)))
+       (when value (%note-quoted value (+ depth 1)))))))
+
 (defun %note-global (sym kind)
   (when (and *global-uses* (symbolp sym) sym (not *mvm-eval-runtime-p*))
     (let* ((p (symbol-package sym))
@@ -10153,6 +10176,8 @@
 
 (defun compile-quote (value dest)
   "Compile (quote VALUE)."
+  (when (and *quote-uses* (not *mvm-eval-runtime-p*))
+    (%note-quoted value 0))
   (cond
     ((null value)
      (compile-nil dest))

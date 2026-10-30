@@ -305,12 +305,18 @@
 
 (defun ensure-dummy-packages ()
   "Create dummy packages so source files can be read."
+  (unless (find-package "MODUS-INT")
+    (make-package "MODUS-INT" :nicknames '("MODUS.MVM") :use '(:cl)))
   (dolist (pkg '(:modus.mvm :modus.mvm.x64 :modus.mvm.aarch64
                  :modus.mvm.riscv :modus.mvm.ppc :modus.mvm.i386
                  :modus.mvm.68k :modus.mvm.arm32
                  :modus.asm :modus.tags :modus.runtime))
     (unless (find-package pkg)
-      (make-package pkg :use '(:cl)))))
+      (make-package pkg :use '(:cl))))
+  ;; and the kernel's step-3 packages with their exports, from the one list
+  ;; (net/ sources read MODUS.NET:NIC-SEND and friends)
+  (load (merge-pathnames "kernel-packages.lisp" (directory-namestring *load-truename*)))
+  (funcall (find-symbol "%ENSURE-KERNEL-PACKAGES" "MODUS.MVM")))
 
 (defun main ()
   (ensure-dummy-packages)

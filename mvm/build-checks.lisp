@@ -1603,6 +1603,37 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
         (error "global-pkg-check: ~D cross-package global reference~:P, ~D collision~:P"
                (length cross) (length coll))))))
 
+(defun %kernel-package-name-for-check-p (pn)
+  (or (member pn '("MODUS-INT" "MODUS.ASM" "MODUS.MVM.X64" "MODUS.MVM.I386")
+              :test 'string=)
+      (and (> (length pn) 6) (string= "MODUS." pn :end2 6))))
+
+(defun check-cross-package-quotes ()
+  "Builder packages step 3.  A quoted symbol keeps its home package in the
+   image, so one name quoted in two KERNEL packages is two symbols, and code
+   that compares them with EQ -- a marker one file conses and another tests
+   for -- quietly stops matching.  Report each such name; fatal unless
+   MODUS_QUOTE_PKG_CHECK=warn.  Only kernel packages count: a library's or
+   the ANSI corpus's own symbols are expected to differ by package."
+  (when *quote-uses*
+    (let ((by-name (make-hash-table :test 'equal)) (split nil))
+      (maphash (lambda (k v) (declare (ignore v))
+                 (when (%kernel-package-name-for-check-p (car k))
+                   (pushnew (car k) (gethash (cdr k) by-name) :test 'string=)))
+               *quote-uses*)
+      (maphash (lambda (name pkgs) (when (> (length pkgs) 1) (push (list name pkgs) split)))
+               by-name)
+      (setf split (sort split #'string< :key #'first))
+      (format t ";; quote-pkg-check: ~D name~:P quoted in two kernel packages (of ~D quoted symbols)~%"
+              (length split) (hash-table-count *quote-uses*))
+      (dolist (s split)
+        (format t ";;   QUOTE-SPLIT ~A in ~{~A~^, ~}~%" (first s) (second s)))
+      (when (and split
+                 (not (member (sb-ext:posix-getenv "MODUS_QUOTE_PKG_CHECK")
+                              '("warn" "0") :test 'equal)))
+        (error "quote-pkg-check: ~D name~:P quoted in two kernel packages (first: ~A in ~{~A~^, ~})"
+               (length split) (first (first split)) (second (first split)))))))
+
 (defun %gck-fallback-census-dump ()
   (let ((path (%gck-fallback-census-path)))
     (when (and path *gck-fallback-census*)
@@ -1632,6 +1663,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
           (when *gck-fallback-census* (clrhash *gck-fallback-census*))
           (clrhash *gck-registered-keys*)
           (setf *global-uses* (make-hash-table :test 'equal))
+          (setf *quote-uses* (make-hash-table :test 'equal))
           (clrhash *overridable-names*)
           (let* ((src (or (getf args :source-text)
                           (let ((forms (getf args :source)))
@@ -1670,6 +1702,7 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (check-undeclared-redefinitions)
             (check-cross-package-calls)
             (check-cross-package-globals)
+            (check-cross-package-quotes)
             result)))
   (setf (fdefinition 'build-image) *build-image-wrapper*))
 

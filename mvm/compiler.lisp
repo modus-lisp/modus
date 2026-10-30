@@ -1307,6 +1307,17 @@
 (defvar *%mxa-local-fns* nil
   "Names an enclosing FLET / LABELS binds in the walk: calls, not macros.")
 
+(defvar *%package-locks-on* nil
+  "True when the COMMON-LISP lock (%CHECK-PACKAGE-LOCK) is in force.  Off by
+   default: modus's own run-time code -- the pretty printer, RESTART-BIND,
+   WITH-HASH-TABLE-ITERATOR -- is DEFMACROed into COMMON-LISP after boot, and
+   locking it refused modus (258 ANSI tests).  A program that wants SBCL's
+   refusal sets it.")
+
+(defvar *%package-locks-off* nil
+  "True inside WITHOUT-PACKAGE-LOCKS: the COMMON-LISP lock (%CHECK-PACKAGE-LOCK)
+   lets a definition through.")
+
 (defvar *%mexp-impure* nil
   "Set when this compile expanded a runtime macro whose expander closes over
    a lexical environment: its expansion can depend on state that changes, so
@@ -4348,6 +4359,38 @@
   (let ((*%mxa-local-fns* nil))
     (declare (special *%mxa-local-fns*))
     (%mxa form env)))
+
+
+;;; ------------------------------------------------------------------
+;;; THE COMMON-LISP PACKAGE LOCK (image only).  CLHS 11.1.2.1.2 leaves
+;;; defining a COMMON-LISP symbol as a function, macro or structure undefined;
+;;; SBCL refuses, and modus did it: a DEFUN of CL:HASH-TABLE-SIZE, or TI's
+;;; (DEFSTRUCT (HASH-TABLE (:CONC-NAME NIL)) HASH-TABLE-REHASH-SIZE ...) in
+;;; cortez, replaced modus's own function and every hash table after it
+;;; faulted.  Refused at the user-level definers only -- DEFUN, DEFMACRO,
+;;; DEFSTRUCT -- and only over a name CL already gives a definition (a DEFUN
+;;; of CL:IGNORE, which names no function, still goes through); the internal
+;;; SET-SYMBOL-FUNCTION that DEFMETHOD and DEFGENERIC use is not touched.
+;;; In force only when *%PACKAGE-LOCKS-ON* says so; WITHOUT-PACKAGE-LOCKS
+;;; (*%PACKAGE-LOCKS-OFF*) lets one through.
+;;; ------------------------------------------------------------------
+
+(defun %cl-external-symbol-p (sym)
+  "SYM is a symbol external in COMMON-LISP."
+  (and (symbolp sym) sym
+       (multiple-value-bind (s st) (find-symbol (symbol-name sym) "COMMON-LISP")
+         (and (eq s sym) (eq st :external)))))
+
+(defun %check-package-lock (sym what &optional any)
+  "Signal the COMMON-LISP lock's error when defining SYM (as WHAT, a phrase)
+   would replace COMMON-LISP's own definition -- or, with ANY, whenever SYM is
+   a COMMON-LISP symbol at all (a structure name)."
+  (when (and *mvm-eval-runtime-p*
+             *%package-locks-on*
+             (not *%package-locks-off*)
+             (%cl-external-symbol-p sym)
+             (or any (fboundp sym) (macro-function sym) (special-operator-p sym)))
+    (error "Lock on package COMMON-LISP violated when defining ~S as ~A." sym what)))
 
 (defun %split-body-decls (body)
   "Split BODY into (values leading-declarations-and-docstring rest)."
@@ -8639,6 +8682,7 @@
               (ll (caddr form))
               (body (cdddr form))
               (decls nil))
+         (%check-package-lock name "a function")
          ;; leading docstring / declarations stay outside the BLOCK
          (loop
            (cond ((and (stringp (car body)) (cdr body)) (setq body (cdr body)))
@@ -8663,6 +8707,7 @@
                              (string= (symbol-name (car raw-name)) "SETF"))
                         (%setf-fn-name (cadr raw-name))
                         raw-name)))
+         (when (symbolp raw-name) (%check-package-lock raw-name "a function"))
          ;; CLHS long-form setf function — link (setf (NAME …) v) to it.
          ;; See *SETF-FUNCTION-REGISTRY*.
          (when (and (stringp name) (consp raw-name) (symbolp (cadr raw-name)))
@@ -8740,6 +8785,7 @@
        (let ((name (cadr form))
              (params (caddr form))
              (body (cdddr form)))
+         (%check-package-lock name "a macro")
          (when (and (stringp (car body)) (cdr body))
            (setq body (cdr body)))
          ;; Macro lambda-lists can lead with &whole VAR and/or carry
@@ -8834,6 +8880,8 @@
       ;; constructor / accessors / predicates / setters so subsequent
       ;; calls in the same source resolve them.  Yields NIL into dest.
       ((= op-name 459236271)   ; DEFSTRUCT
+       (%check-package-lock (if (consp (cadr form)) (car (cadr form)) (cadr form))
+                            "a structure" t)
        ;; mvm-eval production-eval semantics (WS3 flip): Modus represents
        ;; structs only as the native tagged array — a (:TYPE …) option is
        ;; unsupported, and the tree-walker's runtime DEFSTRUCT signals
@@ -12177,9 +12225,13 @@
    library that defines a DECODER struct.  reel defines eight; the last one
    loaded (FFV1's) answered every package's MAKE-DECODER call, and the VP8
    decoder got an FFV1 struct."
-  (intern name (if *mvm-eval-runtime-p*
-                   *package*
-                   (or (find-package "MODUS.MVM") *package*))))
+  (let ((sym (intern name (if *mvm-eval-runtime-p*
+                              *package*
+                              (or (find-package "MODUS.MVM") *package*)))))
+    ;; A generated accessor, constructor or predicate that is COMMON-LISP's
+    ;; own function -- (:CONC-NAME NIL) over a slot named HASH-TABLE-SIZE.
+    (%check-package-lock sym "a structure's function")
+    sym))
 
 ;;; ------------------------------------------------------------
 ;;; DEFSTRUCT (:TYPE LIST) / (:TYPE VECTOR) / (:TYPE (VECTOR elt)) -- CLHS 3.4.6
@@ -29520,6 +29572,7 @@
     ;; Also handles (defun (setf name) (params) body...) → compile as "SETF-NAME"
     ((and (consp form) (name-eq (car form) "DEFUN"))
      (destructuring-bind (raw-name params &body body) (cdr form)
+       (when (symbolp raw-name) (%check-package-lock raw-name "a function"))
        ;; Normalize (setf foo) to "SETF-FOO" string for compilation
        (let ((name (if (and (consp raw-name)
                             (= (length raw-name) 2)
@@ -30384,6 +30437,10 @@
                   ;; is an :OBJ-REF immediate (8 bits), so a slot past 253
                   ;; keeps the Lisp spelling.
                   (push (let ((acc (if conc-name (%defstruct-intern acc-name) slot)))
+                          ;; The slot's own symbol, so not through
+                          ;; %DEFSTRUCT-INTERN's check: (:CONC-NAME NIL) over a
+                          ;; slot named HASH-TABLE-SIZE is that function.
+                          (unless conc-name (%check-package-lock acc "a structure's function"))
                           (if (%obj-slot-imm-p (+ 2 i))
                               `(defun ,acc (obj)
                                  (%struct-slot-ref obj ,min-inst-len ,(+ 2 i) ,struct-name))

@@ -11446,7 +11446,10 @@
                     ;; restart-case body silently (halt)ed the image (exit 1,
                     ;; zero output — the find-system death shape).  `error`
                     ;; itself handles the truly-unarmed case (report + halt).
-                    (error ,cnd-var))))
+                    ;; Now passed on rather than re-signalled, by a NATIVE
+                    ;; helper, which reads the real slot: see
+                    ;; %RC-PASS-ON-CONDITION.
+                    (%rc-pass-on-condition ,cnd-var))))
             (%restart-frame-unwind ,frame-var)))
          env dest)))))
 

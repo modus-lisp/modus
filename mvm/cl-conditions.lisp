@@ -705,7 +705,14 @@
               ;; one value, the common THROW: no VALUES-LIST (a LENGTH walk)
               (if (and (consp l) (null (cdr l))) (car l) (values-list l)))
             v))
-      (if (if (eq cnd :%throw-in-flight) (%error-handler-active-p) nil)
+      ;; Not ours, throw or condition alike: on to the next frame, as a
+      ;; HANDLER-CASE with no matching clause does.  A condition reaches
+      ;; here only after ERROR has offered it to every handler there is, so
+      ;; re-signalling it offered it to all of them a SECOND time, from a
+      ;; stack already unwound: every BLOCK with a closure exit (it wraps a
+      ;; CATCH) ran each outer HANDLER-BIND twice for one error.  Re-signal
+      ;; only when no outer frame is armed, so the toplevel still reports it.
+      (if (%error-handler-active-p)
           (%hc-longjmp)
           (error cnd))))
 

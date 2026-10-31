@@ -3394,27 +3394,28 @@
 
 (defun %setf-place-known-p (name)
   "True when (SETF (NAME ...) v) compiles to a store modus knows, not to the
-   SET-NAME call SETF falls back to for a name it does not: an expander
-   (DEFSETF / DEFINE-SETF-EXPANDER), one of SETF's built-in places, a (SETF
-   NAME) function, a C...R, or a COMMON-LISP accessor whose writer the image
-   defines as SET-NAME (CHAR, DOCUMENTATION).  The built-in places have no
-   expander-table entry, so a host asking that table whether (GETF ...) is a
-   place was told no; this is the question SETF itself answers, by the same
-   tests in the same terms (built-ins matched by name, as SETF matches them)."
+   SET-NAME call SETF falls back to for a name it does not.  Asked of SETF
+   itself, by expanding (SETF (NAME X) V): the answer is the expansion unless
+   that is the SET-NAME fallback, and even then when the image defines that
+   SET-NAME (CHAR, DOCUMENTATION).  SETF stores into CAR, GETF, THIRD and the
+   rest itself, with no entry in the expander table, so a host asking that
+   table whether (GETF ...) is a place was told no -- and a list of SETF's
+   cases written out here would be a second copy, already incomplete."
   (and (symbolp name) name
        (or (mvm-find-setf-expander name)
-           (member (symbol-name name)
-                   '("CAR" "CDR" "AREF" "GETHASH" "GETF" "NTH" "SVREF" "THE"
-                     "VALUES" "SYMBOL-VALUE" "ROW-MAJOR-AREF" "LDB" "MASK-FIELD"
-                     "MEM-REF")
-                   :test #'string=)
            (%find-setf-function name)
-           (let ((cl (find-package "COMMON-LISP")))
-             (and (eq (symbol-package name) cl)
-                  (or (%cxr-place-name-p (symbol-name name))
-                      (let ((w (find-symbol (concatenate 'string "SET-" (symbol-name name))
-                                            (%setter-pkg name))))
-                        (and w (fboundp w)))))))
+           ;; Never for a macro or special operator: SETF expands a macro
+           ;; place first, which runs ITS expander on the probe's X -- a
+           ;; DEFFLAVOR asked this way defined a flavor.  For any other name
+           ;; SETF's cases are tests of the name alone.
+           (let* ((exp (and (not (macro-function name))
+                            (not (special-operator-p name))
+                            (car (%macroexpand-1-mvm-raw (list 'setf (list name 'x) 'v)))))
+                  (fallback (and (consp exp) (symbolp (car exp)) (car exp)
+                                 (string= (symbol-name (car exp))
+                                          (concatenate 'string "SET-" (symbol-name name))))))
+             (and (consp exp)
+                  (or (not fallback) (fboundp (car exp))))))
        t))
 
 (defun %find-setf-function (name)

@@ -4059,7 +4059,7 @@
           (expander
            (let ((result
                   (if *mvm-eval-runtime-p*
-                      (funcall expander form)
+                      (%expand-via-hook expander :one form nil)
                       ;; BUILD-TIME salvage: a user-macro expander that
                       ;; errors host-side (e.g. defmacro.3's body reads a
                       ;; RUNTIME lexical var the null-lexenv host EVAL can't
@@ -4099,7 +4099,7 @@
                ((null mf) (cons form nil))
                ((eq mf t) (cons form nil))
                ((%interp-closure-p mf)
-                (let ((result (%call-interp-closure mf (cdr form))))
+                (let ((result (%expand-via-hook mf :interp form nil)))
                   (if (eq result form) (cons form nil) (cons result t))))
                (t
                 ;; Only a PROGRAM-ERROR means (form) was the wrong shape; any
@@ -4107,17 +4107,53 @@
                 ;; from there -- the same narrowing as cl-eval's MACROEXPAND-1,
                 ;; where catching everything turned TI's LIST-MATCH-P reaching an
                 ;; undefined CIRCULAR-LIST into "invalid number of arguments: 2".
-                (let ((result (block expand
-                                (handler-bind
-                                    ((program-error
-                                       (lambda (c)
-                                         (declare (ignore c))
-                                         (return-from expand (funcall mf form nil)))))
-                                  (funcall mf form)))))
+                (let ((result (%expand-via-hook mf :one-or-two form nil)))
                   (when (%expander-has-env-p mf) (setq *%mexp-impure* t))
                   (if (eq result form) (cons form nil) (cons result t)))))))
           (t (cons form nil))))
       (cons form nil)))
+
+(defvar *%hook-expander* nil
+  "(MF . KIND) of the expansion %EXPAND-VIA-HOOK is running through a user's
+   *MACROEXPAND-HOOK*, read back by %HOOK-EXPANDER.")
+
+(defun %run-expander (mf kind form)
+  "Call macro function MF on FORM in its calling convention KIND: :INTERP, an
+   interpreted closure taking the arguments; :ONE, a compiled expander of the
+   form alone; :ONE-OR-TWO, one that takes (form) or, failing that, (form env)
+   -- only a PROGRAM-ERROR means the one-argument call was the wrong shape."
+  (cond ((eq kind :interp) (%call-interp-closure mf (cdr form)))
+        ((eq kind :one) (funcall mf form))
+        (t (block expand
+             (handler-bind
+                 ((program-error
+                    (lambda (c)
+                      (declare (ignore c))
+                      (return-from expand (funcall mf form nil)))))
+               (funcall mf form))))))
+
+(defun %hook-expander (form env)
+  "The expander a user's *MACROEXPAND-HOOK* is handed: the one
+   %EXPAND-VIA-HOOK is running.  A named function, not a closure, so the
+   hook can call it from evaluated code."
+  (declare (ignore env))
+  (let ((e *%hook-expander*))
+    (%run-expander (car e) (cdr e) form)))
+
+(defun %expand-via-hook (mf kind form env)
+  "Expand FORM with macro function MF (KIND as %RUN-EXPANDER) the way CLHS
+   MACROEXPAND-1 does: (funcall *MACROEXPAND-HOOK* expander form env).  The
+   variable was defined and never consulted, so a hook that watches expansion
+   -- one that catches a name missing inside a macro and carries it out to be
+   supplied, as cortez's does -- saw nothing, and the expansion's error was
+   compiled into the form instead.  The default FUNCALL calls MF directly."
+  (let ((h *macroexpand-hook*))
+    (if (or (null h) (eq h 'funcall))
+        (%run-expander mf kind form)
+        (let ((saved *%hook-expander*))
+          (setq *%hook-expander* (cons mf kind))
+          (unwind-protect (funcall h '%hook-expander form env)
+            (setq *%hook-expander* saved))))))
 
 (defun %expander-has-env-p (mf)
   "MF, a compiled macro expander, closes over a lexical environment."
@@ -8040,10 +8076,18 @@
                      ;; Impure: the error was a fact about the image at THIS
                      ;; compile (an unbound variable, a function not yet
                      ;; defined), so EVAL must not cache the compiled form.
+                     ;; A THROW passing through is not the expander's error:
+                     ;; image HANDLER-CASEs get no NLX guard, so this one took
+                     ;; a hook's escape THROW for a condition, baked it, and
+                     ;; left *CATCH-ACTIVE* set -- every later HANDLER-CASE
+                     ;; then passed real errors on as a throw in flight.
                      (handler-case (macroexpand-mvm form)
                        (error (c)
-                         (setq *%mexp-impure* t)
-                         (list 'error (list 'quote c)))))
+                         (if *catch-active*
+                             (%hc-longjmp)
+                             (progn
+                               (setq *%mexp-impure* t)
+                               (list 'error (list 'quote c)))))))
                    (macroexpand-mvm form))))
    (%cf-trace-note form)
    (when %stmt-unused (%fp-diag-bump 3))
@@ -19002,11 +19046,21 @@
    the signal from the user's HANDLER-BINDs outside the compile -- image
    HANDLER-CASEs push none, so rt's DO-ENTRY saw the COND expander reject
    the binding (COND 17) of (LET ((COND 17)) ...) and aborted the test
-   (LET.15, SYMBOL-MACROLET.1)."
+   (LET.15, SYMBOL-MACROLET.1).
+
+   Not through *MACROEXPAND-HOOK*: these are the compiler's own looks ahead,
+   not expansions of the program, and a hook that leaves an expansion by
+   THROW had that throw swallowed by the catch-all below.  The hook sees the
+   one real expansion COMPILE-FORM makes, as it would on SBCL."
   (if *mvm-eval-runtime-p*
-      (let ((prev (funcall '%hc-barrier-push '(error))))
+      (let ((prev (funcall '%hc-barrier-push '(error)))
+            (hook *macroexpand-hook*))
+        (setq *macroexpand-hook* 'funcall)
         (unwind-protect
-             (handler-case (macroexpand-1-mvm form) (t (c) (progn c nil)))
+             ;; A THROW in flight goes on: see the expander catch in COMPILE-FORM.
+             (handler-case (macroexpand-1-mvm form)
+               (t (c) (if *catch-active* (%hc-longjmp) (progn c nil))))
+          (setq *macroexpand-hook* hook)
           (funcall '%hc-barrier-pop prev)))
       (handler-case (macroexpand-1-mvm form) (t (c) (progn c nil)))))
 

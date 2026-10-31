@@ -1161,8 +1161,7 @@
          ((null mf) (values form nil))
          ((eq mf t) (values form nil))   ; compiler-macro marker
          ((%interp-closure-p mf)
-          (let ((expanded (%call-interp-closure mf (cdr form))))
-            (values expanded t)))
+          (values (%expand-via-hook mf :interp form env) t))
          (t
           ;; Compiled lambda from mvm-define-macro: (lambda (form) ...).
           ;; Try single-arg first; fall back to (form nil) for CL macros
@@ -1178,15 +1177,7 @@
           ;; CIRCULAR-LIST, which an outer handler could have supplied had it
           ;; been told the name.  HANDLER-BIND, not HANDLER-CASE, so a handler
           ;; outside still sees it before anything unwinds.
-          (block expand
-            (let ((expanded (handler-bind
-                                ((program-error
-                                   (lambda (c)
-                                     (declare (ignore c))
-                                     (return-from expand
-                                       (values (funcall mf form nil) t)))))
-                              (funcall mf form))))
-              (values expanded t)))))))
+          (values (%expand-via-hook mf :one-or-two form env) t)))))
     (t (values form nil))))
 
 (defun macroexpand (form &rest env-arg)
@@ -5268,6 +5259,7 @@
 (defvar *compile-print* nil)
 (defvar *compile-verbose* nil)
 (defvar *macroexpand-hook* 'funcall)
+
 (defvar *debugger-hook* nil)
 (defvar *break-on-signals* nil)
 ;; REPL history variables (CLHS 25.1.1): standard, so they must be bound.

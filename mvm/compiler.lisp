@@ -8113,7 +8113,7 @@
        ;; twice, on the same fix, for two different readers.  On the SBCL build
        ;; host *error-output* is stderr; in-image %init-streams now makes it a
        ;; real fd-2 stream (it used to be the stdout stream object itself).
-       (unless (%blob-defines-global-p name)   ; a forward reference, not a typo
+       (unless (%known-global-p name)
          (format *error-output* "~&  WARN: implicit global ~A~%" name))
        (%note-global name :ref)
        (setf (gethash (normalize-name name) *globals*) t)
@@ -14043,7 +14043,7 @@
       (t
        ;; Implicit global for setq
        ;; See the companion note at the implicit-global read site above.
-       (unless (%blob-defines-global-p var)    ; a forward reference, not a typo
+       (unless (%known-global-p var)
          (format *error-output* "~&  WARN: implicit global setq ~A~%" var))
        (%note-global var :ref)
        (setf (gethash (normalize-name var) *globals*) t)
@@ -23586,6 +23586,18 @@
 
 (defun %blob-defines-global-p (name)
   (and *blob-global-names* (gethash (normalize-name name) *blob-global-names*)))
+
+(defun %known-global-p (name)
+  "NAME is a global the program has declared, so a free reference to it is not
+   worth an `implicit global' warning: the image defines it further on (a
+   forward reference), a DEFVAR / DEFPARAMETER / DECLAIM SPECIAL proclaimed it,
+   or -- compiling at runtime, where the compiler's table of globals is per
+   compilation unit and an earlier form's DEFVAR is not in it -- it already has
+   a value (a library's own DEFVARs, the standard constants)."
+  (or (%blob-defines-global-p name)
+      (%proclaimed-special-p name)
+      (and *mvm-eval-runtime-p* (symbolp name)
+           (handler-case (boundp name) (error () nil)))))
 
 (defun %collect-multi-shape-defuns (forms)
   (let ((seen (make-hash-table :test 'equal))

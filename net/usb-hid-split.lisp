@@ -226,6 +226,7 @@
             (setq p (+ p 1)))))))
   (hid-put #x1F8 0)                             ; no USB owner yet
   (hid-put #x94 0)                              ; no port reserved (cold RAM)
+  (hid-put #x98 0)                              ; no reservation requested
   (hid-put #x1F0 (hid-magic))
   (list (= (hid-dev-get (hid-kbd) 0) 1) (= (hid-dev-get (hid-mouse) 0) 1)))
 
@@ -483,10 +484,37 @@
   (hid-put #x94 (logand (hid-get #x94) (lognot (ash 1 port)))) t)
 (defun hid-port-reserved-p (port) (logbitp port (hid-get #x94)))
 
+(defun hid-reserve-high-speed-ports ()
+  "Reserve every connected HIGH-SPEED port of the HID hub; the mask.  A USB network
+   adapter (RTL8153, CDC-ECM) is high speed, and the scan must leave it alone even when
+   nothing reset it first.  Measured on the Zero with the scan on the same thread as the
+   adapter's receive: frames stopped after the first bulk-IN transfer, and kept coming once
+   these ports were reserved (or the scan was off).  Keyboards and mice are low or full
+   speed, so nothing the scan sets up is excluded.  Run by the scan itself
+   (HID-REQUEST-HIGH-SPEED-RESERVE), never in the middle of binding the adapter: the hub
+   transfers right after NET-USB-PROBE's probe left the board with no network."
+  (let ((hub (hid-get #x00)) (n (hid-get #x04)) (p 1))
+    (when (> hub 0)
+      (loop
+        (when (> p n) (return nil))
+        (let ((st (hid-port-status hub p)))
+          (when (and (logbitp 0 st) (logbitp 10 st)) (hid-reserve-port p)))
+        (setq p (+ p 1))))
+    (hid-get #x94)))
+
+(defun hid-request-high-speed-reserve ()
+  "Ask the next hotplug scan to reserve the high-speed ports first (+0x98): what binding a
+   USB network adapter does (net/usb-netdev.lisp)."
+  (hid-put #x98 1)
+  t)
+
 (defun hid-hotplug-tick ()
   (let ((hub (hid-get #x00)))
     (when (and (> hub 0) (hid-time-reached-p (hid-get #x90)))
       (hid-put #x90 (logand (+ (hid-now) (hid-hotplug-period)) #x3FFF))
+      (when (= (hid-get #x98) 1)                ; a network adapter was bound since
+        (hid-put #x98 0)
+        (hid-reserve-high-speed-ports))
       (let ((n (hid-get #x04)) (p 1))
         (loop
           (when (> p n) (return nil))

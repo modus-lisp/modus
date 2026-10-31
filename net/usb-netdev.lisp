@@ -78,6 +78,7 @@
       (let ((r (modus.net.r8152:r8152-probe)))
         (if (> r 0)
             (progn (usb-netdev-set 2)
+                   (hid-request-high-speed-reserve)    ; the HID hotplug scan leaves it alone
                    (%serial-byte 78) (%serial-byte 68) (%serial-byte 58)
                    (%serial-byte 82) (%serial-byte 10)
                    1)
@@ -86,6 +87,7 @@
                    0)))
       (progn (modus.net.cdc:cdcether-probe)
              (usb-netdev-set 1)
+             (hid-request-high-speed-reserve)
              (%serial-byte 78) (%serial-byte 68) (%serial-byte 58)
              (%serial-byte 67) (%serial-byte 10)
              1)))

@@ -3392,6 +3392,31 @@
               (cons (cons k sym) *setf-function-registry*))
         sym))))
 
+(defun %setf-place-known-p (name)
+  "True when (SETF (NAME ...) v) compiles to a store modus knows, not to the
+   SET-NAME call SETF falls back to for a name it does not: an expander
+   (DEFSETF / DEFINE-SETF-EXPANDER), one of SETF's built-in places, a (SETF
+   NAME) function, a C...R, or a COMMON-LISP accessor whose writer the image
+   defines as SET-NAME (CHAR, DOCUMENTATION).  The built-in places have no
+   expander-table entry, so a host asking that table whether (GETF ...) is a
+   place was told no; this is the question SETF itself answers, by the same
+   tests in the same terms (built-ins matched by name, as SETF matches them)."
+  (and (symbolp name) name
+       (or (mvm-find-setf-expander name)
+           (member (symbol-name name)
+                   '("CAR" "CDR" "AREF" "GETHASH" "GETF" "NTH" "SVREF" "THE"
+                     "VALUES" "SYMBOL-VALUE" "ROW-MAJOR-AREF" "LDB" "MASK-FIELD"
+                     "MEM-REF")
+                   :test #'string=)
+           (%find-setf-function name)
+           (let ((cl (find-package "COMMON-LISP")))
+             (and (eq (symbol-package name) cl)
+                  (or (%cxr-place-name-p (symbol-name name))
+                      (let ((w (find-symbol (concatenate 'string "SET-" (symbol-name name))
+                                            (%setter-pkg name))))
+                        (and w (fboundp w)))))))
+       t))
+
 (defun %find-setf-function (name)
   "SETTER-SYMBOL registered for accessor NAME by (defun (setf NAME) …), or
    NIL.  Most-recent registration wins (entries are PUSHed), matching

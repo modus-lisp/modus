@@ -5187,6 +5187,26 @@
                            args))
             (expander (and (symbolp accessor) (%find-setf-expander accessor))))
        (cond
+         ;; GETF's first argument is itself a PLACE (CLHS 5.1.2.2): the new
+         ;; plist has to be stored back through it.  Treated as a function,
+         ;; the plist went into a temporary and the store into that, so
+         ;; (setf (getf (slot-of x) 'k) v) through a DEFSETF or DEFSUBST
+         ;; returned V and changed nothing.
+         ((and (eq accessor 'getf) (consp args) (listp (cdr args)))
+          (multiple-value-bind (vars vals stores store-form access)
+              (get-setf-expansion (car args) env)
+            (let ((ind (gensym "GSE-I"))
+                  (def (gensym "GSE-D"))
+                  (plist (car stores))
+                  (dflt (cdr (cdr args))))
+              (values (append vars (list ind) (if dflt (list def) nil))
+                      (append vals (list (cadr args)) (if dflt (list (car dflt)) nil))
+                      (list g)
+                      `(let ((,plist ,access))
+                         (setf (getf ,plist ,ind) ,g)
+                         ,store-form
+                         ,g)
+                      `(getf ,access ,ind ,@(if dflt (list def) nil))))))
          (expander
           ;; User defsetf — expand via the registered descriptor.
           (values temps args (list g)

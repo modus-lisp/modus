@@ -9,11 +9,12 @@
 ;; construction and used to sit out a whole IO-DELAY (1.5 ms per segment).
 ;; True when a transfer is ready, NIL on timeout.
 (defun net-rx-idle ()
+  (if (usbe-running-p) (usbe-rx-wait)
   (let ((i 0))
     (loop
       (when (>= i 5000) (return nil))
       (when (not (zerop (logand (dwc2-read (dwc2-hcint 1)) 3))) (return t))
-      (setq i (+ i 1)))))
+      (setq i (+ i 1))))))
 
 ;; The advertised receive window.  r8152-meta+8 overrides it live (0 = the
 ;; default); it lives in RAM the driver zeroes at bring-up.  16 KB: 8/16/32 KB
@@ -45,7 +46,8 @@
 ;; an ACK, the largest per-segment cost after the RX copy.  Same bytes on the
 ;; wire.  NIL (do it the general way) unless the RTL8153 is the bound NIC.
 (defun tcp-send-ack-fast ()
-  (if (not (eq (usb-netdev-get) 2))
+  ;; the I/O core owns channel 3 while its engine runs: ACKs take the general path
+  (if (or (not (eq (usb-netdev-get) 2)) (usbe-running-p))
       nil
       (let ((st (e1000-state-base))
             (b (make-array 56 :element-type (quote (unsigned-byte 8)) :initial-element 0))

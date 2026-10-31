@@ -175,3 +175,342 @@
          ;; the local controller is readable only once something has mapped it
          :gpu-route (if (zerop (mem-ref #x70008 :u32)) :unmapped (io-gpu-route)))
    (if (= (io-get 0) #x494F4331) (io-report) (list :probe :never-run))))
+
+;;; ==================================================================================
+;;; STAGE 2: THE ENGINE.  One loop, alone on its core, owns the DWC2.
+;;; ==================================================================================
+;;;
+;;; What it does each pass (USBE-MAIN):
+;;;   RX       channel 1 (the RTL8153's bulk-IN): when a transfer completes, every frame
+;;;            of the aggregate is copied into the RX RING and the channel is re-armed at
+;;;            once -- the device is never left NAKing while the stack walks a buffer.
+;;;   TX       the four TX RINGS (one per producing core, so each has one writer and no
+;;;            push needs an atomic) are sent over channel 2.
+;;;   HID      the keyboard and mouse, every 8 ms (split transactions, channel 4's job
+;;;            in the end; today the split engine's own channel).
+;;;   HOTPLUG  the hub's ports every 500 ms, with the receive HALTED around the hub
+;;;            traffic (the root-port trap, docs/usb-io-core.md) -- a policy of the one
+;;;            scheduler now, not a hook between drivers.
+;;;   PORT     HPRT0's change bits are cleared and logged (recovery is stage 4).
+;;; and then, if nothing was done, it sleeps in WFI until the controller's interrupt
+;;; (channel 1 only: its NAKs are masked), its 3 ms timer tick, or its MAILBOX: a
+;;; producer writes core-1 mailbox 0 after a push, so a TX never waits for the tick.
+;;;
+;;; WHAT IT MAY TOUCH.  It runs inside a GC-SAFE region it never leaves: a region-0
+;;; stop-the-world collection scans its published stack and never waits for it.  So it
+;;; must hold no heap pointer: no allocation, no global, no string or other heap literal.
+;;; Constants, raw memory and the controller only.  The allocation pointer is checked
+;;; every pass (+0x48 counts passes on which it moved; it must stay 0).
+;;;
+;;; BLOCK at USBE-BASE (0x11500000, Normal-WB RAM -- not cleared at boot, so "running"
+;;; means running in THIS boot: +0x64 holds the klog boot number it started under):
+;;;   +0x00 'USBE'  +0x04 state (1 running, 2 stopping, 3 stopped)  +0x08 stop request
+;;;   +0x0C core    +0x10 passes  +0x14 sleeps  +0x18 RX transfers  +0x1C RX frames
+;;;   +0x20 RX ring full (frames dropped)  +0x24 RX errors  +0x28 TX frames
+;;;   +0x2C TX errors  +0x30 TX ring full (producer gave up)  +0x34 HID polls
+;;;   +0x38 hotplug scans  +0x3C port events  +0x40 last HPRT0  +0x44 alloc start
+;;;   +0x48 allocating passes  +0x58 next HID poll  +0x5C next scan (HFNUM ticks)
+;;;   +0x60 consumer holds a frame  +0x64 boot number
+;;;   +0x1000 RX ring: head (engine) +0, tail (consumer) +4; slots at +0x2000,
+;;;           128 x 2 KB: +0 length, +8 frame
+;;;   +0x50000 + core*0x11000: TX ring for that core: head (producer) +0, tail (engine)
+;;;           +4; 32 slots of 2 KB from +0x40
+
+(defun usbe-base () #x11500000)
+(defun usbe-get (off) (mem-ref (+ (usbe-base) off) :u32))
+(defun usbe-put (off v) (setf (mem-ref (+ (usbe-base) off) :u32) (logand v #xFFFFFFFF)))
+(defun usbe-inc (off) (usbe-put off (+ (usbe-get off) 1)))
+(defun usbe-rx-slot (i) (+ (usbe-base) #x2000 (* (logand i 127) #x800)))
+(defun usbe-tx-ring (c) (+ (usbe-base) #x50000 (* (logand c 3) #x11000)))
+
+;; klog tags as numbers (a string is a heap object): 'USBE' 'RXER' 'TXER' 'PORT' 'CONS'
+(defun %t-usbe () #x45425355)
+(defun %t-rxer () #x52455852)
+(defun %t-txer () #x52455854)
+(defun %t-port () #x54524F50)
+(defun %t-cons () #x534E4F43)
+
+(defun %usbe-boot () (let ((b (%klog-base))) (if (zerop b) 0 (mem-ref (+ b 8) :u32))))
+(defun usbe-running-p ()
+  (and (= (usbe-get 0) #x45425355) (= (usbe-get 4) 1) (= (usbe-get #x64) (%usbe-boot))))
+
+;;; ---- the BCM2836 core mailbox: how a producer wakes the engine ------------------
+(defun %usbe-mbox-set (core) (+ #x40000080 (* 16 core)))
+(defun %usbe-mbox-clear (core) (+ #x400000C0 (* 16 core)))
+(defun usbe-poke () (setf (mem-ref (%usbe-mbox-set (usbe-get #xC)) :u32) 1))
+
+;;; ---- RX (engine side) ------------------------------------------------------------
+(defun usbe-rx-arm ()
+  (modus.net.r8152:r8152-rearm)
+  ;; completion, halt and errors only: a NAK every microframe must not wake the core
+  (dwc2-write (dwc2-hcintmsk 1) #x78F))
+
+(defun usbe-rx-push (src len)
+  (let ((h (usbe-get #x1000)) (tl (usbe-get #x1004)))
+    (if (>= (logand (- h tl) #xFFFFFFFF) 128)
+        (usbe-inc #x20)
+        (let* ((slot (usbe-rx-slot h))
+               (m (modus.net.r8152:r8152-ncopy (+ slot 8) src len)))
+          (loop
+            (when (>= m len) (return nil))
+            (setf (mem-ref (+ slot 8 m) :u8) (mem-ref (+ src m) :u8))
+            (setq m (+ m 1)))
+          (setf (mem-ref slot :u32) len)
+          (memory-barrier)
+          (usbe-put #x1000 (+ h 1))
+          (usbe-inc #x1C)))))
+
+(defun usbe-rx-walk (n)
+  "Copy every frame of the N delivered aggregate bytes into the RX ring."
+  (let ((off 0) (agg (modus.net.r8152:r8152-agg-buf)))
+    (loop
+      (when (> (+ off 24) n) (return nil))
+      (let ((plen (- (logand (mem-ref (+ agg off) :u32) #x7FFF) 4)))
+        (when (or (<= plen 0) (>= plen 1600) (> (+ off 24 plen) n)) (return nil))
+        (usbe-rx-push (+ agg off 24) plen)
+        (setq off (logand (+ off 24 plen 4 7) (lognot 7)))))))
+
+(defun usbe-rx-service ()
+  "1 if channel 1 had finished (its frames are in the ring, it is re-armed), else 0."
+  (let ((r (dwc2-poll-bulk-in 1)))
+    (cond ((zerop r) 0)
+          ((= r 1)
+           (usbe-inc #x18)
+           (let ((n (- (modus.net.r8152:r8152-agg-size)
+                       (logand (dwc2-read (dwc2-hctsiz 1)) #x7FFFF))))
+             (modus.net.r8152:r8152-dcache-civac (modus.net.r8152:r8152-agg-buf) n)
+             (usbe-rx-walk n))
+           (usbe-rx-arm)
+           1)
+          (t (usbe-inc #x24)
+             (klog-event 2 (%t-rxer) r (usbe-get #x24) 0)
+             (usbe-rx-arm)
+             1))))
+
+;;; ---- TX (engine side) ------------------------------------------------------------
+(defun usbe-tx-one (src len)
+  ;; the RTL8153's tx_desc {len | first | last, 0}, then the frame, in the DMA buffer
+  (let ((tx (e1000-tx-buf-base)) (i 0))
+    (setf (mem-ref tx :u32) (logior len #xC0000000))
+    (setf (mem-ref (+ tx 4) :u32) 0)
+    (loop
+      (when (>= i len) (return nil))
+      (setf (mem-ref (+ tx 8 i) :u32) (mem-ref (+ src i) :u32))
+      (setq i (+ i 4)))
+    (let ((r (dwc2-bulk-transfer 2 (usb-dev-addr) (usb-bulk-out-ep) 0 tx (+ len 8)
+                                 (usb-bulk-out-mps))))
+      (if (eql r 1)
+          (usbe-inc #x28)
+          (progn (usbe-inc #x2C) (klog-event 2 (%t-txer) r len 0))))))
+
+(defun usbe-tx-service ()
+  "Send everything queued; how many frames."
+  (let ((sent 0) (c 0))
+    (loop
+      (when (> c 3) (return nil))
+      (let ((ring (usbe-tx-ring c)))
+        (loop
+          (let ((h (mem-ref ring :u32)) (tl (mem-ref (+ ring 4) :u32)))
+            (when (= h tl) (return nil))
+            (memory-barrier)
+            (let ((slot (+ ring #x40 (* (logand tl 31) #x800))))
+              (usbe-tx-one (+ slot 8) (min (mem-ref slot :u32) 2032)))
+            (setf (mem-ref (+ ring 4) :u32) (logand (+ tl 1) #xFFFFFFFF))
+            (setq sent (+ sent 1)))))
+      (setq c (+ c 1)))
+    sent))
+
+;;; ---- HID, hotplug, the port ------------------------------------------------------
+;;; A split transaction waits for later microframes (dwc2-split.lisp's
+;;; DWC2-WAIT-NEXT-UFRAME), and an HID poll is mostly such waits: measured on the Zero,
+;;; ~19 ms of every 20.  While the engine polls the keyboard and mouse, +0x68 is 1 and
+;;; each of those waits first serves the receive and the send once -- so a frame waits a
+;;; microframe, not a whole poll.  Not during hub scans: there the receive is halted on
+;;; purpose and control traffic is in flight.  +0x6C counts the background rounds.
+(defun usbe-background ()
+  ;; the block survives a reset: "running" must mean THIS boot, on THIS core
+  (when (and (= (usbe-get #x68) 1) (usbe-running-p) (= (%klog-core) (usbe-get #xC)))
+    (usbe-put #x68 0)                          ; no recursion
+    (usbe-inc #x6C)
+    (usbe-rx-service)
+    (usbe-tx-service)
+    (usbe-put #x68 1)))
+
+(defun usbe-hid-service ()
+  (when (and (hid-ready-p) (hid-time-reached-p (usbe-get #x58)))
+    (usbe-put #x58 (logand (+ (hid-now) 64) #x3FFF))          ; 8 ms
+    (usbe-inc #x34)
+    (usbe-put #x68 1)
+    (when (> (hid-poll-dev (hid-kbd) (hid-kbd-buf)) 0)
+      (hid-kbd-report (hid-kbd-buf)))
+    (hid-repeat-tick)
+    (let ((n (hid-poll-dev (hid-mouse) (hid-mouse-buf))))
+      (when (> n 2) (hid-mouse-report (hid-mouse-buf) n)))
+    (usbe-put #x68 0)))
+
+(defun usbe-hotplug-service ()
+  (let ((hub (hid-get #x00)))
+    (when (and (> hub 0) (hid-time-reached-p (usbe-get #x5C)))
+      (usbe-put #x5C (logand (+ (hid-now) (hid-hotplug-period)) #x3FFF))
+      (usbe-inc #x38)
+      ;; hub traffic with the bulk-IN armed disabled the root port: take what has
+      ;; arrived, halt the receive, scan, re-arm
+      (usbe-rx-service)
+      (dwc2-halt-channel 1)
+      (%hid-hotplug-scan hub)
+      (usbe-rx-arm))))
+
+(defun usbe-port-service ()
+  (let ((p (dwc2-read (dwc2-hprt0))))
+    ;; connect-detected (1), enable-changed (3), overcurrent-changed (5) are
+    ;; write-1-to-clear and hold GINTSTS.PrtInt up: clear them, without writing
+    ;; PrtEna (writing 1 there DISABLES the port)
+    (when (logtest p #x2A)
+      (dwc2-write (dwc2-hprt0) (logior (logand p (dwc2-hprt0-mask)) (logand p #x2A))))
+    (when (/= (logand p #x05) (logand (usbe-get #x40) #x05))   ; connected, enabled
+      (usbe-inc #x3C)
+      (klog-event 3 (%t-port) p (usbe-get #x40) (usbe-get #x3C)))
+    (usbe-put #x40 p)))
+
+;;; ---- per-service accounting: +0x80 + 16*K for K = rx tx port hid hotplug -----------
+;;; +0 counter ticks / 16 spent in it, +4 calls, +8 calls that moved the allocation
+;;; pointer, +12 the largest single call (ticks / 16)
+(defun usbe-measure (k t0 a0)
+  "Account the service K that ran since T0 (counter) with allocation pointer A0.  Now."
+  (let* ((now (rdtsc)) (d (ash (- now t0) -4)) (b (+ #x80 (* 16 k))))
+    (usbe-put b (+ (usbe-get b) d))
+    (usbe-inc (+ b 4))
+    (unless (= a0 (get-alloc-ptr)) (usbe-inc (+ b 8)))
+    (when (> d (usbe-get (+ b 12))) (usbe-put (+ b 12) d))
+    now))
+
+(defun usbe-profile ()
+  "Per service: (name ms-total calls allocating-calls max-ms)."
+  (let ((acc nil) (k 0) (tick-ms (/ (max 1 (cntfrq)) 16000.0)))
+    (dolist (name '(:rx :tx :port :hid :hotplug))
+      (let ((b (+ #x80 (* 16 k))))
+        (push (list name (/ (usbe-get b) tick-ms) (usbe-get (+ b 4)) (usbe-get (+ b 8))
+                    (/ (usbe-get (+ b 12)) tick-ms))
+              acc))
+      (setq k (+ k 1)))
+    (nreverse acc)))
+
+;;; ---- the loop --------------------------------------------------------------------
+(defun usbe-main ()
+  "The engine.  Run as a thread alone on its core (USBE-START); returns when stopped."
+  (let ((core (%klog-core)))
+    (usbe-put #xC core)
+    (io-hcr-imo-on)                           ; at EL2, without it an IRQ never ends WFI
+    (io-route-gpu-irq core)
+    (io-core-vtimer-irq core t)
+    (setf (mem-ref (+ #x40000050 (* 4 core)) :u32) 1)          ; mailbox 0 -> IRQ
+    (setf (mem-ref (%usbe-mbox-clear core) :u32) #xFFFFFFFF)
+    (hid-put #x1F8 (+ (%thr-cpu) 1))          ; the HID driver's owner: this thread
+    (dwc2-write (dwc2-haintmsk) 2)            ; channel 1 only
+    (when (zerop (mem-ref (+ (e1000-state-base) #x48) :u32))
+      (dwc2-write (dwc2-hcintmsk 1) #x78F))   ; armed already: just quiet its NAKs
+    (unless (zerop (mem-ref (+ (e1000-state-base) #x48) :u32))
+      (usbe-rx-arm))
+    (io-usb-irq-enable #x03000000)            ; GINTMSK: HChInt | PrtInt
+    (usbe-put #x40 (dwc2-read (dwc2-hprt0)))
+    (%gc-safe-enter)
+    (setup-irq)
+    (usbe-put 4 1)
+    (klog-event 1 (%t-usbe) core 1 0)
+    (usbe-put #x44 (logand (get-alloc-ptr) #xFFFFFFFF))
+    (loop
+      (when (/= (usbe-get 8) 0) (return nil))
+      (usbe-inc #x10)
+      (setf (mem-ref (%usbe-mbox-clear core) :u32) #xFFFFFFFF)
+      (let ((work 0) (t0 (rdtsc)) (a0 (get-alloc-ptr)))
+        (setq work (usbe-rx-service))
+        (setq t0 (usbe-measure 0 t0 a0)) (setq a0 (get-alloc-ptr))
+        (setq work (+ work (usbe-tx-service)))
+        (setq t0 (usbe-measure 1 t0 a0)) (setq a0 (get-alloc-ptr))
+        (usbe-port-service)
+        (setq t0 (usbe-measure 2 t0 a0)) (setq a0 (get-alloc-ptr))
+        (usbe-hid-service)
+        (setq t0 (usbe-measure 3 t0 a0)) (setq a0 (get-alloc-ptr))
+        (usbe-hotplug-service)
+        (usbe-measure 4 t0 a0)
+        (unless (= (logand (get-alloc-ptr) #xFFFFFFFF) (usbe-get #x44))
+          (when (zerop (usbe-get #x48)) (klog-event 3 (%t-cons) (usbe-get #x10) 0 0))
+          (usbe-inc #x48)
+          (usbe-put #x44 (logand (get-alloc-ptr) #xFFFFFFFF)))
+        (when (zerop work)
+          (usbe-inc #x14)
+          (timer-rearm)
+          (wfi))))
+    (usbe-put 4 2)
+    (dwc2-write (dwc2-gintmsk) 0)
+    (dwc2-write (dwc2-haintmsk) 0)
+    (setf (mem-ref (+ #x40000050 (* 4 core)) :u32) 0)
+    (io-core-vtimer-irq core nil)
+    (hid-put #x1F8 0)
+    (%gc-safe-leave)
+    (klog-event 1 (%t-usbe) core 3 (usbe-get #x48))
+    (usbe-put 4 3)
+    0))
+
+;;; ---- the other side: producers and the consumer (any core but the engine's) -----
+(defun usbe-send (buf len)
+  "Queue the frame in BUF (LEN bytes) on this core's TX ring and wake the engine.  1,
+   or 0 when the ring stayed full."
+  (let* ((ring (usbe-tx-ring (%klog-core))) (h (mem-ref ring :u32)) (k 0) (n (min len 2032)))
+    (loop
+      (when (< (logand (- h (mem-ref (+ ring 4) :u32)) #xFFFFFFFF) 32) (return nil))
+      (when (> k 4000000) (usbe-inc #x30) (return-from usbe-send 0))
+      (setq k (+ k 1)))
+    (let ((slot (+ ring #x40 (* (logand h 31) #x800))) (i 0))
+      (loop
+        (when (>= i n) (return nil))
+        (setf (mem-ref (+ slot 8 i) :u8) (aref buf i))
+        (setq i (+ i 1)))
+      (setf (mem-ref slot :u32) n)
+      (memory-barrier)
+      (setf (mem-ref ring :u32) (logand (+ h 1) #xFFFFFFFF))
+      (usbe-poke)
+      1)))
+
+(defun usbe-receive ()
+  "The next received frame's length, or 0.  The previous one is released; the frame
+   stays at USBE-RX-BUF until the next call (the NIC interface's contract)."
+  (let ((tl (usbe-get #x1004)))
+    (when (= (usbe-get #x60) 1)
+      (setq tl (logand (+ tl 1) #xFFFFFFFF))
+      (usbe-put #x1004 tl)
+      (usbe-put #x60 0))
+    (if (= (usbe-get #x1000) tl)
+        0
+        (progn (memory-barrier)
+               (usbe-put #x60 1)
+               (mem-ref (usbe-rx-slot tl) :u32)))))
+
+(defun usbe-rx-buf () (+ (usbe-rx-slot (usbe-get #x1004)) 8))
+
+(defun usbe-rx-wait ()
+  "Wait a little for a frame (the net stack's idle poll): T when one is there."
+  (let ((i 0))
+    (loop
+      (when (/= (usbe-get #x1000) (usbe-get #x1004)) (return t))
+      (when (>= i 5000) (return nil))
+      (setq i (+ i 1)))))
+
+(defun usbe-status ()
+  (if (not (= (usbe-get 0) #x45425355))
+      (list :engine :never-started)
+      (list :running (usbe-running-p) :state (usbe-get 4) :core (usbe-get #xC)
+            :passes (usbe-get #x10) :sleeps (usbe-get #x14)
+            :rx-transfers (usbe-get #x18) :rx-frames (usbe-get #x1C)
+            :rx-dropped (usbe-get #x20) :rx-errors (usbe-get #x24)
+            :tx-frames (usbe-get #x28) :tx-errors (usbe-get #x2C) :tx-full (usbe-get #x30)
+            :hid-polls (usbe-get #x34) :scans (usbe-get #x38) :port-events (usbe-get #x3C)
+            :hprt0 (usbe-get #x40) :allocating-passes (usbe-get #x48)
+            :background-rounds (usbe-get #x6C))))
+
+(defun usbe-init-block ()
+  (dotimes (i 64) (usbe-put (* 4 i) 0))
+  (usbe-put #x1000 0) (usbe-put #x1004 0)
+  (dotimes (c 4) (setf (mem-ref (usbe-tx-ring c) :u32) 0) (setf (mem-ref (+ (usbe-tx-ring c) 4) :u32) 0))
+  (usbe-put #x64 (%usbe-boot))
+  (usbe-put 0 #x45425355))

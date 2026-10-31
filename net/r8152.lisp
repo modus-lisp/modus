@@ -284,7 +284,7 @@
   (r8152-tx-async-wait)
   (dwc2-setup-channel 3 (dwc2-build-hcchar (usb-bulk-out-mps) (usb-bulk-out-ep)
                                            0 2 (usb-dev-addr)))
-  (dwc2-start-transfer 3 (dwc2-build-hctsiz len (ceiling len (usb-bulk-out-mps))
+  (dwc2-start-transfer 3 (dwc2-build-hctsiz len (dwc2-packets len (usb-bulk-out-mps))
                                             (ash (logand (usb-bulk-out-toggle) 3) 29))
                        buf)
   (setf (mem-ref (+ (r8152-meta) 12) :u32) 1))

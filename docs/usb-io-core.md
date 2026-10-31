@@ -111,3 +111,37 @@ starts them in that order.  Fixed (the core goes to BT-SPAWN), and the probe now
 refuses (returns -1, logs `IOWK core actual -1`) on the wrong core instead of
 sleeping forever.  The hung boot's own record, read after the reset with
 `(modus:klog-dump :boot :previous)`, is what showed the probe had run on `c2`.
+
+## Stage 2: the engine (USBE-MAIN, net/usb-io-core.lisp)
+
+`(modus-int::usbe-start)` from the main thread starts a bare thread alone on core 1
+that owns the DWC2 from then on; `usbe-stop` hands it back.  The NIC interface
+(`usb-nic-*`), `net-rx-idle` and the fast-ACK path route to its rings while it runs.
+`(modus-int::usbe-status)` / `(modus-int::usbe-profile)` / `(modus:image-configuration)`
+read it.  It needs the RTL8153 bound (`:no-rtl8153` otherwise; CDC-ECM is not wired).
+
+Measured on the Zero 2 W, the network running entirely through the engine (ping from
+the builder, SSH evaluations over the same link):
+
+| | first cut | `ceiling` fixed | + background in split waits |
+|---|---|---|---|
+| allocating passes | 950 of 2527 | 1 (a misplaced baseline) | **0** |
+| ping RTT avg / max | 26-34 ms / 57 ms | 35.6 / 462 ms | **5.2** / 489 ms |
+| ping loss (30-60 s) | 0 | 1 of 300 | 2 of 300 |
+| RX / TX errors | 0 / 0 | 0 / 0 | 0 / 0 |
+| root port | enabled throughout | enabled throughout | enabled throughout |
+
+**THE ALLOCATION WAS `CEILING`'S `&REST` LIST.**  `(ceiling len mps)` conses one on
+every two-argument call, and every transfer setup computed its packet count that way.
+`dwc2-packets` is the inline `(truncate (+ len mps -1) mps)`.  The per-service profile
+found it: allocating calls per service went from non-zero to 0 everywhere.
+
+**AN HID POLL IS ~19 ms OF MICROFRAME WAITS** (keyboard + mouse behind the hub, split
+transactions, 95% of the engine's time).  Those waits now serve the receive and the send
+once each (`usbe-background`, only during HID polls -- never during a hub scan, where
+the receive is halted on purpose), which is the 35 -> 5 ms.  The next step is
+asynchronous splits: start a split, return to the loop, continue it at the next
+microframe from the SOF interrupt.
+
+**OPEN:** one hotplug scan right after the start takes ~506 ms with the receive halted
+(the worst ping and the lost ones); unexplained yet.

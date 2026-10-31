@@ -52,23 +52,28 @@
 ;; boot; probing and hot-plug only move the latch.  Rebinding the interface on
 ;; every probe would undo whatever a layer above wrapped around it (kiln's
 ;; board network hands its own connections' frames out of NIC-RECEIVE).
+;; While the I/O core's engine runs (net/usb-io-core.lisp) it owns the controller: frames
+;; go through its rings, and nothing here may touch the DWC2.
 (defun usb-nic-send (buf len)
   (let ((d (usb-netdev-get)))
+    (if (usbe-running-p) (usbe-send buf len)
     (if (eq d 2)
         (modus.net.r8152:r8152-send buf len)
-        (if (eq d 1) (modus.net.cdc:cdcether-send buf len) 0))))
+        (if (eq d 1) (modus.net.cdc:cdcether-send buf len) 0)))))
 
 (defun usb-nic-receive ()
   (let ((d (usb-netdev-get)))
+    (if (usbe-running-p) (usbe-receive)
     (if (eq d 2)
         (modus.net.r8152:r8152-receive)
-        (if (eq d 1) (modus.net.cdc:cdcether-receive) 0))))
+        (if (eq d 1) (modus.net.cdc:cdcether-receive) 0)))))
 
 (defun usb-nic-rx-buf ()
   (let ((d (usb-netdev-get)))
+    (if (usbe-running-p) (usbe-rx-buf)
     (if (eq d 2)
         (modus.net.r8152:r8152-rx-buf)
-        (if (eq d 1) (modus.net.cdc:cdcether-rx-buf) (modus.net.cdc:cdc-rx-buf-addr)))))
+        (if (eq d 1) (modus.net.cdc:cdcether-rx-buf) (modus.net.cdc:cdc-rx-buf-addr))))))
 
 ;; The HID hotplug scan's hub traffic must not run with the RTL8153's bulk-IN armed: the
 ;; controller disabled its root port within seconds (net/r8152.lisp, R8152-RX-PAUSE).  So

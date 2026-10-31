@@ -17,7 +17,8 @@
   "(label . function name) of every live section an image may have.  Add a subsystem
    here: a function of no arguments returning a plist."
   '((:log . klog-status)
-    (:io-core . io-status)))
+    (:io-core . io-status)
+    (:usb-engine . usbe-status)))
 
 (defun %configuration-live ()
   (let ((acc nil))

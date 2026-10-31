@@ -458,6 +458,11 @@
 ;; unresolved function ... emitting NIL sentinel"; see CLAUDE.md limitation 1
 ;; and task #215).  A silently-no-op halt is exactly the bug this function
 ;; exists to fix, so keep this definition ABOVE dwc2-setup-channel.
+;; Packets in a transfer of LEN bytes (LEN > 0, MPS > 0): (ceiling len mps) without its
+;; &REST list -- CEILING conses one on every two-argument call, and these run on the
+;; I/O core, which must never allocate.  The two-argument TRUNCATE compiles inline.
+(defun dwc2-packets (len mps) (truncate (+ len mps -1) mps))
+
 (defun dwc2-halt-channel (ch)
   ;; Halt an active channel. Sets CHDIS+CHENA, waits for CHHLTD.
   (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
@@ -640,7 +645,7 @@
     ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
     ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
     ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
-    (let ((pktcnt (if (zerop len) 1 (ceiling len 64))))
+    (let ((pktcnt (if (zerop len) 1 (dwc2-packets len 64))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data1))))
         (dwc2-start-transfer ch hctsiz buf)
         (let ((r (dwc2-poll-channel ch)))
@@ -670,7 +675,7 @@
     ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
     ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
     ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
-    (let ((pktcnt (if (zerop len) 1 (ceiling len 64))))
+    (let ((pktcnt (if (zerop len) 1 (dwc2-packets len 64))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data1))))
         (dwc2-start-transfer ch hctsiz buf)
         (dwc2-poll-channel ch)))))
@@ -716,7 +721,7 @@
     ;; device drop every second packet as a retransmission).
     ;; PktCnt MUST use integer division — (/ len mps) is an exact RATIO whose
     ;; pointer bits once leaked into the register (see git c3e35dd).
-    (let ((pktcnt (if (zerop len) 1 (ceiling len mps)))
+    (let ((pktcnt (if (zerop len) 1 (dwc2-packets len mps)))
           (tog (logand (if (= epdir 1) (usb-bulk-in-toggle) (usb-bulk-out-toggle)) 3)))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (ash tog 29))))
         (dwc2-start-transfer ch hctsiz buf)
@@ -773,7 +778,7 @@
     ;; the next PID from HCTSIZ on completion — U-Boot pattern, QEMU-neutral).
     ;; PktCnt MUST use integer division — see git c3e35dd for the ratio-
     ;; pointer-in-register bug this once caused.
-    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
+    (let ((pktcnt (if (zerop len) 1 (dwc2-packets len mps))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt
                                        (ash (logand (usb-bulk-in-toggle) 3) 29))))
         (dwc2-start-transfer ch hctsiz buf)))))
@@ -793,6 +798,6 @@
     ;; calls; the HCTSIZ actually programmed for two identical GET_DESCRIPTORs
     ;; was 0x4EE00008 then 0x52600008 (PktCnt 476, then 588 — should be 1).
     ;; QEMU's DWC2 model ignores PktCnt, so this was invisible under emulation.
-    (let ((pktcnt (if (zerop len) 1 (ceiling len mps))))
+    (let ((pktcnt (if (zerop len) 1 (dwc2-packets len mps))))
       (let ((hctsiz (dwc2-build-hctsiz len pktcnt (hctsiz-pid-data0))))
         (dwc2-start-transfer ch hctsiz buf)))))

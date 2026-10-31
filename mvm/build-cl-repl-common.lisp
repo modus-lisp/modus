@@ -1691,6 +1691,12 @@
             ;; The I/O core: the USB host controller owned by one core, woken
             ;; from WFI by its interrupt (stage 1: routing + the wake probe).
             (%rpi-net-text "usb-io-core.lisp")   (string #\Newline)
+            ;; ... and its engine's start/stop, which need bare threads
+            (if (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
+                  (and v (> (length v) 0) (string/= v "0")))
+                (%rpi-net-text "usb-engine-threads.lisp")
+                "")
+            (string #\Newline)
             ;; LPCM audio into the firmware's HDMI link (polled MAI FIFO), fed from a ring
             ;; any thread can fill -- the Zero desk's audio thread pumps it.
             (%rpi-net-text "hdmi-audio.lisp")    (string #\Newline)

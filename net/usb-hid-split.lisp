@@ -365,20 +365,28 @@
         n)
       0))
 
-;; HID usage -> character code.  Usages 4..56; anything else is ignored.
+;; HID usage -> character code.  Usages 4..56; anything else is ignored.  Numbers
+;; only, no string tables: this runs on the I/O core, which may not touch the heap
+;; (a string literal is a heap object a collection can move).
 (defun hid-usage-char (u shift)
   (cond
     ((and (>= u 4) (<= u 29))
      (+ u (if shift 61 93)))                         ; a-z / A-Z
-    ((and (>= u 30) (<= u 39))
-     (char-code (char (if shift "!@#$%^&*()" "1234567890") (- u 30))))
+    ((and (>= u 30) (<= u 39))                       ; 1..9 0 / ! @ # $ % ^ & * ( )
+     (if shift
+         (case u (30 33) (31 64) (32 35) (33 36) (34 37) (35 94) (36 38) (37 42) (38 40) (t 41))
+         (if (= u 39) 48 (+ u 19))))
     ((= u 40) 13)
     ((= u 41) 27)
     ((= u 42) 127)
     ((= u 43) 9)
     ((= u 44) 32)
-    ((and (>= u 45) (<= u 56))
-     (char-code (char (if shift "_+{}|~:\"~<>?" "-=[]\\#;'`,./") (- u 45))))
+    ((and (>= u 45) (<= u 56))                       ; - = [ ] \ # ; ' ` , . /
+     (if shift
+         (case u (45 95) (46 43) (47 123) (48 125) (49 124) (50 126) (51 58) (52 34)
+                 (53 126) (54 60) (55 62) (t 63))
+         (case u (45 45) (46 61) (47 91) (48 93) (49 92) (50 35) (51 59) (52 39)
+                 (53 96) (54 44) (55 46) (t 47))))
     (t -1)))
 
 ;; Key repeat.  The keyboard reports only CHANGES (SET_IDLE 0), so a held key

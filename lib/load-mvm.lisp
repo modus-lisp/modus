@@ -17,6 +17,12 @@
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (load path :verbose nil :print nil)))
 
+;; HOST-ONLY: record every MODUS_* variable this build reads, FIRST, so the knobs
+;; the compiler and translators read while loading are in the record too.  The
+;; record is baked into the image as data (lib/image-config.lisp).
+(unless (find-package :modus.image-config)
+  (mvm-load "lib/image-config.lisp"))
+
 (format t "Loading MVM system...~%")
 
 ;; Load the whole system inside one compilation unit so SBCL DEFERS

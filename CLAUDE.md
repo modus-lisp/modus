@@ -1224,6 +1224,28 @@ the OTG port) and the UART bootloader were mini-Lisp images and are ARCHIVED,
 not ported — both need the physical board; docs/mini-lisp-archive.md says how
 to bring them back.
 
+## Reading an image instead of its build scripts (2026-10-31)
+
+- **`(modus:image-configuration)`** prints what an image is: machine and features;
+  the build script, target and source commit; every `MODUS_*` variable the build
+  READ with the value it got (unset ones listed as defaults); the emission flags in
+  `lib/image-config.lisp`'s `*IMAGE-CONFIGURATION-FLAGS*` for its architecture; and
+  live sections (`%CONFIGURATION-SECTIONS` in `lib/configuration.lisp`: the log, the
+  I/O core).  `:data t` returns the plist.  The build host records knobs by wrapping
+  `posix-getenv` (so a new knob appears without being listed) and writes the record
+  into the SOURCE as a placeholder that the host's `build-image` wrapper fills in at
+  compile time -- after the script has set its flags -- and the UEFI DDC's dump fills
+  in first, so both compilers see one text.  `MODUS_SOURCE_COMMIT` pins the commit
+  field (`build-matrix.sh` does, for byte-identity pairs).  Add a flag that decides
+  emission to that list; add a subsystem's status function to the sections list.
+- **`(modus:klog level "TAG" "text")` / `(modus:klog-event level "TAG" a b c)` /
+  `(modus:klog-dump)`** (`lib/bare-log.lisp`, every bare CL image): a ring per
+  core, appends that never allocate or lock (safe on the I/O core and in fault
+  paths).  On the Pi it is in Device RAM a reset does not clear:
+  `(modus:klog-dump :boot :previous)` reads the boot that hung.  `klog-echo-level`
+  mirrors to the console.  Prefer it to serial prints in anything that runs off
+  the main thread.
+
 ## Tagged Value System
 
 All values are tagged 64-bit words with fixnum-shift=1:

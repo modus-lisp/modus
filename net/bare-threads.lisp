@@ -274,6 +274,9 @@
   (let ((i (percpu-ref 16)))
     (if (< i 4) i (mem-ref (+ (%bt-rec i) #x20) :u32))))
 
+;; The message log's writer index (lib/bare-log.lisp): one ring per core.
+(defun %klog-core () (%bt-core-id))
+
 (defun %bt-switch (from to)
   "Leave record FROM (published SAFE) for record TO, on this core.  Returns when
    something switches back to FROM."
@@ -1142,9 +1145,12 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
     (when (null idx) (error "bt-start-executor: all 8 executors in use"))
     (let ((cell (%sync-cell)))
       (setf (svref *bt-exec-idle* idx) (or idle :none))      ; non-NIL: the entry is taken
-      (bt-pin-next core)
+      ;; CORE goes to BT-SPAWN itself: a separate BT-PIN-NEXT here was overwritten by
+      ;; BT-SPAWN's own least-loaded choice, so an executor asked for core 3 ran on
+      ;; whichever core had the fewest threads (measured: 2 -> 1, 3 -> 2 when started
+      ;; first).  The desk's 1/2/3 executors only matched by starting in that order.
       (let ((c cell) (i idx))
-        (bt-spawn (%bt-exec-entry c i)))
+        (bt-spawn (%bt-exec-entry c i) core))
       (loop (unless (zerop (mem-ref (+ cell #x30) :u32)) (return nil)))
       (list cell idx))))
 

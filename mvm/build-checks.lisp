@@ -1617,6 +1617,15 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
   (setf *build-image-unwrapped* #'build-image)
   (setf *build-image-wrapper*
         (lambda (&rest args)
+          ;; The image's configuration record (lib/image-config.lisp), as it stands now.
+          (let ((st (getf args :source-text)))
+            (when (and st (find-package "MODUS.IMAGE-CONFIG"))
+              (let ((fin (funcall (find-symbol "FINALIZE-IMAGE-CONFIGURATION" "MODUS.IMAGE-CONFIG")
+                                  st (getf args :target :x86-64))))
+                (unless (eq fin st)
+                  (setq args (list* :source-text fin
+                                    (loop for (k v) on args by #'cddr
+                                          unless (eq k :source-text) append (list k v))))))))
           (setf *gck-defun-log* nil)
           (setf *undeclared-redefinitions* nil)
           (when *gck-fallback-census* (clrhash *gck-fallback-census*))

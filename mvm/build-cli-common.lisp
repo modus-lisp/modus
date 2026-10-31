@@ -2315,8 +2315,13 @@
                      (modus.mvm::%source-file-trailer f) (string #\Newline))
         "")))
 
+;;; (modus:image-configuration): lib/configuration.lisp.  In *ALL-RUNTIME-SOURCE*
+;;; so runtime EVAL can call it, and in *FULL-SOURCE* (with the build's record).
+(defvar *configuration-source* (mvm-text "lib/configuration.lisp"))
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
+                       *configuration-source* (string #\Newline)
                        *softfloat-source* (string #\Newline)
                        *gc-source*       (string #\Newline)
                        *mcgc-pin-source*
@@ -2748,7 +2753,12 @@
     *driver-source*
     (string #\Newline)
     ;; WS5 rung 2: baked JIT boot hook + gate (LAST so %jit-enabled-p wins).
-    *jit-boot-source*))
+    *jit-boot-source*
+    ;; What this image was built with (lib/image-config.lisp): read it with
+    ;; (modus:image-configuration).  Source, so the DDC compiles it too.
+    *configuration-source*
+    (modus.mvm::%build-package-scoped-source
+     (modus.image-config:image-configuration-text) "<image configuration>")))
 
 (format t "Full source: ~D characters~%" (length *full-source*))
 

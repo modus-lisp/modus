@@ -16,7 +16,8 @@
 #
 # MODUS_BUILD_ID is pinned to 1: the CLI lineage otherwise bakes a fresh
 # random core id into every build (%CORE-BUILD-ID), so no two of its images
-# would ever compare equal.
+# would ever compare equal.  MODUS_SOURCE_COMMIT is pinned for the same reason:
+# every image records the commit it was built from (lib/image-config.lisp).
 #
 # TREE defaults to the checkout this script is in.  NAMEs select lines of the
 # list; none means all of them.
@@ -55,7 +56,7 @@ build_one() {
   [ "$envs" = "-" ] && envs=
   local t0=$(date +%s)
   # shellcheck disable=SC2086
-  unshare -rm sh -c "mount --bind '$d/tmp' /tmp && mkdir -p /tmp/piboot && cd '$tree' && exec env MODUS_BUILD_ID=1 $envs \
+  unshare -rm sh -c "mount --bind '$d/tmp' /tmp && mkdir -p /tmp/piboot && cd '$tree' && exec env MODUS_BUILD_ID=1 MODUS_SOURCE_COMMIT=build-matrix $envs \
       sbcl --dynamic-space-size 12288 --script $cmd" < /dev/null > "$d/build.log" 2>&1
   local rc=$?
   echo $rc > "$d/rc"

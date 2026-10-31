@@ -3011,7 +3011,12 @@
                        ;; what org libraries (cl-transport, natrium, operandi, seal)
                        ;; look up by name: their thread-local specials, and the
                        ;; hardware entropy source
-                       "REGISTER-PER-COMPUTATION-SPECIAL" "%MODUS-HARDWARE-ENTROPY")))
+                       "REGISTER-PER-COMPUTATION-SPECIAL" "%MODUS-HARDWARE-ENTROPY"
+                       ;; what this image is (lib/configuration.lisp), and the bare-metal
+                       ;; message log (lib/bare-log.lisp)
+                       "IMAGE-CONFIGURATION"
+                       "KLOG" "KLOG-EVENT" "KLOG-DUMP" "KLOG-RECORDS" "KLOG-STATUS"
+                       "KLOG-ECHO-LEVEL")))
       (let ((sym (intern n int)))
         (import sym modus)
         (export sym modus)))

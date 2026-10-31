@@ -445,12 +445,18 @@
     ;; Single-threaded answers to the SB-THREAD shim's primitives (the shim is
     ;; boot-evaluated here too; net/hosted-sync.lisp is hosted-only).
     (mvm-text "net/bare-sync.lisp")
+    ;; The message log (klog / klog-dump): a ring per core, appends that never
+    ;; allocate.  An image keeps one where its board names a region below.
+    (mvm-text "lib/bare-log.lisp")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
+    ;; The Pi's log: 384 KB of the same window, which a board reset does not
+    ;; clear (the old USB ISR ring's neighbourhood, unused by the CL image).
     (if *cl-repl-rpi-p*
         "
 (declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
+(defun %klog-region () (values #x110A0000 #x60000))
 "
         "")
     ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
@@ -988,6 +994,9 @@
   ;; which survives a board reset: clear it before the first character, or the
   ;; banner below is drawn into the previous boot's framebuffer.
   (setf (mem-ref #x111F0800 :u32) 0)
+  ;; The message log (lib/bare-log.lisp) is in the same window and is KEPT across a
+  ;; reset on purpose: count this boot, so the previous one's messages stay readable.
+  (%klog-boot)
   ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
   (setf (mem-ref #x111F2000 :u32) 0)
   (%gc-write64 #x111F2008 0)
@@ -1679,6 +1688,9 @@
             (%rpi-net-text "hdmi-console.lisp")  (string #\Newline)
             (%rpi-net-text "dwc2-split.lisp")    (string #\Newline)
             (%rpi-net-text "usb-hid-split.lisp") (string #\Newline)
+            ;; The I/O core: the USB host controller owned by one core, woken
+            ;; from WFI by its interrupt (stage 1: routing + the wake probe).
+            (%rpi-net-text "usb-io-core.lisp")   (string #\Newline)
             ;; LPCM audio into the firmware's HDMI link (polled MAI FIFO), fed from a ring
             ;; any thread can fill -- the Zero desk's audio thread pumps it.
             (%rpi-net-text "hdmi-audio.lisp")    (string #\Newline)
@@ -3381,6 +3393,14 @@
 #+sbcl
 (let ((p (sb-ext:posix-getenv "MODUS_DDC_DUMP_SOURCE")))
   (when (and p (plusp (length p)))
+    ;; the configuration record, finalized HERE so the dump and this build's own
+    ;; BUILD-IMAGE compile the same text (the wrapper finds no placeholder after)
+    (setq cl-user::*full-source*
+          (modus.image-config:finalize-image-configuration
+           cl-user::*full-source*
+           (cond (cl-user::*cl-repl-virt-p* :fixpoint) (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
+                 (cl-user::*cl-repl-x64-p* :x86-64) (cl-user::*cl-repl-i386-p* :i386)
+                 (cl-user::*cl-repl-arm32-p* :armv7-cl) (t :rpi))))
     (with-open-file (o p :direction :output :if-exists :supersede)
       (write-string cl-user::*full-source* o))
     (format t "~&;; DDC: full source text (~D chars) written to ~A~%"

@@ -6921,7 +6921,8 @@
                              (opts (cdr spec))
                              (initargs nil)
                              (initform :no-initform)
-                             (readers nil))
+                             (readers nil)
+                             (writers nil))
                          (loop
                            (when (null opts) (return))
                            (let ((k (car opts)) (v (cadr opts)))
@@ -6930,13 +6931,22 @@
                                 (setf initargs (append initargs (list v))))
                                ((eq k :initform)
                                 (setf initform v))
-                               ((or (eq k :reader) (eq k :accessor))
+                               ((eq k :reader)
                                 (setf readers (append readers (list v))))
-                               ;; :type, :documentation, :writer, :allocation —
+                               ;; An :ACCESSOR is a reader and a (SETF NAME)
+                               ;; writer (CLHS DEFINE-CONDITION).  Only the
+                               ;; reader was made, so (setf (acc c) v) called
+                               ;; an undefined SET-ACC.
+                               ((eq k :accessor)
+                                (setf readers (append readers (list v)))
+                                (setf writers (append writers (list (list 'setf v)))))
+                               ((eq k :writer)
+                                (setf writers (append writers (list v))))
+                               ;; :type, :documentation, :allocation —
                                ;; recognised, ignored
                                )
                              (setf opts (cddr opts))))
-                         (list sname initargs initform readers))))
+                         (list sname initargs initform readers writers))))
                  slot-specs))
              ;; Descriptors: (name (initargs) initform) — drop readers
              (slot-descriptors
@@ -7008,7 +7018,26 @@
                                  `(unless (%cond-install-reader-if-generic
                                            (quote ,r) (quote ,name) (quote ,sname))
                                     (defun ,r (c) (%condition-slot c (quote ,sname)))))
-                             acc)))))))
+                             acc))
+                     ;; Writers: run-time only, as DEFCLASS makes them -- a
+                     ;; (SETF NAME) generic with a method on this condition,
+                     ;; and for an :ACCESSOR the legacy SET-NAME entry SETF
+                     ;; falls back to when it compiled (setf (NAME c) v)
+                     ;; before the writer existed.
+                     (when *mvm-eval-runtime-p*
+                       (dolist (w (fifth p))
+                         (push `(progn
+                                  (unless (%find-gf (quote ,w))
+                                    (%install-accessor-dispatcher (quote ,w) ':writer))
+                                  (%cond-install-writer (quote ,w) (quote ,name) (quote ,sname)))
+                               acc)
+                         (when (and (consp w) (eq (car w) 'setf))
+                           (let ((acc-name (cadr w)))
+                             (push `(%install-accessor-dispatcher
+                                     (quote ,(intern (concatenate 'string "SET-" (symbol-name acc-name))
+                                                     (%setter-pkg acc-name)))
+                                     ':setter (quote ,acc-name))
+                                   acc))))))))))
         `(progn ,def-call ,@reader-defuns))))
 
   ;; MAKE-ARRAY native multi-dim support has moved from this

@@ -50,7 +50,7 @@
     ("MODUS.NET.R8152" ("COMMON-LISP" "MODUS-INT")
      ("R8152-FIND-ADDR" "R8152-PROBE" "R8152-SEND" "R8152-RECEIVE"
       "R8152-RX-BUF" "R8152-META" "R8152-NCOPY" "R8152-ACK-BUF"
-      "R8152-TX-ASYNC-START" "R8152-TX-ASYNC-WAIT"))
+      "R8152-TX-ASYNC-START" "R8152-TX-ASYNC-WAIT" "R8152-RX-PAUSE" "R8152-RX-RESUME"))
     ;; SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519 (net/crypto*.lisp):
     ;; what SSH, the SNP attestation and the isolated net domain call
     ("MODUS.CRYPTO" ("COMMON-LISP" "MODUS-INT")
@@ -101,7 +101,7 @@
           "SSH-DO-EVAL-EXPR" "SSH-HANDLE-CHANNEL-DATA"
           ;; for the USB NIC drivers: the DWC2 host controller and USB core
           ;; (net/dwc2.lisp, net/usb.lisp; a MODUS.USB package later)
-          "DWC2-INIT" "DWC2-READ" "DWC2-HCTSIZ" "DWC2-START-BULK-IN"
+          "DWC2-INIT" "DWC2-READ" "DWC2-HCTSIZ" "DWC2-HALT-CHANNEL" "DWC2-START-BULK-IN"
           "DWC2-POLL-BULK-IN" "DWC2-DELAY-MS" "USB-ENUMERATE"
           "USB-CONTROL-TRANSFER" "USB-GET-DESCRIPTOR" "USB-REQ-GET-DESCRIPTOR"
           "USB-BULK-SEND" "USB-BULK-RECEIVE" "USB-BULK-IN-EP" "USB-BULK-IN-MPS"

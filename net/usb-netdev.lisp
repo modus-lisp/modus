@@ -70,6 +70,15 @@
         (modus.net.r8152:r8152-rx-buf)
         (if (eq d 1) (modus.net.cdc:cdcether-rx-buf) (modus.net.cdc:cdc-rx-buf-addr)))))
 
+;; The HID hotplug scan's hub traffic must not run with the RTL8153's bulk-IN armed: the
+;; controller disabled its root port within seconds (net/r8152.lisp, R8152-RX-PAUSE).  So
+;; the scan pauses the receive of the adapter bound here.  CDC-ECM is not measured.
+(defun %hid-hub-traffic-begin ()
+  (if (eql (usb-netdev-get) 2) (modus.net.r8152:r8152-rx-pause) 0))
+(defun %hid-hub-traffic-end (token)
+  (when (eql (usb-netdev-get) 2) (modus.net.r8152:r8152-rx-resume token))
+  nil)
+
 (defun net-usb-probe ()
   (usb-netdev-set 0)
   ;; Bind markers use %serial-byte (proven in kernel-main), not

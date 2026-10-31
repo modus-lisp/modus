@@ -508,10 +508,23 @@
   (hid-put #x98 1)
   t)
 
+(declaim (overridable %hid-hub-traffic-begin %hid-hub-traffic-end))
+(defun %hid-hub-traffic-begin ()
+  "Before the scan talks to the hub: quiet whatever must not be busy meanwhile (a bound
+   network adapter's receive: net/usb-netdev.lisp).  A token for %HID-HUB-TRAFFIC-END."
+  0)
+(defun %hid-hub-traffic-end (token) token nil)
+
 (defun hid-hotplug-tick ()
   (let ((hub (hid-get #x00)))
     (when (and (> hub 0) (hid-time-reached-p (hid-get #x90)))
       (hid-put #x90 (logand (+ (hid-now) (hid-hotplug-period)) #x3FFF))
+      (let ((tok (%hid-hub-traffic-begin)))
+        (unwind-protect (%hid-hotplug-scan hub)
+          (%hid-hub-traffic-end tok))))))
+
+(defun %hid-hotplug-scan (hub)
+  (progn
       (when (= (hid-get #x98) 1)                ; a network adapter was bound since
         (hid-put #x98 0)
         (hid-reserve-high-speed-ports))
@@ -525,7 +538,7 @@
               (when (and (not (zerop (logand st 1))) (zerop (logand st #x400)))
                 (dwc2-delay-ms 100)
                 (hid-setup-port hub p (not (zerop (logand st #x200)))))))
-          (setq p (+ p 1)))))))
+          (setq p (+ p 1))))))
 
 (defun hid-split-poll ()
   ;; Poll the keyboard and the mouse once each, and the hub for hotplug -- unless another

@@ -357,6 +357,23 @@
          (when (zerop plen) (r8152-rearm))
          plen)))))
 
+;; Around the HID hotplug scan's hub traffic (net/usb-netdev.lisp binds these into it).
+;; With the bulk-IN armed, the scan's control transfers to the hub got the controller to
+;; disable its root port within seconds -- the NIC, the keyboard and the mouse all gone
+;; (HPRT0 0x100D -> 0x1809).  Measured on the Zero over 60 s with the scan running: the
+;; port went down in ~2 s; halting the bulk-IN for the scan's traffic and re-arming it
+;; after kept it up for the whole minute, frames still arriving.  A transfer halted part
+;; way loses what it held; TCP sends it again.
+(defun r8152-rx-pause ()
+  "Halt the bulk-IN if it is armed; 1 if it was (R8152-RX-RESUME re-arms it), else 0."
+  (if (zerop (mem-ref (+ (e1000-state-base) #x48) :u32))
+      (progn (dwc2-halt-channel 1) 1)
+      0))
+
+(defun r8152-rx-resume (paused)
+  (when (eql paused 1) (r8152-rearm))
+  nil)
+
 (defun r8152-receive ()
   (let* ((st (e1000-state-base))
          (n (r8152-next-in-aggregate st)))

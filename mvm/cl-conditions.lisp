@@ -113,6 +113,33 @@
               (return (cdr entry))))))
       (setq cur (cdr cur)))))
 
+(defun %condition-slot-set (cond slot-name value)
+  "Store VALUE in COND's slot SLOT-NAME (matched as %CONDITION-SLOT matches it),
+   adding the slot when the condition was made without it.  The writer that a
+   DEFINE-CONDITION :ACCESSOR or :WRITER defines."
+  (let ((nhash (and (symbolp slot-name) (not (null slot-name)) (not (eq slot-name t))
+                    (aref slot-name 0)))
+        (cur (%condition-slot-alist cond)))
+    (loop
+      (when (null cur)
+        (setf (aref cond 1) (cons (cons slot-name value) (aref cond 1)))
+        (return value))
+      (let ((entry (car cur)))
+        (when (consp entry)
+          (let ((k (car entry)))
+            (when (or (eq k slot-name)
+                      (and nhash (symbolp k) (not (null k)) (not (eq k t))
+                           (= (aref k 0) nhash)))
+              (setf (cdr entry) value)
+              (return value)))))
+      (setq cur (cdr cur)))))
+
+(defun %cond-install-writer (writer-name class-name slot-name)
+  "WRITER-NAME, a symbol or (SETF NAME), as a method on CLASS-NAME storing SLOT-NAME."
+  (%defmethod writer-name nil (list t class-name)
+              (lambda (nv c) (%condition-slot-set c slot-name nv)))
+  t)
+
 (defun %condition-all-parents (name)
   "Every ancestor type name of a condition type, itself first, in CLASS
    PRECEDENCE order (CLHS 4.3.5): (name) + C3-merge(L(p1) ... L(pn) (p1 ... pn)).

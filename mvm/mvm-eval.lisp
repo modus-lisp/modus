@@ -1144,12 +1144,23 @@
                           ;; the same call: a site whose callee did not exist
                           ;; when its page was built is bridged too
                           ;; (%JIT-RELOC-CALLS).
-                          (error (quote undefined-function)
-                                 ;; the SYMBOL, as the interpreter's NAME is:
-                                 ;; a handler asking CELL-ERROR-NAME which
-                                 ;; function to supply can do nothing with the
-                                 ;; table key string "PKG::SYM"
-                                 :name (%runtime-fn-name-symbol nm)))))))))))
+                          (%jit-bridge-undefined nm idx))))))))))
+
+(defun %jit-bridge-undefined (nm idx)
+  "Signal UNDEFINED-FUNCTION for bridge thunk IDX's callee NM, with SBCL's two
+   restarts: CONTINUE resolves the name again (a handler that has just defined
+   it resumes the call in place, nothing unwound and nothing re-run) and
+   USE-VALUE calls the function it is given instead.  Without them a handler
+   that could supply the function had only one move, unwinding and starting
+   its whole computation over."
+  (restart-case (error (quote undefined-function)
+                       :name (%runtime-fn-name-symbol nm))
+    (continue ()
+      :report "Retry calling the function."
+      (%jit-bridge-resolve idx))
+    (use-value (f)
+      :report "Call a function given in its place."
+      (if (functionp f) f (fdefinition f)))))
 ;; THE BRIDGE'S HIT, INLINE: a cached pair whose site is settled (patched, or
 ;; retired because the callee is a closure -- every runtime DEFCLASS accessor)
 ;; is the callee itself; anything else asks %JIT-BRIDGE-RESOLVE.

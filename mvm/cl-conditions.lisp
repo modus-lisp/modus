@@ -1712,6 +1712,19 @@
   (setq *current-condition* condition)
   (%hc-longjmp))
 
+(defun %rc-pass-on-condition (condition)
+  "A condition, not a restart transfer, came out of a RESTART-CASE body: ERROR
+   has already offered it to every handler there is, so send it on to the
+   next handler frame out instead of signalling it again (which ran each outer
+   HANDLER-BIND a second time, from a stack already unwound).  Re-signal only
+   when no outer frame is armed, so the toplevel still reports it.  Native, so
+   %ERROR-HANDLER-ACTIVE-P reads the real frame slot -- see COMPILE-RESTART-
+   CASE for why the bytecode expansion cannot ask this itself."
+  (setq *current-condition* condition)
+  (if (%error-handler-active-p)
+      (%hc-longjmp)
+      (error condition)))
+
 (defun %rc-clear-invoke ()
   "Clear the invoke handshake state after the bytecode restart-case handler
    has read the invoked restart + args and is about to run the clause body."

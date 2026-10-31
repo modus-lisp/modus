@@ -19050,7 +19050,31 @@
                       (= h 502453647)   ; GO
                       (= h 182681998)   ; UNWIND-PROTECT
                       (= h 44774594))   ; CATCH
-              (return cur)))
+              (return cur))
+            ;; HANDLER-BIND is not a macro but COMPILE-HANDLER-BIND puts its
+            ;; body in a thunk, so walk it as that thunk.  Seen raw, a
+            ;; RETURN-FROM or GO in the body read as same-unit, the target got
+            ;; no runtime catch frame, and the exit returned from the thunk
+            ;; instead: (block b (handler-bind (...) (return-from b 1)) 2) => 2,
+            ;; and a retry loop whose exit sits in a handler-bind body never
+            ;; left its LOOP.  Only a well-formed one: the walk also passes
+            ;; through data shaped like a call, and (SYMBOL-MACROLET
+            ;; ((HANDLER-BIND 17)) ...) hands it (HANDLER-BIND 17), whose
+            ;; rewrite errored inside the compiler.
+            (when (and (= h 49694955)   ; HANDLER-BIND
+                       (consp (cdr cur))
+                       (listp (cddr cur))
+                       (let ((bs (cadr cur)))
+                         (loop (cond ((null bs) (return t))
+                                     ((not (and (consp bs) (consp (car bs))
+                                                (consp (cdar bs))))
+                                      (return nil)))
+                               (setq bs (cdr bs)))))
+              (return
+                `(%with-handler-bind
+                  (list ,@(mapcar (lambda (b) `(%hb-handler-entry ',(car b) ,(cadr b)))
+                                  (cadr cur)))
+                  (lambda () ,@(cddr cur))))))
           (let ((r (%quiet-macroexpand-1 cur)))
             (if (and (consp r) (cdr r))
                 (progn (setq cur (car r)) (setq n (+ n 1)))
@@ -19209,11 +19233,9 @@
                     ;; ql http-fetch's with-connection lambda (whose
                     ;; expansion contains unwind-protect) lost its catch
                     ;; frame and the fetch loop never exited (task #278).
-                    (if in-fn
-                        (let ((cur (cdr form)))
-                          (loop while (consp cur) do (walk (car cur) in-fn)
-                                (setq cur (cdr cur))))
-                        (setq found t)))
+                    (let ((cur (cdr form)))
+                      (loop while (consp cur) do (walk (car cur) in-fn)
+                            (setq cur (cdr cur)))))
                    ((and in-fn (%form-op-is form 502453647 "GO"))
                     (setq found t))
                    ((%form-op-is form 80380232 "LAMBDA")

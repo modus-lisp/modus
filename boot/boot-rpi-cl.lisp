@@ -300,6 +300,18 @@
   (emit-rpi-cl-putc-imm buf 83 miniuart)    ; 'S'
   (emit-aarch64-u32 buf #x910003EA)         ; MOV X10,SP
   (emit-rpi-cl-puthex64 buf miniuart)
+  (emit-rpi-cl-putc-imm buf 32 miniuart)
+  ;; X30 -- who called: a jump through a bad function pointer leaves ELR at the
+  ;; garbage target (L0000000000000100) and nothing else to go on
+  (emit-rpi-cl-putc-imm buf 82 miniuart)    ; 'R'
+  (emit-aarch64-u32 buf #xAA1E03EA)         ; MOV X10,X30
+  (emit-rpi-cl-puthex64 buf miniuart)
+  (emit-rpi-cl-putc-imm buf 32 miniuart)
+  ;; MPIDR -- which core (Aff0): with threads, a fault on core 2 or 3 halts that core
+  ;; alone, and the REPL on core 0 carries on as if nothing happened
+  (emit-rpi-cl-putc-imm buf 67 miniuart)    ; 'C'
+  (emit-aarch64-u32 buf #xD53800AA)         ; MRS X10,MPIDR_EL1
+  (emit-rpi-cl-puthex64 buf miniuart)
   (emit-rpi-cl-putc-imm buf 10 miniuart)    ; '\n'
   (emit-aarch64-u32 buf #x14000000))        ; B .  — halt, do NOT resume
 

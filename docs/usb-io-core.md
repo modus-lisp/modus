@@ -232,49 +232,78 @@ least 5 s apart, so a bus that will not come back costs a bring-up every 5 s, no
 `(modus-int::usbe-test-disable-port)` disables the root port on purpose (PrtEna is
 write-1-to-disable), which is the failure, reproduced on demand.
 
-## The network service and SSH (net/net-service.lisp, net/ssh-inetd.lisp)
+## The network on the I/O core (net/io-net.lisp, net/net-service.lisp, net/ssh-inetd.lisp)
 
-On a threaded Pi SSH build, `(ssh-boot)` enumerates the tree, binds, starts the engine,
-then the network service and the SSH server on it -- and **returns**: the main thread is
-the REPL's again.  `MODUS_SSH_NETACTOR=1` keeps the old server (`net-actor-main` polling
-the NIC on the main thread, forever).  The three files are carried in the image as source
-and evaluated by `ssh-boot` the first time (they need CLOS and the SB-THREAD surface).
+**Core 0 is the Lisp system; core 1 is the I/O core.**  The network stack -- ARP, ICMP echo,
+IPv4, TCP, UDP -- runs on core 1 as one more step of the engine's loop (`ion-step`), so a busy
+evaluation on core 0 holds up only Lisp.  Measured on the Zero: 120 pings at 50 ms intervals
+during a 31 s busy loop on the main thread, 120/120 answered, 0.27 ms average.
 
-- **The service** is one core-0 thread that owns the NIC: it blocks on the engine's
-  receive head, runs `tcp-conns.lisp`'s connections, and never blocks on anything else
-  (core 0's "no blocking" policy).  An error ends the pass, not the service (`NETE`).
-  `(modus-int::net-service-status)`.
-- **The watchdog** thread logs every pause over the limit (`PAUS ms gcs ring-waiting`)
-  and restarts a dead service (`NETR`).
-- **inetd**: `(net-service-listen port spawn)` -- the service accepts each connection,
-  gives it a slot and a channel, and calls SPAWN, which starts a handler thread.
-  Messages: service -> handler `(:data bytes)` `(:close)` `(:result bytes)`; handler ->
-  service `(:send slot bytes)` `(:close slot)` `(:eval slot string)`.
-- **Evaluations run on the MAIN thread**, one at a time, while it waits at the console for
-  a key (`%bt-main-jobs`, called from `%console-idle`) -- as the old server's did, and as
-  kiln relies on: `(kiln-zero-main)` sent over SSH takes the main thread over.  They first
-  ran on core-0 threads of their own, and that is wrong today: **evaluation off the main
-  thread loses SETQs** -- `(let ((s 0)) (dotimes (i 3) (setq s (+ s 1))) s)` is 3 on main
-  and 0 on a core-0 thread -- and EVAL of a fresh form on a thread, even one main started,
-  wedged core 0.  (A closure compiled on main runs correctly on a thread; it is runtime
-  compilation off main that breaks.  Open.)  The cost: while main evaluates, core 0's other
-  threads, this service among them, wait until it sleeps, waits or finishes, so a busy
-  evaluation holds up the network (the watchdog logs it, `PAUS`).  And `ip.lisp`'s TCP,
-  polling the NIC from main inside an evaluation, lets core 0's threads run once on every
-  empty poll, or the service that fills its queue never ran (kiln's install fetch timed out).
-- **SSH sessions** (`ssh-serve`) run the whole protocol on cores 2-3 -- never core 1,
-  whose engine never yields -- one of four SSH blocks each.  Their waits are REAL TIME:
-  30 s for the client's version string, 60 s idle before authentication.  ssh.lisp counts
-  polls, and a poll here is a 10 ms channel wait, so its 50-poll version wait was 0.5 s:
-  a client further away than that, or QEMU's user network, was dropped right after its
-  KEXINIT (4 of 16 attempts in QEMU).
-- **Log shipping** (`net/kmsg-ship.lisp`): `(modus:kmsg-ship-to host [port 514])` sends the
-  message log as syslog over UDP from the service's shipper thread.
+| core | role | rule |
+|---|---|---|
+| 0 | the Lisp system: main (REPL, desk, SSH evaluations), anything that compiles, interns or sets globals; inetd's accept threads, the watchdog, log shipping | may block; only Lisp waits |
+| 1 | the I/O core: USB engine and network stack, one loop | never blocks, never allocates, never runs user code |
+| 2-3 | SSH sessions (protocol and crypto), the desk's screen and audio | own heaps, talk by channel or through the static block |
 
-Measured on the Zero: 4 concurrent SSH sessions; an outbound TCP client; log shipping;
-kiln's whole desk install (`kiln zero --netboot`: fetch, compile, `jit-eager`, start)
-through SSH evaluations, and the desk then up with the network (ping 0.75 ms avg) and
-SB-BSD-SOCKETS working from it.
+**The rules of core 1 are the engine's**: no allocation, no heap pointer held, no global set,
+no symbol, keyword or string literal; two-argument arithmetic only (`min`, `max` and
+three-argument `logior` take `&rest` and allocate).  The engine's allocating-pass counter
+stays 0 with the stack running.
+
+**The static block** (`ion-base`, 0x11800000, 8 MB) is a region no collector owns.  It holds
+words and bytes only -- no Lisp object, so nothing in it points anywhere -- and every core
+reads and writes it.  Each word has one writer: a client allocates a connection, listener
+or UDP port under the one lock (core 1 only ever *tries* it: a SYN that finds it held is
+dropped and sent again); everything else is single-producer, single-consumer.  Clients wait
+on one generation word core 1 bumps when anything changes.  **It survives a reset, and DRAM
+decays during one**: a reset left `0xAAAAAAAA` records that core 1 then served as
+connections, so the stack is on only if it was started in this boot (+0x60, as the engine's
++0x64).
+
+**TCP data stays in the block until it is read.**  Each connection has a 64 KB receive ring
+and a 64 KB send ring indexed by sequence number.  Core 1 copies a payload into the receive
+ring once and the reader copies it out once; a writer copies into the send ring once and
+core 1 segments -- and retransmits -- straight from it, so nothing is kept per segment.  The
+advertised window is the receive ring's free space.  One measured necessity beyond in-order
+receive: **data past one hole is kept** (written where it belongs, the range remembered).
+The builder bursts up to 8 KB and a segment goes missing now and then; a capture showed what
+dropping everything after the hole does -- duplicate ACKs, and the sender (no SACK here)
+recovering one segment at a time.
+
+**It stays out of keyboard and mouse transactions.**  A split's complete-split has a window
+of a few microframes; a network pass of up to 1.5 ms in the middle of one made it miss --
+99 failures over a 5 MB transfer.  `ion-step` does nothing during a round (the receive is
+paused for it anyway) and ACKs once per connection per pass: 0 failures.
+
+**The API** is `tcp-conns.lisp`'s, unchanged for its callers: `tcpc-open` / `-read` /
+`-write` / `-close` / `-listen` / `-accept` and `udp-open` / `-send-to` / `-recv` /
+`-close` delegate to `ion-*` once the stack is on, so `bare-sockets` (SB-BSD-SOCKETS) and kiln
+work as before.  Loopback pairs stay in `tcp-conns`.  What core 1 does not take -- ARP
+replies, broadcasts, DHCP, TCP for no connection of its own -- goes to a **legacy ring**
+that `modus.net:nic-receive` reads, so `ip.lisp`'s one-connection TCP and its HTTP client
+work unchanged (the installer's fetch uses it).
+
+**Core 0's side** (`net-service.lisp`): inetd -- `(net-service-listen port spawn)` blocks a
+core-0 thread on the port and hands each connection to the handler SPAWN starts, which
+reads and writes it directly (no relay); evaluations on the main thread
+(`net-service-eval`, drained from the console's wait); the watchdog (`PAUS` when core 0 is
+held); log shipping.
+
+**SSH** (`ssh-serve`) runs each session on core 2 or 3, its waits in real time (30 s for the
+client's version, 60 s idle before authentication; ssh.lisp's 50-poll version wait was 0.5 s
+and dropped any slower client right after its KEXINIT).  A session lets the client hang up
+first: a FIN that overtook its DISCONNECT read as "closed by remote host".
+
+**Evaluations run on the main thread**, one at a time, while it waits at the console for a
+key -- as the old server's did, and as kiln relies on (`(kiln-zero-main)` over SSH takes the
+main thread over).  Off the main thread, evaluation is wrong today: `(let ((s 0)) (dotimes
+(i 3) (setq s (+ s 1))) s)` is 3 on main and 0 on a core-0 thread, and EVAL of a fresh form
+on a thread wedged core 0 (open).  So an SSH command waits while main is busy.
+
+Measured on the Zero (`ion-hw.sh`): SSH 6/6 one-shot, interactive, 4 concurrent; 4 MB in
+in 1.1 s with a position-weighted checksum matching 3/3; 1 MB out in 0.5 s, byte-exact;
+UDP in and out; ping 0.2-0.3 ms average; 0 retransmits, 0 keyboard/mouse failures, 0
+allocating passes.
 
 ## The QEMU rig (/home/claude/qemu-zero)
 

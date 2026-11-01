@@ -232,7 +232,7 @@
 ;;; A failure that repeats must not wash its own beginning out of the log (measured: a
 ;;; dead bus logged a slow hub scan every 0.5 s and the ring lost the moment it died).
 ;;; Kind K (0..7) counts its occurrences at +0xE0+4K; the first 8 are logged, then every
-;;; 256th, with the count as the third word.  (+0x80..+0xCF is the per-service profile.)
+;;; 256th, with the count as the third word.  (+0x80..+0xDF is the per-service profile.)
 (defun usbe-log-limited (k level tag a b)
   (let* ((off (+ #xE0 (* 4 (logand k 7)))) (n (+ (usbe-get off) 1)))
     (usbe-put off n)
@@ -712,7 +712,7 @@
     (kmsg-event 2 #x54534554 p (dwc2-read (dwc2-hprt0)) (dwc2-hprt0-mask))   ; 'TEST'
     p))
 
-;;; ---- per-service accounting: +0x80 + 16*K for K = rx tx port hid hotplug -----------
+;;; ---- per-service accounting: +0x80 + 16*K for K = rx tx port hid hotplug net -------
 ;;; +0 counter ticks / 16 spent in it, +4 calls, +8 calls that moved the allocation
 ;;; pointer, +12 the largest single call (ticks / 16)
 (defun usbe-measure (k t0 a0)
@@ -727,7 +727,7 @@
 (defun usbe-profile ()
   "Per service: (name ms-total calls allocating-calls max-ms)."
   (let ((acc nil) (k 0) (tick-ms (/ (max 1 (cntfrq)) 16000.0)))
-    (dolist (name '(:rx :tx :port :hid :hotplug))
+    (dolist (name '(:rx :tx :port :hid :hotplug :net))
       (let ((b (+ #x80 (* 16 k))))
         (push (list name (/ (usbe-get b) tick-ms) (usbe-get (+ b 4)) (usbe-get (+ b 8))
                     (/ (usbe-get (+ b 12)) tick-ms))
@@ -771,6 +771,10 @@
         (setq t0 (usbe-measure 0 t0 a0)) (setq a0 (get-alloc-ptr))
         (setq work (+ work (usbe-tx-service)))
         (setq t0 (usbe-measure 1 t0 a0)) (setq a0 (get-alloc-ptr))
+        ;; the network stack, once it is on this core (net/io-net.lisp): the frames the
+        ;; receive just brought, then each connection's sends and timers
+        (setq work (+ work (ion-step)))
+        (setq t0 (usbe-measure 5 t0 a0)) (setq a0 (get-alloc-ptr))
         (usbe-hid-step)
         (setq t0 (usbe-measure 3 t0 a0)) (setq a0 (get-alloc-ptr))
         (usbe-hotplug-service)

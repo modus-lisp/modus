@@ -9,7 +9,7 @@
 ;; construction and used to sit out a whole IO-DELAY (1.5 ms per segment).
 ;; True when a transfer is ready, NIL on timeout.
 (defun net-rx-idle ()
-  (if (usbe-running-p) (usbe-rx-wait)
+  (if (usbe-running-p) (if (ion-on-p) (ion-legacy-wait) (usbe-rx-wait))
   (let ((i 0))
     (loop
       (when (>= i 5000) (return nil))

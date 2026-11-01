@@ -97,7 +97,7 @@
       (%bs-flush b)
       (let ((c (bs-conn b))) (when (typep c 'tcp-conn) (tcpc-close c)))
       (when (bs-listener b) (setq *tcp-listeners* (remove (bs-listener b) *tcp-listeners*)))
-      (when (eq (bs-kind b) :datagram) (setq *udp-ports* (remove (bs-lport b) *udp-ports* :key #'car)))
+      (when (eq (bs-kind b) :datagram) (udp-close (bs-lport b)))
       (with-net-lock (remhash fd *bsocks*)))
     0))
 
@@ -176,9 +176,9 @@
     (if (null b) -9
         (let ((ready (lambda ()
                        (let ((c (bs-conn b)))
-                         (cond ((bs-listener b) (tl-ready (bs-listener b)))
-                               ((eq (bs-kind b) :datagram) (cdr (assoc (bs-lport b) *udp-ports*)))
-                               ((typep c 'tcp-conn) (or (> (fill-pointer (tc-rx c)) 0) (tc-rx-eof c)))
+                         (cond ((bs-listener b) (tcpc-acceptable-p (bs-listener b)))
+                               ((eq (bs-kind b) :datagram) (udp-readable-p (bs-lport b)))
+                               ((typep c 'tcp-conn) (tcpc-readable-p c))
                                (t t))))))
           (if (%pump-until ready (if (< ms 0) 86400000 ms)) 1 0)))))
 
@@ -294,7 +294,7 @@
              (when r
                (let ((ip (ignore-errors (%dns-first-a (third r)))))
                  (when ip (return ip))))))
-      (setq *udp-ports* (remove lport *udp-ports* :key #'car)))))
+      (udp-close lport))))
 
 ;;; THE DATE.  A board has no RTC: GET-UNIVERSAL-TIME counts from boot until something sets it
 ;;; (SET-UNIVERSAL-TIME, mvm/build-cl-repl-common.lisp), and a TLS handshake, a Nostr event's
@@ -318,7 +318,7 @@
                    (let ((ut (logior (ash (aref v 40) 24) (ash (aref v 41) 16)
                                      (ash (aref v 42) 8) (aref v 43))))
                      (when (> ut 0) (return ut))))))
-          (setq *udp-ports* (remove lport *udp-ports* :key #'car)))))))
+          (udp-close lport))))))
 
 (defun bare-set-clock (&rest args)
   "Set the board's date from SNTP (BARE-NTP-TIME's arguments).  The universal time, or NIL."

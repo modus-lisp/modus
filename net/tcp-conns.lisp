@@ -22,6 +22,11 @@
 ;;;; it serves, an admission client to the admission service beside it.  Both ends belong to the
 ;;;; one thread that owns every connection (above), so nothing here races.
 ;;;;
+;;;; ON THE I/O CORE (net/io-net.lisp): once the USB engine runs the network (ION-ON-P), every
+;;;; call here is the I/O core's -- a TCP-CONN carries its connection HANDLE, a listener its
+;;;; index, a UDP port is bound there -- and nothing below reads the NIC.  Loopback pairs stay
+;;;; here.  What follows is the stack for an image without the I/O core.
+;;;;
 ;;;; ANY THREAD MAY RUN THE NETWORK, ONE STEP AT A TIME.  The connection table, the UDP queues,
 ;;;; the receive buffers and the NIC's receive ring (one consumer) are guarded by *NET-LOCK*, a
 ;;;; recursive lock taken for one pump step or one connection operation; a blocking wait
@@ -58,11 +63,22 @@
    (peer-window :initform 65535 :accessor tc-peer-window)
    (listener :initform nil :initarg :listener :accessor tc-listener)
    ;; the other end of a LOOPBACK connection (above), or NIL for one over the network
-   (peer :initform nil :accessor tc-peer)))
+   (peer :initform nil :accessor tc-peer)
+   ;; its handle on the I/O core (net/io-net.lisp), or NIL
+   (ion :initform nil :initarg :ion :accessor tc-ion)))
 
 (defclass tcp-listener ()
   ((port :initarg :port :accessor tl-port)
-   (ready :initform nil :accessor tl-ready)))
+   (ready :initform nil :accessor tl-ready)
+   (ion :initform nil :initarg :ion :accessor tl-ion)))
+
+(defun %ion-p () (and (fboundp 'ion-on-p) (ion-on-p)))
+
+(defun %tcpc-wrap (h)
+  "A TCP-CONN for I/O-core connection H."
+  (multiple-value-bind (rip rport lport) (ion-peer h)
+    (make-instance 'tcp-conn :lport lport :rip rip :rport rport :snd-nxt 0
+                             :state :established :ion h)))
 
 (defmethod print-object ((c tcp-conn) s)
   (format s "#<TCP ~D -> ~D.~D.~D.~D:~D ~A>" (tc-lport c)
@@ -238,11 +254,11 @@
           (setf (svref u 3) now (svref u 4) (min 4000 (* 2 (svref u 4))) (svref u 5) (+ 1 (svref u 5))))))
     (setf *tcp-conns* (remove :closed *tcp-conns* :key #'tc-state))))
 
-;;; THE NETWORK SERVICE (net/net-service.lisp), when it runs, is the only reader of the NIC:
-;;; one core-0 thread takes every frame and hands it to its connection.  Then NET-PUMP takes
-;;; nothing, and a wait (%PUMP-UNTIL) sleeps until the service's next delivering pass -- the
-;;; generation word it bumps -- instead of pumping.  These live HERE, not in the service's file,
-;;; so that a copy of this file loaded again (kiln zero carries one) agrees with the service.
+;;; WHEN SOMETHING ELSE OWNS THE NIC, NET-PUMP takes nothing and a wait (%PUMP-UNTIL) sleeps on
+;;; the owner's generation word instead of pumping: the I/O core's stack (net/io-net.lisp,
+;;; ION-ON-P), or the older core-0 network service (*NS-THREAD*, kept for images and copies of
+;;; this file that still have it).  These live HERE so that a copy of this file loaded again
+;;; (kiln zero carries one) agrees with whichever runs.
 (defvar *ns-thread* nil "The network service's thread while it runs, else NIL.")
 (defun %ns-gen-addr () #x11030800)          ; u32 (raw: the waiters may be on any core)
 (defun %ns-gen () (mem-ref (%ns-gen-addr) :u32))
@@ -256,7 +272,7 @@
   "Take up to MAX frames off the NIC and give each to its connection or port; then
    retransmit what is overdue.  The number of frames taken -- none while the network
    service runs: it owns the NIC."
-  (if *ns-thread* 0 (with-net-lock (%net-pump-1 max))))
+  (if (or *ns-thread* (%ion-p)) 0 (with-net-lock (%net-pump-1 max))))
 
 (defun %net-pump-1 (max)
   (let ((n 0) (me (%our-ip)))
@@ -292,9 +308,9 @@
         (when v (return v))
         (let ((left (- end (%now-ms))))
           (when (< left 0) (return nil))
-          (if *ns-thread*
-              (%ns-wait (%ns-gen-addr) g (max 1 (min left 50)))
-              (when (zerop (net-pump)) (%net-idle))))))))
+          (cond ((%ion-p) (%ion-wait (ion-get #x10) (max 1 (min left 50))))
+                (*ns-thread* (%ns-wait (%ns-gen-addr) g (max 1 (min left 50))))
+                (t (when (zerop (net-pump)) (%net-idle)))))))))
 
 (defun %net-idle ()
   "Nothing arrived: let this core's other threads run (net/bare-threads.lisp's BT-YIELD --
@@ -330,6 +346,9 @@
   "A connection to IP:PORT, established, or NIL."
   (when (%loopback-ip-p ip)
     (return-from tcpc-open (%tcpc-open-loopback ip port)))
+  (when (%ion-p)
+    (return-from tcpc-open
+      (let ((h (ion-open ip port :timeout-ms timeout-ms))) (and h (%tcpc-wrap h)))))
   (let ((c (make-instance 'tcp-conn :lport (+ 49152 (setq *tcp-port-next* (logand (+ *tcp-port-next* 1) #x3FFF)))
                           :rip ip :rport port :state :syn-sent
                           :snd-nxt (logand (* 2654435761 (+ (%now-ms) *tcp-port-next*)) #xFFFFFFFF))))
@@ -344,6 +363,8 @@
 
 (defun tcpc-write (c data &key (start 0) end (timeout-ms 10000))
   "Send DATA[START, END) on C, segment by segment, keeping at most 32 KB unacknowledged."
+  (when (tc-ion c)
+    (return-from tcpc-write (ion-write (tc-ion c) data :start start :end end :timeout-ms timeout-ms)))
   (when (tc-peer c)
     ;; LOOPBACK: straight into the other end's receive buffer
     (let ((p (tc-peer c)) (end (or end (length data))))
@@ -376,6 +397,8 @@
    has closed and everything is read; an empty vector on timeout.  With INTO, an octet
    vector of at least MAX, the bytes go there and the answer is their count (0 on timeout):
    a socket read then allocates nothing."
+  (when (tc-ion c)
+    (return-from tcpc-read (ion-read (tc-ion c) :max max :timeout-ms timeout-ms :into into)))
   (%pump-until (lambda () (or (> (fill-pointer (tc-rx c)) 0) (tc-rx-eof c))) timeout-ms)
   (with-net-lock
     (let* ((rx (tc-rx c)) (have (fill-pointer rx)))
@@ -399,6 +422,10 @@
 
 (defun tcpc-close (c &key (timeout-ms 2000))
   "Send FIN and wait (briefly) for it to be acknowledged."
+  (when (tc-ion c)
+    (ion-close (tc-ion c) :timeout-ms timeout-ms)
+    (setf (tc-state c) :closed)
+    (return-from tcpc-close t))
   (when (tc-peer c)
     ;; LOOPBACK: the other end reads EOF once it has read what was written
     (with-net-lock (setf (tc-rx-eof (tc-peer c)) t (tc-state c) :closed))
@@ -414,18 +441,39 @@
 (defun tcpc-listen (port)
   (with-net-lock
   (or (find port *tcp-listeners* :key #'tl-port)
-      (let ((l (make-instance 'tcp-listener :port port))) (push l *tcp-listeners*) l))))
+      (let ((l (make-instance 'tcp-listener :port port :ion (and (%ion-p) (ion-listen port)))))
+        (push l *tcp-listeners*) l))))
+
+(defun tcpc-acceptable-p (l)
+  (or (tl-ready l) (and (tl-ion l) (ion-acceptable-p (tl-ion l)))))
 
 (defun tcpc-accept (l &key (timeout-ms 5000))
-  "The next established connection to listener L, or NIL."
-  (when (%pump-until (lambda () (tl-ready l)) timeout-ms)
-    (with-net-lock (pop (tl-ready l)))))
+  "The next established connection to listener L (a loopback one first), or NIL."
+  (when (%pump-until (lambda () (tcpc-acceptable-p l)) timeout-ms)
+    (or (with-net-lock (pop (tl-ready l)))
+        (let ((h (and (tl-ion l) (ion-accept (tl-ion l) :timeout-ms 0))))
+          (and h (%tcpc-wrap h))))))
+
+(defun tcpc-readable-p (c)
+  "A read of C will not wait: data, or its peer has finished."
+  (if (tc-ion c)
+      (ion-readable-p (tc-ion c))
+      (or (> (fill-pointer (tc-rx c)) 0) (tc-rx-eof c))))
 
 (defun udp-open (port)
   (with-net-lock (or (assoc port *udp-ports*) (car (push (list port) *udp-ports*))))
+  (when (%ion-p) (ion-udp-bind port))
   port)
 
+(defun udp-close (port)
+  (with-net-lock (setq *udp-ports* (remove port *udp-ports* :key #'car)))
+  (when (%ion-p) (ion-udp-unbind port)))
+
+(defun udp-readable-p (port)
+  (if (%ion-p) (ion-udp-readable-p port) (cdr (assoc port *udp-ports*))))
+
 (defun udp-send-to (ip port lport data &optional (n (length data)))
+  (when (%ion-p) (return-from udp-send-to (ion-udp-send ip port lport data n)))
   (with-net-lock
   (let* ((len (+ 8 n)) (seg (make-array len :initial-element 0)))
     (%put16 seg 0 lport) (%put16 seg 2 port) (%put16 seg 4 len)
@@ -435,6 +483,7 @@
 
 (defun udp-recv (port &key (timeout-ms 1000))
   "(ip port bytes) for the oldest datagram to PORT, or NIL."
+  (when (%ion-p) (return-from udp-recv (ion-udp-recv port :timeout-ms timeout-ms)))
   (let ((q (assoc port *udp-ports*)))
     (when (%pump-until (lambda () (cdr q)) timeout-ms)
       (with-net-lock (pop (cdr q))))))

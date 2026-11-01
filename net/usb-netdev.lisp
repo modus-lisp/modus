@@ -63,14 +63,14 @@
 
 (defun usb-nic-receive ()
   (let ((d (usb-netdev-get)))
-    (if (usbe-running-p) (usbe-receive)
+    (if (usbe-running-p) (if (ion-on-p) (ion-legacy-receive) (usbe-receive))
     (if (eq d 2)
         (modus.net.r8152:r8152-receive)
         (if (eq d 1) (modus.net.cdc:cdcether-receive) 0)))))
 
 (defun usb-nic-rx-buf ()
   (let ((d (usb-netdev-get)))
-    (if (usbe-running-p) (usbe-rx-buf)
+    (if (usbe-running-p) (if (ion-on-p) (ion-legacy-rx-buf) (usbe-rx-buf))
     (if (eq d 2)
         (modus.net.r8152:r8152-rx-buf)
         (if (eq d 1) (modus.net.cdc:cdcether-rx-buf) (modus.net.cdc:cdc-rx-buf-addr))))))

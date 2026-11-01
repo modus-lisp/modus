@@ -1753,6 +1753,9 @@
             ;; keyboard, mouse and network adapter wherever they are; the I/O core's
             ;; recovery and SSH-BOOT enumerate through it
             (%rpi-net-text "usb-tree.lisp")      (string #\Newline)
+            ;; the network stack on the I/O core: ARP, ICMP, IP, TCP, UDP in a static block,
+            ;; run by the engine's loop once ION-START hands it the network
+            (%rpi-net-text "io-net.lisp")        (string #\Newline)
             ;; ... and its engine's start/stop, which need bare threads
             (if (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
                   (and v (> (length v) 0) (string/= v "0")))

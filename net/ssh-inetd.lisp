@@ -1,17 +1,17 @@
-;;;; ssh-inetd.lisp - the SSH server as a client of the network service.
+;;;; ssh-inetd.lisp - the SSH server as an inetd client of the network service.
 ;;;;
-;;;; The service (net/net-service.lisp) listens on port 22 and accepts; each connection gets a
-;;;; SESSION thread on cores 1..3 that runs the whole SSH protocol (key exchange, host-key
-;;;; signature, ciphers, channels: net/ssh.lisp) in its own core's heap and talks to the
-;;;; network only through its slot's channel.  Commands are evaluated on the main thread
-;;;; ((:eval ...), net/net-service.lisp), in turn with the serial REPL, as the old server did.
-;;;; The protocol and its crypto run here, so the main thread is free between commands.
+;;;; The network service (net/net-service.lisp) accepts on port 22 and hands each connection to
+;;;; a SESSION thread on cores 2..3 (never core 1: the I/O core runs the network and the USB
+;;;; engine and never yields).  The session runs the whole SSH protocol (key exchange, host-key
+;;;; signature, ciphers, channels: net/ssh.lisp) in its own core's heap and reads and writes its
+;;;; connection directly in the I/O core's static block (net/io-net.lisp ION-READ / ION-WRITE):
+;;;; no relay, no channel for the bytes.  Commands are evaluated on the MAIN thread
+;;;; (NET-SERVICE-EVAL), in turn with the serial REPL, as the old server did.
 ;;;;
-;;;; This is net/isolated-cl.lisp's session half (its net domain was net-actor-main on the
-;;;; main thread, polling the NIC): the same per-session words in the SSH block --
-;;;; +0x3F80/+0x3FA0 the session's own X25519 pair, +0x3FC8 "the peer has gone", +0x3FCC
-;;;; "the session is over" -- and +0x3FD0 the service slot it is served on.  The SSH block
-;;;; is chosen by connection slot (conn-ssh K, K = 0..3), one per live session.
+;;;; This is net/isolated-cl.lisp's session half: the same per-session words in the SSH block --
+;;;; +0x3F80/+0x3FA0 the session's own X25519 pair, +0x3FC8 "the peer has gone", +0x3FCC "the
+;;;; session is over" -- and +0x3FD0 the service slot it is served on, +0x3FD4 its connection
+;;;; handle.  The SSH block is chosen by connection slot (conn-ssh K, K = 0..3), one per session.
 ;;;;
 ;;;; Loaded after net/net-service.lisp.   (modus-int::ssh-serve)
 
@@ -23,7 +23,6 @@
 
 (defun %sd-slot-addr (ssh) (+ ssh #x3FD0))
 (defun %sd-k (ssh) (ash (- ssh #x20 (ssh-conn-base)) -14))
-(defun %sd-to-service (msg) (%ns-send *ns-to-service* msg))
 (defun %sd-me () (percpu-ref 16))
 
 ;; What every other caller keeps getting: the definitions in force when this file loaded
@@ -48,29 +47,33 @@
       (funcall *sd-old-tcp-send-conn* cb data len)
       (%sd-tcp-send-conn cb data len)))
 
+(defun %sd-handle (ssh) (mem-ref (+ ssh #x3FD4) :u32))
+
 (defun %sd-tcp-send-conn (cb data len)
-  (when (> len 0)
-    (%sd-to-service (list :send (mem-ref (%sd-slot-addr (+ cb #x20)) :u32) (%sd-bytes data len))))
+  (when (> len 0) (ion-write (%sd-handle (+ cb #x20)) data :end len))
   0)
 
-(defun %sd-take (ssh msg)
-  "Apply one message from the service to this session.  0 = the peer is gone."
-  (case (car msg)
-    (:data (let* ((v (cadr msg)) (n (length v)) (blen (mem-ref (+ ssh #x6D4) :u32)))
-             (dotimes (i n) (setf (mem-ref (+ ssh #x6D8 blen i) :u8) (aref v i)))
-             (setf (mem-ref (+ ssh #x6D4) :u32) (+ blen n))
-             1))
-    (:close (setf (mem-ref (+ ssh #x3FC8) :u32) 1) 0)
-    (t 1)))
-
-(defun %sd-channel (ssh) (svref *ns-slot-ch* (mem-ref (%sd-slot-addr ssh) :u32)))
+(defun %sd-channel (ssh) (net-service-slot-channel (mem-ref (%sd-slot-addr ssh) :u32)))
 
 (defun %sd-old (i) (svref *sd-old-seams* i))
 
+(defvar *sd-rxbufs* (let ((v (make-array 4)))
+                      (dotimes (i 4 v) (setf (svref v i) (make-array 4096 :element-type '(unsigned-byte 8))))))
+
 (defun %sd-wait-data (ssh)
+  "Bytes from the peer into the SSH receive buffer (4 KB at +0x6D8): 1 to keep waiting, 0 when
+   the peer has gone."
   (if (not (%sd-session-p)) (funcall (%sd-old 0) ssh)
-  (let ((m (funcall *ns-chan-recv* (%sd-channel ssh) :timeout 0.01)))
-    (if (null m) 1 (%sd-take ssh m)))))
+  (let* ((blen (mem-ref (+ ssh #x6D4) :u32)) (room (- 4096 blen)))
+    (if (<= room 0)
+        1
+        (let* ((buf (svref *sd-rxbufs* (%sd-k ssh)))
+               (n (ion-read (%sd-handle ssh) :max room :timeout-ms 10 :into buf)))
+          (cond ((eq n :eof) (setf (mem-ref (+ ssh #x3FC8) :u32) 1) 0)
+                ((zerop n) 1)
+                (t (dotimes (i n) (setf (mem-ref (+ ssh #x6D8 blen i) :u8) (aref buf i)))
+                   (setf (mem-ref (+ ssh #x6D4) :u32) (+ blen n))
+                   1)))))))
 
 (defun %sd-peer-closed-p ()
   (if (not (%sd-session-p)) (funcall (%sd-old 4))
@@ -122,13 +125,13 @@
 (defun %sd-eval-line (ssh cmd cmd-len)
   (let ((s (make-string cmd-len)) (slot (mem-ref (%sd-slot-addr ssh) :u32)))
     (dotimes (i cmd-len) (setf (aref s i) (code-char (aref cmd i))))
-    (%sd-to-service (list :eval slot s))
+    (net-service-eval slot s)
     (let ((reply nil))
       (loop
         (when reply (return))
+        (when (= (mem-ref (+ ssh #x3FC8) :u32) 1) (return-from %sd-eval-line nil))
         (let ((m (funcall *ns-chan-recv* (%sd-channel ssh) :timeout 1)))
-          (when m
-            (if (eq (car m) :result) (setq reply (cadr m)) (%sd-take ssh m)))))
+          (when (and m (eq (car m) :result)) (setq reply (cadr m)))))
       (modus.ssh::ssh-send-string ssh reply (length reply)))))
 
 ;;; ---- a session ----------------------------------------------------------------------
@@ -145,16 +148,22 @@
               (dotimes (i 32) (setf (mem-ref (+ ssh #x3FA0 i) :u8) (aref pub i)))))
           (modus.ssh::ssh-handle-connection ssh))
       (error (c) (handler-case (kmsg 3 "SSHE" (princ-to-string c)) (error () nil))))
-    (%sd-to-service (list :close (mem-ref (%sd-slot-addr ssh) :u32)))
+    ;; Let the client hang up first: it answers our CHANNEL_CLOSE with its own and a
+    ;; DISCONNECT, and a FIN that overtakes them reads as "closed by remote host" to it.
+    (let ((h (%sd-handle ssh)) (end (+ (%bt-ticks) (%bt-ms-ticks 2000))))
+      (loop (when (or (eq (ion-read h :max 4096 :timeout-ms 100 :into (svref *sd-rxbufs* k)) :eof)
+                      (> (%bt-ticks) end))
+              (return)))
+      (ion-close h))
     (kmsg-event 1 "SSHX" k (mem-ref (%sd-slot-addr ssh) :u32) 0)
+    (net-service-slot-done (mem-ref (%sd-slot-addr ssh) :u32))
     (setf (svref *sd-conn-slot* k) -1)                 ; the block is free again
     (setf (svref *sd-threads* (%sd-me)) -1)
     :done))
 
-(defun %sd-spawn (slot ch)
-  "The service's SPAWN for port 22: an SSH block, then a session on cores 1..3.  NIL when
-   all four blocks are busy."
-  (declare (ignore ch))
+(defun %sd-spawn (h slot)
+  "The service's SPAWN for port 22, for connection H: an SSH block, then a session on cores
+   2..3.  NIL when all four blocks are busy."
   (let ((k (dotimes (i 4 nil) (when (< (svref *sd-conn-slot* i) 0) (return i)))))
     (unless k (kmsg-event 2 "SSHR" slot 0 0))
     (when k
@@ -163,13 +172,14 @@
         (ssh-copy-host-key k)
         (dolist (off '(#x00 #x04 #x08 #x0C #x10 #x28 #x150 #x154 #x6D4 #x3FC8 #x3FCC))
           (setf (mem-ref (+ ssh off) :u32) 0))
-        (setf (mem-ref (+ ssh #x2C) :u32) (logand (+ (* slot 7919) (%ns-gen)) #xFFFFFFFF))
+        (setf (mem-ref (+ ssh #x2C) :u32) (logand (+ (* slot 7919) (rdtsc)) #xFFFFFFFF))
         (setf (mem-ref (%sd-slot-addr ssh) :u32) slot)
+        (setf (mem-ref (+ ssh #x3FD4) :u32) h)
         ;; the session's ephemeral private key: drawn here, from the server's DRBG
         (dotimes (i 32) (setf (mem-ref (+ ssh #x3F80 i) :u8) (modus.ssh::ssh-random ssh))))
-      ;; Not core 1 while the USB I/O core runs there: its engine never gives the core up, so
-      ;; a session started on it never ran (2 of 4 concurrent sessions, on the Zero).
-      (bt-pin-next (if (%ns-engine-p) (+ 2 (mod slot 2)) (%bt-least-loaded-core)))
+      ;; Not core 1: the I/O core never gives the core up, so a session started on it never
+      ;; ran (2 of 4 concurrent sessions, on the Zero).
+      (bt-pin-next (+ 2 (mod slot 2)))
       (let ((kk k))
         (sb-thread:make-thread (lambda () (%sd-session kk)) :name "ssh session")))))
 

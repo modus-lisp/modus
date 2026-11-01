@@ -3015,8 +3015,8 @@
                        ;; what this image is (lib/configuration.lisp), and the bare-metal
                        ;; message log (lib/bare-log.lisp)
                        "IMAGE-CONFIGURATION"
-                       "KLOG" "KLOG-EVENT" "KLOG-DUMP" "KLOG-RECORDS" "KLOG-STATUS"
-                       "KLOG-ECHO-LEVEL")))
+                       "KMSG" "KMSG-EVENT" "KMSG-DUMP" "KMSG-RECORDS" "KMSG-STATUS"
+                       "KMSG-ECHO-LEVEL" "KMSG-SHIP-TO" "KMSG-SHIP-STATUS")))
       (let ((sym (intern n int)))
         (import sym modus)
         (export sym modus)))

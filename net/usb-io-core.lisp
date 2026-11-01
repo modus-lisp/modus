@@ -125,8 +125,8 @@
    the control block (IO-REPORT)."
   ;; CORE must be where this runs: the probe arms THIS core's timer but routes CORE's
   ;; timer and the GPU interrupt, so on any other core nothing would ever end the WFI.
-  (unless (= core (%klog-core))
-    (klog-event 3 "IOWK" core (%klog-core) -1)
+  (unless (= core (%kmsg-core))
+    (kmsg-event 3 "IOWK" core (%kmsg-core) -1)
     (return-from io-wake-probe -1))
   (dotimes (i 16) (io-put (* 4 i) 0))
   (io-put 0 #x494F4331)
@@ -136,7 +136,7 @@
   (let* ((per-ms (max 1 (truncate (cntfrq) 1000)))
          (end (+ (rdtsc) (* ms per-ms))))
     (io-put #x30 per-ms)
-    (klog-event 1 "IOWK" core ms (io-get #x2C))
+    (kmsg-event 1 "IOWK" core ms (io-get #x2C))
     (io-put 8 1)
     (setup-irq)
     (loop
@@ -158,7 +158,7 @@
               ((logtest src 8) (io-inc #x18))
               (t (io-inc #x1C)))))
     (io-put 8 0)
-    (klog-event 1 "IOWK" (io-get #x10) (io-get #x14) (io-get #x18))
+    (kmsg-event 1 "IOWK" (io-get #x10) (io-get #x14) (io-get #x18))
     (io-get #x10)))
 
 (defun io-report ()
@@ -203,7 +203,7 @@
 ;;; every pass (+0x48 counts passes on which it moved; it must stay 0).
 ;;;
 ;;; BLOCK at USBE-BASE (0x11500000, Normal-WB RAM -- not cleared at boot, so "running"
-;;; means running in THIS boot: +0x64 holds the klog boot number it started under):
+;;; means running in THIS boot: +0x64 holds the kmsg boot number it started under):
 ;;;   +0x00 'USBE'  +0x04 state (1 running, 2 stopping, 3 stopped)  +0x08 stop request
 ;;;   +0x0C core    +0x10 passes  +0x14 sleeps  +0x18 RX transfers  +0x1C RX frames
 ;;;   +0x20 RX ring full (frames dropped)  +0x24 RX errors  +0x28 TX frames
@@ -223,14 +223,14 @@
 (defun usbe-rx-slot (i) (+ (usbe-base) #x2000 (* (logand i 127) #x800)))
 (defun usbe-tx-ring (c) (+ (usbe-base) #x50000 (* (logand c 3) #x11000)))
 
-;; klog tags as numbers (a string is a heap object): 'USBE' 'RXER' 'TXER' 'PORT' 'CONS'
+;; kmsg tags as numbers (a string is a heap object): 'USBE' 'RXER' 'TXER' 'PORT' 'CONS'
 (defun %t-usbe () #x45425355)
 (defun %t-rxer () #x52455852)
 (defun %t-txer () #x52455854)
 (defun %t-port () #x54524F50)
 (defun %t-cons () #x534E4F43)
 
-(defun %usbe-boot () (let ((b (%klog-base))) (if (zerop b) 0 (mem-ref (+ b 8) :u32))))
+(defun %usbe-boot () (let ((b (%kmsg-base))) (if (zerop b) 0 (mem-ref (+ b 8) :u32))))
 (defun usbe-running-p ()
   (and (= (usbe-get 0) #x45425355) (= (usbe-get 4) 1) (= (usbe-get #x64) (%usbe-boot))))
 
@@ -283,7 +283,7 @@
            (usbe-rx-arm)
            1)
           (t (usbe-inc #x24)
-             (klog-event 2 (%t-rxer) r (usbe-get #x24) 0)
+             (kmsg-event 2 (%t-rxer) r (usbe-get #x24) 0)
              (usbe-rx-arm)
              1))))
 
@@ -301,7 +301,7 @@
                                  (usb-bulk-out-mps))))
       (if (eql r 1)
           (usbe-inc #x28)
-          (progn (usbe-inc #x2C) (klog-event 2 (%t-txer) r len 0))))))
+          (progn (usbe-inc #x2C) (kmsg-event 2 (%t-txer) r len 0))))))
 
 (defun usbe-tx-service ()
   "Send everything queued; how many frames."
@@ -329,7 +329,7 @@
 ;;; purpose and control traffic is in flight.  +0x6C counts the background rounds.
 (defun usbe-background ()
   ;; the block survives a reset: "running" must mean THIS boot, on THIS core
-  (when (and (= (usbe-get #x68) 1) (usbe-running-p) (= (%klog-core) (usbe-get #xC)))
+  (when (and (= (usbe-get #x68) 1) (usbe-running-p) (= (%kmsg-core) (usbe-get #xC)))
     (usbe-put #x68 0)                          ; no recursion
     (usbe-inc #x6C)
     (usbe-rx-service)
@@ -369,7 +369,7 @@
       (dwc2-write (dwc2-hprt0) (logior (logand p (dwc2-hprt0-mask)) (logand p #x2A))))
     (when (/= (logand p #x05) (logand (usbe-get #x40) #x05))   ; connected, enabled
       (usbe-inc #x3C)
-      (klog-event 3 (%t-port) p (usbe-get #x40) (usbe-get #x3C)))
+      (kmsg-event 3 (%t-port) p (usbe-get #x40) (usbe-get #x3C)))
     (usbe-put #x40 p)))
 
 ;;; ---- per-service accounting: +0x80 + 16*K for K = rx tx port hid hotplug -----------
@@ -398,7 +398,7 @@
 ;;; ---- the loop --------------------------------------------------------------------
 (defun usbe-main ()
   "The engine.  Run as a thread alone on its core (USBE-START); returns when stopped."
-  (let ((core (%klog-core)))
+  (let ((core (%kmsg-core)))
     (usbe-put #xC core)
     (io-hcr-imo-on)                           ; at EL2, without it an IRQ never ends WFI
     (io-route-gpu-irq core)
@@ -416,7 +416,7 @@
     (%gc-safe-enter)
     (setup-irq)
     (usbe-put 4 1)
-    (klog-event 1 (%t-usbe) core 1 0)
+    (kmsg-event 1 (%t-usbe) core 1 0)
     (usbe-put #x44 (logand (get-alloc-ptr) #xFFFFFFFF))
     (loop
       (when (/= (usbe-get 8) 0) (return nil))
@@ -434,7 +434,7 @@
         (usbe-hotplug-service)
         (usbe-measure 4 t0 a0)
         (unless (= (logand (get-alloc-ptr) #xFFFFFFFF) (usbe-get #x44))
-          (when (zerop (usbe-get #x48)) (klog-event 3 (%t-cons) (usbe-get #x10) 0 0))
+          (when (zerop (usbe-get #x48)) (kmsg-event 3 (%t-cons) (usbe-get #x10) 0 0))
           (usbe-inc #x48)
           (usbe-put #x44 (logand (get-alloc-ptr) #xFFFFFFFF)))
         (when (zerop work)
@@ -448,7 +448,7 @@
     (io-core-vtimer-irq core nil)
     (hid-put #x1F8 0)
     (%gc-safe-leave)
-    (klog-event 1 (%t-usbe) core 3 (usbe-get #x48))
+    (kmsg-event 1 (%t-usbe) core 3 (usbe-get #x48))
     (usbe-put 4 3)
     0))
 
@@ -456,7 +456,7 @@
 (defun usbe-send (buf len)
   "Queue the frame in BUF (LEN bytes) on this core's TX ring and wake the engine.  1,
    or 0 when the ring stayed full."
-  (let* ((ring (usbe-tx-ring (%klog-core))) (h (mem-ref ring :u32)) (k 0) (n (min len 2032)))
+  (let* ((ring (usbe-tx-ring (%kmsg-core))) (h (mem-ref ring :u32)) (k 0) (n (min len 2032)))
     (loop
       (when (< (logand (- h (mem-ref (+ ring 4) :u32)) #xFFFFFFFF) 32) (return nil))
       (when (> k 4000000) (usbe-inc #x30) (return-from usbe-send 0))

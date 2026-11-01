@@ -1238,11 +1238,11 @@ to bring them back.
   in first, so both compilers see one text.  `MODUS_SOURCE_COMMIT` pins the commit
   field (`build-matrix.sh` does, for byte-identity pairs).  Add a flag that decides
   emission to that list; add a subsystem's status function to the sections list.
-- **`(modus:klog level "TAG" "text")` / `(modus:klog-event level "TAG" a b c)` /
-  `(modus:klog-dump)`** (`lib/bare-log.lisp`, every bare CL image): a ring per
+- **`(modus:kmsg level "TAG" "text")` / `(modus:kmsg-event level "TAG" a b c)` /
+  `(modus:kmsg-dump)`** (`lib/bare-log.lisp`, every bare CL image): a ring per
   core, appends that never allocate or lock (safe on the I/O core and in fault
   paths).  On the Pi it is in Device RAM a reset does not clear:
-  `(modus:klog-dump :boot :previous)` reads the boot that hung.  `klog-echo-level`
+  `(modus:kmsg-dump :boot :previous)` reads the boot that hung.  `kmsg-echo-level`
   mirrors to the console.  Prefer it to serial prints in anything that runs off
   the main thread.
 

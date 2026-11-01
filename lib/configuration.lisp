@@ -16,9 +16,10 @@
 (defun %configuration-sections ()
   "(label . function name) of every live section an image may have.  Add a subsystem
    here: a function of no arguments returning a plist."
-  '((:log . klog-status)
+  '((:log . kmsg-status)
     (:io-core . io-status)
-    (:usb-engine . usbe-status)))
+    (:usb-engine . usbe-status)
+    (:log-shipping . kmsg-ship-status)))
 
 (defun %configuration-live ()
   (let ((acc nil))

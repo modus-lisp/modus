@@ -47,7 +47,7 @@ interaction; the design below removes the class.
    whatever owns the main thread (the desk does).  It conses, so it is not on
    the I/O core.
 7. **Evidence**: counters in the control block, readable from any core; the
-   message log (`lib/bare-log.lisp`, `(modus:klog-dump)`); a check that the
+   message log (`lib/bare-log.lisp`, `(modus:kmsg-dump)`); a check that the
    loop allocates nothing; and the 60-second netboot soak as a standing board
    test.
 
@@ -110,7 +110,7 @@ desk's USB/screen/audio executors on 1/2/3 were right only because the desk
 starts them in that order.  Fixed (the core goes to BT-SPAWN), and the probe now
 refuses (returns -1, logs `IOWK core actual -1`) on the wrong core instead of
 sleeping forever.  The hung boot's own record, read after the reset with
-`(modus:klog-dump :boot :previous)`, is what showed the probe had run on `c2`.
+`(modus:kmsg-dump :boot :previous)`, is what showed the probe had run on `c2`.
 
 ## Stage 2: the engine (USBE-MAIN, net/usb-io-core.lisp)
 

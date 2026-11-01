@@ -6,7 +6,7 @@
    :STARTED, :ALREADY, or why not.  The RTL8153 must be bound (NET-USB-PROBE) first."
   (cond ((usbe-running-p) :already)
         ((not (eql (usb-netdev-get) 2)) :no-rtl8153)
-        ((zerop (%klog-base)) :no-log)
+        ((zerop (%kmsg-base)) :no-log)
         (t
          (io-stubs)
          (io-map-local)

@@ -445,7 +445,7 @@
     ;; Single-threaded answers to the SB-THREAD shim's primitives (the shim is
     ;; boot-evaluated here too; net/hosted-sync.lisp is hosted-only).
     (mvm-text "net/bare-sync.lisp")
-    ;; The message log (klog / klog-dump): a ring per core, appends that never
+    ;; The message log (kmsg / kmsg-dump): a ring per core, appends that never
     ;; allocate.  An image keeps one where its board names a region below.
     (mvm-text "lib/bare-log.lisp")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
@@ -456,7 +456,7 @@
         "
 (declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
-(defun %klog-region () (values #x110A0000 #x60000))
+(defun %kmsg-region () (values #x110A0000 #x60000))
 "
         "")
     ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
@@ -996,7 +996,7 @@
   (setf (mem-ref #x111F0800 :u32) 0)
   ;; The message log (lib/bare-log.lisp) is in the same window and is KEPT across a
   ;; reset on purpose: count this boot, so the previous one's messages stay readable.
-  (%klog-boot)
+  (%kmsg-boot)
   ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
   (setf (mem-ref #x111F2000 :u32) 0)
   (%gc-write64 #x111F2008 0)
@@ -1836,6 +1836,10 @@
         ;; The Pi's TCP fast paths over the RTL8153 (net/r8152-post.lisp):
         ;; overrides of ip.lisp's seams, so spliced after it.
         (if *cl-repl-rpi-p* (concatenate 'string (%rpi-net-text "r8152-post.lisp") (string #\Newline)) "")
+        ;; the message log leaves the board: syslog over UDP (KMSG-SHIP-STEP), run by the
+        ;; network service's shipper thread (net/net-service.lisp).  After ip.lisp: it
+        ;; sends with ip.lisp's UDP-SEND.
+        (if *cl-repl-rpi-p* (concatenate 'string (%rpi-net-text "kmsg-ship.lisp") (string #\Newline)) "")
         (%rpi-net-text "http-client.lisp")   (string #\Newline)
         ;; Bigger HTTP response buffer.  The stock http-fetch-impl caps a
         ;; response at 4096 bytes and tcp-rx-copy bounds its copy to 4096 — too

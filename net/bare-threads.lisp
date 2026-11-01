@@ -275,7 +275,7 @@
     (if (< i 4) i (mem-ref (+ (%bt-rec i) #x20) :u32))))
 
 ;; The message log's writer index (lib/bare-log.lisp): one ring per core.
-(defun %klog-core () (%bt-core-id))
+(defun %kmsg-core () (%bt-core-id))
 
 (defun %bt-switch (from to)
   "Leave record FROM (published SAFE) for record TO, on this core.  Returns when

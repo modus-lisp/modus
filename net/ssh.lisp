@@ -938,21 +938,55 @@
     (aset reply 14 0)        ; partial success = FALSE
     (ssh-send-payload ssh reply 15)))
 
+;; THE ALLOWED KEYS, set at run time (a card's bootargs: kiln's SSH_KEYS=).  Up to 8 raw
+;; 32-byte Ed25519 keys at +0x7A0, their count at +0x79C.  With any in the table the table is
+;; what is checked, and the build's baked key at +0x750 is not; SSH-AUTHORIZE-KEYS-RESET with
+;; no keys after it leaves the server refusing everyone.
+(defun ssh-auth-keys-base () (+ (e1000-state-base) #x7A0))
+(defun ssh-auth-keys-count () (mem-ref (+ (e1000-state-base) #x79C) :u32))
+(defun ssh-authorize-keys-reset ()
+  "Enforce publickey auth with no key allowed yet."
+  (setf (mem-ref (+ (e1000-state-base) #x79C) :u32) 0)
+  (setf (mem-ref (+ (e1000-state-base) #x770) :u32) 1)
+  t)
+(defun ssh-authorize-key (key)
+  "Allow the raw 32-byte Ed25519 public key KEY.  NIL when the table (8) is full."
+  (let ((n (ssh-auth-keys-count)))
+    (if (>= n 8)
+        ()
+        (progn
+          (dotimes (i 32)
+            (setf (mem-ref (+ (ssh-auth-keys-base) (* n 32) i) :u8) (aref key i)))
+          (setf (mem-ref (+ (e1000-state-base) #x79C) :u32) (+ n 1))
+          (setf (mem-ref (+ (e1000-state-base) #x770) :u32) 1)
+          t))))
+
 ;; Raw 32-byte Ed25519 key inside an SSH publickey blob:
 ;;   string("ssh-ed25519")  = u32(11) + 11 bytes  (offsets 0..14)
 ;;   string(key)            = u32(32) + 32 bytes   (key begins at offset 19)
-;; T iff those 32 bytes equal the baked authorized key.
+;; T iff those 32 bytes equal one of the allowed keys (or, with none set, the baked key).
+(defun ssh-blob-key-matches-p (pk-blob base)
+  (let ((ok 1) (i 0))
+    (loop
+      (if (>= i 32)
+          (return (not (zerop ok)))
+          (progn
+            (unless (eq (aref pk-blob (+ 19 i)) (mem-ref (+ base i) :u8))
+              (setq ok 0))
+            (setq i (+ i 1)))))))
+
 (defun ssh-key-authorized-p (pk-blob pklen)
   (if (< pklen 51)
       ()
-      (let ((base (ssh-auth-key-addr)) (ok 1) (i 0))
-        (loop
-          (if (>= i 32)
-              (return (not (zerop ok)))
-              (progn
-                (unless (eq (aref pk-blob (+ 19 i)) (mem-ref (+ base i) :u8))
-                  (setq ok 0))
-                (setq i (+ i 1))))))))
+      (let ((n (ssh-auth-keys-count)))
+        (if (zerop n)
+            (ssh-blob-key-matches-p pk-blob (ssh-auth-key-addr))
+            (let ((hit ()) (k 0))
+              (loop
+                (when (or hit (>= k n)) (return hit))
+                (when (ssh-blob-key-matches-p pk-blob (+ (ssh-auth-keys-base) (* k 32)))
+                  (setq hit t))
+                (setq k (+ k 1))))))))
 
 ;; Extract the 64-byte Ed25519 signature from the payload's signature field at
 ;; OFF: string( string("ssh-ed25519") + string(64-byte-sig) ).  NIL if malformed.
@@ -1100,9 +1134,10 @@
               (ssh-derive-keys ssh)
               (ssh-message-loop ssh))))))))
 
-;; Second pass of publickey auth WITH a baked key: verify the signature over
-;; the reconstructed RFC 4252 §7 blob, against the (already key-matched) baked
-;; authorized key.  SIGOFF is the payload offset of the signature field.
+;; Second pass of publickey auth: verify the signature over the reconstructed
+;; RFC 4252 §7 blob against the key in the request, which SSH-KEY-AUTHORIZED-P
+;; has already matched to an allowed one.  SIGOFF is the payload offset of the
+;; signature field.
 (defun ssh-userauth-verify (ssh payload sigoff uoff ulen soff slen algo alen pk-blob pklen)
   (let ((sig (ssh-extract-ed25519-sig payload sigoff)))
     (if (null sig)
@@ -1113,7 +1148,7 @@
           (dotimes (i slen) (aset svc i (aref payload (+ soff i))))
           (let ((signed (ssh-build-userauth-signed ssh user ulen svc slen algo alen pk-blob pklen))
                 (authkey (make-array 32)))
-            (ssh-mem-load authkey (ssh-auth-key-addr) 32)
+            (dotimes (i 32) (aset authkey i (aref pk-blob (+ 19 i))))
             (if (ed25519-verify authkey sig signed (array-length signed))
                 (progn
                   (ssh-send-auth-success ssh)

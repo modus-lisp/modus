@@ -1312,6 +1312,28 @@
     (%it-eval-kernel-source (%net-service-source) \"net-service\"))
   t)
 
+(defvar *ssh-boot-dhcp* nil
+  \"T: SSH-BOOT asks DHCP for the address before the I/O core takes the NIC, keeping the static
+   one (10.0.0.2 via 10.0.0.1) when nothing answers.  A card sets it from its bootargs (NET=dhcp).\")
+
+(defun %ssh-boot-dhcp ()
+  \"DHCP on the bound NIC, polled from this core (the I/O core is not running yet).  T when an
+   address was leased.\"
+  (let* ((st (e1000-state-base))
+         (gw0 (mem-ref (+ st #x1C) :u32)))
+    (setf (mem-ref (+ st #x60) :u32) 0)
+    (handler-case (dhcp-client) (error () nil))
+    (if (eql (mem-ref (+ st #x60) :u32) 3)
+        ;; leased: DHCP-PARSE-OFFER kept the gateway as a host-order number, and the I/O core
+        ;; reads +0x1C as the address's four bytes in network order, as SSH-BOOT writes it
+        (let ((gw (mem-ref (+ st #x1C) :u32)))
+          (dotimes (i 4) (setf (mem-ref (+ st #x1C i) :u8) (logand (ash gw (* -8 (- 3 i))) 255)))
+          (kmsg-event 1 \"DHCP\" (mem-ref (+ st #x18) :u32) (mem-ref (+ st #x1C) :u32) 1)
+          t)
+        (progn (setf (mem-ref (+ st #x1C) :u32) gw0)
+               (kmsg-event 2 \"DHCP\" 0 0 0)
+               nil))))
+
 (defun %ssh-boot-serve ()
   \"SSH-BOOT's last step on a threaded Pi: the USB I/O core, the network service, the SSH
    server on it -- then back to the caller (the REPL).\"
@@ -1322,6 +1344,7 @@
   (usbt-enumerate)
   (usbt-bind-hid)
   (when (> (usbt-bind-nic) 0) (hid-request-high-speed-reserve))
+  (when (and *ssh-boot-dhcp* (> (usb-netdev-get) 0)) (%ssh-boot-dhcp))
   (kmsg-event (if (zerop (usb-netdev-get)) 3 1) \"NICB\" (usb-netdev-get) (usbt-count) 0)
   (usbe-start)
   (%install-net-service)

@@ -118,7 +118,8 @@ sleeping forever.  The hung boot's own record, read after the reset with
 that owns the DWC2 from then on; `usbe-stop` hands it back.  The NIC interface
 (`usb-nic-*`), `net-rx-idle` and the fast-ACK path route to its rings while it runs.
 `(modus-int::usbe-status)` / `(modus-int::usbe-profile)` / `(modus:image-configuration)`
-read it.  It needs the RTL8153 bound (`:no-rtl8153` otherwise; CDC-ECM is not wired).
+read it.  It drives whatever NIC is bound when it starts -- the RTL8153 in its vendor
+mode, a CDC-ECM adapter, or none (the keyboard, mouse and hubs alone).
 
 Measured on the Zero 2 W, the network running entirely through the engine (ping from
 the builder, SSH evaluations over the same link):
@@ -143,5 +144,102 @@ the receive is halted on purpose), which is the 35 -> 5 ms.  The next step is
 asynchronous splits: start a split, return to the loop, continue it at the next
 microframe from the SOF interrupt.
 
-**OPEN:** one hotplug scan right after the start takes ~506 ms with the receive halted
-(the worst ping and the lost ones); unexplained yet.
+The long hotplug scan right after the start (~506 ms with the receive halted) is gone
+with the tree's scan (below): no scan on the board takes more than 20 ms.
+
+## Stage 3: the keyboard and mouse under the engine
+
+The polls are a state machine (`usbe-hid-step`): program a split, return to the loop,
+continue when the channel halts or the next SOF arrives.  It never worked on the board --
+every CSPLIT was answered NYET until it gave up -- and the cause was not the state
+machine:
+
+**WITH THE NIC'S BULK-IN ARMED, EVERY PERIODIC SPLIT NYETS.**  Measured on the Zero,
+deterministic: halt channel 1 (the receive) and the same polls are NAKed (nothing new) at
+once; re-arm it and they fail again.  Control splits are unaffected, which is why
+enumeration always worked.  So each keyboard/mouse round -- a few microframes every 8 ms --
+runs with the receive paused (`usbe-rx-pause` / `usbe-rx-resume`, +0x12C): what has
+arrived is taken first, the channel halted, and re-armed when the round ends.  The adapter
+buffers meanwhile.
+
+| | before | paused |
+|---|---|---|
+| HID transactions failed | all | **0** |
+| NAKs (nothing new) | 0 | ~150/s |
+| ping avg | 5 ms | **1-2 ms** |
+
+`HFIR` also read 60000 (the full-speed frame interval) after a cold init; it is set for
+the root port's speed now (7500 at high speed).  That was not the cause.
+
+## The bus as a tree (net/usb-tree.lisp)
+
+`usbt-enumerate` starts from a reset of the root port -- so U-Boot's state no longer
+matters; after a netboot the RTL8153 used to come up three different ways (`ND:R`,
+`ND:0`, `CDC:E2` then a binding that never received) -- and walks every hub at any depth,
+one port reset at a time.  Each device record carries its TT: the first high-speed hub
+above it and the port its branch leaves that hub by.  Then `usbt-bind-hid` binds the
+first boot keyboard and mouse wherever they are, and `usbt-bind-nic` the first device
+with a CDC-ECM configuration (the RTL8153's configuration 2; QEMU's `usb-net`).  The
+packet filter must be set for the RTL8153 to receive in CDC-ECM (the old comment in
+`r8152.lisp` saying ECM NAKs every bulk-IN was wrong for this sequence).
+
+**A NIC BOUND BY CLASS NEEDS THE VENDOR DRIVER'S COPY HELPER.**  The engine copies every
+received frame through `r8152-ncopy`'s native helper, which only the vendor probe
+installed; bound by class, the engine core jumped to `0x100` on its first full-size frame
+(found in QEMU; latent on the board, where `ssh-boot`'s early probe happened to install
+it).  `usbt-bind-nic` calls `r8152-ensure-helpers`, which installs them behind a magic
+word (that page holds garbage after a cold boot).
+
+**HOTPLUG** (`usbt-scan`, the engine's hotplug service once the table is populated): every
+hub's port changes; a disconnect forgets the branch below it and unbinds what was in it
+(`NICX` when the NIC goes), a connect enumerates the new branch and binds what it finds.
+Verified in QEMU by unplugging and replugging a keyboard behind a second hub, then the
+hub itself.
+
+`(modus-int::usbt-status)` lists the table.
+
+The fault reporter prints `R` (X30, the caller) and `C` (MPIDR, which core) as well, since
+a fault on core 1-3 halts that core alone.  `MODUS_SYMMAP=path` writes the symbol map at
+build time; runtime address = map VA + `0x2FD80000`.
+
+## Stage 4: recovery (USBE-RECOVER)
+
+The engine's port check runs first in every pass.  When HPRT0 says the hub is connected
+but the port is NOT enabled -- the end state of every root-port failure seen on this board
+-- the bus is gone until a USB reset, and a reset of the hub resets everything behind it.
+So recovery is the whole bus, cold, through the tree, and logged step by step
+(`RCVR step a b` in kmsg):
+
+| step | what | code |
+|---|---|---|
+| 0 | noticed (HPRT0, recovery count) | `usbe-port-service` |
+| 1 | the whole tree enumerated again from a root-port reset | `usbt-enumerate` |
+| 2 | keyboard and mouse bound | `usbt-bind-hid` |
+| 3 | the NIC bound by its CDC-ECM configuration | `usbt-bind-nic` |
+| 4 | the engine's interrupt routing, the receive armed | `usbe-irq-setup` |
+
+The adapter comes back in CDC-ECM, not its vendor mode: the vendor mode needs the RTL8153
+init U-Boot's r8152 driver does and modus does not have, while CDC-ECM is a standard class
+-- kiln's `net-up` already drove the board's network this way.  The engine therefore speaks
+both framings (`usbe-nic`: 2 = vendor aggregate, 1 = CDC-ECM one frame per transfer, 0 = no
+NIC).  The network's own state -- address, ARP, TCP connections -- is untouched; TCP resends
+what was lost.
+
+Recovery conses (`hid-split-init` returns a list), so the engine leaves its GC-safe region
+for it -- as any thread may -- and takes a new allocation baseline after.  Attempts are at
+least 5 s apart, so a bus that will not come back costs a bring-up every 5 s, not a spin.
+
+`(modus-int::usbe-test-disable-port)` disables the root port on purpose (PrtEna is
+write-1-to-disable), which is the failure, reproduced on demand.
+
+## The QEMU rig (/home/claude/qemu-zero)
+
+QEMU 11.1.3 built locally (branch `zero-fidelity`) with what the Zero's bus does and stock
+QEMU does not: TT split transactions with their timing (`dwc2-usb.split-model=on`,
+`split-window=24` under TCG), a misrouted split answered with a transaction error, the
+bulk-IN starvation above (`split-bulk-starve=on`), high-speed hubs (`usb-hub
+high-speed=on`), a high-speed `usb-net`, and a vendor-class HDMI adapter stub
+(`usb-display`).  The board console is the mini UART, QEMU's second serial
+(`-serial null -serial stdio`).  The unfixed image fails every keyboard poll there; the
+fixed one works.  Keyboard/mouse polls still fail now and then under TCG (`HIDF` in kmsg):
+the emulator's timing, not the board's.

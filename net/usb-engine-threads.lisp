@@ -3,9 +3,9 @@
 
 (defun usbe-start (&optional (core 1))
   "From the MAIN thread: give the USB controller to an engine thread alone on CORE.
-   :STARTED, :ALREADY, or why not.  The RTL8153 must be bound (NET-USB-PROBE) first."
+   :STARTED, :ALREADY, or why not.  It drives the NIC bound then (the RTL8153 or CDC-ECM),
+   or none: the keyboard, mouse and hub alone."
   (cond ((usbe-running-p) :already)
-        ((not (eql (usb-netdev-get) 2)) :no-rtl8153)
         ((zerop (%kmsg-base)) :no-log)
         (t
          (io-stubs)
@@ -31,3 +31,6 @@
             (when (= (usbe-get 4) 3) (return :stopped))
             (when (> k 200000000) (return :timeout))
             (setq k (+ k 1)))))))
+
+;; usb-io-core.lisp's wait seam: with threads, a wait lets core 0's other threads run.
+(defun usbe-idle-yield () (bt-yield))

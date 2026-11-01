@@ -52,7 +52,9 @@
       "R8152-RX-BUF" "R8152-META" "R8152-NCOPY" "R8152-ACK-BUF"
       "R8152-TX-ASYNC-START" "R8152-TX-ASYNC-WAIT" "R8152-RX-PAUSE" "R8152-RX-RESUME"
       ;; the I/O core (net/usb-io-core.lisp) drives the receive itself
-      "R8152-AGG-BUF" "R8152-AGG-SIZE" "R8152-DCACHE-CIVAC" "R8152-REARM"))
+      "R8152-AGG-BUF" "R8152-AGG-SIZE" "R8152-DCACHE-CIVAC" "R8152-REARM"
+      ;; and its helpers, whichever NIC is bound (net/usb-tree.lisp)
+      "R8152-ENSURE-HELPERS"))
     ;; SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519 (net/crypto*.lisp):
     ;; what SSH, the SNP attestation and the isolated net domain call
     ("MODUS.CRYPTO" ("COMMON-LISP" "MODUS-INT")

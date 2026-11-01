@@ -1691,6 +1691,10 @@
             ;; The I/O core: the USB host controller owned by one core, woken
             ;; from WFI by its interrupt (stage 1: routing + the wake probe).
             (%rpi-net-text "usb-io-core.lisp")   (string #\Newline)
+            ;; the whole USB tree, hubs inside hubs, from a reset of the root port: the
+            ;; keyboard, mouse and network adapter wherever they are; the I/O core's
+            ;; recovery and SSH-BOOT enumerate through it
+            (%rpi-net-text "usb-tree.lisp")      (string #\Newline)
             ;; ... and its engine's start/stop, which need bare threads
             (if (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
                   (and v (> (length v) 0) (string/= v "0")))

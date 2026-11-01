@@ -70,10 +70,9 @@
       (setq i (+ i 1)))))
 
 (defun dwc2-wait-next-uframe ()
-  ;; Until HFNUM's frame number moves on (a microframe is 125 us), bounded.  On the I/O
-  ;; core the wait is not wasted: the engine serves its receive and send once first
-  ;; (USBE-BACKGROUND does nothing anywhere else).
-  (usbe-background)
+  ;; Until HFNUM's frame number moves on (a microframe is 125 us), bounded.  (The I/O
+  ;; core's engine does not wait here: its keyboard and mouse polls are a state machine
+  ;; woken by the controller, net/usb-io-core.lisp USBE-HID-STEP.)
   (let ((f (logand (dwc2-read (dwc2-hfnum)) #x3FFF)) (i 0))
     (loop
       (when (or (/= f (logand (dwc2-read (dwc2-hfnum)) #x3FFF)) (> i 200000)) (return nil))

@@ -352,11 +352,16 @@
 ;;; Polling
 ;;; ---------------------------------------------------------------------------
 
+;; The hub whose TT serves DEV: its own (+0x1C, set by net/usb-tree.lisp for a device
+;; behind nested hubs), else the one hub this file found.
+(defun hid-dev-hub (dev)
+  (let ((h (hid-dev-get dev #x1C))) (if (zerop h) (hid-get #x00) h)))
+
 (defun hid-poll-dev (dev buf)
   ;; One interrupt-IN poll.  Bytes received (> 0), 0 for none, < 0 on error.
   (if (= (hid-dev-get dev 0) 1)
       (multiple-value-bind (n np)
-          (usb-split-interrupt-in (hid-dev-get dev #x04) (hid-get #x00)
+          (usb-split-interrupt-in (hid-dev-get dev #x04) (hid-dev-hub dev)
                                   (hid-dev-get dev #x08)
                                   (= (hid-dev-get dev #x0C) 1)
                                   (hid-dev-get dev #x10) (hid-dev-get dev #x14)
@@ -541,6 +546,7 @@
           (when (> p n) (return nil))
           (let ((st (if (hid-port-reserved-p p) 0 (hid-port-status hub p))))
             (when (not (zerop (logand st #x10000)))
+              (kmsg-event 1 #x50544F48 p st 0)          ; 'HOTP': port P changed
               (hid-clear-port-changes hub p)
               (hid-port-gone p)
               (when (and (not (zerop (logand st 1))) (zerop (logand st #x400)))

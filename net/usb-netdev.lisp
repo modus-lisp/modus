@@ -114,12 +114,14 @@
 ;; not accidentally clear port-enable/enable-change.  Read RAW to test the bits.
 (declaim (overridable usb-netdev-hotplug-poll))
 (defun usb-netdev-hotplug-poll ()
-  (let ((hprt (dwc2-read (dwc2-hprt0))))
-    (when (not (zerop (logand hprt (hprt0-prtconndet))))
-      (dwc2-write (dwc2-hprt0)
-                  (logior (logand hprt (dwc2-hprt0-mask)) (hprt0-prtconndet)))
-      (if (zerop (logand hprt (hprt0-prtconnsts)))
-          (progn (usb-netdev-set 0)
-                 (%serial-byte 78) (%serial-byte 68) (%serial-byte 58)
-                 (%serial-byte 85) (%serial-byte 10))   ; "ND:U" unplug
-          (net-usb-probe)))))
+  ;; the I/O core's engine owns the controller (and the port) while it runs
+  (unless (usbe-running-p)
+    (let ((hprt (dwc2-read (dwc2-hprt0))))
+      (when (not (zerop (logand hprt (hprt0-prtconndet))))
+        (dwc2-write (dwc2-hprt0)
+                    (logior (logand hprt (dwc2-hprt0-mask)) (hprt0-prtconndet)))
+        (if (zerop (logand hprt (hprt0-prtconnsts)))
+            (progn (usb-netdev-set 0)
+                   (%serial-byte 78) (%serial-byte 68) (%serial-byte 58)
+                   (%serial-byte 85) (%serial-byte 10))   ; "ND:U" unplug
+            (net-usb-probe))))))

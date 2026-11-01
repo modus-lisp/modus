@@ -191,7 +191,22 @@
     (r8152-u64 (r8152-meta) code)
     (r8152-u64 (+ (r8152-meta) 8) 0)          ; tcp-rx-window override: none
     (setf (mem-ref (+ (r8152-meta) 12) :u32) 0) ; no async TX in flight
+    (setf (mem-ref (+ (r8152-meta) 16) :u32) (r8152-helpers-magic))
     code))
+
+;; THE HELPERS ARE NOT THE VENDOR DRIVER'S ALONE.  The I/O core's receive copies every frame
+;; through R8152-NCOPY whichever NIC it drives, so a CDC-ECM adapter bound without the vendor
+;; probe ever running (net/usb-tree.lisp binds by class) jumped to address 0x100 -- the meta
+;; word was 0 -- and the engine's core halted on the first frame of 64 bytes or more
+;; (QEMU, the fidelity build).  The meta page is ordinary RAM, so after a cold boot its code
+;; word is whatever was there: +16 holds a magic number once the helpers really are installed.
+(defun r8152-helpers-magic () #x4E434F50)                       ; 'NCOP'
+
+(defun r8152-ensure-helpers ()
+  "Install the cache-maintenance and copy helpers unless they are already in place."
+  (unless (= (mem-ref (+ (r8152-meta) 16) :u32) (r8152-helpers-magic))
+    (r8152-cache-init))
+  t)
 
 (defun r8152-ncopy (dst src n)
   "Copy the whole 64-byte chunks of N bytes SRC -> DST natively (both ordinary

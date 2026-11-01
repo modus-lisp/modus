@@ -2750,6 +2750,14 @@
     ;; exec page the restore has just overwritten.  (A board reset keeps DRAM:
     ;; the desk faulted executing that page on one load address and drew into
     ;; a dead framebuffer -- the firmware's rainbow square -- on a cold boot.)
+    ;; THE THREAD LAYER'S WORDS ARE NOT IN THE CORE, so a cold boot (a card: firmware, no
+    ;; U-Boot) finds them holding whatever DRAM held -- QEMU zeroes RAM and never showed it.
+    ;; Measured on a Zero: core 0's CPU id (per-CPU block +16) read 0x5555..., and the first
+    ;; kmsg on core 0 (%BT-CORE-ID) faulted through it; a non-zero \"up\" flag would make
+    ;; %BT-INIT skip itself.  Both as a fresh boot has them: CPU 0, threads not started.
+    (when (fboundp (quote %bt-up-p))
+      (setf (mem-ref #x10213008 :u32) 0)
+      (setf (mem-ref #x10080010 :u64) 0))
     (when (fboundp (quote hcon-init))
       (handler-case (hcon-init) (t (c) nil)))
     (handler-case (%fdt-after-restore) (t (c) nil))   ; THIS boot's bootargs, not the builder's

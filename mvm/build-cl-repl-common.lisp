@@ -1286,10 +1286,57 @@
 ;; on QEMU virt.  Only the Pi runs the actor/USB shape.
 (defvar *ssh-sync-p* (or *cl-repl-pc-p* *cl-repl-virt-p*))
 
-;; MODUS_SSH_AUTOSTART=1 (with MODUS_SSH_BUILD=1) — start the SSH server from
-;; kernel-main right after the net pipeline, instead of waiting for (ssh-boot) at
-;; the REPL.  The server never returns, so the REPL is not reached.  Used by the
-;; attested-SSH image: nothing is typed at a console that does not exist.
+;; THE NETWORK SERVICE: a threaded Pi SSH build serves SSH through it (net/net-service.lisp,
+;; net/ssh-inetd.lisp) -- SSH-BOOT starts the USB I/O core, the service and the server, and
+;; RETURNS, leaving the main thread to the REPL.  MODUS_SSH_NETACTOR=1 keeps the old server
+;; (NET-ACTOR-MAIN polling the NIC on the main thread, forever).
+(defvar *ssh-service-p*
+  (and *cl-repl-rpi-p* (not *cl-repl-virt-p*) *ssh-build-p*
+       (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS"))) (and v (> (length v) 0) (string/= v "0")))
+       (not (let ((v (sb-ext:posix-getenv "MODUS_SSH_ISOLATED"))) (and v (> (length v) 0) (string/= v "0"))))
+       (not (let ((v (sb-ext:posix-getenv "MODUS_SSH_NETACTOR"))) (and v (> (length v) 0) (string/= v "0"))))))
+
+(defun %ns-escape (text)
+  "TEXT as the inside of a Lisp string literal."
+  (with-output-to-string (o)
+    (loop for c across text do (when (member c '(#\\ #\")) (write-char #\\ o)) (write-char c o))))
+
+(defun %net-service-source-text ()
+  (format nil "
+(defun %net-service-source ()
+  \"~A\")
+
+(defun %install-net-service ()
+  \"Evaluate the network service's source, once.\"
+  (unless (fboundp 'net-service-start)
+    (%it-eval-kernel-source (%net-service-source) \"net-service\"))
+  t)
+
+(defun %ssh-boot-serve ()
+  \"SSH-BOOT's last step on a threaded Pi: the USB I/O core, the network service, the SSH
+   server on it -- then back to the caller (the REPL).\"
+  ;; THE BUS, FROM A RESET OF THE ROOT PORT (net/usb-tree.lisp): U-Boot's state no longer
+  ;; matters -- after a netboot the RTL8153 came up three different ways (ND:R, ND:0, CDC:E2
+  ;; then a CDC binding that never received).  Every hub at any depth, the keyboard and mouse
+  ;; wherever they are, the network adapter by its CDC-ECM configuration.
+  (usbt-enumerate)
+  (usbt-bind-hid)
+  (when (> (usbt-bind-nic) 0) (hid-request-high-speed-reserve))
+  (kmsg-event (if (zerop (usb-netdev-get)) 3 1) \"NICB\" (usb-netdev-get) (usbt-count) 0)
+  (usbe-start)
+  (%install-net-service)
+  (funcall 'ssh-serve)
+  t)
+"
+          (%ns-escape
+           ;; the files' own text: evaluated in the image, which reads their IN-PACKAGE
+           (apply #'concatenate 'string
+                  (mapcar (lambda (f)
+                            (let ((p (merge-pathnames f (merge-pathnames "net/" *modus-base*))))
+                              (modus.mvm::check-parses p)
+                              (concatenate 'string (read-file-text p) (string #\Newline))))
+                          '("tcp-conns.lisp" "net-service.lisp" "ssh-inetd.lisp"))))))
+
 ;; MODUS_SSH_ISOLATED=1 (with MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1): the
 ;; isolated server -- see net/isolated-cl.lisp.  Threads are the substrate, so
 ;; it is refused without them rather than built half-working.
@@ -1302,6 +1349,10 @@
                        (and v (plusp (length v)) (string/= v "0"))))))
   (error "MODUS_SSH_ISOLATED=1 needs MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1 on the ~
           :RPI or :VIRT platform: its sessions are bare-threads (net/bare-threads.lisp)."))
+;; MODUS_SSH_AUTOSTART=1 (with MODUS_SSH_BUILD=1) — start the SSH server from
+;; kernel-main right after the net pipeline, instead of waiting for (ssh-boot) at
+;; the REPL.  The server never returns, so the REPL is not reached.  Used by the
+;; attested-SSH image: nothing is typed at a console that does not exist.
 (defvar *ssh-autostart-p*
   (let ((v #+sbcl (sb-ext:posix-getenv "MODUS_SSH_AUTOSTART")))
     (and *ssh-build-p* v (string= v "1"))))
@@ -1570,7 +1621,7 @@
   (write-string-serial \"NETUP\") (write-char-serial 10)
 " (%lisp-spin-form "ssh-netup") "  (let ((n 0)) (loop (when (or (zerop (modus.net:nic-receive)) (> n 2000)) (return ())) (setq n (+ n 1))))
   (net-actor-main))"))
-        "(defun ssh-boot ()
+        (concatenate 'string "(defun ssh-boot ()
   (let ((s (e1000-state-base))) (dotimes (i 1024) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-ipc-base))) (dotimes (i 76800) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
   (let ((s (ssh-conn-base))) (dotimes (i 8192) (setf (mem-ref (+ s (* i 8)) :u64) 0)))
@@ -1586,7 +1637,7 @@
   (smp-init)
   (actor-init)
   (write-string-serial \"NETUP\") (write-char-serial 10)
-  (net-actor-main))")
+" (if *ssh-service-p* "  (%ssh-boot-serve))" "  (net-actor-main))")))
         (string #\Newline)
         ;; usb-netdev.lisp LAST: runtime USB NIC binding + hot-plug.  Its
         ;; e1000-send/receive/rx-buf DISPATCHERS win over r8152's forwarders
@@ -1603,6 +1654,13 @@
         ;; the CL successor of isolated-net.lisp).  LAST: it replaces the accept,
         ;; deliver, send, wait and eval seams above by last-defun-wins.
         (if *ssh-isolated-p* (%rpi-net-text "isolated-cl.lisp") "")  (string #\Newline)
+        ;; THE NETWORK SERVICE (threaded Pi builds): one core-0 thread owns the NIC
+        ;; (net/net-service.lisp), the SSH server is its client with each session on a core
+        ;; of its own (net/ssh-inetd.lisp), over many-connection TCP (net/tcp-conns.lisp).
+        ;; Kernel SOURCE, evaluated by SSH-BOOT the first time (it needs CLOS and the
+        ;; SB-THREAD surface, which exist only once the image is up): carried as a string,
+        ;; so nothing host-side reads it.
+        (if *ssh-service-p* (%net-service-source-text) "")  (string #\Newline)
         ;; :VIRT has no USB host to hot-plug: each poll pass only steps the sessions.
         (if (and *ssh-isolated-p* *cl-repl-virt-p*)
             (format nil "~%(defun usb-netdev-hotplug-poll () (%iso-net-step))~%")

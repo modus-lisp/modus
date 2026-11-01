@@ -232,6 +232,38 @@ least 5 s apart, so a bus that will not come back costs a bring-up every 5 s, no
 `(modus-int::usbe-test-disable-port)` disables the root port on purpose (PrtEna is
 write-1-to-disable), which is the failure, reproduced on demand.
 
+## The network service and SSH (net/net-service.lisp, net/ssh-inetd.lisp)
+
+On a threaded Pi SSH build, `(ssh-boot)` enumerates the tree, binds, starts the engine,
+then the network service and the SSH server on it -- and **returns**: the main thread is
+the REPL's again.  `MODUS_SSH_NETACTOR=1` keeps the old server (`net-actor-main` polling
+the NIC on the main thread, forever).  The three files are carried in the image as source
+and evaluated by `ssh-boot` the first time (they need CLOS and the SB-THREAD surface).
+
+- **The service** is one core-0 thread that owns the NIC: it blocks on the engine's
+  receive head, runs `tcp-conns.lisp`'s connections, and never blocks on anything else
+  (core 0's "no blocking" policy).  An error ends the pass, not the service (`NETE`).
+  `(modus-int::net-service-status)`.
+- **The watchdog** thread logs every pause over the limit (`PAUS ms gcs ring-waiting`)
+  and restarts a dead service (`NETR`).
+- **inetd**: `(net-service-listen port spawn)` -- the service accepts each connection,
+  gives it a slot and a channel, and calls SPAWN, which starts a handler thread.
+  Messages: service -> handler `(:data bytes)` `(:close)` `(:result bytes)`; handler ->
+  service `(:send slot bytes)` `(:close slot)` `(:eval slot string)`.  An `:eval` runs on
+  a core-0 thread of its own, so a long evaluation holds up neither the network nor the
+  other sessions.
+- **SSH sessions** (`ssh-serve`) run the whole protocol on cores 2-3 -- never core 1,
+  whose engine never yields -- one of four SSH blocks each.  Their waits are REAL TIME:
+  30 s for the client's version string, 60 s idle before authentication.  ssh.lisp counts
+  polls, and a poll here is a 10 ms channel wait, so its 50-poll version wait was 0.5 s:
+  a client further away than that, or QEMU's user network, was dropped right after its
+  KEXINIT (4 of 16 attempts in QEMU).
+- **Log shipping** (`net/kmsg-ship.lisp`): `(modus:kmsg-ship-to host [port 514])` sends the
+  message log as syslog over UDP from the service's shipper thread.
+
+Measured on the Zero: 4 concurrent SSH sessions; a 3 s evaluation with 50/50 pings
+answered meanwhile; an outbound TCP client; log shipping.
+
 ## The QEMU rig (/home/claude/qemu-zero)
 
 QEMU 11.1.3 built locally (branch `zero-fidelity`) with what the Zero's bus does and stock

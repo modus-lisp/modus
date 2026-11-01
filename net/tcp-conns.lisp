@@ -238,10 +238,25 @@
           (setf (svref u 3) now (svref u 4) (min 4000 (* 2 (svref u 4))) (svref u 5) (+ 1 (svref u 5))))))
     (setf *tcp-conns* (remove :closed *tcp-conns* :key #'tc-state))))
 
+;;; THE NETWORK SERVICE (net/net-service.lisp), when it runs, is the only reader of the NIC:
+;;; one core-0 thread takes every frame and hands it to its connection.  Then NET-PUMP takes
+;;; nothing, and a wait (%PUMP-UNTIL) sleeps until the service's next delivering pass -- the
+;;; generation word it bumps -- instead of pumping.  These live HERE, not in the service's file,
+;;; so that a copy of this file loaded again (kiln zero carries one) agrees with the service.
+(defvar *ns-thread* nil "The network service's thread while it runs, else NIL.")
+(defun %ns-gen-addr () #x11030800)          ; u32 (raw: the waiters may be on any core)
+(defun %ns-gen () (mem-ref (%ns-gen-addr) :u32))
+(defun %ns-wait (addr val ms)
+  "Until the u32 at ADDR is not VAL (ADDR 0: just the time) or MS pass, letting this core's
+   other threads run."
+  (let ((dl (+ (%bt-ticks) (%bt-ms-ticks ms))))
+    (if (%bt-slot-p) (%bt-block addr val dl) (%bt-main-wait addr val dl))))
+
 (defun net-pump (&optional (max 64))
   "Take up to MAX frames off the NIC and give each to its connection or port; then
-   retransmit what is overdue.  The number of frames taken."
-  (with-net-lock (%net-pump-1 max)))
+   retransmit what is overdue.  The number of frames taken -- none while the network
+   service runs: it owns the NIC."
+  (if *ns-thread* 0 (with-net-lock (%net-pump-1 max))))
 
 (defun %net-pump-1 (max)
   (let ((n 0) (me (%our-ip)))
@@ -267,13 +282,19 @@
     n))
 
 (defun %pump-until (pred timeout-ms)
-  "Pump until PRED is true or TIMEOUT-MS pass; PRED's last value.  The network lock is held
-   for each test and pump step and released between them (see the top of the file)."
+  "Wait until PRED is true or TIMEOUT-MS pass; PRED's last value.  The network lock is held
+   for each test and released between them.  Between tests: with the network service
+   running, sleep until its next delivering pass; without it, pump."
   (let ((end (+ (%now-ms) timeout-ms)))
     (loop
-      (let ((v (with-net-lock (funcall pred)))) (when v (return v)))
-      (when (> (%now-ms) end) (return nil))
-      (when (zerop (net-pump)) (%net-idle)))))
+      (let* ((g (%ns-gen))
+             (v (with-net-lock (funcall pred))))
+        (when v (return v))
+        (let ((left (- end (%now-ms))))
+          (when (< left 0) (return nil))
+          (if *ns-thread*
+              (%ns-wait (%ns-gen-addr) g (max 1 (min left 50)))
+              (when (zerop (net-pump)) (%net-idle))))))))
 
 (defun %net-idle ()
   "Nothing arrived: let this core's other threads run (net/bare-threads.lisp's BT-YIELD --
@@ -313,8 +334,12 @@
                           :rip ip :rport port :state :syn-sent
                           :snd-nxt (logand (* 2654435761 (+ (%now-ms) *tcp-port-next*)) #xFFFFFFFF))))
     (with-net-lock (push c *tcp-conns*) (%tcp-emit c #x02))
-    (if (%pump-until (lambda () (member (tc-state c) '(:established :closed))) timeout-ms)
-        (if (eq (tc-state c) :established) c (progn (setf (tc-state c) :closed) nil))
+    ;; Done once the handshake is past :SYN-SENT, whatever came after it: a peer that sends
+    ;; and closes at once has the connection in :CLOSE-WAIT by the time the opener looks (on
+    ;; the Zero, waiting on the network service, an `nc' that answered in 8 ms was reported
+    ;; as no connection).  Its data is in the receive buffer either way.
+    (if (%pump-until (lambda () (not (eq (tc-state c) :syn-sent))) timeout-ms)
+        (if (member (tc-state c) '(:established :close-wait)) c (progn (setf (tc-state c) :closed) nil))
         (progn (setf (tc-state c) :closed) nil))))
 
 (defun tcpc-write (c data &key (start 0) end (timeout-ms 10000))

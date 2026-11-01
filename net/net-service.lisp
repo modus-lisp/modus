@@ -129,6 +129,26 @@
     (when (fboundp 'kmsg-ship-step) (kmsg-ship-step))
     (%ns-wait 0 0 1000)))
 
+;;; ---- the date: a board has no RTC --------------------------------------------------------
+;;; GET-UNIVERSAL-TIME counts from boot (midnight) until something sets it.  SNTP through the
+;;; I/O core (net/bare-sockets.lisp BARE-SET-CLOCK: DNS for pool.ntp.org, then NTP), on a core-0
+;;; thread of its own so nothing waits for the network: retried until it answers (the link may
+;;; still be coming up), then again every 6 hours.  kmsg CLKS: 1 set (the year), 0 not yet.
+(defvar *ns-clock* nil)
+(defun %ns-clock-main ()
+  (let ((tries 0))
+    (loop
+      (when *ns-stop* (return :stopped))
+      (let ((ut (handler-case (and (fboundp 'bare-set-clock) (funcall 'bare-set-clock))
+                  (error () nil))))
+        (incf tries)
+        (if ut
+            (progn (kmsg-event 1 "CLKS" 1 (nth-value 5 (decode-universal-time ut 0)) tries)
+                   (setq tries 0)
+                   (%ns-wait 0 0 (* 6 3600 1000)))
+            (progn (when (or (= tries 1) (zerop (mod tries 10))) (kmsg-event 2 "CLKS" 0 tries 0))
+                   (%ns-wait 0 0 (if (< tries 6) 10000 600000))))))))
+
 ;;; ---- control ----------------------------------------------------------------------------
 (defun net-service-start (&key (pause-ms *ns-pause-ms*) (ship t))
   "Give the network to the I/O core and start core 0's side.  :STARTED, :ALREADY or why not."
@@ -143,6 +163,7 @@
      (fill *ns-stats* 0) (fill *ns-wd* 0)
      (setq *ns-watchdog* (sb-thread:make-thread #'%ns-watchdog-main :name "core-0 watchdog")
            *ns-shipper* (and ship (sb-thread:make-thread #'%ns-shipper-main :name "kmsg shipper"))
+           *ns-clock* (sb-thread:make-thread #'%ns-clock-main :name "clock")
            *ns-up* t)
      (kmsg-event 1 "NETS" 1 pause-ms 0)
      :started)))

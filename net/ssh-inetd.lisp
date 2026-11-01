@@ -3,10 +3,9 @@
 ;;;; The service (net/net-service.lisp) listens on port 22 and accepts; each connection gets a
 ;;;; SESSION thread on cores 1..3 that runs the whole SSH protocol (key exchange, host-key
 ;;;; signature, ciphers, channels: net/ssh.lisp) in its own core's heap and talks to the
-;;;; network only through its slot's channel.  Commands are evaluated on core 0 by the
-;;;; service ((:eval ...)), each on a core-0 thread of its own.  Nothing here runs on the
-;;;; main thread and nothing here waits on the NIC, so the main thread stays free -- the
-;;;; serial REPL, or the desk.
+;;;; network only through its slot's channel.  Commands are evaluated on the main thread
+;;;; ((:eval ...), net/net-service.lisp), in turn with the serial REPL, as the old server did.
+;;;; The protocol and its crypto run here, so the main thread is free between commands.
 ;;;;
 ;;;; This is net/isolated-cl.lisp's session half (its net domain was net-actor-main on the
 ;;;; main thread, polling the NIC): the same per-session words in the SSH block --

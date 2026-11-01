@@ -87,7 +87,12 @@
       (funcall *ns-receive*)
       (let* ((idx *ns-legacy-idx*) (head (svref idx 0)))
         (if (= head (svref idx 1))
-            (progn (setf (svref *ns-staged* 0) 0) 0)
+            ;; Nothing yet: let core 0's threads run once -- this service is one of them, and
+            ;; a caller polling here on the MAIN thread (ip.lisp's TCP, the HTTP fetch, inside
+            ;; an SSH evaluation) would otherwise spin with the queue never filled.
+            (progn (setf (svref *ns-staged* 0) 0)
+                   (if (%bt-slot-p) (bt-yield) (%bt-main-idle))
+                   0)
             (let ((v (svref *ns-legacy-bufs* head)) (n (svref *ns-legacy-lens* head)) (b (%ns-stage)))
               (dotimes (k n) (setf (mem-ref (+ b k) :u8) (aref v k)))
               (setf (svref idx 0) (mod (1+ head) 32)
@@ -194,9 +199,15 @@
 ;;;     (:send SLOT BYTES)   (:close SLOT)   (:eval SLOT STRING)
 ;;; The service never blocks on a handler: what it is given to send waits in the slot's
 ;;; queue for window, and a handler that died without (:close) is closed for it.
-;;; (:eval SLOT STRING) reads and evaluates STRING on a CORE-0 THREAD of its own (core 0 is
-;;; the image's Lisp domain: a thread on cores 1..3 may not intern or set a global), so a
-;;; long evaluation holds up neither the network nor the other sessions.
+;;; (:eval SLOT STRING) reads and evaluates STRING on the MAIN THREAD, in the order they
+;;; arrive, while it waits at the console for a key (%BT-MAIN-JOBS, below) -- what the old
+;;; server did, and what a client like kiln's desk relies on: `(kiln-zero-main)' sent over
+;;; SSH takes the main thread over.  Not on a thread of its own: evaluation off the main
+;;; thread loses SETQs under DOTIMES/DOLIST and can wedge core 0 (measured on the Zero:
+;;; (let ((s 0)) (dotimes (i 3) (setq s (+ s 1))) s) is 3 on main and 0 on a core-0 thread,
+;;; and EVAL of a fresh form on a thread hung the board).  While main evaluates, core 0's
+;;; other threads -- this service among them -- wait for it to sleep, wait or finish (the
+;;; watchdog logs the pause, PAUS); a busy evaluation holds up the network, as it did before.
 
 (defun %ns-nslots () 8)
 (defvar *ns-listeners* nil "Alist port -> (listener . spawn).")
@@ -218,6 +229,7 @@
     (setq *ns-chan-send* (%ns-modus-fn "CHANNEL-SEND")
           *ns-chan-try* (%ns-modus-fn "CHANNEL-TRY-RECEIVE")
           *ns-chan-recv* (%ns-modus-fn "CHANNEL-RECEIVE"))
+    (setq *ns-main-jobs* (funcall (%ns-modus-fn "MAKE-CHANNEL") :capacity 262144 :name "to the main thread"))
     (setq *ns-to-service* (funcall (%ns-modus-fn "MAKE-CHANNEL") :capacity 262144 :name "to the network service")
           *ns-slot-ch* (make-array (%ns-nslots))
           *ns-slots* (make-array (%ns-nslots) :initial-element nil))
@@ -299,11 +311,24 @@
             (case (car m)
               (:send (setf (svref s 2) (append (svref s 2) (list (cons (caddr m) 0)))))
               (:close (setf (svref s 3) :closing))
-              (:eval (let ((ch (svref *ns-slot-ch* (cadr m))) (text (caddr m)))
-                       (%ns-incf *ns-stats* 11)
-                       (sb-thread:make-thread
-                        (lambda () (%ns-send ch (list :result (%ns-eval-bytes text))))
-                        :name "eval"))))))))))
+              (:eval (%ns-incf *ns-stats* 11)
+                     (%ns-send *ns-main-jobs* (list (cadr m) (caddr m)))))))))))
+
+;;; The main thread's side: the console's wait (net/bare-threads.lisp %CONSOLE-IDLE) runs one
+;;; job at a time, never nested -- an evaluation that itself waits at the console does not
+;;; start the next one.
+(defvar *ns-main-jobs* nil "(SLOT STRING) evaluations for the main thread, oldest first.")
+(defvar *ns-main-busy* nil)
+
+(defun %bt-main-jobs ()
+  (when (and *ns-main-jobs* (not *ns-main-busy*) (zerop (percpu-ref 16)))
+    (let ((m (%ns-try *ns-main-jobs*)))
+      (when m
+        (setq *ns-main-busy* t)
+        (unwind-protect
+             (%ns-send (svref *ns-slot-ch* (car m)) (list :result (%ns-eval-bytes (cadr m))))
+          (setq *ns-main-busy* nil))
+        t))))
 
 (defun %ns-relays-step ()
   "Accept, carry bytes both ways, retire finished slots.  T when anything moved."

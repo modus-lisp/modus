@@ -1208,4 +1208,11 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
 ;;; The REPL waits for a key in the console seams (net/usb-hid-split.lisp): with the
 ;;; layer up, that wait runs core 0's threads.
 (defun %console-wants-poll () (%bt-up-p))
-(defun %console-idle () (%bt-main-idle))
+(defun %console-idle () (%bt-main-jobs) (%bt-main-idle))
+
+;; Work that must run on the MAIN thread, handed over by threads: the network service's
+;; evaluations (net/net-service.lisp defines it when it is loaded).  Only from the console's
+;; wait, where main is between forms -- not from its other waits (a sleep inside the desk),
+;; which would run it in the middle of whatever main was doing.
+(declaim (overridable %bt-main-jobs))
+(defun %bt-main-jobs () nil)

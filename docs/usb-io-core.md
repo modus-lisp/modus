@@ -249,9 +249,19 @@ and evaluated by `ssh-boot` the first time (they need CLOS and the SB-THREAD sur
 - **inetd**: `(net-service-listen port spawn)` -- the service accepts each connection,
   gives it a slot and a channel, and calls SPAWN, which starts a handler thread.
   Messages: service -> handler `(:data bytes)` `(:close)` `(:result bytes)`; handler ->
-  service `(:send slot bytes)` `(:close slot)` `(:eval slot string)`.  An `:eval` runs on
-  a core-0 thread of its own, so a long evaluation holds up neither the network nor the
-  other sessions.
+  service `(:send slot bytes)` `(:close slot)` `(:eval slot string)`.
+- **Evaluations run on the MAIN thread**, one at a time, while it waits at the console for
+  a key (`%bt-main-jobs`, called from `%console-idle`) -- as the old server's did, and as
+  kiln relies on: `(kiln-zero-main)` sent over SSH takes the main thread over.  They first
+  ran on core-0 threads of their own, and that is wrong today: **evaluation off the main
+  thread loses SETQs** -- `(let ((s 0)) (dotimes (i 3) (setq s (+ s 1))) s)` is 3 on main
+  and 0 on a core-0 thread -- and EVAL of a fresh form on a thread, even one main started,
+  wedged core 0.  (A closure compiled on main runs correctly on a thread; it is runtime
+  compilation off main that breaks.  Open.)  The cost: while main evaluates, core 0's other
+  threads, this service among them, wait until it sleeps, waits or finishes, so a busy
+  evaluation holds up the network (the watchdog logs it, `PAUS`).  And `ip.lisp`'s TCP,
+  polling the NIC from main inside an evaluation, lets core 0's threads run once on every
+  empty poll, or the service that fills its queue never ran (kiln's install fetch timed out).
 - **SSH sessions** (`ssh-serve`) run the whole protocol on cores 2-3 -- never core 1,
   whose engine never yields -- one of four SSH blocks each.  Their waits are REAL TIME:
   30 s for the client's version string, 60 s idle before authentication.  ssh.lisp counts
@@ -261,8 +271,10 @@ and evaluated by `ssh-boot` the first time (they need CLOS and the SB-THREAD sur
 - **Log shipping** (`net/kmsg-ship.lisp`): `(modus:kmsg-ship-to host [port 514])` sends the
   message log as syslog over UDP from the service's shipper thread.
 
-Measured on the Zero: 4 concurrent SSH sessions; a 3 s evaluation with 50/50 pings
-answered meanwhile; an outbound TCP client; log shipping.
+Measured on the Zero: 4 concurrent SSH sessions; an outbound TCP client; log shipping;
+kiln's whole desk install (`kiln zero --netboot`: fetch, compile, `jit-eager`, start)
+through SSH evaluations, and the desk then up with the network (ping 0.75 ms avg) and
+SB-BSD-SOCKETS working from it.
 
 ## The QEMU rig (/home/claude/qemu-zero)
 

@@ -1335,7 +1335,7 @@
                             (let ((p (merge-pathnames f (merge-pathnames "net/" *modus-base*))))
                               (modus.mvm::check-parses p)
                               (concatenate 'string (read-file-text p) (string #\Newline))))
-                          '("tcp-conns.lisp" "net-service.lisp" "ssh-inetd.lisp"))))))
+                          '("tcp-conns.lisp" "net-service.lisp" "main-jobs.lisp" "ssh-inetd.lisp"))))))
 
 ;; MODUS_SSH_ISOLATED=1 (with MODUS_SSH_BUILD=1 and MODUS_RPI_THREADS=1): the
 ;; isolated server -- see net/isolated-cl.lisp.  Threads are the substrate, so

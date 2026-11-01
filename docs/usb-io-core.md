@@ -294,11 +294,16 @@ client's version, 60 s idle before authentication; ssh.lisp's 50-poll version wa
 and dropped any slower client right after its KEXINIT).  A session lets the client hang up
 first: a FIN that overtook its DISCONNECT read as "closed by remote host".
 
-**Evaluations run on the main thread**, one at a time, while it waits at the console for a
-key -- as the old server's did, and as kiln relies on (`(kiln-zero-main)` over SSH takes the
-main thread over).  Off the main thread, evaluation is wrong today: `(let ((s 0)) (dotimes
-(i 3) (setq s (+ s 1))) s)` is 3 on main and 0 on a core-0 thread, and EVAL of a fresh form
-on a thread wedged core 0 (open).  So an SSH command waits while main is busy.
+**Evaluations are JOBS on the main thread** (`net/main-jobs.lisp`) -- the one place evaluation
+is correct today: off it, `(let ((s 0)) (dotimes (i 3) (setq s (+ s 1))) s)` is 0 instead of 3
+and EVAL of a fresh form on a thread wedged core 0 (open).  An SSH command is a blocking job;
+`(detach FORM :name "desk")` queues one and returns its name at once; `(jobs)`, `(attach
+NAME)` (its output since the last look, its status and result), `(stop-job NAME)`.  Jobs run
+from the console's wait, and from `(serve-jobs)`, which a long-running job calls at safe
+points -- the desk between frames -- so SSH works while the desk runs, and a stop unwinds the
+job from there through its cleanup.  `kiln zero` starts the desk detached, as job `desk`.
+First use: `(attach "desk")` showed the desk failing every draw on `GLASS::FB-FORMAT` (a glass
+older than kiln's pin in the workspace it was installed from) -- invisible until then.
 
 Measured on the Zero (`ion-hw.sh`): SSH 6/6 one-shot, interactive, 4 concurrent; 4 MB in
 in 1.1 s with a position-weighted checksum matching 3/3; 1 MB out in 0.5 s, byte-exact;

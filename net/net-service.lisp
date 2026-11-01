@@ -10,9 +10,9 @@
 ;;;;               the handler -- a thread anywhere, cores 2..3 included -- which reads and
 ;;;;               writes the connection itself (ION-READ / ION-WRITE / ION-CLOSE: no relay, no
 ;;;;               copy through the service).  SLOT names the handler's reply channel.
-;;;;   EVALUATION  (NET-SERVICE-EVAL SLOT STRING): STRING is read and evaluated on the MAIN
-;;;;               thread, in turn with the serial REPL, while it waits at the console for a key
-;;;;               (%BT-MAIN-JOBS); the reply, (:RESULT BYTES), arrives on SLOT's channel.  Not on
+;;;;   EVALUATION  (NET-SERVICE-EVAL SLOT STRING): STRING becomes a blocking JOB on the MAIN
+;;;;               thread (net/main-jobs.lisp), run in turn with the serial REPL and any other
+;;;;               jobs; the reply, (:RESULT BYTES), arrives on SLOT's channel.  Not on
 ;;;;               a thread of its own: evaluation off the main thread loses SETQs under
 ;;;;               DOTIMES/DOLIST and can wedge core 0 (measured on the Zero: (let ((s 0))
 ;;;;               (dotimes (i 3) (setq s (+ s 1))) s) is 3 on main and 0 on a core-0 thread), and
@@ -48,7 +48,6 @@
 (defvar *ns-chan-try* nil)
 (defvar *ns-chan-recv* nil)
 (defvar *ns-main-jobs* nil "(SLOT STRING) evaluations for the main thread, oldest first.")
-(defvar *ns-main-busy* nil)
 (defvar *ns-slot-ch* nil "Each slot's reply channel, made once.")
 (defvar *ns-slots* nil "Each slot: 0 free, 1 a handler holds it (a fixnum: handlers on any core write it).")
 (defvar *ns-listeners* nil "Alist port -> accept thread.")
@@ -76,33 +75,6 @@
   "Evaluate TEXT on the main thread; (:RESULT BYTES) arrives on SLOT's channel."
   (%ns-incf *ns-stats* 11)
   (%ns-send *ns-main-jobs* (list slot text)))
-
-(defun %ns-eval-bytes (s)
-  "The reply to evaluating S: what it printed, then `= VALUE'."
-  (let* ((out nil)
-         (result (handler-case
-                     (let ((so (make-string-output-stream)))
-                       (let ((r (let ((*standard-output* so)) (eval (read-from-string s)))))
-                         (setq out (get-output-stream-string so))
-                         r))
-                   (error (c) (list 'error c))))
-         (rs (handler-case (prin1-to-string result) (error () "#<unprintable>")))
-         (text (concatenate 'string (or out "") "= " rs (string #\Newline)))
-         (v (make-array (length text) :element-type '(unsigned-byte 8))))
-    (dotimes (i (length text) v) (setf (aref v i) (logand (char-code (char text i)) 255)))))
-
-;;; The main thread's side: the console's wait (net/bare-threads.lisp %CONSOLE-IDLE) runs one
-;;; job at a time, never nested -- an evaluation that itself waits at the console does not
-;;; start the next one.
-(defun %bt-main-jobs ()
-  (when (and *ns-main-jobs* (not *ns-main-busy*) (zerop (percpu-ref 16)))
-    (let ((m (%ns-try *ns-main-jobs*)))
-      (when m
-        (setq *ns-main-busy* t)
-        (unwind-protect
-             (%ns-send (svref *ns-slot-ch* (car m)) (list :result (%ns-eval-bytes (cadr m))))
-          (setq *ns-main-busy* nil))
-        t))))
 
 ;;; ---- inetd ------------------------------------------------------------------------------
 (defun %ns-free-slot ()

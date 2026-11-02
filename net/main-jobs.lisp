@@ -128,13 +128,20 @@
     j))
 
 (defun %jobs-take-commands ()
-  "SSH commands waiting on the channel become blocking jobs."
+  "Evaluations waiting on the channel become jobs: (SLOT TEXT), where SLOT is an SSH handler's
+   reply channel (a blocking job) or -1 for none -- a thread on another core asking the main
+   thread to run something.  A number, not NIL: a thread sends plain data, and a symbol in a
+   message is encoded by name through the package tables, which a thread may not touch."
   (when *ns-main-jobs*
     (loop
       (let ((m (%ns-try *ns-main-jobs*)))
         (unless m (return))
-        (%job-add (%make-job :name (%job-name (format nil "ssh-~D" (incf *job-counter*)))
-                             :text (cadr m) :reply-slot (car m)))))))
+        (let ((slot (car m)))
+          (%job-add (%make-job :name (%job-name (if (and (integerp slot) (>= slot 0))
+                                                    (format nil "ssh-~D" (incf *job-counter*))
+                                                    nil))
+                               :text (cadr m)
+                               :reply-slot (and (integerp slot) (>= slot 0) slot))))))))
 
 (defun %jobs-step (max-depth)
   "Run the next queued job if this depth allows one.  T when one ran."

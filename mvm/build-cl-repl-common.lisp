@@ -1322,7 +1322,18 @@
   (let* ((st (e1000-state-base))
          (gw0 (mem-ref (+ st #x1C) :u32)))
     (setf (mem-ref (+ st #x60) :u32) 0)
-    (handler-case (dhcp-client) (error () nil))
+    ;; AGAIN AND AGAIN for about 40 s: DHCP-CLIENT sends one DISCOVER, and on a board the bus
+    ;; reset just before it drops the adapter's link, which takes seconds to come back --
+    ;; and the server at the other end (a router, NetworkManager's dnsmasq) may only start
+    ;; when that link does.  Measured on a Zero: the one DISCOVER never reached dnsmasq.
+    (let ((t0 (get-universal-time)))
+      (loop
+        (handler-case (dhcp-client) (error () nil))
+        (when (or (eql (mem-ref (+ st #x60) :u32) 3)
+                  (> (- (get-universal-time) t0) 40))
+          (return nil))
+        (setf (mem-ref (+ st #x1C) :u32) gw0)
+        (setf (mem-ref (+ st #x60) :u32) 0)))
     (if (eql (mem-ref (+ st #x60) :u32) 3)
         ;; leased: DHCP-PARSE-OFFER kept the gateway as a host-order number, and the I/O core
         ;; reads +0x1C as the address's four bytes in network order, as SSH-BOOT writes it
@@ -2808,7 +2819,7 @@
         ;; check PEEKS (data-ready), so that byte still reaches the REPL.  Pi only
         ;; (the 1 MHz system timer); elsewhere the hook just runs.
         "    (when (and (boundp (quote *core-restart-hook*)) *core-restart-hook*)
-      (write-string-serial \"CORE-RESTART-HOOK (a byte on serial within 2 s: the REPL instead)\")
+      (write-string-serial \"CORE-RESTART-HOOK (a key, or a byte on serial, within 2 s: the REPL instead)\")
       (write-char-serial 10)
       (let ((skip nil))
 "
@@ -2823,7 +2834,14 @@
         (let ((t0 (mem-ref #x3F003004 :u32)))
           (loop
             (when (or skip (> (logand (- (mem-ref #x3F003004 :u32) t0) #xFFFFFFFF) 2000000)) (return nil))
-            (when (and (fboundp (quote hid-serial-ready-p)) (hid-serial-ready-p)) (setq skip t))))
+            (when (and (fboundp (quote hid-serial-ready-p)) (hid-serial-ready-p)) (setq skip t))
+            ;; ...or a key on the USB keyboard (brought up just above, HID-CONSOLE-INIT): the
+            ;; REPL then reads that keyboard and draws on the HDMI console, as the serial one
+            ;; does.  The key itself is taken off the ring, not handed to the REPL.
+            (when (and (not skip) (fboundp (quote hid-split-poll)) (fboundp (quote hid-ready-p))
+                       (hid-ready-p))
+              (handler-case (hid-split-poll) (t (c) nil))
+              (when (>= (hid-ring-pop) 0) (setq skip t)))))
 "
             "")
         "        (unless skip

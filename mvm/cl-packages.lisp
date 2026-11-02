@@ -802,8 +802,13 @@
              (let ((ans (and (not (%fn-key-system-pkg-name-p name-string))
                              (gethash (compute-name-hash name-string) *runtime-born-pkgs*)
                              t)))
-               (setq *runtime-born-answers*
-                     (cons (cons name-string ans) *runtime-born-answers*))
+               ;; memoised by the MAIN thread only: the memo is a shared global, and a
+               ;; worker's cons stored there is the store bare metal's shared-store guard
+               ;; refuses (a card's desk thread read a special first, before main had --
+               ;; the board reset).  A worker computes the answer every time instead.
+               (when (modus-int::%mvm-on-main-thread-p)
+                 (setq *runtime-born-answers*
+                       (cons (cons name-string ans) *runtime-born-answers*)))
                (return ans)))
            (when (eq (car (car cur)) name-string) (return (cdr (car cur))))
            (setq cur (cdr cur))))))

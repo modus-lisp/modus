@@ -815,6 +815,10 @@
 (defun %irun-ns () (%irt-ns))
 "
         (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* "")
+        ;; PACKED (UNSIGNED-BYTE 32) VECTORS ON (prelude.lisp %U32-VECTORS-P), on the Pi only:
+        ;; not in the shared core source above, which the bare x64 images include too and
+        ;; whose compilers do not set *U32-VECTORS-P*
+        (if *cl-repl-rpi-p* (format nil "~%(defun %u32-vectors-p () t)~%") "")
         ;; GPIO / system timer / activity LED (what the mini-Lisp rpi-periph image had).
         (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") ""))))
 
@@ -2960,6 +2964,8 @@
 ;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*) wherever
 ;; *CL-REPL-RPI-CORE-SOURCE* turns %NARROW-STRINGS-P on.
 (when cl-user::*cl-repl-rpi-p* (setq *narrow-literals-p* t))
+;; ... and packed u32 vectors' arms (compiler.lisp *U32-VECTORS-P*), with them.
+(when cl-user::*cl-repl-rpi-p* (setq *u32-vectors-p* t))
 
 ;;; DIVERGENCE 6/7 (:I386 arm) — the 32-bit x86 boot descriptor and console.
 ;;;

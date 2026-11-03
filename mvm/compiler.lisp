@@ -72,6 +72,12 @@
 ;; than a new #x31 layout: code that reads a #x31 string as words and was not
 ;; taught #x15 says "not a string" instead of reading the wrong bytes.
 (defconstant +subtag-string32+ #x15)
+;; PACKED (unsigned-byte 32) VECTOR: (simple-array (unsigned-byte 32) (*)) in a build that
+;; makes them (%U32-ON-P) -- the same layout as #x15 32-bit strings, one raw u32 per element at
+;; 16 + 4I, read and written by the same %C32-REF / %C32-SET -- but integers, not
+;; characters.  4 bytes an element where the word form spends 8, and the 32-bit lanes
+;; XRGB8888 pixels are, so a framebuffer is the bytes a display controller reads.
+(defconstant +subtag-u32-vector+ #x17)
 (defconstant +subtag-f32-vector+ #x12)  ; packed single-float vector (4-byte IEEE32 lanes)
 (defconstant +subtag-ratio+  #x33)   ; 2-slot: numerator, denominator
 (defconstant +subtag-mda+    #x34)   ; 7-slot multi-dim array header:
@@ -1222,6 +1228,16 @@
    unmodified ansi-test's compile-and-load.lsp replaced COMPILE-FILE-PATHNAME
    with its own fallback.  Saved/restored with SETQ, not LET (see
    *MVM-GENSYM-COUNTER*).")
+
+(defvar *u32-vectors-p* nil
+  "Host flag: this build packs (simple-array (unsigned-byte 32) (*)) as #x17 (its
+   collectors know the subtag).  The image's own compiler asks %U32-VECTORS-P instead.
+   Set by build-generic-cli and the Pi board build; NOT by the UEFI or aarch64-Linux
+   images, so the DDC's two compilers agree without a self-host setting.")
+
+(defun %u32-on-p ()
+  "Does this build make packed u32 vectors (#x17), and so emit their arms?"
+  (if *mvm-eval-runtime-p* (%u32-vectors-p) *u32-vectors-p*))
 
 (defun %string32-on-p ()
   "Does this build make #x15 strings (and so emit their arms)?  The AOT build
@@ -3848,6 +3864,7 @@
       (when ok
         (let ((ty (list 'simple-array et (list '*))))
           (cond ((%u8-simple-array-decl-p ty) ty)
+                ((%u32-simple-array-decl-p ty) ty)
                 ((%generic-element-type-p et) ty)
                 ;; the packed single-float vector a declared f32 array is
                 ;; (illatio's f32-dot16 accumulator: every AREF was generic)
@@ -24596,6 +24613,11 @@
     (emit-ir :li temp2 (ash +subtag-string32+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
+    ;; packed (unsigned-byte 32) vector (subtag #x17), in a build that makes them
+    (when (%u32-on-p)
+      (emit-ir :li temp2 (ash +subtag-u32-vector+ +fixnum-shift+))
+      (emit-ir :cmp temp temp2)
+      (emit-ir :beq true-label))
     (emit-ir-label false-label)
     (compile-nil dest)
     (emit-ir :br end-label)
@@ -25983,7 +26005,25 @@
            (integerp (cadr ty))
            (let ((n (symbol-name (car ty))) (w (cadr ty)))
              (or (and (string= n "SIGNED-BYTE")   (member w '(32 64)))
-                 (and (string= n "UNSIGNED-BYTE") (member w '(16 32 64))))))))
+                 (and (string= n "UNSIGNED-BYTE")
+                      ;; with packed u32 vectors every unsigned width up to 32 upgrades
+                      ;; to them (monotonic upgrading), so only 64 stays a word array
+                      (member w (if (%u32-on-p) '(64) '(16 32 64)))))))))
+
+(defun %u32-simple-array-decl-p (ty)
+  "True for a declared (simple-array (unsigned-byte 32) ...) in a build that packs it (#x17):
+   element access is %C32-REF / %C32-SET, a raw 32-bit lane."
+  (and (%u32-on-p)
+       (consp ty) (symbolp (car ty))
+       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (consp (cdr ty))
+       (let ((et (cadr ty)))
+         (and (consp et) (symbolp (car et)) (consp (cdr et)) (null (cddr et))
+              (string= (symbol-name (car et)) "UNSIGNED-BYTE")
+              (eql (cadr et) 32)))))
+
+(defun %declared-u32-array-var-p (form env)
+  (and form (symbolp form) (%u32-simple-array-decl-p (%expr-dtype form env))))
 
 (defun %inline-generic-element-type-p (form)
   "True for a QUOTED generic element-type form, (quote TY) — see
@@ -26812,6 +26852,20 @@
       (compile-form nil env dest))))
 
 ;;; %PRIM-AREF / %PRIM-ASET — subtag-dispatching primitive element access.
+(defun %prim-dispatch-form (g-arr u8-form s32-form u32-form word-form)
+  "The subtag dispatch both expand to: byte-packed (#x11 u8 vector, #x13 narrow string),
+   then the 32-bit-lane kinds the build makes (#x15 strings: %STRING32-ON-P; #x17 u32
+   vectors: %U32-ON-P), then the tagged word."
+  (if (not (or (%u32-on-p) (%string32-on-p)))
+      ;; neither: the historic shape, so such an image compiles exactly as before
+      `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13)) ,u8-form ,word-form)
+      (let ((tail word-form))
+        (when (%u32-on-p) (setq tail `(if (eq st #x17) ,u32-form ,tail)))
+        (when (%string32-on-p) (setq tail `(if (eq st #x15) ,s32-form ,tail)))
+        `(let ((st (obj-subtag ,g-arr)))
+           (if (or (eq st #x11) (eq st #x13)) ,u8-form ,tail)))))
+
+
 ;;; A byte-packed u8 vector (subtag #x11) reads/writes a single byte via
 ;;; %u8-ref/%u8-set; every other object (general array #x32, string #x31,
 ;;; etc.) uses the tagged-word path (%word-aref/%word-aset).  The dispatch
@@ -26829,19 +26883,14 @@
         ;; common one — 19 ns of call per element read.  compile-eql now
         ;; folds this itself, but say what is meant.
         ;; byte-packed: a u8 vector (#x11) or a narrow string (#x13)
-        ,(if (%string32-on-p)
-             `(let ((st (obj-subtag ,g-arr)))
-                (if (or (eq st #x11) (eq st #x13))
-                    (%u8-ref ,g-arr ,g-idx)
-                    ;; 32-bit string: out of line (prelude.lisp %C32-AREF) -- an
-                    ;; inline arm put an index check and its cold call at every
-                    ;; %PRIM-AREF site in the image, +0.5 MB of JIT code
-                    (if (eq st #x15)
-                        (%c32-aref ,g-arr ,g-idx)
-                        (%word-aref ,g-arr ,g-idx))))
-             `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
-                  (%u8-ref ,g-arr ,g-idx)
-                  (%word-aref ,g-arr ,g-idx))))
+        ;; 32-bit strings and packed u32 vectors: out of line (prelude.lisp %C32-AREF) --
+        ;; an inline arm put an index check and its cold call at every %PRIM-AREF site in
+        ;; the image, +0.5 MB of JIT code.  Each arm only in a build that makes the kind.
+        ,(%prim-dispatch-form g-arr
+                              `(%u8-ref ,g-arr ,g-idx)
+                              `(%c32-aref ,g-arr ,g-idx)
+                              `(%c32-aref ,g-arr ,g-idx)
+                              `(%word-aref ,g-arr ,g-idx)))
      env dest)))
 
 (defun compile-struct-slot (args setp env dest)
@@ -26896,16 +26945,11 @@
     (compile-form
      `(let ((,g-arr ,arr-form) (,g-idx ,idx-form) (,g-val ,val-form))
         ;; EQ, not EQL — see compile-prim-aref.
-        ,(if (%string32-on-p)
-             `(let ((st (obj-subtag ,g-arr)))
-                (if (or (eq st #x11) (eq st #x13))
-                    (%u8-set ,g-arr ,g-idx ,g-val)
-                    (if (eq st #x15)
-                        (%c32-aset ,g-arr ,g-idx ,g-val)   ; out of line, as above
-                        (%word-aset ,g-arr ,g-idx ,g-val))))
-             `(if (or (eq (obj-subtag ,g-arr) #x11) (eq (obj-subtag ,g-arr) #x13))
-                  (%u8-set ,g-arr ,g-idx ,g-val)
-                  (%word-aset ,g-arr ,g-idx ,g-val))))
+        ,(%prim-dispatch-form g-arr
+                              `(%u8-set ,g-arr ,g-idx ,g-val)
+                              `(%c32-aset ,g-arr ,g-idx ,g-val)
+                              `(%u32-aset ,g-arr ,g-idx ,g-val)
+                              `(%word-aset ,g-arr ,g-idx ,g-val)))
      env dest)))
 
 (defun compile-prim-array-length (arr-form env dest)
@@ -27248,6 +27292,9 @@
   (when (%declared-f32-array-var-p arr-form env)
     (return-from compile-aref
       (compile-f32-load arr-form idx-form env dest)))
+  ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane.
+  (when (%declared-u32-array-var-p arr-form env)
+    (return-from compile-aref (compile-c32-ref arr-form idx-form env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
   ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
   (when (%declared-generic-array-var-p arr-form env)
@@ -27451,6 +27498,18 @@
       (return-from compile-aset nil))
     (return-from compile-aset
       (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))
+  ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane -- the
+  ;; value checked to be such an integer unless (safety 0), as every checked path is.
+  (when (%declared-u32-array-var-p arr-form env)
+    (return-from compile-aset
+      (if (%bounds-check-p)
+          (let ((g (%mvm-gensym "U32V")))
+            (compile-form `(let ((,g ,val-form))
+                             (if (and (fixnump ,g) (>= ,g 0) (<= ,g 4294967295))
+                                 (%c32-set ,arr-form ,idx-form ,g)
+                                 (%u32-aset ,arr-form ,idx-form ,g)))
+                          env dest))
+          (compile-c32-set arr-form idx-form val-form env dest))))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot store, no
   ;; wrapper/string/mda dispatch and no char->code coercion (never a string).
   (when (%declared-generic-array-var-p arr-form env)

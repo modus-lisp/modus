@@ -3870,6 +3870,9 @@
     ;; character / bit.
     ;; Packed single-float vector (subtag #x12): element type is exactly
     ;; SINGLE-FLOAT; matches the float/real/number supertypes, not T.
+    ((eql (obj-subtag arr) #x17)
+     (or (null elt) (eq elt '*)
+         (equal (upgraded-array-element-type elt) '(unsigned-byte 32))))
     ((eql (obj-subtag arr) #x12)
      (or (null elt) (eq elt '*)
          (%typename-eq elt 'single-float) (%typename-eq elt 'short-float)
@@ -5522,6 +5525,9 @@
     ;; packed single-float vector (subtag #x12)
     ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x12))
      (list 'simple-array 'single-float (list (length obj))))
+    ;; packed (unsigned-byte 32) vector (subtag #x17)
+    ((and (not (consp obj)) (not (%mda-p obj)) (eql (obj-subtag obj) #x17))
+     (list 'simple-array '(unsigned-byte 32) (list (length obj))))
     ;; Other arrays by their ELEMENT TYPE: a byte vector is
     ;; (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (n)), not SIMPLE-VECTOR (CLHS: a
     ;; simple-vector holds T).  Non-simple (fill pointer) vectors as for strings.
@@ -5995,7 +6001,8 @@
                (not (%complex-p obj))
                (or (= (obj-subtag obj) #x31) (= (obj-subtag obj) #x32)
                    (= (obj-subtag obj) #x11) (= (obj-subtag obj) #x12)
-                   (= (obj-subtag obj) #x13) (= (obj-subtag obj) #x15))
+                   (= (obj-subtag obj) #x13) (= (obj-subtag obj) #x15)
+                   (= (obj-subtag obj) #x17))
                (let* ((et (and (cdr type) (%element-type-expand (cadr type))))
                       (sz-given (and (cddr type) t))
                       (sz (and (cddr type) (caddr type)))
@@ -6009,6 +6016,8 @@
                       ;; Packed single-float vector (subtag #x12): element
                       ;; type is exactly SINGLE-FLOAT, NOT T.
                       (is-f32     (= (obj-subtag obj) #x12))
+                      ;; Packed (unsigned-byte 32) vector (subtag #x17).
+                      (is-u32     (= (obj-subtag obj) #x17))
                       (is-bitvec  (and is-array
                                        (> (array-length obj) 0)
                                        (bit-vector-p obj)))
@@ -6040,6 +6049,10 @@
                                       (eq (car et) 'mod)))
                              t)
                             (t nil)))
+                         ;; u32 vector: exactly the element types that upgrade to it
+                         (is-u32
+                          (or (null et) (eq et '*)
+                              (equal (upgraded-array-element-type et) '(unsigned-byte 32))))
                          ;; f32 vector: single-float and its float/real/number
                          ;; supertypes; NOT T / character / integer types.
                          (is-f32

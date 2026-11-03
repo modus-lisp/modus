@@ -481,6 +481,9 @@
        (not (eq (obj-subtag src) #x11))
        (not (eq (obj-subtag dst) #x12))
        (not (eq (obj-subtag src) #x12))
+       ;; packed (unsigned-byte 32) vectors (#x17): 4-byte lanes, not words
+       (not (eq (obj-subtag dst) #x17))
+       (not (eq (obj-subtag src) #x17))
        ;; narrow strings (#x13) are byte-packed too
        (not (eq (obj-subtag dst) #x13))
        (not (eq (obj-subtag src) #x13))
@@ -490,6 +493,12 @@
        (if (%prim-stringp dst)
            (%prim-stringp src)
            (not (%prim-stringp src)))))
+
+;;; PACKED (UNSIGNED-BYTE 32) VECTORS (compiler.lisp +SUBTAG-U32-VECTOR+, #x17): 4 bytes an
+;;; element.  %U32-VECTORS-P says whether this build makes them -- its collectors size #x17
+;;; -- and the builds that do override it to T (build-generic-cli, the Pi board).
+(declaim (overridable %u32-vectors-p))
+(defun %u32-vectors-p () nil)
 
 ;;; NARROW STRINGS (compiler.lisp +SUBTAG-BASE-STRING+, #x13): a byte per
 ;;; character.  %NARROW-STRINGS-P says whether this build makes them; the
@@ -537,6 +546,24 @@
 (defun %c32-aset (s i code)
   "%PRIM-ASET's 32-bit string arm: store CODE (a character is lowered to its code)."
   (%c32-set s i (if (fixnump code) code (char-code code))))
+
+(defun %make-u32-vector (n)
+  "A fresh packed (unsigned-byte 32) vector (#x17) of N elements, all 0: a byte vector of
+   4N whose header is rewritten to (N << 8) | #x17, as %MAKE-STRING32 does for #x15.  What
+   MAKE-ARRAY makes for a simple vector of an element type that upgrades to
+   (UNSIGNED-BYTE 32), in a build that makes them (%U32-VECTORS-P).  Nothing
+   allocates in between."
+  (let* ((s (%alloc-u8 (* 4 n)))
+         (raw (- (%val->word s) 9)))
+    (setf (mem-ref raw :u32) (logand (logior (ash n 8) #x17) #xFFFFFFFF))
+    (setf (mem-ref (+ raw 4) :u32) (ash n -24))
+    s))
+
+(defun %u32-aset (v i x)
+  "%PRIM-ASET's packed (unsigned-byte 32) arm: store X, which must be such an integer."
+  (if (and (fixnump x) (>= x 0) (<= x 4294967295))
+      (%c32-set v i x)
+      (error 'type-error :datum x :expected-type '(unsigned-byte 32))))
 
 (defun %make-string32 (n)
   "A fresh 32-bit string (#x15) of N characters, all code 0: a byte vector of 4N
@@ -4035,6 +4062,8 @@
                              (eq (obj-subtag seq) #x11)) (%make-u8-vector len))
                        ((and (not (consp seq)) (not (%mda-p seq))
                              (eq (obj-subtag seq) #x12)) (%make-f32-vector len))
+                       ((and (not (consp seq)) (not (%mda-p seq))
+                             (eq (obj-subtag seq) #x17)) (%make-u32-vector len))
                        (t (make-array len)))))
         (let ((i 0))
           (cond

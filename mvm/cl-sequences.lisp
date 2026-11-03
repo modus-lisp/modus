@@ -2011,6 +2011,8 @@
     ((eql (obj-subtag a) #x11) '(unsigned-byte 8))
     ;; Packed single-float vector (subtag #x12).
     ((eql (obj-subtag a) #x12) 'single-float)
+    ;; Packed (unsigned-byte 32) vector (subtag #x17).
+    ((eql (obj-subtag a) #x17) '(unsigned-byte 32))
     (t t)))
 (defun check-type-error (fn args) nil)
 (defun make-array-with-checks (dims &rest args) (if (consp dims) (make-array (car dims)) (make-array dims)))
@@ -2115,6 +2117,19 @@
         (if p
             (make-array size :element-type 'single-float :initial-element (cadr p))
             (make-array size :element-type 'single-float)))))
+  ;; (VECTOR <an element type that upgrades to (UNSIGNED-BYTE 32)>): the packed #x17 vector,
+  ;; as MAKE-ARRAY makes it
+  (when (and (consp type) (eq (car type) 'vector) (consp (cdr type))
+             (%u32-element-type-p (cadr type)))
+    (let ((n (and (consp (cddr type)) (caddr type))))
+      (when (and (integerp n) (not (= n size)))
+        (%signal-type-error)
+        (return-from make-sequence nil)))
+    (return-from make-sequence
+      (let ((p (member :initial-element args)))
+        (if p
+            (make-array size :element-type (cadr type) :initial-element (cadr p))
+            (make-array size :element-type (cadr type))))))
   ;; Resolve a class designator (class object or class-proxy) to its name
   ;; so the dispatch below can match symbols uniformly.  Keeps callers
   ;; using `(find-class 'list)' / `(class-of '(a b c))' working.
@@ -5264,6 +5279,10 @@
     ((%u8-element-type-p type) '(unsigned-byte 8))
     ;; SINGLE-FLOAT (and SHORT-FLOAT) — the packed #x12 vector.
     ((%f32-element-type-p type) 'single-float)
+    ;; Any other type of non-negative integers below 2^32 -- the packed #x17 vector, in a
+    ;; build that has it.  ALL of them, not just (UNSIGNED-BYTE 32): upgrading must be
+    ;; monotonic (CLHS 15.1.2.1), and (UNSIGNED-BYTE 16) is a subtype of it.
+    ((%u32-element-type-p type) '(unsigned-byte 32))
     ;; Everything else is stored as a general (T) element.
     (t t)))
 
@@ -5293,6 +5312,8 @@
     ((eql (obj-subtag x) #x11) nil)
     ;; Packed single-float vector (subtag #x12): element-type SINGLE-FLOAT.
     ((eql (obj-subtag x) #x12) nil)
+    ;; Packed (unsigned-byte 32) vector (subtag #x17).
+    ((eql (obj-subtag x) #x17) nil)
     ;; Native multi-dim header: only rank-1, T-element, plain vectors qualify.
     ((%mda-p x)
      (and (eql (%mda-rank x) 1)
@@ -5597,6 +5618,40 @@
      t)
     (t nil)))
 
+(defun %u32-element-type-p (etype)
+  "True if ETYPE upgrades to (UNSIGNED-BYTE 32), the packed #x17 vector: a type of
+   non-negative integers below 2^32 that is neither BIT nor an (UNSIGNED-BYTE 8) spelling,
+   in a build that makes them (%U32-VECTORS-P: its collectors know #x17).  Called
+   after UPGRADED-ARRAY-ELEMENT-TYPE's BIT and byte arms."
+  (and (%u32-vectors-p)
+       etype (not (eq etype t)) (not (eq etype '*))
+       (not (%u8-element-type-p etype))
+       (not (equal etype '(integer 0 1))) (not (eq etype 'bit)) (not (equal etype '(mod 2)))
+       (cond
+         ;; the usual spellings, answered without SUBTYPEP (MAKE-ARRAY calls this)
+         ((and (consp etype) (symbolp (car etype)))
+          (let ((h (symbol-name (car etype))) (a (cdr etype)))
+            (cond ((string= h "UNSIGNED-BYTE")
+                   (and (consp a) (integerp (car a)) (<= 1 (car a) 32)))
+                  ((string= h "MOD")
+                   (and (consp a) (integerp (car a)) (<= 1 (car a) 4294967296)))
+                  ((string= h "INTEGER")
+                   (and (consp a) (consp (cdr a))
+                        (integerp (car a)) (>= (car a) 0)
+                        (integerp (cadr a)) (<= (cadr a) 4294967295)))
+                  ((member h '("SIGNED-BYTE" "SIMPLE-ARRAY" "ARRAY" "VECTOR" "FLOAT" "SINGLE-FLOAT"
+                               "DOUBLE-FLOAT" "REAL" "RATIONAL" "COMPLEX" "CONS" "OR" "AND" "NOT"
+                               "MEMBER" "EQL" "SATISFIES")
+                           :test #'string=)
+                   ;; OR / AND / MEMBER of small integers could be subtypes too: ask
+                   (and (member h '("OR" "AND" "MEMBER" "EQL") :test #'string=)
+                        (ignore-errors (values (subtypep etype '(unsigned-byte 32))))))
+                  (t nil))))
+         ;; a standard name (FIXNUM, INTEGER, CHARACTER, ...) is never one
+         ((and (symbolp etype) (eq (symbol-package etype) (find-package "COMMON-LISP"))) nil)
+         ;; a DEFTYPE: ask
+         (t (ignore-errors (values (subtypep etype '(unsigned-byte 32))))))))
+
 (defun %f32-element-type-p (etype)
   "True if ETYPE upgrades to SINGLE-FLOAT (the packed #x12 vector):
    single-float and short-float (which upgrades to single)."
@@ -5720,6 +5775,12 @@
              (f32-elt (and etype-set (%f32-element-type-p etype)
                            (= rank 1) (not (consp dim))
                            (not fp) (not adj) (not disp)))
+             ;; Packed (unsigned-byte 32) storage (subtag #x17), 4 bytes an element:
+             ;; the simple 1-D vector only, as for single-float above.
+             (u32-elt (and etype-set (not f32-elt) (not u8-elt)
+                           (= rank 1) (not (consp dim))
+                           (not fp) (not adj) (not disp)
+                           (equal (upgraded-array-element-type etype) '(unsigned-byte 32))))
              ;; BIT: built as the 0/1 words below like any general array,
              ;; then packed eight to a byte under an MDA header (cl-clos.lisp,
              ;; PACKED BIT ARRAYS) -- every rank and shape, so the header's
@@ -5746,6 +5807,7 @@
                       (let* ((a (cond (char-elt (%make-string-array total))
                                       (u8-elt (%make-u8-vector total))
                                       (f32-elt (%make-f32-vector total))
+                                      (u32-elt (%make-u32-vector total))
                                       (t (make-array total))))
                              (store (if (and char-elt (characterp ie))
                                         (char-code ie) ie))
@@ -5768,11 +5830,13 @@
                       (let ((a (cond (char-elt (%make-string-array total))
                                      (u8-elt (%make-u8-vector total))
                                      (f32-elt (%make-f32-vector total))
+                                     (u32-elt (%make-u32-vector total))
                                      (t (make-array total)))))
                         (%mda-fill-contents-flat a ic dim-list)))
                      (char-elt (%make-string-array total))
                      (u8-elt (%make-u8-vector total))
                      (f32-elt (%make-f32-vector total))
+                     (u32-elt (%make-u32-vector total))
                      (t (make-array total)))))
         ;; Decide return shape.  Phase 2a: wrap in MDA whenever rank ≠ 1,
         ;; or any non-trivial kwarg appeared, or the dim was passed as
@@ -5802,11 +5866,15 @@
                            (if ic-p (%pack-bits data total) data))))
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp)
-                (or (eq etype t) (and (not char-elt) (not u8-elt) (not f32-elt))))
+                (or (eq etype t) (and (not char-elt) (not u8-elt) (not f32-elt) (not u32-elt))))
            data)
           ;; Plain 1-D single-float vector: the packed #x12 object itself.
           ((and (= rank 1) (not (consp dim))
                 (not fp) (not adj) (not disp) f32-elt)
+           data)
+          ;; ... and the packed (unsigned-byte 32) one.
+          ((and (= rank 1) (not (consp dim))
+                (not fp) (not adj) (not disp) u32-elt)
            data)
           ;; (VECTOR NIL): see NIL-ELT above.  Only the simple one; a fill
           ;; pointer / adjustable / displaced one takes the general MDA arm

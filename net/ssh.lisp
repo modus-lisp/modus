@@ -1803,11 +1803,20 @@
           ;; shell echoes what is typed (+0x3FD8, read by the image's line editor)
           (when (eq rtype-len 7)
             (when (eq (aref payload 9) 112)
-              (setf (mem-ref (+ ssh #x3FD8) :u32) 1)))
+              (setf (mem-ref (+ ssh #x3FD8) :u32) 1)
+              ;; the terminal's width (+0x3FDC): after want_reply and the TERM string
+              (let ((tl (ssh-get-u32 payload 17)))
+                (when (< (+ 25 tl) plen)
+                  (setf (mem-ref (+ ssh #x3FDC) :u32) (ssh-get-u32 payload (+ 21 tl)))))))
+          ;; "window-change" (rtype_len=13, 'w'=119): the new width
+          (when (eq rtype-len 13)
+            (when (eq (aref payload 9) 119)
+              (when (< 27 plen)
+                (setf (mem-ref (+ ssh #x3FDC) :u32) (ssh-get-u32 payload 23)))))
           ;; "shell" (rtype_len=5, 's'=115) → send prompt, enter interactive
           (when (eq rtype-len 5)
             (when (eq (aref payload 9) 115)
-              (ssh-send-prompt ssh)))
+              (ssh-start-shell ssh)))
           ;; "exec" (rtype_len=4, 'e'=101) → execute command, send result
           (when (eq rtype-len 4)
             (when (eq (aref payload 9) 101)
@@ -1852,6 +1861,11 @@
       (setf (mem-ref flag-addr :u32) 0))
     (when (eq msg-type 1)
       (setf (mem-ref flag-addr :u32) 0))))
+
+(defun ssh-start-shell (ssh)
+  "The client asked for a shell: a prompt, and lines through SSH-HANDLE-CHANNEL-DATA.  An
+   image may run a shell of its own here instead (net/ssh-inetd.lisp)."
+  (ssh-send-prompt ssh))
 
 (defun ssh-send-eof-close (ssh)
   (let ((cli-chan (mem-ref (+ ssh #x18) :u32)))

@@ -114,8 +114,11 @@
                    (setq result (handler-case (prin1-to-string v) (error () "#<unprintable>"))))
                (error (c)
                  (setq status :failed
-                       result (handler-case (prin1-to-string (list 'error c))
-                                (error () "(ERROR #<unprintable>)")))))
+                       ;; (ERROR TYPE "message"): the condition's report, not just its type
+                       result (handler-case
+                                  (prin1-to-string (list 'error (type-of c) (princ-to-string c)))
+                                (error () (handler-case (prin1-to-string (list 'error c))
+                                            (error () "(ERROR #<unprintable>)")))))))
              (setq stopped nil))
            (when stopped (setq status :stopped result ":STOPPED")))
       (setq *job-current* outer *job-depth* (- *job-depth* 1))

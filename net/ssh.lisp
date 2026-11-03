@@ -1791,6 +1791,7 @@
         (let ((cli-chan (ssh-get-u32 payload (+ 5 ctype-len))))
           (setf (mem-ref (+ ssh #x18) :u32) cli-chan)
           (setf (mem-ref (+ ssh #x14) :u32) 0)
+          (setf (mem-ref (+ ssh #x3FD8) :u32) 0)
           (ssh-send-channel-confirm ssh cli-chan 0))))
     (when (eq msg-type 98)
       (let ((rtype-len (ssh-get-u32 payload 5)))
@@ -1798,6 +1799,11 @@
           (when (not (zerop want-reply))
             (ssh-send-channel-success ssh
              (mem-ref (+ ssh #x18) :u32)))
+          ;; "pty-req" (rtype_len=7, 'p'=112): the client has a terminal in raw mode, so the
+          ;; shell echoes what is typed (+0x3FD8, read by the image's line editor)
+          (when (eq rtype-len 7)
+            (when (eq (aref payload 9) 112)
+              (setf (mem-ref (+ ssh #x3FD8) :u32) 1)))
           ;; "shell" (rtype_len=5, 's'=115) → send prompt, enter interactive
           (when (eq rtype-len 5)
             (when (eq (aref payload 9) 115)

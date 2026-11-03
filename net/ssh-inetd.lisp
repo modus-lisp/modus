@@ -134,6 +134,75 @@
           (when (and m (eq (car m) :result)) (setq reply (cadr m)))))
       (modus.ssh::ssh-send-string ssh reply (length reply)))))
 
+;;; ---- the interactive shell's line editor ----------------------------------------------
+;; Typed bytes collect in the session's own line (one per SSH block, so two shells never share
+;; a line).  With a terminal (the client sent pty-req, +0x3FD8 = 1) the client echoes nothing,
+;; so the editor does: characters, backspace, ^C (drop the line), ^U (erase it), ^D on an empty
+;; line or (quit) / (exit) (end the session), and a line whose parentheses are still open
+;; continues on the next one.  Escape sequences (arrow keys) are swallowed.  Without a terminal
+;; (`echo FORM | ssh ...`) nothing is echoed, as before.
+
+(defvar *sd-lines* (let ((v (make-array 4)))
+                     (dotimes (i 4 v) (setf (svref v i) (make-array 8192 :element-type '(unsigned-byte 8))))))
+(defvar *sd-line-st* (make-array 8 :initial-element 0) "Per SSH block K: 2K length, 2K+1 escape state.")
+
+(defun %sd-out (ssh &rest codes)
+  (when (= (mem-ref (+ ssh #x3FD8) :u32) 1)
+    (let ((v (coerce codes 'simple-vector)))
+      (modus.ssh::ssh-send-string ssh v (length v)))))
+
+(defun %sd-line-complete-p (buf n)
+  "The line's parentheses are closed (outside strings, comments and #\ characters)."
+  (let ((depth 0) (str nil) (esc nil) (comment nil) (i 0))
+    (loop
+      (when (>= i n) (return (and (<= depth 0) (not str))))
+      (let ((b (aref buf i)))
+        (cond (comment (when (= b 10) (setq comment nil)))
+              (str (cond (esc (setq esc nil)) ((= b 92) (setq esc t)) ((= b 34) (setq str nil))))
+              ((= b 34) (setq str t))
+              ((= b 59) (setq comment t))
+              ((and (= b 35) (< (+ i 1) n) (= (aref buf (+ i 1)) 92)) (setq i (+ i 2)))
+              ((= b 40) (setq depth (+ depth 1)))
+              ((= b 41) (setq depth (- depth 1)))))
+      (setq i (+ i 1)))))
+
+(defun %sd-line-is-p (buf n word)
+  "The line, without surrounding blanks, is WORD."
+  (let ((a 0) (z n))
+    (loop (when (or (>= a z) (> (aref buf a) 32)) (return)) (setq a (+ a 1)))
+    (loop (when (or (<= z a) (> (aref buf (- z 1)) 32)) (return)) (setq z (- z 1)))
+    (and (= (- z a) (length word))
+         (dotimes (i (length word) t)
+           (unless (= (aref buf (+ a i)) (char-code (char-downcase (char word i)))) (return nil))))))
+
+(defun %sd-shell-byte (ssh k buf b)
+  (let ((n (svref *sd-line-st* (* 2 k))) (esc (svref *sd-line-st* (+ (* 2 k) 1))))
+    (flet ((len (x) (setf (svref *sd-line-st* (* 2 k)) x)))
+      (cond ((= esc 1) (setf (svref *sd-line-st* (+ (* 2 k) 1)) (if (or (= b 91) (= b 79)) 2 0)))
+            ((= esc 2) (when (and (>= b 64) (<= b 126)) (setf (svref *sd-line-st* (+ (* 2 k) 1)) 0)))
+            ((= b 27) (setf (svref *sd-line-st* (+ (* 2 k) 1)) 1))
+            ((= b 3) (len 0) (%sd-out ssh 94 67 10) (modus.ssh::ssh-send-prompt ssh))
+            ((= b 21) (len 0) (%sd-out ssh 94 85 10) (modus.ssh::ssh-send-prompt ssh))
+            ((= b 4) (when (zerop n) (modus.ssh::ssh-handle-ctrl-d ssh)))
+            ((or (= b 127) (= b 8))
+             (when (and (> n 0) (/= (aref buf (- n 1)) 10)) (len (- n 1)) (%sd-out ssh 8 32 8)))
+            ((or (= b 13) (= b 10))
+             (%sd-out ssh 10)
+             (cond ((zerop n) (when (or (= b 13) (/= (mem-ref (+ ssh #x3FD8) :u32) 1))
+                                (modus.ssh::ssh-send-prompt ssh)))
+                   ((or (%sd-line-is-p buf n "(quit)") (%sd-line-is-p buf n "(exit)"))
+                    (len 0) (modus.ssh::ssh-handle-ctrl-d ssh))
+                   ((%sd-line-complete-p buf n)
+                    (len 0) (ssh-eval-line ssh buf n) (modus.ssh::ssh-send-prompt ssh))
+                   ((< n 8191) (setf (aref buf n) 10) (len (+ n 1)))))
+            ((or (>= b 32) (= b 9))
+             (when (< n 8191) (setf (aref buf n) b) (len (+ n 1)) (%sd-out ssh b)))))))
+
+(defun %sd-channel-data (ssh payload plen)
+  (if (not (%sd-session-p)) (funcall (%sd-old 8) ssh payload plen)
+      (let ((k (%sd-k ssh)) (len (modus.ssh::ssh-get-u32 payload 5)))
+        (dotimes (i len) (%sd-shell-byte ssh k (svref *sd-lines* k) (aref payload (+ 9 i)))))))
+
 ;;; ---- a session ----------------------------------------------------------------------
 
 (defun %sd-session (k)
@@ -170,8 +239,9 @@
       (setf (svref *sd-conn-slot* k) slot)
       (let ((ssh (conn-ssh k)))
         (ssh-copy-host-key k)
-        (dolist (off '(#x00 #x04 #x08 #x0C #x10 #x28 #x150 #x154 #x6D4 #x3FC8 #x3FCC))
+        (dolist (off '(#x00 #x04 #x08 #x0C #x10 #x28 #x150 #x154 #x6D4 #x3FC8 #x3FCC #x3FD8))
           (setf (mem-ref (+ ssh off) :u32) 0))
+        (setf (svref *sd-line-st* (* 2 k)) 0 (svref *sd-line-st* (+ (* 2 k) 1)) 0)
         (setf (mem-ref (+ ssh #x2C) :u32) (logand (+ (* slot 7919) (rdtsc)) #xFFFFFFFF))
         (setf (mem-ref (%sd-slot-addr ssh) :u32) slot)
         (setf (mem-ref (+ ssh #x3FD4) :u32) h)
@@ -195,7 +265,8 @@
                                  (fdefinition 'modus.ssh::ssh-peer-closed-p)
                                  (fdefinition 'modus.ssh::ssh-preauth-clock)
                                  (fdefinition 'modus.ssh::ssh-wait-expired-p)
-                                 (fdefinition 'modus.ssh::ssh-version-wait-expired-p)))
+                                 (fdefinition 'modus.ssh::ssh-version-wait-expired-p)
+                                 (fdefinition 'ssh-handle-channel-data)))
     (setf (fdefinition 'modus.ssh::ssh-wait-data) #'%sd-wait-data
           (fdefinition 'modus.ssh::ssh-refresh-ephemeral) #'%sd-refresh-ephemeral
           (fdefinition 'modus.ssh::ssh-eph-base) #'%sd-eph-base
@@ -203,7 +274,8 @@
           (fdefinition 'modus.ssh::ssh-peer-closed-p) #'%sd-peer-closed-p
           (fdefinition 'modus.ssh::ssh-preauth-clock) #'%sd-clock
           (fdefinition 'modus.ssh::ssh-wait-expired-p) #'%sd-wait-expired-p
-          (fdefinition 'modus.ssh::ssh-version-wait-expired-p) #'%sd-version-wait-expired-p)
+          (fdefinition 'modus.ssh::ssh-version-wait-expired-p) #'%sd-version-wait-expired-p
+          (fdefinition 'ssh-handle-channel-data) #'%sd-channel-data)
     (setq *sd-up* t))
   (net-service-listen port #'%sd-spawn)
   (kmsg-event 1 "SSHD" port 0 0)

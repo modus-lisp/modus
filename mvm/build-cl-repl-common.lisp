@@ -1804,7 +1804,11 @@
             (%rpi-net-text "hdmi-audio.lisp")    (string #\Newline)
             ;; The boot SD card, read only (SDHOST, adopting U-Boot's setup):
             ;; the sector source for a pagetree/cabinet store on a partition.
-            (%rpi-net-text "sdhost.lisp")        (string #\Newline)))))))
+            (%rpi-net-text "sdhost.lisp")        (string #\Newline)
+            ;; ... and read-write through the Arasan controller, for a board the firmware
+            ;; booted alone (kiln zero's cards): EMMC-INIT, EMMC-READ/WRITE-SECTORS.
+            ;; Nothing calls it at boot.
+            (%rpi-net-text "emmc.lisp")          (string #\Newline)))))))
 
 ;; THE NIC INTERFACE (builder packages step 3): net/nic.lisp's MODUS.NET
 ;; NIC-SEND / -RECEIVE / -RX-BUF / -PROBE, which ip.lisp, ssh.lisp and

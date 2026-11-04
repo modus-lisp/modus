@@ -1096,9 +1096,178 @@
         (funcall acquire)))))"))
           (eval (read-from-string (second spec))))))))
 
+(defun asdf::%quirk-usocket ()
+  "usocket has a backend per implementation and none for modus; it took the GENERA one
+   (modus advertises :GENERA), whose file does not even read here, so the system failed to
+   load.  *SYSTEM-FEATURE-MASKS* hides :GENERA from usocket's components, so it loads with
+   no backend, and this installs one over modus's SB-BSD-SOCKETS: IPv4 TCP and UDP, and
+   WAIT-FOR-INPUT by poll(2).  No IPv6, no connect or read timeouts (the shim's connect
+   blocks).  Carried here rather than in usocket: the backend leans on modus internals."
+  (let ((p (find-package "USOCKET")))
+    (when p
+      (let ((*package* p))
+        (load (make-string-input-stream "
+(defun %modus-quad (host)
+  \"HOST (string, vector or integer) as an sb-bsd-sockets #(a b c d) vector.\"
+  (cond ((and (vectorp host) (not (stringp host))) host)          ; a quad, not a string
+        ((integerp host) (hbo-to-vector-quad host))
+        ((eq host *wildcard-host*) #(0 0 0 0))
+        (t (car (get-hosts-by-name (host-to-hostname host))))))
+
+(defun handle-condition (condition &optional (socket nil) (host-or-ip nil))
+  \"Map an SB-BSD-SOCKETS condition onto usocket's.\"
+  (declare (ignore host-or-ip))
+  (typecase condition
+    (sb-bsd-sockets:connection-refused-error
+     (error 'connection-refused-error :socket socket))
+    (sb-bsd-sockets:address-in-use-error
+     (error 'address-in-use-error :socket socket))
+    (sb-bsd-sockets:socket-error
+     (error 'unknown-error :socket socket :real-error condition))
+    (t nil)))
+
+(defun get-hosts-by-name (name)
+  (with-mapped-conditions (nil name)
+    (sb-bsd-sockets:host-ent-addresses (sb-bsd-sockets:get-host-by-name name))))
+
+(defun get-host-by-address (address)
+  (declare (ignore address))
+  (unsupported 'get-host-by-address 'modus))
+
+(defun socket-connect-internal (host &key port (protocol :stream) (element-type 'character)
+                                          timeout deadline (nodelay t)
+                                          local-host local-port
+                                     &allow-other-keys)
+  (declare (ignore timeout))
+  (when deadline (unsupported 'deadline 'socket-connect))
+  (let* ((sock (make-instance 'sb-bsd-sockets:inet-socket
+                              :type protocol
+                              :protocol (if (eq protocol :datagram) :udp :tcp)))
+         (ok nil) usocket)
+    (unwind-protect
+         (progn
+           (when (or local-host local-port)
+             (sb-bsd-sockets:socket-bind sock (%modus-quad (or local-host *wildcard-host*))
+                                         (or local-port *auto-port*)))
+           (ecase protocol
+             (:stream
+              (with-mapped-conditions (nil host)
+                (when nodelay
+                  (ignore-errors (setf (sb-bsd-sockets:sockopt-tcp-nodelay sock) t)))
+                (sb-bsd-sockets:socket-connect sock (%modus-quad host) port))
+              (setf usocket (make-stream-socket
+                             :socket sock
+                             :stream (sb-bsd-sockets:socket-make-stream
+                                      sock :input t :output t :element-type element-type))))
+             (:datagram
+              (setf usocket (make-datagram-socket sock))
+              (when (and host port)
+                (with-mapped-conditions (usocket host)
+                  (sb-bsd-sockets:socket-connect sock (%modus-quad host) port)
+                  (setf (connected-p usocket) t)))))
+           (setf ok t))
+      (unless ok (ignore-errors (sb-bsd-sockets:socket-close sock))))
+    usocket))
+
+(defun socket-listen-internal (host &key port reuseaddress
+                                         (reuse-address nil reuse-address-supplied-p)
+                                         (backlog 5) (element-type 'character))
+  (let ((sock (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+        (reuse (if reuse-address-supplied-p reuse-address reuseaddress)))
+    (handler-case
+        (with-mapped-conditions (nil host)
+          (when reuse (setf (sb-bsd-sockets:sockopt-reuse-address sock) t))
+          (sb-bsd-sockets:socket-bind sock (%modus-quad (or host *wildcard-host*)) port)
+          (sb-bsd-sockets:socket-listen sock backlog)
+          (make-stream-server-socket sock :element-type element-type))
+      (error (c)
+        (ignore-errors (sb-bsd-sockets:socket-close sock))
+        (error c)))))
+
+(defmethod socket-accept ((usocket stream-server-usocket) &key element-type)
+  (with-mapped-conditions (usocket)
+    (let ((sock (sb-bsd-sockets:socket-accept (socket usocket))))
+      (when sock
+        (make-stream-socket
+         :socket sock
+         :stream (sb-bsd-sockets:socket-make-stream
+                  sock :input t :output t
+                  :element-type (or element-type (element-type usocket))))))))
+
+(defmethod socket-close ((usocket usocket))
+  (with-mapped-conditions (usocket)
+    (sb-bsd-sockets:socket-close (socket usocket))))
+
+(defmethod socket-close ((usocket stream-usocket))
+  (with-mapped-conditions (usocket)
+    (ignore-errors (close (socket-stream usocket)))
+    (sb-bsd-sockets:socket-close (socket usocket))))
+
+(defmethod socket-shutdown ((usocket stream-usocket) direction)
+  (with-mapped-conditions (usocket)
+    (sb-bsd-sockets:socket-shutdown (socket usocket) :direction direction)))
+
+(defmethod socket-send ((usocket datagram-usocket) buffer size &key host port (offset 0))
+  (let ((buf (if (zerop offset) buffer (subseq buffer offset (+ offset size)))))
+    (with-mapped-conditions (usocket host)
+      (if (and host port)
+          (sb-bsd-sockets:socket-send (socket usocket) buf size
+                                      :address (list (%modus-quad host) port))
+          (sb-bsd-sockets:socket-send (socket usocket) buf size)))))
+
+(defmethod socket-receive ((usocket datagram-usocket) buffer length &key element-type)
+  (declare (ignore element-type))
+  (with-mapped-conditions (usocket)
+    (sb-bsd-sockets:socket-receive (socket usocket) buffer length)))
+
+(defmethod get-local-name ((usocket usocket))
+  (sb-bsd-sockets:socket-name (socket usocket)))
+(defmethod get-peer-name ((usocket stream-usocket))
+  (sb-bsd-sockets:socket-peername (socket usocket)))
+(defmethod get-local-address ((usocket usocket))
+  (nth-value 0 (get-local-name usocket)))
+(defmethod get-peer-address ((usocket stream-usocket))
+  (nth-value 0 (get-peer-name usocket)))
+(defmethod get-local-port ((usocket usocket))
+  (nth-value 1 (get-local-name usocket)))
+(defmethod get-peer-port ((usocket stream-usocket))
+  (nth-value 1 (get-peer-name usocket)))
+
+;;; wait-for-input: poll each waiter in turn, in slices, until one is ready or
+;;; the timeout runs out.  A stream with bytes already buffered counts as ready.
+(defun %setup-wait-list (wait-list) (declare (ignore wait-list)))
+(defun %add-waiter (wait-list waiter) (declare (ignore wait-list waiter)))
+(defun %remove-waiter (wait-list waiter) (declare (ignore wait-list waiter)))
+
+(defun %modus-ready-p (waiter)
+  (or (and (stream-usocket-p waiter)
+           (ignore-errors (listen (socket-stream waiter))))
+      (let ((fd (sb-bsd-sockets:socket-file-descriptor (socket waiter))))
+        (and fd (> (modus-int::%sbs-poll-in fd 0) 0)))))
+
+(defun wait-for-input-internal (wait-list &key timeout)
+  (let* ((slice-ms 10)
+         (budget (and timeout (max 0 (round (* timeout 1000))))))
+    (loop
+      (let ((any nil))
+        (dolist (w (wait-list-waiters wait-list))
+          (setf (state w) (if (%modus-ready-p w) :read nil))
+          (when (state w) (setf any t)))
+        (when (or any (and budget (<= budget 0)))
+          (return wait-list))
+        (sleep (/ slice-ms 1000))
+        (when budget (decf budget slice-ms))))))
+"))))))
+
+(defvar asdf::*system-feature-masks*
+  '(("usocket" "genera"))
+  "System name -> feature names its own components' :IF-FEATURE sees as absent (see
+   *IT-MASKED-FEATURES*).")
+
 (defvar asdf::*system-quirks*
   '(("float-features" . asdf::%quirk-float-features)
-    ("bordeaux-threads" . asdf::%quirk-bordeaux-threads))
+    ("bordeaux-threads" . asdf::%quirk-bordeaux-threads)
+    ("usocket" . asdf::%quirk-usocket))
   "System name -> a function run right after that system loads: the fix-ups
    for libraries that have a branch per implementation and none for modus.")
 
@@ -1168,7 +1337,12 @@
        (unwind-protect
             (progn
               (dolist (d (asdf::%dep-names sys)) (asdf::load-system d))
-              (asdf::%load-system-files sys)
+              ;; this system's own files see its masked features as absent
+              (let ((saved *it-masked-features*))
+                (setq *it-masked-features*
+                      (cdr (assoc n asdf::*system-feature-masks* :test #'string-equal)))
+                (unwind-protect (asdf::%load-system-files sys)
+                  (setq *it-masked-features* saved)))
               (asdf::%set-loaded sys t)
               (asdf::%apply-system-quirks n)
               (asdf::%jit-loaded-system))

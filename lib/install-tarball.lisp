@@ -440,12 +440,20 @@
       (when (eq (car cur) key) (return (cadr cur)))
       (setq cur (cddr cur)))))
 
+(defvar *it-masked-features* nil
+  "Feature names (lower case, as %IT-STRING-DESIGNATOR gives them) that a component's
+   :IF-FEATURE sees as ABSENT, though they are on *FEATURES*.  ASDF:LOAD-SYSTEM sets it
+   for one system's own files from ASDF::*SYSTEM-FEATURE-MASKS*: modus advertises
+   :GENERA, and a library whose Genera branch cannot work here must not take it.")
+
 (defun %it-feature-name-p (x)
-  "True when the feature-expression atom X is currently on *FEATURES*.
-   Compared by NAME, not identity: an .asd read in CL-USER interns
-   `:sbcl' as a keyword, and Modus's *FEATURES* holds keywords too, but
+  "True when the feature-expression atom X is currently on *FEATURES*, and not masked
+   (*IT-MASKED-FEATURES*).  Compared by NAME, not identity: an .asd read in CL-USER
+   interns `:sbcl' as a keyword, and Modus's *FEATURES* holds keywords too, but
    a designator may also arrive as an ordinary symbol."
   (let ((want (%it-string-designator x)) (found nil))
+    (when (member want *it-masked-features* :test #'string=)
+      (return-from %it-feature-name-p nil))
     (dolist (f *features*)
       (when (and (not found)
                  (symbolp f)

@@ -2249,11 +2249,25 @@
 
 
 
+(defun %mismatch-u8 (s1 s2)
+  "MISMATCH of two plain byte vectors, no keywords: the first index where they differ, or the
+   shorter one's length when that one is a prefix of the other, or NIL when equal."
+  (let* ((l1 (length s1)) (l2 (length s2)) (n (min l1 l2)) (i 0))
+    (declare (type fixnum l1 l2 n i))
+    (loop
+      (when (>= i n) (return (if (= l1 l2) nil n)))
+      (unless (eq (%u8-ref s1 i) (%u8-ref s2 i)) (return i))
+      (setq i (+ i 1)))))
+
 (defun mismatch (s1 s2 &rest args)
   "Compare S1 vs S2 element-by-element. Returns first index where they
    differ, or NIL if equal. Honors :test, :key, :start1, :end1, :start2,
    :end2, :from-end.
    Per CLHS 3.4.1.4.1, leftmost keyword wins on duplicate kwargs."
+  ;; TWO BYTE VECTORS, NO KEYWORDS: a byte loop.  The general loop below is an ELT and an EQL a
+  ;; element -- 9x SBCL on aarch64, and a Zero RFB server comparing 400 screen rows took 1.7 s.
+  (when (and (null args) (%u8-bare-p s1) (%u8-bare-p s2))
+    (return-from mismatch (%mismatch-u8 s1 s2)))
   (%check-kw-allowed args
    '(:test :test-not :key :start1 :end1 :start2 :end2 :from-end))
   (let ((test nil) (key nil)
@@ -4788,6 +4802,29 @@
                       fp)))))
            (t (%signal-type-error)))))))
 
+(defun %vpe-fast (vector new-element)
+  "VECTOR-PUSH-EXTEND's common case on MDA header VECTOR: undisplaced, one dimension, room
+   left, and NEW-ELEMENT storable as it is.  Stores and returns the old fill pointer; NIL,
+   having touched nothing, when the case does not apply."
+  (let ((fp (%word-aref vector 2)) (dims (%word-aref vector 1)) (d (%word-aref vector 6)))
+    (when (and (fixnump fp) (null (%word-aref vector 3))
+               (consp dims) (null (cdr dims)) (fixnump (car dims)) (< fp (car dims)))
+      (cond ((%prim-u8-vector-p d)
+             (when (and (fixnump new-element) (<= 0 new-element 255))
+               (%u8-set d fp new-element)
+               (%word-aset vector 2 (+ fp 1))
+               fp))
+            ((%prim-stringp d)
+             (when (characterp new-element)
+               (%prim-aset d fp (char-code new-element))
+               (%word-aset vector 2 (+ fp 1))
+               fp))
+            ;; a BIT array's store is a general vector too (16 bits a word)
+            ((and (%prim-simple-vector-p d) (not (eq (%word-aref vector 5) 'bit)))
+             (%word-aset d fp new-element)
+             (%word-aset vector 2 (+ fp 1))
+             fp)))))
+
 (defun vector-push-extend (new-element vector &rest args)
   "Push NEW-ELEMENT onto VECTOR, extending if needed.  Character on
    string-backed vector is char-code-converted (vector-push-extend test
@@ -4800,24 +4837,13 @@
   (cond
     ;; THE COMMON CASE, slots read directly (MDA: 1 dims, 2 fill pointer,
     ;; 3 displaced-to, 5 element type, 6 data): a non-displaced vector with
-    ;; room, storing a character into string data or anything into a simple
-    ;; vector.  Seven out-of-line slot readers and a generic ASET per push made
-    ;; cl-bench fill-strings/adjustable 9.5x SBCL.
-    ((and (%mda-p vector)
-          (fixnump (%prim-aref vector 2))
-          (null (%prim-aref vector 3))
-          (not (eq (%prim-aref vector 5) 'bit))
-          (let ((dims (%prim-aref vector 1)))
-            (and (consp dims) (null (cdr dims)) (fixnump (car dims))
-                 (< (%prim-aref vector 2) (car dims))))
-          (let ((d (%prim-aref vector 6)))
-            (if (%prim-stringp d)
-                (characterp new-element)
-                (%prim-simple-vector-p d))))
-     (let ((fp (%prim-aref vector 2)) (d (%prim-aref vector 6)))
-       (%prim-aset d fp (if (%prim-stringp d) (char-code new-element) new-element))
-       (%prim-aset vector 2 (+ fp 1))
-       fp))
+    ;; room, storing a character into string data, a byte into byte data, or
+    ;; anything into a simple vector.  Seven out-of-line slot readers and a
+    ;; generic ASET per push made cl-bench fill-strings/adjustable 9.5x SBCL;
+    ;; the header words are read with %WORD-AREF, one load each -- %PRIM-AREF
+    ;; is the whole generic dispatch per slot, and pushes stayed 4x SBCL
+    ;; (92 ns against 22 on a Pi 5, a seventh of cram's DEFLATE).
+    ((and (%mda-p vector) (%vpe-fast vector new-element)))
     ((and (%mda-p vector) (%mda-bit-p vector))
      (%bit-vector-push new-element vector t args))
     ((%mda-p vector)

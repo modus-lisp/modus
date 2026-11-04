@@ -8208,6 +8208,13 @@
     ;; ~40 instructions a slot.  Measured on a Pi 5: this read was 57% of DEFLATE.
     ((and (%mda-p a) (null (%word-aref a 3)) (%prim-u8-vector-p (%word-aref a 6)))
      (%u8-ref (%word-aref a 6) i))
+    ;; AND A GENERAL VECTOR BEHIND ONE (cram's LZ77 token list, any adjustable vector of T):
+    ;; the general MDA arm below read the data slot twice and asked %MDA-BIT-P per element --
+    ;; a quarter of DEFLATE on hosted x64.  A BIT array's store is a general vector too (16
+    ;; bits a word), so it is excluded by its element type.
+    ((and (%mda-p a) (null (%word-aref a 3)) (%prim-simple-vector-p (%word-aref a 6))
+          (not (eq (%word-aref a 5) 'bit)))
+     (%word-aref (%word-aref a 6) i))
     ((%prim-simple-string-p a) (code-char (%word-aref a i)))
     ((%prim-simple-vector-p a) (%word-aref a i))
     ((%prim-u8-vector-p a) (%u8-ref a i))

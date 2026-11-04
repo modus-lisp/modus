@@ -44,7 +44,7 @@
   (:use)
   (:export "STAT" "STAT-MODE" "STAT-UID" "STAT-GID" "STAT-INO" "STAT-SIZE"
            "S-ISDIR" "S-ISSOCK" "S-ISREG" "CHMOD" "UNLINK" "GETUID" "GETPID"
-           "SYSCALL-ERROR" "ENOENT"))
+           "RENAME" "FTRUNCATE" "SYSCALL-ERROR" "ENOENT"))
 
 (defpackage "SB-SYS"
   (:use)
@@ -71,7 +71,7 @@
            "OCTETS-TO-STRING" "STRING-TO-OCTETS"
            "DOUBLE-FLOAT-POSITIVE-INFINITY" "DOUBLE-FLOAT-NEGATIVE-INFINITY"
            "SINGLE-FLOAT-POSITIVE-INFINITY" "SINGLE-FLOAT-NEGATIVE-INFINITY"
-           "SEED-RANDOM-STATE" "SPIN-LOOP-HINT"))
+           "SEED-RANDOM-STATE" "SPIN-LOOP-HINT" "WITH-TIMEOUT" "TIMEOUT"))
 
 ;;; SB-KERNEL and SB-INT: only the float-bits and float-trap names portable numeric code reaches
 ;;; for (mill reads ONNX tensors with them; ieee-floats-style code does the same).
@@ -357,6 +357,20 @@
   (let ((r (%sbs-unlink (if (stringp pathname) pathname (namestring pathname)))))
     (if (< r 0) (error 'sb-posix:syscall-error :errno (- 0 r)) 0)))
 
+(defun sb-posix:rename (oldpath newpath)
+  "rename(2), through the image's own %SYS-RENAME (RENAME-FILE's floor), so the
+   per-arch syscall number lives in one place.  cl-consensus's mempool and block
+   store write a temporary file and rename it over the real one."
+  (flet ((s (p) (if (stringp p) p (namestring p))))
+    (let ((r (%sys-rename (s oldpath) (s newpath))))
+      (if (and (integerp r) (< r 0)) (error 'sb-posix:syscall-error :errno (- 0 r)) 0))))
+
+(defun sb-posix:ftruncate (fd length)
+  "ftruncate(2) on a raw descriptor, through net/hosted-storage.lisp's
+   %SYS-FTRUNCATE."
+  (let ((r (%sys-ftruncate fd length)))
+    (if (and (integerp r) (< r 0)) (error 'sb-posix:syscall-error :errno (- 0 r)) 0)))
+
 (defun sb-posix:getuid () (%sbs-getuid))
 (defun sb-posix:getpid () (%sbs-getpid))
 (defconstant sb-posix:enoent 2)
@@ -374,6 +388,27 @@
    unlinking UNIX socket files) is documented there as a courtesy rather than
    the mechanism, so a hook that never runs loses a courtesy — but a caller that
    believes cleanup happened should read this line.")
+
+;;; SB-EXT:WITH-TIMEOUT -- PARTIAL.  SBCL interrupts the body with a timer
+;;; signal.  modus has no timer interrupt, so this cannot stop a body that never
+;;; returns.  It runs BODY and, if it took longer than SECONDS, signals
+;;; SB-EXT:TIMEOUT once it does return.  It catches "too slow", not "infinite":
+;;; a real hang still needs an outer limit (the caller's process timeout).
+;;; Without it at all, every call was an UNDEFINED-FUNCTION, which a
+;;; handler-case catching SERIOUS-CONDITION silently counts as an outcome
+;;; (cl-consensus's fuzz gate counted every parse as "rejected" and passed).
+(define-condition sb-ext:timeout (serious-condition)
+  ((seconds :initarg :seconds :initform nil :reader %timeout-seconds))
+  (:report (lambda (c s) (format s "Timeout occurred~@[ after ~a seconds~]."
+                                 (%timeout-seconds c)))))
+
+(defmacro sb-ext:with-timeout (seconds &body body)
+  (let ((lim (gensym "LIM")) (t0 (gensym "T0")))
+    `(let ((,lim ,seconds) (,t0 (get-internal-real-time)))
+       (multiple-value-prog1 (progn ,@body)
+         (when (and ,lim (> (- (get-internal-real-time) ,t0)
+                            (* ,lim internal-time-units-per-second)))
+           (error 'sb-ext:timeout :seconds ,lim))))))
 
 (defun sb-ext:posix-getenv (name)
   "The environment variable NAME, or NIL.  modus reads its environment through

@@ -111,6 +111,9 @@
 (defun %sys-mkdir (path-str mode)
   (%string-to-cstr path-str *cstr-scratch*)
   (syscall3 39 *cstr-scratch* mode 0))
+(defun %sys-rmdir (path-str)                     ; rmdir(2): 40 here, as mkdir is 39
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall3 40 *cstr-scratch* 0 0))
 (defun %sys-readlink (path-str) (declare (ignore path-str)) nil)   ; links not followed here yet
 
 (defun %sys-stat-exists (path-str)

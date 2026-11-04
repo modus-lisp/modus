@@ -124,6 +124,9 @@
 (defun %sys-mkdir (path-str mode)
   (%string-to-cstr path-str *cstr-scratch*)
   (syscall6 34 -100 *cstr-scratch* mode 0 0 0))
+(defun %sys-rmdir (path-str)                     ; unlinkat(AT_FDCWD, PATH, AT_REMOVEDIR)
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall6 35 -100 *cstr-scratch* #x200 0 0 0))
 (defun %sys-readlink (path-str)
   ;; readlinkat(AT_FDCWD, PATH, buf, 4000) -- syscall 78 on RISC-V
   (let* ((path-addr (%string-to-cstr path-str *cstr-scratch*))

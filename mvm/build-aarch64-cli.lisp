@@ -816,6 +816,11 @@
         (let ((new-addr (+ *cstr-scratch* 2048)))
           (%string-to-cstr new-str new-addr)
           (%aarch64-renameat *cstr-scratch* new-addr 0)))))
+(defun %sys-rmdir (path-str)
+  ;; unlinkat(AT_FDCWD, PATH, AT_REMOVEDIR) through the generic syscall: the
+  ;; dedicated unlinkat trap (#x0507) passes flags 0, which removes files only.
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall6 35 -100 *cstr-scratch* #x200 0 0 0))
 (defun %sys-mkdir (path-str mode)
   (if (%cab-on)
       (progn (%cab :mkdir path-str) 0)

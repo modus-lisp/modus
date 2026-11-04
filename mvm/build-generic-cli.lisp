@@ -167,6 +167,15 @@
   (%core-slice fd stage #x28))
 ")
 
+;; PACKED (UNSIGNED-BYTE 32) VECTORS (prelude.lisp %U32-VECTORS-P, #x17): x64's collectors
+;; size #x17 as 4-byte lanes.  On unless MODUS_U32_VECTORS=0.
+(defvar *cli-u32-vectors*
+  (let ((v (sb-ext:posix-getenv "MODUS_U32_VECTORS"))) (not (and v (string= v "0")))))
+(when *cli-u32-vectors*
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %u32-vectors-p () t)" (string #\Newline))))
+
 ;; NARROW STRINGS (prelude.lisp %NARROW-STRINGS-P): x64's collector sizes #x13
 ;; as bytes; MODUS_NARROW_STRINGS=1 has the reader make them in this build.
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
@@ -184,6 +193,9 @@
 (mvm-load "boot/boot-linux-x64.lisp")
 
 (in-package :modus.mvm)
+
+;; ... and the compiler emits their arms (compiler.lisp *U32-VECTORS-P*).
+(when cl-user::*cli-u32-vectors* (setq *u32-vectors-p* t))
 
 ;; ... and its AOT string literals narrow too (compiler.lisp *NARROW-LITERALS-P*).
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))

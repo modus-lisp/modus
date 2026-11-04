@@ -134,6 +134,175 @@
           (when (and m (eq (car m) :result)) (setq reply (cadr m)))))
       (modus.ssh::ssh-send-string ssh reply (length reply)))))
 
+;;; ---- the interactive shell's line editor ----------------------------------------------
+;; Typed bytes collect in the session's own line (one per SSH block, so two shells never share
+;; a line).  With a terminal (the client sent pty-req, +0x3FD8 = 1) the client echoes nothing,
+;; so the editor does: characters, backspace, ^C (drop the line), ^U (erase it), ^D on an empty
+;; line or (quit) / (exit) (end the session), and a line whose parentheses are still open
+;; continues on the next one.  Escape sequences (arrow keys) are swallowed.  Without a terminal
+;; (`echo FORM | ssh ...`) nothing is echoed, as before.
+
+(defvar *sd-lines* (let ((v (make-array 4)))
+                     (dotimes (i 4 v) (setf (svref v i) (make-array 8192 :element-type '(unsigned-byte 8))))))
+(defvar *sd-line-st* (make-array 8 :initial-element 0) "Per SSH block K: 2K length, 2K+1 escape state.")
+(defvar *sd-shell-on* (make-array 4 :initial-element 0) "Per SSH block K: 1 while its shell runs an editor.")
+
+(defun %sd-out (ssh &rest codes)
+  (when (= (mem-ref (+ ssh #x3FD8) :u32) 1)
+    (let ((v (coerce codes 'simple-vector)))
+      (modus.ssh::ssh-send-string ssh v (length v)))))
+
+(defun %sd-line-complete-p (buf n)
+  "The line's parentheses are closed (outside strings, comments and #\ characters)."
+  (let ((depth 0) (str nil) (esc nil) (comment nil) (i 0))
+    (loop
+      (when (>= i n) (return (and (<= depth 0) (not str))))
+      (let ((b (aref buf i)))
+        (cond (comment (when (= b 10) (setq comment nil)))
+              (str (cond (esc (setq esc nil)) ((= b 92) (setq esc t)) ((= b 34) (setq str nil))))
+              ((= b 34) (setq str t))
+              ((= b 59) (setq comment t))
+              ((and (= b 35) (< (+ i 1) n) (= (aref buf (+ i 1)) 92)) (setq i (+ i 2)))
+              ((= b 40) (setq depth (+ depth 1)))
+              ((= b 41) (setq depth (- depth 1)))))
+      (setq i (+ i 1)))))
+
+(defun %sd-line-is-p (buf n word)
+  "The line, without surrounding blanks, is WORD."
+  (let ((a 0) (z n))
+    (loop (when (or (>= a z) (> (aref buf a) 32)) (return)) (setq a (+ a 1)))
+    (loop (when (or (<= z a) (> (aref buf (- z 1)) 32)) (return)) (setq z (- z 1)))
+    (and (= (- z a) (length word))
+         (dotimes (i (length word) t)
+           (unless (= (aref buf (+ a i)) (char-code (char-downcase (char word i)))) (return nil))))))
+
+(defun %sd-shell-byte (ssh k buf b)
+  (let ((n (svref *sd-line-st* (* 2 k))) (esc (svref *sd-line-st* (+ (* 2 k) 1))))
+    (flet ((len (x) (setf (svref *sd-line-st* (* 2 k)) x)))
+      (cond ((= esc 1) (setf (svref *sd-line-st* (+ (* 2 k) 1)) (if (or (= b 91) (= b 79)) 2 0)))
+            ((= esc 2) (when (and (>= b 64) (<= b 126)) (setf (svref *sd-line-st* (+ (* 2 k) 1)) 0)))
+            ((= b 27) (setf (svref *sd-line-st* (+ (* 2 k) 1)) 1))
+            ((= b 3) (len 0) (%sd-out ssh 94 67 10) (modus.ssh::ssh-send-prompt ssh))
+            ((= b 21) (len 0) (%sd-out ssh 94 85 10) (modus.ssh::ssh-send-prompt ssh))
+            ((= b 4) (when (zerop n) (modus.ssh::ssh-handle-ctrl-d ssh)))
+            ((or (= b 127) (= b 8))
+             (when (and (> n 0) (/= (aref buf (- n 1)) 10)) (len (- n 1)) (%sd-out ssh 8 32 8)))
+            ((or (= b 13) (= b 10))
+             (%sd-out ssh 10)
+             (cond ((zerop n) (when (or (= b 13) (/= (mem-ref (+ ssh #x3FD8) :u32) 1))
+                                (modus.ssh::ssh-send-prompt ssh)))
+                   ((or (%sd-line-is-p buf n "(quit)") (%sd-line-is-p buf n "(exit)"))
+                    (len 0) (modus.ssh::ssh-handle-ctrl-d ssh))
+                   ((%sd-line-complete-p buf n)
+                    (len 0) (ssh-eval-line ssh buf n) (modus.ssh::ssh-send-prompt ssh))
+                   ((< n 8191) (setf (aref buf n) 10) (len (+ n 1)))))
+            ((or (>= b 32) (= b 9))
+             (when (< n 8191) (setf (aref buf n) b) (len (+ n 1)) (%sd-out ssh b)))))))
+
+(defun %sd-channel-data (ssh payload plen)
+  (if (not (%sd-session-p)) (funcall (%sd-old 8) ssh payload plen)
+      (let ((k (%sd-k ssh)) (len (modus.ssh::ssh-get-u32 payload 5)))
+        (if (= (svref *sd-shell-on* k) 1)
+            (dotimes (i len) (%sd-queue-put k (aref payload (+ 9 i))))
+            (dotimes (i len) (%sd-shell-byte ssh k (svref *sd-lines* k) (aref payload (+ 9 i))))))))
+
+;;; ---- a shell with a real line editor ----------------------------------------------------
+;; With a terminal and an editor installed, the session runs a shell of its own: *SSH-READ-LINE*
+;; reads a line pulling keys from the channel -- packets are received and dispatched while it
+;; waits, and their data lands in this session's queue -- then the line is evaluated as above.
+;; *SSH-READ-LINE* is called as (FUNCALL F INPUT OUTPUT PROMPT WIDTH STATE): INPUT a function
+;; (&optional timeout) -> byte or NIL, OUTPUT a character stream, STATE a cons this session
+;; keeps for it (history), and returns (values TEXT STATUS), STATUS :OK, :EOF or :INTERRUPT.
+;; kiln's Zero sets it to quill.  Without one, the editor above.
+
+(defvar *ssh-read-line* nil "A line editor for SSH sessions with a terminal (see above), or NIL.")
+(defvar *sd-queue* (let ((v (make-array 4)))
+                     (dotimes (i 4 v) (setf (svref v i) (make-array 4096 :element-type '(unsigned-byte 8))))))
+(defvar *sd-queue-st* (make-array 8 :initial-element 0) "Per SSH block K: 2K head, 2K+1 count.")
+
+(defun %sd-queue-put (k b)
+  (let ((n (svref *sd-queue-st* (+ (* 2 k) 1))))
+    (when (< n 4096)
+      (setf (aref (svref *sd-queue* k) (mod (+ (svref *sd-queue-st* (* 2 k)) n) 4096)) b
+            (svref *sd-queue-st* (+ (* 2 k) 1)) (+ n 1)))))
+
+(defun %sd-queue-take (k)
+  (let ((n (svref *sd-queue-st* (+ (* 2 k) 1))))
+    (when (> n 0)
+      (let ((h (svref *sd-queue-st* (* 2 k))))
+        (setf (svref *sd-queue-st* (* 2 k)) (mod (+ h 1) 4096)
+              (svref *sd-queue-st* (+ (* 2 k) 1)) (- n 1))
+        (aref (svref *sd-queue* k) h)))))
+
+(defun %sd-session-over-p (ssh)
+  (or (zerop (mem-ref (+ ssh #x3FCC) :u32)) (= (mem-ref (+ ssh #x3FC8) :u32) 1)))
+
+(defun %sd-flush (ssh out)
+  "What the editor wrote, to the channel, UTF-8."
+  (let ((text (get-output-stream-string out)))
+    (when (plusp (length text))
+      (let ((bytes '()))
+        (loop for ch across text for c = (char-code ch)
+              do (cond ((< c #x80) (push c bytes))
+                       ((< c #x800) (push (logior #xC0 (ash c -6)) bytes) (push (logior #x80 (logand c #x3F)) bytes))
+                       ((< c #x10000) (push (logior #xE0 (ash c -12)) bytes)
+                        (push (logior #x80 (logand (ash c -6) #x3F)) bytes) (push (logior #x80 (logand c #x3F)) bytes))
+                       (t (push (logior #xF0 (ash c -18)) bytes) (push (logior #x80 (logand (ash c -12) #x3F)) bytes)
+                          (push (logior #x80 (logand (ash c -6) #x3F)) bytes) (push (logior #x80 (logand c #x3F)) bytes))))
+        (let ((v (coerce (nreverse bytes) 'simple-vector)))
+          (modus.ssh::ssh-send-string ssh v (length v)))))))
+
+(defun %sd-next-byte (ssh k out timeout)
+  "The next key byte: what is queued, else packets received and dispatched until one comes,
+   TIMEOUT seconds pass (NIL: no limit) or the session ends (NIL)."
+  (%sd-flush ssh out)
+  (let ((end (and timeout (+ (%bt-ticks) (%bt-ms-ticks (max 1 (round (* timeout 1000))))))))
+    (loop
+      (let ((b (%sd-queue-take k)))
+        (when b (return b)))
+      (when (%sd-session-over-p ssh) (return nil))
+      (when (and end (> (%bt-ticks) end)) (return nil))
+      (let ((pkt (modus.ssh::ssh-receive-packet ssh 5)))
+        (when pkt
+          (modus.ssh::ssh-dispatch-msg ssh (car pkt) (cdr pkt) (+ ssh #x3FCC)))))))
+
+(defun %sd-start-shell (ssh)
+  (if (not (%sd-session-p)) (funcall (%sd-old 9) ssh)
+      (if (and *ssh-read-line* (= (mem-ref (+ ssh #x3FD8) :u32) 1))
+          (%sd-shell ssh)
+          (modus.ssh::ssh-send-prompt ssh))))
+
+(defun %sd-shell (ssh)
+  (let* ((k (%sd-k ssh)) (out (make-string-output-stream)) (state (list nil))
+         (input (lambda (&optional timeout) (%sd-next-byte ssh k out timeout))))
+    (setf (svref *sd-queue-st* (* 2 k)) 0 (svref *sd-queue-st* (+ (* 2 k) 1)) 0
+          (svref *sd-shell-on* k) 1)
+    (unwind-protect
+         (loop
+           (when (%sd-session-over-p ssh) (return))
+           (let ((w (mem-ref (+ ssh #x3FDC) :u32)))
+             (multiple-value-bind (text status)
+                 (handler-case
+                     (funcall *ssh-read-line* input out "modus> " (if (> w 1) w nil) state)
+                   (error (c) (kmsg 3 "SSHL" (princ-to-string c)) (values nil :failed)))
+               (%sd-flush ssh out)
+               (cond ((eq status :failed)            ; the editor broke: the plain one, from here
+                      (setf (svref *sd-shell-on* k) 0)
+                      (modus.ssh::ssh-send-prompt ssh)
+                      (return))
+                     ((eq status :eof) (modus.ssh::ssh-handle-ctrl-d ssh) (return))
+                     ((eq status :interrupt))
+                     ((or (%sd-text-is-p text "(quit)") (%sd-text-is-p text "(exit)"))
+                      (modus.ssh::ssh-handle-ctrl-d ssh) (return))
+                     ((plusp (length (string-trim '(#\Space #\Tab #\Newline) text)))
+                      (let ((v (make-array (length text))))
+                        (dotimes (i (length text)) (setf (svref v i) (logand (char-code (char text i)) 255)))
+                        (ssh-eval-line ssh v (length v))))))))
+      (setf (svref *sd-shell-on* k) 0))))
+
+(defun %sd-text-is-p (text word)
+  (string-equal (string-trim '(#\Space #\Tab #\Newline) text) word))
+
 ;;; ---- a session ----------------------------------------------------------------------
 
 (defun %sd-session (k)
@@ -170,8 +339,10 @@
       (setf (svref *sd-conn-slot* k) slot)
       (let ((ssh (conn-ssh k)))
         (ssh-copy-host-key k)
-        (dolist (off '(#x00 #x04 #x08 #x0C #x10 #x28 #x150 #x154 #x6D4 #x3FC8 #x3FCC))
+        (dolist (off '(#x00 #x04 #x08 #x0C #x10 #x28 #x150 #x154 #x6D4 #x3FC8 #x3FCC #x3FD8 #x3FDC))
           (setf (mem-ref (+ ssh off) :u32) 0))
+        (setf (svref *sd-line-st* (* 2 k)) 0 (svref *sd-line-st* (+ (* 2 k) 1)) 0
+              (svref *sd-shell-on* k) 0)
         (setf (mem-ref (+ ssh #x2C) :u32) (logand (+ (* slot 7919) (rdtsc)) #xFFFFFFFF))
         (setf (mem-ref (%sd-slot-addr ssh) :u32) slot)
         (setf (mem-ref (+ ssh #x3FD4) :u32) h)
@@ -195,7 +366,9 @@
                                  (fdefinition 'modus.ssh::ssh-peer-closed-p)
                                  (fdefinition 'modus.ssh::ssh-preauth-clock)
                                  (fdefinition 'modus.ssh::ssh-wait-expired-p)
-                                 (fdefinition 'modus.ssh::ssh-version-wait-expired-p)))
+                                 (fdefinition 'modus.ssh::ssh-version-wait-expired-p)
+                                 (fdefinition 'ssh-handle-channel-data)
+                                 (fdefinition 'modus.ssh::ssh-start-shell)))
     (setf (fdefinition 'modus.ssh::ssh-wait-data) #'%sd-wait-data
           (fdefinition 'modus.ssh::ssh-refresh-ephemeral) #'%sd-refresh-ephemeral
           (fdefinition 'modus.ssh::ssh-eph-base) #'%sd-eph-base
@@ -203,7 +376,9 @@
           (fdefinition 'modus.ssh::ssh-peer-closed-p) #'%sd-peer-closed-p
           (fdefinition 'modus.ssh::ssh-preauth-clock) #'%sd-clock
           (fdefinition 'modus.ssh::ssh-wait-expired-p) #'%sd-wait-expired-p
-          (fdefinition 'modus.ssh::ssh-version-wait-expired-p) #'%sd-version-wait-expired-p)
+          (fdefinition 'modus.ssh::ssh-version-wait-expired-p) #'%sd-version-wait-expired-p
+          (fdefinition 'ssh-handle-channel-data) #'%sd-channel-data
+          (fdefinition 'modus.ssh::ssh-start-shell) #'%sd-start-shell)
     (setq *sd-up* t))
   (net-service-listen port #'%sd-spawn)
   (kmsg-event 1 "SSHD" port 0 0)

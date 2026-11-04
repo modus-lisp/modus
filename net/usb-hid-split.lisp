@@ -386,6 +386,13 @@
     ((= u 42) 127)
     ((= u 43) 9)
     ((= u 44) 32)
+    ;; keys with no character, as codes 128 and up (the ring is bytes, and ASCII stops at
+    ;; 127): F1-F12 136-147, Insert 128, Home 129, PgUp 130, Delete 131, End 132, PgDn 133,
+    ;; Right 134, Left 135, Down 148, Up 149 -- kiln's desk turns them into X keysyms
+    ((and (>= u 58) (<= u 69)) (+ u 78))             ; F1..F12
+    ((and (>= u 73) (<= u 80)) (+ u 55))             ; Insert Home PgUp Delete End PgDn Right Left
+    ((= u 81) 148)                                   ; Down
+    ((= u 82) 149)                                   ; Up
     ((and (>= u 45) (<= u 56))                       ; - = [ ] \ # ; ' ` , . /
      (if shift
          (case u (45 95) (46 43) (47 123) (48 125) (49 124) (50 126) (51 58) (52 34)
@@ -408,17 +415,24 @@
   (< (logand (- (hid-now) t1) #x3FFF) #x2000))
 
 (defun hid-key-char (u mods)
-  ;; Character for usage U under modifier byte MODS, or -1.
+  ;; Character for usage U under modifier byte MODS, or -1.  Control makes a control code
+  ;; of a character (not of a key code, 128 and up).
   (let ((c (hid-usage-char u (not (zerop (logand mods #x22))))))
-    (if (and (>= c 0) (not (zerop (logand mods #x11))) (>= c 64))
+    (if (and (>= c 64) (< c 128) (not (zerop (logand mods #x11))))
         (logand c 31)
         c)))
+
+(defun hid-push-key (c mods)
+  ;; C into the ring, after an ESC when Alt is held: Meta as a terminal sends it.
+  (when (not (zerop (logand mods #x44))) (hid-ring-push 27))
+  (hid-ring-push c))
 
 (defun hid-repeat-tick ()
   (let ((u (hid-get #x88)))
     (when (and (> u 0) (hid-time-reached-p (hid-get #x8C)))
-      (let ((c (hid-key-char u (mem-ref (+ (hid-st) #x70) :u8))))
-        (when (>= c 0) (hid-ring-push c)))
+      (let ((m (mem-ref (+ (hid-st) #x70) :u8)))
+        (let ((c (hid-key-char u m)))
+          (when (>= c 0) (hid-push-key c m))))
       (hid-put #x8C (logand (+ (hid-now) (hid-repeat-period)) #x3FFF)))))
 
 (defun hid-key-was-down (u)
@@ -439,7 +453,7 @@
           (when (and (> u 3) (not (hid-key-was-down u)))
             (let ((c (hid-key-char u mods)))
               (when (>= c 0)
-                (hid-ring-push c)
+                (hid-push-key c mods)
                 ;; the newest key repeats, after the initial delay
                 (setq held u) (setq still t)
                 (hid-put #x88 u)

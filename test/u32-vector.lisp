@@ -1,0 +1,135 @@
+;;;; test/u32-vector.lisp — packed (unsigned-byte 32) vectors (subtag #x17).
+;;;;
+;;;;   ./modus --script test/u32-vector.lisp      (prints U32-VECTOR PASS n / FAIL n)
+;;;;
+;;;; In a build with 32-bit strings, a simple vector whose element type upgrades to
+;;;; (UNSIGNED-BYTE 32) is 4 bytes an element: glass's framebuffers are exactly this.  The
+;;;; questions are CL's, asked as an ANSI test would, plus the representation and the
+;;;; collector: a packed vector must survive collections bit for bit.
+
+(defvar *pass* 0)
+(defvar *fail* 0)
+(defmacro check (name form expected)
+  `(let ((got (handler-case ,form (error (e) (list :error (type-of e))))))
+     (if (equalp got ,expected)
+         (incf *pass*)
+         (progn (incf *fail*) (format t "FAIL ~a~%  expected ~s~%  got      ~s~%" ,name ,expected got)))))
+
+(defun packed-p (v) (eql (modus-int::obj-subtag v) #x17))
+
+(defun declared-roundtrip (v)
+  (declare (type (simple-array (unsigned-byte 32) (*)) v))
+  (setf (aref v 1) #xDEADBEEF)
+  (setf (aref v 2) 0)
+  (list (aref v 1) (aref v 2) (length v)))
+
+(defun declared-sum (v)
+  (declare (type (simple-array (unsigned-byte 32) (*)) v))
+  (let ((s 0)) (dotimes (i (length v) s) (incf s (aref v i)))))
+
+(let ((v (make-array 4 :element-type '(unsigned-byte 32))))
+  (check "packed" (packed-p v) t)
+  (check "type-of" (type-of v) '(simple-array (unsigned-byte 32) (4)))
+  (check "array-element-type" (array-element-type v) '(unsigned-byte 32))
+  (check "zero-filled" (coerce v 'list) '(0 0 0 0))
+  (check "typep simple-array u32" (typep v '(simple-array (unsigned-byte 32) (*))) t)
+  (check "typep vector u16 (upgrades alike)" (typep v '(vector (unsigned-byte 16))) t)
+  (check "typep simple-array t" (typep v '(simple-array t (*))) nil)
+  (check "typep u8 vector" (typep v '(vector (unsigned-byte 8))) nil)
+  (check "simple-vector-p" (simple-vector-p v) nil)
+  (check "vectorp arrayp" (list (vectorp v) (arrayp v) (stringp v)) '(t t nil))
+  (setf (aref v 0) 4294967295 (aref v 3) 12345)
+  (check "max and small" (list (aref v 0) (aref v 3)) '(4294967295 12345))
+  (check "store -1 signals" (setf (aref v 1) -1) '(:error type-error))
+  (check "store 2^32 signals" (setf (aref v 1) 4294967296) '(:error type-error))
+  (check "store a character signals" (setf (aref v 1) #\a) '(:error type-error))
+  (check "declared aref/aset" (declared-roundtrip v) '(#xDEADBEEF 0 4))
+  (check "declared sum" (declared-sum v) (+ 4294967295 #xDEADBEEF 12345))
+  )
+
+(check "upgraded u32" (upgraded-array-element-type '(unsigned-byte 32)) '(unsigned-byte 32))
+(check "upgraded u16" (upgraded-array-element-type '(unsigned-byte 16)) '(unsigned-byte 32))
+(check "upgraded mod 1000" (upgraded-array-element-type '(mod 1000)) '(unsigned-byte 32))
+(check "upgraded integer 0 70000" (upgraded-array-element-type '(integer 0 70000)) '(unsigned-byte 32))
+(check "upgraded u8 stays" (upgraded-array-element-type '(unsigned-byte 8)) '(unsigned-byte 8))
+(check "upgraded bit stays" (upgraded-array-element-type 'bit) 'bit)
+(check "upgraded s32 is T" (upgraded-array-element-type '(signed-byte 32)) t)
+(check "upgraded u33 is T" (upgraded-array-element-type '(unsigned-byte 33)) t)
+(check "upgraded u64 is T" (upgraded-array-element-type '(unsigned-byte 64)) t)
+(check "upgraded fixnum is T" (upgraded-array-element-type 'fixnum) t)
+(check "make-array u16 is packed" (packed-p (make-array 3 :element-type '(unsigned-byte 16))) t)
+(check "make-array s32 is not" (packed-p (make-array 3 :element-type '(signed-byte 32))) nil)
+(check "aet = upgraded, u16"
+       (array-element-type (make-array 3 :element-type '(unsigned-byte 16)))
+       (upgraded-array-element-type '(unsigned-byte 16)))
+
+(check ":initial-element" (coerce (make-array 3 :element-type '(unsigned-byte 32) :initial-element 7) 'list) '(7 7 7))
+(check ":initial-contents" (coerce (make-array 3 :element-type '(unsigned-byte 32) :initial-contents '(1 2 #xFFFFFFFF)) 'list)
+       '(1 2 #xFFFFFFFF))
+
+(let ((v (make-array 6 :element-type '(unsigned-byte 32) :initial-contents '(10 20 30 40 50 60))))
+  (check "subseq keeps the type" (let ((s (subseq v 1 4))) (list (packed-p s) (coerce s 'list))) '(t (20 30 40)))
+  (check "copy-seq keeps the type" (let ((s (copy-seq v))) (list (packed-p s) (equalp s v))) '(t t))
+  (check "reverse" (coerce (reverse v) 'list) '(60 50 40 30 20 10))
+  (check "fill" (coerce (fill (copy-seq v) 9 :start 2 :end 4) 'list) '(10 20 9 9 50 60))
+  (check "replace from a list" (coerce (replace (copy-seq v) '(1 2) :start1 4) 'list) '(10 20 30 40 1 2))
+  (check "replace u32 to u32 (overlap)" (coerce (let ((w (copy-seq v))) (replace w w :start1 1)) 'list)
+         '(10 10 20 30 40 50))
+  (check "replace into a general vector" (coerce (replace (make-array 3) v :start2 3) 'list) '(40 50 60))
+  (check "map into list" (map 'list #'1+ v) '(11 21 31 41 51 61))
+  (check "position / find" (list (position 40 v) (find 50 v)) '(3 50))
+  (check "equalp general vector" (equalp v (vector 10 20 30 40 50 60)) t)
+  (check "sort" (coerce (sort (copy-seq v) #'>) 'list) '(60 50 40 30 20 10))
+  (check "displaced view" (let ((d (make-array 2 :element-type '(unsigned-byte 32) :displaced-to v
+                                                   :displaced-index-offset 2)))
+                            (setf (aref d 1) 99)
+                            (list (coerce d 'list) (aref v 3)))
+         '((30 99) 99))
+  (check "make-sequence" (let ((s (make-sequence '(vector (unsigned-byte 32)) 3 :initial-element 5)))
+                           (list (packed-p s) (coerce s 'list)))
+         '(t (5 5 5))))
+
+;; THE BULK PATHS (REPLACE, FILL, SUBSEQ on packed lanes), at sizes that cross the doubling fill's
+;; steps, with overlap both ways
+(let* ((n 1000) (v (make-array n :element-type '(unsigned-byte 32))))
+  (dotimes (i n) (setf (aref v i) (* i 4000001)))
+  (check "fill odd span" (let ((w (copy-seq v))) (fill w #xFFFFFFFF :start 3 :end 770)
+                           (list (aref w 2) (aref w 3) (aref w 769) (aref w 770) (count #xFFFFFFFF w)))
+         (list (* 2 4000001) #xFFFFFFFF #xFFFFFFFF (* 770 4000001) 767))
+  (check "fill whole" (let ((w (copy-seq v))) (fill w 7) (every (lambda (x) (= x 7)) w)) t)
+  (check "fill 1" (let ((w (copy-seq v))) (fill w 9 :start 5 :end 6) (list (aref w 4) (aref w 5) (aref w 6)))
+         (list (* 4 4000001) 9 (* 6 4000001)))
+  (check "replace up (overlap)" (let ((w (copy-seq v))) (replace w w :start1 10 :start2 0 :end2 500)
+                                  (list (aref w 10) (aref w 509) (aref w 9)))
+         (list 0 (* 499 4000001) (* 9 4000001)))
+  (check "replace down (overlap)" (let ((w (copy-seq v))) (replace w w :start1 0 :start2 10)
+                                    (list (aref w 0) (aref w 989) (aref w 990)))
+         (list (* 10 4000001) (* 999 4000001) (* 990 4000001)))
+  (check "replace between" (let ((w (make-array 600 :element-type '(unsigned-byte 32))))
+                             (replace w v :start2 400) (list (aref w 0) (aref w 599)))
+         (list (* 400 4000001) (* 999 4000001)))
+  (check "subseq bulk" (let ((s (subseq v 250 260))) (list (packed-p s) (aref s 0) (aref s 9)))
+         (list t (* 250 4000001) (* 259 4000001))))
+
+(let ((a (make-array 3 :element-type '(unsigned-byte 32) :adjustable t :fill-pointer 0)))
+  (vector-push-extend 1 a) (vector-push-extend #xFFFFFFFF a)
+  (check "adjustable/fill-pointer" (list (coerce a 'list) (array-element-type a)) '((1 #xFFFFFFFF) (unsigned-byte 32))))
+
+;; THE COLLECTOR: packed vectors among garbage, collected several times, contents intact.
+(defun make-pattern (n k)
+  (let ((v (make-array n :element-type '(unsigned-byte 32))))
+    (dotimes (i n v) (setf (aref v i) (logand (* (+ i 1) k 2654435761) #xFFFFFFFF)))))
+(defun pattern-ok (v n k)
+  (and (packed-p v) (= (length v) n)
+       (dotimes (i n t) (unless (= (aref v i) (logand (* (+ i 1) k 2654435761) #xFFFFFFFF)) (return nil)))))
+(let ((keep (loop for k from 1 to 40 collect (make-pattern (+ 1 (* k 97)) k)))
+      (before (modus-int::%gc-epoch)))
+  (dotimes (round 6)
+    (dotimes (j 3000) (make-array (+ 10 (mod j 50))))           ; garbage between them
+    (modus-int::%gc-collect-here))
+  (check "collections happened" (> (modus-int::%gc-epoch) before) t)
+  (check "40 packed vectors survive collections intact"
+         (loop for v in keep for k from 1 always (pattern-ok v (+ 1 (* k 97)) k))
+         t))
+
+(format t "~&U32-VECTOR ~:[FAIL~;PASS~] ~d passed, ~d failed~%" (zerop *fail*) *pass* *fail*)

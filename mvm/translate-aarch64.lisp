@@ -8350,6 +8350,8 @@
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
     (a64-cmp-imm buf +a64-x14+ #x15)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x17)                     ; u32 vector: 4 bytes/element
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
     (a64-add-imm buf +a64-x9+ +a64-x16+ 16)
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i havesz :b))
     (a64-set-label buf f32sz)
@@ -8359,7 +8361,7 @@
     (a64-set-label buf havesz)
     (a64-add-imm buf +a64-x9+ +a64-x9+ 15) (a64-lsr-imm buf +a64-x9+ +a64-x9+ 4) (a64-lsl-imm buf +a64-x9+ +a64-x9+ 4)
     (a64-add-reg buf +a64-x24+ +a64-x26+ +a64-x9+ 0 0)       ; next object
-    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66))
+    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x31 #x60 #x64 #x65 #x66))
       (a64-cmp-imm buf +a64-x14+ st)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i nextobj :bcond)))
     ;; slots [max(obj+16, card start), min(obj+16+count*8, card end))
@@ -8605,6 +8607,8 @@
     (a64-cmp-imm buf +a64-x14+ #x12)
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
     (a64-cmp-imm buf +a64-x14+ #x15)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x17)                     ; u32 vector: 4 bytes/element
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
     (a64-add-imm buf +a64-x9+ +a64-x16+ 16)
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i havesz :b))
@@ -9003,6 +9007,8 @@
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
     (a64-cmp-imm buf +a64-x14+ #x15)                     ; 32-bit string: 4 bytes/char
     (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
+    (a64-cmp-imm buf +a64-x14+ #x17)                     ; u32 vector: 4 bytes/element
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz2 :bcond))
     (a64-add-imm buf +a64-x9+ +a64-x16+ 16)              ; general: count*8+16
     (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i haveslots :b))
     (a64-set-label buf f32sz2)
@@ -9019,7 +9025,7 @@
     ;; from-space was reused -- natrium's *P25519* after a tarball install on the
     ;; Pi (INTEGER-LENGTH never returned).  A small bignum's two slots are tagged
     ;; fixnums, safe to scan.  x64 made the same fix in 9d0790c.
-    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x31 #x60 #x64 #x65 #x66))
+    (dolist (st (list #x10 #x11 #x12 #x13 #x14 #x15 #x16 #x17 #x31 #x60 #x64 #x65 #x66))
       (a64-cmp-imm buf +a64-x14+ st)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i leafskip :bcond)))
     ;; pointer-bearing: scan slots [x23 .. slot_end=x26)
@@ -9207,6 +9213,8 @@
         (a64-cmp-imm buf +a64-x9+ #x12)                  ; f32-vector: 4 bytes/lane
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
         (a64-cmp-imm buf +a64-x9+ #x15)                  ; 32-bit string: 4 bytes/char
+        (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
+        (a64-cmp-imm buf +a64-x9+ #x17)                     ; u32 vector: 4 bytes/element
         (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i f32sz :bcond))
         (a64-lsl-imm buf +a64-x15+ +a64-x15+ 3) (a64-add-imm buf +a64-x15+ +a64-x15+ 16) ; (count+2)*8 = count*8+16
         (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i hadsz :b))

@@ -203,14 +203,26 @@
 (defun %sbs-peercred (fd) fd (%bare-no-namespace "peer credentials"))
 
 ;;; ---- file streams over socket descriptors (mvm/cl-fileio.lisp's *NET-FD-CALL*) --------
+;;; A CLOSED SOCKET IS STILL A SOCKET.  Descriptors are numbered from 2000 and never reused, so
+;;; one below *BSOCK-NEXT* that is not in the table was a socket and has been closed -- by
+;;; another thread, typically, while this one was reading its stream (the desk's Terminal closed
+;;; while an SSH reader waited).  Answering "not ours" sent that read to cl-fileio's Linux path,
+;;; a read(2) SVC, which on bare metal is a CPU fault that took core 0 and the desk with it.
+;;; Now it reads end of file and a write signals.
+
+(defun %bs-gone-p (fd)
+  (and (integerp fd) (>= fd 2000) (< fd *bsock-next*) (null (%bs fd))
+       (not (ignore-errors (%cab-fd-p fd)))))
 
 (defun %net-fd-dispatch (op fd &rest args)
   (let ((b (%bs fd)))
+    (when (and (null b) (not (member op '(:fd-p :close :flush :ready-p :read-bytes :read-into))))
+      (error "socket ~d is closed" fd))
     (case op
-      (:fd-p (and b t))
-      (:close (%sbs-close fd))
+      (:fd-p (or (and b t) (%bs-gone-p fd)))
+      (:close (if b (%sbs-close fd) 0))
       (:flush (when b (%bs-flush b)) t)
-      (:ready-p (and b (> (%sbs-poll-in fd 0) 0)))
+      (:ready-p (or (null b) (> (%sbs-poll-in fd 0) 0)))   ; closed: EOF is ready
       (:write-byte
        (let ((o (bs-out b)))
          (vector-push (first args) o)
@@ -224,13 +236,15 @@
            (error "write-sequence: the connection on socket ~d is gone" fd)))
        t)
       (:read-bytes                                   ; (seq start end): until full or EOF; the index
-       (let ((seq (first args)) (i (second args)) (end (third args)) (c (bs-conn b)))
+       (let ((seq (first args)) (i (second args)) (end (third args)) (c (and b (bs-conn b))))
          (loop
            (when (or (>= i end) (not (typep c 'tcp-conn))) (return i))
+           (when (null (%bs fd)) (return i))          ; closed under us: end of file
            (let ((r (tcpc-read c :max (- end i) :timeout-ms 1000)))
              (cond ((eq r :eof) (return i))
                    ((> (length r) 0) (replace seq r :start1 i) (setq i (+ i (length r)))))))))
       (:read-into                                    ; (buf count): into the stream's string buffer
+       (unless b (return-from %net-fd-dispatch 0))  ; closed: end of file
        (let* ((buf (first args)) (count (second args))
               (tmp (make-array count :element-type '(unsigned-byte 8)))
               (n (socket-recv fd tmp count)))

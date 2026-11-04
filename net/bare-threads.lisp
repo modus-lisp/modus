@@ -1132,7 +1132,12 @@ modus: a thread needed the runtime lock but the lock arena is exhausted; stoppin
             (setf (svref *bt-exec-fns* idx) nil)
             (mfence)
             (%gc-write64 (+ cell #x10) req))))
-      (unless idle (bt-yield)))))
+      ;; EVERY round gives the core up, idle function or not: an executor that kept its
+      ;; core starved every other thread pinned there -- with the desk's screen (core 2)
+      ;; and audio (core 3) executors running, an SSH session on those cores never ran
+      ;; and every connection timed out in the banner exchange.  A round trip through
+      ;; the core's scheduler when nothing else is ready.
+      (bt-yield))))
 
 (defun bt-start-executor (core &optional idle)
   "Start an executor pinned to CORE (1..3) running IDLE between calls (NIL: it only

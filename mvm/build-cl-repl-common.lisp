@@ -457,6 +457,43 @@
 (declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
 (defun %kmsg-region () (values #x110A0000 #x60000))
+;; THE HEAP'S SIZE COMES FROM THE BOARD (boot-rpi-cl.lisp's memory map): region 0 runs
+;; from 0x12000000 to 4 MB below the top of the ARM's RAM, as the VideoCore reports it
+;; -- 448 MiB on a Zero at the firmware's default gpu_mem=64, 480 at gpu_mem=32, 960 MiB
+;; on a 1 GB Pi 3B or QEMU raspi3b -- capped at 0x20000000, where the GC bitmaps' cover
+;; ends.  Kernel-main asks before the heap is published, so both run with no heap:
+;; raw stores and fixnum arithmetic only, and bounded waits, because a mailbox that does
+;; not answer must cost a boot nothing worse than the smallest board's heap.
+(defun %rpi-arm-ram-top ()
+  \"The top of the ARM's RAM from the VideoCore property mailbox (GET_ARM_MEMORY,
+   tag 0x00010005): base + size, or 0 when the firmware does not answer.\"
+  (let ((b #x111F0000) (mbox #x3F00B880) (i 0))
+    (setf (mem-ref b :u32) 32)                     ; buffer size
+    (setf (mem-ref (+ b 4) :u32) 0)                ; a request
+    (setf (mem-ref (+ b 8) :u32) #x10005)          ; GET_ARM_MEMORY
+    (setf (mem-ref (+ b 12) :u32) 8)               ; value buffer: base, size
+    (setf (mem-ref (+ b 16) :u32) 0)
+    (setf (mem-ref (+ b 20) :u32) 0)
+    (setf (mem-ref (+ b 24) :u32) 0)
+    (setf (mem-ref (+ b 28) :u32) 0)               ; end tag
+    (loop (when (or (> i 1000000)
+                    (zerop (logand (mem-ref (+ mbox #x38) :u32) #x80000000)))
+            (return nil))
+          (setq i (+ i 1)))
+    (setf (mem-ref (+ mbox #x20) :u32) (logior #xC0000000 b 8))   ; channel 8, bus alias
+    (setq i 0)
+    (loop (when (> i 1000000) (return 0))
+          (when (zerop (logand (mem-ref (+ mbox #x18) :u32) #x40000000))
+            (mem-ref mbox :u32)                    ; take the answer off the queue
+            (return (if (= (mem-ref (+ b 4) :u32) #x80000000)
+                        (+ (mem-ref (+ b 20) :u32) (mem-ref (+ b 24) :u32))
+                        0)))
+          (setq i (+ i 1)))))
+(defun %rpi-heap-end (top)
+  \"Where region 0 ends on a board whose ARM RAM ends at TOP: 4 MB below it, capped at
+   0x20000000, a multiple of 4 MB, and never below the smallest board's 0x1BC00000.\"
+  (let ((e (- (min top #x20000000) #x400000)))
+    (max #x1BC00000 (* #x400000 (floor e #x400000)))))
 "
         "")
     ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
@@ -581,6 +618,14 @@
 (defvar *core-restart-hook* nil)
 (declaim (overridable %core-addr))
 (defun %core-addr () #x18000000)
+;; A core may come from a board with more RAM, or from QEMU's 1 GiB raspi3b: region 0
+;; is sized from the RAM (%RPI-HEAP-END), so any semispace size restores as long as the
+;; saved heap fits this one, leaves the collector's guard, and ends below the core's
+;; own RAM, which the restore is still reading while it fills the heap.
+(defun %core-geometry-ok-p (saved-size) (and saved-size t))
+(defun %core-heap-fits-p (from used)
+  (and (<= used (- (%core-space-size) #x100000))
+       (<= (+ from used) (%core-addr))))
 ;; The board region of boot-rpi-cl.lisp's memory map: (values BASE BYTES), RAM that
 ;; modus leaves alone for the board's own use (kiln keeps its RAM cabinet there).
 (defun %rpi-board-ram () (values #x03200000 #x02000000))
@@ -1057,7 +1102,13 @@
   ;; SP (+rpi-cl-stack-top+).  The geometry is boot-rpi-cl.lisp's memory map
   ;; (+rpi-cl-heap-base+ .. +rpi-cl-heap-end+); %RPI-MEMORY-MAP-ASSERTS checks
   ;; that these literals agree with it.
-  (%gc-init #x12000000 #x09C00000 #x08000000)
+  ;; The size is the board's (%RPI-HEAP-END).  The stub set the allocation limit for the
+  ;; smallest board's midpoint, which is below this one, so raise it the same guard short
+  ;; of the new midpoint.  Nothing has allocated yet.
+  (let* ((top (%rpi-arm-ram-top))
+         (size (- (%rpi-heap-end top) #x12000000)))
+    (%gc-init #x12000000 size #x08000000)
+    (set-alloc-limit (- (+ #x12000000 (ash size -1)) #x100000)))
 
   ;; #160 OBJECT-START + CONS-KIND BITMAPS, bare-metal flavour.
   ;;
@@ -1087,6 +1138,13 @@
   ;; %FDT-KEEP): QEMU puts it where the threaded build's bitmaps go.
   (%fdt-keep)
   (%rpi-gc-bitmap-init #x08000000 #x08400000 #x2E0000 #x09000000)
+  ;; What the board gave region 0 (allocating is legal from here on).
+  (write-string-serial \"HEAP=2x\")
+  (print-dec (ash (%gc-space-size) -20))
+  (write-string-serial \"MB RAM=\")
+  (print-dec (ash (%rpi-arm-ram-top) -20))
+  (write-string-serial \"MB\")
+  (write-char-serial 10)
 
   ;; NOTE: no (setup-irq) / (nic-irq-unmask) here.  Those program a GICv2,
   ;; which a BCM2837 does not have (it uses the BCM interrupt controller), and
@@ -3504,9 +3562,16 @@
       (when (> heap-end min-board-ram)
         (error "BUILD-TIME ASSERT: the heap ends ~X past ~X, the RAM a Pi Zero 2 W's ARM ~
                 sees at gpu_mem=64." heap-end min-board-ram))
-      (must-say (format nil "(%gc-init #x~8,'0X #x~8,'0X #x~8,'0X)"
-                        heap-base (- heap-end heap-base) stack-top)
-                "region 0's geometry")
+      ;; region 0's geometry is the board's (%RPI-HEAP-END of the mailbox's answer):
+      ;; the base and stack are literals, the smallest board's end is the floor and
+      ;; the bitmaps' end the cap, and the limit is raised by the translator's guard
+      (must-say (format nil "(%gc-init #x~8,'0X size #x~8,'0X)" heap-base stack-top)
+                "region 0's base and stack")
+      (must-say (format nil "(max #x~8,'0X " heap-end) "the smallest board's heap end")
+      (must-say (format nil "(min top #x~8,'0X)" bm-end) "the heap's cap, the bitmaps' end")
+      (must-say (format nil "(set-alloc-limit (- (+ #x~8,'0X (ash size -1)) #x~X))"
+                        heap-base modus.mvm::*aarch64-gc-limit-guard*)
+                "the raised limit, with the translator's guard")
       ;; the saved core is read from the upper semispace while the lower one fills
       (unless (and (>= core-addr heap-mid) (< core-addr heap-end))
         (error "BUILD-TIME ASSERT: the core load address ~X is not in the upper semispace ~
@@ -3528,8 +3593,9 @@
       (format t "  threads    ~8,'0X .. ~8,'0X  (core heaps)~%" arena arena-end)
       (format t "  scheduler, SSH, scratch  ~8,'0X .. ~8,'0X~%" #x10900000 high-small-hi)
       (format t "  net/DMA    ~8,'0X .. ~8,'0X  (Device window, rings, the I/O core)~%" net-lo net-hi)
-      (format t "  heap       ~8,'0X .. ~8,'0X  (2 x ~D MB, midpoint ~8,'0X); core loads at ~8,'0X~%"
-              heap-base heap-end (floor (- heap-mid heap-base) (* 1024 1024)) heap-mid core-addr)
+      (format t "  heap       ~8,'0X .. RAM top - 4 MB, capped at ~8,'0X (smallest board: ..~8,'0X, 2 x ~D MB, midpoint ~8,'0X); core loads at ~8,'0X~%"
+              heap-base bm-end
+              heap-end (floor (- heap-mid heap-base) (* 1024 1024)) heap-mid core-addr)
       (format t "  periph     ~8,'0X ..            (PL011 UART0 at 3F201000)~%" periph-base)
       ;; The limit guard must exceed every allocation that is NOT checked
       ;; against its own size (FUSE-GC-CHECKS census).

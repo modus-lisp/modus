@@ -152,7 +152,10 @@
 (defconstant +rpi-cl-jit-hi+        #x0D000000)
 (defconstant +rpi-cl-thread-arena+  #x0D000000)  ; net/bare-threads.lisp's core heaps
 (defconstant +rpi-cl-heap-base+     #x12000000)  ; x24 — Cheney from-space
-(defconstant +rpi-cl-heap-mid+      #x16E00000)  ; x25 — semispace midpoint
+;; The heap ends 4 MB below the top of the ARM's RAM, as kernel-main reads it from the
+;; VideoCore (%RPI-HEAP-END).  These are the SMALLEST board's -- a Zero at gpu_mem=64,
+;; 448 MiB -- which the stub's first allocation limit uses until kernel-main raises it.
+(defconstant +rpi-cl-heap-mid+      #x16E00000)  ; x25 — the smallest board's midpoint
 (defconstant +rpi-cl-heap-end+      #x1BC00000)  ; 2 x 78 MB, below 448 MiB of ARM RAM
 (defconstant +rpi-cl-percpu+        #x10080000)  ; TPIDR_EL1
 ;; SMP PHASE 2 (opt-in, MODUS_RPI_THREADS=1): the hosted aarch64 per-thread WINDOW on bare

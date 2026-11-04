@@ -2681,17 +2681,6 @@
 (defvar *jit-hot-promoted* nil "CENSUS: modules built by a hot DEFUN (callees included).")
 (defvar *jit-hot-failed* nil "CENSUS: those whose page did not build (they stay interpreted).")
 (defvar *jit-hot-busy* nil "T while a hot build runs: a trampoline firing inside it waits.")
-(defvar *jit-translating* nil
-  "T while a page is being translated.  The translators keep their state in
-   globals (*MVM-LABEL-COUNTER*, *AARCH64-JIT-MODE*, *A64-JIT-PAGE-REJECT*, the
-   frame-slot cache ...), so a second translation that starts before the first
-   finishes corrupts both -- and \"main thread\" (%MVM-ON-MAIN-THREAD-P) is CPU 0,
-   which on the Zero board is every unpinned thread: core-0 coroutines that
-   switch at allocation.  Measured there: a background thread's page began while
-   glass-webrtc's 21703-byte page was mid-translation, and the load never ended.")
-(defvar *jit-translate-busy-count* nil
-  "CENSUS: translations declined (interpreted) because one was already running.")
-
 
 (defun %jit-hot-call-threshold ()
   (let ((v (handler-case *jit-hot-calls* (error (c) nil))))
@@ -2739,7 +2728,7 @@
    NIL when this is not the moment (the JIT off or inhibited, a worker thread,
    a build already running); the names then wait for the next chance."
   (when (and (%jit-enabled-p) (%jit-active-p) (%mvm-on-main-thread-p)
-             (not *jit-hot-busy*) (not *jit-translating*) (consp *jit-script-def-names*))
+             (not *jit-hot-busy*) (consp *jit-script-def-names*))
     (let ((names (reverse *jit-script-def-names*))
           (before (or *jit-native-defun-count* 0))
           (seen (cons nil 4096))
@@ -2766,9 +2755,7 @@
    agent, ~2 minutes into a cl-marmot session: SIGSEGV on a PUSH).  So SELF only
    ever forwards to its own module's code, through its box."
   (cond ((not (%jit-enabled-p)) nil)
-        ((or (not (%jit-active-p)) (not (%mvm-on-main-thread-p)) *jit-hot-busy*
-             *jit-translating*)
-         :retry)
+        ((or (not (%jit-active-p)) (not (%mvm-on-main-thread-p)) *jit-hot-busy*) :retry)
         (t (let ((before (or *jit-native-defun-count* 0)))
              (setq *jit-hot-busy* t)
              (unwind-protect
@@ -2805,7 +2792,7 @@
   "On the main thread: build every DEFUN a worker found hot.  The count taken."
   (let ((f *jit-want-flag*))
     (if (and (consp f) (car f) (%mvm-on-main-thread-p) *jit-trampoline-forwards*
-             (%jit-enabled-p) (%jit-active-p) (not *jit-hot-busy*) (not *jit-translating*))
+             (%jit-enabled-p) (%jit-active-p) (not *jit-hot-busy*))
         (let ((names nil))
           (setf (car f) nil)
           (maphash (lambda (k v)
@@ -3691,7 +3678,7 @@
   "Re-attempt every queued module once.  Called after a successful native
    install (a new native callee exists).  A module that builds is installed
    and removed; one that fails is kept with attempts+1, or dropped at the cap."
-  (when (and *jit-retry-queue* (not *jit-retry-busy*) (not *jit-translating*))
+  (when (and *jit-retry-queue* (not *jit-retry-busy*))
     (setq *jit-retry-busy* t)
     (unwind-protect
         (let ((keep nil) (now (or *jit-native-defun-count* 0)))
@@ -3749,19 +3736,6 @@
    %mvm-eval-run-tuple / mvm-eval-forms is kept as belt-and-suspenders; this inner
    guard exists because a translate error must degrade to NIL (interpret)
    even in any context whose outer catch might not see it."
-  (if *jit-translating*
-      ;; One already running (another core-0 thread, or a nested entry): this
-      ;; form is interpreted, as on any other fallback.
-      (progn (setq *jit-translate-busy-count*
-                   (if *jit-translate-busy-count* (+ 1 *jit-translate-busy-count*) 1))
-             nil)
-      (progn
-        ;; check-and-set with no allocation between, so no coroutine switch
-        (setq *jit-translating* t)
-        (unwind-protect (%jit-translate-page-guarded bc mvm-entry ft-list rt-table)
-          (setq *jit-translating* nil)))))
-
-(defun %jit-translate-page-guarded (bc mvm-entry ft-list rt-table)
   (handler-case
       (if (eq *jit-target-arch* :aarch64)
           (%jit-translate-page-1-aarch64 bc mvm-entry ft-list rt-table)

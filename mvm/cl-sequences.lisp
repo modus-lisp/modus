@@ -2874,6 +2874,10 @@
            ((and (integerp store-item) (%u8-bare-p seq))
             (%fill-u8 seq i eff-end store-item)
             seq)
+           ;; packed u32 (glass's framebuffer clear and every FB-RECT row)
+           ((and (fixnump store-item) (<= 0 store-item 4294967295) (%u32-bare-p seq))
+            (%fill-u32 seq i eff-end store-item)
+            seq)
            ((and (not (stringp seq)) (%bulk-copy-ok-p seq seq))
             ;; plain word-slot array (general or typed-generic, not a
             ;; string / wrapper / mda): raw slot stores — a VP8 macroblock

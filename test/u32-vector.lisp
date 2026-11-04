@@ -89,6 +89,28 @@
                            (list (packed-p s) (coerce s 'list)))
          '(t (5 5 5))))
 
+;; THE BULK PATHS (REPLACE, FILL, SUBSEQ on packed lanes), at sizes that cross the doubling fill's
+;; steps, with overlap both ways
+(let* ((n 1000) (v (make-array n :element-type '(unsigned-byte 32))))
+  (dotimes (i n) (setf (aref v i) (* i 4000001)))
+  (check "fill odd span" (let ((w (copy-seq v))) (fill w #xFFFFFFFF :start 3 :end 770)
+                           (list (aref w 2) (aref w 3) (aref w 769) (aref w 770) (count #xFFFFFFFF w)))
+         (list (* 2 4000001) #xFFFFFFFF #xFFFFFFFF (* 770 4000001) 767))
+  (check "fill whole" (let ((w (copy-seq v))) (fill w 7) (every (lambda (x) (= x 7)) w)) t)
+  (check "fill 1" (let ((w (copy-seq v))) (fill w 9 :start 5 :end 6) (list (aref w 4) (aref w 5) (aref w 6)))
+         (list (* 4 4000001) 9 (* 6 4000001)))
+  (check "replace up (overlap)" (let ((w (copy-seq v))) (replace w w :start1 10 :start2 0 :end2 500)
+                                  (list (aref w 10) (aref w 509) (aref w 9)))
+         (list 0 (* 499 4000001) (* 9 4000001)))
+  (check "replace down (overlap)" (let ((w (copy-seq v))) (replace w w :start1 0 :start2 10)
+                                    (list (aref w 0) (aref w 989) (aref w 990)))
+         (list (* 10 4000001) (* 999 4000001) (* 990 4000001)))
+  (check "replace between" (let ((w (make-array 600 :element-type '(unsigned-byte 32))))
+                             (replace w v :start2 400) (list (aref w 0) (aref w 599)))
+         (list (* 400 4000001) (* 999 4000001)))
+  (check "subseq bulk" (let ((s (subseq v 250 260))) (list (packed-p s) (aref s 0) (aref s 9)))
+         (list t (* 250 4000001) (* 259 4000001))))
+
 (let ((a (make-array 3 :element-type '(unsigned-byte 32) :adjustable t :fill-pointer 0)))
   (vector-push-extend 1 a) (vector-push-extend #xFFFFFFFF a)
   (check "adjustable/fill-pointer" (list (coerce a 'list) (array-element-type a)) '((1 #xFFFFFFFF) (unsigned-byte 32))))

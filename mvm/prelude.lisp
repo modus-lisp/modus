@@ -654,6 +654,41 @@
       (%u8-set seq i item)
       (setq i (+ i 1)))))
 
+(defun %u32-bare-p (x)
+  "True for a plain packed (unsigned-byte 32) vector (subtag #x17): no header, no wrapper."
+  (and x (not (consp x)) (not (%mda-p x)) (eq (obj-subtag x) #x17)))
+
+(defun %bulk-copy-u32-ok-p (dst src)
+  "Both plain packed u32 vectors: copy 4-byte lanes (%BULK-COPY-OK-P excludes #x17 -- its
+   slots are not words)."
+  (and (%u32-bare-p dst) (%u32-bare-p src)))
+
+(declaim (overridable %bulk-copy-u32))
+(defun %bulk-copy-u32 (dst dstart src sstart n)
+  "Lane copy SRC[sstart...] -> DST[dstart...], memmove semantics like %BULK-COPY-U8.  A lane at a
+   time; the aarch64 and x64 images replace this with one BULK-MOVE of 4N bytes."
+  (declare (type fixnum dstart sstart n))
+  (if (and (eq dst src) (> dstart sstart))
+      (let ((i (- n 1)))
+        (declare (type fixnum i))
+        (loop (when (< i 0) (return dst))
+          (%c32-set dst (+ dstart i) (%c32-ref src (+ sstart i)))
+          (setq i (- i 1))))
+      (let ((i 0))
+        (declare (type fixnum i))
+        (loop (when (>= i n) (return dst))
+          (%c32-set dst (+ dstart i) (%c32-ref src (+ sstart i)))
+          (setq i (+ i 1))))))
+
+(declaim (overridable %fill-u32))
+(defun %fill-u32 (seq start end item)
+  "SEQ[START..END) := ITEM (0..2^32-1), SEQ a plain packed u32 vector, END within it.  A lane
+   at a time; the aarch64 and x64 images replace this with BULK-MOVEs (native-bulk.lisp)."
+  (let ((i start))
+    (loop (when (>= i end) (return seq))
+      (%c32-set seq i item)
+      (setq i (+ i 1)))))
+
 (declaim (overridable %fill-words))
 (defun %fill-words (seq start end item)
   "SEQ[START..END) := ITEM in raw word slots (%BULK-COPY-OK-P SEQ SEQ, END within
@@ -4074,6 +4109,8 @@
             ;; 1.8 MB clip spent 58% of 314 s on the Zero right here.
             ((%bulk-copy-u8-ok-p result seq)
              (%bulk-copy-u8 result 0 seq start len) result)
+            ((%bulk-copy-u32-ok-p result seq)
+             (%bulk-copy-u32 result 0 seq start len) result)
             ((%bulk-copy-ok-p result seq)
              (%bulk-copy result 0 seq start len) result)
             (t

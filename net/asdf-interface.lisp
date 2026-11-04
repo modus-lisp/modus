@@ -101,9 +101,9 @@
    "MISSING-REQUIRES" "MISSING-PARENT" "MISSING-REQUIRED-BY"
    ;; system definition + lookup
    "DEFSYSTEM" "FIND-SYSTEM" "REGISTERED-SYSTEM" "REGISTERED-SYSTEMS"
-   "CLEAR-SYSTEM" "COERCE-NAME" "PRIMARY-SYSTEM-NAME"
+   "CLEAR-SYSTEM" "COERCE-NAME" "PRIMARY-SYSTEM-NAME" "INITIALIZE-SOURCE-REGISTRY"
    ;; component accessors
-   "COMPONENT-NAME" "COMPONENT-LOADED-P"
+   "COMPONENT-NAME" "COMPONENT-LOADED-P" "COMPONENT-VERSION"
    "SYSTEM-SOURCE-FILE" "SYSTEM-SOURCE-DIRECTORY" "SYSTEM-RELATIVE-PATHNAME"
    "SYSTEM-DEPENDS-ON" "SYSTEM-DEFSYSTEM-DEPENDS-ON"
    ;; operations
@@ -791,6 +791,47 @@
    definition.  Modus never EVALUATES a .asd (it reads and interprets the
    form), so nothing acts on this; it is reported, not honoured."
   (%it-plist-get (cddr (asdf::%system-form sys)) :defsystem-depends-on))
+
+(defun asdf::%source-registry-dirs (spec)
+  "The directories a source-registry SPEC names, in order.  Understands
+   (:tree DIR) -- DIR and every directory under it holding a .asd --,
+   (:directory DIR), and :inherit-configuration, which reads the
+   CL_SOURCE_REGISTRY environment variable when it holds a form.  Other
+   directives (:exclude, :also-exclude, :default-registry ...) are ignored."
+  (let ((out '()))
+    (dolist (d (if (and (consp spec) (eq (car spec) :source-registry)) (cdr spec) spec))
+      (cond
+        ((and (consp d) (eq (car d) :tree))
+         (dolist (asd (directory (merge-pathnames "**/*.asd" (uiop::ensure-directory-pathname (cadr d)))))
+           (pushnew (make-pathname :name nil :type nil :defaults asd) out :test #'equal)))
+        ((and (consp d) (eq (car d) :directory))
+         (pushnew (uiop::ensure-directory-pathname (cadr d)) out :test #'equal))
+        ((eq d :inherit-configuration)
+         (let ((env (uiop::getenv "CL_SOURCE_REGISTRY")))
+           (when (and (stringp env) (plusp (length env)) (char= (char env 0) #\())
+             (dolist (x (asdf::%source-registry-dirs (read-from-string env)))
+               (pushnew x out :test #'equal)))))))
+    (nreverse out)))
+
+(defun asdf::initialize-source-registry (&optional spec)
+  "ASDF:INITIALIZE-SOURCE-REGISTRY over this ASDF's *CENTRAL-REGISTRY*: every
+   directory SPEC names (see %SOURCE-REGISTRY-DIRS) goes to the FRONT of the
+   registry, in order, so it wins over earlier entries.  With no SPEC, the
+   CL_SOURCE_REGISTRY environment variable is read."
+  (let ((dirs (asdf::%source-registry-dirs (or spec '(:source-registry :inherit-configuration)))))
+    (setq asdf::*central-registry*
+          (append dirs (remove-if (lambda (x) (member x dirs :test #'equal))
+                                  asdf::*central-registry*)))
+    dirs))
+
+(defun asdf::component-version (sys)
+  "ASDF:COMPONENT-VERSION — the :VERSION string of SYS's definition, or NIL.
+   Only a literal string is answered; a computed version such as
+   (:read-file-form \"version.sexp\") is not evaluated and reads as NIL.
+   Libraries ask for it at read time (hunchentoot's *HUNCHENTOOT-VERSION* is
+   #.(asdf:component-version (asdf:find-system :hunchentoot)))."
+  (let ((v (%it-plist-get (cddr (asdf::%system-form sys)) :version)))
+    (and (stringp v) v)))
 
 (defun asdf::%featurep (x)
   "A feature expression against *FEATURES*: a symbol (compared by name, as

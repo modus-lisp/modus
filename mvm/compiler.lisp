@@ -1724,6 +1724,18 @@
             (%reg-pkg-alist-put (gethash key *global-symbol-macros-pkg*)
                                 p (cons expansion nil))))))
 
+(defun %gsm-bare-ok-p (sym key)
+  "May the BARE (name-keyed) global symbol-macro entry stand for SYM?
+   Not when SYM has a home package and the per-package table holds entries
+   under KEY: those entries belong to other packages, and SYM's package has
+   none of its own.  Falling back there made (define-symbol-macro *x* p1:*x*)
+   expand P1:*X* to itself forever (hunchentoot's *SUPPORTS-THREADS-P* over
+   bordeaux-threads' variable of the same name: a segfault on load).  At
+   build time %REG-PKG-OF is NIL and the table is empty, so this is T."
+  (not (and *global-symbol-macros-pkg*
+            (gethash key *global-symbol-macros-pkg*)
+            (%reg-pkg-of sym))))
+
 (defvar *static-keywords-p* nil
   "When T, an image build (not a runtime mvm-eval compile) bakes every keyword
    literal as a STATIC keyword object in the image constant pool and loads it
@@ -8071,7 +8083,8 @@
       ((%gsm-pkg-get name (normalize-name name))
        (compile-form (car (%gsm-pkg-get name (normalize-name name))) env dest))
       ((and *global-symbol-macros*
-            (nth-value 1 (gethash (normalize-name name) *global-symbol-macros*)))
+            (nth-value 1 (gethash (normalize-name name) *global-symbol-macros*))
+            (%gsm-bare-ok-p name (normalize-name name)))
        (compile-form (gethash (normalize-name name) *global-symbol-macros*) env dest))
       ;; Compile-time constant: fold to literal -- the build's, or a runtime DEFCONSTANT's
       ((let ((const-val (let ((c (gethash (normalize-name name) *constants* :not-found)))
@@ -8289,7 +8302,8 @@
         ((%gsm-pkg-get place (normalize-name place))
          (%gsm-pkg-get place (normalize-name place)))
         ((and *global-symbol-macros*
-              (nth-value 1 (gethash (normalize-name place) *global-symbol-macros*)))
+              (nth-value 1 (gethash (normalize-name place) *global-symbol-macros*))
+              (%gsm-bare-ok-p place (normalize-name place)))
          (list (gethash (normalize-name place) *global-symbol-macros*)))
         (t nil)))))
 
@@ -13990,7 +14004,8 @@
                     env dest)))
   (when (and *global-symbol-macros*
              (not (env-lookup env var))
-             (nth-value 1 (gethash (normalize-name var) *global-symbol-macros*)))
+             (nth-value 1 (gethash (normalize-name var) *global-symbol-macros*))
+             (%gsm-bare-ok-p var (normalize-name var)))
     (return-from compile-setq
       (compile-form `(setf ,(gethash (normalize-name var) *global-symbol-macros*) ,val)
                     env dest)))

@@ -268,55 +268,36 @@
 
 (defun %mvm-rt-cell-fn (runtime-table target name)
   "The native function a runtime stub TARGET calls, through the stub's cache
-   cell: the (pair store-p . bare) list mvm-eval made under key (- TARGET) when
-   it built RUNTIME-TABLE.  PAIR caches the *SYMBOL-FUNCTION-TABLE* entry CONS,
-   which PUTHASH updates in place, so a redefinition is seen with no
+   cell: the (pair . store-p) cons mvm-eval made under key (- TARGET) when it
+   built RUNTIME-TABLE.  The cell caches the *SYMBOL-FUNCTION-TABLE* entry
+   CONS, which PUTHASH updates in place, so a redefinition is seen with no
    invalidation; only the first call per stub pays the string-keyed lookup
    (an EQUAL hash of the whole name, ~10% of a Quicklisp load when every
-   interpreted call paid it).  BARE is a (bare-pair . gen) cons for a name that
-   resolves through its BARE fallback (a MODUS-INT function, keyed bare, called
-   as MODUS-INT::F): the entry is cached while GEN is *JIT-BRIDGE-GEN*, which
-   every DEFUN / (SETF FDEFINITION) / FMAKUNBOUND bumps -- so defining the
-   qualified key is seen too.  Before it, every such call re-ran SUBSEQ +
-   FIND-SYMBOL + two EQUAL hashes (the Zero gateway's interpreted code).  A
-   two-slot (pair . store-p) cell from an older build has no BARE slot."
+   interpreted call paid it).  Only a direct key hit is cached; the bare-name
+   fallback, and tables built without cells, resolve every time."
   (let ((cell (gethash (- target) runtime-table)))
     (if (consp cell)
         (let ((pair (car cell)))
           (if (and (consp pair) (cdr pair))
               (cdr pair)
-              (let* ((bare (if (consp (cdr cell)) (cdr (cdr cell)) nil))
-                     (gen (if (boundp '*jit-bridge-gen*) *jit-bridge-gen* nil))
-                     (bp (and (consp bare) gen (eql (cdr bare) gen) (car bare))))
-                (if (and (consp bp) (cdr bp))
-                    (cdr bp)
-                    (let* ((sft (and (boundp '*symbol-function-table*)
-                                     *symbol-function-table*))
-                           (p (and sft (stringp name) (%gethash-pair name sft))))
-                      (if (and (consp p) (cdr p))
-                          (progn (rplaca cell p) (cdr p))
-                          (let* ((bn (and sft (stringp name) (%mvm-runtime-fallback-name name)))
-                                 (q (and bn (%gethash-pair bn sft))))
-                            (if (and (consp q) (cdr q))
-                                (progn
-                                  ;; pair before stamp; both are region-0 objects
-                                  (when (and (consp bare) gen)
-                                    (rplaca bare q)
-                                    (rplacd bare gen))
-                                  (cdr q))
-                                (%mvm-resolve-runtime-fn name)))))))))
+              (let ((p (and (boundp '*symbol-function-table*)
+                            *symbol-function-table*
+                            (stringp name)
+                            (%gethash-pair name *symbol-function-table*))))
+                (if (and (consp p) (cdr p))
+                    (progn (rplaca cell p) (cdr p))
+                    (%mvm-resolve-runtime-fn name)))))
         (%mvm-resolve-runtime-fn name))))
 
 (defun %mvm-rt-cell-store-p (runtime-table target name)
-  "%MVM-STORE-FN-NAME-P of the stub's NAME, memoized in its cache cell's
-   second slot (0 = not yet asked; the answer depends on NAME alone)."
+  "%MVM-STORE-FN-NAME-P of the stub's NAME, memoized in its cache cell's CDR
+   (0 = not yet asked; the answer depends on NAME alone)."
   (let ((cell (gethash (- target) runtime-table)))
     (if (consp cell)
-        (let* ((slot (if (consp (cdr cell)) (cdr cell) nil))
-               (v (if slot (car slot) (cdr cell))))
+        (let ((v (cdr cell)))
           (if (eql v 0)
               (let ((r (if (%mvm-store-fn-name-p name) t nil)))
-                (if slot (rplaca slot r) (rplacd cell r))
+                (rplacd cell r)
                 r)
               v))
         (%mvm-store-fn-name-p name))))

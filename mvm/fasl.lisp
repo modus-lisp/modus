@@ -476,7 +476,7 @@
             (%fasl-put-u64 bc np (nth (cadr operands) idx)))))
       (dolist (p rt)
         (setf (gethash (car p) rt-table) (cdr p))
-        (setf (gethash (- (car p)) rt-table) (list* nil 0 (cons nil nil))))
+        (setf (gethash (- (car p)) rt-table) (cons nil 0)))
       (dolist (p lam) (setf (gethash (car p) lam-offsets) (cdr p)))
       (list bc entry ft-list fn-table rt-table lam-offsets persist lam-bearing (nth 10 rec)))))
 

@@ -7,7 +7,7 @@ sock = os.environ.get("QTEST_SOCKDIR","/tmp/claude-1001")+"/qtest-%d.sock" % os.
 forms = sys.argv[2:]
 RAW = open(os.environ["QTEST_RAW"], "ab") if os.environ.get("QTEST_RAW") else None   # whole serial transcript
 q = subprocess.Popen(["qemu-system-aarch64", "-M", "raspi3b", "-kernel", img, "-serial", "null",
-                      "-serial", "unix:%s,server" % sock, "-display", "none", "-no-reboot"] + (["-device", "loader,file=%s,addr=%s" % (blob, os.environ.get("QTEST_BLOB_ADDR", "0x28000000"))] if blob else [])
+                      "-serial", "unix:%s,server" % sock, "-display", "none", "-no-reboot"] + (["-device", "loader,file=%s,addr=%s" % (blob, os.environ.get("QTEST_BLOB_ADDR", "0x20000000"))] if blob else [])
                      # QTEST_EXTRA="FILE@ADDR,FILE@ADDR": more blobs in guest RAM (a clip, a disk)
                      + sum([["-device", "loader,file=%s,addr=%s" % tuple(e.rsplit("@", 1))]
                             for e in os.environ.get("QTEST_EXTRA", "").split(",") if e], [])

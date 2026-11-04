@@ -14,9 +14,10 @@
 #            DEFUN interpreted (hot = a form evaluated twice, never a function called often)
 #
 #   TARS=dir   tarballs <name>.tar (default tmp/tars); each is placed at TAR_BASE + 16 MB * k
-#   TAR_BASE   default 0x28000000: above the heap, which on QEMU's 1 GiB raspi3b reaches
-#              0x20000000 (boot/boot-rpi-cl.lisp's memory map), below the 960 MiB it has
-#              (the board never sees these)
+#   TAR_BASE   default 0x20000000: above the heap, which on QEMU's 1 GiB raspi3b reaches
+#              at most 0x20000000 (boot/boot-rpi-cl.lisp's memory map), and below
+#              0x30000000, the canonical code VA the boot aliases onto the image -- a
+#              tarball there reads back as the image (16 slots; checked below)
 #   GDBPORT    default 1234
 # The mini-UART is QEMU raspi3b's SECOND -serial; the first is wired to null.
 set -u
@@ -29,7 +30,9 @@ for a in "$@"; do case $a in --load=*) loads+=("${a#*=}");; --blob=*) blobs+=("$
 W=$(mktemp -d /tmp/modus-rpi-core.XXXXXX); SOCK=$W/uart.sock
 LOADERS=(); TARSPEC=(); k=0
 for n in "${loads[@]}"; do f=$(readlink -f "$TARS/$n.tar"); [ -s "$f" ] || { echo "FAIL: no tarball $TARS/$n.tar"; exit 1; }
-  addr=$((${TAR_BASE:-0x28000000} + k*16777216)); LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n"); k=$((k+1)); done
+  addr=$((${TAR_BASE:-0x20000000} + k*16777216))
+  (( addr + $(stat -c %s "$f") <= 0x30000000 )) || { echo "FAIL: tarball $n at $(printf 0x%X $addr) reaches the 0x30000000 code window"; exit 1; }
+  LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n"); k=$((k+1)); done
 for b in "${blobs[@]}"; do f=$(readlink -f "${b%@*}"); [ -s "$f" ] || { echo "FAIL: no blob ${b%@*}"; exit 1; }
   LOADERS+=(-device "loader,file=$f,addr=${b##*@}"); done
 boot() { # extra qemu args...

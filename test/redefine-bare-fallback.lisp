@@ -22,6 +22,11 @@
 
 (defun modus-int::bbf-inner (x) (+ x 1))
 (defun bbf-outer (x) (modus-int::bbf-inner x))
+;; A NON-NATIVE callee (a closure: every runtime DEFCLASS accessor and generic
+;; function is one) is reached through a late-binding thunk on every call.
+(setf (fdefinition 'modus-int::bbf-clo) (let ((k 3)) (lambda (x) (+ x k))))
+(defun bbf-via-clo (x) (modus-int::bbf-clo x))
+(defun bbf-clo-loop (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s (bbf-via-clo 1))))))
 ;; A FORWARD reference: native before its callee exists, so the call goes
 ;; through a bridge thunk under the qualified name, and the bridge falls back.
 (defun bbf-fwd (x) (modus-int::bbf-later x))
@@ -44,6 +49,11 @@
 (defun modus-int::bbf-inner (x) (- x 5))
 (bbf-check "defined again" (bbf-outer 1) -4)
 
+(bbf-check "closure callee" (bbf-via-clo 1) 4)
+(bbf-check "closure callee again" (bbf-via-clo 1) 4)
+(setf (fdefinition 'modus-int::bbf-clo) (lambda (x) (* x 11)))
+(bbf-check "closure callee replaced" (bbf-via-clo 2) 22)
+
 ;; The forward-referenced callee, defined after its caller went native.
 (bbf-check "forward: undefined" (handler-case (bbf-fwd 1) (undefined-function () :undefined)) :undefined)
 (defun modus-int::bbf-later (x) (+ x 10))
@@ -62,5 +72,9 @@
 (let ((t0 (get-internal-real-time)))
   (bbf-loop 200000)
   (format t "~&  200000 forward-referenced calls: ~d ms~%"
+          (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+(let ((t0 (get-internal-real-time)))
+  (bbf-clo-loop 200000)
+  (format t "~&  200000 calls to a closure callee: ~d ms~%"
           (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
 (format t "~&BAREFB ~a~%" (if (zerop *bbf-fail*) "PASS" "FAIL"))

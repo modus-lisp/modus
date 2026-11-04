@@ -2589,14 +2589,15 @@
 ;;; Defaults are the Raspberry Pi values.  QEMU virt CANNOT use them: under
 ;;; boot-aarch64's fixpoint tables L2[128..511] map VA 0x10000000-0x3FFFFFFF as
 ;;; identity DEVICE memory (PCI MMIO), so JIT pages written at 0x14000000 would
-;;; land in unbacked MMIO and %jit-call would branch into zeros.  The virt build
+;;; land in unbacked MMIO and %jit-call would branch into zeros.  (The Pi's arena
+;;; moved to 0x09000000 when its heap went above the runtime block -- boot-rpi-cl.lisp.)  The virt build
 ;;; overrides these with a real DRAM window.
 (declaim (overridable %jit-exec-bump))
-(defun %jit-exec-bump () #x13FFFFF0)
+(defun %jit-exec-bump () #x08FFFFF0)
 (declaim (overridable %jit-exec-lo))
-(defun %jit-exec-lo   () #x14000000)
+(defun %jit-exec-lo   () #x09000000)
 (declaim (overridable %jit-exec-hi))
-(defun %jit-exec-hi   () #x18000000)
+(defun %jit-exec-hi   () #x0D000000)
 
 (defconstant +sysreg-cntpct-el0+ #xDF01 "CNTPCT_EL0: S3_3_C14_C0_1")
 ;; MRS sysreg field = op0[1:0]<<14 | op1<<11 | CRn<<7 | CRm<<3 | op2.
@@ -3809,11 +3810,12 @@
                           (logior #x14000000 (- (a64-current-index buf) b-at))))))
                ((= code #x0531)
                 ;; BARE-METAL %MMAP-EXEC-PAGE: no mmap — bump-allocate from the
-                ;; reserved JIT code region [0x14000000, 0x18000000).  The
+                ;; reserved JIT code region [%JIT-EXEC-LO, %JIT-EXEC-HI) -- on the Pi
+                ;; [0x09000000, 0x0D000000).  The
                 ;; bare-metal page tables map all RAM Normal-WB with no PXN/UXN
                 ;; (block attr 0x701), so the region is already executable; the
                 ;; #x0533 DC CVAU / IC IVAU flush provides SMC coherency.  The
-                ;; bump pointer lives at 0x13FFFFF0; real-hardware DRAM is NOT
+                ;; bump pointer lives at %JIT-EXEC-BUMP (Pi: 0x08FFFFF0); real-hardware DRAM is NOT
                 ;; zeroed, so a range check re-initialises it on first use
                 ;; (garbage/0 -> region base) instead of trusting a boot zero.
                 ;; V0(x0)=size(tagged); result = tagged 16-aligned address.

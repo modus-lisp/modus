@@ -128,10 +128,32 @@
 (defconstant +rpi-cl-vbar+          #x00080800)  ; GPU-loaded value
 (defconstant +rpi-cl-native-off+    #x00001000)  ; native code at image + 0x1000
 
+;;; THE PI MEMORY MAP.  Everything below is in physical RAM, identity-mapped:
+;;;   0x00080000  the image                      0x10000000  runtime window (compiled in)
+;;;   0x03200000  the BOARD REGION (32 MB)        0x10080000  per-CPU, thread pages, ...
+;;;   0x05200000  thread stacks
+;;;   0x06000000  code-remap L3 tables, FDT       0x108A0000  scheduler, SSH state, scratch
+;;;   0x08000000  main stack top; GC bitmaps      0x11000000  USB DMA window (Device)
+;;;   0x09000000  JIT arena (64 MB)              0x11400000  NIC/USB rings, the I/O core
+;;;   0x0D000000  thread heaps (3 x 16 MB)       0x12000000  THE HEAP, to the top of RAM
+;;; The heap is the one region that grows with the board; everything a board must have
+;;; sits below it.  build-cl-repl-common.lisp's %RPI-MEMORY-MAP-ASSERTS checks the rest
+;;; of the image's addresses against these.
+;; The board region: RAM nothing in modus uses, for what runs on the board to keep outside
+;; the heap (kiln's RAM cabinet).  The image must end below it.  %RPI-BOARD-RAM in the image.
+(defconstant +rpi-cl-board-lo+      #x03200000)
+(defconstant +rpi-cl-board-hi+      #x05200000)
 (defconstant +rpi-cl-stack-top+     #x08000000)  ; grows down
-(defconstant +rpi-cl-heap-base+     #x09000000)  ; x24 — Cheney from-space
-(defconstant +rpi-cl-heap-mid+      #x0C800000)  ; x25 — semispace midpoint
-(defconstant +rpi-cl-heap-end+      #x10000000)  ; 112 MB total
+(defconstant +rpi-cl-bitmap-obj+    #x08000000)  ; GC object-start bitmap
+(defconstant +rpi-cl-bitmap-cons+   #x08400000)  ; GC cons-kind bitmap
+(defconstant +rpi-cl-bitmap-base+   #x09000000)  ; their page_base: the lowest heap object
+(defconstant +rpi-cl-bitmap-end+    #x20000000)  ; ... and the highest a heap may reach
+(defconstant +rpi-cl-jit-lo+        #x09000000)  ; runtime JIT arena
+(defconstant +rpi-cl-jit-hi+        #x0D000000)
+(defconstant +rpi-cl-thread-arena+  #x0D000000)  ; net/bare-threads.lisp's core heaps
+(defconstant +rpi-cl-heap-base+     #x12000000)  ; x24 — Cheney from-space
+(defconstant +rpi-cl-heap-mid+      #x16E00000)  ; x25 — semispace midpoint
+(defconstant +rpi-cl-heap-end+      #x1BC00000)  ; 2 x 78 MB, below 448 MiB of ARM RAM
 (defconstant +rpi-cl-percpu+        #x10080000)  ; TPIDR_EL1
 ;; SMP PHASE 2 (opt-in, MODUS_RPI_THREADS=1): the hosted aarch64 per-thread WINDOW on bare
 ;; metal.  TPIDR_EL0 holds the window delta exactly as on Linux; core 0 runs at delta 0, so

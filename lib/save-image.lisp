@@ -227,12 +227,14 @@
           (return (car probe)))))))
 
 (defun %gc-force-to-space-0 ()
-  "Collect until the live data sits in the FIRST semispace (from_start equals
-   the bitmap page_base), the space a fresh boot stub sets the registers up
-   for -- so a restored process needs no relocation and no limit change.
-   Returns from_start."
+  "Collect until the live data sits in the FIRST semispace -- the LOWER of the
+   two, the space a fresh boot stub sets the registers up for -- so a restored
+   process needs no relocation and no limit change.  Returns from_start.
+   (It used to compare with the bitmap page_base, which is the lower semispace
+   only when the bitmaps start at the heap; the Pi's start below it, at its JIT
+   arena, and there the test never matched.)"
   (%gc-force)
-  (when (/= (%core-from-start) (%core-page-base))
+  (when (> (%core-from-start) (%core-to-start))
     (%gc-force))
   (%core-from-start))
 

@@ -463,8 +463,11 @@
 ;; I/O core, which must never allocate.  The two-argument TRUNCATE compiles inline.
 (defun dwc2-packets (len mps) (truncate (+ len mps -1) mps))
 
-(defun dwc2-halt-channel (ch)
-  ;; Halt an active channel. Sets CHDIS+CHENA, waits for CHHLTD.
+(defun dwc2-halt-channel-hcint (ch)
+  "Halt an active channel (CHDIS+CHENA, wait for CHHLTD) and return the HCINT it ended
+   with, before clearing it.  A transfer that finished before the halt took effect shows
+   XFERCOMPL there, and its data is in the buffer: a caller that re-arms without looking
+   loses it (and the toggle it advanced)."
   (let ((hcchar (dwc2-read (dwc2-hcchar ch))))
     (dwc2-write (dwc2-hcchar ch)
                 (logior hcchar (logior (hcchar-chena) (hcchar-chdis)))))
@@ -474,7 +477,14 @@
       (when (not (zerop (logand (dwc2-read (dwc2-hcint ch)) (hcint-chhltd))))
         (return nil))
       (setq j (+ j 1))))
-  (dwc2-write (dwc2-hcint ch) #xFFFFFFFF))
+  (let ((hcint (dwc2-read (dwc2-hcint ch))))
+    (dwc2-write (dwc2-hcint ch) #xFFFFFFFF)
+    hcint))
+
+(defun dwc2-halt-channel (ch)
+  ;; Halt an active channel. Sets CHDIS+CHENA, waits for CHHLTD.
+  (dwc2-halt-channel-hcint ch)
+  nil)
 
 (defun dwc2-setup-channel (ch hcchar-val)
   ;; Write HCCHAR for channel (without enabling yet)

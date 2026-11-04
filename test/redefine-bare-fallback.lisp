@@ -68,6 +68,23 @@
 (defun modus-int::bbf-later (x) (- x 1))
 (bbf-check "forward: defined again" (bbf-fwd 1) 0)
 
+;; An INTERPRETED caller (hot JIT off, defined after JIT-EAGER): the
+;; interpreter's per-stub cell (%MVM-RT-CELL-FN) has the same fallback.
+(setq *jit-hot-calls* 0)
+(defun modus-int::bbf-ii (x) (+ x 1))
+(defun bbf-interp (x) (modus-int::bbf-ii x))
+(defun bbf-interp-loop (n) (let ((s 0)) (dotimes (i n s) (setq s (+ s (bbf-interp 1))))))
+(bbf-check "interpreted: original" (bbf-interp 1) 2)
+(bbf-check "interpreted: again (cached)" (bbf-interp 1) 2)
+(defun modus-int::bbf-ii (x) (* x 9))
+(bbf-check "interpreted: after DEFUN" (bbf-interp 1) 9)
+(setf (fdefinition 'modus-int::bbf-ii) (lambda (x) (* x 100)))
+(bbf-check "interpreted: after (setf fdefinition)" (bbf-interp 1) 100)
+(fmakunbound 'modus-int::bbf-ii)
+(bbf-check "interpreted: after FMAKUNBOUND" (handler-case (bbf-interp 1) (undefined-function () :undefined)) :undefined)
+(defun modus-int::bbf-ii (x) (- x 5))
+(bbf-check "interpreted: defined again" (bbf-interp 1) -4)
+
 ;; Rough cost of one fallback-resolved call, for the record.
 (let ((t0 (get-internal-real-time)))
   (bbf-loop 200000)
@@ -76,5 +93,9 @@
 (let ((t0 (get-internal-real-time)))
   (bbf-clo-loop 200000)
   (format t "~&  200000 calls to a closure callee: ~d ms~%"
+          (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
+(let ((t0 (get-internal-real-time)))
+  (bbf-interp-loop 20000)
+  (format t "~&  20000 interpreted calls: ~d ms~%"
           (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second)))
 (format t "~&BAREFB ~a~%" (if (zerop *bbf-fail*) "PASS" "FAIL"))

@@ -8053,8 +8053,17 @@
    would be a copy and EQ to the constant's value would stop holding."
   (let ((v (symbol-value name)))
     (when (or (numberp v) (characterp v) (keywordp v) (eq v t) (null v))
-      (setf (gethash (normalize-name name) (%runtime-constants)) v))
+      (setf (gethash (%runtime-constant-key name) (%runtime-constants)) v))
     name))
+
+;;; KEYED BY THE SYMBOL, NOT ITS NAME.  NORMALIZE-NAME hashes only the name, so
+;;; two packages' constants of one name shared an entry: cl-consensus's
+;;; (defconstant +empty+ 0) made cl-payments' unrelated (defparameter +empty+ #())
+;;; compile as 0 -- an HKDF called on 0 and the whole BOLT #8 handshake with it.
+;;; This table holds only RUNTIME defconstants, so its keys can be the symbols
+;;; themselves; the build's *CONSTANTS* is left as it is.
+(defun %runtime-constant-key (name)
+  (if (symbolp name) name (normalize-name name)))
 
 ;;; THE RUNTIME TABLE IS ITS OWN.  *CONSTANTS* is the build's table, and in the image a SETF
 ;;; GETHASH on it does not stick (measured on the x64 CLI: store, read back NIL, count 0), so
@@ -8068,7 +8077,7 @@
 (defun %runtime-constant (name)
   "NAME's folded runtime-defconstant value, or :NOT-FOUND."
   (if (and (boundp '*runtime-constants*) (hash-table-p *runtime-constants*))
-      (gethash (normalize-name name) *runtime-constants* :not-found)
+      (gethash (%runtime-constant-key name) *runtime-constants* :not-found)
       :not-found))
 
 (defun compile-variable-ref (name env dest)
@@ -15592,6 +15601,24 @@
         (push (cadr p) result)))
     (nreverse result)))
 
+(defun %lambda-list-defaults-in-scope (lambda-list)
+  "Each default form in LAMBDA-LIST paired with the parameter names in scope
+   where it is evaluated: the parameters BEFORE it (CLHS 3.4.1), not itself.
+   ((DEFAULT . NAMES) ...).  A default that names its own parameter -- the
+   (&key (secret secret)) idiom, an outer SECRET by default -- refers to the
+   enclosing binding, and must count as a capture."
+  (let ((seen '()) (out '()))
+    (dolist (x (if (listp lambda-list) lambda-list '()))
+      (cond ((member x '(&optional &rest &key &aux &allow-other-keys &body &whole &environment)) nil)
+            ((symbolp x) (push x seen))
+            ((consp x)
+             (let ((var (if (consp (car x)) (cadr (car x)) (car x))))
+               (when (consp (cdr x)) (push (cons (cadr x) seen) out))
+               (when (symbolp var) (push var seen))
+               (when (and (consp (cdr x)) (consp (cddr x)) (symbolp (caddr x)))
+                 (push (caddr x) seen))))))
+    (nreverse out)))
+
 (defun %flet-functions-capture-vars-p (defs env)
   "Return T if any function body OR lambda-list default in DEFS references a
    variable bound in ENV's chain — the FLET/LABELS needs closure semantics so
@@ -15605,9 +15632,11 @@
    any lexical — while a bare (lambda (&optional (i v)) …) captured it
    correctly.  `(defun r (v) (labels ((f (&optional (i v)) i)) (f)))' returned
    NIL instead of V; it drives quicklisp http.lisp's NEXT-LINE-POS /
-   PROCESS-HEADER.  All param names are excluded from the default scan, so a
-   default that references an EARLIER parameter (CLHS 3.4.1) is not mistaken
-   for an outer capture.
+   PROCESS-HEADER.  Each default is scanned with the parameters BEFORE it
+   excluded (CLHS 3.4.1), so a default naming an earlier parameter is not
+   mistaken for a capture -- and one naming its OWN parameter, (&key (secret
+   secret)), is: that SECRET is the outer one.  Excluding every parameter name
+   made cl-payments' rail gate pass NIL as the payment secret.
 
    HISTORY (2026-06-10, probes 9864/9867): this used to fire ONLY for
    %CELL- prefixed vars (cell-rewrite artifacts), on the theory that
@@ -15628,9 +15657,9 @@
                (param-names (%extract-lambda-param-names fparams))
                (free (%collect-free-vars-list (cddr def) param-names env nil))
                (dflt-free (unless free
-                            (%collect-free-vars-list
-                             (%lambda-list-default-forms fparams)
-                             param-names env nil))))
+                            (some (lambda (entry)
+                                    (%collect-free-vars-list (list (car entry)) (cdr entry) env nil))
+                                  (%lambda-list-defaults-in-scope fparams)))))
           (when (or free dflt-free)
             (setq any-captures t)))))
     any-captures))

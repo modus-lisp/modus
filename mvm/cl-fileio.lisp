@@ -347,6 +347,15 @@
           (%string-to-cstr new-str new-addr)
           (syscall3 82 *cstr-scratch* new-addr 0)))))
 
+(declaim (overridable %sys-rmdir))
+(defun %sys-rmdir (path-str)
+  "Remove an empty directory: 0, or -errno.  x86-64 rmdir(2) is syscall 84; each
+   CLI build script overrides it with its own number, beside %SYS-MKDIR."
+  (if (%cab-on)
+      -38                                  ; ENOSYS: the cabinet has no directories to drop
+      (progn (%string-to-cstr path-str *cstr-scratch*)
+             (syscall3 84 *cstr-scratch* 0 0))))
+
 (declaim (overridable %sys-mkdir))
 (defun %sys-mkdir (path-str mode)
   "Create a directory."

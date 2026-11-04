@@ -80,6 +80,7 @@
            "SPLIT-STRING" "STRING-PREFIX-P" "STRING-SUFFIX-P" "EMPTYP"
            "FIRST-CHAR" "LAST-CHAR" "NATIVE-NAMESTRING" "PARSE-NATIVE-NAMESTRING"
            "MERGE-PATHNAMES*" "ENSURE-DIRECTORY-PATHNAME"
+           "PATHNAME-DIRECTORY-PATHNAME" "PATHNAME-PARENT-DIRECTORY-PATHNAME"
            "RUN-PROGRAM" "LAUNCH-PROGRAM" "WAIT-PROCESS" "TERMINATE-PROCESS"
            "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"
            "SUBPROCESS-ERROR" "SUBPROCESS-ERROR-CODE" "SUBPROCESS-ERROR-COMMAND"
@@ -258,6 +259,10 @@
 
 (defun uiop::first-char (s) (and (stringp s) (plusp (length s)) (char s 0)))
 (defun uiop::last-char (s) (and (stringp s) (plusp (length s)) (char s (- (length s) 1))))
+
+(defun uiop::pathname-directory-pathname (x)
+  "X with its name, type and version dropped: the directory it is in."
+  (and x (make-pathname :name nil :type nil :version nil :defaults (pathname x))))
 
 (defun uiop::pathname-parent-directory-pathname (x)
   "The directory containing directory X (X itself at the root)."
@@ -450,9 +455,33 @@
   (when (null (%pinfo-code p))
     (%proc-kill (uiop::process-info-pid p) (if urgent 9 15))))
 
-(defun uiop::delete-directory-tree (dir &rest keys)
-  (declare (ignore keys))
-  (error "UIOP:DELETE-DIRECTORY-TREE is not implemented on Modus (~A)" dir))
+(defun uiop::delete-directory-tree (dir &key (validate nil validate-p) (if-does-not-exist :error))
+  "UIOP:DELETE-DIRECTORY-TREE: delete DIR and everything under it.  As UIOP's,
+   VALIDATE must be supplied and true (T, or a predicate DIR must satisfy), DIR
+   must be an absolute directory pathname, and the root is refused outright.
+   Symbolic links are deleted, not followed (DIRECTORY here does not follow
+   them).  IF-DOES-NOT-EXIST: :ERROR or :IGNORE.  Returns DIR's pathname, as UIOP
+   does, or NIL when it was absent and ignored."
+  (let* ((d (uiop::ensure-directory-pathname dir))
+         (s (namestring d)))
+    (unless (and validate-p validate
+                 (or (eq validate t) (funcall validate d)))
+      (error "UIOP:DELETE-DIRECTORY-TREE: refusing ~A without :VALIDATE" s))
+    (unless (and (plusp (length s)) (char= (char s 0) #\/) (string/= s "/"))
+      (error "UIOP:DELETE-DIRECTORY-TREE: refusing ~A (not an absolute non-root directory)" s))
+    (if (not (probe-file d))
+        (if (eq if-does-not-exist :ignore)
+            nil
+            (error "UIOP:DELETE-DIRECTORY-TREE: ~A does not exist" s))
+        (labels ((walk (d)
+                   (dolist (sub (uiop::subdirectories d)) (walk (pathname sub)))
+                   (dolist (f (uiop::directory-files d)) (delete-file f))
+                   (let ((r (%sys-rmdir (string-right-trim "/" (namestring d)))))
+                     (when (< r 0)
+                       (error "UIOP:DELETE-DIRECTORY-TREE: rmdir ~A failed (errno ~D)"
+                              (namestring d) (- r))))))
+          (walk d)
+          d))))                           ; UIOP returns the directory
 
 (defun asdf::%string-of (x)
   "A string designator (string / symbol / character) as a STRING.  Written
@@ -792,12 +821,16 @@
    form), so nothing acts on this; it is reported, not honoured."
   (%it-plist-get (cddr (asdf::%system-form sys)) :defsystem-depends-on))
 
-(defun asdf::%source-registry-dirs (spec)
+(defun asdf::%source-registry-dirs (spec &optional from-env)
   "The directories a source-registry SPEC names, in order.  Understands
    (:tree DIR) -- DIR and every directory under it holding a .asd --,
    (:directory DIR), and :inherit-configuration, which reads the
    CL_SOURCE_REGISTRY environment variable when it holds a form.  Other
-   directives (:exclude, :also-exclude, :default-registry ...) are ignored."
+   directives (:exclude, :also-exclude, :default-registry ...) are ignored.
+   FROM-ENV is true while expanding CL_SOURCE_REGISTRY itself: there
+   :inherit-configuration means the defaults, not the variable again (a value
+   ending in :inherit-configuration -- the usual shape -- would otherwise
+   re-read itself forever)."
   (let ((out '()))
     (dolist (d (if (and (consp spec) (eq (car spec) :source-registry)) (cdr spec) spec))
       (cond
@@ -806,10 +839,10 @@
            (pushnew (make-pathname :name nil :type nil :defaults asd) out :test #'equal)))
         ((and (consp d) (eq (car d) :directory))
          (pushnew (uiop::ensure-directory-pathname (cadr d)) out :test #'equal))
-        ((eq d :inherit-configuration)
+        ((and (eq d :inherit-configuration) (not from-env))
          (let ((env (uiop::getenv "CL_SOURCE_REGISTRY")))
            (when (and (stringp env) (plusp (length env)) (char= (char env 0) #\())
-             (dolist (x (asdf::%source-registry-dirs (read-from-string env)))
+             (dolist (x (asdf::%source-registry-dirs (read-from-string env) t))
                (pushnew x out :test #'equal)))))))
     (nreverse out)))
 

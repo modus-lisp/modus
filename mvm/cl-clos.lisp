@@ -2326,6 +2326,17 @@
           (t (let ((idx (%clos-slot-index cls slot-name)))
                (if (< idx 0) :missing idx))))))
 
+(defun %struct-slot-missing (obj slot-name op)
+  "A DEFSTRUCT instance has no slot SLOT-NAME: signal, as SLOT-MISSING's default does."
+  (error "~S: the slot ~S is missing from ~S, a structure of type ~S."
+         op slot-name obj (%struct-type-name obj)))
+
+(defun %struct-slot-location (obj slot-name op)
+  "Where slot SLOT-NAME of DEFSTRUCT instance OBJ is stored: its array index (the slots follow
+   the marker and the type name), or a SLOT-MISSING error."
+  (let ((idx (%struct-slot-index (%struct-type-name obj) slot-name)))
+    (if (< idx 0) (%struct-slot-missing obj slot-name op) (+ 2 idx))))
+
 (defun %slot-value (obj slot-name)
   "Read slot SLOT-NAME from CLOS instance OBJ.
    Calls slot-unbound if the slot has no value, slot-missing when
@@ -2334,6 +2345,11 @@
    :allocation :class slots route to per-class shared storage via
    %slot-class-owner / %class-slot-get."
   (when (or (null obj) (not (%clos-instance-p obj)))
+    ;; A DEFSTRUCT instance: its own registry knows the slots (SLOT-VALUE on a structure is
+    ;; SBCL's and every implementation's; it answered NIL for every slot, and a program that
+    ;; did arithmetic on that crashed the bare-metal board)
+    (when (%struct-instance-p obj)
+      (return-from %slot-value (aref obj (%struct-slot-location obj slot-name 'slot-value))))
     (return-from %slot-value nil))
   ;; FAST PATH: the instance slot index through *CLOS-REG-MEMO* (one lookup
   ;; for what took a class lookup, a CPL walk for class allocation and a
@@ -2380,6 +2396,9 @@
 
    :allocation :class slots route to per-class shared storage."
   (when (or (null obj) (not (%clos-instance-p obj)))
+    (when (%struct-instance-p obj)
+      (let ((dummy (aset obj (%struct-slot-location obj slot-name 'setf) new-val))) dummy)
+      (return-from set-slot-value new-val))
     (when (%builtin-class-proxy-p (class-of obj))
       (%slot-of-builtin-error '(setf slot-value) obj slot-name))
     (return-from set-slot-value new-val))
@@ -2406,6 +2425,10 @@
 (defun %slot-boundp (obj slot-name)
   "True if slot SLOT-NAME of OBJ is bound.  Calls slot-missing for
    nonexistent slots; whatever it returns is taken as the boundp answer."
+  ;; a structure's slots are always bound (they are initialised, to NIL at worst)
+  (when (%struct-instance-p obj)
+    (%struct-slot-location obj slot-name 'slot-boundp)
+    (return-from %slot-boundp t))
   (let* ((class-name (%inst-key obj))
          (cls (%find-clos-class class-name)))
     (when (null cls) (return-from %slot-boundp nil))
@@ -2489,6 +2512,9 @@
    be called on any object, not just standard objects — in particular it
    must work on condition objects (slot-exists-p.15/.16)."
   (when (null obj) (return-from %slot-exists-p nil))
+  (when (%struct-instance-p obj)
+    (return-from %slot-exists-p
+      (>= (%struct-slot-index (%struct-type-name obj) slot-name) 0)))
   ;; Condition objects: query the condition-type slot registry.  Conditions
   ;; are #x32 arrays too, so check this before the CLOS-instance path.  Use a
   ;; NAME/HASH-robust registry resolve (%cond-type-name-of) rather than

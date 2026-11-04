@@ -2882,6 +2882,11 @@
   ;; #306: boot is over — enable the JIT's late-bound call bridge for what the
   ;; REPL evaluates (OFF through boot; see *jit-bridge-on* in mvm-eval.lisp).
   (setq *jit-bridge-on* t)
+  ;; And NIL is no longer a number, as on the hosted CLIs (lib/cli-toplevel.lisp): arithmetic
+  ;; on NIL or a character signals TYPE-ERROR from here on.  Unset, (+ NIL 100) was NIL's word
+  ;; plus 100 -- a fake object pointer -- and the first thing to look at it took a CPU fault,
+  ;; which stops every core of a bare-metal board.  A core saved from this REPL keeps it set.
+  (setq *%arith-strict* t)
   ;; --- the REPL (lib/serial-repl.lisp) ------------------------------------
   ;; A condition that unwinds PAST the REPL's own handlers ends the machine;
   ;; say which one, or the serial log just stops (that silence cost an

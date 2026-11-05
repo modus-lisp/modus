@@ -180,18 +180,14 @@
                      (symbol-value 'cl-user::*cl-repl-i386-p*))))
       (mvm-text "mvm/native-bulk.lisp")
       ""))
-;; MODUS_NO_SOURCE_BLOB=1: leave out the image's copy of its own source (the
-;; "MVMS" blob, ~6.7 MB of a 35 MB image).  OFF by default and deliberately:
-;; an image that carries its own source is part of what makes it legible (see
-;; README "carries its own source").  Nothing in the image READS it at run time
-;; -- self-hosting reads the source files -- and on a hosted system it costs
-;; DISK, not RAM: it sits in the file-backed segment and is never paged in.  It
-;; costs RAM wherever the whole image is loaded, i.e. bare metal, which is what
-;; this switch is for.  The Pi's MODUS_RPI_NO_BLOB is the same switch.
-(when (let ((v (sb-ext:posix-getenv "MODUS_NO_SOURCE_BLOB")))
+;; MODUS_SOURCE_BLOB=1: keep the image's copy of its own source (the MVMS blob).  Off by
+;; default (mvm/cross.lisp *EMBED-SOURCE-BLOB*): nothing reads it -- the self-hosting
+;; compiler reads its source from files -- and it is the biggest thing in an image after
+;; its code.  MODUS_NO_SOURCE_BLOB is accepted and does what the default does.
+(when (let ((v (sb-ext:posix-getenv "MODUS_SOURCE_BLOB")))
         (and v (plusp (length v)) (not (string= v "0"))))
-  (setf modus.mvm::*embed-source-blob* nil)
-  (format t "~&;; MODUS_NO_SOURCE_BLOB: embedded source blob dropped~%"))
+  (setf modus.mvm::*embed-source-blob* t)
+  (format t "~&;; MODUS_SOURCE_BLOB: embedded source blob kept~%"))
 ;; MCGC stage-4d pin API + pin-stress probe.  Included ONLY when
 ;; MODUS_MCGC_PINNING=1; flag-off omits it (byte-identical to canonical).
 (defvar *mcgc-pin-source*

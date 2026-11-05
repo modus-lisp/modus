@@ -450,9 +450,12 @@
               (mvm-emit-u32 buf (mvm-function-info-native-offset fn-info))))))
     (mvm-buffer-used-bytes buf)))
 
-(defvar *embed-source-blob* t
-  "When NIL, emit the MVMS header with a ZERO-length body instead of the whole
-   source text.  Default T — every existing build is byte-identical.
+(defvar *embed-source-blob* nil
+  "When NIL (the default since 2026-11-05), emit the MVMS header with a ZERO-length body
+   instead of the whole source text.  A build that wants the blob sets it T: the
+   build scripts do for MODUS_SOURCE_BLOB=1 (build-cli-common, build-cl-repl-common).
+   It is a quarter of a board kernel -- 8.86 MB of a 38.4 MB Pi Zero image, loaded into
+   RAM whole -- and nothing reads it.
 
    WHY THIS EXISTS.  Measured on the bare-metal RPi CL image: the blob is
    3,742,336 bytes of verbatim ASCII, 22% of a 17 MB image, and NOTHING READS

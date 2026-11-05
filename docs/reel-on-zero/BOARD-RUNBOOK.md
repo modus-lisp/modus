@@ -109,7 +109,7 @@ is at 600 MHz; if it prints `600000000->600000000` the mailbox request was
 refused — do not measure on that boot.
 - `MODUS_RPI_CHAINLOAD=1` is the load-address-agnostic chainloader layout the
   netboot `go 0x300000` expects.
-- Optional trims: `MODUS_RPI_NO_BLOB=1`, `MODUS_RPI_NO_BRIDGE=1` (smaller image).
+- Optional trim: `MODUS_RPI_NO_BRIDGE=1` (smaller image).  The source blob is out by default (`MODUS_SOURCE_BLOB=1` keeps it).
 - The raw `kernel8.img` is mostly zero-filled BSS; the gzip is what travels.
   ~5 MB gz is normal and boots fine.
 

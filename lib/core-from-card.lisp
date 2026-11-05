@@ -267,7 +267,7 @@
   (let ((n (length args)) (i 0) (at nil))
     (loop
       (when (or at (> (+ i 5) n)) (return at))
-      (when (and (or (= i 0) (= (%prim-aref args (- i 1)) 32))
+      (when (and (or (= i 0) (<= (%prim-aref args (- i 1)) 32))
                  (= (%prim-aref args i) 67) (= (%prim-aref args (+ i 1)) 79)        ; C O
                  (= (%prim-aref args (+ i 2)) 82) (= (%prim-aref args (+ i 3)) 69)  ; R E
                  (= (%prim-aref args (+ i 4)) 61))                                  ; =
@@ -282,7 +282,7 @@
          (at (and args (%cfc-core-arg args))))
     (when at
       (let* ((n (length args))
-             (end (let ((j at)) (loop (when (or (>= j n) (= (%prim-aref args j) 32)) (return j))
+             (end (let ((j at)) (loop (when (or (>= j n) (<= (%prim-aref args j) 32)) (return j))   ; space, NUL, newline
                                       (setq j (+ j 1)))))
              (part (if (< at n) (- (%prim-aref args at) 48) -1)))
         (cond

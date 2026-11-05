@@ -874,6 +874,8 @@
 (defun %irun-ns () (%irt-ns))
 "
         (if *cl-repl-rpi-p* *cl-repl-rpi-core-source* "")
+        ;; a core from a file on the card when the firmware placed none; REBOOT (:TRYBOOT)
+        (if *cl-repl-rpi-p* (mvm-text "lib/core-from-card.lisp") "")
         ;; PACKED (UNSIGNED-BYTE 32) VECTORS ON (prelude.lisp %U32-VECTORS-P), on the Pi only:
         ;; not in the shared core source above, which the bare x64 images include too and
         ;; whose compilers do not set *U32-VECTORS-P*

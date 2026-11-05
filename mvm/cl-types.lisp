@@ -4553,6 +4553,27 @@
         (list* (car type) (%element-type-expand (cadr type)) (cddr type))
         type)))
 
+(defun %u8-type-length (type)
+  "The length the octet vector TYPE demands, or NIL when it leaves it open."
+  (let ((dims (if (consp (cddr type)) (caddr type) '*)))
+    (cond ((integerp dims) (if (string= (symbol-name (car type)) "VECTOR") dims nil))
+          ((and (consp dims) (null (cdr dims)) (integerp (car dims))) (car dims))
+          (t nil))))
+
+(defun %u8-vector-of-type-p (object type)
+  "True when OBJECT is a simple packed (unsigned-byte 8) vector of the octet array TYPE, a
+   (VECTOR|ARRAY|SIMPLE-ARRAY (UNSIGNED-BYTE 8) ...) that %SEQ-TYPE-U8-P accepted: rank 1, and
+   the length right when TYPE gives one."
+  (and (%prim-u8-vector-p object)
+       (let ((dims (if (consp (cddr type)) (caddr type) '*)))
+         (if (string= (symbol-name (car type)) "VECTOR")
+             (or (eq dims '*) (eql dims (length object)))
+             (cond ((eq dims '*) t)
+                   ((eql dims 1) t)
+                   ((and (consp dims) (null (cdr dims)))
+                    (or (eq (car dims) '*) (eql (car dims) (length object))))
+                   (t nil))))))
+
 (defun coerce (object result-type)
   "Coerce OBJECT to RESULT-TYPE.  Accepts compound type forms like
    (vector *), (vector * 2), (simple-string 5) — uses the head symbol
@@ -4573,7 +4594,17 @@
       (if (typep object result-type)
           object
           (error 'type-error :datum object :expected-type result-type))))
-  (when (%seq-type-u8-p result-type) (return-from coerce (%seq-u8-copy object)))
+  ;; An octet vector already of the octet type: itself, not a copy.  The exact TYPE-OF match
+  ;; above misses it whenever the type leaves the length open -- (SIMPLE-ARRAY (UNSIGNED-BYTE 8)
+  ;; (*)) is not EQUAL to (SIMPLE-ARRAY (UNSIGNED-BYTE 8) (2389853)) -- and cram's inflate
+  ;; coerces its input that way on every call: cairn inflating each object of a 2.4 MB git
+  ;; pack copied the whole pack per object, 1210 times (a Pi Zero desk: 643 s -> 85 s).
+  (when (%seq-type-u8-p result-type)
+    (let ((n (%u8-type-length result-type)))
+      (when (and n (/= n (length object)))
+        (error 'type-error :datum object :expected-type result-type)))
+    (return-from coerce
+      (if (%u8-vector-of-type-p object result-type) object (%seq-u8-copy object))))
   ;; (COMPLEX <float type>): a real becomes a complex of that format with a
   ;; zero imaginary part, a complex has its parts converted (SBCL; the
   ;; upstream ACOSH.3/ASINH.3/ATANH.3 build their zeros this way).
@@ -4752,8 +4783,9 @@
             (let ((raw (%wrapper-aref object i)))
               (aset v i (if (and string-p (integerp raw)) (code-char raw) raw)))
             (setq i (+ i 1)))))
-       ;; a bit-vector is not a SIMPLE-VECTOR (element type BIT, not T)
-       ((and (eq result-type 'simple-vector) (bit-vector-p object))
+       ;; a SIMPLE-VECTOR has element type T: a bit vector, an octet vector, a string or any
+       ;; other specialized or non-simple array is not one, and is copied (SBCL agrees)
+       ((and (eq result-type 'simple-vector) (arrayp object) (not (%prim-simple-vector-p object)))
         (let* ((len (length object)) (v (make-array len)) (i 0))
           (loop (when (>= i len) (return v))
             (aset v i (aref object i))

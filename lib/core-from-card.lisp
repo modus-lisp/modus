@@ -344,12 +344,24 @@
                                  t)
                                 (t nil))))))))))))))))
 
-;;; The firmware's core at 0x18000000 wins; without one, the card's.
+;;; A core at 0x18000000 that THIS kernel wrote wins; without one, the card's.  "This kernel"
+;;; matters on a tryboot: config.txt's common lines still have the firmware place slot A's
+;;; core there (its filters only add settings), and A's core would be refused by the restore
+;;; (a core holds addresses into the binary that saved it) -- so a foreign build id counts as
+;;; no core, and CORE= is read instead.  The id is header word 16, written through the same
+;;; halving :u64 pair the magic is.
+(defun %cfc-own-core-p ()
+  (and (eq (mem-ref (%core-addr) :u64) (%core-magic))
+       (eq (mem-ref (+ (%core-addr) 128) :u64) (%core-build-id))))
+
 (defun %core-requested-p ()
-  (or (eq (mem-ref (%core-addr) :u64) (%core-magic))
-      (and (%cfc-load-core)
-           (or (eq (mem-ref (%core-addr) :u64) (%core-magic))
-               (%cfc-say "core: the file is not a modus core" nil)))))
+  (or (%cfc-own-core-p)
+      (progn
+        (when (eq (mem-ref (%core-addr) :u64) (%core-magic))
+          (%cfc-say "core: the core in RAM is another kernel's" nil))
+        (and (%cfc-load-core)
+             (or (%cfc-own-core-p)
+                 (%cfc-say "core: the file is not a core this kernel wrote" nil))))))
 
 ;;; ---- rebooting, and rebooting once into B --------------------------------------------------
 (defun reboot (&key tryboot)

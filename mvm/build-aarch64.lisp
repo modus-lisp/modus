@@ -35,7 +35,7 @@
 ;;;; Output path override: MODUS_CL_REPL_OUT.
 ;;;;
 ;;;; Knobs (all read by the common file): MODUS_NET_BUILD, MODUS_NET_URL,
-;;;; MODUS_NET_BUFSZ, MODUS_LIB_EXPR, MODUS_NET_NOAUTO, MODUS_RPI_NO_BLOB,
+;;;; MODUS_NET_BUFSZ, MODUS_LIB_EXPR, MODUS_NET_NOAUTO, MODUS_SOURCE_BLOB,
 ;;;; MODUS_RPI_NO_TEST_AUX, MODUS_SYMMAP.
 ;;;; SSH: MODUS_NET_BUILD=1 MODUS_SSH_BUILD=1 MODUS_NET_NOAUTO=1, then at the
 ;;;;   REPL (run-net-pipeline) and (ssh-boot) -- the synchronous server, as on

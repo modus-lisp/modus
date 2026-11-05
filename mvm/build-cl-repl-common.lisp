@@ -370,22 +370,19 @@
 ;;; mini-UART takes ~5.6 hours, so the bring-up image can drop payload the bare
 ;;; Pi does not need YET.  Both default OFF.
 ;;;
-;;;   MODUS_RPI_NO_BLOB=1    drop the embedded self-source blob (~3.7MB).
-;;;                          `read-embedded-source' is the only consumer and it
-;;;                          is commented out at its single call site; the "MVMS"
-;;;                          header is still emitted so the image footer's offset
-;;;                          arithmetic stays valid.
+;;;   (the embedded self-source blob is out by default now -- mvm/cross.lisp
+;;;   *EMBED-SOURCE-BLOB*; MODUS_SOURCE_BLOB=1 keeps it, MODUS_RPI_NO_BLOB is accepted)
 ;;;   MODUS_RPI_NO_TEST_AUX=1  drop mvm/ansi-test-aux.lisp (the ANSI-test
 ;;;                          helpers).  Not measured: the boot calls
 ;;;                          %INIT-STANDARD-CHARS, which lives there.
 (defun %rpi-cull-p (var)
   (let ((v (sb-ext:posix-getenv var)))
     (and v (plusp (length v)) (not (string= v "0")))))
-(defvar *rpi-no-blob* (%rpi-cull-p "MODUS_RPI_NO_BLOB"))
+(defvar *rpi-source-blob* (%rpi-cull-p "MODUS_SOURCE_BLOB"))
 (defvar *cli-omit-ansi-test-aux* (%rpi-cull-p "MODUS_RPI_NO_TEST_AUX"))
-(when *rpi-no-blob*
-  (setf modus.mvm::*embed-source-blob* nil)
-  (format t "~&;; CULL: embedded source blob DROPPED~%"))
+(when *rpi-source-blob*
+  (setf modus.mvm::*embed-source-blob* t)
+  (format t "~&;; MODUS_SOURCE_BLOB: embedded source blob kept~%"))
 (when *cli-omit-ansi-test-aux*
   (format t "~&;; CULL: mvm/ansi-test-aux.lisp DROPPED~%"))
 

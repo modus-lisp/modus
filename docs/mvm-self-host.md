@@ -19,7 +19,7 @@ SBCL is only needed once. After Gen0 boots, the kernel can recompile itself inde
 1. **Boot preamble**: Multiboot header, 32→64 bit transition, GDT, IDT, paging, serial init, AP trampoline
 2. **MVM compilation**: All `*runtime-functions*` forms → MVM bytecode → x86-64 native code
 3. **register-builtins**: Generates NFN table entries for ~440 callable functions (uses old cross-compiler for this one function)
-4. **Source blob**: Plain s-expression source (~558KB) embedded in the image
+4. **Source blob**: Plain s-expression source (~558KB) embedded in the image.  *(2026-11-05: out by default -- `MODUS_SOURCE_BLOB=1` keeps it.  Self-hosting now reads source files, and nothing reads the blob.)*
 5. **Metadata**: Preamble size, total size, source offset patched into fixed addresses
 
 The kernel is a flat Multiboot ELF loaded at 0x100000.

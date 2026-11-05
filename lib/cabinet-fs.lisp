@@ -143,6 +143,25 @@
     (when (>= pos (cdr cell)) (setf (cdr cell) (+ pos 1)))
     1))
 
+;;; The same, for SEQ[START,END) at POS in one call: WRITE-SEQUENCE and WRITE-STRING on a
+;;; cabinet stream (cl-fileio %CAB-WRITE-BYTES).  Byte by byte, each byte was a dispatch, three
+;;; fd-table walks and an EQUAL walk of this cache: 58 us a byte on a QEMU board, so a gateway
+;;; writing its 214 KB CA bundle and 508 KB client payload at boot spent 41 s doing it.
+(defun %cabfs-write-bytes (path pos seq start end)
+  (%cabfs-rcache-drop path)
+  (let* ((cell (%cabfs-wc-cell path))
+         (v (car cell))
+         (top (+ pos (- end start))))
+    (when (> top (length v))
+      (let ((nv (make-array (max 256 (* 2 top)) :element-type '(unsigned-byte 8)
+                                                :initial-element 0)))
+        (replace nv v)
+        (setf (car cell) nv)
+        (setq v nv)))
+    (replace v seq :start1 pos :start2 start :end2 end)
+    (when (> top (cdr cell)) (setf (cdr cell) top))
+    (- end start)))
+
 (defun %cabfs-dispatch (op &rest args)
   "The whole protocol cl-fileio's %CAB speaks."
   (let ((a (car args)) (b (cadr args)) (c (caddr args)))
@@ -165,6 +184,7 @@
                                     (finish-output))))
                               0))
       ((eq op :write-byte) (%cabfs-write-byte a b c))
+      ((eq op :write-bytes) (%cabfs-write-bytes a b c (cadddr args) (car (cddddr args))))
       ((eq op :mkdir)  (handler-case (progn (funcall *cf-mkdir* *cabfs* a) 0)
                          (error () 0)))
       ((eq op :unlink) (progn (%cabfs-flush-all) (%cabfs-rcache-drop nil)

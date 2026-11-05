@@ -27,6 +27,14 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 WORKDIR=${1:-/var/tmp/modus-allarch}
 shift || true
 ARCHES=${*:-"aarch64 i386 arm32 riscv32 riscv64"}
+# Where qemu-user lives.  A machine without the distro package keeps the static binaries
+# elsewhere (here: ~/qemu-static/root/usr/bin); a wrong path is no error until every shard
+# exits 127 with "passed=0 failed=0", so it is checked before anything is built.
+QEMU_USER_DIR=${QEMU_USER_DIR:-/usr/bin}
+for a in $ARCHES; do
+  q=$QEMU_USER_DIR/qemu-$(case $a in arm32) echo arm ;; *) echo "$a" ;; esac)-static
+  [ -x "$q" ] || { echo "allarch-ansi: no $q (set QEMU_USER_DIR)" >&2; exit 2; }
+done
 mkdir -p "$WORKDIR" || exit 2
 WORKDIR=$(cd "$WORKDIR" && pwd)
 
@@ -37,7 +45,7 @@ port() { # arch: build, wrap, sweep
   ( cd "$REPO" && MODUS_CLI_OUT=$bin sbcl --dynamic-space-size 12288 \
       --script "mvm/build-$a-cli.lisp" > "$WORKDIR/build-$a.log" 2>&1 ) \
     || { echo "BUILD-FAILED" > "$WORKDIR/sweep-$a.result"; return; }
-  printf '#!/bin/sh\nexec /usr/bin/qemu-%s-static %s "$@"\n' "$(qemu_for "$a")" "$bin" > "$wrap"
+  printf '#!/bin/sh\nexec %s/qemu-%s-static %s "$@"\n' "$QEMU_USER_DIR" "$(qemu_for "$a")" "$bin" > "$wrap"
   chmod +x "$bin" "$wrap"
   local n=28 env=
   case $a in

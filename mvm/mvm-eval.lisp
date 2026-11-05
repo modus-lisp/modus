@@ -1102,8 +1102,12 @@
                       (%jit-bridge-self-patch idx f))
                     ;; Not native code (a closure): the site stays a bridge.
                     ;; Retire it, keeping the site, so %JIT-BRIDGE-N's inline
-                    ;; path serves it until the callee turns native.
-                    (unless (eq (car site) :retired)
+                    ;; path serves it until the callee turns native.  Main
+                    ;; only: the marker is a fresh cons stored into a global
+                    ;; vector, and a worker's cons there is the store the
+                    ;; shared-store guard refuses (glass's sender died on it).
+                    ;; A worker leaves the site pending and resolves here.
+                    (unless (or (eq (car site) :retired) (not (%mvm-on-main-thread-p)))
                       (setf (svref sites idx) (cons :retired site)))))))
           f)
         (let* ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))

@@ -764,9 +764,18 @@
   (let ((i (%ion-i h)))
     (if (null i)
         :eof
-        (let* ((tl (ion-cget i #x38)) (have (%ion-u32- (ion-cget i #x34) tl)))
+        ;; THE FLAG BEFORE THE COUNT.  Core 1 stores a segment's bytes, then the count (+0x34),
+        ;; then, for a FIN, the flag (+0x40).  Read the other way round, a peer's last segment
+        ;; -- data and FIN together, which is how GitHub ends a response -- could land between
+        ;; the two reads: an old count (nothing new) and a new flag (finished), so :EOF with the
+        ;; last bytes still in the ring.  A chunked body lost its terminating chunk that way
+        ;; ("chunked body cut off" on a Pi Zero, every byte acknowledged on the wire).  A flag
+        ;; read first covers every byte counted before it, so a zero count after it is the end.
+        (let* ((done (logtest (progn (memory-barrier) (ion-cget i #x40)) 3))
+               (tl (progn (memory-barrier) (ion-cget i #x38)))
+               (have (%ion-u32- (ion-cget i #x34) tl)))
           (if (zerop have)
-              (if (logtest (ion-cget i #x40) 3) :eof (if into 0 (make-array 0 :element-type '(unsigned-byte 8))))
+              (if done :eof (if into 0 (make-array 0 :element-type '(unsigned-byte 8))))
               (let* ((n (min max have)) (out (or into (make-array n :element-type '(unsigned-byte 8))))
                      (ring (ion-rx-ring i)))
                 (memory-barrier)

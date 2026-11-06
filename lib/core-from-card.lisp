@@ -9,12 +9,12 @@
 ;;;; if the firmware had put it there.  The boot partition then holds kernels (6 MB
 ;;;; gzipped) and the cores live on the store.
 ;;;;
-;;;; A/B.  config.txt keeps its own lines and gains a section the firmware reads only on a
-;;;; tryboot:
-;;;;     [tryboot]
+;;;; A/B.  On a tryboot the firmware reads tryboot.txt INSTEAD of config.txt (a [tryboot]
+;;;; section inside config.txt is never read then, and with no tryboot.txt it boots its own
+;;;; defaults: no core, no serial -- both measured on a Zero).  So tryboot.txt is a whole
+;;;; config: config.txt's lines, then
 ;;;;     kernel=kernel8-b.img
 ;;;;     cmdline=cmdline-b.txt        <- its CORE= names B's core
-;;;;     [all]
 ;;;; (REBOOT :TRYBOOT T) asks the firmware for that once (SET_REBOOT_FLAGS, as Linux's
 ;;;; `reboot "0 tryboot"') and resets through the watchdog.  The next reset or power cycle
 ;;;; is A again, so a B that does not come up costs a power cycle, not a card.
@@ -388,8 +388,8 @@
                                 (t nil))))))))))))))))
 
 ;;; A core at 0x18000000 that THIS kernel wrote wins; without one, the card's.  "This kernel"
-;;; matters on a tryboot: config.txt's common lines still have the firmware place slot A's
-;;; core there (its filters only add settings), and A's core would be refused by the restore
+;;; matters on a tryboot: tryboot.txt keeps config.txt's initramfs line, so the firmware
+;;; still places slot A's core there, and A's core would be refused by the restore
 ;;; (a core holds addresses into the binary that saved it) -- so a foreign build id counts as
 ;;; no core, and CORE= is read instead.  The id is header word 16, written through the same
 ;;; halving :u64 pair the magic is.
@@ -409,7 +409,7 @@
 ;;; ---- rebooting, and rebooting once into B --------------------------------------------------
 (defun reboot (&key tryboot)
   "Reset the board through the watchdog.  With TRYBOOT, ask the firmware first to read the
-   [tryboot] section of config.txt for this one boot (SET_REBOOT_FLAGS = 1, as Linux's
+   tryboot.txt instead of config.txt for this one boot (SET_REBOOT_FLAGS = 1, as Linux's
    `reboot \"0 tryboot\"'); the boot after that is the normal one again."
   (when tryboot
     (let ((r (%cfc-mbox #x00038064 1 0)))

@@ -203,7 +203,16 @@
    live.  %GC-STACK-BASE answers for the active region, which in an actor is
    the actor's own stack, so argv/envp walks from there read garbage."
   (mem-ref (+ (%gc-region-0) #x18) :u64))
-(defun %gc-count ()        (mem-ref (+ (%gc-region) #x20) :u64))
+(defun %gc-count-raw ()    (mem-ref (+ (%gc-region) #x20) :u64))
+(defun %gc-count ()
+  "Collections of the active region since boot, as a real integer on every target.
+   The field is stored SHL'd by one on some targets and raw on others (x64's
+   collector bumps it with a native INC), and the bare :u64 load %GC-COUNT-RAW
+   does is only right on the first kind: on x64 an odd count came back as a
+   pointer, and printing (%GC-STATS) after one collection was a MEMORY-FAULT.
+   Reads through %GC-META-READ instead, in the scale %GC-META-SCALE measures.
+   Mutator only; the collector's own increment uses %GC-COUNT-RAW."
+  (%gc-meta-read (+ (%gc-region) #x20) (%gc-meta-scale)))
 (defun %gc-epoch ()
   "A value that CHANGES at every collection of the active region and is ALWAYS
    a genuine fixnum -- for callers that only need 'has a GC happened since?'.
@@ -1341,7 +1350,7 @@
       (%gc-set-r12 free-ptr)
       (%gc-set-r14 (%gc-guarded-limit to-start space-size))
       ;; Step 6: Increment GC count
-      (%gc-set-count (+ (%gc-count) 1))
+      (%gc-set-count (+ (%gc-count-raw) 1))
       (write-char-serial 53)  ; '5' — done
       )))
 

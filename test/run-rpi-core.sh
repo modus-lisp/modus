@@ -8,16 +8,19 @@
 #                        [--form=FORM ...] [--probe=FORM --expect=TEXT]
 #
 #   --blob   another file QEMU places in guest RAM (fonts, data) for a --form to read
-#            with (ramv ADDR LEN); keep it clear of the tarballs at TAR_BASE + 16 MB*k
+#            with (ramv ADDR LEN); keep it clear of the tarballs (TAR_BASE onward, packed)
 #   --form   evaluated after the installs, before the probe and the save, in order;
 #            (jit-eager) here makes the core NATIVE -- saved hot-only, it restores every
 #            DEFUN interpreted (hot = a form evaluated twice, never a function called often)
 #
-#   TARS=dir   tarballs <name>.tar (default tmp/tars); each is placed at TAR_BASE + 16 MB * k
+#   TARS=dir   tarballs <name>.tar (default tmp/tars), placed end to end from TAR_BASE, each
+#              at a 1 MB boundary: tarball k at TAR_BASE + the sizes of 0..k-1, each rounded
+#              up to 1 MB (kiln zero places its fonts past them the same way)
 #   TAR_BASE   default 0x20000000: above the heap, which on QEMU's 1 GiB raspi3b reaches
 #              at most 0x20000000 (boot/boot-rpi-cl.lisp's memory map), and below
 #              0x30000000, the canonical code VA the boot aliases onto the image -- a
-#              tarball there reads back as the image (16 slots; checked below)
+#              tarball there reads back as the image (checked below).  A slot of 16 MB each
+#              left room for 16, and a gateway card installs 22
 #   GDBPORT    default 1234
 # The mini-UART is QEMU raspi3b's SECOND -serial; the first is wired to null.
 set -u
@@ -28,11 +31,12 @@ loads=(); probe=""; expect=""; blobs=(); forms=()
 for a in "$@"; do case $a in --load=*) loads+=("${a#*=}");; --blob=*) blobs+=("${a#*=}");; --form=*) forms+=(--form "${a#*=}");;
   --probe=*) probe=${a#*=};; --expect=*) expect=${a#*=};; *) echo "unknown arg $a" >&2; exit 2;; esac; done
 W=$(mktemp -d /tmp/modus-rpi-core.XXXXXX); SOCK=$W/uart.sock
-LOADERS=(); TARSPEC=(); k=0
+LOADERS=(); TARSPEC=(); next=0
 for n in "${loads[@]}"; do f=$(readlink -f "$TARS/$n.tar"); [ -s "$f" ] || { echo "FAIL: no tarball $TARS/$n.tar"; exit 1; }
-  addr=$((${TAR_BASE:-0x20000000} + k*16777216))
+  addr=$((${TAR_BASE:-0x20000000} + next))
   (( addr + $(stat -c %s "$f") <= 0x30000000 )) || { echo "FAIL: tarball $n at $(printf 0x%X $addr) reaches the 0x30000000 code window"; exit 1; }
-  LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n"); k=$((k+1)); done
+  LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n")
+  next=$(( next + ($(stat -c %s "$f") + 1048575) / 1048576 * 1048576 )); done
 for b in "${blobs[@]}"; do f=$(readlink -f "${b%@*}"); [ -s "$f" ] || { echo "FAIL: no blob ${b%@*}"; exit 1; }
   LOADERS+=(-device "loader,file=$f,addr=${b##*@}"); done
 boot() { # extra qemu args...

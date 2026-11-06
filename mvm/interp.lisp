@@ -493,6 +493,13 @@
   (let ((mv (%mv-slot-index addr width)))
     (cond (mv (svref (mvm-mv-vals state) mv))
           ((= width 3) (mem-ref addr :u64))
+          ;; ONE access of the width, as compiled code makes -- not bytes.  A device
+          ;; register does not answer byte reads: the Pi's power-management block
+          ;; gave its true low byte and the ASCII of its name above it ("pm" for the
+          ;; watchdog), and ignored byte stores, so an interpreted watchdog reset
+          ;; never fired while the same form compiled did.
+          ((= width 2) (%word->val (mem-ref addr :u32)))
+          ((= width 1) (%word->val (mem-ref addr :u16)))
           (t (%word->val (mem-read state addr width))))))
 
 (defun mem-write-value (state addr val width)
@@ -501,6 +508,11 @@
     (cond (mv (setf (svref (mvm-mv-vals state) mv) val))
           ((= width 3)
            (let ((stored (setf (mem-ref addr :u64) val))) stored))
+          ;; One store of the width (see MEM-READ-VALUE), truncated as the byte path did.
+          ((= width 2)
+           (let ((stored (setf (mem-ref addr :u32) (logand (%val->word val) #xFFFFFFFF)))) stored))
+          ((= width 1)
+           (let ((stored (setf (mem-ref addr :u16) (logand (%val->word val) #xFFFF)))) stored))
           (t (mem-write state addr (%val->word val) width)))))
 
 ;;; Object representation — REAL native CL objects (no simulation).  The

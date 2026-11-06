@@ -30431,6 +30431,19 @@
    is compiled again with promotion inhibited."
   (when (%conv-form-present-p form) (setq form (%conv-subst form)))
   (if (and (%promote-locals-p) (not *promote-inhibit*))
+      ;; THE RETRY STARTS WHERE THE ATTEMPT DID.  The attempt can fail anywhere
+      ;; inside FORM, and the compiler state it had changed by then stayed
+      ;; changed: *%DEFUN-DEFERRED* left T by an IF branch the error unwound
+      ;; out of made the retry compile every DEFUN in FORM as a
+      ;; (SET-SYMBOL-FUNCTION 'NAME (LAMBDA ...)) closure, and the attempt's
+      ;; nested functions stayed on *PENDING-FLET-IR*, so a (PROGN ...) form's
+      ;; functions went into the module twice.  Either way the JIT could not
+      ;; publish them under their names and they ran interpreted for good:
+      ;; natrium's SHA-512 (a FLOOR in %SHA512-OUT runs aarch64 out of
+      ;; temporaries) took 183 ms per RANDOM-BYTES on the Pi 5, 0.45 ms on x64.
+      ;; Lexical saves restored by SETQ, as everywhere in this compiler.
+      (let ((%pfi-saved *pending-flet-ir*) (%dd-saved *%defun-deferred*)
+            (%cfn-saved *current-function-name*) (%e2p-saved *e2-persist-defuns*))
       ;; Under runtime EVAL the attempt runs behind a HANDLER-CASE barrier
       ;; (see %QUIET-MACROEXPAND-1): image HANDLER-CASEs push no frame, so a
       ;; user's HANDLER-BIND outside the EVAL saw "out of temporary
@@ -30452,10 +30465,13 @@
                                           (if (stringp fc) fc ""))
                             (error () "")))
                   (search "out of temporary" (handler-case (format nil "~a" e) (error () ""))))
-              (let ((*promote-inhibit* t))
-                (declare (special *promote-inhibit*))
-                (%mvm-compile-toplevel-1 form))
-              (error e))))
+              (progn
+                (setq *pending-flet-ir* %pfi-saved) (setq *%defun-deferred* %dd-saved)
+                (setq *current-function-name* %cfn-saved) (setq *e2-persist-defuns* %e2p-saved)
+                (let ((*promote-inhibit* t))
+                  (declare (special *promote-inhibit*))
+                  (%mvm-compile-toplevel-1 form)))
+              (error e)))))
       (%mvm-compile-toplevel-1 form)))
 
 (defun %mvm-compile-toplevel-1 (form)

@@ -5541,11 +5541,16 @@
               ;; words straight onto its list (two calls and a generic AREF
               ;; per character before).
               (%sos-push-codes (%stream-data s) str start eff-end)
-              (let ((i start))
-                (loop
-                  (when (>= i eff-end) (return nil))
-                  (%write-char-to-stream (%ensure-char-code (aref str i)) s)
-                  (setq i (+ i 1)))))
+              ;; a cabinet file: the whole slice in one call (cl-fileio %FS-WRITE-STRING-CAB)
+              (unless (and (= (%stream-type s) 9) (stringp str)
+                           (fixnump start) (fixnump eff-end) (<= 0 start) (<= start eff-end)
+                           (<= eff-end len)
+                           (%fs-write-string-cab s str start eff-end))
+                (let ((i start))
+                  (loop
+                    (when (>= i eff-end) (return nil))
+                    (%write-char-to-stream (%ensure-char-code (aref str i)) s)
+                    (setq i (+ i 1))))))
           ;; Serial fallback only handles whole-string writes; emulate.
           (let ((i start))
             (loop

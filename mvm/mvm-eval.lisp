@@ -997,6 +997,11 @@
    CONS once a call has resolved it (see %JIT-BRIDGE-RESOLVE).  Made on the
    main thread with the names vector, so a worker only stores an existing
    region-0 cons into it.")
+(defvar *jit-bridge-bare-pairs* nil
+  "Parallel to *JIT-BRIDGE-NAMES*: the BARE-name table entry a package-qualified
+   callee fell back to (%MVM-RUNTIME-FALLBACK-NAME), valid while its stamp in
+   *JIT-BRIDGE-BARE-GENS* equals *JIT-BRIDGE-GEN*.  Made on the main thread.")
+(defvar *jit-bridge-bare-gens* nil)
 (defvar *jit-bridge-count* nil "Fill index into *jit-bridge-names*.  NIL = 0.")
 (defvar *jit-thunk-page* nil "Current thunk pool page base (exec).")
 (defvar *jit-thunk-bump* nil "Byte offset of the next free thunk in the page.")
@@ -1075,8 +1080,8 @@
   "The callee of bridge thunk IDX, resolved at CALL time (late binding).  The
    symbol-function-table entry CONS is cached per thunk: PUTHASH updates it in
    place, so a redefinition is still seen, and a call no longer pays an EQUAL
-   hash of the callee's name (~10% of an operandi ACP turn).  Only a direct key
-   hit is cached; the bare-name fallback resolves every time."
+   hash of the callee's name (~10% of an operandi ACP turn).  A direct key hit
+   is cached for good; a bare-name fallback per redefinition generation."
   (let* ((pairs *jit-bridge-pairs*)
          (pair (and (%prim-simple-vector-p pairs) (< idx (%prim-array-length pairs))
                     (svref pairs idx))))
@@ -1097,22 +1102,49 @@
                       (%jit-bridge-self-patch idx f))
                     ;; Not native code (a closure): the site stays a bridge.
                     ;; Retire it, keeping the site, so %JIT-BRIDGE-N's inline
-                    ;; path serves it until the callee turns native.
-                    (unless (eq (car site) :retired)
+                    ;; path serves it until the callee turns native.  Main
+                    ;; only: the marker is a fresh cons stored into a global
+                    ;; vector, and a worker's cons there is the store the
+                    ;; shared-store guard refuses (glass's sender died on it).
+                    ;; A worker leaves the site pending and resolves here.
+                    (unless (or (eq (car site) :retired) (not (%mvm-on-main-thread-p)))
                       (setf (svref sites idx) (cons :retired site)))))))
           f)
-        (let ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
-                      (aref *jit-bridge-names* idx) nil)))
-          (let ((p (and nm pairs (< idx (length pairs))
-                        (boundp '*symbol-function-table*) *symbol-function-table*
-                        (%gethash-pair nm *symbol-function-table*))))
-            (if (and (consp p) (cdr p))
-                (progn (setf (aref pairs idx) p) (cdr p))
-                (let ((f (and nm (%mvm-resolve-runtime-fn nm))))
-                  ;; UNDEFINED-FUNCTION, as the interpreter signals for the
-                  ;; same call: a site whose callee did not exist when its
-                  ;; page was built is bridged too (%JIT-RELOC-CALLS).
-                  (if f f (error (quote undefined-function) :name nm)))))))))
+        (let* ((nm (if (and *jit-bridge-names* (< idx (length *jit-bridge-names*)))
+                       (aref *jit-bridge-names* idx) nil))
+               (bps *jit-bridge-bare-pairs*) (bgs *jit-bridge-bare-gens*)
+               (gen *jit-bridge-gen*)
+               (bslot (and (%prim-simple-vector-p bps) (%prim-simple-vector-p bgs)
+                           (< idx (%prim-array-length bps)) (< idx (%prim-array-length bgs))))
+               (bp (and bslot (eql (svref bgs idx) gen) (svref bps idx))))
+          ;; A package-qualified callee bound through its BARE name: the bare
+          ;; entry, cached under the redefinition generation.  Any DEFUN /
+          ;; (SETF FDEFINITION) / FMAKUNBOUND -- including one that defines
+          ;; the qualified key itself -- bumps the generation, and PUTHASH of
+          ;; the bare name updates the cached cons in place.  Without it every
+          ;; such call re-ran SUBSEQ + FIND-SYMBOL + two EQUAL hashes.
+          (if (and (consp bp) (cdr bp))
+              (cdr bp)
+              (let* ((sft (and (boundp '*symbol-function-table*) *symbol-function-table*))
+                     (p (and nm pairs (< idx (length pairs)) sft
+                             (%gethash-pair nm sft))))
+                (if (and (consp p) (cdr p))
+                    (progn (setf (aref pairs idx) p) (cdr p))
+                    (let* ((bare (and nm sft (%mvm-runtime-fallback-name nm)))
+                           (q (and bare (%gethash-pair bare sft))))
+                      (if (and (consp q) (cdr q))
+                          (progn
+                            ;; pair before stamp: a reader that sees the
+                            ;; stamp sees this pair (a region-0 table cons)
+                            (when bslot
+                              (setf (svref bps idx) q)
+                              (setf (svref bgs idx) gen))
+                            (cdr q))
+                          ;; UNDEFINED-FUNCTION, as the interpreter signals for
+                          ;; the same call: a site whose callee did not exist
+                          ;; when its page was built is bridged too
+                          ;; (%JIT-RELOC-CALLS).
+                          (error (quote undefined-function) :name nm))))))))))
 ;; THE BRIDGE'S HIT, INLINE: a cached pair whose site is settled (patched, or
 ;; retired because the callee is a closure -- every runtime DEFCLASS accessor)
 ;; is the callee itself; anything else asks %JIT-BRIDGE-RESOLVE.
@@ -1175,6 +1207,10 @@
   (when (or (null *jit-bridge-pairs*)
             (< (length *jit-bridge-pairs*) (%jit-bridge-cap)))
     (setq *jit-bridge-pairs* (make-array (%jit-bridge-cap) :initial-element nil)))
+  (when (or (null *jit-bridge-bare-pairs*)
+            (< (length *jit-bridge-bare-pairs*) (%jit-bridge-cap)))
+    (setq *jit-bridge-bare-pairs* (make-array (%jit-bridge-cap) :initial-element nil)
+          *jit-bridge-bare-gens* (make-array (%jit-bridge-cap) :initial-element nil)))
   (when (null *jit-thunk-page*)
     (%jit-thunk-new-page))
   (if *jit-thunk-page* t nil))
@@ -1887,7 +1923,7 @@
    Returns T if every reloc resolved, NIL if any failed (→ caller falls back)."
   (let ((ok t))
     (dolist (r relocs)
-      (let* ((name (gethash (cdr r) rt-table))
+      (let* ((name (%mvm-runtime-key (gethash (cdr r) rt-table)))
              (fn (and name (%mvm-resolve-runtime-fn name)))
              ;; %val->word FN = the callee's tagged native word (entry|3; the
              ;; LEA+OR-3 tag from mvm-fn-addr — entry is 16-aligned so low nibble
@@ -1998,7 +2034,7 @@
    the trampoline is late-bound there anyway."
   (let ((ok t))
     (dolist (r relocs)
-      (let* ((name (gethash (cdr r) rt-table))
+      (let* ((name (%mvm-runtime-key (gethash (cdr r) rt-table)))
              (fn (and name (%mvm-resolve-runtime-fn name)))
              (word0 (if fn (%val->word fn) 0))
              (word (if (eql (logand word0 15) 3)
@@ -3384,7 +3420,7 @@
         ;; so aarch64 needs exactly the same guard as x64 — this is the same
         ;; defect, not a port of an x64-specific workaround.
         (dolist (r crel)
-          (let* ((name (gethash (cdr r) rt-table))
+          (let* ((name (%mvm-runtime-key (gethash (cdr r) rt-table)))
                  (fn (and name (%mvm-resolve-runtime-fn name)))
                  (word (if fn (%val->word fn) 0))
                  (addr (if (eql (logand word 15) 3) (- word 3) 0)))
@@ -3478,7 +3514,7 @@
         ;; Keeping these forms NATIVE via a nargs-generic late-binding thunk
         ;; (%jit-make-bridge-thunk-aarch64 is nargs-specific today) is the follow-on.
         (dolist (r frel)
-          (let* ((name (gethash (cdr r) rt-table))
+          (let* ((name (%mvm-runtime-key (gethash (cdr r) rt-table)))
                  ;; AN IMAGE FUNCTION IS ITSELF.  #'EQUAL in JIT'd code used to be
                  ;; the thunk below -- a DIFFERENT object from (symbol-function
                  ;; 'equal) -- so anything that recognises a function by identity

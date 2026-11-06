@@ -209,6 +209,28 @@
 ;; WS1.0.  Base is far above any real mvm-eval module size and fits in a u32.
 (defconstant +mvm-runtime-call-base+ #x40000000)
 
+(defun %mvm-runtime-fallback-name (name)
+  "The BARE key %MVM-RESOLVE-RUNTIME-FN falls back to for a package-qualified
+   NAME (PKG::NAME), or NIL when NAME has none or must not take it."
+  (let ((n (length name)) (i 0) (cut nil))
+    (loop
+      (when (>= (+ i 1) n) (return))
+      (when (and (char= (char name i) #\:) (char= (char name (+ i 1)) #\:))
+        (setq cut (+ i 2)) (return))
+      (setq i (+ i 1)))
+    ;; Not for a name that shadows a CL external: its bare entry is
+    ;; CL's function, and P::LDB is not CL:LDB -- see %FN-INFO-FOR-KEY.
+    (and cut (< cut n)
+         ;; nor for a non-kernel symbol named like a kernel function:
+         ;; it is its own symbol, never the kernel's (cl-eval.lisp)
+         (not (and (fboundp '%shadows-cl-name-p)
+                   (let ((s (find-symbol (subseq name cut) (subseq name 0 (- cut 2)))))
+                     (and s (funcall '%shadows-cl-name-p s)))))
+         (let ((nm (subseq name cut)))
+           (unless (and (not (%kernel-home-pkg-name-p (subseq name 0 (- cut 2))))
+                        *kernel-fn-names* (gethash nm *kernel-fn-names*))
+             nm)))))
+
 (defun %mvm-resolve-runtime-fn (name)
   "Resolve a native function by NAME (string) via the symbol-function table.
    A package-qualified key (PKG::NAME — what the compiler emits for a symbol
@@ -220,24 +242,20 @@
   (and (boundp '*symbol-function-table*)
        *symbol-function-table*
        (or (gethash name *symbol-function-table*)
-           (let ((n (length name)) (i 0) (cut nil))
-             (loop
-               (when (>= (+ i 1) n) (return))
-               (when (and (char= (char name i) #\:) (char= (char name (+ i 1)) #\:))
-                 (setq cut (+ i 2)) (return))
-               (setq i (+ i 1)))
-             ;; Not for a name that shadows a CL external: its bare entry is
-             ;; CL's function, and P::LDB is not CL:LDB -- see %FN-INFO-FOR-KEY.
-             (and cut (< cut n)
-                  ;; nor for a non-kernel symbol named like a kernel function:
-                  ;; it is its own symbol, never the kernel's (cl-eval.lisp)
-                  (not (and (fboundp '%shadows-cl-name-p)
-                            (let ((s (find-symbol (subseq name cut) (subseq name 0 (- cut 2)))))
-                              (and s (funcall '%shadows-cl-name-p s)))))
-                  (let ((nm (subseq name cut)))
-                    (unless (and (not (%kernel-home-pkg-name-p (subseq name 0 (- cut 2))))
-                                 *kernel-fn-names* (gethash nm *kernel-fn-names*))
-                      (gethash nm *symbol-function-table*))))))))
+           (let ((nm (%mvm-runtime-fallback-name name)))
+             (and nm (gethash nm *symbol-function-table*))))))
+
+(defun %mvm-runtime-key (name)
+  "The symbol-function-table KEY that %MVM-RESOLVE-RUNTIME-FN resolves NAME
+   through: NAME itself, or its bare fallback.  NAME when neither is defined.
+   Native code links a callee's stub, cell or thunk under this key, because it
+   is the key a redefinition invalidates: a MODUS-INT DEFUN is keyed bare, so a
+   caller linked under \"MODUS-INT::F\" never saw F redefined."
+  (if (and name (boundp '*symbol-function-table*) *symbol-function-table*
+           (not (gethash name *symbol-function-table*)))
+      (let ((nm (%mvm-runtime-fallback-name name)))
+        (if (and nm (gethash nm *symbol-function-table*)) nm name))
+      name))
 
 (defun %rt-stub-count (runtime-table)
   "Number of runtime stubs in RUNTIME-TABLE: keys #x40000000, +1, ... are

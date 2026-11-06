@@ -301,7 +301,7 @@
   "Wait until PRED is true or TIMEOUT-MS pass; PRED's last value.  The network lock is held
    for each test and released between them.  Between tests: with the network service
    running, sleep until its next delivering pass; without it, pump."
-  (let ((end (+ (%now-ms) timeout-ms)))
+  (let ((end (+ (%now-ms) timeout-ms)) (idle 0))
     (loop
       (let* ((g (%ns-gen))
              (v (with-net-lock (funcall pred))))
@@ -310,16 +310,29 @@
           (when (< left 0) (return nil))
           (cond ((%ion-p) (%ion-wait (ion-get #x10) (max 1 (min left 50))))
                 (*ns-thread* (%ns-wait (%ns-gen-addr) g (max 1 (min left 50))))
-                (t (when (zerop (net-pump)) (%net-idle)))))))))
+                ;; Back off while PRED stays false even when frames DID arrive: on a board
+                ;; every core-0 waiter pumps for all of them, and relay keepalives, TURN
+                ;; refreshes and ICE consent keep frames coming, so resetting on a frame kept
+                ;; the waiter for an idle listener spinning.  A frame that makes PRED true is
+                ;; seen at the next test, at most 16 ms on.
+                (t (net-pump)
+                   (%net-idle (min idle left))
+                   (setq idle (min 16 (max 1 (* 2 idle)))))))))))
 
-(defun %net-idle ()
+(defun %net-idle (&optional (ms 0))
   "Nothing arrived: let this core's other threads run (net/bare-threads.lisp's BT-YIELD --
    on the main thread, core 0's; the other end of a LOOPBACK pair is often one of them),
    and only when none could, wait (IO-DELAY: QEMU's event loop gets its moment, and it is
    5000 device reads -- paid between every chunk of a loopback transfer, it was most of
-   the time an RFB frame took)."
-  (unless (and (fboundp 'bt-yield) (bt-yield))
-    (io-delay)))
+   the time an RFB frame took).
+   A THREAD SLEEPS MS instead (%PUMP-UNTIL's back-off: 0, then 1, 2 .. 16 ms while its
+   condition stays false).  Its BT-YIELD always succeeds, so a waiting thread used to spin:
+   on a board with nobody pumping for it (kiln's executor, not *NS-THREAD*), glass's admission
+   service blocked in ACCEPT was 40% of core 0 with no connection coming, and a phone's offer
+   waited behind it."
+  (cond ((and (plusp ms) (fboundp '%bt-slot-p) (%bt-slot-p)) (%sleep-ms ms))
+        ((and (fboundp 'bt-yield) (bt-yield)))
+        (t (io-delay))))
 
 ;;; ---- the API ------------------------------------------------------------------------------
 

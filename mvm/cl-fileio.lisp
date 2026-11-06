@@ -1172,9 +1172,63 @@
        (equal (array-element-type seq) '(unsigned-byte 8))
        (let ((spec (%fs-elt-spec stream))) (and (= (car spec) 1) (not (cdr spec))))))
 
+;;; A CABINET stream takes a slice in ONE %CAB call, not a dispatch per byte (58 us a byte on a
+;;; QEMU board: the board gateway's boot spent 41 s writing its CA bundle and client payload).
+;;; NIL when the shim has no :WRITE-BYTES -- kiln copies lib/cabinet-fs.lisp into a board's
+;;; tarballs, so the kernel can be newer than the shim -- and the caller goes byte by byte.
+(defun %cab-write-bytes (stream fd seq start end)
+  (let ((path (%cab-fd-path fd)) (pos (%cab-fd-pos fd)))
+    (when (handler-case (progn (%cab :write-bytes path pos seq start end) t)
+            (error () nil))
+      (%cab-fd-set-pos fd (+ pos (- end start)))
+      (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
+      t)))
+
+(defun %fs-utf8-octets (str start end)
+  "STR[START,END) as a UTF-8 byte vector, encoded as %FS-WRITE-CHAR encodes."
+  (let ((n 0) (i start))
+    (loop
+      (when (>= i end) (return nil))
+      (setq n (+ n (%utf8-len-of-code (char-code (char str i)))))
+      (setq i (+ i 1)))
+    (let ((v (make-array n :element-type '(unsigned-byte 8))) (j 0))
+      (setq i start)
+      (loop
+        (when (>= i end) (return v))
+        (let ((code (char-code (char str i))))
+          (cond
+            ((< code #x80)
+             (setf (aref v j) code) (setq j (+ j 1)))
+            ((< code #x800)
+             (setf (aref v j) (logior #xC0 (ash code -6))
+                   (aref v (+ j 1)) (logior #x80 (logand code #x3F)))
+             (setq j (+ j 2)))
+            ((< code #x10000)
+             (setf (aref v j) (logior #xE0 (ash code -12))
+                   (aref v (+ j 1)) (logior #x80 (logand (ash code -6) #x3F))
+                   (aref v (+ j 2)) (logior #x80 (logand code #x3F)))
+             (setq j (+ j 3)))
+            (t
+             (setf (aref v j) (logior #xF0 (ash code -18))
+                   (aref v (+ j 1)) (logior #x80 (logand (ash code -12) #x3F))
+                   (aref v (+ j 2)) (logior #x80 (logand (ash code -6) #x3F))
+                   (aref v (+ j 3)) (logior #x80 (logand code #x3F)))
+             (setq j (+ j 4)))))
+        (setq i (+ i 1))))))
+
+(defun %fs-write-string-cab (stream str start end)
+  "WRITE-STRING of STR[START,END) onto a cabinet file stream in one call; T if done."
+  (let ((fd (%fs-fd stream)))
+    (and (>= fd 0) (%cab-fd-p fd)
+         (let ((v (%fs-utf8-octets str start end)))
+           (%cab-write-bytes stream fd v 0 (length v))))))
+
 (defun %fs-write-bytes (stream seq start end)
   "Write SEQ[START,END) to the file stream in 4 KB system calls; T if done."
   (let ((fd (%fs-fd stream)))
+    (when (and (%fs-bulk-ok-p stream seq) (%cab-fd-p fd)
+               (%cab-write-bytes stream fd seq start end))
+      (return-from %fs-write-bytes t))
     ;; A socket *NET-FD-CALL* serves (bare metal): the whole slice in one call.  Through
     ;; WRITE-BYTE it was a dispatch per byte -- a 1.2 MB RFB frame took minutes on a board.
     (when (and (%fs-bulk-ok-p stream seq) (%net-fd-p fd))

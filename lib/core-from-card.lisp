@@ -245,8 +245,42 @@
       (setq c (%cfc-next-cluster fat c) hops (+ hops 1)))
     (if found (values fcl fsz fdir) nil)))
 
+;; READ_MULTIPLE_BLOCK (CMD18) with the controller's own CMD12 at the end: index 18,
+;; 48-bit response with CRC and index checks, data, read, multi-block, block count, auto
+;; CMD12.  One command per run of contiguous clusters instead of one per sector: CMD17 a
+;; sector at a time paid the card's access latency 85,000 times for a 44 MB core (41 s on a
+;; Zero).
+(defun %cfc-read-blocks (lba n dst)
+  "N sectors from LBA to raw memory DST with one CMD18.  T, or NIL."
+  (%cfc-set #x04 (logior (ash n 16) 512))
+  (if (< (%cfc-cmd #x123A0036 lba) 0)
+      nil
+      (let ((ok t) (p dst))
+        (dotimes (b n)
+          (when ok
+            (if (%cfc-wait-irpt (ash 1 5))
+                (progn
+                  (dotimes (k 128) (setf (mem-ref (+ p (* 4 k)) :u32) (%cfc-reg #x20)))
+                  (setq p (+ p 512)))
+                (setq ok nil))))
+        (and ok (%cfc-wait-irpt 2)))))
+
+(defun %cfc-read-singly (lba n dst)
+  "N sectors from LBA to DST one CMD17 at a time, after resetting the data line a failed
+   CMD18 may have left busy.  T, or NIL."
+  (%cfc-set #x2C (logior (%cfc-reg #x2C) (ash 1 26)))          ; SRST_DATA
+  (%cfc-wait #x2C (ash 1 26) 0 200000)
+  (%cfc-set #x30 #xFFFFFFFF)
+  (%cfc-say "core: a multi-block read failed, reading sector by sector from" lba)
+  (let ((ok t))
+    (dotimes (i n)
+      (when (and ok (not (%cfc-read-sector (+ lba i) (+ dst (* 512 i)))))
+        (setq ok nil)))
+    ok))
+
 (defun %cfc-read-file (fat data spc cl size dst limit)
-  "Read SIZE bytes of the chain starting at cluster CL to DST.  T, or NIL."
+  "Read SIZE bytes of the chain starting at cluster CL to DST, a run of contiguous
+   clusters per command.  T, or NIL."
   (if (> (+ dst size) limit)
       (%cfc-say "core: does not fit below the top of RAM, bytes" size)
       (let ((left size) (p dst) (c cl) (hops 0) (ok t))
@@ -254,12 +288,21 @@
           (when (or (not ok) (<= left 0)) (return ok))
           (when (or (< c 2) (>= c #x0FFFFFF8) (> hops 1000000))
             (return (%cfc-say "core: the file's cluster chain ends early, bytes left" left)))
-          (dotimes (si spc)
-            (when (and ok (> left 0))
-              (if (%cfc-read-sector (+ data (* (- c 2) spc) si) p)
-                  (setq p (+ p 512) left (- left 512))
-                  (setq ok (%cfc-say "core: a sector read failed at cluster" c)))))
-          (setq c (%cfc-next-cluster fat c) hops (+ hops 1))))))
+          ;; the run: C, C+1, ... while the chain is contiguous, it is still short of LEFT,
+          ;; and one more cluster stays within 32768 sectors (CMD18 counts to 65535)
+          (let ((first c) (k 1) (nxt (%cfc-next-cluster fat c)))
+            (loop
+              (when (or (/= nxt (+ first k))
+                        (>= (* k spc 512) left)
+                        (> (* (+ k 1) spc) 32768))
+                (return nil))
+              (setq k (+ k 1) nxt (%cfc-next-cluster fat nxt)))
+            (let ((blocks (min (* k spc) (floor (+ left 511) 512)))
+                  (lba (+ data (* (- first 2) spc))))
+              (if (or (%cfc-read-blocks lba blocks p) (%cfc-read-singly lba blocks p))
+                  (setq p (+ p (* 512 blocks)) left (- left (* 512 blocks)))
+                  (setq ok (%cfc-say "core: a sector read failed at cluster" first))))
+            (setq c nxt hops (+ hops k)))))))
 
 ;;; ---- CORE=P:/path --------------------------------------------------------------------------
 (defun %cfc-core-arg (args)

@@ -1533,6 +1533,7 @@
     (%restore-image)
     (%core-post-restore)
     (%kernel-redirects-reapply)
+    (%core-run-restore-hooks)
     (handler-case (cli-toplevel) (t (c) (%cli-exit 1)))
     (%cli-exit 0))
 ")
@@ -1543,6 +1544,7 @@
     (%restore-image)
     (%core-post-restore)
     (%kernel-redirects-reapply)
+    (%core-run-restore-hooks)
 " *cli-arch-core-resume* "    )
 ")))
   ;; ---- SHARED boot init.  Identical on every arch, and the whole reason this

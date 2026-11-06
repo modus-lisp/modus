@@ -130,6 +130,7 @@
 
 ;;; THE PI MEMORY MAP.  Everything below is in physical RAM, identity-mapped:
 ;;;   0x00080000  the image                      0x10000000  runtime window (compiled in)
+;;;   0x03000000  the STATIC REGION (2 MB)
 ;;;   0x03200000  the BOARD REGION (32 MB)        0x10080000  per-CPU, thread pages, ...
 ;;;   0x05200000  thread stacks
 ;;;   0x06000000  code-remap L3 tables, FDT       0x108A0000  scheduler, SSH state, scratch
@@ -139,8 +140,13 @@
 ;;; The heap is the one region that grows with the board; everything a board must have
 ;;; sits below it.  build-cl-repl-common.lisp's %RPI-MEMORY-MAP-ASSERTS checks the rest
 ;;; of the image's addresses against these.
+;; The static region: RAM no collector owns, where MAKE-STATIC-VECTOR puts what must never move
+;; (natrium's secret arena), since a board has no mmap.  Per boot: a core does not carry it.
+;; %STATIC-REGION in the image.  The image must end below it.
+(defconstant +rpi-cl-static-lo+     #x03000000)
+(defconstant +rpi-cl-static-hi+     #x03200000)
 ;; The board region: RAM nothing in modus uses, for what runs on the board to keep outside
-;; the heap (kiln's RAM cabinet).  The image must end below it.  %RPI-BOARD-RAM in the image.
+;; the heap (kiln's RAM cabinet).  %RPI-BOARD-RAM in the image.
 (defconstant +rpi-cl-board-lo+      #x03200000)
 (defconstant +rpi-cl-board-hi+      #x05200000)
 (defconstant +rpi-cl-stack-top+     #x08000000)  ; grows down

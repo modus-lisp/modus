@@ -629,6 +629,8 @@
 ;; The board region of boot-rpi-cl.lisp's memory map: (values BASE BYTES), RAM that
 ;; modus leaves alone for the board's own use (kiln keeps its RAM cabinet there).
 (defun %rpi-board-ram () (values #x03200000 #x02000000))
+;; The static region of the same map: MAKE-STATIC-VECTOR's RAM on the board (mvm-eval.lisp).
+(defun %static-region () (values #x03000000 #x00200000))
 ;; NARROW STRINGS ON (prelude.lisp %NARROW-STRINGS-P): the aarch64 collector
 ;; sizes #x13 as bytes, so the reader makes them.  Last definition wins.
 (defun %narrow-strings-p () t)
@@ -3488,6 +3490,8 @@
            (stack-headroom (* 8 1024 1024))
            (stack-va-lo    (- stack-top stack-headroom))
            (low-tables     #x05200000)  ; thread stacks, then the L3 tables at 0x06000000
+           (static-lo      (c "+RPI-CL-STATIC-LO+"))
+           (static-hi      (c "+RPI-CL-STATIC-HI+"))
            (board-lo       (c "+RPI-CL-BOARD-LO+"))
            (board-hi       (c "+RPI-CL-BOARD-HI+"))
            (bm-obj         (c "+RPI-CL-BITMAP-OBJ+"))
@@ -3521,9 +3525,21 @@
                image-va-start image-va-end (/ image-bytes 1024.0 1024.0)
                stack-va-lo stack-top))
       ;; a U-Boot netboot loads the image at 0x300000, 0x280000 above the SD card's 0x80000
-      (when (>= (+ image-va-end #x280000) board-lo)
+      (when (>= (+ image-va-end #x280000) static-lo)
         (error "BUILD-TIME ASSERT: image end ~X (~X when netbooted at 0x300000) reaches the ~
-                board region at ~X." image-va-end (+ image-va-end #x280000) board-lo))
+                static region at ~X." image-va-end (+ image-va-end #x280000) static-lo))
+      (when (> static-hi board-lo)
+        (error "BUILD-TIME ASSERT: the static region ends ~X past the board region at ~X."
+               static-hi board-lo))
+      (let ((form (format nil "(defun %static-region () (values #x~8,'0X #x~8,'0X))"
+                          static-lo (- static-hi static-lo))))
+        (must-say form "the static region")
+        ;; ... and it must be the LAST definition: last defun wins, and a default
+        ;; after it would leave the board with no static region at all
+        (unless (eql (search form cl-user::*full-source* :from-end t)
+                     (search "(defun %static-region " cl-user::*full-source* :from-end t))
+          (error "BUILD-TIME ASSERT: a %STATIC-REGION definition follows the board's, so ~
+                  the board's is not the one that runs.")))
       (when (> board-hi low-tables)
         (error "BUILD-TIME ASSERT: the board region ends ~X past the thread stacks at ~X."
                board-hi low-tables))
@@ -3584,6 +3600,7 @@
       (format t "~%Pi memory map (identity-mapped DRAM; boot-rpi-cl.lisp):~%")
       (format t "  image      ~8,'0X .. ~8,'0X  (~,2F MB)~%"
               image-va-start image-va-end (/ image-bytes 1024.0 1024.0))
+      (format t "  static     ~8,'0X .. ~8,'0X  (%STATIC-REGION)~%" static-lo static-hi)
       (format t "  board      ~8,'0X .. ~8,'0X  (%RPI-BOARD-RAM)~%" board-lo board-hi)
       (format t "  stack top  ~8,'0X            (grows down, ~,1F MB clear of image)~%"
               stack-top (/ (- stack-va-lo image-va-end) 1024.0 1024.0))

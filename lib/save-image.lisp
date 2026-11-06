@@ -128,6 +128,14 @@
 ;;; band, which the first bordeaux-threads lock carves off region 0's top and
 ;;; which holds the sync-cell control words, region control blocks and actor
 ;;; table.  0 / 0 = none (the default).
+;;; STATIC MEMORY (mvm-eval.lisp %STATIC-ALLOC, MAKE-STATIC-VECTOR): (values BASE
+;;; BYTES) of RAM no collector owns, or 0 0 for none (the default: a hosted
+;;; image maps its static vectors).  The Pi's memory map overrides it.  HERE and
+;;; not beside %STATIC-ALLOC: this file precedes the board's source, so its
+;;; override is the definition that wins.
+(declaim (overridable %static-region))
+(defun %static-region () (values 0 0))
+
 (declaim (overridable %core-extra-addr))
 (defun %core-extra-addr () 0)
 (declaim (overridable %core-extra-len))

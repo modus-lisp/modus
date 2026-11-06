@@ -2902,6 +2902,67 @@
   "(TAGGED-WORD . BYTES) for every live mapping MAKE-STATIC-VECTOR made: what
    FREE-STATIC-VECTOR may unmap.")
 
+;;; STATIC MEMORY ON BARE METAL.  A board has no mmap, so a static vector there
+;;; comes from %STATIC-REGION, RAM the memory map gives no collector (the Pi's:
+;;; boot-rpi-cl.lisp).  It is bump-allocated and never freed.  The bump word and
+;;; a spinlock word live at the region's start, so every core allocates from it
+;;; under XCHG-MEM like any other raw word; nothing about it is on a heap.
+;;; Like an mmap, it belongs to ONE boot: a core does not carry it, and a
+;;; restored process starts the region over (%CORE-RUN-RESTORE-HOOKS) -- a
+;;; static vector made before SAVE-IMAGE is gone after the restore.  Cold DRAM
+;;; is not zero (a Zero's reads 0x55555555), so every allocation is zeroed.
+;;; %STATIC-REGION's default (0 0: none) is in lib/save-image.lisp, which precedes
+;;; the board source that overrides it; defined here, after it, the default won.
+;;; An image without lib/save-image.lisp has no static region.
+
+(defvar *static-region-ready* nil
+  "T once this boot has set up %STATIC-REGION's bump and lock words.")
+
+(defun %static-alloc (bytes)
+  "Raw address of BYTES (rounded to 16) of zeroed static memory, or 0 when there
+   is no static region or it is full."
+  (multiple-value-bind (base size) (handler-case (%static-region) (error () (values 0 0)))
+    (if (or (zerop size) (<= bytes 0))
+        0
+        (let ((lock base) (bump (+ base 8)) (end (+ base size))
+              (bytes (* 16 (ceiling bytes 16))))
+          (unless *static-region-ready*
+            (setf (mem-ref lock :u64) 0)
+            (setf (mem-ref bump :u64) (+ base 64))
+            (setq *static-region-ready* t))
+          (loop (when (zerop (xchg-mem lock 1)) (return)))
+          (let ((a (mem-ref bump :u64)))
+            (if (> (+ a bytes) end)
+                (setq a 0)
+                (setf (mem-ref bump :u64) (+ a bytes)))
+            (mfence)
+            (xchg-mem lock 0)
+            (unless (zerop a)
+              (do ((p a (+ p 8))) ((>= p (+ a bytes))) (setf (mem-ref p :u64) 0)))
+            a)))))
+
+;;; RESTORE HOOKS.  What a library keeps outside the heap -- an mmap, the static
+;;; region, a descriptor -- a core does not carry.  ADD-RESTORE-HOOK registers a
+;;; function of no arguments to run, in the order added, once a restored process
+;;; is up (after %CORE-POST-RESTORE and the kernel redirects, before anything the
+;;; core was saved to run).  A hook that signals is reported and the rest run.
+(defvar *restore-hooks* nil "Functions run after a core is restored, oldest first.")
+
+(defun add-restore-hook (fn)
+  "Run FN (no arguments) whenever a core saved from this process is restored."
+  (unless (member fn *restore-hooks*)
+    (setq *restore-hooks* (append *restore-hooks* (list fn))))
+  fn)
+
+(defun %core-run-restore-hooks ()
+  ;; the image's own first: the restored process has none of the saved one's
+  ;; mappings, and the static region starts over
+  (setq *static-vector-maps* nil)
+  (setq *static-region-ready* nil)
+  (dolist (fn *restore-hooks*)
+    (handler-case (funcall fn)
+      (error (e) (format t "~&;; restore hook failed: ~a~%" e)))))
+
 (defun make-static-vector (n &key (element-type '(unsigned-byte 8)))
   "An N-element (simple-array ELEMENT-TYPE (*)), zero-filled, outside the
    moving heap (see STATIC VECTORS above).  ELEMENT-TYPE is (UNSIGNED-BYTE 8)
@@ -2910,12 +2971,17 @@
     (let* ((bytes (+ 16 (* 16 (ceiling (* n width) 16))))
            ;; mmap(NULL, bytes, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS):
            ;; x86-64 numbering, as every runtime syscall; each target remaps.
-           (a (handler-case (syscall6 9 0 bytes 3 #x22 -1 0) (error () nil))))
+           ;; a board's static region first (bare metal has no mmap)
+           (s (%static-alloc bytes))
+           (a (if (zerop s)
+                  (handler-case (syscall6 9 0 bytes 3 #x22 -1 0) (error () nil))
+                  s)))
       (if (and (integerp a) (> a 4096))
           (progn
             (%store-word-bytes a (logior (ash n 8) subtag))
             (%store-word-bytes (+ a 8) 0)
-            (push (cons (+ a 9) bytes) *static-vector-maps*)
+            ;; static RAM is never freed: only a mapping goes on the list
+            (when (zerop s) (push (cons (+ a 9) bytes) *static-vector-maps*))
             (%word->val (+ a 9)))
           (make-array n :element-type element-type
                         :initial-element (if (= subtag #x12) 0.0 0))))))
@@ -2940,7 +3006,8 @@
    symbol's function cell and the qualified SFT key are set."
   (let ((p (find-package "MODUS")))
     (when p
-      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE" "MAKE-STATIC-VECTOR" "FREE-STATIC-VECTOR"))
+      (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE" "MAKE-STATIC-VECTOR" "FREE-STATIC-VECTOR"
+                      "ADD-RESTORE-HOOK" "%STATIC-ALLOC"))
         (let ((fn (%mvm-resolve-runtime-fn nm)))
           (when fn
             (let ((dst (intern nm p)))

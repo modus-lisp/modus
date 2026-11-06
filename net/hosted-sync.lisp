@@ -439,6 +439,13 @@
     (%layout-if :stw (%gc-safe-leave) nil)
     r))
 
+;;; All six arguments, for the socket layer's recvfrom(2) (net/hosted-sockets-post.lisp).
+(defun %gc-safe-syscall6 (n a b c d e f)
+  (%layout-if :stw (%gc-safe-enter) nil)
+  (let ((r (syscall6 n a b c d e f)))
+    (%layout-if :stw (%gc-safe-leave) nil)
+    r))
+
 (defun %nanosleep-at (ts sec nsec)
   "nanosleep(2) for SEC seconds + NSEC nanoseconds, restarting on EINTR with
    the kernel's own remainder, using the caller-supplied 32-byte scratch at TS

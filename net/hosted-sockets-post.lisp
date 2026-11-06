@@ -273,7 +273,7 @@
 ;;; -1, which throws away the one distinction a poll loop needs: -11 (EAGAIN)
 ;;; means "nothing was waiting, come back later" and every other negative means
 ;;; the listener is in trouble.
-(defun socket-accept-raw (lfd) (syscall3 43 lfd 0 0))
+(defun socket-accept-raw (lfd) (%gc-safe-block-3 43 lfd 0 0))
 
 ;;; ============================================================
 ;;; poll(2)
@@ -305,7 +305,7 @@
 
 ;;; poll(fds, nfds, timeout_ms).  Returns the number of ready fds, 0 on
 ;;; timeout, or a negative -errno.
-(defun %sk-poll (n ms) (syscall3 7 (%sk-pollfds) n ms))
+(defun %sk-poll (n ms) (%gc-safe-block-3 7 (%sk-pollfds) n ms))
 
 ;;; Wait until FD accepts a write, using the RESERVED entry 63 so the caller's
 ;;; own poll set is untouched.  Passing the address of entry 63 with nfds = 1
@@ -315,7 +315,7 @@
     (setf (mem-ref a :u32) fd)
     (setf (mem-ref (+ a 4) :u16) 4)
     (setf (mem-ref (+ a 6) :u16) 0)
-    (syscall3 7 a 1 ms)))
+    (%gc-safe-block-3 7 a 1 ms)))
 
 ;;; Wait for FD to become readable — the one-fd case, for a client that has no
 ;;; poll set of its own.  Returns 1 if it is readable, 0 on timeout, negative
@@ -328,7 +328,7 @@
           (setf (mem-ref a :u32) fd)
           (setf (mem-ref (+ a 4) :u16) 1)
           (setf (mem-ref (+ a 6) :u16) 0)
-          (syscall3 7 a 1 ms)))))
+          (%gc-safe-block-3 7 a 1 ms)))))
 
 ;;; ============================================================
 ;;; THE SERVER CONTROL BLOCK
@@ -995,7 +995,7 @@
 (defun %sbs-open (family type) (syscall3 41 family type 0))
 (defun %sbs-close (fd) (syscall3 3 fd 0 0))
 (defun %sbs-listen (fd backlog) (syscall3 50 fd backlog 0))
-(defun %sbs-accept (fd) (syscall3 43 fd 0 0))
+(defun %sbs-accept (fd) (%gc-safe-block-3 43 fd 0 0))
 (defun %sbs-shutdown (fd how) (syscall3 48 fd how 0))
 
 (defun %sbs-bind-in (fd ip port)
@@ -1004,7 +1004,7 @@
 
 (defun %sbs-connect-in (fd ip port)
   (let ((a (%sbs-addr-in ip port)))
-    (if (zerop a) -12 (syscall3 42 fd a 16))))
+    (if (zerop a) -12 (%gc-safe-block-3 42 fd a 16))))
 
 ;;; UNCONNECTED UDP for the shim: sendto(2) and recvfrom(2) WITH the sender.
 ;;; net/hosted-sockets.lisp's UDP-RECVFROM throws the sender away, which is fine
@@ -1037,7 +1037,7 @@
         (progn
           (%ha-zero a (+ a 24))
           (setf (mem-ref (+ a 16) :u32) 16)        ; socklen_t, in and out
-          (let ((n (syscall6 45 fd (%sock-io-buf) want 0 a (+ a 16))))
+          (let ((n (%gc-safe-syscall6 45 fd (%sock-io-buf) want 0 a (+ a 16))))
             (when (> n 0)
               (let ((io (%sock-io-buf)) (i 0))
                 (loop
@@ -1068,7 +1068,7 @@
 
 (defun %sbs-connect-un (fd path)
   (let ((len (%sbs-addr-un path)))
-    (if (< len 0) -36 (syscall3 42 fd (%sbs-scratch) len))))
+    (if (< len 0) -36 (%gc-safe-block-3 42 fd (%sbs-scratch) len))))
 
 (defun %sbs-getname (fd which)
   "getsockname(51) / getpeername(52), PACKED: (ip * 65536) + port, both host
@@ -1192,3 +1192,37 @@
 
 (defun %sbs-getuid () (syscall3 102 0 0 0))
 (defun %sbs-getpid () (syscall3 39 0 0 0))
+
+;;; ============================================================
+;;; BLOCKING CALLS ARE STOP-THE-WORLD SAFE REGIONS
+;;; ============================================================
+;;;
+;;; A thread blocked in accept(2), read(2), poll(2) ... cannot reach a
+;;; safepoint, so a collection started on another thread waited for it for as
+;;; long as the call blocked: the glass gateway's admission thread sits in
+;;; accept for the life of the process, and the first collection after it
+;;; started spun the main thread in the rendezvous (sched_yield) forever.  Each
+;;; call below goes through %GC-SAFE-BLOCK-3 / %GC-SAFE-SYSCALL6
+;;; (net/hosted-sync.lisp), as SLEEP and the futex waits do.  Every pointer
+;;; they hand the kernel is this CPU's raw scratch or I/O buffer, never a heap
+;;; object.  Last-defun-wins overrides of net/hosted-sockets.lisp, which is
+;;; baked above net/hosted-sync.lisp and cannot call it.
+(defun %sock-connect-fd (fd) (%gc-safe-block-3 42 fd (%sock-addr-buf) 16))
+(defun %sock-write (fd len)  (%gc-safe-block-3 1 fd (%sock-io-buf) len))
+(defun %sock-read (fd len)   (%gc-safe-block-3 0 fd (%sock-io-buf) len))
+
+(defun socket-accept (lfd)
+  (let ((c (%gc-safe-block-3 43 lfd 0 0)))
+    (if (< c 0) -1 c)))
+
+(defun udp-recvfrom (fd arr max)
+  (let ((want max))
+    (when (> want (%sock-io-cap)) (setq want (%sock-io-cap)))
+    (let ((n (%gc-safe-syscall6 45 fd (%sock-io-buf) want 0 0 0)))
+      (if (< n 1)
+          n
+          (let ((io (%sock-io-buf)) (i 0))
+            (loop
+              (when (>= i n) (return n))
+              (aset arr i (mem-ref (+ io i) :u8))
+              (setq i (+ i 1))))))))

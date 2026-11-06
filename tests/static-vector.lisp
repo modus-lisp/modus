@@ -20,10 +20,10 @@
 ;; vector must not be used again -- not even passed to a function -- but a
 ;; reference left in a heap object does not trouble the collector.
 (let* ((v (modus:make-static-vector 1000 :element-type 'single-float))
-       (n (length modus::*static-vector-maps*)))
+       (n (length modus-int::*static-vector-maps*)))
   (setf (aref v 3) 1.5)
   (check "free: a static vector" (and (= (aref v 3) 1.5) (modus:free-static-vector v)
-                                      (= (length modus::*static-vector-maps*) (1- n)))))
+                                      (= (length modus-int::*static-vector-maps*) (1- n)))))
 (let ((holder (vector (modus:make-static-vector 64 :element-type 'single-float) 1)))
   (modus:free-static-vector (svref holder 0))
   (let ((junk nil) (k 0))

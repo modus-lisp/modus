@@ -483,7 +483,7 @@
 (defun %fasl-apply-effect (e)
   "Redo one logged compile-time registration (see %FASL-EFFECT)."
   (let ((k (car e)) (a (cdr e)))
-    (cond ((eq k :special) (%note-runtime-special (car a)))
+    (cond ((eq k :special) (apply #'%note-runtime-special a))
           ((eq k :optimize) (%declaim-note-optimize (car a)))
           ((eq k :declaim-special) (%declaim-note-special (car a)))
           ((eq k :declaim-inline) (%declaim-note-inline (car a)))

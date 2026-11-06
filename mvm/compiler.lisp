@@ -1515,22 +1515,31 @@
    (deliberately NOT reset per mvm-eval-forms).  Host builds never populate
    it (*mvm-eval-runtime-p* stays NIL) — byte-identical.")
 
-(defun %note-runtime-special (name-hash)
-  "Record NAME-HASH as runtime-proclaimed-special (see *runtime-special-names*)."
-  (%fasl-effect :special name-hash)
+(defun %note-runtime-special-entry (name-hash name)
+  "Add NAME (a string, or NIL when unknown) under NAME-HASH.  The entry is the
+   list of names proclaimed with that hash, or T once one came without a name
+   (a FASL effect logged before names were): T matches any name."
+  (unless *runtime-special-names*
+    (setq *runtime-special-names* (make-hash-table :test 'eql)))
+  (let ((e (gethash name-hash *runtime-special-names*)))
+    (setf (gethash name-hash *runtime-special-names*)
+          (cond ((or (eq e t) (null name)) t)
+                ((member name e :test #'string=) e)
+                (t (cons name e))))))
+
+(defun %note-runtime-special (name-hash &optional name)
+  "Record NAME-HASH (and the NAME it hashes) as runtime-proclaimed-special
+   (see *runtime-special-names*)."
+  (%fasl-effect :special name-hash name)
   (when *mvm-eval-runtime-p*
-    (unless *runtime-special-names*
-      (setq *runtime-special-names* (make-hash-table :test 'eql)))
-    (setf (gethash name-hash *runtime-special-names*) t)))
+    (%note-runtime-special-entry name-hash name)))
 
 (defun %proclaim-special-name (sym)
   "PROCLAIM (SPECIAL SYM) at runtime: record SYM in *RUNTIME-SPECIAL-NAMES*.
    Unconditional -- PROCLAIM is a runtime call, not something the compiler
    sees, so it cannot wait for *MVM-EVAL-RUNTIME-P*."
   (%fasl-taint "%proclaim-special-name")
-  (unless *runtime-special-names*
-    (setq *runtime-special-names* (make-hash-table :test 'eql)))
-  (setf (gethash (normalize-name sym) *runtime-special-names*) t)
+  (%note-runtime-special-entry (normalize-name sym) (symbol-name sym))
   sym)
 
 (defun %runtime-special-p (var)
@@ -1538,7 +1547,12 @@
   (and *mvm-eval-runtime-p*
        *runtime-special-names*
        (symbolp var)
-       (gethash (normalize-name var) *runtime-special-names*)))
+       ;; Confirm the NAME on a hash match: the hash is 29 bits, and a
+       ;; collision made a LET's own SAVE- gensym "special" -- its restore
+       ;; then read the gensym as a global (unbound on a worker thread).
+       (let ((e (gethash (normalize-name var) *runtime-special-names*)))
+         (or (eq e t)
+             (and e (member (symbol-name var) e :test #'string=) t)))))
 
 (defvar *build-special-symbols* nil
   "Build time: the SYMBOLS proclaimed special (EQ hash) -- every DEFVAR,
@@ -8835,7 +8849,7 @@
               (name-hash (normalize-name var-name)))
          (%note-global var-name :def)
          (setf (gethash name-hash *globals*) t)
-         (%note-runtime-special name-hash)
+         (%note-runtime-special name-hash (and (symbolp var-name) (symbol-name var-name)))
          (%note-build-special var-name)
          (when has-initform
            ;; %GLOBAL-NAME-KEY, not NAME-HASH: the STORE key must match what
@@ -30589,7 +30603,7 @@
        ;; Register as global variable
        (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
-       (%note-runtime-special name-hash)
+       (%note-runtime-special name-hash (and (symbolp name) (symbol-name name)))
        (%note-build-special name)
        ;; Compile as a thunk that initializes the variable
        ;; IMPORTANT: 1) Use raw name-hash (NOT pre-shifted), because
@@ -30637,7 +30651,7 @@
        ;; Register as global variable
        (%note-global name :def)
        (setf (gethash name-hash *globals*) t)
-       (%note-runtime-special name-hash)
+       (%note-runtime-special name-hash (and (symbolp name) (symbol-name name)))
        (%note-build-special name)
        (when has-initform
          (let ((tmp-var (%mvm-gensym "INIT-TMP"))

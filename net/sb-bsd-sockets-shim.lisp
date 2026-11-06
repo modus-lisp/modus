@@ -262,6 +262,28 @@
         (error 'sb-bsd-sockets:socket-error :errno (- n))
         n)))
 
+;;; NON-BLOCKING-MODE and its SETF, for a HOSTED image: O_NONBLOCK on the descriptor
+;;; (net/hosted-sockets-post.lisp's fcntl helpers).  The gateway sets it on its glass
+;;; socket and reads by readiness; without it the hosted image had no such function at
+;;; all.  net/bare-sockets.lisp, loaded after this on bare metal, replaces both with its
+;;; own descriptor table's flag.
+(defun %sbs-nonblocking-of (socket)
+  ;; fcntl(F_GETFL) through the image's baked syscall path: this file is evaluated at
+  ;; start-up, where an intrinsic SYSCALL does not return the kernel's answer
+  (let ((fl (funcall '%gc-safe-block-6 72 (%socket-fd socket) 3 0 0)))
+    (and (integerp fl) (>= fl 0) (/= 0 (logand fl 2048)))))
+(defun %sbs-set-nonblocking (value socket)
+  (if value
+      (funcall 'socket-set-nonblock (%socket-fd socket))
+      (funcall 'socket-set-block (%socket-fd socket)))
+  value)
+(setf (fdefinition (intern "NON-BLOCKING-MODE" "SB-BSD-SOCKETS")) (function %sbs-nonblocking-of))
+(setf (fdefinition (list 'setf (intern "NON-BLOCKING-MODE" "SB-BSD-SOCKETS"))) (function %sbs-set-nonblocking))
+;; ...and the legacy SET- name the compiler's SETF fallback emits for code compiled before
+;; the setf function existed (a FASL cached by an older image): (SET-NAME object value)
+(setf (fdefinition (intern "SET-NON-BLOCKING-MODE" "SB-BSD-SOCKETS"))
+      (lambda (socket value) (%sbs-set-nonblocking value socket)))
+
 (defun sb-bsd-sockets:socket-receive (socket buffer length &key oob peek waitall element-type)
   "One read(2) of up to LENGTH bytes (BUFFER's length when NIL) into BUFFER,
    or into a fresh (unsigned-byte 8) vector of LENGTH when BUFFER is NIL.
@@ -282,9 +304,9 @@
         (return-from sb-bsd-sockets:socket-receive (values buf n v port)))))
   (let* ((buf (or buffer (make-array length :element-type '(unsigned-byte 8))))
          (n (socket-recv (%socket-fd socket) buf (or length (length buf)))))
-    (if (< n 0)
-        (error 'sb-bsd-sockets:socket-error :errno (- n))
-        (values buf n nil))))
+    (cond ((= n -11) (values nil nil nil))   ; EAGAIN on a non-blocking socket: nothing yet, as SBCL
+          ((< n 0) (error 'sb-bsd-sockets:socket-error :errno (- n)))
+          (t (values buf n nil)))))
 
 (defun sb-bsd-sockets:socket-make-stream (socket &key input output
                                                       (element-type 'character)

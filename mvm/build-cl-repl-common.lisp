@@ -1062,6 +1062,12 @@
   ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
   (setf (mem-ref #x111F2000 :u32) 0)
   (%gc-write64 #x111F2008 0)
+  ;; ... and the I/O core's copy helpers' magic word (net/r8152.lisp R8152-META + 16).
+  ;; Its code page is this boot's to hand out again, so a magic the previous boot left
+  ;; made R8152-ENSURE-HELPERS trust a page now holding other code: after a warm reset
+  ;; the first received frame jumped into the thread layer's core-entry stub and the
+  ;; network core faulted (address 0 under QEMU, DRAM's fill pattern on a Zero).
+  (setf (mem-ref #x11404010 :u32) 0)
   ;; ... and net/bare-threads.lisp's (cacheable: the SMP mutexes need exclusives).
   (setf (mem-ref #x10300000 :u32) 0)
   (%gc-write64 #x10300008 0)

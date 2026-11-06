@@ -4592,6 +4592,46 @@
          (let ((n (symbol-name (car f))))
            (or (string= n "DEFMETHOD") (string= n "DEFGENERIC"))))))
 
+(defvar *mvm-loop-scan-budget* 0 "Conses %MVM-FORMS-LOOP-P may still look at.")
+
+(defun %mvm-loop-scan-args (l)
+  (let ((hit nil))
+    (do ((p l (cdr p))) ((or hit (atom p) (<= *mvm-loop-scan-budget* 0)) hit)
+      (setq hit (%mvm-loop-scan (car p))))))
+
+(defun %mvm-loop-scan (x)
+  "True when the code X runs a looping operator; see %MVM-FORMS-LOOP-P."
+  (when (and (consp x) (> *mvm-loop-scan-budget* 0))
+    (setq *mvm-loop-scan-budget* (- *mvm-loop-scan-budget* 1))
+    (let ((n (and (symbolp (car x)) (car x) (symbol-name (car x)))))
+      (cond ((null n) (or (%mvm-loop-scan (car x)) (%mvm-loop-scan-args (cdr x))))
+            ((member n '("DOTIMES" "DOLIST" "LOOP" "DO" "DO*" "TAGBODY" "PROG" "PROG*"
+                         "DO-SYMBOLS" "DO-EXTERNAL-SYMBOLS" "DO-ALL-SYMBOLS")
+                     :test (function string=))
+             t)
+            ;; only the body of FLET / LABELS / MACROLET runs now
+            ((member n '("FLET" "LABELS" "MACROLET") :test (function string=))
+             (and (consp (cdr x)) (%mvm-loop-scan-args (cddr x))))
+            ((member n '("QUOTE" "FUNCTION" "LAMBDA") :test (function string=)) nil)
+            (t (%mvm-loop-scan-args (cdr x)))))))
+
+(defun %mvm-forms-loop-p (forms)
+  "True when FORMS runs a loop NOW: a top-level form that is not a definition and
+   whose code (not its quoted data, nor the bodies of the lambdas it only makes)
+   holds a looping operator.  RETRY-ON-HOT interprets a form's first eval, and a
+   top-level loop has no second eval -- there is no on-stack replacement -- so a
+   (DOTIMES (I 3000000) ...) in a script ran interpreted to the end.  Such a form
+   is translated on its first eval, like a lambda-bearing one.  A DEF... form only
+   installs code, so it keeps RETRY-ON-HOT (a load's thousands of DEFUNs are why
+   RETRY-ON-HOT exists).  The walk stops after 4000 conses."
+  (let* ((f (if (and (consp forms) (null (cdr forms))) (car forms) forms))
+         (n (and (consp f) (symbolp (car f)) (car f) (symbol-name (car f)))))
+    (and n
+         (not (and (>= (length n) 3) (string= (subseq n 0 3) "DEF")))
+         (not (member n '("IN-PACKAGE" "DECLAIM" "PROCLAIM") :test (function string=)))
+         (progn (setq *mvm-loop-scan-budget* 4000)
+                (%mvm-loop-scan f)))))
+
 ;;; The second half of a fresh MVM-EVAL-FORMS: publish the module's toplevel
 ;;; DEFUNs (trampolines, JIT-EAGER registration), store it in the in-memory
 ;;; compile cache, and run it.  A function of its own so a module that did NOT
@@ -4740,7 +4780,8 @@
                   (if (and (%jit-active-p)
                            (or (not (%jit-hot-only-p))
                                %lam-bearing
-                               (%mvm-forms-define-methods-p forms)))
+                               (%mvm-forms-define-methods-p forms)
+                               (%mvm-forms-loop-p forms)))
                       (handler-case
                           (%mvm-eval-jit-run bc entry (reverse ft-list)
                                           fn-table rt-table lam-offsets nil

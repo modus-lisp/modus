@@ -8,13 +8,16 @@
 #                        [--form=FORM ...] [--probe=FORM --expect=TEXT]
 #
 #   --blob   another file QEMU places in guest RAM (fonts, data) for a --form to read
-#            with (ramv ADDR LEN); keep it clear of the tarballs at 0x1A000000 + 16 MB*k
+#            with (ramv ADDR LEN); keep it clear of the tarballs at TAR_BASE + 16 MB*k
 #   --form   evaluated after the installs, before the probe and the save, in order;
 #            (jit-eager) here makes the core NATIVE -- saved hot-only, it restores every
 #            DEFUN interpreted (hot = a form evaluated twice, never a function called often)
 #
-#   TARS=dir   tarballs <name>.tar (default tmp/tars); each is placed at 0x1A000000 + 16 MB * k (inside the 448 MB the image maps; the core may overwrite them after they are consumed)
-#              (the board never sees these)
+#   TARS=dir   tarballs <name>.tar (default tmp/tars); each is placed at TAR_BASE + 16 MB * k
+#   TAR_BASE   default 0x20000000: above the heap, which on QEMU's 1 GiB raspi3b reaches
+#              at most 0x20000000 (boot/boot-rpi-cl.lisp's memory map), and below
+#              0x30000000, the canonical code VA the boot aliases onto the image -- a
+#              tarball there reads back as the image (16 slots; checked below)
 #   GDBPORT    default 1234
 # The mini-UART is QEMU raspi3b's SECOND -serial; the first is wired to null.
 set -u
@@ -27,7 +30,9 @@ for a in "$@"; do case $a in --load=*) loads+=("${a#*=}");; --blob=*) blobs+=("$
 W=$(mktemp -d /tmp/modus-rpi-core.XXXXXX); SOCK=$W/uart.sock
 LOADERS=(); TARSPEC=(); k=0
 for n in "${loads[@]}"; do f=$(readlink -f "$TARS/$n.tar"); [ -s "$f" ] || { echo "FAIL: no tarball $TARS/$n.tar"; exit 1; }
-  addr=$((${TAR_BASE:-0x1A000000} + k*16777216)); LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n"); k=$((k+1)); done
+  addr=$((${TAR_BASE:-0x20000000} + k*16777216))
+  (( addr + $(stat -c %s "$f") <= 0x30000000 )) || { echo "FAIL: tarball $n at $(printf 0x%X $addr) reaches the 0x30000000 code window"; exit 1; }
+  LOADERS+=(-device "loader,file=$f,addr=$addr"); TARSPEC+=(--tar "$addr:$(stat -c %s "$f"):$n"); k=$((k+1)); done
 for b in "${blobs[@]}"; do f=$(readlink -f "${b%@*}"); [ -s "$f" ] || { echo "FAIL: no blob ${b%@*}"; exit 1; }
   LOADERS+=(-device "loader,file=$f,addr=${b##*@}"); done
 boot() { # extra qemu args...
@@ -56,8 +61,7 @@ trap '[ -n "${QP:-}" ] && kill $QP 2>/dev/null' EXIT
 echo "== phase 1: boot, install from RAM, save ($W)"
 # BASE_CORE=FILE: a SECOND STAGE -- phase 1 boots with that core restored (the driver takes
 # the REPL over its restart hook), so only the new tarballs and forms are installed, compiled
-# and JIT-translated before the save.  Put the tarballs clear of it with TAR_BASE (a core runs
-# past 0x1A000000; 0x24000000 is mapped and free).
+# and JIT-translated before the save.  The tarballs are clear of it at TAR_BASE.
 boot "${LOADERS[@]}" ${BASE_CORE:+-device loader,file=$(readlink -f "${BASE_CORE:-/dev/null}"),addr=0x18000000}
 python3 test/rpi-core-driver.py $SOCK --banner-wait 900 "${TARSPEC[@]}" "${forms[@]}" ${probe:+--probe "$probe"} --save | tee $W/phase1.txt | sed 's/^/   /'
 end=$(grep -a '^CORE-END=' $W/phase1.txt | tail -1 | cut -d= -f2)

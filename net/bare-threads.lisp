@@ -82,7 +82,15 @@
 
 (defvar *bt-region-size* nil)
 (defun %bt-region-size () (or *bt-region-size* #x800000))   ; 3 cores x 2 x 8 MB = 48 MB
+;; The core heaps.  The Pi overrides this with its memory map's thread arena
+;; (boot-rpi-cl.lisp +RPI-CL-THREAD-ARENA+, via build-cl-repl-common.lisp).
+(declaim (overridable %bt-arena))
 (defun %bt-arena () #x18000000)
+;; Where a saved core's magic word is, so starting threads can retire it (the core's
+;; RAM becomes ordinary memory once it is restored).  Where it was the arena's own
+;; address, the arena's first word; the Pi's core is not in its arena.
+(declaim (overridable %bt-core-addr))
+(defun %bt-core-addr () (%bt-arena))
 (defun %bt-guard (size) (min #x800000 (ash size -2)))       ; the trampoline's own rule
 
 ;; The closures threads are started with, by record: a GLOBAL, so a region-0
@@ -370,7 +378,7 @@
         (dotimes (k 16) (%gc-write64 (+ #x10640000 (* k 8)) 0))
         (setf (mem-ref #x10080010 :u64) 0)            ; core 0 is CPU 0
         (setf (mem-ref #x10000FF8 :u32) 1)            ; per-CPU region cells on
-        (%gc-write64 (%bt-arena) 0)                   ; a saved core's magic: ours now
+        (%gc-write64 (%bt-core-addr) 0)               ; a saved core's magic: ours now
         (setq *bt-funs* (make-array (%bt-nrecs)))
         (%bt-stub-install)
         (%gc-write64 #x10000DA8 (%bt-page))
@@ -894,10 +902,11 @@
                  (- (+ (%gc-meta-read r0 k) (- (%gc-meta-read (+ r0 #x10) k) (+ n #x200000)))
                     #x800000))
           (%gc-collect-here))
-        ;; THE TOP 2 MB OF EACH SEMISPACE IS LEFT OUT: the board's *CSTR-SCRATCH* and
-        ;; *IO-BUF-ADDR* live at 0x0FE00000..0x10000000, the top of the UPPER semispace
-        ;; (inside its old 8 MB limit guard), and an arena carved there when the upper
-        ;; one is the from-space would hand the I/O staging pages out as objects.
+        ;; THE TOP 2 MB OF EACH SEMISPACE IS LEFT OUT: QEMU virt's *CSTR-SCRATCH* and
+        ;; *IO-BUF-ADDR* live at 0x0FE00000..0x10000000, the top of its UPPER semispace,
+        ;; and an arena carved there when the upper one is the from-space would hand the
+        ;; I/O staging pages out as objects.  (The Pi's pages are outside its heap since
+        ;; boot-rpi-cl.lisp's memory map moved it; the 2 MB is merely unused there.)
         (let* ((from (%gc-meta-read r0 k))
                (size (%gc-meta-read (+ r0 #x10) k))
                (newsize (- size (+ n #x200000)))

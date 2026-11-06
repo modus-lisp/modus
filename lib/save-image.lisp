@@ -144,6 +144,13 @@
    A carve (above) shrinks region 0, so the saved size may be smaller than a
    fresh boot's; the arch that carves overrides this and %CORE-ADOPT-GEOMETRY."
   (= saved-size (%core-space-size)))
+(declaim (overridable %core-heap-fits-p))
+(defun %core-heap-fits-p (from used)
+  "True when a saved heap of USED bytes at FROM can be read into this process's
+   region 0.  The Raspberry Pi's, whose heap is sized from the board's RAM so that
+   a core saved under QEMU may meet a smaller one, also keeps it off the core's own
+   RAM, which the restore is still reading (build-cl-repl-common.lisp)."
+  (<= used (%core-space-size)))
 (declaim (overridable %core-adopt-geometry))
 (defun %core-adopt-geometry (saved-size)
   "Make region 0 the size it had when saved.  Runs after the heap is in and
@@ -227,12 +234,14 @@
           (return (car probe)))))))
 
 (defun %gc-force-to-space-0 ()
-  "Collect until the live data sits in the FIRST semispace (from_start equals
-   the bitmap page_base), the space a fresh boot stub sets the registers up
-   for -- so a restored process needs no relocation and no limit change.
-   Returns from_start."
+  "Collect until the live data sits in the FIRST semispace -- the LOWER of the
+   two, the space a fresh boot stub sets the registers up for -- so a restored
+   process needs no relocation and no limit change.  Returns from_start.
+   (It used to compare with the bitmap page_base, which is the lower semispace
+   only when the bitmaps start at the heap; the Pi's start below it, at its JIT
+   arena, and there the test never matched.)"
   (%gc-force)
-  (when (/= (%core-from-start) (%core-page-base))
+  (when (> (%core-from-start) (%core-to-start))
     (%gc-force))
   (%core-from-start))
 
@@ -413,6 +422,8 @@
           (dlo (mem-ref (+ hdr 104) :u64))
           (xaddr (mem-ref (+ hdr 112) :u64))
           (xlen (mem-ref (+ hdr 120) :u64)))
+      (unless (%core-heap-fits-p from (- free sfrom))
+        (%core-die "core: the saved heap does not fit this process's heap"))
       (when (and (> abump 0)
                  (or (= (%core-jit-arena-bump) 0) (/= (+ alo d) (%core-jit-arena-lo))))
         (%core-die "core: snapshot has JIT pages but this process has no matching exec arena"))

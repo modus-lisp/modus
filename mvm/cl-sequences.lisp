@@ -4870,11 +4870,20 @@
                        (new-cap (max (+ cap hint) (+ fp 1) (* cap 2)))
                        (str-p (or (stringp arr)
                                   (and disp (stringp disp))))
-                       (new-arr (if str-p
-                                    (%make-string-array new-cap)
-                                    (make-array new-cap))))
+                       ;; an octet store grows into an octet store: as a general vector it
+                       ;; costs a word a byte (a 2.4 MB HTTP body became 19 MB and exhausted
+                       ;; a Pi Zero desk's heap).  Only octets: the copy below and the store
+                       ;; after it are ASET, which writes a packed float store's raw word.
+                       (new-arr (cond (str-p (%make-string-array new-cap))
+                                      ((%prim-u8-vector-p arr)
+                                       (make-array new-cap :element-type '(unsigned-byte 8)))
+                                      (t (make-array new-cap)))))
                   ;; Copy old visible contents (0..cap from old aref-routing)
                   ;; through the MDA's current view so displacement is honored.
+                  (cond
+                    ((and (null disp) (%prim-u8-vector-p arr) (%prim-u8-vector-p new-arr))
+                     (replace new-arr arr :end1 cap :end2 cap))
+                    (t
                   (if (and (null disp)
                            (or (and (%prim-stringp arr) (%prim-stringp new-arr))
                                (and (%prim-simple-vector-p arr)
@@ -4894,7 +4903,7 @@
                                      (disp (aref arr (+ off i)))
                                      (t (aref arr i)))))
                             (aset new-arr i v))
-                          (setq i (+ i 1)))))
+                          (setq i (+ i 1)))))))
                   ;; Update MDA: data ← new-arr, displaced ← nil, offset ← 0,
                   ;; dims ← (new-cap).  Adjusting dims keeps array-total-size
                   ;; honest after the grow.
@@ -4928,7 +4937,9 @@
                          (new-arr nil))
                     (if (stringp arr)
                         (setq new-arr (%make-string-array new-len))
-                        (setq new-arr (make-array new-len)))
+                        (setq new-arr (if (%prim-u8-vector-p arr)
+                                          (make-array new-len :element-type '(unsigned-byte 8))
+                                          (make-array new-len))))
                     (let ((i 0))
                       (loop
                         (when (>= i len) (return))

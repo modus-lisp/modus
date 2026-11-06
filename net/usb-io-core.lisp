@@ -297,6 +297,18 @@
         (usbe-rx-push (+ agg off 24) plen)
         (setq off (logand (+ off 24 plen 4 7) (lognot 7)))))))
 
+(defun usbe-rx-take (nic)
+  "Copy channel 1's finished transfer into the RX ring (it is not re-armed here)."
+  (usbe-inc #x18)
+  (if (= nic 2)
+      (let ((n (- (modus.net.r8152:r8152-agg-size)
+                  (logand (dwc2-read (dwc2-hctsiz 1)) #x7FFFF))))
+        (modus.net.r8152:r8152-dcache-civac (modus.net.r8152:r8152-agg-buf) n)
+        (usbe-rx-walk n))
+      (let ((n (- 2048 (logand (dwc2-read (dwc2-hctsiz 1)) #x7FFFF))))
+        (when (and (> n 13) (< n 1600))
+          (usbe-rx-push (modus.net.cdc:cdc-rx-buf-addr) n)))))
+
 (defun usbe-rx-service ()
   "1 if channel 1 had finished (its frames are in the ring, it is re-armed), else 0."
   (let ((nic (usbe-nic)))
@@ -305,15 +317,7 @@
         (let ((r (dwc2-poll-bulk-in 1)))
           (cond ((zerop r) 0)
                 ((= r 1)
-                 (usbe-inc #x18)
-                 (if (= nic 2)
-                     (let ((n (- (modus.net.r8152:r8152-agg-size)
-                                 (logand (dwc2-read (dwc2-hctsiz 1)) #x7FFFF))))
-                       (modus.net.r8152:r8152-dcache-civac (modus.net.r8152:r8152-agg-buf) n)
-                       (usbe-rx-walk n))
-                     (let ((n (- 2048 (logand (dwc2-read (dwc2-hctsiz 1)) #x7FFFF))))
-                       (when (and (> n 13) (< n 1600))
-                         (usbe-rx-push (modus.net.cdc:cdc-rx-buf-addr) n))))
+                 (usbe-rx-take nic)
                  (usbe-rx-arm)
                  1)
                 (t (usbe-inc #x24)
@@ -378,7 +382,7 @@
 ;;;   +0x104 device (0 keyboard, 1 mouse)   +0x108 microframe the wait started in
 ;;;   +0x10C CSPLIT tries   +0x110 errors   +0x114 issue time (counter >> 10)
 ;;;   +0x118 reports  +0x11C NAKs (nothing new)  +0x120 failed transactions
-;;;   +0x124 SOF wakes
+;;;   +0x124 SOF wakes  +0x130 receive transfers that finished as a HID round halted them
 ;;; The keyboard and the mouse take turns on channel 6; a round of both every 8 ms.
 
 (defun %usbe-sof-on (on)
@@ -396,10 +400,22 @@
 ;;; transaction, then the mouse's, a few microframes each every 8 ms -- runs with the receive
 ;;; halted: what has arrived is taken first, and the channel is re-armed when the round
 ;;; ends.  The adapter buffers what arrives meanwhile.  +0x12C: 1 while paused.
+;;;
+;;; THE HALT CAN LOSE A TRANSFER.  One that finishes between the service and the halt
+;;; leaves XFERCOMPL, its data in the buffer and its toggle advanced -- and the halt used
+;;; to clear the first and the re-arm overwrite the second and reuse the old toggle.  So
+;;; the halt reports what it found: a finished transfer is taken here, and the toggle
+;;; HCTSIZ ended with is kept either way.  Measured under QEMU, whose usb-net holds ONE
+;;; frame: the second of every back-to-back pair went this way, each loss a TCP timeout
+;;; (a 191 KB HTTPS GET ran past 20 minutes).  +0x130 counts transfers taken here.
 (defun usbe-rx-pause ()
   (when (and (zerop (usbe-get #x12C)) (not (zerop (usbe-nic))))
     (usbe-rx-service)
-    (dwc2-halt-channel 1)
+    (let ((hcint (dwc2-halt-channel-hcint 1)))
+      (usb-set-bulk-in-toggle (logand (ash (dwc2-read (dwc2-hctsiz 1)) -29) 3))
+      (unless (zerop (logand hcint (hcint-xfercompl)))
+        (usbe-inc #x130)
+        (usbe-rx-take (usbe-nic))))
     (usbe-put #x12C 1)))
 
 (defun usbe-rx-resume ()
@@ -857,7 +873,7 @@
       (list :running (usbe-running-p) :state (usbe-get 4) :core (usbe-get #xC)
             :passes (usbe-get #x10) :sleeps (usbe-get #x14)
             :rx-transfers (usbe-get #x18) :rx-frames (usbe-get #x1C)
-            :rx-dropped (usbe-get #x20) :rx-errors (usbe-get #x24)
+            :rx-dropped (usbe-get #x20) :rx-errors (usbe-get #x24) :rx-taken-at-pause (usbe-get #x130)
             :tx-frames (usbe-get #x28) :tx-errors (usbe-get #x2C) :tx-full (usbe-get #x30)
             :hid-polls (usbe-get #x34) :scans (usbe-get #x38) :port-events (usbe-get #x3C)
             :hprt0 (usbe-get #x40) :allocating-passes (usbe-get #x48)

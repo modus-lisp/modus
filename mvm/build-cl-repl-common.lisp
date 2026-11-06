@@ -244,9 +244,9 @@
 
 ;;; Runtime JIT: ON (flipped 2026-08-24).  The mmap obstacle is gone:
 ;;; translate-aarch64's trap #x0531 now has a BARE-METAL branch that
-;;; bump-allocates exec pages from the reserved region [0x14000000,
-;;; 0x18000000) (Normal-WB, no PXN — already executable; bump word at
-;;; 0x13FFFFF0 with a range-check init because real DRAM is not zeroed),
+;;; bump-allocates exec pages from the reserved region [0x09000000,
+;;; 0x0D000000) (Normal-WB, no PXN — already executable; bump word at
+;;; 0x08FFFFF0 with a range-check init because real DRAM is not zeroed),
 ;;; and #x0534 (munmap) is a bare-metal no-op.  Traps #x0532 (BLR) and
 ;;; #x0533 (DC CVAU / IC IVAU / ISB) were always pure-CPU and work as-is.
 ;;; This image inherits build-cli-common's ARCH-DISPATCHED aarch64
@@ -457,6 +457,43 @@
 (declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
 (defun %kmsg-region () (values #x110A0000 #x60000))
+;; THE HEAP'S SIZE COMES FROM THE BOARD (boot-rpi-cl.lisp's memory map): region 0 runs
+;; from 0x12000000 to 4 MB below the top of the ARM's RAM, as the VideoCore reports it
+;; -- 448 MiB on a Zero at the firmware's default gpu_mem=64, 480 at gpu_mem=32, 960 MiB
+;; on a 1 GB Pi 3B or QEMU raspi3b -- capped at 0x20000000, where the GC bitmaps' cover
+;; ends.  Kernel-main asks before the heap is published, so both run with no heap:
+;; raw stores and fixnum arithmetic only, and bounded waits, because a mailbox that does
+;; not answer must cost a boot nothing worse than the smallest board's heap.
+(defun %rpi-arm-ram-top ()
+  \"The top of the ARM's RAM from the VideoCore property mailbox (GET_ARM_MEMORY,
+   tag 0x00010005): base + size, or 0 when the firmware does not answer.\"
+  (let ((b #x111F0000) (mbox #x3F00B880) (i 0))
+    (setf (mem-ref b :u32) 32)                     ; buffer size
+    (setf (mem-ref (+ b 4) :u32) 0)                ; a request
+    (setf (mem-ref (+ b 8) :u32) #x10005)          ; GET_ARM_MEMORY
+    (setf (mem-ref (+ b 12) :u32) 8)               ; value buffer: base, size
+    (setf (mem-ref (+ b 16) :u32) 0)
+    (setf (mem-ref (+ b 20) :u32) 0)
+    (setf (mem-ref (+ b 24) :u32) 0)
+    (setf (mem-ref (+ b 28) :u32) 0)               ; end tag
+    (loop (when (or (> i 1000000)
+                    (zerop (logand (mem-ref (+ mbox #x38) :u32) #x80000000)))
+            (return nil))
+          (setq i (+ i 1)))
+    (setf (mem-ref (+ mbox #x20) :u32) (logior #xC0000000 b 8))   ; channel 8, bus alias
+    (setq i 0)
+    (loop (when (> i 1000000) (return 0))
+          (when (zerop (logand (mem-ref (+ mbox #x18) :u32) #x40000000))
+            (mem-ref mbox :u32)                    ; take the answer off the queue
+            (return (if (= (mem-ref (+ b 4) :u32) #x80000000)
+                        (+ (mem-ref (+ b 20) :u32) (mem-ref (+ b 24) :u32))
+                        0)))
+          (setq i (+ i 1)))))
+(defun %rpi-heap-end (top)
+  \"Where region 0 ends on a board whose ARM RAM ends at TOP: 4 MB below it, capped at
+   0x20000000, a multiple of 4 MB, and never below the smallest board's 0x1BC00000.\"
+  (let ((e (- (min top #x20000000) #x400000)))
+    (max #x1BC00000 (* #x400000 (floor e #x400000)))))
 "
         "")
     ;; SMP (MODUS_RPI_THREADS=1): threads on the secondary cores, replacing the above
@@ -467,7 +504,15 @@
         (concatenate 'string
           (mvm-text "net/bare-threads.lisp")
           ;; QEMU virt: EL1 and PSCI CPU_ON instead of EL2 and the spin table.
-          (if *cl-repl-virt-p* (mvm-text "net/bare-threads-virt.lisp") ""))
+          (if *cl-repl-virt-p* (mvm-text "net/bare-threads-virt.lisp") "")
+          ;; The Pi: its memory map puts the thread heaps below region 0
+          ;; (boot-rpi-cl.lisp), and its saved core is not in the arena.
+          (if *cl-repl-rpi-p*
+              "
+(defun %bt-arena () #x0D000000)
+(defun %bt-core-addr () (%core-addr))
+"
+              ""))
         "")
     ;; The PC console (x86-64): after serial-repl, whose console seams it
     ;; replaces by last-defun-wins.
@@ -508,20 +553,21 @@
 ;; Both bases are published with the SAME convention gc.lisp's readers expect:
 ;; (setf (mem-ref .. :u64)) stores value<<1 and %gc-bitmap-base et al read it
 ;; back through the matching halving, exactly as the hosted path does — do NOT
-;; \"helpfully\" pre-shift these.  page_base is from_start (the lowest object
-;; address), matching %gc-bitmap-init.
+;; \"helpfully\" pre-shift these.  page_base is the lowest address the maps cover:
+;; PAGE-BASE when given (the Pi's maps start at its JIT arena, below the thread heaps
+;; and region 0), else from_start, matching %gc-bitmap-init.
 ;;
 ;; NON-ALLOCATING by construction: raw mem-ref stores and fixnum arithmetic
 ;; only.  It runs before init-symbol-table, so there is no heap to allocate
 ;; from yet, and a bignum here would fault rather than collect.
-(defun %rpi-gc-bitmap-init (obj-base cons-base nbytes)
+(defun %rpi-gc-bitmap-init (obj-base cons-base nbytes &optional page-base)
   (let ((i 0))
     (loop
       (when (>= i nbytes) (return nil))
       (setf (mem-ref (+ obj-base i) :u64) 0)
       (setf (mem-ref (+ cons-base i) :u64) 0)
       (setq i (+ i 8))))
-  (setf (mem-ref #x10000E00 :u64) (%gc-from-start))
+  (setf (mem-ref #x10000E00 :u64) (or page-base (%gc-from-start)))
   (setf (mem-ref #x10000E18 :u64) obj-base)
   (setf (mem-ref #x10000E40 :u64) cons-base)
   nil)
@@ -572,6 +618,17 @@
 (defvar *core-restart-hook* nil)
 (declaim (overridable %core-addr))
 (defun %core-addr () #x18000000)
+;; A core may come from a board with more RAM, or from QEMU's 1 GiB raspi3b: region 0
+;; is sized from the RAM (%RPI-HEAP-END), so any semispace size restores as long as the
+;; saved heap fits this one, leaves the collector's guard, and ends below the core's
+;; own RAM, which the restore is still reading while it fills the heap.
+(defun %core-geometry-ok-p (saved-size) (and saved-size t))
+(defun %core-heap-fits-p (from used)
+  (and (<= used (- (%core-space-size) #x100000))
+       (<= (+ from used) (%core-addr))))
+;; The board region of boot-rpi-cl.lisp's memory map: (values BASE BYTES), RAM that
+;; modus leaves alone for the board's own use (kiln keeps its RAM cabinet there).
+(defun %rpi-board-ram () (values #x03200000 #x02000000))
 ;; NARROW STRINGS ON (prelude.lisp %NARROW-STRINGS-P): the aarch64 collector
 ;; sizes #x13 as bytes, so the reader makes them.  Last definition wins.
 (defun %narrow-strings-p () t)
@@ -594,7 +651,9 @@
     (write-char-serial 10)
     (setf (mem-ref #x111F1F00 :u32) 0)
     ;; A SPLIT CORE (U-Boot netboot): U-Boot sits at the top of RAM while it loads,
-    ;; so only [0x18000000, ~0x1CB00000) is free for the core there.  The loader
+    ;; so only [0x18000000, ~0x1CB00000) is free for the core there.  The spill address
+    ;; must be outside the heap's LOWER semispace (boot-rpi-cl.lisp's memory map),
+    ;; which the restore fills while it reads the core.  The loader
     ;; then puts the file's tail at a SPILL address and leaves a descriptor at
     ;; 0x111F1F10: 'SPLT', the slot end, the spill address.  Taken here into
     ;; 0x111F1F20/24 for %CORE-READ-ALL and cleared, so a descriptor surviving a
@@ -1037,11 +1096,19 @@
   ;; x24/x25, so kernel-main has to publish the semispace metadata itself
   ;; (same call the QEMU-virt bare image makes).  Heap is 112 MB split into two
   ;; 56-MB semispaces: from-start 0x09000000, to-start 0x0C800000.
-  ;; boot-rpi-cl.lisp sets x25 = 0x0C800000 so the first overflow trips the GC
+  ;; boot-rpi-cl.lisp sets x25 = the midpoint so the first overflow trips the GC
   ;; trampoline rather than running off the end of the from-space.  The third
   ;; argument is the conservative stack scan base — keep it equal to the boot
-  ;; SP (+rpi-cl-stack-top+).
-  (%gc-init #x09000000 #x07000000 #x08000000)
+  ;; SP (+rpi-cl-stack-top+).  The geometry is boot-rpi-cl.lisp's memory map
+  ;; (+rpi-cl-heap-base+ .. +rpi-cl-heap-end+); %RPI-MEMORY-MAP-ASSERTS checks
+  ;; that these literals agree with it.
+  ;; The size is the board's (%RPI-HEAP-END).  The stub set the allocation limit for the
+  ;; smallest board's midpoint, which is below this one, so raise it the same guard short
+  ;; of the new midpoint.  Nothing has allocated yet.
+  (let* ((top (%rpi-arm-ram-top))
+         (size (- (%rpi-heap-end top) #x12000000)))
+    (%gc-init #x12000000 size #x08000000)
+    (set-alloc-limit (- (+ #x12000000 (ash size -1)) #x100000)))
 
   ;; #160 OBJECT-START + CONS-KIND BITMAPS, bare-metal flavour.
   ;;
@@ -1055,10 +1122,11 @@
   ;; copying past 0x10000000 onto the GC metadata at 0x10000040, i.e. the
   ;; collector overwriting its own saved_rsp (tell: phase trace 12345 -> 1S2345).
   ;;
-  ;; Fixed RAM instead of mmap.  1 bit / 16-byte granule over the 112 MB heap =
-  ;; 0x07000000/128 = 0xE0000 bytes (896 KB) per bitmap.  Placed at 80 MB
-  ;; (0x05000000 / 0x05100000), which clears the image and sits well below the
-  ;; stack top; both bounds are asserted at build time.  MUST run before the
+  ;; Fixed RAM instead of mmap.  1 bit / 16-byte granule over everything a heap
+  ;; object may live in -- the JIT arena, the thread heaps and region 0, i.e.
+  ;; 0x09000000 .. 0x20000000 -- = 0x17000000/128 = 0x2E0000 bytes per bitmap, at
+  ;; 0x08000000 / 0x08400000: above the main stack top, below the JIT arena.  Both
+  ;; bounds are asserted at build time.  MUST run before the
   ;; first allocation (init-symbol-table, just below) so every mutator alloc
   ;; records its start bit, and after %gc-init because page_base is read from
   ;; from_start.
@@ -1069,7 +1137,14 @@
   ;; FIRST the firmware's device tree is moved out of their way (lib/fdt.lisp
   ;; %FDT-KEEP): QEMU puts it where the threaded build's bitmaps go.
   (%fdt-keep)
-  (%rpi-gc-bitmap-init #x05000000 #x05100000 #xE0000)
+  (%rpi-gc-bitmap-init #x08000000 #x08400000 #x2E0000 #x09000000)
+  ;; What the board gave region 0 (allocating is legal from here on).
+  (write-string-serial \"HEAP=2x\")
+  (print-dec (ash (%gc-space-size) -20))
+  (write-string-serial \"MB RAM=\")
+  (print-dec (ash (%rpi-arm-ram-top) -20))
+  (write-string-serial \"MB\")
+  (write-char-serial 10)
 
   ;; NOTE: no (setup-irq) / (nic-irq-unmask) here.  Those program a GICv2,
   ;; which a BCM2837 does not have (it uses the BCM interrupt controller), and
@@ -1097,23 +1172,14 @@
 ;;; happens at a point where a fault would be attributable, rather than inside
 ;;; an installer's handler-case.  Wrapped, because a diagnostic must never be
 ;;; the thing that stops a boot.
-;; SMP (MODUS_RPI_THREADS=1): the per-core thread heaps live at 0x18000000..0x1B000000
-;; (net/bare-threads.lisp), above region 0, and the collector rejects any root whose
-;; granule has no start bit -- so the two bitmaps must cover page_base (0x09000000) up to
-;; 0x1B000000: 0x240000 bytes each, at 0x08000000 / 0x08400000 (free RAM between the main
-;; stack top and the heap; the restore header sits at 0x08FFFF00).
+;; SMP (MODUS_RPI_THREADS=1): the per-core thread heaps live at 0x0D000000..0x10000000
+;; (net/bare-threads.lisp), below region 0.  The collector rejects any root whose granule
+;; has no start bit, and the Pi's bitmaps cover everything a heap object may live in --
+;; page_base 0x09000000 up to 0x20000000 -- for every Pi build, threaded or not.
 (defvar cl-user::*rpi-threads-p*
   (and (or *cl-repl-rpi-p* *cl-repl-virt-p*)
        (let ((v (sb-ext:posix-getenv "MODUS_RPI_THREADS")))
          (and v (> (length v) 0) (string/= v "0")))))
-(when cl-user::*rpi-threads-p*
-  (let* ((old "(%rpi-gc-bitmap-init #x05000000 #x05100000 #xE0000)")
-         (new "(%rpi-gc-bitmap-init #x08000000 #x08400000 #x240000)")
-         (at (search old *cli-arch-kernel-prologue*)))
-    (unless at (error "SMP: the Pi bitmap call moved; update build-cl-repl-common"))
-    (setq *cli-arch-kernel-prologue*
-          (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 at) new
-                       (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
 ;; ... and DRAM is not zero at reset (a cold Zero reads 0x55555555): the threads layer's
 ;; control words outside the window must start at zero, BEFORE a core restore -- the
 ;; thread table (its "cores are up" word made %BT-INIT skip starting them, so the desk
@@ -1144,7 +1210,7 @@
          (new "  (%gc-write64 #x10005058 0)
   (let ((a #x10213000)) (loop (when (>= a #x10214000) (return nil)) (setf (mem-ref a :u64) 0) (setq a (+ a 8))))
   (let ((a #x10300000)) (loop (when (>= a #x10380000) (return nil)) (setf (mem-ref a :u64) 0) (setq a (+ a 8))))
-  (setf (mem-ref #x13FFFFF0 :u64) 0)"))
+  (setf (mem-ref #x08FFFFF0 :u64) 0)"))
     (unless at (error "SMP: the prologue's guard-marker line moved; update build-cl-repl-common"))
     (setq *cli-arch-kernel-prologue*
           (concatenate 'string (subseq *cli-arch-kernel-prologue* 0 at) new
@@ -1213,6 +1279,17 @@
                   ("-4611686018427387904" . "-536870912"))))
     (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
       (unless at (error "32-bit: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+      (setq *cli-arch-io-scratch-source*
+            (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
+                         (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
+
+;;; :RPI: the two scratch pages were at the top of the old heap; boot-rpi-cl.lisp's
+;;; memory map puts the thread heaps there now, and the pages in the free RAM above
+;;; the runtime window, beside the scheduler block and the SSH state.
+(when *cl-repl-rpi-p*
+  (dolist (pair '(("#x0FE00000" . "#x10C00000") ("#x0FF00000" . "#x10D00000")))
+    (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
+      (unless at (error "rpi: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
       (setq *cli-arch-io-scratch-source*
             (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
                          (subseq *cli-arch-io-scratch-source* (+ at (length (car pair)))))))))
@@ -1471,28 +1548,34 @@
 ")
     (t
       "
-(defun percpu-data-base ()   #x12000000)
-(defun sched-lock-addr ()    #x12000200)
-(defun actor-table-base ()   #x12010000)
-(defun sched-state-base ()   #x12012000)
-(defun scratch-addr ()       #x12012050)
-(defun decode-ptr-addr ()    #x12012058)
-(defun actor-stack-base ()   #x12020000)
-(defun mailbox-pool-base ()  #x12420000)
-(defun mailbox-pool-limit () #x12440000)
-(defun pool-state-base ()    #x12440000)
-(defun staging-base-addr ()  #x12500000)
-(defun actor-heap-base ()    #x16000000)
+;; The scheduler block, in the free RAM above the runtime window (boot-rpi-cl.lisp's
+;; memory map): SSH-BOOT's SMP-INIT / ACTOR-INIT / POOL-INIT write the per-CPU words,
+;; the 8 KB actor table, the scheduler state and the 128 KB mailbox pool.  Nothing on
+;; this board spawns an actor (sessions are bare-threads), so actor stacks, staging
+;; and actor heaps are never touched; they get addresses inside the block, not RAM.
+(defun percpu-data-base ()   #x10900000)
+(defun sched-lock-addr ()    #x10900200)
+(defun actor-table-base ()   #x10910000)
+(defun sched-state-base ()   #x10912000)
+(defun scratch-addr ()       #x10912050)
+(defun decode-ptr-addr ()    #x10912058)
+(defun actor-stack-base ()   #x10920000)
+(defun mailbox-pool-base ()  #x10940000)
+(defun mailbox-pool-limit () #x10960000)
+(defun pool-state-base ()    #x10960000)
+(defun staging-base-addr ()  #x10980000)
+(defun actor-heap-base ()    #x109C0000)
 ;; SSH CPU-side scratch MUST be Normal-WB, not the Device USB-DMA window: the
 ;; SSH stack does UNALIGNED u32 stores into e1000-state (ssh-init-strings @
 ;; +0x1000, crypto @ +0x680) and ssh-ipc, which Device-nGnRnE memory faults
 ;; (ESR alignment). arch-rpi-cl puts these at 0x1106/8/11_0000 (inside the 2 MB
-;; Device block). Relocate to Normal-WB 0x1300_0000; the DMA buffers
+;; Device block). Relocate to Normal-WB RAM; the DMA buffers
 ;; (usb-dma/e1000-rx/tx-buf/desc, cdc-rx = e1000-rx-buf-base) STAY in the Device
-;; window — they are separate addresses and not referenced off e1000-state.
-(defun e1000-state-base ()   #x13000000)
-(defun ssh-conn-base ()      #x13010000)
-(defun ssh-ipc-base ()       #x13100000)
+;; window — they are separate addresses and not referenced off e1000-state.  Above
+;; the runtime window with the scheduler block (boot-rpi-cl.lisp's memory map).
+(defun e1000-state-base ()   #x10A00000)
+(defun ssh-conn-base ()      #x10A10000)
+(defun ssh-ipc-base ()       #x10B00000)
 ")))
 
 ;; SSH transport: address map + actor scheduler + net-actor + SSH server.
@@ -3385,97 +3468,139 @@
 ;;;   1. image end reaching the stack region  -> pushes shred native code
 ;;;      (this is precisely what boot-rpi.lisp's 0x00200000 stack top does
 ;;;      to any CL-sized image, task #47's failure class)
-;;;   2. image end reaching the heap base     -> allocation over code
-;;;   3. heap end reaching the peripherals    -> DMA/MMIO aliasing
+;;;   2. image end reaching what lies above it -> stacks / tables over code
+;;;   3. a region of boot-rpi-cl.lisp's MEMORY MAP overlapping another, or the
+;;;      heap running past the RAM of the smallest board
+;;; and one way the map silently disagrees with itself: the image text spells its
+;;; geometry as LITERALS (%GC-INIT, the bitmap call, the thread and JIT arenas), so
+;;; each literal is looked for in the assembled source, computed from the map's
+;;; constants.
 (defun %rpi-memory-map-asserts (image)
+  (flet ((c (name) (symbol-value (find-symbol name :modus.mvm)))
+         (must-say (form why)
+           (unless (search form cl-user::*full-source*)
+             (error "BUILD-TIME ASSERT: the image source does not say ~A -- ~A.  ~
+                     Keep it in step with boot-rpi-cl.lisp's memory map." form why))))
     (let* ((image-bytes (length (kernel-image-image-bytes image)))
            (image-va-start #x80000)
            (image-va-end   (+ image-va-start image-bytes))
-           (stack-top      (symbol-value '+rpi-cl-stack-top+))
+           (stack-top      (c "+RPI-CL-STACK-TOP+"))
            (stack-headroom (* 8 1024 1024))
            (stack-va-lo    (- stack-top stack-headroom))
-           (heap-base      (symbol-value '+rpi-cl-heap-base+))
-           (heap-end       (symbol-value '+rpi-cl-heap-end+))
+           (low-tables     #x05200000)  ; thread stacks, then the L3 tables at 0x06000000
+           (board-lo       (c "+RPI-CL-BOARD-LO+"))
+           (board-hi       (c "+RPI-CL-BOARD-HI+"))
+           (bm-obj         (c "+RPI-CL-BITMAP-OBJ+"))
+           (bm-cons        (c "+RPI-CL-BITMAP-CONS+"))
+           (bm-base        (c "+RPI-CL-BITMAP-BASE+"))
+           (bm-end         (c "+RPI-CL-BITMAP-END+"))
+           (bm-bytes       (floor (- bm-end bm-base) 128))
+           (jit-lo         (c "+RPI-CL-JIT-LO+"))
+           (jit-hi         (c "+RPI-CL-JIT-HI+"))
+           (jit-bump       (modus.mvm::%jit-exec-bump))
+           (arena          (c "+RPI-CL-THREAD-ARENA+"))
+           (arena-end      (+ arena (* 3 2 #x800000)))   ; bare-threads: 3 cores x 2 x 8 MB
+           (window         #x10000000)
+           (high-small-hi  #x10E00000)  ; scheduler block, SSH state, scratch pages
+           (net-lo         #x11000000)
+           (net-hi         #x12000000)  ; the Device window, NIC/USB rings, the I/O core
+           (heap-base      (c "+RPI-CL-HEAP-BASE+"))
+           (heap-mid       (c "+RPI-CL-HEAP-MID+"))
+           (heap-end       (c "+RPI-CL-HEAP-END+"))
+           (core-addr      #x18000000)
+           ;; THE SMALLEST BOARD this image must run on: a Pi Zero 2 W at the
+           ;; firmware's default gpu_mem=64, whose ARM sees 448 MiB (U-Boot prints
+           ;; "DRAM: 448 MiB").  QEMU raspi3b models a 1 GiB Pi 3B, so anything
+           ;; between 448 MiB and 1 GiB passes every emulated test and addresses a
+           ;; hole on the real target.
+           (min-board-ram  #x1C000000)
            (periph-base    #x3F000000))
       (when (>= image-va-end stack-va-lo)
         (error "BUILD-TIME ASSERT: image [~X..~X] (~,1F MB) reaches the stack ~
                 region [~X..~X].  Stack pushes would overwrite native code."
                image-va-start image-va-end (/ image-bytes 1024.0 1024.0)
                stack-va-lo stack-top))
-      (when (>= image-va-end heap-base)
-        (error "BUILD-TIME ASSERT: image end ~X reached the heap base ~X."
-               image-va-end heap-base))
-      ;; #160 bitmaps live at 0x05000000 / 0x05100000, 0xE0000 bytes each
-      ;; (1 bit / 16-byte granule over the 112 MB heap).  They must clear the
-      ;; image below and the stack above; both are checked here rather than
-      ;; discovered as heap corruption at runtime.  Keep in step with the
-      ;; %rpi-gc-bitmap-init call in kernel-main.
-      (let* ((objmap-lo  (if cl-user::*rpi-threads-p* #x08000000 #x05000000))
-             (consmap-lo (if cl-user::*rpi-threads-p* #x08400000 #x05100000))
-             (map-bytes  (if cl-user::*rpi-threads-p* #x240000 #xE0000))
-             (maps-hi    (+ consmap-lo map-bytes)))
-        (when (< objmap-lo image-va-end)
-          (error "BUILD-TIME ASSERT: #160 object-start bitmap at ~X is inside ~
-                  the image (ends ~X)." objmap-lo image-va-end))
-        (when (> (+ objmap-lo map-bytes) consmap-lo)
-          (error "BUILD-TIME ASSERT: #160 object-start bitmap ~X+~X overlaps ~
-                  the cons-kind bitmap at ~X." objmap-lo map-bytes consmap-lo))
-        (if cl-user::*rpi-threads-p*
-            ;; Threaded: ABOVE the main stack top, below the restore header.
-            (when (or (< objmap-lo stack-top) (> maps-hi #x08FFFF00))
-              (error "BUILD-TIME ASSERT: SMP bitmaps ~X..~X are not inside ~
-                      [stack top ~X, restore header 0x08FFFF00)." objmap-lo maps-hi stack-top))
-            (when (>= maps-hi stack-va-lo)
-              (error "BUILD-TIME ASSERT: #160 bitmaps end ~X reach the stack low ~
-                      water ~X." maps-hi stack-va-lo)))
-        (format t "  gc bitmaps ~8,'0X .. ~8,'0X  (#160 object-start + cons-kind)~%"
-                objmap-lo maps-hi)
-        ;; The limit guard must exceed every allocation that is NOT checked
-        ;; against its own size (FUSE-GC-CHECKS census).
-        (format t "  gc-check census: ~D variable-size allocation~:P without a size-aware check~%"
-                modus.mvm::*gc-check-unsized-var-allocs*))
+      ;; a U-Boot netboot loads the image at 0x300000, 0x280000 above the SD card's 0x80000
+      (when (>= (+ image-va-end #x280000) board-lo)
+        (error "BUILD-TIME ASSERT: image end ~X (~X when netbooted at 0x300000) reaches the ~
+                board region at ~X." image-va-end (+ image-va-end #x280000) board-lo))
+      (when (> board-hi low-tables)
+        (error "BUILD-TIME ASSERT: the board region ends ~X past the thread stacks at ~X."
+               board-hi low-tables))
+      (must-say (format nil "(defun %rpi-board-ram () (values #x~8,'0X #x~8,'0X))"
+                        board-lo (- board-hi board-lo))
+                "the board region")
+      ;; the bitmaps: above the main stack, below the JIT arena's bump word
+      (when (> (+ bm-obj bm-bytes) bm-cons)
+        (error "BUILD-TIME ASSERT: the object-start bitmap ~X+~X overlaps the ~
+                cons-kind bitmap at ~X." bm-obj bm-bytes bm-cons))
+      (when (or (< bm-obj stack-top) (> (+ bm-cons bm-bytes) jit-bump))
+        (error "BUILD-TIME ASSERT: the bitmaps ~X..~X are not inside [stack top ~X, ~
+                the JIT bump word ~X)." bm-obj (+ bm-cons bm-bytes) stack-top jit-bump))
+      (must-say (format nil "(%rpi-gc-bitmap-init #x~8,'0X #x~8,'0X #x~X #x~8,'0X)"
+                        bm-obj bm-cons bm-bytes bm-base)
+                "the bitmaps' places, size and page_base")
+      ;; the JIT arena, the thread arena, region 0: in order, not overlapping
+      (unless (and (= (modus.mvm::%jit-exec-lo) jit-lo) (= (modus.mvm::%jit-exec-hi) jit-hi)
+                   (< jit-bump jit-lo) (= jit-lo bm-base))
+        (error "BUILD-TIME ASSERT: translate-aarch64's JIT arena [~X, ~X) bump ~X is not ~
+                the map's [~X, ~X) at the bitmaps' base ~X."
+               (modus.mvm::%jit-exec-lo) (modus.mvm::%jit-exec-hi) jit-bump jit-lo jit-hi bm-base))
+      (when (> jit-hi arena)
+        (error "BUILD-TIME ASSERT: the JIT arena ends ~X past the thread arena ~X." jit-hi arena))
+      (when (> arena-end window)
+        (error "BUILD-TIME ASSERT: the thread arena ends ~X past the runtime window ~X."
+               arena-end window))
+      (when cl-user::*rpi-threads-p*
+        (must-say (format nil "(defun %bt-arena () #x~8,'0X)" arena) "the thread arena"))
+      (when (< heap-base net-hi)
+        (error "BUILD-TIME ASSERT: the heap base ~X is below the end ~X of the I/O block."
+               heap-base net-hi))
+      (when (/= (- heap-mid heap-base) (- heap-end heap-mid))
+        (error "BUILD-TIME ASSERT: the semispaces [~X, ~X) and [~X, ~X) differ in size."
+               heap-base heap-mid heap-mid heap-end))
+      (when (> heap-end min-board-ram)
+        (error "BUILD-TIME ASSERT: the heap ends ~X past ~X, the RAM a Pi Zero 2 W's ARM ~
+                sees at gpu_mem=64." heap-end min-board-ram))
+      ;; region 0's geometry is the board's (%RPI-HEAP-END of the mailbox's answer):
+      ;; the base and stack are literals, the smallest board's end is the floor and
+      ;; the bitmaps' end the cap, and the limit is raised by the translator's guard
+      (must-say (format nil "(%gc-init #x~8,'0X size #x~8,'0X)" heap-base stack-top)
+                "region 0's base and stack")
+      (must-say (format nil "(max #x~8,'0X " heap-end) "the smallest board's heap end")
+      (must-say (format nil "(min top #x~8,'0X)" bm-end) "the heap's cap, the bitmaps' end")
+      (must-say (format nil "(set-alloc-limit (- (+ #x~8,'0X (ash size -1)) #x~X))"
+                        heap-base modus.mvm::*aarch64-gc-limit-guard*)
+                "the raised limit, with the translator's guard")
+      ;; the saved core is read from the upper semispace while the lower one fills
+      (unless (and (>= core-addr heap-mid) (< core-addr heap-end))
+        (error "BUILD-TIME ASSERT: the core load address ~X is not in the upper semispace ~
+                [~X, ~X), where a restore can read it while it writes the lower one."
+               core-addr heap-mid heap-end))
+      (must-say (format nil "(defun %core-addr () #x~8,'0X)" core-addr) "the core's address")
       (when (> heap-end periph-base)
         (error "BUILD-TIME ASSERT: heap end ~X is inside the BCM2837 ~
                 peripheral window at ~X." heap-end periph-base))
-      (format t "~%Pi 3B memory map (all identity-mapped DRAM, MMU off):~%")
+      (format t "~%Pi memory map (identity-mapped DRAM; boot-rpi-cl.lisp):~%")
       (format t "  image      ~8,'0X .. ~8,'0X  (~,2F MB)~%"
               image-va-start image-va-end (/ image-bytes 1024.0 1024.0))
+      (format t "  board      ~8,'0X .. ~8,'0X  (%RPI-BOARD-RAM)~%" board-lo board-hi)
       (format t "  stack top  ~8,'0X            (grows down, ~,1F MB clear of image)~%"
               stack-top (/ (- stack-va-lo image-va-end) 1024.0 1024.0))
-      (format t "  heap       ~8,'0X .. ~8,'0X  (112 MB, midpoint ~8,'0X)~%"
-              heap-base heap-end (symbol-value '+rpi-cl-heap-mid+))
-      (format t "  periph     ~8,'0X ..            (PL011 UART0 at 3F201000)~%"
-              periph-base)
-      ;; #209 rung 2: the USB/net DMA + state block (net/arch-rpi-cl.lisp).
-      ;; It must clear BOTH the runtime metadata window (which ends at
-      ;; 0x10200000) and the peripherals, or the NIC DMAs over live data —
-      ;; the exact failure build-aarch64-ansi.lisp's net relocation exists to stop.
-      (when cl-user::*net-build-p*
-        (let ((net-lo #x11000000)
-              (net-hi #x11113000)
-              (meta-end #x10200000)
-              ;; SMALLEST board this image must run on: Pi Zero 2 W, 512 MB,
-              ;; minus gpu_mem=16 => the ARM sees 0x1F000000 (496 MB).  QEMU
-              ;; raspi3b models a 1 GiB Pi 3B, so anything between 496 MB and
-              ;; 1 GiB passes every emulated test and addresses a HOLE on the
-              ;; real target.  The net block used to sit at 0x20000000 =
-              ;; exactly 512 MB and was unusable on hardware for that reason.
-              (min-board-ram #x1F000000))
-          (when (< net-lo meta-end)
-            (error "BUILD-TIME ASSERT: net DMA base ~X is inside the runtime ~
-                    metadata window (ends ~X)." net-lo meta-end))
-          (when (>= net-hi periph-base)
-            (error "BUILD-TIME ASSERT: net region end ~X is inside the ~
-                    BCM2837 peripheral window at ~X." net-hi periph-base))
-          (when (>= net-hi min-board-ram)
-            (error "BUILD-TIME ASSERT: net region end ~X is at/above ~X, the ~
-                    RAM the ARM sees on a Pi Zero 2 W (512 MB - gpu_mem=16). ~
-                    It would DMA into a hole on the real target while passing ~
-                    every QEMU raspi3b test, because raspi3b models 1 GiB."
-                   net-hi min-board-ram))
-          (format t "  net/DMA    ~8,'0X .. ~8,'0X  (USB + E1000-shaped state)~%"
-                  net-lo net-hi))))
-)
+      (format t "  gc bitmaps ~8,'0X .. ~8,'0X  (#160 object-start + cons-kind, cover ~8,'0X..~8,'0X)~%"
+              bm-obj (+ bm-cons bm-bytes) bm-base bm-end)
+      (format t "  JIT arena  ~8,'0X .. ~8,'0X~%" jit-lo jit-hi)
+      (format t "  threads    ~8,'0X .. ~8,'0X  (core heaps)~%" arena arena-end)
+      (format t "  scheduler, SSH, scratch  ~8,'0X .. ~8,'0X~%" #x10900000 high-small-hi)
+      (format t "  net/DMA    ~8,'0X .. ~8,'0X  (Device window, rings, the I/O core)~%" net-lo net-hi)
+      (format t "  heap       ~8,'0X .. RAM top - 4 MB, capped at ~8,'0X (smallest board: ..~8,'0X, 2 x ~D MB, midpoint ~8,'0X); core loads at ~8,'0X~%"
+              heap-base bm-end
+              heap-end (floor (- heap-mid heap-base) (* 1024 1024)) heap-mid core-addr)
+      (format t "  periph     ~8,'0X ..            (PL011 UART0 at 3F201000)~%" periph-base)
+      ;; The limit guard must exceed every allocation that is NOT checked
+      ;; against its own size (FUSE-GC-CHECKS census).
+      (format t "  gc-check census: ~D variable-size allocation~:P without a size-aware check~%"
+              modus.mvm::*gc-check-unsized-var-allocs*))))
 
 (format t "~%Compiling bare-metal ~A CL REPL image (~D chars)...~%"
         (cond (cl-user::*cl-repl-virt-p* "AArch64 QEMU-virt")

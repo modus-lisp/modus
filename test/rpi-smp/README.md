@@ -10,7 +10,7 @@ Run the driver under QEMU raspi3b (4 cores; the same spin-table release as the f
     N=$(stat -c %s test/rpi-smp/smp-lisp.lisp)
     python3 test/rpi-smp/qtest.py thr.img --blob=$PWD/test/rpi-smp/smp-lisp.lisp \
       "(defun ramv (a n) (let ((v (make-array n :element-type (quote (unsigned-byte 8))))) (dotimes (i n v) (setf (aref v i) (mem-ref (+ a i) :u8)))))" \
-      "(progn (load (make-string-input-stream (map (quote string) (function code-char) (ramv #x1A000000 $N)))) :loaded)" \
+      "(progn (load (make-string-input-stream (map (quote string) (function code-char) (ramv #x20000000 $N)))) :loaded)" \
       "(progn (jit-eager) :jitted)" "(smp-snapshot)" \
       "(smp-start 2 (quote core-spin))" "(smp-start 3 (quote core-spin))" "(smp-start 1 (quote core-spin))" \
       "(smp-counters)" "(smp-counters)"

@@ -45,6 +45,10 @@ JOBS=${GATE_JOBS:-48}
 wt_for() { # ref -> worktree dir (idempotent)
   local dir="$WORKDIR/wt-$(git -C "$REPO" rev-parse --short "$1")"
   [ -d "$dir" ] || git -C "$REPO" worktree add -q --detach "$dir" "$1" >/dev/null || return 1
+  # a ref that pins vessel builds its bare-metal images from vessel at THAT commit
+  if [ -f "$dir/vessel.pin" ] && [ -x "$dir/scripts/vessel-checkout.sh" ]; then
+    "$dir/scripts/vessel-checkout.sh" "$dir" >&2 || return 1
+  fi
   echo "$dir"
 }
 

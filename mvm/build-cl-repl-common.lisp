@@ -176,7 +176,7 @@
 ;; net/ sources are read RAW (no package wrapper) — they are flat-namespace
 ;; bare-metal drivers and none of them declares a package.
 (defun %rpi-net-text (rel)
-  (let ((p (merge-pathnames rel (merge-pathnames "net/" *modus-base*))))
+  (let ((p (modus-source (concatenate 'string "net/" rel))))
     (modus.mvm::check-parses p)
     ;; Scoped like MVM-TEXT: a driver's own (in-package ...) (builder
     ;; packages step 3) must not leak into the next spliced file.
@@ -1449,7 +1449,7 @@
            ;; the files' own text: evaluated in the image, which reads their IN-PACKAGE
            (apply #'concatenate 'string
                   (mapcar (lambda (f)
-                            (let ((p (merge-pathnames f (merge-pathnames "net/" *modus-base*))))
+                            (let ((p (modus-source (concatenate 'string "net/" f))))
                               ;; not the sockets shim: it names SB-BSD-SOCKETS, which the build host
                               ;; does not load (build-cli-common carries it unchecked too)
                               (unless (string= f "sb-bsd-sockets-shim.lisp") (modus.mvm::check-parses p))

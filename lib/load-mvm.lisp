@@ -13,9 +13,43 @@
          (modus-dir (namestring (truename (merge-pathnames "../" this-dir)))))
     (pathname modus-dir)))
 
+;;; vessel: what makes modus a machine.  modus is the Lisp; the bare-metal drivers, boot
+;;; stubs and board runtime a kernel image is compiled from live in the modus-lisp/vessel
+;;; repo, under kernel/, at the same relative paths they would have here
+;;; (kernel/net/dwc2.lisp is "net/dwc2.lisp").  vessel.pin names the commit a build is
+;;; meant to use.  The checkout is MODUS_VESSEL; else .vessel/ in this tree (made at the
+;;; pin by scripts/vessel-checkout.sh); else the sibling ../vessel of a workspace.
+(defvar *vessel-base*
+  (let* ((env (sb-ext:posix-getenv "MODUS_VESSEL"))
+         (dir (if (and env (plusp (length env)))
+                  (probe-file (concatenate 'string (string-right-trim "/" env) "/"))
+                  ;; .vessel/: the checkout scripts/vessel-checkout.sh makes at vessel.pin,
+                  ;; inside this tree (gitignored) -- what the gate and a fresh clone use
+                  (or (probe-file (merge-pathnames ".vessel/kernel/" *modus-base*))
+                      (probe-file (merge-pathnames "../vessel/kernel/" *modus-base*))))))
+    (cond ((null dir) nil)
+          ((and env (plusp (length env))) (pathname dir))
+          (t (make-pathname :directory (butlast (pathname-directory dir))   ; .../kernel/ -> the checkout
+                            :name nil :type nil :defaults dir))))
+  "The vessel checkout modus's bare-metal builds read their drivers from, or NIL.")
+
+(defun modus-source (relative-path)
+  "The file a build means by RELATIVE-PATH: modus's own if modus has it, else vessel's
+   kernel/ copy.  Signals, naming both places, when neither has it -- a missing vessel
+   checkout must be loud, not a build that silently leaves a driver out."
+  (let ((here (merge-pathnames relative-path *modus-base*)))
+    (cond ((probe-file here) here)
+          ((and *vessel-base*
+                (probe-file (merge-pathnames (concatenate 'string "kernel/" relative-path)
+                                             *vessel-base*))))
+          (t (error "~A is in neither modus (~A) nor vessel (~A).  The bare-metal ~
+                     sources live in modus-lisp/vessel: check it out beside modus at the ~
+                     commit in vessel.pin, or set MODUS_VESSEL."
+                    relative-path *modus-base*
+                    (if *vessel-base* (merge-pathnames "kernel/" *vessel-base*) "no checkout found"))))))
+
 (defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
+  (load (modus-source relative-path) :verbose nil :print nil))
 
 ;; HOST-ONLY: record every MODUS_* variable this build reads, FIRST, so the knobs
 ;; the compiler and translators read while loading are in the record too.  The
@@ -194,6 +228,6 @@
    behind the lenient mid-build reader for weeks.  The text is wrapped so
    its own (in-package ...) cannot leak into the next file of the
    concatenated build blob (#211, modus.mvm::*build-package-reset-text*)."
-  (let ((path (merge-pathnames relative-path *modus-base*)))
+  (let ((path (modus-source relative-path)))
     (modus.mvm::check-parses path)
     (modus.mvm::%build-package-scoped-source (read-file-text path) relative-path)))

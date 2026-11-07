@@ -295,12 +295,30 @@
     "net/arch-i386-cl.lisp" "net/arch-aarch64-cl.lisp"
     "net/bcm2835-gpio.lisp"))
 
+(defun %vessel-kernel ()
+  "vessel's kernel/ (the bare-metal sources modus compiles, moved out of modus), from
+   MODUS_VESSEL or the sibling ../vessel; NIL without a checkout."
+  (let* ((env (sb-ext:posix-getenv "MODUS_VESSEL"))
+         (root (and env (plusp (length env)) (concatenate 'string (string-right-trim "/" env) "/"))))
+    (if root
+        (probe-file (concatenate 'string root "kernel/"))
+        (or (probe-file ".vessel/kernel/") (probe-file "../vessel/kernel/")))))
+
+(defun %resolve-source (f)
+  "F (relative to modus) as a path: modus's own file, else vessel's kernel/ copy."
+  (or (probe-file f)
+      (let ((k (%vessel-kernel))) (and k (probe-file (merge-pathnames f k))))
+      (pathname f)))
+
 (defun all-source-files ()
-  "Return list of all Lisp source files."
-  (let ((files nil))
+  "Return list of all Lisp source files: modus's, and vessel's kernel/ beside it."
+  (let ((files nil) (k (%vessel-kernel)))
     (dolist (dir '("net/" "mvm/" "cross/" "boot/"))
       (dolist (f (directory (merge-pathnames "*.lisp" dir)))
-        (push f files)))
+        (push f files))
+      (when k
+        (dolist (f (directory (merge-pathnames (concatenate 'string dir "*.lisp") k)))
+          (push f files))))
     (nreverse files)))
 
 (defun ensure-dummy-packages ()
@@ -330,10 +348,10 @@
                                           (string= (subseq a (- (length a) 5)) ".lisp")
                                           (not (search "check-source" a))))
                                    args))
-         (files (cond (net-mode (mapcar #'pathname *net-files*))
+         (files (cond (net-mode (mapcar #'%resolve-source *net-files*))
                       (all-mode (all-source-files))
                       (file-args (mapcar #'pathname file-args))
-                      (t (mapcar #'pathname *net-files*)))))
+                      (t (mapcar #'%resolve-source *net-files*)))))
     (setf *show-info* (not (null info-mode)))
     (format t "~%MVM Source Checker — scanning ~D file~:P~A...~%~%"
             (length files) (if net-mode " (bare-metal)" ""))

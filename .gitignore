@@ -12,3 +12,6 @@ alex-after.log
 scratch/
 modus-aa64
 *.fasl
+
+# modus-lisp/vessel at vessel.pin (scripts/vessel-checkout.sh)
+/.vessel/

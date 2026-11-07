@@ -1192,12 +1192,22 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     (when (or (eq mode :off) *gck-parse-sweep-done* (null *gck-parse-sweep-root*))
       (return-from check-source-parses nil))
     (setf *gck-parse-sweep-done* t)
-    (let ((files (sort (loop for d in *gck-parse-sweep-dirs*
+    (let ((files (sort (loop with vessel = (let ((s (find-symbol "*VESSEL-BASE*" "CL-USER")))
+                                             (and s (boundp s) (symbol-value s)))
+                             for d in *gck-parse-sweep-dirs*
                              append (directory
                                      (merge-pathnames
                                       (make-pathname :directory (list :relative d)
                                                      :name :wild :type "lisp")
-                                      *gck-parse-sweep-root*)))
+                                      *gck-parse-sweep-root*))
+                             ;; vessel's kernel/: the bare-metal sources moved out of modus
+                             ;; are first-party too, and read the same way
+                             when vessel
+                               append (directory
+                                       (merge-pathnames
+                                        (make-pathname :directory (list :relative "kernel" d)
+                                                       :name :wild :type "lisp")
+                                        vessel)))
                        #'string< :key #'namestring))
           (stubs nil)
           (findings nil))

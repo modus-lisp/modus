@@ -13,6 +13,24 @@ VNC clients from its own RFB server on modus. See "Per-region GC" and the
 threading sections below; `docs/handler-stack-collision.md` is required reading
 before touching the handler stack or the per-thread window.
 
+## modus is the Lisp; vessel is the machine (2026-11-07)
+
+The bare-metal drivers, boot stubs and board runtime a kernel image is compiled from are
+moving to **modus-lisp/vessel**, under `kernel/` at the same relative paths
+(`kernel/net/dwc2.lisp` is what a build calls `"net/dwc2.lisp"`).  modus keeps the
+compiler, the runtime and the hosted platform.  Stage 1, done: the Raspberry Pi's USB host,
+SD, HDMI, GPIO, RNG, `arch-rpi-cl` and `boot-rpi-cl`.
+
+- **A build finds them through `MODUS-SOURCE`** (lib/load-mvm.lisp): modus's own file if it
+  has one, else vessel's.  `mvm-load`, `mvm-text` and the `net/` readers all go through it;
+  a new reader must too, never `(merge-pathnames "net/..." *modus-base*)`.
+- **Which vessel:** `MODUS_VESSEL`, else `.vessel/` in the tree, else a sibling `../vessel`.
+  `vessel.pin` names the commit; `scripts/vessel-checkout.sh` puts that commit in `.vessel/`,
+  and the acceptance gate does it for both refs.
+- **Moving a driver** is a vessel commit (with history) plus deleting it here and bumping
+  `vessel.pin`, proved by `build-matrix.sh` on both trees and `build-matrix-compare.sh`
+  reporting every image byte-identical.
+
 ## Directory Structure
 
 ```

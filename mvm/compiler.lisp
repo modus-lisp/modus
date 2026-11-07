@@ -13281,6 +13281,30 @@
            ;; is no longer required — safety is the only condition.
            (and safe :promote)))))
 
+(defvar *extended-loop-expansions* nil
+  "((source-form . expansion) ...): %EXTENDED-LOOP-EXPANSION's recent results.")
+
+(defun %extended-loop-expansion (f)
+  "The expansion of F when it is an extended LOOP (FOR / WITH / SUM ...), else
+   NIL.  The promotion walkers judge such a LOOP by what compiles: its FOR
+   variables are LET-bound there (so they are candidates), and a FROM or
+   initial form sits OUTSIDE the simple LOOP (so it is weighted as read once,
+   not as read every iteration)."
+  (and (consp f) (symbolp (car f)) (name-eq (car f) "LOOP")
+       (consp (cdr f)) (not (every #'consp (cdr f)))
+       ;; the walkers ask once per node and once per candidate variable:
+       ;; keep the last few expansions, keyed by the (unchanging) source form
+       (let ((hit (assoc f *extended-loop-expansions* :test #'eq)))
+         (if hit
+             (cdr hit)
+             (let ((x (handler-case (expand-cl-loop (cdr f)) (error () nil))))
+               (setq *extended-loop-expansions*
+                     (cons (cons f x)
+                           (if (> (length *extended-loop-expansions*) 31)
+                               (subseq *extended-loop-expansions* 0 31)
+                               *extended-loop-expansions*)))
+               x)))))
+
 (defun %var-ref-weight (var form)
   "Static reference weight of VAR in FORM: each occurrence counts 1, times 8
    per enclosing loop form (LOOP/DOTIMES/DOLIST/DO/DO*).  Quoted forms are
@@ -13290,6 +13314,7 @@
              (cond ((and (symbolp f) f (name-equal f var)) w)
                    ((atom f) 0)
                    ((and (symbolp (car f)) (name-eq (car f) "QUOTE")) 0)
+                   ((%extended-loop-expansion f) (walk (%extended-loop-expansion f) w))
                    (t (let ((w2 (if (and (symbolp (car f))
                                          (member (symbol-name (car f)) *promote-loop-ops*
                                                  :test #'string=))
@@ -13315,6 +13340,8 @@
                      ((> depth 60) nil)
                      ((not (symbolp (car f))) (walk-list f mult depth))
                      ((name-eq (car f) "QUOTE") nil)
+                     ((%extended-loop-expansion f)
+                      (walk (%extended-loop-expansion f) mult (+ depth 1)))
                      ((or (name-eq (car f) "LET") (name-eq (car f) "LET*"))
                       (when (and (consp (cdr f)) (listp (cadr f)))
                         (let ((lbody (cons 'progn (cddr f))))
@@ -16154,6 +16181,21 @@
 ;;;   (loop ... finally EXPR)
 ;;;   (loop ... return EXPR)
 
+(defun %loop-drop-setq (form var)
+  "FORM with every (SETQ VAR T) replaced by (PROGN).  VAR is a fresh gensym
+   of GENERATE-LOOP-CODE, so no user form can mention it."
+  (cond ((atom form) form)
+        ((and (eq (car form) 'setq) (consp (cdr form)) (eq (cadr form) var)
+              (consp (cddr form)) (eq (caddr form) t) (null (cdddr form)))
+         (list 'progn))
+        (t (let ((out nil) (r form))
+             (loop (when (not (consp r)) (return))
+                   (setq out (cons (%loop-drop-setq (car r) var) out))
+                   (setq r (cdr r)))
+             (let ((res (nreverse out)))
+               (when r (setf (cdr (last res)) r))   ; keep a dotted tail
+               res)))))
+
 (defun expand-cl-loop (body)
   "Expand a CL-style loop body into basic Lisp forms."
   (let ((state (parse-cl-loop body)))
@@ -18398,10 +18440,13 @@
                        (if ,%nat-var
                            ,natural-form
                            ,%bv-var))))
-                 ;; The termination tests still SETQ the flag; without this
-                 ;; binding it was an unbound gensym, i.e. a GLOBAL hash-table
-                 ;; write on every exit of every `loop while … do`.
-                 (t `(let ((,%nat-var nil)) ,inner2))))
+                 ;; No guard reads the flag: its SETQs are dead, so they go
+                 ;; (each becomes (PROGN), never NIL, which a TAGBODY would
+                 ;; take for a tag) and nothing is bound.  Unbound, a SETQ
+                 ;; was a GLOBAL write on every exit of every `loop while …
+                 ;; do`; bound but dead, it was a local the register ranking
+                 ;; counted as hot, and it took a register from the body.
+                 (t (%loop-drop-setq inner2 %nat-var))))
              ;; INITIALLY runs once before the loop body, after WITH bindings
              (with-init (if initially
                             `(progn ,@initially ,result)
@@ -29450,18 +29495,22 @@
       ;; Save register params to stack and build environment.  PARAMETER
       ;; PROMOTION: a fixed-arity function (no &optional/&rest prologue that
       ;; reads the slots) whose body is promotion-safe keeps its hottest
-      ;; register-passed parameters in the local registers instead.
+      ;; register-passed parameters in the local registers instead.  Only
+      ;; those can be (a parameter past +MAX-REG-ARGS+ arrives in the
+      ;; caller's frame and keeps that slot), but a function with more
+      ;; parameters still promotes its first ones: glass's
+      ;; (tile-changed-p fb snap x0 y0 x1 y1) reloaded SNAP from its slot
+      ;; for every pixel.
       (let ((param-set (and *local-vregs-free*
                             (null rest-slot)
                             (or (null opt-count) (zerop opt-count))
-                            (<= (length params) +max-reg-args+)
                             (%let-promotion-plan body)
                             (let ((decls (%declared-types body)))
                               (%promotion-choice
                                (remove-if (lambda (pm)
                                             (let ((d (assoc pm decls :test #'equal)))
                                               (and d (%fp-type-kind (cdr d)))))
-                                          params)
+                                          (subseq params 0 (min (length params) +max-reg-args+)))
                                (cons 'progn body)
                                (length *local-vregs-free*))))))
         (loop for param in params

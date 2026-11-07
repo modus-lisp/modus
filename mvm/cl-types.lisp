@@ -5534,10 +5534,13 @@
     ((vectorp obj)
      (let ((et (array-element-type obj)))
        (cond ((array-has-fill-pointer-p obj) (list 'vector et '*))
+             ;; displaced: not simple, so not what TYPEP calls SIMPLE-ARRAY
+             ((and (%mda-p obj) (%mda-displaced obj)) (list 'vector et (length obj)))
              ((eq et t) (list 'simple-vector (length obj)))
              (t (list 'simple-array et (list (length obj)))))))
     ((arrayp obj)
-     (list 'simple-array (array-element-type obj) (array-dimensions obj)))
+     (list (if (and (%mda-p obj) (%mda-displaced obj)) 'array 'simple-array)
+           (array-element-type obj) (array-dimensions obj)))
     (t t)))
 
 ;;; ---------- typep: stream subtype dispatch (CLHS 21.1.3) -----------------
@@ -5931,9 +5934,14 @@
          ((and (or (eq head 'vector) (eq head 'simple-vector)
                    (eq head 'simple-array) (eq head 'array))
                (%mda-p obj))
-          (let ((et   (and (cdr type) (%element-type-expand (cadr type))))
-                (dims (and (cddr type) (caddr type)))
-                (dims-given (and (cddr type) t)))
+          ;; (VECTOR ET SIZE) gives a LENGTH where (ARRAY ET DIMS) gives dimensions,
+          ;; and (SIMPLE-VECTOR SIZE) has no element type at all: read both as
+          ;; (ARRAY ET (SIZE)), or an integer SIZE is compared against the RANK.
+          (let* ((sv   (eq head 'simple-vector))
+                 (et   (if sv t (and (cdr type) (%element-type-expand (cadr type)))))
+                 (dims-given (if sv (and (cdr type) t) (and (cddr type) t)))
+                 (dims (if sv (and (cdr type) (cadr type)) (and (cddr type) (caddr type))))
+                 (dims (if (and (or sv (eq head 'vector)) (integerp dims)) (list dims) dims)))
             (and
              ;; vector / simple-vector require rank 1
              (if (or (eq head 'vector) (eq head 'simple-vector))

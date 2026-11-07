@@ -5939,6 +5939,17 @@
              (if (or (eq head 'vector) (eq head 'simple-vector))
                  (= (array-rank obj) 1)
                  t)
+             ;; SIMPLE-ARRAY / SIMPLE-VECTOR: no fill pointer and not displaced, whatever the
+             ;; element type -- the atomic SIMPLE-ARRAY clause's rule.  This branch asked it
+             ;; only of bit arrays, so (typep (make-array 4 :element-type '(unsigned-byte 8)
+             ;; :adjustable t :fill-pointer 0) '(simple-array (unsigned-byte 8) (*))) was T,
+             ;; and a fast path that dispatched on it at (safety 0) read the wrapper's own
+             ;; header words as octets: cram's deferred-modulo Adler-32 over the vector an
+             ;; inflate grows gave a wrong checksum.  (An array made :ADJUSTABLE with neither
+             ;; is still taken for simple; the wrapper does not record :ADJUSTABLE.)
+             (if (or (eq head 'simple-array) (eq head 'simple-vector))
+                 (and (null (%mda-fp obj)) (null (%mda-displaced obj)))
+                 t)
              ;; element-type: MDA-with-string-data → character family;
              ;; otherwise element type is T.
              (let ((str (%mda-stringp obj)) (bitp (%mda-bit-p obj)))

@@ -5553,10 +5553,10 @@
                    (a64-add-imm buf +a64-x17+ +a64-x29+ (a64-frame-slot-offset 0))
                    (a64-sub-reg buf pd +a64-x17+ +a64-x16+ 0 0)
                    (a64-ldur buf pd pd 0))
+                 ;; slot 0 at tagged+7: the 7 rides in the load's offset
                  (let ((pobj (ensure-src (vr 1) +a64-x16+)))
-                   (a64-add-imm buf +a64-x16+ pobj 7)
-                   (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
-                   (a64-ldur buf pd +a64-x16+ 0)))
+                   (a64-add-reg buf +a64-x16+ pobj pidx 0 2)
+                   (a64-ldur buf pd +a64-x16+ 7)))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

@@ -26976,8 +26976,12 @@
       (let ((arr-reg (alloc-temp-reg))
             (idx-reg (alloc-temp-reg))
             (skip (make-compiler-label)))
-        (compile-form arr-form env arr-reg)
-        (compile-form idx-form env idx-reg)
+        ;; a register-resident array or index is read in place, not copied --
+        ;; unless it is DEST, which the bounds check loads the length into
+        (let ((ra (let ((r (%operand-reg arr-form env))) (and r (/= r dest) r)))
+              (ri (let ((r (%operand-reg idx-form env))) (and r (/= r dest) r))))
+          (if ra (setq arr-reg ra) (compile-form arr-form env arr-reg))
+          (if ri (setq idx-reg ri) (compile-form idx-form env idx-reg)))
         (when (%bounds-check-p) (%emit-index-check arr-reg idx-reg dest skip))
         (emit-ir :aref dest arr-reg idx-reg)
         (emit-ir-label skip)

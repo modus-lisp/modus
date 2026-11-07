@@ -17006,7 +17006,8 @@
                                           :init-form init
                                           :step-form (cond ((not has-then) init)
                                                            ((null step) (list 'quote nil))
-                                                           (t step)))
+                                                           (t step))
+                                          :type for-type)
                           (loop-state-iterations state))))
 
                  ;; FOR var BEING [THE | EACH] kind {OF | IN} expr [USING (k v)]
@@ -17961,8 +17962,17 @@
          ;; before them already stepped (cl-ppcre's `for quant = (quant lexer)
          ;; for seq = quant then (cond ...)` read a NIL QUANT from a binding).
          ;; Without THEN, INIT is re-evaluated on every pass.
-         (let ((var (loop-iter-var iter)))
-           (push (list var nil) bindings)
+         ;; A declared integer type (`for i fixnum = (+ row x)`) is kept: VAR
+         ;; is bound to 0 and declared FIXNUM, as a numeric FOR's is.  It is
+         ;; assigned before the body first reads it, so the 0 is never seen;
+         ;; untyped, every use of VAR took the generic arithmetic path.
+         (let* ((var (loop-iter-var iter))
+                (int-p (and (loop-iter-type iter)
+                            (ignore-errors
+                             (%decl-int-width (%resolve-declared-type (loop-iter-type iter))))
+                            t)))
+           (push (list var (if int-p 0 nil)) bindings)
+           (when int-p (push (cons var 'fixnum) typed))
            (setq c-ufirst (cons var (loop-iter-init-form iter))
                  c-unext (cons var (loop-iter-step-form iter)))))
 
@@ -18290,11 +18300,37 @@
              ;; body form for LOOP-FINISH occurrences.
              (effective-body
                (mapcar loop-finish-expander test-forms-with-nat))
-             (inner2 (if (eq effective-body loop-body)
-                         inner
-                         (if block-name
-                             `(loop (%loop-nonil) ,@effective-body)
-                             `(loop ,@effective-body))))
+             ;; ROTATED: the first pass runs ONCE at the top of a TAGBODY whose
+             ;; back-edge is a GO past it, instead of behind FIRSTV on every
+             ;; iteration -- the same order of clauses, without the flag test
+             ;; per pass and its frame slot.  Every exit still leaves the same
+             ;; simple LOOP (its block, and :%LOOP-EXIT).  A backward GO polls
+             ;; for safepoints like the LOOP back-edge (COMPILE-GO).  Skipped
+             ;; when a form is an atom, which a TAGBODY would read as a tag.
+             (rotated
+               (and firstv (consp effective-body)
+                    (let ((f0 (car effective-body)))
+                      (and (consp f0) (eq (car f0) 'if) (eq (cadr f0) firstv)
+                           (consp (caddr f0)) (eq (car (caddr f0)) 'progn)
+                           (null (cdddr f0))
+                           (let ((top (cdr (caddr f0))))
+                             (and (consp top) (consp (car top)) (eq (caar top) 'setq)
+                                  (eq (cadr (car top)) firstv)
+                                  (notany (function atom) (cdr top))
+                                  (notany (function atom) (cdr effective-body))
+                                  (let ((next (%mvm-gensym "NEXT")))
+                                    `((tagbody ,@(cdr top) ,next
+                                               ,@(cdr effective-body) (go ,next))))))))))
+             (inner2 (cond
+                       (rotated
+                        (setq bindings (remove firstv bindings
+                                               :key (lambda (b) (and (consp b) (car b)))))
+                        (if block-name
+                            `(loop (%loop-nonil) ,@rotated)
+                            `(loop ,@rotated)))
+                       ((eq effective-body loop-body) inner)
+                       (block-name `(loop (%loop-nonil) ,@effective-body))
+                       (t `(loop ,@effective-body))))
              ;; Pre-finally fixups for the list accumulators: there are none.
              ;; NONE.  The list accumulators are built forward onto a tail
              ;; pointer, so every one of them is already in iteration order —

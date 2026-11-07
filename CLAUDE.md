@@ -18,8 +18,13 @@ before touching the handler stack or the per-thread window.
 The bare-metal drivers, boot stubs and board runtime a kernel image is compiled from are
 moving to **modus-lisp/vessel**, under `kernel/` at the same relative paths
 (`kernel/net/dwc2.lisp` is what a build calls `"net/dwc2.lisp"`).  modus keeps the
-compiler, the runtime and the hosted platform.  Stage 1, done: the Raspberry Pi's USB host,
-SD, HDMI, GPIO, RNG, `arch-rpi-cl` and `boot-rpi-cl`.
+compiler, the runtime and the hosted platform.  Moved so far: the Raspberry Pi's USB host,
+SD, HDMI, GPIO, RNG, `arch-rpi-cl` and `boot-rpi-cl` (stage 1); the x86/QEMU NICs, the PC
+console, SEV-SNP's GHCB and attestation, the bare-metal arch adapters, `bare-threads`,
+`bare-sync`, `bare-perf`, and the bare-metal network services -- `io-net`, `tcp-conns`,
+`bare-sockets`, `net-service`, `main-jobs`, `ssh-inetd`, `http-client` (stage 2).  What
+hosted modus reads too (`ip`, `ssh`, `crypto*`, `actors`, the `sb-*` shims) stays here, and
+so, for now, do the boot descriptors `lib/load-mvm.lisp` loads for every target.
 
 - **A build finds them through `MODUS-SOURCE`** (lib/load-mvm.lisp): modus's own file if it
   has one, else vessel's.  `mvm-load`, `mvm-text` and the `net/` readers all go through it;

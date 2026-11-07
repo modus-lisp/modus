@@ -315,7 +315,8 @@
   "A Lisp stream over the socket's descriptor.
 
    PARTIAL: :BUFFERING, :TIMEOUT and :EXTERNAL-FORMAT are accepted and IGNORED.
-   modus's fd streams are always buffered, never time out, and pass 8-bit bytes
+   modus's socket streams are buffered both ways (output until FINISH-OUTPUT,
+   a full buffer or a read), never time out, and pass 8-bit bytes
    through unchanged.  A :TIMEOUT that was silently honoured as `no timeout'
    would be a read that blocks where the caller asked it not to — glass's
    `serve' never passes one (src/rfb.lisp:1047 takes every default), so the
@@ -325,7 +326,7 @@
   (%make-file-stream-full (%socket-fd socket)
                           (cond ((and input (not output)) 0)
                                 ((and output (not input)) 1)
-                                (t 2))
+                                (t 3))   ; io, output buffered (cl-fileio SOCKET OUTPUT BUFFER)
                           element-type))
 
 ;;; ---- socket options -----------------------------------------------------

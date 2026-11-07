@@ -419,13 +419,19 @@
 ;;; as (UNSIGNED-BYTE 8)).  stream-element-type reports it; binary streams
 ;;; let read-sequence read BYTES (via %input-stream-reads-chars-p).
 
+(defconstant +fs-obuf-size+ 16384 "Output bytes a socket stream holds before a write(2).")
+
 (defun %make-file-stream-full (fd dir &rest et)
-  "Create a file stream with given fd and direction (0=in, 1=out, 2=io).
+  "Create a file stream with given fd and direction (0=in, 1=out, 2=io,
+   3=io on a SOCKET: output buffered too, see SOCKET OUTPUT BUFFER below).
    Optional ET arg is the :element-type (defaults to CHARACTER)."
   (let ((buf (%make-string-array 4096))
+        ;; made HERE, by the thread that makes the stream: a worker that only
+        ;; writes the stream later stores bytes into it, never an object
+        (obuf (if (eql dir 3) (%make-string-array +fs-obuf-size+) nil))
         (elt-type (if et (car et) 'character)))
     (%make-stream 9
-      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons nil elt-type))))))))))
+      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons obuf (cons 0 (cons nil elt-type))))))))))))
 
 (declaim (overridable %fd-input-ready-p))
 (defun %fd-input-ready-p (fd)
@@ -451,7 +457,7 @@
 
 (defun %make-file-stream ()
   "Create a closed/dummy file stream."
-  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons t (quote character))))))))))
+  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons nil (cons 0 (cons t (quote character))))))))))))
 
 (defun %fs-fd      (s) (car  (%stream-data s)))
 (defun %fs-dir     (s) (cadr (%stream-data s)))
@@ -462,16 +468,20 @@
 (defun %fs-bpos    (s) (car  (cddr (cddr (%stream-data s)))))
 (defun %fs-blen-cell (s) (cdr (cddr (cddr (%stream-data s)))))
 (defun %fs-blen    (s) (car  (cdr (cddr (cddr (%stream-data s))))))
+;;; the output buffer (a socket stream's; NIL otherwise) and its fill count
+(defun %fs-obuf    (s) (car (cdr (cdr (cddr (cddr (%stream-data s)))))))
+(defun %fs-olen    (s) (car (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))
+(defun %fs-set-olen (s v) (set-car (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))) v))
 ;;; closed flag now lives in the CAR of the final two-element tail cell.
-(defun %fs-closed-cell (s) (cdr (cdr (cddr (cddr (%stream-data s))))))
-(defun %fs-closed  (s) (car (cdr (cdr (cddr (cddr (%stream-data s)))))))
+(defun %fs-closed-cell (s) (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))
+(defun %fs-closed  (s) (car (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))))))
 ;;; element-type lives in the CDR of that same final tail cell.
-(defun %fs-element-type (s) (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))))
+(defun %fs-element-type (s) (cdr (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))))))
 
 (defun %fs-set-pos  (s v) (set-car (cddr (%stream-data s)) v))
 (defun %fs-set-bpos (s v) (set-car (cddr (cddr (%stream-data s))) v))
 (defun %fs-set-blen (s v) (set-car (cdr (cddr (cddr (%stream-data s)))) v))
-(defun %fs-set-closed (s v) (set-car (cdr (cdr (cddr (cddr (%stream-data s))))) v))
+(defun %fs-set-closed (s v) (set-car (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))) v))
 
 ;;; *default-pathname-defaults* — base directory for relative pathnames
 (defvar *default-pathname-defaults* "")
@@ -812,8 +822,54 @@
   (and (> fd 2) (= (%fs-dir stream) 1) (not (%cab-fd-p fd)) (not (%net-fd-p fd))
        (eql (mem-ref #x10000DB8 :u32) 0)))
 
+;;; SOCKET OUTPUT BUFFER.  A socket stream (direction 3, from SOCKET-MAKE-STREAM)
+;;; holds up to +FS-OBUF-SIZE+ output bytes and writes them at FINISH-OUTPUT /
+;;; FORCE-OUTPUT, CLOSE, when full, and before any read that goes to the kernel
+;;; -- so a request is never stuck behind the reply it waits for.  Without it
+;;; every WRITE-BYTE on a socket was its own write(2): glass's desk made 81538
+;;; writes for a 27 MB drag (SBCL, whose fd-streams buffer: 1167) and spent 3x
+;;; SBCL's CPU.  Bare metal's sockets (%NET-FD-P) buffer in the net stack and do
+;;; not take this path.  The buffer is the stream's own, not on the global
+;;; *FS-BUFFERED-STREAMS*, so a threaded image can use it.
+(defun %fs-obuf-p (stream fd)
+  (and (eql (%fs-dir stream) 3) (%fs-obuf stream) (>= fd 0)
+       (not (%net-fd-p fd)) (not (%cab-fd-p fd))))
+
+(defun %fs-write-buf-all (fd buf n)
+  "write(2) the first N bytes of the byte STRING BUF to FD, all of them."
+  (let ((page (%fs-io-page)) (i 0))
+    (loop
+      (when (>= i n) (return nil))
+      (let ((k (min 4096 (- n i))) (j 0) (off 0))
+        (loop
+          (when (>= j k) (return nil))
+          (setf (mem-ref (+ page j) :u8) (%prim-aref buf (+ i j)))
+          (setq j (+ j 1)))
+        (loop
+          (when (>= off k) (return nil))
+          (let ((w (%sys-write-raw fd (+ page off) (- k off))))
+            (cond ((> w 0) (setq off (+ off w)))
+                  ((or (= w -4) (= w -11)) nil)          ; EINTR / EAGAIN: again
+                  (t (error "socket write failed (~d)" w)))))
+        (setq i (+ i k))))))
+
+(defun %fs-oflush (stream)
+  "Write a socket stream's pending output bytes, if any."
+  (let ((n (%fs-olen stream)))
+    (when (and (integerp n) (> n 0) (%fs-obuf stream))
+      (%fs-set-olen stream 0)
+      (%fs-write-buf-all (%fs-fd stream) (%fs-obuf stream) n))))
+
 (defun %fs-put-byte (stream fd byte)
   "Write one byte to file STREAM on FD, through its buffer when it has one."
+  (when (%fs-obuf-p stream fd)
+    (let ((n (%fs-olen stream)))
+      (when (>= n +fs-obuf-size+)
+        (%fs-oflush stream)
+        (setq n 0))
+      (%prim-aset (%fs-obuf stream) n byte)
+      (%fs-set-olen stream (+ n 1))
+      (return-from %fs-put-byte byte)))
   (if (%fs-wbuf-p stream fd)
       (let ((n (%fs-blen stream)))
         (when (>= n 4096)
@@ -836,6 +892,7 @@
     (when (= (%stream-type stream) 9)
       (let ((fd (%fs-fd stream)))
         (when (and (>= fd 0) (%net-fd-p fd)) (funcall *net-fd-call* :flush fd))
+        (when (%fs-obuf-p stream fd) (%fs-oflush stream))
         (when (and (>= fd 0) (%fs-wbuf-eligible-p stream fd))
           (let ((n (%fs-blen stream)))
             (when (> n 0)
@@ -941,7 +998,7 @@
               ;; Need to refill buffer
               ;; %SYS-READ-INTO-BUF fills the stream's own Lisp buffer, from
               ;; the syscall via *IO-BUF-ADDR* or straight from cabinet bytes.
-              (let ((n (%sys-read-into-buf fd (%fs-buf stream) 4096)))
+              (let ((n (progn (%fs-oflush stream) (%sys-read-into-buf fd (%fs-buf stream) 4096))))
                 (if (<= n 0)
                     -1                                  ; EOF
                     (progn
@@ -1104,7 +1161,7 @@
       (when (and (< i end) (>= fd 0) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
         (loop
           (when (>= i end) (return nil))
-          (let ((n (%sys-read-raw fd (%fs-io-page) (min 4096 (- end i)))))
+          (let ((n (progn (%fs-oflush stream) (%sys-read-raw fd (%fs-io-page) (min 4096 (- end i))))))
             (when (<= n 0) (return nil))
             (let ((io (%fs-io-page)) (k 0))
               (loop
@@ -1129,7 +1186,7 @@
                 (%fs-set-bpos stream (+ bpos 1))
                 (%fs-set-pos stream (+ (%fs-pos stream) 1))
                 b)
-              (let ((n (%sys-read-into-buf fd (%fs-buf stream) 4096)))
+              (let ((n (progn (%fs-oflush stream) (%sys-read-into-buf fd (%fs-buf stream) 4096))))
                 (if (<= n 0)
                     (if eof-error-p (%signal-eof stream) eof-value)
                     (progn
@@ -1226,6 +1283,20 @@
 (defun %fs-write-bytes (stream seq start end)
   "Write SEQ[START,END) to the file stream in 4 KB system calls; T if done."
   (let ((fd (%fs-fd stream)))
+    ;; a socket stream: into its output buffer when the slice fits, else the
+    ;; buffer goes out first and the slice after it, straight
+    (when (and (%fs-bulk-ok-p stream seq) (%fs-obuf-p stream fd))
+      (let ((n (%fs-olen stream)) (len (- end start)))
+        (if (<= (+ n len) +fs-obuf-size+)
+            (let ((ob (%fs-obuf stream)) (j 0))
+              (loop
+                (when (>= j len) (return nil))
+                (%prim-aset ob (+ n j) (aref seq (+ start j)))
+                (setq j (+ j 1)))
+              (%fs-set-olen stream (+ n len))
+              (%fs-set-pos stream (+ (%fs-pos stream) len))
+              (return-from %fs-write-bytes t))
+            (%fs-oflush stream))))
     (when (and (%fs-bulk-ok-p stream seq) (%cab-fd-p fd)
                (%cab-write-bytes stream fd seq start end))
       (return-from %fs-write-bytes t))

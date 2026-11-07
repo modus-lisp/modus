@@ -11128,7 +11128,27 @@
      ;; promoted local) is compared in place — no MOV into DEST / a temp.
      (let* ((bop (%fusable-compare test env))
             (a (cadr test)) (b (caddr test))
-            (ra (%operand-reg a env)) (rb (%operand-reg b env)))
+            (ra (%operand-reg a env)) (rb (%operand-reg b env))
+            ;; PURE RIGHT OPERAND (a typed AREF, typed + - * ...): A goes into
+            ;; a temp of its own, so B's code cannot disturb it and no push/pop
+            ;; is needed -- see COMPILE-COMPARE-2.  The evaluation order is
+            ;; unchanged.
+            ;; Only while both temps are PHYSICAL (V4..V8): past them a temp
+            ;; is a frame slot written through VR, and the push/pop is cheaper
+            ;; (x64's dirty-tile scan ran 35% slower with A in a slot temp).
+            (ta (and (not ra) (not rb) (not (integerp b))
+                     (not (%leaf-operand-p b env)) (%pure-simple-expr-p b env)
+                     (<= *temp-reg-counter* 3)
+                     (alloc-temp-reg))))
+       (when ta
+         (compile-form a env ta)
+         (let ((temp (alloc-temp-reg)))
+           (compile-form b env temp)
+           (emit-ir :cmp ta temp)
+           (emit-ir (%inverse-branch bop) false-label)
+           (free-temp-reg)
+           (free-temp-reg))
+         (return-from %compile-test-branch nil))
        (unless ra (compile-form a env dest))
        ;; a non-negative fixnum literal on the right: CMP-IMM, no temp
        (when (and (integerp b) (>= b 0) (< (ash b +fixnum-shift+) #x80000000))
@@ -11281,9 +11301,17 @@
              (emit-ir :call helper 2)
              (emit-ir :bnull +vreg-vr+ false-label)
              (emit-ir :br through))))
-        (let ((a-temp nil) (tag-temp nil))
-          (if (%temps-must-spill-p 2)
-              (progn
+        (let ((a-temp nil) (tag-temp nil) (l-temp nil) (lhs dest))
+          (cond
+            ;; PURE RIGHT OPERAND: A and B each in a temp of their own, no
+            ;; push/pop -- see COMPILE-COMPARE-2.
+            ((and (not (%leaf-operand-p b env)) (%pure-simple-expr-p b env)
+                  (<= *temp-reg-counter* 2))   ; all three temps physical (V4..V8)
+             (setf a-temp (alloc-temp-reg) tag-temp (alloc-temp-reg) l-temp (alloc-temp-reg)
+                   lhs l-temp)
+             (compile-form a env l-temp)
+             (compile-form b env a-temp))
+            ((%temps-must-spill-p 2)
                 (compile-form a env dest)
                 (emit-ir :push dest)
                 (compile-form b env dest)
@@ -11291,7 +11319,7 @@
                 (setf tag-temp (alloc-temp-reg))
                 (emit-ir :mov a-temp dest)
                 (emit-ir :pop dest))
-              (progn
+            (t
                 (setf a-temp (alloc-temp-reg))
                 (setf tag-temp (alloc-temp-reg))
                 (compile-form a env dest)
@@ -11303,22 +11331,23 @@
                       (compile-form b env a-temp)
                       (emit-ir :pop dest)))))
           (unless (and (%expr-width a env) (%expr-width b env))
-            (emit-ir :or tag-temp dest a-temp)
+            (emit-ir :or tag-temp lhs a-temp)
             (emit-ir :test-imm tag-temp 1)
             (emit-ir :bne slow))
-          (emit-ir :cmp dest a-temp)
+          (emit-ir :cmp lhs a-temp)
           (emit-ir (%inverse-branch branch-op) false-label)
           (emit-ir-label through)
-          (let ((at a-temp))
+          (let ((at a-temp) (lt lhs))
             (emit-deferred-tail
              (lambda ()
                (emit-ir-label slow)
-               (emit-ir :mov +vreg-v0+ dest)
+               (emit-ir :mov +vreg-v0+ lt)
                (emit-ir :mov +vreg-v1+ at)
                (emit-ir :set-nargs 2)
                (emit-ir :call helper 2)
                (emit-ir :bnull +vreg-vr+ false-label)
                (emit-ir :br through))))
+          (when l-temp (free-temp-reg))
           (free-temp-reg)
           (free-temp-reg)))))
 
@@ -23282,10 +23311,30 @@
     (return-from compile-compare-2 (%compile-float-compare branch-op a b env dest)))
   (let ((a-temp     nil)
         (tag-temp   nil)
+        ;; LHS: the register holding A for the compare.  DEST, except on the
+        ;; PURE-RIGHT path below, where A sits in a temp of its own.
+        (lhs        dest)
+        (l-temp     nil)
         (true-label (make-compiler-label))
         (slow-label (make-compiler-label))
         (end-label  (make-compiler-label)))
-    (if (%temps-must-spill-p 2)
+    (cond
+      ;; PURE RIGHT OPERAND (a typed AREF, typed + - *, ...: straight-line,
+      ;; no call): A goes into a temp of its own and B into another, so
+      ;; nothing B's code touches -- x64 writes an AREF through rax = VR,
+      ;; which is often DEST -- can disturb A, and no push/pop is needed.
+      ;; The order of evaluation is unchanged.  glass's dirty-tile scan
+      ;; (= (aref px i) (aref snap i)) spent four instructions per pixel
+      ;; spilling the first element through the stack.
+      ((and (not (%leaf-operand-p b env)) (%pure-simple-expr-p b env)
+            (<= *temp-reg-counter* 2))   ; all three temps physical (V4..V8)
+       (setf a-temp (alloc-temp-reg))
+       (setf tag-temp (alloc-temp-reg))
+       (setf l-temp (alloc-temp-reg))
+       (setf lhs l-temp)
+       (compile-form a env l-temp)
+       (compile-form b env a-temp))
+      ((%temps-must-spill-p 2)
         ;; SPILL variant: hold NO temps across the operand recursions —
         ;; a lives on the hardware stack while b compiles into dest, and
         ;; the two check temps are allocated only for the straight-line
@@ -23297,9 +23346,9 @@
           (setf a-temp (alloc-temp-reg))
           (setf tag-temp (alloc-temp-reg))
           (emit-ir :mov a-temp dest)
-          (emit-ir :pop dest))
-        ;; Historical variant (byte-identical below the threshold).
-        (progn
+          (emit-ir :pop dest)))
+      ;; Historical variant (byte-identical below the threshold).
+      (t
           (setf a-temp (alloc-temp-reg))
           (setf tag-temp (alloc-temp-reg))
           (compile-form a env dest)
@@ -23313,7 +23362,7 @@
                 (emit-ir :push dest)
                 (compile-form b env a-temp)
                 (emit-ir :pop dest)))))
-    ;; Tag check: (dest | a-temp) & 1 == 0  ⇒ both fixnums (low bit 0).
+    ;; Tag check: (lhs | a-temp) & 1 == 0  ⇒ both fixnums (low bit 0).
     ;; :bnnull tests against NIL (≠NIL→branch), so we use :cmp + :bne.
     ;; Typed fast path: when both operands are provably fixnum-typed
     ;; expressions (declared variables, typed aref, literals — see
@@ -23321,11 +23370,11 @@
     ;; but unreachable.  The dotimes (< var count) test is one of these
     ;; per iteration of every loop.
     (unless (and (%expr-width a env) (%expr-width b env))
-      (emit-ir :or  tag-temp dest a-temp)
+      (emit-ir :or  tag-temp lhs a-temp)
       (emit-ir :test-imm tag-temp 1)
       (emit-ir :bne slow-label))
     ;; Fast path: tagged-fixnum compare.
-    (emit-ir :cmp dest a-temp)
+    (emit-ir :cmp lhs a-temp)
     (emit-ir branch-op true-label)
     (compile-nil dest)
     (emit-ir :br end-label)
@@ -23348,7 +23397,7 @@
                     ((eq branch-op :ble) "%CHECKED-LE")
                     ((eq branch-op :bge) "%CHECKED-GE")
                     (t                   "%CHECKED-EQ"))))
-      (emit-ir :mov +vreg-v0+ dest)
+      (emit-ir :mov +vreg-v0+ lhs)
       (emit-ir :mov +vreg-v1+ a-temp)
       (emit-ir :set-nargs 2)
       (emit-ir :call helper 2)
@@ -23357,6 +23406,7 @@
     (emit-ir-label true-label)
     (compile-t dest)
     (emit-ir-label end-label)
+    (when l-temp (free-temp-reg))   ; l-temp
     (free-temp-reg)   ; tag-temp
     (free-temp-reg))) ; a-temp
 

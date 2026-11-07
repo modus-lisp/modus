@@ -14075,6 +14075,33 @@
 ;;; Setq
 ;;; ============================================================
 
+(defvar *wrapping-arith-args* nil
+  "The argument list (EQ) of a two-operand + or - whose result is stored into
+   a fixnum-declared variable under (SAFETY 0): COMPILE-ADD / COMPILE-SUB trust
+   it not to overflow.  A non-fixnum there is undefined (CLHS 3.3.4), so the
+   plain op is a valid compile, as SBCL's is.  Set by COMPILE-SETQ, SETQ and
+   restore, not LET -- see *TAGBODY-EMITTED-LABELS*.")
+
+(defun %wrapping-arith-args (var val env)
+  "VAL's argument list when (setq VAR VAL) may wrap -- see
+   *WRAPPING-ARITH-ARGS* -- else NIL."
+  (and (= *compile-safety* 0)
+       (consp val) (symbolp (car val))
+       (or (name-eq (car val) "+") (name-eq (car val) "-"))
+       (consp (cdr val)) (consp (cddr val)) (null (cdddr val))
+       (let ((b (env-lookup env var)))
+         (and b (member (binding-location b) '(:stack :reg))
+              (let ((w (ignore-errors (%decl-int-width (%resolve-declared-type (binding-dtype b))))))
+                (and w (<= w +fixnum-signed-bits+)))))
+       (cdr val)))
+
+(defun %wrap-trust (args trust)
+  "TRUST, or a no-overflow trust when ARGS is *WRAPPING-ARITH-ARGS* and both
+   operands are proven fixnums (TRUST non-NIL)."
+  (if (and trust args (eq args *wrapping-arith-args*))
+      (list t t (caddr trust))
+      trust))
+
 (defun compile-setq (var val env dest)
   "Compile (setq var val).  symbol-macrolet name → (setf expansion val)
    per CLHS 5.1.2.4."
@@ -14096,6 +14123,19 @@
     (return-from compile-setq
       (compile-form `(setf ,(gethash (normalize-name var) *global-symbol-macros*) ,val)
                     env dest)))
+  ;; (SAFETY 0) store of + / - into a fixnum variable: the op may wrap.
+  ;; Restored at the end of the compile (every return below is after it).
+  (let ((wa (%wrapping-arith-args var val env)))
+    (when wa
+      (let ((saved *wrapping-arith-args*))
+        (setq *wrapping-arith-args* wa)
+        (compile-setq-1 var val env dest)
+        (setq *wrapping-arith-args* saved)
+        (return-from compile-setq nil))))
+  (compile-setq-1 var val env dest))
+
+(defun compile-setq-1 (var val env dest)
+  "COMPILE-SETQ for a lexical or global variable (no symbol-macro)."
   ;; FP-resident local (layer 2c): the value tree lands in the register
   ;; directly; a non-tree value is boxed then unboxed; DEST (the setq
   ;; value) is boxed only when wanted.
@@ -14108,7 +14148,7 @@
       (if (and dest (not *setq-value-unused*))
           (%emit-fpreg-box dest fb)
           (%fp-diag-bump 5))
-      (return-from compile-setq nil)))
+      (return-from compile-setq-1 nil)))
   ;; SETQ INTO A REGISTER-RESIDENT VARIABLE (2026-09-18): when VAL can be
   ;; evaluated with the variable's own register as the destination — the
   ;; variable is read at most once in VAL and that read is the first leaf
@@ -14124,7 +14164,7 @@
         (compile-form val env reg)
         (when (and dest (/= dest reg) (not *setq-value-unused*))
           (emit-ir :mov dest reg))
-        (return-from compile-setq nil))))
+        (return-from compile-setq-1 nil))))
   (compile-form val env dest)
   (let ((binding (env-lookup env var)))
     (cond
@@ -22520,7 +22560,10 @@
     (return-from compile-add (%compile-single-float-arith "+" args env dest)))
   (when (%double-float-arith-applicable-p args env)
     (return-from compile-add (%compile-double-float-arith "+" args env dest)))
-  (setq args (%swap-commutative-args args env))
+  (let ((orig args))
+    (setq args (%swap-commutative-args args env))
+    ;; a wrapping store's mark follows the operands it names
+    (when (and orig (eq orig *wrapping-arith-args*)) (setq *wrapping-arith-args* args)))
   (let ((anf (and args (cdr args) (anf-normalize-arith-args '+ args env))))
     (cond
       ((null args) (compile-integer 0 dest))
@@ -22536,7 +22579,7 @@
        (let ((lw (%expr-width (car args) env)))
          (dolist (arg (cdr args))
            (check-arith-nesting '+ arg)   ; backstop — ANF above handles the hit
-           (let ((trust (%arith-trust-for lw (%expr-width arg env) :add)))
+           (let ((trust (%wrap-trust args (%arith-trust-for lw (%expr-width arg env) :add))))
              (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                  (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                    (%compile-arith-arg-step-e2 arg env dest :add-checked "GENERIC-ADD" trust (or src1 dest))
@@ -22611,7 +22654,7 @@
              (let ((lw (%expr-width (car args) env)))
                (dolist (arg (cdr args))
                  (check-arith-nesting '- arg)   ; backstop — ANF above handles the hit
-                 (let ((trust (%arith-trust-for lw (%expr-width arg env) :sub)))
+                 (let ((trust (%wrap-trust args (%arith-trust-for lw (%expr-width arg env) :sub))))
                    (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                        (let ((*arith-push-depth* (1+ *arith-push-depth*)))
                          (%compile-arith-arg-step-e2 arg env dest :sub-checked "GENERIC-SUBTRACT" trust (or src1 dest))

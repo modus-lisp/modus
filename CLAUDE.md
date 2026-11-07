@@ -23,8 +23,11 @@ SD, HDMI, GPIO, RNG, `arch-rpi-cl` and `boot-rpi-cl` (stage 1); the x86/QEMU NIC
 console, SEV-SNP's GHCB and attestation, the bare-metal arch adapters, `bare-threads`,
 `bare-sync`, `bare-perf`, and the bare-metal network services -- `io-net`, `tcp-conns`,
 `bare-sockets`, `net-service`, `main-jobs`, `ssh-inetd`, `http-client` (stage 2).  What
-hosted modus reads too (`ip`, `ssh`, `crypto*`, `actors`, the `sb-*` shims) stays here, and
-so, for now, do the boot descriptors `lib/load-mvm.lisp` loads for every target.
+hosted modus reads too (`ip`, `ssh`, `crypto*`, `actors`, the `sb-*` shims) stays here.  So
+do the boot descriptors (`boot/*.lisp`), by decision rather than by omission: they are the
+compiler's knowledge of how to emit a freestanding image for each target, `lib/load-mvm.lisp`
+loads them for every build (hosted included), and moving them would make every modus build
+need vessel.
 
 - **A build finds them through `MODUS-SOURCE`** (lib/load-mvm.lisp): modus's own file if it
   has one, else vessel's.  `mvm-load`, `mvm-text` and the `net/` readers all go through it;

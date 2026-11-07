@@ -19220,6 +19220,12 @@
             env dest)
         (setq *nonlocal-tagbodies* %ntb-saved)))))
 
+(defvar *tagbody-emitted-labels* nil
+  "Labels of TAGBODY tags already emitted in this compile: a GO to one of them
+   branches BACKWARD, i.e. closes a loop.  Maintained by SETQ and restored, not
+   LET-bound (a special LET in the self-hosted compiler is invisible to its
+   callees -- see %COMPILE-LOOP-1).")
+
 (defun compile-tagbody (body env dest)
   "Compile (tagbody {tag | form}*).  Tags can be symbols or integers
    per CLHS 5.6.1.2; the previous symbol-only check silently treated
@@ -19262,19 +19268,23 @@
       (when (%tagbody-tag-p item)
         (push (cons item (cons (%note-label-depth (make-compiler-label)) tb-seq))
               *tagbody-tags*)))
-    ;; Second pass: compile
-    (let ((rest body))
+    ;; Second pass: compile.  This tagbody's labels leave
+    ;; *TAGBODY-EMITTED-LABELS* when it ends (its tags are out of scope).
+    (let ((rest body) (%emitted-saved *tagbody-emitted-labels*))
       (loop while rest
             do (let ((item (car rest)))
                  (if (%tagbody-tag-p item)
                      ;; It's a tag: emit label
-                     (emit-ir-label (cadr (assoc item *tagbody-tags* :test #'eql)))
+                     (let ((lbl (cadr (assoc item *tagbody-tags* :test #'eql))))
+                       (emit-ir-label lbl)
+                       (setq *tagbody-emitted-labels* (cons lbl *tagbody-emitted-labels*)))
                      ;; It's a form: compile it.  A TAGBODY form is a statement
                      ;; by definition — its value is always discarded.
                      (progn
                        (%fp-diag-bump 0)
                        (%compile-statement item env dest))))
-               (setq rest (cdr rest))))
+               (setq rest (cdr rest)))
+      (setq *tagbody-emitted-labels* %emitted-saved))
     ;; Tagbody returns nil
     (compile-nil dest)))
 
@@ -19301,6 +19311,12 @@
     ;; cleanups before branching (GO carries no value, so no push/pop).
     (%emit-uwp-unwind-to (cddr entry))
     (%emit-pop-to-label-depth (cadr entry))
+    ;; A BACKWARD GO closes a loop: poll for a stop-the-world request or a
+    ;; preemption there, as the simple LOOP's back-edge does.  Without it a
+    ;; (tagbody top ... (go top)) loop never reached a GC rendezvous, and a
+    ;; threaded image waited on it forever.
+    (when (member (cadr entry) *tagbody-emitted-labels* :test #'eq)
+      (emit-ir :yield))
     (emit-ir :br (cadr entry))))
 
 ;;; ============================================================

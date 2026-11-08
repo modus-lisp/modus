@@ -31657,7 +31657,7 @@
        ;; body can use %PRIM-AREF / %PRIM-ASET directly and skip the public
        ;; AREF/ASET cond entirely — which was already testing %MDA-P (itself
        ;; five type tests plus an OBJ-SUBTAG), CONSP and %PRIM-STRINGP on
-       ;; every single slot access.  See GATE-RESULT-244-accessors.md.
+       ;; every single slot access.  See docs/gate-results/GATE-RESULT-244-accessors.md.
        ;; The printer consults this before printing #S(...).  It was parsed
        ;; nowhere: a struct with :PRINT-FUNCTION / :PRINT-OBJECT printed
        ;; #S(...) regardless.

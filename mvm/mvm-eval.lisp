@@ -2264,7 +2264,7 @@
    INVALIDATION comment there.  The residual — an already-installed native
    function whose page baked a callee that is later redefined — is a real
    divergence from the interpreter's late binding and is reported, not fixed;
-   see GATE-RESULT-jit-defun.md.
+   see docs/gate-results/GATE-RESULT-jit-defun.md.
 
    The superseded page is NOT unmapped (a live caller may hold its address), so
    each redefinition leaks its predecessor's page — a few KB per redefinition,

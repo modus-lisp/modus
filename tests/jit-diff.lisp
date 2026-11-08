@@ -879,7 +879,7 @@
 ;; ... but once jd-redef-caller is itself installed NATIVE it has BAKED
 ;; jd-redef's address, so a later redefinition of jd-redef is invisible to it.
 ;; This is the one semantic divergence #222 introduces and it is deliberately
-;; reported, not fixed -- see jd-note-earlybind and GATE-RESULT-jit-defun.md.
+;; reported, not fixed -- see jd-note-earlybind and docs/gate-results/GATE-RESULT-jit-defun.md.
 (eval '(defun jd-redef (x) (* x 7)))
 (jd-note-earlybind "d222-redef-via-2" (eval '(jd-redef-caller 5)) 35)
 ;; The DIRECT call, however, must always see the newest definition.

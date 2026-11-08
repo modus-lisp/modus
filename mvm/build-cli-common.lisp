@@ -359,7 +359,7 @@
           ;; worktrees both sides, same 17625-test corpus —
           ;;   BASE 17476 / NET 17475, CHUNK-CRASH 0=0, FILE-WEDGE 30=30.
           ;; The lone -1 (P:13445) passes 3/3 on BOTH binaries in isolation, so
-          ;; it is 600s shard-truncation noise.  See GATE-RESULT-206-207.md.
+          ;; it is 600s shard-truncation noise.  See docs/gate-results/GATE-RESULT-206-207.md.
           ;;
           ;; Perf cost of the fix measured ~zero (3.991s -> 4.033s on the same
           ;; workload): only the TOP-LEVEL form degrades to interpret, and

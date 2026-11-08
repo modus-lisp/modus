@@ -23,7 +23,7 @@ Drivers embed the ABSOLUTE tarball path, so they are generated per run
 produced) rather than committed.  Output is deterministic: the same --tars
 gives byte-identical drivers.
 
-History: this was /home/claude/lf ("library frontier", GATE-RESULT-libfrontier.md)
+History: this was /home/claude/lf ("library frontier", docs/gate-results/GATE-RESULT-libfrontier.md)
 -- gen.py (probes) + gen-ql.py (the real-path drivers), merged.  gen.py's
 other mode, drivers that loaded a file list computed by the HOST's ASDF, is
 not carried over: it measured the language and almost none of the system.

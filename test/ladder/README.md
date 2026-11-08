@@ -7,7 +7,7 @@ use-probes before (`P1.*`) and after (`P2.*`) a forced collection.
 
 This is the gate for i386 (see "Running i386" in CLAUDE.md) and the cross-arch
 comparison for x64 / aarch64. It used to live outside the repo at
-`/home/claude/lf` ("library frontier", after `GATE-RESULT-libfrontier.md`),
+`/home/claude/lf` ("library frontier", after `docs/gate-results/GATE-RESULT-libfrontier.md`),
 which is why the logs and Lisp helpers still say `LF-` / `lf-`.
 
 ```bash

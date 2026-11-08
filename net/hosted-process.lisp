@@ -240,3 +240,148 @@
                       (t (setq b -1)))))))))
     (%proc-unmap buf (+ cap 16))
     (cons o1 o2)))
+
+;;; ============================================================
+;;; PSEUDO-TERMINALS, SESSIONS AND A CHOSEN ENVIRONMENT
+;;; ============================================================
+;;;
+;;; What SB-EXT:RUN-PROGRAM's :PTY, :ENVIRONMENT and :WAIT NIL need
+;;; (net/sb-sys-shim.lisp builds the SBCL surface on these).  The shim is
+;;; runtime-compiled, and a JIT-compiled function that issues a syscall can get
+;;; the syscall NUMBER back (THE SYSCALL FLOOR, net/hosted-sockets-post.lisp),
+;;; so every syscall stays here, in AOT code.
+;;;
+;;; A pty on Linux is posix_openpt + grantpt + unlockpt + ptsname, and three of
+;;; those are ioctls glibc wraps: open("/dev/ptmx"), TIOCSPTLCK(0) to unlock the
+;;; slave, TIOCGPTN for its number (the slave is /dev/pts/N).  grantpt is a
+;;; no-op on devpts, which already gives the slave the caller's uid.
+;;;
+;;; THE CHILD BECOMES A SESSION LEADER (setsid) and opens the slave WITHOUT
+;;; O_NOCTTY, which makes the slave its controlling terminal (TIOCSCTTY too, for
+;;; a kernel built otherwise): the shell then owns job control, ^C on the pty
+;;; signals its foreground group, and a hangup reaches the whole session.
+;;; Everything the child needs -- the slave's path, argv, envp -- is laid out
+;;; before the fork, exactly as %PROC-SPAWN does; the child makes syscalls on
+;;; fixnums and nothing else.
+;;;
+;;; x86-64: ioctl 16, setsid 112; TIOCSPTLCK #x40045431, TIOCGPTN #x80045430,
+;;; TIOCSCTTY #x540E.
+
+(defun %proc-openpt ()
+  "posix_openpt(O_RDWR|O_NOCTTY|O_CLOEXEC) + unlockpt + ptsname: (master-fd . N),
+   the slave being /dev/pts/N, or a negative errno."
+  (let* ((buf (%proc-scratch 32)))
+    (if (= buf 0)
+        -12
+        (progn
+          (%proc-put-cstr "/dev/ptmx" buf)
+          (let ((fd (syscall3 2 buf (logior 2 #x100 (%proc-o-cloexec)) 0)))
+            (if (< fd 0)
+                (progn (%proc-unmap buf 32) fd)
+                (progn
+                  (setf (mem-ref (+ buf 16) :u32) 0)
+                  (let ((r1 (syscall3 16 fd #x40045431 (+ buf 16))))
+                    (setf (mem-ref (+ buf 16) :u32) 0)
+                    (let ((r2 (if (< r1 0) r1 (syscall3 16 fd #x80045430 (+ buf 16)))))
+                      (let ((n (mem-ref (+ buf 16) :u32)))
+                        (%proc-unmap buf 32)
+                        (if (< r2 0)
+                            (progn (syscall3 3 fd 0 0) r2)
+                            (cons fd n))))))))))))
+
+(defun %proc-ioctl-buf (fd request bytes in)
+  "ioctl(FD, REQUEST, &buf) on a fresh BYTES-byte buffer, seeded from the byte
+   vector IN when given.  Returns (result . bytes-after) -- the kernel's answer
+   and the buffer's contents as a byte vector -- so the caller never holds a raw
+   address."
+  (let ((buf (%proc-scratch bytes)))
+    (if (= buf 0)
+        (cons -12 nil)
+        (let ((i 0))
+          (when in
+            (loop
+              (when (>= i (min bytes (length in))) (return nil))
+              (setf (mem-ref (+ buf i) :u8) (aref in i))
+              (setq i (+ i 1))))
+          (let ((r (syscall3 16 fd request buf))
+                (out (make-array bytes :element-type '(unsigned-byte 8))))
+            (setq i 0)
+            (loop
+              (when (>= i bytes) (return nil))
+              (setf (aref out i) (mem-ref (+ buf i) :u8))
+              (setq i (+ i 1)))
+            (%proc-unmap buf bytes)
+            (cons r out))))))
+
+(defun %proc-child-2 (path-addr argv-addr envp dir-addr in out err sig-addr tty-addr)
+  "%PROC-CHILD, with a controlling terminal: when TTY-ADDR is not 0, setsid, open
+   that pty slave (becoming its controlling terminal) and make it fds 0-2 before
+   IN/OUT/ERR (an explicit fd still wins).  Syscalls on fixnums only."
+  (when (> tty-addr 0)
+    (syscall3 112 0 0 0)                              ; setsid
+    (let ((t-fd (syscall3 2 tty-addr 2 0)))           ; O_RDWR, a controlling tty
+      (when (< t-fd 0) (syscall3 231 127 0 0))
+      (syscall3 16 t-fd #x540E 0)                     ; TIOCSCTTY
+      (syscall3 33 t-fd 0 0)
+      (syscall3 33 t-fd 1 0)
+      (syscall3 33 t-fd 2 0)
+      (when (> t-fd 2) (syscall3 3 t-fd 0 0))))
+  (when (>= in 0) (syscall3 33 in 0 0))
+  (when (>= out 0) (syscall3 33 out 1 0))
+  (when (>= err 0) (syscall3 33 err 2 0))
+  (when (> dir-addr 0)
+    (when (< (syscall3 80 dir-addr 0 0) 0) (syscall3 231 127 0 0)))
+  (syscall6 13 13 sig-addr 0 8 0 0)        ; SIGPIPE -> SIG_DFL
+  (syscall6 14 2 sig-addr 0 8 0 0)         ; SIG_SETMASK, empty
+  (syscall3 59 path-addr argv-addr envp)
+  (syscall3 231 127 0 0))
+
+(defun %proc-spawn-2 (path args env dir in out err tty)
+  "%PROC-SPAWN, and: ENV, a list of \"NAME=value\" strings for the child's
+   environment (NIL: this process's own); TTY, a pty slave's path for the child
+   to take as its controlling terminal and fds 0-2 (NIL: none).  Returns the
+   pid, or -errno."
+  (let* ((nargs (length args))
+         (nenv (length env))
+         (bytes (+ 64 (* 8 (+ nargs 1)) (* 8 (+ nenv 1)) (+ 1 (%proc-utf8-len path))
+                   (if dir (+ 1 (%proc-utf8-len dir)) 0)
+                   (if tty (+ 1 (%proc-utf8-len tty)) 0)
+                   (let ((s 0)) (dolist (a args s) (setq s (+ s 1 (%proc-utf8-len a)))))
+                   (let ((s 0)) (dolist (a env s) (setq s (+ s 1 (%proc-utf8-len a)))))))
+         (buf (%proc-scratch bytes)))
+    (if (= buf 0)
+        -12
+        (let* ((sig buf)                                  ; 32 zero bytes
+               (argv (+ buf 64))
+               (envv (+ argv (* 8 (+ nargs 1))))
+               (p (+ envv (* 8 (+ nenv 1))))
+               (path-addr p)
+               (dir-addr 0)
+               (tty-addr 0))
+          (setq p (%proc-put-cstr path p))
+          (when dir (setq dir-addr p) (setq p (%proc-put-cstr dir p)))
+          (when tty (setq tty-addr p) (setq p (%proc-put-cstr tty p)))
+          (let ((i 0))
+            (dolist (a args)
+              (%proc-put64 (+ argv (* 8 i)) p)
+              (setq p (%proc-put-cstr a p))
+              (setq i (+ i 1)))
+            (%proc-put64 (+ argv (* 8 i)) 0))
+          (let ((i 0))
+            (dolist (a env)
+              (%proc-put64 (+ envv (* 8 i)) p)
+              (setq p (%proc-put-cstr a p))
+              (setq i (+ i 1)))
+            (%proc-put64 (+ envv (* 8 i)) 0))
+          (let ((envp (if env envv (%proc-envp))))
+            ;; clone(CLONE_VFORK|SIGCHLD): see %PROC-SPAWN.
+            (let ((pid (syscall6 56 #x4011 0 0 0 0 0)))
+              (when (= pid 0)
+                (%proc-child-2 path-addr argv envp dir-addr in out err sig tty-addr))
+              (%proc-unmap buf bytes)
+              pid))))))
+
+(defun %proc-ioctl-addr (fd request addr)
+  "ioctl(FD, REQUEST, ADDR) on a raw address (an SB-ALIEN scratch the caller
+   filled).  The kernel's answer."
+  (syscall3 16 fd request addr))

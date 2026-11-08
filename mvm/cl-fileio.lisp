@@ -410,14 +410,18 @@
           (mem-ref (+ buf-addr 48) :u32)))))
 
 ;;; File stream constructor and accessors
-;;; Data = (fd dir pos buf buf-pos buf-len closed elt-type)
+;;; Data = (fd dir pos buf buf-pos buf-len obuf olen closed elt-type ext-format)
 ;;; Encoded as a cons chain:
-;;;   (fd . (dir . (pos . (buf . (buf-pos . (buf-len . (closed . elt-type)))))))
-;;; The final two-element tail (closed . elt-type) is a proper cons so
-;;; elt-type lives at the very last cdr.  elt-type is the :element-type the
-;;; file was opened with (a symbol like CHARACTER or a type specifier such
-;;; as (UNSIGNED-BYTE 8)).  stream-element-type reports it; binary streams
-;;; let read-sequence read BYTES (via %input-stream-reads-chars-p).
+;;;   (fd . (dir . (pos . (buf . (buf-pos . (buf-len . (obuf . (olen . (closed . (elt-type . ef))))))))))
+;;; The final tail (closed . (elt-type . ef)) holds the closed flag, the
+;;; :element-type the file was opened with (a symbol like CHARACTER or a type
+;;; specifier such as (UNSIGNED-BYTE 8)) -- stream-element-type reports it;
+;;; binary streams let read-sequence read BYTES (via
+;;; %input-stream-reads-chars-p) -- and the EXTERNAL FORMAT of a character
+;;; stream: NIL for UTF-8 (the default), :LATIN-1 for a byte per character
+;;; both ways.  A pty or a byte protocol read as characters wants the second:
+;;; every byte comes back as itself, and no read waits for the rest of a UTF-8
+;;; sequence that has not arrived (READ-CHAR-NO-HANG on a terminal).
 
 (defconstant +fs-obuf-size+ 16384 "Output bytes a socket stream holds before a write(2).")
 
@@ -429,9 +433,17 @@
         ;; made HERE, by the thread that makes the stream: a worker that only
         ;; writes the stream later stores bytes into it, never an object
         (obuf (if (eql dir 3) (%make-string-array +fs-obuf-size+) nil))
-        (elt-type (if et (car et) 'character)))
+        (elt-type (if et (car et) 'character))
+        (ef (if (cdr et) (%normalize-external-format (cadr et)) nil)))
     (%make-stream 9
-      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons obuf (cons 0 (cons nil elt-type))))))))))))
+      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons obuf (cons 0 (cons nil (cons elt-type ef)))))))))))))
+
+(defun %normalize-external-format (ef)
+  "NIL for UTF-8 (and :DEFAULT), :LATIN-1 for a byte per character.  A list
+   (:LATIN-1 :EOL-STYLE :LF) is its first element.  Any other format is read as
+   UTF-8, as every format was before Latin-1 existed here."
+  (let ((name (if (consp ef) (car ef) ef)))
+    (if (member name '(:latin-1 :latin1 :iso-8859-1 :iso8859-1 :ascii :us-ascii)) :latin-1 nil)))
 
 (declaim (overridable %fd-input-ready-p))
 (defun %fd-input-ready-p (fd)
@@ -457,7 +469,7 @@
 
 (defun %make-file-stream ()
   "Create a closed/dummy file stream."
-  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons nil (cons 0 (cons t (quote character))))))))))))
+  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons nil (cons 0 (cons t (cons (quote character) nil))))))))))))
 
 (defun %fs-fd      (s) (car  (%stream-data s)))
 (defun %fs-dir     (s) (cadr (%stream-data s)))
@@ -475,8 +487,10 @@
 ;;; closed flag now lives in the CAR of the final two-element tail cell.
 (defun %fs-closed-cell (s) (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))
 (defun %fs-closed  (s) (car (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))))))
-;;; element-type lives in the CDR of that same final tail cell.
-(defun %fs-element-type (s) (cdr (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))))))
+;;; element-type and the external format live in the CDR of that same final tail cell.
+(defun %fs-element-type (s) (car (cdr (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))))
+(defun %fs-external-format (s) (cdr (cdr (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))))
+(defun %fs-latin-1-p (s) (eq (%fs-external-format s) :latin-1))
 
 (defun %fs-set-pos  (s v) (set-car (cddr (%stream-data s)) v))
 (defun %fs-set-bpos (s v) (set-car (cddr (cddr (%stream-data s))) v))
@@ -572,6 +586,7 @@
         (if-exists :new-version)
         (if-does-not-exist nil)  ; default: determined by direction below
         (element-type 'character)
+        (external-format nil)
         (if-does-not-exist-set nil)
         (cur args))
     ;; Parse keyword args from &rest.  Unknown keywords signal
@@ -587,7 +602,7 @@
            (setq if-does-not-exist val)
            (setq if-does-not-exist-set t))
           ((eq key :element-type) (setq element-type val))
-          ((eq key :external-format) nil)  ; accepted, ignored
+          ((eq key :external-format) (setq external-format val))
           ((eq key :allow-other-keys) nil) ; accepted, ignored
           ((eq key :class) nil)            ; permitted impl extension
           (t (error "open: unknown option ~A" key))))
@@ -654,7 +669,7 @@
                (cond
                  ((null if-does-not-exist) nil)
                  (t (error 'file-error :pathname filespec)))
-               (%make-file-stream-full fd 0 element-type))))
+               (%make-file-stream-full fd 0 element-type external-format))))
         ;; :output — write
         ((eq direction :output)
          (let ((exists (%sys-stat-exists path)))
@@ -670,7 +685,7 @@
                  (let ((fd (%sys-open-wronly path)))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)
-                       (%make-file-stream-full fd 1 element-type))))
+                       (%make-file-stream-full fd 1 element-type external-format))))
                 ((eq if-exists :overwrite)
                  ;; :overwrite means open existing file without truncating.
                  ;; O_WRONLY only (no O_CREAT, no O_TRUNC).
@@ -680,16 +695,16 @@
                                          (t (c) -1))))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)
-                       (%make-file-stream-full fd 1 element-type))))
+                       (%make-file-stream-full fd 1 element-type external-format))))
                 ((eq if-exists :append)
                  (let ((fd (%sys-open-append path)))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)
-                       (%make-file-stream-full fd 1 element-type))))
+                       (%make-file-stream-full fd 1 element-type external-format))))
                 (t (let ((fd (%sys-open-wronly path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 1 element-type))))))
+                         (%make-file-stream-full fd 1 element-type external-format))))))
              ;; File doesn't exist
              (t
               (cond
@@ -705,7 +720,7 @@
                 (t (let ((fd (%sys-open-wronly path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 1 element-type)))))))))
+                         (%make-file-stream-full fd 1 element-type external-format)))))))))
         ;; :io — read/write
         ((eq direction :io)
          (let ((exists (%sys-stat-exists path)))
@@ -725,11 +740,11 @@
                  (let ((fd (%sys-open-rdwr path)))
                    (if (< fd 0)
                        (error 'file-error :pathname filespec)
-                       (%make-file-stream-full fd 2 element-type))))
+                       (%make-file-stream-full fd 2 element-type external-format))))
                 (t (let ((fd (%sys-open-rdwr path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (let ((st (%make-file-stream-full fd 2 element-type)))
+                         (let ((st (%make-file-stream-full fd 2 element-type external-format)))
                            ;; :APPEND: the file position starts at the end
                            (when (eq if-exists :append)
                              (file-position st (file-length st)))
@@ -742,7 +757,7 @@
                 (t (let ((fd (%sys-open-rdwr path)))
                      (if (< fd 0)
                          (error 'file-error :pathname filespec)
-                         (%make-file-stream-full fd 2 element-type)))))))))
+                         (%make-file-stream-full fd 2 element-type external-format)))))))))
         (t (error "Unknown :direction ~A" direction))))))
 
 ;;; --- close ---
@@ -941,11 +956,13 @@
   (error 'end-of-file :stream stream))
 
 (defun %fs-read-char (stream eof-error-p eof-value)
-  "Read one character from a file stream: one UTF-8 sequence."
+  "Read one character from a file stream: one UTF-8 sequence, or one byte on a
+   :LATIN-1 stream."
   (let ((b0 (%fs-read-byte-code stream)))
     (cond
       ((< b0 0) (if eof-error-p (%signal-eof stream) eof-value))
       ((< b0 #x80) (code-char b0))
+      ((%fs-latin-1-p stream) (code-char b0))
       (t
        (let ((n (cond ((= (logand b0 #xE0) #xC0) 1)
                       ((= (logand b0 #xF0) #xE0) 2)
@@ -1036,8 +1053,13 @@
 
 ;;; --- File stream write-char ---
 (defun %fs-write-char (code stream)
-  "Write a char code to a file stream, UTF-8 encoded."
+  "Write a char code to a file stream, UTF-8 encoded -- or as one byte on a
+   :LATIN-1 stream, where a character past #xFF is written as ?."
   (let ((fd (%fs-fd stream)))
+    (when (and (>= fd 0) (%fs-latin-1-p stream))
+      (%fs-put-byte stream fd (if (< code 256) code 63))
+      (%fs-set-pos stream (+ (%fs-pos stream) 1))
+      (return-from %fs-write-char nil))
     (when (>= fd 0)
       (cond
         ((< code #x80)
@@ -3145,10 +3167,29 @@
           (let ((ty (%stream-type s)))
             (cond
               ;; Stream types that can produce data without blocking.
-              ((or (= ty 1) (= ty 3) (= ty 4) (= ty 6) (= ty 9))
+              ((or (= ty 1) (= ty 3) (= ty 4) (= ty 6))
                (%read-char-from-stream s eof-error-p eof-value))
+              ;; A file stream reads without waiting only when that is so: it
+              ;; has bytes buffered, or is a seekable file (data or end of file,
+              ;; neither waits), or the kernel says its fd is readable.  A pipe,
+              ;; a pty or a socket with nothing to read answers NIL -- it used to
+              ;; block in read(2), which made READ-CHAR-NO-HANG a READ-CHAR.
+              ((= ty 9)
+               (if (%fs-would-block-p s)
+                   nil
+                   (%read-char-from-stream s eof-error-p eof-value)))
               (t nil)))
           nil))))
+
+(defun %fs-would-block-p (s)
+  "Would reading file stream S wait?  Not with bytes buffered, not on a seekable
+   file, not on an fd poll(2) reports readable (or at end of file)."
+  (let ((fd (%fs-fd s)))
+    (and (>= fd 0)
+         (>= (%fs-bpos s) (%fs-blen s))
+         (let ((cur (%sys-lseek fd 0 1)))
+           (not (and (integerp cur) (>= cur 0))))
+         (not (%fd-input-ready-p fd)))))
 
 ;;; --- Core write-char ---
 

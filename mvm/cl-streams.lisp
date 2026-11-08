@@ -103,7 +103,12 @@
               nil
               (quote character)))
       (quote character)))
-(defun stream-external-format (s) :default)
+(defun stream-external-format (s)
+  ;; :LATIN-1 for a file stream made so (cl-fileio %FS-EXTERNAL-FORMAT); every
+  ;; other stream is UTF-8, which has always been reported as :DEFAULT here.
+  (if (and (streamp s) (= (%stream-type s) 9) (eq (%fs-external-format s) :latin-1))
+      :latin-1
+      :default))
 (defun interactive-stream-p (s) nil)
 
 

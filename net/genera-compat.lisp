@@ -147,6 +147,9 @@
 
 (defpackage "GRAY-STREAMS"
   (:use)
+  ;; SB-GRAY too: SBCL's name for the same 28 symbols, which code written for
+  ;; SBCL reads (glass's listener: sb-gray:fundamental-character-output-stream).
+  (:nicknames "SB-GRAY")
   (:export
    ;; classes
    "FUNDAMENTAL-STREAM"

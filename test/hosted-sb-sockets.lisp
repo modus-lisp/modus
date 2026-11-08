@@ -236,10 +236,9 @@
 (chk "posix-getenv of something unset"
      (sb-ext:posix-getenv "MODUS_DEFINITELY_NOT_SET_XYZZY") nil)
 (chk "*exit-hooks* exists and is a list" sb-ext:*exit-hooks* nil)
-(chk "run-program signals (stated NOT IMPLEMENTED)"
-     (handler-case (progn (sb-ext:run-program "/bin/true" nil) :returned)
-       (t (c) c :signalled))
-     :signalled)
+(chk "run-program runs /bin/true (test/hosted-run-program.lisp has the rest)"
+     (sb-ext:process-exit-code (sb-ext:run-program "/bin/true" nil))
+     0)
 
 (format t "~%-- an explicit-port listener, and it is a DIFFERENT call -~%")
 (chk "socket-listen-port refuses port 0" (socket-listen-port 0) -2)

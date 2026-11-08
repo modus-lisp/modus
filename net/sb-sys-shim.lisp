@@ -28,9 +28,11 @@
 ;;;;                       SIZE and nothing else.  The other 20 fields are not
 ;;;;                       read out of the buffer, and asking for one signals
 ;;;;                       rather than answering 0.
-;;;;   SB-EXT:RUN-PROGRAM  NOT IMPLEMENTED — signals.  modus has no fork and no
-;;;;                       exec.  glass/term is the only caller and is not part
-;;;;                       of the :GLASS system.
+;;;;   SB-EXT:RUN-PROGRAM  hosted x86-64 only (net/hosted-process.lisp).  :PTY T,
+;;;;                       :WAIT, :ENVIRONMENT, :DIRECTORY, :SEARCH, and NIL / T /
+;;;;                       :STREAM / a file for :INPUT :OUTPUT :ERROR.  A Lisp
+;;;;                       stream to copy through, :STATUS-HOOK, :PRESERVE-FDS
+;;;;                       signal.  No SIGCHLD: status is collected when asked.
 ;;;;   SB-ALIEN            Only the shape glass uses: WITH-ALIEN over INT and
 ;;;;                       (ARRAY INT n), ADDR, DEREF, CAST, and ALIEN-FUNCALL
 ;;;;                       of an EXTERN-ALIEN naming a function modus knows how
@@ -44,7 +46,11 @@
   (:use)
   (:export "STAT" "STAT-MODE" "STAT-UID" "STAT-GID" "STAT-INO" "STAT-SIZE"
            "S-ISDIR" "S-ISSOCK" "S-ISREG" "CHMOD" "UNLINK" "GETUID" "GETPID"
-           "SYSCALL-ERROR" "ENOENT"))
+           "SYSCALL-ERROR" "ENOENT"
+           "TERMIOS" "TCGETATTR" "TCSETATTR" "TERMIOS-IFLAG" "TERMIOS-OFLAG"
+           "TERMIOS-CFLAG" "TERMIOS-LFLAG" "TERMIOS-CC"
+           "TCSANOW" "TCSADRAIN" "TCSAFLUSH" "ECHO" "ICANON" "ISIG" "IEXTEN" "ECHOE"
+           "ICRNL" "OPOST" "ONLCR" "VMIN" "VTIME" "VINTR" "VEOF"))
 
 (defpackage "SB-SYS"
   (:use)
@@ -54,6 +60,7 @@
 (defpackage "SB-ALIEN"
   (:use)
   (:export "INT" "UNSIGNED-LONG" "UNSIGNED-INT" "LONG" "CHAR" "C-STRING" "VOID"
+           "SHORT" "UNSIGNED-SHORT" "UNSIGNED-CHAR"
            "ARRAY" "WITH-ALIEN" "ADDR" "DEREF" "CAST" "EXTERN-ALIEN"
            "ALIEN-FUNCALL" "ALIEN-SIZE"))
 
@@ -67,7 +74,8 @@
   (:export "POSIX-GETENV" "*EXIT-HOOKS*" "EXIT" "QUIT" "GC"
            "*INVOKE-DEBUGGER-HOOK*" "RUN-PROGRAM"
            "PROCESS-PTY" "PROCESS-KILL" "PROCESS-ALIVE-P" "PROCESS-EXIT-CODE"
-           "PROCESS-WAIT" "PROCESS-INPUT" "PROCESS-OUTPUT"
+           "PROCESS-WAIT" "PROCESS-INPUT" "PROCESS-OUTPUT" "PROCESS-ERROR"
+           "PROCESS-PID" "PROCESS-STATUS" "PROCESS-CLOSE" "PROCESS-P"
            "OCTETS-TO-STRING" "STRING-TO-OCTETS"
            "DOUBLE-FLOAT-POSITIVE-INFINITY" "DOUBLE-FLOAT-NEGATIVE-INFINITY"
            "SINGLE-FLOAT-POSITIVE-INFINITY" "SINGLE-FLOAT-NEGATIVE-INFINITY"
@@ -167,6 +175,9 @@
    shim does not implement, rather than guessing 8."
   (cond ((eq type 'sb-alien:int) 4)
         ((eq type 'sb-alien:unsigned-int) 4)
+        ((eq type 'sb-alien:short) 2)
+        ((eq type 'sb-alien:unsigned-short) 2)
+        ((eq type 'sb-alien:unsigned-char) 1)
         ((eq type 'sb-alien:long) 8)
         ((eq type 'sb-alien:unsigned-long) 8)
         ((eq type 'sb-alien:char) 1)
@@ -182,7 +193,10 @@
         ((eq type 'sb-alien:long)
          (let ((v (mem-ref a :u64))) (if (>= v #x8000000000000000) (- v #x10000000000000000) v)))
         ((eq type 'sb-alien:unsigned-long) (mem-ref a :u64))
-        ((eq type 'sb-alien:char) (mem-ref a :u8))
+        ((eq type 'sb-alien:char) (let ((v (mem-ref a :u8))) (if (>= v 128) (- v 256) v)))
+        ((eq type 'sb-alien:unsigned-char) (mem-ref a :u8))
+        ((eq type 'sb-alien:short) (let ((v (mem-ref a :u16))) (if (>= v 32768) (- v 65536) v)))
+        ((eq type 'sb-alien:unsigned-short) (mem-ref a :u16))
         (t (error "sb-alien: unsupported scalar type ~S on modus." type))))
 
 (defun %alien-store (a type v)
@@ -190,7 +204,10 @@
          (setf (mem-ref a :u32) (logand v #xFFFFFFFF)))
         ((or (eq type 'sb-alien:long) (eq type 'sb-alien:unsigned-long))
          (setf (mem-ref a :u64) (logand v #xFFFFFFFFFFFFFFFF)))
-        ((eq type 'sb-alien:char) (setf (mem-ref a :u8) (logand v #xFF)))
+        ((or (eq type 'sb-alien:char) (eq type 'sb-alien:unsigned-char))
+         (setf (mem-ref a :u8) (logand v #xFF)))
+        ((or (eq type 'sb-alien:short) (eq type 'sb-alien:unsigned-short))
+         (setf (mem-ref a :u16) (logand v #xFFFF)))
         (t (error "sb-alien: unsupported scalar type ~S on modus." type)))
   v)
 
@@ -207,7 +224,8 @@
    SOCKET-UNSENT-BYTES returns N -- and on modus that N was a pointer: every send queue
    read as ~1.4e14 bytes, so session audio and the microphone judged themselves backed
    up on every send, and a window manager keyed on the backlog would never draw a window."
-  (let ((saved (gensym "CUR")) (binds nil) (inits nil) (macros nil) (addrs nil) (rest bindings))
+  (let ((saved (gensym "CUR")) (binds nil) (inits nil) (macros nil) (addrs nil) (arrays nil)
+        (rest bindings))
     (loop
       (when (null rest) (return nil))
       (let* ((b (car rest)) (name (car b)) (type (cadr b))
@@ -215,9 +233,11 @@
              (a (if scalar (gensym (symbol-name name)) name)))
         (setq binds (cons (list a (list '%alien-alloc (list '%alien-type-bytes (list 'quote type))))
                           binds))
-        (when scalar
-          (setq macros (cons (list name (list '%alien-load a (list 'quote type))) macros))
-          (setq addrs (cons (cons name a) addrs)))
+        (if scalar
+            (progn
+              (setq macros (cons (list name (list '%alien-load a (list 'quote type))) macros))
+              (setq addrs (cons (cons name a) addrs)))
+            (setq arrays (cons (cons name (cadr type)) arrays)))
         (when (cddr b)
           (setq inits (cons (if scalar
                                 (list '%alien-store a (list 'quote type) (caddr b))
@@ -230,13 +250,34 @@
               ,@(reverse inits)
               (macrolet ((sb-alien:addr (place)
                            (let ((hit (assoc place ',addrs)))
-                             (if hit (cdr hit) place))))
+                             (if hit (cdr hit) place)))
+                         ;; DEREF of an array bound HERE knows its element type: an
+                         ;; (ARRAY UNSIGNED-SHORT 4) is read and SETF'd 2 bytes at a
+                         ;; time (struct winsize).  Anything else is the 32-bit DEREF.
+                         (sb-alien:deref (place &optional (index 0))
+                           (let ((hit (assoc place ',arrays)))
+                             (if hit
+                                 (list '%alien-load
+                                       (list '+ place (list '* index (%alien-type-bytes (cdr hit))))
+                                       (list 'quote (cdr hit)))
+                                 (list '%alien-deref32 place index)))))
                 (symbol-macrolet ,(reverse macros)
                   ,@body)))
          (setq *alien-cursor* ,saved)))))
 
 (defmacro sb-alien:addr (place) place)
 (defmacro sb-alien:cast (thing type) (declare (ignore type)) thing)
+
+(defun %alien-deref32 (address index) (mem-ref (+ address (* index 4)) :u32))
+(defun %alien-set-deref32 (address index v)
+  (setf (mem-ref (+ address (* index 4)) :u32) (logand v #xFFFFFFFF))
+  v)
+(defsetf %alien-deref32 (address index) (v) `(%alien-set-deref32 ,address ,index ,v))
+;;; Inside WITH-ALIEN, SETF reaches the local DEREF macro (which knows the element
+;;; width) and not this: a local macro shadows a global setf expander.  modus's
+;;; SETF did not know that until mvm/compiler.lisp's *MACROLET-NAMES*, and an
+;;; (ARRAY UNSIGNED-SHORT 4)'s element 1 was stored 32 bits wide at byte 4.
+(defsetf sb-alien:deref (address &optional (index 0)) (v) `(%alien-set-deref32 ,address ,index ,v))
 
 (defun sb-alien:deref (address &optional (index 0))
   "Read the INDEXth 32-bit int at ADDRESS.  PARTIAL: this shim's WITH-ALIEN only
@@ -318,15 +359,17 @@
 
 (defun sb-sys:make-fd-stream (fd &key input output (element-type 'character)
                                       buffering external-format timeout name)
-  "A stream over an existing descriptor.  :BUFFERING, :EXTERNAL-FORMAT,
-   :TIMEOUT and :NAME are accepted and ignored — modus's fd streams are always
-   buffered, always 8-bit-through, never time out and are not named."
-  buffering external-format timeout name
+  "A stream over an existing descriptor.  :EXTERNAL-FORMAT is UTF-8 (the default)
+   or :LATIN-1 (a byte per character).  :BUFFERING, :TIMEOUT and :NAME are
+   accepted and ignored — modus's fd streams are always buffered, never time out
+   and are not named."
+  buffering timeout name
   (%make-file-stream-full fd
                           (cond ((and input (not output)) 0)
                                 ((and output (not input)) 1)
                                 (t 2))
-                          element-type))
+                          element-type
+                          external-format))
 
 (defmacro sb-sys:with-pinned-objects (objects &body body)
   "PARTIAL AND HONEST: modus's collector COPIES, and there is no pinning
@@ -394,6 +437,77 @@
 (defun sb-posix:getuid () (%sbs-getuid))
 (defun sb-posix:getpid () (%sbs-getpid))
 (defconstant sb-posix:enoent 2)
+;;; ---- termios, and ioctl on a pointer ---------------------------------------------
+;;;
+;;; TCGETS / TCSETS{,W,F} (#x5401..#x5404) on the kernel's struct termios: four
+;;; u32 flag words (iflag oflag cflag lflag), c_line, then 19 control characters
+;;; -- 36 bytes, x86-64 Linux.  A TERMIOS is that, as Lisp values; the ioctls are
+;;; AOT (net/hosted-process.lisp, %PROC-IOCTL-BUF), as every syscall here must be.
+
+(defclass sb-posix:termios ()
+  ((iflag :initarg :iflag :initform 0 :accessor sb-posix:termios-iflag)
+   (oflag :initarg :oflag :initform 0 :accessor sb-posix:termios-oflag)
+   (cflag :initarg :cflag :initform 0 :accessor sb-posix:termios-cflag)
+   (lflag :initarg :lflag :initform 0 :accessor sb-posix:termios-lflag)
+   (line :initarg :line :initform 0 :accessor %termios-line)
+   (cc :initarg :cc :initform (make-array 19 :initial-element 0) :accessor sb-posix:termios-cc)))
+
+(defconstant sb-posix:tcsanow 0)
+(defconstant sb-posix:tcsadrain 1)
+(defconstant sb-posix:tcsaflush 2)
+(defconstant sb-posix:isig #o1)
+(defconstant sb-posix:icanon #o2)
+(defconstant sb-posix:echo #o10)
+(defconstant sb-posix:echoe #o20)
+(defconstant sb-posix:iexten #o100000)
+(defconstant sb-posix:icrnl #o400)
+(defconstant sb-posix:opost #o1)
+(defconstant sb-posix:onlcr #o4)
+(defconstant sb-posix:vintr 0)
+(defconstant sb-posix:veof 4)
+(defconstant sb-posix:vtime 5)
+(defconstant sb-posix:vmin 6)
+
+(defun %posix-fd (fd)
+  (cond ((integerp fd) fd)
+        ((streamp fd) (sb-sys:fd-stream-fd fd))
+        (t (error "sb-posix: ~S is not a file descriptor" fd))))
+
+(defun %termios-u32 (b i)
+  (+ (aref b i) (* 256 (aref b (+ i 1))) (* 65536 (aref b (+ i 2))) (* 16777216 (aref b (+ i 3)))))
+
+(defun sb-posix:tcgetattr (fd)
+  "tcgetattr(3): FD's terminal settings as a TERMIOS.  Signals SYSCALL-ERROR (ENOTTY
+   for something that is not a terminal), as SBCL's does."
+  (unless (fboundp '%proc-ioctl-buf)
+    (error "sb-posix:tcgetattr: this modus image has no terminal layer (hosted x86-64 only)."))
+  (let* ((r (%proc-ioctl-buf (%posix-fd fd) #x5401 36 nil))
+         (b (cdr r)))
+    (when (< (car r) 0) (error 'sb-posix:syscall-error :errno (- 0 (car r))))
+    (let ((cc (make-array 19)))
+      (dotimes (i 19) (setf (aref cc i) (aref b (+ 17 i))))
+      (make-instance 'sb-posix:termios
+                     :iflag (%termios-u32 b 0) :oflag (%termios-u32 b 4)
+                     :cflag (%termios-u32 b 8) :lflag (%termios-u32 b 12)
+                     :line (aref b 16) :cc cc))))
+
+(defun sb-posix:tcsetattr (fd actions termios)
+  "tcsetattr(3): ACTIONS is TCSANOW, TCSADRAIN or TCSAFLUSH."
+  (let ((b (make-array 36 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (flet ((put (i v) (dotimes (k 4) (setf (aref b (+ i k)) (logand (ash v (* -8 k)) 255)))))
+      (put 0 (sb-posix:termios-iflag termios)) (put 4 (sb-posix:termios-oflag termios))
+      (put 8 (sb-posix:termios-cflag termios)) (put 12 (sb-posix:termios-lflag termios))
+      (setf (aref b 16) (%termios-line termios))
+      (dotimes (i 19) (setf (aref b (+ 17 i)) (logand (aref (sb-posix:termios-cc termios) i) 255))))
+    (let ((r (car (%proc-ioctl-buf (%posix-fd fd) (+ #x5402 (case actions (1 1) (2 2) (t 0))) 36 b))))
+      (if (< r 0) (error 'sb-posix:syscall-error :errno (- 0 r)) 0))))
+
+(defun sb-posix::ioctl-with-pointer-arg (fd request pointer)
+  "ioctl(2) with a pointer argument: an address SB-ALIEN handed out (WITH-ALIEN, ADDR).
+   SBCL's own non-variadic entry point, which code reaches for because ioctl is variadic
+   (see glass's term-pty.lisp)."
+  (let ((r (%proc-ioctl-addr (%posix-fd fd) request pointer)))
+    (if (< r 0) (error 'sb-posix:syscall-error :errno (- 0 r)) r)))
 
 ;;; ============================================================
 ;;; SB-EXT additions
@@ -499,12 +613,154 @@
   "A spin-wait's courtesy to the CPU (PAUSE on x86).  Nothing here: correctness never rests on it."
   nil)
 
-(defun sb-ext:run-program (program args &rest options)
-  "NOT IMPLEMENTED, deliberately.  modus has no fork(2), no execve(2), and no
-   pty; :PTY additionally needs /dev/ptmx and a session model.  glass/term is
-   the only production caller and is not part of the :GLASS system."
-  program args options
-  (error "sb-ext:run-program is not implemented on modus (no fork, no exec)."))
+;;; ---- RUN-PROGRAM ---------------------------------------------------------------
+;;;
+;;; SBCL's process interface over net/hosted-process.lisp's fork/exec (hosted
+;;; x86-64; an image without it signals, saying so).  What is here:
+;;;   PROGRAM        a path; with :SEARCH T, looked up on $PATH as execvp does
+;;;   ARGS           strings (argv[0] is PROGRAM, as SBCL makes it)
+;;;   :WAIT          T (default): return when it has exited; NIL: at once
+;;;   :PTY T         a new pseudo-terminal: the child is a session leader with
+;;;                  the slave as controlling terminal and as fds 0-2;
+;;;                  PROCESS-PTY is an I/O fd-stream on the master
+;;;   :INPUT :OUTPUT :ERROR
+;;;                  NIL (/dev/null), T (inherit this process's), :STREAM (a
+;;;                  pipe: PROCESS-INPUT / -OUTPUT / -ERROR), a pathname or
+;;;                  string (a file; :IF-OUTPUT-EXISTS :APPEND appends);
+;;;                  :ERROR :OUTPUT joins stderr to stdout.  Under :PTY,
+;;;                  anything left NIL is the pty, as on SBCL.
+;;;   :ENVIRONMENT   a list of "NAME=value" (default: this process's)
+;;;   :DIRECTORY     the child's working directory
+;;;   :EXTERNAL-FORMAT  :LATIN-1 / :UTF-8 for the streams made here
+;;; PARTIAL: :PTY as a stream, :INPUT/:OUTPUT as a Lisp stream to copy through,
+;;; :STATUS-HOOK and :PRESERVE-FDS signal rather than being dropped.  There is
+;;; no SIGCHLD handler: a child's status is collected when asked for
+;;; (PROCESS-ALIVE-P, -STATUS, -EXIT-CODE, -WAIT), and a child nobody asks about
+;;; stays a zombie until then.  Not a registry the asking could be automatic
+;;; from: only the thread that started a child may wait for it, and on modus a
+;;; thread cannot keep its own objects anywhere global.
+
+;;; The accessors are %PROCESS-*, and SBCL's names are functions over them: a
+;;; :CONC-NAME of SB-EXT::PROCESS- would make the accessor and the exported
+;;; function one symbol, and the first draft's (defun sb-ext:process-pid (p)
+;;; (sb-ext::process-pid p)) was a function calling itself.
+(defstruct (sb-ext::%process (:constructor %make-process) (:predicate sb-ext:process-p)
+                             (:conc-name %process-))
+  pid pty input output error (status :running) exit-code)
+
+(defun %sb-proc-poll (proc hang)
+  "Collect PROC's exit if it has exited (or, with HANG, when it does)."
+  (when (eq (%process-status proc) :running)
+    (let ((code (%proc-wait (%process-pid proc) hang)))
+      (when code
+        (setf (%process-exit-code proc) (if (>= code 128) (- code 128) code)
+              (%process-status proc) (cond ((< code 0) :exited)
+                                                  ((>= code 128) :signaled)
+                                                  (t :exited))))))
+  proc)
+
+(defun %sb-fd-stream (fd dir external-format)
+  (sb-sys:make-fd-stream fd :input (member dir '(:input :io)) :output (member dir '(:output :io))
+                            :external-format (or external-format :default)))
+
+(defun sb-ext:run-program (program args &key (wait t) pty input output (error nil error-given)
+                                        environment directory search external-format
+                                        (if-input-does-not-exist :error)
+                                        (if-output-exists :supersede)
+                                        (if-error-exists :supersede)
+                                        status-hook preserve-fds
+                                        &allow-other-keys)
+  if-input-does-not-exist
+  (unless (fboundp '%proc-spawn-2)
+    (error "sb-ext:run-program: this modus image has no process layer (only the hosted ~
+            x86-64 image starts programs)."))
+  (when (or status-hook preserve-fds (and pty (not (eq pty t))))
+    (error "sb-ext:run-program: :STATUS-HOOK, :PRESERVE-FDS and a stream :PTY are not ~
+            implemented on modus."))
+  (let* ((program (namestring program))
+         (path (if search (%proc-find-program program) program))
+         (args (mapcar (lambda (a) (if (stringp a) a (princ-to-string a))) args))
+         (closes '()) (keep '()) (master nil) (tty nil)
+         (in -1) (out -1) (err -1) (in-s nil) (out-s nil) (err-s nil))
+    (unless path (error "sb-ext:run-program: ~S not found on PATH" program))
+    (labels ((fail (fmt &rest a) (dolist (fd closes) (%proc-close fd))
+               (dolist (fd keep) (%proc-close fd))
+               (apply (function error) fmt a))
+             (open-fd (spec mode)
+               (let ((fd (%proc-open (namestring spec) mode)))
+                 (when (< fd 0) (fail "sb-ext:run-program: cannot open ~A (errno ~D)" spec (- fd)))
+                 (push fd closes) fd))
+             (child-fd (spec dir exists)
+               ;; (values fd-for-the-child parent-end-of-a-pipe-or-NIL)
+               (cond ((eq spec t) (values -1 nil))
+                     ((null spec) (if master (values -1 nil)
+                                      (values (open-fd "/dev/null" (if (eq dir :input) :input :supersede)) nil)))
+                     ((eq spec :stream)
+                      (let ((pp (%proc-pipe)))
+                        (unless pp (fail "sb-ext:run-program: pipe failed"))
+                        (if (eq dir :input)
+                            (progn (push (car pp) closes) (push (cdr pp) keep) (values (car pp) (cdr pp)))
+                            (progn (push (cdr pp) closes) (push (car pp) keep) (values (cdr pp) (car pp))))))
+                     ((or (stringp spec) (pathnamep spec))
+                      (values (open-fd spec (cond ((eq dir :input) :input)
+                                                  ((eq exists :append) :append)
+                                                  (t :supersede)))
+                              nil))
+                     (t (fail "sb-ext:run-program: ~S as ~(~A~) is not implemented on modus" spec dir)))))
+      (when pty
+        (let ((pt (%proc-openpt)))
+          (unless (consp pt) (fail "sb-ext:run-program: no pseudo-terminal (errno ~D)" (- pt)))
+          (setq master (car pt) tty (format nil "/dev/pts/~D" (cdr pt)))
+          (push master keep)))
+      (multiple-value-bind (fd pe) (child-fd input :input nil)
+        (setq in fd) (when pe (setq in-s (%sb-fd-stream pe :output external-format))))
+      (multiple-value-bind (fd pe) (child-fd output :output if-output-exists)
+        (setq out fd) (when pe (setq out-s (%sb-fd-stream pe :input external-format))))
+      (if (and error-given (eq error :output))
+          (setq err (if (>= out 0) out 1))
+          (multiple-value-bind (fd pe) (child-fd error :error if-error-exists)
+            (setq err fd) (when pe (setq err-s (%sb-fd-stream pe :input external-format)))))
+      (let ((pid (%proc-spawn-2 path (cons program args) environment
+                                (and directory (namestring directory)) in out err tty)))
+        ;; The child holds its own copies now; ours would keep pipes open.
+        (dolist (fd closes) (%proc-close fd))
+        (when (< pid 0)
+          (dolist (fd keep) (%proc-close fd))
+          (error "sb-ext:run-program: fork failed (errno ~D)" (- pid)))
+        (let ((proc (%make-process :pid pid :input in-s :output out-s :error err-s
+                                   :pty (and master (%sb-fd-stream master :io external-format)))))
+          (when wait (%sb-proc-poll proc t))
+          proc)))))
+
+(defun sb-ext:process-pid (p) (%process-pid p))
+(defun sb-ext:process-pty (p) (%process-pty p))
+(defun sb-ext:process-input (p) (%process-input p))
+(defun sb-ext:process-output (p) (%process-output p))
+(defun sb-ext:process-error (p) (%process-error p))
+
+(defun sb-ext:process-status (p) (%process-status (%sb-proc-poll p nil)))
+(defun sb-ext:process-alive-p (p) (eq (sb-ext:process-status p) :running))
+(defun sb-ext:process-exit-code (p) (%process-exit-code (%sb-proc-poll p nil)))
+
+(defun sb-ext:process-wait (p &optional check-for-stopped)
+  "Wait for P to exit; P."
+  check-for-stopped
+  (%sb-proc-poll p t))
+
+(defun sb-ext:process-kill (p signal &optional (whom :pid))
+  "Send SIGNAL to P (:PID), or to its process group (:PROCESS-GROUP / :PTY-PROCESS-GROUP:
+   a :PTY child leads its own).  T if the kernel took it."
+  (and (eq (%process-status p) :running)
+       (>= (%proc-kill (if (eq whom :pid) (%process-pid p) (- (%process-pid p)))
+                       signal)
+           0)))
+
+(defun sb-ext:process-close (p)
+  "Close P's streams."
+  (dolist (s (list (%process-pty p) (%process-input p)
+                   (%process-output p) (%process-error p)))
+    (when s (ignore-errors (close s))))
+  p)
 
 ;;; ============================================================
 ;;; THE FEATURES

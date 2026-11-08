@@ -454,6 +454,44 @@
 (declaim (overridable %bare-sync-arena))
 (defun %bare-sync-arena () (values #x111F2000 #x111FF000))
 (defun %kmsg-region () (values #x110A0000 #x60000))
+;; THE SERIAL RING: every byte the console writes, also kept in 64 KB of the same window
+;; (translate-aarch64 *AARCH64-SERIAL-RING*, which the trap writes: +0 the byte count,
+;; the data at +16).  Header: +4 the count when this boot started, +8 when the previous
+;; one did, +12 'SRNG'.  Counts are u32 and run on across resets, like kmsg's boots.
+(defun %serial-ring () #x111C0000)
+(defun %serial-ring-boot ()
+  (let ((r (%serial-ring)))
+    (if (= (mem-ref (+ r 12) :u32) #x474E5253)
+        (progn (setf (mem-ref (+ r 8) :u32) (mem-ref (+ r 4) :u32))
+               (setf (mem-ref (+ r 4) :u32) (mem-ref r :u32)))
+        (progn (setf (mem-ref r :u32) 0) (setf (mem-ref (+ r 4) :u32) 0)
+               (setf (mem-ref (+ r 8) :u32) 0) (setf (mem-ref (+ r 12) :u32) #x474E5253)))))
+(defun serial-ring-count ()
+  \"Bytes written to the serial console since the ring began (u32, runs on across boots).\"
+  (mem-ref (%serial-ring) :u32))
+(defun serial-ring-boot-start ()
+  \"SERIAL-RING-COUNT as it was when this boot began.\"
+  (mem-ref (+ (%serial-ring) 4) :u32))
+(defun serial-ring-bytes (from to)
+  \"The serial bytes numbered FROM..TO (counts as SERIAL-RING-COUNT gives them), as an octet
+   vector: only the 64 KB before the current count are kept, so an older FROM is raised.\"
+  (let* ((r (%serial-ring))
+         ;; the ring holds the 64 KB before the CURRENT count: a range older than that is
+         ;; partly written over, and only its newest part is still there
+         (keep (max 0 (- 65536 (logand (- (mem-ref r :u32) to) #xFFFFFFFF))))
+         (n (min (logand (- to from) #xFFFFFFFF) keep))
+         (from (logand (- to n) #xFFFFFFFF))
+         (out (make-array n :element-type (quote (unsigned-byte 8)))))
+    (dotimes (i n out)
+      (setf (aref out i) (mem-ref (+ r 16 (logand (+ from i) #xFFFF)) :u8)))))
+(defun dmesg (&key previous)
+  \"What the console printed this boot (with :PREVIOUS T, the boot before), as a string:
+   the last 64 KB at most, older bytes having been written over.\"
+  (let* ((r (%serial-ring)) (now (mem-ref r :u32)) (boot (mem-ref (+ r 4) :u32))
+         (b (if previous
+                (serial-ring-bytes (mem-ref (+ r 8) :u32) boot)
+                (serial-ring-bytes boot now))))
+    (map (quote string) (function code-char) b)))
 ;; THE HEAP'S SIZE COMES FROM THE BOARD (boot-rpi-cl.lisp's memory map): region 0 runs
 ;; from 0x12000000 to 4 MB below the top of the ARM's RAM, as the VideoCore reports it
 ;; -- 448 MiB on a Zero at the firmware's default gpu_mem=64, 480 at gpu_mem=32, 960 MiB
@@ -1061,6 +1099,8 @@
   ;; The message log (lib/bare-log.lisp) is in the same window and is KEPT across a
   ;; reset on purpose: count this boot, so the previous one's messages stay readable.
   (%kmsg-boot)
+  ;; ... and the serial ring (dmesg), also kept: this boot starts where the last one ended
+  (%serial-ring-boot)
   ;; Same for net/bare-sync.lisp's mutex arena: its cell count and clock.
   (setf (mem-ref #x111F2000 :u32) 0)
   (%gc-write64 #x111F2008 0)
@@ -2773,12 +2813,14 @@
                    "(setq *aarch64-serial-base* #x3F215040)
   (setq *aarch64-serial-width* 2)
   (setq *aarch64-serial-tx-poll* (list #x14 5 :tbz))
-  (setq *aarch64-serial-rx-poll* (list #x14 0 :tbz))")
+  (setq *aarch64-serial-rx-poll* (list #x14 0 :tbz))
+  (setq *aarch64-serial-ring* #x111C0000)")
                   (t
                    "(setq *aarch64-serial-base* #x3F201000)
   (setq *aarch64-serial-width* 0)
   (setq *aarch64-serial-tx-poll* nil)
-  (setq *aarch64-serial-rx-poll* (list #x18 4 :tbnz))"))))
+  (setq *aarch64-serial-rx-poll* (list #x18 4 :tbnz))
+  (setq *aarch64-serial-ring* #x111C0000)"))))
       ""))
 
 ;; SEV-SNP attestation (docs/snp-guest.md): the guest-message framing over the
@@ -3334,12 +3376,14 @@
             (setf *aarch64-serial-width* 2)
             (setf *aarch64-serial-tx-poll* '(#x14 5 :tbz))
             (setf *aarch64-serial-rx-poll* '(#x14 0 :tbz))
+            (setf *aarch64-serial-ring* #x111C0000)
             (format t "~&;; CONSOLE: BCM2835 mini UART 0x3F215040 (real Pi Zero 2 W)~%"))
           (progn
             (setf *aarch64-serial-base* #x3F201000)
             (setf *aarch64-serial-width* 0)
             (setf *aarch64-serial-tx-poll* nil)
             (setf *aarch64-serial-rx-poll* '(#x18 4 :tbnz))
+            (setf *aarch64-serial-ring* #x111C0000)
             (format t "~&;; CONSOLE: PL011 UART0 0x3F201000 (QEMU raspi3b)~%"))))))
 
 ;; No GICv2 on a BCM2837, and nothing here needs interrupts (the REPL polls

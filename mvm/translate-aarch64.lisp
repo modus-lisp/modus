@@ -66,6 +66,13 @@
   "Store width for serial write: 0=byte (strb, PL011), 2=word (str, mini UART).
    BCM2835 mini UART requires 32-bit stores to AUX_MU_IO register.")
 
+;; THE SERIAL RING (dmesg).  NIL, or the address of a ring every bare-metal serial byte is
+;; also written to: +0 a byte count (u32, running on across boots), the data at +16, 64 KB,
+;; byte N at +16 + (N mod 65536).  The rest of the header is the image's (%SERIAL-RING-BOOT,
+;; DMESG).  Set by the Pi CL images only, so every other image's trap 0x0300 is unchanged.
+;; Bytes from two cores at once may overwrite one another: a log, not a channel.
+(defvar *aarch64-serial-ring* nil)
+
 (defvar *aarch64-serial-rx-poll* '(#x18 4 :tbnz)
   "(OFFSET BIT POLARITY) for the serial RX ready-poll, mirroring
    *AARCH64-SERIAL-TX-POLL*.  Default is PL011: poll UARTFR at 0x18 and keep
@@ -3282,7 +3289,21 @@
                                                (ash bit 19)
                                                (ash (logand -1 #x3FFF) 5)
                                                +a64-x15+)))))
-                   (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*))))
+                   (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*)
+                   (when *aarch64-serial-ring*
+                     ;; ...and into the ring: x16 is the byte, x15/x17 are free again
+                     ;;   ldurh w15, [x17]          ; count mod 65536 = where it goes
+                     ;;   strb  w16, [x17+16, x15]
+                     ;;   count + 1 -> [x17]        ; after the byte, so a reader never
+                     ;;                             ; counts a byte not yet written
+                     (a64-load-imm64 buf +a64-x17+ *aarch64-serial-ring*)
+                     (a64-ldr-width buf +a64-x15+ +a64-x17+ 0 1)
+                     (a64-add-imm buf +a64-x17+ +a64-x17+ 16)
+                     (a64-emit buf (logior #x38206800 (ash +a64-x15+ 16) (ash +a64-x17+ 5) +a64-x16+)) ; strb w16,[x17,x15]
+                     (a64-sub-imm buf +a64-x17+ +a64-x17+ 16)
+                     (a64-ldr-width buf +a64-x15+ +a64-x17+ 0 2)
+                     (a64-add-imm buf +a64-x15+ +a64-x15+ 1)
+                     (a64-str-width buf +a64-x15+ +a64-x17+ 0 2)))))
                ((= code #x0301)
                 ;; Serial read: poll UART until a byte is available,
                 ;; return tagged fixnum char code in x0.

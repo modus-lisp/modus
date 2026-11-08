@@ -5,6 +5,9 @@ Branch `jit-diff`, off `main` @ `603e672`.  Unpushed.
 **Headline: the runtime JIT produces the same answers as the interpreter.**
 64-shard NET gate over IDs 10001..27800, JIT-ON vs JIT-OFF, both sides built
 from the same pristine `main` tree with the same 17 625-test corpus:
+(Raw output: `shards-jit/`, `shards-off/`, `gate-jit-summary.txt` and
+`gate-off-summary.txt`, removed from the tree root in 7491cd2a; read them with
+`git show a8db942a:shards-jit/shard-0.out` and so on.)
 
 | | passed | CHUNK-CRASH | FILE-WEDGE |
 |---|---|---|---|

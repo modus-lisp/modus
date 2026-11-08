@@ -11541,6 +11541,18 @@
   ;; Also handle pre-hashed integer ops
   )
 
+(defun %collect-setq-vars-via-expansion (form bound-vars mx)
+  "The BOUND-VARS that FORM's one-step macro expansion assigns, or NIL when it
+   does not expand (or the expander fails out of context, or MX says this path
+   has expanded enough) -- the macro arm of COLLECT-SETQ-VARS-IN-BODY, for an
+   assignment form whose PLACE is not a variable."
+  (let ((x (and (< mx 16)
+                (handler-case (%macroexpand-1-mvm-raw form)
+                  (error () nil)))))
+    (if (and (consp x) (cdr x) (not (eq (car x) form)))
+        (collect-setq-vars-in-body (car x) bound-vars (+ mx 1))
+        nil)))
+
 (defun collect-setq-vars-in-body (form bound-vars &optional (mx 0))
   "Return list of variables (from BOUND-VARS) that are mutated anywhere in FORM
    (via setq/incf/decf), including inside lambdas. BOUND-VARS is a list of variable
@@ -11578,7 +11590,17 @@
                   (setq result (adjoin arg result :test #'name-equal)))
                  (t ;; non-symbol place — recurse for nested mutations
                   (dolist (v (collect-setq-vars-in-body arg bound-vars))
-                    (setq result (adjoin v result :test #'name-equal)))))
+                    (setq result (adjoin v result :test #'name-equal)))
+                  ;; ...and through its SETF EXPANSION, which may assign a
+                  ;; variable the place only reads: (setf (getf out k) v) is
+                  ;; (setq out (set-getf out k v)).  Without this OUT was not
+                  ;; boxed, and the assignment from inside a closure (an FLET
+                  ;; helper building a plist) never reached the outer OUT.
+                  (when (consp args)
+                    (dolist (v (%collect-setq-vars-via-expansion
+                                (list 'setf arg (if (consp (cdr args)) (cadr args) nil))
+                                bound-vars mx))
+                      (setq result (adjoin v result :test #'name-equal))))))
                ;; value position — recurse
                (dolist (v (collect-setq-vars-in-body arg bound-vars))
                  (setq result (adjoin v result :test #'name-equal)))))
@@ -11608,9 +11630,14 @@
             (rest (apply #'append
                          (mapcar (lambda (f) (collect-setq-vars-in-body f bound-vars))
                                  (cddr form)))))
-       (if (and (symbolp var) (member var bound-vars :test #'name-equal))
-           (adjoin var rest :test #'name-equal)
-           rest)))
+       (cond ((and (symbolp var) (member var bound-vars :test #'name-equal))
+              (adjoin var rest :test #'name-equal))
+             ;; A non-symbol place ((incf (getf out k 0)), (push x (getf out k)))
+             ;; can assign a variable through its expansion, as SETF's can.
+             ((consp var)
+              (dolist (v (%collect-setq-vars-via-expansion form bound-vars mx) rest)
+                (setq rest (adjoin v rest :test #'name-equal))))
+             (t rest))))
     ;; Skip init of lambda params — they shadow the outer vars
     ((and (consp form)
           (or (and (symbolp (car form)) (string= (symbol-name (car form)) "LAMBDA"))

@@ -161,7 +161,7 @@
                                                  (* sb-alien:int)))
                                      (sb-sys:fd-stream-fd cs) #x5411
                                      (sb-alien:addr n)))
-                             (sb-alien:deref n) -1))
+                             n -1))
                      (t (c) c :error))))
             (format t "  ... SIOCOUTQ on the client fd: ~A~%" q)
             (chk-true "sb-alien ioctl emulation answered a number"

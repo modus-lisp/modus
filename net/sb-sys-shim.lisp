@@ -174,32 +174,66 @@
          (* (%alien-type-bytes (cadr type)) (caddr type)))
         (t (error "sb-alien: unsupported type ~S on modus." type))))
 
+(defun %alien-load (a type)
+  "The value of the scalar alien TYPE stored at A: INT and LONG sign-extended, as C reads them."
+  (cond ((eq type 'sb-alien:int)
+         (let ((v (mem-ref a :u32))) (if (>= v #x80000000) (- v #x100000000) v)))
+        ((eq type 'sb-alien:unsigned-int) (mem-ref a :u32))
+        ((eq type 'sb-alien:long)
+         (let ((v (mem-ref a :u64))) (if (>= v #x8000000000000000) (- v #x10000000000000000) v)))
+        ((eq type 'sb-alien:unsigned-long) (mem-ref a :u64))
+        ((eq type 'sb-alien:char) (mem-ref a :u8))
+        (t (error "sb-alien: unsupported scalar type ~S on modus." type))))
+
+(defun %alien-store (a type v)
+  (cond ((or (eq type 'sb-alien:int) (eq type 'sb-alien:unsigned-int))
+         (setf (mem-ref a :u32) (logand v #xFFFFFFFF)))
+        ((or (eq type 'sb-alien:long) (eq type 'sb-alien:unsigned-long))
+         (setf (mem-ref a :u64) (logand v #xFFFFFFFFFFFFFFFF)))
+        ((eq type 'sb-alien:char) (setf (mem-ref a :u8) (logand v #xFF)))
+        (t (error "sb-alien: unsupported scalar type ~S on modus." type)))
+  v)
+
+(defsetf %alien-load (a type) (v) `(%alien-store ,a ,type ,v))
+
 (defmacro sb-alien:with-alien (bindings &body body)
-  "(WITH-ALIEN ((name type [initial]) …) body).  Each NAME is bound to the RAW
-   ADDRESS of that many bytes of per-CPU scratch — so ADDR is the identity and
-   DEREF is a load, which is exactly the shape the two glass call sites use."
-  (let ((saved (gensym "CUR")))
-    (let ((binds nil) (inits nil) (rest bindings))
-      (loop
-        (when (null rest) (return nil))
-        (let* ((b (car rest))
-               (name (car b))
-               (type (cadr b))
-               (init (if (cddr b) (caddr b) nil)))
-          (setq binds (cons (list name (list '%alien-alloc
-                                             (list '%alien-type-bytes
-                                                   (list 'quote type))))
-                            binds))
-          (when (cddr b)
-            (setq inits (cons (list 'setf (list 'mem-ref name :u32) init)
-                              inits))))
-        (setq rest (cdr rest)))
-      `(let ((,saved *alien-cursor*))
-         (unwind-protect
-              (let* ,(reverse binds)
-                ,@(reverse inits)
-                ,@body)
-           (setq *alien-cursor* ,saved))))))
+  "(WITH-ALIEN ((name type [initial]) …) body), with SBCL's meaning: a SCALAR alien
+   variable (INT, LONG, …) READS AS ITS VALUE and SETF stores into it, and (ADDR name)
+   is the address of its bytes.  An ARRAY variable stands for its address, so DEREF
+   with an index is a load from it.
+
+   IT USED TO BIND EVERY NAME TO THE RAW ADDRESS.  That suited this file's own tests,
+   which wrote (DEREF n), but SBCL code reads an int variable as plain N -- cl-transport's
+   SOCKET-UNSENT-BYTES returns N -- and on modus that N was a pointer: every send queue
+   read as ~1.4e14 bytes, so session audio and the microphone judged themselves backed
+   up on every send, and a window manager keyed on the backlog would never draw a window."
+  (let ((saved (gensym "CUR")) (binds nil) (inits nil) (macros nil) (addrs nil) (rest bindings))
+    (loop
+      (when (null rest) (return nil))
+      (let* ((b (car rest)) (name (car b)) (type (cadr b))
+             (scalar (not (and (consp type) (eq (car type) 'sb-alien:array))))
+             (a (if scalar (gensym (symbol-name name)) name)))
+        (setq binds (cons (list a (list '%alien-alloc (list '%alien-type-bytes (list 'quote type))))
+                          binds))
+        (when scalar
+          (setq macros (cons (list name (list '%alien-load a (list 'quote type))) macros))
+          (setq addrs (cons (cons name a) addrs)))
+        (when (cddr b)
+          (setq inits (cons (if scalar
+                                (list '%alien-store a (list 'quote type) (caddr b))
+                                (list 'setf (list 'mem-ref a :u32) (caddr b)))
+                            inits))))
+      (setq rest (cdr rest)))
+    `(let ((,saved *alien-cursor*))
+       (unwind-protect
+            (let* ,(reverse binds)
+              ,@(reverse inits)
+              (macrolet ((sb-alien:addr (place)
+                           (let ((hit (assoc place ',addrs)))
+                             (if hit (cdr hit) place))))
+                (symbol-macrolet ,(reverse macros)
+                  ,@body)))
+         (setq *alien-cursor* ,saved)))))
 
 (defmacro sb-alien:addr (place) place)
 (defmacro sb-alien:cast (thing type) (declare (ignore type)) thing)

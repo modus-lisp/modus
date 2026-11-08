@@ -4013,6 +4013,14 @@
   "HOST stub: structural hash (collisions only cost a miss — entries are
    EQ-validated).  mvm-eval.lisp overrides with the object's address."
   (sxhash form))
+(defvar *macrolet-names* nil
+  "Normalized names an enclosing MACROLET binds in the code being compiled.  A
+   local macro shadows a global SETF expander of the same name (CLHS 5.1.2.7:
+   the place is macroexpanded in its lexical environment), so SETF of one of
+   these skips DEFSETF / DEFINE-SETF-EXPANDER and expands the macro instead.
+   (macrolet ((gl (i) `(aref v ,i))) (setf (gl 0) 50)) stored through a global
+   (defsetf gl ...) instead.")
+
 (defvar *flet-shadowed-macros* nil
   "Normalized names that an enclosing FLET / LABELS binds as LOCAL FUNCTIONS
    in the code being compiled.  A local function shadows a macro of the same
@@ -5551,6 +5559,8 @@
                 ;; override built-in expansions.
                 ((and (consp place)
                       (symbolp (car place))
+                      (not (and *macrolet-names*
+                                (member (normalize-name (car place)) *macrolet-names*)))
                       (mvm-find-setf-expander (car place)))
                  (funcall (mvm-find-setf-expander (car place))
                           (cdr place) value))
@@ -9077,12 +9087,15 @@
              (push (cons mname old) saved-macros)
              (mvm-define-macro mname expander)))
          ;; Compile body -- a MACROLET of a name an enclosing FLET bound
-         ;; shadows that local function again.
-         (if *flet-shadowed-macros*
-             (%compile-shadowing-body
-              (mapcar (lambda (mdef) (normalize-name (car mdef))) macro-defs)
-              nil body env dest)
-             (compile-progn body env dest))
+         ;; shadows that local function again, and a global SETF expander.
+         (let ((*macrolet-names*
+                 (append (mapcar (lambda (mdef) (normalize-name (car mdef))) macro-defs)
+                         *macrolet-names*)))
+           (if *flet-shadowed-macros*
+               (%compile-shadowing-body
+                (mapcar (lambda (mdef) (normalize-name (car mdef))) macro-defs)
+                nil body env dest)
+               (compile-progn body env dest)))
          ;; Restore previous macro bindings
          (%mexp-memo-invalidate)
          (dolist (saved saved-macros)
@@ -13901,8 +13914,9 @@
     ;; Fix stack-depth in the final env
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
-    ;; (declare (type …)) forms at the head of BODY scope over these bindings.
-    (%apply-declared-types new-env decl-body)
+    ;; (declare (type …)) forms at the head of BODY scope over these bindings
+    ;; (and a free one over the body alone).
+    (setq new-env (%apply-declared-types new-env decl-body n-bindings))
     ;; Undeclared bindings: infer a width from the init form (LET inits see
     ;; the OUTER env) when the variable is never assigned in the body.
     (%infer-let-widths new-env bindings decl-body env)
@@ -14057,8 +14071,9 @@
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
-    ;; (declare (type …)) forms at the head of BODY scope over these bindings.
-    (%apply-declared-types new-env decl-body)
+    ;; (declare (type …)) forms at the head of BODY scope over these bindings
+    ;; (and a free one over the body alone).
+    (setq new-env (%apply-declared-types new-env decl-body n-bindings))
     ;; Undeclared bindings: infer a width from the init form (LET* inits see
     ;; the earlier bindings, so look up in the new env) when the variable
     ;; is never assigned in the body.
@@ -26358,15 +26373,44 @@
          (setq b (cdr b)))
         (t (return out)))))))
 
-(defun %apply-declared-types (env body)
+(defun %apply-declared-types (env body &optional own)
   "Stamp binding-dtype on the CURRENT frame's bindings named by BODY's
    leading type declarations (a declaration scopes over the form that binds
-   the variable, so only this frame, never a parent's)."
-  (when env
-    (dolist (pair (%declared-types body))
-      (let ((b (find (car pair) (compile-env-bindings env)
-                     :key #'binding-name :test #'equal)))
-        (when b (setf (binding-dtype b) (cdr pair)))))))
+   the variable, so only this frame, never a parent's).  Returns the env the
+   body is to be compiled in.
+
+   OWN, when given, is how many leading entries of ENV's bindings THIS form
+   made (a LET's N bindings).  A declaration naming any other variable is a
+   FREE declaration -- (locally (declare (type simple-vector v)) ...) is a LET
+   of no variables -- and scopes over this body only: the body gets a COPY of
+   the outer binding carrying the type, in an env of its own.  Stamping the
+   outer binding itself made the type outlive the form: in
+     (if (typep d 'simple-vector) (locally (declare (simple-vector d)) (aref d i))
+         (aref d i))
+   the second AREF compiled as a SIMPLE-VECTOR access too, and cram's
+   ADLER-STEP read an adjustable vector's header as its data (every ZRLE
+   frame failed: the value 7 is not of type (INTEGER 0 6))."
+  (if (null env)
+      env
+      (let ((frame (if own (subseq (compile-env-bindings env) 0
+                                   (min own (length (compile-env-bindings env))))
+                       (compile-env-bindings env)))
+            (out env))
+        (dolist (pair (%declared-types body) out)
+          (let ((b (find (car pair) frame :key #'binding-name :test #'equal)))
+            (cond
+              (b (setf (binding-dtype b) (cdr pair)))
+              (own
+               (let ((outer (find (car pair) (compile-env-bindings out)
+                                  :key #'binding-name :test #'equal)))
+                 (when (and outer (member (binding-location outer) '(:reg :stack)))
+                   (let ((copy (copy-binding outer)))
+                     (setf (binding-dtype copy) (cdr pair))
+                     (setq out (make-compile-env
+                                :bindings (cons copy (compile-env-bindings out))
+                                :stack-depth (compile-env-stack-depth out)
+                                :parent (compile-env-parent out)
+                                :fn-names (compile-env-fn-names out)))))))))))))
 
 (defvar *decl-fastpath-check* nil
   "DIAGNOSTIC.  When T at compile time, the declared-array fast path emits a

@@ -268,7 +268,14 @@
     "mvm/cl-sequences.lisp" "mvm/cl-streams.lisp" "mvm/cl-fileio.lisp"
     "mvm/cl-printer.lisp" "mvm/cl-reader.lisp" "mvm/cl-eval.lisp" "mvm/cl-clos.lisp"
     "mvm/cl-types.lisp" "mvm/cl-packages.lisp" "mvm/cl-conditions.lisp"
-    "mvm/ansi-test-aux.lisp"))
+    "mvm/ansi-test-aux.lisp"
+    ;; The baked net/ files that define MACROS (or SETF expanders): a cached
+    ;; module holds their EXPANSION.  Without these, SB-SYS-SHIM's WITH-ALIEN was
+    ;; fixed and cl-transport's SOCKET-UNSENT-BYTES kept replaying the old
+    ;; expansion -- a pointer for a byte count -- from every cache built before.
+    "net/asdf-interface.lisp" "net/cooperative-atomics.lisp" "net/genera-compat.lisp"
+    "net/hosted-sync.lisp" "net/sb-gray-shim.lisp" "net/sb-sys-shim.lisp"
+    "net/sb-thread-shim.lisp"))
 (defvar *fasl-fingerprint-source*
   (let ((a 2166136261) (b 3735928559))
     (dolist (f *fasl-fingerprint-files*)

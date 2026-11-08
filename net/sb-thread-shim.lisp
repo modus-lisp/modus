@@ -247,9 +247,18 @@
              ;; (the JIT refuses it), so a closure written here would run
              ;; INTERPRETED, and an error unwinding into interpreter frames on
              ;; a worker crashed.  The closure only makes the call.
+             ;; THE STANDARD STREAMS AS THEY ARE NOW, for the new thread to bind
+             ;; (%SB-THREAD-BODY).  Main shallow-binds -- its LET of a special
+             ;; writes the value cell every thread reads -- so without this a
+             ;; thread started before main bound *ERROR-OUTPUT* to something of
+             ;; its own wrote into it afterwards: glass's network thread printed
+             ;; its client log into a Lisp listener's window while main was
+             ;; evaluating there.  Only from main: a worker's own streams are
+             ;; its objects and cannot be handed over.
+             (streams (if worker nil (%sb-standard-streams)))
              (body (if worker
                        (%sb-locked (256) (lambda () (%sb-thread-body thread box function arguments)))
-                       (lambda () (%sb-thread-body thread box function arguments))))
+                       (lambda () (%sb-thread-body thread box function arguments streams))))
              (slot (%make-native-thread body)))
         dummy
         ;; A FULL TABLE MAY BE FULL OF THE DEAD.  SBCL does not require a
@@ -437,7 +446,20 @@ modus: unhandled error in a thread: "))
 
 (export (list (intern "SHARE" "MODUS") (intern "MAKE-SHARED-ARRAY" "MODUS")) "MODUS")
 
-(defun %sb-thread-body (thread box function arguments)
+(defun %sb-standard-streams ()
+  (list *standard-output* *error-output* *trace-output* *standard-input*
+        *terminal-io* *debug-io* *query-io*))
+
+(defun %sb-thread-body (thread box function arguments &optional streams)
+  (if streams
+      (let ((*standard-output* (nth 0 streams)) (*error-output* (nth 1 streams))
+            (*trace-output* (nth 2 streams)) (*standard-input* (nth 3 streams))
+            (*terminal-io* (nth 4 streams)) (*debug-io* (nth 5 streams))
+            (*query-io* (nth 6 streams)))
+        (%sb-thread-body-1 thread box function arguments))
+      (%sb-thread-body-1 thread box function arguments)))
+
+(defun %sb-thread-body-1 (thread box function arguments)
   "What every thread MAKE-THREAD starts runs: bind *CURRENT-THREAD*, call
    FUNCTION, and leave its result in BOX as a MESSAGE (%SB-PUBLISH-VALUE).  An
    error nothing on the thread handles ends the THREAD, not the process: it is

@@ -1318,6 +1318,7 @@
   (setq *fasl-taint-who* who)
   (setq *fasl-taint* (if (integerp *fasl-taint*) (+ *fasl-taint* 1) 1)))
 
+(declaim (overridable %e2-const-register))
 (defun %e2-const-register (value)
   "Register VALUE in the mvm-eval quote pool; return its index.  The pool is a
    HOLDER cons whose car is a simple vector, doubled when full: the indices are
@@ -1325,7 +1326,11 @@
    conses (64 bytes) -- 1.5 MB of a Zero network core, against 8 bytes a slot.
    The holder keeps one identity across growth, so a JIT page or retry entry
    that saved \"its\" pool (%JIT-RETRY-DRAIN swaps it back in) still writes
-   and reads the one live vector."
+   and reads the one live vector.  The image's own definition (mvm-eval.lisp)
+   adds what a WORKER THREAD must do instead."
+  (%e2-const-register-1 value))
+
+(defun %e2-const-register-1 (value)
   (unless *e2-const-pool*
     (setq *e2-const-pool* (cons (make-array 1024 :initial-element nil) nil))
     (setq *e2-const-count* 0))
@@ -1342,12 +1347,32 @@
     (setq *e2-const-count* (+ idx 1))
     idx))
 
+;;; A WORKER'S OWN QUOTE POOL (see %E2-CONST-REGISTER in mvm-eval.lisp).
+;;; *E2-THREAD-POOL* is bound per computation (%WITH-COMPUTATION-STATE,
+;;; net/hosted-sync.lisp), NIL until the thread's first own literal; then
+;;; (VECTOR . COUNT).  Its indices are offset by %E2-THREAD-POOL-BASE, far above
+;;; any shared-pool index, so code compiled on main keeps reading the shared
+;;; pool from any thread, and only code this thread compiled reads its own.
+(defvar *e2-thread-pool* nil
+  "This computation's own quote pool, (VECTOR . COUNT), or NIL.  See above.")
+
+(defun %e2-thread-pool-base ()
+  "First index of a thread's own quote pool -- keep in step with %E2-CONST-REF,
+   which writes the number out (it is the interpreter's LI-CONST hot path)."
+  #x10000000)
+
 (defun %e2-const-ref (idx)
-  "Entry IDX of the quote pool, NIL if none."
-  (let ((vec (and (consp *e2-const-pool*) (car *e2-const-pool*))))
-    (if (and vec (integerp idx) (>= idx 0) (< idx (length vec)))
-        (aref vec idx)
-        nil)))
+  "Entry IDX of the quote pool (or of this thread's own pool, see
+   %E2-THREAD-POOL-BASE), NIL if none."
+  (if (and (integerp idx) (>= idx #x10000000))
+      (let ((holder *e2-thread-pool*) (i (- idx #x10000000)))
+        (if (and (consp holder) (< i (cdr holder)))
+            (aref (car holder) i)
+            nil))
+      (let ((vec (and (consp *e2-const-pool*) (car *e2-const-pool*))))
+        (if (and vec (integerp idx) (>= idx 0) (< idx (length vec)))
+            (aref vec idx)
+            nil))))
 
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")

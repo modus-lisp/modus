@@ -2873,8 +2873,35 @@ Stopping.
          (*jit-inhibit* nil)
          ;; OPEN's stream -> path table: a worker opening a file fills its own.
          (*%file-stream-paths* nil)
+         ;; THE COMPILER'S SCRATCH GLOBALS, so a worker's EVAL never stores its
+         ;; own objects into main's cells: the macroexpansion memo (a fresh
+         ;; table per compile), the 64 KB bytecode buffer and its label table,
+         ;; the quote pool's per-thread half (%E2-CONST-REGISTER), the deferred-
+         ;; DEFUN and impurity notes, COMPILE-FORM's trace ring -- and the FASL
+         ;; cache's load-loop state, which is main's LOAD's: a worker's compile
+         ;; took main's record slot.
+         ;; The compile cache is read through (main's table), never written
+         ;; off main (%MVM-ON-MAIN-THREAD-P).
+         (*mexp-memo* nil)
+         (*mexp-memo-gc* -1)
+         (*mvm-eval-buffer* nil)
+         (*mvm-eval-cache* *mvm-eval-cache*)
+         (*e2-thread-pool* nil)
+         (*%defun-deferred* nil)
+         (*%mexp-impure* nil)
+         (*fasl-depth* nil)
+         (*fasl-base* nil)
+         (*fasl-outer* nil)
+         (*fasl-slot* nil)
+         (*fasl-effects* nil)
+         (*fasl-taint* nil)
+         (*cf-trace* nil)
+         (*cf-trace-i* 0)
+         (*e2-gf-name-memo* nil)
          )
-     (declare (special *%file-stream-paths* *%escape-report-busy* *jit-native-ran* *jit-infra-fallback* *e2-active-defun-names* *e2-persist-defuns* *e2-module-defuns* *mvm-eval-no-cache* *jit-inhibit*
+     (declare (special *cf-trace* *cf-trace-i* *e2-gf-name-memo*
+                       *mexp-memo* *mexp-memo-gc* *mvm-eval-buffer* *mvm-eval-cache* *e2-thread-pool* *%defun-deferred* *%mexp-impure* *fasl-depth* *fasl-base* *fasl-outer* *fasl-slot* *fasl-effects* *fasl-taint*
+                       *%file-stream-paths* *%escape-report-busy* *jit-native-ran* *jit-infra-fallback* *e2-active-defun-names* *e2-persist-defuns* *e2-module-defuns* *mvm-eval-no-cache* *jit-inhibit*
                        *mvm-last-mv* *nlx-state-serial* *current-condition* *catch-active* *restart-stack* *handler-bind-stack* *handler-bind-effective-skip* *restart-frame-condition-map* *signal-walk-depth* *restarts-being-invoked* *restart-invoking-p* *restart-case-result* *rc-invoked-restart* *format-iter-escape* *write-object-budget* *%circ-next* *%ppx-stack* *%pp-ctx* *load-error-condition* *%load-depth* *%next-methods* *%current-gf-args* *%current-gf* *%dmc-call-args* *catch-tag* *catch-value* *catch-values* *catch-tags*))
      (progv *per-computation-specials*
          (make-list (length *per-computation-specials*))

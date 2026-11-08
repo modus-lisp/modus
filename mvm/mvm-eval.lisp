@@ -4569,7 +4569,9 @@
     (when (and (integerp *fasl-outer*) (eql %fd (if (integerp *fasl-base*) *fasl-base* 0)))
       (setq *fasl-outer* (+ *fasl-outer* 1)))
     (unwind-protect
-        (%mvm-eval-forms-2 forms)
+        (if (%mvm-on-main-thread-p)
+            (%mvm-eval-forms-2 forms)
+            (%mvm-eval-forms-worker forms))
       (setq *fasl-depth* %fd)
       ;; Still holding THIS call's level (the compile did not reach a run
       ;; site: an error, or an early exit) — give it back.
@@ -4577,6 +4579,55 @@
                  (eql (mem-ref #x10000EB8 :u32) (%eval-lock-me))
                  (>= (mem-ref #x10000EC0 :u32) %depth))
         (%eval-lock-release)))))
+
+(defun %mvm-eval-forms-worker (forms)
+  "%MVM-EVAL-FORMS-2 on a worker thread, with the compile's scratch state its own.
+   The compiler keeps a compile's state in globals -- the IR being built, the
+   pending FLET / LAMBDA bodies, the module's function and unresolved-call
+   tables, the label and push-depth bookkeeping -- which on main hold MAIN's
+   current module while it runs (a thread started from a form is started from
+   inside that form's run).  A worker that compiled with them read main's
+   pending bodies as its own and stored its IR into main's conses: the
+   shared-store guard refused (SETF (CDR E)) in the module assembly, and
+   (eval '(+ 1 2)) failed on every thread but main.  Here each starts EMPTY, as
+   a fresh compile on main starts, in a binding of this thread's own (declared
+   special: a compiled LET of a compiler global is otherwise lexical).
+
+   AND THE MODULE IS INTERPRETED, NOT JIT-TRANSLATED.  The translator keeps
+   its own state in globals (its error census among them), and a worker's
+   module may hold literals of the worker's own quote pool, which the JIT's
+   constant baking and constant vector read from the SHARED pool only."
+  (let ((*jit-inhibit* t)
+        (*functions* (make-hash-table :test (quote equal)))
+        (*function-table* nil)
+        (*constant-table* nil)
+        (*unresolved-calls* (make-hash-table :test (quote equal)))
+        (*pending-flet-ir* nil)
+        (*init-thunk-names* nil)
+        (*ir-buffer* nil)
+        (*label-push-depths* nil)
+        (*deferred-tails* nil)
+        (*loop-exit-label* nil)
+        (*block-labels* nil)
+        (*tagbody-tags* nil)
+        (*nonlocal-blocks* nil)
+        (*nonlocal-tagbodies* nil)
+        (*flet-self-exits* nil)
+        (*in-loop-catch-wrap* nil)
+        (*let-special-sites* nil)
+        (*tagbody-emitted-labels* nil)
+        (*fpd-hoisted* nil)
+        (*current-function-name* nil)
+        (*uwp-cleanups* nil)
+        (*last-compiled-functions* nil))
+    (declare (special *jit-inhibit* *functions* *function-table* *constant-table*
+                      *unresolved-calls* *pending-flet-ir* *init-thunk-names* *ir-buffer*
+                      *label-push-depths* *deferred-tails* *loop-exit-label*
+                      *block-labels* *tagbody-tags* *nonlocal-blocks* *nonlocal-tagbodies*
+                      *flet-self-exits* *in-loop-catch-wrap* *let-special-sites*
+                      *tagbody-emitted-labels* *fpd-hoisted* *current-function-name*
+                      *uwp-cleanups* *last-compiled-functions*))
+    (%mvm-eval-forms-2 forms)))
 
 (defun %mvm-forms-define-methods-p (forms)
   "True when FORMS is a DEFMETHOD or DEFGENERIC top-level form.  Such a form
@@ -5707,3 +5758,47 @@
 ;;; host stub uses SXHASH).  The tagged word of the form object; entries are
 ;;; EQ-validated so a GC-moved form simply misses.
 (defun %form-key (form) (%val->word form))
+
+;;; THE QUOTE POOL ON A WORKER (compiler.lisp's %E2-CONST-REGISTER is the host
+;;; and single-threaded definition).  The pool is shared memory.  A value the
+;;; worker does not own -- a symbol, anything main made -- goes in it as
+;;; before, under the runtime lock so a grown vector is shared too.  A value it
+;;; DOES own -- a string or list its own reader made: every literal of a form a
+;;; REPL thread reads and EVALs -- may not: the shared-store guard refuses the
+;;; store, and nothing could keep the entry valid once the worker's region
+;;; collects.  It goes in the thread's own pool (*E2-THREAD-POOL*, indices from
+;;; %E2-THREAD-POOL-BASE).  The JIT bakes or vectors constants from the SHARED
+;;; pool only; a worker's modules are interpreted (%MVM-EVAL-FORMS-WORKER).
+(defun %e2-const-register (value)
+  (cond ((or (eql (mem-ref #x10000DB8 :u32) 0) (eql (modus.runtime::%dynb-block) 0))
+         (%e2-const-register-1 value))
+        ((modus.runtime::%own-region-object-p value)
+         (%e2-thread-const-register value))
+        (t
+         (%rt-enter)
+         (unwind-protect
+              (progn
+                ;; room for the pool's first vector, or a doubling of it
+                (%rt-reserve (+ 16384 (if (consp *e2-const-pool*)
+                                          (* 16 (length (car *e2-const-pool*)))
+                                          0)))
+                (%e2-const-register-1 value))
+           (%rt-leave)))))
+
+(defun %e2-thread-const-register (value)
+  (let ((holder *e2-thread-pool*))
+    (unless holder
+      (setq holder (cons (make-array 64 :initial-element nil) 0))
+      (setq *e2-thread-pool* holder))
+    (let ((idx (cdr holder)) (vec (car holder)))
+      (when (>= idx (length vec))
+        (let ((new (make-array (* 2 (length vec)) :initial-element nil)) (i 0))
+          (loop
+            (when (>= i idx) (return nil))
+            (setf (aref new i) (aref vec i))
+            (setq i (+ i 1)))
+          (setq vec new)
+          (setf (car holder) new)))
+      (setf (aref vec idx) value)
+      (setf (cdr holder) (+ idx 1))
+      (+ idx (%e2-thread-pool-base)))))

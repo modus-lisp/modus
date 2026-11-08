@@ -1805,10 +1805,9 @@
           (#.+op-li-const+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (idx npc2) (%ifetch-u64 bc npc)
-               (reg-set regs vd (%val->word
-                                 (if *e2-const-pool*
-                                     (%e2-const-ref idx)
-                                     nil)))
+               ;; (A worker's own literals live in ITS pool, which may exist
+               ;; while the shared one does not: %E2-CONST-REF reads both.)
+               (reg-set regs vd (%val->word (%e2-const-ref idx)))
                (setf pc npc2))))
 
           ;; PUSH/POP store real VALUES on mvm-stack (not raw words) so the GC

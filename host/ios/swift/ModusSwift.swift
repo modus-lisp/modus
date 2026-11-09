@@ -200,6 +200,8 @@ let addChild: Call = { parent, child, _, _, _, _ in
 // first responder goes whichever view holds it: a text field, or the desk (which takes keys too).
 let resign: Call = { _, _, _, _, _, _ in
     keyRoot()?.endEditing(true)
+    // and whatever is the first responder now, wherever it is, gives it up
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     return 0
 }
 

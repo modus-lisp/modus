@@ -270,7 +270,7 @@
 (defun %sbs-nonblocking-of (socket)
   ;; fcntl(F_GETFL) through the image's baked syscall path: this file is evaluated at
   ;; start-up, where an intrinsic SYSCALL does not return the kernel's answer
-  (let ((fl (funcall '%gc-safe-block-6 72 (%socket-fd socket) 3 0 0)))
+  (let ((fl (funcall '%sbs-fcntl (%socket-fd socket) 3 0)))
     (and (integerp fl) (>= fl 0) (/= 0 (logand fl 2048)))))
 (defun %sbs-set-nonblocking (value socket)
   (if value

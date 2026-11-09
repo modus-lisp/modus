@@ -1920,6 +1920,11 @@
                (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)
+               ;; the AArch64 socket floor (its syscall numbers; x86-64 has hosted-sockets-post)
+               (if (eq *cli-arch* :aarch64)
+                   (read-file-text (merge-pathnames "net/hosted-sockets-a64.lisp" *modus-base*))
+                   "")
+               (string #\Newline)
                (read-file-text (merge-pathnames "net/sb-bsd-sockets-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)

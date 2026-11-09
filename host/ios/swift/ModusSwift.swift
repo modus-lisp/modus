@@ -11,6 +11,8 @@ typealias Call = @convention(c) (UInt, UInt, UInt, UInt, UInt, UInt) -> UInt
 
 private var views: [UInt: UIView] = [:]
 private var nextHandle: UInt = 1
+// A scroll view's handle maps to the stack that holds its children (ui_add puts them there).
+private var scrollContent: [UInt: UIStackView] = [:]
 // The events, oldest first.  kind 1: a button tapped.  2: a switch changed (value 1 on, 0 off).
 // 3: a slider changed (value 0..100).  4: a text field's text changed (read it with ui_text_value).
 private var events: [(kind: UInt, handle: UInt, value: UInt)] = []
@@ -142,6 +144,65 @@ let textValue: Call = { h, buf, cap, _, _, _ in
     return UInt(bytes.count)
 }
 
+// stack_new(axis, spacing, x, y, w, h): a stack view, its children laid out along the axis (0 vertical,
+// 1 horizontal) with the spacing between them.  Native layout: UIKit does the arranging.
+let stackNew: Call = { axis, spacing, x, y, w, h in
+    let stack = UIStackView(frame: rect(x, y, w, h))
+    stack.axis = axis == 1 ? .horizontal : .vertical
+    stack.spacing = CGFloat(spacing)
+    return adopt(stack)
+}
+
+// scroll_new(x, y, w, h): a scroll view whose children stack vertically in its content (ui_add).
+let scrollNew: Call = { x, y, w, h, _, _ in
+    let scroll = UIScrollView(frame: rect(x, y, w, h))
+    let content = UIStackView()
+    content.axis = .vertical
+    content.spacing = 12
+    content.translatesAutoresizingMaskIntoConstraints = false
+    scroll.addSubview(content)
+    NSLayoutConstraint.activate([
+        content.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor, constant: 12),
+        content.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -12),
+        content.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 12),
+        content.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -12),
+        content.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -24),
+    ])
+    let handle = adopt(scroll)
+    scrollContent[handle] = content
+    return handle
+}
+
+// image_new(name, length, x, y, w, h): an SF Symbol by its name (such as "star.fill"), in white.
+let imageNew: Call = { p, n, x, y, w, h in
+    let view = UIImageView(frame: rect(x, y, w, h))
+    view.image = UIImage(systemName: text(p, n))
+    view.tintColor = .white
+    view.contentMode = .scaleAspectFit
+    return adopt(view)
+}
+
+// add(parent, child): the child moves into the parent: a stack's arranged children, a scroll
+// view's content, or a plain view's subviews.
+let addChild: Call = { parent, child, _, _, _, _ in
+    guard let c = views[child] else { return 0 }
+    if let content = scrollContent[parent] {
+        content.addArrangedSubview(c)
+    } else if let stack = views[parent] as? UIStackView {
+        stack.addArrangedSubview(c)
+    } else {
+        views[parent]?.addSubview(c)
+    }
+    return 0
+}
+
+// resign(handle): the keyboard goes away.  endEditing ends editing in the whole screen, so the
+// first responder goes whichever view holds it: a text field, or the desk (which takes keys too).
+let resign: Call = { _, _, _, _, _, _ in
+    keyRoot()?.endEditing(true)
+    return 0
+}
+
 // set_frame(handle, x, y, w, h).
 let setFrame: Call = { h, x, y, w, hh, _ in
     views[h]?.frame = rect(x, y, w, hh)
@@ -152,6 +213,7 @@ let setFrame: Call = { h, x, y, w, hh, _ in
 let removeView: Call = { h, _, _, _, _, _ in
     views[h]?.removeFromSuperview()
     views[h] = nil
+    scrollContent[h] = nil
     return 0
 }
 
@@ -189,6 +251,11 @@ public func modusSwiftInstall() {
     register("ui_slider_new", sliderNew)
     register("ui_text_field_new", textFieldNew)
     register("ui_panel_new", panelNew)
+    register("ui_stack_new", stackNew)
+    register("ui_scroll_new", scrollNew)
+    register("ui_image_new", imageNew)
+    register("ui_add", addChild)
+    register("ui_resign", resign)
     register("ui_set_text", setText)
     register("ui_set_value", setValue)
     register("ui_text_value", textValue)

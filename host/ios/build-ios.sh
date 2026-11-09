@@ -48,6 +48,15 @@ cat > "$OUT/Info.plist" <<PLIST
   <key>LSRequiresIPhoneOS</key><true/>
   <key>UILaunchScreen</key><dict/>
   <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
+  <key>UIApplicationSceneManifest</key><dict>
+    <key>UIApplicationSupportsMultipleScenes</key><false/>
+    <key>UISceneConfigurations</key><dict>
+      <key>UIWindowSceneSessionRoleApplication</key><array><dict>
+        <key>UISceneConfigurationName</key><string>Default</string>
+        <key>UISceneDelegateClassName</key><string>ModusSceneDelegate</string>
+      </dict></array>
+    </dict>
+  </dict>
   <key>CFBundleSupportedPlatforms</key><array><string>$( [ $KIND = sim ] && echo iPhoneSimulator || echo iPhoneOS )</string></array>
 </dict></plist>
 PLIST

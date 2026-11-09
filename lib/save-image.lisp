@@ -72,9 +72,11 @@
 (declaim (overridable %core-jit-arena-hi))
 (defun %core-jit-arena-hi ()
   "End of the JIT exec arena: code grows up from its base, data pages
-   (mvm-eval.lisp %JIT-DATA-PAGE) down from here.  Hosted reserves 512 MB;
+   (mvm-eval.lisp %JIT-DATA-PAGE) down from here.  Hosted reserves 512 MB
+   unless the layout says otherwise (MODUS_JIT_ARENA_SIZE: iOS's arena is
+   smaller, and this must agree with the segment the image maps for it);
    a board's arena is the fixed region it has (the Pi overrides)."
-  (+ (%core-jit-arena-lo) #x20000000))
+  (+ (%core-jit-arena-lo) (%layout :jit-arena-size #x20000000)))
 
 (declaim (overridable %core-jit-bump-slot))
 (defun %core-jit-bump-slot ()

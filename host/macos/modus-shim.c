@@ -104,7 +104,7 @@ static __thread int image_leader;
 // host/ios/modus-ui.m (host/watch/modus-watch.swift on watchOS): a framebuffer
 // and touch events for the image.
 extern void modus_ui_init(void);
-extern void modus_ui_start(void);
+extern void modus_ui_start(void *scene);
 extern long modus_ui_call(long nr, long a0, long a1, long a2, long a3);
 #if TARGET_OS_WATCH
 // watchOS has no public UIKit: the SwiftUI app in host/watch/modus-watch.swift
@@ -118,8 +118,13 @@ static signed char modus_did_finish(void *self, SEL cmd, void *app, void *opts) 
     // device backgrounds the app and iOS suspends it within seconds, which
     // froze long runs mid-way.  (A lock by the user still suspends it.)
     ((void (*)(void *, SEL, signed char))objc_msgSend)(app, sel_registerName("setIdleTimerDisabled:"), 1);
-    modus_ui_start();
     return 1;
+}
+// THE SCENE, not the application, owns the window (iOS 27 refuses the legacy
+// lifecycle).  UIKit calls this on the main thread when it connects the scene.
+static void modus_scene_will_connect(void *self, SEL cmd, void *scene, void *session, void *opts) {
+    (void)self; (void)cmd; (void)session; (void)opts;
+    modus_ui_start(scene);
 }
 #endif
 struct image_start { uint64_t sp, entry; };
@@ -152,6 +157,12 @@ static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t 
     class_addMethod(c, sel_registerName("application:didFinishLaunchingWithOptions:"),
                     (IMP)modus_did_finish, "c@:@@");
     objc_registerClassPair(c);
+    Class sc = objc_allocateClassPair(objc_getClass("UIResponder"), "ModusSceneDelegate", 0);
+    class_addMethod(sc, sel_registerName("scene:willConnectToSession:options:"),
+                    (IMP)modus_scene_will_connect, "v@:@@@");
+    // UIKit refuses a scene delegate that does not declare the protocol.
+    class_addProtocol(sc, objc_getProtocol("UIWindowSceneDelegate"));
+    objc_registerClassPair(sc);
     UIApplicationMain(argc, argv, NULL, CFSTR("ModusAppDelegate"));
     _exit(0);   // UIApplicationMain does not return; the image's exit() ends the app
 #endif
@@ -577,6 +588,8 @@ static long jit_read(int fd, void *buf, size_t n) {
 // (hosted-layout-env.lisp +LAYOUT-DARWIN-TSD-KEY+).
 #define MODUS_TSD_KEY 300
 #define LX_SYS_SET_THREAD_DELTA 1000     // translate-aarch64 +A64-DARWIN-SYS-SET-THREAD-DELTA+
+#define LX_SYS_MLOCK 1020                // natrium's secret arena (gossamer): mlock(addr, len).  Linux's
+                                         // aarch64 mlock is 228, which the shim faults on, so Darwin uses this
 
 struct stub_frame {                       // syscall-stub.S, 608 bytes
     uint64_t x1_15[15];                   // x1..x15            @0
@@ -737,6 +750,7 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
     case 220: return dx_clone(a0, a1, (uint32_t *)a2, (uint32_t *)a4, frame);
     case 98:  return dx_futex((uint32_t *)a0, a1, a2, (const struct timespec *)a3);
     case LX_SYS_SET_THREAD_DELTA: pthread_setspecific(delta_key, (void *)a0); return 0;
+    case LX_SYS_MLOCK: RET(mlock((const void *)a0, (size_t)a1));
     case 113: RET(clock_gettime(dx_clock(a0), (struct timespec *)a1));
     case 169: RET(gettimeofday((struct timeval *)a0, NULL));
     case 101: RET(nanosleep((const struct timespec *)a0, (struct timespec *)a1));

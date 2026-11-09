@@ -131,15 +131,18 @@ static uint32_t keysym_for(uint32_t cp) {
 
 static UIWindow *window;
 
-// Called by the shim's app delegate, on the main thread, once launching is done.
-void modus_ui_start(void) {
+// Called by the shim's scene delegate, on the main thread, when UIKit connects the
+// scene.  iOS 27 traps an app that runs on the legacy app-delegate lifecycle, so the
+// window belongs to a UIWindowScene and not to the application.
+void modus_ui_start(void *scene) {
     CGRect b = [[UIScreen mainScreen] bounds];
     ui_scale = (long)[[UIScreen mainScreen] scale];
     if (ui_scale < 1) ui_scale = 1;
     fb_w = (long)b.size.width * UI_SCALE;
     fb_h = (long)b.size.height * UI_SCALE;
     fb = calloc((size_t)(fb_w * fb_h), 4);
-    window = [[UIWindow alloc] initWithFrame:b];
+    window = [[UIWindow alloc] initWithWindowScene:(__bridge UIWindowScene *)scene];
+    window.frame = b;
     UIViewController *vc = [[UIViewController alloc] init];
     ModusView *v = [[ModusView alloc] initWithFrame:b];
     v.multipleTouchEnabled = YES;

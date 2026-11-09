@@ -1841,8 +1841,12 @@
    Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
   (%kernel-redirect-hook name)
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
+  ;; Only while this process can write code, as the fill above is: a restored iOS
+  ;; snapshot's thunks are read-only pages, and their cache slots were emptied before
+  ;; the save (%JIT-BEFORE-SAVE), so there is nothing to clear and the store would fault.
   (let ((h (%jit-fnaddr-thunk-entry name)))
-    (when h (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0)))
+    (when (and h (%jit-enabled-p))
+      (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0)))
   ;; x64 native callers reach a runtime DEFUN through its linkage stub: until
   ;; a native definition is installed (which retargets it again), resolve late.
   (when (not (eq *jit-target-arch* :aarch64))
@@ -1858,7 +1862,8 @@
   ;; at call time; a native install that follows this call (that path calls
   ;; here first) then repoints the cell straight at the new code.  Only for a
   ;; name that HAS a cell -- some native caller links through it.
-  (when (and (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*
+  (when (and (%jit-enabled-p)
+             (boundp (quote *jit-linkage-cells*)) *jit-linkage-cells*
              *jit-lcell-table* (gethash name *jit-lcell-table*))
     (let ((th (%jit-make-fnaddr-thunk-aarch64 name)))
       (when th (%jit-lcell-set name th)))))

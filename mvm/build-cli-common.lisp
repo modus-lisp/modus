@@ -1259,6 +1259,13 @@
 ;;; the blob does not resolve).  net/hosted-actors-post.lisp must FOLLOW it,
 ;;; because its SPIN-LOCK / SPIN-UNLOCK / AP-SCHEDULER are last-defun-wins
 ;;; overrides of definitions net/actors.lisp itself makes.
+;; THE HOSTED ACTOR RUNTIME (net/hosted-actor-runtime.lisp) is linked only into the x64
+;; hosted CLI, and it is the only file that defines ACTORS-START and its siblings.  The
+;; public runtime API (%PUBLISH-RUNTIME-API-HOSTED) names them, so it may publish them
+;; only where this is true.  The source clause below uses this same variable.
+(defvar *cli-hosted-actor-runtime-p*
+  (and (eq *cli-arch* :x64) (not *cli-bare-metal*)))
+
 (defvar *cli-hosted-actors-source*
   (cond
    ((and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*)
@@ -1267,7 +1274,7 @@
                  (mvm-text "net/actors.lisp") (string #\Newline)
                  (mvm-text "net/hosted-actors-post.lisp") (string #\Newline)
                  (mvm-text "net/hosted-sync.lisp") (string #\Newline)))
-   ((and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+   (*cli-hosted-actor-runtime-p*
       (concatenate 'string (string #\Newline)
                    (mvm-text "net/hosted-actors.lisp")
                    (string #\Newline)
@@ -2014,9 +2021,10 @@
 ;; write to a server that had hung up killed everything with exit 141).
 ;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
 " (%ignore-sigpipe-source) "
-" (if *cli-bare-metal*
+" (if (not *cli-hosted-actor-runtime-p*)
       ;; The actor runtime and the per-computation registry are hosted-only
-      ;; (*cli-hosted-actors-source*); a bare image has nothing to publish.
+      ;; (*cli-hosted-actors-source*); an image without the actor runtime (bare metal,
+      ;; aarch64) has nothing to publish.
       "(defun %publish-runtime-api () nil)"
       "(defun %publish-runtime-api () (%publish-runtime-api-hosted))") "
 

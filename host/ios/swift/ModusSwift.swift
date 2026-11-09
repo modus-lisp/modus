@@ -13,8 +13,11 @@ private var views: [UInt: UIView] = [:]
 private var nextHandle: UInt = 1
 // A scroll view's handle maps to the stack that holds its children (ui_add puts them there).
 private var scrollContent: [UInt: UIStackView] = [:]
+// A list's handle maps to its data source (a UITableView keeps its data source weakly).
+private var lists: [UInt: ModusList] = [:]
 // The events, oldest first.  kind 1: a button tapped.  2: a switch changed (value 1 on, 0 off).
 // 3: a slider changed (value 0..100).  4: a text field's text changed (read it with ui_text_value).
+// 5: a list's row selected (value: the row's index).
 private var events: [(kind: UInt, handle: UInt, value: UInt)] = []
 
 private func text(_ p: UInt, _ n: UInt) -> String {
@@ -196,6 +199,56 @@ let addChild: Call = { parent, child, _, _, _, _ in
     return 0
 }
 
+// A list of rows of text.  Lisp pushes the rows (ui_list_set_rows); the table asks this object for its
+// cells as it needs them, and a tap on a row is a select event (kind 5) with the row's index.  UIKit never
+// calls into Lisp: the rows are data it already holds.
+final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
+    var rows: [String] = []
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        rows.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "row")
+            ?? UITableViewCell(style: .default, reuseIdentifier: "row")
+        cell.textLabel?.text = rows[indexPath.row]
+        cell.textLabel?.textColor = .white
+        cell.backgroundColor = .clear
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        events.append((kind: 5, handle: handle, value: UInt(indexPath.row)))
+    }
+}
+
+// list_new(x, y, w, h): an empty list; its rows come from ui_list_set_rows.
+let listNew: Call = { x, y, w, h, _, _ in
+    let table = UITableView(frame: rect(x, y, w, h), style: .plain)
+    table.backgroundColor = .clear
+    let handle = adopt(table)
+    let source = ModusList(handle: handle)
+    table.dataSource = source
+    table.delegate = source
+    lists[handle] = source
+    return handle
+}
+
+// list_set_rows(handle, text, length): the rows, one per line of the text (none for an empty text).
+let listSetRows: Call = { h, p, n, _, _, _ in
+    let s = text(p, n)
+    lists[h]?.rows = s.isEmpty ? [] : s.components(separatedBy: "\n")
+    (views[h] as? UITableView)?.reloadData()
+    return 0
+}
+
 // resign(handle): the keyboard goes away.  endEditing ends editing in the whole screen, so the
 // first responder goes whichever view holds it: a text field, or the desk (which takes keys too).
 let resign: Call = { _, _, _, _, _, _ in
@@ -216,6 +269,7 @@ let removeView: Call = { h, _, _, _, _, _ in
     views[h]?.removeFromSuperview()
     views[h] = nil
     scrollContent[h] = nil
+    lists[h] = nil
     return 0
 }
 
@@ -258,6 +312,8 @@ public func modusSwiftInstall() {
     register("ui_image_new", imageNew)
     register("ui_add", addChild)
     register("ui_resign", resign)
+    register("ui_list_new", listNew)
+    register("ui_list_set_rows", listSetRows)
     register("ui_set_text", setText)
     register("ui_set_value", setValue)
     register("ui_text_value", textValue)

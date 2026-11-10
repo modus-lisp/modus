@@ -319,8 +319,10 @@ let longPressOn: Call = { h, ms, _, _, _, _ in
 // alert_present shows it.  Choosing a button sends an ALERT event with the alert's handle and the button's index.
 private var alerts: [UInt: UIAlertController] = [:]
 
-let alertNew: Call = { tp, tn, mp, mn, _, _ in
-    let alert = UIAlertController(title: text(tp, tn), message: text(mp, mn), preferredStyle: .alert)
+// sheet: 1 for an action sheet (its buttons from the bottom of the screen), 0 for an alert.
+let alertNew: Call = { tp, tn, mp, mn, sheet, _ in
+    let alert = UIAlertController(title: text(tp, tn), message: text(mp, mn),
+                                  preferredStyle: sheet != 0 ? .actionSheet : .alert)
     let handle = nextHandle
     nextHandle += 1
     alerts[handle] = alert
@@ -386,6 +388,53 @@ let refreshOn: Call = { h, _, _, _, _, _ in
     control.addAction(UIAction { _ in send("REFRESH", [.int(Int(h))]) }, for: .valueChanged)
     table.refreshControl = control
     return 1
+}
+
+// The search bar's delegate: each change of its text sends a TEXT event (read the text with text_value).
+final class ModusSearchBar: NSObject, UISearchBarDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
+        send("TEXT", [.int(Int(handle))])
+    }
+}
+
+private var searchBarDelegates: [UInt: ModusSearchBar] = [:]
+
+// search_bar_new(placeholder, length, x, y, w, h): a search bar, its placeholder text, white on the dark screen.
+let searchBarNew: Call = { p, n, x, y, w, h in
+    let bar = UISearchBar(frame: rect(x, y, w, h))
+    bar.placeholder = text(p, n)
+    bar.searchBarStyle = .minimal
+    bar.tintColor = .white
+    bar.searchTextField.textColor = .white
+    let handle = adopt(bar)
+    let delegate = ModusSearchBar(handle: handle)
+    bar.delegate = delegate
+    searchBarDelegates[handle] = delegate
+    return handle
+}
+
+// toolbar_new(titles, length, x, y, w, h): a toolbar with a button per title (a term: a list of strings), spaced
+// evenly.  Tapping a button sends a SELECT event with its index.
+let toolbarNew: Call = { p, n, x, y, w, h in
+    let bar = UIToolbar(frame: rect(x, y, w, h))
+    bar.tintColor = .white
+    bar.barTintColor = UIColor(white: 0.12, alpha: 1)
+    let handle = adopt(bar)
+    var items: [UIBarButtonItem] = []
+    for (i, title) in titlesOf(p, n).enumerated() {
+        if i > 0 { items.append(UIBarButtonItem(systemItem: .flexibleSpace)) }
+        items.append(UIBarButtonItem(primaryAction: UIAction(title: title) { _ in
+            send("SELECT", [.int(Int(handle)), .int(i)])
+        }))
+    }
+    bar.items = items
+    return handle
 }
 
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
@@ -470,6 +519,8 @@ let setText: Call = { h, p, n, _, _, _ in
         field.text = s
     } else if let view = views[h] as? UITextView {
         view.text = s
+    } else if let bar = views[h] as? UISearchBar {
+        bar.text = s
     }
     return 0
 }
@@ -500,7 +551,8 @@ let setValue: Call = { h, value, _, _, _, _ in
 // text_value(handle, buffer, capacity): the text of a text field or label, as UTF-8 at the buffer if it
 // fits; the length of the text in bytes either way (0 for no text).
 let textValue: Call = { h, buf, cap, _, _, _ in
-    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? (views[h] as? UITextView)?.text ?? ""
+    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? (views[h] as? UITextView)?.text
+        ?? (views[h] as? UISearchBar)?.text ?? ""
     let bytes = Array(s.utf8)
     if !bytes.isEmpty, bytes.count <= Int(cap), let out = UnsafeMutableRawPointer(bitPattern: buf) {
         bytes.withUnsafeBytes { out.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
@@ -611,6 +663,8 @@ public func modusSwiftInstall() {
     register("ui_tab_bar_new", tabBarNew)
     register("ui_refresh_on", refreshOn)
     register("ui_send_refresh", sendRefresh)
+    register("ui_search_bar_new", searchBarNew)
+    register("ui_toolbar_new", toolbarNew)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

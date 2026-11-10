@@ -351,6 +351,21 @@
   "MOVE.B (An), Dd"
   (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn +ea-mode-an-ind+ an)))
 
+(defun m68k-emit-move-byte-disp-dn (buf an disp dn)
+  "MOVE.B d16(An), Dd"
+  (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn +ea-mode-an-disp+ an))
+  (m68k-emit-word buf (logand disp #xFFFF)))
+
+(defun m68k-emit-check-cons (buf dn)
+  "Trap (ILLEGAL) unless the low four bits of DN are +TAG-CONS+.  Clobbers D1.
+   MOVEQ / AND.L / SUBQ.L (6 bytes) for the ANDI.L / CMPI.L (12) it replaces,
+   and the skip is a fixed BEQ.S over the 2-byte ILLEGAL."
+  (m68k-emit-moveq buf +68k-d1+ 15)
+  (m68k-emit-and-dn-dn buf dn +68k-d1+)
+  (m68k-emit-subq buf +68k-d1+ +tag-cons+)
+  (m68k-emit-word buf #x6702)                    ; BEQ.S *+4: over the ILLEGAL
+  (m68k-emit-illegal buf))
+
 (defun m68k-emit-move-byte-dn-an-ind (buf dn an)
   "MOVE.B Dd, (An)"
   (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-an-ind+ an +ea-mode-dn+ dn)))
@@ -1871,13 +1886,13 @@
       ;; (cmp-imm / test-imm Va imm32): the immediate into D1, then as CMP / TEST
       (#.+op-cmp-imm+
        (let ((da (m68k-vreg-or-scratch buf (first operands) +68k-d0+)))
-         (m68k-emit-move-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
+         (m68k-emit-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
          (m68k-emit-cmp-dn-dn buf +68k-d1+ da)))
 
       (#.+op-test-imm+
        (progn
          (m68k-load-vreg buf +68k-d0+ (first operands))
-         (m68k-emit-move-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
+         (m68k-emit-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
          (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
          (m68k-emit-tst buf +68k-d0+)))
 
@@ -1947,41 +1962,22 @@
       (#.+op-car+
        (let ((vd (first operands))
              (vs (second operands)))
-         ;; Type check: low 4 bits == +tag-cons+
+         ;; Type check (trap on a non-cons), then the car at the tag-folded
+         ;; displacement: -tag(A0) is the cons's first word.
          (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
-         (m68k-emit-andi buf +68k-d1+ #xF)
-         (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
-         (let ((ok-label (mvm-make-label)))
-           (m68k-emit-beq buf ok-label)
-           (m68k-emit-illegal buf)   ; trap on non-cons
-           (m68k-emit-label buf ok-label))
-         ;; Strip tag, load car via address register
-         ;; D0 has the tagged pointer, subtract tag to get raw address
-         (m68k-emit-subi buf +68k-d0+ +tag-cons+)
-         ;; Move to address register for indirect access
+         (m68k-emit-check-cons buf +68k-d0+)
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-         ;; MOVE.L (A0), D0  -- load car
-         (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+)
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cdr+
        (let ((vd (first operands))
              (vs (second operands)))
-         ;; Type check
+         ;; Type check, then the cdr at (4 - tag)(A0)
          (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
-         (m68k-emit-andi buf +68k-d1+ #xF)
-         (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
-         (let ((ok-label (mvm-make-label)))
-           (m68k-emit-beq buf ok-label)
-           (m68k-emit-illegal buf)
-           (m68k-emit-label buf ok-label))
-         ;; Strip tag, load cdr (offset 4 on 32-bit)
-         (m68k-emit-subi buf +68k-d0+ +tag-cons+)
+         (m68k-emit-check-cons buf +68k-d0+)
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-         ;; MOVE.L 4(A0), D0
-         (m68k-emit-move-disp-dn buf +68k-a0+ 4 +68k-d0+)
+         (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+)
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cons+
@@ -2187,7 +2183,8 @@
        (let ((vd (first operands))
              (vs (second operands)))
          (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-andi buf +68k-d0+ #xF)
+         (m68k-emit-moveq buf +68k-d1+ 15)               ; AND #15 in 4 bytes, not 6
+         (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
          ;; Tag as fixnum: shift left 1
          (m68k-emit-lsl-imm buf +68k-d0+ 1)
          (m68k-store-vreg buf vd +68k-d0+)))
@@ -2206,17 +2203,18 @@
            (m68k-load-vreg buf +68k-d0+ vs)
            (m68k-emit-cmpi buf +68k-d0+ +t-value+)
            (m68k-emit-beq buf zero)
-           (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
-           (m68k-emit-andi buf +68k-d1+ #xF)
-           (m68k-emit-cmpi buf +68k-d1+ +tag-object+)
+           (m68k-emit-moveq buf +68k-d1+ 15)
+           (m68k-emit-and-dn-dn buf +68k-d0+ +68k-d1+)
+           (m68k-emit-cmpi-byte buf +68k-d1+ +tag-object+)
            (m68k-emit-bne buf zero)
-           (m68k-emit-subi buf +68k-d0+ +tag-object+)
            (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-           ;; Load header; the subtag is its LOW byte, (count << 8) | subtag
-           (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
-           (m68k-emit-andi buf +68k-d0+ #xFF)
+           ;; The subtag is the header's LOW byte, (count << 8) | subtag: the
+           ;; header long is at -tag(A0), so its low byte, big-endian, is at
+           ;; (3 - tag)(A0).
+           (m68k-emit-moveq buf +68k-d0+ 0)
+           (m68k-emit-move-byte-disp-dn buf +68k-a0+ (- 3 +tag-object+) +68k-d0+)
            ;; Tag as fixnum
-           (m68k-emit-lsl-imm buf +68k-d0+ 1)
+           (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d0+)
            (m68k-emit-bra buf done)
            (m68k-emit-label buf zero)
            (m68k-emit-moveq buf +68k-d0+ 0)

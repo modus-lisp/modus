@@ -116,7 +116,30 @@
 ;;; where every megabyte is minutes of UART time.  NOT measured since the split:
 ;;; the bare-metal boot calls %INIT-STANDARD-CHARS, which lives there.  Default
 ;;; NIL => every existing build is byte-identical.
-(defvar *cli-omit-ansi-test-aux* nil)
+;;; MODUS_SMALL_IMAGE=1: the smallest image that keeps the whole language and
+;;; runtime, for small-RAM targets (the 68LC040).  It builds the boot tables
+;;; (function table, symbol names) from packed text instead of per-entry code
+;;; and drops ansi-test-aux.  The source blob is MODUS_NO_SOURCE_BLOB's call.
+;;; Off by default => every existing build is byte-identical.
+(defvar *small-image*
+  (let ((v (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
+    (and v (plusp (length v)) (not (string= v "0")))))
+(when *small-image*
+  (format t "~&;; MODUS_SMALL_IMAGE: boot tables from packed text, no ansi-test-aux~%"))
+(defvar *cli-omit-ansi-test-aux* *small-image*)
+
+;;; MODUS_NO_COMPILER=1: no compiler in the image -- no ISA, bytecode
+;;; interpreter, compiler, mvm-eval, FASL cache, opcode table or stage
+;;; self-tests.  Such an image cannot EVAL, COMPILE or LOAD source; it runs
+;;; only what the BUILD-TIME compiler baked in.  CLI-TOPLEVEL becomes a call to
+;;; %IMAGE-MAIN, which MODUS_EXTRA_SOURCE=FILE supplies (see
+;;; *NO-COMPILER-SOURCE*).  For the smallest targets (the 68LC040).  Off by
+;;; default => every existing build is byte-identical.
+(defvar *no-compiler*
+  (let ((v (sb-ext:posix-getenv "MODUS_NO_COMPILER")))
+    (and v (plusp (length v)) (not (string= v "0")))))
+(when *no-compiler*
+  (format t "~&;; MODUS_NO_COMPILER: no compiler; the image runs a baked %IMAGE-MAIN~%"))
 
 ;;; ============================================================
 ;;; 1. Load MVM infrastructure (SBCL-side)
@@ -2340,6 +2363,68 @@
 ;;; so runtime EVAL can call it, and in *FULL-SOURCE* (with the build's record).
 (defvar *configuration-source* (mvm-text "lib/configuration.lisp"))
 
+;; What a no-compiler image runs instead of the SBCL-faithful toplevel (whose
+;; --eval / --load / REPL all need EVAL): %IMAGE-MAIN, normally baked in with
+;; MODUS_EXTRA_SOURCE=FILE.  This default says so and exits 1.
+(defvar *no-compiler-source*
+  (if cl-user::*no-compiler*
+      "
+;; RT (mvm/rt.lisp, mvm/rtest.lisp) is left out: its tests are defined by EVAL.
+;; KERNEL-MAIN still resets its counters and installs DEFTEST at boot.
+(defvar *rt-test-count* 0)
+(defvar *rt-pass-count* 0)
+(defvar *rt-fail-count* 0)
+(defvar *rt-registered-tests* nil)
+(defun %install-deftest-macro () nil)
+(defun %init-rtest () nil)
+;; Nor CL's macros as runtime source (mvm/runtime-cl-macros.lisp): they serve
+;; EVAL and MACROEXPAND; baked code was expanded by the build.
+(defun %install-runtime-cl-macros () nil)
+;; Every boot surface (Genera, the SBCL shims, ASDF) installs by EVALuating
+;; its source, so in this image they are all off.
+(declaim (overridable %surface-off-p))
+(defun %surface-off-p (var) var t)
+(declaim (overridable %image-main cli-toplevel))
+(defun %image-main ()
+  (write-line \"modus: built without a compiler (MODUS_NO_COMPILER=1); bake a %IMAGE-MAIN in with MODUS_EXTRA_SOURCE\")
+  (%cli-exit 1))
+(defun cli-toplevel ()
+  (%image-main)
+  (%cli-exit 0))
+"
+      ""))
+
+;; MODUS_NO_COMPILER (above): the compiler's sources, filtered to the part the
+;; rest of the image reaches, plus stubs for the entry points it still names --
+;; before the scanners and the blob see them (mvm/build-no-compiler.lisp).
+(when cl-user::*no-compiler*
+  (load (merge-pathnames "build-no-compiler.lisp" *load-truename*))
+  (setq *rt-source* "" *rtest-pkg-source* "" *rt-macros-source* "")
+  (multiple-value-bind (f stubs kept total stubbed)
+      (%nc-filter (list *isa-source* *interp-source* *stage1-test-source*
+                        *compiler-source* *stage2-float-override*
+                        *opcode-table-init-source* *fasl-source*
+                        *fasl-fingerprint-source* *mvm-eval-canonical-source*
+                        *stage2-test-source*)
+                  (list *prelude-source* *configuration-source* *softfloat-source*
+                        *gc-source* *mcgc-pin-source* *rt-source* *rtest-pkg-source*
+                        *rt-macros-source* *bridge-source* *cli-arch-override-source*
+                        *cli-native-bulk-source* *cli-hosted-actors-source*
+                        *cli-bare-metal-net-source* *driver-source* *genera-source*
+                        *sb-shim-source* *sb-gray-source* *asdf-source*
+                        *deferred-surfaces-source* *no-compiler-source*
+                        (%extra-source-text)))
+    (destructuring-bind (isa interp s1 comp float op fasl fp mvm-eval s2) f
+      (setq *isa-source* isa *interp-source* interp *stage1-test-source* s1
+            *compiler-source* comp *stage2-float-override* float
+            *opcode-table-init-source* op *fasl-source* fasl
+            *fasl-fingerprint-source* fp
+            ;; the stubs where most of what they replace was defined
+            *mvm-eval-canonical-source* (concatenate 'string mvm-eval stubs)
+            *stage2-test-source* s2))
+    (format t "~&;; MODUS_NO_COMPILER: kept ~D of ~D compiler-side forms; ~D stubbed: ~{~A~^ ~}~%"
+            kept total (length stubbed) stubbed)))
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *configuration-source* (string #\Newline)
@@ -2480,7 +2565,41 @@
       (format out "(defun %kernel-global-names-text () ~S)~%"
               (format nil "~{~A~^ ~}" *all-global-names*)))))
 
-(defvar *sft-auto-source* (emit-sft-auto *all-defun-names* 200))
+;; Function table under MODUS_SMALL_IMAGE (CL-USER::*SMALL-IMAGE*, above): the keys come from ONE string
+;; literal and each entry is a call passing #'NAME, instead of a PUTHASH whose
+;; key literal is built inline character by character (measured on 68k: ~700
+;; bytes of code an entry, 3.4 MB for the table).  Same keys, same functions,
+;; same order.
+(defun emit-sft-auto-packed (names chunk-size)
+  (let ((keys (mapcar (lambda (n) (or (gethash n *scan-defuns-qualified*) n)) names)))
+    (dolist (k keys)
+      (when (or (find #\Newline k) (string= k ""))
+        (error "emit-sft-auto-packed: key ~S is empty or holds a newline" k)))
+    (with-output-to-string (out)
+      (format out "(defun %sft-auto-text () ~S)~%" (format nil "~{~A~^~%~}" keys))
+      (format out "(defun %sft-auto-put (text pos fn)
+  (let ((j (or (position #\\Newline text :start pos) (length text))))
+    (puthash (subseq text pos j) *symbol-function-table* fn)
+    (+ j 1)))~%")
+      (let ((n-chunks (ceiling (length names) chunk-size)))
+        (dotimes (c n-chunks)
+          (format out "(defun %init-sft-auto-~D (text pos)~%" c)
+          (loop for i from (* c chunk-size) below (min (* (1+ c) chunk-size) (length names))
+                do (format out "  (setq pos (%sft-auto-put text pos #'~A))~%" (nth i names)))
+          (format out "  pos)~%"))
+        (format out "(defun %init-sft-auto ()~%  (let ((text (%sft-auto-text)) (pos 0))~%")
+        (dotimes (c n-chunks)
+          (format out "    (setq pos (%init-sft-auto-~D text pos))~%" c))
+        (format out "    pos)~%"))
+      (format out "  (%snapshot-kernel-fn-names)~%")
+      (format out "  (%snapshot-kernel-global-names (%kernel-global-names-text)))~%")
+      (format out "(defun %kernel-global-names-text () ~S)~%"
+              (format nil "~{~A~^ ~}" *all-global-names*)))))
+
+(defvar *sft-auto-source*
+  (if cl-user::*small-image*
+      (emit-sft-auto-packed *all-defun-names* 200)
+      (emit-sft-auto *all-defun-names* 200)))
 (format t "  sft-auto: ~D chars~%" (length *sft-auto-source*))
 
 ;; sym-name-auto: collect every symbol NAME mentioned in source so
@@ -2616,7 +2735,35 @@
         (format out "  (%init-sym-name-auto-~D)~%" c))
       (format out ")~%"))))
 
-(defvar *sym-name-auto-source* (emit-sym-name-auto *all-symbol-names* 200))
+;; MODUS_SMALL_IMAGE=1: the same table from ONE string literal (constant pool)
+;; split at boot, as %SNAPSHOT-KERNEL-GLOBAL-NAMES does.  Measured on 68k: the
+;; per-name PUTHASH forms above are ~820 bytes of code each, 12.7 MB for 12127
+;; names, all run once at boot.  The table's contents and order are identical;
+;; the names become heap strings instead of literals.
+
+(defun emit-sym-name-auto-packed (names)
+  (dolist (n names)
+    (when (find #\Newline n)
+      (error "emit-sym-name-auto-packed: symbol name ~S holds a newline" n)))
+  (with-output-to-string (out)
+    (format out "(defun %sym-name-auto-text () ~S)~%"
+            (format nil "~{~A~^~%~}" (remove "" names :test #'string=)))
+    (format out "(defun %init-sym-name-auto ()
+  (let ((text (%sym-name-auto-text)) (i 0))
+    (let ((n (length text)))
+      (loop
+        (when (>= i n) (return))
+        (let ((j (or (position #\\Newline text :start i) n)))
+          (let ((nm (subseq text i j)))
+            (puthash (compute-name-hash nm) *sym-name-table* nm))
+          (setq i (+ j 1))))))~:[~;
+  (puthash (compute-name-hash \"\") *sym-name-table* \"\")~])~%"
+            (member "" names :test #'string=))))
+
+(defvar *sym-name-auto-source*
+  (if cl-user::*small-image*
+      (emit-sym-name-auto-packed *all-symbol-names*)
+      (emit-sym-name-auto *all-symbol-names* 200)))
 
 ;; Macro table — extract every (mvm-define-macro NAME ...) from
 ;; compiler.lisp at build time so runtime macroexpand-1 can see them.
@@ -2770,6 +2917,9 @@
     ;; their installers), for the forward-reference reason given there.
     *deferred-surfaces-source*
     (string #\Newline)
+    ;; MODUS_NO_COMPILER: the toplevel runs %IMAGE-MAIN.  BEFORE the extra
+    ;; source, whose own %IMAGE-MAIN wins (last-defun-wins).
+    *no-compiler-source*
     (%extra-source-text)
     *driver-source*
     (string #\Newline)

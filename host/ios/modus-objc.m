@@ -31,6 +31,19 @@ enum { F_OP = 0, F_RECV = 8, F_SEL = 16, F_NARGS = 24, F_ARGS = 32, F_RESULT = 6
 static uint64_t fget(const uint8_t *f, int off) { uint64_t w; memcpy(&w, f + off, 8); return w; }
 static void fput(uint8_t *f, int off, uint64_t w) { memcpy(f + off, &w, 8); }
 
+// Does SEL, sent to RECV, return an object?  Its return type says so: '@' (an id) or '#' (a class).
+// A count, a BOOL or a C string comes back as a word, and retaining that word would crash.
+static int returns_object(id recv, SEL sel) {
+    if (!recv) return 0;
+    Method m = class_getInstanceMethod(object_getClass(recv), sel);
+    if (!m) return 0;
+    char type[64];
+    method_getReturnType(m, type, sizeof type);
+    const char *t = type;
+    while (*t && strchr("rnNoORV", *t)) t++;   // type qualifiers (const, in, oneway ...)
+    return *t == '@' || *t == '#';
+}
+
 static long run(uint8_t *f) {
     switch (fget(f, F_OP)) {
     case 1:
@@ -60,9 +73,10 @@ static long run(uint8_t *f) {
         }
         // A returned object belongs to the image now: UIKit drains its autorelease pool between
         // two calls, which would free an alert or an action the image is still holding.  So it is
-        // retained, and the image's own references are never released (a leak, for now).  A tagged
-        // pointer (top bit set on arm64) is no object in memory, and is left alone.
-        if (r != 0 && !(r >> 63)) CFRetain((CFTypeRef)(uintptr_t)r);
+        // retained, and the image's own references are never released (a leak, for now).  Only an
+        // object return is retained (returns_object); a tagged pointer (top bit set on arm64) is no
+        // object in memory, and is left alone.
+        if (r != 0 && !(r >> 63) && returns_object(recv, sel)) CFRetain((CFTypeRef)(uintptr_t)r);
         fput(f, F_RESULT, r);
         return 0;
     }

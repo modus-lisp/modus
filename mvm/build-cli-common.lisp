@@ -355,7 +355,7 @@
           ;; worktrees both sides, same 17625-test corpus —
           ;;   BASE 17476 / NET 17475, CHUNK-CRASH 0=0, FILE-WEDGE 30=30.
           ;; The lone -1 (P:13445) passes 3/3 on BOTH binaries in isolation, so
-          ;; it is 600s shard-truncation noise.  See GATE-RESULT-206-207.md.
+          ;; it is 600s shard-truncation noise.  See docs/gate-results/GATE-RESULT-206-207.md.
           ;;
           ;; Perf cost of the fix measured ~zero (3.991s -> 4.033s on the same
           ;; workload): only the TOP-LEVEL form degrades to interpret, and
@@ -1255,6 +1255,13 @@
 ;;; the blob does not resolve).  net/hosted-actors-post.lisp must FOLLOW it,
 ;;; because its SPIN-LOCK / SPIN-UNLOCK / AP-SCHEDULER are last-defun-wins
 ;;; overrides of definitions net/actors.lisp itself makes.
+;; THE HOSTED ACTOR RUNTIME (net/hosted-actor-runtime.lisp) is linked only into the x64
+;; hosted CLI, and it is the only file that defines ACTORS-START and its siblings.  The
+;; public runtime API (%PUBLISH-RUNTIME-API-HOSTED) names them, so it may publish them
+;; only where this is true.  The source clause below uses this same variable.
+(defvar *cli-hosted-actor-runtime-p*
+  (and (eq *cli-arch* :x64) (not *cli-bare-metal*)))
+
 (defvar *cli-hosted-actors-source*
   (cond
    ((and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*)
@@ -1263,7 +1270,7 @@
                  (mvm-text "net/actors.lisp") (string #\Newline)
                  (mvm-text "net/hosted-actors-post.lisp") (string #\Newline)
                  (mvm-text "net/hosted-sync.lisp") (string #\Newline)))
-   ((and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+   (*cli-hosted-actor-runtime-p*
       (concatenate 'string (string #\Newline)
                    (mvm-text "net/hosted-actors.lisp")
                    (string #\Newline)
@@ -1909,6 +1916,11 @@
                (read-file-text (merge-pathnames "net/sb-sys-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)
+               ;; the AArch64 socket floor (its syscall numbers; x86-64 has hosted-sockets-post)
+               (if (eq *cli-arch* :aarch64)
+                   (read-file-text (merge-pathnames "net/hosted-sockets-a64.lisp" *modus-base*))
+                   "")
+               (string #\Newline)
                (read-file-text (merge-pathnames "net/sb-bsd-sockets-shim.lisp"
                                                 *modus-base*))
                (string #\Newline)
@@ -2010,9 +2022,10 @@
 ;; write to a server that had hung up killed everything with exit 141).
 ;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
 " (%ignore-sigpipe-source) "
-" (if *cli-bare-metal*
+" (if (not *cli-hosted-actor-runtime-p*)
       ;; The actor runtime and the per-computation registry are hosted-only
-      ;; (*cli-hosted-actors-source*); a bare image has nothing to publish.
+      ;; (*cli-hosted-actors-source*); an image without the actor runtime (bare metal,
+      ;; aarch64) has nothing to publish.
       "(defun %publish-runtime-api () nil)"
       "(defun %publish-runtime-api () (%publish-runtime-api-hosted))") "
 

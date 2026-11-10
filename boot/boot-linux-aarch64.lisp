@@ -342,7 +342,7 @@
             (cons "MODUS-LAYOUT-HEAP-LO" hlo)
             (cons "MODUS-LAYOUT-HEAP-HI" (+ hlo (linux-aarch64-heap-size)))
             (cons "MODUS-LAYOUT-ARENA-LO" alo)
-            (cons "MODUS-LAYOUT-ARENA-HI" (+ alo +linux-aarch64-jit-arena-size+))))))
+            (cons "MODUS-LAYOUT-ARENA-HI" (+ alo (hosted-layout :jit-arena-size +linux-aarch64-jit-arena-size+)))))))
 
 (defun emit-aarch64-layout-addr (buf rd addr)
   "Xd := ADDR, an address in the image's layout: PC-relative under
@@ -481,7 +481,7 @@
   ;; arena base on success, 0 if the kernel refused (the trap then falls back
   ;; to mmap(NULL)).  MAP_NORESERVE: it is address space, not memory.
   (emit-aarch64-layout-addr buf 0 (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+))
-  (emit-aarch64-load-imm64 buf 1 +linux-aarch64-jit-arena-size+)
+  (emit-aarch64-load-imm64 buf 1 (hosted-layout :jit-arena-size +linux-aarch64-jit-arena-size+))
   (emit-aarch64-load-imm64 buf 2 7)          ; PROT_READ|WRITE|EXEC
   (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
   (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)

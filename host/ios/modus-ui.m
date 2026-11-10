@@ -82,7 +82,8 @@ static uint32_t keysym_for(uint32_t cp) {
 // THE KEYBOARD.  The view is a UIKeyInput, so it can be first responder: the on-screen keyboard
 // types into it, and so does a hardware one while the view holds focus.  Text is the image's to
 // interpret -- no autocorrection, no auto-capitals, the keys as typed.
-@interface ModusView : UIView <UIKeyInput>
+@interface ModusView : UIView <UIKeyInput, UIEditMenuInteractionDelegate>
+@property(nonatomic, strong) UIEditMenuInteraction *editMenu;   // the paste menu (two-finger press)
 @property(nonatomic) UITextAutocorrectionType autocorrectionType;
 @property(nonatomic) UITextAutocapitalizationType autocapitalizationType;
 @property(nonatomic) UITextSpellCheckingType spellCheckingType;
@@ -103,6 +104,48 @@ static uint32_t keysym_for(uint32_t cp) {
     }];
 }
 - (void)deleteBackward { push_key(0xff08); }
+
+// PASTE.  The clipboard's text goes in as keys, as typing would: keysym_for makes a newline Return
+// and a tab Tab.  Cmd-V on a hardware keyboard, a Paste in the menu that a two-finger press
+// brings up (one finger stays the pointer), and the system's own paste: all come here.
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc]
+            initWithTarget:self action:@selector(twoFingerPress:)];
+        press.numberOfTouchesRequired = 2;
+        [self addGestureRecognizer:press];
+        self.editMenu = [[UIEditMenuInteraction alloc] initWithDelegate:self];
+        [self addInteraction:self.editMenu];
+    }
+    return self;
+}
+- (void)paste:(id)sender {
+    NSString *s = [UIPasteboard generalPasteboard].string;
+    if (s.length) [self insertText:s];
+}
+- (BOOL)canPerformAction:(SEL)action withSender:(id)sender {
+    if (action == @selector(paste:)) return [UIPasteboard generalPasteboard].hasStrings;
+    return [super canPerformAction:action withSender:sender];
+}
+- (NSArray<UIKeyCommand *> *)keyCommands {
+    return @[ [UIKeyCommand keyCommandWithInput:@"v" modifierFlags:UIKeyModifierCommand
+                                         action:@selector(paste:)] ];
+}
+- (void)twoFingerPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    UIEditMenuConfiguration *c = [UIEditMenuConfiguration configurationWithIdentifier:nil
+                                                                          sourcePoint:[g locationInView:self]];
+    [self.editMenu presentEditMenuWithConfiguration:c];
+}
+- (UIMenu *)editMenuInteraction:(UIEditMenuInteraction *)interaction
+          menuForConfiguration:(UIEditMenuConfiguration *)configuration
+              suggestedActions:(NSArray<UIMenuElement *> *)suggestedActions {
+    if (![UIPasteboard generalPasteboard].hasStrings) return nil;
+    UIAction *paste = [UIAction actionWithTitle:@"Paste" image:nil identifier:nil
+                                        handler:^(__kindof UIAction *a) { [self paste:nil]; }];
+    return [UIMenu menuWithChildren:@[ paste ]];
+}
 // A hardware keyboard's arrows and Escape never reach insertText.
 - (void)pressesBegan:(NSSet<UIPress *> *)presses withEvent:(UIPressesEvent *)e {
     BOOL rest = NO;
@@ -131,15 +174,18 @@ static uint32_t keysym_for(uint32_t cp) {
 
 static UIWindow *window;
 
-// Called by the shim's app delegate, on the main thread, once launching is done.
-void modus_ui_start(void) {
+// Called by the shim's scene delegate, on the main thread, when UIKit connects the
+// scene.  iOS 27 traps an app that runs on the legacy app-delegate lifecycle, so the
+// window belongs to a UIWindowScene and not to the application.
+void modus_ui_start(void *scene) {
     CGRect b = [[UIScreen mainScreen] bounds];
     ui_scale = (long)[[UIScreen mainScreen] scale];
     if (ui_scale < 1) ui_scale = 1;
     fb_w = (long)b.size.width * UI_SCALE;
     fb_h = (long)b.size.height * UI_SCALE;
     fb = calloc((size_t)(fb_w * fb_h), 4);
-    window = [[UIWindow alloc] initWithFrame:b];
+    window = [[UIWindow alloc] initWithWindowScene:(__bridge UIWindowScene *)scene];
+    window.frame = b;
     UIViewController *vc = [[UIViewController alloc] init];
     ModusView *v = [[ModusView alloc] initWithFrame:b];
     v.multipleTouchEnabled = YES;
@@ -207,6 +253,13 @@ long modus_ui_call(long nr, long a0, long a1, long a2, long a3) {
     case 1002: return fill(a0, a1, a2);
     case 1003: present(); return 0;
     case 1005: return blit(a0, a1, a2, a3);
+    case 1007: {   // copy: the UTF-8 bytes at a0, a1 long, onto the pasteboard
+        NSString *s = [[NSString alloc] initWithBytes:(const void *)a0 length:(NSUInteger)a1
+                                             encoding:NSUTF8StringEncoding];
+        if (!s) return -22;
+        dispatch_async(dispatch_get_main_queue(), ^{ [UIPasteboard generalPasteboard].string = s; });
+        return 0;
+    }
     case 1006:
         dispatch_async(dispatch_get_main_queue(), ^{
             if (a0) [fb_view becomeFirstResponder]; else [fb_view resignFirstResponder];

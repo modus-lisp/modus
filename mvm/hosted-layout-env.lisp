@@ -34,7 +34,13 @@
   (let ((out nil))
     (dolist (kv '(("MODUS_CODE_BASE" . :code-base)
                   ("MODUS_HEAP_BASE" . :heap-base)
-                  ("MODUS_JIT_ARENA_BASE" . :jit-arena-base)))
+                  ("MODUS_JIT_ARENA_BASE" . :jit-arena-base)
+                  ;; the whole heap (both semispaces), when a target must hold less
+                  ;; than enable-layout-threads' default: iOS's address budget
+                  ("MODUS_HEAP_SIZE" . :heap-size)
+                  ;; the JIT arena's address space: iOS runs no JIT, and its budget
+                  ;; is ~2.2 GB for the whole app
+                  ("MODUS_JIT_ARENA_SIZE" . :jit-arena-size)))
       (let ((v (%layout-env-hex (car kv))))
         (when v (setq out (list* (cdr kv) v out)))))
     out))

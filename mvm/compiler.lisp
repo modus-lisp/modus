@@ -1318,6 +1318,7 @@
   (setq *fasl-taint-who* who)
   (setq *fasl-taint* (if (integerp *fasl-taint*) (+ *fasl-taint* 1) 1)))
 
+(declaim (overridable %e2-const-register))
 (defun %e2-const-register (value)
   "Register VALUE in the mvm-eval quote pool; return its index.  The pool is a
    HOLDER cons whose car is a simple vector, doubled when full: the indices are
@@ -1325,7 +1326,11 @@
    conses (64 bytes) -- 1.5 MB of a Zero network core, against 8 bytes a slot.
    The holder keeps one identity across growth, so a JIT page or retry entry
    that saved \"its\" pool (%JIT-RETRY-DRAIN swaps it back in) still writes
-   and reads the one live vector."
+   and reads the one live vector.  The image's own definition (mvm-eval.lisp)
+   adds what a WORKER THREAD must do instead."
+  (%e2-const-register-1 value))
+
+(defun %e2-const-register-1 (value)
   (unless *e2-const-pool*
     (setq *e2-const-pool* (cons (make-array 1024 :initial-element nil) nil))
     (setq *e2-const-count* 0))
@@ -1342,12 +1347,32 @@
     (setq *e2-const-count* (+ idx 1))
     idx))
 
+;;; A WORKER'S OWN QUOTE POOL (see %E2-CONST-REGISTER in mvm-eval.lisp).
+;;; *E2-THREAD-POOL* is bound per computation (%WITH-COMPUTATION-STATE,
+;;; net/hosted-sync.lisp), NIL until the thread's first own literal; then
+;;; (VECTOR . COUNT).  Its indices are offset by %E2-THREAD-POOL-BASE, far above
+;;; any shared-pool index, so code compiled on main keeps reading the shared
+;;; pool from any thread, and only code this thread compiled reads its own.
+(defvar *e2-thread-pool* nil
+  "This computation's own quote pool, (VECTOR . COUNT), or NIL.  See above.")
+
+(defun %e2-thread-pool-base ()
+  "First index of a thread's own quote pool -- keep in step with %E2-CONST-REF,
+   which writes the number out (it is the interpreter's LI-CONST hot path)."
+  #x10000000)
+
 (defun %e2-const-ref (idx)
-  "Entry IDX of the quote pool, NIL if none."
-  (let ((vec (and (consp *e2-const-pool*) (car *e2-const-pool*))))
-    (if (and vec (integerp idx) (>= idx 0) (< idx (length vec)))
-        (aref vec idx)
-        nil)))
+  "Entry IDX of the quote pool (or of this thread's own pool, see
+   %E2-THREAD-POOL-BASE), NIL if none."
+  (if (and (integerp idx) (>= idx #x10000000))
+      (let ((holder *e2-thread-pool*) (i (- idx #x10000000)))
+        (if (and (consp holder) (< i (cdr holder)))
+            (aref (car holder) i)
+            nil))
+      (let ((vec (and (consp *e2-const-pool*) (car *e2-const-pool*))))
+        (if (and vec (integerp idx) (>= idx 0) (< idx (length vec)))
+            (aref vec idx)
+            nil))))
 
 (defvar *loop-exit-label* nil
   "Label for (return) to jump to in a loop")
@@ -11541,6 +11566,18 @@
   ;; Also handle pre-hashed integer ops
   )
 
+(defun %collect-setq-vars-via-expansion (form bound-vars mx)
+  "The BOUND-VARS that FORM's one-step macro expansion assigns, or NIL when it
+   does not expand (or the expander fails out of context, or MX says this path
+   has expanded enough) -- the macro arm of COLLECT-SETQ-VARS-IN-BODY, for an
+   assignment form whose PLACE is not a variable."
+  (let ((x (and (< mx 16)
+                (handler-case (%macroexpand-1-mvm-raw form)
+                  (error () nil)))))
+    (if (and (consp x) (cdr x) (not (eq (car x) form)))
+        (collect-setq-vars-in-body (car x) bound-vars (+ mx 1))
+        nil)))
+
 (defun collect-setq-vars-in-body (form bound-vars &optional (mx 0))
   "Return list of variables (from BOUND-VARS) that are mutated anywhere in FORM
    (via setq/incf/decf), including inside lambdas. BOUND-VARS is a list of variable
@@ -11578,7 +11615,17 @@
                   (setq result (adjoin arg result :test #'name-equal)))
                  (t ;; non-symbol place — recurse for nested mutations
                   (dolist (v (collect-setq-vars-in-body arg bound-vars))
-                    (setq result (adjoin v result :test #'name-equal)))))
+                    (setq result (adjoin v result :test #'name-equal)))
+                  ;; ...and through its SETF EXPANSION, which may assign a
+                  ;; variable the place only reads: (setf (getf out k) v) is
+                  ;; (setq out (set-getf out k v)).  Without this OUT was not
+                  ;; boxed, and the assignment from inside a closure (an FLET
+                  ;; helper building a plist) never reached the outer OUT.
+                  (when (consp args)
+                    (dolist (v (%collect-setq-vars-via-expansion
+                                (list 'setf arg (if (consp (cdr args)) (cadr args) nil))
+                                bound-vars mx))
+                      (setq result (adjoin v result :test #'name-equal))))))
                ;; value position — recurse
                (dolist (v (collect-setq-vars-in-body arg bound-vars))
                  (setq result (adjoin v result :test #'name-equal)))))
@@ -11608,9 +11655,14 @@
             (rest (apply #'append
                          (mapcar (lambda (f) (collect-setq-vars-in-body f bound-vars))
                                  (cddr form)))))
-       (if (and (symbolp var) (member var bound-vars :test #'name-equal))
-           (adjoin var rest :test #'name-equal)
-           rest)))
+       (cond ((and (symbolp var) (member var bound-vars :test #'name-equal))
+              (adjoin var rest :test #'name-equal))
+             ;; A non-symbol place ((incf (getf out k 0)), (push x (getf out k)))
+             ;; can assign a variable through its expansion, as SETF's can.
+             ((consp var)
+              (dolist (v (%collect-setq-vars-via-expansion form bound-vars mx) rest)
+                (setq rest (adjoin v rest :test #'name-equal))))
+             (t rest))))
     ;; Skip init of lambda params — they shadow the outer vars
     ((and (consp form)
           (or (and (symbolp (car form)) (string= (symbol-name (car form)) "LAMBDA"))
@@ -31605,7 +31657,7 @@
        ;; body can use %PRIM-AREF / %PRIM-ASET directly and skip the public
        ;; AREF/ASET cond entirely — which was already testing %MDA-P (itself
        ;; five type tests plus an OBJ-SUBTAG), CONSP and %PRIM-STRINGP on
-       ;; every single slot access.  See GATE-RESULT-244-accessors.md.
+       ;; every single slot access.  See docs/gate-results/GATE-RESULT-244-accessors.md.
        ;; The printer consults this before printing #S(...).  It was parsed
        ;; nowhere: a struct with :PRINT-FUNCTION / :PRINT-OBJECT printed
        ;; #S(...) regardless.

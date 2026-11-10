@@ -49,6 +49,7 @@ typedef mach_vm_size_t modus_vsize_t;
 #include <os/clock.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
@@ -75,6 +76,7 @@ static inline void modus_jit_wp(int executable) {
 }
 
 extern void modus_syscall_stub(void);
+extern long modus_keychain_call(long nr, long a0, long a1, long a2);   // host/macos/modus-keychain.m
 
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
 // sigaltstack is prohibited on watchOS: there the fault handler runs on the
@@ -104,8 +106,10 @@ static __thread int image_leader;
 // host/ios/modus-ui.m (host/watch/modus-watch.swift on watchOS): a framebuffer
 // and touch events for the image.
 extern void modus_ui_init(void);
-extern void modus_ui_start(void);
+extern void modus_ui_start(void *scene);
 extern long modus_ui_call(long nr, long a0, long a1, long a2, long a3);
+extern long modus_objc_call(long frame);                              // host/ios/modus-objc.m
+extern long modus_swift_call(long frame);                             // host/ios/modus-swift.m
 #if TARGET_OS_WATCH
 // watchOS has no public UIKit: the SwiftUI app in host/watch/modus-watch.swift
 // owns the main thread instead.
@@ -118,8 +122,13 @@ static signed char modus_did_finish(void *self, SEL cmd, void *app, void *opts) 
     // device backgrounds the app and iOS suspends it within seconds, which
     // froze long runs mid-way.  (A lock by the user still suspends it.)
     ((void (*)(void *, SEL, signed char))objc_msgSend)(app, sel_registerName("setIdleTimerDisabled:"), 1);
-    modus_ui_start();
     return 1;
+}
+// THE SCENE, not the application, owns the window (iOS 27 refuses the legacy
+// lifecycle).  UIKit calls this on the main thread when it connects the scene.
+static void modus_scene_will_connect(void *self, SEL cmd, void *scene, void *session, void *opts) {
+    (void)self; (void)cmd; (void)session; (void)opts;
+    modus_ui_start(scene);
 }
 #endif
 struct image_start { uint64_t sp, entry; };
@@ -152,6 +161,12 @@ static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t 
     class_addMethod(c, sel_registerName("application:didFinishLaunchingWithOptions:"),
                     (IMP)modus_did_finish, "c@:@@");
     objc_registerClassPair(c);
+    Class sc = objc_allocateClassPair(objc_getClass("UIResponder"), "ModusSceneDelegate", 0);
+    class_addMethod(sc, sel_registerName("scene:willConnectToSession:options:"),
+                    (IMP)modus_scene_will_connect, "v@:@@@");
+    // UIKit refuses a scene delegate that does not declare the protocol.
+    class_addProtocol(sc, objc_getProtocol("UIWindowSceneDelegate"));
+    objc_registerClassPair(sc);
     UIApplicationMain(argc, argv, NULL, CFSTR("ModusAppDelegate"));
     _exit(0);   // UIApplicationMain does not return; the image's exit() ends the app
 #endif
@@ -577,6 +592,8 @@ static long jit_read(int fd, void *buf, size_t n) {
 // (hosted-layout-env.lisp +LAYOUT-DARWIN-TSD-KEY+).
 #define MODUS_TSD_KEY 300
 #define LX_SYS_SET_THREAD_DELTA 1000     // translate-aarch64 +A64-DARWIN-SYS-SET-THREAD-DELTA+
+#define LX_SYS_MLOCK 1020                // natrium's secret arena (gossamer): mlock(addr, len).  Linux's
+                                         // aarch64 mlock is 228, which the shim faults on, so Darwin uses this
 
 struct stub_frame {                       // syscall-stub.S, 608 bytes
     uint64_t x1_15[15];                   // x1..x15            @0
@@ -737,6 +754,25 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
     case 220: return dx_clone(a0, a1, (uint32_t *)a2, (uint32_t *)a4, frame);
     case 98:  return dx_futex((uint32_t *)a0, a1, a2, (const struct timespec *)a3);
     case LX_SYS_SET_THREAD_DELTA: pthread_setspecific(delta_key, (void *)a0); return 0;
+    case LX_SYS_MLOCK: RET(mlock((const void *)a0, (size_t)a1));
+    case 25: {                                                // fcntl.  O_NONBLOCK is 2048 in Linux and 4 in
+        int fd = (int)a0, cmd = (int)a1;                      // Darwin, so the bit is translated both ways
+        if (cmd == F_GETFL) {
+            int fl = fcntl(fd, F_GETFL);
+            if (fl < 0) return -lx_errno(errno);
+            return (fl & ~O_NONBLOCK) | ((fl & O_NONBLOCK) ? 2048 : 0);
+        }
+        if (cmd == F_SETFL) {
+            long v = a2;
+            int dv = (int)(v & ~2048L) | ((v & 2048L) ? O_NONBLOCK : 0);
+            RET(fcntl(fd, F_SETFL, dv));
+        }
+        RET(fcntl(fd, cmd, (long)a2)); }
+    case 73: {                                                // ppoll(fds, n, timespec *, sigmask) as poll(2)
+        const struct timespec *t = (const struct timespec *)a2;
+        int ms = t ? (int)(t->tv_sec * 1000 + t->tv_nsec / 1000000) : -1;
+        int r = poll((struct pollfd *)a0, (nfds_t)a1, ms);
+        return r < 0 ? -lx_errno(errno) : r; }
     case 113: RET(clock_gettime(dx_clock(a0), (struct timespec *)a1));
     case 169: RET(gettimeofday((struct timeval *)a0, NULL));
     case 101: RET(nanosleep((const struct timespec *)a0, (struct timespec *)a1));
@@ -797,9 +833,15 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
         return 0; }
     case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
+    case 1030: case 1031: case 1032:                                    // the keychain, random bytes (modus-keychain.m)
+        return modus_keychain_call(nr, a0, a1, a2);
 #if TARGET_OS_IPHONE
-    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006:   // screen, input (host/ios/modus-ui.m)
+    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007:   // screen, input, copy (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
+    case 1040:   // the Objective-C runtime: a frame in the image's memory (host/ios/modus-objc.m)
+        return modus_objc_call(a0);
+    case 1060:   // Lisp calls a Swift function by name (host/ios/modus-swift.m)
+        return modus_swift_call(a0);
 #endif
     case 1010: case 1011: case 1012:                          // the speaker (host/macos/modus-audio.c)
         return modus_audio_call(nr, a0, a1);

@@ -1487,6 +1487,30 @@
                   (when (eq (car pair) key) (setq r (cdr pair)) (return r)))
                 (setq cur (cdr cur))))))))
 
+;;; A READ THAT BUILDS THE INDEX.  GETHASH (and %GETHASH-PAIR) build a table's
+;;; index lazily, on the first lookup after the table crosses the threshold --
+;;; a WRITE, done by a reader.  On a worker thread whose table is shared (made
+;;; on main: CLOS's *GF-FIND-MEMO*, a package's symbol table), the new index is
+;;; the worker's own object stored into shared memory, which the shared-store
+;;; guard refuses: every later generic-function call on that thread that missed
+;;; its dispatch cache failed.  So a worker builds it the way a writer does,
+;;; inside the runtime lock, where it allocates from the lock arena (shared
+;;; address space) -- and first looks again, since another thread may have
+;;; built it while this one waited.  Main, a process with no threads, and a
+;;; worker reading its OWN table build as before: that index must be the
+;;; worker's own object too, or the worker's next PUTHASH would store its keys
+;;; into a shared vector -- the same refusal, one step later.
+(defun %ht-read-build-index (ht holder)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0) (eql (%dynb-block) 0)
+          (%own-region-object-p ht))
+      (%ht-rebuild-index ht holder (cdr (cdr holder)))
+      (progn
+        (%rt-enter)
+        (unwind-protect
+             (let ((v (car holder)))
+               (if (null v) (%ht-rebuild-index ht holder (cdr (cdr holder))) v))
+          (%rt-leave)))))
+
 ;;; SAFETY 0 for GETHASH alone (as cl-eval.lisp's bignum kernel): every index
 ;;; it reads is bounded by construction -- a bucket number masked to the vector,
 ;;; a dict slot masked to its index, an entry number checked against the
@@ -1517,7 +1541,7 @@
         (when (null vec)
           ;; still small: build the index once the table crosses the threshold
           (when (>= (car (cdr holder)) 32)
-            (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
+            (setq vec (%ht-read-build-index ht holder))))
         (when (consp vec)
           ;; COMPACT DICT (see %HTD-FIND)
           (setq use-linear nil)
@@ -1625,7 +1649,7 @@
         (when (null vec)
           ;; still small: build the index once the table crosses the threshold
           (when (>= (car (cdr holder)) 32)
-            (setq vec (%ht-rebuild-index ht holder (cdr (cdr holder))))))
+            (setq vec (%ht-read-build-index ht holder))))
         (when (consp vec)
           ;; A pair is about to be handed out: this table is PINNED from now on
           ;; (see *%HT-PINNED-PAIRS*) -- back to its alist and classic buckets.
@@ -3227,6 +3251,29 @@
         (if (>= hi #x80000000)
             (+ (%conv-addr #x10000000) (+ (* (* (- hi 4294967296) 65536) 65536) lo))
             (+ (%conv-addr #x10000000) (+ (* (* hi 65536) 65536) lo))))))
+
+(defun %own-region-object-p (x)
+  "T when X is a heap object inside THIS thread's own region pair -- the
+   shared-store guard's own test (translate-x64, %SSG-EMIT-IN-REGION): the
+   objects a worker may not store into shared memory.  NIL on main (which has
+   no window block, and no region pair), for immediates, and wherever no
+   window was ever seeded.  The pair is the window's words +0x5040 (semispace
+   A), +0x5048 (B) and +0x5050 (size), read from this thread's block 32 bits
+   at a time (a :U64 MEM-REF is not exact) -- as %SB-WORKER-OBJECT-P reads
+   them in a hosted image."
+  (let ((blk (%dynb-block)))
+    (if (eql blk 0)
+        nil
+        (let ((w (%val->word x)))
+          (if (not (eql (logand w 5) 1))
+              nil
+              (let ((a (logand w -16))
+                    (ba (+ (mem-ref (+ blk #x5040) :u32) (* 4294967296 (mem-ref (+ blk #x5044) :u32))))
+                    (bb (+ (mem-ref (+ blk #x5048) :u32) (* 4294967296 (mem-ref (+ blk #x504C) :u32))))
+                    (sz (+ (mem-ref (+ blk #x5050) :u32) (* 4294967296 (mem-ref (+ blk #x5054) :u32)))))
+                (and (> sz 0)
+                     (or (and (>= a ba) (< a (+ ba sz)))
+                         (and (>= a bb) (< a (+ bb sz)))))))))))
 
 (defun %dynb-depth (blk)
   "Number of live dynamic bindings on this thread's stack.  Stored TAGGED so

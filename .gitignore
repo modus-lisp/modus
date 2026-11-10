@@ -15,3 +15,9 @@ modus-aa64
 
 # modus-lisp/vessel at vessel.pin (scripts/vessel-checkout.sh)
 /.vessel/
+
+# gate and probe outputs written to the tree root
+/gate-*.out
+/gate-*.out.shard.*
+/tmp.dat
+/shards-*/

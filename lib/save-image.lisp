@@ -72,9 +72,11 @@
 (declaim (overridable %core-jit-arena-hi))
 (defun %core-jit-arena-hi ()
   "End of the JIT exec arena: code grows up from its base, data pages
-   (mvm-eval.lisp %JIT-DATA-PAGE) down from here.  Hosted reserves 512 MB;
+   (mvm-eval.lisp %JIT-DATA-PAGE) down from here.  Hosted reserves 512 MB
+   unless the layout says otherwise (MODUS_JIT_ARENA_SIZE: iOS's arena is
+   smaller, and this must agree with the segment the image maps for it);
    a board's arena is the fixed region it has (the Pi overrides)."
-  (+ (%core-jit-arena-lo) #x20000000))
+  (+ (%core-jit-arena-lo) (%layout :jit-arena-size #x20000000)))
 
 (declaim (overridable %core-jit-bump-slot))
 (defun %core-jit-bump-slot ()
@@ -565,9 +567,13 @@
           (lognot 15)))
 
 (defun %core-leaf-p (subtag)
-  "A raw payload, as the native walk's leaf set: never relocated."
+  "A raw payload, as the native walk's leaf set: never relocated.  NOT bignum #x30: a big
+   bignum's slot 1 points at its limb array, which moves with the heap, so its words are
+   relocated like any pointer (gc.lisp %GC-LEAF-SUBTAG-P says the same).  Left out of this
+   set, a restored big bignum kept its old limb pointer -- every bignum global came back
+   corrupt on the phone (natrium's constants, seal's curves)."
   (or (= subtag #x10) (= subtag #x11) (= subtag #x12) (= subtag #x13) (= subtag #x14) (= subtag #x15)
-      (= subtag #x16) (= subtag #x17) (= subtag #x30) (= subtag #x31) (= subtag #x60)
+      (= subtag #x16) (= subtag #x17) (= subtag #x31) (= subtag #x60)
       (= subtag #x64) (= subtag #x65) (= subtag #x66)))
 
 (defun %core-reloc-heap (from free l0 l1 d)

@@ -248,6 +248,8 @@
 ;;; O_NONBLOCK (04000 = 2048) via fcntl(72): F_GETFL = 3, F_SETFL = 4.  Read
 ;;; the flags rather than assuming them, because clearing a flag the kernel set
 ;;; (O_RDWR, O_CLOEXEC) would be a different bug every time.
+(defun %sbs-fcntl (fd cmd arg) (syscall3 72 fd cmd arg))   ; fcntl, x86-64 (the AArch64 file: 25)
+
 (defun socket-set-nonblock (fd)
   (let ((fl (syscall3 72 fd 3 0)))
     (if (< fl 0)

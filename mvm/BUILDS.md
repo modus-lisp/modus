@@ -45,7 +45,7 @@ exactly that shape (`:net` / `:main` / `:extra` / `:parts` / `:flags`); the
 `:parts` order is load-bearing (single-threaded SSH puts kernel-main LAST so
 it wins the entry point; the actor builds put it FIRST).  `actors` and
 `isolated` share one verbatim kernel-main — they differ only by appending
-`isolated-net.lisp`.  Evidence: `GATE-RESULT-ssh-cells.md`.
+`isolated-net.lisp`.  Evidence: `docs/gate-results/GATE-RESULT-ssh-cells.md`.
 
 ## Running them — one entry point
 
@@ -69,7 +69,7 @@ the four `run-rpi-*` ones are **kept**: their targets could not be proven, and
 not for launcher reasons — the SSH payload wedges in `dhcp-discover` before
 printing `DHCP:D` (the scripts `run.sh` would replace fail *identically*, and
 the images are byte-identical to the md5s in this file), and the RPi family
-still dies on the `A64-BUFFER` build error.  Evidence: `GATE-RESULT-run-cells.md`.
+still dies on the `A64-BUFFER` build error.  Evidence: `docs/gate-results/GATE-RESULT-run-cells.md`.
 
 Proving `run.sh` also turned up three defects in it, now fixed: the ssh
 readiness test was a `/dev/tcp` probe, which QEMU satisfies the instant it

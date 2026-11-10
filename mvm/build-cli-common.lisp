@@ -2634,7 +2634,7 @@
       (format out "(defun %sft-auto-text () ~S)~%" (format nil "~{~A~^~%~}" keys))
       (format out "(defun %sft-auto-put (text pos fn)
   (let ((j (or (position #\\Newline text :start pos) (length text))))
-    (puthash (subseq text pos j) *symbol-function-table* fn)
+    (puthash (modus.runtime::%narrow-copy (subseq text pos j)) *symbol-function-table* fn)
     (+ j 1)))~%")
       (let ((n-chunks (ceiling (length names) chunk-size)))
         (dotimes (c n-chunks)
@@ -2809,7 +2809,7 @@
       (loop
         (when (>= i n) (return))
         (let ((j (or (position #\\Newline text :start i) n)))
-          (let ((nm (subseq text i j)))
+          (let ((nm (modus.runtime::%narrow-copy (subseq text i j))))
             (puthash (compute-name-hash nm) *sym-name-table* nm))
           (setq i (+ j 1))))))~:[~;
   (puthash (compute-name-hash \"\") *sym-name-table* \"\")~])~%"

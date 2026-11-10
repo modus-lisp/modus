@@ -173,6 +173,14 @@
 
 (require :sb-posix)
 
+;; NARROW STRINGS (prelude.lisp %NARROW-STRINGS-P): the 68k collector sizes
+;; #x13 as bytes (translate-68k.lisp M68K-EMIT-OBJECT-SIZE); MODUS_NARROW_STRINGS=1
+;; has the reader and the runtime's name tables make them in this build.
+(when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline))))
+
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 

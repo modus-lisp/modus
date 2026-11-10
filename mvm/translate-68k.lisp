@@ -3009,14 +3009,18 @@
 
 (defun m68k-emit-object-size (buf dst hdr)
   "DST = the byte size of the object whose header word is in HDR, aligned to
-   16.  Mirrors every 68k allocation site: a u8 vector (#x11) counts bytes
-   after its 4-byte header, everything else (count + 1) longwords.  Clobbers
-   only DST."
-  (let ((words (mvm-make-label)) (al (mvm-make-label)))
+   16.  Mirrors every 68k allocation site: a u8 vector (#x11) and a narrow
+   string (#x13, %MAKE-BASE-STRING: a u8 vector with its subtag rewritten)
+   count bytes after their 4-byte header, everything else (count + 1)
+   longwords.  Clobbers only DST."
+  (let ((words (mvm-make-label)) (bytes (mvm-make-label)) (al (mvm-make-label)))
     (m68k-emit-move-dn-dn buf hdr dst)
     (m68k-emit-andi buf dst #xFF)
     (m68k-emit-cmpi buf dst +subtag-u8-vector+)
+    (m68k-emit-beq buf bytes)
+    (m68k-emit-cmpi buf dst #x13)                 ; narrow string
     (m68k-emit-bne buf words)
+    (m68k-emit-label buf bytes)
     (m68k-emit-move-dn-dn buf hdr dst)
     (m68k-emit-lsr-imm buf dst 8)
     (m68k-emit-addq buf dst 4)
@@ -3030,9 +3034,9 @@
     (m68k-emit-addi buf dst 15)
     (m68k-emit-andi buf dst (logand (lognot 15) #xFFFFFFFF))))
 
-(defparameter *68k-gc-leaf-subtags* '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66)
+(defparameter *68k-gc-leaf-subtags* '(#x10 #x11 #x12 #x13 #x14 #x16 #x60 #x64 #x65 #x66)
   "Objects whose payload holds no pointers: copied, never scanned.  ARM32's
-   list exactly.")
+   list, plus #x13: a narrow string's payload is bytes.")
 
 (defun m68k-emit-gc-collector (buf)
   "Emit the hosted collector at *68K-GC-LABEL*.  Entered by BSR.L from

@@ -891,6 +891,97 @@ let announce: Call = { p, n, _, _, _, _ in
     return 0
 }
 
+// A tab bar controller's delegate: a tab picked sends a SELECT event with its index.
+final class ModusTabs: NSObject, UITabBarControllerDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func tabBarController(_ tabBarController: UITabBarController, didSelect viewController: UIViewController) {
+        send("SELECT", [.int(Int(handle)), .int(tabBarController.selectedIndex)])
+    }
+}
+
+private var tabDelegates: [UInt: ModusTabs] = [:]
+private var tabContent: [UInt: [UInt]] = [:]
+
+// tab_controller_new(titles, length): a tab bar controller, a tab per title, each tab's content a view (tab_content).
+// Shown with modal_present; a tab picked is a SELECT event with its index.  Returns the controller's handle.
+let tabControllerNew: Call = { p, n, _, _, _, _ in
+    let tabs = UITabBarController()
+    var controllers: [UIViewController] = []
+    var contents: [UInt] = []
+    for (i, title) in titlesOf(p, n).enumerated() {
+        let vc = UIViewController()
+        vc.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        vc.tabBarItem = UITabBarItem(title: title, image: nil, tag: i)
+        controllers.append(vc)
+        let content = nextHandle
+        nextHandle += 1
+        views[content] = vc.view
+        contents.append(content)
+    }
+    tabs.viewControllers = controllers
+    let handle = nextHandle
+    nextHandle += 1
+    modalControllers[handle] = tabs
+    tabContent[handle] = contents
+    let delegate = ModusTabs(handle: handle)
+    tabs.delegate = delegate
+    tabDelegates[handle] = delegate
+    return handle
+}
+
+// tab_content(controller, index): the view of a tab, to add to with ui_add.
+let tabContentOf: Call = { h, i, _, _, _, _ in
+    tabContent[h]?[Int(i)] ?? 0
+}
+
+// nav_controller_new(): a navigation controller whose root view is its first content (nav_root).  Shown with
+// modal_present.
+private var navContent: [UInt: [UInt]] = [:]
+
+let navControllerNew: Call = { _, _, _, _, _, _ in
+    let root = UIViewController()
+    root.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    root.title = "start"
+    let nav = UINavigationController(rootViewController: root)
+    nav.navigationBar.barStyle = .black
+    nav.navigationBar.tintColor = .white
+    nav.navigationBar.titleTextAttributes = [.foregroundColor: UIColor.white]
+    let rootContent = nextHandle
+    nextHandle += 1
+    views[rootContent] = root.view
+    let handle = nextHandle
+    nextHandle += 1
+    modalControllers[handle] = nav
+    navContent[handle] = [rootContent]
+    return handle
+}
+
+// nav_root(controller): the view of the navigation controller's root.
+let navRoot: Call = { h, _, _, _, _, _ in
+    navContent[h]?.first ?? 0
+}
+
+// nav_push_view(controller, title, length): pushes a view titled so, and returns its handle.  Its back button reads
+// 'back'.
+let navPushView: Call = { h, p, n, _, _, _ in
+    guard let nav = modalControllers[h] as? UINavigationController else { return 0 }
+    let vc = UIViewController()
+    vc.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    vc.title = text(p, n)
+    vc.navigationItem.backButtonTitle = "back"
+    let content = nextHandle
+    nextHandle += 1
+    views[content] = vc.view
+    navContent[h, default: []].append(content)
+    nav.pushViewController(vc, animated: false)
+    return content
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1148,6 +1239,11 @@ public func modusSwiftInstall() {
     register("ui_list_actions", listActions)
     register("ui_paging_new", pagingNew)
     register("ui_announce", announce)
+    register("ui_tab_controller_new", tabControllerNew)
+    register("ui_tab_content", tabContentOf)
+    register("ui_nav_controller_new", navControllerNew)
+    register("ui_nav_root", navRoot)
+    register("ui_nav_push_view", navPushView)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

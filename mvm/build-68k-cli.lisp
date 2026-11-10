@@ -186,6 +186,8 @@
 
 (install-68k-translator)
 (m68k-set-linux-mode t)
+;; MODUS_SMALL_IMAGE: each branch as short as its distance allows (two passes).
+(when cl-user::*small-image* (setf *68k-relax-branches* t))
 
 (let ((v (sb-ext:posix-getenv "MODUS_68K_GC_POISON")))
   (when (and v (plusp (length v)) (not (string= v "0")))

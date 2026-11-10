@@ -162,7 +162,7 @@
    range-checked before encoding — out-of-range silently truncates."
   (let ((words (m68k-buffer-words buf)))
     (dolist (fixup (m68k-buffer-fixups buf))
-      (destructuring-bind (word-idx label-id fixup-type ref-pos) fixup
+      (destructuring-bind (word-idx label-id fixup-type ref-pos &optional ord) fixup
         (let ((target (gethash label-id (m68k-buffer-labels buf))))
           (unless target
             (error "68k: undefined label ~D" label-id))
@@ -190,6 +190,8 @@
              ;; 32-bit displacement (two words) — full 32-bit signed range,
              ;; no realistic overflow but the assert keeps the invariant.
              (let ((disp (- target (- ref-pos 2))))
+               (when (and ord *68k-branch-distances*)
+                 (setf (gethash ord *68k-branch-distances*) (cons disp ref-pos)))
                (unless (<= -2147483648 disp 2147483647)
                  (error "68k :disp32 ~D out of range at word-idx ~D"
                         disp word-idx))
@@ -612,6 +614,18 @@
 ;;; (outside the mapped TLBs), on m68k virt it is ordinary RAM.
 (defun m68k-mvcount-addr () modus.mvm::+mv-count-addr+)
 
+(defun m68k-emit-store-absl (buf dn addr)
+  "MOVE.L Dn, (ADDR).L -- one instruction, 6 bytes, no address register."
+  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-special+ 1 +ea-mode-dn+ dn))
+  (m68k-emit-long buf addr))
+
+(defun m68k-emit-imm-dn (buf imm32 dn)
+  "Dn = IMM32: MOVEQ (2 bytes) when it sign-extends from a byte, else MOVE.L."
+  (let ((s (if (>= imm32 #x80000000) (- imm32 #x100000000) imm32)))
+    (if (<= -128 s 127)
+        (m68k-emit-moveq buf dn (logand s #xFF))
+        (m68k-emit-move-imm-dn buf (logand imm32 #xFFFFFFFF) dn))))
+
 (defun m68k-emit-store-abs (buf dn addr)
   "Store data register DN to absolute ADDR (address parked in A1)."
   (m68k-emit-move-imm-an buf addr +68k-a1+)
@@ -733,28 +747,88 @@
 
 ;;; --- Branch ---
 
+;;; BRANCH RELAXATION (*68K-RELAX-BRANCHES*).  A branch is long by default: the
+;;; CL image is megabytes of native code and a 16-bit displacement reaches 32 KB.
+;;; With relaxation TRANSLATE-MVM-TO-68K translates twice.  Pass 1 emits every
+;;; branch long and records, by its ordinal, where it went; pass 2 emits each
+;;; one as short as that distance allows: Bcc.S (2 bytes), Bcc.W (4), Bcc.L (6).
+;;; Pass 2 only ever shrinks code, so a distance can only shrink -- except
+;;; that a function entry's 16-byte alignment pad can grow by up to 15 when the
+;;; code before it shrinks, so every entry a branch crosses costs it 16 bytes of
+;;; margin.  The branches are emitted in the same order both times, which is
+;;; what makes the ordinal a name.
+
+(defvar *68k-relax-branches* nil
+  "When T, 68k branches are relaxed to their shortest form (two translations).")
+(defvar *68k-branch-plan* nil
+  "Pass 2: vector, branch ordinal -> :BYTE / :WORD / :LONG.  NIL: all long.")
+(defvar *68k-branch-ordinal* 0)
+(defvar *68k-branch-distances* nil
+  "Pass 1: hash, branch ordinal -> (DISP . REF-POS) of its long form.")
+(defvar *68k-fn-entry-positions* nil
+  "Pass 1: native positions of the function entries, for the margin.")
+
+(defun m68k-emit-branch (buf base label-id)
+  "BRA (BASE #x6000), BSR (#x6100) or Bcc (#x6000 | cc<<8) to LABEL-ID, in the
+   size the relaxation plan gives this branch's ordinal (long without one)."
+  (let* ((ord (incf *68k-branch-ordinal*))
+         (size (if (and *68k-branch-plan* label-id (< ord (length *68k-branch-plan*)))
+                   (aref *68k-branch-plan* ord)
+                   :long))
+         (pos (m68k-buffer-position buf)))
+    (ecase size
+      (:byte
+       (m68k-emit-word buf base)                ; the fixup fills the low byte
+       (push (list (1- (m68k-buffer-word-count buf)) label-id :disp8-in-opcode (+ pos 2))
+             (m68k-buffer-fixups buf)))
+      (:word
+       (m68k-emit-word buf base)
+       (let ((ext (m68k-buffer-position buf)))
+         (m68k-emit-word buf 0)
+         (push (list (1- (m68k-buffer-word-count buf)) label-id :disp16 (+ ext 2))
+               (m68k-buffer-fixups buf))))
+      (:long
+       (m68k-emit-word buf (logior base #xFF))
+       (let ((disp-pos (m68k-buffer-position buf)))
+         (m68k-emit-word buf 0)
+         (when label-id
+           (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2) ord)
+                 (m68k-buffer-fixups buf)))
+         (m68k-emit-word buf 0))))))
+
+(defun m68k-relax-plan (n-branches)
+  "The pass-2 size of each branch, from pass 1's distances and entry positions."
+  (let ((plan (make-array (1+ n-branches) :initial-element :long))
+        (entries (sort (coerce *68k-fn-entry-positions* 'vector) #'<)))
+    (flet ((crossed (a b)                       ; entries strictly between
+             (let ((lo (min a b)) (hi (max a b)) (n 0))
+               (loop for e across entries when (and (> e lo) (< e hi)) do (incf n))
+               n)))
+      (maphash
+       (lambda (ord v)
+         (destructuring-bind (disp . ref-pos) v
+           ;; DISP is from the extension word (opcode + 2) in both forms; the
+           ;; long form's own 4 extension bytes are between it and a forward
+           ;; target, and vanish in the shorter forms.
+           (let* ((d (if (> disp 0) (- disp 4) disp))
+                  (margin (* 16 (1+ (crossed (- ref-pos 4) (+ (- ref-pos 2) disp))))))
+             (setf (aref plan ord)
+                   (cond ((and (if (> disp 0) (>= d 2) t)
+                               (<= (+ -128 margin) d (- 127 margin)))
+                          :byte)
+                         ((<= (+ -32768 margin) d (- 32767 margin)) :word)
+                         (t :long))))))
+       *68k-branch-distances*))
+    plan))
+
 (defun m68k-emit-bra (buf &optional label-id)
-  "BRA.L target -- 68020+, 32-bit displacement.  Every branch is long: the CL
-   image is megabytes of native code, and a 16-bit displacement reaches 32 KB."
-  (m68k-emit-word buf #x60FF)
-  (let ((disp-pos (m68k-buffer-position buf)))
-    (m68k-emit-word buf 0)
-    (when label-id
-      (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2))
-            (m68k-buffer-fixups buf)))
-    (m68k-emit-word buf 0)))
+  "BRA to LABEL-ID (relaxed; long without a plan)."
+  (m68k-emit-branch buf #x6000 label-id))
 
 (defun m68k-emit-bcc-word (buf cc &optional label-id)
-  "Bcc.L target -- 68020+, 32-bit displacement (the name is historical).  CC is
-   the 4-bit condition code.  See M68K-EMIT-BRA for why every branch is long."
-  ;; Format: 0110 cc(4) 11111111, then disp32
-  (m68k-emit-word buf (logior (ash #b0110 12) (ash (logand cc #xF) 8) #xFF))
-  (let ((disp-pos (m68k-buffer-position buf)))
-    (m68k-emit-word buf 0)
-    (when label-id
-      (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2))
-            (m68k-buffer-fixups buf)))
-    (m68k-emit-word buf 0)))
+  "Bcc to LABEL-ID (relaxed; long without a plan -- the name is historical).
+   CC is the 4-bit condition code."
+  (m68k-emit-branch buf (logior #x6000 (ash (logand cc #xF) 8)) label-id))
 
 ;; 68k condition codes
 (defconstant +68k-cc-t+   0)  ; True (always)
@@ -803,15 +877,8 @@
                               (logand an 7))))
 
 (defun m68k-emit-bsr (buf &optional label-id)
-  "BSR.L target -- 68020+, 32-bit displacement.  Every branch is long: the CL
-   image is megabytes of native code, and a 16-bit displacement reaches 32 KB."
-  (m68k-emit-word buf #x61FF)
-  (let ((disp-pos (m68k-buffer-position buf)))
-    (m68k-emit-word buf 0)
-    (when label-id
-      (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ disp-pos 2))
-            (m68k-buffer-fixups buf)))
-    (m68k-emit-word buf 0)))
+  "BSR to LABEL-ID (relaxed; long without a plan)."
+  (m68k-emit-branch buf #x6100 label-id))
 
 (defun m68k-emit-rts (buf)
   "RTS - return from subroutine"
@@ -2074,14 +2141,20 @@
                                         (+ +68k-frame-slot-base+ (* idx -4))
                                         +68k-d0+)
                (m68k-store-vreg buf vd +68k-d0+))
-             ;; Normal object slot access
-             (progn
-               (m68k-load-vreg buf +68k-d0+ vobj)
-               ;; Strip tag
-               (m68k-emit-subi buf +68k-d0+ +tag-object+)
-               ;; Load slot via address register
-               (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-               (m68k-emit-move-disp-dn buf +68k-a0+ (* (1+ idx) 4) +68k-d0+)
+             ;; Normal object slot access.  The tagged pointer goes straight
+             ;; to A0 and the tag folds into the displacement: (4(i+1)-tag)(A0)
+             ;; is the same address SUBI #tag then 4(i+1)(A0) was, minus the
+             ;; SUBI (6 bytes) and a MOVEA.
+             (let ((disp (- (* (1+ idx) 4) +tag-object+)))
+               (if (<= -32768 disp 32767)
+                   (progn
+                     (m68k-load-vreg-to-an buf +68k-a0+ vobj)
+                     (m68k-emit-move-disp-dn buf +68k-a0+ disp +68k-d0+))
+                   (progn
+                     (m68k-load-vreg buf +68k-d0+ vobj)
+                     (m68k-emit-subi buf +68k-d0+ +tag-object+)
+                     (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+                     (m68k-emit-move-disp-dn buf +68k-a0+ (* (1+ idx) 4) +68k-d0+)))
                (m68k-store-vreg buf vd +68k-d0+)))))
 
       (#.+op-obj-set+
@@ -2094,13 +2167,21 @@
                (m68k-load-vreg buf +68k-d0+ vs)
                (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+
                                         (+ +68k-frame-slot-base+ (* idx -4))))
-             ;; Normal object slot store
-             (progn
-               (m68k-load-vreg buf +68k-d0+ vobj)
-               (m68k-emit-subi buf +68k-d0+ +tag-object+)
-               (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-               (m68k-load-vreg buf +68k-d1+ vs)
-               (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ (* (1+ idx) 4))))))
+             ;; Normal object slot store, the tag folded as in OBJ-REF.  A0
+             ;; is translator scratch, never a vreg, so loading it first
+             ;; cannot clobber VS.
+             (let ((disp (- (* (1+ idx) 4) +tag-object+)))
+               (if (<= -32768 disp 32767)
+                   (progn
+                     (m68k-load-vreg-to-an buf +68k-a0+ vobj)
+                     (m68k-load-vreg buf +68k-d1+ vs)
+                     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ disp))
+                   (progn
+                     (m68k-load-vreg buf +68k-d0+ vobj)
+                     (m68k-emit-subi buf +68k-d0+ +tag-object+)
+                     (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+                     (m68k-load-vreg buf +68k-d1+ vs)
+                     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ (* (1+ idx) 4))))))))
 
       (#.+op-obj-tag+
        (let ((vd (first operands))
@@ -2728,9 +2809,11 @@
       ;; executed an illegal instruction.
       ;; nargs is stored RAW; :get-nargs tags it (<<1) on the way out.
       (#.+op-set-nargs+
+       ;; MOVEQ + MOVE.L to absolute long: 8 bytes, was 14 (MOVE.L #, MOVEA.L #,
+       ;; MOVE.L (A1)).  D0 is scratch; nothing after reads A1 for this address.
        (let ((n (logand (first operands) #xFF)))
-         (m68k-emit-move-imm-dn buf n +68k-d0+)
-         (m68k-emit-store-abs buf +68k-d0+ (m68k-nargs-addr))))
+         (m68k-emit-imm-dn buf n +68k-d0+)
+         (m68k-emit-store-absl buf +68k-d0+ (m68k-nargs-addr))))
 
       (#.+op-get-nargs+
        (let ((vd (first operands)))
@@ -2750,8 +2833,8 @@
 
       (#.+op-set-mv-count+
        (let ((tagged (ash (first operands) 1)))
-         (m68k-emit-move-imm-dn buf tagged +68k-d0+)
-         (m68k-emit-store-abs buf +68k-d0+ (m68k-mvcount-addr))))
+         (m68k-emit-imm-dn buf tagged +68k-d0+)
+         (m68k-emit-store-absl buf +68k-d0+ (m68k-mvcount-addr))))
 
       (otherwise
        ;; Unknown opcode: ILLEGAL -- and RECORDED, so a build can say what is
@@ -3237,9 +3320,28 @@
   *68k-unimpl-opcodes*)
 
 (defun translate-mvm-to-68k (bytecode function-table)
-  (setf *68k-li-const-patches* nil
-        *68k-unimpl-opcodes* nil)
-  (translate-mvm-to-68k-1 bytecode function-table))
+  (if *68k-relax-branches*
+      (let ((plan nil))
+        ;; Pass 1: every branch long; where each one went is recorded.
+        (let ((*68k-branch-plan* nil)
+              (*68k-branch-ordinal* 0)
+              (*68k-branch-distances* (make-hash-table))
+              (*68k-fn-entry-positions* nil))
+          (setf *68k-li-const-patches* nil *68k-unimpl-opcodes* nil)
+          (translate-mvm-to-68k-1 bytecode function-table)
+          (setq plan (m68k-relax-plan *68k-branch-ordinal*))
+          (format t "~&;; 68k branch relaxation: ~D branches, ~D short, ~D word, ~D long~%"
+                  *68k-branch-ordinal* (count :byte plan) (count :word plan)
+                  (- (count :long plan) 1)))
+        ;; Pass 2: the real translation, each branch as short as it can be.
+        (let ((*68k-branch-plan* plan)
+              (*68k-branch-ordinal* 0))
+          (setf *68k-li-const-patches* nil *68k-unimpl-opcodes* nil)
+          (translate-mvm-to-68k-1 bytecode function-table)))
+      (progn
+        (setf *68k-li-const-patches* nil
+              *68k-unimpl-opcodes* nil)
+        (translate-mvm-to-68k-1 bytecode function-table))))
 
 (defun translate-mvm-to-68k-1 (bytecode function-table)
   "Translate MVM bytecode to Motorola 68000 native code.
@@ -3252,7 +3354,9 @@
          (fn-entries nil)
          (bc bytecode)
          (len (length bc))
-         (pc 0))
+         (pc 0)
+         (op-stats (and (sb-ext:posix-getenv "MODUS_68K_OP_STATS")
+                        (make-hash-table :test 'eql))))
 
     ;; First pass: scan for branch targets
     (loop while (< pc len)
@@ -3314,7 +3418,9 @@
                ;; NOP -- harmless, a function never falls through (RTS/branch).
                (when (and function-table (gethash pc fn-entries))
                  (loop while (/= 0 (mod (m68k-buffer-position buf) 16))
-                       do (m68k-emit-nop buf)))
+                       do (m68k-emit-nop buf))
+                 (when *68k-branch-distances*
+                   (push (m68k-buffer-position buf) *68k-fn-entry-positions*)))
                ;; Emit label at current PC before translating
                (let ((label (gethash pc label-map)))
                  (when label
@@ -3322,9 +3428,31 @@
                (let* ((decoded (decode-instruction bc pc))
                       (opcode (car decoded))
                       (operands (cadr decoded))
-                      (new-pc (cddr decoded)))
+                      (new-pc (cddr decoded))
+                      (at (m68k-buffer-position buf)))
                  (m68k-translate-insn buf opcode operands new-pc label-map function-table)
+                 (when op-stats
+                   (let ((e (or (gethash opcode op-stats)
+                                (setf (gethash opcode op-stats) (list 0 0 0)))))
+                     (incf (first e)) (incf (second e) (- (m68k-buffer-position buf) at))
+                     (incf (third e) (- new-pc pc))))
                  (setf pc new-pc))))
+
+    ;; MODUS_68K_OP_STATS: native bytes per MVM opcode, the largest first
+    (when op-stats
+      (let ((rows nil) (total 0))
+        (maphash (lambda (op e)
+                   (incf total (second e))
+                   (push (list op (first e) (second e) (third e)) rows))
+                 op-stats)
+        (setq rows (sort rows #'> :key #'third))
+        (format t "~&;; 68k op stats: ~D native bytes~%;;   ~10A ~8@A ~10@A ~6@A ~8@A~%"
+                total "opcode" "count" "bytes" "%" "B/insn")
+        (dolist (r (subseq rows 0 (min 30 (length rows))))
+          (let* ((info (gethash (first r) *opcode-table*))
+                 (nm (if info (opcode-info-name info) (first r))))
+            (format t ";;   ~10A ~8D ~10D ~5,1F% ~8,1F~%" nm (second r) (third r)
+                    (/ (* 100.0 (third r)) total) (/ (third r) (max 1 (second r))))))))
 
     (when *68k-gc-label*
       (m68k-emit-gc-collector buf))

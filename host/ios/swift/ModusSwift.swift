@@ -11,7 +11,7 @@
 // Events, as terms, oldest first (ui_events_next):
 //   (TAP handle)   (SWITCH handle on)   (SLIDER handle value: a double)   (TEXT handle)   (SELECT handle index)
 //   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
-//   (ALERT handle index)   (REFRESH handle)
+//   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)
 
 import UIKit
 
@@ -437,6 +437,81 @@ let toolbarNew: Call = { p, n, x, y, w, h in
     return handle
 }
 
+// The picker's data source and delegate: one wheel of rows, the titles; a choice sends a SELECT event with its row.
+final class ModusPicker: NSObject, UIPickerViewDataSource, UIPickerViewDelegate {
+    let handle: UInt
+    var rows: [String] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func numberOfComponents(in pickerView: UIPickerView) -> Int {
+        1
+    }
+
+    func pickerView(_ pickerView: UIPickerView, numberOfRowsInComponent component: Int) -> Int {
+        rows.count
+    }
+
+    func pickerView(_ pickerView: UIPickerView, titleForRow row: Int, forComponent component: Int) -> String? {
+        rows[row]
+    }
+
+    func pickerView(_ pickerView: UIPickerView, didSelectRow row: Int, inComponent component: Int) {
+        send("SELECT", [.int(Int(handle)), .int(row)])
+    }
+}
+
+private var pickers: [UInt: ModusPicker] = [:]
+
+// picker_new(titles, length, x, y, w, h): a wheel of rows, one per title (a term: a list of strings).  Choosing a
+// row sends a SELECT event with its index.
+let pickerNew: Call = { p, n, x, y, w, h in
+    let wheel = UIPickerView(frame: rect(x, y, w, h))
+    let handle = adopt(wheel)
+    let source = ModusPicker(handle: handle)
+    source.rows = titlesOf(p, n)
+    wheel.dataSource = source
+    wheel.delegate = source
+    pickers[handle] = source
+    return handle
+}
+
+// blur_new(x, y, w, h): a blur of what is behind it, dark.  Its children (ui_add) go in its content view.
+let blurNew: Call = { x, y, w, h, _, _ in
+    let view = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+    view.frame = rect(x, y, w, h)
+    return adopt(view)
+}
+
+// The pan gesture's target: a pan that ends sends a PAN event with the horizontal distance dragged (a double).
+final class ModusPan: NSObject {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    @objc func panned(_ recognizer: UIPanGestureRecognizer) {
+        guard recognizer.state == .ended, let view = recognizer.view else { return }
+        send("PAN", [.int(Int(handle)), .double(Double(recognizer.translation(in: view).x))])
+    }
+}
+
+private var panTargets: [UInt: ModusPan] = [:]
+
+// pan_on(handle): a pan on the view, its events as above.  The view takes touches for it.
+let panOn: Call = { h, _, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let target = ModusPan(handle: h)
+    let recognizer = UIPanGestureRecognizer(target: target, action: #selector(ModusPan.panned(_:)))
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(recognizer)
+    panTargets[h] = target
+    return 1
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -502,6 +577,8 @@ let addChild: Call = { parent, child, _, _, _, _ in
         content.addArrangedSubview(c)
     } else if let stack = views[parent] as? UIStackView {
         stack.addArrangedSubview(c)
+    } else if let effect = views[parent] as? UIVisualEffectView {
+        effect.contentView.addSubview(c)
     } else {
         views[parent]?.addSubview(c)
     }
@@ -544,6 +621,8 @@ let setValue: Call = { h, value, _, _, _, _ in
         picker.date = Date(timeIntervalSince1970: TimeInterval(value))
     } else if let table = views[h] as? UITableView {
         if value == 0 { table.refreshControl?.endRefreshing() } else { table.refreshControl?.beginRefreshing() }
+    } else if let wheel = views[h] as? UIPickerView {
+        wheel.selectRow(Int(value), inComponent: 0, animated: false)
     }
     return 0
 }
@@ -665,6 +744,9 @@ public func modusSwiftInstall() {
     register("ui_send_refresh", sendRefresh)
     register("ui_search_bar_new", searchBarNew)
     register("ui_toolbar_new", toolbarNew)
+    register("ui_picker_new", pickerNew)
+    register("ui_blur_new", blurNew)
+    register("ui_pan_on", panOn)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

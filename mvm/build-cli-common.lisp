@@ -2423,7 +2423,45 @@
             *mvm-eval-canonical-source* (concatenate 'string mvm-eval stubs)
             *stage2-test-source* s2))
     (format t "~&;; MODUS_NO_COMPILER: kept ~D of ~D compiler-side forms; ~D stubbed: ~{~A~^ ~}~%"
-            kept total (length stubbed) stubbed)))
+            kept total (length stubbed) stubbed))
+  ;; MODUS_LEAN_BOOT=1 (with MODUS_NO_COMPILER): KERNEL-MAIN skips the steps in
+  ;; *NC-LEAN-BOOT-SKIP*, and the image keeps only what KERNEL-MAIN and the
+  ;; baked program reach (%NC-SHAKE).  The boot tables' generators get nothing
+  ;; to emit.
+  (when (let ((v (sb-ext:posix-getenv "MODUS_LEAN_BOOT")))
+          (and v (plusp (length v)) (not (string= v "0"))))
+    (multiple-value-bind (text removed) (%nc-lean-kernel-main *driver-source* *nc-lean-boot-skip*)
+      (setq *driver-source* text)
+      (format t "~&;; MODUS_LEAN_BOOT: KERNEL-MAIN skips ~{~A~^ ~}~%" removed))
+    (defvar *sft-auto-source* "")
+    (defvar *sym-name-auto-source* "")
+    (defvar *runtime-macros-source* "")
+    (let* ((vars '(*prelude-source* *softfloat-source* *gc-source* *mcgc-pin-source*
+                   *rt-source* *rtest-pkg-source* *rt-macros-source* *bridge-source*
+                   *cli-arch-override-source* *cli-native-bulk-source*
+                   *cli-hosted-actors-source* *isa-source* *interp-source*
+                   *stage1-test-source* *compiler-source* *stage2-float-override*
+                   *opcode-table-init-source* *fasl-source* *fasl-fingerprint-source*
+                   *mvm-eval-canonical-source* *cli-arch-jit-translator-source*
+                   *stage2-test-source* *cli-bare-metal-net-source* *genera-source*
+                   *sb-gray-source* *sb-shim-source* *asdf-source*
+                   *deferred-surfaces-source* *no-compiler-source* *driver-source*
+                   *jit-boot-source* *configuration-source*))
+           (before (reduce #'+ vars :key (lambda (v) (length (symbol-value v)))))
+           (roots (let ((h (make-hash-table :test #'equal)))
+                    (%nc-add-symbols (%extra-source-text) h)
+                    (let ((r (append (list "KERNEL-MAIN")
+                                     ;; what compiled code calls without naming
+                                     (%nc-emitted-callee-roots
+                                      (mapcar (lambda (f) (merge-pathnames f *modus-base*))
+                                              '("mvm/compiler.lisp" "mvm/cross.lisp"
+                                                "mvm/translate-68k.lisp"))))))
+                      (maphash (lambda (k v) (declare (ignore v)) (push k r)) h)
+                      r))))
+      ;; a boot step lean boot skips is never a root, whoever names it
+      (mapc #'set vars (%nc-shake (mapcar #'symbol-value vars) roots :exclude *nc-lean-boot-skip*))
+      (format t "~&;; MODUS_LEAN_BOOT: image source ~D -> ~D chars~%"
+              before (reduce #'+ vars :key (lambda (v) (length (symbol-value v))))))))
 
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)

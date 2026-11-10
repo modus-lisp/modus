@@ -178,7 +178,9 @@
   (if (and (member *cli-arch* '(:x64 :aarch64))
            (not (and (boundp 'cl-user::*cl-repl-i386-p*)
                      (symbol-value 'cl-user::*cl-repl-i386-p*))))
-      (mvm-text "mvm/native-bulk.lisp")
+      (concatenate 'string (mvm-text "mvm/native-bulk.lisp")
+                   ;; x86-64 only: Raw pixel rows on BULK-MOVE kind 2
+                   (if (eq *cli-arch* :x64) (mvm-text "mvm/native-pixels-x64.lisp") ""))
       ""))
 ;; MODUS_SOURCE_BLOB=1: keep the image's copy of its own source (the MVMS blob).  Off by
 ;; default (mvm/cross.lisp *EMBED-SOURCE-BLOB*): nothing reads it -- the self-hosting

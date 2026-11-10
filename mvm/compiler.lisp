@@ -9352,9 +9352,9 @@
            (emit-ir :mul dest dest temp)
            (free-temp-reg))))
       ((= op-name 249914557)  ; 1+
-       (when (arity-ok-p form 1 1 env dest) (compile-1+ (cadr form) env dest)))
+       (when (arity-ok-p form 1 1 env dest) (compile-1+ (cadr form) env dest (cdr form))))
       ((= op-name 210297867)  ; 1-
-       (when (arity-ok-p form 1 1 env dest) (compile-1- (cadr form) env dest)))
+       (when (arity-ok-p form 1 1 env dest) (compile-1- (cadr form) env dest (cdr form))))
       ((= op-name 396221377) (compile-truncate (cdr form) env dest))  ; TRUNCATE
       ((= op-name #.(compute-name-hash "%FIXNUM-TRUNCATE2"))
        (compile-fixnum-truncate2 (cdr form) env dest))
@@ -9923,6 +9923,9 @@
        (compile-bulk-op :bulk-move (cdr form) 5 env dest))
       ((= op-name #.(compute-name-hash "%BULK-FILL"))
        (compile-bulk-op :bulk-fill (cdr form) 4 env dest))
+      ;; (%kernel src i val n kind) -- the :kernel instruction, its result in DEST
+      ((= op-name #.(compute-name-hash "%KERNEL"))
+       (compile-kernel-op (cdr form) env dest))
 
       ;; ROTATEF — (rotatef place1 place2 ...) → rotate values left
       ;; For simple variable places: (let ((tmp p1)) (setq p1 p2) (setq p2 tmp) nil)
@@ -14144,7 +14147,8 @@
 
 (defvar *wrapping-arith-args* nil
   "The argument list (EQ) of a two-operand + or - whose result is stored into
-   a fixnum-declared variable under (SAFETY 0): COMPILE-ADD / COMPILE-SUB trust
+   a fixnum-declared variable under (SAFETY 0) -- or of a 1+ / 1-, which
+   COMPILE-1+ / COMPILE-1- pass on to the (+ X 1) they build: COMPILE-ADD / COMPILE-SUB trust
    it not to overflow.  A non-fixnum there is undefined (CLHS 3.3.4), so the
    plain op is a valid compile, as SBCL's is.  Set by COMPILE-SETQ, SETQ and
    restore, not LET -- see *TAGBODY-EMITTED-LABELS*.")
@@ -14154,13 +14158,33 @@
    *WRAPPING-ARITH-ARGS* -- else NIL."
   (and (= *compile-safety* 0)
        (consp val) (symbolp (car val))
-       (or (name-eq (car val) "+") (name-eq (car val) "-"))
-       (consp (cdr val)) (consp (cddr val)) (null (cdddr val))
+       (or (and (or (name-eq (car val) "+") (name-eq (car val) "-"))
+                (consp (cdr val)) (consp (cddr val)) (null (cdddr val)))
+           (and (or (name-eq (car val) "1+") (name-eq (car val) "1-"))
+                (consp (cdr val)) (null (cddr val))))
        (let ((b (env-lookup env var)))
          (and b (member (binding-location b) '(:stack :reg))
               (let ((w (ignore-errors (%decl-int-width (%resolve-declared-type (binding-dtype b))))))
                 (and w (<= w +fixnum-signed-bits+)))))
        (cdr val)))
+
+;; An array INDEX under (SAFETY 0) is the same case as a fixnum store: a valid
+;; index is a fixnum, so an index (+ A B ...) or (- A B ...) of proven fixnums
+;; that overflowed would be undefined, and SBCL compiles the plain add.  Glass's
+;; pixel loops index with (+ row ax lx): two checked adds, each with its whole
+;; slow-path call, per pixel.  COMPILE-AREF / COMPILE-ASET mark the index's
+;; argument list; COMPILE-ADD / COMPILE-SUB still require every pair's operand
+;; widths (%WRAP-TRUST takes no trust they did not already have).
+(defun %wrapping-index-args (idx-form)
+  "IDX-FORM's argument list when it is a + or - of two or more operands, or a 1+ or 1-, that may
+   wrap under (SAFETY 0) -- see *WRAPPING-ARITH-ARGS* -- else NIL."
+  (and (= *compile-safety* 0)
+       (consp idx-form) (symbolp (car idx-form))
+       (or (and (or (name-eq (car idx-form) "+") (name-eq (car idx-form) "-"))
+                (consp (cdr idx-form)) (consp (cddr idx-form)))
+           (and (or (name-eq (car idx-form) "1+") (name-eq (car idx-form) "1-"))
+                (consp (cdr idx-form)) (null (cddr idx-form))))
+       (cdr idx-form)))
 
 (defun %wrap-trust (args trust)
   "TRUST, or a no-overflow trust when ARGS is *WRAPPING-ARITH-ARGS* and both
@@ -23077,18 +23101,25 @@
                                (t (%idiv-trunc ,a-sym ,b-sym)))))))
         (compile-form acc env dest))))
 
-(defun compile-1+ (arg env dest)
+(defun %pass-wrapping-mark (cell args)
+  "ARGS, marked as wrapping when CELL (the (1+ X) / (1- X) form's argument list) is
+   *WRAPPING-ARITH-ARGS*: the rewrite makes a fresh list, and the mark is EQ on it."
+  (when (and cell (eq cell *wrapping-arith-args*)) (setq *wrapping-arith-args* args))
+  args)
+
+(defun compile-1+ (arg env dest &optional cell)
   "Compile (1+ x) as (+ x 1) — CLHS 12.2.  Routes through the :add-checked
    fast path, which detects non-fixnum operands (ratio / bignum / float /
    complex) and fixnum overflow and falls to GENERIC-ADD.  The old raw :inc
    added tagged 1 directly to whatever was in DEST, corrupting a heap-object
-   pointer (ratio/bignum/float) and silently wrapping at MOST-POSITIVE-FIXNUM."
-  (compile-add (list arg 1) env dest))
+   pointer (ratio/bignum/float) and silently wrapping at MOST-POSITIVE-FIXNUM.
+   CELL is the form's argument list, for *WRAPPING-ARITH-ARGS*."
+  (compile-add (%pass-wrapping-mark cell (list arg 1)) env dest))
 
-(defun compile-1- (arg env dest)
+(defun compile-1- (arg env dest &optional cell)
   "Compile (1- x) as (- x 1) — CLHS 12.2.  Routes through GENERIC-SUBTRACT
    for non-fixnum / overflow operands (see compile-1+)."
-  (compile-sub (list arg 1) env dest))
+  (compile-sub (%pass-wrapping-mark cell (list arg 1)) env dest))
 
 (defun compile-truncate (args env dest)
   "Compile (truncate a) or (truncate a b).
@@ -27159,10 +27190,22 @@
 ;;; NREGS register operands, evaluated left to right into temps, then the
 ;;; literal KIND (0 word slots, 1 bytes).  The value is NIL.  Unchecked: the
 ;;; caller has proved the kinds and the bounds (%bulk-copy-ok-p and friends).
+;;; %KERNEL — one :kernel instruction (mvm.lisp): SRC, I, VAL and N into temps, the
+;;; literal KIND, and the result in DEST.  Unchecked, like %BULK-MOVE.
+(defun compile-kernel-op (args env dest)
+  (let ((kind (nth 4 args)))
+    (unless (and (= (length args) 5) (member kind '(0 1)))
+      (error "MVM compiler: (%KERNEL src i val n kind) takes four values and a literal kind 0 or 1: ~S" args))
+    (let ((regs (loop repeat 4 collect (alloc-temp-reg))))
+      (loop for r in regs for a in args do (compile-form a env r))
+      (emit-ir :kernel dest (first regs) (second regs) (third regs) (fourth regs) kind)
+      (loop repeat 4 do (free-temp-reg)))))
+
 (defun compile-bulk-op (op args nregs env dest)
   (let ((kind (nth nregs args)))
-    (unless (and (= (length args) (1+ nregs)) (member kind '(0 1)))
-      (error "MVM compiler: (~A ...) takes ~D values and a literal kind 0 or 1: ~S"
+    (unless (and (= (length args) (1+ nregs))
+                 (or (member kind '(0 1)) (and (eq op :bulk-move) (member kind '(2 3 4)))))
+      (error "MVM compiler: (~A ...) takes ~D values and a literal kind 0 or 1 (BULK-MOVE: or 2, 3, 4): ~S"
              op nregs args))
     (let ((regs (loop repeat nregs collect (alloc-temp-reg))))
       (loop for r in regs for a in args do (compile-form a env r))
@@ -27587,12 +27630,23 @@
    reaches this expansion has them.")
 
 (defun compile-aref (arr-form idx-form env dest)
+  "COMPILE-AREF-1, with a (SAFETY 0) + / - index marked as wrapping."
+  (let ((wa (%wrapping-index-args idx-form)))
+    (if wa
+        (let ((saved *wrapping-arith-args*))
+          (setq *wrapping-arith-args* wa)
+          (compile-aref-1 arr-form idx-form env dest)
+          (setq *wrapping-arith-args* saved)
+          nil)
+        (compile-aref-1 arr-form idx-form env dest))))
+
+(defun compile-aref-1 (arr-form idx-form env dest)
   "Compile (aref array index) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aref.  Multi-subscript
    forms go via compile-aref-form below."
   (when *compile-plain-arrays*
     ;; Image without the CL array runtime: flat word-slot arrays only.
-    (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
+    (return-from compile-aref-1 (compile-word-aref arr-form idx-form env dest)))
   ;; DECLARED (simple-array (unsigned-byte 8) …) variable: the packed-byte
   ;; primitive directly — no wrapper/string/mda dispatch and no runtime #x11
   ;; subtag test.  reel's pixel planes (u8vec) — the 6-tap motion-comp
@@ -27605,15 +27659,15 @@
             (error "decl-fastpath u8-aref: ~a is not a packed u8 vector: ~a" (quote ,arr-form) ,arr-form))
          env tmp)
         (free-temp-reg)))
-    (return-from compile-aref (compile-u8-ref arr-form idx-form env dest)))
+    (return-from compile-aref-1 (compile-u8-ref arr-form idx-form env dest)))
   ;; DECLARED (simple-array single-float …): the packed f32 lane, boxed by
   ;; the runtime wrapper (no subtag dispatch).
   (when (%declared-f32-array-var-p arr-form env)
-    (return-from compile-aref
+    (return-from compile-aref-1
       (compile-f32-load arr-form idx-form env dest)))
   ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane.
   (when (%declared-u32-array-var-p arr-form env)
-    (return-from compile-aref (compile-c32-ref arr-form idx-form env dest)))
+    (return-from compile-aref-1 (compile-c32-ref arr-form idx-form env dest)))
   ;; DECLARED (simple-array <generic> …) variable: raw word-slot access, no
   ;; wrapper/string/mda dispatch.  See %declared-generic-array-var-p.
   (when (%declared-generic-array-var-p arr-form env)
@@ -27624,7 +27678,7 @@
             (error "decl-fastpath aref: ~a is not a bare array: ~a" (quote ,arr-form) ,arr-form))
          env tmp)
         (free-temp-reg)))
-    (return-from compile-aref (compile-word-aref arr-form idx-form env dest)))
+    (return-from compile-aref-1 (compile-word-aref arr-form idx-form env dest)))
   (let* ((g-arr (%mvm-gensym "AREFA"))
          (g-idx (%mvm-gensym "AREFI"))
          (g-raw (%mvm-gensym "AREFR"))
@@ -27760,13 +27814,24 @@
        (compile-form `(%aref-multi-public ,arr ,@subs) env dest)))))
 
 (defun compile-aset (arr-form idx-form val-form env dest &optional unused)
+  "COMPILE-ASET-1, with a (SAFETY 0) + / - index marked as wrapping."
+  (let ((wa (%wrapping-index-args idx-form)))
+    (if wa
+        (let ((saved *wrapping-arith-args*))
+          (setq *wrapping-arith-args* wa)
+          (compile-aset-1 arr-form idx-form val-form env dest unused)
+          (setq *wrapping-arith-args* saved)
+          nil)
+        (compile-aset-1 arr-form idx-form val-form env dest unused))))
+
+(defun compile-aset-1 (arr-form idx-form val-form env dest &optional unused)
   "Compile (aset array index value) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aset.  Multi-subscript
    forms go via compile-aset-form below.  UNUSED: the store is a discarded
    statement (see *unused-value-form*), so an unboxed value is not boxed
    into DEST."
   (when *compile-plain-arrays*
-    (return-from compile-aset
+    (return-from compile-aset-1
       (compile-word-aset arr-form idx-form val-form env dest)))
   ;; DECLARED (simple-array (unsigned-byte 8) …) variable: the packed-byte
   ;; store directly (VAL's low byte; returns VAL like aset).
@@ -27778,7 +27843,7 @@
             (error "decl-fastpath u8-aset: ~a is not a packed u8 vector: ~a" (quote ,arr-form) ,arr-form))
          env tmp)
         (free-temp-reg)))
-    (return-from compile-aset
+    (return-from compile-aset-1
       (compile-u8-set arr-form idx-form val-form env dest)))
   (when (%declared-f32-array-var-p arr-form env)
     ;; Unboxed value tree → straight into the lane (part 2b): ZERO boxes
@@ -27814,13 +27879,13 @@
                 (emit-ir :fp-box dest fd))
               (free-fp-reg))
             (free-temp-reg) (free-temp-reg)))
-      (return-from compile-aset nil))
-    (return-from compile-aset
+      (return-from compile-aset-1 nil))
+    (return-from compile-aset-1
       (compile-form (list '%f32-aset arr-form idx-form val-form) env dest)))
   ;; DECLARED (simple-array (unsigned-byte 32) …) in a packing build: the raw lane -- the
   ;; value checked to be such an integer unless (safety 0), as every checked path is.
   (when (%declared-u32-array-var-p arr-form env)
-    (return-from compile-aset
+    (return-from compile-aset-1
       (if (%bounds-check-p)
           (let ((g (%mvm-gensym "U32V")))
             (compile-form `(let ((,g ,val-form))
@@ -27839,7 +27904,7 @@
             (error "decl-fastpath aset: ~a is not a bare array: ~a" (quote ,arr-form) ,arr-form))
          env tmp)
         (free-temp-reg)))
-    (return-from compile-aset
+    (return-from compile-aset-1
       (compile-word-aset arr-form idx-form val-form env dest)))
   (let ((g-arr (%mvm-gensym "ASETA"))
         (g-idx (%mvm-gensym "ASETI"))
@@ -29928,6 +29993,7 @@
       (:vi-lane 6)
       (:bulk-move 7)
       (:bulk-fill 6)
+      (:kernel 7)
       (:add   4)
       (:sub   4)
       (:adds  4)
@@ -30291,6 +30357,7 @@
           (:vi-lane (mvm-vi-lane buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn)))
           (:bulk-move (mvm-bulk-move buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn) (nth 6 insn)))
           (:bulk-fill (mvm-bulk-fill buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn)))
+          (:kernel (mvm-kernel buf (second insn) (third insn) (fourth insn) (fifth insn) (sixth insn) (nth 6 insn)))
 
           ;; ---- 3-reg instructions ----
           (:add

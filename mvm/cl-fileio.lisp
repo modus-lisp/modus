@@ -1244,6 +1244,8 @@
 ;;; staging page.  NIL = not handled, and the caller takes the element path
 ;;; exactly as before.  (Reading has its own bulk path, %FS-READ-U8-BULK.)
 
+;; x86-64 replaces this with one BULK-MOVE kind 3 (mvm/native-pixels-x64.lisp)
+(declaim (overridable %fs-page-copy))
 (defun %fs-page-copy (seq i n page)
   "Copy SEQ[I, I+N) into the raw I/O page at PAGE.  SEQ is a simple (unsigned-byte 8) array:
    the typed loop is ~5x the untyped one (an AREF dispatch per byte), which is what a RFB
@@ -1272,6 +1274,8 @@
               ((or (= w -4) (= w -11)) nil)
               (t (error "write: failed (~d)" w)))))))
 
+;; x86-64 replaces this with BULK-MOVE kind 2 rows (mvm/native-pixels-x64.lisp)
+(declaim (overridable %fs-write-pixel-rows))
 (defun %fs-write-pixel-rows (stream px fw x y w h)
   "Write the rectangle (X,Y,W,H) of PX (an (unsigned-byte 32) array, row stride FW) to the
    buffered SOCKET output STREAM as 4-byte little-endian pixels, B G R 0 -- RFB's Raw
@@ -1300,6 +1304,64 @@
         (setq total (+ total n)))
       (%fs-set-pos stream (+ (%fs-pos stream) total))
       t)))
+
+;;; Two inner loops of glass's ZRLE encoder, as runtime functions so that x86-64 can run
+;;; them as KERNEL instructions (mvm/native-pixels-x64.lisp): there a Lisp loop keeps its
+;;; variables in frame slots, and these were about half a ZRLE frame's encode.  Every other
+;;; build keeps these definitions.
+
+(declaim (overridable %u32-rect-uniform-p))
+(defun %u32-rect-uniform-p (px fw x y w h c)
+  "T when every pixel of the rectangle (X,Y,W,H) of PX (an (unsigned-byte 32) array, row
+   stride FW) equals C: a solid ZRLE tile."
+  (declare (type (simple-array (unsigned-byte 32) (*)) px) (fixnum fw x y w h)
+           (optimize (speed 3) (safety 0)))
+  (let ((yy y) (end (+ y h)))
+    (declare (fixnum yy end))
+    (loop
+      (when (>= yy end) (return t))
+      (let ((row (+ (* yy fw) x)) (k 0))
+        (declare (fixnum row k))
+        (loop
+          (when (>= k w) (return nil))
+          (unless (= (aref px (+ row k)) c) (return-from %u32-rect-uniform-p nil))
+          (setq k (+ k 1))))
+      (setq yy (+ yy 1)))))
+
+(declaim (overridable %u32-to-cpixels))
+(defun %u32-to-cpixels (buf i px si n)
+  "Write the N pixels PX[SI..] (u32 lanes) into the octet vector BUF from index I as 3-byte
+   CPIXELs -- the low three bytes, B G R -- and return the index after them."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
+           (type (simple-array (unsigned-byte 32) (*)) px) (fixnum i si n)
+           (optimize (speed 3) (safety 0)))
+  (let ((k 0))
+    (declare (fixnum k))
+    (loop
+      (when (>= k n) (return (+ i (* 3 n))))
+      (let ((p (aref px (+ si k))) (o (+ i (* 3 k))))
+        (declare (fixnum o))
+        (setf (aref buf o) (logand p #xff)
+              (aref buf (+ o 1)) (logand (ash p -8) #xff)
+              (aref buf (+ o 2)) (logand (ash p -16) #xff)))
+      (setq k (+ k 1)))))
+
+(declaim (overridable %adler32-update))
+(defun %adler32-update (data start end a b)
+  "Adler-32's sums A and B advanced over the octets DATA[START,END) (a simple
+   (unsigned-byte 8) array), reduced mod 65521 every 5552 bytes: (values A B)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data) (fixnum start end)
+           (optimize (speed 3) (safety 0)))
+  (let ((i start))
+    (declare (fixnum i))
+    (loop
+      (when (>= i end) (return (values a b)))
+      (let ((lim (min end (+ i 5552))))
+        (declare (fixnum lim))
+        (loop
+          (when (>= i lim) (return nil))
+          (setq a (+ a (aref data i)) b (+ b a) i (+ i 1)))
+        (setq a (mod a 65521) b (mod b 65521))))))
 
 (defun %fs-bulk-ok-p (stream seq)
   (and (streamp stream) (= (%stream-type stream) 9)

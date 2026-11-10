@@ -583,9 +583,32 @@
 (defun %obj-elt-len (obj) (%prim-array-length obj))
 
 ;;; BULK-MOVE / BULK-FILL, element by element: the semantics the native arms
-;;; must reproduce.  KIND 0 word slots, 1 bytes of a u8 vector.
+;;; must reproduce.  KIND 0 word slots, 1 bytes of a u8 vector, 2 packed u32
+;;; elements to raw memory at DST+DI (DST a fixnum address) with the top byte cleared,
+;;; 3 bytes of a u8 vector to raw memory at DST+DI.
 (defun %interp-bulk-move (dst di src si n kind)
   "memmove N elements SRC[SI..] -> DST[DI..]: a same-object move upward runs from the top."
+  (when (= kind 4)
+    (let ((k 0))
+      (loop (when (>= k n) (return nil))
+        (let ((v (%c32-ref src (+ si k))) (o (+ di (* 3 k))))
+          (%u8-set dst o (logand v 255))
+          (%u8-set dst (+ o 1) (logand (ash v -8) 255))
+          (%u8-set dst (+ o 2) (logand (ash v -16) 255)))
+        (setq k (+ k 1))))
+    (return-from %interp-bulk-move nil))
+  (when (= kind 3)
+    (let ((k 0))
+      (loop (when (>= k n) (return nil))
+        (setf (mem-ref (+ dst di k) :u8) (%u8-ref src (+ si k)))
+        (setq k (+ k 1))))
+    (return-from %interp-bulk-move nil))
+  (when (= kind 2)
+    (let ((k 0))
+      (loop (when (>= k n) (return nil))
+        (setf (mem-ref (+ dst di (* 4 k)) :u32) (logand (%c32-ref src (+ si k)) #xFFFFFF))
+        (setq k (+ k 1))))
+    (return-from %interp-bulk-move nil))
   (if (and (eq dst src) (> di si))
       (let ((k (- n 1)))
         (loop (when (< k 0) (return nil))
@@ -599,6 +622,21 @@
               (%obj-elt-set dst (+ di k) (%obj-elt-ref src (+ si k)))
               (%u8-set dst (+ di k) (%u8-ref src (+ si k))))
           (setq k (+ k 1))))))
+
+(defun %interp-kernel (src i val n kind)
+  "KERNEL's result: kind 0, how many of the N u32 lanes SRC[I..] equal VAL; kind 1,
+   Adler-32's (B<<16)|A after the N bytes SRC[I..], from VAL = (B<<16)|A, reduced
+   mod 65521 every 5552 bytes as the native arm does."
+  (if (= kind 0)
+      (let ((k 0))
+        (loop (when (or (>= k n) (/= (%c32-ref src (+ i k)) val)) (return k))
+          (setq k (+ k 1))))
+      (let ((a (logand val #xFFFF)) (b (ash val -16)) (k 0))
+        (loop (when (>= k n) (return (logior (ash b 16) a)))
+          (let ((lim (min n (+ k 5552))))
+            (loop (when (>= k lim) (return nil))
+              (setq a (+ a (%u8-ref src (+ i k))) b (+ b a) k (+ k 1)))
+            (setq a (mod a 65521) b (mod b 65521)))))))
 
 (defun %interp-bulk-fill (arr i n val kind)
   "ARR[I..I+N) := VAL -- the value itself in word slots, its low byte in bytes."
@@ -2846,6 +2884,17 @@
                      (multiple-value-bind (kind npc6) (fetch-byte bc npc5)
                        (%interp-bulk-move (svref regs vd) (svref regs vdi) (svref regs vs)
                                           (svref regs vsi) (svref regs vn) kind)
+                       (setf pc npc6))))))))
+          (#.+op-kernel+
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vi npc3) (fetch-reg bc npc2)
+                 (multiple-value-bind (vv npc4) (fetch-reg bc npc3)
+                   (multiple-value-bind (vn npc5) (fetch-reg bc npc4)
+                     (multiple-value-bind (kind npc6) (fetch-byte bc npc5)
+                       (setf (svref regs vd)
+                             (%interp-kernel (svref regs vs) (svref regs vi) (svref regs vv)
+                                             (svref regs vn) kind))
                        (setf pc npc6))))))))
           (#.+op-bulk-fill+
            (multiple-value-bind (va npc) (fetch-reg bc pc)

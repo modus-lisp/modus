@@ -620,9 +620,99 @@
   (let ((raw (ash (logand obj (- 0 4)) 1)))
     (mem-ref raw :u8)))
 
-;; Compute serialized byte count for a term
+;; THE WIRE FORMAT, by tag.  A term is a tree: nil, fixnum, cons, string, symbol, vector, bignum.
+;;   0 nil            1 fixnum (u64)            2 cons (car, then cdr)
+;;   3 string, 8-bit  (decoded for a sender that predates 7; not written any more)
+;;   4 vector (bytes) 5 bignum (limbs)          6 symbol (name, then package)
+;;   7 string, UTF-8  (u32 byte count, the bytes)
+;;   8 double-float   (IEEE bits: the low u32, then the high u32)
+;; A string travels as UTF-8, so a character past Latin-1 arrives as itself.  A double travels as its
+;; bits, so zero, the sign of zero and the NaNs all arrive as they left.
+
+(defun term-float-p (val)
+  "A boxed double-float.  Tested before anything else: zerop would send 0.0 as nil, and a float
+   is not a fixnum.  The subtag is read with OBJ-SUBTAG, the primitive: SOFT-SUBTAG reads 0 for a
+   float (measured: literal, quoted and computed doubles alike), so it would send a float as a pointer."
+  (and (numberp val) (not (integerp val)) (= (obj-subtag val) #x60)))
+
+(defun %utf8-length (s)
+  "The bytes S takes as UTF-8."
+  (let ((n 0) (i 0))
+    (loop
+      (when (>= i (length s)) (return n))
+      (let ((c (char-code (aref s i))))
+        (setq n (+ n (cond ((< c #x80) 1) ((< c #x800) 2) ((< c #x10000) 3) (t 4)))))
+      (setq i (+ i 1)))))
+
+(defun %utf8-put (s buf)
+  "Write S as UTF-8 at the raw address BUF.  The number of bytes written."
+  (let ((p buf) (i 0))
+    (loop
+      (when (>= i (length s)) (return (- p buf)))
+      (let ((c (char-code (aref s i))))
+        (cond ((< c #x80)
+               (setf (mem-ref p :u8) c)
+               (setq p (+ p 1)))
+              ((< c #x800)
+               (setf (mem-ref p :u8) (logior #xC0 (ash c -6)))
+               (setf (mem-ref (+ p 1) :u8) (logior #x80 (logand c #x3F)))
+               (setq p (+ p 2)))
+              ((< c #x10000)
+               (setf (mem-ref p :u8) (logior #xE0 (ash c -12)))
+               (setf (mem-ref (+ p 1) :u8) (logior #x80 (logand (ash c -6) #x3F)))
+               (setf (mem-ref (+ p 2) :u8) (logior #x80 (logand c #x3F)))
+               (setq p (+ p 3)))
+              (t
+               (setf (mem-ref p :u8) (logior #xF0 (ash c -18)))
+               (setf (mem-ref (+ p 1) :u8) (logior #x80 (logand (ash c -12) #x3F)))
+               (setf (mem-ref (+ p 2) :u8) (logior #x80 (logand (ash c -6) #x3F)))
+               (setf (mem-ref (+ p 3) :u8) (logior #x80 (logand c #x3F)))
+               (setq p (+ p 4)))))
+      (setq i (+ i 1)))))
+
+(defun %utf8-get (base nbytes)
+  "The string made of the NBYTES of UTF-8 at the raw address BASE."
+  (let ((count 0) (i 0))
+    ;; a character starts at every byte that is not a continuation byte (10xxxxxx)
+    (loop
+      (when (>= i nbytes) (return 0))
+      (unless (= (logand (mem-ref (+ base i) :u8) #xC0) #x80) (setq count (+ count 1)))
+      (setq i (+ i 1)))
+    (let ((s (make-string count)) (k 0) (i 0))
+      (loop
+        (when (>= i nbytes) (return s))
+        (let* ((b0 (mem-ref (+ base i) :u8))
+               (len (cond ((< b0 #x80) 1) ((< b0 #xE0) 2) ((< b0 #xF0) 3) (t 4)))
+               (code (cond ((= len 1) b0)
+                           ((= len 2)
+                            (logior (ash (logand b0 #x1F) 6)
+                                    (logand (mem-ref (+ base i 1) :u8) #x3F)))
+                           ((= len 3)
+                            (logior (ash (logand b0 #x0F) 12)
+                                    (ash (logand (mem-ref (+ base i 1) :u8) #x3F) 6)
+                                    (logand (mem-ref (+ base i 2) :u8) #x3F)))
+                           (t
+                            (logior (ash (logand b0 #x07) 18)
+                                    (ash (logand (mem-ref (+ base i 1) :u8) #x3F) 12)
+                                    (ash (logand (mem-ref (+ base i 2) :u8) #x3F) 6)
+                                    (logand (mem-ref (+ base i 3) :u8) #x3F))))))
+          (setf (aref s k) (code-char code))
+          (setq k (+ k 1))
+          (setq i (+ i len)))))))
+
+;; Compute serialized byte count for a term.  The float and the string are measured first, as they
+;; are written first (term-float-p before the zero test, for the reason on that function).
 (defun term-size (val)
-  (if (zerop val) 1
+  (cond ((term-float-p val) 9)
+        ((null val) 1)
+        ((stringp val) (+ 5 (%utf8-length val)))
+        ((symbolp val)
+         (let ((nm (symbol-name val)) (pk (symbol-package val)))
+           (+ 9 (length nm) (if pk (length (package-name pk)) 0))))
+        (t (term-size-value val))))
+
+(defun term-size-value (val)
+  (if (null val) 1
       (if (consp val)
           (let ((s1 (term-size (car val))))
             (let ((s2 (term-size (cdr val))))
@@ -638,7 +728,16 @@
 ;; Serialize term to buffer at raw address buf. Returns bytes written.
 ;; Uses soft-subtag for object type dispatch (compatible with try-alloc-obj).
 (defun term-encode (val buf)
-  (if (zerop val)
+  (if (term-float-p val)
+      (progn
+        (setf (mem-ref buf :u8) 8)
+        (setf (mem-ref (+ buf 1) :u32) (%float-lo32 val))
+        (setf (mem-ref (+ buf 5) :u32) (%float-hi32 val))
+        9)
+      (term-encode-value val buf)))
+
+(defun term-encode-value (val buf)
+  (if (null val)
       (progn (setf (mem-ref buf :u8) 0) 1)
       (if (consp val)
           (progn
@@ -672,15 +771,11 @@
           ;; RECEIVER'S REGION; it was dead code because nothing ever emitted
           ;; it.  The asymmetry was the bug.  This emits it.
           (if (stringp val)
-              (let ((slen (length val)))
-                (setf (mem-ref buf :u8) 3)
-                (setf (mem-ref (+ buf 1) :u32) slen)
-                (let ((i 0))
-                  (loop
-                    (when (>= i slen) (return 0))
-                    (setf (mem-ref (+ (+ buf 5) i) :u8) (char-code (aref val i)))
-                    (setq i (+ i 1))))
-                (+ 5 slen))
+              ;; UTF-8 (tag 7): the bytes go down first, then the tag and their count in front
+              (let ((nbytes (%utf8-put val (+ buf 5))))
+                (setf (mem-ref buf :u8) 7)
+                (setf (mem-ref (+ buf 1) :u32) nbytes)
+                (+ 5 nbytes))
           ;; TAG 6 — A SYMBOL, BY NAME AND PACKAGE NAME.
           ;;
           ;; The receiver INTERNS it, which is the whole point: the intern
@@ -757,7 +852,7 @@
     (let ((buf (mem-ref da :u64)))
       (let ((tag (mem-ref buf :u8)))
         (if (zerop tag)
-            (progn (setf (mem-ref da :u64) (+ buf 1)) 0)
+            (progn (setf (mem-ref da :u64) (+ buf 1)) nil)
             (if (= tag 1)
                 (let ((v (mem-ref (+ buf 1) :u64)))
                   (setf (mem-ref da :u64) (+ buf 9))
@@ -830,6 +925,17 @@
                                     (setq i (+ i 1))))
                                 (setf (mem-ref da :u64) (+ (+ buf 5) alen))
                                 a))
+                            (if (= tag 7)
+                                ;; UTF-8 string (tag 7)
+                                (let ((nbytes (mem-ref (+ buf 1) :u32)))
+                                  (let ((s (%utf8-get (+ buf 5) nbytes)))
+                                    (setf (mem-ref da :u64) (+ (+ buf 5) nbytes))
+                                    s))
+                            (if (= tag 8)
+                                ;; double-float (tag 8): the low half, then the high half, as IEEE bits
+                                (let ((lo (mem-ref (+ buf 1) :u32)) (hi (mem-ref (+ buf 5) :u32)))
+                                  (setf (mem-ref da :u64) (+ buf 9))
+                                  (%float-set-bits (%make-float2) hi lo))
                             ;; Bignum (tag 5)
                             (let ((nlimbs (mem-ref (+ buf 1) :u32)))
                               (let ((b (make-bignum-n nlimbs)))
@@ -842,7 +948,7 @@
                                       (setq i (+ i 1))))
                                 (setf (mem-ref da :u64)
                                       (+ (+ buf 5) (ash nlimbs 3)))
-                                b)))))))))))))
+                                b)))))))))))))))
 
 ;; Allocate bignum with nlimbs limbs
 (defun make-bignum-n (nlimbs)

@@ -14,6 +14,7 @@
 //   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)   (MENU handle index)   (COLOR handle rgb)
 //   (POP handle)   (NAVTAP handle)   (CONTEXT handle index)   (SWIPE handle direction)
 //   (SHARE handle completed)   (DISMISS handle)   (FADE handle)   (ROWACTION handle index)   (ZOOM handle percent)
+//   (DELETE handle index)   (EDIT handle index)
 
 import UIKit
 
@@ -107,6 +108,16 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         send("SELECT", [.int(Int(handle)), .int(groups[indexPath.section].rows[indexPath.row].index)])
+    }
+
+    // In editing mode a row's delete control removes the row, and sends a DELETE event with the row's index.
+    func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle,
+                   forRowAt indexPath: IndexPath) {
+        guard editingStyle == .delete else { return }
+        let row = groups[indexPath.section].rows.remove(at: indexPath.row)
+        groups = groupsOf(groups.flatMap { $0.rows })
+        tableView.reloadData()
+        send("DELETE", [.int(Int(handle)), .int(row.index)])
     }
 
     // Swipe actions for a row, from the actions set with list_actions: a button for each, and a tap on one sends a
@@ -1183,6 +1194,82 @@ let pageContent: Call = { h, i, _, _, _, _ in
     pageContents[h]?[Int(i)] ?? 0
 }
 
+// list_editing(list, on): the list's rows show their delete controls (on 1) or not (0).
+let listEditing: Call = { h, on, _, _, _, _ in
+    (views[h] as? UITableView)?.setEditing(on != 0, animated: false)
+    return 0
+}
+
+// The edit menu's target: a long press on the view opens the edit menu of the choices; a choice sends an EDIT event
+// with the view's handle and the choice's index.
+final class ModusEditMenu: NSObject, UIEditMenuInteractionDelegate {
+    let handle: UInt
+    let choices: [String]
+    var interaction: UIEditMenuInteraction?
+
+    init(handle: UInt, choices: [String]) {
+        self.handle = handle
+        self.choices = choices
+    }
+
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+        UIMenu(children: choices.enumerated().map { i, title in
+            UIAction(title: title) { _ in send("EDIT", [.int(Int(self.handle)), .int(i)]) }
+        })
+    }
+
+    @objc func pressed(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began, let view = recognizer.view, let interaction = interaction else { return }
+        interaction.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil,
+                                                                  sourcePoint: recognizer.location(in: view)))
+    }
+}
+
+private var editMenus: [UInt: ModusEditMenu] = [:]
+
+// edit_menu_on(handle, choices, length): a long press on the view opens an edit menu of the choices (a term: a list
+// of strings).
+let editMenuOn: Call = { h, p, n, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let menu = ModusEditMenu(handle: h, choices: titlesOf(p, n))
+    let interaction = UIEditMenuInteraction(delegate: menu)
+    menu.interaction = interaction
+    view.addInteraction(interaction)
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(UILongPressGestureRecognizer(target: menu, action: #selector(ModusEditMenu.pressed(_:))))
+    editMenus[h] = menu
+    return 1
+}
+
+// popover_present(content, source): the modal content shown as a popover from the source view.  On a phone a popover
+// is a sheet; on a tablet it points at the source.
+let popoverPresent: Call = { h, source, _, _, _, _ in
+    guard let controller = modalControllers[h], let root = keyRoot()?.window?.rootViewController,
+          let anchor = views[source] else { return 0 }
+    controller.modalPresentationStyle = .popover
+    controller.popoverPresentationController?.sourceView = anchor
+    controller.popoverPresentationController?.sourceRect = anchor.bounds
+    root.present(controller, animated: true)
+    return 1
+}
+
+// split_present(primary, secondary): a split view controller of two modal contents, shown as a sheet.  Returns its
+// handle (ui_modal_dismiss takes it).  On a phone it collapses: the secondary shows first, and the primary is behind
+// its Back button.
+let splitPresent: Call = { primary, secondary, _, _, _, _ in
+    guard let p = modalControllers[primary], let s = modalControllers[secondary],
+          let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let split = UISplitViewController(style: .doubleColumn)
+    split.setViewController(p, for: .primary)
+    split.setViewController(s, for: .secondary)
+    let handle = nextHandle
+    nextHandle += 1
+    modalControllers[handle] = split
+    root.present(split, animated: true)
+    return handle
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1469,6 +1556,10 @@ public func modusSwiftInstall() {
     register("ui_file_image_new", fileImageNew)
     register("ui_page_controller_new", pageControllerNew)
     register("ui_page_content", pageContent)
+    register("ui_list_editing", listEditing)
+    register("ui_edit_menu_on", editMenuOn)
+    register("ui_popover_present", popoverPresent)
+    register("ui_split_present", splitPresent)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

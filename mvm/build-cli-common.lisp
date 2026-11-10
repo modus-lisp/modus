@@ -2453,9 +2453,11 @@
                     (let ((r (append (list "KERNEL-MAIN")
                                      ;; what compiled code calls without naming
                                      (%nc-emitted-callee-roots
-                                      (mapcar (lambda (f) (merge-pathnames f *modus-base*))
-                                              '("mvm/compiler.lisp" "mvm/cross.lisp"
-                                                "mvm/translate-68k.lisp"))))))
+                                      (remove-if-not #'probe-file
+                                                     (mapcar (lambda (f) (merge-pathnames f *modus-base*))
+                                                             (list "mvm/compiler.lisp" "mvm/cross.lisp"
+                                                                   ;; this architecture's translator
+                                                                   (format nil "mvm/translate-~(~A~).lisp" *cli-arch*))))))))
                       (maphash (lambda (k v) (declare (ignore v)) (push k r)) h)
                       r))))
       ;; a boot step lean boot skips is never a root, whoever names it

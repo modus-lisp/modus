@@ -12,6 +12,7 @@
 //   (TAP handle)   (SWITCH handle on)   (SLIDER handle value: a double)   (TEXT handle)   (SELECT handle index)
 //   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
 //   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)   (MENU handle index)   (COLOR handle rgb)
+//   (POP handle)   (NAVTAP handle)   (CONTEXT handle index)   (SWIPE handle direction)
 
 import UIKit
 
@@ -604,6 +605,146 @@ let colorWellNew: Call = { rgb, x, y, w, h, _ in
     return handle
 }
 
+// The navigation bar's delegate: a pop (the back button, or a pop from code) sends a POP event.
+final class ModusNavBar: NSObject, UINavigationBarDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func navigationBar(_ navigationBar: UINavigationBar, didPop item: UINavigationItem) {
+        send("POP", [.int(Int(handle))])
+    }
+}
+
+private var navBarDelegates: [UInt: ModusNavBar] = [:]
+
+// nav_bar_new(x, y, w, h): a navigation bar, dark, with no items.  nav_push pushes an item.
+let navBarNew: Call = { x, y, w, h, _, _ in
+    let bar = UINavigationBar(frame: rect(x, y, w, h))
+    bar.barStyle = .black
+    bar.tintColor = .white
+    bar.titleTextAttributes = [.foregroundColor: UIColor.white]
+    let handle = adopt(bar)
+    let delegate = ModusNavBar(handle: handle)
+    bar.delegate = delegate
+    navBarDelegates[handle] = delegate
+    return handle
+}
+
+// nav_push(bar, title, length, right, length): pushes an item with the title and, unless the right title is empty,
+// a right button.  Tapping the right button sends a NAVTAP event with the bar's handle.
+let navPush: Call = { h, tp, tn, rp, rn, _ in
+    guard let bar = views[h] as? UINavigationBar else { return 0 }
+    let item = UINavigationItem(title: text(tp, tn))
+    let right = text(rp, rn)
+    if !right.isEmpty {
+        item.rightBarButtonItem = UIBarButtonItem(primaryAction: UIAction(title: right) { _ in
+            send("NAVTAP", [.int(Int(h))])
+        })
+    }
+    bar.pushItem(item, animated: false)
+    return 0
+}
+
+// nav_pop(bar): pops the top item.
+let navPop: Call = { h, _, _, _, _, _ in
+    (views[h] as? UINavigationBar)?.popItem(animated: false)
+    return 0
+}
+
+// The context menu's delegate: a long press on the view opens a menu of the choices; a choice sends a CONTEXT event
+// with the view's handle and the choice's index.
+final class ModusContextMenu: NSObject, UIContextMenuInteractionDelegate {
+    let handle: UInt
+    let choices: [String]
+
+    init(handle: UInt, choices: [String]) {
+        self.handle = handle
+        self.choices = choices
+    }
+
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in
+            UIMenu(title: "", children: self.choices.enumerated().map { i, title in
+                UIAction(title: title) { _ in send("CONTEXT", [.int(Int(self.handle)), .int(i)]) }
+            })
+        }
+    }
+}
+
+private var contextMenus: [UInt: ModusContextMenu] = [:]
+
+// context_menu_on(handle, titles, length): a context menu on the view, of the choices (a term: a list of strings).
+let contextMenuOn: Call = { h, p, n, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let menu = ModusContextMenu(handle: h, choices: titlesOf(p, n))
+    view.isUserInteractionEnabled = true
+    view.addInteraction(UIContextMenuInteraction(delegate: menu))
+    contextMenus[h] = menu
+    return 1
+}
+
+// animate_to(handle, x, y, w, h, ms): the view's frame moves to the new one over ms milliseconds.
+let animateTo: Call = { h, x, y, w, hh, ms in
+    guard let view = views[h] else { return 0 }
+    UIView.animate(withDuration: Double(ms) / 1000) {
+        view.frame = rect(x, y, w, hh)
+    }
+    return 0
+}
+
+// shape_new(kind, x, y, w, h, rgb): a filled shape in the frame: kind 0 an oval, 1 a rounded rectangle.
+let shapeNew: Call = { kind, x, y, w, h, rgb in
+    let view = UIView(frame: rect(x, y, w, h))
+    view.backgroundColor = .clear
+    let path = kind == 0
+        ? UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+        : UIBezierPath(roundedRect: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)), cornerRadius: 16)
+    let shape = CAShapeLayer()
+    shape.path = path.cgPath
+    shape.fillColor = colorOf(rgb).cgColor
+    view.layer.addSublayer(shape)
+    return adopt(view)
+}
+
+// The swipe's target: a swipe sends a SWIPE event with the view's handle and the direction (0 left, 1 right,
+// 2 up, 3 down).
+final class ModusSwipe: NSObject {
+    let handle: UInt
+    let direction: Int
+
+    init(handle: UInt, direction: Int) {
+        self.handle = handle
+        self.direction = direction
+    }
+
+    @objc func swiped(_ recognizer: UISwipeGestureRecognizer) {
+        send("SWIPE", [.int(Int(handle)), .int(direction)])
+    }
+}
+
+private var swipeTargets: [UInt: ModusSwipe] = [:]
+
+// swipe_on(handle, direction): a swipe in the direction (0 left, 1 right, 2 up, 3 down) on the view.
+let swipeOn: Call = { h, dir, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let target = ModusSwipe(handle: h, direction: Int(dir))
+    let recognizer = UISwipeGestureRecognizer(target: target, action: #selector(ModusSwipe.swiped(_:)))
+    switch dir {
+    case 0: recognizer.direction = .left
+    case 1: recognizer.direction = .right
+    case 2: recognizer.direction = .up
+    default: recognizer.direction = .down
+    }
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(recognizer)
+    swipeTargets[h] = target
+    return 1
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -844,6 +985,13 @@ public func modusSwiftInstall() {
     register("ui_grid_new", gridNew)
     register("ui_menu_button_new", menuButtonNew)
     register("ui_color_well_new", colorWellNew)
+    register("ui_nav_bar_new", navBarNew)
+    register("ui_nav_push", navPush)
+    register("ui_nav_pop", navPop)
+    register("ui_context_menu_on", contextMenuOn)
+    register("ui_animate_to", animateTo)
+    register("ui_shape_new", shapeNew)
+    register("ui_swipe_on", swipeOn)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

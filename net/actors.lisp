@@ -749,8 +749,12 @@
           (if (numberp val)
               ;; Fixnum (non-zero)
               (progn
+                ;; The VALUE, as a little-endian u64, in two u32 halves: a :u64 store writes the
+                ;; machine word, which is the fixnum shifted left by one, and no other image could
+                ;; read that as the integer.  Two's complement, so a negative fixnum is its u64 too.
                 (setf (mem-ref buf :u8) 1)
-                (setf (mem-ref (+ buf 1) :u64) val)
+                (setf (mem-ref (+ buf 1) :u32) (logand val 4294967295))
+                (setf (mem-ref (+ buf 5) :u32) (logand (ash val -32) 4294967295))
                 9)
           ;; ---- STRINGS AND SYMBOLS GO BY VALUE, NOT BY POINTER ----------
           ;;
@@ -854,9 +858,13 @@
         (if (zerop tag)
             (progn (setf (mem-ref da :u64) (+ buf 1)) nil)
             (if (= tag 1)
-                (let ((v (mem-ref (+ buf 1) :u64)))
+                ;; the integer from its two u32 halves (see term-encode): a high half with its top
+                ;; bit set is negative, in two's complement
+                (let* ((lo (mem-ref (+ buf 1) :u32))
+                       (hi (mem-ref (+ buf 5) :u32))
+                       (v (+ lo (ash hi 32))))
                   (setf (mem-ref da :u64) (+ buf 9))
-                  v)
+                  (if (>= hi 2147483648) (- v 18446744073709551616) v))
                 (if (= tag 2)
                     (progn
                       (setf (mem-ref da :u64) (+ buf 1))

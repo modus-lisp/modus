@@ -58,17 +58,21 @@ private func adopt(_ v: UIView) -> UInt {
     return handle
 }
 
-// A row of a list: its title, and a subtitle when it has one.
+// A row of a list: its title, a subtitle when it has one, its section when it has one, and its index among all the
+// rows (the one a SELECT event names).
 struct Row {
     let title: String
     let subtitle: String?
+    let section: String?
+    let index: Int
 }
 
 // A list of rows.  Lisp sends the rows as data (ui_list_set_data: a list of plists, each with :TITLE and
 // optionally :SUBTITLE); the table asks this object for its cells as it needs them, and a tap on a row is a
 // SELECT event.  UIKit never calls into Lisp: the rows are data it already holds.
 final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
-    var rows: [Row] = []
+    // The rows in order of their sections: runs of rows with the same section, each run a section.
+    var groups: [(title: String?, rows: [Row])] = []
     var actions: [String] = []
     let handle: UInt
 
@@ -76,14 +80,22 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
         self.handle = handle
     }
 
+    func numberOfSections(in tableView: UITableView) -> Int {
+        groups.count
+    }
+
+    func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+        groups[section].title
+    }
+
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        rows.count
+        groups[section].rows.count
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "row")
             ?? UITableViewCell(style: .subtitle, reuseIdentifier: "row")
-        let row = rows[indexPath.row]
+        let row = groups[indexPath.section].rows[indexPath.row]
         cell.textLabel?.text = row.title
         cell.textLabel?.textColor = .white
         cell.detailTextLabel?.text = row.subtitle
@@ -94,7 +106,7 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        send("SELECT", [.int(Int(handle)), .int(indexPath.row)])
+        send("SELECT", [.int(Int(handle)), .int(groups[indexPath.section].rows[indexPath.row].index)])
     }
 
     // Swipe actions for a row, from the actions set with list_actions: a button for each, and a tap on one sends a
@@ -115,19 +127,21 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
 // The rows out of a list term: each element a plist (:KEY value ...); keys are symbols by name.
 private func rowsOf(_ data: Term) -> [Row] {
     guard let items = data.listItems else { return [] }
-    return items.map { item in
+    return items.enumerated().map { index, item in
         var title = ""
         var subtitle: String?
+        var section: String?
         let pairs = item.listItems ?? []
         var i = 0
         while i + 1 < pairs.count {
             if case .symbol(let key, _) = pairs[i], case .string(let value) = pairs[i + 1] {
                 if key == "TITLE" { title = value }
                 if key == "SUBTITLE" { subtitle = value }
+                if key == "SECTION" { section = value }
             }
             i += 2
         }
-        return Row(title: title, subtitle: subtitle)
+        return Row(title: title, subtitle: subtitle, section: section, index: index)
     }
 }
 
@@ -1073,19 +1087,100 @@ let zoomContent: Call = { h, _, _, _, _, _ in
     zoomContents[h] ?? 0
 }
 
-// drawn_image_new(kind, rgb, size, x, y): an image drawn here, a filled oval (kind 0) or rounded square (1) in rgb,
-// shown as a square of size points.
+// A shape drawn into an image: an oval (kind 0) or a rounded square (1), filled in rgb, size points square.
+private func shapeImage(_ kind: UInt, _ rgb: UInt, _ size: CGFloat) -> UIImage {
+    UIGraphicsImageRenderer(size: CGSize(width: size, height: size)).image { _ in
+        colorOf(rgb).setFill()
+        let frame = CGRect(x: 0, y: 0, width: size, height: size)
+        (kind == 0 ? UIBezierPath(ovalIn: frame) : UIBezierPath(roundedRect: frame, cornerRadius: size / 4)).fill()
+    }
+}
+
+// drawn_image_new(kind, rgb, size, x, y): an image drawn here, a shape as shapeImage draws it.
 let drawnImageNew: Call = { kind, rgb, size, x, y, _ in
     let s = CGFloat(size)
-    let renderer = UIGraphicsImageRenderer(size: CGSize(width: s, height: s))
-    let image = renderer.image { _ in
-        colorOf(rgb).setFill()
-        let frame = CGRect(x: 0, y: 0, width: s, height: s)
-        (kind == 0 ? UIBezierPath(ovalIn: frame) : UIBezierPath(roundedRect: frame, cornerRadius: s / 4)).fill()
-    }
-    let view = UIImageView(image: image)
+    let view = UIImageView(image: shapeImage(kind, rgb, s))
     view.frame = CGRect(x: CGFloat(x), y: CGFloat(y), width: s, height: s)
     return adopt(view)
+}
+
+// file_image_new(kind, rgb, size, x, y): a shape drawn and saved as a PNG in the app's temporary folder, then shown
+// from that file (loaded back, not the drawn image).
+let fileImageNew: Call = { kind, rgb, size, x, y, _ in
+    let s = CGFloat(size)
+    let path = NSTemporaryDirectory() + "storybook-shape.png"
+    if let data = shapeImage(kind, rgb, s).pngData() {
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
+    let view = UIImageView(image: UIImage(contentsOfFile: path))
+    view.frame = CGRect(x: CGFloat(x), y: CGFloat(y), width: s, height: s)
+    return adopt(view)
+}
+
+// A page view controller's data source and delegate: its pages in order.  A page that comes to rest sends a PAGE
+// event with its index.
+final class ModusPageVC: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
+    let handle: UInt
+    var pages: [UIViewController] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerBefore viewController: UIViewController) -> UIViewController? {
+        guard let i = pages.firstIndex(where: { $0 === viewController }), i > 0 else { return nil }
+        return pages[i - 1]
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerAfter viewController: UIViewController) -> UIViewController? {
+        guard let i = pages.firstIndex(where: { $0 === viewController }), i + 1 < pages.count else { return nil }
+        return pages[i + 1]
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController, didFinishAnimating finished: Bool,
+                            previousViewControllers: [UIViewController], transitionCompleted completed: Bool) {
+        guard completed, let current = pageViewController.viewControllers?.first,
+              let i = pages.firstIndex(where: { $0 === current }) else { return }
+        send("PAGE", [.int(Int(handle)), .int(i)])
+    }
+}
+
+private var pageSources: [UInt: ModusPageVC] = [:]
+private var pageContents: [UInt: [UInt]] = [:]
+
+// page_controller_new(count): a page view controller of count pages, each a view (page_content).  Shown with
+// modal_present.  Returns its handle.
+let pageControllerNew: Call = { count, _, _, _, _, _ in
+    let pager = UIPageViewController(transitionStyle: .scroll, navigationOrientation: .horizontal)
+    let handle = nextHandle
+    nextHandle += 1
+    let source = ModusPageVC(handle: handle)
+    var contents: [UInt] = []
+    for _ in 0..<Int(count) {
+        let vc = UIViewController()
+        vc.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        source.pages.append(vc)
+        let content = nextHandle
+        nextHandle += 1
+        views[content] = vc.view
+        contents.append(content)
+    }
+    pager.dataSource = source
+    pager.delegate = source
+    if let first = source.pages.first {
+        pager.setViewControllers([first], direction: .forward, animated: false)
+    }
+    modalControllers[handle] = pager
+    pageSources[handle] = source
+    pageContents[handle] = contents
+    return handle
+}
+
+// page_content(controller, index): the view of a page, to add to with ui_add.
+let pageContent: Call = { h, i, _, _, _, _ in
+    pageContents[h]?[Int(i)] ?? 0
 }
 
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
@@ -1217,6 +1312,20 @@ let textValue: Call = { h, buf, cap, _, _, _ in
     return UInt(bytes.count)
 }
 
+// The rows in sections: each run of consecutive rows with the same section is one section (a row with no section
+// is in the run of rows with none).
+private func groupsOf(_ rows: [Row]) -> [(title: String?, rows: [Row])] {
+    var groups: [(title: String?, rows: [Row])] = []
+    for row in rows {
+        if let last = groups.last, last.title == row.section {
+            groups[groups.count - 1].rows.append(row)
+        } else {
+            groups.append((title: row.section, rows: [row]))
+        }
+    }
+    return groups
+}
+
 // list_new(x, y, w, h): an empty list; its rows come from ui_list_set_data.
 let listNew: Call = { x, y, w, h, _, _ in
     let table = UITableView(frame: rect(x, y, w, h), style: .plain)
@@ -1233,7 +1342,7 @@ let listNew: Call = { x, y, w, h, _, _ in
 // in place; a term that is not a list of plists leaves the list empty.
 let listSetData: Call = { h, p, n, _, _, _ in
     guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else {
-        lists[h]?.rows = []
+        lists[h]?.groups = []
         (views[h] as? UITableView)?.reloadData()
         return 0
     }
@@ -1245,7 +1354,7 @@ let listSetData: Call = { h, p, n, _, _, _ in
         print("list_set_data: \(error)")
         rows = []
     }
-    lists[h]?.rows = rows
+    lists[h]?.groups = groupsOf(rows)
     (views[h] as? UITableView)?.reloadData()
     return 0
 }
@@ -1357,6 +1466,9 @@ public func modusSwiftInstall() {
     register("ui_zoom_scroll_new", zoomScrollNew)
     register("ui_zoom_content", zoomContent)
     register("ui_drawn_image_new", drawnImageNew)
+    register("ui_file_image_new", fileImageNew)
+    register("ui_page_controller_new", pageControllerNew)
+    register("ui_page_content", pageContent)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

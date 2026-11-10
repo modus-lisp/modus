@@ -13,6 +13,7 @@
 //   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
 //   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)   (MENU handle index)   (COLOR handle rgb)
 //   (POP handle)   (NAVTAP handle)   (CONTEXT handle index)   (SWIPE handle direction)
+//   (SHARE handle completed)   (DISMISS handle)   (FADE handle)
 
 import UIKit
 
@@ -745,6 +746,92 @@ let swipeOn: Call = { h, dir, _, _, _, _ in
     return 1
 }
 
+// share_present(text, length): the share sheet, with the text as its item.  Its completion is a SHARE event with the
+// handle and 1 (an activity was completed) or 0 (it was not).  Returns the handle.
+let sharePresent: Call = { p, n, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let sheet = UIActivityViewController(activityItems: [text(p, n)], applicationActivities: nil)
+    sheet.completionWithItemsHandler = { _, completed, _, _ in
+        send("SHARE", [.int(Int(handle)), .int(completed ? 1 : 0)])
+    }
+    root.present(sheet, animated: true)
+    return handle
+}
+
+// set_accessibility(handle, text, length): the view's accessibility label, what VoiceOver reads and what a test finds.
+let setAccessibility: Call = { h, p, n, _, _, _ in
+    views[h]?.accessibilityLabel = text(p, n)
+    return 0
+}
+
+// haptic(style): an impact feedback, 0 light, 1 medium, 2 heavy.
+let haptic: Call = { style, _, _, _, _, _ in
+    let weight: UIImpactFeedbackGenerator.FeedbackStyle = style == 0 ? .light : (style == 1 ? .medium : .heavy)
+    UIImpactFeedbackGenerator(style: weight).impactOccurred()
+    return 0
+}
+
+// fade_to(handle, percent, ms): the view's alpha moves to percent (0 to 100) over ms milliseconds.  Its completion
+// is a FADE event with the handle.
+let fadeTo: Call = { h, percent, ms, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    UIView.animate(withDuration: Double(ms) / 1000, animations: {
+        view.alpha = CGFloat(min(percent, 100)) / 100
+    }, completion: { _ in
+        send("FADE", [.int(Int(h))])
+    })
+    return 0
+}
+
+// A modal sheet's content: a view (adopted as the others are not: it is shown by the sheet, not the screen) and its
+// controller.  Dragging the sheet down is a DISMISS event; dismissing it from code is not.
+private var modalControllers: [UInt: UIViewController] = [:]
+
+final class ModusModal: NSObject, UIAdaptivePresentationControllerDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        send("DISMISS", [.int(Int(handle))])
+    }
+}
+
+private var modalDelegates: [UInt: ModusModal] = [:]
+
+// modal_new(): a sheet's content, not yet shown.  Its children are added with ui_add.
+let modalNew: Call = { _, _, _, _, _, _ in
+    let controller = UIViewController()
+    controller.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    let handle = nextHandle
+    nextHandle += 1
+    views[handle] = controller.view
+    modalControllers[handle] = controller
+    return handle
+}
+
+// modal_present(handle, large): the sheet comes up over the app, at medium height, or at large (large != 0).
+let modalPresent: Call = { h, large, _, _, _, _ in
+    guard let controller = modalControllers[h], let root = keyRoot()?.window?.rootViewController else { return 0 }
+    controller.modalPresentationStyle = .pageSheet
+    controller.sheetPresentationController?.detents = large != 0 ? [.large()] : [.medium()]
+    root.present(controller, animated: true)
+    let delegate = ModusModal(handle: h)
+    controller.presentationController?.delegate = delegate
+    modalDelegates[h] = delegate
+    return 1
+}
+
+// modal_dismiss(handle): the sheet goes away.
+let modalDismiss: Call = { h, _, _, _, _, _ in
+    modalControllers[h]?.dismiss(animated: true)
+    return 0
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -992,6 +1079,13 @@ public func modusSwiftInstall() {
     register("ui_animate_to", animateTo)
     register("ui_shape_new", shapeNew)
     register("ui_swipe_on", swipeOn)
+    register("ui_share_present", sharePresent)
+    register("ui_set_accessibility", setAccessibility)
+    register("ui_haptic", haptic)
+    register("ui_fade_to", fadeTo)
+    register("ui_modal_new", modalNew)
+    register("ui_modal_present", modalPresent)
+    register("ui_modal_dismiss", modalDismiss)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

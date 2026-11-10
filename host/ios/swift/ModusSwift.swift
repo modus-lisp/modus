@@ -11,7 +11,7 @@
 // Events, as terms, oldest first (ui_events_next):
 //   (TAP handle)   (SWITCH handle on)   (SLIDER handle value: a double)   (TEXT handle)   (SELECT handle index)
 //   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
-//   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)
+//   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)   (MENU handle index)   (COLOR handle rgb)
 
 import UIKit
 
@@ -512,6 +512,98 @@ let panOn: Call = { h, _, _, _, _, _ in
     return 1
 }
 
+// The grid's data source and delegate: one tile per title; a tap on a tile sends a SELECT event with its index.
+final class ModusGrid: NSObject, UICollectionViewDataSource, UICollectionViewDelegate {
+    let handle: UInt
+    var items: [String] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        items.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "tile", for: indexPath)
+        let label: UILabel
+        if let existing = cell.contentView.viewWithTag(1) as? UILabel {
+            label = existing
+        } else {
+            label = UILabel(frame: cell.contentView.bounds)
+            label.tag = 1
+            label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            label.textColor = .white
+            label.textAlignment = .center
+            cell.contentView.addSubview(label)
+        }
+        label.text = items[indexPath.item]
+        cell.backgroundColor = UIColor(white: 0.2, alpha: 1)
+        return cell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        send("SELECT", [.int(Int(handle)), .int(indexPath.item)])
+    }
+}
+
+private var grids: [UInt: ModusGrid] = [:]
+
+// grid_new(titles, length, x, y, w, h): a collection view of tiles, one per title (a term: a list of strings).
+let gridNew: Call = { p, n, x, y, w, h in
+    let layout = UICollectionViewFlowLayout()
+    layout.itemSize = CGSize(width: 100, height: 60)
+    layout.minimumInteritemSpacing = 8
+    layout.minimumLineSpacing = 8
+    let view = UICollectionView(frame: rect(x, y, w, h), collectionViewLayout: layout)
+    view.backgroundColor = .clear
+    view.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "tile")
+    let handle = adopt(view)
+    let source = ModusGrid(handle: handle)
+    source.items = titlesOf(p, n)
+    view.dataSource = source
+    view.delegate = source
+    grids[handle] = source
+    return handle
+}
+
+// menu_button_new(choices, length, x, y, w, h): a button, 'options', whose menu offers the choices (a term: a list
+// of strings).  Choosing one sends a MENU event with its index.
+let menuButtonNew: Call = { p, n, x, y, w, h in
+    let button = UIButton(type: .system)
+    button.frame = rect(x, y, w, h)
+    button.setTitle("options", for: .normal)
+    button.showsMenuAsPrimaryAction = true
+    let handle = adopt(button)
+    let choices = titlesOf(p, n).enumerated().map { i, title in
+        UIAction(title: title) { _ in send("MENU", [.int(Int(handle)), .int(i)]) }
+    }
+    button.menu = UIMenu(title: "", children: choices)
+    return handle
+}
+
+// The colour of rgb, as 0xRRGGBB.
+private func colorOf(_ rgb: UInt) -> UIColor {
+    UIColor(red: CGFloat((rgb >> 16) & 255) / 255, green: CGFloat((rgb >> 8) & 255) / 255,
+            blue: CGFloat(rgb & 255) / 255, alpha: 1)
+}
+
+// color_well_new(rgb, x, y, w, h): a colour well showing the colour.  Choosing a colour sends a COLOR event with the
+// new colour as 0xRRGGBB.
+let colorWellNew: Call = { rgb, x, y, w, h, _ in
+    let well = UIColorWell(frame: rect(x, y, w, h))
+    well.selectedColor = colorOf(rgb)
+    let handle = adopt(well)
+    well.addAction(UIAction { _ in
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        well.selectedColor?.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let packed = (Int(r * 255) << 16) | (Int(g * 255) << 8) | Int(b * 255)
+        send("COLOR", [.int(Int(handle)), .int(packed)])
+    }, for: .valueChanged)
+    return handle
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -623,6 +715,8 @@ let setValue: Call = { h, value, _, _, _, _ in
         if value == 0 { table.refreshControl?.endRefreshing() } else { table.refreshControl?.beginRefreshing() }
     } else if let wheel = views[h] as? UIPickerView {
         wheel.selectRow(Int(value), inComponent: 0, animated: false)
+    } else if let well = views[h] as? UIColorWell {
+        well.selectedColor = colorOf(value)
     }
     return 0
 }
@@ -747,6 +841,9 @@ public func modusSwiftInstall() {
     register("ui_picker_new", pickerNew)
     register("ui_blur_new", blurNew)
     register("ui_pan_on", panOn)
+    register("ui_grid_new", gridNew)
+    register("ui_menu_button_new", menuButtonNew)
+    register("ui_color_well_new", colorWellNew)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

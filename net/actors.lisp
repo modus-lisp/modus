@@ -943,7 +943,7 @@
                                 ;; double-float (tag 8): the low half, then the high half, as IEEE bits
                                 (let ((lo (mem-ref (+ buf 1) :u32)) (hi (mem-ref (+ buf 5) :u32)))
                                   (setf (mem-ref da :u64) (+ buf 9))
-                                  (%float-set-bits (%make-float2) hi lo))
+                                  (modus.runtime::%float-set-bits (%make-float2) hi lo))
                             ;; Bignum (tag 5)
                             (let ((nlimbs (mem-ref (+ buf 1) :u32)))
                               (let ((b (make-bignum-n nlimbs)))

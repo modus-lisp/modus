@@ -290,7 +290,7 @@
   '("net/ip.lisp" "net/crypto.lisp" "net/crypto-fast.lisp" "net/crypto-32-fast.lisp"
     "net/ssh.lisp" "net/http-client.lisp"
     "net/e1000.lisp" "net/dwc2.lisp" "net/usb.lisp" "net/cdc-ether.lisp"
-    "net/actors.lisp" "net/ne2000.lisp"
+    "net/term.lisp" "net/actors.lisp" "net/ne2000.lisp"
     "net/arch-rpi-cl.lisp" "net/arch-x86-cl.lisp"
     "net/arch-i386-cl.lisp" "net/arch-aarch64-cl.lisp"
     "net/bcm2835-gpio.lisp"))

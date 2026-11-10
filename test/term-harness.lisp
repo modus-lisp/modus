@@ -1,11 +1,6 @@
-;;;; term-harness.lisp -- the wire functions of net/actors.lisp, loaded and usable from a script (the
-;;;; cross-language tests load it).  The functions are READ FROM net/actors.lisp and evaluated, so what runs
-;;;; is what ships.  This image lacks two float helpers and the decode cursor; they are supplied here (see
-;;;; test/term-format.lisp for the reasoning).
-
-(defparameter *wanted*
-  '("SOFT-SUBTAG" "TERM-FLOAT-P" "%UTF8-LENGTH" "%UTF8-PUT" "%UTF8-GET"
-    "TERM-SIZE" "TERM-SIZE-VALUE" "TERM-ENCODE" "TERM-ENCODE-VALUE" "TERM-DECODE-STEP"))
+;;;; term-harness.lisp -- the wire format (net/term.lisp), loaded and usable from a script: the cross-language
+;;;; tests load it.  The caller provides DECODE-PTR-ADDR (the decoder's read cursor); here it is a cell of
+;;;; this script's own.  Everything else is the shipped code.
 
 (defparameter *cell* (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
 (defparameter *buf* (make-array 65536 :element-type '(unsigned-byte 8) :initial-element 0))
@@ -13,36 +8,9 @@
 (defun %addr (array)
   (+ (modus-int::%gc-word-of array (modus-int::%conv-addr #x100050A0)) 7))
 
-(defun bits-to-double (hi lo)
-  "The double whose IEEE bits are HI (the high 32) and LO (the low 32): arithmetic, exact for every
-   finite double and zero."
-  (let* ((sign (ash hi -31))
-         (expo (logand (ash hi -20) #x7FF))
-         (mant (+ (* (logand hi #xFFFFF) 4294967296) lo))
-         (value (cond ((and (= expo 0) (= mant 0)) 0.0d0)
-                      ((= expo 0) (* (float mant 1d0) (expt 2d0 -1074)))
-                      (t (* (+ 1d0 (/ (float mant 1d0) 4503599627370496d0))
-                            (expt 2d0 (- expo 1023)))))))
-    (if (= sign 1) (- 0.0d0 value) value)))
+(defun decode-ptr-addr () (%addr *cell*))
 
-(setf (fdefinition '%float-lo32) (fdefinition 'modus-int::%float-lo32))
-(setf (fdefinition '%float-hi32) (fdefinition 'modus-int::%float-hi32))
-
-(defun %standin (sym fn)
-  (unless (fboundp sym) (setf (fdefinition sym) fn)))
-
-(%standin 'decode-ptr-addr (lambda () (%addr *cell*)))
-(%standin '%make-float2 (lambda () 0.0d0))
-(%standin '%float-set-bits (lambda (f hi lo) (declare (ignore f)) (bits-to-double hi lo)))
-
-(with-open-file (in "net/actors.lisp")
-  (loop for form = (read in nil :eof)
-        until (eq form :eof)
-        do (when (and (consp form)
-                      (member (car form) '(defun defparameter defvar))
-                      (member (symbol-name (second form)) *wanted* :test #'string=))
-             (handler-case (eval form)
-               (serious-condition (e) (format t "~&EVAL of ~A failed: ~A~%" (second form) e))))))
+(load "net/term.lisp")
 
 (defun term-hex (value)
   "VALUE as the wire bytes, in hex."

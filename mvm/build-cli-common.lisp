@@ -2437,6 +2437,8 @@
     (setq modus.mvm::*ir-dce-roots* (list "KERNEL-MAIN" "%%UNRESOLVED-FN"))
     ;; and initialises globals without a HANDLER-CASE around each
     (setq modus.mvm::*init-globals-unguarded* t)
+    ;; and a quoted symbol is a static object in the constant pool
+    (setq modus.mvm::*static-symbols-full* t)
     ;; MODUS_HOT_ORDER=FILE: one function name a line, laid out first in that
     ;; order -- a profile of what boot runs (qemu -d in_asm + MODUS_SYMMAP)
     (let ((f (sb-ext:posix-getenv "MODUS_HOT_ORDER")))

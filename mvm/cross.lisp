@@ -421,6 +421,28 @@
                   (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
+               (symbol
+                ;; STATIC SYMBOL (compile-quote under *static-symbols-full*,
+                ;; lean images): what %ALLOC-SYM3 builds -- header (3 << 8) |
+                ;; #x50, padding, slot 0 the tagged name hash, slots 1 (package)
+                ;; and 2 (name) NIL.  NIL lives at a fixed address outside the
+                ;; heap, so the object holds no heap pointer and the collector
+                ;; never needs to see it.
+                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                      do (mvm-emit-byte buf 0))
+                (let* ((obj-offset (mvm-buffer-position buf))
+                       (tag (target-object-tag target))
+                       (data-off (target-object-data-offset target))
+                       (pad-words (1- (/ data-off word-size))))
+                  (emit-word (logior #x50 (ash 3 8)))
+                  (dotimes (i pad-words)
+                    (emit-word 0))
+                  (emit-word (ash (normalize-name constant) 1))
+                  (emit-word +nil-value+)
+                  (emit-word +nil-value+)
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                        do (mvm-emit-byte buf 0))
+                  (setf (aref addr-table idx) (logior obj-offset tag))))
                (t
                 ;; Non-string constants in the table are unexpected for now —
                 ;; primitives are inlined by compile-quote, and other

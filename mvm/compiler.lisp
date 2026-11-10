@@ -2259,6 +2259,17 @@
    %TAKE-PENDING-FAULT, MAKE-CONDITION, the printer and FORMAT.  Set by the
    MODUS_LEAN_BOOT builds; NIL everywhere else.")
 
+(defvar *static-symbols-full* nil
+  "When T (MODUS_LEAN_BOOT), a quoted interned symbol compiles to ONE :LI-CONST
+   of a static symbol object in the constant pool -- header (3 << 8) | #x50,
+   slot 0 the tagged name hash, slots 1 (package) and 2 (name) NIL -- the way a
+   static keyword does, instead of the phase-2 cached %STATIC-SYMBOL-REF site.
+   A lean image has no packages to intern into and does no run-time interning:
+   a symbol interned at run time there is NOT EQ to the literal, as with its
+   keywords.  NIL everywhere else.")
+(defvar *static-symbol-full-index* nil
+  "\"PKG::NAME\" -> constant-table index of its static symbol object.")
+
 (defvar *ir-hot-order* nil
   "NIL, or function names (upcased strings) to lay out FIRST, in this order,
    ahead of every other kept function -- a profile of what boot executes, so
@@ -10494,6 +10505,20 @@
     ;; in the vector at #x10000FB0; slot 0 means "not yet", and the fill
     ;; interns it exactly as the path below does.  Uninterned symbols keep
     ;; the old path (their identity semantics are not this change's to touch).
+    ;; Lean images: the symbol itself, static, in the constant pool.
+    ((and (symbolp value) *static-symbols-full* (not *mvm-eval-runtime-p*)
+          (symbol-package value) (not (keywordp value)))
+     (let* ((key (concatenate 'string (package-name (symbol-package value)) "::"
+                              (symbol-name value)))
+            (idx (and *static-symbol-full-index*
+                      (gethash key *static-symbol-full-index*))))
+       (unless idx
+         (unless *static-symbol-full-index*
+           (setq *static-symbol-full-index* (make-hash-table :test 'equal)))
+         (setq idx (length *constant-table*))
+         (push value *constant-table*)
+         (setf (gethash key *static-symbol-full-index*) idx))
+       (emit-ir :li-const dest idx)))
     ((and (symbolp value) *static-symbols-p* (not *mvm-eval-runtime-p*)
           (symbol-package value))
      (let* ((h (normalize-name value))
@@ -32106,6 +32131,7 @@
     (setq *init-nil-thunk-names* nil)
     (setq *static-keyword-index* nil)
     (setq *static-literal-index* nil)
+    (setq *static-symbol-full-index* nil)
 
     ;; Register standard macros (cond, and, or) for this compilation
     (register-mvm-bootstrap-macros)

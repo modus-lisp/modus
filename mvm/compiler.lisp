@@ -2235,6 +2235,91 @@
 ;;;   translate-x64.lisp +op-cons+      : R12 += 16
 ;;; If either allocator's advance changes, these must change with it.
 
+(defvar *ir-dce-roots* nil
+  "NIL, or the names (upcased strings) of the functions an image is entered
+   through.  When set, MVM-COMPILE-ALL drops every function the roots do not
+   reach before laying out bytecode (%IR-DCE): exact, because it follows the
+   IR after inlining -- a (+ a b) the compiler inlined is no call to the
+   out-of-line +.  Set by the MODUS_LEAN_BOOT builds; NIL everywhere else, so
+   every other image is unchanged.")
+
+(defun %ir-dce-names (insn acc)
+  "Every string and symbol name inside the IR instruction INSN, into ACC."
+  (flet ((note (n)
+           ;; as written and without its package: a call may name
+           ;; "PKG::NAME" where the function is registered bare
+           (let* ((u (string-upcase n)) (c (position #\: u :from-end t)))
+             (setf (gethash u acc) t)
+             (when c (setf (gethash (subseq u (1+ c)) acc) t)))))
+    (cond ((stringp insn) (note insn))
+          ((and insn (symbolp insn) (not (keywordp insn))) (note (symbol-name insn)))
+          ((consp insn)
+           (loop for x on insn
+                 do (%ir-dce-names (car x) acc)
+                    (unless (listp (cdr x)) (%ir-dce-names (cdr x) acc))))))
+  acc)
+
+(defun %ir-dce (all-ir roots)
+  "ALL-IR (list of (FUNCTION-INFO . IR)) without the functions ROOTS do not
+   reach.  A function reaches every function whose name appears anywhere in
+   its IR -- a call, a function object, a generated lambda's name -- which
+   over-approximates only through names that are data.  A dropped function
+   leaves *FUNCTIONS* and *FUNCTION-TABLE*, as a SKIPped one does, so a call
+   that still names it resolves to %%UNRESOLVED-FN and is reported."
+  (let ((by-name (make-hash-table :test 'equal))
+        (seen (make-hash-table :test 'equal))
+        (parent (make-hash-table :test 'equal))   ; NAME -> who first reached it
+        (from nil)
+        (work nil))
+    ;; Only a name's LAST definition is live (last-defun-wins), so only its
+    ;; edges count.
+    (dolist (e all-ir)
+      (let ((info (car e)))
+        (setf (gethash (string-upcase (string (function-info-name info))) by-name) (list e))
+        (let ((q (function-info-qualified-name info)))
+          (when q (setf (gethash (string-upcase q) by-name) (list e))))))
+    (unless (some (lambda (r) (gethash (string-upcase r) by-name)) roots)
+      (return-from %ir-dce all-ir))         ; not an image: nothing to enter it by
+    (flet ((want (n) (when (and (gethash n by-name) (not (gethash n seen)))
+                       (setf (gethash n seen) t (gethash n parent) from)
+                       (setq work (nconc work (list n))))))   ; breadth first
+      (dolist (r roots) (want (string-upcase r)))
+      (loop while work
+            do (let ((n (pop work)))
+                 (setq from n)
+                 (dolist (e (gethash n by-name))
+                   (maphash (lambda (n v) (declare (ignore v)) (want n))
+                            (%ir-dce-names (cdr e) (make-hash-table :test 'equal)))))))
+    ;; MODUS_IR_DCE_WHY=NAME,NAME...: print how each was reached
+    (let ((why (sb-ext:posix-getenv "MODUS_IR_DCE_WHY")))
+      (when (and why (plusp (length why)))
+        (let ((st 0))
+          (loop
+            (let* ((j (position #\, why :start st))
+                   (n (string-upcase (subseq why st j))))
+              (format t "~&  IR-DCE WHY ~A:~:[ not kept~;~{ <- ~A~}~]~%" n (gethash n seen)
+                      (loop for m = (gethash n parent) then (gethash m parent)
+                            while m collect m))
+              (if j (setq st (1+ j)) (return)))))))
+    (let ((kept nil) (dropped 0))
+      (dolist (e all-ir)
+        (let* ((info (car e))
+               (n (string-upcase (string (function-info-name info)))))
+          (if (and (gethash n seen) (eq e (car (gethash n by-name))))
+              (push e kept)
+              (progn
+                (incf dropped)
+                ;; an earlier definition of a kept name leaves the table entry,
+                ;; which is the live definition's, alone
+                (unless (gethash n seen)
+                  (remhash (function-info-name info) *functions*)
+                  (let ((q (function-info-qualified-name info)))
+                    (when q (remhash q *functions*))))
+                (setf *function-table* (remove info *function-table*))))))
+      (format t "~&  IR-DCE: kept ~D functions, dropped ~D (roots ~{~A~^ ~})~%"
+              (length kept) dropped roots)
+      (nreverse kept))))
+
 (defvar *gc-check-fusion-enabled* t
   "Gate for the Stage-1a size-aware gc-check peephole (fuse-gc-checks).
    Set NIL to emit the historical unsized :gc-check everywhere — the image is
@@ -32208,6 +32293,10 @@
     (when *gc-check-fusion-enabled*
       (dolist (entry all-ir)
         (setf (cdr entry) (fuse-gc-checks (cdr entry)))))
+
+    ;; Phase 2c: drop what the image's entry points do not reach (*IR-DCE-ROOTS*).
+    (when *ir-dce-roots*
+      (setq all-ir (%ir-dce all-ir *ir-dce-roots*)))
 
     ;; Phase 3: Emit bytecode
     (let ((buf (make-mvm-buffer)))

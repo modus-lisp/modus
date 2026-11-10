@@ -20,8 +20,9 @@
 
 (in-package :cl-user)
 
-(defparameter *nc-always-kept-heads* '("IN-PACKAGE" "DEFPACKAGE" "DECLAIM")
-  "Top-level forms kept whatever they name: they set context and cost nothing.")
+(defparameter *nc-always-kept-heads* '("IN-PACKAGE" "DEFPACKAGE" "DECLAIM" "%SOURCE-FILE")
+  "Top-level forms kept whatever they name: they set context and cost nothing.
+   %SOURCE-FILE is the marker naming the file the forms after it came from.")
 
 (defparameter *nc-nil-hooks*
   '("%JIT-ENABLED-P" "%JIT-DRAIN-WANTED" "%JIT-FNADDR-THUNK-INVALIDATE"

@@ -2433,6 +2433,8 @@
     (multiple-value-bind (text removed) (%nc-lean-kernel-main *driver-source* *nc-lean-boot-skip*)
       (setq *driver-source* text)
       (format t "~&;; MODUS_LEAN_BOOT: KERNEL-MAIN skips ~{~A~^ ~}~%" removed))
+    ;; and the compiler drops what KERNEL-MAIN does not reach, exactly (%IR-DCE)
+    (setq modus.mvm::*ir-dce-roots* (list "KERNEL-MAIN" "%%UNRESOLVED-FN"))
     (defvar *sft-auto-source* "")
     (defvar *sym-name-auto-source* "")
     (defvar *runtime-macros-source* "")

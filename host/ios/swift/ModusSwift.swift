@@ -11,6 +11,7 @@
 // Events, as terms, oldest first (ui_events_next):
 //   (TAP handle)   (SWITCH handle on)   (SLIDER handle value: a double)   (TEXT handle)   (SELECT handle index)
 //   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
+//   (ALERT handle index)   (REFRESH handle)
 
 import UIKit
 
@@ -314,6 +315,86 @@ let longPressOn: Call = { h, ms, _, _, _, _ in
     return 1
 }
 
+// alert_new(title, length, message, length): an alert, not yet shown.  Its buttons come from alert_action, and
+// alert_present shows it.  Choosing a button sends an ALERT event with the alert's handle and the button's index.
+private var alerts: [UInt: UIAlertController] = [:]
+
+let alertNew: Call = { tp, tn, mp, mn, _, _ in
+    let alert = UIAlertController(title: text(tp, tn), message: text(mp, mn), preferredStyle: .alert)
+    let handle = nextHandle
+    nextHandle += 1
+    alerts[handle] = alert
+    return handle
+}
+
+// alert_action(handle, text, length): a button of the alert, in the order they are added.
+let alertAction: Call = { h, p, n, _, _, _ in
+    guard let alert = alerts[h] else { return 0 }
+    let index = alert.actions.count
+    alert.addAction(UIAlertAction(title: text(p, n), style: .default) { _ in
+        send("ALERT", [.int(Int(h)), .int(index)])
+    })
+    return 0
+}
+
+// alert_present(handle): the alert is shown over the app's screen.
+let alertPresent: Call = { h, _, _, _, _, _ in
+    guard let alert = alerts[h], let root = keyRoot()?.window?.rootViewController else { return 0 }
+    root.present(alert, animated: true)
+    return 1
+}
+
+// The tab bar's delegate: a choice sends a SELECT event with the item's index (its tag).
+final class ModusTabBar: NSObject, UITabBarDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func tabBar(_ tabBar: UITabBar, didSelect item: UITabBarItem) {
+        send("SELECT", [.int(Int(handle)), .int(item.tag)])
+    }
+}
+
+private var tabBarDelegates: [UInt: ModusTabBar] = [:]
+
+// tab_bar_new(titles, length, x, y, w, h): a tab bar, an item per title (a term: a list of strings).  Choosing an
+// item sends a SELECT event with its index.
+let tabBarNew: Call = { p, n, x, y, w, h in
+    let bar = UITabBar(frame: rect(x, y, w, h))
+    bar.items = titlesOf(p, n).enumerated().map { i, title in
+        UITabBarItem(title: title, image: nil, tag: i)
+    }
+    bar.selectedItem = bar.items?.first
+    bar.tintColor = .white
+    bar.barTintColor = UIColor(white: 0.12, alpha: 1)
+    bar.unselectedItemTintColor = .lightGray
+    let handle = adopt(bar)
+    let delegate = ModusTabBar(handle: handle)
+    bar.delegate = delegate
+    tabBarDelegates[handle] = delegate
+    return handle
+}
+
+// refresh_on(list): pulling the list down sends a REFRESH event with the list's handle.  The spinner stops when
+// set_value sets the list to 0.
+let refreshOn: Call = { h, _, _, _, _, _ in
+    guard let table = views[h] as? UITableView else { return 0 }
+    let control = UIRefreshControl()
+    control.tintColor = .white
+    control.addAction(UIAction { _ in send("REFRESH", [.int(Int(h))]) }, for: .valueChanged)
+    table.refreshControl = control
+    return 1
+}
+
+// send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
+// For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
+let sendRefresh: Call = { h, _, _, _, _, _ in
+    (views[h] as? UITableView)?.refreshControl?.sendActions(for: .valueChanged)
+    return 0
+}
+
 // panel_new(x, y, w, h, rgb): a plain view of one colour; w = 0 makes it the whole screen.
 let panelNew: Call = { x, y, w, h, rgb, _ in
     let frame = w == 0
@@ -410,6 +491,8 @@ let setValue: Call = { h, value, _, _, _, _ in
         page.currentPage = Int(value)
     } else if let picker = views[h] as? UIDatePicker {
         picker.date = Date(timeIntervalSince1970: TimeInterval(value))
+    } else if let table = views[h] as? UITableView {
+        if value == 0 { table.refreshControl?.endRefreshing() } else { table.refreshControl?.beginRefreshing() }
     }
     return 0
 }
@@ -522,6 +605,12 @@ public func modusSwiftInstall() {
     register("ui_page_new", pageNew)
     register("ui_date_new", dateNew)
     register("ui_long_press_on", longPressOn)
+    register("ui_alert_new", alertNew)
+    register("ui_alert_action", alertAction)
+    register("ui_alert_present", alertPresent)
+    register("ui_tab_bar_new", tabBarNew)
+    register("ui_refresh_on", refreshOn)
+    register("ui_send_refresh", sendRefresh)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

@@ -13,7 +13,7 @@
 //   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
 //   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)   (MENU handle index)   (COLOR handle rgb)
 //   (POP handle)   (NAVTAP handle)   (CONTEXT handle index)   (SWIPE handle direction)
-//   (SHARE handle completed)   (DISMISS handle)   (FADE handle)
+//   (SHARE handle completed)   (DISMISS handle)   (FADE handle)   (ROWACTION handle index)
 
 import UIKit
 
@@ -69,6 +69,7 @@ struct Row {
 // SELECT event.  UIKit never calls into Lisp: the rows are data it already holds.
 final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
     var rows: [Row] = []
+    var actions: [String] = []
     let handle: UInt
 
     init(handle: UInt) {
@@ -94,6 +95,20 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
         send("SELECT", [.int(Int(handle)), .int(indexPath.row)])
+    }
+
+    // Swipe actions for a row, from the actions set with list_actions: a button for each, and a tap on one sends a
+    // ROWACTION event with the list's handle and the button's index (the row is the one swiped).
+    func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
+        -> UISwipeActionsConfiguration? {
+        guard !actions.isEmpty else { return nil }
+        let items = actions.enumerated().map { i, title in
+            UIContextualAction(style: .normal, title: title) { _, _, done in
+                send("ROWACTION", [.int(Int(self.handle)), .int(i)])
+                done(true)
+            }
+        }
+        return UISwipeActionsConfiguration(actions: items)
     }
 }
 
@@ -832,6 +847,50 @@ let modalDismiss: Call = { h, _, _, _, _, _ in
     return 0
 }
 
+// list_actions(handle, titles, length): the swipe actions of the list's rows (a term: a list of strings).
+let listActions: Call = { h, p, n, _, _, _ in
+    lists[h]?.actions = titlesOf(p, n)
+    return 1
+}
+
+// The paging scroll view's delegate: when a page stops, a PAGE event with its index.
+final class ModusPaging: NSObject, UIScrollViewDelegate {
+    let handle: UInt
+    var width: CGFloat = 0
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        guard width > 0 else { return }
+        send("PAGE", [.int(Int(handle)), .int(Int((scrollView.contentOffset.x / width).rounded()))])
+    }
+}
+
+private var pagings: [UInt: ModusPaging] = [:]
+
+// paging_new(pages, x, y, w, h): a scroll view of pages, each as wide as the view, that snap to a page (ui_add puts
+// each page's content in place, at its own x).  A page that comes to rest is a PAGE event with its index.
+let pagingNew: Call = { pages, x, y, w, h, _ in
+    let scroll = UIScrollView(frame: rect(x, y, w, h))
+    scroll.isPagingEnabled = true
+    scroll.showsHorizontalScrollIndicator = false
+    scroll.contentSize = CGSize(width: CGFloat(w) * CGFloat(pages), height: CGFloat(h))
+    let handle = adopt(scroll)
+    let delegate = ModusPaging(handle: handle)
+    delegate.width = CGFloat(w)
+    scroll.delegate = delegate
+    pagings[handle] = delegate
+    return handle
+}
+
+// announce(text, length): VoiceOver announces the text, with no change on the screen.
+let announce: Call = { p, n, _, _, _, _ in
+    UIAccessibility.post(notification: .announcement, argument: text(p, n))
+    return 0
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1086,6 +1145,9 @@ public func modusSwiftInstall() {
     register("ui_modal_new", modalNew)
     register("ui_modal_present", modalPresent)
     register("ui_modal_dismiss", modalDismiss)
+    register("ui_list_actions", listActions)
+    register("ui_paging_new", pagingNew)
+    register("ui_announce", announce)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

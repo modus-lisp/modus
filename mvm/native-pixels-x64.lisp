@@ -68,3 +68,9 @@
   (declare (fixnum i si n))
   (when (> n 0) (%bulk-move buf i px si n 4))
   (+ i (* 3 n)))
+
+(defun modus.runtime::%fixnum-vector-rebase (vec off)
+  "Each fixnum X of VEC := X - OFF when X >= OFF, else -1: one KERNEL kind 2."
+  (declare (fixnum off))
+  (%kernel vec 0 off (length vec) 2)
+  vec)

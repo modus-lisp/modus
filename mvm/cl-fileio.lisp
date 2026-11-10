@@ -1346,6 +1346,20 @@
               (aref buf (+ o 2)) (logand (ash p -16) #xff)))
       (setq k (+ k 1)))))
 
+(declaim (overridable %fixnum-vector-rebase))
+(defun %fixnum-vector-rebase (vec off)
+  "Each element X of the simple vector of fixnums VEC := X - OFF when X >= OFF, else -1:
+   a deflate window's position tables after the window slides down by OFF."
+  (declare (simple-vector vec) (fixnum off) (optimize (speed 3) (safety 0)))
+  (let ((k 0) (n (length vec)))
+    (declare (fixnum k n))
+    (loop
+      (when (>= k n) (return vec))
+      (let ((v (svref vec k)))
+        (declare (fixnum v))
+        (setf (svref vec k) (if (>= v off) (- v off) -1)))
+      (setq k (+ k 1)))))
+
 (declaim (overridable %adler32-update))
 (defun %adler32-update (data start end a b)
   "Adler-32's sums A and B advanced over the octets DATA[START,END) (a simple

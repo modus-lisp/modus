@@ -599,7 +599,8 @@
 ;; so a function using it falls back to the interpreter there; only the x64 build's
 ;; mvm/native-pixels-x64.lisp emits it).  KIND 0: Vd := how many of the N u32 lanes
 ;; SRC[I..] equal the u32 VAL.  KIND 1: Vd := Adler-32's (B<<16)|A after the N bytes
-;; of the u8 vector SRC[I..], from VAL = (B<<16)|A, A and B below 65521.
+;; of the u8 vector SRC[I..], from VAL = (B<<16)|A, A and B below 65521.  KIND 2:
+;; each of the N fixnum word slots SRC[I..] := x >= VAL ? x - VAL : -1; Vd := 0.
 (defconstant +op-kernel+ #x96)    ; (kernel Vd Vsrc Vi Vval Vn kind)
 
 ;;; ============================================================

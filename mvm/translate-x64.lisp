@@ -6240,7 +6240,24 @@
            (dolist (r '(rcx rdx rsi rdi r8 r9 r10 r11)) (emit-push buf r))
            (dolist (v (subseq operands 1 5)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
            (emit-bytes buf #x59 #x5A #x58 #x5E)               ; pop rcx/rdx/rax/rsi: n val i src
-           (if (= kind 0)
+           (cond
+             ((= kind 2)
+              ;; each of the N word slots SRC[I..] (tagged fixnums): x >= VAL ? x - VAL : -1,
+              ;; on tagged values (VAL stays tagged).  Fixnums only: no barrier.
+              (emit-bytes buf #x48 #x8D #x74 #x86 #x07        ; lea rsi,[rsi+rax*4+7]  (slot I)
+                              #x48 #xD1 #xF9                  ; sar rcx,1
+                              #x49 #xC7 #xC0 #xFE #xFF #xFF #xFF ; mov r8,-2 (tagged -1)
+                              #x48 #x85 #xC9)                 ; test rcx,rcx
+              (emit-jcc buf :z done)
+              (emit-label buf top)
+              (emit-bytes buf #x48 #x8B #x06 #x49 #x89 #xC1     ; mov rax,[rsi]; mov r9,rax
+                              #x49 #x29 #xD1 #x48 #x39 #xD0     ; sub r9,rdx; cmp rax,rdx
+                              #x4D #x0F #x4C #xC8 #x4C #x89 #x0E ; cmovl r9,r8; mov [rsi],r9
+                              #x48 #x83 #xC6 #x08 #x48 #xFF #xC9) ; add rsi,8; dec rcx
+              (emit-jcc buf :nz top)
+              (emit-label buf done)
+              (emit-bytes buf #x31 #xC0))                     ; xor eax,eax: result 0
+             ((= kind 0)
                (progn
                  (emit-bytes buf #x48 #xD1 #xF9 #x48 #xD1 #xFA ; sar rcx,1; sar rdx,1
                                  #x48 #x8D #x74 #x46 #x07      ; lea rsi,[rsi+rax*2+7]  (lane I)
@@ -6251,7 +6268,8 @@
                  (emit-jcc buf :ne done)
                  (emit-bytes buf #x48 #xFF #xC0 #x48 #x39 #xC8) ; inc rax; cmp rax,rcx
                  (emit-jcc buf :c top)
-                 (emit-label buf done))
+                 (emit-label buf done)))
+             (t
                (let ((outer (make-label)) (chunk (make-label)))
                  (emit-bytes buf #x48 #xD1 #xFA                ; sar rdx,1: (B<<16)|A
                                  #x49 #x89 #xD0                ; mov r8,rdx
@@ -6280,7 +6298,7 @@
                  (emit-jmp buf outer)
                  (emit-label buf done)
                  (emit-bytes buf #x4C #x89 #xC8 #x48 #xC1 #xE0 #x10 ; mov rax,r9; shl rax,16
-                                 #x4C #x09 #xC0)))             ; or rax,r8
+                                 #x4C #x09 #xC0))))            ; or rax,r8
            (emit-bytes buf #x48 #xD1 #xE0)                     ; shl rax,1: tag
            (dolist (r '(r11 r10 r9 r8 rdi rsi rdx rcx)) (emit-pop buf r))
            (emit-store-vreg buf (first operands) 'rax)))

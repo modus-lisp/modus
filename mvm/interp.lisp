@@ -627,6 +627,13 @@
   "KERNEL's result: kind 0, how many of the N u32 lanes SRC[I..] equal VAL; kind 1,
    Adler-32's (B<<16)|A after the N bytes SRC[I..], from VAL = (B<<16)|A, reduced
    mod 65521 every 5552 bytes as the native arm does."
+  (when (= kind 2)
+    (let ((k 0))
+      (loop (when (>= k n) (return nil))
+        (let ((v (%prim-aref src (+ i k))))
+          (%prim-aset src (+ i k) (if (>= v val) (- v val) -1)))
+        (setq k (+ k 1))))
+    (return-from %interp-kernel 0))
   (if (= kind 0)
       (let ((k 0))
         (loop (when (or (>= k n) (/= (%c32-ref src (+ i k)) val)) (return k))

@@ -2437,6 +2437,15 @@
     (setq modus.mvm::*ir-dce-roots* (list "KERNEL-MAIN" "%%UNRESOLVED-FN"))
     ;; and initialises globals without a HANDLER-CASE around each
     (setq modus.mvm::*init-globals-unguarded* t)
+    ;; MODUS_HOT_ORDER=FILE: one function name a line, laid out first in that
+    ;; order -- a profile of what boot runs (qemu -d in_asm + MODUS_SYMMAP)
+    (let ((f (sb-ext:posix-getenv "MODUS_HOT_ORDER")))
+      (when (and f (plusp (length f)))
+        (setq modus.mvm::*ir-hot-order*
+              (with-open-file (in f)
+                (loop for l = (read-line in nil) while l
+                      when (plusp (length (string-trim " " l)))
+                        collect (string-upcase (string-trim " " l)))))))
     (defvar *sft-auto-source* "")
     (defvar *sym-name-auto-source* "")
     (defvar *runtime-macros-source* "")

@@ -2251,6 +2251,12 @@
    %TAKE-PENDING-FAULT, MAKE-CONDITION, the printer and FORMAT.  Set by the
    MODUS_LEAN_BOOT builds; NIL everywhere else.")
 
+(defvar *ir-hot-order* nil
+  "NIL, or function names (upcased strings) to lay out FIRST, in this order,
+   ahead of every other kept function -- a profile of what boot executes, so
+   the pages it touches hold code that runs instead of neighbours that do not.
+   Layout only: what the image contains is unchanged.  Used with *IR-DCE-ROOTS*.")
+
 (defun %ir-dce-names (insn acc)
   "Every string and symbol name inside the IR instruction INSN, into ACC."
   (flet ((note (n)
@@ -2326,7 +2332,18 @@
                 (setf *function-table* (remove info *function-table*))))))
       (format t "~&  IR-DCE: kept ~D functions, dropped ~D (roots ~{~A~^ ~})~%"
               (length kept) dropped roots)
-      (nreverse kept))))
+      (setq kept (nreverse kept))
+      (when *ir-hot-order*
+        (let ((rank (make-hash-table :test 'equal)) (i 0))
+          (dolist (n *ir-hot-order*)
+            (unless (gethash n rank) (setf (gethash n rank) (incf i))))
+          (flet ((r (e) (or (gethash (string-upcase (string (function-info-name (car e)))) rank)
+                            most-positive-fixnum)))
+            (setq kept (stable-sort kept #'< :key #'r))
+            (format t "~&  IR-DCE: ~D of ~D hot functions laid out first~%"
+                    (count-if (lambda (e) (< (r e) most-positive-fixnum)) kept)
+                    (length *ir-hot-order*)))))
+      kept)))
 
 (defvar *gc-check-fusion-enabled* t
   "Gate for the Stage-1a size-aware gc-check peephole (fuse-gc-checks).

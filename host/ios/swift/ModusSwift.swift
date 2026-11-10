@@ -13,7 +13,7 @@
 //   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
 //   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)   (MENU handle index)   (COLOR handle rgb)
 //   (POP handle)   (NAVTAP handle)   (CONTEXT handle index)   (SWIPE handle direction)
-//   (SHARE handle completed)   (DISMISS handle)   (FADE handle)   (ROWACTION handle index)
+//   (SHARE handle completed)   (DISMISS handle)   (FADE handle)   (ROWACTION handle index)   (ZOOM handle percent)
 
 import UIKit
 
@@ -982,6 +982,112 @@ let navPushView: Call = { h, p, n, _, _, _ in
     return content
 }
 
+// attributed_label_new(text, length, x, y, w, h): a label whose text is underlined and tinted, as attributed text.
+let attributedLabelNew: Call = { p, n, x, y, w, h in
+    let label = UILabel(frame: rect(x, y, w, h))
+    let styled = NSMutableAttributedString(string: text(p, n))
+    styled.addAttributes([.underlineStyle: NSUnderlineStyle.single.rawValue, .foregroundColor: UIColor.systemTeal],
+                         range: NSRange(location: 0, length: styled.length))
+    label.attributedText = styled
+    label.numberOfLines = 0
+    return adopt(label)
+}
+
+// dynamic_label_new(text, length, x, y, w, h): a label in a text style that follows the user's text size (Dynamic
+// Type): its font scales with the content size category.
+let dynamicLabelNew: Call = { p, n, x, y, w, h in
+    let label = UILabel(frame: rect(x, y, w, h))
+    label.text = text(p, n)
+    label.font = UIFont.preferredFont(forTextStyle: .title1)
+    label.adjustsFontForContentSizeCategory = true
+    label.textColor = .white
+    return adopt(label)
+}
+
+// safe_area_top(): the top safe-area inset of the screen, in points (the status bar, the notch).
+let safeAreaTop: Call = { _, _, _, _, _, _ in
+    UInt(keyRoot()?.safeAreaInsets.top ?? 0)
+}
+
+// parallax_on(handle, amount): the view moves a little with the device's tilt, by amount points, as a parallax
+// motion effect does.
+let parallaxOn: Call = { h, amount, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let d = CGFloat(amount)
+    let horizontal = UIInterpolatingMotionEffect(keyPath: "center.x", type: .tiltAlongHorizontalAxis)
+    horizontal.minimumRelativeValue = -d
+    horizontal.maximumRelativeValue = d
+    let vertical = UIInterpolatingMotionEffect(keyPath: "center.y", type: .tiltAlongVerticalAxis)
+    vertical.minimumRelativeValue = -d
+    vertical.maximumRelativeValue = d
+    view.addMotionEffect(horizontal)
+    view.addMotionEffect(vertical)
+    return 1
+}
+
+// The zoom scroll view's delegate: its content zooms, and the zoom when it ends is a ZOOM event (the scale, in
+// percent).
+final class ModusZoom: NSObject, UIScrollViewDelegate {
+    let handle: UInt
+    let content: UIView
+
+    init(handle: UInt, content: UIView) {
+        self.handle = handle
+        self.content = content
+    }
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        content
+    }
+
+    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        send("ZOOM", [.int(Int(handle)), .int(Int(scale * 100))])
+    }
+}
+
+private var zoomDelegates: [UInt: ModusZoom] = [:]
+private var zoomContents: [UInt: UInt] = [:]
+
+// zoom_scroll_new(x, y, w, h): a scroll view whose content (zoom_content) zooms from 1x to 4x.
+let zoomScrollNew: Call = { x, y, w, h, _, _ in
+    let scroll = UIScrollView(frame: rect(x, y, w, h))
+    let content = UIView(frame: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+    content.backgroundColor = UIColor(white: 0.2, alpha: 1)
+    scroll.addSubview(content)
+    scroll.contentSize = content.frame.size
+    scroll.minimumZoomScale = 1
+    scroll.maximumZoomScale = 4
+    let handle = adopt(scroll)
+    let contentHandle = nextHandle
+    nextHandle += 1
+    views[contentHandle] = content
+    zoomContents[handle] = contentHandle
+    let delegate = ModusZoom(handle: handle, content: content)
+    scroll.delegate = delegate
+    zoomDelegates[handle] = delegate
+    return handle
+}
+
+// zoom_content(scroll): the content view of a zoom scroll view, to add to with ui_add.
+let zoomContent: Call = { h, _, _, _, _, _ in
+    zoomContents[h] ?? 0
+}
+
+// drawn_image_new(kind, rgb, size, x, y): an image drawn here, a filled oval (kind 0) or rounded square (1) in rgb,
+// shown as a square of size points.
+let drawnImageNew: Call = { kind, rgb, size, x, y, _ in
+    let s = CGFloat(size)
+    let renderer = UIGraphicsImageRenderer(size: CGSize(width: s, height: s))
+    let image = renderer.image { _ in
+        colorOf(rgb).setFill()
+        let frame = CGRect(x: 0, y: 0, width: s, height: s)
+        (kind == 0 ? UIBezierPath(ovalIn: frame) : UIBezierPath(roundedRect: frame, cornerRadius: s / 4)).fill()
+    }
+    let view = UIImageView(image: image)
+    view.frame = CGRect(x: CGFloat(x), y: CGFloat(y), width: s, height: s)
+    return adopt(view)
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1244,6 +1350,13 @@ public func modusSwiftInstall() {
     register("ui_nav_controller_new", navControllerNew)
     register("ui_nav_root", navRoot)
     register("ui_nav_push_view", navPushView)
+    register("ui_attributed_label_new", attributedLabelNew)
+    register("ui_dynamic_label_new", dynamicLabelNew)
+    register("ui_safe_area_top", safeAreaTop)
+    register("ui_parallax_on", parallaxOn)
+    register("ui_zoom_scroll_new", zoomScrollNew)
+    register("ui_zoom_content", zoomContent)
+    register("ui_drawn_image_new", drawnImageNew)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

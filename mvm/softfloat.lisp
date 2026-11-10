@@ -411,14 +411,14 @@
 
 ;;; Packed single-float lanes: raw IEEE32 bits in the CPU's byte order from
 ;;; byte 4i of the payload -- the layout %F32-BITS-REF-NARROW reads.
-(defun %sf-lane-check (arr i) (%f32-lane-check arr i))
+(defun %sf-lane-check (arr i) (modus.runtime::%f32-lane-check arr i))
 
 (defun %sf-f32-load (arr i)
   (%sf-lane-check arr i)
-  (let* ((b0 (%u8-ref-unchecked arr (%f32-lane-byte i 0)))
-         (b1 (%u8-ref-unchecked arr (%f32-lane-byte i 1)))
-         (b2 (%u8-ref-unchecked arr (%f32-lane-byte i 2)))
-         (b3 (%u8-ref-unchecked arr (%f32-lane-byte i 3)))
+  (let* ((b0 (%u8-ref-unchecked arr (modus.runtime::%f32-lane-byte i 0)))
+         (b1 (%u8-ref-unchecked arr (modus.runtime::%f32-lane-byte i 1)))
+         (b2 (%u8-ref-unchecked arr (modus.runtime::%f32-lane-byte i 2)))
+         (b3 (%u8-ref-unchecked arr (modus.runtime::%f32-lane-byte i 3)))
          (sign (ash b3 -7))
          (e8 (+ (* (logand b3 127) 2) (ash b2 -7)))
          (m23 (+ (* (logand b2 127) 65536) (* b1 256) b0)))
@@ -443,8 +443,8 @@
                         (if (< q 8388608)
                             (setq m23 q)                         ; subnormal
                             (setq e8 (+ e3 23 127) m23 (- q 8388608))))))))))
-    (%u8-set-unchecked arr (%f32-lane-byte i 0) (logand m23 255))
-    (%u8-set-unchecked arr (%f32-lane-byte i 1) (logand (ash m23 -8) 255))
-    (%u8-set-unchecked arr (%f32-lane-byte i 2) (+ (logand (ash m23 -16) 127) (* (logand e8 1) 128)))
-    (%u8-set-unchecked arr (%f32-lane-byte i 3) (+ (* sign 128) (ash e8 -1)))
+    (%u8-set-unchecked arr (modus.runtime::%f32-lane-byte i 0) (logand m23 255))
+    (%u8-set-unchecked arr (modus.runtime::%f32-lane-byte i 1) (logand (ash m23 -8) 255))
+    (%u8-set-unchecked arr (modus.runtime::%f32-lane-byte i 2) (+ (logand (ash m23 -16) 127) (* (logand e8 1) 128)))
+    (%u8-set-unchecked arr (modus.runtime::%f32-lane-byte i 3) (+ (* sign 128) (ash e8 -1)))
     x))

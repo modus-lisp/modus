@@ -27,10 +27,12 @@
 (defun %u8-set-unchecked (a i v) (setf (aref a i) v))
 (defun %prim-array-length (a) (floor (length a) 4))
 ;; prelude's lane helpers, little-endian layout (the big-endian arm only
-;; permutes the four byte offsets)
-(defun %f32-lane-check (a i)
+;; permutes the four byte offsets).  softfloat.lisp names them in the runtime's
+;; package, as the image's pkg-check requires, so they are defined there.
+(defpackage :modus.runtime (:use))
+(defun modus.runtime::%f32-lane-check (a i)
   (unless (and (integerp i) (>= i 0) (< i (%prim-array-length a))) (error "lane ~D" i)))
-(defun %f32-lane-byte (i k) (+ (* 4 i) k))
+(defun modus.runtime::%f32-lane-byte (i k) (+ (* 4 i) k))
 (load (merge-pathnames "../mvm/softfloat.lisp" (directory-namestring *load-truename*)))
 
 (defun box (d) (let* ((hi (cl:logand (sb-kernel:double-float-high-bits d) #xFFFFFFFF))

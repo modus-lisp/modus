@@ -1244,6 +1244,63 @@
 ;;; staging page.  NIL = not handled, and the caller takes the element path
 ;;; exactly as before.  (Reading has its own bulk path, %FS-READ-U8-BULK.)
 
+(defun %fs-page-copy (seq i n page)
+  "Copy SEQ[I, I+N) into the raw I/O page at PAGE.  SEQ is a simple (unsigned-byte 8) array:
+   the typed loop is ~5x the untyped one (an AREF dispatch per byte), which is what a RFB
+   frame's 1.2 MB write-sequence paid on every update.  Unrolled by four: the loop's own
+   bookkeeping was a third of the copy (measured 2.5 ms against 3.6 ms per 1.2 MB)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) seq) (fixnum i n page) (optimize (speed 3) (safety 0)))
+  (let ((j 0) (p page) (k i))
+    (declare (fixnum j p k))
+    (loop (when (>= j (- n 3)) (return))
+      (setf (mem-ref p :u8) (aref seq k)
+            (mem-ref (+ p 1) :u8) (aref seq (+ k 1))
+            (mem-ref (+ p 2) :u8) (aref seq (+ k 2))
+            (mem-ref (+ p 3) :u8) (aref seq (+ k 3)))
+      (setq p (+ p 4) k (+ k 4) j (+ j 4)))
+    (loop (when (>= j n) (return))
+      (setf (mem-ref p :u8) (aref seq k))
+      (setq p (+ p 1) k (+ k 1) j (+ j 1)))))
+
+(defun %fs-page-flush (fd page n)
+  "Write the N bytes at the raw PAGE to FD, all of them (EINTR and EAGAIN again)."
+  (let ((off 0))
+    (loop
+      (when (>= off n) (return nil))
+      (let ((w (%sys-write-raw fd (+ page off) (- n off))))
+        (cond ((> w 0) (setq off (+ off w)))
+              ((or (= w -4) (= w -11)) nil)
+              (t (error "write: failed (~d)" w)))))))
+
+(defun %fs-write-pixel-rows (stream px fw x y w h)
+  "Write the rectangle (X,Y,W,H) of PX (an (unsigned-byte 32) array, row stride FW) to the
+   buffered SOCKET output STREAM as 4-byte little-endian pixels, B G R 0 -- RFB's Raw
+   encoding for a 32bpp true-colour client.  The pixel word IS those bytes (the top byte is
+   masked to 0), so each pixel is one store into the I/O page, which goes out 4 KB at a time.
+   Nothing is built in a byte array first: a 640x480 frame was 2.6 ms of fill plus ~3 ms of
+   byte copy, and this is 0.8 ms.  Returns T when it wrote the rectangle.  Returns NIL, having
+   written nothing, unless STREAM is a buffered socket output: the caller takes its byte path."
+  (declare (type (simple-array (unsigned-byte 32) (*)) px) (fixnum fw x y w h)
+           (optimize (speed 3) (safety 0)))
+  (let ((fd (%fs-fd stream)))
+    (unless (%fs-obuf-p stream fd) (return-from %fs-write-pixel-rows nil))
+    ;; whatever the stream already holds (the rectangle header, written byte by byte) goes first
+    (%fs-oflush stream)
+    (let* ((page (modus-int::%sock-io-buf)) (cap (modus-int::%sock-io-cap)) (n 0) (total 0))
+      (declare (fixnum n total cap))
+      (loop for yy fixnum from y below (+ y h) for row fixnum = (* yy fw) do
+        (loop for xx fixnum from x below (+ x w) do
+          (setf (mem-ref (+ page n) :u32) (logand (aref px (+ row xx)) #xffffff))
+          (setq n (+ n 4))
+          (when (= n cap)
+            (%fs-page-flush fd page cap)
+            (setq total (+ total cap) n 0))))
+      (when (> n 0)
+        (%fs-page-flush fd page n)
+        (setq total (+ total n)))
+      (%fs-set-pos stream (+ (%fs-pos stream) total))
+      t)))
+
 (defun %fs-bulk-ok-p (stream seq)
   (and (streamp stream) (= (%stream-type stream) 9)
        (>= (%fs-fd stream) 0)
@@ -1329,14 +1386,22 @@
       (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
       (return-from %fs-write-bytes t))
     (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
-      (let ((page (%fs-io-page)) (i start))
+      ;; a socket goes out through the per-CPU socket buffer when there is one (64 KB, not 4 KB:
+      ;; each write(2) is a wakeup for the reader, and a 98 KB ZRLE frame was 25 of them)
+      (let* ((sock (%fs-obuf-p stream fd))
+             (page (if sock (modus-int::%sock-io-buf) (%fs-io-page)))
+             (chunk (if sock (modus-int::%sock-io-cap) 4096))
+             (i start))
         (loop
           (when (>= i end) (return nil))
-          (let ((n (min 4096 (- end i))) (j 0) (off 0))
-            (loop
-              (when (>= j n) (return nil))
-              (setf (mem-ref (+ page j) :u8) (aref seq (+ i j)))
-              (setq j (+ j 1)))
+          (let ((n (min chunk (- end i))) (off 0))
+            (if (typep seq '(simple-array (unsigned-byte 8) (*)))
+                (%fs-page-copy seq i n page)
+                (let ((j 0))
+                  (loop
+                    (when (>= j n) (return nil))
+                    (setf (mem-ref (+ page j) :u8) (aref seq (+ i j)))
+                    (setq j (+ j 1)))))
             (loop
               (when (>= off n) (return nil))
               (let ((w (%sys-write-raw fd (+ page off) (- n off))))

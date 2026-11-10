@@ -10,6 +10,7 @@
 //
 // Events, as terms, oldest first (ui_events_next):
 //   (TAP handle)   (SWITCH handle on)   (SLIDER handle value: a double)   (TEXT handle)   (SELECT handle index)
+//   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
 
 import UIKit
 
@@ -21,6 +22,8 @@ private var nextHandle: UInt = 1
 private var scrollContent: [UInt: UIStackView] = [:]
 // A list's handle maps to its data source (a UITableView keeps its data source weakly).
 private var lists: [UInt: ModusList] = [:]
+// A text view's delegate is weak in UIKit, so the view's handle keeps it here.
+private var textViewDelegates: [UInt: ModusTextView] = [:]
 private var events: [Term] = []
 
 private func send(_ name: String, _ args: [Term]) {
@@ -164,6 +167,153 @@ let textFieldNew: Call = { p, n, x, y, w, h in
     return handle
 }
 
+// text_view_new(text, length, x, y, w, h): a multi-line text view.  Its changes send TEXT events; a text view
+// has no UIAction, so the delegate below does the sending.
+final class ModusTextView: NSObject, UITextViewDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func textViewDidChange(_ textView: UITextView) {
+        send("TEXT", [.int(Int(handle))])
+    }
+}
+
+let textViewNew: Call = { p, n, x, y, w, h in
+    let view = UITextView(frame: rect(x, y, w, h))
+    view.text = text(p, n)
+    view.font = .systemFont(ofSize: 18)
+    view.textColor = .white
+    view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    view.layer.cornerRadius = 8
+    let handle = adopt(view)
+    let delegate = ModusTextView(handle: handle)
+    view.delegate = delegate
+    textViewDelegates[handle] = delegate
+    return handle
+}
+
+// The titles out of a term: a list of strings (segmented_new's data).
+private func titlesOf(_ p: UInt, _ n: UInt) -> [String] {
+    guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else { return [] }
+    let bytes = Array(UnsafeRawBufferPointer(start: base, count: Int(n)))
+    guard let items = (try? decodeTerm(bytes))?.listItems else { return [] }
+    return items.compactMap { item -> String? in
+        if case .string(let s) = item { return s }
+        return nil
+    }
+}
+
+// segmented_new(titles, length, x, y, w, h): a segmented control, one segment per title (a term: a list of
+// strings).  Choosing a segment sends a SELECT event with its index.
+let segmentedNew: Call = { p, n, x, y, w, h in
+    let titles = titlesOf(p, n)
+    let control = UISegmentedControl(items: titles)
+    control.frame = rect(x, y, w, h)
+    if !titles.isEmpty { control.selectedSegmentIndex = 0 }
+    let handle = adopt(control)
+    control.addAction(UIAction { _ in send("SELECT", [.int(Int(handle)), .int(control.selectedSegmentIndex)]) },
+                      for: .valueChanged)
+    return handle
+}
+
+// progress_new(percent, x, y, w, h): a progress bar, from 0 to 100 (set_value moves it).
+let progressNew: Call = { percent, x, y, w, h, _ in
+    let bar = UIProgressView(progressViewStyle: .default)
+    bar.frame = rect(x, y, w, h)
+    bar.progressTintColor = .white
+    bar.trackTintColor = UIColor(white: 0.3, alpha: 1)
+    bar.progress = Float(min(percent, 100)) / 100
+    return adopt(bar)
+}
+
+// spinner_new(x, y, w, h): an activity indicator, spinning until set_value stops it (0) or starts it (1).
+let spinnerNew: Call = { x, y, w, h, _, _ in
+    let spinner = UIActivityIndicatorView(style: .medium)
+    spinner.frame = rect(x, y, w, h)
+    spinner.color = .white
+    spinner.startAnimating()
+    return adopt(spinner)
+}
+
+// stepper_new(value, x, y): a stepper from 0 to 100, one step at a time.  Each change sends a STEP event with
+// its value (a double).
+let stepperNew: Call = { value, x, y, _, _, _ in
+    let stepper = UIStepper()
+    stepper.minimumValue = 0
+    stepper.maximumValue = 100
+    stepper.stepValue = 1
+    stepper.value = Double(value)
+    stepper.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
+    stepper.sizeToFit()
+    let handle = adopt(stepper)
+    stepper.addAction(UIAction { _ in send("STEP", [.int(Int(handle)), .double(stepper.value)]) },
+                      for: .valueChanged)
+    return handle
+}
+
+// page_new(pages, current, x, y): a page control, a dot per page, the current one lit.  A tap on a dot sends a
+// PAGE event with its index.
+let pageNew: Call = { pages, current, x, y, _, _ in
+    let control = UIPageControl()
+    control.numberOfPages = Int(pages)
+    control.currentPage = Int(current)
+    control.pageIndicatorTintColor = UIColor(white: 0.35, alpha: 1)
+    control.currentPageIndicatorTintColor = .white
+    control.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
+    control.sizeToFit()
+    let handle = adopt(control)
+    control.addAction(UIAction { _ in send("PAGE", [.int(Int(handle)), .int(control.currentPage)]) },
+                      for: .valueChanged)
+    return handle
+}
+
+// date_new(seconds, x, y): a date picker showing the date (seconds since 1970), compact.  A change sends a DATE
+// event with the new date's seconds (a double).
+let dateNew: Call = { seconds, x, y, _, _, _ in
+    let picker = UIDatePicker()
+    picker.datePickerMode = .date
+    picker.preferredDatePickerStyle = .compact
+    picker.overrideUserInterfaceStyle = .dark
+    picker.date = Date(timeIntervalSince1970: TimeInterval(seconds))
+    picker.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
+    picker.sizeToFit()
+    let handle = adopt(picker)
+    picker.addAction(UIAction { _ in send("DATE", [.int(Int(handle)), .double(picker.date.timeIntervalSince1970)]) },
+                     for: .valueChanged)
+    return handle
+}
+
+// A long press's target: UIKit keeps a gesture's target weakly, so the view's handle keeps it here.
+final class ModusGesture: NSObject {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    @objc func fired(_ recognizer: UILongPressGestureRecognizer) {
+        if recognizer.state == .began { send("LONGPRESS", [.int(Int(handle))]) }
+    }
+}
+
+private var gestureTargets: [UInt: ModusGesture] = [:]
+
+// long_press_on(handle, ms): a long press on the view, held at least ms milliseconds, sends a LONGPRESS event with
+// the view's handle.  Once per press, when UIKit recognises it.
+let longPressOn: Call = { h, ms, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let target = ModusGesture(handle: h)
+    let recognizer = UILongPressGestureRecognizer(target: target, action: #selector(ModusGesture.fired(_:)))
+    recognizer.minimumPressDuration = Double(ms) / 1000
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(recognizer)
+    gestureTargets[h] = target
+    return 1
+}
+
 // panel_new(x, y, w, h, rgb): a plain view of one colour; w = 0 makes it the whole screen.
 let panelNew: Call = { x, y, w, h, rgb, _ in
     let frame = w == 0
@@ -237,16 +387,29 @@ let setText: Call = { h, p, n, _, _, _ in
         button.setTitle(s, for: .normal)
     } else if let field = views[h] as? UITextField {
         field.text = s
+    } else if let view = views[h] as? UITextView {
+        view.text = s
     }
     return 0
 }
 
-// set_value(handle, value): a switch's state (0 or 1) or a slider's value (0..100).
+// set_value(handle, value): a switch's state (0 or 1), a slider's value (0..100), a progress bar's percent
+// (0..100), or an activity indicator's state (0 stops it, 1 starts it).
 let setValue: Call = { h, value, _, _, _, _ in
     if let sw = views[h] as? UISwitch {
         sw.isOn = value != 0
     } else if let slider = views[h] as? UISlider {
         slider.value = Float(value)
+    } else if let bar = views[h] as? UIProgressView {
+        bar.progress = Float(min(value, 100)) / 100
+    } else if let spinner = views[h] as? UIActivityIndicatorView {
+        if value != 0 { spinner.startAnimating() } else { spinner.stopAnimating() }
+    } else if let stepper = views[h] as? UIStepper {
+        stepper.value = Double(value)
+    } else if let page = views[h] as? UIPageControl {
+        page.currentPage = Int(value)
+    } else if let picker = views[h] as? UIDatePicker {
+        picker.date = Date(timeIntervalSince1970: TimeInterval(value))
     }
     return 0
 }
@@ -254,7 +417,7 @@ let setValue: Call = { h, value, _, _, _, _ in
 // text_value(handle, buffer, capacity): the text of a text field or label, as UTF-8 at the buffer if it
 // fits; the length of the text in bytes either way (0 for no text).
 let textValue: Call = { h, buf, cap, _, _, _ in
-    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? ""
+    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? (views[h] as? UITextView)?.text ?? ""
     let bytes = Array(s.utf8)
     if !bytes.isEmpty, bytes.count <= Int(cap), let out = UnsafeMutableRawPointer(bitPattern: buf) {
         bytes.withUnsafeBytes { out.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
@@ -351,6 +514,14 @@ public func modusSwiftInstall() {
     register("ui_switch_new", switchNew)
     register("ui_slider_new", sliderNew)
     register("ui_text_field_new", textFieldNew)
+    register("ui_text_view_new", textViewNew)
+    register("ui_segmented_new", segmentedNew)
+    register("ui_progress_new", progressNew)
+    register("ui_spinner_new", spinnerNew)
+    register("ui_stepper_new", stepperNew)
+    register("ui_page_new", pageNew)
+    register("ui_date_new", dateNew)
+    register("ui_long_press_on", longPressOn)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

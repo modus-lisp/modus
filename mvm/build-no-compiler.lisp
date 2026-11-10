@@ -347,6 +347,10 @@
     "%INIT-READER" "%INIT-CONDITION-TYPES" "%INIT-METHOD-COMBINATIONS"
     "%INIT-CLOS-PROTOCOL" "%INIT-SIGNAL-HANDLING" "%INIT-SIGNAL-SYMBOLS"
     "%INIT-MAKE-LOAD-FORM" "%INSTALL-RUNTIME-BACKQUOTE" "%SEAT-BACKQUOTE-MARKERS"
+    ;; registering every static keyword in the runtime keyword table: that
+    ;; only keeps a keyword interned AT RUN TIME (reader, INTERN) EQ to the
+    ;; literal, and a keyword literal loads its static object either way
+    "%SEED-STATIC-KEYWORDS"
     ;; RT, the MODUS package, the JIT and the deferred surfaces
     "%INSTALL-DEFTEST-MACRO" "%INIT-RTEST" "%INIT-MODUS-PACKAGE" "%JIT-BOOT-INIT"
     "%DEFER-BOOT-SURFACES")

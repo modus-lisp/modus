@@ -212,18 +212,38 @@
 
 ;;; ---- lean boot ----------------------------------------------------------------
 
+(defun %nc-inner-form (form)
+  "Text of the first parenthesized subform of FORM, or NIL."
+  (let ((p (position #\( form :start 1)))
+    (and p (let ((e (%nc-form-end form p))) (and e (subseq form p e))))))
+
 (defun %nc-form-calls (form)
-  "The function a KERNEL-MAIN body form calls: its head, or for
-   (HANDLER-CASE (F ...) ...) the F it guards."
+  "The function a KERNEL-MAIN body form calls: its head; for
+   (HANDLER-CASE (F ...) ...) the F it guards; for (WHEN (F ...) ...) the F
+   it tests."
   (multiple-value-bind (head) (%nc-head-and-name form)
-    (if (and head (string= head "HANDLER-CASE"))
-        (let ((p (position #\( form :start 1)))
-          (and p (values (%nc-head-and-name (subseq form p)))))
+    (if (and head (member head '("HANDLER-CASE" "WHEN") :test #'string=))
+        (let ((inner (%nc-inner-form form)))
+          (and inner (values (%nc-head-and-name inner))))
         head)))
+
+(defparameter *nc-lean-boot-replace*
+  '(("%INIT-PACKAGES"
+     . "(progn (setq modus.runtime::*pkg-tag* 987654321)
+       (setq modus.runtime::*sym-tag* 123456789)
+       (setq modus.runtime::*all-packages* nil)
+       (setq modus.runtime::*pkg-any-local-nicknames* nil)
+       (modus.runtime::%init-pkg-by-hash))"))
+  "MODUS_LEAN_BOOT: KERNEL-MAIN steps replaced rather than skipped.
+   %INIT-PACKAGES builds COMMON-LISP, CL-USER, KEYWORD and MODUS and interns and
+   exports their symbols; a lean image keeps only its first lines -- the type
+   tags and an EMPTY package-by-hash table -- so the quoted symbols the code
+   touches are interned lazily, with no home package.")
 
 (defun %nc-lean-kernel-main (text skip)
   "TEXT with every top-level form of KERNEL-MAIN's body that calls a name in
-   SKIP (upcased strings) removed.  Returns (values TEXT REMOVED)."
+   SKIP (upcased strings) removed, and every remaining (HANDLER-CASE (F ...)
+   ...) reduced to (F ...).  Returns (values TEXT REMOVED)."
   (let* ((start (search "(defun kernel-main ()" text))
          (span (and start (find start (%nc-form-spans text) :key #'car))))
     (unless span (error "lean boot: no (defun kernel-main () ...) in the driver source"))
@@ -236,9 +256,16 @@
                        (let* ((form (subseq body (car sp) (cdr sp)))
                               (calls (%nc-form-calls form)))
                          (write-string body out :start pos :end (car sp))
-                         (if (and calls (member calls skip :test #'string=))
-                             (push calls removed)
-                             (write-string form out))
+                         (cond ((and calls (assoc calls *nc-lean-boot-replace* :test #'string=))
+                                (push (format nil "~A(replaced)" calls) removed)
+                                (write-string (cdr (assoc calls *nc-lean-boot-replace* :test #'string=)) out))
+                               ((and calls (member calls skip :test #'string=))
+                                (push calls removed))
+                               ;; (HANDLER-CASE (F ...) ...) runs as (F ...): a
+                               ;; lean image carries no condition system for it
+                               ((string= (or (%nc-head-and-name form) "") "HANDLER-CASE")
+                                (write-string (%nc-inner-form form) out))
+                               (t (write-string form out)))
                          (setf pos (cdr sp))))
                      (write-string body out :start pos)))))
       (values (concatenate 'string (subseq text 0 open) kept ")" (subseq text (cdr span)))

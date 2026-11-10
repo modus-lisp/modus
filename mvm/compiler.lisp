@@ -2243,6 +2243,14 @@
    out-of-line +.  Set by the MODUS_LEAN_BOOT builds; NIL everywhere else, so
    every other image is unchanged.")
 
+(defvar *init-globals-unguarded* nil
+  "When T, INIT-ALL-GLOBALS and %RUN-NIL-DEFVAR-INITS call each defvar init
+   thunk directly instead of inside a HANDLER-CASE.  A failing initform then
+   stops boot instead of leaving its variable NIL, and the image needs no
+   condition system to initialise its globals -- the guard alone reaches
+   %TAKE-PENDING-FAULT, MAKE-CONDITION, the printer and FORMAT.  Set by the
+   MODUS_LEAN_BOOT builds; NIL everywhere else.")
+
 (defun %ir-dce-names (insn acc)
   "Every string and symbol name inside the IR instruction INSN, into ACC."
   (flet ((note (n)
@@ -32165,8 +32173,10 @@
       ;; the current package, which is MODUS.MVM at build time anyway.
       (let ((pkg (or (%build-mvm-package) *package*)))
         (dolist (thunk-name (nreverse *init-thunk-names*))
-          (push `(handler-case (,(intern thunk-name pkg))
-                   (t (c) nil))
+          (push (if *init-globals-unguarded*
+                    `(,(intern thunk-name pkg))
+                    `(handler-case (,(intern thunk-name pkg))
+                       (t (c) nil)))
                 init-calls)))
       (let* ((result (mvm-compile-toplevel
                        `(defun init-all-globals ()
@@ -32180,7 +32190,10 @@
       (let ((nil-calls nil)
             (pkg (or (%build-mvm-package) *package*)))
         (dolist (thunk-name (reverse *init-nil-thunk-names*))
-          (push `(handler-case (,(intern thunk-name pkg)) (t (c) nil)) nil-calls))
+          (push (if *init-globals-unguarded*
+                    `(,(intern thunk-name pkg))
+                    `(handler-case (,(intern thunk-name pkg)) (t (c) nil)))
+                nil-calls))
         (let* ((result (mvm-compile-toplevel
                          `(defun %run-nil-defvar-inits () ,@(nreverse nil-calls) nil)))
                (info (car result))

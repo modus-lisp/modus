@@ -1516,7 +1516,15 @@
          (setq value (cdr value) n (+ n 1)))
        (when value (%note-quoted value (+ depth 1)))))))
 
+(defvar *fn-global-refs* nil
+  "While %IR-DCE is on (*IR-DCE-ROOTS*): function name -> the globals it
+   READS, by name.  A global read compiles to a cached cell load keyed by name
+   hash, so the IR does not carry the name; this does.")
+
 (defun %note-global (sym kind)
+  (when (and *fn-global-refs* (eq kind :ref) (symbolp sym) sym *current-function-name*)
+    (push (symbol-name sym)
+          (gethash (string-upcase *current-function-name*) *fn-global-refs*)))
   (when (and *global-uses* (symbolp sym) sym (not *mvm-eval-runtime-p*))
     (let* ((p (symbol-package sym))
            (k (cons (if p (package-name p) "") (symbol-name sym))))
@@ -2294,16 +2302,35 @@
           (when q (setf (gethash (string-upcase q) by-name) (list e))))))
     (unless (some (lambda (r) (gethash (string-upcase r) by-name)) roots)
       (return-from %ir-dce all-ir))         ; not an image: nothing to enter it by
+    ;; The global initialisers: INIT-ALL-GLOBALS and %RUN-NIL-DEFVAR-INITS call
+    ;; every defvar's init thunk (INIT-<name>).  Under *INIT-GLOBALS-UNGUARDED*
+    ;; they do not reach those thunks; READING a global does -- by a recorded
+    ;; read (*FN-GLOBAL-REFS*) or by its name in the IR (SYMBOL-VALUE of a
+    ;; quoted name) -- so only globals something kept reads are initialised.
     (flet ((want (n) (when (and (gethash n by-name) (not (gethash n seen)))
                        (setf (gethash n seen) t (gethash n parent) from)
-                       (setq work (nconc work (list n))))))   ; breadth first
+                       (setq work (nconc work (list n)))))   ; breadth first
+           (driver-p (n) (and *init-globals-unguarded* *fn-global-refs*
+                              (member (let ((c (position #\: n :from-end t)))
+                                        (if c (subseq n (1+ c)) n))
+                                      '("INIT-ALL-GLOBALS" "%RUN-NIL-DEFVAR-INITS")
+                                      :test #'string=))))
       (dolist (r roots) (want (string-upcase r)))
       (loop while work
             do (let ((n (pop work)))
                  (setq from n)
                  (dolist (e (gethash n by-name))
-                   (maphash (lambda (n v) (declare (ignore v)) (want n))
-                            (%ir-dce-names (cdr e) (make-hash-table :test 'equal)))))))
+                   (let ((names (%ir-dce-names (cdr e) (make-hash-table :test 'equal))))
+                     (when *fn-global-refs*
+                       (dolist (g (gethash n *fn-global-refs*))
+                         (setf (gethash (string-upcase g) names) t)))
+                     (maphash (lambda (m v) (declare (ignore v))
+                                (unless (and (driver-p n)
+                                             (> (length m) 5) (string= "INIT-" m :end2 5))
+                                  (want m))
+                                (unless (driver-p n)
+                                  (want (concatenate 'string "INIT-" m))))
+                              names))))))
     ;; MODUS_IR_DCE_WHY=NAME,NAME...: print how each was reached
     (let ((why (sb-ext:posix-getenv "MODUS_IR_DCE_WHY")))
       (when (and why (plusp (length why)))
@@ -2315,6 +2342,28 @@
                       (loop for m = (gethash n parent) then (gethash m parent)
                             while m collect m))
               (if j (setq st (1+ j)) (return)))))))
+    (when (and *init-globals-unguarded* *fn-global-refs*)
+      (dolist (d '("INIT-ALL-GLOBALS" "%RUN-NIL-DEFVAR-INITS"))
+        (let ((e (car (gethash d by-name))) (cut 0))
+          (when e
+            (setf (cdr e)
+                  (let ((out nil))
+                    (dolist (insn (cdr e) (nreverse out))
+                      (let ((target (and (consp insn) (eq (car insn) :call) (cadr insn))))
+                        (if (and target
+                                 (let* ((tn (string-upcase (string target)))
+                                        (c (position #\: tn :from-end t))
+                                        (bare (if c (subseq tn (1+ c)) tn)))
+                                   ;; the call names it "PKG::INIT-<name>"
+                                   (and (> (length bare) 5) (string= "INIT-" bare :end2 5)
+                                        (gethash bare by-name) (not (gethash bare seen)))))
+                            (progn
+                              (incf cut)
+                              ;; and the (:set-nargs N) a call may be preceded by
+                              (when (and out (consp (car out)) (eq (caar out) :set-nargs))
+                                (pop out)))
+                            (push insn out))))))
+            (format t "~&  IR-DCE: ~A initialises ~D fewer globals~%" d cut)))))
     (let ((kept nil) (dropped 0))
       (dolist (e all-ir)
         (let* ((info (car e))
@@ -32028,6 +32077,7 @@
         (*uwp-cleanups* nil)
         (*uwp-seq-counter* 0)
         (*pending-flet-ir* nil)
+        (*fn-global-refs* (and *ir-dce-roots* (make-hash-table :test 'equal)))
         (all-ir nil))
     (declare (special *uwp-seq-counter*))   ; #248: reset per unit in-image too
     ;; REPRODUCIBLE BUILDS: reset the compiler's own gensym counter so the

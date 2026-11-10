@@ -1,9 +1,15 @@
-// ModusSwift.swift — the native components a modus app builds from Lisp: UIKit views made here,
-// named by a handle, and the events they send back.  Lisp calls these by name (modus-swift.m,
-// pseudo-syscall 1060); each runs on the main thread, where UIKit lives.
+// ModusSwift.swift — the native components a modus app builds from Lisp: UIKit views made here, named by a
+// handle, and the events they send back.  Lisp calls these by name (modus-swift.m, pseudo-syscall 1060); each
+// runs on the main thread, where UIKit lives.
 //
-// Every argument is a word.  Text is a pointer and a length: UTF-8 bytes the image holds, read here
-// in place.  A function returns a word: a handle, a value, 1 or 0, or nothing (0).
+// Words and text: every argument is a word.  Text is a pointer and a length: UTF-8 bytes the image holds,
+// read here in place.  A function returns a word: a handle, a value, 1 or 0, or nothing (0).
+//
+// Terms: structured data crosses as terms (Term.swift, the wire format of net/term.lisp): a pointer and a
+// length of encoded bytes.  Lisp sends list data (ui_list_set_data), and Swift sends its events as terms.
+//
+// Events, as terms, oldest first (ui_events_next):
+//   (TAP handle)   (SWITCH handle on)   (SLIDER handle value: a double)   (TEXT handle)   (SELECT handle index)
 
 import UIKit
 
@@ -15,10 +21,11 @@ private var nextHandle: UInt = 1
 private var scrollContent: [UInt: UIStackView] = [:]
 // A list's handle maps to its data source (a UITableView keeps its data source weakly).
 private var lists: [UInt: ModusList] = [:]
-// The events, oldest first.  kind 1: a button tapped.  2: a switch changed (value 1 on, 0 off).
-// 3: a slider changed (value 0..100).  4: a text field's text changed (read it with ui_text_value).
-// 5: a list's row selected (value: the row's index).
-private var events: [(kind: UInt, handle: UInt, value: UInt)] = []
+private var events: [Term] = []
+
+private func send(_ name: String, _ args: [Term]) {
+    events.append(.list([.symbol(name: name, package: "KEYWORD")] + args))
+}
 
 private func text(_ p: UInt, _ n: UInt) -> String {
     guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else { return "" }
@@ -45,6 +52,64 @@ private func adopt(_ v: UIView) -> UInt {
     return handle
 }
 
+// A row of a list: its title, and a subtitle when it has one.
+struct Row {
+    let title: String
+    let subtitle: String?
+}
+
+// A list of rows.  Lisp sends the rows as data (ui_list_set_data: a list of plists, each with :TITLE and
+// optionally :SUBTITLE); the table asks this object for its cells as it needs them, and a tap on a row is a
+// SELECT event.  UIKit never calls into Lisp: the rows are data it already holds.
+final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
+    var rows: [Row] = []
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        rows.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "row")
+            ?? UITableViewCell(style: .subtitle, reuseIdentifier: "row")
+        let row = rows[indexPath.row]
+        cell.textLabel?.text = row.title
+        cell.textLabel?.textColor = .white
+        cell.detailTextLabel?.text = row.subtitle
+        cell.detailTextLabel?.textColor = .lightGray
+        cell.backgroundColor = .clear
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: true)
+        send("SELECT", [.int(Int(handle)), .int(indexPath.row)])
+    }
+}
+
+// The rows out of a list term: each element a plist (:KEY value ...); keys are symbols by name.
+private func rowsOf(_ data: Term) -> [Row] {
+    guard let items = data.listItems else { return [] }
+    return items.map { item in
+        var title = ""
+        var subtitle: String?
+        let pairs = item.listItems ?? []
+        var i = 0
+        while i + 1 < pairs.count {
+            if case .symbol(let key, _) = pairs[i], case .string(let value) = pairs[i + 1] {
+                if key == "TITLE" { title = value }
+                if key == "SUBTITLE" { subtitle = value }
+            }
+            i += 2
+        }
+        return Row(title: title, subtitle: subtitle)
+    }
+}
+
 // MARK: - the components
 
 let labelNew: Call = { p, n, x, y, w, h in
@@ -61,8 +126,7 @@ let buttonNew: Call = { p, n, x, y, w, h in
     button.frame = rect(x, y, w, h)
     button.setTitle(text(p, n), for: .normal)
     let handle = adopt(button)
-    button.addAction(UIAction { _ in events.append((kind: 1, handle: handle, value: 0)) },
-                     for: .touchUpInside)
+    button.addAction(UIAction { _ in send("TAP", [.int(Int(handle))]) }, for: .touchUpInside)
     return handle
 }
 
@@ -72,7 +136,7 @@ let switchNew: Call = { on, x, y, _, _, _ in
     sw.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
     sw.isOn = on != 0
     let handle = adopt(sw)
-    sw.addAction(UIAction { _ in events.append((kind: 2, handle: handle, value: sw.isOn ? 1 : 0)) },
+    sw.addAction(UIAction { _ in send("SWITCH", [.int(Int(handle)), .int(sw.isOn ? 1 : 0)]) },
                  for: .valueChanged)
     return handle
 }
@@ -84,7 +148,7 @@ let sliderNew: Call = { value, x, y, w, h, _ in
     slider.maximumValue = 100
     slider.value = Float(value)
     let handle = adopt(slider)
-    slider.addAction(UIAction { _ in events.append((kind: 3, handle: handle, value: UInt(slider.value))) },
+    slider.addAction(UIAction { _ in send("SLIDER", [.int(Int(handle)), .double(Double(slider.value))]) },
                      for: .valueChanged)
     return handle
 }
@@ -96,8 +160,7 @@ let textFieldNew: Call = { p, n, x, y, w, h in
     field.placeholder = text(p, n)
     field.textColor = .white
     let handle = adopt(field)
-    field.addAction(UIAction { _ in events.append((kind: 4, handle: handle, value: 0)) },
-                    for: .editingChanged)
+    field.addAction(UIAction { _ in send("TEXT", [.int(Int(handle))]) }, for: .editingChanged)
     return handle
 }
 
@@ -111,40 +174,6 @@ let panelNew: Call = { x, y, w, h, rgb, _ in
                                     green: CGFloat((rgb >> 8) & 255) / 255,
                                     blue: CGFloat(rgb & 255) / 255, alpha: 1)
     return adopt(panel)
-}
-
-// set_text(handle, text, length): a label's text, a button's title, or a text field's text.
-let setText: Call = { h, p, n, _, _, _ in
-    let s = text(p, n)
-    if let label = views[h] as? UILabel {
-        label.text = s
-    } else if let button = views[h] as? UIButton {
-        button.setTitle(s, for: .normal)
-    } else if let field = views[h] as? UITextField {
-        field.text = s
-    }
-    return 0
-}
-
-// set_value(handle, value): a switch's state (0 or 1) or a slider's value (0..100).
-let setValue: Call = { h, value, _, _, _, _ in
-    if let sw = views[h] as? UISwitch {
-        sw.isOn = value != 0
-    } else if let slider = views[h] as? UISlider {
-        slider.value = Float(value)
-    }
-    return 0
-}
-
-// text_value(handle, buffer, capacity): the text of a text field or label, as UTF-8 at the buffer if
-// it fits; the length of the text in bytes either way (0 for no text).
-let textValue: Call = { h, buf, cap, _, _, _ in
-    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? ""
-    let bytes = Array(s.utf8)
-    if !bytes.isEmpty, bytes.count <= Int(cap), let out = UnsafeMutableRawPointer(bitPattern: buf) {
-        bytes.withUnsafeBytes { out.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
-    }
-    return UInt(bytes.count)
 }
 
 // stack_new(axis, spacing, x, y, w, h): a stack view, its children laid out along the axis (0 vertical,
@@ -185,8 +214,8 @@ let imageNew: Call = { p, n, x, y, w, h in
     return adopt(view)
 }
 
-// add(parent, child): the child moves into the parent: a stack's arranged children, a scroll
-// view's content, or a plain view's subviews.
+// add(parent, child): the child moves into the parent: a stack's arranged children, a scroll view's
+// content, or a plain view's subviews.
 let addChild: Call = { parent, child, _, _, _, _ in
     guard let c = views[child] else { return 0 }
     if let content = scrollContent[parent] {
@@ -199,37 +228,41 @@ let addChild: Call = { parent, child, _, _, _, _ in
     return 0
 }
 
-// A list of rows of text.  Lisp pushes the rows (ui_list_set_rows); the table asks this object for its
-// cells as it needs them, and a tap on a row is a select event (kind 5) with the row's index.  UIKit never
-// calls into Lisp: the rows are data it already holds.
-final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
-    var rows: [String] = []
-    let handle: UInt
-
-    init(handle: UInt) {
-        self.handle = handle
+// set_text(handle, text, length): a label's text, a button's title, or a text field's text.
+let setText: Call = { h, p, n, _, _, _ in
+    let s = text(p, n)
+    if let label = views[h] as? UILabel {
+        label.text = s
+    } else if let button = views[h] as? UIButton {
+        button.setTitle(s, for: .normal)
+    } else if let field = views[h] as? UITextField {
+        field.text = s
     }
-
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        rows.count
-    }
-
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let cell = tableView.dequeueReusableCell(withIdentifier: "row")
-            ?? UITableViewCell(style: .default, reuseIdentifier: "row")
-        cell.textLabel?.text = rows[indexPath.row]
-        cell.textLabel?.textColor = .white
-        cell.backgroundColor = .clear
-        return cell
-    }
-
-    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        tableView.deselectRow(at: indexPath, animated: true)
-        events.append((kind: 5, handle: handle, value: UInt(indexPath.row)))
-    }
+    return 0
 }
 
-// list_new(x, y, w, h): an empty list; its rows come from ui_list_set_rows.
+// set_value(handle, value): a switch's state (0 or 1) or a slider's value (0..100).
+let setValue: Call = { h, value, _, _, _, _ in
+    if let sw = views[h] as? UISwitch {
+        sw.isOn = value != 0
+    } else if let slider = views[h] as? UISlider {
+        slider.value = Float(value)
+    }
+    return 0
+}
+
+// text_value(handle, buffer, capacity): the text of a text field or label, as UTF-8 at the buffer if it
+// fits; the length of the text in bytes either way (0 for no text).
+let textValue: Call = { h, buf, cap, _, _, _ in
+    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? ""
+    let bytes = Array(s.utf8)
+    if !bytes.isEmpty, bytes.count <= Int(cap), let out = UnsafeMutableRawPointer(bitPattern: buf) {
+        bytes.withUnsafeBytes { out.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
+    }
+    return UInt(bytes.count)
+}
+
+// list_new(x, y, w, h): an empty list; its rows come from ui_list_set_data.
 let listNew: Call = { x, y, w, h, _, _ in
     let table = UITableView(frame: rect(x, y, w, h), style: .plain)
     table.backgroundColor = .clear
@@ -241,20 +274,24 @@ let listNew: Call = { x, y, w, h, _, _ in
     return handle
 }
 
-// list_set_rows(handle, text, length): the rows, one per line of the text (none for an empty text).
-let listSetRows: Call = { h, p, n, _, _, _ in
-    let s = text(p, n)
-    lists[h]?.rows = s.isEmpty ? [] : s.components(separatedBy: "\n")
+// list_set_data(handle, bytes, length): the rows, from a term (a list of plists).  The bytes are read here
+// in place; a term that is not a list of plists leaves the list empty.
+let listSetData: Call = { h, p, n, _, _, _ in
+    guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else {
+        lists[h]?.rows = []
+        (views[h] as? UITableView)?.reloadData()
+        return 0
+    }
+    let bytes = Array(UnsafeRawBufferPointer(start: base, count: Int(n)))
+    let rows: [Row]
+    do {
+        rows = rowsOf(try decodeTerm(bytes))
+    } catch {
+        print("list_set_data: \(error)")
+        rows = []
+    }
+    lists[h]?.rows = rows
     (views[h] as? UITableView)?.reloadData()
-    return 0
-}
-
-// resign(handle): the keyboard goes away.  endEditing ends editing in the whole screen, so the
-// first responder goes whichever view holds it: a text field, or the desk (which takes keys too).
-let resign: Call = { _, _, _, _, _, _ in
-    keyRoot()?.endEditing(true)
-    // and whatever is the first responder now, wherever it is, gives it up
-    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     return 0
 }
 
@@ -273,22 +310,30 @@ let removeView: Call = { h, _, _, _, _, _ in
     return 0
 }
 
-// send_tap(handle): a tap on a button, sent as the touch itself would send it (the events then
-// come back as any tap does).  For tests and for automation; a user's taps need no call.
+// send_tap(handle): a tap on a button, sent as the touch itself would send it (the events then come back as
+// any tap does).  For tests and for automation; a user's taps need no call.
 let sendTap: Call = { h, _, _, _, _, _ in
     (views[h] as? UIControl)?.sendActions(for: .touchUpInside)
     return 0
 }
 
-// events_next(buffer): the oldest event, as three words (kind, handle, value) at the buffer; 1 if
-// there was one, 0 if not.
-let eventsNext: Call = { buf, _, _, _, _, _ in
-    guard !events.isEmpty, let out = UnsafeMutableRawPointer(bitPattern: buf) else { return 0 }
-    let e = events.removeFirst()
-    out.storeBytes(of: e.kind, toByteOffset: 0, as: UInt.self)
-    out.storeBytes(of: e.handle, toByteOffset: 8, as: UInt.self)
-    out.storeBytes(of: e.value, toByteOffset: 16, as: UInt.self)
-    return 1
+// resign(): the keyboard goes away.  endEditing ends editing in the whole screen, and the responder chain
+// then resigns whatever is the first responder, a text field or the desk (which takes keys too).
+let resign: Call = { _, _, _, _, _, _ in
+    keyRoot()?.endEditing(true)
+    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    return 0
+}
+
+// events_next(buffer, capacity): the oldest event, encoded as a term into the buffer; its length in bytes, or 0
+// if there is none (or it does not fit, which an event never does at 1 KB).
+let eventsNext: Call = { buf, cap, _, _, _, _ in
+    guard let e = events.first, let out = UnsafeMutableRawPointer(bitPattern: buf) else { return 0 }
+    let bytes = e.encoded()
+    guard bytes.count <= Int(cap) else { return 0 }
+    events.removeFirst()
+    bytes.withUnsafeBytes { out.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
+    return UInt(bytes.count)
 }
 
 // MARK: - registration
@@ -311,14 +356,14 @@ public func modusSwiftInstall() {
     register("ui_scroll_new", scrollNew)
     register("ui_image_new", imageNew)
     register("ui_add", addChild)
-    register("ui_resign", resign)
-    register("ui_list_new", listNew)
-    register("ui_list_set_rows", listSetRows)
     register("ui_set_text", setText)
     register("ui_set_value", setValue)
     register("ui_text_value", textValue)
+    register("ui_list_new", listNew)
+    register("ui_list_set_data", listSetData)
     register("ui_set_frame", setFrame)
     register("ui_remove", removeView)
     register("ui_send_tap", sendTap)
+    register("ui_resign", resign)
     register("ui_events_next", eventsNext)
 }

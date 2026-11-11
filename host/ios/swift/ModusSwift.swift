@@ -21,7 +21,7 @@ import UIKit
 typealias Call = @convention(c) (UInt, UInt, UInt, UInt, UInt, UInt) -> UInt
 
 private var views: [UInt: UIView] = [:]
-private var nextHandle: UInt = 1
+var nextHandle: UInt = 1
 // A scroll view's handle maps to the stack that holds its children (ui_add puts them there).
 private var scrollContent: [UInt: UIStackView] = [:]
 // A list's handle maps to its data source (a UITableView keeps its data source weakly).
@@ -34,12 +34,12 @@ private func send(_ name: String, _ args: [Term]) {
     events.append(.list([.symbol(name: name, package: "KEYWORD")] + args))
 }
 
-private func text(_ p: UInt, _ n: UInt) -> String {
+func text(_ p: UInt, _ n: UInt) -> String {
     guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else { return "" }
     return String(decoding: UnsafeRawBufferPointer(start: base, count: Int(n)), as: UTF8.self)
 }
 
-private func rect(_ x: UInt, _ y: UInt, _ w: UInt, _ h: UInt) -> CGRect {
+func rect(_ x: UInt, _ y: UInt, _ w: UInt, _ h: UInt) -> CGRect {
     CGRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(w), height: CGFloat(h))
 }
 
@@ -51,7 +51,7 @@ private func keyRoot() -> UIView? {
     return (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController?.view
 }
 
-private func adopt(_ v: UIView) -> UInt {
+func adopt(_ v: UIView) -> UInt {
     let handle = nextHandle
     nextHandle += 1
     views[handle] = v
@@ -1856,7 +1856,7 @@ let eventsNext: Call = { buf, cap, _, _, _, _ in
 
 // MARK: - registration
 
-private func register(_ name: String, _ fn: Call) {
+func register(_ name: String, _ fn: Call) {
     let p = unsafeBitCast(fn, to: UnsafeMutableRawPointer.self)
     name.withCString { modus_swift_register($0, p) }
 }
@@ -1864,6 +1864,7 @@ private func register(_ name: String, _ fn: Call) {
 // modus-swift.m calls this, once, before the first Lisp call.
 @_cdecl("modus_swift_install")
 public func modusSwiftInstall() {
+    installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_switch_new", switchNew)

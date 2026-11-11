@@ -1865,6 +1865,7 @@ func register(_ name: String, _ fn: Call) {
 @_cdecl("modus_swift_install")
 public func modusSwiftInstall() {
     installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
+    installSpeech()                                // Speech.swift: the platform's voice and ear
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_switch_new", switchNew)

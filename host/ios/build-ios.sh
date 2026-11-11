@@ -58,7 +58,7 @@ done
 # shellcheck disable=SC2086  # LINKX is a flag list
 xcrun --sdk $SDKN swiftc -target $TARGET -sdk "$SDK" -o "$OUT/modus" "$OBJS"/*.o \
   -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore \
-  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal $LINKX
+  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal -framework Speech $LINKX
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,6 +71,8 @@ cat > "$OUT/Info.plist" <<PLIST
   <key>CFBundleShortVersionString</key><string>0.1</string>
   <key>MinimumOSVersion</key><string>18.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>modus listens when you ask it to: the Listen app transcribes what it hears.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>The Listen app turns what you say into text.</string>
   <key>UILaunchScreen</key><dict/>
   <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
   <key>UIApplicationSceneManifest</key><dict>

@@ -3008,11 +3008,17 @@
    AFTER the symbol-function table is populated (the package itself is created
    early in %init-packages so the reader can name MODUS:… symbols).  A call to a
    non-CL-USER symbol resolves via its QUALIFIED name string, so both the
-   symbol's function cell and the qualified SFT key are set."
+   symbol's function cell and the qualified SFT key are set.
+
+   %GC-SAFE-BLOCK-6 is the hosted image's syscall path for runtime-loaded code
+   (an intrinsic SYSCALL there does not return the kernel's answer).  natrium's
+   gossamer maps its secret arena through it; its symbol used to exist only
+   because the sockets shim happened to quote it, and when that line changed the
+   arena silently stopped coming up.  An image without it skips the name."
   (let ((p (find-package "MODUS")))
     (when p
       (dolist (nm (list "JIT-EAGER" "JIT-PRUNE" "JIT-SOURCE" "MAKE-STATIC-VECTOR" "FREE-STATIC-VECTOR"
-                      "ADD-RESTORE-HOOK" "%STATIC-ALLOC"))
+                      "ADD-RESTORE-HOOK" "%STATIC-ALLOC" "%GC-SAFE-BLOCK-6"))
         (let ((fn (%mvm-resolve-runtime-fn nm)))
           (when fn
             (let ((dst (intern nm p)))

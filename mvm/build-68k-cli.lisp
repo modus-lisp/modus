@@ -183,12 +183,46 @@
   ;; ... and pooled literals are narrow too (cross.lisp *POOL-NARROW-STRINGS*).
   (setq *pool-narrow-strings* t))
 
+;; MODUS_68K_GC_STATIC: boot's heap becomes static once boot is done -- held
+;; once, walked by every collection, never copied (translate-68k.lisp
+;; *68K-GC-STATIC*).  1 = on, 0 = off; unset, it follows MODUS_SMALL_IMAGE.
+;; Read HERE, before build-cli-common assembles the image source.
+(let ((v (sb-ext:posix-getenv "MODUS_68K_GC_STATIC"))
+      (small (let ((s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))   ; *SMALL-IMAGE*'s rule;
+               (and s (plusp (length s)) (not (string= s "0"))))))  ; it is not defined yet
+  ;; CL-USER here: the translator's package is not current until below, where
+  ;; MODUS.MVM::*68K-GC-STATIC* is set from this.
+  (defparameter cl-user::*68k-gc-static-on*
+    (cond ((null v) small)
+          ((string= v "0") nil)
+          (t t))))
+(when cl-user::*68k-gc-static-on*
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source* "
+(defun %gc-static-freeze ()
+  \"Post the collector's freeze request (translate-68k.lisp *68K-GC-STATIC*)
+   and allocate until a collection has happened: what boot left live is then
+   static.  Called once, between boot and the toplevel.\"
+  (setf (mem-ref #x10006000 :u32) 1)
+  (let ((before (mem-ref #x10000060 :u32)) (junk nil))
+    (loop
+      (unless (eql (mem-ref #x10000060 :u32) before) (return nil))
+      (setq junk (make-list 32)))))
+"))
+  (setq *cli-arch-kernel-epilogue*
+        "  ;; --- the heap boot built becomes static (MODUS_68K_GC_STATIC) ---
+  (%gc-static-freeze)
+  ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
+  (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
+"))
+
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 
 (mvm-load "boot/boot-linux-68k.lisp")
 
 (in-package :modus.mvm)
+(setf *68k-gc-static* cl-user::*68k-gc-static-on*)
 
 (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
   (when (and sm (> (length sm) 0))

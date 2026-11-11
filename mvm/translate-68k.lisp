@@ -3008,6 +3008,26 @@
    costs a small map, and the bias below stays a translate-time constant.")
 (defconstant +68k-gc-kind-bias+ (- +68k-gc-kind-map+ (ash #x10000000 -4))
   "K: the kind byte of address A is at K + (A >> 4).")
+(defvar *68k-gc-static* nil
+  "STATIC BOOT HEAP (MODUS_68K_GC_STATIC; unset, it follows MODUS_SMALL_IMAGE).
+   A request word makes the collector, at the end of the collection that sees
+   it, keep what that collection copied where it is -- the objects it copied up
+   and the conses it copied down become a STATIC range each -- and continue on
+   two semispaces the size of the room left between them.  Every later
+   collection walks both ranges as typed roots (like the Cheney scan, leaf
+   payloads skipped) and never copies them: what boot built is held once, not
+   twice.  No barrier is needed because nothing static is skipped.  AArch64's
+   GC-TENURE without its cards, on 68k's own words (+68K-GC-STATIC-BLOCK+).")
+
+(defconstant +68k-gc-static-block+ #x10006000
+  "Raw words: +0 request (non-zero: freeze at the end of the next collection),
+   +4/+8 the static objects [lo, hi), +C/+10 the static conses [lo, hi).
+   Below the heap, so the low-block root scan reads them: raw 16-aligned
+   addresses, which carry no pointer tag.")
+
+(defconstant +68k-gc-heap-start+ #x10020000
+  "Where the first semispace starts (boot-linux-68k's heap + alloc-start).")
+
 (defconstant +68k-gc-margin-max+ #x100000
   "The collector leaves min(1 MB, a quarter of a semispace) free below VL --
    COMPUTED from space_size at each collection, so it needs no stored word.")
@@ -3292,6 +3312,97 @@
   "Objects whose payload holds no pointers: copied, never scanned.  ARM32's
    list, plus #x13: a narrow string's payload is bytes.")
 
+(defun m68k-emit-gc-static-walk (buf scan)
+  "Collector: scan every slot of the static objects [+4, +8) -- leaf payloads
+   skipped, as the Cheney object scan does -- and the car and cdr of every
+   static cons [+C, +10).  SCAN is the collector's slot routine (A0 = slot).
+   Uses A5, A4, D7, D3, D1, D0 (all saved by the collector's entry)."
+  (let ((ol (mvm-make-label)) (od (mvm-make-label)) (sl (mvm-make-label))
+        (leaf (mvm-make-label)) (cl (mvm-make-label)) (cd (mvm-make-label))
+        (blk +68k-gc-static-block+))
+    (flet ((here (l) (m68k-emit-label buf l)))
+      ;; -- objects: A5 = cursor, [blk+8] = end --
+      (m68k-emit-move-imm-an buf blk +68k-a0+)
+      (m68k-emit-move-disp-an buf +68k-a0+ 4 +68k-a5+)
+      (here ol)
+      (m68k-emit-move-imm-an buf blk +68k-a0+)
+      (m68k-emit-move-disp-dn buf +68k-a0+ 8 +68k-d0+)
+      (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                   ; A5 - end
+      (m68k-emit-bcc-word buf +68k-cc-cc+ od)
+      (m68k-emit-move-an-ind-dn buf +68k-a5+ +68k-d3+)         ; header
+      (m68k-emit-object-size buf +68k-d0+ +68k-d3+)
+      (m68k-emit-move-an-dn buf +68k-a5+ +68k-d7+)
+      (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d7+)              ; D7 = next
+      (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+      (m68k-emit-andi buf +68k-d1+ #xFF)
+      (dolist (st *68k-gc-leaf-subtags*)
+        (m68k-emit-cmpi buf +68k-d1+ st)
+        (m68k-emit-beq buf leaf))
+      (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+      (m68k-emit-lsr-imm buf +68k-d1+ 8)                       ; count
+      (m68k-emit-lsl-imm buf +68k-d1+ 2)
+      (m68k-emit-addq buf +68k-d1+ 4)
+      (m68k-emit-move-an-dn buf +68k-a5+ +68k-d0+)
+      (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
+      (m68k-emit-move-dn-an buf +68k-d1+ +68k-a4+)             ; A4 = slot end
+      (m68k-emit-addq-an buf +68k-a5+ 4)
+      (here sl)
+      (m68k-emit-cmpa-an buf +68k-a4+ +68k-a5+)                ; A5 - A4
+      (m68k-emit-bcc-word buf +68k-cc-cc+ leaf)
+      (m68k-emit-move-an-an buf +68k-a5+ +68k-a0+)
+      (m68k-emit-bsr buf scan)
+      (m68k-emit-addq-an buf +68k-a5+ 4)
+      (m68k-emit-bra buf sl)
+      (here leaf)
+      (m68k-emit-move-dn-an buf +68k-d7+ +68k-a5+)
+      (m68k-emit-bra buf ol)
+      (here od)
+      ;; -- conses: A5 = cursor, [blk+16] = end --
+      (m68k-emit-move-imm-an buf blk +68k-a0+)
+      (m68k-emit-move-disp-an buf +68k-a0+ 12 +68k-a5+)
+      (here cl)
+      (m68k-emit-move-imm-an buf blk +68k-a0+)
+      (m68k-emit-move-disp-dn buf +68k-a0+ 16 +68k-d0+)
+      (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)
+      (m68k-emit-bcc-word buf +68k-cc-cc+ cd)
+      (m68k-emit-move-an-an buf +68k-a5+ +68k-a0+)
+      (m68k-emit-bsr buf scan)
+      (m68k-emit-lea-disp buf +68k-a5+ 4 +68k-a0+)
+      (m68k-emit-bsr buf scan)
+      (m68k-emit-lea-disp buf +68k-a5+ 16 +68k-a5+)
+      (m68k-emit-bra buf cl)
+      (here cd))))
+
+(defun m68k-emit-gc-static-freeze (buf)
+  "Collector, after the swap (A1 = meta, A2 = object free, A3 = cons low, D4 =
+   the evacuated semispace): when the request word is set and nothing is static
+   yet, keep [from, A2) and [A3, from + size) as the static ranges and continue
+   on semispaces of size A3 - A2: the gap [A2, A3) and the start of the
+   evacuated one.  Clears the request.  Clobbers D0, D1, A0."
+  (let ((skip (mvm-make-label)) (blk +68k-gc-static-block+))
+    (m68k-emit-move-imm-an buf blk +68k-a0+)
+    (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)          ; request
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf skip)
+    (m68k-emit-move-disp-dn buf +68k-a0+ 8 +68k-d0+)          ; already static?
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-bne buf skip)
+    (m68k-emit-move-disp-dn buf +68k-a1+ #x00 +68k-d0+)       ; from (= old to)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 4)          ; objects lo
+    (m68k-emit-move-an-disp buf +68k-a2+ +68k-a0+ 8)          ; objects hi
+    (m68k-emit-move-an-disp buf +68k-a3+ +68k-a0+ 12)         ; conses lo
+    (m68k-emit-move-disp-dn buf +68k-a1+ #x10 +68k-d1+)
+    (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 16)         ; conses hi
+    (m68k-emit-move-an-dn buf +68k-a3+ +68k-d0+)
+    (m68k-emit-move-an-dn buf +68k-a2+ +68k-d1+)
+    (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d0+)               ; size' = A3 - A2
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ #x10)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a1+ #x00)       ; from = A2
+    (m68k-emit-moveq buf +68k-d0+ 0)
+    (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)          ; request done
+    (m68k-emit-label buf skip)))
+
 (defun m68k-emit-gc-collector (buf)
   "Emit the hosted collector at *68K-GC-LABEL*.  Entered by BSR.L from
    :gc-check; every register is preserved except the new VA/VL it installs."
@@ -3339,15 +3450,24 @@
       ;; payloads included -- as conservative roots: a bytecode word that
       ;; happened to spell a live from-space cons was "forwarded" in place, and
       ;; the interpreter then decoded garbage.
-      (let ((have (lbl)))
-        (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d7+)
-        (m68k-emit-move-imm-an buf meta +68k-a0+)
-        (m68k-emit-move-disp-dn buf +68k-a0+ #x08 +68k-d0+)       ; to_start
-        (m68k-emit-cmp-dn-dn buf +68k-d0+ +68k-d7+)               ; from_start - to_start
-        (m68k-emit-bcc-word buf +68k-cc-cs+ have)
-        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d7+)
-        (here have))
+      ;; With a static heap the semispaces no longer start at the heap's start
+      ;; (the static ranges sit inside them), so the low block ends at the
+      ;; heap's FIXED start, as on arm32 -- a typed range must never be read
+      ;; as conservative roots.
+      (if *68k-gc-static*
+          (m68k-emit-move-imm-dn buf +68k-gc-heap-start+ +68k-d7+)
+          (let ((have (lbl)))
+            (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d7+)
+            (m68k-emit-move-imm-an buf meta +68k-a0+)
+            (m68k-emit-move-disp-dn buf +68k-a0+ #x08 +68k-d0+)       ; to_start
+            (m68k-emit-cmp-dn-dn buf +68k-d0+ +68k-d7+)               ; from_start - to_start
+            (m68k-emit-bcc-word buf +68k-cc-cs+ have)
+            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d7+)
+            (here have)))
       (root-range)
+      ;; ---- the static ranges, typed (empty until a freeze) ----
+      (when *68k-gc-static*
+        (m68k-emit-gc-static-walk buf scan))
       ;; ---- Cheney: A5 = object scan (up), A6 = cons scan (down) ----
       (m68k-emit-move-imm-an buf meta +68k-a1+)
       (m68k-emit-move-disp-an buf +68k-a1+ #x08 +68k-a5+)          ; to_start
@@ -3429,6 +3549,38 @@
           (m68k-emit-addq-an buf +68k-a0+ 4)
           (m68k-emit-bra buf pl)
           (here pd)))
+      ;; ---- hand the evacuated semispace's pages back (static-heap images) ----
+      ;; madvise(MADV_DONTNEED) on the page-aligned inside of [D4, D5): resident
+      ;; memory is then what lives plus what is being allocated into, not every
+      ;; page either semispace ever touched -- at the freeze, the whole of the
+      ;; semispace boot filled.  Not with poison, which wants the pages written.
+      (when (and *68k-gc-static* (not *68k-gc-poison*))
+        (let ((none (lbl)))
+          (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d1+)
+          (m68k-emit-addi buf +68k-d1+ 4095)
+          (m68k-emit-andi buf +68k-d1+ #xFFFFF000)                  ; start, up
+          (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d2+)
+          (m68k-emit-andi buf +68k-d2+ #xFFFFF000)                  ; end, down
+          (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d2+)               ; length
+          (m68k-emit-bcc-word buf +68k-cc-ls+ none)                 ; <= 0
+          (m68k-emit-move-imm-dn buf 238 +68k-d0+)                  ; madvise
+          (m68k-emit-moveq buf +68k-d3+ 4)                          ; MADV_DONTNEED
+          (m68k-emit-word buf #x4E40)                               ; TRAP #0
+          (here none))
+        ;; ... and the kind bytes of that range, zeroed above: a released page
+        ;; reads back as zero, which is what they hold.
+        (let ((none (lbl)))
+          (m68k-emit-kind-addr buf +68k-d1+ +68k-d4+)
+          (m68k-emit-addi buf +68k-d1+ 4095)
+          (m68k-emit-andi buf +68k-d1+ #xFFFFF000)
+          (m68k-emit-kind-addr buf +68k-d2+ +68k-d5+)
+          (m68k-emit-andi buf +68k-d2+ #xFFFFF000)
+          (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d2+)
+          (m68k-emit-bcc-word buf +68k-cc-ls+ none)
+          (m68k-emit-move-imm-dn buf 238 +68k-d0+)
+          (m68k-emit-moveq buf +68k-d3+ 4)
+          (m68k-emit-word buf #x4E40)
+          (here none)))
       ;; ---- swap the semispaces, count the collection ----
       (m68k-emit-move-imm-an buf meta +68k-a1+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d0+)
@@ -3437,6 +3589,8 @@
       (m68k-emit-move-disp-dn buf +68k-a1+ #x20 +68k-d0+)
       (m68k-emit-addq buf +68k-d0+ 1)
       (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ #x20)
+      (when *68k-gc-static*
+        (m68k-emit-gc-static-freeze buf))
       ;; ---- new VA = object free, VL = cons low - margin, into the frame ----
       (let ((exhausted (lbl)))
         ;; margin = min(1 MB, space_size / 4), 16-aligned -- the stub's rule

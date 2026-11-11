@@ -20,7 +20,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 | image | file | resident | heap floor |
 |---|---|---|---|
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
-| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 11.7 MB | 5.75 MB |
+| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.3 MB | 5.75 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -41,6 +41,7 @@ All opt-in; unset, every image is built as before.  68k soft float:
 | `MODUS_SMALL_IMAGE=1` | boot tables built from packed text (symbol names, function table, opcode table), global init batched through one guarded loop, no `ansi-test-aux`; on 68k turns on branch relaxation |
 | `MODUS_NARROW_STRINGS=1` | one byte a character for strings the reader and the name tables make, and (68k) for pooled literals (the collector sizes `#x13` since `238b68e2`) |
 | `MODUS_68K_A5_GLOBALS=1` / `0` | A5 holds the globals base, so nargs / closure env / MV count are `(A5)` / `d16(A5)`; unset follows `MODUS_SMALL_IMAGE` |
+| `MODUS_68K_GC_STATIC=1` / `0` | after boot, what boot left live becomes a static heap the collector walks and never copies, and the collector hands evacuated pages back (`madvise`); unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_68K_RELAX_BRANCHES=1` / `0` | each 68k branch as short as its distance allows (two translation passes); unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_NO_SOURCE_BLOB=1` | no embedded source (disk only on a hosted system) |
 | `MODUS_NO_COMPILER=1` | no compiler: the compiler-side files filtered to what the rest of the image reaches (`mvm/build-no-compiler.lisp`), entry points stubbed to signal; the toplevel runs a `%IMAGE-MAIN` baked in with `MODUS_EXTRA_SOURCE=FILE` |
@@ -124,9 +125,14 @@ All opt-in; unset, every image is built as before.  68k soft float:
    sequences out of line, one copy each: type checks, the GC check, argument
    setup, the global-read cache path.  Native speed stays; each pattern is
    measured on its own.
-2. **Boot from a saved core with a static region.**  Build the boot data at
-   build time and keep it where the collector does not copy it, as MCL booted
-   from a saved heap.  Lowers the heap floor and the boot time.
+2. **A static boot heap.**  First half done (`MODUS_68K_GC_STATIC`): after
+   boot the collector freezes what it copied -- 1.56 MB of objects, 0.51 MB of
+   conses -- walks it typed at every collection, and releases evacuated
+   pages (and their kind bytes), so the heap at the prompt is 2.3-2.5 MB
+   resident, not 5.4, and the kind map 0.12 MB, not 0.37.  The heap
+   FLOOR is unchanged (5-6 MB), because boot's final live set is what sets it;
+   lowering it means freezing during boot, or building the boot data at build
+   time (a saved core, as MCL booted from a saved heap).
 3. Measure against 4 MB / 6 MB.  If native cannot get there: the **bytecode
    image** (the web REPL's design -- the image stays MVM bytecode, a small
    native interpreter runs it; slower, several times smaller).

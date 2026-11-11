@@ -14698,10 +14698,11 @@
   ;; GUARDED FOR THREADS: the emitted read tests the arming word first and,
   ;; once threads are armed, takes the miss arm, where %GV-REF-FILL lets this
   ;; thread's own dynamic binding win (see the THREADS FIRST note below).
-  (when (eq *gv-cache-mode* :call)
-    (return-from %compile-global-read-cached
-      (compile-form (list '%gv-ref-fill key slot) env dest)))
-  (let ((save-count (min *temp-reg-counter* 12))
+  ;; :CALL emits only the miss arm: the same call, the same caller-save, and
+  ;; SAVE's %GV-SAVE-FILL (a COMPILE-FORM of %GV-REF-FILL here gave the
+  ;; LET-special save the read's semantics).
+  (let ((call-only (eq *gv-cache-mode* :call))
+        (save-count (min *temp-reg-counter* 12))
         (miss (make-compiler-label))
         (done (make-compiler-label)))
     ;; Two temps, with DEST as a third scratch.  Register pressure is the
@@ -14721,6 +14722,7 @@
           (setq r (+ r 1)))))
     (let ((cell (alloc-temp-reg))
           (want (alloc-temp-reg)))
+     (unless call-only
       ;; THREADS FIRST.  A worker's dynamic binding lives in that thread's own
       ;; storage, not in the pair, so once the image has armed threads (the
       ;; word %RT-ENTER, %DYNBIND and the baked-cell read test) the read goes
@@ -14783,7 +14785,7 @@
       ;; saying it here keeps the two paths -- and the pre-change behaviour --
       ;; identical.
       (emit-ir :set-mv-count 1)
-      (emit-ir :br done)
+      (emit-ir :br done))
       (emit-ir-label miss)
       (emit-li-tagged +vreg-v0+ key)
       (emit-li-tagged +vreg-v1+ slot)

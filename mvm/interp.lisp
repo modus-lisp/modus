@@ -22,8 +22,7 @@
 ;;; Tag constants and helpers
 
 (defconstant +tag-fixnum+ 0)
-(defconstant +tag-cons+   1)
-(defconstant +tag-object+ 9)
+;; +TAG-CONS+ / +TAG-OBJECT+: per target (target.lisp TARGET-TAG-SCHEME).
 ;; NIL/T immediates must match the COMPILER's representation (compiler.lisp
 ;; +nil-value+ #xDEAD0001 / +t-value+ #xDEAD1009), not the obsolete 0/2 fixnum
 ;; model.  Truthiness is "not NIL": every value except #xDEAD0001 (and host
@@ -31,7 +30,10 @@
 ;; (nil | 8) = #xDEAD0009 — also non-NIL, so truthy.  mvm-nil-p must therefore
 ;; key on #xDEAD0001 exactly.
 (defconstant +mvm-nil+ #xDEAD0001)
-(defconstant +mvm-t+   #xDEAD1009)
+(defconstant +mvm-t+   +t-value+)
+;; T's low byte: its object tag, #x09, or #x07 on 68k's 3-bit scheme.  The LI
+;; arm recognises T by its wire bytes.
+(defconstant +mvm-t-low-byte+ (logand +t-value+ #xFF))
 
 (declaim (inline tag-fixnum untag-fixnum mvm-nil-p mvm-boolean))
 (defun tag-fixnum (n) (ash n 1))
@@ -1786,7 +1788,8 @@
                (cond
                  ((and deadp (= (aref bc (+ npc 1)) #x00) (= (aref bc npc) #x01))
                   (reg-set-nil regs vd) (setf pc (+ npc 8)))
-                 ((and deadp (= (aref bc (+ npc 1)) #x10) (= (aref bc npc) #x09))
+                 ((and deadp (= (aref bc (+ npc 1)) #x10)
+                       (= (aref bc npc) +mvm-t-low-byte+))
                   (reg-set-t regs vd) (setf pc (+ npc 8)))
                  ;; |W| >= 2^+fixnum-bits+: the word is not a fixnum VALUE, so
                  ;; reg-set's %word->val would wrap it.  TOP is W>>24 (hi and

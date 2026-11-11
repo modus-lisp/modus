@@ -639,6 +639,23 @@
 (defparameter +mv-values-addr+ #x10000098
   "Base of the multiple-values vector; the count slot's word plus one.")
 
+;;; THE POINTER TAGS, per target (TARGET-TAG-SCHEME).  Every pointer tag is odd
+;;; (a fixnum's low bit is 0).  The 16-byte scheme -- cons 1, function 3,
+;;; immediate 5, object 9, forward 15, T = #xDEAD1009 -- reads four tag bits,
+;;; so every heap object and cons sits on a 16-byte granule.
+;;; *68K-TAGS3* (MODUS_68K_TAGS3): 68k's 32-bit scheme instead -- cons 1,
+;;; function 3, immediate 5, object 7, T = #xDEAD1007 -- three tag bits, so
+;;; objects and conses sit on an 8-byte granule (a cons is its two words, not
+;;; half of a 16-byte cell).  Forwarding is kept in the collector's kind map.
+(defvar *68k-tags3* nil)
+
+(defparameter +tag-cons+      1)
+(defparameter +tag-function+  3)
+(defparameter +tag-object+    9)
+(defparameter +tag-immediate+ 5)
+(defparameter +tag-forward+   15)
+(defparameter +t-value+       #xDEAD1009)
+
 (defparameter +fixnum-bits+      62)
 (defparameter +fixnum-max+       4611686018427387903)
 (defparameter +fixnum-min+       -4611686018427387903)
@@ -770,8 +787,17 @@
           +name-hash-bits+)
   bits)
 
+(defun set-target-tag-scheme-for (target)
+  "The pointer tags of TARGET: the 16-byte scheme, or 68k's 3-bit one."
+  (let ((three (and *68k-tags3* (eq (target-name target) :68k))))
+    (setf +tag-cons+ 1 +tag-function+ 3 +tag-immediate+ 5
+          +tag-object+ (if three 7 9)
+          +tag-forward+ 15
+          +t-value+ (if three #xDEAD1007 #xDEAD1009))))
+
 (defun set-target-fixnum-bits-for (target)
   "Derive the numeric width, endianness and MV-slot addresses from TARGET."
+  (set-target-tag-scheme-for target)
   (setf *target-big-endian-p* (eq (target-endianness target) :big)
         +target-big-endian+   (if *target-big-endian-p* 1 0))
   ;; The fpd-* (unboxed double) ops exist in the interpreter and the x86-64 /
@@ -802,7 +828,9 @@
     ;; odd, so both moved to 9 with a 16-byte granule (rv-object-tag,
     ;; +arm32-object-tag+).  Kept as a function so a port can diverge again
     ;; only by saying so here.
-    (t 9)))
+    ;; 68k's 3-bit scheme diverges (SET-TARGET-TAG-SCHEME-FOR): the answer
+    ;; is the current target's parameter.
+    (t +tag-object+)))
 
 (defun target-object-data-offset (target)
   "Bytes from an object's RAW (untagged) base to the first data slot.
@@ -905,7 +933,10 @@
      (defconstant +mv-count-addr+ ~D)~%~
      (defconstant +mv-values-addr+ ~D)~%~
      (defconstant +target-big-endian+ ~D)~%~
-     (defconstant +target-soft-float+ ~D)~%"
+     (defconstant +target-soft-float+ ~D)~%~
+     (defconstant +tag-cons+ ~D)~%(defconstant +tag-function+ ~D)~%~
+     (defconstant +tag-object+ ~D)~%(defconstant +tag-immediate+ ~D)~%~
+     (defconstant +tag-forward+ ~D)~%(defconstant +t-value+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
     +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+
     +fixnum-signed-bits+ +fixnum-bits-1+ +limb-bits+ +limb-bits-1+
@@ -913,4 +944,5 @@
     +small-bignum-bits+ +half-limb-bits+ +neg-half-limb-bits+
     +half-limb-mask+
     +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+
-    +mv-count-addr+ +mv-values-addr+ +target-big-endian+ +target-soft-float+))
+    +mv-count-addr+ +mv-values-addr+ +target-big-endian+ +target-soft-float+
+    +tag-cons+ +tag-function+ +tag-object+ +tag-immediate+ +tag-forward+ +t-value+))

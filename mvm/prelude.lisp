@@ -513,7 +513,7 @@
    is rewritten #x11 -> #x13.  Nothing allocates between the two, so no
    collection sees the byte vector it briefly was."
   (let* ((s (%alloc-u8 n))
-         (raw (- (%val->word s) 9)))
+         (raw (- (%val->word s) +tag-object+)))
     (setf (mem-ref raw :u32) (logior (ash n 8) #x13))
     s))
 
@@ -554,7 +554,7 @@
    (UNSIGNED-BYTE 32), in a build that makes them (%U32-VECTORS-P).  Nothing
    allocates in between."
   (let* ((s (%alloc-u8 (* 4 n)))
-         (raw (- (%val->word s) 9)))
+         (raw (- (%val->word s) +tag-object+)))
     (setf (mem-ref raw :u32) (logand (logior (ash n 8) #x17) #xFFFFFFFF))
     (setf (mem-ref (+ raw 4) :u32) (ash n -24))
     s))
@@ -572,7 +572,7 @@
    What %MAKE-STRING-ARRAY makes in a narrow-strings build (compiler.lisp
    COMPILE-MAKE-STRING-ARRAY).  Nothing allocates in between."
   (let* ((s (%alloc-u8 (* 4 n)))
-         (raw (- (%val->word s) 9)))
+         (raw (- (%val->word s) +tag-object+)))
     (setf (mem-ref raw :u32) (logand (logior (ash n 8) #x15) #xFFFFFFFF))
     (setf (mem-ref (+ raw 4) :u32) (ash n -24))
     s))

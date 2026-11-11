@@ -63,6 +63,10 @@
   (require :sb-posix)
   (funcall (find-symbol installer :modus.mvm))
   (funcall (find-symbol mode-setter :modus.mvm) t)
+  ;; MODUS_68K_TAGS3=1: 68k's 3-bit tags and 8-byte granule (target.lisp).
+  (when (and (string= arch "68k")
+             (equal (sb-ext:posix-getenv "MODUS_68K_TAGS3") "1"))
+    (setf (symbol-value (find-symbol "*68K-TAGS3*" :modus.mvm)) t))
   (let* ((src (third sb-ext:*posix-argv*))
          (out (or (sb-ext:posix-getenv out-env) out-default))
          (text (if src

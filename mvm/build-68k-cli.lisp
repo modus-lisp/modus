@@ -197,9 +197,27 @@
     (cond ((null v) small)
           ((string= v "0") nil)
           (t t))))
+;; MODUS_68K_TAGS3 (read here, in CL-USER, for the card code's constants;
+;; MODUS.MVM::*68K-TAGS3* is set from it below): unset follows MODUS_SMALL_IMAGE.
+(defparameter cl-user::*68k-tags3-on*
+  (let ((v (sb-ext:posix-getenv "MODUS_68K_TAGS3"))
+        (s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
+    (cond ((null v) (and s (plusp (length s)) (not (string= s "0"))))
+          ((string= v "0") nil)
+          (t t))))
+(defun cl-user::%68k-granule-subst (text)
+  "TEXT with the heap granule's constants filled in."
+  (let ((pairs (if cl-user::*68k-tags3-on*
+                   '(("GRAN-1" . "7") ("MINUS-GRAN" . "-8") ("MAX-SHIFT" . "10") ("MINUS-KSHIFT" . "-3"))
+                   '(("GRAN-1" . "15") ("MINUS-GRAN" . "-16") ("MAX-SHIFT" . "11") ("MINUS-KSHIFT" . "-4")))))
+    (dolist (p pairs text)
+      (loop for i = (search (car p) text) while i
+            do (setq text (concatenate 'string (subseq text 0 i) (cdr p)
+                                       (subseq text (+ i (length (car p))))))))))
+
 (when cl-user::*68k-gc-static-on*
   (setq *cli-arch-override-source*
-        (concatenate 'string *cli-arch-override-source* "
+        (concatenate 'string *cli-arch-override-source* (cl-user::%68k-granule-subst "
 (defun %gc-static-freeze ()
   \"Post the collector's freeze request (translate-68k.lisp *68K-GC-STATIC*)
    and allocate until a collection has happened: what boot left live is then
@@ -223,7 +241,7 @@
          (shift 9) (ncards 0) (a olo))
     (loop
       (setq ncards (ash (+ (- chi lo) (ash 1 shift) -1) (- shift)))
-      (when (or (<= ncards 7680) (>= shift 11)) (return nil))
+      (when (or (<= ncards 7680) (>= shift MAX-SHIFT)) (return nil))
       (setq shift (+ shift 1)))
     (when (<= ncards 7680)
       (dotimes (i ncards)
@@ -234,11 +252,11 @@
         (let* ((st (mem-ref (+ a 3) :u8))
                (n (+ (* (mem-ref a :u8) 65536) (* (mem-ref (+ a 1) :u8) 256)
                      (mem-ref (+ a 2) :u8)))
-               (size (logand (+ (if (or (= st 17) (= st 19)) (+ n 4) (* (+ n 1) 4)) 15) -16))
+               (size (logand (+ (if (or (= st 17) (= st 19)) (+ n 4) (* (+ n 1) 4)) GRAN-1) MINUS-GRAN))
                (c (ash (- a lo) (- shift))))
           (when (= (mem-ref (+ #x1001E000 c) :u8) 255)
             (setf (mem-ref (+ #x1001E000 c) :u8)
-                  (ash (- (- a lo) (ash c shift)) -4)))
+                  (ash (- (- a lo) (ash c shift)) MINUS-KSHIFT)))
           (setq a (+ a size))))
       (setf (mem-ref #x10006018 :u32) lo)
       (setf (mem-ref #x10006020 :u32) shift)
@@ -290,7 +308,7 @@
       (%cli-exit 3))
     (%sys-close fd)
     (%cli-exit 0)))
-"))
+")))
   (setq *cli-arch-kernel-epilogue*
         "  ;; --- the heap boot built becomes static (MODUS_68K_GC_STATIC) ---
   ;; MODUS_68K_SAVE_CORE=PATH (the build's core run): freeze, then write the
@@ -310,6 +328,8 @@
 
 (in-package :modus.mvm)
 (setf *68k-gc-static* cl-user::*68k-gc-static-on*)
+(setf *68k-tags3* cl-user::*68k-tags3-on*)
+(when *68k-tags3* (format t "~&;; MODUS_68K_TAGS3: 3-bit tags, 8-byte heap granule~%"))
 (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
   (setf *pool-narrow-strings* t))
 
@@ -360,6 +380,9 @@
 (when (let ((v (sb-ext:posix-getenv "MODUS_68K_PROFILE"))) (and v (string/= v "0")))
   (setf *68k-profile* t))
 
+;; MODUS_68K_TAGS3=1: the 3-bit pointer tags and the 8-byte heap granule
+;; (target.lisp *68K-TAGS3*).  Read early: the card code below is baked with
+;; the granule.
 ;; MODUS_68K_THREADED=1: every function that can be is THREADED cold code --
 ;; a byte token stream run by shared native handlers (translate-68k.lisp
 ;; *68K-THREADED*).  A5 is then the token pointer, so it does not hold the

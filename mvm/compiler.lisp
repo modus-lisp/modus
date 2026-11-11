@@ -41,11 +41,10 @@
 ;;; 1111 = GC forwarding pointer
 
 (defconstant +tag-fixnum+    #b0000)
-(defconstant +tag-cons+      #b0001)
-(defconstant +tag-function+  #b0011)
-(defconstant +tag-object+    #b1001)
-(defconstant +tag-immediate+ #b0101)
-(defconstant +tag-forward+   #b1111)
+;;; +TAG-CONS+ +TAG-FUNCTION+ +TAG-OBJECT+ +TAG-IMMEDIATE+ +TAG-FORWARD+ and
+;;; +T-VALUE+ are PER TARGET (target.lisp, TARGET-TAG-SCHEME): host parameters,
+;;; and constants WIDTH-CONSTANTS-SOURCE injects ahead of every compilation, so
+;;; the image's own compiler sees the same values.
 
 (defconstant +fixnum-shift+ 1)
 
@@ -132,7 +131,7 @@
 
 ;;; Placeholder addresses for NIL and T (patched during image build)
 (defconstant +nil-value+ #xDEAD0001)
-(defconstant +t-value+   #xDEAD1009)
+;;; +t-value+: per target, see the tag constants above.
 
 ;;; Multiple-value return storage (fixed addresses in BSS/globals area)
 ;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)

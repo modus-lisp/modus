@@ -378,11 +378,24 @@
   (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn +ea-mode-an-disp+ an))
   (m68k-emit-word buf (logand disp #xFFFF)))
 
+(defun m68k-granule ()
+  "The heap granule: 16 bytes, or 8 with *68K-TAGS3* (target.lisp)."
+  (if *68k-tags3* 8 16))
+(defun m68k-tag-mask ()
+  "The pointer-tag bits: four, or three with *68K-TAGS3*."
+  (if *68k-tags3* 7 15))
+(defun m68k-kind-shift ()
+  "log2 of the granule: one kind byte per granule."
+  (if *68k-tags3* 3 4))
+(defun m68k-round (n)
+  "N bytes rounded up to the granule."
+  (let ((g (m68k-granule))) (logand (+ n g -1) (- g))))
+
 (defun m68k-emit-check-cons (buf dn)
   "Trap (ILLEGAL) unless the low four bits of DN are +TAG-CONS+.  Clobbers D1.
    MOVEQ / AND.L / SUBQ.L (6 bytes) for the ANDI.L / CMPI.L (12) it replaces,
    and the skip is a fixed BEQ.S over the 2-byte ILLEGAL."
-  (m68k-emit-moveq buf +68k-d1+ 15)
+  (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))
   (m68k-emit-and-dn-dn buf dn +68k-d1+)
   (m68k-emit-subq buf +68k-d1+ +tag-cons+)
   (m68k-emit-word buf #x6702)                    ; BEQ.S *+4: over the ILLEGAL
@@ -1375,7 +1388,7 @@
                 (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
               (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
               (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
-              (m68k-emit-move-imm-dn buf #xDEAD1009 +68k-d2+)  ; second return: T
+              (m68k-emit-move-imm-dn buf +t-value+ +68k-d2+)  ; second return: T
               (m68k-emit-jmp-an-ind buf +68k-a0+)
               (m68k-emit-label buf nohandler)
               (m68k-emit-illegal buf)))
@@ -2121,7 +2134,7 @@
          ;; and the next object's tag 9 read as nibble 1 (a cons) while the next
          ;; cons's 1 read as 9.  r26-callee-alloc answered 1042 on 68k (and on
          ;; riscv32 and ppc32).  ADDQ stops at 8, hence LEA.
-         (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)
+         (m68k-emit-lea-disp buf +68k-a2+ (m68k-granule) +68k-a2+)
          (m68k-store-vreg buf vd +68k-d0+)))))
 
       (#.+op-setcar+
@@ -2150,7 +2163,7 @@
              (vs (second operands)))
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
-         (m68k-emit-andi buf +68k-d1+ #xF)
+         (m68k-emit-andi buf +68k-d1+ (m68k-tag-mask))
          ;; AND NIL IS NOT A CONS.  NIL's low nibble IS +tag-cons+ by design --
          ;; that is what lets car/cdr of NIL be a plain load into a NIL-filled
          ;; page -- so the tag test alone answers T for NIL.  translate-i386's
@@ -2183,7 +2196,7 @@
              (vs (second operands)))
          (m68k-load-vreg buf +68k-d0+ vs)
          (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
-         (m68k-emit-andi buf +68k-d1+ #xF)
+         (m68k-emit-andi buf +68k-d1+ (m68k-tag-mask))
          ;; The inverse of +op-consp+'s NIL exclusion: (atom NIL) is T.
          (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
          (let ((true-label (mvm-make-label))
@@ -2208,7 +2221,7 @@
         (if *68k-alloc-obj-label*
          (progn                          ; the shared ALLOC-OBJ
            (m68k-emit-imm-dn buf (logior (ash size 8) subtag) +68k-d0+)
-           (m68k-emit-imm-dn buf (logand (+ (* (1+ size) 4) 15) (lognot 15)) +68k-d1+)
+           (m68k-emit-imm-dn buf (m68k-round (* (1+ size) 4)) +68k-d1+)
            (m68k-emit-bsr buf *68k-alloc-obj-label*)
            (m68k-store-vreg buf vd +68k-d0+))
          (progn
@@ -2234,7 +2247,7 @@
            ;; DEFCLASS/MAKE-INSTANCE rounds in a 16 MB heap (see
            ;; translate-arm32's +op-alloc-obj+).  x64, aarch64, i386 and arm32
            ;; all zero here.
-           (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15)))
+           (let ((total (m68k-round (* (1+ size) 4)))
                  (zl (mvm-make-label)))
              (m68k-emit-lea-disp buf +68k-a2+ 4 +68k-a0+)
              (m68k-emit-move-imm-dn buf (1- (floor total 4)) +68k-d1+)
@@ -2315,7 +2328,7 @@
        (let ((vd (first operands))
              (vs (second operands)))
          (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-moveq buf +68k-d1+ 15)               ; AND #15 in 4 bytes, not 6
+         (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))  ; AND in 4 bytes, not 6
          (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
          ;; Tag as fixnum: shift left 1
          (m68k-emit-lsl-imm buf +68k-d0+ 1)
@@ -2340,7 +2353,7 @@
            (m68k-load-vreg buf +68k-d0+ vs)
            (m68k-emit-cmpi buf +68k-d0+ +t-value+)
            (m68k-emit-beq buf zero)
-           (m68k-emit-moveq buf +68k-d1+ 15)
+           (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))
            (m68k-emit-and-dn-dn buf +68k-d0+ +68k-d1+)
            (m68k-emit-cmpi-byte buf +68k-d1+ +tag-object+)
            (m68k-emit-bne buf zero)
@@ -2462,8 +2475,8 @@
          ;; bytes = align16(4N + 4); ZERO everything past the header (a new
          ;; vector reads 0.0f0), then VA += bytes.
          (m68k-emit-lsl-imm buf +68k-d1+ 2)
-         (m68k-emit-addi buf +68k-d1+ 19)
-         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-addi buf +68k-d1+ (+ 3 (m68k-granule)))
+         (m68k-emit-andi buf +68k-d1+ (logand (- (m68k-granule)) #xFFFFFFFF))
          (m68k-emit-lea-disp buf +68k-a2+ 4 +68k-a0+)
          (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
          (m68k-emit-lsr-imm buf +68k-d0+ 2)
@@ -2483,7 +2496,7 @@
          (m68k-emit-lsl-imm buf +68k-d0+ 1)                     ; 4i
          (m68k-load-vreg buf +68k-d1+ (second operands))
          (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-subi buf +68k-d0+ 5)
+         (m68k-emit-subi buf +68k-d0+ (- +tag-object+ 4))
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-emit-fmove-s-from-an-ind buf +68k-a0+ 0)
          (m68k-float-box buf 0 (logior #x64 (ash 4 8)))
@@ -2500,7 +2513,7 @@
          (m68k-emit-lsl-imm buf +68k-d0+ 1)
          (m68k-load-vreg buf +68k-d1+ (first operands))
          (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-subi buf +68k-d0+ 5)
+         (m68k-emit-subi buf +68k-d0+ (- +tag-object+ 4))
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-emit-fmove-s-to-an-ind buf 0 +68k-a0+)))
 
@@ -2617,7 +2630,7 @@
          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-cons+)
          ;; Bump A2 by 16 -- the same reason as +op-cons+.
-         (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)
+         (m68k-emit-lea-disp buf +68k-a2+ (m68k-granule) +68k-a2+)
          (m68k-store-vreg buf vd +68k-d0+)))
 
       ((#.+op-gc-check+ #.+op-gc-check-n+ #.+op-gc-check-r+)
@@ -2780,8 +2793,8 @@
          ;; D1 = align16((count + 1) * 4), then A2 += D1.
          (m68k-emit-addi buf +68k-d1+ 1)
          (m68k-emit-lsl-imm buf +68k-d1+ 2)
-         (m68k-emit-addi buf +68k-d1+ 15)
-         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-addi buf +68k-d1+ (1- (m68k-granule)))
+         (m68k-emit-andi buf +68k-d1+ (logand (- (m68k-granule)) #xFFFFFFFF))
          (m68k-emit-zero-and-bump buf)))
 
       (#.+op-aref+
@@ -2848,9 +2861,9 @@
          (m68k-store-vreg buf vd +68k-d0+)))))
 
       ;;; --- Byte vectors and strings ---
-      ;; Payload starts right after the header longword, at obj - 9 + 4, i.e.
-      ;; obj - 5.  The 68k has no byte move with a displacement here, so the
-      ;; -5 is folded into the address before it reaches A0.  Shapes mirror
+      ;; Payload starts right after the header longword, at obj - tag + 4 (obj - 5
+      ;; with tag 9, obj - 3 with *68K-TAGS3*'s 7).  The 68k has no byte move with
+      ;; a displacement here, so it is folded into the address before A0.  Shapes mirror
       ;; translate-i386, including which operands arrive TAGGED.
       (#.+op-alloc-u8+
        (let ((vd (first operands))
@@ -2867,8 +2880,8 @@
          (m68k-emit-ori buf +68k-d0+ +tag-object+)
          (m68k-store-vreg buf vd +68k-d0+)
          ;; bytes = align16(N + 4)
-         (m68k-emit-addi buf +68k-d1+ 19)                ; N + 4 + 15
-         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-addi buf +68k-d1+ (+ 3 (m68k-granule)))  ; N + 4 + granule - 1
+         (m68k-emit-andi buf +68k-d1+ (logand (- (m68k-granule)) #xFFFFFFFF))
          (m68k-emit-zero-and-bump buf)))
 
       (#.+op-alloc-string+
@@ -2887,8 +2900,8 @@
          ;; bytes = align16((count + 1) * 4)
          (m68k-emit-addi buf +68k-d1+ 1)
          (m68k-emit-lsl-imm buf +68k-d1+ 2)
-         (m68k-emit-addi buf +68k-d1+ 15)
-         (m68k-emit-andi buf +68k-d1+ (logand (lognot 15) #xFFFFFFFF))
+         (m68k-emit-addi buf +68k-d1+ (1- (m68k-granule)))
+         (m68k-emit-andi buf +68k-d1+ (logand (- (m68k-granule)) #xFFFFFFFF))
          (m68k-emit-zero-and-bump buf)))
 
       (#.+op-u8-ref+
@@ -2899,7 +2912,7 @@
          (m68k-emit-asr-imm buf +68k-d0+ 1)
          (m68k-load-vreg buf +68k-d1+ varr)
          (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-subi buf +68k-d0+ 5)                 ; tag 9 - header 4
+         (m68k-emit-subi buf +68k-d0+ (- +tag-object+ 4)) ; tag - header 4
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d0+)
          (m68k-emit-andi buf +68k-d0+ #xFF)              ; MOVE.B leaves the top
@@ -2916,7 +2929,7 @@
          (m68k-emit-asr-imm buf +68k-d0+ 1)
          (m68k-load-vreg buf +68k-d1+ varr)
          (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-subi buf +68k-d0+ 5)
+         (m68k-emit-subi buf +68k-d0+ (- +tag-object+ 4))
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-load-vreg buf +68k-d0+ vval)
          (m68k-emit-asr-imm buf +68k-d0+ 1)
@@ -3040,8 +3053,10 @@
    choose (#x10000000 + 248 MB + 4 MB guard), where ARM32's has always been.
    The stub maps only the S/16 bytes a heap of size S needs, so a small heap
    costs a small map, and the bias below stays a translate-time constant.")
-(defconstant +68k-gc-kind-bias+ (- +68k-gc-kind-map+ (ash #x10000000 -4))
-  "K: the kind byte of address A is at K + (A >> 4).")
+(defun m68k-kind-bias ()
+  "K: the kind byte of address A is at K + (A >> kind-shift), one byte per
+   heap granule."
+  (- +68k-gc-kind-map+ (ash #x10000000 (- (m68k-kind-shift)))))
 (defvar *68k-gc-static* nil
   "STATIC BOOT HEAP (MODUS_68K_GC_STATIC; unset, it follows MODUS_SMALL_IMAGE).
    A request word makes the collector, at the end of the collection that sees
@@ -3144,8 +3159,8 @@
    every allocation arm, before either holds an operand."
   (when *68k-gc-label*
     (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
-    (m68k-emit-lsr-imm buf +68k-d0+ 4)
-    (m68k-emit-move-imm-an buf +68k-gc-kind-bias+ +68k-a0+) ; A0 = K
+    (m68k-emit-lsr-imm buf +68k-d0+ (m68k-kind-shift))
+    (m68k-emit-move-imm-an buf (m68k-kind-bias) +68k-a0+) ; A0 = K
     (m68k-emit-adda-dn buf +68k-d0+ +68k-a0+)
     (m68k-emit-moveq buf +68k-d0+ kind)
     (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+)))
@@ -3179,7 +3194,7 @@
   (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ 4)   ; cdr
   (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
   (m68k-emit-addq buf +68k-d0+ +tag-cons+)            ; 16-aligned: + tag = OR tag
-  (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)       ; 16, as the inline CONS
+  (m68k-emit-lea-disp buf +68k-a2+ (m68k-granule) +68k-a2+)       ; 16, as the inline CONS
   (m68k-emit-rts buf))
 
 (defvar *68k-subtag-label* nil
@@ -3209,7 +3224,7 @@
     (m68k-emit-label buf *68k-subtag-label*)
     (m68k-emit-cmpi buf +68k-d0+ +t-value+)
     (m68k-emit-beq buf zero)
-    (m68k-emit-moveq buf +68k-d1+ 15)
+    (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))
     (m68k-emit-and-dn-dn buf +68k-d0+ +68k-d1+)
     (m68k-emit-cmpi-byte buf +68k-d1+ +tag-object+)
     (m68k-emit-bne buf zero)
@@ -3396,7 +3411,7 @@
 (defun m68k-emit-kind-addr (buf dst-dn addr-dn)
   "DST-DN = the kind-byte address of the granule at ADDR-DN; K is in D6."
   (unless (= dst-dn addr-dn) (m68k-emit-move-dn-dn buf addr-dn dst-dn))
-  (m68k-emit-lsr-imm buf dst-dn 4)
+  (m68k-emit-lsr-imm buf dst-dn (m68k-kind-shift))
   (m68k-emit-add-dn-dn buf +68k-d6+ dst-dn))
 
 (defun m68k-emit-object-size (buf dst hdr)
@@ -3423,8 +3438,8 @@
     (m68k-emit-addq buf dst 1)
     (m68k-emit-lsl-imm buf dst 2)
     (m68k-emit-label buf al)
-    (m68k-emit-addi buf dst 15)
-    (m68k-emit-andi buf dst (logand (lognot 15) #xFFFFFFFF))))
+    (m68k-emit-addi buf dst (1- (m68k-granule)))
+    (m68k-emit-andi buf dst (logand (- (m68k-granule)) #xFFFFFFFF))))
 
 (defparameter *68k-gc-leaf-subtags* '(#x10 #x11 #x12 #x13 #x14 #x16 #x60 #x64 #x65 #x66)
   "Objects whose payload holds no pointers: copied, never scanned.  ARM32's
@@ -3513,7 +3528,7 @@
       (m68k-emit-word buf #x1030) (m68k-emit-word buf #x7800) ; MOVE.B (0,A0,D7.L),D0
       (m68k-emit-cmpi buf +68k-d0+ 255)
       (m68k-emit-beq buf aftercard)
-      (m68k-emit-lsl-imm buf +68k-d0+ 4)
+      (m68k-emit-lsl-imm buf +68k-d0+ (m68k-kind-shift))      ; granules
       (m68k-emit-word buf #xDBC0)                           ; ADDA.L D0,A5
       ;; objects starting in [A5, card end), and below ohi
       (here olp)
@@ -3574,7 +3589,7 @@
       (m68k-emit-bsr buf scan)
       (m68k-emit-lea-disp buf +68k-a5+ 4 +68k-a1+)
       (young-check +68k-a1+)
-      (m68k-emit-lea-disp buf +68k-a5+ 16 +68k-a5+)
+      (m68k-emit-lea-disp buf +68k-a5+ (m68k-granule) +68k-a5+)
       (m68k-emit-bra buf cpl)
       ;; re-mark the card if it still refers to the young space
       (here aftercard)
@@ -3646,7 +3661,7 @@
       (m68k-emit-bsr buf scan)
       (m68k-emit-lea-disp buf +68k-a5+ 4 +68k-a0+)
       (m68k-emit-bsr buf scan)
-      (m68k-emit-lea-disp buf +68k-a5+ 16 +68k-a5+)
+      (m68k-emit-lea-disp buf +68k-a5+ (m68k-granule) +68k-a5+)
       (m68k-emit-bra buf cl)
       (here cd))))
 
@@ -3712,7 +3727,7 @@
       (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d1+)
       (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
       (m68k-emit-move-dn-an buf +68k-d1+ +68k-a3+)               ; cons low = to_end
-      (m68k-emit-move-imm-dn buf +68k-gc-kind-bias+ +68k-d6+)    ; K
+      (m68k-emit-move-imm-dn buf (m68k-kind-bias) +68k-d6+)    ; K
       ;; ---- roots: the stack from the save frame, then the low block ----
       (m68k-emit-move-an-an buf +68k-a7+ +68k-a5+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x18 +68k-d7+)        ; stack_base
@@ -3804,7 +3819,7 @@
         (m68k-emit-bra buf ch)
         ;; -- one cons below A6 --
         (here cons)
-        (m68k-emit-lea-disp buf +68k-a6+ -16 +68k-a6+)
+        (m68k-emit-lea-disp buf +68k-a6+ (- (m68k-granule)) +68k-a6+)
         (m68k-emit-move-an-an buf +68k-a6+ +68k-a0+)
         (m68k-emit-bsr buf scan)
         (m68k-emit-lea-disp buf +68k-a6+ 4 +68k-a0+)
@@ -3904,14 +3919,14 @@
         (here scan)
         (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
         (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
-        (m68k-emit-andi buf +68k-d1+ 15)                         ; tag
-        (m68k-emit-cmpi buf +68k-d1+ 1)
+        (m68k-emit-andi buf +68k-d1+ (m68k-tag-mask))            ; tag
+        (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
         (m68k-emit-beq buf isptr)
-        (m68k-emit-cmpi buf +68k-d1+ 9)
+        (m68k-emit-cmpi buf +68k-d1+ +tag-object+)
         (m68k-emit-bne buf ret)
         (here isptr)
         (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
-        (m68k-emit-andi buf +68k-d2+ (logand (lognot 15) #xFFFFFFFF)) ; address
+        (m68k-emit-andi buf +68k-d2+ (logand (lognot (m68k-tag-mask)) #xFFFFFFFF)) ; address
         (m68k-emit-cmp-dn-dn buf +68k-d4+ +68k-d2+)               ; D2 - from_start
         (m68k-emit-bcc-word buf +68k-cc-cs+ ret)
         (m68k-emit-cmp-dn-dn buf +68k-d5+ +68k-d2+)               ; D2 - from_end
@@ -3921,6 +3936,34 @@
         (m68k-emit-move-dn-an buf +68k-d3+ +68k-a1+)
         (m68k-emit-moveq buf +68k-d3+ 0)
         (m68k-emit-move-byte-an-ind-dn buf +68k-a1+ +68k-d3+)
+        (if *68k-tags3*
+            ;; 3-BIT TAGS: forwarding is in the kind map, not in the word --
+            ;; 3 = forwarded object, 4 = forwarded cons -- and the old first
+            ;; word holds the new TAGGED pointer.  (Every 3-bit pointer tag is
+            ;; a live type; there is no spare one to mark a forward with.)
+            (let ((fwd (lbl)))
+              (m68k-emit-cmpi buf +68k-d1+ +tag-cons+)
+              (m68k-emit-bne buf kobj)
+              (m68k-emit-cmpi buf +68k-d3+ 4)
+              (m68k-emit-beq buf fwd)
+              (m68k-emit-cmpi buf +68k-d3+ 2)
+              (m68k-emit-bne buf ret)
+              (m68k-emit-bra buf kok)
+              (here kobj)
+              (m68k-emit-cmpi buf +68k-d3+ 3)
+              (m68k-emit-beq buf fwd)
+              (m68k-emit-cmpi buf +68k-d3+ 1)
+              (m68k-emit-bne buf ret)
+              (m68k-emit-bra buf kok)
+              (here fwd)
+              (m68k-emit-move-dn-an buf +68k-d2+ +68k-a1+)
+              (m68k-emit-move-an-ind-dn buf +68k-a1+ +68k-d3+)    ; new, tagged
+              (m68k-emit-move-dn-an-ind buf +68k-d3+ +68k-a0+)
+              (m68k-emit-rts buf)
+              (here kok)
+              (m68k-emit-move-dn-an buf +68k-d2+ +68k-a1+)        ; A1 = old base
+              (m68k-emit-move-an-ind-dn buf +68k-a1+ +68k-d3+))   ; first word
+            (progn
         (m68k-emit-cmpi buf +68k-d1+ 1)
         (m68k-emit-bne buf kobj)
         (m68k-emit-cmpi buf +68k-d3+ 2)
@@ -3940,20 +3983,29 @@
         (m68k-emit-andi buf +68k-d3+ (logand (lognot 15) #xFFFFFFFF))
         (m68k-emit-or-dn-dn buf +68k-d1+ +68k-d3+)
         (m68k-emit-move-dn-an-ind buf +68k-d3+ +68k-a0+)
-        (m68k-emit-rts buf)
+        (m68k-emit-rts buf)))
         (here notfwd)
         (m68k-emit-cmpi buf +68k-d1+ 1)
         (m68k-emit-bne buf obj)
-        ;; -- cons: 16 bytes down from A3 --
-        (m68k-emit-lea-disp buf +68k-a3+ -16 +68k-a3+)
+        ;; -- cons: a granule down from A3 --
+        (m68k-emit-lea-disp buf +68k-a3+ (- (m68k-granule)) +68k-a3+)
         (m68k-emit-cmpa-an buf +68k-a2+ +68k-a3+)                 ; A3 - A2
         (m68k-emit-bcc-word buf +68k-cc-cs+ ovf)
         (m68k-emit-move-dn-disp buf +68k-d3+ +68k-a3+ 0)          ; car
         (m68k-emit-move-disp-dn buf +68k-a1+ 4 +68k-d0+)
         (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a3+ 4)          ; cdr
         (m68k-emit-move-an-dn buf +68k-a3+ +68k-d0+)
-        (m68k-emit-ori buf +68k-d0+ 15)
-        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)          ; forward
+        (if *68k-tags3*
+            (progn                                                ; forward:
+              (m68k-emit-ori buf +68k-d0+ +tag-cons+)             ; the new pointer,
+              (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)
+              (m68k-emit-kind-addr buf +68k-d0+ +68k-d2+)         ; and kind 4
+              (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)
+              (m68k-emit-moveq buf +68k-d0+ 4)
+              (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a1+))
+            (progn
+              (m68k-emit-ori buf +68k-d0+ 15)
+              (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)))  ; forward
         (m68k-emit-move-an-dn buf +68k-a3+ +68k-d0+)
         (m68k-emit-ori buf +68k-d0+ 1)
         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)          ; update slot
@@ -3986,10 +4038,19 @@
         (m68k-emit-bne buf cl)
         (m68k-emit-move-dn-an buf +68k-d2+ +68k-a1+)
         (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
-        (m68k-emit-ori buf +68k-d0+ 15)
-        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)          ; forward
+        (if *68k-tags3*
+            (progn                                                ; forward:
+              (m68k-emit-ori buf +68k-d0+ +tag-object+)           ; the new pointer,
+              (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)
+              (m68k-emit-kind-addr buf +68k-d0+ +68k-d2+)         ; and kind 3
+              (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)
+              (m68k-emit-moveq buf +68k-d0+ 3)
+              (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a1+))
+            (progn
+              (m68k-emit-ori buf +68k-d0+ 15)
+              (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)))  ; forward
         (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
-        (m68k-emit-ori buf +68k-d0+ 9)
+        (m68k-emit-ori buf +68k-d0+ +tag-object+)
         (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)          ; update slot
         (m68k-emit-kind-addr buf +68k-d0+ +68k-d3+)
         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a1+)

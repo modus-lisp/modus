@@ -23,6 +23,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 | `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.2 MB | 5.75 MB |
 | `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` + `MODUS_HOT_ORDER` (REPL) | 5.5 MB | 5.6 MB | 5.75 MB |
 | `+ MODUS_68K_CORE` (REPL booting from its saved core, 512 KB young heap) | 7.8 MB | 4.5 MB after a REPL session, 0.44 MB of it dirty | 512 KB |
+| `+ MODUS_68K_TAGS3` (3-bit tags, 8-byte granule) | 7.5 MB; core 1.88 MB (was 2.24) | 4.15 MB after a REPL session (was 4.52), 0.34 MB of it dirty (was 0.44) | 512 KB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -48,6 +49,7 @@ All opt-in; unset, every image is built as before.  68k soft float:
 | `MODUS_68K_HOT=FILE` | with `MODUS_68K_THREADED`: the functions named in FILE (one a line) stay native |
 | `MODUS_68K_PROFILE=1` | per-function execution counters at `#x10010000` (entries + loop heads), for choosing the hot list |
 | `MODUS_68K_CORE=1` | with `MODUS_68K_GC_STATIC`: the build boots the image once (`MODUS_68K_SAVE_CORE`), saves the low block and the static heap, and links them in as `PT_LOAD`s (`scripts/68k-core-link.py`); the image then starts from that heap: no boot init, 0.1 s to the prompt |
+| `MODUS_68K_TAGS3=1` / `0` | 68k pointer tags in 3 bits (object 7, T `#xDEAD1007`) and an 8-byte heap granule instead of 16: a cons is 8 bytes, objects round to 8, the kind map is one byte per 8 bytes, forwarding is recorded in the kind map.  Unset follows `MODUS_SMALL_IMAGE`; `mvm/build-hosted.lisp` reads it too, for the hosted ladder |
 | `MODUS_68K_RELAX_BRANCHES=1` / `0` | each 68k branch as short as its distance allows (two translation passes); unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_NO_SOURCE_BLOB=1` | no embedded source (disk only on a hosted system) |
 | `MODUS_NO_COMPILER=1` | no compiler: the compiler-side files filtered to what the rest of the image reaches (`mvm/build-no-compiler.lisp`), entry points stubbed to signal; the toplevel runs a `%IMAGE-MAIN` baked in with `MODUS_EXTRA_SOURCE=FILE` |
@@ -141,6 +143,22 @@ All opt-in; unset, every image is built as before.  68k soft float:
 - **A symbols-first constant pool** (lean images): no measurable effect.
 - **A tethered REPL** (compile on a host, replay FASL records on the target):
   feasible, set aside -- the goal is a self-contained REPL.
+
+## The 8-byte granule (`MODUS_68K_TAGS3`)
+
+The 16-byte granule cost 426 KB of the 2.1 MB static heap (an 8-byte cons
+took 16).  With 3-bit tags the core goes 2,240,544 -> 1,884,192 bytes.  The
+tag constants are per-target parameters in `target.lisp` (folded into the
+image through the width preamble), and three places had the old values
+baked in, each found by the image failing:
+- `translate-i386.lisp` DEFCONSTANTed `+tag-cons+` / `+tag-object+`, so every
+  translator loaded after it folded 9 (SBCL: `(constantp '+tag-object+)` = T);
+- prelude's `%make-base-string` / `%make-string32` / `%make-u32-vector`
+  wrote the header at `word - 9`;
+- the interpreter's LI arm recognised T by its low byte `#x09`.
+Validated: hosted ladder 35/35 + h01 under tags3, `validate.sh` and the poison
+build identical to the references, core image included.  x64 and i386 ladder
+images byte-identical to before.
 
 ## Plan
 

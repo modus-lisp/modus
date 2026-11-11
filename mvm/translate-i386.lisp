@@ -103,9 +103,9 @@
 ;;; Tagged Value Constants
 ;;; ============================================================
 
-(defconstant +tag-cons+    #x01 "Cons tag: low 4 bits = 0001")
-(defconstant +tag-object+  #x09 "Object tag: low 4 bits = 1001")
-(defconstant +tag-mask+    #x0F "Mask for extracting tag from pointer")
+;; +TAG-CONS+ / +TAG-OBJECT+ are target.lisp's per-target parameters; a
+;; DEFCONSTANT here made them constants for every translator loaded after it.
+(defconstant +tag-mask+   #x0F "Mask for extracting tag from pointer")
 (defconstant +i386-mvm-t+  #xDEAD1009 "Placeholder T value (object-tagged marker)")
 
 ;;; ============================================================

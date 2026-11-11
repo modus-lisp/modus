@@ -3879,8 +3879,9 @@
                    (push (list op (first e) (second e) (third e)) rows))
                  op-stats)
         (setq rows (sort rows #'> :key #'third))
-        (format t "~&;; 68k op stats: ~D native bytes~%;;   ~10A ~8@A ~10@A ~6@A ~8@A~%"
-                total "opcode" "count" "bytes" "%" "B/insn")
+        (format t "~&;; 68k op stats: ~D native bytes from ~D MVM bytecode bytes~%;;   ~10A ~8@A ~10@A ~6@A ~8@A~%"
+                total (let ((bc 0)) (maphash (lambda (op e) (declare (ignore op)) (incf bc (third e))) op-stats) bc)
+                "opcode" "count" "bytes" "%" "B/insn")
         (dolist (r (subseq rows 0 (min 30 (length rows))))
           (let* ((info (gethash (first r) *opcode-table*))
                  (nm (if info (opcode-info-name info) (first r))))

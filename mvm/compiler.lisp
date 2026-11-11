@@ -24372,14 +24372,14 @@
    no generic slow path.  The declarations were there and unused: (logxor a b) on two
    (unsigned-byte 32) variables kept a tag test and a GENERIC-LOGXOR call, nine of SHA-1's
    ~330 instructions a round.  NIL when any width is unknown (bignum operands stay generic).
-   A width of the full +FIXNUM-SIGNED-BITS+ is NOT trusted: that is a declared FIXNUM,
-   whose range includes MOST-NEGATIVE-FIXNUM, and that one value is a BIGNUM at run time
-   here (its magnitude 2^62 is not demoted), so a plain AND of it would AND a pointer.
-   One bit narrower, every value in range really is a fixnum."
+   A declared FIXNUM (the full +FIXNUM-SIGNED-BITS+) is trusted too: MOST-NEGATIVE-FIXNUM
+   is -(2^62 - 1), the bottom of the symmetric range every integer is normalized into, so
+   every value of that type is a fixnum.  (When it was -2^62 -- a bignum here -- a
+   declared FIXNUM could hold a pointer, and this trusted only narrower widths.)"
   (let ((w 0))
     (dolist (a flat-args (list t t w))
       (let ((wa (%expr-width a env)))
-        (unless (and wa (< wa +fixnum-signed-bits+)) (return nil))
+        (unless wa (return nil))
         (setq w (max w wa))))))
 
 (defun compile-logand (args env dest)

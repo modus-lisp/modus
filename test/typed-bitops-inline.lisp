@@ -55,6 +55,16 @@
   (check 'bignum-and (untyped-and big2 (ash big2 -3)) (gen-and big2 (ash big2 -3)))
   (check 'bignum-and-fix (untyped-and (+ big 12345) #xffff) 12345))
 
+;; the fixnum range's own bounds are fixnums, and the next integer past each is not --
+;; modus's MOST-NEGATIVE-FIXNUM was -2^62, a bignum here, so a declared FIXNUM could hold
+;; a pointer and the trust above had to stop one bit short
+(check 'mnf-is-fixnum (typep most-negative-fixnum 'fixnum) t)
+(check 'mpf-is-fixnum (typep most-positive-fixnum 'fixnum) t)
+(check 'below-mnf (typep (1- most-negative-fixnum) 'fixnum) nil)
+(check 'above-mpf (typep (1+ most-positive-fixnum) 'fixnum) nil)
+(check 'fixnum-subtype (and (subtypep 'fixnum `(integer ,most-negative-fixnum ,most-positive-fixnum))
+                            (subtypep `(integer ,most-negative-fixnum ,most-positive-fixnum) 'fixnum)) t)
+
 ;;; ---- inline calls with integer-literal arguments -----------------------------------------
 (declaim (inline rol32 add3 shifty uses-let loopy assigns))
 (defun rol32 (x n)

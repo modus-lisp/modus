@@ -1274,7 +1274,7 @@
   (setq *gentemp-counter* 0)
   (setq internal-time-units-per-second 1000000)
   (setq most-positive-fixnum  4611686018427387903)
-  (setq most-negative-fixnum -4611686018427387904)
+  (setq most-negative-fixnum -4611686018427387903)
   (%init-standard-chars)
   (%init-boole-constants)
   (setq *serial-repl-buf* nil)
@@ -1290,7 +1290,7 @@
   (setq *gentemp-counter* 0)
   (setq internal-time-units-per-second 1000000)
   (setq most-positive-fixnum  4611686018427387903)
-  (setq most-negative-fixnum -4611686018427387904)
+  (setq most-negative-fixnum -4611686018427387903)
   (%init-standard-chars)
   (%init-boole-constants)
   (handler-case
@@ -1323,7 +1323,7 @@
                  (if *cl-repl-i386-p* '(("#x0FE00000" . "#x03B00000")
                                         ("#x0FF00000" . "#x03C00000")) nil)
                  '(("4611686018427387903" . "536870911")
-                  ("-4611686018427387904" . "-536870912"))))
+                  ("-4611686018427387903" . "-536870911"))))
     (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
       (unless at (error "32-bit: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
       (setq *cli-arch-io-scratch-source*
@@ -3695,7 +3695,7 @@
     ;; implicit globals (NIL).  The toplevel DEFCONSTANT clause only records
     ;; them in *constants* and never redefines a host constant.
     (format out "(defconstant most-positive-fixnum 4611686018427387903)~%")
-    (format out "(defconstant most-negative-fixnum -4611686018427387904)~%")
+    (format out "(defconstant most-negative-fixnum -4611686018427387903)~%")
     (incf n 2)
     (loop
       (let ((p (search "(defconstant +" text :start2 pos)))

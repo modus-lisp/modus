@@ -2090,6 +2090,13 @@
        (let ((vd (first operands))
              (size (second operands))
              (subtag (third operands)))
+        (if *68k-alloc-obj-label*
+         (progn                          ; the shared ALLOC-OBJ
+           (m68k-emit-imm-dn buf (logior (ash size 8) subtag) +68k-d0+)
+           (m68k-emit-imm-dn buf (logand (+ (* (1+ size) 4) 15) (lognot 15)) +68k-d1+)
+           (m68k-emit-bsr buf *68k-alloc-obj-label*)
+           (m68k-store-vreg buf vd +68k-d0+))
+         (progn
          (m68k-emit-alloc-mark buf 1)   ; FIRST: clobbers D0/A0
          ;; Header: (size << 8) | subtag -- the one 32-bit header layout every
          ;; other allocation site here, ARM32 and i386 write, and the one the
@@ -2131,7 +2138,7 @@
                                                (ash #b111 6)  ; .L ADDA
                                                (ash +ea-mode-dn+ 3)
                                                +68k-d1+)))))
-           (m68k-store-vreg buf vd +68k-d0+))))
+           (m68k-store-vreg buf vd +68k-d0+))))))
 
       (#.+op-obj-ref+
        (let ((vd (first operands))
@@ -3058,6 +3065,34 @@
   (m68k-emit-lsl-imm buf +68k-d0+ 1)
   (m68k-emit-rts buf))
 
+(defvar *68k-alloc-obj-label* nil
+  "Label of the shared ALLOC-OBJ sequence while translating, else NIL.")
+
+(defun m68k-emit-alloc-obj-helper (buf)
+  "The shared ALLOC-OBJ: D0 = the header, D1 = the object's total bytes (a
+   multiple of 16, at least 16) in; D0 = the tagged object out, every word past
+   the header zeroed.  Clobbers D1 and A0.  The site's GC-CHECK-N stays at the
+   site, so no collection runs in here."
+  (let ((zl (mvm-make-label)))
+    (m68k-emit-label buf *68k-alloc-obj-label*)
+    (when *68k-gc-label*
+      (m68k-emit-push-dn buf +68k-d0+)
+      (m68k-emit-alloc-mark buf 1)                    ; clobbers D0 and A0
+      (m68k-emit-pop-dn buf +68k-d0+))
+    (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)   ; header
+    (m68k-emit-lea-disp buf +68k-a2+ 4 +68k-a0+)
+    (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+    (m68k-emit-lsr-imm buf +68k-d0+ 2)
+    (m68k-emit-subq buf +68k-d0+ 1)                   ; words past the header
+    (m68k-emit-label buf zl)
+    (m68k-emit-word buf #x4298)                       ; CLR.L (A0)+
+    (m68k-emit-subq buf +68k-d0+ 1)
+    (m68k-emit-bne buf zl)
+    (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+    (m68k-emit-ori buf +68k-d0+ +tag-object+)
+    (m68k-emit-adda-dn buf +68k-d1+ +68k-a2+)          ; bump
+    (m68k-emit-rts buf)))
+
 (defun m68k-next-is-unlabelled-cons-p (next-pc)
   "True when the instruction at NEXT-PC is a CONS that no branch lands on."
   (and *68k-cons-label* *68k-bytecode*
@@ -3450,6 +3485,7 @@
          (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-alloc-obj-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-bytecode* bytecode)
          (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
@@ -3565,6 +3601,8 @@
       (m68k-emit-subtag-helper buf))
     (when *68k-array-len-label*
       (m68k-emit-array-len-helper buf))
+    (when *68k-alloc-obj-label*
+      (m68k-emit-alloc-obj-helper buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)

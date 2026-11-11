@@ -11212,6 +11212,13 @@
     ((and (consp test) (symbolp (car test)) (consp (cdr test)) (null (cddr test))
           (name-eq (car test) "ZEROP") (%expr-width (cadr test) env))
      (%compile-test-branch (list '= (cadr test) 0) env dest false-label))
+    ;; ZEROP / PLUSP / MINUSP of a float tree: against a zero of its format in
+    ;; FP registers.  ZEROP is x >= 0 and x <= 0 -- true for both zeros, false
+    ;; for a NaN, as ZEROP -- the tree evaluated twice, which a call-free tree
+    ;; allows.  It went through NUMERIC-EQUAL-P: mill's MM-DENSE-P asks it of
+    ;; every multiplier of every MatMul.
+    ((%fp-sign-test test env)
+     (%compile-test-branch (%fp-sign-test test env) env dest false-label))
     ;; two float trees: FP registers (COMPILE-COMPARE-2's path).  The fixnum
     ;; branches below box a double literal on every evaluation and call the
     ;; generic comparison -- (< -707d0 xd) allocated 48 bytes
@@ -13677,6 +13684,20 @@
               ((string= n "VALUES")
                (and (consp (cdr form)) (null (cddr form))
                     (%fp-scope-call-free-p (cadr form) env (1+ depth))))
+              ;; several pairs: each pair on its own (mill's register block
+              ;; updates every accumulator in one SETF)
+              ((and (or (string= n "SETQ") (string= n "SETF"))
+                    (consp (cdr form)) (consp (cddr form)) (consp (cdddr form)))
+               (let ((r (cdr form)) (ok t))
+                 (loop (when (or (not ok) (not (consp r))) (return))
+                       (unless (and (consp (cdr r))
+                                    (%fp-scope-call-free-p
+                                     (list (if (string= n "SETQ") 'setq 'setf)
+                                           (car r) (cadr r))
+                                     env (1+ depth)))
+                         (setq ok nil))
+                       (setq r (cddr r)))
+                 ok))
               ((string= n "SETQ")
                (and (consp (cdr form)) (symbolp (cadr form))
                     (env-lookup env (cadr form))            ; lexical only (a global setq calls)
@@ -14338,6 +14359,15 @@
         (return-from compile-setq nil))))
   (compile-setq-1 var val env dest))
 
+(defun %fp-setq-tree-fits-p (val env kind)
+  "VAL is an unboxed tree of KIND that fits the FP registers left now."
+  (case kind
+    (:vector (%v4-tree-fits-p val env))
+    (:dscalar (let ((n (%fpd-pure-need val env)))
+                (and n (<= (+ *fp-reg-counter* n) +fp-reg-max+))))
+    (:scalar (%fp-tree-fits-p val env))
+    (t nil)))
+
 (defun compile-setq-1 (var val env dest)
   "COMPILE-SETQ for a lexical or global variable (no symbol-macro)."
   ;; FP-resident local (layer 2c): the value tree lands in the register
@@ -14355,22 +14385,29 @@
         ;; with none free, through a box.
         (cond ((%setq-direct-safe-p var val env)
                (%compile-init-into-fpreg val env (binding-reg fb) kind))
-              ((< *fp-reg-counter* +fp-reg-max+)
+              ;; a tree that fits beside a fresh register: there, then move.
+              ;; Judged BEFORE the register is taken -- taken first, the fit
+              ;; test counted it twice, and with mill's 4x2 block (eleven
+              ;; resident locals) every accumulator update took the boxed
+              ;; route and called the prelude's vector functions: 2 us a step
+              ((%fp-setq-tree-fits-p val env kind)
                (let ((tf (alloc-fp-reg)))
-                 (%compile-init-into-fpreg val env tf kind)
+                 (case kind
+                   (:vector (compile-v4-unboxed val env tf))
+                   (:dscalar (compile-double-unboxed val env tf))
+                   (t (compile-float-unboxed val env tf)))
                  (emit-ir :fp-mov (binding-reg fb) tf)
                  (free-fp-reg)))
-              ;; a 4-lane value has no box to go through: the old route (correct
-              ;; whenever the variable is read first, as above)
-              ((eq kind :vector)
-               (%compile-init-into-fpreg val env (binding-reg fb) kind))
-              (t
+              ;; else through a box, straight into the variable's register: the
+              ;; whole value is computed before the register is written.  (A
+              ;; double goes through the box explicitly: %COMPILE-DOUBLE-INTO-
+              ;; FPREG would take a pure tree straight into the register.)
+              ((eq kind :dscalar)
                (let ((tmp (alloc-temp-reg)))
                  (compile-form val env tmp)
-                 (if (eq kind :dscalar)
-                     (emit-ir :fpd-unbox (binding-reg fb) tmp)
-                     (emit-ir :fp-unbox (binding-reg fb) tmp))
-                 (free-temp-reg)))))
+                 (emit-ir :fpd-unbox (binding-reg fb) tmp)
+                 (free-temp-reg)))
+              (t (%compile-init-into-fpreg val env (binding-reg fb) kind))))
       ;; box the assignment's value only when some consumer will read DEST
       (if (and dest (not *setq-value-unused*))
           (%emit-fpreg-box dest fb)
@@ -22811,7 +22848,13 @@
           (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
                (let ((a (%v4-tree-need (cadr form) env))
                      (b (%v4-tree-need (caddr form) env)))
-                 (and a b (max a (1+ b))))))
+                 (and a b
+                      ;; an operand that is a register-resident vector local is
+                      ;; read in place (COMPILE-V4-UNBOXED): only the other one
+                      ;; needs registers
+                      (cond ((%v4-resident-reg (caddr form) env) a)
+                            ((%v4-resident-reg (cadr form) env) b)
+                            (t (max a (1+ b))))))))
          ((%vil-op-p (car form)) (%vil-tree-need form env))   ; integer lanes (2b)
          (t nil))))
     (t nil))))
@@ -22825,6 +22868,12 @@
         ((string= name "%F32V-") :v4-sub)
         ((string= name "%F32V*") :v4-mul)
         (t :v4-div)))
+
+(defun %v4-resident-reg (form env)
+  "The FP register of FORM when it is a vector local kept in one, else NIL."
+  (and form (symbolp form)
+       (let ((b (env-lookup env form)))
+         (and b (eq (binding-location b) :fpvreg) (binding-reg b)))))
 
 (defun compile-v4-unboxed (form env fd)
   "Compile the vector tree FORM (caller checked %v4-tree-need) into FP vreg FD."
@@ -22862,12 +22911,26 @@
           (compile-float-unboxed (cadr form) env fd)  ; scalar single into FD
           (emit-ir :v4-dup fd fd))
          (t
-          (let ((op (%v4-arith-op n)))
-            (compile-v4-unboxed (cadr form) env fd)
-            (let ((ft (alloc-fp-reg)))
-              (compile-v4-unboxed (caddr form) env ft)
-              (emit-ir op fd fd ft)
-              (free-fp-reg))))))))))
+          ;; An operand that is a register-resident local is read in place:
+          ;; (%f32v+ acc (%f32v* xv bv)) took three fresh registers for two
+          ;; moves, and mill's 4x2 register block (eleven locals) then did not
+          ;; fit and boxed every accumulator.
+          (let ((op (%v4-arith-op n))
+                (ra (%v4-resident-reg (cadr form) env))
+                (rb (%v4-resident-reg (caddr form) env)))
+            (cond ((and ra rb) (emit-ir op fd ra rb))
+                  ((and rb (/= rb fd))
+                   (compile-v4-unboxed (cadr form) env fd)
+                   (emit-ir op fd fd rb))
+                  ((and ra (/= ra fd))
+                   (compile-v4-unboxed (caddr form) env fd)
+                   (emit-ir op fd ra fd))
+                  (t
+                   (compile-v4-unboxed (cadr form) env fd)
+                   (let ((ft (alloc-fp-reg)))
+                     (compile-v4-unboxed (caddr form) env ft)
+                     (emit-ir op fd fd ft)
+                     (free-fp-reg))))))))))))
 
 (defun %emit-v4-box (dest fd)
   "DEST ← a fresh 4-lane packed single-float vector holding FD's lanes."
@@ -23992,6 +24055,18 @@
                  (nb (if (eq kind :single) (%fp-tree-need b env) (%fpd-pure-need b env))))
              (<= (+ *fp-reg-counter* (max na (1+ nb))) +fp-reg-max+))
            kind))))
+
+(defun %fp-sign-test (test env)
+  "The comparison form a ZEROP / PLUSP / MINUSP of a float tree is, or NIL."
+  (and (consp test) (symbolp (car test)) (consp (cdr test)) (null (cddr test))
+       (or (name-eq (car test) "ZEROP") (name-eq (car test) "PLUSP") (name-eq (car test) "MINUSP"))
+       (let* ((x (cadr test))
+              (zero (cond ((%fp-compare-kind :blt x 0.0 env) 0.0)
+                          ((%fp-compare-kind :blt x 0d0 env) 0d0))))
+         (and zero
+              (cond ((name-eq (car test) "ZEROP") (list 'and (list '>= x zero) (list '<= x zero)))
+                    ((name-eq (car test) "PLUSP") (list '> x zero))
+                    (t (list '< x zero)))))))
 
 (defun %fp-compare-test-p (test env)
   "T when TEST is (< a b), (> a b), (<= a b) or (>= a b) of two float trees."
@@ -27125,7 +27200,13 @@
          (let ((n (symbol-name ty)))
            (cond ((string= n "FIXNUM") +fixnum-signed-bits+)   ; magnitude bits + sign
                  ((string= n "BIT") 1)
-                 (t nil))))
+                 ;; a DEFTYPE name: what it expands to.  A variable's declared
+                 ;; type is resolved when it is bound, but (THE dim x) reaches
+                 ;; here raw -- mill's (+ bb (the dim (* kk n))) was a generic
+                 ;; add, and with it every register accumulator of the matmul
+                 ;; block was boxed
+                 (t (let ((x (%resolve-declared-type ty)))
+                      (and x (not (eq x ty)) (not (symbolp x)) (%decl-int-width x)))))))
         ((and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (integerp (cadr ty)))
          (let ((n (symbol-name (car ty))) (w (cadr ty)))
            ;; Bounds are the TARGET's fixnum (62/61 on the 62-bit tower,
@@ -27177,7 +27258,13 @@
     ((integerp form)
      (let ((w (+ 1 (integer-length (abs form))))) (and (<= w +fixnum-bits+) w)))
     ((symbolp form)
-     (and form (%decl-int-width (%var-dtype form env))))
+     (and form
+          (or (%decl-int-width (%var-dtype form env))
+              ;; a DEFCONSTANT (the build's or a runtime one) is its integer:
+              ;; mill's (* j +f32-lanes+) index arithmetic was a generic call
+              (and (not (env-lookup env form))
+                   (let ((v (%const-int-value form)))
+                     (and v (%expr-width-1 v env)))))))
     ((not (consp form)) nil)
     ((not (symbolp (car form))) nil)
     (t

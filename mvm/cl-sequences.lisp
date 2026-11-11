@@ -5703,6 +5703,12 @@
    #x11), payload zero-initialised by the alloc-u8 opcode."
   (%alloc-u8 n))
 
+(defun %f32-fill (a x n)
+  "Store the single X in lanes [0, N) of the packed single-float vector A."
+  (declare (type (simple-array single-float (*)) a) (type single-float x) (type fixnum n))
+  (dotimes (i n a)
+    (setf (aref a i) x)))
+
 (defun make-array (dim &rest kwargs)
   "ANSI make-array — see file-level comment above for current scope."
   (let* ((dim-list (cond ((null dim) nil)
@@ -5861,6 +5867,13 @@
                           ;; to be a generic ASET per element.
                           ((and u8-elt (eql store 0)) a)
                           ((and u8-elt (integerp store) (<= 0 store 255)) (fill a store))
+                          ;; a single-float vector: %ALLOC-F32 is zero-filled, so
+                          ;; +0.0 (not -0.0, which EQL tells apart) is nothing to
+                          ;; do; another single goes through a typed store loop.
+                          ;; Both were a generic ASET per element -- every mill
+                          ;; tensor (make-tensor zeroes its data this way).
+                          ((and f32-elt (eql store 0.0)) a)
+                          ((and f32-elt (typep store 'single-float)) (%f32-fill a store total))
                           (t
                            (loop (when (>= i total) (return a))
                              (aset a i store)

@@ -180,8 +180,9 @@
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source*
                      (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)))
-  ;; ... and pooled literals are narrow too (cross.lisp *POOL-NARROW-STRINGS*).
-  (setq *pool-narrow-strings* t))
+  ;; ... and pooled literals are narrow too (cross.lisp *POOL-NARROW-STRINGS*,
+  ;; set from this below: MODUS.MVM does not exist yet here).
+  (defparameter cl-user::*68k-pool-narrow* t))
 
 ;; MODUS_68K_GC_STATIC: boot's heap becomes static once boot is done -- held
 ;; once, walked by every collection, never copied (translate-68k.lisp
@@ -223,6 +224,8 @@
 
 (in-package :modus.mvm)
 (setf *68k-gc-static* cl-user::*68k-gc-static-on*)
+(when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
+  (setf *pool-narrow-strings* t))
 
 (let ((sm (sb-ext:posix-getenv "MODUS_SYMMAP")))
   (when (and sm (> (length sm) 0))

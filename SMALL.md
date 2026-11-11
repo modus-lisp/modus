@@ -20,8 +20,8 @@ fixed program (a "thunk"): the floor for microcontrollers.
 | image | file | resident | heap floor |
 |---|---|---|---|
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
-| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.3 MB | 5.75 MB |
-| `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` (REPL, cold code threaded) | 7.4 MB | 7.5 MB | 5.75 MB |
+| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.2 MB | 5.75 MB |
+| `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` + `MODUS_HOT_ORDER` (REPL) | 5.5 MB | 5.6 MB | 5.75 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -50,7 +50,7 @@ All opt-in; unset, every image is built as before.  68k soft float:
 | `MODUS_NO_SOURCE_BLOB=1` | no embedded source (disk only on a hosted system) |
 | `MODUS_NO_COMPILER=1` | no compiler: the compiler-side files filtered to what the rest of the image reaches (`mvm/build-no-compiler.lisp`), entry points stubbed to signal; the toplevel runs a `%IMAGE-MAIN` baked in with `MODUS_EXTRA_SOURCE=FILE` |
 | `MODUS_LEAN_BOOT=1` | with `MODUS_NO_COMPILER`: boot builds only what the thunk needs -- no packages (lazy interning), no name tables, no keyword seeding, globals initialised only if kept code reads them -- the image is shaken to what `KERNEL-MAIN` reaches (`%IR-DCE`, exact, from the IR), and quoted symbols are static objects in the constant pool.  Strictly boot-and-run: integer printing and `handler-case` of `error` do not work |
-| `MODUS_HOT_ORDER=FILE` | lay out first the functions boot runs (`scripts/hot-order.py` makes the file from a `MODUS_SYMMAP` and a `qemu -d in_asm` log) |
+| `MODUS_HOT_ORDER=FILE` | lay out first the functions boot runs (`scripts/hot-order.py` makes the file from a `MODUS_SYMMAP` and a `qemu -d in_asm` log); any build, not only `MODUS_LEAN_BOOT`.  `mvm/68k-hotorder-repl.txt` is boot + a first REPL command |
 
 ## Measuring
 
@@ -65,6 +65,11 @@ All opt-in; unset, every image is built as before.  68k soft float:
   and LI by destination and immediate class with the commonest immediates.
 - **Why something is kept:** `MODUS_IR_DCE_WHY=NAME,...` (lean builds) prints
   the call chain that kept each name.
+- **Resident memory, carefully:** measure after the REPL has ANSWERED (poll
+  its output), with `MODUS_FASL=0` (a FASL cache hit runs a different path
+  and touches other pages), and read the pages of YOUR process (`$!`), never
+  a `pgrep` of the image's path -- a concurrent test run of the same image
+  answers instead.  Each of these produced wrong numbers here first.
 - **Resident memory:** qemu-user maps the guest 1:1, so the guest's pages are
   the host process's pages below `#x41000000`.  Read `/proc/PID/pagemap` per
   region -- image (the ELF's file bytes), heap (`#x10000000`), kind map
@@ -146,8 +151,12 @@ All opt-in; unset, every image is built as before.  68k soft float:
    bytecode itself is only ~15% denser than 68k (8.0 vs 9.4 MB), so the cold
    tier is a new encoding: 1-byte tokens for the 255 commonest shapes,
    operands sized by value.  All 5,990 eligible functions threaded: 7.75 MB
-   image, ~14x slower.  With the profile's 300 hottest kept native: 7.4 MB
-   image (functions with SETJMP / LONGJMP thread too), smoke time on a par
+   image, ~14x slower.  With the profile's 300 hottest kept native (functions
+   with SETJMP / LONGJMP thread too), boot-time shim sources baked without
+   comments (they are evaluated, not read by people), pooled literals really
+   narrow (the switch had been set in the wrong package), and boot's
+   functions laid out first: 5.5 MB image, 5.6 MB resident at the prompt
+   (image pages 3.1, heap 2.3 -- the static boot data), smoke time on a par
    with the native image.
    Next: superinstructions (call sequences, push/pop runs) and a smaller
    handler table; the boot-time cost of `%GV-CACHE-FLUSH` (16,384 slots

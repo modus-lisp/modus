@@ -364,6 +364,18 @@
                          do (mvm-emit-byte buf (logand (ash val (* -8 i)) #xFF)))
                    (loop for i from 0 below nbytes
                          do (mvm-emit-byte buf (logand (ash val (* -8 i)) #xFF)))))))
+    ;; MODUS_POOL_STATS: what the pool holds, largest first.
+    (when (sb-ext:posix-getenv "MODUS_POOL_STATS")
+      (let ((rows nil) (kinds (make-hash-table :test 'equal)))
+        (dolist (c constants)
+          (let ((k (type-of c)) (n (if (stringp c) (length c) 0)))
+            (incf (gethash (if (consp k) (car k) k) kinds 0) (max n 1))
+            (when (stringp c) (push (cons n c) rows))))
+        (maphash (lambda (k v) (format t "~&;; pool: ~A ~D~%" k v)) kinds)
+        (dolist (r (subseq (sort rows #'> :key #'car) 0 (min 30 (length rows))))
+          (format t ";; pool string ~8D ~A ~S~%" (car r)
+                  (if (every (lambda (c) (< (char-code c) 256)) (cdr r)) "n" "W")
+                  (substitute #\Space #\Newline (subseq (cdr r) 0 (min 70 (car r))))))))
     (loop for constant in constants
           for idx from 0
           do (typecase constant

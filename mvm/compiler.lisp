@@ -2428,16 +2428,23 @@
               (length kept) dropped roots)
       (setq kept (nreverse kept))
       (when *ir-hot-order*
-        (let ((rank (make-hash-table :test 'equal)) (i 0))
-          (dolist (n *ir-hot-order*)
-            (unless (gethash n rank) (setf (gethash n rank) (incf i))))
-          (flet ((r (e) (or (gethash (string-upcase (string (function-info-name (car e)))) rank)
-                            most-positive-fixnum)))
-            (setq kept (stable-sort kept #'< :key #'r))
-            (format t "~&  IR-DCE: ~D of ~D hot functions laid out first~%"
-                    (count-if (lambda (e) (< (r e) most-positive-fixnum)) kept)
-                    (length *ir-hot-order*)))))
+        (setq kept (%ir-hot-sort kept)))
       kept)))
+
+(defun %ir-hot-sort (all-ir)
+  "ALL-IR with the functions *IR-HOT-ORDER* names first, in its order; the
+   rest keep theirs.  STABLE: two definitions of one name share a rank, so the
+   later one stays later (last-defun-wins is unchanged)."
+  (let ((rank (make-hash-table :test 'equal)) (i 0))
+    (dolist (n *ir-hot-order*)
+      (unless (gethash n rank) (setf (gethash n rank) (incf i))))
+    (flet ((r (e) (or (gethash (string-upcase (string (function-info-name (car e)))) rank)
+                      most-positive-fixnum)))
+      (let ((sorted (stable-sort (copy-list all-ir) #'< :key #'r)))
+        (format t "~&  hot order: ~D of ~D named functions laid out first~%"
+                (count-if (lambda (e) (< (r e) most-positive-fixnum)) sorted)
+                (length *ir-hot-order*))
+        sorted))))
 
 (defvar *gc-check-fusion-enabled* t
   "Gate for the Stage-1a size-aware gc-check peephole (fuse-gc-checks).
@@ -32499,6 +32506,9 @@
     ;; Phase 2c: drop what the image's entry points do not reach (*IR-DCE-ROOTS*).
     (when *ir-dce-roots*
       (setq all-ir (%ir-dce all-ir *ir-dce-roots*)))
+    ;; ... and without it, MODUS_HOT_ORDER is layout alone.
+    (when (and *ir-hot-order* (not *ir-dce-roots*))
+      (setq all-ir (%ir-hot-sort all-ir)))
 
     ;; Phase 3: Emit bytecode
     (let ((buf (make-mvm-buffer)))

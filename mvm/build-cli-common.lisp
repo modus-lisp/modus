@@ -1895,6 +1895,72 @@
 ;;;   reversible-flip pattern as MODUS_NO_EVAL2.
 ;;; ============================================================
 
+(defun %strip-lisp-comments (text)
+  "TEXT with its ; and #| |# comments removed, for source evaluated at boot
+   from a baked string (MODUS_SMALL_IMAGE: comments cost image bytes and, when
+   they hold a character above 255, keep the whole literal wide).  Strings,
+   |quoted symbols| and #\\x characters are copied untouched; a removed line
+   comment keeps its newline, and a run of whitespace becomes one."
+  (with-output-to-string (out)
+    (let ((n (length text)) (i 0))
+      (loop while (< i n)
+            do (let ((c (char text i)))
+                 (cond
+                   ((char= c #\")                    ; string
+                    (write-char c out) (incf i)
+                    (loop while (< i n)
+                          do (let ((d (char text i)))
+                               (write-char d out) (incf i)
+                               (cond ((char= d #\\) (when (< i n) (write-char (char text i) out) (incf i)))
+                                     ((char= d #\") (return))))))
+                   ((char= c #\|)                    ; |quoted symbol|
+                    (write-char c out) (incf i)
+                    (loop while (< i n)
+                          do (let ((d (char text i)))
+                               (write-char d out) (incf i)
+                               (cond ((char= d #\\) (when (< i n) (write-char (char text i) out) (incf i)))
+                                     ((char= d #\|) (return))))))
+                   ((and (char= c #\#) (< (1+ i) n) (char= (char text (1+ i)) #\\))
+                    ;; #\x: copy the backslash and the character after it
+                    (write-char c out) (write-char #\\ out) (incf i 2)
+                    (when (< i n) (write-char (char text i) out) (incf i)))
+                   ((and (char= c #\#) (< (1+ i) n) (char= (char text (1+ i)) #\|))
+                    (let ((depth 1)) (incf i 2)          ; #| ... |#, nested
+                      (loop while (and (< i n) (> depth 0))
+                            do (cond ((and (char= (char text i) #\|) (< (1+ i) n)
+                                           (char= (char text (1+ i)) #\#))
+                                      (decf depth) (incf i 2))
+                                     ((and (char= (char text i) #\#) (< (1+ i) n)
+                                           (char= (char text (1+ i)) #\|))
+                                      (incf depth) (incf i 2))
+                                     (t (incf i)))))
+                    (write-char #\Space out))
+                   ((char= c #\;)                    ; ; to end of line
+                    (loop while (and (< i n) (char/= (char text i) #\Newline)) do (incf i)))
+                   ((member c '(#\Space #\Tab #\Newline #\Return #\Page))
+                    ;; a run of whitespace is one separator
+                    (let ((nl nil))
+                      (loop while (and (< i n) (member (char text i)
+                                                       '(#\Space #\Tab #\Newline #\Return #\Page)))
+                            do (when (char= (char text i) #\Newline) (setq nl t))
+                               (incf i))
+                      (write-char (if nl #\Newline #\Space) out)))
+                   (t (write-char c out) (incf i))))))))
+
+(defun %small-boot-text (text)
+  "TEXT as baked for boot-time evaluation.  In a small image: no comments, and
+   the em dash and ellipsis in its docstrings spelled -- and ..., so the
+   literal pools at a byte a character (one character above 255 keeps a
+   whole literal wide)."
+  (if cl-user::*small-image*
+      (with-output-to-string (out)
+        (loop for c across (%strip-lisp-comments text)
+              do (case (char-code c)
+                   (#x2014 (write-string "--" out))
+                   (#x2026 (write-string "..." out))
+                   (t (write-char c out)))))
+      text))
+
 (defun %escape-lisp-string (text)
   "Escape TEXT so it can be emitted as a Lisp string literal."
   (with-output-to-string (out)
@@ -1919,10 +1985,10 @@
 (defvar *genera-source*
   (concatenate 'string "
 (defun %cooperative-atomics-source ()
-  \"" (%escape-lisp-string *cooperative-atomics-text*) "\")
+  \"" (%escape-lisp-string (%small-boot-text *cooperative-atomics-text*)) "\")
 
 (defun %genera-compat-source ()
-  \"" (%escape-lisp-string *genera-compat-text*) "\")
+  \"" (%escape-lisp-string (%small-boot-text *genera-compat-text*)) "\")
 
 (defun %install-genera-compat ()
   ;; MODUS_NO_GENERA=1 => do not advertise :genera and do not create the
@@ -2000,7 +2066,7 @@
 (defvar *sb-shim-source*
   (concatenate 'string "
 (defun %sb-shim-source ()
-  \"" (%escape-lisp-string *sb-shim-text*) "\")
+  \"" (%escape-lisp-string (%small-boot-text *sb-shim-text*)) "\")
 
 (defun %install-sb-shims ()
   (let ((off (%cli-getenv \"MODUS_NO_SB\")))
@@ -2055,7 +2121,7 @@
 (defvar *sb-gray-source*
   (concatenate 'string "
 (defun %sb-gray-source ()
-  \"" (%escape-lisp-string *sb-gray-text*) "\")
+  \"" (%escape-lisp-string (%small-boot-text *sb-gray-text*)) "\")
 
 (defun %ensure-gray-streams-aot ()
   (let ((p (find-package \"GRAY-STREAMS\")))
@@ -2151,7 +2217,7 @@
 (defvar *asdf-source*
   (concatenate 'string "
 (defun %asdf-interface-source ()
-  \"" (%escape-lisp-string *asdf-interface-text*) "\")
+  \"" (%escape-lisp-string (%small-boot-text *asdf-interface-text*)) "\")
 
 (defun %install-asdf-interface ()
   (let ((off (%cli-getenv \"MODUS_NO_ASDF\")))
@@ -2671,6 +2737,17 @@
 ;; ... and a 30-bit tower's arithmetic range guard is a shift pair
 ;; (compiler.lisp *ARITH-RANGE-BY-SHIFT*).
 (when cl-user::*small-image* (setq modus.mvm::*arith-range-by-shift* t))
+;; MODUS_HOT_ORDER=FILE (any build; MODUS_LEAN_BOOT reads it too): one function
+;; name a line, laid out first in that order -- what boot and a first REPL
+;; command run (scripts/hot-order.py), so the pages they touch hold code that
+;; runs.
+(let ((f (sb-ext:posix-getenv "MODUS_HOT_ORDER")))
+  (when (and f (plusp (length f)) (null modus.mvm::*ir-hot-order*))
+    (setq modus.mvm::*ir-hot-order*
+          (with-open-file (in f)
+            (loop for l = (read-line in nil) while l
+                  when (plusp (length (string-trim " " l)))
+                    collect (string-upcase (string-trim " " l)))))))
 
 ;; Function table under MODUS_SMALL_IMAGE (CL-USER::*SMALL-IMAGE*, above): the keys come from ONE string
 ;; literal and each entry is a call passing #'NAME, instead of a PUTHASH whose

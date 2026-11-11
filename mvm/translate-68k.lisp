@@ -4241,6 +4241,30 @@
       (loop for (k . n) in rows for j from 0
             do (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) n k)))
       (setq *68k-cold-fns* cold *68k-thread-shapes* shapes)
+      ;; MODUS_68K_THREAD_STATS: stream bytes, and the commonest adjacent
+      ;; token pairs (superinstruction candidates), by bytes they would save.
+      (when (sb-ext:posix-getenv "MODUS_68K_THREAD_STATS")
+        (let ((tok 0) (opnd 0) (pairs (make-hash-table :test 'equal)))
+          (maphash (lambda (st info)
+                     (let ((prev nil))
+                       (m68k-thread-walk st (car info) (cdr info)
+                                         (lambda (pc k p npc) (declare (ignore npc))
+                                           (let ((i (svref (gethash k shapes) 0)))
+                                             (incf tok (if (< i 255) 1 3)))
+                                           (dolist (x p)
+                                             (incf opnd (case (first x) (:i (second x)) (:lic 4) (:rel 4)
+                                                          (:br (cdr info)))))
+                                           (when (and prev (null (gethash pc *68k-label-map*)))
+                                             (incf (gethash (cons prev k) pairs 0)))
+                                           (setq prev k)))))
+                   cold)
+          (format t "~&;; 68k thread stats: stream ~D bytes = tokens ~D + operands ~D~%"
+                  (+ tok opnd) tok opnd)
+          (let ((rows nil))
+            (maphash (lambda (k n) (push (cons k n) rows)) pairs)
+            (setq rows (sort rows #'> :key #'cdr))
+            (loop for (k . n) in rows repeat 40
+                  do (format t ";;   pair ~7D  ~S  ~S~%" n (car k) (cdr k))))))
       (format t "~&;; 68k threaded: ~D of ~D functions cold, ~D shapes~%"
               (hash-table-count cold) (length starts) (hash-table-count shapes)))))
 

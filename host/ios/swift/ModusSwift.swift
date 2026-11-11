@@ -1336,6 +1336,109 @@ let documentPickerShow: Call = { _, _, _, _, _, _ in
     return 1
 }
 
+// The collection's data source and delegate: sections of tiles under a header each.  A tap on a tile sends a SELECT
+// event with the tile's index among all the rows.
+final class ModusCollection: NSObject, UICollectionViewDataSource, UICollectionViewDelegate {
+    let handle: UInt
+    var groups: [(title: String?, rows: [Row])] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func numberOfSections(in collectionView: UICollectionView) -> Int {
+        groups.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        groups[section].rows.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "tile", for: indexPath)
+        let label: UILabel
+        if let existing = cell.contentView.viewWithTag(1) as? UILabel {
+            label = existing
+        } else {
+            label = UILabel(frame: cell.contentView.bounds)
+            label.tag = 1
+            label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            label.textColor = .white
+            label.textAlignment = .center
+            cell.contentView.addSubview(label)
+        }
+        label.text = groups[indexPath.section].rows[indexPath.item].title
+        cell.backgroundColor = UIColor(white: 0.2, alpha: 1)
+        return cell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, viewForSupplementaryElementOfKind kind: String,
+                        at indexPath: IndexPath) -> UICollectionReusableView {
+        let header = collectionView.dequeueReusableSupplementaryView(ofKind: kind, withReuseIdentifier: "header",
+                                                                     for: indexPath)
+        let label: UILabel
+        if let existing = header.viewWithTag(1) as? UILabel {
+            label = existing
+        } else {
+            label = UILabel(frame: header.bounds)
+            label.tag = 1
+            label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            label.textColor = .lightGray
+            label.font = .boldSystemFont(ofSize: 14)
+            header.addSubview(label)
+        }
+        label.text = groups[indexPath.section].title
+        return header
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        send("SELECT", [.int(Int(handle)), .int(groups[indexPath.section].rows[indexPath.item].index)])
+    }
+}
+
+private var collections: [UInt: ModusCollection] = [:]
+
+// The compositional layout of a collection: three tiles to a row, a header on each section.
+private func sectionedLayout() -> UICollectionViewCompositionalLayout {
+    UICollectionViewCompositionalLayout { _, _ in
+        let item = NSCollectionLayoutItem(layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1.0 / 3.0), heightDimension: .absolute(60)))
+        let group = NSCollectionLayoutGroup.horizontal(layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1), heightDimension: .absolute(60)), subitem: item, count: 3)
+        group.interItemSpacing = .fixed(8)
+        let section = NSCollectionLayoutSection(group: group)
+        section.interGroupSpacing = 8
+        section.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 16, trailing: 8)
+        let header = NSCollectionLayoutBoundarySupplementaryItem(layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1), heightDimension: .absolute(28)),
+            elementKind: UICollectionView.elementKindSectionHeader, alignment: .top)
+        section.boundarySupplementaryItems = [header]
+        return section
+    }
+}
+
+// collection_new(rows, length, x, y, w, h): a collection view of sections (rows as ui_list_set_data: a term, with a
+// SECTION per row), its tiles in three columns under a header per section.  Returns its handle.
+let collectionNew: Call = { p, n, x, y, w, h in
+    let view = UICollectionView(frame: rect(x, y, w, h), collectionViewLayout: sectionedLayout())
+    view.backgroundColor = .clear
+    view.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "tile")
+    view.register(UICollectionReusableView.self,
+                  forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader, withReuseIdentifier: "header")
+    let handle = adopt(view)
+    let source = ModusCollection(handle: handle)
+    if n > 0, let base = UnsafeRawPointer(bitPattern: p) {
+        let bytes = Array(UnsafeRawBufferPointer(start: base, count: Int(n)))
+        if let data = try? decodeTerm(bytes) {
+            source.groups = groupsOf(rowsOf(data))
+        }
+    }
+    view.dataSource = source
+    view.delegate = source
+    collections[handle] = source
+    return handle
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1630,6 +1733,7 @@ public func modusSwiftInstall() {
     register("ui_keyboard_avoid_on", keyboardAvoidOn)
     register("ui_keyboard_post", keyboardPost)
     register("ui_document_picker_show", documentPickerShow)
+    register("ui_collection_new", collectionNew)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

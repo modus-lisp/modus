@@ -2046,9 +2046,12 @@
          ;; Type check (trap on a non-cons), then the car at the tag-folded
          ;; displacement: -tag(A0) is the cons's first word.
          (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-check-cons buf +68k-d0+)
-         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-         (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+)
+         (if *68k-car-label*
+             (m68k-emit-bsr buf *68k-car-label*)
+             (progn
+               (m68k-emit-check-cons buf +68k-d0+)
+               (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+               (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+)))
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cdr+
@@ -2056,9 +2059,12 @@
              (vs (second operands)))
          ;; Type check, then the cdr at (4 - tag)(A0)
          (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-check-cons buf +68k-d0+)
-         (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-         (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+)
+         (if *68k-cdr-label*
+             (m68k-emit-bsr buf *68k-cdr-label*)
+             (progn
+               (m68k-emit-check-cons buf +68k-d0+)
+               (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+               (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+)))
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cons+
@@ -3112,6 +3118,21 @@
 
 (defvar *68k-subtag-label* nil
   "Label of the shared OBJ-SUBTAG sequence while translating, else NIL.")
+(defvar *68k-car-label* nil
+  "Label of the shared CAR (D0 = car of D0, trap unless a cons), else NIL.")
+(defvar *68k-cdr-label* nil
+  "Label of the shared CDR, else NIL.")
+
+(defun m68k-emit-car-cdr-helpers (buf)
+  "The shared CAR and CDR: D0 = a cons in; D0 = its car / cdr.  The same
+   type check as the inline form (ILLEGAL on a non-cons).  Clobbers D1, A0."
+  (loop for (label disp) in (list (list *68k-car-label* (- +tag-cons+))
+                                  (list *68k-cdr-label* (- 4 +tag-cons+)))
+        do (m68k-emit-label buf label)
+           (m68k-emit-check-cons buf +68k-d0+)
+           (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+           (m68k-emit-move-disp-dn buf +68k-a0+ disp +68k-d0+)
+           (m68k-emit-rts buf)))
 (defvar *68k-array-len-label* nil
   "Label of the shared ARRAY-LEN sequence while translating, else NIL.")
 
@@ -3586,6 +3607,8 @@
   (let* ((*68k-gc-label* (and *68k-linux-mode* (mvm-make-label)))
          (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-car-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-cdr-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-alloc-obj-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-bytecode* bytecode)
@@ -3727,6 +3750,8 @@
       (m68k-emit-cons-helper buf))
     (when *68k-subtag-label*
       (m68k-emit-subtag-helper buf))
+    (when *68k-car-label*
+      (m68k-emit-car-cdr-helpers buf))
     (when *68k-array-len-label*
       (m68k-emit-array-len-helper buf))
     (when *68k-alloc-obj-label*

@@ -14,8 +14,9 @@
 # the app's own __TEXT, at 8 MB, by MODUS_SEGMENT_SHIFT (host/macos/image-segments.sh).  Not in the free top
 # gigabyte: dyld sign-extends a __LINKEDIT above 2 GB (docs/macos-hosting.md, "On a real watch"):
 #   MODUS_CODE_BASE=300010000 MODUS_CONV_DELTA=2F5000000 MODUS_REGION_SIZE=1100000 \
-#   MODUS_HEAP_BASE=306000000 MODUS_HEAP_SIZE=9000000 MODUS_GC_MIDPOINT=4000000 \
-#   MODUS_JIT_ARENA_BASE=310000000 MODUS_JIT_ARENA_SIZE=2000000 MODUS_DARWIN_TSD_KEY=150 (+ PCREL, DARWIN, NO_JIT)
+#   MODUS_HEAP_BASE=306000000 MODUS_HEAP_SIZE=B000000 MODUS_GC_MIDPOINT=5000000 \
+#   MODUS_JIT_ARENA_BASE=312000000 MODUS_JIT_ARENA_SIZE=2000000 MODUS_DARWIN_TSD_KEY=150 (+ PCREL, DARWIN)
+# (`kiln ios watch-device` builds exactly this, with a slim world.)
 # A device build needs a development identity and a provisioning profile that names the watch.
 #
 # MODUS_CORE=FILE puts a snapshot's compiled code in the app (image-segments.sh).

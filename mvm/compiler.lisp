@@ -9922,6 +9922,20 @@
        (compile-fround32 (cadr form) env dest))
       ((= op-name #.(compute-name-hash "%FSQRT"))
        (compile-fsqrt (cadr form) env dest))
+      ;; (%EXP-D d): exp of a double tree, in registers and boxed once
+      ;; (%EMIT-EXP-DOUBLE-FULL); the runtime defun of the same name where
+      ;; there are no double FP ops.
+      ((and (= op-name #.(compute-name-hash "%EXP-D"))
+            (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+            (consp (cdr form)) (null (cddr form))
+            (let ((n (%fpd-pure-need (cadr form) env)))
+              (and n (<= (+ *fp-reg-counter* (max n 7)) +fp-reg-max+))))
+       (let ((fd (alloc-fp-reg)))
+         (compile-double-unboxed (cadr form) env fd)
+         (%emit-exp-double-full env fd)
+         (emit-ir :gc-check)
+         (emit-ir :fpd-box dest fd)
+         (free-fp-reg)))
       ;; f32x4 vector contract (layer 2a): unboxed in FP registers when the
       ;; form is a call-free tree over declared arrays, else the prelude defun.
       ((or (= op-name #.(compute-name-hash "%F32V-REF"))
@@ -11198,6 +11212,12 @@
     ((and (consp test) (symbolp (car test)) (consp (cdr test)) (null (cddr test))
           (name-eq (car test) "ZEROP") (%expr-width (cadr test) env))
      (%compile-test-branch (list '= (cadr test) 0) env dest false-label))
+    ;; two float trees: FP registers (COMPILE-COMPARE-2's path).  The fixnum
+    ;; branches below box a double literal on every evaluation and call the
+    ;; generic comparison -- (< -707d0 xd) allocated 48 bytes
+    ((%fp-compare-test-p test env)
+     (compile-form test env dest)
+     (emit-ir :bnull dest false-label))
     ((%fusable-compare test env)
      ;; Operand-direct: a comparison operand that lives in a register (a
      ;; promoted local) is compared in place — no MOV into DEST / a temp.
@@ -13785,12 +13805,22 @@
    nothing in BODY assigns VAR.  Such a variable is FP-resident like a
    declared one: (let ((x (abs (aref a i)))) (when (> x m) ...)) needed a
    declaration to stay unboxed."
-  (and init (consp init)
+  (and init (or (consp init) (symbolp init))
        (%expr-single-float-p init env)
        (%fp-tree-need init env)
-       (not (%form-mentions-any-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
-                              init))
+       ;; only the bindings BEFORE this one can be rebound under it (a LET*'s);
+       ;; its own name and later ones are the outer variables, which ENV types
+       ;; -- an inlined (sigmoid-d x) is (let ((x x)) ...)
+       (not (%form-mentions-any-p (%bindings-before var bindings) init))
        (notany (lambda (f) (%form-setqs-var-p var f 0)) body)))
+
+(defun %bindings-before (var bindings)
+  "The names bound before VAR in BINDINGS."
+  (let ((acc nil))
+    (dolist (b bindings (nreverse acc))
+      (let ((v (if (consp b) (car b) b)))
+        (when (eq v var) (return (nreverse acc)))
+        (push v acc)))))
 
 (defun %inferred-vector-local-p (var init bindings body env)
   "T when an UNDECLARED LET variable VAR is provably a 4-lane float vector for
@@ -21720,9 +21750,10 @@
          ((%fp-abs-p form) (%expr-single-float-p (cadr form) env))
          ((%fp-minmax-op form)
           (and (%expr-single-float-p (cadr form) env) (%expr-single-float-p (caddr form) env)))
-         ((%fp-single-conversion-arg form) t)
+         ((%fp-single-conversion-arg form env) t)
          ;; EXP of a single is a single
          ((%fp-exp-arg form) (%expr-single-float-p (%fp-exp-arg form) env))
+         ((%fp-tanh-arg form) (%expr-single-float-p (%fp-tanh-arg form) env))
          ;; a macro: judge what it expands to, as the tree walkers do -- an
          ;; undeclared (let ((x (f32v-ref a i))) ...) was boxed (mill, 30x)
          ((let ((x (%tree-expand form)))
@@ -21924,6 +21955,19 @@
     ;; a single-float tree widened in register (fcvt d<-s), not a hoisted call
     ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
      (%fp-tree-need (%double-conversion-arg form) env))
+    ;; (EXP d) of a double tree: %EMIT-EXP-DOUBLE-FULL, no call.  Its peak is 6
+    ;; with the result: x and a constant beside the core's three (k's double, r,
+    ;; one series operand); 7, as the single EXP, for a margin.  Ten made
+    ;; (/ 1d0 (+ 1d0 (exp ...))) -- a sigmoid -- not fit, and box everything
+    ((and (%fp-exp-arg form) (or *mvm-eval-runtime-p* *target-has-fpd-p*))
+     (let ((n (%fpd-tree-need (%fp-exp-arg form) env)))
+       (and n (max n 7))))
+    ;; an inlined call: (let ((p arg) ...) body).  Pure inits only: a hoisted
+    ;; conversion is evaluated before the tree, outside the LET's scope
+    ((%fp-tree-let-parts form)
+     (%fp-tree-let-need form env (function %fpd-tree-need)))
+    ((%tree-inline form env)
+     (%with-tree-inline form (function %fpd-tree-need) env))
     (t nil)))
 
 (defun %fpd-arith-op (name)
@@ -21943,7 +21987,7 @@
                         (push f acc)))
                      ((and (consp f) (symbolp (car f))
                            (or (member (symbol-name (car f)) '("+" "-" "*" "/") :test #'string=)
-                               (%fp-abs-p f) (%fp-minmax-op f)))
+                               (%fp-abs-p f) (%fp-minmax-op f) (%fp-exp-arg f)))
                       (dolist (a (cdr f)) (walk a))))))
       (walk form))
     (nreverse acc)))
@@ -21981,6 +22025,16 @@
         ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
          (compile-float-unboxed (%double-conversion-arg form) env fd)
          (emit-ir :fp-op1 fd fd 2)                               ; fcvt d<-s
+         (return-from compile-double-unboxed nil))
+        ((%fp-exp-arg form)
+         (compile-double-unboxed (%fp-exp-arg form) env fd)
+         (%emit-exp-double-full env fd)
+         (return-from compile-double-unboxed nil))
+        ((%fp-tree-let-parts form)
+         (%compile-fp-tree-let form env fd (function compile-double-unboxed))
+         (return-from compile-double-unboxed nil))
+        ((%tree-inline form env)
+         (%with-tree-inline form (function compile-double-unboxed) env fd)
          (return-from compile-double-unboxed nil)))
   (if (and (consp form) (not (name-eq (car form) "QUOTE")))
       (let ((op (%fpd-arith-op (symbol-name (car form)))))
@@ -22166,8 +22220,10 @@
        (cond ((name-eq (car form) "MAX") :max)
              ((name-eq (car form) "MIN") :min))))
 
-(defun %fp-single-conversion-arg (form)
-  "X when FORM is (COERCE X 'SINGLE-FLOAT) or (FLOAT X <single literal>)."
+(defun %fp-single-conversion-arg (form &optional env)
+  "X when FORM is (COERCE X 'SINGLE-FLOAT) or (FLOAT X <single literal>), or
+   given ENV, (FLOAT X P) with P a variable known to be a single (mill's
+   (float (sigmoid-d x) x) rounds a double back to its input's format)."
   (and (consp form) (symbolp (car form)) (consp (cdr form)) (consp (cddr form))
        (null (cdddr form))
        (let ((p (caddr form)))
@@ -22177,6 +22233,9 @@
                      (string= (symbol-name (cadr p)) "SINGLE-FLOAT"))
                 (cadr form))
                ((and (name-eq (car form) "FLOAT") (typep p 'single-float))
+                (cadr form))
+               ((and env (name-eq (car form) "FLOAT") p (symbolp p)
+                     (%expr-single-float-p p env))
                 (cadr form))))))
 
 (defun %fpd-pure-need (form env)
@@ -22217,8 +22276,8 @@
          ((%fp-minmax-op form)
           (let ((a (%fp-tree-need (cadr form) env)) (b (%fp-tree-need (caddr form) env)))
             (and a b (max a (1+ b)))))
-         ((%fp-single-conversion-arg form)
-          (let ((x (%fp-single-conversion-arg form)))
+         ((%fp-single-conversion-arg form env)
+          (let ((x (%fp-single-conversion-arg form env)))
             (or (%fp-tree-need x env) (%fpd-pure-need x env)
                 (%fp-itof-need x env))))
          ((%fp-exp-arg form)
@@ -22226,6 +22285,16 @@
                         (%fp-tree-need (%fp-exp-arg form) env))))
             ;; 7: what %COMPILE-EXP-SINGLE holds at its peak, result included
             (and n (max n 7))))
+         ((%fp-tanh-arg form)
+          (let ((n (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+                        (%fp-tree-need (%fp-tanh-arg form) env))))
+            ;; the second EXP's peak with ep and xd held beside it
+            (and n (max n 9))))
+         ;; an inlined call: (let ((p arg) ...) body)
+         ((%fp-tree-let-parts form)
+          (%fp-tree-let-need form env (function %fp-tree-need)))
+         ((%tree-inline form env)
+          (%with-tree-inline form (function %fp-tree-need) env))
          (t nil)))
       (t nil))))
 
@@ -22276,6 +22345,101 @@
                       :parent (compile-env-parent env)
                       :fn-names (compile-env-fn-names env))))
 
+(defun %tree-inline (form env)
+  "The expansion of FORM when it is a call COMPILE-CALL would expand in place
+   (a declaimed-inline function, not shadowed by a local FLET/LABELS), else
+   NIL -- so a float tree sees an inlined call as the LET it becomes."
+  (and (consp form) (symbolp (car form)) (car form) (not (keywordp (car form)))
+       (or *mvm-eval-runtime-p* *aot-inline*) *inline-fn-defs*
+       (null *inline-only-in*)
+       (null (env-lookup-fn env (%local-fn-key (car form))))
+       (%inline-expansion (car form) (cdr form))))
+
+(defun %with-tree-inline (form fn &rest args)
+  "(FN expansion . ARGS) with FORM's inline expansion, the function marked
+   active meanwhile (the recursion guard COMPILE-CALL keeps).  The expansion
+   is taken BEFORE the mark: %INLINE-EXPANSION refuses an active name."
+  (let ((x (%inline-expansion (car form) (cdr form))))
+    (let ((*inline-active* (cons (%inline-name-key (car form)) *inline-active*)))
+      (declare (special *inline-active*))
+      (apply fn x args))))
+
+(defun %fp-tree-let-parts (form)
+  "(BINDINGS . BODY) when FORM is (LET ((v init) ...) body) with plain variables
+   and one body form -- what an inlined call is (%INLINE-EXPANSION) -- else NIL."
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "LET")
+       (consp (cdr form)) (listp (cadr form)) (consp (cddr form)) (null (cdddr form))
+       (not (and (consp (caddr form)) (symbolp (car (caddr form)))
+                 (name-eq (car (caddr form)) "DECLARE")))
+       (every (lambda (b) (and (consp b) (car b) (symbolp (car b)) (not (keywordp (car b)))
+                               (consp (cdr b)) (null (cddr b))))
+              (cadr form))
+       (cons (cadr form) (caddr form))))
+
+(defun %fp-tree-let-kinds (bindings env)
+  "Per binding :SINGLE or :DOUBLE (its init a single tree, else a pure double
+   tree), or NIL when an init is neither."
+  (let ((acc nil))
+    (dolist (b bindings (nreverse acc))
+      (let ((k (cond ((%fp-tree-need (cadr b) env) :single)
+                     ((and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+                           (%fpd-pure-need (cadr b) env))
+                      :double))))
+        (unless k (return nil))
+        (push k acc)))))
+
+(defun %fp-env-with-kinds (env names kinds regs)
+  "ENV with each of NAMES an FP-resident local of its KIND in its REG."
+  (let ((bs (compile-env-bindings env)))
+    (loop for n in names for k in kinds for r in regs
+          do (setq bs (cons (if (eq k :double)
+                                (make-binding :name n :location :fpdreg :reg r :dtype 'double-float)
+                                (make-binding :name n :location :fpreg :reg r :dtype 'single-float))
+                            bs)))
+    (make-compile-env :bindings bs
+                      :stack-depth (compile-env-stack-depth env)
+                      :parent (compile-env-parent env)
+                      :fn-names (compile-env-fn-names env))))
+
+(defun %fp-tree-let-need (form env body-need)
+  "FP registers a tree LET needs: each init with the registers of the bindings
+   before it held, then the body (judged by BODY-NEED, a function of a form and
+   an env) with all of them held.  NIL when it is not one."
+  (let ((parts (%fp-tree-let-parts form)))
+    (when parts
+      (let ((kinds (%fp-tree-let-kinds (car parts) env)))
+        (when kinds
+          (let ((worst 0) (i 0))
+            (loop for b in (car parts) for k in kinds
+                  do (let ((n (if (eq k :single) (%fp-tree-need (cadr b) env)
+                                  (%fpd-pure-need (cadr b) env))))
+                       (setq worst (max worst (+ i n)))
+                       (setq i (+ i 1))))
+            (let ((nb (funcall body-need (cdr parts)
+                               (%fp-env-with-kinds env (mapcar #'car (car parts)) kinds
+                                                   (mapcar (lambda (b) (declare (ignore b)) 0)
+                                                           (car parts))))))
+              (and nb (max worst (+ i nb))))))))))
+
+(defun %compile-fp-tree-let (form env fd body-compile)
+  "Compile the tree LET FORM (%FP-TREE-LET-NEED said yes) into FD: each init
+   into an FP register of its own, the body by BODY-COMPILE (a function of a
+   form, an env and FD) in an env where the variables are those registers."
+  (let* ((parts (%fp-tree-let-parts form))
+         (kinds (%fp-tree-let-kinds (car parts) env))
+         (regs nil))
+    (loop for b in (car parts) for k in kinds
+          do (let ((r (alloc-fp-reg)))
+               (if (eq k :single)
+                   (compile-float-unboxed (cadr b) env r)
+                   (compile-double-unboxed (cadr b) env r))
+               (push r regs)))
+    (setq regs (nreverse regs))
+    (funcall body-compile (cdr parts)
+             (%fp-env-with-kinds env (mapcar #'car (car parts)) kinds regs)
+             fd)
+    (dolist (r regs) (declare (ignore r)) (free-fp-reg))))
+
 (defun %emit-fpd-select-if-lt (fa fb fd fs)
   "When Fa < Fb (ordered: not for a NaN), Fd <- Fs."
   (let ((b (alloc-temp-reg)) (z (alloc-temp-reg)) (skip (make-compiler-label)))
@@ -22302,12 +22466,24 @@
    was ~250 ns."
   (compile-float-unboxed x env fd)
   (emit-ir :fp-op1 fd fd 2)                                       ; xd
+  (%emit-fpd-clamp fd -110d0 100d0 env)
+  (%emit-exp-double-core env fd)
+  (emit-ir :fp-op1 fd fd 3))                                      ; to single
+
+(defun %emit-fpd-clamp (fd lo hi env)
+  "FD <- FD clamped to [LO, HI] (a NaN passes both and stays NaN)."
   (let ((c (alloc-fp-reg)))
-    (compile-double-unboxed 100d0 env c)
-    (%emit-fpd-select-if-lt c fd fd c)                            ; 100 < xd: xd = 100
-    (compile-double-unboxed -110d0 env c)
-    (%emit-fpd-select-if-lt fd c fd c)                            ; xd < -110: xd = -110
-    (free-fp-reg))
+    (compile-double-unboxed hi env c)
+    (%emit-fpd-select-if-lt c fd fd c)                            ; hi < xd: xd = hi
+    (compile-double-unboxed lo env c)
+    (%emit-fpd-select-if-lt fd c fd c)                            ; xd < lo: xd = lo
+    (free-fp-reg)))
+
+(defun %emit-exp-double-core (env fd &optional wide)
+  "FD <- exp(FD), FD a double with exp(FD) and 2^k normal (the caller has
+   bounded it): %EXP-F's normal path, operation for operation, so its bits.
+   k = truncate(xd/ln2 +- 0.5), r = (xd - k ln2_hi) - k ln2_lo, the degree-13
+   Horner series, times 2^k (fpd-scale, the multiply %EXP-F's table does)."
   (let* ((xd (%mvm-gensym "XD")) (tq (%mvm-gensym "TQ")) (kd (%mvm-gensym "KD")) (r (%mvm-gensym "R"))
          (ft (alloc-fp-reg))
          (e1 (%fp-env-with-fpd env (list xd) (list fd)))
@@ -22345,10 +22521,109 @@
               do (setq series (list '+ (list '/ (list '* series r) (float n 1d0)) 1d0)))
         (compile-double-unboxed series (%fp-env-with-fpd env (list r) (list fr)) fd))
       (free-fp-reg))
-    (emit-ir :fpd-scale fd kreg)
-    (emit-ir :fp-op1 fd fd 3)                                     ; to single
+    (if wide
+        (%emit-fpd-scale-wide fd kreg)
+        (emit-ir :fpd-scale fd kreg))
     (free-temp-reg)
     (free-fp-reg)))
+
+(defun %emit-fpd-scale-wide (fd kreg)
+  "FD <- FD * 2^k for k in [-1076, 1024], as %EXP-F-EDGES scales: one step in
+   the normal range, 2^1023 then 2^(k-1023) above it, 2^(k+600) then 2^-600
+   below it (so a subnormal result is rounded once, by the last multiply)."
+  (let ((tc (alloc-temp-reg)) (tk (alloc-temp-reg))
+        (low (make-compiler-label)) (high (make-compiler-label)) (done (make-compiler-label)))
+    (compile-integer 1023 tc)
+    (emit-ir :cmp kreg tc)
+    (emit-ir :bgt high)
+    (compile-integer -1022 tc)
+    (emit-ir :cmp kreg tc)
+    (emit-ir :blt low)
+    (emit-ir :fpd-scale fd kreg)
+    (emit-ir :br done)
+    (emit-ir-label high)
+    (compile-integer 1023 tc)
+    (emit-ir :fpd-scale fd tc)
+    (emit-ir :sub tk kreg tc)
+    (emit-ir :fpd-scale fd tk)
+    (emit-ir :br done)
+    (emit-ir-label low)
+    (compile-integer 600 tc)
+    (emit-ir :add tk kreg tc)
+    (emit-ir :fpd-scale fd tk)
+    (compile-integer -600 tc)
+    (emit-ir :fpd-scale fd tc)
+    (emit-ir-label done)
+    (free-temp-reg) (free-temp-reg)))
+
+(defun %emit-exp-double-full (env fd)
+  "FD <- exp(FD) for every double, in registers, with %EXP-F's bits: past
+   709.782712893384 it is +infinity, below -745.1332191019411 +0.0, a NaN is
+   returned as it came; between, %EMIT-EXP-DOUBLE-CORE with the two-step
+   scales (the argument clamped to [-746, 710] first, which changes nothing
+   the selects keep, and bounds k for the scales)."
+  (let ((fx (alloc-fp-reg)) (fc (alloc-fp-reg)))
+    (emit-ir :fp-mov fx fd)
+    (%emit-fpd-clamp fd -746d0 710d0 env)
+    (%emit-exp-double-core env fd t)
+    ;; overflow: 709.78... < x  ->  +inf (1e300 * 1e300)
+    (compile-double-unboxed 709.782712893384d0 env fc)
+    (let ((fi (alloc-fp-reg)))
+      (compile-double-unboxed 1d300 env fi)
+      (emit-ir :fpd-mul fi fi fi)
+      (%emit-fpd-select-if-lt fc fx fd fi)
+      ;; underflow: x < -745.13...  ->  +0.0
+      (compile-double-unboxed -745.1332191019411d0 env fc)
+      (compile-double-unboxed 0d0 env fi)
+      (%emit-fpd-select-if-lt fx fc fd fi)
+      (free-fp-reg))
+    ;; a NaN (not even x <= x) is returned as it came
+    (let ((b (alloc-temp-reg)) (z (alloc-temp-reg)) (skip (make-compiler-label)))
+      (emit-ir :fpd-le b fx fx)
+      (emit-ir :li z 0)
+      (emit-ir :cmp b z)
+      (emit-ir :bne skip)
+      (emit-ir :fp-mov fd fx)
+      (emit-ir-label skip)
+      (free-temp-reg) (free-temp-reg))
+    (free-fp-reg) (free-fp-reg)))
+
+(defun %fp-tanh-arg (form)
+  "X when FORM is (TANH X)."
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "TANH")
+       (consp (cdr form)) (null (cddr form))
+       (cadr form)))
+
+(defun %compile-tanh-single (x env fd)
+  "(TANH X) of the single tree X into FD, in registers, with no call: what
+   %TANH-FLOAT computes, in the same order, so its bits.  xd = X widened; a
+   zero is its own tanh (-0.0 stays -0.0, which the formula would make +0.0);
+   past |xd| = 22 the formula is +-1 in double already, so xd is clamped there
+   (which also keeps both exps and 2^k normal); else ep = exp(xd),
+   em = exp(-xd), (ep - em) / (ep + em), rounded to single.  mill's Tanh went
+   through the generic TANH, ~400 ns an element."
+  (compile-float-unboxed x env fd)
+  (emit-ir :fp-op1 fd fd 2)                                       ; xd
+  (%emit-fpd-clamp fd -22d0 22d0 env)
+  (let ((fx (alloc-fp-reg)) (fe (alloc-fp-reg)))
+    (emit-ir :fp-mov fx fd)                                       ; xd, kept
+    (%emit-exp-double-core env fd)                                ; ep
+    (compile-double-unboxed -1d0 env fe)
+    (emit-ir :fpd-mul fe fe fx)                                   ; -xd
+    (%emit-exp-double-core env fe)                                ; em
+    (let ((fs (alloc-fp-reg)))
+      (emit-ir :fp-mov fs fd)
+      (emit-ir :fpd-add fs fs fe)                                 ; ep + em
+      (emit-ir :fpd-sub fd fd fe)                                 ; ep - em
+      (emit-ir :fpd-div fd fd fs)
+      ;; a zero (the smallest nonzero single is 1.4e-45) is returned as is
+      (emit-ir :fp-mov fs fx)
+      (emit-ir :fp-op1 fs fs 1)                                   ; |xd|
+      (compile-double-unboxed 1d-50 env fe)
+      (%emit-fpd-select-if-lt fs fe fd fx)
+      (free-fp-reg))
+    (free-fp-reg) (free-fp-reg))
+  (emit-ir :fp-op1 fd fd 3))                                      ; to single
 
 (defun %fp-itof-need (x env)
   "FP registers to convert the integer X to a single in register, or NIL.
@@ -22423,8 +22698,14 @@
          (free-fp-reg)))
       ((%fp-exp-arg form)
        (%compile-exp-single (%fp-exp-arg form) env fd))
-      ((%fp-single-conversion-arg form)
-       (let ((x (%fp-single-conversion-arg form)))
+      ((%fp-tanh-arg form)
+       (%compile-tanh-single (%fp-tanh-arg form) env fd))
+      ((%fp-tree-let-parts form)
+       (%compile-fp-tree-let form env fd (function compile-float-unboxed)))
+      ((%tree-inline form env)
+       (%with-tree-inline form (function compile-float-unboxed) env fd))
+      ((%fp-single-conversion-arg form env)
+       (let ((x (%fp-single-conversion-arg form env)))
          (cond ((%fp-tree-need x env)
                 (compile-float-unboxed x env fd))                ; already single
                ((%fpd-pure-need x env)
@@ -23671,6 +23952,28 @@
     (emit-ir-label end-label)
     (free-temp-reg)))
 
+(defun %fp-compare-kind (branch-op a b env)
+  ":SINGLE or :DOUBLE when the ordering comparison BRANCH-OP of A and B is two
+   float trees that fit the FP registers (compared in them, no box), else NIL."
+  (when (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+             (member branch-op '(:blt :bgt :ble :bge)))
+    (let ((kind (cond ((and (%fp-tree-need a env) (%fp-tree-need b env)) :single)
+                      ((and (%fpd-pure-need a env) (%fpd-pure-need b env)) :double))))
+      (and kind
+           (let ((na (if (eq kind :single) (%fp-tree-need a env) (%fpd-pure-need a env)))
+                 (nb (if (eq kind :single) (%fp-tree-need b env) (%fpd-pure-need b env))))
+             (<= (+ *fp-reg-counter* (max na (1+ nb))) +fp-reg-max+))
+           kind))))
+
+(defun %fp-compare-test-p (test env)
+  "T when TEST is (< a b), (> a b), (<= a b) or (>= a b) of two float trees."
+  (and (consp test) (symbolp (car test)) (consp (cdr test)) (consp (cddr test))
+       (null (cdddr test))
+       (let ((bop (cdr (assoc (symbol-name (car test))
+                              '(("<" . :blt) (">" . :bgt) ("<=" . :ble) (">=" . :bge))
+                              :test #'string=))))
+         (and bop (%fp-compare-kind bop (cadr test) (caddr test) env) t))))
+
 (defun compile-compare-2 (branch-op a b env dest)
   "Compile a 2-operand comparison, result T or NIL into DEST.
    Fast path: both operands are tagged fixnums (low bit = 0); use :cmp.
@@ -23694,15 +23997,9 @@
   ;; TWO FLOAT TREES: compare in FP registers straight from the trees -- no
   ;; box for an FP-resident local, no unbox (fp-cmp for singles, fpd-lt/-le
   ;; for doubles).
-  (when (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
-             (member branch-op '(:blt :bgt :ble :bge)))
-    (let ((kind (cond ((and (%fp-tree-need a env) (%fp-tree-need b env)) :single)
-                      ((and (%fpd-pure-need a env) (%fpd-pure-need b env)) :double))))
-      (when (and kind
-                 (let ((na (if (eq kind :single) (%fp-tree-need a env) (%fpd-pure-need a env)))
-                       (nb (if (eq kind :single) (%fp-tree-need b env) (%fpd-pure-need b env))))
-                   (<= (+ *fp-reg-counter* (max na (1+ nb))) +fp-reg-max+)))
-        (return-from compile-compare-2 (%compile-fp-tree-compare kind branch-op a b env dest)))))
+  (let ((kind (%fp-compare-kind branch-op a b env)))
+    (when kind
+      (return-from compile-compare-2 (%compile-fp-tree-compare kind branch-op a b env dest))))
   (when (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
              (member branch-op '(:blt :bgt :ble :bge))
              (or (%expr-double-float-p a env) (%expr-single-float-p a env))

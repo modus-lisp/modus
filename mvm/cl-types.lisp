@@ -356,6 +356,14 @@
               (dotimes (i 2046 v) (setf (svref v i) (%dbl (ash (+ (- i 1022) 1023) 20) 0)))))))
 
 (defun %exp-f (x)
+  "exp of double X: on a target with double FP ops the compiler emits %EXP-D in
+   registers for every X (%EMIT-EXP-DOUBLE-FULL, %EXP-F-EDGES's arithmetic and
+   so its bits); elsewhere %EXP-D is the function below."
+  (let ((xd x))
+    (declare (type double-float xd))
+    (%exp-d xd)))
+
+(defun %exp-f-edges (x)
   "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
    exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
    the exponent bits.  The old version halved X until |X| <= 1 and squared back,
@@ -374,7 +382,19 @@
       ((let ((xd x)) (declare (type double-float xd))
          (< xd -745.1332191019411d0))                           ; < #xC0874910D52D3051: underflow
        (%fl 0))
-      (t
+      ;; the normal range, where both the result and 2^k are normal doubles: on a
+      ;; target with double FP ops the compiler emits this in registers (the
+      ;; same operations, so the same bits), and boxes only the result -- the
+      ;; let* below boxed each of its doubles, ~150 ns an EXP
+      (t (%exp-f-general x)))))
+
+(defun %exp-d (x)
+  "exp of double X; the compiler's in-register version (%EMIT-EXP-DOUBLE-FULL)
+   replaces this call on targets that have double FP ops."
+  (%exp-f-edges x))
+
+(defun %exp-f-general (x)
+  "%EXP-F's arithmetic for a finite X that neither overflows nor underflows."
        ;; The arithmetic is unboxed double trees (declared DOUBLE-FLOAT locals and
        ;; literal constants), not %FLOAT-* calls: it was ~40 boxed operations an
        ;; EXP, 0.8 us, and illatio's SwiGLU calls EXP 117k times a token.  The
@@ -407,10 +427,7 @@
                             (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
                (t
                 (%float-mul (%float-mul acc (%dbl (ash (+ (+ k 600) 1023) 20) 0))
-                            (%dbl (ash (+ -600 1023) 20) 0)))))))))
-
-
-
+                            (%dbl (ash (+ -600 1023) 20) 0))))))
 (defun %log-f (x)
   "Natural log of double X > 0.  x = m 2^e exactly from the IEEE bits (a
    subnormal is scaled by 2^54 first), m brought into [sqrt(1/2), sqrt 2);

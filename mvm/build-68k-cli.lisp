@@ -209,10 +209,62 @@
     (loop
       (unless (eql (mem-ref #x10000060 :u32) before) (return nil))
       (setq junk (make-list 32)))))
+
+;; A SAVED CORE (scripts/68k-core-link.py): the low block and the static heap,
+;; mapped by the ELF itself.  #x10006014 is non-zero only in a core, so boot
+;; init is skipped; the stub has already done the restoring.
+(defun %core-requested-p () (eql (mem-ref #x10006014 :u32) 1))
+(defun %restore-image () nil)
+
+(defun %68k-write-all (fd addr len)
+  (loop
+    (when (<= len 0) (return t))
+    (let ((n (%sys-write-raw fd addr len)))
+      (when (<= n 0) (return nil))
+      (setq addr (+ addr n) len (- len n)))))
+
+(defun %68k-save-core (path)
+  \"Write the core to PATH: a header (magic, Y, three regions as address and
+   length) at #x10003000, then the low block [#x10000000, #x10020000) and the
+   static objects and conses, each rounded out to pages.  Called right after
+   the freeze and allocates NOTHING, so no saved word points at the young
+   space, which the core does not carry.  The low block is saved as a core
+   boot must see it: flag set, no freeze request, no handler frames.\"
+  (let* ((olo (logand (mem-ref #x10006004 :u32) -4096))
+         (ohi (logand (+ (mem-ref #x10006008 :u32) 4095) -4096))
+         (clo (logand (mem-ref #x1000600C :u32) -4096))
+         (chi (logand (+ (mem-ref #x10006010 :u32) 4095) -4096))
+         (y (logand (+ (max ohi chi) 65535) -65536))
+         (h #x10003000)
+         (fd 0))
+    (setf (mem-ref #x10006014 :u32) 1)
+    (setf (mem-ref #x10006000 :u32) 0)
+    (setf (mem-ref #x10000400 :u32) 0)             ; handler depth
+    (setf (mem-ref #x10000180 :u32) 0)             ; armed jmpbuf
+    (setf (mem-ref #x10000360 :u32) 0)             ; capped pushes
+    (setf (mem-ref h :u32) 12865357)               ; magic
+    (setf (mem-ref (+ h 4) :u32) y)
+    (setf (mem-ref (+ h 8) :u32) #x10000000)  (setf (mem-ref (+ h 12) :u32) #x20000)
+    (setf (mem-ref (+ h 16) :u32) olo)        (setf (mem-ref (+ h 20) :u32) (- ohi olo))
+    (setf (mem-ref (+ h 24) :u32) clo)        (setf (mem-ref (+ h 28) :u32) (- chi clo))
+    (setq fd (%sys-open-wronly path))
+    (when (< fd 0) (%cli-exit 2))
+    (unless (and (%68k-write-all fd h 32)
+                 (%68k-write-all fd #x10000000 #x20000)
+                 (%68k-write-all fd olo (- ohi olo))
+                 (%68k-write-all fd clo (- chi clo)))
+      (%cli-exit 3))
+    (%sys-close fd)
+    (%cli-exit 0)))
 "))
   (setq *cli-arch-kernel-epilogue*
         "  ;; --- the heap boot built becomes static (MODUS_68K_GC_STATIC) ---
-  (%gc-static-freeze)
+  ;; MODUS_68K_SAVE_CORE=PATH (the build's core run): freeze, then write the
+  ;; core and exit -- read BEFORE the freeze, since nothing may allocate after.
+  (let ((core-path (%cli-getenv \"MODUS_68K_SAVE_CORE\")))
+    (%gc-static-freeze)
+    (when (and core-path (> (length core-path) 0))
+      (%68k-save-core core-path)))
   ;; --- entry: the SHARED SBCL-faithful CLI toplevel ------------------------
   (handler-case (cli-toplevel) (t (c) (sys-exit 1))))
 "))
@@ -305,4 +357,29 @@
   (funcall (find-symbol "CHMOD" "SB-POSIX") out #o755)
   (format t "~%Wrote ~D bytes to ~A~%"
           (length (kernel-image-image-bytes image)) out)
-  (format t "Run: qemu-m68k-static ~A --eval EXPR --quit~%" out))
+  (format t "Run: qemu-m68k-static ~A --eval EXPR --quit~%" out)
+  ;; MODUS_68K_CORE=1 (a MODUS_68K_GC_STATIC image): boot it once under qemu to
+  ;; save its core, then link the core in as PT_LOADs (scripts/68k-core-link.py)
+  ;; -- the image then starts from the saved heap.  OUT.nocore keeps the plain
+  ;; image.  MODUS_68K_CORE_HEAP: the heap of that one boot (default 8 MB).
+  (when (and *68k-gc-static*
+             (let ((v (sb-ext:posix-getenv "MODUS_68K_CORE"))) (and v (string/= v "0"))))
+    (let* ((plain (concatenate 'string out ".nocore"))
+           (core (concatenate 'string out ".core"))
+           (heap (or (sb-ext:posix-getenv "MODUS_68K_CORE_HEAP") "8"))
+           (script (namestring (merge-pathnames "scripts/68k-core-link.py" cl-user::*modus-base*))))
+      (rename-file out plain)
+      (let ((p (sb-ext:run-program "qemu-m68k-static"
+                                   (list "-cpu" "m68040" plain "--dynamic-space-size" heap)
+                                   :search t :input nil :output t
+                                   :environment (append (list (format nil "MODUS_68K_SAVE_CORE=~A" core)
+                                                              "MODUS_FASL=0")
+                                                        (sb-ext:posix-environ)))))
+        (unless (and (zerop (sb-ext:process-exit-code p)) (probe-file core))
+          (error "68k core: the core run failed (exit ~D)" (sb-ext:process-exit-code p))))
+      (let ((p (sb-ext:run-program "python3" (list script plain core out)
+                                   :search t :output t)))
+        (unless (zerop (sb-ext:process-exit-code p))
+          (error "68k core: linking the core failed")))
+      (funcall (find-symbol "CHMOD" "SB-POSIX") out #o755)
+      (format t "~&Wrote ~A (with its core)~%" out))))

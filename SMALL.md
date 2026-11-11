@@ -22,6 +22,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
 | `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.2 MB | 5.75 MB |
 | `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` + `MODUS_HOT_ORDER` (REPL) | 5.5 MB | 5.6 MB | 5.75 MB |
+| `+ MODUS_68K_CORE` (REPL booting from its saved core, 1 MB young heap) | 7.8 MB | dirty 0.4 MB; a command touches 1.0 MB code + 2.4 MB heap | 1 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -46,6 +47,7 @@ All opt-in; unset, every image is built as before.  68k soft float:
 | `MODUS_68K_THREADED=1` | cold functions become THREADED CODE: a byte stream of tokens (one per MVM instruction, a compare and its branch fused) run by ~2,800 shared native handlers; A5 is the token pointer (so not the globals base) |
 | `MODUS_68K_HOT=FILE` | with `MODUS_68K_THREADED`: the functions named in FILE (one a line) stay native |
 | `MODUS_68K_PROFILE=1` | per-function execution counters at `#x10010000` (entries + loop heads), for choosing the hot list |
+| `MODUS_68K_CORE=1` | with `MODUS_68K_GC_STATIC`: the build boots the image once (`MODUS_68K_SAVE_CORE`), saves the low block and the static heap, and links them in as `PT_LOAD`s (`scripts/68k-core-link.py`); the image then starts from that heap: no boot init, 0.1 s to the prompt |
 | `MODUS_68K_RELAX_BRANCHES=1` / `0` | each 68k branch as short as its distance allows (two translation passes); unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_NO_SOURCE_BLOB=1` | no embedded source (disk only on a hosted system) |
 | `MODUS_NO_COMPILER=1` | no compiler: the compiler-side files filtered to what the rest of the image reaches (`mvm/build-no-compiler.lisp`), entry points stubbed to signal; the toplevel runs a `%IMAGE-MAIN` baked in with `MODUS_EXTRA_SOURCE=FILE` |
@@ -65,6 +67,9 @@ All opt-in; unset, every image is built as before.  68k soft float:
   and LI by destination and immediate class with the commonest immediates.
 - **Why something is kept:** `MODUS_IR_DCE_WHY=NAME,...` (lean builds) prints
   the call chain that kept each name.
+- **What a REPL needs, Coral-fashion:** dirty memory plus the clean pages one
+  more command touches (`/proc/PID/clear_refs`, then `Referenced:` in smaps)
+  -- clean image pages can be dropped and re-read, as Mac code segments were.
 - **Resident memory, carefully:** measure after the REPL has ANSWERED (poll
   its output), with `MODUS_FASL=0` (a FASL cache hit runs a different path
   and touches other pages), and read the pages of YOUR process (`$!`), never
@@ -139,7 +144,16 @@ All opt-in; unset, every image is built as before.  68k soft float:
    sequences out of line, one copy each: type checks, the GC check, argument
    setup, the global-read cache path.  Native speed stays; each pattern is
    measured on its own.
-2. **A static boot heap.**  First half done (`MODUS_68K_GC_STATIC`): after
+2. **Boot from a saved core** (`MODUS_68K_CORE`): done.  The low block and the
+   static heap are file-backed `PT_LOAD`s, clean until written; the stub maps
+   only the young semispaces (`--dynamic-space-size` is their total, min 512
+   KB), and KERNEL-MAIN's core hook skips boot init.  Dirty memory at the
+   prompt ~0.3 MB (was 2.4); boot 0.1 s (was 12); the smoke program 0.4 s.
+   What is left: every collection walks the whole 2 MB static heap, so it is
+   all in a command's working set (and collections at a 1 MB heap are slow):
+   a card-marking barrier, so a collection scans only written static cards.
+   The core image still carries boot's init code and tables: disk, not RAM.
+   **A static boot heap.**  First half done (`MODUS_68K_GC_STATIC`): after
    boot the collector freezes what it copied -- 1.56 MB of objects, 0.51 MB of
    conses -- walks it typed at every collection, and releases evacuated
    pages (and their kind bytes), so the heap at the prompt is 2.3-2.5 MB

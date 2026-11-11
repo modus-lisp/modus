@@ -398,6 +398,7 @@
 (declaim (overridable %core-pre-restore))
 (defun %core-pre-restore () t)
 
+(declaim (overridable %restore-image))
 (defun %restore-image ()
   "Read the snapshot named by argv[2] into this process.  See the file header
    for what is and is not restored.  Returns the restored allocation pointer."

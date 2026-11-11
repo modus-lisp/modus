@@ -80,6 +80,9 @@
 ;;; Entry stub
 ;;; ============================================================
 
+(defvar *68k-core-desc-label* nil
+  "While the entry stub is emitted: the label of its core descriptor.")
+
 (defun emit-linux-68k-choose-heap-size (buf)
   "Leave the heap size in BYTES in A5 (a syscall clobbers d0-d5 and a0 only).
    Reads argv for --dynamic-space-size, else asks sysinfo(2) for physical RAM
@@ -296,8 +299,30 @@
    No signal handlers and no JIT arena: a fault is a clean SIGSEGV rather than a
    longjmp into handler-case, and there is no m68k JIT.  Deliberate omissions."
   (let ((buf (make-m68k-buffer))
-        (no-cap (mvm-make-label)))
+        (no-cap (mvm-make-label))
+        (core-boot (mvm-make-label))
+        (go (mvm-make-label)))
+    ;; CORE DESCRIPTOR (*68K-GC-STATIC* images): a marker and two longwords
+    ;; scripts/68k-core-link.py patches when it appends a saved core -- the
+    ;; flag (non-zero: the low block and the static heap are already mapped,
+    ;; by the ELF's own PT_LOADs) and Y, where the young semispaces start.
+    (when *68k-gc-static*
+      (let ((over (mvm-make-label)))
+        (m68k-emit-bra buf over)
+        (m68k-emit-label buf (setq *68k-core-desc-label* (mvm-make-label)))
+        (m68k-emit-long buf #x6D6F6475)                   ; "modu"
+        (m68k-emit-long buf #x73636F72)                   ; "scor"
+        (m68k-emit-long buf 0)                            ; flag
+        (m68k-emit-long buf 0)                            ; Y
+        (m68k-emit-label buf over)))
     (emit-linux-68k-choose-heap-size buf)
+    (when *68k-gc-static*
+      (m68k-emit-word buf #x41FA)                         ; LEA (d16,PC),A0
+      (m68k-emit-word buf 0)
+      (m68k-emit-fixup buf *68k-core-desc-label* :disp16)
+      (m68k-emit-move-disp-dn buf +68k-a0+ 8 +68k-d0+)
+      (m68k-emit-tst buf +68k-d0+)
+      (m68k-emit-bne buf core-boot))
     ;; --- mmap2 FIRST: the argc slot is INSIDE this mapping, and this port asks
     ;;     for no BSS, so writing it beforehand is an immediate SIGSEGV.
     ;;     mmap2(addr, S + guard, PROT_READ|WRITE, MAP_PRIVATE|ANON|FIXED, -1, 0)
@@ -374,12 +399,108 @@
     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x18)   ; stack_base
     (m68k-emit-moveq buf +68k-d1+ 0)
     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x20)   ; gc_count
+    (when *68k-gc-static*
+      (m68k-emit-bra buf go)
+      (emit-linux-68k-core-boot buf core-boot))
+    (m68k-emit-label buf go)
     ;; --- VFP must point at a frame before the first prologue runs
     (m68k-emit-move-an-an buf +68k-a7+ +68k-a6+)
     ;; --- fall through to translated native code
     (m68k-fixup-labels buf)
     (loop for b across (m68k-buffer-to-bytes buf)
           do (mvm-emit-byte mbuf b))))
+
+;;; CORE BOOT (a *68K-GC-STATIC* image with a saved core appended by
+;;; scripts/68k-core-link.py).  The ELF's PT_LOADs have already mapped the low
+;;; block [#x10000000, #x10020000) and the static heap, file-backed and private:
+;;; clean until written.  So map only the young semispaces, at Y (from the
+;;; descriptor), each half of the requested size (min 256 KB), and the kind map
+;;; up to their end; stage argv into the mapped low block; write the Cheney
+;;; geometry (the collection count is the core's).  A5 = the requested size.
+(defun emit-linux-68k-core-boot (buf label)
+  (let ((big (mvm-make-label)) (no-cap (mvm-make-label)))
+    (m68k-emit-label buf label)
+    ;; D6 = young = (S/2) & ~#xFFFF, at least 256 KB;  D7 = Y
+    (m68k-emit-move-an-dn buf +68k-a5+ +68k-d6+)
+    (m68k-emit-lsr-imm buf +68k-d6+ 1)
+    (m68k-emit-andi buf +68k-d6+ #xFFFF0000)
+    (m68k-emit-cmpi buf +68k-d6+ #x40000)
+    (m68k-emit-bcc-word buf +68k-cc-cc+ big)
+    (m68k-emit-move-imm-dn buf #x40000 +68k-d6+)
+    (m68k-emit-label buf big)
+    (m68k-emit-word buf #x41FA)                         ; LEA desc(PC),A0
+    (m68k-emit-word buf 0)
+    (m68k-emit-fixup buf *68k-core-desc-label* :disp16)
+    (m68k-emit-move-disp-dn buf +68k-a0+ 12 +68k-d7+)
+    ;; mmap2(Y, 2*young + guard, RW, PRIVATE|ANON|FIXED, -1, 0)
+    (m68k-emit-move-dn-dn buf +68k-d7+ +68k-d1+)
+    (m68k-emit-move-dn-dn buf +68k-d6+ +68k-d2+)
+    (m68k-emit-add-dn-dn buf +68k-d6+ +68k-d2+)
+    (m68k-emit-addi buf +68k-d2+ +linux-68k-gc-guard+)
+    (m68k-emit-move-imm-dn buf 3 +68k-d3+)
+    (m68k-emit-move-imm-dn buf #x32 +68k-d4+)
+    (m68k-emit-move-imm-dn buf -1 +68k-d5+)
+    (m68k-emit-move-imm-an buf 0 +68k-a0+)
+    (m68k-emit-move-imm-dn buf +68k-linux-sys-mmap2+ +68k-d0+)
+    (m68k-emit-trap buf 0)
+    ;; the kind map: (Y + 2*young + guard - base) / 16 bytes at its fixed address
+    (m68k-emit-move-dn-dn buf +68k-d7+ +68k-d2+)
+    (m68k-emit-add-dn-dn buf +68k-d6+ +68k-d2+)
+    (m68k-emit-add-dn-dn buf +68k-d6+ +68k-d2+)
+    (m68k-emit-addi buf +68k-d2+ (- +linux-68k-gc-guard+ +linux-68k-heap-addr+))
+    (m68k-emit-lsr-imm buf +68k-d2+ 4)
+    (m68k-emit-move-imm-dn buf +68k-gc-kind-map+ +68k-d1+)
+    (m68k-emit-move-imm-dn buf 3 +68k-d3+)
+    (m68k-emit-move-imm-dn buf #x32 +68k-d4+)
+    (m68k-emit-move-imm-dn buf -1 +68k-d5+)
+    (m68k-emit-move-imm-an buf 0 +68k-a0+)
+    (m68k-emit-move-imm-dn buf +68k-linux-sys-mmap2+ +68k-d0+)
+    (m68k-emit-trap buf 0)
+    ;; NIL page, staged argv, argc -- as the plain boot
+    (emit-linux-68k-nil-page buf)
+    (emit-linux-68k-stage-argv buf)
+    (m68k-emit-move-disp-dn buf +68k-a7+ 0 +68k-d0+)
+    (m68k-emit-move-imm-an buf (+ +linux-68k-heap-addr+ #x200) +68k-a0+)
+    (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+    ;; D6/D7 survive the syscalls?  They do not need to: reload both.
+    (m68k-emit-move-an-dn buf +68k-a5+ +68k-d6+)
+    (m68k-emit-lsr-imm buf +68k-d6+ 1)
+    (m68k-emit-andi buf +68k-d6+ #xFFFF0000)
+    (let ((big2 (mvm-make-label)))
+      (m68k-emit-cmpi buf +68k-d6+ #x40000)
+      (m68k-emit-bcc-word buf +68k-cc-cc+ big2)
+      (m68k-emit-move-imm-dn buf #x40000 +68k-d6+)
+      (m68k-emit-label buf big2))
+    (m68k-emit-word buf #x41FA)
+    (m68k-emit-word buf 0)
+    (m68k-emit-fixup buf *68k-core-desc-label* :disp16)
+    (m68k-emit-move-disp-dn buf +68k-a0+ 12 +68k-d7+)
+    ;; margin = min(margin-max, young/4), 16-aligned
+    (m68k-emit-move-dn-dn buf +68k-d6+ +68k-d5+)
+    (m68k-emit-lsr-imm buf +68k-d5+ 2)
+    (m68k-emit-andi buf +68k-d5+ (logand (lognot 15) #xFFFFFFFF))
+    (m68k-emit-cmpi buf +68k-d5+ +linux-68k-gc-margin-max+)
+    (m68k-emit-bcc-word buf +68k-cc-ls+ no-cap)
+    (m68k-emit-move-imm-dn buf +linux-68k-gc-margin-max+ +68k-d5+)
+    (m68k-emit-label buf no-cap)
+    ;; VA = Y, VL = Y + young - margin, VN = NIL
+    (m68k-emit-move-dn-an buf +68k-d7+ +68k-a2+)
+    (m68k-emit-move-dn-dn buf +68k-d7+ +68k-d1+)
+    (m68k-emit-add-dn-dn buf +68k-d6+ +68k-d1+)
+    (m68k-emit-sub-dn-dn buf +68k-d5+ +68k-d1+)
+    (m68k-emit-move-dn-an buf +68k-d1+ +68k-a3+)
+    (m68k-emit-move-imm-an buf +nil-value+ +68k-a4+)
+    ;; Cheney geometry: from = Y, to = Y + young, size = young, stack_base
+    (m68k-emit-move-imm-an buf (+ +linux-68k-heap-addr+ #x40) +68k-a0+)
+    (m68k-emit-move-dn-disp buf +68k-d7+ +68k-a0+ #x00)
+    (m68k-emit-move-dn-dn buf +68k-d7+ +68k-d1+)
+    (m68k-emit-add-dn-dn buf +68k-d6+ +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x08)
+    (m68k-emit-move-dn-disp buf +68k-d6+ +68k-a0+ #x10)
+    (m68k-emit-move-an-dn buf +68k-a7+ +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x18)
+    (when *68k-a5-globals*
+      (m68k-emit-move-imm-an buf *68k-hosted-globals-base* +68k-a5+))))
 
 ;;; ============================================================
 ;;; Boot descriptor

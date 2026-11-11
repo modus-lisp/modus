@@ -6158,7 +6158,11 @@
           ;; *A64-BULK-MOVE-WORDS* & co.  Operands go through x12-x16 only, so
           ;; x17 (and x16 once loaded) survive to the guard pass below.
           ;; ---- BULK-MOVE Vdst, Vdi, Vsrc, Vsi, Vn, kind ----
+          ((= op +op-kernel+)
+           (error "KERNEL is x86-64 only"))
           ((= op +op-bulk-move+)
+           (when (>= (vr 5) 2)
+             (error "BULK-MOVE kinds 2 and 3 (to raw memory) are x86-64 only"))
            (let ((bytes (= (vr 5) 1)))
              (a64-bulk-elt-addr buf +a64-x9+ (ensure-src (vr 0) +a64-x12+)
                                 (ensure-src (vr 1) +a64-x13+) bytes)

@@ -128,6 +128,7 @@
    #:+op-vi-ld+ #:+op-vi-st+ #:+op-vi-dup+ #:+op-vi-un+ #:+op-vi-shift+
    #:+op-vi-bin+ #:+op-vi-movi+ #:+op-vi-umov+ #:+op-vi-lane+
    #:+op-bulk-move+ #:+op-bulk-fill+ #:mvm-bulk-move #:mvm-bulk-fill
+   #:+op-kernel+ #:mvm-kernel
    #:mvm-vi-ld #:mvm-vi-st #:mvm-vi-dup #:mvm-vi-un #:mvm-vi-shift
    #:mvm-vi-bin #:mvm-vi-movi #:mvm-vi-umov #:mvm-vi-lane
    #:mvm-load #:mvm-store #:mvm-fence
@@ -582,13 +583,28 @@
 ;; BULK MEMORY: the element loops under REPLACE and FILL as one instruction each.
 ;; Elements are addressed as AREF / U8-REF address them (the translator knows its
 ;; own layout); KIND 0 is word slots -- the tagged value is stored as it is -- and
-;; KIND 1 bytes of a u8 vector.  BULK-MOVE is memmove: a same-object move upward
+;; KIND 1 bytes of a u8 vector.  BULK-MOVE KIND 2 (x86-64 only; aarch64 refuses it)
+;; copies packed u32 elements to RAW memory at DST+DI, DST a fixnum address, each
+;; with its top byte cleared: the RFB Raw pixel row (mvm/native-pixels-x64.lisp).
+;; KIND 3 (x86-64 only) copies bytes of a u8 vector to raw memory the same way: the
+;; socket page copy.  KIND 4 (x86-64 only) packs u32 lanes into a u8 vector as
+;; 3-byte CPIXELs, the low three bytes of each: ZRLE's raw tile.  BULK-MOVE is memmove: a same-object move upward
 ;; copies from the top.  Native on aarch64 and x64; the interpreter arm is the
 ;; reference.  Only those two builds' kernels emit them (see
 ;; *NATIVE-BULK-SOURCE* in build-cli-common.lisp), so the 32-bit translators
 ;; never see them.
 (defconstant +op-bulk-move+ #x94) ; (bulk-move Vdst Vdi Vsrc Vsi Vn kind)  N elements src[si..] -> dst[di..]
 (defconstant +op-bulk-fill+ #x95) ; (bulk-fill Varr Vi Vn Vval kind)       N elements from Vi := Vval
+;; KERNEL: a native inner loop with a fixnum result, x86-64 only (aarch64 refuses it,
+;; so a function using it falls back to the interpreter there; only the x64 build's
+;; mvm/native-pixels-x64.lisp emits it).  KIND 0: Vd := how many of the N u32 lanes
+;; SRC[I..] equal the u32 VAL.  KIND 1: Vd := Adler-32's (B<<16)|A after the N bytes
+;; of the u8 vector SRC[I..], from VAL = (B<<16)|A, A and B below 65521.  KIND 2:
+;; each of the N fixnum word slots SRC[I..] := x >= VAL ? x - VAL : -1; Vd := 0.
+;; KINDS 3-5, hosted x86-64 only (mvm/x64-kernels/*.s): 3, AES counter mode (SRC = J0 ++
+;; round keys, I = in, VAL = out, N = BYTES<<4 | ROUNDS); 4, GHASH (SRC = H ++ Y ++ the
+;; byte-reversal mask, Y updated; I = data, N = bytes); 5, CPUID leaf 1's ECX.
+(defconstant +op-kernel+ #x96)    ; (kernel Vd Vsrc Vi Vval Vn kind)
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -828,8 +844,9 @@
 (defopcode :vi-movi  #xE8 (:reg :imm8 :imm8)           "immediate byte → every lane")
 (defopcode :vi-umov  #xE9 (:reg :reg :imm8 :imm8)      "one lane → fixnum")
 (defopcode :vi-lane  #xEA (:reg :reg :reg :imm8 :imm8) "s16x8 by-element mla/mls/mul/sqdmulh/sqrdmulh")
-(defopcode :bulk-move #x94 (:reg :reg :reg :reg :reg :imm8) "memmove N elements (kind 0 words, 1 bytes)")
+(defopcode :bulk-move #x94 (:reg :reg :reg :reg :reg :imm8) "memmove N elements (kind 0 words, 1 bytes, 2 u32 / 3 bytes to raw memory, 4 u32 to CPIXELs)")
 (defopcode :bulk-fill #x95 (:reg :reg :reg :reg :imm8)      "N elements := value (kind 0 words, 1 bytes)")
+(defopcode :kernel    #x96 (:reg :reg :reg :reg :reg :imm8) "native loop with a result (kind 0 u32 run, 1 adler-32)")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -1447,6 +1464,7 @@
 (defun mvm-vi-lane (buf fd fa fb op lane) (encode-instruction buf +op-vi-lane+ fd fa fb op lane))
 (defun mvm-bulk-move (buf vd vdi vs vsi vn kind) (encode-instruction buf +op-bulk-move+ vd vdi vs vsi vn kind))
 (defun mvm-bulk-fill (buf va vi vn vv kind) (encode-instruction buf +op-bulk-fill+ va vi vn vv kind))
+(defun mvm-kernel (buf vd vs vi vv vn kind) (encode-instruction buf +op-kernel+ vd vs vi vv vn kind))
 
 ;; Memory
 (defun mvm-load (buf vd vaddr width)

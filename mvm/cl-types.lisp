@@ -4173,7 +4173,13 @@
 
 (defvar most-positive-fixnum +fixnum-max+)
 
-(defvar most-negative-fixnum +fixnum-neg-limit+)
+(defvar most-negative-fixnum +fixnum-min+
+  "-(2^62 - 1): the fixnum range is SYMMETRIC here.  A word holds -2^62 too, but nothing
+   produces one -- the literal compiler, the interpreter's loader and normalization all
+   test against +FIXNUM-MIN+, because -2^62 is where negation wraps -- so that value is a
+   BIGNUM, and as the old MOST-NEGATIVE-FIXNUM it was not even a FIXNUM: (typep
+   most-negative-fixnum 'fixnum) was NIL, and a declared FIXNUM could hold a bignum.
+   The CLHS lets an implementation choose its range; it must contain its own bounds.")
 
 (defvar call-arguments-limit +fixnum-max+)   ; see APPLY (cl-printer.lisp)
 

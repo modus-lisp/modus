@@ -1244,6 +1244,156 @@
 ;;; staging page.  NIL = not handled, and the caller takes the element path
 ;;; exactly as before.  (Reading has its own bulk path, %FS-READ-U8-BULK.)
 
+;; x86-64 replaces this with one BULK-MOVE kind 3 (mvm/native-pixels-x64.lisp)
+(declaim (overridable %fs-page-copy))
+(defun %fs-page-copy (seq i n page)
+  "Copy SEQ[I, I+N) into the raw I/O page at PAGE.  SEQ is a simple (unsigned-byte 8) array:
+   the typed loop is ~5x the untyped one (an AREF dispatch per byte), which is what a RFB
+   frame's 1.2 MB write-sequence paid on every update.  Unrolled by four: the loop's own
+   bookkeeping was a third of the copy (measured 2.5 ms against 3.6 ms per 1.2 MB)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) seq) (fixnum i n page) (optimize (speed 3) (safety 0)))
+  (let ((j 0) (p page) (k i))
+    (declare (fixnum j p k))
+    (loop (when (>= j (- n 3)) (return))
+      (setf (mem-ref p :u8) (aref seq k)
+            (mem-ref (+ p 1) :u8) (aref seq (+ k 1))
+            (mem-ref (+ p 2) :u8) (aref seq (+ k 2))
+            (mem-ref (+ p 3) :u8) (aref seq (+ k 3)))
+      (setq p (+ p 4) k (+ k 4) j (+ j 4)))
+    (loop (when (>= j n) (return))
+      (setf (mem-ref p :u8) (aref seq k))
+      (setq p (+ p 1) k (+ k 1) j (+ j 1)))))
+
+(defun %fs-page-flush (fd page n)
+  "Write the N bytes at the raw PAGE to FD, all of them (EINTR and EAGAIN again)."
+  (let ((off 0))
+    (loop
+      (when (>= off n) (return nil))
+      (let ((w (%sys-write-raw fd (+ page off) (- n off))))
+        (cond ((> w 0) (setq off (+ off w)))
+              ((or (= w -4) (= w -11)) nil)
+              (t (error "write: failed (~d)" w)))))))
+
+;; x86-64 replaces this with BULK-MOVE kind 2 rows (mvm/native-pixels-x64.lisp)
+(declaim (overridable %fs-write-pixel-rows))
+(defun %fs-write-pixel-rows (stream px fw x y w h)
+  "Write the rectangle (X,Y,W,H) of PX (an (unsigned-byte 32) array, row stride FW) to the
+   buffered SOCKET output STREAM as 4-byte little-endian pixels, B G R 0 -- RFB's Raw
+   encoding for a 32bpp true-colour client.  The pixel word IS those bytes (the top byte is
+   masked to 0), so each pixel is one store into the I/O page, which goes out 4 KB at a time.
+   Nothing is built in a byte array first: a 640x480 frame was 2.6 ms of fill plus ~3 ms of
+   byte copy, and this is 0.8 ms.  Returns T when it wrote the rectangle.  Returns NIL, having
+   written nothing, unless STREAM is a buffered socket output: the caller takes its byte path."
+  (declare (type (simple-array (unsigned-byte 32) (*)) px) (fixnum fw x y w h)
+           (optimize (speed 3) (safety 0)))
+  (let ((fd (%fs-fd stream)))
+    (unless (%fs-obuf-p stream fd) (return-from %fs-write-pixel-rows nil))
+    ;; whatever the stream already holds (the rectangle header, written byte by byte) goes first
+    (%fs-oflush stream)
+    (let* ((page (modus-int::%sock-io-buf)) (cap (modus-int::%sock-io-cap)) (n 0) (total 0))
+      (declare (fixnum n total cap))
+      (loop for yy fixnum from y below (+ y h) for row fixnum = (* yy fw) do
+        (loop for xx fixnum from x below (+ x w) do
+          (setf (mem-ref (+ page n) :u32) (logand (aref px (+ row xx)) #xffffff))
+          (setq n (+ n 4))
+          (when (= n cap)
+            (%fs-page-flush fd page cap)
+            (setq total (+ total cap) n 0))))
+      (when (> n 0)
+        (%fs-page-flush fd page n)
+        (setq total (+ total n)))
+      (%fs-set-pos stream (+ (%fs-pos stream) total))
+      t)))
+
+;;; Two inner loops of glass's ZRLE encoder, as runtime functions so that x86-64 can run
+;;; them as KERNEL instructions (mvm/native-pixels-x64.lisp): there a Lisp loop keeps its
+;;; variables in frame slots, and these were about half a ZRLE frame's encode.  Every other
+;;; build keeps these definitions.
+
+(declaim (overridable %u32-rect-uniform-p))
+(defun %u32-rect-uniform-p (px fw x y w h c)
+  "T when every pixel of the rectangle (X,Y,W,H) of PX (an (unsigned-byte 32) array, row
+   stride FW) equals C: a solid ZRLE tile."
+  (declare (type (simple-array (unsigned-byte 32) (*)) px) (fixnum fw x y w h)
+           (optimize (speed 3) (safety 0)))
+  (let ((yy y) (end (+ y h)))
+    (declare (fixnum yy end))
+    (loop
+      (when (>= yy end) (return t))
+      (let ((row (+ (* yy fw) x)) (k 0))
+        (declare (fixnum row k))
+        (loop
+          (when (>= k w) (return nil))
+          (unless (= (aref px (+ row k)) c) (return-from %u32-rect-uniform-p nil))
+          (setq k (+ k 1))))
+      (setq yy (+ yy 1)))))
+
+(declaim (overridable %u32-to-cpixels))
+(defun %u32-to-cpixels (buf i px si n)
+  "Write the N pixels PX[SI..] (u32 lanes) into the octet vector BUF from index I as 3-byte
+   CPIXELs -- the low three bytes, B G R -- and return the index after them."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buf)
+           (type (simple-array (unsigned-byte 32) (*)) px) (fixnum i si n)
+           (optimize (speed 3) (safety 0)))
+  (let ((k 0))
+    (declare (fixnum k))
+    (loop
+      (when (>= k n) (return (+ i (* 3 n))))
+      (let ((p (aref px (+ si k))) (o (+ i (* 3 k))))
+        (declare (fixnum o))
+        (setf (aref buf o) (logand p #xff)
+              (aref buf (+ o 1)) (logand (ash p -8) #xff)
+              (aref buf (+ o 2)) (logand (ash p -16) #xff)))
+      (setq k (+ k 1)))))
+
+(declaim (overridable %fixnum-vector-rebase))
+(defun %fixnum-vector-rebase (vec off)
+  "Each element X of the simple vector of fixnums VEC := X - OFF when X >= OFF, else -1:
+   a deflate window's position tables after the window slides down by OFF."
+  (declare (simple-vector vec) (fixnum off) (optimize (speed 3) (safety 0)))
+  (let ((k 0) (n (length vec)))
+    (declare (fixnum k n))
+    (loop
+      (when (>= k n) (return vec))
+      (let ((v (svref vec k)))
+        (declare (fixnum v))
+        (setf (svref vec k) (if (>= v off) (- v off) -1)))
+      (setq k (+ k 1)))))
+
+(declaim (overridable %aes-ctr-xor))
+(defun %aes-ctr-xor (ks in out bytes rounds)
+  "AES counter mode in native code where this image has it: OUT[0,BYTES) := IN[0,BYTES) xor
+   the keystream from counter J0+1 (GCM's inc32), KS being J0's 16 bytes then the expanded
+   key (16*(ROUNDS+1) bytes), all octet vectors.  T when done; NIL -- here, and on a CPU
+   without AES-NI -- when the caller must do it itself."
+  (declare (ignore ks in out bytes rounds))
+  nil)
+
+(declaim (overridable %ghash-update))
+(defun %ghash-update (state data bytes)
+  "GCM's GHASH in native code where this image has it: STATE is the octet vector H[16]
+   Y[16] MASK[16] (MASK = 15 14 ... 0), and Y := GHASH_H(Y, DATA[0,BYTES)), BYTES a
+   multiple of 16.  T when done; NIL when the caller must do it itself."
+  (declare (ignore state data bytes))
+  nil)
+
+(declaim (overridable %adler32-update))
+(defun %adler32-update (data start end a b)
+  "Adler-32's sums A and B advanced over the octets DATA[START,END) (a simple
+   (unsigned-byte 8) array), reduced mod 65521 every 5552 bytes: (values A B)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) data) (fixnum start end)
+           (optimize (speed 3) (safety 0)))
+  (let ((i start))
+    (declare (fixnum i))
+    (loop
+      (when (>= i end) (return (values a b)))
+      (let ((lim (min end (+ i 5552))))
+        (declare (fixnum lim))
+        (loop
+          (when (>= i lim) (return nil))
+          (setq a (+ a (aref data i)) b (+ b a) i (+ i 1)))
+        (setq a (mod a 65521) b (mod b 65521))))))
+
 (defun %fs-bulk-ok-p (stream seq)
   (and (streamp stream) (= (%stream-type stream) 9)
        (>= (%fs-fd stream) 0)
@@ -1329,14 +1479,22 @@
       (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
       (return-from %fs-write-bytes t))
     (when (and (%fs-bulk-ok-p stream seq) (not (%cab-fd-p fd)) (not (%net-fd-p fd)))
-      (let ((page (%fs-io-page)) (i start))
+      ;; a socket goes out through the per-CPU socket buffer when there is one (64 KB, not 4 KB:
+      ;; each write(2) is a wakeup for the reader, and a 98 KB ZRLE frame was 25 of them)
+      (let* ((sock (%fs-obuf-p stream fd))
+             (page (if sock (modus-int::%sock-io-buf) (%fs-io-page)))
+             (chunk (if sock (modus-int::%sock-io-cap) 4096))
+             (i start))
         (loop
           (when (>= i end) (return nil))
-          (let ((n (min 4096 (- end i))) (j 0) (off 0))
-            (loop
-              (when (>= j n) (return nil))
-              (setf (mem-ref (+ page j) :u8) (aref seq (+ i j)))
-              (setq j (+ j 1)))
+          (let ((n (min chunk (- end i))) (off 0))
+            (if (typep seq '(simple-array (unsigned-byte 8) (*)))
+                (%fs-page-copy seq i n page)
+                (let ((j 0))
+                  (loop
+                    (when (>= j n) (return nil))
+                    (setf (mem-ref (+ page j) :u8) (aref seq (+ i j)))
+                    (setq j (+ j 1)))))
             (loop
               (when (>= off n) (return nil))
               (let ((w (%sys-write-raw fd (+ page off) (- n off))))

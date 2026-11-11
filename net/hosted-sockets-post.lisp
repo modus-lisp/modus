@@ -1213,6 +1213,27 @@
 (defun %sock-write (fd len)  (%gc-safe-block-3 1 fd (%sock-io-buf) len))
 (defun %sock-read (fd len)   (%gc-safe-block-3 0 fd (%sock-io-buf) len))
 
+;;; The same, for the STREAM path: mvm/cl-fileio.lisp's %SYS-READ-RAW and
+;;; %SYS-WRITE-RAW move a socket stream's bytes too (SB-BSD-SOCKETS:SOCKET-
+;;; MAKE-STREAM -> READ-SEQUENCE -> %FS-READ-U8-BULK -> read(2)), and a bare
+;;; syscall there left a thread blocked in a socket read marked as running
+;;; Lisp.  Glass's window manager, in the same process as a WebRTC gateway,
+;;; waited in its RFB handshake for a phone still loading the client; the
+;;; gateway's next collection spun main in the rendezvous, and each signal it
+;;; sent only turned the reader's read(2) into EINTR and another read(2) --
+;;; both threads at a full core, the phone never answered.  Every caller hands
+;;; these a raw page (%FS-IO-PAGE, a scratch buffer), never a heap object.
+;;; EINTR is retried, as there.
+(defun %sys-read-raw (fd buf-addr count)
+  (loop
+    (let ((n (%gc-safe-block-3 0 fd buf-addr count)))
+      (unless (= n -4) (return n)))))
+
+(defun %sys-write-raw (fd buf-addr count)
+  (loop
+    (let ((n (%gc-safe-block-3 1 fd buf-addr count)))
+      (unless (= n -4) (return n)))))
+
 (defun socket-accept (lfd)
   (let ((c (%gc-safe-block-3 43 lfd 0 0)))
     (if (< c 0) -1 c)))

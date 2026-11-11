@@ -327,6 +327,11 @@
 ;;;
 ;;; MVM registers (translate-aarch64.lisp): x24=VA x25=VL x26=NIL x29=FP.
 
+(defun linux-aarch64-region-size ()
+  "How much of the runtime-data region the image maps, from +CONV-REGION-LOW+: all of it, or the hosted
+   layout's :REGION-SIZE (MODUS_REGION_SIZE), a watch's compact region."
+  (hosted-layout :region-size (- +conv-region-end+ +conv-region-low+)))
+
 (defun linux-aarch64-layout-syms ()
   "For a PC-relative image (MODUS_PCREL): absolute ELF symbols naming its
    data layout — the runtime-data region, the heap and the JIT arena, each as
@@ -338,7 +343,7 @@
            (hlo (hosted-layout :heap-base +linux-aarch64-fixed-heap-base+))
            (alo (hosted-layout :jit-arena-base +linux-aarch64-jit-arena-base+)))
       (list (cons "MODUS-LAYOUT-REGION-LO" rlo)
-            (cons "MODUS-LAYOUT-REGION-HI" (+ rlo (- +conv-region-end+ +conv-region-low+)))
+            (cons "MODUS-LAYOUT-REGION-HI" (+ rlo (linux-aarch64-region-size)))
             (cons "MODUS-LAYOUT-HEAP-LO" hlo)
             (cons "MODUS-LAYOUT-HEAP-HI" (+ hlo (linux-aarch64-heap-size)))
             (cons "MODUS-LAYOUT-ARENA-LO" alo)
@@ -378,7 +383,7 @@
   (when (or (not (eql (conv-real +conv-region-base+) +conv-region-base+))
             (>= (linux-aarch64-code-base) +conv-region-end+))
     (emit-aarch64-layout-addr buf 0 (conv-real +conv-region-low+))
-    (emit-aarch64-load-imm64 buf 1 (- +conv-region-end+ +conv-region-low+))
+    (emit-aarch64-load-imm64 buf 1 (linux-aarch64-region-size))
     (emit-aarch64-load-imm64 buf 2 3)          ; PROT_READ|WRITE
     (emit-aarch64-load-imm64 buf 3 #x104022)   ; PRIV|ANON|NORESERVE|FIXED_NOREPLACE
     (emit-aarch64-load-imm64 buf 4 #xFFFFFFFFFFFFFFFF)

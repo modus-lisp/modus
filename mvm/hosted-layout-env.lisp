@@ -40,7 +40,12 @@
                   ("MODUS_HEAP_SIZE" . :heap-size)
                   ;; the JIT arena's address space: iOS runs no JIT, and its budget
                   ;; is ~2.2 GB for the whole app
-                  ("MODUS_JIT_ARENA_SIZE" . :jit-arena-size)))
+                  ("MODUS_JIT_ARENA_SIZE" . :jit-arena-size)
+                  ;; how much of the runtime-data region is MAPPED, from its low end
+                  ;; (+conv-region-low+): a watch's 4 GB holds no 784 MB region, and
+                  ;; the runtime touches only the low block (measured, MODUS_SHIM_RESIDENT)
+                  ;; once the file-I/O scratch moves into it (build-aarch64-cli.lisp)
+                  ("MODUS_REGION_SIZE" . :region-size)))
       (let ((v (%layout-env-hex (car kv))))
         (when v (setq out (list* (cdr kv) v out)))))
     out))
@@ -68,10 +73,15 @@
    by ENABLE-LAYOUT-THREADS, which only the CLI calls: the ANSI gate bakes no
    thread support and keeps its historic code.")
 
-(defconstant +layout-darwin-tsd-key+ 300
+(defconstant +layout-darwin-tsd-key+
+  (let ((v (sb-ext:posix-getenv "MODUS_DARWIN_TSD_KEY")))
+    (if (and v (plusp (length v))) (parse-integer v) 300))
   "The pthread key a Darwin image keeps its per-thread-window delta in.  The
    host shim creates keys until it holds this one (host/macos/modus-shim.c
-   MODUS_TSD_KEY); the image reads it at TPIDRRO_EL0 + 8*key.")
+   MODUS_TSD_KEY); the image reads it at TPIDRRO_EL0 + 8*key.  A watch's TSD
+   slots are 4 bytes (arm64_32), so its image is built with
+   MODUS_DARWIN_TSD_KEY=150: the 8-byte read then spans the shim's keys 300 and
+   301, which hold the delta's two halves.")
 
 (defun enable-layout-threads ()
   "Turn native threads on for this build unless MODUS_NO_THREADS is set.  The

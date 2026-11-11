@@ -201,7 +201,13 @@
   (if (and (member *cli-arch* '(:x64 :aarch64))
            (not (and (boundp 'cl-user::*cl-repl-i386-p*)
                      (symbol-value 'cl-user::*cl-repl-i386-p*))))
-      (mvm-text "mvm/native-bulk.lisp")
+      (concatenate 'string (mvm-text "mvm/native-bulk.lisp")
+                   ;; HOSTED x86-64 only: the socket and RFB loops on BULK-MOVE kinds 2-4
+                   ;; and KERNEL.  Not bare metal: the UEFI image's source is what the
+                   ;; aarch64 DDC compiles, and the aarch64 translator has no arm for them.
+                   (if (and (eq *cli-arch* :x64) (not *cli-bare-metal*))
+                       (mvm-text "mvm/native-pixels-x64.lisp")
+                       ""))
       ""))
 ;; MODUS_SOURCE_BLOB=1: keep the image's copy of its own source (the MVMS blob).  Off by
 ;; default (mvm/cross.lisp *EMBED-SOURCE-BLOB*): nothing reads it -- the self-hosting

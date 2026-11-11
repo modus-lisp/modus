@@ -99,10 +99,10 @@ static long audio_queued(void) {
     return n;
 }
 
-long modus_audio_call(long nr, long a0, long a1) {
+int64_t modus_audio_call(int64_t nr, int64_t a0, int64_t a1) {   // int64_t: a long is 32 bits on a watch
     switch (nr) {
-    case 1010: return audio_open(a0);
-    case 1011: return audio_write(a0, a1);
+    case 1010: return audio_open((long)a0);
+    case 1011: return audio_write((long)a0, (long)a1);
     case 1012: return audio_queued();
     }
     return -38;

@@ -1810,6 +1810,69 @@
           (ash (logand reg #b111) 3)
           (logand rm #b111)))
 
+;;; KERNEL kinds 3-5 are whole routines in AES-NI / PCLMULQDQ / CPUID, assembled from
+;;; mvm/x64-kernels/*.s by scripts/x64-kernels.sh and copied in as bytes: every branch is
+;;; inside its routine, so the bytes are position-independent.  Each starts with the
+;;; KERNEL arm's registers (rsi src, rax i, rdx val, rcx n, all tagged) and leaves its
+;;; untagged result in rax.
+(defun emit-byte-vector (buf v)
+  "Every byte of the vector V, in order."
+  (dotimes (i (length v)) (emit-byte buf (aref v i))))
+
+(defparameter *x64-kernel-aes-ctr*
+  ;; 223 bytes, from mvm/x64-kernels/aes-ctr.s (scripts/x64-kernels.sh)
+  #(#x48 #x83 #xEC #x40 #xF3 #x0F #x7F #x04 #x24 #xF3 #x0F #x7F #x4C #x24 #x10 #xF3
+    #x0F #x7F #x54 #x24 #x20 #x48 #xD1 #xF9 #x49 #x89 #xC8 #x49 #x83 #xE0 #x0F #x48
+    #xC1 #xE9 #x04 #x48 #x83 #xC6 #x07 #x48 #x83 #xC0 #x07 #x48 #x83 #xC2 #x07 #xF3
+    #x0F #x6F #x06 #x44 #x8B #x4E #x0C #x41 #x0F #xC9 #x48 #x85 #xC9 #x0F #x84 #x85
+    #x00 #x00 #x00 #x41 #xFF #xC1 #x45 #x89 #xCA #x41 #x0F #xCA #x66 #x0F #x6F #xC8
+    #x66 #x41 #x0F #x3A #x22 #xCA #x03 #xF3 #x0F #x6F #x56 #x10 #x66 #x0F #xEF #xCA
+    #x4C #x8D #x5E #x20 #x4D #x89 #xC2 #x49 #xFF #xCA #xF3 #x41 #x0F #x6F #x13 #x66
+    #x0F #x38 #xDC #xCA #x49 #x83 #xC3 #x10 #x49 #xFF #xCA #x75 #xED #xF3 #x41 #x0F
+    #x6F #x13 #x66 #x0F #x38 #xDD #xCA #x48 #x83 #xF9 #x10 #x72 #x1C #xF3 #x0F #x6F
+    #x10 #x66 #x0F #xEF #xCA #xF3 #x0F #x7F #x0A #x48 #x83 #xC0 #x10 #x48 #x83 #xC2
+    #x10 #x48 #x83 #xE9 #x10 #x75 #x9C #xEB #x1F #xF3 #x0F #x7F #x4C #x24 #x30 #x4D
+    #x31 #xDB #x46 #x0F #xB6 #x14 #x18 #x46 #x32 #x54 #x1C #x30 #x46 #x88 #x14 #x1A
+    #x49 #xFF #xC3 #x49 #x39 #xCB #x72 #xEA #xF3 #x0F #x6F #x04 #x24 #xF3 #x0F #x6F
+    #x4C #x24 #x10 #xF3 #x0F #x6F #x54 #x24 #x20 #x48 #x83 #xC4 #x40 #x31 #xC0))
+(defparameter *x64-kernel-ghash*
+  ;; 501 bytes, from mvm/x64-kernels/ghash.s (scripts/x64-kernels.sh)
+  #(#x48 #x81 #xEC #xB0 #x00 #x00 #x00 #xF3 #x0F #x7F #x04 #x24 #xF3 #x0F #x7F #x4C
+    #x24 #x10 #xF3 #x0F #x7F #x54 #x24 #x20 #xF3 #x0F #x7F #x5C #x24 #x30 #xF3 #x0F
+    #x7F #x64 #x24 #x40 #xF3 #x0F #x7F #x6C #x24 #x50 #xF3 #x0F #x7F #x74 #x24 #x60
+    #xF3 #x0F #x7F #x7C #x24 #x70 #xF3 #x44 #x0F #x7F #x84 #x24 #x80 #x00 #x00 #x00
+    #xF3 #x44 #x0F #x7F #x8C #x24 #x90 #x00 #x00 #x00 #xF3 #x44 #x0F #x7F #x94 #x24
+    #xA0 #x00 #x00 #x00 #x48 #xD1 #xF9 #x48 #x83 #xC6 #x07 #x48 #x83 #xC0 #x07 #xF3
+    #x44 #x0F #x6F #x56 #x20 #xF3 #x0F #x6F #x0E #x66 #x41 #x0F #x38 #x00 #xCA #xF3
+    #x0F #x6F #x46 #x10 #x66 #x41 #x0F #x38 #x00 #xC2 #x48 #x85 #xC9 #x0F #x84 #x11
+    #x01 #x00 #x00 #xF3 #x0F #x6F #x10 #x66 #x41 #x0F #x38 #x00 #xD2 #x66 #x0F #xEF
+    #xC2 #x66 #x0F #x6F #xD8 #x66 #x0F #x3A #x44 #xD9 #x00 #x66 #x0F #x6F #xE0 #x66
+    #x0F #x3A #x44 #xE1 #x10 #x66 #x0F #x6F #xE8 #x66 #x0F #x3A #x44 #xE9 #x01 #x66
+    #x0F #x6F #xF0 #x66 #x0F #x3A #x44 #xF1 #x11 #x66 #x0F #xEF #xE5 #x66 #x0F #x6F
+    #xEC #x66 #x0F #x73 #xDC #x08 #x66 #x0F #x73 #xFD #x08 #x66 #x0F #xEF #xDD #x66
+    #x0F #xEF #xF4 #x66 #x0F #x6F #xFB #x66 #x44 #x0F #x6F #xC6 #x66 #x0F #x72 #xF3
+    #x01 #x66 #x0F #x72 #xF6 #x01 #x66 #x0F #x72 #xD7 #x1F #x66 #x41 #x0F #x72 #xD0
+    #x1F #x66 #x44 #x0F #x6F #xCF #x66 #x41 #x0F #x73 #xF8 #x04 #x66 #x0F #x73 #xFF
+    #x04 #x66 #x41 #x0F #x73 #xD9 #x0C #x66 #x0F #xEB #xDF #x66 #x41 #x0F #xEB #xF0
+    #x66 #x41 #x0F #xEB #xF1 #x66 #x0F #x6F #xFB #x66 #x44 #x0F #x6F #xC3 #x66 #x44
+    #x0F #x6F #xCB #x66 #x0F #x72 #xF7 #x1F #x66 #x41 #x0F #x72 #xF0 #x1E #x66 #x41
+    #x0F #x72 #xF1 #x19 #x66 #x41 #x0F #xEF #xF8 #x66 #x41 #x0F #xEF #xF9 #x66 #x44
+    #x0F #x6F #xC7 #x66 #x0F #x73 #xFF #x0C #x66 #x41 #x0F #x73 #xD8 #x04 #x66 #x0F
+    #xEF #xDF #x66 #x0F #x6F #xD3 #x66 #x0F #x6F #xE3 #x66 #x0F #x6F #xEB #x66 #x0F
+    #x72 #xD2 #x01 #x66 #x0F #x72 #xD4 #x02 #x66 #x0F #x72 #xD5 #x07 #x66 #x0F #xEF
+    #xD4 #x66 #x0F #xEF #xD5 #x66 #x41 #x0F #xEF #xD0 #x66 #x0F #xEF #xDA #x66 #x0F
+    #xEF #xF3 #x66 #x0F #x6F #xC6 #x48 #x83 #xC0 #x10 #x48 #x83 #xE9 #x10 #x0F #x85
+    #xEF #xFE #xFF #xFF #x66 #x41 #x0F #x38 #x00 #xC2 #xF3 #x0F #x7F #x46 #x10 #xF3
+    #x0F #x6F #x04 #x24 #xF3 #x0F #x6F #x4C #x24 #x10 #xF3 #x0F #x6F #x54 #x24 #x20
+    #xF3 #x0F #x6F #x5C #x24 #x30 #xF3 #x0F #x6F #x64 #x24 #x40 #xF3 #x0F #x6F #x6C
+    #x24 #x50 #xF3 #x0F #x6F #x74 #x24 #x60 #xF3 #x0F #x6F #x7C #x24 #x70 #xF3 #x44
+    #x0F #x6F #x84 #x24 #x80 #x00 #x00 #x00 #xF3 #x44 #x0F #x6F #x8C #x24 #x90 #x00
+    #x00 #x00 #xF3 #x44 #x0F #x6F #x94 #x24 #xA0 #x00 #x00 #x00 #x48 #x81 #xC4 #xB0
+    #x00 #x00 #x00 #x31 #xC0))
+(defparameter *x64-kernel-cpuid*
+  ;; 13 bytes, from mvm/x64-kernels/cpuid.s (scripts/x64-kernels.sh)
+  #(#x53 #xB8 #x01 #x00 #x00 #x00 #x31 #xC9 #x0F #xA2 #x89 #xC8 #x5B))
+
 (defun translate-instruction (state opcode operands mvm-next-pos)
   "Translate a single MVM instruction into x86-64 code.
    OPCODE is the numeric MVM opcode.
@@ -6233,6 +6296,130 @@
         ;; V1/V0/V5/VR: everything borrowed is pushed first, the operands are
         ;; staged through the stack (so no operand is read after its register
         ;; was reused), and it all comes back off.  Bytes from as/objdump.
+        ((op= +op-kernel+)
+         ;; KERNEL Vd Vsrc Vi Vval Vn kind (mvm.lisp): the loop runs in rax rcx rdx rsi
+         ;; r8-r11, all saved but rax (scratch); the result goes to Vd after the restore.
+         (let ((kind (sixth operands)) (top (make-label)) (done (make-label)))
+           (dolist (r '(rcx rdx rsi rdi r8 r9 r10 r11)) (emit-push buf r))
+           (dolist (v (subseq operands 1 5)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
+           (emit-bytes buf #x59 #x5A #x58 #x5E)               ; pop rcx/rdx/rax/rsi: n val i src
+           (cond
+             ((= kind 3) (emit-byte-vector buf *x64-kernel-aes-ctr*))
+             ((= kind 4) (emit-byte-vector buf *x64-kernel-ghash*))
+             ((= kind 5) (emit-byte-vector buf *x64-kernel-cpuid*))
+             ((= kind 2)
+              ;; each of the N word slots SRC[I..] (tagged fixnums): x >= VAL ? x - VAL : -1,
+              ;; on tagged values (VAL stays tagged).  Fixnums only: no barrier.
+              (emit-bytes buf #x48 #x8D #x74 #x86 #x07        ; lea rsi,[rsi+rax*4+7]  (slot I)
+                              #x48 #xD1 #xF9                  ; sar rcx,1
+                              #x49 #xC7 #xC0 #xFE #xFF #xFF #xFF ; mov r8,-2 (tagged -1)
+                              #x48 #x85 #xC9)                 ; test rcx,rcx
+              (emit-jcc buf :z done)
+              (emit-label buf top)
+              (emit-bytes buf #x48 #x8B #x06 #x49 #x89 #xC1     ; mov rax,[rsi]; mov r9,rax
+                              #x49 #x29 #xD1 #x48 #x39 #xD0     ; sub r9,rdx; cmp rax,rdx
+                              #x4D #x0F #x4C #xC8 #x4C #x89 #x0E ; cmovl r9,r8; mov [rsi],r9
+                              #x48 #x83 #xC6 #x08 #x48 #xFF #xC9) ; add rsi,8; dec rcx
+              (emit-jcc buf :nz top)
+              (emit-label buf done)
+              (emit-bytes buf #x31 #xC0))                     ; xor eax,eax: result 0
+             ((= kind 0)
+               (progn
+                 (emit-bytes buf #x48 #xD1 #xF9 #x48 #xD1 #xFA ; sar rcx,1; sar rdx,1
+                                 #x48 #x8D #x74 #x46 #x07      ; lea rsi,[rsi+rax*2+7]  (lane I)
+                                 #x31 #xC0 #x48 #x85 #xC9)     ; xor eax,eax; test rcx,rcx
+                 (emit-jcc buf :z done)
+                 (emit-label buf top)
+                 (emit-bytes buf #x39 #x14 #x86)               ; cmp [rsi+rax*4],edx
+                 (emit-jcc buf :ne done)
+                 (emit-bytes buf #x48 #xFF #xC0 #x48 #x39 #xC8) ; inc rax; cmp rax,rcx
+                 (emit-jcc buf :c top)
+                 (emit-label buf done)))
+             (t
+               (let ((outer (make-label)) (chunk (make-label)))
+                 (emit-bytes buf #x48 #xD1 #xFA                ; sar rdx,1: (B<<16)|A
+                                 #x49 #x89 #xD0                ; mov r8,rdx
+                                 #x41 #x81 #xE0 #xFF #xFF #x00 #x00 ; and r8d,#xFFFF: A
+                                 #x48 #xC1 #xEA #x10           ; shr rdx,16
+                                 #x49 #x89 #xD1                ; mov r9,rdx: B
+                                 #x48 #xD1 #xF9 #x48 #xD1 #xF8 ; sar rcx,1; sar rax,1
+                                 #x48 #x8D #x74 #x06 #x07      ; lea rsi,[rsi+rax+7]  (byte I)
+                                 #x41 #xBA #xF1 #xFF #x00 #x00) ; mov r10d,65521
+                 (emit-label buf outer)
+                 (emit-bytes buf #x48 #x85 #xC9)               ; test rcx,rcx
+                 (emit-jcc buf :z done)
+                 (emit-bytes buf #x49 #x89 #xCB                ; mov r11,rcx
+                                 #x49 #x81 #xFB #xB0 #x15 #x00 #x00) ; cmp r11,5552 (zlib's NMAX)
+                 (emit-jcc buf :be chunk)
+                 (emit-bytes buf #x41 #xBB #xB0 #x15 #x00 #x00) ; mov r11d,5552
+                 (emit-label buf chunk)
+                 (emit-bytes buf #x4C #x29 #xD9)               ; sub rcx,r11
+                 (emit-label buf top)
+                 (emit-bytes buf #x0F #xB6 #x06                ; movzx eax,byte [rsi]
+                                 #x49 #x01 #xC0 #x4D #x01 #xC1 ; add r8,rax; add r9,r8
+                                 #x48 #xFF #xC6 #x49 #xFF #xCB) ; inc rsi; dec r11
+                 (emit-jcc buf :nz top)
+                 (emit-bytes buf #x4C #x89 #xC0 #x31 #xD2 #x49 #xF7 #xF2 #x49 #x89 #xD0 ; A mod 65521
+                                 #x4C #x89 #xC8 #x31 #xD2 #x49 #xF7 #xF2 #x49 #x89 #xD1) ; B mod 65521
+                 (emit-jmp buf outer)
+                 (emit-label buf done)
+                 (emit-bytes buf #x4C #x89 #xC8 #x48 #xC1 #xE0 #x10 ; mov rax,r9; shl rax,16
+                                 #x4C #x09 #xC0))))            ; or rax,r8
+           (emit-bytes buf #x48 #xD1 #xE0)                     ; shl rax,1: tag
+           (dolist (r '(r11 r10 r9 r8 rdi rsi rdx rcx)) (emit-pop buf r))
+           (emit-store-vreg buf (first operands) 'rax)))
+        ((and (op= +op-bulk-move+) (= (sixth operands) 4))
+         ;; KIND 4: N u32 lanes SRC[SI..] -> 3-byte CPIXELs (the low three bytes, B G R)
+         ;; into the u8 vector DST at byte DI.  A byte payload: no guard, no cards.
+         (let ((top (make-label)) (done (make-label)))
+           (dolist (r '(rax rcx rdx rsi rdi)) (emit-push buf r))
+           (dolist (v (subseq operands 0 5)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
+           (emit-bytes buf #x59 #x58 #x5E #x5A #x5F)          ; pop rcx/rax/rsi/rdx/rdi: n si src di dst
+           (emit-bytes buf #x48 #xD1 #xFA #x48 #x8D #x7C #x17 #x07 ; sar rdx,1; lea rdi,[rdi+rdx+7]
+                           #x48 #x8D #x74 #x46 #x07            ; lea rsi,[rsi+rax*2+7]  (lane SI)
+                           #x48 #xD1 #xF9 #x48 #x85 #xC9)      ; sar rcx,1; test rcx,rcx
+           (emit-jcc buf :z done)
+           (emit-label buf top)
+           (emit-bytes buf #x8B #x06 #x66 #x89 #x07            ; mov eax,[rsi]; mov [rdi],ax
+                           #xC1 #xE8 #x10 #x88 #x47 #x02       ; shr eax,16; mov [rdi+2],al
+                           #x48 #x83 #xC6 #x04 #x48 #x83 #xC7 #x03 ; add rsi,4; add rdi,3
+                           #x48 #xFF #xC9)                     ; dec rcx
+           (emit-jcc buf :nz top)
+           (emit-label buf done)
+           (emit-bytes buf #x5F #x5E #x5A #x59 #x58)))         ; pop rdi/rsi/rdx/rcx/rax
+        ((and (op= +op-bulk-move+) (= (sixth operands) 3))
+         ;; KIND 3: N bytes of a u8 vector SRC[SI..] -> raw memory at DST+DI (DST a
+         ;; fixnum address, DI a byte offset): the socket page copy.  Forward only --
+         ;; a raw page and a heap vector never overlap.  No object written: no guard.
+         (dolist (r '(rax rcx rdx rsi rdi)) (emit-push buf r))
+         (dolist (v (subseq operands 0 5)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
+         (emit-bytes buf #x59 #x58 #x5E #x5A #x5F)            ; pop rcx/rax/rsi/rdx/rdi: n si src di dst
+         (emit-bytes buf #x48 #xD1 #xFF #x48 #xD1 #xFA         ; sar rdi,1; sar rdx,1
+                         #x48 #x01 #xD7                        ; add rdi,rdx
+                         #x48 #xD1 #xF8 #x48 #x8D #x74 #x06 #x07 ; sar rax,1; lea rsi,[rsi+rax+7]
+                         #x48 #xD1 #xF9 #xF3 #xA4              ; sar rcx,1; rep movsb
+                         #x5F #x5E #x5A #x59 #x58))            ; pop rdi/rsi/rdx/rcx/rax
+        ((and (op= +op-bulk-move+) (= (sixth operands) 2))
+         ;; KIND 2: N packed u32 elements SRC[SI..] -> raw memory at DST+DI (DST a
+         ;; fixnum address, DI a byte offset), each with its top byte cleared --
+         ;; the RFB Raw pixel row.  No object is written, so no guard or cards.
+         (let ((top (make-label)) (done (make-label)))
+           (dolist (r '(rax rcx rdx rsi rdi)) (emit-push buf r))
+           (dolist (v (subseq operands 0 5)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
+           (emit-bytes buf #x59 #x58 #x5E #x5A #x5F)          ; pop rcx/rax/rsi/rdx/rdi: n si src di dst
+           (emit-bytes buf #x48 #xD1 #xFF #x48 #xD1 #xFA       ; sar rdi,1; sar rdx,1
+                           #x48 #x01 #xD7                      ; add rdi,rdx
+                           #x48 #x8D #x74 #x46 #x07            ; lea rsi,[rsi+rax*2+7]
+                           #x48 #xD1 #xF9 #x48 #x85 #xC9)      ; sar rcx,1; test rcx,rcx
+           (emit-jcc buf :z done)
+           (emit-label buf top)
+           (emit-bytes buf #x8B #x06 #x25 #xFF #xFF #xFF #x00  ; mov eax,[rsi]; and eax,#xFFFFFF
+                           #x89 #x07                           ; mov [rdi],eax
+                           #x48 #x83 #xC6 #x04 #x48 #x83 #xC7 #x04 ; add rsi,4; add rdi,4
+                           #x48 #xFF #xC9)                     ; dec rcx
+           (emit-jcc buf :nz top)
+           (emit-label buf done)
+           (emit-bytes buf #x5F #x5E #x5A #x59 #x58)))         ; pop rdi/rsi/rdx/rcx/rax
         ((op= +op-bulk-move+)
          (let ((bytes (= (sixth operands) 1)) (g (translate-state-ssg-label state)))
            (dolist (r '(rax rcx rdx rsi rdi)) (emit-push buf r))

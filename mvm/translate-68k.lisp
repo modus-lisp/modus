@@ -2206,6 +2206,11 @@
          ;; any value"), and this arm dereferenced a fixnum: the first 68k CL
          ;; image faulted at address -1 on its first addition.  T is excluded
          ;; explicitly: +T-VALUE+ carries the object nibble but is an immediate.
+         (if *68k-subtag-label*
+          (progn                         ; the shared OBJ-SUBTAG
+            (m68k-load-vreg buf +68k-d0+ vs)
+            (m68k-emit-bsr buf *68k-subtag-label*)
+            (m68k-store-vreg buf vd +68k-d0+))
          (let ((zero (mvm-make-label)) (done (mvm-make-label)))
            (m68k-load-vreg buf +68k-d0+ vs)
            (m68k-emit-cmpi buf +68k-d0+ +t-value+)
@@ -2226,7 +2231,7 @@
            (m68k-emit-label buf zero)
            (m68k-emit-moveq buf +68k-d0+ 0)
            (m68k-emit-label buf done)
-           (m68k-store-vreg buf vd +68k-d0+))))
+           (m68k-store-vreg buf vd +68k-d0+)))))
 
       ;;; --- Memory (raw) ---
       (#.+op-load+
@@ -2700,13 +2705,19 @@
        ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
        (let ((vd (first operands))
              (vobj (second operands)))
+        (if *68k-array-len-label*
+         (progn                          ; the shared ARRAY-LEN
+           (m68k-load-vreg buf +68k-d0+ vobj)
+           (m68k-emit-bsr buf *68k-array-len-label*)
+           (m68k-store-vreg buf vd +68k-d0+))
+         (progn
          (m68k-load-vreg buf +68k-d0+ vobj)
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-object+) +68k-d0+)
          (m68k-emit-lsr-imm buf +68k-d0+ 8)
          (m68k-emit-andi buf +68k-d0+ #xFFFFFF)
          (m68k-emit-lsl-imm buf +68k-d0+ 1)            ; tag as fixnum
-         (m68k-store-vreg buf vd +68k-d0+)))
+         (m68k-store-vreg buf vd +68k-d0+)))))
 
       ;;; --- Byte vectors and strings ---
       ;; Payload starts right after the header longword, at obj - 9 + 4, i.e.
@@ -3009,6 +3020,42 @@
   (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
   (m68k-emit-addq buf +68k-d0+ +tag-cons+)            ; 16-aligned: + tag = OR tag
   (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)       ; 16, as the inline CONS
+  (m68k-emit-rts buf))
+
+(defvar *68k-subtag-label* nil
+  "Label of the shared OBJ-SUBTAG sequence while translating, else NIL.")
+(defvar *68k-array-len-label* nil
+  "Label of the shared ARRAY-LEN sequence while translating, else NIL.")
+
+(defun m68k-emit-subtag-helper (buf)
+  "The shared OBJ-SUBTAG: D0 = any value in; D0 = its header's subtag, tagged,
+   for a real heap object, else 0 (T included).  Clobbers D1 and A0."
+  (let ((zero (mvm-make-label)))
+    (m68k-emit-label buf *68k-subtag-label*)
+    (m68k-emit-cmpi buf +68k-d0+ +t-value+)
+    (m68k-emit-beq buf zero)
+    (m68k-emit-moveq buf +68k-d1+ 15)
+    (m68k-emit-and-dn-dn buf +68k-d0+ +68k-d1+)
+    (m68k-emit-cmpi-byte buf +68k-d1+ +tag-object+)
+    (m68k-emit-bne buf zero)
+    (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+    (m68k-emit-moveq buf +68k-d0+ 0)
+    (m68k-emit-move-byte-disp-dn buf +68k-a0+ (- 3 +tag-object+) +68k-d0+)
+    (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d0+)
+    (m68k-emit-rts buf)
+    (m68k-emit-label buf zero)
+    (m68k-emit-moveq buf +68k-d0+ 0)
+    (m68k-emit-rts buf)))
+
+(defun m68k-emit-array-len-helper (buf)
+  "The shared ARRAY-LEN: D0 = an object in; D0 = its header's count, tagged.
+   Clobbers A0."
+  (m68k-emit-label buf *68k-array-len-label*)
+  (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+  (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-object+) +68k-d0+)
+  (m68k-emit-lsr-imm buf +68k-d0+ 8)
+  (m68k-emit-andi buf +68k-d0+ #xFFFFFF)
+  (m68k-emit-lsl-imm buf +68k-d0+ 1)
   (m68k-emit-rts buf))
 
 (defun m68k-next-is-unlabelled-cons-p (next-pc)
@@ -3401,6 +3448,8 @@
    Returns a byte vector of 68k big-endian machine code."
   (let* ((*68k-gc-label* (and *68k-linux-mode* (mvm-make-label)))
          (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-bytecode* bytecode)
          (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
@@ -3512,6 +3561,10 @@
       (m68k-emit-gc-collector buf))
     (when *68k-cons-label*
       (m68k-emit-cons-helper buf))
+    (when *68k-subtag-label*
+      (m68k-emit-subtag-helper buf))
+    (when *68k-array-len-label*
+      (m68k-emit-array-len-helper buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)

@@ -1549,6 +1549,8 @@
         ;; the right offset.
         (setf (kernel-image-constant-pool-offset image)
               (mvm-buffer-position final-buf)))
+      (format t "~&;; image sections: native ~D, constant pool ~D, NFN table ~D, source blob ~D bytes~%"
+              (length native-code) (length constant-pool) (length nfn-table) (length source-blob))
       ;; Constant pool
       (loop for b across constant-pool
             do (mvm-emit-byte final-buf b))

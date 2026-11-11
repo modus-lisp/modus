@@ -21,7 +21,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 |---|---|---|---|
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
 | `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.3 MB | 5.75 MB |
-| `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` (REPL, cold code threaded) | 8.2 MB | 7.5 MB | 5.75 MB |
+| `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` (REPL, cold code threaded) | 7.4 MB | 7.5 MB | 5.75 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -146,8 +146,9 @@ All opt-in; unset, every image is built as before.  68k soft float:
    bytecode itself is only ~15% denser than 68k (8.0 vs 9.4 MB), so the cold
    tier is a new encoding: 1-byte tokens for the 255 commonest shapes,
    operands sized by value.  All 5,990 eligible functions threaded: 7.75 MB
-   image, ~14x slower.  With the profile's 300 hottest kept native: 8.2 MB
-   image, 7.5 MB resident, smoke time on a par with the native image.
+   image, ~14x slower.  With the profile's 300 hottest kept native: 7.4 MB
+   image (functions with SETJMP / LONGJMP thread too), smoke time on a par
+   with the native image.
    Next: superinstructions (call sequences, push/pop runs) and a smaller
    handler table; the boot-time cost of `%GV-CACHE-FLUSH` (16,384 slots
    cleared per global created, ~7,500 times at boot: the profile's hottest

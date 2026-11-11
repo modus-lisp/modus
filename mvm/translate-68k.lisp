@@ -4096,8 +4096,12 @@
 ;;; convention are native: the collector, backtraces and callers see no
 ;;; difference.
 ;;;
+;;; SETJMP / LONGJMP thread as they are: SETJMP's resume point is a label in its
+;;; own handler, which falls through to NEXT, and the A5 it saves points at the
+;;; token after it -- so a LONGJMP back resumes the stream there.
+;;;
 ;;; NOT threaded (stays native): a function whose first instruction is not a
-;;; frame enter, that contains SETJMP / LONGJMP or a context switch, a
+;;; frame enter, that contains a context switch, a
 ;;; conditional branch not directly after the compare that sets its flags
 ;;; (the dispatch's MOVE.B clobbers them; BVS always), or a call whose target
 ;;; has no label.
@@ -4137,6 +4141,8 @@
   (let ((s (%imm32-signed (logand x #xFFFFFFFF))))
     (cond ((<= -128 s 127) 1) ((<= -32768 s 32767) 2) (t 4))))
 
+(defvar *68k-thread-why* nil "The last reason a span could not be threaded.")
+
 (defun m68k-thread-classify (op operands new-pc w)
   "(values KEY PARAMS) for one unfused instruction, or :NATIVE when a function
    holding it cannot be threaded.  PARAMS: (:i SIZE VALUE) (:br TARGET-PC)
@@ -4163,14 +4169,15 @@
      (values (list :br w) (list (list :br (+ new-pc (first operands))))))
     ((or (eql op +op-bnull+) (eql op +op-bnnull+))
      (values (list op (first operands) w) (list (list :br (+ new-pc (second operands))))))
-    ((or (m68k-cond-br-cc op) (eql op +op-bvs+)) :native)  ; only fused
+    ((or (m68k-cond-br-cc op) (eql op +op-bvs+))             ; only fused
+     (setq *68k-thread-why* (list :unfused-branch op)) :native)
     ((eql op +op-ret+) (values (list :ret) nil))
     ((eql op +op-trap+)
      (let ((code (first operands)))
        (cond ((>= code #x8000) (values (list :enter code) nil))
-             ((member code '(#x0510 #x0511)) :native)
              (t (values (list op code) nil)))))
-    ((or (eql op +op-save-ctx+) (eql op +op-restore-ctx+)) :native)
+    ((or (eql op +op-save-ctx+) (eql op +op-restore-ctx+))
+     (setq *68k-thread-why* (list :ctx op)) :native)
     (t (values (cons op operands) nil))))
 
 (defun m68k-thread-walk (start end w fn)
@@ -4204,6 +4211,7 @@
                        #'<))
          (len (length *68k-bytecode*))
          (counts (make-hash-table :test 'equal))
+         (why (make-hash-table :test 'equal))
          (cold (make-hash-table :test 'eql)))
     (loop for (s . rest) on starts
           for e = (or (first rest) len)
@@ -4212,12 +4220,20 @@
                          (let ((d (decode-instruction *68k-bytecode* s)))
                            (not (and (eql (car d) +op-trap+) (>= (first (cadr d)) #x8000)))))
                (let ((local (make-hash-table :test 'equal)))
-                 (unless (eq :native
-                             (m68k-thread-walk s e w
-                                               (lambda (pc k p npc) (declare (ignore pc p npc))
-                                                 (incf (gethash k local 0)))))
-                   (setf (gethash s cold) (cons e w))
-                   (maphash (lambda (k n) (incf (gethash k counts 0) n)) local)))))
+                 (setq *68k-thread-why* (list :other))
+                 (if (eq :native
+                         (m68k-thread-walk s e w
+                                           (lambda (pc k p npc) (declare (ignore pc p npc))
+                                             (incf (gethash k local 0)))))
+                     (let ((r (gethash *68k-thread-why* why)))
+                       (unless r (setq r (setf (gethash *68k-thread-why* why) (list 0 0))))
+                       (incf (first r)) (incf (second r) (- e s)))
+                     (progn
+                       (setf (gethash s cold) (cons e w))
+                       (maphash (lambda (k n) (incf (gethash k counts 0) n)) local))))))
+    (maphash (lambda (k r) (format t "~&;; 68k threaded: native because ~S: ~D functions, ~D MVM bytes~%"
+                                   k (first r) (second r)))
+             why)
     (let ((rows nil) (shapes (make-hash-table :test 'equal)))
       (maphash (lambda (k n) (push (cons k n) rows)) counts)
       (setq rows (sort rows #'> :key #'cdr))

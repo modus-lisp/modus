@@ -8572,6 +8572,12 @@
       ;; FBOUNDP: the build host has no %SHADOWS-CL-NAME-P and no source shadows CL.
       ((and (symbolp op) (fboundp '%shadows-cl-name-p) (funcall '%shadows-cl-name-p op))
        (compile-call op (cdr form) env dest))
+      ;; AND BY KERNEL NAME: a user package's own function named like one of
+      ;; this compiler's intrinsics (vessel's KILN-ZERO-BOOT::%KERNEL) is that
+      ;; package's function, not the instruction.  Runtime compile only.
+      ((and (symbolp op) *mvm-eval-runtime-p* (fboundp '%user-own-function-p)
+            (funcall '%user-own-function-p op))
+       (compile-call op (cdr form) env dest))
       ;; Non-symbol operator (immediately-applied lambda, etc.).  Route
       ;; through compile-funcall, NOT compile-call: compile-call's
       ;; indirect path emits a bare :call-indirect with no closure

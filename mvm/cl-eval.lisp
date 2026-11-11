@@ -1065,6 +1065,25 @@
            (declare (ignore s))
            (eq status :external)))))
 
+(defun %user-own-function-p (sym)
+  "T when SYM's home package is neither COMMON-LISP, KEYWORD nor one of the
+   kernel's, and SYM names a function there: the program's own function, which
+   a call must reach whatever its NAME.  The compiler's intrinsics and special
+   handlers match an operator by name alone, so vessel's
+   (defun %kernel (name) ...) in KILN-ZERO-BOOT compiled every
+   (funcall (%kernel \"X\") ...) as modus's (%KERNEL src i val n kind)
+   instruction -- the DEFUNs holding it signalled at compile time, LOAD
+   swallowed them, and a Zero card's boot hook died on an undefined %BOOTARG.
+   A user function defined LATER in the file is not yet fbound and still
+   meets the intrinsic: define a helper before its first use, as SBCL's
+   compiler would want anyway."
+  (let ((pn (%macro-sym-pkg-name sym)))
+    (and pn
+         (not (string= pn "COMMON-LISP"))
+         (not (string= pn "KEYWORD"))
+         (not (%kernel-package-name-p pn))
+         (fboundp sym))))
+
 (defun set-macro-function (sym fn &rest env)
   "Install FN as the macro expander for SYM.  Accepts CL symbols, native
    MVM #x50 symbols (keyed by symbol object itself when symbol-name is

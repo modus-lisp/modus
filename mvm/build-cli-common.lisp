@@ -2664,6 +2664,8 @@
 ;; MODUS_SMALL_IMAGE: the globals' init thunks run in batches through one
 ;; guarded loop, not a HANDLER-CASE's code each (compiler.lisp *INIT-GLOBALS-BATCHED*).
 (when cl-user::*small-image* (setq modus.mvm::*init-globals-batched* t))
+;; ... and a quoted symbol's site is one call (compiler.lisp *STATIC-SYMBOL-ONE-CALL*).
+(when cl-user::*small-image* (setq modus.mvm::*static-symbol-one-call* t))
 
 ;; Function table under MODUS_SMALL_IMAGE (CL-USER::*SMALL-IMAGE*, above): the keys come from ONE string
 ;; literal and each entry is a call passing #'NAME, instead of a PUTHASH whose

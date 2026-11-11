@@ -2285,6 +2285,14 @@
    %TAKE-PENDING-FAULT, MAKE-CONDITION, the printer and FORMAT.  Set by the
    MODUS_LEAN_BOOT builds; NIL everywhere else.")
 
+(defvar *static-symbol-one-call* nil
+  "When T (MODUS_SMALL_IMAGE), a quoted symbol's phase-2 site is ONE CALL to
+   %STATIC-SYMBOL-REF with (idx, name hash, package hash) -- the shape before
+   the filled slot was inlined (2026-10-16) -- instead of the inline vector
+   check plus the deferred miss arm that makes the same call: ~26 bytes of 68k
+   a site, not ~65, at ~24,000 sites in the CLI image.  Slower per quoted
+   symbol: every use pays the call.")
+
 (defvar *static-symbols-full* nil
   "When T (MODUS_LEAN_BOOT), a quoted interned symbol compiles to ONE :LI-CONST
    of a static symbol object in the constant pool -- header (3 << 8) | #x50,
@@ -10572,6 +10580,15 @@
        ;; vector and DEST the index (the register shape %COMPILE-GLOBAL-READ-
        ;; CACHED uses: x64's AREF with the vector in DEST = RAX overwrote the
        ;; vector with the scaled index); the miss arm is the old site exactly.
+       (if *static-symbol-one-call*
+         (progn
+           (emit-li-tagged +vreg-v0+ idx)
+           (emit-li-tagged +vreg-v1+ h)
+           (emit-li-tagged +vreg-v2+ ph)
+           (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+           (emit-ir :call "%STATIC-SYMBOL-REF" 3)
+           (unless (= dest +vreg-vr+)
+             (emit-ir :mov dest +vreg-vr+)))
        (let ((miss (make-compiler-label)) (done (make-compiler-label))
              (vec (alloc-temp-reg)))
          (emit-li-tagged vec (conv-real #x10000FB0))
@@ -10598,7 +10615,7 @@
             (emit-ir :call "%STATIC-SYMBOL-REF" 3)
             (unless (= dest +vreg-vr+)
               (emit-ir :mov dest +vreg-vr+))
-            (emit-ir :br done))))))
+            (emit-ir :br done)))))))
     ((symbolp value)
      (let* ((pkg (symbol-package value))
             (pkg-name (and pkg (package-name pkg)))

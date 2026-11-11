@@ -85,7 +85,7 @@ static long run(uint8_t *f) {
     }
 }
 
-long modus_objc_call(long frame) {
+int64_t modus_objc_call(int64_t frame) {   // int64_t: the shim's word (a long is 32 bits on a watch)
     uint8_t *f = (uint8_t *)(uintptr_t)frame;
     if ([NSThread isMainThread]) return run(f);
     __block long rc = 0;

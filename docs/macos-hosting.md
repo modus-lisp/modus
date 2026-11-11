@@ -1126,16 +1126,72 @@ phone.  The shim needs three watchOS changes:
 On an Apple Watch Series 11 (46 mm) Simulator, watchOS 26.4, `hello` runs and
 `test/ios-draw.lisp` draws its tile grid, 3×4 on a small screen.
 
-**A real watch is a different project.**  Watches up to at least the S5
-(this Watch5,10) run `arm64_32`: AArch64 instructions with a 4 GB address
-space.  Reaching one needs:
-- a layout below 4 GB with a far smaller heap;
-- explicit address marking in the compiler, since the by-value
-  PC-relative rule needs a layout above 4 GB;
-- an ILP32 port of the shim;
-- a footprint that fits a watch app's memory limit.
+The Simulator runs watch apps as 64-bit Mac processes and shows none of
+what follows.
 
-The Simulator runs watch apps as 64-bit Mac processes and shows none of this.
+## On a real watch — arm64_32 (2026-11-11)
+
+modus runs on an Apple Watch SE (Watch5,10, watchOS 10.6): `(+ 1 2)` and
+`(expt 2 100)` print on its console and it exits 0.  The watch is `arm64_32`:
+AArch64 instructions, 32-bit pointers, a 4 GB address space, about 300 MB of
+memory.  A probe app measured its address space: the shared cache holds
+0x1A000000–0xC0000000; 341 MB is free below it (0x7E8000–0x15D00000, where the
+app itself loads); the top gigabyte is free too.
+
+**Link high, place low.**  The by-value PC-relative rule (compiler.lisp
+`pcrel-layout-addr-p`) treats any literal inside the layout as an address, so
+`check-layout-pcrel` keeps the layout above 4 GB, where no constant lives.
+Below 4 GB that would catch SHA-2 round constants, A64 opcode words, masks and
+NIL (`#xDEAD0001`).  So the watch image is still LINKED above 4 GB, and
+`image-segments.sh` PLACES its segments `MODUS_SEGMENT_SHIFT` lower: the image
+is position-independent, so a negative slide is just a slide, and no compiler
+change was needed.
+
+**Below 2 GB, not in the top gigabyte.**  The first placement put the segments
+at 3 GB.  The linker then put `__LINKEDIT` after them, and dyld sign-extended
+its address (it faulted at 0xffffffffd83…).  The image now sits just above the
+app's own `__TEXT`: `__MODUS` at 0x810000, everything below 0x12800000.
+
+**A compact layout** (all knobs in `mvm/hosted-layout-env.lisp`):
+
+```
+MODUS_PCREL=1 MODUS_DARWIN=1 MODUS_NO_JIT=1 MODUS_DARWIN_TSD_KEY=150
+MODUS_CODE_BASE=300010000                         code     58 MB
+MODUS_CONV_DELTA=2F5000000 MODUS_REGION_SIZE=1100000   region   17 MB (not 784)
+MODUS_HEAP_BASE=306000000 MODUS_HEAP_SIZE=9000000 MODUS_GC_MIDPOINT=4000000
+MODUS_JIT_ARENA_BASE=310000000 MODUS_JIT_ARENA_SIZE=2000000
+host/watch/build-watch.sh IMAGE OUT.app device IDENTITY PROFILE   (shift 2FF800000)
+```
+
+- **The region.**  `MODUS_SHIM_RESIDENT=1` (the shim, at exit, `mincore` over
+  each large mapping) showed that even the full kiln world touches 96 KB of the
+  784 MB region: the low block, plus three file-I/O scratch pages at
+  0x1DD/1DE/1DF00000.  `MODUS_REGION_SIZE` maps only the low end.  With it set,
+  `build-aarch64-cli.lisp` moves the scratch pages to 0x10040000–0x10048000,
+  which no runtime constant names.
+- **TSD.**  The image reads its per-thread-window delta at `TPIDRRO_EL0 +
+  8*key`.  On arm64_32 a TSD slot is 4 bytes, so the image is built with key
+  150, and the shim keeps the delta's halves in keys 300 and 301.
+- **The shim, ILP32.**  A C `long` is 32 bits here, so the syscall interface
+  is `int64_t` (`lw`), and addresses reach C through `uintptr_t`.  Linux's
+  `timespec`/`timeval` (two 64-bit words) are converted for futex, ppoll,
+  clock_gettime, nanosleep, gettimeofday and the socket timeouts.  The
+  syscall slot is written as 8 bytes, and `modus_resume` zero-extends its
+  pointer argument.
+- **No `sigaction` on fatal signals.**  watchOS kills an app that tries ("sigaction on fatal signals is not
+  supported"), so the shim installs no fault reporter there and drops the
+  image's SEGV/BUS/ILL/FPE registrations: a fault on the watch ends the app.
+- **Deploying.**  A device build of any watch target registers the watch with
+  the team and makes the profile:
+  `xcodebuild -destination 'platform=watchOS,id=UDID' -allowProvisioningUpdates
+  -allowProvisioningDeviceRegistration`.  A generic-destination build does not
+  register it.  Then `devicectl device install app` and `devicectl device
+  process launch --console`.  The watch must be awake: asleep, it refuses
+  launches and drops off the network.  Crash reports come from `devicectl
+  device copy from --domain-type systemCrashLogs`.
+
+Next: a slim world with the watch storybook (the kiln world's snapshot is 200
+MB), and the watch suite on the device.
 
 ## After rebasing onto main (2026-09-30)
 

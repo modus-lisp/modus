@@ -20,8 +20,9 @@
 // below, exactly as it does on Linux.
 
 #include <errno.h>
+#include <stdint.h>
 // host/macos/modus-audio.c: the speaker, pseudo-syscalls 1010-1012, every Apple target.
-extern long modus_audio_call(long nr, long a0, long a1);
+extern int64_t modus_audio_call(int64_t nr, int64_t a0, int64_t a1);
 #include <fcntl.h>
 #include <dirent.h>
 #include <mach-o/dyld.h>
@@ -76,7 +77,7 @@ static inline void modus_jit_wp(int executable) {
 }
 
 extern void modus_syscall_stub(void);
-extern long modus_keychain_call(long nr, long a0, long a1, long a2);   // host/macos/modus-keychain.m
+extern int64_t modus_keychain_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2);   // host/macos/modus-keychain.m
 
 extern void modus_enter(uint64_t sp, uint64_t entry) __attribute__((noreturn));
 // sigaltstack is prohibited on watchOS: there the fault handler runs on the
@@ -88,6 +89,19 @@ static inline void modus_altstack(stack_t *ss) {
     sigaltstack(ss, NULL);
 #endif
 }
+// A WATCH (watchOS on a device, not the Simulator) refuses sigaction on a fatal signal -- the app is killed
+// ("sigaction on fatal signals is not supported").  So there is no fault reporter and no recovery from a fault:
+// the image's handlers for them are accepted and dropped, and a fault ends the app with a crash report.
+#if TARGET_OS_WATCH && !TARGET_OS_SIMULATOR
+#define MODUS_NO_FATAL_SIGNALS 1
+#else
+#define MODUS_NO_FATAL_SIGNALS 0
+#endif
+static int fatal_signal(int sig) {
+    return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGTRAP || sig == SIGFPE ||
+           sig == SIGABRT || sig == SIGSYS;
+}
+
 // The thread the image STARTED on: Linux's thread-group leader, whose TID is
 // the PID.  The process's main thread on macOS; on iOS a thread of its own,
 // because the main thread belongs to UIKit (below).
@@ -107,9 +121,9 @@ static __thread int image_leader;
 // and touch events for the image.
 extern void modus_ui_init(void);
 extern void modus_ui_start(void *scene);
-extern long modus_ui_call(long nr, long a0, long a1, long a2, long a3);
-extern long modus_objc_call(long frame);                              // host/ios/modus-objc.m
-extern long modus_swift_call(long frame);                             // host/ios/modus-swift.m
+extern int64_t modus_ui_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3);
+extern int64_t modus_objc_call(int64_t frame);                              // host/ios/modus-objc.m
+extern int64_t modus_swift_call(int64_t frame);                             // host/ios/modus-swift.m
 #if TARGET_OS_WATCH
 // watchOS has no public UIKit: the SwiftUI app in host/watch/modus-watch.swift
 // owns the main thread instead.
@@ -173,6 +187,12 @@ static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t 
 }
 #endif
 
+// THE LINUX WORD.  Every syscall argument and result is a 64-bit register on the image's side; a C long is
+// 32 bits on a watch (arm64_32, ILP32), so the syscall interface says int64_t, and an address in one of these
+// words reaches C through uintptr_t (an arm64_32 layout lies below 4 GB: image-segments.sh MODUS_SEGMENT_SHIFT).
+typedef int64_t lw;
+#define PTR(x) ((void *)(uintptr_t)(x))
+
 #define PAGE16K 0x4000ULL
 #define ROUND_UP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
@@ -184,7 +204,7 @@ static void die(const char *what, long code) {
 // ---------------------------------------------------------------- errno ---
 // Darwin errno -> Linux errno, for the values that differ.  The image checks
 // results as -errno the Linux way.
-static long lx_errno(int e) {
+static lw lx_errno(int e) {
     switch (e) {
     case EAGAIN:       return 11;
     case EINPROGRESS:  return 115;
@@ -217,12 +237,12 @@ static long lx_errno(int e) {
     default:           return e;   // 1..34 agree
     }
 }
-#define RET(expr) do { long _r = (long)(expr); return _r < 0 ? -lx_errno(errno) : _r; } while (0)
+#define RET(expr) do { lw _r = (lw)(expr); return _r < 0 ? -lx_errno(errno) : _r; } while (0)
 
 // ------------------------------------------------------- flag / constant ---
-static int dx_dirfd(long fd) { return (int)fd == -100 ? AT_FDCWD : (int)fd; }   // Linux AT_FDCWD = -100
+static int dx_dirfd(lw fd) { return (int)fd == -100 ? AT_FDCWD : (int)fd; }   // Linux AT_FDCWD = -100
 
-static int dx_open_flags(long f) {
+static int dx_open_flags(lw f) {
     int o = (int)(f & 3);                          // O_RDONLY/O_WRONLY/O_RDWR agree
     if (f & 0x40)     o |= O_CREAT;
     if (f & 0x80)     o |= O_EXCL;
@@ -236,14 +256,14 @@ static int dx_open_flags(long f) {
     return o;
 }
 
-static int dx_at_flags(long f) {
+static int dx_at_flags(lw f) {
     int o = 0;
     if (f & 0x100) o |= AT_SYMLINK_NOFOLLOW;
     if (f & 0x200) o |= AT_REMOVEDIR;              // same bit Linux uses for unlinkat
     return o;
 }
 
-static clockid_t dx_clock(long c) {
+static clockid_t dx_clock(lw c) {
     switch (c) {
     case 0: return CLOCK_REALTIME;
     case 1: return CLOCK_MONOTONIC;
@@ -269,6 +289,13 @@ static void to_lx_stat(const struct stat *s, struct lx_stat *l) {
     l->atime = s->st_atimespec.tv_sec; l->atime_ns = s->st_atimespec.tv_nsec;
     l->mtime = s->st_mtimespec.tv_sec; l->mtime_ns = s->st_mtimespec.tv_nsec;
     l->ctime = s->st_ctimespec.tv_sec; l->ctime_ns = s->st_ctimespec.tv_nsec;
+}
+
+// Linux aarch64 struct timespec (and timeval): two 64-bit words.  Darwin's is the same on LP64 and narrower on a
+// watch, so every one that crosses is converted.
+struct lx_timespec { int64_t sec, nsec; };
+static void to_lx_timespec(const struct timespec *t, struct lx_timespec *l) {
+    if (l) { l->sec = t->tv_sec; l->nsec = t->tv_nsec; }
 }
 
 // JIT regions: MAP_JIT memory is writable OR executable per thread, never
@@ -340,7 +367,42 @@ static uint64_t jit_split(void *p, uint64_t len) {
     return len - JIT_DATA_SLICE;
 }
 
-static long dx_mmap(long addr, long len, long prot, long flags, long fd, long off) {
+// MODUS_SHIM_RESIDENT=1: at exit, which pages of each large mapping the image ever touched (mincore), to size
+// a layout by what is used rather than by what is reserved -- the runtime region is ~800 MB of address space.
+#define MAXBIG 16
+static struct { uint64_t lo, len; } big_maps[MAXBIG];
+static int n_big;
+static void note_big(uint64_t lo, uint64_t len) {
+    if (len >= (8ull << 20) && n_big < MAXBIG) { big_maps[n_big].lo = lo; big_maps[n_big].len = len; n_big++; }
+}
+static void report_resident(void) {
+    if (!getenv("MODUS_SHIM_RESIDENT")) return;
+    for (int i = 0; i < n_big; i++) {
+        uint64_t lo = big_maps[i].lo, len = big_maps[i].len, pages = len / PAGE16K, run = 0, total = 0;
+        char *vec = malloc((size_t)pages);
+        if (!vec || mincore((void *)(uintptr_t)lo, (size_t)len, vec) != 0) { free(vec); continue; }
+        fprintf(stderr, "modus-shim: mapping %#llx +%#llx:", (unsigned long long)lo, (unsigned long long)len);
+        for (uint64_t p = 0; p <= pages; p++) {
+            int in = p < pages && (vec[p] & 1);
+            if (in) { if (!run) run = p + 1; total++; }
+            else if (run) {
+                fprintf(stderr, " [+%#llx,+%#llx)", (unsigned long long)((run - 1) * PAGE16K), (unsigned long long)(p * PAGE16K));
+                run = 0;
+            }
+        }
+        fprintf(stderr, "  %llu KB resident\n", (unsigned long long)(total * PAGE16K >> 10));
+        free(vec);
+    }
+}
+
+static lw dx_mmap_1(lw addr, lw len, lw prot, lw flags, lw fd, lw off);
+static lw dx_mmap(lw addr, lw len, lw prot, lw flags, lw fd, lw off) {
+    lw r = dx_mmap_1(addr, len, prot, flags, fd, off);
+    if (r >= 0 || r < -4096) note_big((uint64_t)r, (uint64_t)len);
+    return r;
+}
+
+static lw dx_mmap_1(lw addr, lw len, lw prot, lw flags, lw fd, lw off) {
     if (preloaded_lo && (uint64_t)addr == preloaded_lo) return addr;
     int f = (int)(flags & 3);                      // SHARED/PRIVATE agree
     if (flags & 0x20) f |= MAP_ANON;
@@ -352,32 +414,32 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
         // take it back as MAP_JIT at the (now free) address; where there is
         // no JIT (iOS without the entitlement) it becomes plain RW data.
         if (jit) {
-            munmap((void *)addr, (size_t)len);
-            void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_JIT, (int)fd, (off_t)off);
-            if (p == (void *)addr) {
+            munmap(PTR(addr), (size_t)len);
+            void *p = mmap(PTR(addr), (size_t)len, (int)prot, f | MAP_JIT, (int)fd, (off_t)off);
+            if (p == PTR(addr)) {
                 uint64_t jl = jit_split(p, (uint64_t)len);
-                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + jl; n_jit++; }
+                if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)(uintptr_t)p; jit_regions[n_jit].hi = (uint64_t)(uintptr_t)p + jl; n_jit++; }
                 modus_jit_wp(1);
-                return (long)p;
+                return (lw)(uintptr_t)p;
             }
             if (p != MAP_FAILED) munmap(p, (size_t)len);
             prot &= ~PROT_EXEC;
         }
-        void *p = mmap((void *)addr, (size_t)len, (int)prot, f | MAP_FIXED, (int)fd, (off_t)off);
-        return p == MAP_FAILED ? -lx_errno(errno) : (long)p;
+        void *p = mmap(PTR(addr), (size_t)len, (int)prot, f | MAP_FIXED, (int)fd, (off_t)off);
+        return p == MAP_FAILED ? -lx_errno(errno) : (lw)(uintptr_t)p;
     }
     // macOS refuses RWX anonymous memory without MAP_JIT, and MAP_JIT with
     // MAP_FIXED; it does honour MAP_JIT's address HINT (probed), which keeps
     // the JIT arena at its fixed address for save-and-die.
     if (jit) f |= MAP_JIT;
     else if ((flags & 0x10) && !noreplace) f |= MAP_FIXED;
-    void *p = mmap((void *)addr, (size_t)len, (int)prot, f, (int)fd, (off_t)off);
+    void *p = mmap(PTR(addr), (size_t)len, (int)prot, f, (int)fd, (off_t)off);
     if (p != MAP_FAILED && jit) {
-        if (noreplace && (long)p != addr) { munmap(p, (size_t)len); return -17; }
+        if (noreplace && (lw)(uintptr_t)p != addr) { munmap(p, (size_t)len); return -17; }
         uint64_t jl = jit_split(p, (uint64_t)len);
-        if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)p; jit_regions[n_jit].hi = (uint64_t)p + jl; n_jit++; }
+        if (n_jit < MAXJIT) { jit_regions[n_jit].lo = (uint64_t)(uintptr_t)p; jit_regions[n_jit].hi = (uint64_t)(uintptr_t)p + jl; n_jit++; }
         modus_jit_wp(1);           // running mode: executable
-        return (long)p;
+        return (lw)(uintptr_t)p;
     }
     if (p == MAP_FAILED && (prot & PROT_EXEC) && (prot & PROT_WRITE) && addr == 0) {
         // An unfixed RWX request is the runtime's exec-page primitive with no
@@ -389,13 +451,13 @@ static long dx_mmap(long addr, long len, long prot, long flags, long fd, long of
         p = mmap(NULL, (size_t)len, (int)(prot & ~PROT_EXEC), f, (int)fd, (off_t)off);
     }
     if (p == MAP_FAILED) return -lx_errno(errno);
-    if (noreplace && (long)p != addr) { munmap(p, (size_t)len); return -17; }   // EEXIST
-    return (long)p;
+    if (noreplace && (lw)(uintptr_t)p != addr) { munmap(p, (size_t)len); return -17; }   // EEXIST
+    return (lw)(uintptr_t)p;
 }
 
 // ------------------------------------------------------------- signals ---
 // Linux and Darwin agree on most signal numbers but not all.
-static int dx_sig(long l) {
+static int dx_sig(lw l) {
     switch (l) {
     case 7:  return SIGBUS;   case 10: return SIGUSR1;  case 12: return SIGUSR2;
     case 17: return SIGCHLD;  case 18: return SIGCONT;  case 19: return SIGSTOP;
@@ -421,12 +483,16 @@ struct lx_sigaction { uint64_t handler, flags, restorer, mask; };
 static struct lx_sigaction image_fault_handler[2];      // [0] SEGV, [1] BUS
 static int fault_slot(int sig) { return sig == SIGSEGV ? 0 : sig == SIGBUS ? 1 : -1; }
 
-static long dx_rt_sigaction(long lsig, struct lx_sigaction *nw, struct lx_sigaction *old) {
+static lw dx_rt_sigaction(lw lsig, struct lx_sigaction *nw, struct lx_sigaction *old) {
     int sig = dx_sig(lsig);
     int slot = fault_slot(sig);
     if (slot >= 0) {
         if (old) *old = image_fault_handler[slot];
         if (nw) image_fault_handler[slot] = *nw;
+        return 0;
+    }
+    if (MODUS_NO_FATAL_SIGNALS && fatal_signal(sig)) {
+        if (old) memset(old, 0, sizeof *old);
         return 0;
     }
     struct sigaction dn, dold; memset(&dn, 0, sizeof dn);
@@ -454,7 +520,7 @@ static long dx_rt_sigaction(long lsig, struct lx_sigaction *nw, struct lx_sigact
     return 0;
 }
 
-static long dx_rt_sigprocmask(long how, const uint64_t *set, uint64_t *old) {
+static lw dx_rt_sigprocmask(lw how, const uint64_t *set, uint64_t *old) {
     int h = how == 0 ? SIG_BLOCK : how == 1 ? SIG_UNBLOCK : SIG_SETMASK;
     sigset_t ns, os; if (set) ns = dx_sigset(*set);
     if (sigprocmask(h, set ? &ns : NULL, &os) < 0) return -lx_errno(errno);
@@ -472,33 +538,33 @@ struct lx_dirent64 { uint64_t ino; int64_t off; uint16_t reclen; uint8_t type; c
 static DIR *dirs[MAXDIRFD];
 static struct dirent *pending[MAXDIRFD];
 
-static long dx_getdents64(long fd, uint8_t *buf, long len) {
+static lw dx_getdents64(lw fd, uint8_t *buf, lw len) {
     if (fd < 0 || fd >= MAXDIRFD) return -9;       // EBADF
     if (!dirs[fd]) {
         int d = dup((int)fd);
         if (d < 0) return -lx_errno(errno);
         if (!(dirs[fd] = fdopendir(d))) { close(d); return -lx_errno(errno); }
     }
-    long used = 0;
+    lw used = 0;
     for (;;) {
         struct dirent *e = pending[fd] ? pending[fd] : readdir(dirs[fd]);
         pending[fd] = NULL;
         if (!e) break;
         size_t nlen = strlen(e->d_name);
         size_t rec = ROUND_UP(sizeof(struct lx_dirent64) + nlen + 1, 8);
-        if (used + (long)rec > len) {
+        if (used + (lw)rec > len) {
             if (used == 0) return -22;             // EINVAL: buffer too small
             pending[fd] = e; break;
         }
         struct lx_dirent64 *d = (struct lx_dirent64 *)(buf + used);
-        d->ino = e->d_ino; d->off = used + (long)rec; d->reclen = (uint16_t)rec;
+        d->ino = e->d_ino; d->off = used + (lw)rec; d->reclen = (uint16_t)rec;
         d->type = e->d_type;                       // DT_* values agree
         memcpy(d->name, e->d_name, nlen + 1);
-        used += (long)rec;
+        used += (lw)rec;
     }
     return used;
 }
-static void forget_dir(long fd) {
+static void forget_dir(lw fd) {
     if (fd >= 0 && fd < MAXDIRFD && dirs[fd]) { closedir(dirs[fd]); dirs[fd] = NULL; pending[fd] = NULL; }
 }
 
@@ -522,7 +588,7 @@ static void lx_sockaddr(const struct sockaddr_storage *d, uint8_t *lx, uint32_t 
     if (n >= 2) { lx[0] = (uint8_t)fam; lx[1] = (uint8_t)(fam >> 8); }
     *lxlen = dlen;
 }
-static int dx_sockopt(long level, long opt, int *dlevel) {
+static int dx_sockopt(lw level, lw opt, int *dlevel) {
     if (level == 1) {                              // SOL_SOCKET
         *dlevel = SOL_SOCKET;
         switch (opt) {
@@ -536,7 +602,7 @@ static int dx_sockopt(long level, long opt, int *dlevel) {
     *dlevel = (int)level;                          // IPPROTO_TCP = 6, TCP_NODELAY = 1 agree
     return (int)opt;
 }
-static long dx_socket(long domain, long type, long proto) {
+static lw dx_socket(lw domain, lw type, lw proto) {
     int d = domain == 10 ? AF_INET6 : (int)domain;
     int fd = socket(d, (int)(type & 0xF), (int)proto);   // SOCK_STREAM/DGRAM agree
     if (fd < 0) return -lx_errno(errno);
@@ -551,16 +617,16 @@ static long dx_socket(long domain, long type, long proto) {
 // handler.  (Restoring a core reads its JIT pages straight into the arena.)
 // Read into ordinary memory and copy in with write mode open.
 static int jit_overlap(uint64_t p, uint64_t n) { return n && (in_jit(p) || in_jit(p + n - 1)); }
-static long jit_read(int fd, void *buf, size_t n) {
-    if (!jit_overlap((uint64_t)buf, n)) {
-        long r = read(fd, buf, n);
+static lw jit_read(int fd, void *buf, size_t n) {
+    if (!jit_overlap((uint64_t)(uintptr_t)buf, n)) {
+        lw r = read(fd, buf, n);
         if (getenv("MODUS_SHIM_TRACE") && (r < 0 || (size_t)r < n))
-            fprintf(stderr, "modus-shim: read(fd=%d, buf=%p, n=%zu) = %ld\n", fd, buf, n, r);
+            fprintf(stderr, "modus-shim: read(fd=%d, buf=%p, n=%zu) = %lld\n", fd, buf, n, (long long)r);
         return r;
     }
     void *tmp = malloc(n);
     if (!tmp) { errno = ENOMEM; return -1; }
-    long r = read(fd, tmp, n);
+    lw r = read(fd, tmp, n);
     int e = errno;
     if (r > 0) {
         modus_jit_wp(0);
@@ -590,6 +656,10 @@ static long jit_read(int fd, void *buf, size_t n) {
 // Keys are handed out lowest-free-first, so creating keys until we hold
 // MODUS_TSD_KEY reserves it; the image was linked against the same number
 // (hosted-layout-env.lisp +LAYOUT-DARWIN-TSD-KEY+).
+//
+// WHERE A POINTER IS 4 BYTES (a watch, arm64_32) so is a TSD slot, and the image's 8-byte read at TPIDRRO_EL0 +
+// 8*K spans slots 2K and 2K+1: such an image is linked with K = 150 (hosted-layout-env MODUS_DARWIN_TSD_KEY),
+// and the delta's two halves live in keys 300 and 301.
 #define MODUS_TSD_KEY 300
 #define LX_SYS_SET_THREAD_DELTA 1000     // translate-aarch64 +A64-DARWIN-SYS-SET-THREAD-DELTA+
 #define LX_SYS_MLOCK 1020                // natrium's secret arena (gossamer): mlock(addr, len).  Linux's
@@ -605,6 +675,22 @@ struct resume_ctx { uint64_t x[31]; uint64_t sp, pc; };
 extern void modus_resume(struct resume_ctx *) __attribute__((noreturn));
 
 static pthread_key_t delta_key;
+#if !__LP64__
+static pthread_key_t delta_key_hi;              // the delta's high half (see MODUS_TSD_KEY)
+#endif
+static void set_delta(int64_t d) {
+    pthread_setspecific(delta_key, PTR((uint64_t)d));
+#if !__LP64__
+    pthread_setspecific(delta_key_hi, PTR((uint64_t)d >> 32));
+#endif
+}
+static int64_t get_delta(void) {
+    uint64_t d = (uint64_t)(uintptr_t)pthread_getspecific(delta_key);
+#if !__LP64__
+    d |= (uint64_t)(uintptr_t)pthread_getspecific(delta_key_hi) << 32;
+#endif
+    return (int64_t)d;
+}
 static __thread uint32_t *my_ctid;        // CLONE_CHILD_CLEARTID word, or NULL
 static __thread int is_clone;             // a thread this shim started
 
@@ -616,37 +702,41 @@ static void reserve_delta_key(void) {
         if (k > MODUS_TSD_KEY) die("the per-thread-window pthread key is already taken", (long)k);
     }
     delta_key = k;
+#if !__LP64__
+    if (pthread_key_create(&delta_key_hi, NULL) != 0 || delta_key_hi != MODUS_TSD_KEY + 1)
+        die("the per-thread-window pthread key's high half is already taken", (long)delta_key_hi);
+#endif
 }
 
 // A Linux TID is a positive 32-bit number; Darwin's thread ids are 64-bit
 // and sequential.  Keep the low 31 bits (distinct for 2^31 consecutive
 // threads) and never answer 0, which the join reads as "exited".
-static long lx_tid(uint64_t id) {
-    long t = (long)(id & 0x7FFFFFFF);
+static lw lx_tid(uint64_t id) {
+    lw t = (lw)(id & 0x7FFFFFFF);
     return t ? t : 1;
 }
-static long my_tid(void) {
+static lw my_tid(void) {
     if (image_leader) return getpid();          // Linux: the group leader's TID is the PID
     uint64_t id = 0;
     pthread_threadid_np(NULL, &id);
     return lx_tid(id);
 }
 
-struct clone_start { struct resume_ctx ctx; void *delta; uint32_t *ctid; };
+struct clone_start { struct resume_ctx ctx; int64_t delta; uint32_t *ctid; };
 
 static void *clone_child(void *arg) {
     struct clone_start cs = *(struct clone_start *)arg;
     free(arg);
     is_clone = 1;
     my_ctid = cs.ctid;
-    pthread_setspecific(delta_key, cs.delta);   // the parent's window, as Linux inherits TPIDR_EL0
+    set_delta(cs.delta);                        // the parent's window, as Linux inherits TPIDR_EL0
     // sigaltstack is per thread: the fault handler needs one here too.
     stack_t ss = { .ss_sp = malloc(1 << 16), .ss_size = 1 << 16, .ss_flags = 0 };
     modus_altstack(&ss);
     modus_resume(&cs.ctx);
 }
 
-static long dx_clone(long flags, long newsp, uint32_t *ptid, uint32_t *ctid,
+static lw dx_clone(lw flags, lw newsp, uint32_t *ptid, uint32_t *ctid,
                      struct stub_frame *f) {
     if ((flags & 0x10000) == 0) return -38;     // only CLONE_THREAD: fork is not a clone here
     struct clone_start *cs = calloc(1, sizeof *cs);
@@ -660,7 +750,7 @@ static long dx_clone(long flags, long newsp, uint32_t *ptid, uint32_t *ctid,
     // LR: start 16 below the new stack so that pop leaves SP where clone put it.
     cs->ctx.sp = (uint64_t)newsp - 16;
     cs->ctx.pc = f->x30;
-    cs->delta = pthread_getspecific(delta_key);
+    cs->delta = get_delta();
     cs->ctid = (flags & 0x200000) ? ctid : NULL;
     pthread_attr_t at;
     pthread_attr_init(&at);
@@ -672,7 +762,7 @@ static long dx_clone(long flags, long newsp, uint32_t *ptid, uint32_t *ctid,
     if (e) { free(cs); return -lx_errno(e); }
     uint64_t id = 0;
     pthread_threadid_np(th, &id);
-    long tid = lx_tid(id);
+    lw tid = lx_tid(id);
     // PARENT_SETTID and CHILD_CLEARTID name the same word here; Linux writes it
     // before clone returns in the parent, and so must we — the join polls it.
     if (flags & 0x100000) __atomic_store_n(ptid, (uint32_t)tid, __ATOMIC_SEQ_CST);
@@ -688,13 +778,13 @@ static void thread_exit(void) {
 }
 
 // futex(uaddr, op, val, timeout): WAIT and WAKE, private or not.
-static long dx_futex(uint32_t *ua, long op, long val, const struct timespec *to) {
+static lw dx_futex(uint32_t *ua, lw op, lw val, const struct lx_timespec *to) {
     switch (op & 0x7F) {
     case 0: {                                   // FUTEX_WAIT
         if (__atomic_load_n(ua, __ATOMIC_SEQ_CST) != (uint32_t)val) return -11;   // EAGAIN
         int r;
         if (to) {
-            uint64_t ns = (uint64_t)to->tv_sec * 1000000000ULL + (uint64_t)to->tv_nsec;
+            uint64_t ns = (uint64_t)to->sec * 1000000000ULL + (uint64_t)to->nsec;
             if (ns == 0) return -110;
             r = os_sync_wait_on_address_with_timeout(ua, (uint64_t)(uint32_t)val, 4,
                     OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, ns);
@@ -716,45 +806,46 @@ static long dx_futex(uint32_t *ua, long op, long val, const struct timespec *to)
 
 static unsigned char unknown_seen[512];
 
-static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5, long nr,
-                            struct stub_frame *frame);
+static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
+                          struct stub_frame *frame);
 static int strace_on = -1;
 // MODUS_SHIM_STRACE=1: every translated call and its result, on stderr.
-long modus_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long nr,
-                   struct stub_frame *frame) {
+lw modus_syscall(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
+                 struct stub_frame *frame) {
     if (strace_on < 0) strace_on = getenv("MODUS_SHIM_STRACE") != NULL;
-    long r = modus_syscall_1(a0, a1, a2, a3, a4, a5, nr, frame);
+    lw r = modus_syscall_1(a0, a1, a2, a3, a4, a5, nr, frame);
     if (strace_on)
-        fprintf(stderr, "[%ld] sys %ld(%#lx, %#lx, %#lx, %#lx) = %ld\n",
-                my_tid(), nr, a0, a1, a2, a3, r);
+        fprintf(stderr, "[%lld] sys %lld(%#llx, %#llx, %#llx, %#llx) = %lld\n",
+                (long long)my_tid(), (long long)nr, (unsigned long long)a0, (unsigned long long)a1,
+                (unsigned long long)a2, (unsigned long long)a3, (long long)r);
     return r;
 }
 
-static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5, long nr,
-                            struct stub_frame *frame) {
+static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
+                          struct stub_frame *frame) {
     struct stat st;
     switch (nr) {
-    case 63:  RET(jit_read((int)a0, (void *)a1, (size_t)a2));
-    case 64:  RET(write((int)a0, (const void *)a1, (size_t)a2));
-    case 56:  RET(openat(dx_dirfd(a0), (const char *)a1, dx_open_flags(a2), (int)a3));
+    case 63:  RET(jit_read((int)a0, (void *)(uintptr_t)a1, (size_t)a2));
+    case 64:  RET(write((int)a0, (const void *)(uintptr_t)a1, (size_t)a2));
+    case 56:  RET(openat(dx_dirfd(a0), (const char *)(uintptr_t)a1, dx_open_flags(a2), (int)a3));
     case 57:  forget_dir(a0); RET(close((int)a0));
-    case 61:  return dx_getdents64(a0, (uint8_t *)a1, a2);
+    case 61:  return dx_getdents64(a0, (uint8_t *)(uintptr_t)a1, a2);
     case 62:  RET(lseek((int)a0, (off_t)a1, (int)a2));
     case 79: {                                     // newfstatat
-        if (fstatat(dx_dirfd(a0), (const char *)a1, &st, dx_at_flags(a3)) < 0) return -lx_errno(errno);
-        to_lx_stat(&st, (struct lx_stat *)a2); return 0; }
+        if (fstatat(dx_dirfd(a0), (const char *)(uintptr_t)a1, &st, dx_at_flags(a3)) < 0) return -lx_errno(errno);
+        to_lx_stat(&st, (struct lx_stat *)(uintptr_t)a2); return 0; }
     case 80: {                                     // fstat
         if (fstat((int)a0, &st) < 0) return -lx_errno(errno);
-        to_lx_stat(&st, (struct lx_stat *)a1); return 0; }
+        to_lx_stat(&st, (struct lx_stat *)(uintptr_t)a1); return 0; }
     case 222: return dx_mmap(a0, a1, a2, a3, a4, a5);
-    case 215: RET(munmap((void *)a0, (size_t)a1));
-    case 226: RET(mprotect((void *)a0, (size_t)a1, (int)a2));
-    case 93: if (is_clone) thread_exit(); _exit((int)a0);   // exit: the THREAD
-    case 94: _exit((int)a0);                                // exit_group
-    case 220: return dx_clone(a0, a1, (uint32_t *)a2, (uint32_t *)a4, frame);
-    case 98:  return dx_futex((uint32_t *)a0, a1, a2, (const struct timespec *)a3);
-    case LX_SYS_SET_THREAD_DELTA: pthread_setspecific(delta_key, (void *)a0); return 0;
-    case LX_SYS_MLOCK: RET(mlock((const void *)a0, (size_t)a1));
+    case 215: RET(munmap((void *)(uintptr_t)a0, (size_t)a1));
+    case 226: RET(mprotect((void *)(uintptr_t)a0, (size_t)a1, (int)a2));
+    case 93: if (is_clone) thread_exit(); report_resident(); _exit((int)a0);   // exit: the THREAD
+    case 94: report_resident(); _exit((int)a0);             // exit_group
+    case 220: return dx_clone(a0, a1, (uint32_t *)(uintptr_t)a2, (uint32_t *)(uintptr_t)a4, frame);
+    case 98:  return dx_futex((uint32_t *)(uintptr_t)a0, a1, a2, (const struct lx_timespec *)(uintptr_t)a3);
+    case LX_SYS_SET_THREAD_DELTA: set_delta(a0); return 0;
+    case LX_SYS_MLOCK: RET(mlock((const void *)(uintptr_t)a0, (size_t)a1));
     case 25: {                                                // fcntl.  O_NONBLOCK is 2048 in Linux and 4 in
         int fd = (int)a0, cmd = (int)a1;                      // Darwin, so the bit is translated both ways
         if (cmd == F_GETFL) {
@@ -763,42 +854,55 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
             return (fl & ~O_NONBLOCK) | ((fl & O_NONBLOCK) ? 2048 : 0);
         }
         if (cmd == F_SETFL) {
-            long v = a2;
+            lw v = a2;
             int dv = (int)(v & ~2048L) | ((v & 2048L) ? O_NONBLOCK : 0);
             RET(fcntl(fd, F_SETFL, dv));
         }
-        RET(fcntl(fd, cmd, (long)a2)); }
+        RET(fcntl(fd, cmd, (int)a2)); }
     case 73: {                                                // ppoll(fds, n, timespec *, sigmask) as poll(2)
-        const struct timespec *t = (const struct timespec *)a2;
-        int ms = t ? (int)(t->tv_sec * 1000 + t->tv_nsec / 1000000) : -1;
-        int r = poll((struct pollfd *)a0, (nfds_t)a1, ms);
+        const struct lx_timespec *t = (const struct lx_timespec *)(uintptr_t)a2;
+        int ms = t ? (int)(t->sec * 1000 + t->nsec / 1000000) : -1;
+        int r = poll((struct pollfd *)(uintptr_t)a0, (nfds_t)a1, ms);
         return r < 0 ? -lx_errno(errno) : r; }
-    case 113: RET(clock_gettime(dx_clock(a0), (struct timespec *)a1));
-    case 169: RET(gettimeofday((struct timeval *)a0, NULL));
-    case 101: RET(nanosleep((const struct timespec *)a0, (struct timespec *)a1));
+    case 113: {                                    // clock_gettime
+        struct timespec ts;
+        if (clock_gettime(dx_clock(a0), &ts) < 0) return -lx_errno(errno);
+        to_lx_timespec(&ts, (struct lx_timespec *)(uintptr_t)a1); return 0; }
+    case 169: {                                    // gettimeofday: a Linux timeval, two 64-bit words too
+        struct timeval tv;
+        if (gettimeofday(&tv, NULL) < 0) return -lx_errno(errno);
+        struct lx_timespec *l = (struct lx_timespec *)(uintptr_t)a0;
+        if (l) { l->sec = tv.tv_sec; l->nsec = tv.tv_usec; }
+        return 0; }
+    case 101: {                                    // nanosleep
+        const struct lx_timespec *l = (const struct lx_timespec *)(uintptr_t)a0;
+        struct timespec req = { .tv_sec = (time_t)l->sec, .tv_nsec = (long)l->nsec }, rem;
+        int r = nanosleep(&req, &rem);
+        if (r < 0 && a1) to_lx_timespec(&rem, (struct lx_timespec *)(uintptr_t)a1);
+        return r < 0 ? -lx_errno(errno) : 0; }
     case 124: RET(sched_yield());
     case 172: return getpid();
     case 178: return my_tid();                     // gettid
     case 17: {                                     // getcwd: Linux returns the length
-        if (!getcwd((char *)a0, (size_t)a1)) return -lx_errno(errno);
-        return (long)strlen((char *)a0) + 1; }
-    case 49:  RET(chdir((const char *)a0));
-    case 34:  RET(mkdirat(dx_dirfd(a0), (const char *)a1, (mode_t)a2));
-    case 35:  RET(unlinkat(dx_dirfd(a0), (const char *)a1, dx_at_flags(a2)));
-    case 38:  RET(renameat(dx_dirfd(a0), (const char *)a1, dx_dirfd(a2), (const char *)a3));
-    case 48:  RET(faccessat(dx_dirfd(a0), (const char *)a1, (int)a2, 0));
-    case 78:  RET(readlinkat(dx_dirfd(a0), (const char *)a1, (char *)a2, (size_t)a3));
+        if (!getcwd((char *)(uintptr_t)a0, (size_t)a1)) return -lx_errno(errno);
+        return (lw)strlen((char *)(uintptr_t)a0) + 1; }
+    case 49:  RET(chdir((const char *)(uintptr_t)a0));
+    case 34:  RET(mkdirat(dx_dirfd(a0), (const char *)(uintptr_t)a1, (mode_t)a2));
+    case 35:  RET(unlinkat(dx_dirfd(a0), (const char *)(uintptr_t)a1, dx_at_flags(a2)));
+    case 38:  RET(renameat(dx_dirfd(a0), (const char *)(uintptr_t)a1, dx_dirfd(a2), (const char *)(uintptr_t)a3));
+    case 48:  RET(faccessat(dx_dirfd(a0), (const char *)(uintptr_t)a1, (int)a2, 0));
+    case 78:  RET(readlinkat(dx_dirfd(a0), (const char *)(uintptr_t)a1, (char *)(uintptr_t)a2, (size_t)a3));
     case 46:  RET(ftruncate((int)a0, (off_t)a1));
     case 23:  RET(dup((int)a0));
     case 29:  return -25;                          // ioctl: ENOTTY (no terminal control yet)
-    case 278: arc4random_buf((void *)a0, (size_t)a1); return a1;   // getrandom
+    case 278: arc4random_buf((void *)(uintptr_t)a0, (size_t)a1); return a1;   // getrandom
     case 214: return -12;                          // brk: ENOMEM (the image mmaps)
-    case 134: return dx_rt_sigaction(a0, (struct lx_sigaction *)a1, (struct lx_sigaction *)a2);
-    case 135: return dx_rt_sigprocmask(a0, (const uint64_t *)a1, (uint64_t *)a2);
+    case 134: return dx_rt_sigaction(a0, (struct lx_sigaction *)(uintptr_t)a1, (struct lx_sigaction *)(uintptr_t)a2);
+    case 135: return dx_rt_sigprocmask(a0, (const uint64_t *)(uintptr_t)a1, (uint64_t *)(uintptr_t)a2);
     case 129: RET(kill((pid_t)a0, dx_sig(a1)));
     case 198: return dx_socket(a0, a1, a2);
     case 200: case 203: {                          // bind, connect
-        struct sockaddr_storage ss; socklen_t n = dx_sockaddr((const uint8_t *)a1, (socklen_t)a2, &ss);
+        struct sockaddr_storage ss; socklen_t n = dx_sockaddr((const uint8_t *)(uintptr_t)a1, (socklen_t)a2, &ss);
         if (nr == 200) RET(bind((int)a0, (struct sockaddr *)&ss, n));
         RET(connect((int)a0, (struct sockaddr *)&ss, n)); }
     case 201: RET(listen((int)a0, (int)a1));
@@ -806,30 +910,44 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
         struct sockaddr_storage ss; socklen_t n = sizeof ss;
         int fd = accept((int)a0, (struct sockaddr *)&ss, &n);
         if (fd < 0) return -lx_errno(errno);
-        lx_sockaddr(&ss, (uint8_t *)a1, (uint32_t *)a2, n);
+        lx_sockaddr(&ss, (uint8_t *)(uintptr_t)a1, (uint32_t *)(uintptr_t)a2, n);
         int one = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one);
         return fd; }
     case 204: case 205: {                          // getsockname, getpeername
         struct sockaddr_storage ss; socklen_t n = sizeof ss;
         if ((nr == 204 ? getsockname : getpeername)((int)a0, (struct sockaddr *)&ss, &n) < 0) return -lx_errno(errno);
-        lx_sockaddr(&ss, (uint8_t *)a1, (uint32_t *)a2, n); return 0; }
+        lx_sockaddr(&ss, (uint8_t *)(uintptr_t)a1, (uint32_t *)(uintptr_t)a2, n); return 0; }
     case 206: {                                    // sendto
-        struct sockaddr_storage ss; socklen_t n = a4 ? dx_sockaddr((const uint8_t *)a4, (socklen_t)a5, &ss) : 0;
-        RET(sendto((int)a0, (const void *)a1, (size_t)a2, (int)(a3 & 0x1), a4 ? (struct sockaddr *)&ss : NULL, n)); }
+        struct sockaddr_storage ss; socklen_t n = a4 ? dx_sockaddr((const uint8_t *)(uintptr_t)a4, (socklen_t)a5, &ss) : 0;
+        RET(sendto((int)a0, (const void *)(uintptr_t)a1, (size_t)a2, (int)(a3 & 0x1), a4 ? (struct sockaddr *)&ss : NULL, n)); }
     case 207: {                                    // recvfrom
         struct sockaddr_storage ss; socklen_t n = sizeof ss;
-        long r = recvfrom((int)a0, (void *)a1, (size_t)a2, (int)(a3 & 0x2 ? MSG_PEEK : 0),
+        lw r = recvfrom((int)a0, (void *)(uintptr_t)a1, (size_t)a2, (int)(a3 & 0x2 ? MSG_PEEK : 0),
                           a4 ? (struct sockaddr *)&ss : NULL, a4 ? &n : NULL);
         if (r < 0) return -lx_errno(errno);
-        if (a4) lx_sockaddr(&ss, (uint8_t *)a4, (uint32_t *)a5, n);
+        if (a4) lx_sockaddr(&ss, (uint8_t *)(uintptr_t)a4, (uint32_t *)(uintptr_t)a5, n);
         return r; }
     case 208: case 209: {                          // setsockopt, getsockopt
         int lvl; int opt = dx_sockopt(a1, a2, &lvl);
         if (opt < 0) return nr == 208 ? 0 : -92;   // unknown option: accept a set, ENOPROTOOPT a get
-        if (nr == 208) RET(setsockopt((int)a0, lvl, opt, (const void *)a3, (socklen_t)a4));
-        socklen_t n = a4 ? *(uint32_t *)a4 : 0;
-        if (getsockopt((int)a0, lvl, opt, (void *)a3, &n) < 0) return -lx_errno(errno);
-        if (a4) *(uint32_t *)a4 = n;
+        if (lvl == SOL_SOCKET && (opt == SO_RCVTIMEO || opt == SO_SNDTIMEO)) {
+            // a Linux timeval is two 64-bit words; a Darwin one is narrower where a long is 32 bits
+            struct lx_timespec *l = (struct lx_timespec *)(uintptr_t)a3;
+            struct timeval tv = { 0, 0 };
+            if (nr == 208) {
+                tv.tv_sec = (time_t)l->sec; tv.tv_usec = (suseconds_t)l->nsec;
+                RET(setsockopt((int)a0, lvl, opt, &tv, sizeof tv));
+            }
+            socklen_t n = sizeof tv;
+            if (getsockopt((int)a0, lvl, opt, &tv, &n) < 0) return -lx_errno(errno);
+            l->sec = tv.tv_sec; l->nsec = tv.tv_usec;
+            if (a4) *(uint32_t *)(uintptr_t)a4 = 16;
+            return 0;
+        }
+        if (nr == 208) RET(setsockopt((int)a0, lvl, opt, (const void *)(uintptr_t)a3, (socklen_t)a4));
+        socklen_t n = a4 ? *(uint32_t *)(uintptr_t)a4 : 0;
+        if (getsockopt((int)a0, lvl, opt, (void *)(uintptr_t)a3, &n) < 0) return -lx_errno(errno);
+        if (a4) *(uint32_t *)(uintptr_t)a4 = n;
         return 0; }
     case 210: RET(shutdown((int)a0, (int)a1));      // SHUT_* agree
     case 103: return 0;                            // setitimer
@@ -848,7 +966,7 @@ static long modus_syscall_1(long a0, long a1, long a2, long a3, long a4, long a5
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {
             unknown_seen[nr] = 1;
-            fprintf(stderr, "modus-shim: unimplemented Linux syscall %ld\n", nr);
+            fprintf(stderr, "modus-shim: unimplemented Linux syscall %lld\n", (long long)nr);
         }
         return -38;                                // ENOSYS
     }
@@ -895,7 +1013,7 @@ static void on_fault(int sig, siginfo_t *si, void *uc_) {
     if (show < 0) show = getenv("MODUS_SHIM_FAULTS") != NULL;
     if (show) {
         __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
-        fprintf(stderr, "modus-shim: [%ld] signal %d", my_tid(), sig);
+        fprintf(stderr, "modus-shim: [%lld] signal %d", (long long)my_tid(), sig);
         pr_reg("pc", pc);
         fprintf(stderr, " addr=%p", si->si_addr);
         pr_reg("lr", __darwin_arm_thread_state64_get_lr(*ts));
@@ -942,6 +1060,7 @@ static void report_fault(int sig, siginfo_t *si, void *uc_) {
     _exit(128 + sig);
 }
 static void install_fault_report(void) {
+    if (MODUS_NO_FATAL_SIGNALS) return;
     static uint8_t altstack[1 << 16];
     stack_t ss = { .ss_sp = altstack, .ss_size = sizeof altstack, .ss_flags = 0 };
     modus_altstack(&ss);
@@ -1036,7 +1155,8 @@ int main(int argc, char **argv, char **envp) {
     kr = mach_vm_allocate(mach_task_self(), &slot, PAGE16K, VM_FLAGS_FIXED);
     if (kr != KERN_SUCCESS) die("could not map the syscall slot page", kr);
     }
-    *(void **)(uintptr_t)slot = (void *)modus_syscall_stub;
+    // the image loads the slot as an 8-byte word, whatever a pointer's size here
+    *(uint64_t *)(uintptr_t)slot = (uint64_t)(uintptr_t)modus_syscall_stub;
 
     { unsigned long n = 0;
       uint8_t *c = getsectiondata(&_mh_execute_header, "__MODUSC", "__code", &n);

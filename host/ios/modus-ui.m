@@ -245,7 +245,7 @@ static long blit(long src, long wh, long xy, long stride) {
     return 0;
 }
 
-long modus_ui_call(long nr, long a0, long a1, long a2, long a3) {
+int64_t modus_ui_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3) {   // the shim's words
     if (!ui_ready) return -38;
     wait_ui();
     switch (nr) {

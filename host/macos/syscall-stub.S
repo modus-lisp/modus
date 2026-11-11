@@ -92,6 +92,9 @@ _modus_enter:
     .globl _modus_resume
     .p2align 2
 _modus_resume:
+#if !__LP64__
+    mov  w0, w0                    // arm64_32: a pointer argument is only the register's low half
+#endif
     ldr  x16, [x0, #248]
     mov  sp, x16
     ldr  x17, [x0, #256]

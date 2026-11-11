@@ -23,6 +23,11 @@
 # the layout, so signed and read-only it runs wherever the loader slides it --
 # which is how an iOS app, which can never write code, carries native code
 # compiled on the Mac.  The restore finds those bytes already in place.
+#
+# MODUS_SEGMENT_SHIFT=HEX places every segment that far BELOW its link address.  A PC-relative image runs at any
+# slide, so it can be linked above 4 GB -- where no constant in the runtime is ever mistaken for a layout address
+# (mvm/hosted-layout-env.lisp CHECK-LAYOUT-PCREL) -- and still be placed below 4 GB, in a watch's 32-bit address
+# space (an arm64_32 process has nothing else to give it).
 set -eu
 IMAGE=$1
 DIR=$2
@@ -32,6 +37,8 @@ VADDR=$(u64 $((PHOFF + 16)))
 FILESZ=$(u64 $((PHOFF + 32)))
 MEMSZ=$(u64 $((PHOFF + 40)))
 P=16384
+SHIFT=$((0x${MODUS_SEGMENT_SHIFT:-0}))
+at() { printf '%#x' $(( $1 - SHIFT )); }   # where a segment linked at $1 is placed
 round() { echo $(( ($1 + P - 1) / P * P )); }
 FILESPAN=$(round "$FILESZ")
 TAIL=$(( $(round "$MEMSZ") - FILESPAN ))
@@ -54,10 +61,10 @@ S="$DIR/segments.s"
   echo ".incbin \"$DIR/image.bin\""
   [ "$TAIL" -gt 0 ] && echo ".zerofill __MODUSB,__bss,_modus_image_bss,$TAIL,14"
 } > "$S"
-FLAGS="-Wl,-segprot,__MODUSS,rw,rw -Wl,-segaddr,__MODUSS,$(printf '%#x' $((VADDR - P)))"
-FLAGS="$FLAGS -Wl,-segprot,__MODUS,rx,rx -Wl,-segaddr,__MODUS,$(printf '%#x' "$VADDR")"
+FLAGS="-Wl,-segprot,__MODUSS,rw,rw -Wl,-segaddr,__MODUSS,$(at $((VADDR - P)))"
+FLAGS="$FLAGS -Wl,-segprot,__MODUS,rx,rx -Wl,-segaddr,__MODUS,$(at "$VADDR")"
 [ "$TAIL" -gt 0 ] &&
-  FLAGS="$FLAGS -Wl,-segprot,__MODUSB,rw,rw -Wl,-segaddr,__MODUSB,$(printf '%#x' $((VADDR + FILESPAN)))"
+  FLAGS="$FLAGS -Wl,-segprot,__MODUSB,rw,rw -Wl,-segaddr,__MODUSB,$(at $((VADDR + FILESPAN)))"
 if [ -n "$(sym MODUS-LAYOUT-REGION-LO)" ]; then
   for part in REGION:__MODUSR HEAP:__MODUSH ARENA:__MODUSA; do
     name=${part%%:*}; seg=${part##*:}
@@ -81,12 +88,12 @@ if [ -n "$(sym MODUS-LAYOUT-REGION-LO)" ]; then
         echo ".section __MODUSC,__code" >> "$S"
         echo ".incbin \"$DIR/arena-code.bin\"" >> "$S"
         [ "$CSPAN" -gt "$CODE" ] && echo ".space $((CSPAN - CODE))" >> "$S"
-        FLAGS="$FLAGS -Wl,-segprot,__MODUSC,rx,rx -Wl,-segaddr,__MODUSC,$(printf '%#x' "$lo")"
+        FLAGS="$FLAGS -Wl,-segprot,__MODUSC,rx,rx -Wl,-segaddr,__MODUSC,$(at "$lo")"
         lo=$((lo + CSPAN))
       fi
     fi
     echo ".zerofill $seg,__reserve,_modus_reserve_$name,$((hi - lo)),14" >> "$S"
-    FLAGS="$FLAGS -Wl,-segprot,$seg,rw,rw -Wl,-segaddr,$seg,$(printf '%#x' "$lo")"
+    FLAGS="$FLAGS -Wl,-segprot,$seg,rw,rw -Wl,-segaddr,$seg,$(at "$lo")"
   done
 fi
 echo "$FLAGS $S"

@@ -35,7 +35,9 @@ void modus_swift_register(const char *name, void *fn) {
     }
 }
 
-static uintptr_t fword(const uint8_t *f, int off) { uintptr_t w; memcpy(&w, f + off, 8); return w; }
+// A frame word is 8 bytes even where a pointer is 4 (a watch's arm64_32): read it whole, and hand the function
+// its low half there.  The addresses in it are below 4 GB on such a target, as the image's layout puts them.
+static uintptr_t fword(const uint8_t *f, int off) { uint64_t w; memcpy(&w, f + off, 8); return (uintptr_t)w; }
 
 static long run(uint8_t *f) {
     if (!installed) {
@@ -50,14 +52,15 @@ static long run(uint8_t *f) {
             // calling convention passes the first eight in registers)
             uintptr_t r = fn(fword(f, F_ARGS), fword(f, F_ARGS + 8), fword(f, F_ARGS + 16),
                              fword(f, F_ARGS + 24), fword(f, F_ARGS + 32), fword(f, F_ARGS + 40));
-            memcpy(f + F_RESULT, &r, 8);
+            uint64_t r64 = r;                    // zero-extended where uintptr_t is 32 bits
+            memcpy(f + F_RESULT, &r64, 8);
             return 0;
         }
     }
     return -2;
 }
 
-long modus_swift_call(long frame) {
+int64_t modus_swift_call(int64_t frame) {   // int64_t: the shim's word (a long is 32 bits on a watch)
     uint8_t *f = (uint8_t *)(uintptr_t)frame;
     if ([NSThread isMainThread]) return run(f);
     __block long rc = 0;

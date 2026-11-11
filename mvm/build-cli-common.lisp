@@ -1073,6 +1073,47 @@
 ;; host table and trigger it via a defparameter init-thunk (those DO run).
 (defvar *opcode-table-init-source*
   (with-output-to-string (s)
+   (if cl-user::*small-image*
+    ;; MODUS_SMALL_IMAGE: the table as one text literal (a pooled constant), a
+    ;; line an opcode -- "CODE NAME OPERAND... <tab> DESCRIPTION" -- parsed at
+    ;; boot, instead of a SETF and a MAKE-OPCODE-INFO with its description built
+    ;; a character at a time for each.  Names and operands are keywords: INTERN
+    ;; returns the static keyword objects, seeded before the globals' thunks run.
+    (let ((lines nil))
+      (maphash (lambda (code info)
+                 (let ((d (modus.mvm::opcode-info-description info)))
+                   (when (or (find #\Tab d) (find #\Newline d))
+                     (error "opcode ~D: description holds a tab or newline" code))
+                   (push (format nil "~D ~A~{ ~A~}~C~A" code
+                                 (symbol-name (modus.mvm::opcode-info-name info))
+                                 (mapcar #'symbol-name (modus.mvm::opcode-info-operands info))
+                                 #\Tab d)
+                         lines)))
+               modus.mvm::*opcode-table*)
+      (format s "(defun %populate-opcode-table ()
+  (let ((text ~S) (i 0))
+    (let ((n (length text)))
+      (loop
+        (when (>= i n) (return t))
+        (let* ((e (or (position #\\Newline text :start i) n))
+               (tab (position #\\Tab text :start i :end e))
+               (words nil) (k i))
+          (loop
+            (let ((sp (or (position #\\Space text :start k :end tab) tab)))
+              (when (> sp k) (setq words (cons (subseq text k sp) words)))
+              (when (>= sp tab) (return nil))
+              (setq k (+ sp 1))))
+          (setq words (nreverse words))
+          (let ((code (parse-integer (car words))))
+            (setf (gethash code *opcode-table*)
+                  (make-opcode-info :code code
+                                    :name (intern (car (cdr words)) \"KEYWORD\")
+                                    :operands (mapcar (lambda (w) (intern w \"KEYWORD\"))
+                                                      (cdr (cdr words)))
+                                    :description (subseq text (+ tab 1) e))))
+          (setq i (+ e 1)))))))~%" (format nil "~{~A~^~%~}" (nreverse lines)))
+      (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%"))
+   (progn
     (format s "(defun %~A-opcode-table ()~%" "populate")
     (maphash (lambda (code info)
                (format s "  (setf (gethash ~D *opcode-table*) (make-opcode-info :code ~D :name ~S :operands (quote ~S) :description ~S))~%"
@@ -1084,7 +1125,7 @@
     (format s "  t)~%")
     ;; defparameter init-thunk runs %populate-opcode-table at boot, AFTER the
     ;; *opcode-table* defparameter (earlier in source order) creates the table.
-    (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%")))
+    (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%")))))
 ;; STAGE 1 diagnostics: real (defun ...) so scan-defuns registers them in the
 ;; sft, letting runtime EVAL exercise the defstruct + interpreter in isolation.
 (defvar *stage1-test-source* "

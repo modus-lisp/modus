@@ -22,7 +22,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
 | `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.2 MB | 5.75 MB |
 | `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` + `MODUS_HOT_ORDER` (REPL) | 5.5 MB | 5.6 MB | 5.75 MB |
-| `+ MODUS_68K_CORE` (REPL booting from its saved core, 1 MB young heap) | 7.8 MB | dirty 0.4 MB; a command touches 1.0 MB code + 1.3 MB heap | 1 MB |
+| `+ MODUS_68K_CORE` (REPL booting from its saved core, 512 KB young heap) | 7.8 MB | 4.5 MB after a REPL session, 0.44 MB of it dirty | 512 KB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -67,6 +67,10 @@ All opt-in; unset, every image is built as before.  68k soft float:
   and LI by destination and immediate class with the commonest immediates.
 - **Why something is kept:** `MODUS_IR_DCE_WHY=NAME,...` (lean builds) prints
   the call chain that kept each name.
+- **qemu-user cannot show a code working set:** code it has translated runs
+  from its own cache and never touches the guest's pages again, so
+  `Referenced:` on the image counts data (token streams, constants, tables)
+  and first translations.  Dirty memory and resident memory are sound.
 - **What a REPL needs, Coral-fashion:** dirty memory plus the clean pages one
   more command touches (`/proc/PID/clear_refs`, then `Referenced:` in smaps)
   -- clean image pages can be dropped and re-read, as Mac code segments were.

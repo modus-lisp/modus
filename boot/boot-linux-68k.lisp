@@ -43,7 +43,8 @@
    with 36 MB gets an 18 MB heap from the same binary a 4 GB VM gets 128 MB
    from.  Nothing in the translator depends on it: the collector and every
    allocation site read the geometry the stub leaves in memory.")
-(defconstant +linux-68k-heap-min+ #x100000 "1 MB: two 512 KB semispaces.")
+(defconstant +linux-68k-heap-min+ #x80000
+  "512 KB: a core boot's two 256 KB young semispaces (a plain boot needs ~6 MB anyway).")
 (defconstant +linux-68k-heap-max+ #x0F800000
   "248 MB, ARM32's geometry: heap + guard end at #x1FC00000, where the kind map
    starts (+68K-GC-KIND-MAP+), and everything stays below #x20000000, which a

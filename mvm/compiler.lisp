@@ -21428,6 +21428,12 @@
 ;;; Arithmetic Operations
 ;;; ============================================================
 
+(defvar *arith-range-by-shift* nil
+  "Small images on 30-bit towers: EMIT-ARITH-PAIR's operand range guard is
+   SHL / SAR / CMP / BNE on a scratch temp instead of two immediates, two
+   compares and two branches.  The scratch is dead after the guard; the 68k
+   translator relies on that to fuse the four (M68K-RANGE-GUARD-AT).")
+
 (defun emit-arith-pair (fast-op generic-name dest temp &optional (src1 dest))
   "Tag-checked pairwise arithmetic.  When dest and temp are both tagged
    fixnums (low bit zero) we use FAST-OP inline.  Otherwise we call
@@ -21502,12 +21508,21 @@
       (flet ((in-range-or (x bits miss)
                ;; branch to MISS unless -2^BITS < x < 2^BITS (x a TAGGED word)
                (let ((tb (ash (ash 1 bits) +fixnum-shift+)))
+                (if *arith-range-by-shift*
+                 ;; -TB <= x < TB iff x survives a 32-bit shift left by S and
+                 ;; back: no immediates, and one fused ASL + BVS on 68k.
+                 (let ((s (- 31 (1- (integer-length tb)))))
+                   (emit-ir :shl one-temp x s)
+                   (emit-ir :sar one-temp one-temp s)
+                   (emit-ir :cmp one-temp x)
+                   (emit-ir :bne miss))
+                (progn
                  (emit-ir :li one-temp tb)
                  (emit-ir :cmp x one-temp)
                  (emit-ir :bge miss)
                  (emit-ir :li one-temp (- tb))
                  (emit-ir :cmp x one-temp)
-                 (emit-ir :blt miss))))
+                 (emit-ir :blt miss))))))
         (cond
           ((member fast-op '(:add :sub :add-checked :sub-checked))
            (in-range-or src1 (- +fixnum-bits+ 2) slow-label)

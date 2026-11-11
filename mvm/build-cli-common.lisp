@@ -2668,6 +2668,9 @@
 (when cl-user::*small-image* (setq modus.mvm::*static-symbol-one-call* t))
 ;; ... and a global read or write is one call (compiler.lisp *GV-CACHE-MODE* :CALL).
 (when cl-user::*small-image* (setq modus.mvm::*gv-cache-mode* :call))
+;; ... and a 30-bit tower's arithmetic range guard is a shift pair
+;; (compiler.lisp *ARITH-RANGE-BY-SHIFT*).
+(when cl-user::*small-image* (setq modus.mvm::*arith-range-by-shift* t))
 
 ;; Function table under MODUS_SMALL_IMAGE (CL-USER::*SMALL-IMAGE*, above): the keys come from ONE string
 ;; literal and each entry is a call passing #'NAME, instead of a PUTHASH whose

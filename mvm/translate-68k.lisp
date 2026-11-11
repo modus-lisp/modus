@@ -728,6 +728,17 @@
                                 (ash #b01 3)   ; type=LSR
                                 (logand dn 7)))))
 
+(defun m68k-emit-asl-imm (buf dn count)
+  "ASL.L #count, Dn -- V set when the sign changes during the shift"
+  (let ((cnt (if (= count 8) 0 count)))
+    (m68k-emit-word buf (logior (ash #b1110 12)
+                                (ash (logand cnt 7) 9)
+                                (ash 1 8)      ; direction=left
+                                (ash +68k-size-long+ 6)
+                                (ash 0 5)      ; i/r=0
+                                (ash #b00 3)   ; type=AS
+                                (logand dn 7)))))
+
 (defun m68k-emit-asr-imm (buf dn count)
   "ASR.L #count, Dn (arithmetic shift right)"
   (let ((cnt (if (= count 8) 0 count)))
@@ -1856,6 +1867,19 @@
        (let ((vd (first operands))
              (vs (second operands))
              (amt (third operands)))
+        (multiple-value-bind (skip-to target-pc) (m68k-range-guard-at mvm-pc vd vs amt)
+         (if skip-to
+          ;; EMIT-ARITH-PAIR's range guard (compiler.lisp
+          ;; *ARITH-RANGE-BY-SHIFT*): ASL sets V exactly when a bit shifted
+          ;; out differs from the sign, i.e. when (x << s) >> s /= x.  The
+          ;; scratch gets x, which is its value on the fall-through.
+          (progn
+            (m68k-load-vreg buf +68k-d0+ vs)
+            (m68k-store-vreg buf vd +68k-d0+)
+            (m68k-emit-asl-imm buf +68k-d0+ amt)
+            (m68k-emit-bcc-word buf +68k-cc-vs+ (ensure-label target-pc))
+            (setq *68k-skip-to* skip-to))
+          (progn
          (m68k-load-vreg buf +68k-d0+ vs)
          ;; 68k immediate shift max is 8; larger needs register shift
          (if (<= 1 amt 8)
@@ -1863,7 +1887,7 @@
              (progn
                (m68k-emit-moveq buf +68k-d1+ amt)
                (m68k-emit-lsl-dn buf +68k-d1+ +68k-d0+)))
-         (m68k-store-vreg buf vd +68k-d0+)))
+         (m68k-store-vreg buf vd +68k-d0+))))))
 
       (#.+op-shr+
        (let ((vd (first operands))
@@ -3150,6 +3174,27 @@
     (m68k-emit-adda-dn buf +68k-d1+ +68k-a2+)          ; bump
     (m68k-emit-rts buf)))
 
+(defvar *68k-skip-to* nil
+  "Set by a handler that consumed the instructions after its own: the MVM pc
+   the translation loop resumes at.")
+
+(defun m68k-range-guard-at (next-pc vd vs amt)
+  "When SHL VD,VS,AMT is followed by SAR VD,VD,AMT / CMP VD,VS / BNE, none a
+   branch target, under *ARITH-RANGE-BY-SHIFT*: (values PC-AFTER-BNE TARGET)."
+  (when (and *arith-range-by-shift* *68k-bytecode* (/= vd vs) (<= 1 amt 8))
+    (let ((bc *68k-bytecode*) (pc next-pc) (ops nil))
+      (dotimes (i 3)
+        (when (or (>= pc (length bc)) (gethash pc *68k-label-map*))
+          (return-from m68k-range-guard-at nil))
+        (let ((d (decode-instruction bc pc)))
+          (push (cons (car d) (cadr d)) ops)
+          (setq pc (cddr d))))
+      (destructuring-bind (bne cmp sar) ops
+        (when (and (eql (car sar) +op-sar+) (equal (cdr sar) (list vd vd amt))
+                   (eql (car cmp) +op-cmp+) (equal (cdr cmp) (list vd vs))
+                   (eql (car bne) +op-bne+))
+          (values pc (+ pc (second bne))))))))
+
 (defun m68k-next-is-unlabelled-cons-p (next-pc)
   "True when the instruction at NEXT-PC is a CONS that no branch lands on."
   (and *68k-cons-label* *68k-bytecode*
@@ -3645,6 +3690,8 @@
                             (e (or (gethash k li-stats) (setf (gethash k li-stats) (list 0 0)))))
                        (incf (first e)) (incf (second e) (- (m68k-buffer-position buf) at))
                        (incf (gethash imm li-imms 0)))))
+                 (when *68k-skip-to*
+                   (setq new-pc *68k-skip-to* *68k-skip-to* nil))
                  (setf pc new-pc))))
 
     ;; MODUS_68K_OP_STATS: native bytes per MVM opcode, the largest first

@@ -20,7 +20,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 | image | file | resident | heap floor |
 |---|---|---|---|
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
-| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 12.5 MB | 12.0 MB | 5.75 MB |
+| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 12.1 MB | 11.8 MB | 5.75 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -80,9 +80,10 @@ All opt-in; unset, every image is built as before.  68k soft float:
   allocation sequences, a quoted symbol as one call, and a global read or
   write as one call (`*GV-CACHE-MODE*` `:CALL`, no inline cache probe), a
   quoted symbol's site passing only its slot index (the hashes in a table),
-  the calling-convention slots through A5, and shifted-byte immediates as
-  MOVEQ + LSL: the REPL image's native code 13.7 -> 10.0 MB; the smoke
-  program runs ~20% slower.
+  the calling-convention slots through A5, shifted-byte immediates as
+  MOVEQ + LSL, and the 30-bit arithmetic range guard as one ASL + BVS: the
+  REPL image's native code 13.7 -> 9.6 MB; the smoke program runs ~20%
+  slower.
 - **The compiler**, ~5.3 MB of native code, ~2.7 MB touched in a short session.
 - **Boot data built at boot.**  Packages, symbols, the name and function
   tables: most of the heap floor, held twice over by the copying collector.

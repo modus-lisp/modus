@@ -58,7 +58,7 @@ done
 # shellcheck disable=SC2086  # LINKX is a flag list
 xcrun --sdk $SDKN swiftc -target $TARGET -sdk "$SDK" -o "$OUT/modus" "$OBJS"/*.o \
   -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore \
-  -framework CoreGraphics -framework CoreFoundation -framework Security $LINKX
+  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal $LINKX
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

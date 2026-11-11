@@ -40,11 +40,12 @@ static long kc_put(const char *name, const uint8_t *buf, long len) {
     return SecItemAdd((__bridge CFDictionaryRef)a, NULL) == errSecSuccess ? 1 : 0;
 }
 
-long modus_keychain_call(long nr, long a0, long a1, long a2) {
+// int64_t, not long: the image's words are 64 bits, and a long is 32 on a watch (arm64_32)
+int64_t modus_keychain_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2) {
     switch (nr) {
-    case 1030: return kc_get((const char *)a0, (uint8_t *)a1, a2);
-    case 1031: return kc_put((const char *)a0, (const uint8_t *)a1, a2);
-    case 1032: return SecRandomCopyBytes(kSecRandomDefault, (size_t)a1, (uint8_t *)a0) == errSecSuccess ? 1 : 0;
+    case 1030: return kc_get((const char *)(uintptr_t)a0, (uint8_t *)(uintptr_t)a1, (long)a2);
+    case 1031: return kc_put((const char *)(uintptr_t)a0, (const uint8_t *)(uintptr_t)a1, (long)a2);
+    case 1032: return SecRandomCopyBytes(kSecRandomDefault, (size_t)a1, (uint8_t *)(uintptr_t)a0) == errSecSuccess ? 1 : 0;
     }
     return 0;
 }

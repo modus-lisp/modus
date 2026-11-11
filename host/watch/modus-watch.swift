@@ -76,18 +76,24 @@ private let waited = OSAllocatedUnfairLock(initialState: false)
 @_cdecl("modus_ui_init") public func modusUIInit() {}
 @_cdecl("modus_ui_start") public func modusUIStart() {}
 
+// The shim's words are 64 bits; an Int is 32 on a watch (arm64_32), and an event packs 64 bits.
 @_cdecl("modus_ui_call")
-public func modusUICall(_ nr: Int, _ a0: Int, _ a1: Int, _ a2: Int, _ a3: Int) -> Int {
+public func modusUICall(_ nr: Int64, _ a0: Int64, _ a1: Int64, _ a2: Int64, _ a3: Int64) -> Int64 {
+    modusUICall32(Int(nr), Int(truncatingIfNeeded: a0), Int(truncatingIfNeeded: a1), Int(truncatingIfNeeded: a2))
+}
+
+/// The call, with its arguments in Ints (addresses and sizes fit), and an event as its full 64 bits.
+private func modusUICall32(_ nr: Int, _ a0: Int, _ a1: Int, _ a2: Int) -> Int64 {
     // The image thread starts before the view exists: wait for it, once.
     if !waited.withLock({ $0 }) {
         ready.wait(); ready.signal()
         waited.withLock { $0 = true }
     }
     switch nr {
-    case 1001: return a0 == 0 ? fbW : a0 == 1 ? fbH : scale
-    case 1002: return fill(a0, a1, a2)
+    case 1001: return Int64(a0 == 0 ? fbW : a0 == 1 ? fbH : scale)
+    case 1002: return Int64(fill(a0, a1, a2))
     case 1003: present(); return 0
-    case 1004: return Int(truncatingIfNeeded: events.withLock { q -> UInt64 in q.isEmpty ? 0 : q.removeFirst() })
+    case 1004: return Int64(bitPattern: events.withLock { q -> UInt64 in q.isEmpty ? 0 : q.removeFirst() })
     default: return -38
     }
 }
@@ -110,6 +116,8 @@ struct ModusView: View {
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { v in pushEvent(down ? 2 : 1, v.location); down = true }
                 .onEnded { v in pushEvent(3, v.location); down = false })
+            // the components Lisp makes (modus-watch-ui.swift), over the framebuffer and its touches
+            .overlay(alignment: .topLeading) { NodesLayer() }
             .onAppear { start(g.size) }
         }
         .ignoresSafeArea()

@@ -285,7 +285,19 @@
 ;;; these just BELOW the heap base (0x10000000), inside the ELF's own mapped
 ;;; BSS tail.  i386 cannot: its heap is at 0x30000000 and 0x0FE00000 is
 ;;; unmapped there.
-(defvar *cli-arch-io-scratch-source* "")
+;;; A COMPACT REGION (MODUS_REGION_SIZE, a watch's layout: hosted-layout-env.lisp) maps only the region's low
+;;; end, so the three scratch areas move into the low block: nothing the runtime uses lies between #x10040000
+;;; and #x10080000 (checked against every region constant), and the region it maps reaches #x10100000 at least.
+;;; Unset, this adds nothing: the shipping image is unchanged.
+(defvar *cli-arch-io-scratch-source*
+  (let ((v (sb-ext:posix-getenv "MODUS_REGION_SIZE")))
+    (if (and v (plusp (length v)))
+        "  (setq *cstr-scratch* (%conv-addr #x10040000))      ; compact region: C strings (rename uses +2048)
+  (setq *io-buf-addr* (%conv-addr #x10041000))       ; one 4 KB I/O page
+  (setq *%dirent-buf-addr* (%conv-addr #x10044000))  ; getdents64, 16 KB
+  (setq *scratch-mmapped* t)                         ; the region is mapped: never mmap
+"
+        "")))
 
 ;;; ARCH SLOT: the toplevel entry / probe program.  This is the one place the
 ;;; two images are genuinely DIFFERENT PROGRAMS: x64's shipping CLI goes

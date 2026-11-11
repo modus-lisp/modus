@@ -10,29 +10,36 @@
 //
 // Events, as terms, oldest first (ui_events_next):
 //   (TAP handle)   (SWITCH handle on)   (SLIDER handle value: a double)   (TEXT handle)   (SELECT handle index)
+//   (STEP handle value: a double)   (PAGE handle index)   (DATE handle seconds: a double)   (LONGPRESS handle)
+//   (ALERT handle index)   (REFRESH handle)   (PAN handle dx: a double)   (MENU handle index)   (COLOR handle rgb)
+//   (POP handle)   (NAVTAP handle)   (CONTEXT handle index)   (SWIPE handle direction)
+//   (SHARE handle completed)   (DISMISS handle)   (FADE handle)   (ROWACTION handle index)   (ZOOM handle percent)
+//   (DELETE handle index)   (EDIT handle index)
 
 import UIKit
 
 typealias Call = @convention(c) (UInt, UInt, UInt, UInt, UInt, UInt) -> UInt
 
 private var views: [UInt: UIView] = [:]
-private var nextHandle: UInt = 1
+var nextHandle: UInt = 1
 // A scroll view's handle maps to the stack that holds its children (ui_add puts them there).
 private var scrollContent: [UInt: UIStackView] = [:]
 // A list's handle maps to its data source (a UITableView keeps its data source weakly).
 private var lists: [UInt: ModusList] = [:]
+// A text view's delegate is weak in UIKit, so the view's handle keeps it here.
+private var textViewDelegates: [UInt: ModusTextView] = [:]
 private var events: [Term] = []
 
 private func send(_ name: String, _ args: [Term]) {
     events.append(.list([.symbol(name: name, package: "KEYWORD")] + args))
 }
 
-private func text(_ p: UInt, _ n: UInt) -> String {
+func text(_ p: UInt, _ n: UInt) -> String {
     guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else { return "" }
     return String(decoding: UnsafeRawBufferPointer(start: base, count: Int(n)), as: UTF8.self)
 }
 
-private func rect(_ x: UInt, _ y: UInt, _ w: UInt, _ h: UInt) -> CGRect {
+func rect(_ x: UInt, _ y: UInt, _ w: UInt, _ h: UInt) -> CGRect {
     CGRect(x: CGFloat(x), y: CGFloat(y), width: CGFloat(w), height: CGFloat(h))
 }
 
@@ -44,7 +51,7 @@ private func keyRoot() -> UIView? {
     return (windows.first { $0.isKeyWindow } ?? windows.first)?.rootViewController?.view
 }
 
-private func adopt(_ v: UIView) -> UInt {
+func adopt(_ v: UIView) -> UInt {
     let handle = nextHandle
     nextHandle += 1
     views[handle] = v
@@ -52,31 +59,44 @@ private func adopt(_ v: UIView) -> UInt {
     return handle
 }
 
-// A row of a list: its title, and a subtitle when it has one.
+// A row of a list: its title, a subtitle when it has one, its section when it has one, and its index among all the
+// rows (the one a SELECT event names).
 struct Row {
     let title: String
     let subtitle: String?
+    let section: String?
+    let index: Int
 }
 
 // A list of rows.  Lisp sends the rows as data (ui_list_set_data: a list of plists, each with :TITLE and
 // optionally :SUBTITLE); the table asks this object for its cells as it needs them, and a tap on a row is a
 // SELECT event.  UIKit never calls into Lisp: the rows are data it already holds.
 final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
-    var rows: [Row] = []
+    // The rows in order of their sections: runs of rows with the same section, each run a section.
+    var groups: [(title: String?, rows: [Row])] = []
+    var actions: [String] = []
     let handle: UInt
 
     init(handle: UInt) {
         self.handle = handle
     }
 
+    func numberOfSections(in tableView: UITableView) -> Int {
+        groups.count
+    }
+
+    func tableView(_ tableView: UITableView, titleForHeaderInSection section: Int) -> String? {
+        groups[section].title
+    }
+
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        rows.count
+        groups[section].rows.count
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "row")
             ?? UITableViewCell(style: .subtitle, reuseIdentifier: "row")
-        let row = rows[indexPath.row]
+        let row = groups[indexPath.section].rows[indexPath.row]
         cell.textLabel?.text = row.title
         cell.textLabel?.textColor = .white
         cell.detailTextLabel?.text = row.subtitle
@@ -87,26 +107,52 @@ final class ModusList: NSObject, UITableViewDataSource, UITableViewDelegate {
 
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
         tableView.deselectRow(at: indexPath, animated: true)
-        send("SELECT", [.int(Int(handle)), .int(indexPath.row)])
+        send("SELECT", [.int(Int(handle)), .int(groups[indexPath.section].rows[indexPath.row].index)])
+    }
+
+    // In editing mode a row's delete control removes the row, and sends a DELETE event with the row's index.
+    func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle,
+                   forRowAt indexPath: IndexPath) {
+        guard editingStyle == .delete else { return }
+        let row = groups[indexPath.section].rows.remove(at: indexPath.row)
+        groups = groupsOf(groups.flatMap { $0.rows })
+        tableView.reloadData()
+        send("DELETE", [.int(Int(handle)), .int(row.index)])
+    }
+
+    // Swipe actions for a row, from the actions set with list_actions: a button for each, and a tap on one sends a
+    // ROWACTION event with the list's handle and the button's index (the row is the one swiped).
+    func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
+        -> UISwipeActionsConfiguration? {
+        guard !actions.isEmpty else { return nil }
+        let items = actions.enumerated().map { i, title in
+            UIContextualAction(style: .normal, title: title) { _, _, done in
+                send("ROWACTION", [.int(Int(self.handle)), .int(i)])
+                done(true)
+            }
+        }
+        return UISwipeActionsConfiguration(actions: items)
     }
 }
 
 // The rows out of a list term: each element a plist (:KEY value ...); keys are symbols by name.
 private func rowsOf(_ data: Term) -> [Row] {
     guard let items = data.listItems else { return [] }
-    return items.map { item in
+    return items.enumerated().map { index, item in
         var title = ""
         var subtitle: String?
+        var section: String?
         let pairs = item.listItems ?? []
         var i = 0
         while i + 1 < pairs.count {
             if case .symbol(let key, _) = pairs[i], case .string(let value) = pairs[i + 1] {
                 if key == "TITLE" { title = value }
                 if key == "SUBTITLE" { subtitle = value }
+                if key == "SECTION" { section = value }
             }
             i += 2
         }
-        return Row(title: title, subtitle: subtitle)
+        return Row(title: title, subtitle: subtitle, section: section, index: index)
     }
 }
 
@@ -162,6 +208,1440 @@ let textFieldNew: Call = { p, n, x, y, w, h in
     let handle = adopt(field)
     field.addAction(UIAction { _ in send("TEXT", [.int(Int(handle))]) }, for: .editingChanged)
     return handle
+}
+
+// text_view_new(text, length, x, y, w, h): a multi-line text view.  Its changes send TEXT events; a text view
+// has no UIAction, so the delegate below does the sending.
+final class ModusTextView: NSObject, UITextViewDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func textViewDidChange(_ textView: UITextView) {
+        send("TEXT", [.int(Int(handle))])
+    }
+}
+
+let textViewNew: Call = { p, n, x, y, w, h in
+    let view = UITextView(frame: rect(x, y, w, h))
+    view.text = text(p, n)
+    view.font = .systemFont(ofSize: 18)
+    view.textColor = .white
+    view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    view.layer.cornerRadius = 8
+    let handle = adopt(view)
+    let delegate = ModusTextView(handle: handle)
+    view.delegate = delegate
+    textViewDelegates[handle] = delegate
+    return handle
+}
+
+// The titles out of a term: a list of strings (segmented_new's data).
+private func titlesOf(_ p: UInt, _ n: UInt) -> [String] {
+    guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else { return [] }
+    let bytes = Array(UnsafeRawBufferPointer(start: base, count: Int(n)))
+    guard let items = (try? decodeTerm(bytes))?.listItems else { return [] }
+    return items.compactMap { item -> String? in
+        if case .string(let s) = item { return s }
+        return nil
+    }
+}
+
+// segmented_new(titles, length, x, y, w, h): a segmented control, one segment per title (a term: a list of
+// strings).  Choosing a segment sends a SELECT event with its index.
+let segmentedNew: Call = { p, n, x, y, w, h in
+    let titles = titlesOf(p, n)
+    let control = UISegmentedControl(items: titles)
+    control.frame = rect(x, y, w, h)
+    if !titles.isEmpty { control.selectedSegmentIndex = 0 }
+    let handle = adopt(control)
+    control.addAction(UIAction { _ in send("SELECT", [.int(Int(handle)), .int(control.selectedSegmentIndex)]) },
+                      for: .valueChanged)
+    return handle
+}
+
+// progress_new(percent, x, y, w, h): a progress bar, from 0 to 100 (set_value moves it).
+let progressNew: Call = { percent, x, y, w, h, _ in
+    let bar = UIProgressView(progressViewStyle: .default)
+    bar.frame = rect(x, y, w, h)
+    bar.progressTintColor = .white
+    bar.trackTintColor = UIColor(white: 0.3, alpha: 1)
+    bar.progress = Float(min(percent, 100)) / 100
+    return adopt(bar)
+}
+
+// spinner_new(x, y, w, h): an activity indicator, spinning until set_value stops it (0) or starts it (1).
+let spinnerNew: Call = { x, y, w, h, _, _ in
+    let spinner = UIActivityIndicatorView(style: .medium)
+    spinner.frame = rect(x, y, w, h)
+    spinner.color = .white
+    spinner.startAnimating()
+    return adopt(spinner)
+}
+
+// stepper_new(value, x, y): a stepper from 0 to 100, one step at a time.  Each change sends a STEP event with
+// its value (a double).
+let stepperNew: Call = { value, x, y, _, _, _ in
+    let stepper = UIStepper()
+    stepper.minimumValue = 0
+    stepper.maximumValue = 100
+    stepper.stepValue = 1
+    stepper.value = Double(value)
+    stepper.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
+    stepper.sizeToFit()
+    let handle = adopt(stepper)
+    stepper.addAction(UIAction { _ in send("STEP", [.int(Int(handle)), .double(stepper.value)]) },
+                      for: .valueChanged)
+    return handle
+}
+
+// page_new(pages, current, x, y): a page control, a dot per page, the current one lit.  A tap on a dot sends a
+// PAGE event with its index.
+let pageNew: Call = { pages, current, x, y, _, _ in
+    let control = UIPageControl()
+    control.numberOfPages = Int(pages)
+    control.currentPage = Int(current)
+    control.pageIndicatorTintColor = UIColor(white: 0.35, alpha: 1)
+    control.currentPageIndicatorTintColor = .white
+    control.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
+    control.sizeToFit()
+    let handle = adopt(control)
+    control.addAction(UIAction { _ in send("PAGE", [.int(Int(handle)), .int(control.currentPage)]) },
+                      for: .valueChanged)
+    return handle
+}
+
+// date_new(seconds, x, y): a date picker showing the date (seconds since 1970), compact.  A change sends a DATE
+// event with the new date's seconds (a double).
+let dateNew: Call = { seconds, x, y, _, _, _ in
+    let picker = UIDatePicker()
+    picker.datePickerMode = .date
+    picker.preferredDatePickerStyle = .compact
+    picker.overrideUserInterfaceStyle = .dark
+    picker.date = Date(timeIntervalSince1970: TimeInterval(seconds))
+    picker.frame.origin = CGPoint(x: CGFloat(x), y: CGFloat(y))
+    picker.sizeToFit()
+    let handle = adopt(picker)
+    picker.addAction(UIAction { _ in send("DATE", [.int(Int(handle)), .double(picker.date.timeIntervalSince1970)]) },
+                     for: .valueChanged)
+    return handle
+}
+
+// A long press's target: UIKit keeps a gesture's target weakly, so the view's handle keeps it here.
+final class ModusGesture: NSObject {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    @objc func fired(_ recognizer: UILongPressGestureRecognizer) {
+        if recognizer.state == .began { send("LONGPRESS", [.int(Int(handle))]) }
+    }
+}
+
+private var gestureTargets: [UInt: ModusGesture] = [:]
+
+// long_press_on(handle, ms): a long press on the view, held at least ms milliseconds, sends a LONGPRESS event with
+// the view's handle.  Once per press, when UIKit recognises it.
+let longPressOn: Call = { h, ms, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let target = ModusGesture(handle: h)
+    let recognizer = UILongPressGestureRecognizer(target: target, action: #selector(ModusGesture.fired(_:)))
+    recognizer.minimumPressDuration = Double(ms) / 1000
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(recognizer)
+    gestureTargets[h] = target
+    return 1
+}
+
+// alert_new(title, length, message, length): an alert, not yet shown.  Its buttons come from alert_action, and
+// alert_present shows it.  Choosing a button sends an ALERT event with the alert's handle and the button's index.
+private var alerts: [UInt: UIAlertController] = [:]
+
+// sheet: 1 for an action sheet (its buttons from the bottom of the screen), 0 for an alert.
+let alertNew: Call = { tp, tn, mp, mn, sheet, _ in
+    let alert = UIAlertController(title: text(tp, tn), message: text(mp, mn),
+                                  preferredStyle: sheet != 0 ? .actionSheet : .alert)
+    let handle = nextHandle
+    nextHandle += 1
+    alerts[handle] = alert
+    return handle
+}
+
+// alert_action(handle, text, length): a button of the alert, in the order they are added.
+let alertAction: Call = { h, p, n, _, _, _ in
+    guard let alert = alerts[h] else { return 0 }
+    let index = alert.actions.count
+    alert.addAction(UIAlertAction(title: text(p, n), style: .default) { _ in
+        send("ALERT", [.int(Int(h)), .int(index)])
+    })
+    return 0
+}
+
+// alert_present(handle): the alert is shown over the app's screen.
+let alertPresent: Call = { h, _, _, _, _, _ in
+    guard let alert = alerts[h], let root = keyRoot()?.window?.rootViewController else { return 0 }
+    // an action sheet on an iPad is a popover, anchored like the share sheet's
+    if let popover = alert.popoverPresentationController {
+        popover.sourceView = root.view
+        popover.sourceRect = CGRect(x: root.view.bounds.midX, y: root.view.bounds.midY, width: 1, height: 1)
+        popover.permittedArrowDirections = []
+    }
+    root.present(alert, animated: true)
+    return 1
+}
+
+// The tab bar's delegate: a choice sends a SELECT event with the item's index (its tag).
+final class ModusTabBar: NSObject, UITabBarDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func tabBar(_ tabBar: UITabBar, didSelect item: UITabBarItem) {
+        send("SELECT", [.int(Int(handle)), .int(item.tag)])
+    }
+}
+
+private var tabBarDelegates: [UInt: ModusTabBar] = [:]
+
+// tab_bar_new(titles, length, x, y, w, h): a tab bar, an item per title (a term: a list of strings).  Choosing an
+// item sends a SELECT event with its index.
+let tabBarNew: Call = { p, n, x, y, w, h in
+    let bar = UITabBar(frame: rect(x, y, w, h))
+    bar.items = titlesOf(p, n).enumerated().map { i, title in
+        UITabBarItem(title: title, image: nil, tag: i)
+    }
+    bar.selectedItem = bar.items?.first
+    bar.tintColor = .white
+    bar.barTintColor = UIColor(white: 0.12, alpha: 1)
+    bar.unselectedItemTintColor = .lightGray
+    let handle = adopt(bar)
+    let delegate = ModusTabBar(handle: handle)
+    bar.delegate = delegate
+    tabBarDelegates[handle] = delegate
+    return handle
+}
+
+// refresh_on(list): pulling the list down sends a REFRESH event with the list's handle.  The spinner stops when
+// set_value sets the list to 0.
+let refreshOn: Call = { h, _, _, _, _, _ in
+    guard let table = views[h] as? UITableView else { return 0 }
+    let control = UIRefreshControl()
+    control.tintColor = .white
+    control.addAction(UIAction { _ in send("REFRESH", [.int(Int(h))]) }, for: .valueChanged)
+    table.refreshControl = control
+    return 1
+}
+
+// The search bar's delegate: each change of its text sends a TEXT event (read the text with text_value).
+final class ModusSearchBar: NSObject, UISearchBarDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
+        send("TEXT", [.int(Int(handle))])
+    }
+}
+
+private var searchBarDelegates: [UInt: ModusSearchBar] = [:]
+
+// search_bar_new(placeholder, length, x, y, w, h): a search bar, its placeholder text, white on the dark screen.
+let searchBarNew: Call = { p, n, x, y, w, h in
+    let bar = UISearchBar(frame: rect(x, y, w, h))
+    bar.placeholder = text(p, n)
+    bar.searchBarStyle = .minimal
+    bar.tintColor = .white
+    bar.searchTextField.textColor = .white
+    let handle = adopt(bar)
+    let delegate = ModusSearchBar(handle: handle)
+    bar.delegate = delegate
+    searchBarDelegates[handle] = delegate
+    return handle
+}
+
+// toolbar_new(titles, length, x, y, w, h): a toolbar with a button per title (a term: a list of strings), spaced
+// evenly.  Tapping a button sends a SELECT event with its index.
+let toolbarNew: Call = { p, n, x, y, w, h in
+    let bar = UIToolbar(frame: rect(x, y, w, h))
+    bar.tintColor = .white
+    bar.barTintColor = UIColor(white: 0.12, alpha: 1)
+    let handle = adopt(bar)
+    var items: [UIBarButtonItem] = []
+    for (i, title) in titlesOf(p, n).enumerated() {
+        if i > 0 { items.append(UIBarButtonItem(systemItem: .flexibleSpace)) }
+        items.append(UIBarButtonItem(primaryAction: UIAction(title: title) { _ in
+            send("SELECT", [.int(Int(handle)), .int(i)])
+        }))
+    }
+    bar.items = items
+    return handle
+}
+
+// The picker's data source and delegate: one wheel of rows, the titles; a choice sends a SELECT event with its row.
+final class ModusPicker: NSObject, UIPickerViewDataSource, UIPickerViewDelegate {
+    let handle: UInt
+    var rows: [String] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func numberOfComponents(in pickerView: UIPickerView) -> Int {
+        1
+    }
+
+    func pickerView(_ pickerView: UIPickerView, numberOfRowsInComponent component: Int) -> Int {
+        rows.count
+    }
+
+    func pickerView(_ pickerView: UIPickerView, titleForRow row: Int, forComponent component: Int) -> String? {
+        rows[row]
+    }
+
+    func pickerView(_ pickerView: UIPickerView, didSelectRow row: Int, inComponent component: Int) {
+        send("SELECT", [.int(Int(handle)), .int(row)])
+    }
+}
+
+private var pickers: [UInt: ModusPicker] = [:]
+
+// picker_new(titles, length, x, y, w, h): a wheel of rows, one per title (a term: a list of strings).  Choosing a
+// row sends a SELECT event with its index.
+let pickerNew: Call = { p, n, x, y, w, h in
+    let wheel = UIPickerView(frame: rect(x, y, w, h))
+    let handle = adopt(wheel)
+    let source = ModusPicker(handle: handle)
+    source.rows = titlesOf(p, n)
+    wheel.dataSource = source
+    wheel.delegate = source
+    pickers[handle] = source
+    return handle
+}
+
+// blur_new(x, y, w, h): a blur of what is behind it, dark.  Its children (ui_add) go in its content view.
+let blurNew: Call = { x, y, w, h, _, _ in
+    let view = UIVisualEffectView(effect: UIBlurEffect(style: .systemThinMaterialDark))
+    view.frame = rect(x, y, w, h)
+    return adopt(view)
+}
+
+// The pan gesture's target: a pan that ends sends a PAN event with the horizontal distance dragged (a double).
+final class ModusPan: NSObject {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    @objc func panned(_ recognizer: UIPanGestureRecognizer) {
+        guard recognizer.state == .ended, let view = recognizer.view else { return }
+        send("PAN", [.int(Int(handle)), .double(Double(recognizer.translation(in: view).x))])
+    }
+}
+
+private var panTargets: [UInt: ModusPan] = [:]
+
+// pan_on(handle): a pan on the view, its events as above.  The view takes touches for it.
+let panOn: Call = { h, _, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let target = ModusPan(handle: h)
+    let recognizer = UIPanGestureRecognizer(target: target, action: #selector(ModusPan.panned(_:)))
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(recognizer)
+    panTargets[h] = target
+    return 1
+}
+
+// The grid's data source and delegate: one tile per title; a tap on a tile sends a SELECT event with its index.
+final class ModusGrid: NSObject, UICollectionViewDataSource, UICollectionViewDelegate {
+    let handle: UInt
+    var items: [String] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        items.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "tile", for: indexPath)
+        let label: UILabel
+        if let existing = cell.contentView.viewWithTag(1) as? UILabel {
+            label = existing
+        } else {
+            label = UILabel(frame: cell.contentView.bounds)
+            label.tag = 1
+            label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            label.textColor = .white
+            label.textAlignment = .center
+            cell.contentView.addSubview(label)
+        }
+        label.text = items[indexPath.item]
+        cell.backgroundColor = UIColor(white: 0.2, alpha: 1)
+        return cell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        send("SELECT", [.int(Int(handle)), .int(indexPath.item)])
+    }
+}
+
+private var grids: [UInt: ModusGrid] = [:]
+
+// grid_new(titles, length, x, y, w, h): a collection view of tiles, one per title (a term: a list of strings).
+let gridNew: Call = { p, n, x, y, w, h in
+    let layout = UICollectionViewFlowLayout()
+    layout.itemSize = CGSize(width: 100, height: 60)
+    layout.minimumInteritemSpacing = 8
+    layout.minimumLineSpacing = 8
+    let view = UICollectionView(frame: rect(x, y, w, h), collectionViewLayout: layout)
+    view.backgroundColor = .clear
+    view.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "tile")
+    let handle = adopt(view)
+    let source = ModusGrid(handle: handle)
+    source.items = titlesOf(p, n)
+    view.dataSource = source
+    view.delegate = source
+    grids[handle] = source
+    return handle
+}
+
+// menu_button_new(choices, length, x, y, w, h): a button, 'options', whose menu offers the choices (a term: a list
+// of strings).  Choosing one sends a MENU event with its index.
+let menuButtonNew: Call = { p, n, x, y, w, h in
+    let button = UIButton(type: .system)
+    button.frame = rect(x, y, w, h)
+    button.setTitle("options", for: .normal)
+    button.showsMenuAsPrimaryAction = true
+    let handle = adopt(button)
+    let choices = titlesOf(p, n).enumerated().map { i, title in
+        UIAction(title: title) { _ in send("MENU", [.int(Int(handle)), .int(i)]) }
+    }
+    button.menu = UIMenu(title: "", children: choices)
+    return handle
+}
+
+// The colour of rgb, as 0xRRGGBB.
+private func colorOf(_ rgb: UInt) -> UIColor {
+    UIColor(red: CGFloat((rgb >> 16) & 255) / 255, green: CGFloat((rgb >> 8) & 255) / 255,
+            blue: CGFloat(rgb & 255) / 255, alpha: 1)
+}
+
+// color_well_new(rgb, x, y, w, h): a colour well showing the colour.  Choosing a colour sends a COLOR event with the
+// new colour as 0xRRGGBB.
+let colorWellNew: Call = { rgb, x, y, w, h, _ in
+    let well = UIColorWell(frame: rect(x, y, w, h))
+    well.selectedColor = colorOf(rgb)
+    let handle = adopt(well)
+    well.addAction(UIAction { _ in
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        well.selectedColor?.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let packed = (Int(r * 255) << 16) | (Int(g * 255) << 8) | Int(b * 255)
+        send("COLOR", [.int(Int(handle)), .int(packed)])
+    }, for: .valueChanged)
+    return handle
+}
+
+// The navigation bar's delegate: a pop (the back button, or a pop from code) sends a POP event.
+final class ModusNavBar: NSObject, UINavigationBarDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func navigationBar(_ navigationBar: UINavigationBar, didPop item: UINavigationItem) {
+        send("POP", [.int(Int(handle))])
+    }
+}
+
+private var navBarDelegates: [UInt: ModusNavBar] = [:]
+
+// nav_bar_new(x, y, w, h): a navigation bar, dark, with no items.  nav_push pushes an item.
+let navBarNew: Call = { x, y, w, h, _, _ in
+    let bar = UINavigationBar(frame: rect(x, y, w, h))
+    bar.barStyle = .black
+    bar.tintColor = .white
+    bar.titleTextAttributes = [.foregroundColor: UIColor.white]
+    let handle = adopt(bar)
+    let delegate = ModusNavBar(handle: handle)
+    bar.delegate = delegate
+    navBarDelegates[handle] = delegate
+    return handle
+}
+
+// nav_push(bar, title, length, right, length): pushes an item with the title and, unless the right title is empty,
+// a right button.  Tapping the right button sends a NAVTAP event with the bar's handle.
+let navPush: Call = { h, tp, tn, rp, rn, _ in
+    guard let bar = views[h] as? UINavigationBar else { return 0 }
+    let item = UINavigationItem(title: text(tp, tn))
+    let right = text(rp, rn)
+    if !right.isEmpty {
+        item.rightBarButtonItem = UIBarButtonItem(primaryAction: UIAction(title: right) { _ in
+            send("NAVTAP", [.int(Int(h))])
+        })
+    }
+    bar.pushItem(item, animated: false)
+    return 0
+}
+
+// nav_pop(bar): pops the top item.
+let navPop: Call = { h, _, _, _, _, _ in
+    (views[h] as? UINavigationBar)?.popItem(animated: false)
+    return 0
+}
+
+// The context menu's delegate: a long press on the view opens a menu of the choices; a choice sends a CONTEXT event
+// with the view's handle and the choice's index.
+final class ModusContextMenu: NSObject, UIContextMenuInteractionDelegate {
+    let handle: UInt
+    let choices: [String]
+
+    init(handle: UInt, choices: [String]) {
+        self.handle = handle
+        self.choices = choices
+    }
+
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in
+            UIMenu(title: "", children: self.choices.enumerated().map { i, title in
+                UIAction(title: title) { _ in send("CONTEXT", [.int(Int(self.handle)), .int(i)]) }
+            })
+        }
+    }
+}
+
+private var contextMenus: [UInt: ModusContextMenu] = [:]
+
+// context_menu_on(handle, titles, length): a context menu on the view, of the choices (a term: a list of strings).
+let contextMenuOn: Call = { h, p, n, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let menu = ModusContextMenu(handle: h, choices: titlesOf(p, n))
+    view.isUserInteractionEnabled = true
+    view.addInteraction(UIContextMenuInteraction(delegate: menu))
+    contextMenus[h] = menu
+    return 1
+}
+
+// animate_to(handle, x, y, w, h, ms): the view's frame moves to the new one over ms milliseconds.
+let animateTo: Call = { h, x, y, w, hh, ms in
+    guard let view = views[h] else { return 0 }
+    UIView.animate(withDuration: Double(ms) / 1000) {
+        view.frame = rect(x, y, w, hh)
+    }
+    return 0
+}
+
+// shape_new(kind, x, y, w, h, rgb): a filled shape in the frame: kind 0 an oval, 1 a rounded rectangle.
+let shapeNew: Call = { kind, x, y, w, h, rgb in
+    let view = UIView(frame: rect(x, y, w, h))
+    view.backgroundColor = .clear
+    let path = kind == 0
+        ? UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+        : UIBezierPath(roundedRect: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)), cornerRadius: 16)
+    let shape = CAShapeLayer()
+    shape.path = path.cgPath
+    shape.fillColor = colorOf(rgb).cgColor
+    view.layer.addSublayer(shape)
+    return adopt(view)
+}
+
+// The swipe's target: a swipe sends a SWIPE event with the view's handle and the direction (0 left, 1 right,
+// 2 up, 3 down).
+final class ModusSwipe: NSObject {
+    let handle: UInt
+    let direction: Int
+
+    init(handle: UInt, direction: Int) {
+        self.handle = handle
+        self.direction = direction
+    }
+
+    @objc func swiped(_ recognizer: UISwipeGestureRecognizer) {
+        send("SWIPE", [.int(Int(handle)), .int(direction)])
+    }
+}
+
+private var swipeTargets: [UInt: ModusSwipe] = [:]
+
+// swipe_on(handle, direction): a swipe in the direction (0 left, 1 right, 2 up, 3 down) on the view.
+let swipeOn: Call = { h, dir, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let target = ModusSwipe(handle: h, direction: Int(dir))
+    let recognizer = UISwipeGestureRecognizer(target: target, action: #selector(ModusSwipe.swiped(_:)))
+    switch dir {
+    case 0: recognizer.direction = .left
+    case 1: recognizer.direction = .right
+    case 2: recognizer.direction = .up
+    default: recognizer.direction = .down
+    }
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(recognizer)
+    swipeTargets[h] = target
+    return 1
+}
+
+// share_present(text, length): the share sheet, with the text as its item.  Its completion is a SHARE event with the
+// handle and 1 (an activity was completed) or 0 (it was not).  Returns the handle.
+let sharePresent: Call = { p, n, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let sheet = UIActivityViewController(activityItems: [text(p, n)], applicationActivities: nil)
+    sheet.completionWithItemsHandler = { _, completed, _, _ in
+        send("SHARE", [.int(Int(handle)), .int(completed ? 1 : 0)])
+    }
+    // on an iPad the sheet is a popover, which must be anchored or presenting it raises: the screen's centre
+    if let popover = sheet.popoverPresentationController {
+        popover.sourceView = root.view
+        popover.sourceRect = CGRect(x: root.view.bounds.midX, y: root.view.bounds.midY, width: 1, height: 1)
+        popover.permittedArrowDirections = []
+    }
+    root.present(sheet, animated: true)
+    return handle
+}
+
+// set_accessibility(handle, text, length): the view's accessibility label, what VoiceOver reads and what a test finds.
+let setAccessibility: Call = { h, p, n, _, _, _ in
+    views[h]?.accessibilityLabel = text(p, n)
+    return 0
+}
+
+// haptic(style): an impact feedback, 0 light, 1 medium, 2 heavy.
+let haptic: Call = { style, _, _, _, _, _ in
+    let weight: UIImpactFeedbackGenerator.FeedbackStyle = style == 0 ? .light : (style == 1 ? .medium : .heavy)
+    UIImpactFeedbackGenerator(style: weight).impactOccurred()
+    return 0
+}
+
+// fade_to(handle, percent, ms): the view's alpha moves to percent (0 to 100) over ms milliseconds.  Its completion
+// is a FADE event with the handle.
+let fadeTo: Call = { h, percent, ms, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    UIView.animate(withDuration: Double(ms) / 1000, animations: {
+        view.alpha = CGFloat(min(percent, 100)) / 100
+    }, completion: { _ in
+        send("FADE", [.int(Int(h))])
+    })
+    return 0
+}
+
+// A modal sheet's content: a view (adopted as the others are not: it is shown by the sheet, not the screen) and its
+// controller.  Dragging the sheet down is a DISMISS event; dismissing it from code is not.
+private var modalControllers: [UInt: UIViewController] = [:]
+
+final class ModusModal: NSObject, UIAdaptivePresentationControllerDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        send("DISMISS", [.int(Int(handle))])
+    }
+}
+
+private var modalDelegates: [UInt: ModusModal] = [:]
+
+// modal_new(): a sheet's content, not yet shown.  Its children are added with ui_add.
+let modalNew: Call = { _, _, _, _, _, _ in
+    let controller = UIViewController()
+    controller.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    let handle = nextHandle
+    nextHandle += 1
+    views[handle] = controller.view
+    modalControllers[handle] = controller
+    return handle
+}
+
+// modal_present(handle, large): the sheet comes up over the app, at medium height, or at large (large != 0).
+let modalPresent: Call = { h, large, _, _, _, _ in
+    guard let controller = modalControllers[h], let root = keyRoot()?.window?.rootViewController else { return 0 }
+    controller.modalPresentationStyle = .pageSheet
+    controller.sheetPresentationController?.detents = large != 0 ? [.large()] : [.medium()]
+    root.present(controller, animated: true)
+    let delegate = ModusModal(handle: h)
+    controller.presentationController?.delegate = delegate
+    modalDelegates[h] = delegate
+    return 1
+}
+
+// modal_dismiss(handle): the sheet goes away.
+let modalDismiss: Call = { h, _, _, _, _, _ in
+    modalControllers[h]?.dismiss(animated: true)
+    return 0
+}
+
+// list_actions(handle, titles, length): the swipe actions of the list's rows (a term: a list of strings).
+let listActions: Call = { h, p, n, _, _, _ in
+    lists[h]?.actions = titlesOf(p, n)
+    return 1
+}
+
+// The paging scroll view's delegate: when a page stops, a PAGE event with its index.
+final class ModusPaging: NSObject, UIScrollViewDelegate {
+    let handle: UInt
+    var width: CGFloat = 0
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        guard width > 0 else { return }
+        send("PAGE", [.int(Int(handle)), .int(Int((scrollView.contentOffset.x / width).rounded()))])
+    }
+}
+
+private var pagings: [UInt: ModusPaging] = [:]
+
+// paging_new(pages, x, y, w, h): a scroll view of pages, each as wide as the view, that snap to a page (ui_add puts
+// each page's content in place, at its own x).  A page that comes to rest is a PAGE event with its index.
+let pagingNew: Call = { pages, x, y, w, h, _ in
+    let scroll = UIScrollView(frame: rect(x, y, w, h))
+    scroll.isPagingEnabled = true
+    scroll.showsHorizontalScrollIndicator = false
+    scroll.contentSize = CGSize(width: CGFloat(w) * CGFloat(pages), height: CGFloat(h))
+    let handle = adopt(scroll)
+    let delegate = ModusPaging(handle: handle)
+    delegate.width = CGFloat(w)
+    scroll.delegate = delegate
+    pagings[handle] = delegate
+    return handle
+}
+
+// announce(text, length): VoiceOver announces the text, with no change on the screen.
+let announce: Call = { p, n, _, _, _, _ in
+    UIAccessibility.post(notification: .announcement, argument: text(p, n))
+    return 0
+}
+
+// A tab bar controller's delegate: a tab picked sends a SELECT event with its index.
+final class ModusTabs: NSObject, UITabBarControllerDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func tabBarController(_ tabBarController: UITabBarController, didSelect viewController: UIViewController) {
+        send("SELECT", [.int(Int(handle)), .int(tabBarController.selectedIndex)])
+    }
+}
+
+private var tabDelegates: [UInt: ModusTabs] = [:]
+private var tabContent: [UInt: [UInt]] = [:]
+
+// tab_controller_new(titles, length): a tab bar controller, a tab per title, each tab's content a view (tab_content).
+// Shown with modal_present; a tab picked is a SELECT event with its index.  Returns the controller's handle.
+let tabControllerNew: Call = { p, n, _, _, _, _ in
+    let tabs = UITabBarController()
+    var controllers: [UIViewController] = []
+    var contents: [UInt] = []
+    for (i, title) in titlesOf(p, n).enumerated() {
+        let vc = UIViewController()
+        vc.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        vc.tabBarItem = UITabBarItem(title: title, image: nil, tag: i)
+        controllers.append(vc)
+        let content = nextHandle
+        nextHandle += 1
+        views[content] = vc.view
+        contents.append(content)
+    }
+    tabs.viewControllers = controllers
+    let handle = nextHandle
+    nextHandle += 1
+    modalControllers[handle] = tabs
+    tabContent[handle] = contents
+    let delegate = ModusTabs(handle: handle)
+    tabs.delegate = delegate
+    tabDelegates[handle] = delegate
+    return handle
+}
+
+// tab_content(controller, index): the view of a tab, to add to with ui_add.
+let tabContentOf: Call = { h, i, _, _, _, _ in
+    tabContent[h]?[Int(i)] ?? 0
+}
+
+// nav_controller_new(): a navigation controller whose root view is its first content (nav_root).  Shown with
+// modal_present.
+private var navContent: [UInt: [UInt]] = [:]
+
+let navControllerNew: Call = { _, _, _, _, _, _ in
+    let root = UIViewController()
+    root.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    root.title = "start"
+    let nav = UINavigationController(rootViewController: root)
+    nav.navigationBar.barStyle = .black
+    nav.navigationBar.tintColor = .white
+    nav.navigationBar.titleTextAttributes = [.foregroundColor: UIColor.white]
+    let rootContent = nextHandle
+    nextHandle += 1
+    views[rootContent] = root.view
+    let handle = nextHandle
+    nextHandle += 1
+    modalControllers[handle] = nav
+    navContent[handle] = [rootContent]
+    return handle
+}
+
+// nav_root(controller): the view of the navigation controller's root.
+let navRoot: Call = { h, _, _, _, _, _ in
+    navContent[h]?.first ?? 0
+}
+
+// nav_push_view(controller, title, length): pushes a view titled so, and returns its handle.  Its back button reads
+// 'back'.
+let navPushView: Call = { h, p, n, _, _, _ in
+    guard let nav = modalControllers[h] as? UINavigationController else { return 0 }
+    let vc = UIViewController()
+    vc.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+    vc.title = text(p, n)
+    vc.navigationItem.backButtonTitle = "back"
+    let content = nextHandle
+    nextHandle += 1
+    views[content] = vc.view
+    navContent[h, default: []].append(content)
+    nav.pushViewController(vc, animated: false)
+    return content
+}
+
+// attributed_label_new(text, length, x, y, w, h): a label whose text is underlined and tinted, as attributed text.
+let attributedLabelNew: Call = { p, n, x, y, w, h in
+    let label = UILabel(frame: rect(x, y, w, h))
+    let styled = NSMutableAttributedString(string: text(p, n))
+    styled.addAttributes([.underlineStyle: NSUnderlineStyle.single.rawValue, .foregroundColor: UIColor.systemTeal],
+                         range: NSRange(location: 0, length: styled.length))
+    label.attributedText = styled
+    label.numberOfLines = 0
+    return adopt(label)
+}
+
+// dynamic_label_new(text, length, x, y, w, h): a label in a text style that follows the user's text size (Dynamic
+// Type): its font scales with the content size category.
+let dynamicLabelNew: Call = { p, n, x, y, w, h in
+    let label = UILabel(frame: rect(x, y, w, h))
+    label.text = text(p, n)
+    label.font = UIFont.preferredFont(forTextStyle: .title1)
+    label.adjustsFontForContentSizeCategory = true
+    label.textColor = .white
+    return adopt(label)
+}
+
+// safe_area_top(): the top safe-area inset of the screen, in points (the status bar, the notch).
+let safeAreaTop: Call = { _, _, _, _, _, _ in
+    UInt(keyRoot()?.safeAreaInsets.top ?? 0)
+}
+
+// screen_height(): the height of the app's screen, in points (874 on an iPhone 17 Pro, 1210 on an 11-inch iPad Pro).
+let screenHeight: Call = { _, _, _, _, _, _ in
+    UInt(keyRoot()?.bounds.height ?? 0)
+}
+
+// screen_width(): the width of the app's screen, in points.
+let screenWidth: Call = { _, _, _, _, _, _ in
+    UInt(keyRoot()?.bounds.width ?? 0)
+}
+
+// parallax_on(handle, amount): the view moves a little with the device's tilt, by amount points, as a parallax
+// motion effect does.
+let parallaxOn: Call = { h, amount, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let d = CGFloat(amount)
+    let horizontal = UIInterpolatingMotionEffect(keyPath: "center.x", type: .tiltAlongHorizontalAxis)
+    horizontal.minimumRelativeValue = -d
+    horizontal.maximumRelativeValue = d
+    let vertical = UIInterpolatingMotionEffect(keyPath: "center.y", type: .tiltAlongVerticalAxis)
+    vertical.minimumRelativeValue = -d
+    vertical.maximumRelativeValue = d
+    view.addMotionEffect(horizontal)
+    view.addMotionEffect(vertical)
+    return 1
+}
+
+// The zoom scroll view's delegate: its content zooms, and the zoom when it ends is a ZOOM event (the scale, in
+// percent).
+final class ModusZoom: NSObject, UIScrollViewDelegate {
+    let handle: UInt
+    let content: UIView
+
+    init(handle: UInt, content: UIView) {
+        self.handle = handle
+        self.content = content
+    }
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+        content
+    }
+
+    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+        send("ZOOM", [.int(Int(handle)), .int(Int(scale * 100))])
+    }
+}
+
+private var zoomDelegates: [UInt: ModusZoom] = [:]
+private var zoomContents: [UInt: UInt] = [:]
+
+// zoom_scroll_new(x, y, w, h): a scroll view whose content (zoom_content) zooms from 1x to 4x.
+let zoomScrollNew: Call = { x, y, w, h, _, _ in
+    let scroll = UIScrollView(frame: rect(x, y, w, h))
+    let content = UIView(frame: CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
+    content.backgroundColor = UIColor(white: 0.2, alpha: 1)
+    scroll.addSubview(content)
+    scroll.contentSize = content.frame.size
+    scroll.minimumZoomScale = 1
+    scroll.maximumZoomScale = 4
+    let handle = adopt(scroll)
+    let contentHandle = nextHandle
+    nextHandle += 1
+    views[contentHandle] = content
+    zoomContents[handle] = contentHandle
+    let delegate = ModusZoom(handle: handle, content: content)
+    scroll.delegate = delegate
+    zoomDelegates[handle] = delegate
+    return handle
+}
+
+// zoom_content(scroll): the content view of a zoom scroll view, to add to with ui_add.
+let zoomContent: Call = { h, _, _, _, _, _ in
+    zoomContents[h] ?? 0
+}
+
+// A shape drawn into an image: an oval (kind 0) or a rounded square (1), filled in rgb, size points square.
+private func shapeImage(_ kind: UInt, _ rgb: UInt, _ size: CGFloat) -> UIImage {
+    UIGraphicsImageRenderer(size: CGSize(width: size, height: size)).image { _ in
+        colorOf(rgb).setFill()
+        let frame = CGRect(x: 0, y: 0, width: size, height: size)
+        (kind == 0 ? UIBezierPath(ovalIn: frame) : UIBezierPath(roundedRect: frame, cornerRadius: size / 4)).fill()
+    }
+}
+
+// drawn_image_new(kind, rgb, size, x, y): an image drawn here, a shape as shapeImage draws it.
+let drawnImageNew: Call = { kind, rgb, size, x, y, _ in
+    let s = CGFloat(size)
+    let view = UIImageView(image: shapeImage(kind, rgb, s))
+    view.frame = CGRect(x: CGFloat(x), y: CGFloat(y), width: s, height: s)
+    return adopt(view)
+}
+
+// file_image_new(kind, rgb, size, x, y): a shape drawn and saved as a PNG in the app's temporary folder, then shown
+// from that file (loaded back, not the drawn image).
+let fileImageNew: Call = { kind, rgb, size, x, y, _ in
+    let s = CGFloat(size)
+    let path = NSTemporaryDirectory() + "storybook-shape.png"
+    if let data = shapeImage(kind, rgb, s).pngData() {
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
+    let view = UIImageView(image: UIImage(contentsOfFile: path))
+    view.frame = CGRect(x: CGFloat(x), y: CGFloat(y), width: s, height: s)
+    return adopt(view)
+}
+
+// A page view controller's data source and delegate: its pages in order.  A page that comes to rest sends a PAGE
+// event with its index.
+final class ModusPageVC: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
+    let handle: UInt
+    var pages: [UIViewController] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerBefore viewController: UIViewController) -> UIViewController? {
+        guard let i = pages.firstIndex(where: { $0 === viewController }), i > 0 else { return nil }
+        return pages[i - 1]
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController,
+                            viewControllerAfter viewController: UIViewController) -> UIViewController? {
+        guard let i = pages.firstIndex(where: { $0 === viewController }), i + 1 < pages.count else { return nil }
+        return pages[i + 1]
+    }
+
+    func pageViewController(_ pageViewController: UIPageViewController, didFinishAnimating finished: Bool,
+                            previousViewControllers: [UIViewController], transitionCompleted completed: Bool) {
+        guard completed, let current = pageViewController.viewControllers?.first,
+              let i = pages.firstIndex(where: { $0 === current }) else { return }
+        send("PAGE", [.int(Int(handle)), .int(i)])
+    }
+}
+
+private var pageSources: [UInt: ModusPageVC] = [:]
+private var pageContents: [UInt: [UInt]] = [:]
+
+// page_controller_new(count): a page view controller of count pages, each a view (page_content).  Shown with
+// modal_present.  Returns its handle.
+let pageControllerNew: Call = { count, _, _, _, _, _ in
+    let pager = UIPageViewController(transitionStyle: .scroll, navigationOrientation: .horizontal)
+    let handle = nextHandle
+    nextHandle += 1
+    let source = ModusPageVC(handle: handle)
+    var contents: [UInt] = []
+    for _ in 0..<Int(count) {
+        let vc = UIViewController()
+        vc.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
+        source.pages.append(vc)
+        let content = nextHandle
+        nextHandle += 1
+        views[content] = vc.view
+        contents.append(content)
+    }
+    pager.dataSource = source
+    pager.delegate = source
+    if let first = source.pages.first {
+        pager.setViewControllers([first], direction: .forward, animated: false)
+    }
+    modalControllers[handle] = pager
+    pageSources[handle] = source
+    pageContents[handle] = contents
+    return handle
+}
+
+// page_content(controller, index): the view of a page, to add to with ui_add.
+let pageContent: Call = { h, i, _, _, _, _ in
+    pageContents[h]?[Int(i)] ?? 0
+}
+
+// list_editing(list, on): the list's rows show their delete controls (on 1) or not (0).
+let listEditing: Call = { h, on, _, _, _, _ in
+    (views[h] as? UITableView)?.setEditing(on != 0, animated: false)
+    return 0
+}
+
+// The edit menu's target: a long press on the view opens the edit menu of the choices; a choice sends an EDIT event
+// with the view's handle and the choice's index.
+final class ModusEditMenu: NSObject, UIEditMenuInteractionDelegate {
+    let handle: UInt
+    let choices: [String]
+    var interaction: UIEditMenuInteraction?
+
+    init(handle: UInt, choices: [String]) {
+        self.handle = handle
+        self.choices = choices
+    }
+
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+        UIMenu(children: choices.enumerated().map { i, title in
+            UIAction(title: title) { _ in send("EDIT", [.int(Int(self.handle)), .int(i)]) }
+        })
+    }
+
+    @objc func pressed(_ recognizer: UILongPressGestureRecognizer) {
+        guard recognizer.state == .began, let view = recognizer.view, let interaction = interaction else { return }
+        interaction.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil,
+                                                                  sourcePoint: recognizer.location(in: view)))
+    }
+}
+
+private var editMenus: [UInt: ModusEditMenu] = [:]
+
+// edit_menu_on(handle, choices, length): a long press on the view opens an edit menu of the choices (a term: a list
+// of strings).
+let editMenuOn: Call = { h, p, n, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let menu = ModusEditMenu(handle: h, choices: titlesOf(p, n))
+    let interaction = UIEditMenuInteraction(delegate: menu)
+    menu.interaction = interaction
+    view.addInteraction(interaction)
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(UILongPressGestureRecognizer(target: menu, action: #selector(ModusEditMenu.pressed(_:))))
+    editMenus[h] = menu
+    return 1
+}
+
+// popover_present(content, source): the modal content shown as a popover from the source view.  On a phone a popover
+// is a sheet; on a tablet it points at the source.
+let popoverPresent: Call = { h, source, _, _, _, _ in
+    guard let controller = modalControllers[h], let root = keyRoot()?.window?.rootViewController,
+          let anchor = views[source] else { return 0 }
+    controller.modalPresentationStyle = .popover
+    controller.popoverPresentationController?.sourceView = anchor
+    controller.popoverPresentationController?.sourceRect = anchor.bounds
+    root.present(controller, animated: true)
+    return 1
+}
+
+// split_present(primary, secondary): a split view controller of two modal contents, shown as a sheet.  Returns its
+// handle (ui_modal_dismiss takes it).  On a phone it collapses: the secondary shows first, and the primary is behind
+// its Back button.
+let splitPresent: Call = { primary, secondary, _, _, _, _ in
+    guard let p = modalControllers[primary], let s = modalControllers[secondary],
+          let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let split = UISplitViewController(style: .doubleColumn)
+    split.setViewController(p, for: .primary)
+    split.setViewController(s, for: .secondary)
+    let handle = nextHandle
+    nextHandle += 1
+    modalControllers[handle] = split
+    root.present(split, animated: true)
+    return handle
+}
+
+// gravity_drop(handle): the view falls under gravity (UIDynamicAnimator) until it comes to rest on the bottom of its
+// superview.  The animator is kept by the handle, so the fall runs on.
+private var animators: [UInt: UIDynamicAnimator] = [:]
+
+let gravityDrop: Call = { h, _, _, _, _, _ in
+    guard let view = views[h], let container = view.superview else { return 0 }
+    let animator = UIDynamicAnimator(referenceView: container)
+    animator.addBehavior(UIGravityBehavior(items: [view]))
+    let collision = UICollisionBehavior(items: [view])
+    collision.translatesReferenceBoundsIntoBoundary = true
+    animator.addBehavior(collision)
+    animators[h] = animator
+    return 1
+}
+
+// keyboard_avoid_on(handle): the view moves up out of the keyboard's way when the keyboard comes up, and returns when
+// it goes down.  It listens for UIKit's keyboard notifications.
+private var keyboardObservers: [UInt: [NSObjectProtocol]] = [:]
+private var keyboardOriginals: [UInt: CGRect] = [:]
+
+let keyboardAvoidOn: Call = { h, _, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let center = NotificationCenter.default
+    let show = center.addObserver(forName: UIResponder.keyboardWillShowNotification, object: nil,
+                                  queue: .main) { note in
+        let keyboard = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue ?? .zero
+        if keyboardOriginals[h] == nil { keyboardOriginals[h] = view.frame }
+        guard let original = keyboardOriginals[h] else { return }
+        let lift = max(0, original.maxY - keyboard.minY + 16)
+        UIView.animate(withDuration: 0.25) {
+            view.frame = original.offsetBy(dx: 0, dy: -lift)
+        }
+    }
+    let hide = center.addObserver(forName: UIResponder.keyboardWillHideNotification, object: nil,
+                                  queue: .main) { _ in
+        guard let original = keyboardOriginals[h] else { return }
+        UIView.animate(withDuration: 0.25) {
+            view.frame = original
+        }
+        keyboardOriginals[h] = nil
+    }
+    keyboardObservers[h] = [show, hide]
+    return 1
+}
+
+// keyboard_post(height): posts the keyboard notifications UIKit posts when a keyboard of this height (points) comes
+// up, or goes down (0).  For tests: the simulator presents no keyboard for the storybook's text.
+let keyboardPost: Call = { height, _, _, _, _, _ in
+    let width = keyRoot()?.bounds.width ?? 402
+    let screen = keyRoot()?.bounds.height ?? 874
+    let keyboard = CGRect(x: 0, y: screen - CGFloat(height), width: width, height: CGFloat(height))
+    let info: [AnyHashable: Any] = [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: keyboard),
+                                    UIResponder.keyboardAnimationDurationUserInfoKey: 0.25]
+    let name = height > 0 ? UIResponder.keyboardWillShowNotification : UIResponder.keyboardWillHideNotification
+    NotificationCenter.default.post(name: name, object: nil, userInfo: info)
+    return 1
+}
+
+// document_picker_show(): the system's document picker, for opening a text file, shown over the app.  Its Cancel
+// closes it.
+let documentPickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    root.present(UIDocumentPickerViewController(documentTypes: ["public.text"], in: .open), animated: true)
+    return 1
+}
+
+// The collection's data source and delegate: sections of tiles under a header each.  A tap on a tile sends a SELECT
+// event with the tile's index among all the rows.
+final class ModusCollection: NSObject, UICollectionViewDataSource, UICollectionViewDelegate {
+    let handle: UInt
+    var groups: [(title: String?, rows: [Row])] = []
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func numberOfSections(in collectionView: UICollectionView) -> Int {
+        groups.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+        groups[section].rows.count
+    }
+
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
+        let cell = collectionView.dequeueReusableCell(withReuseIdentifier: "tile", for: indexPath)
+        let label: UILabel
+        if let existing = cell.contentView.viewWithTag(1) as? UILabel {
+            label = existing
+        } else {
+            label = UILabel(frame: cell.contentView.bounds)
+            label.tag = 1
+            label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            label.textColor = .white
+            label.textAlignment = .center
+            cell.contentView.addSubview(label)
+        }
+        label.text = groups[indexPath.section].rows[indexPath.item].title
+        cell.backgroundColor = UIColor(white: 0.2, alpha: 1)
+        return cell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, viewForSupplementaryElementOfKind kind: String,
+                        at indexPath: IndexPath) -> UICollectionReusableView {
+        let header = collectionView.dequeueReusableSupplementaryView(ofKind: kind, withReuseIdentifier: "header",
+                                                                     for: indexPath)
+        let label: UILabel
+        if let existing = header.viewWithTag(1) as? UILabel {
+            label = existing
+        } else {
+            label = UILabel(frame: header.bounds)
+            label.tag = 1
+            label.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            label.textColor = .lightGray
+            label.font = .boldSystemFont(ofSize: 14)
+            header.addSubview(label)
+        }
+        label.text = groups[indexPath.section].title
+        return header
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        send("SELECT", [.int(Int(handle)), .int(groups[indexPath.section].rows[indexPath.item].index)])
+    }
+}
+
+private var collections: [UInt: ModusCollection] = [:]
+
+// The compositional layout of a collection: three tiles to a row, a header on each section.
+private func sectionedLayout() -> UICollectionViewCompositionalLayout {
+    UICollectionViewCompositionalLayout { _, _ in
+        let item = NSCollectionLayoutItem(layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1.0 / 3.0), heightDimension: .absolute(60)))
+        let group = NSCollectionLayoutGroup.horizontal(layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1), heightDimension: .absolute(60)), subitem: item, count: 3)
+        group.interItemSpacing = .fixed(8)
+        let section = NSCollectionLayoutSection(group: group)
+        section.interGroupSpacing = 8
+        section.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 8, bottom: 16, trailing: 8)
+        let header = NSCollectionLayoutBoundarySupplementaryItem(layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1), heightDimension: .absolute(28)),
+            elementKind: UICollectionView.elementKindSectionHeader, alignment: .top)
+        section.boundarySupplementaryItems = [header]
+        return section
+    }
+}
+
+// collection_new(rows, length, x, y, w, h): a collection view of sections (rows as ui_list_set_data: a term, with a
+// SECTION per row), its tiles in three columns under a header per section.  Returns its handle.
+let collectionNew: Call = { p, n, x, y, w, h in
+    let view = UICollectionView(frame: rect(x, y, w, h), collectionViewLayout: sectionedLayout())
+    view.backgroundColor = .clear
+    view.register(UICollectionViewCell.self, forCellWithReuseIdentifier: "tile")
+    view.register(UICollectionReusableView.self,
+                  forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader, withReuseIdentifier: "header")
+    let handle = adopt(view)
+    let source = ModusCollection(handle: handle)
+    if n > 0, let base = UnsafeRawPointer(bitPattern: p) {
+        let bytes = Array(UnsafeRawBufferPointer(start: base, count: Int(n)))
+        if let data = try? decodeTerm(bytes) {
+            source.groups = groupsOf(rowsOf(data))
+        }
+    }
+    view.dataSource = source
+    view.delegate = source
+    collections[handle] = source
+    return handle
+}
+
+// image_picker_show(): the system's photo picker over the app (the photo library, or the saved photos where there is
+// no library).  Its Cancel closes it.
+let imagePickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let picker = UIImagePickerController()
+    picker.sourceType = UIImagePickerController.isSourceTypeAvailable(.photoLibrary) ? .photoLibrary : .savedPhotosAlbum
+    root.present(picker, animated: true)
+    return 1
+}
+
+// A gesture's target for the simple recognizers: when the gesture is recognised it sends its event with the view's
+// handle.  The recognizer is kept by UIKit; the target is kept here (UIKit keeps it weakly).
+final class ModusRecognized: NSObject {
+    let handle: UInt
+    let event: String
+
+    init(handle: UInt, event: String) {
+        self.handle = handle
+        self.event = event
+    }
+
+    @objc func fired(_ recognizer: UIGestureRecognizer) {
+        if recognizer.state == .recognized || recognizer.state == .ended {
+            send(event, [.int(Int(handle))])
+        }
+    }
+}
+
+private var recognizedTargets: [ModusRecognized] = []
+
+private func recognize(_ h: UInt, _ event: String, _ make: (ModusRecognized) -> UIGestureRecognizer) -> UInt {
+    guard let view = views[h] else { return 0 }
+    let target = ModusRecognized(handle: h, event: event)
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(make(target))
+    recognizedTargets.append(target)
+    return 1
+}
+
+// tap_on(handle): a tap on the view (UITapGestureRecognizer) sends a TAP event, as a button's tap does.
+let tapOn: Call = { h, _, _, _, _, _ in
+    recognize(h, "TAP") { UITapGestureRecognizer(target: $0, action: #selector(ModusRecognized.fired(_:))) }
+}
+
+// edge_pan_on(handle): a pan in from the screen's left edge sends an EDGE event with the handle
+// (UIScreenEdgePanGestureRecognizer).  The recognizer goes on the screen's root view, where an edge pan begins; the
+// handle names the event.
+private var edgeRecognizers: [UInt: UIGestureRecognizer] = [:]
+
+let edgePanOn: Call = { h, _, _, _, _, _ in
+    guard let root = keyRoot() else { return 0 }
+    let target = ModusRecognized(handle: h, event: "EDGE")
+    let edge = UIScreenEdgePanGestureRecognizer(target: target, action: #selector(ModusRecognized.fired(_:)))
+    edge.edges = .left
+    if let old = edgeRecognizers[h] { root.removeGestureRecognizer(old) }
+    root.addGestureRecognizer(edge)
+    edgeRecognizers[h] = edge
+    recognizedTargets.append(target)
+    return 1
+}
+
+// The calendar's selection delegate: a day picked sends a DATE event with its seconds since 1970 (a double).
+final class ModusCalendar: NSObject, UICalendarSelectionSingleDateDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func dateSelection(_ selection: UICalendarSelectionSingleDate, didSelectDate dateComponents: DateComponents?) {
+        guard let date = dateComponents.flatMap({ Calendar.current.date(from: $0) }) else { return }
+        send("DATE", [.int(Int(handle)), .double(date.timeIntervalSince1970)])
+    }
+}
+
+private var calendarDelegates: [UInt: ModusCalendar] = [:]
+
+// calendar_new(seconds, x, y, w, h): a calendar (UICalendarView) showing the month of the date, one day selectable.
+let calendarNew: Call = { seconds, x, y, w, h, _ in
+    let calendar = UICalendarView(frame: rect(x, y, w, h))
+    calendar.overrideUserInterfaceStyle = .dark
+    calendar.visibleDateComponents = Calendar.current.dateComponents([.year, .month, .day],
+                                                                      from: Date(timeIntervalSince1970: TimeInterval(seconds)))
+    let handle = adopt(calendar)
+    let delegate = ModusCalendar(handle: handle)
+    calendar.selectionBehavior = UICalendarSelectionSingleDate(delegate: delegate)
+    calendarDelegates[handle] = delegate
+    return handle
+}
+
+// unavailable_new(text, length, x, y, w, h): a content-unavailable view (UIContentUnavailableView): an image and the
+// text, as an empty screen shows.
+let unavailableNew: Call = { p, n, x, y, w, h in
+    var config = UIContentUnavailableConfiguration.empty()
+    config.image = UIImage(systemName: "tray")
+    config.text = text(p, n)
+    config.secondaryText = "Nothing here yet."
+    let view = UIContentUnavailableView(configuration: config)
+    view.frame = rect(x, y, w, h)
+    view.overrideUserInterfaceStyle = .dark
+    return adopt(view)
+}
+
+// The colour and font pickers' delegate: a colour picked sends a COLOR event (0xRRGGBB), a font a FONT event; the
+// pickers are system view controllers, shown over the app.
+final class ModusPickers: NSObject, UIColorPickerViewControllerDelegate, UIFontPickerViewControllerDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor,
+                                   continuously: Bool) {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        send("COLOR", [.int(Int(handle)), .int((Int(r * 255) << 16) | (Int(g * 255) << 8) | Int(b * 255))])
+    }
+
+    func fontPickerViewControllerDidPickFont(_ viewController: UIFontPickerViewController) {
+        send("FONT", [.int(Int(handle))])
+        viewController.dismiss(animated: true)
+    }
+}
+
+private var pickerDelegates: [UInt: ModusPickers] = [:]
+
+// color_picker_show() and font_picker_show(): the system colour picker and font picker, shown over the app.  Each
+// returns a handle that names its events.
+let colorPickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let delegate = ModusPickers(handle: handle)
+    let picker = UIColorPickerViewController()
+    picker.delegate = delegate
+    pickerDelegates[handle] = delegate
+    root.present(picker, animated: true)
+    return handle
+}
+
+let fontPickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let delegate = ModusPickers(handle: handle)
+    let picker = UIFontPickerViewController()
+    picker.delegate = delegate
+    pickerDelegates[handle] = delegate
+    root.present(picker, animated: true)
+    return handle
+}
+
+// input_keys_on(field, keys, length): the text field's keyboard is replaced by an input view (UIInputView) of a key
+// per title (a term: a list of strings); a key types its title into the field.
+let inputKeysOn: Call = { h, p, n, _, _, _ in
+    guard let field = views[h] as? UITextField else { return 0 }
+    // as wide as the screen from the start: the row of keys inside is laid out from this frame
+    let width = keyRoot()?.bounds.width ?? 402
+    let input = UIInputView(frame: CGRect(x: 0, y: 0, width: width, height: 60), inputViewStyle: .keyboard)
+    let row = UIStackView(frame: input.bounds.insetBy(dx: 8, dy: 8))
+    row.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    row.distribution = .fillEqually
+    row.spacing = 8
+    for title in titlesOf(p, n) {
+        let key = UIButton(type: .system)
+        key.setTitle(title, for: .normal)
+        key.addAction(UIAction { [weak field] _ in field?.insertText(title) }, for: .touchUpInside)
+        row.addArrangedSubview(key)
+    }
+    input.addSubview(row)
+    field.inputView = input
+    field.reloadInputViews()
+    return 1
+}
+
+// send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
+// For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
+let sendRefresh: Call = { h, _, _, _, _, _ in
+    (views[h] as? UITableView)?.refreshControl?.sendActions(for: .valueChanged)
+    return 0
 }
 
 // panel_new(x, y, w, h, rgb): a plain view of one colour; w = 0 makes it the whole screen.
@@ -222,6 +1702,8 @@ let addChild: Call = { parent, child, _, _, _, _ in
         content.addArrangedSubview(c)
     } else if let stack = views[parent] as? UIStackView {
         stack.addArrangedSubview(c)
+    } else if let effect = views[parent] as? UIVisualEffectView {
+        effect.contentView.addSubview(c)
     } else {
         views[parent]?.addSubview(c)
     }
@@ -237,16 +1719,37 @@ let setText: Call = { h, p, n, _, _, _ in
         button.setTitle(s, for: .normal)
     } else if let field = views[h] as? UITextField {
         field.text = s
+    } else if let view = views[h] as? UITextView {
+        view.text = s
+    } else if let bar = views[h] as? UISearchBar {
+        bar.text = s
     }
     return 0
 }
 
-// set_value(handle, value): a switch's state (0 or 1) or a slider's value (0..100).
+// set_value(handle, value): a switch's state (0 or 1), a slider's value (0..100), a progress bar's percent
+// (0..100), or an activity indicator's state (0 stops it, 1 starts it).
 let setValue: Call = { h, value, _, _, _, _ in
     if let sw = views[h] as? UISwitch {
         sw.isOn = value != 0
     } else if let slider = views[h] as? UISlider {
         slider.value = Float(value)
+    } else if let bar = views[h] as? UIProgressView {
+        bar.progress = Float(min(value, 100)) / 100
+    } else if let spinner = views[h] as? UIActivityIndicatorView {
+        if value != 0 { spinner.startAnimating() } else { spinner.stopAnimating() }
+    } else if let stepper = views[h] as? UIStepper {
+        stepper.value = Double(value)
+    } else if let page = views[h] as? UIPageControl {
+        page.currentPage = Int(value)
+    } else if let picker = views[h] as? UIDatePicker {
+        picker.date = Date(timeIntervalSince1970: TimeInterval(value))
+    } else if let table = views[h] as? UITableView {
+        if value == 0 { table.refreshControl?.endRefreshing() } else { table.refreshControl?.beginRefreshing() }
+    } else if let wheel = views[h] as? UIPickerView {
+        wheel.selectRow(Int(value), inComponent: 0, animated: false)
+    } else if let well = views[h] as? UIColorWell {
+        well.selectedColor = colorOf(value)
     }
     return 0
 }
@@ -254,12 +1757,27 @@ let setValue: Call = { h, value, _, _, _, _ in
 // text_value(handle, buffer, capacity): the text of a text field or label, as UTF-8 at the buffer if it
 // fits; the length of the text in bytes either way (0 for no text).
 let textValue: Call = { h, buf, cap, _, _, _ in
-    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? ""
+    let s = (views[h] as? UITextField)?.text ?? (views[h] as? UILabel)?.text ?? (views[h] as? UITextView)?.text
+        ?? (views[h] as? UISearchBar)?.text ?? ""
     let bytes = Array(s.utf8)
     if !bytes.isEmpty, bytes.count <= Int(cap), let out = UnsafeMutableRawPointer(bitPattern: buf) {
         bytes.withUnsafeBytes { out.copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
     }
     return UInt(bytes.count)
+}
+
+// The rows in sections: each run of consecutive rows with the same section is one section (a row with no section
+// is in the run of rows with none).
+private func groupsOf(_ rows: [Row]) -> [(title: String?, rows: [Row])] {
+    var groups: [(title: String?, rows: [Row])] = []
+    for row in rows {
+        if let last = groups.last, last.title == row.section {
+            groups[groups.count - 1].rows.append(row)
+        } else {
+            groups.append((title: row.section, rows: [row]))
+        }
+    }
+    return groups
 }
 
 // list_new(x, y, w, h): an empty list; its rows come from ui_list_set_data.
@@ -278,7 +1796,7 @@ let listNew: Call = { x, y, w, h, _, _ in
 // in place; a term that is not a list of plists leaves the list empty.
 let listSetData: Call = { h, p, n, _, _, _ in
     guard n > 0, let base = UnsafeRawPointer(bitPattern: p) else {
-        lists[h]?.rows = []
+        lists[h]?.groups = []
         (views[h] as? UITableView)?.reloadData()
         return 0
     }
@@ -290,7 +1808,7 @@ let listSetData: Call = { h, p, n, _, _, _ in
         print("list_set_data: \(error)")
         rows = []
     }
-    lists[h]?.rows = rows
+    lists[h]?.groups = groupsOf(rows)
     (views[h] as? UITableView)?.reloadData()
     return 0
 }
@@ -338,7 +1856,7 @@ let eventsNext: Call = { buf, cap, _, _, _, _ in
 
 // MARK: - registration
 
-private func register(_ name: String, _ fn: Call) {
+func register(_ name: String, _ fn: Call) {
     let p = unsafeBitCast(fn, to: UnsafeMutableRawPointer.self)
     name.withCString { modus_swift_register($0, p) }
 }
@@ -346,11 +1864,85 @@ private func register(_ name: String, _ fn: Call) {
 // modus-swift.m calls this, once, before the first Lisp call.
 @_cdecl("modus_swift_install")
 public func modusSwiftInstall() {
+    installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_switch_new", switchNew)
     register("ui_slider_new", sliderNew)
     register("ui_text_field_new", textFieldNew)
+    register("ui_text_view_new", textViewNew)
+    register("ui_segmented_new", segmentedNew)
+    register("ui_progress_new", progressNew)
+    register("ui_spinner_new", spinnerNew)
+    register("ui_stepper_new", stepperNew)
+    register("ui_page_new", pageNew)
+    register("ui_date_new", dateNew)
+    register("ui_long_press_on", longPressOn)
+    register("ui_alert_new", alertNew)
+    register("ui_alert_action", alertAction)
+    register("ui_alert_present", alertPresent)
+    register("ui_tab_bar_new", tabBarNew)
+    register("ui_refresh_on", refreshOn)
+    register("ui_send_refresh", sendRefresh)
+    register("ui_search_bar_new", searchBarNew)
+    register("ui_toolbar_new", toolbarNew)
+    register("ui_picker_new", pickerNew)
+    register("ui_blur_new", blurNew)
+    register("ui_pan_on", panOn)
+    register("ui_grid_new", gridNew)
+    register("ui_menu_button_new", menuButtonNew)
+    register("ui_color_well_new", colorWellNew)
+    register("ui_nav_bar_new", navBarNew)
+    register("ui_nav_push", navPush)
+    register("ui_nav_pop", navPop)
+    register("ui_context_menu_on", contextMenuOn)
+    register("ui_animate_to", animateTo)
+    register("ui_shape_new", shapeNew)
+    register("ui_swipe_on", swipeOn)
+    register("ui_share_present", sharePresent)
+    register("ui_set_accessibility", setAccessibility)
+    register("ui_haptic", haptic)
+    register("ui_fade_to", fadeTo)
+    register("ui_modal_new", modalNew)
+    register("ui_modal_present", modalPresent)
+    register("ui_modal_dismiss", modalDismiss)
+    register("ui_list_actions", listActions)
+    register("ui_paging_new", pagingNew)
+    register("ui_announce", announce)
+    register("ui_tab_controller_new", tabControllerNew)
+    register("ui_tab_content", tabContentOf)
+    register("ui_nav_controller_new", navControllerNew)
+    register("ui_nav_root", navRoot)
+    register("ui_nav_push_view", navPushView)
+    register("ui_attributed_label_new", attributedLabelNew)
+    register("ui_dynamic_label_new", dynamicLabelNew)
+    register("ui_safe_area_top", safeAreaTop)
+    register("ui_screen_height", screenHeight)
+    register("ui_screen_width", screenWidth)
+    register("ui_parallax_on", parallaxOn)
+    register("ui_zoom_scroll_new", zoomScrollNew)
+    register("ui_zoom_content", zoomContent)
+    register("ui_drawn_image_new", drawnImageNew)
+    register("ui_file_image_new", fileImageNew)
+    register("ui_page_controller_new", pageControllerNew)
+    register("ui_page_content", pageContent)
+    register("ui_list_editing", listEditing)
+    register("ui_edit_menu_on", editMenuOn)
+    register("ui_popover_present", popoverPresent)
+    register("ui_split_present", splitPresent)
+    register("ui_gravity_drop", gravityDrop)
+    register("ui_keyboard_avoid_on", keyboardAvoidOn)
+    register("ui_keyboard_post", keyboardPost)
+    register("ui_document_picker_show", documentPickerShow)
+    register("ui_collection_new", collectionNew)
+    register("ui_image_picker_show", imagePickerShow)
+    register("ui_tap_on", tapOn)
+    register("ui_edge_pan_on", edgePanOn)
+    register("ui_calendar_new", calendarNew)
+    register("ui_unavailable_new", unavailableNew)
+    register("ui_color_picker_show", colorPickerShow)
+    register("ui_font_picker_show", fontPickerShow)
+    register("ui_input_keys_on", inputKeysOn)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

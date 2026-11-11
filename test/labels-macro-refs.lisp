@@ -5,7 +5,8 @@
 ;;;;   - a reference produced by a MACRO expansion was missed, and compiled as a
 ;;;;     call to an undefined global function (CHIPZ::ZLIB-FLAGS);
 ;;;;   - a variable binding named like a local function, (LET ((D ...)) ...),
-;;;;     was rewritten as a call, so the variable was never bound.
+;;;;     was rewritten as a call, so the variable was never bound;
+;;;;   - a MACROLET inside the escaping local function signalled a TYPE-ERROR.
 ;;;; Run: ./modus --script test/labels-macro-refs.lisp   (prints PASS or FAIL)
 (defvar *fails* 0)
 (defmacro check (name form expect)
@@ -32,6 +33,21 @@
     (list (funcall #'d 'd) (funcall #'d 1))))
 (defun lmr-symbol-macrolet ()
   (labels ((d (x) (symbol-macrolet ((d (e x))) d)) (e (y) (* y 10))) (funcall #'d 4)))
+(defun lmr-inner-macrolet ()
+  (labels ((f0 () (macrolet ((tr (n) `(function ,n))) (tr f1))) (f1 () 7))
+    (funcall (funcall #'f0))))
+(defun lmr-inner-macrolet-fixed-name ()
+  (labels ((f0 () (macrolet ((tc () '(f1))) (+ (tc) 1))) (f1 () 7)) (funcall #'f0)))
+(defun lmr-inner-macrolet-shadows ()
+  (labels ((f0 () (macrolet ((f1 () 100)) (f1))) (f1 () 7)) (list (funcall #'f0) (funcall #'f1))))
+(defun lmr-hash-iterator (h)
+  (let ((n 0))
+    (flet ((count-all () (with-hash-table-iterator (next h)
+                           (loop (multiple-value-bind (more k v) (next)
+                                   (declare (ignore k v))
+                                   (unless more (return n))
+                                   (incf n))))))
+      (funcall #'count-all))))
 (check "macrolet #'NEXT, entered through #'F" (lmr-macrolet (make-lmr-st)) 7)
 (check "global macro expanding to #'NEXT" (lmr-global-macro) 7)
 (check "macro expanding to a call (NEXT)" (lmr-macro-call) 7)
@@ -40,4 +56,10 @@
 (check "DESTRUCTURING-BIND default calling a local fn" (lmr-dbind) '(1 9))
 (check "CASE key and DO variable named like a local fn" (lmr-case-do) '(:sym 3))
 (check "SYMBOL-MACROLET expansion calling a local fn" (lmr-symbol-macrolet) 40)
+(check "MACROLET inside the escaping local fn" (lmr-inner-macrolet) 7)
+(check "inner macro naming a local fn itself" (lmr-inner-macrolet-fixed-name) 8)
+(check "inner macro shadowing a local fn's name" (lmr-inner-macrolet-shadows) '(100 7))
+(check "WITH-HASH-TABLE-ITERATOR in a capturing FLET"
+       (let ((h (make-hash-table))) (dotimes (i 5) (setf (gethash i h) i)) (lmr-hash-iterator h))
+       5)
 (format t "~a~%" (if (zerop *fails*) "PASS" (format nil "FAIL (~d)" *fails*)))

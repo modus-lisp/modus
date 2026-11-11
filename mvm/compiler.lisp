@@ -15666,11 +15666,20 @@
          ;; itself binds shadow the local functions in its body.
          ((and (not shadowing-done) (consp (cdr form)) (listp (cadr form))
                (or (and (symbolp op)
-                        (member (symbol-name op) '("MACROLET" "FLET" "LABELS") :test #'string=))
+                        (member (symbol-name op) '("FLET" "LABELS") :test #'string=))
                    (and (integerp op) (or (= op 445617652) (= op 417505106)))))  ; FLET LABELS
           (%flet-rewrite-calls-shadowing
            (mapcar (lambda (d) (if (consp d) (car d) nil)) (cadr form))
            form local-names cell-names))
+         ;; (macrolet ((m ll . mbody) ...) . body) — a call to a local function
+         ;; can be PRODUCED by a local macro's expansion.  While the body is
+         ;; walked, the macrolet's expanders are installed in the macro table
+         ;; (as COLLECT-SETQ-VARS-IN-BODY does), so %FLET-REWRITE-EXPANSION
+         ;; expands such a call here and its result is rewritten; the MACROLET
+         ;; itself is emitted unchanged.  (Rewriting each expander's RESULT at
+         ;; expansion time, as this used to, failed under runtime compilation:
+         ;; a MACROLET inside an escaping local function signalled a TYPE-ERROR.)
+         ;; Names the macrolet binds shadow the local functions in its body.
          ((and (symbolp op) (string= (symbol-name op) "MACROLET")
                (consp (cdr form)) (listp (cadr form)))
           (let* ((mnames (mapcar (lambda (d) (if (consp d) (car d) nil)) (cadr form)))
@@ -15679,19 +15688,25 @@
                                  unless (member n mnames :test #'name-equal)
                                  collect (cons n c)))
                  (new-locals (mapcar #'car filtered))
-                 (new-cells  (mapcar #'cdr filtered)))
-            `(macrolet
-                 ,(mapcar
-                   (lambda (d)
-                     (if (and (consp d) (consp (cdr d)))
-                         (multiple-value-bind (head rest) (%split-body-decls (cddr d))
-                           `(,(car d) ,(cadr d) ,@head
-                             (%flet-rewrite-calls (progn ,@rest)
-                                                  ',local-names ',cell-names)))
-                         d))
-                   (cadr form))
-               ,@(mapcar (lambda (f) (%flet-rewrite-calls f new-locals new-cells))
-                         (cddr form)))))
+                 (new-cells  (mapcar #'cdr filtered))
+                 (saved nil))
+            (unwind-protect
+                 (progn
+                   (dolist (mdef (cadr form))
+                     (when (and (consp mdef) (consp (cdr mdef)))
+                       (let ((mname (normalize-name (car mdef))))
+                         (push (cons mname (gethash mname *macro-table*)) saved)
+                         (mvm-define-macro mname (build-macrolet-expander
+                                                  (cadr mdef) (cddr mdef) nil)))))
+                   (%mexp-memo-invalidate)
+                   `(macrolet ,(cadr form)
+                      ,@(mapcar (lambda (f) (%flet-rewrite-calls f new-locals new-cells))
+                                (cddr form))))
+              (%mexp-memo-invalidate)
+              (dolist (sv saved)
+                (if (cdr sv)
+                    (setf (gethash (car sv) *macro-table*) (cdr sv))
+                    (remhash (car sv) *macro-table*))))))
          ;; (function NAME) — if NAME is a local, replace with (car cell)
          ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
               (and (integerp op) (= op 402801909)))  ; FUNCTION

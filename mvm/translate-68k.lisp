@@ -1464,6 +1464,13 @@
            ;; V0..V5 are D2..D7, so each argument is read before its register
            ;; is overwritten; V4/V5 (D6/D7) are only read.  A trap is not a
            ;; call, but V0..V3 are argument registers and dead after it.
+           ((= code #x0532)
+            ;; (%JIT-CALL addr): call native code at the TAGGED byte address
+            ;; in V0; its result comes back in VR.
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+            (m68k-emit-asr-imm buf +68k-d0+ 1)
+            (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
+            (m68k-emit-jsr-an-ind buf +68k-a0+))
            ((and (= code #x0502) *68k-linux-mode*)
             ;; GENERIC 3-ARG SYSCALL: V0 = number, V1..V3 args, all TAGGED;
             ;; result TAGGED in V0.

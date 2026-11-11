@@ -1285,6 +1285,57 @@ let gravityDrop: Call = { h, _, _, _, _, _ in
     return 1
 }
 
+// keyboard_avoid_on(handle): the view moves up out of the keyboard's way when the keyboard comes up, and returns when
+// it goes down.  It listens for UIKit's keyboard notifications.
+private var keyboardObservers: [UInt: [NSObjectProtocol]] = [:]
+private var keyboardOriginals: [UInt: CGRect] = [:]
+
+let keyboardAvoidOn: Call = { h, _, _, _, _, _ in
+    guard let view = views[h] else { return 0 }
+    let center = NotificationCenter.default
+    let show = center.addObserver(forName: UIResponder.keyboardWillShowNotification, object: nil,
+                                  queue: .main) { note in
+        let keyboard = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue ?? .zero
+        if keyboardOriginals[h] == nil { keyboardOriginals[h] = view.frame }
+        guard let original = keyboardOriginals[h] else { return }
+        let lift = max(0, original.maxY - keyboard.minY + 16)
+        UIView.animate(withDuration: 0.25) {
+            view.frame = original.offsetBy(dx: 0, dy: -lift)
+        }
+    }
+    let hide = center.addObserver(forName: UIResponder.keyboardWillHideNotification, object: nil,
+                                  queue: .main) { _ in
+        guard let original = keyboardOriginals[h] else { return }
+        UIView.animate(withDuration: 0.25) {
+            view.frame = original
+        }
+        keyboardOriginals[h] = nil
+    }
+    keyboardObservers[h] = [show, hide]
+    return 1
+}
+
+// keyboard_post(height): posts the keyboard notifications UIKit posts when a keyboard of this height (points) comes
+// up, or goes down (0).  For tests: the simulator presents no keyboard for the storybook's text.
+let keyboardPost: Call = { height, _, _, _, _, _ in
+    let width = keyRoot()?.bounds.width ?? 402
+    let screen = keyRoot()?.bounds.height ?? 874
+    let keyboard = CGRect(x: 0, y: screen - CGFloat(height), width: width, height: CGFloat(height))
+    let info: [AnyHashable: Any] = [UIResponder.keyboardFrameEndUserInfoKey: NSValue(cgRect: keyboard),
+                                    UIResponder.keyboardAnimationDurationUserInfoKey: 0.25]
+    let name = height > 0 ? UIResponder.keyboardWillShowNotification : UIResponder.keyboardWillHideNotification
+    NotificationCenter.default.post(name: name, object: nil, userInfo: info)
+    return 1
+}
+
+// document_picker_show(): the system's document picker, for opening a text file, shown over the app.  Its Cancel
+// closes it.
+let documentPickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    root.present(UIDocumentPickerViewController(documentTypes: ["public.text"], in: .open), animated: true)
+    return 1
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1576,6 +1627,9 @@ public func modusSwiftInstall() {
     register("ui_popover_present", popoverPresent)
     register("ui_split_present", splitPresent)
     register("ui_gravity_drop", gravityDrop)
+    register("ui_keyboard_avoid_on", keyboardAvoidOn)
+    register("ui_keyboard_post", keyboardPost)
+    register("ui_document_picker_show", documentPickerShow)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

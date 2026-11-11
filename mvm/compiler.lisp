@@ -3978,14 +3978,40 @@
 ;;; width paths through %expr-dtype: (aref (pl-data pl) i) with PL declared
 ;;; PLANE and the slot typed U8VEC takes the byte path.
 (defvar *struct-accessors* nil
-  "Alist acc-name-hash -> (setter-hash struct-name-string slot-index slot-type).")
+  "Alist acc-name-hash -> (setter-hash struct-name-string slot-index slot-type
+   min-instance-length struct-name read-only-p).")
 
-(defun %struct-accessor-note (acc-name setter-name struct-str index slot-type)
+(defun %struct-accessor-note (acc-name setter-name struct-str index slot-type
+                              &optional min-len struct-name read-only)
   (%fasl-taint "%struct-accessor-note")
   (let ((h (compute-name-hash acc-name)))
     (setq *struct-accessors*
-          (cons (list h (compute-name-hash setter-name) struct-str index slot-type)
+          (cons (list h (compute-name-hash setter-name) struct-str index slot-type
+                      min-len struct-name read-only)
                 (remove h *struct-accessors* :key (function car))))))
+
+(defun %struct-accessor-forget (name body)
+  "A DEFUN of NAME whose BODY is not a defstruct accessor's or writer's own
+   (one %STRUCT-SLOT-REF / %STRUCT-SLOT-SET form): NAME stops being inlined
+   as a slot access, so the new definition is the one callers reach."
+  (when (and *struct-accessors* (symbolp name))
+    (let ((h (normalize-name name))
+          ;; DEFSTRUCT's own bodies: the reader, the writer (store, then
+          ;; VAL), a :READ-ONLY slot's refusing writer, and the Lisp-spelled
+          ;; check for a slot past the 8-bit OBJ-REF index.
+          (own (and (consp body) (consp (car body)) (symbolp (caar body))
+                    (or (name-eq (caar body) "%STRUCT-SLOT-REF")
+                        (name-eq (caar body) "%STRUCT-SLOT-SET")
+                        (name-eq (caar body) "%SIGNAL-PROGRAM-ERROR")
+                        (and (name-eq (caar body) "IF") (consp (cdar body))
+                             (consp (cadar body)) (consp (cdr (cadar body)))
+                             (consp (cadr (cadar body)))
+                             (symbolp (car (cadr (cadar body))))
+                             (name-eq (car (cadr (cadar body))) "OBJ-SUBTAG"))))))
+      (unless own
+        (setq *struct-accessors*
+              (remove-if (lambda (r) (or (eql (car r) h) (eql (cadr r) h)))
+                         *struct-accessors*))))))
 
 (defun %struct-accessor-info (sym)
   "The record for accessor symbol SYM, or NIL."
@@ -28566,12 +28592,33 @@
       (when (and info (null (cdr args)) (symbolp (car args))
                  (%declared-struct-p (car args) env (third info)))
         (return-from compile-call
-          (compile-form (list '%word-aref (car args) (fourth info)) env dest))))
+          (compile-form (list '%word-aref (car args) (fourth info)) env dest)))
+      ;; Any other argument: the accessor's own body, in place -- the subtag
+      ;; and length check and one load, as SBCL inlines a structure accessor
+      ;; with its type check.  The function call it replaces was most of the
+      ;; cost (cram's inflate: (bitr-n br) on an undeclared BR).  A DEFUN of
+      ;; the name drops the record (%STRUCT-ACCESSOR-FORGET).
+      (when (and info (null (cdr args)) (sixth info) (%obj-slot-imm-p (fourth info))
+                 (%cg-on-p (quote *cg-struct-inline*)))
+        (return-from compile-call
+          (compile-form (list '%struct-slot-ref (car args) (sixth info) (fourth info)
+                              (seventh info))
+                        env dest))))
     (let ((info (%struct-setter-info fn)))
       (when (and info (consp (cdr args)) (null (cddr args)) (symbolp (car args))
                  (%declared-struct-p (car args) env (third info)))
         (return-from compile-call
-          (compile-form (list '%word-aset (car args) (fourth info) (cadr args)) env dest)))))
+          (compile-form (list '%word-aset (car args) (fourth info) (cadr args)) env dest)))
+      (when (and info (consp (cdr args)) (null (cddr args)) (sixth info)
+                 (not (eighth info)) (%obj-slot-imm-p (fourth info))
+                 (%cg-on-p (quote *cg-struct-inline*)))
+        ;; Bound first: %STRUCT-SLOT-SET computes its value before its
+        ;; object, and the call evaluated the object first.
+        (let ((go (%mvm-gensym "SSETO")) (gv (%mvm-gensym "SSETV")))
+          (return-from compile-call
+            (compile-form (list 'let (list (list go (car args)) (list gv (cadr args)))
+                                (list '%struct-slot-set go (sixth info) (fourth info) gv))
+                          env dest))))))
   ;; Typed shortcuts for the helpers the ABS macro expands to: a known-width
   ;; integer expression (see %expr-width) is never complex, and negating one
   ;; of <= 61 bits cannot overflow, so (- 0 x) takes the plain :sub.  Each
@@ -31170,7 +31217,8 @@
            ;; (declaim (inline NAME)) seen earlier: keep the definition for
            ;; call-site expansion (see %inline-expansion).  Runtime DEFUNs
            ;; arrive here (mvm-eval-forms → mvm-compile-toplevel).
-           (%inline-record-defun name params body))
+           (%inline-record-defun name params body)
+           (%struct-accessor-forget name body))
          (when (and *aot-inline* (not *mvm-eval-runtime-p*))
            (%inline-record-defun name params body))
          ;; Detect &rest, &optional, &key before preprocessing strips them
@@ -32041,7 +32089,8 @@
                   ;; compile-time record: a call on an argument DECLARED to be
                   ;; this struct reads the slot in place (see compile-call)
                   (%struct-accessor-note acc-name (format nil "SET-~A" acc-name)
-                                         struct-str (+ 2 i) (nth i slot-types))
+                                         struct-str (+ 2 i) (nth i slot-types)
+                                         min-inst-len struct-name slot-read-only)
                   (let* ((setter-name (format nil "SET-~A" acc-name))
                          ;; NOTE — CHECKED-STORE is bound HERE, as a plain
                          ;; top-level backquote, and spliced below as a bare

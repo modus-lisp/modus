@@ -1,0 +1,56 @@
+;;; Structure accessors inlined at the call site on an UNDECLARED argument
+;;; (compiler.lisp, compile-call: %STRUCT-SLOT-REF / -SET with the accessor's
+;;; own check).  Run: ./modus --script test/struct-inline.lisp  (also SBCL).
+(defvar *fails* 0)
+(defvar *checks* 0)
+(defmacro check (name form expect)
+  `(let ((got (handler-case ,form (error (c) (list :error (type-of c))))))
+     (incf *checks*)
+     (unless (equal got ,expect)
+       (incf *fails*)
+       (format t "FAIL ~a: got ~s want ~s~%" ,name got ,expect))))
+
+(defstruct pt x y)
+(defstruct (pt3 (:include pt)) z)
+(defstruct ro (a 1 :read-only t) b)
+(defstruct other u v)
+
+(defun get-x (p) (pt-x p))
+(defun set-x (p v) (setf (pt-x p) v))
+(defun get-z (p) (pt3-z p))
+(defun sum-xy (p) (+ (pt-x p) (pt-y p)))
+(defvar *calls* 0)
+(defun make-counted () (incf *calls*) (make-pt :x 5 :y 6))
+(defun x-of-fresh () (pt-x (make-counted)))
+(defun store-order (p) (let ((log nil))
+                         (setf (pt-x (progn (push :obj log) p)) (progn (push :val log) 9))
+                         (reverse log)))
+
+(let ((p (make-pt :x 1 :y 2)) (q (make-pt3 :x 10 :y 20 :z 30)))
+  (check "read" (get-x p) 1)
+  (check "sum" (sum-xy p) 3)
+  (check "write returns value" (set-x p 7) 7)
+  (check "write stored" (pt-x p) 7)
+  (check "parent accessor on child" (get-x q) 10)
+  (check "child accessor" (get-z q) 30)
+  (check "child accessor on parent" (get-z p) '(:error type-error))
+  (check "non-struct" (get-x 42) '(:error type-error))
+  (check "list" (get-x (list 1 2)) '(:error type-error))
+  (check "wrong struct, too short" (get-z (make-other :u 1 :v 2)) '(:error type-error))
+  (check "argument evaluated once" (progn (setq *calls* 0) (list (x-of-fresh) *calls*)) '(5 1))
+  (check "object before value" (store-order p) '(:obj :val))
+  (check "stored by setf" (pt-x p) 9)
+  (check "read-only slot refuses SETF"
+         (handler-case (eval '(let ((r (make-ro :b 2))) (setf (ro-a r) 5) (ro-a r)))
+           (error () :refused))
+         :refused)
+  (check "funcall #'accessor" (funcall #'pt-y p) 2)
+  (check "mapcar #'accessor" (mapcar #'pt-x (list p q)) '(9 10)))
+
+;; Redefining an accessor reaches callers compiled AFTER the redefinition.
+(defun pt-y (p) (declare (ignore p)) :redefined)
+(defun get-y-late (p) (pt-y p))
+(check "redefined accessor" (get-y-late (make-pt :x 1 :y 2)) :redefined)
+
+(format t "struct-inline: ~d checks, ~d failed~%" *checks* *fails*)
+(if (zerop *fails*) (format t "PASS~%") (format t "FAIL~%"))

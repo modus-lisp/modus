@@ -204,6 +204,14 @@
               (t t)))
   (when *68k-relax-branches*
     (format t "~&;; MODUS_68K_RELAX_BRANCHES: branches relaxed (two passes)~%")))
+;; MODUS_68K_SHARED: the most repeated sequences (CONS so far) as one shared copy
+;; each, called (translate-68k.lisp *68K-SHARED-SEQUENCES*).  1 = on, 0 = off;
+;; unset, it follows MODUS_SMALL_IMAGE.
+(let ((v (sb-ext:posix-getenv "MODUS_68K_SHARED")))
+  (setf *68k-shared-sequences*
+        (cond ((null v) (and cl-user::*small-image* t))
+              ((string= v "0") nil)
+              (t t))))
 
 (let ((v (sb-ext:posix-getenv "MODUS_68K_GC_POISON")))
   (when (and v (plusp (length v)) (not (string= v "0")))

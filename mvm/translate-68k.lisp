@@ -1984,6 +1984,13 @@
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
+        (if *68k-cons-label*
+         (progn                          ; the shared CONS (M68K-EMIT-CONS-HELPER)
+           (m68k-load-vreg buf +68k-d0+ va)
+           (m68k-load-vreg buf +68k-d1+ vb)
+           (m68k-emit-bsr buf *68k-cons-label*)
+           (m68k-store-vreg buf vd +68k-d0+))
+         (progn
          (m68k-emit-alloc-mark buf 2)   ; FIRST: clobbers D0/A0
          ;; Bump allocator using A2 (VA)
          ;; Store car at (A2)
@@ -2002,7 +2009,7 @@
          ;; cons's 1 read as 9.  r26-callee-alloc answered 1042 on 68k (and on
          ;; riscv32 and ppc32).  ADDQ stops at 8, hence LEA.
          (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)
-         (m68k-store-vreg buf vd +68k-d0+)))
+         (m68k-store-vreg buf vd +68k-d0+)))))
 
       (#.+op-setcar+
        (let ((vd (first operands))
@@ -2505,7 +2512,10 @@
        ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
        ;; Comparing (A3, A2) computes A2 - A3, so carry set means VA < VL.
        ;; Hosted, a full heap calls the collector; bare, it is still ILLEGAL.
-       (m68k-emit-gc-check buf))
+       ;; A plain GC-CHECK right before a CONS: the shared CONS checks itself.
+       (unless (and (eql opcode +op-gc-check+)
+                    (m68k-next-is-unlabelled-cons-p mvm-pc))
+         (m68k-emit-gc-check buf)))
 
       (#.+op-write-barrier+
        (let ((vobj (first operands)))
@@ -2969,6 +2979,45 @@
     (m68k-emit-moveq buf +68k-d0+ kind)
     (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+)))
 
+;;; SHARED SEQUENCES (*68K-SHARED-SEQUENCES*, MODUS_SMALL_IMAGE / MODUS_68K_SHARED).
+;;; The most repeated native sequences, emitted once after the collector and
+;;; called with BSR, instead of inline at every site.  First: CONS, and the
+;;; GC-CHECK the compiler puts right before each one.
+
+(defvar *68k-shared-sequences* nil
+  "When T, CONS (with the GC-CHECK before it) is a call to one shared copy.")
+(defvar *68k-cons-label* nil
+  "Label of the shared CONS sequence while translating, else NIL.")
+(defvar *68k-bytecode* nil
+  "The bytecode being translated, for a one-instruction lookahead.")
+(defvar *68k-label-map* nil
+  "The translation's bytecode offset -> label map.")
+
+(defun m68k-emit-cons-helper (buf)
+  "The shared CONS: D0 = car, D1 = cdr in; D0 = the tagged cons out.  Clobbers
+   A0.  The heap check comes first (a GC-CHECK just before a CONS is dropped
+   at the site, see the GC-CHECK arm): a collection here sees D0 and D1, which
+   the collector saves to the stack, scans and restores, as the roots they are."
+  (m68k-emit-label buf *68k-cons-label*)
+  (m68k-emit-gc-check buf)
+  (when *68k-gc-label*
+    (m68k-emit-push-dn buf +68k-d0+)
+    (m68k-emit-alloc-mark buf 2)                    ; clobbers D0 and A0
+    (m68k-emit-pop-dn buf +68k-d0+))
+  (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a2+)   ; car
+  (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a2+ 4)   ; cdr
+  (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+  (m68k-emit-addq buf +68k-d0+ +tag-cons+)            ; 16-aligned: + tag = OR tag
+  (m68k-emit-lea-disp buf +68k-a2+ 16 +68k-a2+)       ; 16, as the inline CONS
+  (m68k-emit-rts buf))
+
+(defun m68k-next-is-unlabelled-cons-p (next-pc)
+  "True when the instruction at NEXT-PC is a CONS that no branch lands on."
+  (and *68k-cons-label* *68k-bytecode*
+       (< next-pc (length *68k-bytecode*))
+       (null (gethash next-pc *68k-label-map*))
+       (eql (car (decode-instruction *68k-bytecode* next-pc)) +op-cons+)))
+
 (defun m68k-emit-gc-check (buf)
   "Room while VA (A2) < VL (A3); else call the collector (hosted) or ILLEGAL."
   (let ((ok-label (mvm-make-label)))
@@ -3351,8 +3400,11 @@
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
   (let* ((*68k-gc-label* (and *68k-linux-mode* (mvm-make-label)))
+         (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-bytecode* bytecode)
          (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
+         (*68k-label-map* label-map)
          (fn-entries nil)
          (bc bytecode)
          (len (length bc))
@@ -3458,6 +3510,8 @@
 
     (when *68k-gc-label*
       (m68k-emit-gc-collector buf))
+    (when *68k-cons-label*
+      (m68k-emit-cons-helper buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)

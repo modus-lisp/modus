@@ -1439,6 +1439,16 @@ let collectionNew: Call = { p, n, x, y, w, h in
     return handle
 }
 
+// image_picker_show(): the system's photo picker over the app (the photo library, or the saved photos where there is
+// no library).  Its Cancel closes it.
+let imagePickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let picker = UIImagePickerController()
+    picker.sourceType = UIImagePickerController.isSourceTypeAvailable(.photoLibrary) ? .photoLibrary : .savedPhotosAlbum
+    root.present(picker, animated: true)
+    return 1
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1734,6 +1744,7 @@ public func modusSwiftInstall() {
     register("ui_keyboard_post", keyboardPost)
     register("ui_document_picker_show", documentPickerShow)
     register("ui_collection_new", collectionNew)
+    register("ui_image_picker_show", imagePickerShow)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

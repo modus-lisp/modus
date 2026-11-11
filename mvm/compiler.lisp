@@ -27298,8 +27298,8 @@
 ;;; literal KIND, and the result in DEST.  Unchecked, like %BULK-MOVE.
 (defun compile-kernel-op (args env dest)
   (let ((kind (nth 4 args)))
-    (unless (and (= (length args) 5) (member kind '(0 1 2)))
-      (error "MVM compiler: (%KERNEL src i val n kind) takes four values and a literal kind 0, 1 or 2: ~S" args))
+    (unless (and (= (length args) 5) (member kind '(0 1 2 3 4 5)))
+      (error "MVM compiler: (%KERNEL src i val n kind) takes four values and a literal kind 0-5: ~S" args))
     (let ((regs (loop repeat 4 collect (alloc-temp-reg))))
       (loop for r in regs for a in args do (compile-form a env r))
       (emit-ir :kernel dest (first regs) (second regs) (third regs) (fourth regs) kind)

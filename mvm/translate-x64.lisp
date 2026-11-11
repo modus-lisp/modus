@@ -1810,6 +1810,69 @@
           (ash (logand reg #b111) 3)
           (logand rm #b111)))
 
+;;; KERNEL kinds 3-5 are whole routines in AES-NI / PCLMULQDQ / CPUID, assembled from
+;;; mvm/x64-kernels/*.s by scripts/x64-kernels.sh and copied in as bytes: every branch is
+;;; inside its routine, so the bytes are position-independent.  Each starts with the
+;;; KERNEL arm's registers (rsi src, rax i, rdx val, rcx n, all tagged) and leaves its
+;;; untagged result in rax.
+(defun emit-byte-vector (buf v)
+  "Every byte of the vector V, in order."
+  (dotimes (i (length v)) (emit-byte buf (aref v i))))
+
+(defparameter *x64-kernel-aes-ctr*
+  ;; 223 bytes, from mvm/x64-kernels/aes-ctr.s (scripts/x64-kernels.sh)
+  #(#x48 #x83 #xEC #x40 #xF3 #x0F #x7F #x04 #x24 #xF3 #x0F #x7F #x4C #x24 #x10 #xF3
+    #x0F #x7F #x54 #x24 #x20 #x48 #xD1 #xF9 #x49 #x89 #xC8 #x49 #x83 #xE0 #x0F #x48
+    #xC1 #xE9 #x04 #x48 #x83 #xC6 #x07 #x48 #x83 #xC0 #x07 #x48 #x83 #xC2 #x07 #xF3
+    #x0F #x6F #x06 #x44 #x8B #x4E #x0C #x41 #x0F #xC9 #x48 #x85 #xC9 #x0F #x84 #x85
+    #x00 #x00 #x00 #x41 #xFF #xC1 #x45 #x89 #xCA #x41 #x0F #xCA #x66 #x0F #x6F #xC8
+    #x66 #x41 #x0F #x3A #x22 #xCA #x03 #xF3 #x0F #x6F #x56 #x10 #x66 #x0F #xEF #xCA
+    #x4C #x8D #x5E #x20 #x4D #x89 #xC2 #x49 #xFF #xCA #xF3 #x41 #x0F #x6F #x13 #x66
+    #x0F #x38 #xDC #xCA #x49 #x83 #xC3 #x10 #x49 #xFF #xCA #x75 #xED #xF3 #x41 #x0F
+    #x6F #x13 #x66 #x0F #x38 #xDD #xCA #x48 #x83 #xF9 #x10 #x72 #x1C #xF3 #x0F #x6F
+    #x10 #x66 #x0F #xEF #xCA #xF3 #x0F #x7F #x0A #x48 #x83 #xC0 #x10 #x48 #x83 #xC2
+    #x10 #x48 #x83 #xE9 #x10 #x75 #x9C #xEB #x1F #xF3 #x0F #x7F #x4C #x24 #x30 #x4D
+    #x31 #xDB #x46 #x0F #xB6 #x14 #x18 #x46 #x32 #x54 #x1C #x30 #x46 #x88 #x14 #x1A
+    #x49 #xFF #xC3 #x49 #x39 #xCB #x72 #xEA #xF3 #x0F #x6F #x04 #x24 #xF3 #x0F #x6F
+    #x4C #x24 #x10 #xF3 #x0F #x6F #x54 #x24 #x20 #x48 #x83 #xC4 #x40 #x31 #xC0))
+(defparameter *x64-kernel-ghash*
+  ;; 501 bytes, from mvm/x64-kernels/ghash.s (scripts/x64-kernels.sh)
+  #(#x48 #x81 #xEC #xB0 #x00 #x00 #x00 #xF3 #x0F #x7F #x04 #x24 #xF3 #x0F #x7F #x4C
+    #x24 #x10 #xF3 #x0F #x7F #x54 #x24 #x20 #xF3 #x0F #x7F #x5C #x24 #x30 #xF3 #x0F
+    #x7F #x64 #x24 #x40 #xF3 #x0F #x7F #x6C #x24 #x50 #xF3 #x0F #x7F #x74 #x24 #x60
+    #xF3 #x0F #x7F #x7C #x24 #x70 #xF3 #x44 #x0F #x7F #x84 #x24 #x80 #x00 #x00 #x00
+    #xF3 #x44 #x0F #x7F #x8C #x24 #x90 #x00 #x00 #x00 #xF3 #x44 #x0F #x7F #x94 #x24
+    #xA0 #x00 #x00 #x00 #x48 #xD1 #xF9 #x48 #x83 #xC6 #x07 #x48 #x83 #xC0 #x07 #xF3
+    #x44 #x0F #x6F #x56 #x20 #xF3 #x0F #x6F #x0E #x66 #x41 #x0F #x38 #x00 #xCA #xF3
+    #x0F #x6F #x46 #x10 #x66 #x41 #x0F #x38 #x00 #xC2 #x48 #x85 #xC9 #x0F #x84 #x11
+    #x01 #x00 #x00 #xF3 #x0F #x6F #x10 #x66 #x41 #x0F #x38 #x00 #xD2 #x66 #x0F #xEF
+    #xC2 #x66 #x0F #x6F #xD8 #x66 #x0F #x3A #x44 #xD9 #x00 #x66 #x0F #x6F #xE0 #x66
+    #x0F #x3A #x44 #xE1 #x10 #x66 #x0F #x6F #xE8 #x66 #x0F #x3A #x44 #xE9 #x01 #x66
+    #x0F #x6F #xF0 #x66 #x0F #x3A #x44 #xF1 #x11 #x66 #x0F #xEF #xE5 #x66 #x0F #x6F
+    #xEC #x66 #x0F #x73 #xDC #x08 #x66 #x0F #x73 #xFD #x08 #x66 #x0F #xEF #xDD #x66
+    #x0F #xEF #xF4 #x66 #x0F #x6F #xFB #x66 #x44 #x0F #x6F #xC6 #x66 #x0F #x72 #xF3
+    #x01 #x66 #x0F #x72 #xF6 #x01 #x66 #x0F #x72 #xD7 #x1F #x66 #x41 #x0F #x72 #xD0
+    #x1F #x66 #x44 #x0F #x6F #xCF #x66 #x41 #x0F #x73 #xF8 #x04 #x66 #x0F #x73 #xFF
+    #x04 #x66 #x41 #x0F #x73 #xD9 #x0C #x66 #x0F #xEB #xDF #x66 #x41 #x0F #xEB #xF0
+    #x66 #x41 #x0F #xEB #xF1 #x66 #x0F #x6F #xFB #x66 #x44 #x0F #x6F #xC3 #x66 #x44
+    #x0F #x6F #xCB #x66 #x0F #x72 #xF7 #x1F #x66 #x41 #x0F #x72 #xF0 #x1E #x66 #x41
+    #x0F #x72 #xF1 #x19 #x66 #x41 #x0F #xEF #xF8 #x66 #x41 #x0F #xEF #xF9 #x66 #x44
+    #x0F #x6F #xC7 #x66 #x0F #x73 #xFF #x0C #x66 #x41 #x0F #x73 #xD8 #x04 #x66 #x0F
+    #xEF #xDF #x66 #x0F #x6F #xD3 #x66 #x0F #x6F #xE3 #x66 #x0F #x6F #xEB #x66 #x0F
+    #x72 #xD2 #x01 #x66 #x0F #x72 #xD4 #x02 #x66 #x0F #x72 #xD5 #x07 #x66 #x0F #xEF
+    #xD4 #x66 #x0F #xEF #xD5 #x66 #x41 #x0F #xEF #xD0 #x66 #x0F #xEF #xDA #x66 #x0F
+    #xEF #xF3 #x66 #x0F #x6F #xC6 #x48 #x83 #xC0 #x10 #x48 #x83 #xE9 #x10 #x0F #x85
+    #xEF #xFE #xFF #xFF #x66 #x41 #x0F #x38 #x00 #xC2 #xF3 #x0F #x7F #x46 #x10 #xF3
+    #x0F #x6F #x04 #x24 #xF3 #x0F #x6F #x4C #x24 #x10 #xF3 #x0F #x6F #x54 #x24 #x20
+    #xF3 #x0F #x6F #x5C #x24 #x30 #xF3 #x0F #x6F #x64 #x24 #x40 #xF3 #x0F #x6F #x6C
+    #x24 #x50 #xF3 #x0F #x6F #x74 #x24 #x60 #xF3 #x0F #x6F #x7C #x24 #x70 #xF3 #x44
+    #x0F #x6F #x84 #x24 #x80 #x00 #x00 #x00 #xF3 #x44 #x0F #x6F #x8C #x24 #x90 #x00
+    #x00 #x00 #xF3 #x44 #x0F #x6F #x94 #x24 #xA0 #x00 #x00 #x00 #x48 #x81 #xC4 #xB0
+    #x00 #x00 #x00 #x31 #xC0))
+(defparameter *x64-kernel-cpuid*
+  ;; 13 bytes, from mvm/x64-kernels/cpuid.s (scripts/x64-kernels.sh)
+  #(#x53 #xB8 #x01 #x00 #x00 #x00 #x31 #xC9 #x0F #xA2 #x89 #xC8 #x5B))
+
 (defun translate-instruction (state opcode operands mvm-next-pos)
   "Translate a single MVM instruction into x86-64 code.
    OPCODE is the numeric MVM opcode.
@@ -6241,6 +6304,9 @@
            (dolist (v (subseq operands 1 5)) (emit-load-vreg buf v 'rax) (emit-push buf 'rax))
            (emit-bytes buf #x59 #x5A #x58 #x5E)               ; pop rcx/rdx/rax/rsi: n val i src
            (cond
+             ((= kind 3) (emit-byte-vector buf *x64-kernel-aes-ctr*))
+             ((= kind 4) (emit-byte-vector buf *x64-kernel-ghash*))
+             ((= kind 5) (emit-byte-vector buf *x64-kernel-cpuid*))
              ((= kind 2)
               ;; each of the N word slots SRC[I..] (tagged fixnums): x >= VAL ? x - VAL : -1,
               ;; on tagged values (VAL stays tagged).  Fixnums only: no barrier.

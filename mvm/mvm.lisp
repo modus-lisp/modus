@@ -601,6 +601,9 @@
 ;; SRC[I..] equal the u32 VAL.  KIND 1: Vd := Adler-32's (B<<16)|A after the N bytes
 ;; of the u8 vector SRC[I..], from VAL = (B<<16)|A, A and B below 65521.  KIND 2:
 ;; each of the N fixnum word slots SRC[I..] := x >= VAL ? x - VAL : -1; Vd := 0.
+;; KINDS 3-5, hosted x86-64 only (mvm/x64-kernels/*.s): 3, AES counter mode (SRC = J0 ++
+;; round keys, I = in, VAL = out, N = BYTES<<4 | ROUNDS); 4, GHASH (SRC = H ++ Y ++ the
+;; byte-reversal mask, Y updated; I = data, N = bytes); 5, CPUID leaf 1's ECX.
 (defconstant +op-kernel+ #x96)    ; (kernel Vd Vsrc Vi Vval Vn kind)
 
 ;;; ============================================================

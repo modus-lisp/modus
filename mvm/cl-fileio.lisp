@@ -1360,6 +1360,23 @@
         (setf (svref vec k) (if (>= v off) (- v off) -1)))
       (setq k (+ k 1)))))
 
+(declaim (overridable %aes-ctr-xor))
+(defun %aes-ctr-xor (ks in out bytes rounds)
+  "AES counter mode in native code where this image has it: OUT[0,BYTES) := IN[0,BYTES) xor
+   the keystream from counter J0+1 (GCM's inc32), KS being J0's 16 bytes then the expanded
+   key (16*(ROUNDS+1) bytes), all octet vectors.  T when done; NIL -- here, and on a CPU
+   without AES-NI -- when the caller must do it itself."
+  (declare (ignore ks in out bytes rounds))
+  nil)
+
+(declaim (overridable %ghash-update))
+(defun %ghash-update (state data bytes)
+  "GCM's GHASH in native code where this image has it: STATE is the octet vector H[16]
+   Y[16] MASK[16] (MASK = 15 14 ... 0), and Y := GHASH_H(Y, DATA[0,BYTES)), BYTES a
+   multiple of 16.  T when done; NIL when the caller must do it itself."
+  (declare (ignore state data bytes))
+  nil)
+
 (declaim (overridable %adler32-update))
 (defun %adler32-update (data start end a b)
   "Adler-32's sums A and B advanced over the octets DATA[START,END) (a simple

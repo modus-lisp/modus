@@ -74,3 +74,41 @@
   (declare (fixnum off))
   (%kernel vec 0 off (length vec) 2)
   vec)
+
+;;; AES-GCM's two halves for seal (the DTLS records a WebRTC gateway sends): AES-NI counter
+;;; mode and PCLMULQDQ GHASH, KERNEL kinds 3 and 4 (mvm/x64-kernels/).  CPUID (kind 5) is
+;;; asked once; on a CPU without AES-NI, PCLMULQDQ, SSSE3 and SSE4.1 these answer NIL and
+;;; seal keeps its Lisp.  The kernels read and write raw memory, so the arguments' shapes
+;;; are checked here and a wrong one answers NIL rather than reaching them.
+
+(defvar *x64-aes-gcm-state* 0 "0: not asked yet; 1: the CPU has what kinds 3 and 4 need; 2: it does not.")
+
+(defun %x64-aes-gcm-p ()
+  (when (= *x64-aes-gcm-state* 0)
+    ;; ECX bits: PCLMULQDQ 1, SSSE3 9 (PSHUFB), SSE4.1 19 (PINSRD), AES-NI 25
+    (setq *x64-aes-gcm-state*
+          (if (= (logand (%kernel 0 0 0 0 5) #x2080202) #x2080202) 1 2)))
+  (= *x64-aes-gcm-state* 1))
+
+(defun modus.runtime::%aes-ctr-xor (ks in out bytes rounds)
+  "AES counter mode through AES-NI (KERNEL kind 3): see the portable default."
+  (when (and (%x64-aes-gcm-p)
+             (typep ks '(simple-array (unsigned-byte 8) (*)))
+             (typep in '(simple-array (unsigned-byte 8) (*)))
+             (typep out '(simple-array (unsigned-byte 8) (*)))
+             (typep bytes 'fixnum) (>= bytes 0)
+             (or (eql rounds 10) (eql rounds 12) (eql rounds 14))
+             (>= (length ks) (+ 32 (* 16 rounds)))
+             (<= bytes (length in)) (<= bytes (length out)))
+    (%kernel ks in out (logior (ash bytes 4) rounds) 3)
+    t))
+
+(defun modus.runtime::%ghash-update (state data bytes)
+  "GHASH through PCLMULQDQ (KERNEL kind 4): see the portable default."
+  (when (and (%x64-aes-gcm-p)
+             (typep state '(simple-array (unsigned-byte 8) (*)))
+             (typep data '(simple-array (unsigned-byte 8) (*)))
+             (typep bytes 'fixnum) (>= bytes 0) (= (logand bytes 15) 0)
+             (>= (length state) 48) (<= bytes (length data)))
+    (%kernel state data 0 bytes 4)
+    t))

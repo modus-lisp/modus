@@ -627,6 +627,11 @@
   "KERNEL's result: kind 0, how many of the N u32 lanes SRC[I..] equal VAL; kind 1,
    Adler-32's (B<<16)|A after the N bytes SRC[I..], from VAL = (B<<16)|A, reduced
    mod 65521 every 5552 bytes as the native arm does."
+  ;; Kinds 3 and 4 (AES-NI counter mode, PCLMULQDQ GHASH) exist only as x86-64 code.  Kind
+  ;; 5 (CPUID) answers 0 here -- no AES-NI -- so the runtime functions that ask it first
+  ;; never reach 3 or 4 through the interpreter.
+  (when (= kind 5) (return-from %interp-kernel 0))
+  (when (or (= kind 3) (= kind 4)) (error "KERNEL kind ~D is x86-64 native code only" kind))
   (when (= kind 2)
     (let ((k 0))
       (loop (when (>= k n) (return nil))

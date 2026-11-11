@@ -10580,13 +10580,15 @@
        ;; vector and DEST the index (the register shape %COMPILE-GLOBAL-READ-
        ;; CACHED uses: x64's AREF with the vector in DEST = RAX overwrote the
        ;; vector with the scaled index); the miss arm is the old site exactly.
+       ;; *STATIC-SYMBOL-ONE-CALL*: the site passes the slot index alone; the
+       ;; two hashes are looked up in a table generated with the index
+       ;; (%STATIC-SYMBOL-REF1 below), 8 bytes per symbol rather than two
+       ;; immediates per site.
        (if *static-symbol-one-call*
          (progn
            (emit-li-tagged +vreg-v0+ idx)
-           (emit-li-tagged +vreg-v1+ h)
-           (emit-li-tagged +vreg-v2+ ph)
-           (when *mvm-emit-halves* (emit-ir :set-nargs 3))
-           (emit-ir :call "%STATIC-SYMBOL-REF" 3)
+           (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+           (emit-ir :call "%STATIC-SYMBOL-REF1" 1)
            (unless (= dest +vreg-vr+)
              (emit-ir :mov dest +vreg-vr+)))
        (let ((miss (make-compiler-label)) (done (make-compiler-label))
@@ -32425,6 +32427,40 @@
                (ir (cdr result)))
           (when (and info ir)
             (setf all-ir (nconc all-ir (list (cons info ir))))))
+        ;; *STATIC-SYMBOL-ONE-CALL*: the one-argument entry and its table --
+        ;; slot I's name hash and package hash as 4 + 4 big-endian bytes of
+        ;; one string literal (pooled, so a byte a character on a narrow pool).
+        ;; Both hashes are 29 bits.
+        (when *static-symbol-one-call*
+          (let ((tab (make-string (max 256 (* 8 n)) :initial-element (code-char 0))))
+            (when *static-literal-index*
+              (maphash (lambda (key idx)
+                         (loop for v in (list (car key) (cdr key))
+                               for o from (* 8 idx) by 4
+                               do (loop for b from 0 below 4
+                                        do (setf (char tab (+ o b))
+                                                 (code-char (ldb (byte 8 (- 24 (* 8 b))) v))))))
+                       *static-literal-index*))
+            (dolist (form `((defun %static-symbol-u29 (s o)
+                              (+ (* (char-code (char s o)) 16777216)
+                                 (* (char-code (char s (+ o 1))) 65536)
+                                 (* (char-code (char s (+ o 2))) 256)
+                                 (char-code (char s (+ o 3)))))
+                            (defun %static-symbol-miss (idx)
+                              (let ((tab ,tab) (o (* idx 8)))
+                                (%static-symbol-fill idx (%static-symbol-u29 tab o)
+                                                     (%static-symbol-u29 tab (+ o 4)))))
+                            (defun %static-symbol-ref1 (idx)
+                              (let ((vec (mem-ref #x10000FB0 :u64)))
+                                (if (eql vec 0)
+                                    (%static-symbol-miss idx)
+                                    (let ((e (svref vec idx)))
+                                      (if (eql e 0) (%static-symbol-miss idx) (values e))))))))
+              (let* ((result (mvm-compile-toplevel form))
+                     (info (car result))
+                     (ir (cdr result)))
+                (when (and info ir)
+                  (setf all-ir (nconc all-ir (list (cons info ir)))))))))
         ;; The per-site entry: load the slot, fill it the first time.
         (let* ((result (mvm-compile-toplevel
                          `(defun %static-symbol-ref (idx h ph)

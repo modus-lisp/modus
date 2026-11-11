@@ -313,6 +313,11 @@
            (declare (ignore e))
            (make-array 0 :element-type '(unsigned-byte 8))))))))
 
+;;; A 32-bit target whose collector sizes #x13 as bytes (68k under
+;;; MODUS_NARROW_STRINGS) pools a narrow literal as bytes too: header, the
+;;; target's padding words (none on 68k), a byte per character.
+(defvar *pool-narrow-strings* nil)
+
 (defun build-constant-pool (module target)
   "Build the constant pool for the image.
    Lays out compound constants (currently: strings) as full heap objects
@@ -371,7 +376,8 @@
                        (tag (target-object-tag target))
                        (data-off (target-object-data-offset target))
                        (pad-words (1- (/ data-off word-size))))
-                  (if (and (= word-size 8) (= data-off 16)
+                  (if (and (or (and (= word-size 8) (= data-off 16))
+                               *pool-narrow-strings*)
                            (every (lambda (c) (< (char-code c) 256)) constant))
                       ;; NARROW (compiler.lisp +SUBTAG-BASE-STRING+): header
                       ;; (count << 8) | #x13, the pad word, then a BYTE per

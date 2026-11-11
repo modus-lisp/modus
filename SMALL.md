@@ -19,8 +19,8 @@ fixed program (a "thunk"): the floor for microcontrollers.
 
 | image | file | resident | heap floor |
 |---|---|---|---|
-| default 68k CLI (REPL) | 31.0 MB | -- | 7.5 MB |
-| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 13.4 MB | 12.2 MB | 5.75 MB |
+| default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
+| `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 12.5 MB | 12.0 MB | 5.75 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -39,7 +39,8 @@ All opt-in; unset, every image is built as before.  68k soft float:
 | switch | what it does |
 |---|---|
 | `MODUS_SMALL_IMAGE=1` | boot tables built from packed text (symbol names, function table, opcode table), global init batched through one guarded loop, no `ansi-test-aux`; on 68k turns on branch relaxation |
-| `MODUS_NARROW_STRINGS=1` | one byte a character for strings the reader and the name tables make (68k: the collector sizes `#x13` since `238b68e2`) |
+| `MODUS_NARROW_STRINGS=1` | one byte a character for strings the reader and the name tables make, and (68k) for pooled literals (the collector sizes `#x13` since `238b68e2`) |
+| `MODUS_68K_A5_GLOBALS=1` / `0` | A5 holds the globals base, so nargs / closure env / MV count are `(A5)` / `d16(A5)`; unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_68K_RELAX_BRANCHES=1` / `0` | each 68k branch as short as its distance allows (two translation passes); unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_NO_SOURCE_BLOB=1` | no embedded source (disk only on a hosted system) |
 | `MODUS_NO_COMPILER=1` | no compiler: the compiler-side files filtered to what the rest of the image reaches (`mvm/build-no-compiler.lisp`), entry points stubbed to signal; the toplevel runs a `%IMAGE-MAIN` baked in with `MODUS_EXTRA_SOURCE=FILE` |
@@ -50,7 +51,8 @@ All opt-in; unset, every image is built as before.  68k soft float:
 
 - **Size by function:** `MODUS_SYMMAP=FILE` writes address, size and name of
   every function.
-- **Size by MVM opcode:** `MODUS_68K_OP_STATS=1` prints native bytes per opcode.
+- **Size by MVM opcode:** `MODUS_68K_OP_STATS=1` prints native bytes per opcode,
+  and LI by destination and immediate class with the commonest immediates.
 - **Why something is kept:** `MODUS_IR_DCE_WHY=NAME,...` (lean builds) prints
   the call chain that kept each name.
 - **Resident memory:** qemu-user maps the guest 1:1, so the guest's pages are
@@ -76,9 +78,11 @@ All opt-in; unset, every image is built as before.  68k soft float:
   sequences (`0d1c4bc3`, `5860ef14`): default image 38.2 -> 31.0 MB.
   Under `MODUS_SMALL_IMAGE`: out-of-line cons / subtag / array-length /
   allocation sequences, a quoted symbol as one call, and a global read or
-  write as one call (`*GV-CACHE-MODE*` `:CALL`, no inline cache probe): the
-  REPL image's native code 13.7 -> 10.95 MB; the smoke program runs ~20%
-  slower.
+  write as one call (`*GV-CACHE-MODE*` `:CALL`, no inline cache probe), a
+  quoted symbol's site passing only its slot index (the hashes in a table),
+  the calling-convention slots through A5, and shifted-byte immediates as
+  MOVEQ + LSL: the REPL image's native code 13.7 -> 10.0 MB; the smoke
+  program runs ~20% slower.
 - **The compiler**, ~5.3 MB of native code, ~2.7 MB touched in a short session.
 - **Boot data built at boot.**  Packages, symbols, the name and function
   tables: most of the heap floor, held twice over by the copying collector.

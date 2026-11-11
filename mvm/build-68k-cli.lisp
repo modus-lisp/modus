@@ -179,7 +179,9 @@
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source*
-                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline))))
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)))
+  ;; ... and pooled literals are narrow too (cross.lisp *POOL-NARROW-STRINGS*).
+  (setq *pool-narrow-strings* t))
 
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
@@ -209,6 +211,18 @@
 ;; unset, it follows MODUS_SMALL_IMAGE.
 (let ((v (sb-ext:posix-getenv "MODUS_68K_SHARED")))
   (setf *68k-shared-sequences*
+        (cond ((null v) (and cl-user::*small-image* t))
+              ((string= v "0") nil)
+              (t t))))
+
+;; Small images: shifted-byte immediates as MOVEQ + LSL (translate-68k.lisp
+;; *68K-LI-SHIFT*).
+(setf *68k-li-shift* (and cl-user::*small-image* t))
+;; MODUS_68K_A5_GLOBALS: A5 holds the globals base, so the calling-convention
+;; slots are (A5) / d16(A5) (translate-68k.lisp *68K-A5-GLOBALS*).  1 = on,
+;; 0 = off; unset, it follows MODUS_SMALL_IMAGE.
+(let ((v (sb-ext:posix-getenv "MODUS_68K_A5_GLOBALS")))
+  (setf *68k-a5-globals*
         (cond ((null v) (and cl-user::*small-image* t))
               ((string= v "0") nil)
               (t t))))

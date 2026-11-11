@@ -629,27 +629,80 @@
 ;;; (outside the mapped TLBs), on m68k virt it is ordinary RAM.
 (defun m68k-mvcount-addr () modus.mvm::+mv-count-addr+)
 
+;;; A5 = THE HOSTED GLOBALS BASE (*68K-A5-GLOBALS*, MODUS_68K_A5_GLOBALS;
+;;; unset, it follows MODUS_SMALL_IMAGE).  A5 is otherwise unused outside the
+;;; collector, which saves and restores it.  With it on, the boot stub loads A5
+;;; once and the calling-convention slots (nargs, cenv, MV count) are reached as
+;;; (A5) / d16(A5): nargs before every call is MOVEQ + MOVE.L D0,(A5), 4 bytes
+;;; where it was 8.  A raw low-block address in A5 is not a heap pointer, so the
+;;; conservative register scan ignores it.
+(defvar *68k-a5-globals* nil)
+
+(defun m68k-a5-disp (addr)
+  "ADDR's displacement from A5 when A5 holds the globals base and it fits d16."
+  (and *68k-a5-globals* *68k-linux-mode*
+       (let ((d (- addr *68k-hosted-globals-base*)))
+         (and (<= -32768 d 32767) d))))
+
 (defun m68k-emit-store-absl (buf dn addr)
-  "MOVE.L Dn, (ADDR).L -- one instruction, 6 bytes, no address register."
-  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-special+ 1 +ea-mode-dn+ dn))
-  (m68k-emit-long buf addr))
+  "MOVE.L Dn, (ADDR).L -- one instruction, 6 bytes, no address register
+   (2 or 4 bytes through A5, see *68K-A5-GLOBALS*)."
+  (let ((d (m68k-a5-disp addr)))
+    (cond ((eql d 0) (m68k-emit-move-dn-an-ind buf dn +68k-a5+))
+          (d (m68k-emit-move-dn-disp buf dn +68k-a5+ d))
+          (t (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-special+ 1 +ea-mode-dn+ dn))
+             (m68k-emit-long buf addr)))))
+
+(defvar *68k-li-shift* nil
+  "Small images: an immediate that is a signed byte shifted left 1..8 (a
+   tagged fixnum up to 127, say) is MOVEQ + LSL.L, 4 bytes, not MOVE.L #, 6.")
+
+(defun m68k-imm-shifted-byte (s)
+  "(values BYTE COUNT) when S = BYTE << COUNT, BYTE a signed byte, COUNT 1..8."
+  (loop for k from 1 to 8
+        do (when (and (zerop (logand s (1- (ash 1 k))))
+                      (<= -128 (ash s (- k)) 127))
+             (return (values (ash s (- k)) k)))))
 
 (defun m68k-emit-imm-dn (buf imm32 dn)
-  "Dn = IMM32: MOVEQ (2 bytes) when it sign-extends from a byte, else MOVE.L."
+  "Dn = IMM32: MOVEQ (2 bytes) when it sign-extends from a byte, MOVEQ + LSL
+   (4) for a shifted byte under *68K-LI-SHIFT*, else MOVE.L (6)."
   (let ((s (if (>= imm32 #x80000000) (- imm32 #x100000000) imm32)))
     (if (<= -128 s 127)
         (m68k-emit-moveq buf dn (logand s #xFF))
-        (m68k-emit-move-imm-dn buf (logand imm32 #xFFFFFFFF) dn))))
+        (multiple-value-bind (b k) (and *68k-li-shift* (m68k-imm-shifted-byte s))
+          (if b
+              (progn (m68k-emit-moveq buf dn (logand b #xFF))
+                     (m68k-emit-lsl-imm buf dn k))
+              (m68k-emit-move-imm-dn buf (logand imm32 #xFFFFFFFF) dn))))))
+
+(defun m68k-emit-movea-word-imm (buf imm16 an)
+  "MOVEA.W #imm16, An -- sign-extended to 32 bits, 4 bytes"
+  (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-an+ an +ea-mode-special+ 4))
+  (m68k-emit-word buf (logand imm16 #xFFFF)))
+
+(defun m68k-emit-move-imm-disp (buf imm32 an disp)
+  "MOVE.L #imm32, d16(An) -- 8 bytes (source extension first, then d16)"
+  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-disp+ an +ea-mode-special+ 4))
+  (m68k-emit-long buf (logand imm32 #xFFFFFFFF))
+  (m68k-emit-word buf (logand disp #xFFFF)))
 
 (defun m68k-emit-store-abs (buf dn addr)
-  "Store data register DN to absolute ADDR (address parked in A1)."
-  (m68k-emit-move-imm-an buf addr +68k-a1+)
-  (m68k-emit-move-dn-an-ind buf dn +68k-a1+))
+  "Store data register DN to absolute ADDR (address parked in A1, or through
+   A5, see *68K-A5-GLOBALS*)."
+  (if (m68k-a5-disp addr)
+      (m68k-emit-store-absl buf dn addr)
+      (progn (m68k-emit-move-imm-an buf addr +68k-a1+)
+             (m68k-emit-move-dn-an-ind buf dn +68k-a1+))))
 
 (defun m68k-emit-load-abs (buf dn addr)
-  "Load from absolute ADDR into data register DN (address parked in A1)."
-  (m68k-emit-move-imm-an buf addr +68k-a1+)
-  (m68k-emit-move-an-ind-dn buf +68k-a1+ dn))
+  "Load from absolute ADDR into data register DN (address parked in A1, or
+   through A5, see *68K-A5-GLOBALS*)."
+  (let ((d (m68k-a5-disp addr)))
+    (cond ((eql d 0) (m68k-emit-move-an-ind-dn buf +68k-a5+ dn))
+          (d (m68k-emit-move-disp-dn buf +68k-a5+ d dn))
+          (t (m68k-emit-move-imm-an buf addr +68k-a1+)
+             (m68k-emit-move-an-ind-dn buf +68k-a1+ dn)))))
 
 (defun m68k-emit-lsl-imm (buf dn count)
   "LSL.L #count, Dn (logical shift left)"
@@ -1540,24 +1593,28 @@
          (let ((imm32 (logand imm #xFFFFFFFF))
                (pd (m68k-vreg-phys vd)))
            (cond
-             ;; Data register, small immediate
-             ((and pd (eq (m68k-reg-type pd) :data)
-                   (<= -128 (if (>= imm32 #x80000000) (- imm32 #x100000000) imm32) 127))
-              (m68k-emit-moveq buf (m68k-reg-number pd)
-                               (logand (if (>= imm32 #x80000000)
-                                           (- imm32 #x100000000)
-                                           imm32)
-                                       #xFF)))
-             ;; Data register, full immediate
+             ;; NIL is A4 (VN): one register move, 2 bytes (4 to a spill slot).
+             ((and (= imm32 +nil-value+) pd (eq (m68k-reg-type pd) :data))
+              (m68k-emit-move-an-dn buf +68k-a4+ (m68k-reg-number pd)))
+             ((and (= imm32 +nil-value+) pd (eq (m68k-reg-type pd) :address))
+              (m68k-emit-move-an-an buf +68k-a4+ (m68k-reg-number pd)))
+             ((= imm32 +nil-value+)
+              (m68k-emit-move-an-disp buf +68k-a4+ +68k-a6+ (m68k-spill-offset vd)))
+             ;; Data register: MOVEQ, (small images) MOVEQ + LSL, else MOVE.L #
              ((and pd (eq (m68k-reg-type pd) :data))
-              (m68k-emit-move-imm-dn buf imm32 (m68k-reg-number pd)))
-             ;; Address register
+              (m68k-emit-imm-dn buf imm32 (m68k-reg-number pd)))
+             ;; Address register: MOVEA.W # sign-extends, 4 bytes for a word
              ((and pd (eq (m68k-reg-type pd) :address))
-              (m68k-emit-move-imm-an buf imm32 (m68k-reg-number pd)))
-             ;; Spilled
+              (if (or (< imm32 #x8000) (>= imm32 #xFFFF8000))
+                  (m68k-emit-movea-word-imm buf (logand imm32 #xFFFF) (m68k-reg-number pd))
+                  (m68k-emit-move-imm-an buf imm32 (m68k-reg-number pd))))
+             ;; Spilled: a byte by MOVEQ through D0 (6 bytes), else
+             ;; MOVE.L #, d16(A6) (8 bytes; it was MOVE.L #,D0 + store, 10)
+             ((or (< imm32 128) (>= imm32 #xFFFFFF80))
+              (m68k-emit-moveq buf +68k-d0+ (logand imm32 #xFF))
+              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+ (m68k-spill-offset vd)))
              (t
-              (m68k-emit-move-imm-dn buf imm32 +68k-d0+)
-              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+ (m68k-spill-offset vd)))))))
+              (m68k-emit-move-imm-disp buf imm32 +68k-a6+ (m68k-spill-offset vd)))))))
 
       (#.+op-push+
        (let ((vs (first operands)))
@@ -3495,7 +3552,9 @@
          (len (length bc))
          (pc 0)
          (op-stats (and (sb-ext:posix-getenv "MODUS_68K_OP_STATS")
-                        (make-hash-table :test 'eql))))
+                        (make-hash-table :test 'eql)))
+         (li-stats (make-hash-table :test 'equal))
+         (li-imms (make-hash-table :test 'eql)))
 
     ;; First pass: scan for branch targets
     (loop while (< pc len)
@@ -3574,7 +3633,18 @@
                    (let ((e (or (gethash opcode op-stats)
                                 (setf (gethash opcode op-stats) (list 0 0 0)))))
                      (incf (first e)) (incf (second e) (- (m68k-buffer-position buf) at))
-                     (incf (third e) (- new-pc pc))))
+                     (incf (third e) (- new-pc pc)))
+                   (when (eql opcode +op-li+)
+                     (let* ((pd (m68k-vreg-phys (first operands)))
+                            (imm (logand (second operands) #xFFFFFFFF))
+                            (k (list (if pd (m68k-reg-type pd) :spill)
+                                     (cond ((= imm +nil-value+) :nil)
+                                           ((or (< imm 128) (>= imm #xFFFFFF80)) :byte)
+                                           ((or (< imm #x8000) (>= imm #xFFFF8000)) :word)
+                                           (t :long))))
+                            (e (or (gethash k li-stats) (setf (gethash k li-stats) (list 0 0)))))
+                       (incf (first e)) (incf (second e) (- (m68k-buffer-position buf) at))
+                       (incf (gethash imm li-imms 0)))))
                  (setf pc new-pc))))
 
     ;; MODUS_68K_OP_STATS: native bytes per MVM opcode, the largest first
@@ -3591,7 +3661,18 @@
           (let* ((info (gethash (first r) *opcode-table*))
                  (nm (if info (opcode-info-name info) (first r))))
             (format t ";;   ~10A ~8D ~10D ~5,1F% ~8,1F~%" nm (second r) (third r)
-                    (/ (* 100.0 (third r)) total) (/ (third r) (max 1 (second r))))))))
+                    (/ (* 100.0 (third r)) total) (/ (third r) (max 1 (second r))))))
+        ;; LI by destination (data / address register, spilled) and immediate
+        ;; (NIL, signed byte, signed word, long), then the commonest immediates.
+        (let ((lr nil) (ir nil))
+          (maphash (lambda (k e) (push (cons k e) lr)) li-stats)
+          (dolist (r (sort lr #'> :key #'third))
+            (format t ";;   LI ~8A ~6A ~8D ~10D~%" (first (car r)) (second (car r))
+                    (second r) (third r)))
+          (maphash (lambda (k n) (push (cons k n) ir)) li-imms)
+          (setq ir (sort ir #'> :key #'cdr))
+          (format t ";;   LI imms:~{ ~X:~D~}~%"
+                  (loop for (k . n) in (subseq ir 0 (min 24 (length ir))) append (list k n))))))
 
     (when *68k-gc-label*
       (m68k-emit-gc-collector buf))

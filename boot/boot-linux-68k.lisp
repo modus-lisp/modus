@@ -357,6 +357,10 @@
     (m68k-emit-move-dn-an buf +68k-d1+ +68k-a3+)          ; VL = mid - margin
     ;; VN = NIL = +NIL-VALUE+, not zero — see boot-linux-riscv.lisp.
     (m68k-emit-move-imm-an buf +nil-value+ +68k-a4+)
+    ;; A5 = the globals base, when the translator reaches them through it
+    ;; (translate-68k.lisp *68K-A5-GLOBALS*).  Nothing below uses A5.
+    (when *68k-a5-globals*
+      (m68k-emit-move-imm-an buf *68k-hosted-globals-base* +68k-a5+))
     ;; --- Cheney metadata, RAW addresses, at the heap-relative block, with
     ;;     mvm/compiler.lisp's +GC-OFF-*+ offsets
     (m68k-emit-move-imm-an buf (+ +linux-68k-heap-addr+ #x40) +68k-a0+)

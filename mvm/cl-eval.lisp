@@ -51,7 +51,35 @@
                  (cdr pair)))
       (setq cur (cdr cur)))))
 
+(defvar *native-sym-cache* nil
+  "%NATIVE-SYM-RESOLVE's answers, a 256-slot vector of (SYM . FN) by the
+   symbol's name hash, or NIL.  Any redefinition drops the whole vector
+   (%JIT-FNADDR-THUNK-INVALIDATE, which every DEFUN, (SETF FDEFINITION),
+   FMAKUNBOUND and runtime alias calls before it writes a table).  One cons
+   a slot, so a reader on another thread sees a whole entry or none.")
+
 (defun %native-sym-resolve (sym)
+  "%NATIVE-SYM-RESOLVE-1 through *NATIVE-SYM-CACHE*: (funcall 'f ...) and
+   (apply 'f ...) re-ran it on every call -- two hash lookups and the
+   symbol's package-qualified name, ~220 ns against 4 for #'F.  Filled on
+   the main thread only: a worker's cons lives in its own region."
+  (let* ((c *native-sym-cache*)
+         (h (aref sym 0))
+         (i (and (integerp h) (logand h 255)))
+         (e (and c i (svref c i))))
+    (if (and (consp e) (eq (car e) sym))
+        (cdr e)
+        (let ((fn (%native-sym-resolve-1 sym)))
+          ;; a direct call: (funcall '%mvm-on-main-thread-p) would come back
+          ;; here, and recurse until the stack ran out
+          (when (and i (functionp fn) (%mvm-on-main-thread-p))
+            (unless c
+              (setq c (make-array 256 :initial-element nil))
+              (setq *native-sym-cache* c))
+            (setf (svref c i) (cons sym fn)))
+          fn))))
+
+(defun %native-sym-resolve-1 (sym)
   "Given a symbol (native MVM or CL — both have hash at slot 0), return
    its function value.  On miss, returns SYM itself so the caller's
    downstream dispatch falls through to direct-call (= same path that

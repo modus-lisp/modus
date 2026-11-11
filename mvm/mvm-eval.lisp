@@ -1543,6 +1543,7 @@
    another slide could not correct where the pages are read-only (iOS)."
   (dolist (h *jit-fnaddr-thunks*)
     (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))
+  (setq *native-sym-cache* nil)              ; resolved again after a restore
   nil)
 
 (defun %jit-after-relocate (l0 l1 d)
@@ -1841,6 +1842,7 @@
    Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
   (%kernel-redirect-hook name)
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
+  (setq *native-sym-cache* nil)              ; (funcall 'NAME ...) re-resolves
   ;; Only while this process can write code, as the fill above is: a restored iOS
   ;; snapshot's thunks are read-only pages, and their cache slots were emptied before
   ;; the save (%JIT-BEFORE-SAVE), so there is nothing to clear and the store would fault.

@@ -15592,7 +15592,53 @@
 ;;; Flet / Labels
 ;;; ============================================================
 
-(defun %flet-rewrite-calls (form local-names cell-names)
+;;; Operator names that a FLET / LABELS / MACROLET INSIDE the form being
+;;; rewritten binds: %FLET-REWRITE-CALLS must not expand a call to one of them
+;;; through the macro table, because there it names the inner binding, not
+;;; whatever macro the table holds under that name.  (Shadowing more than CL
+;;; would -- a FLET's names over its own definitions too -- only means such a
+;;; call is left unexpanded, as it always was.)
+(defvar *flet-rewrite-shadowed* nil)
+
+(defun %tree-mentions-name-p (tree names)
+  "Some symbol in TREE (conses walked, dotted tails included) is NAME-EQUAL to one of NAMES."
+  (cond
+    ((symbolp tree) (and tree (member tree names :test #'name-equal) t))
+    ((consp tree)
+     (let ((rest tree))
+       (loop while (consp rest) do
+         (when (%tree-mentions-name-p (car rest) names)
+           (return-from %tree-mentions-name-p t))
+         (setq rest (cdr rest)))
+       (%tree-mentions-name-p rest names)))
+    (t nil)))
+
+(defun %flet-rewrite-expansion (form local-names)
+  "FORM's one-level macro expansion when it can PRODUCE a reference to one of
+   LOCAL-NAMES, else NIL.  The capture-aware FLET/LABELS transform rewrites
+   references textually, before the compiler expands macros, so a reference
+   that exists only in an expansion -- chipz's (TRANSITION-TO ZLIB-FLAGS) =>
+   (SETF ... #'ZLIB-FLAGS) inside its LABELS -- was never retargeted at its
+   cell and compiled as a call to an undefined global function.  The expansion
+   is the compiler's own (the same table, so an enclosing MACROLET's expanders
+   are installed); an expander that fails here leaves the form as it was, as
+   in COLLECT-SETQ-VARS-IN-BODY."
+  (when (and local-names (consp form) (symbolp (car form)) (car form)
+             (not (member (car form) *flet-rewrite-shadowed* :test #'name-equal)))
+    (let ((x (handler-case (%macroexpand-1-mvm-raw form)
+               (error () nil))))
+      (when (and (consp x) (cdr x) (not (eq (car x) form))
+                 (%tree-mentions-name-p (car x) local-names))
+        (car x)))))
+
+(defun %flet-rewrite-calls-shadowing (names form local-names cell-names)
+  "%FLET-REWRITE-CALLS of FORM (a MACROLET, FLET or LABELS) with NAMES shadowed."
+  (let ((saved *flet-rewrite-shadowed*))
+    (setq *flet-rewrite-shadowed* (append names saved))
+    (unwind-protect (%flet-rewrite-calls form local-names cell-names t)
+      (setq *flet-rewrite-shadowed* saved))))
+
+(defun %flet-rewrite-calls (form local-names cell-names &optional shadowing-done)
   "Walk FORM, replacing every call (NAME args…) where NAME is in LOCAL-NAMES
    with (FUNCALL (CAR CELL-NAME) args…), and every (FUNCTION NAME) with
    (CAR CELL-NAME).  LOCAL-NAMES and CELL-NAMES are parallel lists.
@@ -15618,6 +15664,13 @@
          ;; over a capturing FLET).  So each expander also passes its RESULT
          ;; through this rewrite, at expansion time.  Names the macrolet
          ;; itself binds shadow the local functions in its body.
+         ((and (not shadowing-done) (consp (cdr form)) (listp (cadr form))
+               (or (and (symbolp op)
+                        (member (symbol-name op) '("MACROLET" "FLET" "LABELS") :test #'string=))
+                   (and (integerp op) (or (= op 445617652) (= op 417505106)))))  ; FLET LABELS
+          (%flet-rewrite-calls-shadowing
+           (mapcar (lambda (d) (if (consp d) (car d) nil)) (cadr form))
+           form local-names cell-names))
          ((and (symbolp op) (string= (symbol-name op) "MACROLET")
                (consp (cdr form)) (listp (cadr form)))
           (let* ((mnames (mapcar (lambda (d) (if (consp d) (car d) nil)) (cadr form)))
@@ -15747,6 +15800,42 @@
                       ,@(mapcar (lambda (f)
                                   (%flet-rewrite-calls f local-names cell-names))
                                 (cdr form)))))
+         ;; Binding forms: a variable binding (NAME INIT) is not a call, even
+         ;; when NAME is also a local function's name -- chipz's LENGTH-CODE
+         ;; state binds a variable LENGTH-CODE, and the general case below
+         ;; rewrote the binding into (FUNCALL (CAR cell) INIT), so the variable
+         ;; was never bound.  Variables do not shadow functions, so LOCAL-NAMES
+         ;; is unchanged inside; only init and value forms are rewritten.
+         ((and (symbolp op)
+               (member (symbol-name op) '("LET" "LET*" "SYMBOL-MACROLET") :test #'string=)
+               (consp (cdr form)) (listp (cadr form)))
+          `(,op ,(mapcar (lambda (b)
+                           (if (and (consp b) (consp (cdr b)))
+                               `(,(car b) ,(%flet-rewrite-calls (cadr b) local-names cell-names)
+                                 ,@(cddr b))
+                               b))
+                         (cadr form))
+                ,@(mapcar (lambda (f) (%flet-rewrite-calls f local-names cell-names))
+                          (cddr form))))
+         ((and (symbolp op)
+               (member (symbol-name op) '("MULTIPLE-VALUE-BIND" "DESTRUCTURING-BIND")
+                       :test #'string=)
+               (consp (cdr form)) (consp (cddr form))
+               ;; a lambda list's default forms can call a local: leave those
+               ;; to the macro expansion below
+               (not (and (consp (cadr form))
+                         (loop for e on (cadr form)
+                               thereis (and (consp (car e))
+                                            (%tree-mentions-name-p (car e) local-names))))))
+          `(,op ,(cadr form)
+                ,@(mapcar (lambda (f) (%flet-rewrite-calls f local-names cell-names))
+                          (cddr form))))
+         ;; A macro call whose EXPANSION can reference a local name: rewrite
+         ;; the expansion (see %FLET-REWRITE-EXPANSION).
+         ((let ((x (%flet-rewrite-expansion form local-names)))
+            (when x
+              (return-from %flet-rewrite-calls
+                (%flet-rewrite-calls x local-names cell-names)))))
          ;; General case: walk operator (compound) and arguments.
          ;; IMPROPER-LIST SAFE: preserve a dotted tail (a LOOP destructuring
          ;; binder like `(o . a)` inside a not-yet-expanded LOOP form) —

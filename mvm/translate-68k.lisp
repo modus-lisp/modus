@@ -2132,7 +2132,8 @@
          (m68k-emit-subi buf +68k-d0+ +tag-cons+)
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-load-vreg buf +68k-d1+ vs)
-         (m68k-emit-move-dn-an-ind buf +68k-d1+ +68k-a0+)))
+         (m68k-emit-move-dn-an-ind buf +68k-d1+ +68k-a0+)
+         (when *68k-barrier-label* (m68k-emit-bsr buf *68k-barrier-label*))))
 
       (#.+op-setcdr+
        (let ((vd (first operands))
@@ -2141,7 +2142,8 @@
          (m68k-emit-subi buf +68k-d0+ +tag-cons+)
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-load-vreg buf +68k-d1+ vs)
-         (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 4)))
+         (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 4)
+         (when *68k-barrier-label* (m68k-emit-bsr buf *68k-barrier-label*))))
 
       (#.+op-consp+
        (let ((vd (first operands))
@@ -2304,7 +2306,10 @@
                      (m68k-emit-subi buf +68k-d0+ +tag-object+)
                      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
                      (m68k-load-vreg buf +68k-d1+ vs)
-                     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ (* (1+ idx) 4))))))))
+                     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ (* (1+ idx) 4))))
+               (when *68k-barrier-label*
+                 (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+)
+                 (m68k-emit-bsr buf *68k-barrier-label*))))))
 
       (#.+op-obj-tag+
        (let ((vd (first operands))
@@ -2819,7 +2824,10 @@
          (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ (- 4 +tag-object+))))
+         (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ (- 4 +tag-object+))
+         (when *68k-barrier-label*
+           (m68k-emit-move-dn-dn buf +68k-d1+ +68k-d0+)
+           (m68k-emit-bsr buf *68k-barrier-label*))))
 
       (#.+op-array-len+
        ;; count = (header >> 8) & 0xFFFFFF, returned TAGGED.
@@ -3050,6 +3058,18 @@
    +4/+8 the static objects [lo, hi), +C/+10 the static conses [lo, hi).
    Below the heap, so the low-block root scan reads them: raw 16-aligned
    addresses, which carry no pointer tag.")
+
+(defconstant +68k-card-marks+ #x10006100
+  "One byte per static card (non-zero: an object starting in it was written
+   since the collection that last scanned it), up to #x10007F00: 7,680 cards.")
+(defconstant +68k-card-max+ 7680)
+(defconstant +68k-card-crossing+ #x1001E000
+  "One byte per static card: where its first object starts, in 16-byte
+   granules from the card's start (255: none).  The 8 KB below the heap.")
+(defvar *68k-barrier-label* nil
+  "While translating a static-heap image: the shared write barrier.  D0 = the
+   object (or cons) just stored into; marks its card when it is static.
+   Clobbers D0, D1, A0.")
 
 (defconstant +68k-gc-heap-start+ #x10020000
   "Where the first semispace starts (boot-linux-68k's heap + alloc-start).")
@@ -3410,6 +3430,165 @@
   "Objects whose payload holds no pointers: copied, never scanned.  ARM32's
    list, plus #x13: a narrow string's payload is bytes.")
 
+(defun m68k-emit-barrier-helper (buf)
+  "The write barrier: D0 = an object or cons just stored into.  When it lies
+   in the static span [lo, lo + span) its card's mark is set.  Before the
+   freeze (and when the span was too big for the mark table) span is 0 and
+   nothing is marked; the collector then walks the whole static heap."
+  (let ((out (mvm-make-label)) (blk +68k-gc-static-block+))
+    (m68k-emit-label buf *68k-barrier-label*)
+    (m68k-emit-word buf #x90B9) (m68k-emit-long buf (+ blk #x18))   ; SUB.L lo,D0
+    (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ blk #x1C))   ; CMP.L span,D0
+    (m68k-emit-bcc-word buf +68k-cc-cc+ out)                         ; outside the span
+    (m68k-emit-word buf #x2239) (m68k-emit-long buf (+ blk #x20))   ; MOVE.L shift,D1
+    (m68k-emit-word buf #xE2A8)                                     ; LSR.L D1,D0
+    (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)           ; 6 bytes
+    (m68k-emit-word buf #x50F0) (m68k-emit-word buf #x0800)         ; ST (0,A0,D0.L)
+    (m68k-emit-label buf out)
+    (m68k-emit-rts buf)))
+
+(defun m68k-emit-gc-card-walk (buf scan)
+  "Collector, static-heap images whose span has cards: scan only the marked
+   cards.  An object card scans every object STARTING in it (its first from the
+   crossing table), a cons card its conses.  A scanned card is cleared, and
+   marked again when a slot still points into to-space afterwards, so a static
+   object keeps being scanned while it refers to the young space.  Uses D7
+   (card), A5 (cursor), A4, D3, D1, D0 and the scratch longword at blk+#x24."
+  (let* ((blk +68k-gc-static-block+)
+         (cl (mvm-make-label)) (cdone (mvm-make-label)) (cnext (mvm-make-label))
+         (conses (mvm-make-label)) (olp (mvm-make-label)) (odone (mvm-make-label))
+         (sl (mvm-make-label)) (leaf (mvm-make-label)) (keep (mvm-make-label))
+         (cpl (mvm-make-label)) (aftercard (mvm-make-label)))
+    (flet ((here (l) (m68k-emit-label buf l))
+           (abs-dn (addr dn)                                   ; MOVE.L (addr).L,Dn
+             (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-dn+ dn 7 1))
+             (m68k-emit-long buf addr))
+           (young-check (slot-an)
+             ;; flag |= (to_start <= (slot) < to_start + size)
+             (let ((no (mvm-make-label)))
+               (m68k-emit-move-an-ind-dn buf slot-an +68k-d0+)
+               (m68k-emit-move-imm-an buf +68k-gc-meta+ +68k-a0+)
+               (m68k-emit-move-disp-dn buf +68k-a0+ #x08 +68k-d1+)   ; to_start
+               (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d0+)           ; v - to_start
+               (m68k-emit-move-disp-dn buf +68k-a0+ #x10 +68k-d1+)   ; size
+               (m68k-emit-cmp-dn-dn buf +68k-d1+ +68k-d0+)
+               (m68k-emit-bcc-word buf +68k-cc-cc+ no)               ; unsigned >= size
+               (m68k-emit-move-imm-an buf (+ blk #x24) +68k-a0+)
+               (m68k-emit-moveq buf +68k-d0+ 1)
+               (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+               (m68k-emit-label buf no))))
+      (m68k-emit-moveq buf +68k-d7+ 0)
+      (here cl)
+      ;; ncards = span >> shift
+      (abs-dn (+ blk #x1C) +68k-d0+)
+      (abs-dn (+ blk #x20) +68k-d1+)
+      (m68k-emit-word buf #xE2A8)                           ; LSR.L D1,D0
+      (m68k-emit-cmp-dn-dn buf +68k-d0+ +68k-d7+)            ; card - ncards
+      (m68k-emit-bcc-word buf +68k-cc-cc+ cdone)
+      (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)
+      (m68k-emit-word buf #x4A30) (m68k-emit-word buf #x7800) ; TST.B (0,A0,D7.L)
+      (m68k-emit-beq buf cnext)
+      (m68k-emit-word buf #x4230) (m68k-emit-word buf #x7800) ; CLR.B (0,A0,D7.L)
+      (m68k-emit-move-imm-an buf (+ blk #x24) +68k-a0+)
+      (m68k-emit-moveq buf +68k-d0+ 0)
+      (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)       ; flag = 0
+      ;; A5 = card start = lo + (card << shift);  A4 = card end
+      (abs-dn (+ blk #x20) +68k-d1+)
+      (m68k-emit-move-dn-dn buf +68k-d7+ +68k-d0+)
+      (m68k-emit-word buf #xE3A8)                           ; LSL.L D1,D0
+      (abs-dn (+ blk #x18) +68k-d3+)
+      (m68k-emit-add-dn-dn buf +68k-d3+ +68k-d0+)
+      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a5+)
+      (m68k-emit-moveq buf +68k-d3+ 1)
+      (m68k-emit-word buf #xE3AB)                           ; LSL.L D1,D3
+      (m68k-emit-add-dn-dn buf +68k-d3+ +68k-d0+)
+      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a4+)           ; card end
+      ;; an object card when its start is below the static objects' end
+      (abs-dn (+ blk 8) +68k-d0+)
+      (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                 ; A5 - ohi
+      (m68k-emit-bcc-word buf +68k-cc-cc+ conses)
+      ;; A5 += crossing[card] * 16 (255: nothing starts here)
+      (m68k-emit-move-imm-an buf +68k-card-crossing+ +68k-a0+)
+      (m68k-emit-moveq buf +68k-d0+ 0)
+      (m68k-emit-word buf #x1030) (m68k-emit-word buf #x7800) ; MOVE.B (0,A0,D7.L),D0
+      (m68k-emit-cmpi buf +68k-d0+ 255)
+      (m68k-emit-beq buf aftercard)
+      (m68k-emit-lsl-imm buf +68k-d0+ 4)
+      (m68k-emit-word buf #xDBC0)                           ; ADDA.L D0,A5
+      ;; objects starting in [A5, card end), and below ohi
+      (here olp)
+      (m68k-emit-cmpa-an buf +68k-a4+ +68k-a5+)              ; A5 - card end
+      (m68k-emit-bcc-word buf +68k-cc-cc+ aftercard)
+      (abs-dn (+ blk 8) +68k-d0+)
+      (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                 ; A5 - ohi
+      (m68k-emit-bcc-word buf +68k-cc-cc+ aftercard)
+      (m68k-emit-move-an-ind-dn buf +68k-a5+ +68k-d3+)       ; header
+      (m68k-emit-object-size buf +68k-d0+ +68k-d3+)
+      ;; the object's end, kept on the stack across its slots
+      (m68k-emit-move-an-dn buf +68k-a5+ +68k-d1+)
+      (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
+      (m68k-emit-word buf #x2F01)                           ; MOVE.L D1,-(SP)
+      (m68k-emit-move-an-an buf +68k-a4+ +68k-a0+)
+      (m68k-emit-word buf #x2F08)                           ; MOVE.L A0,-(SP): card end
+      (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+      (m68k-emit-andi buf +68k-d1+ #xFF)
+      (dolist (st *68k-gc-leaf-subtags*)
+        (m68k-emit-cmpi buf +68k-d1+ st)
+        (m68k-emit-beq buf leaf))
+      (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+      (m68k-emit-lsr-imm buf +68k-d1+ 8)
+      (m68k-emit-lsl-imm buf +68k-d1+ 2)
+      (m68k-emit-addq buf +68k-d1+ 4)
+      (m68k-emit-move-an-dn buf +68k-a5+ +68k-d0+)
+      (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d1+)
+      (m68k-emit-move-dn-an buf +68k-d1+ +68k-a4+)           ; A4 = slot end
+      (m68k-emit-addq-an buf +68k-a5+ 4)
+      (here sl)
+      (m68k-emit-cmpa-an buf +68k-a4+ +68k-a5+)
+      (m68k-emit-bcc-word buf +68k-cc-cc+ leaf)
+      (m68k-emit-move-an-an buf +68k-a5+ +68k-a0+)
+      (m68k-emit-bsr buf scan)
+      (young-check +68k-a5+)
+      (m68k-emit-addq-an buf +68k-a5+ 4)
+      (m68k-emit-bra buf sl)
+      (here leaf)
+      (m68k-emit-word buf #x285F)                           ; MOVEA.L (SP)+,A4: card end
+      (m68k-emit-word buf #x2A5F)                           ; MOVEA.L (SP)+,A5: next object
+      (m68k-emit-bra buf olp)
+      ;; a cons card: the conses in [max(start, clo), min(end, chi))
+      (here conses)
+      (abs-dn (+ blk 12) +68k-d0+)
+      (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                 ; A5 - clo
+      (m68k-emit-bcc-word buf +68k-cc-cc+ cpl)
+      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a5+)
+      (here cpl)
+      (m68k-emit-cmpa-an buf +68k-a4+ +68k-a5+)
+      (m68k-emit-bcc-word buf +68k-cc-cc+ aftercard)
+      (abs-dn (+ blk 16) +68k-d0+)
+      (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                 ; A5 - chi
+      (m68k-emit-bcc-word buf +68k-cc-cc+ aftercard)
+      (m68k-emit-move-an-an buf +68k-a5+ +68k-a0+)
+      (m68k-emit-bsr buf scan)
+      (young-check +68k-a5+)
+      (m68k-emit-lea-disp buf +68k-a5+ 4 +68k-a0+)
+      (m68k-emit-bsr buf scan)
+      (m68k-emit-lea-disp buf +68k-a5+ 4 +68k-a1+)
+      (young-check +68k-a1+)
+      (m68k-emit-lea-disp buf +68k-a5+ 16 +68k-a5+)
+      (m68k-emit-bra buf cpl)
+      ;; re-mark the card if it still refers to the young space
+      (here aftercard)
+      (m68k-emit-move-imm-an buf (+ blk #x24) +68k-a0+)
+      (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
+      (m68k-emit-tst buf +68k-d0+)
+      (m68k-emit-beq buf cnext)
+      (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)
+      (m68k-emit-word buf #x50F0) (m68k-emit-word buf #x7800) ; ST (0,A0,D7.L)
+      (here cnext)
+      (m68k-emit-addq buf +68k-d7+ 1)
+      (m68k-emit-bra buf cl)
+      (here cdone))))
+
 (defun m68k-emit-gc-static-walk (buf scan)
   "Collector: scan every slot of the static objects [+4, +8) -- leaf payloads
    skipped, as the Cheney object scan does -- and the car and cdr of every
@@ -3565,7 +3744,16 @@
       (root-range)
       ;; ---- the static ranges, typed (empty until a freeze) ----
       (when *68k-gc-static*
-        (m68k-emit-gc-static-walk buf scan))
+        (let ((full (mvm-make-label)) (done (mvm-make-label)))
+          (m68k-emit-move-imm-an buf (+ +68k-gc-static-block+ #x1C) +68k-a0+)
+          (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
+          (m68k-emit-tst buf +68k-d0+)
+          (m68k-emit-beq buf full)
+          (m68k-emit-gc-card-walk buf scan)
+          (m68k-emit-bra buf done)
+          (m68k-emit-label buf full)
+          (m68k-emit-gc-static-walk buf scan)
+          (m68k-emit-label buf done)))
       ;; ---- Cheney: A5 = object scan (up), A6 = cons scan (down) ----
       (m68k-emit-move-imm-an buf meta +68k-a1+)
       (m68k-emit-move-disp-an buf +68k-a1+ #x08 +68k-a5+)          ; to_start
@@ -3860,6 +4048,7 @@
          (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-car-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-barrier-label* (and *68k-gc-static* *68k-linux-mode* (mvm-make-label)))
          (*68k-cdr-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-alloc-obj-label* (and *68k-shared-sequences* (mvm-make-label)))
@@ -4043,6 +4232,8 @@
       (m68k-emit-subtag-helper buf))
     (when *68k-car-label*
       (m68k-emit-car-cdr-helpers buf))
+    (when *68k-barrier-label*
+      (m68k-emit-barrier-helper buf))
     (when *68k-cold-fns*
       (m68k-emit-thread-dispatch buf function-table))
     (when *68k-array-len-label*

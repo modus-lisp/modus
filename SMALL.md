@@ -22,7 +22,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
 | `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.2 MB | 5.75 MB |
 | `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` + `MODUS_HOT_ORDER` (REPL) | 5.5 MB | 5.6 MB | 5.75 MB |
-| `+ MODUS_68K_CORE` (REPL booting from its saved core, 1 MB young heap) | 7.8 MB | dirty 0.4 MB; a command touches 1.0 MB code + 2.4 MB heap | 1 MB |
+| `+ MODUS_68K_CORE` (REPL booting from its saved core, 1 MB young heap) | 7.8 MB | dirty 0.4 MB; a command touches 1.0 MB code + 1.3 MB heap | 1 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -149,9 +149,13 @@ All opt-in; unset, every image is built as before.  68k soft float:
    only the young semispaces (`--dynamic-space-size` is their total, min 512
    KB), and KERNEL-MAIN's core hook skips boot init.  Dirty memory at the
    prompt ~0.3 MB (was 2.4); boot 0.1 s (was 12); the smoke program 0.4 s.
-   What is left: every collection walks the whole 2 MB static heap, so it is
-   all in a command's working set (and collections at a 1 MB heap are slow):
-   a card-marking barrier, so a collection scans only written static cards.
+   Every collection walked the whole 2 MB static heap, so all of it was in a
+   command's working set: now a CARD BARRIER marks the static card holding an
+   object's start after each SETCAR / SETCDR / OBJ-SET / ASET (two
+   instructions and a shared helper; threaded code pays it per handler), and
+   a collection scans only marked cards, re-marking those that still refer
+   to the young space.  A command's heap working set 2.4 -> 1.3 MB, most of
+   it the young space itself.
    The core image still carries boot's init code and tables: disk, not RAM.
    **A static boot heap.**  First half done (`MODUS_68K_GC_STATIC`): after
    boot the collector freezes what it copied -- 1.56 MB of objects, 0.51 MB of

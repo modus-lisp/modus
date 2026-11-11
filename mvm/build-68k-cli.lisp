@@ -208,7 +208,41 @@
   (let ((before (mem-ref #x10000060 :u32)) (junk nil))
     (loop
       (unless (eql (mem-ref #x10000060 :u32) before) (return nil))
-      (setq junk (make-list 32)))))
+      (setq junk (make-list 32))))
+  (%gc-cards-init))
+
+(defun %gc-cards-init ()
+  \"The static heap's CARDS (translate-68k.lisp M68K-EMIT-GC-CARD-WALK): the
+   smallest card (512 bytes up, at most 2 KB) that fits the span in the mark
+   table at #x10006100, the crossing table at #x1001E000 -- each card's first
+   object start, in 16-byte granules -- and, LAST, the span, which arms the
+   barrier and the card walk.  Reads headers a byte at a time: no bignum.\"
+  (let* ((olo (mem-ref #x10006004 :u32)) (ohi (mem-ref #x10006008 :u32))
+         (chi (mem-ref #x10006010 :u32))
+         (lo (logand olo -512))
+         (shift 9) (ncards 0) (a olo))
+    (loop
+      (setq ncards (ash (+ (- chi lo) (ash 1 shift) -1) (- shift)))
+      (when (or (<= ncards 7680) (>= shift 11)) (return nil))
+      (setq shift (+ shift 1)))
+    (when (<= ncards 7680)
+      (dotimes (i ncards)
+        (setf (mem-ref (+ #x1001E000 i) :u8) 255)
+        (setf (mem-ref (+ #x10006100 i) :u8) 0))
+      (loop
+        (when (>= a ohi) (return nil))
+        (let* ((st (mem-ref (+ a 3) :u8))
+               (n (+ (* (mem-ref a :u8) 65536) (* (mem-ref (+ a 1) :u8) 256)
+                     (mem-ref (+ a 2) :u8)))
+               (size (logand (+ (if (or (= st 17) (= st 19)) (+ n 4) (* (+ n 1) 4)) 15) -16))
+               (c (ash (- a lo) (- shift))))
+          (when (= (mem-ref (+ #x1001E000 c) :u8) 255)
+            (setf (mem-ref (+ #x1001E000 c) :u8)
+                  (ash (- (- a lo) (ash c shift)) -4)))
+          (setq a (+ a size))))
+      (setf (mem-ref #x10006018 :u32) lo)
+      (setf (mem-ref #x10006020 :u32) shift)
+      (setf (mem-ref #x1000601C :u32) (ash ncards shift)))))
 
 ;; A SAVED CORE (scripts/68k-core-link.py): the low block and the static heap,
 ;; mapped by the ELF itself.  #x10006014 is non-zero only in a core, so boot

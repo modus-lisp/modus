@@ -4074,6 +4074,17 @@
    array type a MAKE-ARRAY call provably returns (%MAKE-ARRAY-DTYPE)."
   (cond ((symbolp form) (%var-dtype form env))
         ((%make-array-dtype form env))
+        ;; (THE TYPE x) promises TYPE exactly as a declaration does, and is
+        ;; trusted the same way: cram's (aref (the (simple-array (unsigned-byte
+        ;; 16) (*)) (huff-fast h)) i) once per decoded symbol went the whole
+        ;; generic %AREF-SLOW chain while the declared spelling took one load.
+        ;; Runtime compile only, so image code is unchanged.
+        ((and *mvm-eval-runtime-p* (consp form) (symbolp (car form))
+              (name-eq (car form) "THE") (consp (cdr form)) (consp (cddr form))
+              (null (cdddr form))
+              (not (and (consp (cadr form)) (symbolp (car (cadr form)))
+                        (name-eq (car (cadr form)) "VALUES"))))
+         (%resolve-declared-type (cadr form)))
         ((and (consp form) (symbolp (car form)) (consp (cdr form)) (null (cddr form))
               (symbolp (cadr form)))
          ;; The RESULT of an accessor call has the slot's declared type
@@ -26611,9 +26622,15 @@
        (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
        (consp (cdr ty))
        (let ((et (cadr ty)))
-         (and (consp et) (symbolp (car et)) (consp (cdr et)) (null (cddr et))
-              (string= (symbol-name (car et)) "UNSIGNED-BYTE")
-              (eql (cadr et) 32)))))
+         (or (and (consp et) (symbolp (car et)) (consp (cdr et)) (null (cddr et))
+                  (string= (symbol-name (car et)) "UNSIGNED-BYTE")
+                  (eql (cadr et) 32))
+             ;; Any element type the runtime UPGRADES to the #x17 vector --
+             ;; (unsigned-byte 16), cram's Huffman fast table, read 1 time per
+             ;; symbol through %AREF-SLOW's whole type chain.  Asked of the
+             ;; runtime's own rule, so a declaration and MAKE-ARRAY cannot
+             ;; disagree; a runtime compile only (the host has no such rule).
+             (and *mvm-eval-runtime-p* (%u32-element-type-p et))))))
 
 (defun %declared-u32-array-var-p (form env)
   (and form (symbolp form) (%u32-simple-array-decl-p (%expr-dtype form env))))
@@ -27934,6 +27951,22 @@
           nil)
         (compile-aref-1 arr-form idx-form env dest))))
 
+(defun %typed-array-form-dtype (arr-form env)
+  "The declared array type of ARR-FORM when it is not a variable but its type
+   is known -- a typed struct slot read, (THE TYPE x) -- and that type takes one
+   of COMPILE-AREF / COMPILE-ASET's typed paths.  Those paths test a VARIABLE's
+   declaration, so (aref (bitr-data br) p) -- cram's per-byte input read --
+   went generic (%AREF-SLOW's whole chain) while the same array in a declared
+   variable took one load.  The caller binds the form to a declared variable.
+   Runtime compile only: image code is unchanged."
+  (when (and *mvm-eval-runtime-p* (consp arr-form)
+             (%cg-on-p (quote *cg-typed-array-forms*)))
+    (let ((ty (%expr-dtype arr-form env)))
+      (and ty
+           (or (%u8-simple-array-decl-p ty) (%f32-simple-array-decl-p ty)
+               (%u32-simple-array-decl-p ty) (%generic-simple-array-decl-p ty))
+           ty))))
+
 (defun compile-aref-1 (arr-form idx-form env dest)
   "Compile (aref array index) — the single-subscript fast path.
    Routes wrapper inputs through %wrapper-aref.  Multi-subscript
@@ -27941,6 +27974,12 @@
   (when *compile-plain-arrays*
     ;; Image without the CL array runtime: flat word-slot arrays only.
     (return-from compile-aref-1 (compile-word-aref arr-form idx-form env dest)))
+  (let ((ty (%typed-array-form-dtype arr-form env)))
+    (when ty
+      (let ((g (%mvm-gensym "TAREF")))
+        (return-from compile-aref-1
+          (compile-form `(let ((,g ,arr-form)) (declare (type ,ty ,g)) (aref ,g ,idx-form))
+                        env dest)))))
   ;; DECLARED (simple-array (unsigned-byte 8) …) variable: the packed-byte
   ;; primitive directly — no wrapper/string/mda dispatch and no runtime #x11
   ;; subtag test.  reel's pixel planes (u8vec) — the 6-tap motion-comp
@@ -28127,6 +28166,15 @@
   (when *compile-plain-arrays*
     (return-from compile-aset-1
       (compile-word-aset arr-form idx-form val-form env dest)))
+  (let ((ty (%typed-array-form-dtype arr-form env)))
+    (when ty
+      ;; the array is bound first, as it is evaluated first; the index and the
+      ;; value keep their order inside the ASET
+      (let ((g (%mvm-gensym "TASET")))
+        (return-from compile-aset-1
+          (compile-form `(let ((,g ,arr-form)) (declare (type ,ty ,g))
+                           (setf (aref ,g ,idx-form) ,val-form))
+                        env dest)))))
   ;; DECLARED (simple-array (unsigned-byte 8) …) variable: the packed-byte
   ;; store directly (VAL's low byte; returns VAL like aset).
   (when (%declared-u8-array-var-p arr-form env)

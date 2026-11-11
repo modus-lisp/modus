@@ -4078,6 +4078,27 @@
               ;; "expansion is a different object" rather than on P.
               (unless (eq x form) (setf (gethash k memo) (cons form x)))
               (values x p))))))
+(defun %the-array-var (f)
+  "SYM when F is (THE type SYM), else NIL."
+  (and (consp f) (symbolp (car f)) (name-eq (car f) "THE")
+       (consp (cdr f)) (consp (cddr f)) (null (cdddr f))
+       (caddr f) (symbolp (caddr f)) (caddr f)))
+
+(defun %aref-see-through (form)
+  "(AREF (THE type V) . subs) as (AREF V . subs), and the same as a SETF place;
+   else NIL.  THE compiles its form and ignores the type, so this changes
+   nothing but what the typed paths can see: every one of them asks whether
+   the array is a variable declared (simple-array single-float (*)), and
+   (aref (the f32v a) i) -- SBCL's idiom, and mill's scalar F32V-REF -- took
+   the generic %AREF-SLOW, 45x, in every kernel mill has."
+  (when (and (consp form) (symbolp (car form)) (consp (cdr form)))
+    (cond ((and (name-eq (car form) "AREF") (%the-array-var (cadr form)))
+           (list* (car form) (%the-array-var (cadr form)) (cddr form)))
+          ((and (name-eq (car form) "SETF") (consp (cddr form)) (null (cdddr form))
+                (consp (cadr form)) (symbolp (car (cadr form)))
+                (name-eq (car (cadr form)) "AREF") (%the-array-var (cadr (cadr form))))
+           (list (car form) (%aref-see-through (cadr form)) (caddr form))))))
+
 (defun %macroexpand-1-mvm-raw (form)
   "Expand one level of macro in FORM, using the MVM macro table.
    Returns (values expanded-form expanded-p).  An expander that returns
@@ -4096,6 +4117,15 @@
   ;; stack overflow on x64 and i386 alike (the ladder's cl-annot SIGSEGV).
   ;; Minimal: (defmacro metaclass (metaclass cdf)
   ;;            (funcall (lambda (c) (append c (list (list :metaclass metaclass)))) cdf))
+  ;; A BACKQUOTE FORM EXPANDS TO ITS LIST-BUILDING CODE, as COMPILE-FORM expands it.  Every analysis walker
+  ;; that macroexpands as it goes (%FORM-SETQS-VAR-P, %PROMOTE-WALK, %FP-SCOPE-CALL-FREE-P ...) asks here,
+  ;; and with no answer it walked INTO the template as if it were code: `(loop for ,k from 0) had its LOOP
+  ;; expanded with a comma for a variable -- a SIGILL -- and mill's DO-BROADCAST, a template holding a LOOP,
+  ;; never finished defining (LOOP's generator, fed the template, built its clauses forever).
+  (if (%aref-see-through form)
+      (cons (%aref-see-through form) t)
+  (if (%bq-form-p form)
+      (cons (expand-backquote (cadr form)) t)
   (if (and (consp form) (symbolp (car form)) (not (keywordp (car form))))
       (let* ((name (normalize-name (car form)))
              ;; CONFIRMED lookup — see %MACRO-NAME-CONFIRMED-P.  A hash
@@ -4163,7 +4193,7 @@
                   (when (%expander-has-env-p mf) (setq *%mexp-impure* t))
                   (if (eq result form) (cons form nil) (cons result t)))))))
           (t (cons form nil))))
-      (cons form nil)))
+      (cons form nil)))))
 
 (defun %expander-has-env-p (mf)
   "MF, a compiled macro expander, closes over a lexical environment."
@@ -5602,6 +5632,10 @@
                 ;; runtime SETF macro, which was right.
                 ((and (consp place) (name-eq (car place) "AREF"))
                  `(aset ,@(cdr place) ,value))
+                ;; (setf (%f32v-ref a i) v) → (%f32v-set a i v): mill's F32V-REF
+                ;; is a place, and on modus it is this primitive
+                ((and (consp place) (name-eq (car place) "%F32V-REF"))
+                 `(%f32v-set ,@(cdr place) ,value))
                 ;; (setf (gethash k h) v)     → (puthash k h v)
                 ;; (setf (gethash k h d) v)   → evaluate D for side effect.
                 ;;     ANSI demands left-to-right evaluation of K, H, D, V
@@ -13382,6 +13416,10 @@
              (cond ((and (symbolp f) f (name-equal f var)) w)
                    ((atom f) 0)
                    ((and (symbolp (car f)) (name-eq (car f) "QUOTE")) 0)
+                   ;; a backquote TEMPLATE is data: weigh the code it builds, never the template -- a
+                   ;; template holding `(loop for ,k ...) was expanded as a LOOP with a comma for a
+                   ;; variable, and LOOP's generator built its clauses forever (mill's DO-BROADCAST)
+                   ((%bq-form-p f) (walk (expand-backquote (cadr f)) w))
                    ((%extended-loop-expansion f) (walk (%extended-loop-expansion f) w))
                    (t (let ((w2 (if (and (symbolp (car f))
                                          (member (symbol-name (car f)) *promote-loop-ops*
@@ -13408,6 +13446,7 @@
                      ((> depth 60) nil)
                      ((not (symbolp (car f))) (walk-list f mult depth))
                      ((name-eq (car f) "QUOTE") nil)
+                     ((%bq-form-p f) (walk (expand-backquote (cadr f)) mult (+ depth 1)))   ; data: see %VAR-REF-WEIGHT
                      ((%extended-loop-expansion f)
                       (walk (%extended-loop-expansion f) mult (+ depth 1)))
                      ((or (name-eq (car f) "LET") (name-eq (car f) "LET*"))
@@ -13520,7 +13559,10 @@
                    (setf (binding-dtype bb) 'fixnum)))
                 ((%inferred-single-local-p var init bindings (strip-declares body) env)
                  (let ((bb (car (compile-env-bindings new))))
-                   (setf (binding-dtype bb) 'single-float)))))))
+                   (setf (binding-dtype bb) 'single-float)))
+                ((%inferred-vector-local-p var init bindings (strip-declares body) env)
+                 (let ((bb (car (compile-env-bindings new))))
+                   (setf (binding-dtype bb) (%fp-kind-dtype :vector))))))))
     (%apply-declared-types new body)
     new))
 
@@ -13529,6 +13571,7 @@
   (cond
     ((> depth 80) nil)
     ((atom form) t)
+    ((%aref-see-through form) (%fp-scope-call-free-p (%aref-see-through form) env depth))
     (t
      (let ((op (car form)))
        (cond
@@ -13573,11 +13616,17 @@
               ((or (string= n "INCF") (string= n "DECF"))
                (and (consp (cdr form)) (symbolp (cadr form))
                     (env-lookup env (cadr form))
-                    (%expr-width (cadr form) env)
-                    (or (null (cddr form))
-                        (let ((d (caddr form)))
-                          (or (integerp d)
-                              (and (or (and d (symbolp d)) (consp d)) (%expr-width d env)))))))
+                    (or (and (%expr-width (cadr form) env)
+                             (or (null (cddr form))
+                                 (let ((d (caddr form)))
+                                   (or (integerp d)
+                                       (and (or (and d (symbolp d)) (consp d)) (%expr-width d env))))))
+                        ;; anything else is its SETQ: (incf s x) of a float accumulator
+                        (and (consp (cddr form)) (null (cdddr form))
+                             (%fp-scope-call-free-p
+                              (list 'setq (cadr form)
+                                    (list (if (string= n "INCF") '+ '-) (cadr form) (caddr form)))
+                              env (1+ depth))))))
               ;; DOTIMES is compiled natively (no macro to expand): a fixnum
               ;; counter over a width-typed count, body walked with the
               ;; counter bound as FIXNUM.
@@ -13646,6 +13695,23 @@
                         ;; K-quant kernel reads its scales beside its lanes)
                         (%declared-u8-array-var-p (cadr form) env))
                     (%simple-index-form-p (caddr form))))
+              ;; (setf var v) is (setq var v): SETF of a lexical variable (INCF
+              ;; expands to it) boxed every float accumulator a SETQ kept in a
+              ;; register (mill's dot products, 10x)
+              ((and (string= n "SETF") (consp (cdr form)) (symbolp (cadr form)))
+               (%fp-scope-call-free-p (cons 'setq (cdr form)) env depth))
+              ((and (string= n "SETF") (consp (cdr form)) (consp (cadr form))
+                    (symbolp (car (cadr form))) (name-eq (car (cadr form)) "%F32V-REF")
+                    (consp (cddr form)) (null (cdddr form)))
+               (%fp-scope-call-free-p (cons '%f32v-set (append (cdr (cadr form)) (cddr form)))
+                                      env (1+ depth)))
+              ;; (setf (MACRO ...) v): judge the place the macro expands to, as
+              ;; SETF itself does (mill's (setf (f32v-ref dr i) ...))
+              ((and (string= n "SETF") (consp (cdr form)) (consp (cadr form))
+                    (consp (cddr form)) (null (cdddr form))
+                    (not (eq (%tree-expand (cadr form)) (cadr form))))
+               (%fp-scope-call-free-p (list (car form) (%tree-expand (cadr form)) (caddr form))
+                                      env (1+ depth)))
               ((string= n "SETF")
                ;; (setf (aref A i) v): declared A, simple i; an f32 store needs
                ;; a fitting float tree (else it CALLS %f32-aset)
@@ -13726,6 +13792,21 @@
                               init))
        (notany (lambda (f) (%form-setqs-var-p var f 0)) body)))
 
+(defun %inferred-vector-local-p (var init bindings body env)
+  "T when an UNDECLARED LET variable VAR is provably a 4-lane float vector for
+   its whole scope, as %INFERRED-SINGLE-LOCAL-P for a single: INIT is an f32x4
+   tree and nothing in BODY assigns VAR.  mill's elementwise cores bind
+   (let ((xa (f32v-ref da i)) ...)) undeclared, and each lane group was boxed."
+  (and init (consp init)
+       (let ((x (%tree-expand init)))
+         (and (consp x) (symbolp (car x))
+              (let ((n (symbol-name (car x))))
+                (and (> (length n) 5) (string= (subseq n 0 5) "%F32V")))))
+       (%v4-tree-need init env)
+       (not (%form-mentions-any-p (mapcar (lambda (b) (if (consp b) (car b) b)) bindings)
+                                  init))
+       (notany (lambda (f) (%form-setqs-var-p var f 0)) body)))
+
 (defun %let-fp-kinds (bindings decl-body body env)
   "For a LET: an array of :scalar / :vector / NIL per binding when at least
    one variable is a declared float/vector local AND the body is call-free
@@ -13740,8 +13821,10 @@
                (k (if pair
                       (%fp-type-kind (cdr pair))
                       (and (consp b) (consp (cdr b))
-                           (%inferred-single-local-p var (cadr b) bindings body env)
-                           :scalar))))
+                           (cond ((%inferred-single-local-p var (cadr b) bindings body env)
+                                  :scalar)
+                                 ((%inferred-vector-local-p var (cadr b) bindings body env)
+                                  :vector))))))
           (when k (setf (aref kinds i) k) (setq any t)))
         (setq i (+ i 1)))
       (and any
@@ -14232,9 +14315,32 @@
   ;; value) is boxed only when wanted.
   (let ((fb (env-lookup env var)))
     (when (and fb (member (binding-location fb) '(:fpreg :fpdreg :fpvreg)))
-      (%compile-init-into-fpreg val env (binding-reg fb)
-                                (case (binding-location fb)
-                                  (:fpvreg :vector) (:fpdreg :dscalar) (t :scalar)))
+      (let ((kind (case (binding-location fb)
+                    (:fpvreg :vector) (:fpdreg :dscalar) (t :scalar))))
+        ;; The variable's own register is the tree's destination only when the
+        ;; variable is read first (the rule %SETQ-DIRECT-SAFE-P states for a GPR):
+        ;; INCF's (setq s (+ (* a b) s)) put a*b in S's register before reading
+        ;; S, and every float accumulator INCF'd came out a*b + a*b.  Else the
+        ;; tree goes to a fresh FP register and moves (one FMOV / MOVAPS), or
+        ;; with none free, through a box.
+        (cond ((%setq-direct-safe-p var val env)
+               (%compile-init-into-fpreg val env (binding-reg fb) kind))
+              ((< *fp-reg-counter* +fp-reg-max+)
+               (let ((tf (alloc-fp-reg)))
+                 (%compile-init-into-fpreg val env tf kind)
+                 (emit-ir :fp-mov (binding-reg fb) tf)
+                 (free-fp-reg)))
+              ;; a 4-lane value has no box to go through: the old route (correct
+              ;; whenever the variable is read first, as above)
+              ((eq kind :vector)
+               (%compile-init-into-fpreg val env (binding-reg fb) kind))
+              (t
+               (let ((tmp (alloc-temp-reg)))
+                 (compile-form val env tmp)
+                 (if (eq kind :dscalar)
+                     (emit-ir :fpd-unbox (binding-reg fb) tmp)
+                     (emit-ir :fp-unbox (binding-reg fb) tmp))
+                 (free-temp-reg)))))
       ;; box the assignment's value only when some consumer will read DEST
       (if (and dest (not *setq-value-unused*))
           (%emit-fpreg-box dest fb)
@@ -21617,6 +21723,10 @@
          ((%fp-single-conversion-arg form) t)
          ;; EXP of a single is a single
          ((%fp-exp-arg form) (%expr-single-float-p (%fp-exp-arg form) env))
+         ;; a macro: judge what it expands to, as the tree walkers do -- an
+         ;; undeclared (let ((x (f32v-ref a i))) ...) was boxed (mill, 30x)
+         ((let ((x (%tree-expand form)))
+            (and (not (eq x form)) (%expr-single-float-p x env))))
          ;; struct accessor whose slot type is single-float
          (t (let ((ty (%expr-dtype form env)))
               (and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")))))))

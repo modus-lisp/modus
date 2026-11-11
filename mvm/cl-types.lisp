@@ -5164,10 +5164,25 @@
                       (em (%exp-f (%float-neg xf))))
                  (%irr-result (%float-div (%float-add ep em) (%fl 2)) x))))))
 
+(defun %tanh-float (x)
+  "TANH of a float: the general arm's arithmetic, in the same order (so the same
+   bits), on a declared double.  The general arm compared X with the INTEGER 22
+   exactly (a float-to-rational comparison) and did every step through boxed
+   generic calls: 570 ns an element, 160x SBCL on mill's Tanh."
+  (let ((xd (%any-to-float x)))
+    (declare (type double-float xd))
+    (cond ((= xd 0d0) x)                       ; -0.0 stays -0.0
+          ((> xd 22d0) (%irr-result (%fl 1) x))
+          ((< xd -22d0) (%irr-result (%fl -1) x))
+          (t (let ((ep (%exp-f xd)) (em (%exp-f (- xd))))
+               (declare (type double-float ep em))
+               (%irr-result (/ (- ep em) (+ ep em)) x))))))
+
 (defun tanh (x &rest extra)
   (if extra
       (%program-error "tanh requires exactly 1 argument")
-      (cond ((complexp x) (%complex-in-format (let ((ep (exp x)) (em (exp (- x)))) (/ (- ep em) (+ ep em))) x))
+      (cond ((floatp x) (%tanh-float x))
+            ((complexp x) (%complex-in-format (let ((ep (exp x)) (em (exp (- x)))) (/ (- ep em) (+ ep em))) x))
             ((and (integerp x) (= x 0)) 0)
             ;; a float zero is its own tanh (-0.0 stays -0.0); past |x| = 22
             ;; tanh is +-1 to double precision, and exp(x)/exp(x) would be

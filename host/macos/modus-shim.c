@@ -662,6 +662,7 @@ static lw jit_read(int fd, void *buf, size_t n) {
 // and the delta's two halves live in keys 300 and 301.
 #define MODUS_TSD_KEY 300
 #define LX_SYS_SET_THREAD_DELTA 1000     // translate-aarch64 +A64-DARWIN-SYS-SET-THREAD-DELTA+
+#define LX_SYS_BACKTRACE 1081           // the caller's frame chain: see modus_backtrace
 #define LX_SYS_MLOCK 1020                // natrium's secret arena (gossamer): mlock(addr, len).  Linux's
                                          // aarch64 mlock is 228, which the shim faults on, so Darwin uses this
 
@@ -805,6 +806,26 @@ static lw dx_futex(uint32_t *ua, lw op, lw val, const struct lx_timespec *to) {
 }
 
 static unsigned char unknown_seen[512];
+static void prof_write(void);         // the profiler's output, written at exit (below, with the profiler)
+
+// THE CALLER'S FRAME CHAIN (pseudo-syscall 1081: buffer, capacity in words).  Every compiled function's
+// prologue leaves a frame record -- [x29] the caller's x29, [x29+8] the return address -- and the syscall stub
+// saved the calling function's x29, so the chain is walkable from here.  Return addresses go out as LINK
+// addresses (the slide taken off), so they name themselves through the build's symbol map (MODUS_SYMMAP);
+// the count is the result.  Stops at a link that does not go up the stack or goes implausibly far.
+static int64_t g_image_slide;
+static lw modus_backtrace(uint64_t fp, uint64_t *out, lw cap) {
+    lw n = 0;
+    uint64_t start = fp;
+    while (n < cap && fp >= 4096 && (fp & 7) == 0) {
+        uint64_t next = ((uint64_t *)(uintptr_t)fp)[0], ret = ((uint64_t *)(uintptr_t)fp)[1];
+        if (ret < 4096) break;
+        out[n++] = ret - (uint64_t)g_image_slide;
+        if (next <= fp || next - start > (256ull << 20)) break;
+        fp = next;
+    }
+    return n;
+}
 
 static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
                           struct stub_frame *frame);
@@ -841,11 +862,12 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
     case 215: RET(munmap((void *)(uintptr_t)a0, (size_t)a1));
     case 226: RET(mprotect((void *)(uintptr_t)a0, (size_t)a1, (int)a2));
     case 93: if (is_clone) thread_exit(); report_resident(); _exit((int)a0);   // exit: the THREAD
-    case 94: report_resident(); _exit((int)a0);             // exit_group
+    case 94: report_resident(); prof_write(); _exit((int)a0);             // exit_group
     case 220: return dx_clone(a0, a1, (uint32_t *)(uintptr_t)a2, (uint32_t *)(uintptr_t)a4, frame);
     case 98:  return dx_futex((uint32_t *)(uintptr_t)a0, a1, a2, (const struct lx_timespec *)(uintptr_t)a3);
     case LX_SYS_SET_THREAD_DELTA: set_delta(a0); return 0;
     case LX_SYS_MLOCK: RET(mlock((const void *)(uintptr_t)a0, (size_t)a1));
+    case LX_SYS_BACKTRACE: return modus_backtrace(frame->x29, (uint64_t *)(uintptr_t)a0, a1);
     case 25: {                                                // fcntl.  O_NONBLOCK is 2048 in Linux and 4 in
         int fd = (int)a0, cmd = (int)a1;                      // Darwin, so the bit is translated both ways
         if (cmd == F_GETFL) {
@@ -984,6 +1006,70 @@ static void pr_reg(const char *n, uint64_t v) {
     else fprintf(stderr, " %s=%#llx", n, (unsigned long long)v);
 }
 static void report_fault(int sig, siginfo_t *si, void *uc_);
+
+// ---------------------------------------------------------- the profiler ---
+// MODUS_SHIM_PROFILE=FILE: a sampling profiler.  ITIMER_PROF interrupts the process every millisecond of CPU,
+// and the handler records the interrupted PC, its LR and the frame chain above it (modus_backtrace's walk:
+// [x29] the caller's x29, [x29+8] the return address) into a buffer allocated up front.  At exit -- or on
+// SIGTERM, so a `timeout' around a hung run still leaves its samples -- the samples are written to FILE, one per
+// line, LINK addresses innermost first, for host/macos/modus-prof.py to name through the build's symbol map
+// (MODUS_SYMMAP) and fold into stacks.
+#define PROF_DEPTH 48
+#define PROF_MAX 200000
+static uint64_t *prof_buf;            // PROF_MAX samples of PROF_DEPTH+2 words: count, pc, lr, returns...
+static volatile long prof_n;
+static const char *prof_path;
+static void prof_write(void) {
+    if (!prof_buf || !prof_path) return;
+    FILE *f = fopen(prof_path, "w");
+    if (!f) return;
+    long n = prof_n < PROF_MAX ? prof_n : PROF_MAX;
+    for (long i = 0; i < n; i++) {
+        uint64_t *s = prof_buf + i * (PROF_DEPTH + 3);
+        for (uint64_t k = 0; k < s[0] && k < PROF_DEPTH + 2; k++)
+            fprintf(f, k ? " %llx" : "%llx", (unsigned long long)s[k + 1]);
+        fputc('\n', f);
+    }
+    fclose(f);
+    fprintf(stderr, "modus-shim: %ld profile samples written to %s\n", n, prof_path);
+    prof_path = NULL;
+}
+static void on_prof(int sig, siginfo_t *si, void *uc_) {
+    (void)sig; (void)si;
+    long i = __atomic_fetch_add(&prof_n, 1, __ATOMIC_RELAXED);
+    if (i >= PROF_MAX) return;
+    uint64_t *s = prof_buf + i * (PROF_DEPTH + 3);
+    ucontext_t *uc = uc_;
+    __typeof__(uc->uc_mcontext->__ss) *ts = &uc->uc_mcontext->__ss;
+    uint64_t pc = __darwin_arm_thread_state64_get_pc(*ts), lr = __darwin_arm_thread_state64_get_lr(*ts);
+    uint64_t fp = __darwin_arm_thread_state64_get_fp(*ts);
+    s[1] = pc - (uint64_t)g_image_slide;
+    s[2] = lr - (uint64_t)g_image_slide;
+    uint64_t k = 2, start = fp;
+    // only a chain that lies in a stack: the image's or a thread's, never the code
+    while (k < PROF_DEPTH + 2 && fp >= 4096 && (fp & 7) == 0 && !(fp >= g_code_lo && fp < g_code_hi)) {
+        uint64_t next = ((uint64_t *)(uintptr_t)fp)[0], ret = ((uint64_t *)(uintptr_t)fp)[1];
+        if (ret < 4096) break;
+        s[++k] = ret - (uint64_t)g_image_slide;
+        if (next <= fp || next - start > (256ull << 20)) break;
+        fp = next;
+    }
+    s[0] = k;
+}
+static void on_prof_term(int sig) { prof_write(); _exit(128 + sig); }
+static void start_profiler(void) {
+    prof_path = getenv("MODUS_SHIM_PROFILE");
+    if (!prof_path || !*prof_path) { prof_path = NULL; return; }
+    prof_buf = calloc((size_t)PROF_MAX * (PROF_DEPTH + 3), sizeof(uint64_t));
+    if (!prof_buf) { prof_path = NULL; return; }
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_prof; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGPROF, &sa, NULL);
+    signal(SIGTERM, on_prof_term);
+    atexit(prof_write);
+    struct itimerval it = { { 0, 1000 }, { 0, 1000 } };
+    setitimer(ITIMER_PROF, &it, NULL);
+}
 static __thread uint64_t last_flip_pc; static __thread int same_pc_flips;   // per thread: W^X is
 
 static void on_fault(int sig, siginfo_t *si, void *uc_) {
@@ -1233,6 +1319,7 @@ int main(int argc, char **argv, char **envp) {
     sp[k++] = 0; sp[k++] = 0;                      // auxv: AT_NULL
 
     g_code_lo = link; g_code_hi = link + ph->memsz;
+    g_image_slide = (int64_t)(link - ph->vaddr);
     if (in_place) {
         note_reservation("__MODUSR");
         note_reservation("__MODUSH");
@@ -1240,6 +1327,7 @@ int main(int argc, char **argv, char **envp) {
     }
     reserve_delta_key();
     install_fault_report();
+    start_profiler();
 #if TARGET_OS_IPHONE
     run_image_beside_uikit(argc, argv, (uint64_t)(uintptr_t)sp, eh->entry + (uint64_t)slide);
 #else

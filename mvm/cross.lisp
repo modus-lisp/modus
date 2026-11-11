@@ -162,6 +162,18 @@
            (bytecode (mvm-module-bytecode module))
            ;; Build function table in the format each translator expects
            (fn-table (build-translator-fn-table fn-list target)))
+      ;; 68k threaded cold code with a HOT list (MODUS_68K_HOT): the named
+      ;; functions stay native.  The translator is given their bytecode offsets.
+      (when (and (boundp 'modus.mvm::*68k-hot-names*)
+                 (symbol-value 'modus.mvm::*68k-hot-names*)
+                 (symbol-value 'modus.mvm::*68k-threaded*))
+        (let ((names (symbol-value 'modus.mvm::*68k-hot-names*))
+              (h (make-hash-table :test 'eql)))
+          (dolist (fi fn-list)
+            (when (gethash (string (mvm-function-info-name fi)) names)
+              (setf (gethash (mvm-function-info-bytecode-offset fi) h) t)))
+          (format t "~&;; 68k threaded: ~D hot functions stay native~%" (hash-table-count h))
+          (setf (symbol-value 'modus.mvm::*68k-threaded*) h)))
       ;; Call the bulk translator — returns (values buf fn-map)
       ;; fn-map maps function-name → label (x86-64/i386/arm32)
       ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)

@@ -21,6 +21,7 @@ fixed program (a "thunk"): the floor for microcontrollers.
 |---|---|---|---|
 | default 68k CLI (REPL) | 30.4 MB | -- | 7.5 MB |
 | `MODUS_SMALL_IMAGE` + `MODUS_NARROW_STRINGS` (REPL) | 11.9 MB | 8.3 MB | 5.75 MB |
+| `+ MODUS_68K_THREADED` + `MODUS_68K_HOT` (REPL, cold code threaded) | 8.2 MB | 7.5 MB | 5.75 MB |
 | `+ MODUS_NO_COMPILER` (hello world, no REPL) | 12.7 MB | 7.3 MB | 4 MB |
 | `+ MODUS_LEAN_BOOT` + `MODUS_HOT_ORDER` (hello world) | 3.0 MB | 0.40 MB | 1.25 MB |
 
@@ -42,6 +43,9 @@ All opt-in; unset, every image is built as before.  68k soft float:
 | `MODUS_NARROW_STRINGS=1` | one byte a character for strings the reader and the name tables make, and (68k) for pooled literals (the collector sizes `#x13` since `238b68e2`) |
 | `MODUS_68K_A5_GLOBALS=1` / `0` | A5 holds the globals base, so nargs / closure env / MV count are `(A5)` / `d16(A5)`; unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_68K_GC_STATIC=1` / `0` | after boot, what boot left live becomes a static heap the collector walks and never copies, and the collector hands evacuated pages back (`madvise`); unset follows `MODUS_SMALL_IMAGE` |
+| `MODUS_68K_THREADED=1` | cold functions become THREADED CODE: a byte stream of tokens (one per MVM instruction, a compare and its branch fused) run by ~2,800 shared native handlers; A5 is the token pointer (so not the globals base) |
+| `MODUS_68K_HOT=FILE` | with `MODUS_68K_THREADED`: the functions named in FILE (one a line) stay native |
+| `MODUS_68K_PROFILE=1` | per-function execution counters at `#x10010000` (entries + loop heads), for choosing the hot list |
 | `MODUS_68K_RELAX_BRANCHES=1` / `0` | each 68k branch as short as its distance allows (two translation passes); unset follows `MODUS_SMALL_IMAGE` |
 | `MODUS_NO_SOURCE_BLOB=1` | no embedded source (disk only on a hosted system) |
 | `MODUS_NO_COMPILER=1` | no compiler: the compiler-side files filtered to what the rest of the image reaches (`mvm/build-no-compiler.lisp`), entry points stubbed to signal; the toplevel runs a `%IMAGE-MAIN` baked in with `MODUS_EXTRA_SOURCE=FILE` |
@@ -52,6 +56,11 @@ All opt-in; unset, every image is built as before.  68k soft float:
 
 - **Size by function:** `MODUS_SYMMAP=FILE` writes address, size and name of
   every function.
+- **A hot list:** build with `MODUS_68K_PROFILE=1 MODUS_SYMMAP=FILE`, run the
+  workload under gdb to `%CLI-EXIT`, `dump binary memory` `#x10010000` ..
+  `#x10018000`; counter i is the i-th function in address order.  On the
+  smoke program + a REPL session the top 100 functions are 96% of the counts
+  (424 KB native), the top 400 99.9% (1.7 MB); 4,100 of 6,226 never ran.
 - **Size by MVM opcode:** `MODUS_68K_OP_STATS=1` prints native bytes per opcode,
   and LI by destination and immediate class with the commonest immediates.
 - **Why something is kept:** `MODUS_IR_DCE_WHY=NAME,...` (lean builds) prints
@@ -133,9 +142,16 @@ All opt-in; unset, every image is built as before.  68k soft float:
    FLOOR is unchanged (5-6 MB), because boot's final live set is what sets it;
    lowering it means freezing during boot, or building the boot data at build
    time (a saved core, as MCL booted from a saved heap).
-3. Measure against 4 MB / 6 MB.  If native cannot get there: the **bytecode
-   image** (the web REPL's design -- the image stays MVM bytecode, a small
-   native interpreter runs it; slower, several times smaller).
+3. **Threaded cold code** (`MODUS_68K_THREADED`): first cut done.  MVM
+   bytecode itself is only ~15% denser than 68k (8.0 vs 9.4 MB), so the cold
+   tier is a new encoding: 1-byte tokens for the 255 commonest shapes,
+   operands sized by value.  All 5,990 eligible functions threaded: 7.75 MB
+   image, ~14x slower.  With the profile's 300 hottest kept native: 8.2 MB
+   image, 7.5 MB resident, smoke time on a par with the native image.
+   Next: superinstructions (call sequences, push/pop runs) and a smaller
+   handler table; the boot-time cost of `%GV-CACHE-FLUSH` (16,384 slots
+   cleared per global created, ~7,500 times at boot: the profile's hottest
+   function).
 4. Smaller: call-free pooled literals; the remaining generated tables (hash
    dispatch names, runtime macros); the FASL cache as an option.
 

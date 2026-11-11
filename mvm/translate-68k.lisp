@@ -117,6 +117,26 @@
   (position 0)      ; byte position
   (word-count 0))   ; word index (position / 2)
 
+;;; MODUS_68K_PROFILE: a longword counter per function at #x10010000 + 4i (i =
+;;; the function's place in translation order), bumped at its entry and at every
+;;; loop head (a backward branch's target), so a function that loops inside one
+;;; call still scores.  A profiling build only: ADDQ clobbers the flags.
+(defvar *68k-profile* nil)
+(defconstant +68k-profile-base+ #x10010000)
+
+;;; THREADED COLD CODE's specials (the tier itself is near the end of this
+;;; file); declared here, before any function that binds them.
+(defvar *68k-threaded* nil
+  "MODUS_68K_THREADED: NIL, :ALL (every function that can be), or a hash of
+   bytecode offsets to keep NATIVE (the hot ones).")
+(defvar *68k-hot-names* nil
+  "MODUS_68K_HOT: an EQUAL hash of function names to keep native when
+   threading (cross.lisp turns it into bytecode offsets for *68K-THREADED*).")
+(defvar *68k-cold-fns* nil "Hash: cold function start pc -> (end-pc . branch-width).")
+(defvar *68k-thread-shapes* nil "Hash: shape key -> shape (vector index label count key).")
+(defvar *68k-thread-next-label* nil)
+(defvar *68k-stream-fixups* nil "List of (byte-pos label size base).")
+
 (defvar *68k-li-const-patches* nil
   "List of (NATIVE-BYTE-OFFSET . POOL-INDEX) recorded by +OP-LI-CONST+: at that
    offset is a MOVE.L #imm32,D0 whose 32-bit immediate (bytes +2..+5, big-endian)
@@ -125,6 +145,8 @@
 
 (defun m68k-emit-word (buf word)
   "Emit a 16-bit instruction word."
+  (when (oddp (m68k-buffer-position buf))
+    (error "68k: a word at the odd position ~D" (m68k-buffer-position buf)))
   (let ((idx (m68k-buffer-word-count buf)))
     ;; Grow by doubling.  The buffer was a fixed 64K words (128 KB), which no
     ;; single-file image ever reached and the CL image exceeds many times over.
@@ -1324,6 +1346,8 @@
               (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
                     for i from 3
                     do (m68k-emit-move-dn-disp buf d +68k-a1+ (* 4 i)))
+              (when *68k-threaded*                        ; the token pointer
+                (m68k-emit-move-an-disp buf +68k-a5+ +68k-a1+ 28))
               (m68k-emit-label buf skip)
               (m68k-emit-move-an-dn buf +68k-a4+ +68k-d2+)      ; first return: NIL
               (m68k-emit-label buf resume)))
@@ -1347,6 +1371,8 @@
                     for i from 3
                     do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
               (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
+              (when *68k-threaded*
+                (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
               (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
               (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
               (m68k-emit-move-imm-dn buf #xDEAD1009 +68k-d2+)  ; second return: T
@@ -3215,6 +3241,78 @@
     (m68k-emit-adda-dn buf +68k-d1+ +68k-a2+)          ; bump
     (m68k-emit-rts buf)))
 
+;;; MODUS_68K_THREAD_STATS: what the image would cost as TOKEN-THREADED code --
+;;; a 2-byte token per MVM instruction naming a shared native handler (the
+;;; instruction's own native code with its register operands baked in, plus a
+;;; 6-byte dispatch), the instruction's other operands inline after the token.
+;;; Policy A puts every non-register operand inline; policy B bakes byte-sized
+;;; ones into the handler.  Inline operands are 2 bytes when they fit a signed
+;;; word, else 4.  A handler is costed at its representative's native size + 6
+;;; (+ 4 for each inline operand it must fetch).
+(defun m68k-thread-stats-note (ts opcode operands native)
+  (let* ((info (gethash opcode *opcode-table*))
+         (types (and info (opcode-info-operands info)))
+         (v (third ts))
+         (flag-op (member opcode (list +op-cmp+ +op-test+ +op-cmp-imm+ +op-test-imm+)))
+         (cond-br (member opcode (list +op-beq+ +op-bne+ +op-blt+ +op-bge+ +op-ble+
+                                       +op-bgt+ +op-bvs+))))
+    (incf (aref v 0)) (incf (aref v 1) native)
+    ;; Policy C: byte-sized inline operands by value (1/2/4), the flag setter
+    ;; and the conditional branch after it fused into one shape; token size is
+    ;; decided in the report (1 byte for the 255 commonest shapes, else 3).
+    (let* ((h (fourth ts))
+           (pend (aref v 2))                    ; a flag setter's (key . inline)
+           (key (list opcode)) (inline 0))
+      (loop for ty in types for x in operands
+            do (cond ((eq ty :reg) (push x key))
+                     ((eq ty :imm8) (push x key))
+                     (t (let ((n (cond ((not (integerp x)) 4)
+                                       ((<= -128 x 127) 1) ((<= -32768 x 32767) 2) (t 4))))
+                          (push n key) (incf inline n)))))
+      (cond ((and cond-br (consp pend))
+             (setq key (append key (car pend)) inline (+ inline (cdr pend)))
+             (setf (aref v 2) 0))
+            ((consp pend)
+             (let ((e (or (gethash (car pend) h) (setf (gethash (car pend) h) (list 0 0)))))
+               (incf (first e)) (incf (second e) (cdr pend)))
+             (setf (aref v 2) 0)))
+      (if flag-op
+          (setf (aref v 2) (cons key inline))
+          (let ((e (or (gethash key h) (setf (gethash key h) (list 0 0)))))
+            (incf (first e)) (incf (second e) inline))))
+    (loop for pol in '(:a :b) for h in (list (first ts) (second ts))
+          do (let ((key (list opcode)) (inline 0) (nparam 0))
+               (loop for ty in types for x in operands
+                     do (cond ((eq ty :reg) (push x key))
+                              ((and (eq pol :b) (eq ty :imm8)) (push x key))
+                              (t (push :p key) (incf nparam)
+                                 (incf inline (if (and (integerp x) (<= -32768 x 32767)) 2 4)))))
+               (let ((e (gethash key h)))
+                 (unless e
+                   (setq e (setf (gethash key h) (list 0 0 (+ native 6 (* 4 nparam))))))
+                 (incf (first e)) (incf (second e) (+ 2 inline)))))))
+
+(defun m68k-thread-stats-report (ts)
+  (let ((v (third ts)))
+    (format t "~&;; 68k thread stats: ~D instructions, ~D native bytes~%" (aref v 0) (aref v 1))
+    (loop for pol in '("A all inline" "B imm8 baked") for h in (list (first ts) (second ts))
+          do (let ((tok 0) (hand 0) (shapes 0) (single 0))
+               (maphash (lambda (k e) (declare (ignore k))
+                          (incf shapes) (incf tok (second e)) (incf hand (third e))
+                          (when (= 1 (first e)) (incf single)))
+                        h)
+               (format t ";;   ~A: tokens ~D B, ~D shapes (~D used once), handlers ~D B, total ~D B (~,2Fx native)~%"
+                       pol tok shapes single hand (+ tok hand)
+                       (/ (+ tok hand) (max 1 (aref v 1))))))
+    (let ((rows nil) (inl 0) (tok 0) (n 0))
+      (maphash (lambda (k e) (push (cons k e) rows) (incf inl (second e))) (fourth ts))
+      (setq rows (sort rows #'> :key #'second))
+      (loop for r in rows for i from 0
+            do (incf n (second r)) (incf tok (* (second r) (if (< i 255) 1 3))))
+      (format t ";;   C byte tokens, fused cmp+branch: ~D tokens, ~D shapes, tokens ~D B + operands ~D B = ~D B (~,2Fx native); top 255 shapes cover ~,1F%~%"
+              n (length rows) tok inl (+ tok inl) (/ (+ tok inl) (max 1 (aref v 1)))
+              (* 100.0 (/ (loop for r in rows for i below 255 sum (second r)) (max 1 n)))))))
+
 (defvar *68k-skip-to* nil
   "Set by a handler that consumed the instructions after its own: the MVM pc
    the translation loop resumes at.")
@@ -3769,12 +3867,21 @@
          (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
          (*68k-label-map* label-map)
+         (*68k-cold-fns* nil)
+         (*68k-thread-shapes* nil)
+         (*68k-thread-next-label* (and *68k-threaded* (mvm-make-label)))
+         (*68k-stream-fixups* nil)
+         (loop-heads (make-hash-table :test 'eql))
+         (prof-index -1)
          (fn-entries nil)
          (bc bytecode)
          (len (length bc))
          (pc 0)
          (op-stats (and (sb-ext:posix-getenv "MODUS_68K_OP_STATS")
                         (make-hash-table :test 'eql)))
+         (thread-stats (and (sb-ext:posix-getenv "MODUS_68K_THREAD_STATS")
+                            (list (make-hash-table :test 'equal) (make-hash-table :test 'equal)
+                                  (vector 0 0 0) (make-hash-table :test 'equal))))
          (li-stats (make-hash-table :test 'equal))
          (li-imms (make-hash-table :test 'eql)))
 
@@ -3804,6 +3911,19 @@
                                     (mvm-make-label))))))))))
                (setf pc new-pc)))
 
+    ;; MODUS_68K_PROFILE: loop heads are the targets of backward branches.
+    (when *68k-profile*
+      (setf pc 0)
+      (loop while (< pc len)
+            do (destructuring-bind (op operands . npc) (decode-instruction bc pc)
+                 (let* ((info (gethash op *opcode-table*))
+                        (types (and info (opcode-info-operands info)))
+                        (k (position :off32 types)))
+                   (when k
+                     (let ((target (+ npc (nth k operands))))
+                       (when (< target pc) (setf (gethash target loop-heads) t)))))
+                 (setf pc npc))))
+
     ;; Register function entry points as branch targets
     (when function-table
       (maphash (lambda (idx mvm-offset)
@@ -3811,6 +3931,10 @@
                  (unless (gethash mvm-offset label-map)
                    (setf (gethash mvm-offset label-map) (mvm-make-label))))
                function-table))
+
+    ;; Threaded cold code: choose the cold functions, number the shapes.
+    (when (and *68k-threaded* function-table)
+      (m68k-thread-plan function-table))
 
     ;; Emit prologue
     (m68k-emit-prologue buf)
@@ -3837,6 +3961,7 @@
                ;; x64, i386 and RISC-V align to 16 for the same reason.  Pad with
                ;; NOP -- harmless, a function never falls through (RTS/branch).
                (when (and function-table (gethash pc fn-entries))
+                 (m68k-word-align buf)
                  (loop while (/= 0 (mod (m68k-buffer-position buf) 16))
                        do (m68k-emit-nop buf))
                  (when *68k-branch-distances*
@@ -3845,12 +3970,22 @@
                (let ((label (gethash pc label-map)))
                  (when label
                    (m68k-emit-label buf label)))
+               (when (and *68k-profile* function-table
+                          (or (gethash pc fn-entries) (gethash pc loop-heads)))
+                 (when (gethash pc fn-entries) (incf prof-index))
+                 (m68k-emit-word buf #x52B9)            ; ADDQ.L #1,(counter).L
+                 (m68k-emit-long buf (+ +68k-profile-base+ (* 4 (max 0 prof-index)))))
+               (if (and *68k-cold-fns* (gethash pc *68k-cold-fns*))
+                 (setf pc (m68k-emit-cold-function buf pc))
                (let* ((decoded (decode-instruction bc pc))
                       (opcode (car decoded))
                       (operands (cadr decoded))
                       (new-pc (cddr decoded))
                       (at (m68k-buffer-position buf)))
                  (m68k-translate-insn buf opcode operands new-pc label-map function-table)
+                 (when thread-stats
+                   (m68k-thread-stats-note thread-stats opcode operands
+                                           (- (m68k-buffer-position buf) at)))
                  (when op-stats
                    (let ((e (or (gethash opcode op-stats)
                                 (setf (gethash opcode op-stats) (list 0 0 0)))))
@@ -3869,8 +4004,9 @@
                        (incf (gethash imm li-imms 0)))))
                  (when *68k-skip-to*
                    (setq new-pc *68k-skip-to* *68k-skip-to* nil))
-                 (setf pc new-pc))))
+                 (setf pc new-pc)))))
 
+    (when thread-stats (m68k-thread-stats-report thread-stats))
     ;; MODUS_68K_OP_STATS: native bytes per MVM opcode, the largest first
     (when op-stats
       (let ((rows nil) (total 0))
@@ -3907,6 +4043,8 @@
       (m68k-emit-subtag-helper buf))
     (when *68k-car-label*
       (m68k-emit-car-cdr-helpers buf))
+    (when *68k-cold-fns*
+      (m68k-emit-thread-dispatch buf function-table))
     (when *68k-array-len-label*
       (m68k-emit-array-len-helper buf))
     (when *68k-alloc-obj-label*
@@ -3914,6 +4052,8 @@
 
     ;; Resolve labels
     (m68k-fixup-labels buf)
+    (when *68k-cold-fns*
+      (m68k-resolve-stream-fixups buf))
     (m68k-unimplemented-report)
 
     ;; Report where each function actually LANDED — see the same change in
@@ -3929,6 +4069,367 @@
                        (setf (gethash mvm-offset fn-map) pos))))
                  function-table))
       (values (m68k-buffer-to-bytes buf) fn-map))))
+
+;;; ============================================================
+;;; THREADED COLD CODE (*68K-THREADED*, MODUS_68K_THREADED)
+;;; ============================================================
+;;;
+;;; A cold function is not translated instruction by instruction: it becomes a
+;;; native STUB (MOVEA.L A5,A1 / LEA stream(PC),A5 / BRA next) followed by a
+;;; byte stream of TOKENS, one per MVM instruction (a compare and the
+;;; conditional branch after it are one), each naming a shared native HANDLER:
+;;; the code this translator emits for that instruction with its register
+;;; operands baked in, then BRA next.  The 255 commonest shapes are one byte;
+;;; the rest are 255 and a 16-bit index.  Operands that vary a lot follow the
+;;; token: immediates (1/2/4 bytes by value), constant addresses (patched by
+;;; cross.lisp as LI-CONST's are), call and function targets (32-bit,
+;;; relative to the operand's end), branch offsets (16-bit, 32 in big
+;;; functions, relative to the operand's end).  Everything else is baked.
+;;;
+;;; A5 IS THE TOKEN POINTER, so threaded images do not keep the globals base
+;;; there (*68K-A5-GLOBALS* is off): native code never touches A5, so a cold
+;;; function's A5 survives every native call it makes.  A cold function saves
+;;; its caller's A5 at A6-4 (free: spill slots start at A6-32) in its frame
+;;; enter, and puts it back in RET and TAILCALL; SETJMP saves A5 in the
+;;; jmpbuf's eighth word and LONGJMP restores it, so a non-local exit lands
+;;; with its own frame's token pointer.  Registers, frames and the calling
+;;; convention are native: the collector, backtraces and callers see no
+;;; difference.
+;;;
+;;; NOT threaded (stays native): a function whose first instruction is not a
+;;; frame enter, that contains SETJMP / LONGJMP or a context switch, a
+;;; conditional branch not directly after the compare that sets its flags
+;;; (the dispatch's MOVE.B clobbers them; BVS always), or a call whose target
+;;; has no label.
+
+;;; (the threaded tier's specials are declared near the top of this file)
+
+(defun m68k-jmpbuf-words () (if *68k-threaded* 8 +68k-jmpbuf-words+))
+
+(defun m68k-emit-byte (buf b)
+  "One byte at the current (possibly odd) position."
+  (let ((pos (m68k-buffer-position buf)))
+    (if (oddp pos)
+        (let ((i (1- (m68k-buffer-word-count buf))))
+          (setf (aref (m68k-buffer-words buf) i)
+                (logior (aref (m68k-buffer-words buf) i) (logand b #xFF)))
+          (incf (m68k-buffer-position buf)))
+        (progn (m68k-emit-word buf (ash (logand b #xFF) 8))
+               (decf (m68k-buffer-position buf))))))
+
+(defun m68k-set-byte (buf pos b)
+  (let ((i (ash pos -1)) (w (m68k-buffer-words buf)))
+    (setf (aref w i) (if (evenp pos)
+                         (logior (logand (aref w i) #x00FF) (ash (logand b #xFF) 8))
+                         (logior (logand (aref w i) #xFF00) (logand b #xFF))))))
+
+(defun m68k-word-align (buf)
+  (when (oddp (m68k-buffer-position buf)) (m68k-emit-byte buf 0)))
+
+(defun m68k-flag-op-p (op) (member op (list +op-cmp+ +op-test+ +op-cmp-imm+ +op-test-imm+)))
+(defun m68k-cond-br-cc (op)
+  (cond ((eql op +op-beq+) +68k-cc-eq+) ((eql op +op-bne+) +68k-cc-ne+)
+        ((eql op +op-blt+) +68k-cc-lt+) ((eql op +op-bge+) +68k-cc-ge+)
+        ((eql op +op-ble+) +68k-cc-le+) ((eql op +op-bgt+) +68k-cc-gt+)))
+
+(defun m68k-imm-class (x)
+  "Bytes a signed 32-bit immediate needs in the stream: 1, 2 or 4."
+  (let ((s (%imm32-signed (logand x #xFFFFFFFF))))
+    (cond ((<= -128 s 127) 1) ((<= -32768 s 32767) 2) (t 4))))
+
+(defun m68k-thread-classify (op operands new-pc w)
+  "(values KEY PARAMS) for one unfused instruction, or :NATIVE when a function
+   holding it cannot be threaded.  PARAMS: (:i SIZE VALUE) (:br TARGET-PC)
+   (:rel TARGET-PC) (:lic INDEX)."
+  (cond
+    ((eql op +op-li+)
+     (let ((n (m68k-imm-class (second operands))))
+       (values (list :li (first operands) n) (list (list :i n (second operands))))))
+    ((eql op +op-li-const+)
+     (values (list :li-const (first operands)) (list (list :lic (second operands)))))
+    ((or (eql op +op-cmp-imm+) (eql op +op-test-imm+))
+     (let ((n (m68k-imm-class (second operands))))
+       (values (list op (first operands) n) (list (list :i n (second operands))))))
+    ((or (eql op +op-call+) (eql op +op-tailcall+))
+     (if (gethash (first operands) *68k-label-map*)
+         (values (list op) (list (list :rel (first operands))))
+         :native))
+    ((eql op +op-fn-addr+)
+     (cond ((= (second operands) #xFFFFFFF0) (values (list op (first operands) :nil) nil))
+           ((gethash (second operands) *68k-label-map*)
+            (values (list op (first operands)) (list (list :rel (second operands)))))
+           (t :native)))
+    ((eql op +op-br+)
+     (values (list :br w) (list (list :br (+ new-pc (first operands))))))
+    ((or (eql op +op-bnull+) (eql op +op-bnnull+))
+     (values (list op (first operands) w) (list (list :br (+ new-pc (second operands))))))
+    ((or (m68k-cond-br-cc op) (eql op +op-bvs+)) :native)  ; only fused
+    ((eql op +op-ret+) (values (list :ret) nil))
+    ((eql op +op-trap+)
+     (let ((code (first operands)))
+       (cond ((>= code #x8000) (values (list :enter code) nil))
+             ((member code '(#x0510 #x0511)) :native)
+             (t (values (list op code) nil)))))
+    ((or (eql op +op-save-ctx+) (eql op +op-restore-ctx+)) :native)
+    (t (values (cons op operands) nil))))
+
+(defun m68k-thread-walk (start end w fn)
+  "Call FN with (pc key params next-pc) for each token of [START, END), fusing
+   a flag setter with the conditional branch after it.  :NATIVE if the span
+   cannot be threaded."
+  (let ((bc *68k-bytecode*) (pc start))
+    (loop while (< pc end)
+          do (destructuring-bind (op operands . npc) (decode-instruction bc pc)
+               (let ((nxt (and (< npc end) (null (gethash npc *68k-label-map*))
+                               (decode-instruction bc npc))))
+                 (if (and (m68k-flag-op-p op) nxt (m68k-cond-br-cc (car nxt)))
+                     (multiple-value-bind (k p) (m68k-thread-classify op operands npc w)
+                       (when (eq k :native) (return-from m68k-thread-walk :native))
+                       (let ((bnpc (cddr nxt)))
+                         (funcall fn pc (list :fused k (car nxt) w)
+                                  (append p (list (list :br (+ bnpc (first (cadr nxt))))))
+                                  bnpc)
+                         (setq pc bnpc)))
+                     (multiple-value-bind (k p) (m68k-thread-classify op operands npc w)
+                       (when (eq k :native) (return-from m68k-thread-walk :native))
+                       (funcall fn pc k p npc)
+                       (setq pc npc))))))
+    t))
+
+(defun m68k-thread-plan (function-table)
+  "Pre-pass: choose the cold functions and number the shapes, commonest first."
+  (let* ((starts (sort (let (l) (maphash (lambda (i off) (declare (ignore i)) (push off l))
+                                         function-table)
+                         (remove-duplicates l))
+                       #'<))
+         (len (length *68k-bytecode*))
+         (counts (make-hash-table :test 'equal))
+         (cold (make-hash-table :test 'eql)))
+    (loop for (s . rest) on starts
+          for e = (or (first rest) len)
+          for w = (if (> (- e s) 20000) 4 2)
+          do (unless (or (and (hash-table-p *68k-threaded*) (gethash s *68k-threaded*))
+                         (let ((d (decode-instruction *68k-bytecode* s)))
+                           (not (and (eql (car d) +op-trap+) (>= (first (cadr d)) #x8000)))))
+               (let ((local (make-hash-table :test 'equal)))
+                 (unless (eq :native
+                             (m68k-thread-walk s e w
+                                               (lambda (pc k p npc) (declare (ignore pc p npc))
+                                                 (incf (gethash k local 0)))))
+                   (setf (gethash s cold) (cons e w))
+                   (maphash (lambda (k n) (incf (gethash k counts 0) n)) local)))))
+    (let ((rows nil) (shapes (make-hash-table :test 'equal)))
+      (maphash (lambda (k n) (push (cons k n) rows)) counts)
+      (setq rows (sort rows #'> :key #'cdr))
+      ;; index 255 is the escape, so shapes skip it
+      (loop for (k . n) in rows for j from 0
+            do (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) n k)))
+      (setq *68k-cold-fns* cold *68k-thread-shapes* shapes)
+      (format t "~&;; 68k threaded: ~D of ~D functions cold, ~D shapes~%"
+              (hash-table-count cold) (length starts) (hash-table-count shapes)))))
+
+(defun m68k-emit-stream-param (buf param w)
+  (destructuring-bind (kind a &optional b) param
+    (ecase kind
+      (:i (let ((v (logand b #xFFFFFFFF)))
+            (loop for i from (1- a) downto 0 do (m68k-emit-byte buf (ldb (byte 8 (* 8 i)) v)))))
+      (:lic (push (cons (- (m68k-buffer-position buf) 2) a) *68k-li-const-patches*)
+       (dotimes (i 4) (m68k-emit-byte buf 0)))
+      ((:br :rel)
+       (let* ((size (if (eq kind :rel) 4 w))
+              (pos (m68k-buffer-position buf))
+              (label (or (gethash a *68k-label-map*)
+                         (error "68k threaded: no label for pc ~D" a))))
+         (push (list pos label size (+ pos size)) *68k-stream-fixups*)
+         (dotimes (i size) (m68k-emit-byte buf 0)))))))
+
+(defun m68k-emit-cold-function (buf start)
+  "Emit cold function START (already aligned, its label placed): the stub,
+   then its tokens.  Returns the pc after it."
+  (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
+    (let ((stream (mvm-make-label)))
+      (m68k-emit-word buf #x224D)                    ; MOVEA.L A5,A1 (caller's A5)
+      (m68k-emit-word buf #x4BFA)                    ; LEA (d16,PC),A5
+      (m68k-emit-word buf 0)
+      (m68k-emit-fixup buf stream :disp16)
+      (m68k-emit-bra buf *68k-thread-next-label*)
+      (m68k-emit-label buf stream)
+      (m68k-thread-walk start end w
+                        (lambda (pc k params npc)
+                          (declare (ignore npc))
+                          (unless (= pc start)
+                            (let ((l (gethash pc *68k-label-map*)))
+                              (when l (m68k-emit-label buf l))))
+                          (let ((i (svref (gethash k *68k-thread-shapes*) 0)))
+                            (if (< i 255)
+                                (m68k-emit-byte buf i)
+                                (progn (m68k-emit-byte buf 255)
+                                       (m68k-emit-byte buf (ash i -8))
+                                       (m68k-emit-byte buf (logand i #xFF)))))
+                          (dolist (p params) (m68k-emit-stream-param buf p w))))
+      (m68k-word-align buf)
+      end)))
+
+(defun m68k-resolve-stream-fixups (buf)
+  (dolist (f *68k-stream-fixups*)
+    (destructuring-bind (pos label size base) f
+      (let* ((target (or (gethash label (m68k-buffer-labels buf))
+                         (error "68k threaded: undefined label ~D" label)))
+             (v (- target base)))
+        (when (and (= size 2) (not (<= -32768 v 32767)))
+          (error "68k threaded: branch of ~D bytes in a 16-bit stream operand" v))
+        (dotimes (i size)
+          (m68k-set-byte buf (+ pos i) (ldb (byte 8 (* 8 (- size 1 i))) v)))))))
+
+;;; --- handlers ---
+
+(defun m68k-emit-fetch (buf size dn)
+  "Dn = the next SIZE-byte signed stream operand, sign-extended; A5 advances."
+  (ecase size
+    (1 (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))   ; MOVE.B (A5)+,Dn
+       (m68k-emit-word buf (logior #x49C0 dn)))                               ; EXTB.L Dn
+    (2 (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ dn 3 5))   ; MOVE.W (A5)+,Dn
+       (m68k-emit-word buf (logior #x48C0 dn)))                               ; EXT.L Dn
+    (4 (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-dn+ dn 3 5))))) ; MOVE.L (A5)+,Dn
+
+(defun m68k-emit-fetch-target (buf)
+  "A0 = the address a 32-bit relative stream operand names (target - its end)."
+  (m68k-emit-fetch buf 4 +68k-d0+)
+  (m68k-emit-word buf #x41F5)                     ; LEA (0,A5,D0.L),A0
+  (m68k-emit-word buf #x0800))
+
+(defun m68k-emit-stream-branch (buf cc w)
+  "Take the stream branch whose offset follows when CC holds (CC NIL: always).
+   MOVEA and ADDA leave the condition codes alone."
+  (m68k-emit-word buf (if (= w 2) #x305D #x205D)) ; MOVEA.W / MOVEA.L (A5)+,A0
+  (when cc
+    (m68k-emit-word buf (logior #x6002 (ash (logxor cc 1) 8))))  ; B!cc.S over the ADDA
+  (m68k-emit-word buf #xDBC8))                    ; ADDA.L A0,A5
+
+(defun m68k-emit-thread-handler (buf key function-table)
+  "The native body of shape KEY (without the trailing BRA next); T when it
+   ends in a return or a jump of its own."
+  (let ((*68k-bytecode* nil) (lm (make-hash-table :test 'eql)))
+    (flet ((native (op operands)
+             (m68k-translate-insn buf op operands 0 lm function-table)
+             (when (plusp (hash-table-count lm))
+               (error "68k threaded: shape ~S referenced an MVM label" key))))
+      (case (first key)
+        (:li (m68k-emit-fetch buf (third key) +68k-d0+)
+         (m68k-store-vreg buf (second key) +68k-d0+) nil)
+        (:li-const (m68k-emit-fetch buf 4 +68k-d0+)
+         (m68k-store-vreg buf (second key) +68k-d0+) nil)
+        (:br (m68k-emit-stream-branch buf nil (second key)) nil)
+        (:ret (m68k-emit-move-disp-an buf +68k-a6+ -4 +68k-a5+)
+         (m68k-emit-epilogue buf) t)
+        (:enter (native +op-trap+ (list (second key)))
+         (m68k-emit-move-an-disp buf +68k-a1+ +68k-a6+ -4) nil)
+        (:fused
+         (destructuring-bind (fk brop w) (rest key)
+           (m68k-emit-thread-flag buf fk function-table #'native)
+           (m68k-emit-stream-branch buf (m68k-cond-br-cc brop) w))
+         nil)
+        (t
+         (let ((op (first key)))
+           (cond
+             ((or (eql op +op-cmp-imm+) (eql op +op-test-imm+))
+              (m68k-emit-thread-flag buf key function-table #'native) nil)
+             ((eql op +op-call+)
+              (m68k-emit-fetch-target buf)
+              (m68k-emit-jsr-an-ind buf +68k-a0+) nil)
+             ((eql op +op-tailcall+)
+              (m68k-emit-fetch-target buf)
+              (m68k-emit-move-disp-an buf +68k-a6+ -4 +68k-a5+)
+              (m68k-emit-movem-from-postinc buf (logior (ash 1 4) (ash 1 5) (ash 1 6) (ash 1 7)))
+              (m68k-emit-unlk buf +68k-a6+)
+              (m68k-emit-jmp-an-ind buf +68k-a0+) t)
+             ((eql op +op-fn-addr+)
+              (if (eq (third key) :nil)
+                  (native op (list (second key) #xFFFFFFF0))
+                  (progn (m68k-emit-fetch-target buf)
+                         (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+)
+                         (m68k-emit-ori buf +68k-d0+ 3)
+                         (m68k-store-vreg buf (second key) +68k-d0+)))
+              nil)
+             ((or (eql op +op-bnull+) (eql op +op-bnnull+))
+              (let ((ds (m68k-vreg-or-scratch buf (second key) +68k-d0+)))
+                (m68k-emit-cmpa buf +68k-a4+ ds))
+              (m68k-emit-stream-branch buf (if (eql op +op-bnull+) +68k-cc-eq+ +68k-cc-ne+)
+                                       (third key))
+              nil)
+             (t (native op (rest key)) nil))))))))
+
+(defun m68k-emit-thread-flag (buf fk function-table native)
+  "A flag setter's body: CMP / TEST natively, CMP-IMM / TEST-IMM with the
+   immediate from the stream (the native forms' exact instructions)."
+  (declare (ignore function-table))
+  (let ((op (first fk)))
+    (cond ((eql op +op-cmp-imm+)
+           (let ((da (m68k-vreg-or-scratch buf (second fk) +68k-d0+)))
+             (m68k-emit-fetch buf (third fk) +68k-d1+)
+             (m68k-emit-cmp-dn-dn buf +68k-d1+ da)))
+          ((eql op +op-test-imm+)
+           (m68k-load-vreg buf +68k-d0+ (second fk))
+           (m68k-emit-fetch buf (third fk) +68k-d1+)
+           (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
+           (m68k-emit-tst buf +68k-d0+))
+          (t (funcall native op (rest fk))))))
+
+(defun m68k-emit-thread-dispatch (buf function-table)
+  "The escape, NEXT, the table (32-bit handler offsets from its own start),
+   then every handler."
+  (let* ((shapes (let (l) (maphash (lambda (k v) (declare (ignore k)) (push v l))
+                                   *68k-thread-shapes*)
+                   (sort l #'< :key (lambda (v) (svref v 0)))))
+         (n (1+ (reduce #'max shapes :key (lambda (v) (svref v 0)) :initial-value 255)))
+         (by-index (let ((a (make-array n :initial-element nil)))
+                     (dolist (v shapes a) (setf (aref a (svref v 0)) v))))
+         (tpos 0)
+         (table (mvm-make-label))
+         (escape (mvm-make-label)))
+    (m68k-word-align buf)
+    (flet ((d8-to-table (opword extword-base)
+             ;; OPWORD, then a brief extension word whose d8 reaches TABLE;
+             ;; resolved below once TABLE's position is known.
+             (m68k-emit-word buf opword)
+             (let ((ext (m68k-buffer-position buf)))
+               (m68k-emit-word buf extword-base)
+               ext)))
+      ;; escape: D0 = the 16-bit index after 255
+      (m68k-emit-label buf escape)
+      (m68k-emit-moveq buf +68k-d0+ 0)
+      (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ 0 3 5))   ; MOVE.W (A5)+,D0
+      (let ((e1 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3) #x0400)) ; MOVE.L (d8,PC,D0.W*4),D0
+            (e2 (d8-to-table #x4EFB #x0800)))                                       ; JMP (d8,PC,D0.L)
+        ;; NEXT
+        (m68k-emit-label buf *68k-thread-next-label*)
+        (m68k-emit-moveq buf +68k-d0+ 0)
+        (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ 0 3 5))   ; MOVE.B (A5)+,D0
+        (let ((e3 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3) #x0400))
+              (e4 (d8-to-table #x4EFB #x0800)))
+          (m68k-emit-label buf table)
+          (setq tpos (m68k-buffer-position buf))
+          (progn
+            (dolist (e (list e1 e2 e3 e4))
+              (let ((d8 (- tpos e)))
+                (unless (<= 0 d8 127) (error "68k threaded: table out of d8 reach"))
+                (let ((i (ash e -1)))
+                  (setf (aref (m68k-buffer-words buf) i)
+                        (logior (aref (m68k-buffer-words buf) i) d8))))))
+          ;; the table: entry I = handler I - table; 255 is the escape
+          (dotimes (i n)
+            (let ((label (if (aref by-index i) (svref (aref by-index i) 1) escape)))
+              (m68k-emit-word buf 0) (m68k-emit-word buf 0)
+              (push (list (- (m68k-buffer-word-count buf) 2) label :disp32 (+ tpos 2))
+                    (m68k-buffer-fixups buf))))
+          ;; shapes at index >= 255 are reached through the escape: their
+          ;; table entry is at index I as well (the escape reads I itself).
+          )))
+    ;; the handlers
+    (dolist (v shapes)
+      (m68k-emit-label buf (svref v 1))
+      (unless (m68k-emit-thread-handler buf (svref v 3) function-table)
+        (m68k-emit-bra buf *68k-thread-next-label*)))))
 
 ;;; ============================================================
 ;;; Installer
@@ -4066,7 +4567,7 @@
 
 (defun m68k-emit-copy-words (buf from-an to-an)
   "Copy the 7 jmpbuf longwords from 0(FROM-AN) to 0(TO-AN) through D1."
-  (dotimes (i +68k-jmpbuf-words+)
+  (dotimes (i (m68k-jmpbuf-words))
     (m68k-emit-move-disp-dn buf from-an (* 4 i) +68k-d1+)
     (m68k-emit-move-dn-disp buf +68k-d1+ to-an (* 4 i))))
 
@@ -4129,7 +4630,7 @@
     (m68k-emit-label buf empty)                             ; zero the whole jmpbuf
     (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
     (m68k-emit-move-imm-dn buf 0 +68k-d1+)
-    (dotimes (i +68k-jmpbuf-words+)
+    (dotimes (i (m68k-jmpbuf-words))
       (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a1+ (* 4 i)))
     (m68k-emit-label buf done)))
 

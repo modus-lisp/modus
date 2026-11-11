@@ -265,6 +265,28 @@
   (when (and v (plusp (length v)) (not (string= v "0")))
     (setf modus.mvm::*68k-gc-poison* t)
     (format t "~&;; MODUS_68K_GC_POISON: collections poison the evacuated semispace~%")))
+
+;; MODUS_68K_PROFILE=1: per-function execution counters (translate-68k.lisp
+;; *68K-PROFILE*) -- a profiling build, for choosing what stays native.
+(when (let ((v (sb-ext:posix-getenv "MODUS_68K_PROFILE"))) (and v (string/= v "0")))
+  (setf *68k-profile* t))
+
+;; MODUS_68K_THREADED=1: every function that can be is THREADED cold code --
+;; a byte token stream run by shared native handlers (translate-68k.lisp
+;; *68K-THREADED*).  A5 is then the token pointer, so it does not hold the
+;; globals base.
+(when (let ((v (sb-ext:posix-getenv "MODUS_68K_THREADED"))) (and v (string/= v "0")))
+  (setf *68k-threaded* :all *68k-a5-globals* nil)
+  (format t "~&;; MODUS_68K_THREADED: cold functions as threaded code~%")
+  ;; MODUS_68K_HOT=FILE: function names, one a line, that stay native (a
+  ;; profile's hottest: MODUS_68K_PROFILE).
+  (let ((f (sb-ext:posix-getenv "MODUS_68K_HOT")))
+    (when (and f (plusp (length f)))
+      (let ((h (make-hash-table :test 'equal)))
+        (with-open-file (in f)
+          (loop for l = (read-line in nil) while l
+                do (let ((n (string-trim " " l))) (when (plusp (length n)) (setf (gethash n h) t)))))
+        (setf *68k-hot-names* h)))))
 (let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                 "/tmp/modus-68k-cli"))
        (image (build-image :target :linux-68k

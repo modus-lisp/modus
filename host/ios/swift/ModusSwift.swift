@@ -1270,6 +1270,21 @@ let splitPresent: Call = { primary, secondary, _, _, _, _ in
     return handle
 }
 
+// gravity_drop(handle): the view falls under gravity (UIDynamicAnimator) until it comes to rest on the bottom of its
+// superview.  The animator is kept by the handle, so the fall runs on.
+private var animators: [UInt: UIDynamicAnimator] = [:]
+
+let gravityDrop: Call = { h, _, _, _, _, _ in
+    guard let view = views[h], let container = view.superview else { return 0 }
+    let animator = UIDynamicAnimator(referenceView: container)
+    animator.addBehavior(UIGravityBehavior(items: [view]))
+    let collision = UICollisionBehavior(items: [view])
+    collision.translatesReferenceBoundsIntoBoundary = true
+    animator.addBehavior(collision)
+    animators[h] = animator
+    return 1
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1560,6 +1575,7 @@ public func modusSwiftInstall() {
     register("ui_edit_menu_on", editMenuOn)
     register("ui_popover_present", popoverPresent)
     register("ui_split_present", splitPresent)
+    register("ui_gravity_drop", gravityDrop)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

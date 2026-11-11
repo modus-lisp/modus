@@ -88,6 +88,16 @@ All opt-in; unset, every image is built as before.  68k soft float:
 - **Boot data built at boot.**  Packages, symbols, the name and function
   tables: most of the heap floor, held twice over by the copying collector.
   Some of it was written as code that runs once (`dfa4db90`, `4a321be3`).
+  Measured at the REPL prompt (68k small + narrow image, a heap dump walked
+  by the collector's kind map): ~1.4 MB in the live semispace, of which
+  0.8 MB is 13,200 WIDE strings (4 bytes a character) -- mostly symbol and
+  package names, 7,900 of them in one hash-table storage vector that could
+  not be tied to a live global (it may be a stale generation) -- 0.27 MB
+  conses, 0.23 MB arrays.  `*SYM-NAME-TABLE*` (11,940 names) is narrow, as
+  are symbol names; the symbol-function table has 240 wide keys.  `COPY-SEQ`
+  and `SUBSEQ` of a narrow string return a WIDE string (CL says the result
+  keeps the element type), and package names are wide.  The heap floor is
+  between 5 and 6 MB.
 - **String literals** are built a character at a time, ~22 bytes of 68k a
   character.
 

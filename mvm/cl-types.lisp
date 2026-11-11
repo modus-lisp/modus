@@ -365,8 +365,8 @@
 
 (defun %exp-f-edges (x)
   "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
-   exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
-   the exponent bits.  The old version halved X until |X| <= 1 and squared back,
+   exact, |r| <= ln2/2; exp(r) by fdlibm's rational form (%EXP-F-GENERAL); scale
+   by 2^k through the exponent bits.  The old version halved X until |X| <= 1 and squared back,
    which amplified the Taylor error (mean 253 ulp against libm, max 5661) and
    cost a few hundred boxed float operations."
   (let ((hi (%float-hi32 x)))
@@ -394,40 +394,49 @@
   (%exp-f-edges x))
 
 (defun %exp-f-general (x)
-  "%EXP-F's arithmetic for a finite X that neither overflows nor underflows."
-       ;; The arithmetic is unboxed double trees (declared DOUBLE-FLOAT locals and
-       ;; literal constants), not %FLOAT-* calls: it was ~40 boxed operations an
-       ;; EXP, 0.8 us, and illatio's SwiGLU calls EXP 117k times a token.  The
-       ;; operations and their order are the old ones, so the bits are too: the
-       ;; series below is the old loop acc = 1 + (r*acc)/n, n = 13..1, unrolled,
-       ;; each step written deep-operand-first so the tree fits the FP pool
-       ;; (IEEE + and * are exactly commutative; r*1 = r and x/1 = x exactly).
-       ;; The literals are the old bit patterns: 1/ln2 #x3FF71547652B82FE,
-       ;; ln2_hi #x3FE62E42FEE00000, ln2_lo #x3DEA39EF35793C76.
-       (let* ((xd x)
-              (tq (* xd 1.4426950408889634d0))                   ; x / ln2
-              ;; k = truncate(tq +- 0.5): round half away from zero, as before
-              (k (if (< tq 0d0)
-                     (the (signed-byte 32) (truncate (- tq 0.5d0)))
-                     (the (signed-byte 32) (truncate (+ tq 0.5d0)))))
-              (r (- (- xd (* (float k 1d0) 0.6931471803691238d0))
-                    (* (float k 1d0) 1.9082149292705877d-10)))
-              ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
-              (acc (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ r 13d0) 1d0) r) 12d0) 1d0) r) 11d0) 1d0) r) 10d0) 1d0) r) 9d0) 1d0) r) 8d0) 1d0) r) 7d0) 1d0) r) 6d0) 1d0) r) 5d0) 1d0) r) 4d0) 1d0) r) 3d0) 1d0) r) 2d0) 1d0) r) 1d0) 1d0)))
-         (declare (type double-float xd tq r acc) (type (signed-byte 32) k))
-         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends.
-         ;; The normal-range 2^k are the same doubles as before, read from a table
-         ;; instead of built from their bits on every call.
-         (cond ((and (>= k -1022) (<= k 1023))
-                (let ((p (svref (%exp2-table) (+ k 1022))))
-                  (declare (type double-float p))
-                  (* acc p)))
-               ((> k 1023)
-                (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
-                            (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
-               (t
-                (%float-mul (%float-mul acc (%dbl (ash (+ (+ k 600) 1023) 20) 0))
-                            (%dbl (ash (+ -600 1023) 20) 0))))))
+  "%EXP-F's arithmetic for a finite X that neither overflows nor underflows:
+   fdlibm's __ieee754_exp.  x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
+   exact; c = r - t P(t), t = r^2, P of degree 5; exp(r) = 1 - ((lo - rc/(2 - c))
+   - hi); times 2^k.  Within 1 ulp of libm (90% exact over [-20, 20]).  The
+   degree-13 Horner series it replaced chained thirteen dependent divisions.
+   The trees are written left-deep (IEEE + and * commute exactly) to fit the
+   FP registers; %EMIT-EXP-DOUBLE-CORE is this, in registers, step for step."
+  ;; The literals' bits: 1/ln2 #x3FF71547652B82FE, ln2_hi #x3FE62E42FEE00000,
+  ;; ln2_lo #x3DEA39EF35793C76; P1..P5 are fdlibm's.
+  (let* ((xd x)
+         (tq (* xd 1.4426950408889634d0))                   ; x / ln2
+         ;; k = truncate(tq +- 0.5): round half away from zero
+         (k (if (< tq 0d0)
+                (the (signed-byte 32) (truncate (- tq 0.5d0)))
+                (the (signed-byte 32) (truncate (+ tq 0.5d0)))))
+         (kd (float k 1d0))
+         (hi (- xd (* kd 0.6931471803691238d0)))
+         (lo (* kd 1.9082149292705877d-10))
+         (r (- hi lo))
+         (tt (* r r))
+         (c (- r (* (+ (* (+ (* (+ (* (+ (* tt 4.13813679705723846039d-08)
+                                         -1.65339022054652515390d-06)
+                                      tt)
+                                   6.61375632143793436117d-05)
+                                tt)
+                             -2.77777777770155933842d-03)
+                          tt)
+                       1.66666666666666019037d-01)
+                    tt)))
+         (acc (- 1d0 (- (- lo (/ (* r c) (- 2d0 c))) hi))))
+    (declare (type double-float xd tq kd hi lo r tt c acc) (type (signed-byte 32) k))
+    ;; times 2^k: one exponent-bits scale in the normal range, two near the ends.
+    (cond ((and (>= k -1022) (<= k 1023))
+           (let ((p (svref (%exp2-table) (+ k 1022))))
+             (declare (type double-float p))
+             (* acc p)))
+          ((> k 1023)
+           (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
+                       (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
+          (t
+           (%float-mul (%float-mul acc (%dbl (ash (+ (+ k 600) 1023) 20) 0))
+                       (%dbl (ash (+ -600 1023) 20) 0))))))
+
 (defun %log-f (x)
   "Natural log of double X > 0.  x = m 2^e exactly from the IEEE bits (a
    subnormal is scaled by 2^54 first), m brought into [sqrt(1/2), sqrt 2);

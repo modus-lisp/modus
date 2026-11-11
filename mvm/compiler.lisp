@@ -9929,7 +9929,7 @@
             (or *mvm-eval-runtime-p* *target-has-fpd-p*)
             (consp (cdr form)) (null (cddr form))
             (let ((n (%fpd-pure-need (cadr form) env)))
-              (and n (<= (+ *fp-reg-counter* (max n 7)) +fp-reg-max+))))
+              (and n (<= (+ *fp-reg-counter* (max n 8)) +fp-reg-max+))))
        (let ((fd (alloc-fp-reg)))
          (compile-double-unboxed (cadr form) env fd)
          (%emit-exp-double-full env fd)
@@ -21955,13 +21955,13 @@
     ;; a single-float tree widened in register (fcvt d<-s), not a hoisted call
     ((and (%double-conversion-arg form) (%fp-tree-need (%double-conversion-arg form) env))
      (%fp-tree-need (%double-conversion-arg form) env))
-    ;; (EXP d) of a double tree: %EMIT-EXP-DOUBLE-FULL, no call.  Its peak is 6
-    ;; with the result: x and a constant beside the core's three (k's double, r,
-    ;; one series operand); 7, as the single EXP, for a margin.  Ten made
-    ;; (/ 1d0 (+ 1d0 (exp ...))) -- a sigmoid -- not fit, and box everything
+    ;; (EXP d) of a double tree: %EMIT-EXP-DOUBLE-FULL, no call.  Its peak is 8
+    ;; with the result: x held beside the core's 7.  An over-estimate costs
+    ;; real code: ten made (/ 1d0 (+ 1d0 (exp ...))) -- a sigmoid -- not fit
+    ;; beside its input, and box everything
     ((and (%fp-exp-arg form) (or *mvm-eval-runtime-p* *target-has-fpd-p*))
      (let ((n (%fpd-tree-need (%fp-exp-arg form) env)))
-       (and n (max n 7))))
+       (and n (max n 8))))
     ;; an inlined call: (let ((p arg) ...) body).  Pure inits only: a hoisted
     ;; conversion is evaluated before the tree, outside the LET's scope
     ((%fp-tree-let-parts form)
@@ -22460,7 +22460,7 @@
           so %EXP-F's two-step scales never apply; a NaN passes the clamps
           and stays NaN;
      k  = truncate(xd/ln2 +- 0.5), r = (xd - k ln2_hi) - k ln2_lo,
-     exp(r) by the degree-13 Horner series, times 2^k (fpd-scale), rounded
+     exp(r) by fdlibm's rational form (one division), times 2^k (fpd-scale), rounded
      to single.
    SwiGLU and softmax call EXP per element; through the generic function it
    was ~250 ns."
@@ -22481,9 +22481,13 @@
 
 (defun %emit-exp-double-core (env fd &optional wide)
   "FD <- exp(FD), FD a double with exp(FD) and 2^k normal (the caller has
-   bounded it): %EXP-F's normal path, operation for operation, so its bits.
-   k = truncate(xd/ln2 +- 0.5), r = (xd - k ln2_hi) - k ln2_lo, the degree-13
-   Horner series, times 2^k (fpd-scale, the multiply %EXP-F's table does)."
+   bounded it, or passes WIDE): %EXP-F-GENERAL operation for operation, so its
+   bits.  fdlibm's __ieee754_exp: k = truncate(xd/ln2 +- 0.5), hi = xd - k
+   ln2_hi, lo = k ln2_lo, r = hi - lo, t = r^2, c = r - t P(t) (degree 5),
+   y = 1 - ((lo - rc/(2 - c)) - hi), times 2^k.  One division; the degree-13
+   series it replaced chained thirteen.  At most 7 FP registers, FD included:
+   each tree below is left-deep (IEEE + and * commute exactly), and the
+   registers of dead values are reused."
   (let* ((xd (%mvm-gensym "XD")) (tq (%mvm-gensym "TQ")) (kd (%mvm-gensym "KD")) (r (%mvm-gensym "R"))
          (ft (alloc-fp-reg))
          (e1 (%fp-env-with-fpd env (list xd) (list fd)))
@@ -22507,20 +22511,43 @@
       (emit-ir :fp-toi kreg fu 5)                                 ; truncate, double
       (free-temp-reg) (free-temp-reg)
       (free-fp-reg) (free-fp-reg))
-    ;; kd = k as a double (FT, tq is dead); r = (xd - kd ln2_hi) - kd ln2_lo
+    ;; kd = k as a double (FT, tq is dead)
     (emit-ir :fpd-itof ft kreg)
-    (let ((fr (alloc-fp-reg))
-          (e3 (%fp-env-with-fpd e1 (list kd) (list ft))))
-      (compile-double-unboxed (list '- (list '- xd (list '* kd 0.6931471803691238d0))
-                                    (list '* kd 1.9082149292705877d-10))
-                              e3 fr)
-      ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...))), %EXP-F's tree, into FD (xd is dead)
-      (let ((series 1d0))
-        (setq series (list '+ (list '/ r 13d0) 1d0))
-        (loop for n from 12 downto 1
-              do (setq series (list '+ (list '/ (list '* series r) (float n 1d0)) 1d0)))
-        (compile-double-unboxed series (%fp-env-with-fpd env (list r) (list fr)) fd))
-      (free-fp-reg))
+    (let* ((hi (%mvm-gensym "HI")) (lo (%mvm-gensym "LO")) (tt (%mvm-gensym "T"))
+           (c (%mvm-gensym "C")) (q (%mvm-gensym "Q"))
+           (e3 (%fp-env-with-fpd e1 (list kd) (list ft)))
+           (fh (alloc-fp-reg)) (fl (alloc-fp-reg)))
+      ;; hi = xd - kd ln2_hi;  lo = kd ln2_lo
+      (compile-double-unboxed (list '- xd (list '* kd 0.6931471803691238d0)) e3 fh)
+      (compile-double-unboxed (list '* kd 1.9082149292705877d-10) e3 fl)
+      ;; r = hi - lo, in FT (kd is dead);  t = r r, in FD (xd is dead)
+      (let ((e4 (%fp-env-with-fpd env (list hi lo) (list fh fl))))
+        (compile-double-unboxed (list '- hi lo) e4 ft)
+        (let ((e5 (%fp-env-with-fpd e4 (list r) (list ft))))
+          (compile-double-unboxed (list '* r r) e5 fd)
+          (let ((fc (alloc-fp-reg))
+                (e6 (%fp-env-with-fpd e5 (list tt) (list fd))))
+            ;; c = r - t(P1 + t(P2 + t(P3 + t(P4 + t P5)))), the product left-deep
+            (compile-double-unboxed
+             (list '- r (list '* (list '+ (list '* (list '+ (list '* (list '+ (list '* (list '+ (list '* tt 4.13813679705723846039d-08)
+                                                                                         -1.65339022054652515390d-06)
+                                                                                   tt)
+                                                                          6.61375632143793436117d-05)
+                                                                    tt)
+                                                           -2.77777777770155933842d-03)
+                                                     tt)
+                                            1.66666666666666019037d-01)
+                              tt))
+             e6 fc)
+            ;; q = rc / (2 - c), in FD (t is dead)
+            (let ((e7 (%fp-env-with-fpd e5 (list c) (list fc))))
+              (compile-double-unboxed (list '/ (list '* r c) (list '- 2d0 c)) e7 fd)
+              ;; w = (lo - q) - hi, in FT (r is dead);  y = 1 - w, in FD
+              (let ((e8 (%fp-env-with-fpd e4 (list q) (list fd))))
+                (compile-double-unboxed (list '- (list '- lo q) hi) e8 ft)
+                (compile-double-unboxed (list '- 1d0 r) e5 fd)))
+            (free-fp-reg))))
+      (free-fp-reg) (free-fp-reg))
     (if wide
         (%emit-fpd-scale-wide fd kreg)
         (emit-ir :fpd-scale fd kreg))
@@ -22561,14 +22588,15 @@
    709.782712893384 it is +infinity, below -745.1332191019411 +0.0, a NaN is
    returned as it came; between, %EMIT-EXP-DOUBLE-CORE with the two-step
    scales (the argument clamped to [-746, 710] first, which changes nothing
-   the selects keep, and bounds k for the scales)."
-  (let ((fx (alloc-fp-reg)) (fc (alloc-fp-reg)))
+   the selects keep, and bounds k for the scales).  The input's copy is the
+   only register held beside the core."
+  (let ((fx (alloc-fp-reg)))
     (emit-ir :fp-mov fx fd)
     (%emit-fpd-clamp fd -746d0 710d0 env)
     (%emit-exp-double-core env fd t)
-    ;; overflow: 709.78... < x  ->  +inf (1e300 * 1e300)
-    (compile-double-unboxed 709.782712893384d0 env fc)
-    (let ((fi (alloc-fp-reg)))
+    (let ((fc (alloc-fp-reg)) (fi (alloc-fp-reg)))
+      ;; overflow: 709.78... < x  ->  +inf (1e300 * 1e300)
+      (compile-double-unboxed 709.782712893384d0 env fc)
       (compile-double-unboxed 1d300 env fi)
       (emit-ir :fpd-mul fi fi fi)
       (%emit-fpd-select-if-lt fc fx fd fi)
@@ -22576,7 +22604,7 @@
       (compile-double-unboxed -745.1332191019411d0 env fc)
       (compile-double-unboxed 0d0 env fi)
       (%emit-fpd-select-if-lt fx fc fd fi)
-      (free-fp-reg))
+      (free-fp-reg) (free-fp-reg))
     ;; a NaN (not even x <= x) is returned as it came
     (let ((b (alloc-temp-reg)) (z (alloc-temp-reg)) (skip (make-compiler-label)))
       (emit-ir :fpd-le b fx fx)
@@ -22586,7 +22614,7 @@
       (emit-ir :fp-mov fd fx)
       (emit-ir-label skip)
       (free-temp-reg) (free-temp-reg))
-    (free-fp-reg) (free-fp-reg)))
+    (free-fp-reg)))
 
 (defun %fp-tanh-arg (form)
   "X when FORM is (TANH X)."

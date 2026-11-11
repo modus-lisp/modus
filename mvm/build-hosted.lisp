@@ -47,7 +47,12 @@
      "MODUS_PPC32_LINUX_OUT"   "/tmp/modus-ppc32-linux"   "qemu-ppc-static")
     ("68k"     ("boot/boot-linux-68k.lisp")
      "INSTALL-68K-TRANSLATOR"     "M68K-SET-LINUX-MODE"  :linux-68k
-     "MODUS_68K_LINUX_OUT"     "/tmp/modus-68k-linux"     "qemu-m68k-static")))
+     "MODUS_68K_LINUX_OUT"     "/tmp/modus-68k-linux"     "qemu-m68k-static")
+    ;; Not hosted: the bare 68k Mac (boot/boot-mac68k.lisp), a flat image for
+    ;; scripts/mac68k-disk.py; the same single-source build.
+    ("mac68k"  ("boot/boot-linux-68k.lisp" "boot/boot-mac68k.lisp")
+     "INSTALL-68K-TRANSLATOR"     "MAC68K-CONFIGURE"     :mac68k
+     "MODUS_MAC68K_OUT"        "/tmp/modus-mac68k.bin"    "scripts/mac68k-disk.py")))
 
 (defparameter *hosted-port*
   (let ((arch (second sb-ext:*posix-argv*)))
@@ -58,13 +63,13 @@
 
 (destructuring-bind (arch boot-files installer mode-setter target out-env out-default qemu)
     *hosted-port*
-  (declare (ignore arch))
+
   (dolist (f boot-files) (mvm-load f))
   (require :sb-posix)
   (funcall (find-symbol installer :modus.mvm))
   (funcall (find-symbol mode-setter :modus.mvm) t)
   ;; MODUS_68K_TAGS3=1: 68k's 3-bit tags and 8-byte granule (target.lisp).
-  (when (and (string= arch "68k")
+  (when (and (member arch '("68k" "mac68k") :test #'string=)
              (equal (sb-ext:posix-getenv "MODUS_68K_TAGS3") "1"))
     (setf (symbol-value (find-symbol "*68K-TAGS3*" :modus.mvm)) t))
   (let* ((src (third sb-ext:*posix-argv*))

@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""mac68k-ladder.py [RUNG...] -- the architecture ladder on a bare 68k Mac.
+
+Each rung (test/arch-rungs/) is built for the :mac68k target
+(`mvm/build-hosted.lisp mac68k`, boot/boot-mac68k.lisp), written to a boot
+disk (scripts/mac68k-disk.py) and booted under Basilisk II: the Mac ROM runs
+our boot blocks, which load the image, which answers over serial port A --
+four bytes, as on the hosted ladder.  Basilisk's serial port A is a
+pseudo-terminal this script reads.
+
+Environment:
+  MAC68K_ROM        the Mac ROM file (required; Apple's, so not in the tree).
+                    Measured with the LC 475 / Quadra 605 ROM (FF7439EE).
+  MAC68K_BASILISK   the command that runs Basilisk II (default BasiliskII); it
+                    gets Basilisk's own arguments appended.  It must have a
+                    display (Basilisk's GTK insists) -- a wrapper that starts an
+                    Xvfb is the usual answer on a headless box.
+  MAC68K_FPU        "false" (default: a 68LC040) or "true" (a 68040).
+  MAC68K_LADDER_JOBS  cells at once (default 4).
+
+The rules are hosted-ladder.py's: a deliberately wrong expectation runs first
+and must come back WRONG (built, ran, rejected), or nothing is run.
+"""
+import os, pty, re, select, shlex, signal, subprocess, sys, tempfile, time, tty
+from concurrent.futures import ThreadPoolExecutor
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNGS = os.path.join(REPO, "test", "arch-rungs")
+
+
+def payload(rung_source):
+    """The rung, then KERNEL-MAIN: the answer as 4 bytes, then halt."""
+    return (rung_source + "\n(defun kernel-main ()\n"
+            "  (let ((v (probe)))\n"
+            "    (write-char-serial (logand v 255))\n"
+            "    (write-char-serial (logand (ash v -8) 255))\n"
+            "    (write-char-serial (logand (ash v -16) 255))\n"
+            "    (write-char-serial (logand (ash v -24) 255))\n"
+            "    (sys-exit 0)))\n")
+
+
+def expected_of(path):
+    with open(path) as f:
+        m = re.search(r"expect\s+(-?\d+)", f.read())
+    return int(m.group(1)) if m else None
+
+
+def boot(disk, nbytes, timeout=90):
+    """Boot DISK under Basilisk II; return the first NBYTES from serial port A."""
+    master, slave = pty.openpty()
+    tty.setraw(slave)
+    cmd = shlex.split(os.environ.get("MAC68K_BASILISK", "BasiliskII")) + [
+        "--nogui", "true", "--rom", os.environ["MAC68K_ROM"],
+        "--cpu", "4", "--fpu", os.environ.get("MAC68K_FPU", "false"),
+        "--ramsize", str(384 << 20),
+        "--disk", disk, "--seriala", os.ttyname(slave)]
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    got, end = b"", time.time() + timeout
+    try:
+        while len(got) < nbytes and time.time() < end and p.poll() is None:
+            r, _, _ = select.select([master], [], [], 0.5)
+            if r:
+                got += os.read(master, 64)
+    finally:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        p.wait(timeout=30)
+        os.close(master)
+        os.close(slave)
+    return got
+
+
+def run_cell(rung_path, expect, keep=False):
+    with open(rung_path) as f:
+        src = f.read()
+    tmpdir = tempfile.mkdtemp(prefix="mac68k-ladder-")
+    srcfile = os.path.join(tmpdir, "payload.lisp")
+    binfile = os.path.join(tmpdir, "image.bin")
+    disk = os.path.join(tmpdir, "boot.dsk")
+    with open(srcfile, "w") as f:
+        f.write(payload(src))
+    b = subprocess.run(["sbcl", "--dynamic-space-size", "4096", "--script",
+                        os.path.join(REPO, "mvm/build-hosted.lisp"), "mac68k", srcfile],
+                       cwd=REPO, env=dict(os.environ, MODUS_MAC68K_OUT=binfile),
+                       capture_output=True, text=True, timeout=1800)
+    if not os.path.exists(binfile):
+        return "BUILD", "BUILD FAILED: " + (b.stderr or b.stdout)[-300:]
+    subprocess.run([sys.executable, os.path.join(REPO, "scripts/mac68k-disk.py"),
+                    binfile, disk], check=True, capture_output=True)
+    out = boot(disk, 4)
+    if not keep:
+        subprocess.run(["rm", "-rf", tmpdir])
+    if len(out) < 4:
+        return "RUN", f"SHORT OUTPUT ({len(out)} bytes) {out!r}"
+    got = int.from_bytes(out[:4], "little")
+    return ("PASS" if got == expect else "WRONG"), \
+           f"{'=' if got == expect else '!='} {got} (want {expect})"
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    keep = "--keep" in sys.argv
+    if "MAC68K_ROM" not in os.environ:
+        print("mac68k-ladder: set MAC68K_ROM to a Mac ROM file")
+        return 2
+    rungs = sorted(os.path.join(RUNGS, f) for f in os.listdir(RUNGS) if f.endswith(".lisp"))
+    if args:
+        rungs = [a if os.path.exists(a) else os.path.join(RUNGS, a) for a in args]
+    outcome, why = run_cell(rungs[0], expected_of(rungs[0]) + 1)
+    if outcome != "WRONG":
+        print(f"mac68k: POSITIVE CONTROL {outcome} ({why}) -- refusing to run")
+        return 2
+    print(f"mac68k: positive control answered WRONG as required ({why})")
+    n = max(1, min(int(os.environ.get("MAC68K_LADDER_JOBS", "4")), len(rungs)))
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        results = list(pool.map(lambda r: (r,) + run_cell(r, expected_of(r), keep), rungs))
+    failures = 0
+    for r, outcome, why in results:
+        if outcome != "PASS":
+            failures += 1
+        print(f"  {os.path.basename(r):<26} mac68k   "
+              f"{outcome if outcome != 'WRONG' else 'FAIL':<5} {why}")
+    print(f"\nmac68k ladder: {failures} failed")
+    return 0 if failures == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -29,10 +29,16 @@
 ;; Lisp NIL) is true.  Comparison opcodes in the compiler build their T as
 ;; (nil | 8) = #xDEAD0009 — also non-NIL, so truthy.  mvm-nil-p must therefore
 ;; key on #xDEAD0001 exactly.
-(defconstant +mvm-nil+ #xDEAD0001)
+(defconstant +mvm-nil+ +nil-value+)
 (defconstant +mvm-t+   +t-value+)
-;; T's low byte: its object tag, #x09, or #x07 on 68k's 3-bit scheme.  The LI
-;; arm recognises T by its wire bytes.
+;; The LI arm recognises NIL and T by their wire bytes (little-endian in the
+;; bytecode): both share NIL's page's top half (#xDEAD, or the 68k Mac's RAM
+;; page), then NIL's low half, or T's byte 1 and its tag byte.
+(defconstant +mvm-nil-b3+ (logand (ash +nil-value+ -24) #xFF))
+(defconstant +mvm-nil-b2+ (logand (ash +nil-value+ -16) #xFF))
+(defconstant +mvm-nil-b1+ (logand (ash +nil-value+ -8) #xFF))
+(defconstant +mvm-nil-b0+ (logand +nil-value+ #xFF))
+(defconstant +mvm-t-b1+ (logand (ash +t-value+ -8) #xFF))
 (defconstant +mvm-t-low-byte+ (logand +t-value+ #xFF))
 
 (declaim (inline tag-fixnum untag-fixnum mvm-nil-p mvm-boolean))
@@ -1832,13 +1838,14 @@
              (let* ((hi (logior (aref bc (+ npc 4)) (ash (aref bc (+ npc 5)) 8)
                                 (ash (aref bc (+ npc 6)) 16) (ash (aref bc (+ npc 7)) 24)))
                     (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi))
-                    (deadp (and (= (aref bc (+ npc 3)) #xDE)
-                                (= (aref bc (+ npc 2)) #xAD)
+                    (deadp (and (= (aref bc (+ npc 3)) +mvm-nil-b3+)
+                                (= (aref bc (+ npc 2)) +mvm-nil-b2+)
                                 (= hi-signed 0))))
                (cond
-                 ((and deadp (= (aref bc (+ npc 1)) #x00) (= (aref bc npc) #x01))
+                 ((and deadp (= (aref bc (+ npc 1)) +mvm-nil-b1+)
+                       (= (aref bc npc) +mvm-nil-b0+))
                   (reg-set-nil regs vd) (setf pc (+ npc 8)))
-                 ((and deadp (= (aref bc (+ npc 1)) #x10)
+                 ((and deadp (= (aref bc (+ npc 1)) +mvm-t-b1+)
                        (= (aref bc npc) +mvm-t-low-byte+))
                   (reg-set-t regs vd) (setf pc (+ npc 8)))
                  ;; |W| >= 2^+fixnum-bits+: the word is not a fixnum VALUE, so

@@ -637,6 +637,19 @@
    +M68K-UART-BASE+ does not exist in our address space there.
    M68K-SET-LINUX-MODE moves the slots and turns the console byte into write(2).")
 
+(defparameter *68k-mac-mode* nil
+  "T when building a BARE 68k MACINTOSH image (boot/boot-mac68k.lisp): booted
+   from the disk's boot blocks by the Mac ROM, no OS, no MMU.  It keeps the
+   HOSTED memory map -- the low block at #x10000000, the heap above it, the
+   native collector -- in real RAM (a Mac with at least 384 MB, as Basilisk II
+   gives), and swaps the Linux service traps for the Mac's: the console is the
+   ROM's serial driver, the clock is Ticks, exit is a halt.  ARM32's
+   *ARM32-CL-BARE* shape.  M68K-SET-MAC-MODE.")
+
+(defun m68k-hosted-layout-p ()
+  "The hosted memory map: Linux/m68k, or a bare Mac that keeps it."
+  (or *68k-linux-mode* *68k-mac-mode*))
+
 (defparameter *68k-hosted-globals-base* #x10000A00
   "Convention slots for the HOSTED port, inside the mmap'd heap and above the
    Cheney metadata at #x10000040 — the address every hosted port picks.")
@@ -675,7 +688,7 @@
 
 (defun m68k-a5-disp (addr)
   "ADDR's displacement from A5 when A5 holds the globals base and it fits d16."
-  (and *68k-a5-globals* *68k-linux-mode*
+  (and *68k-a5-globals* (m68k-hosted-layout-p)
        (let ((d (- addr *68k-hosted-globals-base*)))
          (and (<= -32768 d 32767) d))))
 
@@ -1564,6 +1577,35 @@
             (m68k-emit-asr-imm buf +68k-d1+ 1)
             (m68k-emit-move-imm-dn buf +68k-linux-sys-exit+ +68k-d0+)
             (m68k-emit-trap buf 0))
+           ;; --- THE BARE MAC (*68K-MAC-MODE*): the ROM is the platform -------
+           ((and (= code #x0300) *68k-mac-mode*)
+            ;; serial write: the untagged byte to putc
+            (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+            (m68k-emit-asr-imm buf +68k-d0+ 1)
+            (m68k-emit-mac-putc buf))
+           ((and (= code #x0301) *68k-mac-mode*)
+            ;; serial read: getc waits for a byte; TAGGED in V0, as hosted
+            (m68k-emit-bsr-long buf *68k-mac-getc-label*)
+            (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))
+           ((and (= code #x0310) *68k-mac-mode*)
+            ;; the clock: Ticks ($16A), the ROM's 60 Hz count, TAGGED
+            (m68k-emit-word buf #x2438) (m68k-emit-word buf #x016A)   ; MOVE.L $16A.W,D2
+            (m68k-emit-lsl-imm buf +68k-d2+ 1))
+           ((and (= code #x0311) *68k-mac-mode*)
+            ;; its rate: 60 Hz, TAGGED
+            (m68k-emit-move-imm-dn buf 120 +68k-d2+))
+           ((and (or (= code #x0500) (= code #x0304)) *68k-mac-mode*)
+            ;; exit / halt: nothing to return to -- spin with interrupts on, so
+            ;; the ROM's serial and tick machinery keep running
+            (m68k-emit-word buf #x60FE))                              ; BRA.S *
+           ((and (= code #x0520) *68k-mac-mode*)
+            ;; signal handlers: none on a bare Mac (a fault is the ROM's)
+            nil)
+           ((and *68k-mac-mode* (> code 15))
+            ;; a Linux service trap: a gap here, recorded, and ILLEGAL if run
+            (pushnew (+ #x10000 code) *68k-unimpl-opcodes*)
+            (m68k-emit-word buf #x4AFC))
            ((= code #x0300)
             ;; BARE METAL: serial write.  V0 IS D2, NOT D0 — this arm read D0
             ;; until 2026-09-24, left behind when *68K-VREG-MAP* slid the window
@@ -2534,14 +2576,21 @@
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-ftoi+
-       ;; Double -> tagged fixnum, TRUNCATING: FINTRZ first (round toward
-       ;; zero, whatever FPCR's mode), then FMOVE.L of an already-integral value.
+       ;; Double -> tagged fixnum, TRUNCATING: FMOVE.L under FPCR's
+       ;; round-toward-zero mode, the caller's mode put back after.  NOT FINTRZ:
+       ;; the 68040 does not implement it (Motorola's FPSP emulates it in
+       ;; software -- Linux/m68k carries the FPSP, a bare Mac does not), and
+       ;; Basilisk II's emulation of it rounds a negative value toward +1
+       ;; (-3.5 -> -2), which r31-float-negative caught on the Mac ladder.
        (let ((vd (first operands)))
          (m68k-load-vreg buf +68k-d0+ (second operands))
          (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
          (m68k-float-unbox buf 0)
-         (m68k-emit-fop buf #x03 0 0)                         ; FINTRZ FP0,FP0
+         (m68k-emit-word buf #xF201) (m68k-emit-word buf #xB000)   ; FMOVE.L FPCR,D1
+         (m68k-emit-word buf #xF23C) (m68k-emit-word buf #x9000)   ; FMOVE.L #RZ,FPCR
+         (m68k-emit-long buf #x00000010)
          (m68k-emit-fmove-l-to-dn buf 0 +68k-d0+)
+         (m68k-emit-word buf #xF201) (m68k-emit-word buf #x9000)   ; FMOVE.L D1,FPCR
          (m68k-emit-lsl-imm buf +68k-d0+ 1)                   ; tag
          (m68k-store-vreg buf vd +68k-d0+)))
 
@@ -3055,15 +3104,17 @@
 ;;; the new frontier in them.
 
 (defconstant +68k-gc-meta+ #x10000040)
-(defconstant +68k-gc-kind-map+ #x1FC00000
+(defvar *68k-gc-kind-map* #x1FC00000
   "The kind map's FIXED address: just past the largest heap the stub will
    choose (#x10000000 + 248 MB + 4 MB guard), where ARM32's has always been.
    The stub maps only the S/16 bytes a heap of size S needs, so a small heap
-   costs a small map, and the bias below stays a translate-time constant.")
+   costs a small map, and the bias below stays a translate-time constant.
+   A board with less address space below 2^29 (the 68k Mac: RAM ends at
+   384 MB) moves it, and caps its heap below it.")
 (defun m68k-kind-bias ()
   "K: the kind byte of address A is at K + (A >> kind-shift), one byte per
    heap granule."
-  (- +68k-gc-kind-map+ (ash #x10000000 (- (m68k-kind-shift)))))
+  (- *68k-gc-kind-map* (ash #x10000000 (- (m68k-kind-shift)))))
 (defvar *68k-gc-static* nil
   "STATIC BOOT HEAP (MODUS_68K_GC_STATIC; unset, it follows MODUS_SMALL_IMAGE).
    A request word makes the collector, at the end of the collection that sees
@@ -3105,6 +3156,64 @@
    evacuated with #x00000BA9, so a pointer the collector failed to update
    faults on its first read instead of reading the stale copy.  Set by
    build-68k-cli.lisp from MODUS_68K_GC_POISON=1.  Off: byte-identical.")
+
+(defvar *68k-mac-console-label* nil
+  "While translating a *68K-MAC-MODE* image: the label of the serial console's
+   putc (M68K-EMIT-MAC-CONSOLE).")
+(defvar *68k-mac-getc-label* nil
+  "... and of its getc, 21 words on.")
+
+(defparameter +68k-mac-console-code+
+  #(#x48E7 #x6040 #x13C0 #x1000 #x9100 #x41F9 #x1000 #x9000 #x217C #x1000 #x9100
+    #x0020 #x7001 #x2140 #x0024 #x4268 #x002C #xA003 #x4CDF #x0206 #x4E75
+    #x48E7 #x6040 #x41F9 #x1000 #x9080 #x317C #x0002 #x001A #x42A8 #x001C #xA005
+    #x4AA8 #x001C #x6700 #xFFE8 #x217C #x1000 #x9102 #x0020 #x7001 #x2140 #x0024
+    #x4268 #x002C #xA002 #x7000 #x1039 #x1000 #x9102 #x4CDF #x0206 #x4E75)
+  "The bare Mac's serial console, assembled (m68k-linux-gnu-as -m68040):
+
+   putc:   movem.l d1-d2/a1,-(sp)       ; D0.B -> serial port A
+           move.b  d0,$10009100
+           lea     $10009000,a0          ; .AOut's parameter block
+           move.l  #$10009100,32(a0)     ; ioBuffer
+           moveq   #1,d0
+           move.l  d0,36(a0)             ; ioReqCount
+           clr.w   44(a0)                ; ioPosMode
+           _Write                        ; A003
+           movem.l (sp)+,d1-d2/a1
+           rts
+   getc:   movem.l d1-d2/a1,-(sp)       ; -> D0.L, waits for a byte
+   wait:   lea     $10009080,a0          ; .AIn's parameter block
+           move.w  #2,26(a0)             ; csCode 2: bytes waiting
+           clr.l   28(a0)
+           _Status                       ; A005
+           tst.l   28(a0)
+           beq     wait
+           move.l  #$10009102,32(a0)
+           moveq   #1,d0
+           move.l  d0,36(a0)
+           clr.w   44(a0)
+           _Read                         ; A002
+           moveq   #0,d0
+           move.b  $10009102,d0
+           movem.l (sp)+,d1-d2/a1
+           rts
+
+   The ROM's .AIn/.AOut drivers, opened by the boot stub into the parameter
+   blocks at #x10009080 / #x10009000 (the low block's argv area, unused on a
+   Mac); Basilisk II routes them to a host device, a real Mac to its modem
+   port.  Both keep every register but D0/A0.")
+
+(defun m68k-emit-mac-console (buf)
+  "Emit +68K-MAC-CONSOLE-CODE+: putc at *68K-MAC-CONSOLE-LABEL*, getc (word
+   21) at *68K-MAC-GETC-LABEL*."
+  (m68k-emit-label buf *68k-mac-console-label*)
+  (loop for w across +68k-mac-console-code+ for i from 0
+        do (when (= i 21) (m68k-emit-label buf *68k-mac-getc-label*))
+           (m68k-emit-word buf w)))
+
+(defun m68k-emit-mac-putc (buf)
+  "D0.B to the Mac's serial console (D0/A0 clobbered)."
+  (m68k-emit-bsr-long buf *68k-mac-console-label*))
 
 (defvar *68k-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
@@ -3396,7 +3505,13 @@
 (defun m68k-emit-die (buf message status)
   "write(2, MESSAGE) then exit(STATUS).  The text is pushed onto the stack a
    longword at a time, so it needs no data section and no PC-relative address.
-   Does not return."
+   Does not return.  On a bare Mac: MESSAGE to the serial console, then halt."
+  (when *68k-mac-mode*
+    (loop for c across message
+          do (m68k-emit-moveq buf +68k-d0+ (char-code c))
+             (m68k-emit-mac-putc buf))
+    (m68k-emit-word buf #x60FE)                         ; BRA.S *
+    (return-from m68k-emit-die nil))
   (let* ((bytes (map 'list #'char-code message))
          (padded (append bytes (make-list (mod (- (length bytes)) 4) :initial-element 0))))
     (loop for i from (- (length padded) 4) downto 0 by 4
@@ -3862,7 +3977,7 @@
       ;; memory is then what lives plus what is being allocated into, not every
       ;; page either semispace ever touched -- at the freeze, the whole of the
       ;; semispace boot filled.  Not with poison, which wants the pages written.
-      (when (and *68k-gc-static* (not *68k-gc-poison*))
+      (when (and *68k-gc-static* (not *68k-gc-poison*) *68k-linux-mode*)
         (let ((none (lbl)))
           (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d1+)
           (m68k-emit-addi buf +68k-d1+ 4095)
@@ -4112,11 +4227,13 @@
    BYTECODE is a (vector (unsigned-byte 8)).
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
-  (let* ((*68k-gc-label* (and *68k-linux-mode* (mvm-make-label)))
+  (let* ((*68k-gc-label* (and (m68k-hosted-layout-p) (mvm-make-label)))
+         (*68k-mac-console-label* (and *68k-mac-mode* (mvm-make-label)))
+         (*68k-mac-getc-label* (and *68k-mac-mode* (mvm-make-label)))
          (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-car-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-barrier-label* (and *68k-gc-static* *68k-linux-mode* (mvm-make-label)))
+         (*68k-barrier-label* (and *68k-gc-static* (m68k-hosted-layout-p) (mvm-make-label)))
          (*68k-cdr-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-alloc-obj-label* (and *68k-shared-sequences* (mvm-make-label)))
@@ -4294,6 +4411,8 @@
 
     (when *68k-gc-label*
       (m68k-emit-gc-collector buf))
+    (when *68k-mac-console-label*
+      (m68k-emit-mac-console buf))
     (when *68k-cons-label*
       (m68k-emit-cons-helper buf))
     (when *68k-subtag-label*
@@ -4857,7 +4976,7 @@
   "As many 32-byte frames as fit below the hosted globals at #x10000A00 (they
    end at #x100009C8).  21 overflowed under a real library load on ARM32, the
    same protocol -- see *ARM32-HSTACK-MAX-DEPTH*.")
-(defun m68k-hbase ()           (if *68k-linux-mode* #x10000000 *68k-globals-base*))
+(defun m68k-hbase ()           (if (m68k-hosted-layout-p) #x10000000 *68k-globals-base*))
 (defun m68k-jmpbuf-addr ()     (+ (m68k-hbase) #x180))
 (defun m68k-lj-scratch-addr () (+ (m68k-hbase) #x300))
 (defun m68k-hcapped-addr ()    (+ (m68k-hbase) #x360))
@@ -4939,6 +5058,13 @@
    the first :set-nargs, which precedes EVERY call, so the first function call in
    the image dies rather than something subtle later."
   (setf *68k-linux-mode* (and on t))
+  (setf *68k-globals-base* (if on *68k-hosted-globals-base* #x00600000)))
+
+(defun m68k-set-mac-mode (on)
+  "Turn the bare-Macintosh mode on or off (*68K-MAC-MODE*): the hosted memory
+   map and convention slots, with the Mac's service traps.  Linux mode off."
+  (setf *68k-linux-mode* nil)
+  (setf *68k-mac-mode* (and on t))
   (setf *68k-globals-base* (if on *68k-hosted-globals-base* #x00600000)))
 
 (defun install-68k-translator ()

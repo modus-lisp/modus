@@ -129,9 +129,8 @@
 (defconstant +subtag-short-float+  #x65)
 (defconstant +subtag-long-float+   #x66)
 
-;;; Placeholder addresses for NIL and T (patched during image build)
-(defconstant +nil-value+ #xDEAD0001)
-;;; +t-value+: per target, see the tag constants above.
+;;; +nil-value+ / +t-value+: per target, see the tag constants in target.lisp
+;;; (NIL is #xDEAD0001 unless *68K-NIL-PAGE* moves it).
 
 ;;; Multiple-value return storage (fixed addresses in BSS/globals area)
 ;;; MV-COUNT at 0x600010: number of values returned (tagged fixnum)

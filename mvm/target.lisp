@@ -648,6 +648,10 @@
 ;;; objects and conses sit on an 8-byte granule (a cons is its two words, not
 ;;; half of a 16-byte cell).  Forwarding is kept in the collector's kind map.
 (defvar *68k-tags3* nil)
+;;; *68K-NIL-PAGE*: where NIL's page is on 68k, NIL = page + 1 and T = the next
+;;; page + the object tag.  NIL means #xDEAD0000, the page every hosted port
+;;; maps; a board with no MMU and no RAM there (the 68k Mac) puts it in RAM.
+(defvar *68k-nil-page* nil)
 
 (defparameter +tag-cons+      1)
 (defparameter +tag-function+  3)
@@ -655,6 +659,7 @@
 (defparameter +tag-immediate+ 5)
 (defparameter +tag-forward+   15)
 (defparameter +t-value+       #xDEAD1009)
+(defparameter +nil-value+     #xDEAD0001)
 
 (defparameter +fixnum-bits+      62)
 (defparameter +fixnum-max+       4611686018427387903)
@@ -789,11 +794,14 @@
 
 (defun set-target-tag-scheme-for (target)
   "The pointer tags of TARGET: the 16-byte scheme, or 68k's 3-bit one."
-  (let ((three (and *68k-tags3* (eq (target-name target) :68k))))
+  (let* ((k68 (eq (target-name target) :68k))
+         (three (and *68k-tags3* k68))
+         (page (or (and k68 *68k-nil-page*) #xDEAD0000)))
     (setf +tag-cons+ 1 +tag-function+ 3 +tag-immediate+ 5
           +tag-object+ (if three 7 9)
           +tag-forward+ 15
-          +t-value+ (if three #xDEAD1007 #xDEAD1009))))
+          +nil-value+ (+ page 1)
+          +t-value+ (+ page #x1000 (if three 7 9)))))
 
 (defun set-target-fixnum-bits-for (target)
   "Derive the numeric width, endianness and MV-slot addresses from TARGET."
@@ -936,7 +944,8 @@
      (defconstant +target-soft-float+ ~D)~%~
      (defconstant +tag-cons+ ~D)~%(defconstant +tag-function+ ~D)~%~
      (defconstant +tag-object+ ~D)~%(defconstant +tag-immediate+ ~D)~%~
-     (defconstant +tag-forward+ ~D)~%(defconstant +t-value+ ~D)~%"
+     (defconstant +tag-forward+ ~D)~%(defconstant +t-value+ ~D)~%~
+     (defconstant +nil-value+ ~D)~%"
     +fixnum-bits+ +fixnum-max+ +fixnum-min+ +fixnum-limit+ +fixnum-neg-limit+
     +fixnum-half+ +fixnum-neg-half+ +fixnum-half-max+
     +fixnum-signed-bits+ +fixnum-bits-1+ +limb-bits+ +limb-bits-1+
@@ -945,4 +954,5 @@
     +half-limb-mask+
     +name-hash-bits+ +name-hash-shift+ +name-hash-hi-mask+ +name-hash-lo-mask+
     +mv-count-addr+ +mv-values-addr+ +target-big-endian+ +target-soft-float+
-    +tag-cons+ +tag-function+ +tag-object+ +tag-immediate+ +tag-forward+ +t-value+))
+    +tag-cons+ +tag-function+ +tag-object+ +tag-immediate+ +tag-forward+ +t-value+
+    +nil-value+))

@@ -2620,6 +2620,10 @@
       (format out "(defun %kernel-global-names-text () ~S)~%"
               (format nil "~{~A~^ ~}" *all-global-names*)))))
 
+;; MODUS_SMALL_IMAGE: the globals' init thunks run in batches through one
+;; guarded loop, not a HANDLER-CASE's code each (compiler.lisp *INIT-GLOBALS-BATCHED*).
+(when cl-user::*small-image* (setq modus.mvm::*init-globals-batched* t))
+
 ;; Function table under MODUS_SMALL_IMAGE (CL-USER::*SMALL-IMAGE*, above): the keys come from ONE string
 ;; literal and each entry is a call passing #'NAME, instead of a PUTHASH whose
 ;; key literal is built inline character by character (measured on 68k: ~700

@@ -2251,6 +2251,32 @@
    out-of-line +.  Set by the MODUS_LEAN_BOOT builds; NIL everywhere else, so
    every other image is unchanged.")
 
+(defvar *init-globals-batched* nil
+  "When T (MODUS_SMALL_IMAGE), INIT-ALL-GLOBALS and %RUN-NIL-DEFVAR-INITS hand
+   their init thunks to %INIT-RUN-GUARDED a hundred at a time, as function
+   objects, and it runs each inside the same HANDLER-CASE: a function
+   reference an entry instead of the HANDLER-CASE's code an entry (~375 bytes
+   of 68k, ~600 KB for the CLI image's 918 globals).  Same thunks, same order,
+   same guard.  Ignored under *INIT-GLOBALS-UNGUARDED*.")
+
+(defun %init-guarded-forms (thunk-names pkg)
+  "The body forms that run THUNK-NAMES, each guarded -- batched through
+   %INIT-RUN-GUARDED under *INIT-GLOBALS-BATCHED*, else one HANDLER-CASE each."
+  (if (and *init-globals-batched* (not *init-globals-unguarded*))
+      (let ((out nil) (names thunk-names))
+        (loop while names
+              do (let ((batch nil))
+                   (dotimes (i 100) (when names (push (pop names) batch)))
+                   (push `(%init-run-guarded
+                           ,@(mapcar (lambda (n) `(function ,(intern n pkg))) (nreverse batch)))
+                         out)))
+        (nreverse out))
+      (mapcar (lambda (n)
+                (if *init-globals-unguarded*
+                    `(,(intern n pkg))
+                    `(handler-case (,(intern n pkg)) (t (c) nil))))
+              thunk-names)))
+
 (defvar *init-globals-unguarded* nil
   "When T, INIT-ALL-GLOBALS and %RUN-NIL-DEFVAR-INITS call each defvar init
    thunk directly instead of inside a HANDLER-CASE.  A failing initform then
@@ -32265,12 +32291,16 @@
       ;; self-compiled image died at boot in INIT-ALL-GLOBALS).  Fall back to
       ;; the current package, which is MODUS.MVM at build time anyway.
       (let ((pkg (or (%build-mvm-package) *package*)))
-        (dolist (thunk-name (nreverse *init-thunk-names*))
-          (push (if *init-globals-unguarded*
-                    `(,(intern thunk-name pkg))
-                    `(handler-case (,(intern thunk-name pkg))
-                       (t (c) nil)))
-                init-calls)))
+        (setq init-calls (reverse (%init-guarded-forms (reverse *init-thunk-names*) pkg)))
+        ;; the batch runner, when the forms use it
+        (when (and *init-globals-batched* (not *init-globals-unguarded*))
+          (let* ((result (mvm-compile-toplevel
+                           `(defun %init-run-guarded (&rest fns)
+                              (dolist (f fns) (handler-case (funcall f) (t (c) nil)))
+                              nil)))
+                 (info (car result)) (ir (cdr result)))
+            (when (and info ir)
+              (setf all-ir (nconc all-ir (list (cons info ir))))))))
       (let* ((result (mvm-compile-toplevel
                        `(defun init-all-globals ()
                           ,@(nreverse init-calls))))
@@ -32282,11 +32312,7 @@
       ;; *INIT-NIL-THUNK-NAMES*).  Always generated, as INIT-ALL-GLOBALS is.
       (let ((nil-calls nil)
             (pkg (or (%build-mvm-package) *package*)))
-        (dolist (thunk-name (reverse *init-nil-thunk-names*))
-          (push (if *init-globals-unguarded*
-                    `(,(intern thunk-name pkg))
-                    `(handler-case (,(intern thunk-name pkg)) (t (c) nil)))
-                nil-calls))
+        (setq nil-calls (reverse (%init-guarded-forms *init-nil-thunk-names* pkg)))
         (let* ((result (mvm-compile-toplevel
                          `(defun %run-nil-defvar-inits () ,@(nreverse nil-calls) nil)))
                (info (car result))

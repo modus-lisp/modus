@@ -3809,10 +3809,130 @@
       ;; (UNBOUND-VARIABLE BELOW from md5sum-string).
       (let* ((params (cadr def))
              (nbody (cddr def))
-             (let-form (cons 'let (cons (mapcar (function list) params args) nbody))))
+             (sub (and *mvm-eval-runtime-p* (%inline-substitute-constants params args nbody)))
+             (let-form (if sub
+                           (cons 'let (cons (car sub) (cdr sub)))
+                           (cons 'let (cons (mapcar (function list) params args) nbody)))))
         (if (%tree-has-return-from nbody fn)
             (list 'block fn let-form)
             let-form)))))
+
+;;; ---- constant arguments of an inline call ---------------------------------
+;;; (declaim (inline rol32)) (defun rol32 (x n) (logand #xffffffff (logior (ash x n)
+;;; (ash x (- n 32))))) called as (rol32 a 5) expanded to (let ((x a) (n 5)) ...):
+;;; N became a frame slot, so both ASHes took the variable-count path -- range
+;;; checks, two variable shifts, an overflow test and a BIGNUM-ASH fallback -- where
+;;; a literal count is one shift.  SHA-1 rotates three words a round.  So a
+;;; parameter whose argument is an integer LITERAL is substituted into the body,
+;;; and arithmetic left with only literal operands is folded: (- n 32) -> -27.
+;;; ONLY for a body made of calls to the pure functions below and THE / IF / PROGN
+;;; (and the parameter must never be assigned, which such a body cannot do): any
+;;; other form -- a macro, a LET, a LOOP whose keyword happens to share the
+;;; parameter's name -- leaves the call bound by LET exactly as before.  A blind tree
+;;; substitution, which cannot tell a variable from a keyword or quoted data, is
+;;; what this file once had and removed (md5's FROM parameter, see above).
+
+(defun %inline-pure-op-p (op)
+  ;; CL's own functions only: a package may shadow + with a + of its own
+  (and (symbolp op)
+       (eq (symbol-package op) (find-package "COMMON-LISP"))
+       (member (symbol-name op)
+               '("+" "-" "*" "LOGAND" "LOGIOR" "LOGXOR" "LOGNOT" "ASH" "LOGBITP"
+                 "1+" "1-" "=" "/=" "<" ">" "<=" ">=" "MIN" "MAX" "ZEROP" "PLUSP"
+                 "MINUSP" "EVENP" "ODDP" "AREF" "SVREF" "CHAR" "SCHAR" "LDB" "BYTE"
+                 "MOD" "REM" "FLOOR" "TRUNCATE" "CEILING" "ABS" "INTEGER-LENGTH"
+                 "LOGCOUNT" "LOGTEST" "NOT" "NULL")
+               :test (function string=))))
+
+(defun %inline-fold (op args)
+  "OP applied to ARGS when every arg is an integer literal and OP is a total
+   integer function whose result is a comfortably small fixnum; else NIL."
+  (when (and (every (function integerp) args) (symbolp op))
+    (let* ((n (symbol-name op))
+           (v (handler-case
+                  (cond ((string= n "+") (apply (function +) args))
+                        ((string= n "-") (apply (function -) args))
+                        ((string= n "*") (apply (function *) args))
+                        ((string= n "LOGAND") (apply (function logand) args))
+                        ((string= n "LOGIOR") (apply (function logior) args))
+                        ((string= n "LOGXOR") (apply (function logxor) args))
+                        ((and (string= n "LOGNOT") (= (length args) 1)) (lognot (car args)))
+                        ((and (string= n "1+") (= (length args) 1)) (+ (car args) 1))
+                        ((and (string= n "1-") (= (length args) 1)) (- (car args) 1))
+                        ((and (string= n "ASH") (= (length args) 2) (<= (abs (cadr args)) 64))
+                         (ash (car args) (cadr args)))
+                        (t nil))
+                (error () nil))))
+      (and (integerp v) (< (abs v) (ash 1 (- +fixnum-bits+ 3))) v))))
+
+(defun %inline-subst-form (form alist)
+  "FORM with each symbol in ALIST replaced by its integer, or :FAIL when FORM is
+   not one this substitution understands (see above)."
+  (cond
+    ((symbolp form)
+     (let ((c (assoc form alist :test (function name-equal)))) (if c (cdr c) form)))
+    ((atom form) form)
+    ((not (symbolp (car form))) :fail)
+    ((not (eq (symbol-package (car form)) (find-package "COMMON-LISP"))) :fail)
+    ((string= (symbol-name (car form)) "QUOTE") form)
+    ((string= (symbol-name (car form)) "THE")
+     (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+         (let ((x (%inline-subst-form (caddr form) alist)))
+           (if (eq x :fail) :fail (list (car form) (cadr form) x)))
+         :fail))
+    ((or (string= (symbol-name (car form)) "IF")
+         (string= (symbol-name (car form)) "PROGN")
+         (%inline-pure-op-p (car form)))
+     (let ((out nil))
+       (dolist (a (cdr form))
+         (let ((x (%inline-subst-form a alist)))
+           (when (eq x :fail) (return-from %inline-subst-form :fail))
+           (push x out)))
+       (let ((args (nreverse out)))
+         (or (%inline-fold (car form) args) (cons (car form) args)))))
+    (t :fail)))
+
+(defun %inline-drop-decls (decl names)
+  "DECL, a (DECLARE ...) form, with NAMES removed from every spec that lists
+   variables: (TYPE T v...), (IGNORE v...), (FIXNUM v...) and the like.  OPTIMIZE,
+   INLINE, NOTINLINE, FTYPE and DECLARATION name no variables and are kept whole."
+  (flet ((keep (vars) (remove-if (lambda (v) (member v names :test (function name-equal))) vars)))
+    (cons (car decl)
+          (let ((out nil))
+            (dolist (spec (cdr decl) (nreverse out))
+              (if (not (and (consp spec) (symbolp (car spec))))
+                  (push spec out)
+                  (let ((head (symbol-name (car spec))))
+                    (cond
+                      ((member head '("OPTIMIZE" "INLINE" "NOTINLINE" "FTYPE" "DECLARATION")
+                               :test (function string=))
+                       (push spec out))
+                      ((string= head "TYPE")
+                       (let ((vars (keep (cddr spec))))
+                         (when vars (push (list* (car spec) (cadr spec) vars) out))))
+                      (t
+                       (let ((vars (keep (cdr spec))))
+                         (when vars (push (cons (car spec) vars) out))))))))))))
+
+(defun %inline-substitute-constants (params args body)
+  "(BINDINGS . BODY) for an inline call whose integer-literal arguments have been
+   substituted into BODY, or NIL to leave the call as a plain LET."
+  (let ((alist nil) (bindings nil))
+    (loop for p in params for a in args
+          do (let ((v (and (integerp a) a)))
+               (if v (push (cons p v) alist) (push (list p a) bindings))))
+    (when alist
+      (let ((decls nil) (forms body))
+        (loop while (and (consp forms) (consp (car forms)) (symbolp (caar forms))
+                         (string= (symbol-name (caar forms)) "DECLARE"))
+              do (push (%inline-drop-decls (car forms) (mapcar (function car) alist)) decls)
+                 (setq forms (cdr forms)))
+        (let ((out nil))
+          (dolist (f forms)
+            (let ((x (%inline-subst-form f alist)))
+              (when (eq x :fail) (return-from %inline-substitute-constants nil))
+              (push x out)))
+          (cons (nreverse bindings) (append (nreverse decls) (nreverse out))))))))
 
 ;;; ---- (declaim (type T *global*)) — honoured at runtime ----------------------
 (defvar *global-dtypes* nil
@@ -24245,6 +24365,23 @@
             args))
       args))
 
+(defun %bitop-trust (flat-args env)
+  "*arith-trust* for every pair of a LOGAND / LOGIOR / LOGXOR whose operands FLAT-ARGS all
+   have a known width (%expr-width: each is provably a fixnum): (T T W).  AND, OR and XOR of
+   two fixnums are a fixnum and cannot overflow, so the pair is the plain op -- no tag test,
+   no generic slow path.  The declarations were there and unused: (logxor a b) on two
+   (unsigned-byte 32) variables kept a tag test and a GENERIC-LOGXOR call, nine of SHA-1's
+   ~330 instructions a round.  NIL when any width is unknown (bignum operands stay generic).
+   A width of the full +FIXNUM-SIGNED-BITS+ is NOT trusted: that is a declared FIXNUM,
+   whose range includes MOST-NEGATIVE-FIXNUM, and that one value is a BIGNUM at run time
+   here (its magnitude 2^62 is not demoted), so a plain AND of it would AND a pointer.
+   One bit narrower, every value in range really is a fixnum."
+  (let ((w 0))
+    (dolist (a flat-args (list t t w))
+      (let ((wa (%expr-width a env)))
+        (unless (and wa (< wa +fixnum-signed-bits+)) (return nil))
+        (setq w (max w wa))))))
+
 (defun compile-logand (args env dest)
   "Compile (logand args...).
    Flattens nested logand to prevent push/pop stack corruption.
@@ -24253,7 +24390,8 @@
    GENERIC-LOGAND (low-limb AND of bignum magnitude) instead of doing a
    raw pointer-tag AND that returns garbage for `(logand bignum 1)`
    bodies in evenp/oddp."
-  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logand args))))
+  (let* ((flat-args (%bitop-constants-last (flatten-arith-args 'logand args)))
+         (trust (%bitop-trust flat-args env)))
     (cond
       ((null flat-args)
        ;; (logand) = -1
@@ -24270,7 +24408,7 @@
                  (check-arith-nesting 'logand arg) ; backstop — ANF handles the hit
                  (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                      (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                       (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND"))
+                       (%compile-arith-arg-step-e2 arg env dest :and "GENERIC-LOGAND" trust))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
                        (emit-ir :push dest)
@@ -24279,14 +24417,17 @@
                        ;; Fixnum^fixnum -> raw :and (fast); bignum operand -> GENERIC-LOGAND
                        ;; (the now-fast two's-complement engine).  Raw :and on a bignum
                        ;; pointer returned garbage.
-                       (emit-arith-pair :and "GENERIC-LOGAND" dest temp)
+                       (let ((*arith-trust* trust))
+                         (declare (special *arith-trust*))
+                         (emit-arith-pair :and "GENERIC-LOGAND" dest temp))
                        (free-temp-reg)))))))))))
 
 (defun compile-logior (args env dest)
   "Compile (logior args...).
    Same emit-arith-pair routing as compile-logand — bignum operands fall
    through to GENERIC-LOGIOR."
-  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logior args))))
+  (let* ((flat-args (%bitop-constants-last (flatten-arith-args 'logior args)))
+         (trust (%bitop-trust flat-args env)))
     (cond
       ((null flat-args)
        (compile-integer 0 dest))
@@ -24302,19 +24443,22 @@
                  (check-arith-nesting 'logior arg) ; backstop — ANF handles the hit
                  (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                      (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                       (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR"))
+                       (%compile-arith-arg-step-e2 arg env dest :or "GENERIC-LOGIOR" trust))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
                        (emit-ir :push dest)
                        (compile-form arg env temp)
                        (emit-ir :pop dest)
-                       (emit-arith-pair :or "GENERIC-LOGIOR" dest temp)
+                       (let ((*arith-trust* trust))
+                         (declare (special *arith-trust*))
+                         (emit-arith-pair :or "GENERIC-LOGIOR" dest temp))
                        (free-temp-reg)))))))))))
 
 (defun compile-logxor (args env dest)
   "Compile (logxor args...).
    Same emit-arith-pair routing as compile-logand."
-  (let ((flat-args (%bitop-constants-last (flatten-arith-args 'logxor args))))
+  (let* ((flat-args (%bitop-constants-last (flatten-arith-args 'logxor args)))
+         (trust (%bitop-trust flat-args env)))
     (cond
       ((null flat-args)
        (compile-integer 0 dest))
@@ -24330,13 +24474,15 @@
                  (check-arith-nesting 'logxor arg) ; backstop — ANF handles the hit
                  (if (or *mvm-eval-runtime-p* (%temps-must-spill-p))
                      (let ((*arith-push-depth* (1+ *arith-push-depth*)))
-                       (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR"))
+                       (%compile-arith-arg-step-e2 arg env dest :xor "GENERIC-LOGXOR" trust))
                      (let ((temp (alloc-temp-reg))
                            (*arith-push-depth* (1+ *arith-push-depth*)))
                        (emit-ir :push dest)
                        (compile-form arg env temp)
                        (emit-ir :pop dest)
-                       (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp)
+                       (let ((*arith-trust* trust))
+                         (declare (special *arith-trust*))
+                         (emit-arith-pair :xor "GENERIC-LOGXOR" dest temp))
                        (free-temp-reg)))))))))))
 
 (defun %unsigned-small-max (form env)
@@ -26812,7 +26958,25 @@
          ;; the full width (so never trusted not to overflow further).
          ((or (string= op "%FIXNUM-+") (string= op "%FIXNUM--") (string= op "%FIXNUM-*"))
           +fixnum-signed-bits+)
-         (t nil))))))
+         (t (%inline-call-mask-width form)))))))
+
+(defun %inline-call-mask-width (form)
+  "The width of a call to an INLINE function whose body ends in (LOGAND MASK ...)
+   with MASK a non-negative literal -- the 32-bit-word idiom, (logand #xffffffff
+   ...) -- or NIL.  Needed because the width of a sum is asked of its operands
+   BEFORE they are expanded, so (+ (rol32 a 5) f e k (aref w i)) saw an unknown
+   operand and every add in SHA-1's rounds kept its tag test and overflow check.
+   Only a body whose LAST form is such a LOGAND counts: its width is the mask's
+   whatever the parameters are bound to, so the inline LET's bindings, which this
+   cannot see, do not matter.  Runtime compiles only, like the substitution."
+  (let* ((k (and *mvm-eval-runtime-p* (consp form) (%inline-name-key (car form))))
+         (def (and k *inline-fn-defs* (assoc k *inline-fn-defs* :test (function string=)))))
+    (when (and def (listp (cdr form)) (= (length (cdr form)) (length (cadr def))))
+      (let ((last (car (last (cddr def)))))
+        (when (and (consp last) (symbolp (car last)) (string= (symbol-name (car last)) "LOGAND")
+                   (consp (cdr last)))
+          (let ((c (find-if (lambda (a) (and (integerp a) (>= a 0))) (cdr last))))
+            (and c (+ 1 (integer-length c)))))))))
 
 (defun %arith-chain-width (trust)
   "The width an n-ary + - * chain carries into its NEXT step: the result width

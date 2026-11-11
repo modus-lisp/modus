@@ -1051,6 +1051,11 @@ let screenHeight: Call = { _, _, _, _, _, _ in
     UInt(keyRoot()?.bounds.height ?? 0)
 }
 
+// screen_width(): the width of the app's screen, in points.
+let screenWidth: Call = { _, _, _, _, _, _ in
+    UInt(keyRoot()?.bounds.width ?? 0)
+}
+
 // parallax_on(handle, amount): the view moves a little with the device's tilt, by amount points, as a parallax
 // motion effect does.
 let parallaxOn: Call = { h, amount, _, _, _, _ in
@@ -1912,6 +1917,7 @@ public func modusSwiftInstall() {
     register("ui_dynamic_label_new", dynamicLabelNew)
     register("ui_safe_area_top", safeAreaTop)
     register("ui_screen_height", screenHeight)
+    register("ui_screen_width", screenWidth)
     register("ui_parallax_on", parallaxOn)
     register("ui_zoom_scroll_new", zoomScrollNew)
     register("ui_zoom_content", zoomContent)

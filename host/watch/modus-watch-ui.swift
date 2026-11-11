@@ -13,6 +13,7 @@
 //   (ALERT h index)  (CROWN h value)  (DISMISS h)
 
 import SwiftUI
+import WatchKit
 
 typealias Call = @convention(c) (UInt, UInt, UInt, UInt, UInt, UInt) -> UInt
 
@@ -464,6 +465,10 @@ let sendTap: Call = { h, _, _, _, _, _ in
     return 0
 }
 
+/// The screen's size in points: 184 x 224 on a 44 mm watch, 208 x 248 on a 46 mm one.
+let screenWidth: Call = { _, _, _, _, _, _ in UInt(WKInterfaceDevice.current().screenBounds.width) }
+let screenHeight: Call = { _, _, _, _, _, _ in UInt(WKInterfaceDevice.current().screenBounds.height) }
+
 /// The watch has no keyboard to give up: nothing to do.
 let resign: Call = { _, _, _, _, _, _ in 0 }
 
@@ -579,6 +584,8 @@ public func modusSwiftInstall() {
     register("ui_remove", removeView)
     register("ui_send_tap", sendTap)
     register("ui_resign", resign)
+    register("ui_screen_width", screenWidth)
+    register("ui_screen_height", screenHeight)
     register("ui_alert_new", alertNew)
     register("ui_alert_action", alertAction)
     register("ui_alert_present", alertPresent)

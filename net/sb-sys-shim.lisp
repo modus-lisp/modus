@@ -632,8 +632,12 @@
 ;;;   :ENVIRONMENT   a list of "NAME=value" (default: this process's)
 ;;;   :DIRECTORY     the child's working directory
 ;;;   :EXTERNAL-FORMAT  :LATIN-1 / :UTF-8 for the streams made here
-;;; PARTIAL: :PTY as a stream, :INPUT/:OUTPUT as a Lisp stream to copy through,
-;;; :STATUS-HOOK and :PRESERVE-FDS signal rather than being dropped.  There is
+;;;                  A Lisp STREAM (with :WAIT T): its contents are the child's
+;;;                  stdin, or the child's output is copied into it -- through a
+;;;                  temporary file, so a child filling stdout and stderr at once
+;;;                  cannot deadlock against a reader of one of them.
+;;; PARTIAL: :PTY as a stream, a Lisp stream with :WAIT NIL (SBCL copies those in
+;;; the background), :STATUS-HOOK and :PRESERVE-FDS signal rather than being dropped.  There is
 ;;; no SIGCHLD handler: a child's status is collected when asked for
 ;;; (PROCESS-ALIVE-P, -STATUS, -EXIT-CODE, -WAIT), and a child nobody asks about
 ;;; stays a zombie until then.  Not a registry the asking could be automatic
@@ -663,6 +667,16 @@
   (sb-sys:make-fd-stream fd :input (member dir '(:input :io)) :output (member dir '(:output :io))
                             :external-format (or external-format :default)))
 
+(defun %sb-copy-stream (from to)
+  "Every character of FROM, to TO."
+  (let ((buf (make-string 4096)))
+    (loop (let ((n (read-sequence buf from)))
+            (when (zerop n) (return))
+            (write-string buf to :end n)))))
+
+(defun %sb-temp-path (dir)
+  (format nil "/tmp/modus-run-program-~D-~D-~(~A~)" (sb-posix:getpid) (random 1000000000) dir))
+
 (defun sb-ext:run-program (program args &key (wait t) pty input output (error nil error-given)
                                         environment directory search external-format
                                         (if-input-does-not-exist :error)
@@ -681,10 +695,12 @@
          (path (if search (%proc-find-program program) program))
          (args (mapcar (lambda (a) (if (stringp a) a (princ-to-string a))) args))
          (closes '()) (keep '()) (master nil) (tty nil)
+         (temps '()) (copies '())     ; temporary files; (path . stream) to copy out after
          (in -1) (out -1) (err -1) (in-s nil) (out-s nil) (err-s nil))
     (unless path (error "sb-ext:run-program: ~S not found on PATH" program))
     (labels ((fail (fmt &rest a) (dolist (fd closes) (%proc-close fd))
                (dolist (fd keep) (%proc-close fd))
+               (dolist (f temps) (ignore-errors (delete-file f)))
                (apply (function error) fmt a))
              (open-fd (spec mode)
                (let ((fd (%proc-open (namestring spec) mode)))
@@ -706,6 +722,17 @@
                                                   ((eq exists :append) :append)
                                                   (t :supersede)))
                               nil))
+                     ((streamp spec)
+                      (unless wait
+                        (fail "sb-ext:run-program: a Lisp stream as ~(~A~) needs :WAIT T on modus" dir))
+                      (let ((path (%sb-temp-path dir)))
+                        (push path temps)
+                        (if (eq dir :input)
+                            (with-open-file (f path :direction :output :if-exists :supersede
+                                                    :external-format (or external-format :default))
+                              (%sb-copy-stream spec f))
+                            (push (cons path spec) copies))
+                        (values (open-fd path (if (eq dir :input) :input :supersede)) nil)))
                      (t (fail "sb-ext:run-program: ~S as ~(~A~) is not implemented on modus" spec dir)))))
       (when pty
         (let ((pt (%proc-openpt)))
@@ -726,10 +753,20 @@
         (dolist (fd closes) (%proc-close fd))
         (when (< pid 0)
           (dolist (fd keep) (%proc-close fd))
+          (dolist (f temps) (ignore-errors (delete-file f)))
           (error "sb-ext:run-program: fork failed (errno ~D)" (- pid)))
         (let ((proc (%make-process :pid pid :input in-s :output out-s :error err-s
                                    :pty (and master (%sb-fd-stream master :io external-format)))))
           (when wait (%sb-proc-poll proc t))
+          ;; :ERROR :OUTPUT with a stream :OUTPUT shares one file: copy each path once
+          (unwind-protect
+               (let ((done '()))
+                 (dolist (c (reverse copies))
+                   (unless (member (car c) done :test #'string=)
+                     (push (car c) done)
+                     (with-open-file (f (car c) :external-format (or external-format :default))
+                       (%sb-copy-stream f (cdr c))))))
+            (dolist (f temps) (ignore-errors (delete-file f))))
           proc)))))
 
 (defun sb-ext:process-pid (p) (%process-pid p))

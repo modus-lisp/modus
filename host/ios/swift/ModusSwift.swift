@@ -1449,6 +1449,172 @@ let imagePickerShow: Call = { _, _, _, _, _, _ in
     return 1
 }
 
+// A gesture's target for the simple recognizers: when the gesture is recognised it sends its event with the view's
+// handle.  The recognizer is kept by UIKit; the target is kept here (UIKit keeps it weakly).
+final class ModusRecognized: NSObject {
+    let handle: UInt
+    let event: String
+
+    init(handle: UInt, event: String) {
+        self.handle = handle
+        self.event = event
+    }
+
+    @objc func fired(_ recognizer: UIGestureRecognizer) {
+        if recognizer.state == .recognized || recognizer.state == .ended {
+            send(event, [.int(Int(handle))])
+        }
+    }
+}
+
+private var recognizedTargets: [ModusRecognized] = []
+
+private func recognize(_ h: UInt, _ event: String, _ make: (ModusRecognized) -> UIGestureRecognizer) -> UInt {
+    guard let view = views[h] else { return 0 }
+    let target = ModusRecognized(handle: h, event: event)
+    view.isUserInteractionEnabled = true
+    view.addGestureRecognizer(make(target))
+    recognizedTargets.append(target)
+    return 1
+}
+
+// tap_on(handle): a tap on the view (UITapGestureRecognizer) sends a TAP event, as a button's tap does.
+let tapOn: Call = { h, _, _, _, _, _ in
+    recognize(h, "TAP") { UITapGestureRecognizer(target: $0, action: #selector(ModusRecognized.fired(_:))) }
+}
+
+// edge_pan_on(handle): a pan in from the screen's left edge sends an EDGE event with the handle
+// (UIScreenEdgePanGestureRecognizer).  The recognizer goes on the screen's root view, where an edge pan begins; the
+// handle names the event.
+private var edgeRecognizers: [UInt: UIGestureRecognizer] = [:]
+
+let edgePanOn: Call = { h, _, _, _, _, _ in
+    guard let root = keyRoot() else { return 0 }
+    let target = ModusRecognized(handle: h, event: "EDGE")
+    let edge = UIScreenEdgePanGestureRecognizer(target: target, action: #selector(ModusRecognized.fired(_:)))
+    edge.edges = .left
+    if let old = edgeRecognizers[h] { root.removeGestureRecognizer(old) }
+    root.addGestureRecognizer(edge)
+    edgeRecognizers[h] = edge
+    recognizedTargets.append(target)
+    return 1
+}
+
+// The calendar's selection delegate: a day picked sends a DATE event with its seconds since 1970 (a double).
+final class ModusCalendar: NSObject, UICalendarSelectionSingleDateDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func dateSelection(_ selection: UICalendarSelectionSingleDate, didSelectDate dateComponents: DateComponents?) {
+        guard let date = dateComponents.flatMap({ Calendar.current.date(from: $0) }) else { return }
+        send("DATE", [.int(Int(handle)), .double(date.timeIntervalSince1970)])
+    }
+}
+
+private var calendarDelegates: [UInt: ModusCalendar] = [:]
+
+// calendar_new(seconds, x, y, w, h): a calendar (UICalendarView) showing the month of the date, one day selectable.
+let calendarNew: Call = { seconds, x, y, w, h, _ in
+    let calendar = UICalendarView(frame: rect(x, y, w, h))
+    calendar.overrideUserInterfaceStyle = .dark
+    calendar.visibleDateComponents = Calendar.current.dateComponents([.year, .month, .day],
+                                                                      from: Date(timeIntervalSince1970: TimeInterval(seconds)))
+    let handle = adopt(calendar)
+    let delegate = ModusCalendar(handle: handle)
+    calendar.selectionBehavior = UICalendarSelectionSingleDate(delegate: delegate)
+    calendarDelegates[handle] = delegate
+    return handle
+}
+
+// unavailable_new(text, length, x, y, w, h): a content-unavailable view (UIContentUnavailableView): an image and the
+// text, as an empty screen shows.
+let unavailableNew: Call = { p, n, x, y, w, h in
+    var config = UIContentUnavailableConfiguration.empty()
+    config.image = UIImage(systemName: "tray")
+    config.text = text(p, n)
+    config.secondaryText = "Nothing here yet."
+    let view = UIContentUnavailableView(configuration: config)
+    view.frame = rect(x, y, w, h)
+    view.overrideUserInterfaceStyle = .dark
+    return adopt(view)
+}
+
+// The colour and font pickers' delegate: a colour picked sends a COLOR event (0xRRGGBB), a font a FONT event; the
+// pickers are system view controllers, shown over the app.
+final class ModusPickers: NSObject, UIColorPickerViewControllerDelegate, UIFontPickerViewControllerDelegate {
+    let handle: UInt
+
+    init(handle: UInt) {
+        self.handle = handle
+    }
+
+    func colorPickerViewController(_ viewController: UIColorPickerViewController, didSelect color: UIColor,
+                                   continuously: Bool) {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        send("COLOR", [.int(Int(handle)), .int((Int(r * 255) << 16) | (Int(g * 255) << 8) | Int(b * 255))])
+    }
+
+    func fontPickerViewControllerDidPickFont(_ viewController: UIFontPickerViewController) {
+        send("FONT", [.int(Int(handle))])
+        viewController.dismiss(animated: true)
+    }
+}
+
+private var pickerDelegates: [UInt: ModusPickers] = [:]
+
+// color_picker_show() and font_picker_show(): the system colour picker and font picker, shown over the app.  Each
+// returns a handle that names its events.
+let colorPickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let delegate = ModusPickers(handle: handle)
+    let picker = UIColorPickerViewController()
+    picker.delegate = delegate
+    pickerDelegates[handle] = delegate
+    root.present(picker, animated: true)
+    return handle
+}
+
+let fontPickerShow: Call = { _, _, _, _, _, _ in
+    guard let root = keyRoot()?.window?.rootViewController else { return 0 }
+    let handle = nextHandle
+    nextHandle += 1
+    let delegate = ModusPickers(handle: handle)
+    let picker = UIFontPickerViewController()
+    picker.delegate = delegate
+    pickerDelegates[handle] = delegate
+    root.present(picker, animated: true)
+    return handle
+}
+
+// input_keys_on(field, keys, length): the text field's keyboard is replaced by an input view (UIInputView) of a key
+// per title (a term: a list of strings); a key types its title into the field.
+let inputKeysOn: Call = { h, p, n, _, _, _ in
+    guard let field = views[h] as? UITextField else { return 0 }
+    // as wide as the screen from the start: the row of keys inside is laid out from this frame
+    let width = keyRoot()?.bounds.width ?? 402
+    let input = UIInputView(frame: CGRect(x: 0, y: 0, width: width, height: 60), inputViewStyle: .keyboard)
+    let row = UIStackView(frame: input.bounds.insetBy(dx: 8, dy: 8))
+    row.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    row.distribution = .fillEqually
+    row.spacing = 8
+    for title in titlesOf(p, n) {
+        let key = UIButton(type: .system)
+        key.setTitle(title, for: .normal)
+        key.addAction(UIAction { [weak field] _ in field?.insertText(title) }, for: .touchUpInside)
+        row.addArrangedSubview(key)
+    }
+    input.addSubview(row)
+    field.inputView = input
+    field.reloadInputViews()
+    return 1
+}
+
 // send_refresh(list): a pull on the list, sent as the refresh control sends it (its REFRESH event then comes back).
 // For tests and automation, like send_tap: a one-shot swipe in the simulator does not start a pull.
 let sendRefresh: Call = { h, _, _, _, _, _ in
@@ -1745,6 +1911,13 @@ public func modusSwiftInstall() {
     register("ui_document_picker_show", documentPickerShow)
     register("ui_collection_new", collectionNew)
     register("ui_image_picker_show", imagePickerShow)
+    register("ui_tap_on", tapOn)
+    register("ui_edge_pan_on", edgePanOn)
+    register("ui_calendar_new", calendarNew)
+    register("ui_unavailable_new", unavailableNew)
+    register("ui_color_picker_show", colorPickerShow)
+    register("ui_font_picker_show", fontPickerShow)
+    register("ui_input_keys_on", inputKeysOn)
     register("ui_panel_new", panelNew)
     register("ui_stack_new", stackNew)
     register("ui_scroll_new", scrollNew)

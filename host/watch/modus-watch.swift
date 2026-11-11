@@ -110,6 +110,8 @@ struct ModusView: View {
             .gesture(DragGesture(minimumDistance: 0)
                 .onChanged { v in pushEvent(down ? 2 : 1, v.location); down = true }
                 .onEnded { v in pushEvent(3, v.location); down = false })
+            // the components Lisp makes (modus-watch-ui.swift), over the framebuffer and its touches
+            .overlay(alignment: .topLeading) { NodesLayer() }
             .onAppear { start(g.size) }
         }
         .ignoresSafeArea()

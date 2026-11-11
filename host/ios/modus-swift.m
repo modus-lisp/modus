@@ -20,7 +20,7 @@ typedef uintptr_t (*swift_fn)(uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintpt
 
 enum { F_NARGS = 0, F_ARGS = 8, F_RESULT = 64, F_NAME = 128 };
 
-#define MAX_FNS 128
+#define MAX_FNS 256
 static struct { const char *name; void *fn; } table[MAX_FNS];
 static int nfns;
 static int installed;

@@ -384,6 +384,12 @@ let alertAction: Call = { h, p, n, _, _, _ in
 // alert_present(handle): the alert is shown over the app's screen.
 let alertPresent: Call = { h, _, _, _, _, _ in
     guard let alert = alerts[h], let root = keyRoot()?.window?.rootViewController else { return 0 }
+    // an action sheet on an iPad is a popover, anchored like the share sheet's
+    if let popover = alert.popoverPresentationController {
+        popover.sourceView = root.view
+        popover.sourceRect = CGRect(x: root.view.bounds.midX, y: root.view.bounds.midY, width: 1, height: 1)
+        popover.permittedArrowDirections = []
+    }
     root.present(alert, animated: true)
     return 1
 }
@@ -796,6 +802,12 @@ let sharePresent: Call = { p, n, _, _, _, _ in
     sheet.completionWithItemsHandler = { _, completed, _, _ in
         send("SHARE", [.int(Int(handle)), .int(completed ? 1 : 0)])
     }
+    // on an iPad the sheet is a popover, which must be anchored or presenting it raises: the screen's centre
+    if let popover = sheet.popoverPresentationController {
+        popover.sourceView = root.view
+        popover.sourceRect = CGRect(x: root.view.bounds.midX, y: root.view.bounds.midY, width: 1, height: 1)
+        popover.permittedArrowDirections = []
+    }
     root.present(sheet, animated: true)
     return handle
 }
@@ -1032,6 +1044,11 @@ let dynamicLabelNew: Call = { p, n, x, y, w, h in
 // safe_area_top(): the top safe-area inset of the screen, in points (the status bar, the notch).
 let safeAreaTop: Call = { _, _, _, _, _, _ in
     UInt(keyRoot()?.safeAreaInsets.top ?? 0)
+}
+
+// screen_height(): the height of the app's screen, in points (874 on an iPhone 17 Pro, 1210 on an 11-inch iPad Pro).
+let screenHeight: Call = { _, _, _, _, _, _ in
+    UInt(keyRoot()?.bounds.height ?? 0)
 }
 
 // parallax_on(handle, amount): the view moves a little with the device's tilt, by amount points, as a parallax
@@ -1894,6 +1911,7 @@ public func modusSwiftInstall() {
     register("ui_attributed_label_new", attributedLabelNew)
     register("ui_dynamic_label_new", dynamicLabelNew)
     register("ui_safe_area_top", safeAreaTop)
+    register("ui_screen_height", screenHeight)
     register("ui_parallax_on", parallaxOn)
     register("ui_zoom_scroll_new", zoomScrollNew)
     register("ui_zoom_content", zoomContent)

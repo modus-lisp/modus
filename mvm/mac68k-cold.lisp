@@ -80,3 +80,26 @@
   (when (and (eql (mem-ref #x1000602C :u32) 1)
              (eql (compute-name-hash "CAR") (%cold-names-check)))
     (setq *sym-name-table* nil)))
+
+;;; RIGHT-SIZED BUCKETS.  A pinned table (the symbol-function table, the globals
+;;; table: their (key . value) pairs are cached outside them) keeps a bucket
+;;; vector sized at TWO buckets an entry -- 16,384 words, 64 KB, for the
+;;; function table's 4,711 names.  At the freeze the Mac rebuilds it at one
+;;; bucket per two entries, rounded up to a power of two (4,096: chains of 1.15
+;;; on average).  PUTHASH regrows an index only past two entries a bucket, so
+;;; the frozen size holds until the table has doubled.
+(defun %mac-shrink-buckets (ht)
+  (let ((holder (and ht (modus.runtime::%ht-bucket-holder ht))))
+    (when (and holder (modus.runtime::%ht-pinned-p ht))
+      (let ((old (modus.runtime::%ht-h-vec holder)) (cnt (modus.runtime::%ht-h-count holder)) (n 256))
+        (when (and old (not (eq old (modus.runtime::%ht-nohash))) (not (consp old)))
+          (loop (when (>= (* 2 n) cnt) (return nil)) (setq n (* n 2)))
+          (when (< n (%prim-array-length old))
+            (let ((vec (modus.runtime::%ht-new-bucket-vec n)) (cur (car ht)) (strcmp? (modus.runtime::%ht-h-strcmp holder)))
+              (loop
+                (when (null cur) (return nil))
+                (let ((pair (car cur)))
+                  (modus.runtime::%ht-bucket-put vec (car pair) pair strcmp?))
+                (setq cur (cdr cur)))
+              (modus.runtime::%ht-h-set-vec holder vec)
+              n)))))))

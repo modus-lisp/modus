@@ -3307,6 +3307,9 @@
   (compact-names)
 "
                        (if *mac-cold-names-out* "  (%cold-names-drop)
+  ;; the pinned tables' bucket vectors at one bucket per two entries
+  (%mac-shrink-buckets *symbol-function-table*)
+  (%mac-shrink-buckets (modus.runtime::%globals-table))
 " "")
                        "  ;; the closure-environment slot (translate-68k M68K-CENV-ADDR, the
   ;; hosted convention block at #x10000A00) still holds the LAST closure's

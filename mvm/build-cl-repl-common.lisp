@@ -3134,6 +3134,40 @@
   (halt))
 "))
 
+;;; :MAC68K: its boot files now (their layout is needed by the texts below):
+;;; the image's first act is to set the runtime-data region's delta for the
+;;; compiler it carries (boot-mac68k MAC68K-COINIT-TEXT), and its I/O scratch
+;;; pages are real addresses in the Mac's RAM.
+(when *cl-repl-mac68k-p*
+  (mvm-load "boot/boot-linux-68k.lisp")
+  (mvm-load "boot/boot-mac68k.lisp")
+  ;; in the scratch text, not the prologue: that runs AFTER INIT-ALL-GLOBALS,
+  ;; which would put *CONV-DELTA* back to its initform 0 (measured: runtime
+  ;; code then stored to the virtual MV count)
+  (setq *cli-arch-io-scratch-source*
+        (concatenate 'string (funcall (find-symbol "MAC68K-COINIT-TEXT" "MODUS.MVM"))
+                     *cli-arch-io-scratch-source*))
+  (let ((scr (symbol-value (find-symbol "+MAC68K-SCRATCH+" "MODUS.MVM"))))
+    (dolist (pair (list (cons "#x0FE00000" (format nil "#x~X" scr))
+                        (cons "#x0FF00000" (format nil "#x~X" (+ scr #x40000)))))
+      (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
+        (unless at (error "mac68k: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
+        (setq *cli-arch-io-scratch-source*
+              (concatenate 'string (subseq *cli-arch-io-scratch-source* 0 at) (cdr pair)
+                           (subseq *cli-arch-io-scratch-source* (+ at (length (car pair))))))))))
+
+;;; :MAC68K: the 68k REPL's size switches, as mvm/build-68k-cli.lisp reads them.
+;;; MODUS_NARROW_STRINGS=1: the reader and the name tables make one-byte
+;;; strings, and pooled literals are narrow (set below, once MODUS.MVM exists).
+;;; MODUS_SMALL_IMAGE is build-cli-common's own.
+(when (and *cl-repl-mac68k-p*
+           (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS")))
+             (and v (> (length v) 0) (string/= v "0"))))
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source*
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)))
+  (defparameter cl-user::*68k-pool-narrow* t))
+
 ;;; ============================================================
 ;;; THE SHARED ASSEMBLY
 ;;; ============================================================
@@ -3276,11 +3310,54 @@
 ;;; MAC68K-CONFIGURE puts the translator in *68K-MAC-MODE* and moves NIL's page
 ;;; and the kind map into the Mac's RAM.  Console: the ROM's serial driver.
 (when cl-user::*cl-repl-mac68k-p*
-  (cl-user::mvm-load "boot/boot-linux-68k.lisp")
-  (cl-user::mvm-load "boot/boot-mac68k.lisp")
   (funcall (intern "INSTALL-68K-TRANSLATOR" "MODUS.MVM"))
   (funcall (intern "MAC68K-CONFIGURE" "MODUS.MVM"))
-  (format t "~&;; CONSOLE: the Mac ROM's serial driver, port A (.AIn/.AOut)~%"))
+  (format t "~&;; CONSOLE: the Mac ROM's serial driver, port A (.AIn/.AOut)~%")
+  ;; MODUS_CONV_VALUE_AUDIT=1 (host only; the image is unchanged): every integer
+  ;; literal compiled in the VIRTUAL low block [#x10000000, #x10020000) -- after
+  ;; the region moved, an address used as a VALUE that is not written
+  ;; (%CONV-ADDR K), or a number that only looks like one.  Listed after the build.
+  (when (let ((v (sb-ext:posix-getenv "MODUS_CONV_VALUE_AUDIT"))) (and v (string/= v "0")))
+    (defparameter cl-user::*conv-value-hits* (make-hash-table :test 'equal))
+    (sb-int:encapsulate (intern "COMPILE-INTEGER" "MODUS.MVM") 'conv-value-audit
+      (lambda (f value dest)
+        (when (and (integerp value) (<= #x10000000 value #x1001FFFF))
+          (push value (gethash (symbol-value (intern "*CURRENT-FUNCTION-NAME*" "MODUS.MVM"))
+                               cl-user::*conv-value-hits*)))
+        (funcall f value dest))))
+  ;; THE SIZE SWITCHES, as mvm/build-68k-cli.lisp sets them: each 1 = on, 0 =
+  ;; off, unset follows MODUS_SMALL_IMAGE.  MODUS_68K_THREADED=1 (with
+  ;; MODUS_68K_HOT=FILE) makes cold functions threaded code.  (No static heap
+  ;; or saved core: those are the Linux image's.)
+  (flet ((knob (name)
+           (let ((v (sb-ext:posix-getenv name)))
+             (cond ((null v) (and cl-user::*small-image* t))
+                   ((string= v "0") nil)
+                   (t t))))
+         (sym (name) (intern name "MODUS.MVM")))
+    (setf (symbol-value (sym "*68K-RELAX-BRANCHES*")) (knob "MODUS_68K_RELAX_BRANCHES")
+          (symbol-value (sym "*68K-SHARED-SEQUENCES*")) (knob "MODUS_68K_SHARED")
+          (symbol-value (sym "*68K-LI-SHIFT*")) (and cl-user::*small-image* t)
+          (symbol-value (sym "*68K-A5-GLOBALS*")) (knob "MODUS_68K_A5_GLOBALS")
+          (symbol-value (sym "*68K-TAGS3*")) (knob "MODUS_68K_TAGS3"))
+    (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
+      (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t))
+    (let ((v (sb-ext:posix-getenv "MODUS_68K_THREADED")))
+      (when (and v (string/= v "0"))
+        (setf (symbol-value (sym "*68K-THREADED*")) :all
+              (symbol-value (sym "*68K-A5-GLOBALS*")) nil)
+        (let ((f (sb-ext:posix-getenv "MODUS_68K_HOT")))
+          (when (and f (plusp (length f)))
+            (let ((h (make-hash-table :test 'equal)))
+              (with-open-file (in f)
+                (loop for l = (read-line in nil) while l
+                      do (let ((n (string-trim " " l)))
+                           (when (plusp (length n)) (setf (gethash n h) t)))))
+              (setf (symbol-value (sym "*68K-HOT-NAMES*")) h))))))
+    (format t "~&;; mac68k:~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~%"
+            (symbol-value (sym "*68K-TAGS3*")) (symbol-value (sym "*68K-THREADED*"))
+            (symbol-value (sym "*68K-A5-GLOBALS*")) (symbol-value (sym "*68K-RELAX-BRANCHES*"))
+            (symbol-value (sym "*POOL-NARROW-STRINGS*")))))
 
 (when cl-user::*cl-repl-arm32-p*
   (cl-user::mvm-load "boot/boot-linux-arm32.lisp")
@@ -3917,13 +3994,21 @@
        (let ((gaps (symbol-value (intern "*68K-UNIMPL-OPCODES*" "MODUS.MVM"))))
          (format t "~&;; mac68k TRANSLATOR GAPS (ILLEGAL if run): ~{#x~X~^ ~}~%"
                  (sort (copy-list gaps) #'<)))
-       (let ((end (+ (symbol-value (intern "+MAC68K-LOAD-ADDR+" "MODUS.MVM"))
-                     (length (kernel-image-image-bytes image))))
-             (top (symbol-value (intern "+MAC68K-STACK-TOP+" "MODUS.MVM"))))
-         (format t "~&;; mac68k map: image #x0D000000 .. #x~X (~,1F MB), stack top #x~X~%"
-                 end (/ (- end #x0D000000) 1048576.0) top)
-         (when (> (+ end #x800000) top)
-           (error "mac68k layout: the image ends at #x~X, within 8 MB of the stack top ~
+       (let* ((load (symbol-value (intern "+MAC68K-LOAD-ADDR+" "MODUS.MVM")))
+              (end (+ load (length (kernel-image-image-bytes image))))
+              (top (symbol-value (intern "+MAC68K-STACK-TOP+" "MODUS.MVM"))))
+         (format t "~&;; mac68k map: image #x~X .. #x~X (~,1F MB), stack top #x~X, ~
+                    region #x~X~%"
+                 load end (/ (- end load) 1048576.0) top
+                 (symbol-value (intern "+MAC68K-REGION+" "MODUS.MVM")))
+         (when (boundp 'cl-user::*conv-value-hits*)
+           (format t "~&;; mac68k CONV VALUE AUDIT: ~D functions load a virtual low-block ~
+                      literal~%" (hash-table-count cl-user::*conv-value-hits*))
+           (maphash (lambda (fn vals)
+                      (format t ";;   ~A~{ #x~X~}~%" fn (remove-duplicates vals)))
+                    cl-user::*conv-value-hits*))
+         (when (> (+ end #x200000) top)
+           (error "mac68k layout: the image ends at #x~X, within 2 MB of the stack top ~
                    #x~X." end top))))
       ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
       ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from

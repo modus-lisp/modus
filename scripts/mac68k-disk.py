@@ -18,7 +18,7 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-LOAD_ADDR = 0x0D000000
+LOAD_ADDR = 0x00100000   # boot/boot-mac68k.lisp +MAC68K-LOAD-ADDR+
 
 
 def bootblocks():

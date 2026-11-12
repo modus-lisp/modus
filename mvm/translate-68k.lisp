@@ -675,7 +675,7 @@
 ;;; so the 68k images must be run with at least that much RAM -- the harness
 ;;; passes -m 512.  Unlike RISC-V (where it lands in UART MMIO) and ppc32
 ;;; (outside the mapped TLBs), on m68k virt it is ordinary RAM.
-(defun m68k-mvcount-addr () modus.mvm::+mv-count-addr+)
+(defun m68k-mvcount-addr () (conv-real modus.mvm::+mv-count-addr+))
 
 ;;; A5 = THE HOSTED GLOBALS BASE (*68K-A5-GLOBALS*, MODUS_68K_A5_GLOBALS;
 ;;; unset, it follows MODUS_SMALL_IMAGE).  A5 is otherwise unused outside the
@@ -689,7 +689,7 @@
 (defun m68k-a5-disp (addr)
   "ADDR's displacement from A5 when A5 holds the globals base and it fits d16."
   (and *68k-a5-globals* (m68k-hosted-layout-p)
-       (let ((d (- addr *68k-hosted-globals-base*)))
+       (let ((d (- addr (conv-real *68k-hosted-globals-base*))))
          (and (<= -32768 d 32767) d))))
 
 (defun m68k-emit-store-absl (buf dn addr)
@@ -2427,7 +2427,7 @@
              (width (third operands)))
          ;; Load address into A0
          (m68k-load-vreg-to-an buf +68k-a0+ vaddr)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d0+)
               (m68k-emit-andi buf +68k-d0+ #xFF))        ; zero-extend
            (1 (m68k-emit-move-word-an-ind-dn buf +68k-a0+ +68k-d0+)
@@ -2442,7 +2442,7 @@
              (width (third operands)))
          (m68k-load-vreg-to-an buf +68k-a0+ vaddr)
          (m68k-load-vreg buf +68k-d0+ vs)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+))
            (1 (m68k-emit-move-word-dn-an-ind buf +68k-d0+ +68k-a0+))
            (2 (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+))
@@ -2768,7 +2768,7 @@
              (width (third operands)))
          ;; Load port address
          (m68k-emit-move-imm-an buf port +68k-a0+)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-an-ind-dn buf +68k-a0+ +68k-d0+)
               (m68k-emit-andi buf +68k-d0+ #xFF))
            (1 (m68k-emit-move-word-an-ind-dn buf +68k-a0+ +68k-d0+)
@@ -2783,7 +2783,7 @@
              (width (third operands)))
          (m68k-emit-move-imm-an buf port +68k-a0+)
          (m68k-load-vreg buf +68k-d0+ vs)
-         (ecase width
+         (ecase (logand width 3)   ; widths 4..7 / 8+: the TLS / conv marks
            (0 (m68k-emit-move-byte-dn-an-ind buf +68k-d0+ +68k-a0+))
            (1 (m68k-emit-move-word-dn-an-ind buf +68k-d0+ +68k-a0+))
            (2 (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+))
@@ -3114,7 +3114,7 @@
 (defun m68k-kind-bias ()
   "K: the kind byte of address A is at K + (A >> kind-shift), one byte per
    heap granule."
-  (- *68k-gc-kind-map* (ash #x10000000 (- (m68k-kind-shift)))))
+  (- *68k-gc-kind-map* (ash (conv-real #x10000000) (- (m68k-kind-shift)))))
 (defvar *68k-gc-static* nil
   "STATIC BOOT HEAP (MODUS_68K_GC_STATIC; unset, it follows MODUS_SMALL_IMAGE).
    A request word makes the collector, at the end of the collection that sees
@@ -3222,9 +3222,16 @@
   "Emit +68K-MAC-CONSOLE-CODE+: putc at *68K-MAC-CONSOLE-LABEL*, getc (word
    21) at *68K-MAC-GETC-LABEL*."
   (m68k-emit-label buf *68k-mac-console-label*)
-  (loop for w across +68k-mac-console-code+ for i from 0
-        do (when (= i 21) (m68k-emit-label buf *68k-mac-getc-label*))
-           (m68k-emit-word buf w)))
+  (let ((code (copy-seq +68k-mac-console-code+)))
+    ;; every absolute operand is a $1000_9xxx long: move it with the
+    ;; runtime-data region (CONV-REAL)
+    (loop for i from 0 below (1- (length code))
+          when (and (= (aref code i) #x1000) (= (logand (aref code (1+ i)) #xF000) #x9000))
+            do (let ((a (conv-real (logior #x10000000 (aref code (1+ i))))))
+                 (setf (aref code i) (ash a -16) (aref code (1+ i)) (logand a #xFFFF))))
+    (loop for w across code for i from 0
+          do (when (= i 21) (m68k-emit-label buf *68k-mac-getc-label*))
+             (m68k-emit-word buf w))))
 
 (defun m68k-emit-mac-putc (buf)
   "D0.B to the Mac's serial console (D0/A0 clobbered)."
@@ -3619,7 +3626,7 @@
              ;; flag |= (to_start <= (slot) < to_start + size)
              (let ((no (mvm-make-label)))
                (m68k-emit-move-an-ind-dn buf slot-an +68k-d0+)
-               (m68k-emit-move-imm-an buf +68k-gc-meta+ +68k-a0+)
+               (m68k-emit-move-imm-an buf (conv-real +68k-gc-meta+) +68k-a0+)
                (m68k-emit-move-disp-dn buf +68k-a0+ #x08 +68k-d1+)   ; to_start
                (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d0+)           ; v - to_start
                (m68k-emit-move-disp-dn buf +68k-a0+ #x10 +68k-d1+)   ; size
@@ -3836,7 +3843,7 @@
   "Emit the hosted collector at *68K-GC-LABEL*.  Entered by BSR.L from
    :gc-check; every register is preserved except the new VA/VL it installs."
   (let ((scan (mvm-make-label))
-        (meta +68k-gc-meta+)
+        (meta (conv-real +68k-gc-meta+))
         (save #xFFFE)                     ; D0-D7/A0-A6, predecrement order
         (restore #x7FFF))
     (flet ((lbl () (mvm-make-label))
@@ -3869,7 +3876,7 @@
       (m68k-emit-move-an-an buf +68k-a7+ +68k-a5+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x18 +68k-d7+)        ; stack_base
       (root-range)
-      (m68k-emit-move-imm-an buf #x10000000 +68k-a5+)
+      (m68k-emit-move-imm-an buf (conv-real #x10000000) +68k-a5+)
       ;; the low block ends where the FIRST semispace starts, whichever one is
       ;; from-space now: min(from_start, to_start).  TO_START FROM THE BLOCK,
       ;; NOT A2: the stack roots above have already copied objects, so A2 is
@@ -4991,7 +4998,7 @@
   "As many 32-byte frames as fit below the hosted globals at #x10000A00 (they
    end at #x100009C8).  21 overflowed under a real library load on ARM32, the
    same protocol -- see *ARM32-HSTACK-MAX-DEPTH*.")
-(defun m68k-hbase ()           (if (m68k-hosted-layout-p) #x10000000 *68k-globals-base*))
+(defun m68k-hbase ()           (if (m68k-hosted-layout-p) (conv-real #x10000000) *68k-globals-base*))
 (defun m68k-jmpbuf-addr ()     (+ (m68k-hbase) #x180))
 (defun m68k-lj-scratch-addr () (+ (m68k-hbase) #x300))
 (defun m68k-hcapped-addr ()    (+ (m68k-hbase) #x360))
@@ -5080,7 +5087,7 @@
    map and convention slots, with the Mac's service traps.  Linux mode off."
   (setf *68k-linux-mode* nil)
   (setf *68k-mac-mode* (and on t))
-  (setf *68k-globals-base* (if on *68k-hosted-globals-base* #x00600000)))
+  (setf *68k-globals-base* (if on (conv-real *68k-hosted-globals-base*) #x00600000)))
 
 (defun install-68k-translator ()
   "Install the 68k translator into the target descriptor."

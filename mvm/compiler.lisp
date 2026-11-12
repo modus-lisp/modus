@@ -25690,7 +25690,11 @@
              (lo-off (if be 2 0)))
         (return-from compile-mem-ref
           (compile-form
-            (list 'let (list (list asym addr-form))
+            ;; The halves address a VARIABLE, which the region rule cannot
+            ;; prove: rebase the written address here, once, or a moved
+            ;; region's :u32 reads the virtual word (measured: the 68k Mac
+            ;; faulted on #x10000DB8 in %GV-SET-C).
+            (list 'let (list (list asym (%conv-addr-form addr-form)))
                   (list 'let (list (list hsym (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)))
                         (list 'if (list '< hsym (ash 1 (- +fixnum-bits+ 17)))
                               (list '+ (list 'ash hsym 16)
@@ -25742,7 +25746,8 @@
                   (lo-off (if be 2 0)))
              (return-from compile-setf
                (compile-form
-                 (list 'let (list (list asym addr-form) (list vsym value-form))
+                 ;; rebased once, as compile-mem-ref's split does
+                 (list 'let (list (list asym (%conv-addr-form addr-form)) (list vsym value-form))
                        (list 'setf (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16)
                              (list 'logand vsym 65535))
                        (list 'setf (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)

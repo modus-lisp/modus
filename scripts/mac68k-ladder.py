@@ -52,7 +52,7 @@ def boot(disk, nbytes, timeout=90):
     cmd = shlex.split(os.environ.get("MAC68K_BASILISK", "BasiliskII")) + [
         "--nogui", "true", "--rom", os.environ["MAC68K_ROM"],
         "--cpu", "4", "--fpu", os.environ.get("MAC68K_FPU", "false"),
-        "--ramsize", str(384 << 20),
+        "--ramsize", str(32 << 20),
         "--disk", disk, "--seriala", os.ttyname(slave)]
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)

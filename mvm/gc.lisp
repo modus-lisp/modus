@@ -1807,7 +1807,7 @@
    is also the walk's own precondition."
   (let* ((r (%gc-region-0)) (k (%gc-meta-scale))
          (ts (%gc-meta-read (+ r #x08) k)) (sz (%gc-meta-read (+ r #x10) k))
-         (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+         (cbm (%census-cons-bitmap)) (page (%gc-meta-read (%conv-addr #x10000E00) k))
          (a (%gc-old-lo)) (end (%gc-old-hi)) (objs 0) (dang 0) (bad 0))
     (flet ((slot (w) (when (%gc-cand-addr (%gc-word-lo w) (%gc-word-hi w) ts sz)
                        (setq dang (+ dang 1)))))
@@ -1883,7 +1883,7 @@
          (data (+ meta 128))
          (cross (+ data ncards))
          (k (%gc-meta-scale))
-         (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+         (cbm (%census-cons-bitmap)) (page (%gc-meta-read (%conv-addr #x10000E00) k))
          (a (%gc-old-lo)) (end (%gc-old-hi)))
     (%gc-write64 w 0)
     (%gc-write64 (+ w 16) 0)
@@ -1929,7 +1929,7 @@
            (r (%gc-region-0)) (k (%gc-meta-scale))
            (f (%gc-meta-read r k)) (tt (%gc-meta-read (+ r 8) k))
            (sz (%gc-meta-read (+ r 16) k))
-           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 k))
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read (%conv-addr #x10000E00) k))
            (a (%gc-old-lo)) (end (%gc-old-hi)) (young 0) (bad 0))
       (flet ((slot (x)
                (when (or (%gc-cand-addr (%gc-word-lo x) (%gc-word-hi x) f sz)
@@ -2862,9 +2862,9 @@
    at 0x10000E40; Linux x64 keeps it at the object-start bitmap plus a layout
    constant the CLI bakes as %CORE-KINDBITMAP-DELTA.  Read through
    %GC-META-READ: x64 stores these words raw, and a :u64 read halves them."
-  (let* ((k (%gc-meta-scale)) (c (%gc-meta-read #x10000E40 k)))
+  (let* ((k (%gc-meta-scale)) (c (%gc-meta-read (%conv-addr #x10000E40) k)))
     (if (and (= c 0) (fboundp '%core-kindbitmap-delta))
-        (let ((b (%gc-meta-read #x10000E18 k)))
+        (let ((b (%gc-meta-read (%conv-addr #x10000E18) k)))
           (if (= b 0) 0 (+ b (%core-kindbitmap-delta))))
         c)))
 
@@ -2894,7 +2894,7 @@
   (when (and (/= (%census-cons-bitmap) 0) (%census-span rcb))
     (let* ((counts (make-array 257 :initial-element 0))
            (bytes (make-array 257 :initial-element 0))
-           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read (%conv-addr #x10000E00) (%gc-meta-scale)))
            (span (%census-span rcb))
            (end (cdr span)) (a (car span)) (bad 0))
       (loop
@@ -2918,7 +2918,7 @@
    census says is growing.  Allocates only after the walk."
   (when (and (/= (%census-cons-bitmap) 0) (%census-span rcb))
     (let* ((found (make-array n :initial-element 0)) (k 0)
-           (cbm (%census-cons-bitmap)) (page (%gc-meta-read #x10000E00 (%gc-meta-scale)))
+           (cbm (%census-cons-bitmap)) (page (%gc-meta-read (%conv-addr #x10000E00) (%gc-meta-scale)))
            (span (%census-span rcb)) (end (cdr span)) (a (car span)))
       (loop
         (when (or (>= a end) (>= k n)) (return nil))

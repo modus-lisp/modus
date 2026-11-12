@@ -9,48 +9,65 @@
 ;;;; and drivers are left alone, which is what keeps the serial port (the
 ;;;; console), Ticks (the clock) and the keyboard working.
 ;;;;
-;;;; THE MEMORY MAP IS THE HOSTED ONE (boot-linux-68k.lisp), kept in real RAM,
-;;;; as ARM32's bare CL image keeps its hosted map: the low block at #x10000000,
-;;;; the heap above it, the native collector, the convention slots at
-;;;; #x10000A00.  So the Mac needs RAM to #x18000000 (384 MB) -- what Basilisk
-;;;; II is given.  Measured at boot-block time on Basilisk II with the LC 475
-;;;; ROM and 384 MB: MemTop #x18000000, BufPtr #x17FFE000, the ROM's heap from
-;;;; #x2000 and its boot stack near #x0C010000, the screen at #x18110000 and
-;;;; the ROM at #x18000000.  So [#x0D000000, #x17F00000) is ours:
+;;;; THE MEMORY MAP IS THE HOSTED ONE, MOVED INTO A REAL MAC'S RAM.  The runtime
+;;;; and the collector use the hosted 68k picture (boot-linux-68k.lisp): a low
+;;;; block of convention slots and tables, the heap above it.  Its addresses
+;;;; are the runtime-data region's, which the compiler and the translator
+;;;; rebase by a link-time delta (compiler.lisp *CONV-RELATIVE* / *CONV-DELTA*,
+;;;; CONV-REAL; docs/macos-hosting.md), so the region can sit anywhere.  On a
+;;;; 32 MB Mac (an LC 475 or Quadra 605 tops out at 36): measured at boot-block
+;;;; time on Basilisk II with the LC 475 ROM, the ROM's low memory and system
+;;;; heap end at #x39FE0, its boot stack and our boot blocks sit near
+;;;; #x01010000 (dead once the image runs), RAM ends at #x02000000, the ROM
+;;;; follows it and the screen is at #x02110000.  So:
 ;;;;
-;;;;   #x0D000000  this image (code, then its BSS)
-;;;;   #x0FD00000  top of our stack (grows down)
-;;;;   #x0FE00000  the CL image's I/O scratch pages (*CSTR-SCRATCH*, *IO-BUF-ADDR*)
-;;;;   #x10000000  the low block, then the heap: two 48 MB semispaces + guard
-;;;;   #x16800000  the collector's kind map (*68K-GC-KIND-MAP*)
-;;;;   #x17F00000  NIL's page (NIL = #x17F00001), then T's
+;;;;   #x00100000  this image (code, then its BSS)
+;;;;   #x00A80000  top of our stack (4 MB, down to the image's 6.5 MB mark)
+;;;;   #x00A80000  the CL image's I/O scratch pages (*CSTR-SCRATCH*, *IO-BUF-ADDR*)
+;;;;   #x00B00000  the low block (virtual #x10000000), then the heap: two 8 MB
+;;;;               semispaces and a 1 MB guard
+;;;;   #x01C00000  the collector's kind map (*68K-GC-KIND-MAP*)
+;;;;   #x01F00000  NIL's page (NIL = #x01F00001), then T's
 ;;;;
 ;;;; Everything is below 2^29, the highest address a tagged fixnum can name.
-;;;; A real LC 475 tops out at 36 MB; for it the same picture is built with the
-;;;; 68LC040's MMU (it has one -- only the FPU is missing), arm32's way.  Not
-;;;; yet.
 
 (in-package :modus.mvm)
 
-(defconstant +mac68k-load-addr+ #x0D000000)
-(defconstant +mac68k-stack-top+ #x0FD00000)
-(defconstant +mac68k-heap-size+ #x06000000
-  "96 MB: two 48 MB semispaces; with the guard it ends at #x16400000, below the
-   kind map.")
-(defconstant +mac68k-kind-map+ #x16800000)
-(defconstant +mac68k-nil-page+ #x17F00000)
-(defconstant +mac68k-ser-out-pb+ #x10009000
+(defconstant +mac68k-load-addr+ #x00100000)
+(defconstant +mac68k-stack-top+ #x00A80000)
+(defconstant +mac68k-scratch+ #x00A80000
+  "The I/O scratch pages: *CSTR-SCRATCH* here, *IO-BUF-ADDR* 256 KB on.")
+(defconstant +mac68k-region+ #x00B00000
+  "Where the runtime-data region's base (virtual #x10000000) really is.")
+(defconstant +mac68k-heap-size+ #x01000000
+  "16 MB: two 8 MB semispaces.")
+(defconstant +mac68k-gc-guard+ #x00100000
+  "1 MB past the second semispace (boot-linux-68k's guard is 4 MB).")
+(defconstant +mac68k-kind-map+ #x01C00000)
+(defconstant +mac68k-nil-page+ #x01F00000)
+(defun mac68k-ser-out-pb ()
   "The serial drivers' parameter blocks, in the low block's argv area (a Mac
-   image has no argv); translate-68k's +68K-MAC-CONSOLE-CODE+ reads them.")
-(defconstant +mac68k-ser-in-pb+ #x10009080)
+   image has no argv); translate-68k's +68K-MAC-CONSOLE-CODE+ reads them."
+  (conv-real #x10009000))
+(defun mac68k-ser-in-pb () (conv-real #x10009080))
 
 (defun mac68k-configure (&optional (on t))
-  "The translator and compiler settings a Mac image is built with: Mac mode,
-   NIL's page in RAM, the kind map below it.  Call before building."
+  "The translator and compiler settings a Mac image is built with: the
+   runtime-data region moved to +MAC68K-REGION+ (it must be first: the mode
+   setter places the convention slots with it), Mac mode, NIL's page and the
+   kind map in RAM.  Call before building."
   (declare (ignore on))
+  (setf *conv-relative* t
+        *conv-delta* (- +mac68k-region+ +conv-region-base+))
   (m68k-set-mac-mode t)
   (setf *68k-nil-page* +mac68k-nil-page+
         *68k-gc-kind-map* +mac68k-kind-map+))
+
+(defun mac68k-coinit-text ()
+  "Source text the image runs first in KERNEL-MAIN: the same region delta for
+   the compiler the image carries, which compiles every REPL form."
+  (format nil "  (setq *conv-relative* t)~%  (setq *conv-delta* ~D)~%"
+          (- +mac68k-region+ +conv-region-base+)))
 
 (defun emit-mac68k-zero (buf start bytes)
   "Zero BYTES (a multiple of 4) from START.  Clobbers D0/A0."
@@ -79,7 +96,7 @@
   (let* ((buf (make-m68k-buffer))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (fill (mvm-make-label))
-         (base #x10000000)
+         (base (conv-real #x10000000))
          (size +mac68k-heap-size+)
          (mid (floor size 2))
          (space (- mid +linux-68k-heap-alloc-start+))
@@ -98,7 +115,7 @@
     ;; the low block and the kind map start zeroed, as a fresh mmap does
     (emit-mac68k-zero buf base #x20000)
     (emit-mac68k-zero buf +mac68k-kind-map+
-                      (ash (+ size +linux-68k-gc-guard+) (- (m68k-kind-shift))))
+                      (ash (+ size +mac68k-gc-guard+) (- (m68k-kind-shift))))
     ;; NIL's page and T's, filled with NIL: (car nil) and (cdr nil) are loads
     (m68k-emit-move-imm-an buf +mac68k-nil-page+ +68k-a0+)
     (m68k-emit-move-imm-dn buf +nil-value+ +68k-d1+)
@@ -113,14 +130,14 @@
     (m68k-emit-moveq buf +68k-d0+ 20)
     (m68k-emit-word buf #xA06D)                          ; _InitEvents
     ;; the console: .AIn, then .AOut
-    (emit-mac68k-open buf +mac68k-ser-in-pb+ ain)
-    (emit-mac68k-open buf +mac68k-ser-out-pb+ aout)
+    (emit-mac68k-open buf (mac68k-ser-in-pb) ain)
+    (emit-mac68k-open buf (mac68k-ser-out-pb) aout)
     ;; MVM allocation registers: VA = a2, VL = a3, VN = a4
     (m68k-emit-move-imm-an buf (+ base +linux-68k-heap-alloc-start+) +68k-a2+)
     (m68k-emit-move-imm-an buf (- (+ base mid) margin) +68k-a3+)
     (m68k-emit-move-imm-an buf +nil-value+ +68k-a4+)
     (when *68k-a5-globals*
-      (m68k-emit-move-imm-an buf *68k-hosted-globals-base* +68k-a5+))
+      (m68k-emit-move-imm-an buf (conv-real *68k-hosted-globals-base*) +68k-a5+))
     ;; the Cheney block at #x10000040, as the Linux stub writes it
     (m68k-emit-move-imm-an buf (+ base #x40) +68k-a0+)
     (m68k-emit-move-imm-dn buf (+ base +linux-68k-heap-alloc-start+) +68k-d1+)
@@ -145,6 +162,6 @@
   (list :arch :68k
         :entry-fn #'emit-mac68k-entry
         :load-addr +mac68k-load-addr+
-        :heap-base #x10000000
-        :cons-base #x10000000
+        :heap-base +mac68k-region+
+        :cons-base +mac68k-region+
         :endianness :big))

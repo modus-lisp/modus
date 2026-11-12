@@ -215,6 +215,10 @@
    placed on 64-byte boundaries, so a granule has at most one stream.")
 (defconstant +68k-cache-granule-shift+ 6)
 (defvar *68k-stream-home-label* nil)
+(defvar *68k-reload-label* nil
+  "Paged Mac: the RELOAD token's handler (M68K-EMIT-PAGED-SECTION): a root
+   into a stream the cache evicted while it was active points at a reload
+   record, whose token this is.")
 (defvar *68k-stream-end-label* nil)
 
 (defvar *68k-paged-layout* nil
@@ -4551,6 +4555,7 @@
   (let* ((*68k-native-p* t)
          (*68k-paged-fns* nil)
          (*68k-cold-enter-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-reload-label* (and *68k-paged* *68k-mac-mode* (mvm-make-label)))
          (*68k-stream-table-label* (and *68k-paged* (mvm-make-label)))
          (*68k-stream-section-label* (and *68k-paged* (mvm-make-label)))
          (*68k-stream-home-label* (and *68k-paged* (mvm-make-label)))
@@ -5088,6 +5093,8 @@
         (alloc (mvm-make-label)) (ca5 (mvm-make-label)) (chk (mvm-make-label))
         (ill-drive (mvm-make-label)) (ill-read (mvm-make-label)) (ill-full (mvm-make-label))
         (cacheptr (mvm-make-label)) (lastidx (mvm-make-label)) (pb (mvm-make-label))
+        (force (mvm-make-label)) (recs (mvm-make-label)) (recs-end (mvm-make-label))
+        (roff (mvm-make-label))
         (fns (reverse *68k-paged-fns*))
         (mac (and *68k-mac-mode* *68k-paged-cache*)))
     (m68k-word-align buf)
@@ -5177,6 +5184,11 @@
           (m68k-emit-lea-label buf lastidx +68k-a5+) (ws #x2015)
           (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
           (ws #x2A75 #x0800)                                   ; A5 = the stream
+          ;; + the RELOAD offset (0 for a call), which is then cleared; and A1
+          ;; again from CA5: FORCE may have rewritten the caller's A5 to a record
+          (ws #xDBF9) (m68k-emit-abs32 buf roff)               ; ADDA.L roff,A5
+          (ws #x42B9) (m68k-emit-abs32 buf roff)               ; CLR.L roff
+          (m68k-emit-lea-label buf ca5 +68k-a1+) (ws #x2251)   ; MOVEA.L (A1),A1
           (m68k-emit-bra buf *68k-thread-next-label*)
           ;; a stream that cannot be had: say which way on serial port A, stop
           (loop for (label text) in (list (list ill-drive "!LDR-DRIVE") (list ill-read "!LDR-READ")
@@ -5190,7 +5202,24 @@
                    (let ((spin (mvm-make-label)))
                      (m68k-emit-label buf spin)
                      (m68k-emit-bra buf spin)))
-          (m68k-emit-paged-alloc buf alloc (length fns) ca5)
+          (m68k-emit-paged-alloc buf alloc (length fns) ca5 force)
+          (m68k-emit-paged-force buf force ca5 recs recs-end)
+          ;; THE RELOAD TOKEN: A5 = a reload record + the token's 3 bytes.  The
+          ;; record's stream is entered as COLD-ENTER enters one, at the
+          ;; record's offset (ROFF, added where A5 is set), with no caller
+          (m68k-word-align buf)
+          (m68k-emit-label buf *68k-reload-label*)
+          (ws #x200D #x5680 #x0280 #xFFFF #xFFFC #x2A40)       ; A5 = the record + 4
+          (ws #x201D)                                          ; D0 = i
+          (ws #x23D5) (m68k-emit-abs32 buf roff)               ; roff = the offset
+          (ws #x93C9 #xD080 #xD080)                            ; A1 = 0; D0 = i * 4
+          (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
+          (ws #x0835 #x0000 #x0803)                            ; BTST #0,(3,A5,D0.L)
+          (m68k-emit-bne buf miss)                             ; not loaded: the loader
+          (ws #x2A75 #x0800)                                   ; A5 = the stream
+          (ws #xDBF9) (m68k-emit-abs32 buf roff)               ; + the offset
+          (ws #x42B9) (m68k-emit-abs32 buf roff)
+          (m68k-emit-bra buf *68k-thread-next-label*)
           (when (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CHECK") "1")
             (m68k-emit-paged-check buf chk (length fns) ca5)))))
     (m68k-emit-label buf ill)
@@ -5203,8 +5232,18 @@
     (m68k-emit-long buf 0)
     (m68k-emit-label buf ca5)
     (m68k-emit-long buf 0)
+    (m68k-emit-label buf roff)                                ; RELOAD's offset (0 between)
+    (m68k-emit-long buf 0)
     (m68k-emit-label buf pb)
     (dotimes (i 40) (m68k-emit-word buf 0))
+    ;; the reload records, 16-aligned in memory (FORCE)
+    (when mac
+      ;; (the native buffer starts on a 16-byte boundary in memory: cross.lisp)
+      (loop while (/= 0 (mod (m68k-buffer-position buf) 16))
+            do (m68k-emit-word buf 0))
+      (m68k-emit-label buf recs)
+      (dotimes (i (* 8 +68k-reload-records+)) (m68k-emit-word buf 0))
+      (m68k-emit-label buf recs-end))
     ;; the descriptor: "modusPGD", the table's address, the count, the
     ;; section, and the DISK BIAS: home address - bias = the stream's byte on
     ;; the boot disk (load address - 1024 when the image follows the boot
@@ -5234,7 +5273,109 @@
           (m68k-word-align buf))))
     (m68k-emit-label buf *68k-stream-end-label*)))
 
-(defun m68k-emit-paged-alloc (buf alloc count ca5)
+;;; EVICTING ACTIVE STREAMS.  The allocator above never evicts a stream an
+;;; exact root points into, so a call chain whose streams outgrow the cache
+;;; stopped the Mac (!LDR-FULL: a form with three DO-EXTERNAL-SYMBOLS, measured).
+;;; When no place without one exists, FORCE takes the place at the allocation
+;;; pointer anyway, and every root into a stream it overlaps is REWRITTEN to
+;;; point at a RELOAD RECORD -- the roots are exact (the caller's A5, -4 of every
+;;; frame on the A6 chain, the jmpbuf's and every handler frame's A5), so each
+;;; is a location FORCE can store into.  A record is 16 bytes in a resident
+;;; area: the RELOAD token, the stream's index, the root's offset in it, and a
+;;; mark.  Returning to it runs the token: the stream is loaded wherever it fits
+;;; (perhaps evicting others the same way) and the thread continues at the same
+;;; offset.  Records are recycled by marking: before rewriting, every record a
+;;; root still points at is marked, the rest are free.
+(defconstant +68k-reload-records+ 256)
+
+(defun m68k-reload-token-index ()
+  "The RELOAD token's index: one past every shape (M68K-EMIT-THREAD-DISPATCH),
+   so >= 256 and reached through the escape (255, high byte, low byte)."
+  (+ 1 (reduce #'max (let (l) (maphash (lambda (k v) (declare (ignore k)) (push v l))
+                                        *68k-thread-shapes*) l)
+               :key (lambda (v) (svref v 0)) :initial-value 255)))
+
+(defparameter +68k-force-code+
+  #(
+    #x48E7 #x7EF0 #x2C09 #x41F9 #x7EAD #x0009 #x303C #x00FF #x42A8 #x000C #x41E8
+    #x0010 #x51C8 #xFFF6 #x2879 #x7EAD #x0001 #x2E02 #x0687 #x0000 #x003F #x0287
+    #xFFFF #xFFC0 #xDE8C #xBEB9 #x7EAD #x0003 #x6300 #x0022 #x2879 #x7EAD #x0002
+    #x2E02 #x0687 #x0000 #x003F #x0287 #xFFFF #xFFC0 #xDE8C #xBEB9 #x7EAD #x0003
+    #x6200 #x001C #x7800 #x7A00 #x6100 #x001C #x7A01 #x6100 #x0016 #x4A84 #x6600
+    #x0008 #x7000 #x6000 #x0004 #x7001 #x4CDF #x0F7E #x4E75 #x41F9 #x7EAD #x000B
+    #x6100 #x005E #x2246 #x2479 #x7EAD #x0005 #xB3CA #x6400 #x0018 #x41E9 #xFFFC
+    #x6100 #x0048 #x2009 #x2251 #xB3C0 #x6300 #x0006 #x6000 #xFFE6 #x41F9 #x7EAD
+    #x0006 #x6100 #x0030 #x2239 #x7EAD #x0007 #x0C81 #x0000 #x002E #x6300 #x0004
+    #x722E #x41F9 #x7EAD #x0008 #x4A81 #x6700 #x0010 #x6100 #x000E #x41E8 #x0020
+    #x5381 #x6000 #xFFEE #x4E75 #x48E7 #xF2E0 #x2010 #x4A85 #x6600 #x0028 #x0C80
+    #x7EAD #x0009 #x6500 #x00C6 #x0C80 #x7EAD #x000A #x6400 #x00BC #x0280 #xFFFF
+    #xFFF0 #x2240 #x7201 #x2341 #x000C #x6000 #x00AA #xB0B9 #x7EAD #x0002 #x6500
+    #x00A0 #xB0B9 #x7EAD #x0003 #x6400 #x0096 #x2600 #x96B9 #x7EAD #x0004 #xEC8B
+    #xD683 #x3636 #x3800 #x0283 #x0000 #xFFFF #x6700 #x007C #x5383 #xD683 #xD683
+    #x2233 #x3800 #x0801 #x0000 #x6600 #x006A #xB280 #x6200 #x0064 #x2435 #x3804
+    #x94B5 #x3800 #xD481 #xB480 #x6300 #x0054 #xB287 #x6400 #x004E #x0682 #x0000
+    #x003F #x0282 #xFFFF #xFFC0 #xB48C #x6300 #x003C #x43F9 #x7EAD #x0009 #x3C3C
+    #x00FF #x4AA9 #x000C #x6700 #x0010 #x43E9 #x0010 #x51CE #xFFF2 #x7801 #x6000
+    #x001C #x7C01 #x2346 #x000C #x22BC #x7EAD #x000C #xE48B #x2343 #x0004 #x9081
+    #x2340 #x0008 #x2089 #x4CDF #x074F #x4E75)
+  "FORCE, the code cache's forced eviction (see above), assembled from
+   /tmp-free GNU syntax (m68k-linux-gnu-as -m68000); its absolute operands are
+   the placeholder longs #x7EAD00nn, replaced by M68K-EMIT-PAGED-FORCE:
+     1 the allocation pointer's cell   2 the cache's start cell   3 its end cell
+     4 the owner map's cell            5 the stack base's cell    6 the jmpbuf's A5
+     7 the handler depth's cell        8 the first handler frame's A5
+     9 the records    10 their end     11 the caller's-A5 cell   12 the token word
+   In: D2 bytes wanted, A3 the stream table, A5 the home table, A6 the owner
+   map, A1 the caller's A6.  Out: A4 the place, D7 its end, D0 = 0, or D0 = 1
+   (nothing fits, or no free record).  Keeps D1-D6, A0-A3.
+
+   force:  movem.l d1-d6/a0-a3,-(sp) ; d6 = a1
+           unmark every record (+12)
+           a4 = the allocation pointer; d7 = a4 + d2 up to 64; past the end:
+             a4 = the cache's start, again; past the end: fail
+           d4 = 0; d5 = 0: WALK (mark); d5 = 1: WALK (rewrite); d4 set: fail
+   walk:   VISIT the caller's-A5 cell; -4(a1) along the A6 chain from d6 up to
+           the stack base (ascending); the jmpbuf's A5; each handler frame's A5
+           (+28, 32 bytes apart, the depth clamped to 46)
+   visit:  d0 = (a0).  Mode 0: a pointer into the records marks its record.
+           Mode 1: a pointer into the cache, into stream i (the owner map;
+           loaded, start <= d0 < end), whose extent up to 64 overlaps
+           [a4, d7): a free record gets the token word, i, d0 - start, the
+           mark, and (a0) = the record; none free: d4 = 1.")
+
+(defun m68k-emit-paged-force (buf force ca5 recs recs-end)
+  "Emit +68K-FORCE-CODE+ at FORCE, its placeholders filled."
+  (unless (= *68k-hstack-max-depth* 46)
+    (error "68k paged: FORCE clamps the handler depth to 46, not ~D" *68k-hstack-max-depth*))
+  (let* ((hb (m68k-hbase))
+         (r (m68k-reload-token-index))
+         (tokw (logior (ash 255 24) (ash (ldb (byte 8 8) r) 16) (ash (ldb (byte 8 0) r) 8)))
+         (code +68k-force-code+) (i 0) (n (length code)))
+    (m68k-word-align buf)
+    (m68k-emit-label buf force)
+    (loop while (< i n)
+          do (let ((w (aref code i)))
+               (if (and (= w #x7EAD) (< (1+ i) n) (<= 1 (aref code (1+ i)) 12))
+                   (let ((k (aref code (1+ i))))
+                     (case k
+                       (9 (m68k-emit-abs32 buf recs))
+                       (10 (m68k-emit-abs32 buf recs-end))
+                       (11 (m68k-emit-abs32 buf ca5))
+                       (t (m68k-emit-long buf
+                                          (ecase k
+                                            (1 (conv-real +68k-cache-ptr+))
+                                            (2 (conv-real +68k-cache-lo+))
+                                            (3 (conv-real +68k-cache-hi+))
+                                            (4 (conv-real +68k-cache-map+))
+                                            (5 (conv-real #x10000058))
+                                            (6 (+ hb #x180 28))
+                                            (7 (+ hb #x400))
+                                            (8 (+ hb #x408 28))
+                                            (12 tokw)))))
+                     (incf i 2))
+                   (progn (m68k-emit-word buf w) (incf i)))))))
+
+(defun m68k-emit-paged-alloc (buf alloc count ca5 &optional force)
   "The code cache's FIFO allocator, at ALLOC: D2 = bytes wanted (preserved).
    Returns A4 = a 64-byte-aligned place and D0 = 0, or D0 = 1 when none
    exists.  Preserves D2-D7 and A1-A3, A5, A6.
@@ -5254,7 +5395,8 @@
         (fdone (mvm-make-label)) (evict (mvm-make-label)) (enext (mvm-make-label))
         (ekeep (mvm-make-label)) (eclr (mvm-make-label)) (ok (mvm-make-label))
         (fail (mvm-make-label)) (inplace (mvm-make-label)) (ipno (mvm-make-label))
-        (moved (mvm-make-label)) (hb (m68k-hbase)) (gs +68k-cache-granule-shift+))
+        (moved (mvm-make-label)) (hb (m68k-hbase)) (gs +68k-cache-granule-shift+)
+        (forcing (and force (mvm-make-label))))
     (declare (ignore count))
     (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
            (l32 (v) (m68k-emit-long buf v)))
@@ -5274,7 +5416,7 @@
       (m68k-emit-bcc-word buf +68k-cc-ls+ roots)
       (m68k-emit-label buf wrapped)
       (ws #x5286 #x0C86) (l32 2)                 ; ++wraps > 2: nothing fits
-      (m68k-emit-bcc-word buf +68k-cc-gt+ fail)
+      (m68k-emit-bcc-word buf +68k-cc-gt+ (or forcing fail))
       (ws #x2879) (l32 (conv-real +68k-cache-lo+)) ; A4 = the streams' start
       (m68k-emit-bra buf top)
       ;; ---- the roots ----
@@ -5366,6 +5508,13 @@
       (ws #x4276 #x0800)                         ; CLR.W (0,A6,D0.L)
       (ws #x5480)                                ; next granule's word
       (m68k-emit-bra buf enext)
+      ;; ---- no place without an active stream: FORCE one (see above) ----
+      (when forcing
+        (m68k-emit-label buf forcing)
+        (ws #x226F #x0028)                       ; MOVEA.L 40(SP),A1: the caller's A6
+        (m68k-emit-bsr buf force)                ; FORCE: A4, D7 = the place
+        (ws #x4A80) (m68k-emit-bne buf fail)     ; TST.L D0
+        (m68k-emit-bra buf evict))
       (m68k-emit-label buf fail)
       (ws #x7001)                                ; D0 = 1
       (m68k-emit-bra buf done-l)
@@ -5652,8 +5801,13 @@
                                    *68k-thread-shapes*)
                    (sort l #'< :key (lambda (v) (svref v 0)))))
          (n (1+ (reduce #'max shapes :key (lambda (v) (svref v 0)) :initial-value 255)))
+         ;; paged Mac: one more entry, the RELOAD token (M68K-RELOAD-TOKEN-INDEX)
+         (n (if *68k-reload-label* (1+ n) n))
          (by-index (let ((a (make-array n :initial-element nil)))
-                     (dolist (v shapes a) (setf (aref a (svref v 0)) v))))
+                     (dolist (v shapes a) (setf (aref a (svref v 0)) v))
+                     (when *68k-reload-label*
+                       (setf (aref a (1- n)) (vector (1- n) *68k-reload-label*)))
+                     a))
          (tpos 0)
          (table (mvm-make-label))
          (escape (mvm-make-label)))

@@ -278,3 +278,38 @@ is a PIE and its JIT bakes 32-bit absolute addresses of its globals and heap.
 
 The Mac Plus (68000) would also need a 68000 code-generation mode: the
 translator uses 68020+ instructions (long branches and displacements).
+
+## The 68000 (Mac Classic / Plus / SE): `MODUS_68K_CPU=68000`
+
+The translator's 68020 instructions, each replaced (translate-68k, "THE
+68000"): long `BRA` / `BSR` -> `JMP` / `JSR` to an absolute address (the same 6
+bytes), long `Bcc` -> `B!cc.S` over a `JMP`, `LEA (bd.l,PC)` -> `LEA abs.L`
+(absolute native addresses are filled in after layout: `*68K-ABS-PATCHES*`,
+cross.lisp `apply-68k-abs-patches`; a boot stub's long branches are 16-bit
+instead), `MULS.L` / `MULU.L` (64) / `DIVS.L` -> shared subroutines on D0/D1
+(a boot stub gets a private copy), `EXTB.L` -> `EXT.W` + `EXT.L`, the threaded
+dispatcher's scaled index -> two adds, and every token-stream operand read a
+byte at a time (an operand may be at an odd address, a bus error on a 68000;
+the stream branch tests its condition first because a byte read sets the
+flags).  Off, every image is unchanged (a ladder image is byte-identical).
+
+Measured:
+- the hosted ladder on `qemu-m68k -cpu m68000` (which rejects the 68020
+  instructions but does not fault odd addresses): 32 / 35;
+- the Mac ladder on MAME's Mac Classic (a 68000 that does fault them, 4 MB):
+  32 / 35.  The three misses are the FPU rungs (r18 r30 r31): a ladder image
+  has no runtime, so no soft float;
+- the small CL REPL image built `MODUS_68K_CPU=68000 MODUS_68K_SOFT_FLOAT=1`
+  (5.6 MB) on `qemu-m68k -cpu m68000`: bignums, ratios, `sqrt`, `format ~R`,
+  `defun`, hash tables, `handler-case` all answer as on the 68040.
+
+The Mac Classic itself: `MODUS_MAC68K_MACHINE=classic` (boot/boot-mac68k.lisp
+`*MAC68K-LAYOUTS*`, measured in MAME when our boot blocks run) puts the image
+at 64 KB and a 1 MB heap at 2 MB, under the screen at `#x3FA700`.  The REPL
+image does not fit 4 MB yet.  MAME 0.251 (Debian's) runs `macclasc` headless
+with the Classic ROM (`A49F9914`) and the ADB modem's `342s0440-b.bin`; it has
+no serial port there, so `scripts/mac68k-mame-serial.lua` taps the SCC's
+channel A data register (`#xBFFFFF`) for the ladder's oracle:
+
+    MODUS_MAC68K_MACHINE=classic MODUS_68K_CPU=68000 MAC68K_EMULATOR=mame \
+      MAC68K_MAME=mame MAC68K_ROMPATH=ROMS scripts/mac68k-ladder.py

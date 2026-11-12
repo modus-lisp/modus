@@ -16,6 +16,10 @@ Environment:
                     display (Basilisk's GTK insists) -- a wrapper that starts an
                     Xvfb is the usual answer on a headless box.
   MAC68K_FPU        "false" (default: a 68LC040) or "true" (a 68040).
+  MAC68K_EMULATOR   "mame": a Mac Classic (68000, 4 MB) in MAME instead --
+                    MAC68K_MAME (the command), MAC68K_ROMPATH (its ROM folder:
+                    macclasc's ROM and the ADB modem's 342s0440-b.bin); build
+                    with MODUS_MAC68K_MACHINE=classic MODUS_68K_CPU=68000.
   MAC68K_JIT        "true": Basilisk's JIT, ~8x faster.  Debian's
                     BasiliskII-jit is a PIE and its JIT truncates addresses;
                     relink it low first (scripts/basilisk-unpie.py) and run it
@@ -49,8 +53,34 @@ def expected_of(path):
     return int(m.group(1)) if m else None
 
 
+def boot_mame(disk, nbytes, timeout=600):
+    """Boot DISK on MAME's Mac Classic (macclasc, a 68000, 4 MB); return the
+    first NBYTES the Mac sends on serial port A (scripts/mac68k-mame-serial.lua
+    taps the SCC).  MAC68K_MAME is the command, MAC68K_ROMPATH the ROM path."""
+    out = disk + ".serial"
+    cmd = shlex.split(os.environ.get("MAC68K_MAME", "mame")) + [
+        "macclasc", "-rompath", os.environ["MAC68K_ROMPATH"], "-ramsize", "4M",
+        "-flop1", disk, "-video", "none", "-sound", "none", "-nothrottle",
+        "-skip_gameinfo", "-autoboot_script",
+        os.path.join(REPO, "scripts", "mac68k-mame-serial.lua")]
+    env = dict(os.environ, MAC68K_SERIAL_OUT=out, MAC68K_SERIAL_N=str(nbytes),
+               MAC68K_SECONDS=os.environ.get("MAC68K_MAME_SECONDS", "150"))
+    try:
+        subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        with open(out, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return b""
+
+
 def boot(disk, nbytes, timeout=90):
     """Boot DISK under Basilisk II; return the first NBYTES from serial port A."""
+    if os.environ.get("MAC68K_EMULATOR") == "mame":
+        return boot_mame(disk, nbytes)
     master, slave = pty.openpty()
     tty.setraw(slave)
     cmd = shlex.split(os.environ.get("MAC68K_BASILISK", "BasiliskII")) + [
@@ -111,7 +141,7 @@ def run_cell(rung_path, expect, keep=False):
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     keep = "--keep" in sys.argv
-    if "MAC68K_ROM" not in os.environ:
+    if "MAC68K_ROM" not in os.environ and os.environ.get("MAC68K_EMULATOR") != "mame":
         print("mac68k-ladder: set MAC68K_ROM to a Mac ROM file")
         return 2
     rungs = sorted(os.path.join(RUNGS, f) for f in os.listdir(RUNGS) if f.endswith(".lisp"))

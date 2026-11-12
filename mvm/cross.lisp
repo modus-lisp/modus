@@ -976,6 +976,26 @@
     (dotimes (i 4)
       (setf (aref raw-bytes (+ pos i)) (logand (ash w (* i -8)) #xFF)))))
 
+(defun apply-68k-abs-patches (raw-bytes image boot-descriptor)
+  "Write each 68000 absolute code address (translate-68k *68K-ABS-PATCHES*:
+   native byte offset of the 32-bit word, native offset of its target) as the
+   target's runtime address: load address + wrap header + the native code's
+   image offset + the target's offset, big-endian.  The same address the
+   li-const patches compute for the constant pool."
+  (when (and (eq (getf boot-descriptor :arch) :68k)
+             (boundp 'modus.mvm::*68k-abs-patches*)
+             (symbol-value 'modus.mvm::*68k-abs-patches*))
+    (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
+           (base (+ (or (getf boot-descriptor :code-vaddr-base)
+                        (+ (or (getf boot-descriptor :load-addr) 0)
+                           (wrap-header-size-for-boot boot-descriptor)))
+                    native-image-offset)))
+      (dolist (p (symbol-value 'modus.mvm::*68k-abs-patches*))
+        (let ((pos (+ native-image-offset (car p)))
+              (addr (+ base (cdr p))))
+          (dotimes (i 4)
+            (setf (aref raw-bytes (+ pos i)) (ldb (byte 8 (* 8 (- 3 i))) addr))))))))
+
 (defun apply-li-const-patches (raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
   "Walk the architecture-specific LI-CONST patch list and write tagged
@@ -1501,13 +1521,17 @@
                (let* ((base (+ (or (getf boot-descriptor :load-addr) 0)
                                (wrap-header-size-for-boot boot-descriptor)))
                       (pad (mod (- 16 (mod (+ base (mvm-buffer-position final-buf) 6) 16)) 16))
-                      (disp (+ entry-native-offset 4 pad)))
-                 (mvm-emit-byte final-buf #x60)
-                 (mvm-emit-byte final-buf #xFF)
-                 (mvm-emit-byte final-buf (logand (ash disp -24) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash disp -16) #xFF))
-                 (mvm-emit-byte final-buf (logand (ash disp -8) #xFF))
-                 (mvm-emit-byte final-buf (logand disp #xFF))
+                      (disp (+ entry-native-offset 4 pad))
+                      ;; a 68000 has no BRA.L: JMP abs.L, the same six bytes
+                      (abs-entry (+ base (mvm-buffer-position final-buf) 6 pad
+                                    entry-native-offset))
+                      (word (if (symbol-value 'modus.mvm::*68k-cpu-68000*) abs-entry disp)))
+                 (mvm-emit-byte final-buf (if (symbol-value 'modus.mvm::*68k-cpu-68000*) #x4E #x60))
+                 (mvm-emit-byte final-buf (if (symbol-value 'modus.mvm::*68k-cpu-68000*) #xF9 #xFF))
+                 (mvm-emit-byte final-buf (logand (ash word -24) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash word -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash word -8) #xFF))
+                 (mvm-emit-byte final-buf (logand word #xFF))
                  (dotimes (i (floor pad 2))
                    (mvm-emit-byte final-buf #x4E)
                    (mvm-emit-byte final-buf #x71))
@@ -1593,6 +1617,9 @@
         ;; tagged-addr from pool-vaddr + addr-table[idx].
         (apply-li-const-patches raw-bytes image module boot-descriptor
                                 pool-addr-table native-code)
+        ;; 68000: the absolute native-code addresses its long branches, calls
+        ;; and LEAs carry (translate-68k *68K-ABS-PATCHES*).
+        (apply-68k-abs-patches raw-bytes image boot-descriptor)
         ;; AArch64 fn-addr patches: write the absolute runtime address
         ;; of each target function into the MOVZ + MOVK placeholder
         ;; pair that +op-fn-addr+ emitted.  See translate-aarch64.lisp

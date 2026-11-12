@@ -143,6 +143,42 @@
    cross.lisp's apply-li-const-patches fills with the constant-pool slot's
    tagged address.  Reset at the start of every translation.")
 
+;;; THE 68000 (MODUS_68K_CPU=68000): a Mac Classic / Plus / SE.  No long
+;;; branches, no 32-bit PC-relative LEA, no 32-bit multiply or divide, no
+;;; EXTB.L, no scaled index, and a word or long access at an ODD address is a
+;;; bus error.  So, in this mode: a long BRA / BSR is JMP / JSR to an ABSOLUTE
+;;; address and a long Bcc is B!cc.S over one (the native code's runtime
+;;; address is known only after layout: the translator records each such word
+;;; in *68K-ABS-PATCHES* and cross.lisp's apply-68k-abs-patches fills it in);
+;;; the PC-relative LEA is LEA abs.L; MULS.L / MULU.L / DIVS.L are calls to
+;;; shared subroutines (m68k-emit-68000-helpers); EXTB.L is EXT.W + EXT.L; the
+;;; threaded dispatcher scales its index with adds; and every token-stream
+;;; operand -- at any alignment -- is read a byte at a time.  A boot stub has
+;;; no runtime address to patch, so ITS long branches are 16-bit (the fixup
+;;; range check fails loudly if one does not reach).  QEMU's -cpu m68000
+;;; rejects the 68020 instructions; it does NOT model the odd-address fault.
+(defvar *68k-cpu-68000* (equal (sb-ext:posix-getenv "MODUS_68K_CPU") "68000")
+  "T: emit 68000 code only (see above).")
+(defvar *68k-abs-patches* nil
+  "List of (NATIVE-BYTE-OFFSET . TARGET-NATIVE-OFFSET): a 32-bit absolute
+   address of native code, written by cross.lisp after layout.  Reset at the
+   start of every translation.")
+(defvar *68k-native-p* nil
+  "T while translating the image's native code (absolute patches possible).")
+(defvar *68k-mul32-label* nil)
+(defvar *68k-mulu64-label* nil)
+(defvar *68k-divs32-label* nil)
+
+(defun m68k-emit-abs32 (buf label-id &optional (ref-pos (+ (m68k-buffer-position buf) 2)) ord)
+  "Two placeholder words for the absolute address of LABEL-ID (native code
+   only).  REF-POS / ORD feed branch relaxation the way a :disp32 does."
+  (unless *68k-native-p*
+    (error "68k: an absolute code address outside the native code (boot stub?)"))
+  (m68k-emit-word buf 0)
+  (push (list (1- (m68k-buffer-word-count buf)) label-id :abs32 ref-pos ord)
+        (m68k-buffer-fixups buf))
+  (m68k-emit-word buf 0))
+
 (defun m68k-emit-word (buf word)
   "Emit a 16-bit instruction word."
   (when (oddp (m68k-buffer-position buf))
@@ -208,6 +244,14 @@
                (setf (aref words word-idx)
                      (logior (logand (aref words word-idx) #xFF00)
                              (logand disp #xFF)))))
+            (:abs32
+             ;; 68000: an absolute native address, filled in after layout
+             ;; (cross.lisp apply-68k-abs-patches).  Distances still feed
+             ;; branch relaxation, measured as a :disp32's would be.
+             (let ((disp (- target (- ref-pos 2))))
+               (when (and ord *68k-branch-distances*)
+                 (setf (gethash ord *68k-branch-distances*) (cons disp ref-pos)))
+               (push (cons (* 2 word-idx) target) *68k-abs-patches*)))
             (:disp32
              ;; 32-bit displacement (two words) — full 32-bit signed range,
              ;; no realistic overflow but the assert keeps the invariant.
@@ -523,8 +567,84 @@
                               (ash +ea-mode-dn+ 3)
                               (logand dn 7))))
 
+(defun m68k-emit-68000-binop (buf label src dst)
+  "68000: Ddst = HELPER(Ddst, Dsrc) through a shared subroutine taking D0 and
+   D1 and answering in D0; every other register, and D0/D1 when neither is
+   DST, keeps its value.  The operands go through the stack, so SRC and DST
+   may be any data registers, D0 and D1 included."
+  (m68k-emit-word buf #x48E7) (m68k-emit-word buf #xC000)  ; MOVEM.L D0-D1,-(SP)
+  (m68k-emit-word buf (logior #x2F00 (logand src 7)))      ; MOVE.L Dsrc,-(SP)
+  (m68k-emit-word buf (logior #x2F00 (logand dst 7)))      ; MOVE.L Ddst,-(SP)
+  (m68k-emit-word buf #x201F)                              ; MOVE.L (SP)+,D0
+  (m68k-emit-word buf #x221F)                              ; MOVE.L (SP)+,D1
+  (m68k-emit-bsr buf label)
+  (case dst
+    (0 (m68k-emit-word buf #x2E80))                        ; MOVE.L D0,(SP)
+    (1 (m68k-emit-word buf #x2F40) (m68k-emit-word buf 4)) ; MOVE.L D0,4(SP)
+    (t (m68k-emit-move-dn-dn buf +68k-d0+ dst)))
+  (m68k-emit-word buf #x4CDF) (m68k-emit-word buf #x0003)) ; MOVEM.L (SP)+,D0-D1
+
+(defparameter +68k-68000-mul32+
+  '(#x48E7 #x3000        ; MOVEM.L D2-D3,-(SP)
+               #x2400 #x4842 #xC4C1 ; D2 = ah*bl
+               #x2601 #x4843 #xC6C0 ; D3 = bh*al
+               #xD443 #x4842 #x4242 ; D2 = (D2+D3).w << 16
+               #xC0C1 #xD082        ; D0 = al*bl + D2
+               #x4CDF #x000C #x4E75)
+  "MUL32: D0 = low 32 bits of D0 * D1 (sign does not matter for the low half)
+   = al*bl + ((ah*bl + al*bh) << 16).")
+
+(defparameter +68k-68000-mulu64+
+  '(#x48E7 #x3C00                ; MOVEM.L D2-D5,-(SP)
+               #x2400 #xC4C1                ; D2 = p0 = al*bl
+               #x2600 #x4843 #xC6C1         ; D3 = p1 = ah*bl
+               #x2801 #x4844 #x2A04 #xC8C0  ; D4 = p2 = bh*al, D5.w = bh
+               #x2200 #x4841 #xC2C5         ; D1 = p3 = ah*bh
+               #xD684 #x6406 #x0681 #x0001 #x0000 ; D3 = p1+p2, carry -> D1 += 2^16
+               #x2803 #x4844 #x4244         ; D4 = (mid & #xFFFF) << 16
+               #x4243 #x4843                ; D3 = mid >> 16
+               #x7A00 #xD484 #xD385 #xD283  ; D2 += D4; D1 += X + D3
+               #x2002                       ; D0 = D2
+               #x4CDF #x003C #x4E75)
+  "MULU64: D1:D0 = D0 * D1, unsigned (D0 low, D1 high).")
+
+(defparameter +68k-68000-divs32+
+  '(#x48E7 #x3800                ; MOVEM.L D2-D4,-(SP)
+               #x7800                       ; D4 = 0: the sign
+               #x4A80 #x6A04 #x4480 #x4604  ; |D0|, flip D4
+               #x4A81 #x6A04 #x4481 #x4604  ; |D1|, flip D4
+               #x7400 #x761F                ; D2 = 0 (remainder), D3 = 31
+               #xD080 #xD582 #xB481 #x6504 #x9481 #x5280 #x51CB #xFFF2
+               #x4A04 #x6702 #x4480         ; negate when the signs differed
+               #x4CDF #x001C #x4E75)
+  "DIVS32: D0 = D0 / D1, signed, truncated (DIVS.L's quotient); restoring
+   division on the magnitudes, 32 steps.")
+
+(defun m68k-emit-68000-helpers (buf)
+  "The 68000's MULS.L / MULU.L (64) / DIVS.L, as subroutines on D0 and D1."
+  (loop for (label words) in (list (list *68k-mul32-label* +68k-68000-mul32+)
+                                   (list *68k-mulu64-label* +68k-68000-mulu64+)
+                                   (list *68k-divs32-label* +68k-68000-divs32+))
+        do (m68k-emit-label buf label)
+           (dolist (w words) (m68k-emit-word buf w))))
+
+(defun m68k-68000-local-helper (buf words)
+  "Outside the native code (a boot stub): a private copy of a helper, jumped
+   over; its label."
+  (let ((over (mvm-make-label)) (here (mvm-make-label)))
+    (m68k-emit-bra buf over)
+    (m68k-emit-label buf here)
+    (dolist (w words) (m68k-emit-word buf w))
+    (m68k-emit-label buf over)
+    here))
+
 (defun m68k-emit-muls (buf src dst)
   "MULS.L Ds, Dd - signed multiply (32x32->32 low)"
+  (when *68k-cpu-68000*
+    (return-from m68k-emit-muls
+      (m68k-emit-68000-binop buf (or *68k-mul32-label*
+                                     (m68k-68000-local-helper buf +68k-68000-mul32+))
+                             src dst)))
   ;; 68020+ long multiply: 0100 1100 00 mode reg, then extension word
   ;; Extension: 0 Dl 1 0000 0000 0 Dh (for 32-bit result, Dh is unused)
   (m68k-emit-word buf (logior (ash #b01001100 8)
@@ -539,6 +659,13 @@
 
 (defun m68k-emit-mulu-64 (buf src dlo dhi)
   "MULU.L Ds, Dhi:Dlo - unsigned multiply (32x32->64)"
+  (when *68k-cpu-68000*
+    ;; the one caller (:mul26hi) multiplies D0 by D1 into D1:D0, the helper's shape
+    (unless (and (= src +68k-d1+) (= dlo +68k-d0+) (= dhi +68k-d1+))
+      (error "68k 68000: MULU.L ~D -> ~D:~D is not D1 -> D1:D0" src dhi dlo))
+    (return-from m68k-emit-mulu-64
+      (m68k-emit-bsr buf (or *68k-mulu64-label*
+                             (m68k-68000-local-helper buf +68k-68000-mulu64+)))))
   ;; 68020+ long multiply with 64-bit result
   ;; Extension word bit 10=1 for 64-bit result, bit 11=0 for unsigned
   (m68k-emit-word buf (logior (ash #b01001100 8)
@@ -551,6 +678,11 @@
 
 (defun m68k-emit-divs (buf src dst)
   "DIVS.L Ds, Dd - signed divide (Dd / Ds -> Dd quotient)"
+  (when *68k-cpu-68000*
+    (return-from m68k-emit-divs
+      (m68k-emit-68000-binop buf (or *68k-divs32-label*
+                                     (m68k-68000-local-helper buf +68k-68000-divs32+))
+                             src dst)))
   ;; 68020+ long divide: 0100 1100 01 mode reg, then extension word
   (m68k-emit-word buf (logior (ash #b01001100 8)
                               (ash #b01 6)
@@ -903,6 +1035,18 @@
                    (aref *68k-branch-plan* ord)
                    :long))
          (pos (m68k-buffer-position buf)))
+    ;; 68000: a boot stub's long branch is 16-bit; native code's is absolute.
+    (when (and *68k-cpu-68000* (eq size :long) (not *68k-native-p*))
+      (setq size :word))
+    (when (and *68k-cpu-68000* (eq size :long))
+      (unless label-id (error "68k 68000: a long branch with no label"))
+      (case base
+        (#x6000 (m68k-emit-word buf #x4EF9))             ; JMP abs.L
+        (#x6100 (m68k-emit-word buf #x4EB9))             ; JSR abs.L
+        (t (m68k-emit-word buf (logior (logxor base #x0100) #x06)) ; B!cc.S over:
+           (m68k-emit-word buf #x4EF9)))                 ; JMP abs.L
+      (m68k-emit-abs32 buf label-id (+ pos 4) ord)
+      (return-from m68k-emit-branch nil))
     (ecase size
       (:byte
        (m68k-emit-word buf base)                ; the fixup fills the low byte
@@ -1360,14 +1504,7 @@
               (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
               (m68k-emit-move-an-disp buf +68k-a7+ +68k-a1+ 0)
               (m68k-emit-move-an-disp buf +68k-a6+ +68k-a1+ 4)
-              (m68k-emit-word buf #x41FB)                     ; LEA (bd.l,PC),A0
-              (let ((ext-pos (m68k-buffer-position buf)))
-                (m68k-emit-word buf #x0170)
-                (m68k-emit-word buf 0)
-                (push (list (1- (m68k-buffer-word-count buf)) resume :disp32
-                            (+ ext-pos 2))
-                      (m68k-buffer-fixups buf))
-                (m68k-emit-word buf 0))
+              (m68k-emit-lea-label buf resume +68k-a0+)
               (m68k-emit-move-an-disp buf +68k-a0+ +68k-a1+ 8)
               (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
                     for i from 3
@@ -2624,14 +2761,7 @@
            (return-from m68k-translate-insn nil))
          (unless label
            (error "68k fn-addr: no function at bytecode offset ~D" target))
-         (m68k-emit-word buf #x43FB)                     ; LEA (bd.l,PC),A1
-         (let ((ext-pos (m68k-buffer-position buf)))
-           (m68k-emit-word buf #x0170)                   ; full extension word
-           (m68k-emit-word buf 0)                        ; bd high (patched)
-           (push (list (1- (m68k-buffer-word-count buf)) label :disp32
-                       (+ ext-pos 2))
-                 (m68k-buffer-fixups buf))
-           (m68k-emit-word buf 0))                       ; bd low (patched)
+         (m68k-emit-lea-label buf label +68k-a1+)
          (m68k-emit-move-an-dn buf +68k-a1+ +68k-d0+)
          (m68k-emit-ori buf +68k-d0+ +tag-function+)
          (m68k-store-vreg buf vd +68k-d0+)))
@@ -3261,9 +3391,31 @@
                               (ash +ea-mode-dn+ 3) (logand dn 7)))
   (m68k-emit-word buf (logand imm8 #xFF)))
 
+(defun m68k-emit-lea-label (buf label-id an)
+  "An = the address of LABEL-ID: LEA (bd.l,PC),An -- the 68020 full extension
+   word (#x0170: base PC, index suppressed, 32-bit displacement), whose PC is
+   the extension word's address, so the fixup's reference is set by hand -- or,
+   on a 68000, LEA abs.L,An with the address filled in after layout."
+  (cond
+    (*68k-cpu-68000*
+     (m68k-emit-word buf (logior #x41F9 (ash (logand an 7) 9)))   ; LEA abs.L,An
+     (m68k-emit-abs32 buf label-id))
+    (t
+     (m68k-emit-word buf (logior #x41FB (ash (logand an 7) 9)))   ; LEA (bd.l,PC),An
+     (let ((ext-pos (m68k-buffer-position buf)))
+       (m68k-emit-word buf #x0170)
+       (m68k-emit-word buf 0)
+       (push (list (1- (m68k-buffer-word-count buf)) label-id :disp32 (+ ext-pos 2))
+             (m68k-buffer-fixups buf))
+       (m68k-emit-word buf 0)))))
+
 (defun m68k-emit-bsr-long (buf label-id)
   "BSR.L target -- 68020+, 32-bit displacement, so a gc-check anywhere in an
    image of any size reaches the collector emitted after the last function."
+  (when *68k-cpu-68000*
+    (m68k-emit-word buf #x4EB9)                          ; JSR abs.L
+    (m68k-emit-abs32 buf label-id)
+    (return-from m68k-emit-bsr-long nil))
   (m68k-emit-word buf #x61FF)
   (let ((disp-pos (m68k-buffer-position buf)))
     (m68k-emit-word buf 0)
@@ -4249,7 +4401,12 @@
    BYTECODE is a (vector (unsigned-byte 8)).
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
-  (let* ((*68k-gc-label* (and (m68k-hosted-layout-p) (mvm-make-label)))
+  (setf *68k-abs-patches* nil)
+  (let* ((*68k-native-p* t)
+         (*68k-mul32-label* (and *68k-cpu-68000* (mvm-make-label)))
+         (*68k-mulu64-label* (and *68k-cpu-68000* (mvm-make-label)))
+         (*68k-divs32-label* (and *68k-cpu-68000* (mvm-make-label)))
+         (*68k-gc-label* (and (m68k-hosted-layout-p) (mvm-make-label)))
          (*68k-mac-console-label* (and *68k-mac-mode* (mvm-make-label)))
          (*68k-mac-getc-label* (and *68k-mac-mode* (mvm-make-label)))
          (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
@@ -4449,6 +4606,8 @@
       (m68k-emit-array-len-helper buf))
     (when *68k-alloc-obj-label*
       (m68k-emit-alloc-obj-helper buf))
+    (when *68k-mul32-label*
+      (m68k-emit-68000-helpers buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)
@@ -4725,6 +4884,21 @@
 
 (defun m68k-emit-fetch (buf size dn)
   "Dn = the next SIZE-byte signed stream operand, sign-extended; A5 advances."
+  (when *68k-cpu-68000*
+    ;; byte at a time: a stream operand may be at an odd address
+    (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))       ; MOVE.B (A5)+,Dn
+    (ecase size
+      (1 (m68k-emit-word buf (logior #x4880 dn)))                            ; EXT.W Dn
+      (2 (m68k-emit-word buf (logior #xE148 dn))                             ; LSL.W #8,Dn
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5)))
+      (4 (m68k-emit-word buf (logior #xE148 dn))
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))
+         (m68k-emit-word buf (logior #x4840 dn))                             ; SWAP Dn
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))
+         (m68k-emit-word buf (logior #xE148 dn))
+         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))))
+    (unless (= size 4) (m68k-emit-word buf (logior #x48C0 dn)))              ; EXT.L Dn
+    (return-from m68k-emit-fetch nil))
   (ecase size
     (1 (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ dn 3 5))   ; MOVE.B (A5)+,Dn
        (m68k-emit-word buf (logior #x49C0 dn)))                               ; EXTB.L Dn
@@ -4741,6 +4915,28 @@
 (defun m68k-emit-stream-branch (buf cc w)
   "Take the stream branch whose offset follows when CC holds (CC NIL: always).
    MOVEA and ADDA leave the condition codes alone."
+  (when *68k-cpu-68000*
+    ;; a byte-wise read sets the condition codes, so test first: B!cc.S over
+    ;; the taken arm to ADDQ #W,A5; the taken arm builds the offset on the stack
+    (let ((taken (if (= w 2)
+                     (list (m68k-encode-move-word 1 4 7 3 5)                 ; MOVE.B (A5)+,-(SP)
+                           (m68k-encode-move-word 1 5 7 3 5) 1               ; MOVE.B (A5)+,1(SP)
+                           #x305F)                                           ; MOVEA.W (SP)+,A0
+                     (list #x598F                                            ; SUBQ.L #4,SP
+                           (m68k-encode-move-word 1 2 7 3 5)                 ; MOVE.B (A5)+,(SP)
+                           (m68k-encode-move-word 1 5 7 3 5) 1
+                           (m68k-encode-move-word 1 5 7 3 5) 2
+                           (m68k-encode-move-word 1 5 7 3 5) 3
+                           #x205F))))                                        ; MOVEA.L (SP)+,A0
+      (setq taken (append taken (list #xDBC8)))                              ; ADDA.L A0,A5
+      (when cc
+        (m68k-emit-word buf (logior #x6000 (ash (logxor cc 1) 8)
+                                    (+ (* 2 (length taken)) 2))))            ; B!cc.S skip
+      (dolist (x taken) (m68k-emit-word buf x))
+      (when cc
+        (m68k-emit-word buf #x6002)                                          ; BRA.S over
+        (m68k-emit-word buf (if (= w 2) #x548D #x588D))))                    ; skip: ADDQ.L #W,A5
+    (return-from m68k-emit-stream-branch nil))
   (m68k-emit-word buf (if (= w 2) #x305D #x205D)) ; MOVEA.W / MOVEA.L (A5)+,A0
   (when cc
     (m68k-emit-word buf (logior #x6002 (ash (logxor cc 1) 8))))  ; B!cc.S over the ADDA
@@ -4838,14 +5034,25 @@
       ;; escape: D0 = the 16-bit index after 255
       (m68k-emit-label buf escape)
       (m68k-emit-moveq buf +68k-d0+ 0)
-      (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ 0 3 5))   ; MOVE.W (A5)+,D0
-      (let ((e1 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3) #x0400)) ; MOVE.L (d8,PC,D0.W*4),D0
+      (if *68k-cpu-68000*
+          (progn
+            (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ 0 3 5)) ; MOVE.B (A5)+,D0
+            (m68k-emit-word buf #xE148)                                        ; LSL.W #8,D0
+            (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ 0 3 5)))
+          (m68k-emit-word buf (m68k-encode-move-word 3 +ea-mode-dn+ 0 3 5)))  ; MOVE.W (A5)+,D0
+      (when *68k-cpu-68000*
+        (m68k-emit-word buf #xD040) (m68k-emit-word buf #xD040))             ; D0 *= 4
+      (let ((e1 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3)
+                             (if *68k-cpu-68000* #x0000 #x0400)))              ; MOVE.L (d8,PC,D0.W*4),D0
             (e2 (d8-to-table #x4EFB #x0800)))                                       ; JMP (d8,PC,D0.L)
         ;; NEXT
         (m68k-emit-label buf *68k-thread-next-label*)
         (m68k-emit-moveq buf +68k-d0+ 0)
         (m68k-emit-word buf (m68k-encode-move-word 1 +ea-mode-dn+ 0 3 5))   ; MOVE.B (A5)+,D0
-        (let ((e3 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3) #x0400))
+        (when *68k-cpu-68000*
+          (m68k-emit-word buf #xD040) (m68k-emit-word buf #xD040))           ; D0 *= 4
+        (let ((e3 (d8-to-table (m68k-encode-move-word 2 +ea-mode-dn+ 0 7 3)
+                               (if *68k-cpu-68000* #x0000 #x0400)))
               (e4 (d8-to-table #x4EFB #x0800)))
           (m68k-emit-label buf table)
           (setq tpos (m68k-buffer-position buf))

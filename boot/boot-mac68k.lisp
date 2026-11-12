@@ -33,22 +33,51 @@
 
 (in-package :modus.mvm)
 
-(defconstant +mac68k-load-addr+ #x00100000)
+(defparameter *mac68k-machine*
+  (let ((m (sb-ext:posix-getenv "MODUS_MAC68K_MACHINE")))
+    (cond ((or (null m) (string= m "") (string-equal m "lc")) :lc)
+          ((string-equal m "classic") :classic)
+          (t (error "MODUS_MAC68K_MACHINE=~A: lc or classic" m))))
+  "Which Mac's memory map (MODUS_MAC68K_MACHINE): :LC, the 32 MB LC 475 /
+   Quadra 605 class this file was measured on, or :CLASSIC, a Mac Classic
+   with 4 MB (its maximum) -- measured in MAME's macclasc when our boot
+   blocks run: system heap from #x1600, application zone #x6DF4, the ROM's
+   boot stack #x1FFBFC, the screen #x3FA700 up to MemTop #x400000, the ROM
+   at #x400000.  A 68000, so build it with MODUS_68K_CPU=68000 too.")
+
+(defparameter *mac68k-layouts*
+  '((:lc      :load #x00100000 :stack-top #x00A80000 :scratch #x00A80000
+              :region #x00B00000 :heap-size #x01000000 :gc-guard #x00100000
+              :kind-map #x01C00000 :nil-page #x01F00000)
+    ;; the Classic: image from 64 KB, I/O scratch (a CL image's) at 1.44 MB,
+    ;; a 64 KB stack under 2 MB, the region at 2 MB with a 1 MB heap (two
+    ;; 512 KB semispaces) and a 64 KB guard, the kind map, NIL's page under
+    ;; the screen.  A CL REPL image (5.5 MB) does not fit 4 MB: this map is
+    ;; for the ladder's images until it is made to.
+    (:classic :load #x00010000 :stack-top #x00200000 :scratch #x00170000
+              :region #x00200000 :heap-size #x00100000 :gc-guard #x00010000
+              :kind-map #x00320000 :nil-page #x003E0000)))
+
+(defun mac68k-layout (key)
+  (or (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) key)
+      (error "mac68k: no ~S in the ~S layout" key *mac68k-machine*)))
+
+(defparameter +mac68k-load-addr+ (mac68k-layout :load))
 (defvar *mac68k-load-addr* +mac68k-load-addr+
   "Where this build is linked and the boot blocks put it: +MAC68K-LOAD-ADDR+
    for an image, elsewhere for the boot-disk loader that unpacks one there
    (mvm/mac68k-unlzma.lisp; build-hosted's MODUS_MAC68K_LOAD_ADDR).")
-(defconstant +mac68k-stack-top+ #x00A80000)
-(defconstant +mac68k-scratch+ #x00A80000
+(defparameter +mac68k-stack-top+ (mac68k-layout :stack-top))
+(defparameter +mac68k-scratch+ (mac68k-layout :scratch)
   "The I/O scratch pages: *CSTR-SCRATCH* here, *IO-BUF-ADDR* 256 KB on.")
-(defconstant +mac68k-region+ #x00B00000
+(defparameter +mac68k-region+ (mac68k-layout :region)
   "Where the runtime-data region's base (virtual #x10000000) really is.")
-(defconstant +mac68k-heap-size+ #x01000000
-  "16 MB: two 8 MB semispaces.")
-(defconstant +mac68k-gc-guard+ #x00100000
-  "1 MB past the second semispace (boot-linux-68k's guard is 4 MB).")
-(defconstant +mac68k-kind-map+ #x01C00000)
-(defconstant +mac68k-nil-page+ #x01F00000)
+(defparameter +mac68k-heap-size+ (mac68k-layout :heap-size)
+  "LC: 16 MB, two 8 MB semispaces.  Classic: 1 MB.")
+(defparameter +mac68k-gc-guard+ (mac68k-layout :gc-guard)
+  "Past the second semispace (boot-linux-68k's guard is 4 MB).")
+(defparameter +mac68k-kind-map+ (mac68k-layout :kind-map))
+(defparameter +mac68k-nil-page+ (mac68k-layout :nil-page))
 (defun mac68k-ser-out-pb ()
   "The serial drivers' parameter blocks, in the low block's argv area (a Mac
    image has no argv); translate-68k's +68K-MAC-CONSOLE-CODE+ reads them."

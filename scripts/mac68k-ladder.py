@@ -63,10 +63,13 @@ def boot(disk, nbytes, timeout=90):
             if r:
                 got += os.read(master, 64)
     finally:
-        try:
-            os.killpg(p.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
+        # Basilisk II ignores SIGTERM: TERM the group, then KILL what is left
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(p.pid, sig)
+            except ProcessLookupError:
+                break
+            time.sleep(1)
         p.wait(timeout=30)
         os.close(master)
         os.close(slave)

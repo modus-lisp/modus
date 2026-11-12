@@ -3165,11 +3165,13 @@
 
 (defparameter +68k-mac-console-code+
   #(#x48E7 #x6040 #x13C0 #x1000 #x9100 #x41F9 #x1000 #x9000 #x217C #x1000 #x9100
-    #x0020 #x7001 #x2140 #x0024 #x4268 #x002C #xA003 #x4CDF #x0206 #x4E75
-    #x48E7 #x6040 #x41F9 #x1000 #x9080 #x317C #x0002 #x001A #x42A8 #x001C #xA005
-    #x4AA8 #x001C #x6700 #xFFE8 #x217C #x1000 #x9102 #x0020 #x7001 #x2140 #x0024
+    #x0020 #x7001 #x2140 #x0024 #x4268 #x002C #xA003 #x4CDF #x0206 #x4E75 #x48E7
+    #x6040 #x41F9 #x1000 #x9080 #x317C #x0002 #x001A #x42A8 #x001C #xA005 #x4AA8
+    #x001C #x6600 #x0030 #x41F9 #x1000 #x9110 #x4250 #x7028 #xA031 #x3039 #x1000
+    #x9110 #x0C40 #x0003 #x6700 #x000A #x0C40 #x0005 #x6600 #xFFC6 #x7000 #x1039
+    #x1000 #x9115 #x6000 #x001E #x217C #x1000 #x9102 #x0020 #x7001 #x2140 #x0024
     #x4268 #x002C #xA002 #x7000 #x1039 #x1000 #x9102 #x4CDF #x0206 #x4E75)
-  "The bare Mac's serial console, assembled (m68k-linux-gnu-as -m68040):
+  "The bare Mac's console, assembled (m68k-linux-gnu-as -m68040):
 
    putc:   movem.l d1-d2/a1,-(sp)       ; D0.B -> serial port A
            move.b  d0,$10009100
@@ -3181,27 +3183,40 @@
            _Write                        ; A003
            movem.l (sp)+,d1-d2/a1
            rts
-   getc:   movem.l d1-d2/a1,-(sp)       ; -> D0.L, waits for a byte
-   wait:   lea     $10009080,a0          ; .AIn's parameter block
-           move.w  #2,26(a0)             ; csCode 2: bytes waiting
+   getc:   movem.l d1-d2/a1,-(sp)       ; -> D0.L: a key, or a byte from port A
+   wait:   lea     $10009080,a0          ; .AIn: bytes waiting?
+           move.w  #2,26(a0)             ;   csCode 2
            clr.l   28(a0)
            _Status                       ; A005
            tst.l   28(a0)
-           beq     wait
-           move.l  #$10009102,32(a0)
+           bne     serial
+           lea     $10009110,a0          ; an EventRecord
+           clr.w   (a0)
+           moveq   #$28,d0               ; keyDownMask | autoKeyMask
+           _GetOSEvent                   ; A031
+           move.w  $10009110,d0          ; what
+           cmp.w   #3,d0                 ; keyDown
+           beq     key
+           cmp.w   #5,d0                 ; autoKey
+           bne     wait
+   key:    moveq   #0,d0
+           move.b  $10009115,d0          ; the message's low byte: the character
+           bra     done
+   serial: move.l  #$10009102,32(a0)
            moveq   #1,d0
            move.l  d0,36(a0)
            clr.w   44(a0)
            _Read                         ; A002
            moveq   #0,d0
            move.b  $10009102,d0
-           movem.l (sp)+,d1-d2/a1
+   done:   movem.l (sp)+,d1-d2/a1
            rts
 
    The ROM's .AIn/.AOut drivers, opened by the boot stub into the parameter
    blocks at #x10009080 / #x10009000 (the low block's argv area, unused on a
-   Mac); Basilisk II routes them to a host device, a real Mac to its modem
-   port.  Both keep every register but D0/A0.")
+   Mac), and its event queue, which its keyboard driver fills; Basilisk II
+   routes the serial port to a host device, a real Mac to its modem port.
+   Both routines keep every register but D0/A0.")
 
 (defun m68k-emit-mac-console (buf)
   "Emit +68K-MAC-CONSOLE-CODE+: putc at *68K-MAC-CONSOLE-LABEL*, getc (word

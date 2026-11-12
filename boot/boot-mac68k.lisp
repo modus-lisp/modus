@@ -108,6 +108,10 @@
                                                +ea-mode-dn+ +68k-d1+))  ; MOVE.L D1,(A0)+
     (m68k-emit-subq buf +68k-d0+ 1)
     (m68k-emit-bne buf fill)
+    ;; the event queue: with no System, nothing has called InitEvents, and
+    ;; GetOSEvent (the console's keyboard) faults without it -- measured
+    (m68k-emit-moveq buf +68k-d0+ 20)
+    (m68k-emit-word buf #xA06D)                          ; _InitEvents
     ;; the console: .AIn, then .AOut
     (emit-mac68k-open buf +mac68k-ser-in-pb+ ain)
     (emit-mac68k-open buf +mac68k-ser-out-pb+ aout)

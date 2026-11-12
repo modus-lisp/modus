@@ -106,9 +106,9 @@
 ;;; file; there is deliberately no default, so a new wrapper that forgets it
 ;;; fails loudly here instead of silently building a Pi image.
 (declaim (special *cl-repl-platform*))
-(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32))
+(unless (member *cl-repl-platform* '(:rpi :virt :x64 :i386 :arm32 :mac68k))
   (error "build-cl-repl-common: *CL-REPL-PLATFORM* is ~S; want :RPI, :VIRT, ~
-          :X64, :I386 or :ARM32."
+          :X64, :I386, :ARM32 or :MAC68K."
          *cl-repl-platform*))
 (defvar *cl-repl-rpi-p*  (eq *cl-repl-platform* :rpi))
 (defvar *cl-repl-virt-p* (eq *cl-repl-platform* :virt))
@@ -132,8 +132,14 @@
 ;; onto virt's RAM with the MMU, and the translator runs bare traps over the
 ;; hosted layout (translate-arm32.lisp *ARM32-CL-BARE*).  Console: the PL011.
 (defvar *cl-repl-arm32-p* (eq *cl-repl-platform* :arm32))
-;; The two 32-bit images: 30-bit fixnums, 4-byte object headers.
-(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p*))
+;; :MAC68K — a bare 68k Macintosh (mvm/build-mac68k-cl-repl.lisp): booted from
+;; its own disk's boot blocks by the Mac ROM (boot/boot-mac68k.lisp), the hosted
+;; 68k layout kept in RAM, the translator in *68K-MAC-MODE* (bare traps over the
+;; hosted layout, arm32's shape).  Console: the ROM's serial driver.  Soft float:
+;; the 68LC040 has no FPU.
+(defvar *cl-repl-mac68k-p* (eq *cl-repl-platform* :mac68k))
+;; The 32-bit images: 30-bit fixnums, 4-byte object headers.
+(defvar *cl-repl-32-p* (or *cl-repl-i386-p* *cl-repl-arm32-p* *cl-repl-mac68k-p*))
 (defvar *cl-repl-pc-p* (or *cl-repl-x64-p* *cl-repl-i386-p*)
   "T for the PC machines, 64- and 32-bit: no actor scheduler in the net image
    (the SSH server is ip.lisp's synchronous poll loop) and no USB NIC.")
@@ -214,6 +220,15 @@
             (if *cl-repl-uefi-p* "t" "nil")
             (%rpi-net-text "pc-console.lisp"))))
 
+(defun %mac-console-text ()
+  "mac/mac-console.lisp (vessel) with the 8x8 font it draws in: the bare Mac's
+   screen console.  Its keyboard is the translator's getc."
+  (let ((bytes nil))
+    (dolist (qw (symbol-value (find-symbol "*FONT-8X8-QWORDS*" :modus.mvm)))
+      (dotimes (i 8) (push (ldb (byte 8 (* 8 i)) qw) bytes)))
+    (format nil "~%(defun macc-font-bytes () '~S)~%~A~%"
+            (nreverse bytes) (mvm-text "mac/mac-console.lisp"))))
+
 (defun %rpi-hcon-font-text ()
   "HCON-FONT-BYTES for net/hdmi-console.lisp: boot/boot-uefi-x64.lisp's 8x8
    font (95 glyphs, one little-endian qword each), as 760 row bytes."
@@ -231,7 +246,9 @@
 ;; (machine-type) answered "aarch64" and %JIT-BOOT-INIT carried aarch64's
 ;; layout co-init (*conv-relative*, *a64-x18-base*) into a 32-bit x86 image.
 (defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386)
-                         (*cl-repl-arm32-p* :arm32) (t :aarch64)))
+                         (*cl-repl-arm32-p* :arm32) (*cl-repl-mac68k-p* :68k)
+                         (t :aarch64)))
+(defvar *cli-soft-float* *cl-repl-mac68k-p*)
 
 ;;; BARE-METAL SEAM.  No OS: no Linux syscalls, no fds, no argv, no
 ;;; cli-toplevel.  The tarball pipeline is kept (untar -> parse .asd ->
@@ -318,6 +335,8 @@
     (*cl-repl-i386-p* nil)
     ;; :ARM32 — no in-image JIT on 32-bit ARM either (build-cli-common).
     (*cl-repl-arm32-p* nil)
+    ;; :MAC68K — no 68k JIT.
+    (*cl-repl-mac68k-p* nil)
     ;; :X64 bare metal: JIT OFF by default (translate-x64's exec pages come
     ;; from mmap(2) in linux mode; the bare-metal bump allocator the aarch64
     ;; arm has is not ported yet).  MODUS_X64_JIT=1 opts in for the port work.
@@ -552,6 +571,7 @@
     ;; The PC console (x86-64): after serial-repl, whose console seams it
     ;; replaces by last-defun-wins.
     (if (and *cl-repl-x64-p* *pc-console-p*) (%pc-console-text) "")
+    (if *cl-repl-mac68k-p* (%mac-console-text) "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
     ;; seam defaults, or the defaults win (last-defun-wins).  Read off the
@@ -842,6 +862,59 @@
         ""))))
 
 (defvar *cli-arch-override-source*
+  (if *cl-repl-mac68k-p*
+      ;; THE 68k MAC: no device tree and nothing to read MODUS_* knobs from;
+      ;; the clock is the same text as the boards below, over #x0310/#x0311,
+      ;; which the Mac translator answers with the ROM's Ticks (60 Hz).
+      (concatenate 'string "
+(defun %cli-getenv (name) nil)
+;;; THE CLOCK ON BARE METAL.  cl-fileio.lisp's GET-INTERNAL-REAL-TIME and
+;;; GET-UNIVERSAL-TIME wrap a Linux syscall in a handler-case, expecting the
+;;; bare-metal case to fall through to a counter.  It cannot: an SVC with no
+;;; OS is a synchronous exception, and on a Pi that is the silent `!!FAULT'
+;;; spin (ESR 0x56000000 = EC 0x15, SVC from AArch64) -- the fault was
+;;; measured at GET-INTERNAL-REAL-TIME+0xbc inside a restored quicklisp core.
+;;; Nothing on the board may reach syscall3; route both to the CNTVCT
+;;; counter, exactly as %timer-universal-time's docstring says a bare-metal
+;;; build must select explicitly.  MICROSECONDS: the boot init below sets
+;;; internal-time-units-per-second to 1000000 (the hosted definition), and
+;;; this used to return milliseconds against it — every bare-metal timing
+;;; read 1000× too small (a 20 s reel decode on the Zero 2 W reported as
+;;; 20 ms, 2026-09-10).  Split the division so the product never leaves
+;;; the fixnum range: CNTVCT at 19.2/54 MHz × 10^6 overflows 62 bits in days.
+(defun get-internal-real-time ()
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000)
+             (floor (* (mod ticks hz) 1000000) hz)))
+        0)))
+;;; THE DATE is not the machine's to know: no RTC, so the counter is seconds since boot.
+;;; SET-UNIVERSAL-TIME is how something that does know (an SNTP answer, net/bare-sockets.lisp
+;;; BARE-NTP-TIME) tells it; the offset is a global SET at run time (a DEFVAR initform does not
+;;; run here), unbound -- 0 -- in a core saved before anybody did, which is right: the counter
+;;; restarts with every boot.
+(defun get-universal-time ()
+  (+ (%timer-universal-time)
+     (if (boundp '*universal-time-offset*) (symbol-value '*universal-time-offset*) 0)))
+(defun set-universal-time (ut)
+  \"Tell a board with no clock that it is UT (seconds since 1900) now.  UT.\"
+  (setf (symbol-value '*universal-time-offset*) (- ut (%timer-universal-time)))
+  ut)
+;;; ... and the nanosecond seams under them, which the hot-function JIT calls
+;;; directly to time interpreted calls: cl-fileio.lisp's defaults are the same
+;;; clock_gettime SVC, so the first DEFUN trampoline on the board faulted
+;;; (ESR 0x56000000, during the boot-time eval of the baked compat source).
+;;; One core and no scheduler, so run time is real time.
+(defun %irt-ns ()
+  (let ((hz (cntfrq)))
+    (if (and (integerp hz) (> hz 0))
+        (let ((ticks (rdtsc)))
+          (+ (* (floor ticks hz) 1000000000)
+             (floor (* (mod ticks hz) 1000000000) hz)))
+        0)))
+(defun %irun-ns () (%irt-ns))
+")
   (if *cl-repl-x64-p*
       ;; x86 QEMU-pc: no device tree; nothing to read MODUS_* knobs from yet.
       ;; SAVE-AND-DIE rides along: the same RAM-range core as the Pi, at
@@ -918,7 +991,7 @@
         ;; whose compilers do not set *U32-VECTORS-P*
         (if *cl-repl-rpi-p* (format nil "~%(defun %u32-vectors-p () t)~%") "")
         ;; GPIO / system timer / activity LED (what the mini-Lisp rpi-periph image had).
-        (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") ""))))
+        (if *cl-repl-rpi-p* (%rpi-net-text "bcm2835-gpio.lisp") "")))))
 
 
 
@@ -1264,7 +1337,7 @@
                        (subseq *cli-arch-kernel-prologue* (+ at (length old)))))))
 
 (defvar *cli-arch-io-scratch-source*
-  (if *cl-repl-x64-p*
+  (if (or *cl-repl-x64-p* *cl-repl-mac68k-p*)   ; no device tree to probe
       "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
@@ -2026,6 +2099,11 @@
                                  (if *ssh-isolated-p*
                                      (format nil "  (%bind-isolated-ssh-seams)~%") ""))
                          ""))))
+
+;; The Mac console draws every WRITE-CHAR-SERIAL on the Mac's screen too.
+(when *cl-repl-mac68k-p*
+  (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
+  (format t "~&;; CONSOLE: the Mac's screen, 8x8 font, beside serial port A (mac/mac-console.lisp)~%"))
 
 ;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
 (when (and *cl-repl-x64-p* *pc-console-p*)
@@ -3193,6 +3271,17 @@
 ;;; boot-linux-arm32.lisp's heap geometry (the collector reads the same
 ;;; constants), so both load here rather than in lib/load-mvm.lisp.  The
 ;;; console is translate-arm32's bare PL011 arm, at the VA the stub maps it to.
+;;; DIVERGENCE 6/7 (:MAC68K arm) — the bare 68k Mac.  boot/boot-mac68k.lisp
+;;; needs the 68k translator's emitters and boot-linux-68k.lisp's heap geometry.
+;;; MAC68K-CONFIGURE puts the translator in *68K-MAC-MODE* and moves NIL's page
+;;; and the kind map into the Mac's RAM.  Console: the ROM's serial driver.
+(when cl-user::*cl-repl-mac68k-p*
+  (cl-user::mvm-load "boot/boot-linux-68k.lisp")
+  (cl-user::mvm-load "boot/boot-mac68k.lisp")
+  (funcall (intern "INSTALL-68K-TRANSLATOR" "MODUS.MVM"))
+  (funcall (intern "MAC68K-CONFIGURE" "MODUS.MVM"))
+  (format t "~&;; CONSOLE: the Mac ROM's serial driver, port A (.AIn/.AOut)~%"))
+
 (when cl-user::*cl-repl-arm32-p*
   (cl-user::mvm-load "boot/boot-linux-arm32.lisp")
   (cl-user::mvm-load "boot/boot-arm32-cl.lisp")
@@ -3352,7 +3441,8 @@
 ;; BCM2835 mini-UART base on an x86 image.  The build printed both
 ;; "CONSOLE: COM1 via port I/O" and "CONSOLE: PL011 UART0 0x3F201000", which is
 ;; how it was caught — two consoles for one image is always a fall-through.
-(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*)
+(if (or cl-user::*cl-repl-x64-p* cl-user::*cl-repl-i386-p* cl-user::*cl-repl-arm32-p*
+        cl-user::*cl-repl-mac68k-p*)
     nil
  (if cl-user::*cl-repl-virt-p*
     (format t "~&;; CONSOLE: PL011 via the fixpoint boot descriptor, VA 20000000 ~
@@ -3733,7 +3823,8 @@
            cl-user::*full-source*
            (cond (cl-user::*cl-repl-virt-p* :fixpoint) (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                  (cl-user::*cl-repl-x64-p* :x86-64) (cl-user::*cl-repl-i386-p* :i386)
-                 (cl-user::*cl-repl-arm32-p* :armv7-cl) (t :rpi))))
+                 (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                 (cl-user::*cl-repl-mac68k-p* :mac68k) (t :rpi))))
     (with-open-file (o p :direction :output :if-exists :supersede)
       (write-string cl-user::*full-source* o))
     (format t "~&;; DDC: full source text (~D chars) written to ~A~%"
@@ -3743,6 +3834,7 @@
                                         (cl-user::*cl-repl-x64-p* :x86-64)
                                         (cl-user::*cl-repl-i386-p* :i386)
                                         (cl-user::*cl-repl-arm32-p* :armv7-cl)
+                                        (cl-user::*cl-repl-mac68k-p* :mac68k)
                                         (t :rpi))
                           :source-text cl-user::*full-source*)))
   (let ((path (or #+sbcl (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
@@ -3751,6 +3843,7 @@
                         (cl-user::*cl-repl-x64-p* "/tmp/modus-x64-cl-repl.bin")
                         (cl-user::*cl-repl-i386-p* "/tmp/modus-i386-cl-repl.bin")
                         (cl-user::*cl-repl-arm32-p* "/tmp/modus-arm32-cl-repl.bin")
+                        (cl-user::*cl-repl-mac68k-p* "/tmp/modus-mac68k-cl-repl.bin")
                         (t "/tmp/piboot/kernel8.img")))))
     (ensure-directories-exist path)
     (with-open-file (out path :direction :output
@@ -3817,6 +3910,21 @@
            (error "i386 layout: stack top ~:D is not above the general heap ~:D; ~
                    the stack grows DOWN into it." stack-top general))))
       (cl-user::*cl-repl-x64-p* (%x64-memory-map-asserts image))
+      ;; ---- the 68k Mac (boot-mac68k.lisp's map) ------------------------
+      ;; The image loads at #x0D000000 and must end below the stack's floor;
+      ;; the stack grows down from +MAC68K-STACK-TOP+.
+      (cl-user::*cl-repl-mac68k-p*
+       (let ((gaps (symbol-value (intern "*68K-UNIMPL-OPCODES*" "MODUS.MVM"))))
+         (format t "~&;; mac68k TRANSLATOR GAPS (ILLEGAL if run): ~{#x~X~^ ~}~%"
+                 (sort (copy-list gaps) #'<)))
+       (let ((end (+ (symbol-value (intern "+MAC68K-LOAD-ADDR+" "MODUS.MVM"))
+                     (length (kernel-image-image-bytes image))))
+             (top (symbol-value (intern "+MAC68K-STACK-TOP+" "MODUS.MVM"))))
+         (format t "~&;; mac68k map: image #x0D000000 .. #x~X (~,1F MB), stack top #x~X~%"
+                 end (/ (- end #x0D000000) 1048576.0) top)
+         (when (> (+ end #x800000) top)
+           (error "mac68k layout: the image ends at #x~X, within 8 MB of the stack top ~
+                   #x~X." end top))))
       ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
       ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
       ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything
@@ -3913,6 +4021,8 @@
       (t (%rpi-memory-map-asserts image)))
     (format t "~%Run: ~A~%"
             (cond
+              (cl-user::*cl-repl-mac68k-p*
+                (format nil "scripts/mac68k-disk.py ~A DISK, then Basilisk II with it (serial port A is the console)" path))
               (cl-user::*cl-repl-arm32-p*
                 (format nil "qemu-system-arm -M virt,highmem=off -cpu cortex-a15 -m 1024 -kernel ~A -display none -serial stdio -no-reboot" path))
               (cl-user::*cl-repl-x64-p*

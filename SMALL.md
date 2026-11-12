@@ -365,6 +365,20 @@ of RAM: the ROM's boot stack is mid-RAM, inside the 2.7 MB they read.
 
 Measured on Basilisk II (LC 475 ROM, `--ramsize 4M`, no JIT -- the relinked JIT
 binary still dies at startup now and then): the core boots to the prompt in
-~23 s; defun, bignums, `format ~R`, `loop` answer, the check silent.  Not yet
-on MAME's Classic (a 68000): the 6.6 MB disk is not a floppy, and a SCSI disk
-needs a driver of our own.
+~23 s; defun, bignums, `format ~R`, `loop` answer, the check silent.
+
+**On a Mac Classic** (MAME's `macclasc`: a 68000 at 7.8 MHz, 4 MB), booting a
+SCSI disk: `scripts/mac68k-hd.py VOLUME OUT --chd CHDMAN` puts a driver
+descriptor ('ER') in block 0, our read-only driver (`scripts/mac68k-scsi.s`)
+from block 1 and the boot volume from block 64.  The ROM loads the driver and
+enters it with the SCSI ID in D5; it installs itself (_DrvrInstall, unit 32 +
+ID, marked open), adds a locked, non-ejectable drive, and the ROM boots that
+drive's boot blocks.  PRIME reads through the SCSI Manager (Get, Select, READ(6)
+Cmd, RBlind, Complete).  `_SCSIDispatch` is a Toolbox trap: it may clobber
+D0-D2/A0-A1 under Pascal's convention, which first read as a SCSI error of
+5696.  `scripts/mac68k-mame-repl.lua` types forms when the prompt shows and taps
+the SCC for what the Mac sends.  Measured, in emulated time: the prompt at
+288 s from power-on, `(+ 1 2)` => 3, `(defun sq ...)` => SQ, `(sq 12)` => 144,
+on the Classic's 1-bit screen.  Slow: everything threaded, ~1 minute for
+`(+ 1 2)`, ~5 for a defun -- and that disk was built with
+`MODUS_68K_PAGED_CHECK`, which re-walks every root after every load.

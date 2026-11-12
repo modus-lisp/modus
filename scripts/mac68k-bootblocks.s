@@ -3,10 +3,11 @@
 | The Mac ROM reads the boot disk's first 1024 bytes and, finding 'LK' and an
 | executable version, jumps to bbEntry.  This code finds the boot drive's
 | driver in the drive queue, reads LEN bytes from disk offset OFF to DEST with
-| one synchronous _Read, and jumps to DEST.  scripts/mac68k-disk.py patches
-| DEST/LEN/OFF.  A failed read paints the top of the screen black and stops.
+| one synchronous _Read, and jumps to ENTRY (DEST, or a two-disk boot's
+| stage 2, scripts/mac68k-disk2.s).  scripts/mac68k-disk.py patches
+| DEST/ENTRY/LEN/OFF.  68000 code: a Mac Classic runs it too.  A failed read paints the top of the screen black and stops.
 |
-| Assemble: m68k-linux-gnu-as -m68040 -o b.o mac68k-bootblocks.s
+| Assemble: m68k-linux-gnu-as -m68000 -o b.o mac68k-bootblocks.s
 |           m68k-linux-gnu-objcopy -O binary b.o b.bin
 
         .text
@@ -53,7 +54,7 @@ found:  lea     pb(%pc), %a0
         .word   0xA002                  | _Read
         tst.w   %d0
         bne     fail
-        move.l  dest(%pc), %a0
+        move.l  entry(%pc), %a0         | the image, or a two-disk boot's stage 2
         jmp     (%a0)
 fail:   move.l  0x824, %a0              | ScrnBase: paint 32 rows black
         move.w  0x106, %d1
@@ -66,6 +67,7 @@ f1:     move.l  #-1, (%a0)+
 hang:   bra     hang
         .align  2
 dest:   .long   0x0D000000
+entry:  .long   0x0D000000
 len:    .long   0
 off:    .long   1024
 pb:     .space  80

@@ -199,7 +199,16 @@ probes identical to the untrimmed image.  The margin is 625 bytes.
 
 ## The same, as a Mac boot floppy
 
-    scripts/mac68k-floppy.py MAC-IMAGE DISK      # builds the loader too
+    scripts/mac68k-floppy.py MAC-IMAGE DISK        # two 800 KB floppies, DISK-1 and DISK-2
+    scripts/mac68k-floppy.py MAC-IMAGE DISK --hd   # or one 1.44 MB floppy
+
+Two 800 KB disks (818,176 + 421,699 bytes; 397 KB free on the second): disk
+1's boot blocks enter a 68000 stage 2 (`scripts/mac68k-disk2.s`) that reads
+block 0 of every drive for disk 2's label; if no drive has it, it ejects disk
+1, writes INSERT MODUS DISK 2 on the screen and polls.  Measured: both disks in
+two drives boot to the prompt (15.7 s, JIT); disk 1 alone ejects and shows the
+message.  NOT measured: a swap in ONE drive -- headless Basilisk cannot insert
+a disk after boot.
 
 A bare-Mac image (`mvm/build-mac68k-cl-repl.lisp`, linked at `#x00100000`)
 goes behind the same decoder with a Mac head (`mvm/mac68k-unlzma.lisp`): the

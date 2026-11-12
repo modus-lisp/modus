@@ -24,7 +24,7 @@ LOAD_ADDR = 0x00100000   # boot/boot-mac68k.lisp +MAC68K-LOAD-ADDR+
 def bootblocks():
     with tempfile.TemporaryDirectory() as d:
         o, b = os.path.join(d, 'b.o'), os.path.join(d, 'b.bin')
-        subprocess.run(['m68k-linux-gnu-as', '-m68040', '-o', o,
+        subprocess.run(['m68k-linux-gnu-as', '-m68000', '-o', o,
                         os.path.join(HERE, 'mac68k-bootblocks.s')], check=True)
         subprocess.run(['m68k-linux-gnu-objcopy', '-O', 'binary', o, b], check=True)
         syms = {}
@@ -35,15 +35,17 @@ def bootblocks():
         return bytearray(open(b, 'rb').read()), syms
 
 
-def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200):
-    """Boot blocks that read IMG (bytes) to LOAD_ADDR and jump there, then IMG
-    at offset 1024, padded to whole blocks and to at least MIN_SIZE."""
+def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None):
+    """Boot blocks that read IMG (bytes) to LOAD_ADDR and jump to ENTRY (default
+    LOAD_ADDR), then IMG at offset 1024, padded to whole blocks and to at
+    least MIN_SIZE."""
     bb, syms = bootblocks()
     if syms['start'] != 0x8A:
         sys.exit('mac68k-disk: the loader is at %#x, not 0x8A' % syms['start'])
     if len(bb) > 1024:
         sys.exit('mac68k-disk: boot blocks are %d bytes' % len(bb))
     struct.pack_into('>I', bb, syms['dest'], load_addr)
+    struct.pack_into('>I', bb, syms['entry'], load_addr if entry is None else entry)
     # a disk driver reads whole 512-byte blocks (a byte count is paramErr, -50)
     struct.pack_into('>I', bb, syms['len'], (len(img) + 511) & ~511)
     struct.pack_into('>I', bb, syms['off'], 1024)

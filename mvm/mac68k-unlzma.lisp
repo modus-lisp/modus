@@ -28,7 +28,7 @@
 ;;;; (in that order: the core reads this file's constants)
 
 (defconstant +loader+ #x01200000)       ; MODUS_MAC68K_LOAD_ADDR
-(defconstant +pay+    #x01210000)       ; the loader stays under 64 KB
+(defconstant +pay+    #x01204000)       ; the loader stays under 16 KB
 (defconstant +out+    #x00100000)       ; +mac68k-load-addr+
 (defconstant +st+     #x01A00000)       ; RH RL CH CL IPH IPL, u16 each
 (defconstant +pr+     #x01A00100)       ; 7991 u16 probabilities

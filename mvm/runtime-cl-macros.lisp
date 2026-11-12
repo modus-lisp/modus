@@ -767,6 +767,23 @@
                       (member :big-endian *features*))
             (setq *features* (cons (if (%target-big-endian-p) :big-endian :little-endian)
                                    *features*)))
+          ;; The ARCHITECTURE, spelled as SBCL spells it (:X86-64, :ARM64, :X86, :ARM,
+          ;; :RISCV) so a #+x86-64 / #+arm64 reads the same on both.  It comes from
+          ;; MACHINE-TYPE, which every build defines for its own target
+          ;; (build-cli-common's %MACHINE-TYPE-SOURCE).  *FEATURES* carried no
+          ;; architecture at all, so the FASL key -- which hashes them -- could not
+          ;; tell an x64 module from an aarch64 one.
+          (let* ((m (ignore-errors (machine-type)))
+                 (f (cond ((not (stringp m)) nil)
+                          ((string= m "x86_64") :x86-64)
+                          ((string= m "aarch64") :arm64)
+                          ((string= m "i386") :x86)
+                          ((string= m "armv7l") :arm)
+                          ((or (string= m "riscv64") (string= m "riscv32")) :riscv)
+                          ((string= m "m68k") :m68k)
+                          (t nil))))
+            (when (and f (not (member f *features*)))
+              (setq *features* (cons f *features*))))
           ;; Advertise :modus so UIOP recognises this implementation.  The
           ;; vendored asdf.lisp guards its "ASDF is not supported on your
           ;; implementation" hard error with

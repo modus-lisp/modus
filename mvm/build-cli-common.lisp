@@ -309,7 +309,14 @@
               for k = (char-code c)
               do (setf a (logand (* (logxor a k) 16777619) #xFFFFFFFF))
                  (setf b (logand (* (logxor b (logand (+ k 41) #xFFFF)) 16777619) #xFFFFFFFF)))))
-    (format nil "(defun %fasl-compiler-fingerprint () \"mfasl1-~8,'0x~8,'0x\")~%" a b)))
+    ;; AND THE TARGET: a module's bytecode is compiled for this image's architecture
+    ;; (fixnum width, packed-vector and typed-array paths, byte order), and nothing else
+    ;; in the key named it -- *FEATURES* carries no architecture -- so an aarch64 CLI
+    ;; replayed modules an x64 CLI had cached for the same file from the shared
+    ;; ~/.cache/modus and ran wrong code (cram's inflate read past its input).  Builds of
+    ;; ONE architecture still share (host, QEMU, board), as above.
+    (format nil "(defun %fasl-compiler-fingerprint () \"mfasl1-~8,'0x~8,'0x-~(~a~)\")~%"
+            a b (if (boundp '*cli-arch*) (symbol-value '*cli-arch*) "unknown"))))
 (format t "  FASL fingerprint: ~a" *fasl-fingerprint-source*)
 
 ;;; ============================================================

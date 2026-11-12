@@ -34,6 +34,10 @@
 (in-package :modus.mvm)
 
 (defconstant +mac68k-load-addr+ #x00100000)
+(defvar *mac68k-load-addr* +mac68k-load-addr+
+  "Where this build is linked and the boot blocks put it: +MAC68K-LOAD-ADDR+
+   for an image, elsewhere for the boot-disk loader that unpacks one there
+   (mvm/mac68k-unlzma.lisp; build-hosted's MODUS_MAC68K_LOAD_ADDR).")
 (defconstant +mac68k-stack-top+ #x00A80000)
 (defconstant +mac68k-scratch+ #x00A80000
   "The I/O scratch pages: *CSTR-SCRATCH* here, *IO-BUF-ADDR* 256 KB on.")
@@ -161,7 +165,7 @@
    load at +MAC68K-LOAD-ADDR+ and enter at its first byte."
   (list :arch :68k
         :entry-fn #'emit-mac68k-entry
-        :load-addr +mac68k-load-addr+
+        :load-addr *mac68k-load-addr*
         :heap-base +mac68k-region+
         :cons-base +mac68k-region+
         :endianness :big))

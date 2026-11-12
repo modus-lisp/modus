@@ -170,7 +170,8 @@ The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
     grep -oE '^0x[0-9a-f]+' LOG | sort -u > EXEC
     scripts/68k-floppy-trim.py IMAGE SYMMAP EXEC TRIMMED
     # 2. the loader: LZMA1 decoder in Lisp, no runtime (a ladder rung's build)
-    MODUS_68K_LINUX_OUT=unlzma sbcl --script mvm/build-hosted.lisp 68k mvm/68k-unlzma.lisp
+    MODUS_68K_LINUX_OUT=unlzma sbcl --script mvm/build-hosted.lisp 68k \
+        mvm/68k-unlzma.lisp mvm/unlzma-core.lisp
     # 3. pack (--test: the image writes the unpacked bytes to stdout instead)
     scripts/68k-floppy-pack.py unlzma TRIMMED FLOPPY
 
@@ -179,7 +180,8 @@ The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
   -> 1.456 MB.  The shim sources stay -- they are evaluated at first use.
   It is a post-link hack; the real version is a build-time shake from the
   core-boot path (see the script's header for the two traps it hit).
-- **The loader** (`mvm/68k-unlzma.lisp`, 14.3 KB) is LzmaSpec.cpp in fixnum
+- **The loader** (`mvm/68k-unlzma.lisp`, the Linux head, + `mvm/unlzma-core.lisp`,
+  the decoder; 13.6 KB) is LzmaSpec.cpp in fixnum
   Lisp: the range coder's 32-bit values are 16-bit halves, the arithmetic the
   raw `%FIXNUM-` ops on declared fixnums, so there are no overflow checks and
   nothing to link (generic arithmetic made it 40 KB).  7.46 MB unpacks in
@@ -194,6 +196,21 @@ The core image above, compressed, is 1.57 MB (xz -9e).  On one 1.44 MB disk
 
 Validated: `validate.sh` and DESCRIBE / APROPOS / DOCUMENTATION / COMPILE
 probes identical to the untrimmed image.  The margin is 625 bytes.
+
+## The same, as a Mac boot floppy
+
+    scripts/mac68k-floppy.py MAC-IMAGE DISK      # builds the loader too
+
+A bare-Mac image (`mvm/build-mac68k-cl-repl.lisp`, linked at `#x00100000`)
+goes behind the same decoder with a Mac head (`mvm/mac68k-unlzma.lisp`): the
+boot blocks read loader + stream to `#x01200000`, the loader unpacks to
+`#x00100000`, pushes the 68040's caches (`CPUSHA BC`: the image was written
+as data) and jumps.  No trim needed: the small REPL image (5,557,396 bytes,
+framebuffer console included) is 1,222,613 bytes of LZMA + a 13 KB loader, a
+1.44 MB floppy with 237 KB to spare.  On Basilisk II (LC 475 ROM, 68LC040, no
+JIT, 32 MB), measured: unpacking takes ~58 s, then the image boots exactly as
+from an uncompressed disk (prompt at ~143 s vs ~85 s), from `--floppy` and from
+`--disk` alike.
 
 ## Plan
 

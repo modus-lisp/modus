@@ -35,23 +35,30 @@ def bootblocks():
         return bytearray(open(b, 'rb').read()), syms
 
 
-def main(image, disk):
-    img = open(image, 'rb').read()
+def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200):
+    """Boot blocks that read IMG (bytes) to LOAD_ADDR and jump there, then IMG
+    at offset 1024, padded to whole blocks and to at least MIN_SIZE."""
     bb, syms = bootblocks()
     if syms['start'] != 0x8A:
         sys.exit('mac68k-disk: the loader is at %#x, not 0x8A' % syms['start'])
     if len(bb) > 1024:
         sys.exit('mac68k-disk: boot blocks are %d bytes' % len(bb))
-    struct.pack_into('>I', bb, syms['dest'], LOAD_ADDR)
+    struct.pack_into('>I', bb, syms['dest'], load_addr)
     # a disk driver reads whole 512-byte blocks (a byte count is paramErr, -50)
     struct.pack_into('>I', bb, syms['len'], (len(img) + 511) & ~511)
     struct.pack_into('>I', bb, syms['off'], 1024)
     out = bb + bytes(1024 - len(bb)) + img
     out += bytes(-len(out) % 512)
-    out += bytes(max(0, 819200 - len(out)))
+    out += bytes(max(0, min_size - len(out)))
     open(disk, 'wb').write(out)
+    return len(out)
+
+
+def main(image, disk):
+    img = open(image, 'rb').read()
+    n = write_disk(img, disk)
     print('mac68k-disk: %s (%d bytes at %#x) -> %s, %d bytes'
-          % (image, len(img), LOAD_ADDR, disk, len(out)))
+          % (image, len(img), LOAD_ADDR, disk, n))
 
 
 if __name__ == '__main__':

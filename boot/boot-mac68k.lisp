@@ -48,7 +48,11 @@
 (defparameter *mac68k-layouts*
   '((:lc      :load #x00100000 :stack-top #x00A80000 :scratch #x00A80000
               :region #x00B00000 :heap-size #x01000000 :gc-guard #x00100000
-              :kind-map #x01C00000 :nil-page #x01F00000)
+              :kind-map #x01C00000 :nil-page #x01F00000
+              ;; paged code (MODUS_68K_PAGED): the code cache and the loader's
+              ;; staging buffer, between the resident image and the stack
+              :cache-lo #x00400000 :cache-hi #x00660000
+              :staging #x00660000 :staging-size #x00010000)
     ;; the Classic: image from 64 KB, I/O scratch (a CL image's) at 1.44 MB,
     ;; a 64 KB stack under 2 MB, the region at 2 MB with a 1 MB heap (two
     ;; 512 KB semispaces) and a 64 KB guard, the kind map, NIL's page under
@@ -94,7 +98,13 @@
         *conv-delta* (- +mac68k-region+ +conv-region-base+))
   (m68k-set-mac-mode t)
   (setf *68k-nil-page* +mac68k-nil-page+
-        *68k-gc-kind-map* +mac68k-kind-map+))
+        *68k-gc-kind-map* +mac68k-kind-map+)
+  ;; paged code: where the stream loader puts what it reads
+  (setf *68k-paged-cache*
+        (and *68k-paged*
+             (list (mac68k-layout :cache-lo) (mac68k-layout :cache-hi)
+                   (mac68k-layout :staging) (mac68k-layout :staging-size)
+                   *mac68k-load-addr*))))
 
 (defun mac68k-coinit-text ()
   "Source text the image runs first in KERNEL-MAIN: the same region delta for

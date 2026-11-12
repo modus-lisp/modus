@@ -976,6 +976,21 @@
     (dotimes (i 4)
       (setf (aref raw-bytes (+ pos i)) (logand (ash w (* i -8)) #xFF)))))
 
+(defvar *68k-tail-move* nil
+  "A paged 68k image (translate-68k *68K-PAGED-LAYOUT*): (SECTION END . RAW)
+   when its stream section [SECTION, END) of the native code was written LAST,
+   at raw offset RAW, after the constant pool, the NFN table and the footer
+   -- so everything a small Mac keeps resident is one contiguous low block
+   and the streams are the image's tail (on disk, loaded on demand).  NIL
+   otherwise.  Native offsets in the section map through NATIVE-RAW-POS.")
+
+(defun native-raw-pos (native-image-offset native-pos)
+  "The raw-file offset of native byte NATIVE-POS (see *68K-TAIL-MOVE*)."
+  (let ((m *68k-tail-move*))
+    (if (and m (cddr m) (>= native-pos (first m)))
+        (+ (cddr m) (- native-pos (first m)))
+        (+ native-image-offset native-pos))))
+
 (defun apply-68k-abs-patches (raw-bytes image boot-descriptor)
   "Write each 68000 absolute code address (translate-68k *68K-ABS-PATCHES*:
    native byte offset of the 32-bit word, native offset of its target) as the
@@ -986,13 +1001,12 @@
              (boundp 'modus.mvm::*68k-abs-patches*)
              (symbol-value 'modus.mvm::*68k-abs-patches*))
     (let* ((native-image-offset (or (kernel-image-native-image-offset image) 0))
-           (base (+ (or (getf boot-descriptor :code-vaddr-base)
-                        (+ (or (getf boot-descriptor :load-addr) 0)
-                           (wrap-header-size-for-boot boot-descriptor)))
-                    native-image-offset)))
+           (base (or (getf boot-descriptor :code-vaddr-base)
+                     (+ (or (getf boot-descriptor :load-addr) 0)
+                        (wrap-header-size-for-boot boot-descriptor)))))
       (dolist (p (symbol-value 'modus.mvm::*68k-abs-patches*))
-        (let ((pos (+ native-image-offset (car p)))
-              (addr (+ base (cdr p))))
+        (let ((pos (native-raw-pos native-image-offset (car p)))
+              (addr (+ base (native-raw-pos native-image-offset (cdr p)))))
           (dotimes (i 4)
             (setf (aref raw-bytes (+ pos i)) (ldb (byte 8 (* 8 (- 3 i))) addr))))))))
 
@@ -1066,7 +1080,7 @@
         (dolist (patch patches)
           (let* ((native-pos (car patch))
                  (idx (cdr patch))
-                 (file-pos (+ native-image-offset native-pos))
+                 (file-pos (native-raw-pos native-image-offset native-pos))
                  (offset (if (and pool-addr-table
                                   (< idx (length pool-addr-table)))
                              (aref pool-addr-table idx)
@@ -1539,7 +1553,15 @@
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (setf (kernel-image-native-image-offset image) code-offset)
+          ;; a paged 68k image: the stream section goes LAST (*68K-TAIL-MOVE*)
+          (setf *68k-tail-move*
+                (let ((l (and (eq (and boot-descriptor (getf boot-descriptor :arch)) :68k)
+                              (boundp 'modus.mvm::*68k-paged-layout*)
+                              (symbol-value 'modus.mvm::*68k-paged-layout*))))
+                  (and l (list (getf l :section) (getf l :end)))))
           (loop for b across native-code
+                for i from 0
+                while (or (null *68k-tail-move*) (< i (first *68k-tail-move*)))
                 do (mvm-emit-byte final-buf b))
           ;; Update entry point to absolute offset
           (when (kernel-image-entry-point image)
@@ -1608,6 +1630,18 @@
                                         (length source-blob) 8))
             (mvm-emit-u32 final-buf (- (mvm-buffer-position final-buf)
                                         (length source-blob) 4))))
+      ;; a paged 68k image's stream section, last, 16-aligned in memory
+      (when *68k-tail-move*
+        (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))
+               (wrap-header (wrap-header-size-for-boot boot-descriptor)))
+          (loop until (zerop (mod (+ load-addr wrap-header (mvm-buffer-position final-buf)) 16))
+                do (mvm-emit-byte final-buf 0))
+          (setf (cddr *68k-tail-move*) (mvm-buffer-position final-buf))
+          (loop for i from (first *68k-tail-move*) below (second *68k-tail-move*)
+                do (mvm-emit-byte final-buf (aref native-code i)))
+          (format t "~&;; 68k paged: resident ~D bytes, then the stream section ~D bytes at raw ~D~%"
+                  (cddr *68k-tail-move*) (- (second *68k-tail-move*) (first *68k-tail-move*))
+                  (cddr *68k-tail-move*))))
       (let ((raw-bytes (mvm-buffer-used-bytes final-buf)))
         ;; LI-CONST patches: walk the per-arch patch list and write
         ;; tagged constant-pool addresses into the placeholder MOVABS

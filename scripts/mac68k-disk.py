@@ -37,7 +37,7 @@ def bootblocks():
         return bytearray(open(b, 'rb').read()), syms
 
 
-def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None):
+def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read_len=None):
     """Boot blocks that read IMG (bytes) to LOAD_ADDR and jump to ENTRY (default
     LOAD_ADDR), then IMG at offset 1024, padded to whole blocks and to at
     least MIN_SIZE."""
@@ -49,7 +49,7 @@ def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None):
     struct.pack_into('>I', bb, syms['dest'], load_addr)
     struct.pack_into('>I', bb, syms['entry'], load_addr if entry is None else entry)
     # a disk driver reads whole 512-byte blocks (a byte count is paramErr, -50)
-    struct.pack_into('>I', bb, syms['len'], (len(img) + 511) & ~511)
+    struct.pack_into('>I', bb, syms['len'], ((read_len or len(img)) + 511) & ~511)
     struct.pack_into('>I', bb, syms['off'], 1024)
     out = bb + bytes(1024 - len(bb)) + img
     out += bytes(-len(out) % 512)
@@ -58,12 +58,35 @@ def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None):
     return len(out)
 
 
-def main(image, disk):
+def paged(img):
+    """A paged image (MODUS_68K_PAGED): its stream table marked NOT LOADED
+    (bit 0 of every entry), and how many bytes the boot blocks must read --
+    the resident part, up to the stream section.  The streams stay on the
+    disk after it; the image's loader reads them when they are called."""
+    k = img.find(b'modusPGD')
+    if k < 0 or img.find(b'modusPGD', k + 1) >= 0:
+        sys.exit('mac68k-disk: --paged needs one modusPGD descriptor in the image')
+    table, count, section = struct.unpack('>III', img[k + 8:k + 20])
+    img = bytearray(img)
+    t = table - LOAD_ADDR
+    for i in range(count):
+        v, = struct.unpack_from('>I', img, t + 4 * i)
+        struct.pack_into('>I', img, t + 4 * i, v | 1)
+    return bytes(img), section - LOAD_ADDR, count
+
+
+def main(image, disk, *opts):
     img = open(image, 'rb').read()
+    if '--paged' in opts:
+        img, resident, count = paged(img)
+        n = write_disk(img, disk, read_len=resident)
+        print('mac68k-disk: %s paged: %d resident bytes boot, %d streams (%d bytes) on demand'
+              % (image, resident, count, len(img) - resident))
+        return
     n = write_disk(img, disk)
     print('mac68k-disk: %s (%d bytes at %#x) -> %s, %d bytes'
           % (image, len(img), LOAD_ADDR, disk, n))
 
 
 if __name__ == '__main__':
-    main(*sys.argv[1:3])
+    main(*sys.argv[1:])

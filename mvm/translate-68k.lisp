@@ -188,6 +188,23 @@
 (defvar *68k-cold-enter-label* nil)
 (defvar *68k-stream-table-label* nil)
 (defvar *68k-stream-section-label* nil)
+;;; THE MAC'S STREAM LOADER (paged + Mac mode).  The disk builder
+;;; (scripts/mac68k-disk.py --paged) gives the boot blocks only the RESIDENT
+;;; part of the image and marks every stream-table entry "not loaded" -- bit 0
+;;; set, its home address otherwise (streams are word-aligned).  COLD-ENTER
+;;; takes such an entry to the loader, which reads the blocks holding the
+;;; stream from the boot drive into a staging buffer (the ROM's _Read, the
+;;; boot blocks' way), copies the stream into the CODE CACHE and makes the
+;;; entry its address.  Its length is the gap to the next stream, from the
+;;; HOME TABLE (read-only, one longword more than the table: the section's
+;;; end).  The disk holds the image at byte 1024, so a home address H is disk
+;;; byte 1024 + H - load address.  No eviction yet: a full cache stops.
+(defvar *68k-paged-cache* nil
+  "Mac paged: (CACHE-LO CACHE-HI STAGING STAGING-SIZE LOAD-ADDR), set by
+   boot-mac68k's MAC68K-CONFIGURE from the machine's layout.")
+(defvar *68k-stream-home-label* nil)
+(defvar *68k-stream-end-label* nil)
+
 (defvar *68k-paged-layout* nil
   "After a paged translation: plist :table :section :end :count -- native
    offsets of the stream table, the section and its end (cross.lisp, the Mac
@@ -4436,6 +4453,8 @@
          (*68k-cold-enter-label* (and *68k-paged* (mvm-make-label)))
          (*68k-stream-table-label* (and *68k-paged* (mvm-make-label)))
          (*68k-stream-section-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-stream-home-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-stream-end-label* (and *68k-paged* (mvm-make-label)))
          (*68k-mul32-label* (and *68k-cpu-68000* (mvm-make-label)))
          (*68k-mulu64-label* (and *68k-cpu-68000* (mvm-make-label)))
          (*68k-divs32-label* (and *68k-cpu-68000* (mvm-make-label)))
@@ -4942,29 +4961,100 @@
                       (dolist (p params) (m68k-emit-stream-param buf p w)))))
 
 (defun m68k-emit-paged-section (buf)
-  "Paged: COLD-ENTER, the stream table, then every stream (the section)."
-  (let ((miss (mvm-make-label))
-        (fns (reverse *68k-paged-fns*)))
+  "Paged: COLD-ENTER, the Mac's loader, the stream table and the home table,
+   the descriptor the disk builder finds, then every stream (the section)."
+  (let ((miss (mvm-make-label)) (ill (mvm-make-label))
+        (cacheptr (mvm-make-label)) (lastidx (mvm-make-label)) (pb (mvm-make-label))
+        (fns (reverse *68k-paged-fns*))
+        (mac (and *68k-mac-mode* *68k-paged-cache*)))
     (m68k-word-align buf)
     (m68k-emit-label buf *68k-cold-enter-label*)
     (m68k-emit-word buf #x48C0)                               ; EXT.L D0 (i < 32768)
     (m68k-emit-word buf #xD080) (m68k-emit-word buf #xD080)   ; D0 *= 4
     (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
+    (m68k-emit-word buf #x0835) (m68k-emit-word buf 0) (m68k-emit-word buf #x0803) ; BTST #0,(3,A5,D0.L)
+    (m68k-emit-bne buf miss)                                  ; not loaded
     (m68k-emit-word buf #x2A75) (m68k-emit-word buf #x0800)   ; MOVEA.L (0,A5,D0.L),A5
-    (m68k-emit-word buf #x200D)                               ; MOVE.L A5,D0
-    (m68k-emit-beq buf miss)
     (m68k-emit-bra buf *68k-thread-next-label*)
-    ;; not loaded: no loader yet -- stop where a debugger can see it
     (m68k-emit-label buf miss)
-    (m68k-emit-word buf #x4AFC)                               ; ILLEGAL
-    ;; the table: the stream's address, patched after layout
-    (m68k-emit-word buf #x4E71) (m68k-emit-word buf #x4E71)   ; (aligned to 4)
+    (when mac
+      (destructuring-bind (lo hi staging staging-size load-addr) *68k-paged-cache*
+        (declare (ignore lo))
+        (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+               (l32 (v) (m68k-emit-long buf v)))
+          (ws #x48E7 #x7FFA)                                   ; MOVEM.L D1-D7/A0-A4/A6,-(SP)
+          (ws #x2E00)                                          ; D7 = i*4
+          (m68k-emit-lea-label buf lastidx +68k-a0+) (ws #x2080)   ; lastidx = D0
+          (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a0+)
+          (ws #x2A30 #x7800)                                   ; D5 = home[i]
+          (ws #x2C30 #x7804)                                   ; D6 = home[i+1]
+          (ws #x9C85)                                          ; D6 = length
+          (ws #x2805) (ws #x0484) (l32 (- load-addr 1024))     ; D4 = disk byte
+          (ws #x2604 #x0283) (l32 511)                         ; D3 = skip (D4 mod 512)
+          (ws #x9883)                                          ; D4 = first block's byte
+          (ws #x2403 #xD486 #x0682) (l32 511)
+          (ws #x0282) (l32 #xFFFFFE00)                         ; D2 = bytes to read
+          (ws #x0C82) (l32 staging-size)                       ; too big for the staging?
+          (m68k-emit-bcc-word buf +68k-cc-hi+ ill)
+          ;; the boot drive's drive-queue element (BootDrive $210, DrvQHdr $30A)
+          (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label)))
+            (ws #x3238 #x0210 #x2678 #x030A)
+            (m68k-emit-label buf dq)
+            (ws #x200B) (m68k-emit-beq buf ill)
+            (ws #xB26B #x0006) (m68k-emit-beq buf found)
+            (ws #x2653) (m68k-emit-bra buf dq)
+            (m68k-emit-label buf found)
+            (m68k-emit-lea-label buf pb +68k-a0+)
+            (ws #x7013)                                        ; MOVEQ #19,D0
+            (m68k-emit-label buf zl)
+            (ws #x4298)                                        ; CLR.L (A0)+
+            (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
+            (m68k-emit-lea-label buf pb +68k-a0+)
+            (ws #x316B #x0006 #x0016)                          ; ioVRefNum = dQDrive
+            (ws #x316B #x0008 #x0018)                          ; ioRefNum = dQRefNum
+            (ws #x217C) (l32 staging) (ws #x0020)              ; ioBuffer
+            (ws #x2142 #x0024)                                 ; ioReqCount = D2
+            (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart
+            (ws #x2144 #x002E)                                 ; ioPosOffset = D4
+            (ws #xA002)                                        ; _Read
+            (ws #x4A40) (m68k-emit-bne buf ill))
+          ;; a place in the code cache (word-aligned)
+          (m68k-emit-lea-label buf cacheptr +68k-a0+)
+          (ws #x2850 #x200C #xD086 #x5280 #x0280) (l32 #xFFFFFFFE)
+          (ws #x0C80) (l32 hi) (m68k-emit-bcc-word buf +68k-cc-hi+ ill)
+          (ws #x2080)                                          ; cacheptr = the next free byte
+          ;; copy the stream there from the staging buffer
+          (ws #x247C) (l32 staging) (ws #xD5C3 #x264C #x2006)
+          (ws #x5380 #x6B04 #x16DA #x60F8)                     ; D6 bytes, a byte at a time
+          (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a0+)
+          (ws #x218C #x7800)                                   ; table[i] = A4
+          (ws #x4CDF #x5FFE)                                   ; MOVEM.L (SP)+,D1-D7/A0-A4/A6
+          (m68k-emit-lea-label buf lastidx +68k-a5+) (ws #x2015)
+          (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
+          (ws #x2A75 #x0800)                                   ; A5 = the stream
+          (m68k-emit-bra buf *68k-thread-next-label*))))
+    (m68k-emit-label buf ill)
+    (m68k-emit-word buf #x4AFC)                               ; ILLEGAL: not loadable
+    ;; data: the cache's next free byte, the entry being loaded, a parameter block
     (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-word buf #x4E71))
+    (m68k-emit-label buf cacheptr)
+    (m68k-emit-long buf (if *68k-paged-cache* (first *68k-paged-cache*) 0))
+    (m68k-emit-label buf lastidx)
+    (m68k-emit-long buf 0)
+    (m68k-emit-label buf pb)
+    (dotimes (i 40) (m68k-emit-word buf 0))
+    ;; the descriptor: "modusPGD", the table's address, the count, the section
+    (dolist (w '(#x6D6F #x6475 #x7350 #x4744)) (m68k-emit-word buf w))
+    (m68k-emit-abs32-data buf *68k-stream-table-label*)
+    (m68k-emit-long buf (length fns))
+    (m68k-emit-abs32-data buf *68k-stream-section-label*)
+    ;; the stream table (live: the stream's address; bit 0 = not loaded) and
+    ;; the home table (where each stream is in the image; one more: the end)
     (m68k-emit-label buf *68k-stream-table-label*)
-    (let ((*68k-native-p* t))
-      (dolist (f fns)
-        (m68k-emit-word buf #x4E71) (m68k-emit-word buf #x4E71)   ; placeholder, then:
-        (push (cons (- (m68k-buffer-position buf) 4) (third f)) *68k-paged-table-refs*)))
+    (dolist (f fns) (m68k-emit-abs32-data buf (third f)))
+    (m68k-emit-label buf *68k-stream-home-label*)
+    (dolist (f fns) (m68k-emit-abs32-data buf (third f)))
+    (m68k-emit-abs32-data buf *68k-stream-end-label*)
     ;; the section
     (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-word buf #x4E71))
     (m68k-emit-label buf *68k-stream-section-label*)
@@ -4974,7 +5064,13 @@
         (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
           (m68k-emit-label buf label)
           (m68k-emit-stream-body buf start end w)
-          (m68k-word-align buf))))))
+          (m68k-word-align buf))))
+    (m68k-emit-label buf *68k-stream-end-label*)))
+
+(defun m68k-emit-abs32-data (buf label)
+  "A longword holding LABEL's absolute address (patched after layout)."
+  (m68k-emit-word buf 0) (m68k-emit-word buf 0)
+  (push (cons (- (m68k-buffer-position buf) 4) label) *68k-paged-table-refs*))
 
 (defvar *68k-paged-table-refs* nil
   "Paged: (TABLE-SLOT-POS . STREAM-LABEL), resolved into *68K-ABS-PATCHES*.")

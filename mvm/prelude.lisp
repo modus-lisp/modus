@@ -511,6 +511,17 @@
 ;; strings, unless a build says no (the 68k: compiler.lisp *STRING32-P*).
 (declaim (overridable %string32-strings-p))
 (defun %string32-strings-p () (%narrow-strings-p))
+;; ... and whether EVERY fresh string is narrow (compiler.lisp *BASE-STRINGS-ONLY*):
+;; the Mac's, whose text is 8-bit.
+(declaim (overridable %base-strings-only-p))
+(defun %base-strings-only-p () nil)
+
+(defun %base-string-set (s i code)
+  "Store character CODE at I of narrow string S: a code that does not fit a
+   byte is refused, never truncated (as %ASET-SLOW's narrow arm)."
+  (if (and (fixnump code) (>= code 0) (< code 256))
+      (%u8-set s i code)
+      (error "~S cannot be stored in a narrow (base) string" code)))
 
 (defun %make-base-string (n)
   "A fresh narrow string of N zero bytes: a byte vector whose header's subtag
@@ -4112,13 +4123,19 @@
                  (< (- end start) 64))
         (let* ((len (- end start)) (r (%make-string-array len)) (i 0))
           ;; a narrow-strings build makes 32-bit (#x15) strings
-          (if (%prim-string32-p r)
-              (loop (when (>= i len) (return-from subseq r))
-                (%c32-set r i (%word-aref seq (+ start i)))
-                (setq i (+ i 1)))
-              (loop (when (>= i len) (return-from subseq r))
-                (%word-aset r i (%word-aref seq (+ start i)))
-                (setq i (+ i 1))))))))
+          (cond ((%prim-string32-p r)
+                 (loop (when (>= i len) (return-from subseq r))
+                   (%c32-set r i (%word-aref seq (+ start i)))
+                   (setq i (+ i 1))))
+                ;; a narrow string (*BASE-STRINGS-ONLY*): a checked byte store
+                ((%prim-base-string-p r)
+                 (loop (when (>= i len) (return-from subseq r))
+                   (%base-string-set r i (%word-aref seq (+ start i)))
+                   (setq i (+ i 1))))
+                (t
+                 (loop (when (>= i len) (return-from subseq r))
+                   (%word-aset r i (%word-aref seq (+ start i)))
+                   (setq i (+ i 1)))))))))
   ;; An EXPLICIT nil end (CL: (subseq s start nil)) means \"to the end\" —
   ;; same as omitting it.  Guarding on end-arg alone left end=NIL, which the
   ;; array path then fed to (- end start) → TYPE-ERROR (the list path tolerates

@@ -1243,6 +1243,17 @@
    layout (tag 9, data at +16), so a narrow-literals 68k build keeps #x31 for
    mutable strings.  In-image the question is %STRING32-STRINGS-P (prelude).")
 
+(defvar *base-strings-only* nil
+  "Does the AOT build make every fresh string NARROW (#x13, a byte a character)?
+   The Mac's: its text is 8-bit, and a wide string is 4 bytes a character of a
+   young heap a quarter of a megabyte.  A character above 255 cannot be stored
+   in one (%PRIM-ASET signals).  In-image the question is %BASE-STRINGS-ONLY-P
+   (prelude).")
+
+(defun %base-strings-on-p ()
+  "Does this build make its fresh strings narrow?  (*BASE-STRINGS-ONLY*.)"
+  (if *mvm-eval-runtime-p* (%base-strings-only-p) *base-strings-only*))
+
 (defun %string32-on-p ()
   "Does this build make #x15 strings (and so emit their arms)?  The AOT build
    says so with *NARROW-LITERALS-P* and *STRING32-P*; in-image,
@@ -27557,6 +27568,9 @@
    32-bit strings (%STRING32-ON-P), a call to %MAKE-STRING32.
    GC-check before each alloc (overshoot-past-R14 hazard; see
    compile-make-bignum)."
+  (when (%base-strings-on-p)
+    (return-from compile-make-string-array
+      (compile-form `(%make-base-string ,size-form) env dest)))
   (if (%string32-on-p)
       (return-from compile-make-string-array
         (compile-form `(%make-string32 ,size-form) env dest)))

@@ -3287,13 +3287,19 @@
       ;; The fresh array is a plain #x31 string: store the code words
       ;; directly (ASET dispatched on the array type per character).
       ;; (a 32-bit #x15 string in a narrow-strings build: a u32 a code)
-      (if (%prim-string32-p s)
-          (loop (when (>= i size) (return s))
-            (%c32-set s i ch)
-            (setq i (+ i 1)))
-          (loop (when (>= i size) (return s))
-            (%word-aset s i ch)
-            (setq i (+ i 1)))))))
+      (cond ((%prim-string32-p s)
+             (loop (when (>= i size) (return s))
+               (%c32-set s i ch)
+               (setq i (+ i 1))))
+            ;; a narrow string (*BASE-STRINGS-ONLY*): a checked byte store
+            ((%prim-base-string-p s)
+             (loop (when (>= i size) (return s))
+               (%base-string-set s i ch)
+               (setq i (+ i 1))))
+            (t
+             (loop (when (>= i size) (return s))
+               (%word-aset s i ch)
+               (setq i (+ i 1))))))))
 
 
 ;;; Numeric

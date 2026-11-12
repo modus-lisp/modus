@@ -3175,7 +3175,12 @@
                      ;; but not 32-bit strings: compiler.lisp *STRING32-P*
                      "(defun %string32-strings-p () nil)" (string #\Newline)
                      ;; and SUBSEQ of a narrow string is narrow (prelude)
-                     "(defun %base-subseq-p () t)" (string #\Newline)))
+                     "(defun %base-subseq-p () t)" (string #\Newline)
+                     ;; and every fresh string is narrow (compiler.lisp *BASE-STRINGS-ONLY*)
+                     (if (equal (sb-ext:posix-getenv "MODUS_68K_WIDE_STRINGS") "1")
+                         ""
+                         "(defun %base-strings-only-p () t)")
+                     (string #\Newline)))
   (defparameter cl-user::*68k-pool-narrow* t))
 
 ;;; :MAC68K'S KERNEL PROLOGUE: the banner only.  The 32-bit prologue it shared
@@ -3485,7 +3490,11 @@
       (let ((v (sb-ext:posix-getenv "MODUS_68K_NARROW_LITERALS")))
         (unless (and v (string= v "0"))
           (setf (symbol-value (sym "*NARROW-LITERALS-P*")) t)
-          (setf (symbol-value (sym "*STRING32-P*")) nil))))
+          (setf (symbol-value (sym "*STRING32-P*")) nil)
+          ;; no wide strings at all: a Mac's text is 8-bit (MODUS_68K_WIDE_STRINGS=1 keeps them)
+          (let ((w (sb-ext:posix-getenv "MODUS_68K_WIDE_STRINGS")))
+            (unless (and w (string= w "1"))
+              (setf (symbol-value (sym "*BASE-STRINGS-ONLY*")) t))))))
     (let ((v (sb-ext:posix-getenv "MODUS_68K_THREADED")))
       (when (and v (string/= v "0"))
         (setf (symbol-value (sym "*68K-THREADED*")) :all

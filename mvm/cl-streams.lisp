@@ -242,17 +242,25 @@
             ;; The codes into the fresh plain string's words (ASET dispatched
             ;; on the array type per character).
             ;; a narrow-strings build makes 32-bit (#x15) strings: a u32 a code
-            (if (%prim-string32-p s)
-                (loop
-                  (when (null cur) (return s))
-                  (%c32-set s i (car cur))
-                  (setq cur (cdr cur))
-                  (setq i (- i 1)))
-                (loop
-                  (when (null cur) (return s))
-                  (%word-aset s i (car cur))
-                  (setq cur (cdr cur))
-                  (setq i (- i 1))))))))))
+            (cond ((%prim-string32-p s)
+                   (loop
+                     (when (null cur) (return s))
+                     (%c32-set s i (car cur))
+                     (setq cur (cdr cur))
+                     (setq i (- i 1))))
+                  ;; a narrow string (*BASE-STRINGS-ONLY*): a checked byte store
+                  ((%prim-base-string-p s)
+                   (loop
+                     (when (null cur) (return s))
+                     (%base-string-set s i (car cur))
+                     (setq cur (cdr cur))
+                     (setq i (- i 1))))
+                  (t
+                   (loop
+                     (when (null cur) (return s))
+                     (%word-aset s i (car cur))
+                     (setq cur (cdr cur))
+                     (setq i (- i 1)))))))))))
 
 (defun %sis-normalize-string (str)
   "Coerce STR (which may be a fill-pointer / displaced / adjustable wrapper

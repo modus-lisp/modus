@@ -3208,6 +3208,21 @@
   "MODUS_SMALL_IMAGE's rule, read before build-cli-common defines *SMALL-IMAGE*."
   (let ((s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
     (and s (plusp (length s)) (not (string= s "0")))))
+;;; :MAC68K: COLD NAMES (mvm/mac68k-cold.lisp): with the saved core, the names
+;;; *SYM-NAME-TABLE* holds are also written to IMAGE.cold, which mac68k-core.py
+;;; puts on the core's disk, and the core run drops the table (430 KB of a
+;;; Classic's static heap).  Follows the static heap; MODUS_MAC68K_COLD_NAMES=0
+;;; keeps the table.
+(defvar *mac-cold-names-out*
+  (and *cl-repl-mac68k-p*
+       (let ((v (sb-ext:posix-getenv "MODUS_MAC68K_COLD_NAMES"))
+             (gs (sb-ext:posix-getenv "MODUS_68K_GC_STATIC")))
+         (and (not (equal v "0"))
+              (cond ((null gs) (%mac68k-small-image-env-p)) ((string= gs "0") nil) (t t))
+              (concatenate 'string (or (sb-ext:posix-getenv "MODUS_CL_REPL_OUT")
+                                       "/tmp/modus-mac68k-cl-repl.bin")
+                           ".cold")))))
+
 ;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
 ;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
 ;;; to switch them off in, no sockets or threads for them to wrap, and the text
@@ -3230,6 +3245,8 @@
       (loop for i = (search (car p) text) while i
             do (setq text (concatenate 'string (subseq text 0 i) (cdr p)
                                        (subseq text (+ i (length (car p))))))))
+    (when *mac-cold-names-out*
+      (setq text (concatenate 'string text (string #\Newline) (mvm-text "mvm/mac68k-cold.lisp"))))
     (setq *cli-arch-override-source*
           (concatenate 'string *cli-arch-override-source* (string #\Newline) text "
 ;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.py).
@@ -3274,7 +3291,20 @@
     (unless at (error "mac68k: E2SMOKE-END moved out of *CLI-ARCH-KERNEL-EPILOGUE*"))
     (setq *cli-arch-kernel-epilogue*
           (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 (+ at (length k)))
-                       "  (%gc-static-freeze)
+                       "  ;; boot's own compiled forms (E2SMOKE) are not worth 66 KB of a
+  ;; Classic's static heap: the cache refills from the REPL's forms
+  (setq *mvm-eval-cache* nil)
+  ;; one string per name across the function and name tables (mvm-eval.lisp)
+  (compact-names)
+"
+                       (if *mac-cold-names-out* "  (%cold-names-drop)
+" "")
+                       "  ;; the closure-environment slot (translate-68k M68K-CENV-ADDR, the
+  ;; hosted convention block at #x10000A00) still holds the LAST closure's
+  ;; environment -- COMPACT-NAMES' MAPHASH lambda, over its 12,000-name table:
+  ;; measured, 400 KB the freeze kept.  No closure runs here.
+  (setf (mem-ref #x10000A08 :u32) 0)
+  (%gc-static-freeze)
   (when (eql (mem-ref #x1000602C :u32) 1) (%mac-send-core))
 "
                        (subseq *cli-arch-kernel-epilogue* (+ at (length k))))))

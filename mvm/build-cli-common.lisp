@@ -3014,6 +3014,52 @@
       (emit-sym-name-auto-packed *all-symbol-names*)
       (emit-sym-name-auto *all-symbol-names* 200)))
 
+;;; COLD NAMES (the bare Mac, CL-USER::*MAC-COLD-NAMES-OUT*): the same names,
+;;; also written to a file of 512-byte pages, sorted by name hash -- each entry
+;;; the hash (4 bytes, big-endian), the name's length (1) and its bytes; a page
+;;; ends at a zero hash -- which scripts/mac68k-core.py puts on the disk after
+;;; the code streams.  The image gets each page's first hash (%COLD-NAMES-INDEX,
+;;; 8 hex digits a page) and the hash of "CAR" as the build computed it
+;;; (%COLD-NAMES-CHECK), so SYMBOL-NAME can read a name from disk once the core
+;;; has dropped *SYM-NAME-TABLE* (mac68k-cold.lisp).
+(when (and (boundp 'cl-user::*mac-cold-names-out*) cl-user::*mac-cold-names-out*)
+  (let ((h (make-hash-table)))
+    ;; the table's own rule: a later name with the same hash replaces an earlier
+    (dolist (nm *all-symbol-names*)
+      (when (and (plusp (length nm)) (< (length nm) 256)
+                 (every (lambda (c) (< (char-code c) 256)) nm))
+        (setf (gethash (modus.mvm::compute-name-hash nm) h) nm)))
+    (let ((entries (sort (loop for k being the hash-keys of h using (hash-value v) collect (cons k v))
+                         #'< :key #'car))
+          (pages nil) (page (make-array 512 :element-type '(unsigned-byte 8) :initial-element 0))
+          (fill 0) (firsts nil))
+      (flet ((flush ()
+               (when (plusp fill) (push page pages)
+                 (setq page (make-array 512 :element-type '(unsigned-byte 8) :initial-element 0)
+                       fill 0))))
+        (dolist (e entries)
+          (let ((need (+ 5 (length (cdr e)))))
+            (when (> (+ fill need 4) 512) (flush))
+            (when (zerop fill) (push (car e) firsts))
+            (let ((k (car e)))
+              (setf (aref page fill) (ldb (byte 8 24) k) (aref page (+ fill 1)) (ldb (byte 8 16) k)
+                    (aref page (+ fill 2)) (ldb (byte 8 8) k) (aref page (+ fill 3)) (ldb (byte 8 0) k)
+                    (aref page (+ fill 4)) (length (cdr e))))
+            (loop for c across (cdr e) for j from (+ fill 5) do (setf (aref page j) (char-code c)))
+            (incf fill need)))
+        (flush))
+      (with-open-file (o cl-user::*mac-cold-names-out* :direction :output :if-exists :supersede
+                                                       :element-type '(unsigned-byte 8))
+        (dolist (pg (reverse pages)) (write-sequence pg o)))
+      (format t "~&;; cold names: ~D names in ~D pages (~D KB) -> ~A~%"
+              (length entries) (length pages) (ceiling (* 512 (length pages)) 1024)
+              cl-user::*mac-cold-names-out*)
+      (setq *sym-name-auto-source*
+            (concatenate 'string *sym-name-auto-source*
+                         (format nil "(defun %cold-names-index () ~S)~%(defun %cold-names-check () ~D)~%"
+                                 (format nil "~{~8,'0X~}" (reverse firsts))
+                                 (modus.mvm::compute-name-hash "CAR")))))))
+
 ;; Macro table — extract every (mvm-define-macro NAME ...) from
 ;; compiler.lisp at build time so runtime macroexpand-1 can see them.
 

@@ -203,7 +203,18 @@ def main(image, disk):
     table, cnt, section = struct.unpack_from('>III', chunk, k + 8)
     struct.pack_into('>I', chunk, k + 20, (section - stream_disk) & 0xFFFFFFFF)  # disk bias (SUB.L wraps)
     set_flag(chunk, 'core', 1)
-    md.write_disk(bytes(chunk) + bytes(streams), disk, LOAD, read_len=len(chunk))
+    # 3. COLD NAMES (mvm/mac68k-cold.lisp): IMAGE.cold, when the build wrote one,
+    # on a block boundary after the streams; the static block's #x6044 says where
+    tail = bytes(streams)
+    cold_path = image + '.cold'
+    if os.path.exists(cold_path):
+        cold = open(cold_path, 'rb').read()
+        pad = (-(stream_disk + len(tail))) % 512
+        cold_disk = stream_disk + len(tail) + pad
+        tail += bytes(pad) + cold
+        struct.pack_into('>I', chunk, REGION - LOAD + 0x6044, cold_disk)
+        print('mac68k-core: cold names: %d bytes at disk byte %d' % (len(cold), cold_disk))
+    md.write_disk(bytes(chunk) + tail, disk, LOAD, read_len=len(chunk))
     print('mac68k-core: %s: boot reads %d bytes (image %d, static %d, low block %d); %d streams '
           '(%d bytes) on demand from disk byte %d'
           % (disk, len(chunk), resident, len(objs) + len(conses), LOW_BLOCK, cnt,

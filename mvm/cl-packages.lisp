@@ -155,7 +155,8 @@
       ((and cached (stringp cached) (> (length cached) 0)) cached)
       (t
        (let ((tab (and (boundp '*sym-name-table*) *sym-name-table*)))
-         (let ((found (and tab (gethash (aref sym 0) tab))))
+         (let ((found (or (and tab (gethash (aref sym 0) tab))
+                          (%cold-sym-name (aref sym 0)))))
            (cond
              ((and found (stringp found))
               (aset sym 2 found)
@@ -1004,6 +1005,11 @@
 ;; syms (#x50, hash-only) that aren't in any package symbol table.
 (defvar *sym-name-table* nil)
 
+;; The name for hash H that *SYM-NAME-TABLE* would have given, from wherever an
+;; image keeps them instead (the bare Mac: on disk, mvm/mac68k-cold.lisp).
+(declaim (overridable %cold-sym-name))
+(defun %cold-sym-name (h) h nil)
+
 (defun %keyword-key (name-str)
   "The keyword table key for NAME-STR.  The name hash folds case (the whole
    compiler relies on that), and the keyword table is keyed by the hash alone,
@@ -1064,7 +1070,9 @@
      (let ((h (aref sym 0)))
        ;; First try the build-time reverse table — covers symbols that
        ;; appear ANYWHERE in the source tree (defuns, quoted refs, etc.).
-       (let ((nm (and *sym-name-table* (gethash h *sym-name-table*))))
+       (let ((nm (or (and *sym-name-table* (gethash h *sym-name-table*))
+                     ;; where the table was dropped, its names on disk
+                     (%cold-sym-name h))))
          (cond
            (nm nm)
            (t

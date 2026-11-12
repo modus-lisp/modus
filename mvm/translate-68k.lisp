@@ -1782,6 +1782,28 @@
             (m68k-emit-bsr-long buf *68k-mac-getc-label*)
             (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
             (m68k-emit-lsl-imm buf +68k-d2+ 1))
+           ((and (= code #x0502) *68k-mac-mode*)
+            ;; SYSCALL3 on a bare Mac is a Mac SERVICE: V0 the service, V1..V3
+            ;; its arguments, all TAGGED; the result TAGGED in V0.  Service 1:
+            ;; read V3 bytes from disk byte V1 of the boot drive to address V2
+            ;; (M68K-EMIT-MAC-SERVICE).  Any other: -1.
+            (let ((other (mvm-make-label)) (out (mvm-make-label)))
+              (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)
+              (m68k-emit-cmpi buf +68k-d0+ 1)
+              (m68k-emit-bne buf other)
+              (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
+              (m68k-emit-asr-imm buf +68k-d1+ 1)
+              (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d2+)
+              (m68k-emit-asr-imm buf +68k-d2+ 1)
+              (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d3+)
+              (m68k-emit-asr-imm buf +68k-d3+ 1)
+              (m68k-emit-bsr-long buf *68k-mac-service-label*)
+              (m68k-emit-bra buf out)
+              (m68k-emit-label buf other)
+              (m68k-emit-move-imm-dn buf -1 +68k-d2+)
+              (m68k-emit-label buf out)
+              (m68k-emit-lsl-imm buf +68k-d2+ 1)))
            ((and (= code #x0310) *68k-mac-mode*)
             ;; the clock: Ticks ($16A), the ROM's 60 Hz count, TAGGED
             (m68k-emit-word buf #x2438) (m68k-emit-word buf #x016A)   ; MOVE.L $16A.W,D2
@@ -3349,6 +3371,9 @@
    putc (M68K-EMIT-MAC-CONSOLE).")
 (defvar *68k-mac-getc-label* nil
   "... and of its getc, 21 words on.")
+(defvar *68k-mac-service-label* nil
+  "... and of the disk-read service SYSCALL3 reaches on a bare Mac
+   (M68K-EMIT-MAC-SERVICE).")
 
 (defparameter +68k-mac-console-code+
   #(#x48E7 #x6040 #x13C0 #x1000 #x9100 #x41F9 #x1000 #x9000 #x217C #x1000 #x9100
@@ -3419,6 +3444,47 @@
     (loop for w across code for i from 0
           do (when (= i 21) (m68k-emit-label buf *68k-mac-getc-label*))
              (m68k-emit-word buf w))))
+
+(defun m68k-emit-mac-service (buf)
+  "The bare Mac's disk service, at *68K-MAC-SERVICE-LABEL*: read D2 bytes from
+   byte D1 of the boot drive into D3 (both multiples of 512: the SCSI driver
+   reads whole blocks), the way the code loader reads a stream -- the boot
+   drive's drive-queue element (BootDrive $210, DrvQHdr $30A), then _Read from
+   the start.  D2 = 0, or the _Read error, or -1 when there is no boot drive.
+   Keeps D4-D7 and every address register; _Read itself may clobber D0-D2."
+  (flet ((ws (&rest words) (dolist (w words) (m68k-emit-word buf w))))
+    (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label))
+          (fail (mvm-make-label)) (done (mvm-make-label)) (pb (mvm-make-label)))
+      (m68k-emit-label buf *68k-mac-service-label*)
+      (ws #x48E7 #x0FFA)                                 ; MOVEM.L D4-D7/A0-A4/A6,-(SP)
+      (ws #x3838 #x0210 #x2678 #x030A)                   ; D4 = BootDrive; A3 = DrvQHdr.qHead
+      (m68k-emit-label buf dq)
+      (ws #x200B) (m68k-emit-beq buf fail)               ; end of the queue
+      (ws #xB86B #x0006) (m68k-emit-beq buf found)       ; CMP.W 6(A3),D4: dQDrive
+      (ws #x2653) (m68k-emit-bra buf dq)                 ; A3 = qLink
+      (m68k-emit-label buf found)
+      (m68k-emit-lea-label buf pb +68k-a0+)
+      (ws #x7013)                                        ; MOVEQ #19,D0
+      (m68k-emit-label buf zl)
+      (ws #x4298)                                        ; CLR.L (A0)+
+      (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
+      (m68k-emit-lea-label buf pb +68k-a0+)
+      (ws #x316B #x0006 #x0016)                          ; ioVRefNum = dQDrive
+      (ws #x316B #x0008 #x0018)                          ; ioRefNum = dQRefNum
+      (ws #x2143 #x0020)                                 ; ioBuffer = D3
+      (ws #x2142 #x0024)                                 ; ioReqCount = D2
+      (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart
+      (ws #x2141 #x002E)                                 ; ioPosOffset = D1
+      (ws #xA002)                                        ; _Read
+      (ws #x48C0 #x2400)                                 ; EXT.L D0; D2 = the result
+      (m68k-emit-bra buf done)
+      (m68k-emit-label buf fail)
+      (ws #x74FF)                                        ; MOVEQ #-1,D2
+      (m68k-emit-label buf done)
+      (ws #x4CDF #x5FF0)                                 ; MOVEM.L (SP)+,D4-D7/A0-A4/A6
+      (ws #x4E75)                                        ; RTS
+      (m68k-emit-label buf pb)                           ; the parameter block (80 bytes)
+      (dotimes (i 40) (ws 0)))))
 
 (defun m68k-emit-mac-putc (buf)
   "D0.B to the Mac's serial console (D0/A0 clobbered)."
@@ -4495,6 +4561,7 @@
          (*68k-gc-label* (and (m68k-hosted-layout-p) (mvm-make-label)))
          (*68k-mac-console-label* (and *68k-mac-mode* (mvm-make-label)))
          (*68k-mac-getc-label* (and *68k-mac-mode* (mvm-make-label)))
+         (*68k-mac-service-label* (and *68k-mac-mode* (mvm-make-label)))
          (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-car-label* (and *68k-shared-sequences* (mvm-make-label)))
@@ -4678,6 +4745,8 @@
       (m68k-emit-gc-collector buf))
     (when *68k-mac-console-label*
       (m68k-emit-mac-console buf))
+    (when *68k-mac-service-label*
+      (m68k-emit-mac-service buf))
     (when *68k-cons-label*
       (m68k-emit-cons-helper buf))
     (when *68k-subtag-label*

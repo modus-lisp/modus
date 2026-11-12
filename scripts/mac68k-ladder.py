@@ -16,6 +16,10 @@ Environment:
                     display (Basilisk's GTK insists) -- a wrapper that starts an
                     Xvfb is the usual answer on a headless box.
   MAC68K_FPU        "false" (default: a 68LC040) or "true" (a 68040).
+  MAC68K_JIT        "true": Basilisk's JIT, ~8x faster.  Debian's
+                    BasiliskII-jit is a PIE and its JIT truncates addresses;
+                    relink it low first (scripts/basilisk-unpie.py) and run it
+                    with MALLOC_MMAP_MAX_=0.
   MAC68K_LADDER_JOBS  cells at once (default 4).
 
 The rules are hosted-ladder.py's: a deliberately wrong expectation runs first
@@ -53,6 +57,7 @@ def boot(disk, nbytes, timeout=90):
         "--nogui", "true", "--rom", os.environ["MAC68K_ROM"],
         "--cpu", "4", "--fpu", os.environ.get("MAC68K_FPU", "false"),
         "--ramsize", str(32 << 20),
+        "--jit", os.environ.get("MAC68K_JIT", "false"), "--jitcachesize", "16384",
         "--disk", disk, "--seriala", os.ttyname(slave)]
     p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True)

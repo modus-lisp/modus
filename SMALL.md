@@ -207,10 +207,20 @@ boot blocks read loader + stream to `#x01200000`, the loader unpacks to
 `#x00100000`, pushes the 68040's caches (`CPUSHA BC`: the image was written
 as data) and jumps.  No trim needed: the small REPL image (5,557,396 bytes,
 framebuffer console included) is 1,222,613 bytes of LZMA + a 13 KB loader, a
-1.44 MB floppy with 237 KB to spare.  On Basilisk II (LC 475 ROM, 68LC040, no
-JIT, 32 MB), measured: unpacking takes ~58 s, then the image boots exactly as
-from an uncompressed disk (prompt at ~143 s vs ~85 s), from `--floppy` and from
-`--disk` alike.
+1.44 MB floppy with 237 KB to spare.  Measured on Basilisk II (LC 475 ROM,
+68LC040, 32 MB), prompt at:
+
+| | interpreted | JIT |
+|---|---|---|
+| uncompressed disk | 85.3 s | 11.5 s |
+| compressed, `--disk` | 143.4 s | -- |
+| compressed, `--floppy` | 142.8 s | 13.6 s |
+
+Unpacking is the difference: ~58 s interpreted, ~2 s under the JIT.  Debian's
+`BasiliskII-jit` crashes before the ROM loads (any disk, System 7.5.3 too): it
+is a PIE and its JIT bakes 32-bit absolute addresses of its globals and heap.
+`scripts/basilisk-unpie.py` relinks it at `#x10000000`; run it with
+`MALLOC_MMAP_MAX_=0` so every `malloc` comes from the (now low) brk heap.
 
 ## Plan
 

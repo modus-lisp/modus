@@ -1078,7 +1078,37 @@ struct elf64_ehdr { unsigned char ident[16]; uint16_t type, machine; uint32_t ve
                     phnum, shentsize, shnum, shstrndx; };
 struct elf64_phdr { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz, memsz, align; };
 
+#if TARGET_OS_IPHONE && !TARGET_OS_WATCH
+// A launch from the home screen has no console: stderr goes nowhere, and every
+// startup failure below is a message on stderr and an _exit -- no crash report,
+// the app just closes.  So, with no terminal on stderr, stdout and stderr append
+// to Documents/modus.log, which the Files app shows (UIFileSharingEnabled):
+// On My iPhone > modus > modus.log.  Truncated past 1 MB; a dated line per launch.
+static void log_to_documents(void) {
+    if (isatty(2)) return;
+    const char *home = getenv("HOME");
+    if (!home) return;
+    char path[1024];
+    snprintf(path, sizeof path, "%s/Documents/modus.log", home);
+    struct stat st;
+    int flags = O_WRONLY | O_CREAT | O_APPEND;
+    if (stat(path, &st) == 0 && st.st_size > (1 << 20)) flags |= O_TRUNC;
+    int fd = open(path, flags, 0644);
+    if (fd < 0) return;
+    dup2(fd, 1); dup2(fd, 2); close(fd);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    time_t now = time(NULL);
+    char when[64];
+    strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(stderr, "\n---- modus launch %s ----\n", when);
+}
+#endif
+
 int main(int argc, char **argv, char **envp) {
+#if TARGET_OS_IPHONE && !TARGET_OS_WATCH
+    log_to_documents();
+#endif
     unsigned long size = 0;
     // IN PLACE (docs/macos-hosting.md, "Running in place"): a PC-relative
     // image linked into its own segments (host/macos/image-segments.sh) runs

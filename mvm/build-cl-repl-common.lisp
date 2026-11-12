@@ -3171,7 +3171,11 @@
              (and v (> (length v) 0) (string/= v "0"))))
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source*
-                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)))
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)
+                     ;; but not 32-bit strings: compiler.lisp *STRING32-P*
+                     "(defun %string32-strings-p () nil)" (string #\Newline)
+                     ;; and SUBSEQ of a narrow string is narrow (prelude)
+                     "(defun %base-subseq-p () t)" (string #\Newline)))
   (defparameter cl-user::*68k-pool-narrow* t))
 
 ;;; :MAC68K'S KERNEL PROLOGUE: the banner only.  The 32-bit prologue it shared
@@ -3199,6 +3203,14 @@
   "MODUS_SMALL_IMAGE's rule, read before build-cli-common defines *SMALL-IMAGE*."
   (let ((s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
     (and s (plusp (length s)) (not (string= s "0")))))
+;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
+;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
+;;; to switch them off in, no sockets or threads for them to wrap, and the text
+;;; was 440 KB of the image's constant pool.  MODUS_NO_SURFACES=0 keeps them.
+(defvar *no-surfaces*
+  (let ((v (sb-ext:posix-getenv "MODUS_NO_SURFACES")))
+    (cond ((null v) (and *cl-repl-mac68k-p* (%mac68k-small-image-env-p)))
+          ((string= v "0") nil) (t t))))
 (defvar *mac68k-gc-static*
   (and *cl-repl-mac68k-p*
        (let ((v (sb-ext:posix-getenv "MODUS_68K_GC_STATIC")))
@@ -3462,7 +3474,18 @@
           (symbol-value (sym "*68K-TAGS3*")) (knob "MODUS_68K_TAGS3")
           (symbol-value (sym "*68K-GC-STATIC*")) (and cl-user::*mac68k-gc-static* t))
     (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
-      (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t))
+      (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t)
+      ;; ... and its AOT string literals narrow, as MODUS_NARROW_STRINGS does on
+      ;; the x64 CLI (compiler.lisp *NARROW-LITERALS-P*): a literal is pooled
+      ;; once, narrow, and each evaluation is a %FRESH-STRING of it.  Without it
+      ;; every literal under 256 characters was built a character at a time in
+      ;; native code, and came out a wide (#x31) string -- most of the static
+      ;; heap's 155 KB of them.  The 68k collector sizes #x13 as bytes.
+      ;; MODUS_68K_NARROW_LITERALS=0 is the old way.
+      (let ((v (sb-ext:posix-getenv "MODUS_68K_NARROW_LITERALS")))
+        (unless (and v (string= v "0"))
+          (setf (symbol-value (sym "*NARROW-LITERALS-P*")) t)
+          (setf (symbol-value (sym "*STRING32-P*")) nil))))
     (let ((v (sb-ext:posix-getenv "MODUS_68K_THREADED")))
       (when (and v (string/= v "0"))
         (setf (symbol-value (sym "*68K-THREADED*")) :all
@@ -3475,11 +3498,12 @@
                       do (let ((n (string-trim " " l)))
                            (when (plusp (length n)) (setf (gethash n h) t)))))
               (setf (symbol-value (sym "*68K-HOT-NAMES*")) h))))))
-    (format t "~&;; mac68k:~@[ gc-static~*~]~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~%"
+    (format t "~&;; mac68k:~@[ gc-static~*~]~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~@[ narrow-literals~*~]~%"
             (symbol-value (sym "*68K-GC-STATIC*"))
             (symbol-value (sym "*68K-TAGS3*")) (symbol-value (sym "*68K-THREADED*"))
             (symbol-value (sym "*68K-A5-GLOBALS*")) (symbol-value (sym "*68K-RELAX-BRANCHES*"))
-            (symbol-value (sym "*POOL-NARROW-STRINGS*")))))
+            (symbol-value (sym "*POOL-NARROW-STRINGS*"))
+            (symbol-value (sym "*NARROW-LITERALS-P*")))))
 
 (when cl-user::*cl-repl-arm32-p*
   (cl-user::mvm-load "boot/boot-linux-arm32.lisp")

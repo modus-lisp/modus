@@ -127,6 +127,19 @@
 (when *small-image*
   (format t "~&;; MODUS_SMALL_IMAGE: boot tables from packed text, no ansi-test-aux~%"))
 (defvar *cli-omit-ansi-test-aux* *small-image*)
+;;; MODUS_NO_SURFACES=1: the Genera, SBCL (SB-THREAD, SB-BSD-SOCKETS, gray
+;;; streams, SB-MOP) and ASDF surfaces are left out at BUILD time -- their
+;;; baked source text (~440 KB of literals) and the cooperative atomics with
+;;; them -- and %SURFACE-OFF-P answers T, as MODUS_NO_GENERA / _SB / _ASDF all
+;;; set at once would at run time.  For an image with no environment to set
+;;; them in and no room for the text (the Mac Classic; a 1 MB machine cannot
+;;; hold the source of a socket shim it has no network for).  Off by default
+;;; => every existing build is byte-identical.
+(defvar *no-surfaces*
+  (let ((v (sb-ext:posix-getenv "MODUS_NO_SURFACES")))
+    (and v (plusp (length v)) (not (string= v "0")))))
+(when *no-surfaces*
+  (format t "~&;; MODUS_NO_SURFACES: no Genera / SB-* / gray-streams / ASDF surface source~%"))
 
 ;;; MODUS_NO_COMPILER=1: no compiler in the image -- no ISA, bytecode
 ;;; interpreter, compiler, mvm-eval, FASL cache, opcode table or stage
@@ -192,6 +205,30 @@
   (if (eql modus.mvm::+target-soft-float+ 1) (mvm-text "mvm/softfloat.lisp") ""))
 
 (defvar *prelude-source*  (mvm-text "mvm/prelude.lisp"))
+;;; MODUS_SMALL_IMAGE resizes a few fixed allocations by rewriting their
+;;; literals in the source text: (%SMALL-RESIZE TEXT PATTERN OLD NEW) replaces
+;;; OLD with NEW inside every occurrence of PATTERN, and fails the build when
+;;; there is none (the source moved; the resize must not silently lapse).
+(defun %small-resize (text pat old new)
+  (let ((n 0) (k (search old pat)) (repl nil))
+    (unless k (error "%SMALL-RESIZE: ~S is not in ~S" old pat))
+    (setq repl (concatenate 'string (subseq pat 0 k) new (subseq pat (+ k (length old)))))
+    (loop for at = (search pat text) while at
+          do (setq text (concatenate 'string (subseq text 0 at) repl
+                                     (subseq text (+ at (length pat)))))
+             (incf n))
+    (when (zerop n) (error "MODUS_SMALL_IMAGE: ~S is no longer in the source it resizes" pat))
+    text))
+
+;; MODUS_SMALL_IMAGE: a global-cell cache of 1024 slots, not 16384 (compiler.lisp
+;; *GV-CACHE-SLOTS*, set below): the Mac Classic build assigns 595, and the
+;; vector was 64 KB of its static heap.  Names past the last slot keep the
+;; uncached read.
+(defvar *small-gv-cache-slots* 1024)
+(when *small-image*
+  (dolist (pat '("(make-array 16384)" "(>= %gv-i 16384)"))
+    (setq *prelude-source*
+          (%small-resize *prelude-source* pat "16384" (princ-to-string *small-gv-cache-slots*)))))
 (defvar *gc-source*       (mvm-text "mvm/gc.lisp"))
 ;;; NATIVE BULK MEMORY (mvm/native-bulk.lisp): REPLACE / FILL's four inner loops
 ;;; as BULK-MOVE / BULK-FILL instructions -- only where the translator has them,
@@ -277,6 +314,13 @@
 ;; mvm-eval.lisp's `\"` extraction damage until the flip wave-3 fidelity fix
 ;; (77cea7c) repaired it; the file is now clean, directly mvm-text-readable.
 (defvar *mvm-eval-canonical-source* (mvm-text "mvm/mvm-eval.lisp"))
+;; MODUS_SMALL_IMAGE: mvm-eval's bytecode buffers start at 4 KB, not 64 KB
+;; (MVM-EMIT-BYTE grows them): two of them were 128 KB of the Mac's static heap.
+(when *small-image*
+  (setq *mvm-eval-canonical-source*
+        (%small-resize *mvm-eval-canonical-source*
+                       "(make-mvm-buffer :bytes (make-array 65536 :element-type '(unsigned-byte 8)))"
+                       "65536" "4096")))
 
 ;;; The FASL cache (mvm/fasl.lisp), and its COMPILER FINGERPRINT: a hash of the
 ;;; sources that decide what bytecode a form compiles to -- the ISA, the
@@ -1081,19 +1125,19 @@
   (with-output-to-string (s)
    (if cl-user::*small-image*
     ;; MODUS_SMALL_IMAGE: the table as one text literal (a pooled constant), a
-    ;; line an opcode -- "CODE NAME OPERAND... <tab> DESCRIPTION" -- parsed at
+    ;; line an opcode -- "CODE NAME OPERAND... <tab>", no description -- parsed at
     ;; boot, instead of a SETF and a MAKE-OPCODE-INFO with its description built
     ;; a character at a time for each.  Names and operands are keywords: INTERN
     ;; returns the static keyword objects, seeded before the globals' thunks run.
     (let ((lines nil))
       (maphash (lambda (code info)
-                 (let ((d (modus.mvm::opcode-info-description info)))
-                   (when (or (find #\Tab d) (find #\Newline d))
-                     (error "opcode ~D: description holds a tab or newline" code))
-                   (push (format nil "~D ~A~{ ~A~}~C~A" code
+                 (progn
+                   ;; no description: nothing in an image reads one, and their
+                   ;; em dashes kept this whole literal wide (4 bytes a char)
+                   (push (format nil "~D ~A~{ ~A~}~C" code
                                  (symbol-name (modus.mvm::opcode-info-name info))
                                  (mapcar #'symbol-name (modus.mvm::opcode-info-operands info))
-                                 #\Tab d)
+                                 #\Tab)
                          lines)))
                modus.mvm::*opcode-table*)
       (format s "(defun %populate-opcode-table ()
@@ -1116,7 +1160,7 @@
                                     :name (intern (car (cdr words)) \"KEYWORD\")
                                     :operands (mapcar (lambda (w) (intern w \"KEYWORD\"))
                                                       (cdr (cdr words)))
-                                    :description (subseq text (+ tab 1) e))))
+                                    :description nil)))
           (setq i (+ e 1)))))))~%" (format nil "~{~A~^~%~}" (nreverse lines)))
       (format s "(defparameter *%opcode-table-ready* (progn (%populate-opcode-table) t))~%"))
    (progn
@@ -1976,7 +2020,7 @@
                    (t (write-char c out))))))
 
 (defvar *genera-compat-text*
-  (read-file-text (merge-pathnames "net/genera-compat.lisp" *modus-base*)))
+  (if cl-user::*no-surfaces* "" (read-file-text (merge-pathnames "net/genera-compat.lisp" *modus-base*))))
 
 ;;; The cooperative atomics are installed EAGERLY even though the Genera layer
 ;;; is installed on demand (*DEFERRED-SURFACES-SOURCE*): %ATOMIC-INCF and
@@ -1986,7 +2030,7 @@
 ;;; did exactly that (9 of 31).  They were always evaluated first, ahead of
 ;;; genera-compat.lisp; they still are, just at boot and on their own.
 (defvar *cooperative-atomics-text*
-  (read-file-text (merge-pathnames "net/cooperative-atomics.lisp" *modus-base*)))
+  (if cl-user::*no-surfaces* "" (read-file-text (merge-pathnames "net/cooperative-atomics.lisp" *modus-base*))))
 
 (defvar *genera-source*
   (concatenate 'string "
@@ -2043,6 +2087,7 @@
 ;;; ============================================================
 
 (defvar *sb-shim-text*
+  (if cl-user::*no-surfaces* ""
   (concatenate 'string
                (read-file-text (merge-pathnames "net/sb-thread-shim.lisp"
                                                 *modus-base*))
@@ -2067,7 +2112,7 @@
                ;; define, but it does read modus's CLOS internals (%FIND-CLOS-CLASS, %GF-METHODS),
                ;; so it wants the image fully up.  Rides MODUS_NO_SB with the others.
                (read-file-text (merge-pathnames "net/sb-mop-shim.lisp"
-                                                *modus-base*))))
+                                                *modus-base*)))))
 
 (defvar *sb-shim-source*
   (concatenate 'string "
@@ -2091,7 +2136,7 @@
 ;;; GRAY STREAMS: baked like the shims above but evaluated ON DEMAND, not at
 ;;; boot (net/sb-gray-shim.lisp's header has the measurement).
 (defvar *sb-gray-text*
-  (read-file-text (merge-pathnames "net/sb-gray-shim.lisp" *modus-base*)))
+  (if cl-user::*no-surfaces* "" (read-file-text (merge-pathnames "net/sb-gray-shim.lisp" *modus-base*))))
 
 ;;; %IGNORE-SIGPIPE's source, per port: the rt_sigaction number is the
 ;;; ARCH's (x86-64 13, AArch64/RISC-V 134, i386/ARM EABI 174), and the struct
@@ -2218,7 +2263,7 @@
 ;;; ============================================================
 
 (defvar *asdf-interface-text*
-  (read-file-text (merge-pathnames "net/asdf-interface.lisp" *modus-base*)))
+  (if cl-user::*no-surfaces* "" (read-file-text (merge-pathnames "net/asdf-interface.lisp" *modus-base*))))
 
 (defvar *asdf-source*
   (concatenate 'string "
@@ -2460,6 +2505,18 @@
 (defun modus::condition-backtrace-list (&rest a) (%sb-autoload 'modus::condition-backtrace-list a))
 \")
 ")
+
+;; MODUS_NO_SURFACES: every surface is off whatever the environment says.
+(when cl-user::*no-surfaces*
+  (let* ((old "(defun %surface-off-p (var)
+  (let ((off (%cli-getenv var)))
+    (and off (> (length off) 0) (not (string= off \"0\")))))")
+         (at (search old *deferred-surfaces-source*)))
+    (unless at (error "MODUS_NO_SURFACES: %SURFACE-OFF-P moved in *DEFERRED-SURFACES-SOURCE*"))
+    (setq *deferred-surfaces-source*
+          (concatenate 'string (subseq *deferred-surfaces-source* 0 at)
+                       "(defun %surface-off-p (var) var t)"
+                       (subseq *deferred-surfaces-source* (+ at (length old)))))))
 
 (defun %extra-source-text ()
   "MODUS_EXTRA_SOURCE=FILE: a file compiled INTO the image by the BUILD-TIME
@@ -2740,6 +2797,8 @@
 (when cl-user::*small-image* (setq modus.mvm::*static-symbol-one-call* t))
 ;; ... and a global read or write is one call (compiler.lisp *GV-CACHE-MODE* :CALL).
 (when cl-user::*small-image* (setq modus.mvm::*gv-cache-mode* :call))
+;; ... and its global-cell cache has *SMALL-GV-CACHE-SLOTS* slots (above).
+(when cl-user::*small-image* (setq modus.mvm::*gv-cache-slots* cl-user::*small-gv-cache-slots*))
 ;; ... and a 30-bit tower's arithmetic range guard is a shift pair
 ;; (compiler.lisp *ARITH-RANGE-BY-SHIFT*).
 (when cl-user::*small-image* (setq modus.mvm::*arith-range-by-shift* t))

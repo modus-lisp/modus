@@ -1237,10 +1237,17 @@
   "Does this build make packed u32 vectors (#x17), and so emit their arms?"
   (if *mvm-eval-runtime-p* (%u32-vectors-p) *u32-vectors-p*))
 
+(defvar *string32-p* t
+  "With *NARROW-LITERALS-P*: does the AOT build make 32-bit (#x15) strings?
+   NIL on the 68k: %C32-ADDRESS and %MAKE-STRING32 assume the 64-bit object
+   layout (tag 9, data at +16), so a narrow-literals 68k build keeps #x31 for
+   mutable strings.  In-image the question is %STRING32-STRINGS-P (prelude).")
+
 (defun %string32-on-p ()
   "Does this build make #x15 strings (and so emit their arms)?  The AOT build
-   says so with *NARROW-LITERALS-P*; in-image, %NARROW-STRINGS-P does."
-  (if *mvm-eval-runtime-p* (%narrow-strings-p) *narrow-literals-p*))
+   says so with *NARROW-LITERALS-P* and *STRING32-P*; in-image,
+   %STRING32-STRINGS-P does (%NARROW-STRINGS-P unless a build overrides it)."
+  (if *mvm-eval-runtime-p* (%string32-strings-p) (and *narrow-literals-p* *string32-p*)))
 
 (defun %maybe-narrow (s)
   "A name key, narrow in-image (prelude.lisp %NARROW-COPY); the host build,
@@ -14820,6 +14827,11 @@
    the ANSI corpus adds more.  Past this the compiler simply stops handing out
    slots and those reads keep the old %GV-REF call.")
 
+(defvar *gv-cache-slots* +gv-cache-size+
+  "Slots this build hands out: the cache vector's length, which prelude.lisp's
+   %GV-CACHE-INIT-ONCE spells as a literal (a small image rewrites both:
+   build-cli-common's *SMALL-GV-CACHE-SLOTS*).")
+
 (defvar *gv-cache-enabled* t
   "ON BY DEFAULT since the gate-runner image went 0/0 (19820 vs 19818, no test
    lost) -- MODUS_NO_GVCACHE=1 at BUILD time turns it off.
@@ -14856,7 +14868,7 @@
     (setq *gv-cache-index* (make-hash-table :test 'eql)))
   (let ((hit (gethash key *gv-cache-index*)))
     (cond (hit hit)
-          ((< *gv-cache-count* +gv-cache-size+)
+          ((< *gv-cache-count* *gv-cache-slots*)
            (let ((i *gv-cache-count*))
              (setf (gethash key *gv-cache-index*) i)
              (setq *gv-cache-count* (+ i 1))

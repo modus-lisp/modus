@@ -179,7 +179,11 @@
 (when (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS"))) (and v (> (length v) 0) (string/= v "0")))
   (setq *cli-arch-override-source*
         (concatenate 'string *cli-arch-override-source*
-                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)))
+                     (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)
+                     ;; but no 32-bit (#x15) strings from the in-image compiler:
+                     ;; their accessors assume the 64-bit layout (compiler.lisp
+                     ;; *STRING32-P*)
+                     "(defun %string32-strings-p () nil)" (string #\Newline)))
   ;; ... and pooled literals are narrow too (cross.lisp *POOL-NARROW-STRINGS*,
   ;; set from this below: MODUS.MVM does not exist yet here).
   (defparameter cl-user::*68k-pool-narrow* t))

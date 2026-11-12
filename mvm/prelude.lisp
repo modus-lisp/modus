@@ -507,6 +507,10 @@
 ;;; regardless.
 (declaim (overridable %narrow-strings-p))
 (defun %narrow-strings-p () nil)
+;; ... and whether its fresh mutable strings are 32-bit (#x15): with narrow
+;; strings, unless a build says no (the 68k: compiler.lisp *STRING32-P*).
+(declaim (overridable %string32-strings-p))
+(defun %string32-strings-p () (%narrow-strings-p))
 
 (defun %make-base-string (n)
   "A fresh narrow string of N zero bytes: a byte vector whose header's subtag
@@ -4080,8 +4084,24 @@
 ;;; Sequence utilities
 ;;; ============================================================
 
+;; Does SUBSEQ of a narrow (base) string return a narrow string, as CL's
+;; "same actual array element type" says?  Off by default (every image keeps
+;; its old wide result); the Mac turns it on: its boot cuts thousands of names
+;; out of narrow packed text, and each came out wide, 4 bytes a character.
+(declaim (overridable %base-subseq-p))
+(defun %base-subseq-p () nil)
+
 (defun subseq (seq start &rest end-arg)
   "Return a subsequence from START to END (END defaults to length)."
+  ;; A narrow string, where %BASE-SUBSEQ-P: a narrow copy of the bytes.
+  (when (and (%base-subseq-p) (%prim-base-string-p seq))
+    (let* ((n (array-length seq))
+           (end (if (and end-arg (car end-arg)) (car end-arg) n)))
+      (when (and (fixnump start) (fixnump end) (<= 0 start) (<= start end) (<= end n))
+        (let* ((len (- end start)) (r (%make-base-string len)) (i 0))
+          (loop (when (>= i len) (return-from subseq r))
+            (%u8-set r i (%u8-ref seq (+ start i)))
+            (setq i (+ i 1)))))))
   ;; A simple string with fixnum bounds in range: the code words copied
   ;; directly (the general path below asked LENGTH twice and the bulk-copy
   ;; predicates; JSON-SIMPLE:PARSE spent a fifth of its time here).

@@ -313,3 +313,24 @@ channel A data register (`#xBFFFFF`) for the ladder's oracle:
 
     MODUS_MAC68K_MACHINE=classic MODUS_68K_CPU=68000 MAC68K_EMULATOR=mame \
       MAC68K_MAME=mame MAC68K_ROMPATH=ROMS scripts/mac68k-ladder.py
+
+### Boot's live heap, measured (`MODUS_68K_GC_PEAK=1`)
+
+The collector records the most bytes any collection kept (`#x10006080`) and
+the latest (`#x10006084`).  The small 68k REPL image, booted under qemu:
+
+| heap | boots | collections | peak kept |
+|---|---|---|---|
+| 64 MB | yes | 2 | 1,559,744 |
+| 8 MB | yes | 24 | 1,558,672 |
+| 5 MB | yes | 91 | 1,564,512 |
+| 4.5 MB and below | heap exhausted | | |
+
+Boot's live data only GROWS, to exactly what the freeze keeps (1.29 MB of
+objects, 0.27 MB of conses): a never-copied old space (generational
+promotion) would take the boot floor from ~5 MB to that plus a young pair.
+But boot ALLOCATES on the order of 50 MB (24 collections of a 4 MB
+semispace), so on an 8 MHz 68000 a boot from scratch is likely most of an
+hour whatever the collector: a small Mac starts from a saved core, and with
+one the static freeze already gives the small floor.  Promotion is for a long
+session's growth, not for boot.

@@ -4223,6 +4223,28 @@
           (m68k-emit-moveq buf +68k-d3+ 4)
           (m68k-emit-word buf #x4E40)
           (here none)))
+      ;; MODUS_68K_GC_PEAK=1 (a measurement): the most bytes any collection
+      ;; kept -- objects [to_start, A2) plus conses [A3, to_end) -- at
+      ;; #x10006080, and the latest at #x10006084: what an old space that is
+      ;; never copied (generational promotion) would have to hold.
+      (when (equal (sb-ext:posix-getenv "MODUS_68K_GC_PEAK") "1")
+        (let ((no (lbl)))
+          (m68k-emit-move-imm-an buf meta +68k-a1+)
+          (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
+          (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d1+)
+          (m68k-emit-sub-dn-dn buf +68k-d1+ +68k-d0+)             ; objects
+          (m68k-emit-move-disp-dn buf +68k-a1+ #x10 +68k-d2+)
+          (m68k-emit-add-dn-dn buf +68k-d2+ +68k-d1+)             ; to_end
+          (m68k-emit-move-an-dn buf +68k-a3+ +68k-d2+)
+          (m68k-emit-sub-dn-dn buf +68k-d2+ +68k-d1+)             ; conses
+          (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d0+)
+          (m68k-emit-move-imm-an buf (conv-real #x10006080) +68k-a0+)
+          (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 4)
+          (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d1+)
+          (m68k-emit-cmp-dn-dn buf +68k-d1+ +68k-d0+)             ; kept - peak
+          (m68k-emit-bcc-word buf +68k-cc-ls+ no)
+          (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+          (here no)))
       ;; ---- swap the semispaces, count the collection ----
       (m68k-emit-move-imm-an buf meta +68k-a1+)
       (m68k-emit-move-disp-dn buf +68k-a1+ #x08 +68k-d0+)

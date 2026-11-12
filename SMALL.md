@@ -414,7 +414,7 @@ object by object in the saved core; the image's sizes from the build):
 |---|---|---|---|
 | resident image | 805 KB | 711 KB | the surfaces' source (162 KB) out; literals into the pool (+68 KB) |
 | code streams on disk | 3.96 MB | 3.66 MB | literals no longer built a character at a time |
-| static objects | 1.28 MB | 1.04 MB | wide strings 157 -> 13 KB; the 64 KB cell cache; two 64 KB buffers |
+| static objects | 1.28 MB | 1.04 MB | wide strings 157 KB -> 0; the 64 KB cell cache; two 64 KB buffers |
 | static conses | 267 KB | 254 KB | |
 
 - **`MODUS_NO_SURFACES`** (on for small Mac builds): no Genera / SB-* / gray
@@ -428,6 +428,11 @@ object by object in the saved core; the image's sizes from the build):
   name in the symbol, function and global tables out of narrow packed text.
 - **`MODUS_SMALL_IMAGE`**: the global-cell cache 1024 slots (597 used, of
   16384), mvm-eval's buffers start at 4 KB (they grow), no opcode descriptions.
+- **No wide strings at all** (`*BASE-STRINGS-ONLY*` / `%BASE-STRINGS-ONLY-P`,
+  on for the Mac; `MODUS_68K_WIDE_STRINGS=1` keeps them): every fresh string
+  is narrow, a byte a character, and a character above 255 cannot be stored in
+  one (it signals; nothing truncates).  Mac text is 8-bit.  The core's wide
+  strings 157 KB -> 0, and a form's strings take a quarter of the young heap.
 
 **What is left, and where the next cuts are.**  The resident image is 219 KB
 of native code (stubs, handlers, the stream table) and ~490 KB of pool, of

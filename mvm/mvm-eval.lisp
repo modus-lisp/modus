@@ -4393,7 +4393,7 @@
       ;; cached tuple keeps its bytecode by reference into this array, so the
       ;; next compile overwrote cached forms (ANSI probe 8447 + the whole
       ;; 8644-8848 block).  A reuse needs an explicit copy-out first.
-      (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+      (setq buf (make-mvm-buffer :bytes (make-array 65536 :element-type '(unsigned-byte 8))))
       ;; Pass 1: assign cumulative bytecode offsets + register in *functions*.
       (dolist (e all-ir)
         (let* ((info (car e)) (ir (cdr e))
@@ -5082,7 +5082,9 @@
       (setq *e2-module-defuns* %e2md-saved))
     ;; Small buffer (the default 128MB byte array blows the in-image heap).
     ;; PERF: REUSE a persistent 64KB buffer instead of (make-array 65536) every
-    ;; call.  mvm-buffer-used-bytes copies the bytecode out before the next call,
+    ;; call.  A BYTE vector: MVM-EMIT-BYTE only stores bytes, and a general
+    ;; vector of 65536 is 256 KB (512 KB on 64 bits) of a small image's heap --
+    ;; the largest object in the 68k core (a census of its static heap).  mvm-buffer-used-bytes copies the bytecode out before the next call,
     ;; so nothing retains the buffer — safe to reset + reuse.
     (if *mvm-eval-buffer*
         (progn
@@ -5091,7 +5093,7 @@
           (setf (mvm-buffer-fixups *mvm-eval-buffer*) nil)
           (setq buf *mvm-eval-buffer*))
         (progn
-          (setq buf (make-mvm-buffer :bytes (make-array 65536)))
+          (setq buf (make-mvm-buffer :bytes (make-array 65536 :element-type '(unsigned-byte 8))))
           (setq *mvm-eval-buffer* buf)))
     ;; Pass 1: size each function, assign cumulative bytecode offsets, register
     ;; in *functions* so emit-time CALL resolution finds them.
@@ -5674,7 +5676,7 @@
              (size (let ((s 0))
                      (dolist (insn ir) (setq s (+ s (ir-instruction-size insn))))
                      s))
-             (buf (make-mvm-buffer :bytes (make-array (+ size 256))))
+             (buf (make-mvm-buffer :bytes (make-array (+ size 256) :element-type '(unsigned-byte 8))))
              (lp (compute-label-positions ir)))
         (emit-bytecode-for-ir buf ir lp)
         (format t "; ~A  (~D bytes of MVM bytecode)~%"

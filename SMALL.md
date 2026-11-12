@@ -444,3 +444,38 @@ section at the end of the image that the core disk leaves off is the next
 duplicates), 351 KB of hash-table storage sized for growth (the dict of a
 12,232-entry table is a 64 KB index + 135 KB of entries; a freeze-time compact
 to the live count is ~60 KB), and 254 KB of conses.
+
+## What a session touches, and swapping the rest
+
+**Measured** (MAME's Lua read and write taps over the whole static heap, a
+typical session of eleven forms -- arithmetic, DEFUN and a call, FORMAT ~R,
+DOTIMES, MAPCAR, the printer, HANDLER-CASE, an undefined function, INTERN,
+DEFSTRUCT -- each 8-byte granule mapped back to its object in the saved core):
+the forms touch **170 KB of the 1.29 MB**.  Boot touches every object (the
+resume's %GC-CARDS-INIT reads every header).  Cold, by owner (each global's
+value, keyed by the compiler's name hash): `*SYM-NAME-TABLE*` 430 KB,
+`*KERNEL-FN-NAMES*` 143 KB, the package system 124 KB, the pinned tables
+124 KB, `*MACRO-PKG-TABLE*` 82 KB, `*MVM-EVAL-CACHE*` 66 KB,
+`*KERNEL-GLOBAL-NAMES*` 33 KB.
+
+A 68000 has no MMU, so there is no page fault to catch: data comes off the
+disk where it is ASKED FOR, through a function, as the code streams do.
+**Cold names** (`mvm/mac68k-cold.lisp`) are the first: the build writes the
+12,247 names, sorted by hash, to 512-byte pages (`IMAGE.cold`, 203 KB);
+`mac68k-core.py` puts them on the disk after the streams; the core run drops
+`*SYM-NAME-TABLE*`; and `SYMBOL-NAME`, where the table would have answered,
+asks `%COLD-SYM-NAME` -- a binary search of the pages' first hashes (in the
+image), ONE block read (`SYSCALL3` service 1 on a bare Mac, the code loader's
+`_Read`), the name kept.  The freeze also empties `*MVM-EVAL-CACHE*`, runs
+`COMPACT-NAMES` (5,000 duplicate strings), and clears the closure-environment
+slot, which was holding a 400 KB table live.
+
+| | before | now |
+|---|---|---|
+| static objects | 1.04 MB | 0.89 MB |
+| static conses | 254 KB | 222 KB |
+| prompt on MAME's Classic | 254 s | 224 s |
+
+Next, in both directions: the kernel-name sets and the macro table are
+consulted only at DEFUN / DEFMACRO / global-definition time -- the next cold
+customers, or replaced by a test on what is already resident.

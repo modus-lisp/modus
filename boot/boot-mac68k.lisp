@@ -67,12 +67,17 @@
     ;; Loaded at #x40000, not lower: on the 32 MB LC that runs the core build the
     ;; ROM's system heap reaches #x39FE0 when the boot blocks run (the Classic's
     ;; ends near #x8600), and the same binary must load on both.
+    ;; Below the image, [#x10000, #x40000) is free on a Classic (its system
+    ;; heap ends near #x8600) and is used only by a boot from the core: the
+    ;; stack, the scratch page, the I/O buffer.  So the code cache has the rest
+    ;; up to NIL's page: ~796 KB (measured: a DEFUN's active streams -- the
+    ;; interpreter, the compiler's biggest pieces -- did not fit in 460 KB).
     (:classic :load #x00040000 :static-lo #x00110000 :static-hi #x002B0000
-              :region #x002B0000 :heap-size #x000A0000 :gc-guard #x00008000
-              :kind-map #x00358000 :cache-lo #x0036D000 :cache-hi #x003E0000
+              :region #x002B0000 :heap-size #x00080000 :gc-guard #x00008000
+              :kind-map #x00318000 :cache-lo #x00329000 :cache-hi #x003F0000
               :staging #x003D0000 :staging-size #x00010000
-              :nil-page #x003E0000 :scratch #x003E2000 :io-buf #x003E3000
-              :stack-top #x003F8000
+              :nil-page #x003F0000
+              :stack-top #x00020000 :scratch #x00020000 :io-buf #x00021000
               :boot-heap #x01000000 :boot-heap-size #x00800000
               :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
               :boot-stack-top #x01A00000)))
@@ -173,16 +178,21 @@
     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x18))) ; stack_base
 
 (defun emit-mac68k-cache (buf lo hi)
-  "Paged code: the code cache's bounds into the low block (translate-68k
-   +68K-CACHE-PTR+ / +68K-CACHE-HI+)."
+  "Paged code: the code cache [LO, HI) into the low block (translate-68k
+   +68K-CACHE-PTR+ / -HI+ / -LO+ / -MAP+): its OWNER MAP first, one 16-bit word
+   per 64-byte granule of the whole cache, zeroed; the streams after it."
   (when *68k-paged*
-    (m68k-emit-move-imm-dn buf lo +68k-d1+)
-    (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 0)
-    (m68k-emit-move-imm-dn buf hi +68k-d1+)
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 4)
-    (m68k-emit-move-imm-dn buf lo +68k-d1+)                ; +68K-CACHE-LO+
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 8)))
+    (let* ((map-bytes (ash (- hi lo) (- 1 +68k-cache-granule-shift+)))
+           (start (logand (+ lo map-bytes 63) (lognot 63))))
+      (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
+      (m68k-emit-move-imm-dn buf start +68k-d1+)
+      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 0)    ; the pointer
+      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 8)    ; +68K-CACHE-LO+: streams' start
+      (m68k-emit-move-imm-dn buf hi +68k-d1+)
+      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 4)    ; +68K-CACHE-HI+
+      (m68k-emit-move-imm-dn buf lo +68k-d1+)
+      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 12)   ; +68K-CACHE-MAP+
+      (emit-mac68k-zero buf lo (logand (+ map-bytes 3) (lognot 3))))))
 
 (defun emit-mac68k-entry (mbuf)
   "Emit the bare-Mac entry into MBUF: the boot blocks jump here, in supervisor
@@ -218,8 +228,8 @@
       (m68k-emit-long buf #x6D6F6475) (m68k-emit-long buf #x734D4352)  ; "modusMCR"
       (m68k-emit-long buf 0)                                          ; +8 CORE
       (m68k-emit-long buf 0)                                          ; +12 SAVE
-      (m68k-emit-long buf 0)                                          ; +16 cache start }  a test's
-      (m68k-emit-long buf 0))                                         ; +20 cache end   }  override
+      (m68k-emit-long buf 0)                                          ; +16 } reserved
+      (m68k-emit-long buf 0))                                         ; +20 }
     (m68k-emit-label buf over)
     (when classic
       (m68k-emit-word buf #x41FA) (m68k-emit-word buf 0)              ; LEA desc(PC),A0
@@ -256,21 +266,6 @@
       (m68k-emit-move-imm-an buf +mac68k-stack-top+ +68k-a7+)
       (emit-mac68k-heap buf base (+ base alloc) (- mid alloc) +mac68k-gc-guard+)
       (emit-mac68k-cache buf (mac68k-layout :cache-lo) (mac68k-layout :cache-hi))
-      ;; a test's cache (scripts/mac68k-core.py MAC68K_CORE_CACHE): the
-      ;; descriptor's +16/+20 when set
-      (when *68k-paged*
-        (let ((keep (mvm-make-label)))
-          (m68k-emit-word buf #x41FA) (m68k-emit-word buf 0)
-          (m68k-emit-fixup buf desc :disp16)
-          (m68k-emit-move-disp-dn buf +68k-a0+ 16 +68k-d0+)
-          (m68k-emit-tst buf +68k-d0+)
-          (m68k-emit-beq buf keep)
-          (m68k-emit-move-disp-dn buf +68k-a0+ 20 +68k-d1+)
-          (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
-          (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 0)
-          (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 4)
-          (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 8)
-          (m68k-emit-label buf keep)))
       ;; the serial drivers' parameter blocks: zeroed for the opens below
       (emit-mac68k-zero buf (mac68k-ser-out-pb) #x100)
       (m68k-emit-move-imm-an buf (conv-real +mac68k-save-core-word+) +68k-a0+)

@@ -379,6 +379,28 @@ D0-D2/A0-A1 under Pascal's convention, which first read as a SCSI error of
 5696.  `scripts/mac68k-mame-repl.lua` types forms when the prompt shows and taps
 the SCC for what the Mac sends.  Measured, in emulated time: the prompt at
 288 s from power-on, `(+ 1 2)` => 3, `(defun sq ...)` => SQ, `(sq 12)` => 144,
-on the Classic's 1-bit screen.  Slow: everything threaded, ~1 minute for
-`(+ 1 2)`, ~5 for a defun -- and that disk was built with
-`MODUS_68K_PAGED_CHECK`, which re-walks every root after every load.
+on the Classic's 1-bit screen.
+
+**Where the time went, and goes** (MAME's Lua samples the 68000's PC; the
+translator writes where each shared region starts, `MODUS_68K_REGIONS=FILE`):
+first the stream LOADER, 70-80% of a form -- for every root it searched the
+6,444-entry stream table for the stream holding it, and eviction searched it
+again.  An OWNER MAP (a 16-bit word per 64-byte granule of the cache: the
+stream placed there; streams 64-aligned, so a granule has one) makes both one
+step.  Then the cache was too small for a DEFUN's active streams (the
+interpreter, 176 KB as a stream, and the compiler's biggest pieces): the stack
+and scratch moved below the image ([#x10000, #x40000) is free on a Classic),
+the young semispaces to 2 x 128 KB, the cache to ~796 KB.  Measured, in a
+Classic's own seconds:
+
+| form | before | now | threaded handlers | GC | loader | ROM (SCSI, serial) | barrier |
+|---|---|---|---|---|---|---|---|
+| `(+ 1 2)` | 49 s | 9 s | 45% | -- | 24% | 22% | 7% |
+| `(defun sq ...)` | 178 s | 53 s | 55% | 13% | 10% | 12% | 7% |
+| `(sq 12)` | 177 s | 35 s | 46% | 18% | 14% | 13% | 7% |
+| `format ~R`, bignums | -- | 69 s | 62% | 6% | 8% | 14% | 8% |
+
+Not GC: interpretation.  Boot to the prompt is 262 s, three quarters of it
+threaded code -- the resume's %GC-CARDS-INIT walking the 1.5 MB static heap
+object by object, which the core builder could do instead.  A form still reads
+~450 streams from disk: its working set is about the cache.

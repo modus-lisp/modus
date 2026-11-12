@@ -206,7 +206,14 @@
   "Paged Mac: the code cache's next free byte (raw), in the low block so the
    boot stub sets it for the machine it finds itself on.")
 (defconstant +68k-cache-hi+ #x10006038 "Paged Mac: the code cache's end (raw).")
-(defconstant +68k-cache-lo+ #x1000603C "Paged Mac: the code cache's start (raw).")
+(defconstant +68k-cache-lo+ #x1000603C
+  "Paged Mac: where the code cache's streams start (raw), past its owner map.")
+(defconstant +68k-cache-map+ #x10006040
+  "Paged Mac: the cache's OWNER MAP (raw address; the cache's own first bytes):
+   one 16-bit word per 64-byte granule from here to the cache's end -- the
+   stream index + 1 that was last placed over it, 0 for none.  Streams are
+   placed on 64-byte boundaries, so a granule has at most one stream.")
+(defconstant +68k-cache-granule-shift+ 6)
 (defvar *68k-stream-home-label* nil)
 (defvar *68k-stream-end-label* nil)
 
@@ -4697,6 +4704,24 @@
       (m68k-resolve-stream-fixups buf))
     (when (and *68k-paged* *68k-paged-fns*)
       (m68k-paged-finish buf))
+    ;; where the shared native regions start, for a profile (MODUS_68K_REGIONS=FILE:
+    ;; name and native offset a line; the functions come before all of them)
+    (let ((f (sb-ext:posix-getenv "MODUS_68K_REGIONS")))
+      (when (and f (plusp (length f)))
+        (with-open-file (o f :direction :output :if-exists :supersede)
+          (loop for (name label) in
+                (list (list "gc-collector" *68k-gc-label*) (list "mac-console" *68k-mac-console-label*)
+                      (list "cons-helper" *68k-cons-label*) (list "subtag-helper" *68k-subtag-label*)
+                      (list "car-cdr-helpers" *68k-car-label*) (list "barrier" *68k-barrier-label*)
+                      (list "thread-dispatch" *68k-thread-next-label*)
+                      (list "array-len-helper" *68k-array-len-label*)
+                      (list "alloc-obj-helper" *68k-alloc-obj-label*)
+                      (list "68000-mul-div" *68k-mul32-label*)
+                      (list "paged-loader" *68k-cold-enter-label*)
+                      (list "stream-table" *68k-stream-table-label*)
+                      (list "stream-section" *68k-stream-section-label*))
+                for pos = (and label (gethash label (m68k-buffer-labels buf)))
+                when pos do (format o "~A ~D~%" name pos)))))
     (m68k-unimplemented-report)
 
     ;; Report where each function actually LANDED — see the same change in
@@ -5056,8 +5081,21 @@
           ;; slide the stream down to A4: A2 = A4 + skip, D6 bytes, upward (dest < src)
           (ws #x244C #xD5C3 #x264C #x2006)
           (ws #x5380 #x6B04 #x16DA #x60F8)
-          ;; the allocator's next place: A4 + length, even
-          (ws #x200C #xD086 #x5280 #x0280) (l32 #xFFFFFFFE)
+          ;; the owner map: the stream's granules are now index + 1
+          (ws #x200C #x90B9) (l32 (conv-real +68k-cache-map+))   ; D0 = A4 - map base
+          (ws #xEC88 #xD080)                                   ; first granule's word
+          (ws #x220C #xD286 #x92B9) (l32 (conv-real +68k-cache-map+)) ; D1 = end - map base
+          (ws #x0681) (l32 63) (ws #xEC89 #xD281)              ; past the last granule's word
+          (ws #x2407 #xE48A #x5282)                            ; D2 = i + 1
+          (ws #x2079) (l32 (conv-real +68k-cache-map+))        ; A0 = the map
+          (let ((ml (mvm-make-label)) (md (mvm-make-label)))
+            (m68k-emit-label buf ml)
+            (ws #xB280) (m68k-emit-bcc-word buf +68k-cc-ls+ md)
+            (ws #x3182 #x0800 #x5480)                          ; MOVE.W D2,(0,A0,D0.L); next
+            (m68k-emit-bra buf ml)
+            (m68k-emit-label buf md))
+          ;; the allocator's next place: A4 + length, up to the granule
+          (ws #x2006 #x0680) (l32 63) (ws #x0280) (l32 #xFFFFFFC0) (ws #xD08C)
           (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
           (ws #x2080)
           (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a0+)
@@ -5128,122 +5166,143 @@
     (m68k-emit-label buf *68k-stream-end-label*)))
 
 (defun m68k-emit-paged-alloc (buf alloc count ca5)
-  "The code cache's FIFO allocator, at ALLOC: D2 = bytes wanted.  Returns A4 =
-   the place and D0 = 0, or D0 = 1 when no place exists.  Preserves D2-D7 and
-   A1-A3, A5, A6.
+  "The code cache's FIFO allocator, at ALLOC: D2 = bytes wanted (preserved).
+   Returns A4 = a 64-byte-aligned place and D0 = 0, or D0 = 1 when none
+   exists.  Preserves D2-D7 and A1-A3, A5, A6.
 
    A place is taken at the allocation pointer, wrapping to the cache's start.
-   It must hold no ACTIVE stream: one some ROOT points into.  The roots are
-   exact, because every Lisp function of a paged image is threaded and keeps its
-   caller's token pointer at -4(A6): the caller's A5 (CA5, which the loader
-   keeps), -4 of every frame on the A6 chain, the jmpbuf's and every stacked
-   handler frame's A5 (+28).  An active stream is skipped; every stream
-   overlapping the place is then marked NOT LOADED (home | 1), to be read again
-   when next called."
-  (let ((top (mvm-make-label)) (wrapped (mvm-make-label)) (roots (mvm-make-label))
+   It must hold no ACTIVE stream: one an exact root points into (the caller's
+   A5 -- CA5, which the loader keeps -- -4 of every frame on the A6 chain, the
+   jmpbuf's and every stacked handler frame's A5 at +28; every function of a
+   paged image is threaded, so those slots are token pointers).  A root's
+   stream is found through the OWNER MAP in one step, not by searching the
+   stream table (measured on a Mac Classic: the searches were 70-80% of a
+   form's time); it is active when it OVERLAPS the place.  An active stream is
+   skipped; every stream that owns a granule of the place is then marked NOT
+   LOADED (home | 1) and its granules cleared."
+  (let* ((ipno-d1 (mvm-make-label)) (done-l (mvm-make-label)) (top (mvm-make-label)) (wrapped (mvm-make-label)) (roots (mvm-make-label))
         (chain (mvm-make-label)) (cdone (mvm-make-label)) (frames (mvm-make-label))
         (fdone (mvm-make-label)) (evict (mvm-make-label)) (enext (mvm-make-label))
-        (ekeep (mvm-make-label)) (ok (mvm-make-label)) (fail (mvm-make-label))
-        (inplace (mvm-make-label)) (ipnext (mvm-make-label)) (ipno (mvm-make-label))
-        (moved (mvm-make-label)) (hb (m68k-hbase)))
+        (ekeep (mvm-make-label)) (eclr (mvm-make-label)) (ok (mvm-make-label))
+        (fail (mvm-make-label)) (inplace (mvm-make-label)) (ipno (mvm-make-label))
+        (moved (mvm-make-label)) (hb (m68k-hbase)) (gs +68k-cache-granule-shift+))
+    (declare (ignore count))
     (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
            (l32 (v) (m68k-emit-long buf v)))
       (m68k-emit-label buf alloc)
       (ws #x48E7 #x3F76)                         ; MOVEM.L D2-D7/A1-A3/A5/A6,-(SP)
+      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
+      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
+      (ws #x2C79) (l32 (conv-real +68k-cache-map+))            ; A6 = the owner map
       (ws #x7C00)                                ; D6 = 0: wraps
       (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
       (ws #x2850)                                ; A4 = the allocation pointer
-      ;; ---- try [A4, D7 = A4 + D2) ----
+      ;; ---- try [A4, D7 = A4 + D2 rounded up to the granule) ----
       (m68k-emit-label buf top)
-      (ws #x200C #xD082 #x2E00)                  ; D0 = D7 = A4 + D2
-      (ws #xB0B9) (l32 (conv-real +68k-cache-hi+))
+      (ws #x2E02 #x0687) (l32 63) (ws #x0287) (l32 #xFFFFFFC0)  ; D7 = D2 up to 64
+      (ws #xDE8C)                                ; D7 += A4
+      (ws #xBEB9) (l32 (conv-real +68k-cache-hi+))               ; CMP.L hi,D7
       (m68k-emit-bcc-word buf +68k-cc-ls+ roots)
       (m68k-emit-label buf wrapped)
       (ws #x5286 #x0C86) (l32 2)                 ; ++wraps > 2: nothing fits
       (m68k-emit-bcc-word buf +68k-cc-gt+ fail)
-      (ws #x2879) (l32 (conv-real +68k-cache-lo+)) ; A4 = the cache's start
+      (ws #x2879) (l32 (conv-real +68k-cache-lo+)) ; A4 = the streams' start
       (m68k-emit-bra buf top)
-      ;; ---- the roots: an active stream in the place moves it past that stream ----
+      ;; ---- the roots ----
       (m68k-emit-label buf roots)
       (m68k-emit-lea-label buf ca5 +68k-a0+)
       (ws #x2010) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)   ; the caller's A5
-      ;; the A6 chain, up to the stack base, strictly upward
-      (ws #x204E)                                ; A0 = A6
+      ;; the A6 chain starts at the caller's A6, which MOVEM saved last:
+      ;; D2-D7 A1-A3 A5 A6 = eleven longwords, A6 at 40(SP)
+      (ws #x206F #x0028)                         ; MOVEA.L 40(SP),A0
       (ws #x2479) (l32 (conv-real #x10000058))   ; A2 = the stack base
       (m68k-emit-label buf chain)
-      (ws #xB1CA) (m68k-emit-bcc-word buf +68k-cc-cc+ cdone)           ; A0 >= base
-      (ws #x2028 #xFFFC) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved) ; -4(A0)
+      (ws #xB1CA) (m68k-emit-bcc-word buf +68k-cc-cc+ cdone)
+      (ws #x2028 #xFFFC) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
       (ws #x2248 #x2050)                         ; A1 = A0; A0 = (A0)
-      (ws #xB1C9) (m68k-emit-bcc-word buf +68k-cc-ls+ cdone)           ; not upward: stop
+      (ws #xB1C9) (m68k-emit-bcc-word buf +68k-cc-ls+ cdone)
       (m68k-emit-bra buf chain)
       (m68k-emit-label buf cdone)
-      ;; the jmpbuf's A5, then each stacked handler frame's
       (m68k-emit-move-imm-an buf (+ hb #x180) +68k-a0+)
       (ws #x2028 #x001C) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
       (ws #x2239) (l32 (+ hb #x400))             ; D1 = depth
       (ws #x0C81) (l32 *68k-hstack-max-depth*)
       (m68k-emit-bcc-word buf +68k-cc-ls+ frames)
-      (ws #x7200 #xD2BC) (l32 *68k-hstack-max-depth*)   ; D1 = the cap
+      (ws #x7200 #xD2BC) (l32 *68k-hstack-max-depth*)
       (m68k-emit-label buf frames)
       (m68k-emit-move-imm-an buf (+ hb #x408) +68k-a0+)
       (let ((fl (mvm-make-label)))
         (m68k-emit-label buf fl)
         (ws #x4A81) (m68k-emit-beq buf fdone)
         (ws #x2028 #x001C) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
-        (ws #x41E8 #x0020 #x5381)                ; A0 += 32; D1 -= 1
+        (ws #x41E8 #x0020 #x5381)
         (m68k-emit-bra buf fl))
       (m68k-emit-label buf fdone)
       (m68k-emit-bra buf evict)
       (m68k-emit-label buf moved)
       (m68k-emit-bra buf top)
-      ;; ---- INPLACE: D0 a root's value.  When it is inside a loaded stream
-      ;; that OVERLAPS the place [A4, D7) -- not merely when D0 is in the place:
-      ;; eviction takes every stream overlapping it, and a root can point at
-      ;; the part before A4 (measured: !LDR-LOST, the REPL's own caller) --
-      ;; A4 = that stream's end (even) and Z clear; else Z set.
-      ;; Uses D3-D5, A3, A5 ----
+      ;; ---- INPLACE: D0 a root's value.  Its stream, from the owner map, when it
+      ;; is loaded, holds D0, and overlaps [A4, D7): A4 = its end rounded up to
+      ;; the granule, Z clear.  Else Z set.  Uses D3, D4; keeps D1, A0-A2 ----
       (m68k-emit-label buf inplace)
       (ws #xB0B9) (l32 (conv-real +68k-cache-lo+)) (m68k-emit-bcc-word buf +68k-cc-cs+ ipno)
       (ws #xB0B9) (l32 (conv-real +68k-cache-hi+)) (m68k-emit-bcc-word buf +68k-cc-cc+ ipno)
-      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
-      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
-      (m68k-emit-move-imm-dn buf (1- count) +68k-d5+)
-      (m68k-emit-label buf ipnext)
-      (let ((skip (mvm-make-label)))
-        (ws #x2613 #x0803 #x0000) (m68k-emit-bne buf skip)             ; not loaded
-        (ws #xB680) (m68k-emit-bcc-word buf +68k-cc-hi+ skip)          ; starts after D0
-        (ws #x282D #x0004 #x9895 #xD883)                               ; D4 = its end
-        (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-ls+ skip)          ; ends at or before D0
-        ;; D0's stream is [D3, D4): does it overlap the place?
-        (ws #xB88C) (m68k-emit-bcc-word buf +68k-cc-ls+ ipno)          ; ends by A4
-        (ws #xB687) (m68k-emit-bcc-word buf +68k-cc-cc+ ipno)          ; starts at/after D7
-        (ws #x5284 #x0284) (l32 #xFFFFFFFE)
-        (ws #x2844 #x7601 #x4E75)                ; A4 = past it; Z clear; RTS
-        (m68k-emit-label buf skip)
-        (ws #x588B #x588D)
-        (ws #x51CD) (m68k-emit-word buf 0) (m68k-emit-fixup buf ipnext :disp16))
+      (ws #x2600 #x96B9) (l32 (conv-real +68k-cache-map+))       ; D3 = D0 - map base
+      (ws #xEC8B)                                ; LSR.L #6,D3: the granule
+      (ws #xD683)                                ; D3 *= 2: its word
+      (ws #x3636 #x3800)                         ; MOVE.W (0,A6,D3.L),D3: owner + 1
+      (ws #x0283) (l32 #xFFFF)
+      (m68k-emit-beq buf ipno)                   ; nobody
+      (ws #x5383 #xE58B)                         ; D3 = index * 4
+      (ws #x2833 #x3800)                         ; D4 = table[i]
+      (ws #x0804 #x0000) (m68k-emit-bne buf ipno)                     ; not loaded
+      (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-hi+ ipno)           ; starts after D0
+      (ws #x2F01)                                ; keep D1
+      (ws #x2235 #x3804 #x92B5 #x3800 #xD284)    ; D1 = home[i+1] - home[i] + start: the end
+      (ws #xB280) (m68k-emit-bcc-word buf +68k-cc-ls+ ipno-d1)
+      (ws #x0681) (l32 63) (ws #x0281) (l32 #xFFFFFFC0)               ; end up to 64
+      (ws #xB28C) (m68k-emit-bcc-word buf +68k-cc-ls+ ipno-d1)        ; ends by A4
+      (ws #xB887) (m68k-emit-bcc-word buf +68k-cc-cc+ ipno-d1)        ; starts at/after D7
+      (ws #x2841 #x221F)                         ; A4 = its end; D1 back
+      (ws #x7601 #x4E75)                         ; Z clear; RTS
+      (m68k-emit-label buf ipno-d1)
+      (ws #x221F)                                ; D1 back
       (m68k-emit-label buf ipno)
       (ws #x7600 #x4E75)                         ; Z set; RTS
-      ;; ---- the place holds no active stream: evict what overlaps it ----
+      ;; ---- the place holds no active stream: evict the owners of its granules ----
       (m68k-emit-label buf evict)
-      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
-      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
-      (m68k-emit-move-imm-dn buf (1- count) +68k-d5+)
+      (ws #x200C #x90B9) (l32 (conv-real +68k-cache-map+))       ; D0 = A4 - map base
+      (ws #xEC88 #xD080)                         ; its first granule's word offset
+      (ws #x2207 #x92B9) (l32 (conv-real +68k-cache-map+))       ; D1 = D7 - map base
+      (ws #xEC89 #xD281)                         ; the place's end, as a word offset
       (m68k-emit-label buf enext)
-      (ws #x2213 #x0801 #x0000)                  ; D1 = entry; BTST #0
-      (m68k-emit-bne buf ekeep)
-      (ws #xB287) (m68k-emit-bcc-word buf +68k-cc-cc+ ekeep)  ; entry >= D7: after it
-      (ws #x242D #x0004 #x9495 #xD481)           ; D2' = its end
-      (ws #xB48C) (m68k-emit-bcc-word buf +68k-cc-ls+ ekeep)  ; end <= A4: before it
-      (ws #x2215 #x08C1 #x0000 #x2681)           ; entry = home | 1
+      (ws #xB280) (m68k-emit-bcc-word buf +68k-cc-ls+ ok)        ; done
+      (ws #x3636 #x0800)                         ; D3 = owner + 1 (MOVE.W (0,A6,D0.L))
+      (ws #x0283) (l32 #xFFFF)
+      (m68k-emit-beq buf eclr)
+      (ws #x5383 #xE58B)                         ; i * 4
+      (ws #x2833 #x3800)                         ; D4 = table[i]
+      (ws #x0804 #x0000) (m68k-emit-bne buf eclr)                ; not loaded: stale
+      ;; does stream i hold THIS granule?  start <= its address < end
+      (ws #x2F00)                                ; keep D0
+      (ws #xEB88)                                ; LSL.L #5: word offset -> byte offset
+      (ws #xD0B9) (l32 (conv-real +68k-cache-map+))              ; + map base: the granule
+      (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-hi+ ekeep)     ; starts after it
+      (ws #x2275 #x3804 #x93F5 #x3800 #xD3C4)    ; A1 = home[i+1] - home[i] + start: its end
+      (ws #xB3C0) (m68k-emit-bcc-word buf +68k-cc-ls+ ekeep)     ; CMPA.L D0,A1: ends by it
+      (ws #x2835 #x3800 #x08C4 #x0000 #x2784 #x3800)   ; table[i] = home[i] | 1
       (m68k-emit-label buf ekeep)
-      (ws #x588B #x588D)
-      (ws #x51CD) (m68k-emit-word buf 0) (m68k-emit-fixup buf enext :disp16)
-      (ws #x7000)                                ; D0 = 0: found
-      (m68k-emit-bra buf ok)
+      (ws #x201F)                                ; D0 back
+      (m68k-emit-label buf eclr)
+      (ws #x4276 #x0800)                         ; CLR.W (0,A6,D0.L)
+      (ws #x5480)                                ; next granule's word
+      (m68k-emit-bra buf enext)
       (m68k-emit-label buf fail)
       (ws #x7001)                                ; D0 = 1
+      (m68k-emit-bra buf done-l)
       (m68k-emit-label buf ok)
+      (ws #x7000)                                ; D0 = 0
+      (m68k-emit-label buf done-l)
       (ws #x4CDF #x6EFC)                         ; MOVEM.L (SP)+,D2-D7/A1-A3/A5/A6
       (ws #x4E75))))
 

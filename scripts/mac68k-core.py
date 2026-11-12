@@ -203,11 +203,6 @@ def main(image, disk):
     table, cnt, section = struct.unpack_from('>III', chunk, k + 8)
     struct.pack_into('>I', chunk, k + 20, (section - stream_disk) & 0xFFFFFFFF)  # disk bias (SUB.L wraps)
     set_flag(chunk, 'core', 1)
-    if os.environ.get('MAC68K_CORE_CACHE'):          # a test's cache: "lo:hi"
-        lo, hi = (int(x, 0) for x in os.environ['MAC68K_CORE_CACHE'].split(':'))
-        k2 = chunk.find(b'modusMCR')
-        struct.pack_into('>II', chunk, k2 + 16, lo, hi)
-        print('mac68k-core: the code cache is #%x..#%x (MAC68K_CORE_CACHE)' % (lo, hi))
     md.write_disk(bytes(chunk) + bytes(streams), disk, LOAD, read_len=len(chunk))
     print('mac68k-core: %s: boot reads %d bytes (image %d, static %d, low block %d); %d streams '
           '(%d bytes) on demand from disk byte %d'

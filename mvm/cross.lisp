@@ -330,6 +330,16 @@
 ;;; target's padding words (none on 68k), a byte per character.
 (defvar *pool-narrow-strings* nil)
 
+;;; INIT-ONLY LITERALS (the bare Mac's saved core): an EQUAL table of strings
+;;; only boot reads -- the boot tables' packed text.  BUILD-CONSTANT-POOL lays
+;;; them out LAST, after an 8-byte "modusINI" marker at *POOL-INIT-START*
+;;; (pool-relative), and the image assembly moves that tail past the NFN table
+;;; and the footer, to the very end of the resident image; mac68k-core.py then
+;;; starts the static heap at the marker, over text a core boot never reads.
+;;; NIL: one pool, as always.
+(defvar *pool-init-only* nil)
+(defvar *pool-init-start* nil)
+
 (defun build-constant-pool (module target)
   "Build the constant pool for the image.
    Lays out compound constants (currently: strings) as full heap objects
@@ -376,9 +386,8 @@
           (format t ";; pool string ~8D ~A ~S~%" (car r)
                   (if (every (lambda (c) (< (char-code c) 256)) (cdr r)) "n" "W")
                   (substitute #\Space #\Newline (subseq (cdr r) 0 (min 70 (car r))))))))
-    (loop for constant in constants
-          for idx from 0
-          do (typecase constant
+    (labels ((emit-one (constant idx)
+             (typecase constant
                (string
                 ;; Each heap object is 16-byte aligned at its header.
                 (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
@@ -479,7 +488,18 @@
                 ;; compound types haven't been routed through yet.  Emit a
                 ;; single zero so subsequent layout doesn't drift if such an
                 ;; entry creeps in; addr-table[idx] stays 0.
-                (emit-word 0))))
+                (emit-word 0)))))
+      (setq *pool-init-start* nil)
+      (flet ((init-p (c) (and *pool-init-only* (stringp c) (gethash c *pool-init-only*))))
+        (loop for constant in constants for idx from 0
+              unless (init-p constant) do (emit-one constant idx))
+        (when (some #'init-p constants)
+          (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                do (mvm-emit-byte buf 0))
+          (setq *pool-init-start* (mvm-buffer-position buf))
+          (loop for c across "modusINI" do (mvm-emit-byte buf (char-code c)))
+          (loop for constant in constants for idx from 0
+                when (init-p constant) do (emit-one constant idx)))))
     (values (mvm-buffer-used-bytes buf) addr-table))))
 
 (defun build-nfn-table (module target)
@@ -1609,8 +1629,9 @@
               (mvm-buffer-position final-buf)))
       (format t "~&;; image sections: native ~D, constant pool ~D, NFN table ~D, source blob ~D bytes~%"
               (length native-code) (length constant-pool) (length nfn-table) (length source-blob))
-      ;; Constant pool
+      ;; Constant pool (without its init-only tail, *POOL-INIT-START*: below)
       (loop for b across constant-pool
+            for i from 0 below (or *pool-init-start* (length constant-pool))
             do (mvm-emit-byte final-buf b))
       ;; NFN table
       (loop for b across nfn-table
@@ -1630,6 +1651,23 @@
                                         (length source-blob) 8))
             (mvm-emit-u32 final-buf (- (mvm-buffer-position final-buf)
                                         (length source-blob) 4))))
+      ;; THE POOL'S INIT-ONLY TAIL (*POOL-INIT-ONLY*): last in the resident
+      ;; image, 16-aligned in memory; its constants' addresses move with it
+      (when *pool-init-start*
+        (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))
+               (wrap-header (wrap-header-size-for-boot boot-descriptor)))
+          (loop until (zerop (mod (+ load-addr wrap-header (mvm-buffer-position final-buf)) 16))
+                do (mvm-emit-byte final-buf 0))
+          (let ((delta (- (mvm-buffer-position final-buf)
+                          (+ (kernel-image-constant-pool-offset image) *pool-init-start*))))
+            (loop for i from 0 below (length pool-addr-table)
+                  for e = (aref pool-addr-table i)
+                  when (and (integerp e) (>= e *pool-init-start*))
+                    do (setf (aref pool-addr-table i) (+ e delta)))
+            (loop for i from *pool-init-start* below (length constant-pool)
+                  do (mvm-emit-byte final-buf (aref constant-pool i)))
+            (format t "~&;; init-only literals: ~D bytes, last in the resident image (moved ~D)~%"
+                    (- (length constant-pool) *pool-init-start*) delta))))
       ;; a paged 68k image's stream section, last, 16-aligned in memory
       (when *68k-tail-move*
         (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))

@@ -103,7 +103,7 @@ def capture_core(disk, timeout):
     return got[:k], got[k:need]
 
 
-def relocate(core):
+def relocate(core, static_lo=None):
     base, olo, ohi, clo, chi = struct.unpack('>5I', core[4:24])
     if base != REGION:
         sys.exit('mac68k-core: the low block is at #%x, the layout says #%x' % (base, REGION))
@@ -111,7 +111,7 @@ def relocate(core):
     low = bytearray(core[pos:pos + LOW_BLOCK]); pos += LOW_BLOCK
     objs = bytearray(core[pos:pos + ohi - olo]); pos += ohi - olo
     conses = bytearray(core[pos:pos + chi - clo])
-    nolo = STATIC_LO
+    nolo = static_lo or STATIC_LO
     nclo = (nolo + len(objs) + 4095) & ~4095
     if os.environ.get('MAC68K_CORE_NORELOC') == '1':
         # THE BISECT: the static heap left where the core run had it (a 32 MB
@@ -189,7 +189,25 @@ def main(image, disk):
     print('mac68k-core: the core run took %.0f s; it said:\n%s'
           % (time.time() - t0, console.decode('latin-1')[-400:]))
     open(disk + '.core', 'wb').write(core)        # as sent, for looking into
-    low, nolo, objs, nclo, conses = relocate(core)
+    # INIT-ONLY TEXT (cross.lisp *POOL-INIT-ONLY*): the resident image ends in
+    # literals only boot reads, after a "modusINI" marker; a core boot never
+    # reads them, so the static heap starts there, over them
+    k = img.find(b'modusINI', 0, resident)
+    static_lo = None
+    if k >= 0 and os.environ.get('MAC68K_CORE_KEEP_INIT') == '1':
+        print('mac68k-core: init-only text kept (MAC68K_CORE_KEEP_INIT=1)')
+    elif k >= 0:
+        static_lo = (LOAD + k + 4095) & ~4095
+        print('mac68k-core: init-only text: %d bytes at #%x; the static heap starts at #%x'
+              % (resident - k, LOAD + k, static_lo))
+    # MAC68K_CORE_STATIC_LO=ADDR puts the static heap at ADDR instead.  Basilisk
+    # II's LC 475 ROM uses RAM in [#xB3000, #xB9000) while the REPL runs (a core
+    # with its static heap there breaks DEFMACRO under Basilisk, measured, and
+    # runs on MAME's Classic); for a Basilisk test, start it at #xB9000 or above.
+    if os.environ.get('MAC68K_CORE_STATIC_LO'):
+        static_lo = int(os.environ['MAC68K_CORE_STATIC_LO'], 0)
+        print('mac68k-core: the static heap at #%x (MAC68K_CORE_STATIC_LO)' % static_lo)
+    low, nolo, objs, nclo, conses = relocate(core, static_lo)
     # 2. the disk: [image, low block end) in one read, the streams after it
     top = max(REGION + LOW_BLOCK, nclo + len(conses))
     chunk = bytearray(top - LOAD)

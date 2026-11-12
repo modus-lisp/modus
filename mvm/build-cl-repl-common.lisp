@@ -3223,6 +3223,15 @@
                                        "/tmp/modus-mac68k-cl-repl.bin")
                            ".cold")))))
 
+;;; :MAC68K: INIT-ONLY TEXT (cross.lisp *POOL-INIT-ONLY*), with the saved core:
+;;; the boot tables' packed text (symbol, function and global names) goes last
+;;; in the resident image, where mac68k-core.py starts the static heap over it.
+;;; MODUS_MAC68K_INIT_ONLY=0 keeps it in the pool.
+(defvar *mac-init-only*
+  (and *mac-cold-names-out*
+       (not (equal (sb-ext:posix-getenv "MODUS_MAC68K_INIT_ONLY") "0"))
+       (make-hash-table :test 'equal)))
+
 ;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
 ;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
 ;;; to switch them off in, no sockets or threads for them to wrap, and the text
@@ -3508,6 +3517,8 @@
           (symbol-value (sym "*68K-A5-GLOBALS*")) (knob "MODUS_68K_A5_GLOBALS")
           (symbol-value (sym "*68K-TAGS3*")) (knob "MODUS_68K_TAGS3")
           (symbol-value (sym "*68K-GC-STATIC*")) (and cl-user::*mac68k-gc-static* t))
+    (when cl-user::*mac-init-only*
+      (setf (symbol-value (sym "*POOL-INIT-ONLY*")) cl-user::*mac-init-only*))
     (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
       (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t)
       ;; ... and its AOT string literals narrow, as MODUS_NARROW_STRINGS does on

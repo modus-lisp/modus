@@ -220,6 +220,15 @@
     (when (zerop n) (error "MODUS_SMALL_IMAGE: ~S is no longer in the source it resizes" pat))
     text))
 
+;;; INIT-ONLY TEXT (the bare Mac's saved core, cross.lisp *POOL-INIT-ONLY*): a
+;;; boot table's packed text is read once, by boot.  (%INIT-ONLY TEXT) returns
+;;; TEXT, entering it in CL-USER::*MAC-INIT-ONLY* when that table exists, so its
+;;; literal is laid out where the core's disk can leave it off.
+(defun %init-only (text)
+  (when (and (boundp 'cl-user::*mac-init-only*) (symbol-value 'cl-user::*mac-init-only*))
+    (setf (gethash text (symbol-value 'cl-user::*mac-init-only*)) t))
+  text)
+
 ;; MODUS_SMALL_IMAGE: a global-cell cache of 1024 slots, not 16384 (compiler.lisp
 ;; *GV-CACHE-SLOTS*, set below): the Mac Classic build assigns 595, and the
 ;; vector was 64 KB of its static heap.  Names past the last slot keep the
@@ -2788,7 +2797,7 @@
       ;; and its global names, for %KERNEL-GLOBAL-SHADOW-P
       (format out "  (%snapshot-kernel-global-names (%kernel-global-names-text)))~%")
       (format out "(defun %kernel-global-names-text () ~S)~%"
-              (format nil "~{~A~^ ~}" *all-global-names*)))))
+              (%init-only (format nil "~{~A~^ ~}" *all-global-names*))))))
 
 ;; MODUS_SMALL_IMAGE: the globals' init thunks run in batches through one
 ;; guarded loop, not a HANDLER-CASE's code each (compiler.lisp *INIT-GLOBALS-BATCHED*).
@@ -2825,7 +2834,7 @@
       (when (or (find #\Newline k) (string= k ""))
         (error "emit-sft-auto-packed: key ~S is empty or holds a newline" k)))
     (with-output-to-string (out)
-      (format out "(defun %sft-auto-text () ~S)~%" (format nil "~{~A~^~%~}" keys))
+      (format out "(defun %sft-auto-text () ~S)~%" (%init-only (format nil "~{~A~^~%~}" keys)))
       (format out "(defun %sft-auto-put (text pos fn)
   (let ((j (or (position #\\Newline text :start pos) (length text))))
     (puthash (modus.runtime::%narrow-copy (subseq text pos j)) *symbol-function-table* fn)
@@ -2843,7 +2852,7 @@
       (format out "  (%snapshot-kernel-fn-names)~%")
       (format out "  (%snapshot-kernel-global-names (%kernel-global-names-text)))~%")
       (format out "(defun %kernel-global-names-text () ~S)~%"
-              (format nil "~{~A~^ ~}" *all-global-names*)))))
+              (%init-only (format nil "~{~A~^ ~}" *all-global-names*))))))
 
 (defvar *sft-auto-source*
   (if cl-user::*small-image*
@@ -2996,7 +3005,7 @@
       (error "emit-sym-name-auto-packed: symbol name ~S holds a newline" n)))
   (with-output-to-string (out)
     (format out "(defun %sym-name-auto-text () ~S)~%"
-            (format nil "~{~A~^~%~}" (remove "" names :test #'string=)))
+            (%init-only (format nil "~{~A~^~%~}" (remove "" names :test #'string=))))
     (format out "(defun %init-sym-name-auto ()
   (let ((text (%sym-name-auto-text)) (i 0))
     (let ((n (length text)))

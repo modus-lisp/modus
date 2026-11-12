@@ -66,8 +66,9 @@ def boot_mame(disk, nbytes, timeout=600):
     env = dict(os.environ, MAC68K_SERIAL_OUT=out, MAC68K_SERIAL_N=str(nbytes),
                MAC68K_SECONDS=os.environ.get("MAC68K_MAME_SECONDS", "150"))
     try:
-        subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, timeout=timeout)
+        subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,   # MAME writes cfg/ and
+                       stderr=subprocess.DEVNULL, timeout=timeout,  # nvram/ where it runs
+                       cwd=os.path.dirname(disk))
     except subprocess.TimeoutExpired:
         pass
     try:

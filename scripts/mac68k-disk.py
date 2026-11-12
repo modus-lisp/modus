@@ -19,7 +19,7 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # boot/boot-mac68k.lisp's image address for MODUS_MAC68K_MACHINE (lc / classic)
-LOAD_ADDR = {'lc': 0x00100000, 'classic': 0x00010000}[
+LOAD_ADDR = {'lc': 0x00100000, 'classic': 0x00040000}[
     (os.environ.get('MODUS_MAC68K_MACHINE') or 'lc').lower()]
 
 

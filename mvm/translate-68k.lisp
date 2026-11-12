@@ -202,6 +202,11 @@
 (defvar *68k-paged-cache* nil
   "Mac paged: (CACHE-LO CACHE-HI STAGING STAGING-SIZE LOAD-ADDR), set by
    boot-mac68k's MAC68K-CONFIGURE from the machine's layout.")
+(defconstant +68k-cache-ptr+ #x10006034
+  "Paged Mac: the code cache's next free byte (raw), in the low block so the
+   boot stub sets it for the machine it finds itself on.")
+(defconstant +68k-cache-hi+ #x10006038 "Paged Mac: the code cache's end (raw).")
+(defconstant +68k-cache-lo+ #x1000603C "Paged Mac: the code cache's start (raw).")
 (defvar *68k-stream-home-label* nil)
 (defvar *68k-stream-end-label* nil)
 
@@ -3791,14 +3796,14 @@
    in the static span [lo, lo + span) its card's mark is set.  Before the
    freeze (and when the span was too big for the mark table) span is 0 and
    nothing is marked; the collector then walks the whole static heap."
-  (let ((out (mvm-make-label)) (blk +68k-gc-static-block+))
+  (let ((out (mvm-make-label)) (blk (conv-real +68k-gc-static-block+)))
     (m68k-emit-label buf *68k-barrier-label*)
     (m68k-emit-word buf #x90B9) (m68k-emit-long buf (+ blk #x18))   ; SUB.L lo,D0
     (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ blk #x1C))   ; CMP.L span,D0
     (m68k-emit-bcc-word buf +68k-cc-cc+ out)                         ; outside the span
     (m68k-emit-word buf #x2239) (m68k-emit-long buf (+ blk #x20))   ; MOVE.L shift,D1
     (m68k-emit-word buf #xE2A8)                                     ; LSR.L D1,D0
-    (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)           ; 6 bytes
+    (m68k-emit-move-imm-an buf (conv-real +68k-card-marks+) +68k-a0+)           ; 6 bytes
     (m68k-emit-word buf #x50F0) (m68k-emit-word buf #x0800)         ; ST (0,A0,D0.L)
     (m68k-emit-label buf out)
     (m68k-emit-rts buf)))
@@ -3810,7 +3815,7 @@
    marked again when a slot still points into to-space afterwards, so a static
    object keeps being scanned while it refers to the young space.  Uses D7
    (card), A5 (cursor), A4, D3, D1, D0 and the scratch longword at blk+#x24."
-  (let* ((blk +68k-gc-static-block+)
+  (let* ((blk (conv-real +68k-gc-static-block+))
          (cl (mvm-make-label)) (cdone (mvm-make-label)) (cnext (mvm-make-label))
          (conses (mvm-make-label)) (olp (mvm-make-label)) (odone (mvm-make-label))
          (sl (mvm-make-label)) (leaf (mvm-make-label)) (keep (mvm-make-label))
@@ -3841,7 +3846,7 @@
       (m68k-emit-word buf #xE2A8)                           ; LSR.L D1,D0
       (m68k-emit-cmp-dn-dn buf +68k-d0+ +68k-d7+)            ; card - ncards
       (m68k-emit-bcc-word buf +68k-cc-cc+ cdone)
-      (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)
+      (m68k-emit-move-imm-an buf (conv-real +68k-card-marks+) +68k-a0+)
       (m68k-emit-word buf #x4A30) (m68k-emit-word buf #x7800) ; TST.B (0,A0,D7.L)
       (m68k-emit-beq buf cnext)
       (m68k-emit-word buf #x4230) (m68k-emit-word buf #x7800) ; CLR.B (0,A0,D7.L)
@@ -3864,7 +3869,7 @@
       (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                 ; A5 - ohi
       (m68k-emit-bcc-word buf +68k-cc-cc+ conses)
       ;; A5 += crossing[card] * 16 (255: nothing starts here)
-      (m68k-emit-move-imm-an buf +68k-card-crossing+ +68k-a0+)
+      (m68k-emit-move-imm-an buf (conv-real +68k-card-crossing+) +68k-a0+)
       (m68k-emit-moveq buf +68k-d0+ 0)
       (m68k-emit-word buf #x1030) (m68k-emit-word buf #x7800) ; MOVE.B (0,A0,D7.L),D0
       (m68k-emit-cmpi buf +68k-d0+ 255)
@@ -3938,7 +3943,7 @@
       (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
       (m68k-emit-tst buf +68k-d0+)
       (m68k-emit-beq buf cnext)
-      (m68k-emit-move-imm-an buf +68k-card-marks+ +68k-a0+)
+      (m68k-emit-move-imm-an buf (conv-real +68k-card-marks+) +68k-a0+)
       (m68k-emit-word buf #x50F0) (m68k-emit-word buf #x7800) ; ST (0,A0,D7.L)
       (here cnext)
       (m68k-emit-addq buf +68k-d7+ 1)
@@ -3952,7 +3957,7 @@
    Uses A5, A4, D7, D3, D1, D0 (all saved by the collector's entry)."
   (let ((ol (mvm-make-label)) (od (mvm-make-label)) (sl (mvm-make-label))
         (leaf (mvm-make-label)) (cl (mvm-make-label)) (cd (mvm-make-label))
-        (blk +68k-gc-static-block+))
+        (blk (conv-real +68k-gc-static-block+)))
     (flet ((here (l) (m68k-emit-label buf l)))
       ;; -- objects: A5 = cursor, [blk+8] = end --
       (m68k-emit-move-imm-an buf blk +68k-a0+)
@@ -4012,7 +4017,7 @@
    yet, keep [from, A2) and [A3, from + size) as the static ranges and continue
    on semispaces of size A3 - A2: the gap [A2, A3) and the start of the
    evacuated one.  Clears the request.  Clobbers D0, D1, A0."
-  (let ((skip (mvm-make-label)) (blk +68k-gc-static-block+))
+  (let ((skip (mvm-make-label)) (blk (conv-real +68k-gc-static-block+)))
     (m68k-emit-move-imm-an buf blk +68k-a0+)
     (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)          ; request
     (m68k-emit-tst buf +68k-d0+)
@@ -4088,7 +4093,7 @@
       ;; heap's FIXED start, as on arm32 -- a typed range must never be read
       ;; as conservative roots.
       (if *68k-gc-static*
-          (m68k-emit-move-imm-dn buf +68k-gc-heap-start+ +68k-d7+)
+          (m68k-emit-move-imm-dn buf (conv-real +68k-gc-heap-start+) +68k-d7+)
           (let ((have (lbl)))
             (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d7+)
             (m68k-emit-move-imm-an buf meta +68k-a0+)
@@ -4101,7 +4106,7 @@
       ;; ---- the static ranges, typed (empty until a freeze) ----
       (when *68k-gc-static*
         (let ((full (mvm-make-label)) (done (mvm-make-label)))
-          (m68k-emit-move-imm-an buf (+ +68k-gc-static-block+ #x1C) +68k-a0+)
+          (m68k-emit-move-imm-an buf (conv-real (+ +68k-gc-static-block+ #x1C)) +68k-a0+)
           (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
           (m68k-emit-tst buf +68k-d0+)
           (m68k-emit-beq buf full)
@@ -4985,7 +4990,9 @@
 (defun m68k-emit-paged-section (buf)
   "Paged: COLD-ENTER, the Mac's loader, the stream table and the home table,
    the descriptor the disk builder finds, then every stream (the section)."
-  (let ((miss (mvm-make-label)) (ill (mvm-make-label))
+  (let ((miss (mvm-make-label)) (ill (mvm-make-label)) (diskbias (mvm-make-label))
+        (alloc (mvm-make-label)) (ca5 (mvm-make-label)) (chk (mvm-make-label))
+        (ill-drive (mvm-make-label)) (ill-read (mvm-make-label)) (ill-full (mvm-make-label))
         (cacheptr (mvm-make-label)) (lastidx (mvm-make-label)) (pb (mvm-make-label))
         (fns (reverse *68k-paged-fns*))
         (mac (and *68k-mac-mode* *68k-paged-cache*)))
@@ -5001,28 +5008,34 @@
     (m68k-emit-label buf miss)
     (when mac
       (destructuring-bind (lo hi staging staging-size load-addr) *68k-paged-cache*
-        (declare (ignore lo))
+        (declare (ignore lo hi load-addr staging staging-size))
         (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
                (l32 (v) (m68k-emit-long buf v)))
           (ws #x48E7 #x7FFA)                                   ; MOVEM.L D1-D7/A0-A4/A6,-(SP)
+          (m68k-emit-lea-label buf ca5 +68k-a0+) (ws #x2089)   ; CA5 = A1: the caller's A5
           (ws #x2E00)                                          ; D7 = i*4
           (m68k-emit-lea-label buf lastidx +68k-a0+) (ws #x2080)   ; lastidx = D0
           (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a0+)
           (ws #x2A30 #x7800)                                   ; D5 = home[i]
           (ws #x2C30 #x7804)                                   ; D6 = home[i+1]
           (ws #x9C85)                                          ; D6 = length
-          (ws #x2805) (ws #x0484) (l32 (- load-addr 1024))     ; D4 = disk byte
+          (ws #x2805)                                          ; D4 = home
+          (m68k-emit-lea-label buf diskbias +68k-a0+)
+          (ws #x9890)                                          ; SUB.L (A0),D4: disk byte
           (ws #x2604 #x0283) (l32 511)                         ; D3 = skip (D4 mod 512)
           (ws #x9883)                                          ; D4 = first block's byte
           (ws #x2403 #xD486 #x0682) (l32 511)
           (ws #x0282) (l32 #xFFFFFE00)                         ; D2 = bytes to read
-          (ws #x0C82) (l32 staging-size)                       ; too big for the staging?
-          (m68k-emit-bcc-word buf +68k-cc-hi+ ill)
+          ;; the blocks go straight into the code cache, at the place the FIFO
+          ;; allocator finds for D2 bytes (A4); the stream is then slid down
+          ;; over the lead-in (D3 bytes)
+          (m68k-emit-bsr buf alloc)
+          (ws #x4A80) (m68k-emit-bne buf ill-full)             ; TST.L D0: no room at all
           ;; the boot drive's drive-queue element (BootDrive $210, DrvQHdr $30A)
           (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label)))
             (ws #x3238 #x0210 #x2678 #x030A)
             (m68k-emit-label buf dq)
-            (ws #x200B) (m68k-emit-beq buf ill)
+            (ws #x200B) (m68k-emit-beq buf ill-drive)
             (ws #xB26B #x0006) (m68k-emit-beq buf found)
             (ws #x2653) (m68k-emit-bra buf dq)
             (m68k-emit-label buf found)
@@ -5034,42 +5047,67 @@
             (m68k-emit-lea-label buf pb +68k-a0+)
             (ws #x316B #x0006 #x0016)                          ; ioVRefNum = dQDrive
             (ws #x316B #x0008 #x0018)                          ; ioRefNum = dQRefNum
-            (ws #x217C) (l32 staging) (ws #x0020)              ; ioBuffer
+            (ws #x214C #x0020)                                 ; ioBuffer = A4
             (ws #x2142 #x0024)                                 ; ioReqCount = D2
             (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart
             (ws #x2144 #x002E)                                 ; ioPosOffset = D4
             (ws #xA002)                                        ; _Read
-            (ws #x4A40) (m68k-emit-bne buf ill))
-          ;; a place in the code cache (word-aligned)
-          (m68k-emit-lea-label buf cacheptr +68k-a0+)
-          (ws #x2850 #x200C #xD086 #x5280 #x0280) (l32 #xFFFFFFFE)
-          (ws #x0C80) (l32 hi) (m68k-emit-bcc-word buf +68k-cc-hi+ ill)
-          (ws #x2080)                                          ; cacheptr = the next free byte
-          ;; copy the stream there from the staging buffer
-          (ws #x247C) (l32 staging) (ws #xD5C3 #x264C #x2006)
-          (ws #x5380 #x6B04 #x16DA #x60F8)                     ; D6 bytes, a byte at a time
+            (ws #x4A40) (m68k-emit-bne buf ill-read))
+          ;; slide the stream down to A4: A2 = A4 + skip, D6 bytes, upward (dest < src)
+          (ws #x244C #xD5C3 #x264C #x2006)
+          (ws #x5380 #x6B04 #x16DA #x60F8)
+          ;; the allocator's next place: A4 + length, even
+          (ws #x200C #xD086 #x5280 #x0280) (l32 #xFFFFFFFE)
+          (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
+          (ws #x2080)
           (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a0+)
           (ws #x218C #x7800)                                   ; table[i] = A4
+          ;; MODUS_68K_PAGED_CHECK=1: every root into the cache must be inside a
+          ;; loaded stream, or an active one was evicted (!LDR-LOST)
+          (when (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CHECK") "1")
+            (m68k-emit-bsr buf chk))
           (ws #x4CDF #x5FFE)                                   ; MOVEM.L (SP)+,D1-D7/A0-A4/A6
           (m68k-emit-lea-label buf lastidx +68k-a5+) (ws #x2015)
           (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
           (ws #x2A75 #x0800)                                   ; A5 = the stream
-          (m68k-emit-bra buf *68k-thread-next-label*))))
+          (m68k-emit-bra buf *68k-thread-next-label*)
+          ;; a stream that cannot be had: say which way on serial port A, stop
+          (loop for (label text) in (list (list ill-drive "!LDR-DRIVE") (list ill-read "!LDR-READ")
+                                          (list ill-full "!LDR-FULL"))
+                do (m68k-emit-label buf label)
+                   (loop for ch across text
+                         do (m68k-emit-moveq buf +68k-d0+ (char-code ch))
+                            (m68k-emit-bsr buf *68k-mac-console-label*))
+                   (m68k-emit-moveq buf +68k-d0+ 10)
+                   (m68k-emit-bsr buf *68k-mac-console-label*)
+                   (let ((spin (mvm-make-label)))
+                     (m68k-emit-label buf spin)
+                     (m68k-emit-bra buf spin)))
+          (m68k-emit-paged-alloc buf alloc (length fns) ca5)
+          (when (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CHECK") "1")
+            (m68k-emit-paged-check buf chk (length fns) ca5)))))
     (m68k-emit-label buf ill)
     (m68k-emit-word buf #x4AFC)                               ; ILLEGAL: not loadable
-    ;; data: the cache's next free byte, the entry being loaded, a parameter block
+    ;; data: the entry being loaded, a parameter block
     (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-word buf #x4E71))
     (m68k-emit-label buf cacheptr)
-    (m68k-emit-long buf (if *68k-paged-cache* (first *68k-paged-cache*) 0))
+    (m68k-emit-long buf 0)                                    ; (unused: low-block word now)
     (m68k-emit-label buf lastidx)
+    (m68k-emit-long buf 0)
+    (m68k-emit-label buf ca5)
     (m68k-emit-long buf 0)
     (m68k-emit-label buf pb)
     (dotimes (i 40) (m68k-emit-word buf 0))
-    ;; the descriptor: "modusPGD", the table's address, the count, the section
+    ;; the descriptor: "modusPGD", the table's address, the count, the
+    ;; section, and the DISK BIAS: home address - bias = the stream's byte on
+    ;; the boot disk (load address - 1024 when the image follows the boot
+    ;; blocks; scripts/mac68k-disk.py rewrites it when the streams go elsewhere)
     (dolist (w '(#x6D6F #x6475 #x7350 #x4744)) (m68k-emit-word buf w))
     (m68k-emit-abs32-data buf *68k-stream-table-label*)
     (m68k-emit-long buf (length fns))
     (m68k-emit-abs32-data buf *68k-stream-section-label*)
+    (m68k-emit-label buf diskbias)
+    (m68k-emit-long buf (if *68k-paged-cache* (- (fifth *68k-paged-cache*) 1024) 0))
     ;; the stream table (live: the stream's address; bit 0 = not loaded) and
     ;; the home table (where each stream is in the image; one more: the end)
     (m68k-emit-label buf *68k-stream-table-label*)
@@ -5088,6 +5126,204 @@
           (m68k-emit-stream-body buf start end w)
           (m68k-word-align buf))))
     (m68k-emit-label buf *68k-stream-end-label*)))
+
+(defun m68k-emit-paged-alloc (buf alloc count ca5)
+  "The code cache's FIFO allocator, at ALLOC: D2 = bytes wanted.  Returns A4 =
+   the place and D0 = 0, or D0 = 1 when no place exists.  Preserves D2-D7 and
+   A1-A3, A5, A6.
+
+   A place is taken at the allocation pointer, wrapping to the cache's start.
+   It must hold no ACTIVE stream: one some ROOT points into.  The roots are
+   exact, because every Lisp function of a paged image is threaded and keeps its
+   caller's token pointer at -4(A6): the caller's A5 (CA5, which the loader
+   keeps), -4 of every frame on the A6 chain, the jmpbuf's and every stacked
+   handler frame's A5 (+28).  An active stream is skipped; every stream
+   overlapping the place is then marked NOT LOADED (home | 1), to be read again
+   when next called."
+  (let ((top (mvm-make-label)) (wrapped (mvm-make-label)) (roots (mvm-make-label))
+        (chain (mvm-make-label)) (cdone (mvm-make-label)) (frames (mvm-make-label))
+        (fdone (mvm-make-label)) (evict (mvm-make-label)) (enext (mvm-make-label))
+        (ekeep (mvm-make-label)) (ok (mvm-make-label)) (fail (mvm-make-label))
+        (inplace (mvm-make-label)) (ipnext (mvm-make-label)) (ipno (mvm-make-label))
+        (moved (mvm-make-label)) (hb (m68k-hbase)))
+    (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+           (l32 (v) (m68k-emit-long buf v)))
+      (m68k-emit-label buf alloc)
+      (ws #x48E7 #x3F76)                         ; MOVEM.L D2-D7/A1-A3/A5/A6,-(SP)
+      (ws #x7C00)                                ; D6 = 0: wraps
+      (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
+      (ws #x2850)                                ; A4 = the allocation pointer
+      ;; ---- try [A4, D7 = A4 + D2) ----
+      (m68k-emit-label buf top)
+      (ws #x200C #xD082 #x2E00)                  ; D0 = D7 = A4 + D2
+      (ws #xB0B9) (l32 (conv-real +68k-cache-hi+))
+      (m68k-emit-bcc-word buf +68k-cc-ls+ roots)
+      (m68k-emit-label buf wrapped)
+      (ws #x5286 #x0C86) (l32 2)                 ; ++wraps > 2: nothing fits
+      (m68k-emit-bcc-word buf +68k-cc-gt+ fail)
+      (ws #x2879) (l32 (conv-real +68k-cache-lo+)) ; A4 = the cache's start
+      (m68k-emit-bra buf top)
+      ;; ---- the roots: an active stream in the place moves it past that stream ----
+      (m68k-emit-label buf roots)
+      (m68k-emit-lea-label buf ca5 +68k-a0+)
+      (ws #x2010) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)   ; the caller's A5
+      ;; the A6 chain, up to the stack base, strictly upward
+      (ws #x204E)                                ; A0 = A6
+      (ws #x2479) (l32 (conv-real #x10000058))   ; A2 = the stack base
+      (m68k-emit-label buf chain)
+      (ws #xB1CA) (m68k-emit-bcc-word buf +68k-cc-cc+ cdone)           ; A0 >= base
+      (ws #x2028 #xFFFC) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved) ; -4(A0)
+      (ws #x2248 #x2050)                         ; A1 = A0; A0 = (A0)
+      (ws #xB1C9) (m68k-emit-bcc-word buf +68k-cc-ls+ cdone)           ; not upward: stop
+      (m68k-emit-bra buf chain)
+      (m68k-emit-label buf cdone)
+      ;; the jmpbuf's A5, then each stacked handler frame's
+      (m68k-emit-move-imm-an buf (+ hb #x180) +68k-a0+)
+      (ws #x2028 #x001C) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
+      (ws #x2239) (l32 (+ hb #x400))             ; D1 = depth
+      (ws #x0C81) (l32 *68k-hstack-max-depth*)
+      (m68k-emit-bcc-word buf +68k-cc-ls+ frames)
+      (ws #x7200 #xD2BC) (l32 *68k-hstack-max-depth*)   ; D1 = the cap
+      (m68k-emit-label buf frames)
+      (m68k-emit-move-imm-an buf (+ hb #x408) +68k-a0+)
+      (let ((fl (mvm-make-label)))
+        (m68k-emit-label buf fl)
+        (ws #x4A81) (m68k-emit-beq buf fdone)
+        (ws #x2028 #x001C) (m68k-emit-bsr buf inplace) (m68k-emit-bne buf moved)
+        (ws #x41E8 #x0020 #x5381)                ; A0 += 32; D1 -= 1
+        (m68k-emit-bra buf fl))
+      (m68k-emit-label buf fdone)
+      (m68k-emit-bra buf evict)
+      (m68k-emit-label buf moved)
+      (m68k-emit-bra buf top)
+      ;; ---- INPLACE: D0 a root's value.  When it is inside a loaded stream
+      ;; that OVERLAPS the place [A4, D7) -- not merely when D0 is in the place:
+      ;; eviction takes every stream overlapping it, and a root can point at
+      ;; the part before A4 (measured: !LDR-LOST, the REPL's own caller) --
+      ;; A4 = that stream's end (even) and Z clear; else Z set.
+      ;; Uses D3-D5, A3, A5 ----
+      (m68k-emit-label buf inplace)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-lo+)) (m68k-emit-bcc-word buf +68k-cc-cs+ ipno)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-hi+)) (m68k-emit-bcc-word buf +68k-cc-cc+ ipno)
+      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
+      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
+      (m68k-emit-move-imm-dn buf (1- count) +68k-d5+)
+      (m68k-emit-label buf ipnext)
+      (let ((skip (mvm-make-label)))
+        (ws #x2613 #x0803 #x0000) (m68k-emit-bne buf skip)             ; not loaded
+        (ws #xB680) (m68k-emit-bcc-word buf +68k-cc-hi+ skip)          ; starts after D0
+        (ws #x282D #x0004 #x9895 #xD883)                               ; D4 = its end
+        (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-ls+ skip)          ; ends at or before D0
+        ;; D0's stream is [D3, D4): does it overlap the place?
+        (ws #xB88C) (m68k-emit-bcc-word buf +68k-cc-ls+ ipno)          ; ends by A4
+        (ws #xB687) (m68k-emit-bcc-word buf +68k-cc-cc+ ipno)          ; starts at/after D7
+        (ws #x5284 #x0284) (l32 #xFFFFFFFE)
+        (ws #x2844 #x7601 #x4E75)                ; A4 = past it; Z clear; RTS
+        (m68k-emit-label buf skip)
+        (ws #x588B #x588D)
+        (ws #x51CD) (m68k-emit-word buf 0) (m68k-emit-fixup buf ipnext :disp16))
+      (m68k-emit-label buf ipno)
+      (ws #x7600 #x4E75)                         ; Z set; RTS
+      ;; ---- the place holds no active stream: evict what overlaps it ----
+      (m68k-emit-label buf evict)
+      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
+      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
+      (m68k-emit-move-imm-dn buf (1- count) +68k-d5+)
+      (m68k-emit-label buf enext)
+      (ws #x2213 #x0801 #x0000)                  ; D1 = entry; BTST #0
+      (m68k-emit-bne buf ekeep)
+      (ws #xB287) (m68k-emit-bcc-word buf +68k-cc-cc+ ekeep)  ; entry >= D7: after it
+      (ws #x242D #x0004 #x9495 #xD481)           ; D2' = its end
+      (ws #xB48C) (m68k-emit-bcc-word buf +68k-cc-ls+ ekeep)  ; end <= A4: before it
+      (ws #x2215 #x08C1 #x0000 #x2681)           ; entry = home | 1
+      (m68k-emit-label buf ekeep)
+      (ws #x588B #x588D)
+      (ws #x51CD) (m68k-emit-word buf 0) (m68k-emit-fixup buf enext :disp16)
+      (ws #x7000)                                ; D0 = 0: found
+      (m68k-emit-bra buf ok)
+      (m68k-emit-label buf fail)
+      (ws #x7001)                                ; D0 = 1
+      (m68k-emit-label buf ok)
+      (ws #x4CDF #x6EFC)                         ; MOVEM.L (SP)+,D2-D7/A1-A3/A5/A6
+      (ws #x4E75))))
+
+(defun m68k-emit-paged-check (buf chk count ca5)
+  "MODUS_68K_PAGED_CHECK: at CHK, walk the allocator's roots; one pointing into
+   the cache but into no loaded stream prints !LDR-LOST, the root's kind (C
+   caller, F frame chain, J jmpbuf, H handler frame), its value and the root's
+   address, and stops.  Uses D0-D7, A0-A5."
+  (let ((one (mvm-make-label)) (scan (mvm-make-label)) (found (mvm-make-label))
+        (lost (mvm-make-label)) (hex (mvm-make-label)) (hb (m68k-hbase)))
+    (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+           (l32 (v) (m68k-emit-long buf v))
+           (putc () (m68k-emit-bsr buf *68k-mac-console-label*)))
+      (m68k-emit-label buf chk)
+      (m68k-emit-lea-label buf ca5 +68k-a0+)
+      (ws #x7C43) (ws #x2010) (m68k-emit-bsr buf one)            ; 'C'
+      (ws #x7C46 #x204E)                                         ; 'F', A0 = A6
+      (ws #x2479) (l32 (conv-real #x10000058))
+      (let ((cl (mvm-make-label)) (cd (mvm-make-label)))
+        (m68k-emit-label buf cl)
+        (ws #xB1CA) (m68k-emit-bcc-word buf +68k-cc-cc+ cd)
+        (ws #x2028 #xFFFC) (m68k-emit-bsr buf one)
+        (ws #x2248 #x2050 #xB1C9) (m68k-emit-bcc-word buf +68k-cc-ls+ cd)
+        (m68k-emit-bra buf cl)
+        (m68k-emit-label buf cd))
+      (ws #x7C4A) (m68k-emit-move-imm-an buf (+ hb #x180) +68k-a0+)   ; 'J'
+      (ws #x2028 #x001C) (m68k-emit-bsr buf one)
+      (ws #x7C48 #x2239) (l32 (+ hb #x400))                      ; 'H', D1 = depth
+      (m68k-emit-move-imm-an buf (+ hb #x408) +68k-a0+)
+      (let ((fl (mvm-make-label)) (fd (mvm-make-label)))
+        (m68k-emit-label buf fl)
+        (ws #x4A81) (m68k-emit-beq buf fd)
+        (ws #x0C81) (l32 *68k-hstack-max-depth*) (m68k-emit-bcc-word buf +68k-cc-hi+ fd)
+        (ws #x2028 #x001C) (m68k-emit-bsr buf one)
+        (ws #x41E8 #x0020 #x5381)
+        (m68k-emit-bra buf fl)
+        (m68k-emit-label buf fd))
+      (ws #x4E75)
+      ;; ONE: D0 = a root's value, A0 = where (A0-4 for the chain), D6 = kind
+      (m68k-emit-label buf one)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-lo+)) (m68k-emit-bcc-word buf +68k-cc-cs+ found)
+      (ws #xB0B9) (l32 (conv-real +68k-cache-hi+)) (m68k-emit-bcc-word buf +68k-cc-cc+ found)
+      (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a3+)
+      (m68k-emit-lea-label buf *68k-stream-home-label* +68k-a5+)
+      (m68k-emit-move-imm-dn buf (1- count) +68k-d5+)
+      (m68k-emit-label buf scan)
+      (let ((skip (mvm-make-label)))
+        (ws #x2613 #x0803 #x0000) (m68k-emit-bne buf skip)
+        (ws #xB680) (m68k-emit-bcc-word buf +68k-cc-hi+ skip)
+        (ws #x282D #x0004 #x9895 #xD883)
+        (ws #xB880) (m68k-emit-bcc-word buf +68k-cc-ls+ skip)
+        (m68k-emit-bra buf found)
+        (m68k-emit-label buf skip)
+        (ws #x588B #x588D)
+        (ws #x51CD) (m68k-emit-word buf 0) (m68k-emit-fixup buf scan :disp16))
+      (m68k-emit-label buf lost)
+      (ws #x2E00 #x2A08)                         ; D7 = value, D5 = where
+      (loop for ch across "!LDR-LOST " do (m68k-emit-moveq buf +68k-d0+ (char-code ch)) (putc))
+      (ws #x2006) (putc)                         ; the kind
+      (m68k-emit-moveq buf +68k-d0+ 32) (putc)
+      (ws #x2607) (m68k-emit-bsr buf hex)        ; the value
+      (m68k-emit-moveq buf +68k-d0+ 32) (putc)
+      (ws #x2605) (m68k-emit-bsr buf hex)        ; where
+      (m68k-emit-moveq buf +68k-d0+ 10) (putc)
+      (let ((spin (mvm-make-label))) (m68k-emit-label buf spin) (m68k-emit-bra buf spin))
+      (m68k-emit-label buf found)
+      (ws #x4E75)
+      ;; HEX: D3 as eight digits.  Uses D0, D4.
+      (m68k-emit-label buf hex)
+      (ws #x7807)                                ; D4 = 7
+      (let ((hl (mvm-make-label)) (digit (mvm-make-label)))
+        (m68k-emit-label buf hl)
+        (ws #xE99B)                              ; ROL.L #4,D3
+        (ws #x7000 #x1003 #x0200 #x000F)         ; D0 = D3 & 15 (byte)
+        (ws #x0C00 #x0009) (m68k-emit-bcc-word buf +68k-cc-ls+ digit)
+        (ws #x5E00)                              ; + 7 ('A' - '9' - 1)
+        (m68k-emit-label buf digit)
+        (ws #x0600 #x0030) (putc)                ; + '0'
+        (ws #x51CC) (m68k-emit-word buf 0) (m68k-emit-fixup buf hl :disp16))
+      (ws #x4E75))))
 
 (defun m68k-emit-abs32-data (buf label)
   "A longword holding LABEL's absolute address (patched after layout)."

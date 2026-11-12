@@ -3147,9 +3147,15 @@
   (setq *cli-arch-io-scratch-source*
         (concatenate 'string (funcall (find-symbol "MAC68K-COINIT-TEXT" "MODUS.MVM"))
                      *cli-arch-io-scratch-source*))
-  (let ((scr (symbol-value (find-symbol "+MAC68K-SCRATCH+" "MODUS.MVM"))))
+  (let ((scr (symbol-value (find-symbol "+MAC68K-SCRATCH+" "MODUS.MVM")))
+        ;; the I/O buffer: the layout's :IO-BUF where it names one (the Classic's
+        ;; 4 MB has no room for 256 KB of it), else 256 KB past the scratch page
+        (iob (or (getf (cdr (assoc (symbol-value (find-symbol "*MAC68K-MACHINE*" "MODUS.MVM"))
+                                   (symbol-value (find-symbol "*MAC68K-LAYOUTS*" "MODUS.MVM"))))
+                       :io-buf)
+                 (+ (symbol-value (find-symbol "+MAC68K-SCRATCH+" "MODUS.MVM")) #x40000))))
     (dolist (pair (list (cons "#x0FE00000" (format nil "#x~X" scr))
-                        (cons "#x0FF00000" (format nil "#x~X" (+ scr #x40000)))))
+                        (cons "#x0FF00000" (format nil "#x~X" iob))))
       (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
         (unless at (error "mac68k: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
         (setq *cli-arch-io-scratch-source*
@@ -3167,6 +3173,120 @@
         (concatenate 'string *cli-arch-override-source*
                      (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline)))
   (defparameter cl-user::*68k-pool-narrow* t))
+
+;;; :MAC68K'S KERNEL PROLOGUE: the banner only.  The 32-bit prologue it shared
+;;; (*CL-REPL-I386-KERNEL-PROLOGUE*) zeroes the global table, the symbol table,
+;;; the MV slots and the fault slots -- BSS-equivalent init that the Mac's boot
+;;; stub already does for the whole low block on a boot from scratch, and that
+;;; runs BEFORE kernel-main's core check: on a boot from a saved core it wiped
+;;; the core's global and symbol tables (measured: TYPE-OF of a condition was
+;;; NIL, and the first form typed faulted).
+(when *cl-repl-mac68k-p*
+  (setq *cli-arch-kernel-prologue* "  (write-string-serial \"MODUS-CL\")
+  (write-char-serial 10)
+"))
+
+;;; :MAC68K: THE STATIC HEAP AND THE SAVED CORE (MODUS_68K_GC_STATIC, which
+;;; follows MODUS_SMALL_IMAGE as on the hosted 68k CLI).  After boot the heap is
+;;; frozen (mvm/68k-gc-static.lisp, as mvm/build-68k-cli.lisp does).  On the
+;;; Classic layout a boot whose stub found the SAVE flag (the build's core run,
+;;; scripts/mac68k-core.py) then sends its core over serial port A -- "MCOR",
+;;; the low block's address and the static ranges, the low block, the static
+;;; objects and conses -- and stops; a boot whose stub found a CORE (the low
+;;; block's #x10006014 set, as the core was saved) skips boot init and goes
+;;; straight to the REPL.
+(defun %mac68k-small-image-env-p ()
+  "MODUS_SMALL_IMAGE's rule, read before build-cli-common defines *SMALL-IMAGE*."
+  (let ((s (sb-ext:posix-getenv "MODUS_SMALL_IMAGE")))
+    (and s (plusp (length s)) (not (string= s "0")))))
+(defvar *mac68k-gc-static*
+  (and *cl-repl-mac68k-p*
+       (let ((v (sb-ext:posix-getenv "MODUS_68K_GC_STATIC")))
+         (cond ((null v) (%mac68k-small-image-env-p)) ((string= v "0") nil) (t t)))))
+(when *mac68k-gc-static*
+  (let* ((tags3 (let ((v (sb-ext:posix-getenv "MODUS_68K_TAGS3")))
+                  (cond ((null v) (%mac68k-small-image-env-p)) ((string= v "0") nil) (t t))))
+         (text (mvm-text "mvm/68k-gc-static.lisp")))
+    (dolist (p (if tags3
+                   '(("GRAN-1" . "7") ("MINUS-GRAN" . "-8") ("MAX-SHIFT" . "10") ("MINUS-KSHIFT" . "-3"))
+                   '(("GRAN-1" . "15") ("MINUS-GRAN" . "-16") ("MAX-SHIFT" . "11") ("MINUS-KSHIFT" . "-4"))))
+      (loop for i = (search (car p) text) while i
+            do (setq text (concatenate 'string (subseq text 0 i) (cdr p)
+                                       (subseq text (+ i (length (car p))))))))
+    (setq *cli-arch-override-source*
+          (concatenate 'string *cli-arch-override-source* (string #\Newline) text "
+;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.py).
+(defun %core-requested-p () (eql (mem-ref #x10006014 :u32) 1))
+(defun %core-pre-restore () t)
+(defun %restore-image () nil)
+(defun %core-post-restore () nil)
+(defun %mac-send-u32 (v)
+  (write-char-serial (logand (ash v -24) 255)) (write-char-serial (logand (ash v -16) 255))
+  (write-char-serial (logand (ash v -8) 255)) (write-char-serial (logand v 255)))
+(defun %mac-send-range (a n)
+  (let ((i 0))
+    (loop (when (>= i n) (return nil))
+          (write-char-serial (mem-ref (+ a i) :u8))
+          (setq i (+ i 1)))))
+(defun %mac-send-core ()
+  \"Send this boot's core on serial port A and stop: right after the freeze,
+   allocating nothing (no saved word may point at the young space, which a
+   core does not carry), the low block made as a core boot must find it.\"
+  (setf (mem-ref #x1000921C :u32) 0)             ; the screen console off: bytes only
+  (let ((olo (mem-ref #x10006004 :u32)) (ohi (mem-ref #x10006008 :u32))
+        (clo (mem-ref #x1000600C :u32)) (chi (mem-ref #x10006010 :u32))
+        (base (%conv-addr #x10000000)))
+    (setf (mem-ref #x10006014 :u32) 1)           ; a core
+    (setf (mem-ref #x10006000 :u32) 0)           ; no freeze request
+    (setf (mem-ref #x1000601C :u32) 0)           ; cards off until %GC-CARDS-INIT
+    (setf (mem-ref #x10000400 :u32) 0)           ; handler depth
+    (setf (mem-ref #x10000180 :u32) 0)           ; armed jmpbuf
+    (setf (mem-ref #x10000360 :u32) 0)           ; capped pushes
+    (write-char-serial 77) (write-char-serial 67) (write-char-serial 79) (write-char-serial 82)
+    (%mac-send-u32 base) (%mac-send-u32 olo) (%mac-send-u32 ohi)
+    (%mac-send-u32 clo) (%mac-send-u32 chi)
+    (%mac-send-range base #x20000)
+    (%mac-send-range olo (- ohi olo))
+    (%mac-send-range clo (- chi clo))
+    (halt)))
+")))
+  ;; after the boot self-check: freeze, then (the core run) send the core
+  (let* ((k "(write-string-serial \"E2SMOKE-END\") (write-char-serial 10)
+")
+         (at (search k *cli-arch-kernel-epilogue*)))
+    (unless at (error "mac68k: E2SMOKE-END moved out of *CLI-ARCH-KERNEL-EPILOGUE*"))
+    (setq *cli-arch-kernel-epilogue*
+          (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 (+ at (length k)))
+                       "  (%gc-static-freeze)
+  (when (eql (mem-ref #x1000602C :u32) 1) (%mac-send-core))
+"
+                       (subseq *cli-arch-kernel-epilogue* (+ at (length k))))))
+  ;; a core boot: the cards (the core's are for where its heap was), then the REPL
+  (setq *cli-arch-core-resume* "    (%gc-cards-init)
+    (setq *jit-bridge-on* t)
+    (setq *%arith-strict* t)
+    ;; MODUS_MAC_CORE_PROBES: which subsystem a resumed core breaks in
+    (when (eql (mem-ref #x10006030 :u32) 1)
+      (write-string-serial \"P1 eval=\")
+      (print-dec (handler-case (mvm-eval (quote (+ 1 2)))
+                   (t (c) (write-string-serial \"ERR \")
+                          (handler-case (write-object (type-of c)) (t (c2) (write-string-serial \"?type\")))
+                          (write-char-serial 32)
+                          (handler-case (write-object c) (t (c2) (write-string-serial \"?print\")))
+                          (write-char-serial 32) -1)))
+      (write-char-serial 10)
+      (write-string-serial \"P2 read=\")
+      (print-dec (handler-case (read-from-string \"42\") (t (c) -1))) (write-char-serial 10)
+      (write-string-serial \"P3 typep=\")
+      (print-dec (handler-case (if (typep (list 1) (quote list)) 1 0) (t (c) -1))) (write-char-serial 10)
+      (write-string-serial \"P4 print=\")
+      (handler-case (write-object 7) (t (c) (write-string-serial \"ERR\"))) (write-char-serial 10)
+      (write-string-serial \"P5 eval-read=\")
+      (print-dec (handler-case (mvm-eval (read-from-string \"(+ 1 2)\")) (t (c) -1))) (write-char-serial 10))
+    (handler-case (cl-serial-repl)
+      (t (c) (write-string-serial \"REPL-DIED\") (write-char-serial 10)))
+    (halt)
+"))
 
 ;;; ============================================================
 ;;; THE SHARED ASSEMBLY
@@ -3339,7 +3459,8 @@
           (symbol-value (sym "*68K-SHARED-SEQUENCES*")) (knob "MODUS_68K_SHARED")
           (symbol-value (sym "*68K-LI-SHIFT*")) (and cl-user::*small-image* t)
           (symbol-value (sym "*68K-A5-GLOBALS*")) (knob "MODUS_68K_A5_GLOBALS")
-          (symbol-value (sym "*68K-TAGS3*")) (knob "MODUS_68K_TAGS3"))
+          (symbol-value (sym "*68K-TAGS3*")) (knob "MODUS_68K_TAGS3")
+          (symbol-value (sym "*68K-GC-STATIC*")) (and cl-user::*mac68k-gc-static* t))
     (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
       (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t))
     (let ((v (sb-ext:posix-getenv "MODUS_68K_THREADED")))
@@ -3354,7 +3475,8 @@
                       do (let ((n (string-trim " " l)))
                            (when (plusp (length n)) (setf (gethash n h) t)))))
               (setf (symbol-value (sym "*68K-HOT-NAMES*")) h))))))
-    (format t "~&;; mac68k:~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~%"
+    (format t "~&;; mac68k:~@[ gc-static~*~]~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~%"
+            (symbol-value (sym "*68K-GC-STATIC*"))
             (symbol-value (sym "*68K-TAGS3*")) (symbol-value (sym "*68K-THREADED*"))
             (symbol-value (sym "*68K-A5-GLOBALS*")) (symbol-value (sym "*68K-RELAX-BRANCHES*"))
             (symbol-value (sym "*POOL-NARROW-STRINGS*")))))
@@ -3995,7 +4117,10 @@
          (format t "~&;; mac68k TRANSLATOR GAPS (ILLEGAL if run): ~{#x~X~^ ~}~%"
                  (sort (copy-list gaps) #'<)))
        (let* ((load (symbol-value (intern "+MAC68K-LOAD-ADDR+" "MODUS.MVM")))
-              (end (+ load (length (kernel-image-image-bytes image))))
+              ;; a paged image: only the part before its stream section is in RAM
+              (tail (symbol-value (intern "*68K-TAIL-MOVE*" "MODUS.MVM")))
+              (end (+ load (if (and tail (cddr tail)) (cddr tail)
+                               (length (kernel-image-image-bytes image)))))
               (top (symbol-value (intern "+MAC68K-STACK-TOP+" "MODUS.MVM"))))
          (format t "~&;; mac68k map: image #x~X .. #x~X (~,1F MB), stack top #x~X, ~
                     region #x~X~%"
@@ -4007,9 +4132,16 @@
            (maphash (lambda (fn vals)
                       (format t ";;   ~A~{ #x~X~}~%" fn (remove-duplicates vals)))
                     cl-user::*conv-value-hits*))
-         (when (> (+ end #x200000) top)
-           (error "mac68k layout: the image ends at #x~X, within 2 MB of the stack top ~
-                   #x~X." end top))))
+         (let ((static-lo (getf (cdr (assoc (symbol-value (intern "*MAC68K-MACHINE*" "MODUS.MVM"))
+                                            (symbol-value (intern "*MAC68K-LAYOUTS*" "MODUS.MVM"))))
+                                :static-lo)))
+           (if static-lo
+               (format t "~&;; mac68k Classic: resident image ends at #x~X, ~:[OVER~;under~] the ~
+                          static heap's #x~X by ~D bytes~%"
+                       end (<= end static-lo) static-lo (abs (- static-lo end)))
+               (when (> (+ end #x200000) top)
+                 (error "mac68k layout: the image ends at #x~X, within 2 MB of the stack top ~
+                         #x~X." end top))))))
       ;; ---- ARMv7 QEMU virt (boot-arm32-cl.lisp's map) -----------------
       ;; The image runs at VA #x10000 and grows up; the stack grows DOWN from
       ;; +ARM32-CL-STACK-TOP+, and the L1 table sits above it.  Everything

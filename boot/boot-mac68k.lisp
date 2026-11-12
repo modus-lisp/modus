@@ -53,14 +53,29 @@
               ;; staging buffer, between the resident image and the stack
               :cache-lo #x00400000 :cache-hi #x00660000
               :staging #x00660000 :staging-size #x00010000)
-    ;; the Classic: image from 64 KB, I/O scratch (a CL image's) at 1.44 MB,
-    ;; a 64 KB stack under 2 MB, the region at 2 MB with a 1 MB heap (two
-    ;; 512 KB semispaces) and a 64 KB guard, the kind map, NIL's page under
-    ;; the screen.  A CL REPL image (5.5 MB) does not fit 4 MB: this map is
-    ;; for the ladder's images until it is made to.
-    (:classic :load #x00010000 :stack-top #x00200000 :scratch #x00170000
-              :region #x00200000 :heap-size #x00100000 :gc-guard #x00010000
-              :kind-map #x00320000 :nil-page #x003E0000)))
+    ;; THE CLASSIC (4 MB, booting from a saved core): the resident image from
+    ;; 64 KB, the static heap the core brings, then the runtime-data region
+    ;; (low block, then the YOUNG pair right after it, so the kind map -- which
+    ;; covers [region, young end) -- is small), the code cache and the
+    ;; loader's staging buffer, NIL's page, the stack, the screen at #x3FA700.
+    ;; The boot blocks read [image, low block end) in one go.  Without a core
+    ;; (the build's core run, on a big Mac) the stub uses the :BOOT- values
+    ;; instead: boot's 5 MB heap, a big code cache and stack, all above 4 MB.
+    ;; Measured: the all-threaded paged image is 797 KB resident; boot's static
+    ;; heap ~1.56 MB.  The core run's heap is at 16 MB so that ITS kind bytes
+    ;; (kind map + (address - region) / 8) land above 4 MB, clear of this map.
+    ;; Loaded at #x40000, not lower: on the 32 MB LC that runs the core build the
+    ;; ROM's system heap reaches #x39FE0 when the boot blocks run (the Classic's
+    ;; ends near #x8600), and the same binary must load on both.
+    (:classic :load #x00040000 :static-lo #x00110000 :static-hi #x002B0000
+              :region #x002B0000 :heap-size #x000A0000 :gc-guard #x00008000
+              :kind-map #x00358000 :cache-lo #x0036D000 :cache-hi #x003E0000
+              :staging #x003D0000 :staging-size #x00010000
+              :nil-page #x003E0000 :scratch #x003E2000 :io-buf #x003E3000
+              :stack-top #x003F8000
+              :boot-heap #x01000000 :boot-heap-size #x00800000
+              :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
+              :boot-stack-top #x01A00000)))
 
 (defun mac68k-layout (key)
   (or (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) key)
@@ -133,32 +148,136 @@
   (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 18)
   (m68k-emit-word buf #xA000))                          ; _Open
 
+(defconstant +mac68k-save-core-word+ #x1000602C
+  "Low-block word the stub sets from the core descriptor's SAVE flag: KERNEL-MAIN
+   then sends a core over serial port A and stops (the build's core run).")
+
+(defun emit-mac68k-heap (buf base lo half guard)
+  "Zero the kind map over [BASE, LO + 2*HALF + GUARD), write the Cheney block for
+   semispaces [LO, LO+HALF) and [LO+HALF, LO+2*HALF), and set VA / VL.
+   GC-COUNT: zeroed unless KEEP-COUNT.  Clobbers D0/D1/A0."
+  (let ((margin (min +linux-68k-gc-margin-max+ (logand (floor half 4) (lognot 15)))))
+    (emit-mac68k-zero buf +mac68k-kind-map+
+                      (logand (+ (ash (- (+ lo (* 2 half) guard) base) (- (m68k-kind-shift))) 3)
+                              (lognot 3)))
+    (m68k-emit-move-imm-an buf lo +68k-a2+)
+    (m68k-emit-move-imm-an buf (- (+ lo half) margin) +68k-a3+)
+    (m68k-emit-move-imm-an buf (+ base #x40) +68k-a0+)
+    (m68k-emit-move-imm-dn buf lo +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x00)   ; from_start
+    (m68k-emit-move-imm-dn buf (+ lo half) +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x08)   ; to_start
+    (m68k-emit-move-imm-dn buf half +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x10)   ; space_size
+    (m68k-emit-move-an-dn buf +68k-a7+ +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x18))) ; stack_base
+
+(defun emit-mac68k-cache (buf lo hi)
+  "Paged code: the code cache's bounds into the low block (translate-68k
+   +68K-CACHE-PTR+ / +68K-CACHE-HI+)."
+  (when *68k-paged*
+    (m68k-emit-move-imm-dn buf lo +68k-d1+)
+    (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 0)
+    (m68k-emit-move-imm-dn buf hi +68k-d1+)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 4)
+    (m68k-emit-move-imm-dn buf lo +68k-d1+)                ; +68K-CACHE-LO+
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 8)))
+
 (defun emit-mac68k-entry (mbuf)
   "Emit the bare-Mac entry into MBUF: the boot blocks jump here, in supervisor
-   mode, on the ROM's boot stack."
+   mode, on the ROM's boot stack.
+
+   THE CLASSIC (*MAC68K-MACHINE* :CLASSIC) has two boots.  With a SAVED CORE --
+   the core descriptor's CORE flag set by scripts/mac68k-core.py, which put the
+   low block and the static heap where the boot blocks read them -- the low
+   block is NOT cleared, the young semispaces are the small ones after it, and
+   KERNEL-MAIN resumes the REPL without boot init.  Without one (the build's
+   core run, on a Mac with more than 4 MB) boot runs as ever but on the :BOOT-
+   heap, cache and stack, above 4 MB; the descriptor's SAVE flag then has
+   KERNEL-MAIN send the core over serial port A."
   (let* ((buf (make-m68k-buffer))
+         (classic (eq *mac68k-machine* :classic))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
+         (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
          (fill (mvm-make-label))
          (base (conv-real #x10000000))
          (size +mac68k-heap-size+)
          (mid (floor size 2))
-         (space (- mid +linux-68k-heap-alloc-start+))
-         (margin (min +linux-68k-gc-margin-max+
-                      (logand (floor space 4) (lognot 15)))))
+         (alloc +linux-68k-heap-alloc-start+))
     ;; supervisor, interrupts ON: the ROM's 60 Hz tick and serial drivers run
     (m68k-emit-word buf #x46FC) (m68k-emit-word buf #x2000)   ; MOVE.W #$2000,SR
-    (m68k-emit-move-imm-an buf +mac68k-stack-top+ +68k-a7+)
-    ;; the driver names, jumped over
+    ;; the driver names (and the Classic's core descriptor), jumped over
     (m68k-emit-bra buf over)
     (m68k-emit-label buf ain)
     (m68k-emit-word buf #x042E) (m68k-emit-word buf #x4149) (m68k-emit-word buf #x6E00) ; 4 ".AIn"
     (m68k-emit-label buf aout)
     (m68k-emit-word buf #x052E) (m68k-emit-word buf #x414F) (m68k-emit-word buf #x7574) ; 5 ".AOut"
+    (when classic
+      (m68k-emit-label buf desc)
+      (m68k-emit-long buf #x6D6F6475) (m68k-emit-long buf #x734D4352)  ; "modusMCR"
+      (m68k-emit-long buf 0)                                          ; +8 CORE
+      (m68k-emit-long buf 0)                                          ; +12 SAVE
+      (m68k-emit-long buf 0)                                          ; +16 cache start }  a test's
+      (m68k-emit-long buf 0))                                         ; +20 cache end   }  override
     (m68k-emit-label buf over)
-    ;; the low block and the kind map start zeroed, as a fresh mmap does
-    (emit-mac68k-zero buf base #x20000)
-    (emit-mac68k-zero buf +mac68k-kind-map+
-                      (ash (+ size +mac68k-gc-guard+) (- (m68k-kind-shift))))
+    (when classic
+      (m68k-emit-word buf #x41FA) (m68k-emit-word buf 0)              ; LEA desc(PC),A0
+      (m68k-emit-fixup buf desc :disp16)
+      (m68k-emit-move-disp-dn buf +68k-a0+ 8 +68k-d0+)
+      (m68k-emit-tst buf +68k-d0+)
+      (m68k-emit-bne buf core))
+    ;; ---- a boot from scratch ----
+    (m68k-emit-move-imm-an buf (if classic (mac68k-layout :boot-stack-top) +mac68k-stack-top+)
+                           +68k-a7+)
+    (emit-mac68k-zero buf base #x20000)          ; the low block, as a fresh mmap
+    (if classic
+        (let ((half (floor (mac68k-layout :boot-heap-size) 2)))
+          (emit-mac68k-heap buf base (mac68k-layout :boot-heap) half +mac68k-gc-guard+)
+          (emit-mac68k-cache buf (mac68k-layout :boot-cache-lo) (mac68k-layout :boot-cache-hi))
+          ;; the SAVE flag, for KERNEL-MAIN
+          (m68k-emit-word buf #x41FA) (m68k-emit-word buf 0)
+          (m68k-emit-fixup buf desc :disp16)
+          (m68k-emit-move-disp-dn buf +68k-a0+ 12 +68k-d0+)
+          (m68k-emit-move-imm-an buf (conv-real +mac68k-save-core-word+) +68k-a0+)
+          (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 0))
+        (progn
+          ;; the kind map is cleared over (size + guard), as it always was
+          (emit-mac68k-heap buf base (+ base alloc) (- mid alloc) (+ +mac68k-gc-guard+ alloc))
+          (emit-mac68k-cache buf (if *68k-paged* (mac68k-layout :cache-lo) 0)
+                             (if *68k-paged* (mac68k-layout :cache-hi) 0))))
+    (m68k-emit-move-imm-an buf (+ base #x60) +68k-a0+)
+    (m68k-emit-moveq buf +68k-d1+ 0)
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 0)          ; gc_count
+    (m68k-emit-bra buf common)
+    ;; ---- the Classic from its core: the low block is the core's ----
+    (m68k-emit-label buf core)
+    (when classic
+      (m68k-emit-move-imm-an buf +mac68k-stack-top+ +68k-a7+)
+      (emit-mac68k-heap buf base (+ base alloc) (- mid alloc) +mac68k-gc-guard+)
+      (emit-mac68k-cache buf (mac68k-layout :cache-lo) (mac68k-layout :cache-hi))
+      ;; a test's cache (scripts/mac68k-core.py MAC68K_CORE_CACHE): the
+      ;; descriptor's +16/+20 when set
+      (when *68k-paged*
+        (let ((keep (mvm-make-label)))
+          (m68k-emit-word buf #x41FA) (m68k-emit-word buf 0)
+          (m68k-emit-fixup buf desc :disp16)
+          (m68k-emit-move-disp-dn buf +68k-a0+ 16 +68k-d0+)
+          (m68k-emit-tst buf +68k-d0+)
+          (m68k-emit-beq buf keep)
+          (m68k-emit-move-disp-dn buf +68k-a0+ 20 +68k-d1+)
+          (m68k-emit-move-imm-an buf (conv-real +68k-cache-ptr+) +68k-a0+)
+          (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 0)
+          (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 4)
+          (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 8)
+          (m68k-emit-label buf keep)))
+      ;; the serial drivers' parameter blocks: zeroed for the opens below
+      (emit-mac68k-zero buf (mac68k-ser-out-pb) #x100)
+      (m68k-emit-move-imm-an buf (conv-real +mac68k-save-core-word+) +68k-a0+)
+      (m68k-emit-moveq buf +68k-d1+ 0)
+      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ 0))
+    ;; ---- both ----
+    (m68k-emit-label buf common)
     ;; NIL's page and T's, filled with NIL: (car nil) and (cdr nil) are loads
     (m68k-emit-move-imm-an buf +mac68k-nil-page+ +68k-a0+)
     (m68k-emit-move-imm-dn buf +nil-value+ +68k-d1+)
@@ -175,24 +294,10 @@
     ;; the console: .AIn, then .AOut
     (emit-mac68k-open buf (mac68k-ser-in-pb) ain)
     (emit-mac68k-open buf (mac68k-ser-out-pb) aout)
-    ;; MVM allocation registers: VA = a2, VL = a3, VN = a4
-    (m68k-emit-move-imm-an buf (+ base +linux-68k-heap-alloc-start+) +68k-a2+)
-    (m68k-emit-move-imm-an buf (- (+ base mid) margin) +68k-a3+)
+    ;; VN = NIL; A5 the globals base when it is one
     (m68k-emit-move-imm-an buf +nil-value+ +68k-a4+)
     (when *68k-a5-globals*
       (m68k-emit-move-imm-an buf (conv-real *68k-hosted-globals-base*) +68k-a5+))
-    ;; the Cheney block at #x10000040, as the Linux stub writes it
-    (m68k-emit-move-imm-an buf (+ base #x40) +68k-a0+)
-    (m68k-emit-move-imm-dn buf (+ base +linux-68k-heap-alloc-start+) +68k-d1+)
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x00)   ; from_start
-    (m68k-emit-move-imm-dn buf (+ base mid) +68k-d1+)
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x08)   ; to_start
-    (m68k-emit-move-imm-dn buf space +68k-d1+)
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x10)   ; space_size
-    (m68k-emit-move-an-dn buf +68k-a7+ +68k-d1+)
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x18)   ; stack_base
-    (m68k-emit-moveq buf +68k-d1+ 0)
-    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x20)   ; gc_count
     ;; VFP must point at a frame before the first prologue runs
     (m68k-emit-move-an-an buf +68k-a7+ +68k-a6+)
     (m68k-fixup-labels buf)

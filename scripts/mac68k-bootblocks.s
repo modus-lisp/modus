@@ -12,7 +12,7 @@
 
         .text
 | ---- the boot block header (Inside Macintosh: Files, "Boot Blocks") ----
-        .ascii  "LK"                    | bbID
+bbbase: .ascii  "LK"                    | bbID
         bra.w   start                   | bbEntry
         .word   0x4418                  | bbVersion: executable boot blocks
         .word   0                       | bbPageFlags
@@ -36,7 +36,29 @@
         .long   0x00008000              | bb256KSHeap
         .long   0x00020000              | bbSysHeapSize
 | ---- the loader, at 0x8A ----
-start:  move.w  0x210, %d1              | BootDrive: the drive number
+| FIRST, OUT OF THE WAY: when the ROM runs boot blocks its stack -- and these
+| blocks -- sit in the middle of RAM (measured: #x1FFBFC on a 4 MB Classic,
+| #x20FB8C on a 4 MB LC), inside the range a big image is read to.  So copy
+| these 1024 bytes to 64 KB under the top of RAM or the screen, whichever is
+| lower (MemTop $108, ScrnBase $824; an LC's screen is not in RAM), put the
+| stack under them, and go on from the copy.
+start:  move.l  0x108, %d0              | MemTop
+        move.l  0x824, %d1              | ScrnBase
+        cmp.l   %d1, %d0
+        bls     1f
+        move.l  %d1, %d0
+1:      sub.l   #0x10000, %d0
+        and.l   #-16, %d0
+        move.l  %d0, %a1                | the copy's address
+        lea     bbbase(%pc), %a0
+        move.w  #255, %d1               | 1024 bytes
+2:      move.l  (%a0)+, (%a1)+
+        dbra    %d1, 2b
+        move.l  %d0, %a7                | the stack, under the copy
+        move.l  %d0, %a0
+        add.l   #(moved - bbbase), %a0
+        jmp     (%a0)
+moved:  move.w  0x210, %d1              | BootDrive: the drive number
         move.l  0x30A, %a1              | DrvQHdr.qHead
 dq:     move.l  %a1, %d0
         beq     fail

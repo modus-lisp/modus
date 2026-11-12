@@ -334,3 +334,37 @@ semispace), so on an 8 MHz 68000 a boot from scratch is likely most of an
 hour whatever the collector: a small Mac starts from a saved core, and with
 one the static freeze already gives the small floor.  Promotion is for a long
 session's growth, not for boot.
+
+## A REPL in 4 MB (the Mac Classic map), booting from a saved core
+
+    MODUS_MAC68K_MACHINE=classic MODUS_68K_PAGED=1 MODUS_68K_CPU=68000 \
+      MODUS_SMALL_IMAGE=1 MODUS_NARROW_STRINGS=1 MODUS_68K_THREADED=1 \
+      MODUS_68K_HOT=/dev/null ... sbcl --script mvm/build-mac68k-cl-repl.lisp
+    scripts/mac68k-core.py IMAGE DISK          # boots it once on a 32 MB Mac
+
+Every function threaded and paged: 804 KB resident (stubs, handlers, the
+512 KB constant pool), 3.96 MB of streams on disk.  A Classic cannot boot the
+image from scratch (a 5 MB heap, ~50 MB of allocation), so `mac68k-core.py`
+boots the SAME binary once on Basilisk II with 32 MB -- the stub's :BOOT- heap,
+code cache and stack above 4 MB -- where it freezes and sends its core over
+serial; the static heap (1.28 MB of objects, 0.27 MB of conses) is moved to
+`#x110000` the way a copying collection would move it (89,488 pointers), and
+the disk is the boot blocks, [image, low block end) in one read, then the
+streams.  The Classic map (boot-mac68k.lisp `:classic`): image `#x40000`,
+static heap `#x110000`, low block `#x2B0000`, two 192 KB young semispaces,
+the kind map, a 460 KB CODE CACHE, NIL's page, a 64 KB stack under the screen.
+
+The code cache is a FIFO that never overwrites an ACTIVE stream: one a root
+points into -- the caller's A5, -4(A6) of every frame on the A6 chain (every
+function is threaded, so that slot is always the caller's token pointer), the
+jmpbuf's and every handler frame's A5.  `MODUS_68K_PAGED_CHECK=1` re-walks the
+roots after every load and stops with `!LDR-LOST` if one points into an evicted
+stream; it found the one bug (a root before the place, in a stream overlapping
+it).  The boot blocks first move themselves and the stack 64 KB under the top
+of RAM: the ROM's boot stack is mid-RAM, inside the 2.7 MB they read.
+
+Measured on Basilisk II (LC 475 ROM, `--ramsize 4M`, no JIT -- the relinked JIT
+binary still dies at startup now and then): the core boots to the prompt in
+~23 s; defun, bignums, `format ~R`, `loop` answer, the check silent.  Not yet
+on MAME's Classic (a 68000): the 6.6 MB disk is not a floppy, and a SCSI disk
+needs a driver of our own.

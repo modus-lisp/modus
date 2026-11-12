@@ -165,6 +165,34 @@
    start of every translation.")
 (defvar *68k-native-p* nil
   "T while translating the image's native code (absolute patches possible).")
+;;; PAGED THREADED CODE (MODUS_68K_PAGED=1, with MODUS_68K_THREADED): every cold
+;;; function's token stream moves to one STREAM SECTION at the end of the native
+;;; code and can run from ANY address, so a small machine can keep it on disk
+;;; and load it on demand (a code cache, Mac-segment fashion).  A cold function
+;;; is a resident stub -- MOVEA.L A5,A1 / MOVE.W #i,D0 / BRA cold-enter --
+;;; and COLD-ENTER loads A5 from entry i of the STREAM TABLE (resident, one
+;;; longword a function: the stream's current address, 0 when not loaded).
+;;; Position independence: a stream's own branches were already relative; its
+;;; call / tail-call / function-address operands (:REL) become ABSOLUTE
+;;; addresses of the target's entry (resident), patched after layout like the
+;;; 68000's (cross.lisp apply-68k-abs-patches); constant-pool operands (:LIC)
+;;; were already absolute.  MODUS_68K_PAGED_SHIFT=N is the test: after
+;;; everything is resolved the stream section is MOVED N bytes and only the
+;;; table follows it -- anything still position-dependent breaks.
+(defvar *68k-paged* (let ((v (sb-ext:posix-getenv "MODUS_68K_PAGED"))) (and v (string= v "1")))
+  "T: paged threaded code (see above).")
+(defvar *68k-paged-control* (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CONTROL") "1")
+  "The position test's NEGATIVE CONTROL: :REL stays relative, as unpaged.  A
+   paged image built so and moved by MODUS_68K_PAGED_SHIFT must break.")
+(defvar *68k-paged-fns* nil "Paged: (INDEX START-PC STREAM-LABEL), newest first.")
+(defvar *68k-cold-enter-label* nil)
+(defvar *68k-stream-table-label* nil)
+(defvar *68k-stream-section-label* nil)
+(defvar *68k-paged-layout* nil
+  "After a paged translation: plist :table :section :end :count -- native
+   offsets of the stream table, the section and its end (cross.lisp, the Mac
+   disk builder).")
+
 (defvar *68k-mul32-label* nil)
 (defvar *68k-mulu64-label* nil)
 (defvar *68k-divs32-label* nil)
@@ -4402,7 +4430,12 @@
    FUNCTION-TABLE maps function indices to bytecode offsets.
    Returns a byte vector of 68k big-endian machine code."
   (setf *68k-abs-patches* nil)
+  (setf *68k-paged-layout* nil *68k-paged-table-refs* nil)
   (let* ((*68k-native-p* t)
+         (*68k-paged-fns* nil)
+         (*68k-cold-enter-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-stream-table-label* (and *68k-paged* (mvm-make-label)))
+         (*68k-stream-section-label* (and *68k-paged* (mvm-make-label)))
          (*68k-mul32-label* (and *68k-cpu-68000* (mvm-make-label)))
          (*68k-mulu64-label* (and *68k-cpu-68000* (mvm-make-label)))
          (*68k-divs32-label* (and *68k-cpu-68000* (mvm-make-label)))
@@ -4608,11 +4641,16 @@
       (m68k-emit-alloc-obj-helper buf))
     (when *68k-mul32-label*
       (m68k-emit-68000-helpers buf))
+    ;; paged: the stream section LAST, so it is the native code's tail
+    (when (and *68k-paged* *68k-paged-fns*)
+      (m68k-emit-paged-section buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)
     (when *68k-cold-fns*
       (m68k-resolve-stream-fixups buf))
+    (when (and *68k-paged* *68k-paged-fns*)
+      (m68k-paged-finish buf))
     (m68k-unimplemented-report)
 
     ;; Report where each function actually LANDED — see the same change in
@@ -4834,7 +4872,15 @@
             (loop for i from (1- a) downto 0 do (m68k-emit-byte buf (ldb (byte 8 (* 8 i)) v)))))
       (:lic (push (cons (- (m68k-buffer-position buf) 2) a) *68k-li-const-patches*)
        (dotimes (i 4) (m68k-emit-byte buf 0)))
-      ((:br :rel)
+      (:rel
+       (let ((pos (m68k-buffer-position buf))
+             (label (or (gethash a *68k-label-map*)
+                        (error "68k threaded: no label for pc ~D" a))))
+         ;; paged: the target entry's ABSOLUTE address (patched after layout)
+         (push (list pos label 4 (if (and *68k-paged* (not *68k-paged-control*)) :abs (+ pos 4)))
+               *68k-stream-fixups*)
+         (dotimes (i 4) (m68k-emit-byte buf 0))))
+      (:br
        (let* ((size (if (eq kind :rel) 4 w))
               (pos (m68k-buffer-position buf))
               (label (or (gethash a *68k-label-map*)
@@ -4846,6 +4892,16 @@
   "Emit cold function START (already aligned, its label placed): the stub,
    then its tokens.  Returns the pc after it."
   (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
+    (when *68k-paged*
+      (let ((i (length *68k-paged-fns*)))
+        (when (> i 32767) (error "68k paged: more than 32767 cold functions"))
+        (push (list i start (mvm-make-label)) *68k-paged-fns*)
+        (m68k-emit-word buf #x224D)                  ; MOVEA.L A5,A1 (caller's A5)
+        (m68k-emit-word buf #x303C)                  ; MOVE.W #i,D0
+        (m68k-emit-word buf i)
+        (m68k-emit-bra buf *68k-cold-enter-label*)
+        (m68k-word-align buf)
+        (return-from m68k-emit-cold-function end)))
     (let ((stream (mvm-make-label)))
       (m68k-emit-word buf #x224D)                    ; MOVEA.L A5,A1 (caller's A5)
       (m68k-emit-word buf #x4BFA)                    ; LEA (d16,PC),A5
@@ -4869,12 +4925,105 @@
       (m68k-word-align buf)
       end)))
 
+(defun m68k-emit-stream-body (buf start end w)
+  "The tokens of cold function START..END (branch width W), with its labels."
+  (m68k-thread-walk start end w
+                    (lambda (pc k params npc)
+                      (declare (ignore npc))
+                      (unless (= pc start)
+                        (let ((l (gethash pc *68k-label-map*)))
+                          (when l (m68k-emit-label buf l))))
+                      (let ((i (svref (gethash k *68k-thread-shapes*) 0)))
+                        (if (< i 255)
+                            (m68k-emit-byte buf i)
+                            (progn (m68k-emit-byte buf 255)
+                                   (m68k-emit-byte buf (ash i -8))
+                                   (m68k-emit-byte buf (logand i #xFF)))))
+                      (dolist (p params) (m68k-emit-stream-param buf p w)))))
+
+(defun m68k-emit-paged-section (buf)
+  "Paged: COLD-ENTER, the stream table, then every stream (the section)."
+  (let ((miss (mvm-make-label))
+        (fns (reverse *68k-paged-fns*)))
+    (m68k-word-align buf)
+    (m68k-emit-label buf *68k-cold-enter-label*)
+    (m68k-emit-word buf #x48C0)                               ; EXT.L D0 (i < 32768)
+    (m68k-emit-word buf #xD080) (m68k-emit-word buf #xD080)   ; D0 *= 4
+    (m68k-emit-lea-label buf *68k-stream-table-label* +68k-a5+)
+    (m68k-emit-word buf #x2A75) (m68k-emit-word buf #x0800)   ; MOVEA.L (0,A5,D0.L),A5
+    (m68k-emit-word buf #x200D)                               ; MOVE.L A5,D0
+    (m68k-emit-beq buf miss)
+    (m68k-emit-bra buf *68k-thread-next-label*)
+    ;; not loaded: no loader yet -- stop where a debugger can see it
+    (m68k-emit-label buf miss)
+    (m68k-emit-word buf #x4AFC)                               ; ILLEGAL
+    ;; the table: the stream's address, patched after layout
+    (m68k-emit-word buf #x4E71) (m68k-emit-word buf #x4E71)   ; (aligned to 4)
+    (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-word buf #x4E71))
+    (m68k-emit-label buf *68k-stream-table-label*)
+    (let ((*68k-native-p* t))
+      (dolist (f fns)
+        (m68k-emit-word buf #x4E71) (m68k-emit-word buf #x4E71)   ; placeholder, then:
+        (push (cons (- (m68k-buffer-position buf) 4) (third f)) *68k-paged-table-refs*)))
+    ;; the section
+    (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-word buf #x4E71))
+    (m68k-emit-label buf *68k-stream-section-label*)
+    (dolist (f fns)
+      (destructuring-bind (i start label) f
+        (declare (ignore i))
+        (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
+          (m68k-emit-label buf label)
+          (m68k-emit-stream-body buf start end w)
+          (m68k-word-align buf))))))
+
+(defvar *68k-paged-table-refs* nil
+  "Paged: (TABLE-SLOT-POS . STREAM-LABEL), resolved into *68K-ABS-PATCHES*.")
+
+(defun m68k-paged-finish (buf)
+  "Paged, after every fixup: the table's patches, the layout, and the
+   MODUS_68K_PAGED_SHIFT test move."
+  (let* ((labels (m68k-buffer-labels buf))
+         (sec (gethash *68k-stream-section-label* labels))
+         (table (gethash *68k-stream-table-label* labels))
+         (shift (let ((v (sb-ext:posix-getenv "MODUS_68K_PAGED_SHIFT")))
+                  (if (and v (string/= v "")) (logand (parse-integer v) (lognot 15)) 0))))
+    (dolist (r *68k-paged-table-refs*)
+      (push (cons (car r) (gethash (cdr r) labels)) *68k-abs-patches*))
+    (unless (zerop shift)
+      ;; MOVE the section SHIFT bytes on: words in, positions after it moved,
+      ;; and ONLY the patches pointing into it follow
+      (let* ((w (m68k-buffer-words buf)) (n (m68k-buffer-word-count buf))
+             (k (ash sec -1)) (dw (ash shift -1))
+             (new (make-array (+ n dw 16) :initial-element 0)))
+        (replace new w :end2 k)
+        (fill new #x4E71 :start k :end (+ k dw))
+        (replace new w :start1 (+ k dw) :start2 k :end2 n)
+        (setf (m68k-buffer-words buf) new
+              (m68k-buffer-word-count buf) (+ n dw))
+        (incf (m68k-buffer-position buf) shift)
+        (flet ((mv (x) (if (>= x sec) (+ x shift) x)))
+          (setf *68k-abs-patches*
+                (mapcar (lambda (p) (cons (mv (car p)) (mv (cdr p)))) *68k-abs-patches*)
+                *68k-li-const-patches*
+                (mapcar (lambda (p) (cons (mv (car p)) (cdr p))) *68k-li-const-patches*))
+          (maphash (lambda (k v) (setf (gethash k labels) (mv v))) labels))
+        (format t "~&;; 68k paged: stream section MOVED ~D bytes (the position test)~%" shift)
+        (incf sec shift)))
+    (setf *68k-paged-layout*
+          (list :table table :section sec :end (m68k-buffer-position buf)
+                :count (length *68k-paged-fns*)))
+    (format t "~&;; 68k paged: ~D cold functions, stream table at ~D, section ~D..~D (~D bytes)~%"
+            (length *68k-paged-fns*) table sec (m68k-buffer-position buf)
+            (- (m68k-buffer-position buf) sec))))
+
 (defun m68k-resolve-stream-fixups (buf)
   (dolist (f *68k-stream-fixups*)
     (destructuring-bind (pos label size base) f
       (let* ((target (or (gethash label (m68k-buffer-labels buf))
                          (error "68k threaded: undefined label ~D" label)))
-             (v (- target base)))
+             (v (if (eq base :abs) 0 (- target base))))
+        (when (eq base :abs)
+          (push (cons pos target) *68k-abs-patches*))
         (when (and (= size 2) (not (<= -32768 v 32767)))
           (error "68k threaded: branch of ~D bytes in a 16-bit stream operand" v))
         (dotimes (i size)
@@ -4909,6 +5058,9 @@
 (defun m68k-emit-fetch-target (buf)
   "A0 = the address a 32-bit relative stream operand names (target - its end)."
   (m68k-emit-fetch buf 4 +68k-d0+)
+  (when (and *68k-paged* (not *68k-paged-control*))
+    (m68k-emit-word buf #x2040)                   ; MOVEA.L D0,A0: an absolute address
+    (return-from m68k-emit-fetch-target nil))
   (m68k-emit-word buf #x41F5)                     ; LEA (0,A5,D0.L),A0
   (m68k-emit-word buf #x0800))
 

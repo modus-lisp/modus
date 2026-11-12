@@ -1647,6 +1647,63 @@
             (when (funcall cmp (car pair) key) (return pair)))
           (setq cur (cdr cur))))))
 
+;;; PAIRS OF A COMPACT DICT.  A table whose (KEY . VALUE) pairs are held outside
+;;; it -- the symbol-function table: the JIT bridge's and the interpreter's call
+;;; cells keep a name's pair -- used to be PINNED to its alist and classic
+;;; buckets, three conses an entry, so that each entry HAD a pair.  Only the
+;;; names something caches need one.  So such a table stays a compact dict, and
+;;; %GETHASH-PAIR makes a key's pair the first time it is asked for, keeping it
+;;; in the table's SIDE (an EQUAL table, key -> pair) in *%HT-PAIR-SIDES*:
+;;; PUTHASH of a key with a pair sets the pair's value, REMHASH clears it (so a
+;;; cache holding it resolves the name again, as REMHASH on a pinned table did)
+;;; and forgets it, CLRHASH does that for every pair.  A pair handed out while
+;;; the table was a small alist is the alist's own cons, entered in the side
+;;; too, so it stays current when the table becomes a dict.
+(defvar *%ht-pair-sides* nil "((TABLE . SIDE) ...): the tables that have handed out pairs.")
+
+(defun %ht-pair-side (ht create)
+  (let ((c *%ht-pair-sides*))
+    (loop
+      (when (null c) (return nil))
+      (when (eq (car (car c)) ht) (return-from %ht-pair-side (cdr (car c))))
+      (setq c (cdr c))))
+  (when create
+    (let ((side (make-hash-table :test 'equal)))
+      (setq *%ht-pair-sides* (cons (cons ht side) *%ht-pair-sides*))
+      side)))
+
+(defun %ht-dict-pair (key ht)
+  "KEY's pair in dict table HT, made and entered in its side on first use; NIL
+   when KEY is absent."
+  (multiple-value-bind (v present) (gethash key ht)
+    (when present
+      (let ((side (%ht-pair-side ht t)))
+        (or (gethash key side)
+            (let ((p (cons key v)))
+              (puthash key side p)
+              p))))))
+
+(defun %ht-pair-set (ht key value)
+  "PUTHASH's step: KEY's handed-out pair, if any, now holds VALUE."
+  (let ((side (%ht-pair-side ht nil)))
+    (when side
+      (let ((p (gethash key side)))
+        (when p (set-cdr p value))))))
+
+(defun %ht-pair-forget (ht key)
+  "REMHASH's step: KEY's handed-out pair, if any, is cleared and forgotten."
+  (let ((side (%ht-pair-side ht nil)))
+    (when side
+      (let ((p (gethash key side)))
+        (when p (set-cdr p nil) (remhash key side))))))
+
+(defun %ht-pair-clear (ht)
+  "CLRHASH's step: every handed-out pair of HT is cleared and forgotten."
+  (let ((side (%ht-pair-side ht nil)))
+    (when side
+      (maphash (lambda (k p) k (set-cdr p nil)) side)
+      (clrhash side))))
+
 (defun %gethash-pair (key ht)
   "The (KEY . VALUE) cons that holds KEY in HT, or NIL.  PUTHASH on a present
    key updates that cons IN PLACE and the bucket index shares it, so a holder
@@ -1666,11 +1723,10 @@
           (when (>= (car (cdr holder)) 32)
             (setq vec (%ht-read-build-index ht holder))))
         (when (consp vec)
-          ;; A pair is about to be handed out: this table is PINNED from now on
-          ;; (see *%HT-PINNED-PAIRS*) -- back to its alist and classic buckets.
-          (setq *%ht-pinned-pairs* (cons ht *%ht-pinned-pairs*))
-          (%htd-to-alist ht holder nil)
-          (return-from %gethash-pair (%gethash-pair key ht)))
+          ;; A compact dict keeps its keys and values packed, with no conses:
+          ;; the pair is made on demand and kept in the table's PAIR SIDE
+          ;; (*%HT-PAIR-SIDES*), which PUTHASH and REMHASH keep in step.
+          (return-from %gethash-pair (%ht-dict-pair key ht)))
         (when (and vec (not (eq vec -424242001)))
           (if (and (fixnump key) (not (and (cdr (cdr holder)) (not (eq (cdr (cdr holder)) t)) (eq (cdr (cdr holder)) :equalp))))
               ;; FIXNUM FAST PATH, fully inline (same mix as %ht-hash): this is
@@ -1702,6 +1758,11 @@
     (when use-linear
       ;; Linear alist path (legacy / small / nohash table / :nohash key).
       (setq found-pair (%ht-linear-find ht key)))
+    ;; a small table's own alist cons: entered in the side, so it stays the
+    ;; key's pair when the table becomes a dict (a pinned table never does)
+    (when (and found-pair (not (%ht-pinned-p ht)))
+      (let ((side (%ht-pair-side ht t)))
+        (unless (gethash key side) (puthash key side found-pair))))
     found-pair))
 
 (defun puthash (key ht value)
@@ -1709,6 +1770,8 @@
    A large table is a compact dict (see %HTD-FIND); a small or pinned one keeps
    the authoritative CAR alist and (pinned) the O(1) bucket index, + the
    holder's entry count."
+  ;; a pair handed out for KEY (%GETHASH-PAIR, *%HT-PAIR-SIDES*) sees VALUE
+  (when *%ht-pair-sides* (%ht-pair-set ht key value))
   (let* ((holder (%ht-bucket-holder ht))
          (vec (and holder (%ht-active-vec-h ht holder))))
     (when (consp vec)
@@ -1819,6 +1882,8 @@
   ;; (one EQ per link) instead of calling the table's test on every entry --
   ;; cl-bench's HTABLE-SET+REMOVE removed the oldest of 16k string keys, 16k
   ;; STRING= calls deep, 3800x SBCL.
+  ;; a pair handed out for KEY (%GETHASH-PAIR) is cleared and forgotten
+  (when *%ht-pair-sides* (%ht-pair-forget ht key))
   (let* ((holder (%ht-bucket-holder ht))
          (vec (and holder (%ht-active-vec-h ht holder))))
     (when (consp vec)
@@ -2963,6 +3028,7 @@
 (defun clrhash (ht)
   "Remove all entries from HT.  Returns HT.  Also resets the bucket index
    holder (vec -> nil, count -> 0) so a re-filled table re-indexes lazily."
+  (when *%ht-pair-sides* (%ht-pair-clear ht))
   (set-car ht nil)
   (let ((holder (%ht-bucket-holder ht)))
     (when holder

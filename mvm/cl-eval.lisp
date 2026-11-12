@@ -16,8 +16,10 @@
   "Initialize the symbol-function table.
    Keyed by name-string, so :TEST 'EQUAL is mandatory."
   (setq *symbol-function-table* (make-hash-table :test 'equal))
-  ;; its pairs are cached by the JIT bridge and the interpreter (see REMHASH)
-  (setq *%ht-pinned-pairs* (cons *symbol-function-table* *%ht-pinned-pairs*)))
+  ;; its pairs are cached by the JIT bridge and the interpreter: they are made
+  ;; on demand (prelude.lisp *%HT-PAIR-SIDES*), so the table is a compact dict,
+  ;; not pinned to an alist and buckets
+  t)
 
 ;;; Parallel hash → function table, keyed by the 60-bit FNV-1a hash that
 ;;; native MVM symbols carry in slot 0. ANSI (funcall 'sym ...) / (apply

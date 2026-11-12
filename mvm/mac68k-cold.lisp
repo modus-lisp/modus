@@ -103,3 +103,22 @@
                 (setq cur (cdr cur)))
               (modus.runtime::%ht-h-set-vec holder vec)
               n)))))))
+
+;;; RIGHT-SIZED DICTS (a table that will not grow).  A compact dict doubles its capacity when it fills, so a
+;;; boot table sits at up to twice its count: the symbol-function table's dict
+;;; was 100 KB for 4,711 names.  At the freeze the Mac rebuilds a table's dict
+;;; at its count plus SLACK (%HTD-REBUILD: the same entries, in order, a fresh
+;;; index).  A table that will not grow (the kernel-name snapshots) gets none;
+;;; one that will (the function and symbol tables) gets room for a session's
+;;; definitions before it doubles again -- in the young heap then.
+(defun %mac-right-size (ht slack)
+  (let ((holder (and ht (modus.runtime::%ht-bucket-holder ht))))
+    (when holder
+      (let ((dict (modus.runtime::%ht-h-vec holder)))
+        (when (consp dict)
+          (let ((cap (+ (modus.runtime::%ht-h-count holder) slack))
+                (old (ash (- (%prim-array-length (cdr dict)) 2) -1)))
+            (when (< cap old)
+              (modus.runtime::%htd-rebuild ht holder dict cap
+                                           (modus.runtime::%ht-h-strcmp holder))
+              cap)))))))

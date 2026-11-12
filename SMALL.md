@@ -404,3 +404,38 @@ Not GC: interpretation.  Boot to the prompt is 262 s, three quarters of it
 threaded code -- the resume's %GC-CARDS-INIT walking the 1.5 MB static heap
 object by object, which the core builder could do instead.  A form still reads
 ~450 streams from disk: its working set is about the cache.
+
+## Toward 1 MB: the cheap cuts
+
+What a core-booted Classic holds, before and after (the static heap counted
+object by object in the saved core; the image's sizes from the build):
+
+| | before | now | what went |
+|---|---|---|---|
+| resident image | 805 KB | 711 KB | the surfaces' source (162 KB) out; literals into the pool (+68 KB) |
+| code streams on disk | 3.96 MB | 3.66 MB | literals no longer built a character at a time |
+| static objects | 1.28 MB | 1.04 MB | wide strings 157 -> 13 KB; the 64 KB cell cache; two 64 KB buffers |
+| static conses | 267 KB | 254 KB | |
+
+- **`MODUS_NO_SURFACES`** (on for small Mac builds): no Genera / SB-* / gray
+  streams / ASDF source, and `%SURFACE-OFF-P` is T.  A Mac has no environment
+  to switch them off in, and no sockets or threads for them to wrap.
+- **Narrow literals** (`*NARROW-LITERALS-P*`, as the x64 CLI's
+  `MODUS_NARROW_STRINGS`): pooled once, a byte a character, `%FRESH-STRING`'d.
+  Not 32-bit (#x15) strings, whose accessors assume the 64-bit object layout
+  (`*STRING32-P*` / `%STRING32-STRINGS-P`).
+- **`%BASE-SUBSEQ-P`**: `SUBSEQ` of a narrow string is narrow.  Boot cuts every
+  name in the symbol, function and global tables out of narrow packed text.
+- **`MODUS_SMALL_IMAGE`**: the global-cell cache 1024 slots (597 used, of
+  16384), mvm-eval's buffers start at 4 KB (they grow), no opcode descriptions.
+
+**What is left, and where the next cuts are.**  The resident image is 219 KB
+of native code (stubs, handlers, the stream table) and ~490 KB of pool, of
+which ~270 KB is the BOOT TABLES' packed text (symbol names 152 KB, function
+names 76 KB, global names 16 KB, keyword lists 12 KB) plus the runtime macros'
+source -- read once, by boot.  A core-booted Mac never reads them: an init-only
+section at the end of the image that the core disk leaves off is the next
+~300 KB.  In the static heap: 21,000 narrow strings (419 KB, names, many
+duplicates), 351 KB of hash-table storage sized for growth (the dict of a
+12,232-entry table is a 64 KB index + 135 KB of entries; a freeze-time compact
+to the live count is ~60 KB), and 254 KB of conses.

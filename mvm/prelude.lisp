@@ -1668,7 +1668,7 @@
       (when (eq (car (car c)) ht) (return-from %ht-pair-side (cdr (car c))))
       (setq c (cdr c))))
   (when create
-    (let ((side (make-hash-table :test 'equal)))
+    (let ((side (make-hash-table)))   ; NIL test: EQUAL, and no symbol quoted
       (setq *%ht-pair-sides* (cons (cons ht side) *%ht-pair-sides*))
       side)))
 

@@ -3118,8 +3118,8 @@
       ;; (FIND-ALL-SYMBOLS "NIL") did not contain NIL (upstream READ-SYMBOL.15-18,
       ;; FIND-ALL-SYMBOLS.3-9).
       (dolist (slot '(2 3))
-        (let ((e (%symtab-find-in pkg slot "T"))) (when e (setf (cdr e) t)))
-        (let ((e (%symtab-find-in pkg slot "NIL"))) (when e (setf (cdr e) nil)))))))
+        (%symtab-reseat pkg slot "T" t)
+        (%symtab-reseat pkg slot "NIL" nil)))))
 
 
 ;;; ============================================================

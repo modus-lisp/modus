@@ -322,174 +322,121 @@
               (setq nicks (cdr nicks))))))
       (setq cur (cdr cur)))))
 
-;;; --- Internal alist-based symbol table operations ---
+;;; --- A package's symbol tables -------------------------------------------
+;;;
+;;; A package's internal and external symbols (data slots 2 and 3) are each an
+;;; EQUAL HASH TABLE, name -> symbol: a compact dict once it is large, an alist
+;;; of (name . symbol) pairs while small -- the same packed table every other
+;;; large table is.  They were alists of (name . symbol) cells with a derived
+;;; hash index beside them (slots 7 and 8: a hash table of name-hash -> list of
+;;; cells), four conses and an index entry a symbol.  An ENTRY is still a
+;;; (name . symbol) cons -- %SYMTAB-FIND returns a fresh one -- so callers that
+;;; take its CDR are unchanged; one that means to change the table says so
+;;; (%SYMTAB-RESEAT).  A table may also be NIL (empty) or, made elsewhere, a
+;;; plain alist, which every function here still reads.
 
 (defun %symtab-find (table name-string)
-  "Find symbol in alist TABLE by NAME-STRING.  Returns (name . symbol)
-   or nil.  ANSI: symbol-name lookup is CASE-SENSITIVE — 'a' and 'A'
-   are distinct symbol names."
-  (let ((cur table))
-    (loop
-      (when (null cur) (return nil))
-      (let ((entry (car cur)))
-        (when (string= (car entry) name-string)
-          (return entry)))
-      (setq cur (cdr cur)))))
-
-;;; --- O(1) symbol-table index (task #233) ---
-;;;
-;;; The internal/external symbol tables MUST stay alists: do-symbols,
-;;; package introspection, cl-printer's home-package check and the ANSI
-;;; bridge all `dolist' over them directly.  But %symtab-find above is a
-;;; LINEAR scan, so interning N symbols into one package is O(N^2).  That
-;;; is a real, measurable defect: reading 65536 distinct one-character
-;;; symbols (ANSI reader-test read-symbol.13, syntax.escaped.2/.5 —
-;;; `(loop for i below (min 65536 char-code-limit) ...)') costs minutes
-;;; and trips the harness's 45s per-file alarm, and it is the same
-;;; quadratic that makes loading a large library's package slow.
-;;;
-;;; Fix: each package carries a lazily-built INDEX in data slot 7
-;;; (mirroring internal, slot 2) and slot 8 (mirroring external, slot 3).
-;;; An index is a 2-slot array:
-;;;   [0] HEAD — the alist cons the index was last synced up to
-;;;   [1] HASH — hash table  (compute-name-hash NAME) -> list of entries
-;;;
-;;; The index is DERIVED, never authoritative.  %symtab-index-sync walks
-;;; the alist from its current head until it reaches HEAD, adding only
-;;; the entries pushed since the last sync — O(1) amortised, because
-;;; %symtab-add conses onto the FRONT.  If HEAD is not reachable (a
-;;; %symtab-remove rebuilt the list, or some other code replaced the
-;;; table wholesale via %pkg-set-internal/external) the index is thrown
-;;; away and rebuilt.  So a stale index cannot survive a table change,
-;;; and no call site outside this file needs to know the index exists.
-;;;
-;;; Bucket lists are ordered so the FRONTMOST alist entry comes first,
-;;; reproducing %symtab-find's first-match-wins semantics exactly when a
-;;; name has been added more than once.  compute-name-hash upcases, so
-;;; "a" and "A" share a bucket; the bucket scan is case-sensitive
-;;; string=, same as %symtab-find.
-
-(defun %symtab-index-sync (pkg slot)
-  "Return PKG's hash index for the alist in data SLOT (2=internal,
-   3=external), synced to that alist's current head.  A WRITE: call it under
-   the runtime lock (%SYMTAB-FIND-IN does), so two threads cannot sync one
-   index at once and what it allocates lands beside the package in region 0.
-
-   READERS TAKE NO LOCK (%SYMTAB-FIND-IN on an index already in sync), so
-   every store here that a reader can follow publishes a finished object: a
-   rebuilt index is filled while still private and installed by one store,
-   an incremental sync only PUTHASHes (which publishes safely), and HEAD moves
-   last, after %PUBLISH-FENCE, so a reader that sees HEAD match sees every
-   entry it covers."
-  (let ((data (%pkg-data pkg)))
-    (let ((table (aref data slot))
-          (islot (+ slot 5))
-          (idx (aref data (+ slot 5))))
-      (when (null idx)
-        (setq idx (make-array 2))
-        ;; 0 (a fixnum) is the "never synced" sentinel: it can never be
-        ;; EQ to a list head, so the first sync always rebuilds.  Using a
-        ;; fixnum (not a keyword) keeps this callable before the keyword
-        ;; intern table exists at boot.
-        (aset idx 0 0)
-        (aset idx 1 (make-hash-table))
-        (%publish-fence)
-        (aset data islot idx))
-      (let ((head (aref idx 0)))
-        (unless (eq head table)
-          (let ((cur table) (new nil) (found nil))
-            (loop
-              (when (eq cur head) (setq found t) (return nil))
-              (when (null cur) (return nil))
-              (setq new (cons (car cur) new))
-              (setq cur (cdr cur)))
-            (let ((ht (if found (aref idx 1) (make-hash-table))))
-              (unless found
-                (setq new nil)
-                (let ((c table))
-                  (loop
-                    (when (null c) (return nil))
-                    (setq new (cons (car c) new))
-                    (setq c (cdr c)))))
-              ;; NEW is oldest-first, so pushing in order leaves the
-              ;; frontmost (newest) entry at the head of its bucket.
-              (let ((n new))
-                (loop
-                  (when (null n) (return nil))
-                  (let ((entry (car n)))
-                    (let ((k (compute-name-hash (car entry))))
-                      (puthash k ht (cons entry (gethash k ht)))))
-                  (setq n (cdr n))))
-              (unless found
-                (%publish-fence)
-                (aset idx 1 ht))))
-          (%publish-fence)
-          (aset idx 0 table)))
-      (aref idx 1))))
-
-(defun %symtab-probe (ht name-string)
-  "The entry for NAME-STRING in symtab index HT, or NIL.  No lock, no write."
-  (let ((cur (%ht-get-ro (compute-name-hash name-string) ht))
-        (res nil))
-    (loop
-      (when (null cur) (return res))
-      (let ((entry (car cur)))
-        (when (string= (car entry) name-string)
-          (return entry)))
-      (setq cur (cdr cur)))))
+  "TABLE's entry (NAME . SYMBOL) for NAME-STRING, or NIL.  ANSI: symbol-name
+   lookup is CASE-SENSITIVE -- 'a' and 'A' are distinct symbol names."
+  ;; HASH-TABLE-P FIRST: a hash table is a cons in this runtime too.
+  (cond
+    ((null table) nil)
+    ((hash-table-p table)
+     (multiple-value-bind (sym present) (gethash name-string table)
+       (if present (cons name-string sym) nil)))
+    (t
+     (let ((cur table))
+       (loop
+         (when (null cur) (return nil))
+         (let ((entry (car cur)))
+           (when (string= (car entry) name-string)
+             (return entry)))
+         (setq cur (cdr cur)))))))
 
 (defun %symtab-find-in (pkg slot name-string)
-  "O(1) equivalent of (%symtab-find (aref (%pkg-data pkg) SLOT) NAME-STRING).
-
-   AN INDEX ALREADY IN SYNC IS READ WITHOUT THE LOCK — the common case, and
-   what lets INTERN and FIND-SYMBOL of an existing symbol run on several
-   threads at once.  A stale one is synced UNDER the lock (recursive, so this
-   is also safe inside INTERN's locked body).  Before, FIND-SYMBOL and the
-   printer synced it with no lock at all: two threads could rebuild one
-   index at once, and a worker's sync allocated the index in its own region
-   and stored it into the package, in region 0.  Nothing in the locked arm
-   can signal."
-  (let* ((data (%pkg-data pkg))
-         (table (aref data slot)))
-    (if (null table)
-        nil
-        (let ((idx (aref data (+ slot 5))))
-          (if (and idx (eq (aref idx 0) table))
-              (%symtab-probe (aref idx 1) name-string)
-              (progn
-                (%rt-enter)
-                (let ((r (%symtab-probe (%symtab-index-sync pkg slot) name-string)))
-                  (%rt-leave)
-                  r)))))))
+  "(%SYMTAB-FIND (the table in PKG's data SLOT) NAME-STRING).  A table is read
+   without the lock: GETHASH is safe beside a writer."
+  (%symtab-find (aref (%pkg-data pkg) slot) name-string))
 
 (defun %symtab-add (table name-string symbol)
-  "Add SYMBOL to alist TABLE under NAME-STRING. Returns new table.
-   The key is the symbol's own name when they match -- one string per symbol
-   however many packages it is present in -- and narrow when it fits."
+  "Enter SYMBOL in TABLE under NAME-STRING; returns the table (made from NIL
+   or an alist when needed).  The key is the symbol's own name when they match
+   -- one string per symbol however many packages it is present in -- and
+   narrow when it fits."
   ;; Only a symbol that CARRIES its name: a hash-only one's SYMBOL-NAME walks
   ;; every package's table to find it, and a keyword being interned for the
   ;; first time is in none yet -- so the reader paid that walk, for "", on
-  ;; every new keyword it met.  On a corpus read with ~100 packages that was
-  ;; nearly all of the time.  Such a symbol's key is NAME-STRING regardless.
-  (let ((sn (and (%cl-sym-p symbol) (%cl-sym-name symbol))))
-    (cons (cons (%narrow-copy (if (and (stringp sn) (string= sn name-string))
-                                  sn
-                                  name-string))
-                symbol)
-          table)))
+  ;; every new keyword it met.  Such a symbol's key is NAME-STRING regardless.
+  (let* ((sn (and (%cl-sym-p symbol) (%cl-sym-name symbol)))
+         (key (%narrow-copy (if (and (stringp sn) (string= sn name-string)) sn name-string)))
+         (tab (if (hash-table-p table) table (%symtab-from-alist table))))
+    (puthash key tab symbol)
+    tab))
+
+(defun %symtab-from-alist (alist)
+  "A symbol table holding ALIST's entries (the first of a name wins, as in a
+   search of the alist)."
+  ;; The 0-arg table: its NIL test compares strings by content (EQUAL), and it
+  ;; quotes no symbol -- this runs while packages are being made at boot, and
+  ;; quoting EQUAL there would intern, i.e. re-enter here.
+  (let ((tab (make-hash-table)) (rev nil))
+    (dolist (e alist) (setq rev (cons e rev)))
+    (dolist (e rev) (puthash (car e) tab (cdr e)))
+    tab))
 
 (defun %symtab-remove (table name-string)
-  "Remove NAME-STRING from alist TABLE. Returns new table."
-  (let ((result nil) (cur table))
-    (loop
-      (when (null cur) (return (nreverse result)))
-      ;; STRING=, not STRING-EQUAL: symbol names are case-sensitive, and
-      ;; uninterning |a| must not also remove A.
-      (if (string= (car (car cur)) name-string)
-          (setq cur (cdr cur))
-          (progn
-            (setq result (cons (car cur) result))
-            (setq cur (cdr cur)))))))
+  "Remove NAME-STRING from TABLE; returns the table."
+  (cond
+    ((null table) nil)
+    ((hash-table-p table) (remhash name-string table) table)
+    (t
+     (let ((result nil) (cur table))
+       (loop
+         (when (null cur) (return (nreverse result)))
+         ;; STRING=, not STRING-EQUAL: symbol names are case-sensitive, and
+         ;; uninterning |a| must not also remove A.
+         (if (string= (car (car cur)) name-string)
+             (setq cur (cdr cur))
+             (progn
+               (setq result (cons (car cur) result))
+               (setq cur (cdr cur)))))))))
+
+(defun %symtab-entries (table)
+  "TABLE's entries, a fresh list of (NAME . SYMBOL) conses, newest first --
+   what iterating a package's symbols walks."
+  ;; The table's packed entries are read directly, newest first, with no
+  ;; closure: a MAPHASH lambda here, called from inside DO-SYMBOLS' own
+  ;; closure, broke two DO-EXTERNAL-SYMBOLS in one form on the 68k (!LDR-FULL,
+  ;; measured; one alone worked) -- not understood yet, and not needed.
+  (if (hash-table-p table)
+      (let* ((holder (%ht-bucket-holder table))
+             (dict (and holder (%ht-h-vec holder)))
+             (acc nil))
+        (if (consp dict)
+            (let* ((e (cdr dict)) (used (%word-aref e 0)) (j 0))
+              (loop
+                (when (>= j used) (return nil))
+                (let ((k (%word-aref e (+ 2 (+ j j)))))
+                  (unless (eq k e)          ; a removed entry's key is the vector
+                    (setq acc (cons (cons k (%word-aref e (+ 3 (+ j j)))) acc))))
+                (setq j (+ j 1)))
+              ;; ... and the alist's entries (keys the dict cannot hold)
+              (let ((cur (car table)))
+                (loop (when (null cur) (return nil))
+                  (setq acc (cons (car cur) acc))
+                  (setq cur (cdr cur))))
+              acc)
+            ;; a small table: its alist of (name . symbol) pairs, newest first
+            (car table)))
+      table))
+
+(defun %symtab-reseat (pkg slot name-string symbol)
+  "If PKG's table in SLOT holds NAME-STRING, it now holds SYMBOL there."
+  (let ((tab (aref (%pkg-data pkg) slot)))
+    (when (%symtab-find tab name-string)
+      (if (hash-table-p tab)
+          (puthash name-string tab symbol)
+          (setf (cdr (%symtab-find tab name-string)) symbol)))))
 
 ;;; --- Core package functions ---
 
@@ -921,11 +868,11 @@
       ;; Unuse all packages
       (%pkg-set-use-list p nil)
       ;; Unintern all symbols in this package (set home package to nil)
-      (dolist (entry (%pkg-internal p))
+      (dolist (entry (%symtab-entries (%pkg-internal p)))
         (let ((sym (cdr entry)))
           (when (and (%cl-sym-p sym) (eq (%cl-sym-package sym) p))
             (%cl-sym-set-package sym nil))))
-      (dolist (entry (%pkg-external p))
+      (dolist (entry (%symtab-entries (%pkg-external p)))
         (let ((sym (cdr entry)))
           (when (and (%cl-sym-p sym) (eq (%cl-sym-package sym) p))
             (%cl-sym-set-package sym nil))))
@@ -968,7 +915,8 @@
       (when (or (null cur) exact) (return nil))
       (let ((p (car cur)))
         (when (%pkg-p p)
-          (dolist (entries (list (%pkg-internal p) (%pkg-external p)))
+          (dolist (entries (list (%symtab-entries (%pkg-internal p))
+                                 (%symtab-entries (%pkg-external p))))
             (let ((c2 entries))
               (loop
                 (when (or (null c2) exact) (return nil))
@@ -2016,20 +1964,20 @@
         (seen nil))
     (when p
       ;; Internal symbols
-      (dolist (entry (%pkg-internal p))
+      (dolist (entry (%symtab-entries (%pkg-internal p)))
         (let ((sym (cdr entry)))
           (unless (member sym seen :test #'eq)
             (setq seen (cons sym seen))
             (funcall fn sym))))
       ;; External symbols
-      (dolist (entry (%pkg-external p))
+      (dolist (entry (%symtab-entries (%pkg-external p)))
         (let ((sym (cdr entry)))
           (unless (member sym seen :test #'eq)
             (setq seen (cons sym seen))
             (funcall fn sym))))
       ;; Inherited
       (dolist (used (%pkg-use-list p))
-        (dolist (entry (%pkg-external used))
+        (dolist (entry (%symtab-entries (%pkg-external used)))
           (let ((sym (cdr entry))
                 (name-str (car entry)))
             ;; Only if not shadowed
@@ -2043,7 +1991,7 @@
   "Call FN on each external symbol in PKG."
   (let ((p (%resolve-package pkg)))
     (when p
-      (dolist (entry (%pkg-external p))
+      (dolist (entry (%symtab-entries (%pkg-external p)))
         (funcall fn (cdr entry))))))
 
 (defun %do-all-symbols-fn (fn)
@@ -2051,12 +1999,12 @@
   (let ((seen nil))
     (dolist (pkg *all-packages*)
       (when (%pkg-name pkg)
-        (dolist (entry (%pkg-internal pkg))
+        (dolist (entry (%symtab-entries (%pkg-internal pkg)))
           (let ((sym (cdr entry)))
             (unless (member sym seen :test #'eq)
               (setq seen (cons sym seen))
               (funcall fn sym))))
-        (dolist (entry (%pkg-external pkg))
+        (dolist (entry (%symtab-entries (%pkg-external pkg)))
           (let ((sym (cdr entry)))
             (unless (member sym seen :test #'eq)
               (setq seen (cons sym seen))
@@ -2408,16 +2356,16 @@
           (when pkg
             ;; Internal
             (when (member :internal symbol-types)
-              (dolist (entry (%pkg-internal pkg))
+              (dolist (entry (%symtab-entries (%pkg-internal pkg)))
                 (setq result (cons (list (cdr entry) :internal pkg) result))))
             ;; External
             (when (member :external symbol-types)
-              (dolist (entry (%pkg-external pkg))
+              (dolist (entry (%symtab-entries (%pkg-external pkg)))
                 (setq result (cons (list (cdr entry) :external pkg) result))))
             ;; Inherited
             (when (member :inherited symbol-types)
               (dolist (used (%pkg-use-list pkg))
-                (dolist (entry (%pkg-external used))
+                (dolist (entry (%symtab-entries (%pkg-external used)))
                   (let ((name-str (car entry)))
                     ;; Only if not shadowed by internal/external
                     (unless (or (%symtab-find (%pkg-internal pkg) name-str)
@@ -2559,9 +2507,9 @@
   (let ((p (%resolve-package pkg))
         (acc nil))
     (when p
-      (dolist (entry (%pkg-internal p))
+      (dolist (entry (%symtab-entries (%pkg-internal p)))
         (setq acc (cons (cdr entry) acc)))
-      (dolist (entry (%pkg-external p))
+      (dolist (entry (%symtab-entries (%pkg-external p)))
         (setq acc (cons (cdr entry) acc))))
     acc))
 
@@ -2877,7 +2825,7 @@
 (defun %apropos-collect (entries needle seen acc)
   "ACC plus every symbol of the symtab ENTRIES ((name . sym) cells) whose
    name contains NEEDLE and that SEEN has not recorded."
-  (dolist (entry entries acc)
+  (dolist (entry (%symtab-entries entries) acc)
     (let ((sym (cdr entry)))
       (when (and (symbolp sym) (not (gethash sym seen)))
         (let ((nm (symbol-name sym)))

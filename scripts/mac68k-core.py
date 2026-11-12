@@ -123,25 +123,16 @@ def relocate(core, static_lo=None):
                        (0x6030, 1 if os.environ.get('MODUS_MAC_CORE_PROBES') == '1' else 0)):
             struct.pack_into('>I', low, off, v)
         return low, nolo, objs, nclo, conses
-    nchi = nclo + len(conses)
-    if nchi > STATIC_HI:
-        sys.exit('mac68k-core: the static heap (%d bytes) does not fit #%x..#%x'
-                 % (nchi - nolo, STATIC_LO, STATIC_HI))
-    do, dc = nolo - olo, nclo - clo
-    moved = [0]
-
-    def rel(buf, off):
-        w, = struct.unpack_from('>I', buf, off)
-        t = w & 7
-        if t in (1, 7):
-            a = w - t
-            if olo <= a < ohi:
-                struct.pack_into('>I', buf, off, w + do); moved[0] += 1
-            elif clo <= a < chi:
-                struct.pack_into('>I', buf, off, w + dc); moved[0] += 1
-
-    # objects: typed (68k translate-68k m68k-emit-object-size)
-    i, nobj = 0, 0
+    # THE CORE'S OWN COLLECTION.  A core boot's only roots are the low block's
+    # words (the stack starts fresh), so what they do not reach is garbage the
+    # freeze kept -- a stale word on the core run's stack or in a register
+    # (measured: a dropped 12,250-name table, 326 KB).  Mark from the low
+    # block, as the collector scans (LEAF payloads are not pointers), then copy
+    # the marked objects and conses down in their order, as a copying collection
+    # would.  MAC68K_CORE_NOGC=1 keeps everything (the old uniform move).
+    skip = lambda off: any(a <= off < b for a, b in LOW_BYTES)
+    ostarts, osize, otype = [], {}, {}
+    i = 0
     while i < len(objs):
         h, = struct.unpack_from('>I', objs, i)
         st, n = h & 0xFF, h >> 8
@@ -149,16 +140,93 @@ def relocate(core, static_lo=None):
         size = (size + 7) & ~7
         if size <= 0 or i + size > len(objs):
             sys.exit('mac68k-core: a bad object header #%08x at #%x' % (h, olo + i))
+        ostarts.append(olo + i); osize[olo + i] = size; otype[olo + i] = (st, n)
+        i += size
+    import bisect
+    def node_of(w):
+        """The object start or cons cell a tagged word points into, or None."""
+        t = w & 7
+        if t == 7:
+            a = w - 7
+            if olo <= a < ohi:
+                k = bisect.bisect_right(ostarts, a) - 1
+                return ostarts[k] if k >= 0 else None
+        elif t == 1:
+            a = w - 1
+            if clo <= a < chi:
+                return a & ~7
+        return None
+    nogc = os.environ.get('MAC68K_CORE_NOGC') == '1'
+    marked = set()
+    work = []
+    def mark_word(w):
+        nd = node_of(w)
+        if nd is not None and nd not in marked:
+            marked.add(nd); work.append(nd)
+    if nogc:
+        marked.update(ostarts); marked.update(range(clo, chi, 8))
+    else:
+        for j in range(0, LOW_BLOCK, 4):
+            if not skip(j):
+                mark_word(struct.unpack_from('>I', low, j)[0])
+        while work:
+            nd = work.pop()
+            if nd in osize:
+                st, n = otype[nd]
+                if st in LEAF or n == 0:
+                    continue
+                for w in struct.unpack_from('>%dI' % n, objs, nd - olo + 4):
+                    mark_word(w)
+            else:
+                for w in struct.unpack_from('>II', conses, nd - clo):
+                    mark_word(w)
+    # the new places: marked objects in order from NOLO, conses from NCLO
+    omap, nob, kept = {}, bytearray(), 0
+    for a in ostarts:
+        if a in marked:
+            omap[a] = nolo + len(nob)
+            nob += objs[a - olo:a - olo + osize[a]]
+    nclo = (nolo + len(nob) + 4095) & ~4095
+    cmap, ncs = {}, bytearray()
+    for a in range(clo, chi, 8):
+        if a in marked:
+            cmap[a] = nclo + len(ncs)
+            ncs += conses[a - clo:a - clo + 8]
+    nchi = nclo + len(ncs)
+    if nchi > STATIC_HI:
+        sys.exit('mac68k-core: the static heap (%d bytes) does not fit #%x..#%x'
+                 % (nchi - nolo, nolo, STATIC_HI))
+    moved = [0]
+
+    def rel(buf, off):
+        w, = struct.unpack_from('>I', buf, off)
+        nd = node_of(w)
+        if nd is None:
+            return
+        if nd in omap:
+            struct.pack_into('>I', buf, off, (w - nd) + omap[nd]); moved[0] += 1
+        elif nd in cmap:
+            struct.pack_into('>I', buf, off, (w - nd) + cmap[nd]); moved[0] += 1
+        else:
+            sys.exit('mac68k-core: a pointer to an unmarked node #%x' % nd)
+
+    nobj = 0
+    for a in ostarts:
+        if a not in omap:
+            continue
+        st, n = otype[a]; k = omap[a] - nolo; nobj += 1
         if st not in LEAF:
-            for j in range(i + 4, i + 4 + 4 * n, 4):
-                rel(objs, j)
-        i += size; nobj += 1
-    for j in range(0, len(conses), 4):
-        rel(conses, j)
-    skip = lambda off: any(a <= off < b for a, b in LOW_BYTES)
+            for j in range(k + 4, k + 4 + 4 * n, 4):
+                rel(nob, j)
+    for j in range(0, len(ncs), 4):
+        rel(ncs, j)
     for j in range(0, LOW_BLOCK, 4):
         if not skip(j):
             rel(low, j)
+    print('mac68k-core: the core\'s collection kept %d of %d objects (%d of %d bytes), '
+          '%d of %d bytes of conses' % (nobj, len(ostarts), len(nob), len(objs),
+                                        len(ncs), len(conses)))
+    objs, conses = nob, ncs
     # the static block: the new ranges; cards off until %GC-CARDS-INIT
     for off, v in ((0x6004, nolo), (0x6008, nolo + len(objs)), (0x600C, nclo), (0x6010, nchi),
                    (0x601C, 0), (0x6014, 1),

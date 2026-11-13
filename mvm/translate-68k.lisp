@@ -184,7 +184,7 @@
 (defvar *68k-paged-control* (equal (sb-ext:posix-getenv "MODUS_68K_PAGED_CONTROL") "1")
   "The position test's NEGATIVE CONTROL: :REL stays relative, as unpaged.  A
    paged image built so and moved by MODUS_68K_PAGED_SHIFT must break.")
-(defvar *68k-paged-fns* nil "Paged: (INDEX START-PC STREAM-LABEL), newest first.")
+(defvar *68k-paged-fns* nil "Paged: (INDEX START-PC STREAM-LABEL CHUNK-START CHUNK-END), newest first.")
 (defvar *68k-cold-enter-label* nil)
 (defvar *68k-stream-table-label* nil)
 (defvar *68k-stream-section-label* nil)
@@ -5059,7 +5059,8 @@
       (format t "~&;; 68k threaded: ~D of ~D functions cold, ~D shapes~%"
               (hash-table-count cold) (length starts) (hash-table-count shapes)))))
 
-(defun m68k-emit-stream-param (buf param w)
+(defun m68k-emit-stream-param (buf param w &optional br-label)
+  "BR-LABEL: a :BR's target label in place of its pc's (a chunk's trampoline)."
   (destructuring-bind (kind a &optional b) param
     (ecase kind
       (:i (let ((v (logand b #xFFFFFFFF)))
@@ -5077,7 +5078,7 @@
       (:br
        (let* ((size (if (eq kind :rel) 4 w))
               (pos (m68k-buffer-position buf))
-              (label (or (gethash a *68k-label-map*)
+              (label (or br-label (gethash a *68k-label-map*)
                          (error "68k threaded: no label for pc ~D" a))))
          (push (list pos label size (+ pos size)) *68k-stream-fixups*)
          (dotimes (i size) (m68k-emit-byte buf 0)))))))
@@ -5088,8 +5089,10 @@
   (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
     (when *68k-paged*
       (let ((i (length *68k-paged-fns*)))
-        (when (> i 32767) (error "68k paged: more than 32767 cold functions"))
-        (push (list i start (mvm-make-label)) *68k-paged-fns*)
+        (dolist (c (m68k-chunk-plan start end w))
+          (let ((j (length *68k-paged-fns*)))
+            (when (> j 32767) (error "68k paged: more than 32767 streams"))
+            (push (list j start (mvm-make-label) (car c) (cdr c)) *68k-paged-fns*)))
         (m68k-emit-word buf #x224D)                  ; MOVEA.L A5,A1 (caller's A5)
         (m68k-emit-word buf #x303C)                  ; MOVE.W #i,D0
         (m68k-emit-word buf i)
@@ -5134,6 +5137,98 @@
                                    (m68k-emit-byte buf (ash i -8))
                                    (m68k-emit-byte buf (logand i #xFF)))))
                       (dolist (p params) (m68k-emit-stream-param buf p w)))))
+
+;;; CHUNKED STREAMS.  A cold function's tokens are one stream, and the cache
+;;; must hold a whole stream to run any of it: the bytecode interpreter's is
+;;; 176 KB, so the cache could not be smaller than that and the interpreter
+;;; thrashed every other stream out.  A stream over the chunk size
+;;; (MODUS_68K_CHUNK_KB, Mac paged only) is cut at token boundaries into
+;;; several, each its own index, loaded and evicted alone.  A branch to a
+;;; label in another chunk goes to a TRAMPOLINE at the end of its own chunk,
+;;; and each chunk but the last ends in one to the next (its fall-through):
+;;; an XJUMP, which is the RELOAD token followed, at the next 4-byte boundary,
+;;; by the target's stream index and offset -- a reload record's layout, so
+;;; the RELOAD handler runs it unchanged.  Roots into a chunk are roots into
+;;; its stream; nothing else knows a function was cut.
+(defparameter *68k-chunk-bytes*
+  (let ((v (sb-ext:posix-getenv "MODUS_68K_CHUNK_KB")))
+    (if (and v (string/= v "")) (* 1024 (parse-integer v)) (* 16 1024)))
+  "Paged Mac: a cold function's stream is cut into chunks of about this many
+   bytes (0: never).")
+
+(defun m68k-token-bytes (k params w)
+  (+ (if (< (svref (gethash k *68k-thread-shapes*) 0) 255) 1 3)
+     (loop for p in params sum (ecase (first p) (:i (second p)) (:lic 4) (:rel 4) (:br w)))))
+
+(defun m68k-chunk-plan (start end w)
+  "The chunks of cold function START..END: a list of (CS . CE) pc ranges,
+   one (START . END) when it is not cut."
+  (if (or (null *68k-reload-label*) (<= *68k-chunk-bytes* 0))
+      (list (cons start end))
+      (let ((cuts nil) (acc 0) (limit (- *68k-chunk-bytes* 256)))
+        (m68k-thread-walk start end w
+                          (lambda (pc k params npc)
+                            (declare (ignore npc))
+                            (let ((n (m68k-token-bytes k params w)))
+                              (when (and (> acc 0) (> (+ acc n) limit))
+                                (push pc cuts) (setq acc 0))
+                              (incf acc n))))
+        (let ((bounds (append (list start) (reverse cuts) (list end))))
+          (loop for (a b) on bounds while b collect (cons a b))))))
+
+(defun m68k-emit-xjump (buf idx target-label chunk-label token)
+  "An XJUMP to TARGET-LABEL in stream IDX, which starts at CHUNK-LABEL."
+  (m68k-emit-byte buf 255)
+  (m68k-emit-byte buf (ash token -8))
+  (m68k-emit-byte buf (logand token #xFF))
+  (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-byte buf 0))
+  (m68k-emit-long buf idx)
+  (push (list (m68k-buffer-position buf) target-label 4 (list :from chunk-label))
+        *68k-stream-fixups*)
+  (m68k-emit-long buf 0))
+
+(defun m68k-emit-chunk-body (buf start end w cs ce label siblings)
+  "The tokens of cold function START..END whose pcs are in [CS, CE), a chunk
+   at LABEL; SIBLINGS are all the function's chunks' *68K-PAGED-FNS* entries."
+  (declare (ignore label))
+  (let ((tramps nil) (token (m68k-reload-token-index)))
+    (flet ((home (pc)                    ; the entry of the chunk holding PC
+             (or (find-if (lambda (f) (and (<= (fourth f) pc) (< pc (fifth f)))) siblings)
+                 (error "68k chunks: pc ~D is in no chunk of ~D" pc start))))
+      (m68k-thread-walk start end w
+                        (lambda (pc k params npc)
+                          (declare (ignore npc))
+                          (when (and (<= cs pc) (< pc ce))
+                            (unless (= pc start)
+                              (let ((l (gethash pc *68k-label-map*)))
+                                (when l (m68k-emit-label buf l))))
+                            (let ((i (svref (gethash k *68k-thread-shapes*) 0)))
+                              (if (< i 255)
+                                  (m68k-emit-byte buf i)
+                                  (progn (m68k-emit-byte buf 255)
+                                         (m68k-emit-byte buf (ash i -8))
+                                         (m68k-emit-byte buf (logand i #xFF)))))
+                            (dolist (p params)
+                              (let ((tgt (second p)))
+                                (if (and (eq (first p) :br) (not (and (<= cs tgt) (< tgt ce))))
+                                    (let ((tl (or (cdr (assoc tgt tramps))
+                                                  (let ((l (mvm-make-label)))
+                                                    (push (cons tgt l) tramps) l))))
+                                      (when (= tgt start)
+                                        (error "68k chunks: a branch to ~D's entry" start))
+                                      (m68k-emit-stream-param buf p w tl))
+                                    (m68k-emit-stream-param buf p w)))))))
+      ;; the fall-through, then the trampolines
+      (when (< ce end)
+        (let ((n (home ce)))
+          (m68k-emit-xjump buf (first n) (third n) (third n) token)))
+      (dolist (tr (reverse tramps))
+        (let ((n (home (car tr))))
+          (m68k-emit-label buf (cdr tr))
+          (m68k-emit-xjump buf (first n)
+                           (or (gethash (car tr) *68k-label-map*)
+                               (error "68k chunks: no label for pc ~D" (car tr)))
+                           (third n) token))))))
 
 (defun m68k-emit-paged-section (buf)
   "Paged: COLD-ENTER, the Mac's loader, the stream table and the home table,
@@ -5313,13 +5408,19 @@
     ;; the section
     (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-word buf #x4E71))
     (m68k-emit-label buf *68k-stream-section-label*)
-    (dolist (f fns)
-      (destructuring-bind (i start label) f
-        (declare (ignore i))
-        (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
-          (m68k-emit-label buf label)
-          (m68k-emit-stream-body buf start end w)
-          (m68k-word-align buf))))
+    (let ((chunks (make-hash-table)))      ; function start -> its streams
+      (dolist (f fns) (push f (gethash (second f) chunks)))
+      (dolist (f fns)
+        (destructuring-bind (i start label cs ce) f
+          (declare (ignore i))
+          (destructuring-bind (end . w) (gethash start *68k-cold-fns*)
+            ;; 4-aligned: an XJUMP's operands are found by rounding A5 up to 4
+            (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-word buf #x4E71))
+            (m68k-emit-label buf label)
+            (if (and (= cs start) (= ce end))
+                (m68k-emit-stream-body buf start end w)
+                (m68k-emit-chunk-body buf start end w cs ce label (gethash start chunks)))
+            (m68k-word-align buf)))))
     (m68k-emit-label buf *68k-stream-end-label*)))
 
 ;;; EVICTING ACTIVE STREAMS.  The allocator above never evicts a stream an
@@ -5701,7 +5802,12 @@
     (destructuring-bind (pos label size base) f
       (let* ((target (or (gethash label (m68k-buffer-labels buf))
                          (error "68k threaded: undefined label ~D" label)))
-             (v (if (eq base :abs) 0 (- target base))))
+             (v (cond ((eq base :abs) 0)
+                      ;; (:from L): TARGET's offset from label L (a chunk's start)
+                      ((consp base)
+                       (- target (or (gethash (second base) (m68k-buffer-labels buf))
+                                     (error "68k threaded: undefined label ~D" (second base)))))
+                      (t (- target base)))))
         (when (eq base :abs)
           (push (cons pos target) *68k-abs-patches*))
         (when (and (= size 2) (not (<= -32768 v 32767)))

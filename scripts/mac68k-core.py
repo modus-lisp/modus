@@ -184,6 +184,19 @@ def relocate(core, static_lo=None):
             else:
                 for w in struct.unpack_from('>II', conses, nd - clo):
                     mark_word(w)
+    if os.environ.get('MAC68K_CORE_CENSUS'):
+        # MAC68K_CORE_CENSUS=1: what the static heap holds, by subtag, and the
+        # largest objects (the candidates for paging or for not keeping)
+        import collections
+        cn, cb = collections.Counter(), collections.Counter()
+        for a in ostarts:
+            if a in marked:
+                cn[otype[a][0]] += 1; cb[otype[a][0]] += osize[a]
+        for st, b in cb.most_common():
+            print('mac68k-core: census subtag #x%02x: %6d objects %8d bytes' % (st, cn[st], b))
+        big = sorted((osize[a], a) for a in ostarts if a in marked)[-25:]
+        for sz, a in reversed(big):
+            print('mac68k-core: census big #x%x subtag #x%02x %d bytes' % (a, otype[a][0], sz))
     # the new places: marked objects in order from NOLO, conses from NCLO
     omap, nob, kept = {}, bytearray(), 0
     for a in ostarts:

@@ -92,7 +92,11 @@
     ;; runs on top of the ROM's.  So the stack (64 KB) and the I/O scratch pages
     ;; move from #x10000 to under NIL's page, out of the code cache's top; the
     ;; loader application checks the system heap ends below the image.
-    (:classic-os :load #x00040000 :static-lo #x00110000 :static-hi #x002B0000
+    ;; The runtime threaded JIT's code area (mvm/jit-68k.lisp; MODUS_68K_JIT=1)
+    ;; is the top of the old static range, #x240000-#x2B0000 (448 KB): the
+    ;; saved heap ends near #x120000.
+    (:classic-os :load #x00040000 :static-lo #x00110000 :static-hi #x00240000
+              :jit-area-lo #x00240000 :jit-area-hi #x002B0000
               :region #x002B0000 :heap-size #x00080000 :gc-guard #x00008000
               :kind-map #x00318000 :cache-lo #x00329000 :cache-hi #x003D0000
               :staging #x003D0000 :staging-size #x00000000

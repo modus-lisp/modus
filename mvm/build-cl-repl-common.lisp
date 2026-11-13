@@ -3291,6 +3291,34 @@
       (format t "~&;; split-dispatch: COMPILE-COMPOUND -> ~D handlers over ~D keys~%"
               handlers keys))))
 
+;;; :MAC68K + MODUS_68K_JIT=1: the runtime threaded JIT (mvm/jit-68k.lisp) in
+;;; build-cli-common's late arch slot, with the layout's :JIT-AREA as its code
+;;; area (a Mac has no mmap).  Layouts without one get no JIT.
+(when (and *cl-repl-mac68k-p* (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+           (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
+  (let ((lo (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-lo))
+        (hi (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-hi)))
+    (unless (and lo hi)
+      (error "MODUS_68K_JIT=1: the ~S map has no :JIT-AREA (use classicos)" modus.mvm::*mac68k-machine*))
+    ;; The two seams are REPLACED in the text (one DEFUN each, nothing for a
+    ;; redefinition to get wrong).  The variable is CL-USER's: build-cli-common
+    ;; reads in CL-USER (its one IN-PACKAGE is inside a string), and binding
+    ;; MODUS.MVM's instead left the image with the hosted defaults -- the core
+    ;; run then translated E2SMOKE's DEFUN and went to mmap a code area.
+    (flet ((swap (text head old new)
+             (let* ((i (or (search head text) (error "jit-68k.lisp: no ~A" head)))
+                    (j (or (search old text :start2 i) (error "jit-68k.lisp: ~A body" head))))
+               (concatenate 'string (subseq text 0 j) new (subseq text (+ j (length old)))))))
+      (defvar cl-user::*cli-arch-late-source*   ; build-cli-common's (in CL-USER)
+        (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
+                    "(defun %t68-fixed-area ()" (format nil "~%  nil)")
+                    (format nil "~%  (cons #x~X #x~X))" lo hi))
+              "(defun %t68-allowed-p ()" (format nil "~%  t)")
+              (format nil "~%  (%core-requested-p))"))
+              ;; big modules stay interpreted (see its docstring)
+              "(defun %t68-max-bytecode ()" (format nil "~%  nil)") (format nil "~%  2048)"))))
+    (format t "~&;; mac68k: the threaded JIT, its code at #x~X-#x~X~%" lo hi)))
+
 ;;; :MAC68K: AOT RUNTIME MACROS.  mvm/runtime-cl-macros.lisp keeps CL's runtime
 ;;; macros (WHEN, DOTIMES, PUSH, CASE ...) as DEFMACRO strings that boot READs
 ;;; and EVALs: each expander became an interpreted closure, 56 KB of bytecode in a
@@ -3476,6 +3504,17 @@
   (%mac-right-size *kernel-fn-names* 0)
   (%mac-right-size *kernel-global-names* 0)
 " "")
+                       (if (and (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+                                (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
+                           "  ;; the threaded JIT's tables (the shape index, the permutable
+  ;; operations' operand lists, the constant cells, the area pointer) made HERE,
+  ;; so they are frozen into the core: on a Classic they cost minutes at the
+  ;; first DEFUN.  Nothing is translated (%T68-ALLOWED-P), so the code area,
+  ;; which the core does not carry, is still empty.
+  (handler-case (%t68-init)
+    (error (c) (write-string-serial \"T68-INIT-FAILED\") (write-char-serial 10)))
+"
+                           "")
                        "  ;; the closure-environment slot (translate-68k M68K-CENV-ADDR, the
   ;; hosted convention block at #x10000A00) still holds the LAST closure's
   ;; environment -- COMPACT-NAMES' MAPHASH lambda, over its 12,000-name table:

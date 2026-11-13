@@ -39,7 +39,7 @@ REPO = os.path.dirname(HERE)
 # static heap's card crossing table)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
-    'classicos': (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
+    'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
 }[os.environ['MODUS_MAC68K_MACHINE'].lower()]

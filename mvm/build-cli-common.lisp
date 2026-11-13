@@ -2660,7 +2660,8 @@
               before (reduce #'+ vars :key (lambda (v) (length (symbol-value v))))))))
 
 (defvar *cli-arch-late-source*
-  (if (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1"))
+  (if (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+           (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
       (mvm-text "mvm/jit-68k.lisp")
       "")
   "Arch source placed after the CL runtime, the compiler and mvm-eval (see the

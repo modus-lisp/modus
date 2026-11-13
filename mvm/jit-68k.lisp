@@ -60,6 +60,7 @@
     (98 :r :i :r) (113 :r :r :i)))
 (defvar *t68-by-op* nil "Permutable op -> the operand lists the image has shapes for.")
 (defvar *t68-next* nil "NEXT's address: where every stub jumps.")
+(defvar *t68-abs-calls* nil "T on a paged image (the Mac): CALL operands are absolute addresses.")
 (defvar *t68-ptr* 0 "The code area's next free byte.")
 (defvar *t68-end* 0 "The code area's end.")
 (defvar *t68-why* nil "Why the last module was not translated.")
@@ -133,7 +134,10 @@
   (let ((bytes (%t68-key-bytes key)) (lo 0) (hi (- *t68-table-n* 1)) (found nil))
     (loop while (and (null found) (<= lo hi))
           do (let* ((mid (floor (+ lo hi) 2)) (e (%t68-entry mid)) (c (%t68-compare bytes e)))
-               (cond ((= c 0) (setq found (mem-ref e :u16)))
+               ;; two byte reads: entries are packed, and a word read at an
+               ;; odd address is an address error on a 68000 (not on the
+               ;; 68040s it was first run on: qemu's, Basilisk's)
+               (cond ((= c 0) (setq found (+ (* 256 (mem-ref e :u8)) (mem-ref (+ e 1) :u8))))
                      ((< c 0) (setq hi (- mid 1)))
                      (t (setq lo (+ mid 1))))))
     found))
@@ -193,6 +197,9 @@
                         (and p (%t68-branch-target p))))))
                  (t nil))))
     (unless (%t68-next-p next) (error "jit-68k: cannot find NEXT from CAR's entry"))
+    ;; a paged image's calls name their targets ABSOLUTELY (translate-68k
+    ;; M68K-EMIT-FETCH-TARGET: its streams move), an unpaged one's relative
+    (setq *t68-abs-calls* (= (mem-ref (+ a 2) :u16) #x303C))
     (setq *t68-next* next)))
 
 (defun %t68-find-table ()
@@ -226,7 +233,8 @@
 
 (defun %t68-fixed-area ()
   "(LO . HI) of a code area the map reserves, or NIL to map one (hosted
-   Linux).  The Mac build overrides it with its layout's :JIT-AREA."
+   Linux).  The Mac build replaces this body in the text with its layout's
+   :JIT-AREA (build-cl-repl-common.lisp)."
   nil)
 
 (defun %t68-init (&optional (area-size 1048576))
@@ -309,7 +317,9 @@
                       (setf (gethash (+ npc (first ops)) h) t))
                      ((or (= op +t68-op-bnull+) (= op +t68-op-bnnull+))
                       (setf (gethash (+ npc (second ops)) h) t)))
-               (setq pc npc)))
+               ;; an instruction the decoder cannot size must not loop (and
+               ;; cons) forever: the walk refuses the module on it
+               (setq pc (if (> npc pc) npc len))))
     h))
 
 (defun %t68-walk (bc start end w lbls fn)
@@ -317,7 +327,10 @@
   (let ((pc start))
     (loop while (< pc end)
           do (let* ((d (decode-instruction bc pc)) (op (car d)) (ops (cadr d)) (npc (cddr d))
-                    (nxt (and (< npc end) (not (gethash npc lbls)) (decode-instruction bc npc))))
+                    (nxt (and (> npc pc) (< npc end) (not (gethash npc lbls)) (decode-instruction bc npc))))
+               (when (not (> npc pc))
+                 (setq *t68-why* (list :undecodable op pc))
+                 (return-from %t68-walk :fail))
                (if (and (%t68-flag-op-p op) nxt (%t68-cond-br-p (car nxt)))
                    (multiple-value-bind (k p) (%t68-classify op ops npc w)
                      (when (eq k :fail) (return-from %t68-walk :fail))
@@ -503,7 +516,8 @@
                 (ecase (first p)
                   (:i (%t68-put a (second p) (third p)) (setq a (+ a (second p))))
                   (:br (%t68-put a w (- (third p) (+ a w))) (setq a (+ a w)))
-                  (:call (%t68-put a 4 (- (third p) (+ a 4))) (setq a (+ a 4)))
+                  (:call (%t68-put a 4 (if *t68-abs-calls* (third p) (- (third p) (+ a 4))))
+                         (setq a (+ a 4)))
                   (:cell (%t68-put a 4 (third p)) (setq a (+ a 4)))))))))
       (setq *t68-ptr* addr)
       (mapcar (lambda (e) (cons (first (first e))
@@ -522,18 +536,30 @@
     (puthash nm *symbol-function-table* fn))
   (when (boundp (quote *native-sym-function-table*))
     (puthash (compute-name-hash nm) *native-sym-function-table* fn))
-  (setq *jit-native-defun-count* (if *jit-native-defun-count* (+ *jit-native-defun-count* 1) 1)))
+  (setq *jit-native-defun-count*
+        (if (and (boundp (quote *jit-native-defun-count*)) (integerp *jit-native-defun-count*))
+            (+ *jit-native-defun-count* 1) 1)))
 
 (defvar *t68-translated* 0 "CENSUS: modules translated.")
 (defvar *t68-refused* nil "CENSUS: (name . why) of modules left interpreted, newest first.")
+
+(defun %t68-max-bytecode ()
+  "The largest module (bytes of MVM bytecode) to translate, or NIL for any.
+   Translating holds a few dozen bytes per instruction live at once, so the
+   Mac, whose young semispace is 128 KB, replaces this body in the text: a
+   DEFSTRUCT is ONE module of all its functions (6 KB for two slots) and
+   exhausted the heap."
+  nil)
 
 (defun %t68-on-defun (names)
   "*RUNTIME-DEFUN-HOOK*: translate the module mvm-eval just installed for
    NAMES and publish its DEFUNs; on any failure they stay interpreted."
   (let ((m (and names *jit-module-registry* (gethash (car names) *jit-module-registry*))))
     (when m
-      (let ((fns (handler-case (%t68-translate m)
-                   (error (c) (setq *t68-why* (list :error (princ-to-string c))) nil))))
+      (let ((fns (if (and (%t68-max-bytecode) (> (length (first m)) (%t68-max-bytecode)))
+                     (progn (setq *t68-why* (list :too-big (length (first m)))) nil)
+                     (handler-case (%t68-translate m)
+                       (error (c) (setq *t68-why* (list :error (princ-to-string c))) nil)))))
         (if fns
             (progn
               (setq *t68-translated* (+ *t68-translated* 1))
@@ -554,15 +580,28 @@
 
 (defvar *t68-off* nil "T: leave runtime DEFUNs interpreted.")
 
+(defun %t68-allowed-p ()
+  "May DEFUNs be translated now?  Always, here.  The Mac overrides it: only
+   when running from a saved core -- the build's own boot (the core run, on
+   Basilisk's 68040) defines functions too (E2SMOKE), and code translated
+   there would be lost (the code area is not in the core) while the core kept
+   the function objects pointing at it.  The Mac build replaces this body in
+   the text, as for %T68-FIXED-AREA."
+  t)
+
 (defun %runtime-defun-hook (names)
   "mvm-eval's hook (overridden here, last DEFUN wins): every runtime DEFUN is
    translated as it is defined, the JIT readied on the first one, unless
    *T68-OFF*.  A JIT that cannot start leaves DEFUNs interpreted."
-  (when (and names (not *t68-off*))
-    (when (null *t68-table*)
+  ;; the guard first, and BOUNDP before each read: this runs at every DEFUN
+  ;; from boot on (E2SMOKE's included), before anything has set these, and a
+  ;; global that was never set need not read as NIL on every image
+  (when (and names (%t68-allowed-p)
+             (not (and (boundp (quote *t68-off*)) *t68-off*)))
+    (when (not (and (boundp (quote *t68-table*)) *t68-table*))
       (handler-case (%t68-init)
         (error (c) (setq *t68-off* t *t68-why* (list :init (princ-to-string c))))))
-    (when *t68-table* (%t68-on-defun names))))
+    (when (and (boundp (quote *t68-table*)) *t68-table*) (%t68-on-defun names))))
 
 (defun t68-enable (&optional (area-size 1048576))
   "Ready the JIT now (it starts itself at the first DEFUN otherwise)."

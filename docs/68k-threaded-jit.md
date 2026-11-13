@@ -1,4 +1,4 @@
-# REPL code as threaded code on the 68000 (design, in progress)
+# REPL code as threaded code on the 68000
 
 ## Why
 
@@ -75,6 +75,17 @@ ladder and alexandria/cl-ppcre for regressions.  Then the Mac.
 5. Gates: hosted 68k ladder and libraries; the x64 acceptance gate for the
    shared files.
 
+## Status (2026-11-13)
+
+Runs on the Mac Classic layout launched from Mac OS (`classicos`, 4 MB), in
+MAME's 68000: `(fib 15)` 4 s against ~19 minutes interpreted, `(fib 20)` 17 s.
+Hosted 68k: `t10` (24 cases against the interpreter, constants across a
+collection) passes, `(fib 20)` 27.8 s -> 18 ms.  Not done: handlers generated
+at run time (INDIRECT) -- a missing shape refuses the module instead; late
+binding for redefinitions; translating only hot functions, which would take
+the translation cost (up to a minute a DEFUN on a Classic) off DEFUN.  The
+shape index is built in the core run and saved with the core.
+
 ## Found on the way
 
 - **A RETURN-FROM that did not return.**  In the first `%T68-TRANSLATE`, a
@@ -85,3 +96,29 @@ ladder and alexandria/cl-ppcre for regressions.  Then the Mac.
   initform, inside DOLIST, from a DEFUN) returns correctly; the failing code
   also bound a variable named LABELS.  Not yet reduced; the translator now
   has no non-local exits and no such variable.
+- **The Mac's seams were bound in the wrong package.**  The Mac build gives
+  the JIT its code area and its "only from a saved core" rule by rewriting
+  `jit-68k.lisp`'s text into `*CLI-ARCH-LATE-SOURCE*` before
+  `build-cli-common.lisp` loads.  That file reads in CL-USER (its one
+  `IN-PACKAGE` is inside a string), and the Mac block bound
+  `MODUS.MVM::*CLI-ARCH-LATE-SOURCE*`, a variable nothing read.  The image got
+  the hosted defaults: E2SMOKE's DEFUN in the core run was translated, and the
+  JIT went to mmap a code area on a Mac.  Basilisk then died in the ROM's
+  `_Write` with the File Manager queue's tail at -1, on both 68040 ROMs, and
+  only when the build had the JIT code and the shape table, which looked like
+  a layout fault.  Serial probes found it: `%T68-ALLOWED-P` answered T where a
+  function with its intended body answered NIL, and `MODUS_DDC_DUMP_SOURCE`
+  showed the default bodies in the blob.
+- **What the hosted 68k could not show.**  Two defects passed every hosted
+  test because qemu-user and Basilisk both emulate a 68040 running an unpaged
+  or paged image they are not: a CALL operand in a *paged* image's stream is
+  an absolute address (its streams move; `M68K-EMIT-FETCH-TARGET`), so the
+  JIT's relative operand sent every Mac call into the weeds -- `(sq 7)` ran,
+  `(hanoi 10)` hung; and `%T68-LOOKUP` read a packed table entry's index as
+  one word, an address error on a real 68000 at an odd entry.  The JIT now
+  takes the operand form from CAR's stub (paged or not) and reads bytes.
+- **The Mac's small image makes fewer shapes** (2,979 against the hosted
+  CLI's 4,532), so `(defun fib ...)` there needed `(:FUSED (48 4 6) 67 2)` and
+  was refused.  `mvm/68k-jit-extra-shapes.txt` adds 215 (about 10 KB
+  resident): the hosted image's top 1000 the Mac lacks, and its fused
+  compare-and-branch rows.

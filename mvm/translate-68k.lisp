@@ -133,12 +133,21 @@
   "MODUS_68K_HOT: an EQUAL hash of function names to keep native when
    threading (cross.lisp turns it into bytecode offsets for *68K-THREADED*).")
 (defvar *68k-cold-fns* nil "Hash: cold function start pc -> (end-pc . branch-width).")
-(defvar *68k-jit-shapes* (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+(defvar *68k-jit-shapes* (and (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+                              (not (equal (sb-ext:posix-getenv "MODUS_68K_JIT_SHAPES") "0")))
   "MODUS_68K_JIT=1: the image carries the shapes the runtime threaded JIT needs
    beyond its own (mvm/jit-68k.lisp): (:LI-CELL R) for R in V0..V15 and VR --
    R = the 32-bit word in the CELL whose address follows the token.  A cell is
    a low-block word, which every collection scans and forwards, so a quoted
    heap object a runtime DEFUN loads can move.")
+(defun m68k-jit-extra-shapes ()
+  "The keys in MODUS_68K_JIT_EXTRA (default mvm/68k-jit-extra-shapes.txt), one
+   per line, ;-comments allowed."
+  (let ((f (or (sb-ext:posix-getenv "MODUS_68K_JIT_EXTRA")
+               (namestring (merge-pathnames "mvm/68k-jit-extra-shapes.txt" cl-user::*modus-base*)))))
+    (with-open-file (in f)
+      (let ((*package* (find-package :keyword)) (*read-eval* nil))
+        (loop for k = (read in nil :eof) until (eq k :eof) collect k)))))
 (defvar *68k-thread-shapes* nil "Hash: shape key -> shape (vector index label count key).")
 (defvar *68k-thread-next-label* nil)
 (defvar *68k-stream-fixups* nil "List of (byte-pos label size base).")
@@ -5057,10 +5066,18 @@
             do (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) n k)))
       ;; the runtime JIT's own shapes, after every counted one
       (when *68k-jit-shapes*
-        (loop for r from 0 to 16 for j from (length rows)
-              do (let ((k (list :li-cell r)))
+        (let ((j (length rows)))
+          (flet ((add (k)
                    (unless (gethash k shapes)
-                     (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) 0 k))))))
+                     (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) 0 k))
+                     (incf j))))
+            (loop for r from 0 to 16 do (add (list :li-cell r)))
+            ;; and the shapes REPL code needs that this image's own code may not
+            ;; make (mvm/68k-jit-extra-shapes.txt)
+            (let ((n (hash-table-count shapes)))
+              (dolist (k (m68k-jit-extra-shapes)) (add k))
+              (format t "~&;; 68k JIT: ~D extra shapes for runtime code~%"
+                      (- (hash-table-count shapes) n))))))
       (setq *68k-cold-fns* cold *68k-thread-shapes* shapes)
       ;; MODUS_68K_THREAD_STATS: stream bytes, and the commonest adjacent
       ;; token pairs (superinstruction candidates), by bytes they would save.

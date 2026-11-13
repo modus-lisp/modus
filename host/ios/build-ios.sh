@@ -13,6 +13,7 @@
 # copied into the bundle, before it is signed; pass "@NAME" on the command line
 # to name one, or list the arguments one per line in a bundled modus.args.
 # MODUS_CORE=FILE puts a snapshot's compiled code in the app (image-segments.sh).
+# MODUS_IOS_ROTATES=1: the app turns with the phone (portrait and both landscapes); otherwise iOS's default.
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -55,23 +56,44 @@ for W in $WHERE; do
     *)     LINKX="$LINKX $W" ;;
   esac
 done
+# THE SIMULATOR'S ENTITLEMENTS go in a section of the binary, as Xcode puts them, not in the ad-hoc
+# signature (an ad-hoc signature that carries them is not launched): without an application identifier
+# and its keychain group, every keychain write is refused (errSecMissingEntitlement), so nothing the app
+# keeps there -- an SSH key, a password -- outlives the call that made it.
+if [ "$KIND" = sim ]; then
+  SIMENT=$OBJS/sim.entitlements
+  APPID=SIMULATOR.${MODUS_IOS_BUNDLE_ID:-org.modus-lisp.modus}
+  cat > "$SIMENT" <<ENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>application-identifier</key><string>$APPID</string>
+  <key>keychain-access-groups</key><array><string>$APPID</string></array>
+</dict></plist>
+ENT
+  LINKX="$LINKX -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements -Xlinker $SIMENT"
+fi
 # shellcheck disable=SC2086  # LINKX is a flag list
 xcrun --sdk $SDKN swiftc -target $TARGET -sdk "$SDK" -o "$OUT/modus" "$OBJS"/*.o \
   -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore \
-  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal -framework Speech $LINKX
+  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal -framework Speech -framework QuickLook $LINKX
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>${MODUS_IOS_BUNDLE_ID:-org.modus-lisp.modus}</string>
   <key>CFBundleExecutable</key><string>modus</string>
-  <key>CFBundleName</key><string>modus</string>
+  <key>CFBundleName</key><string>${MODUS_IOS_NAME:-modus}</string>
+  <key>CFBundleDisplayName</key><string>${MODUS_IOS_NAME:-modus}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
   <key>MinimumOSVersion</key><string>18.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>modus listens when you ask it to: the Listen app transcribes what it hears.</string>
+$( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
+  '<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>' )
+  <key>NSLocalNetworkUsageDescription</key><string>${MODUS_IOS_NAME:-modus} connects to computers on your network and on your VPN: the servers you add, over SSH.</string>
   <key>NSSpeechRecognitionUsageDescription</key><string>The Listen app turns what you say into text.</string>
   <key>UILaunchScreen</key><dict/>
   <key>UIFileSharingEnabled</key><true/>

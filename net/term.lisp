@@ -99,7 +99,19 @@
 
 ;; Compute serialized byte count for a term.  The float and the string are measured first, as they
 ;; are written first (term-float-p before the zero test, for the reason on that function).
+;;
+;; A LIST IS WALKED ALONG ITS SPINE, NOT RECURSED DOWN IT: only a car is a recursion.  Recursing on the
+;; cdr took two frames an element, so a list of 5000 rows (a big folder, sent to iOS's UI in one call)
+;; ran off the end of an iPhone thread's stack -- a memory fault, and with no handler armed, the app gone.
 (defun term-size (val)
+  (let ((n 0))
+    (loop
+      (if (consp val)
+          (progn (setq n (+ n (+ 1 (term-size (car val)))))
+                 (setq val (cdr val)))
+          (return (+ n (term-size-1 val)))))))
+
+(defun term-size-1 (val)
   (cond ((term-float-p val) 9)
         ((null val) 1)
         ((stringp val) (+ 5 (%utf8-length val)))
@@ -124,7 +136,17 @@
 
 ;; Serialize term to buffer at raw address buf. Returns bytes written.
 ;; Uses soft-subtag for object type dispatch (compatible with try-alloc-obj).
+;; A list along its spine, as TERM-SIZE: tag 2, its car, and on to its cdr.
 (defun term-encode (val buf)
+  (let ((start buf))
+    (loop
+      (if (consp val)
+          (progn (setf (mem-ref buf :u8) 2)
+                 (setq buf (+ (+ buf 1) (term-encode (car val) (+ buf 1))))
+                 (setq val (cdr val)))
+          (return (+ (- buf start) (term-encode-1 val buf)))))))
+
+(defun term-encode-1 (val buf)
   (if (term-float-p val)
       (progn
         (setf (mem-ref buf :u8) 8)
@@ -263,11 +285,19 @@
                   (setf (mem-ref da :u64) (+ buf 9))
                   (if (>= hi 2147483648) (- v 18446744073709551616) v))
                 (if (= tag 2)
-                    (progn
-                      (setf (mem-ref da :u64) (+ buf 1))
-                      (let ((car-val (term-decode-step)))
-                        (let ((cdr-val (term-decode-step)))
-                          (cons car-val cdr-val))))
+                    ;; along the spine, as TERM-ENCODE wrote it: the cars, then the tail, consed back up
+                    (let ((items nil) (tail nil))
+                      (loop
+                        (let ((at (mem-ref da :u64)))
+                          (if (= (mem-ref at :u8) 2)
+                              (progn (setf (mem-ref da :u64) (+ at 1))
+                                     (setq items (cons (term-decode-step) items)))
+                              (progn (setq tail (term-decode-step))
+                                     (return 0)))))
+                      (loop
+                        (when (null items) (return tail))
+                        (setq tail (cons (car items) tail))
+                        (setq items (cdr items))))
                     (if (= tag 6)
                         ;; A SYMBOL, BY NAME — AND THE INTERN HAPPENS HERE.
                         ;;

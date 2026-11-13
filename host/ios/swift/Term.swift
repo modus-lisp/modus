@@ -73,10 +73,15 @@ extension Term {
             out += n
             appendU32(&out, UInt32(p.count))
             out += p
-        case .cons(let a, let d):
-            out.append(2)
-            a.encode(into: &out)
-            d.encode(into: &out)
+        case .cons:
+            // along the spine, not down it: a long list (a big folder's rows) must not take a frame a cell
+            var cur = self
+            while case .cons(let a, let d) = cur {
+                out.append(2)
+                a.encode(into: &out)
+                cur = d
+            }
+            cur.encode(into: &out)
         case .bytes(let b):
             out.append(4)
             appendU32(&out, UInt32(b.count))
@@ -144,9 +149,15 @@ struct TermReader {
         case 1:
             return .int(Int(Int64(bitPattern: try u64())))
         case 2:
-            let a = try term()
-            let d = try term()
-            return .cons(a, d)
+            // along the spine: the cars, then the tail, consed back up from the end
+            var items = [try term()]
+            while pos < bytes.count, bytes[pos] == 2 {
+                pos += 1
+                items.append(try term())
+            }
+            var t = try term()
+            for a in items.reversed() { t = .cons(a, t) }
+            return t
         case 3:   // the old 8-bit string: one character per byte, Latin-1
             let n = try u32()
             let s = try take(Int(n)).map { Character(Unicode.Scalar($0)) }

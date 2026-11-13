@@ -456,7 +456,7 @@ let appBarMenuSet: Call = { h, p, n, _, _, _ in
     return 1
 }
 
-private func barMenu(_ bh: UInt, _ items: Term?) -> UIMenu {
+private func barMenu(_ bh: UInt, _ items: Term?, event: String = "MENU") -> UIMenu {
     var groups: [(group: Int, header: String?, sub: String?, subImage: String?, actions: [UIAction])] = []
     for item in items?.listItems ?? [] {
         let m = plist(item)
@@ -464,7 +464,7 @@ private func barMenu(_ bh: UInt, _ items: Term?) -> UIMenu {
         var g = 0
         if case .int(let k)? = m["GROUP"] { g = k }
         let action = UIAction(title: str(m["TITLE"]) ?? "", image: str(m["IMAGE"]).flatMap { UIImage(systemName: $0) },
-                              state: flag(m["ON"]) ? .on : .off) { _ in send("MENU", [.int(Int(bh)), .int(id)]) }
+                              state: flag(m["ON"]) ? .on : .off) { _ in send(event, [.int(Int(bh)), .int(id)]) }
         action.subtitle = str(m["SUBTITLE"])
         if let last = groups.last, last.group == g {
             groups[groups.count - 1].actions.append(action)
@@ -656,6 +656,7 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     private(set) var filter = ""
     private var searchBar: UISearchBar?
     private var searchTucked = false              // tucked away once, when there was first enough to scroll
+    private var tuckedAt: CGFloat?                // where the tuck left the list, while nobody has moved it
 
     /// A search bar heads the table; what is typed in it filters the rows by name, as they come too.
     func enableSearch() {
@@ -683,6 +684,24 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     // then the filter.
     private let header = UIView()
     private let infoLabel = UILabel()
+    private var optionsButton: UIButton?
+
+    /// A button to the right of the filter that opens a menu (app_table_options): how the rows are sorted and
+    /// what is shown.  A choice is an OPTIONS event with its id.
+    func setOptions(_ items: Term?) {
+        let b = optionsButton ?? {
+            var config = UIButton.Configuration.plain()
+            config.image = UIImage(systemName: "slider.horizontal.3")
+            let b = UIButton(configuration: config)
+            b.showsMenuAsPrimaryAction = true
+            b.accessibilityLabel = "Sort and View"
+            header.addSubview(b)
+            optionsButton = b
+            return b
+        }()
+        b.menu = barMenu(handle, items, event: "OPTIONS")
+        layoutHeader()
+    }
     private var headerWidth: CGFloat = 0
 
     /// TEXT, its [[symbol]]s drawn as SF Symbols in the text's own colour and size.
@@ -720,9 +739,18 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         let info: CGFloat = infoLabel.attributedText == nil ? 0
             : infoLabel.sizeThatFits(CGSize(width: w - 2 * inset, height: .greatestFiniteMagnitude)).height + 14
         infoLabel.frame = CGRect(x: inset, y: 10, width: w - 2 * inset, height: max(0, info - 14))
-        bar.frame = CGRect(x: 0, y: info, width: w, height: 56)
+        let room: CGFloat = optionsButton == nil ? 0 : 44
+        bar.frame = CGRect(x: 0, y: info, width: w - room, height: 56)
+        optionsButton?.frame = CGRect(x: w - room - table.layoutMargins.right + 8, y: info + 6, width: 44, height: 44)
         header.frame = CGRect(x: 0, y: 0, width: w, height: info + 56)
         if table.tableHeaderView === header { table.tableHeaderView = header }    // its new height taken
+        if table.tableHeaderView === header { fitTuckRoom() }
+        // tucked, and still where the tuck left it: tucked again, past the header as it is now (the info line
+        // arrives after the rows)
+        if let at = tuckedAt, abs(table.contentOffset.y - at) < 1 {
+            table.contentOffset.y = -table.adjustedContentInset.top + header.frame.height
+            tuckedAt = table.contentOffset.y
+        }
     }
 
     func searchBar(_ searchBar: UISearchBar, textDidChange text: String) {
@@ -743,12 +771,28 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     /// The search bar out of sight above the first row, once -- when the rows first fill more than the screen
     /// and nobody has scrolled yet.  Pulled down to, it is there.
     private func tuckSearch() {
-        guard let bar = searchBar, !searchTucked, filter.isEmpty else { return }
+        guard searchBar != nil, table.tableHeaderView === header else { return }
+        fitTuckRoom()
+        guard !searchTucked, filter.isEmpty, !all.isEmpty else { return }
         let top = -table.adjustedContentInset.top
-        guard table.contentSize.height > table.bounds.height, abs(table.contentOffset.y - top) < 1 else { return }
+        guard abs(table.contentOffset.y - top) < 1 else { return }
         searchTucked = true
         table.contentOffset.y = top + header.frame.height
-        _ = bar
+        tuckedAt = table.contentOffset.y
+    }
+
+    // ROOM TO TUCK: a list shorter than the screen cannot scroll its header away, so below its rows there is just
+    // enough room for that (as Mail and Files have it); COVER is what the browser's shelf covers of its bottom.
+    var cover: CGFloat = 0 { didSet { applyBottom() } }
+    private var tuckRoom: CGFloat = 0
+    private func applyBottom() {
+        table.contentInset.bottom = cover + tuckRoom
+        table.verticalScrollIndicatorInsets.bottom = cover
+    }
+    private func fitTuckRoom() {
+        let visible = table.bounds.height - table.safeAreaInsets.top - cover
+        let room = max(0, visible + header.frame.height - table.contentSize.height)
+        if abs(room - tuckRoom) > 1 { tuckRoom = room; applyBottom() }
     }
 
     // ---- the scrubber: for a list many screens long ----
@@ -791,6 +835,8 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         max(1, table.contentSize.height + table.adjustedContentInset.top + table.adjustedContentInset.bottom
                 - table.bounds.height)
     }
+
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) { tuckedAt = nil }   // theirs now
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         updateIndicator()
@@ -1377,9 +1423,6 @@ final class HexView: UITableView, UITableViewDataSource, UITableViewDelegate {
         let hex = data.map { String(format: "%02x", $0) }.joined(separator: " ")
         return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { _ in
             UIMenu(children: [
-                UIAction(title: "Edit Bytes…", image: UIImage(systemName: "pencil")) { [weak self] _ in
-                    self?.onEdit?(start, data)
-                },
                 UIAction(title: "Copy Hex", image: UIImage(systemName: "doc.on.doc")) { _ in
                     UIPasteboard.general.string = hex
                 },
@@ -1748,9 +1791,13 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
             } else {
                 (page.view as? UIScrollView)?.showsVerticalScrollIndicator = !shelfShown
             }
-            guard let t = page.view as? UITableView, abs(t.contentInset.bottom - cover) > 1 else { continue }
-            t.contentInset.bottom = cover
-            t.verticalScrollIndicatorInsets.bottom = cover
+            guard let t = page.view as? UITableView else { continue }
+            if let source = tables.values.first(where: { $0.table === t }) {
+                if abs(source.cover - cover) > 1 { source.cover = cover }
+            } else if abs(t.contentInset.bottom - cover) > 1 {
+                t.contentInset.bottom = cover
+                t.verticalScrollIndicatorInsets.bottom = cover
+            }
         }
         layoutPages()
     }
@@ -1828,9 +1875,9 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         // landscape's floating buttons
         let share = glass("square.and.arrow.up") { [weak self] in self?.sharePreview() }
         shareButton = share
-        let floatingHex = glass("number.square") { [weak self] in self?.toggleHex() }
-        hexToggles.append(floatingHex)
-        floating.addArrangedSubview(floatingHex)
+        let floatingView = glass("eye") {}
+        viewButtons.append(floatingView)
+        floating.addArrangedSubview(floatingView)
         floating.addArrangedSubview(share)
         floating.addArrangedSubview(glass("xmark") { [weak self] in self?.closePreview(byUser: true) })
         floating.spacing = 10
@@ -1847,12 +1894,13 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         let shelfShare = glass("square.and.arrow.up") { [weak self] in self?.sharePreview() }
         self.shelfShare = shelfShare
         // close and the hex toggle on the left, the name, share on the right
-        let shelfHex = glass("number.square") { [weak self] in self?.toggleHex() }
-        hexToggles.append(shelfHex)
+        let shelfView = glass("eye") {}
+        viewButtons.append(shelfView)
         // and its twin on the right, empty, so the name stays in the middle
-        hexTwin.widthAnchor.constraint(equalToConstant: 44).isActive = true
+        viewTwin.widthAnchor.constraint(equalToConstant: 44).isActive = true
         let row = UIStackView(arrangedSubviews: [
-            glass("xmark") { [weak self] in self?.closePreview(byUser: true) }, shelfHex, shelfName, hexTwin, shelfShare])
+            glass("xmark") { [weak self] in self?.closePreview(byUser: true) }, shelfView, shelfName,
+            viewTwin, shelfShare])
         row.alignment = .center
         row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -1908,19 +1956,27 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         vc.view.addSubview(pane)
     }
     var shareButton: UIView?
-    var hexToggles: [UIButton] = []              // "the bytes instead": the shelf's and the floating one
-    let hexTwin = UIView()
+    var viewButtons: [UIButton] = []             // the ways to look at the file: the shelf's and the floating one
+    let viewTwin = UIView()
 
-    /// The hex toggle: shown for a file that has another view (an image, text, a PDF), filled while its bytes are
-    /// what is shown.  A tap is a HEXTOGGLE event; the app shows the file the other way.
-    func setHexToggle(shown: Bool, on: Bool) {
-        hexTwin.isHidden = !shown
-        for b in hexToggles {
+    /// The view button: a menu of the ways to show the file (VIEWS: (title symbol) each), the one shown (CURRENT)
+    /// checked and its symbol on the button.  A choice is a VIEWAS event with its index.  Fewer than two: no button.
+    func setViews(_ views: [(title: String, symbol: String)], current: Int) {
+        let shown = views.count > 1
+        viewTwin.isHidden = !shown
+        for b in viewButtons {
             b.isHidden = !shown
-            b.configuration?.image = UIImage(systemName: on ? "number.square.fill" : "number.square")
+            b.configuration?.image = UIImage(systemName: views.indices.contains(current) ? views[current].symbol : "eye")
+            b.menu = UIMenu(title: "View As", children: views.enumerated().map { i, v in
+                UIAction(title: v.title, image: UIImage(systemName: v.symbol), state: i == current ? .on : .off) {
+                    [weak self] _ in
+                    guard let self else { return }
+                    send("VIEWAS", [.int(Int(self.handle)), .int(i)])
+                }
+            })
+            b.showsMenuAsPrimaryAction = true
         }
     }
-    func toggleHex() { send("HEXTOGGLE", [.int(Int(handle))]) }
     var shelfShare: UIView?
 
     /// The shelf follows the finger; let go, and it springs to the nearer of its two heights -- or away, dragged
@@ -2032,10 +2088,11 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         imageViewer.isHidden = kind != .image
         hexView.isHidden = kind != .hex
         ql.view.isHidden = kind != .quickLook
-        // a hex dump's local copy is only the part looked at: nothing to share
-        shareButton?.isHidden = kind == .hex
-        shelfShare?.alpha = kind == .hex ? 0 : 1
-        shelfShare?.isUserInteractionEnabled = kind != .hex
+        // a hex dump's local copy, or a file's beginning shown as text, is only part of it: nothing to share
+        let part = kind == .hex || url.pathExtension == "part"
+        shareButton?.isHidden = part
+        shelfShare?.alpha = part ? 0 : 1
+        shelfShare?.isUserInteractionEnabled = !part
         switch kind {
         case .hex:
             hexPath = url
@@ -2355,10 +2412,15 @@ let appBrowserSetPath: Call = { h, th, p, n, _, _ in
     return 1
 }
 
-/// app_browser_preview_toggle(browser, shown, on): the preview's hex toggle -- SHOWN 1 for a file with a view
-/// besides its bytes; ON 1 while the bytes are what is shown.
-let appBrowserPreviewToggle: Call = { h, shown, on, _, _, _ in
-    browsers[h]?.setHexToggle(shown: shown != 0, on: on != 0)
+/// app_browser_preview_views(browser, term): ((title symbol) ... current) -- the ways the preview can show its file,
+/// and the one it does: the view button's menu.
+let appBrowserPreviewViews: Call = { h, p, n, _, _, _ in
+    guard let items = termBytes(p, n)?.listItems, let last = items.last, case .int(let current) = last else { return 0 }
+    let views = items.dropLast().compactMap { t -> (title: String, symbol: String)? in
+        guard let v = t.listItems, v.count == 2, let title = str(v[0]), let symbol = str(v[1]) else { return nil }
+        return (title, symbol)
+    }
+    browsers[h]?.setViews(Array(views), current: current)
     return 1
 }
 
@@ -2415,6 +2477,31 @@ let appTableReadme: Call = { h, p, n, _, _, _ in
     var md = false
     if items.count > 2, case .int(let v) = items[2] { md = v != 0 }
     source.setReadme(str(items[0]) ?? "", str(items[1]) ?? "", markdown: md)
+    return 1
+}
+
+/// app_file_stamp(path): a local file's modification time, in seconds since 1970 (0: not there); its size is
+/// app_file_size(path).
+let appFileStamp: Call = { p, n, _, _, _, _ in
+    let attrs = try? FileManager.default.attributesOfItem(atPath: text(p, n))
+    return UInt(max(0, (attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0))
+}
+let appFileSize: Call = { p, n, _, _, _, _ in
+    let attrs = try? FileManager.default.attributesOfItem(atPath: text(p, n))
+    return UInt((attrs?[.size] as? NSNumber)?.uint64Value ?? 0)
+}
+
+/// app_set_mtime(path, seconds): a local file's modification time set (a download's to the server's, so the next
+/// one can tell what changed).
+let appSetMtime: Call = { p, n, secs, _, _, _ in
+    let date = Date(timeIntervalSince1970: TimeInterval(secs))
+    return (try? FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: text(p, n))) == nil ? 0 : 1
+}
+
+/// app_table_options(table, items): a button beside the table's filter that opens a menu of ITEMS (as a bar menu's);
+/// a choice is an OPTIONS event with the item's id.
+let appTableOptions: Call = { h, p, n, _, _, _ in
+    tables[h]?.setOptions(termBytes(p, n))
     return 1
 }
 
@@ -2969,7 +3056,7 @@ func installNative() {
     register("app_browser_pop_to", appBrowserPopTo)
     register("app_browser_set_path", appBrowserSetPath)
     register("app_browser_subtitle", appBrowserSubtitle)
-    register("app_browser_preview_toggle", appBrowserPreviewToggle)
+    register("app_browser_preview_views", appBrowserPreviewViews)
     register("app_browser_hex_total", appBrowserHexTotal)
     register("app_browser_hex_part", appBrowserHexPart)
     register("app_orientation", appOrientation)
@@ -2982,6 +3069,10 @@ func installNative() {
     register("app_table_order", appTableOrder)
     register("app_table_menu", appTableMenu)
     register("app_table_info", appTableInfo)
+    register("app_table_options", appTableOptions)
+    register("app_file_stamp", appFileStamp)
+    register("app_file_size", appFileSize)
+    register("app_set_mtime", appSetMtime)
     register("app_table_readme", appTableReadme)
     register("app_theme", appTheme)
     register("app_bar_button_enable", appBarButtonEnable)

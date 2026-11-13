@@ -74,3 +74,14 @@ ladder and alexandria/cl-ppcre for regressions.  Then the Mac.
 4. The Mac: the runtime code area in `:classic-os`; MAME timings.
 5. Gates: hosted 68k ladder and libraries; the x64 acceptance gate for the
    shared files.
+
+## Found on the way
+
+- **A RETURN-FROM that did not return.**  In the first `%T68-TRANSLATE`, a
+  `(return-from %t68-translate nil)` in the lambda handed to `%T68-WALK`
+  returned from the lambda only (interpreted, hosted 68k), so a missing shape
+  was skipped instead of refused and `(setf (aref ...))`'s token vanished.
+  The same shape in small tests (`/tmp`-style probes: a lambda in a LET*
+  initform, inside DOLIST, from a DEFUN) returns correctly; the failing code
+  also bound a variable named LABELS.  Not yet reduced; the translator now
+  has no non-local exits and no such variable.

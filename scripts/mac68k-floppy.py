@@ -95,7 +95,9 @@ def main(image, disk, hd=False, loader=None):
         sys.exit('mac68k-floppy: the image runs into the loader')
     stream = lzma.compress(img, format=lzma.FORMAT_RAW, filters=FILTERS)
     md = disk_module()
-    cap1 = FLOPPY - 1024                # disk 1 after its boot blocks
+    sp = md.splash()                    # write_disk puts the splash after the data
+    room = FLOPPY - (((len(sp) + 511) & ~511) if sp else 0)
+    cap1 = room - 1024                  # disk 1 after its boot blocks (and splash)
 
     def blob(code):
         head = struct.pack('>HHHH', len(img) >> 16, len(img) & 0xFFFF, 0,
@@ -106,8 +108,8 @@ def main(image, disk, hd=False, loader=None):
         return b
 
     single = blob(b'')
-    if 1024 + len(single) <= FLOPPY or hd:
-        n = md.write_disk(single, disk, LOADER_ADDR, FLOPPY if 1024 + len(single) <= FLOPPY else HD)
+    if 1024 + len(single) <= room or hd:
+        n = md.write_disk(single, disk, LOADER_ADDR, FLOPPY if 1024 + len(single) <= room else HD)
         if n > HD:
             sys.exit('mac68k-floppy: %d bytes do not fit a 1.44 MB floppy' % n)
         print('mac68k-floppy: %s, %d bytes -> %d LZMA + %d loader -> %s, %d bytes (%s)'

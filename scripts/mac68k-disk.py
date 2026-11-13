@@ -38,10 +38,90 @@ def bootblocks():
         return bytearray(open(b, 'rb').read()), syms
 
 
+SPLASH = os.path.join(HERE, '..', 'boot', 'mac68k-splash.pbm')
+
+
+def packbits(data):
+    """Apple PackBits (TN1023): a header byte n; 0..127, n+1 literal bytes
+    follow; -1..-127, the next byte 1-n times."""
+    out, i, n = bytearray(), 0, len(data)
+    while i < n:
+        j = i
+        while j + 1 < n and data[j + 1] == data[i] and j - i < 127:
+            j += 1
+        if j - i + 1 >= 3:
+            out += bytes([(257 - (j - i + 1)) & 0xFF, data[i]])
+            i = j + 1
+            continue
+        k = i
+        while k < n and k - i < 128 and not (k + 2 < n and data[k] == data[k + 1] == data[k + 2]):
+            k += 1
+        out += bytes([k - i - 1]) + data[i:k]
+        i = k
+    return bytes(out)
+
+
+def unpackbits(data, size):
+    out, i = bytearray(), 0
+    while len(out) < size:
+        h = data[i]
+        i += 1
+        if h < 128:
+            out += data[i:i + h + 1]
+            i += h + 1
+        elif h > 128:
+            out += bytes([data[i]]) * (257 - h)
+            i += 1
+    return bytes(out[:size])
+
+
+def splash(path=None):
+    """The boot blocks' splash (mac68k-bootblocks.s): a 512 x 342 PBM's middle,
+    the box of bytes where it differs from the 50% grey the boot blocks draw
+    first -- X0 (bytes), Y0, W (bytes), H as words, then the box XORed with
+    itself two rows up and PackBits'd.  None when there is no picture or
+    MAC68K_SPLASH=0."""
+    path = path or SPLASH
+    if os.environ.get("MAC68K_SPLASH") == "0" or not os.path.exists(path):
+        return None
+    pbm = open(path, 'rb').read()
+    fields, pos = [], 0
+    while len(fields) < 3:                   # P4, width, height (and # comments)
+        while pbm[pos:pos + 1].isspace():
+            pos += 1
+        if pbm[pos:pos + 1] == b'#':
+            pos = pbm.index(b'\n', pos)
+            continue
+        end = pos
+        while not pbm[end:end + 1].isspace():
+            end += 1
+        fields.append(pbm[pos:end])
+        pos = end
+    if fields != [b'P4', b'512', b'342']:
+        sys.exit('mac68k-disk: %s is not a 512 x 342 binary PBM' % path)
+    screen = pbm[pos + 1:pos + 1 + 64 * 342]
+    grey = lambda y: 0xAA if y % 2 == 0 else 0x55
+    box = [(x, y) for y in range(342) for x in range(64) if screen[64 * y + x] != grey(y)]
+    if not box:
+        return None
+    x0, x1 = min(b[0] for b in box), max(b[0] for b in box)
+    y0, y1 = min(b[1] for b in box), max(b[1] for b in box)
+    w, h = x1 - x0 + 1, y1 - y0 + 1
+    rows = b''.join(screen[64 * y + x0:64 * y + x0 + w] for y in range(y0, y1 + 1))
+    delta = bytes(rows[i] ^ (rows[i - 2 * w] if i >= 2 * w else 0) for i in range(len(rows)))
+    packed = packbits(delta)
+    if unpackbits(packed, len(delta)) != delta:
+        sys.exit('mac68k-disk: the splash does not unpack to itself')
+    data = struct.pack('>HHHH', x0, y0, w, h) + packed
+    if len(data) > 0x2000:                   # unpacked at DEST+#x2000
+        sys.exit('mac68k-disk: the splash packs to %d bytes, over 8 KB' % len(data))
+    return data
+
+
 def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read_len=None):
     """Boot blocks that read IMG (bytes) to LOAD_ADDR and jump to ENTRY (default
     LOAD_ADDR), then IMG at offset 1024, padded to whole blocks and to at
-    least MIN_SIZE."""
+    least MIN_SIZE.  The splash, when there is one, goes after IMG."""
     bb, syms = bootblocks()
     if syms['start'] != 0x8A:
         sys.exit('mac68k-disk: the loader is at %#x, not 0x8A' % syms['start'])
@@ -54,6 +134,11 @@ def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read
     struct.pack_into('>I', bb, syms['off'], 1024)
     out = bb + bytes(1024 - len(bb)) + img
     out += bytes(-len(out) % 512)
+    sp = splash()
+    if sp:
+        struct.pack_into('>I', out, syms['spoff'], len(out))
+        struct.pack_into('>I', out, syms['splen'], (len(sp) + 511) & ~511)
+        out += sp + bytes(-len(sp) % 512)
     out += bytes(max(0, min_size - len(out)))
     open(disk, 'wb').write(out)
     return len(out)

@@ -69,7 +69,80 @@ dq:     move.l  %a1, %d0
 found:  lea     pb(%pc), %a0
         move.w  8(%a1), 24(%a0)         | ioRefNum = dQRefNum
         move.w  %d1, 22(%a0)            | ioVRefNum = the drive
+| THE SPLASH (boot/mac68k-splash.pbm), on a compact Mac only: a 512 x 342 x 1
+| screen, 64 bytes a row.  The screen is filled with the desktop's 50% grey,
+| then the picture's middle -- the box where it differs from that grey -- is
+| drawn over it.  On the disk (scripts/mac68k-disk.py, SPLASH): X0 (bytes), Y0,
+| W (bytes), H as words, then the box's W*H bytes, each XORed with the byte
+| two rows above it in the box, PackBits'd (Apple TN1023).  SPLEN bytes from
+| SPOFF are read to DEST, where the image goes next, and unpacked at
+| DEST+#x2000.  A failed read only costs the picture.
+        move.l  splen(%pc), %d0
+        beq     3f
+        move.w  0x106, %d2              | ScreenRow
+        and.w   #0x3FFF, %d2
+        cmp.w   #64, %d2
+        bne     3f
         move.l  dest(%pc), 32(%a0)      | ioBuffer
+        move.l  %d0, 36(%a0)            | ioReqCount
+        move.w  #1, 44(%a0)             | ioPosMode = fsFromStart
+        move.l  spoff(%pc), 46(%a0)     | ioPosOffset
+        .word   0xA002                  | _Read
+        tst.w   %d0
+        bne     3f
+        move.l  0x824, %a3              | the grey: #xAA.. rows and #x55.. rows
+        move.l  #0xAAAAAAAA, %d0
+        move.w  #341, %d1
+70:     moveq   #15, %d2
+71:     move.l  %d0, (%a3)+
+        dbra    %d2, 71b
+        not.l   %d0
+        dbra    %d1, 70b
+        move.l  dest(%pc), %a2
+        movem.w (%a2)+, %d3-%d6         | X0 Y0 W H
+        lea     0x2000-8(%a2), %a3      | unpack to DEST+#x2000 ...
+        move.l  %a3, %a5
+        move.w  %d5, %d0
+        mulu.w  %d6, %d0
+        lea     (%a3,%d0.l), %a4        | ... W*H bytes
+4:      cmp.l   %a4, %a3
+        bhs     6f
+        moveq   #0, %d0
+        move.b  (%a2)+, %d0             | the header byte
+        bmi     5f
+41:     move.b  (%a2)+, (%a3)+          | 0..127: n+1 literal bytes
+        dbra    %d0, 41b
+        bra     4b
+5:      neg.b   %d0                     | -1..-127: the next byte 1-n times
+        bmi     4b                      | -128: nothing
+        move.b  (%a2)+, %d2
+51:     move.b  %d2, (%a3)+
+        dbra    %d0, 51b
+        bra     4b
+6:      move.l  %a5, %a3                | undo the XOR, in place
+        lea     (%a3,%d5.w), %a2
+        add.w   %d5, %a2                | two rows on
+62:     cmp.l   %a4, %a2
+        bhs     7f
+        move.b  (%a3)+, %d0
+        eor.b   %d0, (%a2)+
+        bra     62b
+7:      move.l  %a5, %a3                | the box onto the screen
+        move.l  0x824, %a2
+        mulu.w  #64, %d4
+        add.l   %d4, %a2
+        add.w   %d3, %a2
+        subq.w  #1, %d6
+        subq.w  #1, %d5
+72:     move.l  %a2, %a1
+        move.w  %d5, %d0
+73:     move.b  (%a3)+, (%a1)+
+        dbra    %d0, 73b
+        lea     64(%a2), %a2
+        dbra    %d6, 72b
+        lea     pb(%pc), %a0
+        move.w  0x210, 22(%a0)          | ioVRefNum again: the trap may have changed the block
+3:      move.l  dest(%pc), 32(%a0)      | ioBuffer
         move.l  len(%pc), 36(%a0)       | ioReqCount
         move.w  #1, 44(%a0)             | ioPosMode = fsFromStart
         move.l  off(%pc), 46(%a0)       | ioPosOffset
@@ -92,4 +165,6 @@ dest:   .long   0x0D000000
 entry:  .long   0x0D000000
 len:    .long   0
 off:    .long   1024
+spoff:  .long   0                       | the splash: its disk byte and length,
+splen:  .long   0                       | 0 when the disk has none
 pb:     .space  80

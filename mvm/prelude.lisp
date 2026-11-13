@@ -1533,6 +1533,15 @@
 ;;; Restored right after.
 (declaim (optimize (safety 0)))
 
+;;; COLD TABLES.  A table can keep entries somewhere other than itself -- the
+;;; bare Mac's saved core moves the function table's image entries to disk
+;;; (mvm/mac68k-cold.lisp) -- and a miss in such a table asks %HT-COLD-MISS,
+;;; which answers (VALUE) or NIL.  NIL here (every other image): one global
+;;; read on a miss.
+(defvar *%ht-cold-tables* nil)
+(declaim (overridable %ht-cold-miss))
+(defun %ht-cold-miss (key ht) key ht nil)
+
 (defun gethash (key ht &optional default)
   "Look up KEY in hash table HT.  Returns (values value present-p);
    if not present, value is DEFAULT (nil if not supplied) and
@@ -1617,6 +1626,9 @@
     (when use-linear
       ;; Linear alist path (legacy / small / nohash table / :nohash key).
       (setq found-pair (%ht-linear-find ht key)))
+    (when (and *%ht-cold-tables* (null found-pair) (not dict-hit))
+      (let ((r (%ht-cold-miss key ht)))
+        (when r (setq dict-hit t) (setq dict-val (car r)))))
     ;; ONE VALUES call, at the tail (see the docstring)
     (values (cond (found-pair (cdr found-pair)) (dict-hit dict-val) (t default))
             (if (or found-pair dict-hit) t nil))))

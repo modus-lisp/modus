@@ -3335,6 +3335,10 @@
   ;; after 256 new symbols doubles in one allocation the Classic's 128 KB young
   ;; semispace cannot hold (heap exhausted).
   (%mac-shrink-buckets (modus.runtime::%globals-table))
+  ;; the image's functions go to disk (mac68k-cold.lisp COLD FUNCTIONS); the
+  ;; table keeps what boot defined, with room for a session's
+  (%cold-fns-cut)
+  (%mac-right-size *symbol-function-table* 256)
   (%mac-right-size *kernel-fn-names* 0)
   (%mac-right-size *kernel-global-names* 0)
 " "")
@@ -3344,7 +3348,10 @@
   ;; measured, 400 KB the freeze kept.  No closure runs here.
   (setf (mem-ref #x10000A08 :u32) 0)
   (%gc-static-freeze)
-  (when (eql (mem-ref #x1000602C :u32) 1) (%mac-send-core))
+"
+                       (if *mac-cold-names-out* "  (%cold-fns-hand-over)
+" "")
+                       "  (when (eql (mem-ref #x1000602C :u32) 1) (%mac-send-core))
 "
                        (subseq *cli-arch-kernel-epilogue* (+ at (length k))))))
   ;; a core boot: the cards (the core's are for where its heap was), then the REPL

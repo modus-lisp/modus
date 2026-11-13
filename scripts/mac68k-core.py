@@ -107,6 +107,40 @@ def capture_core(disk, timeout):
     return got[:k], got[k:need]
 
 
+COLD_FNS = None
+
+
+def cold_fn_pages(recs):
+    """The cold function records (hash.l value.l flags.b len.b name, even) as
+    index pages and record pages: page 0.. the count of record pages, then
+    each's first hash; a run of one hash never straddles two pages."""
+    rows, i = [], 0
+    while i < len(recs):
+        h, = struct.unpack_from('>I', recs, i)
+        n = 10 + recs[i + 9]
+        n += n & 1
+        rows.append((h, bytes(recs[i + 4:i + 9]), recs[i:i + n])); i += n
+    rows.sort(key=lambda r: (r[0], r[2]))
+    pages, firsts, cur, k = [], [], bytearray(), 0
+    while k < len(rows):
+        run = [r for r in rows[k:k + 64] if r[0] == rows[k][0]]
+        size = sum(len(r[2]) for r in run)
+        if size > 512:
+            sys.exit('mac68k-core: %d cold functions share hash #%x' % (len(run), rows[k][0]))
+        if len(cur) + size > 512:
+            pages.append(bytes(cur) + bytes(512 - len(cur))); cur = bytearray()
+        if not cur:
+            firsts.append(rows[k][0])
+        for r in run:
+            cur += r[2]
+        k += len(run)
+    if cur:
+        pages.append(bytes(cur) + bytes(512 - len(cur)))
+    index = struct.pack('>I', len(pages)) + b''.join(struct.pack('>I', f) for f in firsts)
+    index += bytes((-len(index)) % 512)
+    return index + b''.join(pages), len(rows), len(pages)
+
+
 def relocate(core, static_lo=None):
     base, olo, ohi, clo, chi = struct.unpack('>5I', core[4:24])
     if base != REGION:
@@ -127,6 +161,20 @@ def relocate(core, static_lo=None):
                        (0x6030, 1 if os.environ.get('MODUS_MAC_CORE_PROBES') == '1' else 0)):
             struct.pack_into('>I', low, off, v)
         return low, nolo, objs, nclo, conses
+    # COLD FUNCTIONS (mvm/mac68k-cold.lisp %COLD-FNS-CUT): the freeze left the
+    # function table's image entries as records in a byte vector, its raw word
+    # at #x6048.  Take the bytes; nothing else points at the vector, so the
+    # collection below drops it.
+    global COLD_FNS
+    w, = struct.unpack_from('>I', low, 0x6048)
+    struct.pack_into('>I', low, 0x6048, 0)
+    struct.pack_into('>I', low, 0x604C, 0)
+    if w:
+        a = w - 7
+        h, = struct.unpack_from('>I', objs, a - olo)
+        if w & 7 != 7 or not (olo <= a < ohi) or h & 0xFF != 0x11:
+            sys.exit('mac68k-core: #x6048 is not a byte vector (#%08x)' % w)
+        COLD_FNS = bytes(objs[a - olo + 4:a - olo + 4 + (h >> 8)])
     # THE CORE'S OWN COLLECTION.  A core boot's only roots are the low block's
     # words (the stack starts fresh), so what they do not reach is garbage the
     # freeze kept -- a stale word on the core run's stack or in a register
@@ -321,6 +369,14 @@ def main(image, disk):
         tail += bytes(pad) + cold
         struct.pack_into('>I', chunk, REGION - LOAD + 0x6044, cold_disk)
         print('mac68k-core: cold names: %d bytes at disk byte %d' % (len(cold), cold_disk))
+    if COLD_FNS:
+        region, n, npages = cold_fn_pages(COLD_FNS)
+        pad = (-(stream_disk + len(tail))) % 512
+        fn_disk = stream_disk + len(tail) + pad
+        tail += bytes(pad) + region
+        struct.pack_into('>I', chunk, REGION - LOAD + 0x604C, fn_disk)
+        print('mac68k-core: cold functions: %d names in %d pages at disk byte %d'
+              % (n, npages, fn_disk))
     md.write_disk(bytes(chunk) + tail, disk, LOAD, read_len=len(chunk))
     print('mac68k-core: %s: boot reads %d bytes (image %d, static %d, low block %d); %d streams '
           '(%d bytes) on demand from disk byte %d'

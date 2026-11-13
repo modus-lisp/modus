@@ -122,3 +122,133 @@
               (modus.runtime::%htd-rebuild ht holder dict cap
                                            (modus.runtime::%ht-h-strcmp holder))
               cap)))))))
+
+;;; COLD FUNCTIONS.  The function table (*SYMBOL-FUNCTION-TABLE*, name -> function)
+;;; holds every DEFUN in the image, 4,700 names, and *KERNEL-FN-NAMES* most of them
+;;; again: ~200 KB of a Mac Classic's static heap with their name strings, of which
+;;; a session asks for a few dozen.  At the freeze of the core run %COLD-FNS-CUT
+;;; takes out every entry whose function is the image's own (its code never
+;;; moves) and writes it as a record -- hash.l, the function's raw word.l,
+;;; flags.b (bit 0: a kernel name), length.b, the name, even -- into one byte
+;;; vector whose raw word goes to the static block's #x10006048.
+;;; scripts/mac68k-core.py takes the records out of the core, sorts them by hash
+;;; into 512-byte pages after an index of each page's first hash, and puts the
+;;; disk byte they start at in #x1000604C.  From then on a miss in either table
+;;; (prelude's GETHASH, *%HT-COLD-TABLES*) asks %HT-COLD-MISS: the index once,
+;;; then one block a name, and a name found is entered in the table again (and
+;;; one not found in *COLD-FNS-MISSES*), so each costs a read once.
+;;; NOT seen by a walk of the table (MAPHASH, APROPOS): only what a session added
+;;; or asked for.  An FMAKUNBOUND of a cold name lasts until it is next asked for.
+(defvar *cold-fns-out* nil)
+(defvar *cold-fns-firsts* nil)
+(defvar *cold-fns-misses* nil)
+
+(defun %image-function-p (v)
+  "Is V a function of the image itself (not a closure or an interpreted one)?"
+  (and (functionp v) (eql (logand (%val->word v) 7) 3)))
+
+(defun %cold-fns-cut ()
+  (when (and (eql (mem-ref #x1000602C :u32) 1) *symbol-function-table*)
+    (let ((names nil) (vals nil) (bytes 0) (kfn *kernel-fn-names*))
+      (maphash (lambda (k v)
+                 (when (and (stringp k) (< (length k) 256) (%image-function-p v))
+                   (setq names (cons k names) vals (cons v vals))
+                   (setq bytes (+ bytes 10 (length k) (logand (length k) 1)))))
+               *symbol-function-table*)
+      (let ((out (make-array bytes :element-type '(unsigned-byte 8))) (i 0) (n 0))
+        (flet ((put4 (x)
+                 (setf (aref out i) (logand (ash x -24) 255)
+                       (aref out (+ i 1)) (logand (ash x -16) 255)
+                       (aref out (+ i 2)) (logand (ash x -8) 255)
+                       (aref out (+ i 3)) (logand x 255))
+                 (setq i (+ i 4))))
+          (loop
+            (when (null names) (return nil))
+            (let* ((k (car names)) (len (length k))
+                   (kernel (and kfn (multiple-value-bind (x present) (gethash k kfn) x present))))
+              (put4 (compute-name-hash k))
+              (put4 (%val->word (car vals)))
+              (setf (aref out i) (if kernel 1 0) (aref out (+ i 1)) len)
+              (setq i (+ i 2))
+              (let ((j 0))
+                (loop (when (>= j len) (return nil))
+                  (setf (aref out i) (char-code (char k j)))
+                  (setq i (+ i 1) j (+ j 1))))
+              (when (oddp len) (setf (aref out i) 0) (setq i (+ i 1)))
+              (remhash k *symbol-function-table*)
+              (when kernel (remhash k kfn))
+              (setq n (+ n 1)))
+            (setq names (cdr names) vals (cdr vals))))
+        (setq *cold-fns-out* out)
+        (setq *%ht-cold-tables* t)
+        n))))
+
+(defun %cold-fns-hand-over ()
+  "After the freeze: the records' raw word where mac68k-core.py looks."
+  (when *cold-fns-out*
+    (setf (mem-ref #x10006048 :u64) *cold-fns-out*)
+    (setq *cold-fns-out* nil)))
+
+(defun %cold-fns-read (page buf)
+  (eql (syscall3 1 (+ (mem-ref #x1000604C :u32) (* page 512)) buf 512) 0))
+
+(defun %cold-fns-u32 (a)
+  (+ (* (mem-ref a :u8) 16777216) (* (mem-ref (+ a 1) :u8) 65536)
+     (* (mem-ref (+ a 2) :u8) 256) (mem-ref (+ a 3) :u8)))
+
+(defun %cold-fns-firsts ()
+  "The record pages' first hashes (the index pages, read once)."
+  (or *cold-fns-firsts*
+      (let ((buf *io-buf-addr*))
+        (when (%cold-fns-read 0 buf)
+          (let* ((n (%cold-fns-u32 buf)) (v (make-array n)) (i 0) (page 0) (off 4))
+            (loop
+              (when (>= i n) (return nil))
+              (when (>= off 512)
+                (setq page (+ page 1) off 0)
+                (unless (%cold-fns-read page buf) (return-from %cold-fns-firsts nil)))
+              (setf (svref v i) (%cold-fns-u32 (+ buf off)))
+              (setq i (+ i 1) off (+ off 4)))
+            (setq *cold-fns-firsts* (cons (floor (+ 4 (* 4 n) 511) 512) v)))))))
+
+(defun %cold-fn-find (key)
+  "(VALUE . FLAGS) for the name KEY from the cold functions on disk, or NIL."
+  (when (and (stringp key) (< (length key) 256) (> (mem-ref #x1000604C :u32) 0)
+             (not (and *cold-fns-misses* (gethash key *cold-fns-misses*))))
+    (let* ((fi (%cold-fns-firsts)) (v (cdr fi)) (n (if fi (length v) 0))
+           (h (compute-name-hash key)) (len (length key)) (found nil))
+      (when (and (> n 0) (>= h (svref v 0)))
+        (let ((lo 0) (hi (- n 1)) (buf *io-buf-addr*))
+          (loop (when (>= lo hi) (return nil))
+            (let ((mid (ash (+ lo hi 1) -1)))
+              (if (<= (svref v mid) h) (setq lo mid) (setq hi (- mid 1)))))
+          (when (%cold-fns-read (+ (car fi) lo) buf)
+            (let ((i 0))
+              (loop
+                (when (> i 501) (return nil))
+                (let ((k (%cold-fns-u32 (+ buf i))) (l (mem-ref (+ buf i 9) :u8)))
+                  (when (or (eql k 0) (> k h)) (return nil))
+                  (when (and (eql k h) (eql l len))
+                    (let ((j 0))
+                      (loop (when (>= j len) (return nil))
+                        (unless (eql (mem-ref (+ buf i 10 j) :u8) (char-code (char key j)))
+                          (return nil))
+                        (setq j (+ j 1)))
+                      (when (>= j len)
+                        (setq found (cons (%word->val (%cold-fns-u32 (+ buf i 4)))
+                                          (mem-ref (+ buf i 8) :u8)))
+                        (return nil))))
+                  (setq i (+ i 10 l (logand l 1)))))))))
+      (unless found
+        (unless *cold-fns-misses* (setq *cold-fns-misses* (make-hash-table)))
+        (puthash key *cold-fns-misses* t))
+      found)))
+
+(defun %ht-cold-miss (key ht)
+  (cond ((eq ht *symbol-function-table*)
+         (let ((r (%cold-fn-find key)))
+           (when r (puthash key ht (car r)) (list (car r)))))
+        ((eq ht *kernel-fn-names*)
+         (let ((r (%cold-fn-find key)))
+           (when (and r (eql (logand (cdr r) 1) 1)) (puthash key ht t) (list t))))
+        (t nil)))

@@ -399,6 +399,49 @@ let appBarButton: Call = { h, p, n, right, _, _ in
     return bh
 }
 
+/// app_bar_menu(screen, plist): a bar button that opens a menu -- (:SYMBOL :RIGHT :ITEMS), ITEMS plists of :ID
+/// :TITLE :SUBTITLE :IMAGE :ON (a checkmark) :GROUP (items of one group together, a rule between groups; the first of a
+/// group may carry :HEADER).  A choice is a MENU event with the button and the item's id.
+let appBarMenu: Call = { h, p, n, _, _, _ in
+    guard let vc = screens[h], let t = termBytes(p, n) else { return 0 }
+    let m = plist(t)
+    let bh = newHandle()
+    let item = UIBarButtonItem(image: UIImage(systemName: str(m["SYMBOL"]) ?? "ellipsis"),
+                               menu: barMenu(bh, m["ITEMS"]))
+    barButtons[bh] = item
+    if flag(m["RIGHT"]) {
+        vc.navigationItem.rightBarButtonItems = (vc.navigationItem.rightBarButtonItems ?? []) + [item]
+    } else {
+        vc.navigationItem.leftBarButtonItems = (vc.navigationItem.leftBarButtonItems ?? []) + [item]
+    }
+    return bh
+}
+
+/// app_bar_menu_set(button, items): the menu's items again (a checkmark moved).
+let appBarMenuSet: Call = { h, p, n, _, _, _ in
+    barButtons[h]?.menu = barMenu(h, termBytes(p, n))
+    return 1
+}
+
+private func barMenu(_ bh: UInt, _ items: Term?) -> UIMenu {
+    var groups: [(group: Int, header: String?, actions: [UIAction])] = []
+    for item in items?.listItems ?? [] {
+        let m = plist(item)
+        guard case .int(let id)? = m["ID"] else { continue }
+        var g = 0
+        if case .int(let k)? = m["GROUP"] { g = k }
+        let action = UIAction(title: str(m["TITLE"]) ?? "", image: str(m["IMAGE"]).flatMap { UIImage(systemName: $0) },
+                              state: flag(m["ON"]) ? .on : .off) { _ in send("MENU", [.int(Int(bh)), .int(id)]) }
+        action.subtitle = str(m["SUBTITLE"])
+        if let last = groups.last, last.group == g {
+            groups[groups.count - 1].actions.append(action)
+        } else {
+            groups.append((g, str(m["HEADER"]), [action]))
+        }
+    }
+    return UIMenu(children: groups.map { UIMenu(title: $0.header ?? "", options: .displayInline, children: $0.actions) })
+}
+
 /// app_bar_button_enable(button, on)
 let appBarButtonEnable: Call = { h, on, _, _, _, _ in
     barButtons[h]?.isEnabled = on != 0
@@ -417,6 +460,8 @@ struct NativeRow {
     let section: String?
     let index: Int
     let sort: String?
+    let group: Int?                              // :GROUP -- shown before higher groups, when the table says so
+    let keys: [String: Term]                     // :KEYS -- what else the rows can be ordered by (:DATE 1700000000)
     let dot: UIColor?
     let menu: [(id: Int, title: String, image: String?, destructive: Bool)]
 
@@ -450,6 +495,37 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
 
     /// Every row, in the order they came (a row's INDEX is its place here, what a SELECT reports).
     var all: [NativeRow] = []
+
+    // THE ORDER (app_table_order): by one of the rows' :KEYS, or by :SORT (as the Finder sorts names) when
+    // ORDERKEY is nil; either way round; lower :GROUPs first (folders before files) when GROUPSFIRST.  A tie
+    // goes by :SORT, A to Z.
+    var orderKey: String?
+    var descending = false
+    var groupsFirst = true
+
+    private func compareKeys(_ a: Term?, _ b: Term?) -> ComparisonResult {
+        switch (a, b) {
+        case (.int(let x)?, .int(let y)?): return x < y ? .orderedAscending : x > y ? .orderedDescending : .orderedSame
+        case (.string(let x)?, .string(let y)?): return x.localizedStandardCompare(y)
+        case (nil, nil): return .orderedSame
+        case (nil, _): return .orderedAscending          // nothing to go by (a folder's size): first, A to Z
+        case (_, nil): return .orderedDescending
+        default: return .orderedSame
+        }
+    }
+
+    func ordered(_ rows: [NativeRow]) -> [NativeRow] {
+        rows.sorted { a, b in
+            if groupsFirst, let ga = a.group, let gb = b.group, ga != gb { return ga < gb }
+            let byName = (a.sort ?? a.title).localizedStandardCompare(b.sort ?? b.title)
+            if let key = orderKey {
+                let c = compareKeys(a.keys[key], b.keys[key])
+                if c != .orderedSame { return descending ? c == .orderedDescending : c == .orderedAscending }
+                return byName == .orderedAscending
+            }
+            return descending ? byName == .orderedDescending : byName == .orderedAscending
+        }
+    }
 
     func setRows(_ rows: [NativeRow]) {
         all = rows
@@ -595,9 +671,7 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     /// "file 10"), then in sections.
     func regroup() {
         let shown = filter.isEmpty ? all : all.filter { $0.title.localizedStandardContains(filter) }
-        let rows = shown.contains { $0.sort != nil }
-            ? shown.sorted { ($0.sort ?? "").localizedStandardCompare($1.sort ?? "") == .orderedAscending }
-            : shown
+        let rows = shown.contains { $0.sort != nil || $0.group != nil } ? ordered(shown) : shown
         var out: [(title: String?, rows: [NativeRow])] = []
         for row in rows {
             if let last = out.last, last.title == row.section {
@@ -659,6 +733,11 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
 
     func showEmpty() {
         showFooter()
+        // the filter only once there is something to filter: not over a placeholder, or an empty folder
+        if let bar = searchBar {
+            let want: UIView? = all.isEmpty ? nil : bar
+            if table.tableHeaderView !== want { table.tableHeaderView = want }
+        }
         let none = groups.allSatisfy { $0.rows.isEmpty }
         if none, !filter.isEmpty, !all.isEmpty {
             var c = UIContentUnavailableConfiguration.search()
@@ -2048,6 +2127,18 @@ let appBrowserPush: Call = { h, p, n, plain, _, _ in
     return th
 }
 
+/// app_table_order(table, plist): how TABLE's rows go -- :KEY (a name among the rows' :KEYS, or nil for :SORT),
+/// :DESCENDING, :GROUPS-FIRST.
+let appTableOrder: Call = { h, p, n, _, _, _ in
+    guard let source = tables[h], let t = termBytes(p, n) else { return 0 }
+    let m = plist(t)
+    source.orderKey = str(m["KEY"])
+    source.descending = flag(m["DESCENDING"])
+    source.groupsFirst = flag(m["GROUPS-FIRST"])
+    source.regroup()
+    return 1
+}
+
 /// app_table_set(table, rows): ROWS a term, a list of plists -- :TITLE, and any of :SUBTITLE :DETAIL :IMAGE (an SF
 /// Symbol's name) :TINT (an RGB integer) :CHEVRON :SECTION :SORT (a key the rows are shown in the order of) :DOT (an RGB integer: a
 /// status dot before the chevron) :MENU (its long press's menu: plists of :ID :TITLE :IMAGE :DESTRUCTIVE, a
@@ -2057,7 +2148,9 @@ private func nativeRow(_ item: Term, _ index: Int) -> NativeRow {
     let m = plist(item)
     return NativeRow(title: str(m["TITLE"]) ?? "", subtitle: str(m["SUBTITLE"]), detail: str(m["DETAIL"]),
                      image: str(m["IMAGE"]), tint: color(m["TINT"]), chevron: flag(m["CHEVRON"]),
-                     section: str(m["SECTION"]), index: index, sort: str(m["SORT"]), dot: color(m["DOT"]),
+                     section: str(m["SECTION"]), index: index, sort: str(m["SORT"]),
+                     group: { if case .int(let g)? = m["GROUP"] { return g }; return nil }(),
+                     keys: m["KEYS"].map(plist) ?? [:], dot: color(m["DOT"]),
                      menu: (m["MENU"]?.listItems ?? []).compactMap { item in
                          let a = plist(item)
                          guard case .int(let id)? = a["ID"] else { return nil }
@@ -2221,8 +2314,11 @@ let appAlertShow: Call = { h, _, _, _, _, _ in
 /// A record edited on a screen of its own, presented over the app: labelled fields in one section, buttons (a
 /// TAP each) in the next, Cancel and SAVE in the bar.  Closing it is a FORM event: (1 value ...) or (0).
 final class NativeForm: NSObject, UITableViewDataSource, UITableViewDelegate {
-    enum Kind: UInt { case text = 0, number, secure, url, toggle }
-    struct Field { let label: String; var value: String; let placeholder: String; let kind: Kind }
+    enum Kind: UInt { case text = 0, number, secure, url, toggle, choice }
+    struct Field {
+        let label: String; var value: String; let placeholder: String; let kind: Kind
+        var choices: [String] = []                       // a choice: its value is the index of the one chosen
+    }
     let handle: UInt
     var fields: [Field] = []
     var buttons: [(title: String, handle: UInt)] = []
@@ -2284,6 +2380,19 @@ final class NativeForm: NSObject, UITableViewDataSource, UITableViewDelegate {
             sw.isOn = f.value == "1"
             sw.addAction(UIAction { [weak self] _ in self?.fields[i].value = sw.isOn ? "1" : "0" }, for: .valueChanged)
             control = sw
+        } else if f.kind == .choice {
+            // a pop-up menu, as Settings has: the choice shown, the others a tap away
+            let button = UIButton(type: .system)
+            let chosen = Int(f.value) ?? 0
+            button.menu = UIMenu(children: f.choices.enumerated().map { k, title in
+                UIAction(title: title, state: k == chosen ? .on : .off) { [weak self] _ in self?.fields[i].value = String(k) }
+            })
+            button.showsMenuAsPrimaryAction = true
+            button.changesSelectionAsPrimaryAction = true
+            button.contentHorizontalAlignment = .trailing
+            let spacer = UIView()
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            control = UIStackView(arrangedSubviews: [spacer, button])
         } else {
             let field = UITextField()
             field.text = f.value
@@ -2326,14 +2435,16 @@ let appForm: Call = { tp, tn, sp, sn, _, _ in
 }
 
 /// app_form_field(form, plist): a field, a term -- (:LABEL :VALUE :PLACEHOLDER :KIND), KIND 0 text, 1 number,
-/// 2 secure, 3 URL-ish, 4 a switch (its value "1" or "0").  Returns the field's index.
+/// 2 secure, 3 URL-ish, 4 a switch (its value "1" or "0"), 5 a choice among :CHOICES (strings; its value the
+/// index of the one chosen, "0" the first).  Returns the field's index.
 let appFormField: Call = { h, p, n, _, _, _ in
     guard let form = forms[h], let t = termBytes(p, n) else { return 0 }
     let m = plist(t)
     var kindNo: UInt = 0
     if case .int(let k)? = m["KIND"] { kindNo = UInt(max(0, k)) }
     form.fields.append(.init(label: str(m["LABEL"]) ?? "", value: str(m["VALUE"]) ?? "",
-                             placeholder: str(m["PLACEHOLDER"]) ?? "", kind: NativeForm.Kind(rawValue: kindNo) ?? .text))
+                             placeholder: str(m["PLACEHOLDER"]) ?? "", kind: NativeForm.Kind(rawValue: kindNo) ?? .text,
+                             choices: (m["CHOICES"]?.listItems ?? []).compactMap { str($0) }))
     return UInt(form.fields.count - 1)
 }
 
@@ -2550,6 +2661,9 @@ func installNative() {
     register("app_show", appShow)
     register("app_set_title", appSetTitle)
     register("app_bar_button", appBarButton)
+    register("app_bar_menu", appBarMenu)
+    register("app_bar_menu_set", appBarMenuSet)
+    register("app_table_order", appTableOrder)
     register("app_bar_button_enable", appBarButtonEnable)
     register("app_table", appTable)
     register("app_table_set", appTableSet)

@@ -3281,13 +3281,21 @@
 (when *mac68k-gc-static*
   (let* ((tags3 (let ((v (sb-ext:posix-getenv "MODUS_68K_TAGS3")))
                   (cond ((null v) (%mac68k-small-image-env-p)) ((string= v "0") nil) (t t))))
-         (text (mvm-text "mvm/68k-gc-static.lisp")))
+         (text (mvm-text "mvm/68k-gc-static.lisp"))
+         ;; the low block's size (boot-mac68k MAC68K-ALLOC-START): the crossing
+         ;; table is its last 8 KB, and the core sends all of it
+         (low (let ((f (find-symbol "MAC68K-ALLOC-START" "MODUS.MVM")))
+                (if (and f (fboundp f)) (funcall f) #x20000))))
     (dolist (p (if tags3
                    '(("GRAN-1" . "7") ("MINUS-GRAN" . "-8") ("MAX-SHIFT" . "10") ("MINUS-KSHIFT" . "-3"))
                    '(("GRAN-1" . "15") ("MINUS-GRAN" . "-16") ("MAX-SHIFT" . "11") ("MINUS-KSHIFT" . "-4"))))
       (loop for i = (search (car p) text) while i
             do (setq text (concatenate 'string (subseq text 0 i) (cdr p)
                                        (subseq text (+ i (length (car p))))))))
+    (let ((cross (format nil "#x~X" (+ #x10000000 low -8192))))
+      (loop for i = (search "#x1001E000" text) while i
+            do (setq text (concatenate 'string (subseq text 0 i) cross
+                                       (subseq text (+ i (length "#x1001E000")))))))
     (when *mac-cold-names-out*
       (setq text (concatenate 'string text (string #\Newline) (mvm-text "mvm/mac68k-cold.lisp"))))
     (setq *cli-arch-override-source*
@@ -3322,7 +3330,8 @@
     (write-char-serial 77) (write-char-serial 67) (write-char-serial 79) (write-char-serial 82)
     (%mac-send-u32 base) (%mac-send-u32 olo) (%mac-send-u32 ohi)
     (%mac-send-u32 clo) (%mac-send-u32 chi)
-    (%mac-send-range base #x20000)
+    (%mac-send-range base "
+            (princ-to-string low) ")
     (%mac-send-range olo (- ohi olo))
     (%mac-send-range clo (- chi clo))
     (halt)))
@@ -3611,7 +3620,8 @@
               (with-open-file (in f)
                 (loop for l = (read-line in nil) while l
                       do (let ((n (string-trim " " l)))
-                           (when (plusp (length n)) (setf (gethash n h) t)))))
+                           (when (and (plusp (length n)) (char/= (char n 0) #\;))
+                             (setf (gethash n h) t)))))
               (setf (symbol-value (sym "*68K-HOT-NAMES*")) h))))))
     (format t "~&;; mac68k:~@[ gc-static~*~]~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~@[ narrow-literals~*~]~%"
             (symbol-value (sym "*68K-GC-STATIC*"))

@@ -1,0 +1,37 @@
+;; The 1 MB Mac's hot natives (MODUS_68K_HOT): mvm/68k-hot-mac.txt's functions
+;; that are at most 2 KB native -- 21 KB of the full list's 127 KB.  Native code
+;; is 5-8x a function's threaded stream, and a 1 MB Mac cannot spare the rest;
+;; the bigger ones (GETHASH, STRING=, MAKE-ARRAY ...) run threaded from the cache.
+%GV-REF-FILL
+%FRESH-STRING
+BIGNUM-ASH
+%HT-VEC-SET
+%MAKE-BASE-STRING
+%HT-LINEAR-FIND
+%STRING-DESIGNATOR
+%STATIC-SYMBOL-REF1
+%HTD-PLACE-AT
+%HTD-MASK
+%GV-SET-C
+%HTD-PLACE-ALL
+%HTD-FIND
+%HT-BUCKET-HOLDER
+%CL-SYM-P
+FUNCTIONP
+%GV-MEMO-CELL
+%HT-NOHASH
+%HTD-SLOTS
+%HT-H-VEC
+%HT-ACTIVE-VEC-H
+%HTD-W
+FLOATP-IMPL
+COMPUTE-NAME-HASH
+GENERIC-LOGAND
+%HT-PAIR-SET
+RPLACD
+%HT-H-COUNT
+%HT-PAIR-SIDE
+%HT-KEYTEST
+MVM-BUFFER-USED-BYTES
+%SAFE-CDR
+NUMBERP

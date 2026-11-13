@@ -33,21 +33,21 @@ os.environ.setdefault('MODUS_MAC68K_MACHINE', 'classic')   # mac68k-disk.py's lo
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
-# boot/boot-mac68k.lisp's :CLASSIC layout
 # per machine (boot/boot-mac68k.lisp's layouts): the image, the static heap's
-# nominal range, the runtime-data region
-LOAD, STATIC_LO, STATIC_HI, REGION = {
-    'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000),
-    'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000),
+# nominal range, the runtime-data region, and the low block's size (the
+# layout's :ALLOC-START: the core run sends that much; its last 8 KB is the
+# static heap's card crossing table)
+LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
+    'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
+    'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
 }[os.environ['MODUS_MAC68K_MACHINE'].lower()]
-LOW_BLOCK = 0x20000
 LEAF = {0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x60, 0x64, 0x65, 0x66}
 # low-block byte tables, offsets from the region (not scanned for pointers)
 LOW_BYTES = [(0x6000, 0x6100),      # the static block's raw words (set by hand)
              (0x6100, 0x7F00),      # card marks
              (0x9000, 0x9800),      # serial parameter blocks, console state + font
              (0xA000, 0xC000),      # the console's text buffer
-             (0x1E000, 0x20000)]    # card crossing table
+             (LOW_BLOCK - 0x2000, LOW_BLOCK)]    # card crossing table
 
 
 def disk_module():

@@ -3377,6 +3377,10 @@
 
 (defconstant +68k-gc-heap-start+ #x10020000
   "Where the first semispace starts (boot-linux-68k's heap + alloc-start).")
+(defvar *68k-gc-heap-start* +68k-gc-heap-start+
+  "The same, for this build: a Mac layout's :ALLOC-START moves it (MAC68K-CONFIGURE).")
+(defvar *68k-card-crossing* +68k-card-crossing+
+  "The crossing table, for this build: the 8 KB below *68K-GC-HEAP-START*.")
 
 (defconstant +68k-gc-margin-max+ #x100000
   "The collector leaves min(1 MB, a quarter of a semispace) free below VL --
@@ -3995,7 +3999,7 @@
       (m68k-emit-cmpa buf +68k-a5+ +68k-d0+)                 ; A5 - ohi
       (m68k-emit-bcc-word buf +68k-cc-cc+ conses)
       ;; A5 += crossing[card] * 16 (255: nothing starts here)
-      (m68k-emit-move-imm-an buf (conv-real +68k-card-crossing+) +68k-a0+)
+      (m68k-emit-move-imm-an buf (conv-real *68k-card-crossing*) +68k-a0+)
       (m68k-emit-moveq buf +68k-d0+ 0)
       (m68k-emit-word buf #x1030) (m68k-emit-word buf #x7800) ; MOVE.B (0,A0,D7.L),D0
       (m68k-emit-cmpi buf +68k-d0+ 255)
@@ -4219,7 +4223,7 @@
       ;; heap's FIXED start, as on arm32 -- a typed range must never be read
       ;; as conservative roots.
       (if *68k-gc-static*
-          (m68k-emit-move-imm-dn buf (conv-real +68k-gc-heap-start+) +68k-d7+)
+          (m68k-emit-move-imm-dn buf (conv-real *68k-gc-heap-start*) +68k-d7+)
           (let ((have (lbl)))
             (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d7+)
             (m68k-emit-move-imm-an buf meta +68k-a0+)

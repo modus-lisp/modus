@@ -94,6 +94,7 @@
     ;; made on a big Mac.
     (:classic-2m :load #x00040000 :static-lo #x000D5000 :static-hi #x00178000
               :region #x00178000 :heap-size #x00060000 :gc-guard #x00004000
+              :alloc-start #x0000E000
               :kind-map #x001BC000 :cache-lo #x001C5000 :cache-hi #x001F6000
               :staging #x001F6000 :staging-size #x00000000
               :nil-page #x001F6000
@@ -135,6 +136,13 @@
   (conv-real #x10009000))
 (defun mac68k-ser-in-pb () (conv-real #x10009080))
 
+(defun mac68k-alloc-start ()
+  "The low block's size: where the young heap starts in the runtime-data region
+   (the layout's :ALLOC-START; boot-linux-68k's #x20000 by default).  The static
+   heap's crossing table is its last 8 KB."
+  (or (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) :alloc-start)
+      +linux-68k-heap-alloc-start+))
+
 (defun mac68k-configure (&optional (on t))
   "The translator and compiler settings a Mac image is built with: the
    runtime-data region moved to +MAC68K-REGION+ (it must be first: the mode
@@ -145,7 +153,9 @@
         *conv-delta* (- +mac68k-region+ +conv-region-base+))
   (m68k-set-mac-mode t)
   (setf *68k-nil-page* +mac68k-nil-page+
-        *68k-gc-kind-map* +mac68k-kind-map+)
+        *68k-gc-kind-map* +mac68k-kind-map+
+        *68k-gc-heap-start* (+ +conv-region-base+ (mac68k-alloc-start))
+        *68k-card-crossing* (+ +conv-region-base+ (mac68k-alloc-start) -8192))
   ;; paged code: where the stream loader puts what it reads
   (setf *68k-paged-cache*
         (and *68k-paged*
@@ -241,7 +251,7 @@
          (base (conv-real #x10000000))
          (size +mac68k-heap-size+)
          (mid (floor size 2))
-         (alloc +linux-68k-heap-alloc-start+))
+         (alloc (mac68k-alloc-start)))
     ;; supervisor, interrupts ON: the ROM's 60 Hz tick and serial drivers run
     (m68k-emit-word buf #x46FC) (m68k-emit-word buf #x2000)   ; MOVE.W #$2000,SR
     ;; the driver names (and the Classic's core descriptor), jumped over
@@ -267,7 +277,7 @@
     ;; ---- a boot from scratch ----
     (m68k-emit-move-imm-an buf (if classic (mac68k-layout :boot-stack-top) +mac68k-stack-top+)
                            +68k-a7+)
-    (emit-mac68k-zero buf base #x20000)          ; the low block, as a fresh mmap
+    (emit-mac68k-zero buf base alloc)            ; the low block, as a fresh mmap
     (if classic
         (let ((half (floor (mac68k-layout :boot-heap-size) 2)))
           (emit-mac68k-heap buf base (mac68k-layout :boot-heap) half +mac68k-gc-guard+)

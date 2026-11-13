@@ -34,9 +34,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
 # boot/boot-mac68k.lisp's :CLASSIC layout
-LOAD = 0x00040000
-STATIC_LO, STATIC_HI = 0x00110000, 0x002B0000
-REGION = 0x002B0000
+# per machine (boot/boot-mac68k.lisp's layouts): the image, the static heap's
+# nominal range, the runtime-data region
+LOAD, STATIC_LO, STATIC_HI, REGION = {
+    'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000),
+    'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000),
+}[os.environ['MODUS_MAC68K_MACHINE'].lower()]
 LOW_BLOCK = 0x20000
 LEAF = {0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x60, 0x64, 0x65, 0x66}
 # low-block byte tables, offsets from the region (not scanned for pointers)

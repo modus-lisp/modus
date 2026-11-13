@@ -37,7 +37,8 @@
   (let ((m (sb-ext:posix-getenv "MODUS_MAC68K_MACHINE")))
     (cond ((or (null m) (string= m "") (string-equal m "lc")) :lc)
           ((string-equal m "classic") :classic)
-          (t (error "MODUS_MAC68K_MACHINE=~A: lc or classic" m))))
+          ((string-equal m "classic2m") :classic-2m)
+          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic or classic2m" m))))
   "Which Mac's memory map (MODUS_MAC68K_MACHINE): :LC, the 32 MB LC 475 /
    Quadra 605 class this file was measured on, or :CLASSIC, a Mac Classic
    with 4 MB (its maximum) -- measured in MAME's macclasc when our boot
@@ -77,6 +78,25 @@
               :kind-map #x00318000 :cache-lo #x00329000 :cache-hi #x003F0000
               :staging #x003D0000 :staging-size #x00010000
               :nil-page #x003F0000
+              :stack-top #x00020000 :scratch #x00020000 :io-buf #x00021000
+              :boot-heap #x01000000 :boot-heap-size #x00800000
+              :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
+              :boot-stack-top #x01A00000)
+    ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
+    ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
+    ;; the 4 MB map; the static heap from the image's init-only text
+    ;; (mac68k-core.py) up to #x178000; then the low block, a YOUNG pair of
+    ;; 64 KB (heap-size #x60000: 128 KB of low block + 2 x 64 KB) and a 16 KB
+    ;; guard, the kind map over them, a 196 KB code cache (the interpreter's
+    ;; stream, ~176 KB, is the floor), NIL's page under the screen.  The boot
+    ;; blocks relocate themselves to #x1EA700, inside the cache: they are done
+    ;; before the stub zeroes it.  The same :BOOT- values: the core is still
+    ;; made on a big Mac.
+    (:classic-2m :load #x00040000 :static-lo #x000D5000 :static-hi #x00178000
+              :region #x00178000 :heap-size #x00060000 :gc-guard #x00004000
+              :kind-map #x001BC000 :cache-lo #x001C5000 :cache-hi #x001F6000
+              :staging #x001F6000 :staging-size #x00000000
+              :nil-page #x001F6000
               :stack-top #x00020000 :scratch #x00020000 :io-buf #x00021000
               :boot-heap #x01000000 :boot-heap-size #x00800000
               :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
@@ -214,7 +234,7 @@
    heap, cache and stack, above 4 MB; the descriptor's SAVE flag then has
    KERNEL-MAIN send the core over serial port A."
   (let* ((buf (make-m68k-buffer))
-         (classic (eq *mac68k-machine* :classic))
+         (classic (member *mac68k-machine* '(:classic :classic-2m)))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
          (fill (mvm-make-label))

@@ -12,8 +12,8 @@
 | mac68k-hd.py), VOLBLOCKS blocks long, read-only: PRIME turns the Device
 | Manager's byte position (dCtlPosition) into SCSI READ(6) commands of up to
 | 64 blocks, through the ROM's SCSI Manager (_SCSIDispatch: Get, Select, Cmd,
-| RBlind, Complete).  A position must be a multiple of 512, as every reader
-| of a modus boot volume makes it.
+| RBlind, Complete).  Any position and count: a partial block goes through a
+| 512-byte bounce buffer (Mac OS booted from it reads those).
 |
 | 68000 code, position independent (the ROM puts it anywhere), its data in
 | its own block (the system heap is RAM).
@@ -111,31 +111,62 @@ dprime: movem.l %d1-%d7/%a0-%a6, -(%sp)
         and.w   #0xFF, %d0
         cmp.w   #2, %d0
         bne     pwrite
-        move.l  16(%a3), %d3            | dCtlPosition, bytes
+        move.l  16(%a3), %d5            | dCtlPosition: the byte to start at
+        move.l  36(%a2), %d6            | ioReqCount
+        move.l  %d6, %d7                | bytes still to read
+        move.l  32(%a2), %a4            | ioBuffer
+| ANY position and count: whole blocks straight into the buffer while the
+| position is on a block and a block or more is left; else one block into
+| BOUNCE and the bytes wanted out of it.  (Rounding the count up to blocks
+| wrote up to 511 bytes past the caller's buffer: Mac OS's own reads are not
+| all whole blocks, and System 6 booted from this driver crashed 6 times in 8.)
+ploop:  tst.l   %d7
+        beq     pdone
+        move.l  %d5, %d3
         lsr.l   #8, %d3
         lsr.l   #1, %d3                 | / 512
         add.l   base(%pc), %d3          | the LBA
-        move.l  36(%a2), %d6            | ioReqCount
-        move.l  %d6, %d7
-        add.l   #511, %d7
-        lsr.l   #8, %d7
-        lsr.l   #1, %d7                 | blocks
-        move.l  32(%a2), %a4            | ioBuffer
-ploop:  tst.l   %d7
-        beq     pdone
+        move.l  %d5, %d4
+        and.l   #511, %d4               | the offset in that block
+        bne     pbounce
+        cmp.l   #512, %d7
+        blo     pbounce
         move.l  %d7, %d2
+        lsr.l   #8, %d2
+        lsr.l   #1, %d2                 | whole blocks left
         cmp.l   #64, %d2
         bls     1f
         moveq   #64, %d2
 1:      bsr     sread                   | D3 LBA, D2 blocks, A4 buffer -> D0
         tst.w   %d0
         bne     perr
-        add.l   %d2, %d3
-        sub.l   %d2, %d7
         move.l  %d2, %d1
         lsl.l   #8, %d1
-        lsl.l   #1, %d1
+        lsl.l   #1, %d1                 | bytes
         add.l   %d1, %a4
+        add.l   %d1, %d5
+        sub.l   %d1, %d7
+        bra     ploop
+pbounce:
+        move.l  %a4, -(%sp)
+        lea     bounce(%pc), %a4
+        moveq   #1, %d2
+        bsr     sread
+        move.l  (%sp)+, %a4
+        tst.w   %d0
+        bne     perr
+        move.l  #512, %d1
+        sub.l   %d4, %d1                | what this block has from the offset on
+        cmp.l   %d7, %d1
+        bls     2f
+        move.l  %d7, %d1                | or what is wanted
+2:      lea     bounce(%pc), %a0
+        add.l   %d4, %a0
+        add.l   %d1, %d5
+        sub.l   %d1, %d7
+        subq.l  #1, %d1
+3:      move.b  (%a0)+, (%a4)+
+        dbra    %d1, 3b
         bra     ploop
 pdone:  move.l  %d6, 40(%a2)            | ioActCount
         add.l   %d6, 16(%a3)            | dCtlPosition
@@ -246,6 +277,7 @@ refnum: .word   0
 stat:   .word   0
 msg:    .word   0
 cdb:    .space  6
+bounce: .space  512                     | PRIME's partial blocks
 | evidence: Prime calls, last position, last count, Cmd|RBlind, Complete, Get, Select
         .ascii  "DBG!"
 dbg:    .space  24

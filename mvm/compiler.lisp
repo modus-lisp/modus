@@ -1008,6 +1008,19 @@
    but one call instead of three instructions per character, and an eighth of
    the bytes.  Set by the build scripts next to their %NARROW-STRINGS-P.")
 
+(defvar *share-string-literal* nil
+  "T while compiling a narrow string literal that is an argument of a function
+   which only READS it (+READ-ONLY-LITERAL-FNS+, COMPILE-CALL): the pooled object
+   itself, not a %FRESH-STRING copy.  ~700 such calls in the image's own source
+   -- (NAME-EQ (CAR FORM) \"DEFUN\"), (STRING= X \"NIL\") -- each allocated a
+   copy per evaluation: time, and garbage in a 1 MB Mac's 40 KB young heap.")
+
+(defparameter +read-only-literal-fns+
+  '("STRING=" "STRING-EQUAL" "STRING/=" "STRING<" "STRING>" "STRING<=" "STRING>="
+    "STRING-LESSP" "STRING-GREATERP" "STRING-NOT-EQUAL" "NAME-EQ" "NAME-EQUAL"
+    "EQUAL" "EQUALP" "SEARCH" "MISMATCH" "FIND-SYMBOL" "FIND-PACKAGE")
+  "Functions whose string arguments are only read, never kept or changed.")
+
 (defvar *ws5-str-bake-min* 0
   "WS5 GC-corruption threshold PROBE.  In a static build, a quoted STRING whose
    length is >= this value is BAKED into the serialized constant pool (adds pool
@@ -10171,6 +10184,10 @@
       ;; the shifted bits carry their own tag (fixnum/cons/object) — this is a
       ;; pure reinterpret, no type guard.  (mvm-eval already does %word->val for
       ;; fixnums as (ash r -1); these generalize it to pointers.)
+      ;; (%SHARED-LITERAL "...") -- COMPILE-CALL's marker: the pooled literal
+      ((= op-name #.(compute-name-hash "%SHARED-LITERAL"))
+       (let ((*share-string-literal* t))
+         (compile-form (cadr form) env dest)))
       ((= op-name #.(compute-name-hash "%VAL->WORD"))
        (compile-val-to-word (cdr form) env dest))
       ((= op-name #.(compute-name-hash "%WORD->VAL"))
@@ -10939,6 +10956,12 @@
               (emit-ir :li-const dest idx))
             (emit-ir :li-const dest (%e2-const-register value))))
        ((>= (length value) 256)
+        (let ((idx (length *constant-table*)))
+          (push value *constant-table*)
+          (emit-ir :li-const dest idx)))
+       ((and *narrow-literals-p* (not *mvm-eval-runtime-p*) *share-string-literal*
+             (every (lambda (c) (< (char-code c) 256)) value))
+        ;; read, never kept: the pooled literal itself (*SHARE-STRING-LITERAL*)
         (let ((idx (length *constant-table*)))
           (push value *constant-table*)
           (emit-ir :li-const dest idx)))
@@ -28682,6 +28705,12 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; a narrow string literal passed to a function that only reads it: the
+  ;; pooled object, no copy (*SHARE-STRING-LITERAL*)
+  (when (and *narrow-literals-p* (not *mvm-eval-runtime-p*) (symbolp fn)
+             (member (symbol-name fn) +read-only-literal-fns+ :test #'string=)
+             (some #'stringp args))
+    (setq args (mapcar (lambda (a) (if (stringp a) (list '%shared-literal a) a)) args)))
   ;; More arguments than a call passes positionally: through APPLY, which
   ;; passes the rest as a list (+REST-TAIL-NARGS+).  Emitted directly, the
   ;; callee's #x0530 copy stops at 121 words and the rest list read garbage.

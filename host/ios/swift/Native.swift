@@ -93,10 +93,42 @@ private func flag(_ t: Term?) -> Bool {
     }
 }
 
+/// An RGB integer, or the name of a colour that follows light and dark mode: :LABEL (black, or white in the
+/// dark), :SECONDARY, :TERTIARY, :GRAY, :DARKGRAY.
 private func color(_ t: Term?) -> UIColor? {
+    if case .symbol(let name, _)? = t {
+        switch name {
+        case "LABEL": return .label
+        case "SECONDARY": return .secondaryLabel
+        case "TERTIARY": return .tertiaryLabel
+        case "GRAY": return .systemGray
+        case "DARKGRAY": return UIColor { $0.userInterfaceStyle == .dark ? .systemGray2 : .darkGray }
+        default: return nil
+        }
+    }
     guard case .int(let rgb)? = t else { return nil }
     return UIColor(red: CGFloat((rgb >> 16) & 255) / 255, green: CGFloat((rgb >> 8) & 255) / 255,
                    blue: CGFloat(rgb & 255) / 255, alpha: 1)
+}
+
+// THE THEME (app_theme): the system's blue, or MONO -- black and white, the other way round in dark mode.  The
+// window's tint is what buttons, links, switches, the cursor and alerts' buttons take; red stays red.
+private var monoTheme = false
+private func applyTheme(_ window: UIWindow) {
+    guard monoTheme else { return }
+    window.tintColor = .label
+}
+
+/// app_theme(mono): 1, black and white (inverted in dark mode).  Before the first screen, so every control
+/// made afterwards takes it.
+let appTheme: Call = { mono, _, _, _, _, _ in
+    monoTheme = mono != 0
+    if monoTheme {
+        UISwitch.appearance().onTintColor = .label
+        UISwitch.appearance().thumbTintColor = .systemBackground     // a dark thumb on a white track, in the dark
+        if let window = keyWindow() { applyTheme(window) }
+    }
+    return 1
 }
 
 private func termBytes(_ p: UInt, _ n: UInt) -> Term? {
@@ -289,6 +321,7 @@ let appNavNew: Call = { p, n, quiet, _, _, _ in
 /// root given to no window is never seen: the app stays black.  Until then, look again every 50 ms.
 private func installRoot(_ vc: UIViewController, tries: Int = 200) {
     if let window = keyWindow() {
+        applyTheme(window)
         window.rootViewController = vc
         window.makeKeyAndVisible()
     } else if tries > 0 {
@@ -462,13 +495,31 @@ struct NativeRow {
     let sort: String?
     let group: Int?                              // :GROUP -- shown before higher groups, when the table says so
     let keys: [String: Term]                     // :KEYS -- what else the rows can be ordered by (:DATE 1700000000)
+    let bar: Double?                             // :BAR -- a share, in thousandths: a fill behind the row that wide
     let dot: UIColor?
     let menu: [(id: Int, title: String, image: String?, destructive: Bool)]
 
     /// Shows the same (its cell need not be redrawn).
     func looksLike(_ o: NativeRow) -> Bool {
         title == o.title && subtitle == o.subtitle && detail == o.detail && image == o.image && tint == o.tint
-            && chevron == o.chevron && dot == o.dot && menu.map(\.title) == o.menu.map(\.title)
+            && chevron == o.chevron && dot == o.dot && bar == o.bar && menu.map(\.title) == o.menu.map(\.title)
+    }
+}
+
+/// The fill behind a row that shows its share: the label's colour, faint, FRACTION of the width.
+final class ShareFill: UIView {
+    let fraction: Double
+    private let fill = UIView()
+    init(_ fraction: Double) {
+        self.fraction = fraction
+        super.init(frame: .zero)
+        fill.backgroundColor = UIColor.label.withAlphaComponent(0.08)
+        addSubview(fill)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        fill.frame = CGRect(x: 0, y: 0, width: bounds.width * fraction, height: bounds.height)
     }
 }
 
@@ -478,7 +529,8 @@ struct NativeAction {
     let tint: UIColor?
 }
 
-final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate {
+final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate,
+                         UIContextMenuInteractionDelegate {
     let handle: UInt
     let table: UITableView
     var groups: [(title: String?, rows: [NativeRow])] = []
@@ -495,6 +547,63 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
 
     /// Every row, in the order they came (a row's INDEX is its place here, what a SELECT reports).
     var all: [NativeRow] = []
+
+    // THE MENU OFF THE ROWS (app_table_menu): a long press on the table where there is no row -- under the last
+    // one, or in an empty folder -- for what is done to the table as a whole.  A MENU event, (-1 id).  The
+    // rows' own menus are the table's; this interaction answers only where they do not.
+    private var spaceMenu: [(id: Int, title: String, image: String?, destructive: Bool)] = []
+    private var spaceInteraction: UIContextMenuInteraction?
+
+    func setSpaceMenu(_ items: [(id: Int, title: String, image: String?, destructive: Bool)]) {
+        spaceMenu = items
+        if spaceInteraction == nil {
+            let i = UIContextMenuInteraction(delegate: self)
+            table.addInteraction(i)
+            spaceInteraction = i
+        }
+    }
+
+    // nothing lifts out for it: the whole table would (the interaction's view), so the "preview" is a clear
+    // point where the finger is, and the menu simply opens there
+    private let spaceAnchor: UIView = {
+        let v = UIView()
+        v.backgroundColor = .clear
+        v.isUserInteractionEnabled = false
+        return v
+    }()
+    private func spacePreview() -> UITargetedPreview? {
+        guard spaceAnchor.window != nil else { return nil }
+        let p = UIPreviewParameters()
+        p.backgroundColor = .clear
+        p.visiblePath = UIBezierPath(rect: spaceAnchor.bounds)
+        return UITargetedPreview(view: spaceAnchor, parameters: p)
+    }
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction, configuration: UIContextMenuConfiguration,
+                                highlightPreviewForItemWithIdentifier identifier: any NSCopying) -> UITargetedPreview? {
+        spacePreview()
+    }
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction, configuration: UIContextMenuConfiguration,
+                                dismissalPreviewForItemWithIdentifier identifier: any NSCopying) -> UITargetedPreview? {
+        spacePreview()
+    }
+
+    func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                configurationForMenuAtLocation location: CGPoint) -> UIContextMenuConfiguration? {
+        guard !spaceMenu.isEmpty, table.indexPathForRow(at: location) == nil else { return nil }
+        if let header = table.tableHeaderView, header.frame.contains(location) { return nil }   // the filter
+        spaceAnchor.frame = CGRect(x: location.x, y: location.y, width: 1, height: 1)
+        if spaceAnchor.superview !== table { table.addSubview(spaceAnchor) }
+        let items = spaceMenu
+        return UIContextMenuConfiguration(identifier: "space" as NSString, previewProvider: nil) { [weak self] _ in
+            UIMenu(children: items.map { item in
+                UIAction(title: item.title, image: item.image.flatMap { UIImage(systemName: $0) },
+                         attributes: item.destructive ? .destructive : []) { _ in
+                    guard let self else { return }
+                    send("MENU", [.int(Int(self.handle)), .list([.int(-1), .int(item.id)])])
+                }
+            })
+        }
+    }
 
     // THE ORDER (app_table_order): by one of the rows' :KEYS, or by :SORT (as the Finder sorts names) when
     // ORDERKEY is nil; either way round; lower :GROUPs first (folders before files) when GROUPSFIRST.  A tie
@@ -778,6 +887,10 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
             content.imageProperties.tintColor = row.tint ?? .tintColor
         }
         cell.contentConfiguration = content
+        // a share of the whole (disk usage): a faint fill behind the row, that much of its width
+        var bg = cell.defaultBackgroundConfiguration()
+        if let bar = row.bar { bg.customView = ShareFill(bar) }
+        cell.backgroundConfiguration = bg
         // the detail on the right, as Settings shows a value
         if let detail = row.detail {
             let label = UILabel()
@@ -1584,6 +1697,9 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         // landscape's floating buttons
         let share = glass("square.and.arrow.up") { [weak self] in self?.sharePreview() }
         shareButton = share
+        let floatingHex = glass("number.square") { [weak self] in self?.toggleHex() }
+        hexToggles.append(floatingHex)
+        floating.addArrangedSubview(floatingHex)
         floating.addArrangedSubview(share)
         floating.addArrangedSubview(glass("xmark") { [weak self] in self?.closePreview(byUser: true) })
         floating.spacing = 10
@@ -1599,8 +1715,13 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         shelfName.lineBreakMode = .byTruncatingMiddle
         let shelfShare = glass("square.and.arrow.up") { [weak self] in self?.sharePreview() }
         self.shelfShare = shelfShare
+        // close and the hex toggle on the left, the name, share on the right
+        let shelfHex = glass("number.square") { [weak self] in self?.toggleHex() }
+        hexToggles.append(shelfHex)
+        // and its twin on the right, empty, so the name stays in the middle
+        hexTwin.widthAnchor.constraint(equalToConstant: 44).isActive = true
         let row = UIStackView(arrangedSubviews: [
-            glass("xmark") { [weak self] in self?.closePreview(byUser: true) }, shelfName, shelfShare])
+            glass("xmark") { [weak self] in self?.closePreview(byUser: true) }, shelfHex, shelfName, hexTwin, shelfShare])
         row.alignment = .center
         row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -1656,6 +1777,19 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         vc.view.addSubview(pane)
     }
     var shareButton: UIView?
+    var hexToggles: [UIButton] = []              // "the bytes instead": the shelf's and the floating one
+    let hexTwin = UIView()
+
+    /// The hex toggle: shown for a file that has another view (an image, text, a PDF), filled while its bytes are
+    /// what is shown.  A tap is a HEXTOGGLE event; the app shows the file the other way.
+    func setHexToggle(shown: Bool, on: Bool) {
+        hexTwin.isHidden = !shown
+        for b in hexToggles {
+            b.isHidden = !shown
+            b.configuration?.image = UIImage(systemName: on ? "number.square.fill" : "number.square")
+        }
+    }
+    func toggleHex() { send("HEXTOGGLE", [.int(Int(handle))]) }
     var shelfShare: UIView?
 
     /// The shelf follows the finger; let go, and it springs to the nearer of its two heights -- or away, dragged
@@ -2081,6 +2215,13 @@ let appBrowserSetPath: Call = { h, th, p, n, _, _ in
     return 1
 }
 
+/// app_browser_preview_toggle(browser, shown, on): the preview's hex toggle -- SHOWN 1 for a file with a view
+/// besides its bytes; ON 1 while the bytes are what is shown.
+let appBrowserPreviewToggle: Call = { h, shown, on, _, _, _ in
+    browsers[h]?.setHexToggle(shown: shown != 0, on: on != 0)
+    return 1
+}
+
 /// app_browser_hex_total(browser, size): the size of the file the next hex preview shows (its parts come later).
 let appBrowserHexTotal: Call = { h, size, _, _, _, _ in
     browsers[h]?.hexTotal = Int64(size)
@@ -2127,6 +2268,18 @@ let appBrowserPush: Call = { h, p, n, plain, _, _ in
     return th
 }
 
+/// app_table_menu(table, items): the menu of a long press off the rows (plists of :ID :TITLE :IMAGE
+/// :DESTRUCTIVE); a choice is a MENU event, (-1 id).
+let appTableMenu: Call = { h, p, n, _, _, _ in
+    guard let source = tables[h] else { return 0 }
+    source.setSpaceMenu((termBytes(p, n)?.listItems ?? []).compactMap { item in
+        let a = plist(item)
+        guard case .int(let id)? = a["ID"] else { return nil }
+        return (id, str(a["TITLE"]) ?? "", str(a["IMAGE"]), flag(a["DESTRUCTIVE"]))
+    })
+    return 1
+}
+
 /// app_table_order(table, plist): how TABLE's rows go -- :KEY (a name among the rows' :KEYS, or nil for :SORT),
 /// :DESCENDING, :GROUPS-FIRST.
 let appTableOrder: Call = { h, p, n, _, _, _ in
@@ -2150,7 +2303,9 @@ private func nativeRow(_ item: Term, _ index: Int) -> NativeRow {
                      image: str(m["IMAGE"]), tint: color(m["TINT"]), chevron: flag(m["CHEVRON"]),
                      section: str(m["SECTION"]), index: index, sort: str(m["SORT"]),
                      group: { if case .int(let g)? = m["GROUP"] { return g }; return nil }(),
-                     keys: m["KEYS"].map(plist) ?? [:], dot: color(m["DOT"]),
+                     keys: m["KEYS"].map(plist) ?? [:],
+                     bar: { if case .int(let b)? = m["BAR"] { return Double(min(1000, max(0, b))) / 1000 }; return nil }(),
+                     dot: color(m["DOT"]),
                      menu: (m["MENU"]?.listItems ?? []).compactMap { item in
                          let a = plist(item)
                          guard case .int(let id)? = a["ID"] else { return nil }
@@ -2379,7 +2534,9 @@ final class NativeForm: NSObject, UITableViewDataSource, UITableViewDelegate {
             let sw = UISwitch()
             sw.isOn = f.value == "1"
             sw.addAction(UIAction { [weak self] _ in self?.fields[i].value = sw.isOn ? "1" : "0" }, for: .valueChanged)
-            control = sw
+            let spacer = UIView()                          // at the row's right edge, as Settings has it
+            spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            control = UIStackView(arrangedSubviews: [spacer, sw])
         } else if f.kind == .choice {
             // a pop-up menu, as Settings has: the choice shown, the others a tap away
             let button = UIButton(type: .system)
@@ -2654,6 +2811,7 @@ func installNative() {
     register("app_browser_pop_to", appBrowserPopTo)
     register("app_browser_set_path", appBrowserSetPath)
     register("app_browser_subtitle", appBrowserSubtitle)
+    register("app_browser_preview_toggle", appBrowserPreviewToggle)
     register("app_browser_hex_total", appBrowserHexTotal)
     register("app_browser_hex_part", appBrowserHexPart)
     register("app_orientation", appOrientation)
@@ -2664,6 +2822,8 @@ func installNative() {
     register("app_bar_menu", appBarMenu)
     register("app_bar_menu_set", appBarMenuSet)
     register("app_table_order", appTableOrder)
+    register("app_table_menu", appTableMenu)
+    register("app_theme", appTheme)
     register("app_bar_button_enable", appBarButtonEnable)
     register("app_table", appTable)
     register("app_table_set", appTableSet)

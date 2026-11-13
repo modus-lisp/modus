@@ -40,7 +40,7 @@ REPO = os.path.dirname(HERE)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
-    'plus1m':    (0x00040000, 0x00094000, 0x000D6000, 0x000D6000, 0xE000),
+    'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
 }[os.environ['MODUS_MAC68K_MACHINE'].lower()]
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk

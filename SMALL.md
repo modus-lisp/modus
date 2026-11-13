@@ -552,3 +552,35 @@ An LRU simulation over that form's load trace still misses ~6,500 times at
 cache it can afford every non-trivial form is minutes of paging -- and a real
 SCSI disk's seek time would make each of those thousands of reads dearer than
 MAME's.  What would change that is a smaller REPL path, not a smaller image.
+
+## A REPL in 1 MB (Mac Plus): `MODUS_MAC68K_MACHINE=plus1m`
+
+MAME `macplus -ramsize 1M`, our boot blocks and SCSI driver, booting from the
+saved core: the prompt at 54 s, and `(+ 1 2)`, DEFUN, a call, FORMAT ~R,
+DEFMACRO and its use, DOTIMES/PUSH/INTERN all right.  Build with an empty
+`MODUS_68K_HOT` (no hot natives).
+
+| range | what |
+|---|---|
+| `#x10000`-`#x18000` | stack |
+| `#x18000`-`#x1C000` | I/O scratch pages |
+| `#x1C000`-`#x3E000` | code cache (136 KB) |
+| `#x3E000`-`#x40000` | NIL's page and T's |
+| `#x40000`-`#x8E000` | resident image (~318 KB) |
+| `#x8E000`-`#xD0000` | saved heap (268 KB) |
+| `#xD1000`-`#xF5000` | low block (56 KB), young semispaces 2 x 40 KB, 8 KB guard |
+| `#xF5000`-`#xF9800` | kind map |
+| `#xFA700`- | the screen |
+
+What it took, beyond the earlier rounds: the init-only text LINKED at 4 MB
+(`*POOL-INIT-BASE*`) for the core run, where this map's region would sit on it;
+CL's runtime macros compiled into the image (-132 KB of saved heap); and the
+serial REPL's input buffer growing from 512 characters instead of a fixed
+16 KB string -- found by dumping RAM at "heap exhausted" and walking the young
+heap through the kind map.  Measured: 20 KB semispaces exhaust before the
+prompt, 32 KB at the first DEFUN, 40 KB with the 16 KB buffer at DEFMACRO.
+
+It is slow: seconds for a call, minutes for DEFMACRO or a loop.  Every REPL
+form is compiled in the image and run by the bytecode interpreter, and their
+working set pages through a 136 KB cache (see "The REPL's code working set is
+the wall" above).

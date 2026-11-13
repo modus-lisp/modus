@@ -2659,6 +2659,13 @@
       (format t "~&;; MODUS_LEAN_BOOT: image source ~D -> ~D chars~%"
               before (reduce #'+ vars :key (lambda (v) (length (symbol-value v))))))))
 
+(defvar *cli-arch-late-source*
+  (if (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1"))
+      (mvm-text "mvm/jit-68k.lisp")
+      "")
+  "Arch source placed after the CL runtime, the compiler and mvm-eval (see the
+   slot in *FULL-SOURCE*).  A build may bind it first to add its own.")
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *configuration-source* (string #\Newline)
@@ -2688,6 +2695,8 @@
                        ;; runtime-reachable and their quoted reg symbols
                        ;; (rax, :e, …) have recoverable names.  "" when JIT off.
                        *cli-arch-jit-translator-source*
+                       ;; the late arch slot's defuns too (T68-ENABLE and co.)
+                       *cli-arch-late-source* (string #\Newline)
                        *jit-boot-source* (string #\Newline)
                        *stage2-test-source* (string #\Newline)
                        *rt-macros-source* (string #\Newline)
@@ -3175,6 +3184,11 @@
     ;; WRITE-BYTE), and BEFORE *driver-source*, whose kernel-main calls
     ;; run-net-pipeline.
     *cli-bare-metal-net-source*
+    (string #\Newline)
+    ;; ARCH LATE SLOT: arch code that calls the compiler and mvm-eval (a forward
+    ;; reference across the blob does not resolve), before the driver.  The 68k
+    ;; threaded JIT (mvm/jit-68k.lisp) under MODUS_68K_JIT=1; "" otherwise.
+    *cli-arch-late-source*
     (string #\Newline)
     *sft-auto-source*
     (string #\Newline)

@@ -5998,6 +5998,65 @@
            (m68k-emit-tst buf +68k-d0+))
           (t (funcall native op (rest fk))))))
 
+(defparameter *68k-key-keywords*
+  '((:li . 1) (:li-const . 2) (:br . 3) (:ret . 4) (:enter . 5) (:fused . 6) (:nil . 7) (:li-cell . 8))
+  "Shape-key keywords and their codes in M68K-KEY-BYTES.")
+
+(defun m68k-key-bytes (key)
+  "Shape KEY as bytes: a list #xD0+length then its elements, an integer below
+   128 one byte, a larger one #x81 and three bytes, a keyword #xC0+code.  The
+   runtime JIT (mvm/jit-68k.lisp %T68-KEY-BYTES) encodes its keys the same way
+   to look them up in the table M68K-EMIT-SHAPE-TABLE writes."
+  (let ((out nil))
+    (labels ((enc (x)
+               (cond ((consp x)
+                      (when (>= (length x) 16) (error "68k shape key too long: ~S" key))
+                      (push (+ #xD0 (length x)) out)
+                      (dolist (e x) (enc e)))
+                     ((and (integerp x) (<= 0 x 127)) (push x out))
+                     ((and (integerp x) (<= 0 x #xFFFFFF))
+                      (push #x81 out) (push (ldb (byte 8 16) x) out)
+                      (push (ldb (byte 8 8) x) out) (push (ldb (byte 8 0) x) out))
+                     ((and (keywordp x) (assoc x *68k-key-keywords*))
+                      (push (+ #xC0 (cdr (assoc x *68k-key-keywords*))) out))
+                     (t (error "68k shape key element ~S in ~S" x key)))))
+      (enc key))
+    (coerce (nreverse out) '(vector (unsigned-byte 8)))))
+
+(defun m68k-emit-shape-table (buf shapes)
+  "MODUS_68K_JIT: every shape's key and token index, for the runtime JIT, after
+   the dispatch table: \"modusSHP\", how far back NEXT is (4 bytes: the
+   runtime's way to NEXT on a paged image, whose stubs go to the loader), a
+   count, the entries' offsets (from the magic) sorted by key bytes, then each
+   entry -- its index (2 bytes), its key's length (1) and bytes.  4-aligned, so
+   the runtime can scan for the magic."
+  (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-byte buf 0))
+  (let* ((rows (sort (mapcar (lambda (v) (cons (m68k-key-bytes (svref v 3)) (svref v 0))) shapes)
+                     (lambda (a b) (let ((x (car a)) (y (car b)))
+                                     (loop for i from 0
+                                           do (cond ((>= i (length x)) (return (< i (length y))))
+                                                    ((>= i (length y)) (return nil))
+                                                    ((/= (aref x i) (aref y i))
+                                                     (return (< (aref x i) (aref y i))))))))))
+         (n (length rows))
+         (head (+ 8 4 4 (* 4 n)))
+         (back (- (m68k-buffer-position buf)
+                  (or (gethash *68k-thread-next-label* (m68k-buffer-labels buf))
+                      (error "68k JIT shape table: NEXT is not placed"))))
+         (offs nil) (pos head))
+    (dolist (r rows) (push pos offs) (incf pos (+ 3 (length (car r)))))
+    (flet ((u32 (v) (loop for sh from 24 downto 0 by 8 do (m68k-emit-byte buf (ldb (byte 8 sh) v)))))
+      (loop for c across "modusSHP" do (m68k-emit-byte buf (char-code c)))
+      (u32 back)
+      (u32 n)
+      (dolist (o (nreverse offs)) (u32 o))
+      (dolist (r rows)
+        (m68k-emit-byte buf (ash (cdr r) -8)) (m68k-emit-byte buf (logand (cdr r) #xFF))
+        (m68k-emit-byte buf (length (car r)))
+        (loop for b across (car r) do (m68k-emit-byte buf b))))
+    (m68k-word-align buf)
+    (format t "~&;; 68k JIT shape table: ~D shapes, ~D bytes~%" n pos)))
+
 (defun m68k-emit-thread-dispatch (buf function-table)
   "The escape, NEXT, the table (32-bit handler offsets from its own start),
    then every handler."
@@ -6063,7 +6122,8 @@
                     (m68k-buffer-fixups buf))))
           ;; shapes at index >= 255 are reached through the escape: their
           ;; table entry is at index I as well (the escape reads I itself).
-          )))
+          ;; the runtime JIT's copy of the shapes, right after the table
+          (when *68k-jit-shapes* (m68k-emit-shape-table buf shapes)))))
     ;; MODUS_68K_SHAPES_OUT=FILE: every shape's token index and key, one a line
     ;; ("INDEX KEY", the key as READ prints it), for the runtime threaded JIT
     ;; (docs/68k-threaded-jit.md) to number its own instructions with

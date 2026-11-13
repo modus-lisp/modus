@@ -2392,6 +2392,15 @@
       (and *jit-defun-trampolines*
            (eq current (gethash name *jit-defun-trampolines*)))))
 
+(declaim (overridable %runtime-defun-hook))
+(defun %runtime-defun-hook (names)
+  "Called with a module's DEFUN names once mvm-eval has installed their
+   interpreter trampolines and registered the module.  Nothing here; the 68k
+   threaded JIT (mvm/jit-68k.lisp, later in the image) overrides it to
+   translate them."
+  names
+  nil)
+
 (defvar *jit-module-registry* nil
   "NAME (string) -> (bc entry ft-list fn-table rt-table lam-offsets persist-names)
    for every runtime DEFUN installed as an interpreter trampoline.  Boots NIL
@@ -4773,7 +4782,10 @@
               (puthash pn *symbol-function-table* tramp))
             (when (boundp (quote *native-sym-function-table*))
               (puthash (compute-name-hash pn)
-                       *native-sym-function-table* tramp)))))))
+                       *native-sym-function-table* tramp))))))
+    ;; RUNTIME DEFUN HOOK: a backend that compiles a runtime DEFUN when it is
+    ;; defined (the 68k threaded JIT, mvm/jit-68k.lisp) overrides it.
+    (%runtime-defun-hook persist-names))
   ;; PERF Round 2: cache the compiled module for these forms so a
   ;; later mvm-eval of the same forms skips the whole compile.  bc is a
   ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.

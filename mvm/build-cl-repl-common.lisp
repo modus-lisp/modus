@@ -3293,13 +3293,16 @@
             do (setq text (concatenate 'string (subseq text 0 i) (cdr p)
                                        (subseq text (+ i (length (car p))))))))
     (let ((cross (format nil "#x~X" (+ #x10000000 low -8192))))
-      (loop for i = (search "#x1001E000" text) while i
+      (loop with start = 0
+            for i = (search "#x1001E000" text :start2 start) while i
             do (setq text (concatenate 'string (subseq text 0 i) cross
-                                       (subseq text (+ i (length "#x1001E000")))))))
+                                       (subseq text (+ i (length "#x1001E000"))))
+                     start (+ i (length cross)))))
     (when *mac-cold-names-out*
       (setq text (concatenate 'string text (string #\Newline) (mvm-text "mvm/mac68k-cold.lisp"))))
     (setq *cli-arch-override-source*
-          (concatenate 'string *cli-arch-override-source* (string #\Newline) text "
+          (concatenate 'string *cli-arch-override-source* (string #\Newline) text
+                       "
 ;; THE MAC'S SAVED CORE (boot/boot-mac68k.lisp, scripts/mac68k-core.py).
 (defun %core-requested-p () (eql (mem-ref #x10006014 :u32) 1))
 (defun %core-pre-restore () t)

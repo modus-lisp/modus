@@ -347,6 +347,12 @@
    literal is copied at each evaluation (%FRESH-STRING), so none is mutated in
    place, and CL lets a compiler coalesce similar literals.")
 (defvar *pool-init-start* nil)
+(defvar *pool-init-base* nil
+  "NIL: the pool's init-only tail is linked where it lies, last in the resident
+   image.  An address: it is LINKED there (16-aligned), though the file still
+   carries it last -- the bare Mac's 1 MB map, whose runtime-data region sits
+   where the tail would; scripts/mac68k-core.py puts the bytes at this address
+   for the core run, and a core boot never reads them.")
 
 (defun build-constant-pool (module target)
   "Build the constant pool for the image.
@@ -1676,16 +1682,21 @@
                (wrap-header (wrap-header-size-for-boot boot-descriptor)))
           (loop until (zerop (mod (+ load-addr wrap-header (mvm-buffer-position final-buf)) 16))
                 do (mvm-emit-byte final-buf 0))
-          (let ((delta (- (mvm-buffer-position final-buf)
-                          (+ (kernel-image-constant-pool-offset image) *pool-init-start*))))
+          (let ((delta (if *pool-init-base*
+                           (- *pool-init-base* load-addr wrap-header
+                              (+ (kernel-image-constant-pool-offset image) *pool-init-start*))
+                           (- (mvm-buffer-position final-buf)
+                              (+ (kernel-image-constant-pool-offset image) *pool-init-start*)))))
+            (when (and *pool-init-base* (/= 0 (mod *pool-init-base* 16)))
+              (error "*POOL-INIT-BASE* #x~X is not 16-aligned" *pool-init-base*))
             (loop for i from 0 below (length pool-addr-table)
                   for e = (aref pool-addr-table i)
                   when (and (integerp e) (>= e *pool-init-start*))
                     do (setf (aref pool-addr-table i) (+ e delta)))
             (loop for i from *pool-init-start* below (length constant-pool)
                   do (mvm-emit-byte final-buf (aref constant-pool i)))
-            (format t "~&;; init-only literals: ~D bytes, last in the resident image (moved ~D)~%"
-                    (- (length constant-pool) *pool-init-start*) delta))))
+            (format t "~&;; init-only literals: ~D bytes, last in the resident image (moved ~D)~@[, linked at #x~X~]~%"
+                    (- (length constant-pool) *pool-init-start*) delta *pool-init-base*))))
       ;; a paged 68k image's stream section, last, 16-aligned in memory
       (when *68k-tail-move*
         (let* ((load-addr (or (and boot-descriptor (getf boot-descriptor :load-addr)) 0))

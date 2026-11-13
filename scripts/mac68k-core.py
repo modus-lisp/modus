@@ -40,7 +40,12 @@ REPO = os.path.dirname(HERE)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
+    'plus1m':    (0x00040000, 0x00094000, 0x000D6000, 0x000D6000, 0xE000),
 }[os.environ['MODUS_MAC68K_MACHINE'].lower()]
+# where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
+# *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk
+# puts it there
+INIT_BASE = {'plus1m': 0x00400000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower())
 LEAF = {0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x60, 0x64, 0x65, 0x66}
 # low-block byte tables, offsets from the region (not scanned for pointers)
 LOW_BYTES = [(0x6000, 0x6100),      # the static block's raw words (set by hand)
@@ -320,7 +325,22 @@ def main(image, disk):
     run = bytearray(img)
     set_flag(run, 'save', 1)
     run_disk = disk + '.corerun'
-    md.write_disk(bytes(run), run_disk, LOAD, read_len=resident)
+    if INIT_BASE is not None:
+        # the init-only text is linked at INIT_BASE: the run reads the
+        # resident part up to its marker, a gap, then the text at INIT_BASE;
+        # the streams follow on the disk, and the descriptor's disk bias says so
+        k = run.find(b'modusINI', 0, resident)
+        if k < 0 or LOAD + k > INIT_BASE:
+            sys.exit('mac68k-core: no init-only text to put at #%x' % INIT_BASE)
+        body = run[:k] + bytes(INIT_BASE - LOAD - k) + run[k:resident]
+        d = body.find(b'modusPGD')
+        sect, = struct.unpack_from('>I', body, d + 16)
+        struct.pack_into('>I', body, d + 20, (sect - (1024 + len(body))) & 0xFFFFFFFF)
+        md.write_disk(bytes(body) + bytes(run[resident:]), run_disk, LOAD, read_len=len(body))
+        print('mac68k-core: the core run reads %d bytes, the init-only text at #%x'
+              % (len(body), INIT_BASE))
+    else:
+        md.write_disk(bytes(run), run_disk, LOAD, read_len=resident)
     t0 = time.time()
     console, core = capture_core(run_disk, float(os.environ.get('MAC68K_CORE_TIMEOUT', '900')))
     print('mac68k-core: the core run took %.0f s; it said:\n%s'

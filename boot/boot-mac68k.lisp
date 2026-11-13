@@ -38,7 +38,8 @@
     (cond ((or (null m) (string= m "") (string-equal m "lc")) :lc)
           ((string-equal m "classic") :classic)
           ((string-equal m "classic2m") :classic-2m)
-          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic or classic2m" m))))
+          ((string-equal m "plus1m") :plus-1m)
+          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classic2m or plus1m" m))))
   "Which Mac's memory map (MODUS_MAC68K_MACHINE): :LC, the 32 MB LC 475 /
    Quadra 605 class this file was measured on, or :CLASSIC, a Mac Classic
    with 4 MB (its maximum) -- measured in MAME's macclasc when our boot
@@ -103,6 +104,32 @@
               :stack-top #x00020000 :scratch #x00020000 :io-buf #x00021000
               :boot-heap #x01000000 :boot-heap-size #x00800000
               :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
+              :boot-stack-top #x01A00000)
+    ;; A MAC PLUS (or 512Ke / SE / Classic) WITH 1 MB (MODUS_MAC68K_MACHINE=plus1m):
+    ;; the screen at #xFA700.  Below the image, [#x10000, #x40000), which no ROM
+    ;; uses once our boot blocks run: the stack (32 KB), the I/O scratch pages,
+    ;; the code cache (136 KB), and NIL's page and T's (#x3E000: in the core
+    ;; run, on an LC, the ROM's system heap ends at #x39FE0).  From #x40000: the
+    ;; image's resident part (~340 KB), the static heap the core brings, from the
+    ;; image's init-only marker up to #xD6000 (measured: it ends at #xD5C00);
+    ;; then the low block (56 KB), a YOUNG pair of 32 KB and an 8 KB guard,
+    ;; ending at the kind map (#xF6000, a byte per 8 bytes: 16 KB), which ends
+    ;; at the screen.  (A pair of 20 KB, measured, exhausts before the REPL
+    ;; prompt.)  The init-only
+    ;; text is LINKED at 4 MB (:INIT-BASE, cross.lisp *POOL-INIT-BASE*): in the
+    ;; core run, on a big Mac, the region here would sit on it -- and that run's
+    ;; kind bytes, for its heap at 16 MB, reach #x3D9000.  The boot blocks relocate themselves to
+    ;; #xEA700, past the end of what they read (the low block ends #xE4000).
+    (:plus-1m :load #x00040000 :static-lo #x00094000 :static-hi #x000D6000
+              :region #x000D6000 :heap-size #x0002C000 :gc-guard #x00002000
+              :alloc-start #x0000E000
+              :kind-map #x000F6000 :cache-lo #x0001C000 :cache-hi #x0003E000
+              :staging #x0003E000 :staging-size #x00000000
+              :nil-page #x0003E000
+              :stack-top #x00018000 :scratch #x00018000 :io-buf #x00019000
+              :init-base #x00400000
+              :boot-heap #x01000000 :boot-heap-size #x00800000
+              :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
               :boot-stack-top #x01A00000)))
 
 (defun mac68k-layout (key)
@@ -157,7 +184,9 @@
   (setf *68k-nil-page* +mac68k-nil-page+
         *68k-gc-kind-map* +mac68k-kind-map+
         *68k-gc-heap-start* (+ +conv-region-base+ (mac68k-alloc-start))
-        *68k-card-crossing* (+ +conv-region-base+ (mac68k-alloc-start) -8192))
+        *68k-card-crossing* (+ +conv-region-base+ (mac68k-alloc-start) -8192)
+        ;; the init-only text's link address, where the layout gives one
+        *pool-init-base* (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) :init-base))
   ;; paged code: where the stream loader puts what it reads
   (setf *68k-paged-cache*
         (and *68k-paged*
@@ -246,7 +275,7 @@
    heap, cache and stack, above 4 MB; the descriptor's SAVE flag then has
    KERNEL-MAIN send the core over serial port A."
   (let* ((buf (make-m68k-buffer))
-         (classic (member *mac68k-machine* '(:classic :classic-2m)))
+         (classic (member *mac68k-machine* '(:classic :classic-2m :plus-1m)))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
          (fill (mvm-make-label))

@@ -5146,7 +5146,7 @@
 ;;; must hold a whole stream to run any of it: the bytecode interpreter's is
 ;;; 176 KB, so the cache could not be smaller than that and the interpreter
 ;;; thrashed every other stream out.  A stream over the chunk size
-;;; (MODUS_68K_CHUNK_KB, Mac paged only) is cut at token boundaries into
+;;; (MODUS_68K_CHUNK_KB, default 4; Mac paged only) is cut at token boundaries into
 ;;; several, each its own index, loaded and evicted alone.  A branch to a
 ;;; label in another chunk goes to a TRAMPOLINE at the end of its own chunk,
 ;;; and each chunk but the last ends in one to the next (its fall-through):
@@ -5156,7 +5156,7 @@
 ;;; its stream; nothing else knows a function was cut.
 (defparameter *68k-chunk-bytes*
   (let ((v (sb-ext:posix-getenv "MODUS_68K_CHUNK_KB")))
-    (if (and v (string/= v "")) (* 1024 (parse-integer v)) (* 16 1024)))
+    (if (and v (string/= v "")) (* 1024 (parse-integer v)) (* 4 1024)))
   "Paged Mac: a cold function's stream is cut into chunks of about this many
    bytes (0: never).")
 

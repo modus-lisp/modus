@@ -511,3 +511,44 @@ Measured on MAME's Classic (68000, SCSI):
 
 The 4 MB Classic's map now holds ~1.77 MB: image 470 KB, saved heap 657 KB,
 low block 128 KB, young heap 256 KB, cache 192 KB, stack and buffers ~70 KB.
+
+## Toward 1 MB: what the saved core and the image hold now
+
+Measured on MAME's 2 MB Classic (`MODUS_MAC68K_MACHINE=classic2m`), same
+REPL forms throughout, every answer right:
+
+| | before | now | how |
+|---|---|---|---|
+| code cache floor | 196 KB (the interpreter's stream) | none (64 KB runs) | **chunked streams**: a cold function over `MODUS_68K_CHUNK_KB` (default 4) is several streams; a cross-chunk branch goes through an XJUMP trampoline, which is the RELOAD token over a record-shaped operand |
+| resident image | 607 KB | 443 KB | no NFN table (nothing reads it); CL's runtime macro texts and the boot-only name lists init-only; the constant pool coalesced (4,921 strings, 2,773 distinct) and 8-aligned; no ANSI-test helpers or stage-1/2 probes |
+| saved heap | 657 KB | 400 KB | **cold functions**: the function table's image entries (4,574 names) and `*KERNEL-FN-NAMES*` go to disk at the freeze, as hash-sorted pages; a miss in either table reads one block and keeps what it found (`%HT-COLD-MISS`, `mac68k-cold.lisp`) |
+| low block | 128 KB | 56 KB | the layout's `:ALLOC-START`; the 72 KB went to the young semispaces (64 -> 100 KB) |
+| prompt | 74 s | 55 s | less to read at boot |
+
+`MAC68K_CORE_CENSUS=1 scripts/mac68k-core.py` prints the saved heap by subtag.
+What is left in it is live: symbols and their intern tables (~130 KB), the
+package tables, the bytecode of the 47 runtime macros boot compiles (56 KB),
+dict indexes, conses (60 KB).
+
+### The REPL's code working set is the wall
+
+Profiled with a write tap on the stream table (every load) and a PC sampler:
+one `(length (let ((l nil)) (dotimes (i 5) (push (intern (format nil "S~D" i)) l)) l))`
+touches **732 streams, 830 KB of threaded code** -- the interpreter (125 KB of
+it), `COMPILE-COMPOUND` (96 KB), `EMIT-BYTECODE-FOR-IR` (65 KB), `COMPILE-CALL`,
+`TYPEP`, `%FORMAT-IMPL` ... every REPL form is compiled by the in-image compiler
+and run by the interpreter.  With a 64 KB cache that form costs ~10,000 stream
+loads, and 69% of its time is the loader and the ROM's disk driver:
+
+| chunk size, 64 KB cache | DOTIMES form | DEFUN | DEFMACRO | LET + macro |
+|---|---|---|---|---|
+| 16 KB | 452 s | 70 s | 253 s | 127 s |
+| 4 KB | 239 s | 62 s | 239 s | 89 s |
+
+An LRU simulation over that form's load trace still misses ~6,500 times at
+64 KB, ~1,900 at 192 KB and ~1,200 at 256 KB.  So a 1 MB Mac can be made to
+*fit* (image + saved heap need to reach ~600 KB, from 843 KB: the 1 MB hot list
+`mvm/68k-hot-mac-1m.txt` is -100 KB, stub/table slots ~-50 KB), but with the
+cache it can afford every non-trivial form is minutes of paging -- and a real
+SCSI disk's seek time would make each of those thousands of reads dearer than
+MAME's.  What would change that is a smaller REPL path, not a smaller image.

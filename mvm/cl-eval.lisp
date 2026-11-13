@@ -1910,8 +1910,58 @@
    closures) and for DEFTYPE expansion in typep/subtypep (%expand-deftype).
    Those callers evaluate a lambda body against a runtime env-alist, which
    mvm-eval (a top-level-form compiler) does not provide — so %eval-in-env is
-   kept as SHARED infrastructure, not a rollback lever."
-  (mvm-eval form))
+   kept as SHARED infrastructure, not a rollback lever.
+
+   A form that needs no compiler is APPLIED instead (%EVAL-SIMPLE-P): a call
+   of a global function whose arguments are themselves such forms.  The
+   compiler is one for every architecture; it need not run for (+ 1 2) --
+   on a Mac Classic that compile was the whole of a REPL form's 13 s."
+  (if (%eval-simple-p form 0)
+      (%eval-simple form)
+      (mvm-eval form)))
+
+(defun %eval-simple-p (form depth)
+  "Can FORM be evaluated without compiling it, in the null lexical
+   environment?  A self-evaluating atom; T, NIL or a keyword; a bound global
+   variable that is not a symbol macro; (QUOTE x); or a call of a global
+   FUNCTION -- not a special operator, not a macro -- on a proper list of such
+   forms, nested at most 8 deep.  Anything else is the compiler's."
+  (cond
+    ((consp form)
+     (let ((op (car form)))
+       (and (< depth 8) op (symbolp op)
+            (if (eq op 'quote)
+                (and (consp (cdr form)) (null (cdr (cdr form))))
+                (and (not (special-operator-p op))
+                     (not (macro-function op))
+                     (fboundp op)
+                     (let ((a (cdr form)) (ok t))
+                       (loop
+                         (when (or (not ok) (null a)) (return ok))
+                         (if (and (consp a) (%eval-simple-p (car a) (+ depth 1)))
+                             (setq a (cdr a))
+                             (setq ok nil)))))))))
+    ((symbolp form)
+     (or (null form) (eq form t) (keywordp form)
+         (and (boundp form) (not (nth-value 1 (macroexpand-1 form))))))
+    (t t)))
+
+(defun %eval-simple (form)
+  "Evaluate FORM, which %EVAL-SIMPLE-P accepted: arguments left to right, then
+   APPLY of the function -- every value it returns."
+  (cond
+    ((consp form)
+     (if (eq (car form) 'quote)
+         (car (cdr form))
+         (let ((args nil) (a (cdr form)))
+           (loop
+             (when (null a) (return nil))
+             (setq args (cons (%eval-simple (car a)) args))
+             (setq a (cdr a)))
+           (apply (fdefinition (car form)) (nreverse args)))))
+    ((symbolp form)
+     (if (or (null form) (eq form t) (keywordp form)) form (symbol-value form)))
+    (t form)))
 
 ;;; ============================================================
 ;;; Compile: return proper 3 values

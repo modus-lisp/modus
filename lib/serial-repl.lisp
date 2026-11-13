@@ -6,7 +6,8 @@
 ;;;;   READ   — the CL reader (READ-FROM-STRING over mvm/cl-reader.lisp)
 ;;;;   EVAL   — EVAL = MVM-EVAL: compile the form to MVM bytecode with the
 ;;;;            self-hosted compiler, then run it through MVM-INTERPRET
-;;;;   PRINT  — WRITE-OBJECT (mvm/prelude.lisp), which writes to serial
+;;;;   PRINT  — PRIN1-TO-STRING (the CL printer), then the string to serial;
+;;;;            WRITE-OBJECT (mvm/prelude.lisp) only if the printer fails
 ;;;;
 ;;;; The ONLY bespoke part is the character source: READ-CHAR-SERIAL (compiled
 ;;;; to TRAP #x0301 — poll the COM1 line-status register at 0x3FD, then IN from
@@ -147,17 +148,29 @@
 ;;; Eval + print
 ;;; ===========================================================================
 
+;;; PRINT is the CL printer: PRIN1 for a value, PRINC (the report) for an
+;;; error.  WRITE-OBJECT, the prelude's boot printer, knows no ratios, prints
+;;; :A as A, 4.5 as 4.500000, a structure as #(%STRUCT-INSTANCE ...), a package
+;;; as its internal vectors and an error as #(UNDEFINED-FUNCTION ((NAME . SQ))
+;;; %CONDITION-MARKER) -- measured on a Mac Classic.  It stays the fallback
+;;; for when the printer itself fails.
+
+(defun %srepl-write-via (fn obj budget)
+  (let ((s (handler-case (funcall fn obj) (t (c) nil))))
+    (if (stringp s)
+        (write-string-serial s)
+        (progn (setq *write-object-budget* budget)
+               (handler-case (write-object obj) (t (c2) (write-string-serial "<unprintable>")))))))
+
 (defun %srepl-report-condition (c)
   (write-string-serial "ERROR: ")
-  (setq *write-object-budget* 400)
-  (handler-case (write-object c) (t (c2) (write-string-serial "<condition>")))
+  (%srepl-write-via (function princ-to-string) c 400)
   (write-char-serial 10))
 
 (defun %srepl-eval-print (form)
   (handler-case
       (let ((v (eval form)))
-        (setq *write-object-budget* 100000)
-        (write-object v)
+        (%srepl-write-via (function prin1-to-string) v 100000)
         (write-char-serial 10))
     (t (c) (%srepl-report-condition c))))
 

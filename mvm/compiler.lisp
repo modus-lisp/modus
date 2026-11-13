@@ -9254,7 +9254,10 @@
                 (push sub *pending-flet-ir*))))
            ((and (consp result) (car result) (cdr result))
             (push result *pending-flet-ir*))))
-       (compile-nil dest))
+       ;; DEFSTRUCT returns the structure's NAME (CLHS defstruct), as DEFVAR
+       ;; below returns the variable's -- it yielded NIL, so a REPL answered
+       ;; (defstruct point x y) with NIL
+       (compile-quote (if (consp (cadr form)) (car (cadr form)) (cadr form)) dest))
       ;; DEFVAR / DEFPARAMETER inside an expression context.  Same fall-
       ;; through trap as DEFUN: nested DEFVAR landed in compile-call as
       ;; a call to a function named "DEFVAR", evaluating BODY at runtime.

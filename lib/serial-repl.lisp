@@ -37,13 +37,31 @@
 (defvar *serial-repl-len* 0)
 (defvar *serial-repl-cap* 0)
 
+;;; The buffer starts at 512 characters and doubles as a form needs it, up to
+;;; 16384: a fixed 16 KB string was 40% of a 1 MB Mac's young heap (measured:
+;;; DEFMACRO exhausted its 40 KB semispaces with it live).
 (defun %srepl-init-buf ()
-  (setq *serial-repl-cap* 16384)
-  (setq *serial-repl-buf* (%make-string-array 16384))
+  (setq *serial-repl-cap* 512)
+  (setq *serial-repl-buf* (%make-string-array 512))
   (setq *serial-repl-len* 0))
+
+(defun %srepl-grow ()
+  "Double the buffer (to at most 16384 characters), keeping what it holds."
+  (let* ((cap (* 2 *serial-repl-cap*))
+         (new (%make-string-array cap))
+         (old *serial-repl-buf*)
+         (i 0))
+    (loop
+      (when (>= i *serial-repl-len*) (return nil))
+      (%prim-aset new i (%prim-aref old i))
+      (setq i (+ i 1)))
+    (setq *serial-repl-buf* new)
+    (setq *serial-repl-cap* cap)))
 
 (defun %srepl-push (code)
   "Append CODE to the buffer (dropping the char if the buffer is full)."
+  (when (and (>= *serial-repl-len* *serial-repl-cap*) (< *serial-repl-cap* 16384))
+    (%srepl-grow))
   (if (< *serial-repl-len* *serial-repl-cap*)
       ;; The store is bound to a variable deliberately: a variable-index ASET
       ;; in non-value position can drop its value (MVM active limitation #2).

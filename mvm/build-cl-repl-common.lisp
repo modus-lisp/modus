@@ -3231,6 +3231,21 @@
   (and *mac-cold-names-out*
        (not (equal (sb-ext:posix-getenv "MODUS_MAC68K_INIT_ONLY") "0"))
        (make-hash-table :test 'equal)))
+;;; ... and so is CL's runtime macro source (mvm/runtime-cl-macros.lisp's
+;;; *MODUS-RUNTIME-MACROS*, a list of DEFMACRO strings boot READs and EVALs):
+;;; ~30 KB of the pool.  The freeze drops the list, so nothing points there.
+(when *mac-init-only*
+  (with-open-file (in (merge-pathnames "runtime-cl-macros.lisp" *load-truename*))
+    (let ((*package* (make-package (gensym "RTM") :use '(:cl))) (n 0))
+      (loop for form = (read in nil in)
+            until (eq form in)
+            when (and (consp form) (eq (car form) 'defvar)
+                      (string= (symbol-name (second form)) "*MODUS-RUNTIME-MACROS*"))
+              do (dolist (x (cdr (third form)))
+                   (when (stringp x) (setf (gethash x *mac-init-only*) t) (incf n)))
+                 (return))
+      (when (zerop n) (error "mac68k: no *MODUS-RUNTIME-MACROS* strings in runtime-cl-macros.lisp"))
+      (format t "~&;; mac68k: ~D runtime macro texts init-only~%" n))))
 
 ;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
 ;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
@@ -3303,6 +3318,8 @@
                        "  ;; boot's own compiled forms (E2SMOKE) are not worth 66 KB of a
   ;; Classic's static heap: the cache refills from the REPL's forms
   (setq *mvm-eval-cache* nil)
+  ;; the runtime macros' source texts are init-only (installed at boot)
+  (setq *modus-runtime-macros* nil)
   ;; one string per name across the function and name tables (mvm-eval.lisp)
   (compact-names)
 "
@@ -3527,6 +3544,10 @@
           (symbol-value (sym "*68K-GC-STATIC*")) (and cl-user::*mac68k-gc-static* t))
     (when cl-user::*mac-init-only*
       (setf (symbol-value (sym "*POOL-INIT-ONLY*")) cl-user::*mac-init-only*))
+    ;; the NFN table (name hash -> native offset, cross.lisp) is read by nothing
+    ;; at run time, and was 52 KB of a Classic's resident image
+    (when cl-user::*small-image*
+      (setf (symbol-value (sym "*NFN-TABLE-P*")) nil))
     (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
       (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t)
       ;; ... and its AOT string literals narrow, as MODUS_NARROW_STRINGS does on

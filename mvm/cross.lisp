@@ -502,13 +502,17 @@
                 when (init-p constant) do (emit-one constant idx)))))
     (values (mvm-buffer-used-bytes buf) addr-table))))
 
+(defvar *nfn-table-p* t
+  "NIL: the NFN table is emitted empty (count 0).  Nothing reads it at run time
+   (NFN-LOOKUP is a stub); the bare Mac sets it, for 52 KB of resident image.")
+
 (defun build-nfn-table (module target)
   "Build the NFN (Name-to-Function-Number) table.
    Maps name hashes to native code offsets."
   (let ((buf (make-mvm-buffer))
         (word-size (target-word-size target)))
     ;; Table format: [count:word] [hash:word addr:word]*
-    (let ((functions (mvm-module-function-table module)))
+    (let ((functions (and *nfn-table-p* (mvm-module-function-table module))))
       (if (= word-size 8)
           (mvm-emit-u64 buf (length functions))
           (mvm-emit-u32 buf (length functions)))

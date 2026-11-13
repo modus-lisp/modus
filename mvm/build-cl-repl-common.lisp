@@ -398,7 +398,10 @@
   (let ((v (sb-ext:posix-getenv var)))
     (and v (plusp (length v)) (not (string= v "0")))))
 (defvar *rpi-source-blob* (%rpi-cull-p "MODUS_SOURCE_BLOB"))
-(defvar *cli-omit-ansi-test-aux* (%rpi-cull-p "MODUS_RPI_NO_TEST_AUX"))
+(defvar *cli-omit-ansi-test-aux*
+  (or (%rpi-cull-p "MODUS_RPI_NO_TEST_AUX")
+      ;; the Mac runs no ANSI tests (MODUS_MAC68K_TEST_AUX=1 keeps them)
+      (and *cl-repl-mac68k-p* (not (%rpi-cull-p "MODUS_MAC68K_TEST_AUX")))))
 (when *rpi-source-blob*
   (setf modus.mvm::*embed-source-blob* t)
   (format t "~&;; MODUS_SOURCE_BLOB: embedded source blob kept~%"))
@@ -1338,7 +1341,7 @@
 
 (defvar *cli-arch-io-scratch-source*
   (if (or *cl-repl-x64-p* *cl-repl-mac68k-p*)   ; no device tree to probe
-      "  (setq *cstr-scratch* #x0FE00000)
+      (concatenate 'string "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
   (setq *filesystem* nil)
@@ -1348,12 +1351,14 @@
   (setq internal-time-units-per-second 1000000)
   (setq most-positive-fixnum  4611686018427387903)
   (setq most-negative-fixnum -4611686018427387903)
-  (%init-standard-chars)
-  (%init-boole-constants)
+"
+      (if *cli-omit-ansi-test-aux* "" "  (%init-standard-chars)
+")
+      "  (%init-boole-constants)
   (setq *serial-repl-buf* nil)
   (setq *serial-repl-len* 0)
   (setq *serial-repl-cap* 0)
-"
+")
       "  (setq *cstr-scratch* #x0FE00000)
   (setq *io-buf-addr*  #x0FF00000)
   (setq *scratch-mmapped* nil)
@@ -3372,6 +3377,13 @@
 ;;; ============================================================
 ;;; THE SHARED ASSEMBLY
 ;;; ============================================================
+
+;;; :MAC68K: no stage-1 / stage-2 diagnostic probes (%S1-*, %S2-*, %WS1-*, ...:
+;;; 106 functions build-cli-common bakes for the self-host checks, which a Mac
+;;; never runs).  DEFVAR before the load keeps these values.
+(when (and *cl-repl-mac68k-p* (not (%rpi-cull-p "MODUS_MAC68K_TEST_AUX")))
+  (defvar modus.mvm::*stage1-test-source* "")
+  (defvar modus.mvm::*stage2-test-source* ""))
 
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))

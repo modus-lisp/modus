@@ -496,13 +496,15 @@ struct NativeRow {
     let group: Int?                              // :GROUP -- shown before higher groups, when the table says so
     let keys: [String: Term]                     // :KEYS -- what else the rows can be ordered by (:DATE 1700000000)
     let bar: Double?                             // :BAR -- a share, in thousandths: a fill behind the row that wide
+    let button: String?                          // :BUTTON -- a button at the row's end; its tap, the row's (a SELECT)
+    let italic: Bool                             // :ITALIC -- the title in italics (a symlink)
     let dot: UIColor?
     let menu: [(id: Int, title: String, image: String?, destructive: Bool)]
 
     /// Shows the same (its cell need not be redrawn).
     func looksLike(_ o: NativeRow) -> Bool {
         title == o.title && subtitle == o.subtitle && detail == o.detail && image == o.image && tint == o.tint
-            && chevron == o.chevron && dot == o.dot && bar == o.bar && menu.map(\.title) == o.menu.map(\.title)
+            && chevron == o.chevron && dot == o.dot && bar == o.bar && button == o.button && italic == o.italic && menu.map(\.title) == o.menu.map(\.title)
     }
 }
 
@@ -880,6 +882,9 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         let cell = tableView.dequeueReusableCell(withIdentifier: "native", for: indexPath)
         var content = UIListContentConfiguration.subtitleCell()
         content.text = row.title
+        if row.italic, let italic = UIFont.preferredFont(forTextStyle: .body).fontDescriptor.withSymbolicTraits(.traitItalic) {
+            content.textProperties.font = UIFont(descriptor: italic, size: 0)
+        }
         content.secondaryText = row.subtitle
         content.secondaryTextProperties.color = .secondaryLabel
         if let name = row.image {
@@ -909,6 +914,19 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         } else {
             cell.accessoryView = nil
             cell.accessoryType = row.chevron ? .disclosureIndicator : .none
+        }
+        if let title = row.button {
+            var config = UIButton.Configuration.bordered()
+            config.title = title
+            config.buttonSize = .small
+            config.cornerStyle = .capsule
+            let index = row.index, h = handle
+            let b = UIButton(configuration: config, primaryAction: UIAction { _ in
+                send("SELECT", [.int(Int(h)), .int(index)])
+            })
+            b.sizeToFit()
+            cell.accessoryType = .none
+            cell.accessoryView = b
         }
         if let dot = row.dot {
             // a status dot (a server with a connection open), before the chevron if there is one
@@ -2305,6 +2323,7 @@ private func nativeRow(_ item: Term, _ index: Int) -> NativeRow {
                      group: { if case .int(let g)? = m["GROUP"] { return g }; return nil }(),
                      keys: m["KEYS"].map(plist) ?? [:],
                      bar: { if case .int(let b)? = m["BAR"] { return Double(min(1000, max(0, b))) / 1000 }; return nil }(),
+                     button: str(m["BUTTON"]), italic: flag(m["ITALIC"]),
                      dot: color(m["DOT"]),
                      menu: (m["MENU"]?.listItems ?? []).compactMap { item in
                          let a = plist(item)

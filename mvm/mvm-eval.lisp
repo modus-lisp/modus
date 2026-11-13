@@ -2831,8 +2831,19 @@
    its first expensive call rather than its 64th.  Once NAME is native, a
    caller still holding this object is forwarded to the native code.
    Multiple values pass through either way."
-  (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets))
-        (left (%jit-hot-call-threshold))
+  (let ((inner (%mvm-make-trampoline bc ftab rt offset nil lam-offsets)))
+    ;; NO JIT, NOTHING TO COUNT TOWARD: the plain trampoline.  The counting
+    ;; wrapper reads the clock twice a call (in nanoseconds: a bignum on a
+    ;; 30-bit tower), conses its arguments and values, and -- with promotion
+    ;; answering :RETRY forever -- did so on every call: measured on a 68000
+    ;; Mac, the bulk of an interpreted recursive call.
+    (if (not (%jit-enabled-p))
+        (progn (%note-fn-name inner name) inner)
+        (%mvm-defun-counting-trampoline name bc inner))))
+
+(defun %mvm-defun-counting-trampoline (name bc inner)
+  "%MVM-MAKE-DEFUN-TRAMPOLINE's wrapper round INNER when there is a JIT."
+  (let ((left (%jit-hot-call-threshold))
         (spent 0)
         ;; the native function this trampoline forwards to once there is one:
         ;; set by a promotion here or by its module being built from anywhere

@@ -274,6 +274,61 @@
       (unless (gethash (+ +mvm-runtime-call-base+ n) runtime-table) (return n))
       (setq n (+ n 1)))))
 
+(defun %mvm-rt-entry (runtime-table bc pc)
+  "The runtime stub the CALL / FN-ADDR target at PC names, as (NAME . CELL),
+   from a vector RUNTIME-TABLE keeps under :RT-VEC, indexed by the stub's
+   number.  The target itself is +MVM-RUNTIME-CALL-BASE+ + n: a BIGNUM on a
+   30-bit tower, so forming it from the bytes, comparing it, hashing it and
+   negating it for the cell was most of an interpreted call on a 68000 Mac.  N
+   comes from the bytes; an entry is made on the stub's first call.  The FASL
+   writer keeps only positive integer keys and the JIT's callee scan only
+   string values, so neither sees the vector."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bc))
+  (let ((n (+ (* (- (aref bc (+ pc 3)) #x40) 16777216) (* (aref bc (+ pc 2)) 65536)
+              (* (aref bc (+ pc 1)) 256) (aref bc pc)))
+        (vec (gethash :rt-vec runtime-table)))
+    (unless (and (simple-vector-p vec) (< n (length vec)))
+      (let ((new (make-array (max (+ n 1) (%rt-stub-count runtime-table)) :initial-element nil)))
+        (when (simple-vector-p vec) (replace new vec))
+        (setf (gethash :rt-vec runtime-table) new)
+        (setq vec new)))
+    (or (svref vec n)
+        (let ((target (+ +mvm-runtime-call-base+ n)))
+          (setf (svref vec n)
+                (cons (gethash target runtime-table) (gethash (- target) runtime-table)))))))
+
+(defun %mvm-rt-target-p (runtime-table bc pc)
+  "Is the u32 target at PC a runtime stub (>= +MVM-RUNTIME-CALL-BASE+, #x40000000)?
+   Its top byte says so, without forming the number."
+  (declare (type (simple-array (unsigned-byte 8) (*)) bc))
+  (and runtime-table (>= (aref bc (+ pc 3)) #x40)))
+
+(defun %mvm-rt-cell-fn-1 (cell name)
+  "%MVM-RT-CELL-FN with the stub's cache cell in hand."
+  (if (consp cell)
+      (let ((pair (car cell)))
+        (if (and (consp pair) (cdr pair))
+            (cdr pair)
+            (let ((p (and (boundp '*symbol-function-table*)
+                          *symbol-function-table*
+                          (stringp name)
+                          (%gethash-pair name *symbol-function-table*))))
+              (if (and (consp p) (cdr p))
+                  (progn (rplaca cell p) (cdr p))
+                  (%mvm-resolve-runtime-fn name)))))
+      (%mvm-resolve-runtime-fn name)))
+
+(defun %mvm-rt-cell-store-p-1 (cell name)
+  "%MVM-RT-CELL-STORE-P with the stub's cache cell in hand."
+  (if (consp cell)
+      (let ((v (cdr cell)))
+        (if (eql v 0)
+            (let ((r (if (%mvm-store-fn-name-p name) t nil)))
+              (rplacd cell r)
+              r)
+            v))
+      (%mvm-store-fn-name-p name)))
+
 (defun %mvm-rt-cell-fn (runtime-table target name)
   "The native function a runtime stub TARGET calls, through the stub's cache
    cell: the (pair . store-p) cons mvm-eval made under key (- TARGET) when it
@@ -282,33 +337,14 @@
    invalidation; only the first call per stub pays the string-keyed lookup
    (an EQUAL hash of the whole name, ~10% of a Quicklisp load when every
    interpreted call paid it).  Only a direct key hit is cached; the bare-name
-   fallback, and tables built without cells, resolve every time."
-  (let ((cell (gethash (- target) runtime-table)))
-    (if (consp cell)
-        (let ((pair (car cell)))
-          (if (and (consp pair) (cdr pair))
-              (cdr pair)
-              (let ((p (and (boundp '*symbol-function-table*)
-                            *symbol-function-table*
-                            (stringp name)
-                            (%gethash-pair name *symbol-function-table*))))
-                (if (and (consp p) (cdr p))
-                    (progn (rplaca cell p) (cdr p))
-                    (%mvm-resolve-runtime-fn name)))))
-        (%mvm-resolve-runtime-fn name))))
+   fallback, and tables built without cells, resolve every time.  The
+   interpreter reaches the cell through %MVM-RT-ENTRY instead."
+  (%mvm-rt-cell-fn-1 (gethash (- target) runtime-table) name))
 
 (defun %mvm-rt-cell-store-p (runtime-table target name)
   "%MVM-STORE-FN-NAME-P of the stub's NAME, memoized in its cache cell's CDR
    (0 = not yet asked; the answer depends on NAME alone)."
-  (let ((cell (gethash (- target) runtime-table)))
-    (if (consp cell)
-        (let ((v (cdr cell)))
-          (if (eql v 0)
-              (let ((r (if (%mvm-store-fn-name-p name) t nil)))
-                (rplacd cell r)
-                r)
-              v))
-        (%mvm-store-fn-name-p name))))
+  (%mvm-rt-cell-store-p-1 (gethash (- target) runtime-table) name))
 
 (defconstant +num-vregs+ 23)
 
@@ -1835,9 +1871,20 @@
              ;; ordinary literals; no #xDEADxxxx word is a legitimate fixnum
              ;; immediate.  A no-op on the 64-bit targets, where reg-set already
              ;; yields exactly T / NIL for these two words.
-             (let* ((hi (logior (aref bc (+ npc 4)) (ash (aref bc (+ npc 5)) 8)
-                                (ash (aref bc (+ npc 6)) 16) (ash (aref bc (+ npc 7)) 24)))
-                    (hi-signed (if (>= hi #x80000000) (- hi #x100000000) hi))
+             ;; HI-SIGNED (bytes 4..7 as a signed 32-bit number) by Horner's
+             ;; rule from the SIGNED top byte, as %IFETCH-LI-VALUE does.  It was
+             ;; (logior ... (ash b7 24)) then (>= hi #x80000000) / (- hi
+             ;; #x100000000): on a 30-bit tower all three are bignums -- the
+             ;; compare against #x80000000 on EVERY LI, the shift and subtract
+             ;; on every negative literal.  Measured on a 68000 Mac, that was
+             ;; most of an interpreted loop.
+             (let* ((hi-signed (let ((b7 (aref bc (+ npc 7))))
+                                 (+ (* (+ (* (+ (* (if (>= b7 128) (- b7 256) b7) 256)
+                                                (aref bc (+ npc 6)))
+                                             256)
+                                          (aref bc (+ npc 5)))
+                                       256)
+                                    (aref bc (+ npc 4)))))
                     (deadp (and (= (aref bc (+ npc 3)) +mvm-nil-b3+)
                                 (= (aref bc (+ npc 2)) +mvm-nil-b2+)
                                 (= hi-signed 0))))
@@ -2314,8 +2361,12 @@
           ;; compared for equality with the register's word (as :CMP does).
           (#.+op-cmp-imm+
            (multiple-value-bind (va npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (u npc2) (%ifetch-u32 bc npc)
-               (let* ((a (svref regs va)) (w (%imm32-signed u)) (b (ash w -1)))
+             ;; the immediate read SIGNED, not as an unsigned u32 put through
+             ;; %IMM32-SIGNED: on a 30-bit tower #x80000000 is a bignum, so every
+             ;; CMP-IMM compared against one (and a negative immediate was a
+             ;; bignum subtraction) -- most of an interpreted loop on a 68000
+             (multiple-value-bind (w npc2) (%ifetch-s32 bc npc)
+               (let* ((a (svref regs va)) (b (ash w -1)))
                  (setf (mvm-flags state)
                        (cond ((oddp w) (if (= (%mvm-word a) w) 0 1))
                              ((integerp a) (cond ((= a b) 0) ((< a b) -1) (t 1)))
@@ -2324,8 +2375,8 @@
 
           (#.+op-test-imm+
            (multiple-value-bind (va npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (u npc2) (%ifetch-u32 bc npc)
-               (let ((r (logand (%mvm-word (svref regs va)) (%imm32-signed u))))
+             (multiple-value-bind (w npc2) (%ifetch-s32 bc npc)  ; signed: see CMP-IMM
+               (let ((r (logand (%mvm-word (svref regs va)) w)))
                  (setf (mvm-flags state)
                        (cond ((zerop r) 0) ((< r 0) -1) (t 1))))
                (setf pc npc2))))
@@ -3175,13 +3226,17 @@
 
           ;; --- Function Calling ---
           (#.+op-call+
-           (multiple-value-bind (target npc) (%ifetch-u32 bc pc)
-             (if (and runtime-table (>= target +mvm-runtime-call-base+))
+           ;; a runtime stub's target is not formed (a bignum on a 30-bit tower):
+           ;; %MVM-RT-ENTRY reads its number from the bytes
+           (multiple-value-bind (target npc)
+               (if (%mvm-rt-target-p runtime-table bc pc) (values nil (+ pc 4)) (%ifetch-u32 bc pc))
+             (if (null target)
                  ;; Runtime native call: funcall the real function inline with
                  ;; %word->val'd args (raw words -> real values, no marshalling),
                  ;; store %val->word of the result in VR, continue after the CALL.
-                 (let* ((name (gethash target runtime-table))
-                        (fn (%mvm-rt-cell-fn runtime-table target name))
+                 (let* ((entry (%mvm-rt-entry runtime-table bc pc))
+                        (name (car entry))
+                        (fn (%mvm-rt-cell-fn-1 (cdr entry) name))
                         (nargs (mvm-nargs state)))
                    (if fn
                        (let ((args
@@ -3199,7 +3254,7 @@
                               (%mvm-collect-call-args state regs nargs
                                                       bc ftab runtime-table
                                                       lambda-offsets
-                                                      (%mvm-rt-cell-store-p runtime-table target name))))
+                                                      (%mvm-rt-cell-store-p-1 (cdr entry) name))))
                          ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
                          ;; multi-valued fns (floor/truncate/round/rem returning a
                          ;; quotient AND remainder) write their secondaries to the
@@ -3280,10 +3335,12 @@
            ;;     compiled in THIS thunk.  Store the offset as a plain fixnum
            ;;     value so CALL-INDIRECT's integer branch jumps to the bytecode.
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (target npc2) (%ifetch-u32 bc npc)
-               (if (and runtime-table (>= target +mvm-runtime-call-base+))
-                   (let* ((name (gethash target runtime-table))
-                          (fn (and name (%mvm-rt-cell-fn runtime-table target name))))
+             (multiple-value-bind (target npc2)
+                 (if (%mvm-rt-target-p runtime-table bc npc) (values nil (+ npc 4)) (%ifetch-u32 bc npc))
+               (if (null target)
+                   (let* ((entry (%mvm-rt-entry runtime-table bc npc))
+                          (name (car entry))
+                          (fn (and name (%mvm-rt-cell-fn-1 (cdr entry) name))))
                      (if (functionp fn)
                          (reg-set regs vd (%val->word fn))
                          (reg-set-nil regs vd)))

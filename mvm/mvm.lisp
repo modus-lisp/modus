@@ -951,12 +951,15 @@
   (mvm-emit-byte buf (logand (ash val -8) #xFF)))
 
 (defun mvm-emit-s16 (buf val)
-  "Emit a 16-bit signed value (little-endian)"
-  (mvm-emit-u16 buf (if (minusp val) (logand val #xFFFF) val)))
+  "Emit a 16-bit signed value (little-endian): its two's-complement bytes,
+   which the byte masks below take straight from a negative VAL."
+  (mvm-emit-u16 buf val))
 
 (defun mvm-emit-s32 (buf val)
-  "Emit a 32-bit signed value (little-endian)"
-  (mvm-emit-u32 buf (if (minusp val) (logand val #xFFFFFFFF) val)))
+  "Emit a 32-bit signed value (little-endian).  Not through (logand val
+   #xFFFFFFFF): that mask is a bignum on a 30-bit tower, and the image's own
+   compiler emits immediates on one."
+  (mvm-emit-u32 buf val))
 
 (defun mvm-emit-u32 (buf val)
   "Emit a 32-bit value (little-endian)"
@@ -966,9 +969,11 @@
   (mvm-emit-byte buf (logand (ash val -24) #xFF)))
 
 (defun mvm-emit-u64 (buf val)
-  "Emit a 64-bit value (little-endian)"
-  (mvm-emit-u32 buf (logand val #xFFFFFFFF))
-  (mvm-emit-u32 buf (logand (ash val -32) #xFFFFFFFF)))
+  "Emit a 64-bit value (little-endian).  MVM-EMIT-U32 takes each byte with a
+   shift and #xFF, so no #xFFFFFFFF mask -- a bignum on a 30-bit tower, where
+   every LI the image's compiler emitted built several."
+  (mvm-emit-u32 buf val)
+  (mvm-emit-u32 buf (ash val -32)))
 
 ;;; ============================================================
 ;;; Register Encoding
@@ -1305,7 +1310,9 @@
 
 (defun %imm32-signed (u)
   "The :imm32 operand U of CMP-IMM / TEST-IMM as the signed value it encodes."
-  (if (>= u #x80000000) (- u #x100000000) u))
+  ;; LOGBITP, not (>= u #x80000000): on a 30-bit tower that constant is a
+  ;; bignum and every call compared against it
+  (if (logbitp 31 u) (- u #x100000000) u))
 
 ;; Branch
 (defun mvm-br (buf offset)

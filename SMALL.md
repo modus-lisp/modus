@@ -479,3 +479,35 @@ slot, which was holding a 400 KB table live.
 Next, in both directions: the kernel-name sets and the macro table are
 consulted only at DEFUN / DEFMACRO / global-definition time -- the next cold
 customers, or replaced by a test on what is already resident.
+
+## Shrinking what stays, and a code cache that can evict anything
+
+**The core's own collection** (`mac68k-core.py`): a core boot's only roots are
+the low block's words, so the builder keeps what they reach and compacts it --
+326 KB the freeze had kept live through a stale stack word went.  **Hash
+tables**: the symbol-function table is a compact dict now -- keys and values
+packed -- and a cached `(name . function)` pair is made on demand
+(`%GETHASH-PAIR`'s side table), not three conses an entry for every name;
+pinned bucket vectors are right-sized at the freeze.  **Packages**: a
+package's symbols are an EQUAL hash table, not an alist with a derived index.
+The saved heap: 1.12 MB -> 657 KB.  (A table that grows is NOT right-sized: a
+doubled 2,400-entry dict does not fit the Classic's 128 KB young semispace.)
+
+**Active streams are evictable.**  The code cache used to stop (`!LDR-FULL`)
+when the streams on the call chain outgrew it -- three DO-EXTERNAL-SYMBOLS in
+one form did.  Now FORCE takes a place anyway and rewrites every exact root
+into what it evicts (the caller's A5, -4 of each frame, the jmpbuf's and
+handler frames' A5) to a RELOAD RECORD: a token, the stream, the offset.
+Returning to one reloads the stream wherever it fits and goes on.  So the
+cache's size is now a speed choice, not a ceiling; its floor is the largest
+stream (the interpreter, ~176 KB).  `MODUS_MAC68K_CACHE_KB=N` sets it.
+Measured on MAME's Classic (68000, SCSI):
+
+| | 796 KB cache | 192 KB cache |
+|---|---|---|
+| prompt | 224 s | 179 s |
+| `(+ 1 2)` | 23 s | 28 s |
+| `defmacro` | 207 s | 316 s |
+
+The 4 MB Classic's map now holds ~1.77 MB: image 470 KB, saved heap 657 KB,
+low block 128 KB, young heap 256 KB, cache 192 KB, stack and buffers ~70 KB.

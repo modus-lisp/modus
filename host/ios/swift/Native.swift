@@ -974,7 +974,7 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
                 table.backgroundView = UIContentUnavailableView(configuration: config)
             }
         } else if none && loading {
-            let spinner = UIActivityIndicatorView(style: .medium)
+            let spinner = UIActivityIndicatorView(style: .large)
             spinner.startAnimating()
             table.backgroundView = spinner
         } else if none, let config = empty {

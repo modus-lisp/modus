@@ -83,8 +83,15 @@
               :boot-stack-top #x01A00000)))
 
 (defun mac68k-layout (key)
-  (or (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) key)
-      (error "mac68k: no ~S in the ~S layout" key *mac68k-machine*)))
+  (let ((v (or (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) key)
+               (error "mac68k: no ~S in the ~S layout" key *mac68k-machine*))))
+    ;; MODUS_MAC68K_CACHE_KB=N: a code cache of N KB, at the top of the
+    ;; layout's -- the test of eviction under pressure (and the size a smaller
+    ;; machine will have)
+    (let ((kb (and (eq key :cache-lo) (sb-ext:posix-getenv "MODUS_MAC68K_CACHE_KB"))))
+      (if (and kb (plusp (length kb)))
+          (max v (logand (- (mac68k-layout :cache-hi) (* 1024 (parse-integer kb))) (lognot 4095)))
+          v))))
 
 (defparameter +mac68k-load-addr+ (mac68k-layout :load))
 (defvar *mac68k-load-addr* +mac68k-load-addr+

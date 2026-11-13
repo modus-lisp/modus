@@ -457,7 +457,7 @@ let appBarMenuSet: Call = { h, p, n, _, _, _ in
 }
 
 private func barMenu(_ bh: UInt, _ items: Term?) -> UIMenu {
-    var groups: [(group: Int, header: String?, actions: [UIAction])] = []
+    var groups: [(group: Int, header: String?, sub: String?, subImage: String?, actions: [UIAction])] = []
     for item in items?.listItems ?? [] {
         let m = plist(item)
         guard case .int(let id)? = m["ID"] else { continue }
@@ -469,10 +469,17 @@ private func barMenu(_ bh: UInt, _ items: Term?) -> UIMenu {
         if let last = groups.last, last.group == g {
             groups[groups.count - 1].actions.append(action)
         } else {
-            groups.append((g, str(m["HEADER"]), [action]))
+            groups.append((g, str(m["HEADER"]), str(m["SUBMENU"]), str(m["SUBMENU-IMAGE"]), [action]))
         }
     }
-    return UIMenu(children: groups.map { UIMenu(title: $0.header ?? "", options: .displayInline, children: $0.actions) })
+    // a group whose first item names a :SUBMENU is a row that opens it (a menu too tall for the screen scrolls)
+    return UIMenu(children: groups.map { g in
+        if let sub = g.sub {
+            let inner = UIMenu(title: sub, image: g.subImage.flatMap { UIImage(systemName: $0) }, children: g.actions)
+            return UIMenu(title: "", options: .displayInline, children: [inner])
+        }
+        return UIMenu(title: g.header ?? "", options: .displayInline, children: g.actions)
+    })
 }
 
 /// app_bar_button_enable(button, on)
@@ -659,8 +666,63 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         bar.autocorrectionType = .no
         bar.delegate = self
         searchBar = bar
-        table.tableHeaderView = bar
+        infoLabel.font = .preferredFont(forTextStyle: .footnote)
+        infoLabel.textColor = .secondaryLabel
+        infoLabel.numberOfLines = 0
+        // a tap on it is an INFO event (ferry: the folder's usage)
+        infoLabel.isUserInteractionEnabled = true
+        infoLabel.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(infoTapped)))
+        header.addSubview(infoLabel)
+        header.addSubview(bar)
+        layoutHeader()
+        table.tableHeaderView = header
         table.keyboardDismissMode = .onDrag
+    }
+
+    // THE HEADER, out of sight above the first row until pulled down to: a few lines about the folder (app_table_info),
+    // then the filter.
+    private let header = UIView()
+    private let infoLabel = UILabel()
+    private var headerWidth: CGFloat = 0
+
+    /// TEXT, its [[symbol]]s drawn as SF Symbols in the text's own colour and size.
+    @objc func infoTapped() { send("INFO", [.int(Int(handle))]) }
+
+    func setInfo(_ text: String) {
+        if text.isEmpty {
+            infoLabel.attributedText = nil
+        } else {
+            let font = UIFont.preferredFont(forTextStyle: .footnote)
+            let out = NSMutableAttributedString()
+            var rest = Substring(text)
+            while let open = rest.range(of: "[["), let close = rest.range(of: "]]", range: open.upperBound..<rest.endIndex) {
+                out.append(NSAttributedString(string: String(rest[..<open.lowerBound]), attributes: [.font: font]))
+                let name = String(rest[open.upperBound..<close.lowerBound])
+                if let image = UIImage(systemName: name, withConfiguration: UIImage.SymbolConfiguration(font: font, scale: .small))?
+                    .withTintColor(.secondaryLabel, renderingMode: .alwaysOriginal) {
+                    out.append(NSAttributedString(attachment: NSTextAttachment(image: image)))
+                }
+                rest = rest[close.upperBound...]
+            }
+            out.append(NSAttributedString(string: String(rest), attributes: [.font: font]))
+            out.addAttribute(.foregroundColor, value: UIColor.secondaryLabel, range: NSRange(location: 0, length: out.length))
+            infoLabel.attributedText = out
+        }
+        layoutHeader()
+        showEmpty()
+    }
+
+    private func layoutHeader() {
+        guard let bar = searchBar else { return }
+        let w = max(table.bounds.width, 1)
+        headerWidth = w
+        let inset = table.layoutMargins.left
+        let info: CGFloat = infoLabel.attributedText == nil ? 0
+            : infoLabel.sizeThatFits(CGSize(width: w - 2 * inset, height: .greatestFiniteMagnitude)).height + 14
+        infoLabel.frame = CGRect(x: inset, y: 10, width: w - 2 * inset, height: max(0, info - 14))
+        bar.frame = CGRect(x: 0, y: info, width: w, height: 56)
+        header.frame = CGRect(x: 0, y: 0, width: w, height: info + 56)
+        if table.tableHeaderView === header { table.tableHeaderView = header }    // its new height taken
     }
 
     func searchBar(_ searchBar: UISearchBar, textDidChange text: String) {
@@ -685,7 +747,8 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         let top = -table.adjustedContentInset.top
         guard table.contentSize.height > table.bounds.height, abs(table.contentOffset.y - top) < 1 else { return }
         searchTucked = true
-        table.contentOffset.y = top + bar.frame.height
+        table.contentOffset.y = top + header.frame.height
+        _ = bar
     }
 
     // ---- the scrubber: for a list many screens long ----
@@ -845,8 +908,9 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     func showEmpty() {
         showFooter()
         // the filter only once there is something to filter: not over a placeholder, or an empty folder
-        if let bar = searchBar {
-            let want: UIView? = all.isEmpty ? nil : bar
+        if searchBar != nil {
+            if abs(headerWidth - table.bounds.width) > 1 { layoutHeader() }
+            let want: UIView? = all.isEmpty && infoLabel.attributedText == nil ? nil : header
             if table.tableHeaderView !== want { table.tableHeaderView = want }
         }
         let none = groups.allSatisfy { $0.rows.isEmpty }
@@ -2286,6 +2350,13 @@ let appBrowserPush: Call = { h, p, n, plain, _, _ in
     return th
 }
 
+/// app_table_info(table, text): lines about what the table shows, above its filter (out of sight until pulled down
+/// to), [[symbol]]s drawn as SF Symbols.  Empty: none.  A tap on them is an INFO event.
+let appTableInfo: Call = { h, p, n, _, _, _ in
+    tables[h]?.setInfo(text(p, n))
+    return 1
+}
+
 /// app_table_menu(table, items): the menu of a long press off the rows (plists of :ID :TITLE :IMAGE
 /// :DESTRUCTIVE); a choice is a MENU event, (-1 id).
 let appTableMenu: Call = { h, p, n, _, _, _ in
@@ -2842,6 +2913,7 @@ func installNative() {
     register("app_bar_menu_set", appBarMenuSet)
     register("app_table_order", appTableOrder)
     register("app_table_menu", appTableMenu)
+    register("app_table_info", appTableInfo)
     register("app_theme", appTheme)
     register("app_bar_button_enable", appBarButtonEnable)
     register("app_table", appTable)

@@ -3400,11 +3400,21 @@
 (defparameter +68k-mac-console-code+
   #(#x48E7 #x6040 #x13C0 #x1000 #x9100 #x41F9 #x1000 #x9000 #x217C #x1000 #x9100
     #x0020 #x7001 #x2140 #x0024 #x4268 #x002C #xA003 #x4CDF #x0206 #x4E75 #x48E7
-    #x6040 #x41F9 #x1000 #x9080 #x317C #x0002 #x001A #x42A8 #x001C #xA005 #x4AA8
-    #x001C #x6600 #x0030 #x41F9 #x1000 #x9110 #x4250 #x7028 #xA031 #x3039 #x1000
-    #x9110 #x0C40 #x0003 #x6700 #x000A #x0C40 #x0005 #x6600 #xFFC6 #x7000 #x1039
-    #x1000 #x9115 #x6000 #x001E #x217C #x1000 #x9102 #x0020 #x7001 #x2140 #x0024
-    #x4268 #x002C #xA002 #x7000 #x1039 #x1000 #x9102 #x4CDF #x0206 #x4E75)
+    #x6040 #x4AB8 #x029E #x6600 #x000E #x41FA #x0074 #x21C8 #x029E #x21C8 #x02A2
+    #x41F9 #x1000 #x9080 #x317C #x0002 #x001A #x42A8 #x001C #xA005 #x4AA8 #x001C
+    #x6600 #x0030 #x41F9 #x1000 #x9110 #x4250 #x7028 #xA031 #x3039 #x1000 #x9110
+    #x0C40 #x0003 #x6700 #x000A #x0C40 #x0005 #x6600 #xFFC6 #x7000 #x1039 #x1000
+    #x9115 #x6000 #x001E #x217C #x1000 #x9102 #x0020 #x7001 #x2140 #x0024 #x4268
+    #x002C #xA002 #x7000 #x1039 #x1000 #x9102 #x4CDF #x0206 #x4E75 #x48E7 #x6080
+    #x7000 #x0242 #x007F #x0C42 #x0040 #x6400 #x0032 #x41FA #x0034 #x0801 #x0000
+    #x6700 #x0006 #x41FA #x0068 #x1030 #x2000 #x0801 #x0001 #x6700 #x0016 #x0C00
+    #x0061 #x6500 #x000E #x0C00 #x007A #x6200 #x0006 #x0400 #x0020 #x4CDF #x0106
+    #x4E75 #x6173 #x6466 #x6867 #x7A78 #x6376 #x0062 #x7177 #x6572 #x7974 #x3132
+    #x3334 #x3635 #x3D39 #x372D #x3830 #x5D6F #x755B #x6970 #x0D6C #x6A27 #x6B3B
+    #x5C2C #x2F6E #x6D2E #x0920 #x6008 #x031B #x0000 #x0000 #x0000 #x0000 #x0000
+    #x4153 #x4446 #x4847 #x5A58 #x4356 #x0042 #x5157 #x4552 #x5954 #x2140 #x2324
+    #x5E25 #x2B28 #x265F #x2A29 #x7D4F #x557B #x4950 #x0D4C #x4A22 #x4B3A #x7C3C
+    #x3F4E #x4D3E #x0920 #x7E08 #x031B #x0000 #x0000 #x0000 #x0000 #x0000)
   "The bare Mac's console, assembled (m68k-linux-gnu-as -m68040):
 
    putc:   movem.l d1-d2/a1,-(sp)       ; D0.B -> serial port A
@@ -3418,6 +3428,11 @@
            movem.l (sp)+,d1-d2/a1
            rts
    getc:   movem.l d1-d2/a1,-(sp)       ; -> D0.L: a key, or a byte from port A
+           tst.l   $29E                  ; Key1Trans: none (a Mac Plus ROM
+           bne     wait                  ;   without a System) -> install KTRANS
+           lea     ktrans(pc),a0         ;   there and at Key2Trans, or the ROM
+           move.l  a0,$29E               ;   keeps KeyMap and posts no keyDown
+           move.l  a0,$2A2
    wait:   lea     $10009080,a0          ; .AIn: bytes waiting?
            move.w  #2,26(a0)             ;   csCode 2
            clr.l   28(a0)
@@ -3445,6 +3460,22 @@
            move.b  $10009102,d0
    done:   movem.l (sp)+,d1-d2/a1
            rts
+   ktrans: movem.l d1-d2/a0,-(sp)       ; D2.W key code, D1.W modifiers -> D0.B
+           moveq   #0,d0                 ; the ROM enters it with RTS (its
+           and.w   #$7F,d2               ;   keyboard routine at $269C pushes
+           cmp.w   #64,d2                ;   Key1Trans) and builds the event's
+           bcc     kout                  ;   message from code << 8 | D0.B
+           lea     klow(pc),a0
+           btst    #0,d1                 ; shift (KeyMap byte 7 bit 0)
+           beq     k1
+           lea     khigh(pc),a0
+   k1:     move.b  (0,a0,d2.w),d0
+           btst    #1,d1                 ; caps lock: letters upper case
+           beq     kout
+           cmp.b   #'a',d0 / bcs kout / cmp.b #'z',d0 / bhi kout / sub.b #32,d0
+   kout:   movem.l (sp)+,d1-d2/a0
+           rts
+   klow / khigh: the US keyboard's 64 key codes, unshifted and shifted
 
    The ROM's .AIn/.AOut drivers, opened by the boot stub into the parameter
    blocks at #x10009080 / #x10009000 (the low block's argv area, unused on a

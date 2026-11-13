@@ -208,6 +208,11 @@
 (defconstant +68k-cache-hi+ #x10006038 "Paged Mac: the code cache's end (raw).")
 (defconstant +68k-cache-lo+ #x1000603C
   "Paged Mac: where the code cache's streams start (raw), past its owner map.")
+(defconstant +68k-mac-file-refnum+ #x10006050
+  "The static block's word for a Mac image launched from Mac OS
+   (scripts/mac68k-chain.py): the reference number of the open file that IS
+   its boot disk, which the code loader and the disk service then _Read
+   instead of the boot drive.  0 (as the core sends it) = the boot drive.")
 (defconstant +68k-cache-map+ #x10006040
   "Paged Mac: the cache's OWNER MAP (raw address; the cache's own first bytes):
    one 16-bit word per 64-byte granule from here to the cache's end -- the
@@ -3511,23 +3516,32 @@
    Keeps D4-D7 and every address register; _Read itself may clobber D0-D2."
   (flet ((ws (&rest words) (dolist (w words) (m68k-emit-word buf w))))
     (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label))
-          (fail (mvm-make-label)) (done (mvm-make-label)) (pb (mvm-make-label)))
+          (fail (mvm-make-label)) (done (mvm-make-label)) (pb (mvm-make-label))
+          (drive (mvm-make-label)) (have (mvm-make-label)))
       (m68k-emit-label buf *68k-mac-service-label*)
       (ws #x48E7 #x0FFA)                                 ; MOVEM.L D4-D7/A0-A4/A6,-(SP)
-      (ws #x3838 #x0210 #x2678 #x030A)                   ; D4 = BootDrive; A3 = DrvQHdr.qHead
-      (m68k-emit-label buf dq)
-      (ws #x200B) (m68k-emit-beq buf fail)               ; end of the queue
-      (ws #xB86B #x0006) (m68k-emit-beq buf found)       ; CMP.W 6(A3),D4: dQDrive
-      (ws #x2653) (m68k-emit-bra buf dq)                 ; A3 = qLink
-      (m68k-emit-label buf found)
       (m68k-emit-lea-label buf pb +68k-a0+)
       (ws #x7013)                                        ; MOVEQ #19,D0
       (m68k-emit-label buf zl)
       (ws #x4298)                                        ; CLR.L (A0)+
       (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
       (m68k-emit-lea-label buf pb +68k-a0+)
+      ;; launched from Mac OS (scripts/mac68k-chain.py): the disk is a file
+      (let ((a (conv-real +68k-mac-file-refnum+)))
+        (ws #x2039 (ash a -16) (logand a #xFFFF)))       ; MOVE.L slot,D0
+      (m68k-emit-beq buf drive)
+      (ws #x3140 #x0018)                                 ; ioRefNum = the file's
+      (m68k-emit-bra buf have)
+      (m68k-emit-label buf drive)
+      (ws #x3838 #x0210 #x2678 #x030A)                   ; D4 = BootDrive; A3 = DrvQHdr.qHead
+      (m68k-emit-label buf dq)
+      (ws #x200B) (m68k-emit-beq buf fail)               ; end of the queue
+      (ws #xB86B #x0006) (m68k-emit-beq buf found)       ; CMP.W 6(A3),D4: dQDrive
+      (ws #x2653) (m68k-emit-bra buf dq)                 ; A3 = qLink
+      (m68k-emit-label buf found)
       (ws #x316B #x0006 #x0016)                          ; ioVRefNum = dQDrive
       (ws #x316B #x0008 #x0018)                          ; ioRefNum = dQRefNum
+      (m68k-emit-label buf have)
       (ws #x2143 #x0020)                                 ; ioBuffer = D3
       (ws #x2142 #x0024)                                 ; ioReqCount = D2
       (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart
@@ -5281,21 +5295,31 @@
           (m68k-emit-bsr buf alloc)
           (ws #x4A80) (m68k-emit-bne buf ill-full)             ; TST.L D0: no room at all
           ;; the boot drive's drive-queue element (BootDrive $210, DrvQHdr $30A)
-          (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label)))
-            (ws #x3238 #x0210 #x2678 #x030A)
-            (m68k-emit-label buf dq)
-            (ws #x200B) (m68k-emit-beq buf ill-drive)
-            (ws #xB26B #x0006) (m68k-emit-beq buf found)
-            (ws #x2653) (m68k-emit-bra buf dq)
-            (m68k-emit-label buf found)
+          (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label))
+                (drive (mvm-make-label)) (have (mvm-make-label)))
             (m68k-emit-lea-label buf pb +68k-a0+)
             (ws #x7013)                                        ; MOVEQ #19,D0
             (m68k-emit-label buf zl)
             (ws #x4298)                                        ; CLR.L (A0)+
             (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
             (m68k-emit-lea-label buf pb +68k-a0+)
+            ;; launched from Mac OS (scripts/mac68k-chain.py): the disk is a
+            ;; file, its reference number in the static block
+            (ws #x2039) (l32 (conv-real +68k-mac-file-refnum+))  ; MOVE.L slot,D0
+            (m68k-emit-beq buf drive)
+            (ws #x3140 #x0018)                                 ; ioRefNum = the file's
+            (m68k-emit-bra buf have)
+            ;; else the boot drive's drive-queue element (BootDrive $210, DrvQHdr $30A)
+            (m68k-emit-label buf drive)
+            (ws #x3238 #x0210 #x2678 #x030A)
+            (m68k-emit-label buf dq)
+            (ws #x200B) (m68k-emit-beq buf ill-drive)
+            (ws #xB26B #x0006) (m68k-emit-beq buf found)
+            (ws #x2653) (m68k-emit-bra buf dq)
+            (m68k-emit-label buf found)
             (ws #x316B #x0006 #x0016)                          ; ioVRefNum = dQDrive
             (ws #x316B #x0008 #x0018)                          ; ioRefNum = dQRefNum
+            (m68k-emit-label buf have)
             (ws #x214C #x0020)                                 ; ioBuffer = A4
             (ws #x2142 #x0024)                                 ; ioReqCount = D2
             (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart

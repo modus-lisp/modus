@@ -19,7 +19,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 # boot/boot-mac68k.lisp's image address for MODUS_MAC68K_MACHINE (lc / classic)
-LOAD_ADDR = {'lc': 0x00100000, 'classic': 0x00040000, 'classic2m': 0x00040000,
+LOAD_ADDR = {'lc': 0x00100000, 'classic': 0x00040000, 'classicos': 0x00040000,
+             'classic2m': 0x00040000,
              'plus1m': 0x00040000}[
     (os.environ.get('MODUS_MAC68K_MACHINE') or 'lc').lower()]
 
@@ -118,10 +119,13 @@ def splash(path=None):
     return data
 
 
-def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read_len=None):
+def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read_len=None,
+               refslot=0, memtop=0):
     """Boot blocks that read IMG (bytes) to LOAD_ADDR and jump to ENTRY (default
     LOAD_ADDR), then IMG at offset 1024, padded to whole blocks and to at
-    least MIN_SIZE.  The splash, when there is one, goes after IMG."""
+    least MIN_SIZE.  The splash, when there is one, goes after IMG.  REFSLOT
+    and MEMTOP, for an image that can be launched from Mac OS: where it wants
+    the open file's reference number, and the RAM its map needs."""
     bb, syms = bootblocks()
     if syms['start'] != 0x8A:
         sys.exit('mac68k-disk: the loader is at %#x, not 0x8A' % syms['start'])
@@ -132,6 +136,9 @@ def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read
     # a disk driver reads whole 512-byte blocks (a byte count is paramErr, -50)
     struct.pack_into('>I', bb, syms['len'], ((read_len or len(img)) + 511) & ~511)
     struct.pack_into('>I', bb, syms['off'], 1024)
+    # for a launch from Mac OS (mac68k-chain.py): 0 = this image cannot
+    struct.pack_into('>I', bb, syms['refslot'], refslot)
+    struct.pack_into('>I', bb, syms['memtop'], memtop)
     out = bb + bytes(1024 - len(bb)) + img
     out += bytes(-len(out) % 512)
     sp = splash()

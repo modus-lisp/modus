@@ -39,9 +39,14 @@ REPO = os.path.dirname(HERE)
 # static heap's card crossing table)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
+    'classicos': (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
 }[os.environ['MODUS_MAC68K_MACHINE'].lower()]
+# a map that can run on top of Mac OS (boot-mac68k's :CLASSIC-OS; launched by
+# scripts/mac68k-chain.py's application): the RAM it needs.  The boot blocks'
+# record then names the static block's #x6050, the open file's reference number.
+CHAIN_MEMTOP = {'classicos': 0x00400000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk
 # puts it there
@@ -398,7 +403,8 @@ def main(image, disk):
         struct.pack_into('>I', chunk, REGION - LOAD + 0x604C, fn_disk)
         print('mac68k-core: cold functions: %d names in %d pages at disk byte %d'
               % (n, npages, fn_disk))
-    md.write_disk(bytes(chunk) + tail, disk, LOAD, read_len=len(chunk))
+    md.write_disk(bytes(chunk) + tail, disk, LOAD, read_len=len(chunk),
+                  refslot=(REGION + 0x6050) if CHAIN_MEMTOP else 0, memtop=CHAIN_MEMTOP)
     print('mac68k-core: %s: boot reads %d bytes (image %d, static %d, low block %d); %d streams '
           '(%d bytes) on demand from disk byte %d'
           % (disk, len(chunk), resident, len(objs) + len(conses), LOW_BLOCK, cnt,

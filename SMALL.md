@@ -584,3 +584,34 @@ It is slow: seconds for a call, minutes for DEFMACRO or a loop.  Every REPL
 form is compiled in the image and run by the bytecode interpreter, and their
 working set pages through a 136 KB cache (see "The REPL's code working set is
 the wall" above).
+
+## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.py`
+
+No floppy and no disk of our own: a Mac application, "Modus", whose data fork
+IS the boot disk `mac68k-core.py` writes.  Double-clicked (or set as the
+startup application), it opens its own data fork, reads the image to its
+address, stores the open file's reference number in the image's static block
+(`#x10006050`, `+68K-MAC-FILE-REFNUM+`) and jumps.  The image runs on top of
+Mac OS as it runs on top of the ROM -- low memory, the system heap, drivers,
+interrupt handlers kept -- and its code loader and disk service `_Read` that
+file instead of the boot drive, so the File Manager follows the file's
+extents and nothing is written to the Mac's disk.  One file to copy
+(MacBinary II); restart to get back to the Finder.
+
+- **The map** (`:CLASSIC-OS`): the 4 MB Classic map with nothing under the
+  image.  Measured on MAME, System 6.0.8 with no INITs: the system heap
+  `#x1400`-`#x24270`, the application zone from `#x2427C`.  The stack and the
+  I/O scratch pages move from `#x10000` to under NIL's page.  The application
+  refuses, on the screen, if MemTop is short of the map, the system heap
+  reaches the image, or its own code or stack is where the image goes.
+- **The boot blocks carry a record** for it: `modusCHN`, then DEST ENTRY LEN
+  OFF SPOFF SPLEN REFSLOT MEMTOP; REFSLOT is 0 for a map that cannot run under
+  Mac OS.  The application draws the splash from SPOFF/SPLEN too.
+- **Measured**, MAME `macclasc -ramsize 4M`, System 6.0.8 on our SCSI driver,
+  Modus as the startup application: the prompt at 61-73 s, (+ 1 2), DEFUN, a
+  call; at 2 MB the refusal on the screen.  The same image booted from its own
+  disk: prompt at 60 s, DEFUN 25 s (the 1 MB Plus: 62 s).
+- **Our SCSI driver now reads any position and count** (a partial block
+  through a bounce buffer).  It rounded every request up to whole blocks --
+  modus's own readers never noticed -- and System 6 booted from it crashed in 6
+  boots of 8, its reads overrunning their buffers; 6 of 6 after.

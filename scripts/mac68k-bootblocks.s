@@ -161,10 +161,18 @@ f1:     move.l  #-1, (%a0)+
         bne     f1
 hang:   bra     hang
         .align  2
+| THE RECORD a loader launched from Mac OS reads (scripts/mac68k-chain.py):
+| everything from DEST to MEMTOP, after this marker.  REFSLOT is where the
+| image wants the open file's reference number (its static block's
+| #x10006050), 0 when the image cannot run on top of Mac OS; MEMTOP the
+| RAM its map needs.
+        .ascii  "modusCHN"
 dest:   .long   0x0D000000
 entry:  .long   0x0D000000
 len:    .long   0
 off:    .long   1024
 spoff:  .long   0                       | the splash: its disk byte and length,
 splen:  .long   0                       | 0 when the disk has none
+refslot: .long  0
+memtop: .long   0
 pb:     .space  80

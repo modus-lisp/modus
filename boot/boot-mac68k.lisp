@@ -39,7 +39,8 @@
           ((string-equal m "classic") :classic)
           ((string-equal m "classic2m") :classic-2m)
           ((string-equal m "plus1m") :plus-1m)
-          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classic2m or plus1m" m))))
+          ((string-equal m "classicos") :classic-os)
+          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classicos, classic2m or plus1m" m))))
   "Which Mac's memory map (MODUS_MAC68K_MACHINE): :LC, the 32 MB LC 475 /
    Quadra 605 class this file was measured on, or :CLASSIC, a Mac Classic
    with 4 MB (its maximum) -- measured in MAME's macclasc when our boot
@@ -80,6 +81,23 @@
               :staging #x003D0000 :staging-size #x00010000
               :nil-page #x003F0000
               :stack-top #x00020000 :scratch #x00020000 :io-buf #x00021000
+              :boot-heap #x01000000 :boot-heap-size #x00800000
+              :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
+              :boot-stack-top #x01A00000)
+    ;; THE CLASSIC (4 MB) LAUNCHED FROM MAC OS (MODUS_MAC68K_MACHINE=classicos,
+    ;; scripts/mac68k-chain.py): the :CLASSIC map with nothing under the image.
+    ;; Mac OS keeps its low memory and system heap -- measured on MAME's Plus
+    ;; and System 6.0.8 with no INITs, the system heap #x1400-#x24270, the
+    ;; application zone from #x2427C -- and the image runs on top of them as it
+    ;; runs on top of the ROM's.  So the stack (64 KB) and the I/O scratch pages
+    ;; move from #x10000 to under NIL's page, out of the code cache's top; the
+    ;; loader application checks the system heap ends below the image.
+    (:classic-os :load #x00040000 :static-lo #x00110000 :static-hi #x002B0000
+              :region #x002B0000 :heap-size #x00080000 :gc-guard #x00008000
+              :kind-map #x00318000 :cache-lo #x00329000 :cache-hi #x003D0000
+              :staging #x003D0000 :staging-size #x00000000
+              :nil-page #x003F0000
+              :stack-top #x003E0000 :scratch #x003E0000 :io-buf #x003E1000
               :boot-heap #x01000000 :boot-heap-size #x00800000
               :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
               :boot-stack-top #x01A00000)
@@ -277,7 +295,7 @@
    heap, cache and stack, above 4 MB; the descriptor's SAVE flag then has
    KERNEL-MAIN send the core over serial port A."
   (let* ((buf (make-m68k-buffer))
-         (classic (member *mac68k-machine* '(:classic :classic-2m :plus-1m)))
+         (classic (member *mac68k-machine* '(:classic :classic-os :classic-2m :plus-1m)))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
          (fill (mvm-make-label))

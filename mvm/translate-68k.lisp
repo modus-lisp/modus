@@ -133,6 +133,12 @@
   "MODUS_68K_HOT: an EQUAL hash of function names to keep native when
    threading (cross.lisp turns it into bytecode offsets for *68K-THREADED*).")
 (defvar *68k-cold-fns* nil "Hash: cold function start pc -> (end-pc . branch-width).")
+(defvar *68k-jit-shapes* (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+  "MODUS_68K_JIT=1: the image carries the shapes the runtime threaded JIT needs
+   beyond its own (mvm/jit-68k.lisp): (:LI-CELL R) for R in V0..V15 and VR --
+   R = the 32-bit word in the CELL whose address follows the token.  A cell is
+   a low-block word, which every collection scans and forwards, so a quoted
+   heap object a runtime DEFUN loads can move.")
 (defvar *68k-thread-shapes* nil "Hash: shape key -> shape (vector index label count key).")
 (defvar *68k-thread-next-label* nil)
 (defvar *68k-stream-fixups* nil "List of (byte-pos label size base).")
@@ -5049,6 +5055,12 @@
       ;; index 255 is the escape, so shapes skip it
       (loop for (k . n) in rows for j from 0
             do (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) n k)))
+      ;; the runtime JIT's own shapes, after every counted one
+      (when *68k-jit-shapes*
+        (loop for r from 0 to 16 for j from (length rows)
+              do (let ((k (list :li-cell r)))
+                   (unless (gethash k shapes)
+                     (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) 0 k))))))
       (setq *68k-cold-fns* cold *68k-thread-shapes* shapes)
       ;; MODUS_68K_THREAD_STATS: stream bytes, and the commonest adjacent
       ;; token pairs (superinstruction candidates), by bytes they would save.
@@ -5926,6 +5938,10 @@
          (m68k-store-vreg buf (second key) +68k-d0+) nil)
         (:li-const (m68k-emit-fetch buf 4 +68k-d0+)
          (m68k-store-vreg buf (second key) +68k-d0+) nil)
+        (:li-cell (m68k-emit-fetch buf 4 +68k-d0+)         ; the cell's address
+         (m68k-emit-word buf #x2040)                        ; MOVEA.L D0,A0
+         (m68k-emit-word buf #x2010)                        ; MOVE.L (A0),D0
+         (m68k-store-vreg buf (second key) +68k-d0+) nil)
         (:br (m68k-emit-stream-branch buf nil (second key)) nil)
         (:ret (m68k-emit-move-disp-an buf +68k-a6+ -4 +68k-a5+)
          (m68k-emit-epilogue buf) t)
@@ -6048,6 +6064,14 @@
           ;; shapes at index >= 255 are reached through the escape: their
           ;; table entry is at index I as well (the escape reads I itself).
           )))
+    ;; MODUS_68K_SHAPES_OUT=FILE: every shape's token index and key, one a line
+    ;; ("INDEX KEY", the key as READ prints it), for the runtime threaded JIT
+    ;; (docs/68k-threaded-jit.md) to number its own instructions with
+    (let ((out (sb-ext:posix-getenv "MODUS_68K_SHAPES_OUT")))
+      (when (and out (plusp (length out)))
+        (with-open-file (o out :direction :output :if-exists :supersede)
+          (let ((*package* (find-package :modus.mvm)) (*print-base* 10))
+            (dolist (v shapes) (format o "~D ~S~%" (svref v 0) (svref v 3)))))))
     ;; the handlers
     (dolist (v shapes)
       (m68k-emit-label buf (svref v 1))

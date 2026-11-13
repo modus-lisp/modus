@@ -3266,6 +3266,31 @@
         (error "mac68k: no name list after ~A in ~A" (second site) (first site)))
       (setf (gethash str *mac-init-only*) t))))
 
+;;; COMPILE-COMPOUND SPLIT (mvm/split-dispatch.lisp), MODUS_SPLIT_COMPOUND=1.  The
+;;; image's copy of the compiler gets COMPILE-COMPOUND's ~300-clause COND as a
+;;; binary search over the operator's name hash, short clauses in its leaves and
+;;; 69 handler functions for the rest, so compiling a form runs the code for its
+;;; own operator, not the whole 96 KB function.  OFF by default: measured on the
+;;; 1 MB Plus (DEFMACRO's stream loads), it cut COMPILE-COMPOUND's own paging
+;;; 1,259 -> 485 KB but the form's total only 13,848 -> 13,540 loads, and no form
+;;; got faster -- the small leaves (GETHASH, STRING= ...) thrash because a form's
+;;; ~740 KB of code does not fit a 136 KB cache, not because of this walk -- and
+;;; it costs 3.4 KB resident (handler stubs) on a map with 1.6 KB to spare.
+(let ((v (sb-ext:posix-getenv "MODUS_SPLIT_COMPOUND")))
+  (when (and v (string= v "1"))
+    (load (merge-pathnames "split-dispatch.lisp" *load-truename*))
+    (multiple-value-bind (text handlers keys)
+        (funcall 'split-cond-dispatch (mvm-text "mvm/compiler.lisp")
+                 :head "(defun compile-compound (form env dest)"
+                 :cond-marker (format nil "~%    (cond~%")
+                 :lambda-list "(form env dest op op-name)"
+                 :block "compile-compound" :prefix "%cc-split")
+      (when (boundp 'cl-user::*compiler-source*)
+        (error "split-dispatch: *COMPILER-SOURCE* is already set"))
+      (defvar cl-user::*compiler-source* text)   ; build-cli-common's (in CL-USER)
+      (format t "~&;; split-dispatch: COMPILE-COMPOUND -> ~D handlers over ~D keys~%"
+              handlers keys))))
+
 ;;; :MAC68K: AOT RUNTIME MACROS.  mvm/runtime-cl-macros.lisp keeps CL's runtime
 ;;; macros (WHEN, DOTIMES, PUSH, CASE ...) as DEFMACRO strings that boot READs
 ;;; and EVALs: each expander became an interpreted closure, 56 KB of bytecode in a

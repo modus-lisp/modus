@@ -885,9 +885,58 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     /// While more rows are coming and some are here: a spinner and the count so far, under the last row -- once
     /// the listing has taken 0.4 s, so a quick one does not flash it.
     var loadingSince = Date()
+    // A README UNDER THE ROWS (app_table_readme): what a folder says of itself, as GitHub shows it.
+    private var readme: UIView?
+    private var readmeText: UITextView?
+    private var readmeWidth: CGFloat = 0
+
+    func setReadme(_ title: String, _ text: String, markdown: Bool) {
+        guard !text.isEmpty else { readme = nil; readmeText = nil; showFooter(); return }
+        let view = UIView()
+        let rule = UIView()
+        rule.backgroundColor = .separator
+        let heading = UILabel()
+        heading.text = title
+        heading.font = .preferredFont(forTextStyle: .footnote)
+        heading.textColor = .secondaryLabel
+        let body = UITextView()
+        body.isEditable = false
+        body.isScrollEnabled = false
+        body.backgroundColor = .clear
+        body.textContainerInset = .zero
+        body.textContainer.lineFragmentPadding = 0
+        if markdown {
+            body.attributedText = Markdown.render(text, base: .preferredFont(forTextStyle: .body))
+        } else {
+            body.text = text
+            body.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            body.textColor = .label
+        }
+        for v in [rule, heading, body] { view.addSubview(v) }
+        readme = view
+        readmeText = body
+        layoutReadme()
+        showFooter()
+    }
+
+    private func layoutReadme() {
+        guard let view = readme, let body = readmeText, view.subviews.count == 3 else { return }
+        let w = max(table.bounds.width, 1), inset = table.layoutMargins.left + 8      // a page's margins, not a row's
+        readmeWidth = w
+        let rule = view.subviews[0], heading = view.subviews[1]
+        rule.frame = CGRect(x: inset, y: 12, width: w - 2 * inset, height: 1 / UIScreen.main.scale)
+        heading.frame = CGRect(x: inset, y: 24, width: w - 2 * inset, height: 18)
+        let h = body.sizeThatFits(CGSize(width: w - 2 * inset, height: .greatestFiniteMagnitude)).height
+        body.frame = CGRect(x: inset, y: 50, width: w - 2 * inset, height: h)
+        view.frame = CGRect(x: 0, y: 0, width: w, height: 50 + h + 40)
+        if table.tableFooterView === view { table.tableFooterView = view }
+    }
+
     func showFooter() {
         guard loading, !all.isEmpty, Date().timeIntervalSince(loadingSince) > 0.4 else {
-            table.tableFooterView = nil; return
+            if readme != nil, abs(readmeWidth - table.bounds.width) > 1 { layoutReadme() }
+            if table.tableFooterView !== readme { table.tableFooterView = readme }
+            return
         }
         let spinner = UIActivityIndicatorView(style: .medium)
         spinner.startAnimating()
@@ -1969,7 +2018,7 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
 
     // MARK: the preview
 
-    enum PreviewKind: UInt { case quickLook = 0, text = 1, image = 2, hex = 3 }
+    enum PreviewKind: UInt { case quickLook = 0, text = 1, image = 2, hex = 3, markdown = 4 }
     var hexTotal: Int64 = 0
 
     func showPreview(_ url: URL, name: String, kind: PreviewKind) {
@@ -1979,7 +2028,7 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         shelfName.text = name
         previewTable = pages.last?.table
         if let t = previewTable { tables[t]?.mark(true) }
-        textView.isHidden = kind != .text
+        textView.isHidden = kind != .text && kind != .markdown
         imageViewer.isHidden = kind != .image
         hexView.isHidden = kind != .hex
         ql.view.isHidden = kind != .quickLook
@@ -1991,7 +2040,16 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         case .hex:
             hexPath = url
             hexView.start((try? Data(contentsOf: url)) ?? Data(), total: hexTotal)
+        case .markdown:
+            // a page: wider margins than the code view's, and type a size up
+            textView.textContainerInset = UIEdgeInsets(top: 18, left: 24, bottom: 40, right: 24)
+            let body = UIFont.preferredFont(forTextStyle: .body)
+            textView.attributedText = Markdown.render(readText(url), base: body.withSize(body.pointSize + 1))
+            textView.setContentOffset(CGPoint(x: 0, y: -textView.adjustedContentInset.top), animated: false)
         case .text:
+            textView.textContainerInset = UIEdgeInsets(top: 12, left: 10, bottom: 24, right: 10)
+            textView.font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
+            textView.textColor = .label
             textView.text = readText(url)
             textView.setContentOffset(CGPoint(x: 0, y: -textView.adjustedContentInset.top), animated: false)
         case .image:
@@ -2348,6 +2406,16 @@ let appBrowserPush: Call = { h, p, n, plain, _, _ in
     source.enableSearch()
     b.push(th, source.table, path: path)
     return th
+}
+
+/// app_table_readme(table, term): (title text markdown) -- a README under the table's rows, drawn as Markdown when
+/// MARKDOWN.  An empty text: none.
+let appTableReadme: Call = { h, p, n, _, _, _ in
+    guard let source = tables[h], let items = termBytes(p, n)?.listItems, items.count >= 2 else { return 0 }
+    var md = false
+    if items.count > 2, case .int(let v) = items[2] { md = v != 0 }
+    source.setReadme(str(items[0]) ?? "", str(items[1]) ?? "", markdown: md)
+    return 1
 }
 
 /// app_table_info(table, text): lines about what the table shows, above its filter (out of sight until pulled down
@@ -2914,6 +2982,7 @@ func installNative() {
     register("app_table_order", appTableOrder)
     register("app_table_menu", appTableMenu)
     register("app_table_info", appTableInfo)
+    register("app_table_readme", appTableReadme)
     register("app_theme", appTheme)
     register("app_bar_button_enable", appBarButtonEnable)
     register("app_table", appTable)

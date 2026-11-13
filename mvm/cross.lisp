@@ -338,6 +338,14 @@
 ;;; starts the static heap at the marker, over text a core boot never reads.
 ;;; NIL: one pool, as always.
 (defvar *pool-init-only* nil)
+(defvar *pool-align* 16
+  "A pooled object's alignment.  The bare Mac's 8-byte granule (translate-68k
+   *68K-TAGS3*) needs 8: a sixth of its pool was padding.")
+(defvar *pool-coalesce* nil
+  "T: one pooled object per distinct string, however many constants name it --
+   the bare Mac's pool held 4,921 strings, 2,773 distinct (38 KB).  A narrow
+   literal is copied at each evaluation (%FRESH-STRING), so none is mutated in
+   place, and CL lets a compiler coalesce similar literals.")
 (defvar *pool-init-start* nil)
 
 (defun build-constant-pool (module target)
@@ -362,7 +370,8 @@
          (constants (mvm-module-constant-table module))
          (n (length constants))
          (addr-table (make-array n :initial-element 0))
-         (big (target-big-endian-p target)))
+         (big (target-big-endian-p target))
+         (seen (and *pool-coalesce* (make-hash-table :test 'equal))))
     ;; POOL WORDS ARE WRITTEN IN THE TARGET'S BYTE ORDER.  mvm-emit-u32/u64 are
     ;; little-endian, which is right for seven targets and byte-swaps every
     ;; header and character of a pooled string on ppc and 68k -- found when
@@ -389,8 +398,12 @@
     (labels ((emit-one (constant idx)
              (typecase constant
                (string
+                (let ((prev (and seen (gethash constant seen))))
+                  (when prev
+                    (setf (aref addr-table idx) prev)
+                    (return-from emit-one nil)))
                 ;; Each heap object is 16-byte aligned at its header.
-                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                       do (mvm-emit-byte buf 0))
                 (let* ((obj-offset (mvm-buffer-position buf))
                        (len (length constant))
@@ -435,9 +448,10 @@
                         ;; :alloc-string does.
                         (loop for c across constant
                               do (emit-word (ash (char-code c) 1)))))
-                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                         do (mvm-emit-byte buf 0))
-                  (setf (aref addr-table idx) (logior obj-offset tag))))
+                  (setf (aref addr-table idx) (logior obj-offset tag))
+                  (when seen (setf (gethash constant seen) (logior obj-offset tag)))))
                (keyword
                 ;; STATIC KEYWORD (compile-keyword under *static-keywords-p*):
                 ;; the same object :ALLOC-OBJ 1 +SUBTAG-KEYWORD+ builds at
@@ -447,7 +461,7 @@
                 ;; moves it and never needs to scan it (pooled strings rely on
                 ;; the same facts).  Boot seeds the keyword table with it
                 ;; (%seed-static-keywords), so runtime interning returns it.
-                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                       do (mvm-emit-byte buf 0))
                 (let* ((obj-offset (mvm-buffer-position buf))
                        (tag (target-object-tag target))
@@ -457,7 +471,7 @@
                   (dotimes (i pad-words)
                     (emit-word 0))
                   (emit-word (ash (normalize-name constant) 1))
-                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
                (symbol
@@ -467,7 +481,7 @@
                 ;; and 2 (name) NIL.  NIL lives at a fixed address outside the
                 ;; heap, so the object holds no heap pointer and the collector
                 ;; never needs to see it.
-                (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                       do (mvm-emit-byte buf 0))
                 (let* ((obj-offset (mvm-buffer-position buf))
                        (tag (target-object-tag target))
@@ -479,7 +493,7 @@
                   (emit-word (ash (normalize-name constant) 1))
                   (emit-word +nil-value+)
                   (emit-word +nil-value+)
-                  (loop while (/= 0 (mod (mvm-buffer-position buf) 16))
+                  (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
                (t

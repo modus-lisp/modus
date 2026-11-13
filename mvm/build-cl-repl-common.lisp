@@ -3251,6 +3251,20 @@
                  (return))
       (when (zerop n) (error "mac68k: no *MODUS-RUNTIME-MACROS* strings in runtime-cl-macros.lisp"))
       (format t "~&;; mac68k: ~D runtime macro texts init-only~%" n))))
+;;; ... and the name lists only package setup reads (%INIT-PACKAGES, at boot):
+;;; CL's 978 exported names and MODUS-INT's exports to the runtime, ~18 KB.
+(when *mac-init-only*
+  (dolist (site '(("cl-conditions.lisp" "(defun %standard-cl-symbol-names")
+                  ("kernel-packages.lisp" "(defun %modus-int-runtime-exports")))
+    (let* ((text (with-open-file (in (merge-pathnames (first site) *load-truename*))
+                   (let ((s (make-string (file-length in))))
+                     (subseq s 0 (read-sequence s in)))))
+           (at (search (second site) text))
+           (q (and at (search "(let ((text \"" text :start2 at)))
+           (str (and q (read-from-string text t nil :start (+ q 12)))))
+      (unless (and (stringp str) (> (length str) 1000))
+        (error "mac68k: no name list after ~A in ~A" (second site) (first site)))
+      (setf (gethash str *mac-init-only*) t))))
 
 ;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
 ;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
@@ -3566,7 +3580,10 @@
     ;; the NFN table (name hash -> native offset, cross.lisp) is read by nothing
     ;; at run time, and was 52 KB of a Classic's resident image
     (when cl-user::*small-image*
-      (setf (symbol-value (sym "*NFN-TABLE-P*")) nil))
+      (setf (symbol-value (sym "*NFN-TABLE-P*")) nil
+            (symbol-value (sym "*POOL-COALESCE*")) t))
+    (when (symbol-value (sym "*68K-TAGS3*"))
+      (setf (symbol-value (sym "*POOL-ALIGN*")) 8))
     (when (and (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
       (setf (symbol-value (sym "*POOL-NARROW-STRINGS*")) t)
       ;; ... and its AOT string literals narrow, as MODUS_NARROW_STRINGS does on

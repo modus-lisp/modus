@@ -86,14 +86,16 @@
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
     ;; the 4 MB map; the static heap from the image's init-only text
     ;; (mac68k-core.py) up to #x178000; then the low block, a YOUNG pair of
-    ;; 64 KB (heap-size #x60000: 128 KB of low block + 2 x 64 KB) and a 16 KB
+    ;; 100 KB (56 KB of low block + 2 x 100 KB) and a 16 KB
     ;; guard, the kind map over them, a 196 KB code cache (the interpreter's
     ;; stream, ~176 KB, is the floor), NIL's page under the screen.  The boot
     ;; blocks relocate themselves to #x1EA700, inside the cache: they are done
     ;; before the stub zeroes it.  The same :BOOT- values: the core is still
     ;; made on a big Mac.
     (:classic-2m :load #x00040000 :static-lo #x000D5000 :static-hi #x00178000
-              :region #x00178000 :heap-size #x00060000 :gc-guard #x00004000
+              ;; the low block's 56 KB, then two 100 KB semispaces: the region
+              ;; ends (base + heap-size - alloc-start + guard) at the kind map
+              :region #x00178000 :heap-size #x0004E000 :gc-guard #x00004000
               :alloc-start #x0000E000
               :kind-map #x001BC000 :cache-lo #x001C5000 :cache-hi #x001F6000
               :staging #x001F6000 :staging-size #x00000000

@@ -1790,12 +1790,30 @@
             ;; SYSCALL3 on a bare Mac is a Mac SERVICE: V0 the service, V1..V3
             ;; its arguments, all TAGGED; the result TAGGED in V0.  Service 1:
             ;; read V3 bytes from disk byte V1 of the boot drive to address V2
-            ;; (M68K-EMIT-MAC-SERVICE).  Any other: -1.
-            (let ((other (mvm-make-label)) (out (mvm-make-label)))
+            ;; (M68K-EMIT-MAC-SERVICE).  Service 2: _BlockMove.  Any other: -1.
+            (let ((other (mvm-make-label)) (out (mvm-make-label)) (svc1 (mvm-make-label)))
               (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
               (m68k-emit-asr-imm buf +68k-d0+ 1)
               (m68k-emit-cmpi buf +68k-d0+ 1)
+              (m68k-emit-beq buf svc1)
+              ;; Service 2: the ROM's _BlockMove of V3 bytes from address V1 to
+              ;; address V2 (overlap-safe; the console's scroll).  Result 0.
+              (m68k-emit-cmpi buf +68k-d0+ 2)
               (m68k-emit-bne buf other)
+              (dolist (w '(#x48E7 #x00C0)) (m68k-emit-word buf w))   ; MOVEM.L A0/A1,-(SP)
+              (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)
+              (m68k-emit-word buf #x2040)                            ; MOVEA.L D0,A0: from
+              (m68k-emit-move-dn-dn buf +68k-d4+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)
+              (m68k-emit-word buf #x2240)                            ; MOVEA.L D0,A1: to
+              (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d0+)
+              (m68k-emit-asr-imm buf +68k-d0+ 1)                     ; D0: bytes
+              (m68k-emit-word buf #xA02E)                            ; _BlockMove
+              (dolist (w '(#x4CDF #x0300)) (m68k-emit-word buf w))   ; MOVEM.L (SP)+,A0/A1
+              (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+              (m68k-emit-bra buf out)
+              (m68k-emit-label buf svc1)
               (m68k-emit-move-dn-dn buf +68k-d3+ +68k-d1+)
               (m68k-emit-asr-imm buf +68k-d1+ 1)
               (m68k-emit-move-dn-dn buf +68k-d5+ +68k-d2+)

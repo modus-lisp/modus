@@ -43,6 +43,7 @@ LEAF = {0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x60, 0x64, 0x65, 0x66}
 LOW_BYTES = [(0x6000, 0x6100),      # the static block's raw words (set by hand)
              (0x6100, 0x7F00),      # card marks
              (0x9000, 0x9800),      # serial parameter blocks, console state + font
+             (0xA000, 0xC000),      # the console's text buffer
              (0x1E000, 0x20000)]    # card crossing table
 
 
@@ -245,8 +246,12 @@ def main(image, disk):
     img0 = open(image, 'rb').read()
     img, resident, count = md.paged(img0)
     img = bytearray(img)
-    if LOAD + resident > STATIC_LO:
-        sys.exit('mac68k-core: the resident image (%d bytes) runs into the static heap' % resident)
+    # what must stay resident: up to the init-only text's marker, when there is
+    # one (the static heap is laid over that text; see below)
+    kept = img.find(b'modusINI', 0, resident)
+    kept = resident if kept < 0 else kept
+    if LOAD + kept > STATIC_LO:
+        sys.exit('mac68k-core: the resident image (%d bytes) runs into the static heap' % kept)
     # 1. the core run: the image as mac68k-disk.py --paged writes it, SAVE set
     run = bytearray(img)
     set_flag(run, 'save', 1)

@@ -599,6 +599,12 @@
         (setq *package* %kpkg)))))
 
 
+;; An image whose build compiled the macros above into image functions (the bare
+;; Mac: build-cl-repl-common.lisp, AOT RUNTIME MACROS) registers them here; their
+;; strings in the list are NIL then, which %RT-INSTALL-ONE skips.
+(declaim (overridable %install-aot-runtime-macros))
+(defun %install-aot-runtime-macros () nil)
+
 (defun %install-runtime-cl-macros ()
   "Eval each entry of *modus-runtime-macros* at boot.  The walks
    below are unrolled because a (loop … (%rt-install-one (car forms))
@@ -607,6 +613,7 @@
    fresh handler-case frame, calls 4+ install a #<INTERP-CLOSURE> but
    set-macro-function doesn't seem to actually puthash it.  Cause not
    yet diagnosed; unrolling sidesteps the issue completely."
+  (%install-aot-runtime-macros)
   (when (boundp '*modus-runtime-macros*)
     (let ((lst *modus-runtime-macros*))
       ;; NO handler-case here — wrapping each install with handler-case

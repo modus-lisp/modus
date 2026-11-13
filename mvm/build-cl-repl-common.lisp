@@ -3266,6 +3266,89 @@
         (error "mac68k: no name list after ~A in ~A" (second site) (first site)))
       (setf (gethash str *mac-init-only*) t))))
 
+;;; :MAC68K: AOT RUNTIME MACROS.  mvm/runtime-cl-macros.lisp keeps CL's runtime
+;;; macros (WHEN, DOTIMES, PUSH, CASE ...) as DEFMACRO strings that boot READs
+;;; and EVALs: each expander became an interpreted closure, 56 KB of bytecode in a
+;;; Classic's saved heap, and every expansion ran in the bytecode interpreter.
+;;; Here each string becomes an image function instead -- %RTM-k of the whole
+;;; form, binding the macro's (required + &REST) lambda list from its CDR -- that
+;;; the build compiles like any other, and %INSTALL-AOT-RUNTIME-MACROS registers
+;;; them as a runtime DEFMACRO would (%DEFINE-COMPILE-TIME-MACRO).  Its string in
+;;; the list becomes NIL, which the installer skips.  MODUS_MAC68K_AOT_MACROS=0
+;;; keeps the strings.
+(when (and *cl-repl-mac68k-p* (not (equal (sb-ext:posix-getenv "MODUS_MAC68K_AOT_MACROS") "0")))
+  (let* ((text (mvm-text "mvm/runtime-cl-macros.lisp"))
+         (at (or (search "(defvar *modus-runtime-macros*" text)
+                 (error "mac68k: no *MODUS-RUNTIME-MACROS* in runtime-cl-macros.lisp")))
+         (spans nil) (defs nil) (regs nil) (k 0)
+         (rt (copy-readtable nil))
+         (string-reader (get-macro-character #\" rt)))
+    ;; read the list, noting where each string literal starts and ends
+    (set-macro-character #\"
+                         (lambda (stream ch)
+                           (let ((start (1- (file-position stream)))
+                                 (str (funcall string-reader stream ch)))
+                             (push (list start (file-position stream) str) spans)
+                             str))
+                         nil rt)
+    (with-input-from-string (in text :start at)
+      (let ((*readtable* rt) (*package* (make-package (gensym "RTM") :use '(:cl))))
+        (read in)))
+    (setq spans (reverse spans))
+    (dolist (sp spans)
+      (let ((src (third sp)))
+        (unless (and (> (length src) 10) (string-equal (subseq src 0 10) "(defmacro "))
+          (error "mac68k: ~S in *MODUS-RUNTIME-MACROS* is not a DEFMACRO" (subseq src 0 (min 40 (length src)))))
+        (let ((*package* (make-package (gensym "RTM") :use '(:cl))))
+          (multiple-value-bind (name p1) (read-from-string src t nil :start 10)
+            (multiple-value-bind (params p2) (read-from-string src t nil :start p1)
+              (let ((req nil) (rest nil) (body (subseq src p2 (position #\) src :from-end t))))
+                ;; compiled in MODUS-INT, where boot read the strings; the
+                ;; runtime's own helpers they call are named as such
+                (dolist (h '("%correctable-case-form" "%rmw-place"
+                             "%apply-setf-expander" "%find-setf-expander"))
+                  (loop for i = (search (format nil "(~A " h) body) while i
+                        do (setq body (concatenate 'string (subseq body 0 (1+ i)) "modus.runtime::"
+                                                   (subseq body (1+ i))))))
+                (loop for (x . more) on params
+                      do (cond ((string= (symbol-name x) "&REST") (setq rest (car more)) (return))
+                               ((char= (char (symbol-name x) 0) #\&)
+                                (error "mac68k: ~A's lambda list ~S" name params))
+                               (t (push x req))))
+                (setq req (nreverse req))
+                (push (format nil "(defun %rtm-~D (%rtm-form)~%  (let* ((%rtm-args (cdr %rtm-form))~{~%         ~A~})~%    %rtm-args~%~A))~%"
+                              k
+                              (append (loop for r in req for i from 0
+                                            collect (format nil "(~A (nth ~D %rtm-args))" (symbol-name r) i))
+                                      (when rest
+                                        (list (format nil "(~A (nthcdr ~D %rtm-args))" (symbol-name rest) (length req)))))
+                              body)
+                      defs)
+                (push (format nil "    (funcall def (intern ~S int) (function %rtm-~D))~%"
+                              (symbol-name name) k)
+                      regs)
+                (incf k)))))))
+    ;; the strings out of the list (from the end, so earlier spans stay put)
+    (dolist (sp (reverse spans))
+      (setq text (concatenate 'string (subseq text 0 (+ at (first sp))) "nil"
+                              (subseq text (+ at (second sp))))))
+    ;; ... and the expanders in their place, in the runtime's own package (the
+    ;; bodies call its internals, %RMW-PLACE and the like)
+    (let* ((default "(defun %install-aot-runtime-macros () nil)")
+           (d (or (search default text)
+                  (error "mac68k: no default %INSTALL-AOT-RUNTIME-MACROS in runtime-cl-macros.lisp"))))
+      (setq text (concatenate 'string (subseq text 0 d)
+                              ;; registered as a runtime DEFMACRO registers its
+                              ;; expander; the compiler's function by name, since it
+                              ;; is MODUS-INT's and this is the runtime's package
+                              (format nil "~{~A~}(defun %install-aot-runtime-macros ()~%  (let* ((int (find-package \"MODUS-INT\"))~%         (def (fdefinition (intern \"%DEFINE-COMPILE-TIME-MACRO\" int)))~%         (old *package*))~%    ;; in MODUS-INT, as %RT-INSTALL-ONE read and evaluated the strings~%    (setq *package* int)~%~{~A~}    (setq *package* old))~%  t)"
+                                      (reverse defs) (reverse regs))
+                              (subseq text (+ d (length default))))))
+    (when (boundp 'cl-user::*rt-macros-source*)
+      (error "mac68k: *RT-MACROS-SOURCE* is already set; the AOT macros would be lost"))
+    (defvar cl-user::*rt-macros-source* text)   ; build-cli-common's (in CL-USER)
+    (format t "~&;; mac68k: ~D runtime macros compiled into the image~%" k)))
+
 ;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
 ;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
 ;;; to switch them off in, no sockets or threads for them to wrap, and the text
@@ -3415,8 +3498,8 @@
 ;;; 106 functions build-cli-common bakes for the self-host checks, which a Mac
 ;;; never runs).  DEFVAR before the load keeps these values.
 (when (and *cl-repl-mac68k-p* (not (%rpi-cull-p "MODUS_MAC68K_TEST_AUX")))
-  (defvar modus.mvm::*stage1-test-source* "")
-  (defvar modus.mvm::*stage2-test-source* ""))
+  (defvar cl-user::*stage1-test-source* "")   ; build-cli-common's (in CL-USER)
+  (defvar cl-user::*stage2-test-source* ""))
 
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))

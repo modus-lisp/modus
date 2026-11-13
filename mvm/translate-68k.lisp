@@ -5302,9 +5302,14 @@
             (ws #x2144 #x002E)                                 ; ioPosOffset = D4
             (ws #xA002)                                        ; _Read
             (ws #x4A40) (m68k-emit-bne buf ill-read))
-          ;; slide the stream down to A4: A2 = A4 + skip, D6 bytes, upward (dest < src)
-          (ws #x244C #xD5C3 #x264C #x2006)
-          (ws #x5380 #x6B04 #x16DA #x60F8)
+          ;; slide the stream down to A4: A2 = A4 + skip, D6 bytes, upward (dest < src),
+          ;; a LONGWORD at a time -- streams are 4-aligned and so are their lengths
+          ;; and the skip (a home address mod 512); a byte at a time was ~40 cycles
+          ;; a byte, measured as 15% of a DEFMACRO on a 1 MB Mac Plus
+          (ws #x244C #xD5C3 #x264C #x2006)                     ; A2, A3, D0 = length
+          (ws #x5680 #xE488)                                   ; ADDQ.L #3,D0; LSR.L #2,D0
+          (ws #x5340 #x6B06)                                   ; SUBQ.W #1,D0; BMI.S done
+          (ws #x26DA #x51C8 #xFFFC)                            ; MOVE.L (A2)+,(A3)+; DBRA D0
           ;; the owner map: the stream's granules are now index + 1
           (ws #x200C #x90B9) (l32 (conv-real +68k-cache-map+))   ; D0 = A4 - map base
           (ws #xEC88 #xD080)                                   ; first granule's word

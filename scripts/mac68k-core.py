@@ -333,6 +333,7 @@ def main(image, disk):
         if k < 0 or LOAD + k > INIT_BASE:
             sys.exit('mac68k-core: no init-only text to put at #%x' % INIT_BASE)
         body = run[:k] + bytes(INIT_BASE - LOAD - k) + run[k:resident]
+        body += bytes(-len(body) % 512)     # streams keep their homes' alignment on disk
         d = body.find(b'modusPGD')
         sect, = struct.unpack_from('>I', body, d + 16)
         struct.pack_into('>I', body, d + 20, (sect - (1024 + len(body))) & 0xFFFFFFFF)

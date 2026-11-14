@@ -65,6 +65,7 @@
    #:frame-enter-code-p #:frame-enter-nparams #:frame-enter-slots
    #:encode-frame-enter #:function-frame-slots
    #:+op-mul26lo+ #:+op-mul26hi+
+   #:+op-w32-li+ #:+op-w32-add+ #:+op-w32-sub+ #:+op-w32-mul+ #:+op-w32-mulhu+ #:+op-w32-and+ #:+op-w32-or+ #:+op-w32-xor+ #:+op-w32-not+ #:+op-w32-shl+ #:+op-w32-shr+ #:+op-w32-sar+ #:+op-w32-rotl+ #:+op-w32-ltu+ #:+op-w32-lts+ #:+op-w32-eq+ #:+op-w32-from-fix+ #:+op-w32-hi16+ #:+op-w32-lo16+ #:+op-w32-join+ #:+op-w32-load+ #:+op-w32-store+
    #:+op-mulsplit-lo+ #:+op-mulsplit-hi+
    #:+op-mul64lo+ #:+op-mul64hi+ #:+op-acc128+
    #:+op-sap-new+ #:+op-sap-ref8+ #:+op-sap-ref32+ #:+op-sap-ref64+
@@ -141,6 +142,7 @@
    #:mvm-fn-addr
    #:mvm-trap #:mvm-rdtsc
    #:mvm-mul26lo #:mvm-mul26hi
+   #:mvm-w32-li #:mvm-w32-add #:mvm-w32-sub #:mvm-w32-mul #:mvm-w32-mulhu #:mvm-w32-and #:mvm-w32-or #:mvm-w32-xor #:mvm-w32-not #:mvm-w32-shl #:mvm-w32-shr #:mvm-w32-sar #:mvm-w32-rotl #:mvm-w32-ltu #:mvm-w32-lts #:mvm-w32-eq #:mvm-w32-from-fix #:mvm-w32-hi16 #:mvm-w32-lo16 #:mvm-w32-join #:mvm-w32-load #:mvm-w32-store
    #:mvm-mulsplit-lo #:mvm-mulsplit-hi
    #:mvm-mul64lo #:mvm-mul64hi #:mvm-acc128
    #:mvm-sap-new #:mvm-sap-ref8 #:mvm-sap-ref32 #:mvm-sap-ref64
@@ -438,6 +440,34 @@
 (defconstant +op-percpu-ref+ #xA5)  ; (percpu-ref Vd offset:imm16) - reg + imm16
 (defconstant +op-percpu-set+ #xA6)  ; (percpu-set offset:imm16 Vs) - imm16 + reg
 (defconstant +op-fn-addr+   #xA7)  ; (fn-addr Vd target:imm32) - load tagged function address
+
+;; W32: native 32-bit words on the 30-bit targets (docs/w32.md, spec 4.4).
+;; A W32 operand is an UNTAGGED 32-bit machine word in an ordinary GPR vreg.
+;; Emitted only when the compilation's target is w32-capable (CT-W32-CAPABLE-P)
+;; -- never on a 64-bit target -- and only where no GC point separates a raw
+;; word from its last use (spec C3).  Semantics: interp.lisp, %W32-BINOP & co.
+(defconstant +op-w32-li+ #x69)  ; Vd = imm32 (raw word)
+(defconstant +op-w32-add+ #x6A)  ; (a + b) mod 2^32
+(defconstant +op-w32-sub+ #x6B)  ; (a - b) mod 2^32
+(defconstant +op-w32-mul+ #x6C)  ; (a * b) mod 2^32
+(defconstant +op-w32-mulhu+ #x6D)  ; floor(a*b / 2^32), unsigned
+(defconstant +op-w32-and+ #x6E)  ; a AND b
+(defconstant +op-w32-or+ #x6F)  ; a OR b
+(defconstant +op-w32-xor+ #x73)  ; a XOR b
+(defconstant +op-w32-not+ #x74)  ; NOT a
+(defconstant +op-w32-shl+ #x75)  ; (a << n) mod 2^32, n 0..31
+(defconstant +op-w32-shr+ #x76)  ; a >> n logical, n 0..31
+(defconstant +op-w32-sar+ #x77)  ; a >> n arithmetic, n 0..31
+(defconstant +op-w32-rotl+ #x78)  ; rotate left by n, n 0..31
+(defconstant +op-w32-ltu+ #x79)  ; tagged fixnum 1/0: a < b unsigned
+(defconstant +op-w32-lts+ #x7A)  ; tagged fixnum 1/0: a < b signed
+(defconstant +op-w32-eq+ #x7B)  ; tagged fixnum 1/0: a = b
+(defconstant +op-w32-from-fix+ #x7C)  ; tagged fixnum Vs -> its value mod 2^32
+(defconstant +op-w32-hi16+ #x7D)  ; tagged fixnum of bits 31..16
+(defconstant +op-w32-lo16+ #x7E)  ; tagged fixnum of bits 15..0
+(defconstant +op-w32-join+ #x7F)  ; Vhi, Vlo tagged fixnums 0..65535 -> hi*2^16+lo
+(defconstant +op-w32-load+ #x84)  ; 32 bits at raw Vaddr+off, CPU order, raw
+(defconstant +op-w32-store+ #x85)  ; (w32-store Vaddr Vs off): 32 raw bits at raw Vaddr+off
 
 ;; Wide multiply with 26-bit split (for crypto field arithmetic on 32-bit targets)
 (defconstant +op-mul26lo+  #xA8)  ; (mul26lo Vd Va Vb) - low 26 bits of untag(Va)*untag(Vb), tagged
@@ -748,6 +778,30 @@
 (defopcode :percpu-ref #xA5 (:reg :imm16)         "Per-CPU data read")
 (defopcode :percpu-set #xA6 (:imm16 :reg)         "Per-CPU data write")
 (defopcode :fn-addr   #xA7 (:reg :imm32)          "Load tagged function address")
+
+;; W32 (docs/w32.md)
+(defopcode :w32-li #x69 (:reg :imm32) "W32: Vd = imm32 (raw word)")
+(defopcode :w32-add #x6A (:reg :reg :reg) "W32: (a + b) mod 2^32")
+(defopcode :w32-sub #x6B (:reg :reg :reg) "W32: (a - b) mod 2^32")
+(defopcode :w32-mul #x6C (:reg :reg :reg) "W32: (a * b) mod 2^32")
+(defopcode :w32-mulhu #x6D (:reg :reg :reg) "W32: floor(a*b / 2^32), unsigned")
+(defopcode :w32-and #x6E (:reg :reg :reg) "W32: a AND b")
+(defopcode :w32-or #x6F (:reg :reg :reg) "W32: a OR b")
+(defopcode :w32-xor #x73 (:reg :reg :reg) "W32: a XOR b")
+(defopcode :w32-not #x74 (:reg :reg) "W32: NOT a")
+(defopcode :w32-shl #x75 (:reg :reg :imm8) "W32: (a << n) mod 2^32, n 0..31")
+(defopcode :w32-shr #x76 (:reg :reg :imm8) "W32: a >> n logical, n 0..31")
+(defopcode :w32-sar #x77 (:reg :reg :imm8) "W32: a >> n arithmetic, n 0..31")
+(defopcode :w32-rotl #x78 (:reg :reg :imm8) "W32: rotate left by n, n 0..31")
+(defopcode :w32-ltu #x79 (:reg :reg :reg) "W32: tagged fixnum 1/0: a < b unsigned")
+(defopcode :w32-lts #x7A (:reg :reg :reg) "W32: tagged fixnum 1/0: a < b signed")
+(defopcode :w32-eq #x7B (:reg :reg :reg) "W32: tagged fixnum 1/0: a = b")
+(defopcode :w32-from-fix #x7C (:reg :reg) "W32: tagged fixnum Vs -> its value mod 2^32")
+(defopcode :w32-hi16 #x7D (:reg :reg) "W32: tagged fixnum of bits 31..16")
+(defopcode :w32-lo16 #x7E (:reg :reg) "W32: tagged fixnum of bits 15..0")
+(defopcode :w32-join #x7F (:reg :reg :reg) "W32: Vhi, Vlo tagged fixnums 0..65535 -> hi*2^16+lo")
+(defopcode :w32-load #x84 (:reg :reg :imm8) "W32: 32 bits at raw Vaddr+off, CPU order, raw")
+(defopcode :w32-store #x85 (:reg :reg :imm8) "W32: (w32-store Vaddr Vs off): 32 raw bits at raw Vaddr+off")
 
 ;; Wide multiply with 26-bit split (crypto field arithmetic)
 (defopcode :mul26lo  #xA8 (:reg :reg :reg)        "Low 26 bits of wide multiply, tagged")
@@ -1576,6 +1630,72 @@
 
 (defun mvm-fn-addr (buf vd target)
   (encode-instruction buf +op-fn-addr+ vd target))
+
+(defun mvm-w32-li (buf vd imm)
+  (encode-instruction buf +op-w32-li+ vd imm))
+
+(defun mvm-w32-add (buf vd va vb)
+  (encode-instruction buf +op-w32-add+ vd va vb))
+
+(defun mvm-w32-sub (buf vd va vb)
+  (encode-instruction buf +op-w32-sub+ vd va vb))
+
+(defun mvm-w32-mul (buf vd va vb)
+  (encode-instruction buf +op-w32-mul+ vd va vb))
+
+(defun mvm-w32-mulhu (buf vd va vb)
+  (encode-instruction buf +op-w32-mulhu+ vd va vb))
+
+(defun mvm-w32-and (buf vd va vb)
+  (encode-instruction buf +op-w32-and+ vd va vb))
+
+(defun mvm-w32-or (buf vd va vb)
+  (encode-instruction buf +op-w32-or+ vd va vb))
+
+(defun mvm-w32-xor (buf vd va vb)
+  (encode-instruction buf +op-w32-xor+ vd va vb))
+
+(defun mvm-w32-not (buf vd vs)
+  (encode-instruction buf +op-w32-not+ vd vs))
+
+(defun mvm-w32-shl (buf vd vs n)
+  (encode-instruction buf +op-w32-shl+ vd vs n))
+
+(defun mvm-w32-shr (buf vd vs n)
+  (encode-instruction buf +op-w32-shr+ vd vs n))
+
+(defun mvm-w32-sar (buf vd vs n)
+  (encode-instruction buf +op-w32-sar+ vd vs n))
+
+(defun mvm-w32-rotl (buf vd vs n)
+  (encode-instruction buf +op-w32-rotl+ vd vs n))
+
+(defun mvm-w32-ltu (buf vd va vb)
+  (encode-instruction buf +op-w32-ltu+ vd va vb))
+
+(defun mvm-w32-lts (buf vd va vb)
+  (encode-instruction buf +op-w32-lts+ vd va vb))
+
+(defun mvm-w32-eq (buf vd va vb)
+  (encode-instruction buf +op-w32-eq+ vd va vb))
+
+(defun mvm-w32-from-fix (buf vd vs)
+  (encode-instruction buf +op-w32-from-fix+ vd vs))
+
+(defun mvm-w32-hi16 (buf vd vs)
+  (encode-instruction buf +op-w32-hi16+ vd vs))
+
+(defun mvm-w32-lo16 (buf vd vs)
+  (encode-instruction buf +op-w32-lo16+ vd vs))
+
+(defun mvm-w32-join (buf vd va vb)
+  (encode-instruction buf +op-w32-join+ vd va vb))
+
+(defun mvm-w32-load (buf vd vaddr off)
+  (encode-instruction buf +op-w32-load+ vd vaddr off))
+
+(defun mvm-w32-store (buf vaddr vs off)
+  (encode-instruction buf +op-w32-store+ vaddr vs off))
 
 (defun mvm-mul26lo (buf vd va vb)
   (encode-instruction buf +op-mul26lo+ vd va vb))

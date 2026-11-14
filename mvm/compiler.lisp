@@ -3335,7 +3335,7 @@
 (defun ct-target-big-endian () (let ((c *compile-target*)) (if c (compile-target-big-endian c) +target-big-endian+)))
 (defun ct-target-soft-float () (let ((c *compile-target*)) (if c (compile-target-soft-float c) +target-soft-float+)))
 (defun ct-has-fpd-p () (let ((c *compile-target*)) (if c (compile-target-has-fpd c) *target-has-fpd-p*)))
-(defun ct-w32-capable-p () (let ((c *compile-target*)) (if c (compile-target-w32-capable c) nil)))
+(defun ct-w32-capable-p () (let ((c *compile-target*)) (if c (compile-target-w32-capable c) (eql +target-w32+ 1))))
 (defun ct-mv-count-addr () (let ((c *compile-target*)) (if c (compile-target-mv-count-addr c) +mv-count-addr+)))
 (defun ct-mv-values-addr () (let ((c *compile-target*)) (if c (compile-target-mv-values-addr c) +mv-values-addr+)))
 (defun ct-tag-cons () (let ((c *compile-target*)) (if c (compile-target-tag-cons c) +tag-cons+)))
@@ -8792,7 +8792,7 @@
     "LIDT" "NCONCING" "SYMBOLS" "STRINGP"
     "ACROSS" "<" "DEFPACKAGE" "%FLOAT-TO-INT"
     "NULL" "ROTATEF" "MUL26LO" "PERCPU-REF" "%APPLY-SPREAD"
-    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI"
+    "%MUL-SPLIT-LO" "%MUL-SPLIT-HI" "%W32"
     "GET-ALLOC-LIMIT" "BLOCK" ">" "COLLECTING"
     "USE-PACKAGE" "DOTIMES" "MEMORY-BARRIER" "%MAKE-FLOAT"
     "FIXNUMP" "EVAL-WHEN" "BIGNUMP" "ALWAYS"
@@ -10006,6 +10006,8 @@
       ((= op-name 421051478) (compile-mul26hi (cdr form) env dest))  ; MUL26HI
       ((= op-name #.(compute-name-hash "%MUL-SPLIT-LO")) (compile-mul-split (cdr form) env dest nil))
       ((= op-name #.(compute-name-hash "%MUL-SPLIT-HI")) (compile-mul-split (cdr form) env dest t))
+      ;; W32 M2: the test-only intrinsic (see COMPILE-W32)
+      ((= op-name #.(compute-name-hash "%W32")) (compile-w32 (cdr form) env dest))
       ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
       ((= op-name 12591721202407133616) (compile-mul64hi (cdr form) env dest))
       ((= op-name 920227542902379435) (compile-acc128 (cdr form) env dest))
@@ -23669,6 +23671,119 @@
       (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
             do (unless (= r dest) (emit-ir :pop r))))))
 
+;;; ---- (%W32 TREE): the W32 TEST INTRINSIC (docs/w32.md, M2) ---------------
+;;; TEST-ONLY.  M2 adds the W32 opcodes without the compiler choosing them on
+;;; its own (that is M3); this is how the rungs and the interpreter
+;;; differential reach them.  TREE compiles straight to W32 instructions:
+;;;
+;;;   root  (fixnum result in DEST):  (w32-hi16 W) (w32-lo16 W)
+;;;                                   (w32-ltu W W) (w32-lts W W) (w32-eq W W)
+;;;                                   (w32-store L OFF W) -> 0
+;;;   W     (raw word):  (w32-li N) (w32-from-fix L) (w32-join L L) (w32-load L OFF)
+;;;                      (w32-add|sub|mul|mulhu|and|or|xor W W) (w32-not W)
+;;;                      (w32-shl|shr|sar|rotl W N)
+;;;   L     a VARIABLE or a fixnum literal (an address L is the fixnum address,
+;;;         as MEM-REF takes; it is untagged here)
+;;;
+;;; Leaves are restricted to variables and literals so the whole tree is free
+;;; of calls and allocations BY CONSTRUCTION: no raw word is live across a GC
+;;; point (spec C3) without any analysis.  Shift counts and offsets must be
+;;; literals 0..31 / 0..255.  An error at compile time, not a silent fallback,
+;;; when the target is not W32-capable: a rung must not pass by not testing.
+(defparameter *w32-rrr-ops*
+  '(("W32-ADD" . :w32-add) ("W32-SUB" . :w32-sub) ("W32-MUL" . :w32-mul)
+    ("W32-MULHU" . :w32-mulhu) ("W32-AND" . :w32-and) ("W32-OR" . :w32-or)
+    ("W32-XOR" . :w32-xor) ("W32-LTU" . :w32-ltu) ("W32-LTS" . :w32-lts)
+    ("W32-EQ" . :w32-eq)))
+(defparameter *w32-shift-ops*
+  '(("W32-SHL" . :w32-shl) ("W32-SHR" . :w32-shr) ("W32-SAR" . :w32-sar)
+    ("W32-ROTL" . :w32-rotl)))
+
+(defun %w32-op-name (node)
+  (and (consp node) (symbolp (car node)) (symbol-name (car node))))
+
+(defun %w32-leaf (leaf env reg)
+  "Compile LEAF -- a variable or a fixnum literal -- into REG (a tagged value)."
+  (unless (or (and (symbolp leaf) leaf (not (eq leaf t)))
+              (and (integerp leaf) (>= leaf (ct-fixnum-min)) (<= leaf (ct-fixnum-max))))
+    (error "%W32: a leaf must be a variable or a fixnum literal, not ~S" leaf))
+  (compile-form leaf env reg))
+
+(defun %w32-node (node env dst)
+  "Compile the W32 subtree NODE; leave its RAW 32-bit word in DST."
+  (let* ((name (%w32-op-name node))
+         (rrr (and name (assoc name *w32-rrr-ops* :test #'string=)))
+         (sh (and name (assoc name *w32-shift-ops* :test #'string=))))
+    (cond
+      ((null name) (error "%W32: not a W32 form: ~S" node))
+      ((string= name "W32-LI")
+       (let ((n (cadr node)))
+         (unless (and (integerp n) (<= 0 n #xFFFFFFFF))
+           (error "%W32: w32-li needs a literal in [0, 2^32): ~S" node))
+         (emit-ir :w32-li dst n)))
+      ((string= name "W32-FROM-FIX")
+       (%w32-leaf (cadr node) env dst)
+       (emit-ir :w32-from-fix dst dst))
+      ((string= name "W32-JOIN")
+       (%w32-leaf (cadr node) env dst)
+       (let ((tmp (alloc-temp-reg)))
+         (%w32-leaf (caddr node) env tmp)
+         (emit-ir :w32-join dst dst tmp)
+         (free-temp-reg)))
+      ((string= name "W32-LOAD")
+       (let ((off (caddr node)))
+         (unless (and (integerp off) (<= 0 off 255))
+           (error "%W32: w32-load needs a literal offset 0..255: ~S" node))
+         (%w32-leaf (cadr node) env dst)
+         (emit-ir :shr dst dst +fixnum-shift+)
+         (emit-ir :w32-load dst dst off)))
+      ((string= name "W32-NOT")
+       (%w32-node (cadr node) env dst)
+       (emit-ir :w32-not dst dst))
+      (sh
+       (let ((n (caddr node)))
+         (unless (and (integerp n) (<= 0 n 31))
+           (error "%W32: ~A needs a literal count 0..31: ~S" name node))
+         (%w32-node (cadr node) env dst)
+         (emit-ir (cdr sh) dst dst n)))
+      (rrr
+       (%w32-node (cadr node) env dst)
+       (let ((tmp (alloc-temp-reg)))
+         (%w32-node (caddr node) env tmp)
+         (emit-ir (cdr rrr) dst dst tmp)
+         (free-temp-reg)))
+      (t (error "%W32: unknown W32 form ~S" node)))))
+
+(defun compile-w32 (args env dest)
+  "(%W32 TREE) -- see the block comment above."
+  (unless (ct-w32-capable-p)
+    (error "%W32: the target of this compilation is not W32-capable"))
+  (let* ((tree (car args))
+         (name (%w32-op-name tree)))
+    (cond
+      ((and name (or (string= name "W32-HI16") (string= name "W32-LO16")))
+       (%w32-node (cadr tree) env dest)
+       (emit-ir (if (string= name "W32-HI16") :w32-hi16 :w32-lo16) dest dest))
+      ((and name (or (string= name "W32-LTU") (string= name "W32-LTS")
+                     (string= name "W32-EQ")))
+       (%w32-node (cadr tree) env dest)
+       (let ((tmp (alloc-temp-reg)))
+         (%w32-node (caddr tree) env tmp)
+         (emit-ir (cdr (assoc name *w32-rrr-ops* :test #'string=)) dest dest tmp)
+         (free-temp-reg)))
+      ((and name (string= name "W32-STORE"))
+       (let ((off (caddr tree)))
+         (unless (and (integerp off) (<= 0 off 255))
+           (error "%W32: w32-store needs a literal offset 0..255: ~S" tree))
+         (%w32-leaf (cadr tree) env dest)
+         (emit-ir :shr dest dest +fixnum-shift+)
+         (let ((tmp (alloc-temp-reg)))
+           (%w32-node (car (cdddr tree)) env tmp)
+           (emit-ir :w32-store dest tmp off)
+           (free-temp-reg))
+         (emit-li-tagged dest 0)))
+      (t (error "%W32: the root must be w32-hi16/lo16/ltu/lts/eq/store: ~S" tree)))))
+
 (defun compile-mul26lo (args env dest)
   "Compile (mul26lo a b) — low 26 bits of untag(a)*untag(b), tagged.
    Uses MUL26LO opcode for hardware wide multiply on 32-bit targets."
@@ -30902,6 +31017,29 @@
       (:sub-checked 4)
       (:mul26lo 4)
       (:mul26hi 4)
+      ;; W32 (docs/w32.md): opcode + regs + imm
+      (:w32-li 6)
+      (:w32-add 4)
+      (:w32-sub 4)
+      (:w32-mul 4)
+      (:w32-mulhu 4)
+      (:w32-and 4)
+      (:w32-or 4)
+      (:w32-xor 4)
+      (:w32-not 3)
+      (:w32-shl 4)
+      (:w32-shr 4)
+      (:w32-sar 4)
+      (:w32-rotl 4)
+      (:w32-ltu 4)
+      (:w32-lts 4)
+      (:w32-eq 4)
+      (:w32-from-fix 3)
+      (:w32-hi16 3)
+      (:w32-lo16 3)
+      (:w32-join 4)
+      (:w32-load 4)
+      (:w32-store 4)
       (:mulsplit-lo 5)
       (:mulsplit-hi 5)
       (:mul64lo 4)
@@ -31368,6 +31506,50 @@
            (mvm-mul26lo buf (second insn) (third insn) (fourth insn)))
           (:mul26hi
            (mvm-mul26hi buf (second insn) (third insn) (fourth insn)))
+          (:w32-li
+           (mvm-w32-li buf (second insn) (third insn)))
+          (:w32-add
+           (mvm-w32-add buf (second insn) (third insn) (fourth insn)))
+          (:w32-sub
+           (mvm-w32-sub buf (second insn) (third insn) (fourth insn)))
+          (:w32-mul
+           (mvm-w32-mul buf (second insn) (third insn) (fourth insn)))
+          (:w32-mulhu
+           (mvm-w32-mulhu buf (second insn) (third insn) (fourth insn)))
+          (:w32-and
+           (mvm-w32-and buf (second insn) (third insn) (fourth insn)))
+          (:w32-or
+           (mvm-w32-or buf (second insn) (third insn) (fourth insn)))
+          (:w32-xor
+           (mvm-w32-xor buf (second insn) (third insn) (fourth insn)))
+          (:w32-not
+           (mvm-w32-not buf (second insn) (third insn)))
+          (:w32-shl
+           (mvm-w32-shl buf (second insn) (third insn) (fourth insn)))
+          (:w32-shr
+           (mvm-w32-shr buf (second insn) (third insn) (fourth insn)))
+          (:w32-sar
+           (mvm-w32-sar buf (second insn) (third insn) (fourth insn)))
+          (:w32-rotl
+           (mvm-w32-rotl buf (second insn) (third insn) (fourth insn)))
+          (:w32-ltu
+           (mvm-w32-ltu buf (second insn) (third insn) (fourth insn)))
+          (:w32-lts
+           (mvm-w32-lts buf (second insn) (third insn) (fourth insn)))
+          (:w32-eq
+           (mvm-w32-eq buf (second insn) (third insn) (fourth insn)))
+          (:w32-from-fix
+           (mvm-w32-from-fix buf (second insn) (third insn)))
+          (:w32-hi16
+           (mvm-w32-hi16 buf (second insn) (third insn)))
+          (:w32-lo16
+           (mvm-w32-lo16 buf (second insn) (third insn)))
+          (:w32-join
+           (mvm-w32-join buf (second insn) (third insn) (fourth insn)))
+          (:w32-load
+           (mvm-w32-load buf (second insn) (third insn) (fourth insn)))
+          (:w32-store
+           (mvm-w32-store buf (second insn) (third insn) (fourth insn)))
           (:mulsplit-lo
            (mvm-mulsplit-lo buf (second insn) (third insn) (fourth insn) (fifth insn)))
           (:mulsplit-hi

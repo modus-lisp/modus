@@ -185,6 +185,55 @@
   "Store machine word W (an exact integer, already machine-width) into VD."
   (setf (svref regs vd) (%mvm-word->val w)))
 
+;;; ---- W32 semantics (docs/w32.md; spec 4.4, C4) ---------------------------
+;;; Defined on the MATHEMATICAL value: a W32 operand is an integer in
+;;; [0, 2^32), "mod" is mod 2^32, a shift count is 0..31 (the compiler
+;;; guarantees it), and ltu/lts/eq/hi16/lo16 answer FIXNUMS.  These are the
+;;; reference every translator's arm is tested against.
+(defun %w32-s32 (x) (if (>= x #x80000000) (- x #x100000000) x))
+(defun %w32-binop (op a b)
+  (cond ((eql op #.+op-w32-add+)   (logand (+ a b) #xFFFFFFFF))
+        ((eql op #.+op-w32-sub+)   (logand (- a b) #xFFFFFFFF))
+        ((eql op #.+op-w32-mul+)   (logand (* a b) #xFFFFFFFF))
+        ((eql op #.+op-w32-mulhu+) (ash (* a b) -32))
+        ((eql op #.+op-w32-and+)   (logand a b))
+        ((eql op #.+op-w32-or+)    (logior a b))
+        ((eql op #.+op-w32-xor+)   (logxor a b))
+        ((eql op #.+op-w32-ltu+)   (if (< a b) 1 0))
+        ((eql op #.+op-w32-lts+)   (if (< (%w32-s32 a) (%w32-s32 b)) 1 0))
+        ((eql op #.+op-w32-eq+)    (if (= a b) 1 0))
+        ;; join: A and B are FIXNUMS 0..65535, the two halves
+        (t                         (logand (+ (ash a 16) b) #xFFFFFFFF))))
+(defun %w32-unop (op a)
+  (cond ((eql op #.+op-w32-not+)      (logxor a #xFFFFFFFF))
+        ;; from-fix: A is a FIXNUM; its value mod 2^32, two's complement
+        ((eql op #.+op-w32-from-fix+) (logand a #xFFFFFFFF))
+        ((eql op #.+op-w32-hi16+)     (ash a -16))
+        (t                            (logand a #xFFFF))))      ; lo16
+(defun %w32-shift (op a n)
+  (cond ((eql op #.+op-w32-shl+) (logand (ash a n) #xFFFFFFFF))
+        ((eql op #.+op-w32-shr+) (ash a (- 0 n)))
+        ((eql op #.+op-w32-sar+) (logand (ash (%w32-s32 a) (- 0 n)) #xFFFFFFFF))
+        (t                       (logand (logior (ash a n) (ash a (- n 32))) #xFFFFFFFF))))
+(defun %w32-step-rrr (regs bc pc op)
+  "(op Vd Va Vb): set Vd, return the next PC."
+  (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+    (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+      (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
+        (setf (svref regs vd) (%w32-binop op (svref regs va) (svref regs vb)))
+        npc3))))
+(defun %w32-step-rr (regs bc pc op)
+  (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+    (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+      (setf (svref regs vd) (%w32-unop op (svref regs vs)))
+      npc2)))
+(defun %w32-step-ri (regs bc pc op)
+  (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+    (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+      (multiple-value-bind (n npc3) (%ifetch-byte bc npc2)
+        (setf (svref regs vd) (%w32-shift op (svref regs vs) n))
+        npc3))))
+
 (defun %mvm-untag-value (v)
   "untag(word(V)) -- the fixnum V itself when it is one, without a round trip."
   (if (typep v 'fixnum) v (ash (%mvm-word v) -1)))
@@ -2588,6 +2637,55 @@
                  (let ((product (* (%mvm-untag-value (svref regs va))
                                    (%mvm-untag-value (svref regs vb)))))
                    (reg-set regs vd (tag-fixnum (logand product #x3FFFFFF))))
+                 (setf pc npc3)))))
+
+          ;; ---- W32: native 32-bit words (docs/w32.md, spec 4.4) -------------
+          ;; THE SEMANTIC ORACLE.  A W32 register here holds the Lisp INTEGER
+          ;; in [0, 2^32) that the machine word means -- a bignum on a 30-bit
+          ;; tower, which the collector traces like any value -- stored with
+          ;; SVREF, not REG-SET (it is a value, not a tagged word).  Fixnum
+          ;; results (ltu/lts/eq, hi16/lo16) are stored as fixnum values the
+          ;; same way.  Every opcode is defined on those mathematical values;
+          ;; the translators implement the same thing on the machine word.
+          (#.+op-w32-add+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-add+)))
+          (#.+op-w32-sub+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-sub+)))
+          (#.+op-w32-mul+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-mul+)))
+          (#.+op-w32-mulhu+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-mulhu+)))
+          (#.+op-w32-and+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-and+)))
+          (#.+op-w32-or+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-or+)))
+          (#.+op-w32-xor+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-xor+)))
+          (#.+op-w32-ltu+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-ltu+)))
+          (#.+op-w32-lts+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-lts+)))
+          (#.+op-w32-eq+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-eq+)))
+          (#.+op-w32-join+ (setf pc (%w32-step-rrr regs bc pc #.+op-w32-join+)))
+          (#.+op-w32-not+ (setf pc (%w32-step-rr regs bc pc #.+op-w32-not+)))
+          (#.+op-w32-from-fix+ (setf pc (%w32-step-rr regs bc pc #.+op-w32-from-fix+)))
+          (#.+op-w32-hi16+ (setf pc (%w32-step-rr regs bc pc #.+op-w32-hi16+)))
+          (#.+op-w32-lo16+ (setf pc (%w32-step-rr regs bc pc #.+op-w32-lo16+)))
+          (#.+op-w32-shl+ (setf pc (%w32-step-ri regs bc pc #.+op-w32-shl+)))
+          (#.+op-w32-shr+ (setf pc (%w32-step-ri regs bc pc #.+op-w32-shr+)))
+          (#.+op-w32-sar+ (setf pc (%w32-step-ri regs bc pc #.+op-w32-sar+)))
+          (#.+op-w32-rotl+ (setf pc (%w32-step-ri regs bc pc #.+op-w32-rotl+)))
+          (#.+op-w32-li+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (imm npc2) (%ifetch-u32 bc npc)
+               (setf (svref regs vd) imm)
+               (setf pc npc2))))
+          (#.+op-w32-load+
+           ;; (w32-load Vd Vaddr off) -- Vaddr holds a RAW address, as :load's
+           ;; does; 32 bits in CPU byte order (MEM-READ follows the target).
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vaddr npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (off npc3) (%ifetch-byte bc npc2)
+                 (setf (svref regs vd)
+                       (mem-read state (+ (reg-get regs vaddr) off) 2))
+                 (setf pc npc3)))))
+          (#.+op-w32-store+
+           ;; (w32-store Vaddr Vs off)
+           (multiple-value-bind (vaddr npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (off npc3) (%ifetch-byte bc npc2)
+                 (mem-write state (+ (reg-get regs vaddr) off) (svref regs vs) 2)
                  (setf pc npc3)))))
 
           (#.+op-mul26hi+

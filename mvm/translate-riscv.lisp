@@ -334,6 +334,10 @@
   "SLT rd, rs1, rs2 (set less than, signed)"
   (rv-emit-u32 buf (rv-encode-r-type #x00 rs2 rs1 #x2 rd #x33)))
 
+(defun rv-emit-sltu (buf rd rs1 rs2)
+  "SLTU rd, rs1, rs2 (set less than, unsigned).  W32's w32-ltu."
+  (rv-emit-u32 buf (rv-encode-r-type #x00 rs2 rs1 #x3 rd #x33)))
+
 ;; --- RV64 R-type word ops (opcode #b0111011 = #x3B) ---
 
 (defun rv-emit-addw (buf rd rs1 rs2)
@@ -1190,6 +1194,74 @@
   (let ((tmp (make-rv-buffer)))
     (rv-emit-genarith-call tmp ra rb 0 nil)
     (rv-current-offset tmp)))
+
+;;; ============================================================
+;;; W32 (RV32 only; see the arm in TRANSLATE-MVM-INSN-RISCV)
+;;; ============================================================
+(defun rv-translate-w32 (buf op o0 o1 o2)
+  "Emit one W32 opcode on RV32.  O0..O2 are its decoded operands (registers,
+   or the immediate in its place).  A vreg is put in a physical register as
+   TRANSLATE-MVM-INSN-RISCV's RESOLVE / RESOLVE2 do (t0 / t1 when spilled), and
+   results go back through t0.  Plain calls, not the arm's local functions, so
+   nothing here closes over them (this file is baked into modus-sh)."
+  (let ((t0 +rv-t0+) (t1 +rv-t1+))
+    (cond
+      ((= op +op-w32-li+)
+       (rv-emit-li buf t0 o1)
+       (rv-store-vreg buf o0 t0))
+      ((= op +op-w32-store+)
+       ;; (w32-store Vaddr Vs off): Vaddr holds a RAW address
+       (let ((ra (rv-vreg-or-load buf o0 t0)) (rs (rv-vreg-or-load buf o1 t1)))
+         (rv-emit-sw buf rs ra o2)))
+      ((= op +op-w32-load+)
+       (let ((ra (rv-vreg-or-load buf o1 t0)))
+         (rv-emit-lw buf t0 ra o2)
+         (rv-store-vreg buf o0 t0)))
+      ((or (= op +op-w32-not+) (= op +op-w32-from-fix+)
+           (= op +op-w32-hi16+) (= op +op-w32-lo16+))
+       (let ((rs (rv-vreg-or-load buf o1 t0)))
+         (cond ((= op +op-w32-not+)      (rv-emit-not buf t0 rs))
+               ((= op +op-w32-from-fix+) (rv-emit-srai buf t0 rs 1))   ; untag
+               ((= op +op-w32-hi16+)     (rv-emit-srli buf t0 rs 16)
+                                         (rv-emit-slli buf t0 t0 1))   ; tag
+               (t                        (rv-emit-slli buf t0 rs 16)   ; lo16:
+                                         (rv-emit-srli buf t0 t0 15))) ; lo<<1, tagged
+         (rv-store-vreg buf o0 t0)))
+      ((or (= op +op-w32-shl+) (= op +op-w32-shr+) (= op +op-w32-sar+)
+           (= op +op-w32-rotl+))
+       (let ((rs (rv-vreg-or-load buf o1 t0)) (n o2))
+         (cond ((= op +op-w32-shl+) (rv-emit-slli buf t0 rs n))
+               ((= op +op-w32-shr+) (rv-emit-srli buf t0 rs n))
+               ((= op +op-w32-sar+) (rv-emit-srai buf t0 rs n))
+               ((= n 0)             (rv-emit-mv buf t0 rs))
+               ;; rotl: the right half first, into t1 -- RS may BE t0
+               (t (rv-emit-srli buf t1 rs (- 32 n))
+                  (rv-emit-slli buf t0 rs n)
+                  (rv-emit-or buf t0 t0 t1)))
+         (rv-store-vreg buf o0 t0)))
+      ((= op +op-w32-join+)
+       ;; o1, o2: tagged fixnums 0..65535 (hi<<1, lo<<1) -> hi*2^16 + lo
+       (let ((ra (rv-vreg-or-load buf o1 t0)))
+         (rv-emit-slli buf t0 ra 15)                 ; (hi<<1)<<15 = hi<<16
+         (let ((rb (rv-vreg-or-load buf o2 t1)))
+           (rv-emit-srli buf t1 rb 1)                ; untag lo
+           (rv-emit-or buf t0 t0 t1)))
+       (rv-store-vreg buf o0 t0))
+      (t
+       (let ((ra (rv-vreg-or-load buf o1 t0)) (rb (rv-vreg-or-load buf o2 t1)))
+         (cond ((= op +op-w32-add+)   (rv-emit-add buf t0 ra rb))
+               ((= op +op-w32-sub+)   (rv-emit-sub buf t0 ra rb))
+               ((= op +op-w32-mul+)   (rv-emit-mul buf t0 ra rb))
+               ((= op +op-w32-mulhu+) (rv-emit-mulhu buf t0 ra rb))
+               ((= op +op-w32-and+)   (rv-emit-and buf t0 ra rb))
+               ((= op +op-w32-or+)    (rv-emit-or buf t0 ra rb))
+               ((= op +op-w32-xor+)   (rv-emit-xor buf t0 ra rb))
+               ((= op +op-w32-ltu+)   (rv-emit-sltu buf t0 ra rb) (rv-emit-slli buf t0 t0 1))
+               ((= op +op-w32-lts+)   (rv-emit-slt buf t0 ra rb) (rv-emit-slli buf t0 t0 1))
+               (t                     (rv-emit-xor buf t0 ra rb)            ; eq
+                                      (rv-emit-seqz buf t0 t0)
+                                      (rv-emit-slli buf t0 t0 1)))
+         (rv-store-vreg buf o0 t0))))))
 
 (defun translate-mvm-insn-riscv (buf opcode operands mvm-pc
                                   &key (pass2 nil) label-map function-table)
@@ -3102,6 +3174,26 @@
        (let ((tagged (ash (vreg 0) 1)))
          (rv-emit-li buf +rv-t2+ tagged)
          (rv-emit-store-abs buf +rv-t2+ (ct-mv-count-addr))))
+
+;; ---- W32: native 32-bit words (docs/w32.md, spec 4.4) ----------------
+      ;; RV32 ONLY: a W32 operand is a raw word in a 32-bit register, so each
+      ;; op is one RV32 instruction (and a tag where the result is a fixnum).
+      ;; On RV64 there is no such word in a register, and the compiler never
+      ;; emits these for a 64-bit target (C1); reaching one there is recorded
+      ;; as a gap and traps, like any unimplemented opcode.  Scratch: RESOLVE
+      ;; loads into t0, RESOLVE2 into t1, results go through t0 -- each arm
+      ;; orders its steps so a source living in t0/t1 is read before it is
+      ;; overwritten.
+      ((#.+op-w32-li+ #.+op-w32-add+ #.+op-w32-sub+ #.+op-w32-mul+ #.+op-w32-mulhu+
+        #.+op-w32-and+ #.+op-w32-or+ #.+op-w32-xor+ #.+op-w32-not+
+        #.+op-w32-shl+ #.+op-w32-shr+ #.+op-w32-sar+ #.+op-w32-rotl+
+        #.+op-w32-ltu+ #.+op-w32-lts+ #.+op-w32-eq+ #.+op-w32-from-fix+
+        #.+op-w32-hi16+ #.+op-w32-lo16+ #.+op-w32-join+ #.+op-w32-load+ #.+op-w32-store+)
+       (if *riscv-64-bit*
+           (progn (rv-note-unimpl opcode)
+                  (rv-emit-addi buf +rv-a7+ +rv-x0+ opcode)
+                  (rv-emit-ebreak buf))
+           (rv-translate-w32 buf opcode (vreg 0) (vreg 1) (vreg 2))))
 
       ;; ---- Unknown opcode ----
       (otherwise

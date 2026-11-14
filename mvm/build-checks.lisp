@@ -1877,7 +1877,7 @@ that no list has ***~%" (length missing))
     "+FIXNUM-HALF+" "+FIXNUM-NEG-HALF+" "+FIXNUM-HALF-MAX+" "+FIXNUM-SIGNED-BITS+"
     "+FIXNUM-BITS-1+" "+LIMB-BITS+" "+LIMB-BITS-1+" "+LIMB-SPLIT-BITS+" "+NEG-LIMB-BITS+"
     "+NEG-LIMB-BITS-1+" "+FIXNUM-READ-GUARD+" "+SMALL-BIGNUM-BITS+" "+HALF-LIMB-BITS+"
-    "+NEG-HALF-LIMB-BITS+" "+HALF-LIMB-MASK+" "+TARGET-BIG-ENDIAN+" "+TARGET-SOFT-FLOAT+"
+    "+NEG-HALF-LIMB-BITS+" "+HALF-LIMB-MASK+" "+TARGET-BIG-ENDIAN+" "+TARGET-SOFT-FLOAT+" "+TARGET-W32+"
     "*TARGET-HAS-FPD-P*" "*TARGET-BIG-ENDIAN-P*" "*TARGET-FIXNUM-BITS*"
     "+MV-COUNT-ADDR+" "+MV-VALUES-ADDR+" "+TAG-CONS+" "+TAG-FUNCTION+" "+TAG-OBJECT+"
     "+TAG-IMMEDIATE+" "+TAG-FORWARD+" "+T-VALUE+" "+NIL-VALUE+")
@@ -1989,10 +1989,11 @@ that no list has ***~%" (length missing))
 ;;; target the two must agree field for field.  Host-only: in an image the
 ;;; names are folded constants (see the comment in SET-TARGET-FIXNUM-BITS-FOR).
 ;;; The host's parameters are put back afterwards.
+(defun %gck-ct-w32-01 (ct) (if (compile-target-w32-capable ct) 1 0))
 (defun check-host-widths-match-descriptor ()
   (let ((problems nil)
         (saved (list +fixnum-bits+ +tag-object+ +nil-value+ +t-value+ +target-big-endian+
-                     +mv-count-addr+ +mv-values-addr+ *target-has-fpd-p*))
+                     +mv-count-addr+ +mv-values-addr+ *target-has-fpd-p* +target-w32+))
         (fields '((+fixnum-bits+ . compile-target-fixnum-bits) (+fixnum-max+ . compile-target-fixnum-max)
                   (+fixnum-min+ . compile-target-fixnum-min) (+fixnum-limit+ . compile-target-fixnum-limit)
                   (+fixnum-neg-limit+ . compile-target-fixnum-neg-limit)
@@ -2012,7 +2013,8 @@ that no list has ***~%" (length missing))
                   (+tag-cons+ . compile-target-tag-cons) (+tag-function+ . compile-target-tag-function)
                   (+tag-object+ . compile-target-tag-object) (+tag-immediate+ . compile-target-tag-immediate)
                   (+tag-forward+ . compile-target-tag-forward) (+t-value+ . compile-target-t-value)
-                  (+nil-value+ . compile-target-nil-value))))
+                  (+nil-value+ . compile-target-nil-value)
+                  (+target-w32+ . %gck-ct-w32-01))))
     (unwind-protect
          (loop for target being the hash-values of *targets*
                do (let ((ct (set-target-fixnum-bits-for target)))
@@ -2022,7 +2024,8 @@ that no list has ***~%" (length missing))
                                       (car f) (symbol-value (car f)) (funcall (cdr f) ct))
                               problems)))))
       ;; put the host back where it was (the build sets it again per image)
-      (destructuring-bind (fb to nv tv be mvc mvv fpd) saved
+      (destructuring-bind (fb to nv tv be mvc mvv fpd w32) saved
+        (setf +target-w32+ w32)
         (set-target-fixnum-bits fb)
         (setf +tag-object+ to +nil-value+ nv +t-value+ tv +target-big-endian+ be
               *target-big-endian-p* (= be 1)

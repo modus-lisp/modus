@@ -591,6 +591,11 @@
    +TARGET-BIG-ENDIAN+ so the image's own compiler does the same.  An integer
    for the same reason: a NIL-valued constant never folds.")
 
+(defparameter +target-w32+ 0
+  "1 when the target is W32-capable (COMPILE-TARGET-W32-CAPABLE), else 0: the
+   running-on twin an image's own compiler folds, as +TARGET-BIG-ENDIAN+ is.
+   An integer for the same reason.  docs/w32.md.")
+
 (defparameter +target-big-endian+ 0
   "1 on a big-endian target, else 0: *TARGET-BIG-ENDIAN-P* as a FOLDED constant, for code that must know the
    target's byte order AFTER the image is built -- the in-image compiler.
@@ -796,7 +801,9 @@
        :big-endian (if (eq (target-endianness target) :big) 1 0)
        :soft-float soft-float
        :has-fpd (and (member (target-name target) '(:x86-64 :aarch64)) t)
-       :w32-capable nil
+       ;; W32 (docs/w32.md): the 32-bit ports whose translators implement every
+       ;; W32 opcode.  ppc32 is not one (spec 5.3); no 64-bit target ever is (C1).
+       :w32-capable (and (member (target-name target) '(:i386 :riscv32 :arm32 :68k)) t)
        :mv-count-addr mvc :mv-values-addr mvv
        :tag-cons 1 :tag-function 3 :tag-object otag :tag-immediate 5
        :tag-forward 15 :t-value (+ page #x1000 otag) :nil-value (+ page 1)))))
@@ -886,6 +893,7 @@
     ;; aarch64 translators only; an image for one of those may use them in its
     ;; BAKED code too, not just in code it compiles at runtime.
     (setf *target-has-fpd-p* (compile-target-has-fpd ct))
+    (setf +target-w32+ (if (compile-target-w32-capable ct) 1 0))
     (setf +mv-count-addr+  (compile-target-mv-count-addr ct)
           +mv-values-addr+ (compile-target-mv-values-addr ct))
     (set-target-fixnum-bits (compile-target-fixnum-bits ct))
@@ -1020,6 +1028,7 @@
      (defconstant +mv-values-addr+ ~D)~%~
      (defconstant +target-big-endian+ ~D)~%~
      (defconstant +target-soft-float+ ~D)~%~
+     (defconstant +target-w32+ ~D)~%~
      (defconstant +tag-cons+ ~D)~%(defconstant +tag-function+ ~D)~%~
      (defconstant +tag-object+ ~D)~%(defconstant +tag-immediate+ ~D)~%~
      (defconstant +tag-forward+ ~D)~%(defconstant +t-value+ ~D)~%~
@@ -1036,5 +1045,6 @@
     (ct-half-limb-mask)
     29 14 32767 16383
     (ct-mv-count-addr) (ct-mv-values-addr) (ct-target-big-endian) (ct-target-soft-float)
+    (if (ct-w32-capable-p) 1 0)
     (ct-tag-cons) (ct-tag-function) (ct-tag-object) (ct-tag-immediate) (ct-tag-forward)
     (ct-t-value) (ct-nil-value)))

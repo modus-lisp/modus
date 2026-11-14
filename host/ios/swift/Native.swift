@@ -3196,6 +3196,15 @@ func statusFollow(_ nav: UINavigationController, _ vc: UIViewController) {
     s.place(on: vc, in: nav)
 }
 
+/// A status's detail in its menu, its parts ("1.3 MB of 96 MB  ·  175 KB/s") kept whole when it wraps: a short
+/// part's spaces do not break (a long one's still may: unbroken, it would be cut mid-word), and the dot stays at
+/// the end of the line it closes -- the line breaks after it.
+func statusDetail(_ text: String) -> String {
+    text.components(separatedBy: "  ·  ")
+        .map { $0.count <= 24 ? $0.replacingOccurrences(of: " ", with: "\u{00A0}") : $0 }
+        .joined(separator: "\u{00A0}\u{00A0}·  ")
+}
+
 /// app_status(nav, text, permille, cancellable): what NAV's app is doing, as a ring in the bar of the screen on
 /// top: filling to PERMILLE (0-1000; above, no measure: it spins), its menu TEXT ("Doing x — how far") and Cancel
 /// when CANCELLABLE (a STATUSCANCEL).  Not CANCELLABLE: a result -- a checkmark, its menu the TEXT.  An empty TEXT
@@ -3237,7 +3246,7 @@ let appStatus: Call = { h, p, n, permille, cancellable, _ in
                 guard let s else { done([]); return }
                 let parts = s.message.components(separatedBy: " — ")
                 let about = UIAction(title: parts[0], image: UIImage(systemName: "arrow.down.circle")) { _ in }
-                if parts.count > 1 { about.subtitle = parts.dropFirst().joined(separator: " — ") }
+                if parts.count > 1 { about.subtitle = statusDetail(parts.dropFirst().joined(separator: " — ")) }
                 done([about, UIMenu(title: "", options: .displayInline, children: [
                     UIAction(title: "Cancel", image: UIImage(systemName: "xmark"), attributes: .destructive) { _ in
                         s.cancel?()

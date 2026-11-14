@@ -609,18 +609,19 @@ second column is the same image before the 2026-11-14 round below):
 
 | type | time | before |
 |---|---|---|
-| `(defun sq (x) (* x x))` (the first form) | 46 s | 62 s |
-| `(defun greet (name) (format nil "Hello, ~A!" name))` | 38 s | 53 s |
-| `(greet "Mac")` | 10 s | 9 s |
-| `(+ 1 2)` | 4 s | 5 s |
-| `(defun fib (n) ...)` | 96 s | 111 s |
+| `(defun sq (x) (* x x))` (the first form) | 42 s | 62 s |
+| `(defun greet (name) (format nil "Hello, ~A!" name))` | 33 s | 53 s |
+| `(greet "Mac")` | 9 s | 9 s |
+| `(+ 1 2)` | 5 s | 5 s |
+| `(defun fib (n) ...)` | 84 s | 111 s |
 | `(compile 'fib)` | 62 s | 105 s |
 | `(fib 20)` | 19 s | heap exhausted |
-| `(defun fact ...)`, `(compile 'fact)`, `(fact 10)` | 74 s, 60 s, 5 s | |
-| `(defun tri (n) ...)`, `(tri 20)` interpreted | 72 s, 54 s | |
-| `(defmacro twice (x) ...)`, its use in a LET | 347 s, 66 s | |
+| `(defun fact ...)`, `(compile 'fact)`, `(fact 10)` | 66 s, 60 s, 5 s | |
+| `(defun tri (n) ...)`, `(tri 20)` interpreted | 64 s, 35 s | |
+| `(defmacro twice (x) ...)`, its use in a LET | 297 s, 60 s | |
 | `(compile 'tri)`, `(tri 100)` | 49 s, 4 s | |
-| `(mapcar #'sq (list 1 2 3))` | 50 s | |
+| `(mapcar #'sq (list 1 2 3))` | 46 s | |
+| `(dotimes (i 5) (print (* i i)))` | 116 s | |
 
 Built with `MODUS_68K_HOT=mvm/68k-hot-mac-plus.txt`: one native function,
 `%GV-REF-FILL` (2 KB of the 5.5 KB the resident range has free), which every
@@ -649,16 +650,33 @@ into a hash table that a 40 KB young semispace could not hold (the "heap
 exhausted" above).  And the cold names' index is searched where it is (15 s
 of the first `(compile 'f)`: 403 PARSE-INTEGERs through the bignum reader).
 
-**What is left of a DEFUN** (`greet`, 38 s): the disk.  The SCSI transfer in
-the ROM is ~33% and our loader ~15%; Lisp is a third.  One DEFUN calls 616
-distinct functions, 664 KB of threaded code, through the 104 KB cache: 1806
-stream loads, 1.7 MB read.  Two functions are a quarter of it --
-`EMIT-BYTECODE-FOR-IR` (65 KB, 339 KB read) and `COMPILE-COMPOUND` (95 KB,
-114 KB read): each is one long chain of tests, walked from the top for every
-instruction or form, so a late arm pages the whole function in.  A simulation
-over the recorded references: a clock policy in place of the FIFO would save
-~20% of the loads, 24 KB more cache ~15%.  DEFMACRO compiles its expander in
-nested EVALs (347 s).
+**Then the disk.**  With those gone a DEFUN (`greet`, 38 s) was the SCSI
+transfer in the ROM ~33%, our loader ~15%, and Lisp a third: one DEFUN called
+616 distinct functions, 664 KB of threaded code, through the 104 KB cache --
+1806 stream loads, 1.7 MB read.  A quarter of that was two functions,
+`EMIT-BYTECODE-FOR-IR` (65 KB; 339 KB read) and `COMPILE-COMPOUND` (95 KB;
+114 KB read): each one long chain of tests walked from the top for every
+instruction or form, so a late clause paged the whole function in, and the
+rest of the cache out.  Now:
+
+- `COMPILE-COMPOUND` sends an operator that is none of its 372 dispatch names
+  -- a call to a function, most forms -- to `COMPILE-CALL` at once
+  (`%COMPOUND-DISPATCH-OP-P`, a binary search; every build checks the name
+  lists are complete, build-checks.lisp CHECK H).
+- `EMIT-BYTECODE-FOR-IR`, `IR-INSTRUCTION-SIZE` and the interpreter's
+  `%MVM-INTERPRET-1` test for the commonest instructions first (the
+  interpreter's order was the opcode table's: OBJ-REF, every read of a local,
+  sat behind a hundred others).
+
+A DEFUN reads 1.2 MB in 1443 loads (`greet`, 33 s); `(tri 20)` interpreted
+went 54 -> 35 s.  On x64 3000 DEFUNs are 980 ms (1360 before both rounds),
+the interpreter unchanged.
+
+**What is left**: still the disk -- 538 functions, 517 KB a DEFUN.  A
+simulation over the recorded references: a clock policy in place of the FIFO
+would save ~20% of the loads, 24 KB more cache ~15%.  The interpreter pages
+itself (64 KB of it for `(tri 20)`, read 18 times over).  DEFMACRO compiles
+its expander in nested EVALs (297 s).  Heap exhaustion is still fatal.
 
 Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
 

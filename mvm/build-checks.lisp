@@ -1329,6 +1329,78 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
             (return-from check-no-host-gensym nil))
           (%gck-fail "check-no-host-gensym failed")))))
 
+;;; ============================================================
+;;; CHECK H. COMPILE-COMPOUND'S DISPATCH NAMES ARE ALL LISTED
+;;; ============================================================
+;;; COMPILE-COMPOUND sends an operator whose name hash is in neither
+;;; *HASH-DISPATCH-NAMES* nor *COMPOUND-DISPATCH-MORE-HASHES* straight to
+;;; COMPILE-CALL, without walking its 300 clauses (%COMPOUND-DISPATCH-OP-P).
+;;; That is only right while the two lists hold every name a clause tests for:
+;;; a clause added without its name would never be reached, and its form would
+;;; compile, silently, as a call to a function of that name.  So the function
+;;; is READ here and every hash in its clauses' tests is looked up.
+(defvar *gck-compound-dispatch-done* nil
+  "Tree-wide like CHECK E — once per SBCL process, not once per BUILD-IMAGE.")
+
+(defun %gck-test-hashes (test acc)
+  "The name hashes TEST, a COND clause's test, compares OP-NAME with: its
+   integers of hash size, and its (COMPUTE-NAME-HASH \"NAME\") calls."
+  (cond ((integerp test)
+         (if (and (> test 65535) (< test (ash 1 +name-hash-bits+))) (cons test acc) acc))
+        ((atom test) acc)
+        ((and (symbolp (car test)) (string= (symbol-name (car test)) "COMPUTE-NAME-HASH")
+              (stringp (cadr test)))
+         (cons (compute-name-hash (cadr test)) acc))
+        (t (let ((x test))
+             (loop while (consp x)
+                   do (setq acc (%gck-test-hashes (car x) acc)) (setq x (cdr x)))
+             acc))))
+
+(defun check-compound-dispatch-names ()
+  "CHECK H.  Every name hash a clause of COMPILE-COMPOUND tests for is in
+   *HASH-DISPATCH-NAMES* or *COMPOUND-DISPATCH-MORE-HASHES*."
+  (let ((mode (%gck-mode)))
+    (when (or (eq mode :off) *gck-compound-dispatch-done* (null *gck-parse-sweep-root*))
+      (return-from check-compound-dispatch-names nil))
+    (setf *gck-compound-dispatch-done* t)
+    (let ((path (merge-pathnames "mvm/compiler.lisp" *gck-parse-sweep-root*)))
+      (when (probe-file path)
+        (let* ((text (with-open-file (s path :direction :input)
+                       (let* ((buf (make-string (file-length s))) (n (read-sequence buf s)))
+                         (subseq buf 0 n))))
+               (at (search "(defun compile-compound (form env dest)" text)))
+          (unless at
+            (%gck-fail "check-compound-dispatch-names: no COMPILE-COMPOUND in mvm/compiler.lisp"))
+          (let* ((form (let ((*package* (find-package :modus.mvm)))
+                         (read-from-string text t nil :start at)))
+                 (dispatch nil) (missing nil) (clauses 0))
+            ;; the dispatch is the function's longest COND
+            (labels ((walk (x)
+                       (when (consp x)
+                         (when (and (eq (car x) 'cond)
+                                    (or (null dispatch) (> (length x) (length dispatch))))
+                           (setq dispatch x))
+                         (let ((y x))
+                           (loop while (consp y) do (walk (car y)) (setq y (cdr y)))))))
+              (walk form))
+            (dolist (clause (cdr dispatch))
+              (incf clauses)
+              (dolist (h (%gck-test-hashes (car clause) nil))
+                (unless (%compound-dispatch-op-p h) (pushnew h missing))))
+            (when (< clauses 100)
+              (%gck-fail "check-compound-dispatch-names: COMPILE-COMPOUND's dispatch has ~D clauses -- not the COND this check knows"
+                         clauses))
+            (when missing
+              (format t "~&*** check-compound-dispatch-names: ~D name hash~:P COMPILE-COMPOUND tests for ~
+that no list has ***~%" (length missing))
+              (dolist (h missing) (format t "  - ~D~%" h))
+              (format t "  Add each to *COMPOUND-DISPATCH-MORE-HASHES* (mvm/compiler.lisp): an operator~%")
+              (format t "  whose hash is in no list goes straight to COMPILE-CALL, so the new~%")
+              (format t "  clause would never run.~%")
+              (when (eq mode :warn)
+                (return-from check-compound-dispatch-names nil))
+              (%gck-fail "check-compound-dispatch-names failed"))))))))
+
 (defun %gck-pre-checks (src)
   "Read the blob ONCE and run every source-level check on it."
   (let ((mode (%gck-mode)))
@@ -1338,6 +1410,8 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
     (%gck-guard "check-source-parses" (check-source-parses))
     ;; F is tree-wide too, and costs one 1 MB file read once per process.
     (%gck-guard "check-no-host-gensym" (check-no-host-gensym))
+    ;; H is tree-wide: one form read from compiler.lisp, once per process.
+    (%gck-guard "check-compound-dispatch-names" (check-compound-dispatch-names))
     ;; check-global-inits owns the =dump / size-cap policy; let it run first
     ;; and only pre-read when it would not have skipped anyway.
     (if (or (eq mode :dump)

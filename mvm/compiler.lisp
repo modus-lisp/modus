@@ -8740,6 +8740,77 @@
       (setq *hash-dispatch-table* tbl)))
   (gethash h *hash-dispatch-table*))
 
+(defparameter *compound-dispatch-more-hashes*
+  '(
+   ;; %%FLET-SELF %%LX-REG %AARCH64-ALARM %AARCH64-MKDIRAT %AARCH64-NEWFSTATAT
+   ;; %AARCH64-OPENAT %AARCH64-RENAMEAT %AARCH64-UNLINKAT %ALLOC-F32 %ALLOC-U8
+   ;; %BULK-FILL %BULK-MOVE %C32-REF %C32-SET %F32-BITS-REF %F32-BITS-SET %F32-LOAD
+   ;; %F32-STORE %F32V* %F32V+ %F32V- %F32V-BROADCAST %F32V-BROADCAST-REF %F32V-REF
+   ;; %F32V-SET %F32V/ %FIXNUM-TRUNCATE2 %FROUND32 %FSQRT %GET-CENV %GV-SAVE-CACHED
+   ;; %GV-SETQ-GLOBAL %INSTALL-SIGNAL-HANDLERS %JIT-CALL %JIT-FREE-PAGE
+   ;; %JIT-ICACHE-FLUSH %KERNEL %LINK-INT %LOWTAG %MAKE-ARRAY-RAW %MAKE-FLOAT2
+   ;; %MAKE-LONG2 %MAKE-SHORT2 %MAKE-SINGLE2 %MAKE-STRING-ARRAY %MDA-P %MMAP-EXEC-PAGE
+   ;; %MMAP-SHARED-PAGE %PRIM-AREF %PRIM-ARRAY-LENGTH %PRIM-ARRAYP %PRIM-ASET
+   ;; %PRIM-BASE-STRING-P %PRIM-SIMPLE-STRING-P %PRIM-SIMPLE-VECTOR-P %PRIM-STRING32-P
+   ;; %PRIM-STRINGP %PRIM-U8-VECTOR-P %RAW-CONSP %SHARED-LITERAL %SLOT-REF %SPAWN-THREAD
+   ;; %STRUCT-SLOT-REF %STRUCT-SLOT-SET %U8-REF %U8-REF-UNCHECKED %U8-SET
+   ;; %U8-SET-UNCHECKED %UCAR %UCDR %VAL->WORD %WORD->VAL %WORD-AREF %WORD-ASET CHAR
+   ;; CNTFRQ SAFETY-CHECK SCHAR WITH-SIMPLE-RESTART
+    128401437 164901478 125009599 279156048 288867729 462383973 343008121 79476218
+    103993613 58414919 121414968 156403790 108856844 9852007 388138896 75164491
+    504669726 209633815 344711121 338108280 324903310 33180769 375151373 62768255
+    162246308 311697628 249365610 427097303 238433040 518776871 14780442 515927907
+    81793486 404197258 65213530 243572300 532245257 43134508 313167340 40586701
+    408251623 17093245 376000333 365446949 377688700 459495135 522091235 283394249
+    301919889 397987113 47648848 198740122 510361305 367602954 203732590 526358600
+    367627940 469097205 84095010 323209429 14355506 434674778 231353088 17781339
+    462768251 388046666 260184480 362441329 437115943 483756498 497160708 121290012
+    292480825 189301986 429343799 367065803 155426392 228425908 483931868)
+  "The hashes of the names COMPILE-COMPOUND's dispatch tests for that
+   *HASH-DISPATCH-NAMES* (made from its bare literals) does not have: the ones
+   its clauses spell #.(COMPUTE-NAME-HASH \"NAME\").  The two together are
+   EVERY name the dispatch can match, and COMPILE-COMPOUND sends an operator in
+   neither straight to COMPILE-CALL (%COMPOUND-DISPATCH-OP-P).  GENERATED, as
+   that list: add a clause, add its name's hash here -- every build checks it
+   (build-checks.lisp CHECK-COMPOUND-DISPATCH-NAMES).  Hashes, not names: on a
+   1 MB Mac a list of 80 strings is room its saved heap does not have.")
+
+(defvar *compound-dispatch-hashes* nil
+  "Every dispatch hash -- *HASH-DISPATCH-NAMES*' and
+   *COMPOUND-DISPATCH-MORE-HASHES* -- in one sorted vector, made at first use.")
+
+(defun %compound-dispatch-hashes ()
+  "The sorted vector, or NIL while the lists it is made from have no value
+   yet.  NOT cached before they do: an image compiles forms while its globals
+   are still being initialised, and *HASH-DISPATCH-TABLE*, built once on the
+   first call, has been an EMPTY table in every image for that reason
+   (measured on x64: 293 names, 0 entries) -- so %OP-NAME-CONFIRMED-P confirms
+   nothing there.  That is left as it is; this must not repeat it."
+  (or *compound-dispatch-hashes*
+      (and *hash-dispatch-names* *compound-dispatch-more-hashes*
+           ;; made by the main thread only, as every cache a worker could
+           ;; otherwise fill from its own heap (mvm-eval.lisp)
+           (or (not (fboundp '%mvm-on-main-thread-p)) (funcall '%mvm-on-main-thread-p))
+           (let ((hs (copy-list *compound-dispatch-more-hashes*)))
+             (dolist (n *hash-dispatch-names*) (setq hs (cons (compute-name-hash n) hs)))
+             (setq *compound-dispatch-hashes*
+                   (coerce (sort hs (function <)) 'simple-vector))))))
+
+(defun %compound-dispatch-op-p (h)
+  "Is H the hash of a name COMPILE-COMPOUND's dispatch tests for?  T too
+   while that cannot be told (%COMPOUND-DISPATCH-HASHES): the dispatch then
+   walks its clauses, as it always did.  A binary search: nine probes."
+  (let ((v (%compound-dispatch-hashes)))
+    (if (null v)
+        t
+        (let ((lo 0) (hi (- (length v) 1)) (found nil))
+          (loop
+            (when (or found (> lo hi)) (return found))
+            (let* ((mid (ash (+ lo hi) -1)) (x (svref v mid)))
+              (cond ((= x h) (setq found t))
+                    ((< x h) (setq lo (+ mid 1)))
+                    (t (setq hi (- mid 1))))))))))
+
 (defun %op-name-confirmed-p (op op-name)
   "NIL only when OP's hash collides with a dispatch name that OP is not."
   (let ((sf (%hash-dispatch-name op-name)))
@@ -8837,6 +8908,14 @@
       ;; prologue correctly (same path #'fn funcall uses).
       ((null op-name)
        (compile-funcall form env dest))
+      ;; NOT A NAME ANY CLAUSE BELOW TESTS FOR -- a call to a function, which
+      ;; is most compound forms.  Every clause from here to the last tests
+      ;; OP-NAME against name hashes (or is %VIL-OP-P), in a chain 300 long
+      ;; that such a form walked to its end to reach the same COMPILE-CALL: on
+      ;; a 68000, paged, that was this whole 95 KB function read from disk for
+      ;; one (FOO X).  %COMPOUND-DISPATCH-OP-P is one hash lookup.
+      ((and (symbolp op) (not (%compound-dispatch-op-p op-name)) (not (%vil-op-p op)))
+       (compile-call op (cdr form) env dest))
       ;; --- Special Forms ---
       ((= op-name 338547669)    (compile-quote (cadr form) dest))  ; QUOTE
       ;; (%CONV-ADDR K): a runtime-data address used as a VALUE — rebased at
@@ -30585,17 +30664,72 @@
   "Return the encoded bytecode size (in bytes) for a single IR instruction"
   (let ((op (car insn)))
     (case op
+      ;; The most frequent first, in EMIT-BYTECODE-FOR-IR's order and for its
+      ;; reason: this is called for every instruction, more than once.
       ;; Labels take 0 bytes
       (:label 0)
+   ; opcode + reg
+      ;; 2-reg instructions: 1 opcode + 2 regs = 3 bytes
+      (:mov   3)
+      ;; Stack load/store: 1 opcode + 1 reg + 2 imm16 = 4 bytes
+      (:stack-load  4)
+      ;; Branch (unconditional): 1 opcode + 4 off32 = 5 bytes
+      (:br    5)
+      ;; 1-reg instructions: 1 opcode + 1 reg = 2 bytes
+      (:push  2)
+      (:pop   2)
+      (:set-nargs 2)
+      ;; Call: 1 opcode + 4 imm32 = 5 bytes
+      (:call  5)
+      (:stack-store 4)
+      (:bne   5)
+      (:cmp   3)
+      (:cmp-imm  6)
+      ;; Load immediate: 1 opcode + 1 reg + 8 imm64 = 10 bytes
+      (:li    10)
+      (:li-const 10)
+      (:li-halves 10)
+      ;; Conditional branches: 1 opcode + 4 off32 = 5 bytes
+      (:beq   5)
+      ;; Branch-null: 1 opcode + 1 reg + 4 off32 = 6 bytes
+      (:bnull  6)
+      (:set-mv-count 2)
+      ;; Frame: 1 opcode + 2 imm16 = 3 bytes
+      (:frame-enter 3)
+      (:frame-leave 1)
+      (:ret   1)
+      (:test-imm 6)
+      (:frame-alloc 3)
+      (:frame-free  3)
+      (:blt   5)
+      (:obj-tag 3)
+      (:array-len 3)
+      (:bge   5)
+      (:or    4)
+      (:obj-subtag 3)
+   ; opcode + imm8
+      (:get-nargs 2)
+      (:gc-check 1)
+      (:cons  4)
+      (:car   3)
+      (:shr   4)
+      (:cdr   3)
+      (:add-checked 4)
+      ;; Object slot access (immediate index): 1 opcode + 2 regs + 1 imm8 = 4 bytes
+      (:obj-ref 4)
+      (:store 4)
+      (:bnnull 6)
+      (:obj-set 4)
+      ;; Memory load/store: 1 opcode + 2 regs + 1 width = 4 bytes
+      (:load  4)
+      ;; ---- the rest, as they were ----
 
       ;; No-operand instructions: 1 byte opcode
       (:nop   1)
-      (:ret   1)
       (:halt  1)
       (:fence 1)
       (:cli   1)
       (:sti   1)
-      (:gc-check 1)
       ;; 1 opcode + imm32 nbytes.  This size MUST be right: every branch
       ;; displacement after a :gc-check-n is computed from this table, so a
       ;; wrong entry silently mis-targets jumps rather than failing loudly.
@@ -30603,35 +30737,17 @@
       ;; 1 opcode + 1 reg + 1 kind byte.  Same warning as :gc-check-n above.
       (:gc-check-r 3)
       (:yield 1)
-      (:set-mv-count 2)
-
-      ;; 1-reg instructions: 1 opcode + 1 reg = 2 bytes
-      (:push  2)
-      (:pop   2)
       (:inc   2)
       (:dec   2)
       (:write-barrier 2)
       (:set-cenv 2)
       (:get-cenv 2)
-      (:set-nargs 2)   ; opcode + imm8
-      (:get-nargs 2)   ; opcode + reg
-
-      ;; 2-reg instructions: 1 opcode + 2 regs = 3 bytes
-      (:mov   3)
-      (:car   3)
-      (:cdr   3)
       (:setcar 3)
       (:setcdr 3)
       (:consp 3)
       (:atom  3)
       (:neg   3)
-      (:cmp   3)
       (:test  3)
-      (:cmp-imm  6)
-      (:test-imm 6)
-      (:obj-tag 3)
-      (:obj-subtag 3)
-      (:array-len 3)
       (:alloc-array 3)  ;; 2-reg: 1 opcode + 2 regs = 3 bytes
       (:alloc-string 3)
       (:alloc-u8 3)     ;; 2-reg: 1 opcode + 2 regs = 3 bytes
@@ -30644,10 +30760,6 @@
 
       ;; Object allocation: 1 opcode + 1 reg + 2 imm16 + 1 imm8 = 5 bytes
       (:alloc-obj 5)
-
-      ;; Object slot access (immediate index): 1 opcode + 2 regs + 1 imm8 = 4 bytes
-      (:obj-ref 4)
-      (:obj-set 4)
 
       ;; 3-reg instructions: 1 opcode + 3 regs = 4 bytes
       (:aref  4)
@@ -30712,7 +30824,6 @@
       (:subs  4)
       (:mul   4)
       (:mul-checked 4)
-      (:add-checked 4)
       (:sub-checked 4)
       (:mul26lo 4)
       (:mul26hi 4)
@@ -30730,9 +30841,7 @@
       (:div   4)
       (:mod   4)
       (:and   4)
-      (:or    4)
       (:xor   4)
-      (:cons  4)
       (:atomic-xchg 4)
       ;; IEEE float ops: 3-reg arith = 4 bytes; 2-reg conversion = 3 bytes
       (:fadd  4)
@@ -30742,17 +30851,11 @@
 
       ;; reg + imm8 shift: 1 opcode + 2 regs + 1 imm8 = 4 bytes
       (:shl   4)
-      (:shr   4)
       (:sar   4)
 
       ;; Variable shift: 2 regs + 1 reg (shift amount) = 4 bytes
       (:shl-var 4)
       (:sar-var 4)
-
-      ;; Load immediate: 1 opcode + 1 reg + 8 imm64 = 10 bytes
-      (:li    10)
-      (:li-halves 10)
-      (:li-const 10)
       (:li-addr 10)
       (:li-taddr 10)
       ;; li-func now emits FN-ADDR (1 opcode + 1 reg + 4 imm32 = 6 bytes)
@@ -30760,35 +30863,15 @@
 
       ;; Function address: 1 opcode + 1 reg + 4 imm32 = 6 bytes
       (:fn-addr 6)
-
-      ;; Branch (unconditional): 1 opcode + 4 off32 = 5 bytes
-      (:br    5)
-
-      ;; Conditional branches: 1 opcode + 4 off32 = 5 bytes
-      (:beq   5)
-      (:bne   5)
-      (:blt   5)
-      (:bge   5)
       (:ble   5)
       (:bgt   5)
       (:bvs   5)
-
-      ;; Branch-null: 1 opcode + 1 reg + 4 off32 = 6 bytes
-      (:bnull  6)
-      (:bnnull 6)
-
-      ;; Call: 1 opcode + 4 imm32 = 5 bytes
-      (:call  5)
 
       ;; Call indirect: 1 opcode + 1 reg = 2 bytes
       (:call-indirect 2)
 
       ;; Call native: 1 opcode + 1 reg = 2 bytes
       (:call-native 2)
-
-      ;; Memory load/store: 1 opcode + 2 regs + 1 width = 4 bytes
-      (:load  4)
-      (:store 4)
 
       ;; I/O: 1 opcode + 1 reg + 2 port + 1 width = 5 bytes
       ;; For register-based port, use different encoding:
@@ -30798,16 +30881,6 @@
       ;; Per-CPU: 1 opcode + 1 reg + 2 imm16 = 4 bytes
       (:percpu-ref 4)
       (:percpu-set 4)
-
-      ;; Frame: 1 opcode + 2 imm16 = 3 bytes
-      (:frame-enter 3)
-      (:frame-leave 1)
-      (:frame-alloc 3)
-      (:frame-free  3)
-
-      ;; Stack load/store: 1 opcode + 1 reg + 2 imm16 = 4 bytes
-      (:stack-load  4)
-      (:stack-store 4)
 
       ;; Context save/restore: 1 opcode + 1 reg = 2 bytes
       (:save-ctx  2)
@@ -30881,11 +30954,181 @@
       (unless (eq (car insn) :label)
       (let ((op (car insn)))
         (case op
-          ;; ---- No-operand instructions ----
-          (:nop
+          ;; THE MOST FREQUENT FIRST.  CASE tests its keys in order, and this one has
+          ;; 176 of them: every instruction walked the chain to its clause.  On a
+          ;; 68000, where the function is 65 KB of threaded code paged through a
+          ;; 104 KB cache, a late clause read the whole function from disk -- 339 KB
+          ;; of one DEFUN's 1.7 MB.  These 41, in the order measured over a REPL
+          ;; session's DEFUNs and forms (x64, 6286 instructions), are 97% of them.
+          (:mov
+           (mvm-mov buf (second insn) (third insn)))
+          (:stack-load
+           ;; load dest from stack slot
+           ;; Encoded as: load dest, VFP, slot-offset
+           ;; Use obj-ref as a proxy: dest = [VFP + slot*8]
+           (let ((dest-reg (second insn))
+                 (slot (third insn)))
+             (mvm-obj-ref buf dest-reg +vreg-vfp+ slot)))
+          (:br
+           (let* ((target-label (second insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 5))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-br buf rel-offset)))
+          (:push
+           (mvm-push buf (second insn)))
+          (:pop
+           (mvm-pop buf (second insn)))
+          (:set-nargs
+           (encode-instruction buf +op-set-nargs+ (second insn)))
+          (:call
+           (let* ((fn-name (second insn))
+                  (fn-info (%fn-info-for-key fn-name))
+                  (target (if fn-info
+                              (function-info-bytecode-offset fn-info)
+                              ;; Unresolved: target the %UNRESOLVED-FN stub
+                              ;; which returns nil safely.
+                              ;; #215: *FUNCTIONS* is keyed by NAME STRING
+                              ;; (defvar above, :test 'equal).  This looked up
+                              ;; COMPUTE-NAME-HASH's INTEGER, so it never hit
+                              ;; and every unresolved call fell through to
+                              ;; target 0 — which is not a trap but the FIRST
+                              ;; function in the module, called with whatever
+                              ;; arguments the caller pushed.  That is the
+                              ;; ":li-func offset-0" garbage-execution class.
+                              (let ((stub (gethash "%UNRESOLVED-FN" *functions*)))
+                                (if stub
+                                    (function-info-bytecode-offset stub)
+                                    0)))))
+             (unless fn-info
+               (when (boundp '*unresolved-calls*)
+                 (incf (gethash fn-name *unresolved-calls* 0)))
+               ;; DDC triage: an unresolved callee whose NAME is NIL is a call
+               ;; the assembler could not even name.  Off unless asked for.
+               (when (and *ddc-trace-nil-callee* (or (null fn-name) (equal fn-name "NIL")))
+                 (format t "~&  NIL-CALLEE in ~A at ~A insn ~S~%"
+                         *current-function-name* *current-source-location* insn)))
+             (mvm-call buf target)))
+          (:stack-store
+           ;; store src to stack slot
+           (let ((src-reg (second insn))
+                 (slot (third insn)))
+             (mvm-obj-set buf +vreg-vfp+ slot src-reg)))
+          (:bne
+           (let* ((target-label (second insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 5))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-bne buf rel-offset)))
+          (:cmp
+           (mvm-cmp buf (second insn) (third insn)))
+          (:cmp-imm
+           (mvm-cmp-imm buf (second insn) (third insn)))
+          (:li
+           (mvm-li buf (second insn) (third insn)))
+          (:li-const
+           ;; Load tagged address of constant-pool[idx].  The translator
+           ;; emits a placeholder absolute load; image-assembly patches it
+           ;; with the real pool slot address once layout is known.
+           (mvm-li-const buf (second insn) (third insn)))
+          (:li-halves
+           ;; Load a 64-bit immediate supplied as two 32-bit halves (lo, hi).
+           ;; Same wire bytes as :li for the combined word; used by the integer/
+           ;; bignum literal path to avoid forming value<<1 as one in-image int.
+           (mvm-li-halves buf (second insn) (third insn) (fourth insn)))
+          (:beq
+           (let* ((target-label (second insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 5))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-beq buf rel-offset)))
+          (:bnull
+           (let* ((reg (second insn))
+                  (target-label (third insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 6))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-bnull buf reg rel-offset)))
+          (:set-mv-count
+           (mvm-set-mv-count buf (second insn)))
+          (:frame-enter
+           (mvm-trap buf (gethash insn frame-codes (second insn))))
+          (:frame-leave
+           ;; Frame teardown: the native backend handles restoring VSP/VFP.
+           ;; In bytecode, emit as NOP (frame management is a higher-level concept).
            (mvm-nop buf))
           (:ret
            (mvm-ret buf))
+          (:test-imm
+           (mvm-test-imm buf (second insn) (third insn)))
+          (:frame-alloc
+           ;; sub VSP, N*8
+           (mvm-trap buf (+ #x100 (second insn))))
+          (:frame-free
+           ;; add VSP, N*8
+           (mvm-trap buf (+ #x200 (second insn))))
+          (:blt
+           (let* ((target-label (second insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 5))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-blt buf rel-offset)))
+          (:obj-tag
+           (mvm-obj-tag buf (second insn) (third insn)))
+          (:array-len
+           (mvm-array-len buf (second insn) (third insn)))
+          (:bge
+           (let* ((target-label (second insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 5))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-bge buf rel-offset)))
+          (:or
+           (mvm-or buf (second insn) (third insn) (fourth insn)))
+          (:obj-subtag
+           (mvm-obj-subtag buf (second insn) (third insn)))
+          (:get-nargs
+           (encode-instruction buf +op-get-nargs+ (second insn)))
+          (:gc-check
+           (mvm-gc-check buf))
+          (:cons
+           (mvm-cons buf (second insn) (third insn) (fourth insn)))
+          (:car
+           (mvm-car buf (second insn) (third insn)))
+          (:shr
+           (mvm-shr buf (second insn) (third insn) (fourth insn)))
+          (:cdr
+           (mvm-cdr buf (second insn) (third insn)))
+          (:add-checked
+           (mvm-add-checked buf (second insn) (third insn) (fourth insn)))
+          (:obj-ref
+           ;; (obj-ref dest obj idx)
+           (mvm-obj-ref buf (second insn) (third insn) (fourth insn)))
+          (:store
+           (mvm-store buf (second insn) (third insn) (fourth insn)))
+          (:bnnull
+           (let* ((reg (second insn))
+                  (target-label (third insn))
+                  (target-pos (or (gethash target-label label-positions)
+                                  (error "Undefined branch target ~A" target-label)))
+                  (insn-end (+ current-offset 6))
+                  (rel-offset (- target-pos insn-end)))
+             (mvm-bnnull buf reg rel-offset)))
+          (:obj-set
+           ;; (obj-set obj idx src)
+           (mvm-obj-set buf (second insn) (third insn) (fourth insn)))
+          (:load
+           (mvm-load buf (second insn) (third insn) (fourth insn)))
+          ;; ---- the rest, as they were ----
+          ;; ---- No-operand instructions ----
+          (:nop
+           (mvm-nop buf))
           (:halt
            (mvm-halt buf))
           (:fence
@@ -30894,8 +31137,6 @@
            (mvm-cli buf))
           (:sti
            (mvm-sti buf))
-          (:gc-check
-           (mvm-gc-check buf))
           (:gc-check-n
            (mvm-gc-check-n buf (second insn)))
           (:gc-check-r
@@ -30904,18 +31145,8 @@
            (mvm-mcgc-collect buf))
           (:yield
            (mvm-yield buf))
-          (:set-mv-count
-           (mvm-set-mv-count buf (second insn)))
-          (:frame-leave
-           ;; Frame teardown: the native backend handles restoring VSP/VFP.
-           ;; In bytecode, emit as NOP (frame management is a higher-level concept).
-           (mvm-nop buf))
 
           ;; ---- 1-reg instructions ----
-          (:push
-           (mvm-push buf (second insn)))
-          (:pop
-           (mvm-pop buf (second insn)))
           (:inc
            (mvm-inc buf (second insn)))
           (:dec
@@ -30926,18 +31157,8 @@
            (encode-instruction buf +op-set-cenv+ (second insn)))
           (:get-cenv
            (encode-instruction buf +op-get-cenv+ (second insn)))
-          (:set-nargs
-           (encode-instruction buf +op-set-nargs+ (second insn)))
-          (:get-nargs
-           (encode-instruction buf +op-get-nargs+ (second insn)))
 
           ;; ---- 2-reg instructions ----
-          (:mov
-           (mvm-mov buf (second insn) (third insn)))
-          (:car
-           (mvm-car buf (second insn) (third insn)))
-          (:cdr
-           (mvm-cdr buf (second insn) (third insn)))
           (:setcar
            (mvm-setcar buf (second insn) (third insn)))
           (:setcdr
@@ -30948,20 +31169,8 @@
            (mvm-atom buf (second insn) (third insn)))
           (:neg
            (mvm-neg buf (second insn) (third insn)))
-          (:cmp
-           (mvm-cmp buf (second insn) (third insn)))
           (:test
            (mvm-test buf (second insn) (third insn)))
-          (:cmp-imm
-           (mvm-cmp-imm buf (second insn) (third insn)))
-          (:test-imm
-           (mvm-test-imm buf (second insn) (third insn)))
-          (:obj-tag
-           (mvm-obj-tag buf (second insn) (third insn)))
-          (:obj-subtag
-           (mvm-obj-subtag buf (second insn) (third insn)))
-          (:array-len
-           (mvm-array-len buf (second insn) (third insn)))
           (:alloc-array
            (mvm-alloc-array buf (second insn) (third insn)))
           (:alloc-string
@@ -30991,12 +31200,6 @@
           (:alloc-obj
            ;; (alloc-obj dest size subtag)
            (mvm-alloc-obj buf (second insn) (third insn) (fourth insn)))
-          (:obj-ref
-           ;; (obj-ref dest obj idx)
-           (mvm-obj-ref buf (second insn) (third insn) (fourth insn)))
-          (:obj-set
-           ;; (obj-set obj idx src)
-           (mvm-obj-set buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- Variable-index array access ----
           (:aref
@@ -31084,8 +31287,6 @@
            (mvm-mul buf (second insn) (third insn) (fourth insn)))
           (:mul-checked
            (mvm-mul-checked buf (second insn) (third insn) (fourth insn)))
-          (:add-checked
-           (mvm-add-checked buf (second insn) (third insn) (fourth insn)))
           (:sub-checked
            (mvm-sub-checked buf (second insn) (third insn) (fourth insn)))
           (:mul26lo
@@ -31108,12 +31309,8 @@
            (mvm-mod buf (second insn) (third insn) (fourth insn)))
           (:and
            (mvm-and buf (second insn) (third insn) (fourth insn)))
-          (:or
-           (mvm-or buf (second insn) (third insn) (fourth insn)))
           (:xor
            (mvm-xor buf (second insn) (third insn) (fourth insn)))
-          (:cons
-           (mvm-cons buf (second insn) (third insn) (fourth insn)))
           (:atomic-xchg
            (mvm-atomic-xchg buf (second insn) (third insn) (fourth insn)))
 
@@ -31131,8 +31328,6 @@
           ;; ---- Shift instructions (reg + reg + imm8) ----
           (:shl
            (mvm-shl buf (second insn) (third insn) (fourth insn)))
-          (:shr
-           (mvm-shr buf (second insn) (third insn) (fourth insn)))
           (:sar
            (mvm-sar buf (second insn) (third insn) (fourth insn)))
 
@@ -31143,20 +31338,8 @@
            (mvm-sarv buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- Load Immediate ----
-          (:li
-           (mvm-li buf (second insn) (third insn)))
-          (:li-halves
-           ;; Load a 64-bit immediate supplied as two 32-bit halves (lo, hi).
-           ;; Same wire bytes as :li for the combined word; used by the integer/
-           ;; bignum literal path to avoid forming value<<1 as one in-image int.
-           (mvm-li-halves buf (second insn) (third insn) (fourth insn)))
           (:li-addr (mvm-li-addr buf (second insn) (third insn)))
           (:li-taddr (mvm-li-taddr buf (second insn) (third insn)))
-          (:li-const
-           ;; Load tagged address of constant-pool[idx].  The translator
-           ;; emits a placeholder absolute load; image-assembly patches it
-           ;; with the real pool slot address once layout is known.
-           (mvm-li-const buf (second insn) (third insn)))
           (:li-func
            ;; Load function address (resolved during translation to native)
            ;; Use FN-ADDR opcode so the translator can map bytecode offset
@@ -31188,42 +31371,6 @@
                               #xFFFFFFF0))))
 
           ;; ---- Branches (1 opcode + 4 off32 = 5 bytes) ----
-          (:br
-           (let* ((target-label (second insn))
-                  (target-pos (or (gethash target-label label-positions)
-                                  (error "Undefined branch target ~A" target-label)))
-                  (insn-end (+ current-offset 5))
-                  (rel-offset (- target-pos insn-end)))
-             (mvm-br buf rel-offset)))
-
-          (:beq
-           (let* ((target-label (second insn))
-                  (target-pos (or (gethash target-label label-positions)
-                                  (error "Undefined branch target ~A" target-label)))
-                  (insn-end (+ current-offset 5))
-                  (rel-offset (- target-pos insn-end)))
-             (mvm-beq buf rel-offset)))
-          (:bne
-           (let* ((target-label (second insn))
-                  (target-pos (or (gethash target-label label-positions)
-                                  (error "Undefined branch target ~A" target-label)))
-                  (insn-end (+ current-offset 5))
-                  (rel-offset (- target-pos insn-end)))
-             (mvm-bne buf rel-offset)))
-          (:blt
-           (let* ((target-label (second insn))
-                  (target-pos (or (gethash target-label label-positions)
-                                  (error "Undefined branch target ~A" target-label)))
-                  (insn-end (+ current-offset 5))
-                  (rel-offset (- target-pos insn-end)))
-             (mvm-blt buf rel-offset)))
-          (:bge
-           (let* ((target-label (second insn))
-                  (target-pos (or (gethash target-label label-positions)
-                                  (error "Undefined branch target ~A" target-label)))
-                  (insn-end (+ current-offset 5))
-                  (rel-offset (- target-pos insn-end)))
-             (mvm-bge buf rel-offset)))
           (:ble
            (let* ((target-label (second insn))
                   (target-pos (or (gethash target-label label-positions)
@@ -31247,52 +31394,8 @@
              (mvm-bvs buf rel-offset)))
 
           ;; ---- Branch-null (1 opcode + 1 reg + 4 off32 = 6 bytes) ----
-          (:bnull
-           (let* ((reg (second insn))
-                  (target-label (third insn))
-                  (target-pos (or (gethash target-label label-positions)
-                                  (error "Undefined branch target ~A" target-label)))
-                  (insn-end (+ current-offset 6))
-                  (rel-offset (- target-pos insn-end)))
-             (mvm-bnull buf reg rel-offset)))
-          (:bnnull
-           (let* ((reg (second insn))
-                  (target-label (third insn))
-                  (target-pos (or (gethash target-label label-positions)
-                                  (error "Undefined branch target ~A" target-label)))
-                  (insn-end (+ current-offset 6))
-                  (rel-offset (- target-pos insn-end)))
-             (mvm-bnnull buf reg rel-offset)))
 
           ;; ---- Call ----
-          (:call
-           (let* ((fn-name (second insn))
-                  (fn-info (%fn-info-for-key fn-name))
-                  (target (if fn-info
-                              (function-info-bytecode-offset fn-info)
-                              ;; Unresolved: target the %UNRESOLVED-FN stub
-                              ;; which returns nil safely.
-                              ;; #215: *FUNCTIONS* is keyed by NAME STRING
-                              ;; (defvar above, :test 'equal).  This looked up
-                              ;; COMPUTE-NAME-HASH's INTEGER, so it never hit
-                              ;; and every unresolved call fell through to
-                              ;; target 0 — which is not a trap but the FIRST
-                              ;; function in the module, called with whatever
-                              ;; arguments the caller pushed.  That is the
-                              ;; ":li-func offset-0" garbage-execution class.
-                              (let ((stub (gethash "%UNRESOLVED-FN" *functions*)))
-                                (if stub
-                                    (function-info-bytecode-offset stub)
-                                    0)))))
-             (unless fn-info
-               (when (boundp '*unresolved-calls*)
-                 (incf (gethash fn-name *unresolved-calls* 0)))
-               ;; DDC triage: an unresolved callee whose NAME is NIL is a call
-               ;; the assembler could not even name.  Off unless asked for.
-               (when (and *ddc-trace-nil-callee* (or (null fn-name) (equal fn-name "NIL")))
-                 (format t "~&  NIL-CALLEE in ~A at ~A insn ~S~%"
-                         *current-function-name* *current-source-location* insn)))
-             (mvm-call buf target)))
 
           (:call-indirect
            (mvm-call-ind buf (second insn)))
@@ -31329,10 +31432,6 @@
                               #xFFFFFFF0))))
 
           ;; ---- Memory ----
-          (:load
-           (mvm-load buf (second insn) (third insn) (fourth insn)))
-          (:store
-           (mvm-store buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- I/O ----
           (:io-read
@@ -31351,28 +31450,8 @@
            (mvm-percpu-set buf (second insn) (third insn)))
 
           ;; ---- Frame management ----
-          (:frame-enter
-           (mvm-trap buf (gethash insn frame-codes (second insn))))
-          (:frame-alloc
-           ;; sub VSP, N*8
-           (mvm-trap buf (+ #x100 (second insn))))
-          (:frame-free
-           ;; add VSP, N*8
-           (mvm-trap buf (+ #x200 (second insn))))
 
           ;; ---- Stack load/store ----
-          (:stack-load
-           ;; load dest from stack slot
-           ;; Encoded as: load dest, VFP, slot-offset
-           ;; Use obj-ref as a proxy: dest = [VFP + slot*8]
-           (let ((dest-reg (second insn))
-                 (slot (third insn)))
-             (mvm-obj-ref buf dest-reg +vreg-vfp+ slot)))
-          (:stack-store
-           ;; store src to stack slot
-           (let ((src-reg (second insn))
-                 (slot (third insn)))
-             (mvm-obj-set buf +vreg-vfp+ slot src-reg)))
 
           ;; ---- Context ----
           (:save-ctx

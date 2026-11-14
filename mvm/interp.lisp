@@ -1566,10 +1566,308 @@
         (setf pc (1+ pc))
         (handler-case
         (case opcode
-
-          ;; --- NOP / BREAK / TRAP ---
+          ;; THE MOST FREQUENT FIRST.  CASE tests its keys in order and this one has
+          ;; 148, laid out as the opcode table is -- so OBJ-REF (every read of a local),
+          ;; OBJ-SET, CALL, RET and SET-NARGS, among the commonest instructions there
+          ;; are, sat past a hundred others, and each one executed walked there.  On a
+          ;; 68000 the interpreter is 176 KB of threaded code paged through a 104 KB
+          ;; cache: that walk read most of it from disk for a single instruction.
+          ;; These are the instructions a REPL session's code is made of, commonest
+          ;; first (counted over its DEFUNs' IR; TRAP is the frame instructions).
           (#.+op-nop+ nil)
           (#.+op-break+ (break "MVM BREAK at PC ~D" (1- pc)))
+          (#.+op-mov+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               ;; Plain register-to-register copy: move the slot VALUE directly.
+               ;; The old `(reg-set vd (reg-get vs))` round-tripped through
+               ;; %val->word (SHL 1) then %word->val (SAR 1) — an identity ONLY
+               ;; while %val->word's value<<1 fits int64.  For a fixnum VALUE
+               ;; near 2^62 the compiled :shl's value<<2 overflows the register
+               ;; and the :sar reads garbage, CORRUPTING the moved operand.  The
+               ;; mvm-eval pairwise-arith step (%compile-arith-arg-step-e2) emits
+               ;; `:mov temp dest` on a freshly compiled ~2^62 literal, so
+               ;; `(+ -3 4611686018427387900)` fed generic-add a garbage second
+               ;; operand and returned -7 (native was correct).  A move needs no
+               ;; reinterpretation — the slots already hold real VALUES.
+               (setf (svref regs vd) (svref regs vs)) (setf pc npc2))))
+          (#.+op-obj-ref+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vobj npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (idx npc3) (%ifetch-byte bc npc2)
+                 (let ((obj (svref regs vobj)))
+                   (setf (svref regs vd) (%obj-elt-ref obj idx)))
+                 (setf pc npc3)))))
+          (#.+op-br+
+           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
+             (setf pc (+ npc off))))
+          ;; PUSH/POP store real VALUES on mvm-stack (not raw words) so the GC
+          ;; traces/updates pushed pointers — same GC-safety reason as the regs
+          ;; vector.  (A pushed float/cons raw-word integer would be invisible to
+          ;; the collector and go stale across an allocation, e.g. when building
+          ;; several boxed-float args.)
+          (#.+op-push+
+           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
+             ;; regs already hold real VALUES — push the value directly (the
+             ;; old %word->val∘reg-get round-trip overflowed for boundary fixnums).
+             (push (svref regs vs) (mvm-stack state)) (setf pc npc)))
+          (#.+op-pop+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (unless (mvm-stack state) (error "MVM: stack underflow at PC ~D" (1- pc)))
+             (setf (svref regs vd) (pop (mvm-stack state))) (setf pc npc)))
+          (#.+op-set-nargs+
+           (multiple-value-bind (n npc) (%ifetch-byte bc pc)
+             (setf (mvm-nargs state) n) (setf pc npc)))
+          (#.+op-call+
+           ;; a runtime stub's target is not formed (a bignum on a 30-bit tower):
+           ;; %MVM-RT-ENTRY reads its number from the bytes
+           (multiple-value-bind (target npc)
+               (if (%mvm-rt-target-p runtime-table bc pc) (values nil (+ pc 4)) (%ifetch-u32 bc pc))
+             (if (null target)
+                 ;; Runtime native call: funcall the real function inline with
+                 ;; %word->val'd args (raw words -> real values, no marshalling),
+                 ;; store %val->word of the result in VR, continue after the CALL.
+                 (let* ((entry (%mvm-rt-entry runtime-table bc pc))
+                        (name (car entry))
+                        (fn (%mvm-rt-cell-fn-1 (cdr entry) name))
+                        (nargs (mvm-nargs state)))
+                   (if fn
+                       (let ((args
+                              ;; regs hold real VALUES — pass them directly (the
+                              ;; old %word->val∘reg-get round-trip overflowed for
+                              ;; a boundary-fixnum arg/result).  %mvm-collect-call-
+                              ;; args reads args 0..3 from V0..V3 and args 4+ from
+                              ;; the mvm-stack (overflow), wrapping any escaping
+                              ;; mvm-eval lambda value (a #x52 closure-over-offset or
+                              ;; a bare in-module offset) in a re-entrant
+                              ;; trampoline so a NATIVE higher-order callee
+                              ;; (mapcar/reduce/…) can funcall it.  Pre-fix this
+                              ;; read regs[0..nargs-1] only, so a >4-arg native
+                              ;; call got garbage for its 5th+ arg.
+                              (%mvm-collect-call-args state regs nargs
+                                                      bc ftab runtime-table
+                                                      lambda-offsets
+                                                      (%mvm-rt-cell-store-p-1 (cdr entry) name))))
+                         ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
+                         ;; multi-valued fns (floor/truncate/round/rem returning a
+                         ;; quotient AND remainder) write their secondaries to the
+                         ;; REAL MV slots, which mvm-eval never reads — mvm-eval reads the
+                         ;; SIMULATED MV slots (the mvm-memory hash, where compile-
+                         ;; values / multiple-value-bind store via op-store and read
+                         ;; via op-load).  So capture ALL return values here and
+                         ;; mirror them into the simulated slots using the SAME word
+                         ;; encoding op-store uses for :u64 (the WORD = %val->word of
+                         ;; the value): mem-write count to +mv-count-addr+ and each
+                         ;; secondary's word to +mv-values-addr+ + i*8.  The primary
+                         ;; still goes in VR (single-value calls write count=1, so the
+                         ;; non-MV path is unchanged).  Constants are interp-local
+                         ;; (the compiler loads after interp, so its +mv-*-addr+
+                         ;; defconstants aren't in scope here) — use the raw addrs.
+                         (let* ((vals (multiple-value-list (apply fn args)))
+                                (nvals (length vals)))
+                           (setf (svref regs +vreg-vr+) (car vals))
+                           ;; count slot (#x10000090) holds the WORD of the fixnum
+                           ;; count — match a normal (setf (mem-ref ... :u64) n),
+                           ;; which stores (reg-get) = %val->word of the fixnum.
+                           (mem-write-value state (%conv-addr #x10000090) nvals 3)
+                           ;; secondaries (value 1+) -> #x10000098 + i*8, stored
+                           ;; as VALUES (op-store's path).  The old %val->word
+                           ;; SHL overflowed for |v| >= 2^61, so (floor 1 mnf)'s
+                           ;; remainder -4611686018427387903 came back as 1.
+                           (let ((i 0))
+                             (dolist (v (cdr vals))
+                               (mem-write-value state (+ (%conv-addr #x10000098) (* i 8)) v 3)
+                               (incf i)))))
+                       ;; Unresolved runtime name: signal UNDEFINED-FUNCTION
+                       ;; (CL semantics — `(eval '(no-such-fn))` must signal).
+                       ;; The old silent `(reg-set VR +mvm-nil+)` made every
+                       ;; undefined call quietly evaluate to NIL under mvm-eval,
+                       ;; so error-expecting ANSI tests failed and value tests
+                       ;; got NILs (WS3 flip).  The signal lands in this
+                       ;; DO-instruction's outer handler-case: routed to an
+                       ;; in-module handler frame when one is active, else
+                       ;; re-signalled out of mvm-interpret to the caller.
+                       ;; CELL-ERROR-NAME is the SYMBOL (upstream
+                       ;; CELL-ERROR-NAME.2): NAME is the runtime-table key,
+                       ;; "PKG::SYM" or a bare name.
+                       (error (quote undefined-function)
+                              :name (%runtime-fn-name-symbol name)))
+                   (setf pc npc))
+                 ;; In-module call: push return frame, jump to the bytecode.
+                 ;; SAVE VFP (the caller's frame array) in the frame: the
+                 ;; callee's frame-enter overwrites VFP with a fresh array and
+                 ;; nothing restored it, so after the callee RET the caller
+                 ;; read its OWN locals through the callee's frame → a local
+                 ;; re-read after a call returned NIL (the accumulator
+                 ;; `(funcall f) (funcall f)` lost f on the 2nd read).  op-ret
+                 ;; restores VFP from the frame.
+                 (progn
+                   ;; CALLEE-SAVED REGISTERS (2026-09-18): native code preserves
+                   ;; V4-V8 (x19-x23) and the local registers V9/V10 (x6/x7)
+                   ;; through the callee's prologue/epilogue, and the compiler's
+                   ;; register promotion relies on that (a promoted local is
+                   ;; live across calls).  Snapshot V4..V10 into the frame and
+                   ;; restore them at RET so the interpreter is faithful to the
+                   ;; ISA (found by the promotion probe: recursion clobbered the
+                   ;; caller's promoted locals under MODUS_NO_JIT).
+                   (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
+                               (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))
+                         (mvm-call-stack state))
+                   (setf pc (if (< target (length ftab)) (aref ftab target) target))))))
+          (#.+op-obj-set+
+           (multiple-value-bind (vobj npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (idx npc2) (%ifetch-byte bc npc)
+               (multiple-value-bind (vs npc3) (%ifetch-reg bc npc2)
+                 (let ((obj (svref regs vobj)))
+                   (%obj-elt-set obj idx (svref regs vs)))
+                 (setf pc npc3)))))
+          (#.+op-bne+
+           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
+             (setf pc (if (/= (mvm-flags state) 0) (+ npc off) npc))))
+          (#.+op-cmp+
+           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vb npc2) (%ifetch-reg bc npc)
+               ;; Compare the register VALUES directly.  The old
+               ;; `(reg-get regs vX)` = `%val->word` (SHL 1) OVERFLOWS the
+               ;; 64-bit register for a fixnum VALUE near 2^62 (V<<1 sets
+               ;; the top word bit → the SHL's V<<2 wraps negative), so
+               ;; `(< BIG-POSITIVE 0)` wrongly returned :lt.  Two big
+               ;; fixnums compared to EACH OTHER happened to survive
+               ;; (both wrap the same way, order preserved), but a big
+               ;; fixnum vs a small constant did not — breaking the
+               ;; sign test in compile-mod's floor adjustment (the mvm-eval
+               ;; mod bug).  The slots hold real VALUES; comparing them
+               ;; directly is exact for fixnums, bignums, and floats.
+               (let ((a (svref regs va)) (b (svref regs vb)))
+                 (setf (mvm-flags state)
+                       (cond ((and (integerp a) (integerp b))
+                              (cond ((= a b) 0) ((< a b) -1) (t 1)))
+                             ((eql a b) 0)
+                             (t 1))))
+               (setf pc npc2))))
+          ;; CMP-IMM / TEST-IMM: the immediate is a sign-extended WORD.  The
+          ;; compiler emits CMP-IMM with a fixnum's word (2k), whose VALUE k is
+          ;; compared with an integer register, or with a CHARACTER's word,
+          ;; compared for equality with the register's word (as :CMP does).
+          (#.+op-cmp-imm+
+           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
+             ;; the immediate read SIGNED, not as an unsigned u32 put through
+             ;; %IMM32-SIGNED: on a 30-bit tower #x80000000 is a bignum, so every
+             ;; CMP-IMM compared against one (and a negative immediate was a
+             ;; bignum subtraction) -- most of an interpreted loop on a 68000
+             (multiple-value-bind (w npc2) (%ifetch-s32 bc npc)
+               (let* ((a (svref regs va)) (b (ash w -1)))
+                 (setf (mvm-flags state)
+                       (cond ((oddp w) (if (= (%mvm-word a) w) 0 1))
+                             ((integerp a) (cond ((= a b) 0) ((< a b) -1) (t 1)))
+                             (t 1))))
+               (setf pc npc2))))
+          (#.+op-li+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             ;; Peek the high 32 bits to choose the load path WITHOUT forming the
+             ;; full word.  |word| < 2^62 (the normal case: small fixnums, the
+             ;; tag-check mask `1`, char/pointer immediates) goes through the
+             ;; reg-set / %word->val path, which keeps the value<->word round-trip
+             ;; exact so the WORD-domain ops (:or/:test/:and via reg-get) see the
+             ;; right bits.  |word| >= 2^62 means a boundary fixnum literal whose
+             ;; word overflows the in-image fixnum range — fetch-li-value returns
+             ;; %word->val(word) DIRECTLY (overflow-free), stored as the value.
+             ;; The NIL / T IMMEDIATES are recognised from their WIRE BYTES and
+             ;; stored as VALUES, before either arithmetic path can touch them.
+             ;;
+             ;; mvm-li encodes its operand verbatim, and compile-t emits
+             ;; `(:li dest +t-value+)', so a T literal arrives here as the raw
+             ;; word #xDEAD1009 (and compiler.lisp's %MCGC-COLLECT path emits
+             ;; #xDEAD0001 the same way).  Both have hi = 0, so the split test
+             ;; below — which reads the HIGH word only and is really a "does
+             ;; |word| reach 2^62" question, i.e. a 62-bit-tower test — sends
+             ;; them down the reg-set branch, where %word->val is an unguarded
+             ;; :sar on what is a BIGNUM at this width.  The T literal came back
+             ;; corrupted: still non-NIL, so `(if t …)' and every truthiness
+             ;; test kept working, but `(eq (eval t) t)' was FALSE.  Silent, and
+             ;; it would break any `(eq x t)' in eval'd code.
+             ;;
+             ;; Discriminating on bytes 3,2 = DE,AD costs one aref and one
+             ;; compare on the hot path and short-circuits immediately for
+             ;; ordinary literals; no #xDEADxxxx word is a legitimate fixnum
+             ;; immediate.  A no-op on the 64-bit targets, where reg-set already
+             ;; yields exactly T / NIL for these two words.
+             ;; HI-SIGNED (bytes 4..7 as a signed 32-bit number) by Horner's
+             ;; rule from the SIGNED top byte, as %IFETCH-LI-VALUE does.  It was
+             ;; (logior ... (ash b7 24)) then (>= hi #x80000000) / (- hi
+             ;; #x100000000): on a 30-bit tower all three are bignums -- the
+             ;; compare against #x80000000 on EVERY LI, the shift and subtract
+             ;; on every negative literal.  Measured on a 68000 Mac, that was
+             ;; most of an interpreted loop.
+             (let* ((hi-signed (let ((b7 (aref bc (+ npc 7))))
+                                 (+ (* (+ (* (+ (* (if (>= b7 128) (- b7 256) b7) 256)
+                                                (aref bc (+ npc 6)))
+                                             256)
+                                          (aref bc (+ npc 5)))
+                                       256)
+                                    (aref bc (+ npc 4)))))
+                    (deadp (and (= (aref bc (+ npc 3)) +mvm-nil-b3+)
+                                (= (aref bc (+ npc 2)) +mvm-nil-b2+)
+                                (= hi-signed 0))))
+               (cond
+                 ((and deadp (= (aref bc (+ npc 1)) +mvm-nil-b1+)
+                       (= (aref bc npc) +mvm-nil-b0+))
+                  (reg-set-nil regs vd) (setf pc (+ npc 8)))
+                 ((and deadp (= (aref bc (+ npc 1)) +mvm-t-b1+)
+                       (= (aref bc npc) +mvm-t-low-byte+))
+                  (reg-set-t regs vd) (setf pc (+ npc 8)))
+                 ;; |W| >= 2^+fixnum-bits+: the word is not a fixnum VALUE, so
+                 ;; reg-set's %word->val would wrap it.  TOP is W>>24 (hi and
+                 ;; byte 3 only), so the test stays in fixnums at every width.
+                 ;; On the 62-bit tower this is exactly the old
+                 ;; `hi-signed outside [-2^30, 2^30)' test; on the 30-bit one
+                 ;; it catches every literal with |value| >= 2^29, which the
+                 ;; old test sent down the wrapping path.
+                 ((let ((top (+ (* hi-signed 256) (aref bc (+ npc 3))))
+                        (lim (ash 1 (- +fixnum-bits+ 24))))
+                    ;; INCLUSIVE below: W = -2^+fixnum-bits+ (value -2^29 at
+                    ;; 30 bits) is a machine word but not a fixnum VALUE here
+                    ;; (+fixnum-min+ is -(2^bits - 1)), so it wraps too.
+                    (or (>= top lim) (<= top (- lim))))
+                  (multiple-value-bind (val npc2) (%ifetch-li-value bc npc)
+                    (setf (svref regs vd) val) (setf pc npc2)))
+                 (t
+                  (multiple-value-bind (imm npc2) (%ifetch-u64 bc npc)
+                    (reg-set regs vd imm) (setf pc npc2)))))))
+          ;; LI-CONST: load constant-pool[idx] — the mvm-eval QUOTE pool.  The
+          ;; compiler (compile-quote under *mvm-eval-runtime-p*) registered the
+          ;; ORIGINAL quoted object in the global *e2-const-pool* and emitted
+          ;; the pool INDEX as the imm64; loading the object back preserves
+          ;; QUOTE identity exactly (CLHS: quote returns its object), matching
+          ;; the tree-walker.  The pool is a global hash (GC root via the
+          ;; special), so the bytecode stays position/GC-independent.
+          (#.+op-li-const+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (idx npc2) (%ifetch-u64 bc npc)
+               ;; (A worker's own literals live in ITS pool, which may exist
+               ;; while the shared one does not: %E2-CONST-REF reads both.)
+               (reg-set regs vd (%val->word (%e2-const-ref idx)))
+               (setf pc npc2))))
+          (#.+op-beq+
+           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
+             (setf pc (if (= (mvm-flags state) 0) (+ npc off) npc))))
+          (#.+op-bnull+
+           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (off npc2) (%ifetch-s32 bc npc)
+               (setf pc (if (reg-nil-p regs vs) (+ npc2 off) npc2)))))
+          (#.+op-set-mv-count+
+           (multiple-value-bind (n npc) (%ifetch-byte bc pc)
+             (setf (mvm-mv-count state) n)
+             ;; ALSO write the SIMULATED MV-count slot (#x10000090).  In
+             ;; native code op-set-mv-count and the mem-ref MV-count slot are
+             ;; ONE real memory location; the interp modeled them separately
+             ;; (state field vs memory hash), so a function epilogue's
+             ;; set-mv-count=1 reset never reached the slot that
+             ;; multiple-value-bind / the mvm-eval MV return path read — a stale
+             ;; count from an inner (values …) leaked past a single-value
+             ;; return.  Word encoding matches op-store / the bridge mirror.
+             (mem-write state (%conv-addr #x10000090) (%val->word n) 3)
+             (setf pc npc)))
           (#.+op-trap+
            ;; TRAP code:u16 multiplexes several compiler pseudo-ops:
            ;;   code  < #x100  : FRAME-ENTER  (code = param count) — allocate frame
@@ -1807,23 +2105,437 @@
                         (setq i (1+ i)))))
                   (reg-set regs +vreg-vfp+ (%val->word frame)))
                 (setf pc npc)))))
-
-          ;; --- Data Movement ---
-          (#.+op-mov+
+          (#.+op-ret+
+           (if (mvm-call-stack state)
+               (let ((frame (pop (mvm-call-stack state))))
+                 ;; frame = (return-pc saved-stack saved-vfp).  Restore the
+                 ;; caller's PC, operand stack AND frame pointer — the last
+                 ;; so a local re-read in the caller after this call sees the
+                 ;; caller's frame, not the (now-dead) callee's.
+                 (setf pc (first frame))
+                 (setf (mvm-stack state) (second frame))
+                 (setf (svref regs +vreg-vfp+) (third frame))
+                 ;; restore the callee-saved range V4..V13 (see op-call)
+                 (when (fourth frame)
+                   (replace regs (fourth frame) :start1 +vreg-v4+)))
+               (progn (setq %halted t) (setf (mvm-halted state) t))))
+          (#.+op-test-imm+
+           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (w npc2) (%ifetch-s32 bc npc)  ; signed: see CMP-IMM
+               (let ((r (logand (%mvm-word (svref regs va)) w)))
+                 (setf (mvm-flags state)
+                       (cond ((zerop r) 0) ((< r 0) -1) (t 1))))
+               (setf pc npc2))))
+          (#.+op-blt+
+           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
+             (setf pc (if (< (mvm-flags state) 0) (+ npc off) npc))))
+          (#.+op-obj-tag+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
-               ;; Plain register-to-register copy: move the slot VALUE directly.
-               ;; The old `(reg-set vd (reg-get vs))` round-tripped through
-               ;; %val->word (SHL 1) then %word->val (SAR 1) — an identity ONLY
-               ;; while %val->word's value<<1 fits int64.  For a fixnum VALUE
-               ;; near 2^62 the compiled :shl's value<<2 overflows the register
-               ;; and the :sar reads garbage, CORRUPTING the moved operand.  The
-               ;; mvm-eval pairwise-arith step (%compile-arith-arg-step-e2) emits
-               ;; `:mov temp dest` on a freshly compiled ~2^62 literal, so
-               ;; `(+ -3 4611686018427387900)` fed generic-add a garbage second
-               ;; operand and returned -7 (native was correct).  A move needs no
-               ;; reinterpretation — the slots already hold real VALUES.
-               (setf (svref regs vd) (svref regs vs)) (setf pc npc2))))
+               ;; Read the register VALUE directly.  The old
+               ;; `(%word->val (reg-get regs vs))` is `%val->word` (SHL 1)
+               ;; then `%word->val` (SAR 1) — a round-trip that OVERFLOWS
+               ;; the 64-bit register for a fixnum VALUE near 2^62 (V<<1
+               ;; already sets the top word bit, so the SHL's V<<2 wraps),
+               ;; yielding a garbage `obj`.  That mis-classified a ~2^62
+               ;; fixnum as an OBJECT → (bignump BIG-FIXNUM) spuriously T
+               ;; → (truncate/mod BIG BIG) routed to the slow bignum path
+               ;; and returned garbage (the mvm-eval gcd/mod bug).  The slot
+               ;; already holds the VALUE, so use it directly.
+               (let ((obj (svref regs vs)))
+                 (reg-set regs vd
+                       ;; A BIGNUM is `integerp' = T but is a tag-9 OBJECT, not a
+                       ;; fixnum — reporting +tag-fixnum+ for it made (bignump
+                       ;; <bignum>) = NIL under mvm-eval, so %integer-truncate's
+                       ;; (not (bignump a)) treated a ~2^62 bignum as a fixnum and
+                       ;; ran inline :div on its heap POINTER → garbage varying
+                       ;; per run (gcd.4 / test 13621 0xDEAD0004 wild call).
+                       ;; Exclude bignums so they route to +tag-object+.
+                       (tag-fixnum (cond ((consp obj) +tag-cons+)
+                                         ((and (integerp obj) (not (bignump obj)))
+                                          +tag-fixnum+)
+                                         (t +tag-object+)))))  ; native object / bignum
+               (setf pc npc2))))
+          (#.+op-array-len+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vobj npc2) (%ifetch-reg bc npc)
+               (let ((obj (svref regs vobj)))
+                 (setf (svref regs vd) (%obj-elt-len obj)))
+               (setf pc npc2))))
+          (#.+op-bge+
+           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
+             (setf pc (if (>= (mvm-flags state) 0) (+ npc off) npc))))
+          (#.+op-or+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (%mvm-bitop-words 1 (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+          (#.+op-obj-subtag+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               ;; native subtag extraction via the obj-subtag primop.
+               ;;
+               ;; Two callable representations cross this opcode and they need
+               ;; DIFFERENT subtags so funcall's dispatch routes them correctly:
+               ;;   - a native CLOSURE object (subtag #x52), built by
+               ;;     compile-make-closure / %make-closure for a CAPTURING
+               ;;     lambda — funcall must take the set-cenv + call-indirect
+               ;;     closure path, which is gated on subtag #x52.
+               ;;   - a bare native FUNCTION (a raw fn-addr resolved by
+               ;;     op-FN-ADDR for #'NAME / a captureless lambda) — NOT a
+               ;;     tagged object, so the raw obj-subtag primop reads garbage;
+               ;;     report #x51 so funcall skips sym/closure/array and falls
+               ;;     through to CALL-INDIRECT's bridge.
+               ;; The earlier `(if (functionp obj) #x51 …)` collapsed BOTH to
+               ;; #x51 because native functionp is true for a #x52 closure too,
+               ;; so every CAPTURING lambda fell out of the closure path → the
+               ;; funcall returned NIL (WS4 oracle).  Fix: prefer the real
+               ;; obj-subtag for genuine OBJECTS (tag = object); only the
+               ;; non-object callable (raw fn-addr) gets the #x51 fallback.
+               ;; Read the VALUE directly (see op-obj-tag): the
+               ;; `(%word->val (reg-get regs vs))` round-trip overflows for
+               ;; a fixnum VALUE near 2^62.  A non-object value falls
+               ;; through obj-subtag's non-tag-9 bail below, so passing the
+               ;; VALUE straight through is correct for objects AND fixnums.
+               (let* ((obj (svref regs vs))
+                      (raw-st (obj-subtag obj))
+                      (st (cond
+                            ;; Genuine non-callable heap object: a clean
+                            ;; low-subtag (< #x50) is a real vector/array/
+                            ;; struct/hash/bignum/ratio/float/etc. — return it
+                            ;; directly, BEFORE the functionp fallback below.
+                            ;; Without this a u8 vector (subtag #x11) whose heap
+                            ;; address happens to satisfy functionp's legacy
+                            ;; code-range check would be reported as #x51
+                            ;; (native-fn) → arrayp/vectorp/typep all break.
+                            ;; Callable subtags (#x50 symbol / #x51 fn / #x52
+                            ;; closure / #x53 keyword) still fall through to the
+                            ;; dispatch-aware arms.  raw-st = 0 means obj-subtag
+                            ;; bailed (non-object) → fall through to functionp.
+                            ((and (> raw-st 0) (< raw-st #x50))
+                             raw-st)
+                            ;; A CLOSURE object reads a clean #x52 from the
+                            ;; obj-subtag primop.  Keep #x52 ONLY for an
+                            ;; IN-MODULE closure — slot 0 is a recorded lambda
+                            ;; bytecode offset — so funcall takes the fast
+                            ;; set-cenv + call-indirect path (the CAPTURING
+                            ;; lambda case; checked BEFORE the functionp arm
+                            ;; because native functionp is true for #x52 too).
+                            ;; A NATIVE #x52 closure (an mvm-eval TRAMPOLINE from
+                            ;; a persisted defun, or any build-time closure)
+                            ;; carries a NATIVE CODE ADDRESS in slot 0 — the
+                            ;; compiled closure path would obj-ref it and
+                            ;; op-call-ind would jump to it as a bytecode pc
+                            ;; (garbage — the run is silently abandoned).
+                            ;; Report #x51 so the dispatch falls through to
+                            ;; CALL-INDIRECT's functionp bridge with the
+                            ;; closure OBJECT, which native funcall/apply
+                            ;; handle correctly — (funcall #'persisted-defun),
+                            ;; (funcall (symbol-function 'f)), uiop's
+                            ;; (funcall detect) in detect-os.
+                            ((= raw-st #x52)
+                             (if (%mvm-module-fn-offset-p
+                                   (%obj-elt-ref obj 0) lambda-offsets)
+                                 #x52
+                                 #x51))
+                            ;; A bare native FUNCTION (raw fn-addr from #'NAME /
+                            ;; captureless lambda) is NOT a tagged object, so
+                            ;; obj-subtag's read above is garbage — report #x51
+                            ;; so funcall falls through to CALL-INDIRECT's
+                            ;; native bridge (funcall/apply/mapcar #'NAME).
+                            ((functionp obj) #x51)
+                            (t raw-st))))
+                 (reg-set regs vd (tag-fixnum st)))
+               (setf pc npc2))))
+          (#.+op-get-nargs+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (reg-set regs vd (tag-fixnum (mvm-nargs state))) (setf pc npc)))
+          (#.+op-gc-check+ nil)
+          (#.+op-cons+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
+                 ;; The cell is stored into REGS, a simple-vector the collector
+                 ;; traces — no retention list needed.  See the mvm-state HEAP
+                 ;; slot comment for why the old push was not just redundant but
+                 ;; ineffective for the case it was written to cover.
+                 (setf (svref regs vd) (cons (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+          ;; Registers hold RAW WORDS.  Reinterpret to a real value with
+          ;; %word->val, do the NATIVE list op on the real (shared-heap) object,
+          ;; and %val->word the result back to a raw word.  So a cons the
+          ;; interpreter builds IS a real native cons holding real values —
+          ;; directly usable by native runtime functions, no marshalling.
+          ;; (mvm-boolean already returns the raw word of t/nil, so consp/atom
+          ;; store it directly.)  GC-SAFE: reg-get/reg-set keep regs slots holding
+          ;; real VALUES, so the moving collector traces+updates held pointers
+          ;; (validated by the list-build-under-early-GC stress test).
+          (#.+op-car+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               (let ((v (svref regs vs)))
+                 (setf (svref regs vd)
+                       (cond ((consp v) (car v))
+                             ((null v) nil)
+                             (t (error 'mvm-type-error :operation "CAR"
+                                       :expected "cons or nil" :got v)))))
+               (setf pc npc2))))
+          (#.+op-cdr+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               (let ((v (svref regs vs)))
+                 (setf (svref regs vd)
+                       (cond ((consp v) (cdr v))
+                             ((null v) nil)
+                             (t (error 'mvm-type-error :operation "CDR"
+                                       :expected "cons or nil" :got v)))))
+               (setf pc npc2))))
+          ;; SHR / SAR ARE WORD-LEVEL, exactly as the native translators
+          ;; implement them.  They shift the TAGGED WORD, not the fixnum value.
+          ;;
+          ;; This used to untag, shift the VALUE, and re-tag.  That round trip
+          ;; discards bit 0, so it was LOSSY in precisely the case the compiler
+          ;; relies on: `(:sar Vd Vd +fixnum-shift+)` is the UNTAG idiom (see
+          ;; compile-make-array-raw, compile-make-string-array, and ~7 further
+          ;; sites that emit `:shr Vd Vd +fixnum-shift+`).  A tagged fixnum's
+          ;; word is 2n — always even — so a word-level shift recovers n
+          ;; EXACTLY for every n, odd or even; the old value-level form yielded
+          ;; 2*(n>>1), i.e. n-1 for odd n.  That was the residual left by the
+          ;; alloc-array/alloc-string fix: (make-array 1001) built 1000.
+          ;;
+          ;; The obvious objection — "won't word-level shifts break (ash v k)?"
+          ;; — does not hold, and it is why this was not fixed sooner.  Reading
+          ;; the shift in isolation says yes: 2v>>1 = v is an ODD word for odd
+          ;; v, an invalid tagged fixnum.  But compile-ash does not stop there:
+          ;; its right-shift path emits `:sar` AND THEN MASKS the low tag bit
+          ;; with -2, restoring a valid word.  Measured, native and interpreted
+          ;; agree and are correct: (ash 9 -1) = 4 both ways.  The sequence is
+          ;; what has to be read, not the opcode.
+          ;;
+          ;; The general principle: the interpreter is a REFERENCE
+          ;; implementation of this ISA.  Being "more correct" than the
+          ;; translators is itself a divergence — it silently papers over
+          ;; compiler bugs while introducing its own.  Faithfulness first;
+          ;; if a faithful interpreter exposes a wrong answer, that is a
+          ;; compiler bug to fix at the source.
+          (#.+op-shr+ ; logical shift right — word-level
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (amt npc3) (%ifetch-byte bc npc2)
+                 (let ((a (svref regs vs)))
+                   (if (and (typep a 'fixnum) (>= a 0) (>= amt 1))
+                       (reg-set regs vd (ash a (- 1 amt)))
+                       ;; A negative word is shifted as the UNSIGNED machine
+                       ;; word -- 32 bits on the 30-bit tower, not a fixed 64.
+                       (let ((w (%mvm-word a)))
+                         (%mvm-put-word regs vd
+                                        (%mvm-wrap-word
+                                         (ash (if (>= w 0)
+                                                  w
+                                                  (logand w (1- (ash 1 (+ +fixnum-bits+ 2)))))
+                                              (- amt)))))))
+                 (setf pc npc3)))))
+          (#.+op-add-checked+
+           ;; High-level `+`: promote on overflow via GENERIC-ADD.
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (generic-add (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+          (#.+op-load+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vaddr npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
+                 ;; Mask +WIDTH-TLS-BIT+: the interpreter simulates ONE
+                 ;; address space with one thread, so a thread-local width is
+                 ;; the plain width.  See mvm/mvm.lisp.
+                 (setf width (logand width 3))
+                 (let ((addr (reg-get regs vaddr)))
+                   ;; compile-mem-ref already untags the address (:shr addr 1),
+                   ;; so the reg holds the raw address VALUE.  reg-get's %val->word
+                   ;; restores the full address word; do NOT untag again (that
+                   ;; extra halving collapsed adjacent 8-byte slots to 2-byte
+                   ;; physical spacing, corrupting the MV-VALUES region — every
+                   ;; secondary's high 32 bits got the next slot's value).
+                   ;;
+                   ;; MEM-READ-VALUE deposits the VALUE whose word is the loaded
+                   ;; bits — the register-domain equivalent of the native
+                   ;; MOVZX/MOV — so no re-tagging happens here.  compile-mem-ref
+                   ;; emits the `:shl 1` re-tag itself for u8/u16/u32, exactly as
+                   ;; the translators run it.
+                   (setf (svref regs vd) (mem-read-value state addr width)))
+                 (setf pc npc3)))))
+          (#.+op-store+
+           (multiple-value-bind (vaddr npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
+                 (setf width (logand width 3))   ; +WIDTH-TLS-BIT+: see op-load
+                 (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
+                   ;; See op-load: the address is already untagged by compile-
+                   ;; mem-ref's :shr; reg-get restores its word — do NOT untag
+                   ;; again (the extra halving collapsed MV slot spacing 4x).
+                   ;;
+                   ;; The VALUE is not untagged here either, and that is the
+                   ;; second half of task #272.  A `(when (< width 3) …
+                   ;; untag-fixnum)` used to sit here, so a u8/u16/u32 store went
+                   ;; through TWO untags: compile-setf already emits
+                   ;; `:sar dest dest 1` ahead of the `:store`, and the
+                   ;; translators then do a plain `MOV [addr],r8` / `STRB` with
+                   ;; no shift of their own.  Halving again wrote v/2.  Read the
+                   ;; emitted SEQUENCE, not the opcode name: :store is a bare
+                   ;; machine store at EVERY width.
+                   (mem-write-value state addr (svref regs vs) width))
+                 (setf pc npc3)))))
+          (#.+op-bnnull+
+           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (off npc2) (%ifetch-s32 bc npc)
+               (setf pc (if (not (reg-nil-p regs vs)) (+ npc2 off) npc2)))))
+          (#.+op-sub-checked+
+           ;; High-level `-`: promote on overflow via GENERIC-SUBTRACT.
+           ;; Mirror of op-add-checked.  Unlike raw op-sub (which reproduces
+           ;; native :sub's LOAD-BEARING int64 wrap for bignum limb borrow
+           ;; detection), this promoting variant returns the TRUE difference,
+           ;; overflowing a fixnum into a bignum — so `(- 0 mnf)` = 2^62 does
+           ;; not wrap back to mnf.  generic-subtract dispatches fixnum /
+           ;; bignum / ratio / float and never re-enters this handler because
+           ;; its bignum-core limb subtracters use raw %fixnum-- (not `-`).
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (generic-subtract (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+          (#.+op-call-ind+
+           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
+             ;; Read the raw stored VALUE (svref), not reg-get: a FN-ADDR to an
+             ;; out-of-module name stores a real native function OBJECT directly
+             ;; in the slot (the alloc-obj store convention), and reg-get's
+             ;; %val->word would SHL-1 that object into garbage.  An in-module
+             ;; FN-ADDR stores the bytecode OFFSET as a tagged fixnum value.
+             (let ((target (svref regs vs)))
+               (cond
+                 ;; In-module bytecode offset (a plain integer): jump to it.
+                 ;; MUST be checked BEFORE the functionp branch: a closure's
+                 ;; fn-slot (and a captureless lambda's li-func) stores the
+                 ;; closure/lambda's in-module bytecode OFFSET as a small
+                 ;; integer, and functionp's code-range heuristic returns T
+                 ;; for such a small integer — so the old functionp-first
+                 ;; order routed every in-module closure call into the native
+                 ;; bridge `(apply <offset> args)` → SIGSEGV (the offset is
+                 ;; not a real function).  A genuine resolved native function
+                 ;; OBJECT (the #'NAME bridge target) is NOT integerp, so it
+                 ;; correctly falls through to the functionp branch below.
+                 ;; Save VFP in the frame (see op-CALL) so a local re-read in
+                 ;; the caller after this call survives the callee's frame.
+                 ((integerp target)
+                  (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
+                              (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))   ; callee-saved V4..V13, see op-call
+                        (mvm-call-stack state))
+                  (setf pc target))
+                 ;; Higher-order mvm-eval bridge: a resolved native function object
+                 ;; (#'+ , #'1+ , #'< , a %*-FN wrapper, etc.).  funcall/apply/
+                 ;; mapcar all route through here.  Pull nargs args (V0..) from
+                 ;; the register file exactly as op-CALL's runtime bridge does and
+                 ;; store the primary result in VR; do NOT push a return frame
+                 ;; (the call completes natively, control returns inline).
+                 ((functionp target)
+                  (let* ((nargs (mvm-nargs state))
+                         ;; Read args 0..3 from V0..V3 and args 4+ from the
+                         ;; mvm-stack overflow (see op-CALL's bridge + %mvm-
+                         ;; collect-call-args).  Wraps any escaping mvm-eval lambda
+                         ;; arg in a trampoline so a native HOF reached via
+                         ;; funcall/apply (e.g. (apply #'mapcar (list lambda
+                         ;; list))) can funcall it.  Pre-fix this read
+                         ;; regs[0..nargs-1] only → garbage for the 5th+ arg.
+                         (args (%mvm-collect-call-args state regs nargs
+                                                       bc ftab runtime-table
+                                                       lambda-offsets)))
+                    ;; PROPAGATE SECONDARY VALUES across the funcall/apply
+                    ;; bridge — identical to op-CALL's runtime-native branch.
+                    ;; A native (or cross-module registered) multi-valued fn
+                    ;; reached via (funcall #'FN …) / (apply #'FN …) writes its
+                    ;; secondaries only into its OWN return list; mvm-eval's
+                    ;; multiple-value-bind/-list read the SIMULATED MV slots
+                    ;; (mem #x10000090 count + #x10000098+ extras via op-load).
+                    ;; Without mirroring here, (funcall #'FN …) truncated to the
+                    ;; primary value — the chipz %inflate `(values consumed
+                    ;; produced)` returned through %decompress/null-vector's
+                    ;; `(funcall fun …)` lost `produced` (garbage 2nd value).
+                    ;; Capture ALL values, put primary in VR, mirror the count
+                    ;; and secondaries into the simulated slots (same WORD
+                    ;; encoding op-store uses for :u64).
+                    (let* ((vals (multiple-value-list (apply target args)))
+                           (nvals (length vals)))
+                      (setf (svref regs +vreg-vr+) (car vals))
+                      (mem-write state (%conv-addr #x10000090) (%val->word nvals) 3)
+                      (let ((i 0))
+                        (dolist (v (cdr vals))
+                          (mem-write state (+ (%conv-addr #x10000098) (* i 8))
+                                     (%val->word v) 3)
+                          (incf i))))
+                    (setf pc npc)))
+                 (t
+                  (error "MVM: CALL-IND with non-callable target ~S" target))))))
+          (#.+op-fn-addr+
+           ;; (fn-addr Vd target:imm32) — load a callable for #'NAME / (function
+           ;; NAME) / a captureless lambda.  The target is either:
+           ;;   - a RUNTIME stub offset (>= runtime-call-base): #'NAME of a
+           ;;     native function.  Resolve the name to the REAL native function
+           ;;     OBJECT and store it directly in the slot (the alloc-obj store
+           ;;     convention: reg-set∘%val->word = identity), so CALL-INDIRECT's
+           ;;     functionp branch bridge-calls it.  This is the higher-order
+           ;;     mvm-eval path (funcall/apply/mapcar #'NAME).
+           ;;   - an in-module bytecode OFFSET: a captureless lambda or a defun
+           ;;     compiled in THIS thunk.  Store the offset as a plain fixnum
+           ;;     value so CALL-INDIRECT's integer branch jumps to the bytecode.
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (target npc2)
+                 (if (%mvm-rt-target-p runtime-table bc npc) (values nil (+ npc 4)) (%ifetch-u32 bc npc))
+               (if (null target)
+                   (let* ((entry (%mvm-rt-entry runtime-table bc npc))
+                          (name (car entry))
+                          (fn (and name (%mvm-rt-cell-fn-1 (cdr entry) name))))
+                     (if (functionp fn)
+                         (reg-set regs vd (%val->word fn))
+                         (reg-set-nil regs vd)))
+                   (setf (svref regs vd) target))
+               (setf pc npc2))))
+          (#.+op-tailcall+
+           (multiple-value-bind (target npc) (%ifetch-u32 bc pc)
+             (declare (ignore npc))
+             (setf pc (if (< target (length ftab)) (aref ftab target) target))))
+          ;; ADD/SUB: tag-preserving since (a<<1)+(b<<1) = (a+b)<<1
+          (#.+op-add+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
+                 ;; RAW WRAPPING add (see %mvm-wrap-tagword-add): reproduce
+                 ;; native :add's int64 wrap of the tagged words WITHOUT the
+                 ;; reg-get/%val->word round-trip, which overflowed for a
+                 ;; fixnum VALUE near 2^62 and collapsed the sum by 2^62
+                 ;; (the mvm-eval `(+ -3 4611686018427387900)` -> -7 bug).  The
+                 ;; wrap is load-bearing for bignum-add limb carry detection.
+                 (setf (svref regs vd)
+                       (%mvm-wrap-tagword-add (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+          (#.+op-sub+
+           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
+             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
+                 ;; RAW WRAPPING sub — mirror of op-add (see
+                 ;; %mvm-wrap-tagword-sub); reproduces native :sub's int64 wrap
+                 ;; of the tagged difference without the overflowing round-trip.
+                 (setf (svref regs vd)
+                       (%mvm-wrap-tagword-sub (svref regs va) (svref regs vb)))
+                 (setf pc npc3)))))
+          ;; --- the rest, as they were ---
+
+          ;; --- NOP / BREAK / TRAP ---
+
+          ;; --- Data Movement ---
 
           ;; LI-TADDR: an address in the image's own layout, loaded as a
           ;; FIXNUM -- i.e. the integer ADDR.  (The runtime compiler emits it
@@ -1841,161 +2553,7 @@
              (multiple-value-bind (addr npc2) (%ifetch-u64 bc npc)
                (setf (svref regs vd) (ash (+ addr (%layout-slide)) -1)) (setf pc npc2))))
 
-          (#.+op-li+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             ;; Peek the high 32 bits to choose the load path WITHOUT forming the
-             ;; full word.  |word| < 2^62 (the normal case: small fixnums, the
-             ;; tag-check mask `1`, char/pointer immediates) goes through the
-             ;; reg-set / %word->val path, which keeps the value<->word round-trip
-             ;; exact so the WORD-domain ops (:or/:test/:and via reg-get) see the
-             ;; right bits.  |word| >= 2^62 means a boundary fixnum literal whose
-             ;; word overflows the in-image fixnum range — fetch-li-value returns
-             ;; %word->val(word) DIRECTLY (overflow-free), stored as the value.
-             ;; The NIL / T IMMEDIATES are recognised from their WIRE BYTES and
-             ;; stored as VALUES, before either arithmetic path can touch them.
-             ;;
-             ;; mvm-li encodes its operand verbatim, and compile-t emits
-             ;; `(:li dest +t-value+)', so a T literal arrives here as the raw
-             ;; word #xDEAD1009 (and compiler.lisp's %MCGC-COLLECT path emits
-             ;; #xDEAD0001 the same way).  Both have hi = 0, so the split test
-             ;; below — which reads the HIGH word only and is really a "does
-             ;; |word| reach 2^62" question, i.e. a 62-bit-tower test — sends
-             ;; them down the reg-set branch, where %word->val is an unguarded
-             ;; :sar on what is a BIGNUM at this width.  The T literal came back
-             ;; corrupted: still non-NIL, so `(if t …)' and every truthiness
-             ;; test kept working, but `(eq (eval t) t)' was FALSE.  Silent, and
-             ;; it would break any `(eq x t)' in eval'd code.
-             ;;
-             ;; Discriminating on bytes 3,2 = DE,AD costs one aref and one
-             ;; compare on the hot path and short-circuits immediately for
-             ;; ordinary literals; no #xDEADxxxx word is a legitimate fixnum
-             ;; immediate.  A no-op on the 64-bit targets, where reg-set already
-             ;; yields exactly T / NIL for these two words.
-             ;; HI-SIGNED (bytes 4..7 as a signed 32-bit number) by Horner's
-             ;; rule from the SIGNED top byte, as %IFETCH-LI-VALUE does.  It was
-             ;; (logior ... (ash b7 24)) then (>= hi #x80000000) / (- hi
-             ;; #x100000000): on a 30-bit tower all three are bignums -- the
-             ;; compare against #x80000000 on EVERY LI, the shift and subtract
-             ;; on every negative literal.  Measured on a 68000 Mac, that was
-             ;; most of an interpreted loop.
-             (let* ((hi-signed (let ((b7 (aref bc (+ npc 7))))
-                                 (+ (* (+ (* (+ (* (if (>= b7 128) (- b7 256) b7) 256)
-                                                (aref bc (+ npc 6)))
-                                             256)
-                                          (aref bc (+ npc 5)))
-                                       256)
-                                    (aref bc (+ npc 4)))))
-                    (deadp (and (= (aref bc (+ npc 3)) +mvm-nil-b3+)
-                                (= (aref bc (+ npc 2)) +mvm-nil-b2+)
-                                (= hi-signed 0))))
-               (cond
-                 ((and deadp (= (aref bc (+ npc 1)) +mvm-nil-b1+)
-                       (= (aref bc npc) +mvm-nil-b0+))
-                  (reg-set-nil regs vd) (setf pc (+ npc 8)))
-                 ((and deadp (= (aref bc (+ npc 1)) +mvm-t-b1+)
-                       (= (aref bc npc) +mvm-t-low-byte+))
-                  (reg-set-t regs vd) (setf pc (+ npc 8)))
-                 ;; |W| >= 2^+fixnum-bits+: the word is not a fixnum VALUE, so
-                 ;; reg-set's %word->val would wrap it.  TOP is W>>24 (hi and
-                 ;; byte 3 only), so the test stays in fixnums at every width.
-                 ;; On the 62-bit tower this is exactly the old
-                 ;; `hi-signed outside [-2^30, 2^30)' test; on the 30-bit one
-                 ;; it catches every literal with |value| >= 2^29, which the
-                 ;; old test sent down the wrapping path.
-                 ((let ((top (+ (* hi-signed 256) (aref bc (+ npc 3))))
-                        (lim (ash 1 (- +fixnum-bits+ 24))))
-                    ;; INCLUSIVE below: W = -2^+fixnum-bits+ (value -2^29 at
-                    ;; 30 bits) is a machine word but not a fixnum VALUE here
-                    ;; (+fixnum-min+ is -(2^bits - 1)), so it wraps too.
-                    (or (>= top lim) (<= top (- lim))))
-                  (multiple-value-bind (val npc2) (%ifetch-li-value bc npc)
-                    (setf (svref regs vd) val) (setf pc npc2)))
-                 (t
-                  (multiple-value-bind (imm npc2) (%ifetch-u64 bc npc)
-                    (reg-set regs vd imm) (setf pc npc2)))))))
-
-          ;; LI-CONST: load constant-pool[idx] — the mvm-eval QUOTE pool.  The
-          ;; compiler (compile-quote under *mvm-eval-runtime-p*) registered the
-          ;; ORIGINAL quoted object in the global *e2-const-pool* and emitted
-          ;; the pool INDEX as the imm64; loading the object back preserves
-          ;; QUOTE identity exactly (CLHS: quote returns its object), matching
-          ;; the tree-walker.  The pool is a global hash (GC root via the
-          ;; special), so the bytecode stays position/GC-independent.
-          (#.+op-li-const+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (idx npc2) (%ifetch-u64 bc npc)
-               ;; (A worker's own literals live in ITS pool, which may exist
-               ;; while the shared one does not: %E2-CONST-REF reads both.)
-               (reg-set regs vd (%val->word (%e2-const-ref idx)))
-               (setf pc npc2))))
-
-          ;; PUSH/POP store real VALUES on mvm-stack (not raw words) so the GC
-          ;; traces/updates pushed pointers — same GC-safety reason as the regs
-          ;; vector.  (A pushed float/cons raw-word integer would be invisible to
-          ;; the collector and go stale across an allocation, e.g. when building
-          ;; several boxed-float args.)
-          (#.+op-push+
-           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
-             ;; regs already hold real VALUES — push the value directly (the
-             ;; old %word->val∘reg-get round-trip overflowed for boundary fixnums).
-             (push (svref regs vs) (mvm-stack state)) (setf pc npc)))
-
-          (#.+op-pop+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (unless (mvm-stack state) (error "MVM: stack underflow at PC ~D" (1- pc)))
-             (setf (svref regs vd) (pop (mvm-stack state))) (setf pc npc)))
-
           ;; --- Arithmetic (tagged fixnums: value << 1) ---
-          ;; ADD/SUB: tag-preserving since (a<<1)+(b<<1) = (a+b)<<1
-          (#.+op-add+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
-                 ;; RAW WRAPPING add (see %mvm-wrap-tagword-add): reproduce
-                 ;; native :add's int64 wrap of the tagged words WITHOUT the
-                 ;; reg-get/%val->word round-trip, which overflowed for a
-                 ;; fixnum VALUE near 2^62 and collapsed the sum by 2^62
-                 ;; (the mvm-eval `(+ -3 4611686018427387900)` -> -7 bug).  The
-                 ;; wrap is load-bearing for bignum-add limb carry detection.
-                 (setf (svref regs vd)
-                       (%mvm-wrap-tagword-add (svref regs va) (svref regs vb)))
-                 (setf pc npc3)))))
-
-          (#.+op-add-checked+
-           ;; High-level `+`: promote on overflow via GENERIC-ADD.
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (generic-add (svref regs va) (svref regs vb)))
-                 (setf pc npc3)))))
-
-          (#.+op-sub+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
-                 ;; RAW WRAPPING sub — mirror of op-add (see
-                 ;; %mvm-wrap-tagword-sub); reproduces native :sub's int64 wrap
-                 ;; of the tagged difference without the overflowing round-trip.
-                 (setf (svref regs vd)
-                       (%mvm-wrap-tagword-sub (svref regs va) (svref regs vb)))
-                 (setf pc npc3)))))
-
-          (#.+op-sub-checked+
-           ;; High-level `-`: promote on overflow via GENERIC-SUBTRACT.
-           ;; Mirror of op-add-checked.  Unlike raw op-sub (which reproduces
-           ;; native :sub's LOAD-BEARING int64 wrap for bignum limb borrow
-           ;; detection), this promoting variant returns the TRUE difference,
-           ;; overflowing a fixnum into a bignum — so `(- 0 mnf)` = 2^62 does
-           ;; not wrap back to mnf.  generic-subtract dispatches fixnum /
-           ;; bignum / ratio / float and never re-enters this handler because
-           ;; its bignum-core limb subtracters use raw %fixnum-- (not `-`).
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (generic-subtract (svref regs va) (svref regs vb)))
-                 (setf pc npc3)))))
 
           (#.+op-mul+
            ;; RAW tagged multiply (wraps) — building block for %fixnum-*.
@@ -2179,14 +2737,6 @@
                        (%mvm-bitop-words 0 (svref regs va) (svref regs vb)))
                  (setf pc npc3)))))
 
-          (#.+op-or+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
-                 (setf (svref regs vd)
-                       (%mvm-bitop-words 1 (svref regs va) (svref regs vb)))
-                 (setf pc npc3)))))
-
           (#.+op-xor+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
@@ -2236,52 +2786,6 @@
                                       (%mvm-wrap-word (ash (%mvm-word v) amt)))))
                  (setf pc npc3)))))
 
-          ;; SHR / SAR ARE WORD-LEVEL, exactly as the native translators
-          ;; implement them.  They shift the TAGGED WORD, not the fixnum value.
-          ;;
-          ;; This used to untag, shift the VALUE, and re-tag.  That round trip
-          ;; discards bit 0, so it was LOSSY in precisely the case the compiler
-          ;; relies on: `(:sar Vd Vd +fixnum-shift+)` is the UNTAG idiom (see
-          ;; compile-make-array-raw, compile-make-string-array, and ~7 further
-          ;; sites that emit `:shr Vd Vd +fixnum-shift+`).  A tagged fixnum's
-          ;; word is 2n — always even — so a word-level shift recovers n
-          ;; EXACTLY for every n, odd or even; the old value-level form yielded
-          ;; 2*(n>>1), i.e. n-1 for odd n.  That was the residual left by the
-          ;; alloc-array/alloc-string fix: (make-array 1001) built 1000.
-          ;;
-          ;; The obvious objection — "won't word-level shifts break (ash v k)?"
-          ;; — does not hold, and it is why this was not fixed sooner.  Reading
-          ;; the shift in isolation says yes: 2v>>1 = v is an ODD word for odd
-          ;; v, an invalid tagged fixnum.  But compile-ash does not stop there:
-          ;; its right-shift path emits `:sar` AND THEN MASKS the low tag bit
-          ;; with -2, restoring a valid word.  Measured, native and interpreted
-          ;; agree and are correct: (ash 9 -1) = 4 both ways.  The sequence is
-          ;; what has to be read, not the opcode.
-          ;;
-          ;; The general principle: the interpreter is a REFERENCE
-          ;; implementation of this ISA.  Being "more correct" than the
-          ;; translators is itself a divergence — it silently papers over
-          ;; compiler bugs while introducing its own.  Faithfulness first;
-          ;; if a faithful interpreter exposes a wrong answer, that is a
-          ;; compiler bug to fix at the source.
-          (#.+op-shr+ ; logical shift right — word-level
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (amt npc3) (%ifetch-byte bc npc2)
-                 (let ((a (svref regs vs)))
-                   (if (and (typep a 'fixnum) (>= a 0) (>= amt 1))
-                       (reg-set regs vd (ash a (- 1 amt)))
-                       ;; A negative word is shifted as the UNSIGNED machine
-                       ;; word -- 32 bits on the 30-bit tower, not a fixed 64.
-                       (let ((w (%mvm-word a)))
-                         (%mvm-put-word regs vd
-                                        (%mvm-wrap-word
-                                         (ash (if (>= w 0)
-                                                  w
-                                                  (logand w (1- (ash 1 (+ +fixnum-bits+ 2)))))
-                                              (- amt)))))))
-                 (setf pc npc3)))))
-
           (#.+op-sar+ ; arithmetic shift right — word-level
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
@@ -2323,27 +2827,6 @@
                    (setf pc npc4))))))
 
           ;; --- Comparison ---
-          (#.+op-cmp+
-           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vb npc2) (%ifetch-reg bc npc)
-               ;; Compare the register VALUES directly.  The old
-               ;; `(reg-get regs vX)` = `%val->word` (SHL 1) OVERFLOWS the
-               ;; 64-bit register for a fixnum VALUE near 2^62 (V<<1 sets
-               ;; the top word bit → the SHL's V<<2 wraps negative), so
-               ;; `(< BIG-POSITIVE 0)` wrongly returned :lt.  Two big
-               ;; fixnums compared to EACH OTHER happened to survive
-               ;; (both wrap the same way, order preserved), but a big
-               ;; fixnum vs a small constant did not — breaking the
-               ;; sign test in compile-mod's floor adjustment (the mvm-eval
-               ;; mod bug).  The slots hold real VALUES; comparing them
-               ;; directly is exact for fixnums, bignums, and floats.
-               (let ((a (svref regs va)) (b (svref regs vb)))
-                 (setf (mvm-flags state)
-                       (cond ((and (integerp a) (integerp b))
-                              (cond ((= a b) 0) ((< a b) -1) (t 1)))
-                             ((eql a b) 0)
-                             (t 1))))
-               (setf pc npc2))))
 
           (#.+op-test+
            (multiple-value-bind (va npc) (%ifetch-reg bc pc)
@@ -2355,52 +2838,7 @@
                        (cond ((zerop r) 0) ((< r 0) -1) (t 1))))
                (setf pc npc2))))
 
-          ;; CMP-IMM / TEST-IMM: the immediate is a sign-extended WORD.  The
-          ;; compiler emits CMP-IMM with a fixnum's word (2k), whose VALUE k is
-          ;; compared with an integer register, or with a CHARACTER's word,
-          ;; compared for equality with the register's word (as :CMP does).
-          (#.+op-cmp-imm+
-           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
-             ;; the immediate read SIGNED, not as an unsigned u32 put through
-             ;; %IMM32-SIGNED: on a 30-bit tower #x80000000 is a bignum, so every
-             ;; CMP-IMM compared against one (and a negative immediate was a
-             ;; bignum subtraction) -- most of an interpreted loop on a 68000
-             (multiple-value-bind (w npc2) (%ifetch-s32 bc npc)
-               (let* ((a (svref regs va)) (b (ash w -1)))
-                 (setf (mvm-flags state)
-                       (cond ((oddp w) (if (= (%mvm-word a) w) 0 1))
-                             ((integerp a) (cond ((= a b) 0) ((< a b) -1) (t 1)))
-                             (t 1))))
-               (setf pc npc2))))
-
-          (#.+op-test-imm+
-           (multiple-value-bind (va npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (w npc2) (%ifetch-s32 bc npc)  ; signed: see CMP-IMM
-               (let ((r (logand (%mvm-word (svref regs va)) w)))
-                 (setf (mvm-flags state)
-                       (cond ((zerop r) 0) ((< r 0) -1) (t 1))))
-               (setf pc npc2))))
-
           ;; --- Branches (offsets relative to end of instruction) ---
-          (#.+op-br+
-           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
-             (setf pc (+ npc off))))
-
-          (#.+op-beq+
-           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
-             (setf pc (if (= (mvm-flags state) 0) (+ npc off) npc))))
-
-          (#.+op-bne+
-           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
-             (setf pc (if (/= (mvm-flags state) 0) (+ npc off) npc))))
-
-          (#.+op-blt+
-           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
-             (setf pc (if (< (mvm-flags state) 0) (+ npc off) npc))))
-
-          (#.+op-bge+
-           (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
-             (setf pc (if (>= (mvm-flags state) 0) (+ npc off) npc))))
 
           (#.+op-ble+
            (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
@@ -2410,59 +2848,8 @@
            (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
              (setf pc (if (> (mvm-flags state) 0) (+ npc off) npc))))
 
-          (#.+op-bnull+
-           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (off npc2) (%ifetch-s32 bc npc)
-               (setf pc (if (reg-nil-p regs vs) (+ npc2 off) npc2)))))
-
-          (#.+op-bnnull+
-           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (off npc2) (%ifetch-s32 bc npc)
-               (setf pc (if (not (reg-nil-p regs vs)) (+ npc2 off) npc2)))))
-
           ;; --- List Operations ---
           ;; --- List ops, ALIGNED MODEL (unified representation) ---
-          ;; Registers hold RAW WORDS.  Reinterpret to a real value with
-          ;; %word->val, do the NATIVE list op on the real (shared-heap) object,
-          ;; and %val->word the result back to a raw word.  So a cons the
-          ;; interpreter builds IS a real native cons holding real values —
-          ;; directly usable by native runtime functions, no marshalling.
-          ;; (mvm-boolean already returns the raw word of t/nil, so consp/atom
-          ;; store it directly.)  GC-SAFE: reg-get/reg-set keep regs slots holding
-          ;; real VALUES, so the moving collector traces+updates held pointers
-          ;; (validated by the list-build-under-early-GC stress test).
-          (#.+op-car+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
-               (let ((v (svref regs vs)))
-                 (setf (svref regs vd)
-                       (cond ((consp v) (car v))
-                             ((null v) nil)
-                             (t (error 'mvm-type-error :operation "CAR"
-                                       :expected "cons or nil" :got v)))))
-               (setf pc npc2))))
-
-          (#.+op-cdr+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
-               (let ((v (svref regs vs)))
-                 (setf (svref regs vd)
-                       (cond ((consp v) (cdr v))
-                             ((null v) nil)
-                             (t (error 'mvm-type-error :operation "CDR"
-                                       :expected "cons or nil" :got v)))))
-               (setf pc npc2))))
-
-          (#.+op-cons+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (va npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (vb npc3) (%ifetch-reg bc npc2)
-                 ;; The cell is stored into REGS, a simple-vector the collector
-                 ;; traces — no retention list needed.  See the mvm-state HEAP
-                 ;; slot comment for why the old push was not just redundant but
-                 ;; ineffective for the case it was written to cover.
-                 (setf (svref regs vd) (cons (svref regs va) (svref regs vb)))
-                 (setf pc npc3)))))
 
           (#.+op-setcar+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
@@ -3001,181 +3388,7 @@
                    (%obj-elt-set obj idx (svref regs vs)))
                  (setf pc npc3)))))
 
-          (#.+op-array-len+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vobj npc2) (%ifetch-reg bc npc)
-               (let ((obj (svref regs vobj)))
-                 (setf (svref regs vd) (%obj-elt-len obj)))
-               (setf pc npc2))))
-
-          (#.+op-obj-ref+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vobj npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (idx npc3) (%ifetch-byte bc npc2)
-                 (let ((obj (svref regs vobj)))
-                   (setf (svref regs vd) (%obj-elt-ref obj idx)))
-                 (setf pc npc3)))))
-
-          (#.+op-obj-set+
-           (multiple-value-bind (vobj npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (idx npc2) (%ifetch-byte bc npc)
-               (multiple-value-bind (vs npc3) (%ifetch-reg bc npc2)
-                 (let ((obj (svref regs vobj)))
-                   (%obj-elt-set obj idx (svref regs vs)))
-                 (setf pc npc3)))))
-
-          (#.+op-obj-tag+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
-               ;; Read the register VALUE directly.  The old
-               ;; `(%word->val (reg-get regs vs))` is `%val->word` (SHL 1)
-               ;; then `%word->val` (SAR 1) — a round-trip that OVERFLOWS
-               ;; the 64-bit register for a fixnum VALUE near 2^62 (V<<1
-               ;; already sets the top word bit, so the SHL's V<<2 wraps),
-               ;; yielding a garbage `obj`.  That mis-classified a ~2^62
-               ;; fixnum as an OBJECT → (bignump BIG-FIXNUM) spuriously T
-               ;; → (truncate/mod BIG BIG) routed to the slow bignum path
-               ;; and returned garbage (the mvm-eval gcd/mod bug).  The slot
-               ;; already holds the VALUE, so use it directly.
-               (let ((obj (svref regs vs)))
-                 (reg-set regs vd
-                       ;; A BIGNUM is `integerp' = T but is a tag-9 OBJECT, not a
-                       ;; fixnum — reporting +tag-fixnum+ for it made (bignump
-                       ;; <bignum>) = NIL under mvm-eval, so %integer-truncate's
-                       ;; (not (bignump a)) treated a ~2^62 bignum as a fixnum and
-                       ;; ran inline :div on its heap POINTER → garbage varying
-                       ;; per run (gcd.4 / test 13621 0xDEAD0004 wild call).
-                       ;; Exclude bignums so they route to +tag-object+.
-                       (tag-fixnum (cond ((consp obj) +tag-cons+)
-                                         ((and (integerp obj) (not (bignump obj)))
-                                          +tag-fixnum+)
-                                         (t +tag-object+)))))  ; native object / bignum
-               (setf pc npc2))))
-
-          (#.+op-obj-subtag+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
-               ;; native subtag extraction via the obj-subtag primop.
-               ;;
-               ;; Two callable representations cross this opcode and they need
-               ;; DIFFERENT subtags so funcall's dispatch routes them correctly:
-               ;;   - a native CLOSURE object (subtag #x52), built by
-               ;;     compile-make-closure / %make-closure for a CAPTURING
-               ;;     lambda — funcall must take the set-cenv + call-indirect
-               ;;     closure path, which is gated on subtag #x52.
-               ;;   - a bare native FUNCTION (a raw fn-addr resolved by
-               ;;     op-FN-ADDR for #'NAME / a captureless lambda) — NOT a
-               ;;     tagged object, so the raw obj-subtag primop reads garbage;
-               ;;     report #x51 so funcall skips sym/closure/array and falls
-               ;;     through to CALL-INDIRECT's bridge.
-               ;; The earlier `(if (functionp obj) #x51 …)` collapsed BOTH to
-               ;; #x51 because native functionp is true for a #x52 closure too,
-               ;; so every CAPTURING lambda fell out of the closure path → the
-               ;; funcall returned NIL (WS4 oracle).  Fix: prefer the real
-               ;; obj-subtag for genuine OBJECTS (tag = object); only the
-               ;; non-object callable (raw fn-addr) gets the #x51 fallback.
-               ;; Read the VALUE directly (see op-obj-tag): the
-               ;; `(%word->val (reg-get regs vs))` round-trip overflows for
-               ;; a fixnum VALUE near 2^62.  A non-object value falls
-               ;; through obj-subtag's non-tag-9 bail below, so passing the
-               ;; VALUE straight through is correct for objects AND fixnums.
-               (let* ((obj (svref regs vs))
-                      (raw-st (obj-subtag obj))
-                      (st (cond
-                            ;; Genuine non-callable heap object: a clean
-                            ;; low-subtag (< #x50) is a real vector/array/
-                            ;; struct/hash/bignum/ratio/float/etc. — return it
-                            ;; directly, BEFORE the functionp fallback below.
-                            ;; Without this a u8 vector (subtag #x11) whose heap
-                            ;; address happens to satisfy functionp's legacy
-                            ;; code-range check would be reported as #x51
-                            ;; (native-fn) → arrayp/vectorp/typep all break.
-                            ;; Callable subtags (#x50 symbol / #x51 fn / #x52
-                            ;; closure / #x53 keyword) still fall through to the
-                            ;; dispatch-aware arms.  raw-st = 0 means obj-subtag
-                            ;; bailed (non-object) → fall through to functionp.
-                            ((and (> raw-st 0) (< raw-st #x50))
-                             raw-st)
-                            ;; A CLOSURE object reads a clean #x52 from the
-                            ;; obj-subtag primop.  Keep #x52 ONLY for an
-                            ;; IN-MODULE closure — slot 0 is a recorded lambda
-                            ;; bytecode offset — so funcall takes the fast
-                            ;; set-cenv + call-indirect path (the CAPTURING
-                            ;; lambda case; checked BEFORE the functionp arm
-                            ;; because native functionp is true for #x52 too).
-                            ;; A NATIVE #x52 closure (an mvm-eval TRAMPOLINE from
-                            ;; a persisted defun, or any build-time closure)
-                            ;; carries a NATIVE CODE ADDRESS in slot 0 — the
-                            ;; compiled closure path would obj-ref it and
-                            ;; op-call-ind would jump to it as a bytecode pc
-                            ;; (garbage — the run is silently abandoned).
-                            ;; Report #x51 so the dispatch falls through to
-                            ;; CALL-INDIRECT's functionp bridge with the
-                            ;; closure OBJECT, which native funcall/apply
-                            ;; handle correctly — (funcall #'persisted-defun),
-                            ;; (funcall (symbol-function 'f)), uiop's
-                            ;; (funcall detect) in detect-os.
-                            ((= raw-st #x52)
-                             (if (%mvm-module-fn-offset-p
-                                   (%obj-elt-ref obj 0) lambda-offsets)
-                                 #x52
-                                 #x51))
-                            ;; A bare native FUNCTION (raw fn-addr from #'NAME /
-                            ;; captureless lambda) is NOT a tagged object, so
-                            ;; obj-subtag's read above is garbage — report #x51
-                            ;; so funcall falls through to CALL-INDIRECT's
-                            ;; native bridge (funcall/apply/mapcar #'NAME).
-                            ((functionp obj) #x51)
-                            (t raw-st))))
-                 (reg-set regs vd (tag-fixnum st)))
-               (setf pc npc2))))
-
           ;; --- Raw Memory ---
-          (#.+op-load+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vaddr npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
-                 ;; Mask +WIDTH-TLS-BIT+: the interpreter simulates ONE
-                 ;; address space with one thread, so a thread-local width is
-                 ;; the plain width.  See mvm/mvm.lisp.
-                 (setf width (logand width 3))
-                 (let ((addr (reg-get regs vaddr)))
-                   ;; compile-mem-ref already untags the address (:shr addr 1),
-                   ;; so the reg holds the raw address VALUE.  reg-get's %val->word
-                   ;; restores the full address word; do NOT untag again (that
-                   ;; extra halving collapsed adjacent 8-byte slots to 2-byte
-                   ;; physical spacing, corrupting the MV-VALUES region — every
-                   ;; secondary's high 32 bits got the next slot's value).
-                   ;;
-                   ;; MEM-READ-VALUE deposits the VALUE whose word is the loaded
-                   ;; bits — the register-domain equivalent of the native
-                   ;; MOVZX/MOV — so no re-tagging happens here.  compile-mem-ref
-                   ;; emits the `:shl 1` re-tag itself for u8/u16/u32, exactly as
-                   ;; the translators run it.
-                   (setf (svref regs vd) (mem-read-value state addr width)))
-                 (setf pc npc3)))))
-
-          (#.+op-store+
-           (multiple-value-bind (vaddr npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
-               (multiple-value-bind (width npc3) (%ifetch-byte bc npc2)
-                 (setf width (logand width 3))   ; +WIDTH-TLS-BIT+: see op-load
-                 (let ((addr (reg-get regs vaddr)) (val (reg-get regs vs)))
-                   ;; See op-load: the address is already untagged by compile-
-                   ;; mem-ref's :shr; reg-get restores its word — do NOT untag
-                   ;; again (the extra halving collapsed MV slot spacing 4x).
-                   ;;
-                   ;; The VALUE is not untagged here either, and that is the
-                   ;; second half of task #272.  A `(when (< width 3) …
-                   ;; untag-fixnum)` used to sit here, so a u8/u16/u32 store went
-                   ;; through TWO untags: compile-setf already emits
-                   ;; `:sar dest dest 1` ahead of the `:store`, and the
-                   ;; translators then do a plain `MOV [addr],r8` / `STRB` with
-                   ;; no shift of their own.  Halving again wrote v/2.  Read the
-                   ;; emitted SEQUENCE, not the opcode name: :store is a bare
-                   ;; machine store at EVERY width.
-                   (mem-write-value state addr (svref regs vs) width))
-                 (setf pc npc3)))))
 
           (#.+op-fence+ nil) ; memory barrier: no-op
 
@@ -3225,227 +3438,12 @@
                (setf pc npc2))))
 
           ;; --- Function Calling ---
-          (#.+op-call+
-           ;; a runtime stub's target is not formed (a bignum on a 30-bit tower):
-           ;; %MVM-RT-ENTRY reads its number from the bytes
-           (multiple-value-bind (target npc)
-               (if (%mvm-rt-target-p runtime-table bc pc) (values nil (+ pc 4)) (%ifetch-u32 bc pc))
-             (if (null target)
-                 ;; Runtime native call: funcall the real function inline with
-                 ;; %word->val'd args (raw words -> real values, no marshalling),
-                 ;; store %val->word of the result in VR, continue after the CALL.
-                 (let* ((entry (%mvm-rt-entry runtime-table bc pc))
-                        (name (car entry))
-                        (fn (%mvm-rt-cell-fn-1 (cdr entry) name))
-                        (nargs (mvm-nargs state)))
-                   (if fn
-                       (let ((args
-                              ;; regs hold real VALUES — pass them directly (the
-                              ;; old %word->val∘reg-get round-trip overflowed for
-                              ;; a boundary-fixnum arg/result).  %mvm-collect-call-
-                              ;; args reads args 0..3 from V0..V3 and args 4+ from
-                              ;; the mvm-stack (overflow), wrapping any escaping
-                              ;; mvm-eval lambda value (a #x52 closure-over-offset or
-                              ;; a bare in-module offset) in a re-entrant
-                              ;; trampoline so a NATIVE higher-order callee
-                              ;; (mapcar/reduce/…) can funcall it.  Pre-fix this
-                              ;; read regs[0..nargs-1] only, so a >4-arg native
-                              ;; call got garbage for its 5th+ arg.
-                              (%mvm-collect-call-args state regs nargs
-                                                      bc ftab runtime-table
-                                                      lambda-offsets
-                                                      (%mvm-rt-cell-store-p-1 (cdr entry) name))))
-                         ;; PROPAGATE SECONDARY VALUES across the bridge.  Native
-                         ;; multi-valued fns (floor/truncate/round/rem returning a
-                         ;; quotient AND remainder) write their secondaries to the
-                         ;; REAL MV slots, which mvm-eval never reads — mvm-eval reads the
-                         ;; SIMULATED MV slots (the mvm-memory hash, where compile-
-                         ;; values / multiple-value-bind store via op-store and read
-                         ;; via op-load).  So capture ALL return values here and
-                         ;; mirror them into the simulated slots using the SAME word
-                         ;; encoding op-store uses for :u64 (the WORD = %val->word of
-                         ;; the value): mem-write count to +mv-count-addr+ and each
-                         ;; secondary's word to +mv-values-addr+ + i*8.  The primary
-                         ;; still goes in VR (single-value calls write count=1, so the
-                         ;; non-MV path is unchanged).  Constants are interp-local
-                         ;; (the compiler loads after interp, so its +mv-*-addr+
-                         ;; defconstants aren't in scope here) — use the raw addrs.
-                         (let* ((vals (multiple-value-list (apply fn args)))
-                                (nvals (length vals)))
-                           (setf (svref regs +vreg-vr+) (car vals))
-                           ;; count slot (#x10000090) holds the WORD of the fixnum
-                           ;; count — match a normal (setf (mem-ref ... :u64) n),
-                           ;; which stores (reg-get) = %val->word of the fixnum.
-                           (mem-write-value state (%conv-addr #x10000090) nvals 3)
-                           ;; secondaries (value 1+) -> #x10000098 + i*8, stored
-                           ;; as VALUES (op-store's path).  The old %val->word
-                           ;; SHL overflowed for |v| >= 2^61, so (floor 1 mnf)'s
-                           ;; remainder -4611686018427387903 came back as 1.
-                           (let ((i 0))
-                             (dolist (v (cdr vals))
-                               (mem-write-value state (+ (%conv-addr #x10000098) (* i 8)) v 3)
-                               (incf i)))))
-                       ;; Unresolved runtime name: signal UNDEFINED-FUNCTION
-                       ;; (CL semantics — `(eval '(no-such-fn))` must signal).
-                       ;; The old silent `(reg-set VR +mvm-nil+)` made every
-                       ;; undefined call quietly evaluate to NIL under mvm-eval,
-                       ;; so error-expecting ANSI tests failed and value tests
-                       ;; got NILs (WS3 flip).  The signal lands in this
-                       ;; DO-instruction's outer handler-case: routed to an
-                       ;; in-module handler frame when one is active, else
-                       ;; re-signalled out of mvm-interpret to the caller.
-                       ;; CELL-ERROR-NAME is the SYMBOL (upstream
-                       ;; CELL-ERROR-NAME.2): NAME is the runtime-table key,
-                       ;; "PKG::SYM" or a bare name.
-                       (error (quote undefined-function)
-                              :name (%runtime-fn-name-symbol name)))
-                   (setf pc npc))
-                 ;; In-module call: push return frame, jump to the bytecode.
-                 ;; SAVE VFP (the caller's frame array) in the frame: the
-                 ;; callee's frame-enter overwrites VFP with a fresh array and
-                 ;; nothing restored it, so after the callee RET the caller
-                 ;; read its OWN locals through the callee's frame → a local
-                 ;; re-read after a call returned NIL (the accumulator
-                 ;; `(funcall f) (funcall f)` lost f on the 2nd read).  op-ret
-                 ;; restores VFP from the frame.
-                 (progn
-                   ;; CALLEE-SAVED REGISTERS (2026-09-18): native code preserves
-                   ;; V4-V8 (x19-x23) and the local registers V9/V10 (x6/x7)
-                   ;; through the callee's prologue/epilogue, and the compiler's
-                   ;; register promotion relies on that (a promoted local is
-                   ;; live across calls).  Snapshot V4..V10 into the frame and
-                   ;; restore them at RET so the interpreter is faithful to the
-                   ;; ISA (found by the promotion probe: recursion clobbered the
-                   ;; caller's promoted locals under MODUS_NO_JIT).
-                   (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
-                               (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))
-                         (mvm-call-stack state))
-                   (setf pc (if (< target (length ftab)) (aref ftab target) target))))))
-
-          (#.+op-fn-addr+
-           ;; (fn-addr Vd target:imm32) — load a callable for #'NAME / (function
-           ;; NAME) / a captureless lambda.  The target is either:
-           ;;   - a RUNTIME stub offset (>= runtime-call-base): #'NAME of a
-           ;;     native function.  Resolve the name to the REAL native function
-           ;;     OBJECT and store it directly in the slot (the alloc-obj store
-           ;;     convention: reg-set∘%val->word = identity), so CALL-INDIRECT's
-           ;;     functionp branch bridge-calls it.  This is the higher-order
-           ;;     mvm-eval path (funcall/apply/mapcar #'NAME).
-           ;;   - an in-module bytecode OFFSET: a captureless lambda or a defun
-           ;;     compiled in THIS thunk.  Store the offset as a plain fixnum
-           ;;     value so CALL-INDIRECT's integer branch jumps to the bytecode.
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (multiple-value-bind (target npc2)
-                 (if (%mvm-rt-target-p runtime-table bc npc) (values nil (+ npc 4)) (%ifetch-u32 bc npc))
-               (if (null target)
-                   (let* ((entry (%mvm-rt-entry runtime-table bc npc))
-                          (name (car entry))
-                          (fn (and name (%mvm-rt-cell-fn-1 (cdr entry) name))))
-                     (if (functionp fn)
-                         (reg-set regs vd (%val->word fn))
-                         (reg-set-nil regs vd)))
-                   (setf (svref regs vd) target))
-               (setf pc npc2))))
-
-          (#.+op-call-ind+
-           (multiple-value-bind (vs npc) (%ifetch-reg bc pc)
-             ;; Read the raw stored VALUE (svref), not reg-get: a FN-ADDR to an
-             ;; out-of-module name stores a real native function OBJECT directly
-             ;; in the slot (the alloc-obj store convention), and reg-get's
-             ;; %val->word would SHL-1 that object into garbage.  An in-module
-             ;; FN-ADDR stores the bytecode OFFSET as a tagged fixnum value.
-             (let ((target (svref regs vs)))
-               (cond
-                 ;; In-module bytecode offset (a plain integer): jump to it.
-                 ;; MUST be checked BEFORE the functionp branch: a closure's
-                 ;; fn-slot (and a captureless lambda's li-func) stores the
-                 ;; closure/lambda's in-module bytecode OFFSET as a small
-                 ;; integer, and functionp's code-range heuristic returns T
-                 ;; for such a small integer — so the old functionp-first
-                 ;; order routed every in-module closure call into the native
-                 ;; bridge `(apply <offset> args)` → SIGSEGV (the offset is
-                 ;; not a real function).  A genuine resolved native function
-                 ;; OBJECT (the #'NAME bridge target) is NOT integerp, so it
-                 ;; correctly falls through to the functionp branch below.
-                 ;; Save VFP in the frame (see op-CALL) so a local re-read in
-                 ;; the caller after this call survives the callee's frame.
-                 ((integerp target)
-                  (push (list npc (mvm-stack state) (svref regs +vreg-vfp+)
-                              (subseq regs +vreg-v4+ (+ +vreg-v13+ 1)))   ; callee-saved V4..V13, see op-call
-                        (mvm-call-stack state))
-                  (setf pc target))
-                 ;; Higher-order mvm-eval bridge: a resolved native function object
-                 ;; (#'+ , #'1+ , #'< , a %*-FN wrapper, etc.).  funcall/apply/
-                 ;; mapcar all route through here.  Pull nargs args (V0..) from
-                 ;; the register file exactly as op-CALL's runtime bridge does and
-                 ;; store the primary result in VR; do NOT push a return frame
-                 ;; (the call completes natively, control returns inline).
-                 ((functionp target)
-                  (let* ((nargs (mvm-nargs state))
-                         ;; Read args 0..3 from V0..V3 and args 4+ from the
-                         ;; mvm-stack overflow (see op-CALL's bridge + %mvm-
-                         ;; collect-call-args).  Wraps any escaping mvm-eval lambda
-                         ;; arg in a trampoline so a native HOF reached via
-                         ;; funcall/apply (e.g. (apply #'mapcar (list lambda
-                         ;; list))) can funcall it.  Pre-fix this read
-                         ;; regs[0..nargs-1] only → garbage for the 5th+ arg.
-                         (args (%mvm-collect-call-args state regs nargs
-                                                       bc ftab runtime-table
-                                                       lambda-offsets)))
-                    ;; PROPAGATE SECONDARY VALUES across the funcall/apply
-                    ;; bridge — identical to op-CALL's runtime-native branch.
-                    ;; A native (or cross-module registered) multi-valued fn
-                    ;; reached via (funcall #'FN …) / (apply #'FN …) writes its
-                    ;; secondaries only into its OWN return list; mvm-eval's
-                    ;; multiple-value-bind/-list read the SIMULATED MV slots
-                    ;; (mem #x10000090 count + #x10000098+ extras via op-load).
-                    ;; Without mirroring here, (funcall #'FN …) truncated to the
-                    ;; primary value — the chipz %inflate `(values consumed
-                    ;; produced)` returned through %decompress/null-vector's
-                    ;; `(funcall fun …)` lost `produced` (garbage 2nd value).
-                    ;; Capture ALL values, put primary in VR, mirror the count
-                    ;; and secondaries into the simulated slots (same WORD
-                    ;; encoding op-store uses for :u64).
-                    (let* ((vals (multiple-value-list (apply target args)))
-                           (nvals (length vals)))
-                      (setf (svref regs +vreg-vr+) (car vals))
-                      (mem-write state (%conv-addr #x10000090) (%val->word nvals) 3)
-                      (let ((i 0))
-                        (dolist (v (cdr vals))
-                          (mem-write state (+ (%conv-addr #x10000098) (* i 8))
-                                     (%val->word v) 3)
-                          (incf i))))
-                    (setf pc npc)))
-                 (t
-                  (error "MVM: CALL-IND with non-callable target ~S" target))))))
-
-          (#.+op-ret+
-           (if (mvm-call-stack state)
-               (let ((frame (pop (mvm-call-stack state))))
-                 ;; frame = (return-pc saved-stack saved-vfp).  Restore the
-                 ;; caller's PC, operand stack AND frame pointer — the last
-                 ;; so a local re-read in the caller after this call sees the
-                 ;; caller's frame, not the (now-dead) callee's.
-                 (setf pc (first frame))
-                 (setf (mvm-stack state) (second frame))
-                 (setf (svref regs +vreg-vfp+) (third frame))
-                 ;; restore the callee-saved range V4..V13 (see op-call)
-                 (when (fourth frame)
-                   (replace regs (fourth frame) :start1 +vreg-v4+)))
-               (progn (setq %halted t) (setf (mvm-halted state) t))))
-
-          (#.+op-tailcall+
-           (multiple-value-bind (target npc) (%ifetch-u32 bc pc)
-             (declare (ignore npc))
-             (setf pc (if (< target (length ftab)) (aref ftab target) target))))
 
           ;; --- GC / Allocation ---
           (#.+op-alloc-cons+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (reg-set regs vd (%val->word (cons nil nil)))  ; store the cons's raw word
-             (setf pc npc)))
-
-          (#.+op-gc-check+ nil) ; no-op in interpreter
+             (setf pc npc))) ; no-op in interpreter
           (#.+op-mcgc-collect+ nil) ; no-op in interpreter (no page pool)
 
           ;; Size-aware gc-check.  Semantically the same no-op as :gc-check
@@ -3473,12 +3471,6 @@
              (setf pc npc)))
 
           ;; --- Calling convention (nargs / closure-env / MV-count) ---
-          (#.+op-set-nargs+
-           (multiple-value-bind (n npc) (%ifetch-byte bc pc)
-             (setf (mvm-nargs state) n) (setf pc npc)))
-          (#.+op-get-nargs+
-           (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
-             (reg-set regs vd (tag-fixnum (mvm-nargs state))) (setf pc npc)))
           ;; CENV is stored as a VALUE (svref, not reg-get/reg-set): the raw
           ;; WORD of a heap env (a fixnum-looking integer) is INVISIBLE to the
           ;; moving GC, and the set-cenv -> callee-get-cenv window ALLOCATES
@@ -3498,19 +3490,6 @@
           (#.+op-get-cenv+
            (multiple-value-bind (vd npc) (%ifetch-reg bc pc)
              (setf (svref regs vd) (mvm-cenv state)) (setf pc npc)))
-          (#.+op-set-mv-count+
-           (multiple-value-bind (n npc) (%ifetch-byte bc pc)
-             (setf (mvm-mv-count state) n)
-             ;; ALSO write the SIMULATED MV-count slot (#x10000090).  In
-             ;; native code op-set-mv-count and the mem-ref MV-count slot are
-             ;; ONE real memory location; the interp modeled them separately
-             ;; (state field vs memory hash), so a function epilogue's
-             ;; set-mv-count=1 reset never reached the slot that
-             ;; multiple-value-bind / the mvm-eval MV return path read — a stale
-             ;; count from an inner (values …) leaked past a single-value
-             ;; return.  Word encoding matches op-store / the bridge mirror.
-             (mem-write state (%conv-addr #x10000090) (%val->word n) 3)
-             (setf pc npc)))
 
           ;; --- Actor / Concurrency ---
           ;; setjmp/longjmp emulation.  The operand register holds the

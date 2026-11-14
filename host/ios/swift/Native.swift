@@ -157,6 +157,7 @@ final class NativeNav: NSObject, UINavigationControllerDelegate, UIGestureRecogn
     /// pop -- the back swipe too -- the outgoing one fades where it is and the incoming one appears once the page
     /// has landed.  A swipe given up puts the old one back.
     func navigationController(_ nav: UINavigationController, willShow vc: UIViewController, animated: Bool) {
+        statusFollow(nav, vc)
         guard animated, let coordinator = nav.transitionCoordinator else { return }
         // the label INSIDE the title view: the bar animates the title view's own alpha in a transition, over ours
         let incoming = (vc.navigationItem.titleView as? TitleBox)?.label
@@ -424,8 +425,9 @@ let appBarButton: Call = { h, p, n, right, _, _ in
         item = UIBarButtonItem(title: name, primaryAction: action)
     }
     barButtons[bh] = item
+    item.width = barItemWidth
     if right != 0 {
-        vc.navigationItem.rightBarButtonItems = (vc.navigationItem.rightBarButtonItems ?? []) + [item]
+        setRightItems(vc, rightItems(vc) + [item])
     } else {
         vc.navigationItem.leftBarButtonItems = (vc.navigationItem.leftBarButtonItems ?? []) + [item]
     }
@@ -442,8 +444,9 @@ let appBarMenu: Call = { h, p, n, _, _, _ in
     let item = UIBarButtonItem(image: UIImage(systemName: str(m["SYMBOL"]) ?? "ellipsis"),
                                menu: barMenu(bh, m["ITEMS"]))
     barButtons[bh] = item
+    item.width = barItemWidth
     if flag(m["RIGHT"]) {
-        vc.navigationItem.rightBarButtonItems = (vc.navigationItem.rightBarButtonItems ?? []) + [item]
+        setRightItems(vc, rightItems(vc) + [item])
     } else {
         vc.navigationItem.leftBarButtonItems = (vc.navigationItem.leftBarButtonItems ?? []) + [item]
     }
@@ -453,6 +456,7 @@ let appBarMenu: Call = { h, p, n, _, _, _ in
 /// app_bar_menu_set(button, items): the menu's items again (a checkmark moved).
 let appBarMenuSet: Call = { h, p, n, _, _, _ in
     barButtons[h]?.menu = barMenu(h, termBytes(p, n))
+    if let item = barButtons[h] { refreshIsland(item) }
     return 1
 }
 
@@ -482,9 +486,213 @@ private func barMenu(_ bh: UInt, _ items: Term?, event: String = "MENU") -> UIMe
     })
 }
 
+/// The width of a bar button in a group: a narrow glyph (a document) left in the bar's own width stands apart.
+let barItemWidth: CGFloat = 34
+
+// THE ISLAND: a screen's right-hand buttons drawn as one bar item -- a row of buttons -- so the
+// space between them is ours: the bar's own gap between items in its group is wide, and a narrow glyph (a
+// document) stands far from its neighbours.  Each button follows its item (image, action, menu, enabled).
+// Kept by the screen and the item themselves (weakly held keys), never by address: a screen's address is
+// reused by the next one, which would then inherit its buttons.
+final class RightBar {
+    var sources: [UIBarButtonItem] = []
+    var island: Island?
+    var islandItem: UIBarButtonItem?
+}
+private let rightBars = NSMapTable<UIViewController, RightBar>.weakToStrongObjects()
+private func rightBar(_ vc: UIViewController) -> RightBar {
+    if let r = rightBars.object(forKey: vc) { return r }
+    let r = RightBar()
+    rightBars.setObject(r, forKey: vc)
+    return r
+}
+private let islandButtons = NSMapTable<UIBarButtonItem, IslandButton>.weakToWeakObjects()
+
+/// A button in an island: while its menu is open it holds still -- a new image under an open menu reloads it --
+/// and catches up when it closes.
+final class IslandButton: UIButton {
+    var menuOpen = false
+    var leaving = false                                // fading out of its island
+    var action: UIAction?                              // its item's, added to it
+    lazy var width = widthAnchor.constraint(equalToConstant: 40)
+    var source: UIBarButtonItem?
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         willDisplayMenuFor configuration: UIContextMenuConfiguration,
+                                         animator: (any UIContextMenuInteractionAnimating)?) {
+        super.contextMenuInteraction(interaction, willDisplayMenuFor: configuration, animator: animator)
+        menuOpen = true
+    }
+    override func contextMenuInteraction(_ interaction: UIContextMenuInteraction,
+                                         willEndFor configuration: UIContextMenuConfiguration,
+                                         animator: (any UIContextMenuInteractionAnimating)?) {
+        super.contextMenuInteraction(interaction, willEndFor: configuration, animator: animator)
+        menuOpen = false
+        if let source { fill(self, from: source) }
+    }
+}
+
+func rightItems(_ vc: UIViewController) -> [UIBarButtonItem] {
+    rightBars.object(forKey: vc)?.sources ?? vc.navigationItem.rightBarButtonItems ?? []
+}
+
+/// The island itself: its width is what the bar's glass is sized to, and its buttons stand against its right
+/// edge.  The bar moves its glass to a new width at once, so nothing inside is animated but the fade: the
+/// buttons that stay stand still, and one coming or going fades at the left.
+final class Island: UIView {
+    let row = UIStackView()
+    /// Its width, given as its FRAME's (a bar sizes a custom view by its frame -- sized by constraints alone,
+    /// the bar gave it a frame of no width, and the buttons drawn outside it took no taps).
+    var width: CGFloat = 0 {
+        didSet { frame.size = CGSize(width: width, height: 36); invalidateIntrinsicContentSize() }
+    }
+    init() {
+        super.init(frame: CGRect(x: 0, y: 0, width: 0, height: 36))
+        row.axis = .horizontal
+        row.spacing = 0
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([row.trailingAnchor.constraint(equalTo: trailingAnchor),
+                                     row.topAnchor.constraint(equalTo: topAnchor),
+                                     row.bottomAnchor.constraint(equalTo: bottomAnchor)])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var intrinsicContentSize: CGSize { CGSize(width: width, height: 36) }
+    // laid out at once even inside the bar's animation: the bar moves the island at once too
+    override func layoutSubviews() { UIView.performWithoutAnimation { super.layoutSubviews() } }
+}
+
+/// Items that stand apart from the island, each in its own glass, as the bar's own items -- so the bar animates
+/// them in and out itself (the status: it comes and goes, and the bar's glass cannot be animated to an island's
+/// new width).
+let standaloneItems = NSHashTable<UIBarButtonItem>.weakObjects()
+private let standaloneGaps = NSMapTable<UIBarButtonItem, UIBarButtonItem>.weakToStrongObjects()
+/// The gap before ITEM: the same one each time, so the bar sees the gap stay while the item stays.
+private func standaloneGap(_ item: UIBarButtonItem) -> UIBarButtonItem {
+    if let g = standaloneGaps.object(forKey: item) { return g }
+    let g = UIBarButtonItem.fixedSpace(0)
+    standaloneGaps.setObject(g, forKey: item)
+    return g
+}
+
+func setRightItems(_ vc: UIViewController, _ items: [UIBarButtonItem]) {
+    let state = rightBar(vc)
+    state.sources = items
+    let grouped = items.filter { !standaloneItems.contains($0) }
+    let animated = vc.viewIfLoaded?.window != nil
+    // the bar's items: the island (rightmost), then those that stand apart
+    func compose() {
+        var bar = state.island != nil ? state.islandItem.map { [$0] } ?? [] : []
+        for item in state.sources where standaloneItems.contains(item) {
+            if !bar.isEmpty { bar.append(standaloneGap(item)) }   // a gap: its own glass, not the island's
+            bar.append(item)
+        }
+        let now = vc.navigationItem.rightBarButtonItems ?? []
+        if now.count != bar.count || zip(now, bar).contains(where: { $0 !== $1 }) {
+            vc.navigationItem.setRightBarButtonItems(bar, animated: vc.viewIfLoaded?.window != nil)
+        }
+    }
+    let island: Island
+    if let have = state.island {
+        island = have
+    } else {
+        if grouped.isEmpty { compose(); return }
+        island = Island()
+        state.island = island
+        state.islandItem = UIBarButtonItem(customView: island)
+    }
+    let row = island.row
+    // On screen, a button of the island comes and goes with a fade; off it, the island is simply made so.
+    let wanted = Array(grouped.reversed())             // rightBarButtonItems run right to left
+    let old = row.arrangedSubviews.compactMap { $0 as? IslandButton }
+    var coming: [IslandButton] = []
+    let going = old.filter { b in !b.leaving && !wanted.contains(where: { $0 === b.source }) }
+    going.forEach { $0.leaving = true }                // before the order below, which they keep out of
+    UIView.performWithoutAnimation {
+        for (i, item) in wanted.enumerated() {
+            let b: IslandButton
+            if let have = old.first(where: { $0.source === item && !$0.leaving }) {
+                b = have
+            } else {
+                b = IslandButton(configuration: .plain())
+                b.source = item
+                b.width.isActive = true
+                b.heightAnchor.constraint(equalToConstant: 36).isActive = true
+                fill(b, from: item)
+                if animated { b.alpha = 0; coming.append(b) }
+            }
+            islandButtons.setObject(b, forKey: item)
+            // its place among the buttons that stay (a leaving one keeps its place until it has gone)
+            let staying = row.arrangedSubviews.filter { !(($0 as? IslandButton)?.leaving ?? false) }
+            if staying.firstIndex(of: b) != i {
+                let at = i < staying.count ? row.arrangedSubviews.firstIndex(of: staying[i]) ?? row.arrangedSubviews.count
+                                           : row.arrangedSubviews.count
+                row.insertArrangedSubview(b, at: at)
+            }
+        }
+    }
+    // a lone button as wide as the bar's own round ones; side by side, a little more room each
+    let each: CGFloat = wanted.count == 1 ? 36 : 40
+    func settle() {
+        for case let b as IslandButton in row.arrangedSubviews { b.width.constant = each }
+        island.width = each * CGFloat(wanted.count)
+        island.invalidateIntrinsicContentSize()
+    }
+    // no buttons left: no island (an empty one would still draw its glass)
+    func vacate() {
+        let left = state.sources.filter { !standaloneItems.contains($0) }
+        if left.isEmpty, state.island === island { state.island = nil }
+        compose()
+    }
+    UIView.performWithoutAnimation { row.layoutIfNeeded() }
+    if !animated || (coming.isEmpty && going.isEmpty) {
+        going.forEach { $0.removeFromSuperview() }
+        settle()
+        vacate()
+        return
+    }
+    UIView.animate(withDuration: 0.25) {
+        for b in coming { b.alpha = 1 }
+        for b in going { b.alpha = 0 }
+    } completion: { _ in
+        UIView.performWithoutAnimation {
+            for b in going where b.leaving { b.removeFromSuperview() }
+            row.layoutIfNeeded()
+        }
+    }
+    settle()
+    compose()
+    if wanted.isEmpty { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { vacate() } }
+}
+
+private func fill(_ b: IslandButton, from item: UIBarButtonItem) {
+    if b.menuOpen { return }                           // after it closes
+    if b.configuration?.image !== item.image { b.configuration?.image = item.image }
+    if b.isEnabled != item.isEnabled { b.isEnabled = item.isEnabled }
+    b.accessibilityLabel = item.accessibilityLabel
+    b.accessibilityValue = item.accessibilityValue
+    if let old = b.action { b.removeAction(old, for: .primaryActionTriggered) }
+    b.action = nil
+    if let action = item.primaryAction {
+        b.addAction(action, for: .primaryActionTriggered)
+        b.action = action
+        b.menu = nil
+        b.showsMenuAsPrimaryAction = false
+    } else {
+        // the same menu, not given again: that would refresh it while it is open
+        if b.menu !== item.menu { b.menu = item.menu }
+        if b.showsMenuAsPrimaryAction != (item.menu != nil) { b.showsMenuAsPrimaryAction = item.menu != nil }
+    }
+}
+
+/// ITEM changed (its image, menu, action): its button in an island, if it has one, the same.
+func refreshIsland(_ item: UIBarButtonItem) {
+    if let b = islandButtons.object(forKey: item) { fill(b, from: item) }
+}
+
 /// app_bar_button_enable(button, on)
 let appBarButtonEnable: Call = { h, on, _, _, _, _ in
     barButtons[h]?.isEnabled = on != 0
+    if let item = barButtons[h] { refreshIsland(item) }
     return 1
 }
 
@@ -686,8 +894,9 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     private let infoLabel = UILabel()
     private var optionsButton: UIButton?
 
-    /// A button to the right of the filter that opens a menu (app_table_options): how the rows are sorted and
-    /// what is shown.  A choice is an OPTIONS event with its id.
+    /// A button to the left of the filter that opens a menu (app_table_options): how the rows are sorted and
+    /// what is shown.  A choice is an OPTIONS event with its id.  Left, not right: the right edge is where a
+    /// finger drags the scroll bar, and a tap that missed the button scrolled the list.
     func setOptions(_ items: Term?) {
         let b = optionsButton ?? {
             var config = UIButton.Configuration.plain()
@@ -707,13 +916,15 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
     /// TEXT, its [[symbol]]s drawn as SF Symbols in the text's own colour and size.
     @objc func infoTapped() { send("INFO", [.int(Int(handle))]) }
 
+    /// The info line's parts (the TEXT given split at its runs of four spaces), each drawn ready: wrapped by
+    /// layoutHeader a whole part at a time, so a part never breaks across lines.
+    private var infoParts: [NSAttributedString] = []
+
     func setInfo(_ text: String) {
-        if text.isEmpty {
-            infoLabel.attributedText = nil
-        } else {
-            let font = UIFont.preferredFont(forTextStyle: .footnote)
+        let font = UIFont.preferredFont(forTextStyle: .footnote)
+        infoParts = text.isEmpty ? [] : text.components(separatedBy: "    ").filter { !$0.isEmpty }.map { part in
             let out = NSMutableAttributedString()
-            var rest = Substring(text)
+            var rest = Substring(part)
             while let open = rest.range(of: "[["), let close = rest.range(of: "]]", range: open.upperBound..<rest.endIndex) {
                 out.append(NSAttributedString(string: String(rest[..<open.lowerBound]), attributes: [.font: font]))
                 let name = String(rest[open.upperBound..<close.lowerBound])
@@ -725,10 +936,32 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
             }
             out.append(NSAttributedString(string: String(rest), attributes: [.font: font]))
             out.addAttribute(.foregroundColor, value: UIColor.secondaryLabel, range: NSRange(location: 0, length: out.length))
-            infoLabel.attributedText = out
+            return out
         }
         layoutHeader()
         showEmpty()
+    }
+
+    /// The parts on lines WIDTH wide: the next part goes on the line if it fits, else starts the next one.
+    private func infoText(width: CGFloat) -> NSAttributedString? {
+        guard !infoParts.isEmpty else { return nil }
+        let font = UIFont.preferredFont(forTextStyle: .footnote)
+        let gap = NSAttributedString(string: "    ", attributes: [.font: font])
+        let gapWidth = gap.size().width
+        let out = NSMutableAttributedString()
+        var line: CGFloat = 0
+        for part in infoParts {
+            let w = ceil(part.size().width)
+            if out.length > 0 {
+                if line + gapWidth + w <= width {
+                    out.append(gap); line += gapWidth
+                } else {
+                    out.append(NSAttributedString(string: "\n", attributes: [.font: font])); line = 0
+                }
+            }
+            out.append(part); line += w
+        }
+        return out
     }
 
     private func layoutHeader() {
@@ -736,12 +969,14 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         let w = max(table.bounds.width, 1)
         headerWidth = w
         let inset = table.layoutMargins.left
+        infoLabel.attributedText = infoText(width: w - 2 * inset)
         let info: CGFloat = infoLabel.attributedText == nil ? 0
             : infoLabel.sizeThatFits(CGSize(width: w - 2 * inset, height: .greatestFiniteMagnitude)).height + 14
         infoLabel.frame = CGRect(x: inset, y: 10, width: w - 2 * inset, height: max(0, info - 14))
-        let room: CGFloat = optionsButton == nil ? 0 : 44
-        bar.frame = CGRect(x: 0, y: info, width: w - room, height: 56)
-        optionsButton?.frame = CGRect(x: w - room - table.layoutMargins.right + 8, y: info + 6, width: 44, height: 44)
+        // the options button at the left, its glyph on the margin; the filter takes the rest
+        let room: CGFloat = optionsButton == nil ? 0 : inset + 28
+        optionsButton?.frame = CGRect(x: inset - 12, y: info + 6, width: 44, height: 44)
+        bar.frame = CGRect(x: room, y: info, width: w - room, height: 56)
         header.frame = CGRect(x: 0, y: 0, width: w, height: info + 56)
         if table.tableHeaderView === header { table.tableHeaderView = header }    // its new height taken
         if table.tableHeaderView === header { fitTuckRoom() }
@@ -1005,7 +1240,7 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         // the filter only once there is something to filter: not over a placeholder, or an empty folder
         if searchBar != nil {
             if abs(headerWidth - table.bounds.width) > 1 { layoutHeader() }
-            let want: UIView? = all.isEmpty && infoLabel.attributedText == nil ? nil : header
+            let want: UIView? = all.isEmpty && infoParts.isEmpty ? nil : header
             if table.tableHeaderView !== want { table.tableHeaderView = want }
         }
         let none = groups.allSatisfy { $0.rows.isEmpty }
@@ -2873,57 +3108,161 @@ let appFormShow: Call = { h, _, _, _, _, _ in
     return 1
 }
 
-// MARK: - the status bar: a transfer's progress, at the bottom
+// MARK: - the status: a ring in the bar, as Files and Safari show a download
 
+/// The status, as a bar button like the bar's others (a custom view is spaced differently in the bar's group):
+/// its image a ring filled to the progress, the system's turning arrows while there is no measure, or a checkmark.
 final class NativeStatus {
-    let label = UILabel()
-    let bar = UIProgressView(progressViewStyle: .default)
-    let stack: UIStackView
+    let item = UIBarButtonItem(image: UIImage(systemName: "circle"), menu: nil)
+    var shown = false
+    var tapAction: UIAction?                     // kept for the result's alert (set as the item's primaryAction)
+    var message = ""                             // what it says now: its menu is made from this when opened
+    var cancel: (() -> Void)?
+    var clearing: DispatchWorkItem?              // taking it away, shortly: a status that follows at once stays
+    private var spinning = false
+    private var lastFill: CGFloat = 0
+
     init() {
-        label.font = .preferredFont(forTextStyle: .footnote)
-        label.textColor = .secondaryLabel
-        label.lineBreakMode = .byTruncatingMiddle
-        stack = UIStackView(arrangedSubviews: [label, bar])
-        stack.axis = .vertical
-        stack.spacing = 4
-        stack.frame = CGRect(x: 0, y: 0, width: 240, height: 32)
+        item.accessibilityLabel = "Status"
+        standaloneItems.add(item)
+    }
+
+    /// PROGRESS 0-1, or nil: no measure (turning arrows); DONE: a checkmark.  The ring fills forward only.
+    func show(progress: Double?, done: Bool) {
+        if done {
+            stopSpinning()
+            item.image = UIImage(systemName: "checkmark.circle")
+        } else if let p = progress {
+            stopSpinning()
+            let v = max(lastFill, CGFloat(max(0, min(1, p))))
+            lastFill = v
+            item.image = StatusRingImage.make(v)
+        } else {
+            lastFill = 0
+            item.image = UIImage(systemName: "arrow.trianglehead.2.clockwise")
+            if !spinning {
+                spinning = true
+                if #available(iOS 18.0, *) { item.addSymbolEffect(.rotate, options: .repeat(.continuous)) }
+            }
+        }
+    }
+    func reset() { lastFill = 0; stopSpinning() }
+    /// Its island button, if it is in one, given what the item now is.
+    func refresh() { refreshIsland(item) }
+    private func stopSpinning() {
+        guard spinning else { return }
+        spinning = false
+        if #available(iOS 18.0, *) { item.removeAllSymbolEffects() }
+    }
+
+    /// On SCREEN's bar (the screen on top), leftmost of its right-hand buttons -- or on none.
+    func place(on screen: UIViewController?, in nav: UINavigationController) {
+        for vc in nav.viewControllers where vc !== screen {
+            let items = rightItems(vc)
+            if items.contains(where: { $0 === item }) { setRightItems(vc, items.filter { $0 !== item }) }
+        }
+        guard let screen else { return }
+        let items = rightItems(screen)
+        if !items.contains(where: { $0 === item }) { setRightItems(screen, items + [item]) }
     }
 }
 
-/// app_status(nav, text, permille, cancellable): the status bar at the bottom of NAV with TEXT and a progress
-/// bar at PERMILLE (0-1000; above 1000, no bar), and Cancel when CANCELLABLE.  An empty TEXT hides it.
+/// A ring at the bar's symbol size, filled to FILL: a template image, so it takes the bar's tint.
+enum StatusRingImage {
+    static func make(_ fill: CGFloat) -> UIImage {
+        let size = CGSize(width: 22, height: 22)
+        let image = UIGraphicsImageRenderer(size: size).image { _ in
+            let c = CGPoint(x: 11, y: 11), r: CGFloat = 9
+            let track = UIBezierPath(arcCenter: c, radius: r, startAngle: 0, endAngle: .pi * 2, clockwise: true)
+            track.lineWidth = 2
+            UIColor.black.withAlphaComponent(0.25).setStroke()
+            track.stroke()
+            if fill > 0 {
+                let arc = UIBezierPath(arcCenter: c, radius: r, startAngle: -.pi / 2,
+                                       endAngle: -.pi / 2 + .pi * 2 * fill, clockwise: true)
+                arc.lineWidth = 2.5
+                arc.lineCapStyle = .round
+                UIColor.black.setStroke()
+                arc.stroke()
+            }
+        }
+        return image.withRenderingMode(.alwaysTemplate)
+    }
+}
+
+/// The status of the nav whose controller is NAV: moved to the screen coming on top (NativeNav calls this).
+func statusFollow(_ nav: UINavigationController, _ vc: UIViewController) {
+    guard let h = navs.first(where: { $0.value === nav })?.key, let s = statuses[h], s.shown else { return }
+    s.place(on: vc, in: nav)
+}
+
+/// app_status(nav, text, permille, cancellable): what NAV's app is doing, as a ring in the bar of the screen on
+/// top: filling to PERMILLE (0-1000; above, no measure: it spins), its menu TEXT ("Doing x — how far") and Cancel
+/// when CANCELLABLE (a STATUSCANCEL).  Not CANCELLABLE: a result -- a checkmark, its menu the TEXT.  An empty TEXT
+/// takes it away.
 let appStatus: Call = { h, p, n, permille, cancellable, _ in
     guard let nav = navs[h] else { return 0 }
     let s = statuses[h] ?? NativeStatus()
     statuses[h] = s
     let message = text(p, n)
+    s.clearing?.cancel()
+    s.clearing = nil
     if message.isEmpty {
-        s.bar.setProgress(0, animated: false)
-        nav.setToolbarHidden(true, animated: true)
+        // not at once: an app often clears one status and gives the next (its result) straight after, and the
+        // ring should stay rather than go and come back
+        guard s.shown else { return 1 }
+        let clear = DispatchWorkItem { [weak s, weak nav] in
+            guard let s, let nav else { return }
+            s.clearing = nil
+            s.shown = false
+            s.reset()
+            s.item.menu = nil
+            s.place(on: nil, in: nav)
+        }
+        s.clearing = clear
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: clear)
         return 1
     }
-    s.label.text = message
-    // the bar is the status line's, kept from one transfer to the next: it animates forward only, and starts
-    // each transfer from where that one is -- not by sliding back from the last one's end
-    let value = Float(min(permille, 1000)) / 1000
-    if permille > 1000 {
-        s.bar.isHidden = true
-        s.bar.setProgress(0, animated: false)
+    let working = cancellable != 0
+    s.show(progress: working && permille <= 1000 ? Double(permille) / 1000 : nil, done: !working)
+    // the menu: what it is, how far it has got, Cancel
+    let parts = message.components(separatedBy: " — ")
+    s.message = message
+    s.cancel = { send("STATUSCANCEL", [.int(Int(h))]) }
+    if working {
+        // made when opened, from the status as it is then -- not replaced at each step under the finger
+        if s.item.menu == nil || s.item.primaryAction != nil {
+            s.item.primaryAction = nil
+            s.item.menu = UIMenu(title: "", children: [UIDeferredMenuElement.uncached { [weak s] done in   // once an opening
+                guard let s else { done([]); return }
+                let parts = s.message.components(separatedBy: " — ")
+                let about = UIAction(title: parts[0], image: UIImage(systemName: "arrow.down.circle")) { _ in }
+                if parts.count > 1 { about.subtitle = parts.dropFirst().joined(separator: " — ") }
+                done([about, UIMenu(title: "", options: .displayInline, children: [
+                    UIAction(title: "Cancel", image: UIImage(systemName: "xmark"), attributes: .destructive) { _ in
+                        s.cancel?()
+                    }])])
+            }])
+        }
     } else {
-        let fresh = s.bar.isHidden || value < s.bar.progress
-        s.bar.isHidden = false
-        s.bar.setProgress(value, animated: !fresh)
+        // a result: a tap pops it up in full, and OK clears the checkmark
+        s.item.menu = nil
+        s.item.primaryAction = UIAction(image: s.item.image) { [weak nav] _ in
+            guard let nav, let host = presenter() else { return }
+            let alert = UIAlertController(title: parts[0],
+                                          message: parts.count > 1 ? parts.dropFirst().joined(separator: " — ") : nil,
+                                          preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "OK", style: .default) { _ in
+                s.shown = false
+                s.place(on: nil, in: nav)
+            })
+            host.present(alert, animated: true)
+        }
     }
-    var items: [UIBarButtonItem] = [UIBarButtonItem(customView: s.stack), .flexibleSpace()]
-    if cancellable != 0 {
-        items.append(UIBarButtonItem(systemItem: .cancel, primaryAction: UIAction { _ in
-            send("STATUSCANCEL", [.int(Int(h))])
-        }))
-    }
-    // the bar goes on every screen of the stack: whichever is on top shows it
-    for vc in nav.viewControllers { vc.toolbarItems = items }
-    s.stack.frame.size.width = max(160, nav.view.bounds.width - (cancellable != 0 ? 120 : 40))
-    nav.setToolbarHidden(false, animated: true)
+    s.item.accessibilityValue = message
+    s.refresh()
+    s.shown = true
+    s.place(on: nav.topViewController, in: nav)
     return 1
 }
 

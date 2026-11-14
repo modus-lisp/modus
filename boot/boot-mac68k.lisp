@@ -96,7 +96,7 @@
     ;; is the top of the old static range, #x240000-#x2B0000 (448 KB): the
     ;; saved heap ends near #x120000.
     (:classic-os :load #x00040000 :static-lo #x00110000 :static-hi #x00240000
-              :jit-area-lo #x00240000 :jit-area-hi #x002B0000
+              :jit-area-lo #x00240000 :jit-area-hi #x002B0000 :jit-max-bytecode 2048
               :region #x002B0000 :heap-size #x00080000 :gc-guard #x00008000
               :kind-map #x00318000 :cache-lo #x00329000 :cache-hi #x003D0000
               :staging #x003D0000 :staging-size #x00000000

@@ -3297,7 +3297,9 @@
 (when (and *cl-repl-mac68k-p* (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
            (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
   (let ((lo (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-lo))
-        (hi (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-hi)))
+        (hi (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-hi))
+        (cap (or (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-max-bytecode)
+                 2048)))
     (unless (and lo hi)
       (error "MODUS_68K_JIT=1: the ~S map has no :JIT-AREA (use classicos)" modus.mvm::*mac68k-machine*))
     ;; The two seams are REPLACED in the text (one DEFUN each, nothing for a
@@ -3316,8 +3318,8 @@
               "(defun %t68-allowed-p ()" (format nil "~%  t)")
               (format nil "~%  (%core-requested-p))"))
               ;; big modules stay interpreted (see its docstring)
-              "(defun %t68-max-bytecode ()" (format nil "~%  nil)") (format nil "~%  2048)"))))
-    (format t "~&;; mac68k: the threaded JIT, its code at #x~X-#x~X~%" lo hi)))
+              "(defun %t68-max-bytecode ()" (format nil "~%  nil)") (format nil "~%  ~D)" cap))))
+    (format t "~&;; mac68k: the threaded JIT, its code at #x~X-#x~X, modules to ~D bytes~%" lo hi cap)))
 
 ;;; :MAC68K: AOT RUNTIME MACROS.  mvm/runtime-cl-macros.lisp keeps CL's runtime
 ;;; macros (WHEN, DOTIMES, PUSH, CASE ...) as DEFMACRO strings that boot READs

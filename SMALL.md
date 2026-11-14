@@ -11,6 +11,33 @@ Macintosh Common Lisp 2.0 (1992): a full Common Lisp with a native compiler,
 CLOS and an IDE, in **4 MB of RAM and 6 MB of disk** on a 68020+ Mac.  Coral /
 Macintosh Allegro CL 1.x ran on a 1 MB Mac Plus (a 68000), slowly.
 
+**Measured 2026-11-14** on MAME's Mac Classic (68000, 4 MB, System 6.0.8), so
+the "68020+" above is not a requirement: MCL 2.0 runs on a 68000.  Its
+application is 1.55 MB and its `SIZE` resource asks for a 3 MB partition (2 MB
+minimum).  Pearl Lisp 1.1, Coral's small CL, is 555 KB and asks for 1 MB (500 KB
+minimum).  MCL 2.0 has 957 of ANSI's 978 CL symbols; the 21 it lacks are
+almost all ANSI's later names for things it has under CLtL2's (`SPECIAL-FORM-P`,
+`DEFINE-SETF-METHOD`, `GET-SETF-METHOD`, `SIMPLE-CONDITION-FORMAT-STRING`), plus
+`READ-SEQUENCE` / `WRITE-SEQUENCE`, `DEFINE-SYMBOL-MACRO`,
+`ENSURE-DIRECTORIES-EXIST`, the `LAMBDA` macro, `COPY-STRUCTURE`.  34 feature
+probes (CLOS with method combination and `PRINT-OBJECT`, conditions, restarts,
+LOOP, FORMAT `~R`/`~{`, bignums, ratios, complexes, `*PRINT-CIRCLE*`,
+`COMPILE`, logical pathnames) all answer as SBCL does.  29-bit fixnums,
+`CHAR-CODE-LIMIT` 256.  Same machine, `TIME` per form:
+
+| form | MCL 2.0 | Pearl 1.1 | modus (classicos image, includes typing) |
+|---|---|---|---|
+| `defun fib` | 0.74 s | 0.25 s | 70 s |
+| `(fib 20)` | 1.26 s | 1.63 s | 17 s |
+| `defmacro` | 0.50 s | 0.27 s | 69 s |
+
+Both compile source straight to 68k code with a compiler that is itself native
+68k code, all of it resident.  modus compiles source to IR to MVM bytecode,
+then translates that to threaded 68k, with a compiler that runs as threaded
+code and pages in from disk.  (Method: a file holding SBCL's list of the 978
+symbols and the probes, LOADed from the MCL volume; results read off the
+Listener, since the boot disk's driver is read-only.)
+
 The goal: a true hosted REPL -- reader, compiler, printer, the whole language --
 on the LC040 inside MCL 2.0's budget.  Below that, images that only run a
 fixed program (a "thunk"): the floor for microcontrollers.

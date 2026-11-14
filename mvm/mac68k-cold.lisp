@@ -16,17 +16,20 @@
 ;;;; Image source for the bare Mac only (build-cl-repl-common.lisp); the
 ;;;; defaults it overrides are in cl-packages.lisp.
 
-(defvar *cold-names-firsts* nil)
 (defvar *cold-names-memo* nil)
 
-(defun %cold-names-firsts ()
-  "Each page's first hash, from %COLD-NAMES-INDEX's 8 hex digits a page."
-  (or *cold-names-firsts*
-      (let* ((s (%cold-names-index)) (n (floor (length s) 8)) (v (make-array n)) (i 0))
-        (loop (when (>= i n) (return nil))
-          (setf (svref v i) (parse-integer s :start (* i 8) :end (+ (* i 8) 8) :radix 16))
-          (setq i (+ i 1)))
-        (setq *cold-names-firsts* v))))
+(defun %cold-names-first-le (s page h)
+  "Is PAGE's first hash -- its 8 hex digits of S, %COLD-NAMES-INDEX -- <= H?
+   Compared a digit at a time, the low digit first so a higher one overrides.
+   The index was once parsed into a vector: 403 PARSE-INTEGERs through the
+   bignum reader, measured as 15 s of a Mac Plus's first (compile 'f), and a
+   vector the young heap then carried."
+  (let ((i (+ (* page 8) 7)) (x h) (r 0) (k 0))
+    (loop
+      (when (>= k 8) (return (<= r 0)))
+      (let* ((c (char-code (char s i))) (d (if (< c 58) (- c 48) (- c 55))) (e (logand x 15)))
+        (cond ((< d e) (setq r -1)) ((> d e) (setq r 1))))
+      (setq i (- i 1) x (ash x -4) k (+ k 1)))))
 
 (defun %cold-names-ready-p ()
   "Can names come from disk?  The core builder said where they are, and this
@@ -39,13 +42,13 @@
    or no disk to read it from."
   (when (and (fixnump h) (> h 0) (%cold-names-ready-p))
     (or (and *cold-names-memo* (gethash h *cold-names-memo*))
-        (let* ((v (%cold-names-firsts)) (n (length v)))
-          (when (and (> n 0) (>= h (svref v 0)))
+        (let* ((v (%cold-names-index)) (n (floor (length v) 8)))
+          (when (and (> n 0) (%cold-names-first-le v 0 h))
             ;; the last page whose first hash is <= H
             (let ((lo 0) (hi (- n 1)))
               (loop (when (>= lo hi) (return nil))
                 (let ((mid (ash (+ lo hi 1) -1)))
-                  (if (<= (svref v mid) h) (setq lo mid) (setq hi (- mid 1)))))
+                  (if (%cold-names-first-le v mid h) (setq lo mid) (setq hi (- mid 1)))))
               (let ((buf *io-buf-addr*))
                 (when (eql (syscall3 1 (+ (mem-ref #x10006044 :u32) (* lo 512)) buf 512) 0)
                   (let ((i 0) (found nil))

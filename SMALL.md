@@ -606,11 +606,27 @@ translate (the layout's `:jit-on-defun nil`) and `(compile 'f)` does.  MAME
 
 | type | time |
 |---|---|
-| `(defun fib (n) ...)` (the first DEFUN) | 119 s |
-| `(compile 'fib)` | 97 s |
+| `(defun fib (n) ...)` (the first DEFUN) | 115 s |
+| `(compile 'fib)` | 78 s |
 | `(fib 15)` | 6 s (interpreted: ~19 minutes on a Classic) |
 | `(fib 20)` | 18 s |
 | a later DEFUN (`greet`) | 54 s (plus1m: 47 s) |
+| `(compile 'greet)` | 21 s |
+
+Built with `MODUS_68K_HOT=mvm/68k-hot-mac-plus.txt`: one native function,
+`%GV-REF-FILL` (2 KB of the 5.5 KB the resident range has free), which every
+special-variable read of a small image calls.  `(compile 'fib)` was 97 s: 15 s
+of it was the cold names' index parsed into a vector at the first name read
+from disk (403 PARSE-INTEGERs; `%COLD-NAMES-FIRST-LE` now compares the index's
+digits where they are); the other 4 s are the native `%GV-REF-FILL` and the
+JIT no longer comparing small operands with 32-bit constants (bignums on this
+tower), not measured apart.
+
+Where a DEFUN's time goes there (MAME, PC and call-stack samples; `greet`):
+the compiler 43%, the SCSI transfer in the ROM 21% and our loader 11% (both
+inside the others), the reader 7%, `REGISTER-MVM-BOOTSTRAP-MACROS` run again at
+every EVAL 7%, `BOUNDP` 9% (each asks whether the name is a kernel global, by
+string), kernel-function names read from the cold functions on disk 5%.
 
 Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
 

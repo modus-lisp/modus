@@ -275,8 +275,16 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Classification (translate-68k.lisp m68k-thread-classify / -walk)
 
+(defun %t68-small-p (x)
+  "Is X a non-negative fixnum under 2^28?  Then no arithmetic against a 32-bit
+   constant is needed: on this 30-bit tower those constants are bignums, and a
+   generic operation on one is thousands of threaded tokens on a 68000."
+  (and (fixnump x) (>= x 0) (< x #x10000000)))
+
 (defun %t68-s32 (x)
-  (let ((u (logand x #xFFFFFFFF))) (if (logbitp 31 u) (- u #x100000000) u)))
+  (if (%t68-small-p x)
+      x
+      (let ((u (logand x #xFFFFFFFF))) (if (logbitp 31 u) (- u #x100000000) u))))
 
 (defun %t68-imm-class (x)
   (let ((s (%t68-s32 x))) (cond ((<= -128 s 127) 1) ((<= -32768 s 32767) 2) (t 4))))
@@ -300,7 +308,7 @@
     ((or (= op +t68-op-call+) (= op +t68-op-tailcall+))
      (values (list op) (list (list :call (first operands)))))
     ((= op +t68-op-fn-addr+)
-     (if (= (second operands) #xFFFFFFF0)
+     (if (and (not (%t68-small-p (second operands))) (= (second operands) #xFFFFFFF0))
          (values (list op (first operands) :nil) nil)
          (values (list op (first operands)) (list (list :call (second operands))))))
     ((= op +t68-op-br+)
@@ -439,7 +447,7 @@
   "The address an MVM call operand names -- a function-table index, a bytecode
    offset (a stub of this module), or a runtime stub (+T68-RT-BASE+ + n) named
    in RT that must be native image code -- or NIL (*T68-WHY*)."
-  (if (>= operand +t68-rt-base+)
+  (if (and (not (%t68-small-p operand)) (>= operand +t68-rt-base+))
       (let* ((name (gethash operand rt))
              (fn (and name (%mvm-resolve-runtime-fn name)))
              (w (and fn (%val->word fn))))

@@ -1,0 +1,6 @@
+;; A 1 MB Mac Plus's hot natives (MODUS_68K_HOT, the plus1m / plus1mjit maps):
+;; the one function its 2-5 KB of free resident image is best spent on.  A small
+;; image reads every special variable with a call to it (*GV-CACHE-MODE* :call),
+;; and threaded and paged it was 6-10% of a DEFUN and of a (compile 'f) (MAME
+;; macplus, PC samples).  Native it is 2 KB.
+%GV-REF-FILL

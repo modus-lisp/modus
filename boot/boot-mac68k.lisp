@@ -39,8 +39,9 @@
           ((string-equal m "classic") :classic)
           ((string-equal m "classic2m") :classic-2m)
           ((string-equal m "plus1m") :plus-1m)
+          ((string-equal m "plus1mjit") :plus-1m-jit)
           ((string-equal m "classicos") :classic-os)
-          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classicos, classic2m or plus1m" m))))
+          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classicos, classic2m, plus1m or plus1mjit" m))))
   "Which Mac's memory map (MODUS_MAC68K_MACHINE): :LC, the 32 MB LC 475 /
    Quadra 605 class this file was measured on, or :CLASSIC, a Mac Classic
    with 4 MB (its maximum) -- measured in MAME's macclasc when our boot
@@ -150,6 +151,26 @@
               :kind-map #x000F5000 :cache-lo #x0001C000 :cache-hi #x0003E000
               :staging #x0003E000 :staging-size #x00000000
               :nil-page #x0003E000
+              :stack-top #x00018000 :scratch #x00018000 :io-buf #x00019000
+              :init-base #x00400000
+              :boot-heap #x01000000 :boot-heap-size #x00800000
+              :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
+              :boot-stack-top #x01A00000)
+    ;; THE SAME 1 MB MAC WITH THE RUNTIME THREADED JIT (MODUS_MAC68K_MACHINE=plus1mjit,
+    ;; MODUS_68K_JIT=1).  The JIT's table and handlers make the resident image
+    ;; ~12 KB bigger than plus1m has room for, so it loads 16 KB lower, NIL's and
+    ;; T's pages under it at #x3A000 -- no lower: in the core run, on an LC, the
+    ;; ROM's system heap ends at #x39FE0.  The code area is the cache's top 16 KB,
+    ;; free in a session (the core run caches at :BOOT-CACHE-LO), so the cache is
+    ;; 104 KB, not 136: measured on plus1m with 92 KB, a DEFUN ~35% slower, calls
+    ;; the same.  Modules capped at 1 KB of bytecode for the 40 KB semispaces.
+    (:plus-1m-jit :load #x0003C000 :static-lo #x0008E000 :static-hi #x000D1000
+              :region #x000D1000 :heap-size #x00030000 :gc-guard #x00002000
+              :alloc-start #x0000E000
+              :kind-map #x000F5000 :cache-lo #x0001C000 :cache-hi #x00036000
+              :jit-area-lo #x00036000 :jit-area-hi #x0003A000 :jit-max-bytecode 1024
+              :staging #x0003A000 :staging-size #x00000000
+              :nil-page #x0003A000
               :stack-top #x00018000 :scratch #x00018000 :io-buf #x00019000
               :init-base #x00400000
               :boot-heap #x01000000 :boot-heap-size #x00800000
@@ -299,7 +320,7 @@
    heap, cache and stack, above 4 MB; the descriptor's SAVE flag then has
    KERNEL-MAIN send the core over serial port A."
   (let* ((buf (make-m68k-buffer))
-         (classic (member *mac68k-machine* '(:classic :classic-os :classic-2m :plus-1m)))
+         (classic (member *mac68k-machine* '(:classic :classic-os :classic-2m :plus-1m :plus-1m-jit)))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
          (fill (mvm-make-label))

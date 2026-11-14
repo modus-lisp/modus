@@ -585,6 +585,25 @@ form is compiled in the image and run by the bytecode interpreter, and their
 working set pages through a 136 KB cache (see "The REPL's code working set is
 the wall" above).
 
+### With the threaded JIT: `MODUS_MAC68K_MACHINE=plus1mjit MODUS_68K_JIT=1`
+
+REPL DEFUNs translated to threaded code (docs/68k-threaded-jit.md).  The JIT's
+shape index (8 KB) and the handlers it adds (79) do not fit plus1m's resident
+range (2.9 KB free), so this map moves the image 16 KB down and takes a code
+area from the cache:
+
+| range | what |
+|---|---|
+| `#x1C000`-`#x36000` | code cache (104 KB) |
+| `#x36000`-`#x3A000` | the JIT's code area (16 KB) |
+| `#x3A000`-`#x3C000` | NIL's page and T's (no lower: the core run's LC ROM keeps its system heap to `#x39FE0`) |
+| `#x3C000`-`#x8E000` | resident image |
+
+MAME `macplus -ramsize 1M`: `(fib 15)` 6 s and `(fib 20)` 18 s (interpreted,
+`(fib 15)` is ~19 minutes on a Classic); the first DEFUN ~200 s, as the JIT's
+own code pages in; later DEFUNs ~75 s (plus1m: ~50 s); `(greet "Mac")` 6 s.
+Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
+
 ## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.py`
 
 No floppy and no disk of our own: a Mac application, "Modus", whose data fork

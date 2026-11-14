@@ -140,14 +140,40 @@
    R = the 32-bit word in the CELL whose address follows the token.  A cell is
    a low-block word, which every collection scans and forwards, so a quoted
    heap object a runtime DEFUN loads can move.")
-(defun m68k-jit-extra-shapes ()
-  "The keys in MODUS_68K_JIT_EXTRA (default mvm/68k-jit-extra-shapes.txt), one
-   per line, ;-comments allowed."
-  (let ((f (or (sb-ext:posix-getenv "MODUS_68K_JIT_EXTRA")
-               (namestring (merge-pathnames "mvm/68k-jit-extra-shapes.txt" cl-user::*modus-base*)))))
+(defun m68k-jit-census ()
+  "The keys in MODUS_68K_JIT_CENSUS (default mvm/68k-jit-repl-shapes.txt):
+   lines of COUNT KEY, ;-comments allowed; most asked for first."
+  (let ((f (or (sb-ext:posix-getenv "MODUS_68K_JIT_CENSUS")
+               (namestring (merge-pathnames "mvm/68k-jit-repl-shapes.txt" cl-user::*modus-base*)))))
     (with-open-file (in f)
-      (let ((*package* (find-package :keyword)) (*read-eval* nil))
-        (loop for k = (read in nil :eof) until (eq k :eof) collect k)))))
+      (let ((*package* (find-package :keyword)) (*read-eval* nil) (rows nil))
+        (loop for n = (read in nil :eof) until (eq n :eof)
+              do (push (cons n (read in)) rows))
+        (mapcar (function cdr) (stable-sort (nreverse rows) (function >) :key (function car)))))))
+
+(defun m68k-jit-equivalents (key)
+  "As jit-68k.lisp's %T68-EQUIVALENTS: keys the runtime JIT accepts for KEY --
+   a register CMP with its operands swapped and its branch mirrored, TEST's
+   operands swapped, a commutative operation's sources swapped."
+  (let ((out nil))
+    (when (and (eq (first key) :fused) (consp (second key)) (= (length (second key)) 3))
+      (destructuring-bind (op a b) (second key)
+        (let ((br (third key)))
+          (cond ((= op 48)
+                 (push (list :fused (list op b a)
+                             (case br (67 70) (70 67) (68 69) (69 68) (t br)) (fourth key))
+                       out))
+                ((= op 49) (push (list :fused (list op b a) br (fourth key)) out))))))
+    (when (and (integerp (first key)) (member (first key) '(32 34 40 41 42 173 174))
+               (= (length key) 4))
+      (push (list (first key) (second key) (fourth key) (third key)) out))
+    out))
+
+(defvar *68k-jit-indexed* nil
+  "MODUS_68K_JIT: an EQUAL hash of the shape keys the image's table indexes for
+   the runtime JIT (the census's, or the equivalents the image has), NIL for
+   all of them.")
+
 (defvar *68k-thread-shapes* nil "Hash: shape key -> shape (vector index label count key).")
 (defvar *68k-thread-next-label* nil)
 (defvar *68k-stream-fixups* nil "List of (byte-pos label size base).")
@@ -5071,13 +5097,27 @@
                    (unless (gethash k shapes)
                      (setf (gethash k shapes) (vector (if (< j 255) j (1+ j)) (mvm-make-label) 0 k))
                      (incf j))))
-            (loop for r from 0 to 16 do (add (list :li-cell r)))
-            ;; and the shapes REPL code needs that this image's own code may not
-            ;; make (mvm/68k-jit-extra-shapes.txt)
-            (let ((n (hash-table-count shapes)))
-              (dolist (k (m68k-jit-extra-shapes)) (add k))
-              (format t "~&;; 68k JIT: ~D extra shapes for runtime code~%"
-                      (- (hash-table-count shapes) n))))))
+            ;; the census (mvm/68k-jit-repl-shapes.txt): what runtime code asks
+            ;; for.  The table indexes each key the image has, or an equivalent
+            ;; it has; a key with neither gets a handler of its own
+            (let ((n (hash-table-count shapes)) (idx (make-hash-table :test 'equal)))
+              (loop for r from 0 to 16 do (add (list :li-cell r)) (setf (gethash (list :li-cell r) idx) t))
+              (dolist (k (m68k-jit-census))
+                (let ((have (if (gethash k shapes) k
+                                (find-if (lambda (e) (gethash e shapes)) (m68k-jit-equivalents k)))))
+                  (unless have (add k) (setq have k))
+                  (setf (gethash have idx) t)
+                  ;; a LOAD / STORE the census saw (hosted) may be spelled here
+                  ;; with the convention-region bit (+WIDTH-CONV-BIT+, 8): the
+                  ;; Mac's compiler sets it.  Indexed when this image has it,
+                  ;; never added (a build without the bit cannot emit it)
+                  (when (and (member (first k) '(112 113)) (= (length k) 4)
+                             (integerp (fourth k)) (< (fourth k) 8))
+                    (let ((v (list (first k) (second k) (third k) (+ (fourth k) 8))))
+                      (when (gethash v shapes) (setf (gethash v idx) t))))))
+              (setq *68k-jit-indexed* idx)
+              (format t "~&;; 68k JIT: ~D shapes for runtime code, ~D indexed~%"
+                      (- (hash-table-count shapes) n) (hash-table-count idx))))))
       (setq *68k-cold-fns* cold *68k-thread-shapes* shapes)
       ;; MODUS_68K_THREAD_STATS: stream bytes, and the commonest adjacent
       ;; token pairs (superinstruction candidates), by bytes they would save.
@@ -6041,14 +6081,18 @@
     (coerce (nreverse out) '(vector (unsigned-byte 8)))))
 
 (defun m68k-emit-shape-table (buf shapes)
-  "MODUS_68K_JIT: every shape's key and token index, for the runtime JIT, after
-   the dispatch table: \"modusSHP\", how far back NEXT is (4 bytes: the
-   runtime's way to NEXT on a paged image, whose stubs go to the loader), a
-   count, the entries' offsets (from the magic) sorted by key bytes, then each
+  "MODUS_68K_JIT: the indexed shapes' keys and token indices (*68K-JIT-INDEXED*),
+   for the runtime JIT, after the dispatch table: \"modusSHP\", how far back
+   NEXT is (4 bytes: the runtime's way to NEXT on a paged image, whose stubs go
+   to the loader), a count, the entries' offsets (2 bytes each, from the magic)
+   sorted by key bytes, then each
    entry -- its index (2 bytes), its key's length (1) and bytes.  4-aligned, so
    the runtime can scan for the magic."
   (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-byte buf 0))
-  (let* ((rows (sort (mapcar (lambda (v) (cons (m68k-key-bytes (svref v 3)) (svref v 0))) shapes)
+  (let* ((rows (sort (mapcar (lambda (v) (cons (m68k-key-bytes (svref v 3)) (svref v 0)))
+                             (if *68k-jit-indexed*
+                                 (remove-if-not (lambda (v) (gethash (svref v 3) *68k-jit-indexed*)) shapes)
+                                 shapes))
                      (lambda (a b) (let ((x (car a)) (y (car b)))
                                      (loop for i from 0
                                            do (cond ((>= i (length x)) (return (< i (length y))))
@@ -6056,7 +6100,7 @@
                                                     ((/= (aref x i) (aref y i))
                                                      (return (< (aref x i) (aref y i))))))))))
          (n (length rows))
-         (head (+ 8 4 4 (* 4 n)))
+         (head (+ 8 4 4 (* 2 n)))
          (back (- (m68k-buffer-position buf)
                   (or (gethash *68k-thread-next-label* (m68k-buffer-labels buf))
                       (error "68k JIT shape table: NEXT is not placed"))))
@@ -6066,7 +6110,8 @@
       (loop for c across "modusSHP" do (m68k-emit-byte buf (char-code c)))
       (u32 back)
       (u32 n)
-      (dolist (o (nreverse offs)) (u32 o))
+      (when (> pos #xFFFF) (error "68k JIT shape table: ~D bytes, over 64 KB" pos))
+      (dolist (o (nreverse offs)) (m68k-emit-byte buf (ash o -8)) (m68k-emit-byte buf (logand o #xFF)))
       (dolist (r rows)
         (m68k-emit-byte buf (ash (cdr r) -8)) (m68k-emit-byte buf (logand (cdr r) #xFF))
         (m68k-emit-byte buf (length (car r)))

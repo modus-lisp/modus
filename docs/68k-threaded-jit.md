@@ -79,6 +79,9 @@ ladder and alexandria/cl-ppcre for regressions.  Then the Mac.
 
 Runs on the Mac Classic layout launched from Mac OS (`classicos`, 4 MB), in
 MAME's 68000: `(fib 15)` 4 s against ~19 minutes interpreted, `(fib 20)` 17 s.
+And on a 1 MB Mac Plus (`plus1mjit`: the image 16 KB lower, a 16 KB code area
+from the page cache): `(fib 15)` 6 s, `(fib 20)` 18 s, the first DEFUN ~200 s
+(it pages the JIT in through a 104 KB cache), a later one ~75 s.
 Hosted 68k: `t10` (24 cases against the interpreter, constants across a
 collection) passes, `(fib 20)` 27.8 s -> 18 ms.  Not done: handlers generated
 at run time (INDIRECT) -- a missing shape refuses the module instead; late
@@ -117,8 +120,12 @@ shape index is built in the core run and saved with the core.
   `(hanoi 10)` hung; and `%T68-LOOKUP` read a packed table entry's index as
   one word, an address error on a real 68000 at an odd entry.  The JIT now
   takes the operand form from CAR's stub (paged or not) and reads bytes.
-- **The Mac's small image makes fewer shapes** (2,979 against the hosted
-  CLI's 4,532), so `(defun fib ...)` there needed `(:FUSED (48 4 6) 67 2)` and
-  was refused.  `mvm/68k-jit-extra-shapes.txt` adds 215 (about 10 KB
-  resident): the hosted image's top 1000 the Mac lacks, and its fused
-  compare-and-branch rows.
+- **The table indexes what runtime code asks for, not every shape.**  The
+  Mac's small image makes fewer shapes than the hosted CLI (2,979 against
+  4,532), so `(defun fib ...)` there needed `(:FUSED (48 4 6) 67 2)` and was
+  refused; and indexing all of them was 40 KB, which a 1 MB Mac has no room
+  for.  `mvm/68k-jit-repl-shapes.txt` is a census (`*T68-KEY-LOG*`) of the 795
+  keys the JIT was asked for while translating alexandria and ~35 REPL
+  functions on the hosted 68k.  An image indexes those, or an equivalent it
+  has, and gets a handler for each it lacks: on the 1 MB image 798 entries in
+  8 KB and 79 handlers.  Entry offsets are 2 bytes.

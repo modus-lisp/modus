@@ -118,7 +118,8 @@
   (+ (* (mem-ref a :u16) 65536) (mem-ref (+ a 2) :u16)))
 
 (defun %t68-entry (i)
-  (+ *t68-table* (%t68-u32 (+ *t68-table* 16 (* 4 i)))))
+  "Entry I's address: its offset is 2 bytes (translate-68k M68K-EMIT-SHAPE-TABLE)."
+  (+ *t68-table* (mem-ref (+ *t68-table* 16 (* 2 i)) :u16)))
 
 (defun %t68-compare (bytes e)
   "-1 / 0 / 1: BYTES against the key of the table entry at E."
@@ -219,7 +220,16 @@
                (setq *t68-table* a *t68-table-n* (%t68-u32 (+ a 12))))
              (setq a (+ a 4)))
     (unless *t68-table* (error "jit-68k: no shape table in the image (built without MODUS_68K_JIT=1?)"))
-    ;; the permutable operations' operand lists
+    ;; the permutable operations' operand lists: when first needed
+    (setq *t68-by-op* nil)
+    *t68-table*))
+
+(defun %t68-build-by-op ()
+  "The operand lists the table has for each permutable operation
+   (%T68-PERMUTED's candidates).  Built at the first permutation, not with the
+   table: the Mac builds the table in its core run, and these lists would sit
+   in a 1 MB Mac's saved heap, which has no room for them."
+  (progn
     (let ((byop (make-hash-table)))
       (dotimes (i *t68-table-n*)
         (let ((e (%t68-entry i)))
@@ -228,8 +238,7 @@
                      (< (mem-ref (+ e 4) :u8) #x80) (assoc (mem-ref (+ e 4) :u8) (%t68-permutable)))
             (let ((k (%t68-decode-key e)))
               (push (cdr k) (gethash (car k) byop))))))
-      (setq *t68-by-op* byop))
-    *t68-table*))
+      (setq *t68-by-op* byop))))
 
 (defun %t68-fixed-area ()
   "(LO . HI) of a code area the map reserves, or NIL to map one (hosted
@@ -377,6 +386,7 @@
    NIL when no candidate fits."
   (let* ((op (first key)) (kinds (cdr (assoc op (%t68-permutable)))) (src (rest key)))
     (when (and kinds (= (length kinds) (length src)))
+      (unless *t68-by-op* (%t68-build-by-op))
       (dolist (cand (gethash op *t68-by-op*) nil)
         (let ((ok t) (moves nil) (idents nil))
           (loop for k in kinds for sr in src for c in cand
@@ -401,9 +411,16 @@
                               (list exec)
                               (reverse pops)))))))))))))         ; the targets back
 
+(defvar *t68-key-log* nil "A hash (key text -> count) to record every shape asked for, or NIL.")
+
 (defun %t68-token (key)
   "KEY's token index in the image's table, or an equivalent key's; NIL (and
    *T68-WHY*) when the image has neither."
+  ;; a census: what runtime code asks for (MEASURES which shapes an image's
+  ;; table must index; see mvm/68k-jit-repl-shapes.txt)
+  (when (and (boundp (quote *t68-key-log*)) (hash-table-p *t68-key-log*))
+    (let ((s (prin1-to-string key)))
+      (setf (gethash s *t68-key-log*) (+ 1 (or (gethash s *t68-key-log*) 0)))))
   (or (%t68-lookup key)
       (dolist (k (%t68-equivalents key) nil)
         (let ((i (%t68-lookup k))) (when i (return i))))

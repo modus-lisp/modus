@@ -42,6 +42,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
+    'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
 }[os.environ['MODUS_MAC68K_MACHINE'].lower()]
 # a map that can run on top of Mac OS (boot-mac68k's :CLASSIC-OS; launched by
 # scripts/mac68k-chain.py's application): the RAM it needs.  The boot blocks'
@@ -50,7 +51,7 @@ CHAIN_MEMTOP = {'classicos': 0x00400000}.get(os.environ['MODUS_MAC68K_MACHINE'].
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk
 # puts it there
-INIT_BASE = {'plus1m': 0x00400000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower())
+INIT_BASE = {'plus1m': 0x00400000, 'plus1mjit': 0x00400000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower())
 LEAF = {0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x60, 0x64, 0x65, 0x66}
 # low-block byte tables, offsets from the region (not scanned for pointers)
 LOW_BYTES = [(0x6000, 0x6100),      # the static block's raw words (set by hand)

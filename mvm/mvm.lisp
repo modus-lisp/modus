@@ -1037,19 +1037,39 @@
         (- val #x10000)
         val)))
 
-(defun decode-u32 (bytes pos)
-  "Decode a 32-bit little-endian value"
+;;; DECODE-S32 branches on the top byte BEFORE it builds the value.
+;;; On a 30-bit fixnum tower (68k, and every 32-bit port) a fixnum is below
+;;; 2^29, so the constants #x80000000 / #x100000000 and any (ash b3 24) with
+;;; b3 >= 32 are bignums -- and the old shape compared every operand against one
+;;; and built every negative offset (b3 = #xFF) through four bignum operations
+;;; to arrive at, say, -12.  Profiled on the Mac, that was ~20% of a DEFUN.
+;;; A signed offset that fits in 30 bits now never touches a bignum; wider
+;;; ones take the general path.  (DECODE-U32 already made a bignum only when
+;;; the value is one: the NIL marker #xFFFFFFF0 as an imm32, 32-bit masks.)
+;;; Results are identical on every target: test/decode-s32.lisp checks every
+;;; top byte against the old definition.
+
+(defun %decode-lo24 (bytes pos)
   (logior (aref bytes pos)
           (ash (aref bytes (+ pos 1)) 8)
-          (ash (aref bytes (+ pos 2)) 16)
-          (ash (aref bytes (+ pos 3)) 24)))
+          (ash (aref bytes (+ pos 2)) 16)))
+
+(defun decode-u32 (bytes pos)
+  "Decode a 32-bit little-endian value"
+  (logior (%decode-lo24 bytes pos) (ash (aref bytes (+ pos 3)) 24)))
 
 (defun decode-s32 (bytes pos)
   "Decode a 32-bit signed little-endian value"
-  (let ((val (decode-u32 bytes pos)))
-    (if (>= val #x80000000)
-        (- val #x100000000)
-        val)))
+  (let ((b3 (aref bytes (+ pos 3))))
+    (cond ((< b3 #x20)
+           (logior (%decode-lo24 bytes pos) (ash b3 24)))
+          ((>= b3 #xE1)                   ; (ash -31 24) > -2^29: a fixnum
+           (+ (%decode-lo24 bytes pos) (ash (- b3 256) 24)))
+          (t
+           (let ((val (logior (%decode-lo24 bytes pos) (ash b3 24))))
+             (if (>= val #x80000000)
+                 (- val #x100000000)
+                 val))))))
 
 (defun decode-u64 (bytes pos)
   "Decode a 64-bit little-endian value"

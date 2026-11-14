@@ -604,29 +604,61 @@ every DEFUN translated, a DEFUN took 196-315 s.  So here DEFUN does not
 translate (the layout's `:jit-on-defun nil`) and `(compile 'f)` does.  MAME
 `macplus -ramsize 1M`:
 
-| type | time |
-|---|---|
-| `(defun fib (n) ...)` (the first DEFUN) | 115 s |
-| `(compile 'fib)` | 78 s |
-| `(fib 15)` | 6 s (interpreted: ~19 minutes on a Classic) |
-| `(fib 20)` | 18 s |
-| a later DEFUN (`greet`) | 54 s (plus1m: 47 s) |
-| `(compile 'greet)` | 21 s |
+A session, in the order typed (each form's time to the next prompt; the
+second column is the same image before the 2026-11-14 round below):
+
+| type | time | before |
+|---|---|---|
+| `(defun sq (x) (* x x))` (the first form) | 46 s | 62 s |
+| `(defun greet (name) (format nil "Hello, ~A!" name))` | 38 s | 53 s |
+| `(greet "Mac")` | 10 s | 9 s |
+| `(+ 1 2)` | 4 s | 5 s |
+| `(defun fib (n) ...)` | 96 s | 111 s |
+| `(compile 'fib)` | 62 s | 105 s |
+| `(fib 20)` | 19 s | heap exhausted |
+| `(defun fact ...)`, `(compile 'fact)`, `(fact 10)` | 74 s, 60 s, 5 s | |
+| `(defun tri (n) ...)`, `(tri 20)` interpreted | 72 s, 54 s | |
+| `(defmacro twice (x) ...)`, its use in a LET | 347 s, 66 s | |
+| `(compile 'tri)`, `(tri 100)` | 49 s, 4 s | |
+| `(mapcar #'sq (list 1 2 3))` | 50 s | |
 
 Built with `MODUS_68K_HOT=mvm/68k-hot-mac-plus.txt`: one native function,
 `%GV-REF-FILL` (2 KB of the 5.5 KB the resident range has free), which every
-special-variable read of a small image calls.  `(compile 'fib)` was 97 s: 15 s
-of it was the cold names' index parsed into a vector at the first name read
-from disk (403 PARSE-INTEGERs; `%COLD-NAMES-FIRST-LE` now compares the index's
-digits where they are); the other 4 s are the native `%GV-REF-FILL` and the
-JIT no longer comparing small operands with 32-bit constants (bignums on this
-tower), not measured apart.
+special-variable read of a small image calls.
 
-Where a DEFUN's time goes there (MAME, PC and call-stack samples; `greet`):
-the compiler 43%, the SCSI transfer in the ROM 21% and our loader 11% (both
-inside the others), the reader 7%, `REGISTER-MVM-BOOTSTRAP-MACROS` run again at
-every EVAL 7%, `BOUNDP` 9% (each asks whether the name is a kernel global, by
-string), kernel-function names read from the cold functions on disk 5%.
+**What a DEFUN was spending, found by sampling the Lisp call stack** (MAME
+Lua: PC, the threaded IP, and the frame chain's return addresses mapped to
+streams through the cache's owner map; `greet`, 53 s).  None of it is the
+Mac's: it is in the shared evaluator and compiler, where a workstation hides
+it (x64, 3000 DEFUNs through EVAL: 1360 ms before, 1050 ms after; the ANSI
+suite 21680/21681 both sides, the same test failing).
+
+| was | what | now |
+|---|---|---|
+| 9% | `BOUNDP`: is the symbol's name a kernel global's (a string hash), then is its package a kernel package (STRING= against each) | the package first, by EQ (`%KERNEL-HOME-PKG-P`) |
+| 7% | the 94 bootstrap macros copied into a fresh `*MACRO-TABLE*` at every EVAL | the fresh table overlays them (`%MACRO-TABLE-REF`) |
+| 5% | every called name looked up in the kernel's function names -- on a Mac a read of the cold functions on disk | only for a symbol of a non-kernel package |
+| 6% | `TAIL-FORM-IS-VALUES-P` building a list of 53 strings to MEMBER the operator's name in (x64: 3 KB and 5 us a call) | by hash, as its other arms |
+| 3% | the arity check's function name compiled through COMPILE-FORM: a macroexpansion of `(QUOTE NAME)` per function | `COMPILE-QUOTE` |
+
+Also in that round, for the heap: the compile's IR and expansion memo are
+dropped before the form runs; `*MVM-EVAL-CACHE*` has a bound (4096 forms; 0
+here -- it kept every form evaluated, compiled, for the life of the process);
+the JIT's permutation candidates are read from the shape table, not collected
+into a hash table that a 40 KB young semispace could not hold (the "heap
+exhausted" above).  And the cold names' index is searched where it is (15 s
+of the first `(compile 'f)`: 403 PARSE-INTEGERs through the bignum reader).
+
+**What is left of a DEFUN** (`greet`, 38 s): the disk.  The SCSI transfer in
+the ROM is ~33% and our loader ~15%; Lisp is a third.  One DEFUN calls 616
+distinct functions, 664 KB of threaded code, through the 104 KB cache: 1806
+stream loads, 1.7 MB read.  Two functions are a quarter of it --
+`EMIT-BYTECODE-FOR-IR` (65 KB, 339 KB read) and `COMPILE-COMPOUND` (95 KB,
+114 KB read): each is one long chain of tests, walked from the top for every
+instruction or form, so a late arm pages the whole function in.  A simulation
+over the recorded references: a clock policy in place of the FIFO would save
+~20% of the loads, 24 KB more cache ~15%.  DEFMACRO compiles its expander in
+nested EVALs (347 s).
 
 Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
 

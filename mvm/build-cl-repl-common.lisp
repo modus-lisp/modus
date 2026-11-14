@@ -3512,8 +3512,8 @@
 " "")
                        (if (and (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
                                 (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
-                           "  ;; the threaded JIT's tables (the shape index, the permutable
-  ;; operations' operand lists, the constant cells, the area pointer) made HERE,
+                           "  ;; the threaded JIT's tables (the shape index, the constant cells, the area
+  ;; pointer) made HERE,
   ;; so they are frozen into the core: on a Classic they cost minutes at the
   ;; first DEFUN.  Nothing is translated (%T68-ALLOWED-P), so the code area,
   ;; which the core does not carry, is still empty.

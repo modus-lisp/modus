@@ -1644,12 +1644,14 @@
   "Runtime compile: VAR is one of the kernel's own globals -- homed in a kernel
    package and named in the build's list of them -- which the image's code
    (compiled ahead of time) treats as special."
+  ;; the package before the name: an EQ test (%KERNEL-HOME-PKG-P) that a
+  ;; user's variable fails, against a string hash every variable paid
   (and *mvm-eval-runtime-p* (symbolp var) var
        (boundp '*kernel-global-names*) *kernel-global-names*
-       (gethash (symbol-name var) *kernel-global-names*)
        (let ((p (symbol-package var)))
-         (and p (fboundp '%kernel-home-pkg-name-p)
-              (funcall '%kernel-home-pkg-name-p (package-name p))))))
+         (and p (%kernel-home-pkg-p p)))
+       (gethash (symbol-name var) *kernel-global-names*)
+       t))
 
 (defun %proclaimed-special-p (var)
   "VAR is proclaimed special: by a DEFVAR / DEFPARAMETER / DECLAIM compiled
@@ -3769,10 +3771,11 @@
                      (nm (and pn
                               (if (and (%any-runtime-born-pkg-p) (%runtime-born-pkg-p pn))
                                   (%cl-sym-name sym)
-                                  (let ((raw (aref sym 2)))
-                                    (and (stringp raw)
-                                         (%kernel-global-shadow-p pn raw)
-                                         raw))))))
+                                  (and (not (%kernel-home-pkg-p p))
+                                       (let ((raw (aref sym 2)))
+                                         (and (stringp raw)
+                                              (%kernel-global-shadow-p pn raw)
+                                              raw)))))))
                 (and nm (> (length nm) 0)
                      (compute-name-hash
                       (%maybe-narrow (concatenate 'string pn "::" nm)))))))))
@@ -4628,7 +4631,7 @@
   (or (and *shadowing-macro-table* (symbolp op)
            (gethash op *shadowing-macro-table*))
       (and (%macro-name-confirmed-p op hash)
-           (let ((e (gethash hash *macro-table*)))
+           (let ((e (%macro-table-ref hash)))
              (and e
                   (not (and (symbolp op) (fboundp '%shadows-cl-name-p)
                             (funcall '%shadows-cl-name-p op)))
@@ -4771,13 +4774,25 @@
             ,db-form))))))
 
 (defvar *bootstrap-macro-template* nil
-  "PERF: persistent name-hash→expander table for the 94 bootstrap macros, built
+  "PERF: persistent name-hash→expander table for the bootstrap macros, built
    ONCE on the first register-mvm-bootstrap-macros call.  Every mvm-eval-forms call
-   binds a fresh *macro-table* and used to re-CONSTRUCT all 94 macro closures
-   (a chunk of the per-eval compile cost).  Now the first call builds them +
-   snapshots them here; every subsequent call just COPIES this table into
-   *macro-table* (94 cheap hash inserts, no closure construction).  User
-   macrolet/defmacro still add to the per-call copy and are discarded after.")
+   binds a fresh *macro-table* and used to re-CONSTRUCT all the macro closures
+   (a chunk of the per-eval compile cost); then it COPIED this table into the
+   fresh one, an insert a macro, which was still 7% of a REPL DEFUN (measured
+   by call stack on a 68000, where it shows).  Now the fresh table is an
+   OVERLAY: a lookup that misses it reads this one (%MACRO-TABLE-REF), and
+   nothing is copied.  User macrolet/defmacro add to the per-call overlay and
+   are discarded after.")
+
+(defun %macro-table-ref (hash)
+  "The expander filed under HASH: the current *MACRO-TABLE*'s own entry (a
+   MACROLET's, a DEFMACRO's, a build's marker), else the bootstrap macros'.
+   A MACROLET that shadows a bootstrap macro saves and restores the OVERLAY's
+   entry with a bare GETHASH / REMHASH, which is what puts the bootstrap macro
+   back in view."
+  (or (gethash hash *macro-table*)
+      (and *bootstrap-macro-template*
+           (gethash hash *bootstrap-macro-template*))))
 
 ;;; A method body that cannot call CALL-NEXT-METHOD or NEXT-METHOD-P needs
 ;;; none of the next-method state the dispatcher sets around every method
@@ -4841,11 +4856,10 @@
 
 (defun register-mvm-bootstrap-macros ()
   "Register standard CL macros needed to compile *runtime-functions*.
-   Fast path (template already built): copy it into the current *macro-table*."
+   Fast path (template already built): nothing to do, the current
+   *macro-table* is an overlay on it (%MACRO-TABLE-REF)."
   (when *bootstrap-macro-template*
     (%mexp-memo-invalidate)
-    (maphash (lambda (k v) (setf (gethash k *macro-table*) v))
-             *bootstrap-macro-template*)
     (return-from register-mvm-bootstrap-macros nil))
   ;; COND → nested IF
   (mvm-define-macro "COND"
@@ -20859,9 +20873,14 @@
           ;; multi-valued", so neither the epilogue nor %MV-CLAMP-TAIL set
           ;; the count, and (and (values t nil) 'a) returned A, NIL
           ;; (upstream AND.6, OR.6, COND.11, SETQ.4, TAGBODY.4 ...).
-          ((member (symbol-name op)
-                   '("QUOTE" "FUNCTION" "SETQ" "PSETQ" "TAGBODY" "LAMBDA")
-                   :test #'string=)
+          ;; By HASH, as every arm above: (MEMBER (SYMBOL-NAME OP) '("QUOTE" ...)
+          ;; :TEST #'STRING=) builds its list of strings again at every call --
+          ;; image code has no literal lists -- and the long list below was 53
+          ;; fresh strings, 3 KB and 5 us a call on x64 (2026-11), the hashed
+          ;; arms 0.06 us.
+          ((or (= hash #.(compute-name-hash "QUOTE")) (= hash #.(compute-name-hash "FUNCTION"))
+              (= hash #.(compute-name-hash "SETQ")) (= hash #.(compute-name-hash "PSETQ"))
+              (= hash #.(compute-name-hash "TAGBODY")) (= hash #.(compute-name-hash "LAMBDA")))
            nil)
           ;; RETURN-FROM / RETURN carry their VALUE form's values.  As a named
           ;; operator they read "possibly multi-valued", so a body like
@@ -20870,28 +20889,41 @@
           ;; label, and a caller's stale count leaked: (funcall (compile nil
           ;; ...)) => -1, NIL, NIL with COMPILE's 3 still in the buffer
           ;; (upstream MISC.159A/173/366 on aarch64).
-          ((string= (symbol-name op) "RETURN-FROM")
+          ((= hash #.(compute-name-hash "RETURN-FROM"))
            (tail-form-is-values-p (list (caddr form))))
-          ((string= (symbol-name op) "RETURN")
+          ((= hash #.(compute-name-hash "RETURN"))
            (tail-form-is-values-p (list (cadr form))))
           ;; THE and LOCALLY pass their body's values through.
-          ((string= (symbol-name op) "THE") (tail-form-is-values-p (cddr form)))
-          ((string= (symbol-name op) "LOCALLY") (tail-form-is-values-p (cdr form)))
-          ((member (symbol-name op) '("MACROLET" "SYMBOL-MACROLET") :test #'string=)
+          ((= hash #.(compute-name-hash "THE")) (tail-form-is-values-p (cddr form)))
+          ((= hash #.(compute-name-hash "LOCALLY")) (tail-form-is-values-p (cdr form)))
+          ((or (= hash #.(compute-name-hash "MACROLET"))
+               (= hash #.(compute-name-hash "SYMBOL-MACROLET")))
            (tail-form-is-values-p (cddr form)))
-          ((member (symbol-name op)
-                   '("MULTIPLE-VALUE-LIST"
-                     "+" "-" "*" "/" "=" "<" ">" "<=" ">="
-                     "CAR" "CDR" "CONS" "LIST" "NULL" "NOT"
-                     "EQ" "EQL" "EQUAL" "EQUALP"
-                     "ATOM" "CONSP" "LISTP" "SYMBOLP"
-                     "NUMBERP" "STRINGP"
-                     "ASH" "LOGAND" "LOGIOR" "LOGXOR" "LOGNOT"
-                     "ZEROP" "PLUSP" "MINUSP" "EVENP" "ODDP"
-                     "1+" "1-" "ABS" "MIN" "MAX"
-                     "CHAR-CODE" "CODE-CHAR" "CHAR=" "CHAR<" "CHAR>"
-                     "ELT" "AREF" "LENGTH")
-                   :test #'string=)
+          ((or (= hash #.(compute-name-hash "MULTIPLE-VALUE-LIST"))
+              (= hash #.(compute-name-hash "+")) (= hash #.(compute-name-hash "-"))
+              (= hash #.(compute-name-hash "*")) (= hash #.(compute-name-hash "/"))
+              (= hash #.(compute-name-hash "=")) (= hash #.(compute-name-hash "<"))
+              (= hash #.(compute-name-hash ">")) (= hash #.(compute-name-hash "<="))
+              (= hash #.(compute-name-hash ">=")) (= hash #.(compute-name-hash "CAR"))
+              (= hash #.(compute-name-hash "CDR")) (= hash #.(compute-name-hash "CONS"))
+              (= hash #.(compute-name-hash "LIST")) (= hash #.(compute-name-hash "NULL"))
+              (= hash #.(compute-name-hash "NOT")) (= hash #.(compute-name-hash "EQ"))
+              (= hash #.(compute-name-hash "EQL")) (= hash #.(compute-name-hash "EQUAL"))
+              (= hash #.(compute-name-hash "EQUALP")) (= hash #.(compute-name-hash "ATOM"))
+              (= hash #.(compute-name-hash "CONSP")) (= hash #.(compute-name-hash "LISTP"))
+              (= hash #.(compute-name-hash "SYMBOLP")) (= hash #.(compute-name-hash "NUMBERP"))
+              (= hash #.(compute-name-hash "STRINGP")) (= hash #.(compute-name-hash "ASH"))
+              (= hash #.(compute-name-hash "LOGAND")) (= hash #.(compute-name-hash "LOGIOR"))
+              (= hash #.(compute-name-hash "LOGXOR")) (= hash #.(compute-name-hash "LOGNOT"))
+              (= hash #.(compute-name-hash "ZEROP")) (= hash #.(compute-name-hash "PLUSP"))
+              (= hash #.(compute-name-hash "MINUSP")) (= hash #.(compute-name-hash "EVENP"))
+              (= hash #.(compute-name-hash "ODDP")) (= hash #.(compute-name-hash "1+"))
+              (= hash #.(compute-name-hash "1-")) (= hash #.(compute-name-hash "ABS"))
+              (= hash #.(compute-name-hash "MIN")) (= hash #.(compute-name-hash "MAX"))
+              (= hash #.(compute-name-hash "CHAR-CODE")) (= hash #.(compute-name-hash "CODE-CHAR"))
+              (= hash #.(compute-name-hash "CHAR=")) (= hash #.(compute-name-hash "CHAR<"))
+              (= hash #.(compute-name-hash "CHAR>")) (= hash #.(compute-name-hash "ELT"))
+              (= hash #.(compute-name-hash "AREF")) (= hash #.(compute-name-hash "LENGTH")))
            nil)
           ;; Any other named call — assume the callee may return
           ;; multi-values via its own (values …) tail.  The callee's
@@ -29961,9 +29993,12 @@
     ;; The name's load may call (and set the nargs slot), so the count rides
     ;; the stack across it.
     (emit-ir :push nargs-reg)
-    (compile-form (if (and name (or (symbolp name) (stringp name))) (list 'quote name) nil)
-                  (make-compile-env :stack-depth 0 :bindings nil :parent nil)
-                  +vreg-v0+)
+    ;; COMPILE-QUOTE / COMPILE-NIL themselves: through COMPILE-FORM this one
+    ;; constant was a macroexpansion of (QUOTE NAME) in every function compiled
+    ;; (2.7% of a REPL DEFUN, call-stack samples on a 68000)
+    (if (and name (or (symbolp name) (stringp name)))
+        (compile-quote name +vreg-v0+)
+        (compile-nil +vreg-v0+))
     (emit-ir :pop +vreg-v1+)
     (emit-ir :set-nargs 2)
     (emit-ir :call "%WRONG-NARGS" 2)
@@ -32831,7 +32866,13 @@
         ;; the batch runner, when the forms use it
         (when (and *init-globals-batched* (not *init-globals-unguarded*))
           (let* ((result (mvm-compile-toplevel
-                           `(defun %init-run-guarded (&rest fns)
+                           ;; ,'DEFUN, here and for the three %STATIC-SYMBOL-
+                           ;; functions below: the build scans source text for
+                           ;; defun tokens to seed the function table
+                           ;; (SCAN-DEFUNS), and these are made in some builds
+                           ;; only -- written plainly, every other build
+                           ;; reported them as unresolved functions
+                           `(,'defun %init-run-guarded (&rest fns)
                               (dolist (f fns) (handler-case (funcall f) (t (c) nil)))
                               nil)))
                  (info (car result)) (ir (cdr result)))
@@ -32956,16 +32997,16 @@
                                         do (setf (char tab (+ o b))
                                                  (code-char (ldb (byte 8 (- 24 (* 8 b))) v))))))
                        *static-literal-index*))
-            (dolist (form `((defun %static-symbol-u29 (s o)
+            (dolist (form `((,'defun %static-symbol-u29 (s o)
                               (+ (* (char-code (char s o)) 16777216)
                                  (* (char-code (char s (+ o 1))) 65536)
                                  (* (char-code (char s (+ o 2))) 256)
                                  (char-code (char s (+ o 3)))))
-                            (defun %static-symbol-miss (idx)
+                            (,'defun %static-symbol-miss (idx)
                               (let ((tab ,tab) (o (* idx 8)))
                                 (%static-symbol-fill idx (%static-symbol-u29 tab o)
                                                      (%static-symbol-u29 tab (+ o 4)))))
-                            (defun %static-symbol-ref1 (idx)
+                            (,'defun %static-symbol-ref1 (idx)
                               (let ((vec (mem-ref #x10000FB0 :u64)))
                                 (if (eql vec 0)
                                     (%static-symbol-miss idx)

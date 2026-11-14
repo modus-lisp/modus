@@ -329,7 +329,13 @@
   (setq *mvm-eval-canonical-source*
         (%small-resize *mvm-eval-canonical-source*
                        "(make-mvm-buffer :bytes (make-array 65536 :element-type '(unsigned-byte 8)))"
-                       "65536" "4096")))
+                       "65536" "4096"))
+  ;; ... and it keeps no compiled form to run again (%MVM-EVAL-CACHE-LIMIT)
+  (setq *mvm-eval-canonical-source*
+        (%small-resize *mvm-eval-canonical-source*
+                       "   40 KB).\"
+  4096)"
+                       "4096" "0")))
 
 ;;; The FASL cache (mvm/fasl.lisp), and its COMPILER FINGERPRINT: a hash of the
 ;;; sources that decide what bytecode a form compiles to -- the ISA, the

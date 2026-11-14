@@ -139,13 +139,42 @@
               (%kernel-package-name-p pn))
        t))
 
+(defvar *kernel-home-pkg-memo* nil
+  "((PACKAGE NAME . ANSWER) ...): %KERNEL-HOME-PKG-P's answers.")
+
+(defun %kernel-home-pkg-p (pkg)
+  "%KERNEL-HOME-PKG-NAME-P of PKG's name, remembered per package object: an
+   EQ walk of a short list (first asked, first found), where the name test is
+   a STRING= against every kernel package's name.  The entry keeps the name's
+   string, so a renamed package is asked again.  Every BOUNDP, every special
+   or function name a runtime compile resolves, asks this; with the string
+   tests BOUNDP alone was 9% of a REPL DEFUN (call-stack samples on a 68000).
+   Filled by the main thread only, as *RUNTIME-BORN-ANSWERS*."
+  (and pkg (%pkg-p pkg)
+       (let ((pn (%pkg-name pkg)) (cur *kernel-home-pkg-memo*) (tail nil))
+         (loop
+           (when (null cur)
+             (let ((ans (%kernel-home-pkg-name-p pn)))
+               (when (modus-int::%mvm-on-main-thread-p)
+                 (let ((cell (cons (cons pkg (cons pn ans)) nil)))
+                   (if tail (rplacd tail cell) (setq *kernel-home-pkg-memo* cell))))
+               (return ans)))
+           (let ((e (car cur)))
+             (when (and (eq (car e) pkg) (eq (car (cdr e)) pn))
+               (return (cdr (cdr e)))))
+           (setq tail cur)
+           (setq cur (cdr cur))))))
+
 (defun %kernel-shadow-key (pkg nm)
   "\"PKG::NM\" when a symbol of PKG named NM must not share the kernel's
    function cell: PKG is not a kernel package and NM is a kernel function's
-   name.  NIL otherwise (the bare key is right)."
+   name.  NIL otherwise (the bare key is right).  The package is asked first:
+   it is an EQ test, the name a string hash -- and on a Mac a read of the cold
+   functions on disk -- that a COMMON-LISP symbol never needs."
   (let ((pn (and pkg (%pkg-name pkg))))
-    (and pn *kernel-fn-names* (gethash nm *kernel-fn-names*)
-         (not (%kernel-home-pkg-name-p pn))
+    (and pn *kernel-fn-names*
+         (not (%kernel-home-pkg-p pkg))
+         (gethash nm *kernel-fn-names*)
          (concatenate 'string pn "::" nm))))
 
 (defun %sym-name-or-hash (sym)
@@ -956,7 +985,7 @@
        (let ((h (%macro-key-name-hash key)))
          (and (> h 0)
               (not (gethash h (%std-fn-not-macro-set)))
-              (gethash h *macro-table*)))))
+              (%macro-table-ref h)))))
 
 (defun %raw-macro-expander (sym)
   "Internal-only: return the raw expander stored for SYM, or NIL.

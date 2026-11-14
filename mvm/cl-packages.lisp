@@ -2160,10 +2160,15 @@
                      ;; without is a baked kernel literal, never shadowed.
                      (let ((nm (if (%runtime-born-pkg-p pn)
                                    (%cl-sym-name sym)
-                                   (let ((raw (aref sym 2)))
-                                     (and (stringp raw)
-                                          (%kernel-global-shadow-p pn raw)
-                                          raw)))))
+                                   ;; the package first (%KERNEL-HOME-PKG-P,
+                                   ;; an EQ test): a kernel package's symbol
+                                   ;; is never shadowed, and the name test
+                                   ;; hashes a string
+                                   (and (not (%kernel-home-pkg-p p))
+                                        (let ((raw (aref sym 2)))
+                                          (and (stringp raw)
+                                               (%kernel-global-shadow-p pn raw)
+                                               raw))))))
                        (and nm (stringp nm) (> (length nm) 0)
                             (compute-name-hash
                              (%narrow-copy (concatenate 'string pn "::" nm)))))))))))

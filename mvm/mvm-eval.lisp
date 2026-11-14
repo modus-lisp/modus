@@ -25,6 +25,16 @@
    is correct: the RESULT depends on live runtime state, not the cache.  bc is a
    COPY (mvm-buffer-used-bytes) so it's safe despite *mvm-eval-buffer* reuse.")
 
+(declaim (overridable %mvm-eval-cache-limit))
+(defun %mvm-eval-cache-limit ()
+  "How many forms *MVM-EVAL-CACHE* may hold.  At the limit it is dropped and
+   starts again: it had no bound, so a process that evaluates forms it never
+   repeats -- a REPL session, a server reading requests -- kept every one,
+   with its bytecode and tables, for as long as it ran.  0: no cache at all
+   (MODUS_SMALL_IMAGE, build-cli-common.lisp: a 1 MB Mac's young heap is
+   40 KB)."
+  4096)
+
 (defvar *e2-active-defun-names* nil
   "Names (strings) of the top-level DEFUNs of the mvm-eval module CURRENTLY
    being interpreted.  Def persistence installs those defuns' trampolines
@@ -4801,6 +4811,9 @@
              ;; region-0 -> worker reference after the CL:INTERN
              ;; lock+copy fix.  See %MVM-ON-MAIN-THREAD-P.
              (%mvm-on-main-thread-p))
+    (when (or (null *mvm-eval-cache*)
+              (>= (hash-table-count *mvm-eval-cache*) (%mvm-eval-cache-limit)))
+      (setq *mvm-eval-cache* (make-hash-table :test (quote equal))))
     (setf (gethash forms *mvm-eval-cache*)
           ;; WS4-S5b: ft-list inserted at index 2 (see %mvm-eval-run-tuple
           ;; layout comment).  reverse → source order (fn-table order).
@@ -4980,6 +4993,7 @@
   ;; Not for COMPILE-FILE's own compile of a toplevel form (mvm/fasl.lisp): a
   ;; hit would RUN the form, and record nothing.
   (let ((%cacheable (and (not *mvm-eval-no-cache*)
+                         (> (%mvm-eval-cache-limit) 0)
                          (not (and *fasl-compile-only* (%fasl-compile-only-here-p)))
                          (%mvm-eval-cacheable-p forms))))
     (when %cacheable
@@ -5217,6 +5231,13 @@
               (%fasl-record %fslot forms bc entry ft-list fn-table rt-table lam-offsets
                             persist-names %lam-bearing %ftaint0)
               (setq *fasl-effects* nil))
+            ;; The compile is over.  Let go of what only it needed -- the IR and
+            ;; the macroexpansion memo -- so the form does not run with its own
+            ;; compilation still live under it: everything it allocates is
+            ;; collected against that, and on a small heap (a 1 MB Mac's is
+            ;; 40 KB) it is room the form itself needs.
+            (setq all-ir nil)
+            (%mexp-memo-invalidate)
             ;; COMPILE-FILE (mvm/fasl.lisp): built, recorded, and not run.
             (if (and *fasl-compile-only* (%fasl-compile-only-skip-p %fslot forms %ftaint0))
                 nil

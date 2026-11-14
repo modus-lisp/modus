@@ -58,7 +58,6 @@
    image (CLAUDE.md limitation 7)."
   '((102 :r :r :r) (202 :r :r :r) (205 :r :r :r) (83 :r :r) (84 :r :r)
     (98 :r :i :r) (113 :r :r :i)))
-(defvar *t68-by-op* nil "Permutable op -> the operand lists the image has shapes for.")
 (defvar *t68-next* nil "NEXT's address: where every stub jumps.")
 (defvar *t68-abs-calls* nil "T on a paged image (the Mac): CALL operands are absolute addresses.")
 (defvar *t68-ptr* 0 "The code area's next free byte.")
@@ -207,8 +206,7 @@
   "The shape table (translate-68k m68k-emit-shape-table): right after the
    dispatch table, which NEXT's MOVE.L (d8,PC,D0.W),D0 names (its extension
    word 6 bytes in, or 10 on the 68000, which scales the index with two ADD.W
-   D0,D0), 4-aligned, behind \"modusSHP\".  The operand lists of the
-   permutable operations are collected too."
+   D0,D0), 4-aligned, behind \"modusSHP\"."
   (%t68-find-next)
   (let* ((ext (if (= (mem-ref (+ *t68-next* 6) :u16) #xD040) (+ *t68-next* 10) (+ *t68-next* 6)))
          (tab (+ ext (logand (mem-ref ext :u16) #xFF)))
@@ -220,25 +218,7 @@
                (setq *t68-table* a *t68-table-n* (%t68-u32 (+ a 12))))
              (setq a (+ a 4)))
     (unless *t68-table* (error "jit-68k: no shape table in the image (built without MODUS_68K_JIT=1?)"))
-    ;; the permutable operations' operand lists: when first needed
-    (setq *t68-by-op* nil)
     *t68-table*))
-
-(defun %t68-build-by-op ()
-  "The operand lists the table has for each permutable operation
-   (%T68-PERMUTED's candidates).  Built at the first permutation, not with the
-   table: the Mac builds the table in its core run, and these lists would sit
-   in a 1 MB Mac's saved heap, which has no room for them."
-  (progn
-    (let ((byop (make-hash-table)))
-      (dotimes (i *t68-table-n*)
-        (let ((e (%t68-entry i)))
-          ;; a list whose first element is a small integer: an op's key
-          (when (and (> (mem-ref (+ e 2) :u8) 1) (>= (mem-ref (+ e 3) :u8) #xD0)
-                     (< (mem-ref (+ e 4) :u8) #x80) (assoc (mem-ref (+ e 4) :u8) (%t68-permutable)))
-            (let ((k (%t68-decode-key e)))
-              (push (cdr k) (gethash (car k) byop))))))
-      (setq *t68-by-op* byop))))
 
 (defun %t68-fixed-area ()
   "(LO . HI) of a code area the map reserves, or NIL to map one (hosted
@@ -394,30 +374,44 @@
    NIL when no candidate fits."
   (let* ((op (first key)) (kinds (cdr (assoc op (%t68-permutable)))) (src (rest key)))
     (when (and kinds (= (length kinds) (length src)))
-      (unless *t68-by-op* (%t68-build-by-op))
-      (dolist (cand (gethash op *t68-by-op*) nil)
-        (let ((ok t) (moves nil) (idents nil))
-          (loop for k in kinds for sr in src for c in cand
-                do (cond ((eq k :i) (unless (eql sr c) (setq ok nil)))
-                         ((eql sr c) (push sr idents))
-                         (t (push (cons sr c) moves))))
-          (setq moves (nreverse moves))
-          (let ((targets (mapcar (function cdr) moves)))
-            (when (and ok moves
-                       (= (length (remove-duplicates targets)) (length targets))
-                       ;; a register an unmoved operand reads must not be overwritten
-                       (notany (lambda (r) (member r targets)) idents))
-              (let ((exec (%t68-lookup (cons op cand)))
-                    (pushes (mapcar (lambda (r) (%t68-lookup (list 18 r))) (append targets (mapcar (function car) moves))))
-                    (pops (mapcar (lambda (r) (%t68-lookup (list 19 r))) targets)))
-                (when (and exec (every (function identity) pushes) (every (function identity) pops))
-                  (let ((n (length targets)))
-                    (return
-                      (append (subseq pushes 0 n)                  ; save the targets
-                              (subseq pushes n)                    ; the operands' values
-                              (reverse pops)                       ; ... into the targets
-                              (list exec)
-                              (reverse pops)))))))))))))         ; the targets back
+      ;; The candidates are the table's own entries for OP, read where they
+      ;; are, last first.  They were once collected into a hash table of
+      ;; operand lists: baked into the core that overflowed a 1 MB Mac's saved
+      ;; heap, and built at the first permutation it was more live data than
+      ;; the 40 KB young semispace has room for -- (compile 'fib) after three
+      ;; DEFUNs ended in "heap exhausted".
+      (let ((i (- *t68-table-n* 1)) (found nil))
+        (loop
+          (when (or found (< i 0)) (return found))
+          (let* ((e (%t68-entry i))
+                 ;; a list whose first element is OP: an op's key
+                 (cand (and (> (mem-ref (+ e 2) :u8) 1) (>= (mem-ref (+ e 3) :u8) #xD0)
+                            (= (mem-ref (+ e 4) :u8) op)
+                            (cdr (%t68-decode-key e)))))
+            (setq i (- i 1))
+            (when cand
+              (let ((ok t) (moves nil) (idents nil))
+                (loop for k in kinds for sr in src for c in cand
+                      do (cond ((eq k :i) (unless (eql sr c) (setq ok nil)))
+                               ((eql sr c) (push sr idents))
+                               (t (push (cons sr c) moves))))
+                (setq moves (nreverse moves))
+                (let ((targets (mapcar (function cdr) moves)))
+                  (when (and ok moves
+                             (= (length (remove-duplicates targets)) (length targets))
+                             ;; a register an unmoved operand reads must not be overwritten
+                             (notany (lambda (r) (member r targets)) idents))
+                    (let ((exec (%t68-lookup (cons op cand)))
+                          (pushes (mapcar (lambda (r) (%t68-lookup (list 18 r))) (append targets (mapcar (function car) moves))))
+                          (pops (mapcar (lambda (r) (%t68-lookup (list 19 r))) targets)))
+                      (when (and exec (every (function identity) pushes) (every (function identity) pops))
+                        (let ((n (length targets)))
+                          (setq found
+                            (append (subseq pushes 0 n)                  ; save the targets
+                                    (subseq pushes n)                    ; the operands' values
+                                    (reverse pops)                       ; ... into the targets
+                                    (list exec)
+                                    (reverse pops))))))))))))))))      ; the targets back
 
 (defvar *t68-key-log* nil "A hash (key text -> count) to record every shape asked for, or NIL.")
 

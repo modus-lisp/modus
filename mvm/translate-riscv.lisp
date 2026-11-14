@@ -52,6 +52,14 @@
 (defconstant +rv-s11+  27)   ; x27 - saved 11
 (defconstant +rv-t3+   28)   ; x28 - temporary 3
 (defconstant +rv-t4+   29)   ; x29 - temporary 4
+;; The Linux syscall numbers the hosted traps use (see *RISCV-LINUX-MODE*
+;; below for why they are named).  DEFINED HERE, BEFORE ANY USE: the image's
+;; own compiler folds a constant only if its DEFCONSTANT came first, and
+;; modus-sh bakes this file (the RV32 DDC); defined at the end, every hosted
+;; write/read/exit trap compiled in-image loaded garbage into a7 (W32 M1).
+(defconstant +rv-linux-sys-read+  63)
+(defconstant +rv-linux-sys-write+ 64)
+(defconstant +rv-linux-sys-exit+  93)
 (defconstant +rv-t5+   30)   ; x30 - temporary 5
 (defconstant +rv-t6+   31)   ; x31 - temporary 6
 
@@ -87,7 +95,13 @@
 ;;; ============================================================
 
 (defstruct rv-buffer
-  (bytes (make-array 131072))           ; fixed-size, position tracks fill
+  ;; An OCTET vector: every store is a byte (LOGAND #xFF).  A generic vector
+  ;; costs a WORD per byte -- 8x on a 64-bit host -- and the doubling below
+  ;; takes a CL image's ~36 MB of RV32 code to a 64M-slot, 512 MB vector, which
+  ;; killed modus-sh --compile-riscv32 (the RV32 DDC) once the input passed 90%
+  ;; of the dump: every prefix up to 22 MB of native code compiled, the whole
+  ;; dump segfaulted.  (W32 M1.)
+  (bytes (make-array 131072 :element-type '(unsigned-byte 8) :initial-element 0))
   (position 0)
   (labels (make-hash-table :test 'eql))
   (fixups nil))    ; list of (byte-position label-id type)
@@ -109,7 +123,8 @@
   (let ((bytes (rv-buffer-bytes buf))
         (pos (rv-buffer-position buf)))
     (when (>= (+ pos 4) (length bytes))
-      (let ((new (make-array (* 2 (length bytes)) :initial-element 0)))
+      (let ((new (make-array (* 2 (length bytes)) :element-type '(unsigned-byte 8)
+                             :initial-element 0)))
         (replace new bytes)
         (setf (rv-buffer-bytes buf) new)
         (setf bytes new)))
@@ -2133,10 +2148,10 @@
          ;; terminates, because (car NIL) is NIL and the walk recurses on NIL
          ;; forever.  Both answers are in registers before any branch and each
          ;; branch skips exactly one 4-byte MV, so the arm is size-stable.
-         (rv-emit-li buf +rv-t2+ +t-value+)
+         (rv-emit-li buf +rv-t2+ (ct-t-value))
          (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+   ; read RS while it is still RS
          (rv-emit-xor buf +rv-t4+ rs +rv-s10+)      ; t4 = 0 iff RS is NIL
-         (rv-emit-addi buf +rv-t3+ +rv-x0+ +tag-cons+)
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ (ct-tag-cons))
          (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; default NIL
          (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep NIL
          (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; cons-tagged -> T
@@ -2151,10 +2166,10 @@
          ;; Same ordering requirement as :consp — read RS before writing t0.
          ;; Four-bit mask and the NIL exclusion, both for the reasons given on
          ;; :consp -- (atom NIL) is T.
-         (rv-emit-li buf +rv-t2+ +t-value+)
+         (rv-emit-li buf +rv-t2+ (ct-t-value))
          (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+
          (rv-emit-xor buf +rv-t4+ rs +rv-s10+)      ; t4 = 0 iff RS is NIL
-         (rv-emit-addi buf +rv-t3+ +rv-x0+ +tag-cons+)
+         (rv-emit-addi buf +rv-t3+ +rv-x0+ (ct-tag-cons))
          (rv-emit-mv buf +rv-t0+ +rv-t2+)           ; default T
          (rv-emit-bne buf +rv-t1+ +rv-t3+ 8)        ; not a cons -> keep T
          (rv-emit-mv buf +rv-t0+ +rv-s10+)          ; cons-tagged -> NIL
@@ -2263,7 +2278,7 @@
          ;; nibble on RV64 but is an immediate, and T-9 is unmapped.  Both
          ;; answers are in registers before the branches, each branch skips a
          ;; fixed run, so the arm is size-stable.
-         (rv-emit-li buf +rv-t3+ +t-value+)
+         (rv-emit-li buf +rv-t3+ (ct-t-value))
          (rv-emit-andi buf +rv-t1+ rs #x0F)   ; +tag-mask+, read RS
          (rv-emit-mv buf +rv-t4+ rs)                  ; keep RS: it may be t0
          (rv-emit-addi buf +rv-t2+ +rv-x0+ (rv-object-tag))
@@ -2519,7 +2534,7 @@
              (progn
                (rv-emit-auipc buf +rv-t0+ (logand hi20 #xFFFFF))
                (rv-emit-addi buf +rv-t0+ +rv-t0+ (logand lo12 #xFFF))
-               (rv-emit-ori buf +rv-t0+ +rv-t0+ +tag-function+)))
+               (rv-emit-ori buf +rv-t0+ +rv-t0+ (ct-tag-function))))
          (store-result vd +rv-t0+)))
 
       (#.+op-li-const+
@@ -2561,7 +2576,7 @@
        ;; vreg, and a funcall inside a loop would otherwise untag the caller's
        ;; own copy of the function pointer once per iteration.
        (let ((rs (resolve (vreg 0))))
-         (rv-emit-addi buf +rv-t1+ rs (- +tag-function+))
+         (rv-emit-addi buf +rv-t1+ rs (- (ct-tag-function)))
          (rv-emit-jalr buf +rv-ra+ +rv-t1+ 0)))
 
       (#.+op-ret+
@@ -3086,7 +3101,7 @@
        ;; The count is stored TAGGED (<<1), matching i386/x64.
        (let ((tagged (ash (vreg 0) 1)))
          (rv-emit-li buf +rv-t2+ tagged)
-         (rv-emit-store-abs buf +rv-t2+ +mv-count-addr+)))
+         (rv-emit-store-abs buf +rv-t2+ (ct-mv-count-addr))))
 
       ;; ---- Unknown opcode ----
       (otherwise
@@ -3869,7 +3884,7 @@
     (rv-emit-load-word buf +rv-t2+ +rv-t0+ 16)       ; resume ip
     (rv-emit-load-word buf +rv-fp+ +rv-t0+ 8)
     (rv-emit-load-word buf +rv-sp+ +rv-t0+ 0)
-    (rv-emit-li buf +rv-a0+ +t-value+)               ; second return: T
+    (rv-emit-li buf +rv-a0+ (ct-t-value))               ; second return: T
     (rv-emit-jalr buf +rv-x0+ +rv-t2+ 0)
     (rv-patch-branch-here buf to-nohandler)
     (funcall no-handler-fn)))
@@ -4065,9 +4080,8 @@
    is 64, where x86-64 says 0 and 1.  They are named in boot-linux-riscv.lisp
    rather than inlined here because the x86 numbers are muscle memory.")
 
-(defconstant +rv-linux-sys-read+  63)
-(defconstant +rv-linux-sys-write+ 64)
-(defconstant +rv-linux-sys-exit+  93)
+;; +RV-LINUX-SYS-READ+ / -WRITE+ / -EXIT+ are defined with the register
+;; constants at the top of this file: they are used long before this point.
 
 (defun riscv-set-linux-mode (on)
   "Turn hosted mode on or off, moving the convention slots with it.  Kept

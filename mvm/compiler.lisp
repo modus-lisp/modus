@@ -988,6 +988,11 @@
    emits the exact same :li IR as before — native translators see no new opcode
    and output is byte-identical.")
 
+(defvar *compile-target* nil
+  "The COMPILE-TARGET of the compilation in progress, or NIL: compile for the
+   machine this code runs on.  Bound by BUILD-IMAGE; rebound to NIL by every
+   entry point that compiles code to run HERE (MVM-EVAL and friends).")
+
 (defvar *static-build-p* nil
   "WS5: when true, the in-image compiler is doing a STATIC BUILD (`modus
    --compile` producing a fresh standalone image), NOT runtime eval.  It runs
@@ -1217,16 +1222,21 @@
    *mvm-eval-runtime-p*'s docstring)."
   (let ((saved-static *static-build-p*)
         (saved-e2rt   *mvm-eval-runtime-p*)
-        (saved-halves *mvm-emit-halves*))
+        (saved-halves *mvm-emit-halves*)
+        ;; W32 M1: the expander RUNS here, so compile it for this machine,
+        ;; not for the build's target (*COMPILE-TARGET*).
+        (saved-ct     *compile-target*))
     (unwind-protect
         (progn
           (setq *static-build-p* nil)
           (setq *mvm-eval-runtime-p* t)
           (setq *mvm-emit-halves* t)
+          (setq *compile-target* nil)
           (eval lambda-form))
       (setq *static-build-p* saved-static)
       (setq *mvm-eval-runtime-p* saved-e2rt)
-      (setq *mvm-emit-halves* saved-halves))))
+      (setq *mvm-emit-halves* saved-halves)
+      (setq *compile-target* saved-ct))))
 
 
 (defvar *%defun-deferred* nil
@@ -3024,7 +3034,7 @@
   "For an instruction that sets a register to NIL / to T: :NIL or :T (the
    register is its SECOND); else NIL."
   (cond ((and (eq (car insn) :mov) (eql (third insn) +vreg-vn+)) :nil)
-        ((and (eq (car insn) :li) (eql (third insn) +t-value+)) :t)
+        ((and (eq (car insn) :li) (eql (third insn) (ct-t-value))) :t)
         (t nil)))
 
 (defun %ir-invert-branch (op)
@@ -3271,6 +3281,71 @@
 (defun ieee-float-lo32 (f)
   (logand (sb-kernel:double-float-low-bits (float f 1.0d0)) #xFFFFFFFF))
 
+;;; ============================================================
+;;; THE COMPILATION'S TARGET -- compiling-for, not running-on (W32 M1)
+;;; ============================================================
+;;; The design is described where the descriptor is MADE: target.lisp,
+;;; MAKE-COMPILE-TARGET-FOR.  These definitions live HERE because every image
+;;; that carries a compiler bakes compiler.lisp, while target.lisp is baked
+;;; only by images that build images (modus-sh, the aarch64 CLI).  Where
+;;; nothing can bind a descriptor, *COMPILE-TARGET* stays NIL and every reader
+;;; returns the running-on value -- the right answer there by construction.
+;;; The readers are the ONE sanctioned place compiler-side code names a
+;;; running-on width constant (build-checks.lisp CHECK I exempts DEFUN CT-*).
+
+;;; *COMPILE-TARGET* itself is defined with the compiler's other mode
+;;; variables, near *STATIC-BUILD-P*: functions above this point read it.
+
+(defstruct compile-target
+  name word-size fixnum-bits
+  fixnum-max fixnum-min fixnum-limit fixnum-neg-limit
+  fixnum-half fixnum-neg-half fixnum-half-max fixnum-signed-bits fixnum-bits-1
+  limb-bits limb-bits-1 limb-split-bits neg-limb-bits neg-limb-bits-1
+  fixnum-read-guard small-bignum-bits
+  half-limb-bits neg-half-limb-bits half-limb-mask
+  big-endian            ; 0 / 1, like +TARGET-BIG-ENDIAN+
+  soft-float            ; 0 / 1, like +TARGET-SOFT-FLOAT+
+  has-fpd               ; T / NIL, like *TARGET-HAS-FPD-P*
+  w32-capable           ; T / NIL: the compiler may emit W32 opcodes (M2+)
+  mv-count-addr mv-values-addr
+  tag-cons tag-function tag-object tag-immediate tag-forward t-value nil-value)
+
+;;; The readers.  Spelled out, one per field, so each is a plain call the
+;;; image's own compiler can compile without a macro.
+(defun ct-fixnum-bits () (let ((c *compile-target*)) (if c (compile-target-fixnum-bits c) +fixnum-bits+)))
+(defun ct-fixnum-max () (let ((c *compile-target*)) (if c (compile-target-fixnum-max c) +fixnum-max+)))
+(defun ct-fixnum-min () (let ((c *compile-target*)) (if c (compile-target-fixnum-min c) +fixnum-min+)))
+(defun ct-fixnum-limit () (let ((c *compile-target*)) (if c (compile-target-fixnum-limit c) +fixnum-limit+)))
+(defun ct-fixnum-neg-limit () (let ((c *compile-target*)) (if c (compile-target-fixnum-neg-limit c) +fixnum-neg-limit+)))
+(defun ct-fixnum-half () (let ((c *compile-target*)) (if c (compile-target-fixnum-half c) +fixnum-half+)))
+(defun ct-fixnum-neg-half () (let ((c *compile-target*)) (if c (compile-target-fixnum-neg-half c) +fixnum-neg-half+)))
+(defun ct-fixnum-half-max () (let ((c *compile-target*)) (if c (compile-target-fixnum-half-max c) +fixnum-half-max+)))
+(defun ct-fixnum-signed-bits () (let ((c *compile-target*)) (if c (compile-target-fixnum-signed-bits c) +fixnum-signed-bits+)))
+(defun ct-fixnum-bits-1 () (let ((c *compile-target*)) (if c (compile-target-fixnum-bits-1 c) +fixnum-bits-1+)))
+(defun ct-limb-bits () (let ((c *compile-target*)) (if c (compile-target-limb-bits c) +limb-bits+)))
+(defun ct-limb-bits-1 () (let ((c *compile-target*)) (if c (compile-target-limb-bits-1 c) +limb-bits-1+)))
+(defun ct-limb-split-bits () (let ((c *compile-target*)) (if c (compile-target-limb-split-bits c) +limb-split-bits+)))
+(defun ct-neg-limb-bits () (let ((c *compile-target*)) (if c (compile-target-neg-limb-bits c) +neg-limb-bits+)))
+(defun ct-neg-limb-bits-1 () (let ((c *compile-target*)) (if c (compile-target-neg-limb-bits-1 c) +neg-limb-bits-1+)))
+(defun ct-fixnum-read-guard () (let ((c *compile-target*)) (if c (compile-target-fixnum-read-guard c) +fixnum-read-guard+)))
+(defun ct-small-bignum-bits () (let ((c *compile-target*)) (if c (compile-target-small-bignum-bits c) +small-bignum-bits+)))
+(defun ct-half-limb-bits () (let ((c *compile-target*)) (if c (compile-target-half-limb-bits c) +half-limb-bits+)))
+(defun ct-neg-half-limb-bits () (let ((c *compile-target*)) (if c (compile-target-neg-half-limb-bits c) +neg-half-limb-bits+)))
+(defun ct-half-limb-mask () (let ((c *compile-target*)) (if c (compile-target-half-limb-mask c) +half-limb-mask+)))
+(defun ct-target-big-endian () (let ((c *compile-target*)) (if c (compile-target-big-endian c) +target-big-endian+)))
+(defun ct-target-soft-float () (let ((c *compile-target*)) (if c (compile-target-soft-float c) +target-soft-float+)))
+(defun ct-has-fpd-p () (let ((c *compile-target*)) (if c (compile-target-has-fpd c) *target-has-fpd-p*)))
+(defun ct-w32-capable-p () (let ((c *compile-target*)) (if c (compile-target-w32-capable c) nil)))
+(defun ct-mv-count-addr () (let ((c *compile-target*)) (if c (compile-target-mv-count-addr c) +mv-count-addr+)))
+(defun ct-mv-values-addr () (let ((c *compile-target*)) (if c (compile-target-mv-values-addr c) +mv-values-addr+)))
+(defun ct-tag-cons () (let ((c *compile-target*)) (if c (compile-target-tag-cons c) +tag-cons+)))
+(defun ct-tag-function () (let ((c *compile-target*)) (if c (compile-target-tag-function c) +tag-function+)))
+(defun ct-tag-object () (let ((c *compile-target*)) (if c (compile-target-tag-object c) +tag-object+)))
+(defun ct-tag-immediate () (let ((c *compile-target*)) (if c (compile-target-tag-immediate c) +tag-immediate+)))
+(defun ct-tag-forward () (let ((c *compile-target*)) (if c (compile-target-tag-forward c) +tag-forward+)))
+(defun ct-t-value () (let ((c *compile-target*)) (if c (compile-target-t-value c) +t-value+)))
+(defun ct-nil-value () (let ((c *compile-target*)) (if c (compile-target-nil-value c) +nil-value+)))
+
 ;; Bignum-literal decomposition helpers — split so the in-image build can
 ;; override them (build-generic.lisp *stage2-bignum-override*) to READ the
 ;; already-built bignum object's slots directly instead of recomputing.  The
@@ -3283,26 +3358,26 @@
 (declaim (overridable %lit-bignum-big-p))
 (defun %lit-bignum-big-p (value)
   "T if VALUE needs the limbs-array (big) bignum shape rather than 2-slot."
-  (> (integer-length (abs value)) +small-bignum-bits+))
+  (> (integer-length (abs value)) (ct-small-bignum-bits)))
 (declaim (overridable %lit-bn-lo))
 (defun %lit-bn-lo (value)
   "Low 62-bit limb (slot 0) of a small bignum VALUE."
-  (logand value +fixnum-max+))
+  (logand value (ct-fixnum-max)))
 (declaim (overridable %lit-bn-hi))
 (defun %lit-bn-hi (value)
   "High signed part (slot 1) of a small bignum VALUE."
-  (ash value +neg-limb-bits+))
+  (ash value (ct-neg-limb-bits)))
 (declaim (overridable %lit-bb-sign))
 (defun %lit-bb-sign (value) (if (< value 0) -1 1))
 (declaim (overridable %lit-bb-nlimbs))
 (defun %lit-bb-nlimbs (value)
   (let ((mag (abs value)) (n 0))
     (loop (when (= mag 0) (return n))
-          (setf mag (ash mag +neg-limb-bits+)) (incf n))))
+          (setf mag (ash mag (ct-neg-limb-bits))) (incf n))))
 (declaim (overridable %lit-bb-limb))
 (defun %lit-bb-limb (value k)
   "K-th 62-bit limb (LSB-first) of VALUE's magnitude."
-  (logand (ash (abs value) (* +neg-limb-bits+ k)) +fixnum-max+))
+  (logand (ash (abs value) (* (ct-neg-limb-bits) k)) (ct-fixnum-max)))
 
 (declaim (overridable normalize-name))
 (defun normalize-name (sym)
@@ -3716,7 +3791,7 @@
    64-BIT TARGETS ARE UNREACHED, not merely unchanged: a 60-bit hash is
    always <= +FIXNUM-MAX+ = 2^62-1 there, so the first branch always wins and
    the emitted IR is bit-identical to before this existed."
-  (if (<= name-hash +fixnum-max+)
+  (if (<= name-hash (ct-fixnum-max))
       `(%gv-set ,name-hash ,tmp-var)
       `(setq ,name ,tmp-var)))
 
@@ -4106,7 +4181,7 @@
                          (ash (car args) (cadr args)))
                         (t nil))
                 (error () nil))))
-      (and (integerp v) (< (abs v) (ash 1 (- +fixnum-bits+ 3))) v))))
+      (and (integerp v) (< (abs v) (ash 1 (- (ct-fixnum-bits) 3))) v))))
 
 (defun %inline-subst-form (form alist)
   "FORM with each symbol in ALIST replaced by its integer, or :FAIL when FORM is
@@ -5343,7 +5418,7 @@
             `(let ((,tmp ,(cadr form)))
                (if (fixnump ,tmp)
                    (if (< ,tmp 0)
-                       (if (eql ,tmp ,(- (+ +fixnum-max+ 1))) (generic-negate-int ,tmp) (- 0 ,tmp))
+                       (if (eql ,tmp ,(- (+ (ct-fixnum-max) 1))) (generic-negate-int ,tmp) (- 0 ,tmp))
                        ,tmp)
                (if (%complex-p ,tmp)
                    (%complex-abs ,tmp)
@@ -6748,8 +6823,8 @@
                 `(let ((,pri ,first))
                    ,@rest
                    (values ,pri))
-                `(let* ((,pri (progn (setf (mem-ref ,+mv-count-addr+ :u64) 1) ,first))
-                        (,cnt (mem-ref ,+mv-count-addr+ :u64))
+                `(let* ((,pri (progn (setf (mem-ref ,(ct-mv-count-addr) :u64) 1) ,first))
+                        (,cnt (mem-ref ,(ct-mv-count-addr) :u64))
                         (,tmp (if (= ,cnt 1)
                                   nil
                                   (if (zerop ,cnt)
@@ -6757,7 +6832,7 @@
                                       (let ((,res nil) (,i (- ,cnt 2)))
                                         (loop
                                           (when (< ,i 0) (return (cons ,pri ,res)))
-                                          (setq ,res (cons (mem-ref (+ ,+mv-values-addr+ (* ,i 8)) :u64) ,res))
+                                          (setq ,res (cons (mem-ref (+ ,(ct-mv-values-addr) (* ,i 8)) :u64) ,res))
                                           (setq ,i (- ,i 1))))))))
                    ,@rest
                    (if (= ,cnt 1)
@@ -8237,7 +8312,7 @@
 
 (defun compile-t (dest)
   "Load T into DEST"
-  (emit-ir :li dest +t-value+))
+  (emit-ir :li dest (ct-t-value)))
 
 (defun emit-li-tagged (dest value)
   "Emit a load of VALUE's tagged word (value<<1) into DEST.
@@ -8324,7 +8399,7 @@
        ;; over-broad rewrite of ALL literals to :li+:shl perturbed the interpreter
        ;; enough to fault, so only NON-positive / large values take a wider path.
        ((zerop value) (emit-ir :li dest 0))
-       ((and (> value 0) (< value +fixnum-half+))    ; small positive: 1 :li
+       ((and (> value 0) (< value (ct-fixnum-half)))    ; small positive: 1 :li
         (emit-ir :li dest (ash value +fixnum-shift+)))
        ;; SMALL NEGATIVE: emitting `(:li (ash value 1))` puts a NEGATIVE value in
        ;; the :li operand, and mvm-emit-u64's native high-32 `(ash val -32)` is
@@ -8332,13 +8407,13 @@
        ;; -2147483648 boundary → the translator dropped whole functions.  Emit the
        ;; POSITIVE magnitude's tagged word (mvm-emit-u64 handles positives) then
        ;; :neg in-register, so no negative is ever a :li operand.
-       ((and (< value 0) (> value +fixnum-neg-half+))   ; small negative: :li+:neg
+       ((and (< value 0) (> value (ct-fixnum-neg-half)))   ; small negative: :li+:neg
         (emit-ir :li dest (ash (- value) +fixnum-shift+))
         (emit-ir :neg dest dest))
        ((> value 0)                               ; large positive
         (emit-ir :li dest value)
         (emit-ir :shl dest dest +fixnum-shift+))
-       ((< value +fixnum-min+)            ; most-negative-fixnum
+       ((< value (ct-fixnum-min))            ; most-negative-fixnum
         (emit-ir :li dest 1)
         (emit-ir :shl dest dest 63))
        (t                                          ; large negative
@@ -8393,7 +8468,7 @@
     ;; a still-numerically-correct small bignum; CL code cannot observe the
     ;; representation difference (EQL/arithmetic identical).  Shared file: gate
     ;; before landing on main.
-    ((and (>= value +fixnum-min+) (<= value +fixnum-max+))
+    ((and (>= value (ct-fixnum-min)) (<= value (ct-fixnum-max)))
      ;; Fixnum range.  emit-li-tagged keeps the host path as `(:li (ash value 1))`
      ;; but uses fixnum-safe halves in-image (value<<1 overflows there for the
      ;; top/bottom bit of the fixnum range — e.g. most-positive/negative-fixnum).
@@ -9856,7 +9931,7 @@
       ;; %FLOAT-ADD / -SUB / -MUL / -DIV: 2-arg, both already IEEE-float
       ;; objects; emit the IR op which the per-arch translator implements
       ;; (SSE2 on x64, FPU on AArch64, soft-float helper on others).
-      ((and (= op-name 504441494) (eql +target-soft-float+ 1))  ; %FLOAT-ADD, no FPU
+      ((and (= op-name 504441494) (eql (ct-target-soft-float) 1))  ; %FLOAT-ADD, no FPU
        (when (arity-ok-p form 2 2 env dest)
          (compile-form (list '%sf-add (cadr form) (caddr form)) env dest)))
       ((= op-name 504441494)  ; %FLOAT-ADD
@@ -9869,7 +9944,7 @@
            (emit-ir :gc-check)
            (emit-ir :fadd dest dest temp)
            (free-temp-reg))))
-      ((and (= op-name 99178435) (eql +target-soft-float+ 1))  ; %FLOAT-SUB, no FPU
+      ((and (= op-name 99178435) (eql (ct-target-soft-float) 1))  ; %FLOAT-SUB, no FPU
        (when (arity-ok-p form 2 2 env dest)
          (compile-form (list '%sf-sub (cadr form) (caddr form)) env dest)))
       ((= op-name 99178435)  ; %FLOAT-SUB
@@ -9882,7 +9957,7 @@
            (emit-ir :gc-check)
            (emit-ir :fsub dest dest temp)
            (free-temp-reg))))
-      ((and (= op-name 241991203) (eql +target-soft-float+ 1))  ; %FLOAT-MUL, no FPU
+      ((and (= op-name 241991203) (eql (ct-target-soft-float) 1))  ; %FLOAT-MUL, no FPU
        (when (arity-ok-p form 2 2 env dest)
          (compile-form (list '%sf-mul (cadr form) (caddr form)) env dest)))
       ((= op-name 241991203)  ; %FLOAT-MUL
@@ -9895,7 +9970,7 @@
            (emit-ir :gc-check)
            (emit-ir :fmul dest dest temp)
            (free-temp-reg))))
-      ((and (= op-name 503197892) (eql +target-soft-float+ 1))  ; %FLOAT-DIV, no FPU
+      ((and (= op-name 503197892) (eql (ct-target-soft-float) 1))  ; %FLOAT-DIV, no FPU
        (when (arity-ok-p form 2 2 env dest)
          (compile-form (list '%sf-div (cadr form) (caddr form)) env dest)))
       ((= op-name 503197892)  ; %FLOAT-DIV
@@ -9909,10 +9984,10 @@
            (emit-ir :fdiv dest dest temp)
            (free-temp-reg))))
       ;; %FLOAT-FROM-INT — tagged integer → fresh float object.
-      ((and (= op-name 345394287) (eql +target-soft-float+ 1))  ; %FLOAT-FROM-INT, no FPU
+      ((and (= op-name 345394287) (eql (ct-target-soft-float) 1))  ; %FLOAT-FROM-INT, no FPU
        (when (arity-ok-p form 1 1 env dest)
          (compile-form (list '%sf-itof (cadr form)) env dest)))
-      ((and (= op-name 458033090) (eql +target-soft-float+ 1))  ; %FLOAT-TO-INT, no FPU
+      ((and (= op-name 458033090) (eql (ct-target-soft-float) 1))  ; %FLOAT-TO-INT, no FPU
        (when (arity-ok-p form 1 1 env dest)
          (compile-form (list '%sf-ftoi (cadr form)) env dest)))
       ((= op-name 345394287)  ; %FLOAT-FROM-INT
@@ -10036,7 +10111,7 @@
       ;; else a no-op.  Lets the pin-stress probe force a full collection.
       ((= op-name 311387315)  ; %MCGC-COLLECT
        (emit-ir :mcgc-collect)
-       (when dest (emit-ir :li dest +nil-value+)))
+       (when dest (emit-ir :li dest (ct-nil-value))))
 
       ;; --- Memory Operations (2-arg) ---
       ((= op-name 473926766)  (when (arity-ok-p form 2 2 env dest) (compile-mem-ref (cadr form) (caddr form) env dest)))  ; MEM-REF
@@ -11807,14 +11882,14 @@
     (emit-ir :bnull dest (if nil-true through false-label))
     (setq temp (alloc-temp-reg))
     (emit-ir :obj-tag temp dest)
-    (emit-ir :cmp-imm temp (ash +tag-cons+ +fixnum-shift+))
+    (emit-ir :cmp-imm temp (ash (ct-tag-cons) +fixnum-shift+))
     (emit-ir :bne false-label)
     (when *mvm-eval-runtime-p*
       (setq temp2 (alloc-temp-reg))
       (emit-ir :cdr temp dest)
       (emit-ir :bnull temp carcheck)
       (emit-ir :obj-tag temp2 temp)
-      (emit-ir :cmp-imm temp2 (ash +tag-cons+ +fixnum-shift+))
+      (emit-ir :cmp-imm temp2 (ash (ct-tag-cons) +fixnum-shift+))
       (emit-ir :bne carcheck)
       (emit-ir :car temp2 temp)
       (emit-ir :cmp-imm temp2 (ash 442386510 +fixnum-shift+))   ; (%ht-tag)
@@ -11836,7 +11911,7 @@
     (compile-form arg env dest)
     (setq temp (alloc-temp-reg))
     (emit-ir :obj-tag temp dest)
-    (emit-ir :cmp-imm temp (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :cmp-imm temp (ash (ct-tag-object) +fixnum-shift+))
     (emit-ir :bne false-label)
     (emit-ir :obj-subtag temp dest)
     (emit-ir :cmp-imm temp (ash subtag +fixnum-shift+))
@@ -14008,7 +14083,7 @@
           ;; a double in the same FP register (its D view): the targets with
           ;; the FPD ops only, like every unboxed double tree
           ((and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")
-                (or *mvm-eval-runtime-p* *target-has-fpd-p*))
+                (or *mvm-eval-runtime-p* (ct-has-fpd-p)))
            :dscalar)
           ((and (symbolp ty) ty (string= (symbol-name ty) "F32V-PACK")) :vector)
           ((and (symbolp ty) ty (string= (symbol-name ty) "VI-PACK")) :ivector)   ; integer lanes (2b)
@@ -14145,7 +14220,7 @@
               ((%fp-tree-need form env) t)
               ;; a double tree too, where the FPD ops exist (no conversion
               ;; calls: %FPD-PURE-NEED hoists nothing)
-              ((and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+              ((and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
                     (%fpd-pure-need form env))
                t)
               ((%v4-tree-need form env) t)
@@ -14258,7 +14333,7 @@
   "For a LET: an array of :scalar / :vector / NIL per binding when at least
    one variable is a declared float/vector local AND the body is call-free
    AND *mvm-eval-runtime-p*; else NIL."
-  (when (and (or *mvm-eval-runtime-p* *fp-locals-force* *target-has-fpd-p*) (consp bindings))
+  (when (and (or *mvm-eval-runtime-p* *fp-locals-force* (ct-has-fpd-p)) (consp bindings))
     (let* ((pairs (%declared-types decl-body))
            (kinds (make-array (length bindings) :initial-element nil))
            (any nil) (i 0))
@@ -14693,7 +14768,7 @@
        (let ((b (env-lookup env var)))
          (and b (member (binding-location b) '(:stack :reg))
               (let ((w (ignore-errors (%decl-int-width (%resolve-declared-type (binding-dtype b))))))
-                (and w (<= w +fixnum-signed-bits+)))))
+                (and w (<= w (ct-fixnum-signed-bits))))))
        (cdr val)))
 
 ;; An array INDEX under (SAFETY 0) is the same case as a fixnum store: a valid
@@ -15087,7 +15162,7 @@
       ;; second compare cost every cached read ~8 instructions)
       (emit-ir :bnull dest miss)
       (emit-ir :obj-tag cell dest)
-      (emit-ir :cmp-imm cell (ash +tag-cons+ +fixnum-shift+))
+      (emit-ir :cmp-imm cell (ash (ct-tag-cons) +fixnum-shift+))
       (emit-ir :bne miss)
       ;; AND THE PAIR MUST STILL CARRY THIS KEY.  A cached pointer is only as
       ;; good as the invariant behind it, and in the ANSI gate-runner image --
@@ -15411,7 +15486,7 @@
                           (emit-ir :aref b a b)))
                (emit-ir :bnull b inline-slow)
                (emit-ir :obj-tag a b)
-               (emit-ir :cmp-imm a (ash +tag-cons+ +fixnum-shift+))
+               (emit-ir :cmp-imm a (ash (ct-tag-cons) +fixnum-shift+))
                (emit-ir :bne inline-slow)
                (emit-ir :car a b)
                (emit-li-tagged c hash)
@@ -20208,7 +20283,7 @@
    result): (SIGNED-BYTE W) below a fixnum's full width, FIXNUM at it.
    %DECL-INT-WIDTH reads (SIGNED-BYTE 63) as no fixnum at all, so a full-width
    count declared that way was untyped."
-  (if (>= w +fixnum-signed-bits+) 'fixnum (list 'signed-byte w)))
+  (if (>= w (ct-fixnum-signed-bits)) 'fixnum (list 'signed-byte w)))
 
 (defun %dotimes-counter-type (count-form env)
   "The type a DOTIMES counter provably has, or NIL.  It runs from 0 up to the
@@ -20225,7 +20300,7 @@
          ;; than %DECL-INT-WIDTH accepts: FIXNUM says the same, usably
          (let ((w (%expr-width count-form env)))
            (cond ((null w) nil)
-                 ((>= w +fixnum-signed-bits+) 'fixnum)
+                 ((>= w (ct-fixnum-signed-bits)) 'fixnum)
                  ((>= w 1) (list 'integer 0 (- (ash 1 (- w 1)) 1)))
                  (t nil))))
         (t nil)))
@@ -20552,7 +20627,7 @@
     (cond
       ((= nvals 0)
        ;; (values) → nil, count = 0
-       (compile-form `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 0) nil)
+       (compile-form `(progn (setf (mem-ref ,(ct-mv-count-addr) :u64) 0) nil)
                      env dest))
       ((= nvals 1)
        ;; (values x) → x, count = 1
@@ -20560,7 +20635,7 @@
        ;; then override count to 1.
        (let ((tmp (%mvm-gensym "V1")))
          (compile-form `(let ((,tmp ,(car args)))
-                          (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+                          (setf (mem-ref ,(ct-mv-count-addr) :u64) 1)
                           ,tmp)
                        env dest)))
       (t
@@ -20576,9 +20651,9 @@
          (setf bindings (nreverse bindings))
          (let ((store-forms nil)
                (idx 0))
-           (push `(setf (mem-ref ,+mv-count-addr+ :u64) ,nvals) store-forms)
+           (push `(setf (mem-ref ,(ct-mv-count-addr) :u64) ,nvals) store-forms)
            (dolist (tmp (cdr temp-vars))
-             (let ((addr (+ +mv-values-addr+ (* idx 8))))
+             (let ((addr (+ (ct-mv-values-addr) (* idx 8))))
                (push `(setf (mem-ref ,addr :u64) ,tmp) store-forms))
              (incf idx))
            (compile-form `(let ,bindings
@@ -20616,7 +20691,7 @@
           (loop
             (when (null ,cur-tmp) (return nil))
             (when (>= ,idx-tmp 20) (return nil))   ; cap: the 20 slots #x10000098..#x10000130
-            (setf (mem-ref (+ ,+mv-values-addr+ (* ,idx-tmp 8)) :u64) (car ,cur-tmp))
+            (setf (mem-ref (+ ,(ct-mv-values-addr) (* ,idx-tmp 8)) :u64) (car ,cur-tmp))
             (setq ,idx-tmp (+ ,idx-tmp 1))
             (setq ,cur-tmp (cdr ,cur-tmp))))
         ;; Store the count LAST (the visible MV count -- handler-case dispatch
@@ -20627,7 +20702,7 @@
         ;; is an out-of-line GENERIC-ADD -- resets the count to 1 on return.
         ;; Measured on i386: (multiple-value-list (values-list '(1 10 20)))
         ;; => (1); cl-ppcre's scanner lost its match end.
-        (setf (mem-ref ,+mv-count-addr+ :u64) ,cnt-tmp)
+        (setf (mem-ref ,(ct-mv-count-addr) :u64) ,cnt-tmp)
         ,pri-tmp)
      env dest)))
 
@@ -20774,7 +20849,7 @@
       (return-from compile-multiple-value-bind
         (compile-form
          `(let ((,primary-var ,form))
-            (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+            (setf (mem-ref ,(ct-mv-count-addr) :u64) 1)
             (let* ((,(car vars) ,primary-var)
                    ,@(mapcar (lambda (v) (list v nil)) (cdr vars)))
               ,@body))
@@ -20786,15 +20861,15 @@
     ;; first so a form that turns out to store nothing (an inlined primop
     ;; behind a call-shaped tail) reads back as a single value rather than
     ;; inheriting the previous producer's count.
-    (push (list primary-var `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+    (push (list primary-var `(progn (setf (mem-ref ,(ct-mv-count-addr) :u64) 1)
                                     ,form))
           bindings)
     ;; Then: read MV count
-    (push (list count-var `(mem-ref ,+mv-count-addr+ :u64)) bindings)
+    (push (list count-var `(mem-ref ,(ct-mv-count-addr) :u64)) bindings)
     ;; Remaining vars: read from MV storage if count > index, else nil
     (let ((idx 0))
       (dolist (var (cdr vars))
-        (let ((addr (+ +mv-values-addr+ (* idx 8))))
+        (let ((addr (+ (ct-mv-values-addr) (* idx 8))))
           (push (list var `(if (> ,count-var ,(1+ idx))
                                (mem-ref ,addr :u64)
                                nil))
@@ -21031,7 +21106,7 @@
 (defun %mv-clamp-leaf (form)
   (let ((g (%mvm-gensym "MVONE")))
     `(let ((,g ,form))
-       (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+       (setf (mem-ref ,(ct-mv-count-addr) :u64) 1)
        ,g)))
 
 (defun %mv-clamp-body (forms)
@@ -21055,7 +21130,7 @@
   ;; Not root-caused; this shape avoids it.)
   (cond
     ((atom form)
-     `(progn (setf (mem-ref ,+mv-count-addr+ :u64) 1) ,form))
+     `(progn (setf (mem-ref ,(ct-mv-count-addr) :u64) 1) ,form))
     ((not (symbolp (car form)))
      (if (tail-form-is-values-p (list form)) form (%mv-clamp-leaf form)))
     (t
@@ -21176,7 +21251,7 @@
       (return-from compile-multiple-value-list
         (compile-form
          `(let ((,pri1 ,form))
-            (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+            (setf (mem-ref ,(ct-mv-count-addr) :u64) 1)
             (cons ,pri1 nil))
          env dest))))
   (let ((pri (%mvm-gensym "MVPRI"))
@@ -21187,7 +21262,7 @@
     (compile-form
      `(progn
         ;; Reset count to 1 so single-valued expressions produce (list val).
-        (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+        (setf (mem-ref ,(ct-mv-count-addr) :u64) 1)
         ;; Evaluate form FIRST (it sets the MV count + secondary slots), capturing
         ;; the primary value before reading the count.  The list is ONE value:
         ;; the count is put back to 1 after it is built, or FORM's count
@@ -21195,7 +21270,7 @@
         ;; (%m (values 1 2 3)))) returned (1 2 3), 2, 3 (upstream
         ;; MULTIPLE-VALUE-LIST.9).
         (let ((,out (let ((,pri ,form))
-          (let ((,cnt (mem-ref ,+mv-count-addr+ :u64)))
+          (let ((,cnt (mem-ref ,(ct-mv-count-addr) :u64)))
             (if (zerop ,cnt)
                 nil
                 (if (= ,cnt 1)
@@ -21205,9 +21280,9 @@
                     (let ((,res nil) (,i (- ,cnt 2)))
                       (loop
                         (when (< ,i 0) (return (cons ,pri ,res)))
-                        (setq ,res (cons (mem-ref (+ ,+mv-values-addr+ (* ,i 8)) :u64) ,res))
+                        (setq ,res (cons (mem-ref (+ ,(ct-mv-values-addr) (* ,i 8)) :u64) ,res))
                         (setq ,i (- ,i 1))))))))))
-          (setf (mem-ref ,+mv-count-addr+ :u64) 1)
+          (setf (mem-ref ,(ct-mv-count-addr) :u64) 1)
           ,out))
      env dest)))
 
@@ -21255,11 +21330,11 @@
     ;; Save MV count and up to n-mv-slots extra values on the stack.
     ;; These are raw u64 (tagged CL objects), loaded without fixnum shift.
     (let ((mv-temp (alloc-temp-reg)))
-      (emit-li-addr mv-temp (conv-real +mv-count-addr+))
+      (emit-li-addr mv-temp (conv-real (ct-mv-count-addr)))
       (emit-ir :load mv-temp mv-temp (%mv-width))
       (emit-ir :push mv-temp)
       (dotimes (i n-mv-slots)
-        (emit-li-addr mv-temp (conv-real (+ +mv-values-addr+ (* i 8))))
+        (emit-li-addr mv-temp (conv-real (+ (ct-mv-values-addr) (* i 8))))
         (emit-ir :load mv-temp mv-temp (%mv-width))
         (emit-ir :push mv-temp))
       (free-temp-reg))
@@ -21284,11 +21359,11 @@
           (addr-temp (alloc-temp-reg)))
       (loop for i from (1- n-mv-slots) downto 0 do
         (emit-ir :pop mv-temp)
-        (emit-li-addr addr-temp (conv-real (+ +mv-values-addr+ (* i 8))))
+        (emit-li-addr addr-temp (conv-real (+ (ct-mv-values-addr) (* i 8))))
         (emit-ir :store addr-temp mv-temp (%mv-width)))
       ;; Restore MV count
       (emit-ir :pop mv-temp)
-      (emit-li-addr addr-temp (conv-real +mv-count-addr+))
+      (emit-li-addr addr-temp (conv-real (ct-mv-count-addr)))
       (emit-ir :store addr-temp mv-temp (%mv-width))
       (free-temp-reg)
       (free-temp-reg))
@@ -21464,7 +21539,7 @@
       (let ((check-reg (alloc-temp-reg))
             (cmp-reg   (alloc-temp-reg)))
         (emit-ir :obj-tag check-reg fn-call-reg)
-        (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+        (emit-ir :li cmp-reg (ash (ct-tag-object) +fixnum-shift+))
         (emit-ir :cmp check-reg cmp-reg)
         (emit-ir :bne after-sym-label)
         (emit-ir :obj-subtag check-reg fn-call-reg)
@@ -21501,7 +21576,7 @@
         ;; obj-tag check first — skips non-objects (fixnums, immediates, cons
         ;; cells) without dereferencing.
         (emit-ir :obj-tag check-reg fn-call-reg)
-        (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+        (emit-ir :li cmp-reg (ash (ct-tag-object) +fixnum-shift+))
         (emit-ir :cmp check-reg cmp-reg)
         (emit-ir :bne direct-call-label)
         ;; Object-tag confirmed — now check subtag.
@@ -21553,7 +21628,7 @@
               (fn-save   (alloc-temp-reg))
               (not-ic-label (make-compiler-label)))
           (emit-ir :obj-tag check-reg fn-call-reg)
-          (emit-ir :li cmp-reg (ash +tag-cons+ +fixnum-shift+))
+          (emit-ir :li cmp-reg (ash (ct-tag-cons) +fixnum-shift+))
           (emit-ir :cmp check-reg cmp-reg)
           (emit-ir :bne not-ic-label)
           ;; cons fn → save fn, shift V0..V_{nargs-1} → V1..V_{nargs},
@@ -21591,7 +21666,7 @@
               (cmp-reg   (alloc-temp-reg))
               (not-ic-label (make-compiler-label)))
           (emit-ir :obj-tag check-reg fn-call-reg)
-          (emit-ir :li cmp-reg (ash +tag-cons+ +fixnum-shift+))
+          (emit-ir :li cmp-reg (ash (ct-tag-cons) +fixnum-shift+))
           (emit-ir :cmp check-reg cmp-reg)
           (emit-ir :bne not-ic-label)
           (emit-ir :push +vreg-v3+)
@@ -21620,7 +21695,7 @@
               (fn-save   (alloc-temp-reg))
               (not-gf-label (make-compiler-label)))
           (emit-ir :obj-tag check-reg fn-call-reg)
-          (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+          (emit-ir :li cmp-reg (ash (ct-tag-object) +fixnum-shift+))
           (emit-ir :cmp check-reg cmp-reg)
           (emit-ir :bne not-gf-label)
           (emit-ir :obj-subtag check-reg fn-call-reg)
@@ -21649,7 +21724,7 @@
               (cmp-reg   (alloc-temp-reg))
               (not-gf-label (make-compiler-label)))
           (emit-ir :obj-tag check-reg fn-call-reg)
-          (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+          (emit-ir :li cmp-reg (ash (ct-tag-object) +fixnum-shift+))
           (emit-ir :cmp check-reg cmp-reg)
           (emit-ir :bne not-gf-label)
           (emit-ir :obj-subtag check-reg fn-call-reg)
@@ -21685,7 +21760,7 @@
               (cmp-reg   (alloc-temp-reg))
               (not-gf-label (make-compiler-label)))
           (emit-ir :obj-tag check-reg fn-call-reg)
-          (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+          (emit-ir :li cmp-reg (ash (ct-tag-object) +fixnum-shift+))
           (emit-ir :cmp check-reg cmp-reg)
           (emit-ir :bne not-gf-label)
           (emit-ir :obj-subtag check-reg fn-call-reg)
@@ -21813,7 +21888,7 @@
     (let ((check-reg (alloc-temp-reg))
           (cmp-reg   (alloc-temp-reg)))
       (emit-ir :obj-tag check-reg fn-reg)
-      (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+      (emit-ir :li cmp-reg (ash (ct-tag-object) +fixnum-shift+))
       (emit-ir :cmp check-reg cmp-reg)
       (emit-ir :bne after-sym-label)
       (emit-ir :obj-subtag check-reg fn-reg)
@@ -21837,7 +21912,7 @@
     (let ((check-reg (alloc-temp-reg))
           (cmp-reg   (alloc-temp-reg)))
       (emit-ir :obj-tag check-reg fn-reg)
-      (emit-ir :li cmp-reg (ash +tag-object+ +fixnum-shift+))
+      (emit-ir :li cmp-reg (ash (ct-tag-object) +fixnum-shift+))
       (emit-ir :cmp check-reg cmp-reg)
       (emit-ir :bne direct-call-label)
       (emit-ir :obj-subtag check-reg fn-reg)
@@ -21954,7 +22029,7 @@
     ;; |operand| < 2^14 keeps the product inside 2^28.  Conservative (some
     ;; safe pairs take the slow path), never wrong, and needs no overflow flag,
     ;; which RISC-V does not have.  64-bit images compile exactly as before.
-    (when (< +fixnum-bits+ 62)
+    (when (< (ct-fixnum-bits) 62)
       (flet ((in-range-or (x bits miss)
                ;; branch to MISS unless -2^BITS < x < 2^BITS (x a TAGGED word)
                (let ((tb (ash (ash 1 bits) +fixnum-shift+)))
@@ -21975,8 +22050,8 @@
                  (emit-ir :blt miss))))))
         (cond
           ((member fast-op '(:add :sub :add-checked :sub-checked))
-           (in-range-or src1 (- +fixnum-bits+ 2) slow-label)
-           (in-range-or temp (- +fixnum-bits+ 2) slow-label))
+           (in-range-or src1 (- (ct-fixnum-bits) 2) slow-label)
+           (in-range-or temp (- (ct-fixnum-bits) 2) slow-label))
           ((member fast-op '(:mul :mul-checked))
            ;; The product fits when the operands' bit lengths sum to at most
            ;; fixnum-bits - 2.  One fixed split (14+14) sent `(* n (fact n-1))'
@@ -21984,7 +22059,7 @@
            ;; tower to call, and a real image pays a call per multiply.  Three
            ;; shapes cover small*small, tiny*medium and medium*tiny inline;
            ;; only a genuinely large product takes the generic path.
-           (let* ((b (- +fixnum-bits+ 2))
+           (let* ((b (- (ct-fixnum-bits) 2))
                   (h (floor b 2))
                   (tiny (floor b 3))
                   (shapes (list (list h (- b h)) (list tiny (- b tiny))
@@ -22202,7 +22277,7 @@
    operand single-float (caller-checked)."
   ;; Unboxed tree (part 2b): the whole expression in FP registers, boxed
   ;; ONCE at the end instead of twice per pair.
-  (when (eql +target-soft-float+ 1)
+  (when (eql (ct-target-soft-float) 1)
     ;; no FPU: each pair through the soft-float op, then rounded to single
     (let ((fn (cond ((string= op-name "+") '%sf-add) ((string= op-name "-") '%sf-sub)
                     ((string= op-name "*") '%sf-mul) (t '%sf-div)))
@@ -22468,7 +22543,7 @@
    each result a boxed double.  Every operand double-float (caller-checked).
    A whole call-free tree goes through the FP pool unboxed instead."
   (let ((tree (cons (%float-op-symbol op-name) args)))
-    (when (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+    (when (or *mvm-eval-runtime-p* (ct-has-fpd-p))
       ;; Conversion operands are calls, and FP registers are caller-clobbered:
       ;; evaluate them first, left to right, into boxed temps (the tree's
       ;; other leaves are variables and literals, so the order is unchanged).
@@ -22500,7 +22575,7 @@
           (dolist (h *fpd-hoisted*) (declare (ignore h)) (free-temp-reg))
           (return-from %compile-double-float-arith nil)))
         (setq *fpd-hoisted* saved)))))
-  (when (eql +target-soft-float+ 1)
+  (when (eql (ct-target-soft-float) 1)
     ;; no FPU: each pair through the soft-float op
     (let ((fn (cond ((string= op-name "+") '%sf-add) ((string= op-name "-") '%sf-sub)
                     ((string= op-name "*") '%sf-mul) (t '%sf-div)))
@@ -22599,7 +22674,7 @@
    (KIND :SINGLE) or double (:DOUBLE) tree that fits; SUB 0..3 in that order.
    The declared width is the promise that makes the conversion's 64-bit
    result a fixnum, with no bignum path."
-  (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+  (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
        (consp form) (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
        (let ((w (ignore-errors (%decl-int-width (%resolve-declared-type (cadr form)))))
              (v (caddr form)))
@@ -22680,7 +22755,7 @@
             (or (%fp-tree-need x env) (%fpd-pure-need x env)
                 (%fp-itof-need x env))))
          ((%fp-exp-arg form)
-          (let ((n (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+          (let ((n (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
                         (%fp-tree-need (%fp-exp-arg form) env))))
             ;; 7: what %COMPILE-EXP-SINGLE holds at its peak, result included
             (and n (max n 7))))
@@ -22816,7 +22891,7 @@
    (THE <int> (ROUND tree)), which converts in register itself
    (%FP-TOI-PLAN).  One register for the result, plus what
    the rounding's own tree holds while it runs."
-  (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+  (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
        (cond ((integerp x) (and (< (integer-length x) 53) 1))
              ((symbolp x) (let ((w (and x (%expr-width x env)))) (and w (<= w 53) 1)))
              ;; call-free integer arithmetic of width-typed operands (the
@@ -22907,7 +22982,7 @@
   "True when FORM is an unboxable tree that fits the FP pool from the
    current allocation point."
   ;; no FPU: there are no FP registers to evaluate a tree in
-  (unless (eql +target-soft-float+ 1)
+  (unless (eql (ct-target-soft-float) 1)
     (let ((need (%fp-tree-need form env)))
       (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+)))))
 
@@ -23549,7 +23624,7 @@
       ;; Closure object (tag object, subtag closure): env via set-cenv, fn = slot 0.
       (let ((direct (make-compiler-label)))
         (emit-ir :obj-tag c-reg f-reg)
-        (emit-ir :li t-reg (ash +tag-object+ +fixnum-shift+))
+        (emit-ir :li t-reg (ash (ct-tag-object) +fixnum-shift+))
         (emit-ir :cmp c-reg t-reg)
         (emit-ir :bne direct)
         (emit-ir :obj-subtag c-reg f-reg)
@@ -23631,7 +23706,7 @@
    compiles the portable definition above, which is exact for every integer."
   (let ((k (and (consp (cdr args)) (consp (cddr args)) (null (cdddr args))
                 (%const-int-value (caddr args)))))
-    (if (and (integerp k) (<= 1 k 62) (= +fixnum-bits+ 62))
+    (if (and (integerp k) (<= 1 k 62) (= (ct-fixnum-bits) 62))
         (progn
           (compile-form (car args) env dest)
           (let ((temp (alloc-temp-reg)))
@@ -23962,9 +24037,9 @@
             (emit-ir :mod r-temp n-temp dest)
             (emit-ir :pop q-temp)
             ;; MV[0] = remainder, MV-COUNT = 2 (n-temp reused as addr)
-            (emit-li-addr n-temp (conv-real +mv-values-addr+))
+            (emit-li-addr n-temp (conv-real (ct-mv-values-addr)))
             (emit-ir :store n-temp r-temp (%mv-width))
-            (emit-li-addr n-temp (conv-real +mv-count-addr+))
+            (emit-li-addr n-temp (conv-real (ct-mv-count-addr)))
             (emit-ir :li r-temp (ash 2 +fixnum-shift+))
             (emit-ir :store n-temp r-temp (%mv-width))
             (emit-ir :mov dest q-temp)
@@ -24018,9 +24093,9 @@
           (emit-ir :mod r-temp n-temp d-temp)
           (emit-ir :pop q-temp)
           ;; MV[0] = remainder, MV-COUNT = 2
-          (emit-li-addr addr-temp (conv-real +mv-values-addr+))
+          (emit-li-addr addr-temp (conv-real (ct-mv-values-addr)))
           (emit-ir :store addr-temp r-temp (%mv-width))
-          (emit-li-addr addr-temp (conv-real +mv-count-addr+))
+          (emit-li-addr addr-temp (conv-real (ct-mv-count-addr)))
           (emit-ir :li r-temp (ash 2 +fixnum-shift+))
           (emit-ir :store addr-temp r-temp (%mv-width))
           (emit-ir :mov dest q-temp)
@@ -24152,7 +24227,7 @@
   ;; TWO FLOAT TREES: compare in FP registers straight from the trees -- no
   ;; box for an FP-resident local, no unbox (fp-cmp for singles, fpd-lt/-le
   ;; for doubles).
-  (when (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+  (when (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
              (member branch-op '(:blt :bgt :ble :bge)))
     (let ((kind (cond ((and (%fp-tree-need a env) (%fp-tree-need b env)) :single)
                       ((and (%fpd-pure-need a env) (%fpd-pure-need b env)) :double))))
@@ -24161,7 +24236,7 @@
                        (nb (if (eq kind :single) (%fp-tree-need b env) (%fpd-pure-need b env))))
                    (<= (+ *fp-reg-counter* (max na (1+ nb))) +fp-reg-max+)))
         (return-from compile-compare-2 (%compile-fp-tree-compare kind branch-op a b env dest)))))
-  (when (and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+  (when (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
              (member branch-op '(:blt :bgt :ble :bge))
              (or (%expr-double-float-p a env) (%expr-single-float-p a env))
              (or (%expr-double-float-p b env) (%expr-single-float-p b env))
@@ -24346,7 +24421,7 @@
            (or (and (integerp v)
                     ;; In FIXNUM range for THIS target — outside it the
                     ;; literal is a boxed bignum and EQ is not enough.
-                    (<= (- (+ +fixnum-max+ 1)) v +fixnum-max+))
+                    (<= (- (+ (ct-fixnum-max) 1)) v (ct-fixnum-max)))
                (characterp v)
                (null v)
                (eq v t))))
@@ -24409,7 +24484,7 @@
             (dolist (r (list dest temp))
               (let ((not-num (make-compiler-label)))
                 (emit-ir :obj-tag tg r)
-                (emit-ir :cmp-imm tg (ash +tag-object+ +fixnum-shift+))
+                (emit-ir :cmp-imm tg (ash (ct-tag-object) +fixnum-shift+))
                 (emit-ir :bne not-num)
                 (emit-ir :obj-subtag tg r)
                 (emit-ir :cmp-imm tg (ash +subtag-float+ +fixnum-shift+))
@@ -24486,7 +24561,7 @@
     ;; Not NIL, so a cons tag means a cons: test the tag in place rather than
     ;; materialize CONSP's T/NIL (which re-tests NIL) and branch on that.
     (emit-ir :obj-tag tag-reg dest)
-    (emit-ir :cmp-imm tag-reg (ash +tag-cons+ +fixnum-shift+))
+    (emit-ir :cmp-imm tag-reg (ash (ct-tag-cons) +fixnum-shift+))
     (emit-ir :bne error-label)
     ;; Cons path: inline :car / :cdr.
     (emit-ir-label cons-label)
@@ -25075,7 +25150,7 @@
     ;; BOTH CONSTANT, result a fixnum with room to spare: the literal.
     ((let ((v (and count (%const-int-value value-form))))
        (and v (<= (abs count) 64)
-            (< (abs (ash v count)) (ash 1 (- +fixnum-bits+ 2)))))
+            (< (abs (ash v count)) (ash 1 (- (ct-fixnum-bits) 2)))))
      (compile-form (ash (%const-int-value value-form) count) env dest))
     ;; VARIABLE COUNT WITH A PROVEN RANGE (2026-09-18, aarch64 runtime): a count
     ;; declared (unsigned-byte n), n <= 6, on a value of proven width W with
@@ -25112,7 +25187,7 @@
             ;; +fixnum-bits+, not a literal 62: at 30 bits the literal
             ;; trusted `(ash 16388 16)' (16 + 16 <= 62), emitted a bare SHL,
             ;; and the product wrapped to -1073479680 in eval'd code.
-            (and w (or (< count 0) (<= (+ w count) +fixnum-bits+)))))
+            (and w (or (< count 0) (<= (+ w count) (ct-fixnum-bits))))))
      (compile-form value-form env dest)
      (if (>= count 0)
          (when (> count 0) (emit-ir :shl dest dest count))
@@ -25147,7 +25222,7 @@
     ;; past it a constant shift was a call to BIGNUM-ASH, whose fixnum arms
     ;; loop -- every (ash low-bits 31) of a 32-bit-half rotate.
     ((and count (or (<= count 30)
-                    (and *mvm-eval-runtime-p* (= +fixnum-bits+ 62) (<= count 61)
+                    (and *mvm-eval-runtime-p* (= (ct-fixnum-bits) 62) (<= count 61)
                          (%cg-on-p (quote *cg-ash-wide-const*)))))
      (compile-form value-form env dest)
      (let ((fix-label (make-compiler-label))
@@ -25392,7 +25467,7 @@
     ;; OBJ-TAG/OBJ-SUBTAG return tagged fixnums (value << fixnum-shift),
     ;; so comparison values must also be tagged.
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :li temp2 (ash (ct-tag-object) +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     ;; Check subtag
@@ -25438,12 +25513,12 @@
     ;; T immediate (+t-value+ #xDEAD1009 — low nibble #x9 collides with
     ;; +tag-object+, so the obj-tag check below would WRONGLY pass it through
     ;; to obj-subtag, reading garbage from a non-pointer).  Compare directly.
-    (emit-ir :li temp2 +t-value+)
+    (emit-ir :li temp2 (ct-t-value))
     (emit-ir :cmp dest temp2)
     (emit-ir :beq true-label)
     ;; Tag check: obj?
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :li temp2 (ash (ct-tag-object) +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     ;; Subtag check: symbol OR keyword.
@@ -25485,7 +25560,7 @@
     (compile-form arg env dest)
     ;; Check object tag
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :li temp2 (ash (ct-tag-object) +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     ;; Check subtag == #x31 (string)
@@ -25511,7 +25586,7 @@
     (emit-ir-label mda-label)
     (emit-ir :obj-ref dest dest 6)
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :li temp2 (ash (ct-tag-object) +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     (emit-ir :obj-subtag temp dest)
@@ -25596,7 +25671,7 @@
         (temp2 (alloc-temp-reg)))
     (compile-form arg env dest)
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :li temp2 (ash (ct-tag-object) +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     (emit-ir :obj-subtag temp dest)
@@ -25674,7 +25749,7 @@
     ;; Check bignum
     (emit-ir-label check-bignum-label)
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
+    (emit-ir :li temp2 (ash (ct-tag-object) +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     ;; Check subtag
@@ -25788,7 +25863,7 @@
    images stay per-function-identical by ARITHMETIC rather than by exemption.
    The same expression is 32 >= 30 on a 32-bit target, where a u32 genuinely
    cannot be a fixnum and must promote to a bignum."
-  (and needs-tag (>= (%mem-width-bits width-code) +fixnum-bits+)))
+  (and needs-tag (>= (%mem-width-bits width-code) (ct-fixnum-bits))))
 
 (defun memory-width-code (type-form)
   "Convert a type keyword to an MVM memory width code.
@@ -25845,7 +25920,7 @@
       ;; semispace during boot.  Values that really are >= 2^29 still promote.
       (let* ((asym (%mvm-gensym "MRA"))
              (hsym (%mvm-gensym "MRH"))
-             (be (eql +target-big-endian+ 1))
+             (be (eql (ct-target-big-endian) 1))
              (hi-off (if be 0 2))
              (lo-off (if be 2 0)))
         (return-from compile-mem-ref
@@ -25856,7 +25931,7 @@
             ;; faulted on #x10000DB8 in %GV-SET-C).
             (list 'let (list (list asym (%conv-addr-form addr-form)))
                   (list 'let (list (list hsym (list 'mem-ref (if (zerop hi-off) asym (list '+ asym hi-off)) :u16)))
-                        (list 'if (list '< hsym (ash 1 (- +fixnum-bits+ 17)))
+                        (list 'if (list '< hsym (ash 1 (- (ct-fixnum-bits) 17)))
                               (list '+ (list 'ash hsym 16)
                                        (list 'mem-ref (if (zerop lo-off) asym (list '+ asym lo-off)) :u16))
                               (list '+ (list 'bignum-ash hsym 16)
@@ -25901,7 +25976,7 @@
          ;; +0 little-endian, at +2 big-endian (68k, PowerPC).
          (when (%mem-width-promotes-p width needs-untag)
            (let* ((asym (%mvm-gensym "MEMA")) (vsym (%mvm-gensym "MEMV"))
-                  (be (eql +target-big-endian+ 1))
+                  (be (eql (ct-target-big-endian) 1))
                   (hi-off (if be 0 2))
                   (lo-off (if be 2 0)))
              (return-from compile-setf
@@ -26228,7 +26303,7 @@
       (free-temp-reg))
     (emit-ir :beq nil-label)
     ;; Non-zero: handler active → return T
-    (emit-ir :li dest +t-value+)
+    (emit-ir :li dest (ct-t-value))
     (emit-ir :br end-label)
     ;; Zero: no handler → return NIL
     (emit-ir-label nil-label)
@@ -27293,15 +27368,15 @@
   (cond ((null ty) nil)
         ((symbolp ty)
          (let ((n (symbol-name ty)))
-           (cond ((string= n "FIXNUM") +fixnum-signed-bits+)   ; magnitude bits + sign
+           (cond ((string= n "FIXNUM") (ct-fixnum-signed-bits))   ; magnitude bits + sign
                  ((string= n "BIT") 1)
                  (t nil))))
         ((and (consp ty) (symbolp (car ty)) (consp (cdr ty)) (integerp (cadr ty)))
          (let ((n (symbol-name (car ty))) (w (cadr ty)))
            ;; Bounds are the TARGET's fixnum (62/61 on the 62-bit tower,
            ;; 30/29 on the 30-bit one), like %expr-width's cap.
-           (cond ((string= n "SIGNED-BYTE")   (and (<= w +fixnum-bits+) w))
-                 ((string= n "UNSIGNED-BYTE") (and (<= w +fixnum-bits-1+) (+ w 1)))
+           (cond ((string= n "SIGNED-BYTE")   (and (<= w (ct-fixnum-bits)) w))
+                 ((string= n "UNSIGNED-BYTE") (and (<= w (ct-fixnum-bits-1)) (+ w 1)))
                  ;; (integer LO HI) with both bounds literal (the dotimes
                  ;; counter declaration): width covers the larger magnitude.
                  ((and (string= n "INTEGER") (consp (cddr ty)) (integerp (caddr ty)))
@@ -27339,13 +27414,13 @@
     ;; RV32 and every float compare and print went wrong.  i386 dodged it only
     ;; because its heap (#x30000000) lies above emit-arith-pair's 30-bit
     ;; operand-range guard, which sent the pointers to the slow path by luck.
-    (and w (<= w +fixnum-signed-bits+) w)))
+    (and w (<= w (ct-fixnum-signed-bits)) w)))
 
 (defun %expr-width-1 (form env)
   "The uncapped estimate behind %expr-width."
   (cond
     ((integerp form)
-     (let ((w (+ 1 (integer-length (abs form))))) (and (<= w +fixnum-bits+) w)))
+     (let ((w (+ 1 (integer-length (abs form))))) (and (<= w (ct-fixnum-bits)) w)))
     ((symbolp form)
      (and form (%decl-int-width (%var-dtype form env))))
     ((not (consp form)) nil)
@@ -27411,12 +27486,12 @@
          ;; (dotimes (i (length v))) count needs for an untagged compare
          ((and (or (string= op "LENGTH") (string= op "ARRAY-LENGTH"))
                (consp args) (null (cdr args)))
-          +fixnum-signed-bits+)
+          (ct-fixnum-signed-bits))
          ;; The raw fixnum ops: a tagged-word add/sub/mul of fixnums yields a
          ;; tagged word -- a fixnum, whatever it wrapped to.  Tag-safe, at
          ;; the full width (so never trusted not to overflow further).
          ((or (string= op "%FIXNUM-+") (string= op "%FIXNUM--") (string= op "%FIXNUM-*"))
-          +fixnum-signed-bits+)
+          (ct-fixnum-signed-bits))
          (t (%inline-call-mask-width form)))))))
 
 (defun %inline-call-mask-width (form)
@@ -27455,7 +27530,7 @@
          ;; The result must fit THIS TARGET's fixnum: 61 bits of magnitude on
          ;; the 62-bit tower (exactly the old constant), 29 on the 30-bit one.
          ;; A hard 61 made a 30-bit build trust products that overflow.
-         (list t (<= rw (- +fixnum-bits+ 1)) rw))))
+         (list t (<= rw (- (ct-fixnum-bits) 1)) rw))))
 
 (defun %leaf-operand-p (form env)
   "True when compiling FORM into a fresh temp register is a pure load that
@@ -28104,7 +28179,7 @@
    fixnum -- every negative single is >= 2^31 -- so the :F32-REF opcode, which
    tags them in a register, cannot be right there; it is a call to
    %F32-BITS-REF-NARROW instead (byte reads + generic arithmetic)."
-  (when (< +fixnum-bits+ 32)
+  (when (< (ct-fixnum-bits) 32)
     (return-from compile-f32-ref
       (compile-form `(%f32-bits-ref-narrow ,arr-form ,idx-form) env dest)))
   (let ((arr-reg (alloc-temp-reg))
@@ -28122,7 +28197,7 @@
   "Compile (%f32-bits-set arr idx bits) — store the low 32 bits of BITS into
    the lane.  Returns BITS.  Narrow towers: %F32-BITS-SET-NARROW, see
    COMPILE-F32-REF (BITS may be a bignum there)."
-  (when (< +fixnum-bits+ 32)
+  (when (< (ct-fixnum-bits) 32)
     (return-from compile-f32-set
       (compile-form `(%f32-bits-set-narrow ,arr-form ,idx-form ,val-form) env dest)))
   (let ((val-reg (alloc-temp-reg)))
@@ -28143,7 +28218,7 @@
 (defun compile-f32-load (arr-form idx-form env dest)
   "Compile (%f32-load arr idx) — the lane as a fresh boxed single-float
    (native fcvt; allocates the 4-slot box)."
-  (when (eql +target-soft-float+ 1)
+  (when (eql (ct-target-soft-float) 1)
     (return-from compile-f32-load
       (compile-form (list '%sf-f32-load arr-form idx-form) env dest)))
   (let ((arr-reg (alloc-temp-reg))
@@ -28161,7 +28236,7 @@
 (defun compile-f32-store (arr-form idx-form val-form env dest)
   "Compile (%f32-store arr idx float) — narrow the boxed float's payload to
    single precision and store the lane.  Returns FLOAT."
-  (when (eql +target-soft-float+ 1)
+  (when (eql (ct-target-soft-float) 1)
     (return-from compile-f32-store
       (compile-form (list '%sf-f32-store arr-form idx-form val-form) env dest)))
   (let ((val-reg (alloc-temp-reg)))
@@ -28183,7 +28258,7 @@
   "Compile (%fsqrt float) -- a fresh DOUBLE-float box holding the correctly
    rounded square root of the payload (sqrtsd / fsqrt / fsqrt.d / vsqrt).
    The software Newton in %SQRT-F was ~1.1 us a call."
-  (when (eql +target-soft-float+ 1)
+  (when (eql (ct-target-soft-float) 1)
     (return-from compile-fsqrt (compile-form (list '%sf-sqrt val-form) env dest)))
   (compile-form val-form env dest)
   (emit-ir :gc-check)
@@ -28193,7 +28268,7 @@
   "Compile (%fround32 float) — a fresh single-float box holding the payload
    rounded to single precision (cvtsd2ss / fcvt), replacing the Lisp-side
    %round-to-single that every float result went through."
-  (when (eql +target-soft-float+ 1)
+  (when (eql (ct-target-soft-float) 1)
     (return-from compile-fround32 (compile-form (list '%sf-round32 val-form) env dest)))
   (compile-form val-form env dest)
   (emit-ir :gc-check)
@@ -28483,7 +28558,7 @@
              ;; instructions an arm on aarch64, four arms before the out-of-line call.
              ;; :OBJ-SUBTAG is tag-safe on x64/aarch64/i386/arm32/riscv but not on 68k or
              ;; PowerPC, hence the guard: T is the one immediate with the object tag.
-             (,g-st (if (and (eql (%lowtag ,g-arr) ,+tag-object+) (not (eq ,g-arr t)))
+             (,g-st (if (and (eql (%lowtag ,g-arr) ,(ct-tag-object)) (not (eq ,g-arr t)))
                         (obj-subtag ,g-arr)
                         0)))
         (cond

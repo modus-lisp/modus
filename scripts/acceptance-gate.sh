@@ -14,14 +14,16 @@
 #    time is reported as a flake; one that passes on BASE and fails on FIX
 #    again fails the gate.  A shard that does not finish at FIX but did at
 #    BASE fails it too.
-# 4. DDC, one x64 and one AArch64, at both refs, in the background from the
+# 4. DDC -- x64, AArch64 and RV32 -- at both refs, in the background from the
 #    start (about 14 minutes, so it overlaps 1-3): the self-hosted compiler
 #    must rebuild the UEFI x64 image byte-for-byte as SBCL built it
 #    (test/run-uefi-ddc.sh), and emit the same Linux/AArch64 image as SBCL
-#    from that source (test/run-aarch64-ddc.sh, reusing its modus-sh).
-#    Either failing at FIX fails the gate unless it also fails at BASE
+#    from that source (test/run-aarch64-ddc.sh, reusing its modus-sh), and
+#    the same Linux/RISC-V 32 image (test/run-riscv32-ddc.sh: a 30-bit target,
+#    so a compiler decision taken from the self-hosted compiler's OWN width is
+#    visible).  Any failing at FIX fails the gate unless it also fails at BASE
 #    (reported, as a build that fails at both refs is).  MODUS_GATE_NO_DDC=1
-#    skips both.
+#    skips all three.
 #
 # Worktrees, images and transcripts go in WORKDIR (default /var/tmp/modus-gate),
 # which is left in place for inspection.  Exit 0 = PASS.
@@ -69,19 +71,28 @@ FAIL=0
 # ---- 4. DDC, started first: it needs only the two trees --------------------
 ddc_start() { # side worktree
   if [ -n "${MODUS_GATE_NO_DDC:-}" ] || [ ! -x "$2/test/run-uefi-ddc.sh" ]; then
-    echo "skipped" > "$WORKDIR/ddc-$1.verdict"; echo "skipped" > "$WORKDIR/aa64-$1.verdict"; return
+    for k in ddc aa64 rv32; do echo "skipped" > "$WORKDIR/$k-$1.verdict"; done; return
   fi
   ( MODUS_DDC_WORK=$WORKDIR/ddc-$1 "$2/test/run-uefi-ddc.sh" > "$WORKDIR/ddc-$1.log" 2>&1
     echo $? > "$WORKDIR/ddc-$1.verdict"
-    if [ -x "$2/test/run-aarch64-ddc.sh" ]; then
-      "$2/test/run-aarch64-ddc.sh" "$WORKDIR/ddc-$1" > "$WORKDIR/aa64-$1.log" 2>&1
-      echo $? > "$WORKDIR/aa64-$1.verdict"
-    else
-      echo "skipped" > "$WORKDIR/aa64-$1.verdict"
-    fi ) &
+    # The AArch64 and RV32 DDCs reuse that run's modus-sh and dump, and write
+    # different files, so they run side by side.
+    ( if [ -x "$2/test/run-aarch64-ddc.sh" ]; then
+        "$2/test/run-aarch64-ddc.sh" "$WORKDIR/ddc-$1" > "$WORKDIR/aa64-$1.log" 2>&1
+        echo $? > "$WORKDIR/aa64-$1.verdict"
+      else
+        echo "skipped" > "$WORKDIR/aa64-$1.verdict"
+      fi ) &
+    ( if [ -x "$2/test/run-riscv32-ddc.sh" ]; then
+        "$2/test/run-riscv32-ddc.sh" "$WORKDIR/ddc-$1" > "$WORKDIR/rv32-$1.log" 2>&1
+        echo $? > "$WORKDIR/rv32-$1.verdict"
+      else
+        echo "skipped" > "$WORKDIR/rv32-$1.verdict"
+      fi ) &
+    wait ) &
   echo $! > "$WORKDIR/ddc-$1.pid"
 }
-rm -f "$WORKDIR"/ddc-*.verdict "$WORKDIR"/aa64-*.verdict
+rm -f "$WORKDIR"/ddc-*.verdict "$WORKDIR"/aa64-*.verdict "$WORKDIR"/rv32-*.verdict
 ddc_start base "$BASE_WT"
 ddc_start fix "$FIX_WT"
 
@@ -200,5 +211,6 @@ ddc_verdict() { # kind label
 }
 ddc_verdict ddc "ddc x64 (UEFI image)"
 ddc_verdict aa64 "ddc aarch64 (Linux image)"
+ddc_verdict rv32 "ddc riscv32 (Linux image, 30-bit target)"
 
 if [ $FAIL -eq 0 ]; then echo "VERDICT: PASS"; exit 0; else echo "VERDICT: FAIL"; exit 1; fi

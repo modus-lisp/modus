@@ -4510,7 +4510,12 @@
         ;; thunks the host never compiles).
         (s-mt *macro-table*) (s-mnt *macro-name-table*) (s-bmt *bootstrap-macro-template*)
         (s-hdt *hash-dispatch-table*) (s-clhs *clhs-standard-specials-hashes*)
-        (s-memo *mexp-memo*) (s-memogc *mexp-memo-gc*))
+        (s-memo *mexp-memo*) (s-memogc *mexp-memo-gc*)
+        ;; W32 M1: the static build's COMPILE-TARGET is the CHILD's (modus-sh
+        ;; --compile-riscv32 has a 30-bit one bound), but what EVAL compiles
+        ;; here RUNS here, so it must be compiled for this machine: NIL.
+        (s-ct *compile-target*))
+    (setq *compile-target* nil)
     (setq *macro-table* (make-hash-table :test 'eql))
     (setq *macro-name-table* nil) (setq *bootstrap-macro-template* nil)
     (setq *hash-dispatch-table* nil) (setq *clhs-standard-specials-hashes* nil)
@@ -4535,7 +4540,8 @@
       (setq *temp-reg-counter* s-temps) (setq *fp-reg-counter* s-fps)
       (setq *macro-table* s-mt) (setq *macro-name-table* s-mnt) (setq *bootstrap-macro-template* s-bmt)
       (setq *hash-dispatch-table* s-hdt) (setq *clhs-standard-specials-hashes* s-clhs)
-      (setq *mexp-memo* s-memo) (setq *mexp-memo-gc* s-memogc))))
+      (setq *mexp-memo* s-memo) (setq *mexp-memo-gc* s-memogc)
+      (setq *compile-target* s-ct))))
 
 (defun mvm-eval-forms (forms)
   (if *static-build-p*

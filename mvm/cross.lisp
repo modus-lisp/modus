@@ -497,8 +497,8 @@
                   (dotimes (i pad-words)
                     (emit-word 0))
                   (emit-word (ash (normalize-name constant) 1))
-                  (emit-word +nil-value+)
-                  (emit-word +nil-value+)
+                  (emit-word (ct-nil-value))
+                  (emit-word (ct-nil-value))
                   (loop while (/= 0 (mod (mvm-buffer-position buf) *pool-align*))
                         do (mvm-emit-byte buf 0))
                   (setf (aref addr-table idx) (logior obj-offset tag))))
@@ -2040,7 +2040,16 @@
     ;; 62-bit fixnums on a 64-bit target, 30-bit on a 32-bit one.  i386 gets
     ;; a coherent 30-bit tower automatically from (target-word-size ...) = 4;
     ;; no per-target special-casing anywhere.
-    (set-target-fixnum-bits-for target-desc)
+    ;; W32 M1: the descriptor of THIS compilation, in force for all of it --
+    ;; compile, assemble, translate.  Compiler-side code reads it through the
+    ;; CT- functions (compiler.lisp), so an image building for another target
+    ;; decides by that target, not by its own folded widths.  Lexical save +
+    ;; SETQ + UNWIND-PROTECT, not a special LET: that is unreliable in-image
+    ;; (*MVM-EMIT-HALVES*), and this runs in modus-sh.
+    (let ((saved-ct *compile-target*))
+     (unwind-protect
+      (progn
+       (setq *compile-target* (set-target-fixnum-bits-for target-desc))
     ;; Get source
     (let ((src-text (or source-text
                        (when source
@@ -2067,7 +2076,8 @@
               (setf (kernel-image-metadata %img)
                     (list* :fn-table (mvm-module-function-table module)
                            (kernel-image-metadata %img)))
-              %img)))))))
+              %img))))))
+      (setq *compile-target* saved-ct)))))
 
 (defun get-boot-descriptor (target-name)
   "Get the boot descriptor for the given target architecture.

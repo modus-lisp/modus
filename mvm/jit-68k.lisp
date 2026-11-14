@@ -220,6 +220,13 @@
     (unless *t68-table* (error "jit-68k: no shape table in the image (built without MODUS_68K_JIT=1?)"))
     *t68-table*))
 
+(defun %t68-flush-code ()
+  "Code was just written as data: make it what the CPU will fetch.  Hosted
+   Linux needs nothing here.  The Mac build replaces this body
+   (build-cl-repl-common.lisp) with SYSCALL3 service 3, the instruction-cache
+   flush of a 68020 or later (translate-68k)."
+  nil)
+
 (defun %t68-fixed-area ()
   "(LO . HI) of a code area the map reserves, or NIL to map one (hosted
    Linux).  The Mac build replaces this body in the text with its layout's
@@ -539,6 +546,7 @@
                          (setq a (+ a 4)))
                   (:cell (%t68-put a 4 (third p)) (setq a (+ a 4)))))))))
       (setq *t68-ptr* addr)
+      (%t68-flush-code)
       (mapcar (lambda (e) (cons (first (first e))
                                 (%t68-object (+ (gethash (second (first e)) stubs) 3))))
               plan))))

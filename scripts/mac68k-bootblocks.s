@@ -57,6 +57,13 @@ start:  move.l  0x108, %d0              | MemTop
         move.l  %d0, %a7                | the stack, under the copy
         move.l  %d0, %a0
         add.l   #(moved - bbbase), %a0
+        cmpi.b  #2, 0x12F.w             | CPUFlag: a 68020 or later has caches,
+        bcs.s   9f                      |   and code was just written as data:
+        move.l  %a0, -(%sp)             |   _HWPriv 1, FlushInstructionCache
+        moveq   #1, %d0                 |   (on a 68040 it pushes the data cache
+        .word   0xA198                  |   too).  A 68000 ROM has no _HWPriv.
+        move.l  (%sp)+, %a0
+9:
         jmp     (%a0)
 moved:  move.w  0x210, %d1              | BootDrive: the drive number
         move.l  0x30A, %a1              | DrvQHdr.qHead
@@ -150,6 +157,13 @@ found:  lea     pb(%pc), %a0
         tst.w   %d0
         bne     fail
         move.l  entry(%pc), %a0         | the image, or a two-disk boot's stage 2
+        cmpi.b  #2, 0x12F.w             | CPUFlag: a 68020 or later has caches,
+        bcs.s   9f                      |   and code was just written as data:
+        move.l  %a0, -(%sp)             |   _HWPriv 1, FlushInstructionCache
+        moveq   #1, %d0                 |   (on a 68040 it pushes the data cache
+        .word   0xA198                  |   too).  A 68000 ROM has no _HWPriv.
+        move.l  (%sp)+, %a0
+9:
         jmp     (%a0)
 fail:   move.l  0x824, %a0              | ScrnBase: paint 32 rows black
         move.w  0x106, %d1

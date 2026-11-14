@@ -141,6 +141,13 @@ start:  link    %a6, #-1168
         move.l  0x2A6, 0x118            | TheZone = SysZone
         .word   0xA852                  | _HideCursor (again is harmless)
         move.l  4(%a2), %a0
+        cmpi.b  #2, 0x12F.w             | CPUFlag: a 68020 or later has caches,
+        bcs.s   9f                      |   and code was just written as data:
+        move.l  %a0, -(%sp)             |   _HWPriv 1, FlushInstructionCache
+        moveq   #1, %d0                 |   (on a 68040 it pushes the data cache
+        .word   0xA198                  |   too).  A 68000 ROM has no _HWPriv.
+        move.l  (%sp)+, %a0
+9:
         jmp     (%a0)                   | ENTRY
 
 | the splash at DEST (scripts/mac68k-disk.py SPLASH, mac68k-bootblocks.s): the

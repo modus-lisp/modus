@@ -402,7 +402,16 @@
     ;; GetOSEvent (the console's keyboard) faults without it -- measured
     (m68k-emit-moveq buf +68k-d0+ 20)
     (m68k-emit-word buf #xA06D)                          ; _InitEvents
-    ;; the console: .AIn, then .AOut
+    ;; no arrow cursor over a text console: the ROM drew one at boot, and on a
+    ;; Quadra its cursor machinery (DAFB's cursor-scanline interrupt) and our
+    ;; console's writes to the screen together ended in an unclaimed slot
+    ;; interrupt -- _SysError with no System, recursing until the stack was
+    ;; gone (MAME's Quadra 950).  The Mac OS launcher hides it too.
+    (m68k-emit-word buf #xA852)                          ; _HideCursor
+    ;; the console: .AIn, then .AOut -- and the port is not given up yet
+    ;; (translate-68k +68K-MAC-CONSOLE-CODE+; a saved core may carry it set)
+    (m68k-emit-move-imm-an buf (conv-real #x1000910C) +68k-a0+)
+    (m68k-emit-word buf #x4210)                          ; CLR.B (A0)
     (emit-mac68k-open buf (mac68k-ser-in-pb) ain)
     (emit-mac68k-open buf (mac68k-ser-out-pb) aout)
     ;; VN = NIL; A5 the globals base when it is one

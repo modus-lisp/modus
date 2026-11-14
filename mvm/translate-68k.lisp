@@ -1836,12 +1836,42 @@
             ;; SYSCALL3 on a bare Mac is a Mac SERVICE: V0 the service, V1..V3
             ;; its arguments, all TAGGED; the result TAGGED in V0.  Service 1:
             ;; read V3 bytes from disk byte V1 of the boot drive to address V2
-            ;; (M68K-EMIT-MAC-SERVICE).  Service 2: _BlockMove.  Any other: -1.
+            ;; (M68K-EMIT-MAC-SERVICE).  Service 2: _BlockMove.  Service 3: flush
+            ;; the instruction cache.  Service 4: a plain copy.  Any other: -1.
             (let ((other (mvm-make-label)) (out (mvm-make-label)) (svc1 (mvm-make-label)))
               (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
               (m68k-emit-asr-imm buf +68k-d0+ 1)
               (m68k-emit-cmpi buf +68k-d0+ 1)
               (m68k-emit-beq buf svc1)
+              ;; Service 3: code was written as data (the threaded JIT): flush the
+              ;; instruction cache on a 68020 or later (the paged loader's
+              ;; sequence; a no-op on a 68000).  Result 0.
+              (let ((not3 (mvm-make-label)))
+                (m68k-emit-cmpi buf +68k-d0+ 3)
+                (m68k-emit-bne buf not3)
+                (dolist (w '(#x0C38 #x0002 #x012F #x650C #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307))
+                  (m68k-emit-word buf w))
+                (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+                (m68k-emit-bra buf out)
+                (m68k-emit-label buf not3))
+              ;; Service 4: copy V3 bytes from address V1 to address V2 with plain
+              ;; moves -- longwords when all three are 4-aligned, else bytes --
+              ;; never overlapping upward.  For a screen at a high address (the
+              ;; console's): _BlockMove on a 68040 copies with MOVE16, line
+              ;; bursts the Quadras' video memory does not take (MAME's Quadra
+              ;; 950 ran into its interrupt handlers until the stack was gone).
+              ;; Result 0.
+              (let ((not4 (mvm-make-label)))
+                (m68k-emit-cmpi buf +68k-d0+ 4)
+                (m68k-emit-bne buf not4)
+                (dolist (w '(#x48E7 #x40C0 #x2003 #xE280 #x2040 #x2004 #xE280 #x2240 #x2005
+                             #xE280 #x2209 #x8280 #x2F01 #x2208 #x829F #x0241 #x0003 #x660C
+                             #xE488 #x6712 #x22D8 #x5380 #x66FA #x600A #x4A80 #x6706 #x12D8
+                             #x5380 #x66FA #x4CDF #x0302))
+                  (m68k-emit-word buf w))
+                (m68k-emit-move-imm-dn buf 0 +68k-d2+)
+                (m68k-emit-bra buf out)
+                (m68k-emit-label buf not4))
               ;; Service 2: the ROM's _BlockMove of V3 bytes from address V1 to
               ;; address V2 (overlap-safe; the console's scroll).  Result 0.
               (m68k-emit-cmpi buf +68k-d0+ 2)
@@ -3442,14 +3472,16 @@
   "While translating a *68K-MAC-MODE* image: the label of the serial console's
    putc (M68K-EMIT-MAC-CONSOLE).")
 (defvar *68k-mac-getc-label* nil
-  "... and of its getc, 21 words on.")
+  "... and of its getc, +68K-MAC-GETC-WORD+ words on.")
 (defvar *68k-mac-service-label* nil
   "... and of the disk-read service SYSCALL3 reaches on a bare Mac
    (M68K-EMIT-MAC-SERVICE).")
 
 (defparameter +68k-mac-console-code+
-  #(#x48E7 #x6040 #x13C0 #x1000 #x9100 #x41F9 #x1000 #x9000 #x217C #x1000 #x9100
-    #x0020 #x7001 #x2140 #x0024 #x4268 #x002C #xA003 #x4CDF #x0206 #x4E75 #x48E7
+  #(#x48E7 #x6040 #x4A39 #x1000 #x910C #x663E #x41F9 #x1000 #x9000 #x2238 #x016A
+    #x5681 #x4A68 #x0010 #x6F0E #xB2B8 #x016A #x62F4 #x50F9 #x1000 #x910C #x601E
+    #x13C0 #x1000 #x9100 #x217C #x1000 #x9100 #x0020 #x7001 #x2140 #x0024 #x4268
+    #x002C #x42A8 #x000C #xA403 #x4CDF #x0206 #x4E75 #x48E7
     #x6040 #x4AB8 #x029E #x6600 #x000E #x41FA #x0074 #x21C8 #x029E #x21C8 #x02A2
     #x41F9 #x1000 #x9080 #x317C #x0002 #x001A #x42A8 #x001C #xA005 #x4AA8 #x001C
     #x6600 #x0030 #x41F9 #x1000 #x9110 #x4250 #x7028 #xA031 #x3039 #x1000 #x9110
@@ -3468,15 +3500,36 @@
   "The bare Mac's console, assembled (m68k-linux-gnu-as -m68040):
 
    putc:   movem.l d1-d2/a1,-(sp)       ; D0.B -> serial port A
-           move.b  d0,$10009100
+           tst.b   $1000910C             ; the port never drained: no serial
+           bne     pout
            lea     $10009000,a0          ; .AOut's parameter block
+           move.l  $16A,d1               ; Ticks + 3: wait at most ~50 ms
+           addq.l  #3,d1
+   pwait:  tst.w   16(a0)                ; ioResult > 0: the last byte is
+           ble     pgo                   ;   still going out
+           cmp.l   $16A,d1
+           bhi     pwait
+           st      $1000910C             ; it never finished: give the port up
+           bra     pout
+   pgo:    move.b  d0,$10009100
            move.l  #$10009100,32(a0)     ; ioBuffer
            moveq   #1,d0
            move.l  d0,36(a0)             ; ioReqCount
            clr.w   44(a0)                ; ioPosMode
-           _Write                        ; A003
-           movem.l (sp)+,d1-d2/a1
+           clr.l   12(a0)                ; ioCompletion: none
+           _Write  ,ASYNC                ; A403
+   pout:   movem.l (sp)+,d1-d2/a1
            rts
+
+   The write is ASYNCHRONOUS and waits for the previous byte with a limit.  It
+   was a synchronous _Write, and a port that never finishes a write -- MAME's
+   SE/30, IIci and Quadra, which have no serial ports wired -- hung the REPL
+   in the Device Manager's wait for its first byte.  A real port sends a byte
+   in ~1 ms at 9600 baud; one that has taken 3 ticks is given up and the
+   console is the screen alone.  The boot stub clears $1000910C.  ioCompletion
+   is cleared every time: a synchronous call ignores it, an asynchronous one
+   CALLS it, and the block comes from a saved core (MAME's Quadra 950 ran into
+   the ROM's interrupt code until the stack was gone).
    getc:   movem.l d1-d2/a1,-(sp)       ; -> D0.L: a key, or a byte from port A
            tst.l   $29E                  ; Key1Trans: none (a Mac Plus ROM
            bne     wait                  ;   without a System) -> install KTRANS
@@ -3533,9 +3586,12 @@
    routes the serial port to a host device, a real Mac to its modem port.
    Both routines keep every register but D0/A0.")
 
+(defconstant +68k-mac-getc-word+ 40
+  "Where getc starts in +68K-MAC-CONSOLE-CODE+, in words.")
+
 (defun m68k-emit-mac-console (buf)
   "Emit +68K-MAC-CONSOLE-CODE+: putc at *68K-MAC-CONSOLE-LABEL*, getc (word
-   21) at *68K-MAC-GETC-LABEL*."
+   +68K-MAC-GETC-WORD+) at *68K-MAC-GETC-LABEL*."
   (m68k-emit-label buf *68k-mac-console-label*)
   (let ((code (copy-seq +68k-mac-console-code+)))
     ;; every absolute operand is a $1000_9xxx long: move it with the
@@ -3545,7 +3601,7 @@
             do (let ((a (conv-real (logior #x10000000 (aref code (1+ i))))))
                  (setf (aref code i) (ash a -16) (aref code (1+ i)) (logand a #xFFFF))))
     (loop for w across code for i from 0
-          do (when (= i 21) (m68k-emit-label buf *68k-mac-getc-label*))
+          do (when (= i +68k-mac-getc-word+) (m68k-emit-label buf *68k-mac-getc-label*))
              (m68k-emit-word buf w))))
 
 (defun m68k-emit-mac-service (buf)
@@ -5403,6 +5459,14 @@
           (ws #x5680 #xE488)                                   ; ADDQ.L #3,D0; LSR.L #2,D0
           (ws #x5340 #x6B06)                                   ; SUBQ.W #1,D0; BMI.S done
           (ws #x26DA #x51C8 #xFFFC)                            ; MOVE.L (A2)+,(A3)+; DBRA D0
+          ;; the stream is code written as data: a 68020 or later must not run
+          ;; it from a stale instruction cache, and a 68040's copyback data
+          ;; cache may not have written it to memory yet.  _HWPriv 1
+          ;; (FlushInstructionCache; on a 68040 it pushes the data cache too),
+          ;; when CPUFlag ($12F) says the CPU has caches -- a 68000 ROM has no
+          ;; _HWPriv.  Registers the trap may use are kept.
+          (ws #x0C38 #x0002 #x012F #x650C)                     ; CMPI.B #2,$12F; BCS.S +12
+          (ws #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307)       ; MOVEM; MOVEQ #1,D0; _HWPriv; MOVEM
           ;; the owner map: the stream's granules are now index + 1
           (ws #x200C #x90B9) (l32 (conv-real +68k-cache-map+))   ; D0 = A4 - map base
           (ws #xEC88 #xD080)                                   ; first granule's word

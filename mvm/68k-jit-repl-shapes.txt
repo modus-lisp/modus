@@ -803,3 +803,6 @@
 1 (100 6 4)
 1 (100 6 16)
 1 (100 5 16)
+;;;; Added by hand (the hosted t10 cases VEC and QUOTED were refused without them):
+1 (:LI 16 2)
+1 (34 4 4 5)

@@ -80,8 +80,10 @@ ladder and alexandria/cl-ppcre for regressions.  Then the Mac.
 Runs on the Mac Classic layout launched from Mac OS (`classicos`, 4 MB), in
 MAME's 68000: `(fib 15)` 4 s against ~19 minutes interpreted, `(fib 20)` 17 s.
 And on a 1 MB Mac Plus (`plus1mjit`: the image 16 KB lower, a 16 KB code area
-from the page cache): `(fib 15)` 6 s, `(fib 20)` 18 s, the first DEFUN ~200 s
-(it pages the JIT in through a 104 KB cache), a later one ~75 s.
+from the page cache): `(fib 15)` 6 s, `(fib 20)` 18 s.  There a translation
+costs minutes (the compiler and the JIT page through a 104 KB cache), so DEFUN
+does not translate and `(compile 'fib)` does (97 s): `%JIT-EAGER-ALL`, the
+seam cl-eval's COMPILE already called for the x64 JIT, now gets the name.
 Hosted 68k: `t10` (24 cases against the interpreter, constants across a
 collection) passes, `(fib 20)` 27.8 s -> 18 ms.  Not done: handlers generated
 at run time (INDIRECT) -- a missing shape refuses the module instead; late

@@ -2620,10 +2620,13 @@
                                   *jit-eager-failed*))))
                 nil))))))
 
-(defun %jit-eager-all ()
+(declaim (overridable %jit-eager-all))
+(defun %jit-eager-all (&optional name)
   "Translate every registered runtime DEFUN that is still an interpreter
    trampoline to native code and publish it.  Returns (INSTALLED MODULES
-   FAILED).  Needs the JIT active.
+   FAILED).  Needs the JIT active.  NAME is the function COMPILE was given
+   (cl-eval %COMPILE-IMPL); this JIT translates everything pending anyway, the
+   68k threaded JIT (mvm/jit-68k.lisp) only NAME's module.
 
    TO A FIXPOINT.  A module is only translated once every function it calls
    is native, so one pass leaves a caller behind whenever its callee comes

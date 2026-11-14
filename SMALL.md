@@ -599,9 +599,19 @@ area from the cache:
 | `#x3A000`-`#x3C000` | NIL's page and T's (no lower: the core run's LC ROM keeps its system heap to `#x39FE0`) |
 | `#x3C000`-`#x8E000` | resident image |
 
-MAME `macplus -ramsize 1M`: `(fib 15)` 6 s and `(fib 20)` 18 s (interpreted,
-`(fib 15)` is ~19 minutes on a Classic); the first DEFUN ~200 s, as the JIT's
-own code pages in; later DEFUNs ~75 s (plus1m: ~50 s); `(greet "Mac")` 6 s.
+A translation pages the compiler and the JIT through the 104 KB cache: with
+every DEFUN translated, a DEFUN took 196-315 s.  So here DEFUN does not
+translate (the layout's `:jit-on-defun nil`) and `(compile 'f)` does.  MAME
+`macplus -ramsize 1M`:
+
+| type | time |
+|---|---|
+| `(defun fib (n) ...)` (the first DEFUN) | 119 s |
+| `(compile 'fib)` | 97 s |
+| `(fib 15)` | 6 s (interpreted: ~19 minutes on a Classic) |
+| `(fib 20)` | 18 s |
+| a later DEFUN (`greet`) | 54 s (plus1m: 47 s) |
+
 Modules over 1 KB of bytecode (every DEFSTRUCT) stay interpreted.
 
 ## Launched from Mac OS: `MODUS_MAC68K_MACHINE=classicos` + `scripts/mac68k-chain.py`

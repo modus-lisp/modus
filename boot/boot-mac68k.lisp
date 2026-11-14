@@ -164,11 +164,14 @@
     ;; free in a session (the core run caches at :BOOT-CACHE-LO), so the cache is
     ;; 104 KB, not 136: measured on plus1m with 92 KB, a DEFUN ~35% slower, calls
     ;; the same.  Modules capped at 1 KB of bytecode for the 40 KB semispaces.
+    ;; A translation pages the compiler and the JIT through that cache (3-5
+    ;; minutes a DEFUN, measured), so DEFUN does not translate: (compile 'f) does.
     (:plus-1m-jit :load #x0003C000 :static-lo #x0008E000 :static-hi #x000D1000
               :region #x000D1000 :heap-size #x00030000 :gc-guard #x00002000
               :alloc-start #x0000E000
               :kind-map #x000F5000 :cache-lo #x0001C000 :cache-hi #x00036000
               :jit-area-lo #x00036000 :jit-area-hi #x0003A000 :jit-max-bytecode 1024
+              :jit-on-defun nil
               :staging #x0003A000 :staging-size #x00000000
               :nil-page #x0003A000
               :stack-top #x00018000 :scratch #x00018000 :io-buf #x00019000

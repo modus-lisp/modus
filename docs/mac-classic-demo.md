@@ -54,6 +54,9 @@ at the prompt runs at the image's own speed.  MAME's Classic (68000), 4 MB:
 | `(fib 15)` | `610` (4 s; ~19 minutes interpreted) |
 | `(fib 20)` | `6765` (17 s) |
 
+On a 1 MB Mac Plus (`plus1mjit`, SMALL.md) DEFUN stays interpreted and
+`(compile 'fib)` translates (97 s); then `(fib 15)` 6 s, `(fib 20)` 18 s.
+
 The price is at the DEFUN: translating adds up to a minute (`greet` 30 s, `fib`
 80 s).  A function the JIT cannot translate (a shape the image lacks, or a
 module over 2 KB of bytecode -- every DEFSTRUCT) stays interpreted, with the

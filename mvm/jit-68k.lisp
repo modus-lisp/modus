@@ -560,6 +560,13 @@
 (defvar *t68-translated* 0 "CENSUS: modules translated.")
 (defvar *t68-refused* nil "CENSUS: (name . why) of modules left interpreted, newest first.")
 
+(defun %t68-on-defun-p ()
+  "Does a DEFUN translate as it is defined?  Here, yes.  The Mac build replaces
+   this body with its layout's :JIT-ON-DEFUN: on a 1 MB Mac a translation pages
+   the compiler and the JIT through a 104 KB cache and costs minutes, so only
+   (compile 'F) translates there."
+  t)
+
 (defun %t68-max-bytecode ()
   "The largest module (bytes of MVM bytecode) to translate, or NIL for any.
    Translating holds a few dozen bytes per instruction live at once, so the
@@ -580,10 +587,25 @@
         (if fns
             (progn
               (setq *t68-translated* (+ *t68-translated* 1))
+              (%t68-note-done (first m))
               (dolist (f fns)
                 (when (member (car f) names :test (function string=))
-                  (%t68-install (car f) (cdr f)))))
-            (setq *t68-refused* (cons (cons (car names) *t68-why*) *t68-refused*)))))))
+                  (%t68-install (car f) (cdr f))))
+              t)
+            (progn
+              (setq *t68-refused* (cons (cons (car names) *t68-why*) *t68-refused*))
+              ;; a callee not translated yet can be later; nothing else changes
+              (unless (and (consp *t68-why*) (member (car *t68-why*) '(:not-native :no-callee)))
+                (%t68-note-done (first m)))
+              nil))))))
+
+(defvar *t68-done* nil "Modules (their bytecode) translated, or refused for good: not tried again.")
+
+(defun %t68-done-p (bc)
+  (and (boundp (quote *t68-done*)) (member bc *t68-done* :test (function eq)) t))
+
+(defun %t68-note-done (bc)
+  (setq *t68-done* (cons bc (if (boundp (quote *t68-done*)) *t68-done* nil))))
 
 (defun %t68-defun (name)
   "Translate runtime DEFUN NAME (a symbol) now; T or NIL (*T68-WHY*)."
@@ -613,12 +635,45 @@
   ;; the guard first, and BOUNDP before each read: this runs at every DEFUN
   ;; from boot on (E2SMOKE's included), before anything has set these, and a
   ;; global that was never set need not read as NIL on every image
-  (when (and names (%t68-allowed-p)
-             (not (and (boundp (quote *t68-off*)) *t68-off*)))
-    (when (not (and (boundp (quote *t68-table*)) *t68-table*))
-      (handler-case (%t68-init)
-        (error (c) (setq *t68-off* t *t68-why* (list :init (princ-to-string c))))))
-    (when (and (boundp (quote *t68-table*)) *t68-table*) (%t68-on-defun names))))
+  (when (and names (%t68-allowed-p) (%t68-on-defun-p)
+             (not (and (boundp (quote *t68-off*)) *t68-off*))
+             (%t68-ready))
+    (%t68-on-defun names)))
+
+(defun %t68-ready ()
+  "Is the JIT ready (its table found, its area known)?  Readies it if not; a
+   JIT that cannot start turns itself off (*T68-OFF*, *T68-WHY*)."
+  (when (not (and (boundp (quote *t68-table*)) *t68-table*))
+    (handler-case (%t68-init)
+      (error (c) (setq *t68-off* t *t68-why* (list :init (princ-to-string c))))))
+  (and (boundp (quote *t68-table*)) *t68-table* t))
+
+(defun %jit-eager-all (&optional name)
+  "COMPILE's seam (cl-eval %COMPILE-IMPL; mvm-eval's is the x64 JIT's): (compile
+   'F) translates F's module now, or with no NAME every module not yet tried.
+   Where DEFUN does not translate (%T68-ON-DEFUN-P: a 1 MB Mac, where it costs
+   minutes) this is how a function is made fast.  The number translated."
+  (let ((n 0))
+    (when (and (%t68-allowed-p) (not (and (boundp (quote *t68-off*)) *t68-off*))
+               (%t68-ready) *jit-module-registry*)
+      (if name
+          (let* ((key (string name)) (m (gethash key *jit-module-registry*)))
+            (when (and m (not (%t68-done-p (first m))))
+              (let ((names nil))
+                (maphash (lambda (k v) (when (eq v m) (setq names (cons k names))))
+                         *jit-module-registry*)
+                (when (%t68-on-defun (cons key (remove key names :test (function string=))))
+                  (setq n 1)))))
+          (let ((todo nil))
+            (maphash (lambda (k v)
+                       (unless (%t68-done-p (first v))
+                         (let ((e (assoc (first v) todo :test (function eq))))
+                           (if e (rplacd e (cons k (cdr e)))
+                               (setq todo (cons (list (first v) k) todo))))))
+                     *jit-module-registry*)
+            (dolist (e todo)
+              (when (%t68-on-defun (cdr e)) (setq n (+ n 1)))))))
+    n))
 
 (defun t68-enable (&optional (area-size 1048576))
   "Ready the JIT now (it starts itself at the first DEFUN otherwise)."

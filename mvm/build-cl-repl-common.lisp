@@ -3299,7 +3299,8 @@
   (let ((lo (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-lo))
         (hi (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-hi))
         (cap (or (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-max-bytecode)
-                 2048)))
+                 2048))
+        (auto (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-on-defun t)))
     (unless (and lo hi)
       (error "MODUS_68K_JIT=1: the ~S map has no :JIT-AREA (use classicos)" modus.mvm::*mac68k-machine*))
     ;; The two seams are REPLACED in the text (one DEFUN each, nothing for a
@@ -3312,14 +3313,17 @@
                     (j (or (search old text :start2 i) (error "jit-68k.lisp: ~A body" head))))
                (concatenate 'string (subseq text 0 j) new (subseq text (+ j (length old)))))))
       (defvar cl-user::*cli-arch-late-source*   ; build-cli-common's (in CL-USER)
-        (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
+        (swap (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
                     "(defun %t68-fixed-area ()" (format nil "~%  nil)")
                     (format nil "~%  (cons #x~X #x~X))" lo hi))
               "(defun %t68-allowed-p ()" (format nil "~%  t)")
               (format nil "~%  (%core-requested-p))"))
               ;; big modules stay interpreted (see its docstring)
-              "(defun %t68-max-bytecode ()" (format nil "~%  nil)") (format nil "~%  ~D)" cap))))
-    (format t "~&;; mac68k: the threaded JIT, its code at #x~X-#x~X, modules to ~D bytes~%" lo hi cap)))
+              "(defun %t68-max-bytecode ()" (format nil "~%  nil)") (format nil "~%  ~D)" cap))
+              ;; translate at DEFUN, or only at (compile 'f)
+              "(defun %t68-on-defun-p ()" (format nil "~%  t)") (format nil "~%  ~A)" (if auto "t" "nil")))))
+    (format t "~&;; mac68k: the threaded JIT, its code at #x~X-#x~X, modules to ~D bytes, ~A~%"
+            lo hi cap (if auto "at each DEFUN" "at (compile 'f)"))))
 
 ;;; :MAC68K: AOT RUNTIME MACROS.  mvm/runtime-cl-macros.lisp keeps CL's runtime
 ;;; macros (WHEN, DOTIMES, PUSH, CASE ...) as DEFMACRO strings that boot READs

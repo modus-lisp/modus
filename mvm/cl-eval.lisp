@@ -2041,7 +2041,7 @@
        ;; translates the pending ones (F among them) -- a module that cannot be
        ;; translated stays interpreted and still works.
        (when (and (null def) (fboundp '%jit-eager-all))
-         (ignore-errors (funcall (symbol-function '%jit-eager-all))))
+         (ignore-errors (funcall (symbol-function '%jit-eager-all) name)))
        (values name nil nil)))))
 
 

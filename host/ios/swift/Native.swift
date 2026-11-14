@@ -713,13 +713,87 @@ struct NativeRow {
     let bar: Double?                             // :BAR -- a share, in thousandths: a fill behind the row that wide
     let button: String?                          // :BUTTON -- a button at the row's end; its tap, the row's (a SELECT)
     let italic: Bool                             // :ITALIC -- the title in italics (a symlink)
+    let strong: String?                          // :STRONG -- the start of the title, as a title is; the rest diminished
+    let trim: String?                            // :TRIM -- a path ending the subtitle, cut from the front to fit
     let dot: UIColor?
     let menu: [(id: Int, title: String, image: String?, destructive: Bool)]
 
     /// Shows the same (its cell need not be redrawn).
     func looksLike(_ o: NativeRow) -> Bool {
         title == o.title && subtitle == o.subtitle && detail == o.detail && image == o.image && tint == o.tint
-            && chevron == o.chevron && dot == o.dot && bar == o.bar && button == o.button && italic == o.italic && menu.map(\.title) == o.menu.map(\.title)
+            && chevron == o.chevron && dot == o.dot && bar == o.bar && button == o.button && italic == o.italic
+            && strong == o.strong && trim == o.trim && menu.map(\.title) == o.menu.map(\.title)
+    }
+}
+
+/// A table's cell, which keeps a subtitle that ends in a path (:TRIM) on one line: the path loses folders from
+/// its front -- "…/claude/modus-mac" -- until the line fits the width the cell has, whatever that is.
+final class NativeCell: UITableViewCell {
+    var trimHead: String?                        // the subtitle before the path ("epyc  ·  ")
+    var trimPath: String?                        // the path, whole
+
+    private var trimmedFor = CGSize.zero         // the width (and text size) the path was cut for
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        // a new text size: the whole path back, and cut again for it
+        registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (cell: NativeCell, _: UITraitCollection) in
+            guard let head = cell.trimHead, let path = cell.trimPath,
+                  let label = cell.secondaryLabel(in: cell.contentView, head: head) else { return }
+            NativeCell.retext(label, head + path)
+            cell.trimmedFor = .zero
+            cell.setNeedsLayout()
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let head = trimHead, let path = trimPath,
+              let label = secondaryLabel(in: contentView, head: head) else { return }
+        let whole = head + path
+        // a new width (a turn of the phone) or text size: the whole path again, measured on the next pass
+        let key = CGSize(width: contentView.bounds.width, height: label.font.pointSize)
+        if key != trimmedFor, label.text != whole {
+            NativeCell.retext(label, whole)
+            trimmedFor = .zero
+            setNeedsLayout()
+            return
+        }
+        // measured only while the label holds it all: wrapped, a label is as wide as its line can be -- and once
+        // it has been laid out (the content view lays its labels out after the cell: until then, no width)
+        guard label.text == whole else { return }
+        contentView.layoutIfNeeded()
+        guard label.bounds.width > 0 else { return }
+        // the label's own attributes (its text is set as attributed text: its FONT is not what it draws in)
+        let attrs = label.attributedText.flatMap { $0.length > 0 ? $0.attributes(at: 0, effectiveRange: nil) : nil }
+            ?? [.font: label.font as Any]
+        // within a point: a label that fits its text is that text's width, give or take a rounding
+        func fits(_ s: String) -> Bool { (s as NSString).size(withAttributes: attrs).width <= label.bounds.width + 1 }
+        trimmedFor = key
+        guard !fits(whole) else { return }
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        var text = head + "…/" + (parts.last.map(String.init) ?? path)    // the last folder, if nothing more fits
+        for k in 1..<max(1, parts.count) {
+            let candidate = head + "…/" + parts[k...].joined(separator: "/")
+            if fits(candidate) { text = candidate; break }
+        }
+        label.attributedText = NSAttributedString(string: text, attributes: attrs)
+    }
+
+    /// LABEL's text made TEXT, in the attributes it has (its plain TEXT would take its FONT, which it does not use).
+    static func retext(_ label: UILabel, _ text: String) {
+        let attrs = label.attributedText.flatMap { $0.length > 0 ? $0.attributes(at: 0, effectiveRange: nil) : nil }
+        label.attributedText = NSAttributedString(string: text, attributes: attrs ?? [.font: label.font as Any])
+    }
+
+    /// The label showing the subtitle: the one whose text starts with HEAD.
+    private func secondaryLabel(in view: UIView, head: String) -> UILabel? {
+        for v in view.subviews {
+            if let l = v as? UILabel, let t = l.text, t.hasPrefix(head) { return l }
+            if let l = secondaryLabel(in: v, head: head) { return l }
+        }
+        return nil
     }
 }
 
@@ -1279,7 +1353,27 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
         if row.italic, let italic = UIFont.preferredFont(forTextStyle: .body).fontDescriptor.withSymbolicTraits(.traitItalic) {
             content.textProperties.font = UIFont(descriptor: italic, size: 0)
         }
+        if let strong = row.strong, row.title.hasPrefix(strong) {
+            // the name as a title is; what follows it as a subtitle is -- smaller, in the secondary colour
+            let title = NSMutableAttributedString(string: row.title,
+                                                  attributes: [.font: content.secondaryTextProperties.font,
+                                                               .foregroundColor: UIColor.secondaryLabel])
+            title.addAttributes([.font: content.textProperties.font, .foregroundColor: UIColor.label],
+                                range: NSRange(location: 0, length: (strong as NSString).length))
+            content.attributedText = title
+            content.textToSecondaryTextVerticalPadding = 5     // a title of two sizes: room under it
+        }
         content.secondaryText = row.subtitle
+        if let cell = cell as? NativeCell {
+            // a path at the subtitle's end: the cell cuts it from the front to keep the line whole
+            if let trim = row.trim, let sub = row.subtitle, sub.hasSuffix(trim), sub.count > trim.count {
+                cell.trimHead = String(sub.dropLast(trim.count))
+                cell.trimPath = trim
+            } else {
+                cell.trimHead = nil
+                cell.trimPath = nil
+            }
+        }
         content.secondaryTextProperties.color = .secondaryLabel
         if let name = row.image {
             content.image = UIImage(systemName: name)
@@ -1405,7 +1499,7 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
 /// A table and its source, registered under a new handle, not yet in any view.
 private func makeTable(plain: Bool, frame: CGRect) -> (UInt, NativeTable) {
     let table = UITableView(frame: frame, style: plain ? .plain : .insetGrouped)
-    table.register(UITableViewCell.self, forCellReuseIdentifier: "native")
+    table.register(NativeCell.self, forCellReuseIdentifier: "native")
     let th = newHandle()
     let source = NativeTable(handle: th, table: table)
     table.dataSource = source
@@ -2785,6 +2879,7 @@ private func nativeRow(_ item: Term, _ index: Int) -> NativeRow {
                      keys: m["KEYS"].map(plist) ?? [:],
                      bar: { if case .int(let b)? = m["BAR"] { return Double(min(1000, max(0, b))) / 1000 }; return nil }(),
                      button: str(m["BUTTON"]), italic: flag(m["ITALIC"]),
+                     strong: str(m["STRONG"]), trim: str(m["TRIM"]),
                      dot: color(m["DOT"]),
                      menu: (m["MENU"]?.listItems ?? []).compactMap { item in
                          let a = plist(item)

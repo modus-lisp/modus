@@ -147,6 +147,60 @@
 ;; zero loops would clear half of each block there.  Rewrite them for i386 as
 ;; two :U32 stores; every other target's text is untouched.  (QEMU hands over
 ;; zeroed RAM, which is why a half-cleared block works there; hardware does not.)
+(defun %strip-global-inits (text)
+  "TEXT with every top-level (DEFVAR name INIT ...) / (DEFPARAMETER name INIT
+   ...) given NIL for INIT.  For host source baked into an image whose
+   KERNEL-MAIN runs every initform at boot: the native 68k tier bakes
+   translate-68k.lisp, whose initforms are the BUILD's (they read its
+   environment, build its tables, hold its code vectors), and with them in the
+   image the REPL's globals table was corrupt at the first prompt (bisected:
+   the translator alone does it).  Its configuration comes from %N68-COINIT."
+  (let ((out (make-string-output-stream)) (i 0) (n (length text)))
+    (labels ((skip-ws (j)
+               ;; past whitespace and ; comments
+               (loop
+                 (cond ((>= j n) (return j))
+                       ((member (char text j) '(#\Space #\Tab #\Newline #\Return)) (incf j))
+                       ((char= (char text j) #\;)
+                        (loop while (and (< j n) (char/= (char text j) #\Newline)) do (incf j)))
+                       (t (return j)))))
+             (skip-form (j)
+               ;; index just past the form starting at J (after whitespace and comments)
+               (setq j (skip-ws j))
+               (let ((depth 0))
+                 (loop
+                   (when (>= j n) (return j))
+                   (let ((c (char text j)))
+                     (cond
+                       ((char= c #\") (incf j)
+                        (loop while (and (< j n) (char/= (char text j) #\"))
+                              do (incf j (if (char= (char text j) #\\) 2 1)))
+                        (incf j))
+                       ((char= c #\;) (loop while (and (< j n) (char/= (char text j) #\Newline)) do (incf j)))
+                       ((and (char= c #\#) (< (1+ j) n) (char= (char text (1+ j)) #\\)) (incf j 3))
+                       ((char= c #\() (incf depth) (incf j))
+                       ;; a ) at depth 0 closes the DEFVAR, not this form
+                       ((char= c #\)) (when (zerop depth) (return j))
+                        (decf depth) (incf j) (when (zerop depth) (return j)))
+                       ((and (zerop depth) (member c '(#\Space #\Tab #\Newline #\Return))) (return j))
+                       (t (incf j))))))))
+      (loop
+        (let ((p (let ((a (search (format nil "~%(defvar ") text :start2 i))
+                       (b (search (format nil "~%(defparameter ") text :start2 i)))
+                   (if (and a b) (min a b) (or a b)))))
+          (unless p (write-string text out :start i) (return))
+          (let* ((head-end (+ p 1 (if (string= "(defvar " text :start2 (1+ p) :end2 (+ p 9)) 8 14)))
+                 (name-end (skip-form head-end))
+                 (k (skip-ws name-end)))
+            (if (or (>= k n) (char= (char text k) #\)))
+                ;; (defvar name) -- no initform
+                (progn (write-string text out :start i :end name-end) (setq i name-end))
+                (let ((init-end (skip-form name-end)))
+                  (write-string text out :start i :end name-end)
+                  (write-string " nil" out)
+                  (setq i init-end)))))))
+    (get-output-stream-string out)))
+
 (defun %replace-all (text old new)
   (let ((out (make-string-output-stream)) (start 0))
     (loop for at = (search old text :start2 start)
@@ -3312,7 +3366,36 @@
              (let* ((i (or (search head text) (error "jit-68k.lisp: no ~A" head)))
                     (j (or (search old text :start2 i) (error "jit-68k.lisp: ~A body" head))))
                (concatenate 'string (subseq text 0 j) new (subseq text (+ j (length old)))))))
+      ;; THE NATIVE TIER (mvm/jit-68k-native.lisp): the image's own emitter,
+      ;; translate-68k.lisp, baked ahead of the threaded JIT, which tries it
+      ;; first.  Its settings are filled in when BUILD-IMAGE compiles, after the
+      ;; boot descriptor has configured the translator (cross.lisp
+      ;; LATE-SOURCE-FILL).  MODUS_68K_NATIVE=0 leaves it out.
+      (unless (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "0")
+        (push (cons "'(:n68-coinit :pending)" 'modus.mvm::m68k-native-coinit-text)
+              modus.mvm::*late-source-fills*))
       (defvar cl-user::*cli-arch-late-source*   ; build-cli-common's (in CL-USER)
+        (concatenate 'string
+          (if (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "0")
+              ""
+              ;; The translator's DEFVARs read the BUILD's environment
+              ;; (SB-EXT:POSIX-GETENV), which this image does not have, and
+              ;; KERNEL-MAIN's INIT-ALL-GLOBALS runs them at boot inside one
+              ;; HANDLER-CASE: the first one to signal left every global after
+              ;; it in the source uninitialised (measured: the REPL took a bus
+              ;; error on its first keystroke).  Here they read an environment
+              ;; with nothing in it; the emitter's real settings come from
+              ;; %N68-COINIT, filled at build time.
+              (concatenate 'string
+                           (%strip-global-inits
+                            (%replace-all (mvm-text "mvm/translate-68k.lisp")
+                                          "(sb-ext:posix-getenv " "(%n68-no-getenv "))
+                           (string #\Newline)
+                           ;; MODUS_68K_NATIVE=tr: the translator alone (bisecting)
+                           (if (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "tr")
+                               ""
+                               (mvm-text "mvm/jit-68k-native.lisp"))
+                           (string #\Newline)))
         (swap (swap (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
                     "(defun %t68-fixed-area ()" (format nil "~%  nil)")
                     (format nil "~%  (cons #x~X #x~X))" lo hi))
@@ -3323,7 +3406,7 @@
               ;; translate at DEFUN, or only at (compile 'f)
               "(defun %t68-on-defun-p ()" (format nil "~%  t)") (format nil "~%  ~A)" (if auto "t" "nil")))
               ;; a 68020 or later must not run the new code from a stale cache
-              "(defun %t68-flush-code ()" (format nil "~%  nil)") (format nil "~%  (syscall3 3 0 0 0))"))))
+              "(defun %t68-flush-code ()" (format nil "~%  nil)") (format nil "~%  (syscall3 3 0 0 0))")))))
     (format t "~&;; mac68k: the threaded JIT, its code at #x~X-#x~X, modules to ~D bytes, ~A~%"
             lo hi cap (if auto "at each DEFUN" "at (compile 'f)"))))
 

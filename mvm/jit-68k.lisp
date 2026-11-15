@@ -585,15 +585,27 @@
    exhausted the heap."
   nil)
 
+(defun %t68-native (m names)
+  "The native tier first (mvm/jit-68k-native.lisp, baked with this file):
+   M's functions as native code, or NIL with the reason in *N68-REFUSED*."
+  (unless (and (boundp (quote *n68-off*)) *n68-off*)
+    (let ((r (handler-case (%n68-translate m)
+               (error (c) (setq *n68-why* (list :error (princ-to-string c))) nil))))
+      (if r
+          (setq *n68-translated* (+ *n68-translated* 1))
+          (setq *n68-refused* (cons (cons (car names) *n68-why*) *n68-refused*)))
+      r)))
+
 (defun %t68-on-defun (names)
   "*RUNTIME-DEFUN-HOOK*: translate the module mvm-eval just installed for
    NAMES and publish its DEFUNs; on any failure they stay interpreted."
   (let ((m (and names *jit-module-registry* (gethash (car names) *jit-module-registry*))))
     (when m
-      (let ((fns (if (and (%t68-max-bytecode) (> (length (first m)) (%t68-max-bytecode)))
-                     (progn (setq *t68-why* (list :too-big (length (first m)))) nil)
-                     (handler-case (%t68-translate m)
-                       (error (c) (setq *t68-why* (list :error (princ-to-string c))) nil)))))
+      (let ((fns (or (%t68-native m names)
+                     (if (and (%t68-max-bytecode) (> (length (first m)) (%t68-max-bytecode)))
+                         (progn (setq *t68-why* (list :too-big (length (first m)))) nil)
+                         (handler-case (%t68-translate m)
+                           (error (c) (setq *t68-why* (list :error (princ-to-string c))) nil))))))
         (if fns
             (progn
               (setq *t68-translated* (+ *t68-translated* 1))

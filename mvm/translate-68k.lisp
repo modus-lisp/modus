@@ -6286,6 +6286,100 @@
     (m68k-word-align buf)
     (format t "~&;; 68k JIT shape table: ~D shapes, ~D bytes~%" n pos)))
 
+;;; THE NATIVE REPL TIER's view of the image (mvm/jit-68k-native.lisp).  A
+;;; function defined at the REPL is translated by this file's own emitter
+;;; (M68K-TRANSLATE-INSN), baked into the image, into a code area.  What it
+;;; emits calls a few routines that live once in the image -- the collector, the
+;;; write barrier, the shared CONS/CAR/... sequences, the 68000's multiply and
+;;; divide, the Mac's console traps.  Their addresses are written here, after
+;;; the shape table, behind "modusJXL": a count, then one 32-bit offset per
+;;; label in M68K-NATIVE-EXPORT-NAMES' order, from the magic to the label
+;;; (#x7FFFFFFF: this image has no such routine).  The runtime reads the order
+;;; from the same function, so the two cannot disagree.
+(defun m68k-native-export-labels ()
+  "The image routines native REPL code may call, in the export table's order."
+  (list *68k-gc-label* *68k-barrier-label* *68k-cons-label* *68k-subtag-label*
+        *68k-car-label* *68k-cdr-label* *68k-array-len-label* *68k-alloc-obj-label*
+        *68k-mul32-label* *68k-mulu64-label* *68k-divs32-label*
+        *68k-mac-console-label* *68k-mac-getc-label* *68k-mac-service-label*
+        *68k-thread-next-label*))
+
+(defun m68k-native-state-name-p (name)
+  "Per-translation state, not configuration: the native tier binds these itself."
+  (or (search "-LABEL*" name)
+      (member name '("*68K-ABS-PATCHES*" "*68K-LI-CONST-PATCHES*" "*68K-STREAM-FIXUPS*"
+                     "*68K-BRANCH-PLAN*" "*68K-BRANCH-ORDINAL*" "*68K-BRANCH-DISTANCES*"
+                     "*68K-FN-ENTRY-POSITIONS*" "*68K-COLD-FNS*" "*68K-PAGED-FNS*"
+                     "*68K-PAGED-LAYOUT*" "*68K-PAGED-TABLE-REFS*" "*68K-BYTECODE*"
+                     "*68K-LABEL-MAP*" "*68K-SKIP-TO*" "*68K-UNIMPL-OPCODES*" "*68K-THREAD-WHY*"
+                     "*68K-JIT-SHAPES*" "*68K-JIT-INDEXED*" "*68K-THREAD-SHAPES*"
+                     "*68K-HOT-NAMES*" "*68K-THREADED*" "*68K-NATIVE-P*" "*68K-PROFILE*")
+              :test #'string=)))
+
+(defun m68k-native-dumpable-p (v)
+  (typecase v
+    ((or number character string symbol) t)
+    (cons (and (m68k-native-dumpable-p (car v)) (m68k-native-dumpable-p (cdr v))))
+    (simple-vector (every #'m68k-native-dumpable-p v))
+    (t nil)))
+
+(defun m68k-native-value-form (v)
+  "Source text evaluating to V in the image, or NIL.  Data is quoted; the
+   register map (a vector of M68K-REG) is rebuilt by its constructor."
+  (cond ((m68k-native-dumpable-p v) (format nil "'~S" v))
+        ((and (simple-vector-p v) (every (lambda (r) (or (null r) (m68k-reg-p r))) v))
+         ;; a spilled vreg's entry is NIL
+         (format nil "(vector~{ ~A~})"
+                 (map 'list (lambda (r) (if r
+                                            (format nil "(make-m68k-reg :type ~S :number ~D)"
+                                                    (m68k-reg-type r) (m68k-reg-number r))
+                                            "nil"))
+                      v)))
+        (t nil)))
+
+(defun m68k-native-coinit-text ()
+  "Source text for jit-68k-native.lisp's %N68-COINIT body: SETQs giving the
+   image's emitter the configuration this image was translated with.  A DEFVAR's
+   initial value never runs in the image (CLAUDE.md), and the host's values are
+   final only once BUILD-IMAGE compiles, so cross.lisp's LATE-SOURCE-FILL calls
+   this then.  Every bound *68K-* / *CONV-* special that is configuration and
+   readable data; skipped ones are listed in the build log."
+  (let ((forms nil) (skipped nil) (pkg (find-package :modus.mvm)))
+    (do-symbols (s pkg)
+      (let ((n (symbol-name s)))
+        (when (and (eq (symbol-package s) pkg) (boundp s)
+                   (or (eql 0 (search "*68K-" n)) (eql 0 (search "*CONV-" n)))
+                   (char= (char n (1- (length n))) #\*)
+                   (not (m68k-native-state-name-p n)))
+          (let ((f (let ((*package* pkg)) (m68k-native-value-form (symbol-value s)))))
+            (if f (push (cons n f) forms) (push n skipped))))))
+    (setq forms (sort forms #'string< :key #'car))
+    (format t "~&;; 68k native tier: ~D emitter settings carried into the image~@[; not data: ~{~A~^ ~}~]~%"
+            (length forms) (sort skipped #'string<))
+    (with-output-to-string (o)
+      (let ((*package* pkg) (*print-readably* nil) (*print-pretty* nil) (*print-base* 10)
+            (*print-radix* nil) (*print-circle* nil))
+        (format o "(progn")
+        (dolist (f forms)
+          (format o "~%    (setq ~A ~A)" (string-downcase (car f)) (cdr f)))
+        (format o "~%    t)")))))
+
+(defun m68k-emit-native-exports (buf)
+  (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-byte buf 0))
+  (let ((magic (m68k-buffer-position buf)) (labels (m68k-native-export-labels)) (n 0))
+    (loop for c across "modusJXL" do (m68k-emit-byte buf (char-code c)))
+    (m68k-emit-long buf (length labels))
+    (dolist (l labels)
+      (if l                             ; placed later (the collector is last); the fixup resolves it
+          (progn
+            ;; :DISP32 is target - (ref - 2); ref = magic + 2 makes it target - magic
+            (m68k-emit-word buf 0) (m68k-emit-word buf 0)
+            (push (list (- (m68k-buffer-word-count buf) 2) l :disp32 (+ magic 2))
+                  (m68k-buffer-fixups buf))
+            (incf n))
+          (m68k-emit-long buf #x7FFFFFFF)))
+    (format t "~&;; 68k native-tier exports: ~D of ~D image routines~%" n (length labels))))
+
 (defun m68k-emit-thread-dispatch (buf function-table)
   "The escape, NEXT, the table (32-bit handler offsets from its own start),
    then every handler."
@@ -6352,7 +6446,9 @@
           ;; shapes at index >= 255 are reached through the escape: their
           ;; table entry is at index I as well (the escape reads I itself).
           ;; the runtime JIT's copy of the shapes, right after the table
-          (when *68k-jit-shapes* (m68k-emit-shape-table buf shapes)))))
+          (when *68k-jit-shapes*
+            (m68k-emit-shape-table buf shapes)
+            (m68k-emit-native-exports buf)))))
     ;; MODUS_68K_SHAPES_OUT=FILE: every shape's token index and key, one a line
     ;; ("INDEX KEY", the key as READ prints it), for the runtime threaded JIT
     ;; (docs/68k-threaded-jit.md) to number its own instructions with

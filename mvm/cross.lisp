@@ -68,12 +68,27 @@
 ;;; Cross-Compilation Pipeline
 ;;; ============================================================
 
+(defvar *late-source-fills* nil
+  "Alist (PLACEHOLDER . FUNCTION): before a compilation reads its source, each
+   PLACEHOLDER string in it is replaced by FUNCTION's text, called THEN -- after
+   the build script and the target's boot descriptor have set every flag, which
+   is when a value the image must carry about its own translation is final
+   (jit-68k-native.lisp's emitter settings).  NIL: nothing to fill.")
+
+(defun late-source-fill (text)
+  (dolist (f *late-source-fills* text)
+    (let ((p (search (car f) text)))
+      (when p
+        (setq text (concatenate 'string (subseq text 0 p) (funcall (cdr f))
+                                (subseq text (+ p (length (car f))))))))))
+
 (defun compile-source-to-module (source-text &key (name :kernel))
   "Phase 1: Compile Lisp source text to an MVM module.
    This is 100% target-independent.
    Delegates to the MVM compiler (compiler.lisp) for the actual
    compilation, then converts the result to an mvm-module for
    the image building pipeline."
+  (setq source-text (late-source-fill source-text))
   ;; Read source forms with line numbers.  Phase markers (gated on
   ;; *static-build-p*, i.e. the self-host --compile) name the phase a fatal
   ;; came from — read vs compile vs module-conversion — so a bare

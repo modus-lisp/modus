@@ -1067,6 +1067,25 @@
                               (ash #b00 3)
                               (logand dst-dn 7))))
 
+(defun m68k-emit-rol-dn (buf count-dn dst-dn)
+  "ROL.L Dc, Dd (rotate left by register).  W32's w32-rotl."
+  (m68k-emit-word buf (logior (ash #b1110 12)
+                              (ash (logand count-dn 7) 9)
+                              (ash 1 8)      ; left
+                              (ash +68k-size-long+ 6)
+                              (ash 1 5)      ; register
+                              (ash #b11 3)   ; type=RO
+                              (logand dst-dn 7))))
+
+(defun m68k-emit-not-l (buf dn)
+  "NOT.L Dn.  W32's w32-not."
+  (m68k-emit-word buf (logior #x4680 (logand dn 7))))
+
+(defun m68k-emit-scc (buf cc dn)
+  "Scc Dn: the LOW BYTE of Dn = #xFF if condition CC (4 bits) holds, else 0.
+   W32's compares (CS unsigned <, LT signed <, EQ)."
+  (m68k-emit-word buf (logior #x50C0 (ash (logand cc 15) 8) (logand dn 7))))
+
 ;;; --- Compare ---
 
 (defun m68k-emit-cmp-dn-dn (buf src dst)
@@ -2134,6 +2153,14 @@
          (let ((db (m68k-vreg-or-scratch buf vb +68k-d1+)))
            (m68k-emit-muls buf db +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+))))
+
+      ;; ---- W32 (docs/w32.md): see M68K-TRANSLATE-W32 ----
+      ((#.+op-w32-li+ #.+op-w32-add+ #.+op-w32-sub+ #.+op-w32-mul+ #.+op-w32-mulhu+
+        #.+op-w32-and+ #.+op-w32-or+ #.+op-w32-xor+ #.+op-w32-not+
+        #.+op-w32-shl+ #.+op-w32-shr+ #.+op-w32-sar+ #.+op-w32-rotl+
+        #.+op-w32-ltu+ #.+op-w32-lts+ #.+op-w32-eq+ #.+op-w32-from-fix+
+        #.+op-w32-hi16+ #.+op-w32-lo16+ #.+op-w32-join+ #.+op-w32-load+ #.+op-w32-store+)
+       (m68k-translate-w32 buf opcode (first operands) (second operands) (third operands)))
 
       (#.+op-mul26lo+
        ;; Low 26 bits of untag(Va)*untag(Vb), tagged
@@ -4684,6 +4711,82 @@
     (format t "~&  *** 68k translator gaps (ILLEGAL emitted; #x1xxxx = trap xxxx): ~{#x~2,'0X~^ ~} ***~%"
             (sort (copy-list *68k-unimpl-opcodes*) #'<)))
   *68k-unimpl-opcodes*)
+
+;;; ============================================================
+;;; W32: native 32-bit words (docs/w32.md, spec 4.4)
+;;; ============================================================
+;;; A W32 operand is the raw word in a 32-bit data register.  Scratch D0/D1/A0,
+;;; as every arm here uses them; results go through D0.  IMMEDIATE shifts on
+;;; 68k encode counts 1..8 only (M68K-EMIT-LSR-IMM masks the count with 7 --
+;;; MUL26HI's `lsr #26' is in fact `lsr #2', a latent bug in a now-unused
+;;; opcode, see docs/w32.md), so every W32 shift takes its count through MOVEQ
+;;; into D1 and shifts by register.  The multiplies call M68K-EMIT-MULU-64 in
+;;; its D1 -> D1:D0 shape, which on a 68000 is the BSR to the existing helper.
+(defun m68k-translate-w32 (buf op o0 o1 o2)
+  (let ((d0 +68k-d0+) (d1 +68k-d1+) (a0 +68k-a0+))
+    (flet ((done () (m68k-store-vreg buf o0 d0))
+           (two () (m68k-load-vreg buf d0 o1) (m68k-load-vreg buf d1 o2)))
+      (cond
+        ((= op +op-w32-li+) (m68k-emit-move-imm-dn buf o1 d0) (done))
+        ((= op +op-w32-load+)
+         (m68k-load-vreg-to-an buf a0 o1)
+         (m68k-emit-move-disp-dn buf a0 o2 d0) (done))
+        ((= op +op-w32-store+)
+         ;; (w32-store Vaddr Vs off), Vaddr a RAW address
+         (m68k-load-vreg-to-an buf a0 o0)
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-move-dn-disp buf d0 a0 o2))
+        ((or (= op +op-w32-mul+) (= op +op-w32-mulhu+))
+         (two)
+         (m68k-emit-mulu-64 buf d1 d0 d1)              ; D1:D0 = D0 * D1
+         (when (= op +op-w32-mulhu+) (m68k-emit-move-dn-dn buf d1 d0))
+         (done))
+        ((or (= op +op-w32-shl+) (= op +op-w32-shr+) (= op +op-w32-sar+)
+             (= op +op-w32-rotl+))
+         (m68k-load-vreg buf d0 o1)
+         (unless (= o2 0)
+           (m68k-emit-moveq buf d1 o2)
+           (cond ((= op +op-w32-shl+) (m68k-emit-lsl-dn buf d1 d0))
+                 ((= op +op-w32-shr+) (m68k-emit-lsr-dn buf d1 d0))
+                 ((= op +op-w32-sar+) (m68k-emit-asr-dn buf d1 d0))
+                 (t                   (m68k-emit-rol-dn buf d1 d0))))
+         (done))
+        ((= op +op-w32-not+)      (m68k-load-vreg buf d0 o1) (m68k-emit-not-l buf d0) (done))
+        ((= op +op-w32-from-fix+) (m68k-load-vreg buf d0 o1) (m68k-emit-asr-imm buf d0 1) (done))
+        ((= op +op-w32-hi16+)
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-swap buf d0)
+         (m68k-emit-andi buf d0 #xFFFF)
+         (m68k-emit-add-dn-dn buf d0 d0) (done))        ; tag
+        ((= op +op-w32-lo16+)
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-andi buf d0 #xFFFF)
+         (m68k-emit-add-dn-dn buf d0 d0) (done))
+        ((= op +op-w32-join+)
+         ;; o1, o2 tagged fixnums 0..65535: (hi<<1)<<15 | (lo<<1)>>1
+         (m68k-load-vreg buf d0 o1)
+         (m68k-emit-moveq buf d1 15)
+         (m68k-emit-lsl-dn buf d1 d0)
+         (m68k-load-vreg buf d1 o2)
+         (m68k-emit-lsr-imm buf d1 1)
+         (m68k-emit-or-dn-dn buf d1 d0) (done))
+        ((or (= op +op-w32-ltu+) (= op +op-w32-lts+) (= op +op-w32-eq+))
+         (two)
+         (m68k-emit-cmp-dn-dn buf d1 d0)               ; CCR = D0 - D1
+         (m68k-emit-scc buf (cond ((= op +op-w32-ltu+) #x5)   ; CS
+                                  ((= op +op-w32-lts+) #xD)   ; LT
+                                  (t #x7))                    ; EQ
+                        d0)
+         (m68k-emit-andi buf d0 2)                      ; #xFF -> 2 = tagged 1
+         (done))
+        (t
+         (two)
+         (cond ((= op +op-w32-add+) (m68k-emit-add-dn-dn buf d1 d0))
+               ((= op +op-w32-sub+) (m68k-emit-sub-dn-dn buf d1 d0))
+               ((= op +op-w32-and+) (m68k-emit-and-dn-dn buf d1 d0))
+               ((= op +op-w32-or+)  (m68k-emit-or-dn-dn buf d1 d0))
+               (t                   (m68k-emit-eor-dn-dn buf d1 d0)))
+         (done))))))
 
 (defun translate-mvm-to-68k (bytecode function-table)
   (if *68k-relax-branches*

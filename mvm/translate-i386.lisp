@@ -851,6 +851,10 @@
   '(("DIV"         . "IDIV requires the dividend in EDX:EAX")
     ("MOD"         . "IDIV requires the dividend in EDX:EAX")
     ("MUL26LO"     . "MUL requires one operand in EAX")
+    ;; W32 (docs/w32.md): MUL's operand is EAX.  The arm saves and restores
+    ;; EAX around it unless the destination IS VR, so a live VR survives.
+    ("W32-MUL"     . "MUL requires one operand in EAX; EAX saved around it")
+    ("W32-MULHU"   . "MUL requires one operand in EAX; EAX saved around it")
     ("MUL26HI"     . "MUL requires one operand in EAX")
     ("IO-READ"     . "IN uses AL/AX/EAX by ISA")
     ("IO-WRITE"    . "OUT uses AL/AX/EAX by ISA")
@@ -2551,6 +2555,92 @@
 ;;; Single-instruction translator.  Called from the main translation
 ;;; loop for each decoded MVM instruction.
 
+;;; ============================================================
+;;; W32: native 32-bit words (docs/w32.md, spec 4.4)
+;;; ============================================================
+;;; A W32 operand is the raw word in a 32-bit register.  Scratch ECX/EDX, as
+;;; the VR-preserving ALU arms use; EAX (= VR) only for MUL, which needs it,
+;;; and then SAVED around it unless the destination is VR: inside a W32 tree
+;;; an earlier operand may be sitting in VR while a later multiply runs.
+;;; (Spills are EBP-relative, so the PUSH/POP does not move them.)  x86 masks
+;;; immediate shift counts to 5 bits; W32 counts are 0..31 by construction,
+;;; and 0 emits nothing.
+(defun i386-emit-rol-reg-imm (buf reg count)
+  "ROL reg, imm8 (C1 /0 ib)."
+  (i386-emit-byte buf #xC1)
+  (i386-emit-byte buf (i386-modrm #b11 0 reg))
+  (i386-emit-byte buf count))
+
+(defun i386-translate-w32 (buf op o0 o1 o2)
+  (let ((c +scratch0+) (d +scratch1+) (eax +i386-eax+))
+    (flet ((done () (i386-store-vreg buf o0 c))
+           (two () (i386-load-vreg buf d o2) (i386-load-vreg buf c o1)))
+      (cond
+        ((= op +op-w32-li+) (i386-emit-mov-reg-imm buf c o1) (done))
+        ((= op +op-w32-load+)
+         (i386-load-vreg buf c o1)
+         (i386-emit-mov-reg-mem buf c c o2) (done))
+        ((= op +op-w32-store+)
+         ;; (w32-store Vaddr Vs off), Vaddr a RAW address
+         (i386-load-vreg buf c o0)
+         (i386-load-vreg buf d o1)
+         (i386-emit-mov-mem-reg buf c o2 d))
+        ((or (= op +op-w32-mul+) (= op +op-w32-mulhu+))
+         (let ((save (not (eql (i386-vreg-phys o0) eax))))
+           (when save (i386-emit-push-reg buf eax))
+           (i386-load-vreg buf c o2)                  ; before EAX is written:
+           (i386-load-vreg buf eax o1)                ; o2 may live in EAX
+           (i386-emit-mul-reg buf c)                  ; EDX:EAX = EAX * ECX
+           (i386-emit-mov-reg-reg buf c (if (= op +op-w32-mul+) eax d))
+           (when save (i386-emit-pop-reg buf eax))
+           (done)))
+        ((or (= op +op-w32-shl+) (= op +op-w32-shr+) (= op +op-w32-sar+)
+             (= op +op-w32-rotl+))
+         (i386-load-vreg buf c o1)
+         (unless (= o2 0)
+           (cond ((= op +op-w32-shl+) (i386-emit-shl-reg-imm buf c o2))
+                 ((= op +op-w32-shr+) (i386-emit-shr-reg-imm buf c o2))
+                 ((= op +op-w32-sar+) (i386-emit-sar-reg-imm buf c o2))
+                 (t                   (i386-emit-rol-reg-imm buf c o2))))
+         (done))
+        ((= op +op-w32-not+)      (i386-load-vreg buf c o1) (i386-emit-not-reg buf c) (done))
+        ((= op +op-w32-from-fix+) (i386-load-vreg buf c o1) (i386-emit-sar-reg-imm buf c 1) (done))
+        ((= op +op-w32-hi16+)
+         (i386-load-vreg buf c o1)
+         (i386-emit-shr-reg-imm buf c 16)
+         (i386-emit-shl-reg-imm buf c 1) (done))       ; tag
+        ((= op +op-w32-lo16+)
+         (i386-load-vreg buf c o1)
+         (i386-emit-shl-reg-imm buf c 16)
+         (i386-emit-shr-reg-imm buf c 15) (done))      ; lo<<1, tagged
+        ((= op +op-w32-join+)
+         ;; o1, o2 tagged fixnums 0..65535: (hi<<1)<<15 | (lo<<1)>>1
+         (two)
+         (i386-emit-shl-reg-imm buf c 15)
+         (i386-emit-shr-reg-imm buf d 1)
+         (i386-emit-or-reg-reg buf c d) (done))
+        ((or (= op +op-w32-ltu+) (= op +op-w32-lts+) (= op +op-w32-eq+))
+         (two)
+         (i386-emit-cmp-reg-reg buf c d)               ; flags = ECX - EDX
+         ;; MOV ECX, 0 as B9 imm32 -- not XOR, which would clobber the flags
+         (i386-emit-byte buf #xB9) (dotimes (k 4) (i386-emit-byte buf 0))
+         ;; SETB / SETL / SETE CL
+         (i386-emit-byte buf #x0F)
+         (i386-emit-byte buf (cond ((= op +op-w32-ltu+) #x92)
+                                   ((= op +op-w32-lts+) #x9C)
+                                   (t #x94)))
+         (i386-emit-byte buf (i386-modrm #b11 0 c))
+         (i386-emit-shl-reg-imm buf c 1)                ; tagged 1 / 0
+         (done))
+        (t
+         (two)
+         (cond ((= op +op-w32-add+) (i386-emit-add-reg-reg buf c d))
+               ((= op +op-w32-sub+) (i386-emit-sub-reg-reg buf c d))
+               ((= op +op-w32-and+) (i386-emit-and-reg-reg buf c d))
+               ((= op +op-w32-or+)  (i386-emit-or-reg-reg buf c d))
+               (t                   (i386-emit-xor-reg-reg buf c d)))
+         (done))))))
+
 (defun i386-translate-insn (state opcode operands mvm-next-pos)
   "Translate one MVM instruction to i386 native code.
    OPCODE: numeric MVM opcode.
@@ -3622,6 +3712,15 @@
            (i386-emit-imul-reg-reg buf +scratch0+ +scratch1+)
            ;; Result is already correctly tagged (a * (b<<1) = (a*b)<<1)
            (i386-store-vreg buf vd +scratch0+)))
+
+        ;; ---- W32 (docs/w32.md): see I386-TRANSLATE-W32 ----
+        ((member opcode (list +op-w32-li+ +op-w32-add+ +op-w32-sub+ +op-w32-mul+ +op-w32-mulhu+
+                          +op-w32-and+ +op-w32-or+ +op-w32-xor+ +op-w32-not+
+                          +op-w32-shl+ +op-w32-shr+ +op-w32-sar+ +op-w32-rotl+
+                          +op-w32-ltu+ +op-w32-lts+ +op-w32-eq+ +op-w32-from-fix+
+                          +op-w32-hi16+ +op-w32-lo16+ +op-w32-join+ +op-w32-load+
+                          +op-w32-store+))
+         (i386-translate-w32 buf opcode (first operands) (second operands) (third operands)))
 
         ((op= +op-mul26lo+)
          ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged

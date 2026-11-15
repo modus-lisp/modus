@@ -2473,6 +2473,14 @@
              (arm32-load-imm32 buf +arm-r12+ offset)
              (arm32-str buf ps +arm-r12+ 0))))
 
+        ;; ---- W32 (docs/w32.md): see ARM32-TRANSLATE-W32 ----
+        ((#.+op-w32-li+ #.+op-w32-add+ #.+op-w32-sub+ #.+op-w32-mul+ #.+op-w32-mulhu+
+          #.+op-w32-and+ #.+op-w32-or+ #.+op-w32-xor+ #.+op-w32-not+
+          #.+op-w32-shl+ #.+op-w32-shr+ #.+op-w32-sar+ #.+op-w32-rotl+
+          #.+op-w32-ltu+ #.+op-w32-lts+ #.+op-w32-eq+ #.+op-w32-from-fix+
+          #.+op-w32-hi16+ #.+op-w32-lo16+ #.+op-w32-join+ #.+op-w32-load+ #.+op-w32-store+)
+         (arm32-translate-w32 buf opcode (vreg 0) (vreg 1) (vreg 2)))
+
         (#.+op-mul26lo+
          ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
          ;; Uses UMULL for 32x32→64 unsigned multiply, extracts low 26 bits.
@@ -2750,6 +2758,86 @@
            (arm32-emit buf (logior #xE7F000F0
                                    (ash (logand (ash opcode -4) #xFFF) 8)
                                    (logand opcode #xF)))))))))
+
+;;; ============================================================
+;;; W32: native 32-bit words (docs/w32.md, spec 4.4)
+;;; ============================================================
+;;; A W32 operand is the raw word in a 32-bit register, so every op is one or
+;;; two ARM instructions.  Scratch: r12 and lr (ARM32-RESOLVE-SRC loads a
+;;; spilled vreg into the scratch it is given); results go through r12.  The
+;;; two multiplies take a third register by PUSHing r4, as MUL26LO/HI do, so
+;;; MUL's and UMULL's destinations never overlap a source on any architecture
+;;; version (pre-v6 forbids it).  Shift counts are 0..31 (the compiler
+;;; guarantees it); a count of 0 is a MOV, because LSR/ASR #0 encode #32 and
+;;; ROR #0 encodes RRX.
+(defun arm32-translate-w32 (buf op o0 o1 o2)
+  (let ((r12 +arm-r12+) (lr +arm-lr+))
+    (flet ((done () (arm32-store-vreg buf r12 o0)))
+      (cond
+        ((= op +op-w32-li+)
+         (arm32-load-imm32 buf r12 o1) (done))
+        ((= op +op-w32-load+)
+         (let ((pa (arm32-resolve-src buf o1 r12)))
+           (arm32-ldr buf r12 pa o2) (done)))
+        ((= op +op-w32-store+)
+         ;; (w32-store Vaddr Vs off), Vaddr a RAW address
+         (let ((pa (arm32-resolve-src buf o0 r12)) (pb (arm32-resolve-src buf o1 lr)))
+           (arm32-str buf pb pa o2)))
+        ((or (= op +op-w32-mul+) (= op +op-w32-mulhu+))
+         (arm32-push buf (ash 1 4))                      ; PUSH {r4}
+         (arm32-load-vreg buf r12 o1)
+         (arm32-load-vreg buf 4 o2)
+         (if (= op +op-w32-mul+)
+             (arm32-mul buf lr 4 r12)                    ; lr = r4 * r12
+             (arm32-umull buf lr r12 4 r12))             ; r12:lr = r4 * r12
+         (when (= op +op-w32-mul+) (arm32-mov buf r12 lr))
+         (arm32-pop buf (ash 1 4))                       ; POP {r4}
+         (done))
+        ((or (= op +op-w32-shl+) (= op +op-w32-shr+) (= op +op-w32-sar+)
+             (= op +op-w32-rotl+))
+         (let ((pa (arm32-resolve-src buf o1 r12)) (n o2))
+           (cond ((= n 0) (arm32-mov buf r12 pa))
+                 ((= op +op-w32-shl+) (arm32-lsl-imm buf r12 pa n))
+                 ((= op +op-w32-shr+) (arm32-lsr-imm buf r12 pa n))
+                 ((= op +op-w32-sar+) (arm32-asr-imm buf r12 pa n))
+                 (t (arm32-dp-reg buf +arm-dp-mov+ r12 0 pa      ; ROR #(32-n)
+                                  :shift-type +arm-shift-ror+ :shift-amt (- 32 n))))
+           (done)))
+        ((or (= op +op-w32-not+) (= op +op-w32-from-fix+)
+             (= op +op-w32-hi16+) (= op +op-w32-lo16+))
+         (let ((pa (arm32-resolve-src buf o1 r12)))
+           (cond ((= op +op-w32-not+)      (arm32-mvn buf r12 pa))
+                 ((= op +op-w32-from-fix+) (arm32-asr-imm buf r12 pa 1))       ; untag
+                 ((= op +op-w32-hi16+)     (arm32-lsr-imm buf r12 pa 16)
+                                           (arm32-lsl-imm buf r12 r12 1))      ; tag
+                 (t                        (arm32-lsl-imm buf r12 pa 16)       ; lo16:
+                                           (arm32-lsr-imm buf r12 r12 15)))    ; lo<<1
+           (done)))
+        ((= op +op-w32-join+)
+         ;; o1, o2 tagged fixnums 0..65535: (hi<<1)<<15 | (lo<<1)>>1
+         (let ((pa (arm32-resolve-src buf o1 r12)))
+           (arm32-lsl-imm buf r12 pa 15)
+           (let ((pb (arm32-resolve-src buf o2 lr)))
+             (arm32-dp-reg buf +arm-dp-orr+ r12 r12 pb
+                           :shift-type +arm-shift-lsr+ :shift-amt 1)))
+         (done))
+        ((or (= op +op-w32-ltu+) (= op +op-w32-lts+) (= op +op-w32-eq+))
+         (let ((pa (arm32-resolve-src buf o1 r12)) (pb (arm32-resolve-src buf o2 lr)))
+           (arm32-cmp buf pa pb)
+           (arm32-mov-imm buf r12 0 0)                   ; MOV does not set flags
+           (arm32-mov-imm-cond buf (cond ((= op +op-w32-ltu+) +arm-cc-cc+)
+                                         ((= op +op-w32-lts+) +arm-cc-lt+)
+                                         (t +arm-cc-eq+))
+                               r12 0 2)                  ; tagged 1
+           (done)))
+        (t
+         (let ((pa (arm32-resolve-src buf o1 r12)) (pb (arm32-resolve-src buf o2 lr)))
+           (cond ((= op +op-w32-add+) (arm32-add buf r12 pa pb))
+                 ((= op +op-w32-sub+) (arm32-sub buf r12 pa pb))
+                 ((= op +op-w32-and+) (arm32-and-r buf r12 pa pb))
+                 ((= op +op-w32-or+)  (arm32-orr buf r12 pa pb))
+                 (t                   (arm32-eor buf r12 pa pb)))         ; xor
+           (done)))))))
 
 ;;; ============================================================
 ;;; Main Translation Entry Point

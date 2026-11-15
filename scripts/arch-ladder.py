@@ -41,7 +41,11 @@ MAGIC = 195948557          # 0x0BADF00D — fits a 30-bit fixnum
 #   arm32  raspi2b, whose RAM starts at 0; `virt' puts RAM at 0x40000000,
 #          out of reach of a 30-bit-fixnum tagged address.
 ARCHES = {
-  "i386":    ("i386",      "qemu-system-i386",    ["-m","256","-no-reboot"],                      0x00700000, 0x00700010),
+  # 512 MB, not 256: the fixed runtime block every image uses -- the multiple-
+  # values slots at #x10000090, which target.lisp calls ordinary RAM on i386 --
+  # starts at 256 MB, so with -m 256 it was not RAM at all (writes vanished,
+  # reads gave 0).  test/w32-rungs/w06-load-store stores there (docs/w32.md).
+  "i386":    ("i386",      "qemu-system-i386",    ["-m","512","-no-reboot"],                      0x00700000, 0x00700010),
   "x64":     ("x86-64",    "qemu-system-x86_64",  ["-m","512","-no-reboot"],                      0x00700000, 0x00700010),
   "aarch64": ("aarch64",   "qemu-system-aarch64", ["-machine","virt","-cpu","cortex-a57","-m","512","-semihosting"], 0x41000000, 0x41000010),
   "arm32":   ("armv7-rpi", "qemu-system-arm",     ["-M","raspi2b","-m","1G"],                     0x00800000, 0x00800010),

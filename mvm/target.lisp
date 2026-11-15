@@ -803,7 +803,7 @@
        :has-fpd (and (member (target-name target) '(:x86-64 :aarch64)) t)
        ;; W32 (docs/w32.md): the 32-bit ports whose translators implement every
        ;; W32 opcode.  ppc32 is not one (spec 5.3); no 64-bit target ever is (C1).
-       :w32-capable (and (member (target-name target) '(:i386 :riscv32 :arm32 :68k)) t)
+       :w32-capable (and (member (target-name target) '(:i386 :riscv32 :arm32 :armv7 :armv7-rpi :68k)) t)
        :mv-count-addr mvc :mv-values-addr mvv
        :tag-cons 1 :tag-function 3 :tag-object otag :tag-immediate 5
        :tag-forward 15 :t-value (+ page #x1000 otag) :nil-value (+ page 1)))))

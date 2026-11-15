@@ -94,69 +94,79 @@
     (setf (gethash l (m68k-buffer-labels buf)) (- addr base))
     l))
 
-(defun %n68-branch-targets (bc start end label-map)
-  "Labels for every branch target in [START, END), as translate-mvm-to-68k-1's
-   first pass makes them."
-  (let ((pc start))
+(defun %n68-decode (bc start end)
+  "The instructions in [START, END) of BC, each (PC OPCODE OPERANDS NEXT-PC):
+   decoded ONCE.  This list is the native tier's input -- what translating from
+   the compiler's IR, without bytecode, will produce instead."
+  (let ((pc start) (out nil))
     (loop while (< pc end)
-          do (let* ((d (decode-instruction bc pc))
-                    (operands (cadr d)) (new-pc (cddr d))
-                    (info (gethash (car d) *opcode-table*)))
-               (when info
-                 (let ((types (opcode-info-operands info)))
-                   (when (member :off32 types)
-                     (let ((target (+ new-pc (if (member :reg types) (second operands) (first operands)))))
-                       (unless (gethash target label-map)
-                         (setf (gethash target label-map) (mvm-make-label)))))))
-               (setq pc new-pc)))))
+          do (let ((d (decode-instruction bc pc)))
+               (push (list pc (car d) (cadr d) (cddr d)) out)
+               (setq pc (cddr d))))
+    (nreverse out)))
+
+(defun %n68-branch-targets (insns label-map)
+  "Labels for every branch target in INSNS, as translate-mvm-to-68k-1's first
+   pass makes them."
+  (dolist (i insns)
+    (let ((info (gethash (second i) *opcode-table*)))
+      (when info
+        (let ((types (opcode-info-operands info)) (operands (third i)))
+          (when (member :off32 types)
+            (let ((target (+ (fourth i) (if (member :reg types) (second operands) (first operands)))))
+              (unless (gethash target label-map)
+                (setf (gethash target label-map) (mvm-make-label))))))))))
 
 (defun %n68-emit-module (buf base bc fns fn-table rt)
   "Emit FNS' code into BUF; NIL (and *N68-WHY*) when a call cannot be resolved."
-  (let ((label-map (make-hash-table)) (entries nil) (stubs (make-hash-table)) (bad nil))
-    ;; every function's entry, and the branch targets inside it
+  (let ((label-map (make-hash-table)) (entries nil) (stubs (make-hash-table)) (bad nil)
+        (one (make-hash-table))                 ; a call's operand -> its label
+        (code nil))                             ; (fn . insns), decoded once
+    ;; every function's entry, its instructions, and the branch targets in them
     (dolist (f fns)
-      (let ((start (second f)))
+      (let* ((start (second f)) (insns (%n68-decode bc start (+ start (third f)))))
         (setf (gethash start label-map) (mvm-make-label))
-        (%n68-branch-targets bc start (+ start (third f)) label-map)))
+        (%n68-branch-targets insns label-map)
+        (push (cons f insns) code)))
+    (setq code (nreverse code))
     ;; in-module calls go to the callee's entry label: %T68-CALL-TARGET's STUBS
     (dolist (f fns) (setf (gethash (second f) stubs) (gethash (second f) label-map)))
     (let ((*68k-label-map* label-map) (*68k-bytecode* bc))
-      (dolist (f fns)
+      (dolist (c code)
         (unless bad
-          (let ((start (second f)) (end (+ (second f) (third f))))
+          (let ((f (car c)))
             ;; 16-aligned entries (translate-mvm-to-68k-1): FN-ADDR ORs in tag 3
             (m68k-word-align buf)
             (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-nop buf))
             (push (cons (first f) (m68k-buffer-position buf)) entries)
-            (let ((pc start))
-              (loop while (and (< pc end) (not bad))
-                    do (let* ((d (decode-instruction bc pc))
-                              (op (car d)) (operands (cadr d)) (new-pc (cddr d))
-                              (l (gethash pc label-map)))
-                         (setq *n68-at* (list pc op operands))
-                         (when l (m68k-emit-label buf l))
-                         (cond
-                           ;; a call / tail call / function address: resolve the
-                           ;; operand as the threaded JIT does; an in-module
-                           ;; target is its entry label, any other an absolute one
-                           ((or (= op +op-call+) (= op +op-tailcall+) (= op +op-fn-addr+))
-                            (let* ((k (if (= op +op-fn-addr+) 1 0))
-                                   (operand (nth k operands))
-                                   (tgt (if (and (= op +op-fn-addr+) (= operand #xFFFFFFF0))
-                                            :undefined
-                                            (%n68-call-label buf base operand rt fn-table stubs))))
-                              (if (null tgt)
-                                  (setq bad t)
-                                  (let ((lm (make-hash-table)))
-                                    (unless (eq tgt :undefined) (setf (gethash operand lm) tgt))
-                                    (m68k-translate-insn buf op operands new-pc lm nil)))))
-                           ;; a constant: its object from the pool index's cell
-                           ((= op +op-li-const+)
-                            (m68k-emit-word buf #x2039)               ; MOVE.L abs.L,D0
-                            (m68k-emit-long buf (%t68-cell (second operands)))
-                            (m68k-store-vreg buf (first operands) +68k-d0+))
-                           (t (m68k-translate-insn buf op operands new-pc label-map nil)))
-                         (setq pc new-pc))))))))
+            (dolist (i (cdr c))
+              (unless bad
+                (let* ((pc (first i)) (op (second i)) (operands (third i)) (new-pc (fourth i))
+                       (l (gethash pc label-map)))
+                  (setq *n68-at* i)
+                  (when l (m68k-emit-label buf l))
+                  (cond
+                    ;; a call / tail call / function address: resolve the
+                    ;; operand as the threaded JIT does; an in-module target is
+                    ;; its entry label, any other an absolute one
+                    ((or (= op +op-call+) (= op +op-tailcall+) (= op +op-fn-addr+))
+                     (let* ((k (if (= op +op-fn-addr+) 1 0))
+                            (operand (nth k operands))
+                            (tgt (if (and (= op +op-fn-addr+) (= operand #xFFFFFFF0))
+                                     :undefined
+                                     (%n68-call-label buf base operand rt fn-table stubs))))
+                       (if (null tgt)
+                           (setq bad t)
+                           (progn
+                             (clrhash one)
+                             (unless (eq tgt :undefined) (setf (gethash operand one) tgt))
+                             (m68k-translate-insn buf op operands new-pc one nil)))))
+                    ;; a constant: its object from the pool index's cell
+                    ((= op +op-li-const+)
+                     (m68k-emit-word buf #x2039)               ; MOVE.L abs.L,D0
+                     (m68k-emit-long buf (%t68-cell (second operands)))
+                     (m68k-store-vreg buf (first operands) +68k-d0+))
+                    (t (m68k-translate-insn buf op operands new-pc label-map nil))))))))))
     (if bad nil (nreverse entries))))
 
 (defun %n68-call-label (buf base operand rt fn-table stubs)

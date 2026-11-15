@@ -715,6 +715,7 @@ struct NativeRow {
     let italic: Bool                             // :ITALIC -- the title in italics (a symlink)
     let strong: String?                          // :STRONG -- the start of the title, as a title is; the rest diminished
     let trim: String?                            // :TRIM -- a path ending the subtitle, cut from the front to fit
+    let actions: [NativeAction]?                 // :ACTIONS -- its own swipe actions, for the table's (app_table_actions)
     let dot: UIColor?
     let menu: [(id: Int, title: String, image: String?, destructive: Bool)]
 
@@ -732,59 +733,75 @@ final class NativeCell: UITableViewCell {
     var trimHead: String?                        // the subtitle before the path ("epyc  ·  ")
     var trimPath: String?                        // the path, whole
 
-    private var trimmedFor = CGSize.zero         // the width (and text size) the path was cut for
+    // how many folders come off a path's front, by subtitle, width and text size: found as rows are laid out,
+    // and given at once when the row is drawn again
+    private static var cuts: [String: Int] = [:]
+    private static func key(_ head: String, _ path: String, _ width: CGFloat, _ size: CGFloat) -> String {
+        "\(head)|\(path)|\(Int(width))|\(size)"
+    }
+
+    /// HEAD and PATH as shown: whole, or "…/" and the folders left once DROPPED have come off the front.
+    static func shown(_ head: String, _ path: String, dropped: Int) -> String {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
+        guard dropped > 0, !parts.isEmpty else { return head + path }
+        return head + "…/" + parts[min(dropped, parts.count - 1)...].joined(separator: "/")
+    }
+
+    /// The subtitle for HEAD and PATH as last found to fit WIDTH at text SIZE (whole, if not yet found).
+    static func cut(_ head: String, _ path: String, width: CGFloat, size: CGFloat) -> String {
+        shown(head, path, dropped: cuts[key(head, path, width, size)] ?? 0)
+    }
 
     override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
         super.init(style: style, reuseIdentifier: reuseIdentifier)
-        // a new text size: the whole path back, and cut again for it
         registerForTraitChanges([UITraitPreferredContentSizeCategory.self]) { (cell: NativeCell, _: UITraitCollection) in
-            guard let head = cell.trimHead, let path = cell.trimPath,
-                  let label = cell.secondaryLabel(in: cell.contentView, head: head) else { return }
-            NativeCell.retext(label, head + path)
-            cell.trimmedFor = .zero
             cell.setNeedsLayout()
         }
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        guard let head = trimHead, let path = trimPath,
-              let label = secondaryLabel(in: contentView, head: head) else { return }
-        let whole = head + path
-        // a new width (a turn of the phone) or text size: the whole path again, measured on the next pass
-        let key = CGSize(width: contentView.bounds.width, height: label.font.pointSize)
-        if key != trimmedFor, label.text != whole {
-            NativeCell.retext(label, whole)
-            trimmedFor = .zero
-            setNeedsLayout()
-            return
-        }
-        // measured only while the label holds it all: wrapped, a label is as wide as its line can be -- and once
-        // it has been laid out (the content view lays its labels out after the cell: until then, no width)
-        guard label.text == whole else { return }
-        contentView.layoutIfNeeded()
-        guard label.bounds.width > 0 else { return }
-        // the label's own attributes (its text is set as attributed text: its FONT is not what it draws in)
-        let attrs = label.attributedText.flatMap { $0.length > 0 ? $0.attributes(at: 0, effectiveRange: nil) : nil }
-            ?? [.font: label.font as Any]
-        // within a point: a label that fits its text is that text's width, give or take a rounding
-        func fits(_ s: String) -> Bool { (s as NSString).size(withAttributes: attrs).width <= label.bounds.width + 1 }
-        trimmedFor = key
-        guard !fits(whole) else { return }
-        let parts = path.split(separator: "/", omittingEmptySubsequences: true)
-        var text = head + "…/" + (parts.last.map(String.init) ?? path)    // the last folder, if nothing more fits
-        for k in 1..<max(1, parts.count) {
-            let candidate = head + "…/" + parts[k...].joined(separator: "/")
-            if fits(candidate) { text = candidate; break }
-        }
-        label.attributedText = NSAttributedString(string: text, attributes: attrs)
+    private var table: UITableView? {
+        var v = superview
+        while let x = v, !(x is UITableView) { v = x.superview }
+        return v as? UITableView
     }
 
-    /// LABEL's text made TEXT, in the attributes it has (its plain TEXT would take its FONT, which it does not use).
-    static func retext(_ label: UILabel, _ text: String) {
-        let attrs = label.attributedText.flatMap { $0.length > 0 ? $0.attributes(at: 0, effectiveRange: nil) : nil }
-        label.attributedText = NSAttributedString(string: text, attributes: attrs ?? [.font: label.font as Any])
+    // CUT AS IT IS LAID OUT -- a label's width is not known until the cell's other parts (a dot, a chevron) have
+    // taken theirs: the subtitle given through the cell's configuration (the label laid out afresh, the row its
+    // new height), and while it takes more than one line, a folder more off the front, until it fits or only the
+    // last is left
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let head = trimHead, let path = trimPath, var content = contentConfiguration as? UIListContentConfiguration,
+              let table, let label = secondaryLabel(in: contentView, head: head) else { return }
+        let font = (label.attributedText.flatMap { $0.length > 0 ? $0.attribute(.font, at: 0, effectiveRange: nil) : nil }
+                    as? UIFont) ?? label.font ?? UIFont.preferredFont(forTextStyle: .subheadline)
+        let key = NativeCell.key(head, path, table.bounds.width, font.pointSize)
+        let dropped = NativeCell.cuts[key] ?? 0
+        let text = NativeCell.shown(head, path, dropped: dropped)
+        if content.secondaryText != text {
+            content.secondaryText = text
+            contentConfiguration = content
+            NativeCell.resize(table)
+            return
+        }
+        contentView.layoutIfNeeded()
+        let folders = path.split(separator: "/", omittingEmptySubsequences: true).count
+        if label.bounds.height > font.lineHeight * 1.5, dropped < folders - 1 {
+            NativeCell.cuts[key] = dropped + 1
+            setNeedsLayout()
+        }
+    }
+
+    /// TABLE's rows measured again, once, after this pass: a subtitle cut to one line makes its row shorter.
+    private static var resizing = false
+    private static func resize(_ table: UITableView) {
+        guard !resizing else { return }
+        resizing = true
+        DispatchQueue.main.async {
+            resizing = false
+            UIView.performWithoutAnimation { table.performBatchUpdates(nil) }
+        }
     }
 
     /// The label showing the subtitle: the one whose text starts with HEAD.
@@ -1369,6 +1386,9 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
             if let trim = row.trim, let sub = row.subtitle, sub.hasSuffix(trim), sub.count > trim.count {
                 cell.trimHead = String(sub.dropLast(trim.count))
                 cell.trimPath = trim
+                // as last found to fit: the row drawn at its height at once
+                content.secondaryText = NativeCell.cut(cell.trimHead!, trim, width: tableView.bounds.width,
+                                                       size: content.secondaryTextProperties.font.pointSize)
             } else {
                 cell.trimHead = nil
                 cell.trimPath = nil
@@ -1459,8 +1479,11 @@ final class NativeTable: NSObject, UITableViewDataSource, UITableViewDelegate, U
 
     func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath)
         -> UISwipeActionsConfiguration? {
+        // the row's own actions, else the table's -- a ROWACTION with the action's place among them
+        let shown = groups[indexPath.section].rows[indexPath.row]
+        let actions = shown.actions ?? self.actions
         guard !actions.isEmpty else { return nil }
-        let row = groups[indexPath.section].rows[indexPath.row].index
+        let row = shown.index
         let items = actions.enumerated().map { i, a in
             let action = UIContextualAction(style: a.destructive ? .destructive : .normal, title: a.title) { _, _, done in
                 send("ROWACTION", [.int(Int(self.handle)), .list([.int(i), .int(row)])])
@@ -2403,7 +2426,7 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
 
     // MARK: the preview
 
-    enum PreviewKind: UInt { case quickLook = 0, text = 1, image = 2, hex = 3, markdown = 4 }
+    enum PreviewKind: UInt { case quickLook = 0, text = 1, image = 2, hex = 3, markdown = 4, log = 5 }
     var hexTotal: Int64 = 0
 
     func showPreview(_ url: URL, name: String, kind: PreviewKind) {
@@ -2413,7 +2436,7 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
         shelfName.text = name
         previewTable = pages.last?.table
         if let t = previewTable { tables[t]?.mark(true) }
-        textView.isHidden = kind != .text && kind != .markdown
+        textView.isHidden = kind != .text && kind != .markdown && kind != .log
         imageViewer.isHidden = kind != .image
         hexView.isHidden = kind != .hex
         ql.view.isHidden = kind != .quickLook
@@ -2438,6 +2461,20 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
             textView.textColor = .label
             textView.text = readText(url)
             textView.setContentOffset(CGPoint(x: 0, y: -textView.adjustedContentInset.top), animated: false)
+        case .log:
+            // output as it comes: its end, and kept in view as it grows -- unless scrolled up to read
+            let following = opening || textView.text.isEmpty
+                || textView.contentOffset.y + textView.bounds.height >= textView.contentSize.height - 40
+            textView.textContainerInset = UIEdgeInsets(top: 12, left: 10, bottom: 24, right: 10)
+            textView.font = .monospacedSystemFont(ofSize: 12.5, weight: .regular)
+            textView.textColor = .label
+            textView.text = readText(url, tail: true)
+            if following {
+                textView.layoutIfNeeded()
+                let bottom = max(-textView.adjustedContentInset.top,
+                                 textView.contentSize.height - textView.bounds.height + textView.adjustedContentInset.bottom)
+                textView.setContentOffset(CGPoint(x: 0, y: bottom), animated: false)
+            }
         case .image:
             imageViewer.image = UIImage(contentsOfFile: url.path)
         case .quickLook:
@@ -2470,9 +2507,12 @@ final class NativeBrowser: NSObject, QLPreviewControllerDataSource, QLPreviewCon
     }
 
     /// A text file's contents to show: UTF-8 (Latin-1 if it is not), the first 2 MB.
-    func readText(_ url: URL) -> String {
+    func readText(_ url: URL, tail: Bool = false) -> String {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
         defer { try? handle.close() }
+        // TAIL: its last 2 MB (a program's output: what it says last matters most)
+        if tail, let end = try? handle.seekToEnd(), end > 2_000_000 { try? handle.seek(toOffset: end - 2_000_000) }
+        else if tail { try? handle.seek(toOffset: 0) }
         let data = (try? handle.read(upToCount: 2_000_000)) ?? Data()
         return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
     }
@@ -2880,6 +2920,13 @@ private func nativeRow(_ item: Term, _ index: Int) -> NativeRow {
                      bar: { if case .int(let b)? = m["BAR"] { return Double(min(1000, max(0, b))) / 1000 }; return nil }(),
                      button: str(m["BUTTON"]), italic: flag(m["ITALIC"]),
                      strong: str(m["STRONG"]), trim: str(m["TRIM"]),
+                     actions: m["ACTIONS"].map { list in
+                         (list.listItems ?? []).map { item in
+                             let a = plist(item)
+                             return NativeAction(title: str(a["TITLE"]) ?? "", destructive: flag(a["DESTRUCTIVE"]),
+                                                 tint: color(a["TINT"]))
+                         }
+                     },
                      dot: color(m["DOT"]),
                      menu: (m["MENU"]?.listItems ?? []).compactMap { item in
                          let a = plist(item)

@@ -14,6 +14,7 @@
 # to name one, or list the arguments one per line in a bundled modus.args.
 # MODUS_CORE=FILE puts a snapshot's compiled code in the app (image-segments.sh).
 # MODUS_IOS_ROTATES=1: the app turns with the phone (portrait and both landscapes); otherwise iOS's default.
+# MODUS_IOS_ICON=PNG: the app's icon, 1024x1024, square (iOS rounds it); MODUS_IOS_ICON_DARK=PNG its dark one.
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -111,6 +112,28 @@ $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
   <key>CFBundleSupportedPlatforms</key><array><string>$( [ $KIND = sim ] && echo iPhoneSimulator || echo iPhoneOS )</string></array>
 </dict></plist>
 PLIST
+# THE ICON: an asset catalog of one 1024-point image (and its dark one), compiled as Xcode compiles it --
+# Assets.car and the icon's keys, which go into the Info.plist
+if [ -n "${MODUS_IOS_ICON:-}" ]; then
+  SET=$OBJS/Assets.xcassets/AppIcon.appiconset
+  mkdir -p "$SET"
+  cp "$MODUS_IOS_ICON" "$SET/icon.png"
+  DARK=""
+  if [ -n "${MODUS_IOS_ICON_DARK:-}" ]; then
+    cp "$MODUS_IOS_ICON_DARK" "$SET/icon-dark.png"
+    DARK=',{"filename":"icon-dark.png","idiom":"universal","platform":"ios","size":"1024x1024",
+            "appearances":[{"appearance":"luminosity","value":"dark"}]}'
+  fi
+  cat > "$SET/Contents.json" <<JSON
+{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}$DARK],
+ "info":{"author":"xcode","version":1}}
+JSON
+  echo '{"info":{"author":"xcode","version":1}}' > "$OBJS/Assets.xcassets/Contents.json"
+  xcrun actool --compile "$OUT" --platform $SDKN --minimum-deployment-target 18.0 \
+    --target-device iphone --target-device ipad --app-icon AppIcon \
+    --output-partial-info-plist "$OBJS/icon.plist" "$OBJS/Assets.xcassets" > "$OBJS/actool.log"
+  /usr/libexec/PlistBuddy -c "Merge $OBJS/icon.plist" "$OUT/Info.plist" > /dev/null
+fi
 for f in ${MODUS_IOS_FILES:-}; do cp -R "$f" "$OUT/"; done
 if [ -n "$PROFILE" ]; then cp "$PROFILE" "$OUT/embedded.mobileprovision"; fi
 if [ -n "$IDENT" ]; then

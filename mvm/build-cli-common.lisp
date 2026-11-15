@@ -767,6 +767,82 @@
   t)
 ")))
 
+(defun %strip-global-inits (text)
+  "TEXT with every top-level (DEFVAR name INIT ...) / (DEFPARAMETER name INIT
+   ...) given NIL for INIT.  For host source baked into an image whose
+   KERNEL-MAIN runs every initform at boot: the native 68k tier bakes
+   translate-68k.lisp, whose initforms are the BUILD's (they read its
+   environment, build its tables, hold its code vectors), and with them in the
+   image the REPL's globals table was corrupt at the first prompt (bisected:
+   the translator alone does it).  Its configuration comes from %N68-COINIT."
+  (let ((out (make-string-output-stream)) (i 0) (n (length text)))
+    (labels ((skip-ws (j)
+               ;; past whitespace and ; comments
+               (loop
+                 (cond ((>= j n) (return j))
+                       ((member (char text j) '(#\Space #\Tab #\Newline #\Return)) (incf j))
+                       ((char= (char text j) #\;)
+                        (loop while (and (< j n) (char/= (char text j) #\Newline)) do (incf j)))
+                       (t (return j)))))
+             (skip-form (j)
+               ;; index just past the form starting at J (after whitespace and comments)
+               (setq j (skip-ws j))
+               (let ((depth 0))
+                 (loop
+                   (when (>= j n) (return j))
+                   (let ((c (char text j)))
+                     (cond
+                       ((char= c #\") (incf j)
+                        (loop while (and (< j n) (char/= (char text j) #\"))
+                              do (incf j (if (char= (char text j) #\\) 2 1)))
+                        (incf j))
+                       ((char= c #\;) (loop while (and (< j n) (char/= (char text j) #\Newline)) do (incf j)))
+                       ((and (char= c #\#) (< (1+ j) n) (char= (char text (1+ j)) #\\)) (incf j 3))
+                       ((char= c #\() (incf depth) (incf j))
+                       ;; a ) at depth 0 closes the DEFVAR, not this form
+                       ((char= c #\)) (when (zerop depth) (return j))
+                        (decf depth) (incf j) (when (zerop depth) (return j)))
+                       ((and (zerop depth) (member c '(#\Space #\Tab #\Newline #\Return))) (return j))
+                       (t (incf j))))))))
+      (loop
+        (let ((p (let ((a (search (format nil "~%(defvar ") text :start2 i))
+                       (b (search (format nil "~%(defparameter ") text :start2 i)))
+                   (if (and a b) (min a b) (or a b)))))
+          (unless p (write-string text out :start i) (return))
+          (let* ((head-end (+ p 1 (if (string= "(defvar " text :start2 (1+ p) :end2 (+ p 9)) 8 14)))
+                 (name-end (skip-form head-end))
+                 (k (skip-ws name-end)))
+            (if (or (>= k n) (char= (char text k) #\)))
+                ;; (defvar name) -- no initform
+                (progn (write-string text out :start i :end name-end) (setq i name-end))
+                (let ((init-end (skip-form name-end)))
+                  (write-string text out :start i :end name-end)
+                  (write-string " nil" out)
+                  (setq i init-end)))))))
+    (get-output-stream-string out)))
+
+;;; THE NATIVE 68K TIER (mvm/jit-68k-native.lisp): a runtime DEFUN translated by
+;;; the image's own emitter, translate-68k.lisp, baked here for every 68k image
+;;; with the threaded JIT (MODUS_68K_JIT=1; jit-68k.lisp tries it first).
+;;; MODUS_68K_NATIVE=0 leaves it out.  The translator's DEFVARs carry the BUILD's
+;;; values (its environment, its tables) and an image runs every initform at
+;;; boot, so they are stripped and the calls to SB-EXT:POSIX-GETENV pointed at a
+;;; stand-in; the emitter's settings are filled in when BUILD-IMAGE compiles,
+;;; after the target is configured (cross.lisp LATE-SOURCE-FILL).
+(defun %68k-native-tier-p ()
+  (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+       (not (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "0"))))
+
+(defun %68k-native-tier-source ()
+  (pushnew (cons "'(:n68-coinit :pending)" 'modus.mvm::m68k-native-coinit-text)
+           modus.mvm::*late-source-fills* :test #'equal)
+  (let ((tr (mvm-text "mvm/translate-68k.lisp")) (old "(sb-ext:posix-getenv "))
+    (loop for p = (search old tr) while p
+          do (setq tr (concatenate 'string (subseq tr 0 p) "(%n68-no-getenv "
+                                   (subseq tr (+ p (length old))))))
+    (concatenate 'string (%strip-global-inits tr) (string #\Newline)
+                 (mvm-text "mvm/jit-68k-native.lisp") (string #\Newline))))
+
 ;;; The assembled translator slot, spliced into *all-runtime-source* and
 ;;; *full-source* as ONE unit.  Both arches: <encoder?> <translator> <co-init>,
 ;;; each followed by a newline — byte-identical on x64 to the three separate
@@ -785,6 +861,7 @@
        (or *aarch64-jit-coinit-source* "") (string #\Newline)))
     ;; i386: no in-image JIT translator — see the *JIT-ON* comment above.
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
+    ((%68k-native-tier-p) (%68k-native-tier-source))
     ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
                (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"

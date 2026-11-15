@@ -590,7 +590,7 @@
    M's functions as native code, or NIL with the reason in *N68-REFUSED*."
   (unless (and (boundp (quote *n68-off*)) *n68-off*)
     (let ((r (handler-case (%n68-translate m)
-               (error (c) (setq *n68-why* (list :error (princ-to-string c))) nil))))
+               (error (c) (setq *n68-why* (list :error (princ-to-string c) :at *n68-at*)) nil))))
       (if r
           (setq *n68-translated* (+ *n68-translated* 1))
           (setq *n68-refused* (cons (cons (car names) *n68-why*) *n68-refused*)))

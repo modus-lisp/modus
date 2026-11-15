@@ -6313,7 +6313,7 @@
                      "*68K-PAGED-LAYOUT*" "*68K-PAGED-TABLE-REFS*" "*68K-BYTECODE*"
                      "*68K-LABEL-MAP*" "*68K-SKIP-TO*" "*68K-UNIMPL-OPCODES*" "*68K-THREAD-WHY*"
                      "*68K-JIT-SHAPES*" "*68K-JIT-INDEXED*" "*68K-THREAD-SHAPES*"
-                     "*68K-HOT-NAMES*" "*68K-THREADED*" "*68K-NATIVE-P*" "*68K-PROFILE*")
+                     "*68K-HOT-NAMES*" "*68K-NATIVE-P*" "*68K-PROFILE*")
               :test #'string=)))
 
 (defun m68k-native-dumpable-p (v)
@@ -6351,7 +6351,12 @@
                    (or (eql 0 (search "*68K-" n)) (eql 0 (search "*CONV-" n)))
                    (char= (char n (1- (length n))) #\*)
                    (not (m68k-native-state-name-p n)))
-          (let ((f (let ((*package* pkg)) (m68k-native-value-form (symbol-value s)))))
+          (let ((f (if (string= n "*68K-THREADED*")
+                       ;; a hash of the functions kept native; the emitter asks
+                       ;; only WHETHER the image is threaded (a handler frame
+                       ;; then holds the token pointer too: 8 words, not 7)
+                       (if (symbol-value s) "':all" "'nil")
+                       (let ((*package* pkg)) (m68k-native-value-form (symbol-value s))))))
             (if f (push (cons n f) forms) (push n skipped))))))
     (setq forms (sort forms #'string< :key #'car))
     (format t "~&;; 68k native tier: ~D emitter settings carried into the image~@[; not data: ~{~A~^ ~}~]~%"

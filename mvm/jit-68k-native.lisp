@@ -39,6 +39,7 @@
 (defvar *n68-ready* nil)
 (defvar *n68-exports* nil "Image routine addresses, M68K-NATIVE-EXPORT-LABELS' order (NIL: none).")
 (defvar *n68-why* nil "Why the last module was not translated natively.")
+(defvar *n68-at* nil "The instruction being translated: (PC OPCODE OPERANDS), for a refusal's report.")
 (defvar *n68-translated* 0 "CENSUS: modules translated natively.")
 (defvar *n68-refused* nil "CENSUS: (name . why), newest first.")
 
@@ -132,6 +133,7 @@
                     do (let* ((d (decode-instruction bc pc))
                               (op (car d)) (operands (cadr d)) (new-pc (cddr d))
                               (l (gethash pc label-map)))
+                         (setq *n68-at* (list pc op operands))
                          (when l (m68k-emit-label buf l))
                          (cond
                            ;; a call / tail call / function address: resolve the
@@ -160,7 +162,8 @@
 (defun %n68-call-label (buf base operand rt fn-table stubs)
   "The label a call operand names: an entry label of this module, or a label
    at the absolute address of an image / earlier runtime function."
-  (if (and (not (%t68-small-p operand)) (>= operand +t68-rt-base+))
+  (if (and (not (%t68-small-p operand)) (>= operand #x40000000))   ; jit-68k +T68-RT-BASE+, defined after this file: a
+                                                 ; constant folds only once seen
       (let ((a (%t68-call-target operand rt fn-table stubs)))
         (setq *n68-why* *t68-why*)
         (and a (%n68-abs-label buf base a)))
@@ -182,7 +185,10 @@
          (buf (make-m68k-buffer :words (make-array 1024) :labels (make-hash-table)))
          (x *n68-exports*)
          (entries nil))
-    (let ((*68k-native-p* t) (*68k-threaded* nil) (*68k-cold-fns* nil) (*68k-profile* nil)
+    ;; *68K-THREADED* stays the IMAGE's: native code in a threaded image builds
+    ;; the image's 8-word handler frames (with the token pointer), as its hot
+    ;; native functions do.  No function is cold here (*68K-COLD-FNS* NIL).
+    (let ((*68k-native-p* t) (*68k-cold-fns* nil) (*68k-profile* nil)
           (*68k-paged* nil) (*68k-skip-to* nil)
           (*68k-branch-plan* nil) (*68k-branch-ordinal* 0) (*68k-branch-distances* nil)
           (*68k-fn-entry-positions* nil) (*68k-abs-patches* nil) (*68k-li-const-patches* nil)

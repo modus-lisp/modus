@@ -1057,12 +1057,46 @@
 ;;; Instruction Encoding Functions
 ;;; ============================================================
 
+;;; THE INSTRUCTION SINK.  A back end that translates a module as it is compiled
+;;; (the native 68k tier, mvm/jit-68k-native.lisp) needs each instruction as
+;;; DECODE-INSTRUCTION would return it -- (PC OPCODE OPERANDS . NEXT-PC) -- and
+;;; decoding the bytecode the compiler has just encoded is pure overhead, with
+;;; bignums on a 30-bit tower for every 32- and 64-bit immediate.  While
+;;; *INSN-SINK* is a cons, ENCODE-INSTRUCTION and MVM-LI-HALVES also push each
+;;; instruction onto its CDR as (PC OPCODE OPERANDS NEXT-PC), operands
+;;; normalised as the decoder reads them back.  NIL (the default, and every build): no cost but the test.
+(defvar *insn-sink* nil)
+
+(defun %insn-norm (type v)
+  "V as DECODE-INSTRUCTION-MV returns an operand of TYPE once encoded."
+  (case type
+    (:reg (logand v #x1F))
+    ((:imm8 :width) (logand v #xFF))
+    (:imm16 (logand v #xFFFF))
+    ;; the common case first: already in range, no arithmetic (no bignum)
+    (:imm32 (if (and (>= v 0) (< v 536870912)) v (mod v 4294967296)))
+    (:imm64 (if (and (>= v 0) (< v 536870912)) v (mod v 18446744073709551616)))
+    (t v)))                                ; :off32 -- the decoder's signed value
+
+(defun %insn-sink-add (pos opcode spec operands next)
+  (let ((norm nil))
+    (loop for op-type in spec for op-val in operands
+          do (push (%insn-norm op-type op-val) norm))
+    (rplacd *insn-sink* (cons (list pos opcode (nreverse norm) next) (cdr *insn-sink*)))))
+
 (defun encode-instruction (buf opcode &rest operands)
   "Encode an MVM instruction into the bytecode buffer.
    OPCODE is the numeric opcode. OPERANDS are the raw values
    matching the opcode's operand specification."
   (let* ((info (gethash opcode *opcode-table*))
-         (spec (if info (opcode-info-operands info) nil)))
+         (spec (if info (opcode-info-operands info) nil))
+         (pos (and *insn-sink* (mvm-buffer-position buf))))
+    (when pos
+      ;; the bytes below advance the buffer by the spec's sizes
+      (%insn-sink-add pos opcode spec operands
+                      (+ pos 1 (loop for ty in spec
+                                     sum (case ty ((:reg :imm8 :width) 1) (:imm16 2)
+                                           ((:imm32 :off32) 4) (:imm64 8) (t 0))))))
     (mvm-emit-byte buf opcode)
     (loop for op-type in spec
           for op-val in operands
@@ -1249,6 +1283,15 @@
    integer — which overflows the in-image 62-bit fixnum range (and triggers
    lossy bignum-word arithmetic) for |value| >= 2^61.  See compiler.lisp
    emit-li-tagged."
+  (when *insn-sink*
+    ;; the decoder's value: lo | hi << 32 -- a bignum only when HI is not 0
+    (let* ((pos (mvm-buffer-position buf))
+           (lo (%insn-norm :imm32 lo32)) (hi (%insn-norm :imm32 hi32)))
+      (rplacd *insn-sink* (cons (list pos +op-li+
+                                      (list (logand vd #x1F)
+                                            (if (eql hi 0) lo (logior lo (ash hi 32))))
+                                      (+ pos 10))
+                                (cdr *insn-sink*)))))
   (mvm-emit-byte buf +op-li+)
   (mvm-emit-reg buf vd)
   (mvm-emit-u32 buf lo32)

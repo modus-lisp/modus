@@ -2453,6 +2453,14 @@
                  name)))
     (and *jit-source-links* (gethash key *jit-source-links*))))
 
+(defvar *jit-capture-insns* nil
+  "T: compile runtime modules with mvm.lisp's *INSN-SINK* on, so the module
+   carries its instructions already decoded (the native 68k tier turns it on).")
+(defvar *jit-last-insns* nil
+  "(BC . INSNS) of the last module emitted with the sink on: tied to its
+   bytecode vector, so a module registered from elsewhere (a cache) never
+   picks up another module's instructions.")
+
 (defun %jit-register-module (names bc entry ft-list fn-table rt-table lam-offsets)
   (%jit-note-source names)
   (when (and (boundp (quote *%load-depth*)) (eql *%load-depth* 1))
@@ -2462,7 +2470,11 @@
   (when (and (boundp (quote *jit-module-registry*)) (null *jit-module-registry*))
     (setq *jit-module-registry* (make-hash-table :test (function equal))))
   (when (boundp (quote *jit-module-registry*))
-    (let ((m (list bc entry ft-list fn-table rt-table lam-offsets names)))
+    (let ((m (list bc entry ft-list fn-table rt-table lam-offsets names
+                   ;; 7: the instructions, decoded, when this module was emitted
+                   ;; with the sink on (*JIT-CAPTURE-INSNS*)
+                   (and (consp *jit-last-insns*) (eq (car *jit-last-insns*) bc)
+                        (cdr *jit-last-insns*)))))
       (dolist (nm names) (puthash nm *jit-module-registry* m)))))
 
 (defun %jit-registered-p (name)
@@ -5177,13 +5189,23 @@
               (setf (gethash (- rt-next) rt-table) (cons nil 0))
               (setq rt-next (+ rt-next 1)))))))
     ;; Pass 2: emit (CALLs resolve to in-module OR synthetic offsets via *functions*).
-    (dolist (e all-ir)
-      (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
-        (emit-bytecode-for-ir buf ir lp)))
+    ;; With *JIT-CAPTURE-INSNS*, the encoder also hands back every instruction
+    ;; decoded (mvm.lisp *INSN-SINK*): SETQ, not LET -- a compiled LET of a
+    ;; special does not bind it in the image.
+    (setq *insn-sink* (and (boundp (quote *jit-capture-insns*)) *jit-capture-insns* (list :sink)))
+    (unwind-protect
+         (dolist (e all-ir)
+           (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
+             (emit-bytecode-for-ir buf ir lp)))
+      (setq *jit-last-insns* (and *insn-sink* (cons :pending (nreverse (cdr *insn-sink*)))))
+      (setq *insn-sink* nil))
     (dolist (e all-ir)
       (when (string-equal (string (function-info-name (car e))) "%MVM-EVAL-THUNK")
         (setq entry (function-info-bytecode-offset (car e)))))
     (let ((bc (mvm-buffer-used-bytes buf)))
+      ;; tie the captured instructions to THIS bytecode vector
+      (when (and (consp *jit-last-insns*) (eq (car *jit-last-insns*) :pending))
+        (rplaca *jit-last-insns* bc))
       (if entry
           (let ((fn-table (make-array (length all-ir))) (i 0)
                 ;; LAMBDA-OFFSETS: the bytecode entry offsets of in-module LAMBDA /

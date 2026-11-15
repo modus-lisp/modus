@@ -84,6 +84,8 @@
     ;; the emitter's labels come from MVM-MAKE-LABEL's counter, a DEFVAR whose
     ;; initial value never ran here
     (unless (integerp *mvm-label-counter*) (setq *mvm-label-counter* 0))
+    ;; from now on runtime modules come with their instructions decoded
+    (setq *jit-capture-insns* t)
     (%n68-find-exports)
     (setq *n68-translated* 0 *n68-refused* nil *n68-ready* t))
   t)
@@ -117,14 +119,36 @@
               (unless (gethash target label-map)
                 (setf (gethash target label-map) (mvm-make-label))))))))))
 
-(defun %n68-emit-module (buf base bc fns fn-table rt)
+(defvar *n68-verify* nil
+  "T: check a module's captured instructions against decoding its bytecode;
+   a difference is recorded in *N68-MISMATCHES* and the decoded ones are used.")
+(defvar *n68-mismatches* nil)
+(defvar *n68-from-sink* 0 "CENSUS: functions translated from captured instructions.")
+
+(defun %n68-insns (bc start end captured)
+  "[START, END)'s instructions: the captured ones when the module has them,
+   else decoded from BC."
+  (if (null captured)
+      (%n68-decode bc start end)
+      (let ((mine (remove-if-not (lambda (i) (and (>= (first i) start) (< (first i) end))) captured)))
+        (when (and (boundp (quote *n68-verify*)) *n68-verify*)
+          (let ((d (%n68-decode bc start end)))
+            (unless (equal d mine)
+              (push (list start (length d) (length mine)
+                          (loop for a in d for b in mine unless (equal a b) do (return (list a b))))
+                    *n68-mismatches*)
+              (setq mine d))))
+        (setq *n68-from-sink* (+ (if (integerp *n68-from-sink*) *n68-from-sink* 0) 1))
+        mine)))
+
+(defun %n68-emit-module (buf base bc fns fn-table rt &optional captured)
   "Emit FNS' code into BUF; NIL (and *N68-WHY*) when a call cannot be resolved."
   (let ((label-map (make-hash-table)) (entries nil) (stubs (make-hash-table)) (bad nil)
         (one (make-hash-table))                 ; a call's operand -> its label
         (code nil))                             ; (fn . insns), decoded once
     ;; every function's entry, its instructions, and the branch targets in them
     (dolist (f fns)
-      (let* ((start (second f)) (insns (%n68-decode bc start (+ start (third f)))))
+      (let* ((start (second f)) (insns (%n68-insns bc start (+ start (third f)) captured)))
         (setf (gethash start label-map) (mvm-make-label))
         (%n68-branch-targets insns label-map)
         (push (cons f insns) code)))
@@ -214,7 +238,7 @@
               (*68k-mul32-label* (ex 8)) (*68k-mulu64-label* (ex 9)) (*68k-divs32-label* (ex 10))
               (*68k-mac-console-label* (ex 11)) (*68k-mac-getc-label* (ex 12))
               (*68k-mac-service-label* (ex 13)) (*68k-thread-next-label* (ex 14)))
-          (setq entries (%n68-emit-module buf base bc fns fn-table rt))
+          (setq entries (%n68-emit-module buf base bc fns fn-table rt (nth 7 m)))
           (when entries
             (when *68k-unimpl-opcodes*
               (setq *n68-why* (list :unimplemented *68k-unimpl-opcodes*) entries nil)))

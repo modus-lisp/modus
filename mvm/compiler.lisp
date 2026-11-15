@@ -4127,7 +4127,12 @@
       ;; (UNBOUND-VARIABLE BELOW from md5sum-string).
       (let* ((params (cadr def))
              (nbody (cddr def))
-             (sub (and *mvm-eval-runtime-p* (%inline-substitute-constants params args nbody)))
+             ;; Also AHEAD OF TIME on a W32-capable target (docs/w32.md, M3):
+             ;; the W32 rewrite needs the literal shift counts natrium's inline
+             ;; ROTL32 is called with, or a rotate is a variable shift it must
+             ;; refuse.  Never on a 64-bit target, whose images are unchanged.
+             (sub (and (or *mvm-eval-runtime-p* (ct-w32-capable-p))
+                       (%inline-substitute-constants params args nbody)))
              (let-form (if sub
                            (cons 'let (cons (car sub) (cdr sub)))
                            (cons 'let (cons (mapcar (function list) params args) nbody)))))
@@ -8245,9 +8250,14 @@
             (not (eql (car form) 123456789)))
        (compile-quote form dest))
 
-      ;; Compound forms (special forms, builtins, calls)
+      ;; Compound forms (special forms, builtins, calls).  On a W32-capable
+      ;; target an integer expression provably 32 bits wide compiles as raw W32
+      ;; arithmetic (%W32-REWRITE; never on a 64-bit target: CT-W32-CAPABLE-P).
       ((consp form)
-       (compile-compound form env dest))
+       (let ((rw (%w32-rewrite form env)))
+         (if rw
+             (compile-form rw env dest)
+             (compile-compound form env dest))))
 
       ;; Float literal → boxed float object (subtag #x60, IEEE bits in slot 0)
       ((floatp form)
@@ -23783,6 +23793,301 @@
            (free-temp-reg))
          (emit-li-tagged dest 0)))
       (t (error "%W32: the root must be w32-hi16/lo16/ltu/lts/eq/store: ~S" tree)))))
+
+;;; ---- THE W32 EXPRESSION REWRITE (docs/w32.md, M3a) -----------------------
+;;; On a W32-capable target, an integer expression whose value is provably a
+;;; 32-bit word is compiled as raw W32 arithmetic instead of generic (bignum)
+;;; arithmetic -- as a SOURCE REWRITE onto the M2 intrinsic:
+;;;
+;;;   (let* ((g1 LEAF1) (g2 LEAF2) ...                       ; source order
+;;;          (h1 (%w32-hi-of g1)) (l1 (%w32-lo-of g1)) ...)  ; maybe-bignum leaves
+;;;     (%w32-box (%w32 (w32-hi16 T)) (%w32 (w32-lo16 T))))
+;;;
+;;; T is the tree in %W32 syntax over the bound leaves: (w32-from-fix g) for a
+;;; fixnum leaf, (w32-join h l) for a maybe-bignum one, (w32-li N) for a
+;;; literal.  THE COLLECTOR RULE (spec C3) HOLDS BY CONSTRUCTION: every call and
+;;; allocation is in the LET* (no raw word exists yet) or in the box (every raw
+;;; word is dead); inside %W32 there are only variable reads and W32 ops.  T is
+;;; computed twice (once per half): a few ALU instructions, against the
+;;; allocations it saves.
+;;;
+;;; ELIGIBILITY IS A RANGE PROOF.  Each node is EXACT (its value is provably in
+;;; [0, 2^w), w <= 32) or MODULAR (only its value mod 2^32 is known).  + - *
+;;; logand logior logxor lognot and left shifts are modular-preserving: the low
+;;; 32 bits of their result depend only on the low 32 bits of their operands.
+;;; A right shift needs an EXACT operand (it pulls high bits down).  The ROOT
+;;; must be exact -- (logand X #xFFFFFFFF) of a modular X is -- so the W32
+;;; result IS the Lisp result and CL semantics cannot change.  A leaf must be a
+;;; provably integer form (a declared integer variable, a typed AREF, THE an
+;;; integer type, a fixnum-width expression); anything else -- a SIMPLE-VECTOR
+;;; element could be 1/2 -- makes the tree ineligible and it compiles as today.
+;;;
+;;; ONLY WHERE IT PAYS: some width must pass the target's fixnum range, or a
+;;; leaf be a maybe-bignum; otherwise the fixnum paths are already right.
+
+(defun %w32-type-class (ty)
+  "Leaf class of declared type TY: (:ufix w) a non-negative fixnum < 2^w,
+   (:u32 w) a non-negative integer < 2^w that may be a bignum here, :sfix a
+   fixnum of either sign, :s32 a (signed-byte 32) that may be a bignum, or NIL."
+  (let ((fb (ct-fixnum-bits)))
+    (cond
+      ((null ty) nil)
+      ((symbolp ty)
+       (let ((n (symbol-name ty)))
+         (cond ((string= n "FIXNUM") :sfix)
+               ((string= n "BIT") (list :ufix 1))
+               (t nil))))
+      ((and (consp ty) (symbolp (car ty)) (consp (cdr ty)))
+       (let ((n (symbol-name (car ty))) (a (cadr ty)))
+         (cond
+           ((and (string= n "UNSIGNED-BYTE") (integerp a) (> a 0))
+            (cond ((< a fb) (list :ufix a))
+                  ((<= a 32) (list :u32 a))
+                  (t nil)))
+           ((and (string= n "SIGNED-BYTE") (integerp a) (> a 0))
+            (cond ((<= a fb) :sfix) ((<= a 32) :s32) (t nil)))
+           ((and (string= n "INTEGER") (integerp a) (consp (cddr ty)) (integerp (caddr ty)))
+            (let ((lo a) (hi (caddr ty)))
+              (cond ((and (>= lo 0) (< (integer-length hi) fb)) (list :ufix (integer-length hi)))
+                    ((and (>= lo 0) (<= (integer-length hi) 32)) (list :u32 (integer-length hi)))
+                    ((and (>= lo (ct-fixnum-min)) (<= hi (ct-fixnum-max))) :sfix)
+                    ((and (>= lo (- 0 #x80000000)) (<= hi #x7FFFFFFF)) :s32)
+                    (t nil))))
+           (t nil))))
+      (t nil))))
+
+(defun %w32-leaf-class (form env)
+  "Leaf class of FORM (see %W32-TYPE-CLASS), or NIL: not provably an integer."
+  (cond
+    ((symbolp form) (and form (not (eq form t)) (%w32-type-class (%var-dtype form env))))
+    ((not (consp form)) nil)
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "THE")
+          (consp (cdr form)))
+     (%w32-type-class (cadr form)))
+    ((and (symbolp (car form)) (string= (symbol-name (car form)) "AREF")
+          (consp (cdr form)))
+     (let ((aty (%expr-dtype (cadr form) env)))
+       (and (consp aty) (symbolp (car aty))
+            (string= (symbol-name (car aty)) "SIMPLE-ARRAY") (consp (cdr aty))
+            (%w32-type-class (cadr aty)))))
+    ;; any other expression the width inference proves a fixnum
+    (t (and (%expr-width form env) :sfix))))
+
+;;; A classified node: (KIND WIDTH TREE) -- KIND :exact or :mod, WIDTH the bit
+;;; bound of an exact node (NIL for :mod), TREE the %W32 subtree with leaves as
+;;; (:leaf I).  *W32-LEAVES* collects (FORM . CLASS), source order; *W32-WIDE*
+;;; notes that something passed the fixnum range.
+;;; The leaf unbox and the result box, INLINE.  A W32-range value on a 30-bit
+;;; tower is a fixnum or a SMALL bignum (two limbs, value = lo + hi * 2^L, L =
+;;; the limb width, hi two's complement), so both directions are fixnum
+;;; arithmetic plus at most one %MAKE-BIGNUM -- no generic arithmetic, which is
+;;; what the M3a first cut called (%W32-HI-OF / -LO-OF / -BOX in the prelude:
+;;; measured 11% SLOWER on SHA-256 and 1.8x slower on ChaCha20 than the bignum
+;;; code it replaced).
+(defun %w32-hi-form (g)
+  "Bits 31..16 of integer G (a fixnum or a small bignum), as a fixnum."
+  (let ((lb (ct-limb-bits)))
+    (list 'if (list 'fixnump g)
+          (list 'logand (list 'ash g -16) #xFFFF)
+          (list 'logand (list 'logior (list 'ash (list '%prim-aref g 1) (- lb 16))
+                              (list 'ash (list '%prim-aref g 0) -16))
+                #xFFFF))))
+(defun %w32-lo-form (g)
+  "Bits 15..0 of integer G (a fixnum or a small bignum), as a fixnum."
+  (list 'if (list 'fixnump g)
+        (list 'logand g #xFFFF)
+        (list 'logand (list '%prim-aref g 0) #xFFFF)))
+(defun %w32-box-form (hi lo)
+  "The non-negative integer HI*2^16 + LO (HI, LO forms yielding fixnums
+   0..65535): a fixnum when it is one, else a small bignum built directly."
+  (let* ((lb (ct-limb-bits)) (k (- lb 16))
+         (bh (%mvm-gensym "W32BH")) (bl (%mvm-gensym "W32BL")) (b (%mvm-gensym "W32B")))
+    (list 'let (list (list bh hi) (list bl lo))
+          (list 'if (list '< bh (ash 1 k))
+                (list 'logior (list 'ash bh 16) bl)
+                (list 'let (list (list b (list '%make-bignum)))
+                      (list '%prim-aset b 0
+                            (list 'logior (list 'ash (list 'logand bh (- (ash 1 k) 1)) 16) bl))
+                      (list '%prim-aset b 1 (list 'ash bh (- 0 k)))
+                      b)))))
+
+(defvar *w32-leaves* nil)
+(defvar *w32-wide* nil)
+
+(defun %w32-note-width (w)
+  (when (and w (>= w (ct-fixnum-bits))) (setq *w32-wide* t))
+  w)
+
+(defun %w32-leaf-node (form env)
+  (let ((cls (%w32-leaf-class form env)))
+    (when cls
+      ;; A VARIABLE read twice in one tree is one leaf: unboxed once.  Sound
+      ;; because a leaf is bound before any W32 op, and only an earlier leaf
+      ;; FORM could change a variable in between -- so a later variable read
+      ;; is shared only when every leaf so far is a variable or literal.
+      (let ((i (or (and (symbolp form)
+                        (every (lambda (lc) (symbolp (car lc))) *w32-leaves*)
+                        (position form *w32-leaves* :key #'car))
+                   (length *w32-leaves*))))
+        (when (= i (length *w32-leaves*))
+          (setq *w32-leaves* (append *w32-leaves* (list (cons form cls)))))
+        (cond ((and (consp cls) (eq (car cls) :ufix)) (list :exact (cadr cls) (list :leaf i)))
+              ((and (consp cls) (eq (car cls) :u32))
+               (setq *w32-wide* t) (list :exact (cadr cls) (list :leaf i)))
+              ((eq cls :s32) (setq *w32-wide* t) (list :mod nil (list :leaf i)))
+              (t (list :mod nil (list :leaf i))))))))
+
+(defun %w32-classify (form env)
+  "Classify FORM as a W32 node, or NIL.  See the block comment above."
+  (let ((form (%tree-expand form)))
+    (cond
+      ((integerp form)
+       (cond ((and (>= form 0) (<= form #xFFFFFFFF))
+              (list :exact (%w32-note-width (integer-length form)) (list 'w32-li form)))
+             ((>= form (- 0 #x80000000))
+              (list :mod nil (list 'w32-li (logand form #xFFFFFFFF))))
+             (t nil)))
+      ((and (consp form) (symbolp (car form)))
+       (let ((op (symbol-name (car form))) (args (cdr form)))
+         (cond
+           ((and (member op '("LOGAND" "LOGIOR" "LOGXOR" "+" "*") :test #'string=)
+                 (consp args) (consp (cdr args)))
+            (let ((acc (%w32-classify (car args) env)))
+              (dolist (a (cdr args) acc)
+                (let ((b (and acc (%w32-classify a env))))
+                  (unless b (return nil))
+                  (setq acc (%w32-combine op acc b))))))
+           ((and (string= op "-") (consp args))
+            (if (null (cdr args))
+                (let ((a (%w32-classify (car args) env)))
+                  (and a (list :mod nil (list 'w32-sub (list 'w32-li 0) (caddr a)))))
+                (let ((acc (%w32-classify (car args) env)))
+                  (dolist (a (cdr args) acc)
+                    (let ((b (and acc (%w32-classify a env))))
+                      (unless b (return nil))
+                      (setq acc (list :mod nil (list 'w32-sub (caddr acc) (caddr b)))))))))
+           ((and (string= op "LOGNOT") (consp args) (null (cdr args)))
+            (let ((a (%w32-classify (car args) env)))
+              (and a (list :mod nil (list 'w32-not (caddr a))))))
+           ((and (string= op "ASH") (consp args) (consp (cdr args)) (null (cddr args))
+                 (integerp (cadr args)))
+            (let ((n (cadr args)) (a (%w32-classify (car args) env)))
+              (cond ((null a) nil)
+                    ((= n 0) a)
+                    ((and (> n 0) (<= n 31))
+                     (if (and (eq (car a) :exact) (<= (+ (cadr a) n) 32))
+                         (list :exact (%w32-note-width (+ (cadr a) n)) (list 'w32-shl (caddr a) n))
+                         (progn (setq *w32-wide* t)
+                                (list :mod nil (list 'w32-shl (caddr a) n)))))
+                    ((and (< n 0) (>= n -31) (eq (car a) :exact))
+                     (list :exact (max 0 (+ (cadr a) n)) (list 'w32-shr (caddr a) (- 0 n))))
+                    (t nil))))
+           (t (%w32-leaf-node form env)))))
+      (t (%w32-leaf-node form env)))))
+
+(defun %w32-combine (op a b)
+  "Combine classified nodes A and B under the binary OP (LOGAND LOGIOR LOGXOR + *)."
+  (let ((ea (eq (car a) :exact)) (eb (eq (car b) :exact))
+        (wa (cadr a)) (wb (cadr b)) (ta (caddr a)) (tb (caddr b)))
+    (cond
+      ((string= op "LOGAND")
+       (let ((tr (list 'w32-and ta tb)))
+         (cond ((and ea eb) (list :exact (min wa wb) tr))
+               (ea (list :exact wa tr))
+               (eb (list :exact wb tr))
+               (t (list :mod nil tr)))))
+      ((or (string= op "LOGIOR") (string= op "LOGXOR"))
+       (let ((tr (list (if (string= op "LOGIOR") 'w32-or 'w32-xor) ta tb)))
+         (if (and ea eb) (list :exact (max wa wb) tr) (list :mod nil tr))))
+      ((string= op "+")
+       (let ((tr (list 'w32-add ta tb)))
+         (if (and ea eb (<= (+ 1 (max wa wb)) 32))
+             (list :exact (%w32-note-width (+ 1 (max wa wb))) tr)
+             (progn (when (and ea eb) (setq *w32-wide* t)) (list :mod nil tr)))))
+      (t                                ; *
+       (let ((tr (list 'w32-mul ta tb)))
+         (if (and ea eb (<= (+ wa wb) 32))
+             (list :exact (%w32-note-width (+ wa wb)) tr)
+             (progn (setq *w32-wide* t) (list :mod nil tr))))))))
+
+;;; ROTATE RECOGNITION and the identity mask (spec 4.5), a bottom-up peephole
+;;; over the finished %W32 tree.  EXACTLY these shapes:
+;;;   (w32-and T (w32-li #xFFFFFFFF)) / (w32-and (w32-li #xFFFFFFFF) T)  ->  T
+;;;   (w32-or (w32-shl X n) (w32-shr X m)), either order, n + m = 32,
+;;;   the two X EQUAL                                                    ->  (w32-rotl X n)
+;;; which covers natrium's two rotates: ChaCha20's (logior (ash x n) (ash x
+;;; (- n 32))) once the inliner has substituted N, and SHA-256's rotate-right
+;;; (logior (ash x (- n)) (ldb (byte 32 0) (ash x (- 32 n)))), whose mask goes
+;;; first.  Anything else -- a rotate through LOGXOR, mismatched counts -- is
+;;; left as its shifts and OR, which compute the same word.
+(defun %w32-simplify (tr)
+  (if (not (consp tr))
+      tr
+      (let* ((tr (cons (car tr) (mapcar #'%w32-simplify (cdr tr))))
+             (op (car tr)))
+        (flet ((ones-p (x) (and (consp x) (eq (car x) 'w32-li) (eql (cadr x) #xFFFFFFFF)))
+               (sh (x name) (and (consp x) (eq (car x) name) (consp (cdr x)) (cddr x))))
+          (cond
+            ((and (eq op 'w32-and) (ones-p (caddr tr))) (cadr tr))
+            ((and (eq op 'w32-and) (ones-p (cadr tr))) (caddr tr))
+            ((eq op 'w32-or)
+             (let* ((a (cadr tr)) (b (caddr tr))
+                    (l (cond ((sh a 'w32-shl) a) ((sh b 'w32-shl) b)))
+                    (r (cond ((sh a 'w32-shr) a) ((sh b 'w32-shr) b))))
+               (if (and l r (not (eq l r))
+                        (= (+ (caddr l) (caddr r)) 32)
+                        (equal (cadr l) (cadr r)))
+                   (list 'w32-rotl (cadr l) (caddr l))
+                   tr)))
+            (t tr))))))
+
+(defun %w32-rewrite (form env)
+  "The W32 rewrite of FORM (see the block comment above), or NIL."
+  (when (and (ct-w32-capable-p) (consp form) (symbolp (car form))
+             (member (symbol-name (car form))
+                     '("LOGAND" "LOGIOR" "LOGXOR" "+" "-" "*" "ASH" "LOGNOT")
+                     :test #'string=))
+    ;; Lexical save + SETQ + UNWIND-PROTECT, not a special LET: this runs in
+    ;; the 32-bit images' own compilers too, where a special LET does not reach
+    ;; callees.  Classification compiles nothing, so it never re-enters.
+    (let ((saved-leaves *w32-leaves*) (saved-wide *w32-wide*))
+     (unwind-protect
+      (progn
+       (setq *w32-leaves* nil)
+       (setq *w32-wide* nil)
+      (let ((node (%w32-classify form env)))
+        (when (and node (eq (car node) :exact) *w32-wide* *w32-leaves*)
+          (let ((binds nil) (halves nil) (gs nil))
+            ;; leaves bound in source order
+            (dolist (lc *w32-leaves*)
+              (let ((g (%mvm-gensym "W32L")))
+                (push (list g (car lc)) binds)
+                (push g gs)))
+            (setq gs (nreverse gs))
+            (let ((leaf-trees
+                    (let ((out nil) (i 0))
+                      (dolist (lc *w32-leaves* (nreverse out))
+                        (let ((cls (cdr lc)) (g (nth i gs)))
+                          (if (or (eq cls :s32) (and (consp cls) (eq (car cls) :u32)))
+                              (let ((h (%mvm-gensym "W32H")) (l (%mvm-gensym "W32L")))
+                                (push (list h (%w32-hi-form g)) halves)
+                                (push (list l (%w32-lo-form g)) halves)
+                                (push (list 'w32-join h l) out))
+                              (push (list 'w32-from-fix g) out)))
+                        (setq i (+ i 1))))))
+              (labels ((subst-leaves (tr)
+                         (cond ((and (consp tr) (eq (car tr) :leaf)) (nth (cadr tr) leaf-trees))
+                               ((consp tr) (cons (car tr) (mapcar #'subst-leaves (cdr tr))))
+                               (t tr))))
+                (let* ((tree (%w32-simplify (subst-leaves (caddr node))))
+                       (hi (list '%w32 (list 'w32-hi16 tree)))
+                       (lo (list '%w32 (list 'w32-lo16 tree)))
+                       (box (if (< (cadr node) (ct-fixnum-bits))
+                                (list 'logior (list 'ash hi 16) lo)
+                                (%w32-box-form hi lo))))
+                  (list 'let* (append (nreverse binds) (nreverse halves)) box))))))))
+      (setq *w32-leaves* saved-leaves)
+      (setq *w32-wide* saved-wide)))))
 
 (defun compile-mul26lo (args env dest)
   "Compile (mul26lo a b) — low 26 bits of untag(a)*untag(b), tagged.

@@ -2447,6 +2447,25 @@
 ;;; as slow as before.  So does every image whose %GC-REGION is unresolved.
 ;;; Numbers stay :NOHASH: EQL compares them by value.
 
+;;; W32 BOXING HELPERS (docs/w32.md, M3).  The compiler's W32 expression
+;;; rewrite (%W32-REWRITE, compiler.lisp) turns a 32-bit integer expression into
+;;; (let* (... (h (%w32-hi-of x)) (l (%w32-lo-of x)) ...) (%w32-box HI LO)) around
+;;; raw W32 arithmetic: these run BEFORE any raw word exists or AFTER the last one
+;;; is dead, so they may allocate.  Plain generic arithmetic, correct for any
+;;; integer (a bignum on a 30-bit tower, a negative value as two's complement).
+;;; Nothing here can itself be rewritten: the arguments are undeclared, so the
+;;; rewrite cannot prove them integers.
+(defun %w32-hi-of (x)
+  "Bits 31..16 of X mod 2^32, as a fixnum 0..65535."
+  (logand (ash x -16) #xFFFF))
+(defun %w32-lo-of (x)
+  "Bits 15..0 of X, as a fixnum 0..65535."
+  (logand x #xFFFF))
+(defun %w32-box (hi lo)
+  "The integer HI * 2^16 + LO, HI and LO fixnums 0..65535: a bignum when it is
+   not a fixnum on this tower."
+  (+ (* hi 65536) lo))
+
 (defun %target-big-endian-p ()
   "T on a big-endian target (68k, PowerPC).  For code compiled without the
    constant preamble (runtime-cl-macros.lisp), which cannot name the folded

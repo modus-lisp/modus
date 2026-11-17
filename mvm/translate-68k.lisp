@@ -2133,13 +2133,16 @@
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
-         (let ((da (m68k-vreg-or-scratch buf va +68k-d0+))
-               (db (m68k-vreg-or-scratch buf vb +68k-d1+)))
-           ;; We need the result in a scratch. If da!=d0, move it.
-           (unless (= da +68k-d0+)
-             (m68k-emit-move-dn-dn buf da +68k-d0+))
-           (m68k-emit-add-dn-dn buf db +68k-d0+)
-           (m68k-store-vreg buf vd +68k-d0+))))
+         (let* ((da (m68k-vreg-or-scratch buf va +68k-d0+))
+                (db (m68k-vreg-or-scratch buf vb +68k-d1+))
+                (dd (m68k-vreg-data-reg vd)))
+           ;; Into VD's own register when it has one: ADD commutes, so when VD
+           ;; is VB's register add VA into it.  Else via D0 as before.
+           (when (and dd (= dd db) (/= dd da)) (rotatef da db))
+           (let ((acc (if (and dd (/= dd db)) dd +68k-d0+)))
+             (unless (= da acc) (m68k-emit-move-dn-dn buf da acc))
+             (m68k-emit-add-dn-dn buf db acc)
+             (m68k-store-vreg buf vd acc)))))
 
       ((#.+op-sub+ #.+op-sub-checked+ #.+op-subs+)
        ;; :SUBS shares this clause.  :adds/:subs are "arithmetic that also sets
@@ -2164,12 +2167,17 @@
        (let ((vd (first operands))
              (va (second operands))
              (vb (third operands)))
-         (let ((da (m68k-vreg-or-scratch buf va +68k-d0+)))
-           (unless (= da +68k-d0+)
-             (m68k-emit-move-dn-dn buf da +68k-d0+))
+         ;; Into VD's own register when it has one and it is not VB's
+         ;; (SUB does not commute).  Else via D0 as before.
+         (let* ((da (m68k-vreg-or-scratch buf va +68k-d0+))
+                (dd (m68k-vreg-data-reg vd))
+                (db0 (m68k-vreg-data-reg vb))
+                (acc (if (and dd (not (eql dd db0))) dd +68k-d0+)))
+           (unless (= da acc)
+             (m68k-emit-move-dn-dn buf da acc))
            (let ((db (m68k-vreg-or-scratch buf vb +68k-d1+)))
-             (m68k-emit-sub-dn-dn buf db +68k-d0+)
-             (m68k-store-vreg buf vd +68k-d0+)))))
+             (m68k-emit-sub-dn-dn buf db acc)
+             (m68k-store-vreg buf vd acc)))))
 
       ((#.+op-mul+ #.+op-mul-checked+)
        ;; :MUL-CHECKED shares this clause.  The checked opcodes mean "tagged
@@ -2712,11 +2720,12 @@
              (idx (third operands)))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot access: use safe A6-relative offset below spill area
-             (progn
+             ;; Straight into VD's data register when it has one; the
+             ;; store-then-reload peephole matches on that register.
+             (let ((dd (or (m68k-vreg-data-reg vd) +68k-d0+)))
                (m68k-emit-move-disp-dn buf +68k-a6+
-                                        (+ +68k-frame-slot-base+ (* idx -4))
-                                        +68k-d0+)
-               (m68k-store-vreg buf vd +68k-d0+))
+                                       (+ +68k-frame-slot-base+ (* idx -4)) dd)
+               (m68k-store-vreg buf vd dd))
              ;; Normal object slot access.  The tagged pointer goes straight
              ;; to A0 and the tag folds into the displacement: (4(i+1)-tag)(A0)
              ;; is the same address SUBI #tag then 4(i+1)(A0) was, minus the
@@ -2739,10 +2748,9 @@
              (vs (third operands)))
          (if (= vobj +vreg-vfp+)
              ;; Frame slot store: use safe A6-relative offset below spill area
-             (progn
-               (m68k-load-vreg buf +68k-d0+ vs)
-               (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+
-                                        (+ +68k-frame-slot-base+ (* idx -4))))
+             ;; From VS's own data register when it has one (no copy to D0).
+             (m68k-emit-move-dn-disp buf (m68k-vreg-or-scratch buf vs +68k-d0+) +68k-a6+
+                                     (+ +68k-frame-slot-base+ (* idx -4)))
              ;; Normal object slot store, the tag folded as in OBJ-REF.  A0
              ;; is translator scratch, never a vreg, so loading it first
              ;; cannot clobber VS.

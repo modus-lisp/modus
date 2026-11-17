@@ -3404,6 +3404,17 @@
 
       (#.+op-get-nargs+
        (let ((vd (first operands)))
+         ;; THE ARITY CHECK, FUSED.  The compiler's entry check is GET-NARGS vD /
+         ;; LI vB n<<1 / CMP vD vB / BEQ ok (emit-arity-check-prologue and the
+         ;; range version).  The good case is first: CMPI.L #n,(nargs).L + BEQ
+         ;; ok, 2 instructions where the sequence below takes 6 with a spill;
+         ;; on a mismatch the sequence still runs, unchanged, for the error path.
+         (multiple-value-bind (n target) (m68k-nargs-check-at mvm-pc vd)
+           (when n
+             (m68k-emit-word buf #x0CB9)                 ; CMPI.L #imm,abs.L
+             (m68k-emit-long buf n)
+             (m68k-emit-long buf (m68k-nargs-addr))
+             (m68k-emit-bcc-word buf +68k-cc-eq+ (ensure-label target))))
          (m68k-emit-load-abs buf +68k-d0+ (m68k-nargs-addr))
          (m68k-emit-lsl-imm buf +68k-d0+ 1)     ; tag as fixnum
          (m68k-store-vreg buf vd +68k-d0+)))
@@ -4013,6 +4024,23 @@
                    (eql (car cmp) +op-cmp+) (equal (cdr cmp) (list vd vs))
                    (eql (car bne) +op-bne+))
           (values pc (+ pc (second bne))))))))
+
+(defun m68k-nargs-check-at (next-pc vd)
+  "When GET-NARGS VD is followed by LI vB IMM / CMP VD vB / BEQ, none a branch
+   target: (values UNTAGGED-COUNT TARGET-PC)."
+  (when (and *68k-bytecode* *68k-label-map*)
+    (let ((bc *68k-bytecode*) (pc next-pc) (ops nil))
+      (dotimes (i 3)
+        (when (or (>= pc (length bc)) (gethash pc *68k-label-map*))
+          (return-from m68k-nargs-check-at nil))
+        (let ((d (decode-instruction bc pc)))
+          (push (cons (car d) (cadr d)) ops)
+          (setq pc (cddr d))))
+      (destructuring-bind (beq cmp li) ops
+        (when (and (eql (car li) +op-li+) (eql (car cmp) +op-cmp+) (eql (car beq) +op-beq+)
+                   (equal (cdr cmp) (list vd (second li)))
+                   (integerp (third li)) (evenp (third li)) (<= 0 (third li) 510))
+          (values (ash (third li) -1) (+ pc (second beq))))))))
 
 (defun m68k-next-is-unlabelled-cons-p (next-pc)
   "True when the instruction at NEXT-PC is a CONS that no branch lands on."

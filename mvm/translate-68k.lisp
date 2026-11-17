@@ -2339,9 +2339,11 @@
           ;; *ARITH-RANGE-BY-SHIFT*): ASL sets V exactly when a bit shifted
           ;; out differs from the sign, i.e. when (x << s) >> s /= x.  The
           ;; scratch gets x, which is its value on the fall-through.
+          ;; The scratch VD is dead after the guard (the flag's contract in
+          ;; compiler.lisp), so it is not written: one frame store less per
+          ;; operand when it is a spilled vreg.
           (progn
             (m68k-load-vreg buf +68k-d0+ vs)
-            (m68k-store-vreg buf vd +68k-d0+)
             (m68k-emit-asl-imm buf +68k-d0+ amt)
             (m68k-emit-bcc-word buf +68k-cc-vs+ (ensure-label target-pc))
             (setq *68k-skip-to* skip-to))
@@ -2437,11 +2439,20 @@
          (m68k-emit-cmp-dn-dn buf +68k-d1+ da)))
 
       (#.+op-test-imm+
-       (progn
+       (let ((imm (logand (%imm32-signed (second operands)) #xFFFFFFFF)))
+        (if (and (= 1 (logcount imm)) (m68k-next-op-in mvm-pc (list +op-beq+ +op-bne+)))
+         ;; ONE BIT, then BEQ/BNE: BTST #bit on the operand where it lives.
+         ;; Z is set exactly when (x & imm) = 0, as AND + TST leave it; N is
+         ;; not, which is why only an equality branch may follow.  The tag test
+         ;; of every arithmetic op (EMIT-ARITH-PAIR) is two of these.
+         (let ((dn (m68k-vreg-or-scratch buf (first operands) +68k-d0+)))
+           (m68k-emit-word buf (logior #x0800 dn))       ; BTST #n,Dn
+           (m68k-emit-word buf (1- (integer-length imm))))
+        (progn
          (m68k-load-vreg buf +68k-d0+ (first operands))
          (m68k-emit-imm-dn buf (logand (%imm32-signed (second operands)) #xFFFFFFFF) +68k-d1+)
          (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
-         (m68k-emit-tst buf +68k-d0+)))
+         (m68k-emit-tst buf +68k-d0+)))))
 
       ;;; --- Branches ---
       (#.+op-br+
@@ -4024,6 +4035,14 @@
                    (eql (car cmp) +op-cmp+) (equal (cdr cmp) (list vd vs))
                    (eql (car bne) +op-bne+))
           (values pc (+ pc (second bne))))))))
+
+(defun m68k-next-op-in (next-pc ops)
+  "True when the instruction at NEXT-PC is one of OPS and no branch lands on it
+   (native translation only: a handler has no bytecode to look at)."
+  (and *68k-bytecode* *68k-label-map*
+       (< next-pc (length *68k-bytecode*))
+       (null (gethash next-pc *68k-label-map*))
+       (member (car (decode-instruction *68k-bytecode* next-pc)) ops)))
 
 (defun m68k-nargs-check-at (next-pc vd)
   "When GET-NARGS VD is followed by LI vB IMM / CMP VD vB / BEQ, none a branch

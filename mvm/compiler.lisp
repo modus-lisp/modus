@@ -21971,6 +21971,22 @@
    compares and two branches.  The scratch is dead after the guard; the 68k
    translator relies on that to fuse the four (M68K-RANGE-GUARD-AT).")
 
+(defun %ir-just-loaded-fixnum (reg)
+  "The tagged word the IR instruction just emitted loaded into REG, when it was
+   a fixnum literal (:LI, or the in-image compiler's :LI-HALVES), else NIL.  A
+   register loaded by the instruction immediately before needs no tag test, and
+   a small one no range guard: (- n 1) tests and guards only N."
+  (let ((i (car *ir-buffer*)))
+    (when (and (consp i) (eql (second i) reg))
+      (let ((w (case (first i)
+                 (:li (third i))
+                 (:li-halves (let ((lo (third i)) (hi (fourth i)))
+                               (cond ((eql hi 0) lo)
+                                     ((eql hi #xFFFFFFFF) (- lo #x100000000))
+                                     (t nil))))
+                 (t nil))))
+        (and (integerp w) (evenp w) w)))))
+
 (defun emit-arith-pair (fast-op generic-name dest temp &optional (src1 dest))
   "Tag-checked pairwise arithmetic.  When dest and temp are both tagged
    fixnums (low bit zero) we use FAST-OP inline.  Otherwise we call
@@ -22013,6 +22029,8 @@
              dest src1 temp)
     (return-from emit-arith-pair))
   (let* ((checked-op nil)
+         ;; TEMP loaded by the instruction just before: a literal, known fixnum
+         (lit-temp   (%ir-just-loaded-fixnum temp))
          (tag-temp   (alloc-temp-reg))
          (one-temp   (alloc-temp-reg))
          (slow-label (make-compiler-label))
@@ -22028,9 +22046,20 @@
     ;; TAG-SAFE pair (both operands provably fixnums, result may still
     ;; overflow): skip the tag test, keep the checked op + slow path.
     (unless (and *arith-trust* (car *arith-trust*))
-      (emit-ir :or   tag-temp src1 temp)
-      (emit-ir :test-imm tag-temp 1)
-      (emit-ir :bne  slow-label))
+      (if (< (ct-fixnum-bits) 62)
+          ;; 32-bit targets: each operand's tag bit tested where it lives -- no
+          ;; temporary, which the 68k spilled to the frame on every op (it has
+          ;; six data registers for V0..V5); BTST there.  64-bit unchanged.
+          (progn
+            (emit-ir :test-imm src1 1)
+            (emit-ir :bne  slow-label)
+            (unless lit-temp                    ; a literal is a fixnum
+              (emit-ir :test-imm temp 1)
+              (emit-ir :bne  slow-label)))
+          (progn
+            (emit-ir :or   tag-temp src1 temp)
+            (emit-ir :test-imm tag-temp 1)
+            (emit-ir :bne  slow-label))))
     ;; OVERFLOW GUARD ON A 30-BIT TOWER.  Overflow promotion is disabled above
     ;; (it regressed ANSI on x64, where a 62-bit fixnum rarely overflows).  At
     ;; 30 bits overflow is ROUTINE -- a ten-digit literal, a hash multiplier --
@@ -22068,7 +22097,9 @@
         (cond
           ((member fast-op '(:add :sub :add-checked :sub-checked))
            (in-range-or src1 (- (ct-fixnum-bits) 2) slow-label)
-           (in-range-or temp (- (ct-fixnum-bits) 2) slow-label))
+           ;; a literal inside the guard's range needs no guard
+           (unless (and lit-temp (< (abs lit-temp) (ash (ash 1 (- (ct-fixnum-bits) 2)) +fixnum-shift+)))
+             (in-range-or temp (- (ct-fixnum-bits) 2) slow-label)))
           ((member fast-op '(:mul :mul-checked))
            ;; The product fits when the operands' bit lengths sum to at most
            ;; fixnum-bits - 2.  One fixed split (14+14) sent `(* n (fact n-1))'

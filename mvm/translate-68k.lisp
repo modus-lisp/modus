@@ -1611,7 +1611,43 @@
 ;;; MVM Opcode Translation
 ;;; ============================================================
 
+(defvar *68k-fast-at* nil
+  "THE SELF-CALL ENTRY.  A fixed-arity function's FRAME-ENTER becomes
+     entry: CMPI.L #n,(nargs).L / BEQ fast / LINK+MOVEM / <the compiler's
+            arity check: reached only on a mismatch, it signals>
+     fast:  LINK+MOVEM          <- emitted in front of the check's OK label
+     ok:    body
+   which costs an ordinary caller exactly what LINK+MOVEM / CMPI / BEQ ok did.
+   A direct call to ITSELF with the right count then skips the count store
+   and the check: SET-NARGS emits nothing and the CALL is BSR fast.  This is
+   the bytecode PC of OK while it is pending (NIL otherwise).")
+(defvar *68k-fast-label* nil "The current function's FAST label (see *68K-FAST-AT*).")
+(defvar *68k-fast-n* nil "Its fixed argument count.")
+(defvar *68k-fast-entry-pc* nil "Its bytecode entry, the FRAME-ENTER's PC.")
+(defvar *68k-fast-prologue* nil "(NPARAMS SLOTS) for the second prologue.")
+(defvar *68k-fast-call* nil "T between a self-call's SET-NARGS and its CALL.")
+
+(defun m68k-fast-entry-plan (frame-pc next-pc)
+  "For the FRAME-ENTER at FRAME-PC: (values N OK-PC) when the next
+   instructions are the compiler's fixed-count check (GET-NARGS ... BEQ ok)."
+  (when (and *68k-bytecode* *68k-label-map* (< next-pc (length *68k-bytecode*))
+             (null (gethash next-pc *68k-label-map*)))
+    (let ((d (decode-instruction *68k-bytecode* next-pc))
+          (f (decode-instruction *68k-bytecode* frame-pc)))
+      (when (and (eql (car d) +op-get-nargs+) (eql (car f) +op-trap+)
+                 (eql (cddr f) next-pc))
+        (m68k-nargs-check-at (cddr d) (first (cadr d)))))))
+
 (defun m68k-translate-insn (buf opcode operands mvm-pc label-map function-table)
+  "Translate a single MVM instruction to 68k native code (then, in front of
+   a pending self-call OK label, the second prologue: see *68K-FAST-AT*)."
+  (%m68k-translate-insn-1 buf opcode operands mvm-pc label-map function-table)
+  (when (and *68k-bytecode* *68k-fast-at* (eql mvm-pc *68k-fast-at*))
+    (setq *68k-fast-at* nil)
+    (m68k-emit-label buf *68k-fast-label*)
+    (m68k-emit-prologue buf (first *68k-fast-prologue*) (second *68k-fast-prologue*))))
+
+(defun %m68k-translate-insn-1 (buf opcode operands mvm-pc label-map function-table)
   "Translate a single MVM instruction to 68k native code."
   (declare (ignorable mvm-pc function-table))
 
@@ -1634,7 +1670,7 @@
                                     +op-f32-load+ +op-f32-store+)))
       (pushnew opcode *68k-unimpl-opcodes*)
       (m68k-emit-illegal buf)
-      (return-from m68k-translate-insn nil))
+      (return-from %m68k-translate-insn-1 nil))
 
     (case opcode
       ;;; --- NOP / BREAK / TRAP ---
@@ -1649,6 +1685,20 @@
          (cond
            ((frame-enter-code-p code)
             ;; Frame-enter: CODE carries the parameter count -- see m68k-emit-prologue.
+            ;; A fixed-count function checks the count FIRST (*68K-FAST-AT*).
+            (when *68k-bytecode*
+              (setq *68k-fast-at* nil *68k-fast-label* nil *68k-fast-call* nil)
+              (multiple-value-bind (n ok) (m68k-fast-entry-plan (- mvm-pc 3) mvm-pc)
+                (when n
+                  (let ((fast (mvm-make-label)))
+                    (m68k-emit-word buf #x0CB9)                 ; CMPI.L #n,abs.L
+                    (m68k-emit-long buf n)
+                    (m68k-emit-long buf (m68k-nargs-addr))
+                    (m68k-emit-bcc-word buf +68k-cc-eq+ fast)
+                    (setq *68k-fast-at* ok *68k-fast-label* fast *68k-fast-n* n
+                          *68k-fast-entry-pc* (- mvm-pc 3)
+                          *68k-fast-prologue* (list (frame-enter-nparams code)
+                                                    (frame-enter-slots code)))))))
             (m68k-emit-prologue buf (frame-enter-nparams code) (frame-enter-slots code)))
            ((< code #x0300)
             ;; Frame-alloc/frame-free: NOP for now
@@ -2853,7 +2903,11 @@
       (#.+op-call+
        ;; Target operand is the bytecode offset of the called function.
        (let* ((target-offset (first operands))
-              (label (gethash target-offset label-map)))
+              (label (if (and *68k-bytecode* *68k-fast-call*
+                              (eql target-offset *68k-fast-entry-pc*))
+                         *68k-fast-label*
+                         (gethash target-offset label-map))))
+         (when *68k-bytecode* (setq *68k-fast-call* nil))
          (if label
              (m68k-emit-bsr buf label)
              ;; Unknown target: emit BSR with no fixup
@@ -3018,7 +3072,7 @@
          (when (= target #xFFFFFFF0)                     ; undefined name: NIL
            (m68k-emit-move-an-dn buf +68k-a4+ +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+)
-           (return-from m68k-translate-insn nil))
+           (return-from %m68k-translate-insn-1 nil))
          (unless label
            (error "68k fn-addr: no function at bytecode offset ~D" target))
          (m68k-emit-lea-label buf label +68k-a1+)
@@ -3418,8 +3472,18 @@
        ;; MOVEQ + MOVE.L to absolute long: 8 bytes, was 14 (MOVE.L #, MOVEA.L #,
        ;; MOVE.L (A1)).  D0 is scratch; nothing after reads A1 for this address.
        (let ((n (logand (first operands) #xFF)))
-         (m68k-emit-imm-dn buf n +68k-d0+)
-         (m68k-emit-store-absl buf +68k-d0+ (m68k-nargs-addr))))
+         (if (and *68k-bytecode* *68k-fast-label* (eql n *68k-fast-n*)
+                  (< mvm-pc (length *68k-bytecode*))
+                  (null (gethash mvm-pc label-map))
+                  (let ((d (decode-instruction *68k-bytecode* mvm-pc)))
+                    (and (eql (car d) +op-call+)
+                         (eql (first (cadr d)) *68k-fast-entry-pc*))))
+             ;; A self-call with the function's own count: no count, and the
+             ;; CALL goes to the fast entry (*68K-FAST-AT*).
+             (setq *68k-fast-call* t)
+             (progn
+               (m68k-emit-imm-dn buf n +68k-d0+)
+               (m68k-emit-store-absl buf +68k-d0+ (m68k-nargs-addr))))))
 
       (#.+op-get-nargs+
        (let ((vd (first operands)))
@@ -3429,7 +3493,7 @@
          ;; ok, 2 instructions where the sequence below takes 6 with a spill;
          ;; on a mismatch the sequence still runs, unchanged, for the error path.
          (multiple-value-bind (n target) (m68k-nargs-check-at mvm-pc vd)
-           (when n
+           (when (and n (not (and *68k-bytecode* *68k-fast-at*)))
              (m68k-emit-word buf #x0CB9)                 ; CMPI.L #imm,abs.L
              (m68k-emit-long buf n)
              (m68k-emit-long buf (m68k-nargs-addr))

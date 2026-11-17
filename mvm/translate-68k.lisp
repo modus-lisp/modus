@@ -310,10 +310,31 @@
   "Current byte position in the code buffer."
   (m68k-buffer-position buf))
 
+(defvar *68k-last-label-pos* -1
+  "Where the last label was placed: the peepholes below never merge across a
+   position something may branch to.")
+
 (defun m68k-emit-label (buf label-id)
   "Record current position as a branch target."
+  (setq *68k-last-label-pos* (m68k-buffer-position buf))
   (setf (gethash label-id (m68k-buffer-labels buf))
         (m68k-buffer-position buf)))
+
+;;; PEEPHOLES at the two places the vreg discipline makes redundant moves: a
+;;; spilled vreg stored from Dn and loaded straight back into Dn, and a value
+;;; pushed and popped straight back into a register (an argument shuffle).
+;;; Both only in native code, at an even position no label marks, looking only
+;;; at the instruction just emitted -- so the two relaxation passes make the
+;;; same decisions and nothing that branches can land between the pair.
+(defun m68k-peephole-ok-p (buf)
+  (let ((pos (m68k-buffer-position buf)))
+    (and *68k-native-p* (evenp pos) (not (eql pos *68k-last-label-pos*))
+         (>= (m68k-buffer-word-count buf) 2))))
+
+(defvar *68k-last-store* nil
+  "(BUF WORD-COUNT-AFTER AN DISP DN) of the last MOVE.L Dn,d16(An) emitted.")
+(defvar *68k-last-push* nil
+  "(BUF WORD-COUNT-AFTER DN) of the last MOVE.L Dn,-(SP) emitted.")
 
 (defun m68k-emit-fixup (buf label-id fixup-type)
   "Record a fixup. FIXUP-TYPE is :disp16 or :disp32."
@@ -476,13 +497,19 @@
 
 (defun m68k-emit-move-disp-dn (buf an disp dn)
   "MOVE.L d16(An), Dd"
+  ;; PEEPHOLE: MOVE.L Dd,d16(An) just emitted -> Dd already holds it.
+  (let ((ls *68k-last-store*))
+    (when (and ls (eq (first ls) buf) (= (second ls) (m68k-buffer-word-count buf))
+               (equal (cddr ls) (list an disp dn)) (m68k-peephole-ok-p buf))
+      (return-from m68k-emit-move-disp-dn nil)))
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-dn+ dn +ea-mode-an-disp+ an))
   (m68k-emit-word buf (logand disp #xFFFF)))
 
 (defun m68k-emit-move-dn-disp (buf dn an disp)
   "MOVE.L Dd, d16(An)"
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-disp+ an +ea-mode-dn+ dn))
-  (m68k-emit-word buf (logand disp #xFFFF)))
+  (m68k-emit-word buf (logand disp #xFFFF))
+  (setq *68k-last-store* (list buf (m68k-buffer-word-count buf) an disp dn)))
 
 (defun m68k-emit-move-disp-an (buf src-an disp dst-an)
   "MOVEA.L d16(An), Ad"
@@ -1295,10 +1322,20 @@
   "MOVE.L Dn, -(SP) - push data register"
   ;; Destination: -(A7) = mode 4, reg 7
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-predec+ +68k-a7+
-                                             +ea-mode-dn+ dn)))
+                                             +ea-mode-dn+ dn))
+  (setq *68k-last-push* (list buf (m68k-buffer-word-count buf) dn)))
 
 (defun m68k-emit-pop-dn (buf dn)
   "MOVE.L (SP)+, Dn - pop to data register"
+  ;; PEEPHOLE: MOVE.L Ds,-(SP) just emitted -> MOVE.L Ds,Dn (or nothing).
+  (let ((lp *68k-last-push*))
+    (when (and lp (eq (first lp) buf) (= (second lp) (m68k-buffer-word-count buf))
+               (m68k-peephole-ok-p buf))
+      (setq *68k-last-push* nil)
+      (decf (m68k-buffer-word-count buf))
+      (decf (m68k-buffer-position buf) 2)
+      (unless (= (third lp) dn) (m68k-emit-move-dn-dn buf (third lp) dn))
+      (return-from m68k-emit-pop-dn nil)))
   ;; Source: (A7)+ = mode 3, reg 7
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-dn+ dn
                                              +ea-mode-an-postinc+ +68k-a7+)))
@@ -6348,7 +6385,9 @@
     (do-symbols (s pkg)
       (let ((n (symbol-name s)))
         (when (and (eq (symbol-package s) pkg) (boundp s)
-                   (or (eql 0 (search "*68K-" n)) (eql 0 (search "*CONV-" n)))
+                   (or (eql 0 (search "*68K-" n)) (eql 0 (search "*CONV-" n))
+                       ;; the compiler's, but M68K-RANGE-GUARD-AT reads it
+                       (string= n "*ARITH-RANGE-BY-SHIFT*"))
                    (char= (char n (1- (length n))) #\*)
                    (not (m68k-native-state-name-p n)))
           (let ((f (if (string= n "*68K-THREADED*")

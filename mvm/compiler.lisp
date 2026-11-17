@@ -22045,7 +22045,12 @@
       (flet ((in-range-or (x bits miss)
                ;; branch to MISS unless -2^BITS < x < 2^BITS (x a TAGGED word)
                (let ((tb (ash (ash 1 bits) +fixnum-shift+)))
-                (if *arith-range-by-shift*
+                ;; The shift form, always: equivalent to the two immediates on
+                ;; every 30-bit target and half the instructions (the flag now
+                ;; only tells the 68k translator it may fuse the four into
+                ;; ASL + BVS).  The image's own compiler never saw the flag --
+                ;; a host special -- so REPL code got the long form.
+                (if t
                  ;; -TB <= x < TB iff x survives a 32-bit shift left by S and
                  ;; back: no immediates, and one fused ASL + BVS on 68k.
                  (let ((s (- 31 (1- (integer-length tb)))))

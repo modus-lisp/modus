@@ -162,9 +162,17 @@
             ;; 16-aligned entries (translate-mvm-to-68k-1): FN-ADDR ORs in tag 3
             (m68k-word-align buf)
             (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-nop buf))
+            (when *68k-branch-distances*            ; pass 1: the planner's margins
+              (push (m68k-buffer-position buf) *68k-fn-entry-positions*))
             (push (cons (first f) (m68k-buffer-position buf)) entries)
             (dolist (i (cdr c))
+              ;; an instruction a handler already consumed (M68K-RANGE-GUARD-AT
+              ;; fuses SHL/SAR/CMP/BNE into ASL + BVS and sets *68K-SKIP-TO* past
+              ;; the BNE), as translate-mvm-to-68k-1's loop skips it
+              (if (and *68k-skip-to* (< (first i) *68k-skip-to*))
+                  nil
               (unless bad
+                (setq *68k-skip-to* nil)
                 (let* ((pc (first i)) (op (second i)) (operands (third i)) (new-pc (fourth i))
                        (l (gethash pc label-map)))
                   (setq *n68-at* i)
@@ -190,7 +198,7 @@
                      (m68k-emit-word buf #x2039)               ; MOVE.L abs.L,D0
                      (m68k-emit-long buf (%t68-cell (second operands)))
                      (m68k-store-vreg buf (first operands) +68k-d0+))
-                    (t (m68k-translate-insn buf op operands new-pc label-map nil))))))))))
+                    (t (m68k-translate-insn buf op operands new-pc label-map nil)))))))))))
     (if bad nil (nreverse entries))))
 
 (defun %n68-call-label (buf base operand rt fn-table stubs)
@@ -205,45 +213,66 @@
         (or (gethash pc stubs)
             (progn (setq *n68-why* (list :no-callee operand)) nil)))))
 
+(defun %n68-emit-pass (bc fns fn-table rt captured base)
+  "One emission of the module into a fresh buffer: (VALUES BUF ENTRIES), ENTRIES
+   NIL when a call does not resolve.  The image's routines are labels at their
+   absolute addresses, for a buffer written at BASE."
+  (let* ((buf (make-m68k-buffer :words (make-array 1024) :labels (make-hash-table)))
+         (x *n68-exports*))
+    (flet ((ex (i) (let ((a (and (< i (length x)) (aref x i))))
+                     (and a (%n68-abs-label buf base a)))))
+      (let ((*68k-gc-label* (ex 0)) (*68k-barrier-label* (ex 1)) (*68k-cons-label* (ex 2))
+            (*68k-subtag-label* (ex 3)) (*68k-car-label* (ex 4)) (*68k-cdr-label* (ex 5))
+            (*68k-array-len-label* (ex 6)) (*68k-alloc-obj-label* (ex 7))
+            (*68k-mul32-label* (ex 8)) (*68k-mulu64-label* (ex 9)) (*68k-divs32-label* (ex 10))
+            (*68k-mac-console-label* (ex 11)) (*68k-mac-getc-label* (ex 12))
+            (*68k-mac-service-label* (ex 13)) (*68k-thread-next-label* (ex 14)))
+        (let ((entries (%n68-emit-module buf base bc fns fn-table rt captured)))
+          (when entries (m68k-fixup-labels buf))
+          (values buf entries))))))
+
 (defun %n68-translate (m)
   "Module M (*JIT-MODULE-REGISTRY*'s (bc entry ft-list fn-table rt-table ...))
    as native 68k in the code area: an alist (NAME . FUNCTION-OBJECT), or NIL
-   (*N68-WHY*).  Nothing is written unless everything resolves."
+   (*N68-WHY*).  Nothing is written unless everything resolves.
+
+   TWO PASSES, as translate-mvm-to-68k relaxes the image's branches: the first
+   with every branch long records where each went, M68K-RELAX-PLAN sizes them,
+   the second emits each as short as it can be.  Without it every branch on the
+   68000 was a 6-byte JMP abs.L (Bcc.S over it for a conditional)."
   (%n68-init)
   (setq *n68-why* nil)
   (let* ((bc (first m)) (ft-list (third m)) (fn-table (fourth m)) (rt (fifth m))
+         (captured (nth 7 m))
          (fns (sort (remove "%MVM-EVAL-THUNK" (copy-list ft-list) :key (function car)
                             :test (function string=))
                     (function <) :key (function second)))
          (base (logand (+ *t68-ptr* 15) -16))
-         (buf (make-m68k-buffer :words (make-array 1024) :labels (make-hash-table)))
-         (x *n68-exports*)
-         (entries nil))
+         (buf nil) (entries nil) (plan nil))
     ;; *68K-THREADED* stays the IMAGE's: native code in a threaded image builds
     ;; the image's 8-word handler frames (with the token pointer), as its hot
     ;; native functions do.  No function is cold here (*68K-COLD-FNS* NIL).
     (let ((*68k-native-p* t) (*68k-cold-fns* nil) (*68k-profile* nil)
           (*68k-paged* nil) (*68k-skip-to* nil)
-          (*68k-branch-plan* nil) (*68k-branch-ordinal* 0) (*68k-branch-distances* nil)
-          (*68k-fn-entry-positions* nil) (*68k-abs-patches* nil) (*68k-li-const-patches* nil)
-          (*68k-unimpl-opcodes* nil)
+          (*68k-li-const-patches* nil) (*68k-unimpl-opcodes* nil)
           (*68k-cold-enter-label* nil) (*68k-reload-label* nil) (*68k-stream-table-label* nil)
           (*68k-stream-section-label* nil) (*68k-stream-home-label* nil)
           (*68k-stream-end-label* nil))
-      (flet ((ex (i) (let ((a (and (< i (length x)) (aref x i))))
-                       (and a (%n68-abs-label buf base a)))))
-        (let ((*68k-gc-label* (ex 0)) (*68k-barrier-label* (ex 1)) (*68k-cons-label* (ex 2))
-              (*68k-subtag-label* (ex 3)) (*68k-car-label* (ex 4)) (*68k-cdr-label* (ex 5))
-              (*68k-array-len-label* (ex 6)) (*68k-alloc-obj-label* (ex 7))
-              (*68k-mul32-label* (ex 8)) (*68k-mulu64-label* (ex 9)) (*68k-divs32-label* (ex 10))
-              (*68k-mac-console-label* (ex 11)) (*68k-mac-getc-label* (ex 12))
-              (*68k-mac-service-label* (ex 13)) (*68k-thread-next-label* (ex 14)))
-          (setq entries (%n68-emit-module buf base bc fns fn-table rt (nth 7 m)))
+      ;; pass 1: every branch long, distances recorded
+      (let ((*68k-branch-plan* nil) (*68k-branch-ordinal* 0)
+            (*68k-branch-distances* (make-hash-table)) (*68k-fn-entry-positions* nil)
+            (*68k-abs-patches* nil))
+        (multiple-value-setq (buf entries) (%n68-emit-pass bc fns fn-table rt captured base))
+        (when entries (setq plan (m68k-relax-plan *68k-branch-ordinal*))))
+      ;; pass 2: each branch as short as pass 1 says it can be
+      (when entries
+        (let ((*68k-branch-plan* plan) (*68k-branch-ordinal* 0)
+              (*68k-branch-distances* nil) (*68k-fn-entry-positions* nil)
+              (*68k-abs-patches* nil) (*68k-unimpl-opcodes* nil))
+          (multiple-value-setq (buf entries) (%n68-emit-pass bc fns fn-table rt captured base))
+          (when (and entries *68k-unimpl-opcodes*)
+            (setq *n68-why* (list :unimplemented *68k-unimpl-opcodes*) entries nil))
           (when entries
-            (when *68k-unimpl-opcodes*
-              (setq *n68-why* (list :unimplemented *68k-unimpl-opcodes*) entries nil)))
-          (when entries
-            (m68k-fixup-labels buf)
             (let* ((nw (m68k-buffer-word-count buf)) (size (* 2 nw)) (w (m68k-buffer-words buf)))
               (if (> (+ base size) *t68-end*)
                   (setq *n68-why* :area-full entries nil)
@@ -255,5 +284,5 @@
                         (setf (mem-ref at :u16) (logand (ash a -16) #xFFFF))
                         (setf (mem-ref (+ at 2) :u16) (logand a #xFFFF))))
                     (setq *t68-ptr* (+ base size))
-                    (%t68-flush-code)))))))
-      (mapcar (lambda (e) (cons (car e) (%t68-object (+ base (cdr e) 3)))) entries))))
+                    (%t68-flush-code))))))))
+      (mapcar (lambda (e) (cons (car e) (%t68-object (+ base (cdr e) 3)))) entries)))

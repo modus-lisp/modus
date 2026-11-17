@@ -11298,7 +11298,22 @@
           (emit-ir :mov dest +vreg-vr+)
           (emit-ir :bnnull dest handler-label)
           ;; === Normal path: body ===
-          (compile-form body-form env dest)
+          ;; The body is registered on the lexical cleanup stack exactly as an
+          ;; UNWIND-PROTECT's protected form is, with NO cleanup forms, so a
+          ;; RETURN-FROM / RETURN / GO compiled inside it that branches OUT
+          ;; (a direct :br, never reaching the CLEAR-HANDLER below) still pops
+          ;; THIS frame on its way (%EMIT-UWP-UNWIND-TO emits the #x0512).
+          ;; Without it every such exit leaked one handler frame:
+          ;;   (block b (handler-case (return-from b 1) (error () 2)))
+          ;; grew the frame stack by one per execution -- and CATCH,
+          ;; IGNORE-ERRORS and RESTART-CASE compile through here too.  On
+          ;; bare aarch64 a worker's frames sit below the NEXT thread's
+          ;; window, so a long enough run (a background git sync: ~300
+          ;; frames per repository) overwrote that thread's MV buffer and
+          ;; binding-stack words, and the board faulted.
+          (let* ((my-seq (incf *uwp-seq-counter*))
+                 (*uwp-cleanups* (cons (list* my-seq env nil) *uwp-cleanups*)))
+            (compile-form body-form env dest))
           (emit-ir :trap #x0512)
           (emit-ir :br end-label)
           ;; === Handler path: dispatch on condition type ===

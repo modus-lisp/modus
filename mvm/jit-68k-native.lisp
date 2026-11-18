@@ -253,7 +253,7 @@
           (when entries (m68k-fixup-labels buf))
           (values buf entries))))))
 
-(defun %n68-translate (m)
+(defun %n68-translate (m &optional keep-thunk)
   "Module M (*JIT-MODULE-REGISTRY*'s (bc entry ft-list fn-table rt-table ...))
    as native 68k in the code area: an alist (NAME . FUNCTION-OBJECT), or NIL
    (*N68-WHY*).  Nothing is written unless everything resolves.
@@ -270,8 +270,10 @@
   (setq *n68-why* nil)
   (let* ((bc (first m)) (ft-list (third m)) (fn-table (fourth m)) (rt (fifth m))
          (captured (nth 7 m))
-         (fns (sort (remove "%MVM-EVAL-THUNK" (copy-list ft-list) :key (function car)
-                            :test (function string=))
+         (fns (sort (if keep-thunk
+                        (copy-list ft-list)
+                        (remove "%MVM-EVAL-THUNK" (copy-list ft-list) :key (function car)
+                                :test (function string=)))
                     (function <) :key (function second)))
          (base (logand (+ *t68-ptr* 15) -16))
          (buf nil) (entries nil) (plan nil))

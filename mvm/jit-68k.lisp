@@ -669,6 +669,41 @@
              (%t68-ready))
     (%t68-on-defun names)))
 
+(defun %native-thunk-run (forms bc entry ft-list fn-table rt-table lam-offsets)
+  "mvm-eval's seam: a toplevel form that LOOPS (%MVM-FORMS-LOOP-P: not a
+   definition) runs as native 68k, its eval thunk translated with the rest of
+   its module -- interpreted, a loop iteration cost ~500-800x its native code
+   (qemu-m68k: an empty DOTIMES step 8.3 us against 0.01).  The code area is
+   given back afterwards when nothing translated here can outlive the run: no
+   lambda in the module, and no other module translated meanwhile.  NIL -- interpret as before --
+   when the tier is off or anything refuses; an error the running form
+   signals propagates (the form is never re-run)."
+  (declare (ignore entry))
+  (when (and (%t68-allowed-p)
+             (not (and (boundp (quote *t68-off*)) *t68-off*))
+             (not (and (boundp (quote *n68-off*)) *n68-off*))
+             (%mvm-forms-loop-p forms) (%t68-ready))
+    (let* ((ptr *t68-ptr*)
+           (m (list bc nil ft-list fn-table rt-table lam-offsets nil
+                    (and (consp *jit-last-insns*) (eq (car *jit-last-insns*) bc)
+                         (cdr *jit-last-insns*))))
+           (fns (handler-case (%n68-translate m t) (error (c) c nil)))
+           (th (and fns (cdr (assoc "%MVM-EVAL-THUNK" fns :test (function string=))))))
+      (if (null th)
+          (progn (setq *t68-ptr* ptr) nil)
+          ;; given back only if nothing else was translated during the run --
+          ;; a DEFUN the loop EVALs puts its code after the thunk's
+          (let* ((n0 *n68-translated*) (t0 *t68-translated*)
+                 (no-lambdas (or (null lam-offsets)
+                                 (and (hash-table-p lam-offsets)
+                                      (eql (hash-table-count lam-offsets) 0))))
+                 (vals (unwind-protect (multiple-value-list (funcall th))
+                         (when (and no-lambdas
+                                    (eql *n68-translated* n0) (eql *t68-translated* t0))
+                           (setq *t68-ptr* ptr)))))
+            (setq *mvm-last-mv* (if (cdr vals) (cons (length vals) (cdr vals)) nil))
+            (list (car vals)))))))
+
 (defun %t68-ready ()
   "Is the JIT ready (its table found, its area known)?  Readies it if not; a
    JIT that cannot start turns itself off (*T68-OFF*, *T68-WHY*)."

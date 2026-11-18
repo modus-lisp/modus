@@ -4735,6 +4735,15 @@
             ((member n '("QUOTE" "FUNCTION" "LAMBDA") :test (function string=)) nil)
             (t (%mvm-loop-scan-args (cdr x)))))))
 
+(declaim (overridable %native-thunk-run))
+(defun %native-thunk-run (forms bc entry ft-list fn-table rt-table lam-offsets)
+  "A backend that can run a freshly compiled toplevel module natively itself
+   (the 68k native tier overrides this: a form that loops, run interpreted, is
+   hundreds of times slower) returns (PRIMARY-VALUE) having run it, with
+   *MVM-LAST-MV* set as MVM-INTERPRET leaves it.  NIL: interpret, as before."
+  (declare (ignore forms bc entry ft-list fn-table rt-table lam-offsets))
+  nil)
+
 (defun %mvm-forms-loop-p (forms)
   "True when FORMS runs a loop NOW: a top-level form that is not a definition and
    whose code (not its quoted data, nor the bodies of the lambdas it only makes)
@@ -4875,6 +4884,13 @@
                   (setq *e2-active-defun-names* persist-names)
                   (setq *jit-native-ran* nil)
                   (setq *jit-infra-fallback* nil)
+                  ;; A BACKEND'S OWN NATIVE RUN of a looping form (the 68k
+                  ;; native tier, jit-68k.lisp): (PRIMARY) when it ran it,
+                  ;; NIL to go on as below.
+                  (let ((%nt (%native-thunk-run forms bc entry ft-list fn-table
+                                                rt-table lam-offsets)))
+                    (if %nt
+                        (car %nt)
                   ;; WS4-S5b: JIT when enabled, interpret-fallback on a
                   ;; SETUP failure (page-build fail / unsupported) or
                   ;; the MV out-of-range residual — but NOT on a user condition
@@ -4944,7 +4960,7 @@
                         (mvm-interpret bc :entry-point entry :function-table fn-table
                                        :runtime-table rt-table :return-raw nil
                                        :lambda-offsets lam-offsets)
-                        bc fn-table rt-table lam-offsets))))
+                        bc fn-table rt-table lam-offsets))))))
          (%mv *mvm-last-mv*)
          ;; Cleared as soon as latched — see the sibling seam above.
          (%mvclr (setq *mvm-last-mv* nil)))

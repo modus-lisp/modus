@@ -1190,14 +1190,33 @@
 (defvar *68k-fn-entry-positions* nil
   "Pass 1: native positions of the function entries, for the margin.")
 
+(defvar *68k-branch-onepass* nil
+  "ONE PASS (the native tier's REPL modules, jit-68k-native %N68-TRANSLATE): with
+   no plan, a branch whose target is already placed is as short as its
+   distance allows, and a forward one is a word (Bcc.W, +-32 KB) -- a module
+   is far smaller than that; a word displacement that overflows signals in
+   M68K-FIXUP-LABELS, and the caller translates again in two passes.")
+
+(defun m68k-onepass-size (buf label-id pos)
+  "*68K-BRANCH-ONEPASS*'s size for a branch at POS to LABEL-ID."
+  (let ((tp (and label-id (gethash label-id (m68k-buffer-labels buf)))))
+    (if (null tp)
+        :word
+        (let ((d (- tp (+ pos 2))))
+          (cond ((and (/= d 0) (<= -128 d 127)) :byte)
+                ((<= -32768 d 32767) :word)
+                (t :long))))))
+
 (defun m68k-emit-branch (buf base label-id)
   "BRA (BASE #x6000), BSR (#x6100) or Bcc (#x6000 | cc<<8) to LABEL-ID, in the
    size the relaxation plan gives this branch's ordinal (long without one)."
   (let* ((ord (incf *68k-branch-ordinal*))
-         (size (if (and *68k-branch-plan* label-id (< ord (length *68k-branch-plan*)))
-                   (aref *68k-branch-plan* ord)
-                   :long))
-         (pos (m68k-buffer-position buf)))
+         (pos (m68k-buffer-position buf))
+         (size (cond ((and *68k-branch-plan* label-id (< ord (length *68k-branch-plan*)))
+                      (aref *68k-branch-plan* ord))
+                     ((and *68k-branch-onepass* label-id)
+                      (m68k-onepass-size buf label-id pos))
+                     (t :long))))
     ;; 68000: a boot stub's long branch is 16-bit; native code's is absolute.
     (when (and *68k-cpu-68000* (eq size :long) (not *68k-native-p*))
       (setq size :word))

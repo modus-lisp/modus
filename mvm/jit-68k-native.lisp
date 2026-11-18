@@ -258,10 +258,14 @@
    as native 68k in the code area: an alist (NAME . FUNCTION-OBJECT), or NIL
    (*N68-WHY*).  Nothing is written unless everything resolves.
 
-   TWO PASSES, as translate-mvm-to-68k relaxes the image's branches: the first
-   with every branch long records where each went, M68K-RELAX-PLAN sizes them,
-   the second emits each as short as it can be.  Without it every branch on the
-   68000 was a 6-byte JMP abs.L (Bcc.S over it for a conditional)."
+   ONE PASS, each branch sized as it is emitted (*68K-BRANCH-ONEPASS*: backward
+   as short as its distance allows, forward a word); if a word displacement
+   overflows, TWO PASSES, as translate-mvm-to-68k relaxes the image's branches:
+   the first with every branch long records where each went, M68K-RELAX-PLAN
+   sizes them, the second emits each as short as it can be.  (Every branch long
+   on the 68000 is a 6-byte JMP abs.L, a Bcc.S over it for a conditional.)
+   Profiled on MAME's Quadra 950, the second pass was half of translating a
+   DEFUN, a sixth of the whole."
   (%n68-init)
   (setq *n68-why* nil)
   (let* ((bc (first m)) (ft-list (third m)) (fn-table (fourth m)) (rt (fifth m))
@@ -280,31 +284,47 @@
           (*68k-cold-enter-label* nil) (*68k-reload-label* nil) (*68k-stream-table-label* nil)
           (*68k-stream-section-label* nil) (*68k-stream-home-label* nil)
           (*68k-stream-end-label* nil))
-      ;; pass 1: every branch long, distances recorded
-      (let ((*68k-branch-plan* nil) (*68k-branch-ordinal* 0)
-            (*68k-branch-distances* (make-hash-table)) (*68k-fn-entry-positions* nil)
-            (*68k-abs-patches* nil))
-        (multiple-value-setq (buf entries) (%n68-emit-pass bc fns fn-table rt captured base))
-        (when entries (setq plan (m68k-relax-plan *68k-branch-ordinal*))))
-      ;; pass 2: each branch as short as pass 1 says it can be
-      (when entries
-        (let ((*68k-branch-plan* plan) (*68k-branch-ordinal* 0)
+      (let ((patches nil) (one-failed nil))
+        ;; ONE PASS (docs/68k-threaded-jit.md, plan 1C): branches sized as they
+        ;; are emitted (translate-68k *68K-BRANCH-ONEPASS*).  A word displacement
+        ;; that overflows signals; then the two passes below.
+        (let ((*68k-branch-plan* nil) (*68k-branch-onepass* t) (*68k-branch-ordinal* 0)
               (*68k-branch-distances* nil) (*68k-fn-entry-positions* nil)
               (*68k-abs-patches* nil) (*68k-unimpl-opcodes* nil))
-          (multiple-value-setq (buf entries) (%n68-emit-pass bc fns fn-table rt captured base))
-          (when (and entries *68k-unimpl-opcodes*)
-            (setq *n68-why* (list :unimplemented *68k-unimpl-opcodes*) entries nil))
+          (multiple-value-setq (buf entries)
+            (handler-case (%n68-emit-pass bc fns fn-table rt captured base)
+              (error (c) c (setq one-failed t) (values nil nil))))
           (when entries
-            (let* ((nw (m68k-buffer-word-count buf)) (size (* 2 nw)) (w (m68k-buffer-words buf)))
-              (if (> (+ base size) *t68-end*)
-                  (setq *n68-why* :area-full entries nil)
-                  (progn
-                    (dotimes (i nw) (setf (mem-ref (+ base (* 2 i)) :u16) (aref w i)))
-                    ;; 68000 absolute addresses: base + the target's position
-                    (dolist (p *68k-abs-patches*)
-                      (let ((a (+ base (cdr p))) (at (+ base (car p))))
-                        (setf (mem-ref at :u16) (logand (ash a -16) #xFFFF))
-                        (setf (mem-ref (+ at 2) :u16) (logand a #xFFFF))))
-                    (setq *t68-ptr* (+ base size))
-                    (%t68-flush-code))))))))
+            (setq patches *68k-abs-patches*)
+            (when *68k-unimpl-opcodes*
+              (setq *n68-why* (list :unimplemented *68k-unimpl-opcodes*) entries nil))))
+        (when one-failed
+          ;; pass 1: every branch long, distances recorded
+          (let ((*68k-branch-plan* nil) (*68k-branch-ordinal* 0)
+                (*68k-branch-distances* (make-hash-table)) (*68k-fn-entry-positions* nil)
+                (*68k-abs-patches* nil))
+            (multiple-value-setq (buf entries) (%n68-emit-pass bc fns fn-table rt captured base))
+            (when entries (setq plan (m68k-relax-plan *68k-branch-ordinal*))))
+          ;; pass 2: each branch as short as pass 1 says it can be
+          (when entries
+            (let ((*68k-branch-plan* plan) (*68k-branch-ordinal* 0)
+                  (*68k-branch-distances* nil) (*68k-fn-entry-positions* nil)
+                  (*68k-abs-patches* nil) (*68k-unimpl-opcodes* nil))
+              (multiple-value-setq (buf entries) (%n68-emit-pass bc fns fn-table rt captured base))
+              (setq patches *68k-abs-patches*)
+              (when (and entries *68k-unimpl-opcodes*)
+                (setq *n68-why* (list :unimplemented *68k-unimpl-opcodes*) entries nil)))))
+        (when entries
+          (let* ((nw (m68k-buffer-word-count buf)) (size (* 2 nw)) (w (m68k-buffer-words buf)))
+            (if (> (+ base size) *t68-end*)
+                (setq *n68-why* :area-full entries nil)
+                (progn
+                  (dotimes (i nw) (setf (mem-ref (+ base (* 2 i)) :u16) (aref w i)))
+                  ;; 68000 absolute addresses: base + the target's position
+                  (dolist (p patches)
+                    (let ((a (+ base (cdr p))) (at (+ base (car p))))
+                      (setf (mem-ref at :u16) (logand (ash a -16) #xFFFF))
+                      (setf (mem-ref (+ at 2) :u16) (logand a #xFFFF))))
+                  (setq *t68-ptr* (+ base size))
+                  (%t68-flush-code)))))))
       (mapcar (lambda (e) (cons (car e) (%t68-object (+ base (cdr e) 3)))) entries)))

@@ -131,3 +131,50 @@ shape index is built in the core run and saved with the core.
   functions on the hosted 68k.  An image indexes those, or an equivalent it
   has, and gets a handler for each it lacks: on the 1 MB image 798 entries in
   8 KB and 79 handlers.  Entry offsets are 2 bytes.
+
+## The native tier: Lisp -> IR -> 68k (plan and status, 2026-11-18)
+
+Threaded tokens are the IMAGE's size trade (one byte a shape against ~10 of native
+code, for thousands of cold functions).  REPL code gains nothing from it, so a
+runtime DEFUN goes native through the same per-instruction emitter that built the
+image (`M68K-TRANSLATE-INSN`, baked in; `mvm/jit-68k-native.lisp`).  One front
+end, one 68k back end, for cross, self-hosted and runtime compilation alike --
+not a second compiler.  The plan, measured each step on MAME (Classic, Quadra 950)
+and the hosted 68k image:
+
+1. **IR -> native 68k for REPL code.**
+   - A. Native emitter instead of threaded tokens.  DONE (`(fib 20)` 2.2 -> 0.8 s
+     on the Quadra, threaded -> native).
+   - B. Instructions from the compiler, not decoded back from the bytecode
+     (mvm.lisp `*INSN-SINK*`, `%N68-INSNS`).  DONE (1aff96e6).
+   - C. One emission, not two.  The second pass only re-sized branches: in a
+     REPL module a backward branch's target is placed, so it is as short as its
+     distance allows, and a forward one is `Bcc.W` (+-32 KB); a module whose word
+     displacement overflows falls back to the two passes.  (`%N68-TRANSLATE`)
+   - D. No bytecode for code that goes native.  The bytes are still encoded for
+     every module; only the eval thunk and a refused translation's interpreter
+     fallback read them.
+2. **A resident native compiler.**  DONE another way: the Quadra map is all
+   native (`MODUS_MAC68K_MACHINE=quadra`), and the small-image size switches
+   that cost speed are off there (`MODUS_SMALL_ACCESS=0`, `MODUS_68K_SHARED=0`).
+3. **Don't translate at DEFUN.**  Translate at the FIRST CALL, not at definition
+   (x64 interprets until hot; here a recursive call inside the bytecode would
+   never count, and there is no on-stack replacement, so a first call of
+   `(fib 25)` would run interpreted throughout).  Moves the cost off DEFUN and
+   off definitions never called.
+
+And in the front end, which every target shares (profile of `defun tak` on the
+Quadra, 2026-11-18: front end ~45%, translation ~33%):
+
+4. **One closure analysis per lambda**, not one walk of the body per parameter
+   (`%REBIND-BOXED-PARAMS` -> `%FORM-HAS-CLOSURE-P` under `SOME`, expanding macros
+   as it walks: 10.5%), and the `RETURN-FROM` escape walk with it (4.8%).
+5. **Symbol slots read directly** in `%CL-SYM-NAME`, `%CL-SYM-PACKAGE`,
+   `NORMALIZE-NAME` (generic `AREF` -> `%AREF-SLOW` every time: 8.4%).
+6. **Function and macro lookup by symbol, not by name string** (`STRING=`,
+   `GETHASH`, `%HT-*`, `MEMBER`: ~30% self).  The structural one.
+
+Measuring: `scripts/period-lisps/lisp.lua` `PROF=T0:T1` samples PC and the A6
+chain every `PROF_US` emulated microseconds; `scripts/mac68k-prof/native.py` and
+`tree.native.py` map them through `cl.map`.  MAME types a long form in tens of
+emulated seconds: the profile window starts where the REPL's reader stops.

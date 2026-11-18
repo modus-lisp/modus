@@ -1866,6 +1866,7 @@ func register(_ name: String, _ fn: Call) {
 public func modusSwiftInstall() {
     installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
     installSpeech()                                // Speech.swift: the platform's voice and ear
+    installBluetooth()                             // Bluetooth.swift: LE links, for a mesh
     installNative()                                // Native.swift: app-grade components (an app, not the desk)
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)

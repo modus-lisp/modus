@@ -317,6 +317,141 @@ let appNavNew: Call = { p, n, quiet, _, _, _ in
     return h
 }
 
+/// app_nav_present(title): a navigation controller with a root screen titled TITLE, shown full-screen over what
+/// is there (the desk, say) -- an app within an app.  Its bar holds still, as app_nav_new's QUIET.  Returns its
+/// handle; app_nav_root gives the root screen's, and app_nav_dismiss takes it away.
+let appNavPresent: Call = { p, n, _, _, _, _ in
+    guard let host = presenter() else { return 0 }
+    let (rootHandle, root) = makeScreen(text(p, n))
+    let nav = UINavigationController(rootViewController: root)
+    nav.navigationBar.prefersLargeTitles = false
+    let delegate = NativeNav()
+    delegate.shown = [root]
+    delegate.nav = nav
+    nav.delegate = delegate
+    nav.interactivePopGestureRecognizer?.delegate = delegate
+    if #available(iOS 26.0, *) { nav.interactiveContentPopGestureRecognizer?.delegate = delegate }
+    let h = newHandle()
+    navs[h] = nav
+    navDelegates[h] = delegate
+    navRoots[h] = rootHandle
+    nav.modalPresentationStyle = .fullScreen
+    if let window = keyWindow() { nav.overrideUserInterfaceStyle = window.overrideUserInterfaceStyle }
+    host.present(nav, animated: true)
+    return h
+}
+
+/// app_nav_dismiss(nav): a navigation controller app_nav_present showed, taken away.
+let appNavDismiss: Call = { h, _, _, _, _, _ in
+    guard let nav = navs[h] else { return 0 }
+    nav.dismiss(animated: true)
+    return 1
+}
+
+/// A text field and a send button along a screen's bottom, above the keyboard when it is up -- what a chat is
+/// written in.  Send (or Return) is a COMPOSE event with the text, and the field is emptied.  The screen's
+/// tables end above it, and one scrolled to its end stays there as the bar moves.
+final class Composer: UIView, UITextFieldDelegate {
+    let handle: UInt
+    let field = UITextField()
+    let sendButton = UIButton(type: .system)
+    weak var screen: UIViewController?
+
+    init(handle: UInt, placeholder: String) {
+        self.handle = handle
+        super.init(frame: .zero)
+        backgroundColor = .systemBackground
+        let rule = UIView()
+        rule.backgroundColor = .separator
+        field.placeholder = placeholder
+        field.borderStyle = .none
+        field.backgroundColor = .secondarySystemBackground
+        field.layer.cornerRadius = 18
+        field.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 1))
+        field.leftViewMode = .always
+        field.returnKeyType = .send
+        field.delegate = self
+        sendButton.setImage(UIImage(systemName: "arrow.up.circle.fill",
+                                    withConfiguration: UIImage.SymbolConfiguration(pointSize: 30)), for: .normal)
+        sendButton.tintColor = .label
+        sendButton.accessibilityLabel = "Send"
+        sendButton.addAction(UIAction { [weak self] _ in self?.sendText() }, for: .primaryActionTriggered)
+        for v in [rule, field, sendButton] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
+        NSLayoutConstraint.activate([
+            rule.topAnchor.constraint(equalTo: topAnchor), rule.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rule.trailingAnchor.constraint(equalTo: trailingAnchor), rule.heightAnchor.constraint(equalToConstant: 0.5),
+            field.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            field.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+            field.leadingAnchor.constraint(equalTo: layoutMarginsGuide.leadingAnchor),
+            field.heightAnchor.constraint(equalToConstant: 36),
+            sendButton.leadingAnchor.constraint(equalTo: field.trailingAnchor, constant: 8),
+            sendButton.trailingAnchor.constraint(equalTo: layoutMarginsGuide.trailingAnchor),
+            sendButton.centerYAnchor.constraint(equalTo: field.centerYAnchor),
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func sendText() {
+        let t = (field.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        field.text = ""
+        send("COMPOSE", [.int(Int(handle)), .string(t)])
+    }
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool { sendText(); return false }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard let view = screen?.view else { return }
+        // the screen's tables: their content ends above this bar
+        for case let t as UITableView in view.subviews {
+            let cover = max(0, t.frame.maxY - frame.minY) - t.safeAreaInsets.bottom
+            guard abs(t.contentInset.bottom - cover) > 0.5 else { continue }
+            let atEnd = t.contentOffset.y + t.bounds.height >= t.contentSize.height + t.adjustedContentInset.bottom - 20
+            t.contentInset.bottom = max(0, cover)
+            t.verticalScrollIndicatorInsets.bottom = max(0, cover)
+            if atEnd { scrollToEnd(t) }
+        }
+    }
+}
+
+/// T scrolled to its last row.
+func scrollToEnd(_ t: UITableView, animated: Bool = false) {
+    let sections = t.numberOfSections
+    guard sections > 0 else { return }
+    let rows = t.numberOfRows(inSection: sections - 1)
+    guard rows > 0 else { return }
+    t.scrollToRow(at: IndexPath(row: rows - 1, section: sections - 1), at: .bottom, animated: animated)
+}
+
+private var composers: [UInt: Composer] = [:]
+
+/// app_compose(screen, placeholder): a compose bar along SCREEN's bottom (Composer).  Returns its handle, the
+/// COMPOSE events'.
+let appCompose: Call = { h, p, n, _, _, _ in
+    guard let vc = screens[h] else { return 0 }
+    let ch = newHandle()
+    let bar = Composer(handle: ch, placeholder: text(p, n))
+    bar.screen = vc
+    bar.translatesAutoresizingMaskIntoConstraints = false
+    vc.view.addSubview(bar)
+    NSLayoutConstraint.activate([
+        bar.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor),
+        bar.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor),
+        bar.bottomAnchor.constraint(equalTo: vc.view.keyboardLayoutGuide.topAnchor),
+    ])
+    vc.view.keyboardLayoutGuide.usesBottomSafeArea = true
+    composers[ch] = bar
+    return ch
+}
+
+/// app_table_scroll_end(table, animated): TABLE scrolled to its last row.
+let appTableScrollEnd: Call = { h, animated, _, _, _, _ in
+    guard let source = tables[h] else { return 0 }
+    source.table.layoutIfNeeded()
+    scrollToEnd(source.table, animated: animated != 0)
+    return 1
+}
+
 /// Make VC the window's root -- once there is a window.  The image starts beside UIKit, so an app's first call
 /// can come before the scene has connected and made one (the first launch after an install, typically), and a
 /// root given to no window is never seen: the app stays black.  Until then, look again every 50 ms.
@@ -3538,6 +3673,10 @@ func installNative() {
     register("app_nav_root", appNavRoot)
     register("app_push", appPush)
     register("app_pop", appPop)
+    register("app_nav_present", appNavPresent)
+    register("app_nav_dismiss", appNavDismiss)
+    register("app_compose", appCompose)
+    register("app_table_scroll_end", appTableScrollEnd)
     register("app_path_title", appPathTitle)
     register("app_browser", appBrowser)
     register("app_browser_push", appBrowserPush)

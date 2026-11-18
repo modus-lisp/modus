@@ -95,6 +95,7 @@ cat > "$OUT/Info.plist" <<PLIST
 $( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
   '<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>' )
   <key>NSLocalNetworkUsageDescription</key><string>${MODUS_IOS_NAME:-modus} connects to computers on your network and on your VPN: the servers you add, over SSH.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>${MODUS_IOS_NAME:-modus} talks with phones nearby over Bluetooth: a mesh chat, phone to phone.</string>
   <key>NSSpeechRecognitionUsageDescription</key><string>The Listen app turns what you say into text.</string>
   <key>UILaunchScreen</key><dict/>
   <key>UIFileSharingEnabled</key><true/>

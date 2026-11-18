@@ -4778,6 +4778,10 @@
     (%mexp-memo-invalidate)
     (setf (gethash hash *macro-table*) expander)))
 
+(defvar *%sole-eval-form* nil
+  "The form MVM-EVAL-FORMS is evaluating when it was given exactly one, else
+   NIL (the DEFMACRO clause of COMPILE-COMPOUND).")
+
 (defun %env-lexically-empty-p (env)
   "No variable or local function binding anywhere in compile-env ENV's chain."
   (loop
@@ -9357,6 +9361,17 @@
              (setq d-params (nreverse acc)))
            ;; (1) Compile-time registration so OTHER forms in this same
            ;; compilation unit that USE the macro can expand against it.
+           ;; A DEFMACRO that IS the whole form being evaluated -- the REPL's,
+           ;; (eval '(defmacro ...)), a LOADed file's toplevel form -- has no
+           ;; other form in its unit, so (1) is skipped and (2) compiles the
+           ;; expander once, in line.  (1) was a nested EVAL of its own -- a
+           ;; module, a publish, an interpreted thunk -- and on the 68k (qemu
+           ;; profile) three quarters of a DEFMACRO.  Not under COMPILE-FILE
+           ;; (*FASL-COMPILE-ONLY*), whose later forms need the macro.
+           (unless (and *mvm-eval-runtime-p* (boundp '*%sole-eval-form*)
+                        (eq form *%sole-eval-form*)
+                        (not (and (boundp '*fasl-compile-only*)
+                                  (symbol-value '*fasl-compile-only*))))
            (let ((expander
                   (setq %dm-expander
                   (%eval-expander-runtime
@@ -9389,7 +9404,7 @@
              ;; expander whenever the branch IS taken.  Mirrors the
              ;; defstruct keyword-ctor persistence a few hundred lines down.
              (when *mvm-eval-runtime-p*
-               (set-macro-function name expander)))
+               (set-macro-function name expander))))
          ;; (2) RUNTIME registration + return-the-name.  An ANSI deftest
          ;; like defmacro.1 does `(eq (defmacro NAME (..) ..) 'NAME)` and
          ;; then `(eval '(NAME ..))`, so the compiled nested DEFMACRO must

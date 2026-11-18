@@ -4557,9 +4557,15 @@
       (setq *compile-target* s-ct))))
 
 (defun mvm-eval-forms (forms)
-  (if *static-build-p*
-      (%mvm-eval-forms-nested-in-static-build forms)
-      (%mvm-eval-forms-1 forms)))
+  ;; *%SOLE-EVAL-FORM* (compiler.lisp): the one form, for the compiler's
+  ;; DEFMACRO; SETQ and put back, as evaluations nest
+  (let ((saved (and (boundp '*%sole-eval-form*) *%sole-eval-form*)))
+    (setq *%sole-eval-form* (and (consp forms) (null (cdr forms)) (car forms)))
+    (unwind-protect
+         (if *static-build-p*
+             (%mvm-eval-forms-nested-in-static-build forms)
+             (%mvm-eval-forms-1 forms))
+      (setq *%sole-eval-form* saved))))
 
 ;;; ============================================================
 ;;; THE EVAL LOCK — one compiler at a time

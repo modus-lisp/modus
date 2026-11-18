@@ -15,6 +15,7 @@ def nm(a):
     i = bisect.bisect_right(st, a) - 1
     return rows[i][2] if i >= 0 and a < rows[i][0] + rows[i][1] + 16 else None
 samples = []
+d = 0
 for l in open(R + 'prof.txt'):
     q = l.split()
     if q[0] == 'BASE':
@@ -23,7 +24,7 @@ for l in open(R + 'prof.txt'):
 if len(sys.argv) > 3:
     t0, t1 = float(sys.argv[2]), float(sys.argv[3])
 else:
-    busy = [t for t, a in samples if 0x600000 <= a[0] < rows[-1][0] + rows[-1][1]]
+    busy = [t for t, a in samples if rows[0][0] <= a[0] < rows[-1][0] + rows[-1][1]]
     t0, t1 = min(busy), max(busy)
 tree, n, selfc = {}, 0, collections.Counter()
 for t, addrs in samples:

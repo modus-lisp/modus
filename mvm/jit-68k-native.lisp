@@ -54,7 +54,10 @@
   '(:n68-coinit :pending))
 
 (defun %n68-find-exports ()
-  "Read the export table that follows the shape table (\"modusJXL\")."
+  "Read the export table that follows the shape table (\"modusJXL\"), or in an
+   all-native image (*T68-TABLE* :NATIVE-ONLY) the one after the helpers."
+  (when (eq *t68-table* :native-only)
+    (return-from %n68-find-exports (%n68-read-exports (%n68-scan-exports))))
   (let* ((tab *t68-table*)
          (n (%t68-u32 (+ tab 12)))
          ;; the entries' offsets are big-endian u16s from the magic, in layout
@@ -69,6 +72,22 @@
           do (setq a (+ a 4)))
     (unless (and (= (%t68-u32 a) #x6D6F6475) (= (%t68-u32 (+ a 4)) #x734A584C))
       (error "jit-68k-native: no export table after the shape table"))
+    (%n68-read-exports a)))
+
+(defun %n68-scan-exports ()
+  "An all-native image's export table: the first \"modusJXL\" after CAR's
+   entry, longword by longword (once, when the JIT starts)."
+  (let ((a (logand (- (%val->word (function car)) 3) -4)))
+    (loop repeat 16000000
+          until (and (= (%t68-u32 a) #x6D6F6475) (= (%t68-u32 (+ a 4)) #x734A584C))
+          do (setq a (+ a 4)))
+    (unless (and (= (%t68-u32 a) #x6D6F6475) (= (%t68-u32 (+ a 4)) #x734A584C))
+      (error "jit-68k-native: no export table in the image"))
+    a))
+
+(defun %n68-read-exports (a)
+  "The export table whose magic is at A, into *N68-EXPORTS*."
+  (progn
     (let* ((k (%t68-u32 (+ a 8)))
            (v (make-array k :initial-element nil)))
       (dotimes (i k)

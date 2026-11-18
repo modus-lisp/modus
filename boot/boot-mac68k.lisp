@@ -41,7 +41,8 @@
           ((string-equal m "plus1m") :plus-1m)
           ((string-equal m "plus1mjit") :plus-1m-jit)
           ((string-equal m "classicos") :classic-os)
-          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classicos, classic2m, plus1m or plus1mjit" m))))
+          ((string-equal m "quadra") :quadra)
+          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classicos, quadra, classic2m, plus1m or plus1mjit" m))))
   "Which Mac's memory map (MODUS_MAC68K_MACHINE): :LC, the 32 MB LC 475 /
    Quadra 605 class this file was measured on, or :CLASSIC, a Mac Classic
    with 4 MB (its maximum) -- measured in MAME's macclasc when our boot
@@ -106,6 +107,29 @@
               :boot-heap #x01000000 :boot-heap-size #x00800000
               :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
               :boot-stack-top #x01A00000)
+;; A BIG MAC LAUNCHED FROM MAC OS (MODUS_MAC68K_MACHINE=quadra): :CLASSIC-OS's
+    ;; shape for a 32 MB Quadra 950 (MAME -ramsize 32M), every region big enough
+    ;; that nothing pages or thrashes: the all-native image (~9 MB of 68000
+    ;; code, MODUS_68K_THREADED=0 MODUS_68K_PAGED=0) from 6 MB -- a 32 MB
+    ;; Quadra's ROM boots with its stack near #x400A00, where a load at 4 MB
+    ;; read over it (Sad Mac 0000000F 00000001) -- a 4 MB static
+    ;; heap, a 2 MB JIT area, two 2 MB semispaces; nothing above #x1B00000 (Mac
+    ;; OS keeps the top 5 MB).  The place to meet MCL before memory is cut back.
+    ;; THE CORE RUN must fit in 32 MB too (Basilisk II faults above that), so
+    ;; its boot heap is the static heap's and the JIT area's 6 MB, which the run
+    ;; does not use; its kind bytes (kind map + (address - region) / 8) then
+    ;; fall in the young pair's range, unused in that run, and its stack under
+    ;; NIL's page above the kind map.
+    (:quadra  :load #x00600000 :static-lo #x00F00000 :static-hi #x01300000
+              :jit-area-lo #x01300000 :jit-area-hi #x01500000 :jit-max-bytecode 16384
+              :region #x01500000 :heap-size #x00420000 :gc-guard #x00010000
+              :kind-map #x01910000 :cache-lo #x019A0000 :cache-hi #x019C0000
+              :staging #x019C0000 :staging-size #x00000000
+              :nil-page #x01A00000
+              :stack-top #x019F0000 :scratch #x019F0000 :io-buf #x019F1000
+              :boot-heap #x00F00000 :boot-heap-size #x00600000
+              :boot-cache-lo #x01A10000 :boot-cache-hi #x01B00000
+              :boot-stack-top #x019F0000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
     ;; the 4 MB map; the static heap from the image's init-only text
@@ -323,7 +347,7 @@
    heap, cache and stack, above 4 MB; the descriptor's SAVE flag then has
    KERNEL-MAIN send the core over serial port A."
   (let* ((buf (make-m68k-buffer))
-         (classic (member *mac68k-machine* '(:classic :classic-os :classic-2m :plus-1m :plus-1m-jit)))
+         (classic (member *mac68k-machine* '(:classic :classic-os :quadra :classic-2m :plus-1m :plus-1m-jit)))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
          (fill (mvm-make-label))

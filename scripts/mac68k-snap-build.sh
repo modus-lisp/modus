@@ -6,13 +6,16 @@
 #   mame/ldpath, mame/root/usr/bin/chdman  (Debian bookworm's mame, mame-tools unpacked)
 set -u
 S=$1; D=$2; RSS=${RSS:-/tmp/rss}
+# MACHINE=quadra: the big map, all native and unpaged (boot-mac68k :QUADRA); default classicos
+MACHINE=${MACHINE:-classicos}
+if [ $MACHINE = quadra ]; then KNOBS="MODUS_68K_PAGED=0 MODUS_68K_THREADED=0"
+else KNOBS="MODUS_68K_PAGED=1 MODUS_68K_THREADED=1 MODUS_68K_HOT=mvm/68k-hot-mac.txt MODUS_HOT_ORDER=mvm/68k-hotorder-repl.txt"; fi
 rm -rf $D && mkdir -p $D && cd $S
-env MODUS_VESSEL=${MODUS_VESSEL:-/home/claude/modus-mac/.vessel} MODUS_68K_JIT=1 MODUS_MAC68K_MACHINE=classicos \
-  MODUS_68K_PAGED=1 MODUS_68K_CPU=68000 MODUS_SMALL_IMAGE=1 MODUS_NARROW_STRINGS=1 MODUS_68K_THREADED=1 \
-  MODUS_68K_HOT=mvm/68k-hot-mac.txt MODUS_HOT_ORDER=mvm/68k-hotorder-repl.txt MODUS_68K_REGIONS=$D/regions.txt \
+env MODUS_VESSEL=${MODUS_VESSEL:-/home/claude/modus-mac/.vessel} MODUS_68K_JIT=1 MODUS_MAC68K_MACHINE=$MACHINE \
+  MODUS_68K_CPU=68000 MODUS_SMALL_IMAGE=1 MODUS_NARROW_STRINGS=1 $KNOBS MODUS_68K_REGIONS=$D/regions.txt \
   MODUS_SYMMAP=$D/cl.map MODUS_CL_REPL_OUT=$D/cl.bin sbcl --dynamic-space-size 12288 --script mvm/build-mac68k-cl-repl.lisp > $D/build.log 2>&1
 echo "BUILD-EXIT $?"; grep -E "Unhandled|68k paged:" $D/build.log | head -5
-for i in 1 2 3; do MODUS_MAC68K_MACHINE=classicos MALLOC_MMAP_MAX_=0 MAC68K_JIT=true MAC68K_ROM=$RSS/b2/lc475.rom \
+for i in 1 2 3; do MODUS_MAC68K_MACHINE=$MACHINE MALLOC_MMAP_MAX_=0 MAC68K_JIT=true MAC68K_ROM=$RSS/b2/lc475.rom \
   MAC68K_BASILISK="env MAC_BASILISK_BIN=BasiliskII-jit-lo $RSS/b2/basilisk-headless.sh" \
   timeout 1500 python3 scripts/mac68k-core.py $D/cl.bin $D/c.dsk > $D/core.log 2>&1 && break; done
 echo "CORE-EXIT $?"; grep "mac68k-core: /" $D/core.log | cut -c1-100

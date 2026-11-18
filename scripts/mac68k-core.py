@@ -40,6 +40,7 @@ REPO = os.path.dirname(HERE)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
+    'quadra':    (0x00600000, 0x00F00000, 0x01300000, 0x01500000, 0x20000),   # JIT area above
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
@@ -47,7 +48,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
 # a map that can run on top of Mac OS (boot-mac68k's :CLASSIC-OS; launched by
 # scripts/mac68k-chain.py's application): the RAM it needs.  The boot blocks'
 # record then names the static block's #x6050, the open file's reference number.
-CHAIN_MEMTOP = {'classicos': 0x00400000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
+CHAIN_MEMTOP = {'classicos': 0x00400000, 'quadra': 0x02000000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk
 # puts it there
@@ -319,7 +320,10 @@ def relocate(core, static_lo=None):
 def main(image, disk):
     md = disk_module()
     img0 = open(image, 'rb').read()
-    img, resident, count = md.paged(img0)
+    if img0.find(b'modusPGD') >= 0:
+        img, resident, count = md.paged(img0)
+    else:                                   # unpaged (MODUS_68K_PAGED=0): all resident
+        img, resident, count = img0, len(img0), 0
     img = bytearray(img)
     # what must stay resident: up to the init-only text's marker, when there is
     # one (the static heap is laid over that text; see below)
@@ -382,8 +386,10 @@ def main(image, disk):
     streams = img[resident:]
     stream_disk = 1024 + len(chunk)                # disk byte of the section's first
     k = chunk.find(b'modusPGD')
-    table, cnt, section = struct.unpack_from('>III', chunk, k + 8)
-    struct.pack_into('>I', chunk, k + 20, (section - stream_disk) & 0xFFFFFFFF)  # disk bias (SUB.L wraps)
+    cnt = 0
+    if k >= 0:
+        table, cnt, section = struct.unpack_from('>III', chunk, k + 8)
+        struct.pack_into('>I', chunk, k + 20, (section - stream_disk) & 0xFFFFFFFF)  # disk bias (SUB.L wraps)
     set_flag(chunk, 'core', 1)
     # 3. COLD NAMES (mvm/mac68k-cold.lisp): IMAGE.cold, when the build wrote one,
     # on a block boundary after the streams; the static block's #x6044 says where

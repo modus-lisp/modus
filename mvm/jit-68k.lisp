@@ -236,7 +236,12 @@
 (defun %t68-init (&optional (area-size 1048576))
   "Ready the JIT: the shape table and NEXT, the constant cells, the code area,
    the counters (a variable's initial value never runs in the image)."
-  (%t68-find-table) (%t68-cells-init)
+  ;; An ALL-NATIVE image has no threaded dispatcher or shape table: only the
+  ;; native tier runs (*T68-TABLE* :NATIVE-ONLY), %T68-ON-DEFUN skips the
+  ;; threaded fallback, and the export table is found by its magic.
+  (handler-case (%t68-find-table)
+    (error () (setq *t68-table* :native-only)))
+  (%t68-cells-init)
   (let ((fixed (%t68-fixed-area)))
     (if fixed
         (setq *t68-ptr* (car fixed) *t68-end* (cdr fixed))
@@ -602,10 +607,12 @@
   (let ((m (and names *jit-module-registry* (gethash (car names) *jit-module-registry*))))
     (when m
       (let ((fns (or (%t68-native m names)
+                     (if (eq *t68-table* :native-only)
+                         nil
                      (if (and (%t68-max-bytecode) (> (length (first m)) (%t68-max-bytecode)))
                          (progn (setq *t68-why* (list :too-big (length (first m)))) nil)
                          (handler-case (%t68-translate m)
-                           (error (c) (setq *t68-why* (list :error (princ-to-string c))) nil))))))
+                           (error (c) (setq *t68-why* (list :error (princ-to-string c))) nil)))))))
         (if fns
             (progn
               (setq *t68-translated* (+ *t68-translated* 1))

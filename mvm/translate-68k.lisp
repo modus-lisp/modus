@@ -5185,6 +5185,10 @@
       (m68k-emit-barrier-helper buf))
     (when *68k-cold-fns*
       (m68k-emit-thread-dispatch buf function-table))
+    ;; An all-native image with the runtime JIT has no dispatcher to put the
+    ;; native tier's export table after: it goes here, found by its magic.
+    (when (and *68k-jit-shapes* (not *68k-cold-fns*))
+      (m68k-emit-native-exports buf))
     (when *68k-array-len-label*
       (m68k-emit-array-len-helper buf))
     (when *68k-alloc-obj-label*

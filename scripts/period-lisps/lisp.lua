@@ -147,3 +147,45 @@ if os.getenv("MOUSE") then
     end
   end)
 end
+
+-- PROF=T0:T1: from emulated second T0 to T1, every PROF_US microseconds
+-- (default 1000), the PC and the return addresses up the A6 frame chain
+-- (LINK frames: [A6] the caller's A6, [A6+4] its return address), to
+-- SNAPDIR/prof.txt as "T PC RET1 RET2 ...".  The first line is "BASE b":
+-- ApplLimit ($130), where mac68k-chain.s's relocating load put the map
+-- (scripts/mac68k-prof/native.py maps the addresses through cl.map).
+-- Sampled by a coroutine sleeping on emu.wait (emulated time), NOT a frame
+-- callback: those run at the video frame's end, exactly when the Mac's VBL
+-- interrupt does, and saw almost nothing but its handler.
+if os.getenv("PROF") then
+  local t0, t1 = string.match(os.getenv("PROF"), "([%d%.]+):([%d%.]+)")
+  t0, t1 = tonumber(t0), tonumber(t1)
+  local step = tonumber(os.getenv("PROF_US") or "1000") / 1e6
+  local cpu = manager.machine.devices[":maincpu"]
+  local mem = cpu.spaces["program"]
+  local f = io.open(snapdir .. "/prof.txt", "w")
+  local function sample(t)
+    local s = cpu.state
+    local out = { string.format("%.4f %X SP=%X SR=%X", t, s["PC"].value, s["A7"].value, s["SR"].value) }
+    local a6 = s["A6"].value
+    for i = 1, 48 do
+      if a6 == 0 or a6 % 2 == 1 or a6 > 0x2000000 then break end
+      local nxt, ret = mem:read_u32(a6), mem:read_u32(a6 + 4)
+      table.insert(out, string.format("%X", ret))
+      if nxt == a6 then break end
+      a6 = nxt
+    end
+    f:write(table.concat(out, " ") .. "\n")
+  end
+  local co = coroutine.create(function()
+    emu.wait(t0)
+    f:write(string.format("BASE %X\n", mem:read_u32(0x130)))
+    while manager.machine.time:as_double() < t1 do
+      sample(manager.machine.time:as_double())
+      emu.wait(step)
+    end
+    f:close()
+  end)
+  local ok, err = coroutine.resume(co)
+  if not ok then print("lisp.lua: PROF: " .. tostring(err)) end
+end

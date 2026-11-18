@@ -2895,10 +2895,17 @@
 ;; MODUS_SMALL_IMAGE: the globals' init thunks run in batches through one
 ;; guarded loop, not a HANDLER-CASE's code each (compiler.lisp *INIT-GLOBALS-BATCHED*).
 (when cl-user::*small-image* (setq modus.mvm::*init-globals-batched* t))
-;; ... and a quoted symbol's site is one call (compiler.lisp *STATIC-SYMBOL-ONE-CALL*).
-(when cl-user::*small-image* (setq modus.mvm::*static-symbol-one-call* t))
-;; ... and a global read or write is one call (compiler.lisp *GV-CACHE-MODE* :CALL).
-(when cl-user::*small-image* (setq modus.mvm::*gv-cache-mode* :call))
+;; MODUS_SMALL_ACCESS (default: MODUS_SMALL_IMAGE): a quoted symbol's site is
+;; one call (compiler.lisp *STATIC-SYMBOL-ONE-CALL*) and a global read or write
+;; is one call (*GV-CACHE-MODE* :CALL), not the inline loads.  Measured on the
+;; all-native Quadra image (MAME, 68040), compiling a DEFMACRO: the two callees
+;; were the top of the profile, %STATIC-SYMBOL-REF 9.6% and %GV-REF-FILL 7.6%
+;; of the time, self.  MODUS_SMALL_ACCESS=0 keeps the rest of a small image.
+(defvar cl-user::*small-access*
+  (let ((v (sb-ext:posix-getenv "MODUS_SMALL_ACCESS")))
+    (if (and v (plusp (length v))) (string/= v "0") cl-user::*small-image*)))
+(when cl-user::*small-access* (setq modus.mvm::*static-symbol-one-call* t))
+(when cl-user::*small-access* (setq modus.mvm::*gv-cache-mode* :call))
 ;; ... and its global-cell cache has *SMALL-GV-CACHE-SLOTS* slots (above).
 (when cl-user::*small-image* (setq modus.mvm::*gv-cache-slots* cl-user::*small-gv-cache-slots*))
 ;; ... and a 30-bit tower's arithmetic range guard is a shift pair

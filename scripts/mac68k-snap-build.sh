@@ -11,7 +11,7 @@ MACHINE=${MACHINE:-classicos}
 # SHIFT=HEX: the whole map moved (boot-mac68k MODUS_MAC68K_SHIFT); always six
 # digits, so builds a shift apart record strings of one length (mac68k-reloc.py)
 export MODUS_MAC68K_SHIFT=$(printf '%06X' $((16#${SHIFT:-0})))
-if [ $MACHINE = quadra ]; then KNOBS="MODUS_68K_PAGED=0 MODUS_68K_THREADED=0"
+if [ $MACHINE = quadra ]; then KNOBS="MODUS_68K_PAGED=0 MODUS_68K_THREADED=0 MODUS_SMALL_ACCESS=${MODUS_SMALL_ACCESS:-0}"
 else KNOBS="MODUS_68K_PAGED=1 MODUS_68K_THREADED=1 MODUS_68K_HOT=mvm/68k-hot-mac.txt MODUS_HOT_ORDER=mvm/68k-hotorder-repl.txt"; fi
 rm -rf $D && mkdir -p $D && cd $S
 env MODUS_VESSEL=${MODUS_VESSEL:-/home/claude/modus-mac/.vessel} MODUS_68K_JIT=1 MODUS_MAC68K_MACHINE=$MACHINE \

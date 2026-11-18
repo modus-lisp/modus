@@ -88,11 +88,20 @@ dopen:
 dclose: moveq   #0, %d0
         rts
 
-| ---- CONTROL / STATUS: KillIO is fine, nothing else is supported ----
+| ---- CONTROL / STATUS: KillIO, and the drive's icon; nothing else ----
+| csCode 21 (the drive's icon) and 22 (the medium's): csParam = an ICN#,
+| the icon then its mask, which the Finder draws the disk with (without
+| them, a generic document)
 dctl:   moveq   #-17, %d0               | controlErr
         cmp.w   #1, 26(%a0)             | csCode KillIO
+        beq     cok
+        cmp.w   #21, 26(%a0)
+        beq     cicon
+        cmp.w   #22, 26(%a0)
         bne     cdone
-        moveq   #0, %d0
+cicon:  pea     hdicon(%pc)             | (A1 is the DCE: IODone needs it)
+        move.l  (%sp)+, 28(%a0)         | csParam
+cok:    moveq   #0, %d0
 cdone:  move.l  0x8FC, -(%sp)           | JIODone
         rts
 dstat:  moveq   #-18, %d0               | statusErr
@@ -268,6 +277,28 @@ sfail:  dbra    %d4, sretry
         rts
 
         .align  2
+| ---- the drive's icon (CONTROL 21 / 22): a hard disk -- a flat case, its
+| light and two slots ----
+hdicon:
+| the icon
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0xFFFFFFFF, 0x80000001, 0x80000001
+        .long   0x903FC7F9, 0x80000001, 0x80000001, 0x80000001
+        .long   0x80000001, 0x80000001, 0xFFFFFFFF, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+| its mask
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+        .long   0x00000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+        .long   0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF
+        .long   0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x00000000
+        .long   0x00000000, 0x00000000, 0x00000000, 0x00000000
+
 | ---- data (patched: BASE, VOLBLOCKS) ----
 base:   .long   64                      | the volume's first block
 volblocks: .long 0                      | its length, in blocks

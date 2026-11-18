@@ -7,7 +7,8 @@ REFSLOT).  OUT.bin is a MacBinary II file -- the usual way to carry a Mac file,
 both forks, through anything that is not a Mac -- of an application, "Modus":
 
   - its resource fork: CODE 0 (the jump table), CODE 1 (scripts/mac68k-chain.s,
-    which starts modus) and SIZE -1;
+    which starts modus), SIZE -1, and its icon, "(m)", with the bundle the
+    Finder finds it by (FINDER_RESOURCES);
   - its data fork: DISK, byte for byte.
 
 Double-clicked on the Mac, it reads the image out of its own data fork to the
@@ -25,6 +26,96 @@ import tempfile
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAME, TYPE, CREATOR = b'Modus', b'APPL', b'MDUS'
+
+
+# The icon: a little compact Mac with "(m)" on its screen.  # is black, o
+# white inside the mask (the case is filled, not transparent on the
+# desktop), . outside.  The small one has a dark screen and a white "m".
+ICON = (
+    '.......##################.......',
+    '......#oooooooooooooooooo#......',
+    '......#oooooooooooooooooo#......',
+    '......#oo##############oo#......',
+    '......#o#oooooooooooooo#o#......',
+    '......#o#oooooooooooooo#o#......',
+    '......#o#oo#ooooooo#ooo#o#......',
+    '......#o#o#oo##o#ooo#oo#o#......',
+    '......#o#o#oo#o#o#oo#oo#o#......',
+    '......#o#o#oo#o#o#oo#oo#o#......',
+    '......#o#o#oo#o#o#oo#oo#o#......',
+    '......#o#o#oo#o#o#oo#oo#o#......',
+    '......#o#oo#ooooooo#ooo#o#......',
+    '......#o#oooooooooooooo#o#......',
+    '......#o#oooooooooooooo#o#......',
+    '......#o#oooooooooooooo#o#......',
+    '......#oo##############oo#......',
+    '......#oooooooooooooooooo#......',
+    '......#oooooooooooooooooo#......',
+    '......#oooooooooooooooooo#......',
+    '......#oooooooooooooooooo#......',
+    '......#o##ooooo########oo#......',
+    '......#oooooooooooooooooo#......',
+    '......#oooooooooooooooooo#......',
+    '......#oooooooooooooooooo#......',
+    '......#oooooooooooooooooo#......',
+    '......####################......',
+    '.......#oooooooooooooooo#.......',
+    '.......#oooooooooooooooo#.......',
+    '.......#oooooooooooooooo#.......',
+    '.......##################.......',
+    '................................',
+)
+SMALL_ICON = (
+    '...##########...',
+    '..#oooooooooo#..',
+    '..#o########o#..',
+    '..#o########o#..',
+    '..#o#oo#o###o#..',
+    '..#o#o#o#o##o#..',
+    '..#o#o#o#o##o#..',
+    '..#o#o#o#o##o#..',
+    '..#o########o#..',
+    '..#oooooooooo#..',
+    '..#ooooo####o#..',
+    '..#oooooooooo#..',
+    '..############..',
+    '...#oooooooo#...',
+    '...#oooooooo#...',
+    '...##########...',
+)
+
+
+def icon_list(rows):
+    """ICN# / ics# data: the bitmap (#), then the mask (# and o)."""
+    def bits(on):
+        out = bytearray()
+        for r in rows:
+            v = 0
+            for c in r:
+                v = v * 2 + (1 if c in on else 0)
+            out += v.to_bytes(len(r) // 8, 'big')
+        return bytes(out)
+    return bits('#') + bits('#o')
+
+
+def finder_resources():
+    """What the Finder shows the application by: its icons (ICN# and ics#
+    128), FREF 128 (an APPL, local icon 0), BNDL 128 (signature MDUS, ICN#
+    and ics# local 0 -> 128, FREF local 0 -> 128) and the signature's
+    owner resource, MDUS 0.  The file needs the hasBundle and hasCustomIcon
+    flags (scripts/period-lisps/mkvol.py sets them)."""
+    fref = b'APPL' + struct.pack('>h', 0) + b'\x00'
+    bndl = CREATOR + struct.pack('>hh', 0, 2)
+    for t in (b'ICN#', b'ics#', b'FREF'):
+        bndl += t + struct.pack('>hhh', 0, 0, 128)
+    # the same icons as the file's CUSTOM icon (-16455, with the file's
+    # hasCustomIcon flag), which the Finder draws straight from the resource
+    # fork: a volume's Desktop DB may never register the bundle (machfs's
+    # is written empty, and the Finder believes it)
+    return [(b'ICN#', 128, icon_list(ICON)), (b'ics#', 128, icon_list(SMALL_ICON)),
+            (b'ICN#', -16455, icon_list(ICON)), (b'ics#', -16455, icon_list(SMALL_ICON)),
+            (b'FREF', 128, fref), (b'BNDL', 128, bndl),
+            (CREATOR, 0, bytes([len(NAME)]) + NAME)]
 
 
 def code1():
@@ -47,7 +138,7 @@ def code0():
     return struct.pack('>IIII', 32 + len(entry), 512, len(entry), 32) + entry
 
 
-def size_rsrc(memtop):
+def size_rsrc(memtop, span=0):
     """SIZE -1, for MultiFinder / System 7: no flags, then the preferred and
     minimum partition.  A map for a 4 MB Mac asks 64 KB (System 6 without
     MultiFinder ignores SIZE, and the image lives above the application zone).
@@ -59,6 +150,16 @@ def size_rsrc(memtop):
     block, from the system heap's end to the Finder's partition, and the
     image's range is inside it (the code checks the system heap's end; the
     code and stack, at the partition's bottom and top, are checked too)."""
+    if span:
+        # a RELOCATED image (mac68k-chain.s's relocating load) goes wherever
+        # the partition is, so the partition is what it needs and no more,
+        # and the Finder and the others keep the rest: SPAN, plus the heap
+        # (the relocation table first, then the Toolbox's), the 512 KB
+        # alignment of the image's base, and the application's own stack.
+        # Asking for all of RAM, as below, left the Finder unable to open
+        # even the desktop (a 32 MB Quadra 950 under 7.5.3).
+        need = span + 0x180000
+        return struct.pack('>HII', 0x0080, need, need)
     if memtop <= 4 << 20:
         return struct.pack('>HII', 0, 64 * 1024, 64 * 1024)
     # is32BitCompatible: a relocated image runs at whatever address its partition has
@@ -129,12 +230,12 @@ def main(disk, out, forks=None):
     k = data.find(b'modusCHN', 0, 1024)
     if k < 0:
         sys.exit('mac68k-chain: %s has no launch record in its boot blocks' % disk)
-    dest, entry, ln, off, _, _, refslot, memtop = struct.unpack_from('>8I', data, k + 8)
+    dest, entry, ln, off, _, _, refslot, memtop, reloff, _, span = struct.unpack_from('>11I', data, k + 8)
     if not refslot:
         sys.exit('mac68k-chain: %s cannot run on top of Mac OS (build it with '
                  'MODUS_MAC68K_MACHINE=classicos)' % disk)
     rsrc = resource_fork([(b'CODE', 0, code0()), (b'CODE', 1, code1()),
-                          (b'SIZE', -1, size_rsrc(memtop))])
+                          (b'SIZE', -1, size_rsrc(memtop, span if reloff else 0))] + finder_resources())
     open(out, 'wb').write(macbinary(NAME, TYPE, CREATOR, data, rsrc))
     if forks:
         os.makedirs(forks, exist_ok=True)

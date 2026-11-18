@@ -13,7 +13,8 @@ emu.register_frame_done(function()
     print(string.format("lisp.lua: shot-%02d at emulated %.3f s", i, t))
     if i <= #forms then
       -- NOTYPE=1: screenshots only (the forms just count them)
-      if not os.getenv("NOTYPE") then manager.machine.natkeyboard:post(forms[i] .. "\r") end
+      -- a form "~": nothing typed (a screenshot only)
+      if not os.getenv("NOTYPE") and forms[i] ~= "~" then manager.machine.natkeyboard:post(forms[i] .. "\r") end
       i = i + 1; nextt = t + gap
     else
       manager.machine:exit()
@@ -108,6 +109,41 @@ if os.getenv("CMDKEY") then
     elseif stage == 2 and now >= t + 1.5 then
       if cmd then cmd:clear_value() end; stage = 3
       print(string.format("lisp.lua: Command-%s at %.1f s (key %s)", c, t, cmd and cmd.name or "NOT FOUND"))
+    end
+  end)
+end
+
+-- MOUSE="T:V:H:B;...": at emulated second T, the cursor to (V, H) -- written
+-- where the Mac keeps it (MTemp $828, RawMouse $82C, then CrsrNew $8CE =
+-- CrsrCouple, as the mouse driver does) -- and the button down (B=1) or up
+-- (B=0), through the emulated mouse's button.  A drag is several steps.
+if os.getenv("MOUSE") then
+  local steps = {}
+  for t, v, h, b in string.gmatch(os.getenv("MOUSE"), "([%d%.]+):(%d+):(%d+):(%d)") do
+    table.insert(steps, {tonumber(t), tonumber(v), tonumber(h), tonumber(b)})
+  end
+  local cpu = manager.machine.devices[":maincpu"]
+  local mem = cpu.spaces["program"]
+  local button
+  for tag, port in pairs(manager.machine.ioport.ports) do
+    for name, field in pairs(port.fields) do
+      local n = string.lower(name)
+      if n == "mouse button 0" then button = field end
+    end
+  end
+  print("lisp.lua: mouse button " .. (button and button.name or "NOT FOUND"))
+  local i = 1
+  emu.register_periodic(function()
+    local now = manager.machine.time:as_double()
+    while i <= #steps and now >= steps[i][1] do
+      local s = steps[i]
+      mem:write_u16(0x828, s[2]); mem:write_u16(0x82A, s[3])
+      mem:write_u16(0x82C, s[2]); mem:write_u16(0x82E, s[3])
+      mem:write_u8(0x8CE, mem:read_u8(0x8CF))
+      if button then
+        if s[4] == 1 then button:set_value(1) else button:clear_value() end
+      end
+      i = i + 1
     end
   end)
 end

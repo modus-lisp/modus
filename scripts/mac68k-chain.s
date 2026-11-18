@@ -440,7 +440,7 @@ fail:   pea     band(%pc)
 | +68K-MAC-HOST+) jump here, through HTABLE, and this code owns a window,
 | the menus and the event loop.
 |
-| The console is a window in Monaco 9: a text buffer COLS x ROWS (redrawn
+| The console is a window in Monaco 9, 64 x 16: a text buffer (redrawn
 | on an update event), a caret while getc waits, a scroll a ScrollRect.
 | getc waits in WaitNextEvent (GetNextEvent + SystemTask on a System 6
 | without MultiFinder), so the other applications run while the REPL waits;
@@ -532,21 +532,32 @@ hinit:  movem.l %d1-%d7/%a0-%a4, -(%sp)
         clr.w   -(%sp)
         .word   0xA935
         .word   0xA937                  | _DrawMenuBar
-| the window: the screen (QuickDraw's screenBits.bounds, -120(A5)) less the
-| menu bar, a title bar and a margin
+| the window: a terminal of WCOLS x WROWS Monaco 9 cells (6 x 11 pixels),
+| below the menu bar and a title bar, inside the screen (QuickDraw's
+| screenBits.bounds, -120(A5)) on a small one
+        .equ    WCOLS, 64
+        .equ    WROWS, 16
         lea     H_R(%a3), %a0
         move.w  -120(%a5), %d0
         add.w   #42, %d0
         move.w  %d0, (%a0)
+        add.w   #WROWS * 11 + 4, %d0
+        move.w  -116(%a5), %d1
+        subq.w  #4, %d1
+        cmp.w   %d1, %d0
+        ble     1f
+        move.w  %d1, %d0
+1:      move.w  %d0, 4(%a0)
         move.w  -118(%a5), %d0
-        addq.w  #4, %d0
+        addq.w  #8, %d0
         move.w  %d0, 2(%a0)
-        move.w  -116(%a5), %d0
-        subq.w  #4, %d0
-        move.w  %d0, 4(%a0)
-        move.w  -114(%a5), %d0
-        subq.w  #4, %d0
-        move.w  %d0, 6(%a0)
+        add.w   #WCOLS * 6 + 8, %d0
+        move.w  -114(%a5), %d1
+        subq.w  #4, %d1
+        cmp.w   %d1, %d0
+        ble     2f
+        move.w  %d1, %d0
+2:      move.w  %d0, 6(%a0)
         subq.l  #4, %sp
         clr.l   -(%sp)                  | the record: in the heap
         pea     H_R(%a3)

@@ -4499,7 +4499,25 @@
    entry is validated by EQ on the stored form (an address key can be reused
    after GC), it is reset at every MVM-COMPILE-TOPLEVEL, and every writer of
    a macro table clears it (see %MEXP-MEMO-INVALIDATE).")
-(defun %mexp-memo-invalidate () (setq *mexp-memo* nil))
+(defvar *%not-macro* nil)
+(defun %mexp-memo-invalidate () (setq *mexp-memo* nil) (setq *%not-macro* nil))
+
+;;; NOT A MACRO, remembered.  Under runtime EVAL every compound form is first
+;;; tried as a macro call (COMPILE-FORM -> MACROEXPAND-MVM), and a call of a
+;;; FUNCTION finds no expander only after the whole search: the compiler's
+;;; table, the symbol's package entry, %SHADOWS-CL-NAME-P (a FIND-SYMBOL), the
+;;; runtime table, the compiler-macro set.  Measured on the 68k (qemu), that
+;;; search for the call in a CAR's own TYPE-ERROR branch was most of compiling
+;;; a CAR.  The answer for a symbol changes only when a macro table does, and
+;;; every writer of one calls %MEXP-MEMO-INVALIDATE, which drops this too.
+;;; Name hash -> the symbols found to be no macro (EQ: the hash is the bare
+;;; name's).  Runtime EVAL only, so a build's output is unchanged.
+(defun %not-macro-p (sym h)
+  (let ((tb *%not-macro*))
+    (and tb (member sym (gethash h tb) :test #'eq) t)))
+(defun %note-not-macro (sym h)
+  (let ((tb (or *%not-macro* (setq *%not-macro* (make-hash-table :test 'eql)))))
+    (setf (gethash h tb) (cons sym (gethash h tb)))))
 
 ;;; The memo is keyed by the form's ADDRESS in the image, and the copying
 ;;; collector moves every form: after a GC every entry MISSED (the EQ
@@ -4606,7 +4624,9 @@
       (let* ((name (normalize-name (car form)))
              ;; CONFIRMED lookup — see %MACRO-NAME-CONFIRMED-P.  A hash
              ;; collision here runs the WRONG expander, silently.
-             (expander (%macro-expander (car form) name)))
+             (expander (if (and *mvm-eval-runtime-p* (%not-macro-p (car form) name))
+                           (return-from %macroexpand-1-mvm-raw (cons form nil))
+                           (%macro-expander (car form) name))))
         (cond
           (expander
            (let ((result
@@ -4648,8 +4668,9 @@
           (*mvm-eval-runtime-p*
            (let ((mf (%raw-macro-expander (car form))))
              (cond
-               ((null mf) (cons form nil))
-               ((eq mf t) (cons form nil))
+               ((or (null mf) (eq mf t))
+                (%note-not-macro (car form) name)
+                (cons form nil))
                ((%interp-closure-p mf)
                 (let ((result (%call-interp-closure mf (cdr form))))
                   (if (eq result form) (cons form nil) (cons result t))))
@@ -25113,8 +25134,25 @@
     ;; NIL and we fall through to done with dest = NIL.
     (emit-ir-label error-label)
     ;; The offending value is in DEST: pass it, and LIST, so the report
-    ;; names them ("The value 5 is not of type LIST.").
-    (compile-form `(%signal-type-error (%%lx-reg ,dest) 'list) env dest)
+    ;; names them ("The value 5 is not of type LIST.").  Under runtime EVAL
+    ;; the call is emitted as COMPILE-CALL would emit it (live temps saved,
+    ;; V0 / V1, the result from VR): compiling the form instead -- a macro
+    ;; lookup that finds nothing, function resolution by name, argument
+    ;; compiles -- was most of compiling a CAR on the 68k (qemu: ~0.9 ms each).
+    (if *mvm-eval-runtime-p*
+        (let ((save-count (min *temp-reg-counter* 12)))
+          (when (> save-count 1)
+            (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
+                  do (unless (= r dest) (emit-ir :push r))))
+          (emit-ir :mov +vreg-v0+ dest)
+          (compile-quote 'list +vreg-v1+)
+          (emit-ir :set-nargs 2)
+          (emit-ir :call "%SIGNAL-TYPE-ERROR" 2)
+          (unless (= dest +vreg-vr+) (emit-ir :mov dest +vreg-vr+))
+          (when (> save-count 1)
+            (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
+                  do (unless (= r dest) (emit-ir :pop r)))))
+        (compile-form `(%signal-type-error (%%lx-reg ,dest) 'list) env dest))
     (emit-ir-label done-label)
     (free-temp-reg)))
 

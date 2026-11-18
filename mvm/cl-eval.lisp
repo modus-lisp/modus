@@ -1964,6 +1964,27 @@
       (%eval-simple form)
       (mvm-eval form)))
 
+(defun %simple-op-p (op)
+  "OP names a global FUNCTION: not a special operator, not a macro, FBOUNDP.
+   Answered once per symbol until a macro table changes (*%SIMPLE-OPS*,
+   dropped by %MEXP-MEMO-INVALIDATE): the questions are lookups by name, and
+   asked of every (EVAL '(F ...)) they were most of the cost of one (qemu-m68k
+   profile; MACRO-FUNCTION alone, which builds the user-facing wrapper closure
+   just to say yes or no, was 17%).  A function that becomes unbound since is
+   still caught: %EVAL-SIMPLE's FDEFINITION signals, as a compiled call would."
+  (let* ((h (modus-int::normalize-name op))
+         (tb *%simple-ops*))
+    (if (and tb (member op (gethash h tb) :test #'eq))
+        t
+        (when (and (not (special-operator-p op))
+                   (not (%raw-macro-expander op))
+                   (not (and *%extra-macro-names*
+                             (gethash h *%extra-macro-names*)))
+                   (fboundp op))
+          (let ((tb (or *%simple-ops* (setq *%simple-ops* (make-hash-table :test 'eql)))))
+            (setf (gethash h tb) (cons op (gethash h tb))))
+          t))))
+
 (defun %eval-simple-p (form depth)
   "Can FORM be evaluated without compiling it, in the null lexical
    environment?  A self-evaluating atom; T, NIL or a keyword; a bound global
@@ -1976,9 +1997,7 @@
        (and (< depth 8) op (symbolp op)
             (if (eq op 'quote)
                 (and (consp (cdr form)) (null (cdr (cdr form))))
-                (and (not (special-operator-p op))
-                     (not (macro-function op))
-                     (fboundp op)
+                (and (%simple-op-p op)
                      (let ((a (cdr form)) (ok t))
                        (loop
                          (when (or (not ok) (null a)) (return ok))

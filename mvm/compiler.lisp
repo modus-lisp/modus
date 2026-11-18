@@ -4500,7 +4500,10 @@
    after GC), it is reset at every MVM-COMPILE-TOPLEVEL, and every writer of
    a macro table clears it (see %MEXP-MEMO-INVALIDATE).")
 (defvar *%not-macro* nil)
-(defun %mexp-memo-invalidate () (setq *mexp-memo* nil) (setq *%not-macro* nil))
+(defvar *%simple-ops* nil
+  "cl-eval %SIMPLE-OP-P's memo of the symbols that name a global function.")
+(defun %mexp-memo-invalidate ()
+  (setq *mexp-memo* nil) (setq *%not-macro* nil) (setq *%simple-ops* nil))
 
 ;;; NOT A MACRO, remembered.  Under runtime EVAL every compound form is first
 ;;; tried as a macro call (COMPILE-FORM -> MACROEXPAND-MVM), and a call of a

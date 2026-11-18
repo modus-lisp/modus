@@ -325,9 +325,16 @@
    semispaces [LO, LO+HALF) and [LO+HALF, LO+2*HALF), and set VA / VL.
    GC-COUNT: zeroed unless KEEP-COUNT.  Clobbers D0/D1/A0."
   (let ((margin (min +linux-68k-gc-margin-max+ (logand (floor half 4) (lognot 15)))))
-    (emit-mac68k-zero buf +mac68k-kind-map+
-                      (logand (+ (ash (- (+ lo (* 2 half) guard) base) (- (m68k-kind-shift))) 3)
-                              (lognot 3)))
+    ;; the kind bytes of [LO, LO + 2*HALF + GUARD) -- and of the low block when
+    ;; LO is above it.  A heap below the region (the core run's boot heap)
+    ;; has its bytes BELOW the kind map; measured as a count gone negative
+    ;; once :QUADRA's region moved above that heap, zeroing past 32 MB
+    (let* ((sh (- (m68k-kind-shift)))
+           (from (ash (- (min lo base) base) sh))
+           (to (ash (- (+ lo (* 2 half) guard) base) sh))
+           (from4 (logand from (lognot 3))))
+      (emit-mac68k-zero buf (+ +mac68k-kind-map+ from4)
+                        (logand (+ (- to from4) 3) (lognot 3))))
     (m68k-emit-move-imm-an buf lo +68k-a2+)
     (m68k-emit-move-imm-an buf (- (+ lo half) margin) +68k-a3+)
     (m68k-emit-move-imm-an buf (+ base #x40) +68k-a0+)

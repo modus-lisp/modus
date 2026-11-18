@@ -2729,6 +2729,7 @@
   (let ((v (handler-case *jit-hot-calls* (error (c) nil))))
     (if (integerp v) v 64)))
 
+(declaim (overridable %jit-hot-ns))
 (defun %jit-hot-ns ()
   "Interpreted time (ns) after which a DEFUN is built regardless of its call
    count: about what translating a module costs, so a function past it has

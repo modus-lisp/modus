@@ -3449,6 +3449,16 @@
                      start (+ i (length cross)))))
     (when *mac-cold-names-out*
       (setq text (concatenate 'string text (string #\Newline) (mvm-text "mvm/mac68k-cold.lisp"))))
+    ;; THE CORE RUN PROMOTES BY COUNT ALONE: a runtime DEFUN's trampoline also
+    ;; goes native after 10 ms interpreted (mvm-eval %JIT-HOT-NS), and under an
+    ;; emulator that is the host's timing -- measured, two core runs of one
+    ;; build (Basilisk II) saved different heaps (a closure where the other had
+    ;; garbage), so the shift pair a relocatable image is made from
+    ;; (mac68k-reloc-disk.py) no longer differed by relocations alone.
+    (setq text (concatenate 'string text "
+(defun %jit-hot-ns ()
+  (if (eql (mem-ref #x1000602C :u32) 1) 1099511627776 10000000))
+"))
     (setq *cli-arch-override-source*
           (concatenate 'string *cli-arch-override-source* (string #\Newline) text
                        "

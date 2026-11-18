@@ -21432,6 +21432,25 @@
 
 (defun compile-funcall (args env dest)
   "Compile (funcall f arg1 arg2 ...) - indirect function call"
+  ;; (FUNCALL 'F ...) in the image's own source, F a function the image has
+  ;; already defined and no FLET / LABELS here binds: the direct call, which
+  ;; means the same for a global function.  The quoted form is how source
+  ;; shared with the host names an image-only function without SBCL warning
+  ;; about it; at run time it resolved F by NAME at every call (string hash
+  ;; tables, %NATIVE-SYM-RESOLVE): measured on the 68k Quadra image, the
+  ;; HANDLER-CASE barrier %QUIET-MACROEXPAND-1 pushes that way around every
+  ;; speculative macroexpansion was 9.8% of compiling a DEFMACRO.  Only a
+  ;; function already in *FUNCTIONS*: one never defined must keep its
+  ;; run-time lookup (and its error), not become a call to nothing.
+  (let ((f (car args)))
+    (when (and (not *mvm-eval-runtime-p*)
+               (consp f) (eq (car f) 'quote) (consp (cdr f)) (null (cddr f))
+               (symbolp (cadr f)) (cadr f) (not (eq (cadr f) t)))
+      (let* ((sym (cadr f)) (nm (symbol-name sym)))
+        (when (and (not (env-lookup-fn env sym)) (not (env-lookup-fn env nm))
+                   (%fn-info-for-key nm))
+          (return-from compile-funcall
+            (compile-form (cons sym (cdr args)) env dest))))))
   ;; More arguments than a call passes positionally: through APPLY (see
   ;; COMPILE-CALL).
   (when (> (length (cdr args)) 120)   ; +APPLY-SPREAD-MAX+, literal as there
@@ -29361,6 +29380,15 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; (FBOUNDP 'F) in the image's own source, F a function the image already
+  ;; defines: T (the guard shared host / image source puts around a FUNCALL
+  ;; of an image-only function; a run-time name lookup at every call)
+  (when (and (not *mvm-eval-runtime-p*) (symbolp fn) (string= (symbol-name fn) "FBOUNDP")
+             (consp args) (null (cdr args))
+             (consp (car args)) (eq (car (car args)) 'quote) (consp (cdr (car args)))
+             (symbolp (cadr (car args))) (cadr (car args))
+             (%fn-info-for-key (symbol-name (cadr (car args)))))
+    (return-from compile-call (compile-form t env dest)))
   ;; (NAME-EQ X "LITERAL"): the literal's hash now, not at every call (%NAME-EQ-H)
   (when (and (symbolp fn) (eql (normalize-name fn) *%name-eq-name-hash*)
              (consp args) (consp (cdr args)) (null (cddr args)) (stringp (cadr args)))

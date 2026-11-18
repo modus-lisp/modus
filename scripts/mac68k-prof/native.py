@@ -36,6 +36,7 @@ def name(a):
 
 delta = 0
 selfc, incl, edges = collections.Counter(), collections.Counter(), collections.Counter()
+icallers = collections.Counter()
 n = 0
 for l in open(prof):
     q = l.split()
@@ -57,6 +58,11 @@ for l in open(prof):
         incl[f] += 1
     if len(chain) >= 2:
         edges[(chain[1], chain[0])] += 1
+    # inclusive callers: the frame above NAME's outermost occurrence
+    w = os.environ.get('CALLERS')
+    if w and w in chain:
+        k = len(chain) - 1 - chain[::-1].index(w)
+        icallers[chain[k + 1] if k + 1 < len(chain) else '<top>'] += 1
 print('%d samples, %.1f s' % (n, t1 - t0))
 print('--- self')
 for f, c in selfc.most_common(top):
@@ -73,4 +79,7 @@ if os.environ.get('CALLERS'):
             callers[a] += c
     print('--- callers of %s (leaf samples)' % want)
     for f, c in callers.most_common(15):
+        print('%5.1f%%  %s' % (100 * c / n, f))
+    print('--- callers of %s (inclusive)' % want)
+    for f, c in icallers.most_common(15):
         print('%5.1f%%  %s' % (100 * c / n, f))

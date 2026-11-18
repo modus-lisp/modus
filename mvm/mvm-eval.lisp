@@ -5828,7 +5828,7 @@
     ((integerp sym) sym)
     ((null sym) (compute-name-hash "NIL"))
     ((eq sym t) (compute-name-hash "T"))
-    ((symbolp sym) (aref sym 0))
+    ((symbolp sym) (%word-aref sym 0))    ; one load: AREF of a symbol is %AREF-SLOW
     ((stringp sym) (compute-name-hash sym))
     (t 0)))
 

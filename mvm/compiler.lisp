@@ -940,8 +940,8 @@
       (when (null cur) (return))
       (let ((p (car cur)))
         (cond
-          ((and (symbolp p) (string= (symbol-name p) "&OPTIONAL")) (setq mode :opt))
-          ((and (symbolp p) (string= (symbol-name p) "&REST")) (setq mode :rest))
+          ((and (symbolp p) (name-eq p "&OPTIONAL")) (setq mode :opt))
+          ((and (symbolp p) (name-eq p "&REST")) (setq mode :rest))
           ((eq mode :rest) (setq rest-var p))
           (t (setq vars (cons (if (consp p) (car p) p) vars)))))
       (setq cur (cdr cur)))
@@ -2037,7 +2037,7 @@
           (when (null opts) (return found))
           (when (and (cdr opts)
                      (symbolp (car opts))
-                     (string= (symbol-name (car opts)) "READ-ONLY"))
+                     (name-eq (car opts) "READ-ONLY"))
             (setq found (if (cadr opts) t nil)))
           (setq opts (cddr opts))))))
 
@@ -4197,14 +4197,14 @@
     ((atom form) form)
     ((not (symbolp (car form))) :fail)
     ((not (eq (symbol-package (car form)) (find-package "COMMON-LISP"))) :fail)
-    ((string= (symbol-name (car form)) "QUOTE") form)
-    ((string= (symbol-name (car form)) "THE")
+    ((name-eq (car form) "QUOTE") form)
+    ((name-eq (car form) "THE")
      (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
          (let ((x (%inline-subst-form (caddr form) alist)))
            (if (eq x :fail) :fail (list (car form) (cadr form) x)))
          :fail))
-    ((or (string= (symbol-name (car form)) "IF")
-         (string= (symbol-name (car form)) "PROGN")
+    ((or (name-eq (car form) "IF")
+         (name-eq (car form) "PROGN")
          (%inline-pure-op-p (car form)))
      (let ((out nil))
        (dolist (a (cdr form))
@@ -4247,7 +4247,7 @@
     (when alist
       (let ((decls nil) (forms body))
         (loop while (and (consp forms) (consp (car forms)) (symbolp (caar forms))
-                         (string= (symbol-name (caar forms)) "DECLARE"))
+                         (name-eq (caar forms) "DECLARE"))
               do (push (%inline-drop-decls (car forms) (mapcar (function car) alist)) decls)
                  (setq forms (cdr forms)))
         (let ((out nil))
@@ -4788,7 +4788,7 @@
   (let ((head nil))
     (loop while (and (consp body)
                      (or (and (consp (car body)) (symbolp (caar body))
-                              (string= (symbol-name (caar body)) "DECLARE"))
+                              (name-eq (caar body) "DECLARE"))
                          (and (stringp (car body)) (consp (cdr body)))))
           do (push (pop body) head))
     (values (nreverse head) body)))
@@ -4818,7 +4818,7 @@
     ;; var; it's handled below via a wrapping DESTRUCTURING-BIND.
     (when (and (consp mparams)
                (symbolp (car mparams))
-               (string= (symbol-name (car mparams)) "&WHOLE"))
+               (name-eq (car mparams) "&WHOLE"))
       (setf whole-var (cadr mparams))
       (setf mparams (cddr mparams)))
     ;; Strip &ENVIRONMENT var (anywhere); collect the rest.  (A literal
@@ -4829,7 +4829,7 @@
       (loop while (consp p) do
         (let ((elt (car p)))
           (if (and (symbolp elt)
-                   (string= (symbol-name elt) "&ENVIRONMENT"))
+                   (name-eq elt "&ENVIRONMENT"))
               (progn (setf env-var (cadr p))
                      (setf p (cddr p)))
               (progn (push elt rest-params)
@@ -4917,7 +4917,7 @@
   (cond
     ((> depth 200) nil)
     ((atom form) nil)
-    ((and (symbolp (car form)) (string= (symbol-name (car form)) "FUNCTION")
+    ((and (symbolp (car form)) (name-eq (car form) "FUNCTION")
           (consp (cdr form)) (symbolp (cadr form)))
      (and (member (symbol-name (cadr form)) '("CALL-NEXT-METHOD" "NEXT-METHOD-P")
                   :test #'string=)
@@ -5651,7 +5651,7 @@
                             (rest-pat pat))
                         ;; &whole handling
                         (when (and (symbolp (car pat))
-                                   (string= (symbol-name (car pat)) "&WHOLE"))
+                                   (name-eq (car pat) "&WHOLE"))
                           (setf whole-var (cadr pat))
                           (setf rest-pat (cddr pat)))
                         ;; Bind a temp for the value to avoid re-evaluation
@@ -5670,11 +5670,11 @@
                                   (cond
                                     ;; Lambda list keywords
                                     ((and (symbolp elt)
-                                          (or (string= (symbol-name elt) "&REST")
-                                              (string= (symbol-name elt) "&BODY")))
+                                          (or (name-eq elt "&REST")
+                                              (name-eq elt "&BODY")))
                                      (setf rest-mode t))
                                     ((and (symbolp elt)
-                                          (string= (symbol-name elt) "&OPTIONAL"))
+                                          (name-eq elt "&OPTIONAL"))
                                      ;; Switch to optional mode for remaining
                                      ;; positional elements.  Each can be
                                      ;; (var [default [supplied-p]]) or just var.
@@ -5682,10 +5682,10 @@
                                      (setf remaining (cdr remaining))
                                      (loop while (and (consp remaining)
                                                       (not (and (symbolp (car remaining))
-                                                                (or (string= (symbol-name (car remaining)) "&REST")
-                                                                    (string= (symbol-name (car remaining)) "&BODY")
-                                                                    (string= (symbol-name (car remaining)) "&KEY")
-                                                                    (string= (symbol-name (car remaining)) "&AUX")))))
+                                                                (or (name-eq (car remaining) "&REST")
+                                                                    (name-eq (car remaining) "&BODY")
+                                                                    (name-eq (car remaining) "&KEY")
+                                                                    (name-eq (car remaining) "&AUX")))))
                                            do (let* ((opt-elt (car remaining))
                                                      (opt-var (if (consp opt-elt) (car opt-elt) opt-elt))
                                                      (opt-default (if (and (consp opt-elt) (cdr opt-elt))
@@ -5721,7 +5721,7 @@
                                      ;; loop incremented remaining; un-do one because outer dec
                                      (setf remaining (cons nil remaining))) ; outer (cdr remaining) → remaining
                                     ((and (symbolp elt)
-                                          (string= (symbol-name elt) "&KEY"))
+                                          (name-eq elt "&KEY"))
                                      ;; &KEY var | (var [default [supplied-p]])
                                      ;; Each var binds by searching cur (a plist)
                                      ;; for :var.  If found, use the value;
@@ -5729,10 +5729,10 @@
                                      (setf remaining (cdr remaining))
                                      (loop while (and (consp remaining)
                                                       (not (and (symbolp (car remaining))
-                                                                (or (string= (symbol-name (car remaining)) "&REST")
-                                                                    (string= (symbol-name (car remaining)) "&BODY")
-                                                                    (string= (symbol-name (car remaining)) "&AUX")
-                                                                    (string= (symbol-name (car remaining)) "&ALLOW-OTHER-KEYS")))))
+                                                                (or (name-eq (car remaining) "&REST")
+                                                                    (name-eq (car remaining) "&BODY")
+                                                                    (name-eq (car remaining) "&AUX")
+                                                                    (name-eq (car remaining) "&ALLOW-OTHER-KEYS")))))
                                            do (let* ((key-elt (car remaining))
                                                      (key-spec (if (consp key-elt) (car key-elt) key-elt))
                                                      ;; ((:keyword var-or-pattern) ...) names the
@@ -5779,7 +5779,7 @@
                                     ;; and its specs destructured from the list
                                     ;; (so (&aux (y 5)) bound Y to NIL).
                                     ((and (symbolp elt)
-                                          (string= (symbol-name elt) "&AUX"))
+                                          (name-eq elt "&AUX"))
                                      (dolist (spec (cdr remaining))
                                        (setf result
                                              (append result
@@ -5788,7 +5788,7 @@
                                                                (list spec nil))))))
                                      (setf remaining (list nil)))
                                     ((and (symbolp elt)
-                                          (string= (symbol-name elt) "&ALLOW-OTHER-KEYS"))
+                                          (name-eq elt "&ALLOW-OTHER-KEYS"))
                                      nil)
                                     (rest-mode
                                      ;; Bind rest of list to this variable/sub-pattern
@@ -6524,7 +6524,7 @@
                 (integer (caddr form)))
             (if (and (consp bytespec)
                      (symbolp (car bytespec))
-                     (string= (symbol-name (car bytespec)) "BYTE")
+                     (name-eq (car bytespec) "BYTE")
                      (integerp (cadr bytespec))
                      (integerp (caddr bytespec)))
                 ;; Constant (byte size pos): inline
@@ -6695,12 +6695,12 @@
       (dolist (d (%leading-declares body))
         (dolist (spec (cdr d))
           (when (and (consp spec) (symbolp (car spec))
-                     (string= (symbol-name (car spec)) "SPECIAL"))
+                     (name-eq (car spec) "SPECIAL"))
             (push spec sp))))
       (if sp (list (cons 'declare (nreverse sp))) nil)))
   (defun %strip-leading-declares (body)
     (loop while (and body (consp (car body)) (symbolp (caar body))
-                     (string= (symbol-name (caar body)) "DECLARE"))
+                     (name-eq (caar body) "DECLARE"))
           do (setq body (cdr body)))
     body)
   ;; DO — (do ((var init step)...) (end-test result...) body...)
@@ -6803,7 +6803,7 @@
                    (dolist (d (%leading-declares body))
                      (dolist (spec (cdr d))
                        (when (and (consp spec) (symbolp (car spec))
-                                  (string= (symbol-name (car spec)) "SPECIAL"))
+                                  (name-eq (car spec) "SPECIAL"))
                          (push spec sp))))
                    (if sp (list (cons 'declare (nreverse sp))) nil))
                (loop
@@ -7360,7 +7360,7 @@
                            (setq params (cons var params))
                            (setq meta-ll (cons var meta-ll))
                            (if (and (consp spec) (symbolp (car spec))
-                                    (string= (symbol-name (car spec)) "EQL"))
+                                    (name-eq (car spec) "EQL"))
                                (setq specs (cons `(list 'eql ,(cadr spec)) specs))
                                (setq specs (cons `',spec specs)))))
                         (t
@@ -7390,7 +7390,7 @@
                       (loop while (and (cdr body)
                                        (or (stringp (car body))
                                            (and (consp (car body)) (symbolp (caar body))
-                                                (string= (symbol-name (caar body)) "DECLARE"))))
+                                                (name-eq (caar body) "DECLARE"))))
                             do (push (pop body) pre))
                       (setq body (append (nreverse pre)
                                          (list (list* 'block bname
@@ -7478,7 +7478,7 @@
              (let ((var (car p)) (spec (cadr p)))
                (setq params (cons var params))
                (if (and (consp spec) (symbolp (car spec))
-                        (string= (symbol-name (car spec)) "EQL"))
+                        (name-eq (car spec) "EQL"))
                    ;; (eql v) — evaluate v at registration via a quoted-list
                    ;; cons so the runtime specializer is (eql <value>).
                    (setq specs (cons `(list 'eql ,(cadr spec)) specs))
@@ -7504,10 +7504,10 @@
         ;; arity/key semantics are unchanged.
         (let ((has-key nil) (has-aok nil))
           (dolist (p params)
-            (when (and (symbolp p) (string= (symbol-name p) "&KEY"))
+            (when (and (symbolp p) (name-eq p "&KEY"))
               (setq has-key t))
             (when (and (symbolp p)
-                       (string= (symbol-name p) "&ALLOW-OTHER-KEYS"))
+                       (name-eq p "&ALLOW-OTHER-KEYS"))
               (setq has-aok t)))
           (setq lambda-params params)
           (when (and has-key (not has-aok))
@@ -7737,7 +7737,7 @@
                     ;; for compiled calls -- a collision CL cannot produce
                     ;; (quicklisp: release's NAME on slot PROJECT-NAME shadowed
                     ;; dist's NAME).  DEFSTRUCT accessors stay ordinary functions.
-                    ((and (symbolp key) (string= (symbol-name key) "READER"))
+                    ((and (symbolp key) (name-eq key "READER"))
                      ;; FIXED arity: an accessor method is (obj) / (nv obj), and
                      ;; CLHS 7.6.4 makes the GF congruent with it -- so no &rest
                      ;; (a (defun (setf x) (&rest a) ...) dispatcher arrived with
@@ -7758,7 +7758,7 @@
                            (cons `(%clos-maybe-accessor-method
                                    ',val ',class-name ',sname ':reader)
                                  extra-defuns)))
-                    ((and (symbolp key) (string= (symbol-name key) "WRITER"))
+                    ((and (symbolp key) (name-eq key "WRITER"))
                      (setq extra-defuns
                            (cons (if *mvm-eval-runtime-p*
                                      `(%install-accessor-dispatcher ',val ':writer)
@@ -7768,7 +7768,7 @@
                            (cons `(%clos-maybe-accessor-method
                                    ',val ',class-name ',sname ':writer)
                                  extra-defuns)))
-                    ((and (symbolp key) (string= (symbol-name key) "ACCESSOR"))
+                    ((and (symbolp key) (name-eq key "ACCESSOR"))
                      ;; reader GF NAME + writer GF (SETF NAME), both as methods.
                      (setq extra-defuns
                            (cons (if *mvm-eval-runtime-p*
@@ -7806,13 +7806,13 @@
                     ;; storage (%CLASS-SLOT-GET/SET); only the ANSI gate
                     ;; runner's DEFCLASS expander ever registered the slot,
                     ;; so in the CLI each instance got its own copy.
-                    ((and (symbolp key) (string= (symbol-name key) "ALLOCATION"))
-                     (when (and (symbolp val) (string= (symbol-name val) "CLASS"))
+                    ((and (symbolp key) (name-eq key "ALLOCATION"))
+                     (when (and (symbolp val) (name-eq val "CLASS"))
                        (setq class-slots (cons sname class-slots))))
-                    ((and (symbolp key) (string= (symbol-name key) "INITARG"))
+                    ((and (symbolp key) (name-eq key "INITARG"))
                      (setq initarg-pairs
                            (cons `(cons ',val ',sname) initarg-pairs)))
-                    ((and (symbolp key) (string= (symbol-name key) "INITFORM"))
+                    ((and (symbolp key) (name-eq key "INITFORM"))
                      ;; %clos-make-initform-thunk is a native identity fn:
                      ;; passing the lambda as a TOP-LEVEL bridge argument
                      ;; lets %mvm-wrap-escaping trampoline-wrap it under
@@ -7841,7 +7841,7 @@
         (let ((default-initarg-pairs nil))
           (dolist (opt (cddddr form))
             (when (and (consp opt) (symbolp (car opt))
-                       (string= (symbol-name (car opt)) "DEFAULT-INITARGS"))
+                       (name-eq (car opt) "DEFAULT-INITARGS"))
               (let ((cur (cdr opt)))
                 (loop
                   (when (null cur) (return nil))
@@ -9212,7 +9212,7 @@
          (loop
            (cond ((and (stringp (car body)) (cdr body)) (setq body (cdr body)))
                  ((and (consp (car body)) (symbolp (caar body))
-                       (string= (symbol-name (caar body)) "DECLARE"))
+                       (name-eq (caar body) "DECLARE"))
                   (setq decls (cons (car body) decls)) (setq body (cdr body)))
                  (t (return nil))))
          (compile-form
@@ -9229,7 +9229,7 @@
               (name (if (and (consp raw-name)
                              (= (length raw-name) 2)
                              (symbolp (car raw-name))
-                             (string= (symbol-name (car raw-name)) "SETF"))
+                             (name-eq (car raw-name) "SETF"))
                         (%setf-fn-name (cadr raw-name))
                         raw-name)))
          ;; CLHS long-form setf function — link (setf (NAME …) v) to it.
@@ -9746,7 +9746,7 @@
          ;; leading DECLAREs belong to the binding: (declare (special var))
          ;; makes it a dynamic binding (FILE-LENGTH.6)
          (loop while (and (consp body) (consp (car body)) (symbolp (caar body))
-                          (string= (symbol-name (caar body)) "DECLARE"))
+                          (name-eq (caar body) "DECLARE"))
                do (push (pop body) decls))
          (compile-form
           `(let ((,var (open ,filename ,@options)))
@@ -9766,7 +9766,7 @@
              (body (cddr form))
              (decls nil))
          (loop while (and (consp body) (consp (car body)) (symbolp (caar body))
-                          (string= (symbol-name (caar body)) "DECLARE"))
+                          (name-eq (caar body) "DECLARE"))
                do (push (pop body) decls))
          (compile-form `(let ((,(car spec) ,(cadr spec)))
                           ,@(nreverse decls)
@@ -11336,7 +11336,7 @@
     (dolist (c clauses)
       (when (and (consp c)
                  (not (and (keywordp (car c))
-                           (string= (symbol-name (car c)) "NO-ERROR"))))
+                           (name-eq (car c) "NO-ERROR"))))
         (push (car c) types)))
     (nreverse types)))
 
@@ -11350,7 +11350,7 @@
                 (lambda (c)
                   (if (and (consp c)
                            (not (and (keywordp (car c))
-                                     (string= (symbol-name (car c)) "NO-ERROR"))))
+                                     (name-eq (car c) "NO-ERROR"))))
                       (multiple-value-bind (decls rest) (%split-body-decls (cddr c))
                         `(,(car c) ,(cadr c) ,@decls (%hc-barrier-pop ,prev) ,@rest))
                       c))
@@ -11392,7 +11392,7 @@
       (cond
         ((and (consp clause) (consp (car clause))) nil)  ; skip malformed
         ((and (consp clause) (keywordp (car clause))
-              (string= (symbol-name (car clause)) "NO-ERROR"))
+              (name-eq (car clause) "NO-ERROR"))
          (setf no-error-clause clause))
         (t (push clause other-clauses))))
     (setf other-clauses (nreverse other-clauses))
@@ -12065,7 +12065,7 @@
         ((and one (is "RATIOP"))
          (%compile-subtype-branch (car args) env dest +subtag-ratio+ false-label) t)
         ((and two (assoc (symbol-name op) *fused-compare-ops* :test #'string=)
-              (not (string= (symbol-name op) "/="))
+              (not (name-eq op "/="))
               ;; COMPILE-COMPARE-2's typed-float path stays a value
               (not (and *mvm-eval-runtime-p*
                         (or (%expr-double-float-p (car args) env) (%expr-single-float-p (car args) env)
@@ -12227,10 +12227,10 @@
     ((and (consp form) (consp (cdr form))
           (let ((op (car form)))
             (or (and (symbolp op)
-                     (or (string= (symbol-name op) "SETQ")
-                         (string= (symbol-name op) "SETF")
-                         (string= (symbol-name op) "PSETQ")
-                         (string= (symbol-name op) "PSETF")))
+                     (or (name-eq op "SETQ")
+                         (name-eq op "SETF")
+                         (name-eq op "PSETQ")
+                         (name-eq op "PSETF")))
                 (and (integerp op) (= op 260934892)))))  ; setq hash
      (let ((args (cdr form))
            (result nil)
@@ -12268,17 +12268,17 @@
     ((and (consp form) (consp (cdr form))
           (let ((op (car form)))
             (and (symbolp op)
-                 (or (string= (symbol-name op) "INCF")
-                     (string= (symbol-name op) "DECF")
-                     (string= (symbol-name op) "PUSH")
-                     (string= (symbol-name op) "POP")
-                     (string= (symbol-name op) "PUSHNEW")))))
+                 (or (name-eq op "INCF")
+                     (name-eq op "DECF")
+                     (name-eq op "PUSH")
+                     (name-eq op "POP")
+                     (name-eq op "PUSHNEW")))))
      (let* ((op (car form))
             ;; PUSH and PUSHNEW: var is 2nd cdr-arg, not 1st (push expects
             ;; (push value place); pop is (pop place)).
             (var (cond ((and (symbolp op)
-                             (or (string= (symbol-name op) "PUSH")
-                                 (string= (symbol-name op) "PUSHNEW")))
+                             (or (name-eq op "PUSH")
+                                 (name-eq op "PUSHNEW")))
                         (caddr form))
                        (t (cadr form))))
             (rest (apply #'append
@@ -12294,7 +12294,7 @@
              (t rest))))
     ;; Skip init of lambda params — they shadow the outer vars
     ((and (consp form)
-          (or (and (symbolp (car form)) (string= (symbol-name (car form)) "LAMBDA"))
+          (or (and (symbolp (car form)) (name-eq (car form) "LAMBDA"))
               (and (integerp (car form)) (= (car form) 80380232))))  ; lambda hash
      ;; Collect mutations in lambda body but shadow params from bound-vars
      (let* ((params (if (consp (cadr form)) (cadr form) nil))
@@ -12313,8 +12313,8 @@
     ;; (FLET ((F () (SETQ B …))) …) was never observed.
     ((and (consp form)
           (or (and (symbolp (car form))
-                   (or (string= (symbol-name (car form)) "FLET")
-                       (string= (symbol-name (car form)) "LABELS")))
+                   (or (name-eq (car form) "FLET")
+                       (name-eq (car form) "LABELS")))
               (and (integerp (car form)) (= (car form) 445617652))   ; flet hash
               (and (integerp (car form)) (= (car form) 417505106)))) ; labels hash
      (let ((defs (cadr form))
@@ -12340,14 +12340,14 @@
            (setq results (adjoin v results :test #'name-equal))))
        results))
     ;; QUOTE: data, never assignments -- and never macroexpanded.
-    ((and (symbolp (car form)) (string= (symbol-name (car form)) "QUOTE")) nil)
+    ((and (symbolp (car form)) (name-eq (car form) "QUOTE")) nil)
     ;; LET / LET*: a binding is (VAR INIT), not a form -- only INIT is code.
     ;; Walked as a form, (let* ((macrolet 17)) ...) reached the MACROLET arm
     ;; below with 17 as its definitions and signalled while COMPILING
     ;; (ansi-test LET*.15 binds every non-variable CL symbol).
     ((and (symbolp (car form))
-          (or (string= (symbol-name (car form)) "LET")
-              (string= (symbol-name (car form)) "LET*"))
+          (or (name-eq (car form) "LET")
+              (name-eq (car form) "LET*"))
           (consp (cdr form)) (listp (cadr form)))
      (let ((results nil))
        (dolist (b (cadr form))
@@ -12367,7 +12367,7 @@
     ;; compile-form will compile it, so a local macro that assigns a variable
     ;; is seen through its expansion (quri's URL-DECODE: a closure over CHAR,
     ;; which only a MACROLET'd GOTO assigns, decoded "a%20b" to "aaaaa").
-    ((and (symbolp (car form)) (string= (symbol-name (car form)) "MACROLET")
+    ((and (symbolp (car form)) (name-eq (car form) "MACROLET")
           (consp (cdr form)) (listp (cadr form)))
      (let ((saved nil))
        (unwind-protect
@@ -12387,7 +12387,7 @@
                (remhash (car sv) *macro-table*))))))
     ;; SYMBOL-MACROLET: an assignment to a symbol macro whose expansion is a
     ;; watched variable assigns that variable.
-    ((and (symbolp (car form)) (string= (symbol-name (car form)) "SYMBOL-MACROLET")
+    ((and (symbolp (car form)) (name-eq (car form) "SYMBOL-MACROLET")
           (consp (cdr form)) (listp (cadr form)))
      (let ((results (collect-setq-vars-in-body (cons 'progn (cddr form)) bound-vars mx)))
        (dolist (sm (cadr form))
@@ -12446,9 +12446,9 @@
 
 (defun %closure-head-p (op)
   (or (and (symbolp op)
-           (or (string= (symbol-name op) "LAMBDA")
-               (string= (symbol-name op) "FLET")
-               (string= (symbol-name op) "LABELS")))
+           (or (name-eq op "LAMBDA")
+               (name-eq op "FLET")
+               (name-eq op "LABELS")))
       (and (integerp op)
            (or (= op 80380232) (= op 445617652) (= op 417505106)))))
 
@@ -12463,7 +12463,7 @@
   (when (and *mvm-eval-runtime-p* (consp form) (consp (cdr form))
              (consp (cddr form)) (symbolp (cadr form))
              (let ((op (car form)))
-               (or (and (symbolp op) (string= (symbol-name op) "DEFUN"))
+               (or (and (symbolp op) (name-eq op "DEFUN"))
                    (and (integerp op) (= op 238798923)))))
     (cons 'lambda (cddr form))))
 
@@ -12486,7 +12486,7 @@
 (defun %form-has-closure-p-1 (form)
   (let ((op (car form)))
     (cond
-      ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+      ((or (and (symbolp op) (name-eq op "QUOTE"))
            (and (integerp op) (= op 338547669)))
        nil)
       ;; a quasiquote: both scans walk its EXPANSION, which is its code.  The
@@ -12515,14 +12515,14 @@
       (let ((op (car form)))
         (cond
           ((%closure-head-p op) t)
-          ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+          ((or (and (symbolp op) (name-eq op "QUOTE"))
                (and (integerp op) (= op 338547669)))
            nil)
           ;; #'X is a closure exactly when X is a LAMBDA; any other X names a
           ;; function and is not a form -- walked as one it is macroexpanded,
           ;; and TI's MACRO writes #'(MACRO NAMED-LAMBDA ...), which expands to
           ;; another #'(MACRO ...) without end (SIGSEGV).
-          ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+          ((or (and (symbolp op) (name-eq op "FUNCTION"))
                (and (integerp op) (= op 402801909)))
            (and (consp (cadr form)) (%form-op-is (cadr form) 80380232 "LAMBDA")))
           ((and (consp op) (%form-has-closure-p op)) t)
@@ -12589,7 +12589,7 @@
                (let ((op (car form)))
                  (cond
                    ;; lambda — now we're inside a lambda, check for setq of let-vars
-                   ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+                   ((or (and (symbolp op) (name-eq op "LAMBDA"))
                         (and (integerp op) (= op 80380232)))  ; LAMBDA
                     ;; Find vars setq'd in this lambda's body (shadowing its own params)
                     (let* ((params (if (consp (cadr form)) (cadr form) nil))
@@ -12605,7 +12605,7 @@
                         (scan f t))))
                    ;; function literal — same as lambda.  Only a LAMBDA: any
                    ;; other #'X names a function (see %FORM-HAS-CLOSURE-P-2).
-                   ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+                   ((or (and (symbolp op) (name-eq op "FUNCTION"))
                         (and (integerp op) (= op 402801909)))  ; FUNCTION
                     (when (and (consp (cadr form))
                                (%form-op-is (cadr form) 80380232 "LAMBDA"))
@@ -12616,8 +12616,8 @@
                    ;; lambda body can.  Treat each (name params fbody…)
                    ;; like a lambda for boxed-var detection.
                    ((or (and (symbolp op)
-                             (or (string= (symbol-name op) "FLET")
-                                 (string= (symbol-name op) "LABELS")))
+                             (or (name-eq op "FLET")
+                                 (name-eq op "LABELS")))
                         (and (integerp op) (= op 445617652))   ; flet hash
                         (and (integerp op) (= op 417505106)))  ; labels hash
                     (let ((defs (cadr form))
@@ -12645,7 +12645,7 @@
                       (dolist (f rest-body)
                         (scan f in-lambda))))
                    ;; skip quoted forms
-                   ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+                   ((or (and (symbolp op) (name-eq op "QUOTE"))
                         (and (integerp op) (= op 338547669)))  ; QUOTE
                     nil)
                    (t
@@ -12682,10 +12682,10 @@
     (t
      (let ((op (car form)))
        (cond
-         ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+         ((or (and (symbolp op) (name-eq op "QUOTE"))
               (and (integerp op) (= op 338547669)))  ; QUOTE
           nil)
-         ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+         ((or (and (symbolp op) (name-eq op "LAMBDA"))
               (and (integerp op) (= op 80380232)))  ; LAMBDA
           (let* ((params (if (consp (cadr form)) (cadr form) nil))
                  (new-locals (append params local-vars))
@@ -12694,16 +12694,16 @@
               (dolist (v (collect-var-refs f bound-vars new-locals))
                 (setq result (adjoin v result :test #'name-equal))))
             result))
-         ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+         ((or (and (symbolp op) (name-eq op "FUNCTION"))
               (and (integerp op) (= op 402801909)))  ; FUNCTION
           (if (and (consp (cadr form))
                    (let ((inner-op (car (cadr form))))
-                     (or (and (symbolp inner-op) (string= (symbol-name inner-op) "LAMBDA"))
+                     (or (and (symbolp inner-op) (name-eq inner-op "LAMBDA"))
                          (and (integerp inner-op) (= inner-op 80380232)))))  ; LAMBDA
               (collect-var-refs (cadr form) bound-vars local-vars)
               nil))
-         ((or (and (symbolp op) (or (string= (symbol-name op) "LET")
-                                    (string= (symbol-name op) "LET*")))
+         ((or (and (symbolp op) (or (name-eq op "LET")
+                                    (name-eq op "LET*")))
               (and (integerp op) (or (= op 536263002)  ; LET
                                      (= op 431241200))))  ; LET*
           (let* ((bindings (cadr form))
@@ -12720,7 +12720,7 @@
                 (setq result (adjoin v result :test #'name-equal))))
             result))
          ;; setq — value is a reference context but var name is not
-         ((or (and (symbolp op) (string= (symbol-name op) "SETQ"))
+         ((or (and (symbolp op) (name-eq op "SETQ"))
               (and (integerp op) (= op 260934892)))  ; SETQ
           (let ((var (cadr form))
                 (val (caddr form))
@@ -12798,25 +12798,25 @@
                (unless (consp form) (return-from scan))
                (let ((op (car form)))
                  (cond
-                   ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+                   ((or (and (symbolp op) (name-eq op "QUOTE"))
                         (and (integerp op) (= op 338547669)))  ; QUOTE
                     nil)
-                   ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+                   ((or (and (symbolp op) (name-eq op "LAMBDA"))
                         (and (integerp op) (= op 80380232)))  ; LAMBDA
                     (let ((params (if (consp (cadr form))
                                       (remove-if-not #'symbolp (cadr form))
                                       nil)))
                       (dolist (f (cddr form))
                         (note (collect-var-refs f let-vars params)))))
-                   ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+                   ((or (and (symbolp op) (name-eq op "FUNCTION"))
                         (and (integerp op) (= op 402801909)))  ; FUNCTION
                     ;; Only a LAMBDA (see %FORM-HAS-CLOSURE-P-2).
                     (when (and (consp (cadr form))
                                (%form-op-is (cadr form) 80380232 "LAMBDA"))
                       (scan (cadr form))))
                    ((or (and (symbolp op)
-                             (or (string= (symbol-name op) "FLET")
-                                 (string= (symbol-name op) "LABELS")))
+                             (or (name-eq op "FLET")
+                                 (name-eq op "LABELS")))
                         (and (integerp op) (= op 445617652))  ; FLET
                         (and (integerp op) (= op 417505106)))  ; LABELS
                     (let ((defs (cadr form))
@@ -13224,9 +13224,9 @@
          ;; (psetq (car %CELL-V) …).  Bind every rewritten value to a temp in a
          ;; LET (parallel evaluation), then assign each place from its temp —
          ;; boxed places via set-car, others via a single-pair setq/setf.
-         ((or (and (symbolp op) (string= (symbol-name op) "PSETQ"))
-              (and (symbolp op) (string= (symbol-name op) "PSETF")))
-          (let* ((psetf-p (string= (symbol-name op) "PSETF"))
+         ((or (and (symbolp op) (name-eq op "PSETQ"))
+              (and (symbolp op) (name-eq op "PSETF")))
+          (let* ((psetf-p (name-eq op "PSETF"))
                  (args (cdr form))
                  (lets nil)
                  (sets nil))
@@ -13254,10 +13254,10 @@
          ;; places were never converted to set-car (they read/wrote the stale
          ;; by-value capture).  Emitting a PROGN of single-pair forms preserves
          ;; left-to-right SETQ/SETF evaluation order.
-         ((or (and (symbolp op) (string= (symbol-name op) "SETQ"))
+         ((or (and (symbolp op) (name-eq op "SETQ"))
               (and (integerp op) (= op 260934892))  ; SETQ
-              (and (symbolp op) (string= (symbol-name op) "SETF")))
-          (let* ((setf-p (and (symbolp op) (string= (symbol-name op) "SETF")))
+              (and (symbolp op) (name-eq op "SETF")))
+          (let* ((setf-p (and (symbolp op) (name-eq op "SETF")))
                  (args (cdr form))
                  (pairs nil))
             (loop while (consp args) do
@@ -13279,7 +13279,7 @@
                   ((null (cdr pairs)) (car pairs))
                   (t `(progn ,@pairs)))))
          ;; (incf var delta) — if var is boxed, rewrite to setcar + car + +
-         ((and (symbolp op) (string= (symbol-name op) "INCF"))
+         ((and (symbolp op) (name-eq op "INCF"))
           (let ((var (cadr form))
                 (delta (or (caddr form) 1)))
             (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
@@ -13296,7 +13296,7 @@
                 `(incf ,(cell-rewrite-form var boxed-vars lambda-params)
                        ,(cell-rewrite-form delta boxed-vars lambda-params)))))
          ;; (decf var delta) — if var is boxed, rewrite to setcar + car + -
-         ((and (symbolp op) (string= (symbol-name op) "DECF"))
+         ((and (symbolp op) (name-eq op "DECF"))
           (let ((var (cadr form))
                 (delta (or (caddr form) 1)))
             (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
@@ -13313,7 +13313,7 @@
          ;; and boxed; without explicit rewriting here, push's
          ;; macro-expansion sees the original (read-only) acc and the
          ;; mutation is invisible to the outer scope.
-         ((and (symbolp op) (string= (symbol-name op) "PUSH"))
+         ((and (symbolp op) (name-eq op "PUSH"))
           (let ((val (cadr form))
                 (var (caddr form)))
             (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
@@ -13325,7 +13325,7 @@
          ;; (pop place) — if place is a boxed var, return (car (car %CELL))
          ;; while updating it to (cdr (car %CELL)).  Wrap in a let so the
          ;; old head is returned per CL semantics.
-         ((and (symbolp op) (string= (symbol-name op) "POP"))
+         ((and (symbolp op) (name-eq op "POP"))
           (let ((var (cadr form)))
             (if (and (symbolp var) (member var boxed-vars :test #'name-equal))
                 `(let ((%popped (car (car ,(cell-var-name var)))))
@@ -13333,7 +13333,7 @@
                    %popped)
                 `(pop ,(cell-rewrite-form var boxed-vars lambda-params)))))
          ;; lambda — shadow boxed-vars with lambda params
-         ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+         ((or (and (symbolp op) (name-eq op "LAMBDA"))
               (and (integerp op) (= op 80380232)))  ; LAMBDA
           (let* ((params (if (consp (cadr form)) (cadr form) (list (cadr form))))
                  ;; Remove params from boxed-vars (they shadow)
@@ -13352,8 +13352,8 @@
          ;; an flet param NAMED the same as an outer boxed var) and
          ;; documents the structural correspondence with LAMBDA.
          ((or (and (symbolp op)
-                   (or (string= (symbol-name op) "FLET")
-                       (string= (symbol-name op) "LABELS")))
+                   (or (name-eq op "FLET")
+                       (name-eq op "LABELS")))
               (and (integerp op) (= op 445617652))   ; flet hash
               (and (integerp op) (= op 417505106)))  ; labels hash
           (let* ((defs (cadr form))
@@ -13384,17 +13384,17 @@
                           rest-body)))
             `(,op ,new-defs ,@new-rest)))
          ;; quote — don't rewrite inside
-         ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+         ((or (and (symbolp op) (name-eq op "QUOTE"))
               (and (integerp op) (= op 338547669)))  ; QUOTE
           form)
          ;; let/let* — inner bindings may shadow
-         ((or (and (symbolp op) (string= (symbol-name op) "LET"))
+         ((or (and (symbolp op) (name-eq op "LET"))
               (and (integerp op) (= op 536263002))  ; LET
-              (and (symbolp op) (string= (symbol-name op) "LET*"))
+              (and (symbolp op) (name-eq op "LET*"))
               (and (integerp op) (= op 431241200))  ; LET*
               ;; PROG / PROG* bind exactly like LET / LET* (special forms here)
-              (and (symbolp op) (string= (symbol-name op) "PROG"))
-              (and (symbolp op) (string= (symbol-name op) "PROG*")))
+              (and (symbolp op) (name-eq op "PROG"))
+              (and (symbolp op) (name-eq op "PROG*")))
           (let* ((bindings (cadr form))
                  (body (cddr form))
                  ;; Variables bound by this let shadow outer boxed vars
@@ -14102,18 +14102,18 @@
   ":scalar for SINGLE-FLOAT, :dscalar for DOUBLE-FLOAT, :vector for
    F32V-PACK / (simple-array single-float (4)), else NIL."
   (let ((ty (%resolve-declared-type ty)))
-    (cond ((and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")) :scalar)
+    (cond ((and (symbolp ty) ty (name-eq ty "SINGLE-FLOAT")) :scalar)
           ;; a double in the same FP register (its D view): the targets with
           ;; the FPD ops only, like every unboxed double tree
-          ((and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")
+          ((and (symbolp ty) ty (name-eq ty "DOUBLE-FLOAT")
                 (or *mvm-eval-runtime-p* (ct-has-fpd-p)))
            :dscalar)
-          ((and (symbolp ty) ty (string= (symbol-name ty) "F32V-PACK")) :vector)
-          ((and (symbolp ty) ty (string= (symbol-name ty) "VI-PACK")) :ivector)   ; integer lanes (2b)
+          ((and (symbolp ty) ty (name-eq ty "F32V-PACK")) :vector)
+          ((and (symbolp ty) ty (name-eq ty "VI-PACK")) :ivector)   ; integer lanes (2b)
           ((and (consp ty) (symbolp (car ty))
-                (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+                (name-eq (car ty) "SIMPLE-ARRAY")
                 (consp (cdr ty)) (symbolp (cadr ty))
-                (string= (symbol-name (cadr ty)) "SINGLE-FLOAT")
+                (name-eq (cadr ty) "SINGLE-FLOAT")
                 (equal (caddr ty) '(4)))
            :vector)
           (t nil))))
@@ -16287,7 +16287,7 @@
      (let ((op (car form)))
        (cond
          ;; (quote ...) — leave as-is
-         ((or (and (symbolp op) (string= (symbol-name op) "QUOTE"))
+         ((or (and (symbolp op) (name-eq op "QUOTE"))
               (and (integerp op) (= op 338547669)))  ; QUOTE
           form)
          ;; (macrolet ((m ll . mbody) ...) . body) — a call to a local
@@ -16313,7 +16313,7 @@
          ;; expansion time, as this used to, failed under runtime compilation:
          ;; a MACROLET inside an escaping local function signalled a TYPE-ERROR.)
          ;; Names the macrolet binds shadow the local functions in its body.
-         ((and (symbolp op) (string= (symbol-name op) "MACROLET")
+         ((and (symbolp op) (name-eq op "MACROLET")
                (consp (cdr form)) (listp (cadr form)))
           (let* ((mnames (mapcar (lambda (d) (if (consp d) (car d) nil)) (cadr form)))
                  (filtered (loop for n in local-names
@@ -16341,7 +16341,7 @@
                     (setf (gethash (car sv) *macro-table*) (cdr sv))
                     (remhash (car sv) *macro-table*))))))
          ;; (function NAME) — if NAME is a local, replace with (car cell)
-         ((or (and (symbolp op) (string= (symbol-name op) "FUNCTION"))
+         ((or (and (symbolp op) (name-eq op "FUNCTION"))
               (and (integerp op) (= op 402801909)))  ; FUNCTION
           (let ((arg (cadr form)))
             (cond
@@ -16349,7 +16349,7 @@
               ;; shadowing any local-names re-bound by the lambda params.
               ((and (consp arg)
                     (or (and (symbolp (car arg))
-                             (string= (symbol-name (car arg)) "LAMBDA"))
+                             (name-eq (car arg) "LAMBDA"))
                         (and (integerp (car arg))
                              (= (car arg) 80380232))))  ; LAMBDA
                (let* ((params (cadr arg))
@@ -16376,7 +16376,7 @@
                  `(car ,cell)))
               (t form))))
          ;; (lambda (params...) body...) — walk body with shadow
-         ((or (and (symbolp op) (string= (symbol-name op) "LAMBDA"))
+         ((or (and (symbolp op) (name-eq op "LAMBDA"))
               (and (integerp op) (= op 80380232)))  ; LAMBDA
           (let* ((params (cadr form))
                  (pnames (if (consp params) (remove-if-not #'symbolp params) nil))
@@ -16395,8 +16395,8 @@
          ;; from the local→cell map before walking inside; only the outer
          ;; body of the nested form sees the shadow (per CL semantics).
          ((or (and (symbolp op)
-                   (or (string= (symbol-name op) "FLET")
-                       (string= (symbol-name op) "LABELS")))
+                   (or (name-eq op "FLET")
+                       (name-eq op "LABELS")))
               (and (integerp op) (= op 445617652))  ; FLET
               (and (integerp op) (= op 417505106)))  ; LABELS
           (let* ((defs (cadr form))
@@ -16578,23 +16578,23 @@
    coarse textual walk: a false positive only costs the cell transform."
   (cond ((atom tree) nil)
         ((and (symbolp (car tree)) (car tree)
-              (string= (symbol-name (car tree)) "FUNCTION") (consp (cdr tree))
+              (name-eq (car tree) "FUNCTION") (consp (cdr tree))
               (symbolp (cadr tree)) (cadr tree)
               (member (cadr tree) names :test #'name-equal))
          t)
         ((and (symbolp (car tree)) (car tree)
-              (or (string= (symbol-name (car tree)) "QUOTE")
-                  (string= (symbol-name (car tree)) "DECLARE")))
+              (or (name-eq (car tree) "QUOTE")
+                  (name-eq (car tree) "DECLARE")))
          nil)
         ;; Lambda lists are not walked: the cell rewrite does not reach a
         ;; default form there (MISC.190), so such a #'F keeps the plain path.
         ((and (symbolp (car tree)) (car tree)
-              (string= (symbol-name (car tree)) "LAMBDA") (consp (cdr tree)))
+              (name-eq (car tree) "LAMBDA") (consp (cdr tree)))
          (%flet-names-function-ref-p (cddr tree) names))
         ((and (symbolp (car tree)) (car tree)
-              (or (string= (symbol-name (car tree)) "FLET")
-                  (string= (symbol-name (car tree)) "LABELS")
-                  (string= (symbol-name (car tree)) "MACROLET"))
+              (or (name-eq (car tree) "FLET")
+                  (name-eq (car tree) "LABELS")
+                  (name-eq (car tree) "MACROLET"))
               (consp (cdr tree)) (listp (cadr tree)))
          (or (some (lambda (d) (and (consp d) (consp (cdr d))
                                     (%flet-names-function-ref-p (cddr d) names)))
@@ -16911,7 +16911,7 @@
   "True for the (%LOOP-NONIL) marker GENERATE-LOOP-CODE puts at the head of
    a NAMED loop's inner simple LOOP."
   (and (consp x) (symbolp (car x)) (null (cdr x))
-       (string= (symbol-name (car x)) "%LOOP-NONIL")))
+       (name-eq (car x) "%LOOP-NONIL")))
 
 (defun %compile-loop-1 (body env dest)
   "Compile (loop forms...) - either simple infinite loop or CL-style loop.
@@ -17549,7 +17549,7 @@
 
 (defun %loop-acc-slot-p (x)
   (and (consp x) (symbolp (car x)) (null (cdr x))
-       (string= (symbol-name (car x)) "%LOOP-ACC-SLOT")))
+       (name-eq (car x) "%LOOP-ACC-SLOT")))
 
 (defun %loop-type-default (ts)
   "CLHS 6.1.2.2 default for an uninitialised typed WITH variable: 0 for
@@ -18507,8 +18507,8 @@
   (let ((ts (%loop-acc-type-spec acc-spec)))
     (and (member (car acc-spec) '(:sum :count :maximize :minimize))
          ts (symbolp ts)
-         (cond ((string= (symbol-name ts) "SINGLE-FLOAT") 'single-float)
-               ((string= (symbol-name ts) "DOUBLE-FLOAT") 'double-float)
+         (cond ((name-eq ts "SINGLE-FLOAT") 'single-float)
+               ((name-eq ts "DOUBLE-FLOAT") 'double-float)
                ((ignore-errors (%decl-int-width (%resolve-declared-type ts))) 'fixnum)
                (t nil)))))
 
@@ -19208,15 +19208,15 @@
                               ((atom x) x)
                               ;; Don't recurse into nested LOOP forms.
                               ((and (consp x) (symbolp (car x))
-                                    (string= (symbol-name (car x)) "LOOP"))
+                                    (name-eq (car x) "LOOP"))
                                x)
                               ;; Don't recurse into QUOTE — its argument
                               ;; can be ANY structure (dotted pairs etc.).
                               ((and (consp x) (symbolp (car x))
-                                    (string= (symbol-name (car x)) "QUOTE"))
+                                    (name-eq (car x) "QUOTE"))
                                x)
                               ((and (consp x) (symbolp (car x))
-                                    (string= (symbol-name (car x)) "LOOP-FINISH")
+                                    (name-eq (car x) "LOOP-FINISH")
                                     (null (cdr x)))
                                `(progn (setq ,%nat-var t)
                                        (return-from :%loop-exit ,loop-finish-return-val)))
@@ -19372,8 +19372,8 @@
                          (cond
                            ((atom f) nil)
                            ((and (symbolp (car f))
-                                 (or (string= (symbol-name (car f)) "RETURN")
-                                     (and (string= (symbol-name (car f)) "RETURN-FROM")
+                                 (or (name-eq (car f) "RETURN")
+                                     (and (name-eq (car f) "RETURN-FROM")
                                           (consp (cdr f))
                                           (null (cadr f)))))
                             t)
@@ -20346,7 +20346,7 @@
               (let ((ty (%dotimes-counter-type count env)))
                 (and ty
                      (not (some (lambda (d)
-                                  (and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "DECLARE")
+                                  (and (consp d) (symbolp (car d)) (name-eq (car d) "DECLARE")
                                        (some (lambda (c)
                                                (and (consp c) (member var (cdr c))))
                                              (cdr d))))
@@ -20424,7 +20424,7 @@
    inline opcodes with no callable entry, so we redirect to wrapper
    functions defined in prelude.lisp (e.g. EQL → %eql-fn)."
   (if (and (consp name) (symbolp (car name))
-           (string= (symbol-name (car name)) "LAMBDA"))
+           (name-eq (car name) "LAMBDA"))
       ;; #'(lambda (params) body...) → compile as lambda
       (compile-lambda (cadr name) (cddr name) env dest)
       ;; #'name or #'(setf name) → load function address
@@ -21138,7 +21138,7 @@
       forms
       (let ((lst (car (last forms))))
         (if (and (consp lst) (symbolp (car lst))
-                 (string= (symbol-name (car lst)) "DECLARE"))
+                 (name-eq (car lst) "DECLARE"))
             forms
             (append (butlast forms) (list (%mv-clamp-tail lst)))))))
 
@@ -22321,7 +22321,7 @@
     ;; declared single-float variable, or a single-float struct slot
     ((symbolp form)
      (let ((ty (%expr-dtype form env)))
-       (and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT"))))
+       (and (symbolp ty) ty (name-eq ty "SINGLE-FLOAT"))))
     ((consp form)
      (let ((op (car form)))
        (cond
@@ -22342,7 +22342,7 @@
          ((%fp-exp-arg form) (%expr-single-float-p (%fp-exp-arg form) env))
          ;; struct accessor whose slot type is single-float
          (t (let ((ty (%expr-dtype form env)))
-              (and (symbolp ty) ty (string= (symbol-name ty) "SINGLE-FLOAT")))))))
+              (and (symbolp ty) ty (name-eq ty "SINGLE-FLOAT")))))))
     (t nil)))
 
 (defun %float-arith-op (op-name)
@@ -22412,10 +22412,10 @@
 
 (defun %f64-simple-array-decl-p (ty)
   (and (consp ty) (symbolp (car ty))
-       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (name-eq (car ty) "SIMPLE-ARRAY")
        (consp (cdr ty))
        (let ((et (cadr ty)))
-         (and (symbolp et) et (string= (symbol-name et) "DOUBLE-FLOAT")))))
+         (and (symbolp et) et (name-eq et "DOUBLE-FLOAT")))))
 
 (defun %double-conversion-arg (form)
   "X when FORM is (FLOAT X <double literal>), (COERCE X 'DOUBLE-FLOAT) or
@@ -22433,7 +22433,7 @@
                  (let ((q (car rest)))
                    (and (consp q) (name-eq (car q) "QUOTE") (consp (cdr q))
                         (symbolp (cadr q)) (cadr q)
-                        (string= (symbol-name (cadr q)) "DOUBLE-FLOAT"))))
+                        (name-eq (cadr q) "DOUBLE-FLOAT"))))
             (cadr form))
            ((and (name-eq (car form) "%TO-DOUBLE") (null rest)) (cadr form))
            (t nil)))))
@@ -22459,7 +22459,7 @@
           (typep (cadr form) 'double-float)) t)
     ((symbolp form)
      (or (let ((ty (%expr-dtype form env)))
-           (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")))
+           (and (symbolp ty) ty (name-eq ty "DOUBLE-FLOAT")))
          (and (not (and env (env-lookup env form))) (%double-constant-p form))))
     ((consp form)
      (let ((op (car form)))
@@ -22472,20 +22472,20 @@
                (consp (cdr form)) (consp (cddr form)))
           (every (lambda (a) (%expr-double-float-p a env)) (cdr form)))
          ;; unary minus, or ABS, of a double
-         ((and (or (string= (symbol-name op) "-") (string= (symbol-name op) "ABS"))
+         ((and (or (name-eq op "-") (name-eq op "ABS"))
                (consp (cdr form)) (null (cddr form)))
           (%expr-double-float-p (cadr form) env))
          ;; two-argument MAX / MIN of doubles
          ((%fp-minmax-op form)
           (and (%expr-double-float-p (cadr form) env) (%expr-double-float-p (caddr form) env)))
          (t (let ((ty (%expr-dtype form env)))
-              (and (symbolp ty) ty (string= (symbol-name ty) "DOUBLE-FLOAT")))))))
+              (and (symbolp ty) ty (name-eq ty "DOUBLE-FLOAT")))))))
     (t nil)))
 
 (defun %fpd-unary-minus-p (form)
   "True for (- X): inside a double tree it is (* -1.0d0 X), the exact IEEE
    negation (signed zeros included)."
-  (and (consp form) (symbolp (car form)) (string= (symbol-name (car form)) "-")
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "-")
        (consp (cdr form)) (null (cddr form))))
 
 (defun %double-float-arith-applicable-p (args env)
@@ -22706,7 +22706,7 @@
         ((and (consp f) (symbolp (car f)))
          (cond
            ;; (THE type index) — mill writes every index as (the dim ...)
-           ((and (string= (symbol-name (car f)) "THE") (consp (cdr f)) (consp (cddr f)))
+           ((and (name-eq (car f) "THE") (consp (cdr f)) (consp (cddr f)))
             (%simple-index-form-p (caddr f)))
            (t (and (member (symbol-name (car f)) '("+" "-" "*" "1+" "1-" "LOGAND" "ASH")
                            :test #'string=)
@@ -22787,7 +22787,7 @@
          (cond ((and (name-eq (car form) "COERCE")
                      (consp p) (name-eq (car p) "QUOTE") (consp (cdr p))
                      (symbolp (cadr p)) (cadr p)
-                     (string= (symbol-name (cadr p)) "SINGLE-FLOAT"))
+                     (name-eq (cadr p) "SINGLE-FLOAT"))
                 (cadr form))
                ((and (name-eq (car form) "FLOAT") (typep p 'single-float))
                 (cadr form))))))
@@ -23083,11 +23083,11 @@
   "A variable declared f32v-pack or (simple-array single-float (4))."
   (and (symbolp form)
        (let ((ty (%var-dtype form env)))
-         (or (and (symbolp ty) ty (string= (symbol-name ty) "F32V-PACK"))
+         (or (and (symbolp ty) ty (name-eq ty "F32V-PACK"))
              (and (consp ty) (symbolp (car ty))
-                  (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+                  (name-eq (car ty) "SIMPLE-ARRAY")
                   (consp (cdr ty)) (symbolp (cadr ty))
-                  (string= (symbol-name (cadr ty)) "SINGLE-FLOAT")
+                  (name-eq (cadr ty) "SINGLE-FLOAT")
                   (equal (caddr ty) '(4)))))))
 
 (defun %v4-tree-need (form env)
@@ -23298,7 +23298,7 @@
 (defun %declared-vi-var-p (form env)
   (and (symbolp form)
        (let ((ty (%var-dtype form env)))
-         (and (symbolp ty) ty (string= (symbol-name ty) "VI-PACK")))))
+         (and (symbolp ty) ty (name-eq ty "VI-PACK")))))
 
 (defun %vil-tree-need (form env)
   "FP registers needed to evaluate the integer-lane tree FORM, or NIL."
@@ -23929,14 +23929,14 @@
   (cond
     ((symbolp form) (and form (not (eq form t)) (%w32-type-class (%var-dtype form env))))
     ((not (consp form)) nil)
-    ((and (symbolp (car form)) (string= (symbol-name (car form)) "THE")
+    ((and (symbolp (car form)) (name-eq (car form) "THE")
           (consp (cdr form)))
      (%w32-type-class (cadr form)))
-    ((and (symbolp (car form)) (string= (symbol-name (car form)) "AREF")
+    ((and (symbolp (car form)) (name-eq (car form) "AREF")
           (consp (cdr form)))
      (let ((aty (%expr-dtype (cadr form) env)))
        (and (consp aty) (symbolp (car aty))
-            (string= (symbol-name (car aty)) "SIMPLE-ARRAY") (consp (cdr aty))
+            (name-eq (car aty) "SIMPLE-ARRAY") (consp (cdr aty))
             (%w32-type-class (cadr aty)))))
     ;; any other expression the width inference proves a fixnum
     (t (and (%expr-width form env) :sfix))))
@@ -25147,7 +25147,7 @@
                         (let ((sp (if (and (consp spec) (eq (car spec) 'quote))
                                       (cadr spec) spec)))
                           (when (and (consp sp) (symbolp (car sp))
-                                     (string= (symbol-name (car sp)) "SPECIAL"))
+                                     (name-eq (car sp) "SPECIAL"))
                             (dolist (v (cdr sp))
                               (when (and v (symbolp v)) (setf (gethash v h) t))))))))))))
       (dolist (f forms) (walk f)))
@@ -25499,7 +25499,7 @@
 (defun %unsigned-small-max (form env)
   "2^n - 1 when FORM is a variable declared (unsigned-byte n) with n <= 6, else NIL."
   (let ((ty (%expr-dtype form env)))
-    (and (consp ty) (symbolp (car ty)) (string= (symbol-name (car ty)) "UNSIGNED-BYTE")
+    (and (consp ty) (symbolp (car ty)) (name-eq (car ty) "UNSIGNED-BYTE")
          (consp (cdr ty)) (integerp (cadr ty)) (<= 0 (cadr ty) 6)
          (- (ash 1 (cadr ty)) 1))))
 (defun %var-shift-plan (value-form count-form env)
@@ -27598,11 +27598,11 @@
    element access is %C32-REF / %C32-SET, a raw 32-bit lane."
   (and (%u32-on-p)
        (consp ty) (symbolp (car ty))
-       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (name-eq (car ty) "SIMPLE-ARRAY")
        (consp (cdr ty))
        (let ((et (cadr ty)))
          (or (and (consp et) (symbolp (car et)) (consp (cdr et)) (null (cddr et))
-                  (string= (symbol-name (car et)) "UNSIGNED-BYTE")
+                  (name-eq (car et) "UNSIGNED-BYTE")
                   (eql (cadr et) 32))
              ;; Any element type the runtime UPGRADES to the #x17 vector --
              ;; (unsigned-byte 16), cram's Huffman fast table, read 1 time per
@@ -27617,7 +27617,7 @@
 (defun %inline-generic-element-type-p (form)
   "True for a QUOTED generic element-type form, (quote TY) — see
    %generic-element-type-p."
-  (and (consp form) (symbolp (car form)) (string= (symbol-name (car form)) "QUOTE")
+  (and (consp form) (symbolp (car form)) (name-eq (car form) "QUOTE")
        (consp (cdr form)) (null (cddr form))
        (%generic-element-type-p (cadr form))))
 
@@ -27640,10 +27640,10 @@
 (defun %generic-simple-array-decl-p (ty)
   "True for a declared type (simple-array ET …) whose ET is generic, and for
    SIMPLE-VECTOR / (simple-vector N) — a plain word-slot vector of T."
-  (or (and (symbolp ty) ty (string= (symbol-name ty) "SIMPLE-VECTOR"))
+  (or (and (symbolp ty) ty (name-eq ty "SIMPLE-VECTOR"))
       (and (consp ty) (symbolp (car ty))
-           (or (string= (symbol-name (car ty)) "SIMPLE-VECTOR")
-               (and (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+           (or (name-eq (car ty) "SIMPLE-VECTOR")
+               (and (name-eq (car ty) "SIMPLE-ARRAY")
                     (consp (cdr ty))
                     (%generic-element-type-p (cadr ty)))))))
 
@@ -27709,10 +27709,10 @@
         ((and (stringp (car b)) (cdr b) (not seen-doc))
          (setq seen-doc t) (setq b (cdr b)))
         ((and (consp (car b)) (symbolp (caar b))
-              (string= (symbol-name (caar b)) "DECLARE"))
+              (name-eq (caar b) "DECLARE"))
          (dolist (d (cdar b))
            (cond
-             ((and (consp d) (symbolp (car d)) (string= (symbol-name (car d)) "TYPE")
+             ((and (consp d) (symbolp (car d)) (name-eq (car d) "TYPE")
                    (consp (cdr d)))
               (let ((ty (%resolve-declared-type (cadr d))))
                 (dolist (v (cddr d))
@@ -27812,10 +27812,10 @@
   "True for a declared (simple-array single-float …) — the packed #x12
    vector, whose element access is %f32-aref / %f32-aset."
   (and (consp ty) (symbolp (car ty))
-       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (name-eq (car ty) "SIMPLE-ARRAY")
        (consp (cdr ty))
        (let ((et (cadr ty)))
-         (and (symbolp et) et (string= (symbol-name et) "SINGLE-FLOAT")))))
+         (and (symbolp et) et (name-eq et "SINGLE-FLOAT")))))
 
 (defun %declared-f32-array-var-p (form env)
   (and form (symbolp form) (%f32-simple-array-decl-p (%expr-dtype form env))))
@@ -27824,11 +27824,11 @@
   "True for a declared (simple-array (unsigned-byte 8) …) — the byte-packed
    #x11 vector, whose element access is %u8-ref / %u8-set."
   (and (consp ty) (symbolp (car ty))
-       (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+       (name-eq (car ty) "SIMPLE-ARRAY")
        (consp (cdr ty))
        (let ((et (cadr ty)))
          (and (consp et) (symbolp (car et)) (consp (cdr et)) (null (cddr et))
-              (string= (symbol-name (car et)) "UNSIGNED-BYTE")
+              (name-eq (car et) "UNSIGNED-BYTE")
               (eql (cadr et) 8)))))
 
 ;;; TYPED-ARITHMETIC FAST PATH.  emit-arith-pair compiles every + - * as a
@@ -27876,10 +27876,10 @@
 
 (defun %decl-array-elt-width (ty)
   "Element width for a declared (simple-array ET …), or NIL."
-  (and (consp ty) (symbolp (car ty)) (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+  (and (consp ty) (symbolp (car ty)) (name-eq (car ty) "SIMPLE-ARRAY")
        (consp (cdr ty))
        (let ((et (cadr ty)))
-         (cond ((and (symbolp et) (string= (symbol-name et) "T")) nil)
+         (cond ((and (symbolp et) (name-eq et "T")) nil)
                (t (%decl-int-width et))))))
 
 (defun %expr-width (form env)
@@ -27995,7 +27995,7 @@
          (def (and k *inline-fn-defs* (assoc k *inline-fn-defs* :test (function string=)))))
     (when (and def (listp (cdr form)) (= (length (cdr form)) (length (cadr def))))
       (let ((last (car (last (cddr def)))))
-        (when (and (consp last) (symbolp (car last)) (string= (symbol-name (car last)) "LOGAND")
+        (when (and (consp last) (symbolp (car last)) (name-eq (car last) "LOGAND")
                    (consp (cdr last)))
           (let ((c (find-if (lambda (a) (and (integerp a) (>= a 0))) (cdr last))))
             (and c (+ 1 (integer-length c)))))))))
@@ -28643,7 +28643,7 @@
                         (cond ((string= k "ELEMENT-TYPE")
                                (setq et (and (consp v) (name-eq (car v) "QUOTE") (consp (cdr v))
                                              (symbolp (cadr v)) (cadr v)
-                                             (string= (symbol-name (cadr v)) "SINGLE-FLOAT"))))
+                                             (name-eq (cadr v) "SINGLE-FLOAT"))))
                               ((string= k "INITIAL-ELEMENT")
                                (let ((x (%fp-literal-value v)))
                                  (unless (and x (eql x 0.0)) (setq ok nil))))
@@ -29100,7 +29100,7 @@
       ((and (symbolp arr) (consp subs) (consp (cdr subs)) (null (cddr subs))
             (let ((ty (%expr-dtype arr env)))
               (and (consp ty) (symbolp (car ty))
-                   (string= (symbol-name (car ty)) "SIMPLE-ARRAY")
+                   (name-eq (car ty) "SIMPLE-ARRAY")
                    (consp (cdr ty)) (consp (cddr ty)) (consp (caddr ty))
                    (consp (cdr (caddr ty))) (null (cddr (caddr ty)))
                    (integerp (cadr (caddr ty))))))
@@ -29350,7 +29350,7 @@
   (or (null form) (eq form t) (integerp form) (stringp form) (characterp form)
       (keywordp form)
       (and (consp form) (symbolp (car form))
-           (string= (symbol-name (car form)) "QUOTE"))))
+           (name-eq (car form) "QUOTE"))))
 
 (defun %call-args-need-ordering-p (args env)
   "T when compile-call's register/stack split would observably evaluate
@@ -29385,7 +29385,7 @@
   ;; (FBOUNDP 'F) in the image's own source, F a function the image already
   ;; defines: T (the guard shared host / image source puts around a FUNCALL
   ;; of an image-only function; a run-time name lookup at every call)
-  (when (and (not *mvm-eval-runtime-p*) (symbolp fn) (string= (symbol-name fn) "FBOUNDP")
+  (when (and (not *mvm-eval-runtime-p*) (symbolp fn) (name-eq fn "FBOUNDP")
              (consp args) (null (cdr args))
              (consp (car args)) (eq (car (car args)) 'quote) (consp (cdr (car args)))
              (symbolp (cadr (car args))) (cadr (car args)) *functions*
@@ -29918,7 +29918,7 @@
        (when (and *compile-list-headed-fn-warn*
                   (consp fn)
                   (not (and (symbolp (car fn))
-                            (string= (symbol-name (car fn)) "LAMBDA"))))
+                            (name-eq (car fn) "LAMBDA"))))
          (format *error-output*
                  "~&;; WARN compile-call: list-headed non-lambda in fn ~
                   position at ~A: ~S~%"
@@ -29982,7 +29982,7 @@
        (if hit (cdr hit) form)))
     ((not (consp form)) form)
     ((and (symbolp (car form)) (car form)
-          (string= (symbol-name (car form)) "QUOTE"))
+          (name-eq (car form) "QUOTE"))
      form)
     (t (let ((a (%sp-subst (car form) alist))
              (d (%sp-subst (cdr form) alist)))
@@ -30183,11 +30183,11 @@
                  (push (caddr p) pnames))))))
     (loop
       (if (and (consp rest) (consp (car rest)) (symbolp (caar rest))
-               (string= (symbol-name (caar rest)) "DECLARE"))
+               (name-eq (caar rest) "DECLARE"))
           (progn
             (dolist (spec (cdar rest))
               (when (and (consp spec) (symbolp (car spec))
-                         (string= (symbol-name (car spec)) "SPECIAL"))
+                         (name-eq (car spec) "SPECIAL"))
                 (dolist (v (cdr spec))
                   (when (and (symbolp v) (not (member v pnames)) (not (member v free)))
                     (push v free)))))
@@ -31056,7 +31056,7 @@
                ;; mvm-eval's toplevel thunk is entered by the evaluator,
                ;; which sets no count.
                (not (and (symbolp name)
-                         (string= (symbol-name name) "%MVM-EVAL-THUNK"))))
+                         (name-eq name "%MVM-EVAL-THUNK"))))
       (let ((req (if (and opt-count (> opt-count 0)) opt-start (length params))))
         (emit-arity-range-check-prologue
          name req (if (and opt-count (> opt-count 0)) (+ opt-start opt-count) req))))
@@ -32319,7 +32319,7 @@
        (let ((name (if (and (consp raw-name)
                             (= (length raw-name) 2)
                             (symbolp (car raw-name))
-                            (string= (symbol-name (car raw-name)) "SETF"))
+                            (name-eq (car raw-name) "SETF"))
                        (%setf-fn-name (cadr raw-name))
                        raw-name)))
          ;; CLHS long-form setf function — link (setf (NAME …) v) to it.
@@ -32737,7 +32737,7 @@
                                              (loop
                                                (when (or (null opts) (null (cdr opts))) (return nil))
                                                (when (and (symbolp (car opts))
-                                                          (string= (symbol-name (car opts)) "TYPE"))
+                                                          (name-eq (car opts) "TYPE"))
                                                  (return (cadr opts)))
                                                (setq opts (cddr opts))))))
                                     raw-slots))
@@ -33046,12 +33046,12 @@
                          (lambda (s)
                            (cond
                              ((and (symbolp s)
-                                   (string= (symbol-name s) "&OPTIONAL"))
+                                   (name-eq s "&OPTIONAL"))
                               (setf optional-seen t)
                               (list :marker s))
                              ((and (symbolp s)
-                                   (or (string= (symbol-name s) "&REST")
-                                       (string= (symbol-name s) "&KEY")))
+                                   (or (name-eq s "&REST")
+                                       (name-eq s "&KEY")))
                               (list :marker s))
                              ((and (symbolp s) optional-seen)
                               (list :opt s :slot-default))
@@ -33487,7 +33487,7 @@
         (let ((line (and source-lines (< form-index (length source-lines))
                          (aref source-lines form-index))))
           (when (and (consp form) (symbolp (car form))
-                     (string= (symbol-name (car form)) "%SOURCE-FILE")
+                     (name-eq (car form) "%SOURCE-FILE")
                      (consp (cdr form)) (stringp (cadr form)))
             (setf *current-source-file* (cadr form)
                   *current-source-file-line* (or line 1)))

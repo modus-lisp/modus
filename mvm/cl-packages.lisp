@@ -134,11 +134,14 @@
     ((not (= (obj-subtag x) #x50)) nil)
     (t (= (array-length x) 1))))
 
-(defun %native-mvm-sym-hash (s) (aref s 0))
+(defun %native-mvm-sym-hash (s) (%word-aref s 0))
 
 (defun %cl-sym-data (sym) sym)  ; legacy accessor — slots live directly on sym
-(defun %cl-sym-hash (sym) (aref sym 0))
-(defun %cl-sym-package (sym) (aref sym 1))
+(defun %cl-sym-hash (sym) (%word-aref sym 0))
+;; The symbol accessors read their slot with %WORD-AREF (one load): a symbol is
+;; no array, so AREF went to %AREF-SLOW's chain of type tests at every call --
+;; 8.4% of compiling a DEFUN on the 68k (MAME Quadra 950 profile).
+(defun %cl-sym-package (sym) (%word-aref sym 1))
 (defun %cl-sym-name (sym)
   "Slot 2 holds the name string.  Compile-time `'foo' literals interned
    via %INTERN-SYMBOL-PKG start with slot 2 empty (we don't pass the
@@ -150,13 +153,13 @@
    Returns the cached value when slot 2 is already populated; \"\" when
    no reverse-lookup table exists or the hash isn't in it (i.e. for
    genuinely uninterned syms like un-stringified gensyms)."
-  (let ((cached (aref sym 2)))
+  (let ((cached (%word-aref sym 2)))
     (cond
       ((and cached (stringp cached) (> (length cached) 0)) cached)
       (t
        (let ((tab (and (boundp '*sym-name-table*) *sym-name-table*)))
-         (let ((found (or (and tab (gethash (aref sym 0) tab))
-                          (%cold-sym-name (aref sym 0)))))
+         (let ((found (or (and tab (gethash (%word-aref sym 0) tab))
+                          (%cold-sym-name (%word-aref sym 0)))))
            (cond
              ((and found (stringp found))
               (aset sym 2 found)

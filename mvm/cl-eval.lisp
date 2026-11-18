@@ -84,7 +84,7 @@
                            ;; CAR's home, read off a literal: FIND-PACKAGE per
                            ;; call cost more than the name lookup it saves.
                            (eq (%cl-sym-package sym) (%cl-sym-package 'car)))
-                       (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))
+                       (%fn-entry (gethash (%word-aref sym 0) *native-sym-function-table*))))
          (nh (and (not by-hash) (%sym-name-or-hash sym)))
          (fn (or by-hash
                  (and nh
@@ -92,7 +92,7 @@
                       *symbol-function-table*
                       (%fn-entry (gethash (car nh) *symbol-function-table*)))
                  (and *native-sym-function-table*
-                      (%fn-entry (gethash (aref sym 0) *native-sym-function-table*))))))
+                      (%fn-entry (gethash (%word-aref sym 0) *native-sym-function-table*))))))
     ;; Still nothing: SYMBOL-FUNCTION's full lookup, which signals
     ;; UNDEFINED-FUNCTION when there is none.  Returning SYM here made
     ;; (funcall 'undefined ...) call the symbol itself and fault -- a

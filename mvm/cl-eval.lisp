@@ -866,6 +866,21 @@
        (%call-interp-closure closure (cdr form)))
       (t (%signal-program-error)))))
 
+(defun %argfn-macro-shim (form &rest extra)
+  "A DEFMACRO's expander when its lambda list is an ordinary one (the
+   compiler's DEFMACRO, %MAKE-ARGFN-EXPANDER): the macro's own function,
+   applied to the call's arguments -- (CDR FORM).  Its arity check is the
+   function's own, so a call with the wrong number of arguments signals."
+  (declare (ignore extra))
+  (let ((fn (car (%get-cenv))))
+    (apply fn (cdr form))))
+
+(defun %make-argfn-expander (fn)
+  "The expander for macro function FN (see %ARGFN-MACRO-SHIM).  Its
+   environment says :%ARGFN, so %EXPANDER-HAS-ENV-P does not take FN for a
+   lexical environment the expansion could depend on."
+  (%make-closure #'%argfn-macro-shim (cons fn :%argfn)))
+
 (defun %compiler-macro-shim (&rest args)
   "Wrapper MACRO-FUNCTION returns for macros the Modus compiler
    implements directly (compiler-macro markers / build-time test-source

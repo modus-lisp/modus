@@ -4696,7 +4696,10 @@
   "MF, a compiled macro expander, closes over a lexical environment."
   (and (functionp mf) (not (consp mf)) (not (fixnump mf))
        (let ((st (obj-subtag mf))) (or (eql st #x51) (eql st #x52)))
-       (%slot-ref mf 1)
+       (let ((e (%slot-ref mf 1)))
+         ;; %MAKE-ARGFN-EXPANDER's wrapper closes over the macro's own
+         ;; function, not over a lexical environment
+         (and e (not (and (consp e) (eq (cdr e) :%argfn)))))
        t))
 
 (defun macroexpand-mvm (form)
@@ -4798,6 +4801,29 @@
       (setf (gethash hash *macro-name-table*) (string name)))
     (%mexp-memo-invalidate)
     (setf (gethash hash *macro-table*) expander)))
+
+(defun %ordinary-macro-lambda-list-p (ll)
+  "LL is an ordinary lambda list a LAMBDA takes as it is (&BODY read as
+   &REST): required parameters are symbols, no nested destructuring."
+  (let ((mode :req))
+    (loop
+      (when (null ll) (return t))
+      (unless (consp ll) (return nil))
+      (let ((p (car ll)))
+        (cond
+          ((and (symbolp p) p (char= (char (symbol-name p) 0) #\&))
+           (cond ((or (name-eq p "&OPTIONAL") (name-eq p "&REST") (name-eq p "&BODY")
+                      (name-eq p "&KEY") (name-eq p "&AUX") (name-eq p "&ALLOW-OTHER-KEYS"))
+                  (setq mode p))
+                 (t (return nil))))
+          ((eq mode :req) (unless (and (symbolp p) p) (return nil)))
+          ((consp p) (unless (and (symbolp (car p)) (car p)) (return nil)))
+          ((not (and (symbolp p) p)) (return nil))))
+      (setq ll (cdr ll)))))
+
+(defun %body-to-rest (ll)
+  "LL with &BODY as &REST."
+  (mapcar (lambda (p) (if (and (symbolp p) (name-eq p "&BODY")) '&rest p)) ll))
 
 (defvar *%sole-eval-form* nil
   "The form MVM-EVAL-FORMS is evaluating when it was given exactly one, else
@@ -9451,6 +9477,23 @@
            ;; built from the same body: register THAT, a constant, rather than
            ;; compile the body a second time.  Measured on the 68k (MAME
            ;; Quadra 950), the expander's compile is most of a DEFMACRO.
+           (cond
+             ;; An ordinary lambda list, no &WHOLE / &ENVIRONMENT: the
+             ;; macro's function is (LAMBDA LAMBDA-LIST . BODY) itself, applied
+             ;; to the arguments by %MAKE-ARGFN-EXPANDER's wrapper -- ONE
+             ;; lambda to compile.  DESTRUCTURING-BIND is (APPLY (LAMBDA ...)
+             ;; ARGS): a second lambda inside the expander's, and on the 68k
+             ;; (qemu) most of a DEFMACRO.  A wrong argument count now signals,
+             ;; from the function's own check.
+             ((and *mvm-eval-runtime-p* (null %dm-expander) (null whole-var) (null env-var)
+                   (%ordinary-macro-lambda-list-p d-params))
+              (compile-form
+               `(progn (set-macro-function
+                        ',name (%make-argfn-expander
+                                (function (lambda ,(%body-to-rest d-params) ,@body))))
+                       ',name)
+               env dest))
+             (t
            (if (and *mvm-eval-runtime-p* %dm-expander (functionp %dm-expander)
                     (null *macrolet-names*) (%env-lexically-empty-p env)
                     (null (%env-visible-symbol-macros env)))
@@ -9466,7 +9509,7 @@
                                         (destructuring-bind (,@d-params) (cdr mform)
                                           ,@body)))))
                ',name)
-            env dest)))))
+            env dest)))))))
       ;; DEFSTRUCT inside an expression context.  Same fall-through trap
       ;; as nested DEFUN / DEFMACRO.  Route through mvm-compile-toplevel
       ;; which already knows how to process DEFSTRUCT — registers

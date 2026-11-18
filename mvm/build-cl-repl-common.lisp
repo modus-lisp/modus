@@ -3296,8 +3296,10 @@
 ;;; area (a Mac has no mmap).  Layouts without one get no JIT.
 (when (and *cl-repl-mac68k-p* (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
            (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
-  (let ((lo (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-lo))
-        (hi (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-hi))
+  (let ((lo (let ((v (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-lo)))
+              (and v (+ v modus.mvm::*mac68k-shift*))))   ; MODUS_MAC68K_SHIFT
+        (hi (let ((v (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-area-hi)))
+              (and v (+ v modus.mvm::*mac68k-shift*))))
         (cap (or (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-max-bytecode)
                  2048))
         (auto (getf (cdr (assoc modus.mvm::*mac68k-machine* modus.mvm::*mac68k-layouts*)) :jit-on-defun t)))
@@ -3524,6 +3526,16 @@
   ;; which the core does not carry, is still empty.
   (handler-case (%t68-init)
     (error (c) (write-string-serial \"T68-INIT-FAILED\") (write-char-serial 10)))
+"
+                           "")
+                       ;; ... and the native tier's: its export table found HERE
+                       ;; (in an all-native image a scan of the code, measured
+                       ;; 21 s on a Quadra 950 at the first DEFUN), saved with the core
+                       (if (and (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
+                                (not (equal (sb-ext:posix-getenv "MODUS_68K_NATIVE") "0"))
+                                (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
+                           "  (handler-case (%n68-init)
+    (error (c) (write-string-serial \"N68-INIT-FAILED\") (write-char-serial 10)))
 "
                            "")
                        "  ;; the closure-environment slot (translate-68k M68K-CENV-ADDR, the

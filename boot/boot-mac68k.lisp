@@ -204,9 +204,23 @@
               :boot-cache-lo #x01A00000 :boot-cache-hi #x01E00000
               :boot-stack-top #x01A00000)))
 
+(defparameter *mac68k-shift*
+  (let ((s (sb-ext:posix-getenv "MODUS_MAC68K_SHIFT")))
+    (if (and s (plusp (length s))) (parse-integer s :radix 16) 0))
+  "MODUS_MAC68K_SHIFT=HEX: every address of the layout moved by that much (a
+   size is not an address).  Two builds a shift apart, diffed, are the image's
+   relocations: what a Mac OS application needs to run wherever the Process
+   Manager puts its partition.")
+
+(defparameter +mac68k-layout-sizes+
+  '(:heap-size :boot-heap-size :gc-guard :staging-size :alloc-start
+    :jit-max-bytecode :jit-on-defun))
+
 (defun mac68k-layout (key)
   (let ((v (or (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) key)
                (error "mac68k: no ~S in the ~S layout" key *mac68k-machine*))))
+    (when (and (integerp v) (not (member key +mac68k-layout-sizes+)))
+      (setq v (+ v *mac68k-shift*)))
     ;; MODUS_MAC68K_CACHE_KB=N: a code cache of N KB, at the top of the
     ;; layout's -- the test of eviction under pressure (and the size a smaller
     ;; machine will have)

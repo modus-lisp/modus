@@ -1496,6 +1496,10 @@
    funcall passes real values) so they are stored with raw svref, matching the
    in-module call convention (op-call's bridge reads args via svref too)."
   (let* ((state (make-mvm-state))
+         ;; NIL's top half (the LI arm's NIL/T test), from NIL itself: as
+         ;; +MVM-NIL-B3+/-B2+ constants these were bytes of an address folded
+         ;; into the code, which a Mac image cannot relocate (mac68k-reloc.py)
+         (nil-hi16 (logand (ash (%val->word nil) -16) #xFFFF))
          (bc (if (typep bytecode '(simple-array (unsigned-byte 8) (*)))
                  bytecode
                  (coerce bytecode '(simple-array (unsigned-byte 8) (*)))))
@@ -1855,8 +1859,7 @@
                                           (aref bc (+ npc 5)))
                                        256)
                                     (aref bc (+ npc 4)))))
-                    (deadp (and (= (aref bc (+ npc 3)) +mvm-nil-b3+)
-                                (= (aref bc (+ npc 2)) +mvm-nil-b2+)
+                    (deadp (and (= (+ (* (aref bc (+ npc 3)) 256) (aref bc (+ npc 2))) nil-hi16)
                                 (= hi-signed 0))))
                (cond
                  ((and deadp (= (aref bc (+ npc 1)) +mvm-nil-b1+)

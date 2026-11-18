@@ -82,7 +82,14 @@ start:  link    %a6, #-1168
         tst.l   24(%a2)
         beq     fail
         lea     m_ram(%pc), %a4
-        move.l  0x108, %d0              | MemTop
+| the machine's RAM: Gestalt 'ram ' (System 6.0.4 and later).  Not MemTop
+| ($108): System 7 swaps that per application partition (measured on a 32 MB
+| Quadra 950 under 7.5.3, with MCL running: $001B13E0).
+        move.l  #0x72616D20, %d0        | 'ram '
+        .word   0xA1AD                  | _Gestalt: A0 = the response, D0 = OSErr
+        tst.w   %d0
+        bne     fail
+        move.l  %a0, %d0
         cmp.l   28(%a2), %d0
         blo     fail
 | the system heap must end below the image (System 6.0.8 with no INITs ends
@@ -261,7 +268,7 @@ m_open:     pstr "Modus: cannot open my own data fork."
 m_read:     pstr "Modus: cannot read the image in my data."
 m_notmodus: pstr "Modus: my data fork is not a modus boot disk."
 m_notchain: pstr "Modus: this image cannot run on top of Mac OS."
-m_ram:      pstr "Modus: not enough memory (it needs 4 MB here)."
+m_ram:      pstr "Modus: this Mac has less memory than the image is built for."
 m_sysheap:  pstr "Modus: the System heap is too big.  Try with fewer extensions."
 m_where:    pstr "Modus: launched where the image has to go."
 m_click:    pstr "Click to return to the Finder."

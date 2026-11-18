@@ -77,9 +77,12 @@
 (defun %n68-scan-exports ()
   "An all-native image's export table: the first \"modusJXL\" after CAR's
    entry, longword by longword (once, when the JIT starts)."
+  ;; 16-bit halves: on a 30-bit tower #x6D6F6475 is a bignum, and comparing
+  ;; it per longword (%T68-U32) made this scan of ~9 MB a hang on a 68040.
   (let ((a (logand (- (%val->word (function car)) 3) -4)))
     (loop repeat 16000000
-          until (and (= (%t68-u32 a) #x6D6F6475) (= (%t68-u32 (+ a 4)) #x734A584C))
+          until (and (= (mem-ref a :u16) #x6D6F) (= (mem-ref (+ a 2) :u16) #x6475)
+                     (= (mem-ref (+ a 4) :u16) #x734A) (= (mem-ref (+ a 6) :u16) #x584C))
           do (setq a (+ a 4)))
     (unless (and (= (%t68-u32 a) #x6D6F6475) (= (%t68-u32 (+ a 4)) #x734A584C))
       (error "jit-68k-native: no export table in the image"))

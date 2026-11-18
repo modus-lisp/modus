@@ -47,10 +47,21 @@ def code0():
     return struct.pack('>IIII', 32 + len(entry), 512, len(entry), 32) + entry
 
 
-def size_rsrc():
-    """SIZE -1, for MultiFinder: no flags, 64 KB preferred and minimum.  The
-    image does not live in the partition anyway."""
-    return struct.pack('>HII', 0, 64 * 1024, 64 * 1024)
+def size_rsrc(memtop):
+    """SIZE -1, for MultiFinder / System 7: no flags, then the preferred and
+    minimum partition.  A map for a 4 MB Mac asks 64 KB (System 6 without
+    MultiFinder ignores SIZE, and the image lives above the application zone).
+    A bigger map's image sits at fixed addresses in the middle of RAM, where
+    System 7's Process Manager would otherwise put the Finder's partition and
+    its own heap (measured on a 32 MB Quadra 950 under 7.5.3: the image read
+    over them, "The disk Macintosh cannot be found", then a Finder bomb).  So
+    it asks for ALL of RAM: the Process Manager gives it the largest free
+    block, from the system heap's end to the Finder's partition, and the
+    image's range is inside it (the code checks the system heap's end; the
+    code and stack, at the partition's bottom and top, are checked too)."""
+    if memtop <= 4 << 20:
+        return struct.pack('>HII', 0, 64 * 1024, 64 * 1024)
+    return struct.pack('>HII', 0, memtop, 20 << 20)
 
 
 def resource_fork(resources):
@@ -122,7 +133,7 @@ def main(disk, out, forks=None):
         sys.exit('mac68k-chain: %s cannot run on top of Mac OS (build it with '
                  'MODUS_MAC68K_MACHINE=classicos)' % disk)
     rsrc = resource_fork([(b'CODE', 0, code0()), (b'CODE', 1, code1()),
-                          (b'SIZE', -1, size_rsrc())])
+                          (b'SIZE', -1, size_rsrc(memtop))])
     open(out, 'wb').write(macbinary(NAME, TYPE, CREATOR, data, rsrc))
     if forks:
         os.makedirs(forks, exist_ok=True)

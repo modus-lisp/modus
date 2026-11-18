@@ -3129,7 +3129,14 @@
     ;; the table's own rule: a later name with the same hash replaces an earlier
     (dolist (nm *all-symbol-names*)
       (when (and (plusp (length nm)) (< (length nm) 256)
-                 (every (lambda (c) (< (char-code c) 256)) nm))
+                 (every (lambda (c) (< (char-code c) 256)) nm)
+                 ;; NOT NUMBERS: the harvest also yields literals (#x1300000 as
+                 ;; "X1300000", "-246415360"), and those are addresses -- the
+                 ;; table's page breaks, so its index string's length, then
+                 ;; moved with the memory map (mac68k-reloc.py found it)
+                 (not (every (lambda (c) (or (digit-char-p c) (char= c #\-))) nm))
+                 (not (and (> (length nm) 1) (char-equal (char nm 0) #\X)
+                           (every (lambda (c) (digit-char-p c 16)) (subseq nm 1)))))
         (setf (gethash (modus.mvm::compute-name-hash nm) h) nm)))
     (let ((entries (sort (loop for k being the hash-keys of h using (hash-value v) collect (cons k v))
                          #'< :key #'car))

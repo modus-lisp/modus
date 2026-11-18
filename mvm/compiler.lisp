@@ -4427,6 +4427,17 @@
        (= (normalize-name sym)
           (compute-name-hash name-string))))
 
+(defun %name-eq-h (sym h)
+  "NAME-EQ with NAME-STRING's hash already computed: what COMPILE-CALL makes of
+   (NAME-EQ X \"LITERAL\"), so the literal is not rehashed at every call.  The
+   compiler's own passes make that call constantly (COMPILE-CALL alone asks
+   (NAME-EQ FN \"REPLACE\") of every call it compiles): NAME-EQ was 4% of
+   compiling a DEFMACRO on the 68k, COMPUTE-NAME-HASH most of it."
+  (and (symbolp sym) (= (normalize-name sym) h)))
+
+(defvar *%name-eq-name-hash* (compute-name-hash "NAME-EQ")
+  "COMPUTE-NAME-HASH of \"NAME-EQ\", for COMPILE-CALL's test of its operator.")
+
 ;;; ============================================================
 ;;; Phase 1: Frontend (Source -> AST)
 ;;; ============================================================
@@ -29350,6 +29361,11 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; (NAME-EQ X "LITERAL"): the literal's hash now, not at every call (%NAME-EQ-H)
+  (when (and (symbolp fn) (eql (normalize-name fn) *%name-eq-name-hash*)
+             (consp args) (consp (cdr args)) (null (cddr args)) (stringp (cadr args)))
+    (return-from compile-call
+      (compile-form (list '%name-eq-h (car args) (compute-name-hash (cadr args))) env dest)))
   ;; a narrow string literal passed to a function that only reads it: the
   ;; pooled object, no copy (*SHARE-STRING-LITERAL*)
   (when (and *narrow-literals-p* (not *mvm-eval-runtime-p*) (symbolp fn)

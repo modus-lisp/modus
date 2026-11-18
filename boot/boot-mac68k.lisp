@@ -128,15 +128,20 @@
     ;; the kind map past them -- moving every kind-map bias by the difference
     ;; (the relocation table's x7/8 class) -- and leaves both in the low block
     ;; (+MAC68K-HEAP-SLOT+), where EMIT-MAC68K-ENTRY takes them.
-    (:quadra  :load #x00600000 :static-lo #x00F00000 :static-hi #x01300000
-              :jit-area-lo #x01300000 :jit-area-hi #x01500000 :jit-max-bytecode 16384
-              :cache-lo #x01500000 :cache-hi #x01520000
-              :staging #x01520000 :staging-size #x00000000
-              :stack-top #x01550000 :scratch #x01550000 :io-buf #x01551000
-              :nil-page #x01560000
-              :region #x01570000 :heap-size #x00420000 :gc-guard #x00010000
-              :kind-map #x01980000
-              :boot-heap #x00F00000 :boot-heap-size #x00600000
+    ;; The image is 11.9 MB with inline symbol and global access
+    ;; (MODUS_SMALL_ACCESS=0), so the rest starts at 18 MB.  The disk boot's
+    ;; heap is 1 MB, so that its kind map (#x1960000) keeps the core run --
+    ;; whose boot heap's kind bytes fall below it, in the young range -- under
+    ;; #x1B00000 with its cache.
+    (:quadra  :load #x00600000 :static-lo #x01200000 :static-hi #x01600000
+              :jit-area-lo #x01600000 :jit-area-hi #x01800000 :jit-max-bytecode 16384
+              :cache-lo #x01800000 :cache-hi #x01820000
+              :staging #x01820000 :staging-size #x00000000
+              :stack-top #x01850000 :scratch #x01850000 :io-buf #x01851000
+              :nil-page #x01860000
+              :region #x01870000 :heap-size #x00100000 :gc-guard #x00010000
+              :kind-map #x01960000
+              :boot-heap #x01200000 :boot-heap-size #x00600000
               :boot-cache-lo #x01A10000 :boot-cache-hi #x01B00000
               :boot-stack-top #x019F0000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at

@@ -179,7 +179,9 @@ hang:   bra     hang
 | everything from DEST to MEMTOP, after this marker.  REFSLOT is where the
 | image wants the open file's reference number (its static block's
 | #x10006050), 0 when the image cannot run on top of Mac OS; MEMTOP the
-| RAM its map needs.
+| RAM its map needs.  RELOFF / RELLEN: the disk bytes of its relocation table
+| (scripts/mac68k-reloc-disk.py), 0 when it has none; SPAN: the bytes of map
+| from DEST it needs, which a relocating loader allocates.
         .ascii  "modusCHN"
 dest:   .long   0x0D000000
 entry:  .long   0x0D000000
@@ -189,4 +191,7 @@ spoff:  .long   0                       | the splash: its disk byte and length,
 splen:  .long   0                       | 0 when the disk has none
 refslot: .long  0
 memtop: .long   0
+reloff: .long   0                       | the relocation table: its disk byte
+rellen: .long   0                       |   and length, 0 = none
+span:   .long   0                       | the map's bytes from DEST
 pb:     .space  80

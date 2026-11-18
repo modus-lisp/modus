@@ -23,6 +23,8 @@ LOAD_ADDR = {'lc': 0x00100000, 'classic': 0x00040000, 'classicos': 0x00040000, '
              'classic2m': 0x00040000,
              'plus1m': 0x00040000, 'plus1mjit': 0x0003C000}[
     (os.environ.get('MODUS_MAC68K_MACHINE') or 'lc').lower()]
+# MODUS_MAC68K_SHIFT (boot-mac68k): the whole map moved
+LOAD_ADDR += int(os.environ.get('MODUS_MAC68K_SHIFT') or '0', 16)
 
 
 def bootblocks():

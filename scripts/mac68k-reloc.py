@@ -37,16 +37,17 @@ def fn_map(path):
     return rows
 
 
-def main(a_path, b_path, shift_hex, out=None):
-    shift = int(shift_hex, 16)
+KINDS = (8, 16, 7)
+
+
+def classify(a, b, shift):
+    """(KINDS -> offsets, [(offset, word a, word b)] that are none of them)."""
     if shift % 0x80000:
         sys.exit('mac68k-reloc: SHIFT must be a multiple of 512 KB')
-    a, b = open(a_path, 'rb').read(), open(b_path, 'rb').read()
     if len(a) != len(b):
         sys.exit('mac68k-reloc: the builds differ in size (%d vs %d): the layout moved, not just addresses'
                  % (len(a), len(b)))
     hi = shift >> 16
-    KINDS = (8, 16, 7)
     kinds = {k: [] for k in KINDS}
     by_d = {(hi * k // 8) & 0xFFFF: k for k in KINDS}
     odd = []
@@ -63,6 +64,13 @@ def main(a_path, b_path, shift_hex, out=None):
             else:
                 odd.append((i, wa, wb))
         i += 2
+    return kinds, odd
+
+
+def main(a_path, b_path, shift_hex, out=None):
+    shift = int(shift_hex, 16)
+    a, b = open(a_path, 'rb').read(), open(b_path, 'rb').read()
+    kinds, odd = classify(a, b, shift)
     print('mac68k-reloc: %d bytes; %d address words, %d tagged-address words, %d kind-map words, '
           '%d other differences' % (len(a), len(kinds[8]), len(kinds[16]), len(kinds[7]), len(odd)))
     fns = fn_map(os.path.splitext(a_path)[0] + '.map')

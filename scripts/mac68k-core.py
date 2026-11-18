@@ -45,6 +45,9 @@ LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
 }[os.environ['MODUS_MAC68K_MACHINE'].lower()]
+# MODUS_MAC68K_SHIFT (boot-mac68k): the whole map moved; LOW_BLOCK is a size
+SHIFT = int(os.environ.get('MODUS_MAC68K_SHIFT') or '0', 16)
+LOAD, STATIC_LO, STATIC_HI, REGION = LOAD + SHIFT, STATIC_LO + SHIFT, STATIC_HI + SHIFT, REGION + SHIFT
 # a map that can run on top of Mac OS (boot-mac68k's :CLASSIC-OS; launched by
 # scripts/mac68k-chain.py's application): the RAM it needs.  The boot blocks'
 # record then names the static block's #x6050, the open file's reference number.

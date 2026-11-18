@@ -170,7 +170,12 @@
             (let* ((k (car names)) (len (length k))
                    (kernel (and kfn (multiple-value-bind (x present) (gethash k kfn) x present))))
               (put4 (compute-name-hash k))
-              (put4 (%val->word (car vals)))
+              ;; FROM CAR'S ENTRY, not absolute: these pages are not in the
+              ;; loaded image, so a relocating load (mac68k-chain.s) does not
+              ;; fix them; CAR's address in the running image does move.
+              ;; Measured relocated on a Quadra 950: an absolute record sent
+              ;; (+ 1 2) to a JSR of address 4.
+              (put4 (logand (- (%val->word (car vals)) (%val->word (function car))) #xFFFFFFFF))
               (setf (aref out i) (if kernel 1 0) (aref out (+ i 1)) len)
               (setq i (+ i 2))
               (let ((j 0))
@@ -198,6 +203,10 @@
 (defun %cold-fns-u32 (a)
   (+ (* (mem-ref a :u8) 16777216) (* (mem-ref (+ a 1) :u8) 65536)
      (* (mem-ref (+ a 2) :u8) 256) (mem-ref (+ a 3) :u8)))
+
+(defun %cold-fn-delta (u)
+  "A record's 32 bits as the signed distance from CAR's entry they are."
+  (if (>= u #x80000000) (- u #x100000000) u))
 
 (defun %cold-fns-firsts ()
   "The record pages' first hashes (the index pages, read once)."
@@ -238,7 +247,8 @@
                           (return nil))
                         (setq j (+ j 1)))
                       (when (>= j len)
-                        (setq found (cons (%word->val (%cold-fns-u32 (+ buf i 4)))
+                        (setq found (cons (%word->val (+ (%cold-fn-delta (%cold-fns-u32 (+ buf i 4)))
+                                                          (%val->word (function car))))
                                           (mem-ref (+ buf i 8) :u8)))
                         (return nil))))
                   (setq i (+ i 10 l (logand l 1)))))))))

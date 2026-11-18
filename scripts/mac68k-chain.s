@@ -28,7 +28,11 @@
         .equ    PB, -80
         .equ    NAME, -144
         .equ    BB, -1168
-start:  link    %a6, #-1168
+        .equ    BASE, -1172                 | a relocating load: where the map goes
+        .equ    TBL, -1176                  |   and its relocation table
+        .equ    DELTA, -1180                |   and BASE - the DEST it was built at
+        .equ    HEXB, -1192                 | SAY's text: a Pascal string, 10 bytes
+start:  link    %a6, #-1192
         pea     -4(%a5)
         .word   0xA86E                  | _InitGraf
         .word   0xA8FE                  | _InitFonts
@@ -92,6 +96,47 @@ start:  link    %a6, #-1168
         move.l  %a0, %d0
         cmp.l   28(%a2), %d0
         blo     fail
+| A RELOCATING LOAD (RELOFF set: scripts/mac68k-reloc-disk.py): the map goes
+| in this application's own partition, wherever the Process Manager put it --
+| in the free space between the application heap's end and the stack, as the
+| fixed-address image sat (SPAN bytes, 512 KB-aligned, so every relocation is
+| a 16-bit add: mac68k-reloc.py).  NOT a NewPtr block after MaxApplZone: that
+| put the image's stack inside the heap, and Mac OS's stack checks (the VBL
+| sniffer, StackSpace before File Manager I/O) took it for a stack that ran
+| into the heap -- measured on a Quadra 950 under System 7.5.3: the process
+| ended at the first tick, then "The disk Macintosh cannot be found".  The
+| table goes in the heap first; ApplLimit then stops the heap short of the
+| map.  DEST, ENTRY and REFSLOT in the record copy move with it; everything
+| below then works on the new addresses.
+        clr.l   BASE(%a6)
+        tst.l   32(%a2)                 | RELOFF
+        beq     5f
+        move.l  36(%a2), %d0            | the table: RELLEN bytes in the heap
+        .word   0xA11E                  | _NewPtr: A0, D0 = OSErr
+        lea     m_alloc(%pc), %a4
+        tst.w   %d0
+        bne     fail
+        move.l  %a0, TBL(%a6)
+        move.l  0x114, %d0              | HeapEnd, 64 KB on, to 512 KB
+        add.l   #0x10000 + 0x7FFFF, %d0
+        and.l   #0xFFF80000, %d0        | BASE
+        move.l  %d0, %d1
+        add.l   40(%a2), %d1            | BASE + SPAN must leave the stack 128 KB
+        add.l   #0x20000, %d1
+        cmp.l   0x908, %d1              | CurStackBase
+        bhi     fail
+        move.l  %d0, BASE(%a6)
+        move.l  %d0, 0x130              | ApplLimit: the heap stops short of it
+        lea     s_alloc(%pc), %a1
+        moveq   #80, %d1
+        bsr     say                     | "allocated" and BASE
+        move.l  BASE(%a6), %d0
+        sub.l   (%a2), %d0              | DELTA = BASE - DEST
+        move.l  %d0, DELTA(%a6)
+        move.l  BASE(%a6), (%a2)        | DEST
+        add.l   %d0, 4(%a2)             | ENTRY
+        add.l   %d0, 24(%a2)            | REFSLOT
+5:
 | the system heap must end below the image (System 6.0.8 with no INITs ends
 | near #x24270; the image is at #x40000)
         lea     m_sysheap(%pc), %a4
@@ -139,6 +184,20 @@ start:  link    %a6, #-1168
         bsr     rd
         lea     m_read(%pc), %a4
         bne     fail
+        tst.l   BASE(%a6)
+        beq     6f
+        lea     s_read(%pc), %a1
+        moveq   #96, %d1
+        move.l  8(%a2), %d0
+        bsr     say                     | "read" and LEN
+        bsr     relocate
+        lea     m_reloc(%pc), %a4
+        bne     fail
+        lea     s_reloc(%pc), %a1
+        moveq   #112, %d1
+        move.l  4(%a2), %d0
+        bsr     say                     | "relocated" and ENTRY
+6:
 | from here on the image's: its streams come from this file, and nothing may
 | allocate in the zone it now covers
         move.l  24(%a2), %a3
@@ -146,6 +205,14 @@ start:  link    %a6, #-1168
         ext.l   %d0
         move.l  %d0, (%a3)              | REFSLOT = the open file
         move.l  0x2A6, 0x118            | TheZone = SysZone
+| THE STACK SNIFFER OFF.  The VBL task that checks, every tick, that the
+| stack pointer is above the application heap's end (StkLowPt $110; 0 turns
+| it off, Inside Macintosh) treats the image's stack -- in a relocating load,
+| inside the NewPtr block in this application's own heap -- as a stack that
+| ran into the heap: measured on a Quadra 950 under System 7.5.3, the first
+| tick's interrupt never returned to the image, the process was ended, and
+| the Finder then lost its disk.
+        clr.l   0x110                   | StkLowPt
         .word   0xA852                  | _HideCursor (again is harmless)
         move.l  4(%a2), %a0
         cmpi.b  #2, 0x12F.w             | CPUFlag: a 68020 or later has caches,
@@ -214,6 +281,86 @@ splash: movem.l %d3-%d6/%a3-%a4, -(%sp)
         movem.l (%sp)+, %d3-%d6/%a3-%a4
         rts
 
+| Apply the relocation table (A2: the record; BASE, TBL): read RELLEN bytes
+| from RELOFF to TBL, then per kind (KIND COUNT, then COUNT gaps: a byte G
+| = 2G bytes on, or 0 and a 4-byte offset) add ((DELTA >> 16) * KIND) / 8 to
+| the 16-bit word at BASE + offset.  The table is byte-packed, so its longs
+| are read a byte at a time (a 68000 faults on an odd MOVE.L).  Z set when
+| it worked.
+relocate:
+        movem.l %d2-%d6/%a3-%a4, -(%sp)
+        move.l  TBL(%a6), %d1
+        move.l  36(%a2), %d2
+        move.l  32(%a2), %d3
+        bsr     rd
+        bne     9f
+        move.l  TBL(%a6), %a3
+        move.l  DELTA(%a6), %d6         | DELTA >> 16 in the low word: DELTA
+        swap    %d6                     |   is a multiple of 512 KB
+        moveq   #2, %d5                 | three kinds
+1:      bsr     rd32                    | KIND
+        move.w  %d0, %d4
+        muls.w  %d6, %d4                | (DELTA >> 16) * KIND, a multiple of 8
+        asr.l   #3, %d4
+        bsr     rd32                    | COUNT
+        move.l  %d0, %d2
+        move.l  BASE(%a6), %a4
+2:      tst.l   %d2
+        beq     4f
+        moveq   #0, %d0
+        move.b  (%a3)+, %d0
+        bne     3f
+        bsr     rd32                    | an offset
+        move.l  BASE(%a6), %a4
+        add.l   %d0, %a4
+        bra     31f
+3:      add.l   %d0, %d0
+        add.l   %d0, %a4
+31:     add.w   %d4, (%a4)
+        subq.l  #1, %d2
+        bra     2b
+4:      dbra    %d5, 1b
+        moveq   #0, %d0
+9:      movem.l (%sp)+, %d2-%d6/%a3-%a4
+        tst.w   %d0
+        rts
+
+| SAY: draw the Pascal string at A1 at (12, D1), then D0 in hex: a launch's
+| progress, on the screen, for whoever is watching it go wrong.  The Toolbox
+| may use D0-D2/A0-A1.
+say:    movem.l %d0-%d3/%a0-%a1, -(%sp)
+        move.w  #12, -(%sp)
+        move.w  %d1, -(%sp)
+        .word   0xA893                  | _MoveTo
+        move.l  20(%sp), -(%sp)         | the saved A1
+        .word   0xA884                  | _DrawString
+        move.l  (%sp), %d3              | the saved D0
+        lea     HEXB(%a6), %a0
+        move.b  #9, (%a0)+
+        move.b  #32, (%a0)+
+        moveq   #7, %d2
+1:      rol.l   #4, %d3
+        move.b  %d3, %d0
+        and.b   #15, %d0
+        add.b   #48, %d0
+        cmp.b   #58, %d0
+        blo     2f
+        addq.b  #7, %d0
+2:      move.b  %d0, (%a0)+
+        dbra    %d2, 1b
+        pea     HEXB(%a6)
+        .word   0xA884
+        movem.l (%sp)+, %d0-%d3/%a0-%a1
+        rts
+
+| D0 = the next 4 bytes at A3 (any alignment), big-endian
+rd32:   moveq   #3, %d1
+        moveq   #0, %d0
+1:      lsl.l   #8, %d0
+        move.b  (%a3)+, %d0
+        dbra    %d1, 1b
+        rts
+
 | D0 outside [D1, D2)?  Z set if so
 outside:
         cmp.l   %d1, %d0
@@ -272,4 +419,9 @@ m_ram:      pstr "Modus: this Mac has less memory than the image is built for."
 m_sysheap:  pstr "Modus: the System heap is too big.  Try with fewer extensions."
 m_where:    pstr "Modus: launched where the image has to go."
 m_click:    pstr "Click to return to the Finder."
+m_alloc:    pstr "Modus: my partition is too small for the image (Get Info: raise its size)."
+m_reloc:    pstr "Modus: cannot read my relocation table."
+s_alloc:    pstr "Modus: allocated at"
+s_read:     pstr "Modus: read"
+s_reloc:    pstr "Modus: relocated, entry"
         .align  2

@@ -154,13 +154,34 @@
 ;;; fixnum cannot hold (an odd word >= 2^30 on the 30-bit tower, e.g. a bignum
 ;;; pointer OR'd with a mask in a tag test): the NATIVE raw add builds and
 ;;; takes apart any bit pattern.  RAW1 is the register object whose bits are 1.
+;;;
+;;; WIDE WORDS.  An EVEN word past the fixnum range -- a fixnum's word shifted
+;;; left, as compile-mul's and compile-ash's range checks do (SHL, SAR back,
+;;; CMP) -- is held the way native code holds it: the fixnum-tagged bit
+;;; pattern, out of range (a WIDE fixnum), built and read with raw adds of
+;;; MOST-POSITIVE-FIXNUM.  It used to be stored as the BIGNUM w/2, and
+;;; %MVM-WORD of a non-fixnum reads its BITS, so the next SAR shifted the
+;;; bignum's heap POINTER: `(* i 7)' in an interpreted loop on i386 faulted
+;;; once a bignum landed at an address with bit 21 set (SHL 21 / SAR 21 of
+;;; i >= 32768), and the iteration it died at moved with the heap.  An ODD
+;;; word past the range had the same flaw ((ash (- w 1) -1) a bignum).
+(defun %mvm-narrow-fixnum-p (v)
+  "Is V a fixnum IN RANGE (not a wide machine word with a fixnum's tag)?"
+  (and (typep v 'fixnum) (<= most-negative-fixnum v most-positive-fixnum)))
+
 (defun %mvm-word (v)
   "The machine word of register VALUE V, as an exact integer."
-  (if (typep v 'fixnum)
-      (* v 2)
-      ;; V's bits are odd (every non-fixnum is): bits - 1 is an even word, i.e.
-      ;; the fixnum (bits-1)/2, which the raw subtract hands back as one.
-      (+ 1 (* 2 (%fixnum-- v (%word->val 1))))))
+  (cond ((%mvm-narrow-fixnum-p v) (* v 2))
+        ;; a wide even word: two raw steps of MOST-POSITIVE-FIXNUM's word
+        ;; (2M) bring it into range; w = 2v' +/- 4M
+        ((typep v 'fixnum)
+         (let ((m most-positive-fixnum))
+           (if (> v m)
+               (+ (* 2 (%fixnum-- (%fixnum-- v m) m)) (* 4 m))
+               (- (* 2 (%fixnum-+ (%fixnum-+ v m) m)) (* 4 m)))))
+        ;; V's bits are odd (every non-fixnum is): bits - 1 is an even word,
+        ;; which the raw subtract hands back as a fixnum, narrow or wide.
+        (t (+ 1 (%mvm-word (%fixnum-- v (%word->val 1)))))))
 
 (defun %mvm-wrap-word (w)
   "W wrapped to a signed machine word: +fixnum-bits+ + 2 bits (32 / 64)."
@@ -176,10 +197,17 @@
 
 (defun %mvm-word->val (w)
   "The register object whose machine word is W (exact, machine-width)."
-  (if (evenp w)
-      (ash w -1)
-      ;; fixnum (w-1)/2 has bits w-1; the raw add of RAW1 makes them w.
-      (%fixnum-+ (ash (- w 1) -1) (%word->val 1))))
+  (cond ((oddp w)
+         ;; the value whose bits are w-1, then the raw add of RAW1 makes them w
+         (%fixnum-+ (%mvm-word->val (- w 1)) (%word->val 1)))
+        ((typep (ash w -1) 'fixnum) (ash w -1))
+        ;; wide (see %MVM-WORD): w -/+ 4M is in range; two raw adds of M
+        ((> w 0)
+         (let ((m most-positive-fixnum))
+           (%fixnum-+ (%fixnum-+ (ash (- w (* 4 m)) -1) m) m)))
+        (t
+         (let ((m most-positive-fixnum))
+           (%fixnum-- (%fixnum-- (ash (+ w (* 4 m)) -1) m) m)))))
 
 (defun %mvm-put-word (regs vd w)
   "Store machine word W (an exact integer, already machine-width) into VD."
@@ -236,7 +264,7 @@
 
 (defun %mvm-untag-value (v)
   "untag(word(V)) -- the fixnum V itself when it is one, without a round trip."
-  (if (typep v 'fixnum) v (ash (%mvm-word v) -1)))
+  (if (%mvm-narrow-fixnum-p v) v (ash (%mvm-word v) -1)))
 
 (defun %mvm-bitop-words (op a b)
   (if (and (typep a 'fixnum) (typep b 'fixnum))
@@ -2394,7 +2422,7 @@
              (multiple-value-bind (vs npc2) (%ifetch-reg bc npc)
                (multiple-value-bind (amt npc3) (%ifetch-byte bc npc2)
                  (let ((a (svref regs vs)))
-                   (if (and (typep a 'fixnum) (>= a 0) (>= amt 1))
+                   (if (and (%mvm-narrow-fixnum-p a) (>= a 0) (>= amt 1))
                        (reg-set regs vd (ash a (- 1 amt)))
                        ;; A negative word is shifted as the UNSIGNED machine
                        ;; word -- 32 bits on the 30-bit tower, not a fixed 64.
@@ -2896,7 +2924,7 @@
                  ;; %FIXNUM-SHL-OR-NIL is that test and the shift in one call
                  ;; (the bound used to be its own (ash 1 ..) call per opcode).
                  (let* ((v (svref regs vs))
-                        (r (and (typep v 'fixnum) (< amt (- +fixnum-bits+ 1))
+                        (r (and (%mvm-narrow-fixnum-p v) (< amt (- +fixnum-bits+ 1))
                                 (%fixnum-shl-or-nil v amt))))
                    (if r
                        (setf (svref regs vd) r)
@@ -2911,7 +2939,7 @@
                  (let ((a (svref regs vs)))
                    ;; Fixnum VALUE a has word 2a; (2a)>>amt = a>>(amt-1),
                    ;; exact and in range — the reg-get round trip is not.
-                   (if (and (typep a 'fixnum) (>= amt 1))
+                   (if (and (%mvm-narrow-fixnum-p a) (>= amt 1))
                        (reg-set regs vd (ash a (- 1 amt)))
                        (%mvm-put-word regs vd (ash (%mvm-word a) (- amt)))))
                  (setf pc npc3)))))

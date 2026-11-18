@@ -4420,6 +4420,21 @@
                 (%resolve-declared-type (fifth info)))))
         (t nil)))
 
+;;; %SHADOWS-CL-NAME-P is the runtime's (cl-eval.lisp), and the compiler also
+;;; runs in the build host, where it does not exist: the compiler asked
+;;; (FBOUNDP '%SHADOWS-CL-NAME-P) and FUNCALLed the symbol -- a lookup by name, at
+;;; every compound form COMPILE-COMPOUND sees (a quarter of the 12% that name
+;;; resolution was of compiling a DEFUN on the 68k).  Resolved once, here.
+(defvar *%shadows-cl-fn* nil)
+(defun %shadows-cl-p (op)
+  "(%SHADOWS-CL-NAME-P OP) where the runtime has it, else NIL."
+  (let ((f (and (boundp '*%shadows-cl-fn*) *%shadows-cl-fn*)))
+    (unless f
+      (when (fboundp '%shadows-cl-name-p)
+        (setq f (symbol-function '%shadows-cl-name-p))
+        (setq *%shadows-cl-fn* f)))
+    (and f (funcall f op) t)))
+
 (declaim (overridable name-eq))
 (defun name-eq (sym name-string)
   "Check if SYM's name matches NAME-STRING via hash comparison"
@@ -4724,8 +4739,7 @@
       (and (%macro-name-confirmed-p op hash)
            (let ((e (%macro-table-ref hash)))
              (and e
-                  (not (and (symbolp op) (fboundp '%shadows-cl-name-p)
-                            (funcall '%shadows-cl-name-p op)))
+                  (not (and (symbolp op) (%shadows-cl-p op)))
                   e)))))
 
 ;;; A DEFMACRO's compile-time registration.  A name that SHADOWS a CL external -- P::IF,
@@ -4738,7 +4752,7 @@
 ;;; macro never ran.  FBOUNDP because the compiler also runs in the build host, where the
 ;;; runtime's function does not exist and no source shadows CL.
 (defun %define-compile-time-macro (name expander)
-  (if (and (fboundp '%shadows-cl-name-p) (funcall '%shadows-cl-name-p name))
+  (if (%shadows-cl-p name)
       (progn
         (unless *shadowing-macro-table*
           (setq *shadowing-macro-table* (make-hash-table :test 'eq)))
@@ -8991,7 +9005,7 @@
       ;; arguments and faulted.  A head that shadows a CL external and was not
       ;; macroexpanded above is a call to that package's function, as in SBCL.
       ;; FBOUNDP: the build host has no %SHADOWS-CL-NAME-P and no source shadows CL.
-      ((and (symbolp op) (fboundp '%shadows-cl-name-p) (funcall '%shadows-cl-name-p op))
+      ((and (symbolp op) (%shadows-cl-p op))
        (compile-call op (cdr form) env dest))
       ;; Non-symbol operator (immediately-applied lambda, etc.).  Route
       ;; through compile-funcall, NOT compile-call: compile-call's
@@ -19599,10 +19613,10 @@
    the binding (COND 17) of (LET ((COND 17)) ...) and aborted the test
    (LET.15, SYMBOL-MACROLET.1)."
   (if *mvm-eval-runtime-p*
-      (let ((prev (funcall '%hc-barrier-push '(error))))
+      (let ((prev (%hc-barrier-push '(error))))
         (unwind-protect
              (handler-case (macroexpand-1-mvm form) (t (c) (progn c nil)))
-          (funcall '%hc-barrier-pop prev)))
+          (%hc-barrier-pop prev)))
       (handler-case (macroexpand-1-mvm form) (t (c) (progn c nil)))))
 
 (defun %walker-macroexpand (form)
@@ -32263,9 +32277,9 @@
       ;; INTERSECTION.11, SUBTYPEP.INTEGER.REAL.4 ... on aarch64).  A real
       ;; error is re-signalled below, after the barrier is gone.
       (handler-case (if *mvm-eval-runtime-p*
-                        (let ((prev (funcall '%hc-barrier-push '(error))))
+                        (let ((prev (%hc-barrier-push '(error))))
                           (unwind-protect (%mvm-compile-toplevel-1 form)
-                            (funcall '%hc-barrier-pop prev)))
+                            (%hc-barrier-pop prev)))
                         (%mvm-compile-toplevel-1 form))
         (error (e)
           ;; The FORMAT CONTROL, not the printed text: printing the condition can

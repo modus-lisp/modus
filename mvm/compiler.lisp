@@ -4778,6 +4778,13 @@
     (%mexp-memo-invalidate)
     (setf (gethash hash *macro-table*) expander)))
 
+(defun %env-lexically-empty-p (env)
+  "No variable or local function binding anywhere in compile-env ENV's chain."
+  (loop
+    (when (null env) (return t))
+    (when (or (compile-env-bindings env) (compile-env-fn-names env)) (return nil))
+    (setq env (compile-env-parent env))))
+
 (defun %env-visible-symbol-macros (env)
   "The SYMBOL-MACROLET bindings visible in compile-env ENV, innermost first,
    as ((NAME EXPANSION) ...).  A later (inner) binding of the same name --
@@ -9322,7 +9329,8 @@
       ((= op-name 320224650)   ; DEFMACRO
        (let ((name (cadr form))
              (params (caddr form))
-             (body (cdddr form)))
+             (body (cdddr form))
+             (%dm-expander nil))
          (when (and (stringp (car body)) (cdr body))
            (setq body (cdr body)))
          ;; Macro lambda-lists can lead with &whole VAR and/or carry
@@ -9350,6 +9358,7 @@
            ;; (1) Compile-time registration so OTHER forms in this same
            ;; compilation unit that USE the macro can expand against it.
            (let ((expander
+                  (setq %dm-expander
                   (%eval-expander-runtime
                    `(lambda (form)
                       (let* (,@(when whole-var `((,whole-var form)))
@@ -9357,7 +9366,7 @@
                         (declare (ignorable ,@(when whole-var (list whole-var))
                                             ,@(when env-var (list env-var))))
                         (destructuring-bind (,@d-params) (cdr form)
-                          ,@body))))))
+                          ,@body)))))))
              (%define-compile-time-macro name expander)
              ;; (1b) …and, under runtime EVAL, make that registration
              ;; TRUTHFUL to the running program.  *MACRO-TABLE* is rebound
@@ -9400,6 +9409,17 @@
          ;; macro-dispatch (and macroexpand-1) call a non-interp-closure
          ;; expander as `(funcall mf form)`, which is exactly this lambda's
          ;; contract.
+           ;; With no lexical scope around the DEFMACRO -- no variable,
+           ;; local function, symbol macro or MACROLET of the code being
+           ;; compiled -- that lambda is exactly the expander (1) has just
+           ;; built from the same body: register THAT, a constant, rather than
+           ;; compile the body a second time.  Measured on the 68k (MAME
+           ;; Quadra 950), the expander's compile is most of a DEFMACRO.
+           (if (and *mvm-eval-runtime-p* %dm-expander (functionp %dm-expander)
+                    (null *macrolet-names*) (%env-lexically-empty-p env)
+                    (null (%env-visible-symbol-macros env)))
+               (compile-form `(progn (set-macro-function ',name ',%dm-expander) ',name)
+                             env dest)
            (compile-form
             `(progn
                (set-macro-function ',name
@@ -9410,7 +9430,7 @@
                                         (destructuring-bind (,@d-params) (cdr mform)
                                           ,@body)))))
                ',name)
-            env dest))))
+            env dest)))))
       ;; DEFSTRUCT inside an expression context.  Same fall-through trap
       ;; as nested DEFUN / DEFMACRO.  Route through mvm-compile-toplevel
       ;; which already knows how to process DEFSTRUCT — registers

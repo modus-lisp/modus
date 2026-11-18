@@ -228,20 +228,30 @@ def relocate(core, static_lo=None):
                 return a & ~7
         return None
     nogc = os.environ.get('MAC68K_CORE_NOGC') == '1'
+    # MARKED in the order a Cheney collection would copy: breadth first from
+    # the low block's words in address order, each node's slots in order.  The
+    # copy below keeps that order, so the static heap's layout is a function
+    # of what is reachable alone -- not of the core run's allocation history,
+    # which a conservative stack scan makes vary between runs of one build
+    # (interrupt frames leave words in frame slots never written).  Two core
+    # runs a shift apart must lay out alike: mac68k-reloc-disk.py diffs them.
+    import collections
     marked = set()
-    work = []
+    order = []
+    work = collections.deque()
     def mark_word(w):
         nd = node_of(w)
         if nd is not None and nd not in marked:
-            marked.add(nd); work.append(nd)
+            marked.add(nd); work.append(nd); order.append(nd)
     if nogc:
         marked.update(ostarts); marked.update(range(clo, chi, 8))
+        order = list(ostarts) + list(range(clo, chi, 8))
     else:
         for j in range(0, LOW_BLOCK, 4):
             if not skip(j):
                 mark_word(struct.unpack_from('>I', low, j)[0])
         while work:
-            nd = work.pop()
+            nd = work.popleft()
             if nd in osize:
                 st, n = otype[nd]
                 if st in LEAF or n == 0:
@@ -266,14 +276,14 @@ def relocate(core, static_lo=None):
             print('mac68k-core: census big #x%x subtag #x%02x %d bytes' % (a, otype[a][0], sz))
     # the new places: marked objects in order from NOLO, conses from NCLO
     omap, nob, kept = {}, bytearray(), 0
-    for a in ostarts:
-        if a in marked:
+    for a in order:
+        if a in osize:
             omap[a] = nolo + len(nob)
             nob += objs[a - olo:a - olo + osize[a]]
     nclo = (nolo + len(nob) + 4095) & ~4095
     cmap, ncs = {}, bytearray()
-    for a in range(clo, chi, 8):
-        if a in marked:
+    for a in order:
+        if a not in osize:
             cmap[a] = nclo + len(ncs)
             ncs += conses[a - clo:a - clo + 8]
     nchi = nclo + len(ncs)
@@ -295,7 +305,7 @@ def relocate(core, static_lo=None):
             sys.exit('mac68k-core: a pointer to an unmarked node #%x' % nd)
 
     nobj = 0
-    for a in ostarts:
+    for a in order:
         if a not in omap:
             continue
         st, n = otype[a]; k = omap[a] - nolo; nobj += 1

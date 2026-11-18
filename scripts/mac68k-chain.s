@@ -10,8 +10,10 @@
 | OFF to DEST, stores the open file's reference number at REFSLOT (the
 | image's code loader then _Reads its streams from the file) and jumps to
 | ENTRY.  Mac OS stays underneath, as the ROM does under a disk boot: low
-| memory, the system heap, its drivers and interrupt handlers.  There is no
-| way back but a restart.
+| memory, the system heap, its drivers and interrupt handlers.  A fixed-
+| address image has no way back but a restart; a RELOCATED one is an
+| ordinary application (THE HOST, below): a window, menus, the event loop,
+| Quit back to the Finder.
 |
 | Anything wrong is said on the screen, and a click returns to the Finder.
 |
@@ -117,6 +119,12 @@ start:  link    %a6, #-1192
         tst.w   %d0
         bne     fail
         move.l  %a0, TBL(%a6)
+| AN APPLICATION: a relocated image runs in this partition next to the
+| Finder and the others, so it gets a window, menus and the events (HINIT
+| below); the progress lines are drawn in the window
+        bsr     hinit
+        lea     m_alloc(%pc), %a4
+        bne     fail
         move.l  0x114, %d0              | HeapEnd, 64 KB on, to 512 KB
         add.l   #0x10000 + 0x7FFFF, %d0
         and.l   #0xFFF80000, %d0        | BASE
@@ -197,6 +205,9 @@ start:  link    %a6, #-1192
         moveq   #112, %d1
         move.l  4(%a2), %d0
         bsr     say                     | "relocated" and ENTRY
+        move.l  TBL(%a6), %a0           | the table is done with: the heap
+        .word   0xA01F                  |   is the Toolbox's (_DisposePtr)
+        bsr     hclear
 6:
 | from here on the image's: its streams come from this file, and nothing may
 | allocate in the zone it now covers
@@ -204,7 +215,17 @@ start:  link    %a6, #-1192
         move.w  %d7, %d0
         ext.l   %d0
         move.l  %d0, (%a3)              | REFSLOT = the open file
-        move.l  0x2A6, 0x118            | TheZone = SysZone
+        tst.l   BASE(%a6)
+        beq     7f
+| an application: the host table in the slot after REFSLOT (translate-68k
+| +68K-MAC-HOST+); the zone stays the application's, the cursor shown
+        lea     htable(%pc), %a0
+        move.l  %a0, 4(%a3)
+        move.l  hstate(%pc), %a0        | the Toolbox's stack from now on
+        lea     -64(%sp), %a1
+        move.l  %a1, H_SP(%a0)
+        bra     8f
+7:      move.l  0x2A6, 0x118            | TheZone = SysZone
 | THE STACK SNIFFER OFF.  The VBL task that checks, every tick, that the
 | stack pointer is above the application heap's end (StkLowPt $110; 0 turns
 | it off, Inside Macintosh) treats the image's stack -- in a relocating load,
@@ -214,6 +235,7 @@ start:  link    %a6, #-1192
 | the Finder then lost its disk.
         clr.l   0x110                   | StkLowPt
         .word   0xA852                  | _HideCursor (again is harmless)
+8:      clr.l   0x110                   | StkLowPt (an application's too)
         move.l  4(%a2), %a0
         cmpi.b  #2, 0x12F.w             | CPUFlag: a 68020 or later has caches,
         bcs.s   9f                      |   and code was just written as data:
@@ -409,6 +431,536 @@ fail:   pea     band(%pc)
         tst.b   (%sp)+
         beq     1b
         .word   0xA9F4                  | _ExitToShell
+
+
+| ---------------------------------------------------------------------------
+| THE HOST: Modus as an application.  A relocated image runs in this
+| partition next to the Finder and the other applications, so it takes
+| nothing of the machine's: its console's putc and getc (translate-68k
+| +68K-MAC-HOST+) jump here, through HTABLE, and this code owns a window,
+| the menus and the event loop.
+|
+| The console is a window in Monaco 9: a text buffer COLS x ROWS (redrawn
+| on an update event), a caret while getc waits, a scroll a ScrollRect.
+| getc waits in WaitNextEvent (GetNextEvent + SystemTask on a System 6
+| without MultiFinder), so the other applications run while the REPL waits;
+| it handles the menus (the Apple menu's desk accessories, File: Quit), a
+| window drag or close, a click in another layer, and returns a key.
+| Quit or the close box: the data fork closed, _ExitToShell.
+|
+| Called from the image: the image's registers, the image's stack, any A5.
+| Every register but D0/A0 is kept, A5 is this application's (CurrentA5
+| $904) across each Toolbox call.  The state is a block in the heap (HSTATE).
+| THE TOOLBOX RUNS ON THE APPLICATION'S OWN STACK: the one this code had
+| when it jumped to the image (H_SP), not the image's.  On the image's --
+| inside the map, between the heap and the application stack -- the first
+| _SetPort ended the process (a Quadra 950 under System 7.5.3: PC in a
+| system patch, then "The disk Macintosh cannot be found"), though the File
+| Manager's reads from there had always worked.
+        .equ    H_WIN, 0                | the WindowPtr
+        .equ    H_COLS, 4
+        .equ    H_ROWS, 6
+        .equ    H_X, 8                  | the cursor
+        .equ    H_Y, 10
+        .equ    H_CARET, 12             | the caret is drawn
+        .equ    H_CW, 14                | a cell: width, height, ascent
+        .equ    H_LH, 16
+        .equ    H_ASC, 18
+        .equ    H_TR, 20                | the text's rectangle
+        .equ    H_BUF, 28               | the text, COLS x ROWS bytes
+        .equ    H_RGN, 32               | ScrollRect's update region
+        .equ    H_WNE, 36               | WaitNextEvent is there
+        .equ    H_REF, 38               | the data fork
+        .equ    H_EVT, 40               | an EventRecord: what message when where modifiers
+        .equ    H_WW, 56                | FindWindow's window
+        .equ    H_R, 60                 | a rectangle
+        .equ    H_FI, 68                | FontInfo: ascent descent widMax leading
+        .equ    H_APPLE, 76
+        .equ    H_FILE, 80
+        .equ    H_STR, 84               | a Str255
+        .equ    H_PB, 340               | a parameter block, 80 bytes
+        .equ    H_SP, 420               | the application's stack (HSTACK)
+        .equ    H_SIZE, 424
+
+hstate: .long   0
+htable: .long   0, 0, 0                 | putc getc poll, filled by HINIT
+
+| HINIT: the state, the menus, the window (the current port), the text
+| buffer.  D7 = the data fork.  Z set when it worked.
+hinit:  movem.l %d1-%d7/%a0-%a4, -(%sp)
+        lea     htable(%pc), %a0
+        lea     hputc(%pc), %a1
+        move.l  %a1, (%a0)+
+        lea     hgetc(%pc), %a1
+        move.l  %a1, (%a0)+
+        lea     hpoll(%pc), %a1
+        move.l  %a1, (%a0)+
+        move.l  #H_SIZE, %d0
+        .word   0xA31E                  | _NewPtr ,CLEAR
+        tst.w   %d0
+        bne     9f
+        lea     hstate(%pc), %a1
+        move.l  %a0, (%a1)
+        move.l  %a0, %a3
+        move.w  %d7, H_REF(%a3)
+| the menus: the Apple menu (About, then the desk accessories) and File
+        subq.l  #4, %sp
+        move.w  #128, -(%sp)
+        pea     t_apple(%pc)
+        .word   0xA931                  | _NewMenu
+        move.l  (%sp)+, %a4
+        move.l  %a4, H_APPLE(%a3)
+        move.l  %a4, -(%sp)
+        pea     i_about(%pc)
+        .word   0xA933                  | _AppendMenu
+        move.l  %a4, -(%sp)
+        move.l  #0x44525652, -(%sp)     | 'DRVR'
+        .word   0xA94D                  | _AddResMenu
+        move.l  %a4, -(%sp)
+        clr.w   -(%sp)
+        .word   0xA935                  | _InsertMenu
+        subq.l  #4, %sp
+        move.w  #129, -(%sp)
+        pea     t_file(%pc)
+        .word   0xA931
+        move.l  (%sp)+, %a4
+        move.l  %a4, H_FILE(%a3)
+        move.l  %a4, -(%sp)
+        pea     i_quit(%pc)
+        .word   0xA933
+        move.l  %a4, -(%sp)
+        clr.w   -(%sp)
+        .word   0xA935
+        .word   0xA937                  | _DrawMenuBar
+| the window: the screen (QuickDraw's screenBits.bounds, -120(A5)) less the
+| menu bar, a title bar and a margin
+        lea     H_R(%a3), %a0
+        move.w  -120(%a5), %d0
+        add.w   #42, %d0
+        move.w  %d0, (%a0)
+        move.w  -118(%a5), %d0
+        addq.w  #4, %d0
+        move.w  %d0, 2(%a0)
+        move.w  -116(%a5), %d0
+        subq.w  #4, %d0
+        move.w  %d0, 4(%a0)
+        move.w  -114(%a5), %d0
+        subq.w  #4, %d0
+        move.w  %d0, 6(%a0)
+        subq.l  #4, %sp
+        clr.l   -(%sp)                  | the record: in the heap
+        pea     H_R(%a3)
+        pea     t_win(%pc)
+        move.b  #1, -(%sp)              | visible
+        move.w  #4, -(%sp)              | noGrowDocProc
+        moveq   #-1, %d0
+        move.l  %d0, -(%sp)             | in front
+        move.b  #1, -(%sp)              | a close box
+        clr.l   -(%sp)
+        .word   0xA913                  | _NewWindow
+        move.l  (%sp)+, %a4
+        move.l  %a4, H_WIN(%a3)
+        moveq   #-1, %d0
+        cmp.l   #0, %a4
+        beq     9f
+        move.l  %a4, -(%sp)
+        .word   0xA873                  | _SetPort
+        move.w  #4, -(%sp)              | Monaco
+        .word   0xA887                  | _TextFont
+        move.w  #9, -(%sp)
+        .word   0xA88A                  | _TextSize
+        pea     H_FI(%a3)
+        .word   0xA88B                  | _GetFontInfo
+        move.w  H_FI(%a3), %d0
+        move.w  %d0, H_ASC(%a3)
+        add.w   H_FI+2(%a3), %d0
+        add.w   H_FI+6(%a3), %d0
+        move.w  %d0, H_LH(%a3)
+        move.w  H_FI+4(%a3), H_CW(%a3)
+| COLS x ROWS from the port's rectangle (16(A4): top left bottom right)
+        moveq   #0, %d0
+        move.w  22(%a4), %d0
+        sub.w   18(%a4), %d0
+        subq.w  #8, %d0
+        divu.w  H_CW(%a3), %d0
+        move.w  %d0, H_COLS(%a3)
+        moveq   #0, %d0
+        move.w  20(%a4), %d0
+        sub.w   16(%a4), %d0
+        subq.w  #4, %d0
+        divu.w  H_LH(%a3), %d0
+        move.w  %d0, H_ROWS(%a3)
+        lea     H_TR(%a3), %a0
+        move.w  #2, (%a0)
+        move.w  #4, 2(%a0)
+        move.w  H_ROWS(%a3), %d0
+        mulu.w  H_LH(%a3), %d0
+        addq.w  #2, %d0
+        move.w  %d0, 4(%a0)
+        move.w  H_COLS(%a3), %d0
+        mulu.w  H_CW(%a3), %d0
+        addq.w  #4, %d0
+        move.w  %d0, 6(%a0)
+        move.w  H_COLS(%a3), %d0
+        mulu.w  H_ROWS(%a3), %d0
+        move.l  %d0, %d3
+        .word   0xA11E                  | _NewPtr: the text
+        tst.w   %d0
+        bne     9f
+        move.l  %a0, H_BUF(%a3)
+1:      move.b  #32, (%a0)+
+        subq.l  #1, %d3
+        bne     1b
+        subq.l  #4, %sp
+        .word   0xA8D8                  | _NewRgn
+        move.l  (%sp)+, H_RGN(%a3)
+| WaitNextEvent: is it implemented?  (System 6 without MultiFinder: no)
+        move.w  #0x60, %d0
+        .word   0xA746                  | _GetToolTrapAddress
+        move.l  %a0, %d1
+        move.w  #0x9F, %d0              | _Unimplemented's
+        .word   0xA746
+        cmp.l   %a0, %d1
+        sne     H_WNE(%a3)
+        moveq   #0, %d0
+9:      movem.l (%sp)+, %d1-%d7/%a0-%a4
+        tst.w   %d0
+        rts
+
+| HCLEAR: the window blank, the cursor home (the launch's progress lines go)
+hclear: movem.l %d0-%d2/%a0-%a1/%a3-%a4, -(%sp)
+        move.l  hstate(%pc), %a3
+        move.l  H_WIN(%a3), %a4
+        pea     16(%a4)
+        .word   0xA8A3                  | _EraseRect
+        clr.l   H_X(%a3)                | X and Y
+        movem.l (%sp)+, %d0-%d2/%a0-%a1/%a3-%a4
+        rts
+
+| onto the application's stack, the image's SP pushed there (the caller
+| pops it back with MOVEA.L (SP),SP).  A BSR'd routine: its return moves too.
+hstack: move.l  (%sp)+, %a1             | the return
+        move.l  %sp, %d1                | the image's SP
+        move.l  hstate(%pc), %a3
+        move.l  H_SP(%a3), %sp
+        move.l  %d1, -(%sp)
+        jmp     (%a1)
+
+| the entry: A5 this application's, A3 the state, the window the port
+henter: move.l  0x904, %a5              | CurrentA5
+        move.l  hstate(%pc), %a3
+        move.l  H_WIN(%a3), -(%sp)
+        .word   0xA873                  | _SetPort
+        rts
+
+| PUTC: D0.B to the console
+hputc:  movem.l %d1-%d7/%a1-%a6, -(%sp)
+        bsr     hstack
+        bsr     henter
+        moveq   #0, %d4
+        move.b  %d0, %d4
+        cmp.b   #10, %d4
+        beq     hnl
+        cmp.b   #13, %d4
+        beq     hcr
+        cmp.b   #8, %d4
+        beq     hbs
+        cmp.b   #9, %d4
+        beq     htab
+        cmp.b   #7, %d4
+        beq     hbel
+        cmp.b   #32, %d4
+        blo     hout
+        bsr     hput
+hout:   movea.l (%sp), %sp              | the image's stack
+        movem.l (%sp)+, %d1-%d7/%a1-%a6
+        rts
+hcr:    clr.w   H_X(%a3)
+        bra     hout
+hbs:    tst.w   H_X(%a3)
+        beq     hout
+        subq.w  #1, H_X(%a3)
+        bra     hout
+htab:   moveq   #32, %d4
+1:      bsr     hput
+        move.w  H_X(%a3), %d0
+        and.w   #7, %d0
+        bne     1b
+        bra     hout
+hbel:   move.w  #1, -(%sp)
+        .word   0xA9C8                  | _SysBeep
+        bra     hout
+hnl:    bsr     hnewl
+        bra     hout
+
+| D4 at the cursor, in the buffer and the window; the cursor on
+hput:   move.w  H_Y(%a3), %d1
+        mulu.w  H_COLS(%a3), %d1
+        add.w   H_X(%a3), %d1
+        move.l  H_BUF(%a3), %a0
+        move.b  %d4, (%a0,%d1.l)
+        move.w  H_X(%a3), %d1
+        move.w  H_Y(%a3), %d2
+        bsr     hmove
+        move.w  %d4, -(%sp)
+        .word   0xA883                  | _DrawChar
+        addq.w  #1, H_X(%a3)
+        move.w  H_X(%a3), %d0
+        cmp.w   H_COLS(%a3), %d0
+        blo     1f
+        bsr     hnewl
+1:      rts
+
+| MoveTo the baseline of cell D1, D2
+hmove:  mulu.w  H_CW(%a3), %d1
+        add.w   H_TR+2(%a3), %d1
+        mulu.w  H_LH(%a3), %d2
+        add.w   H_TR(%a3), %d2
+        add.w   H_ASC(%a3), %d2
+        move.w  %d1, -(%sp)
+        move.w  %d2, -(%sp)
+        .word   0xA893                  | _MoveTo
+        rts
+
+| a new line, and at the bottom a scroll: the window's bits up a line
+| (what was hidden and is now shown comes back as an update), the text too
+hnewl:  clr.w   H_X(%a3)
+        addq.w  #1, H_Y(%a3)
+        move.w  H_Y(%a3), %d0
+        cmp.w   H_ROWS(%a3), %d0
+        blo     9f
+        subq.w  #1, H_Y(%a3)
+        pea     H_TR(%a3)
+        clr.w   -(%sp)
+        move.w  H_LH(%a3), %d0
+        neg.w   %d0
+        move.w  %d0, -(%sp)
+        move.l  H_RGN(%a3), -(%sp)
+        .word   0xA8EF                  | _ScrollRect
+        move.l  H_RGN(%a3), -(%sp)
+        .word   0xA927                  | _InvalRgn
+        moveq   #0, %d0
+        move.w  H_COLS(%a3), %d0
+        move.l  H_BUF(%a3), %a1
+        lea     (%a1,%d0.l), %a0
+        move.w  H_ROWS(%a3), %d1
+        subq.w  #1, %d1
+        mulu.w  %d1, %d0
+        move.l  %d0, %d2
+        .word   0xA02E                  | _BlockMove
+        move.l  H_BUF(%a3), %a0
+        add.l   %d2, %a0
+        move.w  H_COLS(%a3), %d0
+        subq.w  #1, %d0
+1:      move.b  #32, (%a0)+
+        dbra    %d0, 1b
+9:      rts
+
+| the caret: the cursor's cell inverted.  HCARON / HCAROFF keep D0.
+hcaron: tst.b   H_CARET(%a3)
+        bne     9f
+        bra     hcarinv
+hcaroff:
+        tst.b   H_CARET(%a3)
+        beq     9f
+hcarinv:
+        move.l  %d0, -(%sp)
+        not.b   H_CARET(%a3)
+        lea     H_R(%a3), %a0
+        move.w  H_Y(%a3), %d0
+        mulu.w  H_LH(%a3), %d0
+        add.w   H_TR(%a3), %d0
+        move.w  %d0, (%a0)
+        add.w   H_LH(%a3), %d0
+        move.w  %d0, 4(%a0)
+        move.w  H_X(%a3), %d0
+        mulu.w  H_CW(%a3), %d0
+        add.w   H_TR+2(%a3), %d0
+        move.w  %d0, 2(%a0)
+        add.w   H_CW(%a3), %d0
+        move.w  %d0, 6(%a0)
+        move.l  %a0, -(%sp)
+        .word   0xA8A4                  | _InverRect
+        move.l  (%sp)+, %d0
+9:      rts
+
+| the whole window from the text (inside BeginUpdate .. EndUpdate)
+hredraw:
+        move.l  H_WIN(%a3), %a0
+        pea     16(%a0)
+        .word   0xA8A3                  | _EraseRect
+        moveq   #0, %d3                 | the row
+        moveq   #0, %d4                 | its first byte
+1:      cmp.w   H_ROWS(%a3), %d3
+        bhs     2f
+        moveq   #0, %d1
+        move.w  %d3, %d2
+        bsr     hmove
+        move.l  H_BUF(%a3), -(%sp)
+        move.w  %d4, -(%sp)
+        move.w  H_COLS(%a3), -(%sp)
+        .word   0xA885                  | _DrawText
+        addq.w  #1, %d3
+        add.w   H_COLS(%a3), %d4
+        bra     1b
+2:      tst.b   H_CARET(%a3)
+        beq     3f
+        clr.b   H_CARET(%a3)
+        bsr     hcaron
+3:      rts
+
+| GETC: -> D0.L a key, the other applications running while it waits
+hgetc:  movem.l %d1-%d7/%a1-%a6, -(%sp)
+        bsr     hstack
+        bsr     henter
+        bsr     hcaron
+1:      bsr     hevent
+        tst.l   %d0
+        bmi     1b
+        bsr     hcaroff
+        movea.l (%sp), %sp
+        movem.l (%sp)+, %d1-%d7/%a1-%a6
+        rts
+
+| POLL: nothing yet (the image does not call it)
+hpoll:  rts
+
+| one event: D0 = a key, or -1
+hevent: tst.b   H_WNE(%a3)
+        beq     1f
+        clr.w   -(%sp)
+        move.w  #-1, -(%sp)             | everyEvent
+        pea     H_EVT(%a3)
+        moveq   #30, %d0                | sleep half a second
+        move.l  %d0, -(%sp)
+        clr.l   -(%sp)                  | no mouse region
+        .word   0xA860                  | _WaitNextEvent
+        bra     2f
+1:      .word   0xA9B4                  | _SystemTask
+        clr.w   -(%sp)
+        move.w  #-1, -(%sp)
+        pea     H_EVT(%a3)
+        .word   0xA970                  | _GetNextEvent
+2:      move.l  H_WIN(%a3), -(%sp)      | a desk accessory may have moved the port
+        .word   0xA873
+        move.b  (%sp)+, %d0
+        beq     hnone
+        move.w  H_EVT(%a3), %d0
+        cmp.w   #1, %d0
+        beq     hmouse
+        cmp.w   #3, %d0
+        beq     hkey
+        cmp.w   #5, %d0
+        beq     hkey
+        cmp.w   #6, %d0
+        beq     hupd
+hnone:  moveq   #-1, %d0
+        rts
+
+hkey:   moveq   #0, %d0
+        move.b  H_EVT+5(%a3), %d0       | the message's low byte: the character
+        btst    #0, H_EVT+14(%a3)       | cmdKey (modifiers bit 8)
+        beq     9f
+        clr.l   -(%sp)
+        move.w  %d0, -(%sp)
+        .word   0xA93E                  | _MenuKey
+        move.l  (%sp)+, %d0
+        bsr     hmenu
+        bra     hnone
+9:      rts
+
+hupd:   move.l  H_EVT+2(%a3), %a0       | the window
+        cmp.l   H_WIN(%a3), %a0
+        bne     hnone
+        move.l  %a0, -(%sp)
+        .word   0xA922                  | _BeginUpdate
+        bsr     hredraw
+        move.l  H_WIN(%a3), -(%sp)
+        .word   0xA923                  | _EndUpdate
+        bra     hnone
+
+hmouse: clr.w   -(%sp)
+        move.l  H_EVT+10(%a3), -(%sp)
+        pea     H_WW(%a3)
+        .word   0xA92C                  | _FindWindow
+        move.w  (%sp)+, %d0
+        cmp.w   #1, %d0                 | inMenuBar
+        bne     1f
+        clr.l   -(%sp)
+        move.l  H_EVT+10(%a3), -(%sp)
+        .word   0xA93D                  | _MenuSelect
+        move.l  (%sp)+, %d0
+        bsr     hmenu
+        bra     hnone
+1:      cmp.w   #2, %d0                 | inSysWindow
+        bne     2f
+        pea     H_EVT(%a3)
+        move.l  H_WW(%a3), -(%sp)
+        .word   0xA9B3                  | _SystemClick
+        bra     hnone
+2:      cmp.w   #3, %d0                 | inContent
+        bne     3f
+        move.l  H_WW(%a3), -(%sp)
+        .word   0xA91F                  | _SelectWindow
+        bra     hnone
+3:      cmp.w   #4, %d0                 | inDrag
+        bne     4f
+        move.l  H_WW(%a3), -(%sp)
+        move.l  H_EVT+10(%a3), -(%sp)
+        pea     -120(%a5)               | screenBits.bounds
+        .word   0xA925                  | _DragWindow
+        bra     hnone
+4:      cmp.w   #6, %d0                 | inGoAway
+        bne     hnone
+        clr.w   -(%sp)
+        move.l  H_WW(%a3), -(%sp)
+        move.l  H_EVT+10(%a3), -(%sp)
+        .word   0xA91E                  | _TrackGoAway
+        tst.b   (%sp)+
+        bne     hquit
+        bra     hnone
+
+| a menu choice, D0 = menu << 16 | item
+hmenu:  move.l  %d0, %d1
+        swap    %d1
+        cmp.w   #129, %d1               | File
+        bne     1f
+        cmp.w   #1, %d0                 | Quit
+        beq     hquit
+1:      cmp.w   #128, %d1               | Apple: a desk accessory
+        bne     2f
+        cmp.w   #3, %d0
+        blo     2f
+        move.l  H_APPLE(%a3), -(%sp)
+        move.w  %d0, -(%sp)
+        pea     H_STR(%a3)
+        .word   0xA946                  | _GetMenuItemText
+        clr.w   -(%sp)
+        pea     H_STR(%a3)
+        .word   0xA9B6                  | _OpenDeskAcc
+        addq.l  #2, %sp
+2:      clr.w   -(%sp)
+        .word   0xA938                  | _HiliteMenu 0
+        move.l  H_WIN(%a3), -(%sp)
+        .word   0xA873                  | _SetPort
+        rts
+
+| QUIT: the data fork closed, back to the Finder
+hquit:  lea     H_PB(%a3), %a0
+        moveq   #19, %d0
+1:      clr.l   (%a0)+
+        dbra    %d0, 1b
+        lea     H_PB(%a3), %a0
+        move.w  H_REF(%a3), 24(%a0)
+        .word   0xA001                  | _Close
+        .word   0xA9F4                  | _ExitToShell
+
+t_apple:    .byte 1, 0x14
+t_file:     pstr "File"
+t_win:      pstr "Modus"
+i_about:    pstr "(About Modus...;(-"
+i_quit:     pstr "Quit/Q"
+        .align  2
 
 band:   .word   20, 0, 64, 512          | top left bottom right
 m_open:     pstr "Modus: cannot open my own data fork."

@@ -61,7 +61,8 @@ def size_rsrc(memtop):
     code and stack, at the partition's bottom and top, are checked too)."""
     if memtop <= 4 << 20:
         return struct.pack('>HII', 0, 64 * 1024, 64 * 1024)
-    return struct.pack('>HII', 0, memtop, 20 << 20)
+    # is32BitCompatible: a relocated image runs at whatever address its partition has
+    return struct.pack('>HII', 0x0080, memtop, 20 << 20)
 
 
 def resource_fork(resources):

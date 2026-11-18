@@ -364,7 +364,7 @@
          (classic (member *mac68k-machine* '(:classic :classic-os :quadra :classic-2m :plus-1m :plus-1m-jit)))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
-         (fill (mvm-make-label))
+         (fill (mvm-make-label)) (hosted (mvm-make-label))
          (base (conv-real #x10000000))
          (size +mac68k-heap-size+)
          (mid (floor size 2))
@@ -438,6 +438,12 @@
     (m68k-emit-bne buf fill)
     ;; the event queue: with no System, nothing has called InitEvents, and
     ;; GetOSEvent (the console's keyboard) faults without it -- measured
+    ;; a Mac OS application (+68K-MAC-HOST+ set by scripts/mac68k-chain.s):
+    ;; the events, the cursor and the console are the application's -- none
+    ;; of the bare Mac's takeover below
+    (let ((h (conv-real +68k-mac-host+)))
+      (m68k-emit-word buf #x4AB9) (m68k-emit-word buf (ash h -16)) (m68k-emit-word buf (logand h #xFFFF))
+      (m68k-emit-bne buf hosted))
     (m68k-emit-moveq buf +68k-d0+ 20)
     (m68k-emit-word buf #xA06D)                          ; _InitEvents
     ;; no arrow cursor over a text console: the ROM drew one at boot, and on a
@@ -452,6 +458,7 @@
     (m68k-emit-word buf #x4210)                          ; CLR.B (A0)
     (emit-mac68k-open buf (mac68k-ser-in-pb) ain)
     (emit-mac68k-open buf (mac68k-ser-out-pb) aout)
+    (m68k-emit-label buf hosted)
     ;; VN = NIL; A5 the globals base when it is one
     (m68k-emit-move-imm-an buf +nil-value+ +68k-a4+)
     (when *68k-a5-globals*

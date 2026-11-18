@@ -3,6 +3,7 @@ Lisps and/or Modus, set to launch START (default: the first of APPS) at startup.
 
   APPS   comma-separated: pearl, mcl, acl, modus     e.g.  mcl,modus
   START  which of APPS launches at boot               e.g.  modus
+         ("none": none, the Finder alone)
 
 Run with the venv python (needs machfs).  Environment:
   LISPS        base dir (default /mnt/data-fast/claude/rss/lisps): LISPS/sys6/... holds
@@ -70,14 +71,15 @@ for which in apps:
     else:
         raise SystemExit('unknown app %r: pearl, mcl, acl, modus' % which)
 
-start = starts[startname]
+start = starts.get(startname)                # START "none": just the Finder
 app = v
-for part in start: app = app[part]
-if system != '608':
+for part in start or (): app = app[part]
+if start and system != '608':
     si = machfs.Folder(); v['System Folder']['Startup Items'] = si
     c = machfs.File(); c.type, c.creator, c.flags = app.type, app.creator, app.flags
     c.data, c.rsrc = app.data, app.rsrc
     si[start[-1]] = c
 open(out, 'wb').write(v.write(size=size * 1024 * 1024, startapp=start))
+if not start: sys.exit(print(out, 'System', system, 'apps', ','.join(apps), 'no startup application'))
 print(out, 'System', system, 'apps', ','.join(apps), 'start', '/'.join(start), app.type, app.creator,
       len(app.data), len(app.rsrc))

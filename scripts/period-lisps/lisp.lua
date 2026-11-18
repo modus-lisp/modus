@@ -86,3 +86,28 @@ if os.getenv("PBTAP") then
     end)
   end)
 end
+
+-- CMDKEY=T:C: at emulated second T, hold Command and type C (a menu's key
+-- equivalent: CMDKEY=200:q quits an application), then let Command go
+if os.getenv("CMDKEY") then
+  local t, c = string.match(os.getenv("CMDKEY"), "([^:]+):(.+)")
+  t = tonumber(t)
+  local cmd
+  for _, port in pairs(manager.machine.ioport.ports) do
+    for name, field in pairs(port.fields) do
+      if string.find(string.lower(name), "command") then cmd = field end
+    end
+  end
+  local stage = 0
+  emu.register_periodic(function()
+    local now = manager.machine.time:as_double()
+    if stage == 0 and now >= t then
+      if cmd then cmd:set_value(1) end; stage = 1
+    elseif stage == 1 and now >= t + 0.3 then
+      manager.machine.natkeyboard:post(c); stage = 2
+    elseif stage == 2 and now >= t + 1.5 then
+      if cmd then cmd:clear_value() end; stage = 3
+      print(string.format("lisp.lua: Command-%s at %.1f s (key %s)", c, t, cmd and cmd.name or "NOT FOUND"))
+    end
+  end)
+end

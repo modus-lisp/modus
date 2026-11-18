@@ -254,6 +254,16 @@
    (scripts/mac68k-chain.py): the reference number of the open file that IS
    its boot disk, which the code loader and the disk service then _Read
    instead of the boot drive.  0 (as the core sends it) = the boot drive.")
+(defconstant +68k-mac-host+ #x10006054
+  "The static block's word for a Mac image running as a Mac OS application
+   (scripts/mac68k-chain.s, a relocating load): the address of the
+   application's HOST TABLE -- putc, getc, poll, each a long address the
+   console's putc / getc jump through (M68K-EMIT-MAC-CONSOLE), keeping the
+   same registers.  The application then owns the screen, the keyboard and
+   the events (a window, menus, WaitNextEvent) and the image takes none of
+   them: the boot stub skips InitEvents, HideCursor and the serial drivers,
+   and the screen console (mac/mac-console.lisp) stays off.  0 (as the core
+   sends it) = a bare Mac.")
 (defconstant +68k-cache-map+ #x10006040
   "Paged Mac: the cache's OWNER MAP (raw address; the cache's own first bytes):
    one 16-bit word per 64-byte granule from here to the cache's end -- the
@@ -3751,6 +3761,7 @@
   "Emit +68K-MAC-CONSOLE-CODE+: putc at *68K-MAC-CONSOLE-LABEL*, getc (word
    +68K-MAC-GETC-WORD+) at *68K-MAC-GETC-LABEL*."
   (m68k-emit-label buf *68k-mac-console-label*)
+  (m68k-emit-mac-host-jump buf 0)
   (let ((code (copy-seq +68k-mac-console-code+)))
     ;; every absolute operand is a $1000_9xxx long: move it with the
     ;; runtime-data region (CONV-REAL)
@@ -3759,8 +3770,28 @@
             do (let ((a (conv-real (logior #x10000000 (aref code (1+ i))))))
                  (setf (aref code i) (ash a -16) (aref code (1+ i)) (logand a #xFFFF))))
     (loop for w across code for i from 0
-          do (when (= i +68k-mac-getc-word+) (m68k-emit-label buf *68k-mac-getc-label*))
+          do (when (= i +68k-mac-getc-word+)
+               (m68k-emit-label buf *68k-mac-getc-label*)
+               (m68k-emit-mac-host-jump buf 4))
              (m68k-emit-word buf w))))
+
+(defun m68k-emit-mac-host-jump (buf slot)
+  "Running as a Mac OS application (+68K-MAC-HOST+ set): jump through the host
+   table's SLOT (0 putc, 4 getc) instead -- the return address is the caller's.
+       tst.l   host           ; 4AB9 abs.l
+       beq.s   1f             ; skip the 10 or 12 bytes below
+       movea.l host,a0        ; 2079 abs.l
+       movea.l SLOT(a0),a0    ; 2050 / 2068 SLOT
+       jmp     (a0)           ; 4ED0
+   1:"
+  (let* ((a (conv-real +68k-mac-host+)) (hi (ash a -16)) (lo (logand a #xFFFF)))
+    (m68k-emit-word buf #x4AB9) (m68k-emit-word buf hi) (m68k-emit-word buf lo)
+    (m68k-emit-word buf (if (zerop slot) #x670A #x670C))
+    (m68k-emit-word buf #x2079) (m68k-emit-word buf hi) (m68k-emit-word buf lo)
+    (if (zerop slot)
+        (m68k-emit-word buf #x2050)
+        (progn (m68k-emit-word buf #x2068) (m68k-emit-word buf slot)))
+    (m68k-emit-word buf #x4ED0)))
 
 (defun m68k-emit-mac-service (buf)
   "The bare Mac's disk service, at *68K-MAC-SERVICE-LABEL*: read D2 bytes from

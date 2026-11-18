@@ -31,9 +31,10 @@ private func say(_ text: String) -> AVSpeechUtterance {
 }
 
 let speechSay: Call = { p, n, _, _, _, _ in
-    // the speaker, as the media player has it: playback, through the silent switch
+    // the speaker, as the media player has it: playback, through the silent switch -- or Bluetooth headphones
+    // when they are on (A2DP: without it play-and-record drops them from the outputs, and their music with them)
     try? AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .default,
-                                                     options: [.defaultToSpeaker, .mixWithOthers])
+                                                     options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP])
     try? AVAudioSession.sharedInstance().setActive(true)
     synthesizer.speak(say(text(p, n)))
     return 1
@@ -140,7 +141,8 @@ private final class Ear {
 
     private func startEngine() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .measurement, options: [.defaultToSpeaker, .mixWithOthers])
+        try? session.setCategory(.playAndRecord, mode: .measurement,
+                                 options: [.defaultToSpeaker, .mixWithOthers, .allowBluetoothA2DP])
         try? session.setActive(true)
         let request = SFSpeechAudioBufferRecognitionRequest()
         request.shouldReportPartialResults = true

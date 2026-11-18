@@ -282,9 +282,12 @@ void modus_ui_init(void) { ui_ready = dispatch_semaphore_create(0); }
 // The speaker's half that needs UIKit's world (host/macos/modus-audio.c calls it
 // when the image opens the output): PLAYBACK, so a media player is heard with
 // the ring/silent switch off -- the default category treats an app's sound as
-// incidental and mutes it.
+// incidental and mutes it.  MIXING WITH OTHERS: the output opens when the desk
+// starts, and a session that does not mix takes the phone's audio from whatever
+// was playing (music in the AirPods stopped, or moved) just for the app opening.
 void modus_audio_session(void) {
     AVAudioSession *s = [AVAudioSession sharedInstance];
-    [s setCategory:AVAudioSessionCategoryPlayback error:nil];
+    [s setCategory:AVAudioSessionCategoryPlayback
+       withOptions:AVAudioSessionCategoryOptionMixWithOthers error:nil];
     [s setActive:YES error:nil];
 }

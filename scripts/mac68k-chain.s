@@ -34,7 +34,15 @@
         .equ    TBL, -1176                  |   and its relocation table
         .equ    DELTA, -1180                |   and BASE - the DEST it was built at
         .equ    HEXB, -1192                 | SAY's text: a Pascal string, 10 bytes
-start:  link    %a6, #-1192
+        .equ    HHALF, -1196                | the heap from the partition: a semispace,
+        .equ    HKMAP, -1200                |   the kind map past the two,
+        .equ    HEXTRA, -1204               |   and how far that moved it (x7/8 sites)
+        .equ    GUARD, 0x10000              | boot-mac68k :GC-GUARD
+        .equ    LOWBLK, 0x20000             | the low block (the layout's :ALLOC-START)
+start:  link    %a6, #-1204
+        clr.l   HHALF(%a6)
+        clr.l   HKMAP(%a6)
+        clr.l   HEXTRA(%a6)
         pea     -4(%a5)
         .word   0xA86E                  | _InitGraf
         .word   0xA8FE                  | _InitFonts
@@ -84,6 +92,7 @@ start:  link    %a6, #-1192
         lea     m_notmodus(%pc), %a4
         bra     fail
 3:      addq.l  #8, %a2                 | A2: DEST ENTRY LEN OFF SPOFF SPLEN REFSLOT MEMTOP
+                                        |   RELOFF RELLEN SPAN KMAP
         lea     m_notchain(%pc), %a4
         tst.l   24(%a2)
         beq     fail
@@ -144,6 +153,9 @@ start:  link    %a6, #-1192
         move.l  BASE(%a6), (%a2)        | DEST
         add.l   %d0, 4(%a2)             | ENTRY
         add.l   %d0, 24(%a2)            | REFSLOT
+        bsr     hsize
+        lea     m_alloc(%pc), %a4
+        bne     fail
 5:
 | the system heap must end below the image (System 6.0.8 with no INITs ends
 | near #x24270; the image is at #x40000)
@@ -215,6 +227,8 @@ start:  link    %a6, #-1192
         move.w  %d7, %d0
         ext.l   %d0
         move.l  %d0, (%a3)              | REFSLOT = the open file
+        move.l  HHALF(%a6), 8(%a3)      | boot-mac68k +MAC68K-HEAP-SLOT+: the
+        move.l  HKMAP(%a6), 12(%a3)     |   heap, or 0 for the layout's own
         tst.l   BASE(%a6)
         beq     7f
 | an application: the host table in the slot after REFSLOT (translate-68k
@@ -303,6 +317,45 @@ splash: movem.l %d3-%d6/%a3-%a4, -(%sp)
         movem.l (%sp)+, %d3-%d6/%a3-%a4
         rts
 
+| HSIZE (a relocating load whose record has KMAP, the kind map's address as
+| built: the young heap is last in the map, boot-mac68k :QUADRA): the heap
+| from the partition.  From F = DEST + LEN (the low block's end, where the
+| first semispace starts) up to 128 KB below the stack go two semispaces,
+| GUARD, then the kind map -- a byte per 8 bytes of [region, guard's end),
+| 64 KB-aligned, since its move is added to the high words of the x7/8
+| sites.  So a semispace is 4/9 of what is left, in 64 KB units.  HHALF,
+| HKMAP, HEXTRA; NE when the partition leaves less than 256 KB a semispace.
+hsize:  tst.l   44(%a2)
+        beq     9f
+        move.l  (%a2), %d1
+        add.l   8(%a2), %d1             | F
+        move.l  0x908, %d2              | CurStackBase
+        sub.l   #0x20000, %d2
+        sub.l   %d1, %d2
+        sub.l   #GUARD + 0x10000 + LOWBLK / 8, %d2
+        bmi     8f
+        clr.w   %d2
+        swap    %d2                     | 64 KB units
+        lsl.l   #2, %d2
+        divu.w  #9, %d2
+        and.l   #0xFFFF, %d2
+        swap    %d2                     | HALF
+        cmp.l   #0x40000, %d2
+        blo     8f
+        move.l  %d2, HHALF(%a6)
+        add.l   %d2, %d2
+        add.l   %d1, %d2
+        add.l   #GUARD + 0xFFFF, %d2
+        and.l   #0xFFFF0000, %d2
+        move.l  %d2, HKMAP(%a6)
+        sub.l   44(%a2), %d2
+        sub.l   DELTA(%a6), %d2         | - (KMAP + DELTA): the move
+        move.l  %d2, HEXTRA(%a6)
+9:      moveq   #0, %d0
+        rts
+8:      moveq   #-1, %d0
+        rts
+
 | Apply the relocation table (A2: the record; BASE, TBL): read RELLEN bytes
 | from RELOFF to TBL, then per kind (KIND COUNT, then COUNT gaps: a byte G
 | = 2G bytes on, or 0 and a 4-byte offset) add ((DELTA >> 16) * KIND) / 8 to
@@ -324,6 +377,12 @@ relocate:
         move.w  %d0, %d4
         muls.w  %d6, %d4                | (DELTA >> 16) * KIND, a multiple of 8
         asr.l   #3, %d4
+        cmp.l   #7, %d0                 | a kind-map bias: and the kind map's move
+        bne     11f
+        move.l  HEXTRA(%a6), %d1
+        swap    %d1
+        add.w   %d1, %d4
+11:
         bsr     rd32                    | COUNT
         move.l  %d0, %d2
         move.l  BASE(%a6), %a4

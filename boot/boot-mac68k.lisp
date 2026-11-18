@@ -120,13 +120,22 @@
     ;; does not use; its kind bytes (kind map + (address - region) / 8) then
     ;; fall in the young pair's range, unused in that run, and its stack under
     ;; NIL's page above the kind map.
+    ;; THE YOUNG HEAP IS LAST, so a Mac OS application can grow it into its
+    ;; partition: the code cache, the stack, the I/O pages and NIL's page sit
+    ;; below the region, and the kind map after the heap.  A disk boot uses
+    ;; :HEAP-SIZE and :KIND-MAP as they stand; the application's loader
+    ;; (scripts/mac68k-chain.s) sizes the semispaces from the partition, puts
+    ;; the kind map past them -- moving every kind-map bias by the difference
+    ;; (the relocation table's x7/8 class) -- and leaves both in the low block
+    ;; (+MAC68K-HEAP-SLOT+), where EMIT-MAC68K-ENTRY takes them.
     (:quadra  :load #x00600000 :static-lo #x00F00000 :static-hi #x01300000
               :jit-area-lo #x01300000 :jit-area-hi #x01500000 :jit-max-bytecode 16384
-              :region #x01500000 :heap-size #x00420000 :gc-guard #x00010000
-              :kind-map #x01910000 :cache-lo #x019A0000 :cache-hi #x019C0000
-              :staging #x019C0000 :staging-size #x00000000
-              :nil-page #x01A00000
-              :stack-top #x019F0000 :scratch #x019F0000 :io-buf #x019F1000
+              :cache-lo #x01500000 :cache-hi #x01520000
+              :staging #x01520000 :staging-size #x00000000
+              :stack-top #x01550000 :scratch #x01550000 :io-buf #x01551000
+              :nil-page #x01560000
+              :region #x01570000 :heap-size #x00420000 :gc-guard #x00010000
+              :kind-map #x01980000
               :boot-heap #x00F00000 :boot-heap-size #x00600000
               :boot-cache-lo #x01A10000 :boot-cache-hi #x01B00000
               :boot-stack-top #x019F0000)
@@ -331,6 +340,58 @@
     (m68k-emit-move-an-dn buf +68k-a7+ +68k-d1+)
     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x18))) ; stack_base
 
+;; #x10006058 / #x1000605C: written by an application's loader
+;; (scripts/mac68k-chain.s), zero otherwise
+(defconstant +mac68k-heap-slot+ #x10006058
+  "Low-block words the Mac OS application's loader fills: +0 a semispace's
+   size, chosen from the partition; +4 where the kind map then is.  Zero (a
+   disk boot, the core run): the layout's :HEAP-SIZE and :KIND-MAP.")
+
+(defun emit-mac68k-heap-from-slot (buf base lo guard)
+  "When +MAC68K-HEAP-SLOT+ is set: zero the kind map it names over [BASE, LO +
+   2*HALF + GUARD), write the Cheney block for two HALF-byte semispaces from LO
+   and set VA / VL, then branch past the code that follows (the layout's own
+   heap, EMIT-MAC68K-HEAP).  Clobbers D0-D2/A0."
+  (let ((skip (mvm-make-label)) (done (mvm-make-label)) (zero (mvm-make-label))
+        (n (+ (m68k-kind-shift) 2)))
+    (m68k-emit-move-imm-an buf (conv-real +mac68k-heap-slot+) +68k-a0+)
+    (m68k-emit-move-disp-dn buf +68k-a0+ 0 +68k-d1+)      ; D1 = HALF
+    (m68k-emit-tst buf +68k-d1+)
+    (m68k-emit-beq buf skip)
+    ;; the kind map: (LO - BASE + 2*HALF + GUARD) >> shift bytes, in longs
+    (m68k-emit-word buf #x2001)                           ; MOVE.L D1,D0
+    (m68k-emit-word buf #xD080)                           ; ADD.L D0,D0
+    (m68k-emit-word buf #x0680) (m68k-emit-long buf (+ (- lo base) guard)) ; ADDI.L
+    (m68k-emit-word buf (logior #xE088 (ash (logand n 7) 9)))  ; LSR.L #n,D0
+    (m68k-emit-word buf #x2068) (m68k-emit-word buf 4)    ; MOVEA.L 4(A0),A0
+    (m68k-emit-label buf zero)
+    (m68k-emit-word buf #x4298)                           ; CLR.L (A0)+
+    (m68k-emit-subq buf +68k-d0+ 1)
+    (m68k-emit-bne buf zero)
+    ;; VL's margin: min(1 MB, HALF/4 rounded down to 16)
+    (m68k-emit-word buf #x2001)                           ; MOVE.L D1,D0
+    (m68k-emit-word buf #xE488)                           ; LSR.L #2,D0
+    (m68k-emit-word buf #x0280) (m68k-emit-long buf #xFFFFFFF0) ; ANDI.L #-16,D0
+    (m68k-emit-word buf #x0C80) (m68k-emit-long buf +linux-68k-gc-margin-max+) ; CMPI.L
+    (m68k-emit-word buf #x6306)                           ; BLS.S +6
+    (m68k-emit-word buf #x203C) (m68k-emit-long buf +linux-68k-gc-margin-max+) ; MOVE.L #,D0
+    (m68k-emit-move-imm-an buf lo +68k-a2+)               ; VA
+    (m68k-emit-word buf #x243C) (m68k-emit-long buf lo)   ; MOVE.L #LO,D2
+    (m68k-emit-word buf #xD481)                           ; ADD.L D1,D2
+    (m68k-emit-word buf #x9480)                           ; SUB.L D0,D2
+    (m68k-emit-word buf #x2642)                           ; MOVEA.L D2,A3: VL
+    (m68k-emit-move-imm-an buf (+ base #x40) +68k-a0+)
+    (m68k-emit-word buf #x243C) (m68k-emit-long buf lo)   ; MOVE.L #LO,D2
+    (m68k-emit-move-dn-disp buf +68k-d2+ +68k-a0+ #x00)   ; from_start
+    (m68k-emit-word buf #xD481)                           ; ADD.L D1,D2
+    (m68k-emit-move-dn-disp buf +68k-d2+ +68k-a0+ #x08)   ; to_start
+    (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ #x10)   ; space_size
+    (m68k-emit-word buf #x240F)                           ; MOVE.L A7,D2
+    (m68k-emit-move-dn-disp buf +68k-d2+ +68k-a0+ #x18)   ; stack_base
+    (m68k-emit-bra buf done)
+    (m68k-emit-label buf skip)
+    done))
+
 (defun emit-mac68k-cache (buf lo hi)
   "Paged code: the code cache [LO, HI) into the low block (translate-68k
    +68K-CACHE-PTR+ / -HI+ / -LO+ / -MAP+): its OWNER MAP first, one 16-bit word
@@ -418,7 +479,9 @@
     (m68k-emit-label buf core)
     (when classic
       (m68k-emit-move-imm-an buf +mac68k-stack-top+ +68k-a7+)
-      (emit-mac68k-heap buf base (+ base alloc) (- mid alloc) +mac68k-gc-guard+)
+      (let ((done (emit-mac68k-heap-from-slot buf base (+ base alloc) +mac68k-gc-guard+)))
+        (emit-mac68k-heap buf base (+ base alloc) (- mid alloc) +mac68k-gc-guard+)
+        (m68k-emit-label buf done))
       (emit-mac68k-cache buf (mac68k-layout :cache-lo) (mac68k-layout :cache-hi))
       ;; the serial drivers' parameter blocks: zeroed for the opens below
       (emit-mac68k-zero buf (mac68k-ser-out-pb) #x100)

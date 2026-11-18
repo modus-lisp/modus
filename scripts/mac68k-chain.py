@@ -139,7 +139,7 @@ def code0():
     return struct.pack('>IIII', 32 + len(entry), 512, len(entry), 32) + entry
 
 
-def size_rsrc(memtop, span=0):
+def size_rsrc(memtop, span=0, kmap=0):
     """SIZE -1, for MultiFinder / System 7: no flags, then the preferred and
     minimum partition.  A map for a 4 MB Mac asks 64 KB (System 6 without
     MultiFinder ignores SIZE, and the image lives above the application zone).
@@ -160,7 +160,15 @@ def size_rsrc(memtop, span=0):
         # Asking for all of RAM, as below, left the Finder unable to open
         # even the desktop (a 32 MB Quadra 950 under 7.5.3).
         need = span + 0x180000
-        return struct.pack('>HII', 0x0080, need, need)
+        # a map whose young heap is last (KMAP set) takes its semispaces from
+        # whatever partition it gets (mac68k-chain.s HSIZE): SPAN is its
+        # smallest heap, and the preferred size -- Get Info's to change, or
+        # MODUS_PARTITION_KB here -- is that and 4 MB more
+        pref = need
+        if kmap:
+            kb = os.environ.get('MODUS_PARTITION_KB')
+            pref = max(need, int(kb) * 1024) if kb else need + 0x400000
+        return struct.pack('>HII', 0x0080, pref, need)
     if memtop <= 4 << 20:
         return struct.pack('>HII', 0, 64 * 1024, 64 * 1024)
     # is32BitCompatible: a relocated image runs at whatever address its partition has
@@ -231,12 +239,12 @@ def main(disk, out, forks=None):
     k = data.find(b'modusCHN', 0, 1024)
     if k < 0:
         sys.exit('mac68k-chain: %s has no launch record in its boot blocks' % disk)
-    dest, entry, ln, off, _, _, refslot, memtop, reloff, _, span = struct.unpack_from('>11I', data, k + 8)
+    dest, entry, ln, off, _, _, refslot, memtop, reloff, _, span, kmap = struct.unpack_from('>12I', data, k + 8)
     if not refslot:
         sys.exit('mac68k-chain: %s cannot run on top of Mac OS (build it with '
                  'MODUS_MAC68K_MACHINE=classicos)' % disk)
     rsrc = resource_fork([(b'CODE', 0, code0()), (b'CODE', 1, code1()),
-                          (b'SIZE', -1, size_rsrc(memtop, span if reloff else 0))] + finder_resources())
+                          (b'SIZE', -1, size_rsrc(memtop, span if reloff else 0, kmap if reloff else 0))] + finder_resources())
     open(out, 'wb').write(macbinary(NAME, TYPE, CREATOR, data, rsrc))
     if forks:
         os.makedirs(forks, exist_ok=True)

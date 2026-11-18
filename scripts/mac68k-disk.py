@@ -122,7 +122,7 @@ def splash(path=None):
 
 
 def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read_len=None,
-               refslot=0, memtop=0):
+               refslot=0, memtop=0, kmap=0):
     """Boot blocks that read IMG (bytes) to LOAD_ADDR and jump to ENTRY (default
     LOAD_ADDR), then IMG at offset 1024, padded to whole blocks and to at
     least MIN_SIZE.  The splash, when there is one, goes after IMG.  REFSLOT
@@ -141,6 +141,9 @@ def write_disk(img, disk, load_addr=LOAD_ADDR, min_size=819200, entry=None, read
     # for a launch from Mac OS (mac68k-chain.py): 0 = this image cannot
     struct.pack_into('>I', bb, syms['refslot'], refslot)
     struct.pack_into('>I', bb, syms['memtop'], memtop)
+    # the kind map's address, when the layout puts the young heap last: the
+    # application's loader then sizes the heap from its partition
+    struct.pack_into('>I', bb, syms['kmap'], kmap)
     out = bb + bytes(1024 - len(bb)) + img
     out += bytes(-len(out) % 512)
     sp = splash()

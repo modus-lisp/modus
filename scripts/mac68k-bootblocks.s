@@ -194,4 +194,5 @@ memtop: .long   0
 reloff: .long   0                       | the relocation table: its disk byte
 rellen: .long   0                       |   and length, 0 = none
 span:   .long   0                       | the map's bytes from DEST
+kmap:   .long   0                       | the kind map as built, when the heap is last (0: fixed)
 pb:     .space  80

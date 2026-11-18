@@ -326,6 +326,11 @@ def relocate(core, static_lo=None):
                    (0x601C, 0), (0x6014, 1),
                    (0x6030, 1 if os.environ.get('MODUS_MAC_CORE_PROBES') == '1' else 0)):
         struct.pack_into('>I', low, off, v)
+    # the cards' tables (the marks, the crossing table): %GC-CARDS-INIT
+    # rebuilds both at a core boot, and the core run's describe its own layout
+    # -- which two runs a shift apart do not share
+    low[0x6100:0x7F00] = bytes(0x7F00 - 0x6100)
+    low[LOW_BLOCK - 0x2000:LOW_BLOCK] = bytes(0x2000)
     # a new collection count: anything keyed by address re-hashes
     c, = struct.unpack_from('>I', low, 0x60)
     struct.pack_into('>I', low, 0x60, c + 1)

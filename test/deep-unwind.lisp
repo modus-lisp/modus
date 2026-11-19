@@ -1,6 +1,15 @@
 ;;;; deep-unwind.lisp — A NON-LOCAL EXIT RUNS EVERY CLEANUP, AT ANY DEPTH.
 ;;;;
 ;;;;   ./modus --script test/deep-unwind.lisp
+;;;;   qemu-arm-static -s 268435456 modus-arm32-cli --script test/deep-unwind.lisp
+;;;;
+;;;; On a port with no JIT (i386, arm32, riscv64, riscv32, 68k) this file is
+;;;; INTERPRETED, and the interpreter re-enters itself natively at every
+;;;; HANDLER-CASE level, so 2000 levels need more than the default 8 MB native
+;;;; stack: run it there with a 256 MB stack (qemu-user -s 268435456, or
+;;;; ulimit -s 262144 for i386, which runs natively).  With 8 MB the process
+;;;; dies with SIGSEGV in the 2000-deep HANDLER-CASE section -- the native
+;;;; stack's limit, before and after the frame-stack fix alike.
 ;;;;
 ;;;; Every CATCH / UNWIND-PROTECT / HANDLER-CASE keeps one frame on the
 ;;;; per-thread handler-frame stack while its body runs, and a THROW, a handled
@@ -29,6 +38,14 @@
 ;;;; receives a HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION).  The last
 ;;;; section reaches that through the test-only per-window limit, since no
 ;;;; native stack gets to the real capacity.
+;;;;
+;;;; i386, arm32, PowerPC, RISC-V and 68k kept a BALANCED-CAP (127 / 255 /
+;;;; 23-46 / 256 / 46 frames hosted): a push past it stored nothing, so an
+;;;; exit skipped every cleanup past the cap -- here an interpreted
+;;;; HANDLER-CASE 100 deep dispatched to level 56 on i386.  They now take the
+;;;; same extension and loud overflow (HSTACK-GEOMETRY below
+;;;; names each port's window and test-limit word).  Those ports have no
+;;;; threads: the worker and neighbours sections are skipped there, loudly.
 ;;;;
 ;;;; Checked on MAIN and on a WORKER thread, for N from 100 to 5000:
 ;;;;   CLEANUPS   N nested UNWIND-PROTECTs, exited by THROW, a handled ERROR,
@@ -78,6 +95,28 @@
 
 (defun depth () (modus-int::%hc-depth))
 
+;;; AN IMAGE WITHOUT A JIT INTERPRETS THIS FILE (i386, arm32, riscv64,
+;;; riscv32, 68k: no in-image translator).  Its UNWIND-PROTECT and CATCH
+;;; frames then live in the interpreter's own handler list, not on the native
+;;; frame stack, so the "nested natively" checks cannot hold there -- they are
+;;; SKIPPED, counted and announced, never silently passed.  Everything else
+;;; still runs, and is not vacuous: an interpreted HANDLER-CASE around an
+;;; UNWIND-PROTECT takes two NATIVE frames per level (measured on i386:
+;;; depth +2 per level, and on origin/main 7fdb8b4f its 127-frame cap made a
+;;; 100-deep HANDLER-CASE nest dispatch to level 56 and run 56 cleanups).
+(defvar *native-nesting* t
+  "Set below, measured: does a nest of UNWIND-PROTECTs grow the native frame
+   depth on this image?")
+(defvar *skipped* 0)
+;;; A hardware fault is an exit only where a signal stub turns it into a
+;;; LONGJMP (TRAP #x0520).  Hosted 68k has none (its #x0520 is a no-op): there
+;;; the fault kills the process, so the :FAULT exits are SKIPPED, announced.
+(defvar *fault-exits* (not (string= (machine-type) "m68k")))
+(defun chk-native (name got)
+  (if *native-nesting*
+      (chk name got t)
+      (setq *skipped* (+ *skipped* 1))))
+
 (defvar *trace* nil)          ; cleanup levels, pushed as they run
 (defvar *bottom-depth* 0)     ; native frame depth seen at the bottom
 (defvar *sp* :outer)          ; the special the SPECIALS section binds
@@ -126,7 +165,7 @@
 (defun iota (n) (loop for i from 0 below n collect i))
 
 (defun check-cleanups (where lim)
-  (dolist (how '(:throw :error :fault :return-from :go))
+  (dolist (how (if *fault-exits* '(:throw :error :fault :return-from :go) '(:throw :error :return-from :go)))
     (let ((r (run-uwp lim how)))
       (chk (format nil "~A ~D ~(~A~) value" where lim how) (first r)
            (ecase how (:throw :thrown) (:error :handled) (:fault :faulted)
@@ -136,7 +175,7 @@
       (chk (format nil "~A ~D ~(~A~) every cleanup, innermost first" where lim how)
            (second r) (reverse (iota (+ lim 1))))
       (chk (format nil "~A ~D ~(~A~) frame depth restored" where lim how) (third r) t)
-      (chk (format nil "~A ~D ~(~A~) nested natively" where lim how) (fourth r) t))))
+      (chk-native (format nil "~A ~D ~(~A~) nested natively" where lim how) (fourth r)))))
 
 ;;; CATCH: tags are the levels; the bottom throws to level TARGET.
 (defun nest-catch (n lim target)
@@ -165,7 +204,7 @@
       (chk (format nil "~A ~D catch tag ~D cleanups" where lim target)
            (nreverse *trace*) (reverse (iota (+ lim 1))))
       (chk (format nil "~A ~D catch tag ~D depth" where lim target) (= (depth) d0) t)
-      (chk (format nil "~A ~D catch nested natively" where lim) (>= *bottom-depth* (+ d0 lim)) t))))
+      (chk-native (format nil "~A ~D catch nested natively" where lim) (>= *bottom-depth* (+ d0 lim))))))
 
 ;;; SPECIALS: a LET of *SP* at every level.
 (defun nest-special (n lim how k)
@@ -214,7 +253,7 @@
       (chk (format nil "~A ~D handler-case ~(~A~) cleanups" where lim which)
            (nreverse *trace*) (reverse (iota (+ lim 1))))
       (chk (format nil "~A ~D handler-case depth" where lim) (= (depth) d0) t)
-      (chk (format nil "~A ~D handler-case nested natively" where lim) (>= *bottom-depth* (+ d0 lim)) t))))
+      (chk-native (format nil "~A ~D handler-case nested natively" where lim) (>= *bottom-depth* (+ d0 lim))))))
 
 (defvar *seen* nil)
 
@@ -244,12 +283,42 @@
 ;;; OVERFLOW, through the per-window test limit (+HSTACK-EXT-LIMIT-ADDR+,
 ;;; window +0x5608, a raw count of extension frames -- the same word on
 ;;; AArch64, +A64-HSTACK-EXT-LIMIT-ADDR+).
-(defvar *win-frames* (if (string= (machine-type) "aarch64") 170 512)
+(defun hstack-geometry ()
+  "(WINDOW-FRAMES LIMIT-ADDRESS WIDTH) for this machine: the handler frames
+   kept in memory before the extension, and the test-only lower limit on
+   extension frames (a raw count; 0 = none).  NIL: no test limit known here."
+  (let ((mt (machine-type)))
+    (cond ((string= mt "x86_64")
+           (list 512 (+ (modus-int::%tls-self-base) #x10005608) :u64))
+          ((string= mt "aarch64")
+           (list 170 (+ (modus-int::%tls-self-base) #x10005608) :u64))
+          ;; translate-i386: 127 frames in the BSS tail, then the
+          ;; extension; its test limit is a u32 at #x1001FF04
+          ((string= mt "i386") (list 127 #x1001FF04 :u32))
+          ;; translate-riscv: 256 frames at heap+#x20000, then the
+          ;; extension; its test limit at #x10026008 (little-endian, so a
+          ;; u32 store sets the RV64 word too)
+          ((member mt '("riscv64" "riscv32") :test #'string=)
+           (list 256 #x10026008 :u32))
+          ;; translate-arm32: 255 frames at heap+#x20000, then the
+          ;; extension; its test limit is a u32 at #x10021FF4
+          ((string= mt "armv7l") (list 255 #x10021FF4 :u32))
+          ;; translate-68k: 46 frames at #x10000408, then the extension;
+          ;; its test limit is a u32 at #x10005608 (no threads: absolute)
+          ((string= mt "m68k") (list 46 #x10005608 :u32))
+          (t nil))))
+(defvar *geometry* (hstack-geometry))
+(defvar *win-frames* (if *geometry* (first *geometry*) 0)
   "Handler frames the per-thread window holds before the extension.")
 (defvar *entered* 0)
 (defvar *d1* 0)               ; frame depth on entering level 0
-(defun limit-addr () (+ (modus-int::%tls-self-base) #x10005608))
-(defun set-ext-limit (n) (modus-int::%gc-write64 (limit-addr) n))
+(defun set-ext-limit (n)
+  ;; HSTACK-GEOMETRY again, not *GEOMETRY*: on a threaded port the limit
+  ;; word is in THIS thread's window, and *GEOMETRY* was computed on main.
+  (let* ((g (hstack-geometry)) (addr (second g)))
+    (if (eq (third g) :u64)
+        (modus-int::%gc-write64 addr n)
+        (setf (mem-ref addr :u32) n))))
 
 (defun nest-count (n lim)
   (setq *entered* (+ *entered* 1))
@@ -258,7 +327,57 @@
        (if (< n lim) (nest-count (+ n 1) lim) :bottom)
     (push n *trace*)))
 
+(defun nest-count-hc (n lim)
+  "NEST-COUNT for an image that interprets this file.  There a HANDLER-CASE
+   whose body CALLS a function that holds the UNWIND-PROTECT takes two native
+   frames per level (measured on i386 and 68k; with the UNWIND-PROTECT inline
+   in the HANDLER-CASE's own body it takes none), so the overflow is reached
+   through that shape."
+  (setq *entered* (+ *entered* 1))
+  (when (= n 0) (setq *d1* (depth)))
+  (handler-case (nest-count-hc-body n lim)
+    (deep-a () :never)))
+
+(defun nest-count-hc-body (n lim)
+  (unwind-protect
+       (if (< n lim) (nest-count-hc (+ n 1) lim) :bottom)
+    (push n *trace*)))
+
 (defun check-overflow (where)
+  (cond ((null *geometry*)
+         (setq *skipped* (+ *skipped* 1))
+         (format t "  NOTE: ~A overflow SKIPPED: no test-limit word is known for ~S~%"
+                 where (machine-type)))
+        (*native-nesting* (check-overflow-native where))
+        (t (check-overflow-interpreted where))))
+
+(defun check-overflow-interpreted (where)
+  (setq *trace* nil *entered* 0)
+  (set-ext-limit 100)
+  (let* ((d0 (depth))
+         (v (handler-case (nest-count-hc 0 5000)
+              (storage-condition (c) (list :storage (symbol-name (type-of c))
+                                           (typep c 'error))))))
+    (set-ext-limit 0)
+    (chk (format nil "~A overflow signals a storage-condition" where)
+         v '(:storage "HANDLER-STACK-EXHAUSTED" nil))
+    ;; whichever of the level's two pushes overflowed, that level never
+    ;; established its cleanup and every level before it did
+    (chk (format nil "~A overflow: every pushed frame's cleanup ran" where)
+         (length *trace*) (- *entered* 1))
+    (chk (format nil "~A overflow: cleanups innermost first" where)
+         (nreverse *trace*) (reverse (iota (- *entered* 1))))
+    ;; two frames a level: the window and the 100 allowed extension frames
+    ;; were filled before the overflow (within a level)
+    (chk (format nil "~A overflow reached window + limit" where)
+         (<= (abs (- (* 2 (- *entered* 1)) (- (+ *win-frames* 100) *d1*))) 2) t)
+    (chk (format nil "~A overflow depth restored" where) (= (depth) d0) t))
+  ;; and the stack works again, deeper than the old limit, afterwards
+  (setq *trace* nil)
+  (chk (format nil "~A after overflow 1500 deep" where)
+       (list (nest-hc 0 1500 'deep-a) (length *trace*)) (list (list :a-at 1500) 1501)))
+
+(defun check-overflow-native (where)
   (setq *trace* nil *entered* 0)
   (set-ext-limit 100)
   (let* ((d0 (depth))
@@ -332,9 +451,36 @@
 ;;; Around both windows' ends: AArch64's 170, x86-64's 512.
 (defvar *depths* '(100 169 170 171 497 498 511 512 513 600 800 900 1000 2000 5000))
 
+(unless *fault-exits*
+  (format t "~&NOTE: ~A has no signal stub (a fault is not an exit there): the :FAULT exits are SKIPPED~%"
+          (machine-type)))
+(setq *native-nesting* (fourth (run-uwp 50 :throw)))
+(unless *native-nesting*
+  (format t "~&NOTE: ~A interprets this file (its UNWIND-PROTECT / CATCH frames do not ~
+             reach the native frame stack): every \"nested natively\" check is SKIPPED~%"
+          (machine-type)))
+
+;;; Threads: a port without them says so at MAKE-THREAD (i386, arm32, RISC-V
+;;; and 68k CLIs: "%HA-CARVE is undefined"); their sections are SKIPPED, loudly.
+(defvar *threads*
+  (handler-case (eql 7 (sb-thread:join-thread (sb-thread:make-thread (lambda () 7))))
+    (error (e) (format t "~&NOTE: no threads here (~A): the worker and neighbours sections are SKIPPED~%"
+                       (princ-to-string e))
+      nil)))
+
+;;; Hosted i386 runs on a FIXED 8 MB native stack (MAP_FIXED at 0x18000000;
+;;; ulimit does not grow it), and an interpreted HANDLER-CASE 2000 deep
+;;; overflows it: SIGSEGV, on origin/main 7fdb8b4f too.  Those depths are
+;;; dropped there, announced.
+(when (and (not *native-nesting*) (string= (machine-type) "i386"))
+  (format t "~&NOTE: i386 interprets this file on a fixed 8 MB native stack: depths past 1000 are SKIPPED~%")
+  (setq *skipped* (+ *skipped* (count-if (lambda (d) (> d 1000)) *depths*)))
+  (setq *depths* (remove-if (lambda (d) (> d 1000)) *depths*)))
+
 (format t "~&-- main~%")
 (run-all "main" *depths*)
 
+(when *threads*
 (format t "~&-- worker~%")
 (let ((r (sb-thread:join-thread
           (sb-thread:make-thread
@@ -351,7 +497,7 @@
   (chk "worker finished" r :done))
 
 ;;; Main's specials are untouched by the worker's.
-(chk "main special after worker" *sp* :outer)
+(chk "main special after worker" *sp* :outer))
 
 ;;; NEIGHBOURS.  Worker A nests N deep while worker B, started right after it
 ;;; (normally the next window block), is parked inside a HANDLER-CASE with a
@@ -366,6 +512,7 @@
   (unwind-protect (if (< n lim) (nest-nb (+ n 1) lim) (throw 'nb :done))
     (setq *nb-ran* (+ *nb-ran* 1))))
 
+(when *threads*
 (format t "~&-- neighbours~%")
 (dolist (lim '(100 200 400 1000 3000))
   (setq *go* 0 *b-ready* 0)
@@ -391,7 +538,8 @@
     (chk (format nil "neighbours ~D: A ran every cleanup" lim)
          (sb-thread:join-thread a) (list :done (+ lim 1)))
     (chk (format nil "neighbours ~D: B's own handler caught its error" lim)
-         (sb-thread:join-thread b) '(:b-caught :b (1 2 3)))))
+         (sb-thread:join-thread b) '(:b-caught :b (1 2 3))))))
 
-(format t "~&~D checks, ~D failed~%" *checks* *fail*)
+(format t "~&~D checks, ~D failed~:[~;, ~D SKIPPED (see the NOTEs above)~]~%"
+        *checks* *fail* (plusp *skipped*) *skipped*)
 (format t "~A~%" (if (= *fail* 0) "DEEP-UNWIND: PASS" "DEEP-UNWIND: FAIL"))

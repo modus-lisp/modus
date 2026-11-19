@@ -28,9 +28,16 @@
    (hi == #x80000000, the sign bit) as non-zero, which made %float-lt-p
    treat -0.0 - 0.0 = -0.0 as a strict negative → numeric-equal-p 0.0 -0.0
    returned NIL → subtypep-float signed-zero range subset checks failed.
-   Mask off the sign bit before comparing the hi slot."
-  (and (= (logand (%float-hi32 x) #x7FFFFFFF) 0)
-       (= (%float-lo32 x) 0)))
+   Mask off the sign bit before comparing the hi slot.
+
+   Read as the box's four 16-bit chunks (%FLOAT-HI32's own slots), each a
+   fixnum on every tower: building the 32-bit halves made a bignum for most
+   floats on the 30-bit one -- ~16 us a call on i386 (qemu), and SQRT asks
+   this and FLOAT-NEGATIVE-P on every call."
+  (and (= (logand (%prim-aref x 0) #x7FFF) 0)
+       (= (%prim-aref x 1) 0)
+       (= (%prim-aref x 2) 0)
+       (= (%prim-aref x 3) 0)))
 
 ;;; ============================================================
 ;;; Transcendental functions — rational approximations via Taylor
@@ -3290,8 +3297,10 @@
   "Check if boxed float X has its IEEE sign bit set.  The hi32 slot may be
    stored SIGNED (negative fixnum) by the arithmetic path or UNSIGNED
    (0..2^32-1) by the reader's single-float literal path, so test bit 31
-   directly after masking to 32 bits rather than relying on fixnum sign."
-  (= (logand (ash (%float-hi32 x) -31) 1) 1))
+   directly after masking to 32 bits rather than relying on fixnum sign.
+   Bit 15 of the top 16-bit chunk is that bit (see %FLOAT-ZERO-P: a fixnum
+   test, where the 32-bit half is a bignum on the 30-bit tower)."
+  (logbitp 15 (%prim-aref x 0)))
 
 (defun %bignum-trunc-doubling (na nb)
   "Return ⌊na/nb⌋ where NA, NB are non-negative integers (fixnum or

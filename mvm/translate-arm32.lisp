@@ -1027,17 +1027,18 @@
 
 (defconstant +arm32-jmpbuf-words+ 7)
 (defparameter *arm32-hstack-max-depth* 46
-  "As many 32-byte frames as fit below the globals at #x10000A00.  It was 21,
-   and that was the whole of `fresh-FASL-cache loads are broken on arm32':
-   boot already holds 5 frames, a library load RECORDING the cache nests past
-   the other 16, the excess pushes are absorbed, and a throw then lands on the
-   wrong frame -- alexandria's first load failed all 30 probes with 57 throws
-   escaping as %THROW-IN-FLIGHT.  At 46: 30 of 30, no errors, recording and
-   replay alike.  x64 holds 64, i386 63.")
+  "Bare metal: as many 32-byte frames as fit below the globals at #x10000A00
+   (+#x408 .. +#x9C8 of the block).  It was 21, and that was the whole of
+   `fresh-FASL-cache loads are broken on arm32': boot already holds 5 frames,
+   a library load RECORDING the cache nests past the other 16, the excess
+   pushes were absorbed, and a throw then landed on the wrong frame --
+   alexandria's first load failed all 30 probes with 57 throws escaping as
+   %THROW-IN-FLIGHT.  At 46: 30 of 30, no errors, recording and replay alike.
+   The 47th push is now the LOUD overflow (THE HANDLER-FRAME STACK HAS NO
+   SILENT CEILING below), never a dropped frame.")
 (defun arm32-hbase ()           (if (arm32-hosted-layout-p) #x10000000 *arm32-globals-base*))
 (defun arm32-jmpbuf-addr ()     (+ (arm32-hbase) #x180))
 (defun arm32-lj-scratch-addr () (+ (arm32-hbase) #x300))
-(defun arm32-hcapped-addr ()    (+ (arm32-hbase) #x360))
 (defun arm32-hdepth-addr ()     (+ (arm32-hbase) #x400))
 ;;; HOSTED, 46 was not enough either: the upstream ANSI suite's own loader
 ;;; (COMPILE-AND-LOAD* of each aux file, inside LOAD inside LOAD) nests deeper,
@@ -1046,11 +1047,77 @@
 ;;; shards timed out with zero tests run).  The hosted layout keeps its frames
 ;;; in their own region at heap+#x20000, below the allocator's start (#x28000,
 ;;; boot-linux-arm32), so the collector's scan of the low block still covers
-;;; them -- RISC-V's layout.  255 because the depth compare takes an 8-bit
-;;; immediate.  Bare (*arm32-globals-base*) keeps the 46 above.
+;;; them -- RISC-V's layout.  255 IN MEMORY because the depth compare takes an
+;;; 8-bit immediate; hosted Linux continues in the extension past them.
 (defun arm32-hstack-max-depth () (if (arm32-hosted-layout-p) 255 *arm32-hstack-max-depth*))
 (defun arm32-hframes-addr ()    (+ (arm32-hbase) (if (arm32-hosted-layout-p) #x20000 #x408)))
 (defconstant +arm32-r1-r3+ (logior (ash 1 1) (ash 1 2) (ash 1 3)))
+
+;;; ------------------------------------------------------------------
+;;; THE HANDLER-FRAME STACK HAS NO SILENT CEILING (ARM32)
+;;; ------------------------------------------------------------------
+;;;
+;;; The ARM32 twin of translate-x64's section of the same name (read that one
+;;; first).  The frame stack was BALANCED-CAP: a push past the in-memory frames
+;;; stored nothing, bumped a "capped" count at block +#x360, the SETJMP site
+;;; skipped arming, and the matching pop absorbed it -- so a LONGJMP from below
+;;; the cap went straight to the deepest STORED frame and every cleanup past
+;;; the cap was silently skipped (arch-ladder r36: 254 of 301 cleanups hosted).
+;;;
+;;; HOSTED LINUX: frames 0..254 stay at heap+#x20000 (the fast path: the old
+;;; code plus one CMP and a never-taken BLGE); frame 255 and up go to an
+;;; EXTENSION that the out-of-line push helper reserves itself on first use
+;;; (mmap2 MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, +ARM32-HSTACK-EXT-FRAMES+
+;;; frames = 8 MB of address space, pages touched on demand), its address in
+;;; the word +ARM32-HSTACK-EXT-ADDR+ -- in the free gap between the in-memory
+;;; frames (#x20000-#x21FDF) and the allocator's start (#x28000), which the
+;;; fresh anonymous heap mapping zeroes.  arm32 has no threads, so one
+;;; process-global extension serves.  A push that still cannot be stored --
+;;; past the extension, past the test-only limit, or the reservation refused --
+;;; is LOUD: it records #x0F0F at #x10000CB0 and longjmps to the armed frame
+;;; (the one enclosing the form whose push failed) exactly as TRAP #x0511 does,
+;;; and that frame's HANDLER-CASE receives HANDLER-STACK-EXHAUSTED from
+;;; %TAKE-PENDING-FAULT.  The failed frame was never stored, so the stack stays
+;;; balanced and every enclosing cleanup runs.  Nothing armed: a message on
+;;; stderr and exit_group(70), never a branch through a zero frame.
+;;;
+;;; THE FRAMES ARE GC ROOTS: a jmpbuf holds r4..r7 (V4..V7, heap pointers),
+;;; and LONGJMP restores them.  The in-memory frames lie in the low block the
+;;; collector scans whole; the extension's LIVE frames, [ext, ext +
+;;; (depth-255)*32), are scanned explicitly (ARM32-EMIT-GC-COLLECTOR).
+;;;
+;;; THE BARE CL IMAGE (hosted layout, bare traps) has no mmap: its 256th push
+;;; is the loud overflow (#x0F0F at #x10000CB0, mapped there).  BARE METAL keeps
+;;; its 46 frames and its 47th push is the same loud overflow; it records the
+;;; code in the block's word +#x360 (the old capped count, now free) rather
+;;; than at #x10000CB0, which is device space on versatilepb/virt.  Its
+;;; nothing-armed case is UDF.
+;;;
+;;; PUSH and POP stay INLINE at each site (they are the fast path); the slow
+;;; paths are two helpers emitted once per translated module, after the
+;;; collector: ARM32-EMIT-HSTACK-HELPERS.
+
+(defconstant +arm32-hstack-ext-addr+ #x10021FF0
+  "Hosted Linux: ABSOLUTE address of the handler-frame extension (frames 255
+   and up), 0 until the first push past 255 reserves it.")
+(defconstant +arm32-hstack-ext-limit-addr+ #x10021FF4
+  "Hosted Linux: 0, or a TEST-ONLY lower limit on extension frames.")
+(defconstant +arm32-hstack-ext-frames+ #x40000
+  "Frames in the extension: 256K x 32 bytes = 8 MB of reserved address space.
+   The native stack (8 MB, >= 540 bytes per nesting function) runs out first.")
+(defconstant +arm32-hstack-overflow-code+ #x0F0F
+  "Recorded by an overflowing push; %TAKE-PENDING-FAULT turns it into
+   HANDLER-STACK-EXHAUSTED.")
+
+(defvar *arm32-hstack-push-slow-label* nil
+  "While translating: the out-of-line push helper (a frame past the in-memory
+   ones: the extension, or the loud overflow).")
+(defvar *arm32-hstack-pop-ext-label* nil
+  "While translating a hosted Linux module: the pop helper that addresses an
+   extension frame.")
+
+(defun arm32-hstack-overflow-word ()
+  (if (arm32-hosted-layout-p) #x10000CB0 (+ (arm32-hbase) #x360)))
 
 (defun arm32-emit-copy-words (buf from to)
   "Copy the 7 jmpbuf words from [FROM] to [TO] through LR."
@@ -1064,43 +1131,28 @@
   (arm32-dp-reg buf +arm-dp-add+ dst dst depth :shift-type +arm-shift-lsl+ :shift-amt 5))
 
 (defun arm32-emit-handler-push (buf)
-  "Stack the CURRENT jmpbuf.  Leaves r12 = 0 if a frame was stored, 1 if
-   CAPPED.  Preserves r0..r3."
-  (let ((capped (mvm-make-label)) (done (mvm-make-label)))
-    (arm32-push buf +arm32-r1-r3+)
-    (arm32-load-imm32 buf +arm-r3+ (arm32-hdepth-addr))
-    (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
-    (arm32-cmp-imm buf +arm-r2+ 0 (arm32-hstack-max-depth))
-    (arm32-b-cond buf +arm-cc-ge+ capped)
-    (arm32-emit-frame-addr buf +arm-r1+ +arm-r2+)
-    (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
-    (arm32-emit-copy-words buf +arm-r12+ +arm-r1+)
-    (arm32-add-imm buf +arm-r2+ +arm-r2+ 0 1)
-    (arm32-str buf +arm-r2+ +arm-r3+ 0)
-    (arm32-mov-imm buf +arm-r12+ 0 0)
-    (arm32-b buf done)
-    (arm32-emit-label buf capped)
-    (arm32-load-imm32 buf +arm-r3+ (arm32-hcapped-addr))
-    (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
-    (arm32-add-imm buf +arm-r2+ +arm-r2+ 0 1)
-    (arm32-str buf +arm-r2+ +arm-r3+ 0)
-    (arm32-mov-imm buf +arm-r12+ 0 1)
-    (arm32-emit-label buf done)
-    (arm32-pop buf +arm32-r1-r3+)))
+  "Stack the CURRENT jmpbuf.  Always stores it (in memory, or past the
+   in-memory frames through the helper); a frame that cannot be stored does
+   not return here (the loud overflow).  Preserves r0..r3."
+  (arm32-push buf +arm32-r1-r3+)
+  (arm32-load-imm32 buf +arm-r3+ (arm32-hdepth-addr))
+  (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
+  (arm32-emit-frame-addr buf +arm-r1+ +arm-r2+)
+  ;; SIGNED, as before: a real depth is never negative.
+  (arm32-cmp-imm buf +arm-r2+ 0 (arm32-hstack-max-depth))
+  (arm32-emit buf (logior (ash +arm-cc-ge+ 28) #x0B000000))      ; BLGE slow
+  (arm32-emit-fixup buf *arm32-hstack-push-slow-label* :bl)
+  (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
+  (arm32-emit-copy-words buf +arm-r12+ +arm-r1+)
+  (arm32-add-imm buf +arm-r2+ +arm-r2+ 0 1)
+  (arm32-str buf +arm-r2+ +arm-r3+ 0)
+  (arm32-pop buf +arm32-r1-r3+))
 
 (defun arm32-emit-handler-pop (buf)
-  "Absorb a capped push, restore the top stacked frame into the jmpbuf, or zero
-   the jmpbuf when empty.  Preserves r0..r3."
-  (let ((not-capped (mvm-make-label)) (empty (mvm-make-label)) (done (mvm-make-label)))
+  "Restore the top stacked frame into the jmpbuf, or zero the jmpbuf when
+   empty.  Preserves r0..r3."
+  (let ((empty (mvm-make-label)) (done (mvm-make-label)))
     (arm32-push buf +arm32-r1-r3+)
-    (arm32-load-imm32 buf +arm-r3+ (arm32-hcapped-addr))
-    (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
-    (arm32-cmp-imm buf +arm-r2+ 0 0)
-    (arm32-b-cond buf +arm-cc-eq+ not-capped)
-    (arm32-sub-imm buf +arm-r2+ +arm-r2+ 0 1)
-    (arm32-str buf +arm-r2+ +arm-r3+ 0)
-    (arm32-b buf done)
-    (arm32-emit-label buf not-capped)
     (arm32-load-imm32 buf +arm-r3+ (arm32-hdepth-addr))
     (arm32-ldr buf +arm-r2+ +arm-r3+ 0)
     (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
@@ -1109,6 +1161,11 @@
     (arm32-sub-imm buf +arm-r2+ +arm-r2+ 0 1)
     (arm32-str buf +arm-r2+ +arm-r3+ 0)
     (arm32-emit-frame-addr buf +arm-r1+ +arm-r2+)
+    (when *arm32-hstack-pop-ext-label*
+      ;; a frame past the in-memory ones is in the extension
+      (arm32-cmp-imm buf +arm-r2+ 0 (arm32-hstack-max-depth))
+      (arm32-emit buf (logior (ash +arm-cc-ge+ 28) #x0B000000))  ; BLGE ext
+      (arm32-emit-fixup buf *arm32-hstack-pop-ext-label* :bl))
     (arm32-emit-copy-words buf +arm-r1+ +arm-r12+)
     (arm32-b buf done)
     (arm32-emit-label buf empty)
@@ -1117,6 +1174,102 @@
       (arm32-str buf +arm-lr+ +arm-r12+ (* 4 i)))
     (arm32-emit-label buf done)
     (arm32-pop buf +arm32-r1-r3+)))
+
+(defun arm32-emit-hstack-fatal (buf)
+  "Nothing armed at an overflowing push: hosted Linux writes why to stderr and
+   exit_group(70); otherwise UDF.  Never a branch through a zero frame."
+  (if *arm32-linux-mode*
+      (let* ((msg (format nil "~%modus: the handler-frame stack is exhausted (CATCH / UNWIND-PROTECT / HANDLER-CASE nested too deep) and no handler is armed; stopping.~%"))
+             (bytes (map 'vector #'char-code msg))
+             (n (length bytes))
+             (text (mvm-make-label)))
+        (arm32-mov-imm buf +arm-r0+ 0 2)
+        (arm32-emit-pcrel-addr buf +arm-r1+ text)
+        (arm32-load-imm32 buf +arm-r2+ n)
+        (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-write+)
+        (arm32-svc buf)
+        (arm32-mov-imm buf +arm-r0+ 0 70)
+        (arm32-load-imm32 buf +arm-r7+ 248)               ; exit_group
+        (arm32-svc buf)
+        (arm32-emit buf #xE7F000F0)                       ; UDF, unreachable
+        (arm32-emit-label buf text)
+        (loop for i from 0 below n by 4
+              do (arm32-emit buf (loop for k from 0 below 4
+                                       sum (ash (if (< (+ i k) n) (aref bytes (+ i k)) 0)
+                                                (* 8 k))))))
+      (arm32-emit buf #xE7F000F0)))                       ; UDF
+
+(defun arm32-emit-hstack-helpers (buf)
+  "The out-of-line slow paths of ARM32-EMIT-HANDLER-PUSH / -POP; see THE
+   HANDLER-FRAME STACK HAS NO SILENT CEILING (ARM32).
+     push-slow: entered by BLGE with r2 = depth (>= the in-memory frames),
+       r3 = &depth, r1 (dead); returns r1 = the frame's address, every other
+       register but r12 and LR preserved -- or does not return (overflow).
+     pop-ext (hosted Linux): r2 = the frame's index (>= 255); returns
+       r1 = [ext] + (r2-255)*32, every other register but LR preserved."
+  (let ((cap (arm32-hstack-max-depth))
+        (overflow (mvm-make-label)))
+    (arm32-emit-label buf *arm32-hstack-push-slow-label*)
+    (when *arm32-linux-mode*
+      (let ((have (mvm-make-label)) (nolim (mvm-make-label)))
+        (arm32-push buf (logior (ash 1 +arm-r0+) (ash 1 +arm-lr+)))
+        (arm32-load-imm32 buf +arm-r12+ +arm32-hstack-ext-addr+)
+        (arm32-ldr buf +arm-r1+ +arm-r12+ 0)
+        (arm32-cmp-imm buf +arm-r1+ 0 0)
+        (arm32-b-cond buf +arm-cc-ne+ have)
+        ;; first push past the in-memory frames: reserve the extension.
+        ;; mmap2(0, frames*32, PROT_READ|PROT_WRITE,
+        ;;       MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0)
+        (let ((saved (logior (ash 1 +arm-r2+) (ash 1 +arm-r3+) (ash 1 +arm-r4+)
+                             (ash 1 +arm-r5+) (ash 1 +arm-r7+))))
+          (arm32-push buf saved)
+          (arm32-mov-imm buf +arm-r0+ 0 0)
+          (arm32-load-imm32 buf +arm-r1+ (* 32 +arm32-hstack-ext-frames+))
+          (arm32-mov-imm buf +arm-r2+ 0 3)
+          (arm32-load-imm32 buf +arm-r3+ #x4022)
+          (arm32-load-imm32 buf +arm-r4+ #xFFFFFFFF)
+          (arm32-mov-imm buf +arm-r5+ 0 0)
+          (arm32-load-imm32 buf +arm-r7+ +arm-linux-sys-mmap2+)
+          (arm32-svc buf)
+          (arm32-mov buf +arm-r1+ +arm-r0+)
+          (arm32-pop buf saved))
+        (arm32-load-imm32 buf +arm-r12+ #xFFFFF000)
+        (arm32-cmp buf +arm-r1+ +arm-r12+)
+        (arm32-b-cond buf +arm-cc-hi+ overflow)            ; -errno: refused
+        (arm32-load-imm32 buf +arm-r12+ +arm32-hstack-ext-addr+)
+        (arm32-str buf +arm-r1+ +arm-r12+ 0)
+        (arm32-emit-label buf have)
+        (arm32-sub-imm buf +arm-r0+ +arm-r2+ 0 cap)        ; extension index
+        (arm32-load-imm32 buf +arm-r12+ +arm32-hstack-ext-frames+)
+        (arm32-cmp buf +arm-r0+ +arm-r12+)
+        (arm32-b-cond buf +arm-cc-cs+ overflow)
+        ;; the test-only lower limit, when one is set
+        (arm32-load-imm32 buf +arm-r12+ +arm32-hstack-ext-limit-addr+)
+        (arm32-ldr buf +arm-r12+ +arm-r12+ 0)
+        (arm32-cmp-imm buf +arm-r12+ 0 0)
+        (arm32-b-cond buf +arm-cc-eq+ nolim)
+        (arm32-cmp buf +arm-r0+ +arm-r12+)
+        (arm32-b-cond buf +arm-cc-cs+ overflow)
+        (arm32-emit-label buf nolim)
+        (arm32-dp-reg buf +arm-dp-add+ +arm-r1+ +arm-r1+ +arm-r0+
+                      :shift-type +arm-shift-lsl+ :shift-amt 5)
+        (arm32-pop buf (logior (ash 1 +arm-r0+) (ash 1 +arm-pc+)))))
+    ;; ---- the loud overflow: record #x0F0F, longjmp to the armed frame ----
+    (arm32-emit-label buf overflow)
+    (arm32-load-imm32 buf +arm-r12+ (arm32-hstack-overflow-word))
+    (arm32-load-imm32 buf +arm-lr+ +arm32-hstack-overflow-code+)
+    (arm32-str buf +arm-lr+ +arm-r12+ 0)
+    (arm32-emit-longjmp-to-armed buf (lambda () (arm32-emit-hstack-fatal buf)))
+    (when *arm32-hstack-pop-ext-label*
+      (arm32-emit-label buf *arm32-hstack-pop-ext-label*)
+      (arm32-push buf (ash 1 +arm-r0+))
+      (arm32-load-imm32 buf +arm-r0+ +arm32-hstack-ext-addr+)
+      (arm32-ldr buf +arm-r1+ +arm-r0+ 0)
+      (arm32-sub-imm buf +arm-r0+ +arm-r2+ 0 cap)
+      (arm32-dp-reg buf +arm-dp-add+ +arm-r1+ +arm-r1+ +arm-r0+
+                    :shift-type +arm-shift-lsl+ :shift-amt 5)
+      (arm32-pop buf (ash 1 +arm-r0+))
+      (arm32-bx buf +arm-lr+))))
 
 ;;; ============================================================
 ;;; Object tag
@@ -1242,10 +1395,10 @@
              ((= code #x0510)
               ;; SETJMP: stack the outer jmpbuf, save sp / r11 / resume / r4..r7.
               ;; First return NIL (r8); LONGJMP re-enters at RESUME with r0 = T.
-              (let ((skip (mvm-make-label)) (resume (mvm-make-label)))
+              ;; The push always stores (or does not return: the loud
+              ;; overflow), so arming is unconditional.
+              (let ((resume (mvm-make-label)))
                 (arm32-emit-handler-push buf)
-                (arm32-cmp-imm buf +arm-r12+ 0 0)
-                (arm32-b-cond buf +arm-cc-ne+ skip)
                 (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
                 (arm32-str buf +arm-sp+ +arm-r12+ 0)
                 (arm32-str buf +arm-r11+ +arm-r12+ 4)
@@ -1254,11 +1407,10 @@
                 (loop for r in (list +arm-r4+ +arm-r5+ +arm-r6+ +arm-r7+)
                       for i from 3
                       do (arm32-str buf r +arm-r12+ (* 4 i)))
-                (arm32-emit-label buf skip)
                 (arm32-mov buf +arm-r0+ +arm-r8+)             ; first return: NIL
                 (arm32-emit-label buf resume)))
              ((= code #x0511)
-              ;; LONGJMP: copy the jmpbuf aside, zero the capped count, pop,
+              ;; LONGJMP: copy the jmpbuf aside, pop,
               ;; restore, jump with r0 = T.  Nothing armed: UDF, not a jump to 0.
               (arm32-emit-longjmp-to-armed
                buf (lambda () (arm32-emit buf #xE7F000F0))))    ; UDF
@@ -2775,7 +2927,7 @@
   "Unwind to the innermost armed handler-case with r0 = T: TRAP #x0511's body,
    shared with the signal handler #x0520 installs.  Word 0 of the jmpbuf == 0
    is the \"nothing armed\" sentinel; NO-HANDLER-FN emits what happens then.
-   Copies the jmpbuf aside, zeroes the capped count, pops the handler stack,
+   Copies the jmpbuf aside, pops the handler stack,
    restores sp/fp/r4-r7 and jumps to the resume IP."
   (let ((nohandler (mvm-make-label)))
     (arm32-load-imm32 buf +arm-r12+ (arm32-jmpbuf-addr))
@@ -2784,9 +2936,6 @@
     (arm32-b-cond buf +arm-cc-eq+ nohandler)
     (arm32-load-imm32 buf +arm-r1+ (arm32-lj-scratch-addr))
     (arm32-emit-copy-words buf +arm-r12+ +arm-r1+)
-    (arm32-load-imm32 buf +arm-r2+ (arm32-hcapped-addr))
-    (arm32-mov-imm buf +arm-lr+ 0 0)
-    (arm32-str buf +arm-lr+ +arm-r2+ 0)
     (arm32-emit-handler-pop buf)
     (arm32-load-imm32 buf +arm-r12+ (arm32-lj-scratch-addr))
     (loop for r in (list +arm-r4+ +arm-r5+ +arm-r6+ +arm-r7+)
@@ -3112,6 +3261,24 @@
         (arm32-load-imm32 buf +arm-r10+ #x10000000)
         (arm32-load-imm32 buf +arm-r11+ (+ base alloc-start))
         (root-range +arm-r10+ +arm-r11+)
+        ;; ---- the handler-frame extension's live frames (hosted Linux) ----
+        ;; [ext, ext + (depth - 255)*32): a jmpbuf holds r4..r7, which LONGJMP
+        ;; restores (THE HANDLER-FRAME STACK HAS NO SILENT CEILING, ARM32).
+        ;; The in-memory frames are in the low block just scanned.
+        (when *arm32-linux-mode*
+          (let ((none (lbl)))
+            (arm32-load-imm32 buf +arm-r12+ +arm32-hstack-ext-addr+)
+            (arm32-ldr buf +arm-r10+ +arm-r12+ 0)
+            (arm32-cmp-imm buf +arm-r10+ 0 0)
+            (arm32-b-cond buf +arm-cc-eq+ none)
+            (arm32-load-imm32 buf +arm-r12+ (arm32-hdepth-addr))
+            (arm32-ldr buf +arm-r11+ +arm-r12+ 0)
+            (arm32-dp-imm buf +arm-dp-sub+ +arm-r11+ +arm-r11+ 0 (arm32-hstack-max-depth) :s 1)
+            (arm32-b-cond buf +arm-cc-le+ none)
+            (arm32-dp-reg buf +arm-dp-add+ +arm-r11+ +arm-r10+ +arm-r11+
+                          :shift-type +arm-shift-lsl+ :shift-amt 5)
+            (root-range +arm-r10+ +arm-r11+)
+            (here none)))
         ;; ---- Cheney: r10 = object scan (up), r11 = cons scan (down) ----
         (arm32-mov buf +arm-r10+ +arm-r6+)
         (arm32-mov buf +arm-r11+ +arm-r7+)
@@ -3310,6 +3477,8 @@
         *arm32-unimpl-opcodes* nil)
   (let* ((*arm32-v7* v7)
          (*arm32-gc-label* (and (arm32-hosted-layout-p) (mvm-make-label)))
+         (*arm32-hstack-push-slow-label* (mvm-make-label))
+         (*arm32-hstack-pop-ext-label* (and *arm32-linux-mode* (mvm-make-label)))
          (buf (make-arm32-buffer))
          (label-map (make-hash-table :test 'eql))
          (bc bytecode)
@@ -3388,6 +3557,7 @@
       (arm32-emit-divmod buf))
     (when *arm32-gc-label*
       (arm32-emit-gc-collector buf))
+    (arm32-emit-hstack-helpers buf)
 
     ;; Resolve branch fixups
     (arm32-resolve-fixups buf)

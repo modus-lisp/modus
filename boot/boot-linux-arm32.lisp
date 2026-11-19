@@ -48,7 +48,8 @@
 (defconstant +linux-arm32-heap-alloc-start+ #x28000
   "Past the fixed runtime block (#x0000-#x0FFF), the CLI scratch pages
    (#x1000-#x8FFF), the staged argv (#x9000-#x1DFFF) and the handler-frame
-   stack (#x20000-#x21FDF, translate-arm32.lisp ARM32-HFRAMES-ADDR), as on RV32.")
+   stack (#x20000-#x21FDF, translate-arm32.lisp ARM32-HFRAMES-ADDR, and its
+   extension's address / test-limit words at #x21FF0 / #x21FF4), as on RV32.")
 (defconstant +linux-arm32-gc-midpoint+ #x7C00000)
 (defconstant +linux-arm32-gc-guard+ #x400000
   "4 MB past the heap: :gc-check tests the alloc pointer before an allocation

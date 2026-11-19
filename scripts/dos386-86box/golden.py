@@ -109,8 +109,12 @@ class Golden:
             if self.family(s):
                 return s
             t = s.text() if s.ok else ''
+            combo = re.search(r'Ctrl[-_+ ]?Alt[-_+ ]?(Esc|Ins|S)\b[^\n]*SETUP', t, re.I)
             m = re.search(r'<?(DEL|F1|F2|ESC|F10)>?\s*(?:key\s*)?(?:to|for|if you want to)\s*(?:enter\s*|run\s*)?(?:the\s*)?SETUP', t, re.I)
-            if m:
+            if combo:
+                self.log('POST asks for Ctrl-Alt-' + combo.group(1))
+                b.combo('ctrl', 'alt', combo.group(1).lower() if len(combo.group(1)) > 1 else 's')
+            elif m:
                 self.log('POST asks for %s' % m.group(1))
                 b.keys(m.group(1).lower(), gap=300)
             elif re.search(r'RUN SETUP UTILITY', t) and re.search(r'F1>?\s*to\s*RESUME', t):
@@ -135,6 +139,8 @@ class Golden:
             return 'award6'
         if 'WRITE TO CMOS AND EXIT' in t:
             return 'amihiflex'
+        if 'BIOS Utility' in t and 'Load Setup Default Settings' in t:
+            return 'acer'
         if 'Alt+H' in t and 'Optimal' in t:
             return 'winbios'
         if re.search(r'F10\s*:?\s*(Save|Exit)|Save\s*&\s*Exit|Exit Saving Changes|Save Values', t, re.I):
@@ -249,6 +255,27 @@ class Golden:
         b.keys('esc', gap=1500)
         self.snap('exit dialog')
         b.keys('enter', gap=1000)              # Save changes and Exit
+        self.done.append('saved')
+
+    def acer(self):
+        """Acer's BIOS Utility: a list; Esc is "exit and reboot"."""
+        b = self.b
+        if b.goto(r'Load Setup Default Settings'):
+            b.keys('enter', gap=1000)
+            s = self.snap('defaults prompt')
+            if s.search(r'\(Y/N\)'):
+                self.answer_yes()
+            else:
+                b.goto(r'\bYes\b')
+                b.keys('enter', gap=1500)
+            self.done.append('defaults')
+        b.keys('esc', gap=1000)
+        s = self.snap('exit prompt')
+        if s.search(r'\(Y/N\)'):
+            self.answer_yes()
+        else:
+            b.goto(r'\bYes\b')
+            b.keys('enter', gap=1500)
         self.done.append('saved')
 
     def generic(self):

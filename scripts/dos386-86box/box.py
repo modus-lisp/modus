@@ -15,7 +15,7 @@ KEYS = {'esc': 0x01, 'enter': 0x1C, 'space': 0x39, 'tab': 0x0F, 'y': 0x15, 'n': 
         'f7': 0x41, 'f8': 0x42, 'f9': 0x43, 'f10': 0x44, 'f11': 0x57, 'f12': 0x58, 'del': 0x153,
         'up': 0x148, 'down': 0x150, 'left': 0x14B, 'right': 0x14D,
         'pgup': 0x149, 'pgdn': 0x151, 'home': 0x147, 'end': 0x14F,
-        'plus': 0x4E, 'minus': 0x4A, 'lshift': 0x2A}
+        'plus': 0x4E, 'minus': 0x4A, 'lshift': 0x2A, 'ctrl': 0x1D, 'alt': 0x38, 'ins': 0x152}
 for i, ch in enumerate('1234567890'):
     KEYS[ch] = 0x02 + i
 for row, base in (('qwertyuiop', 0x10), ('asdfghjkl', 0x1E), ('zxcvbnm', 0x2C)):
@@ -165,6 +165,18 @@ class Box:
                 self.step(gap)
         if self.log:
             self.log('keys ' + ' '.join(map(str, names)))
+
+    def combo(self, *names, gap=300):
+        """Hold the keys down in order, then let them go in reverse."""
+        codes = [KEYS[n.lower()] for n in names]
+        for c in codes:
+            self('key down 0x%x' % c)
+        for c in reversed(codes):
+            self('key up 0x%x' % c)
+        if gap:
+            self.step(gap)
+        if self.log:
+            self.log('combo ' + '+'.join(names))
 
     def wait_screen(self, pred, timeout_ms, poll_ms=500):
         """Run until PRED(screen) is true; the screen, or None at the timeout."""

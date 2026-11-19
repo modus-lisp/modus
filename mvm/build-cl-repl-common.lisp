@@ -3857,6 +3857,19 @@
   ;; MODUS_I386_FIXED_NARGS=1 keeps every store.
   (setf *elide-fixed-nargs*
         (not (equal (sb-ext:posix-getenv "MODUS_I386_FIXED_NARGS") "1")))
+  ;; Live temps are not saved around a call (the 68k's *CALL-TEMPS-SURVIVE*):
+  ;; on i386 V4 is EBX, which every prologue saves, and V5.. are slots in the
+  ;; caller's own frame, so a callee cannot clobber them.  ~170,000 PUSH/POP
+  ;; pairs.  MODUS_I386_CALL_TEMPS=save keeps them.
+  (setf *call-temps-survive*
+        (not (equal (sb-ext:posix-getenv "MODUS_I386_CALL_TEMPS") "save")))
+  ;; and the 68k's two other compiler-side savings: a type-error arm passes its
+  ;; type as a small integer, a quoted symbol's miss arm its slot index alone
+  ;; (MODUS_TYPE_ERROR_CODES=0 / MODUS_STATIC_SYMBOL_SHORT_MISS=0 turn them off)
+  (unless (equal (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES") "0")
+    (setf *type-error-codes* (make-hash-table :test 'equal)))
+  (unless (equal (sb-ext:posix-getenv "MODUS_STATIC_SYMBOL_SHORT_MISS") "0")
+    (setf *static-symbol-short-miss* t))
   (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~@[; x87~]~%"
           (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))))
 

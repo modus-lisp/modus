@@ -89,7 +89,7 @@
            ;; the browser stack (weft, shuttle, loom) reaches for these
            "FLOAT-NAN-P" "FLOAT-INFINITY-P" "GET-TIME-OF-DAY"
            "MAKE-WEAK-POINTER" "WEAK-POINTER-VALUE" "PARSE-NATIVE-NAMESTRING"
-           "WITH-TIMEOUT" "TIMEOUT"))
+           "WITH-TIMEOUT" "TIMEOUT" "GET-BYTES-CONSED"))
 
 ;;; SB-UNICODE: the one name shuttle's regular expressions use (\p{...}).
 (defpackage "SB-UNICODE"
@@ -600,6 +600,23 @@
     (ignore-errors (finish-output *standard-output*))
     (ignore-errors (finish-output *error-output*)))
   (%cli-exit unix-status))
+
+;;; SB-EXT:GET-BYTES-CONSED -- bytes allocated since boot.  The hosted x86-64
+;;; collector keeps the count of every finished cycle in one word
+;;; (translate-x64.lisp +X64-BYTES-CONSED-ADDR+, #x10000D38, stored <<1 so the
+;;; :U64 read is the number); the cycle in progress is the active region's
+;;; allocation pointer above its from-space start (region block +0, stored raw,
+;;; so its :U64 read is half the address).  PARTIAL: another thread's region
+;;; contributes what its finished collections consed, not its current cycle.
+;;; Elsewhere the collector keeps no such word, and this SIGNALS rather than
+;;; answering 0: a "nothing was allocated" reading passes every allocation
+;;; bound a test asserts.
+(defun sb-ext:get-bytes-consed ()
+  (unless (and (member :x86-64 *features*) (member :linux *features*))
+    (error "sb-ext:get-bytes-consed: this modus image does not count allocation ~
+            (hosted x86-64 Linux only)."))
+  (+ (mem-ref #x10000D38 :u64)
+     (- (get-alloc-ptr) (* 2 (mem-ref (%gc-region) :u64)))))
 
 (defun sb-ext:gc (&rest options)
   "Force one collection of THIS thread\'s active region.  :FULL and :GEN are

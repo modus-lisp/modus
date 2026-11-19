@@ -413,6 +413,19 @@
 (defconstant +x64-gen-tenure-req+    #x10000C88)   ; young from/to/size, <<1
 (defconstant +x64-gen-card-root+     #x10000D88)   ; the card vector, TAGGED
 
+;;; BYTES CONSED (SB-EXT:GET-BYTES-CONSED, net/sb-sys-shim.lisp).  One process-
+;;; global word, stored <<1 so a plain (mem-ref addr :u64) reads it as a fixnum:
+;;; the bytes consed before the last collection, NET of what that collection
+;;; left at the bottom of from-space.  Every collection ADDs, at entry, what its
+;;; region had allocated (R12 - from_start), and SUBtracts, at exit, the base
+;;; the next cycle starts from (new R12 - new from_start: the survivors copied
+;;; there, which were counted once already).  So consed-since-boot is this word
+;;; plus the active region's (R12 - from_start) now.  Hosted Linux only (a bare
+;;; image emits neither site), LOCKed because two regions can collect at once.
+;;; #x10000D38 sat unclaimed between the deadline flag (D30) and the web quote
+;;; vector (D40); outside the per-thread window (compiler %TLS-WINDOW-OFFSET-P).
+(defconstant +x64-bytes-consed-addr+ #x10000D38)
+
 (defun %gen-abs-op (buf opcode reg addr)
   "OPCODE REG, qword [ADDR] (absolute disp32): 8B mov, 2B sub, 3B cmp, 03 add."
   (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
@@ -9754,6 +9767,15 @@
     ;; share this one load of the region base; scan_word pushes/pops RDX, so it
     ;; survives the whole scan exactly as before.
     (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+)
+    ;; BYTES CONSED, entry half: += (R12 - from_start) << 1.  R12 is still the
+    ;; allocation pointer here (promo-setup below reuses it); RSI is free until
+    ;; the stack scan.  See +X64-BYTES-CONSED-ADDR+.
+    (when *x64-linux-mode*
+      (emit-bytes buf #x4C #x89 #xE6)              ; mov rsi, r12
+      (emit-bytes buf #x48 #x29 #xDE)              ; sub rsi, rbx
+      (emit-bytes buf #x48 #xD1 #xE6)              ; shl rsi, 1
+      (emit-bytes buf #xF0 #x48 #x01 #x34 #x25)    ; lock add [abs32], rsi
+      (emit-u32 buf +x64-bytes-consed-addr+))
     ;; GENERATIONAL: R12/R14 for this collection, and the point a major's phase
     ;; 2 runs the collection again from, with new geometry (RBX/RCX/R13 and the
     ;; block's to_start set by EMIT-X64-MAJOR-STEP).
@@ -10065,6 +10087,17 @@
       (emit-shr-reg-imm buf 'rcx 7)                  ; byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
+
+    ;; BYTES CONSED, exit half: -= (new R12 - new from_start) << 1, the
+    ;; survivors the next cycle's count starts above.  RSI = this region's
+    ;; block; RAX and R11 are restored by the epilogue.
+    (when *x64-linux-mode*
+      (emit-bytes buf #x4C #x89 #xE0)              ; mov rax, r12
+      (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-from-start+)
+      (emit-sub-reg-reg buf 'rax 'r11)
+      (emit-bytes buf #x48 #xD1 #xE0)              ; shl rax, 1
+      (emit-bytes buf #xF0 #x48 #x29 #x04 #x25)    ; lock sub [abs32], rax
+      (emit-u32 buf +x64-bytes-consed-addr+))
 
     ;; ---- Increment THIS REGION's collection count ----
     ;; inc qword [rsi + gc_count].  Per-region, so "how many times has region N

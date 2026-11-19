@@ -713,6 +713,8 @@
 (defvar *i386-shared-subtag-label* nil)
 (defvar *i386-shared-arraylen-label* nil)
 (defvar *i386-shared-allocobj-label* nil)
+(defvar *i386-shared-addslow-label* nil)
+(defvar *i386-shared-subslow-label* nil)
 (defun i386-shared-routines-p ()
   (not (equal (sb-ext:posix-getenv "MODUS_I386_SHARED") "0")))
 (defvar *i386-handler-pop-label* nil)
@@ -5734,8 +5736,19 @@
                ;; translation): degrade to plain wrapping arithmetic, exactly
                ;; like translate-x64's fallback branch.
                (i386-store-vreg buf vd +scratch1+)
-               (let ((done (i386-make-label)))
+               (let ((done (i386-make-label))
+                     (shared (and (member kind '(:add :sub))
+                                  (if (eq kind :add) *i386-shared-addslow-label*
+                                      *i386-shared-subslow-label*))))
                  (i386-emit-jcc buf :no done)
+                (if shared
+                 ;; ---- overflow slow path, shared: ECX = vb and EDX the
+                 ;; wrapped result, from which the routine recovers va ----
+                 (progn
+                   (i386-emit-call-rel32 buf shared)
+                   (i386-emit-label buf done)
+                   (i386-store-vreg buf vd +scratch1+))
+                (progn
                  ;; ---- overflow slow path ----
                  ;; va/vb are still intact: the fast path touched only ECX/EDX.
                  (i386-load-vreg buf +scratch0+ va)         ; ECX = va
@@ -5758,7 +5771,7 @@
                  (i386-emit-pop-reg buf +i386-edi+)
                  (i386-emit-pop-reg buf +i386-esi+)
                  (i386-emit-label buf done)
-                 (i386-store-vreg buf vd +scratch1+)))))
+                 (i386-store-vreg buf vd +scratch1+)))))))
 
         ;; ================================================================
         ;; IEEE 64-bit float arithmetic — SSE2 lowering (#200/#201).
@@ -6260,7 +6273,9 @@
             *i386-shared-cons-label* (and shared (i386-make-label))
             *i386-shared-subtag-label* (and shared (i386-make-label))
             *i386-shared-arraylen-label* (and shared (i386-make-label))
-            *i386-shared-allocobj-label* (and shared (i386-make-label))))
+            *i386-shared-allocobj-label* (and shared (i386-make-label))
+            *i386-shared-addslow-label* (and shared (i386-make-label))
+            *i386-shared-subslow-label* (and shared (i386-make-label))))
     ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
     ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
     ;; (REPL/SSH, which have no handler-case) byte-identical; those images are
@@ -6563,7 +6578,35 @@
   (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
   (i386-emit-or-reg-imm buf +scratch0+ +tag-object+)
   (i386-emit-pop-reg buf +i386-eax+)
-  (i386-emit-ret buf))
+  (i386-emit-ret buf)
+  ;; :add-checked / :sub-checked's overflow: ECX = vb, EDX = the wrapped
+  ;; result; va is EDX - ECX (add) or EDX + ECX (sub).  GENERIC-ADD /
+  ;; -SUBTRACT with V0 = va, V1 = vb, nargs 2 and the CALLER's V2/V3 (its
+  ;; frame: EBP is still the caller's here) -> EDX; EAX is the result too,
+  ;; exactly as the inline slow path leaves it.
+  (loop for (label op gen) in (list (list *i386-shared-addslow-label* :sub *i386-genadd-label*)
+                                    (list *i386-shared-subslow-label* :add *i386-gensub-label*))
+        do (i386-emit-label buf label)
+           (when gen
+             (if (eq op :sub)
+                 (i386-emit-sub-reg-reg buf +scratch1+ +scratch0+)
+                 (i386-emit-add-reg-reg buf +scratch1+ +scratch0+))
+             (i386-emit-push-reg buf +i386-esi+)
+             (i386-emit-push-reg buf +i386-edi+)
+             (i386-emit-mov-reg-reg buf +i386-esi+ +scratch1+)
+             (i386-emit-mov-reg-reg buf +i386-edi+ +scratch0+)
+             (i386-emit-byte buf #xC7)
+             (i386-emit-byte buf (i386-modrm #b00 0 5))
+             (i386-emit-u32 buf *nargs-addr*)
+             (i386-emit-u32 buf 2)
+             (i386-emit-push-mem buf +i386-ebp+ -20)
+             (i386-emit-push-mem buf +i386-ebp+ -16)
+             (i386-emit-call-rel32 buf gen)
+             (i386-emit-add-reg-imm buf +i386-esp+ 8)
+             (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+             (i386-emit-pop-reg buf +i386-edi+)
+             (i386-emit-pop-reg buf +i386-esi+))
+           (i386-emit-ret buf)))
 
 (defun i386-native-export-labels ()
   "The image routines the native tier links runtime code to, in the order

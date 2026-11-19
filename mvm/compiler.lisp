@@ -27975,6 +27975,11 @@
          ;; A hard 61 made a 30-bit build trust products that overflow.
          (list t (<= rw (- +fixnum-bits+ 1)) rw))))
 
+(defun %fixnum-literal-p (form)
+  "FORM is an integer literal that COMPILE-INTEGER loads as one immediate
+   (its fixnum range, which starts at -(2^62-1): see there)."
+  (and (integerp form) (>= form +fixnum-min+) (<= form +fixnum-max+)))
+
 (defun %leaf-operand-p (form env)
   "True when compiling FORM into a fresh temp register is a pure load that
    cannot disturb any other register or the stack: an integer literal, or a
@@ -27982,8 +27987,14 @@
    symbol-macro, a special, or a global).  Binary-op emitters use this to
    skip the push/pop that otherwise guards the left operand across the
    right operand's compile — the dominant per-op cost in tight loops (the
-   6-tap filter spent 37 push/pop pairs per pixel)."
-  (cond ((integerp form) t)
+   6-tap filter spent 37 push/pop pairs per pixel).
+   ONLY A FIXNUM literal is a leaf.  A literal past the fixnum range is a
+   BIGNUM, which COMPILE-INTEGER conses at run time (:gc-check + :alloc-obj
+   and a temp of its own) and runtime x64 code writes through rax = VR: with
+   DEST = VR the left operand was overwritten, so a compiled
+   (= x #xa129ca6149be45e5) compared the literal against itself-ish garbage
+   and answered NIL (beacon's SipHash reference vector).  %FIXNUM-LITERAL-P."
+  (cond ((integerp form) (%fixnum-literal-p form))
         ((and form (symbolp form) env)
          (let ((b (env-lookup env form)))
            (and b (member (binding-location b) (list :stack :reg)))))
@@ -28731,8 +28742,9 @@
 (defun %lexical-leaf-p (form env)
   "An integer literal or a lexical variable (stack or register binding):
    loading it into a temp touches no other register, so it may be
-   evaluated AFTER a value expression without changing what either sees."
-  (or (integerp form)
+   evaluated AFTER a value expression without changing what either sees.
+   A bignum literal is no leaf: it is consed (see %LEAF-OPERAND-P)."
+  (or (%fixnum-literal-p form)
       (and form (symbolp form)
            (let ((b (env-lookup env form)))
              (and b (member (binding-location b) '(:stack :reg)))))))

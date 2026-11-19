@@ -1982,6 +1982,16 @@
    or 0 when the callee cannot clobber them (*CALL-TEMPS-SURVIVE*)."
   (if (and *call-temps-survive* (not *mvm-eval-runtime-p*)) 0 (min n 12)))
 
+(defvar *elide-fixed-nargs* nil
+  "When T (the 68k builds), an image call to a function whose FINAL definition
+   (*MULTI-SHAPE-DEFUNS* excludes names defined with different lambda lists)
+   takes required parameters only, with exactly that many arguments, stores no
+   count -- %ELIDE-FIXED-NARGS over the finished IR: such a callee never reads it -- only &OPTIONAL / &REST /
+   &KEY prologues and the arity check (*COMPILE-ARITY-CHECK*, excluded) do.
+   ~209,000 call sites, ~4 bytes of 68k each.  Sound where a run-time
+   redefinition does not reach the image's own callers (no call pads: the
+   68k); never under runtime EVAL.")
+
 (defvar *type-error-codes* nil
   "When non-NIL (a hash table, set by a build), an image call
    (%SIGNAL-TYPE-ERROR X 'TYPE) compiles to (%SIGNAL-TYPE-ERROR-K X K): K a
@@ -2556,6 +2566,42 @@
   "Host census: variable-size allocations FUSE-GC-CHECKS could not give a
    size-aware check (no :gc-check right before them).  See the census in
    FUSE-GC-CHECKS.")
+
+(defun %elide-fixed-nargs (ir)
+  "*ELIDE-FIXED-NARGS*: IR without each (:SET-NARGS N) IMMEDIATELY followed by
+   (:CALL NAME N) whose callee's FINAL definition takes exactly N required
+   parameters and nothing else -- such a callee never reads the count.  Run
+   on the finished IR, so every emitter (COMPILE-CALL, the arithmetic slow
+   paths, the global-read and error arms) and every forward reference is
+   covered.  A name defined with different lambda lists (*MULTI-SHAPE-DEFUNS*)
+   or on the arity-check list keeps its count."
+  (let ((out nil))
+    (loop while ir
+          do (let ((insn (pop ir)))
+               (if (and (consp insn) (eq (car insn) :set-nargs)
+                        (consp (car ir)) (eq (car (car ir)) :call)
+                        (eql (second insn) (third (car ir)))
+                        (%nargs-unread-p (second (car ir)) (second insn)))
+                   nil
+                   (push insn out))))
+    (nreverse out)))
+
+(defun %nargs-unread-p (name n)
+  "Whether a call to NAME with N arguments can omit the count (%ELIDE-FIXED-NARGS)."
+  (let* ((key (if (stringp name) name (string name)))
+         (info (%fn-info-for-key key))
+         (bare (let ((c (search "::" key :from-end t))) (if c (subseq key (+ c 2)) key))))
+    (and info
+         (integerp n)
+         (not (function-info-rest-param-p info))
+         (let ((oc (function-info-optional-count info))) (or (null oc) (zerop oc)))
+         (eql (function-info-param-count info) n)
+         (eql (function-info-required-count info) n)
+         (not (%multi-shape-defun-p bare))
+         (not (and *compile-arity-check*
+                   (or (null *compile-arity-check-names*)
+                       (member (string-upcase bare) *compile-arity-check-names*
+                               :test #'string=)))))))
 
 (defun fuse-gc-checks (ir)
   "Peephole: rewrite (:gc-check) IMMEDIATELY followed by an allocation into
@@ -33978,6 +34024,10 @@
     (when *gc-check-fusion-enabled*
       (dolist (entry all-ir)
         (setf (cdr entry) (fuse-gc-checks (cdr entry)))))
+    ;; Phase 2b': calls to fixed-arity functions store no count (*ELIDE-FIXED-NARGS*)
+    (when (and *elide-fixed-nargs* (not *mvm-eval-runtime-p*))
+      (dolist (entry all-ir)
+        (setf (cdr entry) (%elide-fixed-nargs (cdr entry)))))
 
     ;; Phase 2c: drop what the image's entry points do not reach (*IR-DCE-ROOTS*).
     (when *ir-dce-roots*

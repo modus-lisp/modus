@@ -380,6 +380,12 @@
 (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
   (setf modus.mvm::*call-temps-survive*
         (and (not *68k-threaded*) (not (and v (string= v "1"))))))
+;; MODUS_68K_FIXED_NARGS=1: every image call stores its argument count, as on
+;; other targets; otherwise a call to a fixed-arity function does not
+;; (compiler.lisp *ELIDE-FIXED-NARGS*).  Not with threaded code.
+(let ((v (sb-ext:posix-getenv "MODUS_68K_FIXED_NARGS")))
+  (setf modus.mvm::*elide-fixed-nargs*
+        (and (not *68k-threaded*) (not (and v (string= v "1"))))))
 ;; MODUS_TYPE_ERROR_CODES=0: a type-error arm loads its quoted type as before;
 ;; otherwise it passes a small integer (compiler.lisp *TYPE-ERROR-CODES*).
 (let ((v (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES")))

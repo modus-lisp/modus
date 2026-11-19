@@ -16018,10 +16018,22 @@
    metaobjects, building expander closures via %EVAL-EXPANDER-RUNTIME),
    and a definition form never introduces a free reference to an
    enclosing LEXICAL binding that the plain element walk would miss.
-   Cheap prefix test: all of them start with `DEF`."
+   Cheap prefix test: all of them start with `DEF`.
+
+   AT RUNTIME, ONLY CL's OWN.  A user macro that merely starts with DEF is not
+   a definition: shuttle's (DEF-METHOD obj name (this args) body) expands to
+   (PUT obj name (LAMBDA (this args) body)).  Left unexpanded, the LAMBDA was
+   invisible to VARS-MUTATED-IN-LAMBDAS, so a LET variable the method body
+   INCFs was never boxed -- each call bumped its own copy, and every
+   Array Iterator answered {value: a[0], done: false} forever (any JS for-of
+   or spread ran to the 60M-step budget).  Host builds keep the prefix test
+   (no user macros there; their output stays byte-identical)."
   (and (symbolp head)
        (let ((n (symbol-name head)))
-         (and n (>= (length n) 3) (string= n "DEF" :end1 3)))))
+         (and n (>= (length n) 3) (string= n "DEF" :end1 3)
+              (or (not *mvm-eval-runtime-p*)
+                  (null (symbol-package head))
+                  (eq (symbol-package head) (find-package "COMMON-LISP")))))))
 
 (defun %cfv-macroexpand (form)
   "One macroexpansion step of FORM for the FREE-VARIABLE walker, or NIL

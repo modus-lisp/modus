@@ -25258,7 +25258,6 @@
    returns NIL) the value left in DEST is NIL — matches the CLHS
    suggestion that error-recovery should yield a defined value."
   (let ((null-label  (make-compiler-label))
-        (cons-label  (make-compiler-label))
         (error-label (make-compiler-label))
         (done-label  (make-compiler-label))
         (tag-reg     (alloc-temp-reg)))
@@ -25269,8 +25268,9 @@
     (emit-ir :obj-tag tag-reg dest)
     (emit-ir :cmp-imm tag-reg (ash (ct-tag-cons) +fixnum-shift+))
     (emit-ir :bne error-label)
-    ;; Cons path: inline :car / :cdr.
-    (emit-ir-label cons-label)
+    ;; Cons path: inline :car / :cdr -- straight after the BNE, no label
+    ;; between (nothing branches here): the 68k translator then knows DEST is
+    ;; a cons and drops the template's own check (M68K-KNOWN-CONS-P).
     (emit-ir op dest dest)
     (emit-ir :br done-label)
     ;; NIL path.

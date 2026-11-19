@@ -324,8 +324,14 @@
   "Where the last label was placed: the peepholes below never merge across a
    position something may branch to.")
 
+(defvar *68k-insn-history* nil
+  "The last (up to three) MVM instructions translated since the last label,
+   most recent first, as (OPCODE . OPERANDS): straight-line context for
+   M68K-KNOWN-CONS-P.  A label clears it -- a branch may land there.")
+
 (defun m68k-emit-label (buf label-id)
   "Record current position as a branch target."
+  (setq *68k-insn-history* nil)
   (setq *68k-last-label-pos* (m68k-buffer-position buf))
   (setf (gethash label-id (m68k-buffer-labels buf))
         (m68k-buffer-position buf)))
@@ -1673,6 +1679,20 @@
              (setq tail (cdr tail)))
     (decode-instruction *68k-bytecode* pc)))
 
+(defun m68k-known-cons-p (vs)
+  "Whether VS is known to hold a cons here: the three instructions just
+   translated, with no label since, are the compiler's guard (OBJ-TAG T,VS /
+   CMP-IMM T,cons-tag / BNE) -- COMPILE-CXR-GUARD-AND-DEREF puts :CAR / :CDR
+   straight after it.  Never in a threaded handler (*68K-BYTECODE* NIL)."
+  (let ((h *68k-insn-history*))
+    (and *68k-bytecode* (= (length h) 3)
+         (eql (car (first h)) +op-bne+)
+         (eql (car (second h)) +op-cmp-imm+)
+         (eql (third (second h)) (ash +tag-cons+ +fixnum-shift+))
+         (eql (car (third h)) +op-obj-tag+)
+         (eql (second (second h)) (second (third h)))   ; the same temp
+         (eql (third (third h)) vs))))
+
 (defun m68k-li-shr-fold (vd imm next-pc)
   "LI VD,IMM followed by SHR VD,VD,K (K <= 8, not a branch target): the
    compiler's raw-address idiom -- a TAGGED constant shifted to the raw word at
@@ -1706,6 +1726,9 @@
   "Translate a single MVM instruction to 68k native code (then, in front of
    a pending self-call OK label, the second prologue: see *68K-FAST-AT*)."
   (%m68k-translate-insn-1 buf opcode operands mvm-pc label-map function-table)
+  (let ((h *68k-insn-history*))
+    (setq *68k-insn-history*
+          (list* (cons opcode operands) (and h (list (first h) (second h))))))
   (when (and *68k-bytecode* *68k-fast-at* (eql mvm-pc *68k-fast-at*))
     (setq *68k-fast-at* nil)
     (m68k-emit-label buf *68k-fast-label*)
@@ -2644,26 +2667,36 @@
              (vs (second operands)))
          ;; Type check (trap on a non-cons), then the car at the tag-folded
          ;; displacement: -tag(A0) is the cons's first word.
+         (if (m68k-known-cons-p vs)
+             ;; the guard just checked it: no second check, no copy through D0
+             (progn (m68k-load-vreg-to-an buf +68k-a0+ vs)
+                    (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+))
+         (progn
          (m68k-load-vreg buf +68k-d0+ vs)
          (if *68k-car-label*
              (m68k-emit-bsr buf *68k-car-label*)
              (progn
                (m68k-emit-check-cons buf +68k-d0+)
                (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-               (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+)))
+               (m68k-emit-move-disp-dn buf +68k-a0+ (- +tag-cons+) +68k-d0+)))))
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cdr+
        (let ((vd (first operands))
              (vs (second operands)))
          ;; Type check, then the cdr at (4 - tag)(A0)
+         (if (m68k-known-cons-p vs)
+             ;; the guard just checked it: no second check, no copy through D0
+             (progn (m68k-load-vreg-to-an buf +68k-a0+ vs)
+                    (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+))
+         (progn
          (m68k-load-vreg buf +68k-d0+ vs)
          (if *68k-cdr-label*
              (m68k-emit-bsr buf *68k-cdr-label*)
              (progn
                (m68k-emit-check-cons buf +68k-d0+)
                (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-               (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+)))
+               (m68k-emit-move-disp-dn buf +68k-a0+ (- 4 +tag-cons+) +68k-d0+)))))
          (m68k-store-vreg buf vd +68k-d0+)))
 
       (#.+op-cons+

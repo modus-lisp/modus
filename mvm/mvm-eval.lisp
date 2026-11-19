@@ -4254,6 +4254,17 @@
                     ;; name list).
                     (handler-case (%mvm-eval-jit-run %bc %entry %ftl %fnt %rt %lam t nil)
                       (t (c)
+                      ;; A THROW in flight (*CATCH-ACTIVE*) is not the run failing: it is
+                      ;; control leaving for its CATCH, and it goes on -- as every other
+                      ;; catch-all in the image passes one.  Taken for a failure, it was
+                      ;; either re-run interpreted (the form doubled, the flag left set)
+                      ;; or re-signalled as an ERROR; and with *CATCH-ACTIVE* stuck, no
+                      ;; HANDLER-CASE caught an error again (cortez's escape out of a
+                      ;; macro expanded under TI's COMPOSE-AUTOMATIC-METHODS).
+                       (when *catch-active*
+                         (setq *jit-native-ran* %jnr-save)
+                         (setq *jit-infra-fallback* %jif-save)
+                         (%hc-longjmp))
                          (let ((%ran *jit-native-ran*)
                                (%infra *jit-infra-fallback*))
                            ;; Restore the enclosing attempt's flags before we
@@ -4880,6 +4891,12 @@
                                           fn-table rt-table lam-offsets nil
                                           persist-names)
                         (t (c)
+                         ;; A THROW in flight goes on -- see %MVM-EVAL-RUN-TUPLE.
+                         (when *catch-active*
+                           (setq *jit-native-ran* %jnr-saved)
+                           (setq *jit-infra-fallback* %jif-saved)
+                           (setq *e2-active-defun-names* %adn-saved)
+                           (%hc-longjmp))
                            (let ((%ran *jit-native-ran*)
                                  (%infra *jit-infra-fallback*))
                              (setq *jit-native-ran* %jnr-saved)
@@ -5519,7 +5536,9 @@
              (handler-case
                  (let ((tramp (%e2ic-mvm-eval-nocache form)))
                    (if (functionp tramp) tramp nil))
-               (t (c) nil))))))))
+               ;; A compile failure falls back; a THROW in flight (a macroexpand
+               ;; hook leaving the expansion) goes on -- see %MVM-EVAL-RUN-TUPLE.
+               (t (c) (if *catch-active* (%hc-longjmp) nil)))))))))
 
 (defun %e2ic-cached (fn)
   "The per-closure compile cache: slot 5 of the %interp-closure list

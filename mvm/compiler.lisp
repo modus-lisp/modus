@@ -2211,10 +2211,12 @@
   rest-param-p    ; T if function has &rest parameter
   required-count  ; number of required params (before &rest)
   optional-count  ; number of &optional params (between required and &rest)
-  qualified-name) ; #211: "PKG::NAME" when the defun's name symbol has a
+  qualified-name  ; #211: "PKG::NAME" when the defun's name symbol has a
                   ; foldable home package, else NIL.  NAME stays BARE — the
                   ; emitted native FN table and its by-name probes read that.
                   ; See %FN-KEY-PKG-OF / %FN-REGISTER-INFO.
+  (arity nil))    ; (REQUIRED . MAX), MAX NIL for &rest / &key: what the entry
+                  ; check accepts, kept as data for %FUNCTION-ARITY
 
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
@@ -31149,6 +31151,16 @@
                            (let ((q (%fn-key-qualify name bare-name)))
                              (if (equal q bare-name) nil q)))
                     :param-count (length params)
+                    ;; The counts the arity prologue above checks, in its
+                    ;; terms.  After PREPROCESS-PARAMS a &key list is a
+                    ;; REST-SLOT too, so MAX is NIL for both.
+                    :arity (let ((req (cond ((and opt-count (> opt-count 0)) opt-start)
+                                            (rest-slot rest-slot)
+                                            (t (length params)))))
+                             (cons req (cond (rest-slot nil)
+                                             ((and opt-count (> opt-count 0))
+                                              (+ opt-start opt-count))
+                                             (t req))))
                     :bytecode-offset 0
                     :bytecode-length 0
                     :stack-frame-size 0)))

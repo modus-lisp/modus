@@ -2877,8 +2877,13 @@
     (%jit-note-forward name bc fwd)
     (setf (car self)
     (lambda (&rest args)
-      (if (or (car fwd) (<= left 0))
-          (values-list (multiple-value-list (apply (or (car fwd) inner) args)))
+      (cond
+       ;; asked its arity (%FUNCTION-ARITY): the interpreted body's, which is
+       ;; the function's, never by calling the native one it may forward to
+       (*%arity-probe* (funcall inner))
+       ((or (car fwd) (<= left 0))
+          (values-list (multiple-value-list (apply (or (car fwd) inner) args))))
+       (t
           (let* ((t0 (%irt-ns))
                  (vals (multiple-value-list (apply inner args))))
             (setq left (- left 1))
@@ -2889,7 +2894,8 @@
                     (progn (unless (%mvm-on-main-thread-p) (%jit-want fwd))
                            (setq left (%jit-hot-call-threshold) spent 0))
                     (setq left 0))))
-            (values-list vals)))))
+            (values-list vals))))))
+    (%note-trampoline-code (car self))
     (%note-fn-name (car self) name)
     (car self)))
 
@@ -3090,7 +3096,8 @@
 ;;; toplevel form's thunk -- so their code was credited to whichever DEFUN sat
 ;;; below it in the arena (a method body profiled as ASDF::%QUIRK-FLOAT-
 ;;; FEATURES).  Every x64 page now records each function's exact extent,
-;;; (START END NAME), newest first; net/hosted-backtrace.lisp reads it.  Main
+;;; (START END NAME ARITY), newest first; net/hosted-backtrace.lisp reads the
+;;; first three, %FUNCTION-ARITY the fourth.  Main
 ;;; thread only, as the other JIT caches: a worker's conses must not reach a
 ;;; global.  The x64 arena is bump-allocated and never reused, so extents
 ;;; never go stale.
@@ -3102,7 +3109,7 @@
       (dolist (e ft-list)
         (let* ((lbl (gethash (car e) fn-map))
                (p (and lbl (label-position lbl))))
-          (when (integerp p) (setq starts (cons (cons p (car e)) starts)))))
+          (when (integerp p) (setq starts (cons (cons p e) starts)))))
       (setq starts (sort starts (function <) :key (function car)))
       (let ((l starts))
         (loop
@@ -3111,8 +3118,34 @@
                 (e (if (cdr l) (car (car (cdr l))) nlen)))
             (when (< s e)
               (setq *jit-code-map*
-                    (cons (list (+ base s) (+ base e) (cdr (car l))) *jit-code-map*))))
+                    (cons (list (+ base s) (+ base e) (car (cdr (car l)))
+                                (car (cdr (cdr (cdr (cdr (car l)))))))
+                          *jit-code-map*))))
           (setq l (cdr l)))))))
+
+(defun %function-arity (fn)
+  "How many arguments FN takes, as (REQUIRED . MAX) with MAX NIL when it takes
+   any number more (&rest, &key), or NIL when that is not known: image code,
+   and code another thread compiled.  What the entry check of a run-time
+   compiled function accepts, kept as data (FUNCTION-INFO-ARITY) since the
+   check itself is only compare-and-branch code.  A trampoline is asked, not
+   called (*%ARITY-PROBE*); JIT code -- a closure by its slot 0 -- is found in
+   *JIT-CODE-MAP* by its address."
+  (when (functionp fn)
+    (let ((head (ignore-errors (%prim-aref fn 0))))
+      (if (and head (member head *%trampoline-codes* :test (function eq)))
+          (let ((*%arity-probe* t)) (funcall fn))
+          (let* ((scratch (+ (%tls-self-base) (%conv-addr #x100050A0)))
+                 (w (%gc-word-of fn scratch))
+                 (code (if (= (logand w 15) 3)
+                           (- w 3)
+                           (and (functionp head)
+                                (let ((c (%gc-word-of head scratch)))
+                                  (and (= (logand c 15) 3) (- c 3)))))))
+            (when (and code (consp *jit-code-map*))
+              (let ((e (find-if (lambda (e) (and (<= (first e) code) (< code (second e))))
+                                *jit-code-map*)))
+                (and e (= code (first e)) (fourth e)))))))))
 
 ;; translate-x64.lisp's; declared here for the reads below.
 (defvar *x64-jit-shared-gc-tramp*)
@@ -4469,7 +4502,8 @@
             ;; ADAPTER: (name offset length) for translate-mvm-to-x64 — same
             ;; structs, string name.  Reverse-consed then reversed to preserve
             ;; the all-ir order (which is what fn-table indices track too).
-            (setq ft-list (cons (list nm off len) ft-list))
+            (setq ft-list (cons (list nm off len (function-info-arity (car e))) ft-list))
+            (%lam-offsets-note-arity lam-offsets off (function-info-arity (car e)))
             (if (and (or (search "$$LAMBDA" nm) (search "$$CLOSURE" nm))
                      (not (eql off 0)))
                 (puthash off lam-offsets t)
@@ -5190,8 +5224,11 @@
               (setq ft-list
                     (cons (list (string (function-info-name (car e)))
                                 (function-info-bytecode-offset (car e))
-                                (function-info-bytecode-length (car e)))
+                                (function-info-bytecode-length (car e))
+                                (function-info-arity (car e)))
                           ft-list))
+              (%lam-offsets-note-arity lam-offsets (function-info-bytecode-offset (car e))
+                                       (function-info-arity (car e)))
               (let ((nm (string (function-info-name (car e))))
                     (off (function-info-bytecode-offset (car e))))
                 ;; The T vs :DEFUN distinction is now COSMETIC (both entries

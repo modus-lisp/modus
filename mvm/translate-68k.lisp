@@ -329,6 +329,10 @@
    most recent first, as (OPCODE . OPERANDS): straight-line context for
    M68K-KNOWN-CONS-P.  A label clears it -- a branch may land there.")
 
+(defvar *68k-fused-insn* nil
+  "Set by a handler that consumed the next MVM instruction (as (OPCODE .
+   OPERANDS)), so *68K-INSN-HISTORY* still sees it.")
+
 (defun m68k-emit-label (buf label-id)
   "Record current position as a branch target."
   (setq *68k-insn-history* nil)
@@ -1725,10 +1729,13 @@
 (defun m68k-translate-insn (buf opcode operands mvm-pc label-map function-table)
   "Translate a single MVM instruction to 68k native code (then, in front of
    a pending self-call OK label, the second prologue: see *68K-FAST-AT*)."
+  (setq *68k-fused-insn* nil)
   (%m68k-translate-insn-1 buf opcode operands mvm-pc label-map function-table)
-  (let ((h *68k-insn-history*))
-    (setq *68k-insn-history*
-          (list* (cons opcode operands) (and h (list (first h) (second h))))))
+  (flet ((note (e) (let ((h *68k-insn-history*))
+                     (setq *68k-insn-history* (list* e (and h (list (first h) (second h))))))))
+    (note (cons opcode operands))
+    ;; an instruction this one consumed (OBJ-TAG's CMP-IMM) is history too
+    (when *68k-fused-insn* (note *68k-fused-insn*)))
   (when (and *68k-bytecode* *68k-fast-at* (eql mvm-pc *68k-fast-at*))
     (setq *68k-fast-at* nil)
     (m68k-emit-label buf *68k-fast-label*)
@@ -2918,14 +2925,34 @@
                  (m68k-emit-bsr buf *68k-barrier-label*))))))
 
       (#.+op-obj-tag+
-       (let ((vd (first operands))
-             (vs (second operands)))
-         (m68k-load-vreg buf +68k-d0+ vs)
-         (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))  ; AND in 4 bytes, not 6
-         (m68k-emit-and-dn-dn buf +68k-d1+ +68k-d0+)
-         ;; Tag as fixnum: shift left 1
-         (m68k-emit-lsl-imm buf +68k-d0+ 1)
-         (m68k-store-vreg buf vd +68k-d0+)))
+       (let* ((vd (first operands))
+              (vs (second operands))
+              ;; the compiler's tag test: CMP-IMM VD,K next (no label between)
+              (nx (and *68k-bytecode* *68k-label-map*
+                       (< mvm-pc (length *68k-bytecode*))
+                       (null (gethash mvm-pc *68k-label-map*))
+                       (m68k-insn-at mvm-pc)))
+              (k (and nx (eql (car nx) +op-cmp-imm+) (eql (first (cadr nx)) vd)
+                      (logand (%imm32-signed (second (cadr nx))) #xFFFFFFFF)))
+              (ds (m68k-vreg-data-reg vs)))
+         ;; D1 = the tag (MOVEQ mask; AND the operand where it lives), doubled
+         ;; to the fixnum it is, stored to VD.  Fused with that CMP-IMM, the
+         ;; compare is SUBQ / CMPI on D1 -- the same flags for every Bcc --
+         ;; and the CMP-IMM is skipped: ~4 bytes of 68k less at each of the
+         ;; ~40,000 tag tests (CONSP, the CAR / CDR guard ...).
+         (m68k-emit-moveq buf +68k-d1+ (m68k-tag-mask))
+         (if ds
+             (m68k-emit-and-dn-dn buf ds +68k-d1+)
+             (progn (m68k-load-vreg buf +68k-d0+ vs)
+                    (m68k-emit-and-dn-dn buf +68k-d0+ +68k-d1+)))
+         (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d1+)
+         (m68k-store-vreg buf vd +68k-d1+)
+         (when k
+           (cond ((<= 1 k 8) (m68k-emit-subq buf +68k-d1+ k))
+                 ((zerop k) (m68k-emit-tst buf +68k-d1+))
+                 (t (m68k-emit-cmpi buf +68k-d1+ k)))
+           (setq *68k-skip-to* (cddr nx)
+                 *68k-fused-insn* (cons (car nx) (cadr nx))))))
 
       (#.+op-obj-subtag+
        (let ((vd (first operands))

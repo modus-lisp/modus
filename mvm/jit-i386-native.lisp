@@ -27,8 +27,9 @@
 ;;;; The emitter's configuration is the image's own, carried in by %N386-COINIT,
 ;;;; whose body the build writes (translate-i386 I386-NATIVE-COINIT-TEXT).
 ;;;;
-;;;; A DEFUN is translated when it is defined (%RUNTIME-DEFUN-HOOK), and
-;;;; (compile 'f) translates F's module (%JIT-EAGER-ALL).  Anything this cannot
+;;;; A DEFUN is translated at its first call (%RUNTIME-DEFUN-HOOK installs a
+;;;; stub), (compile 'f) at once (%JIT-EAGER-ALL), and a top-level form that
+;;;; builds closures as it runs (%RUNTIME-FORM-NATIVE).  Anything this cannot
 ;;;; do leaves the module interpreted, with the reason in *N386-REFUSED*.
 
 (in-package :modus.mvm)
@@ -469,16 +470,41 @@
       (error (c) (setq *n386-off* t *n386-why* (list :init (princ-to-string c))))))
   (and (boundp (quote *n386-ready*)) *n386-ready* t))
 
+(defun %n386-first-call-stub (nm names orig)
+  "What NM is until it is first called: a stub that translates NM's module
+   (all of NAMES), then forwards -- to NM's native code, or to ORIG, the
+   interpreter trampoline, put back when the module will not translate.  A
+   caller that kept the stub object goes on through it."
+  (let ((box (list nil)) (self (list nil)))
+    (setf (car self)
+          (lambda (&rest args)
+            (unless (car box)
+              (%n386-on-defun names)
+              (let ((now (%n386-current-fn nm)))
+                (if (or (null now) (eq now (car self)))
+                    (progn (%n386-install nm orig) (%n386-refresh (list nm))
+                           (setf (car box) orig))
+                    (setf (car box) now))))
+            (apply (car box) args)))
+    (car self)))
+
 (defun %runtime-defun-hook (names)
-  "mvm-eval's hook (overridden here, last DEFUN wins): every runtime DEFUN is
-   translated as it is defined, unless *N386-OFF*."
+  "mvm-eval's hook (overridden here, last DEFUN wins): a runtime DEFUN is
+   translated at its FIRST CALL, not as it is defined -- the 68k plan's item
+   3 -- so a library's functions that are never called cost nothing, and
+   neither do boot's.  Each name gets %N386-FIRST-CALL-STUB in place of its
+   trampoline.  (compile 'f) translates at once (%JIT-EAGER-ALL)."
   ;; BOUNDP before each read: this runs at every DEFUN from boot on
   (when (and names (not (and (boundp (quote *n386-off*)) *n386-off*))
              (%n386-ready))
-    ;; the new trampolines first: a late-bound caller reaches them even if
-    ;; this module stays interpreted
-    (%n386-refresh names)
-    (%n386-on-defun names)))
+    (let ((m (and *jit-module-registry* (gethash (car names) *jit-module-registry*))))
+      (when (and m (not (%n386-done-p (first m))))
+        (dolist (nm names)
+          (let ((orig (%n386-current-fn nm)))
+            (when orig
+              (%n386-install nm (%n386-first-call-stub nm names orig)))))))
+    ;; a late-bound caller reaches what is installed now
+    (%n386-refresh names)))
 
 ;; Bytecode of a top-level form -> its native thunk.
 (defvar *n386-forms*)

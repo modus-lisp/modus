@@ -472,6 +472,19 @@
     ;; The message log (kmsg / kmsg-dump): a ring per core, appends that never
     ;; allocate.  An image keeps one where its board names a region below.
     (mvm-text "lib/bare-log.lisp")
+    ;; i386: SLEEP on the clock the image has (the PIT's ticks, translate-i386
+    ;; *I386-PIT-CLOCK*) -- bare-sync's %SLEEP-MS is a busy loop sized for one
+    ;; board, which a 486 and a modern PC are not.
+    (if *cl-repl-i386-p*
+        "
+(defun %sleep-ms (ms)
+  (let ((end (+ (rdtsc) (ceiling (* (max ms 0) (cntfrq)) 1000))))
+    (loop (when (>= (rdtsc) end) (return nil))))
+  nil)
+(defun %monotonic-ns ()
+  (floor (* (rdtsc) 1000000000) (cntfrq)))
+"
+        "")
     ;; The Pi's mutex arena: the top of the uncached USB-DMA window, above the
     ;; HDMI console's state and font.  Zeroed by the kernel prologue.
     ;; The Pi's log: 384 KB of the same window, which a board reset does not

@@ -1572,18 +1572,64 @@
   (i386-emit-shl-reg-imm buf +scratch0+ 2)
   (i386-emit-add-reg-reg buf +scratch0+ +scratch1+))
 
+(defun i386-emit-x87-muldiv (buf load-a op-b)
+  "st0 = A * or / B as a correctly rounded DOUBLE, A pushed by LOAD-A and the
+   operation done by OP-B (closures that emit).  Unscaled first: at 53-bit
+   precision with the x87's 15-bit exponent, a result in the double's NORMAL
+   range is rounded once, exactly as SSE2 rounds it.  Only a result whose
+   double has a zero exponent field (a denormal, or an underflow to 0) is redone
+   with the 2^-15360 scaling (I386-EMIT-X87-SCALE), which puts the x87's
+   denormal threshold at the double's.  And if the scaled result is 0 while the
+   unscaled double was not, the FPU cannot hold the scaled intermediate --
+   emulators that run the x87 on host doubles (86Box's default, DOSBox), where
+   2^-15360 underflows -- so the unscaled double stands: their arithmetic was
+   IEEE double already.  Before this every * and / scaled, and on those
+   emulators every product and quotient was 0.0.  Clobbers ECX; EAX is saved
+   around FNSTSW."
+  (let ((normal (i386-make-label)) (done (i386-make-label)))
+    (funcall load-a)
+    (funcall op-b)
+    (when *i386-x87-scale*
+      (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+      (i386-emit-x87-mem buf #xDD 2 +i386-esp+ 0)               ; fst qword [esp]
+      (i386-emit-mov-reg-mem buf +scratch0+ +i386-esp+ 4)
+      (i386-emit-test-reg-imm buf +scratch0+ #x7FF00000)
+      (i386-emit-jcc buf :ne normal)                             ; exponent != 0
+      ;; tiny (or zero): again, scaled
+      (i386-emit-byte buf #xDD) (i386-emit-byte buf #xD8)        ; fstp st0
+      (funcall load-a)
+      (i386-emit-x87-scale buf -15360)
+      (funcall op-b)
+      (i386-emit-x87-scale buf 15360)
+      ;; scaled 0 but unscaled not: an FPU without the extended exponent
+      (i386-emit-byte buf #xD9) (i386-emit-byte buf #xE4)        ; ftst
+      (i386-emit-byte buf #x50)                                  ; push eax
+      (i386-emit-byte buf #xDF) (i386-emit-byte buf #xE0)        ; fnstsw ax
+      (i386-emit-byte buf #x9E)                                  ; sahf
+      (i386-emit-byte buf #x58)                                  ; pop eax
+      (i386-emit-jcc buf :ne normal)                             ; scaled result non-zero
+      (i386-emit-mov-reg-mem buf +scratch0+ +i386-esp+ 4)
+      (i386-emit-and-reg-imm buf +scratch0+ #x7FFFFFFF)
+      (i386-emit-or-reg-mem buf +scratch0+ +i386-esp+ 0)
+      (i386-emit-jcc buf :e normal)                              ; unscaled was 0 too
+      (i386-emit-byte buf #xDD) (i386-emit-byte buf #xD8)        ; fstp st0
+      (i386-emit-x87-mem buf #xDD 0 +i386-esp+ 0)               ; fld qword [esp]
+      (i386-emit-label buf normal)
+      (i386-emit-add-reg-imm buf +i386-esp+ 8))
+    (i386-emit-label buf done)))
+
 (defun i386-translate-x87-float (buf opcode operands)
   "The x87 arm of every float opcode; NIL if OPCODE is not one."
   (macrolet ((op= (sym) `(= opcode ,sym)))
     (cond
       ((or (op= +op-fadd+) (op= +op-fsub+) (op= +op-fmul+) (op= +op-fdiv+))
-       (let ((scale (and *i386-x87-scale* (or (op= +op-fmul+) (op= +op-fdiv+)))))
-         (i386-emit-x87-fld-float buf (second operands))
-         (when scale (i386-emit-x87-scale buf -15360))
-         (i386-emit-x87-op-float buf (cond ((op= +op-fadd+) 0) ((op= +op-fmul+) 1)
-                                           ((op= +op-fsub+) 4) (t 6))
-                                 (third operands))
-         (when scale (i386-emit-x87-scale buf 15360))
+       (let ((rf (cond ((op= +op-fadd+) 0) ((op= +op-fmul+) 1) ((op= +op-fsub+) 4) (t 6))))
+         (if (or (op= +op-fmul+) (op= +op-fdiv+))
+             (i386-emit-x87-muldiv buf
+                                   (lambda () (i386-emit-x87-fld-float buf (second operands)))
+                                   (lambda () (i386-emit-x87-op-float buf rf (third operands))))
+             (progn (i386-emit-x87-fld-float buf (second operands))
+                    (i386-emit-x87-op-float buf rf (third operands))))
          (i386-emit-x87-box-st0 buf (first operands) +i386-float-header+))
        t)
       ((op= +op-fsqrt+)
@@ -1792,11 +1838,11 @@
                 (fa (i386-fpr (second operands)))
                 (fb (i386-fpr (third operands))))
            (if x87
-               (let ((scale (and dbl *i386-x87-scale* (>= k 2))))
-                 (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 fa)                  ; fld A
-                 (when scale (i386-emit-x87-scale buf -15360))
-                 (i386-emit-x87-abs buf (if dbl #xDC #xD8) (aref #(0 4 1 6) k) fb) ; fop B
-                 (when scale (i386-emit-x87-scale buf 15360))
+               (flet ((ld () (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 fa))   ; fld A
+                      (op () (i386-emit-x87-abs buf (if dbl #xDC #xD8) (aref #(0 4 1 6) k) fb)))
+                 (if (and dbl (>= k 2))
+                     (i386-emit-x87-muldiv buf #'ld #'op)
+                     (progn (ld) (op)))
                  (i386-emit-x87-abs buf (if dbl #xDD #xD9) 3 fd))                 ; fstp D
                (let ((pre (if dbl #xF2 #xF3)))
                  (i386-emit-sse-abs buf pre #x10 +i386-xmm0+ fa)                  ; movs? xmm0, A

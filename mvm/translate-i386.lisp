@@ -772,6 +772,7 @@
 
 (defun i386-emit-label (buf label-id)
   "Record current position as a branch target."
+  (setf *i386-last-store* nil)
   (setf (gethash label-id (i386-buffer-labels buf))
         (i386-buffer-position buf)))
 
@@ -2120,16 +2121,29 @@
 ;;;     caller-saved, so VR cannot be live across a call by ABI anyway.
 ;;; If you add an opcode that needs EAX for any OTHER reason, it is a bug.
 
+(defvar *i386-last-store* nil
+  "(position vreg reg) after I386-STORE-VREG stored REG into a memory vreg:
+   a load of that vreg into that register at the same position, with no
+   label there, finds the value already in it (I386-EMIT-LABEL clears it).")
+
 (defun i386-load-vreg (buf scratch vreg)
   "Load virtual register VREG into physical register SCRATCH.
-   If VREG already lives in SCRATCH, no code is emitted.
+   If VREG already lives in SCRATCH, no code is emitted; nor when the last
+   thing emitted stored SCRATCH into VREG (*I386-LAST-STORE*).  VN is NIL, a
+   constant on the hosted layout: an immediate, not a load.
    NB pass +scratch0+/+scratch1+, not +i386-eax+ — see the register
    invariant above."
   (let ((phys (i386-vreg-phys vreg))
-        (abs (i386-vreg-abs-addr vreg)))
+        (abs (i386-vreg-abs-addr vreg))
+        (last *i386-last-store*))
     (cond
       (phys (unless (= phys scratch)
               (i386-emit-mov-reg-reg buf scratch phys)))
+      ((and last (= (first last) (i386-buffer-position buf))
+            (eql (second last) vreg) (eql (third last) scratch))
+       nil)
+      ((and abs (= vreg +vreg-vn+) (i386-hosted-layout-p))
+       (i386-emit-mov-reg-imm buf scratch #xDEAD0001))
       (abs  (i386-emit-mov-reg-abs buf scratch abs))
       (t    (i386-emit-mov-reg-mem buf scratch +i386-ebp+ (i386-spill-offset vreg))))))
 
@@ -2140,8 +2154,10 @@
     (cond
       (phys (unless (= phys scratch)
               (i386-emit-mov-reg-reg buf phys scratch)))
-      (abs  (i386-emit-mov-abs-reg buf abs scratch))
-      (t    (i386-emit-mov-mem-reg buf +i386-ebp+ (i386-spill-offset vreg) scratch)))))
+      (abs  (i386-emit-mov-abs-reg buf abs scratch)
+            (setf *i386-last-store* (list (i386-buffer-position buf) vreg scratch)))
+      (t    (i386-emit-mov-mem-reg buf +i386-ebp+ (i386-spill-offset vreg) scratch)
+            (setf *i386-last-store* (list (i386-buffer-position buf) vreg scratch))))))
 
 (defun i386-vreg-or-scratch (buf vreg scratch)
   "If VREG has a physical register, return it.
@@ -3157,9 +3173,10 @@
            ;; handler path.  CLEAR-HANDLER (#x0512) keeps the bracket — there
            ;; EAX holds the handler-case BODY's result and must be preserved,
            ;; which is exactly what the bracket does.
-           (let ((eax-is-result (member code *i386-eax-live-traps*)))
-           (unless eax-is-result
-             (i386-emit-push-reg buf +i386-eax+))
+           (let* ((eax-is-result (member code *i386-eax-live-traps*))
+                  (after-push (progn (unless eax-is-result
+                                       (i386-emit-push-reg buf +i386-eax+))
+                                     (i386-buffer-position buf))))
            (cond
              ((frame-enter-code-p code)
               ;; Frame-enter: nparams (the prologue reserved the frame).
@@ -4088,18 +4105,30 @@
                   (incf (gethash (+ #x10000 code) tbl 0))))
               (unless (member code *i386-safe-nop-traps*)
                 (i386-emit-unimpl-trap buf code))))
+           ;; a trap that emitted nothing (most frame-enters): take the PUSH
+           ;; back rather than follow it with a POP
            (unless eax-is-result
-             (i386-emit-pop-reg buf +i386-eax+)))))
+             (if (= (i386-buffer-position buf) after-push)
+                 (decf (i386-buffer-position buf))
+                 (i386-emit-pop-reg buf +i386-eax+))))))
 
         ;; ============================================
         ;; Data Movement
         ;; ============================================
         ((op= +op-mov+)
          ;; (mov Vd Vs) -- route through load/store helpers for VA/VL/VN safety
-         (let ((vd (first operands))
-               (vs (second operands)))
-           (i386-load-vreg buf +scratch0+ vs)
-           (i386-store-vreg buf vd +scratch0+)))
+         ;; Straight between them when either side is a register (a vreg in
+         ;; a register is EAX/EBX/ESI/EDI, and writing EAX is legal exactly
+         ;; when Vd is VR); through ECX only memory to memory.
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (pd (i386-vreg-phys vd))
+                (ps (i386-vreg-phys vs)))
+           (cond ((eql vd vs) nil)
+                 (pd (i386-load-vreg buf pd vs))
+                 (ps (i386-store-vreg buf vd ps))
+                 (t (i386-load-vreg buf +scratch0+ vs)
+                    (i386-store-vreg buf vd +scratch0+)))))
 
         ((op= +op-li+)
          ;; (li Vd imm64) -- on i386, truncate to low 32 bits
@@ -6038,6 +6067,7 @@
                        do (i386-emit-nop buf))))
           do (let ((fn-label (aref fn-labels i)))
                (flet ((translate-body ()
+                        (setf *i386-last-store* nil)
                         (let ((state (make-i386-translate-state
                                       :buf buf
                                       :mvm-bytes bytecode

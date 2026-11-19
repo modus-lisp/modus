@@ -520,9 +520,23 @@
   ;; PEEPHOLE: MOVE.L Dd,d16(An) just emitted -> Dd already holds it.
   (let ((ls *68k-last-store*))
     (when (and ls (eq (first ls) buf) (= (second ls) (m68k-buffer-word-count buf))
-               (equal (cddr ls) (list an disp dn)) (m68k-peephole-ok-p buf))
+               (eql (third ls) an) (eql (fourth ls) disp) (m68k-peephole-ok-p buf))
+      ;; the same register: nothing; another: a register move (2 bytes, not 4)
+      (unless (eql (fifth ls) dn)
+        (m68k-emit-move-dn-dn buf (fifth ls) dn))
       (return-from m68k-emit-move-disp-dn nil)))
   (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-dn+ dn +ea-mode-an-disp+ an))
+  (m68k-emit-word buf (logand disp #xFFFF)))
+
+(defun m68k-emit-move-disp-disp (buf src-an src-disp dst-an dst-disp)
+  "MOVE.L d16(As), d16(Ad) -- memory to memory, 6 bytes"
+  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-disp+ dst-an +ea-mode-an-disp+ src-an))
+  (m68k-emit-word buf (logand src-disp #xFFFF))
+  (m68k-emit-word buf (logand dst-disp #xFFFF)))
+
+(defun m68k-emit-push-disp (buf an disp)
+  "MOVE.L d16(An), -(SP) -- 4 bytes"
+  (m68k-emit-word buf (m68k-encode-move-word 2 +ea-mode-an-predec+ +68k-a7+ +ea-mode-an-disp+ an))
   (m68k-emit-word buf (logand disp #xFFFF)))
 
 (defun m68k-emit-move-dn-disp (buf dn an disp)
@@ -2294,9 +2308,9 @@
               (m68k-emit-push-dn buf (m68k-reg-number ps)))
              ((and ps (eq (m68k-reg-type ps) :address))
               (m68k-emit-push-an buf (m68k-reg-number ps)))
+             ;; spilled: straight from its frame slot (4 bytes, not 6)
              (t
-              (m68k-load-vreg buf +68k-d0+ vs)
-              (m68k-emit-push-dn buf +68k-d0+))))))
+              (m68k-emit-push-disp buf +68k-a6+ (m68k-spill-offset vs)))))))
 
       (#.+op-pop+
        (let ((vd (first operands)))
@@ -2972,8 +2986,15 @@
                (if (<= -32768 disp 32767)
                    (progn
                      (m68k-load-vreg-to-an buf +68k-a0+ vobj)
-                     (m68k-load-vreg buf +68k-d1+ vs)
-                     (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ disp))
+                     ;; from VS where it lives: its data register, or its frame
+                     ;; slot memory to memory (6 bytes, not 4 + 4 through D1)
+                     (let ((ds (m68k-vreg-data-reg vs)))
+                       (cond (ds (m68k-emit-move-dn-disp buf ds +68k-a0+ disp))
+                             ((null (m68k-vreg-phys vs))
+                              (m68k-emit-move-disp-disp buf +68k-a6+ (m68k-spill-offset vs)
+                                                        +68k-a0+ disp))
+                             (t (m68k-load-vreg buf +68k-d1+ vs)
+                                (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ disp)))))
                    (progn
                      (m68k-load-vreg buf +68k-d0+ vobj)
                      (m68k-emit-subi buf +68k-d0+ +tag-object+)

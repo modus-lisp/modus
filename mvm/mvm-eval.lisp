@@ -450,9 +450,19 @@
                 (not (string-equal hn "DEFSTRUCT"))
                 (%macro-expander (car f) (normalize-name (car f))))
            acc)
+          ;; A LOOK, not an expansion of the program: %QUIET-MACROEXPAND-1, the
+          ;; compiler's own look-ahead, which expands with the hook at FUNCALL
+          ;; behind a barrier and passes a THROW in flight on.  This was
+          ;; (handler-case (macroexpand-1-mvm f) (t (c) (cons f nil))), through
+          ;; the user's *MACROEXPAND-HOOK*: a hook that leaves an expansion by
+          ;; THROW (cortez carries a missing name out that way) threw from HERE,
+          ;; the catch-all took the throw for a failure and returned, and
+          ;; *CATCH-ACTIVE* stayed set -- after which no HANDLER-CASE in the
+          ;; image caught an ERROR again: each passed it on as a throw in
+          ;; flight, out of the whole LOAD.  The hook sees the one real
+          ;; expansion, COMPILE-FORM's, as on SBCL.
           (t
-           (let ((ex (handler-case (macroexpand-1-mvm f)
-                       (t (c) (cons f nil)))))
+           (let ((ex (or (%quiet-macroexpand-1 f) (cons f nil))))
              (if (cdr ex)
                  (%e2-scan-persist (car ex) acc (+ depth 1))
                  acc)))))))

@@ -4563,6 +4563,15 @@
       (multiple-value-bind (x p) (%macroexpand-1-mvm-raw form)
         (declare (ignore p))
         x)))
+  ;; A user's *MACROEXPAND-HOOK* is called on EVERY expansion (CLHS
+  ;; MACROEXPAND-1), so while one is in effect nothing is answered from the
+  ;; memo: an entry made by a look that ran with the hook at FUNCALL (the
+  ;; compiler's own, and EVAL's pre-scan) would hand COMPILE-FORM its
+  ;; expansion without the hook ever seeing the form -- and a hook that
+  ;; carries a missing name out by THROW never got to throw.
+  (when (and (consp form)
+             (let ((h *macroexpand-hook*)) (and h (not (eq h 'funcall)))))
+    (return-from macroexpand-1-mvm (%macroexpand-1-mvm-raw form)))
   (if (not (consp form))
       (%macroexpand-1-mvm-raw form)
       (let* ((k (progn (%mexp-memo-sync) (%form-key form)))

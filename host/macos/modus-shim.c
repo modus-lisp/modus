@@ -954,7 +954,7 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
     case 1030: case 1031: case 1032:                                    // the keychain, random bytes (modus-keychain.m)
         return modus_keychain_call(nr, a0, a1, a2);
 #if TARGET_OS_IPHONE
-    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007:   // screen, input, copy (host/ios/modus-ui.m)
+    case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // screen, input, copy, frame clock (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);
     case 1040:   // the Objective-C runtime: a frame in the image's memory (host/ios/modus-objc.m)
         return modus_objc_call(a0);

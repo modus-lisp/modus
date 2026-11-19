@@ -9,6 +9,10 @@
 //   1002 FILL  xy wh rgb    fill [x,x+w)×[y,y+h) with 0xRRGGBB, clipped;
 //                           xy = x | y<<16, wh = w | h<<16
 //   1003 PRESENT            show the buffer (coalesced on the main thread)
+//   1008 WAIT-FRAME ms      block until the display's next refresh (a CADisplayLink
+//                           tick), or MS milliseconds at most; 0 = ticked, 1 = timed out.
+//                           A frame loop paced by this draws once per refresh, in step
+//                           with the screen, instead of guessing with a sleep.
 //   1004 NEXT-EVENT         the oldest event: type<<40 | y<<20 | x for a touch,
 //                           type 1 down / 2 move / 3 up; type<<40 | keysym for
 //                           a key, type 4 (an X11 keysym: Latin-1 as itself,
@@ -28,12 +32,17 @@
 //                           (the part of the screen that changed); 0 means w.
 //
 // The buffer is the screen at SCALE (2) pixels per point, XRGB 32-bit, drawn
-// with nearest-neighbour filtering.  Filling is native, so interpreted Lisp
+// with nearest-neighbour filtering.  IT IS AN IOSURFACE, the view's layer's contents:
+// FILL and BLIT write into it and PRESENT only tells Core Animation it changed.  It used
+// to be a malloc'd buffer copied into a fresh CGImage on every present -- the whole
+// screen, 12.6 MB on an iPhone 15 Pro, on the main thread, for a change of a few rows.  Filling is native, so interpreted Lisp
 // only decides WHAT to draw.  Every call waits until UIKit has put the view
 // up, because the image thread starts before UIApplicationMain.
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <IOSurface/IOSurfaceRef.h>
+#import <QuartzCore/QuartzCore.h>
 #include <os/lock.h>
 #include <stdint.h>
 #include <string.h>
@@ -47,6 +56,9 @@ static long ui_scale = 2;
 
 static uint32_t *fb;
 static long fb_w, fb_h;
+static long fb_stride;             // the surface's row length in pixels (rows are padded)
+static IOSurfaceRef fb_surface;
+static dispatch_semaphore_t frame_tick;   // signalled by the display link once a refresh
 static dispatch_semaphore_t ui_ready;
 static dispatch_once_t ui_once;
 static UIView *fb_view;
@@ -174,6 +186,25 @@ static uint32_t keysym_for(uint32_t cp) {
 
 static UIWindow *window;
 
+static CADisplayLink *frame_link;
+static volatile int frame_banked;
+@interface ModusFrameTicker : NSObject
+- (void)tick:(CADisplayLink *)link;
+@end
+@implementation ModusFrameTicker
+- (void)tick:(CADisplayLink *)link {
+    (void)link;
+    if (!__atomic_exchange_n(&frame_banked, 1, __ATOMIC_ACQ_REL)) dispatch_semaphore_signal(frame_tick);
+}
+@end
+
+static long wait_frame(long ms) {
+    if (!frame_tick) return -38;
+    long r = dispatch_semaphore_wait(frame_tick, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ms > 0 ? ms : 1) * 1000000));
+    __atomic_store_n(&frame_banked, 0, __ATOMIC_RELEASE);
+    return r ? 1 : 0;
+}
+
 // Called by the shim's scene delegate, on the main thread, when UIKit connects the
 // scene.  iOS 27 traps an app that runs on the legacy app-delegate lifecycle, so the
 // window belongs to a UIWindowScene and not to the application.
@@ -183,7 +214,20 @@ void modus_ui_start(void *scene) {
     if (ui_scale < 1) ui_scale = 1;
     fb_w = (long)b.size.width * UI_SCALE;
     fb_h = (long)b.size.height * UI_SCALE;
-    fb = calloc((size_t)(fb_w * fb_h), 4);
+    {
+        NSDictionary *props = @{ (id)kIOSurfaceWidth: @(fb_w), (id)kIOSurfaceHeight: @(fb_h),
+                                 (id)kIOSurfaceBytesPerElement: @4,
+                                 (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA') };
+        fb_surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    }
+    if (fb_surface) {
+        fb = (uint32_t *)IOSurfaceGetBaseAddress(fb_surface);
+        fb_stride = (long)IOSurfaceGetBytesPerRow(fb_surface) / 4;
+        memset(fb, 0, IOSurfaceGetAllocSize(fb_surface));
+    } else {
+        fb = calloc((size_t)(fb_w * fb_h), 4);
+        fb_stride = fb_w;
+    }
     window = [[UIWindow alloc] initWithWindowScene:(__bridge UIWindowScene *)scene];
     window.frame = b;
     UIViewController *vc = [[UIViewController alloc] init];
@@ -191,10 +235,17 @@ void modus_ui_start(void *scene) {
     v.multipleTouchEnabled = YES;
     v.backgroundColor = UIColor.blackColor;
     v.layer.magnificationFilter = kCAFilterNearest;
+    if (fb_surface) v.layer.contents = (__bridge id)fb_surface;
     vc.view = v;
     window.rootViewController = vc;
     [window makeKeyAndVisible];
     fb_view = v;
+    // THE FRAME CLOCK: a display link signals FRAME_TICK once a refresh (60 or 120 Hz), and
+    // WAIT-FRAME waits on it.  At most one tick is banked, so a slow frame does not let the
+    // next ones run back to back.
+    frame_tick = dispatch_semaphore_create(0);
+    frame_link = [CADisplayLink displayLinkWithTarget:[ModusFrameTicker new] selector:@selector(tick:)];
+    [frame_link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     dispatch_semaphore_signal(ui_ready);
 }
 
@@ -210,6 +261,21 @@ static void present(void) {
     if (__atomic_exchange_n(&present_pending, 1, __ATOMIC_ACQ_REL)) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         __atomic_store_n(&present_pending, 0, __ATOMIC_RELEASE);
+        if (fb_surface) {
+            // CALayer's -setContentsChanged: re-read the surface it already shows.  Not in the iOS SDK's
+            // headers (it is in macOS's), so asked for by name; a layer without it is given the surface
+            // again, which Core Animation also takes as new contents.
+            CALayer *l = fb_view.layer;
+            SEL sel = NSSelectorFromString(@"setContentsChanged");
+            if ([l respondsToSelector:sel]) {
+                ((void (*)(id, SEL))[l methodForSelector:sel])(l, sel);
+            } else {
+                [CATransaction begin]; [CATransaction setDisableActions:YES];
+                l.contents = nil; l.contents = (__bridge id)fb_surface;
+                [CATransaction commit];
+            }
+            return;
+        }
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGContextRef cx = CGBitmapContextCreate(fb, (size_t)fb_w, (size_t)fb_h, 8, (size_t)fb_w * 4, cs,
                                                 kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
@@ -226,7 +292,7 @@ static long fill(long xy, long wh, long rgb) {
     if (y + h > fb_h) h = fb_h - y;
     uint32_t c = (uint32_t)rgb & 0xFFFFFF;
     for (long j = 0; j < h; j++) {
-        uint32_t *row = fb + (y + j) * fb_w + x;
+        uint32_t *row = fb + (y + j) * fb_stride + x;
         for (long i = 0; i < w; i++) row[i] = c;
     }
     return 0;
@@ -238,7 +304,7 @@ static long blit(long src, long wh, long xy, long stride) {
     long cw = x + w > fb_w ? fb_w - x : w, ch = y + h > fb_h ? fb_h - y : h;
     const uint64_t *s = (const uint64_t *)(uintptr_t)src;
     for (long j = 0; j < ch; j++) {
-        uint32_t *row = fb + (y + j) * fb_w + x;
+        uint32_t *row = fb + (y + j) * fb_stride + x;
         const uint64_t *in = s + j * (stride > 0 ? stride : w);
         for (long i = 0; i < cw; i++) row[i] = (uint32_t)(in[i] >> 1) & 0xFFFFFF;
     }
@@ -250,9 +316,16 @@ int64_t modus_ui_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3
     wait_ui();
     switch (nr) {
     case 1001: return a0 == 0 ? fb_w : a0 == 1 ? fb_h : UI_SCALE;
-    case 1002: return fill(a0, a1, a2);
+    case 1002: { if (fb_surface) IOSurfaceLock(fb_surface, 0, NULL);
+                 long r = fill(a0, a1, a2);
+                 if (fb_surface) IOSurfaceUnlock(fb_surface, 0, NULL);
+                 return r; }
     case 1003: present(); return 0;
-    case 1005: return blit(a0, a1, a2, a3);
+    case 1005: { if (fb_surface) IOSurfaceLock(fb_surface, 0, NULL);
+                 long r = blit(a0, a1, a2, a3);
+                 if (fb_surface) IOSurfaceUnlock(fb_surface, 0, NULL);
+                 return r; }
+    case 1008: return wait_frame(a0);
     case 1007: {   // copy: the UTF-8 bytes at a0, a1 long, onto the pasteboard
         NSString *s = [[NSString alloc] initWithBytes:(const void *)a0 length:(NSUInteger)a1
                                              encoding:NSUTF8StringEncoding];

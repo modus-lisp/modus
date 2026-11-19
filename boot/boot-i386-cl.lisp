@@ -27,6 +27,13 @@
 ;;;;
 ;;;; The image's end comes from its own Multiboot header's load_end_addr, which
 ;;;; the build patches once the image is written (build-cl-repl-common.lisp).
+;;;;
+;;;; A SAVED CORE may follow the image inside load_end (scripts/dos386-core.py):
+;;;; the low block, the heap and the bitmap slices as boot init left them.  With
+;;;; paging on, the stub copies them into place when the heap's live part fits
+;;;; below this machine's allocation limit, sets #x8024, and keeps the core's
+;;;; allocation pointer and collection count; kernel-main then skips boot init
+;;;; (%CORE-REQUESTED-P).  The core's pages stay mapped and unused.
 
 (in-package :modus.mvm)
 
@@ -47,6 +54,12 @@
 (defconstant +i386-cl-v-b+      #x8018 "one bitmap's bytes")
 (defconstant +i386-cl-v-bm1+    #x801C)
 (defconstant +i386-cl-v-bm2+    #x8020)
+(defconstant +i386-cl-v-core+   #x8024
+  "1 when the stub restored a saved core (%CORE-REQUESTED-P reads it), else 0.")
+(defconstant +i386-cl-v-hdr+    #x8030 "The core's header (physical = virtual).")
+(defconstant +i386-cl-cmdline+  #x8200
+  "The Multiboot command line, copied here by the stub (255 bytes, NUL-ended).")
+(defconstant +i386-cl-core-data+ 64 "The core's header bytes; its data follow.")
 (defconstant +i386-cl-boot-stack+ #x8F000 "Below the IDT at #x90000.")
 (defconstant +i386-cl-tick-addr+ #x8100
   "The PIT's tick count (100 Hz), kept by the timer interrupt: the clock
@@ -66,7 +79,8 @@
     (i386l-assemble
      buf
      (append
-      (list '(#xFA))                                          ; cli
+      (list '(#xFA) '(#xFC)                                   ; cli, cld
+            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 0)))
       ;; the FPU: SSE2's OS bits, or x87 at 53-bit precision (MODUS_I386_FP=x87,
       ;; which runs where there is no CR4 to write -- a 386 or 486), or for
       ;; the soft-float image (MODUS_I386_SOFT_FLOAT, a 486SX or a 386 with no
@@ -90,6 +104,18 @@
                  #x0F #x22 #xE0))))
       (list
        (i386cl-abs '(#x89 #x1D) #x500)                        ; mov [0x500], ebx  (the info)
+       ;; the command line, to #x8200 before anything is allocated: QEMU puts
+       ;; it just past the image, where the page tables are about to go
+       (append (i386cl-abs '(#xC6 #x05) +i386-cl-cmdline+) '(#x00))   ; mov byte [cmdline], 0
+       '(#xF6 #x03 #x04) '(:j8 #x74 cmd-done)                ; test byte [ebx], 4
+       '(#x8B #x73 #x10)                                      ; mov esi, [ebx+16]
+       (cons #xBF (i386l-le32-list +i386-cl-cmdline+))
+       (cons #xB9 (i386l-le32-list 255))
+       '(:label cmd-next)
+       '(#xAC) '(#xAA) '(#x84 #xC0) '(:j8 #x74 cmd-done)      ; lodsb, stosb, test al, al
+       '(#x49) '(:j8 #x75 cmd-next)                           ; dec ecx, jnz
+       '(#xC6 #x07 #x00)                                      ; mov byte [edi], 0
+       '(:label cmd-done)
        (cons #xBC (i386l-le32-list +i386-cl-boot-stack+))     ; mov esp, boot stack
        ;; RAM end = 1 MB + mem_upper KB; the image's end from its header
        '(#x8B #x43 #x08)                                      ; mov eax, [ebx+8]
@@ -184,6 +210,44 @@
        '(:j8 #xEB paged)                                      ; serialise
        '(:label paged)
        (cons #xBC (i386l-le32-list (- +i386-cl-stack-top+ 16)))   ; mov esp, stack top
+       ;; ---- a SAVED CORE (scripts/dos386-core.py): the heap boot init built,
+       ;; appended to the image.  The file's last 16 bytes are 'MODUSCOR' and
+       ;; the header's physical address; the header is 'MCOR', the version, the
+       ;; allocation pointer, the heap bytes from #x19000000 and one bitmap
+       ;; slice's bytes, then at +64 the low block, the heap, both slices.
+       ;; Taken only if it fits below this machine's allocation limit (a
+       ;; smaller machine boots cold).  The words the hosted writes below set
+       ;; from THIS machine's sizes are written after it, as on a cold boot.
+       (i386cl-abs '(#xA1) (+ +i386-cl-load-addr+ 20))        ; mov eax, [load_end]
+       (cons #x3D (i386l-le32-list (+ +i386-cl-load-addr+ 64)))  ; long enough?
+       '(:jcc32 #x72 no-core)                                 ; jb
+       (cons #x81 (cons #x78 (cons #xF0 (i386l-le32-list #x55444F4D))))  ; cmp [eax-16], 'MODU'
+       '(:jcc32 #x75 no-core)
+       (cons #x81 (cons #x78 (cons #xF4 (i386l-le32-list #x524F4353))))  ; cmp [eax-12], 'SCOR'
+       '(:jcc32 #x75 no-core)
+       '(#x8B #x58 #xF8)                                      ; mov ebx, [eax-8]
+       (cons #x81 (cons #x3B (i386l-le32-list #x524F434D)))   ; cmp [ebx], 'MCOR'
+       '(:jcc32 #x75 no-core)
+       (cons #x83 '(#x7B #x04 #x01))                          ; cmp dword [ebx+4], 1
+       '(:jcc32 #x75 no-core)
+       ;; fits: alloc pointer < heap + S/2 - M (this machine's VL)
+       (i386cl-abs '(#xA1) +i386-cl-v-s+) '(#xD1 #xE8)        ; eax = S/2
+       (cons #x05 (i386l-le32-list +i386-cl-heap-va+))
+       (i386cl-abs '(#x2B #x05) +i386-cl-v-m+)
+       '(#x39 #x43 #x08)                                      ; cmp [ebx+8], eax
+       '(:jcc32 #x73 no-core)                                 ; jae
+       (i386cl-abs '(#x89 #x1D) +i386-cl-v-hdr+)
+       (list #x8D #x73 +i386-cl-core-data+)                   ; lea esi, [ebx+64]
+       (cons #xBF (i386l-le32-list +i386-cl-low-va+))
+       (cons #xB9 (i386l-le32-list (floor +i386-cl-low-size+ 4))) '(#xF3 #xA5)   ; rep movsd
+       (cons #xBF (i386l-le32-list +i386-cl-heap-va+))
+       '(#x8B #x4B #x0C) '(#xC1 #xE9 #x02) '(#xF3 #xA5)       ; heap bytes
+       (i386cl-abs '(#x8B #x3D) +i386-cl-v-bm1+)
+       '(#x8B #x4B #x10) '(#xC1 #xE9 #x02) '(#xF3 #xA5)       ; bitmap slice 1
+       (i386cl-abs '(#x8B #x3D) +i386-cl-v-bm2+)
+       '(#x8B #x4B #x10) '(#xC1 #xE9 #x02) '(#xF3 #xA5)       ; bitmap slice 2
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 1))
+       '(:label no-core)
        ;; ---- what the hosted stub does after its mmaps (boot-linux-i386) ----
        (i386cl-abs '(#xA1) +i386-cl-v-s+)
        (i386cl-abs '(#xA3) +linux-i386-heap-total-addr+)
@@ -211,6 +275,15 @@
        (i386cl-abs '(#xA3) (+ g #x1C)) (i386cl-abs '(#xA3) #x10000E18)
        (i386cl-abs '(#xA1) +i386-cl-v-bm2+)
        (i386cl-abs '(#xA3) (+ g #x20)) (i386cl-abs '(#xA3) #x10000E40)
+       ;; a restored core: its allocation pointer, and its collection count
+       ;; (memos keyed on the GC epoch were made at the same addresses)
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-core+) '(#x01))   ; cmp [core], 1
+       '(:jcc32 #x75 core-done)
+       (i386cl-abs '(#x8B #x1D) +i386-cl-v-hdr+)
+       '(#x8B #x43 #x08) (i386cl-abs '(#xA3) (+ g #x00))
+       (cons #x8B (cons #x83 (i386l-le32-list (+ +i386-cl-core-data+ (- +gc-count-addr+ +i386-cl-low-va+)))))
+       (i386cl-abs '(#xA3) +gc-count-addr+)
+       '(:label core-done)
        '(:jmp32 0 past-subroutines))
       ;; ---- subroutines (physical addresses: called with paging off) ----
       ;; alloc: ECX bytes (page-rounded) -> EAX = PA.  Clobbers ECX, EDX.

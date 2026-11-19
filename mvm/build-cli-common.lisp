@@ -2750,6 +2750,57 @@
   "Arch source placed after the CL runtime, the compiler and mvm-eval (see the
    slot in *FULL-SOURCE*).  A build may bind it first to add its own.")
 
+;;; MODUS_SHAKE=1 (mvm/build-shake.lisp): the DEFUNs nothing reaches are left
+;;; out, before the scanners register every DEFUN by name and so make each one
+;;; reachable.  Off by default: every other build is byte-identical.
+(when (let ((v (sb-ext:posix-getenv "MODUS_SHAKE"))) (and v (string= v "1")))
+  (unless (fboundp '%nc-form-spans)
+    (load (merge-pathnames "build-no-compiler.lisp" *load-truename*)))
+  (load (merge-pathnames "build-shake.lisp" *load-truename*))
+  (let* ((vars (remove-if-not
+                #'boundp
+                '(*prelude-source* *softfloat-source* *gc-source* *mcgc-pin-source*
+                  *rt-source* *rtest-pkg-source* *rt-macros-source* *bridge-source*
+                  *cli-arch-override-source* *cli-native-bulk-source*
+                  *cli-hosted-actors-source* *isa-source* *interp-source*
+                  *stage1-test-source* *compiler-source* *stage2-float-override*
+                  *opcode-table-init-source* *fasl-source* *fasl-fingerprint-source*
+                  *mvm-eval-canonical-source* *cli-arch-jit-translator-source*
+                  *stage2-test-source* *cli-bare-metal-net-source* *genera-source*
+                  *sb-gray-source* *sb-shim-source* *asdf-source*
+                  *deferred-surfaces-source* *no-compiler-source* *driver-source*
+                  *jit-boot-source* *configuration-source* *cli-arch-late-source*)))
+         (before (reduce #'+ vars :key (lambda (v) (length (symbol-value v)))))
+         (emitted (%nc-emitted-callee-roots
+                   (remove-if-not #'probe-file
+                                  (mapcar (lambda (f) (merge-pathnames f *modus-base*))
+                                          (list "mvm/compiler.lisp" "mvm/cross.lisp"
+                                                (format nil "mvm/translate-~(~A~).lisp" *cli-arch*))))))
+         (roots (let ((r (list "KERNEL-MAIN")) (h (make-hash-table :test #'equal)))
+                  (do-external-symbols (s "COMMON-LISP") (push (symbol-name s) r))
+                  ;; and the de-facto APIs portable code calls: the MOP
+                  ;; (ENSURE-CLASS, CLASS-DIRECT-SUBCLASSES ...) and SBCL's
+                  ;; extensions (ADD-PACKAGE-LOCAL-NICKNAME ...), by the host's lists
+                  (dolist (p '("SB-MOP" "SB-EXT"))
+                    (do-external-symbols (s p) (push (symbol-name s) r)))
+                  (dolist (e emitted)
+                    (if (consp e)
+                        (pushnew (second e) *shake-kept-prefixes* :test #'string=)
+                        (push e r)))
+                  ;; the image-configuration text (generated, not a component)
+                  (%shake-add-tokens (modus.image-config:image-configuration-text) h)
+                  (%shake-add-tokens (%extra-source-text) h)
+                  (maphash (lambda (k v) (declare (ignore v)) (push k r)) h)
+                  r)))
+    (multiple-value-bind (texts removed) (%shake-defuns (mapcar #'symbol-value vars) roots)
+      (mapc #'set vars texts)
+      (format t "~&;; MODUS_SHAKE: ~D DEFUNs left out; image source ~D -> ~D chars~%"
+              (length removed) before (reduce #'+ vars :key (lambda (v) (length (symbol-value v)))))
+      (let ((f (sb-ext:posix-getenv "MODUS_SHAKE_LIST")))
+        (when (and f (plusp (length f)))
+          (with-open-file (o f :direction :output :if-exists :supersede)
+            (dolist (n removed) (write-line n o))))))))
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *configuration-source* (string #\Newline)

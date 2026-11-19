@@ -691,6 +691,7 @@
 (defvar *i386-shared-cons-label* nil)
 (defvar *i386-shared-subtag-label* nil)
 (defvar *i386-shared-arraylen-label* nil)
+(defvar *i386-shared-allocobj-label* nil)
 (defun i386-shared-routines-p ()
   (not (equal (sb-ext:posix-getenv "MODUS_I386_SHARED") "0")))
 (defvar *i386-handler-pop-label* nil)
@@ -4504,17 +4505,7 @@
          ;; With type check: verify low 4 bits == 0x01
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           ;; Type check — VR-PRESERVING: value in ECX, tag scratch in EDX
-           (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-           (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch1+ +tag-cons+)
-           (let ((ok-label (i386-make-label)))
-             (i386-emit-jcc buf :e ok-label)
-             (i386-emit-int3 buf)   ; trap on non-cons
-             (i386-emit-label buf ok-label))
-           ;; Strip tag, load car (word 0)
-           (i386-emit-sub-reg-imm buf +scratch0+ +tag-cons+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)
+           (i386-emit-cons-field buf 0)
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-cdr+)
@@ -4522,17 +4513,7 @@
          ;; cdr at [ptr - tag + 4] = [ptr - 1 + 4] = [ptr + 3]
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           ;; Type check — VR-PRESERVING: value in ECX, tag scratch in EDX
-           (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-           (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-           (i386-emit-cmp-reg-imm buf +scratch1+ +tag-cons+)
-           (let ((ok-label (i386-make-label)))
-             (i386-emit-jcc buf :e ok-label)
-             (i386-emit-int3 buf)
-             (i386-emit-label buf ok-label))
-           ;; Strip tag, load cdr (word 1 = offset 4 on 32-bit)
-           (i386-emit-sub-reg-imm buf +scratch0+ +tag-cons+)
-           (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 4)
+           (i386-emit-cons-field buf 4)
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-cons+)
@@ -4690,6 +4671,14 @@
          ;; Header word at [VA]: (count << 8) | subtag  (matches x64 format)
          ;; Result = VA | object_tag, advance VA by aligned size
          (let ((vd (first operands)) (count (second operands)) (subtag (third operands)))
+          (if *i386-shared-allocobj-label*
+           ;; header in ECX, size in EDX; the tagged object back in ECX
+           (progn
+             (i386-emit-mov-reg-imm buf +scratch0+ (logior (ash count 8) subtag))
+             (i386-emit-mov-reg-imm buf +scratch1+ (logand (+ (* (1+ count) 4) 15) (lognot 15)))
+             (i386-emit-call-rel32 buf *i386-shared-allocobj-label*)
+             (i386-store-vreg buf vd +scratch0+))
+          (progn
            (i386-emit-mov-reg-abs buf +scratch1+ *va-addr*)
            (i386-emit-mov-mem-imm buf +scratch1+ 0
                                   (logior (ash count 8) subtag))
@@ -4723,7 +4712,7 @@
            (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
            (i386-emit-gc-mark-start buf +scratch1+)      ; object-start only
            (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
-           (i386-store-vreg buf vd +scratch1+)))
+           (i386-store-vreg buf vd +scratch1+)))))
 
         ((op= +op-alloc-array+)
          ;; (alloc-array Vd Vcount) — dynamic array allocation
@@ -5918,7 +5907,8 @@
       (setf *i386-shared-gccheck-label* (and shared (i386-make-label))
             *i386-shared-cons-label* (and shared (i386-make-label))
             *i386-shared-subtag-label* (and shared (i386-make-label))
-            *i386-shared-arraylen-label* (and shared (i386-make-label))))
+            *i386-shared-arraylen-label* (and shared (i386-make-label))
+            *i386-shared-allocobj-label* (and shared (i386-make-label))))
     ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
     ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
     ;; (REPL/SSH, which have no handler-case) byte-identical; those images are
@@ -6044,6 +6034,22 @@
         *i386-pit-clock* tick-addr)
   (i386-set-globals-base globals-base))
 
+(defun i386-emit-cons-field (buf offset)
+  "ECX = the word at OFFSET (0 car, 4 cdr) of the cons in ECX, or INT3 when
+   ECX is not a cons.  Clobbers EDX.  11 bytes, where the old form (copy, AND,
+   CMP, then SUB) was 16 at each of ~17,000 sites:
+     lea edx,[ecx-1] ; test dl,15 ; jz ok ; int3 ; ok: mov ecx,[edx+OFFSET]"
+  (i386-emit-byte buf #x8D) (i386-emit-byte buf #x51)
+  (i386-emit-byte buf (logand (- +tag-cons+) #xFF))       ; lea edx, [ecx-1]
+  (i386-emit-byte buf #xF6) (i386-emit-byte buf #xC2)
+  (i386-emit-byte buf +tag-mask+)                         ; test dl, 15
+  (i386-emit-byte buf #x74) (i386-emit-byte buf #x01)     ; jz +1
+  (i386-emit-int3 buf)
+  (if (zerop offset)
+      (progn (i386-emit-byte buf #x8B) (i386-emit-byte buf #x0A))          ; mov ecx, [edx]
+      (progn (i386-emit-byte buf #x8B) (i386-emit-byte buf #x4A)
+             (i386-emit-byte buf offset))))                                ; mov ecx, [edx+4]
+
 (defun i386-emit-subtag-body (buf)
   "ECX = the object's subtag as a fixnum, or 0 when ECX is not an object
    pointer (or is T).  Clobbers EDX.  The :obj-subtag arm, inline or shared."
@@ -6124,6 +6130,22 @@
   (i386-emit-ret buf)
   (i386-emit-label buf *i386-shared-arraylen-label*)
   (i386-emit-arraylen-body buf)
+  (i386-emit-ret buf)
+  ;; alloc-obj: header in ECX, size (16-aligned) in EDX -> the tagged object
+  ;; in ECX; clobbers EDX, keeps EAX.  The payload and alignment tail get the
+  ;; fill word walking down from the end, as the inline form's wide case.
+  (i386-emit-label buf *i386-shared-allocobj-label*)
+  (i386-emit-push-reg buf +i386-eax+)
+  (i386-emit-mov-reg-abs buf +i386-eax+ *va-addr*)
+  (i386-emit-mov-mem-reg buf +i386-eax+ 0 +scratch0+)    ; header
+  (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+  (i386-emit-add-reg-reg buf +scratch0+ +scratch1+)       ; new VA
+  (i386-emit-mov-abs-reg buf *va-addr* +scratch0+)
+  (i386-emit-fill-range buf +scratch0+ +i386-eax+ :obj)
+  (i386-emit-gc-mark-start buf +i386-eax+)                ; object-start only
+  (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+  (i386-emit-or-reg-imm buf +scratch0+ +tag-object+)
+  (i386-emit-pop-reg buf +i386-eax+)
   (i386-emit-ret buf))
 
 (defun i386-native-export-labels ()

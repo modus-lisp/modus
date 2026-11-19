@@ -5332,7 +5332,8 @@
         (setq top (subseq (sort top #'> :key #'cdr) 0 (min 8 (length top))))
         (setq island-targets
               (append (list *68k-barrier-a0-label* *68k-barrier-label* *68k-cons-label*
-                            *68k-alloc-obj-label* *68k-gc-label*)
+                            *68k-alloc-obj-label* *68k-gc-label* *68k-array-len-label*
+                            *68k-subtag-label*)
                       (loop for (off . nil) in top
                             for l = (gethash off label-map) when l collect l)))))
 

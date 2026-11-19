@@ -6010,6 +6010,17 @@
 ;;; (boot/boot-i386-cl.lisp, scripts/dos386-core.py).
 (defvar *i386-boot-tail* nil)
 
+(defun i386-layout-group (entry)
+  "0 hot, 1 cold (bytecode offset >= *COLD-PC*), 2 boot-only (between
+   *BOOT-TAIL-PC* and *COLD-PC*): the order the image's functions are
+   translated in."
+  (let ((off (second entry))
+        (tail modus.mvm::*boot-tail-pc*)
+        (cold modus.mvm::*cold-pc*))
+    (cond ((and cold (>= off cold)) 1)
+          ((and tail (>= off tail)) 2)
+          (t 0))))
+
 (defun i386-emit-resident-routines (buf)
   "The code emitted once after the image's resident functions: the GC
    trampoline, the shared routines, the handler-case helpers."
@@ -6080,12 +6091,15 @@
   ;; THE BOOT-ONLY TAIL: the table comes in compile order, so the functions
   ;; the compiler laid out last (bytecode offset >= *BOOT-TAIL-PC*) are
   ;; translated last, the rest keeping their order; see *I386-BOOT-TAIL*.
-  (when modus.mvm::*boot-tail-pc*
-    (let ((pc modus.mvm::*boot-tail-pc*))
-      (setf function-table
-            (stable-sort (copy-list function-table) #'<
-                         :key (lambda (e) (if (>= (second e) pc) 1 0))))))
+  ;; With a keep list (compiler.lisp *COLD-KEEP*) the compiler lays out hot,
+  ;; boot-only, cold; translated here as hot, cold, boot-only, so the code a
+  ;; demand-paged image pages ([native start, tail start)) is contiguous and
+  ;; the tail is still last.
+  (when (or modus.mvm::*boot-tail-pc* modus.mvm::*cold-pc*)
+    (setf function-table
+          (stable-sort (copy-list function-table) #'< :key #'i386-layout-group)))
   (let* ((buf (make-i386-buffer))
+         (routines-done nil)
          (n-functions (length function-table))
          (fn-labels (make-array n-functions))
          (fn-map (make-hash-table :test 'equal))
@@ -6154,10 +6168,14 @@
           for fn-offset = (second entry)
           for fn-length = (third entry)
           do (progn
-               (when (and modus.mvm::*boot-tail-pc* (not *i386-boot-tail*)
-                          (>= fn-offset modus.mvm::*boot-tail-pc*))
-                 (i386-emit-resident-routines buf)
-                 (setf *i386-boot-tail* (cons (i386-current-pos buf) nil)))
+               ;; the collector and shared routines after the hot functions,
+               ;; the tail's start before the first boot-only one
+               (let ((group (i386-layout-group entry)))
+                 (when (and (>= group 1) (not routines-done))
+                   (i386-emit-resident-routines buf)
+                   (setf routines-done t))
+                 (when (and (= group 2) (not *i386-boot-tail*))
+                   (setf *i386-boot-tail* (cons (i386-current-pos buf) nil))))
                ;; Function-entry alignment.  With *i386-fn-tag-3* on, :fn-addr
                ;; OR-3s the entry address, so the low nibble must be 0 at the
                ;; RUNTIME virtual address — hence padding is computed against
@@ -6211,7 +6229,7 @@
     (i386-op-bytes-write)
     ;; the collector and the shared routines, unless the boot-only tail came
     ;; first (then they are already in front of it)
-    (unless *i386-boot-tail*
+    (unless routines-done
       (i386-emit-resident-routines buf))
     (when *i386-boot-tail*
       (setf (cdr *i386-boot-tail*) (i386-current-pos buf)))

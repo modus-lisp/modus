@@ -3875,6 +3875,20 @@
   ;; *I386-BOOT-TAIL*): a restored core lays its heap over them.  The range
   ;; goes to OUT.tail for scripts/dos386-core.py.  MODUS_BOOT_TAIL=0: off.
   (setf *boot-tail-last* (not (equal (sb-ext:posix-getenv "MODUS_BOOT_TAIL") "0")))
+  ;; MODUS_I386_COLD_KEEP=FILE (scripts/dos386-coverage.py's output): the
+  ;; functions a REPL session entered are translated first, the rest after
+  ;; them (compiler.lisp *COLD-KEEP*), so a demand-paged image's working set
+  ;; is a few pages (scripts/dos386-core.py, boot-i386-cl.lisp).
+  (let ((f (sb-ext:posix-getenv "MODUS_I386_COLD_KEEP")))
+    (when (and f (plusp (length f)))
+      (let ((h (make-hash-table :test 'equal)))
+        (with-open-file (in f)
+          (loop for line = (read-line in nil) while line
+                do (let ((n (string-trim " " line)))
+                     (when (and (plusp (length n)) (char/= (char n 0) #\;))
+                       (setf (gethash (string-upcase n) h) t)))))
+        (format t "~&;; i386 hot functions: ~D (~A)~%" (hash-table-count h) f)
+        (setf *cold-keep* h))))
   (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~@[; x87~]~%"
           (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))))
 
@@ -4600,7 +4614,15 @@
                 (format o "~D ~D~%" (+ base (car tail)) (+ base (cdr tail))))
               (format t "~&;; i386 boot-only tail: #x~X..#x~X (~D bytes) -> ~A~%"
                       (+ base (car tail)) (+ base (cdr tail)) (- (cdr tail) (car tail)) tail-file))
-            (when (probe-file tail-file) (delete-file tail-file)))))
+            (when (probe-file tail-file) (delete-file tail-file))))
+      ;; the code a restored image may demand-page: native byte 0 to the tail
+      (let ((base (+ #x100000 (or (kernel-image-native-image-offset image) 0)))
+            (tail (symbol-value (intern "*I386-BOOT-TAIL*" "MODUS.MVM.I386"))))
+        (with-open-file (o (concatenate 'string (namestring path) ".paged")
+                           :direction :output :if-exists :supersede)
+          (format o "~D ~D~%" base
+                  (+ base (if tail (car tail)
+                              (length (kernel-image-native-code image))))))))
     (let ((n (length modus.mvm::*redefinition-log*)))
       (when (> n 0)
         (format t "~%REDEFINITIONS: ~D total (grep the build log for \"NOTE: redefining\")~%" n)))

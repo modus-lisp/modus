@@ -1336,14 +1336,12 @@
            ((= code #x0510)
             ;; SETJMP.  Stack the outer jmpbuf, then save A7 / A6 / resume
             ;; address / D4..D7.  First return NIL; LONGJMP re-enters at RESUME
-            ;; with D2 = T.  A capped push arms nothing.  The resume address is
-            ;; LEA (bd.l,PC) with the same hand-referenced :disp32 fixup
-            ;; +op-fn-addr+ uses.
-            (let ((skip (mvm-make-label))
-                  (resume (mvm-make-label)))
+            ;; with D2 = T.  Every push stores its frame or overflows LOUDLY
+            ;; (it then longjmps and never returns here), so the jmpbuf is
+            ;; always armed.  The resume address is LEA (bd.l,PC) with the
+            ;; same hand-referenced :disp32 fixup +op-fn-addr+ uses.
+            (let ((resume (mvm-make-label)))
               (m68k-emit-handler-push buf)
-              (m68k-emit-tst buf +68k-d0+)
-              (m68k-emit-bne buf skip)
               (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
               (m68k-emit-move-an-disp buf +68k-a7+ +68k-a1+ 0)
               (m68k-emit-move-an-disp buf +68k-a6+ +68k-a1+ 4)
@@ -1361,37 +1359,13 @@
                     do (m68k-emit-move-dn-disp buf d +68k-a1+ (* 4 i)))
               (when *68k-threaded*                        ; the token pointer
                 (m68k-emit-move-an-disp buf +68k-a5+ +68k-a1+ 28))
-              (m68k-emit-label buf skip)
               (m68k-emit-move-an-dn buf +68k-a4+ +68k-d2+)      ; first return: NIL
               (m68k-emit-label buf resume)))
            ((= code #x0511)
-            ;; LONGJMP.  Copy the jmpbuf aside first, zero the live capped count,
-            ;; pop, then restore and JMP with D2 = T.  Nothing armed (word 0 = 0):
-            ;; ILLEGAL rather than a jump to address zero.
-            (let ((nohandler (mvm-make-label)))
-              (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
-              (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
-              (m68k-emit-tst buf +68k-d0+)
-              (m68k-emit-beq buf nohandler)
-              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
-              (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
-              (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
-              (m68k-emit-move-imm-dn buf 0 +68k-d0+)
-              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
-              (m68k-emit-handler-pop buf)
-              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
-              (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
-                    for i from 3
-                    do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
-              (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
-              (when *68k-threaded*
-                (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
-              (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
-              (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
-              (m68k-emit-move-imm-dn buf +t-value+ +68k-d2+)  ; second return: T
-              (m68k-emit-jmp-an-ind buf +68k-a0+)
-              (m68k-emit-label buf nohandler)
-              (m68k-emit-illegal buf)))
+            ;; LONGJMP.  Copy the jmpbuf aside first, pop, then restore and
+            ;; JMP with D2 = T.  Nothing armed (word 0 = 0): ILLEGAL rather
+            ;; than a jump to address zero.
+            (m68k-emit-longjmp buf (lambda () (m68k-emit-illegal buf))))
            ((= code #x0512)
             ;; CLEAR-HANDLER: pop one frame; D2 (the result) untouched.
             (m68k-emit-handler-pop buf))
@@ -3106,6 +3080,40 @@
    faults on its first read instead of reading the stale copy.  Set by
    build-68k-cli.lisp from MODUS_68K_GC_POISON=1.  Off: byte-identical.")
 
+;;; The handler-frame stack's constants and specials (THE HANDLER-FRAME STACK,
+;;; at SETJMP / LONGJMP below): declared before the collector and the
+;;; translation driver, which bind and read them.
+(defconstant +68k-jmpbuf-words+ 7)
+(defparameter *68k-hstack-max-depth* 46
+  "Handler frames in the fixed area: as many 32-byte frames as fit below the
+   hosted globals at #x10000A00 (they end at #x100009C8).  Deeper frames go to
+   the hosted extension; on bare metal the next push is the loud overflow.")
+(defconstant +68k-hstack-ext-addr+ #x10005600
+  "Hosted: the extension's address (0 until the first push past the fixed area
+   reserves it).  In the low block, which the heap's anonymous mapping zeroes
+   at a plain boot and %68K-SAVE-CORE zeroes in a saved core.")
+(defconstant +68k-hstack-ext-limit-addr+ #x10005608
+  "Hosted, TEST ONLY: when non-zero, the extension holds at most this many
+   frames, so a test reaches the loud overflow without exhausting the native
+   stack.  A raw 32-bit count; %GC-WRITE64 of a small count at this address
+   writes it here (its high half goes to the unused word after it).")
+(defconstant +68k-hstack-ext-frames+ #x80000
+  "Frames in the hosted extension: 512K = 16 MB of address space.  A nesting
+   level costs more than 32 bytes of native stack, so the stack (8 MB under
+   qemu-user's default) runs out first.")
+(defconstant +68k-hstack-overflow-code+ #x0F0F
+  "Recorded at #x10000CB0 by an overflowing push; %TAKE-PENDING-FAULT turns it
+   into HANDLER-STACK-EXHAUSTED.")
+(defconstant +68k-pending-fault-addr+ #x10000CB0)
+(defvar *68k-hpush-label* nil
+  "While translating: the label of the out-of-line slow push (see above).")
+(defvar *68k-hext-addr-label* nil
+  "While translating a hosted image: the label of the pop's extension-frame
+   address routine.")
+(defvar *68k-hstack-used* nil
+  "Set by the first push or pop emitted, so an image with no SETJMP carries
+   neither stub.")
+
 (defvar *68k-gc-label* nil
   "Label of the hosted collector while translating a hosted module, else NIL
    (then :gc-check is the old ILLEGAL and no allocation marks are emitted).")
@@ -3764,6 +3772,24 @@
             (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d7+)
             (here have)))
       (root-range)
+      ;; ---- the handler frames in the extension (live ones only) ----
+      ;; A saved jmpbuf holds D4..D7, which a LONGJMP puts back: frames are
+      ;; roots.  The fixed area is in the low block above; frames 46.. are
+      ;; [ext, ext + (depth - 46) * 32).  See THE HANDLER-FRAME STACK.
+      (let ((none (lbl)))
+        (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d0+)
+        (m68k-emit-subi buf +68k-d0+ *68k-hstack-max-depth*)
+        (m68k-emit-ble buf none)
+        (m68k-emit-move-imm-an buf +68k-hstack-ext-addr+ +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d7+)
+        (m68k-emit-tst buf +68k-d7+)
+        (m68k-emit-beq buf none)
+        (m68k-emit-move-dn-an buf +68k-d7+ +68k-a5+)
+        (m68k-emit-lsl-imm buf +68k-d0+ 5)
+        (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d7+)
+        (root-range)
+        (here none))
       ;; ---- the static ranges, typed (empty until a freeze) ----
       (when *68k-gc-static*
         (let ((full (mvm-make-label)) (done (mvm-make-label)))
@@ -4120,6 +4146,9 @@
          (*68k-cdr-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
          (*68k-alloc-obj-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-hpush-label* (mvm-make-label))
+         (*68k-hext-addr-label* (and *68k-linux-mode* (mvm-make-label)))
+         (*68k-hstack-used* nil)
          (*68k-bytecode* bytecode)
          (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))
@@ -4308,6 +4337,9 @@
       (m68k-emit-array-len-helper buf))
     (when *68k-alloc-obj-label*
       (m68k-emit-alloc-obj-helper buf))
+    ;; LAST: every push and pop above (the threaded shapes included) calls it.
+    (when *68k-hstack-used*
+      (m68k-emit-hstack-stubs buf))
 
     ;; Resolve labels
     (m68k-fixup-labels buf)
@@ -4837,30 +4869,52 @@
 ;;; ============================================================
 ;;;
 ;;; The protocol of translate-riscv / translate-ppc: one live jmpbuf, a stack of
-;;; saved outer jmpbufs so handler-cases NEST, a depth cap (21) past which a
-;;; push stores nothing and its matching pop is ABSORBED, and LONGJMP copying the
-;;; jmpbuf aside before the pop overwrites it.
+;;; saved outer jmpbufs so handler-cases NEST, and LONGJMP copying the jmpbuf
+;;; aside before the pop overwrites it.
 ;;;
 ;;; JMPBUF = 7 longwords: A7, A6 (VFP), resume address, D4..D7 -- V2..V5, the
 ;;; callee-saved V-registers the prologue's MOVEM saves and whose epilogues a
 ;;; LONGJMP skips.  VA/VL/VN (A2..A4) deliberately absent; V0/V1 (D2/D3) are
-;;; caller-saved.  Frames are 8 longwords (32 bytes, one spare) so a frame
-;;; address is a shift.  Temporaries: D0, D1, A0, A1.
+;;; caller-saved.  (Threaded images add A5, the token pointer, as word 8.)
+;;; Frames are 8 longwords (32 bytes, one spare) so a frame address is a shift.
+;;; Temporaries: D0, D1, A0, A1.
 ;;;
-;;; WHERE: hosted, the shared contract block at the heap base (jmpbuf
-;;; #x10000180 ... frames from #x10000408; 46 frames end at #x100009C8, clear of
-;;; the globals at #x10000A00); bare, the same offsets in *68k-globals-base*'s
-;;; block, which otherwise uses only #x00-#x0F.  Computed at translate time.
+;;; THE HANDLER-FRAME STACK (NO SILENT CEILING).  Frames 0..45 live in the
+;;; fixed area -- hosted, the shared contract block at the heap base (jmpbuf
+;;; #x10000180 ... frames from #x10000408; 46 frames end at #x100009C8, clear
+;;; of the globals at #x10000A00); bare, the same offsets in
+;;; *68k-globals-base*'s block.  That is the FAST PATH: the old inline code
+;;; plus one compare.  A push at depth 46 or more calls ONE out-of-line stub
+;;; (*68K-HPUSH-LABEL*, emitted once after the last function: a 68k image
+;;; would otherwise carry it at every SETJMP):
+;;;   * HOSTED: frames 46.. go to an EXTENSION the stub reserves itself on
+;;;     first use -- mmap2(0, 16 MB, RW, PRIVATE|ANONYMOUS|NORESERVE), 512K
+;;;     frames of address space, pages touched on demand -- its address in
+;;;     the word at #x10005600 (+68K-HSTACK-EXT-ADDR+, the same word x86-64
+;;;     and AArch64 use, free on 68k).  No 68k image has threads, so one
+;;;     process-global extension is the whole design.
+;;;   * A push that still cannot be stored -- past the extension, past the
+;;;     test-only limit at #x10005608, the reservation refused, or any push
+;;;     past frame 45 on BARE METAL, which has no mmap -- is LOUD: it records
+;;;     #x0F0F at #x10000CB0 for %TAKE-PENDING-FAULT (HANDLER-STACK-EXHAUSTED)
+;;;     and LONGJMPs to the frame that is armed now, exactly as TRAP #x0511
+;;;     does.  The failed frame was never stored, so the stack stays balanced
+;;;     and every enclosing cleanup runs.  Nothing armed: hosted, a message on
+;;;     stderr and exit status 4; bare, ILLEGAL (LONGJMP's own answer).
+;;; The pop follows frames into the extension (*68K-HEXT-ADDR-LABEL*), and the
+;;; hosted collector scans the live extension frames as roots: a saved jmpbuf
+;;; holds D4..D7, heap pointers a LONGJMP puts back.  (The fixed frames are in
+;;; the low block, which the collector scans whole.)  68k hosted has no signal
+;;; stub (#x0520 is a no-op), so nothing else walks the frames.
+;;;
+;;; This replaced BALANCED-CAP: a push past frame 45 stored nothing, the setjmp
+;;; site skipped arming and the matching pop absorbed it, so a LONGJMP from
+;;; below the cap went straight to the deepest STORED frame and every cleanup
+;;; past the cap was silently skipped (r36: 45 of 301 cleanups ran).
 
-(defconstant +68k-jmpbuf-words+ 7)
-(defparameter *68k-hstack-max-depth* 46
-  "As many 32-byte frames as fit below the hosted globals at #x10000A00 (they
-   end at #x100009C8).  21 overflowed under a real library load on ARM32, the
-   same protocol -- see *ARM32-HSTACK-MAX-DEPTH*.")
 (defun m68k-hbase ()           (if *68k-linux-mode* #x10000000 *68k-globals-base*))
 (defun m68k-jmpbuf-addr ()     (+ (m68k-hbase) #x180))
 (defun m68k-lj-scratch-addr () (+ (m68k-hbase) #x300))
-(defun m68k-hcapped-addr ()    (+ (m68k-hbase) #x360))
 (defun m68k-hdepth-addr ()     (+ (m68k-hbase) #x400))
 (defun m68k-hframes-addr ()    (+ (m68k-hbase) #x408))
 
@@ -4878,51 +4932,50 @@
   (m68k-emit-move-dn-an buf +68k-d1+ dst-an))
 
 (defun m68k-emit-handler-push (buf)
-  "Stack the CURRENT jmpbuf.  Leaves D0 = 0 if a frame was stored, 1 if the
-   push was CAPPED.  Clobbers D0, D1, A0, A1."
-  (let ((capped (mvm-make-label))
+  "Stack the CURRENT jmpbuf.  Frames in the fixed area inline; deeper ones,
+   and the loud overflow (which does not return), in the out-of-line stub.
+   Clobbers D0, D1, A0, A1."
+  (let ((slow (mvm-make-label))
         (done (mvm-make-label)))
+    (setf *68k-hstack-used* t)
     (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
     (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)        ; D0 = depth
     (m68k-emit-cmpi buf +68k-d0+ *68k-hstack-max-depth*)
-    (m68k-emit-bge buf capped)
+    (m68k-emit-bge buf slow)
     (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
     (m68k-emit-addi buf +68k-d0+ 1)
     (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth++
     (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
     (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
-    (m68k-emit-move-imm-dn buf 0 +68k-d0+)                  ; stored
     (m68k-emit-bra buf done)
-    (m68k-emit-label buf capped)
-    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
-    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
-    (m68k-emit-addi buf +68k-d0+ 1)
-    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
-    (m68k-emit-move-imm-dn buf 1 +68k-d0+)                  ; capped
+    (m68k-emit-label buf slow)
+    (m68k-emit-bsr-long buf *68k-hpush-label*)
     (m68k-emit-label buf done)))
 
 (defun m68k-emit-handler-pop (buf)
-  "Absorb a capped push, restore the top stacked frame into the jmpbuf, or ZERO
-   the jmpbuf when the stack is empty.  Never touches D2 (V0), which holds the
-   handler-case's result at a CLEAR-HANDLER.  Clobbers D0, D1, A0, A1."
-  (let ((not-capped (mvm-make-label))
+  "Restore the top stacked frame into the jmpbuf (from the fixed area or the
+   hosted extension), or ZERO the jmpbuf when the stack is empty.  Never
+   touches D2 (V0), which holds the handler-case's result at a CLEAR-HANDLER.
+   Clobbers D0, D1, A0, A1."
+  (let ((have (mvm-make-label))
+        (fixed (mvm-make-label))
         (empty (mvm-make-label))
         (done (mvm-make-label)))
-    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
-    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
-    (m68k-emit-tst buf +68k-d0+)
-    (m68k-emit-beq buf not-capped)
-    (m68k-emit-subq buf +68k-d0+ 1)
-    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
-    (m68k-emit-bra buf done)
-    (m68k-emit-label buf not-capped)
+    (setf *68k-hstack-used* t)
     (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
     (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
     (m68k-emit-tst buf +68k-d0+)
     (m68k-emit-beq buf empty)
     (m68k-emit-subq buf +68k-d0+ 1)
     (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)        ; depth--
+    (when *68k-hext-addr-label*
+      (m68k-emit-cmpi buf +68k-d0+ *68k-hstack-max-depth*)
+      (m68k-emit-blt buf fixed)
+      (m68k-emit-bsr-long buf *68k-hext-addr-label*)        ; A0 = extension frame
+      (m68k-emit-bra buf have))
+    (m68k-emit-label buf fixed)
     (m68k-emit-frame-addr buf +68k-a0+ +68k-d0+)
+    (m68k-emit-label buf have)
     (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
     (m68k-emit-copy-words buf +68k-a0+ +68k-a1+)
     (m68k-emit-bra buf done)
@@ -4932,6 +4985,117 @@
     (dotimes (i (m68k-jmpbuf-words))
       (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a1+ (* 4 i)))
     (m68k-emit-label buf done)))
+
+(defun m68k-emit-longjmp (buf nohandler-fn)
+  "LONGJMP to the armed frame: copy the jmpbuf aside, pop, restore and JMP
+   with D2 = T.  Nothing armed (word 0 = 0): NOHANDLER-FN emits what happens
+   instead -- never a jump to address zero."
+  (let ((nohandler (mvm-make-label)))
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf nohandler)
+    (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
+    (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+    (m68k-emit-handler-pop buf)
+    (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
+    (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
+          for i from 3
+          do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
+    (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
+    (when *68k-threaded*
+      (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
+    (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
+    (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
+    (m68k-emit-move-imm-dn buf +t-value+ +68k-d2+)  ; second return: T
+    (m68k-emit-jmp-an-ind buf +68k-a0+)
+    (m68k-emit-label buf nohandler)
+    (funcall nohandler-fn)))
+
+(defun m68k-emit-hstack-stubs (buf)
+  "The out-of-line half of the handler-frame stack, emitted once after the
+   last function (see THE HANDLER-FRAME STACK above).
+
+   SLOW PUSH, entered by BSR.L from a push with D0 = depth >= 46: hosted,
+   store the jmpbuf as extension frame depth-46 (reserving the extension on
+   first use) and return; past the extension or the test limit, the mmap
+   refused, or bare metal: the loud overflow, which does not return.  Clobbers
+   D0, D1, A0, A1; saves D2..D5 (mmap2's argument registers) itself.
+
+   EXTENSION FRAME ADDRESS (hosted), for the pop: D0 = depth >= 46 in, A0 =
+   the extension frame's address out.  Clobbers D1."
+  (let ((loud (mvm-make-label)))
+    (m68k-emit-label buf *68k-hpush-label*)
+    (when *68k-linux-mode*
+      (let ((nolimit (mvm-make-label)) (have (mvm-make-label))
+            (refused (mvm-make-label)))
+        (m68k-emit-movem-to-predec buf #x3C00)                ; D2-D5
+        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d2+)
+        (m68k-emit-subi buf +68k-d2+ *68k-hstack-max-depth*)  ; D2 = k
+        (m68k-emit-move-imm-an buf +68k-hstack-ext-limit-addr+ +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d1+)
+        (m68k-emit-tst buf +68k-d1+)
+        (m68k-emit-beq buf nolimit)
+        (m68k-emit-cmp-dn-dn buf +68k-d1+ +68k-d2+)           ; k - limit
+        (m68k-emit-bcc-word buf +68k-cc-cc+ refused)          ; k >= limit
+        (m68k-emit-label buf nolimit)
+        (m68k-emit-cmpi buf +68k-d2+ +68k-hstack-ext-frames+)
+        (m68k-emit-bcc-word buf +68k-cc-cc+ refused)          ; k >= capacity
+        (m68k-emit-move-imm-an buf +68k-hstack-ext-addr+ +68k-a0+)
+        (m68k-emit-move-an-ind-dn buf +68k-a0+ +68k-d1+)
+        (m68k-emit-tst buf +68k-d1+)
+        (m68k-emit-bne buf have)
+        ;; mmap2(0, size, PROT_READ|WRITE, MAP_PRIVATE|ANONYMOUS|NORESERVE, -1, 0):
+        ;; d1..d5 then a0, number in d0, result in d0 (-4095..-1 = -errno).
+        (m68k-emit-push-dn buf +68k-d2+)
+        (m68k-emit-moveq buf +68k-d1+ 0)
+        (m68k-emit-move-imm-dn buf (* 32 +68k-hstack-ext-frames+) +68k-d2+)
+        (m68k-emit-moveq buf +68k-d3+ 3)
+        (m68k-emit-move-imm-dn buf #x4022 +68k-d4+)
+        (m68k-emit-moveq buf +68k-d5+ -1)
+        (m68k-emit-move-imm-an buf 0 +68k-a0+)
+        (m68k-emit-move-imm-dn buf +68k-linux-sys-mmap2+ +68k-d0+)
+        (m68k-emit-trap buf 0)
+        (m68k-emit-pop-dn buf +68k-d2+)
+        (m68k-emit-cmpi buf +68k-d0+ #xFFFFF001)
+        (m68k-emit-bcc-word buf +68k-cc-cc+ refused)          ; an errno
+        (m68k-emit-move-imm-an buf +68k-hstack-ext-addr+ +68k-a0+)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+        (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+        (m68k-emit-label buf have)                            ; D1 = ext, D2 = k
+        (m68k-emit-lsl-imm buf +68k-d2+ 5)
+        (m68k-emit-add-dn-dn buf +68k-d1+ +68k-d2+)
+        (m68k-emit-move-dn-an buf +68k-d2+ +68k-a0+)          ; A0 = the frame
+        (m68k-emit-move-imm-an buf (m68k-hdepth-addr) +68k-a1+)
+        (m68k-emit-move-an-ind-dn buf +68k-a1+ +68k-d0+)
+        (m68k-emit-addq buf +68k-d0+ 1)
+        (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a1+)      ; depth++
+        (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+        (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+        (m68k-emit-movem-from-postinc buf #x003C)             ; D2-D5
+        (m68k-emit-rts buf)
+        (m68k-emit-label buf refused)
+        (m68k-emit-movem-from-postinc buf #x003C)
+        (m68k-emit-bra buf loud)))
+    ;; ---- the loud overflow: record, then LONGJMP to the armed frame ----
+    (m68k-emit-label buf loud)
+    (m68k-emit-move-imm-an buf +68k-pending-fault-addr+ +68k-a0+)
+    (m68k-emit-move-imm-dn buf +68k-hstack-overflow-code+ +68k-d0+)
+    (m68k-emit-move-dn-an-ind buf +68k-d0+ +68k-a0+)
+    (m68k-emit-longjmp buf
+                       (lambda ()
+                         (if *68k-linux-mode*
+                             (m68k-emit-die buf (format nil "modus: handler stack exhausted with no handler armed~%") 4)
+                             (m68k-emit-illegal buf)))))
+  (when *68k-hext-addr-label*
+    (m68k-emit-label buf *68k-hext-addr-label*)
+    (m68k-emit-move-dn-dn buf +68k-d0+ +68k-d1+)
+    (m68k-emit-subi buf +68k-d1+ *68k-hstack-max-depth*)
+    (m68k-emit-lsl-imm buf +68k-d1+ 5)
+    (m68k-emit-move-imm-an buf +68k-hstack-ext-addr+ +68k-a0+)
+    (m68k-emit-move-disp-an buf +68k-a0+ 0 +68k-a0+)
+    (m68k-emit-adda-dn buf +68k-d1+ +68k-a0+)
+    (m68k-emit-rts buf)))
 
 (defun m68k-set-linux-mode (on)
   "Turn hosted mode on or off, moving the convention slots with it.  One

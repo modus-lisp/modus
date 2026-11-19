@@ -296,7 +296,8 @@
     (setf (mem-ref #x10006000 :u32) 0)
     (setf (mem-ref #x10000400 :u32) 0)             ; handler depth
     (setf (mem-ref #x10000180 :u32) 0)             ; armed jmpbuf
-    (setf (mem-ref #x10000360 :u32) 0)             ; capped pushes
+    (setf (mem-ref #x10005600 :u32) 0)             ; handler-frame extension (not in the core)
+    (setf (mem-ref #x10005608 :u32) 0)             ; its test-only limit
     (setf (mem-ref h :u32) 12865357)               ; magic
     (setf (mem-ref (+ h 4) :u32) y)
     (setf (mem-ref (+ h 8) :u32) #x10000000)  (setf (mem-ref (+ h 12) :u32) #x20000)

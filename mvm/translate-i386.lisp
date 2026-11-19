@@ -4646,10 +4646,15 @@
          ;; operand there across the type-check `:or / :test` pair that
          ;; precedes open-coded generic arithmetic.  Clobbering it made
          ;; `(+ a b)` compute (a|b)+b.  Use the ECX/EDX scratch pair.
-         (let ((va (first operands)) (vb (second operands)))
-           (i386-load-vreg buf +scratch1+ vb)
-           (i386-load-vreg buf +scratch0+ va)
-           (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)))
+         (let* ((va (first operands)) (vb (second operands))
+                (pb (i386-vreg-phys vb)))
+           (if pb
+               ;; CMP r/m32(Va), r32(Vb): Va where it lives
+               (i386-emit-vreg-operand buf '(#x39) pb va)
+               (progn
+                 (i386-load-vreg buf +scratch1+ vb)
+                 (i386-load-vreg buf +scratch0+ va)
+                 (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)))))
 
         ((op= +op-test+)
          ;; (test Va Vb) -- AND, sets flags, discards result
@@ -4666,12 +4671,11 @@
         ;; (cmp-imm / test-imm Va imm32): as CMP / TEST with the immediate in
         ;; SCRATCH1 -- VR-preserving like them
         ((or (op= +op-cmp-imm+) (op= +op-test-imm+))
+         ;; on the operand where it lives (no destination: EAX is only read)
          (let ((va (first operands)) (imm (%imm32-signed (second operands))))
-           (i386-emit-mov-reg-imm buf +scratch1+ imm)
-           (i386-load-vreg buf +scratch0+ va)
            (if (op= +op-cmp-imm+)
-               (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
-               (i386-emit-test-reg-reg buf +scratch0+ +scratch1+))))
+               (i386-emit-cmp-vreg-imm buf va imm)
+               (i386-emit-test-vreg-imm buf va imm))))
 
         ;; ============================================
         ;; Branches
@@ -4728,8 +4732,11 @@
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
            ;; VR-PRESERVING (WS5): no destination — must not clobber EAX/VR.
-           (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
+           ;; NIL is a constant on the hosted layout: compare in place.
+           (if (i386-hosted-layout-p)
+               (i386-emit-cmp-vreg-imm buf vs #xDEAD0001)
+               (progn (i386-load-vreg buf +scratch0+ vs)
+                      (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)))
            (i386-emit-jcc buf :e label)))
 
         ((op= +op-bnnull+)
@@ -4739,8 +4746,11 @@
                 (target-pos (+ mvm-next-pos off))
                 (label (i386-ensure-label-at state target-pos)))
            ;; VR-PRESERVING (WS5): no destination — must not clobber EAX/VR.
-           (i386-load-vreg buf +scratch0+ vs)
-           (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)
+           ;; NIL is a constant on the hosted layout: compare in place.
+           (if (i386-hosted-layout-p)
+               (i386-emit-cmp-vreg-imm buf vs #xDEAD0001)
+               (progn (i386-load-vreg buf +scratch0+ vs)
+                      (i386-emit-cmp-reg-abs buf +scratch0+ *vn-addr*)))
            (i386-emit-jcc buf :ne label)))
 
         ;; ============================================
@@ -4993,33 +5003,34 @@
         ((op= +op-obj-ref+)
          ;; (obj-ref Vd Vobj idx:imm8) -- load object slot
          (let ((vd (first operands)) (vobj (second operands)) (idx (third operands)))
-           (if (= vobj +vreg-vfp+)
-               (progn
-                 (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+
+           ;; Straight into Vd's register when it has one (writing EAX is
+           ;; legal exactly when Vd is VR), through the object's register when
+           ;; it has one, the tag folded into the displacement.
+           (let ((dst (or (i386-vreg-phys vd) +scratch0+)))
+             (if (= vobj +vreg-vfp+)
+                 (i386-emit-mov-reg-mem buf dst +i386-ebp+
                                         (+ +frame-slot-base+ (* idx -4)))
-                 (i386-store-vreg buf vd +scratch0+))
-               (progn
-                 (i386-load-vreg buf +scratch0+ vobj)
-                 (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-                 (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ (* (1+ idx) 4))
-                 (i386-store-vreg buf vd +scratch0+)))))
+                 (let ((base (or (i386-vreg-phys vobj)
+                                 (progn (i386-load-vreg buf +scratch0+ vobj) +scratch0+))))
+                   (i386-emit-mov-reg-mem buf dst base (- (* (1+ idx) 4) +tag-object+))))
+             (unless (i386-vreg-phys vd)
+               (i386-store-vreg buf vd +scratch0+)))))
 
         ((op= +op-obj-set+)
          ;; (obj-set Vobj idx:imm8 Vs) -- store object slot
          (let ((vobj (first operands)) (idx (second operands)) (vs (third operands)))
-           (if (= vobj +vreg-vfp+)
-               ;; Frame slot store: use safe EBP-relative offset below spill area
-               (progn
-                 (i386-load-vreg buf +scratch0+ vs)
+           ;; The value from its own register when it has one, the object's
+           ;; register as the base when it has one, the tag folded into the
+           ;; displacement; ECX / EDX only for what lives in memory.
+           (let ((val (or (i386-vreg-phys vs)
+                          (progn (i386-load-vreg buf +scratch0+ vs) +scratch0+))))
+             (if (= vobj +vreg-vfp+)
+                 ;; Frame slot store: use safe EBP-relative offset below spill area
                  (i386-emit-mov-mem-reg buf +i386-ebp+
-                                        (+ +frame-slot-base+ (* idx -4)) +scratch0+))
-               ;; Normal object slot store
-               ;; IMPORTANT: Load value FIRST — loading vobj into EAX clobbers VR.
-               (progn
-                 (i386-load-vreg buf +scratch0+ vs)
-                 (i386-load-vreg buf +scratch1+ vobj)
-                 (i386-emit-sub-reg-imm buf +scratch1+ +tag-object+)
-                 (i386-emit-mov-mem-reg buf +scratch1+ (* (1+ idx) 4) +scratch0+)))))
+                                        (+ +frame-slot-base+ (* idx -4)) val)
+                 (let ((base (or (i386-vreg-phys vobj)
+                                 (progn (i386-load-vreg buf +scratch1+ vobj) +scratch1+))))
+                   (i386-emit-mov-mem-reg buf base (- (* (1+ idx) 4) +tag-object+) val))))))
 
         ;; ============================================
         ;; SAP (System Area Pointer) — a 1-slot object, subtag #x16, whose
@@ -6410,6 +6421,51 @@
       (progn (i386-emit-byte buf #x8B) (i386-emit-byte buf #x0A))          ; mov ecx, [edx]
       (progn (i386-emit-byte buf #x8B) (i386-emit-byte buf #x4A)
              (i386-emit-byte buf offset))))                                ; mov ecx, [edx+4]
+
+(defun i386-emit-vreg-operand (buf opcodes reg-field vreg)
+  "OPCODES, then the ModR/M (and displacement) naming VREG where it lives --
+   its register, its frame slot, or its absolute word -- as the r/m operand,
+   with REG-FIELD in the reg field.  The caller appends any immediate."
+  (dolist (b opcodes) (i386-emit-byte buf b))
+  (let ((phys (i386-vreg-phys vreg))
+        (abs (i386-vreg-abs-addr vreg)))
+    (cond (phys (i386-emit-byte buf (i386-modrm #b11 reg-field phys)))
+          (abs  (i386-emit-byte buf (i386-modrm #b00 reg-field 5))
+                (i386-emit-u32 buf abs))
+          (t (let ((d (i386-spill-offset vreg)))
+               (if (<= -128 d 127)
+                   (progn (i386-emit-byte buf (i386-modrm #b01 reg-field +i386-ebp+))
+                          (i386-emit-byte buf (logand d #xFF)))
+                   (progn (i386-emit-byte buf (i386-modrm #b10 reg-field +i386-ebp+))
+                          (i386-emit-u32 buf (logand d #xFFFFFFFF)))))))))
+
+(defun i386-emit-cmp-vreg-imm (buf vreg imm)
+  "CMP VREG, IMM where VREG lives; the flags of the 32-bit compare.  An 8-bit
+   immediate when IMM fits signed (it is sign-extended); CMP EAX, imm32 is
+   one byte shorter than the general form."
+  (let ((imm (if (>= imm #x80000000) (- imm #x100000000) imm)))
+    (cond ((<= -128 imm 127)
+           (i386-emit-vreg-operand buf '(#x83) 7 vreg)
+           (i386-emit-byte buf (logand imm #xFF)))
+          ((eql (i386-vreg-phys vreg) +i386-eax+)
+           (i386-emit-byte buf #x3D) (i386-emit-u32 buf (logand imm #xFFFFFFFF)))
+          (t (i386-emit-vreg-operand buf '(#x81) 7 vreg)
+             (i386-emit-u32 buf (logand imm #xFFFFFFFF))))))
+
+(defun i386-emit-test-vreg-imm (buf vreg imm)
+  "TEST VREG, IMM where VREG lives.  A mask of 0..#x7F tests the low byte
+   (F6 /0 ib): the result's bits above 7 are zero either way, so ZF, SF and
+   PF come out as from the 32-bit test (CF and OF are cleared by both).  The
+   byte form names AL/BL only, or a frame slot's low byte; ESI/EDI take the
+   32-bit form."
+  (let* ((imm (logand imm #xFFFFFFFF))
+         (phys (i386-vreg-phys vreg)))
+    (if (and (<= 0 imm #x7F)
+             (or (null phys) (eql phys +i386-eax+) (eql phys +i386-ebx+)))
+        (progn (i386-emit-vreg-operand buf '(#xF6) 0 vreg)
+               (i386-emit-byte buf imm))
+        (progn (i386-emit-vreg-operand buf '(#xF7) 0 vreg)
+               (i386-emit-u32 buf imm)))))
 
 (defun i386-emit-subtag-body (buf)
   "ECX = the object's subtag as a fixnum, or 0 when ECX is not an object

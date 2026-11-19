@@ -821,6 +821,12 @@
                        (aref bytes (+ pos 1)) (logand (ash urel -8) #xFF)
                        (aref bytes (+ pos 2)) (logand (ash urel -16) #xFF)
                        (aref bytes (+ pos 3)) (logand (ash urel -24) #xFF)))))
+            (:rel8
+             ;; a short branch (I386-EMIT-BRANCH): relative to the byte's end
+             (let ((rel (- target (+ pos 1))))
+               (unless (<= -128 rel 127)
+                 (error "i386 rel8 ~D out of range at pos ~D" rel pos))
+               (setf (aref bytes pos) (logand rel #xFF))))
             (:rel32
              ;; rel32 is relative to end of the 4-byte displacement field
              (let* ((rel (- target (+ pos 4))))
@@ -1317,12 +1323,43 @@
 
 ;;; --- Jump / Call / Return ---
 
+(defvar *i386-short-branches*
+  (not (equal (sb-ext:posix-getenv "MODUS_I386_SHORT_BRANCHES") "0"))
+  "Translate each image function twice so branches whose target is near are
+   2 bytes, not 5 or 6 (TRANSLATE-MVM-TO-I386).  MODUS_I386_SHORT_BRANCHES=0
+   keeps every branch long.")
+(defvar *i386-jump-index* nil
+  "Inside a function's two-pass translation: the number of the last branch to
+   a label emitted, which names it in both passes.  NIL elsewhere (the
+   collector, the shared routines, the runtime native tier): always long.")
+(defvar *i386-jump-record* nil
+  "First pass: a holder whose car lists (index end-position label shrink) for
+   each long branch; NIL in the second.")
+(defvar *i386-short-jumps* nil
+  "Second pass: the branch numbers to emit short.")
+
+(defun i386-emit-branch (buf short-op long-ops label-id)
+  "A branch to LABEL-ID: SHORT-OP rel8 when the second pass says it fits,
+   else LONG-OPS rel32 (recorded in the first pass)."
+  (let ((idx (and *i386-jump-index* label-id (incf *i386-jump-index*))))
+    (if (and idx *i386-short-jumps* (gethash idx *i386-short-jumps*))
+        (progn
+          (i386-emit-byte buf short-op)
+          (push (list (i386-buffer-position buf) label-id :rel8)
+                (i386-buffer-fixups buf))
+          (i386-emit-byte buf 0))
+        (progn
+          (dolist (b long-ops) (i386-emit-byte buf b))
+          (if label-id
+              (i386-emit-fixup-rel32 buf label-id)
+              (i386-emit-u32 buf 0))
+          (when (and idx *i386-jump-record*)
+            (push (list idx (i386-buffer-position buf) label-id (- (+ (length long-ops) 4) 2))
+                  (car *i386-jump-record*)))))))
+
 (defun i386-emit-jmp-rel32 (buf &optional label-id)
-  "JMP rel32 (near unconditional jump)"
-  (i386-emit-byte buf #xE9)
-  (if label-id
-      (i386-emit-fixup-rel32 buf label-id)
-      (i386-emit-u32 buf 0)))
+  "JMP rel32 (near unconditional jump), or JMP rel8 (see I386-EMIT-BRANCH)"
+  (i386-emit-branch buf #xEB '(#xE9) label-id))
 
 (defun i386-emit-jmp-reg (buf reg)
   "JMP reg (indirect near jump)"
@@ -1359,11 +1396,7 @@
   "Jcc rel32 (conditional jump, near form: 0F 80+cc)"
   (let ((code (cdr (assoc cc *i386-cc-codes*))))
     (unless code (error "i386: unknown condition code ~A" cc))
-    (i386-emit-byte buf #x0F)
-    (i386-emit-byte buf (+ #x80 code))
-    (if label-id
-        (i386-emit-fixup-rel32 buf label-id)
-        (i386-emit-u32 buf 0))))
+    (i386-emit-branch buf (+ #x70 code) (list #x0F (+ #x80 code)) label-id)))
 
 ;;; --- Atomic Exchange ---
 
@@ -6003,40 +6036,69 @@
                                             (i386-current-pos buf))
                                          *i386-fn-align*))
                        do (i386-emit-nop buf))))
-          do (let* ((fn-label (aref fn-labels i))
-                    (state (make-i386-translate-state
-                            :buf buf
-                            :mvm-bytes bytecode
-                            :mvm-length fn-length
-                            :mvm-offset fn-offset
-                            :gc-label *i386-gc-collect-label*
-                            :function-table fn-offset-to-label)))
-               ;; Emit function label
-               (i386-emit-label buf fn-label)
-               ;; Emit prologue
-               (i386-emit-prologue buf (if (zerop fn-length)
-                                           :legacy
-                                           (i386-function-frame-slots bytecode fn-offset)))
-               ;; Pass 1: scan branch targets
-               (i386-scan-branch-targets state)
-               ;; Pass 2: translate
-               (let ((pos fn-offset)
-                     (limit (+ fn-offset fn-length)))
-                 (loop while (< pos limit)
-                       do (progn
-                            (let ((label (gethash pos
-                                                  (i386-translate-state-label-map state))))
-                              (when label
-                                (i386-emit-label buf label)))
-                            (let* ((decoded (decode-instruction bytecode pos))
-                                   (opcode (car decoded))
-                                   (operands (cadr decoded))
-                                   (new-pos (cddr decoded))
-                                   (at (and *i386-op-bytes* (i386-current-pos buf))))
-                              (i386-translate-insn state opcode operands new-pos)
-                              (when at
-                                (i386-op-bytes-count opcode (- (i386-current-pos buf) at)))
-                              (setf pos new-pos)))))
+          do (let ((fn-label (aref fn-labels i)))
+               (flet ((translate-body ()
+                        (let ((state (make-i386-translate-state
+                                      :buf buf
+                                      :mvm-bytes bytecode
+                                      :mvm-length fn-length
+                                      :mvm-offset fn-offset
+                                      :gc-label *i386-gc-collect-label*
+                                      :function-table fn-offset-to-label)))
+                          ;; Emit function label
+                          (i386-emit-label buf fn-label)
+                          ;; Emit prologue
+                          (i386-emit-prologue buf (if (zerop fn-length)
+                                                      :legacy
+                                                      (i386-function-frame-slots bytecode fn-offset)))
+                          ;; Pass 1: scan branch targets
+                          (i386-scan-branch-targets state)
+                          ;; Pass 2: translate
+                          (let ((pos fn-offset)
+                                (limit (+ fn-offset fn-length)))
+                            (loop while (< pos limit)
+                                  do (progn
+                                       (let ((label (gethash pos
+                                                             (i386-translate-state-label-map state))))
+                                         (when label
+                                           (i386-emit-label buf label)))
+                                       (let* ((decoded (decode-instruction bytecode pos))
+                                              (opcode (car decoded))
+                                              (operands (cadr decoded))
+                                              (new-pos (cddr decoded))
+                                              (at (and *i386-op-bytes* (i386-current-pos buf))))
+                                         (i386-translate-insn state opcode operands new-pos)
+                                         (when at
+                                           (i386-op-bytes-count opcode (- (i386-current-pos buf) at)))
+                                         (setf pos new-pos))))))))
+                 (if (not *i386-short-branches*)
+                     (translate-body)
+                     ;; SHORT BRANCHES: translate the function twice.  The first
+                     ;; time every branch to a label is long, and each is
+                     ;; numbered and recorded; then everything that pass
+                     ;; appended is undone, and the second pass emits short
+                     ;; every branch whose first-pass distance fits.  Code only
+                     ;; shrinks the second time, so a distance that fitted
+                     ;; still does -- one pass of relaxation is enough.
+                     (let ((pos0 (i386-buffer-position buf))
+                           (fix0 (i386-buffer-fixups buf))
+                           (lic0 *i386-li-const-patches*)
+                           (short (make-hash-table)))
+                       (let ((*i386-jump-index* 0)
+                             (*i386-jump-record* (list nil))
+                             (*i386-op-bytes* nil))
+                         (translate-body)
+                         (dolist (r (car *i386-jump-record*))
+                           (destructuring-bind (idx end label shrink) r
+                             (let ((target (gethash label (i386-buffer-labels buf))))
+                               (when (and target (<= -128 (+ (- target end) shrink) 127))
+                                 (setf (gethash idx short) t))))))
+                       (setf (i386-buffer-position buf) pos0
+                             (i386-buffer-fixups buf) fix0
+                             *i386-li-const-patches* lic0)
+                       (let ((*i386-jump-index* 0)
+                             (*i386-short-jumps* short))
+                         (translate-body)))))
                ;; the native tier's export table, right after the code of
                ;; jit-i386-native.lisp's %N386-EXPORT-TABLE, so the image finds
                ;; it a few words past that function wherever the build put it

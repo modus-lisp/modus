@@ -1697,6 +1697,32 @@
          (eql (second (second h)) (second (third h)))   ; the same temp
          (eql (third (third h)) vs))))
 
+(defun m68k-li-a5-load (buf vd imm pc)
+  "LI VD,IMM then LOAD VD,(VD) at PC -- a fixed low-block word read into the
+   register that held its address (dead after) -- as one A5-relative MOVE
+   (*68K-A5-GLOBALS*, M68K-A5-DISP): 4 bytes for the 6-byte immediate, the
+   MOVEA and the indirect load.  ~20,000 sites: the static-symbol vector's
+   root, the global-cell cache, the runtime-lock gate.  T when emitted (the
+   translation then resumes after the LOAD)."
+  (progn
+    (when (and *68k-bytecode* *68k-label-map* (integerp imm)
+               (< pc (length *68k-bytecode*))
+               (null (gethash pc *68k-label-map*)))
+      (let* ((d (m68k-insn-at pc))
+             (ops (cadr d))
+             (disp (and (eql (car d) +op-load+)
+                        (eql (first ops) vd) (eql (second ops) vd)
+                        (member (logand (third ops) 3) '(0 2 3))
+                        (m68k-a5-disp (logand imm #xFFFFFFFF)))))
+        (when disp
+          (if (zerop (logand (third ops) 3))
+              (progn (m68k-emit-move-byte-disp-dn buf +68k-a5+ disp +68k-d0+)
+                     (m68k-emit-andi buf +68k-d0+ #xFF))
+              (m68k-emit-move-disp-dn buf +68k-a5+ disp +68k-d0+))
+          (m68k-store-vreg buf vd +68k-d0+)
+          (setq *68k-skip-to* (cddr d))
+          t)))))
+
 (defun m68k-li-shr-fold (vd imm next-pc)
   "LI VD,IMM followed by SHR VD,VD,K (K <= 8, not a branch target): the
    compiler's raw-address idiom -- a TAGGED constant shifted to the raw word at
@@ -2202,6 +2228,7 @@
       (#.+op-li+
        (let* ((vd (first operands))
               (imm (m68k-li-shr-fold vd (second operands) mvm-pc)))
+        (unless (m68k-li-a5-load buf vd imm (or *68k-skip-to* mvm-pc))
          ;; 32-bit on 68k
          (let ((imm32 (logand imm #xFFFFFFFF))
                (pd (m68k-vreg-phys vd)))
@@ -2227,7 +2254,7 @@
               (m68k-emit-moveq buf +68k-d0+ (logand imm32 #xFF))
               (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a6+ (m68k-spill-offset vd)))
              (t
-              (m68k-emit-move-imm-disp buf imm32 +68k-a6+ (m68k-spill-offset vd)))))))
+              (m68k-emit-move-imm-disp buf imm32 +68k-a6+ (m68k-spill-offset vd))))))))
 
       (#.+op-push+
        (let ((vs (first operands)))

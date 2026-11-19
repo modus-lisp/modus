@@ -14,7 +14,7 @@
 //   1012 AUDIO-QUEUED        samples queued and not yet handed to the device.
 //
 // THE IMAGE KEEPS THE QUEUE FED, THE DEVICE KEEPS THE TIME.  An AudioQueue on
-// its own thread drains a ring every 10 ms; the image tops the ring up to a
+// its own thread drains a ring every 40 ms; the image tops the ring up to a
 // cushion whenever its loop comes round (kiln's iOS main, after each paint)
 // and reads AUDIO-QUEUED to know how far ahead it is.  A ring that runs dry
 // plays silence -- a gap, never a stall -- and nothing here ever waits on the
@@ -67,7 +67,11 @@ static long audio_open(long rate) {
     f.mChannelsPerFrame = 1; f.mBitsPerChannel = 16;
     // No run loop: the queue calls back on a thread of its own.
     if (AudioQueueNewOutput(&f, refill, NULL, NULL, NULL, 0, &q) != noErr) { q = NULL; return -5; }
-    uint32_t bytes = (uint32_t)(rate / 100) * 2;      // 10 ms a buffer
+    // 40 ms a buffer, not 10: an iPhone's hardware takes ~1024 frames a cycle, and three 10 ms
+    // buffers (30 ms in all) let the queue run dry whenever its callback was a little late --
+    // short regular gaps in the radio (Groove Salad on an iPhone 15 Pro) while the ring held
+    // 150 ms and every sample the image wrote was whole (a tap of them showed no gap at all).
+    uint32_t bytes = (uint32_t)(rate / 25) * 2;
     for (int i = 0; i < NBUF; i++) {
         AudioQueueBufferRef b;
         if (AudioQueueAllocateBuffer(q, bytes, &b) != noErr) return -12;

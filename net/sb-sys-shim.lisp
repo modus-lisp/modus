@@ -55,7 +55,13 @@
 (defpackage "SB-SYS"
   (:use)
   (:export "FD-STREAM" "FD-STREAM-P" "FD-STREAM-FD" "MAKE-FD-STREAM"
-           "WITH-PINNED-OBJECTS"))
+           "WITH-PINNED-OBJECTS" "ENABLE-INTERRUPT"))
+
+;;; SB-UNIX: the signal numbers SB-SYS:ENABLE-INTERRUPT takes (beacon ignores SIGPIPE with
+;;; them).  Only the ones Linux and Darwin number alike.
+(defpackage "SB-UNIX"
+  (:use)
+  (:export "SIGHUP" "SIGINT" "SIGPIPE" "SIGALRM" "SIGTERM"))
 
 (defpackage "SB-ALIEN"
   (:use)
@@ -936,3 +942,33 @@
           ((<= #x300 code #x36F) :mn)
           ((<= #xE000 code #xF8FF) :co)
           (t :so))))
+
+
+;;; ---- signals: SB-SYS:ENABLE-INTERRUPT ------------------------------------------------------
+
+(defconstant sb-unix:sighup 1)
+(defconstant sb-unix:sigint 2)
+(defconstant sb-unix:sigpipe 13)
+(defconstant sb-unix:sigalrm 14)
+(defconstant sb-unix:sigterm 15)
+
+(defun sb-sys:enable-interrupt (signal handler)
+  "SBCL's (ENABLE-INTERRUPT SIGNAL HANDLER) for HANDLER :IGNORE (SIG_IGN) and :DEFAULT (SIG_DFL),
+   through rt_sigaction.  NIL, as SBCL.  PARTIAL: a Lisp handler FUNCTION is not supported --
+   modus has no way to run Lisp from an asynchronous signal -- and signals an error rather than
+   installing nothing.  So do the signals the runtime itself catches (SIGILL, SIGBUS, SIGFPE,
+   SIGSEGV: they become Lisp conditions), and a refused rt_sigaction (SIGKILL, a bad number)."
+  (unless (and (integerp signal) (< 0 signal 65))
+    (error "SB-SYS:ENABLE-INTERRUPT: ~S is not a signal number" signal))
+  (when (member signal '(4 7 8 11))
+    (error "SB-SYS:ENABLE-INTERRUPT: signal ~D is modus's own (faults become Lisp conditions); ~
+            it cannot be given another disposition" signal))
+  (let ((disposition (cond ((eq handler :ignore) 1)
+                           ((eq handler :default) 0)
+                           (t (error "SB-SYS:ENABLE-INTERRUPT: modus cannot run a Lisp handler ~
+                                      (~S) for signal ~D; only :IGNORE and :DEFAULT are supported"
+                                     handler signal)))))
+    (let ((r (%set-signal-disposition signal disposition)))
+      (when (< r 0)
+        (error "SB-SYS:ENABLE-INTERRUPT: rt_sigaction(~D, ~S) failed, errno ~D" signal handler (- r)))
+      nil)))

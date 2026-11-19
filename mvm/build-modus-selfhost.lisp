@@ -1068,6 +1068,20 @@
   (mvm-interpret (make-array 11 :initial-contents (list 17 16 42 0 0 0 0 0 0 0 162))))
 ")
 (defvar *rt-macros-source* (mvm-text "mvm/runtime-cl-macros.lisp"))
+;;; THE UNICODE CHARACTER-NAME TABLE (see mvm/build-cli-common.lisp).  OFF by default here:
+;;; this image exists to compile itself (--compile, the DDC), and the table is ~210 KB of
+;;; byte-valued string literals that path has never carried.  MODUS_UNICODE_NAMES=1 bakes it.
+(load (merge-pathnames "lib/unicode-names-gen.lisp" *modus-base*))
+(defvar *unicode-names-source*
+  (if (modus.unicode-names-gen::unicode-names-wanted-p nil)
+      (concatenate 'string
+                   (mvm-text "mvm/cl-unicode-names.lisp")
+                   (string #\Newline)
+                   (modus.mvm::%build-package-scoped-source
+                    (modus.unicode-names-gen::unicode-names-source :stream *standard-output*)
+                    "mvm/cl-unicode-names-data.lisp"))
+      (mvm-text "mvm/cl-unicode-names-absent.lisp")))
+
 (defvar *bridge-source*
   (concatenate 'string
     (mvm-text "mvm/cl-sequences.lisp")
@@ -1091,6 +1105,8 @@
     (mvm-text "mvm/kernel-packages.lisp")
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
+    (string #\Newline)
+    *unicode-names-source*
     (string #\Newline)
     (mvm-text "mvm/ansi-test-aux.lisp")
     (string #\Newline)

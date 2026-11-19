@@ -617,6 +617,9 @@
   (%define-condition 'end-of-file '(stream-error) nil nil nil)
   ;; reader-error
   (%define-condition 'reader-error '(parse-error stream-error) nil nil nil)
+  ;; simple-reader-error: a READER-ERROR with a message (SBCL's sb-int:simple-reader-error)
+  ;; -- READER-ERROR itself reports only its type.  The #\\name reader uses it.
+  (%define-condition 'simple-reader-error '(simple-condition reader-error) nil nil nil)
   ;; parse-error
   (%define-condition 'parse-error '(error) nil nil nil)
   ;; print-not-readable

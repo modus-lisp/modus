@@ -2700,80 +2700,114 @@
     (if (= code 10) t (and (>= code 32) (<= code 126)))))
 (defun digit-char (weight &optional (radix 10))
   (if (< weight radix) (code-char (if (< weight 10) (+ 48 weight) (+ 55 weight))) nil))
+;;; CHARACTER NAMES, as SBCL spells and reads them.
+;;;
+;;; Every image knows: the control characters' names (CHAR-NAME of 0..32 and 127..159, which
+;;; the printer uses too), SBCL's short aliases (Lf, Nl, Ff, Sp, Del, ^A ...), the code-point
+;;; forms U+XXXX and UXXXX, and a few Unicode names portable code reads.  Every other Unicode
+;;; name -- LATIN_SMALL_LETTER_A, LOWER_ONE_EIGHTH_BLOCK, HANGUL_SYLLABLE_GA, the Unicode 1.0
+;;; aliases like LINE_FEED_(LF) -- comes from the table (mvm/cl-unicode-names.lisp, generated
+;;; at build time from the build host's CHAR-NAME), which hosted images carry and bare-metal
+;;; images leave out (MODUS_UNICODE_NAMES).  %UCN-PRESENT-P says which this image is.
+
+(defun %base-name-char-code (s)
+  "SBCL's names and aliases for the ASCII control characters (S upcased), or NIL."
+  (cond
+    ((and (= (length s) 2) (char= (char s 0) #\^)
+          (>= (char-code (char s 1)) 64) (<= (char-code (char s 1)) 95))
+     (- (char-code (char s 1)) 64))
+    ((member s '("NUL" "NULL") :test #'string=) 0)
+    ((member s '("BACKSPACE" "BS") :test #'string=) 8)
+    ((member s '("TAB" "HT") :test #'string=) 9)
+    ((member s '("NEWLINE" "LINEFEED" "LF" "NL") :test #'string=) 10)
+    ((member s '("PAGE" "FORM" "FORMFEED" "FF" "NP") :test #'string=) 12)
+    ((member s '("RETURN" "CR") :test #'string=) 13)
+    ((member s '("ESC" "ESCAPE" "ALTMODE" "ALT") :test #'string=) 27)
+    ((member s '("SPACE" "SP") :test #'string=) 32)
+    ((member s '("RUBOUT" "DELETE" "DEL") :test #'string=) 127)
+    (t nil)))
+
+(defun %u-hex-name-code (s)
+  "#\\U+FEFF and #\\UFEFF: SBCL reads a character by its code point either way (S upcased)."
+  (let ((n (length s)))
+    (when (and (> n 1) (char= (char s 0) #\U))
+      (let ((i (if (char= (char s 1) #\+) 2 1)) (v 0))
+        (when (< i n)
+          (loop
+            (when (= i n) (return v))
+            (let ((d (digit-char-p (char s i) 16)))
+              (unless d (return nil))
+              (setq v (+ (* v 16) d))
+              (when (>= v #x110000) (return nil)))
+            (setq i (+ i 1))))))))
+
+(defun %fallback-unicode-name-code (s)
+  "Without the table: the Unicode names portable code is known to read (weft, shuttle), as
+   SBCL resolves them.  Any other Unicode name is a loud reader error, never a guess."
+  (cond
+    ((string= s "NO-BREAK_SPACE") #xA0)
+    ((string= s "REPLACEMENT_CHARACTER") #xFFFD)
+    ((string= s "LINE_SEPARATOR") #x2028)
+    ((string= s "PARAGRAPH_SEPARATOR") #x2029)
+    ((string= s "ZERO_WIDTH_NO-BREAK_SPACE") #xFEFF)
+    (t nil)))
+
 (defun name-char (name)
   "Return the character with the given name (case-insensitive), or nil."
-  (let ((s (string-upcase (cond
-                            ((stringp name) name)
-                            ((symbolp name) (symbol-name name))
-                            ((characterp name) (make-string 1 :initial-element name))
-                            (t (coerce name 'string))))))
-    (cond
-      ((string= s "SPACE")     #\Space)
-      ((string= s "NEWLINE")   #\Newline)
-      ((string= s "TAB")       #\Tab)
-      ((string= s "RETURN")    (code-char 13))
-      ((string= s "BACKSPACE") (code-char 8))
-      ((string= s "RUBOUT")    (code-char 127))
-      ((string= s "PAGE")      (code-char 12))
-      ((string= s "LINEFEED")  (code-char 10))
-      ((string= s "ALTMODE")   (code-char 27))
-      ((string= s "BEL")       (code-char 7))
-      ((string= s "BELL")      (code-char 7))
-      ((string= s "NULL")      (code-char 0))
-      ((string= s "NUL")       (code-char 0))
-      ((string= s "ESCAPE")    (code-char 27))
-      ((string= s "DELETE")    (code-char 127))
-      ;; SBCL's names that portable-ish code uses (weft, the browser engine, reads all three):
-      ;; FormFeed as SBCL spells Page, and two Unicode names
-      ((string= s "FORMFEED")  (code-char 12))
-      ((string= s "NO-BREAK_SPACE") (code-char #xA0))
-      ((string= s "REPLACEMENT_CHARACTER") (code-char #xFFFD))
-      ((string= s "LINE_SEPARATOR") (code-char #x2028))
-      ((string= s "PARAGRAPH_SEPARATOR") (code-char #x2029))
-      ((string= s "ZERO_WIDTH_NO-BREAK_SPACE") (code-char #xFEFF))
-      ((string= s "VT")        (code-char 11))
-      ;; #\U+FEFF: SBCL's name for a character by its code point (shuttle's JavaScript whitespace)
-      ((and (> (length s) 2) (char= (char s 0) #\U) (char= (char s 1) #\+)
-            (let ((n (parse-integer s :start 2 :radix 16 :junk-allowed t)))
-              (and n (< n #x110000) (code-char n)))))
-      ;; every name CHAR-NAME gives
-      (t (let ((i 0) (hit nil))
-           (loop
-             (when (or hit (>= i 160)) (return hit))
-             (let ((n (%code-char-name i)))
-               (when (and n (string-equal n s)) (setq hit (code-char i))))
-             (setq i (+ i 1))))))))
+  (let* ((s (string-upcase (cond
+                             ((stringp name) name)
+                             ((symbolp name) (symbol-name name))
+                             ((characterp name) (make-string 1 :initial-element name))
+                             (t (coerce name 'string)))))
+         (code (or (%base-name-char-code s)
+                   (%u-hex-name-code s)
+                   ;; every name CHAR-NAME gives for 0..32 and 127..159 (Soh, Next-Line ...)
+                   (let ((i 0) (hit nil))
+                     (loop
+                       (when (or hit (>= i 160)) (return hit))
+                       (let ((n (%code-char-name i)))
+                         (when (and n (string-equal n s)) (setq hit i)))
+                       (setq i (+ i 1))))
+                   (if (%ucn-present-p)
+                       (%ucn-name-char s)
+                       (%fallback-unicode-name-code s)))))
+    (if code (code-char code) nil)))
 
 (defun %code-char-name (code)
-  "The name of the character with CODE, or NIL.  Every non-graphic
-   character has one (CLHS 13.1.7; FORMAT.C.4A needs ~:C = CHAR-NAME for
-   each): the control characters get their ASCII mnemonics as SBCL spells
-   them, and 128..159 are U80..U9F."
+  "The name of the character with CODE when it is not graphic (0..32 and 127..159), as SBCL
+   spells it, or NIL.  Every non-graphic character has one (CLHS 13.1.7; FORMAT.C.4A needs
+   ~:C = CHAR-NAME for each); the printer writes #\\ with these.  The graphic characters'
+   names (LATIN_SMALL_LETTER_A ...) are CHAR-NAME's, from the Unicode table."
   (cond
-    ((= code 32)  "Space")
-    ((= code 10)  "Newline")
-    ((= code 9)   "Tab")
-    ((= code 13)  "Return")
-    ((= code 8)   "Backspace")
-    ((= code 127) "Rubout")
-    ((= code 12)  "Page")
-    ((= code 27)  "Escape")
-    ((= code 7)   "Bel")
-    ((= code 0)   "Null")
     ((< code 32)
-     (nth code '("Null" "Soh" "Stx" "Etx" "Eot" "Enq" "Ack" "Bel" "Backspace"
+     (nth code '("Nul" "Soh" "Stx" "Etx" "Eot" "Enq" "Ack" "Bel" "Backspace"
                  "Tab" "Newline" "Vt" "Page" "Return" "So" "Si" "Dle" "Dc1"
-                 "Dc2" "Dc3" "Dc4" "Nak" "Syn" "Etb" "Can" "Em" "Sub" "Escape"
+                 "Dc2" "Dc3" "Dc4" "Nak" "Syn" "Etb" "Can" "Em" "Sub" "Esc"
                  "Fs" "Gs" "Rs" "Us")))
+    ((= code 32)  "Space")
+    ((= code 127) "Rubout")
     ((and (>= code 128) (< code 160))
-     (concatenate 'string "U" (string-upcase (write-to-string code :base 16 :radix nil))))
+     (nth (- code 128)
+          '("U80" "U81" "Break-Permitted" "No-Break-Permitted" "U84" "Next-Line"
+            "Start-Selected-Area" "End-Selected-Area" "Character-Tabulation-Set"
+            "Character-Tabulation-With-Justification" "Line-Tabulation-Set"
+            "Partial-Line-Forward" "Partial-Line-Backward" "Reverse-Linefeed"
+            "Single-Shift-Two" "Single-Shift-Three" "Device-Control-String"
+            "Private-Use-One" "Private-Use-Two" "Set-Transmit-State" "Cancel-Character"
+            "Message-Waiting" "Start-Guarded-Area" "End-Guarded-Area" "Start-String" "U99"
+            "Single-Character-Introducer" "Control-Sequence-Introducer" "String-Terminator"
+            "Operating-System-Command" "Privacy-Message" "Application-Program-Command")))
     (t nil)))
 
 (defun char-name (c)
   "Return the name of the character, or nil.  Signals TYPE-ERROR on
-   non-character per CLHS — required by char-name.5 (char-type-error-check)."
+   non-character per CLHS — required by char-name.5 (char-type-error-check).
+   With the Unicode table, every character has SBCL's name (U<hex> when Unicode gives none);
+   without it, only the non-graphic ones do."
   (unless (characterp c) (%signal-type-error))
-  (%code-char-name (%ensure-char-code c)))
+  (let ((code (%ensure-char-code c)))
+    (or (%code-char-name code)
+        (if (%ucn-present-p) (%ucn-char-name code) nil))))
 
 ;; Char comparisons are variadic per CLHS — single-arg returns T,
 ;; multi-arg checks pairwise.  Tests like (CHAR= (progn (incf i) #\a))

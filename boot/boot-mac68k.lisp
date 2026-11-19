@@ -128,36 +128,43 @@
     ;; the kind map past them -- moving every kind-map bias by the difference
     ;; (the relocation table's x7/8 class) -- and leaves both in the low block
     ;; (+MAC68K-HEAP-SLOT+), where EMIT-MAC68K-ENTRY takes them.
-    ;; PACKED ABOVE THE IMAGE (2026-11-19).  The image (11.2 MB of 68k with
-    ;; CONS / ALLOC-OBJ shared, type-error codes, no call-site temp saves) must
-    ;; end below :STATIC-LO, ~800 KB of room to grow; mac68k-core.py lays the
+    ;; PACKED ABOVE THE IMAGE (2026-11-19).  The image (10.3 MB of 68k with
+    ;; CONS / ALLOC-OBJ shared, type-error codes, no call-site temp saves, the
+    ;; unreachable DEFUNs left out: MODUS_SHAKE) must end below :STATIC-LO,
+    ;; ~250 KB of room to grow; mac68k-core.py lays the
     ;; frozen static heap (~320 KB) from the image's end and fails the build
     ;; past :STATIC-HI.  Then the JIT area, the code cache, the stack, the I/O
-    ;; pages, NIL's page and the region, as before but 6.2 MB lower: the
+    ;; pages, NIL's page and the region, as before but 7.2 MB lower: the
     ;; static heap's 4 MB reserve is gone.  THE CORE RUN (Basilisk II: 32 MB,
     ;; nothing above #x1B00000) puts its 4 MB boot heap where the young heap
     ;; goes, just past the low block -- that run never uses the young heap --
     ;; so the kind map a disk boot is baked with sits past the boot heap and
     ;; its guard: (+ region alloc-start boot-heap-size gc-guard), and its kind
-    ;; bytes run to #x18F6000.  The disk boot's own 1 MB young heap is covered
+    ;; bytes run to #x17F6000.  The disk boot's own 1 MB young heap is covered
     ;; by the same map.  Unpaged, so no code cache is used.
-    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): FB0000.  Its
-    ;; minimum partition is SPAN + 1.5 MB = 17,600 KB, which leaves the young
-    ;; heap two 512 KB semispaces (mac68k-chain.s HSIZE: 4/9 of the room past
-    ;; the low block).  F20000 left 256 KB ones, and the first DEFUN bombed --
-    ;; measured on MAME's Quadra 950 under 7.5.3; 17,600 KB runs the benchmark
-    ;; forms exactly as 24 MB does.
-    (:quadra  :load #x00600000 :static-lo #x01180000 :static-hi #x01200000
-              :jit-area-lo #x01200000 :jit-area-hi #x013D0000 :jit-max-bytecode 16384
-              :cache-lo #x013D0000 :cache-hi #x013F0000
-              :staging #x013F0000 :staging-size #x00000000
-              :stack-top #x01420000 :scratch #x01420000 :io-buf #x01421000
-              :nil-page #x01430000
-              :region #x01440000 :heap-size #x00100000 :gc-guard #x00010000
-              :kind-map #x01870000
-              :boot-heap #x01460000 :boot-heap-size #x00400000
-              :boot-cache-lo #x013D0000 :boot-cache-hi #x013F0000
-              :boot-stack-top #x01420000)
+    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): F30000.  Its
+    ;; minimum partition is SPAN + 1.5 MB = 17,088 KB.  The loader
+    ;; (mac68k-chain.s HSIZE) gives the young heap 4/9 of the room past the low
+    ;; block, after aligning the image's base to 512 KB inside the partition --
+    ;; so what one partition size leaves varies with where the Process Manager
+    ;; puts it.  The span covers the worst alignment, so the minimum always
+    ;; leaves two 512 KB semispaces, and the loader refuses (its "allocate"
+    ;; message) a partition that leaves less.  Measured on MAME's Quadra 950
+    ;; under 7.5.3: at partitions of span + 1.5 MB, with spans 512 KB and
+    ;; 1 MB shorter, some runs passed every benchmark form and some quit with
+    ;; error type 3 at the first DEFUN -- the same image both ways, so the
+    ;; placement (semispaces short of 512 KB, inferred, not read) decides.
+    (:quadra  :load #x00600000 :static-lo #x01080000 :static-hi #x01100000
+              :jit-area-lo #x01100000 :jit-area-hi #x012D0000 :jit-max-bytecode 16384
+              :cache-lo #x012D0000 :cache-hi #x012F0000
+              :staging #x012F0000 :staging-size #x00000000
+              :stack-top #x01320000 :scratch #x01320000 :io-buf #x01321000
+              :nil-page #x01330000
+              :region #x01340000 :heap-size #x00100000 :gc-guard #x00010000
+              :kind-map #x01770000
+              :boot-heap #x01360000 :boot-heap-size #x00400000
+              :boot-cache-lo #x012D0000 :boot-cache-hi #x012F0000
+              :boot-stack-top #x01320000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
     ;; the 4 MB map; the static heap from the image's init-only text

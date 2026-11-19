@@ -324,7 +324,7 @@ splash: movem.l %d3-%d6/%a3-%a4, -(%sp)
 | GUARD, then the kind map -- a byte per 8 bytes of [region, guard's end),
 | 64 KB-aligned, since its move is added to the high words of the x7/8
 | sites.  So a semispace is 4/9 of what is left, in 64 KB units.  HHALF,
-| HKMAP, HEXTRA; NE when the partition leaves less than 256 KB a semispace.
+| HKMAP, HEXTRA; NE when the partition leaves less than 512 KB a semispace.
 hsize:  tst.l   44(%a2)
         beq     9f
         move.l  (%a2), %d1
@@ -340,7 +340,7 @@ hsize:  tst.l   44(%a2)
         divu.w  #9, %d2
         and.l   #0xFFFF, %d2
         swap    %d2                     | HALF
-        cmp.l   #0x40000, %d2
+        cmp.l   #0x80000, %d2           | 512 KB: a first DEFUN bombed in 256 KB ones
         blo     8f
         move.l  %d2, HHALF(%a6)
         add.l   %d2, %d2

@@ -8454,6 +8454,12 @@
   "Convert N to a float (CLHS).  With no PROTO: an existing float is
    returned unchanged, otherwise N becomes a SINGLE-FLOAT (the CLHS
    default).  With PROTO: the result has PROTO's float format."
+  ;; (FLOAT fixnum <double>): one :ITOF, as %TO-DOUBLE does inside a double
+  ;; tree.  The general path builds the double from its 32-bit halves, which
+  ;; are bignums on the 30-bit tower: ~29 us a call on i386 (qemu), the
+  ;; whole cost of a declared double loop.
+  (when (and (fixnump n) proto (%ieee-float-p proto) (= (obj-subtag proto) #x60))
+    (return-from float (%float-from-int n)))
   (let ((f (cond
              ((%ieee-float-p n) n)
              ;; %bignum-to-float (cl-types): cvtsi2sd on a bignum POINTER

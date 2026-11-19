@@ -948,10 +948,15 @@
   (and (floatp x) (= x x) (> (abs x) most-positive-double-float)))
 
 (defun sb-ext:get-time-of-day ()
-  "(values seconds microseconds) since the Unix epoch.  The microseconds come from the internal
-   real-time clock, so they are monotonic within a second's reading rather than the wall clock's."
-  (let ((us (floor (* (get-internal-real-time) 1000000) internal-time-units-per-second)))
-    (values (- (get-universal-time) 2208988800) (mod us 1000000))))
+  "(values seconds microseconds) since the Unix epoch, both halves from ONE CLOCK_REALTIME reading,
+   as gettimeofday(2) gives them.  The microseconds used to come from the monotonic clock while the
+   seconds came from the wall clock, so (+ (* s 1000000) us) jumped by up to a second either way:
+   beacon's store-load log printed a negative duration."
+  (let ((ns (%clock-gettime-ns 0)))
+    (when (or (not (integerp ns)) (<= ns 0))
+      (error "SB-EXT:GET-TIME-OF-DAY: this image has no wall clock"))
+    (multiple-value-bind (s rem) (floor ns 1000000000)
+      (values s (floor rem 1000)))))
 
 ;;; A weak pointer that holds its object STRONGLY: modus's collectors keep no weak references, so
 ;;; the honest answer is "still there".  A cache keyed through one never shrinks, which is the cost.

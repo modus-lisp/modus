@@ -4547,7 +4547,12 @@
   ;; never finished defining (LOOP's generator, fed the template, built its clauses forever).
   (if (%aref-see-through form)
       (cons (%aref-see-through form) t)
-  (if (%bq-form-p form)
+  ;; RUNTIME COMPILES ONLY (*MVM-EVAL-RUNTIME-P*): the build-time compile walks the image's own
+  ;; source as it always did.  With this on there too, the SBCL-hosted and the self-hosted
+  ;; compiles of the image diverged (the UEFI and AArch64 DDCs; the first differing function
+  ;; was a closure in GENERATE-LOOP-CODE), and the image's source never needed it -- the
+  ;; templates it fixes are in libraries loaded at run time, mill's among them.
+  (if (and *mvm-eval-runtime-p* (%bq-form-p form))
       (cons (expand-backquote (cadr form)) t)
   (if (and (consp form) (symbolp (car form)) (not (keywordp (car form))))
       (let* ((name (normalize-name (car form)))

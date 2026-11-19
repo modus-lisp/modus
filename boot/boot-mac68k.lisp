@@ -149,14 +149,20 @@
     ;; shift carries #xF00000 to #x1000000, and the image's source text spells
     ;; layout addresses in hex, so the pool grew a word and every address after
     ;; it moved -- differences the relocation table cannot describe.
-    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 860000 (BC0000
-    ;; before cold native code, D30000 while the JIT area was in the map).  Its
+    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 800000 (860000
+    ;; with a stack of its own, BC0000 before cold native code, D30000 while the JIT area was in the map).  Its
     ;; minimum partition is SPAN + 1.5 MB.
     ;; COLD NATIVE CODE (2026-11-19, compiler.lisp *COLD-KEEP*): the functions a
     ;; coverage run never entered stay on the disk until their first call, so
     ;; the resident image is ~5.4 MB and everything past it moved down 3.4 MB.
-    ;; The boot tail still runs to ~#xB9B250 in the core run: :CACHE-LO is
-    ;; above it.  The loader
+    ;; THE APPLICATION'S STACK IS OVER THE BOOT TAIL: once the core is saved,
+    ;; what the static heap does not cover of the init-only text and the boot
+    ;; tail (~450 KB, to ~#xB9B250) is dead, so :STACK-TOP is just past it and
+    ;; the stack grows down over it.  No code cache (unpaged).  The core run
+    ;; needs the tail, so ITS stack is :BOOT-STACK-TOP, above the disk boot's
+    ;; code area in Basilisk's free RAM; the scratch and I/O pages, NIL's page
+    ;; and the low block, which both runs use, start past the tail
+    ;; (mac68k-core.py fails a tail that reaches :STACK-TOP).  Span 800000.  The loader
     ;; (mac68k-chain.s HSIZE) gives the young heap 4/9 of the room past the low
     ;; block, after aligning the image's base to 512 KB inside the partition --
     ;; so what one partition size leaves varies with where the Process Manager
@@ -175,16 +181,16 @@
     ;; below is what a DISK boot (the core run) uses, past the kind bytes.
     ;; Between :STATIC-HI and :CACHE-LO, 128 KB for the boot tail's end.
     (:quadra  :load #x00600000 :static-lo #x00B00000 :static-hi #x00B80000
-              :jit-area-lo #x010F0000 :jit-area-hi #x01A00000 :jit-max-bytecode 16384
-              :cache-lo #x00BC0000 :cache-hi #x00BE0000
-              :staging #x00BE0000 :staging-size #x00000000
-              :stack-top #x00C10000 :scratch #x00C10000 :io-buf #x00C11000
-              :nil-page #x00C20000
-              :region #x00C30000 :heap-size #x00100000 :gc-guard #x00010000
-              :kind-map #x01060000
-              :boot-heap #x00C50000 :boot-heap-size #x00400000
-              :boot-cache-lo #x00BC0000 :boot-cache-hi #x00BE0000
-              :boot-stack-top #x00C10000)
+              :jit-area-lo #x01090000 :jit-area-hi #x019C0000 :jit-max-bytecode 16384
+              :cache-lo #x00BB0000 :cache-hi #x00BB0000
+              :staging #x00BB0000 :staging-size #x00000000
+              :stack-top #x00BB0000 :scratch #x00BB0000 :io-buf #x00BB1000
+              :nil-page #x00BC0000
+              :region #x00BD0000 :heap-size #x00100000 :gc-guard #x00010000
+              :kind-map #x01000000
+              :boot-heap #x00BF0000 :boot-heap-size #x00400000
+              :boot-cache-lo #x00BB0000 :boot-cache-hi #x00BB0000
+              :boot-stack-top #x01A00000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
     ;; the 4 MB map; the static heap from the image's init-only text

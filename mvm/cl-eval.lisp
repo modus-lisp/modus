@@ -734,6 +734,7 @@
 
 (defun %macro-pkg-put-1 (sym key fn)
   (%mexp-memo-invalidate)
+  (%macro-defs-changed)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn (stringp key))
       (unless *macro-pkg-table*
@@ -755,6 +756,7 @@
 
 (defun %macro-pkg-rem-1 (sym key)
   (%mexp-memo-invalidate)
+  (%macro-defs-changed)
   (let ((pn (%macro-sym-pkg-name sym)))
     (when (and pn *macro-pkg-table* (stringp key))
       (let ((al (gethash key *macro-pkg-table*))

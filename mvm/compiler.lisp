@@ -867,6 +867,7 @@
         (setf (gethash h *setf-expanders-pkg*)
               (%reg-pkg-alist-put (gethash h *setf-expanders-pkg*) p expander))))
     (%mexp-memo-invalidate)   ; a SETF form expanded before this registration is stale
+    (%macro-defs-changed)
     (setf (gethash h *setf-expanders*) expander)))
 
 (defun mvm-find-setf-expander (name)
@@ -4493,6 +4494,31 @@
    a macro table clears it (see %MEXP-MEMO-INVALIDATE).")
 (defun %mexp-memo-invalidate () (setq *mexp-memo* nil))
 
+;;; THE MACRO-DEFINITIONS EPOCH.  EVAL caches the code it compiled for a form
+;;; (*MVM-EVAL-CACHE*), and that code is the form AS EXPANDED: a head that was a
+;;; macro is gone, replaced by its expansion; a head that was not is a CALL.  So
+;;; the code is only the form's meaning while every macro it saw -- and every
+;;; one it did not see -- is as it was.  SBCL expands again on every EVAL; a
+;;; cache hit did not, so (EVAL '(M X)) before M was a macro, and again after,
+;;; called a function M with the value of X both times, and a REDEFINED macro
+;;; kept its old expansion.  TI's (DEFINE-LOOP-MACRO LOOP) was the case: cortez
+;;; evaluates it once while DEFINE-LOOP-MACRO is still being fetched, and every
+;;; later EVAL of it -- with the macro standing -- said LOOP was an unbound
+;;; variable, so their LOOP never existed and no flavor did either.
+;;;
+;;; This counts DEFINITIONS -- a macro, a SETF expander, or the loss of one --
+;;; and an EVAL-cache entry stands only at the count it was compiled under.  Not
+;;; %MEXP-MEMO-INVALIDATE's count: that also fires for the compiler's own
+;;; temporary shadows (FLET over a macro name, MACROLET), which put the table
+;;; back and would empty the cache on every compile.
+(defvar *macro-defs-epoch* nil
+  "Bumped by every macro / SETF-expander definition or removal.  NIL until the
+   first: a DEFVAR's initform does not run at boot, and the boot's own macro
+   registrations are the first callers.")
+
+(defun %macro-defs-changed ()
+  (setq *macro-defs-epoch* (if *macro-defs-epoch* (+ 1 *macro-defs-epoch*) 1)))
+
 ;;; The memo is keyed by the form's ADDRESS in the image, and the copying
 ;;; collector moves every form: after a GC every entry MISSED (the EQ
 ;;; validation kept hits honest but nothing found them), so each analysis
@@ -4793,6 +4819,7 @@
           (setq *shadowing-macro-table* (make-hash-table :test 'eq)))
         (setf (gethash name *shadowing-macro-table*) expander)
         (%mexp-memo-invalidate)
+        (%macro-defs-changed)
         (set-macro-function name expander))
       (mvm-define-macro (normalize-name name) expander)))
 
@@ -4811,6 +4838,7 @@
         (setq *macro-name-table* (make-hash-table :test 'eql)))
       (setf (gethash hash *macro-name-table*) (string name)))
     (%mexp-memo-invalidate)
+    (%macro-defs-changed)
     (setf (gethash hash *macro-table*) expander)))
 
 (defun %env-visible-symbol-macros (env)

@@ -59,6 +59,8 @@
 (defun emit-i386-cl-entry (buf)
   "Entry stub of the bare i386 CL image.  See the file header for the map."
   (let* ((x87 (let ((s (find-symbol "*I386-X87*" "MODUS.MVM.I386"))) (and s (symbol-value s))))
+         (soft (let ((s (find-symbol "*CLI-SOFT-FLOAT*" "COMMON-LISP-USER")))
+                 (and s (boundp s) (symbol-value s))))
          (nil-value +linux-i386-nil-value+)
          (g +linux-i386-globals+))
     (i386l-assemble
@@ -66,16 +68,26 @@
      (append
       (list '(#xFA))                                          ; cli
       ;; the FPU: SSE2's OS bits, or x87 at 53-bit precision (MODUS_I386_FP=x87,
-      ;; which runs where there is no CR4 to write -- a 386 or 486)
-      (if x87
-          (list '(#xDB #xE3)                                  ; fninit
-                '(#x68 #x7F #x02 #x00 #x00)                   ; push #x027F
-                '(#xD9 #x2C #x24)                             ; fldcw [esp]
-                '(#x83 #xC4 #x04))                            ; add esp, 4
-          (list '(#x0F #x20 #xC0 #x25 #xFB #xFF #xFF #xFF     ; cr0: EM=0
-                  #x83 #xC8 #x02 #x0F #x22 #xC0)              ;      MP=1
-                '(#x0F #x20 #xE0 #x0D #x00 #x06 #x00 #x00     ; cr4: OSFXSR|OSXMMEXCPT
-                  #x0F #x22 #xE0)))
+      ;; which runs where there is no CR4 to write -- a 386 or 486), or for
+      ;; the soft-float image (MODUS_I386_SOFT_FLOAT, a 486SX or a 386 with no
+      ;; coprocessor) no FPU at all: CR0.EM=1, MP=0, so a stray FPU
+      ;; instruction traps (#NM) instead of doing nothing, and no CR4, which a
+      ;; 486SX does not have (writing it is #UD: the image died at its first
+      ;; instruction there).
+      (cond
+        (x87
+         (list '(#xDB #xE3)                                   ; fninit
+               '(#x68 #x7F #x02 #x00 #x00)                    ; push #x027F
+               '(#xD9 #x2C #x24)                              ; fldcw [esp]
+               '(#x83 #xC4 #x04)))                            ; add esp, 4
+        (soft
+         (list '(#x0F #x20 #xC0 #x83 #xC8 #x04                ; cr0: EM=1
+                 #x83 #xE0 #xFD #x0F #x22 #xC0)))             ;      MP=0
+        (t
+         (list '(#x0F #x20 #xC0 #x25 #xFB #xFF #xFF #xFF      ; cr0: EM=0
+                 #x83 #xC8 #x02 #x0F #x22 #xC0)               ;      MP=1
+               '(#x0F #x20 #xE0 #x0D #x00 #x06 #x00 #x00      ; cr4: OSFXSR|OSXMMEXCPT
+                 #x0F #x22 #xE0))))
       (list
        (i386cl-abs '(#x89 #x1D) #x500)                        ; mov [0x500], ebx  (the info)
        (cons #xBC (i386l-le32-list +i386-cl-boot-stack+))     ; mov esp, boot stack

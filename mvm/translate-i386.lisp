@@ -5818,6 +5818,44 @@
     (i386-fixup-labels buf)
     buf))
 
+;;; THE BOOT-ONLY TAIL (compiler.lisp *BOOT-TAIL-LAST*, set by the bare
+;;; build): the functions only boot runs are laid out last.  Everything a
+;;; restored process still needs -- the collector, the shared routines, the
+;;; handler-case helpers -- is emitted IN FRONT of them, and *I386-BOOT-TAIL*
+;;; is (start . end), their native positions: once a saved core is restored
+;;; that code is dead, and the entry stub lays the heap over its pages
+;;; (boot/boot-i386-cl.lisp, scripts/dos386-core.py).
+(defvar *i386-boot-tail* nil)
+
+(defun i386-emit-resident-routines (buf)
+  "The code emitted once after the image's resident functions: the GC
+   trampoline, the shared routines, the handler-case helpers."
+  ;; The GC trampoline, emitted once after the last function.
+  (when *i386-gc-collect-label*
+    (when *i386-fn-align*
+      (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
+                              *i386-fn-align*))
+            do (i386-emit-nop buf)))
+    ;; The checker polices OPCODE codegen (EAX doubles as VR there).  Inside
+    ;; the collector every mutator register is already saved by PUSHAD, so
+    ;; EAX is an ordinary temp; silence the checker for this block.
+    (let ((*i386-check-eax-invariant* nil))
+      (i386-emit-gc-trampoline buf *i386-gc-collect-label* nil)))
+  (when *i386-shared-cons-label*
+    (let ((*i386-check-eax-invariant* nil))
+      (i386-emit-shared-routines buf)))
+  ;; The handler-case push/pop helpers, likewise emitted once after the last
+  ;; function.  They use EAX as a copy temp but SAVE AND RESTORE it, which
+  ;; the per-opcode checker cannot see; silence it for this block.
+  (when *i386-handler-push-label*
+    (when *i386-fn-align*
+      (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
+                              *i386-fn-align*))
+            do (i386-emit-nop buf)))
+    (let ((*i386-check-eax-invariant* nil))
+      (i386-emit-handler-helpers buf *i386-handler-push-label*
+                                 *i386-handler-pop-label*))))
+
 ;;; MODUS_I386_OP_BYTES=FILE (build host only; the image is unchanged): the
 ;;; native bytes the image's translation emits per MVM opcode, with the number
 ;;; of instructions, written to FILE sorted by bytes.  What makes i386 code
@@ -5856,6 +5894,14 @@
   ;; Reset the per-translation LI-CONST patch list (see
   ;; *i386-li-const-patches* / cross.lisp's apply-li-const-patches).
   (setf *i386-li-const-patches* nil)
+  ;; THE BOOT-ONLY TAIL: the table comes in compile order, so the functions
+  ;; the compiler laid out last (bytecode offset >= *BOOT-TAIL-PC*) are
+  ;; translated last, the rest keeping their order; see *I386-BOOT-TAIL*.
+  (when modus.mvm::*boot-tail-pc*
+    (let ((pc modus.mvm::*boot-tail-pc*))
+      (setf function-table
+            (stable-sort (copy-list function-table) #'<
+                         :key (lambda (e) (if (>= (second e) pc) 1 0))))))
   (let* ((buf (make-i386-buffer))
          (n-functions (length function-table))
          (fn-labels (make-array n-functions))
@@ -5901,6 +5947,7 @@
     ;; garbage from-space.  Bare-metal i386 therefore keeps `int $0x31` and is
     ;; byte-identical to a pre-collector build; wiring it up is a separate job
     ;; that starts with the boot-side init.
+    (setf *i386-boot-tail* nil)
     (setf *i386-gc-collect-label*
           (and *i386-gc-enabled* (i386-gc-mode-p) (i386-make-label)))
     (let ((shared (and *i386-gc-collect-label* (i386-shared-routines-p))))
@@ -5924,6 +5971,10 @@
           for fn-offset = (second entry)
           for fn-length = (third entry)
           do (progn
+               (when (and modus.mvm::*boot-tail-pc* (not *i386-boot-tail*)
+                          (>= fn-offset modus.mvm::*boot-tail-pc*))
+                 (i386-emit-resident-routines buf)
+                 (setf *i386-boot-tail* (cons (i386-current-pos buf) nil)))
                ;; Function-entry alignment.  With *i386-fn-tag-3* on, :fn-addr
                ;; OR-3s the entry address, so the low nibble must be 0 at the
                ;; RUNTIME virtual address — hence padding is computed against
@@ -5975,31 +6026,12 @@
                           (string-equal (first entry) "%N386-EXPORT-TABLE"))
                  (i386-emit-native-exports buf))))
     (i386-op-bytes-write)
-    ;; The GC trampoline, emitted once after the last function.
-    (when *i386-gc-collect-label*
-      (when *i386-fn-align*
-        (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
-                                *i386-fn-align*))
-              do (i386-emit-nop buf)))
-      ;; The checker polices OPCODE codegen (EAX doubles as VR there).  Inside
-      ;; the collector every mutator register is already saved by PUSHAD, so
-      ;; EAX is an ordinary temp; silence the checker for this block.
-      (let ((*i386-check-eax-invariant* nil))
-        (i386-emit-gc-trampoline buf *i386-gc-collect-label* nil)))
-    (when *i386-shared-cons-label*
-      (let ((*i386-check-eax-invariant* nil))
-        (i386-emit-shared-routines buf)))
-    ;; The handler-case push/pop helpers, likewise emitted once after the last
-    ;; function.  They use EAX as a copy temp but SAVE AND RESTORE it, which
-    ;; the per-opcode checker cannot see; silence it for this block.
-    (when *i386-handler-push-label*
-      (when *i386-fn-align*
-        (loop until (zerop (mod (+ *i386-native-code-offset* (i386-current-pos buf))
-                                *i386-fn-align*))
-              do (i386-emit-nop buf)))
-      (let ((*i386-check-eax-invariant* nil))
-        (i386-emit-handler-helpers buf *i386-handler-push-label*
-                                   *i386-handler-pop-label*)))
+    ;; the collector and the shared routines, unless the boot-only tail came
+    ;; first (then they are already in front of it)
+    (unless *i386-boot-tail*
+      (i386-emit-resident-routines buf))
+    (when *i386-boot-tail*
+      (setf (cdr *i386-boot-tail*) (i386-current-pos buf)))
     ;; Resolve all label fixups
     (i386-fixup-labels buf)
     ;; Resolve fn-map: replace label IDs with actual native byte positions

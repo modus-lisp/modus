@@ -56,7 +56,15 @@
 (defconstant +i386-cl-v-bm2+    #x8020)
 (defconstant +i386-cl-v-core+   #x8024
   "1 when the stub restored a saved core (%CORE-REQUESTED-P reads it), else 0.")
-(defconstant +i386-cl-v-hdr+    #x8030 "The core's header (physical = virtual).")
+(defconstant +i386-cl-v-hdr+    #x8030 "The core's header (physical = virtual), or 0.")
+(defconstant +i386-cl-v-tailpa+ #x8034 "The boot-only tail's first page.")
+(defconstant +i386-cl-v-tail+   #x8038 "The tail's bytes the heap takes (0: none).")
+(defconstant +i386-cl-v-coren+  #x803C "The core's whole pages' bytes the heap takes.")
+(defconstant +i386-cl-v-hcur+   #x8040 "The next heap VA to map.")
+(defconstant +i386-cl-v-free+   #x8044 "The core's allocation pointer.")
+(defconstant +i386-cl-v-count+  #x8048 "The core's collection count.")
+(defconstant +i386-cl-v-heapb+  #x804C "The core's heap bytes.")
+(defconstant +i386-cl-v-bmb+    #x8050 "One bitmap slice's bytes.")
 (defconstant +i386-cl-cmdline+  #x8200
   "The Multiboot command line, copied here by the stub (255 bytes, NUL-ended).")
 (defconstant +i386-cl-core-data+ 64 "The core's header bytes; its data follow.")
@@ -152,11 +160,51 @@
        (cons #xB9 (i386l-le32-list 1024)) '(#xF3 #xAB)       ; rep stosd
        '(#x5E) (cons #xBF (i386l-le32-list #xDEAD0000))
        (cons #xB9 (i386l-le32-list 1)) '(:call 0 map)
+       ;; ---- a SAVED CORE (scripts/dos386-core.py), found before the heap is
+       ;; sized: the file's last 16 bytes are 'MODUSCOR' and the header's
+       ;; physical address.  Header: 'MCOR', version 2, the allocation pointer,
+       ;; the heap bytes from #x19000000, one bitmap slice's bytes, the
+       ;; boot-only tail's first and last page (0 0: none); at +64 the low
+       ;; block, the heap, both slices.  Once restored, the tail's code and the
+       ;; core's own pages are dead, so they count as RAM here and become the
+       ;; heap's first pages (tail, then core).  Copying the core into them is
+       ;; safe going forward: every destination lies below its source.
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hdr+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-tail+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-coren+) (i386l-le32-list 0))
+       (i386cl-abs '(#xA1) (+ +i386-cl-load-addr+ 20))        ; mov eax, [load_end]
+       (cons #x3D (i386l-le32-list (+ +i386-cl-load-addr+ 64)))  ; long enough?
+       '(:jcc32 #x72 probe-done)                              ; jb
+       (cons #x81 (cons #x78 (cons #xF0 (i386l-le32-list #x55444F4D))))  ; cmp [eax-16], 'MODU'
+       '(:jcc32 #x75 probe-done)
+       (cons #x81 (cons #x78 (cons #xF4 (i386l-le32-list #x524F4353))))  ; cmp [eax-12], 'SCOR'
+       '(:jcc32 #x75 probe-done)
+       '(#x8B #x58 #xF8)                                      ; mov ebx, [eax-8]
+       (cons #x81 (cons #x3B (i386l-le32-list #x524F434D)))   ; cmp [ebx], 'MCOR'
+       '(:jcc32 #x75 probe-done)
+       (cons #x83 '(#x7B #x04 #x02))                          ; cmp dword [ebx+4], 2
+       '(:jcc32 #x75 probe-done)
+       (i386cl-abs '(#x89 #x1D) +i386-cl-v-hdr+)
+       '(#x8B #x4B #x14) (i386cl-abs '(#x89 #x0D) +i386-cl-v-tailpa+)   ; tail's first page
+       '(#x8B #x53 #x18) '(#x29 #xCA)                         ; edx = last - first
+       '(:j8 #x76 no-tail)                                    ; jbe
+       (i386cl-abs '(#x89 #x15) +i386-cl-v-tail+)
+       '(:label no-tail)
+       ;; the core's whole pages: [header, (load_end - 16) & ~4095)
+       '(#x89 #xC1) '(#x83 #xE9 #x10)                         ; ecx = load_end - 16
+       '(#x81 #xE1) (i386l-le32-list #xFFFFF000)
+       '(#x29 #xD9)                                           ; - header
+       '(:j8 #x76 probe-done)                                 ; jbe
+       (i386cl-abs '(#x89 #x0D) +i386-cl-v-coren+)
+       '(:label probe-done)
        ;; ---- the heap's size from what is left: X = R - R/32 covers S + M and
        ;;      the bitmaps (2/128); M = min(16 MB, X/9), S = X - M ... -----------
+       '(:label size-again)
        (i386cl-abs '(#xA1) +i386-cl-v-ramend+)
        (i386cl-abs '(#x2B #x05) +i386-cl-v-panext+)          ; sub eax, [panext]
        (cons #x2D (i386l-le32-list +i386-cl-pt-reserve+))     ; sub eax, reserve
+       (i386cl-abs '(#x03 #x05) +i386-cl-v-tail+)            ; + the dead tail
+       (i386cl-abs '(#x03 #x05) +i386-cl-v-coren+)           ; + the core's pages
        '(#x89 #xC2) '(#xC1 #xEA #x05) '(#x29 #xD0)            ; eax -= eax/32
        '(#x89 #xC7)                                           ; edi = X
        '(#x31 #xD2) (cons #xB9 (i386l-le32-list 9)) '(#xF7 #xF1) ; eax = X/9
@@ -177,13 +225,46 @@
        '(#x81 #xE3 #x00 #xF0 #xFF #xFF)                       ; M to a page
        (i386cl-abs '(#xA3) +i386-cl-v-s+)
        (i386cl-abs '(#x89 #x1D) +i386-cl-v-m+)
+       ;; the core fits if its allocation pointer is below this machine's
+       ;; limit, heap + S/2 - M; if not, size again without it (a cold boot)
+       (i386cl-abs '(#x8B #x1D) +i386-cl-v-hdr+)
+       '(#x85 #xDB) '(:jcc32 #x74 fits)                       ; test ebx, ebx; jz
+       '(#xD1 #xE8)                                           ; eax = S/2
+       (cons #x05 (i386l-le32-list +i386-cl-heap-va+))
+       (i386cl-abs '(#x2B #x05) +i386-cl-v-m+)
+       '(#x39 #x43 #x08)                                      ; cmp [ebx+8], eax
+       '(:jcc32 #x72 fits)                                    ; jb
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hdr+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-tail+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-coren+) (i386l-le32-list 0))
+       '(:jmp32 0 size-again)
+       '(:label fits)
        ;; the heap, S + M at VA #x19000000 (not zeroed: every allocation
-       ;; initialises what it takes, as on the hosted mmap's fresh pages)
-       '(#x8D #x0C #x18)                                      ; lea ecx, [eax+ebx]
-       '(#x51) '(:call 0 alloc) '(#x89 #xC6) '(#x59)       ; esi = PA; ecx = S+M
-       '(#x51) '(#xC1 #xE9 #x0C)
-       (cons #xBF (i386l-le32-list +i386-cl-heap-va+)) '(:call 0 map)
-       '(#x59)
+       ;; initialises what it takes, as on the hosted mmap's fresh pages):
+       ;; the tail's pages, the core's, then fresh RAM.  [hcur] = next VA.
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hcur+) (i386l-le32-list +i386-cl-heap-va+))
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-tail+)
+       '(#x85 #xC9) '(:j8 #x74 map-no-tail)
+       (i386cl-abs '(#x8B #x35) +i386-cl-v-tailpa+)
+       (i386cl-abs '(#x8B #x3D) +i386-cl-v-hcur+)
+       '(#xC1 #xE9 #x0C) '(:call 0 map)
+       (i386cl-abs '(#xA1) +i386-cl-v-tail+) (i386cl-abs '(#x01 #x05) +i386-cl-v-hcur+)
+       '(:label map-no-tail)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-coren+)
+       '(#x85 #xC9) '(:j8 #x74 map-no-core)
+       (i386cl-abs '(#x8B #x35) +i386-cl-v-hdr+)
+       (i386cl-abs '(#x8B #x3D) +i386-cl-v-hcur+)
+       '(#xC1 #xE9 #x0C) '(:call 0 map)
+       (i386cl-abs '(#xA1) +i386-cl-v-coren+) (i386cl-abs '(#x01 #x05) +i386-cl-v-hcur+)
+       '(:label map-no-core)
+       ;; the rest: S + M - (hcur - heap)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-s+) (i386cl-abs '(#x03 #x0D) +i386-cl-v-m+)
+       (cons #x81 (cons #xC1 (i386l-le32-list +i386-cl-heap-va+)))   ; add ecx, heap
+       (i386cl-abs '(#x2B #x0D) +i386-cl-v-hcur+)
+       '(#x51) '(:call 0 alloc) '(#x89 #xC6) '(#x59)          ; esi = PA
+       '(#xC1 #xE9 #x0C)
+       (i386cl-abs '(#x8B #x3D) +i386-cl-v-hcur+) '(:call 0 map)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-s+) (i386cl-abs '(#x03 #x0D) +i386-cl-v-m+)  ; ecx = S+M
        ;; one bitmap = (S+M)/128, page-rounded; both zeroed, after the heap
        '(#xC1 #xE9 #x07)
        '(#x81 #xC1) (i386l-le32-list #xFFF)
@@ -210,42 +291,25 @@
        '(:j8 #xEB paged)                                      ; serialise
        '(:label paged)
        (cons #xBC (i386l-le32-list (- +i386-cl-stack-top+ 16)))   ; mov esp, stack top
-       ;; ---- a SAVED CORE (scripts/dos386-core.py): the heap boot init built,
-       ;; appended to the image.  The file's last 16 bytes are 'MODUSCOR' and
-       ;; the header's physical address; the header is 'MCOR', the version, the
-       ;; allocation pointer, the heap bytes from #x19000000 and one bitmap
-       ;; slice's bytes, then at +64 the low block, the heap, both slices.
-       ;; Taken only if it fits below this machine's allocation limit (a
-       ;; smaller machine boots cold).  The words the hosted writes below set
-       ;; from THIS machine's sizes are written after it, as on a cold boot.
-       (i386cl-abs '(#xA1) (+ +i386-cl-load-addr+ 20))        ; mov eax, [load_end]
-       (cons #x3D (i386l-le32-list (+ +i386-cl-load-addr+ 64)))  ; long enough?
-       '(:jcc32 #x72 no-core)                                 ; jb
-       (cons #x81 (cons #x78 (cons #xF0 (i386l-le32-list #x55444F4D))))  ; cmp [eax-16], 'MODU'
-       '(:jcc32 #x75 no-core)
-       (cons #x81 (cons #x78 (cons #xF4 (i386l-le32-list #x524F4353))))  ; cmp [eax-12], 'SCOR'
-       '(:jcc32 #x75 no-core)
-       '(#x8B #x58 #xF8)                                      ; mov ebx, [eax-8]
-       (cons #x81 (cons #x3B (i386l-le32-list #x524F434D)))   ; cmp [ebx], 'MCOR'
-       '(:jcc32 #x75 no-core)
-       (cons #x83 '(#x7B #x04 #x01))                          ; cmp dword [ebx+4], 1
-       '(:jcc32 #x75 no-core)
-       ;; fits: alloc pointer < heap + S/2 - M (this machine's VL)
-       (i386cl-abs '(#xA1) +i386-cl-v-s+) '(#xD1 #xE8)        ; eax = S/2
-       (cons #x05 (i386l-le32-list +i386-cl-heap-va+))
-       (i386cl-abs '(#x2B #x05) +i386-cl-v-m+)
-       '(#x39 #x43 #x08)                                      ; cmp [ebx+8], eax
-       '(:jcc32 #x73 no-core)                                 ; jae
-       (i386cl-abs '(#x89 #x1D) +i386-cl-v-hdr+)
+       ;; ---- the saved core, if the probe above kept it: every header field
+       ;; it needs is read FIRST, since copying the heap overwrites the
+       ;; header's page (the core's pages are now the heap's)
+       (i386cl-abs '(#x8B #x1D) +i386-cl-v-hdr+)
+       '(#x85 #xDB) '(:jcc32 #x74 no-core)
+       '(#x8B #x43 #x08) (i386cl-abs '(#xA3) +i386-cl-v-free+)
+       (cons #x8B (cons #x83 (i386l-le32-list (+ +i386-cl-core-data+ (- +gc-count-addr+ +i386-cl-low-va+)))))
+       (i386cl-abs '(#xA3) +i386-cl-v-count+)
+       '(#x8B #x43 #x0C) (i386cl-abs '(#xA3) +i386-cl-v-heapb+)
+       '(#x8B #x43 #x10) (i386cl-abs '(#xA3) +i386-cl-v-bmb+)
        (list #x8D #x73 +i386-cl-core-data+)                   ; lea esi, [ebx+64]
        (cons #xBF (i386l-le32-list +i386-cl-low-va+))
        (cons #xB9 (i386l-le32-list (floor +i386-cl-low-size+ 4))) '(#xF3 #xA5)   ; rep movsd
        (cons #xBF (i386l-le32-list +i386-cl-heap-va+))
-       '(#x8B #x4B #x0C) '(#xC1 #xE9 #x02) '(#xF3 #xA5)       ; heap bytes
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-heapb+) '(#xC1 #xE9 #x02) '(#xF3 #xA5)
        (i386cl-abs '(#x8B #x3D) +i386-cl-v-bm1+)
-       '(#x8B #x4B #x10) '(#xC1 #xE9 #x02) '(#xF3 #xA5)       ; bitmap slice 1
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-bmb+) '(#xC1 #xE9 #x02) '(#xF3 #xA5)
        (i386cl-abs '(#x8B #x3D) +i386-cl-v-bm2+)
-       '(#x8B #x4B #x10) '(#xC1 #xE9 #x02) '(#xF3 #xA5)       ; bitmap slice 2
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-bmb+) '(#xC1 #xE9 #x02) '(#xF3 #xA5)
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 1))
        '(:label no-core)
        ;; ---- what the hosted stub does after its mmaps (boot-linux-i386) ----
@@ -279,10 +343,8 @@
        ;; (memos keyed on the GC epoch were made at the same addresses)
        (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-core+) '(#x01))   ; cmp [core], 1
        '(:jcc32 #x75 core-done)
-       (i386cl-abs '(#x8B #x1D) +i386-cl-v-hdr+)
-       '(#x8B #x43 #x08) (i386cl-abs '(#xA3) (+ g #x00))
-       (cons #x8B (cons #x83 (i386l-le32-list (+ +i386-cl-core-data+ (- +gc-count-addr+ +i386-cl-low-va+)))))
-       (i386cl-abs '(#xA3) +gc-count-addr+)
+       (i386cl-abs '(#xA1) +i386-cl-v-free+) (i386cl-abs '(#xA3) (+ g #x00))
+       (i386cl-abs '(#xA1) +i386-cl-v-count+) (i386cl-abs '(#xA3) +gc-count-addr+)
        '(:label core-done)
        '(:jmp32 0 past-subroutines))
       ;; ---- subroutines (physical addresses: called with paging off) ----

@@ -1288,9 +1288,13 @@
            ;; long form's own 4 extension bytes are between it and a forward
            ;; target, and vanish in the shorter forms.
            (let* ((d (if (> disp 0) (- disp 4) disp))
-                  (margin (* 16 (1+ (crossed (- ref-pos 4) (+ (- ref-pos 2) disp))))))
+                  (margin (* 16 (1+ (crossed (- ref-pos 4) (+ (- ref-pos 2) disp)))))
+                  (tail *68k-boot-tail-pos*)
+                  (target (+ (- ref-pos 2) disp)))
              (setf (aref plan ord)
-                   (cond ((and (if (> disp 0) (>= d 2) t)
+                   (cond ((and tail (not (eq (< ref-pos tail) (< target tail))))
+                          :long)                ; across the boot tail: absolute
+                         ((and (if (> disp 0) (>= d 2) t)
                                (<= (+ -128 margin) d (- 127 margin)))
                           :byte)
                          ((<= (+ -32768 margin) d (- 32767 margin)) :word)
@@ -1358,6 +1362,15 @@
    SETJMP calls.  NIL: inline, as the native REPL tier emits it.")
 (defvar *68k-hpop-label* nil "... the shared handler pop (CLEAR-HANDLER).")
 (defvar *68k-longjmp-label* nil "... the shared LONGJMP.")
+
+(defvar *68k-boot-tail* nil
+  "After a translation with a boot tail (compiler.lisp *BOOT-TAIL-PC*): (START
+   END), native offsets of the boot-only functions, which cross.lisp moves to
+   the image's end (*68K-TAIL-MOVE*).  NIL otherwise.")
+(defvar *68k-boot-tail-pos* nil
+  "While translating: the native position where the boot tail starts.  A
+   branch whose ends lie on its two sides is long -- absolute on a 68000 --
+   since the tail moves (M68K-RELAX-PLAN).")
 
 (defvar *68k-call-islands* nil
   "When T (the Quadra map), the image's native code carries CALL ISLANDS: at a
@@ -5202,6 +5215,41 @@
               *68k-unimpl-opcodes* nil)
         (translate-mvm-to-68k-1 bytecode function-table))))
 
+(defun m68k-emit-routines (buf function-table)
+  "The shared routines after the functions -- the collector, the console, the
+   shared sequences, the handler helpers, the barrier, the native tier's
+   export table, the 68000's multiply / divide.  Before the boot tail when
+   there is one (*68K-BOOT-TAIL-POS*): they stay resident."
+  (declare (ignorable function-table))
+    (when *68k-gc-label*
+      (m68k-emit-gc-collector buf))
+    (when *68k-mac-console-label*
+      (m68k-emit-mac-console buf))
+    (when *68k-mac-service-label*
+      (m68k-emit-mac-service buf))
+    (when *68k-cons-label*
+      (m68k-emit-cons-helper buf))
+    (when *68k-hpush-label*
+      (m68k-emit-handler-helpers buf))
+    (when *68k-subtag-label*
+      (m68k-emit-subtag-helper buf))
+    (when *68k-car-label*
+      (m68k-emit-car-cdr-helpers buf))
+    (when *68k-barrier-label*
+      (m68k-emit-barrier-helper buf))
+    (when *68k-cold-fns*
+      (m68k-emit-thread-dispatch buf function-table))
+    ;; An all-native image with the runtime JIT has no dispatcher to put the
+    ;; native tier's export table after: it goes here, found by its magic.
+    (when (and *68k-jit-shapes* (not *68k-cold-fns*))
+      (m68k-emit-native-exports buf))
+    (when *68k-array-len-label*
+      (m68k-emit-array-len-helper buf))
+    (when *68k-alloc-obj-label*
+      (m68k-emit-alloc-obj-helper buf))
+    (when *68k-mul32-label*
+      (m68k-emit-68000-helpers buf)))
+
 (defun translate-mvm-to-68k-1 (bytecode function-table)
   "Translate MVM bytecode to Motorola 68000 native code.
    BYTECODE is a (vector (unsigned-byte 8)).
@@ -5209,6 +5257,7 @@
    Returns a byte vector of 68k big-endian machine code."
   (setf *68k-abs-patches* nil)
   (setf *68k-paged-layout* nil *68k-paged-table-refs* nil)
+  (setf *68k-boot-tail-pos* nil *68k-boot-tail* nil)
   (let* ((*68k-native-p* t)
          (*68k-paged-fns* nil)
          (*68k-cold-enter-label* (and *68k-paged* (mvm-make-label)))
@@ -5258,6 +5307,8 @@
          (li-imms (make-hash-table :test 'eql))
          (call-counts (make-hash-table :test 'eql))
          (island-targets nil) (island-pc 0)   ; none before the first 24 KB
+         (boot-tail-pc (and (boundp '*boot-tail-pc*) *boot-tail-pc*))
+         (tail-done nil)
          (*68k-island-map* nil))
 
     ;; First pass: scan for branch targets
@@ -5341,6 +5392,14 @@
     (setf pc 0)
     (loop while (< pc len)
           do (progn
+               (when (and boot-tail-pc (not tail-done) (eql pc boot-tail-pc))
+                 ;; the boot tail: the shared routines first (resident), then
+                 ;; no more islands -- everything after here moves
+                 (m68k-emit-routines buf function-table)
+                 (m68k-word-align buf)
+                 (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-nop buf))
+                 (setq tail-done t island-targets nil *68k-island-map* nil
+                       *68k-boot-tail-pos* (m68k-buffer-position buf)))
                (when (and island-targets (gethash pc fn-entries)
                           (> (- pc island-pc) 24000))
                  (m68k-emit-island buf island-targets)
@@ -5429,34 +5488,9 @@
           (format t ";;   LI imms:~{ ~X:~D~}~%"
                   (loop for (k . n) in (subseq ir 0 (min 24 (length ir))) append (list k n))))))
 
-    (when *68k-gc-label*
-      (m68k-emit-gc-collector buf))
-    (when *68k-mac-console-label*
-      (m68k-emit-mac-console buf))
-    (when *68k-mac-service-label*
-      (m68k-emit-mac-service buf))
-    (when *68k-cons-label*
-      (m68k-emit-cons-helper buf))
-    (when *68k-hpush-label*
-      (m68k-emit-handler-helpers buf))
-    (when *68k-subtag-label*
-      (m68k-emit-subtag-helper buf))
-    (when *68k-car-label*
-      (m68k-emit-car-cdr-helpers buf))
-    (when *68k-barrier-label*
-      (m68k-emit-barrier-helper buf))
-    (when *68k-cold-fns*
-      (m68k-emit-thread-dispatch buf function-table))
-    ;; An all-native image with the runtime JIT has no dispatcher to put the
-    ;; native tier's export table after: it goes here, found by its magic.
-    (when (and *68k-jit-shapes* (not *68k-cold-fns*))
-      (m68k-emit-native-exports buf))
-    (when *68k-array-len-label*
-      (m68k-emit-array-len-helper buf))
-    (when *68k-alloc-obj-label*
-      (m68k-emit-alloc-obj-helper buf))
-    (when *68k-mul32-label*
-      (m68k-emit-68000-helpers buf))
+    (unless tail-done (m68k-emit-routines buf function-table))
+    (setq *68k-boot-tail* (and tail-done *68k-boot-tail-pos*
+                               (list *68k-boot-tail-pos* (m68k-buffer-position buf))))
     ;; paged: the stream section LAST, so it is the native code's tail
     (when (and *68k-paged* *68k-paged-fns*)
       (m68k-emit-paged-section buf))

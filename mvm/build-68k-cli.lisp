@@ -380,6 +380,11 @@
 (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
   (setf modus.mvm::*call-temps-survive*
         (and (not *68k-threaded*) (not (and v (string= v "1"))))))
+;; MODUS_BOOT_TAIL=0: the boot-only functions where they fall; otherwise last,
+;; moved past the constant pool (compiler.lisp *BOOT-TAIL-LAST*).  Not with
+;; threaded or paged code (that tail is the stream section).
+(let ((v (sb-ext:posix-getenv "MODUS_BOOT_TAIL")))
+  (setf modus.mvm::*boot-tail-last* (and (not *68k-threaded*) (not *68k-paged*) (not (and v (string= v "0"))))))
 ;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k.lisp
 ;; *68K-CALL-ISLANDS*); otherwise on, without threaded or paged code.
 (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))

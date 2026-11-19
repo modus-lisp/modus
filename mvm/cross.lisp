@@ -1617,7 +1617,14 @@
                 (let ((l (and (eq (and boot-descriptor (getf boot-descriptor :arch)) :68k)
                               (boundp 'modus.mvm::*68k-paged-layout*)
                               (symbol-value 'modus.mvm::*68k-paged-layout*))))
-                  (and l (list (getf l :section) (getf l :end)))))
+                  (cond (l (list (getf l :section) (getf l :end)))
+                        ;; the boot-only functions (translate-68k *68K-BOOT-TAIL*):
+                        ;; last, past the pool and the init-only text, where the
+                        ;; static heap is laid over them once the core is saved
+                        ((and (eq (and boot-descriptor (getf boot-descriptor :arch)) :68k)
+                              (boundp 'modus.mvm::*68k-boot-tail*)
+                              (symbol-value 'modus.mvm::*68k-boot-tail*))
+                         (copy-list (symbol-value 'modus.mvm::*68k-boot-tail*))))))
           (loop for b across native-code
                 for i from 0
                 while (or (null *68k-tail-move*) (< i (first *68k-tail-move*)))

@@ -3819,6 +3819,12 @@
     (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
       (setf (symbol-value (sym "*CALL-TEMPS-SURVIVE*"))
             (and (not (symbol-value (sym "*68K-THREADED*"))) (not (and v (string= v "1"))))))
+    ;; MODUS_BOOT_TAIL=0: the boot-only functions where they fall (compiler.lisp
+    ;; *BOOT-TAIL-LAST*); otherwise last, past the pool, under the static heap
+    (let ((v (sb-ext:posix-getenv "MODUS_BOOT_TAIL")))
+      (setf (symbol-value (sym "*BOOT-TAIL-LAST*"))
+            (and (not (symbol-value (sym "*68K-THREADED*"))) (not (symbol-value (sym "*68K-PAGED*")))
+                 (not (and v (string= v "0"))))))
     ;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k *68K-CALL-ISLANDS*)
     (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
       (setf (symbol-value (sym "*68K-CALL-ISLANDS*"))

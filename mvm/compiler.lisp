@@ -1992,6 +1992,32 @@
    redefinition does not reach the image's own callers (no call pads: the
    68k); never under runtime EVAL.")
 
+(defvar *boot-tail-last* nil
+  "When T (the Mac's Quadra map, which boots from a saved core), the functions
+   only boot runs -- the defvar initializers (INIT-x) and INIT-ALL-GLOBALS /
+   %RUN-NIL-DEFVAR-INITS that call them, the top-level forms (TOPLEVEL-n), the
+   name tables' seeding (%INIT-SFT-AUTO-n, %INIT-SYM-NAME-AUTO-n,
+   %SEED-STATIC-KEYWORDS) -- are laid out LAST (%BOOT-ONLY-FN-NAME-P), and
+   *BOOT-TAIL-PC* is the first one's bytecode offset: the 68k translator moves
+   their native code to the image's end, past the constant pool, where the
+   static heap is laid over it once the core is saved.  A function nested in
+   one ($$LAMBDA ...) stays: a closure over it can outlive boot.")
+(defvar *boot-tail-pc* nil
+  "With *BOOT-TAIL-LAST*: the bytecode offset of the first boot-only function.")
+(defvar *%boot-first* nil "The first boot-only function's info, while laying out.")
+
+(defun %boot-only-fn-name-p (name)
+  (let* ((s (string-upcase (if (stringp name) name (princ-to-string name))))
+         (c (search "::" s :from-end t))
+         (b (if c (subseq s (+ c 2)) s)))
+    (flet ((prefix (p) (and (> (length b) (length p)) (string= p b :end2 (length p)))))
+      (and (not (search "$$" b))
+           (or (member b *init-thunk-names* :test #'string=)
+               (member b '("INIT-ALL-GLOBALS" "%RUN-NIL-DEFVAR-INITS" "%SEED-STATIC-KEYWORDS")
+                       :test #'string=)
+               (prefix "TOPLEVEL-") (prefix "%INIT-SFT-AUTO-") (prefix "%INIT-SYM-NAME-AUTO-"))
+           t))))
+
 (defvar *type-error-codes* nil
   "When non-NIL (a hash table, set by a build), an image call
    (%SIGNAL-TYPE-ERROR X 'TYPE) compiles to (%SIGNAL-TYPE-ERROR-K X K): K a
@@ -34035,6 +34061,18 @@
     ;; ... and without it, MODUS_HOT_ORDER is layout alone.
     (when (and *ir-hot-order* (not *ir-dce-roots*))
       (setq all-ir (%ir-hot-sort all-ir)))
+    ;; *BOOT-TAIL-LAST*: the boot-only functions last, in their order
+    (setq *boot-tail-pc* nil *%boot-first* nil)
+    (when *boot-tail-last*
+      (let ((keep nil) (tail nil))
+        (dolist (e all-ir)
+          (if (%boot-only-fn-name-p (function-info-name (car e))) (push e tail) (push e keep)))
+        (when tail
+          (let ((n (length tail)))
+            (setq tail (nreverse tail)
+                  *%boot-first* (car (first tail))
+                  all-ir (nconc (nreverse keep) tail))
+            (format t "~&  boot-only functions last: ~D~%" n)))))
 
     ;; Phase 3: Emit bytecode
     (let ((buf (make-mvm-buffer)))
@@ -34053,7 +34091,9 @@
             (setf (function-info-bytecode-length info) fn-size)
             ;; Update function in hash table so calls can resolve
             (%fn-register-info info)
-            (incf global-offset fn-size))))
+            (incf global-offset fn-size)))
+        (when *%boot-first*
+          (setq *boot-tail-pc* (function-info-bytecode-offset *%boot-first*))))
 
       ;; Debug: show bytecode offsets for key functions
       (dolist (name '("ED-SCALAR-MULT" "C64-ED-SCALAR-MULT" "ED-BASE-MULT"

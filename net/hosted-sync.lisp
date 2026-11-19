@@ -69,8 +69,9 @@
 ;;;           +0x08 total wakes issued   +0x10 STOP flag for every scheduler
 ;;;           +0x18 legacy AP-SCHEDULER returns (the pre-blocking behaviour)
 ;;;   +0x1000 free scratch for tests (mutex words, condvars, counters)
-;;;   +0x2000 formerly the PER-THREAD WINDOW BLOCKS (4 KB per CPU, which was
-;;;           too small -- see %THR-TLS-BLOCK); now unused.
+;;;   +0x2000 BOUND-KEY FILTERS, 4 KB per CPU, 16 CPUs (%THR-DYNB-FILTER) --
+;;;           formerly the per-thread window blocks (4 KB per CPU, which was
+;;;           too small -- see %THR-TLS-BLOCK).
 ;;;   +0x12000 the MV/handler-case two-thread selftest's control block, 4 KB.
 ;;;   +0x13000 THE THREAD TABLE, 4 KB — one record per thread, plus the
 ;;;            spawn handshake words.  See MANY THREADS, FROM CLOSURES.
@@ -155,6 +156,13 @@
    counters live here.  0 if the page could not be mapped."
   (let ((p (%thr-page)))
     (if (zerop p) 0 (+ p #x1000))))
+
+(defun %thr-dynb-filter (cpu)
+  "CPU's 4 KB BOUND-KEY FILTER (4096 one-byte counters, mvm/prelude.lisp
+   %DYNB-FILTER) in the thread page's +0x2000..+0x11FFF -- what the 4 KB window
+   blocks used before they outgrew it -- or 0 if unmapped."
+  (let ((p (%thr-page)))
+    (if (zerop p) 0 (+ p (+ #x2000 (* cpu #x1000))))))
 
 (defun %thr-dynb-stack (cpu)
   "CPU's 16 KB dynamic-binding stack in the thread band, or 0 if unmapped."
@@ -272,6 +280,7 @@
                 (setf (mem-ref (+ b #xC50) :u64) 0)   ; next-free entry
                 (setf (mem-ref (+ b #xC58) :u64) 0)   ; depth
                 (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu)) ; stack
+                (setf (mem-ref (+ b #xC70) :u64) (%thr-dynb-filter cpu)) ; wide filter
                 (%dynb-filter-clear b)
                 (%tls-set-self-base delta)
                 0)
@@ -297,6 +306,7 @@
           (setf (mem-ref (+ b #xC50) :u64) 0)
           (setf (mem-ref (+ b #xC58) :u64) 0)
           (setf (mem-ref (+ b #xC60) :u64) (%thr-dynb-stack cpu))
+          (setf (mem-ref (+ b #xC70) :u64) (%thr-dynb-filter cpu))
           (%dynb-filter-clear b)
           (%gc-write64 (+ b #x180) 0)
           (%gc-write64 (+ b #x188) 0)

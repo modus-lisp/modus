@@ -3330,42 +3330,90 @@
    worker starts with its per-computation bindings and nothing else -- used to
    walk the whole binding stack before falling through to the global: 0.76 us
    against main's 3 ns, which made elliptic-curve code 6x slower on a thread.
-   The filter is 256 16-bit counters, one per (KEY mod 256): %DYNBIND counts a
-   key in, %DYNB-UNWIND counts every truncated entry out, and a zero counter
-   answers \"not bound here\" without the walk.  Anything that desynchronises
-   it can only leave a counter too HIGH (a thread that died with bindings live,
-   a wrap), which costs a walk and never a wrong answer.
+   The filter counts each bound key in a slot chosen by its low bits: %DYNBIND
+   counts a key in, %DYNB-UNWIND counts every truncated entry out, and a zero
+   counter answers \"not bound here\" without the walk.  Anything that
+   desynchronises it can only leave a counter too HIGH (a thread that died with
+   bindings live, a saturated counter), which costs a walk and never a wrong
+   answer.
 
-   It lives in the in-window fallback area, blk+0xC80..0xE7F, which is unused
-   exactly when the thread has an extension stack (blk+0xC60 non-zero).  A
-   thread without one keeps its entries there and has no filter."
-  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 0 (+ blk #xC80)))
+   TWO SHAPES.  The WIDE filter -- 4096 one-byte counters, saturating at 255
+   and sticky there -- is a hosted thread's, in the thread page, its address in
+   the window block's +0xC70 (%TLS-PREPARE-BLOCK writes it).  The NARROW one
+   -- 256 16-bit counters in the in-window fallback area, blk+0xC80..0xE7F --
+   is what a stack with no wide filter (an actor's) uses.  256 slots were too
+   few: a page worker binds some 300 specials for its whole life (weft, shuttle,
+   scribe, loom's WITH-THREAD-STATE), which leaves a third of the slots zero,
+   so two reads in three of a special it never bound walked all 300 entries --
+   LENGTH 5x slower there, Hacker News laid out 2.7x slower than on main.
+   With 4096 slots 93% stay zero.
+
+   Both areas are unused exactly when the thread has an extension stack
+   (blk+0xC60 non-zero); a thread without one keeps its entries there and has
+   no filter."
+  (if (eql (mem-ref (+ blk #xC60) :u64) 0)
+      0
+      (let ((w (mem-ref (+ blk #xC70) :u64)))
+        (if (eql w 0) (+ blk #xC80) w))))
+
+(defun %dynb-filter-wide-p (blk)
+  (not (eql (mem-ref (+ blk #xC70) :u64) 0)))
 
 (defun %dynb-filter-slot (f key)
+  "The narrow filter's 16-bit counter for KEY."
   (+ f (ash (logand key 255) 1)))
 
+(defun %dynb-filter-count (blk f key)
+  "Count KEY in: one more live binding of it on this thread."
+  (if (%dynb-filter-wide-p blk)
+      (let* ((slot (+ f (logand key 4095))) (v (mem-ref slot :u8)))
+        (when (< v 255) (setf (mem-ref slot :u8) (+ v 1))))
+      (let ((slot (%dynb-filter-slot f key)))
+        (setf (mem-ref slot :u16) (logand (+ (mem-ref slot :u16) 1) #xFFFF))))
+  0)
+
+(defun %dynb-filter-unbound-p (blk f key)
+  "T when the filter proves this thread has no binding of KEY."
+  (if (%dynb-filter-wide-p blk)
+      (eql (mem-ref (+ f (logand key 4095)) :u8) 0)
+      (eql (mem-ref (%dynb-filter-slot f key) :u16) 0)))
+
 (defun %dynb-filter-clear (blk)
-  "Zero BLK's filter.  Called wherever the stack is emptied."
+  "Zero BLK's filters.  Called wherever the stack is emptied."
   (let ((a (+ blk #xC80)))
     (loop
       (when (>= a (+ blk #xE80)) (return 0))
       (setf (mem-ref a :u32) 0)
-      (setq a (+ a 4)))))
+      (setq a (+ a 4))))
+  (when (%dynb-filter-wide-p blk)
+    (let* ((w (mem-ref (+ blk #xC70) :u64)) (a w))
+      (loop
+        (when (>= a (+ w 4096)) (return 0))
+        (setf (mem-ref a :u32) 0)
+        (setq a (+ a 4)))))
+  0)
 
-(defun %dynb-filter-drop (f a top)
+(defun %dynb-filter-drop (blk f a top)
   "Count out every entry from the KEY word at A up to TOP."
-  (loop
-    (when (>= a top) (return 0))
-    (let ((slot (%dynb-filter-slot f (mem-ref a :u64))))
-      (setf (mem-ref slot :u16) (logand (- (mem-ref slot :u16) 1) #xFFFF)))
-    (setq a (+ a 16))))
+  (let ((wide (%dynb-filter-wide-p blk)))
+    (loop
+      (when (>= a top) (return 0))
+      (let ((key (mem-ref a :u64)))
+        (if wide
+            (let* ((slot (+ f (logand key 4095))) (v (mem-ref slot :u8)))
+              ;; 255 is sticky: once saturated the true count is lost, so the
+              ;; slot stays \"maybe bound\" (a walk, never a wrong answer).
+              (when (and (> v 0) (< v 255)) (setf (mem-ref slot :u8) (- v 1))))
+            (let ((slot (%dynb-filter-slot f key)))
+              (setf (mem-ref slot :u16) (logand (- (mem-ref slot :u16) 1) #xFFFF)))))
+      (setq a (+ a 16)))))
 
 (defun %dynb-lookup (blk key)
   "Address of the VALUE word of this thread's innermost binding of KEY, or 0:
    %DYNB-FIND behind the filter.  Same no-global-read rule as %DYNB-FIND."
   (let ((f (%dynb-filter blk)))
     (if (and (not (eql f 0))
-             (eql (mem-ref (%dynb-filter-slot f key) :u16) 0))
+             (%dynb-filter-unbound-p blk f key))
         0
         (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (%dynb-base blk)))))
 
@@ -3390,7 +3438,7 @@
   (declare (ignore i))
   (if (and (>= a (%dynb-base blk)) (eql (mem-ref a :u64) key))
       (let ((f (%dynb-filter blk)))
-        (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
+        (unless (eql f 0) (%dynb-filter-drop blk f a (%dynb-next blk)))
         (%dynb-set-top blk a (- (%dynb-depth blk) 1))
         1)
       0))
@@ -3470,10 +3518,7 @@
                     (setf (mem-ref (+ a 8) :u64) val)
                     (%dynb-set-top blk (+ a 16) (+ d 1))
                     (let ((f (%dynb-filter blk)))
-                      (unless (eql f 0)
-                        (let ((slot (%dynb-filter-slot f key)))
-                          (setf (mem-ref slot :u16)
-                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))))
+                      (unless (eql f 0) (%dynb-filter-count blk f key)))
                     val)))))))
 
 (defun %dynunbind (key saved)
@@ -3586,12 +3631,29 @@
    special in compiled code actually becomes) were not.  The gate is the
    word %RT-ENTER and %DYNBIND already test, so an unarmed image pays one
    32-bit load and a branch."
+  ;; THE COMMON CASE IS FUSED: this thread's block (%DYNB-BLOCK's arithmetic,
+  ;; inline) and its wide filter's counter for KEY, with no call in between.  A
+  ;; worker reads a special it never bound far more often than anything else
+  ;; here, and the six small calls this used to be were most of a worker's
+  ;; 16-20 ns special read (main's is 2).  Anything else -- no wide filter, or
+  ;; a counter that says KEY may be bound -- takes the general path.
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       0
-      (let ((blk (%dynb-block)))
-        (if (eql blk 0)
+      (let ((lo (mem-ref #x10000C30 :u32))
+            (hi (mem-ref #x10000C34 :u32)))
+        (if (and (eql hi 0) (eql lo 0))
             0
-            (%dynb-lookup blk key)))))
+            (let* ((blk (if (eql hi 0)
+                            (+ (%conv-addr #x10000000) lo)
+                            (if (>= hi #x80000000)
+                                (+ (%conv-addr #x10000000) (+ (* (* (- hi 4294967296) 65536) 65536) lo))
+                                (+ (%conv-addr #x10000000) (+ (* (* hi 65536) 65536) lo)))))
+                   (w (mem-ref (+ blk #xC70) :u64)))
+              (if (and (not (eql w 0))
+                       (not (eql (mem-ref (+ blk #xC60) :u64) 0))
+                       (eql (mem-ref (+ w (logand key 4095)) :u8) 0))
+                  0
+                  (%dynb-lookup blk key)))))))
 
 (defun %gv-ref (%gv-key)
   "Compiled special-variable READ: value of global KEY, NIL if absent

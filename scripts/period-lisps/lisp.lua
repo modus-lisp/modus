@@ -28,10 +28,14 @@ if os.getenv("PCLOG") then
   local t0 = tonumber(os.getenv("PCLOG")); local t1 = tonumber(os.getenv("PCLOG_END") or (t0 + 40))
   local cpu = manager.machine.devices[":maincpu"]
   local f = io.open(snapdir .. "/pclog.txt", "w"); local last = -1
+  local hz = tonumber(os.getenv("PCLOG_HZ") or "50")   -- samples a second (at most a frame's worth)
+  local mem = cpu.spaces["program"]; local based = false
   emu.register_periodic(function()
     local t = manager.machine.time:as_double()
-    if t < t0 or t > t1 or math.floor(t * 50) == last then return end
-    last = math.floor(t * 50)
+    if t < t0 or t > t1 or math.floor(t * hz) == last then return end
+    last = math.floor(t * hz)
+    -- ApplLimit ($130): where mac68k-chain.s's relocating load put the map
+    if not based then f:write(string.format("BASE %X\n", mem:read_u32(0x130))); based = true end
     local s = cpu.state
     f:write(string.format("%.2f PC=%X SR=%X A7=%X A6=%X A5=%X A4=%X A3=%X A2=%X A1=%X A0=%X D0=%X D1=%X\n", t,
       s["PC"].value, s["SR"].value, s["A7"].value, s["A6"].value, s["A5"].value, s["A4"].value,
@@ -167,6 +171,12 @@ if os.getenv("PROF") then
   local function sample(t)
     local s = cpu.state
     local out = { string.format("%.4f %X SP=%X SR=%X", t, s["PC"].value, s["A7"].value, s["SR"].value) }
+    if os.getenv("PROF_REGS") then
+      for _, r in ipairs({"A0","A1","A2","A3","A4","A5","A6","D0","D1","D2","D3"}) do
+        table.insert(out, string.format("%s=%X", r, s[r].value))
+      end
+      table.insert(out, "|")
+    end
     local a6 = s["A6"].value
     for i = 1, 48 do
       if a6 == 0 or a6 % 2 == 1 or a6 > 0x2000000 then break end
@@ -188,4 +198,20 @@ if os.getenv("PROF") then
   end)
   local ok, err = coroutine.resume(co)
   if not ok then print("lisp.lua: PROF: " .. tostring(err)) end
+end
+
+-- MEMDUMP="T:ADDR:LEN,...": at emulated second T, LEN bytes from ADDR (hex) to
+-- SNAPDIR/mem-ADDR.bin (code to disassemble where nothing has symbols)
+if os.getenv("MEMDUMP") then
+  local mem = manager.machine.devices[":maincpu"].spaces["program"]
+  for t, a, n in string.gmatch(os.getenv("MEMDUMP"), "([%d%.]+):(%x+):(%x+)") do
+    local co = coroutine.create(function()
+      emu.wait(tonumber(t))
+      local f = io.open(string.format("%s/mem-%s.bin", snapdir, a), "wb")
+      local base, len = tonumber(a, 16), tonumber(n, 16)
+      for i = 0, len - 1 do f:write(string.char(mem:read_u8(base + i))) end
+      f:close()
+    end)
+    coroutine.resume(co)
+  end
 end

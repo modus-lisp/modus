@@ -3850,6 +3850,13 @@
   (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
     (setf (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))
           (and v (string-equal v "x87"))))
+  ;; A call to a fixed-arity function stores no argument count (the 68k's
+  ;; pass, compiler.lisp *ELIDE-FIXED-NARGS*): sound here for the 68k's
+  ;; reason, i386 images have no call pads, so a run-time redefinition never
+  ;; reaches the image's own callers.  ~88,000 sites, 10 bytes each.
+  ;; MODUS_I386_FIXED_NARGS=1 keeps every store.
+  (setf *elide-fixed-nargs*
+        (not (equal (sb-ext:posix-getenv "MODUS_I386_FIXED_NARGS") "1")))
   (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~@[; x87~]~%"
           (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))))
 

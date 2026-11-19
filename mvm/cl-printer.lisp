@@ -5423,7 +5423,7 @@
   (let ((s (%resolve-output-stream (if stream-arg (car stream-arg) nil))))
     (if (and (streamp s) (not (= (%stream-type s) 8)))
         (%write-char-to-stream 10 s)
-        (write-char-serial 10)))
+        (%write-code-serial 10)))
   nil)
 
 (defun fresh-line (&rest stream-arg)
@@ -5436,8 +5436,8 @@
         (if (%stream-at-bol-p s)
             nil
             (progn (%write-char-to-stream 10 s) t))
-        ;; Serial output: always write newline (no column tracking)
-        (progn (write-char-serial 10) t))))
+        ;; Serial output: the console remembers whether its last character was a newline
+        (if *serial-at-bol* nil (progn (%write-code-serial 10) t)))))
 
 (defun %stream-at-bol-p (s)
   "Check if stream is at beginning of line (last char was newline or nothing written)."
@@ -5457,7 +5457,11 @@
            (if (%stream-data s)
                (%stream-at-bol-p (car (%stream-data s)))
                t))
-          ((= ty 8) nil) ;; serial: assume not at BOL
+          ((= ty 8) *serial-at-bol*)        ;; serial: the console's own record
+          ((= ty 9) (%fs-at-bol-p s))       ;; file, pipe, socket: the stream's record
+          ((= ty 7)                         ;; synonym: the stream it names
+           (let ((tg (%stream-data s)))
+             (and (symbolp tg) (boundp tg) (%stream-at-bol-p (symbol-value tg)))))
           (t nil)))
       nil))
 
@@ -5555,7 +5559,7 @@
           (let ((i start))
             (loop
               (when (>= i eff-end) (return nil))
-              (write-char-serial (%ensure-char-code (aref str i)))
+              (%write-code-serial (%ensure-char-code (aref str i)))   ; UTF-8, and the newline record
               (setq i (+ i 1)))))))
   str)
 
@@ -5608,9 +5612,9 @@
             (let ((i start))
               (loop
                 (when (>= i eff-end) (return nil))
-                (write-char-serial (%ensure-char-code (aref str i)))
+                (%write-code-serial (%ensure-char-code (aref str i)))
                 (setq i (+ i 1))))
-            (write-char-serial 10)))))
+            (%write-code-serial 10)))))
   str)
 
 (defun %ensure-char-code (x)

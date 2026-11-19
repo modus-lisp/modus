@@ -620,6 +620,9 @@
   ;; simple-reader-error: a READER-ERROR with a message (SBCL's sb-int:simple-reader-error)
   ;; -- READER-ERROR itself reports only its type.  The #\\name reader uses it.
   (%define-condition 'simple-reader-error '(simple-condition reader-error) nil nil nil)
+  ;; simple-stream-error: a STREAM-ERROR with a message (SBCL's sb-int:simple-stream-error) --
+  ;; what a failed write(2) signals: "Couldn't write to #<stream>: Broken pipe".
+  (%define-condition 'simple-stream-error '(simple-condition stream-error) nil nil nil)
   ;; parse-error
   (%define-condition 'parse-error '(error) nil nil nil)
   ;; print-not-readable

@@ -445,7 +445,7 @@
         (elt-type (if et (car et) 'character))
         (ef (if (cdr et) (%normalize-external-format (cadr et)) nil)))
     (%make-stream 9
-      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons obuf (cons 0 (cons nil (cons elt-type ef)))))))))))))
+      (cons fd (cons dir (cons 0 (cons buf (cons 0 (cons 0 (cons obuf (cons 0 (cons nil (cons elt-type (cons ef t))))))))))))))
 
 (defun %normalize-external-format (ef)
   "NIL for UTF-8 (and :DEFAULT), :LATIN-1 for a byte per character.  A list
@@ -478,7 +478,7 @@
 
 (defun %make-file-stream ()
   "Create a closed/dummy file stream."
-  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons nil (cons 0 (cons t (cons (quote character) nil))))))))))))
+  (%make-stream 9 (cons -1 (cons 0 (cons 0 (cons nil (cons 0 (cons 0 (cons nil (cons 0 (cons t (cons (quote character) (cons nil t)))))))))))))
 
 (defun %fs-fd      (s) (car  (%stream-data s)))
 (defun %fs-dir     (s) (cadr (%stream-data s)))
@@ -498,7 +498,12 @@
 (defun %fs-closed  (s) (car (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s)))))))))
 ;;; element-type and the external format live in the CDR of that same final tail cell.
 (defun %fs-element-type (s) (car (cdr (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))))
-(defun %fs-external-format (s) (cdr (cdr (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))))
+;;; ...whose CDR is (EXTERNAL-FORMAT . AT-BOL): AT-BOL is T until a byte other than a newline goes
+;;; out, so FRESH-LINE knows where a file, pipe or socket stands (it wrote a newline every time).
+(defun %fs-ef-cell (s) (cdr (cdr (cdr (cdr (cdr (cdr (cddr (cddr (%stream-data s))))))))))
+(defun %fs-external-format (s) (car (%fs-ef-cell s)))
+(defun %fs-at-bol-p (s) (cdr (%fs-ef-cell s)))
+(defun %fs-note-byte (s byte) (set-cdr (%fs-ef-cell s) (eql byte 10)))
 (defun %fs-latin-1-p (s) (eq (%fs-external-format s) :latin-1))
 
 (defun %fs-set-pos  (s v) (set-car (cddr (%stream-data s)) v))
@@ -873,7 +878,7 @@
   (and (eql (%fs-dir stream) 3) (%fs-obuf stream) (>= fd 0)
        (not (%net-fd-p fd)) (not (%cab-fd-p fd))))
 
-(defun %fs-write-buf-all (fd buf n)
+(defun %fs-write-buf-all (fd buf n &optional stream)
   "write(2) the first N bytes of the byte STRING BUF to FD, all of them."
   (let ((page (%fs-io-page)) (i 0))
     (loop
@@ -888,7 +893,7 @@
           (let ((w (%sys-write-raw fd (+ page off) (- k off))))
             (cond ((> w 0) (setq off (+ off w)))
                   ((or (= w -4) (= w -11)) nil)          ; EINTR / EAGAIN: again
-                  (t (error "socket write failed (~d)" w)))))
+                  (t (%fs-write-failed (or stream fd) w)))))
         (setq i (+ i k))))))
 
 (defun %fs-oflush (stream)
@@ -896,7 +901,7 @@
   (let ((n (%fs-olen stream)))
     (when (and (integerp n) (> n 0) (%fs-obuf stream))
       (%fs-set-olen stream 0)
-      (%fs-write-buf-all (%fs-fd stream) (%fs-obuf stream) n))))
+      (%fs-write-buf-all (%fs-fd stream) (%fs-obuf stream) n stream))))
 
 (defun %fs-put-byte (stream fd byte)
   "Write one byte to file STREAM on FD, through its buffer when it has one."
@@ -907,7 +912,9 @@
         (setq n 0))
       (%prim-aset (%fs-obuf stream) n byte)
       (%fs-set-olen stream (+ n 1))
+      (%fs-note-byte stream byte)
       (return-from %fs-put-byte byte)))
+  (%fs-note-byte stream byte)
   (if (%fs-wbuf-p stream fd)
       (let ((n (%fs-blen stream)))
         (when (>= n 4096)
@@ -922,7 +929,26 @@
         ;; Bytes buffered before threads armed go out first, in order.
         (when (and (%fs-wbuf-eligible-p stream fd) (> (%fs-blen stream) 0))
           (%fs-flush stream))
-        (%sys-write-byte-1 fd byte))))
+        (loop
+          (let ((w (%sys-write-byte-1 fd byte)))
+            (cond ((and (integerp w) (> w 0)) (return byte))
+                  ((or (eql w -4) (eql w -11)) nil)              ; EINTR / EAGAIN: again
+                  ((integerp w) (%fs-write-failed stream w))
+                  (t (return byte))))))))                        ; a seam that answers non-numbers
+
+(defun %errno-text (n)
+  "A few errno values a write meets, by name; the number otherwise."
+  (case n (32 "Broken pipe") (9 "Bad file descriptor") (28 "No space left on device")
+          (5 "Input/output error") (104 "Connection reset by peer") (27 "File too large")
+          (122 "Disk quota exceeded") (13 "Permission denied") (22 "Invalid argument")
+          (t (format nil "errno ~d" n))))
+
+(defun %fs-write-failed (stream w)
+  "A write(2) returned W (a negative errno): say so, as SBCL does, instead of carrying on as if the
+   bytes went out.  Writing to a pipe whose reader exited used to return normally and lose them."
+  (error 'simple-stream-error :stream stream
+         :format-control "Couldn't write to ~s: ~a"
+         :format-arguments (list stream (%errno-text (- w)))))
 
 (defun %fs-flush (stream)
   "Write file STREAM's pending output bytes, if any."
@@ -943,7 +969,10 @@
                   (loop
                     (when (>= done n) (return nil))
                     (let ((w (%sys-write-raw fd (+ page done) (- n done))))
-                      (if (<= w 0) (return nil) (setq done (+ done w)))))))
+                      (cond ((> w 0) (setq done (+ done w)))
+                            ((or (= w -4) (= w -11)) nil)          ; EINTR / EAGAIN: again
+                            (t (%fs-set-blen stream 0)             ; dropped, but not silently
+                               (%fs-write-failed stream (if (= w 0) -5 w))))))))
               (%fs-set-blen stream 0))))))))
 
 (defun %flush-output-arg (s)
@@ -1473,6 +1502,7 @@
   (let ((fd (%fs-fd stream)))
     (and (>= fd 0) (%cab-fd-p fd)
          (let ((v (%fs-utf8-octets str start end)))
+           (when (> end start) (%fs-note-byte stream (%ensure-char-code (aref str (1- end)))))
            (%cab-write-bytes stream fd v 0 (length v))))))
 
 (defun %fs-write-bytes (stream seq start end)
@@ -1490,8 +1520,13 @@
                 (setq j (+ j 1)))
               (%fs-set-olen stream (+ n len))
               (%fs-set-pos stream (+ (%fs-pos stream) len))
+              (when (> len 0) (%fs-note-byte stream (aref seq (1- end))))
               (return-from %fs-write-bytes t))
             (%fs-oflush stream))))
+    ;; Every branch below is a 1-byte file stream and a byte vector (%FS-BULK-OK-P); only there
+    ;; may the stream's newline record be touched -- WRITE-SEQUENCE asks this of EVERY stream.
+    (when (and (%fs-bulk-ok-p stream seq) (> end start))
+      (%fs-note-byte stream (aref seq (1- end))))
     (when (and (%fs-bulk-ok-p stream seq) (%cab-fd-p fd)
                (%cab-write-bytes stream fd seq start end))
       (return-from %fs-write-bytes t))
@@ -1523,7 +1558,7 @@
               (let ((w (%sys-write-raw fd (+ page off) (- n off))))
                 (cond ((> w 0) (setq off (+ off w)))
                       ((or (= w -4) (= w -11)) nil)          ; EINTR / EAGAIN: again
-                      (t (error "write-sequence: write failed (~d)" w)))))
+                      (t (%fs-write-failed stream w)))))
             (setq i (+ i n))))
         (%fs-set-pos stream (+ (%fs-pos stream) (- end start)))
         t))))
@@ -3386,7 +3421,12 @@
 
 ;;; The terminal (stdout, the UART, the web page's TextDecoder) is UTF-8 too:
 ;;; WRITE-CHAR-SERIAL emits one byte, so a code past ASCII is encoded here.
+(defvar *serial-at-bol* t
+  "T when the last character written to the serial console (hosted: stdout) was a newline, or
+   nothing has been: FRESH-LINE's answer for a type-8 stream, which wrote a newline every time.")
+
 (defun %write-code-serial (code)
+  (setq *serial-at-bol* (eql code 10))
   (cond
     ((< code #x80) (write-char-serial code))
     ((< code #x800)

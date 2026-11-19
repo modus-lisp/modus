@@ -436,6 +436,15 @@
       (t
        (%remove-vector item seq eff-test-fn key-fn start-idx end-idx eff-count from-end)))))
 
+;;; The REMOVE / DELETE family selects the indices to drop first, then walks
+;;; the sequence once.  The walk used to ask (MEMBER I TO-DROP) per element --
+;;; O(length x drops): removing 50k of 60k list elements was ~3e9 steps (9 s
+;;; per REMOVE-IF-NOT in beacon's reference-model test).  The index lists come
+;;; out monotonic (ascending, or descending when pushed), so put them in
+;;; ascending order once and consume them in step with the walk.
+(defun %ascending-indices (l)
+  (if (and (consp l) (consp (cdr l)) (> (car l) (cadr l))) (reverse l) l))
+
 (defun %delete-splice-list (lst to-drop)
   "Destructively splice the elements of LST at the indices in TO-DROP out
    of the list, by SET-CDR on the surviving predecessor cons.  Returns the
@@ -452,11 +461,12 @@
 
    Only the CDR chain is rewritten; CARs are untouched, so a cons another
    list shares as a TAIL still sees the splice exactly as SBCL's does."
+  (setq to-drop (%ascending-indices to-drop))
   (let ((head lst) (prev nil) (cur lst) (i 0))
     (loop
       (when (null cur) (return head))
       (let ((next (cdr cur)))
-        (if (member i to-drop)
+        (if (if (and to-drop (= i (car to-drop))) (progn (setq to-drop (cdr to-drop)) t) nil)
             (if prev (set-cdr prev next) (setq head next))
             (setq prev cur))
         (setq cur next)
@@ -519,12 +529,12 @@
 (defun %remove-list (item lst test-fn key-fn start-idx end-idx count from-end)
   ;; Non-destructive: mark which indices to drop (shared with the DELETE
   ;; path via %REMOVE-LIST-DROP-INDICES), then build a fresh list.
-  (let ((to-drop (%remove-list-drop-indices item lst test-fn key-fn
-                                            start-idx end-idx count from-end)))
+  (let ((to-drop (%ascending-indices (%remove-list-drop-indices item lst test-fn key-fn
+                                            start-idx end-idx count from-end))))
     (let ((result nil) (cur lst) (i 0))
       (loop
         (when (null cur) (return (nreverse result)))
-        (unless (member i to-drop) (push (car cur) result))
+        (unless (if (and to-drop (= i (car to-drop))) (progn (setq to-drop (cdr to-drop)) t) nil) (push (car cur) result))
         (setq cur (cdr cur))
         (setq i (+ i 1))))))
 
@@ -554,9 +564,10 @@
              (out-len (- len drop-count))
              (out (if string-p (%make-string-array out-len) (make-array out-len)))
              (i 0) (j 0))
+        (setq to-drop (%ascending-indices to-drop))
         (loop
           (when (= i len) (return out))
-          (unless (member i to-drop)
+          (unless (if (and to-drop (= i (car to-drop))) (progn (setq to-drop (cdr to-drop)) t) nil)
             (aset out j (aref vec i))
             (setq j (+ j 1)))
           (setq i (+ i 1)))))))
@@ -584,12 +595,12 @@
 
 (defun %remove-if-list (pred lst key-fn start-idx end-idx count from-end)
   ;; Non-destructive; index selection shared with %DELETE-IF-LIST.
-  (let ((to-drop (%remove-if-list-drop-indices pred lst key-fn
-                                               start-idx end-idx count from-end)))
+  (let ((to-drop (%ascending-indices (%remove-if-list-drop-indices pred lst key-fn
+                                               start-idx end-idx count from-end))))
     (let ((result nil) (cur lst) (i 0))
       (loop
         (when (null cur) (return (nreverse result)))
-        (unless (member i to-drop) (push (car cur) result))
+        (unless (if (and to-drop (= i (car to-drop))) (progn (setq to-drop (cdr to-drop)) t) nil) (push (car cur) result))
         (setq cur (cdr cur))
         (setq i (+ i 1))))))
 
@@ -616,9 +627,10 @@
              (out-len (- len drop-count))
              (out (if string-p (%make-string-array out-len) (make-array out-len)))
              (i 0) (j 0))
+        (setq to-drop (%ascending-indices to-drop))
         (loop
           (when (= i len) (return out))
-          (unless (member i to-drop)
+          (unless (if (and to-drop (= i (car to-drop))) (progn (setq to-drop (cdr to-drop)) t) nil)
             (aset out j (aref vec i))
             (setq j (+ j 1)))
           (setq i (+ i 1)))))))
@@ -5477,7 +5489,13 @@
          (t (%mda-row-major-index dims subscripts)))))
     (t (if (null subscripts) 0 (car subscripts)))))
 
-;;; RPLACA/RPLACD — type-check first arg, strict 2-arg arity
+;;; RPLACA/RPLACD — type-check first arg, strict 2-arg arity.  A two-argument
+;;; call site is inlined by the compiler (mvm-define-macro "RPLACA"), which
+;;; signals through %RPLAC-NOT-CONS; these bodies serve every other shape
+;;; (FUNCALL / APPLY, a wrong argument count).
+(defun %rplac-not-cons (x)
+  (error (make-condition 'type-error :datum x :expected-type 'cons)))
+
 (defun rplaca (cons-arg &rest more)
   (if (null more)
       (%program-error "rplaca requires exactly 2 arguments")

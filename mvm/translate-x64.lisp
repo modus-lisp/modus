@@ -129,6 +129,29 @@
 ;;;     is already stopped; on the way out it checks STOP before popping.
 ;;; Both XCHG their STATE (a full fence) and the collector XCHGs STOP, so the
 ;;; store-then-load on each side is ordered (Dekker).
+;;; Handler-frame stack geometry (hosted Linux): see THE HANDLER-FRAME STACK
+;;; HAS NO SILENT CEILING at EMIT-HANDLER-HELPERS.
+(defconstant +hstack-win-frames+ 512
+  "Hosted Linux: handler frames kept in the per-thread window (+0x1000..+0x5000).")
+(defconstant +hstack-ext-addr+ #x10005600
+  "Hosted Linux, FS-relative per-thread word: ABSOLUTE address of this window's
+   handler-frame extension (frames 512 and up), 0 until the first push past 512
+   reserves it.  Window +0x5600 is past everything else the 32 KB block holds
+   (STW words +0x5000.., guard words +0x5040.., actor stack bounds +0x50C0..,
+   fault backtrace +0x51F8..+0x5400) and, as an absolute address, is unused
+   BSS on the main thread.  %AR-PREPARE-WINDOW preserves it across its zeroing
+   so a reused actor window keeps its reservation instead of leaking it.")
+(defconstant +hstack-ext-limit-addr+ #x10005608
+  "Hosted Linux, FS-relative per-thread word: 0, or a LOWER limit on this
+   window's extension frames (raw count).  Only tests set it -- it is how the
+   loud overflow is reached at all, since no native stack gets to the real
+   capacity; %TLS-PREPARE-BLOCK clears it.")
+(defconstant +hstack-ext-frames+ #x100000
+  "Frames in one extension (1M x 32 bytes = 32 MB of reserved address space).")
+(defconstant +hstack-overflow-code+ #x0F0F
+  "Recorded at 0x10000CB0 by an overflowing push; %TAKE-PENDING-FAULT turns it
+   into HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION).")
+
 (defconstant +stw-state-addr+ #x10005000
   "FS-relative per-thread word: 0 running, 1 in a syscall, 2 parked.")
 (defconstant +stw-rsp-addr+ #x10005008
@@ -413,6 +436,19 @@
 (defconstant +x64-gen-tenure-req+    #x10000C88)   ; young from/to/size, <<1
 (defconstant +x64-gen-card-root+     #x10000D88)   ; the card vector, TAGGED
 
+;;; BYTES CONSED (SB-EXT:GET-BYTES-CONSED, net/sb-sys-shim.lisp).  One process-
+;;; global word, stored <<1 so a plain (mem-ref addr :u64) reads it as a fixnum:
+;;; the bytes consed before the last collection, NET of what that collection
+;;; left at the bottom of from-space.  Every collection ADDs, at entry, what its
+;;; region had allocated (R12 - from_start), and SUBtracts, at exit, the base
+;;; the next cycle starts from (new R12 - new from_start: the survivors copied
+;;; there, which were counted once already).  So consed-since-boot is this word
+;;; plus the active region's (R12 - from_start) now.  Hosted Linux only (a bare
+;;; image emits neither site), LOCKed because two regions can collect at once.
+;;; #x10000D38 sat unclaimed between the deadline flag (D30) and the web quote
+;;; vector (D40); outside the per-thread window (compiler %TLS-WINDOW-OFFSET-P).
+(defconstant +x64-bytes-consed-addr+ #x10000D38)
+
 (defun %gen-abs-op (buf opcode reg addr)
   "OPCODE REG, qword [ADDR] (absolute disp32): 8B mov, 2B sub, 3B cmp, 03 add."
   (emit-byte buf (logior #x48 (if (reg-extended-p reg) #x04 0)))
@@ -673,16 +709,23 @@
 
 (defun emit-stw-scan-handler-rbx (buf seg-reg scan-word-label)
   "Scan the saved RBX of every handler frame of the thread whose segment base
-   is SEG-REG (a longjmp restores it), plus the armed frame's.  Frames are at
-   seg+0x10001000 + i*32, RBX at +24, depth (raw) at seg+0x10000400."
+   is SEG-REG (a longjmp restores it), plus the armed frame's.  Frames 0..511
+   are at seg+0x10001000 + i*32, frames 512.. at [seg+HSTACK-EXT-ADDR] +
+   (i-512)*32 (EMIT-HANDLER-HELPERS-LINUX), RBX at +24, depth (raw) at
+   seg+0x10000400."
   ;; SEG-REG may be one scan_word clobbers (RSI): read everything derived from
-  ;; it BEFORE the first call, and keep the base on the stack for the armed
-  ;; frame's slot, scanned last.
-  (let ((l (make-label)) (d (make-label)))
+  ;; it BEFORE the first call, and keep the base on the stack for the
+  ;; extension and the armed frame's slot, scanned last.
+  (let ((l (make-label)) (d (make-label)) (wok (make-label))
+        (xl (make-label)) (xd (make-label)))
     (emit-push buf seg-reg)
     (emit-mov-reg-mem buf 'r10 seg-reg #x10000400)   ; depth
     (emit-mov-reg-reg buf 'rdi seg-reg)
     (emit-add-reg-imm buf 'rdi (+ #x10001000 24))
+    (emit-cmp-reg-imm buf 'r10 +hstack-win-frames+)  ; the window holds 512
+    (emit-jcc buf :le wok)
+    (emit-mov-reg-imm buf 'r10 +hstack-win-frames+)
+    (emit-label buf wok)
     (emit-label buf l)
     (emit-cmp-reg-imm buf 'r10 0)
     (emit-jcc buf :le d)
@@ -692,6 +735,24 @@
     (emit-sub-reg-imm buf 'r10 1)
     (emit-jmp buf l)
     (emit-label buf d)
+    ;; the extension's frames, if the depth reaches past the window
+    (emit-mov-reg-mem buf 'rax 'rsp 0)
+    (emit-mov-reg-mem buf 'r10 'rax #x10000400)
+    (emit-sub-reg-imm buf 'r10 +hstack-win-frames+)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :le xd)
+    (emit-mov-reg-mem buf 'rdi 'rax +hstack-ext-addr+)
+    (emit-cmp-reg-imm buf 'rdi 0)
+    (emit-jcc buf :e xd)
+    (emit-add-reg-imm buf 'rdi 24)
+    (emit-label buf xl)
+    (emit-mov-reg-reg buf 'rax 'rdi)
+    (emit-call buf scan-word-label)
+    (emit-add-reg-imm buf 'rdi 32)
+    (emit-sub-reg-imm buf 'r10 1)
+    (emit-cmp-reg-imm buf 'r10 0)
+    (emit-jcc buf :g xl)
+    (emit-label buf xd)
     (emit-pop buf 'rax)
     (emit-add-reg-imm buf 'rax #x10000198)
     (emit-call buf scan-word-label)))
@@ -1627,6 +1688,9 @@
   ;; (emit-park-stub).  YIELD polls and blocking syscalls call it while a
   ;; region-0 collection has the world stopped.  NIL everywhere else.
   (park-label nil)
+  ;; HOSTED THREADED IMAGE: this unit's :SAFEPOINT slow path
+  ;; (EMIT-X64-STW-SAFEPOINT-SUB).  NIL everywhere else.
+  (safepoint-label nil)
   ;; HOSTED THREADED IMAGE: this unit's SHARED-STORE GUARD subroutine.
   (ssg-label nil)
   ;; GENERATIONAL GC: this unit's card-barrier subroutines (mark one slot,
@@ -2609,12 +2673,11 @@
                 (emit-u32 buf #x10000D28)
                 (emit-u32 buf 1))
               (emit-call buf (translate-state-handler-push-label state))
-              ;; BALANCED-CAP (universal): r11=1 from __handler_push means the
-              ;; push was CAPPED (frame dropped, overflow counted) — skip
-              ;; arming [0x10000180] so this handler-case is a transparent
-              ;; no-op instead of a stack corrupter.  See emit-handler-helpers.
-              (emit-bytes buf #x4D #x85 #xDB)        ; test r11, r11
-              (emit-jcc buf :ne skiparm-label)
+              ;; __handler_push always stores the frame or does not return:
+              ;; an overflowing push is LOUD (emit-hstack-overflow), never the
+              ;; old BALANCED-CAP "transparent no-op" that returned r11=1 here
+              ;; and silently dropped the frame -- and with it every cleanup
+              ;; and CATCH nested past the cap.  So nothing is tested here.
               ;; Save RSP to 0x10000180
               ;; Use movabs with RCX as temp (address > 0x7FFFFFFF, can't use disp32)
               ;; mov rcx, 0x10000180  (immediate — the ACCESSES below carry
@@ -6156,6 +6219,25 @@
                (emit-call buf (translate-state-yield-longjmp-label state))
                (emit-label buf skip))))
 
+        ((op= +op-safepoint+)
+         ;; A YIELD in a function that holds no raw word (compiler.lisp,
+         ;; *PARK-SAFEPOINTS*): hosted with threads it polls like YIELD and,
+         ;; when a collection is waiting, PARKS HERE instead of at the next
+         ;; allocation, which a non-allocating loop never reaches.  Anywhere
+         ;; else it is exactly YIELD.
+         (if (translate-state-safepoint-label state)
+             (emit-x64-stw-safepoint buf (translate-state-safepoint-label state))
+             (if (or *x64-linux-mode*
+                     (null (translate-state-yield-longjmp-label state)))
+                 (emit-nop buf)
+                 (let ((skip (make-label)))
+                   (emit-bytes buf #x48 #x83 #x3C #x25)
+                   (emit-u32 buf #x10000D30)
+                   (emit-bytes buf #x00)
+                   (emit-jcc buf :e skip)
+                   (emit-call buf (translate-state-yield-longjmp-label state))
+                   (emit-label buf skip)))))
+
         ((op= +op-set-mv-count+)
          ;; Store tagged fixnum count to MV-COUNT address.
          ;; imm8 operand is the raw count (e.g., 1).
@@ -7363,12 +7445,14 @@
     (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 1
     (emit-u32 buf #x10000D28)
     (emit-u32 buf 1))
-  ;; Zero the live-overflow word on EVERY target: the BALANCED-CAP is now
-  ;; universal (Linux port of the bare-metal fix — see emit-handler-helpers),
-  ;; so the longjmp must discard pending capped-frame absorbs everywhere.
-  (emit-bytes buf #x48 #xC7 #x04 #x25)   ; mov qword [imm32], 0
-  (emit-u32 buf #x10000D20)
-  (emit-u32 buf 0)
+  ;; Zero the live-overflow word -- bare metal only: it is the only target
+  ;; whose pop still absorbs it (emit-handler-helpers-bare).  Hosted Linux
+  ;; never stores a capped frame (its overflow is loud), so nothing counts
+  ;; into the word there and its pop does not read it.
+  (unless *x64-linux-mode*
+    (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
+    (emit-u32 buf #x10000D20)
+    (emit-u32 buf 0))
   ;; mov rcx, 0x10000180
   (emit-bytes buf #x48 #xB9)
   (emit-u32 buf #x10000180) (emit-u32 buf 0)
@@ -7475,21 +7559,81 @@
     (emit-u32 buf 0)
     (emit-longjmp-body buf pop-label)))
 
+;;; ------------------------------------------------------------------
+;;; THE HANDLER-FRAME STACK HAS NO SILENT CEILING
+;;; ------------------------------------------------------------------
+;;;
+;;; Every CATCH / UNWIND-PROTECT / HANDLER-CASE / cross-unit BLOCK keeps one
+;;; frame here while its body runs, and a non-local exit unwinds by
+;;; longjmping from frame to frame.  The stack used to be a fixed array (512
+;;; frames on Linux, 64 on bare metal) whose overflow was a TRANSPARENT NO-OP
+;;; (BALANCED-CAP): the frame was dropped, so a THROW / ERROR / RETURN-FROM
+;;; out of more than ~500 nested frames silently skipped every cleanup past
+;;; the cap -- and on a worker each skipped cleanup was a LET of a special
+;;; whose restore never ran, leaving the binding stack one entry deep per
+;;; dropped frame.  SBCL runs all of them.
+;;;
+;;; HOSTED LINUX: the first 512 frames stay where they always were (window
+;;; +0x1000..+0x5000, the fast path, byte-for-byte the old one); frame 512
+;;; and up go to a per-window EXTENSION, reserved lazily by the push helper
+;;; itself (mmap MAP_NORESERVE, so only the pages a deep unwind actually
+;;; touches cost memory) and remembered in the window word
+;;; +HSTACK-EXT-ADDR+.  The extension holds +HSTACK-EXT-FRAMES+ frames,
+;;; which no native stack reaches first (each nested frame costs at least a
+;;; call frame of native stack); past it -- or if the reservation is
+;;; refused -- the push is LOUD, never dropped: see EMIT-HSTACK-OVERFLOW.
+;;;
+;;; BARE METAL keeps 64 frames at 0x10000408 (0x10001000 is its heap base),
+;;; and its 65th push is now the same loud overflow instead of a dropped
+;;; frame.
+(defun emit-hstack-overflow (buf pop-label)
+  "The loud end of a push that cannot store its frame.  Record the overflow
+   for %TAKE-PENDING-FAULT (the same channel a hardware fault uses: this code
+   cannot allocate a condition) and LONGJMP to the frame that is armed now --
+   the one ENCLOSING the form whose push overflowed.  The overflowing frame
+   was never stored and never armed, so nothing is left to pop for it: the
+   stack stays balanced, the enclosing UNWIND-PROTECTs run their cleanups and
+   the nearest HANDLER-CASE receives a STORAGE-CONDITION, exactly as for
+   STACK-EXHAUSTED.  Entered by JMP from inside the push helper; the helper's
+   return address and the setjmp site's saved temporaries are abandoned with
+   the rest of the stack above the armed frame."
+  (emit-bytes buf #xC7 #x04 #x25)                  ; mov dword [imm32], code
+  (emit-u32 buf #x10000CB0)
+  (emit-u32 buf +hstack-overflow-code+)
+  (when *x64-linux-mode*
+    ;; Nothing armed: no frame to deliver it to.  Unreachable while depth > 0
+    ;; (a push only overflows at depth = capacity, and the frame armed above
+    ;; those is [0x10000180]), but if it ever happens say so and stop rather
+    ;; than longjmp through a zero frame.
+    (let ((armed (make-label)))
+      (emit-bytes buf #x48 #xB9)                   ; mov rcx, 0x10000180
+      (emit-u32 buf #x10000180) (emit-u32 buf 0)
+      (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x11) ; mov rdx, [rcx]
+      (emit-bytes buf #x48 #x85 #xD2)              ; test rdx, rdx
+      (emit-jcc buf :ne armed)
+      (emit-fatal-message buf (format nil "~%modus: the handler-frame stack is exhausted (CATCH / UNWIND-PROTECT / HANDLER-CASE nested too deep) and no handler is armed; stopping.~%"))
+      (emit-label buf armed)))
+  (emit-longjmp-body buf pop-label))
+
 (defun emit-handler-helpers (buf push-label pop-label)
   "Emit two helper functions used by handler-case setjmp/clear traps:
-     __handler_push: push current [#x10000180/+8/+16/+24] state onto a memory
-                     stack at #x10000408 (depth at #x10000400, max 64).
+     __handler_push: push current [#x10000180/+8/+16/+24] state onto the
+                     per-thread handler-frame stack (depth at #x10000400).
      __handler_pop:  pop top of stack into [#x10000180/+8/+16/+24]; if stack
                      empty, write 0 to [#x10000180].
    Both preserve all callee-saved regs. They clobber rax/rcx/rdx/r10/r11
-   only — caller-saved per SysV ABI.
+   only — caller-saved per SysV ABI (the push's rare extension reservation
+   saves everything its syscall touches).
 
    Memory map:
      #x10000180/+8/+16/+24 — current handler state (RSP/RBP/IP/RBX, 32 bytes)
      #x10000400        — handler-stack depth (qword, init 0 by fork)
-     #x10000408+32*N   — handler-stack frame N (32 bytes, max 64 frames;
-                         region ends at #x10000C08, just below the #x10000C10
-                         longjmp scratch slots)
+     hosted Linux:  frames 0..511 at #x10001000+32*N (window +0x1000..+0x5000),
+                    frames 512.. in the extension at [+HSTACK-EXT-ADDR+]
+     bare metal:    frames 0..63 at #x10000408+32*N (ends at #x10000C08, just
+                    below the #x10000C10 longjmp scratch slots)
+   A push past the last frame is LOUD (EMIT-HSTACK-OVERFLOW), never dropped:
+   see THE HANDLER-FRAME STACK HAS NO SILENT CEILING above.
 
    The RBX slot [#x10000198] (saved by SETJMP, restored by every longjmp
    path) MUST be stacked with the rest of the frame: without it, nested
@@ -7497,100 +7641,217 @@
    popped, an OUTER longjmp restores the INNER (dead) frame's RBX — the
    caller's V4-cached value is silently replaced and the handler continuation
    runs on corrupt state (the silent-unwind family)."
+  (if *x64-linux-mode*
+      (emit-handler-helpers-linux buf push-label pop-label)
+      (emit-handler-helpers-bare buf push-label pop-label))
+  ;; WS5 #203: to *ERROR-OUTPUT*, not stdout.  translate-x64 is baked INTO the
+  ;; hosted x64 image (kernel-main calls %jit-boot-init at every boot), so this
+  ;; build-time chatter was printing on a SHIPPED binary's stdout on every run —
+  ;; the same pollution class as the implicit-global WARN, one layer down.  On
+  ;; the SBCL build host *error-output* is stderr, so build logs keep it.
+  ;; Not per JIT page: every runtime-compiled form printed it.
+  (unless *x64-jit-mode*
+    (format *error-output* "~&  Handler-stack helpers emitted (push/pop)~%")))
+
+(defun emit-hstack-copy-armed-to-frame (buf frame-in-window-p)
+  "[r11+0..24] := [0x10000180..0x10000198] (this thread's armed frame).
+   FRAME-IN-WINDOW-P: R11 is a window address (the store carries the FS
+   override too); otherwise R11 is absolute (the extension).  Clobbers RAX."
+  (dolist (off '(0 8 16 24))
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25) ; mov rax, [src]
+    (emit-u32 buf (+ #x10000180 off))
+    (when frame-in-window-p (emit-tls-prefix buf))
+    (if (zerop off)
+        (emit-bytes buf #x49 #x89 #x03)                 ; mov [r11], rax
+        (emit-bytes buf #x49 #x89 #x43 off))))          ; mov [r11+off], rax
+
+(defun emit-hstack-copy-frame-to-armed (buf frame-in-window-p)
+  "[0x10000180..0x10000198] := [r11+0..24], through R10 so RAX is untouched
+   (the pop preserves it: a handler-case body's value may live there)."
+  (dolist (off '(0 8 16 24))
+    (when frame-in-window-p (emit-tls-prefix buf))
+    (if (zerop off)
+        (emit-bytes buf #x4D #x8B #x13)                 ; mov r10, [r11]
+        (emit-bytes buf #x4D #x8B #x53 off))            ; mov r10, [r11+off]
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [dst], r10
+    (emit-u32 buf (+ #x10000180 off))))
+
+(defun emit-handler-helpers-linux (buf push-label pop-label)
+  "Hosted Linux push/pop: 512 window frames, then the lazily reserved
+   per-window extension, then a loud overflow.  The window path is the old
+   one instruction for instruction plus the depth test; only a push or pop
+   at depth >= 512 takes the extension path."
+  ;; ---- __handler_push ----
+  (let ((ext (make-label)) (have-ext (make-label)) (reserve (make-label))
+        (overflow (make-label)))
+    (emit-label buf push-label)
+    ;; r10 = depth (PER-THREAD WINDOW: every window access in both helpers
+    ;; carries the FS override, so a thread pushes and pops ITS OWN frame
+    ;; stack.  One shared stack is how thread A's ERROR longjmped onto thread
+    ;; B's stack.)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25) ; mov r10, [depth]
+    (emit-u32 buf #x10000400)
+    (emit-bytes buf #x49 #x81 #xFA)                  ; cmp r10, 512
+    (emit-u32 buf +hstack-win-frames+)
+    (emit-jcc buf :ae ext)
+    ;; window frame: r11 = depth*32 + 0x10001000 (FS-relative)
+    (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
+    (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
+    (emit-u32 buf #x10001000)
+    (emit-hstack-copy-armed-to-frame buf t)
+    (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [depth], r10
+    (emit-u32 buf #x10000400)
+    ;; r11 = 0: frame stored — SETJMP arms [0x10000180].
+    (emit-bytes buf #x4D #x31 #xDB)                  ; xor r11, r11
+    (emit-bytes buf #xC3)                            ; ret
+    ;; extension frame: r11 = [ext] + (depth-512)*32 (ABSOLUTE)
+    (emit-label buf ext)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x1C #x25) ; mov r11, [ext]
+    (emit-u32 buf +hstack-ext-addr+)
+    (emit-bytes buf #x4D #x85 #xDB)                  ; test r11, r11
+    (emit-jcc buf :e reserve)
+    (emit-label buf have-ext)
+    (emit-bytes buf #x4C #x89 #xD0)                  ; mov rax, r10
+    (emit-bytes buf #x48 #x2D)                       ; sub rax, 512
+    (emit-u32 buf +hstack-win-frames+)
+    (emit-bytes buf #x48 #x3D)                       ; cmp rax, ext frames
+    (emit-u32 buf +hstack-ext-frames+)
+    (emit-jcc buf :ae overflow)
+    ;; a lower per-window limit, when one is set (the overflow's own test:
+    ;; no native stack reaches the real capacity).  RCX is free: the setjmp
+    ;; site saved it.
+    (let ((no-limit (make-label)))
+      (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x0C #x25) ; mov rcx, [limit]
+      (emit-u32 buf +hstack-ext-limit-addr+)
+      (emit-bytes buf #x48 #x85 #xC9)                ; test rcx, rcx
+      (emit-jcc buf :e no-limit)
+      (emit-bytes buf #x48 #x39 #xC8)                ; cmp rax, rcx
+      (emit-jcc buf :ae overflow)
+      (emit-label buf no-limit))
+    (emit-bytes buf #x48 #xC1 #xE0 #x05)             ; shl rax, 5
+    (emit-bytes buf #x49 #x01 #xC3)                  ; add r11, rax
+    (emit-hstack-copy-armed-to-frame buf nil)
+    (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [depth], r10
+    (emit-u32 buf #x10000400)
+    (emit-bytes buf #x4D #x31 #xDB)                  ; xor r11, r11
+    (emit-bytes buf #xC3)                            ; ret
+    ;; first push past the window on this window: reserve the extension.
+    ;; mmap(0, frames*32, PROT_READ|PROT_WRITE,
+    ;;      MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0).  SYSCALL destroys
+    ;; RCX/R11; every other register it reads or the caller might hold is
+    ;; saved (R10 is the depth, and an mmap argument).
+    (emit-label buf reserve)
+    (emit-bytes buf #x51 #x52 #x56 #x57)             ; push rcx/rdx/rsi/rdi
+    (emit-bytes buf #x41 #x50 #x41 #x51 #x41 #x52)   ; push r8/r9/r10
+    (emit-bytes buf #x31 #xFF)                       ; xor edi, edi
+    (emit-bytes buf #xBE)                            ; mov esi, bytes
+    (emit-u32 buf (* 32 +hstack-ext-frames+))
+    (emit-bytes buf #xBA #x03 #x00 #x00 #x00)        ; mov edx, 3
+    (emit-bytes buf #x41 #xBA #x22 #x40 #x00 #x00)   ; mov r10d, 0x4022
+    (emit-bytes buf #x49 #xC7 #xC0 #xFF #xFF #xFF #xFF) ; mov r8, -1
+    (emit-bytes buf #x45 #x31 #xC9)                  ; xor r9d, r9d
+    (emit-bytes buf #xB8 #x09 #x00 #x00 #x00)        ; mov eax, 9 (mmap)
+    (emit-bytes buf #x0F #x05)                       ; syscall
+    (emit-bytes buf #x41 #x5A #x41 #x59 #x41 #x58)   ; pop r10/r9/r8
+    (emit-bytes buf #x5F #x5E #x5A #x59)             ; pop rdi/rsi/rdx/rcx
+    (emit-bytes buf #x48 #x3D #x00 #xF0 #xFF #xFF)   ; cmp rax, -4096
+    (emit-jcc buf :a overflow)                       ; -errno: refused
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #x89 #x04 #x25) ; mov [ext], rax
+    (emit-u32 buf +hstack-ext-addr+)
+    (emit-bytes buf #x49 #x89 #xC3)                  ; mov r11, rax
+    (emit-jmp buf have-ext)
+    (emit-label buf overflow)
+    (emit-hstack-overflow buf pop-label))
+  ;; ---- __handler_pop ----
+  ;; Preserves RAX (and R10/R11, which are V7/V8): CLEAR-HANDLER runs right
+  ;; after a handler-case body whose value may live in any of them.
+  (let ((empty (make-label)) (done (make-label)) (ext (make-label)))
+    (emit-label buf pop-label)
+    (emit-bytes buf #x50)                            ; push rax
+    (emit-bytes buf #x41 #x52)                       ; push r10
+    (emit-bytes buf #x41 #x53)                       ; push r11
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25) ; mov r10, [depth]
+    (emit-u32 buf #x10000400)
+    (emit-bytes buf #x4D #x85 #xD2)                  ; test r10, r10
+    (emit-jcc buf :e empty)
+    (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [depth], r10
+    (emit-u32 buf #x10000400)
+    (emit-bytes buf #x49 #x81 #xFA)                  ; cmp r10, 512
+    (emit-u32 buf +hstack-win-frames+)
+    (emit-jcc buf :ae ext)
+    (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
+    (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, 0x10001000
+    (emit-u32 buf #x10001000)
+    (emit-hstack-copy-frame-to-armed buf t)
+    (emit-jmp buf done)
+    ;; extension frame (the push that stored it reserved the extension)
+    (emit-label buf ext)
+    (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x1C #x25) ; mov r11, [ext]
+    (emit-u32 buf +hstack-ext-addr+)
+    (emit-bytes buf #x4C #x89 #xD0)                  ; mov rax, r10
+    (emit-bytes buf #x48 #x2D)                       ; sub rax, 512
+    (emit-u32 buf +hstack-win-frames+)
+    (emit-bytes buf #x48 #xC1 #xE0 #x05)             ; shl rax, 5
+    (emit-bytes buf #x49 #x01 #xC3)                  ; add r11, rax
+    (emit-hstack-copy-frame-to-armed buf nil)
+    (emit-jmp buf done)
+    (emit-label buf empty)
+    ;; [0x10000180] = 0  (legacy "no handler" sentinel)
+    (emit-tls-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
+    (emit-u32 buf #x10000180)
+    (emit-u32 buf 0)
+    (emit-label buf done)
+    (emit-bytes buf #x41 #x5B)                       ; pop r11
+    (emit-bytes buf #x41 #x5A)                       ; pop r10
+    (emit-bytes buf #x58)                            ; pop rax
+    (emit-bytes buf #xC3)))                          ; ret
+
+(defun emit-handler-helpers-bare (buf push-label pop-label)
+  "Bare-metal push/pop: 64 frames at 0x10000408, diagnostics at
+   0x10000D00.., and a LOUD 65th push (EMIT-HSTACK-OVERFLOW).
+
+   The live-overflow word [0x10000D20] and the pop's absorb of it are kept:
+   a push no longer counts into it (it never returns capped), but the inline
+   pops in boot/boot-x64.lisp's ISRs and every longjmp still zero it, and a
+   zero word makes the absorb a no-op."
   ;; ---- __handler_push ----
   (let ((skip (make-label))
         (capped (make-label))
         (nomax (make-label)))
     (emit-label buf push-label)
-    ;; r10 = depth = [0x10000400]   (PER-THREAD WINDOW: every access in both
-    ;; helpers carries the FS override, so a thread pushes and pops ITS OWN
-    ;; frame stack.  One shared stack is how thread A's ERROR longjmped onto
-    ;; thread B's stack.)
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
-    ;; cmp r10, 64 ; jge skip/capped
-    ;; BARE-METAL (non-Linux): route the capped case through a diagnostic
-    ;; counter at [0x10000D00].  A capped push is a STRUCTURAL IMBALANCE:
-    ;; the frame is silently dropped but the matching CLEAR-HANDLER /
-    ;; longjmp still pops, so every capped setjmp+clear pair drains one
-    ;; REAL frame from the stack (the bare-metal ANSI drain-to-depth-0
-    ;; halt class).  The counter makes cap events observable from the
-    ;; runner (mem-ref #x10000D00).
-    (if *x64-linux-mode*
-        (progn (emit-bytes buf #x49 #x81 #xFA)       ; cmp r10, imm32
-               (emit-u32 buf 512))
-        (emit-bytes buf #x49 #x83 #xFA #x40))        ; cmp r10, 64
-    ;; BALANCED-CAP is UNIVERSAL: the old Linux-mode bare `jge skip` (drop
-    ;; the frame, still arm, still pop later) drained one REAL outer frame
-    ;; per capped setjmp+clear pair — deep nesting (e.g. quicklisp's
-    ;; deflate under nested mvm-interpret) then made a later longjmp
-    ;; restore a long-dead frame: wild RIP, RSP in reused memory (task
-    ;; #278 gunzip SIGSEGV).  Route every target through the capped path.
-    ;;
-    ;; LINUX gets a BIGGER stack as well: 512 frames at [0x10001000..
-    ;; 0x10005000] (free BSS inside the ELF LOAD segment) — deep nested
-    ;; interpretation legitimately exceeds 64 frames, and a capped CATCH
-    ;; frame is a transparent no-op that can no longer catch its own tag
-    ;; (the deterministic 64KB gunzip failure).  BARE METAL keeps
-    ;; 64 frames at [0x10000408..0x10000C08]: 0x10001000 is the bare-metal
-    ;; HEAP BASE (boot-x64.lisp semispaces) — NOT free there.
+    (emit-bytes buf #x49 #x83 #xFA #x40)             ; cmp r10, 64
     (emit-jcc buf :ge capped)
-    ;; r11 = depth*32
-    (emit-bytes buf #x4D #x6B #xDA #x20)            ; imul r11, r10, 32
-    ;; r11 += 0x10000408
+    ;; r11 = depth*32 + 0x10000408
+    (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf (if *x64-linux-mode* #x10001000 #x10000408))
-    ;; rax = [0x10000180]; [r11] = rax
-    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
-    (emit-u32 buf #x10000180)
-    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x03)   ; mov [r11], rax
-    ;; rax = [0x10000188]; [r11+8] = rax
-    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
-    (emit-u32 buf #x10000188)
-    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x08) ; mov [r11+8], rax
-    ;; rax = [0x10000190]; [r11+16] = rax
-    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
-    (emit-u32 buf #x10000190)
-    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x10) ; mov [r11+16], rax
-    ;; rax = [0x10000198]; [r11+24] = rax   (saved RBX — see docstring)
-    (emit-tls-prefix buf) (emit-bytes buf #x48 #x8B #x04 #x25)
-    (emit-u32 buf #x10000198)
-    (emit-tls-prefix buf) (emit-bytes buf #x49 #x89 #x43 #x18) ; mov [r11+24], rax
+    (emit-u32 buf #x10000408)
+    (emit-hstack-copy-armed-to-frame buf t)
     ;; depth++ ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xC2)                  ; inc r10
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [imm32], r10
     (emit-u32 buf #x10000400)
-    (unless *x64-linux-mode*
-      ;; DIAG: max-depth watermark at [0x10000D08]
-      (emit-bytes buf #x4C #x8B #x1C #x25)           ; mov r11, [imm32]
-      (emit-u32 buf #x10000D08)
-      (emit-bytes buf #x4D #x39 #xD3)                ; cmp r11, r10
-      (emit-jcc buf :ge nomax)
-      (emit-bytes buf #x4C #x89 #x14 #x25)           ; mov [imm32], r10
-      (emit-u32 buf #x10000D08)
-      (emit-label buf nomax))
-    ;; r11 = 0: frame stored — SETJMP arms [0x10000180].  UNIVERSAL (the
-    ;; capped path returns r11=1; the setjmp trap tests it on every target).
+    ;; DIAG: max-depth watermark at [0x10000D08]
+    (emit-bytes buf #x4C #x8B #x1C #x25)             ; mov r11, [imm32]
+    (emit-u32 buf #x10000D08)
+    (emit-bytes buf #x4D #x39 #xD3)                  ; cmp r11, r10
+    (emit-jcc buf :ge nomax)
+    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
+    (emit-u32 buf #x10000D08)
+    (emit-label buf nomax)
+    ;; r11 = 0: frame stored — SETJMP arms [0x10000180].
     (emit-bytes buf #x4D #x31 #xDB)                  ; xor r11, r11
     (emit-label buf skip)
     (emit-bytes buf #xC3)                            ; ret
-    (progn
-      ;; capped-push path (BARE-METAL BALANCED-CAP): the frame is NOT
-      ;; stored, but the event is COUNTED in the live-overflow word at
-      ;; [0x10000D20] so the matching CLEAR-HANDLER pop absorbs it
-      ;; instead of draining a real stored frame (the drain-to-depth-0
-      ;; halt class).  r11=1 tells the SETJMP trap to skip arming
-      ;; [0x10000180] entirely: the capped handler-case degrades to a
-      ;; transparent no-op (its body's errors go to the enclosing
-      ;; handler) rather than corrupting the stack.  [0x10000D00] is
-      ;; the cumulative diagnostic count.
-      (emit-label buf capped)
-      (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
-      (emit-u32 buf #x10000D00)
-      (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
-      (emit-u32 buf #x10000D20)
-      (emit-bytes buf #x49 #xC7 #xC3 #x01 #x00 #x00 #x00) ; mov r11, 1
-      (emit-bytes buf #xC3)))                        ; ret
+    ;; 65th frame: LOUD.  [0x10000D00] still counts the events.
+    (emit-label buf capped)
+    (emit-bytes buf #x48 #xFF #x04 #x25)             ; inc qword [imm32]
+    (emit-u32 buf #x10000D00)
+    (emit-hstack-overflow buf pop-label))
   ;; ---- __handler_pop ----
   ;; Preserves RAX across the call. CLEAR-HANDLER is emitted after a
   ;; handler-case body succeeds; if dest == VR == RAX, the body's result
@@ -7605,64 +7866,36 @@
     ;; handler-case body whose value may live in one of them: preserve both.
     (emit-bytes buf #x41 #x52)                       ; push r10
     (emit-bytes buf #x41 #x53)                       ; push r11
-
-    (progn
-      ;; BALANCED-CAP (universal): if the live-overflow word [0x10000D20]
-      ;; is non-zero, this pop textually matches a CAPPED push (whose
-      ;; frame was never stored) — absorb it: decrement overflow, leave
-      ;; [0x10000180..198] and the stored stack untouched.  Longjmp-side
-      ;; callers (TRAP #x0511, the #PF/#GP recovery ISR, the PIT deadline
-      ;; ISR) zero [0x10000D20] BEFORE popping — a longjmp unwinds past
-      ;; ALL capped (strictly inner) frames, so their absorbs must not
-      ;; fire against outer pops.
-      (emit-bytes buf #x4C #x8B #x14 #x25)           ; mov r10, [imm32]
-      (emit-u32 buf #x10000D20)
-      (emit-bytes buf #x4D #x85 #xD2)                ; test r10, r10
-      (emit-jcc buf :e no-ovf)
-      (emit-bytes buf #x49 #xFF #xCA)                ; dec r10
-      (emit-bytes buf #x4C #x89 #x14 #x25)           ; mov [imm32], r10
-      (emit-u32 buf #x10000D20)
-      (emit-jmp buf done)
-      (emit-label buf no-ovf))
+    ;; Live-overflow absorb (see the docstring): a non-zero [0x10000D20]
+    ;; means this pop matches a push that stored nothing.
+    (emit-bytes buf #x4C #x8B #x14 #x25)             ; mov r10, [imm32]
+    (emit-u32 buf #x10000D20)
+    (emit-bytes buf #x4D #x85 #xD2)                  ; test r10, r10
+    (emit-jcc buf :e no-ovf)
+    (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
+    (emit-bytes buf #x4C #x89 #x14 #x25)             ; mov [imm32], r10
+    (emit-u32 buf #x10000D20)
+    (emit-jmp buf done)
+    (emit-label buf no-ovf)
     ;; r10 = depth = [0x10000400]
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x8B #x14 #x25)
     (emit-u32 buf #x10000400)
-    ;; test r10, r10 ; jz empty
-    (emit-bytes buf #x4D #x85 #xD2)
+    (emit-bytes buf #x4D #x85 #xD2)                  ; test r10, r10
     (emit-jcc buf :e empty)
-    ;; depth-- ; [0x10000400] = r10
     (emit-bytes buf #x49 #xFF #xCA)                  ; dec r10
     (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
     (emit-u32 buf #x10000400)
     ;; r11 = depth*32 + 0x10000408
     (emit-bytes buf #x4D #x6B #xDA #x20)             ; imul r11, r10, 32
     (emit-bytes buf #x49 #x81 #xC3)                  ; add r11, imm32
-    (emit-u32 buf (if *x64-linux-mode* #x10001000 #x10000408))
-    ;; Use r10 as memory-scratch (its value is now consumed) so RAX
-    ;; stays pristine across mem-to-mem copies.
-    ;; [0x10000180] = [r11]
-    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x13)   ; mov r10, [r11]
-    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25) ; mov [imm32], r10
-    (emit-u32 buf #x10000180)
-    ;; [0x10000188] = [r11+8]
-    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x08) ; mov r10, [r11+8]
-    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
-    (emit-u32 buf #x10000188)
-    ;; [0x10000190] = [r11+16]
-    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x10) ; mov r10, [r11+16]
-    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
-    (emit-u32 buf #x10000190)
-    ;; [0x10000198] = [r11+24]   (saved RBX — see push above)
-    (emit-tls-prefix buf) (emit-bytes buf #x4D #x8B #x53 #x18) ; mov r10, [r11+24]
-    (emit-tls-prefix buf) (emit-bytes buf #x4C #x89 #x14 #x25)
-    (emit-u32 buf #x10000198)
+    (emit-u32 buf #x10000408)
+    (emit-hstack-copy-frame-to-armed buf t)
     (emit-jmp buf done)
     (emit-label buf empty)
-    (unless *x64-linux-mode*
-      ;; DIAG: pop-at-empty counter at [0x10000D10] — each hit means the
-      ;; stack drained below the structural base (imbalance evidence).
-      (emit-bytes buf #x48 #xFF #x04 #x25)           ; inc qword [imm32]
-      (emit-u32 buf #x10000D10))
+    ;; DIAG: pop-at-empty counter at [0x10000D10] — each hit means the
+    ;; stack drained below the structural base (imbalance evidence).
+    (emit-bytes buf #x48 #xFF #x04 #x25)             ; inc qword [imm32]
+    (emit-u32 buf #x10000D10)
     ;; [0x10000180] = 0  (legacy "no handler" sentinel)
     (emit-tls-prefix buf) (emit-bytes buf #x48 #xC7 #x04 #x25) ; mov qword [imm32], 0
     (emit-u32 buf #x10000180)
@@ -7671,15 +7904,7 @@
     (emit-bytes buf #x41 #x5B)                       ; pop r11
     (emit-bytes buf #x41 #x5A)                       ; pop r10
     (emit-bytes buf #x58)                            ; pop rax
-    (emit-bytes buf #xC3))                           ; ret
-  ;; WS5 #203: to *ERROR-OUTPUT*, not stdout.  translate-x64 is baked INTO the
-  ;; hosted x64 image (kernel-main calls %jit-boot-init at every boot), so this
-  ;; build-time chatter was printing on a SHIPPED binary's stdout on every run —
-  ;; the same pollution class as the implicit-global WARN, one layer down.  On
-  ;; the SBCL build host *error-output* is stderr, so build logs keep it.
-  ;; Not per JIT page: every runtime-compiled form printed it.
-  (unless *x64-jit-mode*
-    (format *error-output* "~&  Handler-stack helpers emitted (push/pop)~%")))
+    (emit-bytes buf #xC3)))                          ; ret
 
 ;;; ------------------------------------------------------------------
 ;;; GC WATCH (build knob MODUS_GC_WATCH; default off, collector byte-identical).
@@ -8685,6 +8910,47 @@
     (emit-pop buf 'rax)
     (emit-mov-reg-imm buf 'r14 0)
     (emit-label buf skip)))
+
+(defun emit-x64-stw-safepoint (buf sub)
+  "A :SAFEPOINT back-edge (compiler.lisp *PARK-SAFEPOINTS*: a function that
+   holds no raw word).  The poll is YIELD's, one compare of the stop flag and
+   a branch not taken; with the flag held it calls SUB, this unit's
+   EMIT-X64-STW-SAFEPOINT-SUB, which parks the thread HERE.  Without it a loop
+   that never allocates held every region-0 collection up for as long as it
+   ran: a worker spinning on (loop (when *flag* (return)) ...) while main
+   waited on that collection to set *flag* hung the process
+   (test/stw-spinning-worker.lisp)."
+  (let ((skip (make-label)))
+    (x64-stw-flag-test buf)
+    (emit-jcc buf :e skip)
+    (emit-call buf sub)
+    (emit-label buf skip)))
+
+(defun emit-x64-stw-safepoint-sub (buf label gc-lbl)
+  "The :SAFEPOINT slow path, one per unit.  Clamp R14 as YIELD's poll does
+   (EMIT-X64-STW-CLAMP: the real limit kept in the active region's
+   saved-limit), then a gc-check of nothing -- `cmp r12, r14 ; jl ; call
+   trampoline', the 14-byte shape the trampoline recognises
+   (EMIT-X64-STW-ENTRY).  The trampoline parks, puts the real limit back and
+   returns to the compare, which now passes, and this returns to the loop.
+   Nothing is allocated; nothing is collected unless the region really is full
+   (which the next allocation would do anyway).  Only RAX is used, and saved;
+   the trampoline saves the rest."
+  (let ((clamped (make-label)) (done (make-label)))
+    (emit-label buf label)
+    (emit-cmp-reg-imm buf 'r14 0)
+    (emit-jcc buf :e clamped)
+    (emit-push buf 'rax)
+    (emit-load-gc-region buf 'rax)
+    (emit-mov-mem-reg buf 'rax 'r14 modus.mvm::+gc-off-saved-limit+)
+    (emit-pop buf 'rax)
+    (emit-mov-reg-imm buf 'r14 0)
+    (emit-label buf clamped)
+    (emit-cmp-reg-reg buf 'r12 'r14)
+    (emit-jcc buf :l done)
+    (emit-call buf gc-lbl)
+    (emit-label buf done)
+    (emit-ret buf)))
 
 (defun emit-x64-gc-safe-trap (buf enter)
   "%GC-SAFE-ENTER (ENTER true) / %GC-SAFE-LEAVE.  Enter publishes SP and the
@@ -9763,6 +10029,15 @@
     ;; share this one load of the region base; scan_word pushes/pops RDX, so it
     ;; survives the whole scan exactly as before.
     (emit-mov-reg-mem buf 'rdx 'rax modus.mvm::+gc-off-stack-base+)
+    ;; BYTES CONSED, entry half: += (R12 - from_start) << 1.  R12 is still the
+    ;; allocation pointer here (promo-setup below reuses it); RSI is free until
+    ;; the stack scan.  See +X64-BYTES-CONSED-ADDR+.
+    (when *x64-linux-mode*
+      (emit-bytes buf #x4C #x89 #xE6)              ; mov rsi, r12
+      (emit-bytes buf #x48 #x29 #xDE)              ; sub rsi, rbx
+      (emit-bytes buf #x48 #xD1 #xE6)              ; shl rsi, 1
+      (emit-bytes buf #xF0 #x48 #x01 #x34 #x25)    ; lock add [abs32], rsi
+      (emit-u32 buf +x64-bytes-consed-addr+))
     ;; GENERATIONAL: R12/R14 for this collection, and the point a major's phase
     ;; 2 runs the collection again from, with new geometry (RBX/RCX/R13 and the
     ;; block's to_start set by EMIT-X64-MAJOR-STEP).
@@ -10074,6 +10349,17 @@
       (emit-shr-reg-imm buf 'rcx 7)                  ; byte count = space_size/128
       (emit-bytes buf #x31 #xC0)                     ; xor eax, eax
       (emit-bytes buf #xF3 #xAA))                    ; rep stosb
+
+    ;; BYTES CONSED, exit half: -= (new R12 - new from_start) << 1, the
+    ;; survivors the next cycle's count starts above.  RSI = this region's
+    ;; block; RAX and R11 are restored by the epilogue.
+    (when *x64-linux-mode*
+      (emit-bytes buf #x4C #x89 #xE0)              ; mov rax, r12
+      (emit-mov-reg-mem buf 'r11 'rsi modus.mvm::+gc-off-from-start+)
+      (emit-sub-reg-reg buf 'rax 'r11)
+      (emit-bytes buf #x48 #xD1 #xE0)              ; shl rax, 1
+      (emit-bytes buf #xF0 #x48 #x29 #x04 #x25)    ; lock sub [abs32], rax
+      (emit-u32 buf +x64-bytes-consed-addr+))
 
     ;; ---- Increment THIS REGION's collection count ----
     ;; inc qword [rsi + gc_count].  Per-region, so "how many times has region N
@@ -11617,6 +11903,9 @@
          ;; stays a NOP and the Linux image is byte-identical.
          (yield-longjmp-lbl (unless *x64-linux-mode* (make-label)))
          (park-lbl (when (x64-stw-p) (make-label)))
+         (safepoint-lbl (when (and *x64-linux-mode* *x64-stw*
+                                   (or page-gc-label gc-trampoline-label))
+                          (make-label)))
          (ssg-lbl (when (x64-ssg-p) (make-label)))
          (card-lbl (when (x64-gen-gc-p) (make-label)))
          (card-range-lbl (when (x64-gen-gc-p) (make-label)))
@@ -11680,6 +11969,7 @@
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl
                               :park-label park-lbl
+                              :safepoint-label safepoint-lbl
                               :ssg-label ssg-lbl
                               :card-label (and card-lbl (not (x64-barrier-exempt-fn-p name))
                                                card-lbl)
@@ -11827,6 +12117,9 @@
       ;; HOSTED THREADED: the stop-the-world park stub (see emit-park-stub).
       (when park-lbl
         (emit-park-stub buf park-lbl))
+      (when safepoint-lbl
+        (emit-x64-stw-safepoint-sub buf safepoint-lbl
+                                    (or page-gc-label gc-trampoline-label)))
       (when ssg-lbl
         (emit-shared-store-guard-sub buf ssg-lbl))
       (when card-lbl

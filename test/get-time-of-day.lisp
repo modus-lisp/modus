@@ -1,0 +1,26 @@
+;;;; get-time-of-day.lisp -- SB-EXT:GET-TIME-OF-DAY is one wall-clock reading: seconds and microseconds
+;;;; agree with each other, never run backwards, and match GET-UNIVERSAL-TIME.
+;;;;   modus --script test/get-time-of-day.lisp      (also runs on SBCL)
+(defvar *fail* 0)
+(defmacro check (name form) `(unless ,form (incf *fail*) (format t "~&FAIL: ~a~%" ,name)))
+(defun now-us () (multiple-value-bind (s us) (sb-ext:get-time-of-day) (+ (* s 1000000) us)))
+(multiple-value-bind (s us) (sb-ext:get-time-of-day)
+  (check "microseconds in range" (and (integerp us) (<= 0 us 999999)))
+  (check "seconds match get-universal-time" (<= (abs (- (+ s 2208988800) (get-universal-time))) 1)))
+;; across 3 s of readings 2 ms apart, time never goes backwards and never jumps by more than 0.5 s
+(let ((prev (now-us)) (back 0) (jump 0))
+  (dotimes (i 1500)
+    (sleep 0.002)
+    (let ((n (now-us)))
+      (when (< n prev) (incf back))
+      (when (> (- n prev) 500000) (incf jump))
+      (setf prev n)))
+  (check (format nil "never backwards (~a)" back) (zerop back))
+  (check (format nil "no second-sized jumps (~a)" jump) (zerop jump)))
+;; elapsed wall time agrees with the monotonic clock over a 1.2 s sleep, to within 50 ms
+(let ((a (now-us)) (ra (get-internal-real-time)))
+  (sleep 1.2)
+  (let ((wall (- (now-us) a))
+        (mono (floor (* (- (get-internal-real-time) ra) 1000000) internal-time-units-per-second)))
+    (check (format nil "elapsed agrees (wall ~a us, monotonic ~a us)" wall mono) (< (abs (- wall mono)) 50000))))
+(format t "~&GET-TIME-OF-DAY ~a~%" (if (zerop *fail*) "PASS" (format nil "FAIL (~a)" *fail*)))

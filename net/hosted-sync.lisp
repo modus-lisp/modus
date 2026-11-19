@@ -166,11 +166,15 @@
 
    THE WINDOW REACHES PAST ITS FIRST PAGE ON BOTH TARGETS, and each block has
    to cover all of it:
-   - AArch64: the handler-frame stack at +0x10000 and two words just below it
-     (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64) — 0x11000 bytes.
+   - AArch64: the handler-frame stack at +0x10000 (170 frames; the address of
+     a lazily reserved extension for the frames past them at +0x5600, as on
+     x86-64) and two words just below it (translate-aarch64.lisp, THE
+     PER-THREAD WINDOW, AARCH64) — 0x11000 bytes.
    - x86-64 Linux: the handler-frame stack is 512 frames at +0x1000..+0x5000
      (translate-x64's handler helpers; the 64 in-window frames at +0x408 are
-     bare metal's) plus operandi's shared-store guard word at +0x5058 — 0x8000 bytes.  These blocks used to be 4 KB apart, so a
+     bare metal's) plus operandi's shared-store guard word at +0x5058, and the
+     ADDRESS of the frames past 512 (a lazily reserved extension) at +0x5600 —
+     0x8000 bytes.  A reused block keeps that address: the extension is reused.  These blocks used to be 4 KB apart, so a
      worker's handler frames landed in the NEXT worker's block, on its
      multiple-value slots (+0x90) and nargs (+0x150) — measured: every
      interpreted capturing closure called from two workers at once went wrong
@@ -302,7 +306,11 @@
           (%gc-write64 (+ b #x188) 0)
           (%gc-write64 (+ b #x190) 0)
           (%gc-write64 (+ b #x198) 0)
-          (%gc-write64 (+ b #x400) 0)
+          ;; the handler-frame depth: x86-64's at +0x400, AArch64's at
+          ;; +0x10000 (a thread that died inside a HANDLER-CASE left it
+          ;; non-zero, and its frames would be popped into the new one's
+          ;; armed slots).
+          (%gc-write64 (+ b (%layout-if :a64-threads #x10000 #x400)) 0)
           (%gc-write64 (+ b #x5000) 0)
           (%gc-write64 (+ b #x5008) 0)
           ;; THE SHARED-STORE GUARD'S WORDS (translate-x64, SHARED-STORE
@@ -318,6 +326,11 @@
                      (%gc-write64 (+ b #x5048) 0)
                      (%gc-write64 (+ b #x5050) 0)))
           (%gc-write64 (+ b #x5058) 0)
+          ;; the handler-frame extension's test limit (translate-x64
+          ;; +HSTACK-EXT-LIMIT-ADDR+, translate-aarch64 +A64-HSTACK-EXT-LIMIT-ADDR+
+          ;; -- the same window word); the extension's ADDRESS at +0x5600 is
+          ;; kept, so a reused block reuses its reservation.
+          (%gc-write64 (+ b #x5608) 0)
           (%gc-write64 (+ b #xC30) delta)
           delta))))
 

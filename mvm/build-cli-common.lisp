@@ -575,6 +575,12 @@
   ;; as the image's does.
   (setq *x64-sched-lock-addr* 268439488)
   (setq *tls-window* t)
+  ;; LOOP BACK-EDGES THAT CAN PARK (compiler.lisp *PARK-SAFEPOINTS*): a JIT'd
+  ;; function holding no raw word stops for a region-0 collection at its loop
+  ;; back-edges, not only at an allocation -- or a worker spinning in a loop
+  ;; that never allocates holds every collection up (and the process hangs).
+  ;; The image's own AOT code keeps the poll-only YIELD.
+  (setq *park-safepoints* t)
   ;; THE ACTIVE REGION IS PER-THREAD (build-generic-cli.lisp, NATIVE THREADS
   ;; STEP 3), and a JIT page carries its own copy of the collector.  Left at
   ;; its NIL default here, that copy read the single region word -- region 0's
@@ -629,6 +635,7 @@
   (setq *x64-gc-region-percpu* nil)
   (setq *x64-sched-lock-addr* nil)
   (setq *x64-stw* nil)
+  (setq *park-safepoints* nil)
 "
        "")
    "  t)
@@ -711,8 +718,19 @@
   ;; The hosted layout (docs/macos-hosting.md) — the runtime twin of
   ;; APPLY-LAYOUT-HOST: code compiled at runtime must agree with the fixed code
   ;; on where the region is, which heap and arena, and whether x18 is the base.
-" (layout-coinit-text) "
-  t)
+" (layout-coinit-text)
+   ;; LOOP BACK-EDGES THAT CAN PARK (compiler.lisp *PARK-SAFEPOINTS*), as the
+   ;; x86-64 co-init does: a JIT'd function holding no raw word stops for a
+   ;; region-0 collection at its loop back-edges, or a worker spinning in a
+   ;; loop that never allocates holds every collection up (and the process
+   ;; hangs, test/stw-spinning-worker.lisp).  Only with threads (the layout
+   ;; text above set *A64-TLS-WINDOW*); the image's AOT code keeps YIELD, and
+   ;; bare metal is untouched.
+   (if *cli-bare-metal*
+       ""
+       "  (setq *park-safepoints* *a64-tls-window*)
+")
+   "  t)
 ")))
 
 ;;; The assembled translator slot, spliced into *all-runtime-source* and
@@ -1260,6 +1278,66 @@
 (defvar *cli-hosted-payload-source*
   (concatenate 'string *cli-library-payload-source* *cli-hosted-platform-source*))
 
+;;; %SET-SIGNAL-DISPOSITION's source, per port (and %IGNORE-SIGPIPE on top of it): the
+;;; rt_sigaction number is the ARCH's (x86-64 13, AArch64/RISC-V 134, i386/ARM EABI 174), and
+;;; the struct is the same shape everywhere this needs it -- the handler is the first word of
+;;; every Linux ABI's struct, SIG_DFL is 0, SIG_IGN is 1, the rest zero.  x86-64/AArch64 take a
+;;; fresh zero page (4 KB that stays mapped: a call is boot, core restore, or a program's
+;;; SB-SYS:ENABLE-INTERRUPT, which is rare); the 30-bit ports and RISC-V write the struct into
+;;; the C-string scratch page instead, since a 32-bit guest's mmap can land above the fixnum
+;;; range.  Returns the syscall's result: 0, or a negative errno.
+(defun %ignore-sigpipe-source ()
+  ;; BARE METAL HAS NO SIGNALS AND NO mmap: %MMAP-SHARED-PAGE is trap #x0504,
+  ;; which on a bare AArch64 image is an SVC with nothing behind it -- the Pi
+  ;; kernel8.img built from e7ef4e9 died at boot with
+  ;; `!!FAULT E0000000056000504' (EC 0x15 SVC, ISS = the trap number) before
+  ;; its banner, under QEMU raspi3b and the same on the board.  Nothing to
+  ;; ignore there; the shim install still runs.  A disposition set there has
+  ;; nothing to act on, since nothing ever delivers a signal: 0, success.
+  (when (and (boundp '*cli-bare-metal*) *cli-bare-metal*)
+    (return-from %ignore-sigpipe-source
+      "(defun %set-signal-disposition (signum disposition) signum disposition 0)
+(defun %ignore-sigpipe () 0)"))
+  (let ((nr (ecase *cli-arch*
+              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174))))
+    (concatenate 'string
+      (if (member *cli-arch* '(:x64 :aarch64))
+          (format nil "(defun %set-signal-disposition (signum disposition)
+  (let ((sa (%mmap-shared-page 4096)))
+    (if (< sa 4096)
+        -12
+        (progn (%gc-write64 sa disposition)
+               (syscall6 ~D signum sa 0 8 0 0)))))" nr)
+          (format nil "(defun %set-signal-disposition (signum disposition)
+  (let ((sa *cstr-scratch*))
+    (dotimes (i 8) (setf (mem-ref (+ sa (* 4 i)) :u32) 0))
+    (setf (mem-ref sa :u32) disposition)
+    (syscall6 ~D signum sa 0 8 0 0)))" nr))
+      "
+(defun %ignore-sigpipe () (%set-signal-disposition 13 1))")))
+
+;;; THE UNICODE CHARACTER-NAME TABLE (mvm/cl-unicode-names.lisp + data generated here, from
+;;; this SBCL's CHAR-NAME, by lib/unicode-names-gen.lisp): CHAR-NAME / NAME-CHAR / #\name for
+;;; every name SBCL knows.  ~210 KB of narrow string literals.  MODUS_UNICODE_NAMES=1/0
+;;; decides; unset, hosted images carry it and bare-metal images (the small Pi cores) do not,
+;;; and get mvm/cl-unicode-names-absent.lisp: control names, U+XXXX, a few Unicode names, and
+;;; a reader error that names anything else.  (modus:image-configuration) does not list it;
+;;; (modus.runtime::%ucn-present-p) answers.
+(load (merge-pathnames "lib/unicode-names-gen.lisp" *modus-base*))
+(defvar *cli-unicode-names*
+  (modus.unicode-names-gen::unicode-names-wanted-p (not *cli-bare-metal*)))
+(defvar *unicode-names-source*
+  (if *cli-unicode-names*
+      (concatenate 'string
+                   (mvm-text "mvm/cl-unicode-names.lisp")
+                   (string #\Newline)
+                   (modus.mvm::%build-package-scoped-source
+                    (modus.unicode-names-gen::unicode-names-source :stream *standard-output*)
+                    "mvm/cl-unicode-names-data.lisp"))
+      (progn
+        (format t "~&;; unicode names: no table (MODUS_UNICODE_NAMES / bare metal)~%")
+        (mvm-text "mvm/cl-unicode-names-absent.lisp"))))
+
 (defvar *bridge-source*
   (concatenate 'string
     (mvm-text "mvm/cl-sequences.lisp")
@@ -1283,6 +1361,12 @@
     (mvm-text "mvm/kernel-packages.lisp")
     (string #\Newline)
     (mvm-text "mvm/cl-conditions.lisp")
+    (string #\Newline)
+    *unicode-names-source*
+    (string #\Newline)
+    ;; rt_sigaction for SIGPIPE at boot and SB-SYS:ENABLE-INTERRUPT (in the bridge so runtime
+    ;; EVAL -- the SB-SYS shim -- can call it by name)
+    (%ignore-sigpipe-source)
     (string #\Newline)
     (if *cli-omit-ansi-test-aux* "" (mvm-text "mvm/ansi-test-aux.lisp"))
     (string #\Newline)
@@ -2100,37 +2184,6 @@
 (defvar *sb-gray-text*
   (read-file-text (merge-pathnames "net/sb-gray-shim.lisp" *modus-base*)))
 
-;;; %IGNORE-SIGPIPE's source, per port: the rt_sigaction number is the
-;;; ARCH's (x86-64 13, AArch64/RISC-V 134, i386/ARM EABI 174), and the struct
-;;; is the same shape everywhere this needs it -- the handler is the first word
-;;; of every Linux ABI's struct, SIG_IGN is 1, the rest zero.  x86-64/AArch64
-;;; take a fresh zero page; the 30-bit ports and RISC-V write the struct into
-;;; the C-string scratch page instead, since a 32-bit guest's mmap can land
-;;; above the fixnum range (and it is boot, so nothing else is using it).
-(defun %ignore-sigpipe-source ()
-  ;; BARE METAL HAS NO SIGNALS AND NO mmap: %MMAP-SHARED-PAGE is trap #x0504,
-  ;; which on a bare AArch64 image is an SVC with nothing behind it -- the Pi
-  ;; kernel8.img built from e7ef4e9 died at boot with
-  ;; `!!FAULT E0000000056000504' (EC 0x15 SVC, ISS = the trap number) before
-  ;; its banner, under QEMU raspi3b and the same on the board.  Nothing to
-  ;; ignore there; the shim install still runs.
-  (when (and (boundp '*cli-bare-metal*) *cli-bare-metal*)
-    (return-from %ignore-sigpipe-source "(defun %ignore-sigpipe () 0)"))
-  (let ((nr (ecase *cli-arch*
-              (:x64 13) ((:aarch64 :riscv64 :riscv32) 134) ((:i386 :arm32 :68k) 174))))
-    (if (member *cli-arch* '(:x64 :aarch64))
-        (format nil "(defun %ignore-sigpipe ()
-  (let ((sa (%mmap-shared-page 4096)))
-    (if (< sa 4096)
-        0
-        (progn (%gc-write64 sa 1)
-               (syscall6 ~D 13 sa 0 8 0 0)))))" nr)
-        (format nil "(defun %ignore-sigpipe ()
-  (let ((sa *cstr-scratch*))
-    (dotimes (i 8) (setf (mem-ref (+ sa (* 4 i)) :u32) 0))
-    (setf (mem-ref sa :u32) 1)
-    (syscall6 ~D 13 sa 0 8 0 0)))" nr))))
-
 (defvar *sb-gray-source*
   (concatenate 'string "
 (defun %sb-gray-source ()
@@ -2167,13 +2220,26 @@
 ;; end closed must come back as EPIPE, not end the process (an actor's TLS
 ;; write to a server that had hung up killed everything with exit 141).
 ;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
-" (%ignore-sigpipe-source) "
-" (if (not *cli-hosted-actor-runtime-p*)
-      ;; The actor runtime and the per-computation registry are hosted-only
-      ;; (*cli-hosted-actors-source*); an image without the actor runtime (bare metal,
-      ;; aarch64) has nothing to publish.
-      "(defun %publish-runtime-api () nil)"
-      "(defun %publish-runtime-api () (%publish-runtime-api-hosted))") "
+;; (%IGNORE-SIGPIPE is in the CL bridge, from %IGNORE-SIGPIPE-SOURCE, so runtime EVAL reaches
+;; %SET-SIGNAL-DISPOSITION too: SB-SYS:ENABLE-INTERRUPT calls it.)
+" (cond (*cli-hosted-actor-runtime-p*
+         "(defun %publish-runtime-api () (%publish-runtime-api-hosted))")
+        ;; THE HOSTED aarch64 IMAGE WITH THREADS (macOS, iOS) links net/hosted-sync.lisp --
+        ;; *CLI-HOSTED-ACTORS-SOURCE*'s first clause -- so it has the per-computation registry
+        ;; and its threads bind what is registered (%WITH-COMPUTATION-STATE), but not the actor
+        ;; runtime.  Publish the registry alone.  Unpublished, a library's (fboundp
+        ;; 'register-per-computation-special) found NIL and its global stayed shared: natrium's
+        ;; DRBG, filled by the first worker to want a random byte -- every TLS handshake on a
+        ;; worker -- was a refused shared store on the phone.
+        ((and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*)
+         "(defun %publish-runtime-api ()
+  (let ((f (function register-per-computation-special)))
+    (set-symbol-function (intern \"REGISTER-PER-COMPUTATION-SPECIAL\" (find-package \"COMMON-LISP-USER\")) f)
+    (when (boundp (quote *symbol-function-table*))
+      (puthash \"REGISTER-PER-COMPUTATION-SPECIAL\" *symbol-function-table* f))
+    t))")
+        ;; bare metal, or an image without threads: nothing to publish
+        (t "(defun %publish-runtime-api () nil)")) "
 
 (defun %publish-runtime-api-hosted ()
   (let ((pk (find-package \"COMMON-LISP-USER\")))
@@ -2428,7 +2494,8 @@
       (%push-feature :sb-mop))
     (%defer-packages (function %install-sb-shims-source)
                      (list \"SB-THREAD\" \"SB-POSIX\" \"SB-SYS\" \"SB-ALIEN\" \"SB-EXT\"
-                           \"SB-KERNEL\" \"SB-INT\" \"SB-DEBUG\" \"SB-BSD-SOCKETS\" \"SB-MOP\"))
+                           \"SB-KERNEL\" \"SB-INT\" \"SB-DEBUG\" \"SB-BSD-SOCKETS\" \"SB-MOP\"
+                           \"SB-UNIX\" \"SB-UNICODE\"))
     ;; MODUS's shim-provided names live in a package that already exists, so
     ;; no package lookup can trigger them: export them now, as stubs that
     ;; install the shims and call the real definition.

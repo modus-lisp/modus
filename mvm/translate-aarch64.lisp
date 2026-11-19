@@ -2170,6 +2170,24 @@
   "NIL: the per-thread delta is TPIDR_EL0 (Linux).  An integer: it is the word
    at that byte offset in the pthread TSD array TPIDRRO_EL0 points at (Darwin).")
 
+;;; Handler-frame stack geometry: see THE HANDLER-FRAME STACK HAS NO SILENT
+;;; CEILING (AArch64) at EMIT-AARCH64-HANDLER-PUSH-POP.
+(defconstant +a64-hstack-win-frames+ 170
+  "Hosted: handler frames kept in the window, +0x10008 .. +0x10FF8.")
+(defconstant +a64-hstack-bare-frames+ 2730
+  "Bare metal: handler frames from window +0x10008 up to window +0x1FFF8.")
+(defconstant +a64-hstack-ext-addr+ #x10005600
+  "Hosted, per-thread window word: ABSOLUTE address of this window's frame
+   extension (frames 170 and up), 0 until the first push past 170 reserves it.")
+(defconstant +a64-hstack-ext-limit-addr+ #x10005608
+  "Hosted, per-thread window word: 0, or a test-only LOWER limit on this
+   window's extension frames.")
+(defconstant +a64-hstack-ext-frames+ #x100000
+  "Frames in one extension: 1M x 24 bytes = 24 MB of reserved address space.")
+(defconstant +a64-hstack-overflow-code+ #x0F0F
+  "Recorded at 0x10000CB0 by an overflowing push; %TAKE-PENDING-FAULT turns it
+   into HANDLER-STACK-EXHAUSTED.")
+
 (defconstant +sysreg-tpidr-el0+   #xDE82 "TPIDR_EL0: S3_3_C13_C0_2")
 (defconstant +sysreg-tpidrro-el0+ #xDE83 "TPIDRRO_EL0: S3_3_C13_C0_3")
 
@@ -4296,11 +4314,38 @@
                         ;; --- depth > 0 branch: depth--, copy frame ---
                         (a64-sub-imm buf +a64-x13+ +a64-x13+ 1)
                         (a64-str-unsigned buf +a64-x13+ +a64-x12+ 0)
-                        (a64-add-imm buf +a64-x14+ +a64-x12+ 8)        ; 0x10010008
-                        (a64-lsl-imm buf +a64-x16+ +a64-x13+ 4)        ; depth*16
-                        (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 0)
-                        (a64-lsl-imm buf +a64-x16+ +a64-x13+ 3)        ; depth*8
-                        (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 0)
+                        ;; Hosted: a frame past the window's 170 is in this
+                        ;; window's extension (THE HANDLER-FRAME STACK HAS
+                        ;; NO SILENT CEILING, AArch64): x14 = [+0x5600] +
+                        ;; (depth-170)*24.  The push that stored it reserved
+                        ;; the extension.
+                        (let ((blo-idx nil) (b-win-idx nil))
+                          (when *aarch64-linux-mode*
+                            (a64-cmp-imm buf +a64-x13+ +a64-hstack-win-frames+)
+                            (setq blo-idx (a64-current-index buf))
+                            (a64-bcond buf +cc-cc+ 0)                  ; B.LO window
+                            (a64-load-real-addr buf +a64-x14+ (conv-real +a64-hstack-ext-addr+))
+                            (a64-add-thread-delta buf +a64-x14+ +a64-x16+)
+                            (a64-ldur buf +a64-x14+ +a64-x14+ 0)
+                            (a64-sub-imm buf +a64-x16+ +a64-x13+ +a64-hstack-win-frames+)
+                            (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 4)
+                            (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 3)
+                            (setq b-win-idx (a64-current-index buf))
+                            (a64-emit buf #x14000000)                  ; B copy
+                            (let ((code (a64-buffer-code buf)))
+                              (setf (aref code blo-idx)
+                                    (logior (aref code blo-idx)
+                                            (ash (logand (- (a64-current-index buf) blo-idx) #x7FFFF) 5)))))
+                          (a64-add-imm buf +a64-x14+ +a64-x12+ 8)        ; 0x10010008
+                          (a64-lsl-imm buf +a64-x16+ +a64-x13+ 4)        ; depth*16
+                          (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 0)
+                          (a64-lsl-imm buf +a64-x16+ +a64-x13+ 3)        ; depth*8
+                          (a64-add-reg buf +a64-x14+ +a64-x14+ +a64-x16+ 0 0)
+                          (when b-win-idx
+                            (let ((code (a64-buffer-code buf)))
+                              (setf (aref code b-win-idx)
+                                    (logior #x14000000
+                                            (logand (- (a64-current-index buf) b-win-idx) #x3FFFFFF))))))
                         (a64-ldur buf +a64-x16+ +a64-x14+ 0)
                         (a64-stur buf +a64-x16+ +a64-x15+ 0)
                         (a64-ldur buf +a64-x16+ +a64-x14+ 8)
@@ -6780,7 +6825,18 @@
           ;; enters the trampoline, which parks there.  See STOP-THE-WORLD.
           ((and (= op +op-yield+) *a64-tls-window* *aarch64-gc-native-mcgc*)
            (emit-aarch64-stw-clamp buf))
-          ((= op +op-yield+)
+          ;; ---- SAFEPOINT ----
+          ;; A YIELD in a function that holds no raw word (compiler.lisp
+          ;; *PARK-SAFEPOINTS*): hosted with threads it polls like YIELD and,
+          ;; when a collection is waiting, PARKS HERE instead of at the next
+          ;; allocation, which a non-allocating loop never reaches.  Anywhere
+          ;; else (bare metal's preemption clamp, no native trampoline) it is
+          ;; exactly YIELD.
+          ((and (= op +op-safepoint+) (a64-stw-safepoint-p))
+           (emit-aarch64-stw-safepoint buf))
+          ((and (= op +op-safepoint+) *a64-tls-window* *aarch64-gc-native-mcgc*)
+           (emit-aarch64-stw-clamp buf))
+          ((or (= op +op-yield+) (= op +op-safepoint+))
            (if *aarch64-yield-nop*
                (a64-nop buf)
                (progn
@@ -7678,6 +7734,48 @@
     (a64-lsl-imm buf +a64-x16+ +a64-x25+ 1)
     (a64-str-unsigned buf +a64-x16+ +a64-x15+ +gc-off-saved-limit+)
     (a64-movz buf +a64-x25+ 0 0)
+    (a64-set-label buf skip)))
+
+(defun a64-stw-safepoint-p ()
+  "Whether :SAFEPOINT parks (EMIT-AARCH64-STW-SAFEPOINT): hosted, threads,
+   the native collector reached through x28.  Bare metal keeps YIELD's clamp
+   (it also preempts there, and its trampoline is reached by BL)."
+  (and *a64-tls-window* *aarch64-gc-native-mcgc* *aarch64-linux-mode*
+       *aarch64-gc-trampoline-label*
+       (not *aarch64-gc-trampoline-call-via-bl*)))
+
+(defun emit-aarch64-stw-safepoint (buf)
+  "A :SAFEPOINT back-edge (compiler.lisp *PARK-SAFEPOINTS*: a function that
+   holds no raw word).  The poll is YIELD's -- load the stop flag, compare,
+   branch not taken.  With the flag held: clamp x25 exactly as YIELD does
+   (EMIT-AARCH64-STW-CLAMP keeps the real limit in the active region's
+   saved-limit), then a gc-check of nothing -- x16 = x24, the requested end,
+   and BLR x28 into the trampoline.  Its entry (EMIT-AARCH64-STW-ENTRY) parks
+   the thread, takes the real limit back and, since nothing was asked for,
+   returns at once without a collection of its own (unless the region really
+   is full, which the next allocation would collect anyway).  Every mutator
+   register is in the trampoline's frame while parked, so the collector
+   forwards them.  BLR clobbers x30, as every gc-check's does: the frame
+   saved it.  Without this a loop that never allocates held every region-0
+   collection up for as long as it ran, and a worker spinning on
+   (loop (when *flag* (return)) ...) while main waited on that collection to
+   set *flag* hung the process (test/stw-spinning-worker.lisp).
+   Uses x15-x17 (scratch at every YIELD)."
+  (let ((skip (incf *mvm-label-counter*))
+        (clamped (incf *mvm-label-counter*)))
+    (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
+    (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
+    (a64-cmp-imm buf +a64-x16+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-cmp-imm buf +a64-x25+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i clamped :bcond))
+    (a64-load-gc-region buf +a64-x15+ +a64-x16+)
+    (a64-lsl-imm buf +a64-x16+ +a64-x25+ 1)
+    (a64-str-unsigned buf +a64-x16+ +a64-x15+ +gc-off-saved-limit+)
+    (a64-movz buf +a64-x25+ 0 0)
+    (a64-set-label buf clamped)
+    (a64-mov-reg buf +a64-x16+ +a64-x24+)
+    (a64-blr buf +a64-x28+)
     (a64-set-label buf skip)))
 
 (defconstant +a64-stw-r0-count-addr+ #x10005010
@@ -9784,6 +9882,250 @@
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-gt+ 0) (a64-add-fixup buf i db-loop :bcond))
       (a64-set-label buf db-done))))
 
+;;; ------------------------------------------------------------------
+;;; THE HANDLER-FRAME STACK HAS NO SILENT CEILING (AArch64)
+;;; ------------------------------------------------------------------
+;;;
+;;; The AArch64 twin of translate-x64's section of the same name (read that
+;;; one first).  Every CATCH / UNWIND-PROTECT / HANDLER-CASE / cross-unit
+;;; BLOCK keeps one 24-byte frame (saved SP, FP, IP) while its body runs.
+;;; The frames start at window +0x10008, and the window ends at +0x11000: 170
+;;; frames.  There was NO bound check at all, so frame 170 and up were stored
+;;; past the window -- on a threaded hosted image straight into the NEXT
+;;; thread's window block (its multiple-value slots, armed handler, self slot,
+;;; dynamic-binding words, guard words and, deeper, its own frame stack).
+;;; Measured on the Pi 5 before this: a worker 200 deep made its neighbour's
+;;; HANDLER-CASE receive a MEMORY-FAULT-ERROR instead of its own ERROR, and
+;;; 400 deep killed the process (SIGSEGV).
+;;;
+;;; HOSTED (Linux, and macOS through the host shim's syscall translation):
+;;; frames 0..169 stay in the window (the fast path: the old code plus one
+;;; compare); frame 170 and up go to a per-window EXTENSION that the push
+;;; helper reserves on first use (mmap MAP_NORESERVE, +A64-HSTACK-EXT-FRAMES+
+;;; frames, pages touched on demand), its address in window word +0x5600 --
+;;; the same word x86-64 uses, free on AArch64 too (the AArch64 window's
+;;; words are +0x0..+0xC6F, +0x5000..+0x5060, +0xFF00..+0xFFF7 and the frame
+;;; stack), and covered by every window block (0x11000 bytes).
+;;; %TLS-PREPARE-BLOCK keeps it, so a reused block reuses its reservation.
+;;; Past the extension, or when the reservation is refused, the push is
+;;; LOUD: it records #x0F0F at 0x10000CB0 and longjmps to the armed frame --
+;;; the one enclosing the form whose push failed -- which receives a
+;;; HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION) from %TAKE-PENDING-FAULT.
+;;; The failed frame was never stored, so the stack stays balanced and every
+;;; enclosing cleanup runs.  Window word +0x5608 is a test-only lower limit
+;;; on extension frames (x86-64's, likewise cleared by %TLS-PREPARE-BLOCK).
+;;;
+;;; BARE METAL has no mmap.  Its windows are 0x20000 apart (the Zero's
+;;; per-record windows at 0x10400000 + i*0x20000; main's at 0x10000000 with
+;;; nothing else below 0x10020000), so the frames may run to window +0x20000:
+;;; +A64-HSTACK-BARE-FRAMES+.  The next push is the same loud overflow
+;;; instead of a store into whatever follows.
+;;;
+;;; Frames hold no Lisp objects (raw SP / FP / IP), so no collector scans
+;;; them and the extension needs no root scan.
+;;; (The geometry constants are defined with THE PER-THREAD WINDOW, AARCH64:
+;;; the fault stub's inline pop uses them too.)
+
+(defun a64-hstack-bcond (buf cc label)
+  (let ((i (a64-current-index buf))) (a64-bcond buf cc 0) (a64-add-fixup buf i label :bcond)))
+
+(defun a64-hstack-cbz (buf reg label)
+  (let ((i (a64-current-index buf)))
+    (a64-emit buf (logior #xB4000000 reg))
+    (a64-add-fixup buf i label :cbz)))
+
+(defun a64-hstack-b (buf label)
+  (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i label :b)))
+
+(defun a64-hstack-frame-addr (buf rd base index)
+  "RD := BASE + INDEX*24 (two shifted-register adds; RD /= INDEX)."
+  (a64-add-reg buf rd base index 0 4)
+  (a64-add-reg buf rd rd index 0 3))
+
+(defun a64-hstack-slots (buf rd scratch)
+  "RD := THIS thread's armed-frame slots (0x10000180)."
+  (a64-load-real-addr buf rd (conv-real #x10000180))
+  (a64-add-thread-delta buf rd scratch))
+
+(defun a64-hstack-ext-word (buf rd scratch addr)
+  "RD := the address of THIS thread's window word ADDR (+0x5600 / +0x5608)."
+  (a64-load-real-addr buf rd (conv-real addr))
+  (a64-add-thread-delta buf rd scratch))
+
+(defun a64-hstack-copy (buf from to)
+  "[TO+0..16] := [FROM+0..16] through x13."
+  (dolist (off '(0 8 16))
+    (a64-ldr-unsigned buf +a64-x13+ from off)
+    (a64-str-unsigned buf +a64-x13+ to off)))
+
+(defun emit-aarch64-hstack-overflow (buf)
+  "The loud end of a push that cannot store its frame (entered by branch from
+   inside the push helper).  Record #x0F0F for %TAKE-PENDING-FAULT -- the
+   channel a hardware fault uses, since this code cannot allocate a
+   condition -- and LONGJMP to the armed frame exactly as TRAP #x0511 does:
+   take its SP / FP / IP, pop (which uncovers the frame below it), resume
+   there with x0 = T.  The pop touches only x9..x13 (and the call x16 under
+   the absolute in-module call mode), so x14 / x15 / x17 carry the target
+   across it.  Nothing armed cannot happen at a push this deep, but
+   if it does, BRK: a stop, never a branch through a zero frame."
+  (a64-load-real-addr buf +a64-x13+ (conv-real #x10000CB0))
+  (a64-movz buf +a64-x12+ +a64-hstack-overflow-code+ 0)
+  (a64-str-width buf +a64-x12+ +a64-x13+ 0 2)          ; STR w12
+  (a64-hstack-slots buf +a64-x12+ +a64-x13+)
+  (a64-ldr-unsigned buf +a64-x14+ +a64-x12+ 0)
+  (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 8)
+  (a64-ldr-unsigned buf +a64-x17+ +a64-x12+ 16)
+  (let ((armed (incf *mvm-label-counter*)))
+    (let ((i (a64-current-index buf)))
+      (a64-emit buf (logior #xB5000000 +a64-x14+))      ; CBNZ x14, armed
+      (a64-add-fixup buf i armed :cbz))
+    (a64-brk buf +a64-hstack-overflow-code+)
+    (a64-set-label buf armed))
+  (a64-emit-call-label buf *aarch64-handler-pop-label*)
+  (a64-add-imm buf +a64-sp+ +a64-x14+ 0)                ; mov sp, x14
+  (a64-mov-reg buf +a64-x29+ +a64-x15+)
+  (a64-load-imm64 buf +a64-x0+ #xDEAD1009)
+  (a64-br buf +a64-x17+))
+
+(defun emit-aarch64-hstack-reserve (buf have-ext overflow)
+  "Hosted, first push past the window on this window: reserve the extension.
+   mmap(0, frames*24, PROT_READ|PROT_WRITE,
+        MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0); on success store its
+   address in the window word and continue at HAVE-EXT with it in x11, on
+   -errno go to OVERFLOW.  The syscall's argument registers (live values of
+   the caller) are saved and restored; x9 / x10 survive SVC (only x0 changes,
+   on Darwin too -- the shim's stub preserves everything else; A64-SVC itself
+   keeps x30 and uses x16, which is dead at every helper call)."
+  (a64-stp-pre buf +a64-x0+ +a64-x1+ +a64-sp+ -64)
+  (a64-stp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+  (a64-stp-offset buf +a64-x4+ +a64-x5+ +a64-sp+ 32)
+  (a64-stp-offset buf +a64-x8+ +a64-x9+ +a64-sp+ 48)
+  (a64-movz buf +a64-x0+ 0 0)
+  (a64-load-imm64 buf +a64-x1+ (* 24 +a64-hstack-ext-frames+))
+  (a64-movz buf +a64-x2+ 3 0)                           ; PROT_READ|PROT_WRITE
+  (a64-movz buf +a64-x3+ #x4022 0)                      ; PRIVATE|ANON|NORESERVE
+  (a64-movn buf +a64-x4+ 0 0)                           ; fd -1
+  (a64-movz buf +a64-x5+ 0 0)
+  (a64-movz buf +a64-x8+ 222 0)                         ; mmap
+  (a64-svc buf 0)
+  (a64-mov-reg buf +a64-x11+ +a64-x0+)
+  (a64-ldp-offset buf +a64-x8+ +a64-x9+ +a64-sp+ 48)
+  (a64-ldp-offset buf +a64-x4+ +a64-x5+ +a64-sp+ 32)
+  (a64-ldp-offset buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+  (a64-ldp-post buf +a64-x0+ +a64-x1+ +a64-sp+ 64)
+  (a64-movn buf +a64-x12+ #xFFF 0)                      ; -4096
+  (a64-cmp-reg buf +a64-x11+ +a64-x12+)
+  (a64-hstack-bcond buf #x8 overflow)                   ; B.HI: -errno, refused
+  (a64-hstack-ext-word buf +a64-x12+ +a64-x13+ +a64-hstack-ext-addr+)
+  (a64-str-unsigned buf +a64-x11+ +a64-x12+ 0)
+  (a64-hstack-b buf have-ext))
+
+(defun emit-aarch64-handler-push-pop (buf)
+  "The push and pop helpers.  Both are leaves that touch only x9..x13 on
+   every path that returns (the first push past the window also makes a
+   syscall, saving what it needs); the overflow path does not return.
+     push: frame[depth] := [0x10000180..190], depth += 1
+     pop:  depth = 0: zero 0x10000180..190;  else depth -= 1,
+           [0x10000180..190] := frame[depth]
+   frame[i] = window +0x10008 + i*24 for i below the window capacity, and
+   (hosted) [+0x5600] + (i - 170)*24 above it.  See THE HANDLER-FRAME STACK
+   HAS NO SILENT CEILING (AArch64) above."
+  (let* ((hosted *aarch64-linux-mode*)
+         (cap (if hosted +a64-hstack-win-frames+ +a64-hstack-bare-frames+))
+         (ext (incf *mvm-label-counter*))
+         (have-ext (incf *mvm-label-counter*))
+         (reserve (incf *mvm-label-counter*))
+         (overflow (incf *mvm-label-counter*))
+         (store (incf *mvm-label-counter*)))
+    ;; ---- PUSH helper ----
+    (a64-set-label buf *aarch64-handler-push-label*)
+    (a64-load-real-addr buf +a64-x9+ (conv-real #x10010000))
+    (a64-add-thread-delta buf +a64-x9+ +a64-x10+)       ; THIS thread's stack
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)         ; depth
+    ;; SIGNED: a real depth is never negative, and the minimal QEMU-virt image
+    ;; (boot-aarch64 EMIT-AARCH64-ENTRY: MMU off, so the window is the PCIe
+    ;; MMIO hole, whose reads come back all ones, and SETJMP's landing points
+    ;; x18 there too) reads its depth as -1.  Its frame stack never held
+    ;; anything; a signed test leaves that image as it was (arch-ladder r19)
+    ;; instead of sending its first push to the overflow.
+    (a64-cmp-imm buf +a64-x10+ cap)
+    (a64-hstack-bcond buf +cc-ge+ (if hosted ext overflow))
+    ;; window frame: x11 = &depth + 8 + depth*24
+    (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
+    (a64-hstack-frame-addr buf +a64-x11+ +a64-x11+ +a64-x10+)
+    (a64-set-label buf store)
+    (a64-hstack-slots buf +a64-x12+ +a64-x13+)
+    (a64-hstack-copy buf +a64-x12+ +a64-x11+)
+    (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)
+    (a64-ret buf)
+    (when hosted
+      ;; extension frame: x11 = [ext] + (depth - 170)*24
+      (a64-set-label buf ext)
+      (a64-hstack-ext-word buf +a64-x11+ +a64-x12+ +a64-hstack-ext-addr+)
+      (a64-ldr-unsigned buf +a64-x11+ +a64-x11+ 0)
+      (a64-hstack-cbz buf +a64-x11+ reserve)
+      (a64-set-label buf have-ext)
+      (a64-sub-imm buf +a64-x12+ +a64-x10+ +a64-hstack-win-frames+)
+      (a64-movz buf +a64-x13+ (ash +a64-hstack-ext-frames+ -16) 1)
+      (a64-cmp-reg buf +a64-x12+ +a64-x13+)
+      (a64-hstack-bcond buf +cc-cs+ overflow)
+      ;; the test-only lower limit, when one is set
+      (let ((no-limit (incf *mvm-label-counter*)))
+        (a64-hstack-ext-word buf +a64-x13+ +a64-x11+ +a64-hstack-ext-limit-addr+)
+        (a64-ldr-unsigned buf +a64-x13+ +a64-x13+ 0)
+        (a64-hstack-cbz buf +a64-x13+ no-limit)
+        (a64-cmp-reg buf +a64-x12+ +a64-x13+)
+        (a64-hstack-bcond buf +cc-cs+ overflow)
+        (a64-set-label buf no-limit))
+      ;; x11 was the delta scratch above: reload the extension base
+      (a64-hstack-ext-word buf +a64-x11+ +a64-x13+ +a64-hstack-ext-addr+)
+      (a64-ldr-unsigned buf +a64-x11+ +a64-x11+ 0)
+      (a64-hstack-frame-addr buf +a64-x11+ +a64-x11+ +a64-x12+)
+      (a64-hstack-b buf store)
+      (a64-set-label buf reserve)
+      (emit-aarch64-hstack-reserve buf have-ext overflow))
+    (a64-set-label buf overflow)
+    (emit-aarch64-hstack-overflow buf))
+  ;; ---- POP helper ----
+  (let ((nz (incf *mvm-label-counter*))
+        (ext (incf *mvm-label-counter*))
+        (load (incf *mvm-label-counter*)))
+    (a64-set-label buf *aarch64-handler-pop-label*)
+    (a64-load-real-addr buf +a64-x9+ (conv-real #x10010000))
+    (a64-add-thread-delta buf +a64-x9+ +a64-x10+)       ; THIS thread's stack
+    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
+    (let ((i (a64-current-index buf)))
+      (a64-emit buf (logior #xB5000000 +a64-x10+))      ; CBNZ x10, nz
+      (a64-add-fixup buf i nz :cbz))
+    ;; depth == 0: zero 0x180/188/190 and return
+    (a64-hstack-slots buf +a64-x12+ +a64-x13+)
+    (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 0)
+    (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 8)
+    (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 16)
+    (a64-ret buf)
+    ;; depth > 0: decrement, restore from frame[new depth]
+    (a64-set-label buf nz)
+    (a64-sub-imm buf +a64-x10+ +a64-x10+ 1)
+    (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)
+    (when *aarch64-linux-mode*
+      (a64-cmp-imm buf +a64-x10+ +a64-hstack-win-frames+)
+      (a64-hstack-bcond buf +cc-ge+ ext))                ; signed, as the push's
+    (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
+    (a64-hstack-frame-addr buf +a64-x11+ +a64-x11+ +a64-x10+)
+    (a64-set-label buf load)
+    (a64-hstack-slots buf +a64-x12+ +a64-x13+)
+    (a64-hstack-copy buf +a64-x11+ +a64-x12+)
+    (a64-ret buf)
+    (when *aarch64-linux-mode*
+      ;; extension frame (the push that stored it reserved the extension)
+      (a64-set-label buf ext)
+      (a64-hstack-ext-word buf +a64-x11+ +a64-x12+ +a64-hstack-ext-addr+)
+      (a64-ldr-unsigned buf +a64-x11+ +a64-x11+ 0)
+      (a64-sub-imm buf +a64-x12+ +a64-x10+ +a64-hstack-win-frames+)
+      (a64-hstack-frame-addr buf +a64-x11+ +a64-x11+ +a64-x12+)
+      (a64-hstack-b buf load))))
+
 (defun emit-aarch64-handler-helpers (buf)
   "If *aarch64-handler-push-label* / *aarch64-handler-pop-label* are
    bound (non-nil), emit the push and pop helpers into BUF and set
@@ -9791,71 +10133,7 @@
    callers don't pay for this."
   (when (and *aarch64-handler-push-label* *aarch64-handler-pop-label*)
     (a64-tramp-mark 13)
-    ;; ---- PUSH helper ----
-    (a64-set-label buf *aarch64-handler-push-label*)
-    ;; x9 = 0x10010000 (depth slot)
-    (a64-load-real-addr buf +a64-x9+ (conv-real #x10010000))
-    (a64-add-thread-delta buf +a64-x9+ +a64-x10+)   ; THIS thread's stack
-    ;; x10 = depth
-    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
-    ;; x11 = frame_base = 0x10010008 + depth*24
-    (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
-    (a64-lsl-imm buf +a64-x12+ +a64-x10+ 4)        ; depth*16
-    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
-    (a64-lsl-imm buf +a64-x12+ +a64-x10+ 3)        ; depth*8
-    (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
-    ;; x12 = 0x10000180 (current handler slot)
-    (a64-load-real-addr buf +a64-x12+ (conv-real #x10000180))
-    (a64-add-thread-delta buf +a64-x12+ +a64-x13+)
-    ;; copy 3 doublewords: 180→frame+0, 188→frame+8, 190→frame+16
-    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 0)
-    (a64-str-unsigned buf +a64-x13+ +a64-x11+ 0)
-    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 8)
-    (a64-str-unsigned buf +a64-x13+ +a64-x11+ 8)
-    (a64-ldr-unsigned buf +a64-x13+ +a64-x12+ 16)
-    (a64-str-unsigned buf +a64-x13+ +a64-x11+ 16)
-    ;; depth += 1
-    (a64-add-imm buf +a64-x10+ +a64-x10+ 1)
-    (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)
-    (a64-ret buf)
-    ;; ---- POP helper ----
-    (a64-set-label buf *aarch64-handler-pop-label*)
-    (a64-load-real-addr buf +a64-x9+ (conv-real #x10010000))
-    (a64-add-thread-delta buf +a64-x9+ +a64-x10+)   ; THIS thread's stack
-    (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
-    ;; if depth == 0 → zero slot 180/188/190 and return
-    (a64-cmp-imm buf +a64-x10+ 0)
-    (let ((nz-label (incf *mvm-label-counter*)))
-      (let ((idx (a64-current-index buf)))
-        (a64-bcond buf +cc-ne+ 0)
-        (a64-add-fixup buf idx nz-label :bcond))
-      ;; depth == 0 path: zero 0x180/188/190 and return
-      (a64-load-real-addr buf +a64-x12+ (conv-real #x10000180))
-      (a64-add-thread-delta buf +a64-x12+ +a64-x13+)
-      (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 0)
-      (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 8)
-      (a64-str-unsigned buf +a64-xzr+ +a64-x12+ 16)
-      (a64-ret buf)
-      ;; depth > 0 path: decrement, restore from frame[new-depth]
-      (a64-set-label buf nz-label)
-      (a64-sub-imm buf +a64-x10+ +a64-x10+ 1)
-      (a64-str-unsigned buf +a64-x10+ +a64-x9+ 0)
-      ;; x11 = 0x10010008 + depth*24
-      (a64-add-imm buf +a64-x11+ +a64-x9+ 8)
-      (a64-lsl-imm buf +a64-x12+ +a64-x10+ 4)
-      (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
-      (a64-lsl-imm buf +a64-x12+ +a64-x10+ 3)
-      (a64-add-reg buf +a64-x11+ +a64-x11+ +a64-x12+ 0 0)
-      ;; restore 0x180/188/190 from frame
-      (a64-load-real-addr buf +a64-x12+ (conv-real #x10000180))
-      (a64-add-thread-delta buf +a64-x12+ +a64-x13+)
-      (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 0)
-      (a64-str-unsigned buf +a64-x13+ +a64-x12+ 0)
-      (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 8)
-      (a64-str-unsigned buf +a64-x13+ +a64-x12+ 8)
-      (a64-ldr-unsigned buf +a64-x13+ +a64-x11+ 16)
-      (a64-str-unsigned buf +a64-x13+ +a64-x12+ 16)
-      (a64-ret buf)))
+    (emit-aarch64-handler-push-pop buf))
   ;; ---- GC trampoline ----
   ;; Called by +op-gc-check+ when x24 (alloc ptr) >= x25 (alloc limit).
   ;; Saves caller-saved regs, stashes x24/x25/pre-entry-SP into GC

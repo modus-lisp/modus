@@ -419,6 +419,70 @@
    stores (its block - +TLS-WINDOW-BASE+) here when it installs that same value
    as its segment base.")
 
+;;; LOOP BACK-EDGES THAT CAN PARK (stop-the-world, hosted x86-64 and AArch64).
+;;; A region-0 collection stops every other thread, and a thread stops only at
+;;; an ALLOCATION: the runtime holds raw object words (REG-GET's %VAL->WORD,
+;;; UNTAG, MEM-REF of a computed address) between allocations, invisible to a
+;;; root scan, so a back-edge only POLLS -- it clamps the allocation limit so
+;;; the next allocation parks.  A loop that never allocates therefore held a
+;;; region-0 collection up for as long as it ran, and a worker spinning on
+;;; (loop (when *flag* (return)) ...) while main waited on that collection to
+;;; set *flag* hung the process.
+;;;
+;;; A function that touches no raw word can be stopped at its back-edges just
+;;; as safely as at an allocation: every live value it holds is a tagged
+;;; object in a register or a frame slot, which the park pushes and the
+;;; collector forwards.  So each raw primitive drops a :RAW-MARK into the
+;;; function's IR (%NOTE-RAW-WORDS), and a function that finishes with none
+;;; has its :YIELDs turned into :SAFEPOINTs (%IR-SAFEPOINTS), which the
+;;; back-end makes `poll, and when a collection is waiting, park here'.
+;;; The marker is in the IR, not a special, because the in-image compiler has
+;;; been seen to not isolate per-function specials (GET-IR-INSTRUCTIONS).
+(defparameter *park-safepoints* nil
+  "Turn the :YIELDs of a function with no raw words into :SAFEPOINTs.  Set by
+   the hosted x86-64 and AArch64 JIT co-inits (build-cli-common), whose
+   translators implement :SAFEPOINT; NIL everywhere else, so no other back-end
+   ever sees the opcode.
+   The image's own AOT code is compiled with it OFF: runtime code holds raw
+   words across calls to non-allocating helpers, which a parking back-edge in
+   the helper would invalidate.  User code (the JIT) is where unbounded
+   non-allocating loops live.")
+
+(defun %note-raw-words ()
+  "This function computes or holds a raw (untagged) machine word: its loops
+   must not park (see *PARK-SAFEPOINTS*)."
+  (emit-ir :raw-mark))
+
+(defun %absolute-addr-form-p (form)
+  "True when FORM is an address the collector cannot move: a literal integer,
+   a constant, or a literal base of at least #x10000000 (the low block, the
+   per-thread window) plus an offset -- the MV-buffer expansions' shape."
+  (or (integerp form)
+      (and (symbolp form) form (constantp form))
+      (and (consp form) (symbolp (car form)) (string= (symbol-name (car form)) "+")
+           (or (and (integerp (cadr form)) (>= (cadr form) #x10000000))
+               (and (cadr form) (symbolp (cadr form)) (constantp (cadr form)))))))
+
+(defun %ir-safepoints (ir)
+  "IR with its :RAW-MARKs removed and, when *PARK-SAFEPOINTS* is on and there
+   were none, every :YIELD a :SAFEPOINT."
+  (let ((raw nil) (yields nil))
+    (dolist (insn ir)
+      (case (car insn)
+        (:raw-mark (setq raw t))
+        (:yield (setq yields t))))
+    ;; *TLS-WINDOW* too: only the hosted threaded images (x86-64, AArch64)
+    ;; have it on, and a DDC rebuild of another target from them resets it.
+    (if (or raw (and yields *park-safepoints* *tls-window*))
+        (let ((park (and *park-safepoints* *tls-window* (not raw))) (out nil))
+          (dolist (insn ir)
+            (case (car insn)
+              (:raw-mark nil)
+              (:yield (push (if park (list :safepoint) insn) out))
+              (t (push insn out))))
+          (nreverse out))
+        ir)))
+
 (defparameter *tls-window* nil
   "Emit LOAD/STORE of per-thread-window slots with the thread-local width bit.
    NIL — every image that has not opted in — emits the historic width, so the
@@ -441,7 +505,9 @@
                                              ; +0x1000..+0x5000, FS-relative in
                                              ; translate-x64 itself; the thread
                                              ; blocks are sized for them —
-                                             ; net/hosted-sync.lisp %THR-TLS-BLOCK)
+                                             ; net/hosted-sync.lisp %THR-TLS-BLOCK;
+                                             ; deeper frames in the extension
+                                             ; whose address is at +0x5600)
       (and (>= off #xC10) (<= off #xC37))    ; longjmp scratch + the self slot
       ;; the late-bound bridge's callee-index slot (mvm-eval.lisp
       ;; %JIT-FNADDR-IDX-SLOT): x86-64's any-arity call thunk stores to
@@ -4239,16 +4305,29 @@
 ;;; PLANE and the slot typed U8VEC takes the byte path.
 (defvar *struct-accessors* nil
   "Alist acc-name-hash -> (setter-hash struct-name-string slot-index slot-type
-   min-instance-length struct-name read-only-p).")
+   min-instance-length struct-name read-only-p accessor-symbol).")
 
+;;; THE RECORD IS THE ACCESSOR SYMBOL'S, not its name's.  It is found by the
+;;; name's hash, so a function of the same NAME in another package -- quill's
+;;; SESSION-HISTORY (a slot) and operandi's (a GETHASH) -- found it too, and
+;;; every call of the other one compiled as quill's slot read: "#<HASH-TABLE>
+;;; is not of type QUILL:SESSION".  The accessor symbol rides in the record
+;;; and a lookup must be that symbol (a setter, its package's); a record from
+;;; before the symbol was kept (NIL) matches by name, as it always did.
 (defun %struct-accessor-note (acc-name setter-name struct-str index slot-type
-                              &optional min-len struct-name read-only)
+                              &optional min-len struct-name read-only acc-sym)
   (%fasl-taint "%struct-accessor-note")
   (let ((h (compute-name-hash acc-name)))
     (setq *struct-accessors*
           (cons (list h (compute-name-hash setter-name) struct-str index slot-type
-                      min-len struct-name read-only)
+                      min-len struct-name read-only acc-sym)
                 (remove h *struct-accessors* :key (function car))))))
+
+(defun %struct-record-for-p (record sym setter)
+  "Whether accessor RECORD belongs to SYM (a SETTER: a symbol of the accessor's package)."
+  (let ((a (ninth record)))
+    (or (null a) (not (symbolp a))
+        (if setter (eq (symbol-package a) (symbol-package sym)) (eq a sym)))))
 
 (defun %struct-accessor-forget (name body)
   "A DEFUN of NAME whose BODY is not a defstruct accessor's or writer's own
@@ -4270,19 +4349,22 @@
                              (name-eq (car (cadr (cadar body))) "OBJ-SUBTAG"))))))
       (unless own
         (setq *struct-accessors*
-              (remove-if (lambda (r) (or (eql (car r) h) (eql (cadr r) h)))
+              (remove-if (lambda (r) (or (and (eql (car r) h) (%struct-record-for-p r name nil))
+                                         (and (eql (cadr r) h) (%struct-record-for-p r name t))))
                          *struct-accessors*))))))
 
 (defun %struct-accessor-info (sym)
   "The record for accessor symbol SYM, or NIL."
   (and sym (symbolp sym) *struct-accessors*
-       (assoc (normalize-name sym) *struct-accessors*)))
+       (let ((r (assoc (normalize-name sym) *struct-accessors*)))
+         (and r (%struct-record-for-p r sym nil) r))))
 
 (defun %struct-setter-info (sym)
   "The record whose SETTER is symbol SYM, or NIL."
   (and sym (symbolp sym) *struct-accessors*
-       (let ((h (normalize-name sym)))
-         (find h *struct-accessors* :key (function cadr)))))
+       (let* ((h (normalize-name sym))
+              (r (find h *struct-accessors* :key (function cadr))))
+         (and r (%struct-record-for-p r sym t) r))))
 
 (defun %declared-struct-p (form env struct-str)
   "True when FORM is a variable declared to be the struct named STRUCT-STR."
@@ -5852,6 +5934,31 @@
                                     (unless (eq b fb) (list (list b fb))))))
                 (if binds `(let ,binds ,body) body))
               form))))))
+
+  ;; (RPLACA C V) / (RPLACD C V), exactly two arguments: the store inline.
+  ;; The functions take &REST to report a wrong argument count themselves
+  ;; (cl-sequences), so every call consed its argument list -- and SETF of
+  ;; CAR / CDR expands to them, so did every (setf (car cell) x), including
+  ;; the cell of a variable a closure captures: 16 bytes and a full call per
+  ;; assignment (json-simple's UTF-8 decoder, whose FLET closes over its
+  ;; index, allocated 16 bytes per character).  Any other argument count
+  ;; keeps the call and its PROGRAM-ERROR; a non-cons signals the same
+  ;; TYPE-ERROR the function does (%RPLAC-NOT-CONS).  C is evaluated before
+  ;; V, as in the call.
+  (mvm-define-macro "RPLACA"
+    (lambda (form)
+      (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+          (let ((c (%mvm-gensym "RPC")) (v (%mvm-gensym "RPV")))
+            `(let ((,c ,(cadr form)) (,v ,(caddr form)))
+               (if (consp ,c) (progn (set-car ,c ,v) ,c) (%rplac-not-cons ,c))))
+          form)))
+  (mvm-define-macro "RPLACD"
+    (lambda (form)
+      (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+          (let ((c (%mvm-gensym "RPC")) (v (%mvm-gensym "RPV")))
+            `(let ((,c ,(cadr form)) (,v ,(caddr form)))
+               (if (consp ,c) (progn (set-cdr ,c ,v) ,c) (%rplac-not-cons ,c))))
+          form)))
 
   ;; (FLOOR A B): two fixnums divide inline (%FIXNUM-TRUNCATE2, then the
   ;; toward-minus-infinity adjustment); anything else calls %FLOOR2, the
@@ -8487,12 +8594,25 @@
          (bq-comma-expr template)
          (list 'list (list 'quote (%bq-marker-sym template))
                (expand-backquote (bq-comma-expr template) (- level 1)))))
+    ;; A VECTOR with a comma in it (CLHS 2.4.6: `#(,@xs) is `(... ,@xs) made a vector).  It was
+    ;; quoted as data, so the commas stayed in it as (COMMA X): weft's (%u16vec 3 4 ...) built a
+    ;; one-element vector holding (COMMA-AT XS), and every DEFLATE table derived from it failed.
+    ((and (vectorp template) (not (stringp template)) (%bq-tree-has-comma-p template))
+     (list 'coerce (expand-backquote-list (coerce template 'list) level) ''simple-vector))
     ((atom template) (list 'quote template))
     ((%bq-form-p template)
      (list 'list (list 'quote 'backquote)
            (expand-backquote (cadr template) (+ level 1))))
     ;; List — process element by element
     (t (expand-backquote-list template level))))
+
+(defun %bq-tree-has-comma-p (x)
+  "Whether a comma marker occurs anywhere in X (a list or a non-string vector)."
+  (cond ((bq-comma-p x) t)
+        ((consp x) (or (%bq-tree-has-comma-p (car x)) (%bq-tree-has-comma-p (cdr x))))
+        ((and (vectorp x) (not (stringp x)))
+         (dotimes (i (length x) nil) (when (%bq-tree-has-comma-p (aref x i)) (return t))))
+        (t nil)))
 
 (defun expand-backquote-list (lst &optional (level 1))
   "Expand a backquote list template. Handles splice and nested backquote."
@@ -8520,7 +8640,8 @@
                    ;; ,x — unquote at level 1, rebuilt as data deeper;
                    ;; nested backquote; nested list: all via EXPAND-BACKQUOTE.
                    ;; (An SBCL comma is a STRUCT, not a cons — test it first.)
-                   ((or (bq-comma-p elt) (consp elt))
+                   ((or (bq-comma-p elt) (consp elt)
+                        (and (vectorp elt) (not (stringp elt)) (%bq-tree-has-comma-p elt)))
                     (push (expand-backquote elt level) current))
                    ;; Literal atom
                    (t
@@ -8908,6 +9029,15 @@
      ;; but uses fixnum-safe halves in-image (value<<1 overflows there for the
      ;; top/bottom bit of the fixnum range — e.g. most-positive/negative-fixnum).
      (emit-li-tagged dest value))
+    ;; RUNTIME compile: a bignum literal is an object the reader already
+    ;; built, so load THAT from the quote pool (as COMPILE-QUOTE does for any
+    ;; other constant) instead of consing a copy at every evaluation -- a
+    ;; (ldb (byte 64 0) x), i.e. (logand x #xFFFFFFFFFFFFFFFF), allocated its
+    ;; mask each time round a hash loop.  Bignums are never mutated after
+    ;; construction, so sharing one is safe.  A static build bakes the parts
+    ;; as below (the pool is the running image's, not the output's).
+    ((and *mvm-eval-runtime-p* (not *static-build-p*))
+     (emit-ir :li-const dest (%e2-const-register value)))
     ((not (%lit-bignum-big-p value))
      ;; Small bignum.  value = lo + hi * 2^62, where lo ∈ [0, 2^62-1]
      ;; and hi is signed in [-2^61, 2^61-1].  For negative values
@@ -13992,7 +14122,7 @@
          (site (and (not cell) (not slot) (%let-special-site spec k))))
     (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
           ((and slot (eql k (%global-name-key spec)))
-           `(if (eql (mem-ref #x10000DB8 :u32) 0)
+           `(if ,(%shallow-thread-form)
                 (%gv-setq-global (quote ,spec) ,tmp)
                 (%dynbind-c ,k ,tmp ,slot)))
           (slot `(%dynbind-c ,k ,tmp ,slot))
@@ -14132,14 +14262,18 @@
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
                                ((and slot (eql k (%global-name-key spec)))
-                                `(if (eql (mem-ref #x10000DB8 :u32) 0)
+                                `(if ,(%shallow-thread-form)
                                      (%gv-setq-global (quote ,spec) ,sv)
                                      (%dynunbind-c ,k ,sv ,slot)))
                                (slot `(%dynunbind-c ,k ,sv ,slot))
                                (site (%site-fast site `(progn (set-cdr c ,sv) ,sv)
                                                  `(%dynunbind-site ,k ,sv (quote ,site))))
                                (t `(%dynunbind ,k ,sv)))))
-                     save-vars specials))
+                     ;; REVERSE binding order: the innermost entry is undone first, so each
+                     ;; restore finds its own entry on top of the thread's binding stack
+                     ;; (%DYNB-UNWIND pops only the top).  On the shallow path the order is
+                     ;; immaterial: each restore writes its own variable's saved value.
+                     (reverse save-vars) (reverse specials)))
            (stripped-body (%special-shadow-body %all-declared-specials env
                                                 (strip-declares body))))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -14171,7 +14305,11 @@
               (mapcar (lambda (b)
                         (let ((var (if (consp b) (car b) b))
                               (init (if (consp b) (cadr b) nil)))
-                          (let ((pos (position (normalize-name var) special-names)))
+                          (let ((pos (or (and (symbolp var) (position var specials :test #'eq))
+                                      ;; by name only when no special IS this symbol: two packages'
+                                      ;; *PROGRESS* in one LET (loom binds weft's, fetch's and seal's)
+                                      ;; shared the first one's temp, and the others read unbound
+                                      (position (normalize-name var) special-names))))
                             (if pos
                                 (list (nth pos temp-vars) init)
                                 b))))
@@ -14185,7 +14323,11 @@
             (let ((seq-bindings
                     (mapcan (lambda (b rb)
                               (let ((var (if (consp b) (car b) b)))
-                                (let ((pos (position (normalize-name var) special-names)))
+                                (let ((pos (or (and (symbolp var) (position var specials :test #'eq))
+                                      ;; by name only when no special IS this symbol: two packages'
+                                      ;; *PROGRESS* in one LET (loom binds weft's, fetch's and seal's)
+                                      ;; shared the first one's temp, and the others read unbound
+                                      (position (normalize-name var) special-names))))
                                   (if pos
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
@@ -15458,6 +15600,60 @@
     (or (= n 0)
         (and (= n 1) (%setq-direct-spine-ok var val env)))))
 
+;;; ============================================================
+;;; THE ARMED MAIN THREAD BINDS SHALLOWLY -- AND MAY USE THE CELL
+;;; ============================================================
+;;;
+;;; Every fast path below (the cached and baked reads, the in-place SETQ, the
+;;; LET save / bind / restore through a cell) used to be guarded by the
+;;; threads-live word alone: once ANY thread had been started, EVERY thread
+;;; took the slow arm.  But the slow arm exists for one reason -- a WORKER's
+;;; dynamic bindings live in that thread's own storage, which the globals pair
+;;; cannot see -- and the main thread of an armed image has no such storage:
+;;; its window base is zero, %DYNB-BLOCK answers 0, and %DYNBIND binds it
+;;; shallowly in the globals pair exactly as before threads existed.  For that
+;;; thread the pair IS the binding, so the fast arm is the right answer, not
+;;; merely a faster one.  The test is therefore "unarmed, or this thread has
+;;; no binding block" -- the same question %DYNBIND asks, with %DYNB-BLOCK's
+;;; self-slot reads inlined (#x10000C30/#x10000C34 are WINDOW slots: through
+;;; the window they answer about THIS thread, and main's are BSS zero).
+;;; An unarmed image pays what it did: one 32-bit load and a (now taken)
+;;; branch.  Measured on main after one thread had run: a 26-special LET
+;;; ~100x slower and a special read ~6x slower than before any thread, both
+;;; back to within noise of unarmed (test/main-bind-armed.lisp).  The price is
+;;; the armed arm's self-slot load at every inline site: ~0.8 MB of native
+;;; code in the x64 CLI image (+1.4%), down from 2.3 MB for the first shape
+;;; (two half-word loads, LI+CMP instead of CMP-IMM).
+(defun %shallow-thread-form ()
+  "A source form that is true when THIS thread binds specials shallowly in the
+   globals pairs: threads were never declared, or this thread has no binding
+   block (the main thread).  See THE ARMED MAIN THREAD BINDS SHALLOWLY."
+  '(or (eql (mem-ref #x10000DB8 :u32) 0)
+       (and (eql (mem-ref #x10000C30 :u32) 0)
+            (eql (mem-ref #x10000C34 :u32) 0))))
+
+(defun %emit-shallow-thread-gate (a b slow)
+  "Emit IR that falls through when THIS thread binds shallowly (see THE ARMED
+   MAIN THREAD BINDS SHALLOWLY) and branches to SLOW otherwise -- i.e. when
+   threads are armed AND this thread has a per-thread binding block.  A and B
+   are scratch registers; both are clobbered."
+  (let ((fast (make-compiler-label)))
+    (emit-li-tagged a (conv-real #x10000DB8))
+    (emit-ir :shr a a +fixnum-shift+)
+    (emit-ir :load b a (%tls-width (car (memory-width-code :u32)) #x10000DB8))
+    (emit-ir :cmp-imm b 0)
+    (emit-ir :beq fast)
+    ;; Armed: the whole self slot in ONE raw word load (%DYNB-BLOCK reads it
+    ;; as two tagged halves only because a tagged :U64 MEM-REF is not exact;
+    ;; an IR load compared with zero is).  One sequence, not two: every
+    ;; inline special read carries this, and the second cost ~1 MB of code.
+    (emit-li-tagged a (conv-real #x10000C30))
+    (emit-ir :shr a a +fixnum-shift+)
+    (emit-ir :load b a (%tls-width (car (memory-width-code :u64)) #x10000C30))
+    (emit-ir :cmp-imm b 0)
+    (emit-ir :bne slow)
+    (emit-ir-label fast)))
+
 (defvar *let-special-sites* nil
   "Alist (KEY . site cons): ONE cell cache per special variable for every
    runtime-compiled read, save, bind and restore of it that had no cell at
@@ -15465,8 +15661,8 @@
 
 (defun %site-fast (site fast slow)
   "A per-site special access (see %GV-SITE-CELL) with its common case inline:
-   once SITE's car holds the variable's cell and the image has not armed
-   threads (the word %RT-ENTER and %DYNBIND test), FAST -- a form over the
+   once SITE's car holds the variable's cell and this thread binds
+   shallowly (%SHALLOW-THREAD-FORM: unarmed, or the main thread), FAST -- a form over the
    variable C, the cell -- else SLOW, the out-of-line call that also fills the
    site.  Each access used to be that call, which itself called
    %GV-SITE-CELL: two calls per read, bind and unbind of a special defined
@@ -15475,7 +15671,7 @@
    (The READ is emitted as IR instead: %COMPILE-GLOBAL-READ-BAKED.)"
   (let ((c (%mvm-gensym "SITEC")))
     `(let ((,c (car (quote ,site))))
-       (if (and ,c (eql (mem-ref #x10000DB8 :u32) 0))
+       (if (and ,c ,(%shallow-thread-form))
            ,(subst c 'c fast)
            ,slow))))
 
@@ -15655,16 +15851,12 @@
           (want (alloc-temp-reg)))
      (unless call-only
       ;; THREADS FIRST.  A worker's dynamic binding lives in that thread's own
-      ;; storage, not in the pair, so once the image has armed threads (the
-      ;; word %RT-ENTER, %DYNBIND and the baked-cell read test) the read goes
-      ;; to the miss arm, where %GV-REF-FILL hands it to %GV-REF.  One 32-bit
-      ;; load and a branch, as %COMPILE-GLOBAL-READ-BAKED pays.
-      (emit-li-tagged dest (conv-real #x10000DB8))
-      (emit-ir :shr dest dest +fixnum-shift+)
-      (emit-ir :load cell dest (%tls-width (car (memory-width-code :u32))
-                                           #x10000DB8))
-      (emit-ir :cmp-imm cell 0)
-      (emit-ir :bne miss)
+      ;; storage, not in the pair, so on an armed WORKER the read goes to the
+      ;; miss arm, where %GV-REF-FILL hands it to %GV-REF.  The MAIN thread of
+      ;; an armed image has no per-thread bindings and reads the cache like an
+      ;; unarmed one (%EMIT-SHALLOW-THREAD-GATE).  Unarmed: one 32-bit load
+      ;; and a branch, as %COMPILE-GLOBAL-READ-BAKED pays.
+      (%emit-shallow-thread-gate dest cell miss)
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
       (emit-li-tagged cell (conv-real +gv-cache-root+))
       (emit-ir :shr cell cell +fixnum-shift+)
@@ -15822,13 +16014,7 @@
     (let ((w (alloc-temp-reg)))
       ;; w = (mem-ref #x10000DB8 :u32); DEST is the second scratch until the
       ;; result lands in it.
-      (emit-li-tagged dest (conv-real #x10000DB8))
-      (emit-ir :shr dest dest +fixnum-shift+)
-      (emit-ir :load w dest (%tls-width (car (memory-width-code :u32))
-                                        #x10000DB8))
-      (emit-ir :li dest 0)
-      (emit-ir :cmp w dest)
-      (emit-ir :bne slow)
+      (%emit-shallow-thread-gate dest w slow)
       (if site
           ;; THE PER-SITE CACHE (see %GV-SITE-CELL): SITE's car is the cell
           ;; once found, NIL until then, which takes the slow arm (it fills).
@@ -15914,19 +16100,15 @@
         ;; worker's value after the worker is gone.  Measured as bits 16 and
         ;; 32 of test/hosted-dynbind.lisp and its *DA*-on-main check.  The
         ;; armed arm calls %GV-SET, which consults this thread's bindings
-        ;; first; an unarmed image pays one 32-bit load and a compare.
+        ;; first; an unarmed image pays one 32-bit load and a compare, and
+        ;; the armed MAIN thread stores in place too
+        ;; (%EMIT-SHALLOW-THREAD-GATE).
         ((and cell (or (/= dest +vreg-vr+) (< *temp-reg-counter* 5)))
          (let ((tmp (alloc-temp-reg))
                (zed (alloc-temp-reg))
                (slow (make-compiler-label))
                (done (make-compiler-label)))
-           (emit-li-tagged tmp (conv-real #x10000DB8))
-           (emit-ir :shr tmp tmp +fixnum-shift+)
-           (emit-ir :load tmp tmp (%tls-width (car (memory-width-code :u32))
-                                              #x10000DB8))
-           (emit-ir :li zed 0)
-           (emit-ir :cmp tmp zed)
-           (emit-ir :bne slow)
+           (%emit-shallow-thread-gate zed tmp slow)
            ;; ONLY A FIXNUM OR NIL IS STORED IN PLACE.  Anything else may be,
            ;; or hold, an in-module lambda (a #x52 closure whose slot 0 is
            ;; THIS module's bytecode offset), and only the %GV-SET bridge call
@@ -15995,12 +16177,7 @@
            (when islot
              (let ((a (alloc-temp-reg)) (b (alloc-temp-reg)) (c (alloc-temp-reg))
                    (dest (or vreg-copy dest)))
-               (emit-li-tagged a (conv-real #x10000DB8))
-               (emit-ir :shr a a +fixnum-shift+)
-               (emit-ir :load b a (%tls-width (car (memory-width-code :u32)) #x10000DB8))
-               (emit-ir :li a 0)
-               (emit-ir :cmp b a)
-               (emit-ir :bne inline-slow)
+               (%emit-shallow-thread-gate a b inline-slow)
                (emit-li-tagged a (conv-real +gv-cache-root+))
                (emit-ir :shr a a +fixnum-shift+)
                (emit-ir :load a a (%tls-width (car (memory-width-code :u64)) +gv-cache-root+))
@@ -18580,13 +18757,20 @@
           ;; scanner.  Accumulator clauses still force post-body-tests:
           ;; acc-body is appended AFTER body, so a WHILE that follows a
           ;; COLLECT cannot be expressed by an in-body position.
+          ;; BEFORE any body clause, a WHILE is a CLAUSE among the FORs, emitted in its source
+          ;; place (the clause emitter runs each clause's step and test in order): in
+          ;;   (loop while (< i end) for c = (char s i) ...)
+          ;; the test must come before C is stepped -- as SBCL, CCL and MIT LOOP do -- and as a
+          ;; pre-body test it ran after every FOR, so C read (char s end).  weft's CSS ident
+          ;; reader is exactly that loop.
           ((= kw 208372112)  ; WHILE
            (let ((test `(if (null ,(cadr rest)) (return-from :%loop-exit nil))))
              (cond
                ((or (loop-state-body-forms state)
                     (loop-state-accumulator state))
                 (push test (loop-state-body-forms state)))
-               (t (push test (loop-state-pre-body-tests state)))))
+               (t (push (make-loop-iter :kind :while :init-form (cadr rest))
+                        (loop-state-iterations state)))))
            (setf rest (cddr rest)))
 
           ;; UNTIL condition — same source-order rule.
@@ -18596,7 +18780,8 @@
                ((or (loop-state-body-forms state)
                     (loop-state-accumulator state))
                 (push test (loop-state-body-forms state)))
-               (t (push test (loop-state-pre-body-tests state)))))
+               (t (push (make-loop-iter :kind :until :init-form (cadr rest))
+                        (loop-state-iterations state)))))
            (setf rest (cddr rest)))
 
           ;; REPEAT n
@@ -26825,6 +27010,7 @@
   ;; MULTIPLY promotion is a separate, still-open gap.  Depending on it here
   ;; would have made mem-ref inherit a defect it does not need: SHA-256 uses
   ;; no wide multiply, and neither does this.
+  (unless (%absolute-addr-form-p addr-form) (%note-raw-words))
   (let* ((wt0 (memory-width-code type-form))
          (w0 (car wt0)))
     ;; THE SPLIT IS NOT OPTIONAL ON A BIG-ENDIAN TARGET, ONLY ITS OFFSETS
@@ -26879,6 +27065,7 @@
     ((and (consp place) (name-eq (car place) "MEM-REF"))
      (let ((addr-form (cadr place))
            (type-form (caddr place)))
+       (unless (%absolute-addr-form-p addr-form) (%note-raw-words))
        (let* ((wt2 (memory-width-code type-form))
               (width (car wt2))
               (needs-untag (cdr wt2)))
@@ -26983,6 +27170,7 @@
 
 (defun compile-get-alloc-ptr (dest)
   "Compile (get-alloc-ptr) - return VA tagged as fixnum"
+  (%note-raw-words)
   (emit-ir :mov dest +vreg-va+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
@@ -26990,16 +27178,19 @@
   "Compile (%frame-pointer) - this function's frame pointer (VFP: RBP on x86-64), as a
    fixnum whose value is the address.  A backtrace walks the saved-frame-pointer chain
    from here: [FP] is the caller's FP, [FP+8] the return address into it."
+  (%note-raw-words)
   (emit-ir :mov dest +vreg-vfp+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
 (defun compile-get-alloc-limit (dest)
   "Compile (get-alloc-limit) - return VL tagged as fixnum"
+  (%note-raw-words)
   (emit-ir :mov dest +vreg-vl+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
 (defun compile-set-alloc-ptr (form env dest)
   "Compile (set-alloc-ptr value) - set VA from tagged fixnum"
+  (%note-raw-words)
   (compile-form form env dest)
   (emit-ir :shr dest dest +fixnum-shift+)
   (emit-ir :mov +vreg-va+ dest))
@@ -27012,6 +27203,7 @@
 
 (defun compile-untag (form env dest)
   "Compile (untag value) - remove fixnum tag (logical shift, unsigned)"
+  (%note-raw-words)
   (compile-form form env dest)
   (emit-ir :shr dest dest +fixnum-shift+))
 
@@ -27023,6 +27215,7 @@
   "Compile (save-context addr) - save registers to actor struct.
    Returns 0 on initial save, 1 when resumed via restore-context.
    Untags the address before passing to save-ctx."
+  (%note-raw-words)
   (compile-form addr-form env dest)
   ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
   ;; Must use SHR (not SAR) for 32-bit targets where high addresses set sign bit
@@ -27037,6 +27230,7 @@
   "Compile (restore-context addr) - restore registers from actor struct.
    This never returns to the caller.
    Untags the address before passing to restore-ctx."
+  (%note-raw-words)
   (compile-form addr-form env dest)
   ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
   ;; Must use SHR (not SAR) for 32-bit targets where high addresses set sign bit
@@ -27048,6 +27242,7 @@
 (defun compile-call-native (args env dest)
   "Compile (call-native addr arg1 arg2) - call native code at address.
    Address is a tagged fixnum. Up to 2 arguments supported."
+  (%note-raw-words)
   (let ((addr-form (first args))
         (arg-forms (rest args)))
     ;; Compile address
@@ -27072,6 +27267,7 @@
 (defun compile-fn-addr (name dest)
   "Compile (fn-addr name) - load tagged native function address.
    Resolves function name at link time via FN-ADDR opcode."
+  (%note-raw-words)
   (let ((fn-name (if (symbolp name) (symbol-name name) (string name))))
     (emit-ir :fn-addr dest fn-name)))
 
@@ -27082,6 +27278,7 @@
 (defun compile-xchg-mem (addr-form val-form env dest)
   "Compile (xchg-mem addr val) - atomic exchange.
    Both addr and val are tagged fixnums."
+  (unless (%absolute-addr-form-p addr-form) (%note-raw-words))
   (let ((addr-reg (alloc-temp-reg))
         (val-reg (alloc-temp-reg)))
     (compile-form addr-form env addr-reg)
@@ -27125,6 +27322,7 @@
   "Compile (make-sap-raw raw-u64) — allocate SAP wrapping a raw u64 address.
    raw-u64 is already untagged (e.g., from mem-ref :u64 or syscall result).
    Stored directly without untagging."
+  (%note-raw-words)
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :sap-new dest +vreg-v0+))
 
@@ -27149,6 +27347,7 @@
 
 (defun compile-sap-addr (args env dest)
   "Compile (sap-address sap) — extract raw address from SAP."
+  (%note-raw-words)
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :sap-addr dest +vreg-v0+))
 
@@ -27156,6 +27355,7 @@
   "Compile (%val->word v) — reinterpret value V's native word as an integer.
    V occupies native word W; the integer of magnitude W has native form W<<1.
    So SHL by 1.  No type guard: works for fixnum/cons/object alike."
+  (%note-raw-words)
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :shl dest +vreg-v0+ +fixnum-shift+))
 
@@ -28464,6 +28664,11 @@
          ;; A hard 61 made a 30-bit build trust products that overflow.
          (list t (<= rw (- +fixnum-bits+ 1)) rw))))
 
+(defun %fixnum-literal-p (form)
+  "FORM is an integer literal that COMPILE-INTEGER loads as one immediate
+   (its fixnum range, which starts at -(2^62-1): see there)."
+  (and (integerp form) (>= form +fixnum-min+) (<= form +fixnum-max+)))
+
 (defun %leaf-operand-p (form env)
   "True when compiling FORM into a fresh temp register is a pure load that
    cannot disturb any other register or the stack: an integer literal, or a
@@ -28471,8 +28676,14 @@
    symbol-macro, a special, or a global).  Binary-op emitters use this to
    skip the push/pop that otherwise guards the left operand across the
    right operand's compile — the dominant per-op cost in tight loops (the
-   6-tap filter spent 37 push/pop pairs per pixel)."
-  (cond ((integerp form) t)
+   6-tap filter spent 37 push/pop pairs per pixel).
+   ONLY A FIXNUM literal is a leaf.  A literal past the fixnum range is a
+   BIGNUM, which COMPILE-INTEGER conses at run time (:gc-check + :alloc-obj
+   and a temp of its own) and runtime x64 code writes through rax = VR: with
+   DEST = VR the left operand was overwritten, so a compiled
+   (= x #xa129ca6149be45e5) compared the literal against itself-ish garbage
+   and answered NIL (beacon's SipHash reference vector).  %FIXNUM-LITERAL-P."
+  (cond ((integerp form) (%fixnum-literal-p form))
         ((and form (symbolp form) env)
          (let ((b (env-lookup env form)))
            (and b (member (binding-location b) (list :stack :reg)))))
@@ -28822,6 +29033,7 @@
     (when own (free-temp-reg))))
 
 (defun compile-word-aref (arr-form idx-form env dest)
+  (%note-raw-words)
   (if (%obj-slot-imm-p idx-form)
       (let ((arr-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
@@ -28862,6 +29074,7 @@
     (free-temp-reg)))
 
 (defun compile-word-aset (arr-form idx-form val-form env dest)
+  (%note-raw-words)
   ;; Value first when ARR and IDX are lexical leaves — see compile-u8-set.
   (when (%store-value-first-ok-p arr-form idx-form val-form env dest)
     (return-from compile-word-aset
@@ -29220,8 +29433,9 @@
 (defun %lexical-leaf-p (form env)
   "An integer literal or a lexical variable (stack or register binding):
    loading it into a temp touches no other register, so it may be
-   evaluated AFTER a value expression without changing what either sees."
-  (or (integerp form)
+   evaluated AFTER a value expression without changing what either sees.
+   A bignum literal is no leaf: it is consed (see %LEAF-OPERAND-P)."
+  (or (%fixnum-literal-p form)
       (and form (symbolp form)
            (let ((b (env-lookup env form)))
              (and b (member (binding-location b) '(:stack :reg)))))))
@@ -31623,7 +31837,7 @@
     (flush-deferred-tails)
 
     ;; Build function-info
-    (let ((ir (thread-jumps (get-ir-instructions))))
+    (let ((ir (thread-jumps (%ir-safepoints (get-ir-instructions)))))
       ;; Store the IR on the function-info for later bytecode emission
       (let* ((bare-name (if (symbolp name) (%rt-fn-name name) (string name)))
              (info (make-function-info
@@ -31677,6 +31891,8 @@
       ;; 1 opcode + 1 reg + 1 kind byte.  Same warning as :gc-check-n above.
       (:gc-check-r 3)
       (:yield 1)
+      (:safepoint 1)
+      (:raw-mark 0)
       (:set-mv-count 2)
 
       ;; 1-reg instructions: 1 opcode + 1 reg = 2 bytes
@@ -31978,6 +32194,9 @@
            (mvm-mcgc-collect buf))
           (:yield
            (mvm-yield buf))
+          (:safepoint
+           (mvm-safepoint buf))
+          (:raw-mark nil)
           (:set-mv-count
            (mvm-set-mv-count buf (second insn)))
           (:frame-leave
@@ -33189,6 +33408,19 @@
                           for p in ctor-params
                           collect `(aset obj ,(+ 2 i) ,p))
                   obj))
+         ;; MORE SLOTS THAN A CALL PASSES POSITIONALLY: a call with more than +APPLY-SPREAD-MAX+
+         ;; arguments passes that many and then a LIST of the rest, which only an &rest function
+         ;; accepts -- a fixed-parameter ctor signalled "invalid number of arguments: more than 120".
+         ;; weft's computed style, CSTYLE, has 162 slots.  So a wide struct's ctor takes &rest and
+         ;; fills the slots in order.
+         (when (> nslots +apply-spread-max+)
+           (let ((vals (%defstruct-intern "VALS")) (k (%defstruct-intern "K")) (v (%defstruct-intern "V")))
+             (setf ctor-params (list '&rest vals)
+                   ctor-body `(let ((obj (make-array ,(+ 2 nslots))) (,k 2))
+                                (aset obj 0 (quote %struct-instance))
+                                (aset obj 1 (quote ,struct-name))
+                                (dolist (,v ,vals) (aset obj ,k ,v) (setq ,k (+ ,k 1)))
+                                obj))))
          (push `(defun ,(%defstruct-intern internal-ctor-name)
                     ,ctor-params
                   ,ctor-body)
@@ -33566,7 +33798,8 @@
                   ;; this struct reads the slot in place (see compile-call)
                   (%struct-accessor-note acc-name (format nil "SET-~A" acc-name)
                                          struct-str (+ 2 i) (nth i slot-types)
-                                         min-inst-len struct-name slot-read-only)
+                                         min-inst-len struct-name slot-read-only
+                                         (if conc-name (%defstruct-intern acc-name) slot))
                   (let* ((setter-name (format nil "SET-~A" acc-name))
                          ;; NOTE — CHECKED-STORE is bound HERE, as a plain
                          ;; top-level backquote, and spliced below as a bare

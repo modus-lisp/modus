@@ -1982,7 +1982,16 @@
                     ((string-equal name-str "Delete") (code-char 127))
                     ;; every other name CHAR-NAME gives (Bel, ...)
                     ((name-char name-str))
-                    (t (%reader-error "unknown character name"))))))))))
+                    ;; LOUD: never a guessed character.  Name it, and say when this image
+                    ;; simply has no Unicode name table (a bare-metal build)
+                    (t (error (make-condition
+                               'simple-reader-error
+                               :format-control "unknown character name: #\\~A~A"
+                               :format-arguments
+                               (list name-str
+                                     (if (%ucn-present-p)
+                                         ""
+                                         " (this image has no Unicode name table: write #\\U+XXXX, or build with MODUS_UNICODE_NAMES=1)")))))))))))))
 
 (defun %read-uninterned-symbol (stream rt)
   "Read #:symbol — uninterned symbol.

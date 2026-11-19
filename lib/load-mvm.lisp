@@ -139,7 +139,7 @@
                  "*X64-JIT-CONSTVEC-FULL-P*" "*X64-SCHED-LOCK-ADDR*" "*X64-TLS-WINDOW*"
                  "*X64-LINUX-MODE*" "*WS5-FORCE-NO-KINDCHECK*" "*MCGC-KIND-BITMAP-ENABLED*"))
       (import (find-symbol n x64) asm))
-    (dolist (n '("*HC-FAULT-FIXUP*" "*TLS-WINDOW*" "*LINUX-X64-R14-OFFSET*"))
+    (dolist (n '("*HC-FAULT-FIXUP*" "*TLS-WINDOW*" "*LINUX-X64-R14-OFFSET*" "*PARK-SAFEPOINTS*"))
       (import (intern n mvm) asm))
     ;; the cross-compiling images (aarch64 CLI, self-host) configure the x86-64
     ;; translator from text read in MODUS.MVM

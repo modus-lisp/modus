@@ -57,7 +57,7 @@
    #:+op-call+ #:+op-call-ind+ #:+op-ret+ #:+op-tailcall+
    #:+op-alloc-cons+ #:+op-gc-check+ #:+op-gc-check-n+ #:+op-gc-check-r+
    #:+op-write-barrier+ #:+op-mcgc-collect+
-   #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-atomic-xchg+
+   #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-safepoint+ #:+op-atomic-xchg+
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
    #:+op-cli+ #:+op-sti+ #:+op-percpu-ref+ #:+op-percpu-set+
    #:+op-fn-addr+
@@ -135,7 +135,7 @@
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-gc-check-n #:mvm-gc-check-r
    #:mvm-write-barrier #:mvm-mcgc-collect
-   #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-atomic-xchg
+   #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-safepoint #:mvm-atomic-xchg
    #:mvm-io-read #:mvm-io-write #:mvm-halt
    #:mvm-cli #:mvm-sti #:mvm-percpu-ref #:mvm-percpu-set
    #:mvm-fn-addr
@@ -427,6 +427,7 @@
 (defconstant +op-save-ctx+    #x90)  ; (save-ctx) - no operands
 (defconstant +op-restore-ctx+ #x91)  ; (restore-ctx) - no operands
 (defconstant +op-yield+       #x92)  ; (yield) - no operands
+(defconstant +op-safepoint+   #x97)  ; (safepoint) - a YIELD that may also PARK
 (defconstant +op-atomic-xchg+ #x93)  ; (atomic-xchg Vd Vaddr Vs) - 3 reg
 
 ;; System/platform
@@ -737,6 +738,7 @@
 (defopcode :save-ctx    #x90 (:reg)           "Save actor context (addr in reg, result in reg)")
 (defopcode :restore-ctx #x91 (:reg)           "Restore actor context (addr in reg, never returns)")
 (defopcode :yield       #x92 ()               "Preemption check point")
+(defopcode :safepoint   #x97 ()               "Loop back-edge that may park for stop-the-world (a YIELD where no raw word is live)")
 (defopcode :atomic-xchg #x93 (:reg :reg :reg) "Atomic exchange for spinlocks")
 
 ;; System
@@ -1521,6 +1523,9 @@
 
 (defun mvm-yield (buf)
   (encode-instruction buf +op-yield+))
+
+(defun mvm-safepoint (buf)
+  (encode-instruction buf +op-safepoint+))
 
 (defun mvm-atomic-xchg (buf vd vaddr vs)
   (encode-instruction buf +op-atomic-xchg+ vd vaddr vs))

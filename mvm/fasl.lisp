@@ -567,8 +567,19 @@
 
 (defun %fasl-key (text)
   (%fasl-hash-string
-   (format nil "~a|~a|~a|~a|~a|~a"
+   (format nil "~a~a|~a|~a|~a|~a|~a"
            (%fasl-compiler-fingerprint)
+           ;; A CODEGEN KNOB SET BY THE CO-INIT, not by the compiler's source:
+           ;; with *PARK-SAFEPOINTS* (compiler.lisp; the hosted threaded JIT
+           ;; images) a loop's back-edge compiles to SAFEPOINT, without it to
+           ;; YIELD.  Same fingerprint either way, so a cache an image without
+           ;; it had written (JIT off, no threads, or an image built before the
+           ;; knob) was replayed by one with it, and that file's loops never
+           ;; parked for a collection: a worker spinning in a LOADed function
+           ;; held every region-0 collection up again.  Unset leaves the key
+           ;; as it was.
+           (if (and (boundp (quote *park-safepoints*)) (symbol-value (quote *park-safepoints*)))
+               "+park" "")
            (%fasl-hash-string (%fasl-features-string))
            (if *package* (package-name *package*) "")
            (or *fasl-chain* "")

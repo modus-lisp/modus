@@ -3508,6 +3508,7 @@
                    (setf pc npc)))))
 
           (#.+op-yield+ nil) ; preemption: no-op
+          (#.+op-safepoint+ nil) ; a YIELD that may park: no-op here too
 
           ;; REAL memory and a REAL exchange -- see the MEM-READ-BYTE block
           ;; above.  This arm was the last opcode still keying

@@ -418,6 +418,8 @@
       ;; say what it is instead of a TYPE-ERROR message with NILs in it.
       ((typep c 'stack-exhausted)
        (write-string "Control stack exhausted: the recursion went deeper than the stack." stream) t)
+      ((typep c 'handler-stack-exhausted)
+       (write-string "Handler-frame stack exhausted: CATCH / UNWIND-PROTECT / HANDLER-CASE nested deeper than the frame stack holds." stream) t)
       ((typep c 'memory-fault-error)
        (write-string "Memory fault in compiled code: an operation was applied to an object of the wrong type (no further detail is recorded)." stream) t)
       ((typep c 'mvm-type-error)
@@ -617,6 +619,12 @@
   (%define-condition 'end-of-file '(stream-error) nil nil nil)
   ;; reader-error
   (%define-condition 'reader-error '(parse-error stream-error) nil nil nil)
+  ;; simple-reader-error: a READER-ERROR with a message (SBCL's sb-int:simple-reader-error)
+  ;; -- READER-ERROR itself reports only its type.  The #\\name reader uses it.
+  (%define-condition 'simple-reader-error '(simple-condition reader-error) nil nil nil)
+  ;; simple-stream-error: a STREAM-ERROR with a message (SBCL's sb-int:simple-stream-error) --
+  ;; what a failed write(2) signals: "Couldn't write to #<stream>: Broken pipe".
+  (%define-condition 'simple-stream-error '(simple-condition stream-error) nil nil nil)
   ;; parse-error
   (%define-condition 'parse-error '(error) nil nil nil)
   ;; print-not-readable
@@ -634,6 +642,12 @@
   ;; (see %TAKE-PENDING-FAULT).  A STORAGE-CONDITION, not an ERROR, as SBCL's
   ;; is: deep recursion is a resource running out, not a wrong operation.
   (%define-condition 'stack-exhausted '(storage-condition) nil nil nil)
+  ;; handler-stack-exhausted -- a CATCH / UNWIND-PROTECT / HANDLER-CASE frame
+  ;; could not be pushed: the per-thread handler-frame stack is full (or its
+  ;; extension could not be reserved).  The push longjmps to the enclosing
+  ;; frame instead of dropping the new one (translate-x64,
+  ;; EMIT-HSTACK-OVERFLOW), so every cleanup still runs.
+  (%define-condition 'handler-stack-exhausted '(storage-condition) nil nil nil)
   ;; memory-fault-error -- SIGSEGV/SIGBUS caught by a handler-case (see
   ;; %TAKE-PENDING-FAULT).  A TYPE-ERROR because in compiled code a fault is
   ;; how a type check fails: (car 5) faults, and ANSI says it signals
@@ -840,7 +854,10 @@
    the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
    is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
    MEMORY-FAULT-ERROR -- or STACK-EXHAUSTED when the stub found the fault
-   just below the stack pointer and recorded #x0B0B instead of 11.
+   just below the stack pointer and recorded #x0B0B instead of 11.  #x0F0F is
+   not a signal: an overflowing handler-frame push (translate-x64,
+   EMIT-HSTACK-OVERFLOW; translate-aarch64, EMIT-AARCH64-HSTACK-OVERFLOW)
+   records it, HANDLER-STACK-EXHAUSTED.
 
    A SIGILL may be THE SHARED-STORE GUARD's refusal, which says more than the
    signal does: %HC-FAULT-FIXUP claims it (and clears the signal) when it is.
@@ -854,6 +871,7 @@
       (setq *current-condition*
             (%attach-fault-frames
              (cond ((eql sig #x0B0B) (make-condition 'stack-exhausted))
+                   ((eql sig #x0F0F) (make-condition 'handler-stack-exhausted))
                    ((eql sig 8) (make-condition 'division-by-zero
                                                 :operation nil :operands nil))
                    ((eql sig 4) (make-condition 'illegal-instruction-error))

@@ -317,10 +317,16 @@
 ;; MODUS_68K_SHARED: the most repeated sequences (CONS so far) as one shared copy
 ;; each, called (translate-68k.lisp *68K-SHARED-SEQUENCES*).  1 = on, 0 = off;
 ;; unset, it follows MODUS_SMALL_IMAGE.
+;; A comma list of sequence names shares only those: MODUS_68K_SHARED=cons,alloc-obj.
 (let ((v (sb-ext:posix-getenv "MODUS_68K_SHARED")))
   (setf *68k-shared-sequences*
         (cond ((null v) (and cl-user::*small-image* t))
               ((string= v "0") nil)
+              ((find-if #'alpha-char-p v)
+               (loop for start = 0 then (1+ end)
+                     for end = (or (position #\, v :start start) (length v))
+                     collect (intern (string-upcase (string-trim " " (subseq v start end))) "KEYWORD")
+                     while (< end (length v))))
               (t t))))
 
 ;; Small images: shifted-byte immediates as MOVEQ + LSL (translate-68k.lisp

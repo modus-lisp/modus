@@ -3977,7 +3977,16 @@
 ;;; GC-CHECK the compiler puts right before each one.
 
 (defvar *68k-shared-sequences* nil
-  "When T, CONS (with the GC-CHECK before it) is a call to one shared copy.")
+  "When T, CONS (with the GC-CHECK before it) is a call to one shared copy, and
+   so are SUBTAG, CAR / CDR, ARRAY-LEN and ALLOC-OBJ.  A LIST of keywords
+   (:CONS :SUBTAG :CAR :ARRAY-LEN :ALLOC-OBJ) shares only those: allocation
+   costs enough that a call is cheap beside it, while CAR, CDR and the subtag
+   test stay inline where speed matters (MODUS_68K_SHARED=cons,alloc-obj).")
+
+(defun m68k-shared-p (which)
+  "Whether the shared copy of sequence WHICH (a keyword) is in use."
+  (or (eq *68k-shared-sequences* t)
+      (and (consp *68k-shared-sequences*) (member which *68k-shared-sequences*) t)))
 (defvar *68k-cons-label* nil
   "Label of the shared CONS sequence while translating, else NIL.")
 (defvar *68k-bytecode* nil
@@ -5057,13 +5066,13 @@
          (*68k-mac-console-label* (and *68k-mac-mode* (mvm-make-label)))
          (*68k-mac-getc-label* (and *68k-mac-mode* (mvm-make-label)))
          (*68k-mac-service-label* (and *68k-mac-mode* (mvm-make-label)))
-         (*68k-cons-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-subtag-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-car-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-cons-label* (and (m68k-shared-p :cons) (mvm-make-label)))
+         (*68k-subtag-label* (and (m68k-shared-p :subtag) (mvm-make-label)))
+         (*68k-car-label* (and (m68k-shared-p :car) (mvm-make-label)))
          (*68k-barrier-label* (and *68k-gc-static* (m68k-hosted-layout-p) (mvm-make-label)))
-         (*68k-cdr-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-array-len-label* (and *68k-shared-sequences* (mvm-make-label)))
-         (*68k-alloc-obj-label* (and *68k-shared-sequences* (mvm-make-label)))
+         (*68k-cdr-label* (and (m68k-shared-p :car) (mvm-make-label)))
+         (*68k-array-len-label* (and (m68k-shared-p :array-len) (mvm-make-label)))
+         (*68k-alloc-obj-label* (and (m68k-shared-p :alloc-obj) (mvm-make-label)))
          (*68k-bytecode* bytecode)
          (buf (make-m68k-buffer))
          (label-map (make-hash-table :test 'eql))

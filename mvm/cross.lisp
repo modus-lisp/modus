@@ -2037,6 +2037,8 @@
     (:linux-arm32 :armv7)
     ;; The bare ARMv7 CL image (QEMU virt, MMU-remapped): same translator.
     (:armv7-cl :armv7)
+    ;; The bare i386 CL image (paging over the hosted picture): same translator.
+    (:i386-cl :i386)
     (:linux-i386 :i386)
     (:x64-console :x86-64)
     (:i386-console :i386)
@@ -2126,6 +2128,8 @@
     ;; boot/boot-arm32-cl.lisp is loaded by its build (it needs the arm32
     ;; translator and boot-linux-arm32's geometry), so resolve it by name.
     (:armv7-cl (funcall 'armv7-cl-boot-descriptor))
+    ;; boot/boot-i386-cl.lisp, loaded by its build, as boot-arm32-cl.lisp is.
+    (:i386-cl (funcall 'i386-cl-boot-descriptor))
     (:rpi     (rpi-boot-descriptor))
     (:fixpoint (aarch64-fixpoint-boot-descriptor))
     (:uefi-x64 (uefi-x64-boot-descriptor))

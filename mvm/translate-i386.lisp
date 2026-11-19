@@ -429,6 +429,20 @@
    INT3 placeholder.  Set by the bare CL image; the legacy bare images keep the
    placeholder and stay byte-identical.")
 
+(defparameter *i386-cl-bare* nil
+  "BARE TRAPS OVER THE HOSTED LAYOUT -- arm32's *ARM32-CL-BARE* for i386: the
+   bare-metal CL image (boot/boot-i386-cl.lisp) runs the hosted address picture
+   (boot-linux-i386.lisp: the fixed block and globals at #x10000000.., the heap
+   at #x19000000, the handler-case block and frames at their hosted
+   addresses, the native collector with the hosted geometry and a margin read
+   from the BSS), mapped into RAM with paging, while every trap that would
+   reach Linux is the bare one (COM1 port I/O, RDTSC).  Set by
+   I386-SET-CL-BARE-MODE; *I386-LINUX-MODE* stays NIL.")
+
+(defun i386-hosted-layout-p ()
+  "Is the memory picture the hosted one (Linux, or bare over it)?"
+  (or *i386-linux-mode* *i386-cl-bare*))
+
 (defun i386-gc-mode-p ()
   "Does this image run the native collector: hosted, or a bare image whose
    boot sets it up (*I386-BARE-GC*)?"
@@ -594,13 +608,14 @@
    the Multiboot board -- above the per-CPU block (#x5B0000), below the cons
    space (8 MB), clear of the stack (down from 4 MB).  #x10000180 is past the
    end of RAM on a `qemu-system-i386 -m 256' board."
-  (let ((base (if *i386-linux-mode* #x10000000 *i386-bare-handler-base*)))
+  (let* ((hosted (i386-hosted-layout-p))
+         (base (if hosted #x10000000 *i386-bare-handler-base*)))
     (setf *i386-jmpbuf-addr*          (+ base #x180)
           *i386-longjmp-scratch-addr* (+ base #x3C0)
           *i386-hstack-depth-addr*    (+ base #x400)
           ;; HOSTED: the frames get their own room (see *I386-HOSTED-HSTACK-BASE*).
-          *i386-hstack-base-addr*     (if *i386-linux-mode* *i386-hosted-hstack-base* (+ base #x408))
-          *i386-hstack-max-depth*     (if *i386-linux-mode* 127 63))))
+          *i386-hstack-base-addr*     (if hosted *i386-hosted-hstack-base* (+ base #x408))
+          *i386-hstack-max-depth*     (if hosted 127 63))))
 
 (defparameter *i386-hosted-hstack-base* #x1001E100
   "Hosted handler frames: the free tail of the demand-zeroed BSS, past
@@ -6088,6 +6103,22 @@
 ;;; ============================================================
 ;;; Target Descriptor Installation
 ;;; ============================================================
+
+(defun i386-set-cl-bare-mode (globals-base margin-addr)
+  "Translate the bare-metal CL image over the hosted layout (*I386-CL-BARE*):
+   bare traps, the hosted globals block at GLOBALS-BASE, the native collector
+   with its margin at MARGIN-ADDR (the boot stub chooses the heap's size from
+   the RAM the loader reports), RDTSC behind the clock traps, and function
+   entries 16-aligned and OR-3 tagged as in the hosted CLI."
+  (setf *i386-linux-mode* nil
+        *i386-cl-bare* t
+        *i386-bare-gc* t
+        *i386-bare-clock* t
+        *i386-fn-tag-3* t
+        *i386-fn-align* 16
+        *i386-native-code-offset* 0
+        *i386-gc-margin-addr* margin-addr)
+  (i386-set-globals-base globals-base))
 
 (defun i386-native-export-labels ()
   "The image routines the native tier links runtime code to, in the order

@@ -248,7 +248,12 @@
 (defvar *cli-arch* (cond (*cl-repl-x64-p* :x64) (*cl-repl-i386-p* :i386)
                          (*cl-repl-arm32-p* :arm32) (*cl-repl-mac68k-p* :68k)
                          (t :aarch64)))
-(defvar *cli-soft-float* *cl-repl-mac68k-p*)
+(defvar *cli-soft-float*
+  (or *cl-repl-mac68k-p*
+      ;; i386 on an FPU-less 486SX / 386 (build-i386-cli's MODUS_I386_SOFT_FLOAT)
+      (and *cl-repl-i386-p*
+           (let ((v (sb-ext:posix-getenv "MODUS_I386_SOFT_FLOAT")))
+             (and v (plusp (length v)) (not (string= v "0")))))))
 
 ;;; BARE-METAL SEAM.  No OS: no Linux syscalls, no fds, no argv, no
 ;;; cli-toplevel.  The tarball pipeline is kept (untar -> parse .asd ->
@@ -3688,8 +3693,16 @@
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
   (funcall (intern "I386-SET-CL-BARE-MODE" "MODUS.MVM.I386")
            (symbol-value (intern "+LINUX-I386-GLOBALS+" "MODUS.MVM"))
-           (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM")))
-  (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~%"))
+           (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM"))
+           ;; the clock: the PIT's ticks (a 486 has no RDTSC)
+           (symbol-value (intern "+I386-CL-TICK-ADDR+" "MODUS.MVM")))
+  ;; MODUS_I386_FP=x87: floats on the x87 (a 486DX has no SSE2, nor a CR4 to
+  ;; enable it with), as build-i386-cli.lisp reads it
+  (let ((v (sb-ext:posix-getenv "MODUS_I386_FP")))
+    (setf (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))
+          (and v (string-equal v "x87"))))
+  (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~@[; x87~]~%"
+          (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))))
 
 ;;; DIVERGENCE 6/7 (:ARM32 arm) — the ARMv7 QEMU-virt boot descriptor and console.
 ;;;

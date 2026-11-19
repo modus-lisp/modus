@@ -48,6 +48,9 @@
 (defconstant +i386-cl-v-bm1+    #x801C)
 (defconstant +i386-cl-v-bm2+    #x8020)
 (defconstant +i386-cl-boot-stack+ #x8F000 "Below the IDT at #x90000.")
+(defconstant +i386-cl-tick-addr+ #x8100
+  "The PIT's tick count (100 Hz), kept by the timer interrupt: the clock
+   (translate-i386 *I386-PIT-CLOCK*).  Low memory, identity-mapped.")
 
 (defun i386cl-abs (op-bytes addr)
   "OP-BYTES (a list) then the 32-bit ADDR: an absolute-operand instruction."
@@ -232,7 +235,9 @@
             '(:label past-subroutines))))
     ;; the console and the timer, as the old bare entry does
     (i386-init-serial buf)
-    (emit-i386-interrupt-setup buf)
+    (i386l-bytes buf #xC7 #x05) (i386l-le32 buf +i386-cl-tick-addr+) (i386l-le32 buf 0)
+    (emit-i386-interrupt-setup buf +i386-cl-tick-addr+)
+    (i386l-bytes buf #xFB)                                    ; sti: the clock ticks
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xE5)        ; mov ebp, esp
     ;; native byte 0 on a 16-byte boundary (OR-3 tagged entries): the JMP
     ;; rel32 to kernel-main that cross.lisp appends is 5 bytes

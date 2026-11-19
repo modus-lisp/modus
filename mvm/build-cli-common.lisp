@@ -2789,6 +2789,16 @@
                         (push e r)))
                   ;; the image-configuration text (generated, not a component)
                   (%shake-add-tokens (modus.image-config:image-configuration-text) h)
+                  ;; and every name in the build scripts and boot descriptors:
+                  ;; the source they GENERATE after this point (the function
+                  ;; table's seeding calls %SNAPSHOT-KERNEL-FN-NAMES, boot
+                  ;; calls %GC-INIT, %INIT-BOOLE-CONSTANTS ...) is written
+                  ;; from their strings.  Missing those measured as an x64
+                  ;; image whose kernel name tables stayed empty: the ANSI
+                  ;; suite's own REGRESSION-TEST collided with the image's.
+                  (dolist (f (append (directory (merge-pathnames "mvm/build-*.lisp" *modus-base*))
+                                     (directory (merge-pathnames "boot/*.lisp" *modus-base*))))
+                    (%shake-add-tokens (read-file-text f) h))
                   (%shake-add-tokens (%extra-source-text) h)
                   (maphash (lambda (k v) (declare (ignore v)) (push k r)) h)
                   r)))

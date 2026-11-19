@@ -429,6 +429,13 @@
    INT3 placeholder.  Set by the bare CL image; the legacy bare images keep the
    placeholder and stay byte-identical.")
 
+(defparameter *i386-pit-clock* nil
+  "Bare clock from the PIT instead of the time stamp counter: trap #x0310 reads
+   the tick count the boot stub's timer interrupt keeps at this ADDRESS (100 Hz,
+   boot-i386 EMIT-I386-INTERRUPT-SETUP), #x0311 answers 100.  For CPUs with no
+   RDTSC -- a 486 -- which the bare CL image targets.  NIL: RDTSC
+   (*I386-BARE-CLOCK*).")
+
 (defparameter *i386-cl-bare* nil
   "BARE TRAPS OVER THE HOSTED LAYOUT -- arm32's *ARM32-CL-BARE* for i386: the
    bare-metal CL image (boot/boot-i386-cl.lisp) runs the hosted address picture
@@ -3352,6 +3359,17 @@
               ;; CNTFRQ: #x0310's rate, TAGGED, in VR.  mov eax, 2000.
               (i386-emit-byte buf #xB8) (i386-emit-u32 buf 2000))
 
+             ((and (= code #x0310) *i386-pit-clock*)
+              ;; the PIT's tick count (boot-i386's timer interrupt), TAGGED in
+              ;; EAX: 30 bits wrap after ~124 days at 100 Hz
+              (i386-emit-mov-reg-abs buf +i386-eax+ *i386-pit-clock*)
+              (i386-emit-byte buf #x25) (i386-emit-u32 buf #x3FFFFFFF)  ; and eax, 2^30-1
+              (i386-emit-byte buf #xD1) (i386-emit-byte buf #xE0))      ; shl eax,1 (tag)
+
+             ((and (= code #x0311) *i386-pit-clock*)
+              ;; ticks per second: PIT divisor 11932 -> 1193182/11932 = 100.0 Hz
+              (i386-emit-mov-reg-imm buf +i386-eax+ (* 2 100)))
+
              ((and (= code #x0310) *i386-bare-clock*)
               ;; RDTSC, bare metal (no clock_gettime): bits 12..41 of the time
               ;; stamp counter -- a 30-bit fixnum, monotonic between wraps (2^42
@@ -6104,12 +6122,13 @@
 ;;; Target Descriptor Installation
 ;;; ============================================================
 
-(defun i386-set-cl-bare-mode (globals-base margin-addr)
+(defun i386-set-cl-bare-mode (globals-base margin-addr &optional tick-addr)
   "Translate the bare-metal CL image over the hosted layout (*I386-CL-BARE*):
    bare traps, the hosted globals block at GLOBALS-BASE, the native collector
    with its margin at MARGIN-ADDR (the boot stub chooses the heap's size from
-   the RAM the loader reports), RDTSC behind the clock traps, and function
-   entries 16-aligned and OR-3 tagged as in the hosted CLI."
+   the RAM the loader reports), the clock traps on the PIT's tick word at
+   TICK-ADDR (any 386 or later; NIL: RDTSC, a Pentium's), and function entries
+   16-aligned and OR-3 tagged as in the hosted CLI."
   (setf *i386-linux-mode* nil
         *i386-cl-bare* t
         *i386-bare-gc* t
@@ -6117,7 +6136,8 @@
         *i386-fn-tag-3* t
         *i386-fn-align* 16
         *i386-native-code-offset* 0
-        *i386-gc-margin-addr* margin-addr)
+        *i386-gc-margin-addr* margin-addr
+        *i386-pit-clock* tick-addr)
   (i386-set-globals-base globals-base))
 
 (defun i386-native-export-labels ()

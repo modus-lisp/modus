@@ -348,8 +348,11 @@
   (mvm-emit-byte buf #xB0) (mvm-emit-byte buf val)
   (mvm-emit-byte buf #xE6) (mvm-emit-byte buf port))
 
-(defun emit-i386-interrupt-setup (buf)
-  "Set up PIC remap, PIT timer (~100Hz), and minimal 32-bit IDT for HLT-based io-delay."
+(defun emit-i386-interrupt-setup (buf &optional tick-addr)
+  "Set up PIC remap, PIT timer (~100Hz), and minimal 32-bit IDT for HLT-based io-delay.
+   TICK-ADDR: the timer interrupt also counts its ticks in that dword (the bare
+   CL image's clock, translate-i386 *I386-PIT-CLOCK*); NIL keeps the handler as
+   it always was."
   ;; === Remap PIC ===
   (i386-out buf #x20 #x11) (i386-out buf #xA0 #x11)
   (i386-out buf #x21 #x20) (i386-out buf #xA1 #x28)
@@ -408,6 +411,16 @@
     ;; === Write ISR at 0x90400 ===
     ;; push eax; mov al, 0x20; out 0x20, al; pop eax; iret
     ;; 50 B0 20 E6 20 58 CF = 7 bytes
+    ;; With TICK-ADDR: inc dword [tick] first (FF 05 abs32), 13 bytes in all --
+    ;; inside the 16 before the NE2000 handler at #x90410.  IRET restores the
+    ;; flags INC changes.
+    (when tick-addr
+      (loop for byte in (append (list #xFF #x05) (i386l-le32-list tick-addr)
+                                (list #x50 #xB0 #x20 #xE6 #x20 #x58 #xCF))
+            for k from 0
+            do (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x05)
+               (mvm-emit-u32 buf (+ isr-addr k)) (mvm-emit-byte buf byte)))
+    (unless tick-addr
     (let ((a isr-addr))
       ;; mov byte [a+0], 0x50 (push eax)
       (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x05) (mvm-emit-u32 buf a) (mvm-emit-byte buf #x50)
@@ -422,7 +435,7 @@
       ;; mov byte [a+5], 0x58 (pop eax)
       (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x05) (mvm-emit-u32 buf (+ a 5)) (mvm-emit-byte buf #x58)
       ;; mov byte [a+6], 0xCF (iret)
-      (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x05) (mvm-emit-u32 buf (+ a 6)) (mvm-emit-byte buf #xCF))
+      (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x05) (mvm-emit-u32 buf (+ a 6)) (mvm-emit-byte buf #xCF)))
 
     ;; === Write NE2000 ISR at 0x90410 (9 bytes) ===
     ;; Slave IRQ: EOI to slave PIC (0xA0) then master PIC (0x20)

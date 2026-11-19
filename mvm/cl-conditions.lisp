@@ -856,7 +856,8 @@
    MEMORY-FAULT-ERROR -- or STACK-EXHAUSTED when the stub found the fault
    just below the stack pointer and recorded #x0B0B instead of 11.  #x0F0F is
    not a signal: an overflowing handler-frame push (translate-x64,
-   EMIT-HSTACK-OVERFLOW) records it, HANDLER-STACK-EXHAUSTED.
+   EMIT-HSTACK-OVERFLOW; translate-aarch64, EMIT-AARCH64-HSTACK-OVERFLOW)
+   records it, HANDLER-STACK-EXHAUSTED.
 
    A SIGILL may be THE SHARED-STORE GUARD's refusal, which says more than the
    signal does: %HC-FAULT-FIXUP claims it (and clears the signal) when it is.

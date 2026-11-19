@@ -269,6 +269,11 @@
   (setf (mem-ref #x100001C0 :u64) 0)
   (setf (mem-ref #x100001C8 :u64) 0)
   (setf (mem-ref #x10000400 :u64) 0)
+  ;; The main thread's handler-frame extension address and its test limit
+  ;; (translate-aarch64, THE HANDLER-FRAME STACK HAS NO SILENT CEILING): a
+  ;; garbage address here would be taken for a reserved extension.
+  (setf (mem-ref #x10005600 :u64) 0)
+  (setf (mem-ref #x10005608 :u64) 0)
   ;; WS4-AA64 #160: object-start bitmap config words (page_base / bitmap_base).
   ;; Zero them, then reserve the bitmap BEFORE any allocation (init-symbol-table
   ;; below is the first allocator) so every mutator alloc records its start bit.

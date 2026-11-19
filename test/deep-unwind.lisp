@@ -16,8 +16,15 @@
 ;;;; the script loader's own frames are counted -- a THROW escaped every
 ;;;; CATCH (an unhandled %THROW-IN-FLIGHT) and aborted the file.
 ;;;;
-;;;; Now frames past the window's 512 go to a lazily reserved per-thread
-;;;; extension (translate-x64, THE HANDLER-FRAME STACK HAS NO SILENT CEILING),
+;;;; AArch64 had no bound check at all: its window holds 170 frames and the
+;;;; 171st was stored past it -- on a worker into the NEXT thread's window.
+;;;; Measured on the Pi 5 (origin/main 82fa6e7e): a worker 200 deep made its
+;;;; neighbour's HANDLER-CASE receive a MEMORY-FAULT-ERROR instead of its own
+;;;; ERROR, and 400 deep killed the process with SIGSEGV.
+;;;;
+;;;; Now frames past the window's 512 (AArch64: 170) go to a lazily reserved
+;;;; per-thread extension (translate-x64 / translate-aarch64, THE
+;;;; HANDLER-FRAME STACK HAS NO SILENT CEILING),
 ;;;; and a push that still cannot be stored is LOUD: the enclosing frame
 ;;;; receives a HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION).  The last
 ;;;; section reaches that through the test-only per-window limit, since no
@@ -25,6 +32,7 @@
 ;;;;
 ;;;; Checked on MAIN and on a WORKER thread, for N from 100 to 5000:
 ;;;;   CLEANUPS   N nested UNWIND-PROTECTs, exited by THROW, a handled ERROR,
+;;;;              a handled hardware fault (the signal stub's own pop),
 ;;;;              RETURN-FROM and GO from the bottom: all N cleanups run, in
 ;;;;              innermost-first order, and the frame depth comes back.
 ;;;;   CATCH      N nested CATCHes with distinct tags: a THROW from the bottom
@@ -44,6 +52,8 @@
 ;;;;              dispatch to the innermost one of the right type; HANDLER-BIND
 ;;;;              handlers N deep all run, innermost first, and one that exits
 ;;;;              non-locally still runs every cleanup.
+;;;;   NEIGHBOURS a worker nesting N deep leaves a concurrently parked
+;;;;              worker's window alone (its HANDLER-CASE, special, values).
 ;;;;   OVERFLOW   past the (lowered) limit the push signals a STORAGE-CONDITION
 ;;;;              to the enclosing handler, every frame that WAS pushed runs its
 ;;;;              cleanup, and the stack is usable again afterwards.
@@ -71,6 +81,7 @@
 (defvar *trace* nil)          ; cleanup levels, pushed as they run
 (defvar *bottom-depth* 0)     ; native frame depth seen at the bottom
 (defvar *sp* :outer)          ; the special the SPECIALS section binds
+(defvar *bad-address* 8)      ; unmapped: reading it is a SIGSEGV
 
 (define-condition deep-a (error) ())
 (define-condition deep-b (error) ())
@@ -81,6 +92,9 @@
   (ecase how
     (:throw (throw 'deep :thrown))
     (:error (error "deep bottom"))
+    ;; a hardware fault: the signal stub pops the handler stack itself
+    ;; (an inline pop, not the pop helper), so it is its own exit path
+    (:fault (modus-int::%gc-read64 *bad-address*))
     (:fn (funcall k))))
 
 ;;; CLEANUPS: N nested UNWIND-PROTECTs, each cleanup pushing its level.
@@ -97,6 +111,8 @@
               (:throw (catch 'deep (nest-uwp 0 lim :throw nil)))
               (:error (handler-case (nest-uwp 0 lim :error nil)
                         (error () :handled)))
+              (:fault (handler-case (nest-uwp 0 lim :fault nil)
+                        (error (e) (if (string= (symbol-name (type-of e)) "MEMORY-FAULT-ERROR") :faulted e))))
               (:return-from (block out
                               (nest-uwp 0 lim :fn (lambda () (return-from out :returned)))))
               (:go (let ((r nil))
@@ -110,10 +126,11 @@
 (defun iota (n) (loop for i from 0 below n collect i))
 
 (defun check-cleanups (where lim)
-  (dolist (how '(:throw :error :return-from :go))
+  (dolist (how '(:throw :error :fault :return-from :go))
     (let ((r (run-uwp lim how)))
       (chk (format nil "~A ~D ~(~A~) value" where lim how) (first r)
-           (ecase how (:throw :thrown) (:error :handled) (:return-from :returned) (:go :went)))
+           (ecase how (:throw :thrown) (:error :handled) (:fault :faulted)
+                  (:return-from :returned) (:go :went)))
       ;; *trace* is pushed innermost-first, so reversed it must read
       ;; LIM, LIM-1, ... 0 -- i.e. the reverse of 0..LIM.
       (chk (format nil "~A ~D ~(~A~) every cleanup, innermost first" where lim how)
@@ -225,7 +242,10 @@
     (chk (format nil "~A ~D handler-bind depth" where lim) (= (depth) d0) t)))
 
 ;;; OVERFLOW, through the per-window test limit (+HSTACK-EXT-LIMIT-ADDR+,
-;;; window +0x5608, a raw count of extension frames).
+;;; window +0x5608, a raw count of extension frames -- the same word on
+;;; AArch64, +A64-HSTACK-EXT-LIMIT-ADDR+).
+(defvar *win-frames* (if (string= (machine-type) "aarch64") 170 512)
+  "Handler frames the per-thread window holds before the extension.")
 (defvar *entered* 0)
 (defvar *d1* 0)               ; frame depth on entering level 0
 (defun limit-addr () (+ (modus-int::%tls-self-base) #x10005608))
@@ -256,9 +276,10 @@
          (nreverse *trace*) (reverse (iota (- *entered* 1))))
     ;; frames 0..611 (512 in the window + the 100 allowed) were stored.
     ;; Level I pushes at depth *D1*+I, so the push that overflowed is the
-    ;; one at depth 612: level 612-*D1*, the (613-*D1*)th entered.
+    ;; one at depth 612: level 612-*D1*, the (613-*D1*)th entered.  (AArch64:
+    ;; 170 + 100, so depth 270.)
     (chk (format nil "~A overflow at exactly window + limit" where)
-         *entered* (- 613 *d1*))
+         *entered* (- (+ *win-frames* 101) *d1*))
     (chk (format nil "~A overflow depth restored" where) (= (depth) d0) t))
   ;; and the stack works again, deeper than the old limit, afterwards
   (let ((r (run-uwp 1500 :throw)))
@@ -308,7 +329,8 @@
     (format t "  ~A ~D: ~D checks so far, ~D failed~%" where lim *checks* *fail*))
   (check-overflow where))
 
-(defvar *depths* '(100 497 498 511 512 513 600 800 900 1000 2000 5000))
+;;; Around both windows' ends: AArch64's 170, x86-64's 512.
+(defvar *depths* '(100 169 170 171 497 498 511 512 513 600 800 900 1000 2000 5000))
 
 (format t "~&-- main~%")
 (run-all "main" *depths*)
@@ -330,6 +352,46 @@
 
 ;;; Main's specials are untouched by the worker's.
 (chk "main special after worker" *sp* :outer)
+
+;;; NEIGHBOURS.  Worker A nests N deep while worker B, started right after it
+;;; (normally the next window block), is parked inside a HANDLER-CASE with a
+;;; special bound; then B signals an error its own HANDLER-CASE must catch.
+;;; A frame stored past A's window lands in B's block: before the AArch64
+;;; fix, N = 200 gave B a MEMORY-FAULT-ERROR and N = 400 killed the process.
+(defvar *go* 0)
+(defvar *b-ready* 0)
+(defvar *nb-ran* 0)
+(defun spin-until (sym) (loop (when (eql (symbol-value sym) 1) (return)) (sleep 0.001)))
+(defun nest-nb (n lim)
+  (unwind-protect (if (< n lim) (nest-nb (+ n 1) lim) (throw 'nb :done))
+    (setq *nb-ran* (+ *nb-ran* 1))))
+
+(format t "~&-- neighbours~%")
+(dolist (lim '(100 200 400 1000 3000))
+  (setq *go* 0 *b-ready* 0)
+  (let* ((a (sb-thread:make-thread
+             (lambda ()
+               (handler-case
+                   (let ((*nb-ran* 0))
+                     (spin-until '*b-ready*)
+                     (let ((v (catch 'nb (nest-nb 0 lim))))
+                       (setq *go* 1)
+                       (list v *nb-ran*)))
+                 (error (e) (setq *go* 1) (list :a-died (princ-to-string e)))))))
+         (b (sb-thread:make-thread
+             (lambda ()
+               (handler-case
+                   (let ((*sp* :b))
+                     (handler-case
+                         (progn (setq *b-ready* 1)
+                                (spin-until '*go*)
+                                (error "b's own error"))
+                       (error () (list :b-caught *sp* (multiple-value-list (values 1 2 3))))))
+                 (error (e) (list :b-died (princ-to-string e))))))))
+    (chk (format nil "neighbours ~D: A ran every cleanup" lim)
+         (sb-thread:join-thread a) (list :done (+ lim 1)))
+    (chk (format nil "neighbours ~D: B's own handler caught its error" lim)
+         (sb-thread:join-thread b) '(:b-caught :b (1 2 3)))))
 
 (format t "~&~D checks, ~D failed~%" *checks* *fail*)
 (format t "~A~%" (if (= *fail* 0) "DEEP-UNWIND: PASS" "DEEP-UNWIND: FAIL"))

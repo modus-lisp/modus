@@ -3159,8 +3159,8 @@
                                    (symbol-value (find-symbol "*MAC68K-LAYOUTS*" "MODUS.MVM"))))
                        :io-buf)
                  (+ (symbol-value (find-symbol "+MAC68K-SCRATCH+" "MODUS.MVM")) #x40000))))
-    (dolist (pair (list (cons "#x0FE00000" (format nil "#x~X" scr))
-                        (cons "#x0FF00000" (format nil "#x~X" iob))))
+    (dolist (pair (list (cons "#x0FE00000" (format nil "#x~8,'0X" scr))
+                        (cons "#x0FF00000" (format nil "#x~8,'0X" iob))))
       (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
         (unless at (error "mac68k: ~A moved out of *CLI-ARCH-IO-SCRATCH-SOURCE*" (car pair)))
         (setq *cli-arch-io-scratch-source*
@@ -3320,7 +3320,14 @@
       (defvar cl-user::*cli-arch-late-source*   ; build-cli-common's (in CL-USER)
         (swap (swap (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
                     "(defun %t68-fixed-area ()" (format nil "~%  nil)")
-                    (format nil "~%  (cons #x~X #x~X))" lo hi))
+                    ;; the loader's words (+MAC68K-HEAP-SLOT+ +8/+12: an
+                    ;; application's area from its partition), else the
+                    ;; layout's.  Fixed-width hex: the relocating pair's two
+                    ;; builds must spell every address in as many characters.
+                    (format nil "~%  (let ((lo (+ (* (mem-ref #x10006060 :u16) 65536) (mem-ref #x10006062 :u16))))~
+                                 ~%    (if (zerop lo) (cons #x~8,'0X #x~8,'0X)~
+                                 ~%        (cons lo (+ (* (mem-ref #x10006064 :u16) 65536) (mem-ref #x10006066 :u16))))))"
+                            lo hi))
               "(defun %t68-allowed-p ()" (format nil "~%  t)")
               (format nil "~%  (%core-requested-p))"))
               ;; big modules stay interpreted (see its docstring)

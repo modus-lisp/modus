@@ -40,7 +40,7 @@ REPO = os.path.dirname(HERE)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
-    'quadra':    (0x00600000, 0x00E80000, 0x00F00000, 0x01140000, 0x20000),   # JIT area, cache, stack, NIL's page between
+    'quadra':    (0x00600000, 0x00E80000, 0x00F00000, 0x00F90000, 0x20000),   # cache, stack, NIL's page between
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
@@ -54,7 +54,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION = LOAD + SHIFT, STATIC_LO + SHIFT, STATIC_HI 
 CHAIN_MEMTOP = {'classicos': 0x00400000, 'quadra': 0x02000000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 # the layout's kind map when its young heap is last in the map (boot-mac68k
 # :QUADRA): the application's loader then sizes the heap from its partition
-KMAP = {'quadra': 0x01570000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
+KMAP = {'quadra': 0x013C0000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 KMAP = KMAP and KMAP + SHIFT
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk

@@ -711,7 +711,18 @@
   (when (not (and (boundp (quote *t68-table*)) *t68-table*))
     (handler-case (%t68-init)
       (error (c) (setq *t68-off* t *t68-why* (list :init (princ-to-string c))))))
+  (%t68-area-sync)
   (and (boundp (quote *t68-table*)) *t68-table* t))
+
+(defun %t68-area-sync ()
+  "Take the code area %T68-FIXED-AREA names now, if it is not the one in use.
+   %T68-INIT runs in the Mac's core run and the core keeps its area; an
+   application's loader then picks the area from the partition at each launch
+   (scripts/mac68k-chain.s HSIZE), so the first translation after a launch
+   moves to it.  Hosted Linux (no fixed area) does nothing."
+  (let ((f (%t68-fixed-area)))
+    (when (and f (not (eql (cdr f) *t68-end*)))
+      (setq *t68-ptr* (car f) *t68-end* (cdr f)))))
 
 (defun %jit-eager-all (&optional name)
   "COMPILE's seam (cl-eval %COMPILE-IMPL; mvm-eval's is the x64 JIT's): (compile

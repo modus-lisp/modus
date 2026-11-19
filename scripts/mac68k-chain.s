@@ -37,12 +37,18 @@
         .equ    HHALF, -1196                | the heap from the partition: a semispace,
         .equ    HKMAP, -1200                |   the kind map past the two,
         .equ    HEXTRA, -1204               |   and how far that moved it (x7/8 sites)
+        .equ    HJLO, -1208                 | the JIT's code area from the partition:
+        .equ    HJHI, -1212                 |   [HJLO, HJHI), above the kind map
+        .equ    JITMIN, 0x40000             | 256 KB
+        .equ    JITMAX, 0x400000            | 4 MB
         .equ    GUARD, 0x10000              | boot-mac68k :GC-GUARD
         .equ    LOWBLK, 0x20000             | the low block (the layout's :ALLOC-START)
-start:  link    %a6, #-1204
+start:  link    %a6, #-1212
         clr.l   HHALF(%a6)
         clr.l   HKMAP(%a6)
         clr.l   HEXTRA(%a6)
+        clr.l   HJLO(%a6)
+        clr.l   HJHI(%a6)
         pea     -4(%a5)
         .word   0xA86E                  | _InitGraf
         .word   0xA8FE                  | _InitFonts
@@ -229,6 +235,8 @@ start:  link    %a6, #-1204
         move.l  %d0, (%a3)              | REFSLOT = the open file
         move.l  HHALF(%a6), 8(%a3)      | boot-mac68k +MAC68K-HEAP-SLOT+: the
         move.l  HKMAP(%a6), 12(%a3)     |   heap, or 0 for the layout's own
+        move.l  HJLO(%a6), 16(%a3)      | +16 / +20: the JIT's code area, or 0
+        move.l  HJHI(%a6), 20(%a3)      |   (jit-68k %T68-FIXED-AREA)
         tst.l   BASE(%a6)
         beq     7f
 | an application: the host table in the slot after REFSLOT (translate-68k
@@ -323,7 +331,9 @@ splash: movem.l %d3-%d6/%a3-%a4, -(%sp)
 | first semispace starts) up to 128 KB below the stack go two semispaces,
 | GUARD, then the kind map -- a byte per 8 bytes of [region, guard's end),
 | 64 KB-aligned, since its move is added to the high words of the x7/8
-| sites.  So a semispace is 4/9 of what is left, in 64 KB units.  HHALF,
+| sites.  First the JIT's code area comes off the top: an eighth of the
+| room, 256 KB to 4 MB (HJLO, HJHI).  So a semispace is 4/9 of what is left
+| after that, in 64 KB units.  HHALF,
 | HKMAP, HEXTRA; NE when the partition leaves less than 512 KB a semispace.
 hsize:  tst.l   44(%a2)
         beq     9f
@@ -331,6 +341,21 @@ hsize:  tst.l   44(%a2)
         add.l   8(%a2), %d1             | F
         move.l  0x908, %d2              | CurStackBase
         sub.l   #0x20000, %d2
+        and.l   #0xFFFF0000, %d2        | TOP
+        move.l  %d2, %d0
+        sub.l   %d1, %d0                | the room
+        bmi     8f
+        lsr.l   #3, %d0                 | the JIT's code area: an eighth of it,
+        and.l   #0xFFFF0000, %d0        |   in 64 KB, from 256 KB to 4 MB, at TOP
+        cmp.l   #JITMIN, %d0
+        bhs     1f
+        move.l  #JITMIN, %d0
+1:      cmp.l   #JITMAX, %d0
+        bls     2f
+        move.l  #JITMAX, %d0
+2:      move.l  %d2, HJHI(%a6)
+        sub.l   %d0, %d2
+        move.l  %d2, HJLO(%a6)
         sub.l   %d1, %d2
         sub.l   #GUARD + 0x10000 + LOWBLK / 8, %d2
         bmi     8f

@@ -149,8 +149,10 @@
     ;; shift carries #xF00000 to #x1000000, and the image's source text spells
     ;; layout addresses in hex, so the pool grew a word and every address after
     ;; it moved -- differences the relocation table cannot describe.
-    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): D30000.  Its
-    ;; minimum partition is SPAN + 1.5 MB = 15,040 KB.  The loader
+    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): BC0000 (D30000
+    ;; while the JIT area was in the map).  Its minimum partition is SPAN +
+    ;; 1.5 MB = 13,568 KB (was 15,040 KB), measured on MAME's Quadra 950:
+    ;; every benchmark form at native speed there and at 20 MB.  The loader
     ;; (mac68k-chain.s HSIZE) gives the young heap 4/9 of the room past the low
     ;; block, after aligning the image's base to 512 KB inside the partition --
     ;; so what one partition size leaves varies with where the Process Manager
@@ -161,17 +163,24 @@
     ;; 1 MB shorter, some runs passed every benchmark form and some quit with
     ;; error type 3 at the first DEFUN -- the same image both ways, so the
     ;; placement (semispaces short of 512 KB, inferred, not read) decides.
+    ;; THE JIT'S CODE AREA IS THE PARTITION'S (2026-11-19), not the map's: the
+    ;; loader takes an eighth of the room past the low block, 256 KB to 4 MB,
+    ;; off the top (mac68k-chain.s HSIZE), and leaves it in the low block
+    ;; (+MAC68K-HEAP-SLOT+ +8/+12) for jit-68k's %T68-FIXED-AREA.  The fixed
+    ;; 1.8 MB it was is gone from the map and from the boot read; :JIT-AREA
+    ;; below is what a DISK boot (the core run) uses, past the kind bytes.
+    ;; Between :STATIC-HI and :CACHE-LO, 128 KB for the boot tail's end.
     (:quadra  :load #x00600000 :static-lo #x00E80000 :static-hi #x00F00000
-              :jit-area-lo #x00F00000 :jit-area-hi #x010D0000 :jit-max-bytecode 16384
-              :cache-lo #x010D0000 :cache-hi #x010F0000
-              :staging #x010F0000 :staging-size #x00000000
-              :stack-top #x01120000 :scratch #x01120000 :io-buf #x01121000
-              :nil-page #x01130000
-              :region #x01140000 :heap-size #x00100000 :gc-guard #x00010000
-              :kind-map #x01570000
-              :boot-heap #x01160000 :boot-heap-size #x00400000
-              :boot-cache-lo #x010D0000 :boot-cache-hi #x010F0000
-              :boot-stack-top #x01120000)
+              :jit-area-lo #x01450000 :jit-area-hi #x01550000 :jit-max-bytecode 16384
+              :cache-lo #x00F20000 :cache-hi #x00F40000
+              :staging #x00F40000 :staging-size #x00000000
+              :stack-top #x00F70000 :scratch #x00F70000 :io-buf #x00F71000
+              :nil-page #x00F80000
+              :region #x00F90000 :heap-size #x00100000 :gc-guard #x00010000
+              :kind-map #x013C0000
+              :boot-heap #x00FB0000 :boot-heap-size #x00400000
+              :boot-cache-lo #x00F20000 :boot-cache-hi #x00F40000
+              :boot-stack-top #x00F70000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
     ;; the 4 MB map; the static heap from the image's init-only text
@@ -325,7 +334,7 @@
 (defun mac68k-coinit-text ()
   "Source text the image runs first in KERNEL-MAIN: the same region delta for
    the compiler the image carries, which compiles every REPL form."
-  (format nil "  (setq *conv-relative* t)~%  (setq *conv-delta* ~D)~%"
+  (format nil "  (setq *conv-relative* t)~%  (setq *conv-delta* ~12D)~%"
           (- +mac68k-region+ +conv-region-base+)))
 
 (defun emit-mac68k-zero (buf start bytes)

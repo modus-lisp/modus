@@ -1353,6 +1353,12 @@
                               (ash +ea-mode-an-ind+ 3)
                               (logand an 7))))
 
+(defvar *68k-hpush-label* nil
+  "(Defined before TRANSLATE-MVM-TO-68K-1, which binds it.)  While translating the image (*68K-CALL-ISLANDS*): the shared handler push
+   SETJMP calls.  NIL: inline, as the native REPL tier emits it.")
+(defvar *68k-hpop-label* nil "... the shared handler pop (CLEAR-HANDLER).")
+(defvar *68k-longjmp-label* nil "... the shared LONGJMP.")
+
 (defvar *68k-call-islands* nil
   "When T (the Quadra map), the image's native code carries CALL ISLANDS: at a
    function boundary every ~24 KB of bytecode, a JMP abs.L stub to each of the
@@ -1875,7 +1881,9 @@
             ;; +op-fn-addr+ uses.
             (let ((skip (mvm-make-label))
                   (resume (mvm-make-label)))
-              (m68k-emit-handler-push buf)
+              (if *68k-hpush-label*
+                  (m68k-emit-bsr buf *68k-hpush-label*)  ; the shared push
+                  (m68k-emit-handler-push buf))
               (m68k-emit-tst buf +68k-d0+)
               (m68k-emit-bne buf skip)
               (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
@@ -1891,37 +1899,16 @@
               (m68k-emit-label buf skip)
               (m68k-emit-move-an-dn buf +68k-a4+ +68k-d2+)      ; first return: NIL
               (m68k-emit-label buf resume)))
+           ((and (= code #x0511) *68k-longjmp-label*)
+            ;; LONGJMP, shared: it depends on nothing at the site
+            (m68k-emit-bra buf *68k-longjmp-label*))
            ((= code #x0511)
-            ;; LONGJMP.  Copy the jmpbuf aside first, zero the live capped count,
-            ;; pop, then restore and JMP with D2 = T.  Nothing armed (word 0 = 0):
-            ;; ILLEGAL rather than a jump to address zero.
-            (let ((nohandler (mvm-make-label)))
-              (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
-              (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
-              (m68k-emit-tst buf +68k-d0+)
-              (m68k-emit-beq buf nohandler)
-              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
-              (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
-              (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
-              (m68k-emit-move-imm-dn buf 0 +68k-d0+)
-              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
-              (m68k-emit-handler-pop buf)
-              (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
-              (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
-                    for i from 3
-                    do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
-              (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
-              (when *68k-threaded*
-                (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
-              (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
-              (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
-              (m68k-emit-move-imm-dn buf +t-value+ +68k-d2+)  ; second return: T
-              (m68k-emit-jmp-an-ind buf +68k-a0+)
-              (m68k-emit-label buf nohandler)
-              (m68k-emit-illegal buf)))
+            (m68k-emit-longjmp-body buf))
            ((= code #x0512)
             ;; CLEAR-HANDLER: pop one frame; D2 (the result) untouched.
-            (m68k-emit-handler-pop buf))
+            (if *68k-hpop-label*
+                (m68k-emit-bsr buf *68k-hpop-label*)
+                (m68k-emit-handler-pop buf)))
            ((= code #x0530)
             ;; COPY-OVERFLOW-ARGS: the &rest/&key prologue's RUNTIME copy of
             ;; arguments 4.. into frame slots 4.., as translate-x64/i386/riscv
@@ -5242,6 +5229,9 @@
          (*68k-car-label* (and (m68k-shared-p :car) (mvm-make-label)))
          (*68k-barrier-label* (and *68k-gc-static* (m68k-hosted-layout-p) (mvm-make-label)))
          (*68k-barrier-a0-label* (and *68k-barrier-label* (mvm-make-label)))
+         (*68k-hpush-label* (and *68k-call-islands* (mvm-make-label)))
+         (*68k-hpop-label* (and *68k-call-islands* (mvm-make-label)))
+         (*68k-longjmp-label* (and *68k-call-islands* (mvm-make-label)))
          (*68k-cdr-label* (and (m68k-shared-p :car) (mvm-make-label)))
          (*68k-array-len-label* (and (m68k-shared-p :array-len) (mvm-make-label)))
          (*68k-alloc-obj-label* (and (m68k-shared-p :alloc-obj) (mvm-make-label)))
@@ -5446,6 +5436,8 @@
       (m68k-emit-mac-service buf))
     (when *68k-cons-label*
       (m68k-emit-cons-helper buf))
+    (when *68k-hpush-label*
+      (m68k-emit-handler-helpers buf))
     (when *68k-subtag-label*
       (m68k-emit-subtag-helper buf))
     (when *68k-car-label*
@@ -7002,6 +6994,47 @@
   (m68k-emit-lea-disp buf +68k-a2+ 32 +68k-a2+))
 
 ;;; ============================================================
+(defun m68k-emit-longjmp-body (buf)
+  "LONGJMP.  Copy the jmpbuf aside first, zero the live capped count, pop, then
+   restore and JMP with D2 = T.  Nothing armed (word 0 = 0): ILLEGAL rather
+   than a jump to address zero."
+  (let ((nohandler (mvm-make-label)))
+    (m68k-emit-move-imm-an buf (m68k-jmpbuf-addr) +68k-a1+)
+    (m68k-emit-move-disp-dn buf +68k-a1+ 0 +68k-d0+)
+    (m68k-emit-tst buf +68k-d0+)
+    (m68k-emit-beq buf nohandler)
+    (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a0+)
+    (m68k-emit-copy-words buf +68k-a1+ +68k-a0+)
+    (m68k-emit-move-imm-an buf (m68k-hcapped-addr) +68k-a1+)
+    (m68k-emit-move-imm-dn buf 0 +68k-d0+)
+    (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a1+ 0)
+    (m68k-emit-handler-pop buf)
+    (m68k-emit-move-imm-an buf (m68k-lj-scratch-addr) +68k-a1+)
+    (loop for d in (list +68k-d4+ +68k-d5+ +68k-d6+ +68k-d7+)
+          for i from 3
+          do (m68k-emit-move-disp-dn buf +68k-a1+ (* 4 i) d))
+    (m68k-emit-move-disp-an buf +68k-a1+ 8 +68k-a0+)  ; resume
+    (when *68k-threaded*
+      (m68k-emit-move-disp-an buf +68k-a1+ 28 +68k-a5+))
+    (m68k-emit-move-disp-an buf +68k-a1+ 4 +68k-a6+)
+    (m68k-emit-move-disp-an buf +68k-a1+ 0 +68k-a7+)
+    (m68k-emit-move-imm-dn buf +t-value+ +68k-d2+)  ; second return: T
+    (m68k-emit-jmp-an-ind buf +68k-a0+)
+    (m68k-emit-label buf nohandler)
+    (m68k-emit-illegal buf)))
+
+(defun m68k-emit-handler-helpers (buf)
+  "The shared handler push / pop (each + RTS) and LONGJMP: ~170-310 bytes of
+   68k inline at each of ~1,100 handler-case sites before."
+  (m68k-emit-label buf *68k-hpush-label*)
+  (m68k-emit-handler-push buf)
+  (m68k-emit-rts buf)
+  (m68k-emit-label buf *68k-hpop-label*)
+  (m68k-emit-handler-pop buf)
+  (m68k-emit-rts buf)
+  (m68k-emit-label buf *68k-longjmp-label*)
+  (m68k-emit-longjmp-body buf))
+
 ;;; handler-case: SETJMP (#x0510) / LONGJMP (#x0511) / CLEAR-HANDLER (#x0512)
 ;;; ============================================================
 ;;;

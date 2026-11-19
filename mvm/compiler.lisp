@@ -419,6 +419,69 @@
    stores (its block - +TLS-WINDOW-BASE+) here when it installs that same value
    as its segment base.")
 
+;;; LOOP BACK-EDGES THAT CAN PARK (stop-the-world, hosted x86-64).
+;;; A region-0 collection stops every other thread, and a thread stops only at
+;;; an ALLOCATION: the runtime holds raw object words (REG-GET's %VAL->WORD,
+;;; UNTAG, MEM-REF of a computed address) between allocations, invisible to a
+;;; root scan, so a back-edge only POLLS -- it clamps the allocation limit so
+;;; the next allocation parks.  A loop that never allocates therefore held a
+;;; region-0 collection up for as long as it ran, and a worker spinning on
+;;; (loop (when *flag* (return)) ...) while main waited on that collection to
+;;; set *flag* hung the process.
+;;;
+;;; A function that touches no raw word can be stopped at its back-edges just
+;;; as safely as at an allocation: every live value it holds is a tagged
+;;; object in a register or a frame slot, which the park pushes and the
+;;; collector forwards.  So each raw primitive drops a :RAW-MARK into the
+;;; function's IR (%NOTE-RAW-WORDS), and a function that finishes with none
+;;; has its :YIELDs turned into :SAFEPOINTs (%IR-SAFEPOINTS), which the
+;;; back-end makes `poll, and when a collection is waiting, park here'.
+;;; The marker is in the IR, not a special, because the in-image compiler has
+;;; been seen to not isolate per-function specials (GET-IR-INSTRUCTIONS).
+(defparameter *park-safepoints* nil
+  "Turn the :YIELDs of a function with no raw words into :SAFEPOINTs.  Set by
+   the hosted x86-64 JIT co-init (build-cli-common), whose translator implements
+   :SAFEPOINT; NIL everywhere else, so no other back-end ever sees the opcode.
+   The image's own AOT code is compiled with it OFF: runtime code holds raw
+   words across calls to non-allocating helpers, which a parking back-edge in
+   the helper would invalidate.  User code (the JIT) is where unbounded
+   non-allocating loops live.")
+
+(defun %note-raw-words ()
+  "This function computes or holds a raw (untagged) machine word: its loops
+   must not park (see *PARK-SAFEPOINTS*)."
+  (emit-ir :raw-mark))
+
+(defun %absolute-addr-form-p (form)
+  "True when FORM is an address the collector cannot move: a literal integer,
+   a constant, or a literal base of at least #x10000000 (the low block, the
+   per-thread window) plus an offset -- the MV-buffer expansions' shape."
+  (or (integerp form)
+      (and (symbolp form) form (constantp form))
+      (and (consp form) (symbolp (car form)) (string= (symbol-name (car form)) "+")
+           (or (and (integerp (cadr form)) (>= (cadr form) #x10000000))
+               (and (cadr form) (symbolp (cadr form)) (constantp (cadr form)))))))
+
+(defun %ir-safepoints (ir)
+  "IR with its :RAW-MARKs removed and, when *PARK-SAFEPOINTS* is on and there
+   were none, every :YIELD a :SAFEPOINT."
+  (let ((raw nil) (yields nil))
+    (dolist (insn ir)
+      (case (car insn)
+        (:raw-mark (setq raw t))
+        (:yield (setq yields t))))
+    ;; *TLS-WINDOW* too: only the hosted x86-64 image has it on, and a DDC
+    ;; rebuild of another target from that image resets it.
+    (if (or raw (and yields *park-safepoints* *tls-window*))
+        (let ((park (and *park-safepoints* *tls-window* (not raw))) (out nil))
+          (dolist (insn ir)
+            (case (car insn)
+              (:raw-mark nil)
+              (:yield (push (if park (list :safepoint) insn) out))
+              (t (push insn out))))
+          (nreverse out))
+        ir)))
+
 (defparameter *tls-window* nil
   "Emit LOAD/STORE of per-thread-window slots with the thread-local width bit.
    NIL — every image that has not opted in — emits the historic width, so the
@@ -26419,6 +26482,7 @@
   ;; MULTIPLY promotion is a separate, still-open gap.  Depending on it here
   ;; would have made mem-ref inherit a defect it does not need: SHA-256 uses
   ;; no wide multiply, and neither does this.
+  (unless (%absolute-addr-form-p addr-form) (%note-raw-words))
   (let* ((wt0 (memory-width-code type-form))
          (w0 (car wt0)))
     ;; THE SPLIT IS NOT OPTIONAL ON A BIG-ENDIAN TARGET, ONLY ITS OFFSETS
@@ -26473,6 +26537,7 @@
     ((and (consp place) (name-eq (car place) "MEM-REF"))
      (let ((addr-form (cadr place))
            (type-form (caddr place)))
+       (unless (%absolute-addr-form-p addr-form) (%note-raw-words))
        (let* ((wt2 (memory-width-code type-form))
               (width (car wt2))
               (needs-untag (cdr wt2)))
@@ -26577,6 +26642,7 @@
 
 (defun compile-get-alloc-ptr (dest)
   "Compile (get-alloc-ptr) - return VA tagged as fixnum"
+  (%note-raw-words)
   (emit-ir :mov dest +vreg-va+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
@@ -26584,16 +26650,19 @@
   "Compile (%frame-pointer) - this function's frame pointer (VFP: RBP on x86-64), as a
    fixnum whose value is the address.  A backtrace walks the saved-frame-pointer chain
    from here: [FP] is the caller's FP, [FP+8] the return address into it."
+  (%note-raw-words)
   (emit-ir :mov dest +vreg-vfp+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
 (defun compile-get-alloc-limit (dest)
   "Compile (get-alloc-limit) - return VL tagged as fixnum"
+  (%note-raw-words)
   (emit-ir :mov dest +vreg-vl+)
   (emit-ir :shl dest dest +fixnum-shift+))
 
 (defun compile-set-alloc-ptr (form env dest)
   "Compile (set-alloc-ptr value) - set VA from tagged fixnum"
+  (%note-raw-words)
   (compile-form form env dest)
   (emit-ir :shr dest dest +fixnum-shift+)
   (emit-ir :mov +vreg-va+ dest))
@@ -26606,6 +26675,7 @@
 
 (defun compile-untag (form env dest)
   "Compile (untag value) - remove fixnum tag (logical shift, unsigned)"
+  (%note-raw-words)
   (compile-form form env dest)
   (emit-ir :shr dest dest +fixnum-shift+))
 
@@ -26617,6 +26687,7 @@
   "Compile (save-context addr) - save registers to actor struct.
    Returns 0 on initial save, 1 when resumed via restore-context.
    Untags the address before passing to save-ctx."
+  (%note-raw-words)
   (compile-form addr-form env dest)
   ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
   ;; Must use SHR (not SAR) for 32-bit targets where high addresses set sign bit
@@ -26631,6 +26702,7 @@
   "Compile (restore-context addr) - restore registers from actor struct.
    This never returns to the caller.
    Untags the address before passing to restore-ctx."
+  (%note-raw-words)
   (compile-form addr-form env dest)
   ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
   ;; Must use SHR (not SAR) for 32-bit targets where high addresses set sign bit
@@ -26642,6 +26714,7 @@
 (defun compile-call-native (args env dest)
   "Compile (call-native addr arg1 arg2) - call native code at address.
    Address is a tagged fixnum. Up to 2 arguments supported."
+  (%note-raw-words)
   (let ((addr-form (first args))
         (arg-forms (rest args)))
     ;; Compile address
@@ -26666,6 +26739,7 @@
 (defun compile-fn-addr (name dest)
   "Compile (fn-addr name) - load tagged native function address.
    Resolves function name at link time via FN-ADDR opcode."
+  (%note-raw-words)
   (let ((fn-name (if (symbolp name) (symbol-name name) (string name))))
     (emit-ir :fn-addr dest fn-name)))
 
@@ -26676,6 +26750,7 @@
 (defun compile-xchg-mem (addr-form val-form env dest)
   "Compile (xchg-mem addr val) - atomic exchange.
    Both addr and val are tagged fixnums."
+  (unless (%absolute-addr-form-p addr-form) (%note-raw-words))
   (let ((addr-reg (alloc-temp-reg))
         (val-reg (alloc-temp-reg)))
     (compile-form addr-form env addr-reg)
@@ -26719,6 +26794,7 @@
   "Compile (make-sap-raw raw-u64) — allocate SAP wrapping a raw u64 address.
    raw-u64 is already untagged (e.g., from mem-ref :u64 or syscall result).
    Stored directly without untagging."
+  (%note-raw-words)
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :sap-new dest +vreg-v0+))
 
@@ -26743,6 +26819,7 @@
 
 (defun compile-sap-addr (args env dest)
   "Compile (sap-address sap) — extract raw address from SAP."
+  (%note-raw-words)
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :sap-addr dest +vreg-v0+))
 
@@ -26750,6 +26827,7 @@
   "Compile (%val->word v) — reinterpret value V's native word as an integer.
    V occupies native word W; the integer of magnitude W has native form W<<1.
    So SHL by 1.  No type guard: works for fixnum/cons/object alike."
+  (%note-raw-words)
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :shl dest +vreg-v0+ +fixnum-shift+))
 
@@ -28415,6 +28493,7 @@
     (when own (free-temp-reg))))
 
 (defun compile-word-aref (arr-form idx-form env dest)
+  (%note-raw-words)
   (if (%obj-slot-imm-p idx-form)
       (let ((arr-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
@@ -28455,6 +28534,7 @@
     (free-temp-reg)))
 
 (defun compile-word-aset (arr-form idx-form val-form env dest)
+  (%note-raw-words)
   ;; Value first when ARR and IDX are lexical leaves — see compile-u8-set.
   (when (%store-value-first-ok-p arr-form idx-form val-form env dest)
     (return-from compile-word-aset
@@ -31217,7 +31297,7 @@
     (flush-deferred-tails)
 
     ;; Build function-info
-    (let ((ir (thread-jumps (get-ir-instructions))))
+    (let ((ir (thread-jumps (%ir-safepoints (get-ir-instructions)))))
       ;; Store the IR on the function-info for later bytecode emission
       (let* ((bare-name (if (symbolp name) (%rt-fn-name name) (string name)))
              (info (make-function-info
@@ -31271,6 +31351,8 @@
       ;; 1 opcode + 1 reg + 1 kind byte.  Same warning as :gc-check-n above.
       (:gc-check-r 3)
       (:yield 1)
+      (:safepoint 1)
+      (:raw-mark 0)
       (:set-mv-count 2)
 
       ;; 1-reg instructions: 1 opcode + 1 reg = 2 bytes
@@ -31572,6 +31654,9 @@
            (mvm-mcgc-collect buf))
           (:yield
            (mvm-yield buf))
+          (:safepoint
+           (mvm-safepoint buf))
+          (:raw-mark nil)
           (:set-mv-count
            (mvm-set-mv-count buf (second insn)))
           (:frame-leave

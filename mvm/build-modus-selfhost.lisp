@@ -1583,6 +1583,7 @@
   (setq *use-jit* nil)
   (setq *jit-linkage-cells* nil)
   (setq *tls-window* nil)
+  (setq *park-safepoints* nil)
   (setq *x64-tls-window* nil)
   (setq *x64-jit-constvec-p* nil)
   (setq *x64-jit-constvec-full-p* nil)

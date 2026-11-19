@@ -575,6 +575,12 @@
   ;; as the image's does.
   (setq *x64-sched-lock-addr* 268439488)
   (setq *tls-window* t)
+  ;; LOOP BACK-EDGES THAT CAN PARK (compiler.lisp *PARK-SAFEPOINTS*): a JIT'd
+  ;; function holding no raw word stops for a region-0 collection at its loop
+  ;; back-edges, not only at an allocation -- or a worker spinning in a loop
+  ;; that never allocates holds every collection up (and the process hangs).
+  ;; The image's own AOT code keeps the poll-only YIELD.
+  (setq *park-safepoints* t)
   ;; THE ACTIVE REGION IS PER-THREAD (build-generic-cli.lisp, NATIVE THREADS
   ;; STEP 3), and a JIT page carries its own copy of the collector.  Left at
   ;; its NIL default here, that copy read the single region word -- region 0's
@@ -629,6 +635,7 @@
   (setq *x64-gc-region-percpu* nil)
   (setq *x64-sched-lock-addr* nil)
   (setq *x64-stw* nil)
+  (setq *park-safepoints* nil)
 "
        "")
    "  t)

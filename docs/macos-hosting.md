@@ -981,8 +981,19 @@ set.
   and futex waits.  A thread blocked there counts as stopped, since its
   published stack is all it holds.  Leaving while a collection runs, it goes
   back to SAFE and waits for the flag to clear.
-- **The cost.**  A loop that never allocates and never blocks holds up a
-  region-0 collection until it does one or the other.
+- **The cost, and where it no longer applies.**  A loop that never allocates
+  and never blocks held up a region-0 collection until it did one or the
+  other; a worker spinning on `(loop (when *flag* (return)) ...)` while main
+  waited on that collection to set `*flag*` hung the process.  On x86-64 a
+  JIT-compiled function that holds no raw word now parks at its back-edges
+  too (`compiler.lisp` `*PARK-SAFEPOINTS*`): every raw primitive (`UNTAG`,
+  `%VAL->WORD`, `MEM-REF` of a computed address, ...) drops a `:RAW-MARK`
+  in the function's IR, and a function with none gets `:SAFEPOINT` instead
+  of `YIELD`.  Its poll is the same compare; with the flag held it calls a
+  per-unit stub that clamps R14 and runs a gc-check of nothing, so the
+  trampoline parks it and returns.  The image's AOT code, the MVM
+  interpreter and anything with a raw primitive keep the poll-only YIELD,
+  and so does AArch64 (`test/stw-spinning-worker.lisp`).
 - **x86-64 differences.**  Region metadata is raw, not `<<1`.  The other
   threads' regions and the lock arena are walked with the Cheney scan's own
   flat walk (`EMIT-X64-FLAT-WALK`), not object by object, so they need no

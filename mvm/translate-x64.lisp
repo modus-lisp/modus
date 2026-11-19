@@ -1688,6 +1688,9 @@
   ;; (emit-park-stub).  YIELD polls and blocking syscalls call it while a
   ;; region-0 collection has the world stopped.  NIL everywhere else.
   (park-label nil)
+  ;; HOSTED THREADED IMAGE: this unit's :SAFEPOINT slow path
+  ;; (EMIT-X64-STW-SAFEPOINT-SUB).  NIL everywhere else.
+  (safepoint-label nil)
   ;; HOSTED THREADED IMAGE: this unit's SHARED-STORE GUARD subroutine.
   (ssg-label nil)
   ;; GENERATIONAL GC: this unit's card-barrier subroutines (mark one slot,
@@ -6207,6 +6210,25 @@
                (emit-call buf (translate-state-yield-longjmp-label state))
                (emit-label buf skip))))
 
+        ((op= +op-safepoint+)
+         ;; A YIELD in a function that holds no raw word (compiler.lisp,
+         ;; *PARK-SAFEPOINTS*): hosted with threads it polls like YIELD and,
+         ;; when a collection is waiting, PARKS HERE instead of at the next
+         ;; allocation, which a non-allocating loop never reaches.  Anywhere
+         ;; else it is exactly YIELD.
+         (if (translate-state-safepoint-label state)
+             (emit-x64-stw-safepoint buf (translate-state-safepoint-label state))
+             (if (or *x64-linux-mode*
+                     (null (translate-state-yield-longjmp-label state)))
+                 (emit-nop buf)
+                 (let ((skip (make-label)))
+                   (emit-bytes buf #x48 #x83 #x3C #x25)
+                   (emit-u32 buf #x10000D30)
+                   (emit-bytes buf #x00)
+                   (emit-jcc buf :e skip)
+                   (emit-call buf (translate-state-yield-longjmp-label state))
+                   (emit-label buf skip)))))
+
         ((op= +op-set-mv-count+)
          ;; Store tagged fixnum count to MV-COUNT address.
          ;; imm8 operand is the raw count (e.g., 1).
@@ -8879,6 +8901,47 @@
     (emit-pop buf 'rax)
     (emit-mov-reg-imm buf 'r14 0)
     (emit-label buf skip)))
+
+(defun emit-x64-stw-safepoint (buf sub)
+  "A :SAFEPOINT back-edge (compiler.lisp *PARK-SAFEPOINTS*: a function that
+   holds no raw word).  The poll is YIELD's, one compare of the stop flag and
+   a branch not taken; with the flag held it calls SUB, this unit's
+   EMIT-X64-STW-SAFEPOINT-SUB, which parks the thread HERE.  Without it a loop
+   that never allocates held every region-0 collection up for as long as it
+   ran: a worker spinning on (loop (when *flag* (return)) ...) while main
+   waited on that collection to set *flag* hung the process
+   (test/stw-spinning-worker.lisp)."
+  (let ((skip (make-label)))
+    (x64-stw-flag-test buf)
+    (emit-jcc buf :e skip)
+    (emit-call buf sub)
+    (emit-label buf skip)))
+
+(defun emit-x64-stw-safepoint-sub (buf label gc-lbl)
+  "The :SAFEPOINT slow path, one per unit.  Clamp R14 as YIELD's poll does
+   (EMIT-X64-STW-CLAMP: the real limit kept in the active region's
+   saved-limit), then a gc-check of nothing -- `cmp r12, r14 ; jl ; call
+   trampoline', the 14-byte shape the trampoline recognises
+   (EMIT-X64-STW-ENTRY).  The trampoline parks, puts the real limit back and
+   returns to the compare, which now passes, and this returns to the loop.
+   Nothing is allocated; nothing is collected unless the region really is full
+   (which the next allocation would do anyway).  Only RAX is used, and saved;
+   the trampoline saves the rest."
+  (let ((clamped (make-label)) (done (make-label)))
+    (emit-label buf label)
+    (emit-cmp-reg-imm buf 'r14 0)
+    (emit-jcc buf :e clamped)
+    (emit-push buf 'rax)
+    (emit-load-gc-region buf 'rax)
+    (emit-mov-mem-reg buf 'rax 'r14 modus.mvm::+gc-off-saved-limit+)
+    (emit-pop buf 'rax)
+    (emit-mov-reg-imm buf 'r14 0)
+    (emit-label buf clamped)
+    (emit-cmp-reg-reg buf 'r12 'r14)
+    (emit-jcc buf :l done)
+    (emit-call buf gc-lbl)
+    (emit-label buf done)
+    (emit-ret buf)))
 
 (defun emit-x64-gc-safe-trap (buf enter)
   "%GC-SAFE-ENTER (ENTER true) / %GC-SAFE-LEAVE.  Enter publishes SP and the
@@ -11831,6 +11894,9 @@
          ;; stays a NOP and the Linux image is byte-identical.
          (yield-longjmp-lbl (unless *x64-linux-mode* (make-label)))
          (park-lbl (when (x64-stw-p) (make-label)))
+         (safepoint-lbl (when (and *x64-linux-mode* *x64-stw*
+                                   (or page-gc-label gc-trampoline-label))
+                          (make-label)))
          (ssg-lbl (when (x64-ssg-p) (make-label)))
          (card-lbl (when (x64-gen-gc-p) (make-label)))
          (card-range-lbl (when (x64-gen-gc-p) (make-label)))
@@ -11894,6 +11960,7 @@
                               :handler-pop-label handler-pop-lbl
                               :yield-longjmp-label yield-longjmp-lbl
                               :park-label park-lbl
+                              :safepoint-label safepoint-lbl
                               :ssg-label ssg-lbl
                               :card-label (and card-lbl (not (x64-barrier-exempt-fn-p name))
                                                card-lbl)
@@ -12041,6 +12108,9 @@
       ;; HOSTED THREADED: the stop-the-world park stub (see emit-park-stub).
       (when park-lbl
         (emit-park-stub buf park-lbl))
+      (when safepoint-lbl
+        (emit-x64-stw-safepoint-sub buf safepoint-lbl
+                                    (or page-gc-label gc-trampoline-label)))
       (when ssg-lbl
         (emit-shared-store-guard-sub buf ssg-lbl))
       (when card-lbl

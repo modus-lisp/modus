@@ -2796,6 +2796,13 @@
                   ;; from their strings.  Missing those measured as an x64
                   ;; image whose kernel name tables stayed empty: the ANSI
                   ;; suite's own REGRESSION-TEST collided with the image's.
+                  ;; MODUS_SHAKE_KEEP=FILE: names (one a line) kept whatever reaches them
+                  (let ((f (sb-ext:posix-getenv "MODUS_SHAKE_KEEP")))
+                    (when (and f (plusp (length f)))
+                      (with-open-file (in f)
+                        (loop for l = (read-line in nil) while l
+                              do (let ((n (string-upcase (string-trim " " l))))
+                                   (when (plusp (length n)) (push n r)))))))
                   (dolist (f (append (directory (merge-pathnames "mvm/build-*.lisp" *modus-base*))
                                      (directory (merge-pathnames "boot/*.lisp" *modus-base*))))
                     (%shake-add-tokens (read-file-text f) h))

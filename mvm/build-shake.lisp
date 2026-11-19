@@ -70,11 +70,14 @@
                                         do (if (and (char= (char text k) #\\) (< (1+ k) (length text)))
                                                (progn (write-char (char text (1+ k)) o) (incf k 2))
                                                (progn (write-char (char text k) o) (incf k))))))))
+                 ;; a long string is tokenized whatever it starts with: generated
+                 ;; source (a kernel prologue) may open with a comment, and the
+                 ;; calls after it are as real.  Docstrings add their words too:
+                 ;; over-approximate, never wrong.
                  (cond ((<= (length text) 120)
                         (unless (find-if (lambda (ch) (member ch '(#\Space #\Newline #\Tab #\( #\)))) text)
                           (note text)))
-                       ((char= (char (string-left-trim '(#\Space #\Newline #\Tab) text) 0) #\()
-                        (%shake-add-tokens text table)))
+                       (t (%shake-add-tokens text table)))
                  ;; a short code string too: (FORMAT NIL "(defun ~A ..." ...)
                  (when (and (<= (length text) 120) (find #\( text))
                    (%shake-add-tokens text table)))

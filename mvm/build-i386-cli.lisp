@@ -300,6 +300,10 @@
 ;; is emitted as a separate section, so native code starts at offset 0.
 (setf modus.mvm.i386::*i386-fn-tag-3* t)
 (setf modus.mvm.i386::*i386-fn-align* 16)
+;; MODUS_I386_JIT=1: the native tier (mvm/jit-i386-native.lisp) -- the image
+;; carries the export table and the constant root it needs.
+(setf modus.mvm.i386::*i386-native-tier*
+      (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1"))
 (setf modus.mvm.i386::*i386-native-code-offset* 0)
 (setf modus.mvm.i386::*i386-checked-arith-slowpath*
       (let ((v (sb-ext:posix-getenv "MODUS_I386_NO_CHECKED")))

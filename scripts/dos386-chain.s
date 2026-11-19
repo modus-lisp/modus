@@ -193,8 +193,31 @@ found:
         jmp     memdone
 mem88:  mov     $0x88, %ah
         int     $0x15
-        jc      e_mem
+        jc      memcmos
+        test    %ax, %ax
+        jz      memcmos
         movzx   %ax, %eax
+        jmp     memdone
+# Neither: some BIOSes answer both with carry set (measured: 86Box's
+# 486vipio2, Award 4.50PG, under FreeDOS).  Every AT keeps the count POST
+# found in CMOS 30h/31h (KB above 1 MB, to 64 MB), the configured one in
+# 17h/18h.
+memcmos:
+        mov     $0x31, %al
+        call    cmosrd
+        mov     %al, %ah
+        mov     $0x30, %al
+        call    cmosrd
+        test    %ax, %ax
+        jnz     1f
+        mov     $0x18, %al
+        call    cmosrd
+        mov     %al, %ah
+        mov     $0x17, %al
+        call    cmosrd
+        test    %ax, %ax
+        jz      e_mem
+1:      movzx   %ax, %eax
 memdone:
         mov     %eax, mem_upper
         int     $0x12                   # conventional memory, KB
@@ -446,6 +469,12 @@ a20_test:
         xor     %ax, %ax                # ZF=1: on
         ret
 1:      or      $1, %ax                 # ZF=0: off
+        ret
+
+# cmosrd: AL = CMOS register -> AL = its value (AH kept)
+cmosrd: out     %al, $0x70
+        jmp     1f                      # a short delay between the ports
+1:      in      $0x71, %al
         ret
 
 skipsp: cmpb    $' ', (%si)

@@ -4505,6 +4505,15 @@
 (defun %mexp-memo-invalidate ()
   (setq *mexp-memo* nil) (setq *%not-macro* nil) (setq *%simple-ops* nil))
 
+(defun %mexp-memo-release ()
+  "The end of a compile: let go of the memo of expansions (it holds the
+   form's source) and of %SIMPLE-OP-P's.  NOT the not-a-macro set: no macro
+   table changed, and dropping it here made every EVAL search every
+   operator's expander again -- under the closure walk, %FORM-HAS-CLOSURE-P,
+   ~7% of compiling a DEFUN on the 68k.  Whatever does change a macro table
+   calls %MEXP-MEMO-INVALIDATE."
+  (setq *mexp-memo* nil) (setq *%simple-ops* nil))
+
 ;;; NOT A MACRO, remembered.  Under runtime EVAL every compound form is first
 ;;; tried as a macro call (COMPILE-FORM -> MACROEXPAND-MVM), and a call of a
 ;;; FUNCTION finds no expander only after the whole search: the compiler's
@@ -5025,7 +5034,10 @@
    Fast path (template already built): nothing to do, the current
    *macro-table* is an overlay on it (%MACRO-TABLE-REF)."
   (when *bootstrap-macro-template*
-    (%mexp-memo-invalidate)
+    ;; A fresh overlay drops the last compile's own macros, so its expansions
+    ;; go -- but not its not-a-macro set: no macro under template + the old
+    ;; overlay is none under the template alone (%MEXP-MEMO-RELEASE).
+    (%mexp-memo-release)
     (return-from register-mvm-bootstrap-macros nil))
   ;; COND → nested IF
   (mvm-define-macro "COND"
@@ -12614,8 +12626,11 @@
       (t (%form-has-closure-p-2 form)))))
 
 (defun %form-has-closure-p-2 (form)
+  ;; expand to the end at runtime, but ask a form that is no macro only once
+  ;; (it was asked twice: here and again at the top of the loop)
   (let ((mx (%cfv-macroexpand form)))
-    (when mx (setq form mx)))
+    (when mx (setq form mx))
+    (unless mx (return-from %form-has-closure-p-2 (%form-has-closure-p-3 form))))
   (when *mvm-eval-runtime-p*
     (let ((steps 0))
       (loop
@@ -12624,6 +12639,10 @@
           (if mx
               (progn (setq form mx) (setq steps (+ steps 1)))
               (return nil))))))
+  (%form-has-closure-p-3 form))
+
+(defun %form-has-closure-p-3 (form)
+  "FORM, expanded, as %FORM-HAS-CLOSURE-P-2 answers for it."
   (let ((lf (%defun-as-lambda form)))
     (when lf (setq form lf)))
   (if (not (consp form))

@@ -466,8 +466,10 @@
         (let ((mkey (%macro-sym-key sym)))
           (when mkey
             (%macro-pkg-rem sym mkey)
-            (%mexp-memo-invalidate)
-            (remhash mkey *macro-function-table*))))))
+            ;; only when there was a macro to forget (%MACRO-PKG-REM-1)
+            (when (gethash mkey *macro-function-table*)
+              (%mexp-memo-invalidate)
+              (remhash mkey *macro-function-table*)))))))
   sym)
 
 (defun fdefinition (sym)
@@ -785,14 +787,19 @@
     r))
 
 (defun %macro-pkg-rem-1 (sym key)
-  (%mexp-memo-invalidate)
-  (let ((pn (%macro-sym-pkg-name sym)))
+  "T when there was an expander to drop.  The expansion memos are dropped only
+   then: FMAKUNBOUND runs at every runtime DEFUN, and dropping the not-a-macro
+   set each time made every EVAL search every operator's expander again."
+  (let ((pn (%macro-sym-pkg-name sym)) (removed nil))
     (when (and pn *macro-pkg-table* (stringp key))
       (let ((al (gethash key *macro-pkg-table*))
             (new nil))
         (dolist (e al)
-          (unless (string= (car e) pn) (setq new (cons e new))))
-        (puthash key *macro-pkg-table* new)))))
+          (if (string= (car e) pn) (setq removed t) (setq new (cons e new))))
+        (when removed
+          (%mexp-memo-invalidate)
+          (puthash key *macro-pkg-table* new))))
+    removed))
 
 ;;; CLHS §3.1.2.1.2.2: a macro function takes 2 args (form, environment).
 ;;; Modus expanders use 1-arg `(lambda (form) ...)` internally, so the

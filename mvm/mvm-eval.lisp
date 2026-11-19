@@ -5376,7 +5376,7 @@
             ;; collected against that, and on a small heap (a 1 MB Mac's is
             ;; 40 KB) it is room the form itself needs.
             (setq all-ir nil)
-            (%mexp-memo-invalidate)
+            (%mexp-memo-release)
             ;; COMPILE-FILE (mvm/fasl.lisp): built, recorded, and not run.
             (if (and *fasl-compile-only* (%fasl-compile-only-skip-p %fslot forms %ftaint0))
                 nil

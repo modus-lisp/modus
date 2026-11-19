@@ -2920,9 +2920,11 @@
                      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
                      (m68k-load-vreg buf +68k-d1+ vs)
                      (m68k-emit-move-dn-disp buf +68k-d1+ +68k-a0+ (* (1+ idx) 4))))
-               (when *68k-barrier-label*
-                 (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+)
-                 (m68k-emit-bsr buf *68k-barrier-label*))))))
+               (cond (*68k-barrier-a0-label*
+                      (m68k-emit-bsr buf *68k-barrier-a0-label*))
+                     (*68k-barrier-label*
+                      (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+)
+                      (m68k-emit-bsr buf *68k-barrier-label*)))))))
 
       (#.+op-obj-tag+
        (let* ((vd (first operands))
@@ -3728,6 +3730,9 @@
 (defconstant +68k-card-crossing+ #x1001E000
   "One byte per static card: where its first object starts, in 16-byte
    granules from the card's start (255: none).  The 8 KB below the heap.")
+(defvar *68k-barrier-a0-label* nil
+  "The write barrier's second entry: the address in A0 (MOVE.L A0,D0, then the
+   barrier) -- an OBJ-SET site has its object in A0, and saves the move.")
 (defvar *68k-barrier-label* nil
   "While translating a static-heap image: the shared write barrier.  D0 = the
    object (or cons) just stored into; marks its card when it is static.
@@ -4375,6 +4380,9 @@
    freeze (and when the span was too big for the mark table) span is 0 and
    nothing is marked; the collector then walks the whole static heap."
   (let ((out (mvm-make-label)) (blk (conv-real +68k-gc-static-block+)))
+    (when *68k-barrier-a0-label*
+      (m68k-emit-label buf *68k-barrier-a0-label*)
+      (m68k-emit-move-an-dn buf +68k-a0+ +68k-d0+))
     (m68k-emit-label buf *68k-barrier-label*)
     (m68k-emit-word buf #x90B9) (m68k-emit-long buf (+ blk #x18))   ; SUB.L lo,D0
     (m68k-emit-word buf #xB0B9) (m68k-emit-long buf (+ blk #x1C))   ; CMP.L span,D0
@@ -5148,6 +5156,7 @@
          (*68k-subtag-label* (and (m68k-shared-p :subtag) (mvm-make-label)))
          (*68k-car-label* (and (m68k-shared-p :car) (mvm-make-label)))
          (*68k-barrier-label* (and *68k-gc-static* (m68k-hosted-layout-p) (mvm-make-label)))
+         (*68k-barrier-a0-label* (and *68k-barrier-label* (mvm-make-label)))
          (*68k-cdr-label* (and (m68k-shared-p :car) (mvm-make-label)))
          (*68k-array-len-label* (and (m68k-shared-p :array-len) (mvm-make-label)))
          (*68k-alloc-obj-label* (and (m68k-shared-p :alloc-obj) (mvm-make-label)))
@@ -6616,7 +6625,7 @@
         *68k-car-label* *68k-cdr-label* *68k-array-len-label* *68k-alloc-obj-label*
         *68k-mul32-label* *68k-mulu64-label* *68k-divs32-label*
         *68k-mac-console-label* *68k-mac-getc-label* *68k-mac-service-label*
-        *68k-thread-next-label*))
+        *68k-thread-next-label* *68k-barrier-a0-label*))
 
 (defun m68k-native-state-name-p (name)
   "Per-translation state, not configuration: the native tier binds these itself."

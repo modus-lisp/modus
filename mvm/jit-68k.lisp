@@ -233,6 +233,17 @@
    :JIT-AREA (build-cl-repl-common.lisp)."
   nil)
 
+(defun %t68-limit ()
+  "The code area's end for the next translation.  The Mac build replaces this
+   body (build-cl-repl-common.lisp): cold native code is read into the area's
+   top (translate-68k M68K-EMIT-COLD-ENTER), so its floor is the end."
+  *t68-end*)
+
+(defun %t68-reserve (top)
+  "A translation will write below TOP.  The Mac build replaces this body: it
+   tells the cold-code loader, which must not read anything under it."
+  top)
+
 (defun %t68-init (&optional (area-size 1048576))
   "Ready the JIT: the shape table and NEXT, the constant cells, the code area,
    the counters (a variable's initial value never runs in the image)."
@@ -513,7 +524,8 @@
           (rplaca (cdddr tk) addr)
           (setq addr (+ addr (if (< (second tk) 255) 1 3)
                         (loop for p in (third tk) sum (%t68-param-size p (second e)))))))
-      (when (> addr *t68-end*) (setq *t68-why* :area-full) (return-from %t68-translate nil))
+      (when (> addr (%t68-limit)) (setq *t68-why* :area-full) (return-from %t68-translate nil))
+      (%t68-reserve addr)
       ;; pass 2: every operand's value -- call targets, cells, branch
       ;; targets -- before anything is written
       (dolist (e plan)

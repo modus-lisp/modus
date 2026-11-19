@@ -149,10 +149,14 @@
     ;; shift carries #xF00000 to #x1000000, and the image's source text spells
     ;; layout addresses in hex, so the pool grew a word and every address after
     ;; it moved -- differences the relocation table cannot describe.
-    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): BC0000 (D30000
-    ;; while the JIT area was in the map).  Its minimum partition is SPAN +
-    ;; 1.5 MB = 13,568 KB (was 15,040 KB), measured on MAME's Quadra 950:
-    ;; every benchmark form at native speed there and at 20 MB.  The loader
+    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 860000 (BC0000
+    ;; before cold native code, D30000 while the JIT area was in the map).  Its
+    ;; minimum partition is SPAN + 1.5 MB.
+    ;; COLD NATIVE CODE (2026-11-19, compiler.lisp *COLD-KEEP*): the functions a
+    ;; coverage run never entered stay on the disk until their first call, so
+    ;; the resident image is ~5.4 MB and everything past it moved down 3.4 MB.
+    ;; The boot tail still runs to ~#xB9B250 in the core run: :CACHE-LO is
+    ;; above it.  The loader
     ;; (mac68k-chain.s HSIZE) gives the young heap 4/9 of the room past the low
     ;; block, after aligning the image's base to 512 KB inside the partition --
     ;; so what one partition size leaves varies with where the Process Manager
@@ -170,17 +174,17 @@
     ;; 1.8 MB it was is gone from the map and from the boot read; :JIT-AREA
     ;; below is what a DISK boot (the core run) uses, past the kind bytes.
     ;; Between :STATIC-HI and :CACHE-LO, 128 KB for the boot tail's end.
-    (:quadra  :load #x00600000 :static-lo #x00E80000 :static-hi #x00F00000
-              :jit-area-lo #x01450000 :jit-area-hi #x01550000 :jit-max-bytecode 16384
-              :cache-lo #x00F20000 :cache-hi #x00F40000
-              :staging #x00F40000 :staging-size #x00000000
-              :stack-top #x00F70000 :scratch #x00F70000 :io-buf #x00F71000
-              :nil-page #x00F80000
-              :region #x00F90000 :heap-size #x00100000 :gc-guard #x00010000
-              :kind-map #x013C0000
-              :boot-heap #x00FB0000 :boot-heap-size #x00400000
-              :boot-cache-lo #x00F20000 :boot-cache-hi #x00F40000
-              :boot-stack-top #x00F70000)
+    (:quadra  :load #x00600000 :static-lo #x00B00000 :static-hi #x00B80000
+              :jit-area-lo #x010F0000 :jit-area-hi #x01A00000 :jit-max-bytecode 16384
+              :cache-lo #x00BC0000 :cache-hi #x00BE0000
+              :staging #x00BE0000 :staging-size #x00000000
+              :stack-top #x00C10000 :scratch #x00C10000 :io-buf #x00C11000
+              :nil-page #x00C20000
+              :region #x00C30000 :heap-size #x00100000 :gc-guard #x00010000
+              :kind-map #x01060000
+              :boot-heap #x00C50000 :boot-heap-size #x00400000
+              :boot-cache-lo #x00BC0000 :boot-cache-hi #x00BE0000
+              :boot-stack-top #x00C10000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
     ;; the 4 MB map; the static heap from the image's init-only text
@@ -324,6 +328,13 @@
         *68k-card-crossing* (+ +conv-region-base+ (mac68k-alloc-start) -8192)
         ;; the init-only text's link address, where the layout gives one
         *pool-init-base* (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) :init-base))
+  ;; cold native code (translate-68k M68K-EMIT-COLD-ENTER): the code area a
+  ;; disk boot loads into (an application's comes from its partition), and
+  ;; the load address the core run's disk bias is reckoned from
+  (setf *68k-cold-area*
+        (let ((lo (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) :jit-area-lo)))
+          (and lo (list (mac68k-layout :jit-area-lo) (mac68k-layout :jit-area-hi)
+                        *mac68k-load-addr*))))
   ;; paged code: where the stream loader puts what it reads
   (setf *68k-paged-cache*
         (and *68k-paged*

@@ -49,6 +49,7 @@ start:  link    %a6, #-1212
         clr.l   HEXTRA(%a6)
         clr.l   HJLO(%a6)
         clr.l   HJHI(%a6)
+        clr.l   DELTA(%a6)
         pea     -4(%a5)
         .word   0xA86E                  | _InitGraf
         .word   0xA8FE                  | _InitFonts
@@ -237,6 +238,8 @@ start:  link    %a6, #-1212
         move.l  HKMAP(%a6), 12(%a3)     |   heap, or 0 for the layout's own
         move.l  HJLO(%a6), 16(%a3)      | +16 / +20: the JIT's code area, or 0
         move.l  HJHI(%a6), 20(%a3)      |   (jit-68k %T68-FIXED-AREA)
+        move.l  DELTA(%a6), 32(%a3)     | +32 / +36: how far this launch moved the
+        move.l  HEXTRA(%a6), 36(%a3)    |   map and the kind map (cold native code)
         tst.l   BASE(%a6)
         beq     7f
 | an application: the host table in the slot after REFSLOT (translate-68k

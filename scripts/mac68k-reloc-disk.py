@@ -52,6 +52,38 @@ def printable(w):
     return all(0x20 <= c < 0x7F or c in (9, 10, 13) for c in w.to_bytes(2, 'big'))
 
 
+def cold_lists(a, b, dest, off, ln, shift):
+    """COLD NATIVE CODE (translate-68k M68K-EMIT-COLD-ENTER): per cold body,
+    its words that differ between A and B by a relocation, as COLD-ENTER
+    applies them: n8 n16 n7, then each kind's offsets / 2 (u16s).  None when
+    the image has no cold code.  Returns (the index's disk byte, [lists])."""
+    k = a.find(b'modusCLD', off, off + ln)
+    if k < 0:
+        return None
+    bias, start, count, xindex, stubs = struct.unpack_from('>5I', a, k + 8)
+    lists = []
+    bad = 0
+    for i in range(count):
+        st = off + stubs + 16 * i - dest
+        home, t = struct.unpack_from('>II', a, st + 6)
+        at = home - bias                    # the body's disk byte (A's BIAS)
+        kinds, odd = reloc.classify(bytes(a[at:at + t]), b[at:at + t], shift)
+        if odd:
+            bad += len(odd)
+            for o, wa, wb in odd[:4]:
+                print('  cold %d +%X: %04X -> %04X' % (i, o, wa, wb))
+        lst = struct.pack('>3H', *(len(kinds[kk]) for kk in (8, 16, 7)))
+        for kk in (8, 16, 7):
+            for o in kinds[kk]:
+                if o >= 1 << 17:
+                    sys.exit('mac68k-reloc-disk: cold body %d is too big' % i)
+                lst += struct.pack('>H', o // 2)
+        lists.append(bytes(lst))
+    if bad > int(os.environ.get('MAC68K_RELOC_COLD_ALLOW', '0')):
+        sys.exit('mac68k-reloc-disk: %d differences in cold bodies that are not relocations' % bad)
+    return off + xindex - dest, lists
+
+
 def main(a_path, b_path, shift_hex, span_hex):
     shift, span = int(shift_hex, 16), int(span_hex, 16)
     a, b = bytearray(open(a_path, 'rb').read()), open(b_path, 'rb').read()
@@ -71,6 +103,7 @@ def main(a_path, b_path, shift_hex, span_hex):
         print('  +%07X (#%X)  %04X -> %04X' % (o, dest + o, wa, wb))
     if len(bad) > int(os.environ.get('MAC68K_RELOC_ALLOW', '4')):
         sys.exit('mac68k-reloc-disk: too many differences that are not relocations')
+    cold = cold_lists(a, b, dest, off, ln, shift)
     table = bytearray()
     for k in reloc.KINDS:
         table += struct.pack('>II', k, len(kinds[k])) + encode(kinds[k])
@@ -78,6 +111,25 @@ def main(a_path, b_path, shift_hex, span_hex):
     at = len(a)
     a += table + bytes(-len(table) % 512)
     struct.pack_into('>III', a, r + 32, at, len(table), span)
+    if cold:
+        # the cold bodies' external relocations after the table, and the
+        # resident index (blocks << 25 | disk byte) that finds each
+        xindex, lists = cold
+        base = len(a)
+        blob = bytearray()
+        seen = {}
+        for i, lst in enumerate(lists):
+            if lst not in seen:
+                seen[lst] = base + len(blob)
+                blob += lst
+            at_i = seen[lst]
+            blocks = (at_i % 512 + len(lst) + 511) // 512
+            if blocks > 127 or at_i >= 1 << 25:
+                sys.exit('mac68k-reloc-disk: cold list %d (%d bytes at %d) out of reach' % (i, len(lst), at_i))
+            struct.pack_into('>I', a, xindex + 4 * i, blocks << 25 | at_i)
+        a += blob + bytes(-len(blob) % 512)
+        print('mac68k-reloc-disk: %d cold bodies: %d bytes of external relocations at disk byte %d'
+              % (len(lists), len(blob), base))
     open(a_path, 'wb').write(a)
     print('mac68k-reloc-disk: %s: table %d bytes at disk byte %d, span %#x'
           % (a_path, len(table), at, span))

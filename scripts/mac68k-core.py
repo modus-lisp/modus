@@ -40,7 +40,7 @@ REPO = os.path.dirname(HERE)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
-    'quadra':    (0x00600000, 0x00E80000, 0x00F00000, 0x00F90000, 0x20000),   # cache, stack, NIL's page between
+    'quadra':    (0x00600000, 0x00B00000, 0x00B80000, 0x00C30000, 0x20000),   # cache, stack, NIL's page between
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
@@ -54,7 +54,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION = LOAD + SHIFT, STATIC_LO + SHIFT, STATIC_HI 
 CHAIN_MEMTOP = {'classicos': 0x00400000, 'quadra': 0x02000000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 # the layout's kind map when its young heap is last in the map (boot-mac68k
 # :QUADRA): the application's loader then sizes the heap from its partition
-KMAP = {'quadra': 0x013C0000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
+KMAP = {'quadra': 0x01060000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 KMAP = KMAP and KMAP + SHIFT
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk
@@ -347,6 +347,17 @@ def main(image, disk):
     else:                                   # unpaged (MODUS_68K_PAGED=0): all resident
         img, resident, count = img0, len(img0), 0
     img = bytearray(img)
+    # COLD NATIVE CODE (translate-68k M68K-EMIT-COLD-ENTER): the descriptor
+    # 'modusCLD' (+8 BIAS, +12 the cold section's address, +16 the count); the
+    # section is the image's tail, never read at boot -- not even by the core
+    # run, whose disk has the image at byte 1024 as the build's BIAS assumes
+    cold_desc = img.find(b'modusCLD', 0, resident)
+    cold_n = 0
+    if cold_desc >= 0:
+        cold_at, cold_n = struct.unpack_from('>II', img, cold_desc + 12)
+        resident = cold_at - LOAD
+        print('mac68k-core: %d cold functions, %d bytes from #%x, on the disk after the boot read'
+              % (cold_n, len(img) - resident, cold_at))
     # what must stay resident: up to the init-only text's marker, when there is
     # one (the static heap is laid over that text; see below)
     kept = img.find(b'modusINI', 0, resident)
@@ -420,6 +431,11 @@ def main(image, disk):
         table, cnt, section = struct.unpack_from('>III', chunk, k + 8)
         struct.pack_into('>I', chunk, k + 20, (section - stream_disk) & 0xFFFFFFFF)  # disk bias (SUB.L wraps)
     set_flag(chunk, 'core', 1)
+    if cold_desc >= 0:
+        # the cold section's disk byte: BIAS = its address - that
+        struct.pack_into('>I', chunk, cold_desc + 8, (LOAD + resident - stream_disk) & 0xFFFFFFFF)
+        # what the core run loaded is gone: no cold floor, no JIT top
+        chunk[REGION - LOAD + 0x6068:REGION - LOAD + 0x6078] = bytes(16)
     # 3. COLD NAMES (mvm/mac68k-cold.lisp): IMAGE.cold, when the build wrote one,
     # on a block boundary after the streams; the static block's #x6044 says where
     tail = bytes(streams)

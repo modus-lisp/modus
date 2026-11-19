@@ -3318,7 +3318,7 @@
       ;; build-cli-common's *CLI-ARCH-JIT-TRANSLATOR-SOURCE*, for every 68k JIT
       ;; image, hosted or Mac.
       (defvar cl-user::*cli-arch-late-source*   ; build-cli-common's (in CL-USER)
-        (swap (swap (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
+        (swap (swap (swap (swap (swap (swap (swap (mvm-text "mvm/jit-68k.lisp")
                     "(defun %t68-fixed-area ()" (format nil "~%  nil)")
                     ;; the loader's words (+MAC68K-HEAP-SLOT+ +8/+12: an
                     ;; application's area from its partition), else the
@@ -3330,6 +3330,16 @@
                             lo hi))
               "(defun %t68-allowed-p ()" (format nil "~%  t)")
               (format nil "~%  (%core-requested-p))"))
+              ;; cold native code shares the area: its floor is the JIT's end,
+              ;; and what the JIT reserves is the loader's limit (translate-68k
+              ;; +68K-COLD-FLOOR+ / +68K-JIT-TOP+)
+              "(defun %t68-limit ()" (format nil "~%  *t68-end*)")
+              (format nil "~%  (let ((f (+ (* (mem-ref #x10006068 :u16) 65536) (mem-ref #x1000606A :u16))))~
+                           ~%    (if (and (> f 0) (< f *t68-end*)) f *t68-end*)))"))
+              "(defun %t68-reserve (top)" (format nil "~%  top)")
+              (format nil "~%  (setf (mem-ref #x1000606C :u16) (ash top -16))~
+                           ~%  (setf (mem-ref #x1000606E :u16) (logand top #xFFFF))~
+                           ~%  top)"))
               ;; big modules stay interpreted (see its docstring)
               "(defun %t68-max-bytecode ()" (format nil "~%  nil)") (format nil "~%  ~D)" cap))
               ;; translate at DEFUN, or only at (compile 'f)
@@ -3832,6 +3842,20 @@
       (setf (symbol-value (sym "*BOOT-TAIL-LAST*"))
             (and (not (symbol-value (sym "*68K-THREADED*"))) (not (symbol-value (sym "*68K-PAGED*")))
                  (not (and v (string= v "0"))))))
+    ;; MODUS_68K_COLD_KEEP=FILE: COLD NATIVE CODE (compiler.lisp *COLD-KEEP*):
+    ;; the functions FILE names (one a line, as the symbol map spells them) stay
+    ;; resident, every other one is read from disk at its first call
+    (let ((f (sb-ext:posix-getenv "MODUS_68K_COLD_KEEP")))
+      (when (and f (plusp (length f)))
+        (let ((h (make-hash-table :test 'equal)))
+          (with-open-file (in f)
+            (loop for l = (read-line in nil) while l
+                  do (let ((n (string-trim " " (subseq l (1+ (or (position #\Tab l) -1))))))
+                       (when (and (plusp (length n)) (char/= (char n 0) #\;))
+                         (setf (gethash (string-upcase n) h) t)))))
+          (format t "~&;; 68k cold native code: ~D functions kept resident (~A)~%"
+                  (hash-table-count h) f)
+          (setf (symbol-value (sym "*COLD-KEEP*")) h))))
     ;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k *68K-CALL-ISLANDS*)
     (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
       (setf (symbol-value (sym "*68K-CALL-ISLANDS*"))

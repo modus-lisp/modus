@@ -1998,7 +1998,14 @@
             for vaddr = (+ load-addr elf-header nio nat-off)
             do (format out "~16,'0X~C~D~C~D~C~A~%"
                        vaddr #\Tab size #\Tab nat-off #\Tab name))
-      (format t "  Wrote symbol map: ~A~%" path))))
+      (format t "  Wrote symbol map: ~A~%" path))
+    ;; beside it, PATH.bc: each function's MVM bytecode length (name<TAB>bytes),
+    ;; to weigh a function's native code against its bytecode
+    (with-open-file (out (concatenate 'string (namestring path) ".bc") :direction :output
+                         :if-exists :supersede :if-does-not-exist :create)
+      (dolist (fi function-table)
+        (format out "~A~C~D~%" (string (mvm-function-info-name fi)) #\Tab
+                (or (mvm-function-info-bytecode-length fi) 0))))))
 
 ;;; ============================================================
 ;;; Top-Level API

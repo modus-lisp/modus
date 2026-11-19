@@ -2005,6 +2005,29 @@
 (defvar *boot-tail-pc* nil
   "With *BOOT-TAIL-LAST*: the bytecode offset of the first boot-only function.")
 (defvar *%boot-first* nil "The first boot-only function's info, while laying out.")
+(defvar *%cold-first* nil "The first cold function's info, while laying out.")
+
+(defvar *cold-keep* nil
+  "COLD NATIVE CODE (the Mac's Quadra map, MODUS_68K_COLD_KEEP=FILE): an EQUAL
+   hash of the function names that stay RESIDENT -- a coverage run's, plus a
+   keep-list.  Every other function (not boot-only) is laid out after the
+   boot-only ones, and *COLD-PC* is the first one's bytecode offset: the 68k
+   translator leaves a 16-byte stub in the resident image for each and puts
+   its code in the image's tail, which stays on disk until the first call
+   (translate-68k M68K-EMIT-COLD-ENTER).  NIL: everything resident.")
+(defvar *cold-pc* nil
+  "With *COLD-KEEP*: the bytecode offset of the first cold function.")
+
+(defun %cold-fn-name-key (name)
+  "NAME as the keep-list spells it: the symbol map's name, without a package."
+  (let* ((s (string-upcase (if (stringp name) name (princ-to-string name))))
+         (c (search "::" s :from-end t)))
+    (if c (subseq s (+ c 2)) s)))
+
+(defun %cold-fn-name-p (name)
+  (and *cold-keep*
+       (not (%boot-only-fn-name-p name))
+       (not (gethash (%cold-fn-name-key name) *cold-keep*))))
 
 (defun %boot-only-fn-name-p (name)
   (let* ((s (string-upcase (if (stringp name) name (princ-to-string name))))
@@ -34061,18 +34084,21 @@
     ;; ... and without it, MODUS_HOT_ORDER is layout alone.
     (when (and *ir-hot-order* (not *ir-dce-roots*))
       (setq all-ir (%ir-hot-sort all-ir)))
-    ;; *BOOT-TAIL-LAST*: the boot-only functions last, in their order
-    (setq *boot-tail-pc* nil *%boot-first* nil)
-    (when *boot-tail-last*
-      (let ((keep nil) (tail nil))
+    ;; *BOOT-TAIL-LAST*: the boot-only functions last, in their order; and
+    ;; *COLD-KEEP*: the cold functions after even those
+    (setq *boot-tail-pc* nil *%boot-first* nil *cold-pc* nil *%cold-first* nil)
+    (when (or *boot-tail-last* *cold-keep*)
+      (let ((hot nil) (boot nil) (cold nil))
         (dolist (e all-ir)
-          (if (%boot-only-fn-name-p (function-info-name (car e))) (push e tail) (push e keep)))
-        (when tail
-          (let ((n (length tail)))
-            (setq tail (nreverse tail)
-                  *%boot-first* (car (first tail))
-                  all-ir (nconc (nreverse keep) tail))
-            (format t "~&  boot-only functions last: ~D~%" n)))))
+          (let ((nm (function-info-name (car e))))
+            (cond ((and *boot-tail-last* (%boot-only-fn-name-p nm)) (push e boot))
+                  ((%cold-fn-name-p nm) (push e cold))
+                  (t (push e hot)))))
+        (when boot (format t "~&  boot-only functions last: ~D~%" (length boot)))
+        (when cold (format t "~&  cold functions after them: ~D~%" (length cold)))
+        (setq *%boot-first* (and boot (car (car (last boot))))
+              *%cold-first* (and cold (car (car (last cold))))
+              all-ir (nconc (nreverse hot) (nreverse boot) (nreverse cold)))))
 
     ;; Phase 3: Emit bytecode
     (let ((buf (make-mvm-buffer)))
@@ -34093,7 +34119,9 @@
             (%fn-register-info info)
             (incf global-offset fn-size)))
         (when *%boot-first*
-          (setq *boot-tail-pc* (function-info-bytecode-offset *%boot-first*))))
+          (setq *boot-tail-pc* (function-info-bytecode-offset *%boot-first*)))
+        (when *%cold-first*
+          (setq *cold-pc* (function-info-bytecode-offset *%cold-first*))))
 
       ;; Debug: show bytecode offsets for key functions
       (dolist (name '("ED-SCALAR-MULT" "C64-ED-SCALAR-MULT" "ED-BASE-MULT"

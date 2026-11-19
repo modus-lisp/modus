@@ -372,6 +372,17 @@
         (let ((target (gethash label-id (m68k-buffer-labels buf))))
           (unless target
             (error "68k: undefined label ~D" label-id))
+          (when (and *68k-boot-tail-pos* (member fixup-type '(:disp16 :disp8-in-opcode :disp32))
+                     (not (eql (m68k-code-region (* 2 word-idx)) (m68k-code-region target))))
+            (error "68k: a PC-relative reference across a moved region (word ~D -> ~D)"
+                   (* 2 word-idx) target))
+          (when (and (eq fixup-type :abs32) *68k-cold-bodies*
+                     (let ((r (m68k-code-region target)))
+                       (and (not (member r '(0 1)))
+                            (not (eql r (m68k-code-region (* 2 word-idx))))
+                            (not (gethash word-idx *68k-cold-stub-homes*)))))
+            (error "68k: an absolute reference into a cold body from outside it (word ~D -> ~D)"
+                   (* 2 word-idx) target))
           (ecase fixup-type
             (:disp16
              ;; 16-bit displacement relative to the extension word position
@@ -1273,6 +1284,66 @@
                  (m68k-buffer-fixups buf)))
          (m68k-emit-word buf 0))))))
 
+;;; COLD NATIVE CODE (compiler.lisp *COLD-KEEP*, *COLD-PC*; the Mac's Quadra
+;;; map).  Every cold function keeps a 16-byte STUB in the resident image, at
+;;; the label its callers and #'NAME use:
+;;;     JSR cold-enter.L | HOME.L | T.L | I.W
+;;; and its code -- the BODY -- goes in the image's tail after the boot-only
+;;; functions, followed by a TRAILER: the body-relative word offsets (/2) of
+;;; its absolute references to itself, then their count (a word).  T is body +
+;;; trailer; HOME the body's address as linked; I its index.  The tail is never
+;;; read at boot (mac68k-core.py puts it on the disk after the boot read), so
+;;; HOME is only a disk position: disk byte = HOME - the descriptor's BIAS.
+;;; At the first call COLD-ENTER reads the body into the code area's top (the
+;;; JIT's grows from the bottom), adds (where it landed - HOME) at each trailer
+;;; offset, rewrites the stub to JMP there and goes there, every register as
+;;; the caller left it.  So a body must reach everything outside itself
+;;; ABSOLUTELY: a branch whose ends are in different REGIONS (resident, the
+;;; boot tail, each cold body) is long (M68K-RELAX-PLAN), and a PC-relative
+;;; fixup across regions fails the build (M68K-FIXUP-LABELS).
+(defvar *68k-cold-area* nil
+  "(LO HI LOAD-ADDR): the code area a disk boot's COLD-ENTER loads into, and
+   the load address the build's disk bias is reckoned from (boot-mac68k
+   MAC68K-CONFIGURE).  NIL: no cold native code.")
+(defconstant +68k-cold-floor+ #x10006068
+  "Raw: the lowest byte of cold code loaded into the code area (0: none yet).")
+(defconstant +68k-jit-top+ #x1000606C
+  "Raw: the top of what the JIT has reserved in the code area (0: nothing).")
+(defconstant +68k-reloc-delta+ #x10006070
+  "Raw: the application's relocation (BASE - DEST), from its loader; 0 else.")
+(defconstant +68k-reloc-kmap+ #x10006074
+  "Raw: how far the application's loader moved the kind map (HEXTRA); 0 else.")
+(defvar *68k-cold-pc* nil "While translating: the first cold function's bytecode offset.")
+(defvar *68k-cold-native* nil
+  "While translating with cold native code: hash, a cold function's start pc ->
+   (INDEX STUB-T-WORD BODY-LABEL).")
+(defvar *68k-cold-enter2-label* nil "COLD-ENTER, the cold native loader.")
+(defvar *68k-cold-desc-label* nil)
+(defvar *68k-cold-start-label* nil)
+(defvar *68k-cold-xindex-label* nil)
+(defvar *68k-cold-bodies* nil
+  "After translating: a vector of the cold bodies, (START . END) native
+   positions, ascending.  The relaxation plan reads pass 1's.")
+(defvar *68k-cold-stub-homes* nil
+  "While translating: word indices of the stubs' HOME words (the one absolute
+   reference into a body from outside it).")
+
+(defun m68k-code-region (pos)
+  "Which part of the native code POS is in: 0 resident, 1 the boot tail, or a
+   cold body's start position."
+  (let ((tail *68k-boot-tail-pos*))
+    (cond ((or (null tail) (< pos tail)) 0)
+          ((or (null *68k-cold-bodies*) (zerop (length *68k-cold-bodies*))
+               (< pos (car (aref *68k-cold-bodies* 0))))
+           1)
+          (t (let ((v *68k-cold-bodies*) (lo 0) (hi (1- (length *68k-cold-bodies*))))
+               ;; the last body starting at or before POS
+               (loop while (< lo hi)
+                     do (let ((mid (ash (+ lo hi 1) -1)))
+                          (if (<= (car (aref v mid)) pos) (setq lo mid) (setq hi (1- mid)))))
+               (let ((b (aref v lo)))
+                 (if (< pos (cdr b)) (car b) 1)))))))
+
 (defun m68k-relax-plan (n-branches)
   "The pass-2 size of each branch, from pass 1's distances and entry positions."
   (let ((plan (make-array (1+ n-branches) :initial-element :long))
@@ -1292,8 +1363,9 @@
                   (tail *68k-boot-tail-pos*)
                   (target (+ (- ref-pos 2) disp)))
              (setf (aref plan ord)
-                   (cond ((and tail (not (eq (< ref-pos tail) (< target tail))))
-                          :long)                ; across the boot tail: absolute
+                   (cond ((and tail (not (eql (m68k-code-region ref-pos)
+                                              (m68k-code-region target))))
+                          :long)                ; across regions: absolute
                          ((and (if (> disp 0) (>= d 2) t)
                                (<= (+ -128 margin) d (- 127 margin)))
                           :byte)
@@ -5250,6 +5322,176 @@
     (when *68k-mul32-label*
       (m68k-emit-68000-helpers buf)))
 
+(defun m68k-emit-cold-native-resident (buf function-table label-map)
+  "Cold native code, at the resident boundary: a stub for each cold function
+   (at its label), COLD-ENTER, the descriptor and the external relocations'
+   index (filled by scripts/mac68k-reloc-disk.py).  Fills *68K-COLD-NATIVE*."
+  (let ((offs nil) (i 0) (first-stub (mvm-make-label)))
+    (maphash (lambda (idx off) (declare (ignore idx))
+               (when (>= off *68k-cold-pc*) (pushnew off offs)))
+             function-table)
+    (setq offs (sort offs #'<))
+    (dolist (off offs)
+      (m68k-word-align buf)
+      (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-nop buf))
+      (let ((label (or (gethash off label-map) (error "68k cold: no label for ~D" off)))
+            (body (mvm-make-label)))
+        (when (zerop i) (m68k-emit-label buf first-stub))
+        (m68k-emit-label buf label)
+        (m68k-emit-word buf #x4EB9)                          ; JSR cold-enter.L
+        (m68k-emit-abs32 buf *68k-cold-enter2-label*)
+        (setf (gethash (m68k-buffer-word-count buf) *68k-cold-stub-homes*) t)
+        (m68k-emit-abs32 buf body)                           ; HOME
+        (let ((tw (m68k-buffer-word-count buf)))
+          (m68k-emit-word buf 0) (m68k-emit-word buf 0)      ; T (M68K-COLD-CLOSE)
+          (m68k-emit-word buf i)                             ; I
+          (setf (gethash off *68k-cold-native*) (list i tw body))))
+      (incf i))
+    (m68k-emit-cold-enter buf)
+    ;; the descriptor: "modusCLD", the disk BIAS (a body's disk byte is HOME -
+    ;; BIAS: the build's disk has the image at byte 1024; mac68k-core.py
+    ;; rewrites it for the disk it makes), the cold section, the count, the
+    ;; external relocations' index, the first stub (the I-th is 16 I on)
+    (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-nop buf))
+    (dolist (w '(#x6D6F #x6475 #x7343 #x4C44)) (m68k-emit-word buf w))
+    (m68k-emit-label buf *68k-cold-desc-label*)
+    (m68k-emit-long buf (- (third *68k-cold-area*) 1024))
+    (setf (gethash (m68k-buffer-word-count buf) *68k-cold-stub-homes*) t)
+    (m68k-emit-abs32 buf *68k-cold-start-label*)
+    (m68k-emit-long buf i)
+    (m68k-emit-abs32 buf *68k-cold-xindex-label*)
+    (m68k-emit-abs32 buf first-stub)
+    (m68k-emit-label buf *68k-cold-xindex-label*)
+    (dotimes (k i) (m68k-emit-long buf 0))))
+
+(defun m68k-emit-cold-enter (buf)
+  "COLD-ENTER (see *68K-COLD-AREA*): (SP) = a stub + 6, every register the
+   caller's.  Reads the body into the code area under the cold floor, applies
+   its trailer, rewrites the stub to JMP to it, flushes the caches, and goes
+   there."
+  (destructuring-bind (alo ahi load) *68k-cold-area*
+    (declare (ignore load))
+    (let ((f1 (mvm-make-label)) (f2 (mvm-make-label)) (full (mvm-make-label))
+          (rfail (mvm-make-label)) (xfail (mvm-make-label)) (lp (mvm-make-label))
+          (test (mvm-make-label)) (noext (mvm-make-label)) (xg (mvm-make-label)))
+      (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
+             (l32 (v) (m68k-emit-long buf v)))
+        (m68k-word-align buf)
+        (m68k-emit-label buf *68k-cold-enter2-label*)
+        (ws #x48E7 #xFFFA)                                   ; MOVEM.L D0-D7/A0-A4/A6,-(SP)
+        (ws #x226F #x0038)                                   ; A1 = the stub + 6
+        (ws #x2C11 #x2E29 #x0004)                            ; D6 = HOME, D7 = T
+        (ws #x2206 #x92B9) (m68k-emit-abs32 buf *68k-cold-desc-label*) ; D1 = HOME - BIAS
+        (ws #x2601 #x0283) (l32 511)                         ; D3 = skip
+        (ws #x9283 #x2443)                                   ; D1 = its block; A2 = skip
+        (ws #x2403 #xD487 #x0682) (l32 511)
+        (ws #x0282) (l32 #xFFFFFE00)                         ; D2 = bytes to read
+        ;; the floor: the cold floor, else the area's top
+        (ws #x2839) (l32 (conv-real +68k-cold-floor+)) (m68k-emit-bne buf f1)
+        (ws #x2839) (l32 (conv-real #x10006064)) (m68k-emit-bne buf f1)
+        (ws #x283C) (l32 ahi)
+        (m68k-emit-label buf f1)
+        ;; the limit: the JIT's top, else the area's bottom
+        (ws #x2A39) (l32 (conv-real +68k-jit-top+)) (m68k-emit-bne buf f2)
+        (ws #x2A39) (l32 (conv-real #x10006060)) (m68k-emit-bne buf f2)
+        (ws #x2A3C) (l32 alo)
+        (m68k-emit-label buf f2)
+        (ws #x2845)                                          ; A4 = the limit
+        (ws #x9882 #x0284) (l32 #xFFFFFFF0)                  ; D4 = (floor - D2) & -16
+        (ws #xB885) (m68k-emit-bcc-word buf +68k-cc-cs+ full) ; under the JIT's top
+        (ws #x23C4) (l32 (conv-real +68k-cold-floor+))       ; the new floor
+        (ws #x2604)                                          ; D3 = the buffer
+        (m68k-emit-bsr buf *68k-mac-service-label*)
+        (ws #x4A82) (m68k-emit-bne buf rfail)
+        (ws #x2044 #xD1CA)                                   ; A0 = the body
+        ;; the trailer: count at T - 2, the offsets (/2) before it
+        (ws #x2007 #x7200 #x3230 #x08FE)                     ; D1 = count
+        (ws #x47F0 #x08FE #x97C1 #x97C1)                     ; A3 = the offsets
+        (ws #x2A08 #x9A86)                                   ; D5 = A0 - HOME
+        (m68k-emit-bra buf test)
+        (m68k-emit-label buf lp)
+        (ws #x7000 #x301B #xD080)                            ; D0 = offset
+        (ws #xDBB0 #x0800)                                   ; ADD.L D5,(A0,D0.L)
+        (m68k-emit-label buf test)
+        (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf lp :disp16) ; DBRA D1
+        ;; a relocated application: the body's EXTERNAL relocations, as the
+        ;; application's loader applies its own (scripts/mac68k-chain.s
+        ;; RELOCATE), from the list the index names (mac68k-reloc-disk.py):
+        ;; entry = blocks << 25 | disk byte; the list = n8 n16 n7, then the
+        ;; offsets (/2) of each kind
+        (ws #x2A39) (l32 (conv-real +68k-reloc-delta+))      ; D5 = DELTA
+        (ws #x2C39) (l32 (conv-real +68k-reloc-kmap+))       ; D6 = HEXTRA
+        (ws #x2005 #x8086) (m68k-emit-beq buf noext)
+        (ws #x7000 #x3029 #x0008 #xD080 #xD080)              ; D0 = I * 4
+        (ws #x47F9) (m68k-emit-abs32 buf *68k-cold-xindex-label*)
+        (ws #x2033 #x0800) (m68k-emit-beq buf xfail)         ; no list: the build is wrong
+        (ws #x2400 #xEF9A #x0282) (l32 #x7F)                 ; D2 = blocks
+        (ws #xE18A #xD482)                                   ;   * 512
+        (ws #x2200 #x0281) (l32 #x1FFFFFF)                   ; D1 = disk byte
+        (ws #x2001 #x0280) (l32 511) (ws #x2640 #x9280)      ; A3 = skip; D1 = its block
+        (ws #x2604 #x9682 #x0283) (l32 #xFFFFFFF0)           ; D3 = under the floor
+        (ws #x200C #xB680) (m68k-emit-bcc-word buf +68k-cc-cs+ full)
+        (m68k-emit-bsr buf *68k-mac-service-label*)
+        (ws #x4A82) (m68k-emit-bne buf rfail)
+        (ws #xD7C3 #x49EB #x0006)                            ; A3 = the list; A4 = its offsets
+        (ws #x4845 #x4846)                                   ; DELTA >> 16, HEXTRA >> 16
+        (ws #x3213 #x3405) (m68k-emit-bsr buf xg)            ; kind 8
+        (ws #x322B #x0002 #x3405 #xD442) (m68k-emit-bsr buf xg) ; kind 16
+        (ws #x322B #x0004 #x3405 #xC5FC #x0007 #xE682 #xD446)   ; kind 7, + the kind map's move
+        (m68k-emit-bsr buf xg)
+        (m68k-emit-label buf noext)
+        ;; the stub: JMP body; and the return address: the body
+        (ws #x337C #x4EF9 #xFFFA #x2348 #xFFFC)
+        (ws #x2F48 #x0038)
+        ;; written as data: flush (_HWPriv 1) where CPUFlag says there are caches
+        (ws #x0C38 #x0002 #x012F #x650C)
+        (ws #x48E7 #xE0C0 #x7001 #xA198 #x4CDF #x0307)
+        (ws #x4CDF #x5FFF #x4E75)                            ; MOVEM.L (SP)+; RTS: the body
+        ;; XG: add D2.W at the D1.W word offsets (/2) at A4 into the body at A0
+        (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
+          (m68k-emit-label buf xg)
+          (m68k-emit-bra buf xt)
+          (m68k-emit-label buf xl)
+          (ws #x7000 #x301C #xD080 #xD570 #x0800)            ; ADD.W D2,(A0,D0.L)
+          (m68k-emit-label buf xt)
+          (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
+          (ws #x4E75))
+        (loop for (label text) in (list (list full "!COLD-FULL") (list rfail "!COLD-READ")
+                                        (list xfail "!COLD-RELOC"))
+              do (m68k-emit-label buf label)
+                 (loop for ch across text
+                       do (m68k-emit-moveq buf +68k-d0+ (char-code ch))
+                          (m68k-emit-bsr buf *68k-mac-console-label*))
+                 (m68k-emit-moveq buf +68k-d0+ 10)
+                 (m68k-emit-bsr buf *68k-mac-console-label*)
+                 (let ((spin (mvm-make-label)))
+                   (m68k-emit-label buf spin)
+                   (m68k-emit-bra buf spin)))))))
+
+(defun m68k-cold-close (buf start entry mark)
+  "End the cold body that started at native position START (its stub's
+   *68K-COLD-NATIVE* ENTRY; MARK the fixup list when it began): the trailer --
+   the offsets of its absolute references to itself, then their count -- and
+   the stub's T.  Returns (START . END)."
+  (let ((labels (m68k-buffer-labels buf)) (here (m68k-buffer-position buf)) (offs nil))
+    (loop for c on (m68k-buffer-fixups buf) until (eq c mark)
+          do (destructuring-bind (widx label type &rest r) (car c)
+               (declare (ignore r))
+               (when (eq type :abs32)
+                 (let ((tp (gethash label labels)))
+                   (when (and tp (>= tp start) (< tp here))
+                     (push (- widx (ash start -1)) offs))))))
+    (setq offs (sort offs #'<))
+    (when (and offs (>= (car (last offs)) 65536))
+      (error "68k cold: a body of ~D bytes is too big to be cold (keep it)" (- here start)))
+    (dolist (o offs) (m68k-emit-word buf o))
+    (m68k-emit-word buf (length offs))
+    (let* ((end (m68k-buffer-position buf)) (n (- end start)) (tw (second entry))
+           (words (m68k-buffer-words buf)))
+      (setf (aref words tw) (ldb (byte 16 16) n)
+            (aref words (1+ tw)) (ldb (byte 16 0) n))
+      (cons start end))))
+
 (defun translate-mvm-to-68k-1 (bytecode function-table)
   "Translate MVM bytecode to Motorola 68000 native code.
    BYTECODE is a (vector (unsigned-byte 8)).
@@ -5257,8 +5499,18 @@
    Returns a byte vector of 68k big-endian machine code."
   (setf *68k-abs-patches* nil)
   (setf *68k-paged-layout* nil *68k-paged-table-refs* nil)
-  (setf *68k-boot-tail-pos* nil *68k-boot-tail* nil)
+  (setf *68k-boot-tail-pos* nil *68k-boot-tail* nil *68k-cold-bodies* nil)
   (let* ((*68k-native-p* t)
+         (*68k-cold-pc* (and *68k-cold-area* *68k-mac-mode* function-table
+                             (boundp '*cold-pc*) *cold-pc*))
+         (*68k-cold-native* (and *68k-cold-pc* (make-hash-table)))
+         (*68k-cold-enter2-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-desc-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-start-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-xindex-label* (and *68k-cold-pc* (mvm-make-label)))
+         (*68k-cold-stub-homes* (make-hash-table))
+         (cold-open nil)                ; (START ENTRY MARK) of the body being emitted
+         (cold-bodies nil)
          (*68k-paged-fns* nil)
          (*68k-cold-enter-label* (and *68k-paged* (mvm-make-label)))
          (*68k-reload-label* (and *68k-paged* *68k-mac-mode* (mvm-make-label)))
@@ -5392,10 +5644,15 @@
     (setf pc 0)
     (loop while (< pc len)
           do (progn
-               (when (and boot-tail-pc (not tail-done) (eql pc boot-tail-pc))
+               (when (and (not tail-done)
+                          (or (and boot-tail-pc (eql pc boot-tail-pc))
+                              (and *68k-cold-pc* (eql pc *68k-cold-pc*))))
                  ;; the boot tail: the shared routines first (resident), then
-                 ;; no more islands -- everything after here moves
+                 ;; no more islands -- everything after here moves.  And the
+                 ;; cold functions' stubs and their loader, resident too.
                  (m68k-emit-routines buf function-table)
+                 (when *68k-cold-pc*
+                   (m68k-emit-cold-native-resident buf function-table label-map))
                  (m68k-word-align buf)
                  (loop while (/= 0 (mod (m68k-buffer-position buf) 16)) do (m68k-emit-nop buf))
                  (setq tail-done t island-targets nil *68k-island-map* nil
@@ -5413,16 +5670,27 @@
                ;; allocation marks moved it and FUNCALL took an ILLEGAL.  ARM32,
                ;; x64, i386 and RISC-V align to 16 for the same reason.  Pad with
                ;; NOP -- harmless, a function never falls through (RTS/branch).
+               (when (and cold-open *68k-cold-native* (gethash pc *68k-cold-native*))
+                 (push (apply #'m68k-cold-close buf cold-open) cold-bodies)
+                 (setq cold-open nil))
                (when (and function-table (gethash pc fn-entries))
                  (m68k-word-align buf)
                  (loop while (/= 0 (mod (m68k-buffer-position buf) 16))
                        do (m68k-emit-nop buf))
                  (when *68k-branch-distances*
                    (push (m68k-buffer-position buf) *68k-fn-entry-positions*)))
-               ;; Emit label at current PC before translating
-               (let ((label (gethash pc label-map)))
-                 (when label
-                   (m68k-emit-label buf label)))
+               ;; Emit label at current PC before translating -- a cold
+               ;; function's is at its stub: here its body starts
+               (let ((label (gethash pc label-map))
+                     (cold (and *68k-cold-native* (gethash pc *68k-cold-native*))))
+                 (cond (cold
+                        (when (eql pc *68k-cold-pc*)
+                          (m68k-emit-label buf *68k-cold-start-label*))
+                        (m68k-emit-label buf (third cold))
+                        (setq cold-open (list (m68k-buffer-position buf) cold
+                                              (m68k-buffer-fixups buf))))
+                       (label
+                        (m68k-emit-label buf label))))
                (when (and *68k-profile* function-table
                           (or (gethash pc fn-entries) (gethash pc loop-heads)))
                  (when (gethash pc fn-entries) (incf prof-index))
@@ -5488,6 +5756,14 @@
           (format t ";;   LI imms:~{ ~X:~D~}~%"
                   (loop for (k . n) in (subseq ir 0 (min 24 (length ir))) append (list k n))))))
 
+    (when cold-open
+      (push (apply #'m68k-cold-close buf cold-open) cold-bodies)
+      (setq cold-open nil))
+    (setq *68k-cold-bodies* (and cold-bodies (coerce (reverse cold-bodies) 'vector)))
+    (when cold-bodies
+      (format t "~&;; 68k cold native code: ~D bodies, ~D bytes from #x~X~%"
+              (length cold-bodies) (- (cdr (first cold-bodies)) (car (car (last cold-bodies))))
+              (car (car (last cold-bodies)))))
     (unless tail-done (m68k-emit-routines buf function-table))
     (setq *68k-boot-tail* (and tail-done *68k-boot-tail-pos*
                                (list *68k-boot-tail-pos* (m68k-buffer-position buf))))

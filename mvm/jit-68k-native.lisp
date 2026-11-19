@@ -324,9 +324,10 @@
                 (setq *n68-why* (list :unimplemented *68k-unimpl-opcodes*) entries nil)))))
         (when entries
           (let* ((nw (m68k-buffer-word-count buf)) (size (* 2 nw)) (w (m68k-buffer-words buf)))
-            (if (> (+ base size) *t68-end*)
+            (if (> (+ base size) (%t68-limit))
                 (setq *n68-why* :area-full entries nil)
                 (progn
+                  (%t68-reserve (+ base size))
                   (dotimes (i nw) (setf (mem-ref (+ base (* 2 i)) :u16) (aref w i)))
                   ;; 68000 absolute addresses: base + the target's position
                   (dolist (p patches)

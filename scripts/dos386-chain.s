@@ -11,6 +11,11 @@
 #   MODUS [IMAGE [ARGS...]]       IMAGE defaults to MODUS.BIN; ARGS become
 #                                 the multiboot command line
 #
+# With no FPU (a 386 or 486SX without a coprocessor) it loads IMAGE's
+# soft-float sibling instead: the same name with the extension .SF
+# (C:\MODUS.BIN -> C:\MODUS.SF).  An x87 image on such a machine would compute
+# garbage, not fault: the ESC opcodes do nothing there.
+#
 #   1. a 386 or better, in REAL mode (not V86: no EMM386 or other memory
 #      manager that puts DOS in a virtual 8086 task)
 #   2. find the multiboot header in the image's first 8 KB; take its
@@ -107,6 +112,7 @@ default_name:
         jnz     1b
         pop     %si
 args:
+        call    fpu_pick
         call    skipsp
         mov     $CMDLINE, %di
         mov     $FNAME, %bx             # the command line starts with the
@@ -471,6 +477,55 @@ a20_test:
 1:      or      $1, %ax                 # ZF=0: off
         ret
 
+# fpu_pick: with no FPU, FNAME's extension becomes .SF, and say so.
+# The usual probe: FNINIT, then FNSTSW must store 0 and FNSTCW the reset
+# control word 037Fh (masked to 103Fh: 003Fh).  Without an FPU the stores
+# do not happen and the planted 5A5Ah stays.  SI is kept.
+fpu_pick:
+        fninit
+        movw    $0x5A5A, fpu_word
+        fnstsw  fpu_word
+        cmpb    $0, fpu_word
+        jne     1f
+        fnstcw  fpu_word
+        mov     fpu_word, %ax
+        and     $0x103F, %ax
+        cmp     $0x3F, %ax
+        jne     1f
+        ret
+1:      push    %si
+        mov     $FNAME, %di             # DI = after the last '.' of the last
+        xor     %bx, %bx                # path component, or the end
+2:      mov     (%di), %al
+        test    %al, %al
+        jz      4f
+        cmp     $'.', %al
+        jne     3f
+        mov     %di, %bx
+3:      cmp     $'\\', %al
+        jne     5f
+        xor     %bx, %bx
+5:      inc     %di
+        jmp     2b
+4:      test    %bx, %bx
+        jz      6f
+        mov     %bx, %di
+6:      movl    $0x0046532E, (%di)      # ".SF", 0
+        mov     $msg_nofpu, %dx
+        call    puts
+        mov     $FNAME, %si
+7:      lodsb
+        test    %al, %al
+        jz      8f
+        mov     %al, %dl
+        mov     $0x02, %ah
+        int     $0x21
+        jmp     7b
+8:      mov     $msg_crlf, %dx
+        call    puts
+        pop     %si
+        ret
+
 # cmosrd: AL = CMOS register -> AL = its value (AH kept)
 cmosrd: out     %al, $0x70
         jmp     1f                      # a short delay between the ports
@@ -544,12 +599,15 @@ mem_lower: .long 0
 mem_upper: .long 0
 linear:    .long 0
 stage:     .long 0
+fpu_word:  .word 0
 
 default_image: .asciz "MODUS.BIN"
 loader_name:   .asciz "modus.com (DOS)"
 
 msg_hello:   .ascii "MODUS: DOS loader\r\n$"
 msg_loading: .ascii "MODUS: loading$"
+msg_nofpu:   .ascii "MODUS: no FPU, so the soft-float image $"
+msg_crlf:    .ascii "\r\n$"
 msg_go:      .ascii "\r\nMODUS: starting\r\n$"
 msg_err:     .ascii "\r\nMODUS: $"
 e_not386:    .ascii "needs a 386 or later\r\n$"

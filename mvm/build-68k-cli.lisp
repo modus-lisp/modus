@@ -340,6 +340,10 @@
     (setf modus.mvm::*68k-gc-poison* t)
     (format t "~&;; MODUS_68K_GC_POISON: collections poison the evacuated semispace~%")))
 
+;; MODUS_68K_CALL_SAVES=1: image calls save and restore live temps as on every
+;; other target.  Unset/0 (and no threaded code): they do not -- on the native
+;; 68k a callee cannot clobber them (compiler.lisp *CALL-TEMPS-SURVIVE*).  Set
+;; after MODUS_68K_THREADED below.
 ;; MODUS_68K_PROFILE=1: per-function execution counters (translate-68k.lisp
 ;; *68K-PROFILE*) -- a profiling build, for choosing what stays native.
 (when (let ((v (sb-ext:posix-getenv "MODUS_68K_PROFILE"))) (and v (string/= v "0")))
@@ -364,6 +368,14 @@
           (loop for l = (read-line in nil) while l
                 do (let ((n (string-trim " " l))) (when (plusp (length n)) (setf (gethash n h) t)))))
         (setf *68k-hot-names* h)))))
+(let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
+  (setf modus.mvm::*call-temps-survive*
+        (and (not *68k-threaded*) (not (and v (string= v "1"))))))
+;; MODUS_TYPE_ERROR_CODES=0: a type-error arm loads its quoted type as before;
+;; otherwise it passes a small integer (compiler.lisp *TYPE-ERROR-CODES*).
+(let ((v (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES")))
+  (unless (and v (string= v "0"))
+    (setf modus.mvm::*type-error-codes* (make-hash-table :test 'equal))))
 (let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                 "/tmp/modus-68k-cli"))
        (image (build-image :target :linux-68k

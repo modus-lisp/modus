@@ -1968,6 +1968,31 @@
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
 
+(defvar *call-temps-survive* nil
+  "When T, an image function's live temps survive a call without being saved:
+   the all-native 68k image (translate-68k: V4/V5 are D4/D5, which every
+   prologue saves, and V6..V15 are slots in the CALLER's own frame), so the
+   push before and pop after each call (12 bytes of 68k per spilled temp) are
+   dropped.  Never under runtime EVAL: that code may be INTERPRETED, and the
+   interpreter's one register file is shared across calls.  Set by the 68k
+   builds when no function is threaded code; NIL everywhere else.")
+
+(defun %call-save-count (n)
+  "How many of V4.. a call site saves and restores: N live temps capped at 12,
+   or 0 when the callee cannot clobber them (*CALL-TEMPS-SURVIVE*)."
+  (if (and *call-temps-survive* (not *mvm-eval-runtime-p*)) 0 (min n 12)))
+
+(defvar *type-error-codes* nil
+  "When non-NIL (a hash table, set by a build), an image call
+   (%SIGNAL-TYPE-ERROR X 'TYPE) compiles to (%SIGNAL-TYPE-ERROR-K X K): K a
+   small integer naming TYPE in *TYPE-ERROR-CODE-LIST*, so the site loads an
+   immediate instead of the quoted type -- on the 68k that was ~65 bytes of
+   inline static-symbol fetch at each of ~20,000 type-error arms.  The two
+   functions are generated after everything else (MVM-COMPILE-ALL).  Never
+   under runtime EVAL.")
+(defvar *type-error-code-list* nil
+  "The quoted types of *TYPE-ERROR-CODES*, most recent first.")
+
 ;; Compile-time struct-slot table for DEFSTRUCT :INCLUDE support.  Maps a
 ;; struct-name STRING -> the struct's EFFECTIVE (name . default) slot list
 ;; (parent slots first, then own — CLHS 3.4.6).  Populated as each
@@ -15265,7 +15290,7 @@
   ;; SAVE's %GV-SAVE-FILL (a COMPILE-FORM of %GV-REF-FILL here gave the
   ;; LET-special save the read's semantics).
   (let ((call-only (eq *gv-cache-mode* :call))
-        (save-count (min *temp-reg-counter* 12))
+        (save-count (%call-save-count *temp-reg-counter*))
         (miss (make-compiler-label))
         (done (make-compiler-label)))
     ;; Two temps, with DEST as a third scratch.  Register pressure is the
@@ -15441,7 +15466,7 @@
    Emitted as IR, not as a source template: a variable reference must stay a
    few instructions touching one temp and the destination, or every special
    read in runtime-compiled code drags a frame in behind it."
-  (let ((save-count (min *temp-reg-counter* 12))
+  (let ((save-count (%call-save-count *temp-reg-counter*))
         (slow (make-compiler-label))
         (done (make-compiler-label)))
     ;; Caller-save around the whole sequence: the slow arm is a CALL, and
@@ -15531,7 +15556,7 @@
     ;; array register: a fault on x64 only (aarch64 temps are x19..x23,
     ;; callee-saved).  See reference_mvm_caller_save_bug.
     (let ((cell (%runtime-global-cell var))
-          (save-count (min *temp-reg-counter* 12)))
+          (save-count (%call-save-count *temp-reg-counter*)))
       (cond
         ;; Runtime compile with the global's cell known: store in place —
         ;; li-const of the pair + setcdr (write barrier), no call, no probe.
@@ -21601,7 +21626,7 @@
         ;; V9-V15 are shared across in-module CALLs, so high-pressure temps
         ;; must be saved here too; on native x64 V9-V15 are per-frame spills
         ;; (redundant push/pop, harmless).
-        (save-count (min *temp-reg-counter* 12)))
+        (save-count (%call-save-count *temp-reg-counter*)))
     ;; Save caller-saved temp registers (V5 through V(4+save-count-1))
     ;; Skip dest register — it will be overwritten with the CALL result.
     (when (> save-count 1)
@@ -22028,7 +22053,7 @@
          (leading (butlast rest-forms))
          (spread-form (car (last rest-forms)))
          ;; cap 12 (V5..V15): match compile-call for mvm-eval flat-regfile safety.
-         (save-count (min *temp-reg-counter* 12))
+         (save-count (%call-save-count *temp-reg-counter*))
          (fn-reg (alloc-temp-reg))
          (list-reg (alloc-temp-reg))
          (direct-call-label (make-compiler-label))
@@ -22209,7 +22234,7 @@
          ;; live count is (counter - 2).
          (caller-live (max 0 (- *temp-reg-counter* 2)))
          ;; cap 12 (V5..V15): match compile-call for mvm-eval flat-regfile safety.
-         (save-count  (min caller-live 12)))
+         (save-count  (%call-save-count caller-live)))
     ;; TAG-SAFE pair (both operands provably fixnums, result may still
     ;; overflow): skip the tag test, keep the checked op + slow path.
     (unless (and *arith-trust* (car *arith-trust*))
@@ -23804,7 +23829,7 @@
    COMPILE-FUNCALL does; symbols and interp-closures are resolved by APPLY
    before it gets here."
   (let* ((fn-form (first args)) (r-form (second args)) (n-form (third args))
-         (save-count (min *temp-reg-counter* 12)))
+         (save-count (%call-save-count *temp-reg-counter*)))
     ;; Save caller-saved temp registers (as compile-funcall does).
     (when (> save-count 1)
       (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
@@ -24628,7 +24653,7 @@
         ;; div/mod emission with only 3 temps, reusing n-temp as the
         ;; MV-store address temp (a is dead by then) and dest as the
         ;; divisor register.
-        (let ((save-count (min *temp-reg-counter* 12)))
+        (let ((save-count (%call-save-count *temp-reg-counter*)))
           (compile-form a env dest)
           (emit-ir :push dest)
           (compile-form b env dest)
@@ -24674,7 +24699,7 @@
             (free-temp-reg)
             (free-temp-reg)
             (free-temp-reg)))
-        (let ((save-count (min *temp-reg-counter* 12))
+        (let ((save-count (%call-save-count *temp-reg-counter*))
               (n-temp    (alloc-temp-reg))
               (d-temp    (alloc-temp-reg))
               (q-temp    (alloc-temp-reg))
@@ -25205,7 +25230,7 @@
     ;; lookup that finds nothing, function resolution by name, argument
     ;; compiles -- was most of compiling a CAR on the 68k (qemu: ~0.9 ms each).
     (if *mvm-eval-runtime-p*
-        (let ((save-count (min *temp-reg-counter* 12)))
+        (let ((save-count (%call-save-count *temp-reg-counter*)))
           (when (> save-count 1)
             (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
                   do (unless (= r dest) (emit-ir :push r))))
@@ -25700,7 +25725,7 @@
    result and the TYPE-ERROR for a non-integer are exactly the old ones.
    Only the slow path calls, so only it saves the live caller-saved temps
    (the %COMPILE-SETQ-GLOBAL lesson); three temps, the leaf-emitter budget."
-  (let ((save-count (min *temp-reg-counter* 12)))
+  (let ((save-count (%call-save-count *temp-reg-counter*)))
     (compile-form value-form env dest)
     (let ((cnt (alloc-temp-reg)))
       (if (%leaf-operand-p count-form env)
@@ -28498,7 +28523,7 @@
    (it is written only after the access) unless DEST is VR, which the x64
    translator also uses as its spill scratch.  The cold call saves the live
    caller-saved temps, the %COMPILE-SETQ-GLOBAL discipline."
-  (let* ((save-count (min *temp-reg-counter* 12))
+  (let* ((save-count (%call-save-count *temp-reg-counter*))
          (own (= dest +vreg-vr+))
          (len (if own (alloc-temp-reg) dest))
          (ok (make-compiler-label))
@@ -29534,6 +29559,19 @@
    to prevent clobbering live variables in those registers."
   ;; Guard: args must be a proper list
   (unless (listp args) (setf args (list args)))
+  ;; (%SIGNAL-TYPE-ERROR X 'TYPE) in image code: the type as a small integer
+  ;; (*TYPE-ERROR-CODES*), one call with no quoted-symbol fetch.
+  (when (and *type-error-codes* (not *mvm-eval-runtime-p*) (symbolp fn)
+             (name-eq fn "%SIGNAL-TYPE-ERROR")
+             (consp args) (consp (cdr args)) (null (cddr args))
+             (consp (cadr args)) (eq (car (cadr args)) 'quote) (consp (cdr (cadr args))))
+    (let* ((ty (cadr (cadr args)))
+           (k (or (gethash ty *type-error-codes*)
+                  (progn (push ty *type-error-code-list*)
+                         (setf (gethash ty *type-error-codes*)
+                               (1- (length *type-error-code-list*)))))))
+      (return-from compile-call
+        (compile-call '%signal-type-error-k (list (car args) k) env dest))))
   ;; (FBOUNDP 'F) in the image's own source, F a function the image already
   ;; defines: T (the guard shared host / image source puts around a FUNCALL
   ;; of an image-only function; a run-time name lookup at every call)
@@ -29962,7 +30000,7 @@
         ;; the current *temp-reg-counter*, so low-pressure call sites (counter
         ;; <5) still save only V5..V8 (or fewer) — the V9..V15 pushes only
         ;; appear where the function actually holds that many live temps.
-        (save-count (min *temp-reg-counter* 12)))
+        (save-count (%call-save-count *temp-reg-counter*)))
     ;; Save caller-saved temp registers (V5 through V(4+save-count-1))
     ;; V4 (RBX) is callee-saved, so skip it — start from V5.
     ;; Skip dest register: it will be overwritten with the CALL result,
@@ -33605,6 +33643,8 @@
     (setq *static-keyword-index* nil)
     (setq *static-literal-index* nil)
     (setq *static-symbol-full-index* nil)
+    (when *type-error-codes*
+      (setq *type-error-codes* (make-hash-table :test 'equal) *type-error-code-list* nil))
 
     ;; Register standard macros (cond, and, or) for this compilation
     (register-mvm-bootstrap-macros)
@@ -33816,6 +33856,20 @@
     ;; root is set), and stores it.  Generated here -- after everything else,
     ;; from the complete index -- so an image built without the flag carries
     ;; neither it nor an unresolved call to it.
+    ;; *TYPE-ERROR-CODES*: the table the coded type-error arms index, and its
+    ;; entry.  Before the static-symbol functions below: its quoted types are
+    ;; static literals too.
+    (when (and *type-error-codes* *type-error-code-list*)
+      (format t "  type-error codes: ~D~%" (length *type-error-code-list*))
+      (dolist (form `((,'defun %type-error-type (k)
+                        (nth k ',(reverse *type-error-code-list*)))
+                      (,'defun %signal-type-error-k (obj k)
+                        (%signal-type-error obj (%type-error-type k)))))
+        (let* ((result (mvm-compile-toplevel form))
+               (info (car result))
+               (ir (cdr result)))
+          (when (and info ir)
+            (setf all-ir (nconc all-ir (list (cons info ir))))))))
     (when *static-symbols-p*
       (let ((n (if *static-literal-index* (hash-table-count *static-literal-index*) 0)))
         (format t "  static literal slots: ~D~%" n)

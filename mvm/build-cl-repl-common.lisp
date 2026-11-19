@@ -3819,6 +3819,11 @@
     (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
       (setf (symbol-value (sym "*CALL-TEMPS-SURVIVE*"))
             (and (not (symbol-value (sym "*68K-THREADED*"))) (not (and v (string= v "1"))))))
+    ;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k *68K-CALL-ISLANDS*)
+    (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
+      (setf (symbol-value (sym "*68K-CALL-ISLANDS*"))
+            (and (not (symbol-value (sym "*68K-THREADED*"))) (not (symbol-value (sym "*68K-PAGED*")))
+                 (not (and v (string= v "0"))))))
     ;; MODUS_68K_FIXED_NARGS=1: calls to fixed-arity functions store the count too
     (let ((v (sb-ext:posix-getenv "MODUS_68K_FIXED_NARGS")))
       (setf (symbol-value (sym "*ELIDE-FIXED-NARGS*"))

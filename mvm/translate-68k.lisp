@@ -1339,9 +1339,39 @@
                               (ash +ea-mode-an-ind+ 3)
                               (logand an 7))))
 
+(defvar *68k-call-islands* nil
+  "When T (the Quadra map), the image's native code carries CALL ISLANDS: at a
+   function boundary every ~24 KB of bytecode, a JMP abs.L stub to each of the
+   most-called routines -- the write barrier, the shared CONS and ALLOC-OBJ,
+   the collector, and the eight Lisp functions most CALLed in the bytecode --
+   so a call to one is a BSR.W (4 bytes) to the island behind it rather than a
+   JSR abs.L (6) to a routine megabytes away.  ~160,000 such calls.  Placed by
+   bytecode offset, so both relaxation passes place them alike.")
+(defvar *68k-island-map* nil
+  "While translating with islands: label -> the current island's stub for it.")
+
+(defun m68k-via-island (label-id)
+  (or (and label-id *68k-island-map* (gethash label-id *68k-island-map*)) label-id))
+
+(defun m68k-emit-island (buf targets)
+  "A call island: for each label in TARGETS a stub, JMP abs.L to it; the
+   stubs become the calls' targets (*68K-ISLAND-MAP*).  Between functions:
+   nothing falls through into it."
+  (m68k-word-align buf)
+  (let ((map (make-hash-table :test 'eql)))
+    (dolist (target targets)
+      (when target
+        (let ((stub (mvm-make-label)))
+          (m68k-emit-label buf stub)
+          (m68k-emit-word buf #x4EF9)                     ; JMP abs.L
+          (m68k-emit-abs32 buf target)
+          (setf (gethash target map) stub))))
+    (setq *68k-island-map* map)))
+
 (defun m68k-emit-bsr (buf &optional label-id)
-  "BSR to LABEL-ID (relaxed; long without a plan)."
-  (m68k-emit-branch buf #x6100 label-id))
+  "BSR to LABEL-ID (relaxed; long without a plan) -- through the current call
+   island's stub when it has one (*68K-CALL-ISLANDS*)."
+  (m68k-emit-branch buf #x6100 (m68k-via-island label-id)))
 
 (defun m68k-emit-rts (buf)
   "RTS - return from subroutine"
@@ -4038,6 +4068,10 @@
 (defun m68k-emit-bsr-long (buf label-id)
   "BSR.L target -- 68020+, 32-bit displacement, so a gc-check anywhere in an
    image of any size reaches the collector emitted after the last function."
+  (let ((via (m68k-via-island label-id)))
+    (unless (eq via label-id)                     ; a call island has it
+      (m68k-emit-bsr buf label-id)
+      (return-from m68k-emit-bsr-long nil)))
   (when *68k-cpu-68000*
     (m68k-emit-word buf #x4EB9)                          ; JSR abs.L
     (m68k-emit-abs32 buf label-id)
@@ -5207,7 +5241,10 @@
                             (list (make-hash-table :test 'equal) (make-hash-table :test 'equal)
                                   (vector 0 0 0) (make-hash-table :test 'equal))))
          (li-stats (make-hash-table :test 'equal))
-         (li-imms (make-hash-table :test 'eql)))
+         (li-imms (make-hash-table :test 'eql))
+         (call-counts (make-hash-table :test 'eql))
+         (island-targets nil) (island-pc 0)   ; none before the first 24 KB
+         (*68k-island-map* nil))
 
     ;; First pass: scan for branch targets
     (loop while (< pc len)
@@ -5215,6 +5252,8 @@
                     (opcode (car decoded))
                     (operands (cadr decoded))
                     (new-pc (cddr decoded)))
+               (when (and *68k-call-islands* (eql opcode +op-call+))
+                 (incf (gethash (first operands) call-counts 0)))
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-types (opcode-info-operands info)))
@@ -5271,10 +5310,26 @@
                  (setf (gethash mvm-offset fn-entries) t))
                function-table))
 
+    ;; CALL ISLANDS (*68K-CALL-ISLANDS*): the routines, and the eight Lisp
+    ;; functions CALLed most often in the bytecode
+    (when *68k-call-islands*
+      (let ((top nil))
+        (maphash (lambda (off n) (push (cons off n) top)) call-counts)
+        (setq top (subseq (sort top #'> :key #'cdr) 0 (min 8 (length top))))
+        (setq island-targets
+              (append (list *68k-barrier-a0-label* *68k-barrier-label* *68k-cons-label*
+                            *68k-alloc-obj-label* *68k-gc-label*)
+                      (loop for (off . nil) in top
+                            for l = (gethash off label-map) when l collect l)))))
+
     ;; Second pass: translate
     (setf pc 0)
     (loop while (< pc len)
           do (progn
+               (when (and island-targets (gethash pc fn-entries)
+                          (> (- pc island-pc) 24000))
+                 (m68k-emit-island buf island-targets)
+                 (setq island-pc pc))
                ;; FUNCTION ENTRIES ARE 16-ALIGNED.  +op-fn-addr+ ORs the function
                ;; tag 3 into an entry address, and everything that classifies a
                ;; value reads the low FOUR bits: an entry at 4/8/12 mod 16 tags

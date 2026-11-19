@@ -380,6 +380,10 @@
 (let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_SAVES")))
   (setf modus.mvm::*call-temps-survive*
         (and (not *68k-threaded*) (not (and v (string= v "1"))))))
+;; MODUS_68K_CALL_ISLANDS=0: no call islands (translate-68k.lisp
+;; *68K-CALL-ISLANDS*); otherwise on, without threaded or paged code.
+(let ((v (sb-ext:posix-getenv "MODUS_68K_CALL_ISLANDS")))
+  (setf *68k-call-islands* (and (not *68k-threaded*) (not *68k-paged*) (not (and v (string= v "0"))))))
 ;; MODUS_68K_FIXED_NARGS=1: every image call stores its argument count, as on
 ;; other targets; otherwise a call to a fixed-arity function does not
 ;; (compiler.lisp *ELIDE-FIXED-NARGS*).  Not with threaded code.

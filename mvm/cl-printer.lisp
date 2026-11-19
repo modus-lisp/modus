@@ -1068,6 +1068,11 @@
       ;; and print its raw representation, #(%CLOS-INSTANCE PT 1).
       ;; A PATHNAME is a %CLOS-INSTANCE underneath; leave it to the #P arm
       ;; below unless the user has a PRINT-OBJECT method for it.
+      ;; a funcallable instance prints as the instance it is, not #<FUNCTION>
+      ((%fin-p obj)
+       (if (%user-print-object-p obj)
+           (%print-object-user obj stream)
+           (%print-instance-default (%fin-instance obj) stream)))
       ((and (%clos-instance-p obj)
             (or (not (%pathname-obj-p obj)) (%user-print-object-p obj)))
        (if (%user-print-object-p obj)

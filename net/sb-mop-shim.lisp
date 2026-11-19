@@ -52,7 +52,8 @@
                        'method-qualifiers 'method-specializers 'method-function
                        'method-generic-function
                        'compute-applicable-methods 'compute-applicable-methods-using-classes
-                       'compute-class-precedence-list 'standard-instance-access)))
+                       'compute-class-precedence-list 'standard-instance-access
+                       'set-funcallable-instance-function)))
   ;; check every one before creating anything, so a missing name leaves NO SB-MOP behind
   (dolist (%s %mop-syms)
     (when (not (fboundp %s))
@@ -61,6 +62,11 @@
               UNDEFINED-FUNCTION at the call site" %s)))
   (let ((%pkg (or (find-package "SB-MOP") (make-package "SB-MOP" :use '()))))
     (dolist (%s %mop-syms)
+      (import %s %pkg)
+      (export %s %pkg))
+    ;; the two class names, which name classes and no function: cl-clos's own
+    ;; symbols -- read here they would be this file's, and name no class
+    (dolist (%s (%funcallable-class-names))
       (import %s %pkg)
       (export %s %pkg)))
   (pushnew :sb-mop *features*))

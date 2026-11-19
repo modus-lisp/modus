@@ -8229,7 +8229,17 @@
         ;; %clos-make-initform-thunk bridge the initform path uses (an
         ;; in-module closure escaping unwrapped executes garbage when a
         ;; later make-instance funcalls it cross-module).
-        (let ((default-initarg-pairs nil))
+        (let ((default-initarg-pairs nil)
+              ;; (:METACLASS FUNCALLABLE-STANDARD-CLASS), by name: SB-MOP's
+              ;; and any package's spelling of it.  Other metaclasses are
+              ;; still ignored, as they were.
+              (funcallable (dolist (opt (cddddr form) nil)
+                             (when (and (consp opt) (symbolp (car opt))
+                                        (string= (symbol-name (car opt)) "METACLASS")
+                                        (consp (cdr opt)) (symbolp (cadr opt))
+                                        (string= (symbol-name (cadr opt))
+                                                 "FUNCALLABLE-STANDARD-CLASS"))
+                               (return t)))))
           (dolist (opt (cddddr form))
             (when (and (consp opt) (symbolp (car opt))
                        (string= (symbol-name (car opt)) "DEFAULT-INITARGS"))
@@ -8245,6 +8255,10 @@
           `(progn
              (%defclass-name-check ',class-name)
              (%defclass ',class-name ',slot-names ',supers)
+             ;; always at run time, so a redefinition without the option
+             ;; clears it; in the image only where a class has it
+             ,@(when (or funcallable *mvm-eval-runtime-p*)
+                 `((%register-clos-funcallable ',class-name ',funcallable)))
              (%register-clos-slot-info ',class-name
                                        (list ,@(nreverse initarg-pairs))
                                        (list ,@(nreverse initform-pairs)))

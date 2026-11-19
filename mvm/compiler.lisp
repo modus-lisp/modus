@@ -5834,6 +5834,31 @@
                 (if binds `(let ,binds ,body) body))
               form))))))
 
+  ;; (RPLACA C V) / (RPLACD C V), exactly two arguments: the store inline.
+  ;; The functions take &REST to report a wrong argument count themselves
+  ;; (cl-sequences), so every call consed its argument list -- and SETF of
+  ;; CAR / CDR expands to them, so did every (setf (car cell) x), including
+  ;; the cell of a variable a closure captures: 16 bytes and a full call per
+  ;; assignment (json-simple's UTF-8 decoder, whose FLET closes over its
+  ;; index, allocated 16 bytes per character).  Any other argument count
+  ;; keeps the call and its PROGRAM-ERROR; a non-cons signals the same
+  ;; TYPE-ERROR the function does (%RPLAC-NOT-CONS).  C is evaluated before
+  ;; V, as in the call.
+  (mvm-define-macro "RPLACA"
+    (lambda (form)
+      (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+          (let ((c (%mvm-gensym "RPC")) (v (%mvm-gensym "RPV")))
+            `(let ((,c ,(cadr form)) (,v ,(caddr form)))
+               (if (consp ,c) (progn (set-car ,c ,v) ,c) (%rplac-not-cons ,c))))
+          form)))
+  (mvm-define-macro "RPLACD"
+    (lambda (form)
+      (if (and (consp (cdr form)) (consp (cddr form)) (null (cdddr form)))
+          (let ((c (%mvm-gensym "RPC")) (v (%mvm-gensym "RPV")))
+            `(let ((,c ,(cadr form)) (,v ,(caddr form)))
+               (if (consp ,c) (progn (set-cdr ,c ,v) ,c) (%rplac-not-cons ,c))))
+          form)))
+
   ;; (FLOOR A B): two fixnums divide inline (%FIXNUM-TRUNCATE2, then the
   ;; toward-minus-infinity adjustment); anything else calls %FLOOR2, the
   ;; defun's two-argument body.  (189 ns -> a division.)

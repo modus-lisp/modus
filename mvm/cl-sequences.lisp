@@ -5477,7 +5477,13 @@
          (t (%mda-row-major-index dims subscripts)))))
     (t (if (null subscripts) 0 (car subscripts)))))
 
-;;; RPLACA/RPLACD — type-check first arg, strict 2-arg arity
+;;; RPLACA/RPLACD — type-check first arg, strict 2-arg arity.  A two-argument
+;;; call site is inlined by the compiler (mvm-define-macro "RPLACA"), which
+;;; signals through %RPLAC-NOT-CONS; these bodies serve every other shape
+;;; (FUNCALL / APPLY, a wrong argument count).
+(defun %rplac-not-cons (x)
+  (error (make-condition 'type-error :datum x :expected-type 'cons)))
+
 (defun rplaca (cons-arg &rest more)
   (if (null more)
       (%program-error "rplaca requires exactly 2 arguments")

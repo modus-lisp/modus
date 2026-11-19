@@ -11,7 +11,8 @@ ROMS = os.environ.get('ROMS', os.path.expanduser('~/86Box-roms'))
 
 # Set-1 make codes; 0x100 marks an E0-prefixed key.
 KEYS = {'esc': 0x01, 'enter': 0x1C, 'space': 0x39, 'tab': 0x0F, 'y': 0x15, 'n': 0x31,
-        'f1': 0x3B, 'f2': 0x3C, 'f3': 0x3D, 'f10': 0x44, 'del': 0x153,
+        'f1': 0x3B, 'f2': 0x3C, 'f3': 0x3D, 'f4': 0x3E, 'f5': 0x3F, 'f6': 0x40,
+        'f7': 0x41, 'f8': 0x42, 'f9': 0x43, 'f10': 0x44, 'f11': 0x57, 'f12': 0x58, 'del': 0x153,
         'up': 0x148, 'down': 0x150, 'left': 0x14B, 'right': 0x14D,
         'pgup': 0x149, 'pgdn': 0x151, 'home': 0x147, 'end': 0x14F,
         'plus': 0x4E, 'minus': 0x4A, 'lshift': 0x2A}
@@ -26,6 +27,11 @@ for row, base in (('qwertyuiop', 0x10), ('asdfghjkl', 0x1E), ('zxcvbnm', 0x2C)):
 CONTINUE = [(re.compile(r'<?ESC>?\s*to\s*(Boot|continue|skip)', re.I), 'esc'),
             (re.compile(r'<?F1>?\s*(key\s*)?to\s*(continue|resume)', re.I), 'f1'),
             (re.compile(r'<?F2>?\s*to\s*(continue|resume|load default)', re.I), 'f2')]
+
+
+# MODUS.COM's refusals (scripts/dos386-chain.s: each error is "MODUS: " and
+# one of these); "MODUS: no FPU, so ..." is not one.
+MODUS_REFUSED = re.compile(r'MODUS: (needs|the CPU|cannot|no multiboot|the multiboot|the image|the BIOS|not enough)')
 
 
 def continue_key(scr):

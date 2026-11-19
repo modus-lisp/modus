@@ -21,8 +21,9 @@
 #   2. find the multiboot header in the image's first 8 KB; take its
 #      load_addr / load_end_addr / bss_end_addr / entry_addr (the a.out
 #      kludge is required: there is no ELF reader here)
-#   3. extended memory from the BIOS (INT 15h E801, else 88h), and A20 on
-#      (INT 15h 2401, else port 92h), checked by the wrap-around test
+#   3. extended memory from the BIOS (INT 15h E801, else 88h, else CMOS),
+#      and A20 on (INT 15h 2401, else the 8042's output port, else port 92h),
+#      checked by the wrap-around test
 #   4. read the image in 32 KB pieces through DOS, copying each one above
 #      1 MB through FS in UNREAL mode (FS's descriptor cache keeps a 4 GB
 #      limit after the return to real mode), then zero the BSS
@@ -444,14 +445,46 @@ a20_on:
         int     $0x15
         call    a20_test
         jz      9f
+        call    kbc_wait                # the keyboard controller's output
+        mov     $0xD1, %al              # port: write it with bit 1 (A20) on
+        out     %al, $0x64
+        call    kbc_wait
+        mov     $0xDF, %al
+        out     %al, $0x60
+        call    kbc_wait
+        call    a20_settle
+        jz      9f
         in      $0x92, %al
         test    $2, %al
         jnz     1f
         or      $2, %al
         and     $0xFE, %al
         out     %al, $0x92
-1:      call    a20_test
+1:      call    a20_settle
 9:      ret
+
+# a20_settle: a20_test until A20 is on or 64K tries have passed; a gate the
+# keyboard controller drives can take a while to follow.
+a20_settle:
+        push    %cx
+        xor     %cx, %cx
+1:      call    a20_test
+        jz      2f
+        loop    1b
+        or      $1, %ax                 # ZF=0: still off
+2:      pop     %cx
+        ret
+
+# kbc_wait: until the 8042's input buffer is empty (status bit 1), at most
+# 64K reads: a machine with no 8042 must not hang here.
+kbc_wait:
+        push    %cx
+        xor     %cx, %cx
+1:      in      $0x64, %al
+        test    $2, %al
+        loopnz  1b
+        pop     %cx
+        ret
 
 # a20_test: ZF set when 0000:0500 and FFFF:0510 (= 100500h) differ, i.e. the
 # address does not wrap.

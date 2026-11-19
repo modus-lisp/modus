@@ -89,7 +89,8 @@
            ;; the browser stack (weft, shuttle, loom) reaches for these
            "FLOAT-NAN-P" "FLOAT-INFINITY-P" "GET-TIME-OF-DAY"
            "MAKE-WEAK-POINTER" "WEAK-POINTER-VALUE" "PARSE-NATIVE-NAMESTRING"
-           "WITH-TIMEOUT" "TIMEOUT" "GET-BYTES-CONSED"))
+           "WITH-TIMEOUT" "TIMEOUT" "GET-BYTES-CONSED"
+           "WORD" "ATOMIC-INCF" "ATOMIC-DECF"))
 
 ;;; SB-UNICODE: the one name shuttle's regular expressions use (\p{...}).
 (defpackage "SB-UNICODE"
@@ -617,6 +618,32 @@
             (hosted x86-64 Linux only)."))
   (+ (mem-ref #x10000D38 :u64)
      (- (get-alloc-ptr) (* 2 (mem-ref (%gc-region) :u64)))))
+
+;;; SB-EXT:WORD -- the machine word as an unsigned integer type.
+(deftype sb-ext:word () '(unsigned-byte 64))
+
+;;; SB-EXT:ATOMIC-INCF / ATOMIC-DECF -- add to PLACE as one indivisible step and
+;;; return the OLD value, as SBCL does, for any SETF-able place (SBCL allows a
+;;; struct slot of type WORD, an AREF of a WORD vector, CAR / CDR).  The step
+;;; runs under net/cooperative-atomics.lisp's process-wide atomics lock when
+;;; threads are live (the same lock %ATOMIC-INCF takes), else plainly.
+;;; PARTIAL: no modular wraparound -- SBCL wraps a WORD place at 2^64 and a
+;;; fixnum one at the fixnum range; here the sum is exact.  Atomic only against
+;;; other ATOMIC-INCF / ATOMIC-DECF of the place, not against a plain SETF of
+;;; it (no compare-exchange instruction; see that file).  COMPARE-AND-SWAP is
+;;; deliberately NOT provided, for the reason that file gives.
+(defmacro %sb-atomic-add (place delta)
+  (let ((d (gensym "D")) (old (gensym "OLD")))
+    `(let ((,d ,delta) (,old nil))
+       (if (= (%rt-threads-live-p) 0)
+           (progn (setq ,old ,place) (setf ,place (+ ,old ,d)))
+           (progn
+             (%atomics-acquire)
+             (unwind-protect (progn (setq ,old ,place) (setf ,place (+ ,old ,d)))
+               (%atomics-release))))
+       ,old)))
+(defmacro sb-ext:atomic-incf (place &optional (diff 1)) `(%sb-atomic-add ,place ,diff))
+(defmacro sb-ext:atomic-decf (place &optional (diff 1)) `(%sb-atomic-add ,place (- ,diff)))
 
 (defun sb-ext:gc (&rest options)
   "Force one collection of THIS thread\'s active region.  :FULL and :GEN are

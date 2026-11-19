@@ -65,6 +65,23 @@
 (defconstant +i386-cl-v-count+  #x8048 "The core's collection count.")
 (defconstant +i386-cl-v-heapb+  #x804C "The core's heap bytes.")
 (defconstant +i386-cl-v-bmb+    #x8050 "One bitmap slice's bytes.")
+;; DEMAND-PAGED CODE (a version-3 core with a code store): the restored
+;; process's native code is not resident; a page fault in [plo, phi) maps a
+;; slot of the pool there and decodes the 16 KB chunk into it.
+(defconstant +i386-cl-v-plo+    #x8054 "Paged code: first chunk's address (0: no paging).")
+(defconstant +i386-cl-v-phi+    #x8058 "Paged code: end.")
+(defconstant +i386-cl-v-store+  #x805C "The code store's header (physical = virtual).")
+(defconstant +i386-cl-v-poolpa+ #x8060 "The pool's first page.")
+(defconstant +i386-cl-v-nslots+ #x8064 "The pool's 16 KB slots.")
+(defconstant +i386-cl-v-next+   #x8068 "The next slot to fill (round robin).")
+(defconstant +i386-cl-v-pagedn+ #x806C "The paged code's bytes, given to the heap.")
+(defconstant +i386-cl-v-pool+   #x8070 "The pool's bytes.")
+(defconstant +i386-cl-v-pfaddr+ #x8074 "The page-fault handler's address.")
+(defconstant +i386-cl-v-faults+ #x8078 "Chunks decoded so far (a count, for the curious).")
+(defconstant +i386-cl-v-rem+    #x807C "Heap bytes still to map.")
+(defconstant +i386-cl-owners+   #x8400 "Per slot: the chunk address it holds, or -1.  768 slots at most.")
+(defconstant +i386-cl-pt-window+ #xFFC00000
+  "The page tables, through the page directory's last entry pointing at itself.")
 (defconstant +i386-cl-cmdline+  #x8200
   "The Multiboot command line, copied here by the stub (255 bytes, NUL-ended).")
 (defconstant +i386-cl-core-data+ 64 "The core's header bytes; its data follow.")
@@ -172,6 +189,12 @@
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hdr+) (i386l-le32-list 0))
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-tail+) (i386l-le32-list 0))
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-coren+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-plo+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-phi+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-store+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-pagedn+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-pool+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-faults+) (i386l-le32-list 0))
        (i386cl-abs '(#xA1) (+ +i386-cl-load-addr+ 20))        ; mov eax, [load_end]
        (cons #x3D (i386l-le32-list (+ +i386-cl-load-addr+ 64)))  ; long enough?
        '(:jcc32 #x72 probe-done)                              ; jb
@@ -183,16 +206,51 @@
        (cons #x81 (cons #x3B (i386l-le32-list #x524F434D)))   ; cmp [ebx], 'MCOR'
        '(:jcc32 #x75 probe-done)
        (cons #x83 '(#x7B #x04 #x02))                          ; cmp dword [ebx+4], 2
-       '(:jcc32 #x75 probe-done)
+       '(:jcc32 #x72 probe-done)                              ; jb: versions 2 and 3
        (i386cl-abs '(#x89 #x1D) +i386-cl-v-hdr+)
        '(#x8B #x4B #x14) (i386cl-abs '(#x89 #x0D) +i386-cl-v-tailpa+)   ; tail's first page
        '(#x8B #x53 #x18) '(#x29 #xCA)                         ; edx = last - first
        '(:j8 #x76 no-tail)                                    ; jbe
        (i386cl-abs '(#x89 #x15) +i386-cl-v-tail+)
        '(:label no-tail)
-       ;; the core's whole pages: [header, (load_end - 16) & ~4095)
+       ;; the core's whole pages: [header, (load_end - 16) & ~4095), or, with
+       ;; a code store (version 3), [header, store): the store stays
        '(#x89 #xC1) '(#x83 #xE9 #x10)                         ; ecx = load_end - 16
        '(#x81 #xE1) (i386l-le32-list #xFFFFF000)
+       (cons #x83 '(#x7B #x04 #x03))                          ; cmp dword [ebx+4], 3
+       '(:j8 #x72 core-span)                                  ; jb
+       '(#x8B #x4B #x1C)                                      ; ecx = store
+       (i386cl-abs '(#x89 #x0D) +i386-cl-v-store+)
+       '(#x8B #x01) (i386cl-abs '(#xA3) +i386-cl-v-plo+)      ; store: plo, phi
+       '(#x8B #x41 #x04) (i386cl-abs '(#xA3) +i386-cl-v-phi+)
+       (i386cl-abs '(#x2B #x05) +i386-cl-v-plo+)
+       (i386cl-abs '(#xA3) +i386-cl-v-pagedn+)
+       ;; the pool: RAM/4, at least 2 MB, at most the paged code itself (then
+       ;; nothing is ever evicted) and 12 MB.  Measured with
+       ;; test/dos386/coverage-forms.lisp: its code working set is ~6 MB;
+       ;; a 6 MB pool ran it in the time of an unpaged image, 4 MB 35%
+       ;; slower, 3 MB 4x.
+       (i386cl-abs '(#xA1) +i386-cl-v-ramend+) '(#xC1 #xE8 #x02)
+       (cons #x3D (i386l-le32-list #x200000)) '(:j8 #x73 pool-lo)
+       (cons #xB8 (i386l-le32-list #x200000))
+       '(:label pool-lo)
+       (i386cl-abs '(#x3B #x05) +i386-cl-v-pagedn+) '(:j8 #x76 pool-paged)
+       (i386cl-abs '(#xA1) +i386-cl-v-pagedn+)
+       '(:label pool-paged)
+       (cons #x3D (i386l-le32-list #xC00000)) '(:j8 #x76 pool-hi)
+       (cons #xB8 (i386l-le32-list #xC00000))
+       '(:label pool-hi)
+       ;; ... unless the header names a size (+32; 0: this rule), 12 MB at most
+       '(#x8B #x53 #x20) '(#x85 #xD2) '(:j8 #x74 pool-rule)
+       '(#x89 #xD0) (cons #x3D (i386l-le32-list #xC00000)) '(:j8 #x76 pool-rule)
+       (cons #xB8 (i386l-le32-list #xC00000))
+       '(:label pool-rule)
+       (i386cl-abs '(#x3B #x05) +i386-cl-v-pagedn+) '(:j8 #x76 pool-fits)
+       (i386cl-abs '(#xA1) +i386-cl-v-pagedn+)
+       '(:label pool-fits)
+       (cons #x25 (i386l-le32-list #xFFFFC000))
+       (i386cl-abs '(#xA3) +i386-cl-v-pool+)
+       '(:label core-span)
        '(#x29 #xD9)                                           ; - header
        '(:j8 #x76 probe-done)                                 ; jbe
        (i386cl-abs '(#x89 #x0D) +i386-cl-v-coren+)
@@ -205,6 +263,8 @@
        (cons #x2D (i386l-le32-list +i386-cl-pt-reserve+))     ; sub eax, reserve
        (i386cl-abs '(#x03 #x05) +i386-cl-v-tail+)            ; + the dead tail
        (i386cl-abs '(#x03 #x05) +i386-cl-v-coren+)           ; + the core's pages
+       (i386cl-abs '(#x03 #x05) +i386-cl-v-pagedn+)          ; + the paged code
+       (i386cl-abs '(#x2B #x05) +i386-cl-v-pool+)            ; - the pool
        '(#x89 #xC2) '(#xC1 #xEA #x05) '(#x29 #xD0)            ; eax -= eax/32
        '(#x89 #xC7)                                           ; edi = X
        '(#x31 #xD2) (cons #xB9 (i386l-le32-list 9)) '(#xF7 #xF1) ; eax = X/9
@@ -237,33 +297,60 @@
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hdr+) (i386l-le32-list 0))
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-tail+) (i386l-le32-list 0))
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-coren+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-plo+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-phi+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-pagedn+) (i386l-le32-list 0))
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-pool+) (i386l-le32-list 0))
        '(:jmp32 0 size-again)
        '(:label fits)
        ;; the heap, S + M at VA #x19000000 (not zeroed: every allocation
        ;; initialises what it takes, as on the hosted mmap's fresh pages):
-       ;; the tail's pages, the core's, then fresh RAM.  [hcur] = next VA.
+       ;; the tail's pages, the core's, the paged code's past the pool, then
+       ;; fresh RAM: each run only as far as the heap still needs ([rem]); a
+       ;; small machine's heap can be smaller than what a restore frees.
+       ;; [hcur] = the next heap VA.  The POOL is the paged code's first
+       ;; pages: they are free once the code is unmapped, and contiguous.
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hcur+) (i386l-le32-list +i386-cl-heap-va+))
-       (i386cl-abs '(#x8B #x0D) +i386-cl-v-tail+)
-       '(#x85 #xC9) '(:j8 #x74 map-no-tail)
-       (i386cl-abs '(#x8B #x35) +i386-cl-v-tailpa+)
-       (i386cl-abs '(#x8B #x3D) +i386-cl-v-hcur+)
-       '(#xC1 #xE9 #x0C) '(:call 0 map)
-       (i386cl-abs '(#xA1) +i386-cl-v-tail+) (i386cl-abs '(#x01 #x05) +i386-cl-v-hcur+)
-       '(:label map-no-tail)
-       (i386cl-abs '(#x8B #x0D) +i386-cl-v-coren+)
-       '(#x85 #xC9) '(:j8 #x74 map-no-core)
-       (i386cl-abs '(#x8B #x35) +i386-cl-v-hdr+)
-       (i386cl-abs '(#x8B #x3D) +i386-cl-v-hcur+)
-       '(#xC1 #xE9 #x0C) '(:call 0 map)
-       (i386cl-abs '(#xA1) +i386-cl-v-coren+) (i386cl-abs '(#x01 #x05) +i386-cl-v-hcur+)
-       '(:label map-no-core)
-       ;; the rest: S + M - (hcur - heap)
-       (i386cl-abs '(#x8B #x0D) +i386-cl-v-s+) (i386cl-abs '(#x03 #x0D) +i386-cl-v-m+)
-       (cons #x81 (cons #xC1 (i386l-le32-list +i386-cl-heap-va+)))   ; add ecx, heap
-       (i386cl-abs '(#x2B #x0D) +i386-cl-v-hcur+)
+       (i386cl-abs '(#xA1) +i386-cl-v-s+) (i386cl-abs '(#x03 #x05) +i386-cl-v-m+)
+       (i386cl-abs '(#xA3) +i386-cl-v-rem+)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-tail+) (i386cl-abs '(#x8B #x35) +i386-cl-v-tailpa+)
+       '(:call 0 maprun)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-coren+) (i386cl-abs '(#x8B #x35) +i386-cl-v-hdr+)
+       '(:call 0 maprun)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-pagedn+) (i386cl-abs '(#x2B #x0D) +i386-cl-v-pool+)
+       (i386cl-abs '(#x8B #x35) +i386-cl-v-plo+) (i386cl-abs '(#x03 #x35) +i386-cl-v-pool+)
+       '(:call 0 maprun)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-rem+)
+       '(#x85 #xC9) '(:j8 #x74 map-fresh-done)
        '(#x51) '(:call 0 alloc) '(#x89 #xC6) '(#x59)          ; esi = PA
-       '(#xC1 #xE9 #x0C)
-       (i386cl-abs '(#x8B #x3D) +i386-cl-v-hcur+) '(:call 0 map)
+       '(:call 0 maprun)
+       '(:label map-fresh-done)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-pagedn+)
+       '(#x85 #xC9) '(:jcc32 #x74 map-no-paged)
+       ;; the pool, its slots all empty
+       (i386cl-abs '(#xA1) +i386-cl-v-plo+) (i386cl-abs '(#xA3) +i386-cl-v-poolpa+)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-pool+) '(#xC1 #xE9 #x0E)    ; ecx = slots
+       (i386cl-abs '(#x89 #x0D) +i386-cl-v-nslots+)
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-next+) (i386l-le32-list 0))
+       (cons #xBF (i386l-le32-list +i386-cl-owners+))
+       '(#x83 #xC8 #xFF) '(#xF3 #xAB)                         ; eax = -1; rep stosd
+       ;; the code's own addresses not present: [plo, phi), a PTE at a time
+       (i386cl-abs '(#x8B #x3D) +i386-cl-v-plo+)
+       '(:label unmap-next)
+       (i386cl-abs '(#x3B #x3D) +i386-cl-v-phi+) '(:jcc32 #x73 unmap-done)
+       '(#x89 #xF8) '(#xC1 #xE8 #x16) '(#xC1 #xE0 #x02)       ; eax = (va >> 22) * 4
+       (i386cl-abs '(#x03 #x05) +i386-cl-v-pd+)
+       '(#x8B #x00) (cons #x25 (i386l-le32-list #xFFFFF000))  ; eax = PT
+       '(#x89 #xFA) '(#xC1 #xEA #x0C) '(#x81 #xE2) (i386l-le32-list #x3FF)
+       '(#xC7 #x04 #x90) (i386l-le32-list 0)                  ; mov [eax+edx*4], 0
+       '(#x81 #xC7) (i386l-le32-list 4096)
+       '(:jmp32 0 unmap-next)
+       '(:label unmap-done)
+       ;; the page directory's last entry is the directory: the handler reaches
+       ;; every PTE at +I386-CL-PT-WINDOW+
+       (i386cl-abs '(#xA1) +i386-cl-v-pd+) '(#x89 #xC2) '(#x83 #xCA #x03)
+       '(#x89 #x90) (i386l-le32-list (* 1023 4))              ; mov [eax+4092], edx
+       '(:label map-no-paged)
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-s+) (i386cl-abs '(#x03 #x0D) +i386-cl-v-m+)  ; ecx = S+M
        ;; one bitmap = (S+M)/128, page-rounded; both zeroed, after the heap
        '(#xC1 #xE9 #x07)
@@ -291,6 +378,110 @@
        '(:j8 #xEB paged)                                      ; serialise
        '(:label paged)
        (cons #xBC (i386l-le32-list (- +i386-cl-stack-top+ 16)))   ; mov esp, stack top
+       ;; ---- the page-fault handler.  The CALL pushes its address and skips it.
+       '(:call 0 pf-after)
+       ;; A fault in [plo, phi): the next slot of the pool (its old chunk
+       ;; unmapped), mapped at the 16 KB chunk holding CR2, the chunk decoded
+       ;; into it from the store.  Clean code, so a chunk evicted while a
+       ;; return address still points into it just faults back in.  Anything
+       ;; else: "#PF cr2 eip" on COM1 and halt -- no IDT entry for it before.
+       '(:label pf-handler)
+       '(#x60)                                                ; pushad
+       '(#x0F #x20 #xD0)                                      ; mov eax, cr2
+       (i386cl-abs '(#x3B #x05) +i386-cl-v-plo+) '(:jcc32 #x72 pf-other)
+       (i386cl-abs '(#x3B #x05) +i386-cl-v-phi+) '(:jcc32 #x73 pf-other)
+       (cons #x25 (i386l-le32-list #xFFFFC000))               ; the chunk
+       '(#x89 #xC3)                                           ; ebx = chunk va
+       ;; the victim, by SECOND CHANCE: a slot whose chunk was touched since
+       ;; the hand last passed (an Accessed bit in its PTEs) loses the bits
+       ;; and is passed over; every fault reloads CR3, so the CPU sets them
+       ;; again on the next touch.  Ends within one turn of the pool.
+       '(:label pf-pick)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-next+)
+       '(#x8D #x51 #x01)                                      ; edx = next + 1
+       (i386cl-abs '(#x3B #x15) +i386-cl-v-nslots+) '(:j8 #x72 pf-wrap)
+       '(#x31 #xD2)
+       '(:label pf-wrap)
+       (i386cl-abs '(#x89 #x15) +i386-cl-v-next+)
+       (append '(#x8B #x04 #x8D) (i386l-le32-list +i386-cl-owners+))   ; eax = owner[ecx]
+       '(#x83 #xF8 #xFF) '(:jcc32 #x74 pf-noevict)
+       '(#x89 #xC7) '(#xC1 #xEF #x0C) '(#xC1 #xE7 #x02)       ; edi = PTE of the old chunk
+       (cons #x81 (cons #xC7 (i386l-le32-list +i386-cl-pt-window+)))
+       '(#x8B #x17) '(#x0B #x57 #x04) '(#x0B #x57 #x08) '(#x0B #x57 #x0C)
+       '(#xF6 #xC2 #x20) '(:jcc32 #x74 pf-evict)              ; none Accessed: evict
+       '(#x83 #x27 #xDF) '(#x83 #x67 #x04 #xDF) '(#x83 #x67 #x08 #xDF) '(#x83 #x67 #x0C #xDF)
+       '(:jmp32 0 pf-pick)
+       '(:label pf-evict)
+       '(#x31 #xD2) '(#x89 #x17) '(#x89 #x57 #x04) '(#x89 #x57 #x08) '(#x89 #x57 #x0C)
+       '(:label pf-noevict)
+       (append '(#x89 #x1C #x8D) (i386l-le32-list +i386-cl-owners+))   ; owner[ecx] = chunk
+       '(#x89 #xC8) '(#xC1 #xE0 #x0E)                         ; eax = slot * 16 KB
+       (i386cl-abs '(#x03 #x05) +i386-cl-v-poolpa+) '(#x83 #xC8 #x03)  ; | present, rw
+       '(#x89 #xDF) '(#xC1 #xEF #x0C) '(#xC1 #xE7 #x02)
+       (cons #x81 (cons #xC7 (i386l-le32-list +i386-cl-pt-window+)))
+       '(#x89 #x07) (cons #x05 (i386l-le32-list 4096))
+       '(#x89 #x47 #x04) (cons #x05 (i386l-le32-list 4096))
+       '(#x89 #x47 #x08) (cons #x05 (i386l-le32-list 4096))
+       '(#x89 #x47 #x0C)
+       '(#x0F #x20 #xD8) '(#x0F #x22 #xD8)                    ; reload CR3: a 386 has no INVLPG
+       (i386cl-abs '(#xFF #x05) +i386-cl-v-faults+)
+       ;; the store: plo, phi, chunk bytes, n, offsets[n+1], data
+       '(#x89 #xD8) (i386cl-abs '(#x2B #x05) +i386-cl-v-plo+) '(#xC1 #xE8 #x0E)   ; eax = k
+       (i386cl-abs '(#x8B #x35) +i386-cl-v-store+)
+       '(#x8B #x4E #x0C)                                      ; ecx = n
+       '(#x8D #x54 #x8E #x14)                                 ; edx = data = store + 4n + 20
+       '(#x8B #x4C #x86 #x14)                                 ; ecx = offsets[k+1]
+       '(#x8B #x74 #x86 #x10)                                 ; esi = offsets[k]
+       '(#x01 #xD1) '(#x01 #xD6)                              ; + data
+       '(#x89 #xDF) '(#xFC)                                   ; edi = chunk; cld
+       ;; LZ4 block: token; literals (15: + bytes to a non-255); unless at the
+       ;; end, a 16-bit offset and the match (low nibble + 4, 15: + bytes)
+       '(:label lz-next)
+       '(#x31 #xC0) '(#xAC) '(#x89 #xC3)                      ; eax = ebx = token
+       '(#xC1 #xE8 #x04) '(#x83 #xF8 #x0F) '(:jcc32 #x75 lz-lit)
+       '(:label lz-lit-more)
+       '(#x0F #xB6 #x16) '(#x46) '(#x01 #xD0)                 ; edx = *esi++; eax += edx
+       (cons #x81 (cons #xFA (i386l-le32-list 255))) '(:jcc32 #x74 lz-lit-more)
+       '(:label lz-lit)
+       '(#x51) '(#x89 #xC1) '(#xF3 #xA4) '(#x59)              ; the literals
+       '(#x39 #xCE) '(:jcc32 #x73 lz-done)                    ; end of the block?
+       '(#x31 #xC0) '(#x66 #xAD) '(#x89 #xC2)                 ; edx = offset
+       '(#x89 #xD8) '(#x83 #xE0 #x0F) '(#x83 #xF8 #x0F) '(:jcc32 #x75 lz-match)
+       '(#x52)
+       '(:label lz-match-more)
+       '(#x0F #xB6 #x16) '(#x46) '(#x01 #xD0)
+       (cons #x81 (cons #xFA (i386l-le32-list 255))) '(:jcc32 #x74 lz-match-more)
+       '(#x5A)
+       '(:label lz-match)
+       '(#x83 #xC0 #x04)
+       '(#x56) '(#x89 #xFE) '(#x29 #xD6)                      ; esi = edi - offset
+       '(#x51) '(#x89 #xC1) '(#xF3 #xA4) '(#x59) '(#x5E)      ; byte by byte: overlap is a run
+       '(:jmp32 0 lz-next)
+       '(:label lz-done)
+       '(#x61) '(#x83 #xC4 #x04) '(#xCF)                      ; popad; drop the error code; iret
+       ;; not ours
+       '(:label pf-other)
+       '(#xB0 #x23) '(:call 0 pf-putc) '(#xB0 #x50) '(:call 0 pf-putc)
+       '(#xB0 #x46) '(:call 0 pf-putc) '(#xB0 #x20) '(:call 0 pf-putc)
+       '(#x0F #x20 #xD0) '(:call 0 pf-hex)                    ; cr2
+       '(#xB0 #x20) '(:call 0 pf-putc)
+       '(#x8B #x44 #x24 #x24) '(:call 0 pf-hex)               ; the faulting EIP
+       '(#xB0 #x0A) '(:call 0 pf-putc)
+       '(:label pf-halt) '(#xFA) '(#xF4) '(:j8 #xEB pf-halt)
+       '(:label pf-putc)                                      ; AL to COM1
+       '(#x52) '(#x50) (cons #x66 (cons #xBA '(#xFD #x03)))   ; mov dx, 3FDh
+       '(:label pf-putc-wait) '(#xEC) '(#xA8 #x20) '(:j8 #x74 pf-putc-wait)
+       '(#x58) (cons #x66 (cons #xBA '(#xF8 #x03))) '(#xEE) '(#x5A) '(#xC3)
+       '(:label pf-hex)                                       ; EAX as 8 hex digits
+       '(#x51) (cons #xB9 (i386l-le32-list 8))
+       '(:label pf-hex-next)
+       '(#xC1 #xC0 #x04) '(#x50) '(#x24 #x0F) '(#x04 #x30) '(#x3C #x39) '(:j8 #x76 pf-hex-digit)
+       '(#x04 #x07)
+       '(:label pf-hex-digit)
+       '(:call 0 pf-putc) '(#x58) '(#x49) '(:jcc32 #x75 pf-hex-next)
+       '(#x59) '(#xC3)
+       '(:label pf-after)
+       '(#x58) (i386cl-abs '(#xA3) +i386-cl-v-pfaddr+)       ; pop eax
        ;; ---- the saved core, if the probe above kept it: every header field
        ;; it needs is read FIRST, since copying the heap overwrites the
        ;; header's page (the core's pages are now the heap's)
@@ -356,6 +547,19 @@
             '(#x8D #x14 #x08)                                   ; lea edx, [eax+ecx]
             (i386cl-abs '(#x89 #x15) +i386-cl-v-panext+)
             '(#xC3)
+            ;; maprun: ECX bytes at PA ESI as the next heap pages, at most
+            ;; [rem] of them.  Clobbers EAX-EDX, ESI, EDI.
+            '(:label maprun)
+            (i386cl-abs '(#x3B #x0D) +i386-cl-v-rem+) '(:j8 #x76 maprun-n)
+            (i386cl-abs '(#x8B #x0D) +i386-cl-v-rem+)
+            '(:label maprun-n)
+            '(#x85 #xC9) '(:j8 #x74 maprun-done)
+            (i386cl-abs '(#x29 #x0D) +i386-cl-v-rem+)
+            '(#x51) (i386cl-abs '(#x8B #x3D) +i386-cl-v-hcur+) '(#xC1 #xE9 #x0C)
+            '(:call 0 map)
+            '(#x59) (i386cl-abs '(#x01 #x0D) +i386-cl-v-hcur+)
+            '(:label maprun-done)
+            '(#xC3)
             ;; zero: EDI = PA, ECX = bytes.  Clobbers EAX, ECX, EDI.
             '(:label zero)
             '(#xC1 #xE9 #x02) '(#x31 #xC0) '(#xF3 #xAB) '(#xC3)
@@ -384,6 +588,17 @@
     (i386-init-serial buf)
     (i386l-bytes buf #xC7 #x05) (i386l-le32 buf +i386-cl-tick-addr+) (i386l-le32 buf 0)
     (emit-i386-interrupt-setup buf +i386-cl-tick-addr+)
+    ;; vector 14, the page fault: the handler above (an interrupt gate, so the
+    ;; timer waits while a chunk decodes)
+    (let ((gate (+ #x90000 (* 14 8))))
+      (i386l-bytes buf #xA1) (i386l-le32 buf +i386-cl-v-pfaddr+)   ; mov eax, [pfaddr]
+      (i386l-bytes buf #x89 #xC2)                                   ; mov edx, eax
+      (i386l-bytes buf #x25) (i386l-le32 buf #xFFFF)
+      (i386l-bytes buf #x0D) (i386l-le32 buf #x00080000)           ; selector 8
+      (i386l-bytes buf #xA3) (i386l-le32 buf gate)
+      (i386l-bytes buf #x81 #xE2) (i386l-le32 buf #xFFFF0000)
+      (i386l-bytes buf #x81 #xCA) (i386l-le32 buf #x8E00)          ; present, 32-bit interrupt gate
+      (i386l-bytes buf #x89 #x15) (i386l-le32 buf (+ gate 4)))
     (i386l-bytes buf #xFB)                                    ; sti: the clock ticks
     (mvm-emit-byte buf #x89) (mvm-emit-byte buf #xE5)        ; mov ebp, esp
     ;; native byte 0 on a 16-byte boundary (OR-3 tagged entries): the JMP

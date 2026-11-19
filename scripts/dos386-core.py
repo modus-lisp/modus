@@ -11,11 +11,14 @@ QMP, the low block (#x10000000, 128 KB), the heap from #x19000000 to the
 allocation pointer and the matching slices of the two collector bitmaps, and
 writes OUT = IMAGE + the core:
 
-  page-aligned header: 'MCOR', version 2, allocation pointer, heap bytes,
-                       one bitmap slice's bytes, the boot-only tail's first
-                       and last page (IMAGE.tail, from the build; 0 0 when
-                       there is none); at +64 the low block, the heap,
-                       bitmap slice 1, bitmap slice 2
+  page-aligned header: 'MCOR', version 3 (2 with no code store), allocation
+                       pointer, heap bytes, one bitmap slice's bytes, the
+                       boot-only tail's first and last page (IMAGE.tail,
+                       from the build; 0 0 when there is none), the code
+                       store's address, the pool's size (0: the stub's
+                       rule); at +64 the low block, the heap,
+                       bitmap slice 1, bitmap slice 2; then, page-aligned,
+                       the code store (see CODE-STORE)
   last 16 bytes:       'MODUSCOR', the header's physical address, 0
 
 and patches OUT's Multiboot load_end_addr to its new end.  The entry stub
@@ -25,12 +28,45 @@ It also compares the image as the guest holds it with IMAGE and prints the
 ranges boot init wrote to: those would be lost on a restored boot.
 
   QEMU_MEM  MB of RAM for the save run (default 64)
+  POOL_KB   the demand-paged code's pool, in KB (default 0: the entry
+            stub's rule, RAM/4, at least 2 MB, at most the paged code)
 """
 import json, os, re, select, socket, struct, subprocess, sys, tempfile, time
 
 LOAD = 0x100000
 LOW, LOW_SIZE = 0x10000000, 0x20000
 HEAP = 0x19000000
+
+
+CHUNK = 16384
+
+
+def code_store(image, img, tmp):
+    """The demand-paged code (IMAGE.paged, from the build: native byte 0 to
+    the boot-only tail), whole 16 KB chunks of it, each compressed on its own
+    (scripts/dos386-lz.c): plo, phi, the chunk size, n, offsets[n+1] from the
+    data, the data.  A restored process maps none of it until it is touched
+    (boot/boot-i386-cl.lisp's page-fault handler).  None without IMAGE.paged,
+    or with MODUS_I386_PAGED=0."""
+    if os.environ.get('MODUS_I386_PAGED') == '0' or not os.path.exists(image + '.paged'):
+        return b''
+    lo, hi = map(int, open(image + '.paged').read().split())
+    plo, phi = (lo + CHUNK - 1) // CHUNK * CHUNK, hi // CHUNK * CHUNK
+    if phi <= plo:
+        return b''
+    lz = os.path.join(tmp, 'dos386-lz')
+    subprocess.run(['cc', '-O2', '-o', lz, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                       'dos386-lz.c')], check=True)
+    raw = os.path.join(tmp, 'code.bin')
+    open(raw, 'wb').write(img[plo - LOAD:phi - LOAD])
+    subprocess.run([lz, 'c', raw, raw + '.lz', str(CHUNK)], check=True)
+    subprocess.run([lz, 'd', raw + '.lz', raw + '.back', str(CHUNK)], check=True)
+    if open(raw + '.back', 'rb').read() != img[plo - LOAD:phi - LOAD]:
+        sys.exit('the code store does not decode to the code')
+    packed = open(raw + '.lz', 'rb').read()
+    print('code store: %d bytes of code in %d chunks -> %d bytes (%.2fx)'
+          % (phi - plo, (phi - plo) // CHUNK, len(packed), (phi - plo) / len(packed)))
+    return struct.pack('<III', plo, phi, CHUNK) + packed
 
 
 def clear_from(bm, nbits):
@@ -133,8 +169,19 @@ def main():
         if tail_hi <= tail_lo:
             tail_lo = tail_hi = 0
         print('boot-only tail: %d pages (%d bytes of code)' % ((tail_hi - tail_lo) // 4096, hi - lo))
-    hdr = struct.pack('<4sIIIIII', b'MCOR', 2, free, heap_bytes, bm_bytes, tail_lo, tail_hi)
-    body += hdr + b'\0' * (64 - len(hdr)) + low + heap + bm1 + bm2
+    store = code_store(image, img, tmp)
+    core = low + heap + bm1 + bm2
+    store_pa = 0
+    if store:
+        store_pa = hdr_pa + 64 + len(core)
+        store_pa += -store_pa % 4096
+    pool = int(os.environ.get('POOL_KB', '0')) * 1024
+    hdr = struct.pack('<4sIIIIIIII', b'MCOR', 3 if store else 2, free, heap_bytes, bm_bytes,
+                      tail_lo, tail_hi, store_pa, pool)
+    body += hdr + b'\0' * (64 - len(hdr)) + core
+    if store:
+        body += b'\0' * (store_pa - LOAD - len(body))
+        body += store
     body += b'MODUSCOR' + struct.pack('<II', hdr_pa, 0)
     struct.pack_into('<I', body, 20, LOAD + len(body))       # load_end_addr
     open(out, 'wb').write(body)

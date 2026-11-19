@@ -1673,6 +1673,24 @@
              (setq tail (cdr tail)))
     (decode-instruction *68k-bytecode* pc)))
 
+(defun m68k-li-shr-fold (vd imm next-pc)
+  "LI VD,IMM followed by SHR VD,VD,K (K <= 8, not a branch target): the
+   compiler's raw-address idiom -- a TAGGED constant shifted to the raw word at
+   run time (EMIT-LI-TAGGED of a CONV-REAL address, then :SHR), ~10 bytes of
+   68k for the shift alone at ~25,000 sites.  Returns IMM shifted right by K
+   and resumes after the SHR (*68K-SKIP-TO*); else IMM unchanged."
+  (when (and *68k-bytecode* *68k-label-map* (integerp imm)
+             (< next-pc (length *68k-bytecode*))
+             (null (gethash next-pc *68k-label-map*)))
+    (let ((d (m68k-insn-at next-pc)))
+      (when (and (eql (car d) +op-shr+)
+                 (eql (first (cadr d)) vd) (eql (second (cadr d)) vd)
+                 (integerp (third (cadr d))) (<= 1 (third (cadr d)) 8))
+        (setq *68k-skip-to* (cddr d))
+        (return-from m68k-li-shr-fold
+          (ash (logand imm #xFFFFFFFF) (- (third (cadr d))))))))
+  imm)
+
 (defun m68k-fast-entry-plan (frame-pc next-pc)
   "For the FRAME-ENTER at FRAME-PC: (values N OK-PC) when the next
    instructions are the compiler's fixed-count check (GET-NARGS ... BEQ ok)."
@@ -2152,8 +2170,8 @@
               (m68k-store-vreg buf vd +68k-d0+))))))
 
       (#.+op-li+
-       (let ((vd (first operands))
-             (imm (second operands)))
+       (let* ((vd (first operands))
+              (imm (m68k-li-shr-fold vd (second operands) mvm-pc)))
          ;; 32-bit on 68k
          (let ((imm32 (logand imm #xFFFFFFFF))
                (pd (m68k-vreg-phys vd)))

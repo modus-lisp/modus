@@ -3624,6 +3624,85 @@
     (halt)
 "))
 
+;;; THE i386 SAVED CORE (boot/boot-i386-cl.lisp, scripts/dos386-core.py).
+;;; Boot init -- the symbol, package and function tables, the defvar thunks,
+;;; the runtime macros and the shims compiled from source -- is the same work
+;;; on every boot: about 5 s of QEMU, 60 s on a 486DX2-66, three minutes on a
+;;; 486SX-25.  So the build boots the image once under QEMU with SAVECORE in
+;;; its Multiboot command line, collects until the live data is at the bottom of the lower
+;;; semispace, and stops before the REPL; the harness reads the low block, the
+;;; heap and the bitmap slices out of the guest and appends them to the image.
+;;; A later boot's entry stub copies them back (#x8024 says it did) and
+;;; kernel-main goes straight to the REPL.  The heap is at a fixed virtual
+;;; address on every machine, so nothing is relocated; only the words the stub
+;;; computes from the machine's RAM (semispace size, limit, bitmap bases) are
+;;; this machine's.
+(when *cl-repl-i386-p*
+  ;; the roots the prologue zeroes are the restored core's on a core boot (the
+  ;; stub zeroed the whole block on a cold one)
+  (let ((at (search "  (write-string-serial \"MODUS-CL\")" *cli-arch-kernel-prologue*)))
+    (unless at (error "i386 core: the prologue's banner moved"))
+    (setq *cli-arch-kernel-prologue*
+          (concatenate 'string "  (unless (eql (mem-ref #x8024 :u32) 1)
+" (subseq *cli-arch-kernel-prologue* 0 at) "  )
+" (subseq *cli-arch-kernel-prologue* at))))
+  (setq *cli-arch-override-source*
+        (concatenate 'string *cli-arch-override-source* "
+(defun %core-requested-p () (eql (mem-ref #x8024 :u32) 1))
+(defun %core-pre-restore () t)
+(defun %restore-image () nil)
+(defun %core-post-restore () nil)
+(defun %i386-core-save-requested-p ()
+  ;; SAVECORE in the Multiboot command line (QEMU -append), which the entry
+  ;; stub copied to #x8200 (boot-i386-cl.lisp +I386-CL-CMDLINE+).
+  (let ((i 0) (hit nil))
+    (loop
+      (when (or hit (>= i 248) (eql (mem-ref (+ #x8200 i) :u8) 0)) (return nil))
+      (when (and (eql (mem-ref (+ #x8200 i) :u8) 83) (eql (mem-ref (+ #x8201 i) :u8) 65)
+                 (eql (mem-ref (+ #x8202 i) :u8) 86) (eql (mem-ref (+ #x8203 i) :u8) 69)
+                 (eql (mem-ref (+ #x8204 i) :u8) 67) (eql (mem-ref (+ #x8205 i) :u8) 79)
+                 (eql (mem-ref (+ #x8206 i) :u8) 82) (eql (mem-ref (+ #x8207 i) :u8) 69))
+        (setq hit t))
+      (setq i (+ i 1)))
+    hit))
+(defun %i386-core-save ()
+  \"Collect until the live data is at the bottom of the lower semispace, say
+   where it ends, and stop: scripts/dos386-core.py reads the guest from here.
+   Nothing may allocate after the allocation pointer is read.\"
+  (%gc-force-to-space-0)
+  (let ((free (get-alloc-ptr)))
+    (write-string-serial \"CORE-SAVE free=\")
+    (print-dec free)
+    (write-string-serial \" bm1=\")
+    (print-dec (mem-ref #x10000E18 :u32))
+    (write-string-serial \" bm2=\")
+    (print-dec (mem-ref #x10000E40 :u32))
+    (write-string-serial \" page=\")
+    (print-dec (mem-ref #x10000E00 :u32))
+    (write-string-serial \" handlers=\")
+    (print-dec (mem-ref #x10000400 :u32))
+    (write-char-serial 10)
+    (halt)))
+"))
+  ;; save just before the REPL, after the last boot-time setq
+  (let* ((k "  (handler-case (cl-serial-repl)
+    (t (c) (write-string-serial \"REPL-DIED: \")")
+         (at (search k *cli-arch-kernel-epilogue*)))
+    (unless at (error "i386 core: the epilogue's REPL call moved"))
+    (setq *cli-arch-kernel-epilogue*
+          (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 at)
+                       "  (when (%i386-core-save-requested-p) (%i386-core-save))
+"
+                       (subseq *cli-arch-kernel-epilogue* at))))
+  (setq *cli-arch-core-resume* "    (write-string-serial \"MODUS-CORE\")
+    (write-char-serial 10)
+    (handler-case (cl-serial-repl)
+      (t (c) (write-string-serial \"REPL-DIED: \")
+             (handler-case (write-object c) (t (c2) (write-string-serial \"<unprintable>\")))
+             (write-char-serial 10)))
+    (halt)
+"))
+
 ;;; ============================================================
 ;;; THE SHARED ASSEMBLY
 ;;; ============================================================

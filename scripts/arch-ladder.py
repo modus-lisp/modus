@@ -26,7 +26,7 @@ Exit code: 0 PASS (or SKIP), 3 the image ran and answered WRONG, 1 anything
 else (build failure, dead image, timeout).  3 is separate because the gate's
 positive control must require a WRONG ANSWER, not merely a non-zero exit.
 """
-import json, os, socket, subprocess, sys, tempfile, time
+import json, os, re, socket, subprocess, sys, tempfile, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAGIC = 195948557          # 0x0BADF00D — fits a 30-bit fixnum
@@ -151,6 +151,17 @@ def main():
     if arch not in ARCHES:
         print(f"unknown arch {arch}; known: {' '.join(ARCHES)}", file=sys.stderr)
         return 2
+
+    # A RUNG MAY NAME A CELL IT CANNOT GRADE, with the reason, in its header:
+    #   ;;; skip-arch aarch64: <why>
+    # The cell then prints SKIP and the reason, and the gate counts it as a
+    # skip -- never as a pass.  Only for a defect OUTSIDE what the rung tests
+    # (r36: the minimal QEMU-virt aarch64 image keeps its handler block in the
+    # PCIe MMIO hole, so no LONGJMP at all can work there).
+    for m in re.finditer(r"skip-arch\s+([\w,]+)\s*:\s*(.*)", open(rung).read()):
+        if arch in m.group(1).split(","):
+            print(f"{arch:8s} SKIP      {os.path.basename(rung)}: {m.group(2).strip()[:110]}")
+            return 0
 
     _, qemu = ARCHES[arch][0], ARCHES[arch][1]
     if not any(os.access(os.path.join(d, qemu), os.X_OK)

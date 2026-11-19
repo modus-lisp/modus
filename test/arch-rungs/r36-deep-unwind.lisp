@@ -25,6 +25,14 @@
 ;;; exits: a ladder image has no condition system and no THROW (r19's header).
 ;;; The outermost UNWIND-PROTECT's cleanup ends the unwind with a lexical
 ;;; RETURN-FROM (its own frame was already popped by the longjmp that reached it).
+;;;
+;;; skip-arch aarch64: the minimal QEMU-virt image keeps its handler block at #x10000180, the PCIe MMIO hole there -- no LONGJMP can work (15 deep dies too)
+;;;
+;;; (scripts/arch-ladder.py reads that line: the bare aarch64 cell is SKIPPED,
+;;; not passed.  Measured on origin/main 7fdb8b4f: this rung 15 deep -- one
+;;; longjmp, nowhere near any cap -- is NO MAGIC on that image as well, so it is
+;;; the image's handler block, not this rung's subject.  Hosted AArch64 runs
+;;; test/deep-unwind.lisp instead.)
 
 (defun nest (n lim box)
   (setf (cdr box) n)

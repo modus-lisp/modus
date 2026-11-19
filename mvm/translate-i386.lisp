@@ -2964,7 +2964,7 @@
       (function-frame-slots bytecode offset)
       :legacy))
 
-(defun i386-emit-prologue (buf &optional (slots :legacy))
+(defun i386-emit-prologue (buf &optional (slots :legacy) no-v23)
   "Emit i386 function prologue.
    PUSH EBP; MOV EBP, ESP; SUB ESP, frame_size;
    save callee-saved EBX, ESI, EDI;
@@ -2979,10 +2979,12 @@
   ;; Copy incoming V2/V3 from caller-pushed stack args to local spill slots.
   ;; CALL handler always pushes V2/V3 before every CALL instruction.
   ;; [EBP+8] = V2 incoming, [EBP+12] = V3 incoming.
-  (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 8)   ; load V2 from [EBP+8]
-  (i386-emit-mov-mem-reg buf +i386-ebp+ -16 +scratch0+)  ; store to local V2 slot
-  (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 12)  ; load V3 from [EBP+12]
-  (i386-emit-mov-mem-reg buf +i386-ebp+ -20 +scratch0+)) ; store to local V3 slot
+  ;; NO-V23: the function never reads them (I386-V23-UNREAD-P)
+  (unless no-v23
+    (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 8)   ; load V2 from [EBP+8]
+    (i386-emit-mov-mem-reg buf +i386-ebp+ -16 +scratch0+)  ; store to local V2 slot
+    (i386-emit-mov-reg-mem buf +scratch0+ +i386-ebp+ 12)  ; load V3 from [EBP+12]
+    (i386-emit-mov-mem-reg buf +i386-ebp+ -20 +scratch0+))) ; store to local V3 slot
 
 (defun i386-emit-epilogue (buf)
   "Emit i386 function epilogue. Return value should be in EAX (VR)."
@@ -5030,14 +5032,19 @@
          (let* ((target-offset (first operands))
                 (fn-table (i386-translate-state-function-table state))
                 (label (when fn-table (gethash target-offset fn-table))))
-           ;; Push V3 first (higher address), then V2 (lower address)
-           (i386-emit-push-mem buf +i386-ebp+ -20)  ; V3
-           (i386-emit-push-mem buf +i386-ebp+ -16)  ; V2
-           (if label
+           (if (and label (i386-v23-unread-p
+                           (and *i386-offset-names* (gethash target-offset *i386-offset-names*))))
+               ;; a fixed-arity callee of at most two parameters: no V2/V3
                (i386-emit-call-rel32 buf label)
-               (i386-emit-call-rel32 buf nil))
-           ;; Clean up pushed V2/V3
-           (i386-emit-add-reg-imm buf +i386-esp+ 8)))
+               (progn
+                 ;; Push V3 first (higher address), then V2 (lower address)
+                 (i386-emit-push-mem buf +i386-ebp+ -20)  ; V3
+                 (i386-emit-push-mem buf +i386-ebp+ -16)  ; V2
+                 (if label
+                     (i386-emit-call-rel32 buf label)
+                     (i386-emit-call-rel32 buf nil))
+                 ;; Clean up pushed V2/V3
+                 (i386-emit-add-reg-imm buf +i386-esp+ 8)))))
 
         ((op= +op-call-ind+)
          ;; (call-ind Vs) -- indirect call through register
@@ -5889,6 +5896,29 @@
 ;;; (boot/boot-i386-cl.lisp, scripts/dos386-core.py).
 (defvar *i386-boot-tail* nil)
 
+;;; FIXED-ARITY CALLS.  A function whose final definition takes exactly N <= 2
+;;; required parameters and nothing else never reads V2/V3, which every call
+;;; passes on the stack (PUSH, PUSH, CALL, ADD ESP,8: 9 of a call's 14 bytes).
+;;; Direct calls to one skip them, and its prologue skips copying them.  The
+;;; test is the compiler's own for eliding the argument count
+;;; (%NARGS-UNREAD-P, *ELIDE-FIXED-NARGS*), sound for the same reason: an
+;;; i386 image's callers are bound to the image's definitions (no call pads).
+;;; Image translation only: the runtime native tier leaves this NIL.
+(defvar *i386-offset-names* nil
+  "TRANSLATE-MVM-TO-I386: bytecode offset -> function name, when the build
+   elides fixed argument counts.")
+
+(defun i386-fixed-params (name)
+  "N when NAME's final definition takes exactly N required parameters and
+   nothing else, else NIL."
+  (let ((h modus.mvm::*fixed-arity-params*))
+    (and h (gethash name h))))
+
+(defun i386-v23-unread-p (name)
+  "Does a function NAME never read V2/V3 (fixed, at most two parameters)?"
+  (let ((n (and name *i386-offset-names* (i386-fixed-params name))))
+    (and n (<= n 2))))
+
 (defun i386-layout-group (entry)
   "0 hot, 1 cold (bytecode offset >= *COLD-PC*), 2 boot-only (between
    *BOOT-TAIL-PC* and *COLD-PC*): the order the image's functions are
@@ -5977,6 +6007,11 @@
   (when (or modus.mvm::*boot-tail-pc* modus.mvm::*cold-pc*)
     (setf function-table
           (stable-sort (copy-list function-table) #'< :key #'i386-layout-group)))
+  (setf *i386-offset-names*
+        (and modus.mvm::*elide-fixed-nargs* modus.mvm::*fixed-arity-params*
+             (let ((h (make-hash-table)))
+               (dolist (e function-table h)
+                 (setf (gethash (second e) h) (first e))))))
   (let* ((buf (make-i386-buffer))
          (routines-done nil)
          (n-functions (length function-table))
@@ -6080,7 +6115,8 @@
                           ;; Emit prologue
                           (i386-emit-prologue buf (if (zerop fn-length)
                                                       :legacy
-                                                      (i386-function-frame-slots bytecode fn-offset)))
+                                                      (i386-function-frame-slots bytecode fn-offset))
+                                              (i386-v23-unread-p (first entry)))
                           ;; Pass 1: scan branch targets
                           (i386-scan-branch-targets state)
                           ;; Pass 2: translate

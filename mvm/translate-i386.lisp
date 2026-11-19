@@ -5830,6 +5830,36 @@
     (i386-fixup-labels buf)
     buf))
 
+;;; MODUS_I386_OP_BYTES=FILE (build host only; the image is unchanged): the
+;;; native bytes the image's translation emits per MVM opcode, with the number
+;;; of instructions, written to FILE sorted by bytes.  What makes i386 code
+;;; large, so the heaviest inline sequences can be found and shared.
+(defvar *i386-op-bytes*
+  (let ((f (sb-ext:posix-getenv "MODUS_I386_OP_BYTES")))
+    (and f (plusp (length f)) (cons f (make-hash-table)))))
+
+(defun i386-op-bytes-count (opcode n)
+  (let ((e (or (gethash opcode (cdr *i386-op-bytes*))
+               (setf (gethash opcode (cdr *i386-op-bytes*)) (list 0 0)))))
+    (incf (first e) n)
+    (incf (second e))))
+
+(defun i386-op-bytes-write ()
+  (when *i386-op-bytes*
+    (let ((rows nil) (total 0))
+      (maphash (lambda (op e)
+                 (let ((oi (gethash op *opcode-table*)))
+                   (incf total (first e))
+                   (push (list (if oi (string (opcode-info-name oi)) (format nil "#x~X" op))
+                               (first e) (second e))
+                         rows)))
+               (cdr *i386-op-bytes*))
+      (with-open-file (o (car *i386-op-bytes*) :direction :output :if-exists :supersede)
+        (format o "# opcode bytes count bytes/insn share   (total ~D)~%" total)
+        (dolist (r (sort rows #'> :key #'second))
+          (format o "~A ~D ~D ~,1F ~,1F%~%" (first r) (second r) (third r)
+                  (/ (second r) (max 1 (third r))) (/ (* 100.0 (second r)) (max 1 total))))))))
+
 (defun translate-mvm-to-i386 (bytecode function-table)
   "Translate MVM bytecode to i386 native code.
    BYTECODE: vector of (unsigned-byte 8) containing MVM instructions.
@@ -5938,8 +5968,11 @@
                             (let* ((decoded (decode-instruction bytecode pos))
                                    (opcode (car decoded))
                                    (operands (cadr decoded))
-                                   (new-pos (cddr decoded)))
+                                   (new-pos (cddr decoded))
+                                   (at (and *i386-op-bytes* (i386-current-pos buf))))
                               (i386-translate-insn state opcode operands new-pos)
+                              (when at
+                                (i386-op-bytes-count opcode (- (i386-current-pos buf) at)))
                               (setf pos new-pos)))))
                ;; the native tier's export table, right after the code of
                ;; jit-i386-native.lisp's %N386-EXPORT-TABLE, so the image finds
@@ -5947,6 +5980,7 @@
                (when (and *i386-native-tier*
                           (string-equal (first entry) "%N386-EXPORT-TABLE"))
                  (i386-emit-native-exports buf))))
+    (i386-op-bytes-write)
     ;; The GC trampoline, emitted once after the last function.
     (when *i386-gc-collect-label*
       (when *i386-fn-align*

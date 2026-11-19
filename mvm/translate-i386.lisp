@@ -597,8 +597,6 @@
   (let ((base (if *i386-linux-mode* #x10000000 *i386-bare-handler-base*)))
     (setf *i386-jmpbuf-addr*          (+ base #x180)
           *i386-longjmp-scratch-addr* (+ base #x3C0)
-          *i386-hstack-capcount-addr* (+ base #x3F0)
-          *i386-hstack-overflow-addr* (+ base #x3F8)
           *i386-hstack-depth-addr*    (+ base #x400)
           ;; HOSTED: the frames get their own room (see *I386-HOSTED-HSTACK-BASE*).
           *i386-hstack-base-addr*     (if *i386-linux-mode* *i386-hosted-hstack-base* (+ base #x408))
@@ -611,8 +609,11 @@
    #xA00 were too few: a CATCH past the cap stores no frame and the LONGJMP out
    of an inner HANDLER-CASE skips it -- the upstream suite's
    (compile-and-load \"roman-numerals.lsp\") lost its fasl cache's %FASL-REJECT
-   that way and every ~R test with it.  The collector's handler-stack root loop
-   reads this base and the depth, so the frames stay roots.")
+   that way and every ~R test with it.  These 127 are now only the FAST
+   PATH: frame 127 and up go to the extension (+I386-HSTACK-EXT-ADDR+, THE
+   HANDLER-FRAME STACK HAS NO SILENT CEILING, i386).  The collector's
+   handler-stack root loop reads this base, the extension and the depth, so
+   the frames stay roots.")
 
 (defparameter *i386-jmpbuf-addr* #x10000180
   "Base of the six-word jmp_buf (ESP/EBP/IP/EBX/ESI/EDI).")
@@ -624,7 +625,9 @@
 (defparameter *i386-hstack-base-addr* #x10000408
   "Handler-stack frame 0.  Frame N is at base + 24*N.")
 (defparameter *i386-hstack-max-depth* 63
-  "Frames that fit below the i386 global slot block at 0x10000A00.")
+  "Frames kept in memory at *I386-HSTACK-BASE-ADDR* (bare: 63, below the
+   global slot block; hosted: 127).  Past them a hosted push goes to the
+   extension and a bare push is the loud overflow.")
 
 (defparameter *i386-longjmp-scratch-addr* #x100003C0
   "Six words.  LONGJMP copies the jmp_buf here BEFORE the pop overwrites it.")
@@ -645,15 +648,33 @@
 (defparameter *i386-gc-to-addr*   #x100003E4
   "This collection's to_start, captured BEFORE the semispace swap.")
 
-(defparameter *i386-hstack-capcount-addr* #x100003F0
-  "Cumulative count of capped pushes (diagnostic only).")
-(defparameter *i386-hstack-overflow-addr* #x100003F8
-  "LIVE capped-push count — the BALANCED-CAP counter.  A capped push stores no
-   frame, so the CLEAR-HANDLER that textually matches it must ABSORB its pop
-   rather than drain a real stored frame (the drain-to-depth-0 class x64 hit on
-   bare metal).  LONGJMP zeroes it: a longjmp unwinds past ALL capped (strictly
-   inner) frames at once, so their pending absorbs must not fire against outer
-   pops later.")
+(defparameter *i386-hstack-fault-addr* #x10000CB0
+  "Where an overflowing handler-frame push records #x0F0F: the pending-fault
+   word %TAKE-PENDING-FAULT reads, (mem-ref #x10000CB0 :u32), in BOTH modes.
+   It is not moved with the handler block: like the MV count at #x10000090 it
+   is a shared-contract address of the runtime's fixed block -- demand-zeroed
+   BSS hosted, the fixed block below the heap (#x10100000) on the bare CL
+   image, and past the end of RAM on the 256 MB ladder board, where the
+   store goes nowhere, as that image's MV-count stores already do.")
+(defconstant +i386-hstack-ext-addr+ #x1001FF00
+  "Hosted Linux: ABSOLUTE address of the handler-frame EXTENSION (frames 127
+   and up), 0 until the first push past the in-memory frames reserves it.  In
+   the free tail of the demand-zeroed BSS: past the in-memory frames (which
+   end at #x1001F8E8), below +LINUX-I386-BSS-END+ (#x10020000); no other
+   address in mvm/, boot/, net/ or lib/ falls in [#x1001F8E8, #x10020000).
+   The i386 image has no threads, so one process-global extension serves.")
+(defconstant +i386-hstack-ext-limit-addr+ #x1001FF04
+  "Hosted Linux: 0, or a TEST-ONLY lower limit on extension frames (raw
+   count).  It is how a test reaches the loud overflow without exhausting the
+   native stack.  Demand-zeroed BSS (the hosted ELF is exec'd fresh, never
+   restored from a core), so it is 0 at startup.")
+(defconstant +i386-hstack-ext-frames+ #x100000
+  "Frames in the extension: 1M x 24 bytes = 24 MB of reserved address space
+   (MAP_NORESERVE, pages touched on demand).  The native stack is a MAP_FIXED
+   8 MB, so it runs out long before this does.")
+(defconstant +i386-hstack-overflow-code+ #x0F0F
+  "Recorded by an overflowing push; %TAKE-PENDING-FAULT turns it into
+   HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION).")
 
 (defvar *i386-handler-push-label* nil)
 (defvar *i386-handler-pop-label* nil)
@@ -2082,88 +2103,231 @@
     (i386-emit-pop-reg buf +i386-eax+)
     (i386-emit-ret buf)))
 
+;;; ------------------------------------------------------------------
+;;; THE HANDLER-FRAME STACK HAS NO SILENT CEILING (i386)
+;;; ------------------------------------------------------------------
+;;;
+;;; The i386 twin of translate-x64's section of the same name.  Every CATCH /
+;;; UNWIND-PROTECT / HANDLER-CASE / cross-unit BLOCK keeps one 24-byte frame
+;;; (the outer jmp_buf: ESP EBP IP EBX ESI EDI) while its body runs.  The
+;;; frames were a fixed array (127 hosted, 63 bare) whose overflow was a
+;;; transparent no-op (BALANCED-CAP): a push past the cap stored nothing, the
+;;; setjmp site skipped arming and the matching pop "absorbed" -- so a longjmp
+;;; from below the cap went straight to the deepest STORED frame and every
+;;; cleanup past the cap was silently skipped.
+;;;
+;;; HOSTED Linux: frames 0..126 stay at *I386-HOSTED-HSTACK-BASE* (the fast
+;;; path: the old code plus one compare); frame 127 and up go to an EXTENSION
+;;; the push helper reserves itself on first use (mmap2 MAP_NORESERVE,
+;;; +I386-HSTACK-EXT-FRAMES+ frames), its address in +I386-HSTACK-EXT-ADDR+.
+;;; The image has no threads, so the extension is process-global.  Past the
+;;; extension, or when the reservation is refused, the push is LOUD: it
+;;; records #x0F0F at 0x10000CB0 and longjmps to the ARMED frame -- the one
+;;; enclosing the form whose push failed -- exactly as TRAP #x0511 does, and
+;;; that frame's HANDLER-CASE receives HANDLER-STACK-EXHAUSTED from
+;;; %TAKE-PENDING-FAULT.  The failed frame was never stored, so the stack
+;;; stays balanced and every enclosing cleanup runs.
+;;; +I386-HSTACK-EXT-LIMIT-ADDR+ is a test-only lower limit on extension
+;;; frames.
+;;;
+;;; BARE METAL has no mmap: the 63 frames at base+#x408 (below the global
+;;; slot block at #x600) stay, and the 64th push is the same loud overflow
+;;; (its code recorded at the same #x10000CB0, *I386-HSTACK-FAULT-ADDR*).
+;;;
+;;; The frames hold EBX/ESI/EDI = V4/V0/V1, live heap pointers, so they are GC
+;;; roots: the collector's handler-stack loop scans the in-memory frames AND
+;;; the live extension frames (I386-EMIT-GC-TRAMPOLINE).
+
+(defun i386-emit-hstack-ext-frame-addr (buf reg idx-reg)
+  "REG := [+I386-HSTACK-EXT-ADDR+] + IDX-REG*24, IDX-REG an extension index
+   (depth - 127).  REG /= IDX-REG; IDX-REG is preserved."
+  (i386-emit-imul-reg-reg-imm8 buf reg idx-reg +i386-jmpbuf-size+)
+  (i386-emit-add-reg-abs buf reg +i386-hstack-ext-addr+))
+
+(defun i386-emit-hstack-reserve (buf have-ext overflow)
+  "Hosted, first push past the in-memory frames: reserve the extension.
+   mmap2(0, frames*24, PROT_READ|PROT_WRITE,
+         MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE, -1, 0) -- i386 syscall 192,
+   arguments in EBX ECX EDX ESI EDI EBP.  EBX/ESI/EDI are live vregs and EBP
+   the frame pointer, so all four are saved, and ECX (the depth) with them;
+   int 0x80 changes only EAX (saved by the push helper itself).  On success
+   the address goes to the extension word and control continues at HAVE-EXT
+   with ECX = depth; a -errno result (unsigned above -4096) goes to OVERFLOW."
+  (i386-emit-push-reg buf +i386-ebx+)
+  (i386-emit-push-reg buf +i386-esi+)
+  (i386-emit-push-reg buf +i386-edi+)
+  (i386-emit-push-reg buf +i386-ebp+)
+  (i386-emit-push-reg buf +scratch0+)
+  (i386-emit-mov-reg-imm buf +i386-ebx+ 0)
+  (i386-emit-mov-reg-imm buf +scratch0+ (* +i386-jmpbuf-size+ +i386-hstack-ext-frames+))
+  (i386-emit-mov-reg-imm buf +scratch1+ 3)               ; PROT_READ|PROT_WRITE
+  (i386-emit-mov-reg-imm buf +i386-esi+ #x4022)          ; PRIVATE|ANON|NORESERVE
+  (i386-emit-mov-reg-imm buf +i386-edi+ -1)              ; fd -1
+  (i386-emit-mov-reg-imm buf +i386-ebp+ 0)               ; pgoffset
+  (i386-emit-mov-reg-imm buf +i386-eax+ 192)             ; mmap2
+  (i386-emit-int buf #x80)
+  (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
+  (i386-emit-pop-reg buf +scratch0+)
+  (i386-emit-pop-reg buf +i386-ebp+)
+  (i386-emit-pop-reg buf +i386-edi+)
+  (i386-emit-pop-reg buf +i386-esi+)
+  (i386-emit-pop-reg buf +i386-ebx+)
+  (i386-emit-cmp-reg-imm buf +scratch1+ -4096)
+  (i386-emit-jcc buf :a overflow)                        ; -errno: refused
+  (i386-emit-mov-abs-reg buf +i386-hstack-ext-addr+ +scratch1+)
+  (i386-emit-jmp-rel32 buf have-ext))
+
+(defun i386-emit-hstack-overflow (buf pop-label)
+  "The loud end of a push that cannot store its frame (entered by a jump from
+   inside the push helper, which has pushed EAX and is itself a call: the
+   stack is abandoned, so neither matters).  Record #x0F0F -- the channel a
+   hardware fault uses, since this code cannot allocate a condition -- then
+   LONGJMP to the armed frame exactly as TRAP #x0511 does: copy the jmp_buf
+   aside, pop (which uncovers the frame below it), restore, jump with EAX = T.
+   With nothing armed: a message and exit 71 hosted, INT3 bare -- never a
+   branch through a zero frame."
+  (let ((armed (i386-make-label))
+        (ljs *i386-longjmp-scratch-addr*))
+    (i386-emit-mov-abs-imm buf *i386-hstack-fault-addr* +i386-hstack-overflow-code+)
+    (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))
+      (i386-emit-mov-abs-reg buf (+ ljs (* 4 i)) +scratch1+))
+    (i386-emit-mov-reg-abs buf +scratch0+ ljs)
+    (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+    (i386-emit-jcc buf :ne armed)
+    (i386-emit-abort-msg
+     buf "MODUS i386: handler-frame stack exhausted with no handler armed
+" 71)
+    (i386-emit-label buf armed)
+    (i386-emit-call-rel32 buf pop-label)
+    (i386-emit-mov-reg-abs buf +i386-ebx+ (+ ljs 12))
+    (i386-emit-mov-reg-abs buf +i386-esi+ (+ ljs 16))
+    (i386-emit-mov-reg-abs buf +i386-edi+ (+ ljs 20))
+    (i386-emit-mov-reg-abs buf +i386-ebp+ (+ ljs 4))
+    (i386-emit-mov-reg-abs buf +scratch1+ (+ ljs 8))
+    (i386-emit-mov-reg-abs buf +i386-esp+ ljs)
+    (i386-emit-mov-reg-imm buf +i386-eax+ +i386-mvm-t+)
+    (i386-emit-jmp-reg buf +scratch1+)))
+
 (defun i386-emit-handler-helpers (buf push-label pop-label)
   "Emit __handler_push / __handler_pop: the NESTING half of the handler-case
    traps.  Both preserve EAX (CLEAR-HANDLER is emitted right after a
    handler-case body whose result is in dest — and dest==VR==EAX on i386, so
    clobbering EAX there would hand back a popped frame word as the value).
-   Both clobber only ECX/EDX, the declared scratch pair.
+   Both clobber only ECX/EDX, the declared scratch pair, on every path that
+   returns (the first push past the in-memory frames also makes a syscall,
+   saving what it needs); the overflow path does not return.
 
-   __handler_push: stack the CURRENT jmp_buf, then return EDX = 0 (stored) or
-                   1 (capped).  SETJMP skips arming on 1, which degrades an
-                   over-deep handler-case to a transparent no-op instead of a
-                   stack corrupter.
+   __handler_push: stack the CURRENT jmp_buf.  A frame that cannot be stored
+                   is the LOUD overflow (I386-EMIT-HSTACK-OVERFLOW), never a
+                   dropped frame -- see THE HANDLER-FRAME STACK HAS NO SILENT
+                   CEILING (i386) above.
    __handler_pop:  restore the top stacked frame into the jmp_buf, or zero the
                    jmp_buf when the stack is empty.
+
+   frame[i] = *I386-HSTACK-BASE-ADDR* + i*24 below the in-memory capacity,
+   and (hosted) [+I386-HSTACK-EXT-ADDR+] + (i - 127)*24 above it.
 
    Nesting is NOT deferrable.  SEQUENTIAL handler-cases — exactly what
    init-all-globals does, one per init thunk — work with a single-level
    implementation, so a version without this passes the early milestones and
    fails later, which is the worst available failure shape."
+  (let* ((jb *i386-jmpbuf-addr*)
+         (hd *i386-hstack-depth-addr*)
+         (hs *i386-hstack-base-addr*)
+         (cap *i386-hstack-max-depth*)
+         (hosted *i386-linux-mode*)
+         (ext (i386-make-label))
+         (have-ext (i386-make-label))
+         (reserve (i386-make-label))
+         (overflow (i386-make-label))
+         (store (i386-make-label)))
+    ;; ---------------- __handler_push ----------------
+    (i386-emit-label buf push-label)
+    (i386-emit-push-reg buf +i386-eax+)
+    (i386-emit-mov-reg-abs buf +scratch0+ hd)              ; ECX = depth
+    (i386-emit-cmp-reg-imm buf +scratch0+ cap)
+    (i386-emit-jcc buf :ge (if hosted ext overflow))       ; signed
+    ;; EDX = hs + depth*24
+    (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
+    (i386-emit-add-reg-imm buf +scratch1+ hs)
+    (i386-emit-label buf store)
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-reg-abs buf +i386-eax+ (+ jb (* 4 i)))
+      (i386-emit-mov-mem-reg buf +scratch1+ (* 4 i) +i386-eax+))
+    (i386-emit-add-reg-imm buf +scratch0+ 1)
+    (i386-emit-mov-abs-reg buf hd +scratch0+)
+    (i386-emit-pop-reg buf +i386-eax+)
+    (i386-emit-ret buf)
+    (when hosted
+      ;; extension frame: EDX = [ext] + (depth - 127)*24
+      (let ((no-limit (i386-make-label)))
+        (i386-emit-label buf ext)
+        (i386-emit-mov-reg-abs buf +scratch1+ +i386-hstack-ext-addr+)
+        (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
+        (i386-emit-jcc buf :e reserve)
+        (i386-emit-label buf have-ext)
+        ;; EAX (saved above) = extension index
+        (i386-emit-mov-reg-reg buf +i386-eax+ +scratch0+)
+        (i386-emit-sub-reg-imm buf +i386-eax+ cap)
+        (i386-emit-cmp-reg-imm buf +i386-eax+ +i386-hstack-ext-frames+)
+        (i386-emit-jcc buf :ae overflow)
+        ;; the test-only lower limit, when one is set
+        (i386-emit-mov-reg-abs buf +scratch1+ +i386-hstack-ext-limit-addr+)
+        (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
+        (i386-emit-jcc buf :e no-limit)
+        (i386-emit-cmp-reg-reg buf +i386-eax+ +scratch1+)
+        (i386-emit-jcc buf :ae overflow)
+        (i386-emit-label buf no-limit)
+        (i386-emit-hstack-ext-frame-addr buf +scratch1+ +i386-eax+)
+        (i386-emit-jmp-rel32 buf store))
+      (i386-emit-label buf reserve)
+      (i386-emit-hstack-reserve buf have-ext overflow))
+    (i386-emit-label buf overflow)
+    (i386-emit-hstack-overflow buf pop-label))
+  ;; ---------------- __handler_pop ----------------
   (let ((jb *i386-jmpbuf-addr*)
         (hd *i386-hstack-depth-addr*)
         (hs *i386-hstack-base-addr*)
-        (ovf *i386-hstack-overflow-addr*))
-    ;; ---------------- __handler_push ----------------
-    (let ((capped (i386-make-label)))
-      (i386-emit-label buf push-label)
-      (i386-emit-push-reg buf +i386-eax+)
-      (i386-emit-mov-reg-abs buf +scratch0+ hd)              ; ECX = depth
-      (i386-emit-cmp-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
-      (i386-emit-jcc buf :ge capped)
-      ;; EDX = hs + depth*24
-      (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
-      (i386-emit-add-reg-imm buf +scratch1+ hs)
-      (dotimes (i +i386-jmpbuf-words+)
-        (i386-emit-mov-reg-abs buf +i386-eax+ (+ jb (* 4 i)))
-        (i386-emit-mov-mem-reg buf +scratch1+ (* 4 i) +i386-eax+))
-      (i386-emit-add-reg-imm buf +scratch0+ 1)
-      (i386-emit-mov-abs-reg buf hd +scratch0+)
-      (i386-emit-mov-reg-imm buf +scratch1+ 0)               ; EDX = 0: stored
-      (i386-emit-pop-reg buf +i386-eax+)
-      (i386-emit-ret buf)
-      (i386-emit-label buf capped)
-      (i386-emit-add-abs-imm8 buf *i386-hstack-capcount-addr* 1)
-      (i386-emit-add-abs-imm8 buf ovf 1)
-      (i386-emit-mov-reg-imm buf +scratch1+ 1)               ; EDX = 1: capped
-      (i386-emit-pop-reg buf +i386-eax+)
-      (i386-emit-ret buf))
-    ;; ---------------- __handler_pop ----------------
-    (let ((no-ovf (i386-make-label))
-          (empty (i386-make-label))
-          (done (i386-make-label)))
-      (i386-emit-label buf pop-label)
-      (i386-emit-push-reg buf +i386-eax+)
-      ;; A pop that textually matches a CAPPED push absorbs it and touches
-      ;; nothing else.
-      (i386-emit-mov-reg-abs buf +scratch0+ ovf)
-      (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
-      (i386-emit-jcc buf :e no-ovf)
-      (i386-emit-add-reg-imm buf +scratch0+ -1)
-      (i386-emit-mov-abs-reg buf ovf +scratch0+)
-      (i386-emit-jmp-rel32 buf done)
-      (i386-emit-label buf no-ovf)
-      (i386-emit-mov-reg-abs buf +scratch0+ hd)
-      (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
-      (i386-emit-jcc buf :e empty)
-      (i386-emit-add-reg-imm buf +scratch0+ -1)
-      (i386-emit-mov-abs-reg buf hd +scratch0+)
-      (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
-      (i386-emit-add-reg-imm buf +scratch1+ hs)
-      (dotimes (i +i386-jmpbuf-words+)
-        (i386-emit-mov-reg-mem buf +i386-eax+ +scratch1+ (* 4 i))
-        (i386-emit-mov-abs-reg buf (+ jb (* 4 i)) +i386-eax+))
-      (i386-emit-jmp-rel32 buf done)
-      (i386-emit-label buf empty)
-      ;; Zero the WHOLE jmp_buf, not just word 0.  Word 0 == 0 is the
-      ;; "no handler armed" sentinel LONGJMP checks, but leaving the other
-      ;; five words holding a dead frame's EBX/ESI/EDI leaves the collector
-      ;; scanning stale roots (they are scanned — see i386-emit-gc-trampoline).
-      (dotimes (i +i386-jmpbuf-words+)
-        (i386-emit-mov-abs-imm buf (+ jb (* 4 i)) 0))
-      (i386-emit-label buf done)
-      (i386-emit-pop-reg buf +i386-eax+)
-      (i386-emit-ret buf))))
+        (cap *i386-hstack-max-depth*)
+        (empty (i386-make-label))
+        (ext (i386-make-label))
+        (load (i386-make-label))
+        (done (i386-make-label)))
+    (i386-emit-label buf pop-label)
+    (i386-emit-push-reg buf +i386-eax+)
+    (i386-emit-mov-reg-abs buf +scratch0+ hd)
+    (i386-emit-test-reg-reg buf +scratch0+ +scratch0+)
+    (i386-emit-jcc buf :e empty)
+    (i386-emit-add-reg-imm buf +scratch0+ -1)
+    (i386-emit-mov-abs-reg buf hd +scratch0+)
+    (when *i386-linux-mode*
+      (i386-emit-cmp-reg-imm buf +scratch0+ cap)
+      (i386-emit-jcc buf :ge ext))                         ; signed, as the push's
+    (i386-emit-imul-reg-reg-imm8 buf +scratch1+ +scratch0+ +i386-jmpbuf-size+)
+    (i386-emit-add-reg-imm buf +scratch1+ hs)
+    (i386-emit-label buf load)
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-reg-mem buf +i386-eax+ +scratch1+ (* 4 i))
+      (i386-emit-mov-abs-reg buf (+ jb (* 4 i)) +i386-eax+))
+    (i386-emit-jmp-rel32 buf done)
+    (when *i386-linux-mode*
+      ;; extension frame (the push that stored it reserved the extension)
+      (i386-emit-label buf ext)
+      (i386-emit-sub-reg-imm buf +scratch0+ cap)
+      (i386-emit-hstack-ext-frame-addr buf +scratch1+ +scratch0+)
+      (i386-emit-jmp-rel32 buf load))
+    (i386-emit-label buf empty)
+    ;; Zero the WHOLE jmp_buf, not just word 0.  Word 0 == 0 is the
+    ;; "no handler armed" sentinel LONGJMP checks, but leaving the other
+    ;; five words holding a dead frame's EBX/ESI/EDI leaves the collector
+    ;; scanning stale roots (they are scanned — see i386-emit-gc-trampoline).
+    (dotimes (i +i386-jmpbuf-words+)
+      (i386-emit-mov-abs-imm buf (+ jb (* 4 i)) 0))
+    (i386-emit-label buf done)
+    (i386-emit-pop-reg buf +i386-eax+)
+    (i386-emit-ret buf)))
 
 (defparameter *i386-gc-vl-margin* #x1000000
   "Bytes VL stops short of the end of the ACTIVE semispace (16 MB, the same as
@@ -2314,11 +2478,18 @@
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
       (i386-emit-jmp-rel32 buf jl)
       (i386-emit-label buf jd))
-    ;; Live frames only: [hstack_base, hstack_base + 24*depth).  scan_word
-    ;; clobbers EAX/ECX/EDX and EBX/ESI/EDI are collector state, so the bound
-    ;; goes to memory rather than a register.
-    (let ((hl (i386-make-label)) (hd (i386-make-label)))
+    ;; Live frames only: [hstack_base, hstack_base + 24*min(depth, 127)),
+    ;; then (hosted) the live EXTENSION frames [ext, ext + 24*(depth - 127))
+    ;; -- THE HANDLER-FRAME STACK HAS NO SILENT CEILING (i386): a frame past
+    ;; the in-memory ones holds the same EBX/ESI/EDI.  scan_word clobbers
+    ;; EAX/ECX/EDX and EBX/ESI/EDI are collector state, so the bound goes to
+    ;; memory rather than a register.
+    (let ((hl (i386-make-label)) (hd (i386-make-label)) (in-mem (i386-make-label)))
       (i386-emit-mov-reg-abs buf +scratch0+ *i386-hstack-depth-addr*)
+      (i386-emit-cmp-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
+      (i386-emit-jcc buf :le in-mem)
+      (i386-emit-mov-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
+      (i386-emit-label buf in-mem)
       (i386-emit-imul-reg-reg-imm8 buf +scratch0+ +scratch0+ +i386-jmpbuf-size+)
       (i386-emit-add-reg-imm buf +scratch0+ *i386-hstack-base-addr*)
       (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch0+)
@@ -2331,6 +2502,23 @@
       (i386-emit-add-reg-imm buf +i386-ebp+ 4)
       (i386-emit-jmp-rel32 buf hl)
       (i386-emit-label buf hd))
+    (when *i386-linux-mode*
+      (let ((xl (i386-make-label)) (xd (i386-make-label)))
+        (i386-emit-mov-reg-abs buf +scratch0+ *i386-hstack-depth-addr*)
+        (i386-emit-sub-reg-imm buf +scratch0+ *i386-hstack-max-depth*)
+        (i386-emit-jcc buf :le xd)                       ; no extension frame
+        (i386-emit-imul-reg-reg-imm8 buf +scratch0+ +scratch0+ +i386-jmpbuf-size+)
+        (i386-emit-add-reg-abs buf +scratch0+ +i386-hstack-ext-addr+)
+        (i386-emit-mov-abs-reg buf *i386-gcroot-bound-addr* +scratch0+)
+        (i386-emit-mov-reg-abs buf +i386-ebp+ +i386-hstack-ext-addr+)
+        (i386-emit-label buf xl)
+        (i386-emit-cmp-reg-abs buf +i386-ebp+ *i386-gcroot-bound-addr*)
+        (i386-emit-jcc buf :ae xd)
+        (i386-emit-mov-reg-reg buf +i386-eax+ +i386-ebp+)
+        (i386-emit-call-rel32 buf scan-label)
+        (i386-emit-add-reg-imm buf +i386-ebp+ 4)
+        (i386-emit-jmp-rel32 buf xl)
+        (i386-emit-label buf xd)))
 
     ;; --- Cheney scan of to-space: [to_start, free_ptr), OBJECT BY OBJECT ---
     ;; This walked to-space WORD BY WORD, handing every word to scan_word --
@@ -2791,7 +2979,6 @@
                 (i386-emit-byte buf #x8B) (i386-emit-byte buf #x44)
                 (i386-emit-byte buf #x24) (i386-emit-byte buf #x04)  ; mov eax,[esp+4]
                 (i386-emit-byte buf #xA3) (i386-emit-u32 buf #x10000CB0) ; [CB0]=eax
-                (i386-emit-mov-abs-imm buf *i386-hstack-overflow-addr* 0)
                 (dotimes (i +i386-jmpbuf-words+)
                   (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))
                   (i386-emit-mov-abs-reg buf (+ ljs (* 4 i)) +scratch1+))
@@ -3301,12 +3488,12 @@
              ;; Both modes: the block is placed per mode by
              ;; i386-set-handler-block (bare: #x5C0000 + the same offsets).
              ((and (= code #x0510) *i386-handler-push-label*)
-              (let ((skiparm (i386-make-label))
-                    (resume (i386-make-label)))
-                ;; Stack the OUTER frame first; EDX comes back 1 if capped.
+              (let ((resume (i386-make-label)))
+                ;; Stack the OUTER frame first.  A push that cannot store it
+                ;; does not return here: it longjmps to the OUTER frame (THE
+                ;; HANDLER-FRAME STACK HAS NO SILENT CEILING, i386), so this
+                ;; site always arms.
                 (i386-emit-call-rel32 buf *i386-handler-push-label*)
-                (i386-emit-test-reg-reg buf +scratch1+ +scratch1+)
-                (i386-emit-jcc buf :ne skiparm)
                 ;; Arm: ECX = &jmp_buf, then the five register words.
                 (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
                 (i386-emit-mov-mem-reg buf +scratch0+  0 +i386-esp+)
@@ -3328,7 +3515,6 @@
                   (i386-emit-byte buf (i386-modrm #b11 0 +scratch1+))
                   (i386-emit-fixup-diff32 buf resume anchor))
                 (i386-emit-mov-mem-reg buf +scratch0+ 8 +scratch1+)
-                (i386-emit-label buf skiparm)
                 ;; First return: NIL.  Read from *vn-addr* rather than baking
                 ;; #xDEAD0001 in — bare-metal i386 uses 0 for NIL, and
                 ;; :bnnull compares against this very slot.
@@ -3340,9 +3526,6 @@
               ;; overwrites the jmp_buf, then restore and transfer.
               (let ((armed (i386-make-label))
                     (ljs *i386-longjmp-scratch-addr*))
-                ;; This longjmp unwinds past every capped (strictly inner)
-                ;; frame at once, so their pending absorbs must be discarded.
-                (i386-emit-mov-abs-imm buf *i386-hstack-overflow-addr* 0)
                 (i386-emit-mov-reg-imm buf +scratch0+ *i386-jmpbuf-addr*)
                 (dotimes (i +i386-jmpbuf-words+)
                   (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ (* 4 i))

@@ -14,9 +14,13 @@
 ;;;;      that are not functions are found through the export table the AOT
 ;;;;      translator writes after %N386-EXPORT-TABLE (I386-EMIT-NATIVE-EXPORTS).
 ;;;;   2. CALL OPERANDS name a function-table index, a bytecode offset, or a
-;;;;      runtime name (+N386-RT-BASE+ + n): resolved here to a label of this
-;;;;      module or an image / earlier runtime function's address.  A callee
-;;;;      still interpreted refuses the module (it can be translated later).
+;;;;      runtime name (+N386-RT-BASE+ + n).  This module's functions and native
+;;;;      IMAGE functions are called directly; any other runtime name -- a
+;;;;      runtime DEFUN (native or interpreted), a generic function, a name not
+;;;;      defined yet -- LATE-BOUND, through a cell of the constant vector that
+;;;;      every DEFUN of the name refreshes, dispatched as FUNCALL is (a closure
+;;;;      sets the closure environment; NIL signals UNDEFINED-FUNCTION).  So a
+;;;;      native caller sees a redefinition, as an interpreted one does.
 ;;;;   3. CONSTANTS are heap objects the collector moves, so LI-CONST loads its
 ;;;;      object from the vector the root word +I386-NATIVE-CONST-ROOT+ holds,
 ;;;;      which every collection forwards.
@@ -129,6 +133,32 @@
         (setq *n386-const-fill* (+ n 1))
         (setf (gethash idx *n386-const-slots*) n))))
 
+(defvar *n386-name-slots* nil "Runtime name -> slot of *N386-CONSTS* (its late-bound cell).")
+
+(defun %n386-current-fn (name)
+  "What a call to NAME reaches now: its function object, or NIL."
+  (%mvm-resolve-runtime-fn name))
+
+(defun %n386-name-slot (name)
+  "The cell of runtime function NAME, made on first use holding its object now."
+  (or (gethash name *n386-name-slots*)
+      (let ((n *n386-const-fill*))
+        (when (>= n (length *n386-consts*))
+          (let ((new (make-array (* 2 (length *n386-consts*)) :initial-element nil)))
+            (dotimes (i n) (setf (svref new i) (svref *n386-consts* i)))
+            (setq *n386-consts* new)
+            (%n386-root-set new)))
+        (setf (svref *n386-consts* n) (%n386-current-fn name))
+        (setq *n386-const-fill* (+ n 1))
+        (setf (gethash name *n386-name-slots*) n))))
+
+(defun %n386-refresh (names)
+  "NAMES were (re)defined: their cells, if any, hold what a call reaches now."
+  (when (and (boundp (quote *n386-name-slots*)) (hash-table-p *n386-name-slots*))
+    (dolist (nm names)
+      (let ((slot (gethash nm *n386-name-slots*)))
+        (when slot (setf (svref *n386-consts* slot) (%n386-current-fn nm)))))))
+
 (defun %n386-init ()
   (unless *n386-ready*
     (%n386-coinit)
@@ -138,7 +168,8 @@
     (%n386-find-exports)
     (%n386-area)
     (setq *n386-consts* (make-array 256 :initial-element nil)
-          *n386-const-slots* (make-hash-table) *n386-const-fill* 0)
+          *n386-const-slots* (make-hash-table) *n386-const-fill* 0
+          *n386-name-slots* (make-hash-table :test (function equal)))
     (%n386-root-set *n386-consts*)
     (setq *n386-translated* 0 *n386-refused* nil *n386-done* nil *n386-pending* nil
           *n386-ready* t))
@@ -171,14 +202,17 @@
     out))
 
 (defun %n386-resolve (buf base operand rt fn-table entries)
-  "The label call operand OPERAND names: an entry of this module, or a label at
-   an image / native runtime function's address.  NIL (*N386-WHY*) otherwise."
+  "What call operand OPERAND names: a label (an entry of this module, or an
+   image function's address), (:LATE . SLOT) for a late-bound runtime name, or
+   NIL (*N386-WHY*)."
   (if (>= operand +n386-rt-base+)
       (let* ((name (gethash operand rt))
              (a (and name (%n386-image-fn-addr name))))
-        (if a
-            (%n386-abs-label buf base a)
-            (progn (setq *n386-why* (list :not-native name)) nil)))
+        (cond ((null name) (setq *n386-why* (list :no-name operand)) nil)
+              ;; an IMAGE function: a direct call (the code area holds runtime
+              ;; functions, which are late-bound so a redefinition is seen)
+              ((and a (< a +n386-area-addr+)) (%n386-abs-label buf base a))
+              (t (cons :late (%n386-name-slot name)))))
       (let ((pc (if (< operand (length fn-table)) (aref fn-table operand) operand)))
         (or (gethash pc entries)
             (progn (setq *n386-why* (list :no-callee operand)) nil)))))
@@ -193,10 +227,59 @@
     (modus.mvm.i386::i386-emit-mov-reg-mem buf dst dst (- (* 4 (+ slot 1)) +tag-object+))
     (unless pd (modus.mvm.i386::i386-store-vreg buf vd dst))))
 
+(defun %n386-emit-late-call (buf slot undefined-label)
+  "CALL through cell SLOT, as FUNCALL dispatches (compile-funcall): the object
+   in the cell; NIL -> UNDEFINED-FUNCTION; a closure -> its environment into
+   the CENV slot and its code; else the function's own code.  V2/V3 pushed as
+   I386-TRANSLATE-INSN's CALL pushes them.  ECX/EDX only: EAX (VR) is dead
+   across a call, the argument registers are not touched."
+  (let ((ecx modus.mvm.i386::+scratch0+) (edx modus.mvm.i386::+scratch1+)
+        (ebp modus.mvm.i386::+i386-ebp+) (esp modus.mvm.i386::+i386-esp+)
+        (code (mvm-make-label)) (nil-l (mvm-make-label)) (done (mvm-make-label)))
+    (modus.mvm.i386::i386-emit-push-mem buf ebp -20)                 ; V3
+    (modus.mvm.i386::i386-emit-push-mem buf ebp -16)                 ; V2
+    (modus.mvm.i386::i386-emit-mov-reg-abs buf ecx modus.mvm.i386::+i386-native-const-root+)
+    (modus.mvm.i386::i386-emit-mov-reg-mem buf ecx ecx (- (* 4 (+ slot 1)) +tag-object+))
+    (modus.mvm.i386::i386-emit-cmp-reg-abs buf ecx modus.mvm.i386::*vn-addr*)
+    (modus.mvm.i386::i386-emit-jcc buf :e nil-l)
+    ;; a closure: tag 9 and subtag #x52
+    (modus.mvm.i386::i386-emit-mov-reg-reg buf edx ecx)
+    (modus.mvm.i386::i386-emit-and-reg-imm buf edx 15)
+    (modus.mvm.i386::i386-emit-cmp-reg-imm buf edx +tag-object+)
+    (modus.mvm.i386::i386-emit-jcc buf :ne code)
+    (modus.mvm.i386::i386-emit-movzx-byte buf edx ecx (- +tag-object+))
+    (modus.mvm.i386::i386-emit-cmp-reg-imm buf edx +subtag-closure+)
+    (modus.mvm.i386::i386-emit-jcc buf :ne code)
+    (modus.mvm.i386::i386-emit-mov-reg-mem buf edx ecx (- 8 +tag-object+))  ; slot 1: env
+    (modus.mvm.i386::i386-emit-mov-abs-reg buf modus.mvm.i386::*cenv-addr* edx)
+    (modus.mvm.i386::i386-emit-mov-reg-mem buf ecx ecx (- 4 +tag-object+))  ; slot 0: fn
+    (modus.mvm.i386::i386-emit-label buf code)
+    (modus.mvm.i386::i386-emit-sub-reg-imm buf ecx 3)                ; the function tag
+    (modus.mvm.i386::i386-emit-call-reg buf ecx)
+    (modus.mvm.i386::i386-emit-jmp-rel32 buf done)
+    (modus.mvm.i386::i386-emit-label buf nil-l)
+    ;; nargs 0, as compile-funcall's NIL guard calls it
+    (modus.mvm.i386::i386-translate-insn
+     (modus.mvm.i386::make-i386-translate-state :buf buf) +op-set-nargs+ (list 0) 0)
+    (modus.mvm.i386::i386-emit-call-rel32 buf undefined-label)
+    (modus.mvm.i386::i386-emit-label buf done)
+    (modus.mvm.i386::i386-emit-add-reg-imm buf esp 8)))
+
+(defun %n386-emit-late-fn-addr (buf vd slot)
+  "(FN-ADDR Vd name) of a late-bound name: the object in its cell."
+  (let* ((pd (modus.mvm.i386::i386-vreg-phys vd))
+         (dst (or pd modus.mvm.i386::+scratch0+)))
+    (modus.mvm.i386::i386-emit-mov-reg-abs buf dst modus.mvm.i386::+i386-native-const-root+)
+    (modus.mvm.i386::i386-emit-mov-reg-mem buf dst dst (- (* 4 (+ slot 1)) +tag-object+))
+    (unless pd (modus.mvm.i386::i386-store-vreg buf vd dst))))
+
 (defun %n386-emit-module (buf base bc fns fn-table rt)
   "Emit FNS' code into BUF written at BASE: an alist (NAME . POSITION), or NIL
    (*N386-WHY*)."
-  (let ((entries (make-hash-table)) (calls (make-hash-table)) (out nil) (bad nil))
+  (let ((entries (make-hash-table)) (calls (make-hash-table)) (out nil) (bad nil)
+        (undefined (let ((a (%n386-image-fn-addr "%SIGNAL-UNDEFINED-FUNCTION")))
+                     (and a (%n386-abs-label buf base a)))))
+    (unless undefined (setq *n386-why* :no-undefined-function-signaller bad t))
     (dolist (f fns) (setf (gethash (second f) entries) (mvm-make-label)))
     ;; every call operand's label, once
     (dolist (f fns)
@@ -226,9 +309,26 @@
                        (let* ((d (decode-instruction bc pc))
                               (op (car d)) (operands (cadr d)) (npc (cddr d)))
                          (setq *n386-at* (list pc op operands))
-                         (if (= op +op-li-const+)
-                             (%n386-emit-li-const buf (first operands) (second operands))
-                             (modus.mvm.i386::i386-translate-insn state op operands npc))
+                         (let ((late (and (or (= op +op-call+) (= op +op-tailcall+)
+                                              (= op +op-fn-addr+))
+                                          (let ((c (gethash (if (= op +op-fn-addr+)
+                                                                (second operands)
+                                                                (first operands))
+                                                            calls)))
+                                            (and (consp c) (cdr c))))))
+                           (cond
+                             ((= op +op-li-const+)
+                              (%n386-emit-li-const buf (first operands) (second operands)))
+                             ((and late (= op +op-call+))
+                              (%n386-emit-late-call buf late undefined))
+                             ;; no tail call through a cell: a call, then the
+                             ;; epilogue (the callee's values are VR and the
+                             ;; MV slots, which RET leaves alone)
+                             ((and late (= op +op-tailcall+))
+                              (%n386-emit-late-call buf late undefined)
+                              (modus.mvm.i386::i386-emit-epilogue buf))
+                             (late (%n386-emit-late-fn-addr buf (first operands) late))
+                             (t (modus.mvm.i386::i386-translate-insn state op operands npc))))
                          (setq pc npc))))))))
     (if bad nil (nreverse out))))
 
@@ -328,6 +428,7 @@
               (dolist (f fns)
                 (when (member (car f) names :test (function string=))
                   (%n386-install (car f) (cdr f))))
+              (%n386-refresh names)
               t)
             (progn
               (setq *n386-refused* (cons (cons (car names) *n386-why*) *n386-refused*))
@@ -351,6 +452,9 @@
   ;; BOUNDP before each read: this runs at every DEFUN from boot on
   (when (and names (not (and (boundp (quote *n386-off*)) *n386-off*))
              (%n386-ready))
+    ;; the new trampolines first: a late-bound caller reaches them even if
+    ;; this module stays interpreted
+    (%n386-refresh names)
     (%n386-on-defun names)))
 
 (defun %jit-eager-all (&optional name)

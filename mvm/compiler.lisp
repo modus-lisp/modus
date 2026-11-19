@@ -441,7 +441,9 @@
                                              ; +0x1000..+0x5000, FS-relative in
                                              ; translate-x64 itself; the thread
                                              ; blocks are sized for them —
-                                             ; net/hosted-sync.lisp %THR-TLS-BLOCK)
+                                             ; net/hosted-sync.lisp %THR-TLS-BLOCK;
+                                             ; deeper frames in the extension
+                                             ; whose address is at +0x5600)
       (and (>= off #xC10) (<= off #xC37))    ; longjmp scratch + the self slot
       ;; the late-bound bridge's callee-index slot (mvm-eval.lisp
       ;; %JIT-FNADDR-IDX-SLOT): x86-64's any-arity call thunk stores to

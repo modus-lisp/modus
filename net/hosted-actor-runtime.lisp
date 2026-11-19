@@ -111,8 +111,14 @@
    self slot its own segment base, the guard's words its region pair, and the
    context stack top the collector bounds its stack scan with."
   (let* ((b (%ar-window id))
-         (delta (- b #x10000000)))
+         (delta (- b #x10000000))
+         ;; THE HANDLER-FRAME EXTENSION survives the zeroing: a reserved
+         ;; mapping (translate-x64 +HSTACK-EXT-ADDR+, window +0x5600) holds
+         ;; only dead frames once the depth is 0, and dropping its address
+         ;; would leak 32 MB of address space per deep-nesting actor reuse.
+         (ext (%gc-read64 (+ b #x5600))))
     (%ha-zero b (+ b #x8000))
+    (%gc-write64 (+ b #x5600) ext)
     (setf (mem-ref (+ b #xC60) :u64) (%ar-dynb id))
     (%gc-write64 (+ b #x5040) (%ar-region-from id))
     (%gc-write64 (+ b #x5048) (%ar-region-to id))

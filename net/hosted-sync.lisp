@@ -170,7 +170,9 @@
      (translate-aarch64.lisp, THE PER-THREAD WINDOW, AARCH64) — 0x11000 bytes.
    - x86-64 Linux: the handler-frame stack is 512 frames at +0x1000..+0x5000
      (translate-x64's handler helpers; the 64 in-window frames at +0x408 are
-     bare metal's) plus operandi's shared-store guard word at +0x5058 — 0x8000 bytes.  These blocks used to be 4 KB apart, so a
+     bare metal's) plus operandi's shared-store guard word at +0x5058, and the
+     ADDRESS of the frames past 512 (a lazily reserved extension) at +0x5600 —
+     0x8000 bytes.  A reused block keeps that address: the extension is reused.  These blocks used to be 4 KB apart, so a
      worker's handler frames landed in the NEXT worker's block, on its
      multiple-value slots (+0x90) and nargs (+0x150) — measured: every
      interpreted capturing closure called from two workers at once went wrong
@@ -318,6 +320,10 @@
                      (%gc-write64 (+ b #x5048) 0)
                      (%gc-write64 (+ b #x5050) 0)))
           (%gc-write64 (+ b #x5058) 0)
+          ;; the handler-frame extension's test limit (translate-x64
+          ;; +HSTACK-EXT-LIMIT-ADDR+); the extension's ADDRESS at +0x5600 is
+          ;; kept, so a reused block reuses its reservation.
+          (%gc-write64 (+ b #x5608) 0)
           (%gc-write64 (+ b #xC30) delta)
           delta))))
 

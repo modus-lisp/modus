@@ -39,22 +39,40 @@
    the low block and the stack; an address here is a fixnum on the 30-bit tower.")
 (defconstant +n386-area-size+ #x800000)
 
-(defvar *n386-off* nil "T: leave runtime DEFUNs interpreted.")
-(defvar *n386-ready* nil)
-(defvar *n386-exports* nil "Image routine addresses, I386-NATIVE-EXPORT-LABELS' order.")
-(defvar *n386-why* nil "Why the last module was not translated natively.")
-(defvar *n386-at* nil "The instruction being translated: (PC OPCODE OPERANDS).")
-(defvar *n386-ptr* 0 "The code area's next free byte.")
-(defvar *n386-end* 0 "The code area's end.")
-(defvar *n386-consts* nil "The constant vector runtime code reads (rooted at +I386-NATIVE-CONST-ROOT+).")
-(defvar *n386-const-slots* nil "Pool index -> slot of *N386-CONSTS*.")
-(defvar *n386-const-fill* 0)
-(defvar *n386-translated* 0 "CENSUS: modules translated natively.")
-(defvar *n386-refused* nil "CENSUS: (name . why), newest first.")
-(defvar *n386-done* nil "Modules (their bytecode) translated or refused for good.")
-(defvar *n386-pending* nil
-  "Name lists of modules refused only because a callee was still interpreted
-   (:NOT-NATIVE / :NO-CALLEE): retried after each module that does translate.")
+;;; THE TIER'S STATE HAS NO INITIAL VALUES, on purpose.  KERNEL-MAIN runs every
+;;; DEFVAR's initial-value thunk at (INIT-ALL-GLOBALS), and a top-level form run
+;;; natively at boot (the form seam) can ready the tier BEFORE that: the thunks
+;;; then reset the code-area pointer to 0 under a tier that believed itself
+;;; ready, and every module after it reported :AREA-FULL.  %N386-INIT sets all of
+;;; it; what reads it runs after *N386-READY*, which is read through BOUNDP.
+
+;; T: leave runtime DEFUNs interpreted.
+(defvar *n386-off*)
+(defvar *n386-ready*)
+;; Image routine addresses, I386-NATIVE-EXPORT-LABELS' order.
+(defvar *n386-exports*)
+;; Why the last module was not translated natively.
+(defvar *n386-why*)
+;; The instruction being translated: (PC OPCODE OPERANDS).
+(defvar *n386-at*)
+;; The code area's next free byte.
+(defvar *n386-ptr*)
+;; The code area's end.
+(defvar *n386-end*)
+;; The constant vector runtime code reads (rooted at +I386-NATIVE-CONST-ROOT+).
+(defvar *n386-consts*)
+;; Pool index -> slot of *N386-CONSTS*.
+(defvar *n386-const-slots*)
+(defvar *n386-const-fill*)
+;; CENSUS: modules translated natively.
+(defvar *n386-translated*)
+;; CENSUS: (name . why), newest first.
+(defvar *n386-refused*)
+;; Modules (their bytecode) translated or refused for good.
+(defvar *n386-done*)
+;; Name lists of modules refused only because a callee was still interpreted
+;; (:NOT-NATIVE / :NO-CALLEE): retried after each module that does translate.
+(defvar *n386-pending*)
 
 (defun %n386-coinit ()
   "The emitter's configuration as this image was translated with it."
@@ -133,7 +151,8 @@
         (setq *n386-const-fill* (+ n 1))
         (setf (gethash idx *n386-const-slots*) n))))
 
-(defvar *n386-name-slots* nil "Runtime name -> slot of *N386-CONSTS* (its late-bound cell).")
+;; Runtime name -> slot of *N386-CONSTS* (its late-bound cell).
+(defvar *n386-name-slots*)
 
 (defun %n386-current-fn (name)
   "What a call to NAME reaches now: its function object, or NIL."
@@ -172,7 +191,8 @@
           *n386-name-slots* (make-hash-table :test (function equal)))
     (%n386-root-set *n386-consts*)
     (setq *n386-translated* 0 *n386-refused* nil *n386-done* nil *n386-pending* nil
-          *n386-ready* t))
+          *n386-forms* (make-hash-table) *n386-forms-translated* 0 *n386-why* nil
+          *n386-at* nil *n386-ready* t))
   t)
 
 ;;; ---------------------------------------------------------------------------
@@ -332,15 +352,18 @@
                          (setq pc npc))))))))
     (if bad nil (nreverse out))))
 
-(defun %n386-translate (m)
+(defun %n386-translate (m &optional with-thunk)
   "Module M (*JIT-MODULE-REGISTRY*'s (bc entry ft-list fn-table rt-table ...))
    as native i386 in the code area: an alist (NAME . FUNCTION-OBJECT), or NIL
-   (*N386-WHY*).  Nothing is written unless everything resolves."
+   (*N386-WHY*).  Nothing is written unless everything resolves.  WITH-THUNK:
+   the form's %MVM-EVAL-THUNK too (a top-level form run natively)."
   (%n386-init)
   (setq *n386-why* nil)
   (let* ((bc (first m)) (ft-list (third m)) (fn-table (fourth m)) (rt (fifth m))
-         (fns (sort (remove "%MVM-EVAL-THUNK" (copy-list ft-list) :key (function car)
-                            :test (function string=))
+         (fns (sort (if with-thunk
+                        (copy-list ft-list)
+                        (remove "%MVM-EVAL-THUNK" (copy-list ft-list) :key (function car)
+                                :test (function string=)))
                     (function <) :key (function second)))
          (base (logand (+ *n386-ptr* 15) -16))
          (x *n386-exports*)
@@ -456,6 +479,32 @@
     ;; this module stays interpreted
     (%n386-refresh names)
     (%n386-on-defun names)))
+
+;; Bytecode of a top-level form -> its native thunk.
+(defvar *n386-forms*)
+;; CENSUS: top-level forms run natively.
+(defvar *n386-forms-translated*)
+
+(defun %runtime-form-native (bc entry ft-list fn-table rt-table lam-offsets)
+  "mvm-eval's form seam (overridden here): a top-level form whose module
+   builds closures -- DEFMETHOD's method functions above all -- is translated
+   with its thunk, so the closures it makes are native; its thunk, or NIL to
+   interpret it as before.  Cached by bytecode: a re-evaluated form is the same
+   module."
+  (when (and (not (and (boundp (quote *n386-off*)) *n386-off*)) (%n386-ready)
+             (not (%n386-done-p bc)))
+    (or (gethash bc *n386-forms*)
+        (let* ((m (list bc entry ft-list fn-table rt-table lam-offsets nil nil))
+               (fns (handler-case (%n386-translate m t)
+                      (error (c) (setq *n386-why* (list :error (princ-to-string c) :at *n386-at*))
+                        nil)))
+               (th (cdr (assoc "%MVM-EVAL-THUNK" fns :test (function string=)))))
+          (if th
+              (progn (setq *n386-forms-translated* (+ *n386-forms-translated* 1))
+                     (setf (gethash bc *n386-forms*) th))
+              (progn (setq *n386-refused* (cons (cons :form *n386-why*) *n386-refused*)
+                           *n386-done* (cons bc *n386-done*))
+                     nil))))))
 
 (defun %jit-eager-all (&optional name)
   "COMPILE's seam: (compile 'F) translates F's module now (if DEFUN did not),

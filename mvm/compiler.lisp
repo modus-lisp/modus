@@ -8899,6 +8899,15 @@
      ;; but uses fixnum-safe halves in-image (value<<1 overflows there for the
      ;; top/bottom bit of the fixnum range — e.g. most-positive/negative-fixnum).
      (emit-li-tagged dest value))
+    ;; RUNTIME compile: a bignum literal is an object the reader already
+    ;; built, so load THAT from the quote pool (as COMPILE-QUOTE does for any
+    ;; other constant) instead of consing a copy at every evaluation -- a
+    ;; (ldb (byte 64 0) x), i.e. (logand x #xFFFFFFFFFFFFFFFF), allocated its
+    ;; mask each time round a hash loop.  Bignums are never mutated after
+    ;; construction, so sharing one is safe.  A static build bakes the parts
+    ;; as below (the pool is the running image's, not the output's).
+    ((and *mvm-eval-runtime-p* (not *static-build-p*))
+     (emit-ir :li-const dest (%e2-const-register value)))
     ((not (%lit-bignum-big-p value))
      ;; Small bignum.  value = lo + hi * 2^62, where lo ∈ [0, 2^62-1]
      ;; and hi is signed in [-2^61, 2^61-1].  For negative values

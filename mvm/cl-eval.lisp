@@ -3350,7 +3350,13 @@
                ;; -> bignum-sub -> bignum-add -> here again = infinite
                ;; recursion / stack-overflow SIGSEGV.  logior mnf sign-extends
                ;; bit 62+ and is a raw :or on the tagged fixnum words.
-               (logior lo +fixnum-neg-limit+)
+               ;; ...except that +FIXNUM-NEG-LIMIT+ is -2^62, i.e. MNF, i.e. a
+               ;; BIGNUM literal: the "raw :or" was a tag-check miss into
+               ;; GENERIC-LOGIOR every time, and once that grew a two-limb
+               ;; fast path (%GENERIC-BITWISE) it normalized its result HERE
+               ;; -- unbounded recursion.  lo - max - 1 is two raw fixnum
+               ;; subtractions, each in range for lo in [1, max].
+               (%fixnum-- (%fixnum-- lo +fixnum-max+) 1)
                b))))))
 
 ;;; --- Magnitude arithmetic on LSB-first limb lists ---
@@ -4363,6 +4369,9 @@
     ;; the result; NIL means it would overflow and falls through.)
     ((and (> count 0) (not (bignump n)) (< count +fixnum-bits+)
           (%fixnum-shl-or-nil n count)))
+    ;; Two limbs in, two limbs out: limb arithmetic (see %TWO-LIMB-SHL).
+    ((and (> count 0) (< count +limb-bits+) (%two-limb-int-p n)
+          (%two-limb-shl n count)))
     ((> count 0)
      ;; Left shift: route the full sign+limbs through the limb machinery so
      ;; the result promotes to fixnum / small / big bignum correctly via
@@ -4390,6 +4399,7 @@
          ;; shift arithmetic is fixnum-only
          ((or (bignump k) (>= k (+ (%bignum-integer-length-pos (%int-abs n)) 1)))
           (if (%int-neg-p n) -1 0))
+         ((not (big-bignum-p n)) (%two-limb-sar n k))
          (t (%int-shr-floor n k)))))))
 (defun %fixnum-to-bignum-parts (n)
   "Convert fixnum N to (lo . hi) bignum parts."
@@ -4409,16 +4419,16 @@
     ((or (and (bignump a) (big-bignum-p a))
          (and (bignump b) (big-bignum-p b)))
      (%bignum-add-general a b))
-    ;; Original 2-slot fast path.
+    ;; Original 2-slot fast path.  The parts are read into locals (they were
+    ;; two CONSes per add, as much garbage as the sum itself).
     (t
-     (let ((ap (if (bignump a) (cons (bignum-lo a) (bignum-hi a))
-                   (%fixnum-to-bignum-parts a)))
-           (bp (if (bignump b) (cons (bignum-lo b) (bignum-hi b))
-                   (%fixnum-to-bignum-parts b))))
-       (let ((sum-lo (%fixnum-+ (car ap) (car bp))))
+     (let ((alo (if (bignump a) (aref a 0) (logand a +fixnum-max+)))
+           (ha (if (bignump a) (aref a 1) (if (< a 0) -1 0)))
+           (blo (if (bignump b) (aref b 0) (logand b +fixnum-max+)))
+           (hb (if (bignump b) (aref b 1) (if (< b 0) -1 0))))
+       (let ((sum-lo (%fixnum-+ alo blo)))
          (let ((carry (if (< sum-lo 0) 1 0))
-               (lo (logand sum-lo +fixnum-max+))
-               (ha (cdr ap)) (hb (cdr bp)))
+               (lo (logand sum-lo +fixnum-max+)))
            (let ((sum-hi (%fixnum-+ (%fixnum-+ ha hb) carry)))
              ;; The 2-slot small-bignum representation holds at most 124 bits.
              ;; When both high words share a sign but SUM-HI comes back with the
@@ -4428,9 +4438,13 @@
              ;; with hi ≈ 2^62 and their high words sum out of range).  Route
              ;; those through the general sign-magnitude path, which allocates
              ;; the extra limb instead of silently wrapping to a negative value.
-             (if (and (%same-sign-p ha hb) (not (%same-sign-p ha sum-hi)))
+             ;; SUM-HI = -2^62 is the same overflow in a form the sign test
+             ;; misses: that raw word is below +FIXNUM-MIN+, so the 2-slot
+             ;; result printed as garbage ((+ -2^123 -2^123)).
+             (if (or (and (%same-sign-p ha hb) (not (%same-sign-p ha sum-hi)))
+                     (< sum-hi (%fixnum-- 0 +fixnum-max+)))
                  (%bignum-add-general a b)
-                 (bignum-to-fixnum-if-possible (make-bignum lo sum-hi))))))))))
+                 (%int-from-limbs lo sum-hi)))))))))
 
 (defun %same-sign-p (x y)
   "True if fixnums X and Y have the same sign (both >= 0 or both < 0).
@@ -4574,10 +4588,114 @@
     ((= op 1) (logior x y))
     (t (logxor x y))))
 
+;;; --- TWO-LIMB FAST PATHS (bitwise ops, ASH) --------------------------------
+;;;
+;;; A SMALL bignum IS a two's-complement number already: lo is the low limb
+;;; (unsigned, +fixnum-max+ wide) and hi the signed limb above it, so an
+;;; integer that is a fixnum or a small bignum -- every u64, i.e. every 64-bit
+;;; hash, cipher and checksum word -- is just the pair (lo, hi).  A bitwise op
+;;; is then the op on the two limbs, and a shift by less than a limb moves bits
+;;; between them: plain fixnum arithmetic, one result object at most.  The
+;;; general engines below (limb LISTS for the bitwise ops, digit arrays for
+;;; ASH) cost 200-500 bytes and ~1 us per u64 operation; beacon's SipHash did
+;;; ~200 of them per 32-byte key -- 174 KB and 0.33 ms per hash, its store
+;;; insert 135x slower than SBCL.
+
+(defun %two-limb-int-p (n)
+  "N is a fixnum or a SMALL (two-limb) bignum."
+  (and (integerp n) (or (not (bignump n)) (not (big-bignum-p n)))))
+
+(defun %int-lo-limb (n)
+  "The low limb of a fixnum or small bignum N, in [0, +fixnum-max+]."
+  (if (bignump n) (bignum-lo n) (logand n +fixnum-max+)))
+
+(defun %int-hi-limb (n)
+  "The signed high limb of a fixnum or small bignum N."
+  (if (bignump n) (bignum-hi n) (if (< n 0) -1 0)))
+
+(defun %int-from-limbs (lo hi)
+  "The integer lo + hi * 2^limb, normalized as BIGNUM-TO-FIXNUM-IF-POSSIBLE
+   does (a fixnum when it fits; most-negative-fixnum stays a bignum), without
+   building the bignum first."
+  (cond ((= hi 0) lo)
+        ((and (= hi -1) (> lo 0)) (%fixnum-- (%fixnum-- lo +fixnum-max+) 1))
+        (t (make-bignum lo hi))))
+
+(defun %pow2-limb (k)
+  "2^K for 0 <= K < +limb-bits+: five constant shifts at most (each an inline
+   SHL; no variable-count ASH, which would come back to BIGNUM-ASH)."
+  (let ((p 1))
+    (when (>= k 32) (setq p (ash (ash p 16) 16)) (setq k (%fixnum-- k 32)))
+    (when (>= k 16) (setq p (ash p 16)) (setq k (%fixnum-- k 16)))
+    (when (>= k 8) (setq p (ash p 8)) (setq k (%fixnum-- k 8)))
+    (when (>= k 4) (setq p (ash p 4)) (setq k (%fixnum-- k 4)))
+    (when (>= k 2) (setq p (ash p 2)) (setq k (%fixnum-- k 2)))
+    (if (>= k 1) (ash p 1) p)))
+
+(defun %fx-shr-nonneg (v s)
+  "V >> S for a non-negative fixnum V and 0 <= S < +limb-bits+, by one
+   inline division (no variable-count ASH, which would come back here)."
+  (if (= s 0) v (multiple-value-bind (q r) (%fixnum-truncate2 v (%pow2-limb s)) r q)))
+
+(defun %fx-sar (v s)
+  "Arithmetic V >> S (floor) for a fixnum V and S >= 0."
+  (cond ((>= s +limb-bits+) (if (< v 0) -1 0))
+        ((< v 0) (logxor (%fx-shr-nonneg (logxor v -1) s) -1))
+        (t (%fx-shr-nonneg v s))))
+
+(defun %two-limb-shl (n k)
+  "N * 2^K for a fixnum or small bignum N and 0 < K < +limb-bits+, or NIL
+   when the result does not fit two limbs (the general path takes it)."
+  (let ((lo (%int-lo-limb n)) (hi (%int-hi-limb n))
+        (lim (%pow2-limb (%fixnum-- +limb-bits-1+ k))))   ; |hi| room
+    (if (and (< hi lim) (>= hi (%fixnum-- 0 lim)))
+        (let* ((pk (%pow2-limb k))
+               (keep (%fixnum-- (%pow2-limb (%fixnum-- +limb-bits+ k)) 1))
+               (new-lo (%fixnum-* (logand lo keep) pk))
+               (carry (%fx-shr-nonneg lo (%fixnum-- +limb-bits+ k))))
+          (%int-from-limbs new-lo (%fixnum-+ (%fixnum-* hi pk) carry)))
+        nil)))
+
+(defun %two-limb-sar (n k)
+  "floor(N / 2^K) for a small bignum N and K > 0."
+  (let ((lo (%int-lo-limb n)) (hi (%int-hi-limb n)))
+    (if (>= k +limb-bits+)
+        (%fx-sar hi (%fixnum-- k +limb-bits+))
+        (%int-from-limbs
+         (%fixnum-+ (%fx-shr-nonneg lo k)
+                    (%fixnum-* (logand hi (%fixnum-- (%pow2-limb k) 1))
+                               (%pow2-limb (%fixnum-- +limb-bits+ k))))
+         (%fx-sar hi k)))))
+
 (defun %generic-bitwise (a b op)
   "Apply OP (0=and, 1=ior, 2=xor) to integers A and B as if on infinite
    two's-complement bit strings.  Returns a normalized integer.  TOTAL:
-   never errors on any integer pair."
+   never errors on any integer pair.
+   Two-limb operands take the limb fast path, written out flat (slot reads
+   and inline fixnum ops, no helper calls): it is every u64 logxor."
+  (let ((alo nil) (ahi 0) (blo nil) (bhi 0))
+    (cond ((not (integerp a)) nil)
+          ((bignump a) (unless (= (aref a 0) +bn-sentinel+)
+                         (setq alo (aref a 0)) (setq ahi (aref a 1))))
+          (t (setq alo (logand a +fixnum-max+)) (setq ahi (if (< a 0) -1 0))))
+    (cond ((not (integerp b)) nil)
+          ((bignump b) (unless (= (aref b 0) +bn-sentinel+)
+                         (setq blo (aref b 0)) (setq bhi (aref b 1))))
+          (t (setq blo (logand b +fixnum-max+)) (setq bhi (if (< b 0) -1 0))))
+    (let ((hi (and alo blo
+                   (cond ((= op 0) (logand ahi bhi)) ((= op 1) (logior ahi bhi)) (t (logxor ahi bhi))))))
+      ;; A high limb of -2^62 is no fixnum here (it is the raw word below
+      ;; +FIXNUM-MIN+: (logxor 2^61 -2^61)), so (logxor 2^123 -2^123) needs a
+      ;; third limb: the general engine.
+      (if (and hi (>= hi (%fixnum-- 0 +fixnum-max+)))
+          (let ((lo (cond ((= op 0) (logand alo blo)) ((= op 1) (logior alo blo)) (t (logxor alo blo)))))
+            (cond ((= hi 0) lo)
+                  ((and (= hi -1) (> lo 0)) (%fixnum-- (%fixnum-- lo +fixnum-max+) 1))
+                  (t (make-bignum lo hi))))
+          (%generic-bitwise-limbs a b op)))))
+
+(defun %generic-bitwise-limbs (a b op)
+  "%GENERIC-BITWISE's general engine, over limb lists."
   (let* ((sa (%any-to-limbs a))
          (sb (%any-to-limbs b))
          (la (length (cdr sa)))

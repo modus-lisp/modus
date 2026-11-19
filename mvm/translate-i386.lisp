@@ -1017,6 +1017,13 @@
   (i386-emit-byte buf (i386-modrm #b00 reg 5))
   (i386-emit-u32 buf (logand addr #xFFFFFFFF)))
 
+(defun i386-emit-sub-reg-abs (buf reg addr)
+  "SUB reg, [addr] (absolute 32-bit address, no base register): 2B /r mod=00 r/m=5"
+  (i386-check-eax-write reg)
+  (i386-emit-byte buf #x2B)
+  (i386-emit-byte buf (i386-modrm #b00 reg 5))
+  (i386-emit-u32 buf (logand addr #xFFFFFFFF)))
+
 (defun i386-emit-cmp-reg-abs (buf reg addr)
   "CMP reg, [addr] (compare register with absolute memory)"
   ;; Encoding: 3B /r mod=00 r/m=5 disp32
@@ -2461,6 +2468,14 @@
       (i386-emit-pop-reg buf +i386-eax+)
       (i386-emit-ret buf))))
 
+(defparameter *i386-gc-margin-addr* nil
+  "Hosted i386: the BSS word holding the VL margin the boot stub chose with the
+   heap's size (boot-linux-i386.lisp, EMIT-I386-CHOOSE-HEAP-SIZE).  When set,
+   the collector reads its margin there instead of *I386-GC-VL-MARGIN*, and a
+   collection whose survivors leave no room below VL exits 3 with
+   \"modus: heap exhausted\" rather than collecting again forever.  NIL: the
+   constant, as every other i386 image (byte-identical).")
+
 (defparameter *i386-gc-vl-margin* #x1000000
   "Bytes VL stops short of the end of the ACTIVE semispace (16 MB, the same as
    the upper semispace's +linux-i386-gc-guard+).  :gc-check tests VA < VL
@@ -2727,8 +2742,34 @@
         (progn
           (i386-emit-add-reg-abs buf +i386-eax+ *i386-gc-size-addr*)
           ;; ...less the overshoot margin: see *I386-GC-VL-MARGIN*.
-          (i386-emit-sub-reg-imm buf +i386-eax+ *i386-gc-vl-margin*)))
+          (if *i386-gc-margin-addr*
+              (i386-emit-sub-reg-abs buf +i386-eax+ *i386-gc-margin-addr*)
+              (i386-emit-sub-reg-imm buf +i386-eax+ *i386-gc-vl-margin*))))
     (i386-emit-mov-abs-reg buf *vl-addr* +i386-eax+)
+    ;; HEAP EXHAUSTED: the survivors reach past VL, so the next :gc-check
+    ;; collects again, forever (measured: the library ladder in an 8 MB
+    ;; semispace spun for 20 minutes).  Say so and exit 3, as arm32 / 68k do.
+    (when *i386-gc-margin-addr*
+      (let ((room (i386-make-label)) (msg "modus: heap exhausted (raise --dynamic-space-size)
+"))
+        (i386-emit-cmp-reg-reg buf +i386-esi+ +i386-eax+)        ; free ptr vs new VL
+        (i386-emit-jcc buf :b room)
+        ;; write(2, msg, len) with the message on the stack, then exit_group(3)
+        (let ((bytes (map 'list #'char-code msg)))
+          (loop while (/= 0 (mod (length bytes) 4)) do (setq bytes (append bytes (list 0))))
+          (loop for i from (- (length bytes) 4) downto 0 by 4
+                do (i386-emit-push-imm32 buf (logior (nth i bytes) (ash (nth (+ i 1) bytes) 8)
+                                                     (ash (nth (+ i 2) bytes) 16)
+                                                     (ash (nth (+ i 3) bytes) 24)))))
+        (i386-emit-mov-reg-imm buf +i386-ebx+ 2)
+        (i386-emit-mov-reg-reg buf +scratch0+ +i386-esp+)
+        (i386-emit-mov-reg-imm buf +scratch1+ (length msg))
+        (i386-emit-mov-reg-imm buf +i386-eax+ 4)                  ; SYS_write
+        (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+        (i386-emit-mov-reg-imm buf +i386-ebx+ 3)
+        (i386-emit-mov-reg-imm buf +i386-eax+ 252)                ; SYS_exit_group
+        (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+        (i386-emit-label buf room)))
 
     ;; --- MCGC point (c): byte-exact clear of the reclaimed range's bitmaps ---
     ;; EBX is the semispace this collection just evacuated; its bits are stale.

@@ -1787,6 +1787,15 @@
     (when (/= rex 0) (emit-bytes buf (logior #x40 rex))))
   (emit-bytes buf #x0F op (logior #xC0 (ash (logand reg 7) 3) (logand rm 7))))
 
+(defun x64-sse-rax7 (buf prefix op reg)
+  "Emit [PREFIX] [REX] 0F OP with ModRM [rax+7], disp8: the FP lane loads and
+   stores.  REG is an xmm number 0..15; REX.R carries its high bit.  Hand-built
+   ModRM bytes here and in the register forms dropped that bit, so an FP vreg
+   past F5 (xmm8..13, x64-fpp) read or wrote xmm0..5 instead."
+  (when prefix (emit-bytes buf prefix))
+  (when (>= reg 8) (emit-bytes buf #x44))
+  (emit-bytes buf #x0F op (logior #x40 (ash (logand reg 7) 3)) #x07))
+
 ;;; ============================================================
 ;;; x86-64 Encoding Helpers (ahead of TRANSLATE-INSTRUCTION, their first
 ;;; caller, so the build compiler finds THIS package's definitions there
@@ -4687,7 +4696,7 @@
            (emit-push buf 'rcx) (emit-push buf 'rdx)
            (emit-float-load-bits buf 'rax 'rcx 'rdx)
            (emit-bytes buf #x66 #x48 #x0F #x6E #xC1)                  ; movq xmm0, rcx
-           (emit-bytes buf #xF2 #x0F #x5A (logior #xC0 (ash fd 3)))    ; cvtsd2ss xmmD, xmm0
+           (x64-sse-rr buf #xF2 nil #x5A fd 0)                        ; cvtsd2ss xmmD, xmm0
            (emit-pop buf 'rdx) (emit-pop buf 'rcx)))
 
         ((op= +op-fp-box+)
@@ -4695,7 +4704,7 @@
          (let* ((vd (first operands))
                 (fs (x64-fpp (second operands))))
            (emit-push buf 'rcx) (emit-push buf 'rdx)
-           (emit-bytes buf #xF3 #x0F #x5A (logior #xC0 fs))             ; cvtss2sd xmm0, xmmS
+           (x64-sse-rr buf #xF3 nil #x5A 0 fs)                          ; cvtss2sd xmm0, xmmS
            (emit-mov-reg-imm buf 'rcx #x464)
            (emit-mov-mem-reg buf 'r12 'rcx 0)
            (emit-bytes buf #x66 #x48 #x0F #x7E #xC1)                  ; movq rcx, xmm0
@@ -4726,7 +4735,7 @@
                    (emit-load-vreg buf varr 'r13)
                    (emit-add-reg-reg buf +scratch-reg+ 'r13)
                    (emit-pop buf 'r13))))
-           (emit-bytes buf #xF3 #x0F #x10 (logior #x40 (ash fd 3)) #x07)))  ; movss xmmD, [rax+7]
+           (x64-sse-rax7 buf #xF3 #x10 fd)))                                ; movss xmmD, [rax+7]
 
         ((op= +op-fp-lane-store+)
          ;; (fp-lane-store Varr Vidx Fs) — MOVSS [arr + 4*idx + 7], xmmS
@@ -4744,7 +4753,7 @@
                    (emit-load-vreg buf varr 'r13)
                    (emit-add-reg-reg buf +scratch-reg+ 'r13)
                    (emit-pop buf 'r13))))
-           (emit-bytes buf #xF3 #x0F #x11 (logior #x40 (ash fs 3)) #x07)))  ; movss [rax+7], xmmS
+           (x64-sse-rax7 buf #xF3 #x11 fs)))                                ; movss [rax+7], xmmS
 
         ((or (op= +op-fp-add+) (op= +op-fp-sub+) (op= +op-fp-mul+) (op= +op-fp-div+))
          ;; (fp-<op> Fd Fa Fb) — single-precision: xmm0 ← B; D ← A; D op= xmm0
@@ -4755,10 +4764,10 @@
                            ((op= +op-fp-sub+) #x5C)     ; SUBSS
                            ((op= +op-fp-mul+) #x59)     ; MULSS
                            (t                 #x5E))))  ; DIVSS
-           (emit-bytes buf #x0F #x28 (logior #xC0 fb))                       ; movaps xmm0, xmmB
+           (x64-sse-rr buf nil nil #x28 0 fb)                                ; movaps xmm0, xmmB
            (unless (= fd fa)
-             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fa)))         ; movaps xmmD, xmmA
-           (emit-bytes buf #xF3 #x0F sse (logior #xC0 (ash fd 3)))))         ; opss xmmD, xmm0
+             (x64-sse-rr buf nil nil #x28 fd fa))                            ; movaps xmmD, xmmA
+           (x64-sse-rr buf #xF3 nil sse fd 0)))                              ; opss xmmD, xmm0
 
         ;; ==== f32x4 vector class on the FP vregs (F0..F5 = xmm2..xmm7) ====
         ;; Encodings assembler-verified (movups/addps…/shufps/movss).
@@ -4903,27 +4912,27 @@
          ;; (v4-lane-load Fd Varr Vidx) — MOVUPS xmmD, [arr + 4*idx + 7]
          (let* ((fd (x64-fpp (first operands))))
            (emit-f32-lane-addr buf (second operands) (third operands))
-           (emit-bytes buf #x0F #x10 (logior #x40 (ash fd 3)) #x07)))
+           (x64-sse-rax7 buf nil #x10 fd)))                           ; movups xmmD, [rax+7]
 
         ((op= +op-v4-lane-store+)
          ;; (v4-lane-store Varr Vidx Fs) — MOVUPS [arr + 4*idx + 7], xmmS
          (let* ((fs (x64-fpp (third operands))))
            (emit-f32-lane-addr buf (first operands) (second operands))
-           (emit-bytes buf #x0F #x11 (logior #x40 (ash fs 3)) #x07)))
+           (x64-sse-rax7 buf nil #x11 fs)))                           ; movups [rax+7], xmmS
 
         ((op= +op-v4-dup+)
          ;; (v4-dup Fd Fs) — movaps D, S ; shufps D, D, 0
          (let* ((fd (x64-fpp (first operands))) (fs (x64-fpp (second operands))))
            (unless (= fd fs)
-             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fs)))
-           (emit-bytes buf #x0F #xC6 (logior #xC0 (ash fd 3) fd) #x00)))
+             (x64-sse-rr buf nil nil #x28 fd fs))                     ; movaps xmmD, xmmS
+           (x64-sse-rr buf nil nil #xC6 fd fd) (emit-bytes buf #x00)))  ; shufps xmmD, xmmD, 0
 
         ((op= +op-v4-dup-lane-load+)
          ;; (v4-dup-lane-load Fd Varr Vidx) — movss D, [lane] ; shufps D, D, 0
          (let* ((fd (x64-fpp (first operands))))
            (emit-f32-lane-addr buf (second operands) (third operands))
-           (emit-bytes buf #xF3 #x0F #x10 (logior #x40 (ash fd 3)) #x07)
-           (emit-bytes buf #x0F #xC6 (logior #xC0 (ash fd 3) fd) #x00)))
+           (x64-sse-rax7 buf #xF3 #x10 fd)                           ; movss xmmD, [rax+7]
+           (x64-sse-rr buf nil nil #xC6 fd fd) (emit-bytes buf #x00)))  ; shufps xmmD, xmmD, 0
 
         ((or (op= +op-v4-add+) (op= +op-v4-sub+) (op= +op-v4-mul+) (op= +op-v4-div+))
          ;; (v4-<op> Fd Fa Fb) — packed single: xmm0 ← B; D ← A; D op= xmm0
@@ -4934,16 +4943,16 @@
                            ((op= +op-v4-sub+) #x5C)     ; SUBPS
                            ((op= +op-v4-mul+) #x59)     ; MULPS
                            (t                 #x5E))))  ; DIVPS
-           (emit-bytes buf #x0F #x28 (logior #xC0 fb))                       ; movaps xmm0, xmmB
+           (x64-sse-rr buf nil nil #x28 0 fb)                                ; movaps xmm0, xmmB
            (unless (= fd fa)
-             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fa)))         ; movaps xmmD, xmmA
-           (emit-bytes buf #x0F sse (logior #xC0 (ash fd 3)))))              ; opps xmmD, xmm0
+             (x64-sse-rr buf nil nil #x28 fd fa))                            ; movaps xmmD, xmmA
+           (x64-sse-rr buf nil nil sse fd 0)))                               ; opps xmmD, xmm0
 
         ((op= +op-fp-mov+)
          ;; (fp-mov Fd Fs) — movaps xmmD, xmmS (scalar or 4-lane; 128-bit copy)
          (let* ((fd (x64-fpp (first operands))) (fs (x64-fpp (second operands))))
            (unless (= fd fs)
-             (emit-bytes buf #x0F #x28 (logior #xC0 (ash fd 3) fs)))))
+             (x64-sse-rr buf nil nil #x28 fd fs))))                   ; movaps xmmD, xmmS
 
         ((op= +op-u8-ref+)
          ;; (u8-ref Vd Varr Vidx) — load one byte from a u8 vector.

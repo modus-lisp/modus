@@ -2734,6 +2734,12 @@
                    (push insn out))))
     (nreverse out)))
 
+(defvar *fixed-arity-params* nil
+  "After an image's MVM-COMPILE-ALL with *ELIDE-FIXED-NARGS*: function key ->
+   N for each function whose final definition takes exactly N required
+   parameters and nothing else (%NARGS-UNREAD-P).  The i386 translator reads
+   it: such a callee with N <= 2 never reads V2/V3.")
+
 (defun %nargs-unread-p (name n)
   "Whether a call to NAME with N arguments can omit the count (%ELIDE-FIXED-NARGS)."
   (let* ((key (if (stringp name) name (string name)))
@@ -35532,7 +35538,17 @@
     ;; Phase 2b': calls to fixed-arity functions store no count (*ELIDE-FIXED-NARGS*)
     (when (and *elide-fixed-nargs* (not *mvm-eval-runtime-p*))
       (dolist (entry all-ir)
-        (setf (cdr entry) (%elide-fixed-nargs (cdr entry)))))
+        (setf (cdr entry) (%elide-fixed-nargs (cdr entry))))
+      ;; and the same test, kept past this compile for a translator: every
+      ;; function key whose final definition takes exactly N required
+      ;; parameters and nothing else, with its N (*FIXED-ARITY-PARAMS*)
+      (let ((h (make-hash-table :test 'equal)))
+        (maphash (lambda (key info)
+                   (let ((n (function-info-param-count info)))
+                     (when (and (integerp n) (%nargs-unread-p key n))
+                       (setf (gethash key h) n))))
+                 *functions*)
+        (setf *fixed-arity-params* h)))
 
     ;; Phase 2c: drop what the image's entry points do not reach (*IR-DCE-ROOTS*).
     (when *ir-dce-roots*

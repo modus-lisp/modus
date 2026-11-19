@@ -149,8 +149,8 @@
     ;; shift carries #xF00000 to #x1000000, and the image's source text spells
     ;; layout addresses in hex, so the pool grew a word and every address after
     ;; it moved -- differences the relocation table cannot describe.
-    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 800000 (860000
-    ;; with a stack of its own, BC0000 before cold native code, D30000 while the JIT area was in the map).  Its
+    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 6F0000 (800000
+    ;; before the keep-list was measured on the Mac, 860000 with a stack of its own, BC0000 before cold native code, D30000 while the JIT area was in the map).  Its
     ;; minimum partition is SPAN + 1.5 MB.
     ;; COLD NATIVE CODE (2026-11-19, compiler.lisp *COLD-KEEP*): the functions a
     ;; coverage run never entered stay on the disk until their first call, so
@@ -180,16 +180,16 @@
     ;; 1.8 MB it was is gone from the map and from the boot read; :JIT-AREA
     ;; below is what a DISK boot (the core run) uses, past the kind bytes.
     ;; Between :STATIC-HI and :CACHE-LO, 128 KB for the boot tail's end.
-    (:quadra  :load #x00600000 :static-lo #x00B00000 :static-hi #x00B80000
-              :jit-area-lo #x01090000 :jit-area-hi #x019C0000 :jit-max-bytecode 16384
-              :cache-lo #x00BB0000 :cache-hi #x00BB0000
-              :staging #x00BB0000 :staging-size #x00000000
-              :stack-top #x00BB0000 :scratch #x00BB0000 :io-buf #x00BB1000
-              :nil-page #x00BC0000
-              :region #x00BD0000 :heap-size #x00100000 :gc-guard #x00010000
-              :kind-map #x01000000
-              :boot-heap #x00BF0000 :boot-heap-size #x00400000
-              :boot-cache-lo #x00BB0000 :boot-cache-hi #x00BB0000
+    (:quadra  :load #x00600000 :static-lo #x009F0000 :static-hi #x00A70000
+              :jit-area-lo #x00F80000 :jit-area-hi #x019C0000 :jit-max-bytecode 16384
+              :cache-lo #x00AA0000 :cache-hi #x00AA0000
+              :staging #x00AA0000 :staging-size #x00000000
+              :stack-top #x00AA0000 :scratch #x00AA0000 :io-buf #x00AA1000
+              :nil-page #x00AB0000
+              :region #x00AC0000 :heap-size #x00100000 :gc-guard #x00010000
+              :kind-map #x00EF0000
+              :boot-heap #x00AE0000 :boot-heap-size #x00400000
+              :boot-cache-lo #x00AA0000 :boot-cache-hi #x00AA0000
               :boot-stack-top #x01A00000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on

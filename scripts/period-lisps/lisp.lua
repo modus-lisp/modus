@@ -132,7 +132,10 @@ if os.getenv("MOUSE") then
   for tag, port in pairs(manager.machine.ioport.ports) do
     for name, field in pairs(port.fields) do
       local n = string.lower(name)
+      -- the Quadra's names it; an ADB machine's (LC III: :macadb:MOUSE0) is
+      -- the default "P1 Button 1"
       if n == "mouse button 0" then button = field end
+      if not button and string.match(tag, "MOUSE0$") and string.find(n, "button") then button = field end
     end
   end
   print("lisp.lua: mouse button " .. (button and button.name or "NOT FOUND"))

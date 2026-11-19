@@ -40,7 +40,12 @@
         .equ    HJLO, -1208                 | the JIT's code area from the partition:
         .equ    HJHI, -1212                 |   [HJLO, HJHI), above the kind map
         .equ    JITMIN, 0x40000             | 256 KB
-        .equ    JITMAX, 0x400000            | 4 MB
+        .ifndef JITMAX                      | (mac68k-chain.py MAC68K_CHAIN_DEFS can
+        .equ    JITMAX, 0x400000            |  set these: a measuring run's bigger
+        .endif                              |  area)  4 MB
+        .ifndef JITSHIFT
+        .equ    JITSHIFT, 3                 | an eighth of the room
+        .endif
         .equ    GUARD, 0x10000              | boot-mac68k :GC-GUARD
         .equ    LOWBLK, 0x20000             | the low block (the layout's :ALLOC-START)
 start:  link    %a6, #-1212
@@ -348,7 +353,7 @@ hsize:  tst.l   44(%a2)
         move.l  %d2, %d0
         sub.l   %d1, %d0                | the room
         bmi     8f
-        lsr.l   #3, %d0                 | the JIT's code area: an eighth of it,
+        lsr.l   #JITSHIFT, %d0          | the JIT's code area: an eighth of it,
         and.l   #0xFFFF0000, %d0        |   in 64 KB, from 256 KB to 4 MB, at TOP
         cmp.l   #JITMIN, %d0
         bhs     1f

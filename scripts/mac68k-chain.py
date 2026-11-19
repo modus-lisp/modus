@@ -122,7 +122,12 @@ def finder_resources():
 def code1():
     with tempfile.TemporaryDirectory() as d:
         o, b = os.path.join(d, 'c.o'), os.path.join(d, 'c.bin')
-        subprocess.run(['m68k-linux-gnu-as', '-m68000', '-o', o,
+        # MAC68K_CHAIN_DEFS="SYM=VAL ...": assembler symbols (mac68k-chain.s
+        # JITSHIFT / JITMAX: the code area's share of the room and its cap)
+        defs = []
+        for d_ in os.environ.get('MAC68K_CHAIN_DEFS', '').split():
+            defs += ['--defsym', d_]
+        subprocess.run(['m68k-linux-gnu-as', '-m68000'] + defs + ['-o', o,
                         os.path.join(HERE, 'mac68k-chain.s')], check=True)
         subprocess.run(['m68k-linux-gnu-objcopy', '-O', 'binary', o, b], check=True)
         code = open(b, 'rb').read()

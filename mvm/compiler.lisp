@@ -34092,7 +34092,12 @@
         (dolist (e all-ir)
           (let ((nm (function-info-name (car e))))
             (cond ((and *boot-tail-last* (%boot-only-fn-name-p nm)) (push e boot))
-                  ((%cold-fn-name-p nm) (push e cold))
+                  ;; a body over ~48 KB of bytecode stays: a cold body's
+                  ;; relocations are 16-bit word offsets (128 KB), and the
+                  ;; 68k code is about the bytecode's size
+                  ((and (%cold-fn-name-p nm)
+                        (< (loop for insn in (cdr e) sum (ir-instruction-size insn)) 49152))
+                   (push e cold))
                   (t (push e hot)))))
         (when boot (format t "~&  boot-only functions last: ~D~%" (length boot)))
         (when cold (format t "~&  cold functions after them: ~D~%" (length cold)))

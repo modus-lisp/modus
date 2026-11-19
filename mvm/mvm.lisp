@@ -1084,30 +1084,83 @@
           do (push (%insn-norm op-type op-val) norm))
     (rplacd *insn-sink* (cons (list pos opcode (nreverse norm) next) (cdr *insn-sink*)))))
 
+(defvar *insn-no-bytes* nil
+  "T while the sink is on: ENCODE-INSTRUCTION and MVM-LI-HALVES record each
+   instruction and advance the position, but write NO bytes.  mvm-eval sets it
+   for a DEFUN module the native 68k tier translates from the captured
+   instructions; the bytes are made from those instructions only if something
+   needs them (%BC-FILL-FROM-INSNS, mvm-eval's %BC-ENSURE-BYTES).")
+
+(defvar *opcode-spec-vec* nil
+  "OPCODE -> its operand types, a vector over 0..255 built from *OPCODE-TABLE*
+   on first use: ENCODE-INSTRUCTION's lookup ran once per instruction, and on
+   the Mac a GETHASH there was ~4% of a DEFUN.  (A DEFVAR's value never runs
+   in-image: built lazily, as *E2-CONST-POOL* is.)")
+(defvar *opcode-size-vec* nil "OPCODE -> its encoded size in bytes.")
+
+(defun %operand-size (ty)
+  (case ty ((:reg :imm8 :width) 1) (:imm16 2) ((:imm32 :off32) 4) (:imm64 8) (t 0)))
+
+(defun %opcode-vecs ()
+  (let ((specs (make-array 256 :initial-element nil))
+        (sizes (make-array 256 :initial-element 1)))
+    (maphash (lambda (code info)
+               (when (and (integerp code) (>= code 0) (< code 256))
+                 (let ((spec (opcode-info-operands info)) (n 1))
+                   (dolist (ty spec) (setq n (+ n (%operand-size ty))))
+                   (setf (aref specs code) spec)
+                   (setf (aref sizes code) n))))
+             *opcode-table*)
+    (setq *opcode-size-vec* sizes)
+    (setq *opcode-spec-vec* specs)))
+
+(defun %opcode-spec (opcode)
+  (let ((v *opcode-spec-vec*))
+    (aref (if (simple-vector-p v) v (%opcode-vecs)) opcode)))
+
+(defun %opcode-size (opcode)
+  (let ((v *opcode-size-vec*))
+    (unless (simple-vector-p v) (%opcode-vecs) (setq v *opcode-size-vec*))
+    (aref v opcode)))
+
+(defun %encode-operands (buf spec operands)
+  (loop for op-type in spec
+        for op-val in operands
+        do (ecase op-type
+             (:reg    (mvm-emit-reg buf op-val))
+             (:imm8   (mvm-emit-byte buf op-val))
+             (:imm16  (mvm-emit-u16 buf op-val))
+             (:imm32  (mvm-emit-u32 buf op-val))
+             (:imm64  (mvm-emit-u64 buf op-val))
+             (:off32  (mvm-emit-s32 buf op-val))
+             (:width  (mvm-emit-byte buf op-val)))))
+
 (defun encode-instruction (buf opcode &rest operands)
   "Encode an MVM instruction into the bytecode buffer.
    OPCODE is the numeric opcode. OPERANDS are the raw values
    matching the opcode's operand specification."
-  (let* ((info (gethash opcode *opcode-table*))
-         (spec (if info (opcode-info-operands info) nil))
-         (pos (and *insn-sink* (mvm-buffer-position buf))))
-    (when pos
-      ;; the bytes below advance the buffer by the spec's sizes
-      (%insn-sink-add pos opcode spec operands
-                      (+ pos 1 (loop for ty in spec
-                                     sum (case ty ((:reg :imm8 :width) 1) (:imm16 2)
-                                           ((:imm32 :off32) 4) (:imm64 8) (t 0))))))
-    (mvm-emit-byte buf opcode)
-    (loop for op-type in spec
-          for op-val in operands
-          do (ecase op-type
-               (:reg    (mvm-emit-reg buf op-val))
-               (:imm8   (mvm-emit-byte buf op-val))
-               (:imm16  (mvm-emit-u16 buf op-val))
-               (:imm32  (mvm-emit-u32 buf op-val))
-               (:imm64  (mvm-emit-u64 buf op-val))
-               (:off32  (mvm-emit-s32 buf op-val))
-               (:width  (mvm-emit-byte buf op-val))))))
+  (let ((spec (%opcode-spec opcode)))
+    (if *insn-sink*
+        (let* ((pos (mvm-buffer-position buf)) (next (+ pos (%opcode-size opcode))))
+          (%insn-sink-add pos opcode spec operands next)
+          (if *insn-no-bytes*
+              (setf (mvm-buffer-position buf) next)
+              (progn (mvm-emit-byte buf opcode) (%encode-operands buf spec operands))))
+        (progn (mvm-emit-byte buf opcode) (%encode-operands buf spec operands)))))
+
+(defun %bc-fill-from-insns (bc insns start end)
+  "Write into byte vector BC the bytes of each captured instruction (PC OPCODE
+   OPERANDS NEXT-PC) of INSNS whose PC is in [START, END): what encoding them
+   wrote, since a captured instruction's operands are its encoded operands as
+   DECODE-INSTRUCTION reads them back (*INSN-SINK*)."
+  (let ((buf (make-mvm-buffer :bytes bc :labels nil :position 0)))
+    (dolist (i insns)
+      (let ((pc (first i)))
+        (when (and (>= pc start) (< pc end))
+          (setf (mvm-buffer-position buf) pc)
+          (mvm-emit-byte buf (second i))
+          (%encode-operands buf (%opcode-spec (second i)) (third i)))))
+    bc))
 
 ;;; ============================================================
 ;;; Instruction Decoding
@@ -1292,10 +1345,13 @@
                                             (if (eql hi 0) lo (logior lo (ash hi 32))))
                                       (+ pos 10))
                                 (cdr *insn-sink*)))))
-  (mvm-emit-byte buf +op-li+)
-  (mvm-emit-reg buf vd)
-  (mvm-emit-u32 buf lo32)
-  (mvm-emit-u32 buf hi32))
+  (if (and *insn-sink* *insn-no-bytes*)
+      (setf (mvm-buffer-position buf) (+ (mvm-buffer-position buf) 10))
+      (progn
+        (mvm-emit-byte buf +op-li+)
+        (mvm-emit-reg buf vd)
+        (mvm-emit-u32 buf lo32)
+        (mvm-emit-u32 buf hi32))))
 
 (defun mvm-li-const (buf vd idx)
   "Emit a li-const instruction (load tagged addr of constant-pool[idx]).

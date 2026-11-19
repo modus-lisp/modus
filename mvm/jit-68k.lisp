@@ -611,7 +611,8 @@
                          nil
                      (if (and (%t68-max-bytecode) (> (length (first m)) (%t68-max-bytecode)))
                          (progn (setq *t68-why* (list :too-big (length (first m)))) nil)
-                         (handler-case (%t68-translate m)
+                         ;; the threaded JIT reads bytes: make any missing
+                         (handler-case (progn (%bc-ensure-bytes (first m)) (%t68-translate m))
                            (error (c) (setq *t68-why* (list :error (princ-to-string c))) nil)))))))
         (if fns
             (progn

@@ -122,6 +122,7 @@
   "The instructions in [START, END) of BC, each (PC OPCODE OPERANDS NEXT-PC):
    decoded ONCE.  This list is the native tier's input -- what translating from
    the compiler's IR, without bytecode, will produce instead."
+  (%bc-ensure-bytes bc)
   (let ((pc start) (out nil))
     (loop while (< pc end)
           do (let ((d (decode-instruction bc pc)))
@@ -187,7 +188,10 @@
             (when *68k-branch-distances*            ; pass 1: the planner's margins
               (push (m68k-buffer-position buf) *68k-fn-entry-positions*))
             (push (cons (first f) (m68k-buffer-position buf)) entries)
-            (dolist (i (cdr c))
+            (loop for tail on (cdr c) do
+             (let ((i (car tail)))
+              ;; the translator's lookahead reads the instruction list, not bytes
+              (setq *68k-insn-tail* tail)
               ;; an instruction a handler already consumed (M68K-RANGE-GUARD-AT
               ;; fuses SHL/SAR/CMP/BNE into ASL + BVS and sets *68K-SKIP-TO* past
               ;; the BNE), as translate-mvm-to-68k-1's loop skips it
@@ -220,7 +224,7 @@
                      (m68k-emit-word buf #x2039)               ; MOVE.L abs.L,D0
                      (m68k-emit-long buf (%t68-cell (second operands)))
                      (m68k-store-vreg buf (first operands) +68k-d0+))
-                    (t (m68k-translate-insn buf op operands new-pc label-map nil)))))))))))
+                    (t (m68k-translate-insn buf op operands new-pc label-map nil))))))))))))
     (if bad nil (nreverse entries))))
 
 (defun %n68-call-label (buf base operand rt fn-table stubs)
@@ -249,7 +253,8 @@
             (*68k-mul32-label* (ex 8)) (*68k-mulu64-label* (ex 9)) (*68k-divs32-label* (ex 10))
             (*68k-mac-console-label* (ex 11)) (*68k-mac-getc-label* (ex 12))
             (*68k-mac-service-label* (ex 13)) (*68k-thread-next-label* (ex 14)))
-        (let ((entries (%n68-emit-module buf base bc fns fn-table rt captured)))
+        (let ((entries (unwind-protect (%n68-emit-module buf base bc fns fn-table rt captured)
+                         (setq *68k-insn-tail* nil))))
           (when entries (m68k-fixup-labels buf))
           (values buf entries))))))
 

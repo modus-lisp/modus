@@ -1656,13 +1656,30 @@
 (defvar *68k-fast-prologue* nil "(NPARAMS SLOTS) for the second prologue.")
 (defvar *68k-fast-call* nil "T between a self-call's SET-NARGS and its CALL.")
 
+(defvar *68k-insn-tail* nil
+  "The native tier's instruction list from the one being translated on, as
+   (PC OPCODE OPERANDS NEXT-PC): M68K-INSN-AT reads the lookahead here, since a
+   module translated from its captured instructions may have no bytes.")
+
+(defun m68k-insn-at (pc)
+  "The instruction at PC as DECODE-INSTRUCTION returns it, (OPCODE OPERANDS
+   . NEXT-PC): from *68K-INSN-TAIL* when it holds PC, else decoded."
+  (let ((tail *68k-insn-tail*))
+    (loop repeat 6
+          while (consp tail)
+          do (let ((i (car tail)))
+               (when (eql (first i) pc)
+                 (return-from m68k-insn-at (cons (second i) (cons (third i) (fourth i))))))
+             (setq tail (cdr tail)))
+    (decode-instruction *68k-bytecode* pc)))
+
 (defun m68k-fast-entry-plan (frame-pc next-pc)
   "For the FRAME-ENTER at FRAME-PC: (values N OK-PC) when the next
    instructions are the compiler's fixed-count check (GET-NARGS ... BEQ ok)."
   (when (and *68k-bytecode* *68k-label-map* (< next-pc (length *68k-bytecode*))
              (null (gethash next-pc *68k-label-map*)))
-    (let ((d (decode-instruction *68k-bytecode* next-pc))
-          (f (decode-instruction *68k-bytecode* frame-pc)))
+    (let ((d (m68k-insn-at next-pc))
+          (f (m68k-insn-at frame-pc)))
       (when (and (eql (car d) +op-get-nargs+) (eql (car f) +op-trap+)
                  (eql (cddr f) next-pc))
         (m68k-nargs-check-at (cddr d) (first (cadr d)))))))
@@ -3504,7 +3521,7 @@
          (if (and *68k-bytecode* *68k-fast-label* (eql n *68k-fast-n*)
                   (< mvm-pc (length *68k-bytecode*))
                   (null (gethash mvm-pc label-map))
-                  (let ((d (decode-instruction *68k-bytecode* mvm-pc)))
+                  (let ((d (m68k-insn-at mvm-pc)))
                     (and (eql (car d) +op-call+)
                          (eql (first (cadr d)) *68k-fast-entry-pc*))))
              ;; A self-call with the function's own count: no count, and the
@@ -4149,7 +4166,7 @@
       (dotimes (i 3)
         (when (or (>= pc (length bc)) (gethash pc *68k-label-map*))
           (return-from m68k-range-guard-at nil))
-        (let ((d (decode-instruction bc pc)))
+        (let ((d (m68k-insn-at pc)))
           (push (cons (car d) (cadr d)) ops)
           (setq pc (cddr d))))
       (destructuring-bind (bne cmp sar) ops
@@ -4164,7 +4181,7 @@
   (and *68k-bytecode* *68k-label-map*
        (< next-pc (length *68k-bytecode*))
        (null (gethash next-pc *68k-label-map*))
-       (member (car (decode-instruction *68k-bytecode* next-pc)) ops)))
+       (member (car (m68k-insn-at next-pc)) ops)))
 
 (defun m68k-nargs-check-at (next-pc vd)
   "When GET-NARGS VD is followed by LI vB IMM / CMP VD vB / BEQ, none a branch
@@ -4174,7 +4191,7 @@
       (dotimes (i 3)
         (when (or (>= pc (length bc)) (gethash pc *68k-label-map*))
           (return-from m68k-nargs-check-at nil))
-        (let ((d (decode-instruction bc pc)))
+        (let ((d (m68k-insn-at pc)))
           (push (cons (car d) (cadr d)) ops)
           (setq pc (cddr d))))
       (destructuring-bind (beq cmp li) ops
@@ -4188,7 +4205,7 @@
   (and *68k-cons-label* *68k-bytecode*
        (< next-pc (length *68k-bytecode*))
        (null (gethash next-pc *68k-label-map*))
-       (eql (car (decode-instruction *68k-bytecode* next-pc)) +op-cons+)))
+       (eql (car (m68k-insn-at next-pc)) +op-cons+)))
 
 (defun m68k-emit-gc-check (buf)
   "Room while VA (A2) < VL (A3); else call the collector (hosted) or ILLEGAL."

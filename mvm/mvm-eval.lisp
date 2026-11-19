@@ -4767,6 +4767,71 @@
 ;;; come from the compiler -- one replayed from the FASL cache (mvm/fasl.lisp)
 ;;; -- goes through exactly the same steps.  FT-LIST is in REVERSE source
 ;;; order, as the compiler builds it: (name offset length) per module function.
+;;; THE BYTES OF A NATIVE MODULE.  The native 68k tier translates a module from
+;;; the instructions the encoder captured (*INSN-SINK*), never from its bytes,
+;;; and encoding them was ~15% of a DEFUN on the Mac: the opcode lookup, the
+;;; byte stores, and on a 30-bit tower a bignum shift for every 32-bit
+;;; immediate.  So a DEFUN module emitted with the sink on gets NO bytes
+;;; (mvm.lisp *INSN-NO-BYTES*), only its eval thunk's, which is interpreted.
+;;; The rest are made from the captured instructions (%BC-FILL-FROM-INSNS: a
+;;; captured instruction re-encodes to exactly its bytes) the moment anything
+;;; could read them -- the DEFUN hook declined or fell back to the threaded JIT,
+;;; the thunk calls into its module, a FASL records it, the eval cache keeps it,
+;;; %N68-DECODE -- and once the module is native and nothing can, it never is.
+;;; *BC-ELIDED* is (BC . INSNS) while BC's bytes are missing.
+(defvar *bc-elided* nil)
+(defvar *bc-elide-off* nil "T: always encode the bytes.")
+(defvar *bc-elide-verify* nil
+  "T: encode every module's bytes as before AND rebuild them from the captured
+   instructions; a difference is counted in *BC-ELIDE-MISMATCHES*.")
+(defvar *bc-elide-mismatches* nil)
+(defvar *bc-elide-saved* 0 "CENSUS: modules that never needed their bytes.")
+
+(defun %bc-elide-p ()
+  (not (or (and (boundp (quote *bc-elide-off*)) *bc-elide-off*)
+           (and (boundp (quote *bc-elide-verify*)) *bc-elide-verify*))))
+
+(defun %bc-ensure-bytes (bc)
+  "BC's bytes, all of them, if they were elided.  BC."
+  (let ((e *bc-elided*))
+    (when (and (consp e) (eq (car e) bc))
+      (setq *bc-elided* nil)
+      (%bc-fill-from-insns bc (cdr e) 0 (length bc))))
+  bc)
+
+(defun %bc-thunk-calls-module-p (insns entry ft-list)
+  "Does the eval thunk at ENTRY call, or take the address of, a function of
+   its own module?  Then interpreting it runs that function's bytes."
+  (let ((end entry))
+    (dolist (f ft-list) (when (eql (second f) entry) (setq end (+ entry (third f)))))
+    (dolist (i insns nil)
+      (when (and (>= (first i) entry) (< (first i) end))
+        (let ((op (second i)))
+          (when (or (eql op +op-call+) (eql op +op-tailcall+) (eql op +op-fn-addr+))
+            (let ((operand (if (eql op +op-fn-addr+) (second (third i)) (first (third i)))))
+              (when (and (integerp operand) (< operand #x40000000))
+                (return t)))))))))
+
+(defun %bc-elide-settle (bc native-p entry ft-list keep)
+  "After the DEFUN hook: BC's missing bytes are made unless its module went
+   NATIVE-P and nothing will interpret it (KEEP: the eval cache will)."
+  (let ((e *bc-elided*))
+    (when (and (consp e) (eq (car e) bc))
+      (if (or keep (not (eq native-p t))
+              (%bc-thunk-calls-module-p (cdr e) entry ft-list))
+          (%bc-ensure-bytes bc)
+          (progn
+            (setq *bc-elided* nil)
+            (setq *bc-elide-saved* (+ (if (integerp *bc-elide-saved*) *bc-elide-saved* 0) 1)))))))
+
+(defun %bc-elide-verify (bc insns)
+  (let ((copy (make-array (length bc) :element-type (quote (unsigned-byte 8)))))
+    (%bc-fill-from-insns copy insns 0 (length bc))
+    (unless (equalp copy bc)
+      (setq *bc-elide-mismatches*
+            (cons (let ((k (mismatch copy bc))) (list (length bc) k))
+                  *bc-elide-mismatches*)))))
+
 (defun %mvm-eval-publish-and-run (forms bc entry ft-list fn-table rt-table
                                   lam-offsets persist-names %lam-bearing %cacheable)
             ;; WS3 def persistence: install each top-level user DEFUN as a
@@ -4832,7 +4897,10 @@
                        *native-sym-function-table* tramp))))))
     ;; RUNTIME DEFUN HOOK: a backend that compiles a runtime DEFUN when it is
     ;; defined (the 68k threaded JIT, mvm/jit-68k.lisp) overrides it.
-    (%runtime-defun-hook persist-names))
+    ;; A module with no bytes keeps none only when the hook made it native and
+    ;; nothing will interpret it: see THE BYTES OF A NATIVE MODULE.
+    (%bc-elide-settle bc (%runtime-defun-hook persist-names) entry ft-list %cacheable))
+  (when %cacheable (%bc-ensure-bytes bc))
   ;; PERF Round 2: cache the compiled module for these forms so a
   ;; later mvm-eval of the same forms skips the whole compile.  bc is a
   ;; fresh copy (mvm-buffer-used-bytes), safe despite buffer reuse.
@@ -5216,6 +5284,9 @@
     ;; decoded (mvm.lisp *INSN-SINK*): SETQ, not LET -- a compiled LET of a
     ;; special does not bind it in the image.
     (setq *insn-sink* (and (boundp (quote *jit-capture-insns*)) *jit-capture-insns* (list :sink)))
+    ;; NO BYTES for a DEFUN module the native tier will translate from the
+    ;; captured instructions (%BC-ELIDE-P): see THE BYTES OF A NATIVE MODULE.
+    (setq *insn-no-bytes* (and *insn-sink* persist-names (%bc-elide-p) t))
     (unwind-protect
          (dolist (e all-ir)
            (let* ((ir (cdr e)) (lp (compute-label-positions ir)))
@@ -5225,10 +5296,26 @@
     (dolist (e all-ir)
       (when (string-equal (string (function-info-name (car e))) "%MVM-EVAL-THUNK")
         (setq entry (function-info-bytecode-offset (car e)))))
-    (let ((bc (mvm-buffer-used-bytes buf)))
+    (let ((bc (if *insn-no-bytes*
+                  (make-array (mvm-buffer-position buf) :element-type (quote (unsigned-byte 8)))
+                  (mvm-buffer-used-bytes buf))))
       ;; tie the captured instructions to THIS bytecode vector
       (when (and (consp *jit-last-insns*) (eq (car *jit-last-insns*) :pending))
         (rplaca *jit-last-insns* bc))
+      (setq *bc-elided* nil)
+      (if *insn-no-bytes*
+          (progn
+            (setq *insn-no-bytes* nil)
+            ;; the thunk is interpreted: its bytes now; the rest on demand
+            (dolist (e all-ir)
+              (when (string-equal (string (function-info-name (car e))) "%MVM-EVAL-THUNK")
+                (let ((o (function-info-bytecode-offset (car e))))
+                  (%bc-fill-from-insns bc (cdr *jit-last-insns*)
+                                       o (+ o (function-info-bytecode-length (car e)))))))
+            (setq *bc-elided* (cons bc (cdr *jit-last-insns*))))
+          (when (and (boundp (quote *bc-elide-verify*)) *bc-elide-verify* (consp *jit-last-insns*)
+                     (eq (car *jit-last-insns*) bc))
+            (%bc-elide-verify bc (cdr *jit-last-insns*))))
       (if entry
           (let ((fn-table (make-array (length all-ir))) (i 0)
                 ;; LAMBDA-OFFSETS: the bytecode entry offsets of in-module LAMBDA /
@@ -5279,6 +5366,7 @@
                     ;; which is safe because slot-0 of a #x52 is never DATA.
                     (puthash off lam-offsets (%lam-offset-defun-tag (function-info-name (car e)))))))
             (when %fslot
+              (%bc-ensure-bytes bc)
               (%fasl-record %fslot forms bc entry ft-list fn-table rt-table lam-offsets
                             persist-names %lam-bearing %ftaint0)
               (setq *fasl-effects* nil))

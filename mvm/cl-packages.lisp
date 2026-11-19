@@ -2642,14 +2642,14 @@
       (setq vc (cdr vc)))))
 
 (defun %progv-restore (saves)
-  "Restore values saved by %progv-save."
-  (let ((cur saves))
+  "Restore values saved by %progv-save, in REVERSE binding order (see %DYNB-UNWIND)."
+  (let ((cur (reverse saves)))
     (loop
       (when (null cur) (return nil))
       (let ((p (car cur)))
-        ;; The %DYNBIND above's counterpart.  %DYNUNBIND truncates this
-        ;; thread's binding stack to the entry it finds, so restoring in
-        ;; binding order (which is the order %PROGV-SAVE built) is correct.
+        ;; The %DYNBIND above's counterpart.  %DYNUNBIND pops this thread's
+        ;; top entry when it is this variable's, so the restores run innermost
+        ;; first.
         (%dynunbind (car p) (cdr p)))
       (setq cur (cdr cur)))))
 

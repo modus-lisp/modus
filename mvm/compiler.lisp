@@ -4239,16 +4239,29 @@
 ;;; PLANE and the slot typed U8VEC takes the byte path.
 (defvar *struct-accessors* nil
   "Alist acc-name-hash -> (setter-hash struct-name-string slot-index slot-type
-   min-instance-length struct-name read-only-p).")
+   min-instance-length struct-name read-only-p accessor-symbol).")
 
+;;; THE RECORD IS THE ACCESSOR SYMBOL'S, not its name's.  It is found by the
+;;; name's hash, so a function of the same NAME in another package -- quill's
+;;; SESSION-HISTORY (a slot) and operandi's (a GETHASH) -- found it too, and
+;;; every call of the other one compiled as quill's slot read: "#<HASH-TABLE>
+;;; is not of type QUILL:SESSION".  The accessor symbol rides in the record
+;;; and a lookup must be that symbol (a setter, its package's); a record from
+;;; before the symbol was kept (NIL) matches by name, as it always did.
 (defun %struct-accessor-note (acc-name setter-name struct-str index slot-type
-                              &optional min-len struct-name read-only)
+                              &optional min-len struct-name read-only acc-sym)
   (%fasl-taint "%struct-accessor-note")
   (let ((h (compute-name-hash acc-name)))
     (setq *struct-accessors*
           (cons (list h (compute-name-hash setter-name) struct-str index slot-type
-                      min-len struct-name read-only)
+                      min-len struct-name read-only acc-sym)
                 (remove h *struct-accessors* :key (function car))))))
+
+(defun %struct-record-for-p (record sym setter)
+  "Whether accessor RECORD belongs to SYM (a SETTER: a symbol of the accessor's package)."
+  (let ((a (ninth record)))
+    (or (null a) (not (symbolp a))
+        (if setter (eq (symbol-package a) (symbol-package sym)) (eq a sym)))))
 
 (defun %struct-accessor-forget (name body)
   "A DEFUN of NAME whose BODY is not a defstruct accessor's or writer's own
@@ -4270,19 +4283,22 @@
                              (name-eq (car (cadr (cadar body))) "OBJ-SUBTAG"))))))
       (unless own
         (setq *struct-accessors*
-              (remove-if (lambda (r) (or (eql (car r) h) (eql (cadr r) h)))
+              (remove-if (lambda (r) (or (and (eql (car r) h) (%struct-record-for-p r name nil))
+                                         (and (eql (cadr r) h) (%struct-record-for-p r name t))))
                          *struct-accessors*))))))
 
 (defun %struct-accessor-info (sym)
   "The record for accessor symbol SYM, or NIL."
   (and sym (symbolp sym) *struct-accessors*
-       (assoc (normalize-name sym) *struct-accessors*)))
+       (let ((r (assoc (normalize-name sym) *struct-accessors*)))
+         (and r (%struct-record-for-p r sym nil) r))))
 
 (defun %struct-setter-info (sym)
   "The record whose SETTER is symbol SYM, or NIL."
   (and sym (symbolp sym) *struct-accessors*
-       (let ((h (normalize-name sym)))
-         (find h *struct-accessors* :key (function cadr)))))
+       (let* ((h (normalize-name sym))
+              (r (find h *struct-accessors* :key (function cadr))))
+         (and r (%struct-record-for-p r sym t) r))))
 
 (defun %declared-struct-p (form env struct-str)
   "True when FORM is a variable declared to be the struct named STRUCT-STR."
@@ -8448,12 +8464,25 @@
          (bq-comma-expr template)
          (list 'list (list 'quote (%bq-marker-sym template))
                (expand-backquote (bq-comma-expr template) (- level 1)))))
+    ;; A VECTOR with a comma in it (CLHS 2.4.6: `#(,@xs) is `(... ,@xs) made a vector).  It was
+    ;; quoted as data, so the commas stayed in it as (COMMA X): weft's (%u16vec 3 4 ...) built a
+    ;; one-element vector holding (COMMA-AT XS), and every DEFLATE table derived from it failed.
+    ((and (vectorp template) (not (stringp template)) (%bq-tree-has-comma-p template))
+     (list 'coerce (expand-backquote-list (coerce template 'list) level) ''simple-vector))
     ((atom template) (list 'quote template))
     ((%bq-form-p template)
      (list 'list (list 'quote 'backquote)
            (expand-backquote (cadr template) (+ level 1))))
     ;; List — process element by element
     (t (expand-backquote-list template level))))
+
+(defun %bq-tree-has-comma-p (x)
+  "Whether a comma marker occurs anywhere in X (a list or a non-string vector)."
+  (cond ((bq-comma-p x) t)
+        ((consp x) (or (%bq-tree-has-comma-p (car x)) (%bq-tree-has-comma-p (cdr x))))
+        ((and (vectorp x) (not (stringp x)))
+         (dotimes (i (length x) nil) (when (%bq-tree-has-comma-p (aref x i)) (return t))))
+        (t nil)))
 
 (defun expand-backquote-list (lst &optional (level 1))
   "Expand a backquote list template. Handles splice and nested backquote."
@@ -8481,7 +8510,8 @@
                    ;; ,x — unquote at level 1, rebuilt as data deeper;
                    ;; nested backquote; nested list: all via EXPAND-BACKQUOTE.
                    ;; (An SBCL comma is a STRUCT, not a cons — test it first.)
-                   ((or (bq-comma-p elt) (consp elt))
+                   ((or (bq-comma-p elt) (consp elt)
+                        (and (vectorp elt) (not (stringp elt)) (%bq-tree-has-comma-p elt)))
                     (push (expand-backquote elt level) current))
                    ;; Literal atom
                    (t
@@ -14073,7 +14103,11 @@
                                (site (%site-fast site `(progn (set-cdr c ,sv) ,sv)
                                                  `(%dynunbind-site ,k ,sv (quote ,site))))
                                (t `(%dynunbind ,k ,sv)))))
-                     save-vars specials))
+                     ;; REVERSE binding order: the innermost entry is undone first, so each
+                     ;; restore finds its own entry on top of the thread's binding stack
+                     ;; (%DYNB-UNWIND pops only the top).  On the shallow path the order is
+                     ;; immaterial: each restore writes its own variable's saved value.
+                     (reverse save-vars) (reverse specials)))
            (stripped-body (%special-shadow-body %all-declared-specials env
                                                 (strip-declares body))))
       ;; NON-LOCAL EXIT (#240, 2026-08-08): the restore MUST run on every
@@ -14105,7 +14139,11 @@
               (mapcar (lambda (b)
                         (let ((var (if (consp b) (car b) b))
                               (init (if (consp b) (cadr b) nil)))
-                          (let ((pos (position (normalize-name var) special-names)))
+                          (let ((pos (or (and (symbolp var) (position var specials :test #'eq))
+                                      ;; by name only when no special IS this symbol: two packages'
+                                      ;; *PROGRESS* in one LET (loom binds weft's, fetch's and seal's)
+                                      ;; shared the first one's temp, and the others read unbound
+                                      (position (normalize-name var) special-names))))
                             (if pos
                                 (list (nth pos temp-vars) init)
                                 b))))
@@ -14119,7 +14157,11 @@
             (let ((seq-bindings
                     (mapcan (lambda (b rb)
                               (let ((var (if (consp b) (car b) b)))
-                                (let ((pos (position (normalize-name var) special-names)))
+                                (let ((pos (or (and (symbolp var) (position var specials :test #'eq))
+                                      ;; by name only when no special IS this symbol: two packages'
+                                      ;; *PROGRESS* in one LET (loom binds weft's, fetch's and seal's)
+                                      ;; shared the first one's temp, and the others read unbound
+                                      (position (normalize-name var) special-names))))
                                   (if pos
                                       (list rb
                                             (list (%mvm-gensym "SPECSET")
@@ -18395,13 +18437,20 @@
           ;; scanner.  Accumulator clauses still force post-body-tests:
           ;; acc-body is appended AFTER body, so a WHILE that follows a
           ;; COLLECT cannot be expressed by an in-body position.
+          ;; BEFORE any body clause, a WHILE is a CLAUSE among the FORs, emitted in its source
+          ;; place (the clause emitter runs each clause's step and test in order): in
+          ;;   (loop while (< i end) for c = (char s i) ...)
+          ;; the test must come before C is stepped -- as SBCL, CCL and MIT LOOP do -- and as a
+          ;; pre-body test it ran after every FOR, so C read (char s end).  weft's CSS ident
+          ;; reader is exactly that loop.
           ((= kw 208372112)  ; WHILE
            (let ((test `(if (null ,(cadr rest)) (return-from :%loop-exit nil))))
              (cond
                ((or (loop-state-body-forms state)
                     (loop-state-accumulator state))
                 (push test (loop-state-body-forms state)))
-               (t (push test (loop-state-pre-body-tests state)))))
+               (t (push (make-loop-iter :kind :while :init-form (cadr rest))
+                        (loop-state-iterations state)))))
            (setf rest (cddr rest)))
 
           ;; UNTIL condition — same source-order rule.
@@ -18411,7 +18460,8 @@
                ((or (loop-state-body-forms state)
                     (loop-state-accumulator state))
                 (push test (loop-state-body-forms state)))
-               (t (push test (loop-state-pre-body-tests state)))))
+               (t (push (make-loop-iter :kind :until :init-form (cadr rest))
+                        (loop-state-iterations state)))))
            (setf rest (cddr rest)))
 
           ;; REPEAT n
@@ -32650,6 +32700,19 @@
                           for p in ctor-params
                           collect `(aset obj ,(+ 2 i) ,p))
                   obj))
+         ;; MORE SLOTS THAN A CALL PASSES POSITIONALLY: a call with more than +APPLY-SPREAD-MAX+
+         ;; arguments passes that many and then a LIST of the rest, which only an &rest function
+         ;; accepts -- a fixed-parameter ctor signalled "invalid number of arguments: more than 120".
+         ;; weft's computed style, CSTYLE, has 162 slots.  So a wide struct's ctor takes &rest and
+         ;; fills the slots in order.
+         (when (> nslots +apply-spread-max+)
+           (let ((vals (%defstruct-intern "VALS")) (k (%defstruct-intern "K")) (v (%defstruct-intern "V")))
+             (setf ctor-params (list '&rest vals)
+                   ctor-body `(let ((obj (make-array ,(+ 2 nslots))) (,k 2))
+                                (aset obj 0 (quote %struct-instance))
+                                (aset obj 1 (quote ,struct-name))
+                                (dolist (,v ,vals) (aset obj ,k ,v) (setq ,k (+ ,k 1)))
+                                obj))))
          (push `(defun ,(%defstruct-intern internal-ctor-name)
                     ,ctor-params
                   ,ctor-body)
@@ -33027,7 +33090,8 @@
                   ;; this struct reads the slot in place (see compile-call)
                   (%struct-accessor-note acc-name (format nil "SET-~A" acc-name)
                                          struct-str (+ 2 i) (nth i slot-types)
-                                         min-inst-len struct-name slot-read-only)
+                                         min-inst-len struct-name slot-read-only
+                                         (if conc-name (%defstruct-intern acc-name) slot))
                   (let* ((setter-name (format nil "SET-~A" acc-name))
                          ;; NOTE — CHECKED-STORE is bound HERE, as a plain
                          ;; top-level backquote, and spliced below as a bare

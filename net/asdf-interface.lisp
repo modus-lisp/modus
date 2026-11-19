@@ -84,7 +84,8 @@
            "RUN-PROGRAM" "LAUNCH-PROGRAM" "WAIT-PROCESS" "TERMINATE-PROCESS"
            "PROCESS-ALIVE-P" "DELETE-DIRECTORY-TREE" "QUIT"
            "SUBPROCESS-ERROR" "SUBPROCESS-ERROR-CODE" "SUBPROCESS-ERROR-COMMAND"
-           "SUBPROCESS-ERROR-PROCESS" "PROCESS-INFO" "PROCESS-INFO-PID"))
+           "SUBPROCESS-ERROR-PROCESS" "PROCESS-INFO" "PROCESS-INFO-PID"
+           "FILE-EXISTS-P" "DIRECTORY-EXISTS-P" "TRUENAMIZE" "ENSURE-PATHNAME"))
 
 (defpackage "ASDF"
   (:use "COMMON-LISP" "UIOP")
@@ -282,6 +283,26 @@
                        (uiop::subdirectories d))))
     (remove-if (lambda (f) (member (namestring f) subs :test (function string=)))
                (directory (concatenate 'string d pattern)))))
+
+;;; Four more programs reach for (operandi's SendFile and its chat deletion, loom's file pages):
+;;; PROBE-FILE of the name as a directory is what tells a directory from a file here -- a regular
+;;; file named with a trailing / is not found.
+(defun uiop::file-exists-p (x)
+  "X's truename when it names a file that is not a directory, else NIL."
+  (let ((p (and x (ignore-errors (probe-file x)))))
+    (and p
+         (not (ignore-errors (probe-file (concatenate 'string (string-right-trim "/" (namestring p)) "/"))))
+         p)))
+(defun uiop::directory-exists-p (x)
+  "X's truename (in directory form) when it names a directory, else NIL."
+  (and x (ignore-errors
+          (probe-file (concatenate 'string (string-right-trim "/" (namestring x)) "/")))))
+(defun uiop::truenamize (x)
+  "X's truename when it exists, else X merged with *DEFAULT-PATHNAME-DEFAULTS*."
+  (or (ignore-errors (truename x)) (merge-pathnames x)))
+(defun uiop::ensure-pathname (x &rest keys)
+  (declare (ignore keys))
+  (cond ((null x) nil) ((pathnamep x) x) (t (pathname x))))
 
 (defun uiop::native-namestring (x) (and x (namestring x)))
 (defun uiop::parse-native-namestring (s &rest keys)

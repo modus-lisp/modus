@@ -2168,12 +2168,24 @@
 ;; write to a server that had hung up killed everything with exit 141).
 ;; rt_sigaction(SIGPIPE=13, {SIG_IGN, 0, 0, 0}, NULL, 8) = syscall 13.
 " (%ignore-sigpipe-source) "
-" (if (not *cli-hosted-actor-runtime-p*)
-      ;; The actor runtime and the per-computation registry are hosted-only
-      ;; (*cli-hosted-actors-source*); an image without the actor runtime (bare metal,
-      ;; aarch64) has nothing to publish.
-      "(defun %publish-runtime-api () nil)"
-      "(defun %publish-runtime-api () (%publish-runtime-api-hosted))") "
+" (cond (*cli-hosted-actor-runtime-p*
+         "(defun %publish-runtime-api () (%publish-runtime-api-hosted))")
+        ;; THE HOSTED aarch64 IMAGE WITH THREADS (macOS, iOS) links net/hosted-sync.lisp --
+        ;; *CLI-HOSTED-ACTORS-SOURCE*'s first clause -- so it has the per-computation registry
+        ;; and its threads bind what is registered (%WITH-COMPUTATION-STATE), but not the actor
+        ;; runtime.  Publish the registry alone.  Unpublished, a library's (fboundp
+        ;; 'register-per-computation-special) found NIL and its global stayed shared: natrium's
+        ;; DRBG, filled by the first worker to want a random byte -- every TLS handshake on a
+        ;; worker -- was a refused shared store on the phone.
+        ((and (eq *cli-arch* :aarch64) (not *cli-bare-metal*) cl-user::*layout-threads*)
+         "(defun %publish-runtime-api ()
+  (let ((f (function register-per-computation-special)))
+    (set-symbol-function (intern \"REGISTER-PER-COMPUTATION-SPECIAL\" (find-package \"COMMON-LISP-USER\")) f)
+    (when (boundp (quote *symbol-function-table*))
+      (puthash \"REGISTER-PER-COMPUTATION-SPECIAL\" *symbol-function-table* f))
+    t))")
+        ;; bare metal, or an image without threads: nothing to publish
+        (t "(defun %publish-runtime-api () nil)")) "
 
 (defun %publish-runtime-api-hosted ()
   (let ((pk (find-package \"COMMON-LISP-USER\")))

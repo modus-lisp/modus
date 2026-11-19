@@ -1811,14 +1811,29 @@
             (%jit-icache-flush addr 96)
             addr)))))
 
+(defvar *kernel-code-read-only* nil
+  "T once a pad write has faulted: this process cannot write the image's code.")
+
 (defun %kernel-redirect (name old)
   "OLD, NAME's definition being replaced, is a code object: if it has a pristine
-   call pad, point the pad at NAME's late binding."
+   call pad, point the pad at NAME's late binding.
+
+   WHERE THE IMAGE'S CODE IS READ-ONLY -- the Darwin runner and the phone map it
+   r-x -- the pad's first store faults, before it has changed a byte, and the
+   redefinition must still happen: this is called from inside DEFUN, and a fault
+   escaping it lost the DEFUN itself (sb-gray's 31 %GRAY-WRAP wrappers, so no CL
+   stream function reached a Gray stream on iOS).  There a redefinition reaches
+   what looks the name up -- FUNCALL, the REPL, JIT code through its linkage
+   cells -- and the image's own direct callers keep the original, as before
+   2026-10-14."
+  (when *kernel-code-read-only* (return-from %kernel-redirect nil))
   (let ((pad (- (%val->word old) 3 16)))
     (when (eq (%kernel-pad-state pad) :pristine)
       (let ((target (%kernel-redirect-target name (%kernel-pad-prepack pad))))
         (when target
-          (%kernel-patch-pad pad target)
+          (unless (handler-case (%kernel-patch-pad pad target)
+                    (error () (setq *kernel-code-read-only* t) nil))
+            (return-from %kernel-redirect nil))
           (when (null *kernel-redirects*)
             (setq *kernel-redirects* (make-hash-table :test (function equal))))
           (puthash name *kernel-redirects* pad)

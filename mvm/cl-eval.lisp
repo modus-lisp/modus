@@ -2723,6 +2723,19 @@
       ((string= s "NUL")       (code-char 0))
       ((string= s "ESCAPE")    (code-char 27))
       ((string= s "DELETE")    (code-char 127))
+      ;; SBCL's names that portable-ish code uses (weft, the browser engine, reads all three):
+      ;; FormFeed as SBCL spells Page, and two Unicode names
+      ((string= s "FORMFEED")  (code-char 12))
+      ((string= s "NO-BREAK_SPACE") (code-char #xA0))
+      ((string= s "REPLACEMENT_CHARACTER") (code-char #xFFFD))
+      ((string= s "LINE_SEPARATOR") (code-char #x2028))
+      ((string= s "PARAGRAPH_SEPARATOR") (code-char #x2029))
+      ((string= s "ZERO_WIDTH_NO-BREAK_SPACE") (code-char #xFEFF))
+      ((string= s "VT")        (code-char 11))
+      ;; #\U+FEFF: SBCL's name for a character by its code point (shuttle's JavaScript whitespace)
+      ((and (> (length s) 2) (char= (char s 0) #\U) (char= (char s 1) #\+)
+            (let ((n (parse-integer s :start 2 :radix 16 :junk-allowed t)))
+              (and n (< n #x110000) (code-char n)))))
       ;; every name CHAR-NAME gives
       (t (let ((i 0) (hit nil))
            (loop

@@ -3370,26 +3370,30 @@
         (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (%dynb-base blk)))))
 
 (defun %dynb-unwind (blk key a i)
-  "Pop the innermost binding of KEY, and everything above it, by truncating
-   the stack to entry I.  Answers 1 when it found one, 0 when it did not.
+  "Pop this thread's innermost binding when it is a binding of KEY: A is the
+   KEY word of the TOP entry, I its index.  Answers 1 when it popped one, 0
+   when the top entry is not KEY's (nothing is touched).
 
-   TRUNCATE RATHER THAN POP, and the difference is load-bearing.  A LET* of
-   two specials evaluates its inits INSIDE the unwind-protect, so a throw out
-   of the second init leaves the first bound and the second not, while the
-   cleanup still runs BOTH restores; and the restores run in binding order,
-   not reverse.  Truncation is right in both cases — by the time this
-   cleanup runs every INNER binding has already been popped by its own
-   cleanup, so nothing above I is live."
-  (let ((base (%dynb-base blk)))
-    (loop                                   ; a loop for the reason %DYNB-FIND gives
-      (when (or (< i 0) (< a base)) (return 0))
-      (when (eql (mem-ref a :u64) key)
-        (let ((f (%dynb-filter blk)))
-          (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
-          (%dynb-set-top blk a i)
-          (return 1)))
-      (setq a (- a 16))
-      (setq i (- i 1)))))
+   ONLY THE TOP ENTRY, NEVER A SEARCH.  Every binding is undone by its own
+   cleanup, innermost first, and a LET or PROGV of several specials undoes
+   them in REVERSE binding order (COMPILE-LET-WITH-SPECIALS, %PROGV-RESTORE)
+   -- so when a restore runs, its own entry is the one on top, or it was never
+   made (a LET* init that threw before it) and the top belongs to the binding
+   below.  This used to search down for KEY and truncate there, with restores
+   in binding order: the first restore of a LET took all of its own entries,
+   and every later one then found an OUTER binding of its variable and
+   truncated to it, taking every live binding above that.  shuttle's compiler
+   binds (*strict* *in-function*) and then *out* in each function it compiles;
+   compiling a nested JS function on a worker lost the outer *out*, and the
+   outer compile read it unbound (test/let-specials-nested.lisp).  The main
+   thread binds shallowly and never comes here."
+  (declare (ignore i))
+  (if (and (>= a (%dynb-base blk)) (eql (mem-ref a :u64) key))
+      (let ((f (%dynb-filter blk)))
+        (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
+        (%dynb-set-top blk a (- (%dynb-depth blk) 1))
+        1)
+      0))
 
 (defun %dynb-overflow (key)
   "This thread's binding stack is full (%DYNB-CAPACITY entries).  An honest error rather than a

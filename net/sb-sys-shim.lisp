@@ -79,7 +79,16 @@
            "OCTETS-TO-STRING" "STRING-TO-OCTETS"
            "DOUBLE-FLOAT-POSITIVE-INFINITY" "DOUBLE-FLOAT-NEGATIVE-INFINITY"
            "SINGLE-FLOAT-POSITIVE-INFINITY" "SINGLE-FLOAT-NEGATIVE-INFINITY"
-           "SEED-RANDOM-STATE" "SPIN-LOOP-HINT" "WITH-TIMEOUT" "TIMEOUT"))
+           "SEED-RANDOM-STATE" "SPIN-LOOP-HINT"
+           ;; the browser stack (weft, shuttle, loom) reaches for these
+           "FLOAT-NAN-P" "FLOAT-INFINITY-P" "GET-TIME-OF-DAY"
+           "MAKE-WEAK-POINTER" "WEAK-POINTER-VALUE" "PARSE-NATIVE-NAMESTRING"
+           "WITH-TIMEOUT" "TIMEOUT"))
+
+;;; SB-UNICODE: the one name shuttle's regular expressions use (\p{...}).
+(defpackage "SB-UNICODE"
+  (:use)
+  (:export "GENERAL-CATEGORY"))
 
 ;;; SB-KERNEL and SB-INT: only the float-bits and float-trap names portable numeric code reaches
 ;;; for (mill reads ONNX tensors with them; ieee-floats-style code does the same).
@@ -879,3 +888,51 @@
 (when (find-symbol "*CAPTURE-BACKTRACES*" (symbol-package '%backtrace-list))
   (import (find-symbol "*CAPTURE-BACKTRACES*" (symbol-package '%backtrace-list)) "MODUS")
   (export (find-symbol "*CAPTURE-BACKTRACES*" (symbol-package '%backtrace-list)) "MODUS"))
+
+
+;;; ---- the browser stack's SBCL surface (weft, shuttle, loom), 2026-11-18 ------------------------
+
+(defun sb-ext:float-nan-p (x) (and (floatp x) (/= x x)))
+
+(defun sb-ext:float-infinity-p (x)
+  (and (floatp x) (= x x) (> (abs x) most-positive-double-float)))
+
+(defun sb-ext:get-time-of-day ()
+  "(values seconds microseconds) since the Unix epoch.  The microseconds come from the internal
+   real-time clock, so they are monotonic within a second's reading rather than the wall clock's."
+  (let ((us (floor (* (get-internal-real-time) 1000000) internal-time-units-per-second)))
+    (values (- (get-universal-time) 2208988800) (mod us 1000000))))
+
+;;; A weak pointer that holds its object STRONGLY: modus's collectors keep no weak references, so
+;;; the honest answer is "still there".  A cache keyed through one never shrinks, which is the cost.
+(defun sb-ext:make-weak-pointer (object) (list :weak-pointer object))
+(defun sb-ext:weak-pointer-value (wp)
+  (if (and (consp wp) (eq (car wp) :weak-pointer)) (values (second wp) t) (values nil nil)))
+
+(defun sb-ext:parse-native-namestring (string &optional host defaults &key as-directory)
+  (declare (ignore host))
+  (let ((s (if (and as-directory (plusp (length string))
+                    (char/= (char string (1- (length string))) #\/))
+               (concatenate 'string string "/")
+               string)))
+    (if defaults (merge-pathnames s defaults) (pathname s))))
+
+(defun sb-unicode:general-category (c)
+  "C's Unicode general category, as SBCL's keywords -- from the character predicates modus has and
+   a table of the common punctuation and symbols, not the Unicode database: ASCII and Latin-1 exactly,
+   letters and digits of other scripts by their case, the rest :SO."
+  (let ((code (char-code c)))
+    (cond ((or (< code 32) (<= 127 code 159)) :cc)
+          ((or (= code 32) (= code #xA0) (= code #x1680) (<= #x2000 code #x200A)
+               (= code #x202F) (= code #x205F) (= code #x3000)) :zs)
+          ((= code #x2028) :zl) ((= code #x2029) :zp)
+          ((digit-char-p c) :nd)
+          ((upper-case-p c) :lu) ((lower-case-p c) :ll)
+          ((alpha-char-p c) :lo)
+          ((find c "([{") :ps) ((find c ")]}") :pe)
+          ((char= c #\-) :pd) ((char= c #\_) :pc)
+          ((find c "!\"#%&'*,./:;?@\\") :po)
+          ((find c "+<=>|~") :sm) ((char= c #\$) :sc) ((find c "^`") :sk)
+          ((<= #x300 code #x36F) :mn)
+          ((<= #xE000 code #xF8FF) :co)
+          (t :so))))

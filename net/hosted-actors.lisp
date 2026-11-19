@@ -78,8 +78,9 @@
 ;;; collection count.  Region i's from-space is *HA-RBASE-FROM* + i*rsize and
 ;;; its control block is band +0xA000 + i*0x40.
 ;;;
-;;; IT IS ADAPTIVE IN COUNT AND NOT IN SIZE.  A region is 16 MB or it is not
-;;; carved; what varies with the heap is HOW MANY.  %HA-FIT-REGIONS never
+;;; IT IS ADAPTIVE IN COUNT, AND THE SIZE IS THE PROGRAM'S CHOICE.  A region is 16 MB unless the
+;;; program asks for more (*THREAD-HEAP-BYTES*, MODUS_THREAD_HEAP); what varies with the heap is HOW
+;;; MANY.  %HA-FIT-REGIONS never
 ;;; returns fewer than two, so an image whose semispaces only ever afforded the
 ;;; historic pair carves exactly the historic pair at exactly the historic
 ;;; addresses — *HA-R1-FROM* and *HA-R2-FROM* are still regions 0 and 1 — and
@@ -235,11 +236,39 @@
       (setq n (+ n 1)))
     (if (< n 2) 2 n)))
 
+(defvar *thread-heap-bytes* nil
+  "How big each thread's heap (its region's semispace) is to be, in bytes, or NIL for 16 MB.  Read
+   ONCE, when the regions are carved -- the first thread -- so a program sets it before it starts
+   one; MODUS_THREAD_HEAP (megabytes) in the environment overrides it.  Rounded down to a megabyte,
+   never below 16 MB.
+
+   WHAT IT COSTS: the regions are cut from the top of region 0's semispaces and may take at most
+   half of one (%HA-FIT-REGIONS), so bigger heaps mean FEWER of them -- and a thread slot past the
+   last region has no heap and cannot cons.  When even two do not fit at the size asked for, the
+   size is cut to the two that do.  A phone's world (vessel) asks for heaps a web page fits in:
+   a worker that owns a loaded page holds its DOM, styles, layout, scripts and canvas, which 16 MB
+   does not.")
+
+(defun %ha-region-size (size0)
+  "Each region's semispace size for a region-0 semispace of SIZE0: *THREAD-HEAP-BYTES* (or
+   MODUS_THREAD_HEAP, in MB), at least 16 MB, cut so at least two regions fit."
+  (let* ((env (ignore-errors (%cli-getenv "MODUS_THREAD_HEAP")))
+         (mb (and env (> (length env) 0) (ignore-errors (parse-integer env :junk-allowed t))))
+         (want (or (and mb (> mb 0) (* mb #x100000))
+                   ;; BOUNDP first: a kernel DEFVAR's initform does not run in every image
+                   (and (boundp '*thread-heap-bytes*) (integerp *thread-heap-bytes*) *thread-heap-bytes*)
+                   #x1000000))
+         (want (max #x1000000 (logand want (- 0 #x100000))))
+         (avail (- (- size0 (ash size0 -1)) (+ #x1000000 4096))))
+    (if (>= avail (* 2 want))
+        want
+        (max #x1000000 (logand (floor avail 2) (- 0 #x100000))))))
+
 (defun %ha-carve-new0 (size0)
   "The byte offset into a semispace of SIZE0 at which the carve begins — the
    band base, and the new size of region 0.  Split out of %HA-CARVE because
    %HA-CARVE-ROOM has to know the answer BEFORE the carve commits to it."
-  (let* ((s #x1000000)
+  (let* ((s (%ha-region-size size0))
          (g #x1000000)
          (n (%ha-fit-regions size0 g s (%ha-max-regions))))
     (logand (- size0 (+ g (+ (* n s) 4096))) (- 0 4096))))
@@ -344,7 +373,7 @@
               ;; this arithmetic: %HA-CARVE-ROOM checked the frontier against
               ;; that function's answer, and two spellings that could drift
               ;; would make the check guard an address the carve does not use.
-              (let* ((s #x1000000)
+              (let* ((s (%ha-region-size size0))
                      (g #x1000000)
                      (n (%ha-fit-regions size0 g s (%ha-max-regions)))
                      (new0 (%ha-carve-new0 size0)))

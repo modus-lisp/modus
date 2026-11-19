@@ -20,6 +20,8 @@
 //   (PICKED picker path)             a file picked (copied into the app's tmp), or "" when cancelled
 //   (SHARE handle completed)         the share sheet closed
 
+import CoreImage
+import ImageIO
 import QuickLook
 import UIKit
 import UniformTypeIdentifiers
@@ -31,6 +33,7 @@ private var tables: [UInt: NativeTable] = [:]
 private var barButtons: [UInt: UIBarButtonItem] = [:]
 private var nativeAlerts: [UInt: UIAlertController] = [:]
 private var forms: [UInt: NativeForm] = [:]
+private var invoices: [UInt: NativeInvoice] = [:]
 private var pickers: [UInt: NativePicker] = [:]
 private var statuses: [UInt: NativeStatus] = [:]
 
@@ -3385,6 +3388,190 @@ let appFormShow: Call = { h, _, _, _, _, _ in
     return 1
 }
 
+// MARK: - a Lightning invoice: its QR code to scan, Copy, Open in Wallet; and Paid when it is
+
+/// The invoice as a phone shows one to be paid: the amount, the QR code a wallet scans (CoreImage's generator,
+/// its modules scaled without smoothing), the bolt11 in small monospaced text, Copy and Open in Wallet (a
+/// lightning: URL, which the wallet the phone has registered opens), and a status line Lisp updates as it
+/// polls -- a checkmark once paid.  Done closes it: an INVOICE event (handle).
+final class NativeInvoice: NSObject {
+    let handle: UInt
+    let bolt11: String
+    let controller = UIViewController()
+    let status = UILabel()
+    var nav: UINavigationController?
+
+    init(handle: UInt, title: String, amount: String, bolt11: String) {
+        self.handle = handle
+        self.bolt11 = bolt11
+        super.init()
+        let v = controller.view!
+        v.backgroundColor = .systemBackground
+        controller.title = title
+        controller.navigationItem.rightBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { _ in
+            self.close()
+        })
+
+        let amountLabel = UILabel()
+        amountLabel.text = amount
+        amountLabel.font = .preferredFont(forTextStyle: .title1)
+        amountLabel.textAlignment = .center
+
+        let qr = UIImageView(image: NativeInvoice.qrImage(bolt11.uppercased()))
+        qr.contentMode = .scaleAspectFit
+        qr.layer.magnificationFilter = .nearest
+        qr.backgroundColor = .white
+        qr.translatesAutoresizingMaskIntoConstraints = false
+        qr.widthAnchor.constraint(equalToConstant: 260).isActive = true
+        qr.heightAnchor.constraint(equalToConstant: 260).isActive = true
+
+        let text = UILabel()
+        text.text = bolt11
+        text.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        text.textColor = .secondaryLabel
+        text.numberOfLines = 3
+        text.lineBreakMode = .byTruncatingMiddle
+        text.textAlignment = .center
+
+        var copyCfg = UIButton.Configuration.bordered()
+        copyCfg.title = "Copy"
+        copyCfg.image = UIImage(systemName: "doc.on.doc")
+        copyCfg.imagePadding = 6
+        let copy = UIButton(configuration: copyCfg, primaryAction: UIAction { [weak self] _ in
+            guard let self = self else { return }
+            UIPasteboard.general.string = self.bolt11
+            self.status.text = "Copied"
+        })
+        var openCfg = UIButton.Configuration.borderedProminent()
+        openCfg.title = "Open in Wallet"
+        openCfg.image = UIImage(systemName: "bolt.fill")
+        openCfg.imagePadding = 6
+        let open = UIButton(configuration: openCfg, primaryAction: UIAction { [weak self] _ in
+            guard let self = self, let url = URL(string: "lightning:" + self.bolt11) else { return }
+            UIApplication.shared.open(url, options: [:]) { ok in
+                if !ok { self.status.text = "No wallet on this phone opens lightning: links. Copy the invoice instead." }
+            }
+        })
+        let buttons = UIStackView(arrangedSubviews: [copy, open])
+        buttons.spacing = 12
+        buttons.distribution = .fillEqually
+
+        status.text = "Waiting for payment..."
+        status.font = .preferredFont(forTextStyle: .subheadline)
+        status.textColor = .secondaryLabel
+        status.numberOfLines = 0
+        status.textAlignment = .center
+
+        let stack = UIStackView(arrangedSubviews: [amountLabel, qr, text, buttons, status])
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        v.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: v.safeAreaLayoutGuide.topAnchor, constant: 24),
+            stack.leadingAnchor.constraint(equalTo: v.layoutMarginsGuide.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: v.layoutMarginsGuide.trailingAnchor),
+            text.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            buttons.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            status.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
+    }
+
+    static func qrImage(_ s: String) -> UIImage? {
+        guard let f = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        f.setValue(Data(s.utf8), forKey: "inputMessage")
+        f.setValue("M", forKey: "inputCorrectionLevel")
+        guard let out = f.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)),
+              let cg = CIContext().createCGImage(out, from: out.extent) else { return nil }
+        return UIImage(cgImage: cg)
+    }
+
+    func setStatus(_ text: String, paid: Bool) {
+        status.text = text
+        if paid {
+            status.textColor = .systemGreen
+            status.font = .preferredFont(forTextStyle: .headline)
+        }
+    }
+
+    func close() {
+        send("INVOICE", [.int(Int(handle))])
+        nav?.dismiss(animated: true)
+        invoices[handle] = nil
+    }
+}
+
+/// app_invoice(_, plist): show a Lightning invoice -- (:TITLE :AMOUNT :BOLT11).  Returns its handle.
+let appInvoice: Call = { _, p, n, _, _, _ in
+    guard let t = termBytes(p, n), let host = presenter() else { return 0 }
+    let m = plist(t)
+    let h = newHandle()
+    let inv = NativeInvoice(handle: h, title: str(m["TITLE"]) ?? "Invoice", amount: str(m["AMOUNT"]) ?? "",
+                            bolt11: str(m["BOLT11"]) ?? "")
+    let nav = UINavigationController(rootViewController: inv.controller)
+    inv.nav = nav
+    invoices[h] = inv
+    host.present(nav, animated: true)
+    return h
+}
+
+/// app_invoice_status(invoice, plist): its status line -- (:TEXT :PAID), PAID 1 for the paid look.
+let appInvoiceStatus: Call = { h, p, n, _, _, _ in
+    guard let inv = invoices[h], let t = termBytes(p, n) else { return 0 }
+    let m = plist(t)
+    var paid = false
+    if case .int(let k)? = m["PAID"] { paid = k != 0 }
+    inv.setStatus(str(m["TEXT"]) ?? "", paid: paid)
+    return 1
+}
+
+/// app_thumbnail(path, n, maxSide, buf, cap, bg): the picture at PATH scaled by ImageIO to fit MAXSIDE
+/// pixels, over the colour BG (#xRRGGBB, for any transparency), written to BUF as one little-endian
+/// word per pixel, #x00RRGGBB -- a glass framebuffer's pixels.  Returns (W << 16) | H, or 0 when the file
+/// does not decode or BUF (CAP bytes) is too small.  Native because decoding a phone-sized picture in Lisp
+/// takes more heap than a worker thread has, and more time than the window can wait.
+let appThumbnail: Call = { p, n, maxSide, buf, cap, bg in
+    let url = URL(fileURLWithPath: text(p, n))
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let img = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+              kCGImageSourceCreateThumbnailFromImageAlways: true,
+              kCGImageSourceCreateThumbnailWithTransform: true,
+              kCGImageSourceThumbnailMaxPixelSize: Int(maxSide)] as CFDictionary)
+    else { return 0 }
+    let w = img.width, h = img.height
+    guard w > 0, h > 0, w < 65536, h < 65536, w * h * 4 <= Int(cap),
+          let out = UnsafeMutableRawPointer(bitPattern: buf) else { return 0 }
+    // BGRA in memory, alpha skipped: a little-endian word reads #x00RRGGBB
+    guard let ctx = CGContext(data: out, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
+    else { return 0 }
+    ctx.setFillColor(red: CGFloat((bg >> 16) & 0xff) / 255, green: CGFloat((bg >> 8) & 0xff) / 255,
+                     blue: CGFloat(bg & 0xff) / 255, alpha: 1)
+    ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+    ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+    return UInt((w << 16) | h)
+}
+
+/// app_image_jpeg(path, n, maxSide, out, outN, quality): the picture at PATH scaled by ImageIO to fit
+/// MAXSIDE pixels and written to OUT as a JPEG at QUALITY percent.  Returns the bytes written, 0 on failure.
+/// What a model is shown of a picture: small enough that its base64 fits in a worker thread's heap.
+let appImageJPEG: Call = { p, n, maxSide, op, on, quality in
+    let url = URL(fileURLWithPath: text(p, n)), out = URL(fileURLWithPath: text(op, on))
+    guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+          let img = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+              kCGImageSourceCreateThumbnailFromImageAlways: true,
+              kCGImageSourceCreateThumbnailWithTransform: true,
+              kCGImageSourceThumbnailMaxPixelSize: Int(maxSide)] as CFDictionary),
+          let dst = CGImageDestinationCreateWithURL(out as CFURL, "public.jpeg" as CFString, 1, nil)
+    else { return 0 }
+    CGImageDestinationAddImage(dst, img, [kCGImageDestinationLossyCompressionQuality: Double(quality) / 100] as CFDictionary)
+    guard CGImageDestinationFinalize(dst) else { return 0 }
+    let size = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? Int) ?? 0
+    return UInt(size ?? 0)
+}
+
 // MARK: - the status: a ring in the bar, as Files and Safari show a download
 
 /// The status, as a bar button like the bar's others (a custom view is spaced differently in the bar's group):
@@ -3728,6 +3915,10 @@ func installNative() {
     register("app_share_file", appShareFile)
     register("app_preview", appPreview)
     register("app_copy", appCopy)
+    register("app_invoice", appInvoice)
+    register("app_thumbnail", appThumbnail)
+    register("app_image_jpeg", appImageJPEG)
+    register("app_invoice_status", appInvoiceStatus)
     register("app_utc_offset", appUtcOffset)
     register("app_resolve", appResolve)
     register("app_documents", appDocuments)

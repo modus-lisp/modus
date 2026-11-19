@@ -2893,6 +2893,15 @@
     (setq x (translate-logical-pathname x)))
   (let ((path (handler-case (namestring x) (t (c) nil))))
     (when (null path) (return-from directory nil))
+    ;; A RELATIVE pathspec is merged with *DEFAULT-PATHNAME-DEFAULTS* first (CLHS DIRECTORY), as
+    ;; PROBE-FILE and OPEN already do: it was handed to the filesystem as it stood, so it named the
+    ;; PROCESS's directory -- on a phone, the read-only app container -- and every relative listing
+    ;; (an agent's Glob of "generated/*") came back empty.  Joined as strings, so a wild component
+    ;; is not parsed by MERGE-PATHNAMES.
+    (let ((d (handler-case (namestring *default-pathname-defaults*) (t (c) ""))))
+      (when (and (plusp (length path)) (char/= (char path 0) #\/)
+                 (stringp d) (plusp (length d)) (char= (char d 0) #\/))
+        (setq path (concatenate 'string d (if (char= (char d (1- (length d))) #\/) "" "/") path))))
     (if (not (position #\* path))
         ;; A non-wild pathname naming a FILE matches that file (CLHS
         ;; DIRECTORY): ansi-test's DELETE-ALL-VERSIONS is

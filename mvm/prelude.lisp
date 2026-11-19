@@ -3213,7 +3213,8 @@
 ;;; statement, so a worker that JIT-compiled a closure inside a function died
 ;;; "dynamic binding stack exhausted" (bordeaux-threads' WITH-LOCK-HELD
 ;;; reached it).  %TLS-INSTALL (net/hosted-sync.lisp) points blk+0xC60 at a
-;;; 16 KB per-CPU area in the thread band -- 1024 entries -- and the stack
+;;; 16 KB per-CPU area in the thread band -- 960 entries, the top 1 KB being
+;;; %DYNB-LOOKUP's index cache -- and the stack
 ;;; lives there; a thread whose base is 0 uses the 57 in-window entries, as
 ;;; before.  The collector reads the same word (EMIT-DYNBIND-ROOT-SCAN).
 ;;;
@@ -3287,8 +3288,10 @@
     (if (eql x 0) (+ blk #xC70) x)))
 
 (defun %dynb-capacity (blk)
-  "How many entries this thread's stack holds (see THE EXTENSION)."
-  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 57 1024))
+  "How many entries this thread's stack holds (see THE EXTENSION).  960, not
+   the 1024 the 16 KB area could hold: its top 1 KB is the INDEX CACHE (see
+   %DYNB-LOOKUP)."
+  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 57 960))
 
 (defun %dynb-next (blk)
   "Address of the next free entry's KEY word."
@@ -3362,12 +3365,43 @@
 
 (defun %dynb-lookup (blk key)
   "Address of the VALUE word of this thread's innermost binding of KEY, or 0:
-   %DYNB-FIND behind the filter.  Same no-global-read rule as %DYNB-FIND."
-  (let ((f (%dynb-filter blk)))
-    (if (and (not (eql f 0))
-             (eql (mem-ref (%dynb-filter-slot f key) :u16) 0))
-        0
-        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (%dynb-base blk)))))
+   the index cache, then %DYNB-FIND behind the filter.  Same no-global-read
+   rule as %DYNB-FIND.
+
+   THE INDEX CACHE.  The filter answers a read of a special this thread has
+   NOT bound; a read of one it HAS bound still walked the stack down to the
+   binding, and the code that binds specials binds MANY and then reads them
+   in its inner loops: secp256k1-fast's WITH-FRESH-CT-SCRATCH binds ~55
+   scratch specials per call, so every field operation on a worker walked
+   ~27 entries per special read, and BIP-340 verify ran 2.5-3.5x slower on a
+   worker than on main.  So the top 1 KB of the extension area (ext+0x3C00,
+   which is why the capacity is 960 and not 1024) is 512 u16 slots, one per
+   (KEY mod 512), each holding the 1-based INDEX of the binding of a key in
+   that slot (0 = none).  %DYNBIND writes the slot on every push and a walk
+   that finds the key writes it back, so a slot only ever names the innermost
+   binding of its key: a push of the same key overwrites it, and a slot whose
+   entry was popped is caught by the two checks a hit makes -- the index is
+   at or below the live depth, and that entry's key word is KEY.  Popping
+   needs no maintenance, and neither does a reused stack: until this thread
+   pushes into a slot, no live entry carries a key of that slot, so whatever
+   the slot holds fails the key check.  Collisions only cost a walk."
+  (let ((ext (mem-ref (+ blk #xC60) :u64)))
+    (if (eql ext 0)
+        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (+ blk #xC70))
+        (let* ((cs (+ ext (+ #x3C00 (ash (logand key 511) 1))))
+               (ix (mem-ref cs :u16))
+               (d (mem-ref (+ blk #xC58) :u64)))
+          (if (and (> ix 0) (<= ix d)
+                   (eq (mem-ref (+ ext (ash (- ix 1) 4)) :u64) key))
+              (+ ext (- (ash ix 4) 8))
+              (if (eql (mem-ref (+ blk (+ #xC80 (ash (logand key 255) 1))) :u16) 0)
+                  0
+                  (let ((a (%dynb-find key (- (%dynb-next blk) 16) (- d 1) ext)))
+                    (if (eql a 0)
+                        0
+                        (progn
+                          (setf (mem-ref cs :u16) (+ (ash (- (- a 8) ext) -4) 1))
+                          a)))))))))
 
 (defun %dynb-unwind (blk key a i)
   "Pop this thread's innermost binding when it is a binding of KEY: A is the
@@ -3473,7 +3507,14 @@
                       (unless (eql f 0)
                         (let ((slot (%dynb-filter-slot f key)))
                           (setf (mem-ref slot :u16)
-                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))))
+                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))
+                        ;; The index cache (see %DYNB-LOOKUP): this push is
+                        ;; now KEY's innermost binding, entry D, 1-based D+1.
+                        ;; F is non-zero exactly when the extension is.
+                        (setf (mem-ref (+ (mem-ref (+ blk #xC60) :u64)
+                                          (+ #x3C00 (ash (logand key 511) 1)))
+                                       :u16)
+                              (+ d 1))))
                     val)))))))
 
 (defun %dynunbind (key saved)
@@ -3586,12 +3627,26 @@
    special in compiled code actually becomes) were not.  The gate is the
    word %RT-ENTER and %DYNBIND already test, so an unarmed image pays one
    32-bit load and a branch."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  ;; THE INDEX CACHE'S HIT IS WRITTEN OUT HERE rather than reached through
+  ;; %DYNB-LOOKUP: this is every armed special read, and on a worker the read
+  ;; of a special bound by an enclosing LET is the common case.  A miss (or a
+  ;; thread with no extension stack) takes %DYNB-LOOKUP, which repeats the
+  ;; probe and walks.  EQ, not EQL: every word compared here is a fixnum, and
+  ;; EQL compiles to a type dispatch.
+  (if (eq (mem-ref #x10000DB8 :u32) 0)
       0
       (let ((blk (%dynb-block)))
-        (if (eql blk 0)
+        (if (eq blk 0)
             0
-            (%dynb-lookup blk key)))))
+            (let ((ext (mem-ref (+ blk #xC60) :u64)))
+              (if (eq ext 0)
+                  (%dynb-lookup blk key)
+                  (let ((ix (mem-ref (+ ext (+ #x3C00 (ash (logand key 511) 1))) :u16)))
+                    (if (and (> ix 0)
+                             (<= ix (mem-ref (+ blk #xC58) :u64))
+                             (eq (mem-ref (+ ext (- (ash ix 4) 16)) :u64) key))
+                        (+ ext (- (ash ix 4) 8))
+                        (%dynb-lookup blk key)))))))))
 
 (defun %gv-ref (%gv-key)
   "Compiled special-variable READ: value of global KEY, NIL if absent

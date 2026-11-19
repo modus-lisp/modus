@@ -658,6 +658,20 @@
 (defvar *i386-handler-push-label* nil)
 (defvar *i386-handler-pop-label* nil)
 
+;;; THE NATIVE TIER (mvm/jit-i386-native.lisp, MODUS_I386_JIT=1): a runtime
+;;; DEFUN translated by this file, baked into the image -- the 68k native
+;;; tier's design (docs/68k-threaded-jit.md).  What the image must provide for
+;;; it, all gated here so an image without it is byte-identical:
+;;;   - the EXPORT TABLE right after %N386-EXPORT-TABLE's code: the routines runtime code
+;;;     calls that are not functions (the collector, the handler-case push and
+;;;     pop), as offsets from the table's magic "modusJXL";
+;;;   - a ROOT WORD at +I386-NATIVE-CONST-ROOT+ the collector forwards: the
+;;;     vector of constants runtime code loads (a heap pointer in code would
+;;;     go stale at the first collection).
+(defparameter *i386-native-tier* nil)
+(defconstant +i386-native-const-root+ #x10000FBC
+  "Hosted i386: the upper half of the 64-bit ports' JIT bump word, unused here.")
+
 ;;; ============================================================
 ;;; i386 Code Buffer
 ;;; ============================================================
@@ -2267,12 +2281,15 @@
       (i386-emit-label buf sd))
 
     ;; --- fixed global roots (same set the x64 trampoline scans) ---
-    (dolist (a (list #x10000FA0     ; global-cell cache vector (%GV-REF-FILL)
-                     #x10000FB0     ; static-literal vector (compile-quote)
-                     #x10000080     ; global special-variable alist
-                     #x10000088     ; symbol intern table
-                     #x10000148     ; keyword intern table
-                     #x10000170))   ; package-by-hash table
+    (dolist (a (append
+                (list #x10000FA0     ; global-cell cache vector (%GV-REF-FILL)
+                      #x10000FB0     ; static-literal vector (compile-quote)
+                      #x10000080     ; global special-variable alist
+                      #x10000088     ; symbol intern table
+                      #x10000148     ; keyword intern table
+                      #x10000170)    ; package-by-hash table
+                ;; the native tier's constant vector (runtime code's LI-CONST)
+                (and *i386-native-tier* (list +i386-native-const-root+))))
       (i386-emit-mov-reg-imm buf +i386-eax+ a)
       (i386-emit-call-rel32 buf scan-label))
 
@@ -5521,7 +5538,13 @@
                                    (operands (cadr decoded))
                                    (new-pos (cddr decoded)))
                               (i386-translate-insn state opcode operands new-pos)
-                              (setf pos new-pos)))))))
+                              (setf pos new-pos)))))
+               ;; the native tier's export table, right after the code of
+               ;; jit-i386-native.lisp's %N386-EXPORT-TABLE, so the image finds
+               ;; it a few words past that function wherever the build put it
+               (when (and *i386-native-tier*
+                          (string-equal (first entry) "%N386-EXPORT-TABLE"))
+                 (i386-emit-native-exports buf))))
     ;; The GC trampoline, emitted once after the last function.
     (when *i386-gc-collect-label*
       (when *i386-fn-align*
@@ -5560,6 +5583,23 @@
 ;;; Target Descriptor Installation
 ;;; ============================================================
 
+(defun i386-native-export-labels ()
+  "The image routines the native tier links runtime code to, in the order
+   jit-i386-native.lisp reads them: the collector, handler push, handler pop."
+  (list *i386-gc-collect-label* *i386-handler-push-label* *i386-handler-pop-label*))
+
+(defun i386-emit-native-exports (buf)
+  "\"modusJXL\", a count, then per routine its offset from the magic (a
+   :DIFF32 fixup, anchor = the magic), or #x7FFFFFFF when the image has none."
+  (loop while (/= 0 (mod (i386-current-pos buf) 4)) do (i386-emit-byte buf 0))
+  (let ((magic (i386-current-pos buf)) (labels (i386-native-export-labels)))
+    (loop for c across "modusJXL" do (i386-emit-byte buf (char-code c)))
+    (i386-emit-u32 buf (length labels))
+    (dolist (l labels)
+      (if l
+          (i386-emit-fixup-diff32 buf l magic)
+          (i386-emit-u32 buf #x7FFFFFFF)))))
+
 (defun i386-translate-single-instruction (opcode operands target buf)
   "Translate one MVM instruction to i386 code.
    Conforms to the target translate-fn signature."
@@ -5576,6 +5616,56 @@
   (setf (target-emit-epilogue modus.mvm:*target-i386*)
         (lambda (target buf) (declare (ignore target)) (i386-emit-epilogue buf)))
   modus.mvm:*target-i386*)
+
+;;; HOST ONLY from here (the native tier bakes this file up to
+;;; INSTALL-I386-TRANSLATOR).
+
+(defun i386-native-state-name-p (name)
+  "Per-translation state, not configuration: the native tier binds these."
+  (or (search "-LABEL*" name)
+      (member name '("*I386-LI-CONST-PATCHES*" "*I386-UNIMPL-OPS*" "*I386-EAX-VIOLATIONS*"
+                     "*I386-CUR-OPNAME*" "*I386-CUR-DEST-IS-VR*" "*I386-CHECK-EAX-INVARIANT*"
+                     "*I386-EAX-INVARIANT-FATAL*" "*I386-NATIVE-CODE-OFFSET*"
+                     "*I386-REG-NAMES*")
+              :test #'string=)))
+
+(defun i386-native-dumpable-p (v)
+  (typecase v
+    ((or number character string symbol) t)
+    (cons (and (i386-native-dumpable-p (car v)) (i386-native-dumpable-p (cdr v))))
+    (simple-vector (every #'i386-native-dumpable-p v))
+    (t nil)))
+
+(defun i386-native-coinit-text ()
+  "Source text for jit-i386-native.lisp's %N386-COINIT body: SETQs giving the
+   image's emitter the configuration this image was translated with (a
+   DEFVAR's initial value never runs in the image).  Called by cross.lisp's
+   LATE-SOURCE-FILL, when the host's values are final.  Every bound special of
+   this package that is configuration and readable data."
+  (let ((forms nil) (skipped nil) (pkg (find-package :modus.mvm.i386)))
+    (do-symbols (s pkg)
+      (let ((n (symbol-name s)))
+        (when (and (eq (symbol-package s) pkg) (boundp s)
+                   (> (length n) 2) (char= (char n 0) #\*)
+                   (char= (char n (1- (length n))) #\*)
+                   (not (i386-native-state-name-p n)))
+          (if (i386-native-dumpable-p (symbol-value s))
+              ;; from KEYWORD so every symbol in a value prints with its package
+              (push (cons n (let ((*package* (find-package :keyword)))
+                              (format nil "'~S" (symbol-value s))))
+                    forms)
+              (push n skipped)))))
+    (setq forms (sort forms #'string< :key #'car))
+    (format t "~&;; i386 native tier: ~D emitter settings carried into the image~@[; not data: ~{~A~^ ~}~]~%"
+            (length forms) (sort skipped #'string<))
+    (with-output-to-string (o)
+      (let ((*package* pkg) (*print-readably* nil) (*print-pretty* nil) (*print-base* 10)
+            (*print-radix* nil) (*print-circle* nil))
+        (format o "(progn")
+        (dolist (f forms)
+          ;; package-qualified: jit-i386-native.lisp reads in MODUS.MVM
+          (format o "~%    (setq modus.mvm.i386::~A ~A)" (string-downcase (car f)) (cdr f)))
+        (format o "~%    t)")))))
 
 ;;; ============================================================
 ;;; Debugging Utilities

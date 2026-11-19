@@ -3462,6 +3462,14 @@
 (defun ct-target-big-endian () (let ((c *compile-target*)) (if c (compile-target-big-endian c) +target-big-endian+)))
 (defun ct-target-soft-float () (let ((c *compile-target*)) (if c (compile-target-soft-float c) +target-soft-float+)))
 (defun ct-has-fpd-p () (let ((c *compile-target*)) (if c (compile-target-has-fpd c) *target-has-fpd-p*)))
+
+;; Runtime-compiled code takes the unboxed double path (fpd-*) because what
+;; runs it -- the interpreter, the x86-64 / aarch64 JIT -- has those ops.  A
+;; JIT whose translator does not (the native i386 tier, mvm/jit-i386-native.lisp)
+;; overrides this to NIL, so runtime float code boxes as its image code does.
+(declaim (overridable %runtime-has-fpd-p))
+(defun %runtime-has-fpd-p () t)
+(defun %runtime-fpd-p () (and *mvm-eval-runtime-p* (%runtime-has-fpd-p)))
 (defun ct-w32-capable-p () (let ((c *compile-target*)) (if c (compile-target-w32-capable c) (eql +target-w32+ 1))))
 (defun ct-mv-count-addr () (let ((c *compile-target*)) (if c (compile-target-mv-count-addr c) +mv-count-addr+)))
 (defun ct-mv-values-addr () (let ((c *compile-target*)) (if c (compile-target-mv-values-addr c) +mv-values-addr+)))
@@ -14373,7 +14381,7 @@
           ;; a double in the same FP register (its D view): the targets with
           ;; the FPD ops only, like every unboxed double tree
           ((and (symbolp ty) ty (name-eq ty "DOUBLE-FLOAT")
-                (or *mvm-eval-runtime-p* (ct-has-fpd-p)))
+                (or (%runtime-fpd-p) (ct-has-fpd-p)))
            :dscalar)
           ((and (symbolp ty) ty (name-eq ty "F32V-PACK")) :vector)
           ((and (symbolp ty) ty (name-eq ty "VI-PACK")) :ivector)   ; integer lanes (2b)
@@ -14510,7 +14518,7 @@
               ((%fp-tree-need form env) t)
               ;; a double tree too, where the FPD ops exist (no conversion
               ;; calls: %FPD-PURE-NEED hoists nothing)
-              ((and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
+              ((and (or (%runtime-fpd-p) (ct-has-fpd-p))
                     (%fpd-pure-need form env))
                t)
               ((%v4-tree-need form env) t)
@@ -14623,7 +14631,7 @@
   "For a LET: an array of :scalar / :vector / NIL per binding when at least
    one variable is a declared float/vector local AND the body is call-free
    AND *mvm-eval-runtime-p*; else NIL."
-  (when (and (or *mvm-eval-runtime-p* *fp-locals-force* (ct-has-fpd-p)) (consp bindings))
+  (when (and (or (%runtime-fpd-p) *fp-locals-force* (ct-has-fpd-p)) (consp bindings))
     (let* ((pairs (%declared-types decl-body))
            (kinds (make-array (length bindings) :initial-element nil))
            (any nil) (i 0))
@@ -22890,7 +22898,7 @@
    each result a boxed double.  Every operand double-float (caller-checked).
    A whole call-free tree goes through the FP pool unboxed instead."
   (let ((tree (cons (%float-op-symbol op-name) args)))
-    (when (or *mvm-eval-runtime-p* (ct-has-fpd-p))
+    (when (or (%runtime-fpd-p) (ct-has-fpd-p))
       ;; Conversion operands are calls, and FP registers are caller-clobbered:
       ;; evaluate them first, left to right, into boxed temps (the tree's
       ;; other leaves are variables and literals, so the order is unchanged).
@@ -23021,7 +23029,7 @@
    (KIND :SINGLE) or double (:DOUBLE) tree that fits; SUB 0..3 in that order.
    The declared width is the promise that makes the conversion's 64-bit
    result a fixnum, with no bignum path."
-  (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
+  (and (or (%runtime-fpd-p) (ct-has-fpd-p))
        (consp form) (consp (cdr form)) (consp (cddr form)) (null (cdddr form))
        (let ((w (ignore-errors (%decl-int-width (%resolve-declared-type (cadr form)))))
              (v (caddr form)))
@@ -23102,7 +23110,7 @@
             (or (%fp-tree-need x env) (%fpd-pure-need x env)
                 (%fp-itof-need x env))))
          ((%fp-exp-arg form)
-          (let ((n (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
+          (let ((n (and (or (%runtime-fpd-p) (ct-has-fpd-p))
                         (%fp-tree-need (%fp-exp-arg form) env))))
             ;; 7: what %COMPILE-EXP-SINGLE holds at its peak, result included
             (and n (max n 7))))
@@ -23238,7 +23246,7 @@
    (THE <int> (ROUND tree)), which converts in register itself
    (%FP-TOI-PLAN).  One register for the result, plus what
    the rounding's own tree holds while it runs."
-  (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
+  (and (or (%runtime-fpd-p) (ct-has-fpd-p))
        (cond ((integerp x) (and (< (integer-length x) 53) 1))
              ((symbolp x) (let ((w (and x (%expr-width x env)))) (and w (<= w 53) 1)))
              ;; call-free integer arithmetic of width-typed operands (the
@@ -24982,7 +24990,7 @@
   ;; TWO FLOAT TREES: compare in FP registers straight from the trees -- no
   ;; box for an FP-resident local, no unbox (fp-cmp for singles, fpd-lt/-le
   ;; for doubles).
-  (when (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
+  (when (and (or (%runtime-fpd-p) (ct-has-fpd-p))
              (member branch-op '(:blt :bgt :ble :bge)))
     (let ((kind (cond ((and (%fp-tree-need a env) (%fp-tree-need b env)) :single)
                       ((and (%fpd-pure-need a env) (%fpd-pure-need b env)) :double))))
@@ -24991,7 +24999,7 @@
                        (nb (if (eq kind :single) (%fp-tree-need b env) (%fpd-pure-need b env))))
                    (<= (+ *fp-reg-counter* (max na (1+ nb))) +fp-reg-max+)))
         (return-from compile-compare-2 (%compile-fp-tree-compare kind branch-op a b env dest)))))
-  (when (and (or *mvm-eval-runtime-p* (ct-has-fpd-p))
+  (when (and (or (%runtime-fpd-p) (ct-has-fpd-p))
              (member branch-op '(:blt :bgt :ble :bge))
              (or (%expr-double-float-p a env) (%expr-single-float-p a env))
              (or (%expr-double-float-p b env) (%expr-single-float-p b env))

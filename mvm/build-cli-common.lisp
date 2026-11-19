@@ -843,6 +843,30 @@
     (concatenate 'string (%strip-global-inits tr) (string #\Newline)
                  (mvm-text "mvm/jit-68k-native.lisp") (string #\Newline))))
 
+;;; THE NATIVE i386 TIER (mvm/jit-i386-native.lisp): the 68k native tier's design
+;;; on i386.  MODUS_I386_JIT=1 bakes translate-i386.lisp (up to the host-only
+;;; INSTALL-I386-TRANSLATOR tail, its DEFVAR initforms stripped as the 68k
+;;; tier's are) into the translator slot, and jit-i386-native.lisp into the
+;;; late slot (it overrides mvm-eval's %RUNTIME-DEFUN-HOOK and
+;;; %JIT-EAGER-ALL).  The emitter's settings are filled in when BUILD-IMAGE
+;;; compiles (I386-NATIVE-COINIT-TEXT).  build-i386-cli.lisp sets
+;;; *I386-NATIVE-TIER* so the image carries the export table and the root.
+(defun %i386-native-tier-p ()
+  (and (eq *cli-arch* :i386) (equal (sb-ext:posix-getenv "MODUS_I386_JIT") "1")))
+
+(defun %i386-native-tier-source ()
+  (pushnew (cons "'(:n386-coinit :pending)" 'modus.mvm.i386::i386-native-coinit-text)
+           modus.mvm::*late-source-fills* :test #'equal)
+  (let* ((src (mvm-text "mvm/translate-i386.lisp"))
+         (marker "(defun install-i386-translator")
+         (pos (search marker src)))
+    (unless pos (error "i386 native tier: no INSTALL-I386-TRANSLATOR strip marker"))
+    (concatenate 'string
+                 (%strip-global-inits (subseq src 0 pos))
+                 modus.mvm::*build-package-reset-text*
+                 (modus.mvm::%source-file-trailer "mvm/translate-i386.lisp")
+                 (string #\Newline))))
+
 ;;; The assembled translator slot, spliced into *all-runtime-source* and
 ;;; *full-source* as ONE unit.  Both arches: <encoder?> <translator> <co-init>,
 ;;; each followed by a newline — byte-identical on x64 to the three separate
@@ -862,6 +886,7 @@
     ;; i386: no in-image JIT translator — see the *JIT-ON* comment above.
     ;; i386 / riscv64: no in-image JIT translator — see the *JIT-ON* comment.
     ((%68k-native-tier-p) (%68k-native-tier-source))
+    ((%i386-native-tier-p) (%i386-native-tier-source))
     ((member *cli-arch* '(:i386 :riscv64 :riscv32 :arm32 :68k)) "")
     (t (error "build-cli-common: unknown *cli-arch* ~S ~
                (want :x64, :aarch64, :i386, :riscv64, :riscv32, :arm32 or :68k)"
@@ -2746,7 +2771,7 @@
   (if (and (eq *cli-arch* :68k) (equal (sb-ext:posix-getenv "MODUS_68K_JIT") "1")
            (not (equal (sb-ext:posix-getenv "MODUS_T68_NOBAKE") "1")))
       (mvm-text "mvm/jit-68k.lisp")
-      "")
+      (if (%i386-native-tier-p) (mvm-text "mvm/jit-i386-native.lisp") ""))
   "Arch source placed after the CL runtime, the compiler and mvm-eval (see the
    slot in *FULL-SOURCE*).  A build may bind it first to add its own.")
 

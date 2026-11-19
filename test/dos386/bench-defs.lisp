@@ -40,6 +40,15 @@
 ;; doubles
 (defun float-work (n)
   (let ((s 0d0)) (dotimes (i n s) (setq s (+ s (sqrt (* (float i 1d0) 1.5d0)))))))
+;; doubles, declared: an unboxed tree (fpd-*) where the compiler can keep one
+(defun dfloat-work (n)
+  (declare (fixnum n))
+  (let ((s 0d0))
+    (declare (double-float s))
+    (dotimes (i n s)
+      (let ((x (float i 1d0)))
+        (declare (double-float x))
+        (setq s (+ s (* x 1.5d0) (/ 1d0 (+ x 1d0))))))))
 ;; bignums
 (defun fact (n) (let ((r 1)) (loop for i from 2 to n do (setq r (* r i))) r))
 (defvar *octets*
@@ -64,5 +73,6 @@
   (run "fnv 64K"       4 (lambda () (fnv *octets*)) 429759941)
   (run "hash 5k"       1 (lambda () (hash-work 5000)) 2500)
   (run "float 200k"    1 (lambda () (float-work 200000)) 7.302940021824971d7)
+  (run "dfloat 200k"   1 (lambda () (dfloat-work 200000)) 2.999985001278621d10)
   (run "fact(1000)"    4 (lambda () (mod (fact 1000) 1000000007)) 641419708)
   nil)

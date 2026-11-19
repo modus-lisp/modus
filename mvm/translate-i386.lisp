@@ -1621,6 +1621,284 @@
        t)
       (t nil))))
 
+;;; ---- The FP-register class: unboxed singles and doubles (F0..F11) ----
+;;;
+;;; The compiler's call-free float trees (mvm.lisp, +OP-FP-UNBOX+ .. +OP-FP-TOI+)
+;;; keep their values in FP vregs and box once at the root.  x86-64 and aarch64
+;;; give each FP vreg a register; i386 has xmm0..7 on an SSE2 CPU and only the
+;;; x87 stack before one, so here every FP vreg is an 8-byte SLOT of a fixed
+;;; block in the low BSS (a single in its low 4 bytes, a double in all 8), and
+;;; each op loads, computes and stores.  Nothing is live across a call (the
+;;; class's own rule), so one block serves every function.  The same slots on
+;;; both arms: SSE2 (the default) and x87 (MODUS_I386_FP=x87, which the DOS
+;;; target needs), with the x87 arm's exactness rules (I386-TRANSLATE-X87-FLOAT
+;;; above): 53-bit precision, * and / of doubles scaled around the denormal
+;;; range.  A single computed on the x87 rounds to 53 bits and then to 24, which
+;;; is the correctly rounded single for + - * / (53 >= 2*24 + 2).  Box, unbox,
+;;; copies, constants and |x| move words and need no FPU.  FP-TOI uses FISTP
+;;; under a swapped rounding mode on both arms: floor and ceiling would need
+;;; SSE4.1's ROUNDSD otherwise.  Out of fixnum range it is wrong, as FTOI's
+;;; known gap.  The 4-lane classes (V4-*, VI-*) are not here.
+
+(defconstant +i386-fpr-base+ #x1001FA00
+  "Hosted i386: 12 FP vregs x 8 bytes, past the hosted handler frames
+   (*I386-HOSTED-HSTACK-BASE*, which end at #x1001F8E8), below the BSS end.")
+
+(defun i386-fpr (n) (+ +i386-fpr-base+ (* 8 n)))
+
+(defun i386-emit-abs-modrm (buf regfield addr)
+  "ModRM mod=00 rm=101: a disp32 absolute memory operand."
+  (i386-emit-byte buf (i386-modrm #b00 regfield 5))
+  (i386-emit-u32 buf addr))
+
+(defun i386-emit-sse-abs (buf prefix op xmm addr)
+  "[PREFIX] 0F OP xmm, [ADDR]."
+  (when prefix (i386-emit-byte buf prefix))
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf op)
+  (i386-emit-abs-modrm buf xmm addr))
+
+(defun i386-emit-x87-abs (buf opcode regfield addr)
+  (i386-emit-byte buf opcode)
+  (i386-emit-abs-modrm buf regfield addr))
+
+(defun i386-emit-copy-slot (buf dst src bytes)
+  "Copy BYTES (4 or 8) from absolute SRC to absolute DST through +scratch1+."
+  (dotimes (i (floor bytes 4))
+    (i386-emit-mov-reg-abs buf +scratch1+ (+ src (* 4 i)))
+    (i386-emit-mov-abs-reg buf (+ dst (* 4 i)) +scratch1+)))
+
+(defun i386-emit-fp-flags-to-fixnum (buf vd setcc)
+  "VD = fixnum 1 when the flags satisfy SETCC (#x97 above, #x93 above-or-equal), else 0."
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf setcc)
+  (i386-emit-byte buf (i386-modrm #b11 0 +scratch0+))              ; setcc cl
+  (i386-emit-byte buf #x0F) (i386-emit-byte buf #xB6)
+  (i386-emit-byte buf (i386-modrm #b11 +scratch0+ +scratch0+))     ; movzx ecx, cl
+  (i386-emit-shl-reg-imm buf +scratch0+ 1)
+  (i386-store-vreg buf vd +scratch0+))
+
+(defun i386-emit-x87-compare-slots (buf a b dbl)
+  "st0 = A, st1 = B; FUCOMPP; the x87 condition codes in CF/PF/ZF (UCOMISD's
+   flags: A < B -> CF, equal -> ZF, unordered -> all three).  EAX (VR) is saved
+   around FNSTSW with raw PUSH/POP, which leave the flags alone."
+  (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 b)                  ; fld B
+  (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 a)                  ; fld A
+  (i386-emit-byte buf #xDA) (i386-emit-byte buf #xE9)             ; fucompp
+  (i386-emit-byte buf #x50)                                       ; push eax
+  (i386-emit-byte buf #xDF) (i386-emit-byte buf #xE0)             ; fnstsw ax
+  (i386-emit-byte buf #x9E)                                       ; sahf
+  (i386-emit-byte buf #x58))                                      ; pop eax
+
+(defun i386-emit-fp-box-tail (buf vd header)
+  "The double at [ESP] (8 bytes the caller pushed) into a fresh boxed float with
+   HEADER; releases them; VD = the tagged object."
+  (i386-emit-float-alloc buf +scratch1+ +scratch0+)
+  (unless (= header +i386-float-header+)
+    (i386-emit-mov-mem-imm buf +scratch1+ 0 header))
+  (i386-emit-float-bits-from-stack buf +scratch1+ +scratch0+)
+  (i386-emit-add-reg-imm buf +i386-esp+ 8)
+  (i386-emit-or-reg-imm buf +scratch1+ +tag-object+)
+  (i386-store-vreg buf vd +scratch1+))
+
+(defun i386-translate-fp-reg (buf opcode operands)
+  "The FP-register class (see above); NIL if OPCODE is not one of it."
+  (macrolet ((op= (sym) `(= opcode ,sym)))
+    (let ((x87 *i386-x87*))
+      (cond
+        ;; ---- boxed <-> FP vreg ----
+        ((or (op= +op-fp-unbox+) (op= +op-fpd-unbox+))
+         ;; payload (a double, in a single's box too) -> slot; a single rounds
+         (let ((fd (i386-fpr (first operands))))
+           (i386-load-vreg buf +scratch0+ (second operands))
+           (i386-emit-float-bits-to-stack buf +scratch0+ +scratch1+)
+           (cond ((op= +op-fpd-unbox+)
+                  (i386-emit-byte buf #x8F) (i386-emit-abs-modrm buf 0 fd)        ; pop [fd]
+                  (i386-emit-byte buf #x8F) (i386-emit-abs-modrm buf 0 (+ fd 4))) ; pop [fd+4]
+                 (x87
+                  (i386-emit-x87-mem buf #xDD 0 +i386-esp+ 0)                     ; fld qword [esp]
+                  (i386-emit-x87-abs buf #xD9 3 fd)                               ; fstp dword [fd]
+                  (i386-emit-add-reg-imm buf +i386-esp+ 8))
+                 (t
+                  (i386-emit-movsd-xmm-esp buf +i386-xmm0+)
+                  (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x5A)
+                  (i386-emit-byte buf (i386-modrm #b11 +i386-xmm0+ +i386-xmm0+))  ; cvtsd2ss
+                  (i386-emit-sse-abs buf #xF3 #x11 +i386-xmm0+ fd)               ; movss [fd]
+                  (i386-emit-add-reg-imm buf +i386-esp+ 8))))
+         t)
+        ((op= +op-fpd-box+)
+         (let ((fs (i386-fpr (second operands))))
+           (i386-emit-byte buf #xFF) (i386-emit-abs-modrm buf 6 (+ fs 4))         ; push [fs+4]
+           (i386-emit-byte buf #xFF) (i386-emit-abs-modrm buf 6 fs)               ; push [fs]
+           (i386-emit-fp-box-tail buf (first operands) +i386-float-header+))
+         t)
+        ((op= +op-fp-box+)
+         (let ((fs (i386-fpr (second operands))))
+           (if x87
+               (progn (i386-emit-x87-abs buf #xD9 0 fs)                           ; fld dword [fs]
+                      (i386-emit-x87-box-st0 buf (first operands) #x464))
+               (progn (i386-emit-sse-abs buf #xF3 #x5A +i386-xmm0+ fs)           ; cvtss2sd
+                      (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+                      (i386-emit-movsd-esp-xmm buf +i386-xmm0+)
+                      (i386-emit-fp-box-tail buf (first operands) #x464))))
+         t)
+        ;; ---- packed single lanes ----
+        ((op= +op-fp-lane-load+)
+         (i386-emit-x87-lane-addr buf (second operands) (third operands))         ; ecx = lane + 5
+         (i386-emit-mov-reg-mem buf +scratch1+ +scratch0+ -5)
+         (i386-emit-mov-abs-reg buf (i386-fpr (first operands)) +scratch1+)
+         t)
+        ((op= +op-fp-lane-store+)
+         (i386-emit-x87-lane-addr buf (first operands) (second operands))
+         (i386-emit-mov-reg-abs buf +scratch1+ (i386-fpr (third operands)))
+         (i386-emit-mov-mem-reg buf +scratch0+ -5 +scratch1+)
+         t)
+        ;; ---- arithmetic ----
+        ((or (op= +op-fp-add+) (op= +op-fp-sub+) (op= +op-fp-mul+) (op= +op-fp-div+)
+             (op= +op-fpd-add+) (op= +op-fpd-sub+) (op= +op-fpd-mul+) (op= +op-fpd-div+))
+         (let* ((dbl (or (op= +op-fpd-add+) (op= +op-fpd-sub+) (op= +op-fpd-mul+) (op= +op-fpd-div+)))
+                (k (cond ((or (op= +op-fp-add+) (op= +op-fpd-add+)) 0)
+                         ((or (op= +op-fp-sub+) (op= +op-fpd-sub+)) 1)
+                         ((or (op= +op-fp-mul+) (op= +op-fpd-mul+)) 2)
+                         (t 3)))
+                (fd (i386-fpr (first operands)))
+                (fa (i386-fpr (second operands)))
+                (fb (i386-fpr (third operands))))
+           (if x87
+               (let ((scale (and dbl *i386-x87-scale* (>= k 2))))
+                 (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 fa)                  ; fld A
+                 (when scale (i386-emit-x87-scale buf -15360))
+                 (i386-emit-x87-abs buf (if dbl #xDC #xD8) (aref #(0 4 1 6) k) fb) ; fop B
+                 (when scale (i386-emit-x87-scale buf 15360))
+                 (i386-emit-x87-abs buf (if dbl #xDD #xD9) 3 fd))                 ; fstp D
+               (let ((pre (if dbl #xF2 #xF3)))
+                 (i386-emit-sse-abs buf pre #x10 +i386-xmm0+ fa)                  ; movs? xmm0, A
+                 (i386-emit-sse-abs buf pre (aref #(#x58 #x5C #x59 #x5E) k) +i386-xmm0+ fb)
+                 (i386-emit-sse-abs buf pre #x11 +i386-xmm0+ fd))))               ; movs? D, xmm0
+         t)
+        ((op= +op-fpd-itof+)
+         (let ((fd (i386-fpr (first operands))))
+           (i386-load-vreg buf +scratch0+ (second operands))
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)
+           (if x87
+               (progn (i386-emit-push-reg buf +scratch0+)
+                      (i386-emit-x87-mem buf #xDB 0 +i386-esp+ 0)                 ; fild dword [esp]
+                      (i386-emit-add-reg-imm buf +i386-esp+ 4)
+                      (i386-emit-x87-abs buf #xDD 3 fd))                          ; fstp qword [fd]
+               (progn (i386-emit-cvtsi2sd buf +i386-xmm0+ +scratch0+)
+                      (i386-emit-sse-abs buf #xF2 #x11 +i386-xmm0+ fd))))
+         t)
+        ;; ---- compares: fixnum 1 / 0; a NaN answers 0 ----
+        ((or (op= +op-fpd-lt+) (op= +op-fpd-le+) (op= +op-fp-cmp+))
+         (let* ((dbl (not (op= +op-fp-cmp+)))
+                (lt (if dbl (op= +op-fpd-lt+) (= (fourth operands) 0)))
+                (fa (i386-fpr (second operands)))
+                (fb (i386-fpr (third operands))))
+           (if x87
+               ;; st0 = B, st1 = A: "above" is B > A, i.e. A < B
+               (i386-emit-x87-compare-slots buf fb fa dbl)
+               (progn (i386-emit-sse-abs buf (if dbl #xF2 #xF3) #x10 +i386-xmm0+ fb)
+                      (i386-emit-sse-abs buf (if dbl #x66 nil) #x2E +i386-xmm0+ fa))) ; ucomis? B, A
+           (i386-emit-fp-flags-to-fixnum buf (first operands) (if lt #x97 #x93)))
+         t)
+        ;; ---- constants ----
+        ((or (op= +op-fpd-li+) (op= +op-fp-li+))
+         (let ((fd (i386-fpr (first operands))))
+           (i386-emit-byte buf #xC7) (i386-emit-abs-modrm buf 0 fd)
+           (i386-emit-u32 buf (logand (third operands) #xFFFFFFFF))               ; lo
+           (i386-emit-byte buf #xC7) (i386-emit-abs-modrm buf 0 (+ fd 4))
+           (i386-emit-u32 buf (logand (second operands) #xFFFFFFFF))              ; hi
+           (when (op= +op-fp-li+)                       ; exactly a single: no rounding
+             (if x87
+                 (progn (i386-emit-x87-abs buf #xDD 0 fd) (i386-emit-x87-abs buf #xD9 3 fd))
+                 (progn (i386-emit-sse-abs buf #xF2 #x5A +i386-xmm0+ fd)
+                        (i386-emit-sse-abs buf #xF3 #x11 +i386-xmm0+ fd)))))
+         t)
+        ((op= +op-fpd-scale+)
+         ;; Fd *= 2^k, k in [-1022, 1023]: the double 2^k is (k + 1023) << 52
+         (let ((fd (i386-fpr (first operands))))
+           (i386-load-vreg buf +scratch0+ (second operands))
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)
+           (i386-emit-add-reg-imm buf +scratch0+ 1023)
+           (i386-emit-shl-reg-imm buf +scratch0+ 20)
+           (i386-emit-push-reg buf +scratch0+)
+           (i386-emit-push-imm32 buf 0)
+           (if x87
+               (progn (i386-emit-x87-abs buf #xDD 0 fd)
+                      (i386-emit-x87-mem buf #xDC 1 +i386-esp+ 0)                 ; fmul qword [esp]
+                      (i386-emit-x87-abs buf #xDD 3 fd))
+               (progn (i386-emit-sse-abs buf #xF2 #x10 +i386-xmm0+ fd)
+                      (i386-emit-byte buf #xF2) (i386-emit-byte buf #x0F) (i386-emit-byte buf #x59)
+                      (i386-emit-modrm-mem buf +i386-xmm0+ +i386-esp+ 0)          ; mulsd xmm0, [esp]
+                      (i386-emit-sse-abs buf #xF2 #x11 +i386-xmm0+ fd)))
+           (i386-emit-add-reg-imm buf +i386-esp+ 8))
+         t)
+        ;; ---- one-operand: |x| (both), single <-> double ----
+        ((op= +op-fp-op1+)
+         (let ((fd (i386-fpr (first operands))) (fs (i386-fpr (second operands)))
+               (sub (third operands)))
+           (case sub
+             (0 (i386-emit-copy-slot buf fd fs 4)
+                (i386-emit-byte buf #x81) (i386-emit-abs-modrm buf 4 fd) (i386-emit-u32 buf #x7FFFFFFF))
+             (1 (i386-emit-copy-slot buf fd fs 8)
+                (i386-emit-byte buf #x81) (i386-emit-abs-modrm buf 4 (+ fd 4)) (i386-emit-u32 buf #x7FFFFFFF))
+             (2 (if x87
+                    (progn (i386-emit-x87-abs buf #xD9 0 fs) (i386-emit-x87-abs buf #xDD 3 fd))
+                    (progn (i386-emit-sse-abs buf #xF3 #x5A +i386-xmm0+ fs)       ; cvtss2sd
+                           (i386-emit-sse-abs buf #xF2 #x11 +i386-xmm0+ fd))))
+             (t (if x87
+                    (progn (i386-emit-x87-abs buf #xDD 0 fs) (i386-emit-x87-abs buf #xD9 3 fd))
+                    (progn (i386-emit-sse-abs buf #xF2 #x5A +i386-xmm0+ fs)       ; cvtsd2ss
+                           (i386-emit-sse-abs buf #xF3 #x11 +i386-xmm0+ fd))))))
+         t)
+        ;; ---- max / min, SSE's semantics: A when A > B (A < B), else B ----
+        ((op= +op-fp-op2+)
+         (let* ((fd (i386-fpr (first operands))) (fa (i386-fpr (second operands)))
+                (fb (i386-fpr (third operands))) (sub (fourth operands))
+                (dbl (>= sub 2)) (maxp (evenp sub)))
+           (if x87
+               (let ((pick-a (i386-make-label)) (pick-b (i386-make-label)) (done (i386-make-label)))
+                 (i386-emit-x87-compare-slots buf fa fb dbl)          ; flags: A vs B
+                 (if maxp
+                     (progn (i386-emit-jcc buf :a pick-a) (i386-emit-jmp-rel32 buf pick-b))
+                     (progn (i386-emit-jcc buf :e pick-b)             ; equal or unordered
+                            (i386-emit-jcc buf :b pick-a)
+                            (i386-emit-jmp-rel32 buf pick-b)))
+                 (i386-emit-label buf pick-a)
+                 (i386-emit-copy-slot buf fd fa (if dbl 8 4))
+                 (i386-emit-jmp-rel32 buf done)
+                 (i386-emit-label buf pick-b)
+                 (i386-emit-copy-slot buf fd fb (if dbl 8 4))
+                 (i386-emit-label buf done))
+               (let ((pre (if dbl #xF2 #xF3)))
+                 (i386-emit-sse-abs buf pre #x10 +i386-xmm0+ fa)
+                 (i386-emit-sse-abs buf pre (if maxp #x5F #x5D) +i386-xmm0+ fb)
+                 (i386-emit-sse-abs buf pre #x11 +i386-xmm0+ fd))))
+         t)
+        ;; ---- to a fixnum: 0 round-even 1 truncate 2 floor 3 ceiling; +4 double ----
+        ((op= +op-fp-toi+)
+         (let* ((fs (i386-fpr (second operands))) (sub (third operands))
+                (dbl (>= sub 4)) (rc (aref #(0 3 1 2) (logand sub 3))))
+           (i386-emit-x87-abs buf (if dbl #xDD #xD9) 0 fs)                        ; fld
+           ;; [esp] result, [esp+4] saved control word, [esp+6] ours
+           (i386-emit-sub-reg-imm buf +i386-esp+ 8)
+           (i386-emit-x87-mem buf #xD9 7 +i386-esp+ 4)                            ; fnstcw [esp+4]
+           (i386-emit-movzx-word buf +scratch0+ +i386-esp+ 4)
+           (i386-emit-and-reg-imm buf +scratch0+ #xF3FF)
+           (unless (zerop rc) (i386-emit-or-reg-imm buf +scratch0+ (ash rc 10)))
+           (i386-emit-mov-mem16-reg buf +i386-esp+ 6 +scratch0+)
+           (i386-emit-x87-mem buf #xD9 5 +i386-esp+ 6)                            ; fldcw [esp+6]
+           (i386-emit-x87-mem buf #xDB 3 +i386-esp+ 0)                            ; fistp dword [esp]
+           (i386-emit-x87-mem buf #xD9 5 +i386-esp+ 4)                            ; fldcw [esp+4]
+           (i386-emit-mov-reg-mem buf +scratch0+ +i386-esp+ 0)
+           (i386-emit-add-reg-imm buf +i386-esp+ 8)
+           (i386-emit-shl-reg-imm buf +scratch0+ 1)
+           (i386-store-vreg buf (first operands) +scratch0+))
+         t)
+        ((op= +op-fp-mov+)
+         (unless (= (first operands) (second operands))
+           (i386-emit-copy-slot buf (i386-fpr (first operands)) (i386-fpr (second operands)) 8))
+         t)
+        (t nil)))))
+
 (defun i386-emit-float-bits-to-stack (buf ptr-reg tmp-reg)
   "PTR-REG holds the TAGGED pointer to a float object.  Push 8 bytes and fill
    them with the object's IEEE double, little-endian, so [ESP] is a valid
@@ -2865,6 +3143,10 @@
     (macrolet ((op= (sym) `(= opcode ,sym)))
       (cond
         ((and *i386-x87* (i386-translate-x87-float buf opcode operands)) nil)
+        ;; the FP-register class (unboxed float trees), unless floats are soft
+        ((and (not (eql modus.mvm::+target-soft-float+ 1))
+              (i386-translate-fp-reg buf opcode operands))
+         nil)
         ;; NO SSE2: the compiler lowers every float op to mvm/softfloat.lisp, so
         ;; one reaching here is a gap -- recorded and INT3, never an SSE2
         ;; instruction a pre-Pentium-4 CPU would fault on.

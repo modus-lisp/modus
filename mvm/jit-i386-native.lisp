@@ -405,10 +405,9 @@
 
 (defun %runtime-has-fpd-p ()
   "The compiler's (compiler.lisp): may runtime-compiled code use the unboxed
-   double ops (fpd-*)?  Not here: translate-i386 has none, so a module using
-   them would be refused and stay interpreted.  Runtime float code boxes, as
-   the image's own float code does."
-  nil)
+   double ops (fpd-*)?  Yes where translate-i386 has the FP-register class
+   (I386-TRANSLATE-FP-REG): unless floats are soft."
+  (not (eql +target-soft-float+ 1)))
 
 (defun %n386-install (nm fn)
   "Publish FN as runtime DEFUN NM, as the 68k JIT's %T68-INSTALL does: by name

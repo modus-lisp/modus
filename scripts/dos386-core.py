@@ -11,9 +11,11 @@ QMP, the low block (#x10000000, 128 KB), the heap from #x19000000 to the
 allocation pointer and the matching slices of the two collector bitmaps, and
 writes OUT = IMAGE + the core:
 
-  page-aligned header: 'MCOR', version 1, allocation pointer, heap bytes,
-                       one bitmap slice's bytes; at +64 the low block, the
-                       heap, bitmap slice 1, bitmap slice 2
+  page-aligned header: 'MCOR', version 2, allocation pointer, heap bytes,
+                       one bitmap slice's bytes, the boot-only tail's first
+                       and last page (IMAGE.tail, from the build; 0 0 when
+                       there is none); at +64 the low block, the heap,
+                       bitmap slice 1, bitmap slice 2
   last 16 bytes:       'MODUSCOR', the header's physical address, 0
 
 and patches OUT's Multiboot load_end_addr to its new end.  The entry stub
@@ -122,7 +124,16 @@ def main():
     body = bytearray(img)
     body += b'\0' * (-len(body) % 4096)
     hdr_pa = LOAD + len(body)
-    hdr = struct.pack('<4sIIII', b'MCOR', 1, free, heap_bytes, bm_bytes)
+    # the boot-only tail (IMAGE.tail, written by the build): its whole pages,
+    # which a restored process never runs and the stub lays the heap over
+    tail_lo = tail_hi = 0
+    if os.path.exists(image + '.tail'):
+        lo, hi = map(int, open(image + '.tail').read().split())
+        tail_lo, tail_hi = (lo + 4095) & ~4095, hi & ~4095
+        if tail_hi <= tail_lo:
+            tail_lo = tail_hi = 0
+        print('boot-only tail: %d pages (%d bytes of code)' % ((tail_hi - tail_lo) // 4096, hi - lo))
+    hdr = struct.pack('<4sIIIIII', b'MCOR', 2, free, heap_bytes, bm_bytes, tail_lo, tail_hi)
     body += hdr + b'\0' * (64 - len(hdr)) + low + heap + bm1 + bm2
     body += b'MODUSCOR' + struct.pack('<II', hdr_pa, 0)
     struct.pack_into('<I', body, 20, LOAD + len(body))       # load_end_addr

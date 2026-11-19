@@ -3870,6 +3870,11 @@
     (setf *type-error-codes* (make-hash-table :test 'equal)))
   (unless (equal (sb-ext:posix-getenv "MODUS_STATIC_SYMBOL_SHORT_MISS") "0")
     (setf *static-symbol-short-miss* t))
+  ;; The functions only boot runs go last (compiler.lisp *BOOT-TAIL-LAST*),
+  ;; behind the collector and shared routines (translate-i386
+  ;; *I386-BOOT-TAIL*): a restored core lays its heap over them.  The range
+  ;; goes to OUT.tail for scripts/dos386-core.py.  MODUS_BOOT_TAIL=0: off.
+  (setf *boot-tail-last* (not (equal (sb-ext:posix-getenv "MODUS_BOOT_TAIL") "0")))
   (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~@[; x87~]~%"
           (symbol-value (intern "*I386-X87*" "MODUS.MVM.I386"))))
 
@@ -4585,7 +4590,17 @@
     ;; finds through its own Multiboot header's load_end_addr
     (when cl-user::*cl-repl-i386-p*
       (format t "~&;; i386: load_end_addr = #x~X~%"
-              (funcall (intern "I386-CL-PATCH-LOAD-END" "MODUS.MVM") path)))
+              (funcall (intern "I386-CL-PATCH-LOAD-END" "MODUS.MVM") path))
+      ;; the boot-only tail's addresses, for scripts/dos386-core.py
+      (let ((tail (symbol-value (intern "*I386-BOOT-TAIL*" "MODUS.MVM.I386")))
+            (tail-file (concatenate 'string (namestring path) ".tail")))
+        (if (and tail (cdr tail))
+            (let ((base (+ #x100000 (or (kernel-image-native-image-offset image) 0))))
+              (with-open-file (o tail-file :direction :output :if-exists :supersede)
+                (format o "~D ~D~%" (+ base (car tail)) (+ base (cdr tail))))
+              (format t "~&;; i386 boot-only tail: #x~X..#x~X (~D bytes) -> ~A~%"
+                      (+ base (car tail)) (+ base (cdr tail)) (- (cdr tail) (car tail)) tail-file))
+            (when (probe-file tail-file) (delete-file tail-file)))))
     (let ((n (length modus.mvm::*redefinition-log*)))
       (when (> n 0)
         (format t "~%REDEFINITIONS: ~D total (grep the build log for \"NOTE: redefining\")~%" n)))

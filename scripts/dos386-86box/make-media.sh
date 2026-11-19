@@ -4,7 +4,8 @@
 #                     CONFIG.SYS, MODUS.COM and an AUTOEXEC.BAT that runs
 #                     A:\MODUS.COM C:\MODUS.BIN
 #   VMDIR/hdd.img     41 MB IDE disk (81 x 16 x 63), one FAT16 partition from
-#                     sector 63 holding IMAGE as MODUS.BIN
+#                     sector 63 holding IMAGE as MODUS.BIN; its MBR code is
+#                     INT 18h, so a BIOS that tries C: first goes on to A:
 # FREEDOS is a directory with kernel.sys (FDOS/kernel ke2046_386f16 bin/),
 # COMMAND.COM (FDOS/freecom) and boot12.bin, the kernel's boot/boot.asm
 # assembled with nasm -f bin -DISFAT12 (SYS.COM is a DOS program; this
@@ -37,6 +38,7 @@ def chs(lba):
     c = lba // (H * S); h = (lba // S) % H; s = lba % S + 1
     return bytes([h, (s & 0x3F) | ((c >> 2) & 0xC0), c & 0xFF])
 img[0x1BE:0x1CE] = bytes([0x80]) + chs(start) + bytes([0x06]) + chs(total - 1) + struct.pack('<II', start, total - start)
+img[0:4] = bytes([0xCD, 0x18, 0xEB, 0xFE])   # MBR code: INT 18h (try the next boot device), then hang
 img[0x1FE:0x200] = b'\x55\xAA'
 open(sys.argv[1], 'wb').write(img)
 PY

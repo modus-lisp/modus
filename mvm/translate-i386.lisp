@@ -699,6 +699,21 @@
    HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION).")
 
 (defvar *i386-handler-push-label* nil)
+
+;;; SHARED ROUTINES (as the 68k translator's MODUS_68K_SHARED): the heaviest
+;;; inline sequences, by the MODUS_I386_OP_BYTES census, emitted ONCE after the
+;;; last function and CALLed.  A :gc-check was 23 bytes at each of ~29,000
+;;; sites and a :cons 75 bytes at each of ~29,000 (bitmap marks, fill, tag) --
+;;; 2.8 MB of an 18.5 MB image.  Minted only by TRANSLATE-MVM-TO-I386 (the
+;;; image), so the runtime native tier, which translates through
+;;; I386-TRANSLATE-INSN with these NIL, emits the inline forms as before.
+;;; MODUS_I386_SHARED=0 builds the image without them.
+(defvar *i386-shared-gccheck-label* nil)
+(defvar *i386-shared-cons-label* nil)
+(defvar *i386-shared-subtag-label* nil)
+(defvar *i386-shared-arraylen-label* nil)
+(defun i386-shared-routines-p ()
+  (not (equal (sb-ext:posix-getenv "MODUS_I386_SHARED") "0")))
 (defvar *i386-handler-pop-label* nil)
 
 ;;; THE NATIVE TIER (mvm/jit-i386-native.lisp, MODUS_I386_JIT=1): a runtime
@@ -4711,6 +4726,16 @@
          ;; IMPORTANT: Load cdr into scratch0 FIRST — loading car into EAX
          ;; clobbers VR, so if vb-arg=VR we'd get car's value for cdr.
          (let ((vd (first operands)) (va-arg (second operands)) (vb-arg (third operands)))
+          (if *i386-shared-cons-label*
+           ;; car in ECX, cdr in EDX (a vreg is EAX/EBX/ESI/EDI or memory,
+           ;; so neither load disturbs the other); the routine returns the
+           ;; tagged cons in ECX.  See I386-EMIT-SHARED-ROUTINES.
+           (progn
+             (i386-load-vreg buf +scratch0+ va-arg)
+             (i386-load-vreg buf +scratch1+ vb-arg)
+             (i386-emit-call-rel32 buf *i386-shared-cons-label*)
+             (i386-store-vreg buf vd +scratch0+))
+          (progn
            ;; Load cdr value first (before EAX is touched)
            ;; VR-PRESERVING: car, cdr and the alloc pointer are three live
            ;; values but only ECX/EDX are available, so cdr goes via one
@@ -4746,7 +4771,7 @@
            (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
            (i386-emit-add-reg-imm buf +scratch1+ 16)
            (i386-emit-mov-abs-reg buf *va-addr* +scratch1+)
-           (i386-store-vreg buf vd +scratch0+)))
+           (i386-store-vreg buf vd +scratch0+)))))
 
         ((op= +op-setcar+)
          ;; (setcar Vd Vs) -- [Vd - tag] = Vs
@@ -5023,24 +5048,9 @@
          ;; way, so the tag check already covers it; only T needs naming.
          (let ((vd (first operands)) (vs (second operands)))
            (i386-load-vreg buf +scratch0+ vs)
-           (let ((fail-label (i386-make-label))
-                 (done-label (i386-make-label)))
-             (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-             (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-             (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
-             (i386-emit-jcc buf :ne fail-label)
-             ;; T-immediate check (register compare, not a >2^31 imm32).
-             (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
-             (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
-             (i386-emit-jcc buf :e fail-label)
-             (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-             (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header
-             (i386-emit-and-reg-imm buf +scratch0+ #xFF)          ; mask to subtag
-             (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
-             (i386-emit-jmp-rel32 buf done-label)
-             (i386-emit-label buf fail-label)
-             (i386-emit-mov-reg-imm buf +scratch0+ 0)
-             (i386-emit-label buf done-label))
+           (if *i386-shared-subtag-label*
+               (i386-emit-call-rel32 buf *i386-shared-subtag-label*)
+               (i386-emit-subtag-body buf))
            (i386-store-vreg buf vd +scratch0+)))
 
         ((op= +op-aref+)
@@ -5101,24 +5111,9 @@
          ;; NIL, i.e. "not an array of N+ slots".
          (let ((vd (first operands)) (vobj (second operands)))
            (i386-load-vreg buf +scratch0+ vobj)
-           (let ((fail-label (i386-make-label))
-                 (done-label (i386-make-label)))
-             (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
-             (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
-             (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
-             (i386-emit-jcc buf :ne fail-label)
-             (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
-             (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
-             (i386-emit-jcc buf :e fail-label)
-             (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
-             (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header word
-             (i386-emit-shr-reg-imm buf +scratch0+ 8)             ; count = header >> 8
-             (i386-emit-and-reg-imm buf +scratch0+ #xFFFFFF)      ; mask to 24 bits
-             (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
-             (i386-emit-jmp-rel32 buf done-label)
-             (i386-emit-label buf fail-label)
-             (i386-emit-mov-reg-imm buf +scratch0+ 0)
-             (i386-emit-label buf done-label))
+           (if *i386-shared-arraylen-label*
+               (i386-emit-call-rel32 buf *i386-shared-arraylen-label*)
+               (i386-emit-arraylen-body buf))
            (i386-store-vreg buf vd +scratch0+)))
 
         ;; ============================================
@@ -5256,17 +5251,21 @@
          ;; Both at absolute addresses. If VA >= VL, trigger GC.
          ;; IMPORTANT: Use scratch0 (ECX), NOT EAX! EAX is VR and may hold
          ;; a live value (e.g., the car arg popped before GC-CHECK + CONS).
-         (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
-         (i386-emit-cmp-reg-abs buf +scratch0+ *vl-addr*)
-         (let ((ok-label (i386-make-label)))
-           (i386-emit-jcc buf :b ok-label)   ; unsigned below -> room left
-           ;; GC needed
-           (let ((gc-lbl (and *i386-gc-enabled*
-                              (i386-translate-state-gc-label state))))
-             (if gc-lbl
-                 (i386-emit-call-rel32 buf gc-lbl)
-                 (i386-emit-int buf #x31)))  ; trap to GC handler
-           (i386-emit-label buf ok-label)))
+         (if (and *i386-shared-gccheck-label* (i386-translate-state-gc-label state))
+             ;; the same test, once, in I386-EMIT-SHARED-ROUTINES (clobbers ECX)
+             (i386-emit-call-rel32 buf *i386-shared-gccheck-label*)
+             (progn
+               (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
+               (i386-emit-cmp-reg-abs buf +scratch0+ *vl-addr*)
+               (let ((ok-label (i386-make-label)))
+                 (i386-emit-jcc buf :b ok-label)   ; unsigned below -> room left
+                 ;; GC needed
+                 (let ((gc-lbl (and *i386-gc-enabled*
+                                    (i386-translate-state-gc-label state))))
+                   (if gc-lbl
+                       (i386-emit-call-rel32 buf gc-lbl)
+                       (i386-emit-int buf #x31)))  ; trap to GC handler
+                 (i386-emit-label buf ok-label)))))
 
         ((op= +op-write-barrier+)
          ;; (write-barrier Vobj) -- mark card table dirty (stub)
@@ -6098,6 +6097,11 @@
     ;; that starts with the boot-side init.
     (setf *i386-gc-collect-label*
           (and *i386-gc-enabled* (i386-gc-mode-p) (i386-make-label)))
+    (let ((shared (and *i386-gc-collect-label* (i386-shared-routines-p))))
+      (setf *i386-shared-gccheck-label* (and shared (i386-make-label))
+            *i386-shared-cons-label* (and shared (i386-make-label))
+            *i386-shared-subtag-label* (and shared (i386-make-label))
+            *i386-shared-arraylen-label* (and shared (i386-make-label))))
     ;; handler-case helper entry points (TRAP #x0510/#x0511/#x0512) -- in
     ;; BOTH modes now.  They used to be hosted-only, to keep the bare images
     ;; (REPL/SSH, which have no handler-case) byte-identical; those images are
@@ -6175,6 +6179,9 @@
       ;; EAX is an ordinary temp; silence the checker for this block.
       (let ((*i386-check-eax-invariant* nil))
         (i386-emit-gc-trampoline buf *i386-gc-collect-label* nil)))
+    (when *i386-shared-cons-label*
+      (let ((*i386-check-eax-invariant* nil))
+        (i386-emit-shared-routines buf)))
     ;; The handler-case push/pop helpers, likewise emitted once after the last
     ;; function.  They use EAX as a copy temp but SAVE AND RESTORE it, which
     ;; the per-opcode checker cannot see; silence it for this block.
@@ -6219,6 +6226,88 @@
         *i386-gc-margin-addr* margin-addr
         *i386-pit-clock* tick-addr)
   (i386-set-globals-base globals-base))
+
+(defun i386-emit-subtag-body (buf)
+  "ECX = the object's subtag as a fixnum, or 0 when ECX is not an object
+   pointer (or is T).  Clobbers EDX.  The :obj-subtag arm, inline or shared."
+       (let ((fail-label (i386-make-label))
+             (done-label (i386-make-label)))
+         (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+         (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+         (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
+         (i386-emit-jcc buf :ne fail-label)
+         ;; T-immediate check (register compare, not a >2^31 imm32).
+         (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
+         (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+         (i386-emit-jcc buf :e fail-label)
+         (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+         (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header
+         (i386-emit-and-reg-imm buf +scratch0+ #xFF)          ; mask to subtag
+         (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+         (i386-emit-jmp-rel32 buf done-label)
+         (i386-emit-label buf fail-label)
+         (i386-emit-mov-reg-imm buf +scratch0+ 0)
+         (i386-emit-label buf done-label)))
+
+(defun i386-emit-arraylen-body (buf)
+  "ECX = the object's element count as a fixnum, or 0 when ECX is not an
+   object pointer (or is T).  Clobbers EDX.  The :array-len arm."
+       (let ((fail-label (i386-make-label))
+             (done-label (i386-make-label)))
+         (i386-emit-mov-reg-reg buf +scratch1+ +scratch0+)
+         (i386-emit-and-reg-imm buf +scratch1+ +tag-mask+)
+         (i386-emit-cmp-reg-imm buf +scratch1+ +tag-object+)
+         (i386-emit-jcc buf :ne fail-label)
+         (i386-emit-mov-reg-imm buf +scratch1+ +i386-mvm-t+)
+         (i386-emit-cmp-reg-reg buf +scratch0+ +scratch1+)
+         (i386-emit-jcc buf :e fail-label)
+         (i386-emit-sub-reg-imm buf +scratch0+ +tag-object+)
+         (i386-emit-mov-reg-mem buf +scratch0+ +scratch0+ 0)  ; load header word
+         (i386-emit-shr-reg-imm buf +scratch0+ 8)             ; count = header >> 8
+         (i386-emit-and-reg-imm buf +scratch0+ #xFFFFFF)      ; mask to 24 bits
+         (i386-emit-shl-reg-imm buf +scratch0+ 1)             ; tag as fixnum
+         (i386-emit-jmp-rel32 buf done-label)
+         (i386-emit-label buf fail-label)
+         (i386-emit-mov-reg-imm buf +scratch0+ 0)
+         (i386-emit-label buf done-label)))
+
+(defun i386-emit-shared-routines (buf)
+  "The shared :gc-check and :cons (see *I386-SHARED-CONS-LABEL*).
+   gc-check: clobbers ECX, as the inline form does; the collector's PUSHAD
+   sees every mutator register, and the extra return address on the stack is
+   below the 2^30 heap, so the conservative scan passes over it.
+   cons: car in ECX, cdr in EDX -> the tagged cons in ECX; clobbers EDX and
+   keeps EAX (VR), which it borrows as the cell's base."
+  ;; gc-check
+  (i386-emit-label buf *i386-shared-gccheck-label*)
+  (i386-emit-mov-reg-abs buf +scratch0+ *va-addr*)
+  (i386-emit-cmp-reg-abs buf +scratch0+ *vl-addr*)
+  (let ((ok (i386-make-label)))
+    (i386-emit-jcc buf :b ok)
+    (i386-emit-call-rel32 buf *i386-gc-collect-label*)
+    (i386-emit-label buf ok))
+  (i386-emit-ret buf)
+  ;; cons
+  (i386-emit-label buf *i386-shared-cons-label*)
+  (i386-emit-push-reg buf +i386-eax+)
+  (i386-emit-mov-reg-abs buf +i386-eax+ *va-addr*)
+  (i386-emit-mov-mem-reg buf +i386-eax+ 0 +scratch0+)
+  (i386-emit-mov-mem-reg buf +i386-eax+ 4 +scratch1+)
+  (i386-emit-fill-slots buf +i386-eax+ '(8 12) :cons +scratch0+)
+  (i386-emit-gc-mark-start buf +i386-eax+ t)
+  (i386-emit-mov-reg-reg buf +scratch0+ +i386-eax+)
+  (i386-emit-or-reg-imm buf +scratch0+ +tag-cons+)
+  (i386-emit-add-reg-imm buf +i386-eax+ 16)
+  (i386-emit-mov-abs-reg buf *va-addr* +i386-eax+)
+  (i386-emit-pop-reg buf +i386-eax+)
+  (i386-emit-ret buf)
+  ;; obj-subtag and array-len: ECX -> ECX, clobbering EDX
+  (i386-emit-label buf *i386-shared-subtag-label*)
+  (i386-emit-subtag-body buf)
+  (i386-emit-ret buf)
+  (i386-emit-label buf *i386-shared-arraylen-label*)
+  (i386-emit-arraylen-body buf)
+  (i386-emit-ret buf))
 
 (defun i386-native-export-labels ()
   "The image routines the native tier links runtime code to, in the order

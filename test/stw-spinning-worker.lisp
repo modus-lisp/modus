@@ -10,7 +10,8 @@
 ;;;; and when main was the one that would end the loop -- by setting the flag
 ;;;; the worker polls -- the process hung for good.  A back-edge in a function
 ;;;; that holds no raw word now parks (compiler.lisp *PARK-SAFEPOINTS*,
-;;;; translate-x64 EMIT-X64-STW-SAFEPOINT).
+;;;; translate-x64 EMIT-X64-STW-SAFEPOINT, translate-aarch64
+;;;; EMIT-AARCH64-STW-SAFEPOINT).  Hosted x86-64 and AArch64 alike.
 ;;;;
 ;;;; WHAT WOULD MAKE A PASS MEANINGLESS, AND WHAT STOPS IT.
 ;;;;   - No region-0 collection while a worker spun: every arm requires region

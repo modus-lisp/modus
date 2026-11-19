@@ -6825,7 +6825,18 @@
           ;; enters the trampoline, which parks there.  See STOP-THE-WORLD.
           ((and (= op +op-yield+) *a64-tls-window* *aarch64-gc-native-mcgc*)
            (emit-aarch64-stw-clamp buf))
-          ((= op +op-yield+)
+          ;; ---- SAFEPOINT ----
+          ;; A YIELD in a function that holds no raw word (compiler.lisp
+          ;; *PARK-SAFEPOINTS*): hosted with threads it polls like YIELD and,
+          ;; when a collection is waiting, PARKS HERE instead of at the next
+          ;; allocation, which a non-allocating loop never reaches.  Anywhere
+          ;; else (bare metal's preemption clamp, no native trampoline) it is
+          ;; exactly YIELD.
+          ((and (= op +op-safepoint+) (a64-stw-safepoint-p))
+           (emit-aarch64-stw-safepoint buf))
+          ((and (= op +op-safepoint+) *a64-tls-window* *aarch64-gc-native-mcgc*)
+           (emit-aarch64-stw-clamp buf))
+          ((or (= op +op-yield+) (= op +op-safepoint+))
            (if *aarch64-yield-nop*
                (a64-nop buf)
                (progn
@@ -7723,6 +7734,48 @@
     (a64-lsl-imm buf +a64-x16+ +a64-x25+ 1)
     (a64-str-unsigned buf +a64-x16+ +a64-x15+ +gc-off-saved-limit+)
     (a64-movz buf +a64-x25+ 0 0)
+    (a64-set-label buf skip)))
+
+(defun a64-stw-safepoint-p ()
+  "Whether :SAFEPOINT parks (EMIT-AARCH64-STW-SAFEPOINT): hosted, threads,
+   the native collector reached through x28.  Bare metal keeps YIELD's clamp
+   (it also preempts there, and its trampoline is reached by BL)."
+  (and *a64-tls-window* *aarch64-gc-native-mcgc* *aarch64-linux-mode*
+       *aarch64-gc-trampoline-label*
+       (not *aarch64-gc-trampoline-call-via-bl*)))
+
+(defun emit-aarch64-stw-safepoint (buf)
+  "A :SAFEPOINT back-edge (compiler.lisp *PARK-SAFEPOINTS*: a function that
+   holds no raw word).  The poll is YIELD's -- load the stop flag, compare,
+   branch not taken.  With the flag held: clamp x25 exactly as YIELD does
+   (EMIT-AARCH64-STW-CLAMP keeps the real limit in the active region's
+   saved-limit), then a gc-check of nothing -- x16 = x24, the requested end,
+   and BLR x28 into the trampoline.  Its entry (EMIT-AARCH64-STW-ENTRY) parks
+   the thread, takes the real limit back and, since nothing was asked for,
+   returns at once without a collection of its own (unless the region really
+   is full, which the next allocation would collect anyway).  Every mutator
+   register is in the trampoline's frame while parked, so the collector
+   forwards them.  BLR clobbers x30, as every gc-check's does: the frame
+   saved it.  Without this a loop that never allocates held every region-0
+   collection up for as long as it ran, and a worker spinning on
+   (loop (when *flag* (return)) ...) while main waited on that collection to
+   set *flag* hung the process (test/stw-spinning-worker.lisp).
+   Uses x15-x17 (scratch at every YIELD)."
+  (let ((skip (incf *mvm-label-counter*))
+        (clamped (incf *mvm-label-counter*)))
+    (a64-load-conv-addr buf +a64-x16+ +a64-stw-flag-addr+)
+    (a64-ldr-width buf +a64-x16+ +a64-x16+ 0 2)
+    (a64-cmp-imm buf +a64-x16+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i skip :bcond))
+    (a64-cmp-imm buf +a64-x25+ 0)
+    (let ((i (a64-current-index buf))) (a64-bcond buf +cc-eq+ 0) (a64-add-fixup buf i clamped :bcond))
+    (a64-load-gc-region buf +a64-x15+ +a64-x16+)
+    (a64-lsl-imm buf +a64-x16+ +a64-x25+ 1)
+    (a64-str-unsigned buf +a64-x16+ +a64-x15+ +gc-off-saved-limit+)
+    (a64-movz buf +a64-x25+ 0 0)
+    (a64-set-label buf clamped)
+    (a64-mov-reg buf +a64-x16+ +a64-x24+)
+    (a64-blr buf +a64-x28+)
     (a64-set-label buf skip)))
 
 (defconstant +a64-stw-r0-count-addr+ #x10005010

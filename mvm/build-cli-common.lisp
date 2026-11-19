@@ -718,8 +718,19 @@
   ;; The hosted layout (docs/macos-hosting.md) — the runtime twin of
   ;; APPLY-LAYOUT-HOST: code compiled at runtime must agree with the fixed code
   ;; on where the region is, which heap and arena, and whether x18 is the base.
-" (layout-coinit-text) "
-  t)
+" (layout-coinit-text)
+   ;; LOOP BACK-EDGES THAT CAN PARK (compiler.lisp *PARK-SAFEPOINTS*), as the
+   ;; x86-64 co-init does: a JIT'd function holding no raw word stops for a
+   ;; region-0 collection at its loop back-edges, or a worker spinning in a
+   ;; loop that never allocates holds every collection up (and the process
+   ;; hangs, test/stw-spinning-worker.lisp).  Only with threads (the layout
+   ;; text above set *A64-TLS-WINDOW*); the image's AOT code keeps YIELD, and
+   ;; bare metal is untouched.
+   (if *cli-bare-metal*
+       ""
+       "  (setq *park-safepoints* *a64-tls-window*)
+")
+   "  t)
 ")))
 
 ;;; The assembled translator slot, spliced into *all-runtime-source* and

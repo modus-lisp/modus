@@ -992,8 +992,12 @@ set.
   of `YIELD`.  Its poll is the same compare; with the flag held it calls a
   per-unit stub that clamps R14 and runs a gc-check of nothing, so the
   trampoline parks it and returns.  The image's AOT code, the MVM
-  interpreter and anything with a raw primitive keep the poll-only YIELD,
-  and so does AArch64 (`test/stw-spinning-worker.lisp`).
+  interpreter and anything with a raw primitive keep the poll-only YIELD
+  (`test/stw-spinning-worker.lisp`).  AArch64 does the same
+  (`EMIT-AARCH64-STW-SAFEPOINT`), inline: the flag poll, and with the flag
+  held the YIELD clamp of x25 then `mov x16, x24 ; blr x28` -- a gc-check of
+  nothing, which the trampoline entry parks and returns from early.  Bare
+  metal keeps YIELD's clamp there.
 - **x86-64 differences.**  Region metadata is raw, not `<<1`.  The other
   threads' regions and the lock arena are walked with the Cheney scan's own
   flat walk (`EMIT-X64-FLAT-WALK`), not object by object, so they need no

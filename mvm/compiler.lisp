@@ -419,7 +419,7 @@
    stores (its block - +TLS-WINDOW-BASE+) here when it installs that same value
    as its segment base.")
 
-;;; LOOP BACK-EDGES THAT CAN PARK (stop-the-world, hosted x86-64).
+;;; LOOP BACK-EDGES THAT CAN PARK (stop-the-world, hosted x86-64 and AArch64).
 ;;; A region-0 collection stops every other thread, and a thread stops only at
 ;;; an ALLOCATION: the runtime holds raw object words (REG-GET's %VAL->WORD,
 ;;; UNTAG, MEM-REF of a computed address) between allocations, invisible to a
@@ -440,8 +440,9 @@
 ;;; been seen to not isolate per-function specials (GET-IR-INSTRUCTIONS).
 (defparameter *park-safepoints* nil
   "Turn the :YIELDs of a function with no raw words into :SAFEPOINTs.  Set by
-   the hosted x86-64 JIT co-init (build-cli-common), whose translator implements
-   :SAFEPOINT; NIL everywhere else, so no other back-end ever sees the opcode.
+   the hosted x86-64 and AArch64 JIT co-inits (build-cli-common), whose
+   translators implement :SAFEPOINT; NIL everywhere else, so no other back-end
+   ever sees the opcode.
    The image's own AOT code is compiled with it OFF: runtime code holds raw
    words across calls to non-allocating helpers, which a parking back-edge in
    the helper would invalidate.  User code (the JIT) is where unbounded
@@ -470,8 +471,8 @@
       (case (car insn)
         (:raw-mark (setq raw t))
         (:yield (setq yields t))))
-    ;; *TLS-WINDOW* too: only the hosted x86-64 image has it on, and a DDC
-    ;; rebuild of another target from that image resets it.
+    ;; *TLS-WINDOW* too: only the hosted threaded images (x86-64, AArch64)
+    ;; have it on, and a DDC rebuild of another target from them resets it.
     (if (or raw (and yields *park-safepoints* *tls-window*))
         (let ((park (and *park-safepoints* *tls-window* (not raw))) (out nil))
           (dolist (insn ir)

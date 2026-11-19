@@ -1976,7 +1976,7 @@ Making region 0 collectable under threads needs a stop-the-world handshake with
 per-thread root windows.  **Done, on AArch64 and x86-64** (docs/macos-hosting.md,
 "Stop the world"; `test/hosted-stw.lisp`).  Threads park only at an
 allocation, never at a loop back-edge: the interpreter holds raw object words
-between allocations.  **Except (x86-64, 2026-11):** a JIT-compiled function
+between allocations.  **Except (x86-64 and AArch64, 2026-11):** a JIT-compiled function
 with no raw primitive parks at its back-edges too (`*PARK-SAFEPOINTS*`,
 `:SAFEPOINT`), or a worker spinning in a non-allocating loop hung every
 region-0 collection (`test/stw-spinning-worker.lisp`).

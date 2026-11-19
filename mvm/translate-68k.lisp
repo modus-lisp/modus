@@ -2941,17 +2941,20 @@
              ;; to A0 and the tag folds into the displacement: (4(i+1)-tag)(A0)
              ;; is the same address SUBI #tag then 4(i+1)(A0) was, minus the
              ;; SUBI (6 bytes) and a MOVEA.
-             (let ((disp (- (* (1+ idx) 4) +tag-object+)))
+             ;; Straight into VD's data register when it has one (a spilled
+             ;; VD goes through D0, which the store-then-reload peephole needs).
+             (let ((disp (- (* (1+ idx) 4) +tag-object+))
+                   (dd (or (m68k-vreg-data-reg vd) +68k-d0+)))
                (if (<= -32768 disp 32767)
                    (progn
                      (m68k-load-vreg-to-an buf +68k-a0+ vobj)
-                     (m68k-emit-move-disp-dn buf +68k-a0+ disp +68k-d0+))
+                     (m68k-emit-move-disp-dn buf +68k-a0+ disp dd))
                    (progn
                      (m68k-load-vreg buf +68k-d0+ vobj)
                      (m68k-emit-subi buf +68k-d0+ +tag-object+)
                      (m68k-emit-move-dn-an buf +68k-d0+ +68k-a0+)
-                     (m68k-emit-move-disp-dn buf +68k-a0+ (* (1+ idx) 4) +68k-d0+)))
-               (m68k-store-vreg buf vd +68k-d0+)))))
+                     (m68k-emit-move-disp-dn buf +68k-a0+ (* (1+ idx) 4) dd)))
+               (m68k-store-vreg buf vd dd)))))
 
       (#.+op-obj-set+
        (let ((vobj (first operands))

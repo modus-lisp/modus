@@ -930,7 +930,9 @@
                      "LDB" "MAPHASH" "MAKE-INSTANCE" "GET-SETF-EXPANSION"
                      ;; upstream MACRO-FUNCTION.5
                      "1+" "1-" "CHAR/=" "CHAR<" "CHAR<=" "CHAR=" "CHAR>"
-                     "CHAR>=" "FLOOR"))
+                     "CHAR>=" "FLOOR"
+                     ;; inlined two-argument form (compiler.lisp "RPLACA")
+                     "RPLACA" "RPLACD"))
           (puthash (compute-name-hash n) ht t))
         (setq *%std-fn-not-macro-hashes* ht)
         ht)))

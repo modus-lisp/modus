@@ -25,8 +25,8 @@ OUTDIR/results.json.
   MACHINES_JSON machines.py output      (default ~/dos386-work/86box/machines.json)
   GOLDEN        saved CMOS images       (default ~/dos386-work/86box/nvr-162x16x63: per disk geometry)
   JOBS          machines at once        (default 8)
-  BOOT_MS       emulated ms to the REPL (default 1800000: a 486SX-25
-                reads the 20 MB image through DOS at about 30 KB/s)
+  BOOT_MS       emulated ms to the REPL (default 1800000; measured, power-on
+                to REPL: 486SX-25 soft-float ~265 s, 486DX2-66 ~110 s)
   MEM           RAM in MB               (default 48)
   CPU486        dx2 or default          (default dx2: see cpu_lines)
 """

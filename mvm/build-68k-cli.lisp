@@ -382,6 +382,12 @@
 (let ((v (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES")))
   (unless (and v (string= v "0"))
     (setf modus.mvm::*type-error-codes* (make-hash-table :test 'equal))))
+;; MODUS_STATIC_SYMBOL_SHORT_MISS=0: a quoted symbol's miss arm loads both name
+;; hashes as before; otherwise it passes the slot index alone
+;; (compiler.lisp *STATIC-SYMBOL-SHORT-MISS*).
+(let ((v (sb-ext:posix-getenv "MODUS_STATIC_SYMBOL_SHORT_MISS")))
+  (unless (and v (string= v "0"))
+    (setf modus.mvm::*static-symbol-short-miss* t)))
 (let* ((out (or (sb-ext:posix-getenv "MODUS_CLI_OUT")
                 "/tmp/modus-68k-cli"))
        (image (build-image :target :linux-68k

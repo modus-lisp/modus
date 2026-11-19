@@ -2359,6 +2359,13 @@
    a site, not ~65, at ~24,000 sites in the CLI image.  Slower per quoted
    symbol: every use pays the call.")
 
+(defvar *static-symbol-short-miss* nil
+  "When T (the 68k builds), a quoted symbol's site keeps its inline load of
+   the filled slot, but the deferred miss arm passes the slot index alone to
+   %STATIC-SYMBOL-MISS, which looks the two name hashes up in the table
+   *STATIC-SYMBOL-ONE-CALL* generates (8 bytes a symbol) -- instead of loading
+   both hashes as immediates at every site (12 bytes of 68k each).")
+
 (defvar *static-symbols-full* nil
   "When T (MODUS_LEAN_BOOT), a quoted interned symbol compiles to ONE :LI-CONST
    of a static symbol object in the constant pool -- header (3 << 8) | #x50,
@@ -11158,10 +11165,15 @@
           (lambda ()
             (emit-ir-label miss)
             (emit-li-tagged +vreg-v0+ idx)
-            (emit-li-tagged +vreg-v1+ h)
-            (emit-li-tagged +vreg-v2+ ph)
-            (when *mvm-emit-halves* (emit-ir :set-nargs 3))
-            (emit-ir :call "%STATIC-SYMBOL-REF" 3)
+            (if *static-symbol-short-miss*
+                (progn
+                  (when *mvm-emit-halves* (emit-ir :set-nargs 1))
+                  (emit-ir :call "%STATIC-SYMBOL-MISS" 1))
+                (progn
+                  (emit-li-tagged +vreg-v1+ h)
+                  (emit-li-tagged +vreg-v2+ ph)
+                  (when *mvm-emit-halves* (emit-ir :set-nargs 3))
+                  (emit-ir :call "%STATIC-SYMBOL-REF" 3)))
             (unless (= dest +vreg-vr+)
               (emit-ir :mov dest +vreg-vr+))
             (emit-ir :br done)))))))
@@ -33917,7 +33929,7 @@
         ;; slot I's name hash and package hash as 4 + 4 big-endian bytes of
         ;; one string literal (pooled, so a byte a character on a narrow pool).
         ;; Both hashes are 29 bits.
-        (when *static-symbol-one-call*
+        (when (or *static-symbol-one-call* *static-symbol-short-miss*)
           (let ((tab (make-string (max 256 (* 8 n)) :initial-element (code-char 0))))
             (when *static-literal-index*
               (maphash (lambda (key idx)

@@ -3823,6 +3823,10 @@
     (let ((v (sb-ext:posix-getenv "MODUS_TYPE_ERROR_CODES")))
       (unless (and v (string= v "0"))
         (setf (symbol-value (sym "*TYPE-ERROR-CODES*")) (make-hash-table :test 'equal))))
+    ;; MODUS_STATIC_SYMBOL_SHORT_MISS=0: a quoted symbol's miss arm loads both hashes
+    (let ((v (sb-ext:posix-getenv "MODUS_STATIC_SYMBOL_SHORT_MISS")))
+      (unless (and v (string= v "0"))
+        (setf (symbol-value (sym "*STATIC-SYMBOL-SHORT-MISS*")) t)))
     (format t "~&;; mac68k:~@[ gc-static~*~]~@[ tags3~*~]~@[ threaded~*~]~@[ a5-globals~*~]~@[ relaxed~*~]~@[ narrow-pool~*~]~@[ narrow-literals~*~]~%"
             (symbol-value (sym "*68K-GC-STATIC*"))
             (symbol-value (sym "*68K-TAGS3*")) (symbol-value (sym "*68K-THREADED*"))

@@ -2435,6 +2435,26 @@
       (and *jit-defun-trampolines*
            (eq current (gethash name *jit-defun-trampolines*)))))
 
+(declaim (overridable %runtime-form-native))
+(defun %runtime-form-native (bc entry ft-list fn-table rt-table lam-offsets)
+  "A NATIVE thunk for the module of a top-level form that builds closures (a
+   DEFMETHOD's method function, a hook pushed onto a list), or NIL to
+   interpret it.  The form runs once, but the closures it makes outlive it, and
+   an interpreted closure re-enters the interpreter at every call.  Nothing
+   here; the native i386 tier (mvm/jit-i386-native.lisp) overrides it.  The x64
+   JIT has its own path (%MVM-EVAL-JIT-RUN)."
+  bc entry ft-list fn-table rt-table lam-offsets
+  nil)
+
+(defun %run-native-thunk (thunk)
+  "Run a form's native THUNK in place of mvm-interpret: its primary value, with
+   *MVM-LAST-MV* set as the interpreter leaves it ((count . secondaries), or NIL
+   for exactly one value)."
+  (let* ((vals (multiple-value-list (funcall thunk)))
+         (n (length vals)))
+    (setq *mvm-last-mv* (if (eql n 1) nil (cons n (cdr vals))))
+    (car vals)))
+
 (declaim (overridable %runtime-defun-hook))
 (defun %runtime-defun-hook (names)
   "Called with a module's DEFUN names once mvm-eval has installed their
@@ -4356,11 +4376,14 @@
                                                   :function-table %fnt :runtime-table %rt
                                                   :return-raw nil :lambda-offsets %lam)
                                    %bc %fnt %rt %lam))))))
-                    (%mvm-wrap-escaping-result
-                      (mvm-interpret %bc :entry-point %entry
-                                     :function-table %fnt :runtime-table %rt
-                                     :return-raw nil :lambda-offsets %lam)
-                      %bc %fnt %rt %lam)))
+                    (let ((%nt (and %lam (%runtime-form-native %bc %entry %ftl %fnt %rt %lam))))
+                      (if %nt
+                          (progn (setq *jit-native-ran* t) (%run-native-thunk %nt))
+                          (%mvm-wrap-escaping-result
+                            (mvm-interpret %bc :entry-point %entry
+                                           :function-table %fnt :runtime-table %rt
+                                           :return-raw nil :lambda-offsets %lam)
+                            %bc %fnt %rt %lam)))))
          ;; *mvm-last-mv* must be read IMMEDIATELY after the run (see the note
          ;; at the top of this function and interp.lisp) — nothing may come
          ;; between %prim and %mv.
@@ -5057,11 +5080,18 @@
                                             :return-raw nil
                                             :lambda-offsets lam-offsets)
                              bc fn-table rt-table lam-offsets))))))
-                      (%mvm-wrap-escaping-result
-                        (mvm-interpret bc :entry-point entry :function-table fn-table
-                                       :runtime-table rt-table :return-raw nil
-                                       :lambda-offsets lam-offsets)
-                        bc fn-table rt-table lam-offsets))))))
+                      (let ((%nt (and %lam-bearing (null persist-names)
+                                      (%runtime-form-native bc entry ft-list fn-table
+                                                            rt-table lam-offsets))))
+                        (if %nt
+                            ;; the form's own code from here: its conditions
+                            ;; are the user's (see *JIT-NATIVE-RAN*)
+                            (progn (setq *jit-native-ran* t) (%run-native-thunk %nt))
+                            (%mvm-wrap-escaping-result
+                              (mvm-interpret bc :entry-point entry :function-table fn-table
+                                             :runtime-table rt-table :return-raw nil
+                                             :lambda-offsets lam-offsets)
+                              bc fn-table rt-table lam-offsets))))))))
          (%mv *mvm-last-mv*)
          ;; Cleared as soon as latched — see the sibling seam above.
          (%mvclr (setq *mvm-last-mv* nil)))

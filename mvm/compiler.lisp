@@ -15344,7 +15344,14 @@
               ;; test counted it twice, and with mill's 4x2 block (eleven
               ;; resident locals) every accumulator update took the boxed
               ;; route and called the prelude's vector functions: 2 us a step
-              ((%fp-setq-tree-fits-p val env kind)
+              ;; Only where :FP-MOV exists -- the interpreter and the x86-64 /
+              ;; aarch64 translators, exactly the *TARGET-HAS-FPD-P* set.  i386,
+              ;; RISC-V, arm32, 68k and PowerPC translate no :FP-MOV (a gap: INT3 /
+              ;; EBREAK), and baked image code took this branch there: every
+              ;; (make-array n :element-type 'single-float :initial-element x)
+              ;; trapped.  They take the boxed route below, as before.
+              ((and (or *mvm-eval-runtime-p* *target-has-fpd-p*)
+                    (%fp-setq-tree-fits-p val env kind))
                (let ((tf (alloc-fp-reg)))
                  (case kind
                    (:vector (compile-v4-unboxed val env tf))
@@ -23840,8 +23847,13 @@
 (defun %fp-tree-fits-p (form env)
   "True when FORM is an unboxable tree that fits the FP pool from the
    current allocation point."
-  ;; no FPU: there are no FP registers to evaluate a tree in
-  (unless (eql +target-soft-float+ 1)
+  ;; no FPU: there are no FP registers to evaluate a tree in.  Nor, for baked
+  ;; code, on a target whose translator has no FP-register ops (:FP-UNBOX,
+  ;; :FP-LANE-STORE, :FP-MOV ... exist on x86-64 and aarch64 only, the
+  ;; *TARGET-HAS-FPD-P* set): i386, RISC-V, arm32 would trap on them.  A
+  ;; runtime compile there runs in the interpreter, which has them all.
+  (unless (or (eql +target-soft-float+ 1)
+              (not (or *mvm-eval-runtime-p* *target-has-fpd-p*)))
     (let ((need (%fp-tree-need form env)))
       (and need (<= (+ *fp-reg-counter* need) +fp-reg-max+)))))
 

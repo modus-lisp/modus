@@ -1398,8 +1398,10 @@
   (dolist (pair (append
                  ;; :ARM32's scratch at #x0FE00000.. is mapped DRAM above its
                  ;; stack and L1 table; only i386's heap covers those addresses.
-                 (if *cl-repl-i386-p* '(("#x0FE00000" . "#x03B00000")
-                                        ("#x0FF00000" . "#x03C00000")) nil)
+                 ;; i386 runs the hosted picture: the hosted CLI's scratch pages
+                 ;; in the fixed block (build-i386-cli.lisp)
+                 (if *cl-repl-i386-p* '(("#x0FE00000" . "#x10004000")
+                                        ("#x0FF00000" . "#x10008000")) nil)
                  '(("4611686018427387903" . "536870911")
                   ("-4611686018427387903" . "-536870911"))))
     (let ((at (search (car pair) *cli-arch-io-scratch-source*)))
@@ -3672,75 +3674,22 @@
 ;;; hosted i386 CLI build sets it to T in the same image-building process and a
 ;;; default is a poor thing to rely on across two builds in one session.
 (when cl-user::*cl-repl-i386-p*
-  ;; LAYOUT.  The default i386 map puts the stack top at 4 MB and cons space at
-  ;; 8 MB; this image is ~37 MB at load address 1 MB, so both would sit INSIDE
-  ;; it.  Measured before these overrides existed: the banner printed and the
-  ;; image died before the REPL.  Mirrors the :X64 arm, which moves its stack to
-  ;; 512 MB for the same reason.  Needs -m 512.
-  ;; NO COLLECTOR ON BARE i386 YET, so VL is headroom rather than a semispace
-  ;; boundary.  translate-i386.lisp: *I386-GC-COLLECT-LABEL* is
-  ;; (and *i386-gc-enabled* *i386-linux-mode* ...), so every :gc-check on bare
-  ;; metal compiles to `int $0x31' with no IDT entry behind it.  Measured: the
-  ;; first build reached the banner and then v=31 -> #GP -> double -> triple
-  ;; fault.  Until the collector is wired (its own job — GC metadata, the two
-  ;; bitmaps, a stack base below 2^30), the image must simply never exhaust VL
-  ;; during boot.  128 MB of cons space for an image that interns a few tens of
-  ;; thousands of symbols; -m 512 gives room for all of it.
-  ;; MEASURED, not guessed: with VL at 192 MB the image died with VA =
-  ;; 0x0BFFFFF1, fifteen bytes short of the limit — it really does consume more
-  ;; than 128 MB of cons space before it reaches the prompt.  x64's heap is
-  ;; 224 MB for the same payload.  448 MB here, and the image wants -m 1024.
-  ;; Every address stays below 2^30 because gc.lisp's metadata convention and
-  ;; the 30-bit fixnum tagging both require it.
-  ;;
-  ;; WITH THAT HEADROOM THE GC TRAP IS GONE AND THE NEXT BLOCKER APPEARS:
-  ;; handler-case.  Traps #x0510 SETJMP, #x0511 LONGJMP and #x0512
-  ;; CLEAR-HANDLER are hosted-only (the jmp_buf and handler stack live in the
-  ;; hosted BSS), and translate-i386.lisp lists all three as deliberately NOT
-  ;; safe to no-op because each either produces a value or transfers control.
-  ;; The real CL uses handler-case pervasively — reader, eval and the REPL loop
-  ;; all wrap in it — so the image reaches one immediately and takes the
-  ;; unimplemented-trap reporter (INT3 on bare metal; measured as v=03 at
-  ;; IP 0x0195f6f5, about 6.5 MB further into the code than the GC trap was).
-  ;;
-  ;; So a bare i386 CL REPL needs, in order: (1) this headroom, done; (2)
-  ;; setjmp/longjmp/clear-handler against a jmp_buf and handler stack at fixed
-  ;; bare-metal addresses; (3) eventually the collector, for sustained use
-  ;; rather than boot.  `strings' on the image lists every trap it still cannot
-  ;; service: #x0310 #x0311 #x0500 #x0502 #x0510 #x0511 #x0512 #x0531.
-  ;; THE HEAP STARTS ABOVE THE RUNTIME'S FIXED BLOCK at #x10000000.. (globals
-  ;; table, symbol table, MV buffer, the static-symbol root #x10000FB0, GC
-  ;; region words): it used to run from 64 MB to 512 MB, straight across it,
-  ;; and boot allocates more than the 192 MB below it -- the bump allocator
-  ;; wrote over those words, and the image died in a %STATIC-SYMBOL-REF /
-  ;; %AREF-INDEX-ERROR recursion that moved with every layout change.
-  (setf (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")) #x10100000)    ; 257 MB
-  ;; The heap is two 240 MB semispaces from 257 MB with the collector's two
-  ;; bitmaps after them (boot-i386.lisp I386-CL-GC-LAYOUT); "general base"
-  ;; here is their end, which the layout asserts below hold under the stack.
-  (setf (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")) #x2EA00000) ; 746 MB
-  ;; THE COLLECTOR, on bare metal: boot-i386 sets up what boot-linux-i386 does.
-  (setf (symbol-value (intern "*I386-BARE-GC*" "MODUS.MVM.I386")) t)
-  ;; ... and a clock: RDTSC behind traps #x0310/#x0311.
-  (setf (symbol-value (intern "*I386-BARE-CLOCK*" "MODUS.MVM.I386")) t)
-  (setf (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")) #x3C000000)    ; 960 MB
-  ;; The handler-case block (jmp_buf + handler stack): its bare default,
-  ;; #x5C0000, is inside this image.  56 MB: above the image, below the heap.
-  (setf (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386")) #x03800000)
-  ;; NIL = #xDEAD0001 (the CL runtime's), with paging so NIL's page is RAM.
-  ;; Needs -m 1024 (stack top 960 MB, NIL frame at 964 MB).
-  (setf (symbol-value (intern "*I386-CL-BOOT*" "MODUS.MVM")) t)
+  ;; THE HOSTED PICTURE ON BARE METAL -- arm32's design (boot-arm32-cl.lisp).
+  ;; boot/boot-i386-cl.lisp maps boot-linux-i386.lisp's layout (fixed block and
+  ;; globals at #x10000000, heap at #x19000000 sized from the RAM the Multiboot
+  ;; loader reports, stack below #x18800000, NIL's page) over the PC's RAM with
+  ;; 386 paging; I386-SET-CL-BARE-MODE translates with bare traps (COM1 port
+  ;; I/O, RDTSC) over that layout and the native collector with its geometry.
+  ;; This replaced the old fixed bare map (two 240 MB semispaces, a 1 GB
+  ;; identity map, -m 1024): the image now runs in what it is given -- QEMU
+  ;; -kernel, or DOS through MODUS.COM (scripts/dos386-chain.s).
+  (cl-user::mvm-load "boot/boot-linux-i386.lisp")
+  (cl-user::mvm-load "boot/boot-i386-cl.lisp")
   (funcall (intern "INSTALL-I386-TRANSLATOR" "MODUS.MVM.I386"))
-  (setf (symbol-value (intern "*I386-LINUX-MODE*" "MODUS.MVM.I386")) nil)
-  (setf (symbol-value (intern "*I386-NATIVE-CODE-OFFSET*" "MODUS.MVM.I386")) 0)
-  ;; Function entries 16-byte aligned and OR-3 tagged, as in the hosted i386
-  ;; CLI: the CL runtime's funcall dispatch reads the low nibble.  Without it
-  ;; a function that happened to start at ...1 was taken for a cons --
-  ;; (mapcar (lambda (s) (normalize-name s)) names) returned (NIL NIL) and
-  ;; DEFSTRUCT's keyword constructor died in %INSTALL-SB-SHIMS.
-  (setf (symbol-value (intern "*I386-FN-TAG-3*" "MODUS.MVM.I386")) t)
-  (setf (symbol-value (intern "*I386-FN-ALIGN*" "MODUS.MVM.I386")) 16)
-  (format t "~&;; CONSOLE: COM1 via port I/O (i386 QEMU-pc)~%"))
+  (funcall (intern "I386-SET-CL-BARE-MODE" "MODUS.MVM.I386")
+           (symbol-value (intern "+LINUX-I386-GLOBALS+" "MODUS.MVM"))
+           (symbol-value (intern "+LINUX-I386-HEAP-MARGIN-ADDR+" "MODUS.MVM")))
+  (format t "~&;; CONSOLE: COM1 via port I/O (i386, paged over the hosted picture)~%"))
 
 ;;; DIVERGENCE 6/7 (:ARM32 arm) — the ARMv7 QEMU-virt boot descriptor and console.
 ;;;
@@ -4430,7 +4379,7 @@
 (let ((image (build-image :target (cond (cl-user::*cl-repl-virt-p* :fixpoint)
                                         (cl-user::*cl-repl-uefi-p* :uefi-x64-cl)
                                         (cl-user::*cl-repl-x64-p* :x86-64)
-                                        (cl-user::*cl-repl-i386-p* :i386)
+                                        (cl-user::*cl-repl-i386-p* :i386-cl)
                                         (cl-user::*cl-repl-arm32-p* :armv7-cl)
                                         (cl-user::*cl-repl-mac68k-p* :mac68k)
                                         (t :rpi))
@@ -4450,6 +4399,11 @@
       (write-sequence (kernel-image-image-bytes image) out))
     (format t "~%Wrote ~D bytes to ~A~%"
             (length (kernel-image-image-bytes image)) path)
+    ;; i386: the entry stub places its page tables after the image, which it
+    ;; finds through its own Multiboot header's load_end_addr
+    (when cl-user::*cl-repl-i386-p*
+      (format t "~&;; i386: load_end_addr = #x~X~%"
+              (funcall (intern "I386-CL-PATCH-LOAD-END" "MODUS.MVM") path)))
     (let ((n (length modus.mvm::*redefinition-log*)))
       (when (> n 0)
         (format t "~%REDEFINITIONS: ~D total (grep the build log for \"NOTE: redefining\")~%" n)))
@@ -4470,43 +4424,15 @@
       ;; COM1 and died before reaching the REPL.  That is a build-time fact and
       ;; belongs in a build-time assert, not in a boot log.
       (cl-user::*cl-repl-i386-p*
-       (let* ((image-bytes (length (kernel-image-image-bytes image)))
-              (load-addr   #x100000)
-              (image-end   (+ load-addr image-bytes))
-              (stack-top   (symbol-value (intern "*I386-STACK-TOP-OVERRIDE*" "MODUS.MVM")))
-              (cons-base   (symbol-value (intern "*I386-CONS-BASE-OVERRIDE*" "MODUS.MVM")))
-              (general     (symbol-value (intern "*I386-GENERAL-BASE-OVERRIDE*" "MODUS.MVM")))
-              (stack-top   (or stack-top #x400000))
-              (cons-base   (or cons-base #x800000))
-              (general     (or general  #x7800000)))
-         (format t "~&;; i386 map: image ~,1F MB (1 MB .. ~,1F MB), cons ~,1F MB, ~
-                   general ~,1F MB, stack top ~,1F MB~%"
-                 (/ image-bytes 1048576.0) (/ image-end 1048576.0)
-                 (/ cons-base 1048576.0) (/ general 1048576.0)
-                 (/ stack-top 1048576.0))
-         (when (and (< cons-base #x10010000) (> general #x10000000))
-           (error "i386 layout: the heap ~:D..~:D covers the runtime's fixed block ~
-                   at #x10000000..#x1000FFFF (globals, symbol table, static-symbol ~
-                   root); the allocator would write over it." cons-base general))
-         (when (< cons-base image-end)
-           (error "i386 layout: cons base ~:D is INSIDE the image (1 MB .. ~:D). ~
-                   The allocator would write over the running code.  Raise ~
-                   *I386-CONS-BASE-OVERRIDE*." cons-base image-end))
-         (when (< general cons-base)
-           (error "i386 layout: general heap ~:D is below cons base ~:D."
-                  general cons-base))
-         (let ((hb (symbol-value (intern "*I386-BARE-HANDLER-BASE*" "MODUS.MVM.I386"))))
-           (when (or (< hb image-end) (> (+ hb #x1000) cons-base))
-             (error "i386 layout: the handler-case block ~:D..~:D is not between the ~
-                     image end ~:D and the cons base ~:D.  Move ~
-                     *I386-BARE-HANDLER-BASE*." hb (+ hb #x1000) image-end cons-base)))
-         (when (< stack-top image-end)
-           (error "i386 layout: stack top ~:D is INSIDE the image (1 MB .. ~:D). ~
-                   Pushes would shred native code.  Raise ~
-                   *I386-STACK-TOP-OVERRIDE*." stack-top image-end))
-         (when (<= stack-top general)
-           (error "i386 layout: stack top ~:D is not above the general heap ~:D; ~
-                   the stack grows DOWN into it." stack-top general))))
+       ;; The stub builds the map at boot from the RAM it is given
+       ;; (boot/boot-i386-cl.lisp); the image itself must end below the low
+       ;; block it identity-maps under.
+       (let ((image-end (+ #x100000 (length (kernel-image-image-bytes image)))))
+         (format t "~&;; i386 map: image ~,1F MB (1 MB .. ~,1F MB); the rest is paged at boot~%"
+                 (/ (length (kernel-image-image-bytes image)) 1048576.0) (/ image-end 1048576.0))
+         (when (> image-end #x10000000)
+           (error "i386 layout: the image (to #x~X) reaches the fixed block at #x10000000"
+                  image-end))))
       (cl-user::*cl-repl-x64-p* (%x64-memory-map-asserts image))
       ;; ---- the 68k Mac (boot-mac68k.lisp's map) ------------------------
       ;; The image loads at #x0D000000 and must end below the stack's floor;

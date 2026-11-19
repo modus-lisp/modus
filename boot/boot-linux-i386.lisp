@@ -286,12 +286,13 @@
 (defun i386l-assemble (buf items)
   "Emit ITEMS: byte lists, (:LABEL name), (:J8 opcode name) -- a short jump to
    a label (errors past +-127) -- (:JCC32 opcode name) -- the near form of
-   short Jcc OPCODE (0F 80+cc rel32) -- and (:JMP32 0 name).  Displacements
-   are computed here."
+   short Jcc OPCODE (0F 80+cc rel32) -- (:JMP32 0 name) and (:CALL 0 name).
+   Displacements are computed here."
   (flet ((size (it) (cond ((and (consp it) (eq (car it) :label)) 0)
                           ((and (consp it) (eq (car it) :j8)) 2)
                           ((and (consp it) (eq (car it) :jcc32)) 6)
                           ((and (consp it) (eq (car it) :jmp32)) 5)
+                          ((and (consp it) (eq (car it) :call)) 5)
                           (t (length it)))))
     (let ((pos 0) (labels nil))
       (dolist (it items)                ; pass 1: positions
@@ -299,7 +300,7 @@
         (incf pos (size it)))
       (setq pos 0)
       (dolist (it items)
-        (let ((target (and (consp it) (member (car it) '(:j8 :jcc32 :jmp32))
+        (let ((target (and (consp it) (member (car it) '(:j8 :jcc32 :jmp32 :call))
                            (or (cdr (assoc (caddr it) labels))
                                (error "i386l-assemble: no label ~S" (caddr it))))))
           (cond ((and (consp it) (eq (car it) :label)) nil)
@@ -310,6 +311,9 @@
                  (i386l-le32 buf (- target (+ pos 6))))
                 ((and (consp it) (eq (car it) :jmp32))
                  (i386l-bytes buf #xE9)                         ; jmp rel32
+                 (i386l-le32 buf (- target (+ pos 5))))
+                ((and (consp it) (eq (car it) :call))
+                 (i386l-bytes buf #xE8)                         ; call rel32
                  (i386l-le32 buf (- target (+ pos 5))))
                 (t (apply #'i386l-bytes buf it))))
         (incf pos (size it))))))

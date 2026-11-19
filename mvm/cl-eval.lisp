@@ -1662,7 +1662,8 @@
 (defun %gv-site-cell (hash site)
   "The globals cell for HASH through SITE, a per-site cons in runtime-compiled
    code (CAR = the cell once found, else NIL), or NIL when HASH has no cell
-   yet.  Unarmed callers only; filled on the main thread only.  Cells are never
+   yet.  Shallow-binding callers only (unarmed, or the armed main thread:
+   see %DYNBIND); filled on the main thread only.  Cells are never
    replaced, so a found one stays the live cell."
   (let ((c (car site)))
     (if (and (consp c) (eq (car c) hash))
@@ -1678,7 +1679,9 @@
    when the read was compiled (a DEFVAR without a value, or a variable defined
    later): through SITE's memoised cell once it exists, instead of a table
    probe per read (cl-bench STAK)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if (and c (not (eq (cdr c) (%word->val #x0BADB0B5))))
             (cdr c)
@@ -1702,20 +1705,26 @@
 (defun %gv-site-ref (hash site)
   "The LET-special save (%GV-SAVE semantics: the unbound marker when unbound)
    through SITE."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site))) (if c (cdr c) (%word->val #x0BADB0B5)))
       (%gv-save hash)))
 
 (defun %dynbind-site (hash val site)
   "%DYNBIND through SITE: unarmed with a cell, store in place."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if c (progn (set-cdr c val) val) (%dynbind hash val)))
       (%dynbind hash val)))
 
 (defun %dynunbind-site (hash saved site)
   "%DYNUNBIND through SITE."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((c (%gv-site-cell hash site)))
         (if c (progn (set-cdr c saved) saved) (%dynunbind hash saved)))
       (%dynunbind hash saved)))

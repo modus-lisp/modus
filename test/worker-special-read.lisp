@@ -27,8 +27,8 @@
 ;;;;                 correctly there, bound or not around it.
 ;;;;
 ;;;; and then one timing ratio, generous enough not to flake: a worker reading
-;;;; specials bound under 60 others must stay within 3x of main doing the same
-;;;; (it was 5-10x).
+;;;; specials bound under 60 others must stay within 3x of the same reads with
+;;;; nothing under them (it was 5-10x; see THE REFERENCE below).
 
 (defvar *fail* 0)
 (defvar *checks* 0)
@@ -166,14 +166,40 @@
           (setq s (logand (+ s *x* *y* *ws0* *ws1*) #xffff)))
         s))))
 
+(defun hot-shallow ()
+  "The same reads with only the two the loop reads bound under them: what a
+   worker read costs when there is no stack to walk."
+  (let ((*x* 1) (*y* 2))
+    (with-many ("WS" 2 0)
+      (let ((s 0))
+        (dotimes (i 400000)
+          (setq s (logand (+ s *x* *y* *ws0* *ws1*) #xffff)))
+        s))))
+
 (defun best-of (n f) (let ((b nil)) (dotimes (i n) (let ((m (ms f))) (when (or (null b) (< m b)) (setq b m)))) b))
 
+;;; THE REFERENCE IS THE WORKER ITSELF, NOT MAIN.  This ratio used to be
+;;; worker-vs-main, which held only while main read through the same
+;;; out-of-line call the worker takes.  Since the armed main thread reads
+;;; inline (compiler.lisp, THE ARMED MAIN THREAD BINDS SHALLOWLY) main is
+;;; ~6x faster than that call, so the comparison stopped measuring the defect
+;;; this guards -- a read that WALKS the binding stack -- and started
+;;; measuring the call.  Deep (60 bindings over the ones read) against
+;;; shallow (none) on the same worker is the walk and nothing else.  Main is
+;;; still printed.
 (format t "~&-- timing~%")
 (hot)
 (let* ((main (best-of 3 #'hot))
-       (worker (sb-thread:join-thread (sb-thread:make-thread (lambda () (hot) (best-of 3 #'hot))))))
-  (format t "  main ~D ms, worker ~D ms~%" main worker)
-  (chk "worker special reads within 3x of main" (<= worker (* 3 (max main 5))) t))
+       (pair (sb-thread:join-thread
+              (sb-thread:make-thread
+               (lambda () (hot) (hot-shallow)
+                 (+ (* 100000 (best-of 3 #'hot)) (best-of 3 #'hot-shallow))))))
+       (worker (floor pair 100000))
+       (shallow (mod pair 100000)))
+  (format t "  main ~D ms, worker ~D ms, worker with nothing to walk ~D ms~%"
+          main worker shallow)
+  (chk "worker special reads under 60 bindings within 3x of none"
+       (<= worker (* 3 (max shallow 5))) t))
 
 (format t "~&~D checks, ~D failed~%" *checks* *fail*)
 (format t "~A~%" (if (= *fail* 0) "WORKER-SPECIAL-READ: PASS" "WORKER-SPECIAL-READ: FAIL"))

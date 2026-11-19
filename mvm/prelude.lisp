@@ -3469,22 +3469,44 @@
    once to install and once to restore, and a dynamic binding is not a rare
    operation -- it is every WITH-* macro in the system.
 
-   ONLY THE UNARMED ARM, and the narrowing is measured rather than cautious.
-   The arm below it -- threads declared, but this thread has no binding
-   block, i.e. the main thread of an armed image -- looks equally safe and
-   is not: substituting %GV-SET there as well makes test/hosted-dynbind.lisp
-   die with a READER-ERROR the moment the worker starts, on a build where
-   every other change in the tree passes it.  The mechanism was not chased,
-   so the honest statement is that SET-SYMBOL-VALUE does something on that
-   path that this does not (it takes %RT-ENTER / %RT-LEAVE, which is both a
-   lock and a region hop) and that the difference matters once a second
-   thread exists.  The arm that IS taken has established that the image
-   never declared threads at all, where there is nothing for either to do."
+   THE ARMED MAIN THREAD (threads declared, this thread has no binding
+   block) binds shallowly too, and an EXISTING pair is stored in place,
+   unlocked -- exactly what the compiled SETQ of a special has always done
+   on that thread (%GV-SET's armed arm).  Only an INSERT (no pair yet) goes
+   through SET-SYMBOL-VALUE.  This arm used to be SET-SYMBOL-VALUE for every
+   bind and unbind, which made a LET on main 20-100x dearer once any thread
+   had run.  What that call's %RT-ENTER / %RT-LEAVE buys, chased:
+     * on an EXISTING pair, PUTHASH is a publish fence and a SET-CDR -- no
+       allocation, no rehash, nothing for the lock's region hop to redirect.
+       The lock only orders the store against other threads' LOCKED
+       sections, and none of them depends on a pair's value staying put:
+       lock-free readers (%GV-CELL, %HT-GET-RO) were already the design,
+       a rehash (%HT-REBUILD-INDEX) builds a new bucket vector over the SAME
+       pairs and publishes it whole, and pairs are never replaced.  The
+       fence orders a freshly built value before the store that publishes
+       it: a no-op on x86 (stores are not reordered with stores), and on a
+       weakly ordered target this store is exactly as strong as the
+       unlocked compiled SETQ on main already was -- no weaker.
+     * on an INSERT, it is everything: the new pair and bucket entry are
+       allocated in region 0 (the lock arena), the bucket index may be
+       rebuilt, and two threads inserting the same key must not both win.
+       So the insert keeps the lock.
+   A worker NEVER reaches this arm once its window is installed (its block is
+   non-zero), so main's shallow binding is still the global value a worker
+   reads for a special it has not bound -- the semantics test/hosted-
+   dynbind.lisp and test/main-bind-armed.lisp pin.  (The READER-ERROR an
+   earlier attempt at this recorded did not reproduce on this tree, nor on a
+   rebuild of the commit that recorded it with the change re-applied; that
+   tree failed hosted-dynbind identically with and without the change.)"
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (%gv-set key val)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
-            (set-symbol-value key val)
+            ;; ARMED, NO BLOCK: the main thread (see THE ARMED MAIN THREAD
+            ;; in the docstring).  An EXISTING pair is stored in place, unlocked, like
+            ;; the compiled SETQ; only an insert takes SET-SYMBOL-VALUE's lock.
+            (let ((cl (%gv-cell key)))
+              (if cl (progn (set-cdr cl val) val) (set-symbol-value key val)))
             (let ((d (%dynb-depth blk))
                   (a (%dynb-next blk)))
               ;; HEADROOM.  Signalling the overflow binds specials too
@@ -3526,7 +3548,8 @@
       (%gv-set key saved)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
-            (set-symbol-value key saved)
+            (let ((cl (%gv-cell key)))
+              (if cl (progn (set-cdr cl saved) saved) (set-symbol-value key saved)))
             (let ((d (%dynb-depth blk)))
               (if (<= d 0)
                   saved
@@ -3779,15 +3802,18 @@
 (defun %gv-save-fill (%gv-key %gv-slot)
   "The AOT LET-special SAVE through cache slot SLOT: %GV-SAVE's contract
    (unbound comes back as the unbound marker), memoising the cell."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c (cdr %gv-c) (%gv-save %gv-key)))
       (%gv-save %gv-key)))
 
 (defun %gv-memo-cell (%gv-key %gv-slot)
   "The globals cell for KEY through cache slot SLOT (filling the slot on a
-   miss), or NIL when there is no cell or no cache vector yet.  For UNARMED
-   callers only: a memoised pair cannot see a thread's own binding."
+   miss), or NIL when there is no cell or no cache vector yet.  For threads
+   that bind SHALLOWLY only (unarmed, or the armed main thread -- see
+   %DYNBIND): a memoised pair cannot see a worker's own binding."
   (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
     (if (fixnump %gv-cv)
         nil
@@ -3806,7 +3832,9 @@
    Unarmed and the cell exists: store in place, no table probe.  Otherwise
    exactly %GV-SET (which consults this thread's bindings, and creates the
    cell -- flushing the cache -- when there is none)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c
             (progn (set-cdr %gv-c %gv-val) %gv-val)
@@ -3815,31 +3843,43 @@
 
 (defun %dynbind-c (%gv-key %gv-val %gv-slot)
   "%DYNBIND through the cell cache: its unarmed arm is %GV-SET (see there)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (%gv-set-c %gv-key %gv-val %gv-slot)
       (%dynbind %gv-key %gv-val)))
 
 (defun %dynunbind-c (%gv-key %gv-saved %gv-slot)
   "%DYNUNBIND through the cell cache: its unarmed arm is %GV-SET too."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (%gv-set-c %gv-key %gv-saved %gv-slot)
       (%dynunbind %gv-key %gv-saved)))
 
 (defun %gv-cell-ref (%gv-cell %gv-key)
   "The LET-special save through a cell baked at a runtime compile: the
    cell's value on an unarmed image, else %GV-SAVE (thread bindings first)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0) (cdr %gv-cell) (%gv-save %gv-key)))
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+      (cdr %gv-cell)
+      (%gv-save %gv-key)))
 
 (defun %dynbind-cell (%gv-cell %gv-key %gv-val)
   "%DYNBIND through a cell baked at a runtime compile: its unarmed arm is a
    store into the cell (%GV-SET's in-place update, without the probe)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-val) %gv-val)
       (%dynbind %gv-key %gv-val)))
 
 (defun %dynunbind-cell (%gv-cell %gv-key %gv-saved)
   "%DYNUNBIND through a cell baked at a runtime compile."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-saved) %gv-saved)
       (%dynunbind %gv-key %gv-saved)))
 
@@ -3847,7 +3887,9 @@
   "A runtime SETQ of a special whose cell was baked at compile time, slow arm
    (a value that may be an in-module closure): on an unarmed image store into
    the cell, else %GV-SET (this thread's binding first)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-val) %gv-val)
       (%gv-set %gv-key %gv-val)))
 

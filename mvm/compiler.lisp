@@ -13992,7 +13992,7 @@
          (site (and (not cell) (not slot) (%let-special-site spec k))))
     (cond (cell `(%dynbind-cell (quote ,cell) ,k ,tmp))
           ((and slot (eql k (%global-name-key spec)))
-           `(if (eql (mem-ref #x10000DB8 :u32) 0)
+           `(if ,(%shallow-thread-form)
                 (%gv-setq-global (quote ,spec) ,tmp)
                 (%dynbind-c ,k ,tmp ,slot)))
           (slot `(%dynbind-c ,k ,tmp ,slot))
@@ -14132,7 +14132,7 @@
                               (site (and (not cell) (not slot) (%let-special-site spec k))))
                          (cond (cell `(%dynunbind-cell (quote ,cell) ,k ,sv))
                                ((and slot (eql k (%global-name-key spec)))
-                                `(if (eql (mem-ref #x10000DB8 :u32) 0)
+                                `(if ,(%shallow-thread-form)
                                      (%gv-setq-global (quote ,spec) ,sv)
                                      (%dynunbind-c ,k ,sv ,slot)))
                                (slot `(%dynunbind-c ,k ,sv ,slot))
@@ -15351,6 +15351,60 @@
     (or (= n 0)
         (and (= n 1) (%setq-direct-spine-ok var val env)))))
 
+;;; ============================================================
+;;; THE ARMED MAIN THREAD BINDS SHALLOWLY -- AND MAY USE THE CELL
+;;; ============================================================
+;;;
+;;; Every fast path below (the cached and baked reads, the in-place SETQ, the
+;;; LET save / bind / restore through a cell) used to be guarded by the
+;;; threads-live word alone: once ANY thread had been started, EVERY thread
+;;; took the slow arm.  But the slow arm exists for one reason -- a WORKER's
+;;; dynamic bindings live in that thread's own storage, which the globals pair
+;;; cannot see -- and the main thread of an armed image has no such storage:
+;;; its window base is zero, %DYNB-BLOCK answers 0, and %DYNBIND binds it
+;;; shallowly in the globals pair exactly as before threads existed.  For that
+;;; thread the pair IS the binding, so the fast arm is the right answer, not
+;;; merely a faster one.  The test is therefore "unarmed, or this thread has
+;;; no binding block" -- the same question %DYNBIND asks, with %DYNB-BLOCK's
+;;; self-slot reads inlined (#x10000C30/#x10000C34 are WINDOW slots: through
+;;; the window they answer about THIS thread, and main's are BSS zero).
+;;; An unarmed image pays what it did: one 32-bit load and a (now taken)
+;;; branch.  Measured on main after one thread had run: a 26-special LET
+;;; ~100x slower and a special read ~6x slower than before any thread, both
+;;; back to within noise of unarmed (test/main-bind-armed.lisp).  The price is
+;;; the armed arm's self-slot load at every inline site: ~0.8 MB of native
+;;; code in the x64 CLI image (+1.4%), down from 2.3 MB for the first shape
+;;; (two half-word loads, LI+CMP instead of CMP-IMM).
+(defun %shallow-thread-form ()
+  "A source form that is true when THIS thread binds specials shallowly in the
+   globals pairs: threads were never declared, or this thread has no binding
+   block (the main thread).  See THE ARMED MAIN THREAD BINDS SHALLOWLY."
+  '(or (eql (mem-ref #x10000DB8 :u32) 0)
+       (and (eql (mem-ref #x10000C30 :u32) 0)
+            (eql (mem-ref #x10000C34 :u32) 0))))
+
+(defun %emit-shallow-thread-gate (a b slow)
+  "Emit IR that falls through when THIS thread binds shallowly (see THE ARMED
+   MAIN THREAD BINDS SHALLOWLY) and branches to SLOW otherwise -- i.e. when
+   threads are armed AND this thread has a per-thread binding block.  A and B
+   are scratch registers; both are clobbered."
+  (let ((fast (make-compiler-label)))
+    (emit-li-tagged a (conv-real #x10000DB8))
+    (emit-ir :shr a a +fixnum-shift+)
+    (emit-ir :load b a (%tls-width (car (memory-width-code :u32)) #x10000DB8))
+    (emit-ir :cmp-imm b 0)
+    (emit-ir :beq fast)
+    ;; Armed: the whole self slot in ONE raw word load (%DYNB-BLOCK reads it
+    ;; as two tagged halves only because a tagged :U64 MEM-REF is not exact;
+    ;; an IR load compared with zero is).  One sequence, not two: every
+    ;; inline special read carries this, and the second cost ~1 MB of code.
+    (emit-li-tagged a (conv-real #x10000C30))
+    (emit-ir :shr a a +fixnum-shift+)
+    (emit-ir :load b a (%tls-width (car (memory-width-code :u64)) #x10000C30))
+    (emit-ir :cmp-imm b 0)
+    (emit-ir :bne slow)
+    (emit-ir-label fast)))
+
 (defvar *let-special-sites* nil
   "Alist (KEY . site cons): ONE cell cache per special variable for every
    runtime-compiled read, save, bind and restore of it that had no cell at
@@ -15358,8 +15412,8 @@
 
 (defun %site-fast (site fast slow)
   "A per-site special access (see %GV-SITE-CELL) with its common case inline:
-   once SITE's car holds the variable's cell and the image has not armed
-   threads (the word %RT-ENTER and %DYNBIND test), FAST -- a form over the
+   once SITE's car holds the variable's cell and this thread binds
+   shallowly (%SHALLOW-THREAD-FORM: unarmed, or the main thread), FAST -- a form over the
    variable C, the cell -- else SLOW, the out-of-line call that also fills the
    site.  Each access used to be that call, which itself called
    %GV-SITE-CELL: two calls per read, bind and unbind of a special defined
@@ -15368,7 +15422,7 @@
    (The READ is emitted as IR instead: %COMPILE-GLOBAL-READ-BAKED.)"
   (let ((c (%mvm-gensym "SITEC")))
     `(let ((,c (car (quote ,site))))
-       (if (and ,c (eql (mem-ref #x10000DB8 :u32) 0))
+       (if (and ,c ,(%shallow-thread-form))
            ,(subst c 'c fast)
            ,slow))))
 
@@ -15548,16 +15602,12 @@
           (want (alloc-temp-reg)))
      (unless call-only
       ;; THREADS FIRST.  A worker's dynamic binding lives in that thread's own
-      ;; storage, not in the pair, so once the image has armed threads (the
-      ;; word %RT-ENTER, %DYNBIND and the baked-cell read test) the read goes
-      ;; to the miss arm, where %GV-REF-FILL hands it to %GV-REF.  One 32-bit
-      ;; load and a branch, as %COMPILE-GLOBAL-READ-BAKED pays.
-      (emit-li-tagged dest (conv-real #x10000DB8))
-      (emit-ir :shr dest dest +fixnum-shift+)
-      (emit-ir :load cell dest (%tls-width (car (memory-width-code :u32))
-                                           #x10000DB8))
-      (emit-ir :cmp-imm cell 0)
-      (emit-ir :bne miss)
+      ;; storage, not in the pair, so on an armed WORKER the read goes to the
+      ;; miss arm, where %GV-REF-FILL hands it to %GV-REF.  The MAIN thread of
+      ;; an armed image has no per-thread bindings and reads the cache like an
+      ;; unarmed one (%EMIT-SHALLOW-THREAD-GATE).  Unarmed: one 32-bit load
+      ;; and a branch, as %COMPILE-GLOBAL-READ-BAKED pays.
+      (%emit-shallow-thread-gate dest cell miss)
       ;; cell = [+GV-CACHE-ROOT+]  (the cache vector, or 0 before boot built it)
       (emit-li-tagged cell (conv-real +gv-cache-root+))
       (emit-ir :shr cell cell +fixnum-shift+)
@@ -15715,13 +15765,7 @@
     (let ((w (alloc-temp-reg)))
       ;; w = (mem-ref #x10000DB8 :u32); DEST is the second scratch until the
       ;; result lands in it.
-      (emit-li-tagged dest (conv-real #x10000DB8))
-      (emit-ir :shr dest dest +fixnum-shift+)
-      (emit-ir :load w dest (%tls-width (car (memory-width-code :u32))
-                                        #x10000DB8))
-      (emit-ir :li dest 0)
-      (emit-ir :cmp w dest)
-      (emit-ir :bne slow)
+      (%emit-shallow-thread-gate dest w slow)
       (if site
           ;; THE PER-SITE CACHE (see %GV-SITE-CELL): SITE's car is the cell
           ;; once found, NIL until then, which takes the slow arm (it fills).
@@ -15807,19 +15851,15 @@
         ;; worker's value after the worker is gone.  Measured as bits 16 and
         ;; 32 of test/hosted-dynbind.lisp and its *DA*-on-main check.  The
         ;; armed arm calls %GV-SET, which consults this thread's bindings
-        ;; first; an unarmed image pays one 32-bit load and a compare.
+        ;; first; an unarmed image pays one 32-bit load and a compare, and
+        ;; the armed MAIN thread stores in place too
+        ;; (%EMIT-SHALLOW-THREAD-GATE).
         ((and cell (or (/= dest +vreg-vr+) (< *temp-reg-counter* 5)))
          (let ((tmp (alloc-temp-reg))
                (zed (alloc-temp-reg))
                (slow (make-compiler-label))
                (done (make-compiler-label)))
-           (emit-li-tagged tmp (conv-real #x10000DB8))
-           (emit-ir :shr tmp tmp +fixnum-shift+)
-           (emit-ir :load tmp tmp (%tls-width (car (memory-width-code :u32))
-                                              #x10000DB8))
-           (emit-ir :li zed 0)
-           (emit-ir :cmp tmp zed)
-           (emit-ir :bne slow)
+           (%emit-shallow-thread-gate zed tmp slow)
            ;; ONLY A FIXNUM OR NIL IS STORED IN PLACE.  Anything else may be,
            ;; or hold, an in-module lambda (a #x52 closure whose slot 0 is
            ;; THIS module's bytecode offset), and only the %GV-SET bridge call
@@ -15888,12 +15928,7 @@
            (when islot
              (let ((a (alloc-temp-reg)) (b (alloc-temp-reg)) (c (alloc-temp-reg))
                    (dest (or vreg-copy dest)))
-               (emit-li-tagged a (conv-real #x10000DB8))
-               (emit-ir :shr a a +fixnum-shift+)
-               (emit-ir :load b a (%tls-width (car (memory-width-code :u32)) #x10000DB8))
-               (emit-ir :li a 0)
-               (emit-ir :cmp b a)
-               (emit-ir :bne inline-slow)
+               (%emit-shallow-thread-gate a b inline-slow)
                (emit-li-tagged a (conv-real +gv-cache-root+))
                (emit-ir :shr a a +fixnum-shift+)
                (emit-ir :load a a (%tls-width (car (memory-width-code :u64)) +gv-cache-root+))

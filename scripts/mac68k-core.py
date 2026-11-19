@@ -40,7 +40,7 @@ REPO = os.path.dirname(HERE)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
-    'quadra':    (0x00600000, 0x01000000, 0x01080000, 0x012C0000, 0x20000),   # JIT area, cache, stack, NIL's page between
+    'quadra':    (0x00600000, 0x00E80000, 0x00F00000, 0x01140000, 0x20000),   # JIT area, cache, stack, NIL's page between
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
@@ -54,7 +54,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION = LOAD + SHIFT, STATIC_LO + SHIFT, STATIC_HI 
 CHAIN_MEMTOP = {'classicos': 0x00400000, 'quadra': 0x02000000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 # the layout's kind map when its young heap is last in the map (boot-mac68k
 # :QUADRA): the application's loader then sizes the heap from its partition
-KMAP = {'quadra': 0x016F0000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
+KMAP = {'quadra': 0x01570000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 KMAP = KMAP and KMAP + SHIFT
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk
@@ -402,6 +402,13 @@ def main(image, disk):
     top = max(REGION + LOW_BLOCK, nclo + len(conses))
     chunk = bytearray(top - LOAD)
     chunk[:resident] = img[:resident]
+    # what the static heap does not cover of the init-only text and the boot
+    # tail (cross.lisp *POOL-INIT-ONLY*, compiler.lisp *BOOT-TAIL-LAST*) is dead
+    # once the core is saved: zeroed, so the disk carries no stale code (and
+    # two builds a shift apart agree there, for mac68k-reloc-disk.py)
+    if static_lo is not None:
+        dead_lo = static_lo - LOAD
+        chunk[dead_lo:resident] = bytes(max(0, resident - dead_lo))
     chunk[nolo - LOAD:nolo - LOAD + len(objs)] = objs
     chunk[nclo - LOAD:nclo - LOAD + len(conses)] = conses
     chunk[REGION - LOAD:REGION - LOAD + LOW_BLOCK] = low

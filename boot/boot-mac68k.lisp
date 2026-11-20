@@ -149,10 +149,14 @@
     ;; shift carries #xF00000 to #x1000000, and the image's source text spells
     ;; layout addresses in hex, so the pool grew a word and every address after
     ;; it moved -- differences the relocation table cannot describe.
-    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 6B0000 (6F0000 with
+    ;; THE APPLICATION'S SPAN (mac68k-reloc-disk.py's SPAN): 550000 -- the low
+    ;; block's end, then what HSIZE needs for two 128 KB semispaces (its HMIN:
+    ;; every benchmark form runs in them, 2026-11-20; the old 512 KB floor was
+    ;; a guess from an older bug), the guard, the kind map and a 256 KB code
+    ;; area.  (6B0000 with a 512 KB floor and slack, 6F0000 with
     ;; the boot tail in the map, 800000
     ;; before the keep-list was measured on the Mac, 860000 with a stack of its own, BC0000 before cold native code, D30000 while the JIT area was in the map).  Its
-    ;; minimum partition is SPAN + 576 KB = 7,424 KB, measured (SPAN + 1.5 MB
+    ;; minimum partition is SPAN + 576 KB = 6,016 KB, measured (SPAN + 1.5 MB
     ;; while the relocating load aligned to 512 KB: mac68k-chain.py SIZE-RSRC).
     ;; COLD NATIVE CODE (2026-11-19, compiler.lisp *COLD-KEEP*): the functions a
     ;; coverage run never entered stay on the disk until their first call, so

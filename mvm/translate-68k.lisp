@@ -5023,7 +5023,10 @@
         (m68k-emit-movem-from-postinc buf restore)
         (m68k-emit-rts buf)
         (here exhausted)
-        (m68k-emit-die buf (format nil "modus: heap exhausted (raise --dynamic-space-size)~%") 3))
+        (m68k-emit-die buf (if *68k-mac-mode*
+                               (format nil "Modus: out of memory (Get Info: give it a bigger partition)~%")
+                               (format nil "modus: heap exhausted (raise --dynamic-space-size)~%"))
+                       3))
       ;; ================= SCAN (A0 = slot address) =================
       (let ((ret (lbl)) (isptr (lbl)) (kobj (lbl)) (kok (lbl)) (notfwd (lbl))
             (obj (lbl)) (ovf (lbl)) (cl (lbl)))

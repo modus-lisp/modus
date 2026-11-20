@@ -45,6 +45,9 @@
         .ifndef JITMAX                      | (mac68k-chain.py MAC68K_CHAIN_DEFS can
         .equ    JITMAX, 0x400000            |  set these: a measuring run's bigger
         .endif                              |  area)  4 MB
+        .ifndef HMIN
+        .equ    HMIN, 0x20000               | the smallest semispace HSIZE accepts
+        .endif
         .ifndef JITSHIFT
         .equ    JITSHIFT, 3                 | an eighth of the room
         .endif
@@ -375,7 +378,7 @@ hsize:  tst.l   44(%a2)
         divu.w  #9, %d2
         and.l   #0xFFFF, %d2
         swap    %d2                     | HALF
-        cmp.l   #0x80000, %d2           | 512 KB: a first DEFUN bombed in 256 KB ones
+        cmp.l   #HMIN, %d2              | 128 KB: every benchmark form runs (MAME, 2026-11-20)
         blo     8f
         move.l  %d2, HHALF(%a6)
         add.l   %d2, %d2

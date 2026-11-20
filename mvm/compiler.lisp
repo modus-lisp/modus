@@ -9070,6 +9070,17 @@
     ;; a still-numerically-correct small bignum; CL code cannot observe the
     ;; representation difference (EQL/arithmetic identical).  Shared file: gate
     ;; before landing on main.
+    ;; A FIXNUM below CT-FIXNUM-MIN: -(MOST-POSITIVE-FIXNUM + 1), whose word is
+    ;; 100...0.  Native arithmetic makes it ((ASH -1 30) on a 30-bit tower: the
+    ;; SHL / SAR / CMP check passes), and so does the interpreter, which holds
+    ;; words as native code does; the reader makes the same number a BIGNUM.  At
+    ;; run time it can reach here as a literal -- (EVAL `(THE (VALUES) ',X)),
+    ;; ANSI THE.3-11 and TYPECASE.19 on every 30-bit port -- and the bignum path
+    ;; below would read its slots.  Its own word is what to load.  Only at run
+    ;; time: an image compile's literal comes from the reader, a bignum here and
+    ;; on the host alike (the DDCs compare the two).
+    ((and *mvm-eval-runtime-p* (typep value 'fixnum) (< value (ct-fixnum-min)))
+     (emit-li-tagged dest value))
     ((and (>= value (ct-fixnum-min)) (<= value (ct-fixnum-max)))
      ;; Fixnum range.  emit-li-tagged keeps the host path as `(:li (ash value 1))`
      ;; but uses fixnum-safe halves in-image (value<<1 overflows there for the

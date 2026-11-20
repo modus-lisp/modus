@@ -947,6 +947,15 @@
 (defun sb-ext:float-infinity-p (x)
   (and (floatp x) (= x x) (> (abs x) most-positive-double-float)))
 
+;; SB-EXT:*POSIX-ARGV* IS CLI-TOPLEVEL'S *POSIX-ARGV*: the same symbol, so a read sees what the
+;; command line held (element 0 the program, SBCL's own options dropped) and a SETF or LET of it
+;; is seen by both names.  It used to exist only as MODUS-INT::*POSIX-ARGV*, so every
+;; `sb-ext:*posix-argv*' in portable code read as an unbound fresh symbol.
+(let ((s (find-symbol "*POSIX-ARGV*" (symbol-package '%cli-collect-argv))))
+  (when (and s (not (find-symbol "*POSIX-ARGV*" "SB-EXT")))
+    (import s "SB-EXT")
+    (export s "SB-EXT")))
+
 (defun sb-ext:get-time-of-day ()
   "(values seconds microseconds) since the Unix epoch, both halves from ONE CLOCK_REALTIME reading,
    as gettimeofday(2) gives them.  The microseconds used to come from the monotonic clock while the

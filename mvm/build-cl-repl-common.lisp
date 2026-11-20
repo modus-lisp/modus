@@ -194,15 +194,17 @@
   (let ((v (sb-ext:posix-getenv "MODUS_PC_CONSOLE")))
     (cond ((and v (string= v "0")) nil)
           ((and v (plusp (length v))) t)
-          ;; default: the UEFI image (the T420 boots it from USB and needs its
-          ;; screen and keyboard), but not in SEV-SNP mode, whose guest must
-          ;; not touch the PS/2 ports
+          ;; default: the bare i386 image (a PC without a serial port -- a
+          ;; T420 has none -- is its screen and keyboard), and the UEFI image
+          ;; (the T420 boots it from USB), but not in SEV-SNP mode, whose guest
+          ;; must not touch the PS/2 ports
+          (*cl-repl-i386-p* t)
           (t (and *cl-repl-uefi-p*
                   (let ((snp (sb-ext:posix-getenv "MODUS_UEFI_SNP")))
                     (or (null snp) (string= snp "") (string= snp "0")))))))
-  "Bake net/pc-console.lisp into a bare x86-64 image: VGA text + (UEFI) GOP
+  "Bake net/pc-console.lisp into a bare x86 image: VGA text + (UEFI) GOP
    output, PS/2 keyboard input, beside COM1.  MODUS_PC_CONSOLE=1 / =0
-   overrides the default (on for UEFI unless SEV-SNP).")
+   overrides the default (on for bare i386, and for UEFI unless SEV-SNP).")
 
 (defun %pc-console-text ()
   "net/pc-console.lisp with the data it reads: boot/boot-uefi-x64.lisp's 8x8
@@ -591,7 +593,7 @@
         "")
     ;; The PC console (x86-64): after serial-repl, whose console seams it
     ;; replaces by last-defun-wins.
-    (if (and *cl-repl-x64-p* *pc-console-p*) (%pc-console-text) "")
+    (if (and (or *cl-repl-x64-p* *cl-repl-i386-p*) *pc-console-p*) (%pc-console-text) "")
     (if *cl-repl-mac68k-p* (%mac-console-text) "")
     ;; A board net build carries net/usb-hid-split.lisp, which is spliced
     ;; BEFORE this text: its console must be bound HERE, after serial-repl's
@@ -2138,7 +2140,7 @@
   (format t "~&;; CONSOLE: the Mac's screen, 8x8 font, beside serial port A (mac/mac-console.lisp)~%"))
 
 ;; The PC console draws every WRITE-CHAR-SERIAL on the screen too.
-(when (and *cl-repl-x64-p* *pc-console-p*)
+(when (and (or *cl-repl-x64-p* *cl-repl-i386-p*) *pc-console-p*)
   (setq modus.mvm::*write-char-serial-hook* 'modus.mvm::%console-write-char)
   (format t "~&;; CONSOLE: VGA text~A + PS/2 keyboard, beside COM1 (net/pc-console.lisp)~%"
           (if *cl-repl-uefi-p* " + GOP framebuffer" "")))

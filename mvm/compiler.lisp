@@ -303,8 +303,16 @@
 ;;;
 ;;; So the hosted scheduler lock lives in the BSS, at a fixed address, in the
 ;;; same documented gap the per-region table uses: the table is 16 entries at
-;;; 0x10000F08..0x10000F88 and the mode word is at 0x10000FF8, so
-;;; 0x10000FC0..0x10000FD8 (SMP-INIT zeroes three consecutive words) is free.
+;;; 0x10000F08..0x10000F88 and the mode word is at 0x10000FF8.  ONE WORD,
+;;; 0x10000FC0, is the lock's.  Its neighbours are NOT: 0x10000FC8 is the
+;;; region-0 stop-the-world flag on both back ends (+X64-STW-FLAG-ADDR+,
+;;; +A64-STW-FLAG-ADDR+) and 0x10000FD0 is AArch64's JIT constant-vector root
+;;; (*AARCH64-JIT-CONSTVEC-ROOT*).  net/actors.lisp's SMP-INIT zeroes lock+0,
+;;; +8 and +16 -- bare-metal boards reserve three lock words -- so the hosted
+;;; images override it (net/hosted-actors-post.lisp, SMP-INIT) to zero this
+;;; one word only.  Before that override every hosted actor bring-up wiped the
+;;; stop flag and, on AArch64, the constant-vector root, and the next
+;;; JIT-compiled QUOTE read through a zero root (MEMORY-FAULT at 0x32A7).
 ;;; BSS zero-fill means "unlocked" without anything having to initialise it.
 ;;;
 ;;; TWO PLACES MUST AGREE and a disagreement is an instant deadlock:
@@ -312,8 +320,9 @@
 ;;; mvm/build-generic-cli.lisp sets from this constant and then ratchets against
 ;;; the literal in that file.
 (defconstant +hosted-sched-lock-addr+ #x10000FC0
-  "BSS word the HOSTED actor scheduler's spinlock lives in.  Three words are
-   reserved (0x10000FC0/FC8/FD0) because SMP-INIT zeroes lock+0, +8 and +16.")
+  "BSS word the HOSTED actor scheduler's spinlock lives in.  ONE word: FC8 is
+   the stop-the-world flag and FD0 AArch64's JIT constant-vector root, which is
+   why the hosted SMP-INIT (net/hosted-actors-post.lisp) zeroes only this one.")
 
 ;;; ---- THE PER-COLLECTION SCRATCH BLOCK -----------------------------------
 ;;;

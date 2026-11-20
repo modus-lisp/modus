@@ -4,8 +4,8 @@
 ;;;; baked immediately BEFORE it, because a forward reference to an address
 ;;;; hook would resolve to the NIL sentinel.
 ;;;;
-;;;; One override (AP-SCHEDULER), one DELETED override (SPIN-LOCK — see below),
-;;;; and then the actor-level selftests for steps C and D.
+;;;; Two overrides (AP-SCHEDULER, SMP-INIT), one DELETED override (SPIN-LOCK —
+;;;; see below), and then the actor-level selftests for steps C and D.
 
 ;;; ============================================================
 ;;; SPIN-LOCK / SPIN-UNLOCK — REAL, as of native threads
@@ -62,6 +62,34 @@
     (%gc-write64 c (+ (%gc-read64 c) 1)))
   (set-current-actor 0)
   0)
+
+;;; ============================================================
+;;; SMP-INIT — one scheduler lock word, not three
+;;; ============================================================
+;;;
+;;; net/actors.lisp's SMP-INIT zeroes THREE words from SCHED-LOCK-ADDR (lock+0,
+;;; +8, +16): a bare-metal board reserves that many.  The hosted lock is the
+;;; single BSS word +HOSTED-SCHED-LOCK-ADDR+ (#x10000FC0, mvm/compiler.lisp),
+;;; and the two words after it belong to the runtime: #x10000FC8 is the
+;;; region-0 stop-the-world flag (both back ends) and #x10000FD0 is AArch64's
+;;; JIT constant-vector root.  Zeroing them let every actor bring-up clear a
+;;; stop flag another thread might be collecting under and, on AArch64, drop
+;;; the root every JIT-compiled QUOTE loads through: the next native toplevel
+;;; form read address 0x32A7 and the actor selftests died in MEMORY-FAULT-ERROR
+;;; (test/hosted-actors.lisp, hosted-thread-gc*.lisp, hosted-thread-actors.lisp,
+;;; hosted-actor-regions.lisp).  Everything else is net/actors.lisp's, as is.
+(defun smp-init ()
+  (let ((base (percpu-data-base)))
+    (setf (mem-ref base :u64) base)
+    (setf (mem-ref (+ base 8) :u64) 0)
+    (setf (mem-ref (+ base 16) :u64) 0)
+    (setf (mem-ref (+ base 24) :u64) 0)
+    (setf (mem-ref (+ base 32) :u64) 0)
+    (setf (mem-ref (+ base 56) :u64) (+ (percpu-data-base) #x2000)))
+  (setf (mem-ref (sched-lock-addr) :u64) 0)
+  (let ((cc (+ (sched-state-base) #x20)))
+    (setf (mem-ref cc :u64) 1))
+  1)
 
 ;;; ============================================================
 ;;; STEP 1 ACCEPTANCE — the lock, and who releases it

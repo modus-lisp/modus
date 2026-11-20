@@ -1,7 +1,7 @@
 ;;;; mac68k-unlzma.lisp -- the bare Mac's boot-disk loader: unpack a compressed
 ;;;; modus image to its load address and start it.
 ;;;;
-;;;; scripts/mac68k-floppy.py builds this with mvm/unlzma-core.lisp for the
+;;;; scripts/mac68k-floppy.lisp builds this with mvm/unlzma-core.lisp for the
 ;;;; :mac68k target, LINKED AT +LOADER+ (MODUS_MAC68K_LOAD_ADDR) rather than at
 ;;;; +mac68k-load-addr+, because that is where the image it unpacks goes.  The
 ;;;; boot blocks read loader and payload off the disk in one _Read to +LOADER+
@@ -22,7 +22,7 @@
 ;;;; NIL's page, all clear of both.  Below #x0F000000, so nothing here is
 ;;;; rebased with the runtime-data region.
 ;;;;
-;;;; Build (scripts/mac68k-floppy.py does it):
+;;;; Build (scripts/mac68k-floppy.lisp does it):
 ;;;;   MODUS_MAC68K_LOAD_ADDR=#x01200000 sbcl --script mvm/build-hosted.lisp \
 ;;;;     mac68k mvm/mac68k-unlzma.lisp mvm/unlzma-core.lisp
 ;;;; (in that order: the core reads this file's constants)

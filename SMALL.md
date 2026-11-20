@@ -226,8 +226,8 @@ probes identical to the untrimmed image.  The margin is 625 bytes.
 
 ## The same, as a Mac boot floppy
 
-    scripts/mac68k-floppy.py MAC-IMAGE DISK        # two 800 KB floppies, DISK-1 and DISK-2
-    scripts/mac68k-floppy.py MAC-IMAGE DISK --hd   # or one 1.44 MB floppy
+    sbcl --script scripts/mac68k-floppy.lisp MAC-IMAGE DISK        # two 800 KB floppies, DISK-1 and DISK-2
+    sbcl --script scripts/mac68k-floppy.lisp MAC-IMAGE DISK --hd   # or one 1.44 MB floppy
 
 Two 800 KB disks (818,176 + 421,699 bytes; 397 KB free on the second): disk
 1's boot blocks enter a 68000 stage 2 (`scripts/mac68k-disk2.s`) that reads

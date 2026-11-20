@@ -1,4 +1,4 @@
-| mac68k-disk2.s -- stage 2 of a two-disk Mac boot (scripts/mac68k-floppy.py).
+| mac68k-disk2.s -- stage 2 of a two-disk Mac boot (scripts/mac68k-floppy.lisp).
 |
 | The boot blocks read disk 1's share of the boot blob (loader, payload head,
 | this code, the first part of the LZMA stream) and jump HERE instead of to
@@ -17,7 +17,7 @@
 | GDevice's PixMap when Color QuickDraw is present (ROM85 $28E bit 14
 | clear), else 1.  Depths 1/8/16/32 drawn, others skipped.
 |
-| scripts/mac68k-floppy.py patches LOADER/DEST/LEN/SETID and the message
+| scripts/mac68k-floppy.lisp patches LOADER/DEST/LEN/SETID and the message
 | (MSGN glyphs of 8 row bytes at MSGBUF).
 |
 | Assemble: m68k-linux-gnu-as -m68000 -o s.o mac68k-disk2.s

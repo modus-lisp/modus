@@ -2213,6 +2213,249 @@
       (a64-load-tls-addr buf rd +a64-fault-rec-code-addr+ scratch)
       (a64-load-real-addr buf rd (conv-real #x10000CB0))))
 
+;;; A FAULT INSIDE A COLLECTION STOPS THE PROCESS -- translate-x64's section of
+;;; that name has the reasons.  The same window words: +0x5628 is non-zero
+;;; while THIS thread runs the collector (EMIT-AARCH64-NATIVE-GC-TRAMPOLINE,
+;;; from after its park handshake to before its release), +0x5630 the
+;;; test-only knob that makes this thread's next collection fault.
+(defconstant +a64-fault-rec-gc-addr+ #x10005628)
+(defconstant +a64-fault-rec-gc-test-addr+ #x10005630)
+(defconstant +a64-fault-in-gc-exit-code+ 71
+  "exit_group code of a fault inside a collection (translate-x64's
+   +FAULT-IN-GC-EXIT-CODE+).")
+
+(defun a64-emit-fault-record (buf)
+  "Fault stub: record this fault for %TAKE-PENDING-FAULT -- x0 the signal, x1
+   siginfo, x2 ucontext as the kernel passes them.  THIS thread's record
+   (code, si_addr, PC) where it is per thread, else the code at 0x10000CB0;
+   then #x0B0B in place of the signal for a stack overflow.  Leaves x16 = the
+   code word's address.  Clobbers x13, x17."
+  (a64-load-fault-code-addr buf +a64-x16+ +a64-x17+)
+  (if (a64-fault-rec-p)
+      (progn
+        (a64-mov-reg buf +a64-x17+ +a64-x0+)
+        (a64-emit buf #x2A1103F1)                       ; MOV w17, w17 (zero-extend)
+        (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)    ; code
+        (a64-ldur buf +a64-x17+ +a64-x1+ 16)            ; si_addr
+        (a64-str-unsigned buf +a64-x17+ +a64-x16+ 8)
+        (a64-ldr-unsigned buf +a64-x17+ +a64-x2+ 440)   ; uc_mcontext.pc
+        (a64-str-unsigned buf +a64-x17+ +a64-x16+ 16))
+      (a64-str-width buf +a64-x0+ +a64-x16+ 0 2))       ; STR w0
+  ;; A STACK OVERFLOW, as translate-x64 tells it: the fault address (si_addr,
+  ;; siginfo+16) lies within 64 KB of the interrupted SP (uc_mcontext.sp,
+  ;; ucontext+432: 40 bytes of header, the 128-byte sigmask, sigcontext
+  ;; aligned to 16 at +176 = fault_address, regs[31], sp).  A prologue's STP
+  ;; pre-index faults just below SP, its spill stores just above the new SP;
+  ;; the stack around SP is mapped, so a fault there is the stack's end (the
+  ;; main thread's rlimit, a worker's guard region -- net/hosted-sync,
+  ;; %THR-SLOT-STACK).  Record #x0B0B in place of the signal so
+  ;; %TAKE-PENDING-FAULT makes STACK-EXHAUSTED.  This stub runs at all only
+  ;; because SA_ONSTACK puts it on the thread's alternate stack (installed by
+  ;; trap #x0520 for main, by %THR-TRAMPOLINE for a worker).
+  (a64-ldur buf +a64-x13+ +a64-x1+ 16)           ; si_addr
+  (a64-ldr-unsigned buf +a64-x17+ +a64-x2+ 432)  ; interrupted SP
+  (a64-sub-reg buf +a64-x13+ +a64-x13+ +a64-x17+ 0 0)
+  (a64-movz buf +a64-x17+ 1 1)                   ; 64 KB
+  (a64-add-reg buf +a64-x13+ +a64-x13+ +a64-x17+ 0 0)
+  (a64-movz buf +a64-x17+ 2 1)                   ; 128 KB
+  (a64-cmp-reg buf +a64-x13+ +a64-x17+)
+  (a64-bcond buf +cc-cs+ 3)                      ; outside: not ours
+  (a64-movz buf +a64-x17+ #x0B0B 0)
+  (a64-str-width buf +a64-x17+ +a64-x16+ 0 2))   ; STR w17
+
+(defun a64-emit-fault-report (buf where suffix exit-code)
+  "Write one line about THIS thread's recorded fault to stderr and
+   exit_group(EXIT-CODE), from the fault stub (on the thread's alternate
+   stack, which it uses for the line):
+     modus: <what> WHERE on <the main thread | worker N> (tid T):
+            address #x.., pc #x..; SUFFIX
+   Needs this thread's record complete (A64-EMIT-FAULT-RECORD) and per thread
+   (A64-FAULT-REC-P).  Clobbers everything: it never returns.  Branches are
+   resolved here, by index, like the rest of the stub."
+  (let ((fixups nil) (marks nil) (n 0))
+    (labels ((here () (a64-current-index buf))
+             (new-label () (setq n (+ n 1)) n)
+             (place (l) (setq marks (cons (cons l (here)) marks)))
+             (jump (l kind &optional (cc 0) (reg 0))
+               (setq fixups (cons (list (here) l kind cc reg) fixups))
+               (a64-emit buf 0))
+             (lit (text)
+               ;; x5 := the bytes (ADR over a B), x6 := count; copy to [x3].
+               (let* ((bytes (map 'list #'char-code text))
+                      (len (length bytes))
+                      (words (floor (+ len 3) 4))
+                      (b-idx (here)))
+                 (a64-emit buf #x14000000)
+                 (let ((data-idx (here)))
+                   (dotimes (w words)
+                     (let ((word 0))
+                       (dotimes (k 4)
+                         (let ((i (+ (* w 4) k)))
+                           (when (< i len)
+                             (setq word (logior word (ash (nth i bytes) (* 8 k)))))))
+                       (a64-emit buf word)))
+                   (let ((code (a64-buffer-code buf)))
+                     (setf (aref code b-idx)
+                           (logior #x14000000 (logand (- (here) b-idx) #x3FFFFFF))))
+                   (let* ((adr-idx (here))
+                          (byte-off (* (- data-idx adr-idx) 4)))
+                     (a64-emit buf (logior #x10000000
+                                           (ash (logand byte-off 3) 29)
+                                           (ash (logand (ash byte-off -2) #x7FFFF) 5)
+                                           +a64-x5+))))
+                 (a64-movz buf +a64-x6+ len 0)
+                 (let ((top (here)))
+                   (a64-emit buf (logior #x38401400 (ash +a64-x5+ 5) +a64-x7+)) ; LDRB w7, [x5], #1
+                   (a64-emit buf (logior #x38001400 (ash +a64-x3+ 5) +a64-x7+)) ; STRB w7, [x3], #1
+                   (a64-emit buf (logior #xF1000400 (ash +a64-x6+ 5) +a64-x6+)) ; SUBS x6, x6, #1
+                   (a64-bcond buf +cc-ne+ (- top (here))))))
+             (dec ()
+               ;; x12 in decimal at [x3]: digits backwards from x4+500.
+               (a64-movz buf +a64-x13+ 10 0)
+               (a64-add-imm buf +a64-x6+ +a64-x4+ 500)
+               (a64-mov-reg buf +a64-x7+ +a64-x6+)
+               (let ((top (here)))
+                 (a64-emit buf (logior #x9AC00800 (ash +a64-x13+ 16) (ash +a64-x12+ 5) +a64-x14+)) ; UDIV x14, x12, x13
+                 (a64-emit buf (logior #x9B008000 (ash +a64-x13+ 16) (ash +a64-x12+ 10)
+                                       (ash +a64-x14+ 5) +a64-x15+))                       ; MSUB x15, x14, x13, x12
+                 (a64-add-imm buf +a64-x15+ +a64-x15+ 48)
+                 (a64-emit buf (logior #x381FFC00 (ash +a64-x7+ 5) +a64-x15+))  ; STRB w15, [x7, #-1]!
+                 (a64-mov-reg buf +a64-x12+ +a64-x14+)
+                 (a64-emit buf (logior #xB5000000 (ash (logand (- top (here)) #x7FFFF) 5) +a64-x12+))) ; CBNZ x12
+               (let ((top (here)))
+                 (a64-emit buf (logior #x38401400 (ash +a64-x7+ 5) +a64-x15+)) ; LDRB w15, [x7], #1
+                 (a64-emit buf (logior #x38001400 (ash +a64-x3+ 5) +a64-x15+)) ; STRB w15, [x3], #1
+                 (a64-cmp-reg buf +a64-x7+ +a64-x6+)
+                 (a64-bcond buf +cc-ne+ (- top (here)))))
+             (hex ()
+               ;; x12 in hex, no leading zeros, at [x3].
+               (lit "#x")
+               (a64-movz buf +a64-x13+ 60 0)
+               (a64-movz buf +a64-x14+ 0 0)
+               (let ((top (here)) (emit (new-label)) (next (new-label)) (digit (new-label)) (store (new-label)))
+                 (a64-emit buf (logior #x9AC02400 (ash +a64-x13+ 16) (ash +a64-x12+ 5) +a64-x15+)) ; LSRV x15, x12, x13
+                 (a64-emit buf #x92400DEF)                                       ; AND x15, x15, #15
+                 (jump emit :cbnz 0 +a64-x14+)
+                 (jump emit :cbnz 0 +a64-x15+)
+                 (jump next :cbnz 0 +a64-x13+)
+                 (place emit)
+                 (a64-movz buf +a64-x14+ 1 0)
+                 (a64-cmp-imm buf +a64-x15+ 10)
+                 (jump digit :bcond +cc-cc+)
+                 (a64-add-imm buf +a64-x15+ +a64-x15+ 55)
+                 (jump store :b)
+                 (place digit)
+                 (a64-add-imm buf +a64-x15+ +a64-x15+ 48)
+                 (place store)
+                 (a64-emit buf (logior #x38001400 (ash +a64-x3+ 5) +a64-x15+)) ; STRB w15, [x3], #1
+                 (place next)
+                 (a64-emit buf (logior #xF1001000 (ash +a64-x13+ 5) +a64-x13+)) ; SUBS x13, x13, #4
+                 (a64-bcond buf 5 (- top (here)))))                          ; B.PL top
+             (record (rd)
+               (a64-load-tls-addr buf rd +a64-fault-rec-code-addr+ +a64-x17+)))
+      (a64-sub-imm buf +a64-sp+ +a64-sp+ 512)
+      (a64-add-imm buf +a64-x4+ +a64-sp+ 0)
+      (a64-add-imm buf +a64-x3+ +a64-sp+ 0)
+      (lit (format nil "~%modus: "))
+      ;; what
+      (let ((done (new-label)))
+        (dolist (k '((#x0B0B . "stack exhausted (the control stack overflowed)")
+                     (#x0F0F . "handler-frame stack exhausted")
+                     (11 . "memory fault (SIGSEGV)")
+                     (7 . "bus error (SIGBUS)")
+                     (8 . "arithmetic fault (SIGFPE)")
+                     (4 . "illegal instruction (SIGILL)")))
+          (let ((next (new-label)))
+            (record +a64-x16+)
+            (a64-ldr-unsigned buf +a64-x12+ +a64-x16+ 0)
+            (a64-movz buf +a64-x13+ (car k) 0)
+            (a64-cmp-reg buf +a64-x12+ +a64-x13+)
+            (jump next :bcond +cc-ne+)
+            (lit (cdr k))
+            (jump done :b)
+            (place next)))
+        (lit "hardware fault (signal ")
+        (record +a64-x16+)
+        (a64-ldr-unsigned buf +a64-x12+ +a64-x16+ 0)
+        (dec)
+        (lit ")")
+        (place done))
+      (lit (format nil " ~A on " where))
+      ;; which thread: delta 0 is main; else the slot whose window block this
+      ;; is (net/hosted-sync %THR-TLS-BLOCK: page + 0x94000 + slot*0x11000).
+      (let ((worker (new-label)) (anon (new-label)) (thr-done (new-label)))
+        (a64-load-thread-delta buf +a64-x12+)
+        (jump worker :cbnz 0 +a64-x12+)
+        (lit "the main thread")
+        (jump thr-done :b)
+        (place worker)
+        (a64-load-real-addr buf +a64-x13+ (conv-real #x10000000))
+        (a64-add-reg buf +a64-x12+ +a64-x12+ +a64-x13+ 0 0)
+        (a64-load-real-addr buf +a64-x13+ (conv-real #x10000DA8))
+        (a64-ldr-unsigned buf +a64-x13+ +a64-x13+ 0)
+        (a64-load-imm64 buf +a64-x14+ #x94000)
+        (a64-add-reg buf +a64-x13+ +a64-x13+ +a64-x14+ 0 0)
+        (a64-emit buf (logior #xEB000000 (ash +a64-x13+ 16) (ash +a64-x12+ 5) +a64-x12+)) ; SUBS x12, x12, x13
+        (jump anon :bcond +cc-cc+)
+        (a64-load-imm64 buf +a64-x13+ #x11000)
+        (a64-emit buf (logior #x9AC00800 (ash +a64-x13+ 16) (ash +a64-x12+ 5) +a64-x12+)) ; UDIV x12, x12, x13
+        (a64-cmp-imm buf +a64-x12+ 16)
+        (jump anon :bcond +cc-cs+)
+        (lit "worker ")
+        (dec)
+        (jump thr-done :b)
+        (place anon)
+        (lit "a worker thread")
+        (place thr-done))
+      (lit " (tid ")
+      (a64-movz buf +a64-x8+ 178 0)                     ; gettid
+      (a64-svc buf 0)
+      (a64-mov-reg buf +a64-x12+ +a64-x0+)
+      (dec)
+      (lit "): address ")
+      (record +a64-x16+)
+      (a64-ldr-unsigned buf +a64-x12+ +a64-x16+ 8)
+      (hex)
+      (lit ", pc ")
+      (record +a64-x16+)
+      (a64-ldr-unsigned buf +a64-x12+ +a64-x16+ 16)
+      (hex)
+      (lit (format nil "; ~A~%" suffix))
+      (a64-movz buf +a64-x0+ 2 0)
+      (a64-add-imm buf +a64-x1+ +a64-x4+ 0)
+      (a64-sub-reg buf +a64-x2+ +a64-x3+ +a64-x4+ 0 0)
+      (a64-movz buf +a64-x8+ 64 0)                      ; write
+      (a64-svc buf 0)
+      (a64-movz buf +a64-x0+ exit-code 0)
+      (a64-movz buf +a64-x8+ 94 0)                      ; exit_group
+      (a64-svc buf 0)
+      ;; resolve
+      (let ((code (a64-buffer-code buf)))
+        (dolist (f fixups)
+          (let* ((idx (first f))
+                 (target (cdr (assoc (second f) marks)))
+                 (off (- target idx)))
+            (setf (aref code idx)
+                  (cond ((eq (third f) :b) (logior #x14000000 (logand off #x3FFFFFF)))
+                        ((eq (third f) :bcond)
+                         (logior #x54000000 (ash (logand off #x7FFFF) 5) (fourth f)))
+                        (t (logior #xB5000000 (ash (logand off #x7FFFF) 5) (fifth f)))))))))))
+
+(defun a64-emit-gc-fault-check (buf)
+  "Fault stub, right after A64-EMIT-FAULT-RECORD: a fault while THIS thread
+   runs the collector (window word +0x5628) stops the process with a line
+   saying so (A FAULT INSIDE A COLLECTION STOPS THE PROCESS).  Clobbers x17."
+  (when (a64-fault-rec-p)
+    (a64-load-tls-addr buf +a64-x17+ +a64-fault-rec-gc-addr+ +a64-x13+)
+    (a64-ldr-unsigned buf +a64-x17+ +a64-x17+ 0)
+    (let ((skip (a64-current-index buf)))
+      (a64-emit buf 0)                                  ; CBZ x17, skip
+      (a64-emit-fault-report buf "inside a garbage collection"
+                             "the heap is half-copied and cannot be trusted; stopping."
+                             +a64-fault-in-gc-exit-code+)
+      (setf (aref (a64-buffer-code buf) skip)
+            (logior #xB4000000 (ash (logand (- (a64-current-index buf) skip) #x7FFFF) 5) +a64-x17+)))))
+
 (defconstant +sysreg-tpidr-el0+   #xDE82 "TPIDR_EL0: S3_3_C13_C0_2")
 (defconstant +sysreg-tpidrro-el0+ #xDE83 "TPIDRRO_EL0: S3_3_C13_C0_3")
 
@@ -4298,6 +4541,15 @@
                   ;; ============================================================
                   (let ((stub-start-idx (a64-current-index buf)))
 
+                    ;; THIS thread's fault record first, where it is per thread
+                    ;; (THE FAULT RECORD IS PER THREAD), so every path below --
+                    ;; the handler, a fault inside a collection, no handler --
+                    ;; has it; and a fault in this thread's collector stops
+                    ;; here (A FAULT INSIDE A COLLECTION STOPS THE PROCESS).
+                    (when (a64-fault-rec-p)
+                      (a64-emit-fault-record buf)
+                      (a64-emit-gc-fault-check buf))
+
                     ;; x9/x10/x11 = saved SP / FP / PC.
                     ;; THIS thread's slots (the fault is delivered on the
                     ;; faulting thread; its delta register is intact).
@@ -4313,44 +4565,9 @@
                       (a64-emit buf (logior #xB4000000 9))    ; CBZ x9
                       ;; Record the signal (x0) for %TAKE-PENDING-FAULT: the
                       ;; handler-case dispatch builds the condition from it.
-                      ;; Threaded: THIS thread's record, with the fault address
-                      ;; and PC (THE FAULT RECORD IS PER THREAD); else the
+                      ;; Per thread, it was recorded above; else the
                       ;; process-global word, moved with the region.
-                      (a64-load-fault-code-addr buf +a64-x16+ +a64-x17+)
-                      (if (a64-fault-rec-p)
-                          (progn
-                            (a64-mov-reg buf +a64-x17+ +a64-x0+)
-                            (a64-emit buf #x2A1103F1)                       ; MOV w17, w17 (zero-extend)
-                            (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)    ; code
-                            (a64-ldur buf +a64-x17+ +a64-x1+ 16)            ; si_addr
-                            (a64-str-unsigned buf +a64-x17+ +a64-x16+ 8)
-                            (a64-ldr-unsigned buf +a64-x17+ +a64-x2+ 440)   ; uc_mcontext.pc
-                            (a64-str-unsigned buf +a64-x17+ +a64-x16+ 16))
-                          (a64-str-width buf +a64-x0+ +a64-x16+ 0 2)) ; STR w0
-                      ;; A STACK OVERFLOW, as translate-x64 tells it: the fault
-                      ;; address (si_addr, siginfo+16) lies within 64 KB of the
-                      ;; interrupted SP (uc_mcontext.sp, ucontext+432: 40 bytes
-                      ;; of header, the 128-byte sigmask, sigcontext aligned to
-                      ;; 16 at +176 = fault_address, regs[31], sp).  A prologue's
-                      ;; STP pre-index faults just below SP, its spill stores
-                      ;; just above the new SP; the stack around SP is mapped,
-                      ;; so a fault there is the stack's end (the main thread's
-                      ;; rlimit, a worker's guard region -- net/hosted-sync,
-                      ;; %THR-SLOT-STACK).  Record #x0B0B in place of the signal
-                      ;; so %TAKE-PENDING-FAULT makes STACK-EXHAUSTED.  This stub
-                      ;; runs at all only because SA_ONSTACK puts it on the
-                      ;; thread's alternate stack (installed below for main, by
-                      ;; %THR-TRAMPOLINE for a worker).
-                      (a64-ldur buf +a64-x13+ +a64-x1+ 16)           ; si_addr
-                      (a64-ldr-unsigned buf +a64-x17+ +a64-x2+ 432)  ; interrupted SP
-                      (a64-sub-reg buf +a64-x13+ +a64-x13+ +a64-x17+ 0 0)
-                      (a64-movz buf +a64-x17+ 1 1)                   ; 64 KB
-                      (a64-add-reg buf +a64-x13+ +a64-x13+ +a64-x17+ 0 0)
-                      (a64-movz buf +a64-x17+ 2 1)                   ; 128 KB
-                      (a64-cmp-reg buf +a64-x13+ +a64-x17+)
-                      (a64-bcond buf +cc-cs+ 3)                      ; outside: not ours
-                      (a64-movz buf +a64-x17+ #x0B0B 0)
-                      (a64-str-width buf +a64-x17+ +a64-x16+ 0 2)    ; STR w17
+                      (unless (a64-fault-rec-p) (a64-emit-fault-record buf))
                       ;; The recovered-fault COUNT at 0x10000CA0, as on x64:
                       ;; %HC-FAULT-FIXUP compares it with the last count it
                       ;; saw to tell a fresh fault (the shared-store guard's
@@ -9563,6 +9780,13 @@
     ;; STOP-THE-WORLD: park for another thread's region-0 collection, and a
     ;; safepoint poll that found nothing to do returns here.
     (emit-aarch64-stw-entry buf park early-return)
+    ;; THIS THREAD IS COLLECTING (A FAULT INSIDE A COLLECTION STOPS THE
+    ;; PROCESS): from here to the release the heap is not one a handler may
+    ;; resume on.  x16/x17 are saved scratch.
+    (when (a64-fault-rec-p)
+      (a64-load-tls-addr buf +a64-x16+ +a64-fault-rec-gc-addr+ +a64-x17+)
+      (a64-movz buf +a64-x17+ 1 0)
+      (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0))
     (emit-aarch64-gc-conc-enter buf)
     (a64-tramp-mark 31)
     ;; ---- #286 PAUSE TIMER: stamp collection ENTRY ----
@@ -9590,6 +9814,20 @@
     (a64-load-gc-region buf +a64-x17+ +a64-x16+)
     ;; STOP-THE-WORLD: a region-0 collection with threads armed stops them.
     (emit-aarch64-stw-collector-begin buf park)
+    ;; TEST ONLY (test/fault-in-gc.lisp): window word +0x5630 non-zero makes
+    ;; this collection read address 8 -- a memory fault in the middle of a
+    ;; collection, with the world stopped for a region-0 one.  Cleared first,
+    ;; so it fires once.  x9/x10 are saved scratch; x17 is the region.
+    (when (a64-fault-rec-p)
+      (a64-load-tls-addr buf +a64-x9+ +a64-fault-rec-gc-test-addr+ +a64-x10+)
+      (a64-ldr-unsigned buf +a64-x10+ +a64-x9+ 0)
+      (let ((skip (a64-current-index buf)))
+        (a64-emit buf 0)                                ; CBZ x10, skip
+        (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)
+        (a64-movz buf +a64-x9+ 8 0)
+        (a64-ldr-unsigned buf +a64-x9+ +a64-x9+ 0)      ; the fault
+        (setf (aref (a64-buffer-code buf) skip)
+              (logior #xB4000000 (ash (logand (- (a64-current-index buf) skip) #x7FFFF) 5) +a64-x10+))))
     (a64-tramp-mark 33)
     (flet ((load-abs (rd addr) (a64-load-real-addr buf +a64-x16+ (conv-real addr))
                      (a64-ldr-unsigned buf rd +a64-x16+ 0) (a64-asr-imm buf rd rd 1))
@@ -9918,6 +10156,10 @@
       (a64-add-reg buf +a64-x10+ +a64-x10+ +a64-x12+ 0 0)
       (a64-str-unsigned buf +a64-x10+ +a64-x16+ 0))
     (a64-tramp-mark 12)
+    ;; ...and it is consistent again.  x16/x17 are restored below.
+    (when (a64-fault-rec-p)
+      (a64-load-tls-addr buf +a64-x16+ +a64-fault-rec-gc-addr+ +a64-x17+)
+      (a64-str-unsigned buf +a64-xzr+ +a64-x16+ 0))
     (emit-aarch64-stw-release buf)
     (emit-aarch64-gc-conc-exit buf)
     (a64-set-label buf early-return)                    ; (entered no probe)

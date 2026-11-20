@@ -3083,20 +3083,23 @@
                 ;; with that thread's FS base, so "is a handler-case active?"
                 ;; is answered about the thread that actually faulted — and the
                 ;; longjmp lands on ITS stack, not on some other thread's.
-                ;; A FAULT IN THE COLLECTOR.  If this thread holds STOP it
-                ;; was mid-collection: the heap is half-copied and every other
-                ;; thread is parked on it.  Recovering into a handler would run
-                ;; Lisp on that heap; returning never would deadlock the rest.
-                ;; Stop the process and say why.
-                (when (x64-stw-p)
+                ;; THIS THREAD'S RECORD gets its code now (EDI: the signal, or
+                ;; #x0B0B from the call-site capture), before the paths split,
+                ;; so a stop below can say what happened.  And A FAULT INSIDE
+                ;; A COLLECTION STOPS THE PROCESS: this thread was running the
+                ;; collector, the heap is half-copied, and no handler may
+                ;; resume on it.
+                (when (x64-fault-rec-p)
                   (let ((not-gc (make-label)))
-                    (emit-cmp-abs64-zero buf +stw-stop-addr+)
-                    (emit-jcc buf :e not-gc)
-                    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf #x10000C30) ; mov rax, fs:[self]
-                    (emit-bytes buf #x48 #xFF #xC0)          ; inc rax
-                    (emit-bytes buf #x48 #x3B #x04 #x25) (emit-u32 buf +stw-owner-addr+) ; cmp rax, [owner]
-                    (emit-jcc buf :ne not-gc)
-                    (emit-fatal-message buf (format nil "~%modus: a hardware fault inside a garbage collection; the heap cannot be trusted, stopping.~%"))
+                    (emit-bytes buf #x64 #x89 #x3C #x25)  ; mov fs:[code], edi
+                    (emit-u32 buf +fault-rec-code-addr+)
+                    (emit-bytes buf #x64 #xC7 #x04 #x25)  ; mov dword fs:[code+4], 0
+                    (emit-u32 buf (+ +fault-rec-code-addr+ 4)) (emit-u32 buf 0)
+                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-bytes buf #x00)
+                    (emit-jcc buf :e not-gc)              ; cmp qword fs:[in-gc], 0
+                    (emit-fault-report buf "inside a garbage collection"
+                                       "the heap is half-copied and cannot be trusted; stopping."
+                                       +fault-in-gc-exit-code+)
                     (emit-label buf not-gc)))
                 (emit-bytes buf #x48 #xB9)
                 (emit-u32 buf #x10000180) (emit-u32 buf 0)
@@ -3116,15 +3119,10 @@
                 ;; dynamic-binding area), not 0x10000EB8: EB8 is the eval
                 ;; lock's OWNER word (mvm-eval.lisp, macos-hosting) -- the
                 ;; 2026-09-30 merge found the collision.
-                (if (x64-fault-rec-p)
-                    (progn
-                      (emit-bytes buf #x64 #x89 #x3C #x25)  ; mov fs:[code], edi
-                      (emit-u32 buf +fault-rec-code-addr+)
-                      (emit-bytes buf #x64 #xC7 #x04 #x25)  ; mov dword fs:[code+4], 0
-                      (emit-u32 buf (+ +fault-rec-code-addr+ 4)) (emit-u32 buf 0))
-                    (progn
-                      (emit-bytes buf #x89 #x3C #x25)       ; mov [disp32], edi
-                      (emit-u32 buf #x10000CB0)))
+                ;; (Per thread, it was stored above.)
+                (unless (x64-fault-rec-p)
+                  (emit-bytes buf #x89 #x3C #x25)           ; mov [disp32], edi
+                  (emit-u32 buf #x10000CB0))
                 ;; A STACK OVERFLOW was recognised at the top of the stub (the
                 ;; call-site capture), which left #x0B0B in EDI.  This stub can
                 ;; only be running at all then because it is on the alternate
@@ -8296,6 +8294,155 @@
   "The fault record is per thread (THE FAULT RECORD IS PER THREAD)."
   (and *x64-linux-mode* *x64-tls-window* *x64-stw*))
 
+;;; A FAULT INSIDE A COLLECTION STOPS THE PROCESS.  While a thread runs the
+;;; collector the heap is half-copied -- objects forwarded, roots partly
+;;; updated, the allocation pointer in to-space -- and for a region-0
+;;; collection every other thread is parked on it.  A fault there (a stack
+;;; overflow in the trampoline's own frames, a wild pointer the scan follows)
+;;; that the stub recovered into the nearest HANDLER-CASE would run Lisp on
+;;; that heap.  So the trampoline marks the thread's window word +0x5628 from
+;;; after its park handshake to its restore, and the stub, seeing it, writes a
+;;; line and stops (+FAULT-IN-GC-EXIT-CODE+).  Per thread, so it covers a
+;;; worker collecting its OWN region as well as region 0: the check it
+;;; replaces tested the stop flag and owner word of the dormant
+;;; operandi-on-modus protocol (X64-STW-P), which is never emitted, so it
+;;; covered neither.  +0x5630 is a test-only knob: non-zero makes this
+;;; thread's next collection read address 8 (test/fault-in-gc.lisp).
+(defconstant +fault-rec-gc-addr+ #x10005628)
+(defconstant +fault-rec-gc-test-addr+ #x10005630)
+(defconstant +fault-in-gc-exit-code+ 71
+  "exit_group code of a fault inside a collection.")
+
+(defun emit-fault-report (buf where suffix exit-code)
+  "Write one line about THIS thread's recorded fault (+FAULT-REC-CODE-ADDR+
+   and on, which must be complete) to stderr and exit_group(EXIT-CODE):
+     modus: <what> WHERE on <the main thread | worker N> (tid T):
+            address #x.., pc #x..; SUFFIX
+   From the fault stub, on the thread's alternate stack, which holds the line.
+   Clobbers everything: it never returns."
+  (flet ((lit (text)
+           ;; rsi := the bytes (CALL over them), copy to [rdi].
+           (let ((after (make-label)) (bytes (map 'list #'char-code text)))
+             (emit-call buf after)
+             (dolist (b bytes) (emit-byte buf b))
+             (emit-label buf after)
+             (emit-bytes buf #x5E)                                ; pop rsi
+             (emit-bytes buf #xB9) (emit-u32 buf (length bytes))  ; mov ecx, len
+             (emit-bytes buf #xF3 #xA4)))                         ; rep movsb
+         (dec ()
+           ;; RAX in decimal at [rdi]: digits backwards from r8+500.
+           (let ((top (make-label)))
+             (emit-bytes buf #x4D #x8D #x90) (emit-u32 buf 500)   ; lea r10, [r8+500]
+             (emit-bytes buf #x4D #x89 #xD3)                      ; mov r11, r10
+             (emit-bytes buf #xB9 #x0A #x00 #x00 #x00)            ; mov ecx, 10
+             (emit-label buf top)
+             (emit-bytes buf #x31 #xD2)                           ; xor edx, edx
+             (emit-bytes buf #x48 #xF7 #xF1)                      ; div rcx
+             (emit-bytes buf #x80 #xC2 #x30)                      ; add dl, '0'
+             (emit-bytes buf #x49 #xFF #xCA)                      ; dec r10
+             (emit-bytes buf #x41 #x88 #x12)                      ; mov [r10], dl
+             (emit-bytes buf #x48 #x85 #xC0)                      ; test rax, rax
+             (emit-jcc buf :ne top)
+             (emit-bytes buf #x4C #x89 #xD6)                      ; mov rsi, r10
+             (emit-bytes buf #x4C #x89 #xD9)                      ; mov rcx, r11
+             (emit-bytes buf #x4C #x29 #xD1)                      ; sub rcx, r10
+             (emit-bytes buf #xF3 #xA4)))                         ; rep movsb
+         (hex ()
+           ;; RAX in hex, no leading zeros, at [rdi].
+           (let ((top (make-label)) (emit (make-label)) (next (make-label))
+                 (digit (make-label)) (store (make-label)))
+             (emit-bytes buf #xC6 #x07 #x23 #xC6 #x47 #x01 #x78)  ; "#x"
+             (emit-bytes buf #x48 #x83 #xC7 #x02)                 ; add rdi, 2
+             (emit-bytes buf #x49 #x89 #xC3)                      ; mov r11, rax
+             (emit-bytes buf #xB9 #x3C #x00 #x00 #x00)            ; mov ecx, 60
+             (emit-bytes buf #x45 #x31 #xD2)                      ; xor r10d, r10d
+             (emit-label buf top)
+             (emit-bytes buf #x4C #x89 #xD8)                      ; mov rax, r11
+             (emit-bytes buf #x48 #xD3 #xE8)                      ; shr rax, cl
+             (emit-bytes buf #x83 #xE0 #x0F)                      ; and eax, 15
+             (emit-bytes buf #x45 #x85 #xD2) (emit-jcc buf :ne emit) ; started?
+             (emit-bytes buf #x85 #xC0) (emit-jcc buf :ne emit)      ; non-zero?
+             (emit-bytes buf #x85 #xC9) (emit-jcc buf :ne next)      ; last digit?
+             (emit-label buf emit)
+             (emit-bytes buf #x41 #xBA #x01 #x00 #x00 #x00)       ; mov r10d, 1
+             (emit-bytes buf #x83 #xF8 #x0A) (emit-jcc buf :b digit)
+             (emit-bytes buf #x83 #xC0 #x37) (emit-jmp buf store) ; 'A'-10
+             (emit-label buf digit)
+             (emit-bytes buf #x83 #xC0 #x30)                      ; '0'
+             (emit-label buf store)
+             (emit-bytes buf #x88 #x07)                           ; mov [rdi], al
+             (emit-bytes buf #x48 #xFF #xC7)                      ; inc rdi
+             (emit-label buf next)
+             (emit-bytes buf #x83 #xE9 #x04)                      ; sub ecx, 4
+             (emit-jcc buf :ns top))))
+    (emit-bytes buf #x48 #x81 #xEC) (emit-u32 buf 512)           ; sub rsp, 512
+    (emit-bytes buf #x48 #x83 #xE4 #xF0)                         ; and rsp, -16
+    (emit-bytes buf #x49 #x89 #xE0)                              ; mov r8, rsp
+    (emit-bytes buf #x4C #x89 #xC7)                              ; mov rdi, r8
+    (lit (format nil "~%modus: "))
+    (let ((done (make-label)))
+      (dolist (k '((#x0B0B . "stack exhausted (the control stack overflowed)")
+                   (#x0F0F . "handler-frame stack exhausted")
+                   (11 . "memory fault (SIGSEGV)")
+                   (7 . "bus error (SIGBUS)")
+                   (8 . "arithmetic fault (SIGFPE)")
+                   (4 . "illegal instruction (SIGILL)")))
+        (let ((next (make-label)))
+          (emit-bytes buf #x64 #x81 #x3C #x25) (emit-u32 buf +fault-rec-code-addr+) (emit-u32 buf (car k))
+          (emit-jcc buf :ne next)                                ; cmp dword fs:[code], k
+          (lit (cdr k))
+          (emit-jmp buf done)
+          (emit-label buf next)))
+      (lit "hardware fault (signal ")
+      (emit-bytes buf #x64 #x8B #x04 #x25) (emit-u32 buf +fault-rec-code-addr+) ; mov eax, fs:[code]
+      (dec)
+      (lit ")")
+      (emit-label buf done))
+    (lit (format nil " ~A on " where))
+    ;; Which thread: self base 0 is main; else the slot whose window block it
+    ;; is (net/hosted-sync %THR-TLS-BLOCK: page + 0x94000 + slot*0x8000).
+    (let ((worker (make-label)) (anon (make-label)) (thr-done (make-label)))
+      (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf #x10000C30) ; mov rax, fs:[self]
+      (emit-bytes buf #x48 #x85 #xC0) (emit-jcc buf :ne worker)
+      (lit "the main thread")
+      (emit-jmp buf thr-done)
+      (emit-label buf worker)
+      (emit-bytes buf #x48 #x05) (emit-u32 buf #x10000000)       ; add rax, 0x10000000
+      (emit-bytes buf #x48 #x8B #x0C #x25) (emit-u32 buf #x10000DA8) ; mov rcx, [thread page]
+      (emit-bytes buf #x48 #x81 #xC1) (emit-u32 buf #x94000)     ; add rcx, 0x94000
+      (emit-bytes buf #x48 #x29 #xC8)                            ; sub rax, rcx
+      (emit-jcc buf :b anon)
+      (emit-bytes buf #x48 #xC1 #xE8 #x0F)                       ; shr rax, 15
+      (emit-bytes buf #x48 #x83 #xF8 #x10) (emit-jcc buf :ae anon)
+      (emit-bytes buf #x50)                                      ; push rax
+      (lit "worker ")
+      (emit-bytes buf #x58)                                      ; pop rax
+      (dec)
+      (emit-jmp buf thr-done)
+      (emit-label buf anon)
+      (lit "a worker thread")
+      (emit-label buf thr-done))
+    (lit " (tid ")
+    (emit-bytes buf #xB8 #xBA #x00 #x00 #x00)                    ; mov eax, 186 (gettid)
+    (emit-bytes buf #x0F #x05)
+    (dec)
+    (lit "): address ")
+    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf +fault-rec-addr-addr+)
+    (hex)
+    (lit ", pc ")
+    (emit-bytes buf #x64 #x48 #x8B #x04 #x25) (emit-u32 buf +fault-rec-pc-addr+)
+    (hex)
+    (lit (format nil "; ~A~%" suffix))
+    (emit-bytes buf #x48 #x89 #xFA)                              ; mov rdx, rdi
+    (emit-bytes buf #x4C #x29 #xC2)                              ; sub rdx, r8
+    (emit-bytes buf #x4C #x89 #xC6)                              ; mov rsi, r8
+    (emit-bytes buf #xBF #x02 #x00 #x00 #x00)                    ; mov edi, 2
+    (emit-bytes buf #xB8 #x01 #x00 #x00 #x00)                    ; mov eax, 1 (write)
+    (emit-bytes buf #x0F #x05)
+    (emit-bytes buf #xBF) (emit-u32 buf exit-code)               ; mov edi, code
+    (emit-bytes buf #xB8 #xE7 #x00 #x00 #x00)                    ; mov eax, 231 (exit_group)
+    (emit-bytes buf #x0F #x05)))
+
 (defun emit-diag-store (buf addr)
   "mov [ADDR], rax -- one of the #x0520 stub's absolute FRAGILITY DIAG words
    (0x10000C38..C58).  Every faulting thread writes the same words, so in a
@@ -10092,6 +10239,10 @@
     ;; STOP-THE-WORLD: park for another thread's region-0 collection; a
     ;; clamped back-edge poll with room to spare returns from here.
     (emit-x64-stw-entry buf park-label)
+    ;; THIS THREAD IS COLLECTING (A FAULT INSIDE A COLLECTION STOPS THE
+    ;; PROCESS), until the restore label.
+    (when (x64-fault-rec-p)
+      (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-u32 buf 1))
 
     ;; ---- STOP THE WORLD if this is region 0 with threads live, BEFORE any
     ;; metadata is read: a collector that has to wait for another one reads
@@ -10101,6 +10252,17 @@
     (emit-gc-concurrency-enter buf)
     ;; STOP-THE-WORLD: a region-0 collection with threads armed stops them.
     (emit-x64-stw-collector-begin buf park-label)
+    ;; TEST ONLY (test/fault-in-gc.lisp): window word +0x5630 non-zero makes
+    ;; this collection read address 8 -- a memory fault in the middle of a
+    ;; collection, with the world stopped for a region-0 one.  Cleared first,
+    ;; so it fires once.  RCX is on the stack.
+    (when (x64-fault-rec-p)
+      (let ((no-test (make-label)))
+        (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf +fault-rec-gc-test-addr+) (emit-bytes buf #x00)
+        (emit-jcc buf :e no-test)
+        (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-test-addr+) (emit-u32 buf 0)
+        (emit-bytes buf #x48 #x8B #x0C #x25) (emit-u32 buf 8) ; mov rcx, [8]
+        (emit-label buf no-test)))
 
     ;; ---- Load GC metadata FROM THE ACTIVE REGION'S CONTROL BLOCK ----
     ;; RAX = region base (see emit-load-gc-region: 0 in the pointer word means
@@ -10778,6 +10940,9 @@
     (emit-label buf restore-label)
     ;; RSP should equal RBP (saved after all pushes). Force it for safety.
     (emit-mov-reg-reg buf 'rsp 'rbp)
+    ;; The heap is consistent again: this thread is no longer collecting.
+    (when (x64-fault-rec-p)
+      (emit-bytes buf #x64 #x48 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-gc-addr+) (emit-u32 buf 0))
     ;; ---- ...and it has ended.  Before the pops, so RAX is still scratch.
     (emit-gc-concurrency-exit buf)
     (emit-pop buf 'rbp)

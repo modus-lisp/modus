@@ -332,10 +332,15 @@
           ;; kept, so a reused block reuses its reservation.
           (%gc-write64 (+ b #x5608) 0)
           ;; THE FAULT RECORD (translate-x64, THE FAULT RECORD IS PER THREAD):
-          ;; no pending code, address or PC left by the previous occupant.
+          ;; no pending code, address or PC left by the previous occupant, and
+          ;; neither its in-collection mark nor the collection test knob (A
+          ;; FAULT INSIDE A COLLECTION STOPS THE PROCESS): a stale mark would
+          ;; make this thread's every fault a stop.
           (%gc-write64 (+ b #x5610) 0)
           (%gc-write64 (+ b #x5618) 0)
           (%gc-write64 (+ b #x5620) 0)
+          (%gc-write64 (+ b #x5628) 0)
+          (%gc-write64 (+ b #x5630) 0)
           (%gc-write64 (+ b #xC30) delta)
           delta))))
 

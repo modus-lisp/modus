@@ -37,6 +37,18 @@
   (and (> (mem-ref #x10006044 :u32) 0)
        (eql (compute-name-hash "CAR") (%cold-names-check))))
 
+(defun %cold-disk-read (at buf)
+  "512 bytes of a cold table into BUF; 0 when read.  AT is a disk byte (the
+   Mac disk service), or -- when #x10006078 is non-zero, a core booted from a
+   compressed floppy that carries the tables in RAM (mac68k-core.py
+   MAC68K_CORE_RAW) -- their address."
+  (if (eql (mem-ref #x10006078 :u32) 0)
+      (syscall3 1 at buf 512)
+      (let ((i 0))
+        (loop (when (>= i 512) (return 0))
+          (setf (mem-ref (+ buf i) :u16) (mem-ref (+ at i) :u16))
+          (setq i (+ i 2))))))
+
 (defun %cold-sym-name (h)
   "The name whose hash is H, from the cold names on disk; NIL when there is none
    or no disk to read it from."
@@ -50,7 +62,7 @@
                 (let ((mid (ash (+ lo hi 1) -1)))
                   (if (%cold-names-first-le v mid h) (setq lo mid) (setq hi (- mid 1)))))
               (let ((buf *io-buf-addr*))
-                (when (eql (syscall3 1 (+ (mem-ref #x10006044 :u32) (* lo 512)) buf 512) 0)
+                (when (eql (%cold-disk-read (+ (mem-ref #x10006044 :u32) (* lo 512)) buf) 0)
                   (let ((i 0) (found nil))
                     (loop
                       (when (> i 507) (return nil))
@@ -198,7 +210,7 @@
     (setq *cold-fns-out* nil)))
 
 (defun %cold-fns-read (page buf)
-  (eql (syscall3 1 (+ (mem-ref #x1000604C :u32) (* page 512)) buf 512) 0))
+  (eql (%cold-disk-read (+ (mem-ref #x1000604C :u32) (* page 512)) buf) 0))
 
 (defun %cold-fns-u32 (a)
   (+ (* (mem-ref a :u8) 16777216) (* (mem-ref (+ a 1) :u8) 65536)

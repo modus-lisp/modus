@@ -22,6 +22,7 @@
        (cond ((string= m "lc") #x00100000)
              ((member m '("classic" "classicos" "classic2m" "plus1m") :test #'string=) #x00040000)
              ((string= m "quadra") #x00600000)
+             ((string= m "floppy") #x00100000)
              ((string= m "plus1mjit") #x0003C000)
              (t (error "mac68k-disk: no load address for MODUS_MAC68K_MACHINE=~A" m))))
      ;; MODUS_MAC68K_SHIFT (boot-mac68k): the whole map moved

@@ -41,6 +41,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
     'quadra':    (0x00600000, 0x009D0000, 0x00A30000, 0x00A80000, 0x20000),   # cache, stack, NIL's page between
+    'floppy':    (0x00100000, 0x00960000, 0x00AE0000, 0x00B40000, 0x20000),   # the same, all resident
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
@@ -466,6 +467,31 @@ def main(image, disk):
         struct.pack_into('>I', chunk, REGION - LOAD + 0x604C, fn_disk)
         print('mac68k-core: cold functions: %d names in %d pages at disk byte %d'
               % (n, npages, fn_disk))
+    # MAC68K_CORE_RAW=FILE: the boot read's bytes alone, LOAD up -- for a floppy
+    # that carries the core compressed (scripts/mac68k-floppy.lisp --load); only
+    # a build with no code to read from disk later (no streams, no cold code).
+    # The cold NAME tables (the .cold file's, the cold functions') come along in
+    # RAM: copied into the room past the static heap -- below :STATIC-HI, which
+    # the static heap's moved objects do not reach -- with #x6044 / #x604C their
+    # ADDRESSES and #x6078 = 1, which mac68k-cold.lisp %COLD-DISK-READ reads as
+    # "copy from there" instead of the disk service.
+    if os.environ.get('MAC68K_CORE_RAW'):
+        if cnt or cold_desc >= 0:
+            sys.exit('mac68k-core: MAC68K_CORE_RAW wants an image with no streams or cold code')
+        raw = bytearray(chunk)
+        low_at = REGION - LOAD
+        used = max(nolo + len(objs), nclo + len(conses))
+        at = (used + 0xFFF) & ~0xFFF               # the tables' first address
+        if at + len(tail) > STATIC_HI:
+            sys.exit('mac68k-core: the cold tables (%d bytes) do not fit below :STATIC-HI' % len(tail))
+        raw[at - LOAD:at - LOAD + len(tail)] = tail
+        for slot in (0x6044, 0x604C):
+            d, = struct.unpack_from('>I', raw, low_at + slot)
+            struct.pack_into('>I', raw, low_at + slot, at + d - stream_disk if d else 0)
+        struct.pack_into('>I', raw, low_at + 0x6078, 1)
+        open(os.environ['MAC68K_CORE_RAW'], 'wb').write(bytes(raw))
+        print('mac68k-core: the cold tables, %d bytes, at %#x' % (len(tail), at))
+        print('mac68k-core: raw core %s: %d bytes at %#x' % (os.environ['MAC68K_CORE_RAW'], len(chunk), LOAD))
     md.write_disk(bytes(chunk) + tail, disk, LOAD, read_len=len(chunk),
                   refslot=(REGION + 0x6050) if CHAIN_MEMTOP else 0, memtop=CHAIN_MEMTOP,
                   kmap=KMAP if CHAIN_MEMTOP else 0)

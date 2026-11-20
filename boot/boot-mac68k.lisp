@@ -42,7 +42,8 @@
           ((string-equal m "plus1mjit") :plus-1m-jit)
           ((string-equal m "classicos") :classic-os)
           ((string-equal m "quadra") :quadra)
-          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classicos, quadra, classic2m, plus1m or plus1mjit" m))))
+          ((string-equal m "floppy") :floppy)
+          (t (error "MODUS_MAC68K_MACHINE=~A: lc, classic, classicos, quadra, floppy, classic2m, plus1m or plus1mjit" m))))
   "Which Mac's memory map (MODUS_MAC68K_MACHINE): :LC, the 32 MB LC 475 /
    Quadra 605 class this file was measured on, or :CLASSIC, a Mac Classic
    with 4 MB (its maximum) -- measured in MAME's macclasc when our boot
@@ -200,6 +201,29 @@
               :kind-map #x00EB0000
               :boot-heap #x00AA0000 :boot-heap-size #x00400000
               :boot-cache-lo #x00A60000 :boot-cache-hi #x00A60000
+              :boot-stack-top #x01A00000)
+    ;; THE FLOPPY (MODUS_MAC68K_MACHINE=floppy, 2026-11-20): a 68020+ Mac with
+    ;; 32 MB booting a SAVED CORE from one compressed 1.44 MB floppy
+    ;; (scripts/mac68k-floppy.lisp --load, mac68k-core.py MAC68K_CORE_RAW).  The
+    ;; Quadra map's core path with everything resident (no cold code: nothing
+    ;; is on a disk to page in) -- so the image from 1 MB, then the static heap
+    ;; the core brings, the stack, NIL's page, the low block and a young pair of
+    ;; 4 MB.  The kind map and the JIT's area lie over the floppy loader's
+    ;; blob and state (#x01200000 .. #x01A10000), dead once the image runs.
+    ;; The core run (Basilisk, 32 MB) boots from scratch with an 8 MB heap at
+    ;; :BOOT-HEAP and its stack at :BOOT-STACK-TOP.  Why: startup from scratch
+    ;; is ~4.3 min on a 68040 (building the package and symbol tables); from
+    ;; the core it is the restore.
+    (:floppy  :load #x00100000 :static-lo #x00960000 :static-hi #x00AE0000
+              :jit-area-lo #x01480000 :jit-area-hi #x019C0000 :jit-max-bytecode 16384
+              :cache-lo #x00B20000 :cache-hi #x00B20000
+              :staging #x00B20000 :staging-size #x00000000
+              :stack-top #x00B20000 :scratch #x00B20000 :io-buf #x00B21000
+              :nil-page #x00B30000
+              :region #x00B40000 :heap-size #x00800000 :gc-guard #x00010000
+              :kind-map #x01370000
+              :boot-heap #x00B60000 :boot-heap-size #x00800000
+              :boot-cache-lo #x00B20000 :boot-cache-hi #x00B20000
               :boot-stack-top #x01A00000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
@@ -498,7 +522,7 @@
    heap, cache and stack, above 4 MB; the descriptor's SAVE flag then has
    KERNEL-MAIN send the core over serial port A."
   (let* ((buf (make-m68k-buffer))
-         (classic (member *mac68k-machine* '(:classic :classic-os :quadra :classic-2m :plus-1m :plus-1m-jit)))
+         (classic (member *mac68k-machine* '(:classic :classic-os :quadra :floppy :classic-2m :plus-1m :plus-1m-jit)))
          (over (mvm-make-label)) (ain (mvm-make-label)) (aout (mvm-make-label))
          (desc (mvm-make-label)) (core (mvm-make-label)) (common (mvm-make-label))
          (fill (mvm-make-label)) (hosted (mvm-make-label))

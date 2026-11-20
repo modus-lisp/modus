@@ -1,13 +1,23 @@
 ;;;; mac68k-floppy.lisp -- compressed Mac boot disks.
 ;;;;
-;;;;   sbcl --script scripts/mac68k-floppy.lisp IMAGE DISK [--hd]
+;;;;   sbcl --script scripts/mac68k-floppy.lisp IMAGE DISK [--hd] [--load HEX]
 ;;;;
-;;;; IMAGE is a flat bare-Mac image (built for :mac68k, linked at #x00100000).
+;;;; IMAGE is a flat bare-Mac image (built for :mac68k, linked at #x00100000), or
+;;;; with --load HEX one that goes at HEX -- a saved core (mac68k-core.py's
+;;;; MAC68K_CORE_RAW: the image, its static heap and low block, from the map's :LOAD).
 ;;;; It is compressed as a raw LZMA1 stream (cram's LZMA-COMPRESS, lc 2 lp 1 pb 2)
 ;;;; behind a loader, scripts/mac68k-unlzma.s: 68020 assembly, under 1 KB, its
 ;;;; decoder scripts/mac68k-lzma.inc (test/mac68k-unlzma/run.sh checks it).
 ;;;; The boot blocks (scripts/mac68k-disk.lisp) read the blob to #x01200000; the
-;;;; loader unpacks IMAGE to #x00100000 and jumps to it.
+;;;; loader unpacks IMAGE to #x00100000 (or --load) and jumps to it.
+;;;;
+;;;; THE FAST FLOPPY is a saved core (boot/boot-mac68k.lisp :FLOPPY): the REPL in
+;;;; ~105 s on a 68040 (MAME's Quadra 950) where a fresh image takes ~400 s, all
+;;;; but ~2 s of it reading the disk and unpacking.  Build the image with
+;;;; MODUS_MAC68K_MACHINE=floppy and mac68k-snap-build.sh's quadra knobs but
+;;;; MODUS_68K_COLD_KEEP= (empty: nothing may be left on a disk), take its core
+;;;; with MAC68K_CORE_RAW=CORE scripts/mac68k-core.py IMAGE DISK, then
+;;;;   MODUS_MAC68K_MACHINE=floppy sbcl --script scripts/mac68k-floppy.lisp CORE DISK --hd --load 100000
 ;;;;
 ;;;; Disks: one 800 KB floppy, DISK, if the blob fits; else, with --hd, one 1.44 MB
 ;;;; floppy; else TWO 800 KB floppies, DISK-1 and DISK-2.  A two-disk set boots
@@ -35,10 +45,10 @@
 (defconstant +hd+ 1474560)
 (defparameter *message* "INSERT MODUS DISK 2")
 
-(defun jumper ()
+(defun jumper (out)
   "At +PAY+ + 8: CPUSHA BC; MOVEA.L #OUT,A0; JMP (A0); NOP (pad)."
   (let ((v (make-array 12 :element-type '(unsigned-byte 8))))
-    (fs-apple:set-u16 v 0 #xF4F8) (fs-apple:set-u16 v 2 #x207C) (fs-apple:set-u32 v 4 +out+)
+    (fs-apple:set-u16 v 0 #xF4F8) (fs-apple:set-u16 v 2 #x207C) (fs-apple:set-u32 v 4 out)
     (fs-apple:set-u16 v 8 #x4ED0) (fs-apple:set-u16 v 10 #x4E71)
     v))
 
@@ -74,17 +84,19 @@
 (defun zeros (n) (make-array (max n 0) :element-type '(unsigned-byte 8) :initial-element 0))
 (defun pad512 (n) (* 512 (ceiling n 512)))
 
-(defun main (image disk &key hd)
-  (let ((lo (assemble "mac68k-unlzma.s" :cpu "68020")) (img (read-bytes image)))
+(defun main (image disk &key hd (out +out+))
+  (multiple-value-bind (lo lsyms) (assemble "mac68k-unlzma.s" :cpu "68020")
+   (fs-apple:set-u32 lo (gethash "outaddr" lsyms) out)
+   (let ((img (read-bytes image)))
     (when (> (length lo) +pay-off+)
       (error "mac68k-floppy: the loader is ~D bytes, over ~D" (length lo) +pay-off+))
-    (when (> (+ +out+ (length img)) +loader-addr+)
+    (when (> (+ out (length img)) +loader-addr+)
       (error "mac68k-floppy: the image runs into the loader"))
     (let* ((stream (cram:lzma-compress img :lc 2 :lp 1 :pb 2 :dict-size (ash 1 23)))
            (sp (mac68k-disk::splash))      ; write-disk puts the splash after the data
            (room (- +floppy+ (if sp (pad512 (length sp)) 0)))
            (cap1 (- room 1024))
-           (jumper (jumper)))
+           (jumper (jumper out)))
       (flet ((blob (code)
                (let* ((head (make-array 8 :element-type '(unsigned-byte 8) :initial-element 0))
                       (b nil))
@@ -133,8 +145,10 @@
                       (write-bytes d2 (pad-to (octets label part2) 1 +floppy+))
                       (format t "mac68k-floppy: ~A, ~D bytes -> ~D LZMA + ~D loader -> ~A (~D bytes) + ~A (~D bytes), two 800K floppies, ~D bytes to spare on the second~%"
                               image (length img) (length stream) (length lo) d1 (length part1) d2
-                              (length part2) (- +floppy+ 512 len2))))))))))))
-
-(let* ((args (argv)) (hd (member "--hd" args :test #'string=)))
+                              (length part2) (- +floppy+ 512 len2)))))))))))))
+(let* ((args (argv)) (hd (member "--hd" args :test #'string=))
+       (k (position "--load" args :test #'string=))
+       (out (if k (parse-integer (nth (1+ k) args) :radix 16) +out+)))
+  (when k (setq args (append (subseq args 0 k) (subseq args (+ k 2)))))
   (setq args (remove "--hd" args :test #'string=))
-  (main (first args) (second args) :hd (and hd t)))
+  (main (first args) (second args) :hd (and hd t) :out out))

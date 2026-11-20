@@ -12,6 +12,9 @@
 //                            how many were taken: all of them unless the queue
 //                            is full, when the rest are dropped.
 //   1012 AUDIO-QUEUED        samples queued and not yet handed to the device.
+//   1013 AUDIO-UNDERRUNS     how many times the device asked for a buffer and the ring could
+//                            not fill it (each such buffer partly silence): the gaps a listener
+//                            hears, counted where they happen.
 //
 // THE IMAGE KEEPS THE QUEUE FED, THE DEVICE KEEPS THE TIME.  An AudioQueue on
 // its own thread drains a ring every 40 ms; the image tops the ring up to a
@@ -30,6 +33,7 @@
 #define NBUF 3
 static int16_t ring[RING];
 static uint64_t rd, wr;           // samples ever read / written; wr - rd queued
+static uint64_t underruns;        // refills that found the ring short (after the first sound)
 static os_unfair_lock lk = OS_UNFAIR_LOCK_INIT;
 static AudioQueueRef q;
 
@@ -46,6 +50,7 @@ static void refill(void *u, AudioQueueRef aq, AudioQueueBufferRef b) {
     take = avail < n ? (uint32_t)avail : n;
     for (uint32_t i = 0; i < take; i++) out[i] = ring[(rd + i) % RING];
     rd += take;
+    if (take < n && wr > 0) underruns++;
     os_unfair_lock_unlock(&lk);
     memset(out + take, 0, (size_t)(n - take) * 2);   // dry: silence for the rest
     b->mAudioDataByteSize = n * 2;
@@ -108,6 +113,7 @@ int64_t modus_audio_call(int64_t nr, int64_t a0, int64_t a1) {   // int64_t: a l
     case 1010: return audio_open((long)a0);
     case 1011: return audio_write((long)a0, (long)a1);
     case 1012: return audio_queued();
+    case 1013: return (int64_t)underruns;
     }
     return -38;
 }

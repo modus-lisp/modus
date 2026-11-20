@@ -961,7 +961,7 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
     case 1060:   // Lisp calls a Swift function by name (host/ios/modus-swift.m)
         return modus_swift_call(a0);
 #endif
-    case 1010: case 1011: case 1012:                          // the speaker (host/macos/modus-audio.c)
+    case 1010: case 1011: case 1012: case 1013:               // the speaker (host/macos/modus-audio.c)
         return modus_audio_call(nr, a0, a1);
     default:
         if (nr >= 0 && nr < 512 && !unknown_seen[nr]) {

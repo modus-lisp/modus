@@ -29032,8 +29032,22 @@
     (emit-ir-label ok)
     (when own (free-temp-reg))))
 
+;;; A WORD-SLOT ACCESS HOLDS NO RAW WORD, so it does not stop a loop parking
+;;; (*PARK-SAFEPOINTS*).  Every operand it leaves in a register is TAGGED -- the
+;;; array, the tagged index, the element (a tagged word: these are the generic
+;;; element types, never a packed lane) -- and the element's address is formed
+;;; in the translator's scratch inside the one :AREF / :ASET / :OBJ-REF /
+;;; :OBJ-SET instruction (translate-x64, translate-aarch64), never kept across
+;;; it.  A collection that moves the array while the loop is parked forwards
+;;; the tagged pointer in the parked frame, and the next access addresses the
+;;; new copy.  These used to drop a :RAW-MARK anyway, and that was the gap: on
+;;; AArch64 Linux, which has no packed u32 vectors (*U32-VECTORS-P*), a
+;;; (simple-array (unsigned-byte 32) (*)) is a word vector, so glass's
+;;; framebuffer loops -- a 640x480 pixel swizzle -- never parked and held
+;;; main's region-0 collections up for the whole loop (4.5 s measured on the
+;;; Pi 5; test/u32-loop-parks.lisp).  x86-64 packs u32 (%C32-REF, unmarked),
+;;; so it parked there already.
 (defun compile-word-aref (arr-form idx-form env dest)
-  (%note-raw-words)
   (if (%obj-slot-imm-p idx-form)
       (let ((arr-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
@@ -29074,7 +29088,7 @@
     (free-temp-reg)))
 
 (defun compile-word-aset (arr-form idx-form val-form env dest)
-  (%note-raw-words)
+  ;; No :RAW-MARK: see compile-word-aref.
   ;; Value first when ARR and IDX are lexical leaves — see compile-u8-set.
   (when (%store-value-first-ok-p arr-form idx-form val-form env dest)
     (return-from compile-word-aset

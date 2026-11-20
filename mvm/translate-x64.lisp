@@ -2937,7 +2937,36 @@
                 (emit-bytes buf #x48 #x8B #x82 #xA0 #x00 #x00 #x00) ; mov rax, [rdx+0xA0] (saved RSP)
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C38)
-                (emit-bytes buf #x48 #x8B #x00)                     ; mov rax, [rax]    (call site)
+                ;; THE CALL SITE AT [RSP] -- BUT NOT WHEN THE FAULT IS THE
+                ;; STACK'S END.  A prologue's SUB RSP moves RSP below the
+                ;; mapped stack before its first store faults, so [RSP] is the
+                ;; very address that faulted: reading it here faulted again
+                ;; (SA_NODEFER re-enters this stub), and the second entry
+                ;; captured the ALTERNATE stack's RSP against the first fault's
+                ;; address -- 64 KB apart is the overflow test below, so deep
+                ;; recursion came out as MEMORY-FAULT-ERROR, not
+                ;; STACK-EXHAUSTED.  When si_addr lies within 64 KB of RSP
+                ;; (the same window as that test) the call site is left 0.
+                (let ((skip-site (make-label)) (site-done (make-label)))
+                  (emit-bytes buf #x48 #x8B #x46 #x10)              ; mov rax, [rsi+16] (si_addr)
+                  (emit-bytes buf #x48 #x2B #x82 #xA0 #x00 #x00 #x00) ; sub rax, [rdx+0xA0] (RSP)
+                  (emit-bytes buf #x48 #x05) (emit-u32 buf #x10000) ; add rax, 64 KB
+                  (emit-bytes buf #x48 #x3D) (emit-u32 buf #x20000) ; cmp rax, 128 KB
+                  (emit-jcc buf :b skip-site)                       ; a stack fault: [RSP] may be unmapped
+                  (emit-bytes buf #x48 #x8B #x82 #xA0 #x00 #x00 #x00) ; mov rax, [rdx+0xA0] (saved RSP)
+                  (emit-bytes buf #x48 #x8B #x00)                   ; mov rax, [rax]    (call site)
+                  (emit-jmp buf site-done)
+                  (emit-label buf skip-site)
+                  ;; A STACK OVERFLOW: record #x0B0B in place of the signal
+                  ;; (EDI is stored at 0x10000CB0 below) so %TAKE-PENDING-FAULT
+                  ;; makes STACK-EXHAUSTED.  Decided HERE, from this thread's
+                  ;; own siginfo and ucontext, and not later from the absolute
+                  ;; diagnostic words 0x10000C38/C50, which every faulting
+                  ;; thread writes: two threads overflowing at once could read
+                  ;; each other's.
+                  (emit-bytes buf #xBF) (emit-u32 buf #x0B0B)       ; mov edi, #x0B0B
+                  (emit-bytes buf #x31 #xC0)                        ; xor eax, eax
+                  (emit-label buf site-done))
                 (emit-bytes buf #x48 #x89 #x04 #x25)
                 (emit-u32 buf #x10000C40)
                 (emit-bytes buf #x48 #x8B #x82 #x90 #x00 #x00 #x00) ; mov rax, [rdx+0x90] (saved RAX)
@@ -3048,23 +3077,11 @@
                 ;; 2026-09-30 merge found the collision.
                 (emit-bytes buf #x89 #x3C #x25)           ; mov [disp32], edi
                 (emit-u32 buf #x10000CB0)
-                ;; A STACK OVERFLOW: the fault address (si_addr, saved at
-                ;; 0x10000C50 above) lies within 64 KB of the faulting RSP
-                ;; (0x10000C38) -- below it for a PUSH or CALL, above it for a
-                ;; prologue's store after SUB RSP.  The stack around RSP is
-                ;; mapped, so a fault there is the stack's end and nothing else.
-                ;; Record #x0B0B in place of the signal so %TAKE-PENDING-FAULT
-                ;; makes STACK-EXHAUSTED.  This stub can only be running at all
-                ;; because it is on the alternate stack the install below gives
-                ;; it (SA_ONSTACK).
-                (let ((not-overflow (make-label)))
-                  (emit-bytes buf #x48 #x8B #x04 #x25) (emit-u32 buf #x10000C50) ; mov rax, [si_addr slot]
-                  (emit-bytes buf #x48 #x2B #x04 #x25) (emit-u32 buf #x10000C38) ; sub rax, [RSP slot]
-                  (emit-bytes buf #x48 #x05) (emit-u32 buf #x10000)             ; add rax, 64 KB
-                  (emit-bytes buf #x48 #x3D) (emit-u32 buf #x20000)             ; cmp rax, 128 KB
-                  (emit-jcc buf :ae not-overflow)                              ; unsigned: outside = not ours
-                  (emit-bytes buf #xC7 #x04 #x25) (emit-u32 buf #x10000CB0) (emit-u32 buf #x0B0B)
-                  (emit-label buf not-overflow))
+                ;; A STACK OVERFLOW was recognised at the top of the stub (the
+                ;; call-site capture), which left #x0B0B in EDI.  This stub can
+                ;; only be running at all then because it is on the alternate
+                ;; stack the install below gives it (SA_ONSTACK) -- for a
+                ;; worker, the one %THR-TRAMPOLINE arms (net/hosted-sync).
                 ;; --- Active handler-case: do the longjmp ---
                 ;; Save OUR state to scratch (#x10000C10..) before the pop
                 ;; helper overwrites [180].
@@ -3222,8 +3239,9 @@
                 ;; handed to sigaltstack(2) as a stack_t built in the struct
                 ;; area (ss_sp, ss_flags, ss_size).  Per thread in Linux, and
                 ;; cleared for a CLONE_VM thread -- so this covers the thread
-                ;; that installs the handlers; a worker's overflow still ends
-                ;; the process.  An mmap failure skips it and changes nothing.
+                ;; that installs the handlers; a worker arms its own, below the
+                ;; guard under its stack (net/hosted-sync, %THR-SIGALTSTACK).
+                ;; An mmap failure skips it and changes nothing.
                 (let ((no-alt (make-label)))
                   ;; r9 is kept in the struct's last word (sa_mask, done with):
                   ;; a PUSH would move RSP under the stack_t built at [rsp].

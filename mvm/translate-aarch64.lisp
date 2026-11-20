@@ -3123,7 +3123,11 @@
   ;; earlier entry's TO re-maps that result: x64 202 (futex) must come BEFORE
   ;; (43 . 202), or every accept becomes a futex.  Keep new entries first
   ;; and check both columns.
-  '(;; Threads (net/hosted-sync.lisp, net/sb-thread-shim.lisp).  Unmapped,
+  '(;; A worker's stack guard and alternate signal stack (net/hosted-sync,
+    ;; %THR-SLOT-STACK / %THR-SIGALTSTACK).
+    (10 . 226)   ; mprotect
+    (131 . 132)  ; sigaltstack
+    ;; Threads (net/hosted-sync.lisp, net/sb-thread-shim.lisp).  Unmapped,
     ;; futex 202 was aarch64 accept and gettid 186 msgsnd.
     (186 . 178)  ; gettid
     (202 . 98)   ; futex
@@ -4287,6 +4291,30 @@
                       ;; A process-global word, moved with the region.
                       (a64-load-real-addr buf +a64-x16+ (conv-real #x10000CB0))
                       (a64-str-width buf +a64-x0+ +a64-x16+ 0 2) ; STR w0
+                      ;; A STACK OVERFLOW, as translate-x64 tells it: the fault
+                      ;; address (si_addr, siginfo+16) lies within 64 KB of the
+                      ;; interrupted SP (uc_mcontext.sp, ucontext+432: 40 bytes
+                      ;; of header, the 128-byte sigmask, sigcontext aligned to
+                      ;; 16 at +176 = fault_address, regs[31], sp).  A prologue's
+                      ;; STP pre-index faults just below SP, its spill stores
+                      ;; just above the new SP; the stack around SP is mapped,
+                      ;; so a fault there is the stack's end (the main thread's
+                      ;; rlimit, a worker's guard region -- net/hosted-sync,
+                      ;; %THR-SLOT-STACK).  Record #x0B0B in place of the signal
+                      ;; so %TAKE-PENDING-FAULT makes STACK-EXHAUSTED.  This stub
+                      ;; runs at all only because SA_ONSTACK puts it on the
+                      ;; thread's alternate stack (installed below for main, by
+                      ;; %THR-TRAMPOLINE for a worker).
+                      (a64-ldur buf +a64-x13+ +a64-x1+ 16)           ; si_addr
+                      (a64-ldr-unsigned buf +a64-x17+ +a64-x2+ 432)  ; interrupted SP
+                      (a64-sub-reg buf +a64-x13+ +a64-x13+ +a64-x17+ 0 0)
+                      (a64-movz buf +a64-x17+ 1 1)                   ; 64 KB
+                      (a64-add-reg buf +a64-x13+ +a64-x13+ +a64-x17+ 0 0)
+                      (a64-movz buf +a64-x17+ 2 1)                   ; 128 KB
+                      (a64-cmp-reg buf +a64-x13+ +a64-x17+)
+                      (a64-bcond buf +cc-cs+ 3)                      ; outside: not ours
+                      (a64-movz buf +a64-x17+ #x0B0B 0)
+                      (a64-str-width buf +a64-x17+ +a64-x16+ 0 2)    ; STR w17
                       ;; The recovered-fault COUNT at 0x10000CA0, as on x64:
                       ;; %HC-FAULT-FIXUP compares it with the last count it
                       ;; saw to tell a fresh fault (the shared-store guard's
@@ -4447,9 +4475,16 @@
                                   ;; STR x16, [sp, #0].
                                   (a64-str-unsigned buf +a64-x16+ +a64-sp+ 0)
 
-                                  ;; sa_flags = SA_SIGINFO | SA_NODEFER = 0x40000004.
+                                  ;; sa_flags = SA_SIGINFO | SA_NODEFER = 0x40000004,
+                                  ;; | SA_ONSTACK (0x08000000) on hosted Linux:
+                                  ;; the stub runs on the thread's alternate
+                                  ;; stack, so a fault that IS the stack running
+                                  ;; out is handled (STACK-EXHAUSTED) instead of
+                                  ;; the kernel killing the process for want of
+                                  ;; a frame to push.  A thread without one runs
+                                  ;; it on its own stack, as before.
                                   (a64-movz buf +a64-x16+ 4 0)
-                                  (a64-movk buf +a64-x16+ #x4000 1)
+                                  (a64-movk buf +a64-x16+ (if *aarch64-linux-mode* #x4800 #x4000) 1)
                                   (a64-str-unsigned buf +a64-x16+ +a64-sp+ 8)
 
                                   ;; sa_restorer = 0; sa_mask = 0.
@@ -4463,6 +4498,35 @@
                                     (a64-movz buf +a64-x2+ 0 0)
                                     (a64-movz buf +a64-x3+ 8 0)
                                     (a64-movz buf +a64-x8+ 134 0)   ; rt_sigaction
+                                    (a64-svc buf 0))
+
+                                  ;; THE MAIN THREAD'S ALTERNATE SIGNAL STACK, for
+                                  ;; SA_ONSTACK: 64 KB from mmap, handed to
+                                  ;; sigaltstack(2) as a stack_t built where the
+                                  ;; sigaction was (ss_sp, ss_flags, ss_size).  Per
+                                  ;; thread, and cleared for a CLONE_VM child, so a
+                                  ;; worker installs its own (%THR-TRAMPOLINE).  An
+                                  ;; mmap failure skips it and changes nothing.
+                                  (when *aarch64-linux-mode*
+                                    (a64-movz buf +a64-x0+ 0 0)
+                                    (a64-movz buf +a64-x1+ 1 1)          ; 64 KB
+                                    (a64-movz buf +a64-x2+ 3 0)          ; PROT_READ|WRITE
+                                    (a64-movz buf +a64-x3+ #x22 0)       ; PRIVATE|ANONYMOUS
+                                    (a64-movn buf +a64-x4+ 0 0)          ; fd -1
+                                    (a64-movz buf +a64-x5+ 0 0)
+                                    (a64-movz buf +a64-x8+ 222 0)        ; mmap
+                                    (a64-svc buf 0)
+                                    ;; An errno is -4095..-1: skip.  CMN x0, #4095
+                                    ;; carries exactly for those.
+                                    (a64-adds-imm buf +a64-xzr+ +a64-x0+ 4095)
+                                    (a64-bcond buf +cc-cs+ 9)
+                                    (a64-str-unsigned buf +a64-x0+ +a64-sp+ 0)   ; ss_sp
+                                    (a64-str-unsigned buf +a64-xzr+ +a64-sp+ 8)  ; ss_flags
+                                    (a64-movz buf +a64-x16+ 1 1)
+                                    (a64-str-unsigned buf +a64-x16+ +a64-sp+ 16) ; ss_size
+                                    (a64-add-imm buf +a64-x0+ +a64-sp+ 0)
+                                    (a64-movz buf +a64-x1+ 0 0)
+                                    (a64-movz buf +a64-x8+ 132 0)        ; sigaltstack
                                     (a64-svc buf 0))
 
                                   ;; ADD sp, sp, #32 — free sigaction.

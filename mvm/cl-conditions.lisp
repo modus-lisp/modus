@@ -637,9 +637,10 @@
     nil nil)
   ;; storage-condition
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
-  ;; stack-exhausted -- the control stack ran out: a SIGSEGV just below the
-  ;; stack pointer, which the hosted x64 stub takes on its alternate stack
-  ;; (see %TAKE-PENDING-FAULT).  A STORAGE-CONDITION, not an ERROR, as SBCL's
+  ;; stack-exhausted -- the control stack ran out: a SIGSEGV beside the stack
+  ;; pointer (the main thread's rlimit, a worker's guard region), which the
+  ;; hosted x86-64 and AArch64 stubs take on the thread's alternate stack
+  ;; (see %TAKE-PENDING-FAULT, test/stack-exhaustion.lisp).  A STORAGE-CONDITION, not an ERROR, as SBCL's
   ;; is: deep recursion is a resource running out, not a wrong operation.
   (%define-condition 'stack-exhausted '(storage-condition) nil nil nil)
   ;; handler-stack-exhausted -- a CATCH / UNWIND-PROTECT / HANDLER-CASE frame

@@ -2709,6 +2709,26 @@ Stopping.
 ;;; no longer leak one mapping each.
 (defvar *thr-stack-bytes* 16777216)
 
+;;; A WORKER'S STACK HAS AN END THAT SAYS SO.  Below the stack proper the
+;;; mapping holds a PROT_NONE GUARD and, below that, the thread's ALTERNATE
+;;; SIGNAL STACK:
+;;;
+;;;     m ......... m+64K ........ m+64K+256K ................ +16 MB
+;;;     [ altstack ][ guard, PROT_NONE ][ stack (rec +0x10, +0x18) ]
+;;;
+;;; Without them unbounded recursion on a worker ran off the bottom of its
+;;; 16 MB into whatever the kernel had mapped next (another slot's stack, a
+;;; heap) or, unmapped, faulted with nowhere to push the signal frame, and the
+;;; kernel ended the process with SIGSEGV.  Now the overflow faults in the
+;;; guard, the signal stub runs on the alternate stack (SA_ONSTACK, which
+;;; sigaltstack(2) arms per thread: a CLONE_VM child starts with none), sees
+;;; the fault address beside the stack pointer and hands the nearest armed
+;;; frame a STACK-EXHAUSTED (translate-x64 / translate-aarch64 trap #x0520).
+;;; The guard stays PROT_NONE, so the next overflow is caught the same way.
+;;; 256 KB of guard so a large frame cannot step over it.
+(defvar *thr-stack-guard-bytes* 262144)
+(defvar *thr-altstack-bytes* 65536)
+
 (defun %thr-slot-stack (rec)
   "A stack for the thread about to start in the slot whose record is REC: the
    slot's previous stack when it is the current size, else a fresh mapping.
@@ -2720,7 +2740,27 @@ Stopping.
         (sz (%gc-read64 (+ rec #x18))))
     (if (and (> old 4096) (= sz *thr-stack-bytes*))
         old
-        (%mmap-shared-page *thr-stack-bytes*))))
+        (let ((m (%mmap-shared-page (+ *thr-altstack-bytes* *thr-stack-guard-bytes*
+                                       *thr-stack-bytes*))))
+          (if (< m 4096)
+              m
+              (progn
+                ;; mprotect(guard, PROT_NONE).  x86-64 numbering; the AArch64
+                ;; syscall trap remaps it.
+                (syscall3 10 (+ m *thr-altstack-bytes*) *thr-stack-guard-bytes* 0)
+                (+ m *thr-altstack-bytes* *thr-stack-guard-bytes*)))))))
+
+
+(defun %thr-sigaltstack (stk)
+  "Arm THIS thread's alternate signal stack: the bottom of the mapping
+   %THR-SLOT-STACK made for the stack at STK.  The stack_t (ss_sp, ss_flags,
+   ss_size) is built in that memory itself -- the kernel copies it in, and
+   nothing runs on that stack yet."
+  (let ((base (- stk (+ *thr-altstack-bytes* *thr-stack-guard-bytes*))))
+    (%gc-write64 base base)
+    (%gc-write64 (+ base 8) 0)
+    (%gc-write64 (+ base 16) *thr-altstack-bytes*)
+    (syscall3 131 base 0 0)))
 
 (defun %thr-funs ()
   (if (null *thr-funs*) (setq *thr-funs* (make-array 16)) 0)
@@ -2932,6 +2972,9 @@ Stopping.
     ;;    multiple values and handler frames are still the spawner's.
     (%tls-install slot)
     (%gc-write64 (+ rec #x38) (%tls-self-base))
+    ;; Its alternate signal stack, so that running off the end of this one
+    ;; signals STACK-EXHAUSTED instead of killing the process.
+    (%thr-sigaltstack (%gc-read64 (+ rec #x10)))
     ;; 2. its own per-CPU block and CPU id.
     (%ha-percpu-init-cpu (%thr-percpu-base slot) slot)
     ;; JOIN STOP-THE-WORLD, now that this thread has its own per-CPU block

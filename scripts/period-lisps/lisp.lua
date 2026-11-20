@@ -218,3 +218,28 @@ if os.getenv("MEMDUMP") then
     coroutine.resume(co)
   end
 end
+
+-- FLOPLOAD="T:PATH;...": at emulated second T, insert the floppy image PATH into
+-- the first floppy drive (a disk swap: modus's two-disk sets eject disk 1 and
+-- ask for disk 2, scripts/mac68k-disk2.s)
+if os.getenv("FLOPLOAD") then
+  for t, path in string.gmatch(os.getenv("FLOPLOAD"), "([%d%.]+):([^;]+)") do
+    local co = coroutine.create(function()
+      emu.wait(tonumber(t))
+      for tag, img in pairs(manager.machine.images) do
+        print(string.format("lisp.lua: image %s (%s / %s)", tag, tostring(img.instance_name),
+                            tostring(img.brief_instance_name)))
+      end
+      for tag, img in pairs(manager.machine.images) do
+        local b = tostring(img.brief_instance_name)
+        if b == "flop1" or b == "flop" then
+          local err = img:load(path)
+          print(string.format("lisp.lua: %s into %s at %.1f s: %s", path, tag,
+                              manager.machine.time:as_double(), tostring(err or "ok")))
+          break
+        end
+      end
+    end)
+    coroutine.resume(co)
+  end
+end

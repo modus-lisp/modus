@@ -2635,6 +2635,359 @@
                    (push insn out))))
     (nreverse out)))
 
+(defvar *ir-peephole*
+  (not (equal (sb-ext:posix-getenv "MODUS_IR_PEEPHOLE") "0"))
+  "Run %IR-PEEPHOLE over each image function's finished IR (MVM-COMPILE-ALL,
+   every target).  MODUS_IR_PEEPHOLE=0: off.  Never under runtime EVAL.")
+
+(defun %irp-target (insn)
+  "The label a branch names (%IR-BRANCH-P; THREAD-JUMPS' accessors), else NIL."
+  (and (%ir-branch-p insn) (%ir-branch-target insn)))
+
+(defun %ir-pure-write (insn)
+  "The register INSN writes when it does nothing else -- MOV d s (s /= d),
+   LI d, STACK-LOAD d -- and d is V0..V15 or VR; else NIL."
+  (and (member (car insn) '(:mov :li :stack-load))
+       (let ((d (second insn)))
+         (and (integerp d) (<= 0 d 16)
+              (not (and (eq (car insn) :mov) (eql (third insn) d)))
+              d))))
+
+(defun %ir-peephole (ir)
+  "Local, target-independent clean-ups of one function's finished IR, to a
+   fixed point, after THREAD-JUMPS (which keeps every label, so code behind a
+   label nothing names survived it).  Labels are named only by branches (%IR-BRANCH-P), so a label no
+   branch names has no other way in than falling through to it.
+   - unreachable: after BR / RET / TAILCALL, everything up to the next label
+     that is named goes;
+   - an unnamed label goes;
+   - a branch to a label whose code (labels skipped) is BR M branches to M;
+   - a branch to where control falls anyway goes (labels between included:
+     a branch sets no flags);
+   - a pure write (%IR-PURE-WRITE) whose register the next instruction --
+     labels skipped, since control leaving it can only fall through --
+     overwrites without reading goes;
+   - PUSH r, an LI or register MOV into another register, POP r: the PUSH
+     and the POP go (not a STACK-LOAD between: a target may address frame
+     slots from the stack pointer)."
+  ;; Written with DOTIMES / DO / DOLIST and helpers that take V as an
+  ;; argument: the image's own compiler runs this too (every DDC), and a
+  ;; FLET over V plus FOR clauses reading (AREF V I) read one past the end
+  ;; of V there once the first step had shortened it.
+  (let ((changed t) (v (coerce ir 'vector)))
+    (do () ((not changed))
+      (setq changed nil)
+      ;; unreachable code and unnamed labels
+      (let ((named (%irp-named-labels v)) (out nil) (dead nil))
+        (dotimes (i (length v))
+          (let ((insn (aref v i)))
+            (cond ((eq (car insn) :label)
+                   (if (gethash (second insn) named)
+                       (progn (setq dead nil) (push insn out))
+                       (setq changed t)))
+                  (dead (setq changed t))
+                  (t (push insn out)
+                     (when (member (car insn) '(:br :ret :tailcall))
+                       (setq dead t))))))
+        (setq v (coerce (nreverse out) 'vector)))
+      ;; branches: thread BR chains; drop a branch to the fall-through
+      (let ((label-at (make-hash-table)) (n (length v)))
+        (dotimes (i n)
+          (let ((insn (aref v i)))
+            (when (eq (car insn) :label)
+              (setf (gethash (second insn) label-at) i))))
+        (dotimes (i n)
+          (let ((tg (%irp-target (aref v i))))
+            (when tg
+              (let ((final tg) (steps 0))
+                (do () ((>= steps 8))
+                  (setq steps (1+ steps))
+                  (let* ((at (gethash final label-at))
+                         (j (and at (%irp-next-real v at)))
+                         (nx (and j (aref v j))))
+                    (if (and nx (eq (car nx) :br) (not (eql (second nx) final)))
+                        (setq final (second nx))
+                        (setq steps 8))))
+                (unless (eql final tg)
+                  (setf (aref v i) (%ir-retarget (aref v i) final) changed t)))
+              (let ((tg2 (%irp-target (aref v i))) (j (1+ i)) (falls nil))
+                (do () ((or falls (>= j n) (not (eq (car (aref v j)) :label))))
+                  (when (eql (second (aref v j)) tg2) (setq falls t))
+                  (setq j (1+ j)))
+                (when falls
+                  (setf (aref v i) '(:nop-removed) changed t)))))))
+      ;; dead pure writes and PUSH / POP pairs
+      (let ((n (length v)))
+        (dotimes (i n)
+          (let* ((insn (aref v i)) (d (%ir-pure-write insn)))
+            (when d
+              (let* ((j (%irp-next-real v (1+ i)))
+                     (nx (and j (aref v j))))
+                (when (and nx (eql (%ir-pure-write nx) d)
+                           (not (and (eq (car nx) :mov) (eql (third nx) d))))
+                  (setf (aref v i) '(:nop-removed) changed t))))
+            (when (and (eq (car insn) :push) (< (+ i 2) n))
+              (let ((mid (aref v (+ i 1))) (pop (aref v (+ i 2))) (r (second insn)))
+                (when (and (eq (car pop) :pop) (eql (second pop) r)
+                           (member (car mid) '(:li :mov))
+                           (%ir-pure-write mid) (not (eql (%ir-pure-write mid) r)))
+                  (setf (aref v i) '(:nop-removed)
+                        (aref v (+ i 2)) '(:nop-removed)
+                        changed t)))))))
+      (setq v (remove '(:nop-removed) v :test #'equal)))
+    (coerce v 'list)))
+
+(defun %irp-named-labels (v)
+  "The labels some branch in V names, as a hash table."
+  (let ((h (make-hash-table)))
+    (dotimes (i (length v))
+      (let ((tg (%irp-target (aref v i))))
+        (when tg (setf (gethash tg h) t))))
+    h))
+
+(defun %irp-next-real (v i)
+  "Index of the first non-label instruction of V at or after I, or NIL."
+  (do ((j i (1+ j)))
+      ((>= j (length v)) nil)
+    (unless (eq (car (aref v j)) :label) (return j))))
+
+;;; ---------------------------------------------------------------------------
+;;; %IR-DATAFLOW: liveness, copy propagation and frame-slot forwarding over one
+;;; function's finished IR (every target: it runs on the MVM IR, before any
+;;; translator).  Conservative by construction: an opcode the shape table
+;;; below does not know reads every register and every frame slot, writes
+;;; nothing anyone can rely on, and ends every forward fact; a function with a
+;;; TRAP (setjmp / longjmp landings, syscalls, the &rest copy) is left alone.
+
+(defvar *ir-dataflow*
+  (not (equal (sb-ext:posix-getenv "MODUS_IR_DATAFLOW") "0"))
+  "Run %IR-DATAFLOW over each image function's IR after %IR-PEEPHOLE
+   (MVM-COMPILE-ALL, every target).  MODUS_IR_DATAFLOW=0: off.  Never under
+   runtime EVAL.")
+
+(defvar *irdf-range*
+  (let ((r (sb-ext:posix-getenv "MODUS_IR_DATAFLOW_RANGE")))
+    (and r (let ((c (position #\, r)))
+             (cons (parse-integer r :end c) (parse-integer r :start (1+ c))))))
+  "MODUS_IR_DATAFLOW_RANGE=LO,HI (a bisecting aid): %IR-DATAFLOW only for
+   names whose SXHASH mod 1000000 is in [LO, HI).")
+
+(defun %irdf-selected-p (name)
+  (or (null *irdf-range*)
+      (let ((h (mod (sxhash (string name)) 1000000)))
+        (and (<= (car *irdf-range*) h) (< h (cdr *irdf-range*))))))
+
+(defun %irdf-shape (op)
+  "(READS WRITES) -- the operand positions (1 = the first operand) OP reads
+   and writes as registers -- for an opcode whose every effect on V0..VR and
+   on the frame slots is that list (plus %IRDF-INSN's few implicit ones), or
+   :UNKNOWN."
+  (case op
+    (:mov '((2) (1)))
+    ((:li :li-const :li-func :get-cenv :get-nargs :alloc-obj :pop :stack-load) '(() (1)))
+    ((:stack-store :push :bnull :bnnull :cmp-imm :test-imm :write-barrier :set-cenv)
+     '((1) ()))
+    ((:label :br :beq :bne :blt :bge :ble :bgt :bvs :gc-check :gc-check-n
+      :set-nargs :set-mv-count :frame-alloc :frame-free :frame-enter :frame-leave)
+     '(() ()))
+    ((:cmp :test :setcar :setcdr :store) '((1 2) ()))
+    ((:obj-tag :obj-subtag :array-len :car :cdr :consp :atom :neg :shl :sar :shr
+      :load :alloc-array :alloc-string :alloc-u8 :obj-ref)
+     '((2) (1)))
+    ((:add :sub :and :or :xor :mul :add-checked :sub-checked :mul-checked :div :mod
+      :cons :aref :u8-ref)
+     '((2 3) (1)))
+    ((:aset :u8-set) '((1 2 3) ()))
+    (:obj-set '((1 3) ()))
+    ((:call :ret) '(() ()))
+    (t :unknown)))
+
+(defun %irdf-reg-p (x) (and (integerp x) (<= 0 x 16)))
+
+(defvar *irdf-vr-is-v0* t
+  "Set by %IR-DATAFLOW (a SETQ, not a binding: the image's own compiler
+   would need it declared special): whether this compile's target keeps VR and V0 in
+   one physical register (%IRDF-VR-IS-V0-P).")
+
+(defun %irdf-vr-is-v0-p ()
+  "VR IS V0 on aarch64, RISC-V, arm32, PowerPC and 68k (one physical
+   register); x86-64 (RAX / RSI) and i386 (EAX / ESI) keep them apart.  With
+   no compile target bound, assume they alias: that is the safe answer."
+  (let ((c *compile-target*))
+    (not (and c (member (compile-target-name c) '(:x86-64 :i386))))))
+
+(defun %irdf-bits (r)
+  "The liveness bits register R stands for.  Where VR is V0
+   (*IRDF-VR-IS-V0*) the two are one register to every read here: a read of
+   either keeps both live, a write ends forward facts about both, and a
+   write to one is dead only when neither is live.  (A write kills only its
+   own bit, which is right on every target.)"
+  (if (and *irdf-vr-is-v0* (or (eql r 0) (eql r 16))) #x10001 (ash 1 r)))
+
+(defun %irdf-source-p (x)
+  "Whether a read may be redirected to register X: V0..V15, never VR.  An
+   opcode may clobber VR as a hidden effect -- i386's checked add / subtract
+   / multiply reach GENERIC-ADD &c. on overflow, which return in EAX = VR --
+   and the compiler never keeps a value in VR across one; a copy propagated
+   FROM VR would."
+  (and (integerp x) (<= 0 x 15)))
+
+(defun %irdf-frame-touch-p (insn)
+  "Whether INSN may read or write a frame slot other than through its own
+   STACK-LOAD / STACK-STORE slot: it names VSP or VFP as a register, or it is
+   a raw LOAD / STORE (whose address could be one)."
+  (or (member (car insn) '(:load :store))
+      (and (listp (%irdf-shape (car insn)))
+           (destructuring-bind (rd wr) (%irdf-shape (car insn))
+             (loop for p in (append rd wr)
+                   thereis (member (nth p insn) '(20 21)))))))
+
+(defun %irdf-masks (insn all-slots)
+  "(values GEN KILL) for liveness: bits 0..16 are V0..VR, bit 32+S frame slot S."
+  (let ((shape (%irdf-shape (car insn))))
+    (if (eq shape :unknown)
+        (values (logior #x1FFFF all-slots) 0)
+        (let ((gen 0) (kill 0))
+          (destructuring-bind (rd wr) shape
+            (dolist (p rd)
+              (let ((r (nth p insn))) (when (%irdf-reg-p r) (setq gen (logior gen (%irdf-bits r))))))
+            (dolist (p wr)
+              (let ((r (nth p insn))) (when (%irdf-reg-p r) (setq kill (logior kill (ash 1 r)))))))
+          (case (car insn)
+            (:stack-load (setq gen (logior gen (ash 1 (+ 32 (third insn))))))
+            (:stack-store (setq kill (logior kill (ash 1 (+ 32 (third insn))))))
+            ;; a callee takes V0..V3 (and may unwind to a landing that reads
+            ;; any slot); RET hands back VR
+            (:call (setq gen (logior gen #xF (%irdf-bits 0) all-slots)
+                         kill (logior kill (ash 1 16))))
+            (:ret (setq gen (logior gen (%irdf-bits 16)))))
+          (when (%irdf-frame-touch-p insn) (setq gen (logior gen all-slots)))
+          ;; a register both read and written stays live above
+          (values gen (logandc2 kill gen))))))
+
+(defun %irdf-pure-p (insn)
+  (and (member (car insn) '(:mov :li :li-const :li-func :get-cenv :stack-load))
+       (%irdf-reg-p (second insn))))
+
+(defun %irdf-dse (v)
+  "Liveness over V (a vector of IR); returns V with dead pure writes and dead
+   STACK-STOREs replaced by NIL, and whether anything changed."
+  (let* ((n (length v))
+         (nslots (1+ (loop for insn across v
+                           when (member (car insn) '(:stack-load :stack-store))
+                             maximize (third insn) into m
+                           finally (return (or m -1)))))
+         (all-slots (ash (1- (ash 1 nslots)) 32))
+         (label-at (make-hash-table))
+         (gen (make-array n)) (kill (make-array n))
+         (live-in (make-array n :initial-element 0))
+         (changed nil))
+    (dotimes (k n)
+      (let ((insn (aref v k)))
+        (when (eq (car insn) :label) (setf (gethash (second insn) label-at) k))
+        (multiple-value-bind (g kl) (%irdf-masks insn all-slots)
+          (setf (aref gen k) g (aref kill k) kl))))
+    (flet ((live-out (k)
+             (let* ((insn (aref v k)) (op (car insn)) (out 0))
+               (unless (member op '(:br :ret :tailcall))
+                 (when (< (1+ k) n) (setq out (aref live-in (1+ k)))))
+               (let* ((tg (%irp-target insn)) (j (and tg (gethash tg label-at))))
+                 (when j (setq out (logior out (aref live-in j)))))
+               out)))
+      (loop with again = t
+            while again
+            do (setq again nil)
+               (loop for k from (1- n) downto 0
+                     do (let ((in (logior (aref gen k)
+                                          (logandc2 (live-out k) (aref kill k)))))
+                          (unless (= in (aref live-in k))
+                            (setf (aref live-in k) in again t)))))
+      (dotimes (k n)
+        (let ((insn (aref v k)))
+          (when (or (and (%irdf-pure-p insn)
+                         (not (logtest (%irdf-bits (second insn)) (live-out k))))
+                    (and (eq (car insn) :stack-store)
+                         (not (logbitp (+ 32 (third insn)) (live-out k)))))
+            (setf (aref v k) nil changed t)))))
+    (values (remove nil v) changed)))
+
+(defun %irdf-forward (v)
+  "Within each straight run of V (a label ends it, a branch does not): reads
+   of a register that is a copy of another read the original instead
+   (MOV d s), a STACK-LOAD of a slot whose value a register still holds
+   becomes a MOV from it (or nothing), and a self-MOV goes.  Returns the new
+   vector and whether anything changed."
+  (let ((copy (make-array 17 :initial-element nil))  ; r -> the register r equals
+        (slot (make-hash-table))                     ; slot -> a register holding it
+        (out nil) (changed nil))
+    (labels ((reset () (fill copy nil) (clrhash slot))
+             (clobber (w)
+               ;; V0 and VR are one register on most targets (%IRDF-BITS)
+               (when *irdf-vr-is-v0*
+                 (when (eql w 0) (clobber1 16))
+                 (when (eql w 16) (clobber1 0)))
+               (clobber1 w))
+             (clobber1 (w)
+               (setf (aref copy w) nil)
+               (dotimes (x 17) (when (eql (aref copy x) w) (setf (aref copy x) nil)))
+               (let ((dead nil))
+                 (maphash (lambda (s r) (when (eql r w) (push s dead))) slot)
+                 (dolist (s dead) (remhash s slot)))))
+      (loop for insn across v
+            do (let* ((op (car insn)) (shape (%irdf-shape op)))
+                 (cond
+                   ((eq op :label) (reset) (push insn out))
+                   ((or (eq shape :unknown) (eq op :call))
+                    (reset) (push insn out))
+                   (t
+                    (destructuring-bind (rd wr) shape
+                      ;; reads see through copies
+                      (let ((new (copy-list insn)))
+                        (dolist (p rd)
+                          (let ((r (nth p new)))
+                            (when (and (%irdf-reg-p r) (aref copy r))
+                              (setf (nth p new) (aref copy r)))))
+                        (unless (equal new insn) (setq changed t insn new)))
+                      ;; a reload of a slot a register holds
+                      (when (eq op :stack-load)
+                        (let ((r (gethash (third insn) slot)))
+                          (when r
+                            (setq insn (list :mov (second insn) r) op :mov changed t))))
+                      (cond
+                        ((and (eq op :mov) (eql (second insn) (third insn)))
+                         (setq changed t))      ; a self-move: gone
+                        (t
+                         (push insn out)
+                         (when (%irdf-frame-touch-p insn) (clrhash slot))
+                         (dolist (p wr)
+                           (let ((w (nth p insn))) (when (%irdf-reg-p w) (clobber w))))
+                         (case op
+                           (:mov (when (and (%irdf-reg-p (second insn)) (%irdf-source-p (third insn)))
+                                   (setf (aref copy (second insn)) (third insn))))
+                           (:stack-store
+                            (if (%irdf-source-p (second insn))
+                                (setf (gethash (third insn) slot) (second insn))
+                                (remhash (third insn) slot)))
+                           (:stack-load
+                            (when (%irdf-source-p (second insn))
+                              (setf (gethash (third insn) slot) (second insn))))
+                           ((:br :ret) (reset))))))))))
+      (values (coerce (nreverse out) 'vector) changed))))
+
+(defun %ir-dataflow (ir)
+  "%IRDF-FORWARD and %IRDF-DSE over one function's IR, to a fixed point
+   (at most 6 rounds).  A function with a TRAP comes back unchanged."
+  (if (find :trap ir :key #'car)
+      ir
+      (let ((v (coerce ir 'vector)))
+        (setq *irdf-vr-is-v0* (%irdf-vr-is-v0-p))
+        (loop repeat 6
+              do (multiple-value-bind (v1 c1) (%irdf-forward v)
+                   (multiple-value-bind (v2 c2) (%irdf-dse v1)
+                     (setq v v2)
+                     (unless (or c1 c2) (return)))))
+        (coerce v 'list))))
+
 (defvar *fixed-arity-params* nil
   "After an image's MVM-COMPILE-ALL with *ELIDE-FIXED-NARGS*: function key ->
    N for each function whose final definition takes exactly N required
@@ -34102,9 +34455,24 @@
                  *functions*)
         (setf *fixed-arity-params* h)))
 
+    ;; Phase 2b'': local clean-ups of the finished IR (%IR-PEEPHOLE)
+    (when (and *ir-peephole* (not *mvm-eval-runtime-p*))
+      (dolist (entry all-ir)
+        (setf (cdr entry) (%ir-peephole (cdr entry)))))
+    ;; ... then liveness, copy propagation and slot forwarding (%IR-DATAFLOW),
+    ;; and the peephole again over what they leave
+    (when (and *ir-dataflow* (not *mvm-eval-runtime-p*))
+      (dolist (entry all-ir)
+        (when (%irdf-selected-p (function-info-name (car entry)))
+          (setf (cdr entry) (%ir-dataflow (cdr entry))))
+        (when *ir-peephole*
+          (setf (cdr entry) (%ir-peephole (cdr entry))))))
     ;; Phase 2c: drop what the image's entry points do not reach (*IR-DCE-ROOTS*).
     (when *ir-dce-roots*
       (setq all-ir (%ir-dce all-ir *ir-dce-roots*)))
+    ;; MODUS_DUMP_IR=NAME,NAME...: those functions' final IR on the build log
+    (unless *mvm-eval-runtime-p*
+      (%dump-ir-named all-ir))
     ;; ... and without it, MODUS_HOT_ORDER is layout alone.
     (when (and *ir-hot-order* (not *ir-dce-roots*))
       (setq all-ir (%ir-hot-sort all-ir)))
@@ -34336,6 +34704,31 @@
     (loop for const in (compiled-module-constant-table module)
           for i from 0
           do (format t "  [~D] ~S~%" i const))))
+
+(defun %dump-ir-named (all-ir)
+  "MODUS_DUMP_IR=NAME,NAME... (build host only): print each named function's
+   final IR -- after every IR pass -- as DUMP-IR does.  MODUS_DUMP_IR=@FILE:
+   every function's, to FILE, one (NAME . IR) form a line."
+  (let ((v (sb-ext:posix-getenv "MODUS_DUMP_IR")))
+    ;; @FILE: every function, to FILE, as (name . ir) forms one a line
+    (when (and v (> (length v) 1) (char= (char v 0) #\@))
+      (with-open-file (o (subseq v 1) :direction :output :if-exists :supersede)
+        (let ((*print-pretty* nil) (*print-readably* nil))
+          (dolist (e all-ir)
+            (prin1 (cons (princ-to-string (function-info-name (car e))) (cdr e)) o)
+            (terpri o))))
+      (return-from %dump-ir-named nil))
+    (when (and v (plusp (length v)))
+      (let ((names (let ((out nil) (start 0))
+                     (loop for c = (position #\, v :start start)
+                           do (push (string-upcase (subseq v start c)) out)
+                              (if c (setq start (1+ c)) (return)))
+                     out)))
+        (dolist (e all-ir)
+          (let ((nm (string-upcase (princ-to-string (function-info-name (car e))))))
+            (when (member nm names :test #'string=)
+              (format t "~&;; IR of ~A (~D instructions)~%" nm (length (cdr e)))
+              (dump-ir (cdr e)))))))))
 
 (defun dump-ir (ir-list)
   "Print IR instructions in a human-readable format for debugging"

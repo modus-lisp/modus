@@ -163,6 +163,12 @@
 ;; BUILD-IMAGE.  See mvm/build-checks.lisp.
 (mvm-load "mvm/build-checks.lisp")
 
+;; HOST-ONLY: the fixed-address registry (low-block words, window slots,
+;; per-port extension words) and CHECK H -- two features claiming the same
+;; address fail the build here, naming both owners.  See
+;; mvm/fixed-addresses.lisp and docs/fixed-addresses.md.
+(mvm-load "mvm/fixed-addresses.lisp")
+
 ;; HOST-ONLY: MODUS_A64_NO_FRAME_RECORDS=1 builds AArch64 code without frame
 ;; records (translate-aarch64.lisp, A64-FRAME-RECORDS-P), for A/B comparison.
 (let ((v (sb-ext:posix-getenv "MODUS_A64_NO_FRAME_RECORDS")))

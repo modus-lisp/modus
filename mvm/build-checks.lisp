@@ -1636,6 +1636,14 @@ Set MODUS_GLOBAL_CHECK=warn to downgrade, =0 to disable.~%~%~{  - ~A~%~}~%"
                   (setq args (list* :source-text fin
                                     (loop for (k v) on args by #'cddr
                                           unless (eq k :source-text) append (list k v))))))))
+          ;; CHECK H (mvm/fixed-addresses.lisp, loaded after this file): the
+          ;; fixed-address registry -- overlaps, drifted constants, window
+          ;; extents -- re-run now that the build's boot descriptors are
+          ;; loaded, and the once-per-process tree ratchet.  Before the
+          ;; compile, so a collision leaves no binary behind.
+          (when (fboundp 'check-fixed-addresses)
+            (%gck-guard "check-fixed-addresses"
+              (funcall 'check-fixed-addresses :where (%gck-build-label))))
           (setf *gck-defun-log* nil)
           (setf *undeclared-redefinitions* nil)
           (when *gck-fallback-census* (clrhash *gck-fallback-census*))

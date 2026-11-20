@@ -3432,6 +3432,30 @@
     (defvar cl-user::*rt-macros-source* text)   ; build-cli-common's (in CL-USER)
     (format t "~&;; mac68k: ~D runtime macros compiled into the image~%" k)))
 
+;;; :MAC68K: FLOPPY FILES (mvm/mac68k-files.lisp): fs-fat's lib/fat32.lisp and
+;;; the FLOPPY package over the Mac's disk service, baked as TEXT that the
+;;; build's core run LOADs before the freeze (fs-fat is its own repository and
+;;; package; the image's own source is kernel code).  The text is init-only.
+;;; On for MODUS_MAC68K_MACHINE=floppy (the 8 MB floppy set: its second disk
+;;; is FAT12); MODUS_MAC68K_FILES=1 / 0 says otherwise.  fs-fat is FS_FAT, else
+;;; a checkout beside this one.
+(defvar *mac68k-files-text*
+  (let ((on (sb-ext:posix-getenv "MODUS_MAC68K_FILES")))
+    (when (and *cl-repl-mac68k-p*
+               (if (and on (plusp (length on)))
+                   (string/= on "0")
+                   (string-equal (or (sb-ext:posix-getenv "MODUS_MAC68K_MACHINE") "") "floppy")))
+      (let* ((e (sb-ext:posix-getenv "FS_FAT"))
+             (lib (if (and e (plusp (length e)))
+                      (merge-pathnames "lib/fat32.lisp"
+                                       (if (char= (char e (1- (length e))) #\/) e (concatenate 'string e "/")))
+                      (merge-pathnames "../fs-fat/lib/fat32.lisp" *modus-base*))))
+        (unless (probe-file lib)
+          (error "mac68k: floppy files need fs-fat: set FS_FAT (no ~A)" lib))
+        (format t "~&;; mac68k: floppy files: ~A + mvm/mac68k-files.lisp, LOADed by the core run~%" lib)
+        (concatenate 'string (read-file-text lib) (string #\Newline)
+                     (mvm-text "mvm/mac68k-files.lisp"))))))
+
 ;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
 ;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
 ;;; to switch them off in, no sockets or threads for them to wrap, and the text
@@ -3466,6 +3490,23 @@
                      start (+ i (length cross)))))
     (when *mac-cold-names-out*
       (setq text (concatenate 'string text (string #\Newline) (mvm-text "mvm/mac68k-cold.lisp"))))
+    ;; FLOPPY FILES: the text (init-only), and its LOAD in the core run
+    (when *mac68k-files-text*
+      (when *mac-init-only* (setf (gethash *mac68k-files-text* *mac-init-only*) t))
+      (setq text (concatenate 'string text (format nil "
+(defun %mac-files-source ()
+  ~A)
+
+(defun %mac-files-install ()
+  (when (eql (mem-ref #x1000602C :u32) 1)
+    (handler-case
+        (progn (%it-eval-source (%mac-files-source) \"floppy\")
+               (write-string-serial \"FLOPPY-FILES\") (write-char-serial 10))
+      (error (c)
+        (write-string-serial \"FLOPPY-FILES-FAILED \")
+        (handler-case (write-string-serial (princ-to-string c)) (error (e) nil))
+        (write-char-serial 10)))))
+" (prin1-to-string *mac68k-files-text*)))))
     ;; THE CORE RUN PROMOTES BY COUNT ALONE: a runtime DEFUN's trampoline also
     ;; goes native after 10 ms interpreted (mvm-eval %JIT-HOT-NS), and under an
     ;; emulator that is the host's timing -- measured, two core runs of one
@@ -3522,6 +3563,8 @@
     (unless at (error "mac68k: E2SMOKE-END moved out of *CLI-ARCH-KERNEL-EPILOGUE*"))
     (setq *cli-arch-kernel-epilogue*
           (concatenate 'string (subseq *cli-arch-kernel-epilogue* 0 (+ at (length k)))
+                       (if *mac68k-files-text* "  (%mac-files-install)
+" "")
                        "  ;; boot's own compiled forms (E2SMOKE) are not worth 66 KB of a
   ;; Classic's static heap: the cache refills from the REPL's forms
   (setq *mvm-eval-cache* nil)

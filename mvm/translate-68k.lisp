@@ -2191,7 +2191,11 @@
             ;; its arguments, all TAGGED; the result TAGGED in V0.  Service 1:
             ;; read V3 bytes from disk byte V1 of the boot drive to address V2
             ;; (M68K-EMIT-MAC-SERVICE).  Service 2: _BlockMove.  Service 3: flush
-            ;; the instruction cache.  Service 4: a plain copy.  Any other: -1.
+            ;; the instruction cache.  Service 4: a plain copy.  Services 5-8,
+            ;; any drive (M68K-EMIT-MAC-SERVICE): 5 select drive V1; 6 read V3
+            ;; bytes from byte V1 of it to V2; 7 write V3 bytes from V2 there;
+            ;; 8 the word at byte V2 of the V1-th drive-queue element.  Any
+            ;; other: -1.
             (let ((other (mvm-make-label)) (out (mvm-make-label)) (svc1 (mvm-make-label)))
               (m68k-emit-move-dn-dn buf +68k-d2+ +68k-d0+)
               (m68k-emit-asr-imm buf +68k-d0+ 1)
@@ -2226,6 +2230,14 @@
                 (m68k-emit-move-imm-dn buf 0 +68k-d2+)
                 (m68k-emit-bra buf out)
                 (m68k-emit-label buf not4))
+              ;; 5-8: the service routine, D0 the service, D1-D3 as for 1
+              (let ((not58 (mvm-make-label)))
+                (m68k-emit-cmpi buf +68k-d0+ 5)
+                (m68k-emit-bcc-word buf +68k-cc-cs+ not58)
+                (m68k-emit-cmpi buf +68k-d0+ 8)
+                (m68k-emit-bcc-word buf +68k-cc-hi+ not58)
+                (m68k-emit-bra buf svc1)
+                (m68k-emit-label buf not58))
               ;; Service 2: the ROM's _BlockMove of V3 bytes from address V1 to
               ;; address V2 (overlap-safe; the console's scroll).  Result 0.
               (m68k-emit-cmpi buf +68k-d0+ 2)
@@ -4078,32 +4090,76 @@
     (m68k-emit-word buf #x4ED0)))
 
 (defun m68k-emit-mac-service (buf)
-  "The bare Mac's disk service, at *68K-MAC-SERVICE-LABEL*: read D2 bytes from
-   byte D1 of the boot drive into D3 (both multiples of 512: the SCSI driver
-   reads whole blocks), the way the code loader reads a stream -- the boot
-   drive's drive-queue element (BootDrive $210, DrvQHdr $30A), then _Read from
-   the start.  D2 = 0, or the _Read error, or -1 when there is no boot drive.
-   Keeps D4-D7 and every address register; _Read itself may clobber D0-D2."
+  "The bare Mac's disk service, at *68K-MAC-SERVICE-LABEL*, D0 the service:
+     1  read D2 bytes from byte D1 of the BOOT drive into D3 (the code loader's
+        and COLD-ENTER's: the boot drive's drive-queue element -- BootDrive
+        $210, DrvQHdr $30A -- then _Read from the start; launched from Mac OS,
+        the open file instead)
+     5  select drive D1 (its dQDrive) for 6 and 7; 0 is the boot drive again
+     6  read D2 bytes from byte D1 of the selected drive into D3
+     7  write D2 bytes from D3 to byte D1 of the selected drive (_Write)
+     8  the word at byte D3 of the D1-th drive-queue element (6 its drive
+        number, 8 its driver's refNum), or 0 past the queue's end
+   (a floppy's driver takes whole 512-byte blocks).  D2 = 0, or the _Read /
+   _Write error, or -1 when there is no such drive or service; 8: the word.
+   Keeps D4-D7 and every address register; the traps may clobber D0-D2."
   (flet ((ws (&rest words) (dolist (w words) (m68k-emit-word buf w))))
     (let ((dq (mvm-make-label)) (found (mvm-make-label)) (zl (mvm-make-label))
           (fail (mvm-make-label)) (done (mvm-make-label)) (pb (mvm-make-label))
-          (drive (mvm-make-label)) (have (mvm-make-label)))
+          (drive (mvm-make-label)) (have (mvm-make-label)) (common (mvm-make-label))
+          (sel (mvm-make-label)) (n5 (mvm-make-label)) (n8 (mvm-make-label))
+          (walk (mvm-make-label)) (got (mvm-make-label)) (past (mvm-make-label))
+          (n6 (mvm-make-label)) (wr (mvm-make-label)) (trapped (mvm-make-label))
+          (boot (mvm-make-label)))
       (m68k-emit-label buf *68k-mac-service-label*)
       (ws #x48E7 #x0FFA)                                 ; MOVEM.L D4-D7/A0-A4/A6,-(SP)
+      (ws #x7A00 #x7800)                                 ; MOVEQ #0,D5 (read); MOVEQ #0,D4 (boot drive)
+      (m68k-emit-cmpi buf +68k-d0+ 1) (m68k-emit-beq buf common)
+      ;; 5: select
+      (m68k-emit-cmpi buf +68k-d0+ 5) (m68k-emit-bne buf n5)
+      (m68k-emit-lea-label buf sel +68k-a0+)
+      (ws #x3081)                                        ; MOVE.W D1,(A0)
+      (ws #x7400) (m68k-emit-bra buf done)               ; MOVEQ #0,D2
+      (m68k-emit-label buf n5)
+      ;; 8: a drive-queue element's word
+      (m68k-emit-cmpi buf +68k-d0+ 8) (m68k-emit-bne buf n8)
+      (ws #x2078 #x030A #x2C01)                          ; MOVEA.L $30A,A0; MOVE.L D1,D6
+      (m68k-emit-label buf walk)
+      (ws #x2E08) (m68k-emit-beq buf past)               ; MOVE.L A0,D7: the end
+      (ws #x4A86) (m68k-emit-beq buf got)                ; TST.L D6
+      (ws #x5386 #x2050) (m68k-emit-bra buf walk)        ; SUBQ.L #1,D6; MOVEA.L (A0),A0
+      (m68k-emit-label buf got)
+      (ws #x3430 #x3000 #x48C2) (m68k-emit-bra buf done) ; MOVE.W (0,A0,D3.W),D2; EXT.L D2
+      (m68k-emit-label buf past)
+      (ws #x7400) (m68k-emit-bra buf done)               ; MOVEQ #0,D2
+      (m68k-emit-label buf n8)
+      ;; 6 and 7: the selected drive, reading or writing
+      (m68k-emit-cmpi buf +68k-d0+ 7) (m68k-emit-bne buf n6)
+      (ws #x7A01)                                        ; MOVEQ #1,D5: write
+      (m68k-emit-label buf n6)
+      (m68k-emit-cmpi buf +68k-d0+ 6) (m68k-emit-bcc-word buf +68k-cc-cs+ fail)
+      (m68k-emit-cmpi buf +68k-d0+ 7) (m68k-emit-bcc-word buf +68k-cc-hi+ fail)
+      (m68k-emit-lea-label buf sel +68k-a0+)
+      (ws #x3810)                                        ; MOVE.W (A0),D4
+      (m68k-emit-label buf common)
       (m68k-emit-lea-label buf pb +68k-a0+)
       (ws #x7013)                                        ; MOVEQ #19,D0
       (m68k-emit-label buf zl)
       (ws #x4298)                                        ; CLR.L (A0)+
       (ws #x51C8) (m68k-emit-word buf 0) (m68k-emit-fixup buf zl :disp16) ; DBRA D0,zl
       (m68k-emit-lea-label buf pb +68k-a0+)
-      ;; launched from Mac OS (scripts/mac68k-chain.py): the disk is a file
+      ;; the boot drive (D4 = 0) launched from Mac OS (scripts/mac68k-chain.py):
+      ;; the disk is a file
+      (ws #x4A44) (m68k-emit-bne buf drive)              ; TST.W D4
       (let ((a (conv-real +68k-mac-file-refnum+)))
         (ws #x2039 (ash a -16) (logand a #xFFFF)))       ; MOVE.L slot,D0
-      (m68k-emit-beq buf drive)
+      (m68k-emit-beq buf boot)
       (ws #x3140 #x0018)                                 ; ioRefNum = the file's
       (m68k-emit-bra buf have)
+      (m68k-emit-label buf boot)
+      (ws #x3838 #x0210)                                 ; D4 = BootDrive
       (m68k-emit-label buf drive)
-      (ws #x3838 #x0210 #x2678 #x030A)                   ; D4 = BootDrive; A3 = DrvQHdr.qHead
+      (ws #x2678 #x030A)                                 ; A3 = DrvQHdr.qHead
       (m68k-emit-label buf dq)
       (ws #x200B) (m68k-emit-beq buf fail)               ; end of the queue
       (ws #xB86B #x0006) (m68k-emit-beq buf found)       ; CMP.W 6(A3),D4: dQDrive
@@ -4116,7 +4172,12 @@
       (ws #x2142 #x0024)                                 ; ioReqCount = D2
       (ws #x317C #x0001 #x002C)                          ; ioPosMode = fsFromStart
       (ws #x2141 #x002E)                                 ; ioPosOffset = D1
+      (ws #x4A85) (m68k-emit-bne buf wr)                 ; TST.L D5
       (ws #xA002)                                        ; _Read
+      (m68k-emit-bra buf trapped)
+      (m68k-emit-label buf wr)
+      (ws #xA003)                                        ; _Write
+      (m68k-emit-label buf trapped)
       (ws #x48C0 #x2400)                                 ; EXT.L D0; D2 = the result
       (m68k-emit-bra buf done)
       (m68k-emit-label buf fail)
@@ -4124,6 +4185,8 @@
       (m68k-emit-label buf done)
       (ws #x4CDF #x5FF0)                                 ; MOVEM.L (SP)+,D4-D7/A0-A4/A6
       (ws #x4E75)                                        ; RTS
+      (m68k-emit-label buf sel)                          ; the selected drive (0: the boot drive)
+      (ws 0 0)
       (m68k-emit-label buf pb)                           ; the parameter block (80 bytes)
       (dotimes (i 40) (ws 0)))))
 
@@ -5419,6 +5482,7 @@
         (ws #xB885) (m68k-emit-bcc-word buf +68k-cc-cs+ full) ; under the JIT's top
         (ws #x23C4) (l32 (conv-real +68k-cold-floor+))       ; the new floor
         (ws #x2604)                                          ; D3 = the buffer
+        (ws #x7001)                                          ; MOVEQ #1,D0: service 1
         (m68k-emit-bsr buf *68k-mac-service-label*)
         (ws #x4A82) (m68k-emit-bne buf rfail)
         (ws #x2044 #xD1CA)                                   ; A0 = the body
@@ -5449,6 +5513,7 @@
         (ws #x2001 #x0280) (l32 511) (ws #x2640 #x9280)      ; A3 = skip; D1 = its block
         (ws #x2604 #x9682 #x0283) (l32 #xFFFFFFF0)           ; D3 = under the floor
         (ws #x200C #xB680) (m68k-emit-bcc-word buf +68k-cc-cs+ full)
+        (ws #x7001)                                          ; MOVEQ #1,D0: service 1
         (m68k-emit-bsr buf *68k-mac-service-label*)
         (ws #x4A82) (m68k-emit-bne buf rfail)
         (ws #xD7C3 #x49EB #x0006)                            ; A3 = the list; A4 = its offsets

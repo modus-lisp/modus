@@ -94,6 +94,16 @@
   "A core boot's STATIC heap (translate-i386.lisp +I386-GC-STATIC-LO+): the
    restored heap, walked by every collection and never copied.")
 (defconstant +i386-cl-v-static-hi+ #x8094 "Its end; 0: none.")
+(defconstant +i386-cl-v-dataoff+ #x8098
+  "A version-5 core's code store data: its file offset (0: in memory).  A
+   page fault reads the chunk's sectors through the no-DOS loader's PM_READ.")
+(defconstant +i386-cl-v-imglba+ #x809C "The image file's first sector (the boot record's).")
+(defconstant +i386-cl-v-diskread+ #x80A0 "PM_READ's address (the boot record's).")
+(defconstant +i386-cl-bootrec+ #x0580
+  "scripts/pcboot2.s's boot record: 'PCBT', PM_READ, the image's first sector,
+   the drive.")
+(defconstant +i386-cl-v-stacksz+ #x80A4
+  "The stack's bytes: 1 MB, or 384 KB on a machine under 16 MB.")
 (defvar *i386-cl-gc-static*
   (not (equal (sb-ext:posix-getenv "MODUS_I386_GC_STATIC") "0"))
   "A core boot's restored heap is static, the semispaces above it hold only
@@ -109,6 +119,17 @@
 (defconstant +i386-cl-tick-addr+ #x8100
   "The PIT's tick count (100 Hz), kept by the timer interrupt: the clock
    (translate-i386 *I386-PIT-CLOCK*).  Low memory, identity-mapped.")
+
+(defun i386cl-say-and-halt (text)
+  "Items that write TEXT to the top-left of VGA text memory and COM1, then
+   stop -- the no-ram exit's shape, for any message."
+  (append
+   (list (cons #xBF (i386l-le32-list #xB8000)))
+   (loop for ch across text
+         for c = (char-code ch)
+         append (list (list #x66 #xC7 #x07 c #x4F) '(#x83 #xC7 #x02)
+                      '(#x66 #xBA #xF8 #x03) (list #xB0 c) '(#xEE)))
+   (list '(#xFA) '(#xF4) '(#xEB #xFC))))                  ; cli; hlt; jmp hlt
 
 (defun i386cl-abs (op-bytes addr)
   "OP-BYTES (a list) then the 32-bit ADDR: an absolute-operand instruction."
@@ -127,7 +148,8 @@
       (list '(#xFA) '(#xFC)                                   ; cli, cld
             (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 0))
             (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-static-lo+) (i386l-le32-list 0))
-            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-static-hi+) (i386l-le32-list 0)))
+            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-static-hi+) (i386l-le32-list 0))
+            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-dataoff+) (i386l-le32-list 0)))
       ;; the FPU: SSE2's OS bits, or x87 at 53-bit precision (MODUS_I386_FP=x87,
       ;; which runs where there is no CR4 to write -- a 386 or 486), or for
       ;; the soft-float image (MODUS_I386_SOFT_FLOAT, a 486SX or a 386 with no
@@ -220,11 +242,25 @@
        '(#x5E)                                                ; pop esi
        (cons #xBF (i386l-le32-list +i386-cl-low-va+))
        (cons #xB9 (i386l-le32-list (floor +i386-cl-low-size+ 4096))) '(:call 0 map)
-       ;; the stack
-       (cons #xB9 (i386l-le32-list +i386-cl-stack-size+)) '(:call 0 alloc)
+       ;; the stack: 1 MB of extended memory, or on a machine under 16 MB
+       ;; 256 KB of CONVENTIONAL memory, [4F000h, 8F000h), which nothing uses
+       ;; once the image runs (the boot stack's top is in it, and done with
+       ;; before this stack is used): an 8 MB machine has no extended memory
+       ;; to spare, and the REPL's deepest work fits
+       (cons #xB9 (i386l-le32-list +i386-cl-stack-size+))
+       (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-v-ramend+) (i386l-le32-list #x1000000))))
+       '(:j8 #x73 stack-big)                                  ; jae
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-stacksz+) (i386l-le32-list #x40000))
+       (cons #xBE (i386l-le32-list #x4F000))                  ; esi = PA
+       '(:j8 #xEB stack-map)
+       '(:label stack-big)
+       (i386cl-abs '(#x89 #x0D) +i386-cl-v-stacksz+)
+       '(:call 0 alloc)
        '(#x89 #xC6)
-       (cons #xBF (i386l-le32-list (- +i386-cl-stack-top+ +i386-cl-stack-size+)))
-       (cons #xB9 (i386l-le32-list (floor +i386-cl-stack-size+ 4096))) '(:call 0 map)
+       '(:label stack-map)
+       (cons #xBF (i386l-le32-list +i386-cl-stack-top+))
+       (i386cl-abs '(#x2B #x3D) +i386-cl-v-stacksz+)          ; edi = top - size
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-stacksz+) '(#xC1 #xE9 #x0C) '(:call 0 map)
        ;; NIL's page, all NIL
        (cons #xB9 (i386l-le32-list 4096)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB8 (i386l-le32-list nil-value))
@@ -279,6 +315,20 @@
        '(#x8B #x41 #x04) (i386cl-abs '(#xA3) +i386-cl-v-phi+)
        (i386cl-abs '(#x2B #x05) +i386-cl-v-plo+)
        (i386cl-abs '(#xA3) +i386-cl-v-pagedn+)
+       ;; version 5: the store's data is on the disk -- the boot record says
+       ;; where the image starts and how to read it, or there is no paging
+       (cons #x83 '(#x7B #x04 #x05))                          ; cmp dword [ebx+4], 5
+       '(:jcc32 #x72 store-in-ram)
+       '(#x8B #x43 #x28) (i386cl-abs '(#xA3) +i386-cl-v-dataoff+)  ; [hdr+40]
+       (cons #x81 (cons #x3D (append (i386l-le32-list +i386-cl-bootrec+)
+                                     (i386l-le32-list #x54424350))))   ; cmp [rec], 'PCBT'
+       '(:jcc32 #x75 no-disk)
+       (i386cl-abs '(#xA1) (+ +i386-cl-bootrec+ 8))
+       '(#x85 #xC0) '(:jcc32 #x74 no-disk)
+       (i386cl-abs '(#xA3) +i386-cl-v-imglba+)
+       (i386cl-abs '(#xA1) (+ +i386-cl-bootrec+ 4))
+       (i386cl-abs '(#xA3) +i386-cl-v-diskread+)
+       '(:label store-in-ram)
        ;; the pool: RAM/4, at least 2 MB, at most the paged code itself (then
        ;; nothing is ever evicted) and 12 MB.  Measured with
        ;; test/dos386/coverage-forms.lisp: its code working set is ~6 MB;
@@ -302,9 +352,11 @@
        (i386cl-abs '(#x3B #x05) +i386-cl-v-pagedn+) '(:j8 #x76 pool-fits)
        (i386cl-abs '(#xA1) +i386-cl-v-pagedn+)
        '(:label pool-fits)
-       ;; with a gap the pool is RAM the heap could have had, so the heap goes
-       ;; first: the pool is what is left past 8 MB of heap, from 2 MB up to
-       ;; the rule above (a header-named size still wins)
+       ;; with a gap the pool is RAM the heap could have had: of what is left,
+       ;; L, the pool takes max(L/3, L - 8 MB), from 512 KB up to the rule
+       ;; above (a header-named size still wins).  L/3 is the small machine's
+       ;; share (6 MB: ~1 MB, 8 MB: ~1.7 MB -- at 512 KB the code thrashed,
+       ;; 7651 faults over 103 x (make-list 10000)), L - 8 MB the large one's
        '(#x51)                                                ; push ecx (the store, for core-span)
        (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hole+) '(#x00))
        '(:jcc32 #x74 pool-capped)
@@ -312,14 +364,29 @@
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-ramend+)
        (i386cl-abs '(#x2B #x0D) +i386-cl-v-panext+)
        '(:j8 #x72 pool-min)                                   ; jb
-       '(#x81 #xE9) (i386l-le32-list (+ #x800000 +i386-cl-pt-reserve+))   ; sub ecx, 8 MB + PTs
+       '(#x81 #xE9) (i386l-le32-list +i386-cl-pt-reserve+)    ; sub ecx, PTs: ecx = L
        '(:j8 #x72 pool-min)
+       '(#x50)                                                ; push eax (the cap)
+       '(#x89 #xCA)                                           ; edx = L
+       '(#x81 #xEA) (i386l-le32-list #x800000)                ; edx = L - 8 MB
+       '(:j8 #x73 pool-big)                                   ; jae
+       '(#x31 #xD2)                                           ; edx = 0
+       '(:label pool-big)
+       '(#x52)                                                ; push edx
+       '(#x89 #xC8) '(#x31 #xD2)                              ; eax = L, edx = 0
+       (cons #xB9 (i386l-le32-list 3)) '(#xF7 #xF1)           ; eax = L/3
+       '(#x5A)                                                ; pop edx
+       '(#x39 #xD0) '(:j8 #x73 pool-third)                    ; cmp eax, edx; jae
+       '(#x89 #xD0)                                           ; eax = L - 8 MB
+       '(:label pool-third)
+       '(#x89 #xC1)                                           ; ecx = the share
+       '(#x58)                                                ; pop eax (the cap)
        '(#x39 #xC8) '(:j8 #x76 pool-floor)                    ; cmp eax, ecx; jbe
        '(#x89 #xC8)                                           ; eax = ecx
        '(:label pool-floor)
-       (cons #x3D (i386l-le32-list #x200000)) '(:j8 #x73 pool-capped)   ; >= 2 MB
+       (cons #x3D (i386l-le32-list #x80000)) '(:j8 #x73 pool-capped)   ; >= 512 KB
        '(:label pool-min)
-       (cons #xB8 (i386l-le32-list #x200000))
+       (cons #xB8 (i386l-le32-list #x80000))
        '(:label pool-capped)
        '(#x59)                                                ; pop ecx
        (cons #x25 (i386l-le32-list #xFFFFC000))
@@ -378,14 +445,14 @@
        '(#x85 #xDB) '(:jcc32 #x74 fits)                       ; test ebx, ebx; jz
        (if *i386-cl-gc-static*
            ;; static: the restored heap's pages, then two semispaces of at
-           ;; least M + 256 KB each, within S
+           ;; least M + 128 KB each, within S
            (list :splice '(#x8B #x43 #x08)                    ; eax = free
                  (cons #x05 (i386l-le32-list #xFFF))
                  (cons #x25 (i386l-le32-list #xFFFFF000))
                  (cons #x2D (i386l-le32-list +i386-cl-heap-va+))   ; the static pages
                  (i386cl-abs '(#x8B #x0D) +i386-cl-v-m+)
-                 '(#x81 #xC1) (i386l-le32-list #x40000)
-                 '(#xD1 #xE1)                                 ; ecx = 2 (M + 256 KB)
+                 '(#x81 #xC1) (i386l-le32-list #x20000)
+                 '(#xD1 #xE1)                                 ; ecx = 2 (M + 128 KB)
                  '(#x01 #xC8)                                 ; add eax, ecx
                  (i386cl-abs '(#x3B #x05) +i386-cl-v-s+)
                  '(:jcc32 #x76 fits))                         ; jbe
@@ -541,7 +608,23 @@
        '(#x8D #x54 #x8E #x14)                                 ; edx = data = store + 4n + 20
        '(#x8B #x4C #x86 #x14)                                 ; ecx = offsets[k+1]
        '(#x8B #x74 #x86 #x10)                                 ; esi = offsets[k]
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-dataoff+) '(#x00))
+       '(:jcc32 #x75 pf-disk)
        '(#x01 #xD1) '(#x01 #xD6)                              ; + data
+       '(:jmp32 0 pf-decode)
+       ;; the store on the disk: the chunk's sectors to 30000h through PM_READ
+       '(:label pf-disk)
+       (i386cl-abs '(#xA1) +i386-cl-v-dataoff+) '(#x01 #xF0)  ; eax = its file byte
+       '(#x29 #xF1) '(#x51)                                   ; ecx = len; push
+       '(#x89 #xC2) '(#x81 #xE2) (i386l-le32-list 511) '(#x52)   ; edx = skip; push
+       '(#xC1 #xE8 #x09) (i386cl-abs '(#x03 #x05) +i386-cl-v-imglba+)   ; eax = sector
+       '(#x8D #x8C #x0A) (i386l-le32-list 511) '(#xC1 #xE9 #x09)       ; ecx = sectors
+       (i386cl-abs '(#xFF #x15) +i386-cl-v-diskread+)         ; call [PM_READ]
+       '(:jcc32 #x72 pf-diskerr)
+       '(#x5A) '(#x59)                                        ; edx = skip, ecx = len
+       '(#x8D #xB2) (i386l-le32-list #x30000)                 ; esi = 30000h + skip
+       '(#x01 #xF1)                                           ; ecx = its end
+       '(:label pf-decode)
        '(#x89 #xDF) '(#xFC)                                   ; edi = chunk; cld
        ;; LZ4 block: token; literals (15: + bytes to a non-255); unless at the
        ;; end, a 16-bit offset and the match (low nibble + 4, 15: + bytes)
@@ -696,6 +779,10 @@
             '(#xC3)
             ;; "MODUS: not enough memory" at the top of the text screen (paging
             ;; is off, B8000h is itself) and on COM1, then halt
+            '(:label no-disk)
+            (cons :splice (i386cl-say-and-halt "MODUS: this image pages its code from the disk it booted from (scripts/pcboot.sh)"))
+            '(:label pf-diskerr)
+            (cons :splice (i386cl-say-and-halt "MODUS: a disk error paging code in"))
             '(:label no-ram)
             (cons #xBF (i386l-le32-list #xB8000))
             '(#x66 #xC7 #x07 77 #x4F) '(#x83 #xC7 #x02)

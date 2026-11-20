@@ -3199,8 +3199,9 @@
 ;;; :MAC68K: the 68k REPL's size switches, as mvm/build-68k-cli.lisp reads them.
 ;;; MODUS_NARROW_STRINGS=1: the reader and the name tables make one-byte
 ;;; strings, and pooled literals are narrow (set below, once MODUS.MVM exists).
-;;; MODUS_SMALL_IMAGE is build-cli-common's own.
-(when (and *cl-repl-mac68k-p*
+;;; MODUS_SMALL_IMAGE is build-cli-common's own.  Bare i386 the same: its
+;;; collector sizes #x13 as bytes (translate-i386's copy_object and typed walk).
+(when (and (or *cl-repl-mac68k-p* *cl-repl-i386-p*)
            (let ((v (sb-ext:posix-getenv "MODUS_NARROW_STRINGS")))
              (and v (> (length v) 0) (string/= v "0"))))
   (setq *cli-arch-override-source*
@@ -3211,7 +3212,9 @@
                      ;; and SUBSEQ of a narrow string is narrow (prelude)
                      "(defun %base-subseq-p () t)" (string #\Newline)
                      ;; and every fresh string is narrow (compiler.lisp *BASE-STRINGS-ONLY*)
-                     (if (equal (sb-ext:posix-getenv "MODUS_68K_WIDE_STRINGS") "1")
+                     (if (or (equal (sb-ext:posix-getenv "MODUS_68K_WIDE_STRINGS") "1")
+                             (and *cl-repl-i386-p*
+                                  (equal (sb-ext:posix-getenv "MODUS_WIDE_STRINGS") "1")))
                          ""
                          "(defun %base-strings-only-p () t)")
                      (string #\Newline)))
@@ -3826,6 +3829,19 @@
            (not (equal (sb-ext:posix-getenv "MODUS_I386_POOL_LITERALS") "0")))
   (setq *narrow-literals-p* t
         *string32-p* nil))
+;; ... and with MODUS_NARROW_STRINGS=1, the 68k Mac's narrow strings: pooled
+;; literals one byte a character (they were 4: 535 K characters, 2.1 MB of the
+;; resident image), every fresh string narrow (MODUS_WIDE_STRINGS=1 keeps wide
+;; ones), and with MODUS_SMALL_IMAGE one pooled object per distinct string and
+;; no NFN table, which nothing reads at run time.
+(when (and cl-user::*cl-repl-i386-p*
+           (boundp 'cl-user::*68k-pool-narrow*) cl-user::*68k-pool-narrow*)
+  (setq *pool-narrow-strings* t)
+  (unless (equal (sb-ext:posix-getenv "MODUS_WIDE_STRINGS") "1")
+    (setq *base-strings-only* t))
+  (when cl-user::*small-image*
+    (setq *pool-coalesce* t
+          *nfn-table-p* nil)))
 ;; ... and packed u32 vectors' arms (compiler.lisp *U32-VECTORS-P*), with them.
 (when cl-user::*cl-repl-rpi-p* (setq *u32-vectors-p* t))
 

@@ -2390,10 +2390,13 @@
     (i386-emit-and-reg-imm buf +scratch1+ 15)
     (i386-emit-cmp-reg-imm buf +scratch1+ 15)
     (i386-emit-jcc buf :e c-fwd)
-    ;; size -> EDX.  u8 vectors count BYTES, everything else counts WORDS.
+    ;; size -> EDX.  u8 vectors and narrow strings (#x13, a u8 vector with its
+    ;; subtag rewritten) count BYTES, everything else counts WORDS.
     (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
     (i386-emit-and-reg-imm buf +scratch1+ 255)
     (i386-emit-cmp-reg-imm buf +scratch1+ #x11)
+    (i386-emit-jcc buf :e c-u8)
+    (i386-emit-cmp-reg-imm buf +scratch1+ #x13)
     (i386-emit-jcc buf :e c-u8)
     (i386-emit-mov-reg-reg buf +scratch1+ +i386-eax+)
     (i386-emit-shr-reg-imm buf +scratch1+ 8)     ; element count
@@ -2829,6 +2832,8 @@
       ;; EAX = size (copy_object's rule), then EAX = next object
       (i386-emit-cmp-reg-imm buf +scratch0+ #x11)
       (i386-emit-jcc buf :e c-u8)
+      (i386-emit-cmp-reg-imm buf +scratch0+ #x13)            ; narrow string
+      (i386-emit-jcc buf :e c-u8)
       (i386-emit-mov-reg-reg buf +i386-eax+ +scratch1+)
       (i386-emit-add-reg-imm buf +i386-eax+ 1)
       (i386-emit-shl-reg-imm buf +i386-eax+ 2)
@@ -2842,7 +2847,7 @@
       (i386-emit-add-reg-reg buf +i386-eax+ +i386-ebp+)
       (i386-emit-push-reg buf +i386-eax+)                      ; [esp] = next
       ;; leaf subtags: skip the payload
-      (dolist (st '(#x10 #x11 #x12 #x14 #x16 #x60 #x64 #x65 #x66))
+      (dolist (st '(#x10 #x11 #x12 #x13 #x14 #x16 #x60 #x64 #x65 #x66))
         (i386-emit-cmp-reg-imm buf +scratch0+ st)
         (i386-emit-jcc buf :e c-skip))
       ;; slots: [ebp+4, ebp+4+4*count)

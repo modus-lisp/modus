@@ -194,14 +194,33 @@ def main():
         store_pa = hdr_pa + 64 + len(core)
         store_pa += -store_pa % 4096
     pool = int(os.environ.get('POOL_KB', '0')) * 1024
-    hdr = struct.pack('<4sIIIIIIIII', b'MCOR', 4 if gap else 3 if store else 2, free,
-                      heap_bytes, bm_bytes, tail_lo, tail_hi, store_pa, pool, gap)
+    # THE STORE ON THE DISK (version 5, MODUS_I386_DISK_STORE=1, with a gap):
+    # the store's index -- plo, phi, the chunk size, n, offsets[n+1] -- stays
+    # where it was; its data goes after the trailer, past load_end, so the
+    # loader never reads it.  A page fault reads the sectors of the one chunk
+    # it needs, through the no-DOS loader's PM_READ (scripts/pcboot2.s), from
+    # the image's first sector + its file offset (+40).  Only a disk that
+    # boots with scripts/pcboot.sh can run such an image.
+    disk = bool(gap) and os.environ.get('MODUS_I386_DISK_STORE') == '1'
+    index, data = store, b''
+    if disk:
+        n = struct.unpack_from('<I', store, 12)[0]
+        index, data = store[:16 + 4 * (n + 1)], store[16 + 4 * (n + 1):]
+    version = 5 if disk else 4 if gap else 3 if store else 2
+    hdr = struct.pack('<4sIIIIIIIIII', b'MCOR', version, free,
+                      heap_bytes, bm_bytes, tail_lo, tail_hi, store_pa, pool, gap, 0)
     body += hdr + b'\0' * (64 - len(hdr)) + core
     if store:
         body += b'\0' * (store_pa - LOAD - len(body))
-        body += store
+        body += index
     body += b'MODUSCOR' + struct.pack('<II', hdr_pa, 0)
     struct.pack_into('<I', body, 20, LOAD + len(body))       # load_end_addr
+    if disk:
+        body += b'\0' * (-len(body) % 512)
+        struct.pack_into('<I', body, hdr_pa - LOAD + 40, len(body))   # the data's file offset
+        body += data
+        print('code store on the disk: index %d bytes loaded, %d bytes of data past load_end'
+              % (len(index), len(data)))
     open(out, 'wb').write(body)
     print('%s: image %d + core %d bytes (low %d, heap %d, bitmaps 2 x %d)'
           % (out, hdr_pa - LOAD, len(body) - (hdr_pa - LOAD), LOW_SIZE, heap_bytes, bm_bytes))

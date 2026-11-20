@@ -22,6 +22,19 @@
 # the 64 KB it stages HMA-bound data in): one LBA call, or with CHS one call
 # per track.
 #
+# THE BOOT RECORD (at 0:0580, for the image once it runs): "PCBT", the linear
+# address of PM_READ, the first sector of the image MODUS.COM opened (a .BIN or
+# .SF), the drive.  PM_READ is a 32-bit routine the image calls from protected
+# mode, paging on, interrupts off: EAX = a sector, ECX = how many (1..64) ->
+# the sectors at 3000:0000 (linear 30000h), EAX = how many were read, CF on a
+# disk error; every other register kept.  It drops to real mode with the
+# BIOS's interrupt controller mapping (IRQ 0-7 at 08h, 8-15 at 70h; the timer,
+# the floppy and the disks unmasked, the keyboard not), reads with INT 13h,
+# and returns to the image's mapping (20h / 28h, masks FAh / FDh: what
+# boot/boot-i386.lisp EMIT-I386-INTERRUPT-SETUP programs) and its GDT, IDT,
+# CR0 and stack.  Everything it touches below 1 MB is the shim's own, the
+# buffer, and a real-mode stack under 7C00h.
+#
 # Assemble: as --32 -o b2.o pcboot2.s
 #           ld -m elf_i386 -Ttext=0x0800 --oformat binary -o pcboot2.bin b2.o
 
@@ -34,6 +47,7 @@
         .equ    BSEG,   0x3000          # the read buffer's
         .equ    BSECS,  64              # its size in sectors
         .equ    NHANDLE, 4
+        .equ    BOOTREC, 0x0580
 
 _start:
         xor     %ax, %ax
@@ -66,6 +80,12 @@ _start:
 
         mov     $msg_boot, %si
         call    putz
+
+        movl    $0x54424350, BOOTREC    # "PCBT"
+        movl    $pm_read, BOOTREC+4
+        movl    $0, BOOTREC+8
+        movzbl  drive, %eax
+        mov     %eax, BOOTREC+12
 
         movw    $int21, 0x84            # INT 21h is ours
         movw    $0, 0x86
@@ -297,6 +317,14 @@ open_dsdx:
         jb      8b
         jmp     notfound
 9:      mov     %di, ent(%bx)
+        push    %eax                    # an image (not MODUS.COM): its sector
+        cmpb    $'.', 5(%di)            # "MODUS.SF" / "MODUS.BIN": '.' at 5
+        jne     10f
+        cmpb    $'C', 6(%di)
+        je      10f
+        mov     16(%di), %eax
+        mov     %eax, BOOTREC+8
+10:     pop     %eax
         shl     $1, %bx                 # pos is 4 bytes a slot
         movl    $0, pos(%bx)
         shr     $2, %bx
@@ -494,6 +522,110 @@ rs_err: pop     %di
         stc
         ret
 
+# --- PM_READ: the image's disk reads (see THE BOOT RECORD above) ------------
+        .code32
+pm_read:
+        pushal
+        pushfl
+        cli
+        mov     %eax, rd_lba
+        mov     %ecx, rd_cnt
+        mov     %esp, rd_esp
+        sgdt    rd_gdt
+        sidt    rd_idt
+        mov     %cr0, %eax
+        mov     %eax, rd_cr0
+        mov     %cs, %ax
+        mov     %ax, rd_back+4
+        mov     %ds, %ax
+        mov     %ax, rd_ds
+        mov     rd_cr0, %eax            # paging off: this runs identity-mapped
+        and     $0x7FFFFFFF, %eax
+        mov     %eax, %cr0
+        lgdt    rm_gdtr
+        ljmp    $0x08, $pm16
+        .code16
+pm16:   mov     $0x10, %ax              # 16-bit segments, then real mode
+        mov     %ax, %ds
+        mov     %ax, %es
+        mov     %ax, %ss
+        mov     %ax, %fs
+        mov     %ax, %gs
+        mov     %cr0, %eax
+        and     $0xFFFFFFFE, %eax
+        mov     %eax, %cr0
+        ljmp    $0, $rm
+rm:     xor     %ax, %ax
+        mov     %ax, %ds
+        mov     %ax, %es
+        mov     %ax, %ss
+        mov     $0x7C00, %sp
+        lidtl   rm_idtr
+        mov     $0x08, %bl              # the BIOS's interrupt mapping
+        mov     $0x70, %bh
+        mov     $0xBA, %cl              # IRQ 0, 2, 6 (timer, cascade, floppy)
+        mov     $0x3F, %ch              # IRQ 14, 15 (the disks)
+        call    pic_map
+        sti
+        mov     rd_lba, %eax
+        mov     %eax, rlba
+        mov     rd_cnt, %ecx
+        call    readsecs                # -> CX sectors, CF
+        cli
+        setc    rd_err
+        mov     %cx, rd_got
+        mov     $0x20, %bl              # the image's
+        mov     $0x28, %bh
+        mov     $0xFA, %cl
+        mov     $0xFD, %ch
+        call    pic_map
+        lgdtl   rd_gdt                  # back: protected mode, its CS
+        mov     rd_cr0, %eax
+        and     $0x7FFFFFFF, %eax
+        mov     %eax, %cr0
+        ljmpl   *rd_back
+        .code32
+pm32back:
+        mov     rd_ds, %ax
+        mov     %ax, %ds
+        mov     %ax, %es
+        mov     %ax, %ss
+        mov     %ax, %fs
+        mov     %ax, %gs
+        lidt    rd_idt
+        mov     rd_cr0, %eax            # paging back on
+        mov     %eax, %cr0
+        jmp     1f
+1:      mov     rd_esp, %esp
+        popfl
+        popal
+        movzwl  rd_got, %eax
+        btw     $0, rd_err              # CF = the error
+        ret
+        .code16
+
+# pic_map: both 8259s initialised, master at BL, slave at BH, masks CL / CH
+pic_map:
+        mov     $0x11, %al
+        out     %al, $0x20
+        out     %al, $0xA0
+        mov     %bl, %al
+        out     %al, $0x21
+        mov     %bh, %al
+        out     %al, $0xA1
+        mov     $0x04, %al
+        out     %al, $0x21
+        mov     $0x02, %al
+        out     %al, $0xA1
+        mov     $0x01, %al
+        out     %al, $0x21
+        out     %al, $0xA1
+        mov     %cl, %al
+        out     %al, $0x21
+        mov     %ch, %al
+        out     %al, $0xA1
+        ret
+
 # --- output -----------------------------------------------------------------
 putz:   lodsb                           # DS:SI to NUL
         test    %al, %al
@@ -554,3 +686,26 @@ heads:  .byte   2
 ent:    .fill   NHANDLE, 2, 0           # each handle's table entry
 pos:    .fill   NHANDLE, 4, 0           # and its position
 namebuf: .fill  64, 1, 0
+
+        .p2align 3
+rm_gdt: .quad   0
+        .quad   0x00009A000000FFFF      # 08h: 16-bit code, base 0, 64 KB
+        .quad   0x000092000000FFFF      # 10h: 16-bit data
+rm_gdtr: .word  3*8-1
+        .long   rm_gdt
+rm_idtr: .word  0x3FF
+        .long   0
+rd_gdt: .word   0
+        .long   0
+rd_idt: .word   0
+        .long   0
+        .p2align 2
+rd_lba: .long   0
+rd_cnt: .long   0
+rd_esp: .long   0
+rd_cr0: .long   0
+rd_back: .long  pm32back
+        .word   0
+rd_ds:  .word   0
+rd_got: .word   0
+rd_err: .word   0

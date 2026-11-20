@@ -19,6 +19,8 @@
 ;;;; the core disk's boot read as one LZMA stream and its tail as blocks a driver
 ;;;; unpacks on demand (MAIN-CORE below; scripts/mac68k-lzdisk.s).  Build:
 ;;;;   MODUS_MAC68K_MACHINE=floppy MODUS_68K_COLD_KEEP=mvm/68k-keep-quadra.txt
+;;;;     MODUS_HOT_ORDER=mvm/68k-hotorder-floppy.txt (a session's cold code in the
+;;;;     order it loads, so it shares few blocks) FS_FAT=fs-fat
 ;;;;     MODUS_68K_THREADED=0 MODUS_68K_PAGED=0 (and mac68k-snap-build.sh's other
 ;;;;     quadra knobs) sbcl ... mvm/build-mac68k-cl-repl.lisp
 ;;;;   MODUS_MAC68K_MACHINE=floppy scripts/mac68k-core.py IMAGE CORE-DISK
@@ -183,10 +185,12 @@
 ;;; the blocks on the boot floppy after the blob instead: one disk, no swap, the
 ;;; free space gone.
 (defparameter *core-maps*
-  '((:floppy :blob #x00580000 :driver #x007C0000 :state #x007E0000 :memneed #x007E8000))
+  '((:floppy :blob #x00580000 :driver #x007B0000 :state #x007E0000 :memneed #x007E8000
+     :ncache 2))
   "Per map: where the boot blocks put the blob; the driver's address (its
-   buffers follow it); the loader's state; and the RAM the map needs (MemTop),
-   past the driver's buffers.  boot-mac68k.lisp's :FLOPPY says why.")
+   buffers follow it); the loader's state; the RAM the map needs (MemTop),
+   past the driver's buffers; and how many unpacked blocks the driver keeps
+   (mac68k-lzdisk.s NCACHE, 64 KB each).  boot-mac68k.lisp's :FLOPPY says why.")
 (defconstant +block+ 65536 "mac68k-lzdisk.s BLOCK")
 
 (defun cold-floppy (cold)
@@ -248,10 +252,12 @@
          (cold (apply #'octets label blocks))
          (jumper (jumper load)))
     (when (> nblk 256) (error "mac68k-floppy --core: ~D blocks, over the driver's 256" nblk))
-    (multiple-value-bind (dv dsyms) (assemble "mac68k-lzdisk.s" :cpu "68020")
+    (multiple-value-bind (dv dsyms) (assemble "mac68k-lzdisk.s" :cpu "68020"
+                                              :defsyms (list (cons "NCACHE" (getf m :ncache 1))))
       (multiple-value-bind (lo lsyms) (assemble "mac68k-unlzma.s" :cpu "68020")
         (let* ((dv (pad-to dv 4))
-               (bufs-end (+ (getf m :driver) (gethash "bufs" dsyms) 32 16384 +block+ 2048 +block+))
+               (bufs-end (+ (getf m :driver) (gethash "bufs" dsyms) 32 16384 +block+ 2048
+                           (* (getf m :ncache 1) +block+)))
                (head (zeros 8))
                (drvsrc (+ 8 (length jumper)))
                (blob-len (+ +pay-off+ drvsrc (length dv) (length stream)))

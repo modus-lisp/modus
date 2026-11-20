@@ -82,16 +82,19 @@
           (replace w v)
           w))))
 
-(defun assemble (source &key (cpu "68000"))
+(defun assemble (source &key (cpu "68000") defsyms)
   "SOURCE (a file in scripts/) assembled for CPU (default the 68000; .include
-   looks in scripts/): (values its bytes, a hash of its symbols' offsets)."
+   looks in scripts/), DEFSYMS ((NAME . VALUE) ...) defined first: (values its
+   bytes, a hash of its symbols' offsets)."
   (let* ((dir (format nil "/tmp/mac68k-as-~D/" (random 1000000000 (make-random-state t))))
          (o (concatenate 'string dir "s.o")) (b (concatenate 'string dir "s.bin")))
     (ensure-directories-exist dir)
     (unwind-protect
          (progn
-           (run "m68k-linux-gnu-as" (concatenate 'string "-m" cpu) "-I" (namestring *scripts*)
-                "-o" o (namestring (merge-pathnames source *scripts*)))
+           (apply #'run "m68k-linux-gnu-as" (concatenate 'string "-m" cpu) "-I" (namestring *scripts*)
+                  (append (loop for (n . v) in defsyms
+                                collect "--defsym" collect (format nil "~A=~D" n v))
+                          (list "-o" o (namestring (merge-pathnames source *scripts*)))))
            (run "m68k-linux-gnu-objcopy" "-O" "binary" o b)
            (let ((syms (make-hash-table :test 'equal)))
              (with-input-from-string (s (run "m68k-linux-gnu-nm" o))

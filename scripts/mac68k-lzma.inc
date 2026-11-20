@@ -48,6 +48,42 @@
         .equ    DICTEND, -16
         .equ    DELTA, -20
 
+| RCBIT: RCBIT (below) inline, for the loops a bit at a time -- the bit trees and
+| the literals -- where the BSR / RTS was a fifth of a bit's time on a 68030.
+        .macro  RCBIT
+        moveq   #0, %d1
+        move.w  (%a0), %d1
+        move.l  %d7, %d2
+        lsr.l   #8, %d2
+        lsr.l   #3, %d2
+        mulu.l  %d1, %d2
+        cmp.l   %d2, %d6
+        bcc     .Lone\@
+        move.l  %d2, %d7
+        move.w  #2048, %d2
+        sub.w   %d1, %d2
+        lsr.w   #5, %d2
+        add.w   %d2, (%a0)
+        cmp.l   #0x01000000, %d7
+        bcc     .Lzn\@
+        lsl.l   #8, %d7
+        lsl.l   #8, %d6
+        move.b  (%a2)+, %d6
+.Lzn\@: move.w  #4, %ccr
+        bra     .Ldone\@
+.Lone\@: sub.l   %d2, %d7
+        sub.l   %d2, %d6
+        lsr.w   #5, %d1
+        sub.w   %d1, (%a0)
+        cmp.l   #0x01000000, %d7
+        bcc     .Lon\@
+        lsl.l   #8, %d7
+        lsl.l   #8, %d6
+        move.b  (%a2)+, %d6
+.Lon\@: move.w  #0x11, %ccr
+.Ldone\@:
+        .endm
+
 lzdec:  move.l  %a3, %a0                | every probability 1024
         move.w  #N_PROBS-1, %d0
 1:      move.w  #1024, (%a0)+
@@ -107,7 +143,7 @@ lit_match:
         add.b   %d3, %d3                | C = the match bit
         bcs     lm1
         lea     (512, %a6, %d0.l*2), %a0 | match bit 0: probs + 0x100 + sym
-        bsr     rcbit
+        RCBIT
         addx.w  %d0, %d0
         btst    #0, %d0
         bne     lit_plain               | the bits differ: plain from here
@@ -115,7 +151,7 @@ lit_match:
         bcs     lit_match
         bra     lit_store
 lm1:    lea     (1024, %a6, %d0.l*2), %a0 | match bit 1: probs + 0x200 + sym
-        bsr     rcbit
+        RCBIT
         addx.w  %d0, %d0
         btst    #0, %d0
         beq     lit_plain
@@ -126,7 +162,7 @@ lit_plain:
         cmp.w   #256, %d0
         bcc     lit_store
 5:      lea     (0, %a6, %d0.l*2), %a0
-        bsr     rcbit
+        RCBIT
         addx.w  %d0, %d0
         cmp.w   #256, %d0
         bcs     5b
@@ -279,7 +315,7 @@ rc1n:   move.w  #0x11, %ccr
 bittree:
         moveq   #1, %d0
 19:     lea     (0, %a6, %d0.l*2), %a0
-        bsr     rcbit
+        RCBIT
         addx.w  %d0, %d0
         dbra    %d3, 19b
         rts
@@ -359,19 +395,18 @@ distdec:
         rts
 26:     subq.w  #5, %d1                 | nd - 4 direct bits (dbra count)
 27:     lsr.l   #1, %d7
-        cmp.l   %d7, %d6
-        bcs     28f
-        sub.l   %d7, %d6
-28:     scc     %d0                     | the bit: code >= range
-        neg.b   %d0                     | 0 or 1, as X
-        lsr.b   #1, %d0
-        addx.l  %d4, %d4
-        cmp.l   #0x01000000, %d7
-        bcc     29f
+        add.l   %d4, %d4
+        sub.l   %d7, %d6                | the bit: code >= range
+        bcc     28f
+        add.l   %d7, %d6                | 0: put code back
+        bra     29f
+28:     addq.l  #1, %d4                 | 1
+29:     cmp.l   #0x01000000, %d7
+        bcc     30f
         lsl.l   #8, %d7
         lsl.l   #8, %d6
         move.b  (%a2)+, %d6
-29:     dbra    %d1, 27b
+30:     dbra    %d1, 27b
         lsl.l   #4, %d4
         lea     ALIGN*2(%a3), %a6
         moveq   #3, %d3

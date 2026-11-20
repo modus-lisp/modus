@@ -216,7 +216,8 @@
     ;;   #x540000  the low block, two 704 KB young semispaces, the guard
     ;;   #x6B0000  the kind map
     ;;   #x6E0000  the code area: cold bodies from the top, the JIT's from the bottom
-    ;;   #x7C0000  the driver's 160 KB (mac68k-floppy.lisp +DRIVER+)
+    ;;   #x7B0000  the driver's 224 KB, two unpacked blocks (mac68k-floppy.lisp
+    ;;             *CORE-MAPS*; measured, a session ~350 KB of cold code)
     ;;   #x7E8000  free to MemTop: the boot blocks' copy and stack, a screen
     ;; The floppy's blob is read to #x580000 (the young heap, dead until the image
     ;; runs).  The core run (Basilisk, 32 MB) boots from scratch with an 8 MB heap
@@ -226,7 +227,7 @@
     ;; (measured: !COLD-FULL), so its code area is :BOOT-JIT-AREA, between those
     ;; kind bytes and the boot heap.
     (:floppy  :load #x00040000 :static-lo #x00440000 :static-hi #x00500000
-              :jit-area-lo #x006E0000 :jit-area-hi #x007C0000 :jit-max-bytecode 16384
+              :jit-area-lo #x006E0000 :jit-area-hi #x007B0000 :jit-max-bytecode 16384
               :cache-lo #x00520000 :cache-hi #x00520000
               :staging #x00520000 :staging-size #x00000000
               :stack-top #x00520000 :scratch #x00520000 :io-buf #x00521000

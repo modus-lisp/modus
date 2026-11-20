@@ -46,11 +46,20 @@
         .equ    PROBS_OFF, 32           | in BUFS: 20 bytes under the probabilities
         .equ    CBUF_OFF, PROBS_OFF + 16384
         .equ    CACHE_OFF, CBUF_OFF + BLOCK + 2048
-        .equ    BUFS_SIZE, CACHE_OFF + BLOCK
+        .ifndef NCACHE
+        .equ    NCACHE, 1               | blocks kept unpacked (--defsym NCACHE=n)
+        .endif
+        .equ    BUFS_SIZE, CACHE_OFF + NCACHE * BLOCK
 
         .text
 drvr:   bra.w   install
         bra.w   find                    | drvr+4: A1 = a 512-byte buffer
+| STATISTICS, at fixed offsets for a probe (Lisp: (mem-ref (+ DRVADDR 8) :u32)):
+nfetch: .long   0                       | +8   blocks unpacked
+nprime: .long   0                       | +12  read requests
+bhist:  .space  256                     | +16  unpacks per block (saturating at 255)
+nreq:   .long   0                       | +272 block requests (FETCH calls)
+reqlog: .space  1024                    | +276 the block of request i, at i mod 1024
 | ---- the DRVR header _DrvrInstall is given ----
 header: .word   0x4F00                  | needLock, status, control, write, read
         .word   0, 0, 0                 | delay, event mask, menu
@@ -131,8 +140,6 @@ install:
         lea     0x308, %a1              | DrvQHdr
         .word   0xA96F                  | _Enqueue
         move.w  mydrive(%pc), 0x210     | BootDrive: this drive from now on
-        lea     cached(%pc), %a0
-        move.l  #-1, (%a0)              | nothing unpacked yet
         moveq   #0, %d0
         bra     iout
 ifail:  moveq   #-1, %d0
@@ -160,6 +167,8 @@ dprime: movem.l %d1-%d7/%a0-%a6, -(%sp)
         and.w   #0xFF, %d0
         cmp.w   #2, %d0
         bne     pwrite
+        lea     nprime(%pc), %a0
+        addq.l  #1, (%a0)
         move.l  16(%a3), %d5            | dCtlPosition: the byte to start at
         move.l  36(%a2), %d6            | ioReqCount
         move.l  %d6, %d7                | bytes still to read
@@ -185,8 +194,7 @@ ploop:  tst.l   %d7
         cmp.l   %d7, %d1
         bls     1f
         move.l  %d7, %d1                | or what is wanted
-1:      lea     bufs(%pc), %a0
-        add.l   #CACHE_OFF, %a0
+1:      move.l  %a1, %a0                | FETCH's buffer
         add.l   %d4, %a0
         add.l   %d1, %d5
         sub.l   %d1, %d7
@@ -205,12 +213,37 @@ pout:   movem.l (%sp)+, %d1-%d7/%a0-%a6
         move.l  0x8FC, -(%sp)           | JIODone, D0 = the result
         rts
 
-| ---- FETCH: block D1 into CACHE.  D0 = 0 or an error.  Uses everything. ----
-fetch:  lea     cached(%pc), %a0
-        cmp.l   (%a0), %d1
-        beq     fok
-        move.l  #-1, (%a0)              | (a failed unpack leaves nothing cached)
-        move.l  %d1, -(%sp)
+| ---- FETCH: block D1, unpacked, at A1.  D0 = 0 or an error.  Uses everything.
+| NCACHE blocks stay unpacked, the least recently used one goes. ----
+fetch:  lea     nreq(%pc), %a0
+        move.l  (%a0), %d0
+        addq.l  #1, (%a0)
+        and.l   #1023, %d0
+        lea     reqlog(%pc), %a0
+        move.b  %d1, (%a0,%d0.l)
+        lea     cblk(%pc), %a0          | a slot holding it?
+        moveq   #0, %d2
+1:      cmp.l   (%a0,%d2.l*4), %d1
+        beq     fhit
+        addq.l  #1, %d2
+        cmp.l   #NCACHE, %d2
+        bcs     1b
+        lea     cuse(%pc), %a0          | no: the least recently used slot
+        moveq   #0, %d2
+        move.l  (%a0), %d3
+        moveq   #1, %d0
+2:      cmp.l   #NCACHE, %d0
+        bcc     3f
+        cmp.l   (%a0,%d0.l*4), %d3
+        bls     4f
+        move.l  (%a0,%d0.l*4), %d3
+        move.l  %d0, %d2
+4:      addq.l  #1, %d0
+        bra     2b
+3:      lea     cblk(%pc), %a0
+        move.l  #-1, (%a0,%d2.l*4)      | (a failed unpack leaves it empty)
+        move.l  %d2, -(%sp)             | the slot
+        move.l  %d1, -(%sp)             | the block
         lea     table(%pc), %a0
         move.l  (%a0,%d1.l*4), %d2      | the block's first byte on the floppy
         move.l  4(%a0,%d1.l*4), %d3     | and its end
@@ -221,8 +254,8 @@ fetch:  lea     cached(%pc), %a0
         sub.l   %d4, %d3                | to the end of its last: whole sectors
         lea     pb(%pc), %a0
         moveq   #19, %d0                | the parameter block, 80 bytes, zeroed
-1:      clr.l   (%a0)+
-        dbra    %d0, 1b
+5:      clr.l   (%a0)+
+        dbra    %d0, 5b
         lea     pb(%pc), %a0
         move.w  rdrive(%pc), 22(%a0)    | ioVRefNum = the floppy's drive
         move.w  rref(%pc), 24(%a0)      | ioRefNum = its driver
@@ -235,10 +268,8 @@ fetch:  lea     cached(%pc), %a0
         move.l  %d2, -(%sp)
         .word   0xA002                  | _Read
         move.l  (%sp)+, %d2
-        move.l  (%sp)+, %d1
         tst.w   %d0
-        bne     fout
-        move.l  %d1, -(%sp)
+        bne     ffail
         lea     bufs(%pc), %a2          | A2 = the stream: CBUF + the first byte's
         add.l   #CBUF_OFF, %a2          |   place in its sector
         and.l   #511, %d2
@@ -246,15 +277,39 @@ fetch:  lea     cached(%pc), %a0
         lea     bufs(%pc), %a3
         add.l   #PROBS_OFF, %a3
         move.l  dictend(%pc), -16(%a3)  | DICTEND: the resident code's end
+        move.l  4(%sp), %d0             | the slot's buffer
+        swap    %d0
+        clr.w   %d0                     | x 64 KB
         lea     bufs(%pc), %a5
         add.l   #CACHE_OFF, %a5
+        add.l   %d0, %a5
         move.l  %a5, %a4
         add.l   #BLOCK, %a4
         bsr     lzdec
-        move.l  (%sp)+, %d1
-        lea     cached(%pc), %a0
-        move.l  %d1, (%a0)
-fok:    moveq   #0, %d0
+        move.l  (%sp)+, %d1             | the block
+        move.l  (%sp)+, %d2             | the slot
+        lea     cblk(%pc), %a0
+        move.l  %d1, (%a0,%d2.l*4)
+        lea     nfetch(%pc), %a0
+        addq.l  #1, (%a0)
+        lea     bhist(%pc), %a0
+        cmp.b   #255, (%a0,%d1.l)
+        beq     fhit
+        addq.b  #1, (%a0,%d1.l)
+fhit:   lea     tick(%pc), %a0          | D2 the slot: used now
+        addq.l  #1, (%a0)
+        move.l  (%a0), %d0
+        lea     cuse(%pc), %a0
+        move.l  %d0, (%a0,%d2.l*4)
+        move.l  %d2, %d0
+        swap    %d0
+        clr.w   %d0
+        lea     bufs(%pc), %a1
+        add.l   #CACHE_OFF, %a1
+        add.l   %d0, %a1                | A1 = its buffer
+        moveq   #0, %d0
+        rts
+ffail:  addq.l  #8, %sp
 fout:   rts
 
 | ---- FIND: the disk whose sector at LABELOFF is this set's label ----
@@ -420,7 +475,11 @@ rownext:
 vbase:  .long   0                       | the core disk's byte at block 0
 nblk:   .long   0                       | blocks
 dictend: .long  0                       | the preset dictionary's end ([LOAD, DICTEND))
-cached: .long   -1                      | the block in CACHE, or -1
+tick:   .long   0                       | the LRU clock
+cblk:   .rept   NCACHE                  | the block in each cache slot, or -1
+        .long   -1
+        .endr
+cuse:   .space  4 * NCACHE              | each slot's last use (TICK)
 labeloff: .long 0                       | the label sector's byte on its floppy
 setid:  .long   0                       | this set's id, in the label
 fbuf:   .long   0                       | FIND's buffer

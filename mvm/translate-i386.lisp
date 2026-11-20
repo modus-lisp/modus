@@ -5513,7 +5513,10 @@ modus: heap exhausted -- this machine needs more RAM
          (let* ((vd (first operands))
                 (idx (second operands))
                 (pd (i386-vreg-phys vd))
-                (dst (or pd +i386-eax+))
+                ;; a spilled VD goes through ECX, never EAX: EAX is VR (the
+                ;; invariant above), and with pooled string literals
+                ;; (*NARROW-LITERALS-P*) a spilled LI-CONST is common
+                (dst (or pd +scratch0+))
                 (start (i386-current-pos buf)))
            (i386-emit-mov-reg-imm buf dst 0)
            (let ((emitted (- (i386-current-pos buf) start)))

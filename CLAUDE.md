@@ -1170,6 +1170,34 @@ into free RAM from gdb at the kernel entry (`0x100020` — the multiboot ROM
 copies the kernel after reset, so patch there, not at `0xfff0`) and patch the
 function to jump to it.
 
+### The modern PC matrix: `scripts/pc-matrix.py` (2026-11-20)
+
+```bash
+scripts/pcboot.sh /tmp/pc.img CORE.bin        # a disk that boots modus with no DOS
+scripts/pc-matrix.py /tmp/pc.img              # 45 cells, about a minute
+scripts/pc-matrix.py /tmp/pc.img 't420' 'bochs-*' --keep    # some; transcripts in /dev/shm
+```
+
+The 86Box matrix (`scripts/dos386-86box/`) runs real 1990s BIOSes; nothing emulates a
+later machine's own firmware (a T420's Lenovo UEFI + CSM, its chipset, its EC), so this
+covers what an emulator can after them.  **QEMU**: i440FX and q35; CPUs n270 Atom, Core 2,
+Nehalem .. Sandy Bridge (the T420) .. Ice Lake, Athlon .. EPYC-Milan; SeaBIOS booting off
+IDE, AHCI, NVMe, virtio, SCSI and a USB stick on UHCI/EHCI/xHCI; 6 MB .. 8 GB; 4 CPUs --
+typed on the PS/2 keyboard (QMP send-key) and read out of VGA text memory, a laptop's own
+console.  **Bochs** (2.7): its own models, Pentium II .. Tiger Lake and Ryzen, under its own
+BIOS -- typed through its VNC server (key events, so its 8042 model is in the loop), read
+on COM1.  Every cell must ANSWER seven forms correctly (bignum, double float, 100 x 10000
+conses, a hash table), and reports the RAM, semispace and code pool the stub chose.
+**It refuses to report unless a control cell, expecting `(+ 1 2)` to be 4, FAILs on that
+form**; a disk with its image zeroed fails every cell (QEMU: the guest resets; Bochs: no
+prompt).  Bochs's build here has its debugger compiled in and stops at the first
+instruction (`-rc` a file holding `c`); it has no headless display but `rfb`, and no rfb
+port option (it takes the first free one from 5900, found with `ss`).
+
+Above 4 GB the stub sees what is below the PCI hole: 2 GB on q35, 3 GB on i440FX (32-bit
+paging, no PAE).  What none of this exercises: a real CSM's quirks, SMM, an EC-routed
+keyboard and USB legacy emulation -- one boot on the real machine.
+
 ### QEMU arm32 (virt) — the bare-metal CL image (2026-10-24)
 
 ```bash

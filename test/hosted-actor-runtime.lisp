@@ -159,11 +159,19 @@
 ;; A REUSED SLOT STARTS CLEAN: the previous occupant's object-start bits made
 ;; stale stack words look like roots, and the collector wrote forwarding
 ;; pointers into live objects (the canary came back corrupt from the 3rd reuse).
+;; THE TIMEOUT IS MILLISECONDS and only guards against a hang: each churner
+;; runs ~100 collections of its region, 35-45 ms on an idle x86-64 host and
+;; past 60 ms on a loaded one.  It was 60 (ms, meant as seconds), so a slow
+;; churner timed out, ran alongside the next one (no longer one slot reused),
+;; and its late :INTACT was taken by the next check's receive -- failing this
+;; check and the two stop-the-world checks after it with nothing corrupt.
 (chk "actors reusing one slot keep their heaps intact across collections"
      (let ((all t))
        (dotimes (i 5)
          (actors-spawn 'canary-churner)            ; one at a time: each reuses the slot
-         (unless (eq (actors-receive 60) :intact) (setq all nil)))
+         (multiple-value-bind (m got) (actors-receive 60000)
+           (unless (and got (eq m :intact)) (setq all nil))
+           (unless got (format t "  (canary ~D did not answer in 60 s)~%" i))))
        all))
 
 ;; STOP-THE-WORLD REACHES ACTORS (gap 2): parked, then running.

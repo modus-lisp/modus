@@ -269,6 +269,11 @@
   (setf (mem-ref #x100001C0 :u64) 0)
   (setf (mem-ref #x100001C8 :u64) 0)
   (setf (mem-ref #x10000400 :u64) 0)
+  ;; The main thread's handler-frame extension address and its test limit
+  ;; (translate-aarch64, THE HANDLER-FRAME STACK HAS NO SILENT CEILING): a
+  ;; garbage address here would be taken for a reserved extension.
+  (setf (mem-ref #x10005600 :u64) 0)
+  (setf (mem-ref #x10005608 :u64) 0)
   ;; WS4-AA64 #160: object-start bitmap config words (page_base / bitmap_base).
   ;; Zero them, then reserve the bitmap BEFORE any allocation (init-symbol-table
   ;; below is the first allocator) so every mutator alloc records its start bit.
@@ -828,6 +833,11 @@
         (let ((new-addr (+ *cstr-scratch* 2048)))
           (%string-to-cstr new-str new-addr)
           (%aarch64-renameat *cstr-scratch* new-addr 0)))))
+(defun %sys-rmdir (path-str)
+  ;; unlinkat(AT_FDCWD, PATH, AT_REMOVEDIR) through the generic syscall: the
+  ;; dedicated unlinkat trap (#x0507) passes flags 0, which removes files only.
+  (%string-to-cstr path-str *cstr-scratch*)
+  (syscall6 35 -100 *cstr-scratch* #x200 0 0 0))
 (defun %sys-mkdir (path-str mode)
   (if (%cab-on)
       (progn (%cab :mkdir path-str) 0)

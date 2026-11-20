@@ -1154,7 +1154,23 @@
                           ;; the same call: a site whose callee did not exist
                           ;; when its page was built is bridged too
                           ;; (%JIT-RELOC-CALLS).
-                          (error (quote undefined-function) :name nm))))))))))
+                          (%jit-bridge-undefined nm idx))))))))))
+
+(defun %jit-bridge-undefined (nm idx)
+  "Signal UNDEFINED-FUNCTION for bridge thunk IDX's callee NM, with SBCL's two
+   restarts: CONTINUE resolves the name again (a handler that has just defined
+   it resumes the call in place, nothing unwound and nothing re-run) and
+   USE-VALUE calls the function it is given instead.  Without them a handler
+   that could supply the function had only one move, unwinding and starting
+   its whole computation over."
+  (restart-case (error (quote undefined-function)
+                       :name (%runtime-fn-name-symbol nm))
+    (continue ()
+      :report "Retry calling the function."
+      (%jit-bridge-resolve idx))
+    (use-value (f)
+      :report "Call a function given in its place."
+      (if (functionp f) f (fdefinition f)))))
 ;; THE BRIDGE'S HIT, INLINE: a cached pair whose site is settled (patched, or
 ;; retired because the callee is a closure -- every runtime DEFCLASS accessor)
 ;; is the callee itself; anything else asks %JIT-BRIDGE-RESOLVE.
@@ -1553,6 +1569,7 @@
    another slide could not correct where the pages are read-only (iOS)."
   (dolist (h *jit-fnaddr-thunks*)
     (setf (mem-ref (%jit-fnaddr-thunk-cache-slot (cdr h)) :u64) 0))
+  (setq *native-sym-cache* nil)              ; resolved again after a restore
   nil)
 
 (defun %jit-after-relocate (l0 l1 d)
@@ -1805,14 +1822,29 @@
             (%jit-icache-flush addr 96)
             addr)))))
 
+(defvar *kernel-code-read-only* nil
+  "T once a pad write has faulted: this process cannot write the image's code.")
+
 (defun %kernel-redirect (name old)
   "OLD, NAME's definition being replaced, is a code object: if it has a pristine
-   call pad, point the pad at NAME's late binding."
+   call pad, point the pad at NAME's late binding.
+
+   WHERE THE IMAGE'S CODE IS READ-ONLY -- the Darwin runner and the phone map it
+   r-x -- the pad's first store faults, before it has changed a byte, and the
+   redefinition must still happen: this is called from inside DEFUN, and a fault
+   escaping it lost the DEFUN itself (sb-gray's 31 %GRAY-WRAP wrappers, so no CL
+   stream function reached a Gray stream on iOS).  There a redefinition reaches
+   what looks the name up -- FUNCALL, the REPL, JIT code through its linkage
+   cells -- and the image's own direct callers keep the original, as before
+   2026-10-14."
+  (when *kernel-code-read-only* (return-from %kernel-redirect nil))
   (let ((pad (- (%val->word old) 3 16)))
     (when (eq (%kernel-pad-state pad) :pristine)
       (let ((target (%kernel-redirect-target name (%kernel-pad-prepack pad))))
         (when target
-          (%kernel-patch-pad pad target)
+          (unless (handler-case (%kernel-patch-pad pad target)
+                    (error () (setq *kernel-code-read-only* t) nil))
+            (return-from %kernel-redirect nil))
           (when (null *kernel-redirects*)
             (setq *kernel-redirects* (make-hash-table :test (function equal))))
           (puthash name *kernel-redirects* pad)
@@ -1851,6 +1883,7 @@
    Every call also empties the bridge function cache (*JIT-BRIDGE-GEN*)."
   (%kernel-redirect-hook name)
   (setq *jit-bridge-gen* (if (integerp *jit-bridge-gen*) (+ *jit-bridge-gen* 1) 1))
+  (setq *native-sym-cache* nil)              ; (funcall 'NAME ...) re-resolves
   ;; Only while this process can write code, as the fill above is: a restored iOS
   ;; snapshot's thunks are read-only pages, and their cache slots were emptied before
   ;; the save (%JIT-BEFORE-SAVE), so there is nothing to clear and the store would fault.

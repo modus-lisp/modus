@@ -13,6 +13,8 @@
 # copied into the bundle, before it is signed; pass "@NAME" on the command line
 # to name one, or list the arguments one per line in a bundled modus.args.
 # MODUS_CORE=FILE puts a snapshot's compiled code in the app (image-segments.sh).
+# MODUS_IOS_ROTATES=1: the app turns with the phone (portrait and both landscapes); otherwise iOS's default.
+# MODUS_IOS_ICON=PNG: the app's icon, 1024x1024, square (iOS rounds it); MODUS_IOS_ICON_DARK=PNG its dark one.
 set -eu
 IMAGE=$1; OUT=$2; KIND=${3:-sim}; IDENT=${4:-}; PROFILE=${5:-}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -55,23 +57,49 @@ for W in $WHERE; do
     *)     LINKX="$LINKX $W" ;;
   esac
 done
+# THE SIMULATOR'S ENTITLEMENTS go in a section of the binary, as Xcode puts them, not in the ad-hoc
+# signature (an ad-hoc signature that carries them is not launched): without an application identifier
+# and its keychain group, every keychain write is refused (errSecMissingEntitlement), so nothing the app
+# keeps there -- an SSH key, a password -- outlives the call that made it.
+if [ "$KIND" = sim ]; then
+  SIMENT=$OBJS/sim.entitlements
+  APPID=SIMULATOR.${MODUS_IOS_BUNDLE_ID:-org.modus-lisp.modus}
+  cat > "$SIMENT" <<ENT
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>application-identifier</key><string>$APPID</string>
+  <key>keychain-access-groups</key><array><string>$APPID</string></array>
+</dict></plist>
+ENT
+  LINKX="$LINKX -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __entitlements -Xlinker $SIMENT"
+fi
 # shellcheck disable=SC2086  # LINKX is a flag list
 xcrun --sdk $SDKN swiftc -target $TARGET -sdk "$SDK" -o "$OUT/modus" "$OBJS"/*.o \
   -framework AudioToolbox -framework AVFoundation -framework UIKit -framework QuartzCore \
-  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal $LINKX
+  -framework CoreGraphics -framework CoreFoundation -framework Security -framework Metal -framework Speech -framework QuickLook $LINKX
 cat > "$OUT/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>CFBundleIdentifier</key><string>${MODUS_IOS_BUNDLE_ID:-org.modus-lisp.modus}</string>
   <key>CFBundleExecutable</key><string>modus</string>
-  <key>CFBundleName</key><string>modus</string>
+  <key>CFBundleName</key><string>${MODUS_IOS_NAME:-modus}</string>
+  <key>CFBundleDisplayName</key><string>${MODUS_IOS_NAME:-modus}</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
   <key>MinimumOSVersion</key><string>18.0</string>
   <key>LSRequiresIPhoneOS</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>modus listens when you ask it to: the Listen app transcribes what it hears.</string>
+$( [ "${MODUS_IOS_ROTATES:-0}" != 0 ] && printf '%s\n' \
+  '<key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>' )
+  <key>NSLocalNetworkUsageDescription</key><string>${MODUS_IOS_NAME:-modus} connects to computers on your network and on your VPN: the servers you add, over SSH.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key><string>${MODUS_IOS_NAME:-modus} talks with phones nearby over Bluetooth: a mesh chat, phone to phone.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>The Listen app turns what you say into text.</string>
   <key>UILaunchScreen</key><dict/>
+  <key>UIFileSharingEnabled</key><true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key><true/>
   <key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>
   <key>UIApplicationSceneManifest</key><dict>
     <key>UIApplicationSupportsMultipleScenes</key><false/>
@@ -85,6 +113,28 @@ cat > "$OUT/Info.plist" <<PLIST
   <key>CFBundleSupportedPlatforms</key><array><string>$( [ $KIND = sim ] && echo iPhoneSimulator || echo iPhoneOS )</string></array>
 </dict></plist>
 PLIST
+# THE ICON: an asset catalog of one 1024-point image (and its dark one), compiled as Xcode compiles it --
+# Assets.car and the icon's keys, which go into the Info.plist
+if [ -n "${MODUS_IOS_ICON:-}" ]; then
+  SET=$OBJS/Assets.xcassets/AppIcon.appiconset
+  mkdir -p "$SET"
+  cp "$MODUS_IOS_ICON" "$SET/icon.png"
+  DARK=""
+  if [ -n "${MODUS_IOS_ICON_DARK:-}" ]; then
+    cp "$MODUS_IOS_ICON_DARK" "$SET/icon-dark.png"
+    DARK=',{"filename":"icon-dark.png","idiom":"universal","platform":"ios","size":"1024x1024",
+            "appearances":[{"appearance":"luminosity","value":"dark"}]}'
+  fi
+  cat > "$SET/Contents.json" <<JSON
+{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}$DARK],
+ "info":{"author":"xcode","version":1}}
+JSON
+  echo '{"info":{"author":"xcode","version":1}}' > "$OBJS/Assets.xcassets/Contents.json"
+  xcrun actool --compile "$OUT" --platform $SDKN --minimum-deployment-target 18.0 \
+    --target-device iphone --target-device ipad --app-icon AppIcon \
+    --output-partial-info-plist "$OBJS/icon.plist" "$OBJS/Assets.xcassets" > "$OBJS/actool.log"
+  /usr/libexec/PlistBuddy -c "Merge $OBJS/icon.plist" "$OUT/Info.plist" > /dev/null
+fi
 for f in ${MODUS_IOS_FILES:-}; do cp -R "$f" "$OUT/"; done
 if [ -n "$PROFILE" ]; then cp "$PROFILE" "$OUT/embedded.mobileprovision"; fi
 if [ -n "$IDENT" ]; then

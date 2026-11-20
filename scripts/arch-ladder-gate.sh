@@ -108,7 +108,7 @@ if [ "$fail" -ne 0 ]; then
   exit 1
 fi
 if [ "$skip" -ne 0 ]; then
-  echo "PASS (with $skip skipped — install the missing qemu-system-* to cover them)"
+  echo "PASS (with $skip skipped — see the SKIP lines: a missing qemu-system-*, or a cell a rung names as ungradable)"
 else
   echo "PASS"
 fi

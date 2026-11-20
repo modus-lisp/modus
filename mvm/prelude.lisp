@@ -3325,7 +3325,8 @@
 ;;; statement, so a worker that JIT-compiled a closure inside a function died
 ;;; "dynamic binding stack exhausted" (bordeaux-threads' WITH-LOCK-HELD
 ;;; reached it).  %TLS-INSTALL (net/hosted-sync.lisp) points blk+0xC60 at a
-;;; 16 KB per-CPU area in the thread band -- 1024 entries -- and the stack
+;;; 16 KB per-CPU area in the thread band -- 960 entries, the top 1 KB being
+;;; %DYNB-LOOKUP's index cache -- and the stack
 ;;; lives there; a thread whose base is 0 uses the 57 in-window entries, as
 ;;; before.  The collector reads the same word (EMIT-DYNBIND-ROOT-SCAN).
 ;;;
@@ -3399,8 +3400,10 @@
     (if (eql x 0) (+ blk #xC70) x)))
 
 (defun %dynb-capacity (blk)
-  "How many entries this thread's stack holds (see THE EXTENSION)."
-  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 57 1024))
+  "How many entries this thread's stack holds (see THE EXTENSION).  960, not
+   the 1024 the 16 KB area could hold: its top 1 KB is the INDEX CACHE (see
+   %DYNB-LOOKUP)."
+  (if (eql (mem-ref (+ blk #xC60) :u64) 0) 57 960))
 
 (defun %dynb-next (blk)
   "Address of the next free entry's KEY word."
@@ -3474,34 +3477,69 @@
 
 (defun %dynb-lookup (blk key)
   "Address of the VALUE word of this thread's innermost binding of KEY, or 0:
-   %DYNB-FIND behind the filter.  Same no-global-read rule as %DYNB-FIND."
-  (let ((f (%dynb-filter blk)))
-    (if (and (not (eql f 0))
-             (eql (mem-ref (%dynb-filter-slot f key) :u16) 0))
-        0
-        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (%dynb-base blk)))))
+   the index cache, then %DYNB-FIND behind the filter.  Same no-global-read
+   rule as %DYNB-FIND.
+
+   THE INDEX CACHE.  The filter answers a read of a special this thread has
+   NOT bound; a read of one it HAS bound still walked the stack down to the
+   binding, and the code that binds specials binds MANY and then reads them
+   in its inner loops: secp256k1-fast's WITH-FRESH-CT-SCRATCH binds ~55
+   scratch specials per call, so every field operation on a worker walked
+   ~27 entries per special read, and BIP-340 verify ran 2.5-3.5x slower on a
+   worker than on main.  So the top 1 KB of the extension area (ext+0x3C00,
+   which is why the capacity is 960 and not 1024) is 512 u16 slots, one per
+   (KEY mod 512), each holding the 1-based INDEX of the binding of a key in
+   that slot (0 = none).  %DYNBIND writes the slot on every push and a walk
+   that finds the key writes it back, so a slot only ever names the innermost
+   binding of its key: a push of the same key overwrites it, and a slot whose
+   entry was popped is caught by the two checks a hit makes -- the index is
+   at or below the live depth, and that entry's key word is KEY.  Popping
+   needs no maintenance, and neither does a reused stack: until this thread
+   pushes into a slot, no live entry carries a key of that slot, so whatever
+   the slot holds fails the key check.  Collisions only cost a walk."
+  (let ((ext (mem-ref (+ blk #xC60) :u64)))
+    (if (eql ext 0)
+        (%dynb-find key (- (%dynb-next blk) 16) (- (%dynb-depth blk) 1) (+ blk #xC70))
+        (let* ((cs (+ ext (+ #x3C00 (ash (logand key 511) 1))))
+               (ix (mem-ref cs :u16))
+               (d (mem-ref (+ blk #xC58) :u64)))
+          (if (and (> ix 0) (<= ix d)
+                   (eq (mem-ref (+ ext (ash (- ix 1) 4)) :u64) key))
+              (+ ext (- (ash ix 4) 8))
+              (if (eql (mem-ref (+ blk (+ #xC80 (ash (logand key 255) 1))) :u16) 0)
+                  0
+                  (let ((a (%dynb-find key (- (%dynb-next blk) 16) (- d 1) ext)))
+                    (if (eql a 0)
+                        0
+                        (progn
+                          (setf (mem-ref cs :u16) (+ (ash (- (- a 8) ext) -4) 1))
+                          a)))))))))
 
 (defun %dynb-unwind (blk key a i)
-  "Pop the innermost binding of KEY, and everything above it, by truncating
-   the stack to entry I.  Answers 1 when it found one, 0 when it did not.
+  "Pop this thread's innermost binding when it is a binding of KEY: A is the
+   KEY word of the TOP entry, I its index.  Answers 1 when it popped one, 0
+   when the top entry is not KEY's (nothing is touched).
 
-   TRUNCATE RATHER THAN POP, and the difference is load-bearing.  A LET* of
-   two specials evaluates its inits INSIDE the unwind-protect, so a throw out
-   of the second init leaves the first bound and the second not, while the
-   cleanup still runs BOTH restores; and the restores run in binding order,
-   not reverse.  Truncation is right in both cases — by the time this
-   cleanup runs every INNER binding has already been popped by its own
-   cleanup, so nothing above I is live."
-  (let ((base (%dynb-base blk)))
-    (loop                                   ; a loop for the reason %DYNB-FIND gives
-      (when (or (< i 0) (< a base)) (return 0))
-      (when (eql (mem-ref a :u64) key)
-        (let ((f (%dynb-filter blk)))
-          (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
-          (%dynb-set-top blk a i)
-          (return 1)))
-      (setq a (- a 16))
-      (setq i (- i 1)))))
+   ONLY THE TOP ENTRY, NEVER A SEARCH.  Every binding is undone by its own
+   cleanup, innermost first, and a LET or PROGV of several specials undoes
+   them in REVERSE binding order (COMPILE-LET-WITH-SPECIALS, %PROGV-RESTORE)
+   -- so when a restore runs, its own entry is the one on top, or it was never
+   made (a LET* init that threw before it) and the top belongs to the binding
+   below.  This used to search down for KEY and truncate there, with restores
+   in binding order: the first restore of a LET took all of its own entries,
+   and every later one then found an OUTER binding of its variable and
+   truncated to it, taking every live binding above that.  shuttle's compiler
+   binds (*strict* *in-function*) and then *out* in each function it compiles;
+   compiling a nested JS function on a worker lost the outer *out*, and the
+   outer compile read it unbound (test/let-specials-nested.lisp).  The main
+   thread binds shallowly and never comes here."
+  (declare (ignore i))
+  (if (and (>= a (%dynb-base blk)) (eql (mem-ref a :u64) key))
+      (let ((f (%dynb-filter blk)))
+        (unless (eql f 0) (%dynb-filter-drop f a (%dynb-next blk)))
+        (%dynb-set-top blk a (- (%dynb-depth blk) 1))
+        1)
+      0))
 
 (defun %dynb-overflow (key)
   "This thread's binding stack is full (%DYNB-CAPACITY entries).  An honest error rather than a
@@ -3543,22 +3581,44 @@
    once to install and once to restore, and a dynamic binding is not a rare
    operation -- it is every WITH-* macro in the system.
 
-   ONLY THE UNARMED ARM, and the narrowing is measured rather than cautious.
-   The arm below it -- threads declared, but this thread has no binding
-   block, i.e. the main thread of an armed image -- looks equally safe and
-   is not: substituting %GV-SET there as well makes test/hosted-dynbind.lisp
-   die with a READER-ERROR the moment the worker starts, on a build where
-   every other change in the tree passes it.  The mechanism was not chased,
-   so the honest statement is that SET-SYMBOL-VALUE does something on that
-   path that this does not (it takes %RT-ENTER / %RT-LEAVE, which is both a
-   lock and a region hop) and that the difference matters once a second
-   thread exists.  The arm that IS taken has established that the image
-   never declared threads at all, where there is nothing for either to do."
+   THE ARMED MAIN THREAD (threads declared, this thread has no binding
+   block) binds shallowly too, and an EXISTING pair is stored in place,
+   unlocked -- exactly what the compiled SETQ of a special has always done
+   on that thread (%GV-SET's armed arm).  Only an INSERT (no pair yet) goes
+   through SET-SYMBOL-VALUE.  This arm used to be SET-SYMBOL-VALUE for every
+   bind and unbind, which made a LET on main 20-100x dearer once any thread
+   had run.  What that call's %RT-ENTER / %RT-LEAVE buys, chased:
+     * on an EXISTING pair, PUTHASH is a publish fence and a SET-CDR -- no
+       allocation, no rehash, nothing for the lock's region hop to redirect.
+       The lock only orders the store against other threads' LOCKED
+       sections, and none of them depends on a pair's value staying put:
+       lock-free readers (%GV-CELL, %HT-GET-RO) were already the design,
+       a rehash (%HT-REBUILD-INDEX) builds a new bucket vector over the SAME
+       pairs and publishes it whole, and pairs are never replaced.  The
+       fence orders a freshly built value before the store that publishes
+       it: a no-op on x86 (stores are not reordered with stores), and on a
+       weakly ordered target this store is exactly as strong as the
+       unlocked compiled SETQ on main already was -- no weaker.
+     * on an INSERT, it is everything: the new pair and bucket entry are
+       allocated in region 0 (the lock arena), the bucket index may be
+       rebuilt, and two threads inserting the same key must not both win.
+       So the insert keeps the lock.
+   A worker NEVER reaches this arm once its window is installed (its block is
+   non-zero), so main's shallow binding is still the global value a worker
+   reads for a special it has not bound -- the semantics test/hosted-
+   dynbind.lisp and test/main-bind-armed.lisp pin.  (The READER-ERROR an
+   earlier attempt at this recorded did not reproduce on this tree, nor on a
+   rebuild of the commit that recorded it with the change re-applied; that
+   tree failed hosted-dynbind identically with and without the change.)"
   (if (eql (mem-ref #x10000DB8 :u32) 0)
       (%gv-set key val)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
-            (set-symbol-value key val)
+            ;; ARMED, NO BLOCK: the main thread (see THE ARMED MAIN THREAD
+            ;; in the docstring).  An EXISTING pair is stored in place, unlocked, like
+            ;; the compiled SETQ; only an insert takes SET-SYMBOL-VALUE's lock.
+            (let ((cl (%gv-cell key)))
+              (if cl (progn (set-cdr cl val) val) (set-symbol-value key val)))
             (let ((d (%dynb-depth blk))
                   (a (%dynb-next blk)))
               ;; HEADROOM.  Signalling the overflow binds specials too
@@ -3581,7 +3641,14 @@
                       (unless (eql f 0)
                         (let ((slot (%dynb-filter-slot f key)))
                           (setf (mem-ref slot :u16)
-                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))))
+                                (logand (+ (mem-ref slot :u16) 1) #xFFFF)))
+                        ;; The index cache (see %DYNB-LOOKUP): this push is
+                        ;; now KEY's innermost binding, entry D, 1-based D+1.
+                        ;; F is non-zero exactly when the extension is.
+                        (setf (mem-ref (+ (mem-ref (+ blk #xC60) :u64)
+                                          (+ #x3C00 (ash (logand key 511) 1)))
+                                       :u16)
+                              (+ d 1))))
                     val)))))))
 
 (defun %dynunbind (key saved)
@@ -3593,7 +3660,8 @@
       (%gv-set key saved)
       (let ((blk (%dynb-block)))
         (if (eql blk 0)
-            (set-symbol-value key saved)
+            (let ((cl (%gv-cell key)))
+              (if cl (progn (set-cdr cl saved) saved) (set-symbol-value key saved)))
             (let ((d (%dynb-depth blk)))
               (if (<= d 0)
                   saved
@@ -3694,12 +3762,26 @@
    special in compiled code actually becomes) were not.  The gate is the
    word %RT-ENTER and %DYNBIND already test, so an unarmed image pays one
    32-bit load and a branch."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  ;; THE INDEX CACHE'S HIT IS WRITTEN OUT HERE rather than reached through
+  ;; %DYNB-LOOKUP: this is every armed special read, and on a worker the read
+  ;; of a special bound by an enclosing LET is the common case.  A miss (or a
+  ;; thread with no extension stack) takes %DYNB-LOOKUP, which repeats the
+  ;; probe and walks.  EQ, not EQL: every word compared here is a fixnum, and
+  ;; EQL compiles to a type dispatch.
+  (if (eq (mem-ref #x10000DB8 :u32) 0)
       0
       (let ((blk (%dynb-block)))
-        (if (eql blk 0)
+        (if (eq blk 0)
             0
-            (%dynb-lookup blk key)))))
+            (let ((ext (mem-ref (+ blk #xC60) :u64)))
+              (if (eq ext 0)
+                  (%dynb-lookup blk key)
+                  (let ((ix (mem-ref (+ ext (+ #x3C00 (ash (logand key 511) 1))) :u16)))
+                    (if (and (> ix 0)
+                             (<= ix (mem-ref (+ blk #xC58) :u64))
+                             (eq (mem-ref (+ ext (- (ash ix 4) 16)) :u64) key))
+                        (+ ext (- (ash ix 4) 8))
+                        (%dynb-lookup blk key)))))))))
 
 (defun %gv-ref (%gv-key)
   "Compiled special-variable READ: value of global KEY, NIL if absent
@@ -3832,15 +3914,18 @@
 (defun %gv-save-fill (%gv-key %gv-slot)
   "The AOT LET-special SAVE through cache slot SLOT: %GV-SAVE's contract
    (unbound comes back as the unbound marker), memoising the cell."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c (cdr %gv-c) (%gv-save %gv-key)))
       (%gv-save %gv-key)))
 
 (defun %gv-memo-cell (%gv-key %gv-slot)
   "The globals cell for KEY through cache slot SLOT (filling the slot on a
-   miss), or NIL when there is no cell or no cache vector yet.  For UNARMED
-   callers only: a memoised pair cannot see a thread's own binding."
+   miss), or NIL when there is no cell or no cache vector yet.  For threads
+   that bind SHALLOWLY only (unarmed, or the armed main thread -- see
+   %DYNBIND): a memoised pair cannot see a worker's own binding."
   (let ((%gv-cv (mem-ref #x10000FA0 :u64)))
     (if (fixnump %gv-cv)
         nil
@@ -3859,7 +3944,9 @@
    Unarmed and the cell exists: store in place, no table probe.  Otherwise
    exactly %GV-SET (which consults this thread's bindings, and creates the
    cell -- flushing the cache -- when there is none)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (let ((%gv-c (%gv-memo-cell %gv-key %gv-slot)))
         (if %gv-c
             (progn (set-cdr %gv-c %gv-val) %gv-val)
@@ -3868,31 +3955,43 @@
 
 (defun %dynbind-c (%gv-key %gv-val %gv-slot)
   "%DYNBIND through the cell cache: its unarmed arm is %GV-SET (see there)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (%gv-set-c %gv-key %gv-val %gv-slot)
       (%dynbind %gv-key %gv-val)))
 
 (defun %dynunbind-c (%gv-key %gv-saved %gv-slot)
   "%DYNUNBIND through the cell cache: its unarmed arm is %GV-SET too."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (%gv-set-c %gv-key %gv-saved %gv-slot)
       (%dynunbind %gv-key %gv-saved)))
 
 (defun %gv-cell-ref (%gv-cell %gv-key)
   "The LET-special save through a cell baked at a runtime compile: the
    cell's value on an unarmed image, else %GV-SAVE (thread bindings first)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0) (cdr %gv-cell) (%gv-save %gv-key)))
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
+      (cdr %gv-cell)
+      (%gv-save %gv-key)))
 
 (defun %dynbind-cell (%gv-cell %gv-key %gv-val)
   "%DYNBIND through a cell baked at a runtime compile: its unarmed arm is a
    store into the cell (%GV-SET's in-place update, without the probe)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-val) %gv-val)
       (%dynbind %gv-key %gv-val)))
 
 (defun %dynunbind-cell (%gv-cell %gv-key %gv-saved)
   "%DYNUNBIND through a cell baked at a runtime compile."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-saved) %gv-saved)
       (%dynunbind %gv-key %gv-saved)))
 
@@ -3900,7 +3999,9 @@
   "A runtime SETQ of a special whose cell was baked at compile time, slow arm
    (a value that may be an in-module closure): on an unarmed image store into
    the cell, else %GV-SET (this thread's binding first)."
-  (if (eql (mem-ref #x10000DB8 :u32) 0)
+  (if (or (eql (mem-ref #x10000DB8 :u32) 0)       ; unarmed, or no binding
+          (and (eql (mem-ref #x10000C30 :u32) 0)  ; block (main): see THE
+               (eql (mem-ref #x10000C34 :u32) 0))) ; ARMED MAIN THREAD
       (progn (set-cdr %gv-cell %gv-val) %gv-val)
       (%gv-set %gv-key %gv-val)))
 

@@ -39,9 +39,24 @@
 ;; `,',x / `,,x tunnelling work (a `(... `(... ,',def ...)) form).  A
 ;; nested BACKQUOTE bumps the level by one for its template.
 (defun runtime-bq-expand (template) (%rbq template 1))
+(defun %rbq-has-comma-p (x)
+  "Whether a COMMA / COMMA-AT / COMMA-DOT marker occurs anywhere in X (a list or a non-string vector)."
+  (cond ((consp x)
+         (or (and (symbolp (car x))
+                  (or (%rbq-sym-name-eq (car x) "COMMA") (%rbq-sym-name-eq (car x) "COMMA-AT")
+                      (%rbq-sym-name-eq (car x) "COMMA-DOT")))
+             (%rbq-has-comma-p (car x)) (%rbq-has-comma-p (cdr x))))
+        ((and (vectorp x) (not (stringp x)))
+         (let ((hit nil))
+           (dotimes (i (length x) hit) (when (%rbq-has-comma-p (aref x i)) (setq hit t)))))
+        (t nil)))
 (defun %rbq (template level)
   (cond
     ((null template) nil)
+    ;; A VECTOR with commas in it: `#(1 ,x ,@ys) is `(1 ,x ,@ys) made a vector (CLHS 2.4.6).  Quoted
+    ;; as data, weft's (%u16vec 3 4 ...) -- `(coerce #(,@xs) ...) -- built a one-element vector.
+    ((and (vectorp template) (not (stringp template)) (%rbq-has-comma-p template))
+     (list 'coerce (%rbq-list (coerce template 'list) level) ''simple-vector))
     ((atom template) (list 'quote template))
     ;; nested COMMA
     ((%rbq-sym-name-eq (car template) "COMMA")

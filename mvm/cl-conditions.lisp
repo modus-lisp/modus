@@ -113,6 +113,33 @@
               (return (cdr entry))))))
       (setq cur (cdr cur)))))
 
+(defun %condition-slot-set (cond slot-name value)
+  "Store VALUE in COND's slot SLOT-NAME (matched as %CONDITION-SLOT matches it),
+   adding the slot when the condition was made without it.  The writer that a
+   DEFINE-CONDITION :ACCESSOR or :WRITER defines."
+  (let ((nhash (and (symbolp slot-name) (not (null slot-name)) (not (eq slot-name t))
+                    (aref slot-name 0)))
+        (cur (%condition-slot-alist cond)))
+    (loop
+      (when (null cur)
+        (setf (aref cond 1) (cons (cons slot-name value) (aref cond 1)))
+        (return value))
+      (let ((entry (car cur)))
+        (when (consp entry)
+          (let ((k (car entry)))
+            (when (or (eq k slot-name)
+                      (and nhash (symbolp k) (not (null k)) (not (eq k t))
+                           (= (aref k 0) nhash)))
+              (setf (cdr entry) value)
+              (return value)))))
+      (setq cur (cdr cur)))))
+
+(defun %cond-install-writer (writer-name class-name slot-name)
+  "WRITER-NAME, a symbol or (SETF NAME), as a method on CLASS-NAME storing SLOT-NAME."
+  (%defmethod writer-name nil (list t class-name)
+              (lambda (nv c) (%condition-slot-set c slot-name nv)))
+  t)
+
 (defun %condition-all-parents (name)
   "Every ancestor type name of a condition type, itself first, in CLASS
    PRECEDENCE order (CLHS 4.3.5): (name) + C3-merge(L(p1) ... L(pn) (p1 ... pn)).
@@ -389,6 +416,10 @@
        (format stream "The slot ~S is unbound in the object ~S." (slot 'name) (slot 'instance)) t)
       ;; A native fault knows nothing about the operation or its operands:
       ;; say what it is instead of a TYPE-ERROR message with NILs in it.
+      ((typep c 'stack-exhausted)
+       (write-string "Control stack exhausted: the recursion went deeper than the stack." stream) t)
+      ((typep c 'handler-stack-exhausted)
+       (write-string "Handler-frame stack exhausted: CATCH / UNWIND-PROTECT / HANDLER-CASE nested deeper than the frame stack holds." stream) t)
       ((typep c 'memory-fault-error)
        (write-string "Memory fault in compiled code: an operation was applied to an object of the wrong type (no further detail is recorded)." stream) t)
       ((typep c 'mvm-type-error)
@@ -588,6 +619,12 @@
   (%define-condition 'end-of-file '(stream-error) nil nil nil)
   ;; reader-error
   (%define-condition 'reader-error '(parse-error stream-error) nil nil nil)
+  ;; simple-reader-error: a READER-ERROR with a message (SBCL's sb-int:simple-reader-error)
+  ;; -- READER-ERROR itself reports only its type.  The #\\name reader uses it.
+  (%define-condition 'simple-reader-error '(simple-condition reader-error) nil nil nil)
+  ;; simple-stream-error: a STREAM-ERROR with a message (SBCL's sb-int:simple-stream-error) --
+  ;; what a failed write(2) signals: "Couldn't write to #<stream>: Broken pipe".
+  (%define-condition 'simple-stream-error '(simple-condition stream-error) nil nil nil)
   ;; parse-error
   (%define-condition 'parse-error '(error) nil nil nil)
   ;; print-not-readable
@@ -600,6 +637,18 @@
     nil nil)
   ;; storage-condition
   (%define-condition 'storage-condition '(serious-condition) nil nil nil)
+  ;; stack-exhausted -- the control stack ran out: a SIGSEGV beside the stack
+  ;; pointer (the main thread's rlimit, a worker's guard region), which the
+  ;; hosted x86-64 and AArch64 stubs take on the thread's alternate stack
+  ;; (see %TAKE-PENDING-FAULT, test/stack-exhaustion.lisp).  A STORAGE-CONDITION, not an ERROR, as SBCL's
+  ;; is: deep recursion is a resource running out, not a wrong operation.
+  (%define-condition 'stack-exhausted '(storage-condition) nil nil nil)
+  ;; handler-stack-exhausted -- a CATCH / UNWIND-PROTECT / HANDLER-CASE frame
+  ;; could not be pushed: the per-thread handler-frame stack is full (or its
+  ;; extension could not be reserved).  The push longjmps to the enclosing
+  ;; frame instead of dropping the new one (translate-x64,
+  ;; EMIT-HSTACK-OVERFLOW), so every cleanup still runs.
+  (%define-condition 'handler-stack-exhausted '(storage-condition) nil nil nil)
   ;; memory-fault-error -- SIGSEGV/SIGBUS caught by a handler-case (see
   ;; %TAKE-PENDING-FAULT).  A TYPE-ERROR because in compiled code a fault is
   ;; how a type check fails: (car 5) faults, and ANSI says it signals
@@ -698,7 +747,14 @@
               ;; one value, the common THROW: no VALUES-LIST (a LENGTH walk)
               (if (and (consp l) (null (cdr l))) (car l) (values-list l)))
             v))
-      (if (if (eq cnd :%throw-in-flight) (%error-handler-active-p) nil)
+      ;; Not ours, throw or condition alike: on to the next frame, as a
+      ;; HANDLER-CASE with no matching clause does.  A condition reaches
+      ;; here only after ERROR has offered it to every handler there is, so
+      ;; re-signalling it offered it to all of them a SECOND time, from a
+      ;; stack already unwound: every BLOCK with a closure exit (it wraps a
+      ;; CATCH) ran each outer HANDLER-BIND twice for one error.  Re-signal
+      ;; only when no outer frame is armed, so the toplevel still reports it.
+      (if (%error-handler-active-p)
           (%hc-longjmp)
           (error cnd))))
 
@@ -792,26 +848,66 @@
         (write-char-serial 10)
         (setq *%escape-report-busy* nil))))
 
+;;; THE PENDING-FAULT WORD IS PER THREAD where threads run Lisp (layout key
+;;; :STW: hosted x86-64 and AArch64).  The stubs write THIS thread's window
+;;; word +0x5610 there (translate-x64, THE FAULT RECORD IS PER THREAD; the
+;;; fault address and PC follow it at +0x5618 / +0x5620), because one word for
+;;; the whole process let two threads faulting at once read -- or consume --
+;;; each other's code (test/fault-race.lisp).  Every other image keeps the
+;;; absolute #x10000CB0.  The window word is past the range the compiler can
+;;; prove per-thread, so it is addressed through the self slot, as
+;;; %HC-FAULT-FIXUP addresses the shared-store guard's marker.
+(defun %fault-self-base ()
+  "This thread's window delta, from the self slot (0 on main): as
+   %TLS-SELF-BASE, which this file cannot assume is loaded."
+  (let ((lo (mem-ref #x10000C30 :u32))
+        (hi (mem-ref #x10000C34 :u32)))
+    (if (= hi 0)
+        lo
+        ;; SIGNED: a macOS AArch64 worker's window lies below the region.
+        (+ (* (* (if (>= hi #x80000000) (- hi 4294967296) hi) 65536) 65536) lo))))
+
+(defun %pending-fault-code ()
+  (%layout-if :stw
+    (mem-ref (+ (%fault-self-base) (%conv-addr #x10005610)) :u32)
+    (mem-ref #x10000CB0 :u32)))
+
+(defun %clear-pending-fault ()
+  (%layout-if :stw
+    (setf (mem-ref (+ (%fault-self-base) (%conv-addr #x10005610)) :u32) 0)
+    (setf (mem-ref #x10000CB0 :u32) 0))
+  0)
+
 (defun %take-pending-fault ()
   "Called by every handler-case dispatch.  A signal stub (TRAP #x0520 on
    every port) longjmps into the handler-case with the raw signal number in
-   the word at #x10000CB0 and no condition, since it cannot allocate; build
+   the pending-fault word (%PENDING-FAULT-CODE: #x10000CB0, or this thread's
+   own where threads run Lisp) and no condition, since it cannot allocate; build
    the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
    is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
-   MEMORY-FAULT-ERROR.
+   MEMORY-FAULT-ERROR -- or STACK-EXHAUSTED when the stub found the fault
+   just below the stack pointer and recorded #x0B0B instead of 11.  #x0F0F is
+   not a signal: an overflowing handler-frame push (translate-x64,
+   EMIT-HSTACK-OVERFLOW; translate-aarch64, EMIT-AARCH64-HSTACK-OVERFLOW;
+   translate-i386, I386-EMIT-HSTACK-OVERFLOW; translate-arm32,
+   ARM32-EMIT-HSTACK-HELPERS; translate-ppc, PPC-EMIT-HSTACK-STUBS;
+   translate-riscv, RV-EMIT-HSTACK-STUBS; translate-68k,
+   M68K-EMIT-HSTACK-STUBS) records it, HANDLER-STACK-EXHAUSTED.
 
    A SIGILL may be THE SHARED-STORE GUARD's refusal, which says more than the
    signal does: %HC-FAULT-FIXUP claims it (and clears the signal) when it is.
    Asked here, every handler-case gets that answer -- not only the ones
    compiled with *HC-FAULT-FIXUP*, which an image without a JIT (iOS devices)
    never sets."
-  (when (eql (mem-ref #x10000CB0 :u32) 4) (%hc-fault-fixup))
-  (let ((sig (mem-ref #x10000CB0 :u32)))
+  (when (eql (%pending-fault-code) 4) (%hc-fault-fixup))
+  (let ((sig (%pending-fault-code)))
     (unless (eql sig 0)
-      (setf (mem-ref #x10000CB0 :u32) 0)
+      (%clear-pending-fault)
       (setq *current-condition*
             (%attach-fault-frames
-             (cond ((eql sig 8) (make-condition 'division-by-zero
+             (cond ((eql sig #x0B0B) (make-condition 'stack-exhausted))
+                   ((eql sig #x0F0F) (make-condition 'handler-stack-exhausted))
+                   ((eql sig 8) (make-condition 'division-by-zero
                                                 :operation nil :operands nil))
                    ((eql sig 4) (make-condition 'illegal-instruction-error))
                    (t (make-condition 'memory-fault-error
@@ -1695,6 +1791,19 @@
    frame out, the handshake state left as INVOKE-RESTART set it."
   (setq *current-condition* condition)
   (%hc-longjmp))
+
+(defun %rc-pass-on-condition (condition)
+  "A condition, not a restart transfer, came out of a RESTART-CASE body: ERROR
+   has already offered it to every handler there is, so send it on to the
+   next handler frame out instead of signalling it again (which ran each outer
+   HANDLER-BIND a second time, from a stack already unwound).  Re-signal only
+   when no outer frame is armed, so the toplevel still reports it.  Native, so
+   %ERROR-HANDLER-ACTIVE-P reads the real frame slot -- see COMPILE-RESTART-
+   CASE for why the bytecode expansion cannot ask this itself."
+  (setq *current-condition* condition)
+  (if (%error-handler-active-p)
+      (%hc-longjmp)
+      (error condition)))
 
 (defun %rc-clear-invoke ()
   "Clear the invoke handshake state after the bytecode restart-case handler
@@ -2766,32 +2875,32 @@
 (defun %hc-fault-fixup ()
   "Called first on a HANDLER-CASE handler path (hosted CLI, both 64-bit arches), before
    %TAKE-PENDING-FAULT.  If the #x0520 fault stub has recovered a hardware
-   fault since the last check (its count at #x10000CA0 moved past the
-   last-seen count at #x10000CA8) and it was THE SHARED-STORE GUARD's trap,
+   fault on this thread since the last check (a SIGILL pending in this
+   thread's record where threads run Lisp; elsewhere its count at #x10000CA0
+   moved past the last-seen count at #x10000CA8) and it was THE SHARED-STORE GUARD's trap,
    publish that guard's error and clear the pending signal; any other fault
    is left for %TAKE-PENDING-FAULT to type."
+  ;; A FRESH FAULT ON THIS THREAD: its own pending SIGILL where the record is
+  ;; per thread.  The COUNT at #x10000CA0 against the last-seen count at
+  ;; #x10000CA8 is process-global, so a fault on another thread -- or another
+  ;; thread's handler taking the count first -- hid this thread's guard trap
+  ;; behind a plain ILLEGAL-INSTRUCTION-ERROR; it stays the test where the
+  ;; record is the process-global word.
   (let ((n (mem-ref #x10000CA0 :u32)))
-    (unless (= n (mem-ref #x10000CA8 :u32))
-      (setf (mem-ref #x10000CA8 :u32) n)
+    (unless (%layout-if :stw (not (eql (%pending-fault-code) 4))
+                        (= n (mem-ref #x10000CA8 :u32)))
+      (%layout-if :stw nil (setf (mem-ref #x10000CA8 :u32) n))
       ;; THE SHARED-STORE GUARD (translate-x64, translate-aarch64) marks its trap in this
       ;; thread's window word +0x5058 before faulting; the word is outside
       ;; the range the compiler can prove per-thread, so address it through
       ;; the self slot (0 on main, where the absolute word is unused).
-      (let* ((lo (mem-ref #x10000C30 :u32))
-             (hi (mem-ref #x10000C34 :u32))
-             ;; SIGNED, as %TLS-SELF-BASE: a macOS AArch64 worker's window
-             ;; lies below the region, so its delta is negative.
-             (self (if (= hi 0)
-                       lo
-                       (+ (* (* (if (>= hi #x80000000) (- hi 4294967296) hi)
-                                65536) 65536)
-                          lo)))
+      (let* ((self (%fault-self-base))
              (m (+ self (%conv-addr #x10005058))))
         (if (and (/= self 0) (= (%gc-read64 m) 1))
             (progn
               (%gc-write64 m 0)
               ;; This condition says more than the signal would: claim it.
-              (setf (mem-ref #x10000CB0 :u32) 0)
+              (%clear-pending-fault)
               (setq *current-condition*
                     (%attach-fault-frames (make-condition 'simple-error
                                     :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused (at #x~x)."

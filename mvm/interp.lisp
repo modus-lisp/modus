@@ -1771,8 +1771,25 @@
            (multiple-value-bind (vobj npc) (%ifetch-reg bc pc)
              (multiple-value-bind (idx npc2) (%ifetch-byte bc npc)
                (multiple-value-bind (vs npc3) (%ifetch-reg bc npc2)
-                 (let ((obj (svref regs vobj)))
-                   (%obj-elt-set obj idx (svref regs vs)))
+                 (let ((obj (svref regs vobj))
+                       (v (svref regs vs)))
+                   ;; A slot store is an ESCAPE, like an argument to a native
+                   ;; call: the object may be read by native code, which can
+                   ;; only funcall a native closure.  So an in-module lambda
+                   ;; closure goes in as its (cached, so EQ-stable) trampoline.
+                   ;; The inlined structure writer -- (setf (desk-keyboard-fn d)
+                   ;; (lambda ...)) used to be a CALL of the native setter, whose
+                   ;; argument the bridge wrapped -- stored the interpreter
+                   ;; closure raw, and glass's native %FOCUS then jumped through
+                   ;; its bytecode offset (opening Notes on the Zero).  Stores
+                   ;; INTO a closure are how one is built (slot 0 the offset,
+                   ;; slot 1 the environment) and are left alone.
+                   (unless (or (integerp v) (consp v) (null v)
+                               (and obj (not (consp obj)) (not (integerp obj))
+                                    (= (obj-subtag obj) #x52)))
+                     (setq v (%mvm-wrap-escaping-result v bc ftab runtime-table
+                                                        lambda-offsets)))
+                   (%obj-elt-set obj idx v))
                  (setf pc npc3)))))
           (#.+op-bne+
            (multiple-value-bind (off npc) (%ifetch-s32 bc pc)
@@ -3635,6 +3652,7 @@
                    (setf pc npc)))))
 
           (#.+op-yield+ nil) ; preemption: no-op
+          (#.+op-safepoint+ nil) ; a YIELD that may park: no-op here too
 
           ;; REAL memory and a REAL exchange -- see the MEM-READ-BYTE block
           ;; above.  This arm was the last opcode still keying

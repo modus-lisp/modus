@@ -356,9 +356,17 @@
               (dotimes (i 2046 v) (setf (svref v i) (%dbl (ash (+ (- i 1022) 1023) 20) 0)))))))
 
 (defun %exp-f (x)
+  "exp of double X: on a target with double FP ops the compiler emits %EXP-D in
+   registers for every X (%EMIT-EXP-DOUBLE-FULL, %EXP-F-EDGES's arithmetic and
+   so its bits); elsewhere %EXP-D is the function below."
+  (let ((xd x))
+    (declare (type double-float xd))
+    (%exp-d xd)))
+
+(defun %exp-f-edges (x)
   "exp of double X.  Reduce x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
-   exact, |r| <= ln2/2; exp(r) by a degree-13 Horner series; scale by 2^k through
-   the exponent bits.  The old version halved X until |X| <= 1 and squared back,
+   exact, |r| <= ln2/2; exp(r) by fdlibm's rational form (%EXP-F-GENERAL); scale
+   by 2^k through the exponent bits.  The old version halved X until |X| <= 1 and squared back,
    which amplified the Taylor error (mean 253 ulp against libm, max 5661) and
    cost a few hundred boxed float operations."
   (let ((hi (%float-hi32 x)))
@@ -374,42 +382,60 @@
       ((let ((xd x)) (declare (type double-float xd))
          (< xd -745.1332191019411d0))                           ; < #xC0874910D52D3051: underflow
        (%fl 0))
-      (t
-       ;; The arithmetic is unboxed double trees (declared DOUBLE-FLOAT locals and
-       ;; literal constants), not %FLOAT-* calls: it was ~40 boxed operations an
-       ;; EXP, 0.8 us, and illatio's SwiGLU calls EXP 117k times a token.  The
-       ;; operations and their order are the old ones, so the bits are too: the
-       ;; series below is the old loop acc = 1 + (r*acc)/n, n = 13..1, unrolled,
-       ;; each step written deep-operand-first so the tree fits the FP pool
-       ;; (IEEE + and * are exactly commutative; r*1 = r and x/1 = x exactly).
-       ;; The literals are the old bit patterns: 1/ln2 #x3FF71547652B82FE,
-       ;; ln2_hi #x3FE62E42FEE00000, ln2_lo #x3DEA39EF35793C76.
-       (let* ((xd x)
-              (tq (* xd 1.4426950408889634d0))                   ; x / ln2
-              ;; k = truncate(tq +- 0.5): round half away from zero, as before
-              (k (if (< tq 0d0)
-                     (the (signed-byte 32) (truncate (- tq 0.5d0)))
-                     (the (signed-byte 32) (truncate (+ tq 0.5d0)))))
-              (r (- (- xd (* (float k 1d0) 0.6931471803691238d0))
-                    (* (float k 1d0) 1.9082149292705877d-10)))
-              ;; exp(r) = 1 + r(1 + r/2(1 + r/3(...)))
-              (acc (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ (* (+ (/ r 13d0) 1d0) r) 12d0) 1d0) r) 11d0) 1d0) r) 10d0) 1d0) r) 9d0) 1d0) r) 8d0) 1d0) r) 7d0) 1d0) r) 6d0) 1d0) r) 5d0) 1d0) r) 4d0) 1d0) r) 3d0) 1d0) r) 2d0) 1d0) r) 1d0) 1d0)))
-         (declare (type double-float xd tq r acc) (type (signed-byte 32) k))
-         ;; times 2^k: one exponent-bits scale in the normal range, two near the ends.
-         ;; The normal-range 2^k are the same doubles as before, read from a table
-         ;; instead of built from their bits on every call.
-         (cond ((and (>= k -1022) (<= k 1023))
-                (let ((p (svref (%exp2-table) (+ k 1022))))
-                  (declare (type double-float p))
-                  (* acc p)))
-               ((> k 1023)
-                (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
-                            (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
-               (t
-                (%float-mul (%float-mul acc (%dbl (ash (+ (+ k 600) 1023) 20) 0))
-                            (%dbl (ash (+ -600 1023) 20) 0)))))))))
+      ;; the normal range, where both the result and 2^k are normal doubles: on a
+      ;; target with double FP ops the compiler emits this in registers (the
+      ;; same operations, so the same bits), and boxes only the result -- the
+      ;; let* below boxed each of its doubles, ~150 ns an EXP
+      (t (%exp-f-general x)))))
 
+(defun %exp-d (x)
+  "exp of double X; the compiler's in-register version (%EMIT-EXP-DOUBLE-FULL)
+   replaces this call on targets that have double FP ops."
+  (%exp-f-edges x))
 
+(defun %exp-f-general (x)
+  "%EXP-F's arithmetic for a finite X that neither overflows nor underflows:
+   fdlibm's __ieee754_exp.  x = k ln2 + r with ln2 split hi/lo so k ln2_hi is
+   exact; c = r - t P(t), t = r^2, P of degree 5; exp(r) = 1 - ((lo - rc/(2 - c))
+   - hi); times 2^k.  Within 1 ulp of libm (90% exact over [-20, 20]).  The
+   degree-13 Horner series it replaced chained thirteen dependent divisions.
+   The trees are written left-deep (IEEE + and * commute exactly) to fit the
+   FP registers; %EMIT-EXP-DOUBLE-CORE is this, in registers, step for step."
+  ;; The literals' bits: 1/ln2 #x3FF71547652B82FE, ln2_hi #x3FE62E42FEE00000,
+  ;; ln2_lo #x3DEA39EF35793C76; P1..P5 are fdlibm's.
+  (let* ((xd x)
+         (tq (* xd 1.4426950408889634d0))                   ; x / ln2
+         ;; k = truncate(tq +- 0.5): round half away from zero
+         (k (if (< tq 0d0)
+                (the (signed-byte 32) (truncate (- tq 0.5d0)))
+                (the (signed-byte 32) (truncate (+ tq 0.5d0)))))
+         (kd (float k 1d0))
+         (hi (- xd (* kd 0.6931471803691238d0)))
+         (lo (* kd 1.9082149292705877d-10))
+         (r (- hi lo))
+         (tt (* r r))
+         (c (- r (* (+ (* (+ (* (+ (* (+ (* tt 4.13813679705723846039d-08)
+                                         -1.65339022054652515390d-06)
+                                      tt)
+                                   6.61375632143793436117d-05)
+                                tt)
+                             -2.77777777770155933842d-03)
+                          tt)
+                       1.66666666666666019037d-01)
+                    tt)))
+         (acc (- 1d0 (- (- lo (/ (* r c) (- 2d0 c))) hi))))
+    (declare (type double-float xd tq kd hi lo r tt c acc) (type (signed-byte 32) k))
+    ;; times 2^k: one exponent-bits scale in the normal range, two near the ends.
+    (cond ((and (>= k -1022) (<= k 1023))
+           (let ((p (svref (%exp2-table) (+ k 1022))))
+             (declare (type double-float p))
+             (* acc p)))
+          ((> k 1023)
+           (%float-mul (%float-mul acc (%dbl (ash (+ 1023 1023) 20) 0))
+                       (%dbl (ash (+ (- k 1023) 1023) 20) 0)))
+          (t
+           (%float-mul (%float-mul acc (%dbl (ash (+ (+ k 600) 1023) 20) 0))
+                       (%dbl (ash (+ -600 1023) 20) 0))))))
 
 (defun %log-f (x)
   "Natural log of double X > 0.  x = m 2^e exactly from the IEEE bits (a
@@ -5170,10 +5196,25 @@
                       (em (%exp-f (%float-neg xf))))
                  (%irr-result (%float-div (%float-add ep em) (%fl 2)) x))))))
 
+(defun %tanh-float (x)
+  "TANH of a float: the general arm's arithmetic, in the same order (so the same
+   bits), on a declared double.  The general arm compared X with the INTEGER 22
+   exactly (a float-to-rational comparison) and did every step through boxed
+   generic calls: 570 ns an element, 160x SBCL on mill's Tanh."
+  (let ((xd (%any-to-float x)))
+    (declare (type double-float xd))
+    (cond ((= xd 0d0) x)                       ; -0.0 stays -0.0
+          ((> xd 22d0) (%irr-result (%fl 1) x))
+          ((< xd -22d0) (%irr-result (%fl -1) x))
+          (t (let ((ep (%exp-f xd)) (em (%exp-f (- xd))))
+               (declare (type double-float ep em))
+               (%irr-result (/ (- ep em) (+ ep em)) x))))))
+
 (defun tanh (x &rest extra)
   (if extra
       (%program-error "tanh requires exactly 1 argument")
-      (cond ((complexp x) (%complex-in-format (let ((ep (exp x)) (em (exp (- x)))) (/ (- ep em) (+ ep em))) x))
+      (cond ((floatp x) (%tanh-float x))
+            ((complexp x) (%complex-in-format (let ((ep (exp x)) (em (exp (- x)))) (/ (- ep em) (+ ep em))) x))
             ((and (integerp x) (= x 0)) 0)
             ;; a float zero is its own tanh (-0.0 stays -0.0); past |x| = 22
             ;; tanh is +-1 to double precision, and exp(x)/exp(x) would be
@@ -5841,7 +5882,11 @@
               ;; TN: the compile-time defstruct registration thunk may not
               ;; have run at boot, but the instance still carries its type.
               ;; structure-1-1 / structure-1-4 depend on this.
-              ((%struct-instance-p obj) (%struct-instance-named-p obj tn))
+              ;; A NO is final only when TN is not a DEFTYPE: (deftype p () 'pt)
+              ;; named no struct, so (typep (make-pt) 'p) answered NIL without
+              ;; ever expanding P -- the DEFTYPE clause below.
+              ((and (%struct-instance-p obj) (%struct-instance-named-p obj tn)) t)
+              ((and (%struct-instance-p obj) (not (%deftype-lookup tn))) nil)
               ;; Registered struct type — fall back to the registry walk
               ;; (covers (typep non-struct 'struct-type) → NIL too).
               ((%find-struct-type tn) (%struct-instance-typep obj tn))

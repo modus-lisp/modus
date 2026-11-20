@@ -253,7 +253,10 @@
             (*68k-mul32-label* (ex 8)) (*68k-mulu64-label* (ex 9)) (*68k-divs32-label* (ex 10))
             (*68k-mac-console-label* (ex 11)) (*68k-mac-getc-label* (ex 12))
             (*68k-mac-service-label* (ex 13)) (*68k-thread-next-label* (ex 14))
-            (*68k-barrier-a0-label* (ex 15)))
+            (*68k-barrier-a0-label* (ex 15))
+            ;; the handler stack's out-of-line half: a push past the fixed
+            ;; frames, a pop of an extension frame (older images: NIL)
+            (*68k-hpush-label* (ex 16)) (*68k-hext-addr-label* (ex 17)))
         (let ((entries (unwind-protect (%n68-emit-module buf base bc fns fn-table rt captured)
                          (setq *68k-insn-tail* nil))))
           (when entries (m68k-fixup-labels buf))

@@ -30,7 +30,7 @@ private var lists: [UInt: ModusList] = [:]
 private var textViewDelegates: [UInt: ModusTextView] = [:]
 private var events: [Term] = []
 
-private func send(_ name: String, _ args: [Term]) {
+func send(_ name: String, _ args: [Term]) {
     events.append(.list([.symbol(name: name, package: "KEYWORD")] + args))
 }
 
@@ -1865,6 +1865,9 @@ func register(_ name: String, _ fn: Call) {
 @_cdecl("modus_swift_install")
 public func modusSwiftInstall() {
     installGPU()                                   // GPU.swift: Metal, under WebGPU's shape
+    installSpeech()                                // Speech.swift: the platform's voice and ear
+    installBluetooth()                             // Bluetooth.swift: LE links, for a mesh
+    installNative()                                // Native.swift: app-grade components (an app, not the desk)
     register("ui_label_new", labelNew)
     register("ui_button_new", buttonNew)
     register("ui_switch_new", switchNew)

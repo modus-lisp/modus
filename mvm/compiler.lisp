@@ -6524,6 +6524,28 @@
                       (mvm-find-setf-expander (car place)))
                  (funcall (mvm-find-setf-expander (car place))
                           (cdr place) value))
+                ;; A (DEFUN (SETF NAME) ...) for a LIBRARY's own symbol is that
+                ;; place's store, whatever its name spells.  The built-in cases
+                ;; below match by NAME (NAME-EQ), so a package that shadows CAR,
+                ;; CDR, FIRST, AREF ... and defines (SETF CDR) on its own CDR was
+                ;; given CL:CDR's store instead -- SET-CDR of an object that is
+                ;; not a cons ("is not of type CONS"), where SBCL calls the
+                ;; package's setter.  cortez's CDR, which takes a locative,
+                ;; stopped TI's screen at (SETF (CDR loc) ...).  Asked only of a
+                ;; symbol whose home folds (%FN-KEY-PKG-OF): COMMON-LISP's own
+                ;; places, and Modus's, never reach the registry here.  Same
+                ;; expansion as the registry clause further down: subforms once,
+                ;; left to right, then the value, which goes FIRST (CLHS 5.1.2.9).
+                ((and (consp place) (symbolp (car place)) (car place)
+                      (%fn-key-pkg-of (car place))
+                      (%find-setf-function (car place)))
+                 (let* ((setter (%find-setf-function (car place)))
+                        (gargs  (mapcar (lambda (a) (declare (ignore a)) (%mvm-gensym "SFA"))
+                                        (cdr place)))
+                        (gval   (%mvm-gensym "SFV")))
+                   `(let* (,@(mapcar #'list gargs (cdr place))
+                           (,gval ,value))
+                      (,setter ,gval ,@gargs))))
                 ;; (setf (car x) v) → (set-car x v)
                 ((and (consp place) (name-eq (car place) "CAR"))
                  `(set-car ,(cadr place) ,value))

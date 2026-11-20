@@ -127,7 +127,7 @@ def run_cell(rung_path, expect, keep=False):
                        capture_output=True, text=True, timeout=1800)
     if not os.path.exists(binfile):
         return "BUILD", "BUILD FAILED: " + (b.stderr or b.stdout)[-300:]
-    subprocess.run([sys.executable, os.path.join(REPO, "scripts/mac68k-disk.py"),
+    subprocess.run(["sbcl", "--script", os.path.join(REPO, "scripts/mac68k-disk.lisp"),
                     binfile, disk], check=True, capture_output=True)
     out = boot(disk, 4)
     if not keep:

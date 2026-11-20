@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """mac68k-disk.py IMAGE DISK -- a Mac boot disk that IS modus.
 
+SUPERSEDED by scripts/mac68k-disk.lisp (byte-identical, 2026-11-20); kept only
+because scripts/mac68k-core.py imports WRITE_DISK and PAGED from it, and goes
+when that is ported.
+
 IMAGE is a flat bare-Mac image (`mvm/build-hosted.lisp mac68k`, or any image
 built for the :mac68k target, boot/boot-mac68k.lisp).  DISK is its boot blocks
 (scripts/mac68k-bootblocks.s, assembled here) followed by IMAGE at offset 1024,

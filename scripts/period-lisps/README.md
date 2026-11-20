@@ -31,7 +31,7 @@ L=/mnt/data-fast/claude/rss/lisps; V="$L/venv/bin/python -I"
 python3 scripts/mac68k-chain.py /tmp/rss/m-n68j/c.dsk $L/modus/n68j/Modus.bin --forks $L/modus/n68j
 MODUS_FORKS=$L/modus/n68j $V scripts/period-lisps/mkvol.py mcl,modus mm.hfv 24 modus
 SYSTEM=753 MODUS_FORKS=$L/modus/q3 $V scripts/period-lisps/mkvol.py mcl,modus mmq.hfv 48 mcl
-python3 scripts/mac68k-hd.py mm.hfv mm.hd --chd "env LD_LIBRARY_PATH=/tmp/rss/mame/root/usr/lib/x86_64-linux-gnu /tmp/rss/mame/root/usr/bin/chdman"
+sbcl --script scripts/mac68k-hd.lisp mm.hfv mm.hd --chd "env LD_LIBRARY_PATH=/tmp/rss/mame/root/usr/lib/x86_64-linux-gnu /tmp/rss/mame/root/usr/bin/chdman"
 ```
 
 `macqd950` is not in MAME 0.251. `run-lisp.sh` uses the Quadra-only 0.289 build at

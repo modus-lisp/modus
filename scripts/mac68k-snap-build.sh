@@ -22,4 +22,4 @@ for i in 1 2 3; do MODUS_MAC68K_MACHINE=$MACHINE MALLOC_MMAP_MAX_=0 MAC68K_JIT=t
   MAC68K_BASILISK="env MAC_BASILISK_BIN=BasiliskII-jit-lo $RSS/b2/basilisk-headless.sh" \
   timeout 1500 python3 scripts/mac68k-core.py $D/cl.bin $D/c.dsk > $D/core.log 2>&1 && break; done
 echo "CORE-EXIT $?"; grep "mac68k-core: /" $D/core.log | cut -c1-100
-python3 scripts/mac68k-hd.py $D/c.dsk $D/c.hd --chd "env LD_LIBRARY_PATH=$(cat $RSS/mame/ldpath) $RSS/mame/root/usr/bin/chdman" | tail -1
+FS_APPLE=${FS_APPLE:?mac68k-snap-build: set FS_APPLE to an fs-apple checkout (a snapshot has no sibling one)} sbcl --script scripts/mac68k-hd.lisp $D/c.dsk $D/c.hd --chd "env LD_LIBRARY_PATH=$(cat $RSS/mame/ldpath) $RSS/mame/root/usr/bin/chdman" | tail -1

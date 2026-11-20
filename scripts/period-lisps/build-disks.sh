@@ -87,6 +87,6 @@ cd $LISPS/disks
 for w in $WHICH; do
   $PY $HERE/mkvol.py $w $w.hfv
   rm -f $w.hd $w.hd.chd
-  python3 $REPO/scripts/mac68k-hd.py $w.hfv $w.hd --chd "env LD_LIBRARY_PATH=$L $MAME/root/usr/bin/chdman" | tail -1
+  sbcl --script $REPO/scripts/mac68k-hd.lisp $w.hfv $w.hd --chd "env LD_LIBRARY_PATH=$L $MAME/root/usr/bin/chdman" | tail -1
 done
 ls -la $LISPS/disks

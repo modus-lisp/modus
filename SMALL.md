@@ -395,7 +395,7 @@ binary still dies at startup now and then): the core boots to the prompt in
 ~23 s; defun, bignums, `format ~R`, `loop` answer, the check silent.
 
 **On a Mac Classic** (MAME's `macclasc`: a 68000 at 7.8 MHz, 4 MB), booting a
-SCSI disk: `scripts/mac68k-hd.py VOLUME OUT --chd CHDMAN` puts a driver
+SCSI disk: `sbcl --script scripts/mac68k-hd.lisp VOLUME OUT --chd CHDMAN` puts a driver
 descriptor ('ER') in block 0, our read-only driver (`scripts/mac68k-scsi.s`)
 from block 1 and the boot volume from block 64.  The ROM loads the driver and
 enters it with the SCSI ID in D5; it installs itself (_DrvrInstall, unit 32 +

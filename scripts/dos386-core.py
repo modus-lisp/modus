@@ -11,12 +11,14 @@ QMP, the low block (#x10000000, 128 KB), the heap from #x19000000 to the
 allocation pointer and the matching slices of the two collector bitmaps, and
 writes OUT = IMAGE + the core:
 
-  page-aligned header: 'MCOR', version 3 (2 with no code store), allocation
+  page-aligned header: 'MCOR', version 4 (3 without the gap, 2 with no code
+                       store; see THE GAP in main), allocation
                        pointer, heap bytes, one bitmap slice's bytes, the
                        boot-only tail's first and last page (IMAGE.tail,
                        from the build; 0 0 when there is none), the code
                        store's address, the pool's size (0: the stub's
-                       rule); at +64 the low block, the heap,
+                       rule), the gap's bytes (version 4); at +64 the low
+                       block, the heap,
                        bitmap slice 1, bitmap slice 2; then, page-aligned,
                        the code store (see CODE-STORE)
   last 16 bytes:       'MODUSCOR', the header's physical address, 0
@@ -157,7 +159,20 @@ def main():
     print('image bytes boot init changed: %d ranges, %d bytes' % (len(diffs), sum(n for _, n in diffs)))
     for a, n in diffs[:20]:
         print('  0x%08x +%d' % (a, n))
-    body = bytearray(img)
+    # THE GAP (version 4): with a code store the paged code [plo, phi) is in
+    # the file twice, raw in the image and packed in the store, and the raw
+    # copy is unmapped the moment the stub runs.  Left out, the loader reads
+    # 7.7 MB less and the machine needs that much less RAM: the stub maps
+    # [phi, ..) onto where the rest landed, PHI - PLO lower.  Every physical
+    # address written below (header, store, tail) is where the bytes ARE.
+    # MODUS_I386_GAP=0 keeps the raw copy (version 3).
+    store = code_store(image, img, tmp)
+    gap = plo = phi = 0
+    if store and os.environ.get('MODUS_I386_GAP', '1') != '0':
+        plo, phi = struct.unpack_from('<II', store, 0)
+        gap = phi - plo
+        print('gap: [0x%x, 0x%x), %d bytes of raw code left out' % (plo, phi, gap))
+    body = bytearray(img[:plo - LOAD] + img[phi - LOAD:]) if gap else bytearray(img)
     body += b'\0' * (-len(body) % 4096)
     hdr_pa = LOAD + len(body)
     # the boot-only tail (IMAGE.tail, written by the build): its whole pages,
@@ -169,15 +184,18 @@ def main():
         if tail_hi <= tail_lo:
             tail_lo = tail_hi = 0
         print('boot-only tail: %d pages (%d bytes of code)' % ((tail_hi - tail_lo) // 4096, hi - lo))
-    store = code_store(image, img, tmp)
+        if gap and tail_lo:                         # where its pages are
+            assert tail_lo >= phi, 'the boot-only tail is inside the gap'
+            tail_lo -= gap
+            tail_hi -= gap
     core = low + heap + bm1 + bm2
     store_pa = 0
     if store:
         store_pa = hdr_pa + 64 + len(core)
         store_pa += -store_pa % 4096
     pool = int(os.environ.get('POOL_KB', '0')) * 1024
-    hdr = struct.pack('<4sIIIIIIII', b'MCOR', 3 if store else 2, free, heap_bytes, bm_bytes,
-                      tail_lo, tail_hi, store_pa, pool)
+    hdr = struct.pack('<4sIIIIIIIII', b'MCOR', 4 if gap else 3 if store else 2, free,
+                      heap_bytes, bm_bytes, tail_lo, tail_hi, store_pa, pool, gap)
     body += hdr + b'\0' * (64 - len(hdr)) + core
     if store:
         body += b'\0' * (store_pa - LOAD - len(body))
@@ -186,7 +204,7 @@ def main():
     struct.pack_into('<I', body, 20, LOAD + len(body))       # load_end_addr
     open(out, 'wb').write(body)
     print('%s: image %d + core %d bytes (low %d, heap %d, bitmaps 2 x %d)'
-          % (out, len(img), len(body) - len(img), LOW_SIZE, heap_bytes, bm_bytes))
+          % (out, hdr_pa - LOAD, len(body) - (hdr_pa - LOAD), LOW_SIZE, heap_bytes, bm_bytes))
 
 
 if __name__ == '__main__':

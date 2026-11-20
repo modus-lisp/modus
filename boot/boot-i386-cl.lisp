@@ -84,6 +84,12 @@
 (defconstant +i386-cl-v-pfaddr+ #x8074 "The page-fault handler's address.")
 (defconstant +i386-cl-v-faults+ #x8078 "Chunks decoded so far (a count, for the curious).")
 (defconstant +i386-cl-v-rem+    #x807C "Heap bytes still to map.")
+(defconstant +i386-cl-v-hole+   #x8080
+  "A version-4 core's GAP: the paged code's bytes, which the file leaves out
+   (scripts/dos386-core.py), or 0.  Everything the file holds past [plo, phi)
+   sits that much lower in physical memory than its address.")
+(defconstant +i386-cl-v-holelo+ #x8084 "The gap's plo, read before the probe.")
+(defconstant +i386-cl-v-holehi+ #x8088 "The gap's phi.")
 (defconstant +i386-cl-owners+   #x8400 "Per slot: the chunk address it holds, or -1.  768 slots at most.")
 (defconstant +i386-cl-pt-window+ #xFFC00000
   "The page tables, through the page directory's last entry pointing at itself.")
@@ -161,10 +167,42 @@
        (cons #xB9 (i386l-le32-list 4096)) '(:call 0 alloc)
        (i386cl-abs '(#xA3) +i386-cl-v-pd+)
        '(#x89 #xC7) (cons #xB9 (i386l-le32-list 4096)) '(:call 0 zero)
-       ;; identity: [0, image end)
+       ;; identity: [0, image end) -- or, with a version-4 core, whose file
+       ;; leaves the paged code [plo, phi) out (scripts/dos386-core.py): the
+       ;; identity [0, phi) and [phi, ...) onto the file's rest, which the
+       ;; loader put at plo.  [plo, phi)'s entries go when the paged code is
+       ;; unmapped below; mapping them first makes their page tables.
+       (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hole+) (i386l-le32-list 0))
+       (i386cl-abs '(#xA1) (+ +i386-cl-load-addr+ 20))        ; mov eax, [load_end]
+       (cons #x3D (i386l-le32-list (+ +i386-cl-load-addr+ 64)))
+       '(:jcc32 #x72 map-plain)
+       (cons #x81 (cons #x78 (cons #xF0 (i386l-le32-list #x55444F4D))))  ; 'MODU'
+       '(:jcc32 #x75 map-plain)
+       (cons #x81 (cons #x78 (cons #xF4 (i386l-le32-list #x524F4353))))  ; 'SCOR'
+       '(:jcc32 #x75 map-plain)
+       '(#x8B #x58 #xF8)                                      ; ebx = header
+       (cons #x81 (cons #x3B (i386l-le32-list #x524F434D)))   ; 'MCOR'
+       '(:jcc32 #x75 map-plain)
+       (cons #x83 '(#x7B #x04 #x04))                          ; version 4?
+       '(:jcc32 #x72 map-plain)
+       '(#x8B #x4B #x24) '(#x85 #xC9) '(:jcc32 #x74 map-plain)    ; ecx = [hdr+36], the gap
+       (i386cl-abs '(#x89 #x0D) +i386-cl-v-hole+)
+       '(#x8B #x53 #x1C)                                      ; edx = the store (physical)
+       '(#x8B #x02) (i386cl-abs '(#xA3) +i386-cl-v-holelo+)   ; plo
+       '(#x8B #x42 #x04) (i386cl-abs '(#xA3) +i386-cl-v-holehi+)  ; phi
+       '(#x31 #xFF) '(#x31 #xF6)                              ; [0, phi) identity
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-holehi+)
+       '(#xC1 #xE9 #x0C) '(:call 0 map)
+       (i386cl-abs '(#x8B #x3D) +i386-cl-v-holehi+)           ; [phi, ..) -> plo
+       (i386cl-abs '(#x8B #x35) +i386-cl-v-holelo+)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-imgend+)
+       '(#x29 #xF1) '(#xC1 #xE9 #x0C) '(:call 0 map)          ; sub ecx, esi; shr 12
+       '(:jmp32 0 map-image-done)
+       '(:label map-plain)
        '(#x31 #xFF) '(#x31 #xF6)                              ; edi = esi = 0
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-imgend+)
        '(#xC1 #xE9 #x0C) '(:call 0 map)                    ; shr ecx, 12
+       '(:label map-image-done)
        ;; the fixed block, zeroed (hosted: a fresh mapping)
        (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 alloc)
        '(#x50) '(#x89 #xC7) (cons #xB9 (i386l-le32-list +i386-cl-low-size+)) '(:call 0 zero)
@@ -223,7 +261,7 @@
        '(#x89 #xC1) '(#x83 #xE9 #x10)                         ; ecx = load_end - 16
        '(#x81 #xE1) (i386l-le32-list #xFFFFF000)
        (cons #x83 '(#x7B #x04 #x03))                          ; cmp dword [ebx+4], 3
-       '(:j8 #x72 core-span)                                  ; jb
+       '(:jcc32 #x72 core-span)                               ; jb
        '(#x8B #x4B #x1C)                                      ; ecx = store
        (i386cl-abs '(#x89 #x0D) +i386-cl-v-store+)
        '(#x8B #x01) (i386cl-abs '(#xA3) +i386-cl-v-plo+)      ; store: plo, phi
@@ -253,8 +291,33 @@
        (i386cl-abs '(#x3B #x05) +i386-cl-v-pagedn+) '(:j8 #x76 pool-fits)
        (i386cl-abs '(#xA1) +i386-cl-v-pagedn+)
        '(:label pool-fits)
+       ;; with a gap the pool is RAM the heap could have had, so the heap goes
+       ;; first: the pool is what is left past 8 MB of heap, from 2 MB up to
+       ;; the rule above (a header-named size still wins)
+       '(#x51)                                                ; push ecx (the store, for core-span)
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hole+) '(#x00))
+       '(:jcc32 #x74 pool-capped)
+       '(#x83 #x7B #x20 #x00) '(:jcc32 #x75 pool-capped)      ; cmp dword [ebx+32], 0
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-ramend+)
+       (i386cl-abs '(#x2B #x0D) +i386-cl-v-panext+)
+       '(:j8 #x72 pool-min)                                   ; jb
+       '(#x81 #xE9) (i386l-le32-list (+ #x800000 +i386-cl-pt-reserve+))   ; sub ecx, 8 MB + PTs
+       '(:j8 #x72 pool-min)
+       '(#x39 #xC8) '(:j8 #x76 pool-floor)                    ; cmp eax, ecx; jbe
+       '(#x89 #xC8)                                           ; eax = ecx
+       '(:label pool-floor)
+       (cons #x3D (i386l-le32-list #x200000)) '(:j8 #x73 pool-capped)   ; >= 2 MB
+       '(:label pool-min)
+       (cons #xB8 (i386l-le32-list #x200000))
+       '(:label pool-capped)
+       '(#x59)                                                ; pop ecx
        (cons #x25 (i386l-le32-list #xFFFFC000))
        (i386cl-abs '(#xA3) +i386-cl-v-pool+)
+       ;; a gap: the paged code has no pages to give, the pool comes from
+       ;; fresh RAM (pagedn = pool makes both of their terms below vanish)
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hole+) '(#x00))
+       '(:jcc32 #x74 core-span)
+       (i386cl-abs '(#xA3) +i386-cl-v-pagedn+)
        '(:label core-span)
        '(#x29 #xD9)                                           ; - header
        '(:j8 #x76 probe-done)                                 ; jbe
@@ -270,6 +333,12 @@
        (i386cl-abs '(#x03 #x05) +i386-cl-v-coren+)           ; + the core's pages
        (i386cl-abs '(#x03 #x05) +i386-cl-v-pagedn+)          ; + the paged code
        (i386cl-abs '(#x2B #x05) +i386-cl-v-pool+)            ; - the pool
+       ;; ... and with a gap, whose pool is fresh RAM (pagedn = pool cancelled
+       ;; the two terms above), the pool again
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hole+) '(#x00))
+       '(:j8 #x74 size-nogap)
+       (i386cl-abs '(#x2B #x05) +i386-cl-v-pool+)
+       '(:label size-nogap)
        '(#x89 #xC2) '(#xC1 #xEA #x05) '(#x29 #xD0)            ; eax -= eax/32
        '(#x89 #xC7)                                           ; edi = X
        '(#x31 #xD2) (cons #xB9 (i386l-le32-list 9)) '(#xF7 #xF1) ; eax = X/9
@@ -301,6 +370,9 @@
        (i386cl-abs '(#x2B #x05) +i386-cl-v-m+)
        '(#x39 #x43 #x08)                                      ; cmp [ebx+8], eax
        '(:jcc32 #x72 fits)                                    ; jb
+       ;; a gap: the file holds no paged code to boot cold with
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hole+) '(#x00))
+       '(:jcc32 #x75 no-ram)
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-hdr+) (i386l-le32-list 0))
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-tail+) (i386l-le32-list 0))
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-coren+) (i386l-le32-list 0))
@@ -334,8 +406,14 @@
        '(:label map-fresh-done)
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-pagedn+)
        '(#x85 #xC9) '(:jcc32 #x74 map-no-paged)
-       ;; the pool, its slots all empty
+       ;; the pool, its slots all empty: the paged code's first pages, or
+       ;; with a gap fresh RAM
        (i386cl-abs '(#xA1) +i386-cl-v-plo+) (i386cl-abs '(#xA3) +i386-cl-v-poolpa+)
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hole+) '(#x00))
+       '(:jcc32 #x74 pool-placed)
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-pool+) '(:call 0 alloc)
+       (i386cl-abs '(#xA3) +i386-cl-v-poolpa+)
+       '(:label pool-placed)
        (i386cl-abs '(#x8B #x0D) +i386-cl-v-pool+) '(#xC1 #xE9 #x0E)    ; ecx = slots
        (i386cl-abs '(#x89 #x0D) +i386-cl-v-nslots+)
        (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-next+) (i386l-le32-list 0))
@@ -489,6 +567,18 @@
        '(#x59) '(#xC3)
        '(:label pf-after)
        '(#x58) (i386cl-abs '(#xA3) +i386-cl-v-pfaddr+)       ; pop eax
+       ;; with a gap, the header and the store are read from here on at their
+       ;; addresses, the gap above their physical places
+       (i386cl-abs '(#x8B #x0D) +i386-cl-v-hole+)
+       '(#x85 #xC9) '(:jcc32 #x74 gap-done)
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hdr+) '(#x00))
+       '(:j8 #x74 gap-store)
+       (i386cl-abs '(#x01 #x0D) +i386-cl-v-hdr+)             ; add [hdr], ecx
+       '(:label gap-store)
+       (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-store+) '(#x00))
+       '(:j8 #x74 gap-done)
+       (i386cl-abs '(#x01 #x0D) +i386-cl-v-store+)
+       '(:label gap-done)
        ;; ---- the saved core, if the probe above kept it: every header field
        ;; it needs is read FIRST, since copying the heap overwrites the
        ;; header's page (the core's pages are now the heap's)

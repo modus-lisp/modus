@@ -34091,7 +34091,13 @@
       (let ((hot nil) (boot nil) (cold nil))
         (dolist (e all-ir)
           (let ((nm (function-info-name (car e))))
-            (cond ((and *boot-tail-last* (%boot-only-fn-name-p nm)) (push e boot))
+            (cond ((and *boot-tail-last* (%boot-only-fn-name-p nm))
+                   ;; with cold code, boot-only code is cold too: the core run
+                   ;; reads it from the disk, and the application never maps it
+                   (if (and *cold-keep*
+                            (< (loop for insn in (cdr e) sum (ir-instruction-size insn)) 49152))
+                       (push e cold)
+                       (push e boot)))
                   ;; a body over ~48 KB of bytecode stays: a cold body's
                   ;; relocations are 16-bit word offsets (128 KB), and the
                   ;; 68k code is about the bytecode's size

@@ -40,7 +40,7 @@ REPO = os.path.dirname(HERE)
 LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
-    'quadra':    (0x00600000, 0x009F0000, 0x00A70000, 0x00AC0000, 0x20000),   # cache, stack, NIL's page between
+    'quadra':    (0x00600000, 0x009D0000, 0x00A30000, 0x00A80000, 0x20000),   # cache, stack, NIL's page between
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
@@ -54,7 +54,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION = LOAD + SHIFT, STATIC_LO + SHIFT, STATIC_HI 
 CHAIN_MEMTOP = {'classicos': 0x00400000, 'quadra': 0x00800000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 # the layout's kind map when its young heap is last in the map (boot-mac68k
 # :QUADRA): the application's loader then sizes the heap from its partition
-KMAP = {'quadra': 0x00EF0000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
+KMAP = {'quadra': 0x00EB0000}.get(os.environ['MODUS_MAC68K_MACHINE'].lower(), 0)
 KMAP = KMAP and KMAP + SHIFT
 # where the layout LINKS the init-only text (boot-mac68k :INIT-BASE, cross.lisp
 # *POOL-INIT-BASE*), when not where it lies in the image: the core run's disk
@@ -323,7 +323,7 @@ def relocate(core, static_lo=None):
     objs, conses = nob, ncs
     # the static block: the new ranges; cards off until %GC-CARDS-INIT
     for off, v in ((0x6004, nolo), (0x6008, nolo + len(objs)), (0x600C, nclo), (0x6010, nchi),
-                   (0x601C, 0), (0x6014, 1),
+                   (0x6018, 0), (0x601C, 0), (0x6014, 1),
                    (0x6030, 1 if os.environ.get('MODUS_MAC_CORE_PROBES') == '1' else 0)):
         struct.pack_into('>I', low, off, v)
     # the cards' tables (the marks, the crossing table): %GC-CARDS-INIT
@@ -331,9 +331,15 @@ def relocate(core, static_lo=None):
     # -- which two runs a shift apart do not share
     low[0x6100:0x7F00] = bytes(0x7F00 - 0x6100)
     low[LOW_BLOCK - 0x2000:LOW_BLOCK] = bytes(0x2000)
-    # a new collection count: anything keyed by address re-hashes
+    # a new collection count: anything keyed by address re-hashes.  A fixed
+    # one, not the run's + 1: two core runs a shift apart need not collect
+    # equally often (cold code arrives by disk reads, and anything timed at
+    # boot then allocates differently), and the relocating pair must agree
     c, = struct.unpack_from('>I', low, 0x60)
-    struct.pack_into('>I', low, 0x60, c + 1)
+    struct.pack_into('>I', low, 0x60, 0x4000 if c < 0x4000 else c + 1)
+    # the semispaces the run ended in: every boot from the core sets them anew
+    # (boot-mac68k EMIT-MAC68K-HEAP / -HEAP-FROM-SLOT), and two runs differ
+    low[0x40:0x58] = bytes(0x18)
     print('mac68k-core: %d objects (%d bytes) -> #%x, %d bytes of conses -> #%x; %d pointers moved'
           % (nobj, len(objs), nolo, len(conses), nclo, moved[0]))
     return low, nolo, objs, nclo, conses

@@ -164,7 +164,10 @@ def size_rsrc(memtop, span=0, kmap=0):
         # alignment of the image's base, and the application's own stack.
         # Asking for all of RAM, as below, left the Finder unable to open
         # even the desktop (a 32 MB Quadra 950 under 7.5.3).
-        need = span + 0x180000
+        # measured (MAME Quadra 950, 7.5.3, MODUS_PARTITION_FORCE=1): span +
+        # 576 KB runs every benchmark form, span + 320 KB is refused by the
+        # loader's own check.  (0x180000 while BASE was 512 KB-aligned.)
+        need = span + 0x90000
         # a map whose young heap is last (KMAP set) takes its semispaces from
         # whatever partition it gets (mac68k-chain.s HSIZE): SPAN is its
         # smallest heap, and the preferred size -- Get Info's to change, or
@@ -173,6 +176,10 @@ def size_rsrc(memtop, span=0, kmap=0):
         if kmap:
             kb = os.environ.get('MODUS_PARTITION_KB')
             pref = max(need, int(kb) * 1024) if kb else need + 0x400000
+        if os.environ.get('MODUS_PARTITION_FORCE') == '1' and os.environ.get('MODUS_PARTITION_KB'):
+            # testing the floor: MODUS_PARTITION_KB is the partition, smaller
+            # than NEED if so (the loader refuses one it cannot use)
+            pref = need = int(os.environ['MODUS_PARTITION_KB']) * 1024
         return struct.pack('>HII', 0x0080, pref, need)
     if memtop <= 4 << 20:
         return struct.pack('>HII', 0, 64 * 1024, 64 * 1024)

@@ -5373,7 +5373,8 @@
     (declare (ignore load))
     (let ((f1 (mvm-make-label)) (f2 (mvm-make-label)) (full (mvm-make-label))
           (rfail (mvm-make-label)) (xfail (mvm-make-label)) (lp (mvm-make-label))
-          (test (mvm-make-label)) (noext (mvm-make-label)) (xg (mvm-make-label)))
+          (test (mvm-make-label)) (noext (mvm-make-label)) (xg (mvm-make-label))
+          (xg7 (mvm-make-label)))
       (flet ((ws (&rest ws) (dolist (w ws) (m68k-emit-word buf w)))
              (l32 (v) (m68k-emit-long buf v)))
         (m68k-word-align buf)
@@ -5434,11 +5435,13 @@
         (m68k-emit-bsr buf *68k-mac-service-label*)
         (ws #x4A82) (m68k-emit-bne buf rfail)
         (ws #xD7C3 #x49EB #x0006)                            ; A3 = the list; A4 = its offsets
-        (ws #x4845 #x4846)                                   ; DELTA >> 16, HEXTRA >> 16
+        ;; kind 7 (a kind-map bias, a 32-bit immediate): 7 DELTA / 8 + HEXTRA
+        ;; to the whole long -- DELTA is only 64 KB-aligned (mac68k-chain.s)
+        (ws #x2E05 #xE78F #x9E85 #xE687 #xDE86)              ; D7 = 7 D5 / 8 + D6
+        (ws #x4845)                                          ; DELTA >> 16
         (ws #x3213 #x3405) (m68k-emit-bsr buf xg)            ; kind 8
         (ws #x322B #x0002 #x3405 #xD442) (m68k-emit-bsr buf xg) ; kind 16
-        (ws #x322B #x0004 #x3405 #xC5FC #x0007 #xE682 #xD446)   ; kind 7, + the kind map's move
-        (m68k-emit-bsr buf xg)
+        (ws #x322B #x0004) (m68k-emit-bsr buf xg7)           ; kind 7
         (m68k-emit-label buf noext)
         ;; the stub: JMP body; and the return address: the body
         (ws #x337C #x4EF9 #xFFFA #x2348 #xFFFC)
@@ -5453,6 +5456,15 @@
           (m68k-emit-bra buf xt)
           (m68k-emit-label buf xl)
           (ws #x7000 #x301C #xD080 #xD570 #x0800)            ; ADD.W D2,(A0,D0.L)
+          (m68k-emit-label buf xt)
+          (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
+          (ws #x4E75))
+        ;; XG7: add D7.L at the D1.W word offsets (/2) at A4 into the body at A0
+        (let ((xl (mvm-make-label)) (xt (mvm-make-label)))
+          (m68k-emit-label buf xg7)
+          (m68k-emit-bra buf xt)
+          (m68k-emit-label buf xl)
+          (ws #x7000 #x301C #xD080 #xDFB0 #x0800)            ; ADD.L D7,(A0,D0.L)
           (m68k-emit-label buf xt)
           (ws #x51C9) (m68k-emit-word buf 0) (m68k-emit-fixup buf xl :disp16)
           (ws #x4E75))

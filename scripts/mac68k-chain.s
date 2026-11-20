@@ -39,6 +39,8 @@
         .equ    HEXTRA, -1204               |   and how far that moved it (x7/8 sites)
         .equ    HJLO, -1208                 | the JIT's code area from the partition:
         .equ    HJHI, -1212                 |   [HJLO, HJHI), above the kind map
+        .equ    HK7, -1216                  | RELOCATE: kind 7's long add
+        .equ    HKIND, -1220                |   and the kind being applied
         .equ    JITMIN, 0x40000             | 256 KB
         .ifndef JITMAX                      | (mac68k-chain.py MAC68K_CHAIN_DEFS can
         .equ    JITMAX, 0x400000            |  set these: a measuring run's bigger
@@ -48,7 +50,7 @@
         .endif
         .equ    GUARD, 0x10000              | boot-mac68k :GC-GUARD
         .equ    LOWBLK, 0x20000             | the low block (the layout's :ALLOC-START)
-start:  link    %a6, #-1212
+start:  link    %a6, #-1220
         clr.l   HHALF(%a6)
         clr.l   HKMAP(%a6)
         clr.l   HEXTRA(%a6)
@@ -146,9 +148,9 @@ start:  link    %a6, #-1212
         bsr     hinit
         lea     m_alloc(%pc), %a4
         bne     fail
-        move.l  0x114, %d0              | HeapEnd, 64 KB on, to 512 KB
-        add.l   #0x10000 + 0x7FFFF, %d0
-        and.l   #0xFFF80000, %d0        | BASE
+        move.l  0x114, %d0              | HeapEnd, 64 KB on, to 64 KB
+        add.l   #0x10000 + 0xFFFF, %d0
+        and.l   #0xFFFF0000, %d0        | BASE
         move.l  %d0, %d1
         add.l   40(%a2), %d1            | BASE + SPAN must leave the stack 128 KB
         add.l   #0x20000, %d1
@@ -392,7 +394,9 @@ hsize:  tst.l   44(%a2)
 | Apply the relocation table (A2: the record; BASE, TBL): read RELLEN bytes
 | from RELOFF to TBL, then per kind (KIND COUNT, then COUNT gaps: a byte G
 | = 2G bytes on, or 0 and a 4-byte offset) add ((DELTA >> 16) * KIND) / 8 to
-| the 16-bit word at BASE + offset.  The table is byte-packed, so its longs
+| the 16-bit word at BASE + offset -- kinds 8 and 16; a kind-7 site (a
+| kind-map bias, always a 32-bit immediate) gets 7 DELTA / 8 + HEXTRA added
+| to the whole long, since BASE is only 64 KB-aligned.  The table is byte-packed, so its longs
 | are read a byte at a time (a 68000 faults on an odd MOVE.L).  Z set when
 | it worked.
 relocate:
@@ -404,17 +408,22 @@ relocate:
         bne     9f
         move.l  TBL(%a6), %a3
         move.l  DELTA(%a6), %d6         | DELTA >> 16 in the low word: DELTA
-        swap    %d6                     |   is a multiple of 512 KB
+        swap    %d6                     |   is a multiple of 64 KB
         moveq   #2, %d5                 | three kinds
 1:      bsr     rd32                    | KIND
         move.w  %d0, %d4
-        muls.w  %d6, %d4                | (DELTA >> 16) * KIND, a multiple of 8
+        muls.w  %d6, %d4                | (DELTA >> 16) * KIND
         asr.l   #3, %d4
-        cmp.l   #7, %d0                 | a kind-map bias: and the kind map's move
-        bne     11f
-        move.l  HEXTRA(%a6), %d1
-        swap    %d1
-        add.w   %d1, %d4
+        move.l  %d0, HKIND(%a6)
+        cmp.l   #7, %d0                 | a kind-map bias: 7/8 of DELTA is not a
+        bne     11f                     |   whole 64 KB, so the whole long moves:
+        move.l  DELTA(%a6), %d1         |   7 DELTA / 8 + the kind map's move
+        move.l  %d1, %d4
+        lsl.l   #3, %d4
+        sub.l   %d1, %d4
+        asr.l   #3, %d4
+        add.l   HEXTRA(%a6), %d4
+        move.l  %d4, HK7(%a6)
 11:
         bsr     rd32                    | COUNT
         move.l  %d0, %d2
@@ -430,8 +439,13 @@ relocate:
         bra     31f
 3:      add.l   %d0, %d0
         add.l   %d0, %a4
-31:     add.w   %d4, (%a4)
-        subq.l  #1, %d2
+31:     cmp.l   #7, HKIND(%a6)
+        beq     32f
+        add.w   %d4, (%a4)              | the high word
+        bra     33f
+32:     move.l  HK7(%a6), %d0           | kind 7: the long
+        add.l   %d0, (%a4)
+33:     subq.l  #1, %d2
         bra     2b
 4:      dbra    %d5, 1b
         moveq   #0, %d0

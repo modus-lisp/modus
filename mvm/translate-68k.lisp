@@ -1242,6 +1242,13 @@
                 ((<= -32768 d 32767) :word)
                 (t :long))))))
 
+(defvar *68k-long-absolute* nil
+  "While translating native code with a moved region (a boot tail, cold code):
+   a long branch is JMP / JSR abs.L on any CPU, as on the 68000 -- a 68020's
+   BRA.L / BSR.L is PC-relative, and the region it crosses into moves
+   (M68K-RELAX-PLAN makes every crossing branch long; M68K-FIXUP-LABELS fails
+   a PC-relative one).")
+
 (defun m68k-emit-branch (buf base label-id)
   "BRA (BASE #x6000), BSR (#x6100) or Bcc (#x6000 | cc<<8) to LABEL-ID, in the
    size the relaxation plan gives this branch's ordinal (long without one)."
@@ -1255,7 +1262,7 @@
     ;; 68000: a boot stub's long branch is 16-bit; native code's is absolute.
     (when (and *68k-cpu-68000* (eq size :long) (not *68k-native-p*))
       (setq size :word))
-    (when (and *68k-cpu-68000* (eq size :long))
+    (when (and (or *68k-cpu-68000* *68k-long-absolute*) (eq size :long))
       (unless label-id (error "68k 68000: a long branch with no label"))
       (case base
         (#x6000 (m68k-emit-word buf #x4EF9))             ; JMP abs.L
@@ -4149,7 +4156,7 @@
    the extension word's address, so the fixup's reference is set by hand -- or,
    on a 68000, LEA abs.L,An with the address filled in after layout."
   (cond
-    (*68k-cpu-68000*
+    ((or *68k-cpu-68000* *68k-long-absolute*)                   ; (a moved region: absolute)
      (m68k-emit-word buf (logior #x41F9 (ash (logand an 7) 9)))   ; LEA abs.L,An
      (m68k-emit-abs32 buf label-id))
     (t
@@ -4168,7 +4175,7 @@
     (unless (eq via label-id)                     ; a call island has it
       (m68k-emit-bsr buf label-id)
       (return-from m68k-emit-bsr-long nil)))
-  (when *68k-cpu-68000*
+  (when (or *68k-cpu-68000* *68k-long-absolute*)        ; (*68K-LONG-ABSOLUTE*: a moved region)
     (m68k-emit-word buf #x4EB9)                          ; JSR abs.L
     (m68k-emit-abs32 buf label-id)
     (return-from m68k-emit-bsr-long nil))
@@ -5524,6 +5531,8 @@
          (*68k-cold-start-label* (and *68k-cold-pc* (mvm-make-label)))
          (*68k-cold-xindex-label* (and *68k-cold-pc* (mvm-make-label)))
          (*68k-cold-stub-homes* (make-hash-table))
+         (*68k-long-absolute* (or (and (boundp '*boot-tail-pc*) *boot-tail-pc* t)
+                                  (and *68k-cold-pc* t)))
          (cold-open nil)                ; (START ENTRY MARK) of the body being emitted
          (cold-bodies nil)
          (*68k-paged-fns* nil)

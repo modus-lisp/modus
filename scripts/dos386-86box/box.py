@@ -90,6 +90,31 @@ class Screen:
                     x += 1
         return best
 
+    def moved_highlight(self, before):
+        """The highlight as what changed since BEFORE (a key moved it): the
+        run of cells whose attribute differs from BEFORE's, with letters in it,
+        that now has the rarer attribute.  For menus whose title bar is drawn
+        in a rarer colour than the selected item (PhoenixBIOS 4.0's Main Menu),
+        where HIGHLIGHT's rarest-attribute rule picks the title."""
+        if not (self.ok and before and before.ok):
+            return None
+        cells = collections.Counter(a for row in self.attrs for a in row)
+        best, key = None, None
+        for y, (row, at, at0) in enumerate(zip(self.rows, self.attrs, before.attrs)):
+            x = 0
+            while x < len(at):
+                if at[x] != at0[x]:
+                    x0 = x
+                    while x < len(at) and at[x] != at0[x] and at[x] == at[x0]:
+                        x += 1
+                    text = row[x0:x].strip()
+                    k = cells[at[x0]]
+                    if re.search('[A-Za-z]{2}', text) and (key is None or k < key):
+                        best, key = (y, x0, x, text), k
+                else:
+                    x += 1
+        return best
+
     def find(self, pattern):
         """(row, col) of the first match of PATTERN on a single row."""
         for y, row in enumerate(self.rows):
@@ -190,10 +215,39 @@ class Box:
 
     def goto(self, pattern, tries=40):
         """Move a setup menu's highlight onto the item matching PATTERN.
-        False if it is not on the screen, or the highlight stops moving."""
+        False if it is not on the screen, or the highlight stops moving.
+        When the rarest-attribute guess does not move with the arrow keys
+        (a title bar rarer than the item), the highlight is tracked as what a
+        key changes (Screen.moved_highlight)."""
+        if self._goto(pattern, tries, lambda scr, prev: scr.highlight()):
+            return True
+        prev = self.screen()
+        self.keys('down')
+        cur = self.screen()
+        hl = cur.moved_highlight(prev)
+        if hl is None:                      # already on the last item
+            prev = cur
+            self.keys('up')
+            cur = self.screen()
+            hl = cur.moved_highlight(prev)
+        for _ in range(tries):
+            if hl is None:
+                return False
+            if re.search(pattern, hl[3], re.I):
+                return True
+            at = cur.find(pattern)
+            if not at:
+                return False
+            y, x = at
+            self.keys('up' if y < hl[0] else 'down' if y > hl[0] else 'left' if x < hl[1] else 'right')
+            prev, cur = cur, self.screen()
+            hl = cur.moved_highlight(prev)
+        return False
+
+    def _goto(self, pattern, tries, hlf):
         for _ in range(tries):
             scr = self.screen()
-            hl = scr.highlight()
+            hl = hlf(scr, None)
             if hl and re.search(pattern, hl[3], re.I):
                 return True
             at = scr.find(pattern)

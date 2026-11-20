@@ -328,9 +328,8 @@ paper over it in the next one.
 - Disk is tight (about 4.6 GB free on /home, 6.3 GB on / today).  The
   acceptance gate needs `GATE_MIN_FREE_GB` (8) free under a workdir outside
   /tmp; clean up your own artifacts first and say so if you cannot reach it.
-- Commit messages end with
-  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`; no model
-  identifiers anywhere else in commits, code or docs.
+- Commit messages end with the co-author trailer the session's instructions
+  give; no model identifiers anywhere else in commits, code or docs.
 - Benchmarks follow the workspace CLAUDE.md: SBCL and Modus numbers, with an
   independent reference check of the outputs.
 - Line numbers in this spec are pointers into a moving tree; trust the

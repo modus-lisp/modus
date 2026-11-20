@@ -90,6 +90,15 @@
    sits that much lower in physical memory than its address.")
 (defconstant +i386-cl-v-holelo+ #x8084 "The gap's plo, read before the probe.")
 (defconstant +i386-cl-v-holehi+ #x8088 "The gap's phi.")
+(defconstant +i386-cl-v-static-lo+ #x8090
+  "A core boot's STATIC heap (translate-i386.lisp +I386-GC-STATIC-LO+): the
+   restored heap, walked by every collection and never copied.")
+(defconstant +i386-cl-v-static-hi+ #x8094 "Its end; 0: none.")
+(defvar *i386-cl-gc-static*
+  (not (equal (sb-ext:posix-getenv "MODUS_I386_GC_STATIC") "0"))
+  "A core boot's restored heap is static, the semispaces above it hold only
+   what is allocated after (the 68k's MODUS_68K_GC_STATIC): the heap needs the
+   boot data once, not twice.  MODUS_I386_GC_STATIC=0: the old layout.")
 (defconstant +i386-cl-owners+   #x8400 "Per slot: the chunk address it holds, or -1.  768 slots at most.")
 (defconstant +i386-cl-pt-window+ #xFFC00000
   "The page tables, through the page directory's last entry pointing at itself.")
@@ -116,7 +125,9 @@
      buf
      (append
       (list '(#xFA) '(#xFC)                                   ; cli, cld
-            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 0)))
+            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-core+) (i386l-le32-list 0))
+            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-static-lo+) (i386l-le32-list 0))
+            (append (i386cl-abs '(#xC7 #x05) +i386-cl-v-static-hi+) (i386l-le32-list 0)))
       ;; the FPU: SSE2's OS bits, or x87 at 53-bit precision (MODUS_I386_FP=x87,
       ;; which runs where there is no CR4 to write -- a 386 or 486), or for
       ;; the soft-float image (MODUS_I386_SOFT_FLOAT, a 486SX or a 386 with no
@@ -365,11 +376,24 @@
        ;; limit, heap + S/2 - M; if not, size again without it (a cold boot)
        (i386cl-abs '(#x8B #x1D) +i386-cl-v-hdr+)
        '(#x85 #xDB) '(:jcc32 #x74 fits)                       ; test ebx, ebx; jz
-       '(#xD1 #xE8)                                           ; eax = S/2
-       (cons #x05 (i386l-le32-list +i386-cl-heap-va+))
-       (i386cl-abs '(#x2B #x05) +i386-cl-v-m+)
-       '(#x39 #x43 #x08)                                      ; cmp [ebx+8], eax
-       '(:jcc32 #x72 fits)                                    ; jb
+       (if *i386-cl-gc-static*
+           ;; static: the restored heap's pages, then two semispaces of at
+           ;; least M + 256 KB each, within S
+           (list :splice '(#x8B #x43 #x08)                    ; eax = free
+                 (cons #x05 (i386l-le32-list #xFFF))
+                 (cons #x25 (i386l-le32-list #xFFFFF000))
+                 (cons #x2D (i386l-le32-list +i386-cl-heap-va+))   ; the static pages
+                 (i386cl-abs '(#x8B #x0D) +i386-cl-v-m+)
+                 '(#x81 #xC1) (i386l-le32-list #x40000)
+                 '(#xD1 #xE1)                                 ; ecx = 2 (M + 256 KB)
+                 '(#x01 #xC8)                                 ; add eax, ecx
+                 (i386cl-abs '(#x3B #x05) +i386-cl-v-s+)
+                 '(:jcc32 #x76 fits))                         ; jbe
+           (list :splice '(#xD1 #xE8)                         ; eax = S/2
+                 (cons #x05 (i386l-le32-list +i386-cl-heap-va+))
+                 (i386cl-abs '(#x2B #x05) +i386-cl-v-m+)
+                 '(#x39 #x43 #x08)                            ; cmp [ebx+8], eax
+                 '(:jcc32 #x72 fits)))                        ; jb
        ;; a gap: the file holds no paged code to boot cold with
        (append (i386cl-abs '(#x83 #x3D) +i386-cl-v-hole+) '(#x00))
        '(:jcc32 #x75 no-ram)
@@ -633,6 +657,29 @@
        '(:jcc32 #x75 core-done)
        (i386cl-abs '(#xA1) +i386-cl-v-free+) (i386cl-abs '(#xA3) (+ g #x00))
        (i386cl-abs '(#xA1) +i386-cl-v-count+) (i386cl-abs '(#xA3) +gc-count-addr+)
+       (if *i386-cl-gc-static*
+           ;; STATIC: [page_base, free) is the static heap; the semispaces
+           ;; split what is above its last page; the young space is empty.
+           ;; page_base (the bitmaps' base) stays the heap's start, so the
+           ;; restored bits keep describing the static objects.
+           (list :splice (i386cl-abs '(#xA1) +i386-cl-v-free+)
+                 (i386cl-abs '(#xA3) +i386-cl-v-static-hi+)
+                 (cons #xB9 (i386l-le32-list (+ +i386-cl-heap-va+ +linux-i386-heap-alloc-start+)))
+                 (i386cl-abs '(#x89 #x0D) +i386-cl-v-static-lo+)
+                 (cons #x05 (i386l-le32-list #xFFF))
+                 (cons #x25 (i386l-le32-list #xFFFFF000))     ; eax = A, the first semispace
+                 (i386cl-abs '(#x8B #x15) +i386-cl-v-s+)
+                 '(#x81 #xC2) (i386l-le32-list +i386-cl-heap-va+)
+                 '(#x29 #xC2) '(#xD1 #xEA)                    ; edx = (heap + S - A) / 2
+                 '(#x83 #xE2 #xF0)                            ; to 16 bytes
+                 (i386cl-abs '(#xA3) (+ g #x00))              ; VA = A
+                 (i386cl-abs '(#xA3) +gc-from-start-addr+)
+                 (i386cl-abs '(#x89 #x15) +gc-space-size-addr+)
+                 '(#x8D #x0C #x10)                            ; lea ecx, [eax+edx]
+                 (i386cl-abs '(#x89 #x0D) +gc-to-start-addr+)
+                 (i386cl-abs '(#x2B #x0D) +i386-cl-v-m+)
+                 (i386cl-abs '(#x89 #x0D) (+ g #x04)))        ; VL = to - M
+           nil)
        '(:label core-done)
        '(:jmp32 0 past-subroutines))
       ;; ---- subroutines (physical addresses: called with paging off) ----

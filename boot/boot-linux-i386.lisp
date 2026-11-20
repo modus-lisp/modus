@@ -287,7 +287,11 @@
   "Emit ITEMS: byte lists, (:LABEL name), (:J8 opcode name) -- a short jump to
    a label (errors past +-127) -- (:JCC32 opcode name) -- the near form of
    short Jcc OPCODE (0F 80+cc rel32) -- (:JMP32 0 name) and (:CALL 0 name).
-   Displacements are computed here."
+   Displacements are computed here.  An item (:SPLICE . ITEMS) is ITEMS in
+   its place (a conditional part); NIL items vanish."
+  (setq items (loop for it in items
+                    if (and (consp it) (eq (car it) :splice)) append (cdr it)
+                    else if it collect it))
   (flet ((size (it) (cond ((and (consp it) (eq (car it) :label)) 0)
                           ((and (consp it) (eq (car it) :j8)) 2)
                           ((and (consp it) (eq (car it) :jcc32)) 6)

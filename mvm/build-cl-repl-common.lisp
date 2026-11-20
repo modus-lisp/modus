@@ -3755,6 +3755,18 @@
 ;; Narrow AOT string literals (compiler.lisp *NARROW-LITERALS-P*) wherever
 ;; *CL-REPL-RPI-CORE-SOURCE* turns %NARROW-STRINGS-P on.
 (when cl-user::*cl-repl-rpi-p* (setq *narrow-literals-p* t))
+;; i386: AOT string literals POOLED (compiler.lisp *NARROW-LITERALS-P*), each
+;; evaluation a %FRESH-STRING copy of the pooled one -- wide here, i386 has no
+;; narrow strings -- instead of one LI and one OBJ-SET per character: 919 KB of
+;; the bare image's 8.9 MB of native code.  MODUS_I386_POOL_LITERALS=0: the old
+;; way.  Mutable strings stay #x31, as on the 68k: %MAKE-STRING32 and
+;; %C32-ADDRESS assume the 64-bit layout (data at +16), so with *STRING32-P* on
+;; every 32-bit string wrote 12 bytes past its end -- harmless until a
+;; collection, which copies only the real size (compiler.lisp *STRING32-P*).
+(when (and cl-user::*cl-repl-i386-p*
+           (not (equal (sb-ext:posix-getenv "MODUS_I386_POOL_LITERALS") "0")))
+  (setq *narrow-literals-p* t
+        *string32-p* nil))
 ;; ... and packed u32 vectors' arms (compiler.lisp *U32-VECTORS-P*), with them.
 (when cl-user::*cl-repl-rpi-p* (setq *u32-vectors-p* t))
 

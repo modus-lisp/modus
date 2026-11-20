@@ -38,6 +38,11 @@
 (in-package :modus.mvm)
 
 (defconstant +i386-cl-load-addr+  #x100000)
+(defvar *i386-cl-max-heap*
+  (let ((v (sb-ext:posix-getenv "MODUS_I386_MAX_HEAP_MB")))
+    (if (and v (plusp (length v))) (* (parse-integer v) #x100000) #x20000000))
+  "The heap's S at most: 512 MB, or MODUS_I386_MAX_HEAP_MB (a test knob: a
+   small heap on a big machine, so a collection comes early).")
 (defconstant +i386-cl-heap-va+    #x19000000 "+linux-i386-heap-hint+.")
 (defconstant +i386-cl-stack-top+  #x18800000 "Hosted: +linux-i386-stack-addr+ + its 8 MB.")
 (defconstant +i386-cl-stack-size+ #x100000)
@@ -276,10 +281,12 @@
        '(:label m-small)
        '(#x89 #xC3) '(#xC1 #xE0 #x03)                         ; M = X/9, S = 8M
        '(:label m-done)
-       (cons #x3D (i386l-le32-list #x20000000))               ; S <= 512 MB
+       (cons #x3D (i386l-le32-list *i386-cl-max-heap*))       ; S <= 512 MB
        '(:j8 #x76 s-ok)
-       (cons #xB8 (i386l-le32-list #x20000000))
-       (cons #xBB (i386l-le32-list +linux-i386-gc-guard+))
+       (cons #xB8 (i386l-le32-list *i386-cl-max-heap*))
+       (cons #xBB (i386l-le32-list (if (= *i386-cl-max-heap* #x20000000)
+                                       +linux-i386-gc-guard+
+                                       (floor *i386-cl-max-heap* 8))))
        '(:label s-ok)
        (cons #x25 (i386l-le32-list #xFFFC0000))               ; S to 256 KB
        '(#x81 #xE3 #x00 #xF0 #xFF #xFF)                       ; M to a page

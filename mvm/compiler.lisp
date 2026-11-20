@@ -4201,9 +4201,18 @@
    dtype is read (typed array access, width inference).  A declaim is a
    promise, as in SBCL: the variable must hold what it says.")
 
+(defun %global-dtype-key (sym)
+  "The key a global's declared type is filed under: its PACKAGE and name.  A name alone
+   was the key, so a declaim in one library typed every same-named global in every other:
+   reel's (declaim (type (simple-array (unsigned-byte 8) (16)) +zigzag+)) made pigment's
+   +ZIGZAG+, a simple-vector, read as bytes in native code -- all zeros, and every JPEG's
+   coefficients piled into one slot."
+  (let ((p (symbol-package sym)))
+    (compute-name-hash (concatenate 'string (if p (package-name p) "#") "::" (symbol-name sym)))))
+
 (defun %global-dtype (sym)
   (and sym (symbolp sym) *global-dtypes*
-       (cdr (assoc (normalize-name sym) *global-dtypes*))))
+       (cdr (assoc (%global-dtype-key sym) *global-dtypes*))))
 
 (defun %var-dtype (form env)
   "Declared type of the variable FORM: its lexical binding's dtype when it has
@@ -4224,7 +4233,7 @@
         (let ((ty (%resolve-declared-type (cadr s))))
           (dolist (v (cddr s))
             (when (and v (symbolp v))
-              (let ((h (normalize-name v)))
+              (let ((h (%global-dtype-key v)))
                 (setq *global-dtypes*
                       (cons (cons h ty)
                             (remove h *global-dtypes* :key (function car))))))))))))

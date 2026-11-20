@@ -1325,6 +1325,11 @@
   "While translating with cold native code: hash, a cold function's start pc ->
    (INDEX STUB-T-WORD BODY-LABEL).")
 (defvar *68k-cold-enter2-label* nil "COLD-ENTER, the cold native loader.")
+(defvar *68k-routines-label* nil
+  "With cold native code: where the shared routines start, the resident
+   functions' end.  The functions before it are never written at run time;
+   the routines after it keep state inline (the console's), so a floppy's
+   preset dictionary (scripts/mac68k-floppy.lisp --core) ends here.")
 (defvar *68k-cold-desc-label* nil)
 (defvar *68k-cold-start-label* nil)
 (defvar *68k-cold-xindex-label* nil)
@@ -5361,7 +5366,8 @@
     ;; the descriptor: "modusCLD", the disk BIAS (a body's disk byte is HOME -
     ;; BIAS: the build's disk has the image at byte 1024; mac68k-core.py
     ;; rewrites it for the disk it makes), the cold section, the count, the
-    ;; external relocations' index, the first stub (the I-th is 16 I on)
+    ;; external relocations' index, the first stub (the I-th is 16 I on), and
+    ;; the resident functions' end (*68K-ROUTINES-LABEL*)
     (loop while (/= 0 (mod (m68k-buffer-position buf) 4)) do (m68k-emit-nop buf))
     (dolist (w '(#x6D6F #x6475 #x7343 #x4C44)) (m68k-emit-word buf w))
     (m68k-emit-label buf *68k-cold-desc-label*)
@@ -5371,6 +5377,7 @@
     (m68k-emit-long buf i)
     (m68k-emit-abs32 buf *68k-cold-xindex-label*)
     (m68k-emit-abs32 buf first-stub)
+    (m68k-emit-abs32 buf *68k-routines-label*)
     (m68k-emit-label buf *68k-cold-xindex-label*)
     (dotimes (k i) (m68k-emit-long buf 0))))
 
@@ -5674,6 +5681,8 @@
                  ;; the boot tail: the shared routines first (resident), then
                  ;; no more islands -- everything after here moves.  And the
                  ;; cold functions' stubs and their loader, resident too.
+                 (setq *68k-routines-label* (mvm-make-label))
+                 (m68k-emit-label buf *68k-routines-label*)
                  (m68k-emit-routines buf function-table)
                  (when *68k-cold-pc*
                    (m68k-emit-cold-native-resident buf function-table label-map))

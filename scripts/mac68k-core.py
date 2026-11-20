@@ -41,7 +41,7 @@ LOAD, STATIC_LO, STATIC_HI, REGION, LOW_BLOCK = {
     'classic':   (0x00040000, 0x00110000, 0x002B0000, 0x002B0000, 0x20000),
     'classicos': (0x00040000, 0x00110000, 0x00240000, 0x002B0000, 0x20000),   # JIT area above
     'quadra':    (0x00600000, 0x009D0000, 0x00A30000, 0x00A80000, 0x20000),   # cache, stack, NIL's page between
-    'floppy':    (0x00100000, 0x00960000, 0x00AE0000, 0x00B40000, 0x20000),   # the same, all resident
+    'floppy':    (0x00040000, 0x00440000, 0x00500000, 0x00540000, 0x20000),   # 8 MB, cold code on the floppy
     'classic2m': (0x00040000, 0x000D5000, 0x00178000, 0x00178000, 0xE000),
     'plus1m':    (0x00040000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
     'plus1mjit': (0x0003C000, 0x0008E000, 0x000D1000, 0x000D1000, 0xE000),
@@ -446,8 +446,10 @@ def main(image, disk):
     if cold_desc >= 0:
         # the cold section's disk byte: BIAS = its address - that
         struct.pack_into('>I', chunk, cold_desc + 8, (LOAD + resident - stream_disk) & 0xFFFFFFFF)
-        # what the core run loaded is gone: no cold floor, no JIT top
-        chunk[REGION - LOAD + 0x6068:REGION - LOAD + 0x6078] = bytes(16)
+        # what the core run loaded is gone: no cold floor, no JIT top; and no
+        # code area of its own (boot-mac68k :BOOT-JIT-AREA; an application's
+        # loader writes its partition's there at launch)
+        chunk[REGION - LOAD + 0x6060:REGION - LOAD + 0x6078] = bytes(24)
     # 3. COLD NAMES (mvm/mac68k-cold.lisp): IMAGE.cold, when the build wrote one,
     # on a block boundary after the streams; the static block's #x6044 says where
     tail = bytes(streams)

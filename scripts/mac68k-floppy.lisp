@@ -1,6 +1,7 @@
 ;;;; mac68k-floppy.lisp -- compressed Mac boot disks.
 ;;;;
 ;;;;   sbcl --script scripts/mac68k-floppy.lisp IMAGE DISK [--hd] [--load HEX]
+;;;;   sbcl --script scripts/mac68k-floppy.lisp CORE-DISK DISK --core
 ;;;;
 ;;;; IMAGE is a flat bare-Mac image (built for :mac68k, linked at #x00100000), or
 ;;;; with --load HEX one that goes at HEX -- a saved core (mac68k-core.py's
@@ -11,13 +12,23 @@
 ;;;; The boot blocks (scripts/mac68k-disk.lisp) read the blob to #x01200000; the
 ;;;; loader unpacks IMAGE to #x00100000 (or --load) and jumps to it.
 ;;;;
-;;;; THE FAST FLOPPY is a saved core (boot/boot-mac68k.lisp :FLOPPY): the REPL in
-;;;; ~105 s on a 68040 (MAME's Quadra 950) where a fresh image takes ~400 s, all
-;;;; but ~2 s of it reading the disk and unpacking.  Build the image with
-;;;; MODUS_MAC68K_MACHINE=floppy and mac68k-snap-build.sh's quadra knobs but
-;;;; MODUS_68K_COLD_KEEP= (empty: nothing may be left on a disk), take its core
-;;;; with MAC68K_CORE_RAW=CORE scripts/mac68k-core.py IMAGE DISK, then
-;;;;   MODUS_MAC68K_MACHINE=floppy sbcl --script scripts/mac68k-floppy.lisp CORE DISK --hd --load 100000
+;;;; THE CORE FLOPPY (--core; boot-mac68k :FLOPPY): a 68020+ Mac with 8 MB, the
+;;;; REPL from one 1.44 MB disk -- ~60 s on a 68040 (MAME's Quadra 950), ~131 s
+;;;; on a 16 MHz 68030 (the SE/30).  The image is all native code, 3.9 MB of it
+;;;; resident and 5.6 MB COLD (read at a function's first call); the floppy holds
+;;;; the core disk's boot read as one LZMA stream and its tail as blocks a driver
+;;;; unpacks on demand (MAIN-CORE below; scripts/mac68k-lzdisk.s).  Build:
+;;;;   MODUS_MAC68K_MACHINE=floppy MODUS_68K_COLD_KEEP=mvm/68k-keep-quadra.txt
+;;;;     MODUS_68K_THREADED=0 MODUS_68K_PAGED=0 (and mac68k-snap-build.sh's other
+;;;;     quadra knobs) sbcl ... mvm/build-mac68k-cl-repl.lisp
+;;;;   MODUS_MAC68K_MACHINE=floppy scripts/mac68k-core.py IMAGE CORE-DISK
+;;;;   MODUS_MAC68K_MACHINE=floppy sbcl --script scripts/mac68k-floppy.lisp CORE-DISK DISK --core
+;;;; Needs cram with preset dictionaries (LZMA-PREPARE-DICT).  Less RAM than the
+;;;; map needs stops in the boot blocks with _SysError 25 (a Sad Mac, 0000000F
+;;;; 00000019 on an SE/30).
+;;;;
+;;;; --load HEX (a saved core as MAC68K_CORE_RAW writes it, everything resident)
+;;;; is the 32 MB floppy this replaced: ~105 s on the Quadra 950.
 ;;;;
 ;;;; Disks: one 800 KB floppy, DISK, if the blob fits; else, with --hd, one 1.44 MB
 ;;;; floppy; else TWO 800 KB floppies, DISK-1 and DISK-2.  A two-disk set boots
@@ -46,10 +57,14 @@
 (defparameter *message* "INSERT MODUS DISK 2")
 
 (defun jumper (out)
-  "At +PAY+ + 8: CPUSHA BC; MOVEA.L #OUT,A0; JMP (A0); NOP (pad)."
+  "At +PAY+ + 8: MOVEQ #1,D0; _HWPriv (FlushInstructionCache, which on a 68040
+   pushes the data cache too -- the image was written as data); MOVEA.L
+   #OUT,A0; JMP (A0).  (It was CPUSHA BC, a 68040 instruction: on a 68020 or
+   68030 an F-line trap.)"
   (let ((v (make-array 12 :element-type '(unsigned-byte 8))))
-    (fs-apple:set-u16 v 0 #xF4F8) (fs-apple:set-u16 v 2 #x207C) (fs-apple:set-u32 v 4 out)
-    (fs-apple:set-u16 v 8 #x4ED0) (fs-apple:set-u16 v 10 #x4E71)
+    (fs-apple:set-u16 v 0 #x7001) (fs-apple:set-u16 v 2 #xA198)
+    (fs-apple:set-u16 v 4 #x207C) (fs-apple:set-u32 v 6 out)
+    (fs-apple:set-u16 v 10 #x4ED0)
     v))
 
 (defun font ()
@@ -87,6 +102,7 @@
 (defun main (image disk &key hd (out +out+))
   (multiple-value-bind (lo lsyms) (assemble "mac68k-unlzma.s" :cpu "68020")
    (fs-apple:set-u32 lo (gethash "outaddr" lsyms) out)
+   (fs-apple:set-u32 lo (gethash "stateaddr" lsyms) +state+)
    (let ((img (read-bytes image)))
     (when (> (length lo) +pay-off+)
       (error "mac68k-floppy: the loader is ~D bytes, over ~D" (length lo) +pay-off+))
@@ -146,9 +162,103 @@
                       (format t "mac68k-floppy: ~A, ~D bytes -> ~D LZMA + ~D loader -> ~A (~D bytes) + ~A (~D bytes), two 800K floppies, ~D bytes to spare on the second~%"
                               image (length img) (length stream) (length lo) d1 (length part1) d2
                               (length part2) (- +floppy+ 512 len2)))))))))))))
+;;; ---- THE CORE FLOPPY (--core): 8 MB, cold code packed on the floppy ----------
+;;;
+;;; IMAGE is a core disk (mac68k-core.py's c.dsk) of a map whose cold native code
+;;; stays on the disk (boot-mac68k :FLOPPY, MODUS_68K_COLD_KEEP).  The floppy:
+;;;   the boot blocks, reading the BLOB to :BLOB and entering it:
+;;;     the loader (mac68k-unlzma.s) | the payload: header, jumper, the DRIVER
+;;;     (mac68k-lzdisk.s), the core disk's boot read as one LZMA stream
+;;;   then the core disk's TAIL (from the boot read's end: cold code, cold
+;;;   names) as 64 KB blocks, each an LZMA stream against the resident code
+;;;   (the boot read's [LOAD, the resident functions' end)), which the driver unpacks when
+;;;   the image reads its disk.  The image reads the drive as its boot disk.
+(defparameter *core-maps*
+  '((:floppy :blob #x00580000 :driver #x007C0000 :state #x007E0000 :memneed #x007E8000))
+  "Per map: where the boot blocks put the blob; the driver's address (its
+   buffers follow it); the loader's state; and the RAM the map needs (MemTop),
+   past the driver's buffers.  boot-mac68k.lisp's :FLOPPY says why.")
+(defconstant +block+ 65536 "mac68k-lzdisk.s BLOCK")
+
+(defun main-core (image disk)
+  (let* ((m (or (cdr (assoc (intern (string-upcase (env "MODUS_MAC68K_MACHINE" "floppy")) "KEYWORD")
+                            *core-maps*))
+                (error "mac68k-floppy --core: no core map for MODUS_MAC68K_MACHINE")))
+         (d (read-bytes image))
+         ;; the boot blocks' record (mac68k-bootblocks.s): "modusCHN", then DEST
+         ;; ENTRY LEN OFF ... -- by its marker, not by the symbols of boot blocks
+         ;; assembled now, which may not be the ones the disk was written with
+         (chn (or (search (map 'vector #'char-code "modusCHN") d :end2 1024)
+                  (error "mac68k-floppy --core: ~A has no modusCHN record" image)))
+         (load (fs-apple:u32-ref d (+ chn 8)))
+         (len (fs-apple:u32-ref d (+ chn 16)))
+         (off (fs-apple:u32-ref d (+ chn 20)))
+         (core (subseq d off (+ off len)))
+         (vbase (+ off len))
+         (end (let ((e (length d))) (loop while (and (> e vbase) (zerop (aref d (1- e)))) do (decf e)) e))
+         (nblk (ceiling (- end vbase) +block+))
+         (tail (let ((v (zeros (* nblk +block+)))) (replace v d :start2 vbase :end2 end) v))
+         (cld (or (search (map 'vector #'char-code "modusCLD") core)
+                  (error "mac68k-floppy --core: no cold code descriptor (modusCLD) in ~A" image)))
+         ;; the descriptor (translate-68k M68K-EMIT-COLD-NATIVE-RESIDENT): BIAS,
+         ;; the section, the count, the index, the first stub, then the resident
+         ;; FUNCTIONS' end -- the shared routines after them keep state inline
+         ;; (measured: the console's, 13 bytes in a session), so the dictionary,
+         ;; which must never change, stops there
+         (dictend (fs-apple:u32-ref core (+ cld 8 20)))
+         (dict (subseq core 0 (- dictend load)))
+         (prep (cram:lzma-prepare-dict dict))
+         (blocks (loop for i below nblk
+                       collect (cram:lzma-compress (subseq tail (* i +block+) (* (1+ i) +block+))
+                                                   :dict prep :lc 2 :lp 1 :pb 2 :end-marker nil
+                                                   :dict-size (ash 1 23))))
+         (stream (cram:lzma-compress core :lc 2 :lp 1 :pb 2 :end-marker nil :dict-size (ash 1 23)))
+         (jumper (jumper load)))
+    (when (> nblk 256) (error "mac68k-floppy --core: ~D blocks, over the driver's 256" nblk))
+    (multiple-value-bind (dv dsyms) (assemble "mac68k-lzdisk.s" :cpu "68020")
+      (multiple-value-bind (lo lsyms) (assemble "mac68k-unlzma.s" :cpu "68020")
+        (let* ((dv (pad-to dv 4))
+               (bufs-end (+ (getf m :driver) (gethash "bufs" dsyms) 32 16384 +block+ 2048 +block+))
+               (head (zeros 8))
+               (drvsrc (+ 8 (length jumper)))
+               (blob-len (+ +pay-off+ drvsrc (length dv) (length stream)))
+               (first (+ 1024 blob-len))          ; the first block's floppy byte
+               (table (gethash "table" dsyms)))
+          (when (> (length lo) +pay-off+) (error "mac68k-floppy: the loader is over ~D bytes" +pay-off+))
+          (when (> (+ load len) (getf m :blob)) (error "mac68k-floppy --core: the core runs into the blob"))
+          (when (> (+ (getf m :blob) blob-len) (getf m :driver))
+            (error "mac68k-floppy --core: the blob runs into the driver"))
+          (when (> bufs-end (getf m :memneed)) (error "mac68k-floppy --core: the driver's buffers end past MEMNEED"))
+          (flet ((dset (name v) (fs-apple:set-u32 dv (gethash name dsyms) v))
+                 (lset (name v) (fs-apple:set-u32 lo (gethash name lsyms) v)))
+            (dset "vbase" vbase) (dset "nblk" nblk) (dset "dictend" dictend)
+            (let ((at first))
+              (loop for b in blocks for i from 0
+                    do (fs-apple:set-u32 dv (+ table (* 4 i)) at) (incf at (length b))
+                    finally (fs-apple:set-u32 dv (+ table (* 4 nblk)) at)))
+            (lset "outaddr" load) (lset "stateaddr" (getf m :state)) (lset "memneed" (getf m :memneed))
+            (lset "drvsrc" drvsrc) (lset "drvlen" (length dv)) (lset "drvaddr" (getf m :driver)))
+          (fs-apple:set-u16 head 0 (ash len -16))
+          (fs-apple:set-u16 head 2 (logand len #xFFFF))
+          (fs-apple:set-u16 head 6 (+ drvsrc (length dv)))
+          (let* ((blob (octets lo (zeros (- +pay-off+ (length lo))) head jumper dv stream))
+                 (packed (apply #'octets blob blocks))
+                 (n (mac68k-disk:write-disk packed disk :load-addr (getf m :blob) :read-len (length blob)
+                                                        :min-size +hd+ :memtop (getf m :memneed))))
+            (assert (= (length blob) blob-len))
+            (when (> n +hd+)
+              (error "mac68k-floppy --core: ~D bytes, over a 1.44 MB floppy by ~D" n (- n +hd+)))
+            (format t "mac68k-floppy: ~A: the boot read ~D bytes -> ~D LZMA; the tail ~D bytes -> ~D blocks, ~D LZMA against ~D bytes of resident code; ~A, ~D bytes free~%"
+                    image len (length stream) (- end vbase) nblk (reduce #'+ blocks :key #'length)
+                    (length dict) disk (- +hd+ 1024 (length packed)
+                                          (let ((sp (mac68k-disk::splash))) (if sp (pad512 (length sp)) 0))))))))))
+
 (let* ((args (argv)) (hd (member "--hd" args :test #'string=))
        (k (position "--load" args :test #'string=))
        (out (if k (parse-integer (nth (1+ k) args) :radix 16) +out+)))
   (when k (setq args (append (subseq args 0 k) (subseq args (+ k 2)))))
   (setq args (remove "--hd" args :test #'string=))
-  (main (first args) (second args) :hd (and hd t) :out out))
+  (if (member "--core" args :test #'string=)
+      (let ((args (remove "--core" args :test #'string=)))
+        (main-core (first args) (second args)))
+      (main (first args) (second args) :hd (and hd t) :out out)))

@@ -42,7 +42,14 @@ bbbase: .ascii  "LK"                    | bbID
 | these 1024 bytes to 64 KB under the top of RAM or the screen, whichever is
 | lower (MemTop $108, ScrnBase $824; an LC's screen is not in RAM), put the
 | stack under them, and go on from the copy.
-start:  move.l  0x108, %d0              | MemTop
+start:  move.l  memtop(%pc), %d0        | the RAM the map needs (0: any):
+        beq     91f                     |   MemTop under it is _SysError 25,
+        cmp.l   0x108, %d0              |   out of memory -- before reading
+        bls     91f                     |   anything to an address past the RAM
+90:     moveq   #25, %d0
+        .word   0xA9C9                  | _SysError
+        bra     90b
+91:     move.l  0x108, %d0              | MemTop
         move.l  0x824, %d1              | ScrnBase
         cmp.l   %d1, %d0
         bls     1f

@@ -202,28 +202,40 @@
               :boot-heap #x00AA0000 :boot-heap-size #x00400000
               :boot-cache-lo #x00A60000 :boot-cache-hi #x00A60000
               :boot-stack-top #x01A00000)
-    ;; THE FLOPPY (MODUS_MAC68K_MACHINE=floppy, 2026-11-20): a 68020+ Mac with
-    ;; 32 MB booting a SAVED CORE from one compressed 1.44 MB floppy
-    ;; (scripts/mac68k-floppy.lisp --load, mac68k-core.py MAC68K_CORE_RAW).  The
-    ;; Quadra map's core path with everything resident (no cold code: nothing
-    ;; is on a disk to page in) -- so the image from 1 MB, then the static heap
-    ;; the core brings, the stack, NIL's page, the low block and a young pair of
-    ;; 4 MB.  The kind map and the JIT's area lie over the floppy loader's
-    ;; blob and state (#x01200000 .. #x01A10000), dead once the image runs.
-    ;; The core run (Basilisk, 32 MB) boots from scratch with an 8 MB heap at
-    ;; :BOOT-HEAP and its stack at :BOOT-STACK-TOP.  Why: startup from scratch
-    ;; is ~4.3 min on a 68040 (building the package and symbol tables); from
-    ;; the core it is the restore.
-    (:floppy  :load #x00100000 :static-lo #x00960000 :static-hi #x00AE0000
-              :jit-area-lo #x01480000 :jit-area-hi #x019C0000 :jit-max-bytecode 16384
-              :cache-lo #x00B20000 :cache-hi #x00B20000
-              :staging #x00B20000 :staging-size #x00000000
-              :stack-top #x00B20000 :scratch #x00B20000 :io-buf #x00B21000
-              :nil-page #x00B30000
-              :region #x00B40000 :heap-size #x00800000 :gc-guard #x00010000
-              :kind-map #x01370000
-              :boot-heap #x00B60000 :boot-heap-size #x00800000
-              :boot-cache-lo #x00B20000 :boot-cache-hi #x00B20000
+    ;; THE FLOPPY (MODUS_MAC68K_MACHINE=floppy): a 68020+ Mac with 8 MB booting a
+    ;; SAVED CORE from one compressed 1.44 MB floppy (scripts/mac68k-floppy.lisp).
+    ;; All native code; the functions a session uses resident
+    ;; (MODUS_68K_COLD_KEEP=mvm/68k-keep-quadra.txt, ~4 MB), every other one
+    ;; COLD: on the floppy, read at its first call into the code area.  The
+    ;; floppy's loader installs a driver (scripts/mac68k-lzdisk.s) whose drive
+    ;; is the core's disk as mac68k-core.py wrote it, the cold tail kept as
+    ;; LZMA blocks: the image reads it as it would any boot disk.
+    ;;   #x040000  the image (the ROM's system heap ends below: #x39FE0 on a
+    ;;             32 MB LC), then the static heap the core brings, to :STATIC-HI
+    ;;   #x500000  the stack's top (128 KB), the I/O pages, NIL's page
+    ;;   #x540000  the low block, two 704 KB young semispaces, the guard
+    ;;   #x6B0000  the kind map
+    ;;   #x6E0000  the code area: cold bodies from the top, the JIT's from the bottom
+    ;;   #x7C0000  the driver's 160 KB (mac68k-floppy.lisp +DRIVER+)
+    ;;   #x7E8000  free to MemTop: the boot blocks' copy and stack, a screen
+    ;; The floppy's blob is read to #x580000 (the young heap, dead until the image
+    ;; runs).  The core run (Basilisk, 32 MB) boots from scratch with an 8 MB heap
+    ;; at :BOOT-HEAP, above the map; its kind bytes ((address - region) / 8 past
+    ;; the kind map) fall at #x808000-#x908000, also above it; and it calls the
+    ;; boot-only cold functions, ~1 MB more than the map's code area holds
+    ;; (measured: !COLD-FULL), so its code area is :BOOT-JIT-AREA, between those
+    ;; kind bytes and the boot heap.
+    (:floppy  :load #x00040000 :static-lo #x00440000 :static-hi #x00500000
+              :jit-area-lo #x006E0000 :jit-area-hi #x007C0000 :jit-max-bytecode 16384
+              :cache-lo #x00520000 :cache-hi #x00520000
+              :staging #x00520000 :staging-size #x00000000
+              :stack-top #x00520000 :scratch #x00520000 :io-buf #x00521000
+              :nil-page #x00530000
+              :region #x00540000 :heap-size #x00180000 :gc-guard #x00010000
+              :kind-map #x006B0000
+              :boot-heap #x01000000 :boot-heap-size #x00800000
+              :boot-cache-lo #x00520000 :boot-cache-hi #x00520000
+              :boot-jit-area-lo #x00920000 :boot-jit-area-hi #x01000000
               :boot-stack-top #x01A00000)
     ;; THE CLASSIC WITH 2 MB (MODUS_MAC68K_MACHINE=classic2m): the screen at
     ;; #x1FA700, so everything packs below it.  The image from #x40000 as on
@@ -560,6 +572,17 @@
         (let ((half (floor (mac68k-layout :boot-heap-size) 2)))
           (emit-mac68k-heap buf base (mac68k-layout :boot-heap) half +mac68k-gc-guard+)
           (emit-mac68k-cache buf (mac68k-layout :boot-cache-lo) (mac68k-layout :boot-cache-hi))
+          ;; :BOOT-JIT-AREA: the core run's code area, in the words an
+          ;; application's loader leaves its partition's in (+MAC68K-HEAP-SLOT+
+          ;; +8 / +12), which COLD-ENTER and the JIT take over the layout's
+          ;; (mac68k-core.py clears them in the core it saves)
+          (let ((lo (getf (cdr (assoc *mac68k-machine* *mac68k-layouts*)) :boot-jit-area-lo)))
+            (when lo
+              (m68k-emit-move-imm-an buf (conv-real (+ +mac68k-heap-slot+ 8)) +68k-a0+)
+              (m68k-emit-move-imm-dn buf lo +68k-d0+)
+              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 0)
+              (m68k-emit-move-imm-dn buf (mac68k-layout :boot-jit-area-hi) +68k-d0+)
+              (m68k-emit-move-dn-disp buf +68k-d0+ +68k-a0+ 4)))
           ;; the SAVE flag, for KERNEL-MAIN
           (m68k-emit-word buf #x41FA) (m68k-emit-word buf 0)
           (m68k-emit-fixup buf desc :disp16)

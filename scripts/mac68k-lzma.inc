@@ -8,8 +8,19 @@
 |
 |   lzdec:  A5 = output start, A4 = output end, A2 = the stream (its first
 |           byte, which is 0), A3 = 7991 u16 probabilities (15982 bytes,
-|           initialised here) with 12 bytes below A3 for REP1..REP3.
+|           initialised here) with 20 bytes below A3: REP1..REP3, DICTEND
+|           (the caller's: 0, or a preset dictionary's end) and DELTA.
 |           Returns with the output written.  Uses D0-D7, A0-A6.
+|
+| A PRESET DICTIONARY (cram's LZMA-COMPRESS :DICT): bytes anywhere in memory,
+| ending at DICTEND, that the stream treats as output just before A5 -- a
+| match may reach back into them, and the first literal's previous byte is
+| their last.  Every read of the window maps an address under A5 to the
+| dictionary (WINMAP: + DELTA, which is DICTEND - A5); a match that starts in
+| the dictionary is copied by a loop that steps from DICTEND to A5.  With
+| DICTEND 0 no address is ever under A5 (the stream is valid) and nothing
+| changes.  The floppy's driver (scripts/mac68k-lzdisk.s) decodes the cold
+| code's blocks against the resident code this way.
 |
 | 68020 and up: MULU.L and scaled indexing (the floppy's Macs are an LC and a
 | Quadra; a 68000 would need a 16x16 split multiply here).
@@ -34,6 +45,8 @@
         .equ    REP1, -4
         .equ    REP2, -8
         .equ    REP3, -12
+        .equ    DICTEND, -16
+        .equ    DELTA, -20
 
 lzdec:  move.l  %a3, %a0                | every probability 1024
         move.w  #N_PROBS-1, %d0
@@ -50,6 +63,9 @@ lzdec:  move.l  %a3, %a0                | every probability 1024
         clr.l   REP1(%a3)
         clr.l   REP2(%a3)
         clr.l   REP3(%a3)
+        move.l  DICTEND(%a3), %d0       | DELTA = DICTEND - the output's start
+        sub.l   %a5, %d0
+        move.l  %d0, DELTA(%a3)
         move.l  %a5, %a1
 
 lzloop: cmp.l   %a4, %a1
@@ -66,9 +82,13 @@ lzloop: cmp.l   %a4, %a1
 
 | A literal: probabilities LITERAL + 0x300 * (((pos & 1) << 2) + (prev >> 6))
         moveq   #0, %d0
+        move.l  %a1, %a0
         cmp.l   %a5, %a1
+        bne     31f
+        move.l  DICTEND(%a3), %a0       | the first byte: the dictionary's last, or 0
+        tst.l   %a0
         beq     3f
-        move.b  -1(%a1), %d0
+31:     move.b  -1(%a0), %d0
         lsr.b   #6, %d0
 3:      btst    #0, %d3
         beq     4f
@@ -80,7 +100,9 @@ lzloop: cmp.l   %a4, %a1
         bcs     lit_plain
         move.l  %a1, %a0                | the match byte, at -rep0-1
         sub.l   %d4, %a0
-        move.b  -1(%a0), %d3
+        subq.l  #1, %a0
+        bsr     winmap
+        move.b  (%a0), %d3
 lit_match:
         add.b   %d3, %d3                | C = the match bit
         bcs     lm1
@@ -156,7 +178,9 @@ lzrep:  lea     (IS_REP_G0*2, %a3, %d5.l*2), %a0
 10:     moveq   #9, %d5
 11:     move.l  %a1, %a0
         sub.l   %d4, %a0
-        move.b  -1(%a0), (%a1)+
+        subq.l  #1, %a0
+        bsr     winmap
+        move.b  (%a0), (%a1)+
         bra     lzloop
 lzrepg1:
         lea     (IS_REP_G1*2, %a3, %d5.l*2), %a0
@@ -194,11 +218,27 @@ lzcopy: addq.l  #2, %d0
         sub.l   %d4, %a0
         subq.l  #1, %a0
         subq.w  #1, %d0
+        cmp.l   %a5, %a0
+        bcs     19f                     | it starts in the dictionary
 18:     move.b  (%a0)+, (%a1)+
         dbra    %d0, 18b
         bra     lzloop
+19:     add.l   DELTA(%a3), %a0
+        move.l  DICTEND(%a3), %d1
+20:     move.b  (%a0)+, (%a1)+
+        cmp.l   %d1, %a0
+        bne     21f
+        move.l  %a5, %a0                | off the dictionary's end: the output's start
+21:     dbra    %d0, 20b
+        bra     lzloop
 
 lzdone: rts
+
+| winmap: A0 = a window address; under the output's start, the dictionary's.
+winmap: cmp.l   %a5, %a0
+        bcc     1f
+        add.l   DELTA(%a3), %a0
+1:      rts
 
 | rcbit: A0 = a probability.  Decode one bit with it, update it, normalise.
 | Z when 0; X and C when 1.  Uses D1, D2.

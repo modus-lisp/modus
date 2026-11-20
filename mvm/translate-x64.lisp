@@ -149,8 +149,36 @@
 (defconstant +hstack-ext-frames+ #x100000
   "Frames in one extension (1M x 32 bytes = 32 MB of reserved address space).")
 (defconstant +hstack-overflow-code+ #x0F0F
-  "Recorded at 0x10000CB0 by an overflowing push; %TAKE-PENDING-FAULT turns it
-   into HANDLER-STACK-EXHAUSTED (a STORAGE-CONDITION).")
+  "Recorded in the pending-fault word by an overflowing push;
+   %TAKE-PENDING-FAULT turns it into HANDLER-STACK-EXHAUSTED (a
+   STORAGE-CONDITION).")
+
+;;; THE FAULT RECORD IS PER THREAD (hosted threaded images).  What a fault
+;;; was -- the signal, #x0B0B for the stack's end, #x0F0F for the handler-
+;;; frame stack's -- is written by the signal stub (trap #x0520) or an
+;;; overflowing push and read back by %TAKE-PENDING-FAULT in the dispatch of
+;;; the frame the stub longjmped to.  That word was 0x10000CB0, ONE for the
+;;; whole process, so two threads faulting at once read each other's code or
+;;; one consumed the other's (test/fault-race.lisp: a worker's handler-frame
+;;; overflow came out as MEMORY-FAULT-ERROR, an unmapped read as
+;;; STACK-EXHAUSTED).  In an image whose threads run Lisp the record lives in
+;;; each thread's window instead, FS-relative, next to the handler-frame
+;;; extension words:
+;;;   +0x5610  the code (a u32 in a zeroed word)
+;;;   +0x5618  the fault address (si_addr)
+;;;   +0x5620  the interrupted PC
+;;; Window +0x5610..+0x5627 is past every other word a 32 KB block holds (see
+;;; +HSTACK-EXT-ADDR+) and, absolutely, unused BSS: main's record is the
+;;; absolute words, as main's window always is.  %TLS-PREPARE-BLOCK clears a
+;;; reused block's record; an actor window (%AR-PREPARE-WINDOW) is zeroed
+;;; whole.  mvm/cl-conditions reads it under (%LAYOUT-IF :STW ...), which is
+;;; set exactly where X64-FAULT-REC-P holds (build-generic-cli and the CLI
+;;; JIT's co-init set :STW, *X64-TLS-WINDOW* and *X64-STW* together).  Every
+;;; other image keeps the absolute 0x10000CB0.
+(defconstant +fault-rec-code-addr+ #x10005610)
+(defconstant +fault-rec-addr-addr+ #x10005618)
+(defconstant +fault-rec-pc-addr+ #x10005620)
+
 
 (defconstant +stw-state-addr+ #x10005000
   "FS-relative per-thread word: 0 running, 1 in a syscall, 2 parked.")
@@ -2880,6 +2908,21 @@
 
                 ;; --- Embedded handler stub (kernel jumps here on signal) ---
                 (emit-label buf stub-label)
+                ;; THIS THREAD'S FAULT RECORD (THE FAULT RECORD IS PER THREAD):
+                ;; the fault address and the interrupted PC, from this
+                ;; thread's own siginfo / ucontext, into its window.  Not on a
+                ;; re-entry from inside the backtrace walk below (its busy
+                ;; word is set): that fault is the walk's, and the record
+                ;; keeps the one being handled.
+                (when (x64-fault-rec-p)
+                  (let ((rec-busy (make-label)))
+                    (emit-bytes buf #x64 #x48 #x83 #x3C #x25) (emit-u32 buf #x100051F8) (emit-bytes buf #x00)
+                    (emit-jcc buf :ne rec-busy)                     ; cmp qword fs:[busy], 0
+                    (emit-bytes buf #x48 #x8B #x46 #x10)            ; mov rax, [rsi+16] (si_addr)
+                    (emit-bytes buf #x64 #x48 #x89 #x04 #x25) (emit-u32 buf +fault-rec-addr-addr+)
+                    (emit-bytes buf #x48 #x8B #x82 #xA8 #x00 #x00 #x00) ; mov rax, [rdx+0xA8] (RIP)
+                    (emit-bytes buf #x64 #x48 #x89 #x04 #x25) (emit-u32 buf +fault-rec-pc-addr+)
+                    (emit-label buf rec-busy)))
                 ;; FRAGILITY DIAG: capture useful state from the kernel's
                 ;; ucontext (RDX, requires SA_SIGINFO above).
                 ;;
@@ -2935,8 +2978,7 @@
                   (emit-u32 buf #x10000C30)
                   (emit-label buf skip-rip)))
                 (emit-bytes buf #x48 #x8B #x82 #xA0 #x00 #x00 #x00) ; mov rax, [rdx+0xA0] (saved RSP)
-                (emit-bytes buf #x48 #x89 #x04 #x25)
-                (emit-u32 buf #x10000C38)
+                (emit-diag-store buf #x10000C38)
                 ;; THE CALL SITE AT [RSP] -- BUT NOT WHEN THE FAULT IS THE
                 ;; STACK'S END.  A prologue's SUB RSP moves RSP below the
                 ;; mapped stack before its first store faults, so [RSP] is the
@@ -2967,19 +3009,15 @@
                   (emit-bytes buf #xBF) (emit-u32 buf #x0B0B)       ; mov edi, #x0B0B
                   (emit-bytes buf #x31 #xC0)                        ; xor eax, eax
                   (emit-label buf site-done))
-                (emit-bytes buf #x48 #x89 #x04 #x25)
-                (emit-u32 buf #x10000C40)
+                (emit-diag-store buf #x10000C40)
                 (emit-bytes buf #x48 #x8B #x82 #x90 #x00 #x00 #x00) ; mov rax, [rdx+0x90] (saved RAX)
-                (emit-bytes buf #x48 #x89 #x04 #x25)
-                (emit-u32 buf #x10000C48)
+                (emit-diag-store buf #x10000C48)
                 ;; Also capture si_addr (siginfo+16) and the kernel-passed
                 ;; RDX itself, to verify our ucontext-relative reads.
                 (emit-bytes buf #x48 #x8B #x46 #x10)                ; mov rax, [rsi+16] (si_addr)
-                (emit-bytes buf #x48 #x89 #x04 #x25)
-                (emit-u32 buf #x10000C50)
+                (emit-diag-store buf #x10000C50)
                 (emit-bytes buf #x48 #x89 #xD0)                     ; mov rax, rdx (ucontext ptr)
-                (emit-bytes buf #x48 #x89 #x04 #x25)
-                (emit-u32 buf #x10000C58)
+                (emit-diag-store buf #x10000C58)
                 ;; THE FAULT'S BACKTRACE.  The longjmp below discards the
                 ;; faulting frames, so walk them NOW, while they exist: the
                 ;; interrupted RIP, then the return address of every frame up
@@ -3070,13 +3108,23 @@
                 (emit-jcc buf :e exit-label)
                 ;; Record the signal (EDI = signum) for %TAKE-PENDING-FAULT,
                 ;; which builds the condition in the handler-case dispatch --
-                ;; this stub cannot allocate one.  A process-global word (no
-                ;; TLS prefix): a worker's window at that offset is its
-                ;; dynamic-binding area.  0x10000CB0, not 0x10000EB8: EB8 is the
-                ;; eval lock's OWNER word (mvm-eval.lisp, macos-hosting) -- the
+                ;; this stub cannot allocate one.  In a threaded image, in
+                ;; THIS thread's record (THE FAULT RECORD IS PER THREAD): the
+                ;; process-global word let two threads faulting at once read
+                ;; each other's code.  Elsewhere 0x10000CB0 (absolute, no TLS
+                ;; prefix: a worker's window at that offset is its
+                ;; dynamic-binding area), not 0x10000EB8: EB8 is the eval
+                ;; lock's OWNER word (mvm-eval.lisp, macos-hosting) -- the
                 ;; 2026-09-30 merge found the collision.
-                (emit-bytes buf #x89 #x3C #x25)           ; mov [disp32], edi
-                (emit-u32 buf #x10000CB0)
+                (if (x64-fault-rec-p)
+                    (progn
+                      (emit-bytes buf #x64 #x89 #x3C #x25)  ; mov fs:[code], edi
+                      (emit-u32 buf +fault-rec-code-addr+)
+                      (emit-bytes buf #x64 #xC7 #x04 #x25)  ; mov dword fs:[code+4], 0
+                      (emit-u32 buf (+ +fault-rec-code-addr+ 4)) (emit-u32 buf 0))
+                    (progn
+                      (emit-bytes buf #x89 #x3C #x25)       ; mov [disp32], edi
+                      (emit-u32 buf #x10000CB0)))
                 ;; A STACK OVERFLOW was recognised at the top of the stub (the
                 ;; call-site capture), which left #x0B0B in EDI.  This stub can
                 ;; only be running at all then because it is on the alternate
@@ -7615,9 +7663,8 @@
    STACK-EXHAUSTED.  Entered by JMP from inside the push helper; the helper's
    return address and the setjmp site's saved temporaries are abandoned with
    the rest of the stack above the armed frame."
-  (emit-bytes buf #xC7 #x04 #x25)                  ; mov dword [imm32], code
-  (emit-u32 buf #x10000CB0)
-  (emit-u32 buf +hstack-overflow-code+)
+  ;; THIS thread's record (THE FAULT RECORD IS PER THREAD).
+  (emit-fault-code-imm buf +hstack-overflow-code+)
   (when *x64-linux-mode*
     ;; Nothing armed: no frame to deliver it to.  Unreachable while depth > 0
     ;; (a push only overflows at depth = capacity, and the frame armed above
@@ -8243,6 +8290,31 @@
    and extra roots, the loop back-edge poll, and the safe-region traps.
    Hosted threaded images only (build-generic-cli.lisp and the CLI JIT's
    co-init set it).")
+
+;;; (THE FAULT RECORD IS PER THREAD, at +FAULT-REC-CODE-ADDR+: after *X64-STW*.)
+(defun x64-fault-rec-p ()
+  "The fault record is per thread (THE FAULT RECORD IS PER THREAD)."
+  (and *x64-linux-mode* *x64-tls-window* *x64-stw*))
+
+(defun emit-diag-store (buf addr)
+  "mov [ADDR], rax -- one of the #x0520 stub's absolute FRAGILITY DIAG words
+   (0x10000C38..C58).  Every faulting thread writes the same words, so in a
+   threaded image (X64-FAULT-REC-P) they are skipped unless the
+   MODUS_FAULT_DUMP build wants them: the per-thread record holds the fault
+   address and PC there, and nothing else reads these."
+  (when (or (not (x64-fault-rec-p)) *x64-fault-dump*)
+    (emit-bytes buf #x48 #x89 #x04 #x25)
+    (emit-u32 buf addr)))
+
+(defun emit-fault-code-imm (buf code)
+  "Record CODE as this thread's pending fault: the per-thread word in a
+   threaded hosted image, 0x10000CB0 elsewhere."
+  (if (x64-fault-rec-p)
+      (progn
+        (emit-bytes buf #x64 #xC7 #x04 #x25) (emit-u32 buf +fault-rec-code-addr+) (emit-u32 buf code)
+        (emit-bytes buf #x64 #xC7 #x04 #x25) (emit-u32 buf (+ +fault-rec-code-addr+ 4)) (emit-u32 buf 0))
+      (progn
+        (emit-bytes buf #xC7 #x04 #x25) (emit-u32 buf #x10000CB0) (emit-u32 buf code))))
 
 (defconstant +x64-stw-flag-addr+ #x10000FC8)
 (defconstant +x64-stw-frame+ 64)

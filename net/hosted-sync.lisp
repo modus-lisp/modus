@@ -331,6 +331,11 @@
           ;; -- the same window word); the extension's ADDRESS at +0x5600 is
           ;; kept, so a reused block reuses its reservation.
           (%gc-write64 (+ b #x5608) 0)
+          ;; THE FAULT RECORD (translate-x64, THE FAULT RECORD IS PER THREAD):
+          ;; no pending code, address or PC left by the previous occupant.
+          (%gc-write64 (+ b #x5610) 0)
+          (%gc-write64 (+ b #x5618) 0)
+          (%gc-write64 (+ b #x5620) 0)
           (%gc-write64 (+ b #xC30) delta)
           delta))))
 

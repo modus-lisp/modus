@@ -2185,8 +2185,33 @@
 (defconstant +a64-hstack-ext-frames+ #x100000
   "Frames in one extension: 1M x 24 bytes = 24 MB of reserved address space.")
 (defconstant +a64-hstack-overflow-code+ #x0F0F
-  "Recorded at 0x10000CB0 by an overflowing push; %TAKE-PENDING-FAULT turns it
-   into HANDLER-STACK-EXHAUSTED.")
+  "Recorded in the pending-fault word by an overflowing push;
+   %TAKE-PENDING-FAULT turns it into HANDLER-STACK-EXHAUSTED.")
+
+;;; THE FAULT RECORD IS PER THREAD (hosted threaded images) -- translate-x64's
+;;; section of that name has the bug and the design.  The same window words:
+;;;   +0x5610  the code (signal, #x0B0B, #x0F0F; a u32 in a zeroed word)
+;;;   +0x5618  the fault address (si_addr)
+;;;   +0x5620  the interrupted PC (uc_mcontext.pc)
+;;; free on AArch64 too (see the window's words at THE HANDLER-FRAME STACK HAS
+;;; NO SILENT CEILING) and covered by every window block (0x11000 bytes).
+;;; mvm/cl-conditions reads it under (%LAYOUT-IF :STW ...): hosted AArch64 sets
+;;; :STW exactly when it has the per-thread window (ENABLE-LAYOUT-THREADS),
+;;; so A64-FAULT-REC-P is that test.  Bare metal (the Zero's SMP window
+;;; included, which has no :STW) keeps the absolute 0x10000CB0.
+(defconstant +a64-fault-rec-code-addr+ #x10005610)
+(defconstant +a64-fault-rec-addr-addr+ #x10005618)
+(defconstant +a64-fault-rec-pc-addr+ #x10005620)
+
+(defun a64-fault-rec-p ()
+  "The fault record is per thread (THE FAULT RECORD IS PER THREAD)."
+  (and *aarch64-linux-mode* *a64-tls-window* t))
+
+(defun a64-load-fault-code-addr (buf rd scratch)
+  "Xd := the address of THIS thread's pending-fault word (SCRATCH /= RD)."
+  (if (a64-fault-rec-p)
+      (a64-load-tls-addr buf rd +a64-fault-rec-code-addr+ scratch)
+      (a64-load-real-addr buf rd (conv-real #x10000CB0))))
 
 (defconstant +sysreg-tpidr-el0+   #xDE82 "TPIDR_EL0: S3_3_C13_C0_2")
 (defconstant +sysreg-tpidrro-el0+ #xDE83 "TPIDRRO_EL0: S3_3_C13_C0_3")
@@ -4288,9 +4313,20 @@
                       (a64-emit buf (logior #xB4000000 9))    ; CBZ x9
                       ;; Record the signal (x0) for %TAKE-PENDING-FAULT: the
                       ;; handler-case dispatch builds the condition from it.
-                      ;; A process-global word, moved with the region.
-                      (a64-load-real-addr buf +a64-x16+ (conv-real #x10000CB0))
-                      (a64-str-width buf +a64-x0+ +a64-x16+ 0 2) ; STR w0
+                      ;; Threaded: THIS thread's record, with the fault address
+                      ;; and PC (THE FAULT RECORD IS PER THREAD); else the
+                      ;; process-global word, moved with the region.
+                      (a64-load-fault-code-addr buf +a64-x16+ +a64-x17+)
+                      (if (a64-fault-rec-p)
+                          (progn
+                            (a64-mov-reg buf +a64-x17+ +a64-x0+)
+                            (a64-emit buf #x2A1103F1)                       ; MOV w17, w17 (zero-extend)
+                            (a64-str-unsigned buf +a64-x17+ +a64-x16+ 0)    ; code
+                            (a64-ldur buf +a64-x17+ +a64-x1+ 16)            ; si_addr
+                            (a64-str-unsigned buf +a64-x17+ +a64-x16+ 8)
+                            (a64-ldr-unsigned buf +a64-x17+ +a64-x2+ 440)   ; uc_mcontext.pc
+                            (a64-str-unsigned buf +a64-x17+ +a64-x16+ 16))
+                          (a64-str-width buf +a64-x0+ +a64-x16+ 0 2)) ; STR w0
                       ;; A STACK OVERFLOW, as translate-x64 tells it: the fault
                       ;; address (si_addr, siginfo+16) lies within 64 KB of the
                       ;; interrupted SP (uc_mcontext.sp, ucontext+432: 40 bytes
@@ -9968,7 +10004,8 @@
 ;;; helper reserves on first use (mmap MAP_NORESERVE, +A64-HSTACK-EXT-FRAMES+
 ;;; frames, pages touched on demand), its address in window word +0x5600 --
 ;;; the same word x86-64 uses, free on AArch64 too (the AArch64 window's
-;;; words are +0x0..+0xC6F, +0x5000..+0x5060, +0xFF00..+0xFFF7 and the frame
+;;; words are +0x0..+0xC6F, +0x5000..+0x5060, +0x5600..+0x5627 (with the fault
+;;; record, THE FAULT RECORD IS PER THREAD), +0xFF00..+0xFFF7 and the frame
 ;;; stack), and covered by every window block (0x11000 bytes).
 ;;; %TLS-PREPARE-BLOCK keeps it, so a reused block reuses its reservation.
 ;;; Past the extension, or when the reservation is refused, the push is
@@ -10032,9 +10069,12 @@
    the absolute in-module call mode), so x14 / x15 / x17 carry the target
    across it.  Nothing armed cannot happen at a push this deep, but
    if it does, BRK: a stop, never a branch through a zero frame."
-  (a64-load-real-addr buf +a64-x13+ (conv-real #x10000CB0))
+  ;; THIS thread's record when threaded (THE FAULT RECORD IS PER THREAD).
+  (a64-load-fault-code-addr buf +a64-x13+ +a64-x12+)
   (a64-movz buf +a64-x12+ +a64-hstack-overflow-code+ 0)
-  (a64-str-width buf +a64-x12+ +a64-x13+ 0 2)          ; STR w12
+  (if (a64-fault-rec-p)
+      (a64-str-unsigned buf +a64-x12+ +a64-x13+ 0)      ; STR x12: the whole word
+      (a64-str-width buf +a64-x12+ +a64-x13+ 0 2))      ; STR w12
   (a64-hstack-slots buf +a64-x12+ +a64-x13+)
   (a64-ldr-unsigned buf +a64-x14+ +a64-x12+ 0)
   (a64-ldr-unsigned buf +a64-x15+ +a64-x12+ 8)

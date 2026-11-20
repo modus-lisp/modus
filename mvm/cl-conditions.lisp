@@ -848,10 +848,41 @@
         (write-char-serial 10)
         (setq *%escape-report-busy* nil))))
 
+;;; THE PENDING-FAULT WORD IS PER THREAD where threads run Lisp (layout key
+;;; :STW: hosted x86-64 and AArch64).  The stubs write THIS thread's window
+;;; word +0x5610 there (translate-x64, THE FAULT RECORD IS PER THREAD; the
+;;; fault address and PC follow it at +0x5618 / +0x5620), because one word for
+;;; the whole process let two threads faulting at once read -- or consume --
+;;; each other's code (test/fault-race.lisp).  Every other image keeps the
+;;; absolute #x10000CB0.  The window word is past the range the compiler can
+;;; prove per-thread, so it is addressed through the self slot, as
+;;; %HC-FAULT-FIXUP addresses the shared-store guard's marker.
+(defun %fault-self-base ()
+  "This thread's window delta, from the self slot (0 on main): as
+   %TLS-SELF-BASE, which this file cannot assume is loaded."
+  (let ((lo (mem-ref #x10000C30 :u32))
+        (hi (mem-ref #x10000C34 :u32)))
+    (if (= hi 0)
+        lo
+        ;; SIGNED: a macOS AArch64 worker's window lies below the region.
+        (+ (* (* (if (>= hi #x80000000) (- hi 4294967296) hi) 65536) 65536) lo))))
+
+(defun %pending-fault-code ()
+  (%layout-if :stw
+    (mem-ref (+ (%fault-self-base) (%conv-addr #x10005610)) :u32)
+    (mem-ref #x10000CB0 :u32)))
+
+(defun %clear-pending-fault ()
+  (%layout-if :stw
+    (setf (mem-ref (+ (%fault-self-base) (%conv-addr #x10005610)) :u32) 0)
+    (setf (mem-ref #x10000CB0 :u32) 0))
+  0)
+
 (defun %take-pending-fault ()
   "Called by every handler-case dispatch.  A signal stub (TRAP #x0520 on
    every port) longjmps into the handler-case with the raw signal number in
-   the word at #x10000CB0 and no condition, since it cannot allocate; build
+   the pending-fault word (%PENDING-FAULT-CODE: #x10000CB0, or this thread's
+   own where threads run Lisp) and no condition, since it cannot allocate; build
    the condition here.  SIGFPE (8) is DIVISION-BY-ZERO (integer division
    is what traps), SIGILL (4) ILLEGAL-INSTRUCTION-ERROR, SIGSEGV/SIGBUS
    MEMORY-FAULT-ERROR -- or STACK-EXHAUSTED when the stub found the fault
@@ -868,10 +899,10 @@
    Asked here, every handler-case gets that answer -- not only the ones
    compiled with *HC-FAULT-FIXUP*, which an image without a JIT (iOS devices)
    never sets."
-  (when (eql (mem-ref #x10000CB0 :u32) 4) (%hc-fault-fixup))
-  (let ((sig (mem-ref #x10000CB0 :u32)))
+  (when (eql (%pending-fault-code) 4) (%hc-fault-fixup))
+  (let ((sig (%pending-fault-code)))
     (unless (eql sig 0)
-      (setf (mem-ref #x10000CB0 :u32) 0)
+      (%clear-pending-fault)
       (setq *current-condition*
             (%attach-fault-frames
              (cond ((eql sig #x0B0B) (make-condition 'stack-exhausted))
@@ -2844,32 +2875,32 @@
 (defun %hc-fault-fixup ()
   "Called first on a HANDLER-CASE handler path (hosted CLI, both 64-bit arches), before
    %TAKE-PENDING-FAULT.  If the #x0520 fault stub has recovered a hardware
-   fault since the last check (its count at #x10000CA0 moved past the
-   last-seen count at #x10000CA8) and it was THE SHARED-STORE GUARD's trap,
+   fault on this thread since the last check (a SIGILL pending in this
+   thread's record where threads run Lisp; elsewhere its count at #x10000CA0
+   moved past the last-seen count at #x10000CA8) and it was THE SHARED-STORE GUARD's trap,
    publish that guard's error and clear the pending signal; any other fault
    is left for %TAKE-PENDING-FAULT to type."
+  ;; A FRESH FAULT ON THIS THREAD: its own pending SIGILL where the record is
+  ;; per thread.  The COUNT at #x10000CA0 against the last-seen count at
+  ;; #x10000CA8 is process-global, so a fault on another thread -- or another
+  ;; thread's handler taking the count first -- hid this thread's guard trap
+  ;; behind a plain ILLEGAL-INSTRUCTION-ERROR; it stays the test where the
+  ;; record is the process-global word.
   (let ((n (mem-ref #x10000CA0 :u32)))
-    (unless (= n (mem-ref #x10000CA8 :u32))
-      (setf (mem-ref #x10000CA8 :u32) n)
+    (unless (%layout-if :stw (not (eql (%pending-fault-code) 4))
+                        (= n (mem-ref #x10000CA8 :u32)))
+      (%layout-if :stw nil (setf (mem-ref #x10000CA8 :u32) n))
       ;; THE SHARED-STORE GUARD (translate-x64, translate-aarch64) marks its trap in this
       ;; thread's window word +0x5058 before faulting; the word is outside
       ;; the range the compiler can prove per-thread, so address it through
       ;; the self slot (0 on main, where the absolute word is unused).
-      (let* ((lo (mem-ref #x10000C30 :u32))
-             (hi (mem-ref #x10000C34 :u32))
-             ;; SIGNED, as %TLS-SELF-BASE: a macOS AArch64 worker's window
-             ;; lies below the region, so its delta is negative.
-             (self (if (= hi 0)
-                       lo
-                       (+ (* (* (if (>= hi #x80000000) (- hi 4294967296) hi)
-                                65536) 65536)
-                          lo)))
+      (let* ((self (%fault-self-base))
              (m (+ self (%conv-addr #x10005058))))
         (if (and (/= self 0) (= (%gc-read64 m) 1))
             (progn
               (%gc-write64 m 0)
               ;; This condition says more than the signal would: claim it.
-              (setf (mem-ref #x10000CB0 :u32) 0)
+              (%clear-pending-fault)
               (setq *current-condition*
                     (%attach-fault-frames (make-condition 'simple-error
                                     :format-control "modus: a thread stored one of its own objects into shared memory. Threads share no state -- pass the value as a message (or allocate shared data under the runtime lock); the store was refused (at #x~x)."

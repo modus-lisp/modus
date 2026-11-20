@@ -6,7 +6,7 @@
 (defpackage #:mac68k-tools
   (:use #:cl)
   (:export #:*scripts* #:run #:read-bytes #:write-bytes #:pad-to #:assemble
-           #:env #:env-hex #:argv))
+           #:env #:env-hex #:argv #:load-cram))
 (in-package #:mac68k-tools)
 
 (defparameter *scripts* (make-pathname :name nil :type nil :defaults *load-truename*)
@@ -21,19 +21,30 @@
 
 (defun argv () (rest sb-ext:*posix-argv*))
 
-(defun fs-apple-dir ()
-  "fs-apple, as vessel is found: $FS_APPLE, else .fs-apple/ in the tree, else
-   a sibling checkout ../fs-apple."
-  (let ((e (env "FS_APPLE")))
+(defun sibling-dir (repo var)
+  "An org library, as vessel is found: $VAR, else .REPO/ in the tree, else a
+   sibling checkout ../REPO."
+  (let ((e (env var)))
     (if e
         (pathname (if (char= (char e (1- (length e))) #\/) e (concatenate 'string e "/")))
-        (or (probe-file (merge-pathnames "../.fs-apple/" *scripts*))
-            (probe-file (merge-pathnames "../../fs-apple/" *scripts*))
-            (error "no fs-apple (set FS_APPLE, or check it out beside modus)")))))
+        (or (probe-file (merge-pathnames (format nil "../.~A/" repo) *scripts*))
+            (probe-file (merge-pathnames (format nil "../../~A/" repo) *scripts*))
+            (error "no ~A (set ~A, or check it out beside modus)" repo var)))))
 
 (unless (find-package "FS-APPLE")
   (dolist (f '("package" "apm" "packbits"))
-    (load (merge-pathnames (format nil "lib/~A.lisp" f) (fs-apple-dir)))))
+    (load (merge-pathnames (format nil "lib/~A.lisp" f) (sibling-dir "fs-apple" "FS_APPLE")))))
+
+(defun load-cram ()
+  "cram's CRC-32 and LZMA (src/deflate.lisp, src/lzma.lisp), compiled."
+  (unless (and (find-package "CRAM") (fboundp (find-symbol "LZMA-COMPRESS" "CRAM")))
+    (let ((dir (sibling-dir "cram" "CRAM")))
+      (unless (find-package "CRAM") (load (merge-pathnames "src/packages.lisp" dir)))
+      (dolist (f '("deflate" "lzma"))
+        (let ((fasl (compile-file (merge-pathnames (format nil "src/~A.lisp" f) dir)
+                                  :output-file (format nil "/tmp/mac68k-cram-~A-~D.fasl" f
+                                                       (random 1000000000 (make-random-state t))))))
+          (unwind-protect (load fasl) (delete-file fasl)))))))
 
 (defun run (program &rest args)
   "PROGRAM's standard output, or an error with its standard error."

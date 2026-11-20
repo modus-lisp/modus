@@ -6,7 +6,7 @@
 (defpackage #:mac68k-tools
   (:use #:cl)
   (:export #:*scripts* #:run #:read-bytes #:write-bytes #:pad-to #:assemble
-           #:env #:env-hex #:argv #:load-cram))
+           #:env #:env-hex #:argv #:load-cram #:load-fs-fat))
 (in-package #:mac68k-tools)
 
 (defparameter *scripts* (make-pathname :name nil :type nil :defaults *load-truename*)
@@ -45,6 +45,12 @@
                                   :output-file (format nil "/tmp/mac68k-cram-~A-~D.fasl" f
                                                        (random 1000000000 (make-random-state t))))))
           (unwind-protect (load fasl) (delete-file fasl)))))))
+
+(defun load-fs-fat ()
+  "fs-fat (lib/fat32.lisp: FAT12 to FAT32): the floppy that carries a Mac's cold
+   code and its files."
+  (unless (find-package "FS-FAT")
+    (load (merge-pathnames "lib/fat32.lisp" (sibling-dir "fs-fat" "FS_FAT")))))
 
 (defun run (program &rest args)
   "PROGRAM's standard output, or an error with its standard error."

@@ -22,10 +22,20 @@
 | unpacks it.  The floppy is the drive the Mac booted from: BootDrive when
 | INSTALL runs.
 |
-| INSTALL (the first byte; called by the floppy's loader, scripts/mac68k-unlzma.s,
-| once the image is unpacked): _DrvrInstall at a free unit (39 -- SCSI ID 7 is
-| the Mac -- or the first free from 40), a locked, non-ejectable drive numbered
-| past every drive in the queue, and BootDrive ($210) set to it.
+| THE DISK.  The blocks live on the floppy whose sector at LABELOFF starts
+| "MODUS-D2" and this set's id: the second floppy, a FAT12 disk on which they
+| are the file MODUS/COLD.BIN (its first sector the label), with room for the
+| user's files -- or, a one-disk set, the boot floppy itself.  FIND (the second
+| entry, drvr+4; the loader calls it in the blob, before the unpack, so a user
+| with one drive swaps disks while the Mac unpacks) reads that sector in every
+| drive; if none has it, it ejects the boot disk once, draws INSERT MODUS DISK
+| 2 and polls every half second (scripts/mac68k-disk2.s's way).  The drive it
+| finds is the one the blocks are read from (RDRIVE, RREF).
+|
+| INSTALL (the first byte; called by the loader once the image is unpacked):
+| _DrvrInstall at a free unit (39 -- SCSI ID 7 is the Mac -- or the first free
+| from 40), a locked, non-ejectable drive numbered past every drive in the
+| queue, and BootDrive ($210) set to it.
 |
 | Placed at a fixed address by the loader (the map's driver area); its buffers
 | follow it (BUFS).  68020: the decoder's MULU.L and scaled indexing.
@@ -40,6 +50,7 @@
 
         .text
 drvr:   bra.w   install
+        bra.w   find                    | drvr+4: A1 = a 512-byte buffer
 | ---- the DRVR header _DrvrInstall is given ----
 header: .word   0x4F00                  | needLock, status, control, write, read
         .word   0, 0, 0                 | delay, event mask, menu
@@ -55,25 +66,19 @@ header: .word   0x4F00                  | needLock, status, control, write, read
 | ---- INSTALL ----
 install:
         movem.l %d1-%d7/%a0-%a6, -(%sp)
-        | the floppy: the boot drive's queue element
-        move.w  0x210, %d1              | BootDrive
+        lea     rdrive(%pc), %a0
+        tst.w   2(%a0)
+        beq     ifail                   | FIND found no disk (it does not return then)
         move.l  0x30A, %a1              | DrvQHdr.qHead
-        moveq   #0, %d2                 | the highest drive number seen
+        moveq   #0, %d2                 | the highest drive number in the queue
 1:      move.l  %a1, %d0
         beq     2f
         cmp.w   6(%a1), %d2
         bcc     3f
         move.w  6(%a1), %d2
-3:      cmp.w   6(%a1), %d1
-        bne     4f
-        lea     rdrive(%pc), %a0
-        move.w  %d1, (%a0)              | the floppy's drive and its driver
-        move.w  8(%a1), 2(%a0)
-4:      move.l  (%a1), %a1
+3:      move.l  (%a1), %a1
         bra     1b
-2:      lea     rdrive(%pc), %a0
-        tst.w   2(%a0)
-        beq     ifail                   | no boot drive in the queue
+2:
         addq.w  #1, %d2
         lea     mydrive(%pc), %a0
         move.w  %d2, (%a0)
@@ -252,14 +257,173 @@ fetch:  lea     cached(%pc), %a0
 fok:    moveq   #0, %d0
 fout:   rts
 
+| ---- FIND: the disk whose sector at LABELOFF is this set's label ----
+find:   movem.l %d0-%d7/%a0-%a6, -(%sp)
+        lea     fbuf(%pc), %a0
+        move.l  %a1, (%a0)
+fscan:  move.l  0x30A, %a3              | DrvQHdr.qHead
+1:      move.l  %a3, %d0
+        beq     fnone
+        bsr     ftry
+        tst.w   %d0
+        beq     ffound
+        move.l  (%a3), %a3              | qLink
+        bra     1b
+fnone:  lea     ejected(%pc), %a0
+        tst.b   (%a0)
+        bne     fwait
+        st      (%a0)
+        bsr     eject
+        bsr     message
+fwait:  move.l  0x16A, %d1              | Ticks: half a second
+        add.l   #30, %d1
+2:      cmp.l   0x16A, %d1
+        bhi     2b
+        bra     fscan
+ffound: lea     rdrive(%pc), %a0
+        move.w  6(%a3), (%a0)           | dQDrive
+        move.w  8(%a3), 2(%a0)          | dQRefNum
+        movem.l (%sp)+, %d0-%d7/%a0-%a6
+        rts
+
+| ftry: A3 = a drive queue element.  D0 = 0 when its sector at LABELOFF is the label.
+ftry:   bsr     pbinit
+        move.w  6(%a3), 22(%a0)         | ioVRefNum = dQDrive
+        move.w  8(%a3), 24(%a0)         | ioRefNum  = dQRefNum
+        move.l  fbuf(%pc), 32(%a0)      | ioBuffer
+        move.l  #512, 36(%a0)           | ioReqCount
+        move.l  labeloff(%pc), 46(%a0)  | ioPosOffset
+        .word   0xA002                  | _Read
+        tst.w   %d0
+        bne     fno
+        move.l  fbuf(%pc), %a2
+        cmp.l   #0x4D4F4455, (%a2)      | "MODU"
+        bne     fno
+        cmp.l   #0x532D4432, 4(%a2)     | "S-D2"
+        bne     fno
+        move.l  setid(%pc), %d1
+        cmp.l   8(%a2), %d1
+        bne     fno
+        moveq   #0, %d0
+        rts
+fno:    moveq   #-1, %d0
+        rts
+
+| pbinit: A0 = the parameter block, zeroed, ioPosMode fsFromStart.
+pbinit: lea     pb(%pc), %a0
+        moveq   #19, %d0                | 80 bytes
+3:      clr.l   (%a0)+
+        dbra    %d0, 3b
+        lea     pb(%pc), %a0
+        move.w  #1, 44(%a0)
+        rts
+
+| eject: the boot drive's disk (BootDrive $210), if the drive queue has it.
+eject:  move.l  0x30A, %a3
+4:      move.l  %a3, %d0
+        beq     5f
+        move.w  0x210, %d1
+        cmp.w   6(%a3), %d1
+        beq     6f
+        move.l  (%a3), %a3
+        bra     4b
+6:      bsr     pbinit
+        move.w  6(%a3), 22(%a0)
+        move.w  8(%a3), 24(%a0)
+        move.w  #7, 26(%a0)             | csCode = ejectCode
+        .word   0xA004                  | _Control
+5:      rts
+
+| message: MSGN glyphs from MSGBUF, centred on row 160, black on white
+| (scripts/mac68k-disk2.s's, which draws depths 1, 8, 16 and 32).
+message:
+        move.l  0x824, %a2              | ScrnBase
+        moveq   #0, %d6
+        move.w  0x106, %d6
+        and.w   #0x3FFF, %d6            | ScreenRow
+        moveq   #1, %d7                 | depth
+        move.w  0x28E, %d0              | ROM85
+        btst    #14, %d0
+        bne     7f                      | no Color QuickDraw: 1 bit
+        move.l  0x8A4, %d0              | MainDevice
+        beq     7f
+        move.l  %d0, %a0
+        move.l  (%a0), %a0              | GDevice
+        move.l  22(%a0), %a0            | gdPMap
+        move.l  (%a0), %a0              | PixMap
+        move.w  32(%a0), %d7            | pixelSize
+7:      cmp.w   #1, %d7
+        beq     10f
+        cmp.w   #8, %d7
+        beq     10f
+        cmp.w   #16, %d7
+        beq     10f
+        cmp.w   #32, %d7
+        bne     9f
+10:     move.w  msgn(%pc), %d5
+        move.w  %d5, %d0
+        mulu.w  %d7, %d0                | the message's width in bytes
+        move.l  %d6, %d1
+        sub.l   %d0, %d1
+        bmi     9f
+        lsr.l   #1, %d1
+        and.w   #0xFFFC, %d1
+        move.l  #160, %d0
+        mulu.w  %d6, %d0
+        add.l   %d1, %d0
+        add.l   %d0, %a2                | A2 = the first glyph's top row
+        lea     msgbuf(%pc), %a4
+        subq.w  #1, %d5
+glyph:  move.l  %a2, %a1
+        moveq   #7, %d4
+row:    move.b  (%a4)+, %d3
+        cmp.w   #1, %d7
+        bne     8f
+        move.b  %d3, (%a1)
+        bra     rownext
+8:      move.l  %a1, %a0
+        moveq   #7, %d2
+pix:    add.b   %d3, %d3
+        bcs     ink
+        cmp.w   #8, %d7
+        bne     11f
+        clr.b   (%a0)+
+        bra     pnext
+11:     cmp.w   #16, %d7
+        bne     12f
+        move.w  #0x7FFF, (%a0)+
+        bra     pnext
+12:     move.l  #0x00FFFFFF, (%a0)+
+        bra     pnext
+ink:    cmp.w   #8, %d7
+        bne     13f
+        st      (%a0)+
+        bra     pnext
+13:     cmp.w   #16, %d7
+        bne     14f
+        clr.w   (%a0)+
+        bra     pnext
+14:     clr.l   (%a0)+
+pnext:  dbra    %d2, pix
+rownext:
+        add.l   %d6, %a1
+        dbra    %d4, row
+        adda.w  %d7, %a2
+        dbra    %d5, glyph
+9:      rts
+
         .include "mac68k-lzma.inc"
 
-| ---- data: the packer (scripts/mac68k-floppy.lisp) fills VBASE NBLK DICTEND TABLE ----
+| ---- data: the packer (scripts/mac68k-floppy.lisp) fills VBASE NBLK DICTEND
+| LABELOFF SETID TABLE and the message (MSGN glyphs of 8 row bytes at MSGBUF) ----
         .align  2
 vbase:  .long   0                       | the core disk's byte at block 0
 nblk:   .long   0                       | blocks
 dictend: .long  0                       | the preset dictionary's end ([LOAD, DICTEND))
 cached: .long   -1                      | the block in CACHE, or -1
+labeloff: .long 0                       | the label sector's byte on its floppy
+setid:  .long   0                       | this set's id, in the label
+fbuf:   .long   0                       | FIND's buffer
 rdrive: .word   0                       | the floppy's drive number
 rref:   .word   0                       |   and its driver's refNum
 mydrive: .word  0
@@ -269,6 +433,10 @@ refnum: .word   0
         .space  4                       | the drive queue element's flags
 dqe:    .space  16
 pb:     .space  80
+msgn:   .word   0
+ejected: .byte  0
+        .align  2
+msgbuf: .space  256
 table:  .space  4 * 257                 | NBLK + 1 floppy bytes (256 blocks: 16 MB)
         .align  4
 bufs:                                   | PROBS, CBUF, CACHE: BUFS_SIZE bytes, not in the image

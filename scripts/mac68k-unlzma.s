@@ -14,8 +14,10 @@
 | OUTADDR (below) is where the image goes and starts: #x100000 unless the
 | packer patches it (a saved core loads at its map's :LOAD).  With a DRIVER
 | (DRVLEN not 0; scripts/mac68k-lzdisk.s, the floppy whose cold code stays
-| packed) it is copied from the payload to DRVADDR and its INSTALL called,
-| after the unpack, before the jumper.  Too little RAM (MemTop under MEMNEED):
+| packed) its FIND is called in the payload first, before the unpack (it finds
+| the floppy the driver will read -- asking for it, on a Mac with one drive);
+| after the unpack it is copied to DRVADDR and its INSTALL called, then the
+| jumper.  Too little RAM (MemTop under MEMNEED):
 | _SysError 25, out of memory.
 | The probabilities and the stack go at STATEADDR, past the blob's end (the
 | packer checks); the image is below LOADER.  All of it is RAM the image
@@ -36,6 +38,15 @@ start:  move.w  #0x2000, %sr            | supervisor, interrupts on (as the imag
         lea     start(%pc), %a0
         add.l   #PAY, %a0
         move.l  %a0, -(%sp)             | the payload
+        move.l  drvlen(%pc), %d0        | a driver: its FIND first (drvr+4, in the
+        beq     3f                      |   payload), before the unpack -- the disk
+        move.l  %a0, %a2                |   its blocks are on may be the next one
+        add.l   drvsrc(%pc), %a2        |   to insert, and the user can swap while
+        addq.l  #4, %a2                 |   this unpacks
+        move.l  %a3, %a1                | its 512-byte buffer: the probabilities,
+        jsr     (%a2)                   |   unused until LZDEC
+        move.l  (%sp), %a0
+3:
         move.l  outaddr(%pc), %a5
         move.l  %a5, %a4
         add.l   (%a0), %a4              | + the size

@@ -2885,8 +2885,13 @@
     ;; collects again, forever (measured: the library ladder in an 8 MB
     ;; semispace spun for 20 minutes).  Say so and exit 3, as arm32 / 68k do.
     (when *i386-gc-margin-addr*
-      (let ((room (i386-make-label)) (msg "modus: heap exhausted (raise --dynamic-space-size)
-"))
+      (let ((room (i386-make-label))
+            (msg (if *i386-linux-mode*
+                     "modus: heap exhausted (raise --dynamic-space-size)
+"
+                     "
+modus: heap exhausted -- this machine needs more RAM
+")))
         (i386-emit-cmp-reg-reg buf +i386-esi+ +i386-eax+)        ; free ptr vs new VL
         (i386-emit-jcc buf :b room)
         ;; write(2, msg, len) with the message on the stack, then exit_group(3)
@@ -2896,14 +2901,39 @@
                 do (i386-emit-push-imm32 buf (logior (nth i bytes) (ash (nth (+ i 1) bytes) 8)
                                                      (ash (nth (+ i 2) bytes) 16)
                                                      (ash (nth (+ i 3) bytes) 24)))))
-        (i386-emit-mov-reg-imm buf +i386-ebx+ 2)
-        (i386-emit-mov-reg-reg buf +scratch0+ +i386-esp+)
-        (i386-emit-mov-reg-imm buf +scratch1+ (length msg))
-        (i386-emit-mov-reg-imm buf +i386-eax+ 4)                  ; SYS_write
-        (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
-        (i386-emit-mov-reg-imm buf +i386-ebx+ 3)
-        (i386-emit-mov-reg-imm buf +i386-eax+ 252)                ; SYS_exit_group
-        (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+        (if *i386-linux-mode*
+            (progn
+              (i386-emit-mov-reg-imm buf +i386-ebx+ 2)
+              (i386-emit-mov-reg-reg buf +scratch0+ +i386-esp+)
+              (i386-emit-mov-reg-imm buf +scratch1+ (length msg))
+              (i386-emit-mov-reg-imm buf +i386-eax+ 4)                  ; SYS_write
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80)
+              (i386-emit-mov-reg-imm buf +i386-ebx+ 3)
+              (i386-emit-mov-reg-imm buf +i386-eax+ 252)                ; SYS_exit_group
+              (i386-emit-byte buf #xCD) (i386-emit-byte buf #x80))
+            ;; BARE METAL: there is no INT 80h to take (it reset the machine:
+            ;; no IDT entry).  The message to COM1, a byte at a time as the
+            ;; transmitter empties, then stop.
+            (let ((next (i386-make-label)) (wait (i386-make-label)) (halt (i386-make-label)))
+              (i386-emit-mov-reg-reg buf +i386-esi+ +i386-esp+)
+              (i386-emit-mov-reg-imm buf +scratch0+ (length msg))
+              (i386-emit-byte buf #xFC)                                  ; cld
+              (i386-emit-label buf next)
+              (i386-emit-byte buf #x66) (i386-emit-byte buf #xBA)        ; mov dx, 3FDh
+              (i386-emit-byte buf #xFD) (i386-emit-byte buf #x03)
+              (i386-emit-label buf wait)
+              (i386-emit-byte buf #xEC)                                  ; in al, dx
+              (i386-emit-byte buf #xA8) (i386-emit-byte buf #x20)        ; test al, 20h
+              (i386-emit-jcc buf :e wait)
+              (i386-emit-byte buf #x66) (i386-emit-byte buf #xBA)        ; mov dx, 3F8h
+              (i386-emit-byte buf #xF8) (i386-emit-byte buf #x03)
+              (i386-emit-byte buf #xAC)                                  ; lodsb
+              (i386-emit-byte buf #xEE)                                  ; out dx, al
+              (i386-emit-byte buf #x49)                                  ; dec ecx
+              (i386-emit-jcc buf :ne next)
+              (i386-emit-label buf halt)
+              (i386-emit-byte buf #xFA) (i386-emit-byte buf #xF4)        ; cli; hlt
+              (i386-emit-jmp-rel32 buf halt)))
         (i386-emit-label buf room)))
 
     ;; --- MCGC point (c): byte-exact clear of the reclaimed range's bitmaps ---

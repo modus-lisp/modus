@@ -1481,17 +1481,26 @@
                ;; 16-byte boundary (the translator 16-aligns every function
                ;; entry relative to it; see translate-mvm-to-arm32).  The
                ;; payload loads at the ELF32 header size past a page boundary.
+               ;; B reaches +-32 MB; past that (a 34 MB arm32 CLI) it wrapped
+               ;; and the image jumped to #xFE012950 at startup.  Then:
+               ;;   LDR ip,[pc,#0] ; ADD pc,pc,ip ; .word OFF
+               ;; ADD reads pc = its own address + 8 = the code start, so OFF
+               ;; is PAD + entry offset.  Images that fit keep the 4-byte B.
                (let* ((hdr (if (eq (getf boot-descriptor :elf-format) :linux-arm32) 84 0))
-                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) 4) 16)) 16))
+                      (long-p (>= (+ entry-native-offset 32) (ash 1 25)))
+                      (jlen (if long-p 12 4))
+                      (pad (mod (- 16 (mod (+ hdr (mvm-buffer-position final-buf) jlen) 16)) 16))
                       (byte-offset (+ entry-native-offset pad))
                       (arm-offset (ash (- byte-offset 4) -2))  ; instruction units, adjusted for PC+8
-                      (insn (logior #xEA000000 (logand arm-offset #xFFFFFF))))
-                 (dolist (w (cons insn (make-list (floor pad 4) :initial-element #xE1A00000)))
+                      (words (if long-p
+                                 (list #xE59FC000 #xE08FF00C byte-offset)
+                                 (list (logior #xEA000000 (logand arm-offset #xFFFFFF))))))
+                 (dolist (w (append words (make-list (floor pad 4) :initial-element #xE1A00000)))
                    (mvm-emit-byte final-buf (logand w #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -8) #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -16) #xFF))
                    (mvm-emit-byte final-buf (logand (ash w -24) #xFF)))
-                 (setq jmp-size (+ 4 pad))))
+                 (setq jmp-size (+ jlen pad))))
               ((and (member arch '(:aarch64 :rpi))
                     (not aarch64-unified-p))
                ;; AArch64 B (unconditional branch, 4 bytes)

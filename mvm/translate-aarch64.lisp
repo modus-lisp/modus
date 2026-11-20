@@ -4001,12 +4001,14 @@
                 ;;   it_interval.tv_usec @ 8  = 0
                 ;;   it_value.tv_sec     @ 16 = duration
                 ;;   it_value.tv_usec    @ 24 = 0
-                ;; We stage it at fixed BSS slot 0x10000280..0x100002A0.
+                ;; We stage it at fixed BSS slot 0x100002A0..0x100002C0 (registered
+                ;; as :A64-ITIMERVAL in mvm/fixed-addresses.lisp).  It was 0x10000280,
+                ;; whose first 8 bytes were argv[2]'s copy (0x10000248..0x10000287).
                 ;; Default SIGALRM action is process termination, which is
                 ;; what we want for fork-file's per-file timeout — the
                 ;; child gets killed, parent wait4 returns, we move on.
                 (a64-asr-imm buf +a64-x10+ +a64-x0+ 1)  ; x10 = seconds untag
-                (a64-load-conv-addr buf +a64-x9+ #x10000280)
+                (a64-load-conv-addr buf +a64-x9+ #x100002A0)
                 (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 0)   ; it_interval.tv_sec
                 (a64-str-unsigned buf +a64-xzr+ +a64-x9+ 8)   ; it_interval.tv_usec
                 (a64-str-unsigned buf +a64-x10+ +a64-x9+ 16)  ; it_value.tv_sec = N

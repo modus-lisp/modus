@@ -808,12 +808,9 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
   (:argv1-copy #x10000208 #x40 :doc "argv[1] (63 bytes + NUL); lib/save-image reads \"-core\" here.")
   (:argv2-copy #x10000248 #x40 :doc "argv[2] (63 bytes + NUL)."))
 
-(define-fixed-word :a64-itimerval #x10000280 #x20 :images (:a64-hosted)
-  :shares (:argv2-copy)
-  :reason "NEAR-MISS (8 bytes): it_interval.tv_sec lands on argv[2]'s bytes 56..63.
-   Only %AARCH64-ALARM writes it, only fork-file calls that, and only in the
-   forked child after argv was parsed.  Move it before anything else uses alarm."
-  :owner "mvm/translate-aarch64.lisp" :doc "fork-file's setitimer itimerval staging.")
+(define-fixed-word :a64-itimerval #x100002A0 #x20 :images (:a64-hosted)
+  :owner "mvm/translate-aarch64.lisp" :doc "fork-file's setitimer itimerval staging.
+   It was #x10000280, 8 bytes into argv[2]'s copy; moved clear of it.")
 
 (define-fixed-word :i386-saved-esp #x10000290 4 :images (:i386-hosted)
   :owner "boot/boot-linux-i386.lisp" :doc "The kernel's initial ESP (argv/envp walk).")

@@ -135,7 +135,6 @@ repository; its words — `+RPI-CL-DTB-PTR-SLOT+` — are registered by hand).
 | `a64-gc-stats`, `a64-jit-bump`, `core-cursor-slot` ↔ `gc-region-table` | a64-bare | CPU 3..11's cells of the per-CPU active-region table; one CPU runs Lisp there.  The threaded layout moves them to `0x1000FF00`. |
 | `68k-core-header` ↔ `dirent-buf-page` | 68k-hosted | Header written only while saving a core. |
 | `x64-bare-rescue-rip` ↔ `clos-debug-budget` | x64-bare | A rescued fault leaves the RIP in cl-clos's EQ-COLL print budget (diagnostic output only). |
-| `a64-itimerval` ↔ `argv2-copy` | a64-hosted | **8 bytes**: `it_interval.tv_sec` lands on argv[2]'s bytes 56..63.  Only fork-file's child calls `%AARCH64-ALARM`, after argv was parsed. |
 | `68k-profile-counters` ↔ `argv-arena` | 68k-hosted | `MODUS_68K_PROFILE` builds only: the counters sit in the staged-argv arena's tail. |
 | `gv-cache-root`, `gv-cache-guard`, `static-literal-root` ↔ `rv-bare-uart`, `arm32-bare-device-space` | rv-bare, arm32-bare | The compiler bakes these roots as absolute `#x10000FAx/FB0` for every target; on bare RISC-V/ARM32 that is device space.  Unverified on hardware; the bare ladder passes. |
 

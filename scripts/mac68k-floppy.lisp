@@ -1,11 +1,11 @@
 ;;;; mac68k-floppy.lisp -- compressed Mac boot disks.
 ;;;;
-;;;;   sbcl --script scripts/mac68k-floppy.lisp IMAGE DISK [--hd] [--loader LOADER]
+;;;;   sbcl --script scripts/mac68k-floppy.lisp IMAGE DISK [--hd]
 ;;;;
 ;;;; IMAGE is a flat bare-Mac image (built for :mac68k, linked at #x00100000).
 ;;;; It is compressed as a raw LZMA1 stream (cram's LZMA-COMPRESS, lc 2 lp 1 pb 2)
-;;;; behind a loader -- mvm/mac68k-unlzma.lisp with mvm/unlzma-core.lisp, built here
-;;;; for :mac68k linked at #x01200000 unless --loader names one already built.
+;;;; behind a loader, scripts/mac68k-unlzma.s: 68020 assembly, under 1 KB, its
+;;;; decoder scripts/mac68k-lzma.inc (test/mac68k-unlzma/run.sh checks it).
 ;;;; The boot blocks (scripts/mac68k-disk.lisp) read the blob to #x01200000; the
 ;;;; loader unpacks IMAGE to #x00100000 and jumps to it.
 ;;;;
@@ -27,10 +27,10 @@
 (load-cram)
 
 (defparameter *root* (merge-pathnames "../" *scripts*))
-(defconstant +loader-addr+ #x01200000 "mvm/mac68k-unlzma.lisp +LOADER+")
-(defconstant +pay-off+ #x4000 "+PAY+ - +LOADER+")
-(defconstant +out+ #x00100000 "+OUT+")
-(defconstant +state+ #x01A00000 "+ST+: the blob must end below it")
+(defconstant +loader-addr+ #x01200000 "Where the boot blocks put the blob")
+(defconstant +pay-off+ #x4000 "mac68k-unlzma.s PAY")
+(defconstant +out+ #x00100000 "mac68k-unlzma.s OUT")
+(defconstant +state+ #x01A00000 "mac68k-unlzma.s STATE: the blob must end below it")
 (defconstant +floppy+ 819200)
 (defconstant +hd+ 1474560)
 (defparameter *message* "INSERT MODUS DISK 2")
@@ -41,17 +41,6 @@
     (fs-apple:set-u16 v 0 #xF4F8) (fs-apple:set-u16 v 2 #x207C) (fs-apple:set-u32 v 4 +out+)
     (fs-apple:set-u16 v 8 #x4ED0) (fs-apple:set-u16 v 10 #x4E71)
     v))
-
-(defun build-loader (out)
-  (let ((p (sb-ext:run-program "sbcl" (list "--script" "mvm/build-hosted.lisp" "mac68k"
-                                            "mvm/mac68k-unlzma.lisp" "mvm/unlzma-core.lisp")
-                               :search t :directory (namestring *root*)
-                               :environment (append (list (format nil "MODUS_MAC68K_LOAD_ADDR=#x~8,'0X" +loader-addr+)
-                                                          (format nil "MODUS_MAC68K_OUT=~A" out))
-                                                    (sb-ext:posix-environ))
-                               :output nil :error nil)))
-    (unless (and (zerop (sb-ext:process-exit-code p)) (probe-file out))
-      (error "mac68k-floppy: the loader build failed"))))
 
 (defun font ()
   "The 8x8 font the consoles draw in: boot/boot-uefi-x64.lisp, 95 glyphs, each 8
@@ -85,11 +74,8 @@
 (defun zeros (n) (make-array (max n 0) :element-type '(unsigned-byte 8) :initial-element 0))
 (defun pad512 (n) (* 512 (ceiling n 512)))
 
-(defun main (image disk &key hd loader)
-  (unless loader
-    (setq loader (concatenate 'string disk ".loader"))
-    (build-loader loader))
-  (let ((lo (read-bytes loader)) (img (read-bytes image)))
+(defun main (image disk &key hd)
+  (let ((lo (assemble "mac68k-unlzma.s" :cpu "68020")) (img (read-bytes image)))
     (when (> (length lo) +pay-off+)
       (error "mac68k-floppy: the loader is ~D bytes, over ~D" (length lo) +pay-off+))
     (when (> (+ +out+ (length img)) +loader-addr+)
@@ -149,11 +135,6 @@
                               image (length img) (length stream) (length lo) d1 (length part1) d2
                               (length part2) (- +floppy+ 512 len2))))))))))))
 
-(let* ((args (argv))
-       (hd (member "--hd" args :test #'string=))
-       (k (position "--loader" args :test #'string=))
-       (loader (and k (nth (1+ k) args))))
+(let* ((args (argv)) (hd (member "--hd" args :test #'string=)))
   (setq args (remove "--hd" args :test #'string=))
-  (when k (setq args (let ((k (position "--loader" args :test #'string=)))
-                       (append (subseq args 0 k) (subseq args (+ k 2))))))
-  (main (first args) (second args) :hd (and hd t) :loader loader))
+  (main (first args) (second args) :hd (and hd t)))

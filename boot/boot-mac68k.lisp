@@ -303,8 +303,8 @@
 (defparameter +mac68k-load-addr+ (mac68k-layout :load))
 (defvar *mac68k-load-addr* +mac68k-load-addr+
   "Where this build is linked and the boot blocks put it: +MAC68K-LOAD-ADDR+
-   for an image, elsewhere for the boot-disk loader that unpacks one there
-   (mvm/mac68k-unlzma.lisp; build-hosted's MODUS_MAC68K_LOAD_ADDR).")
+   for an image; build-hosted's MODUS_MAC68K_LOAD_ADDR links a build elsewhere
+   (the floppy's Lisp loader did, before scripts/mac68k-unlzma.s).")
 (defparameter +mac68k-stack-top+ (mac68k-layout :stack-top))
 (defparameter +mac68k-scratch+ (mac68k-layout :scratch)
   "The I/O scratch pages: *CSTR-SCRATCH* here, *IO-BUF-ADDR* 256 KB on.")

@@ -5,8 +5,9 @@
 ;;;; mvm/unlzma-core.lisp`).  The head defines where things are -- +OUT+ the
 ;;;; output, +ST+ the coder state (RH RL CH CL IPH IPL, u16 each), +PR+ the
 ;;;; 7991 u16 probabilities -- and KERNEL-MAIN, which calls LZ-INIT on the
-;;;; stream and LZ-DECODE with the unpacked size.  Heads: mvm/68k-unlzma.lisp
-;;;; (Linux/m68k, an ELF), mvm/mac68k-unlzma.lisp (a bare Mac, the boot disk).
+;;;; stream and LZ-DECODE with the unpacked size.  Head: mvm/68k-unlzma.lisp
+;;;; (Linux/m68k, an ELF).  The bare Mac's floppy loader was a second head; it is
+;;;; 68020 assembly now (scripts/mac68k-unlzma.s, scripts/mac68k-lzma.inc).
 ;;;;
 ;;;; Everything is a fixnum: 68k fixnums are 30 bits and there is no runtime to
 ;;;; promote to, so the range coder's 32-bit RANGE and CODE are kept as 16-bit

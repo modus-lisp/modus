@@ -238,7 +238,9 @@ message.  NOT measured: a swap in ONE drive -- headless Basilisk cannot insert
 a disk after boot.
 
 A bare-Mac image (`mvm/build-mac68k-cl-repl.lisp`, linked at `#x00100000`)
-goes behind the same decoder with a Mac head (`mvm/mac68k-unlzma.lisp`): the
+goes behind a Mac loader (`scripts/mac68k-unlzma.s`, 68020 assembly since
+2026-11-20; it was this Lisp decoder with a Mac head, ~15 minutes on a real
+68040's clock): the
 boot blocks read loader + stream to `#x01200000`, the loader unpacks to
 `#x00100000`, pushes the 68040's caches (`CPUSHA BC`: the image was written
 as data) and jumps.  No trim needed: the small REPL image (5,557,396 bytes,

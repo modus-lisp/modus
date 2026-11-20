@@ -8504,10 +8504,120 @@
 
 (defun x64-stw-mfence (buf) (emit-bytes buf #x0F #xAE #xF0))
 
-(defun x64-stw-sched-yield (buf)
-  "sched_yield(2).  Clobbers RAX, RCX, R11."
-  (emit-bytes buf #xB8 24 0 0 0)
-  (emit-bytes buf #x0F #x05))
+
+;;; THE WAITS SLEEP.  Both stop-the-world waits -- the collector waiting for
+;;; every running thread to stop, and a stopped thread waiting for the
+;;; collection to end -- were sched_yield loops: every waiting thread kept a
+;;; core busy in system time for the whole collection, and on a loaded box
+;;; the spinners took the CPU from the collector and from the very threads it
+;;; was waiting for (test/stw-futex-wait.lisp: 6 workers, 300 collections,
+;;; 134 s of system time in 48 s).  Both now FUTEX_WAIT (private), on two
+;;; words, each with a "somebody may be asleep" word beside it so that the
+;;; signalling side issues a wake only when one is needed:
+;;;   - the COLLECTOR sleeps on table +0xC0 (CSLEEP), which it sets to 1, then
+;;;     re-reads the record it waits for (Dekker against the thread's state
+;;;     store), then FUTEX_WAITs while CSLEEP still reads 1.  A thread that
+;;;     leaves RUNNING (park, a safe region, exit) with the flag held swaps
+;;;     CSLEEP to 0 and, if it was 1, FUTEX_WAKEs it.
+;;;   - a WAITER counts itself in table +0xC8 (RSLEEP, the waiters in the
+;;;     loop: LOCK INC on the way in, LOCK DEC on the way out), re-reads the
+;;;     stop flag, and FUTEX_WAITs on the flag word itself (its low 32 bits:
+;;;     the token) while it still holds that token.  The collector clears the
+;;;     flag, fences, and wakes every waiter if RSLEEP is not 0.  A COUNT and
+;;;     not a flag the release clears: main collects back to back with one
+;;;     token, so a waiter can read T, miss that release, and sleep on the
+;;;     NEXT collection's T -- it is parked, so that is fine, but only if the
+;;;     next release still knows it is there (measured: 1 lost wake in 1900
+;;;     sleeps on the Pi 5 with a cleared flag).
+;;; Every wait also has a TIMEOUT (+STW-COLLECTOR-TIMEOUT-NS+ /
+;;; +STW-WAITER-TIMEOUT-NS+) and re-checks its condition when it returns: a
+;;; safety net, never the mechanism.  Table +0xD0 counts the collector's
+;;; sleeps and +0xD8 those that timed out with the thread ALREADY STOPPED;
+;;; +0xE0 the waiters' sleeps and +0xE8 those that timed out with the flag
+;;; ALREADY CLEAR (%STW-WAIT-STATS).  Those two are lost wakes and should
+;;; read 0: a timeout while the collection is still running, or the thread
+;;; still in a long loop that parks only at its next allocation, is not one.
+;;; The table is MAP_ANONYMOUS, so all six words start at 0.
+(defconstant +stw-csleep-off+ #xC0)
+(defconstant +stw-rsleep-off+ #xC8)
+(defconstant +stw-csleeps-off+ #xD0)
+(defconstant +stw-ctimeouts-off+ #xD8)
+(defconstant +stw-wsleeps-off+ #xE0)
+(defconstant +stw-wtimeouts-off+ #xE8)
+(defconstant +stw-collector-timeout-ns+ 10000000)
+(defconstant +stw-waiter-timeout-ns+ 20000000)
+
+(defun x64-stw-table-rax (buf)
+  "RAX = the thread table (stop-the-world is known to be armed)."
+  (emit-mov-reg-abs buf 'rax #x10000DA8)
+  (emit-add-reg-imm buf 'rax #x13000))
+
+(defun x64-stw-lock-inc (buf base off)
+  "lock inc qword [BASE+OFF]"
+  (emit-byte buf #xF0)
+  (x64-stw-rm buf '(#xFF) 0 base off))
+
+(defun x64-stw-futex (buf op timeout-ns)
+  "futex(RDI, OP, EDX, TIMEOUT-NS ? {0, TIMEOUT-NS} : NULL).  RDI and EDX are
+   the caller's.  Result in RAX.  Clobbers RAX RCX RSI R10 R11."
+  (when timeout-ns
+    (emit-byte buf #x68) (emit-u32 buf timeout-ns)          ; push tv_nsec
+    (emit-bytes buf #x6A #x00)                              ; push 0 (tv_sec)
+    (emit-bytes buf #x49 #x89 #xE2))                        ; mov r10, rsp
+  (unless timeout-ns
+    (emit-bytes buf #x45 #x31 #xD2))                        ; xor r10d, r10d
+  (emit-bytes buf #xBE) (emit-u32 buf op)                   ; mov esi, op
+  (emit-bytes buf #xB8 #xCA #x00 #x00 #x00)                 ; mov eax, 202
+  (emit-bytes buf #x0F #x05)                                ; syscall
+  (when timeout-ns
+    (emit-bytes buf #x48 #x83 #xC4 #x10)))                  ; add rsp, 16
+
+(defun x64-stw-wake-collector (buf)
+  "Right after this thread stored a state that is not RUNNING: if a
+   collection holds the flag and its collector may be asleep (CSLEEP), wake
+   it.  The MFENCE orders the state store before the flag load (the
+   collector's side: CSLEEP := 1 by XCHG, then the state load).
+   Clobbers RAX RCX RDX RSI RDI R10 R11."
+  (let ((skip (make-label)))
+    (x64-stw-mfence buf)
+    (x64-stw-flag-test buf)
+    (emit-jcc buf :e skip)
+    (x64-stw-table-rax buf)
+    (emit-bytes buf #x31 #xC9)                              ; xor ecx, ecx
+    (x64-stw-rm buf '(#x87) 1 'rax +stw-csleep-off+)        ; xchg [rax+CSLEEP], rcx
+    (emit-cmp-reg-imm buf 'rcx 0)
+    (emit-jcc buf :e skip)
+    (x64-stw-rm buf '(#x8D) 7 'rax +stw-csleep-off+)        ; lea rdi, [rax+CSLEEP]
+    (emit-bytes buf #xBA #x01 #x00 #x00 #x00)               ; mov edx, 1
+    (x64-stw-futex buf 129 nil)                             ; FUTEX_WAKE_PRIVATE, 1
+    (emit-label buf skip)))
+
+(defun x64-stw-wait-release (buf)
+  "Wait, in FUTEX_WAIT on the stop flag, until the flag is clear.
+   Clobbers RAX RCX RDX RSI RDI R10 R11."
+  (let ((again (make-label)) (out (make-label)))
+    (x64-stw-table-rax buf)
+    (x64-stw-lock-inc buf 'rax +stw-rsleep-off+)            ; a waiter (a fence)
+    (emit-label buf again)
+    (emit-mov-reg-abs buf 'rdx +x64-stw-flag-addr+)         ; the token (low 32 bits)
+    (emit-cmp-reg-imm buf 'rdx 0)
+    (emit-jcc buf :e out)
+    (x64-stw-table-rax buf)                                 ; RAX is the futex result after a pass
+    (x64-stw-lock-inc buf 'rax +stw-wsleeps-off+)
+    (emit-bytes buf #xBF) (emit-u32 buf +x64-stw-flag-addr+) ; mov edi, flag
+    (x64-stw-futex buf 128 +stw-waiter-timeout-ns+)         ; FUTEX_WAIT_PRIVATE
+    ;; Timed out with the flag already clear: a wake went missing.
+    (emit-cmp-reg-imm buf 'rax -110)                        ; ETIMEDOUT
+    (emit-jcc buf :ne again)
+    (x64-stw-flag-test buf)
+    (emit-jcc buf :ne again)
+    (x64-stw-table-rax buf)
+    (x64-stw-lock-inc buf 'rax +stw-wtimeouts-off+)
+    (emit-jmp buf again)
+    (emit-label buf out)
+    (x64-stw-table-rax buf)
+    (emit-byte buf #xF0)
+    (x64-stw-rm buf '(#xFF) 1 'rax +stw-rsleep-off+)))      ; lock dec [RSLEEP]
 
 (defun x64-stw-table (buf reg skip)
   "REG = the thread table if stop-the-world is ARMED, else jump to SKIP."
@@ -8535,10 +8645,14 @@
 
 (defun emit-x64-stw-park (buf park)
   "The PARK subroutine: R9 = this thread's record.  Publish SP and the active
-   region's frontier (R12), then PARKED; wait for the flag to clear; RUNNING.
-   Clobbers RAX, RCX, R8, R11."
-  (let ((spin (make-label)) (out (make-label)))
+   region's frontier (R12), then PARKED; wake the collector if it sleeps;
+   wait (FUTEX_WAIT, THE WAITS SLEEP) for the flag to clear; RUNNING.
+   Clobbers RAX, RCX, R8, R11.  RDI RSI RDX R10, which the futex calls use,
+   are saved BEFORE SP is published, so they lie inside the window the
+   collector scans and come back forwarded."
+  (progn
     (emit-label buf park)
+    (dolist (r '(rdi rsi rdx r10)) (emit-push buf r))
     (emit-mov-mem-reg buf 'r9 'rsp #x70)
     (emit-load-gc-region buf 'r8)
     ;; Not into REGION 0's block: its collector never reads it there, and a
@@ -8550,15 +8664,12 @@
       (emit-jcc buf :e r0)
       (emit-mov-mem-reg buf 'r8 'r12 modus.mvm::+gc-off-saved-alloc+)
       (emit-label buf r0))
-    (x64-stw-store-imm buf 'r9 #x68 1)            ; x86 stores are ordered
-    (emit-label buf spin)
-    (x64-stw-flag-test buf)
-    (emit-jcc buf :e out)
-    (x64-stw-sched-yield buf)
-    (emit-jmp buf spin)
-    (emit-label buf out)
+    (x64-stw-store-imm buf 'r9 #x68 1)
+    (x64-stw-wake-collector buf)
+    (x64-stw-wait-release buf)
     (x64-stw-store-imm buf 'r9 #x68 3)
     (x64-stw-mfence buf)
+    (dolist (r '(r10 rdx rsi rdi)) (emit-pop buf r))
     (emit-ret buf)))
 
 (defun emit-x64-stw-refresh (buf changed)
@@ -8705,9 +8816,36 @@
       (emit-label buf wait)
       (x64-stw-cmp-imm buf 'rsi #x68 3)
       (emit-jcc buf :ne next)                        ; parked, safe or absent
-      (x64-stw-sched-yield buf)
+      ;; Still RUNNING: sleep until it stops (THE WAITS SLEEP).  No spin
+      ;; first: neither PAUSE spins (1k, 10k) nor a per-collection budget of
+      ;; sched_yields (20, 200) beat sleeping at once, measured alternating
+      ;; on the loaded dev box (the spread between runs of ONE binary was
+      ;; 4x; between the variants, none that held up).
+      (let ((woke (make-label)))
+        (emit-mov-reg-mem buf 'rax 'rbp -8)          ; table
+        (emit-bytes buf #xB9 #x01 #x00 #x00 #x00)    ; mov ecx, 1
+        (x64-stw-rm buf '(#x87) 1 'rax +stw-csleep-off+) ; xchg [CSLEEP], rcx (a fence)
+        (x64-stw-cmp-imm buf 'rsi #x68 3)
+        (emit-jcc buf :ne next)                      ; it stopped meanwhile
+        (emit-push buf 'rdi) (emit-push buf 'rsi)
+        (x64-stw-lock-inc buf 'rax +stw-csleeps-off+)
+        (x64-stw-rm buf '(#x8D) 7 'rax +stw-csleep-off+) ; lea rdi, [CSLEEP]
+        (emit-bytes buf #xBA #x01 #x00 #x00 #x00)    ; mov edx, 1
+        (x64-stw-futex buf 128 +stw-collector-timeout-ns+) ; FUTEX_WAIT_PRIVATE
+        (emit-pop buf 'rsi) (emit-pop buf 'rdi)
+        ;; Timed out with the thread already stopped: a wake went missing.
+        (emit-cmp-reg-imm buf 'rax -110)
+        (emit-jcc buf :ne woke)
+        (x64-stw-cmp-imm buf 'rsi #x68 3)
+        (emit-jcc buf :e woke)
+        (emit-mov-reg-mem buf 'rax 'rbp -8)
+        (x64-stw-lock-inc buf 'rax +stw-ctimeouts-off+)
+        (emit-label buf woke))
       (emit-jmp buf wait)
       (emit-label buf evac)
+      ;; The world is stopped: nobody needs to wake this collector now.
+      (emit-mov-reg-mem buf 'rax 'rbp -8)
+      (x64-stw-store-imm buf 'rax +stw-csleep-off+ 0)
       (emit-x64-stw-evac-begin buf)
       (emit-label buf normal))))
 
@@ -9136,6 +9274,16 @@
       ;; The collector's own R12 is the new frontier: nothing to reload.
       (emit-x64-r0-count-snapshot buf 'rax)
       (emit-mov-abs-imm32 buf +x64-stw-flag-addr+ 0)
+      ;; Wake every waiter if any may be asleep (THE WAITS SLEEP): the flag
+      ;; store, a fence, then the waiter count.  Every register but
+      ;; RBP/RSP/R12-R15 is scratch here (EMIT-X64-STW-EVAC-FINISH).
+      (x64-stw-mfence buf)
+      (x64-stw-table-rax buf)
+      (x64-stw-cmp-imm buf 'rax +stw-rsleep-off+ 0)
+      (emit-jcc buf :e skip)
+      (emit-bytes buf #xBF) (emit-u32 buf +x64-stw-flag-addr+) ; mov edi, flag
+      (emit-bytes buf #xBA) (emit-u32 buf #x7FFFFFFF) ; mov edx, all
+      (x64-stw-futex buf 129 nil)                    ; FUTEX_WAKE_PRIVATE
       (emit-label buf skip))))
 
 (defun emit-x64-stw-clamp (buf)
@@ -9213,18 +9361,20 @@
           (emit-load-gc-region buf 'rdx)
           (emit-mov-mem-reg buf 'rdx 'r12 modus.mvm::+gc-off-saved-alloc+)
           (emit-x64-r0-count-snapshot buf 'rcx)
-          (x64-stw-store-imm buf 'r9 #x68 2))
-        (let ((again (make-label)) (spin (make-label)) (running (make-label)))
+          (x64-stw-store-imm buf 'r9 #x68 2)
+          ;; A collector may be asleep waiting for exactly this.
+          (x64-stw-wake-collector buf))
+        (let ((again (make-label)) (running (make-label)))
           (emit-label buf again)
           (x64-stw-store-imm buf 'r9 #x68 3)
           (x64-stw-mfence buf)
           (x64-stw-flag-test buf)
           (emit-jcc buf :e running)
+          ;; SAFE again -- the collector may have seen RUNNING and gone to
+          ;; sleep on it -- and wait for the flag to clear.
           (x64-stw-store-imm buf 'r9 #x68 2)
-          (emit-label buf spin)
-          (x64-stw-sched-yield buf)
-          (x64-stw-flag-test buf)
-          (emit-jcc buf :ne spin)
+          (x64-stw-wake-collector buf)
+          (x64-stw-wait-release buf)
           ;; Another thread may have collected region 0 meanwhile.
           (let ((back (make-label)))
             (emit-x64-stw-refresh buf back)

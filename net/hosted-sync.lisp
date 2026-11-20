@@ -1874,6 +1874,30 @@ Stopping.
             1)))
     0))
 
+(defun %stw-wake-collector ()
+  "This thread just left RUNNING (exit; the translators' park and safe-region
+   traps do the same inline): if a region-0 collection holds the stop flag and
+   its collector may be asleep waiting for this thread, wake it.  The fence
+   orders the state store before the flag load; the collector sets the
+   table's +0xC0 word to 1 before it reads the state (translate-x64, THE WAITS
+   SLEEP)."
+  (mfence)
+  (if (zerop (%gc-read64 (%conv-addr #x10000FC8)))
+      0
+      (let ((w (+ (%thr-table) #xC0)))
+        (if (zerop (xchg-mem w 0)) 0 (progn (%futex-wake w 1) 0)))))
+
+(defun %stw-wait-stats ()
+  "How the stop-the-world waits went in this process (translate-x64, THE
+   WAITS SLEEP): (collector-sleeps collector-lost-wakes waiter-sleeps
+   waiter-lost-wakes), a lost wake being a sleep that timed out after its
+   condition already held.  NIL before the thread table exists."
+  (let ((tt (%thr-table)))
+    (if (zerop tt)
+        nil
+        (list (%gc-read64 (+ tt #xD0)) (%gc-read64 (+ tt #xD8))
+              (%gc-read64 (+ tt #xE0)) (%gc-read64 (+ tt #xE8))))))
+
 (defun %rt-threads-on ()
   "Declare that more than one thread is about to run Lisp through the shared
    runtime tables.  Returns 1 on success, 0 if the precondition is not met.
@@ -3047,6 +3071,7 @@ Stopping.
     (%gc-write64 (+ rec #x30) 1)
     ;; LEAVE STOP-THE-WORLD: from here on this thread touches no heap object.
     (%gc-write64 (+ rec #x68) 0)
+    (%layout-if :stw (%stw-wake-collector) 0)
     (%gc-write64 (+ rec #x00) 2)
     0))
 

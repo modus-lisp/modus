@@ -981,6 +981,26 @@ set.
   and futex waits.  A thread blocked there counts as stopped, since its
   published stack is all it holds.  Leaving while a collection runs, it goes
   back to SAFE and waits for the flag to clear.
+- **The waits sleep.**  The collector waiting for a running thread, and a
+  parked or safe thread waiting for the flag to clear, used to spin on
+  `sched_yield`: every waiting thread burned a core in system time for the
+  whole collection (6 workers, 300 collections on x86-64: 134 s of system
+  time in 48 s of wall time).  Both are futex waits now, with a timeout as a
+  safety net (translate-x64, "THE WAITS SLEEP"):
+  - The collector sets the thread table's `+0xC0` word to 1, re-reads the
+    thread's state and sleeps on that word.  A thread that leaves RUNNING
+    with the flag held (park, `%GC-SAFE-ENTER`, exit) clears it and wakes the
+    collector.
+  - A waiter counts itself in `+0xC8` and sleeps on the stop flag itself.
+    The collector clears the flag and wakes every waiter when the count is
+    not 0.
+  - Hosted Linux and Darwin take the same path: the call is Linux aarch64
+    futex (98), which the host shim turns into `os_sync_wait_on_address` /
+    `os_sync_wake_by_address_*` (`DX-FUTEX`).  Bare metal keeps the YIELD
+    hint spin.
+  - `%STW-WAIT-STATS` counts the sleeps, and the sleeps that timed out
+    after their condition already held (lost wakes).
+    `test/stw-futex-wait.lisp` bounds both.
 - **The cost, and where it no longer applies.**  A loop that never allocates
   and never blocks held up a region-0 collection until it did one or the
   other; a worker spinning on `(loop (when *flag* (return)) ...)` while main

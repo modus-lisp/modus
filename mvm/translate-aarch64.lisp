@@ -3896,6 +3896,14 @@
                     (when *aarch64-linux-mode*
                       (a64-r0-count-snapshot buf +a64-x10+ +a64-x11+ +a64-x12+))
                     (a64-stw-publish buf +a64-x14+ 2)
+                    ;; A collector may be asleep waiting for exactly this
+                    ;; (THE WAITS SLEEP).  x0 is the result, set below.
+                    (when *aarch64-linux-mode*
+                      (a64-stp-pre buf +a64-x1+ +a64-x2+ +a64-sp+ -16)
+                      (a64-stp-pre buf +a64-x3+ +a64-x8+ +a64-sp+ -16)
+                      (a64-stw-wake-collector buf)
+                      (a64-ldp-post buf +a64-x3+ +a64-x8+ +a64-sp+ 16)
+                      (a64-ldp-post buf +a64-x1+ +a64-x2+ +a64-sp+ 16))
                     (a64-set-label buf skip)))
                 (a64-mov-reg buf +a64-x0+ +a64-x26+))
                ((and (or *aarch64-linux-mode* *a64-tls-window*) (= code #x0544))
@@ -3936,15 +3944,30 @@
                     (a64-movz buf +a64-x10+ 2 0)                    ; safe again
                     (a64-dmb buf #xB)
                     (a64-str-unsigned buf +a64-x10+ +a64-x14+ #x68)
-                    ;; sched_yield clobbers x0/x8, and x8 is a local register.
-                    (a64-stp-pre buf +a64-x0+ +a64-x8+ +a64-sp+ -16)
-                    (a64-set-label buf spin)
-                    (a64-sched-yield buf)
-                    (a64-ldar buf +a64-x12+ +a64-x11+)
-                    (a64-cmp-imm buf +a64-x12+ 0)
-                    (let ((i (a64-current-index buf)))
-                      (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i spin :bcond))
-                    (a64-ldp-post buf +a64-x0+ +a64-x8+ +a64-sp+ 16)
+                    (if *aarch64-linux-mode*
+                        ;; HOSTED: the collector may have seen RUNNING and
+                        ;; gone to sleep on it; wake it, then sleep until the
+                        ;; flag clears (THE WAITS SLEEP).  x0-x3 and x8 (a
+                        ;; local register) are saved around the calls.
+                        (progn
+                          (a64-stp-pre buf +a64-x0+ +a64-x1+ +a64-sp+ -16)
+                          (a64-stp-pre buf +a64-x2+ +a64-x3+ +a64-sp+ -16)
+                          (a64-stp-pre buf +a64-x8+ +a64-x9+ +a64-sp+ -16)
+                          (a64-stw-wake-collector buf)
+                          (a64-stw-wait-release buf)
+                          (a64-ldp-post buf +a64-x8+ +a64-x9+ +a64-sp+ 16)
+                          (a64-ldp-post buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+                          (a64-ldp-post buf +a64-x0+ +a64-x1+ +a64-sp+ 16))
+                        (progn
+                          ;; sched_yield clobbers x0/x8, and x8 is a local register.
+                          (a64-stp-pre buf +a64-x0+ +a64-x8+ +a64-sp+ -16)
+                          (a64-set-label buf spin)
+                          (a64-sched-yield buf)
+                          (a64-ldar buf +a64-x12+ +a64-x11+)
+                          (a64-cmp-imm buf +a64-x12+ 0)
+                          (let ((i (a64-current-index buf)))
+                            (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i spin :bcond))
+                          (a64-ldp-post buf +a64-x0+ +a64-x8+ +a64-sp+ 16)))
                     ;; Another thread may have collected region 0 meanwhile.
                     (let ((back (incf *mvm-label-counter*)))
                       (emit-aarch64-stw-refresh buf back)
@@ -8005,11 +8028,150 @@
   (a64-dmb buf #xB)
   (a64-str-unsigned buf +a64-x16+ rec #x68))
 
+;;; THE WAITS SLEEP (hosted).  The collector's wait for running threads and a
+;;; stopped thread's wait for the collection to end are FUTEX_WAITs, not
+;;; sched_yield loops: translate-x64's THE WAITS SLEEP has the protocol and
+;;; the thread-table words (+0xC0 CSLEEP, +0xC8 RSLEEP, +0xD0..+0xE8 the
+;;; counts); the code below is the same protocol with DMB ISH where x86 has
+;;; MFENCE / XCHG.  The syscall is the Linux aarch64 futex (98), which the
+;;; Darwin shim turns into os_sync_wait_on_address / os_sync_wake_by_address
+;;; (host/macos/modus-shim.c DX-FUTEX), so macOS hosting takes this path too.
+;;; BARE METAL keeps the YIELD-hint spin: there is no kernel to wait in.
+(defconstant +a64-stw-csleep-off+ #xC0)
+(defconstant +a64-stw-rsleep-off+ #xC8)
+(defconstant +a64-stw-csleeps-off+ #xD0)
+(defconstant +a64-stw-ctimeouts-off+ #xD8)
+(defconstant +a64-stw-wsleeps-off+ #xE0)
+(defconstant +a64-stw-wtimeouts-off+ #xE8)
+(defconstant +a64-stw-collector-timeout-ns+ 10000000)
+(defconstant +a64-stw-waiter-timeout-ns+ 20000000)
+
+(defun a64-stw-bc (buf cc label)
+  (let ((i (a64-current-index buf))) (a64-bcond buf cc 0) (a64-add-fixup buf i label :bcond)))
+
+(defun a64-stw-b (buf label)
+  (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i label :b)))
+
+(defun a64-stw-table-reg (buf rd)
+  "Xd = the thread table (stop-the-world is known to be armed)."
+  (a64-load-real-addr buf rd (conv-real #x10000DA8))
+  (a64-ldr-unsigned buf rd rd 0)
+  (a64-add-imm-lsl12 buf rd rd #x13))
+
+(defun a64-stw-swap (buf old addr new status)
+  "OLD := [ADDR], [ADDR] := NEW, atomically (LDAXR/STLXR).  STATUS scratch."
+  (let ((again (incf *mvm-label-counter*)))
+    (a64-set-label buf again)
+    (a64-emit buf (logior #xC85FFC00 (ash addr 5) old))               ; LDAXR old,[addr]
+    (a64-emit buf (logior #xC800FC00 (ash status 16) (ash addr 5) new)) ; STLXR ws,new,[addr]
+    (a64-cmp-imm buf status 0)
+    (a64-stw-bc buf +cc-ne+ again)))
+
+(defun a64-stw-atomic-inc (buf addr tmp status &optional (delta 1))
+  "[ADDR] += DELTA (1 or -1), atomically.  TMP, STATUS scratch."
+  (let ((again (incf *mvm-label-counter*)))
+    (a64-set-label buf again)
+    (a64-emit buf (logior #xC85FFC00 (ash addr 5) tmp))
+    (if (minusp delta) (a64-sub-imm buf tmp tmp 1) (a64-add-imm buf tmp tmp 1))
+    (a64-emit buf (logior #xC800FC00 (ash status 16) (ash addr 5) tmp))
+    (a64-cmp-imm buf status 0)
+    (a64-stw-bc buf +cc-ne+ again)))
+
+(defun a64-stw-futex (buf op timeout-ns)
+  "futex(x0, OP, x2, TIMEOUT-NS ? {0, TIMEOUT-NS} : NULL); result in x0.
+   x0 and x2 are the caller's.  Clobbers x0 x1 x3 x8 (x16 on Darwin); with a
+   timeout, 16 bytes below SP for the call."
+  (a64-movz buf +a64-x1+ op 0)
+  (if timeout-ns
+      (progn (a64-load-imm64 buf +a64-x3+ timeout-ns)
+             (a64-stp-pre buf +a64-xzr+ +a64-x3+ +a64-sp+ -16)     ; {tv_sec 0, tv_nsec}
+             (a64-add-imm buf +a64-x3+ +a64-sp+ 0))
+      (a64-movz buf +a64-x3+ 0 0))
+  (a64-movz buf +a64-x8+ 98 0)
+  (a64-svc buf 0)
+  (when timeout-ns
+    (a64-add-imm buf +a64-sp+ +a64-sp+ 16)))
+
+(defun a64-stw-wake-collector (buf)
+  "Right after this thread stored a state that is not RUNNING: if a
+   collection holds the flag and its collector may be asleep (CSLEEP), wake
+   it.  DMB ISH orders the state store before the flag load.
+   Clobbers x0 x1 x2 x3 x8 x11 x12 x15 (x16 on Darwin)."
+  (let ((skip (incf *mvm-label-counter*)))
+    (a64-dmb buf #xB)
+    (a64-load-real-addr buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
+    (a64-ldar buf +a64-x12+ +a64-x11+)
+    (a64-cmp-imm buf +a64-x12+ 0)
+    (a64-stw-bc buf +cc-eq+ skip)
+    (a64-stw-table-reg buf +a64-x15+)
+    (a64-add-imm buf +a64-x11+ +a64-x15+ +a64-stw-csleep-off+)
+    (a64-stw-swap buf +a64-x12+ +a64-x11+ +a64-xzr+ +a64-x0+)
+    (a64-cmp-imm buf +a64-x12+ 0)
+    (a64-stw-bc buf +cc-eq+ skip)
+    (a64-mov-reg buf +a64-x0+ +a64-x11+)
+    (a64-movz buf +a64-x2+ 1 0)
+    (a64-stw-futex buf 129 nil)                                      ; FUTEX_WAKE_PRIVATE, 1
+    (a64-set-label buf skip)))
+
+(defun a64-stw-wait-release (buf)
+  "Wait, in FUTEX_WAIT on the stop flag, until it is clear.
+   Clobbers x0 x1 x2 x3 x8 x11 x12 x15 (x16 on Darwin)."
+  (let ((again (incf *mvm-label-counter*))
+        (out (incf *mvm-label-counter*)))
+    ;; Counted in as a waiter (RSLEEP, translate-x64's THE WAITS SLEEP has
+    ;; why a count), then a full barrier before the flag load.
+    (a64-stw-table-reg buf +a64-x15+)
+    (a64-add-imm buf +a64-x0+ +a64-x15+ +a64-stw-rsleep-off+)
+    (a64-stw-atomic-inc buf +a64-x0+ +a64-x1+ +a64-x3+)
+    (a64-dmb buf #xB)
+    (a64-set-label buf again)
+    (a64-load-real-addr buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
+    (a64-ldar buf +a64-x12+ +a64-x11+)
+    (a64-cmp-imm buf +a64-x12+ 0)
+    (a64-stw-bc buf +cc-eq+ out)
+    (a64-add-imm buf +a64-x0+ +a64-x15+ +a64-stw-wsleeps-off+)
+    (a64-stw-atomic-inc buf +a64-x0+ +a64-x1+ +a64-x3+)
+    (a64-mov-reg buf +a64-x0+ +a64-x11+)
+    (a64-mov-reg buf +a64-x2+ +a64-x12+)                             ; the token
+    (a64-stw-futex buf 128 +a64-stw-waiter-timeout-ns+)              ; FUTEX_WAIT_PRIVATE
+    ;; Timed out with the flag already clear: a wake went missing.
+    (a64-add-imm buf +a64-x1+ +a64-x0+ 110)                          ; -ETIMEDOUT?
+    (a64-cmp-imm buf +a64-x1+ 0)
+    (a64-stw-bc buf +cc-ne+ again)
+    (a64-ldar buf +a64-x12+ +a64-x11+)
+    (a64-cmp-imm buf +a64-x12+ 0)
+    (a64-stw-bc buf +cc-ne+ again)
+    (a64-stw-table-reg buf +a64-x15+)
+    (a64-add-imm buf +a64-x0+ +a64-x15+ +a64-stw-wtimeouts-off+)
+    (a64-stw-atomic-inc buf +a64-x0+ +a64-x1+ +a64-x3+)
+    (a64-stw-b buf again)
+    (a64-set-label buf out)
+    (a64-stw-table-reg buf +a64-x15+)
+    (a64-add-imm buf +a64-x0+ +a64-x15+ +a64-stw-rsleep-off+)
+    (a64-stw-atomic-inc buf +a64-x0+ +a64-x1+ +a64-x3+ -1)))
+
 (defun emit-aarch64-stw-park (buf park)
   "The PARK subroutine (label PARK): x14 = this thread's record.  Publishes
    the thread as parked and waits for the stop flag to clear.  Registers
    are the caller's to have saved (the trampoline's frame); it clobbers
    x0/x8/x11/x12/x15/x16/x17 and returns with the thread running."
+  (if *aarch64-linux-mode*
+      ;; HOSTED: sleep (THE WAITS SLEEP).  x1-x4, which the futex calls use,
+      ;; are saved BEFORE SP is published, inside the window the collector
+      ;; scans.
+      (progn
+        (a64-set-label buf park)
+        (a64-stp-pre buf +a64-x1+ +a64-x2+ +a64-sp+ -16)
+        (a64-stp-pre buf +a64-x3+ +a64-x4+ +a64-sp+ -16)
+        (a64-stw-publish buf +a64-x14+ 1)
+        (a64-stw-wake-collector buf)
+        (a64-stw-wait-release buf)
+        (a64-movz buf +a64-x16+ 3 0)                                 ; running
+        (a64-str-unsigned buf +a64-x16+ +a64-x14+ #x68)
+        (a64-dmb buf #xB)
+        (a64-ldp-post buf +a64-x3+ +a64-x4+ +a64-sp+ 16)
+        (a64-ldp-post buf +a64-x1+ +a64-x2+ +a64-sp+ 16)
+        (a64-ret buf))
   (let ((spin (incf *mvm-label-counter*))
         (out (incf *mvm-label-counter*)))
     (a64-set-label buf park)
@@ -8025,7 +8187,7 @@
     (a64-movz buf +a64-x16+ 3 0)                                     ; running
     (a64-str-unsigned buf +a64-x16+ +a64-x14+ #x68)
     (a64-dmb buf #xB)
-    (a64-ret buf)))
+    (a64-ret buf))))
 
 (defun emit-aarch64-stw-clamp (buf)
   "A loop back-edge's stop-the-world poll.  When a collection wants the world
@@ -8323,9 +8485,47 @@
       (a64-ldar buf +a64-x10+ +a64-x11+)
       (a64-cmp-imm buf +a64-x10+ 3)
       (let ((i (a64-current-index buf))) (a64-bcond buf +cc-ne+ 0) (a64-add-fixup buf i next :bcond)) ; not running
-      (a64-sched-yield buf)
+      (if *aarch64-linux-mode*
+          ;; HOSTED: sleep until it stops (THE WAITS SLEEP; no spin first,
+          ;; see translate-x64).  CSLEEP := 1, a full barrier, the state
+          ;; again, then FUTEX_WAIT while CSLEEP still reads 1.  x0 and x8
+          ;; are free here (the sched_yield this replaces clobbered them);
+          ;; x1-x3 are saved around the call.
+          (let ((woke (incf *mvm-label-counter*)))
+            (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)               ; table
+            (a64-movz buf +a64-x10+ 1 0)
+            (a64-str-unsigned buf +a64-x10+ +a64-x9+ +a64-stw-csleep-off+)
+            (a64-dmb buf #xB)
+            (a64-ldar buf +a64-x10+ +a64-x11+)
+            (a64-cmp-imm buf +a64-x10+ 3)
+            (a64-stw-bc buf +cc-ne+ next)                            ; it stopped meanwhile
+            (a64-stp-pre buf +a64-x1+ +a64-x2+ +a64-sp+ -16)
+            (a64-stp-pre buf +a64-x3+ +a64-x8+ +a64-sp+ -16)
+            (a64-add-imm buf +a64-x0+ +a64-x9+ +a64-stw-csleeps-off+)
+            (a64-stw-atomic-inc buf +a64-x0+ +a64-x1+ +a64-x3+)
+            (a64-add-imm buf +a64-x0+ +a64-x9+ +a64-stw-csleep-off+)
+            (a64-movz buf +a64-x2+ 1 0)
+            (a64-stw-futex buf 128 +a64-stw-collector-timeout-ns+)   ; FUTEX_WAIT_PRIVATE
+            ;; Timed out with the thread already stopped: a lost wake.
+            (a64-add-imm buf +a64-x1+ +a64-x0+ 110)                  ; -ETIMEDOUT?
+            (a64-cmp-imm buf +a64-x1+ 0)
+            (a64-stw-bc buf +cc-ne+ woke)
+            (a64-ldar buf +a64-x10+ +a64-x11+)
+            (a64-cmp-imm buf +a64-x10+ 3)
+            (a64-stw-bc buf +cc-eq+ woke)
+            (a64-stw-table-reg buf +a64-x9+)
+            (a64-add-imm buf +a64-x0+ +a64-x9+ +a64-stw-ctimeouts-off+)
+            (a64-stw-atomic-inc buf +a64-x0+ +a64-x1+ +a64-x3+)
+            (a64-set-label buf woke)
+            (a64-ldp-post buf +a64-x3+ +a64-x8+ +a64-sp+ 16)
+            (a64-ldp-post buf +a64-x1+ +a64-x2+ +a64-sp+ 16))
+          (a64-sched-yield buf))
       (let ((i (a64-current-index buf))) (a64-b buf 0) (a64-add-fixup buf i wait :b))
       (a64-set-label buf done)
+      (when *aarch64-linux-mode*
+        ;; The world is stopped: nobody needs to wake this collector now.
+        (a64-ldr-unsigned buf +a64-x9+ +a64-sp+ 0)
+        (a64-str-unsigned buf +a64-xzr+ +a64-x9+ +a64-stw-csleep-off+))
       (emit-aarch64-stw-evac-begin buf)
       (a64-set-label buf normal)
       (a64-set-label buf ready))))
@@ -9408,6 +9608,26 @@
       (a64-load-real-addr buf +a64-x11+ (conv-real +a64-stw-flag-addr+))
       (a64-dmb buf #xB)
       (a64-str-unsigned buf +a64-xzr+ +a64-x11+ 0)
+      (when *aarch64-linux-mode*
+        ;; Wake every waiter if any may be asleep (THE WAITS SLEEP): the flag
+        ;; store, a full barrier, the waiter count.  x0-x3/x8 saved.
+        (let ((nowake (incf *mvm-label-counter*)))
+          (a64-dmb buf #xB)
+          (a64-ldr-unsigned buf +a64-x12+ +a64-sp+ 0)                ; table (before the pushes)
+          (a64-add-imm buf +a64-x12+ +a64-x12+ +a64-stw-rsleep-off+)
+          (a64-stp-pre buf +a64-x0+ +a64-x1+ +a64-sp+ -16)
+          (a64-stp-pre buf +a64-x2+ +a64-x3+ +a64-sp+ -16)
+          (a64-stp-pre buf +a64-x8+ +a64-x9+ +a64-sp+ -16)
+          (a64-ldr-unsigned buf +a64-x10+ +a64-x12+ 0)               ; waiters?
+          (a64-cmp-imm buf +a64-x10+ 0)
+          (a64-stw-bc buf +cc-eq+ nowake)
+          (a64-mov-reg buf +a64-x0+ +a64-x11+)
+          (a64-load-imm64 buf +a64-x2+ #x7FFFFFFF)
+          (a64-stw-futex buf 129 nil)                                ; FUTEX_WAKE_PRIVATE, all
+          (a64-set-label buf nowake))
+        (a64-ldp-post buf +a64-x8+ +a64-x9+ +a64-sp+ 16)
+        (a64-ldp-post buf +a64-x2+ +a64-x3+ +a64-sp+ 16)
+        (a64-ldp-post buf +a64-x0+ +a64-x1+ +a64-sp+ 16))
       (a64-set-label buf skip)
       (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-stw-frame+))))
 

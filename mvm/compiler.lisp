@@ -23763,12 +23763,17 @@
       (flet ((in-range-or (x bits miss)
                ;; branch to MISS unless -2^BITS < x < 2^BITS (x a TAGGED word)
                (let ((tb (ash (ash 1 bits) +fixnum-shift+)))
-                ;; The shift form, always: equivalent to the two immediates on
-                ;; every 30-bit target and half the instructions (the flag now
-                ;; only tells the 68k translator it may fuse the four into
-                ;; ASL + BVS).  The image's own compiler never saw the flag --
-                ;; a host special -- so REPL code got the long form.
-                (if t
+                ;; The shift form where the flag says so (small 68k images, and
+                ;; the 68k native tier, which carries it in): half the
+                ;; instructions, fused by the 68k translator into ASL + BVS.
+                ;; NOT everywhere: "x survives a 32-bit shift left and back"
+                ;; holds only where the shift IS 32 bits wide -- native code.
+                ;; The bytecode INTERPRETER's shifts do not wrap, so the guard
+                ;; never failed there, an overflowing product took the fixnum
+                ;; path and faulted: ansi-test *.7 / =.16 / COMPARE-RATIONALS.1
+                ;; on i386, ARM32 and RISC-V 32 (no runtime JIT: REPL and
+                ;; loaded code are interpreted).  30d118fa made it (IF T ...).
+                (if *arith-range-by-shift*
                  ;; -TB <= x < TB iff x survives a 32-bit shift left by S and
                  ;; back: no immediates, and one fused ASL + BVS on 68k.
                  (let ((s (- 31 (1- (integer-length tb)))))

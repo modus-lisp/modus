@@ -20,6 +20,15 @@
 # CONTROL: the same collections without the knob return, and a fault right
 # after them is an ordinary, caught MEMORY-FAULT-ERROR -- the mark is cleared.
 #
+# A FAULT WITH NO HANDLER ARMED (the stub's exit path).  It used to end the
+# process with a bare 139 and no word on both arches, main and workers alike
+# (x86-64's message was behind the same dormant X64-STW-P).  Now: exit 70 and
+# one line -- what (memory fault, stack exhausted, ...), "with no handler
+# armed", which thread, tid, fault address and PC.  "No handler armed" is
+# made by zeroing this thread's armed-frame slot (window +0x180) in compiled
+# code, then faulting: an unmapped read, and unbounded recursion; on main
+# alone, on main with a worker running, and on a worker.
+#
 # Before (origin/main 45ac60ed): AArch64 had no such check at all, and the
 # x86-64 one tested words of a dormant protocol (X64-STW-P answers NIL).
 # Measured with the knob and without the check, both arches: main and a worker
@@ -112,6 +121,30 @@ printf '%s' "$OUT" | grep -q "MAIN MEMORY-FAULT-ERROR" && ok "control: main faul
 printf '%s' "$OUT" | grep -q "WORKER MEMORY-FAULT-ERROR" && ok "control: worker fault after a collection is caught" || fail "control worker: $OUT"
 printf '%s' "$OUT" | grep -q "WORKER-R0 unmoved" && ok "control: the worker collected its own region (region 0 unmoved)" || fail "control worker region: $OUT"
 printf '%s' "$OUT" | grep -q "CONTROL DONE" && ok "control: finished" || fail "control: did not finish"
+
+echo
+echo "=== A FAULT WITH NO HANDLER ARMED SAYS SO ==="
+DISARM='(defun disarm () (setf (mem-ref #x10000180 :u64) 0))
+(defun rec (n) (1+ (rec (1+ n))))
+(defun bad-read () (disarm) (mem-ref 64 :u32))
+(defun bad-rec () (disarm) (rec 0))
+(defvar *stop* nil)
+(defun spinner () (sb-thread:make-thread (lambda () (let ((n 0)) (loop (when *stop* (return n)) (setq n (+ n 1)))))))'
+MAIN_MEM="memory fault (SIGSEGV) with no handler armed on the main thread (tid [0-9]*): address #x40, pc #x[0-9A-F]*; stopping."
+MAIN_STK="stack exhausted (the control stack overflowed) with no handler armed on the main thread (tid [0-9]*): address #x[0-9A-F]*, pc #x[0-9A-F]*; stopping."
+
+printf '%s\n(format t "start~%%")\n(bad-read)\n(format t "RESUMED~%%")\n' "$DISARM" >"$T/uc-main-read.lisp"
+expect uc-main-read 70 "$MAIN_MEM" RESUMED
+printf '%s\n(bad-rec)\n(format t "RESUMED~%%")\n' "$DISARM" >"$T/uc-main-rec.lisp"
+expect uc-main-rec 70 "$MAIN_STK" RESUMED
+printf '%s\n(defvar *th* (spinner))\n(modus-int::%%sleep-ms 50)\n(bad-read)\n(format t "RESUMED~%%")\n' "$DISARM" >"$T/uc-main-read-threads.lisp"
+expect uc-main-read-threads 70 "$MAIN_MEM" RESUMED
+printf '%s\n(defvar *th* (spinner))\n(modus-int::%%sleep-ms 50)\n(bad-rec)\n(format t "RESUMED~%%")\n' "$DISARM" >"$T/uc-main-rec-threads.lisp"
+expect uc-main-rec-threads 70 "$MAIN_STK" RESUMED
+printf '%s\n(format t "RESUMED ~S~%%" (sb-thread:join-thread (sb-thread:make-thread (lambda () (bad-read) :after))))\n' "$DISARM" >"$T/uc-worker-read.lisp"
+expect uc-worker-read 70 "memory fault (SIGSEGV) with no handler armed on worker [0-9]* (tid [0-9]*): address #x40, pc #x[0-9A-F]*; stopping." RESUMED
+printf '%s\n(format t "RESUMED ~S~%%" (sb-thread:join-thread (sb-thread:make-thread (lambda () (bad-rec) :after))))\n' "$DISARM" >"$T/uc-worker-rec.lisp"
+expect uc-worker-rec 70 "stack exhausted (the control stack overflowed) with no handler armed on worker [0-9]* (tid [0-9]*): address #x[0-9A-F]*, pc #x" RESUMED
 
 echo
 echo "$checks checks, $fails failed"

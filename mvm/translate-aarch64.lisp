@@ -2223,6 +2223,9 @@
 (defconstant +a64-fault-in-gc-exit-code+ 71
   "exit_group code of a fault inside a collection (translate-x64's
    +FAULT-IN-GC-EXIT-CODE+).")
+(defconstant +a64-uncaught-fault-exit-code+ 70
+  "exit_group code of a fault with no handler armed (translate-x64's
+   +UNCAUGHT-FAULT-EXIT-CODE+).")
 
 (defun a64-emit-fault-record (buf)
   "Fault stub: record this fault for %TAKE-PENDING-FAULT -- x0 the signal, x1
@@ -4664,6 +4667,12 @@
                               ;; of reporting.  Identical bug to x86-64's
                               ;; 60-vs-231; see translate-x64.lisp.
                               (let ((exit-label-idx (a64-current-index buf)))
+                                ;; SAY WHY (translate-x64's exit path has the
+                                ;; story): one line from this thread's record
+                                ;; and exit 70, not a bare 139.
+                                (when (a64-fault-rec-p)
+                                  (a64-emit-fault-report buf "with no handler armed" "stopping."
+                                                         +a64-uncaught-fault-exit-code+))
                                 (a64-movz buf +a64-x0+ 139 0)
                                 (a64-movz buf +a64-x8+ 94 0)
                                 (a64-svc buf 0)

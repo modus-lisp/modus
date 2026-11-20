@@ -956,6 +956,17 @@
 ;; syms (#x50, hash-only) that aren't in any package symbol table.
 (defvar *sym-name-table* nil)
 
+(declaim (overridable %static-symbol-tableless-p))
+(defun %static-symbol-tableless-p ()
+  "With no *SYM-NAME-TABLE*, can a static-symbol slot (compiler.lisp
+   %STATIC-SYMBOL-FILL) cache a symbol whose own name slot is empty?  Not by
+   default: the table is missing only early in boot, when such a symbol may be
+   a placeholder INTERN later replaces.  A bare Mac's core drops the table for
+   COLD NAMES and says yes (mvm/mac68k-cold.lisp) -- or every quoted kernel
+   symbol re-interned at each evaluation (measured on MAME's SE/30: 35% of a
+   floppy MOUNT in %STATIC-SYMBOL-REF and -MISS)."
+  nil)
+
 ;; The name for hash H that *SYM-NAME-TABLE* would have given, from wherever an
 ;; image keeps them instead (the bare Mac: on disk, mvm/mac68k-cold.lisp).
 (declaim (overridable %cold-sym-name))

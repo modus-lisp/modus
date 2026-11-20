@@ -34006,7 +34006,11 @@
                                       (if (and (stringp nm) (> (length nm) 0))
                                           t
                                           (let ((tab *sym-name-table*))
-                                            (if tab (if (gethash h tab) t nil) nil))))
+                                            ;; no table: a Mac core dropped it
+                                            ;; for COLD NAMES, which resolve
+                                            ;; every name (mac68k-cold.lisp)
+                                            (if tab (if (gethash h tab) t nil)
+                                                (%static-symbol-tableless-p)))))
                                 (when (eql vec 0)
                                   (let ((v (%make-array-raw ,n)) (i 0))
                                     (loop (when (>= i ,n) (return nil))

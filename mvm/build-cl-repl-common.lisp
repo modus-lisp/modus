@@ -3432,13 +3432,32 @@
     (defvar cl-user::*rt-macros-source* text)   ; build-cli-common's (in CL-USER)
     (format t "~&;; mac68k: ~D runtime macros compiled into the image~%" k)))
 
-;;; :MAC68K: FLOPPY FILES (mvm/mac68k-files.lisp): fs-fat's lib/fat32.lisp and
-;;; the FLOPPY package over the Mac's disk service, baked as TEXT that the
-;;; build's core run LOADs before the freeze (fs-fat is its own repository and
-;;; package; the image's own source is kernel code).  The text is init-only.
-;;; On for MODUS_MAC68K_MACHINE=floppy (the 8 MB floppy set: its second disk
-;;; is FAT12); MODUS_MAC68K_FILES=1 / 0 says otherwise.  fs-fat is FS_FAT, else
-;;; a checkout beside this one.
+;;; :MAC68K: FLOPPY FILES (mvm/mac68k-files.lisp): fs-fat's lib/fat32.lisp
+;;; compiled INTO the image as kernel code -- its DEFPACKAGE, IN-PACKAGE and
+;;; DECLAIM left out, nothing else touched -- with mvm/mac68k-disk-io.lisp and
+;;; mvm/mac68k-files.lisp, whose %MAC-FILES-INSTALL the core run calls to make
+;;; the package FLOPPY.  (LOADed as text in the core run instead, it stayed
+;;; bytecode: a Mac translates at DEFUN and the core run cannot.)  On for
+;;; MODUS_MAC68K_MACHINE=floppy (the 8 MB floppy set: its second disk is
+;;; FAT12); MODUS_MAC68K_FILES=1 / 0 says otherwise.  fs-fat is FS_FAT, else a
+;;; checkout beside this one.  Its names do not collide with the kernel's
+;;; (checked when this went in: 115 DEFUNs and DEFVARs, none defined here).
+(defun %mac68k-drop-forms (text heads)
+  "TEXT without its top-level forms whose first symbol is one of HEADS."
+  (let ((out (make-string-output-stream)) (pos 0) (n (length text)))
+    (loop
+      (let ((k (loop for i from pos below n
+                     when (and (char= (char text i) #\()
+                               (or (= i 0) (char= (char text (1- i)) #\Newline))
+                               (some (lambda (h) (let ((e (+ i 1 (length h))))
+                                                   (and (<= e n) (string-equal h text :start2 (1+ i) :end2 e)
+                                                        (member (char text e) '(#\Space #\Newline)))))
+                                     heads))
+                       return i)))
+        (unless k (write-string text out :start pos) (return (get-output-stream-string out)))
+        (write-string text out :start pos :end k)
+        (setq pos (let ((*read-suppress* t)) (nth-value 1 (read-from-string text t nil :start k))))))))
+
 (defvar *mac68k-files-text*
   (let ((on (sb-ext:posix-getenv "MODUS_MAC68K_FILES")))
     (when (and *cl-repl-mac68k-p*
@@ -3452,9 +3471,11 @@
                       (merge-pathnames "../fs-fat/lib/fat32.lisp" *modus-base*))))
         (unless (probe-file lib)
           (error "mac68k: floppy files need fs-fat: set FS_FAT (no ~A)" lib))
-        (format t "~&;; mac68k: floppy files: ~A + mvm/mac68k-files.lisp, LOADed by the core run~%" lib)
-        (concatenate 'string (read-file-text lib) (string #\Newline)
-                     (mvm-text "mvm/mac68k-files.lisp"))))))
+        (format t "~&;; mac68k: floppy files: ~A compiled in, with mvm/mac68k-files.lisp~%" lib)
+        (concatenate 'string
+                     (%mac68k-drop-forms (read-file-text lib) '("defpackage" "in-package" "declaim"))
+                     (string #\Newline) (mvm-text "mvm/mac68k-disk-io.lisp")
+                     (string #\Newline) (mvm-text "mvm/mac68k-files.lisp"))))))
 
 ;;; :MAC68K: no Genera / SB-* / ASDF surface source (build-cli-common's
 ;;; MODUS_NO_SURFACES), following MODUS_SMALL_IMAGE: a Mac has no environment
@@ -3490,23 +3511,9 @@
                      start (+ i (length cross)))))
     (when *mac-cold-names-out*
       (setq text (concatenate 'string text (string #\Newline) (mvm-text "mvm/mac68k-cold.lisp"))))
-    ;; FLOPPY FILES: the text (init-only), and its LOAD in the core run
+    ;; FLOPPY FILES: fs-fat and the FLOPPY package's functions, native
     (when *mac68k-files-text*
-      (when *mac-init-only* (setf (gethash *mac68k-files-text* *mac-init-only*) t))
-      (setq text (concatenate 'string text (format nil "
-(defun %mac-files-source ()
-  ~A)
-
-(defun %mac-files-install ()
-  (when (eql (mem-ref #x1000602C :u32) 1)
-    (handler-case
-        (progn (%it-eval-source (%mac-files-source) \"floppy\")
-               (write-string-serial \"FLOPPY-FILES\") (write-char-serial 10))
-      (error (c)
-        (write-string-serial \"FLOPPY-FILES-FAILED \")
-        (handler-case (write-string-serial (princ-to-string c)) (error (e) nil))
-        (write-char-serial 10)))))
-" (prin1-to-string *mac68k-files-text*)))))
+      (setq text (concatenate 'string text (string #\Newline) *mac68k-files-text*)))
     ;; THE CORE RUN PROMOTES BY COUNT ALONE: a runtime DEFUN's trampoline also
     ;; goes native after 10 ms interpreted (mvm-eval %JIT-HOT-NS), and under an
     ;; emulator that is the host's timing -- measured, two core runs of one

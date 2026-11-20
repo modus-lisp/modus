@@ -86,6 +86,13 @@
                       (puthash h *cold-names-memo* found))
                     found)))))))))
 
+(defun %static-symbol-tableless-p ()
+  "After the freeze the table is gone ON PURPOSE: every name resolves from the
+   cold pages, and INTERN replaces an occupant only when SYMBOL-NAME says it has
+   none -- so a static-symbol slot may cache (compiler.lisp %STATIC-SYMBOL-FILL;
+   the default, in cl-packages.lisp, is the reason it may not otherwise)."
+  (%cold-names-ready-p))
+
 (defun %cold-names-drop ()
   "At the freeze of the CORE RUN (the SAVE flag, #x1000602C): drop
    *SYM-NAME-TABLE*, whose names the saved core's disk carries cold

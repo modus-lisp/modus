@@ -2039,8 +2039,13 @@
    A form that needs no compiler is APPLIED instead (%EVAL-SIMPLE-P): a call
    of a global function whose arguments are themselves such forms.  The
    compiler is one for every architecture; it need not run for (+ 1 2) --
-   on a Mac Classic that compile was the whole of a REPL form's 13 s."
-  (if (%eval-simple-p form 0)
+   on a Mac Classic that compile was the whole of a REPL form's 13 s.
+   NOT while a fasl record is being made (*FASL-SLOT*: COMPILE-FILE, the load
+   cache): the record is the form's compiled module, and a form applied
+   without one is replayed from its source -- a toplevel (EVAL-WHEN (:EXECUTE)
+   ...), which COMPILE-FILE turns into NIL, then ran its body at LOAD
+   (ansi-test EVAL-WHEN.1)."
+  (if (and (null *fasl-slot*) (%eval-simple-p form 0))
       (%eval-simple form)
       (mvm-eval form)))
 

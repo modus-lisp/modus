@@ -292,6 +292,47 @@
               (aref bytes (+ (* i 4) 2)) (logand (ash w -16) #xFF)
               (aref bytes (+ (* i 4) 3)) (logand (ash w -24) #xFF))))))
 
+;;; THE BRANCH ISLAND.  B / BL reach +-2^23 instructions (+-32 MB), and a CLI
+;;; image's native code outgrew that (main's 33.4 MB built only because its
+;;; far calls happened to fall short; with native68k merged in, 34+ MB did not:
+;;; `BL branch offset -8560931 out of range').  So the translation leaves an
+;;; ISLAND at the first function boundary past +ARM32-ISLAND-AT+ (16 MB): a word
+;;; per function, UDF until used.  A branch that cannot reach its target goes
+;;; to the target's VENEER in the island instead -- one word, B target -- and a
+;;; BL's link register is the caller's, as without it.  No scratch register is
+;;; needed (r12 carries helper arguments).  An island at 16 MB reaches every
+;;; caller and target of an image up to 48 MB; past that, still the error.
+(defconstant +arm32-island-at+ (ash 1 22) "Instructions: 16 MB.")
+(defvar *arm32-island* nil "The island's first instruction index, or NIL.")
+(defvar *arm32-island-cap* 0 "Its words.")
+(defvar *arm32-island-used* 0 "Veneers allocated.")
+(defvar *arm32-island-veneers* nil "Target index -> its veneer's index.")
+
+(defun arm32-maybe-emit-island (buf nfns)
+  "At a function boundary: the island, once, past +ARM32-ISLAND-AT+."
+  (when (and (null *arm32-island*) (>= (arm32-current-index buf) +arm32-island-at+))
+    (setq *arm32-island* (arm32-current-index buf)
+          *arm32-island-cap* (* 4 (ceiling (max nfns 64) 4))
+          *arm32-island-used* 0
+          *arm32-island-veneers* (make-hash-table :test 'eql))
+    (dotimes (i *arm32-island-cap*) (arm32-emit buf #xE7F000F0))))   ; UDF
+
+(defun arm32-island-veneer (code index target)
+  "The veneer for TARGET that the branch at INDEX can reach, or NIL."
+  (when *arm32-island*
+    (let ((v (gethash target *arm32-island-veneers*)))
+      (unless v
+        (when (>= *arm32-island-used* *arm32-island-cap*)
+          (error "ARM32: the branch island's ~D veneers are all used" *arm32-island-cap*))
+        (setq v (+ *arm32-island* *arm32-island-used*))
+        (let ((off (- target v 2)))
+          (unless (<= (- (ash 1 23)) off (1- (ash 1 23)))
+            (return-from arm32-island-veneer nil))
+          (setf (aref code v) (logior #xEA000000 (logand off #xFFFFFF))))  ; B target
+        (incf *arm32-island-used*)
+        (setf (gethash target *arm32-island-veneers*) v))
+      (and (<= (- (ash 1 23)) (- v index 2) (1- (ash 1 23))) v))))
+
 (defun arm32-resolve-fixups (buf)
   "Resolve all branch fixups.  Asserts the signed 24-bit imm fits
    before encoding (±2^23 instructions = ±32 MB).  Without the assert
@@ -312,6 +353,9 @@
                ;; already target - literal - 2 in words, so that is OFFSET - 1.
                (setf (aref code index) (logand (* 4 (- offset 1)) #xFFFFFFFF)))
               ((:b :bl :b-cond)
+               (unless (<= (- (ash 1 23)) offset (1- (ash 1 23)))
+                 (let ((v (arm32-island-veneer code index target)))
+                   (when v (setq offset (- v index 2)))))
                (unless (<= (- (ash 1 23)) offset (1- (ash 1 23)))
                  (error "ARM32 ~A branch offset ~D out of range ~
                          [-2^23, 2^23-1] at index ~D — would silently truncate"
@@ -3567,6 +3611,8 @@
          (*arm32-gc-label* (and (arm32-hosted-layout-p) (mvm-make-label)))
          (*arm32-hstack-push-slow-label* (mvm-make-label))
          (*arm32-hstack-pop-ext-label* (and *arm32-linux-mode* (mvm-make-label)))
+         (*arm32-island* nil) (*arm32-island-cap* 0) (*arm32-island-used* 0)
+         (*arm32-island-veneers* nil)
          (buf (make-arm32-buffer))
          (label-map (make-hash-table :test 'eql))
          (bc bytecode)
@@ -3627,6 +3673,7 @@
       (loop while (< pc len)
             do (progn
                  (when (gethash pc fn-starts)
+                   (arm32-maybe-emit-island buf (length function-table))
                    (loop until (zerop (mod (arm32-current-index buf) 4))
                          do (arm32-emit buf #xE1A00000)))        ; MOV r0, r0
                  ;; Emit label at current PC before translating
@@ -3649,6 +3696,9 @@
 
     ;; Resolve branch fixups
     (arm32-resolve-fixups buf)
+    (when *arm32-island*
+      (format t "~&;; arm32: branch island at +~D MB, ~D of ~D veneers used~%"
+              (floor (* 4 *arm32-island*) (ash 1 20)) *arm32-island-used* *arm32-island-cap*))
     (arm32-unimplemented-report)
 
     ;; Build fn-map: name → resolved native position

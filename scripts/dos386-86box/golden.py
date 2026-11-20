@@ -74,6 +74,18 @@ class Golden:
         wr(0x15, 0x80)
         wr(0x16, 0x02)
         wr(0x0E, 0x00)
+        # Extended memory (KB above 1 MB), in both the checksummed copy
+        # (17h-18h) and POST's own (30h-31h).  An AMI BIOS of 1993 compares it
+        # with what POST counts and stops at "CMOS memory size mismatch" on
+        # every boot, its own setup's save not updating it.
+        cfg = open(os.path.join(self.vm, '86box.cfg')).read()
+        mm = re.search(r'^mem_size\s*=\s*(\d+)', cfg, re.M)
+        if mm:
+            ext = min(int(mm.group(1)) - 1024, 0xFFFF)
+            wr(0x17, ext & 0xFF)
+            wr(0x18, ext >> 8)
+            wr(0x30, ext & 0xFF)
+            wr(0x31, ext >> 8)
         # Drive C: as type 47 (user-defined) with the disk's own geometry, in
         # the AMI / Award layout: BIOSes without auto-detection (AMI 1990)
         # keep it, the rest replace it with what they detect.
@@ -90,6 +102,26 @@ class Golden:
         wr(0x2E, s >> 8 & 0xFF)
         wr(0x2F, s & 0xFF)
         b('release')
+
+    def fix_ext_memory(self):
+        """CMOS 17h-18h := 30h-31h (extended memory as POST counted it), and
+        the 10h-2Dh checksum again."""
+        b = self.b
+
+        def rd(r):
+            b('iow 0x70 1 %d' % r)
+            return b('ior 0x71 1')['values'][0]
+
+        def wr(r, v):
+            b('iow 0x70 1 %d' % r)
+            b('iow 0x71 1 %d' % v)
+
+        wr(0x17, rd(0x30))
+        wr(0x18, rd(0x31))
+        s = sum(rd(r) for r in range(0x10, 0x2E))
+        wr(0x2E, s >> 8 & 0xFF)
+        wr(0x2F, s & 0xFF)
+        self.done.append('ext-memory')
 
     # --- POST -------------------------------------------------------------
 
@@ -143,6 +175,10 @@ class Golden:
             return 'acer'
         if 'Alt+H' in t and 'Optimal' in t:
             return 'winbios'
+        if 'System Setup Utility' in t and 'Fixed Disk Setup' in t:
+            return 'phoenix4'
+        if 'Phoenix SETUP Utility' in t:
+            return 'phoenix92'
         if re.search(r'F10\s*:?\s*(Save|Exit)|Save\s*&\s*Exit|Exit Saving Changes|Save Values', t, re.I):
             return 'generic'
         return None
@@ -217,6 +253,45 @@ class Golden:
         b.keys('enter', gap=800)
         self.snap('save prompt')
         self.answer_yes()
+        self.done.append('saved')
+
+    def phoenix4(self):
+        """PhoenixBIOS 4.0's "System Setup Utility" (TriGem's of 1994): a Main
+        Menu of pages.  Fixed Disk Setup > Fixed Disk 0 Control > Autotype, then
+        F10 and its [Yes].  No ROM defaults: they turn on a drive B: the
+        machine does not have, and POST stops on it."""
+        b = self.b
+        if b.goto(r'Fixed Disk Setup'):
+            b.keys('enter', gap=1500)
+            if b.goto(r'Fixed Disk 0 Control'):
+                b.keys('enter', gap=1500)
+                # the page opens on its first field, Autotype (the highlight
+                # is the field's value, "[Press Enter]", not its label)
+                b.keys('enter', gap=3000)
+                s = self.snap('autotype')
+                if not s.search(r'Type:\s*\[None\]'):
+                    self.done.append('detect')
+                b.keys('esc', gap=1000)
+            b.keys('esc', gap=1000)
+        b.keys('f10', gap=1000)
+        self.snap('save prompt')
+        # [Yes]  [No]: "Space Select, Enter Accept" -- Enter alone accepts
+        # nothing selected and stays in setup
+        b.goto(r'Yes')
+        b.keys('space', gap=500)
+        b.keys('enter', gap=1000)
+        self.done.append('saved')
+
+    def phoenix92(self):
+        """Phoenix SETUP Utility 1.00 (1992; Packard Bell's ACC 2168 boards):
+        two pages of fields, Esc for the exit menu, F4 there saves and
+        reboots.  Hard Disk 1 is Auto-Type: it is typed at POST once the
+        values are saved (an unsaved CMOS is "Invalid configuration" and boots
+        no disk)."""
+        b = self.b
+        b.keys('esc', gap=1000)
+        self.snap('exit menu')
+        b.keys('f4', gap=1500)
         self.done.append('saved')
 
     def winbios(self):
@@ -327,10 +402,23 @@ class Golden:
             getattr(self, fam)()
             ok = None
             for _ in range(4):
-                ok = b.wait_screen(lambda s: s.ok and (DOS_UP.search(s.text()) or continue_key(s)), 180000, 1000)
+                # a POST prompt counts only while the boot has not gone past it:
+                # it stays on the screen above DOS's own output (TriGem's
+                # "Diskette drive B error ... <F1> to resume")
+                ok = b.wait_screen(lambda s: s.ok and (DOS_UP.search(s.text()) or
+                                                       (continue_key(s) and not re.search(r'FreeDOS|MODUS:', s.text()))),
+                                   300000, 1000)
                 if not ok or DOS_UP.search(ok.text()):
                     break
-                self.log('POST: ' + continue_key(ok))
+                self.snap('POST stops: ' + continue_key(ok))
+                if 'CMOS memory size mismatch' in ok.text():
+                    # The 1993 AMI (ALi M1429) counts its relocated 256 KB at
+                    # POST (30h-31h) and leaves it out when its own setup saves
+                    # 17h-18h, so it stops on every boot.  Make the checksummed
+                    # copy what POST counts, and boot again.
+                    self.fix_ext_memory()
+                    b.combo('ctrl', 'alt', 'del', gap=3000)
+                    continue
                 b.keys(continue_key(ok), gap=2000)
             res['stage'] = 'no-dos' if not ok else 'dos' if 'MODUS: starting' in ok.text() else 'modus-refused'
         res['done'] = self.done

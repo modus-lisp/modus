@@ -1974,6 +1974,19 @@
   ;; 13 bytes, from mvm/x64-kernels/cpuid.s (scripts/x64-kernels.sh)
   #(#x53 #xB8 #x01 #x00 #x00 #x00 #x31 #xC9 #x0F #xA2 #x89 #xC8 #x5B))
 
+;;; The fault record's collection words and exit codes (EMIT-FAULT-REPORT, far
+;;; below, says what they are), defined before TRANSLATE-INSTRUCTION uses them:
+;;; a baked file must define a constant before its first use (build-checks
+;;; CHECK K), or the image's own compiler reads it as an unbound global.
+(defconstant +fault-rec-gc-addr+ #x10005628)
+(defconstant +fault-rec-gc-test-addr+ #x10005630)
+(defconstant +fault-in-gc-exit-code+ 71
+  "exit_group code of a fault inside a collection.")
+(defconstant +uncaught-fault-exit-code+ 70
+  "exit_group code of a fault with no handler armed on the faulting thread
+   (hosted threaded images: they say what and where first).  Not 139, which
+   a shell cannot tell from the kernel's own SIGSEGV kill.")
+
 (defun translate-instruction (state opcode operands mvm-next-pos)
   "Translate a single MVM instruction into x86-64 code.
    OPCODE is the numeric MVM opcode.
@@ -8311,14 +8324,8 @@
 ;;; operandi-on-modus protocol (X64-STW-P), which is never emitted, so it
 ;;; covered neither.  +0x5630 is a test-only knob: non-zero makes this
 ;;; thread's next collection read address 8 (test/fault-in-gc.lisp).
-(defconstant +fault-rec-gc-addr+ #x10005628)
-(defconstant +fault-rec-gc-test-addr+ #x10005630)
-(defconstant +fault-in-gc-exit-code+ 71
-  "exit_group code of a fault inside a collection.")
-(defconstant +uncaught-fault-exit-code+ 70
-  "exit_group code of a fault with no handler armed on the faulting thread
-   (hosted threaded images: they say what and where first).  Not 139, which
-   a shell cannot tell from the kernel's own SIGSEGV kill.")
+;;; (+FAULT-REC-GC-ADDR+ and its kin: before TRANSLATE-INSTRUCTION, which
+;;; uses them -- build-checks CHECK K.)
 
 (defun emit-fault-report (buf where suffix exit-code)
   "Write one line about THIS thread's recorded fault (+FAULT-REC-CODE-ADDR+

@@ -111,9 +111,12 @@
 (defparameter *fixed-address-maps*
   '(:x64-hosted :x64-bare :a64-hosted :a64-bare :rv64-hosted :rv32-hosted :rv-bare
     :ppc-hosted :ppc-bare :i386-hosted :i386-bare :arm32-hosted :arm32-bare
-    :68k-hosted :68k-bare :web)
+    :68k-hosted :68k-bare :68k-mac :web)
   "Every image memory map the registry knows.  :WEB is the browser image
-   (mvm/build-web.lisp), whose linear memory mirrors the low block.")
+   (mvm/build-web.lisp), whose linear memory mirrors the low block.  :68K-MAC
+   is the bare Macintosh (boot/boot-mac68k.lisp): the hosted 68k low block,
+   relocated into the Mac's RAM by CONV-REAL, with no Linux argv to stage --
+   its argv area holds the ROM serial drivers' parameter blocks.")
 
 (defparameter *fixed-address-groups*
   '((:all          . :all)
@@ -122,7 +125,7 @@
     (:bare         :x64-bare :a64-bare :rv-bare :ppc-bare :i386-bare :arm32-bare :68k-bare)
     ;; Every map whose convention block is RAM at #x10000000 (see THE MODEL).
     (:low-block    :x64-hosted :x64-bare :a64-hosted :a64-bare :rv64-hosted :rv32-hosted
-                   :ppc-hosted :i386-hosted :i386-bare :arm32-hosted :68k-hosted :68k-bare :web)
+                   :ppc-hosted :i386-hosted :i386-bare :arm32-hosted :68k-hosted :68k-bare :68k-mac :web)
     ;; The two back ends with native threads and a per-thread window.
     (:threads      :x64-hosted :a64-hosted)
     (:x64          :x64-hosted :x64-bare)
@@ -1311,7 +1314,7 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
                "MODUS-INT::+LINUX-RISCV32-ARGV-ARENA+" "MODUS-INT::+LINUX-68K-ARGV-ARENA+")
    :doc "The staged argv/envp strings, to #x1001E000."))
 
-(define-fixed-words (:images (:68k-hosted :68k-bare) :owner "mvm/translate-68k.lisp")
+(define-fixed-words (:images (:68k-hosted :68k-bare :68k-mac) :owner "mvm/translate-68k.lisp")
   (:68k-hstack-ext       #x10005600 8 :images (:68k-hosted)
    :constants ("MODUS-INT::+68K-HSTACK-EXT-ADDR+") :doc "Handler-frame extension address.")
   (:68k-hstack-ext-limit #x10005608 8 :images (:68k-hosted)
@@ -1330,6 +1333,25 @@ mvm/fixed-address-allowlist.lisp: it may only shrink.~%"
    :doc "MODUS_68K_PROFILE builds only: a longword per function (~8K functions).")
   (:68k-card-crossing    #x1001E000 #x2000 :kind :range :constants ("MODUS-INT::+68K-CARD-CROSSING+")
    :doc "One byte per static card: its first object start.  The 8 KB below the heap."))
+
+;;; The bare Mac (MODUS_MAC68K_MACHINE=...; boot/boot-mac68k.lisp): its words
+;;; after the static block's, and the serial / console blocks in the argv area.
+(define-fixed-words (:images (:68k-mac)
+                     :owner "boot/boot-mac68k.lisp, mvm/translate-68k.lisp, mvm/mac68k-cold.lisp, mvm/build-cl-repl-common.lisp")
+  (:mac68k-static-words #x1000602C #x5C :kind :range
+   :doc "+2C the SAVE flag (the core run); +30 a core boot; +34/+38/+3C the paged
+   code cache's pointer, end and start; +40 its owner map; +44/+48 the cold
+   names' disk byte and index; +4C the cold functions' disk byte; +50 the Mac OS
+   file's refNum (an application launch); +54 the Mac OS host table; +58/+5C the
+   application's heap slot (semispace, kind map); +60/+64 its code area (the
+   core run's too, :BOOT-JIT-AREA); +68 the cold floor; +6C the JIT's top; +70
+   the relocation delta; +74 the kind-map move; +78 cold tables in RAM; +80/+84
+   the old space's collection marks.")
+  (:mac68k-serial-blocks #x10009000 #x300 :kind :range
+   :doc "+000 .AOut's parameter block, +080 .AIn's, +100 the byte out, +102 the
+   byte in, +10C the dead-port flag, +110 an EventRecord (GetOSEvent), +21C the
+   screen console's off switch (translate-68k +68K-MAC-CONSOLE-CODE+,
+   mac/mac-console.lisp)."))
 
 (define-fixed-words (:images (:i386-hosted) :owner "mvm/translate-i386.lisp")
   (:i386-gcdbg        #x1001E000 #x20 :doc "*I386-GCDBG-BASE*: *I386-GC-INSTRUMENT* counters (32 bytes).")

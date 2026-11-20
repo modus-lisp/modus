@@ -625,7 +625,7 @@
               (%gc-region-init rcb2 *ha-r1-from* *ha-r1-to* *ha-rsize*
                                (%gc-meta-read (+ r0 #x18) (%gc-meta-scale))
                                (%gc-meta-scale))
-              (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+              (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* (%ha-rsize 1)
                                (+ *ha-t2-stack* *ha-t2-stack-size*)
                                (%gc-meta-scale))
               (%gc-write64 (+ tb #xC0) rcb3)
@@ -989,7 +989,7 @@
 ;;; idle scheduler, ACTOR-EXIT) already read it.  Nothing had ever written a
 ;;; non-zero value into it in a running system.  This does.
 
-(defun %ha-give-region (id rcb from to)
+(defun %ha-give-region (id rcb from to &optional (size *ha-rsize*))
   "Make RCB the region of actor ID: semispaces [FROM,+*HA-RSIZE*) and
    [TO,+*HA-RSIZE*), and the pointer written into the actor struct at +0x68 in
    net/actors.lisp's convention — the STORED MACHINE WORD is the address, hence
@@ -1002,7 +1002,7 @@
    unmapped address space.  With a region per actor the RUNNING window is
    [live RBP, this actor's stack top) and the PARKED window is [the SP the
    switch recorded, that same top): both lie inside one 64 KB stack."
-  (%gc-region-init rcb from to *ha-rsize* (actor-stack-top id) (%gc-meta-scale))
+  (%gc-region-init rcb from to size (actor-stack-top id) (%gc-meta-scale))
   (actor-set id #x68 (untag rcb))
   rcb)
 
@@ -1038,7 +1038,7 @@
         (setq idb (actor-spawn (%ha-entry-b)))
         ;; ---- THE WRITE THAT MAKES AN ACTOR OWN A REGION ----
         (%ha-give-region ida rcb2 *ha-r1-from* *ha-r1-to*)
-        (%ha-give-region idb rcb3 *ha-r2-from* *ha-r2-to*)
+        (%ha-give-region idb rcb3 *ha-r2-from* *ha-r2-to* (%ha-rsize 1))
         (%gc-write64 res nmsg)
         (%gc-write64 (+ res #x08) nlinks)
         (%gc-write64 (+ res #x10) ida)
@@ -1129,8 +1129,8 @@
         ;; Zero in both directions across BOTH semispaces of the other region,
         ;; and zero out of each into region 0's live space.
         (%gc-write64 (+ res #x128)
-                     (+ (%gc-count-foreign-refs f2 a2 f3 *ha-rsize*)
-                        (%gc-count-foreign-refs f2 a2 t3 *ha-rsize*)))
+                     (+ (%gc-count-foreign-refs f2 a2 f3 (%ha-rsize 1))
+                        (%gc-count-foreign-refs f2 a2 t3 (%ha-rsize 1))))
         (%gc-write64 (+ res #x130)
                      (+ (%gc-count-foreign-refs f3 a3 f2 *ha-rsize*)
                         (%gc-count-foreign-refs f3 a3 t2 *ha-rsize*)))
@@ -1146,7 +1146,7 @@
         (%gc-write64 (+ res #x140)
                      (%gc-count-foreign-refs ctl-lo ctl-hi f2 *ha-rsize*))
         (%gc-write64 (+ res #x148)
-                     (%gc-count-foreign-refs ctl-lo ctl-hi f3 *ha-rsize*))
+                     (%gc-count-foreign-refs ctl-lo ctl-hi f3 (%ha-rsize 1)))
         ;; POSITIVE CONTROL 2, REAL.  Actor 2's PARKED WINDOW — the span the
         ;; collector actually scanned — must hold at least one live pointer into
         ;; region 2's current from-space, since that is where its chain is.
@@ -1157,7 +1157,7 @@
         (%gc-write64 (+ res #x158)
                      (%gc-count-foreign-refs
                       (%gc-read64 (+ (actor-struct-addr idb) #x08))
-                      (actor-stack-top idb) f3 *ha-rsize*))
+                      (actor-stack-top idb) f3 (%ha-rsize 1)))
         ;; ================= STATE, READ BACK =================
         (%gc-write64 (+ res #x160) (%gc-read64 (+ (actor-struct-addr ida) #x08)))
         (%gc-write64 (+ res #x168) (actor-stack-top ida))
@@ -1650,7 +1650,7 @@
               ;; the running actor's live frames exactly, and the parked one's
               ;; frames plus some dead stack, which is conservative RETENTION,
               ;; never corruption (the object-start bitmap rejects the rest).
-              (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+              (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* (%ha-rsize 1)
                                (+ (actor-stack-base) #x40000) k)
               ;; ---- THREAD 1's REGION (step 5 only; step 4 stays in region 0) ----
               (if (> nlinks 0)
@@ -1768,10 +1768,10 @@
               (%gc-write64 (+ res #x190)
                            (+ (%gc-count-foreign-refs
                                (%gc-meta-read tref k) (%gc-meta-read (+ tref #x30) k)
-                               (%gc-meta-read rcb3 k) *ha-rsize*)
+                               (%gc-meta-read rcb3 k) (%ha-rsize 1))
                               (%gc-count-foreign-refs
                                (%gc-meta-read tref k) (%gc-meta-read (+ tref #x30) k)
-                               (%gc-meta-read (+ rcb3 #x08) k) *ha-rsize*)))
+                               (%gc-meta-read (+ rcb3 #x08) k) (%ha-rsize 1))))
               ;; POSITIVE CONTROL, EXACT: a zeroed 8-word window holding exactly
               ;; ONE cons-tagged pointer into thread 2's from-space must count 1.
               ;; An oracle that can only answer zero is worth nothing.
@@ -1780,7 +1780,7 @@
               (%gc-write64 (+ res #x198)
                            (%gc-count-foreign-refs ctl (+ ctl #x40)
                                                    (%gc-meta-read rcb3 k)
-                                                   *ha-rsize*))
+                                                   (%ha-rsize 1)))
               (%gc-write64 (+ res #x1A0)
                            (%gc-count-foreign-refs ctl (+ ctl #x40)
                                                    (%gc-meta-read tref k)

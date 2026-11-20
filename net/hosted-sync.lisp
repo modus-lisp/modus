@@ -323,7 +323,7 @@
           (if (and (< cpu (%ha-nregions)) (not (zerop (%thr-threads-can-cons-p))))
               (progn (%gc-write64 (+ b #x5040) (%ha-region-from cpu))
                      (%gc-write64 (+ b #x5048) (%ha-region-to cpu))
-                     (%gc-write64 (+ b #x5050) *ha-rsize*))
+                     (%gc-write64 (+ b #x5050) (%ha-rsize cpu)))
               (progn (%gc-write64 (+ b #x5040) 0)
                      (%gc-write64 (+ b #x5048) 0)
                      (%gc-write64 (+ b #x5050) 0)))
@@ -1248,7 +1248,7 @@
                     ;; Thread 2's region.  STACK_BASE is the top of the actor
                     ;; stack slice its actors live on, for the reason
                     ;; %HA-MT-SELFTEST gives: that is where its live roots are.
-                    (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+                    (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* (%ha-rsize 1)
                                      (+ (actor-stack-base) #x40000) k)
                     (%gc-write64 (+ tb #x4D0) rcb3)
                     (%ha-set-percpu-mode 1)
@@ -2275,7 +2275,7 @@ Stopping.
                                            *ha-rsize*
                                            (%gc-meta-read (+ r0 #x18) k) k)
                           (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to*
-                                           *ha-rsize*
+                                           (%ha-rsize 1)
                                            (+ *ha-t2-stack* *ha-t2-stack-size*)
                                            k)
                           (%gc-write64 (+ (%ha-thread-block) #x4D0) rcb3)
@@ -2574,7 +2574,7 @@ Stopping.
                       (%gc-write64 (+ (%ha-thread-block) #x340) k)
                       (%gc-region-init rcb2 *ha-r1-from* *ha-r1-to* *ha-rsize*
                                        (%gc-meta-read (+ r0 #x18) k) k)
-                      (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* *ha-rsize*
+                      (%gc-region-init rcb3 *ha-r2-from* *ha-r2-to* (%ha-rsize 1)
                                        (+ *ha-t2-stack* *ha-t2-stack-size*) k)
                       (%gc-write64 (+ (%ha-thread-block) #x4D0) rcb3)
                       (%ha-set-percpu-mode 1)
@@ -2760,10 +2760,10 @@ Stopping.
         ;; (%THR-CLEAR-REGION-BITS-X64).  Measured on x86-64: the 5th thread
         ;; through one slot died TYPE-ERROR in test/hosted-slot-reuse.lisp.
         (%layout-if :a64-threads
-          (progn (%ha-bitmap-clear from (+ from *ha-rsize*))
-                 (%ha-bitmap-clear to (+ to *ha-rsize*)))
-          (%thr-clear-region-bits-x64 from to *ha-rsize*))
-        (%gc-region-init rcb from to *ha-rsize* stack-top k)
+          (progn (%ha-bitmap-clear from (+ from (%ha-rsize slot)))
+                 (%ha-bitmap-clear to (+ to (%ha-rsize slot))))
+          (%thr-clear-region-bits-x64 from to (%ha-rsize slot)))
+        (%gc-region-init rcb from to (%ha-rsize slot) stack-top k)
         rcb)))
 
 (defun %thr-clear-region-bits-x64 (from to size)
@@ -2997,16 +2997,43 @@ Stopping.
 (defun %thr-trampoline-entry ()
   (- (%gc-word-of (fn-addr %thr-trampoline) (%thr-scratch-word)) 3))
 
+(defvar *%thread-heap-want* nil
+  "Bytes of heap the thread being started asked for (SB-THREAD:MAKE-THREAD :HEAP-BYTES), or NIL.
+   Bound by MAKE-THREAD around %MAKE-NATIVE-THREAD; read by %THR-FREE-SLOT.")
+
 (defun %thr-free-slot ()
-  "The lowest slot that has never been used or whose thread has exited.  Slot
-   0 is the MAIN thread's — it has a window and a per-CPU block of its own
-   identity and is not startable — so slots run from 1."
-  (let ((i 1) (r -1))
-    (loop
-      (when (>= i (%thr-max-threads)) (return 0))
-      (when (zerop (%gc-read64 (+ (%thr-rec i) #x00)))
-        (progn (setq r i) (return 0)))
-      (setq i (+ i 1)))
+  "A slot that has never been used or whose thread has exited.  Slot 0 is the
+   MAIN thread's — it has a window and a per-CPU block of its own identity and
+   is not startable — so slots run from 1.
+
+   BY SIZE, when the regions have different sizes (*THREAD-HEAP-SIZES*): the
+   free slot with the SMALLEST region of at least the bytes asked for
+   (*%THREAD-HEAP-WANT*, else the default size), lowest first among equals; if
+   no free region is that big, the biggest free one; a slot past the last
+   region only when no slot with a region is free.  With one size for every
+   region this is the lowest free slot, as it always was."
+  (let ((i 1) (r -1) (best -1) (bsize 0) (big -1) (gsize -1) (bare -1)
+        (want (let ((w (and (boundp '*%thread-heap-want*) *%thread-heap-want*)))
+                (if (and (integerp w) (> w 0)) w *ha-default-rsize*)))
+        (nreg (%ha-nregions)))
+    (if (not (%ha-layout-p))
+        (loop
+          (when (>= i (%thr-max-threads)) (return 0))
+          (when (zerop (%gc-read64 (+ (%thr-rec i) #x00)))
+            (progn (setq r i) (return 0)))
+          (setq i (+ i 1)))
+        (progn
+          (loop
+            (when (>= i (%thr-max-threads)) (return 0))
+            (when (zerop (%gc-read64 (+ (%thr-rec i) #x00)))
+              (if (>= i nreg)
+                  (when (< bare 0) (setq bare i))
+                  (let ((sz (%ha-rsize i)))
+                    (when (and (>= sz want) (or (< best 0) (< sz bsize)))
+                      (setq best i) (setq bsize sz))
+                    (when (> sz gsize) (setq big i) (setq gsize sz)))))
+            (setq i (+ i 1)))
+          (setq r (cond ((>= best 0) best) ((>= big 0) big) (t bare)))))
     r))
 
 (defun %make-native-thread (fn)
@@ -3376,10 +3403,10 @@ Stopping.
               0
               (let ((b (%ha-rcb (+ j 1))))
                 (setq tot (+ tot (%gc-count-foreign-refs
-                                  alo ahi (%gc-meta-read b k) *ha-rsize*)))
+                                  alo ahi (%gc-meta-read b k) (%ha-rsize (+ j 1)))))
                 (setq tot (+ tot (%gc-count-foreign-refs
                                   alo ahi (%gc-meta-read (+ b #x08) k)
-                                  *ha-rsize*)))))
+                                  (%ha-rsize (+ j 1)))))))
           (setq j (+ j 1))))
       (setq i (+ i 1)))
     tot))
@@ -3519,11 +3546,11 @@ Stopping.
                   (%gc-write64 (+ res #x60)
                                (%gc-count-foreign-refs ctl (+ ctl #x40)
                                                        (%gc-meta-read (%ha-rcb 1) k)
-                                                       *ha-rsize*))
+                                                       (%ha-rsize 1)))
                   (%gc-write64 (+ res #x68)
                                (%gc-count-foreign-refs ctl (+ ctl #x40)
                                                        (%gc-meta-read (%ha-rcb 2) k)
-                                                       *ha-rsize*)))
+                                                       (%ha-rsize 2))))
                 ;; ---- snapshot every worker's heap and block ----
                 (%thr-nr-snapshot res n k 0)
                 ;; ---- THE DRIVER COLLECTS ITS OWN REGION, TWICE ----

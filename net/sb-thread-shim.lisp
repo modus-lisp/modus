@@ -203,12 +203,18 @@
   `(progn (%rt-enter-sized ,bytes)
           (unwind-protect (progn ,@body) (%rt-leave))))
 
-(defun sb-thread::make-thread (function &key name arguments ephemeral)
+(defun sb-thread::make-thread (function &key name arguments ephemeral heap-bytes)
   "Start an OS thread running FUNCTION and return a THREAD object.
 
    ARGUMENTS is applied to FUNCTION, exactly as SBCL does it.
    NAME is carried on the object and is otherwise decoration; modus does not
    name threads to the kernel.
+
+   :HEAP-BYTES N (modus) asks for a heap of at least N bytes: the thread gets
+   the free slot with the smallest region that big, when the regions have
+   different sizes (*THREAD-HEAP-SIZES* / MODUS_THREAD_HEAPS, net/hosted-actors.lisp).
+   With one size for every region it changes nothing.  SBCL has no such
+   argument: portable code passes it under #+modus.
 
    PARTIAL — :EPHEMERAL is accepted and IGNORED.  In SBCL it marks a thread the
    image need not wait for at save time; modus does not save images and has no
@@ -259,15 +265,23 @@
              (body (if worker
                        (%sb-locked (256) (lambda () (%sb-thread-body thread box function arguments)))
                        (lambda () (%sb-thread-body thread box function arguments streams))))
-             (slot (%make-native-thread body)))
-        dummy
+             ;; WITH REGIONS OF DIFFERENT SIZES, RECLAIM FIRST.  %THR-FREE-SLOT
+             ;; answers a bigger region, or a slot with none, before it answers
+             ;; "full", so the retry below never ran: a player that starts a
+             ;; decoder per track and never joins the last one walked its
+             ;; decoders up the table, 16 MB slot by 16 MB slot, onto the 64 MB
+             ;; ones and then past the last region.  Main only: the reap writes
+             ;; the registry, a global.
+             (reaped (and (not worker) (%ha-layout-p) (%sb-reap-exited-threads)))
+             (slot (let ((*%thread-heap-want* heap-bytes)) (%make-native-thread body))))
+        dummy reaped
         ;; A FULL TABLE MAY BE FULL OF THE DEAD.  SBCL does not require a
         ;; thread to be joined, and bordeaux-threads' genera backend never
         ;; joins natively (it waits for PROCESS-ACTIVE-P to go false), so
         ;; every thread it started held its slot forever and the sixteenth
         ;; MAKE-THREAD of a program failed.  Reclaim exited threads, retry once.
         (when (and (= slot -1) (> (%sb-reap-exited-threads) 0))
-          (setq slot (%make-native-thread body)))
+          (setq slot (let ((*%thread-heap-want* heap-bytes)) (%make-native-thread body))))
         (if (< slot 0)
             (error "sb-thread:make-thread: no thread could be started (code ~D). ~
                     -1 = all 15 thread slots are in use, -2 = the thread page ~

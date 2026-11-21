@@ -15,6 +15,11 @@
 # VM_FWD gives the guest a NIC (QEMU user networking, an e1000e) with these
 # host forwards, e.g. VM_FWD=tcp::5933-:5910 for a server in the guest on port
 # 5910 that the host reaches at localhost:5933.  Default: no network at all.
+# VM_UI=1 names the command file UI.CMD instead of RUN.CMD: on a disk made by
+# vm-ui-setup.sh it runs at the Administrator's (automatic) logon, in the desktop
+# session, so a program's windows are on the guest's screen.  VM_DURING is a host
+# command run while the guest is up, with QMP set to its QMP socket (screenshots,
+# input); the guest still powers off when its command file ends.
 # VM_WORK keeps the work directory (default: a temporary one, removed);
 # VM_RUN_TIMEOUT bounds the whole boot-run-shutdown (default 1200 s).  While it
 # runs, test/win64/vm-screen.py WORK/vm.qmp OUT.png shows the screen.
@@ -32,7 +37,8 @@ rm -rf "$stage" "$work/out"; mkdir -p "$stage" "$work/out"
 # ---- the cases, as files for the guest -----------------------------------
 WDIR="D:"                     # the FAT disk's letter in the guest (checked below)
 n=0; : > "$work/manifest"
-emit() { printf '%s\r\n' "$1" >> "$stage/RUN.CMD"; }
+cmdfile=RUN.CMD; [ -n "${VM_UI:-}" ] && cmdfile=UI.CMD
+emit() { printf '%s\r\n' "$1" >> "$stage/$cmdfile"; }
 next() { n=$((n+1)); id=$(printf 'c%02d' $n); }
 check() {
   next; printf '%s\n' "$2" > "$stage/$id.in"
@@ -46,7 +52,7 @@ script() {
 }
 put() { printf '%s\n' "$2" > "$stage/$1"; }
 
-: > "$stage/RUN.CMD"
+: > "$stage/$cmdfile"
 emit "@echo off"
 emit "echo %~d0> DRIVE.TXT"
 emit "ver > VER.TXT"
@@ -77,9 +83,14 @@ mcopy -i "$part" "$stage"/* :: || exit 1
 # ---- boot a throwaway overlay of the installed disk -----------------------
 qemu-img create -q -f qcow2 -b "$base" -F qcow2 "$work/run.qcow2" || exit 1
 net="-nic none"
+tablet=""; [ -n "${VM_UI:-}" ] && tablet="-device qemu-xhci -device usb-tablet"   # absolute pointer for QMP input
 [ -n "${VM_FWD:-}" ] && net="-nic user,model=e1000e,hostfwd=$VM_FWD"
 echo "booting $(basename "$base") with $n cases (typically 2-5 minutes)"
 t0=$(date +%s)
+if [ -n "${VM_DURING:-}" ]; then
+  ( for i in $(seq 1 60); do [ -S "$work/vm.qmp" ] && break; sleep 1; done
+    QMP="$work/vm.qmp" sh -c "$VM_DURING" ) > "$work/during.log" 2>&1 &
+fi
 timeout ${VM_RUN_TIMEOUT:-1200} qemu-system-x86_64 \
   -enable-kvm -machine q35 -cpu host -smp 4 -m 4096 \
   -drive file="$work/run.qcow2",if=none,id=hd,format=qcow2 \
@@ -87,10 +98,12 @@ timeout ${VM_RUN_TIMEOUT:-1200} qemu-system-x86_64 \
   -device ahci,id=ahci \
   -device ide-hd,drive=hd,bus=ahci.0 \
   -device ide-hd,drive=data,bus=ahci.1 \
-  $net -display none -vga std \
+  $net $tablet -display none -vga std \
   -qmp unix:"$work/vm.qmp",server=on,wait=off
 rc=$?
 echo "guest ran $(( $(date +%s) - t0 )) s (qemu exit $rc)"
+wait
+[ -s "$work/during.log" ] && { echo "--- VM_DURING:"; cat "$work/during.log"; }
 mcopy -n -i "$part" '::*' "$work/out/" 2>/dev/null
 
 # ---- judge -----------------------------------------------------------------

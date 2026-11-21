@@ -2932,6 +2932,13 @@
           (with-open-file (o f :direction :output :if-exists :supersede)
             (dolist (n removed) (write-line n o))))))))
 
+;;; Text a build adds to *ALL-RUNTIME-SOURCE* for its NAMES only (that variable is
+;;; scanned, never compiled), because the build appends the code itself to
+;;; *FULL-SOURCE* later -- the Windows image's net/win32-window.lisp, whose functions
+;;; must be callable by name (glass's native presenter finds them with FIND-SYMBOL).
+;;; "" everywhere else, so every other build's scanner input is unchanged.
+(defvar *cli-scan-extra-source* "")
+
 (defvar *all-runtime-source*
   (concatenate 'string *prelude-source*  (string #\Newline)
                        *configuration-source* (string #\Newline)
@@ -2984,6 +2991,7 @@
                        ;; SYM-NAME-AUTO — is byte-identical.
                        *cli-bare-metal-net-source*
                        (%extra-source-text)
+                       *cli-scan-extra-source*
                        *driver-source*))
 
 ;;; NOTE: *genera-source* is deliberately NOT part of *all-runtime-source*.

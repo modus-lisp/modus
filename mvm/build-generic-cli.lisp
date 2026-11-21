@@ -184,6 +184,15 @@
         (concatenate 'string *cli-arch-override-source*
                      (string #\Newline) "(defun %narrow-strings-p () t)" (string #\Newline))))
 
+;; Windows: net/win32-window.lisp is appended to the image by WIN64-CONFIGURE-BUILD
+;; (it needs boot-win64's constants); its names go to the scanners here.
+(defvar *cli-scan-extra-source* "")
+(when cl-user::*cli-win64*
+  (setq *cli-scan-extra-source*
+        (with-open-file (s (merge-pathnames "../net/win32-window.lisp"
+                                            (directory-namestring (truename *load-truename*))))
+          (let ((b (make-string (file-length s))))
+            (subseq b 0 (read-sequence b s))))))
 (load (merge-pathnames "build-cli-common.lisp"
                        (directory-namestring (truename *load-truename*))))
 

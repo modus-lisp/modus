@@ -76,7 +76,8 @@
      "CreateDirectoryA" "RemoveDirectoryA" "GetCurrentDirectoryA"
      "TlsAlloc" "CreateThread" "ResumeThread" "ExitThread" "GetCurrentThreadId"
      "SwitchToThread" "AddVectoredExceptionHandler" "GetProcessTimes"
-     "GetThreadTimes" "GetSystemTimePreciseAsFileTime")
+     "GetThreadTimes" "GetSystemTimePreciseAsFileTime" "GetModuleHandleA"
+     "LoadLibraryA" "GetProcAddress")
     ("KERNELBASE.dll"
      "WaitOnAddress" "WakeByAddressSingle" "WakeByAddressAll")
     ("WS2_32.dll"
@@ -137,6 +138,14 @@
 
 (defconstant +win64-call-base+ #x1000
   "Syscall numbers from here call an import directly: #x1000 + its IAT slot.")
+(defconstant +win64-callv-base+ #x2000
+  "Syscall numbers from here call an import with its arguments in memory: #x2000 +
+   its IAT slot, RDI the address of the arguments (qwords), RSI how many (<= 20).")
+(defconstant +win64-callp+ #x3000
+  "Syscall #x3000 calls the function at RDI with RDX arguments from the qwords at
+   RSI (<= 20): a function the runtime looked up itself (GetProcAddress) -- USER32
+   and GDI32 are loaded only by a program that opens a window
+   (net/win32-window.lisp), so a console modus.exe never maps them.")
 
 ;;; ============================================================
 ;;; A tiny two-pass assembler for the stub.  Jumps and calls are relative to
@@ -477,6 +486,10 @@
       ;; #x1000 + slot: call that import with the Linux argument registers in
       ;; Win64 order (rcx rdx r8 r9 [rsp+20] [rsp+28], and 0 as a seventh), and
       ;; return its RAX as it is.  The Windows runtime makes its own sense of it.
+      (:bytes #x48 #x3D ,@(w64-le32 +win64-callp+))           ; cmp rax,#x3000
+      (:jcc 4 :h-callp)                                       ; je
+      (:bytes #x48 #x3D ,@(w64-le32 +win64-callv-base+))      ; cmp rax,#x2000
+      (:jcc 3 :h-callv)                                       ; jae
       (:bytes #x48 #x3D ,@(w64-le32 +win64-call-base+))       ; cmp rax,#x1000
       (:jcc 2 :h-enosys)                                      ; jb
       (:bytes #x48 #x3D ,@(w64-le32 (+ +win64-call-base+ (win64-iat-slots)))) ; cmp rax,end
@@ -493,6 +506,43 @@
       (:bytes #x4C #x89 #x54 #x24 #x28)            ; mov [rsp+0x28],r10
       (:bytes #x48 #xC7 #x44 #x24 #x30 0 0 0 0)    ; mov qword [rsp+0x30],0
       (:bytes #x41 #xFF #x14 #xC3)                 ; call [r11+rax*8]
+      (:jmp :done)
+
+      ;; #x2000 + slot: that import with RSI arguments taken from the qwords at
+      ;; RDI -- the first four in RCX RDX R8 R9, the rest on the stack.
+      (:label :h-callv)
+      (:bytes #x48 #x2D ,@(w64-le32 +win64-callv-base+))      ; sub rax,#x2000  (slot)
+      (:bytes #x48 #x3D ,@(w64-le32 (win64-iat-slots)))       ; cmp rax,slots
+      (:jcc 3 :h-enosys)                                      ; jae
+      (:bytes #x49 #xC7 #xC3 ,@(w64-le32 (+ +win64-text-va+ 5))) ; mov r11,IAT
+      (:bytes #x4D #x8B #x1C #xC3)                 ; mov r11,[r11+rax*8]  the function
+      (:bytes #x4C #x8B #x55 #xF8)                 ; mov r10,[rbp-8]   arguments
+      (:bytes #x48 #x8B #x4D #xF0)                 ; mov rcx,[rbp-16]  count
+      (:jmp :cv-args)
+      ;; #x3000: the function at RDI, RDX arguments at RSI.
+      (:label :h-callp)
+      (:bytes #x4C #x8B #x5D #xF8)                 ; mov r11,[rbp-8]   the function
+      (:bytes #x4C #x8B #x55 #xF0)                 ; mov r10,[rbp-16]  arguments
+      (:bytes #x48 #x8B #x4D #xE8)                 ; mov rcx,[rbp-24]  count
+      (:label :cv-args)
+      (:bytes #x48 #x83 #xF9 #x14)                 ; cmp rcx,20
+      (:jcc 7 :h-einval)                           ; ja
+      (:bytes #x48 #x81 #xEC #x80 #x00 #x00 #x00)  ; sub rsp,0x80  (16 stack arguments; LEAVE undoes it)
+      (:bytes #x31 #xD2)                           ; xor edx,edx
+      (:label :cv-loop)
+      (:bytes #x4C #x8D #x42 #x04)                 ; lea r8,[rdx+4]
+      (:bytes #x49 #x39 #xC8)                      ; cmp r8,rcx
+      (:jcc 3 :cv-go)                              ; jae
+      (:bytes #x4D #x8B #x4C #xD2 #x20)            ; mov r9,[r10+rdx*8+0x20]
+      (:bytes #x4C #x89 #x4C #xD4 #x20)            ; mov [rsp+rdx*8+0x20],r9
+      (:bytes #x48 #xFF #xC2)                      ; inc rdx
+      (:jmp :cv-loop)
+      (:label :cv-go)
+      (:bytes #x49 #x8B #x0A)                      ; mov rcx,[r10]
+      (:bytes #x49 #x8B #x52 #x08)                 ; mov rdx,[r10+8]
+      (:bytes #x4D #x8B #x42 #x10)                 ; mov r8,[r10+16]
+      (:bytes #x4D #x8B #x4A #x18)                 ; mov r9,[r10+24]
+      (:bytes #x41 #xFF #xD3)                      ; call r11
       (:jmp :done)
 
       ;; read(fd, buf, count): fd 0 is stdin; any other fd is a SOCKET (recv) or,
@@ -1237,10 +1287,96 @@
     (:zeros 8)
     (:label :veh-installed)
     (:zeros 8)
+    ;; USER32's GetWindowLongPtrA, DefWindowProcA and ValidateRect, for the window
+    ;; procedure: written by net/win32-window.lisp when it loads USER32.
+    (:label :wp-getwlp)
+    (:zeros 8)
+    (:label :wp-defwp)
+    (:zeros 8)
+    (:label :wp-validate)
+    (:zeros 8)
     (:align 16)
     ,@(win64-shim-items)
     (:align 16)
+    ,@(win64-wndproc-items)
+    (:align 16)
     ,@(win64-prologue-items)))
+
+(defun win64-wndproc-items ()
+  "The window procedure of every modus window (net/win32-window.lisp).  Win32
+   calls it -- inside DispatchMessageA, on the thread that pumps the window --
+   and no Lisp runs in it: it appends (msg, wParam, lParam) to the window's event
+   ring and lets DefWindowProcA do the rest, except that WM_PAINT only validates
+   (the ring tells Lisp to present), WM_ERASEBKGND answers 1 (no flicker) and
+   WM_CLOSE answers 0 (Lisp decides).  The ring is the window's GWLP_USERDATA:
+   +0 the event count (dword), +8 the capacity (dword), entries of 24 bytes from
+   +16 (msg dword, wParam, lParam); a full ring drops.  Until Lisp sets it,
+   messages go to DefWindowProcA.  The three USER32 functions it calls are in the
+   stub's :WP-* words, which the runtime fills when it loads USER32."
+  `((:label :wndproc)
+    (:bytes #x53 #x56 #x57)                      ; push rbx/rsi/rdi
+    (:bytes #x48 #x83 #xEC #x30)                 ; sub rsp,0x30  (aligned, shadow space)
+    (:bytes #x48 #x89 #xCB)                      ; mov rbx,rcx   hwnd
+    (:bytes #x89 #xD6)                           ; mov esi,edx   msg
+    (:bytes #x4C #x89 #x44 #x24 #x20)            ; mov [rsp+0x20],r8  wParam
+    (:bytes #x4C #x89 #x4C #x24 #x28)            ; mov [rsp+0x28],r9  lParam
+    (:bytes #xBA #xEB #xFF #xFF #xFF)            ; mov edx,GWLP_USERDATA (-21)
+    (:rip-load 0 :wp-getwlp) (:bytes #xFF #xD0)  ; call GetWindowLongPtrA
+    (:bytes #x48 #x85 #xC0)                      ; test rax,rax
+    (:jcc 4 :wp-def)                             ; je: no ring yet
+    (:bytes #x48 #x89 #xC7)                      ; mov rdi,rax  ring
+    (:bytes #x83 #xFE #x14)                      ; cmp esi,WM_ERASEBKGND
+    (:jcc 4 :wp-one)
+    ;; Record only what Lisp reads: keys (0x100-0x10F), the mouse (0x200-0x20F),
+    ;; WM_SIZE, WM_SETFOCUS, WM_KILLFOCUS, WM_PAINT, WM_CLOSE.
+    (:bytes #x8D #x86 #x00 #xFF #xFF #xFF)       ; lea eax,[rsi-0x100]
+    (:bytes #x83 #xF8 #x10)                      ; cmp eax,0x10
+    (:jcc 2 :wp-rec)                             ; jb
+    (:bytes #x8D #x86 #x00 #xFE #xFF #xFF)       ; lea eax,[rsi-0x200]
+    (:bytes #x83 #xF8 #x10)                      ; cmp eax,0x10
+    (:jcc 2 :wp-rec)
+    (:bytes #x83 #xFE #x05) (:jcc 4 :wp-rec)     ; WM_SIZE
+    (:bytes #x83 #xFE #x07) (:jcc 4 :wp-rec)     ; WM_SETFOCUS
+    (:bytes #x83 #xFE #x08) (:jcc 4 :wp-rec)     ; WM_KILLFOCUS
+    (:bytes #x83 #xFE #x0F) (:jcc 4 :wp-rec)     ; WM_PAINT
+    (:bytes #x83 #xFE #x10) (:jcc 4 :wp-rec)     ; WM_CLOSE
+    (:jmp :wp-def)
+    (:label :wp-rec)
+    (:bytes #x8B #x07)                           ; mov eax,[rdi]   count
+    (:bytes #x3B #x47 #x08)                      ; cmp eax,[rdi+8] capacity
+    (:jcc 3 :wp-full)                            ; jae
+    (:bytes #x48 #x6B #xC0 #x18)                 ; imul rax,rax,24
+    (:bytes #x89 #x74 #x07 #x10)                 ; mov [rdi+rax+16],esi
+    (:bytes #x48 #x8B #x4C #x24 #x20)            ; mov rcx,[rsp+0x20]
+    (:bytes #x48 #x89 #x4C #x07 #x18)            ; mov [rdi+rax+24],rcx
+    (:bytes #x48 #x8B #x4C #x24 #x28)            ; mov rcx,[rsp+0x28]
+    (:bytes #x48 #x89 #x4C #x07 #x20)            ; mov [rdi+rax+32],rcx
+    (:bytes #xFF #x07)                           ; inc dword [rdi]
+    (:label :wp-full)
+    (:bytes #x83 #xFE #x0F)                      ; cmp esi,WM_PAINT
+    (:jcc 4 :wp-paint)
+    (:bytes #x83 #xFE #x10)                      ; cmp esi,WM_CLOSE
+    (:jcc 4 :wp-zero)
+    (:label :wp-def)
+    (:bytes #x48 #x89 #xD9)                      ; mov rcx,rbx
+    (:bytes #x89 #xF2)                           ; mov edx,esi
+    (:bytes #x4C #x8B #x44 #x24 #x20)            ; mov r8,[rsp+0x20]
+    (:bytes #x4C #x8B #x4C #x24 #x28)            ; mov r9,[rsp+0x28]
+    (:rip-load 0 :wp-defwp) (:bytes #xFF #xD0)   ; call DefWindowProcA
+    (:jmp :wp-ret)
+    (:label :wp-paint)
+    (:bytes #x48 #x89 #xD9)                      ; mov rcx,rbx
+    (:bytes #x31 #xD2)                           ; xor edx,edx  (the whole window)
+    (:rip-load 0 :wp-validate) (:bytes #xFF #xD0) ; call ValidateRect
+    (:label :wp-zero)
+    (:bytes #x31 #xC0)                           ; xor eax,eax
+    (:jmp :wp-ret)
+    (:label :wp-one)
+    (:bytes #xB8 #x01 #x00 #x00 #x00)            ; mov eax,1
+    (:label :wp-ret)
+    (:bytes #x48 #x83 #xC4 #x30)                 ; add rsp,0x30
+    (:bytes #x5F #x5E #x5B)                      ; pop rdi/rsi/rbx
+    (:bytes #xC3)))                              ; ret
 
 (defvar *win64-stub-cache* nil
   "(stub-bytes shim-offset iat-offset), assembled once per process: the LAYOUT
@@ -1250,7 +1386,7 @@
   (unless *win64-stub-cache*
     (multiple-value-bind (bytes labels) (w64-assemble (win64-stub-items))
       (setf *win64-stub-cache*
-            (list bytes (cdr (assoc :shim labels)) (cdr (assoc :iat labels))))))
+            (list bytes (cdr (assoc :shim labels)) (cdr (assoc :iat labels)) labels))))
   (first *win64-stub-cache*))
 
 (defun win64-shim-offset ()
@@ -1260,6 +1396,12 @@
 (defun win64-iat-offset ()
   (win64-stub)
   (third *win64-stub-cache*))
+
+(defun win64-label-va (label)
+  "Virtual address of LABEL in the stub."
+  (win64-stub)
+  (+ +win64-text-va+ (or (cdr (assoc label (fourth *win64-stub-cache*)))
+                         (error "boot-win64: no stub label ~S" label))))
 
 (defun win64-shim-va ()
   "Virtual address of the syscall shim.  translate-x64 calls it for every syscall
@@ -1664,7 +1806,11 @@
     (dolist (dll *win64-imports*)
       (dolist (name (rest dll))
         (format o "(defconstant +w32-~(~A~)+ ~D)~%"
-                name (+ +win64-call-base+ (win64-import-slot name)))))))
+                name (+ +win64-call-base+ (win64-import-slot name)))))
+    ;; The window procedure (WIN64-WNDPROC-ITEMS), for net/win32-window.lisp.
+    (format o "(defconstant +w32-wndproc-va+ ~D)~%" (win64-label-va :wndproc))
+    (dolist (l '(:wp-getwlp :wp-defwp :wp-validate))
+      (format o "(defconstant +w32-~(~A~)-va+ ~D)~%" l (win64-label-va l)))))
 
 (defun win64-configure-build ()
   "Point the translator at this image's layout and add the Windows runtime
@@ -1676,7 +1822,11 @@
   (setf modus.mvm.x64::*x64-win-shim-va* (win64-shim-va))
   (setq cl-user::*full-source*
         (concatenate 'string cl-user::*full-source* (string #\Newline)
-                     (win64-import-constants-source) *win64-runtime-source*))
+                     (win64-import-constants-source) *win64-runtime-source*
+                     (string #\Newline)
+                     (with-open-file (s (cl-user::modus-source "net/win32-window.lisp"))
+                       (let ((b (make-string (file-length s))))
+                         (subseq b 0 (read-sequence b s))))))
   ;; The JIT co-init's shim address (build-cli-common, *CLI-WIN64*).  Every copy of
   ;; the co-init in the source gets it; with the JIT on there must be at least one.
   (let ((token "WIN64-SHIM-VA-PLACEHOLDER")

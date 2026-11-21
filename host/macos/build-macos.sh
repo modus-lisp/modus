@@ -40,7 +40,8 @@ case $KIND in
     mkdir -p "$OUT/Contents/MacOS"
     BIN=$OUT/Contents/MacOS/modus
     DEFS="-DMODUS_MAC_GUI=1"
-    EXTRA_SRC="$HERE/modus-ui-mac.m"
+    # the window, and the Objective-C bridge the iOS build uses (host/ios/modus-objc.m: it needs no UIKit)
+    EXTRA_SRC="$HERE/modus-ui-mac.m $HERE/../ios/modus-objc.m"
     FRAMEWORKS="-framework AudioToolbox -framework Security -framework Foundation -framework AppKit -framework IOSurface -framework QuartzCore"
     cat > "$OUT/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

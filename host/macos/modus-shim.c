@@ -194,6 +194,7 @@ static void run_image_beside_uikit(int argc, char **argv, uint64_t sp, uint64_t 
 extern void modus_mac_init(void);
 extern void modus_mac_main(void) __attribute__((noreturn));
 extern int64_t modus_mac_call(int64_t nr, int64_t a0, int64_t a1, int64_t a2, int64_t a3);
+extern int64_t modus_objc_call(int64_t frame);   // host/ios/modus-objc.m: built into the Mac window too
 struct mac_image_start { uint64_t sp, entry; };
 static void *mac_image_thread(void *arg) {
     struct mac_image_start st = *(struct mac_image_start *)arg;
@@ -1009,6 +1010,8 @@ static lw modus_syscall_1(lw a0, lw a1, lw a2, lw a3, lw a4, lw a5, lw nr,
 #if defined(MODUS_MAC_GUI)
     case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // the window (host/macos/modus-ui-mac.m)
         return modus_mac_call(nr, a0, a1, a2, a3);
+    case 1040:   // the Objective-C runtime: a frame in the image's memory (host/ios/modus-objc.m, the same bridge)
+        return modus_objc_call(a0);
 #elif TARGET_OS_IPHONE
     case 1001: case 1002: case 1003: case 1004: case 1005: case 1006: case 1007: case 1008:   // screen, input, copy, frame clock (host/ios/modus-ui.m)
         return modus_ui_call(nr, a0, a1, a2, a3);

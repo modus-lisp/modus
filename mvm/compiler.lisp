@@ -27786,10 +27786,17 @@
     ;; inline fixnum fast path, with BIGNUM-ASH kept as the out-of-line slow
     ;; path.  See %COMPILE-ASH-VAR-FAST.  (setq *cg-var-ash* :off) at runtime
     ;; restores the plain call, for A/B in one binary.
+    ;; ... and only on a 62-bit fixnum tower: the fast path bounds a left shift
+    ;; at 62 and checks it by shifting back in ONE machine word.  The bare i386
+    ;; image never sets *JIT-TARGET-ARCH* (it stays :X64), so its native tier
+    ;; took this path with 32-bit words: (ash 1 30) wrapped to -1073741824 and
+    ;; (ash 1 31) to 0, the shift-back agreeing with the wrap.  On a 30-bit
+    ;; tower every variable count takes the BIGNUM-ASH call below.
     ((and (null count) *mvm-eval-runtime-p*
           (boundp (quote *jit-target-arch*))
           (let ((a (symbol-value (quote *jit-target-arch*))))
             (or (eq a :x64) (eq a :aarch64)))
+          (> (ct-fixnum-bits) 40)
           (%cg-on-p (quote *cg-var-ash*)))
      (%compile-ash-var-fast value-form count-form env dest))
     ;; Large constant or variable count — call bignum-ash so we

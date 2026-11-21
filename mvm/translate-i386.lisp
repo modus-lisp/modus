@@ -4681,21 +4681,34 @@ modus: heap exhausted -- this machine needs more RAM
            (i386-emit-sar-reg-imm buf +scratch0+ (if (>= amt 32) 31 amt))
            (i386-store-vreg buf vd +scratch0+)))
 
-        ((op= +op-shlv+)
-         ;; (shlv Vd Vs Vc) — shift left by register count
-         ;; Load count into ECX (CL), source into EAX, SHL EAX,CL
-         (let ((vd (first operands)) (vs (second operands)) (vc (third operands)))
+        ((or (op= +op-shlv+) (op= +op-sarv+))
+         ;; (shlv/sarv Vd Vs Vc) — shift the TAGGED word Vs by the TAGGED fixnum
+         ;; count Vc: the VALUE-level contract of the interpreter, aarch64 and
+         ;; x64 (mvm.lisp :SHLV).  This arm loaded the count into CL still
+         ;; tagged, a shift by 2k, silently: compile-ash's runtime fast path
+         ;; (%COMPILE-ASH-VAR-FAST) shifts back by the same wrong count to check
+         ;; for overflow, so it never noticed.  The bare i386 native tier runs
+         ;; that path (*JIT-TARGET-ARCH* is its :X64 default there), and every
+         ;; JIT'd (ash 1 k) came out 2^(2k): brotli-pure's dictionary offsets,
+         ;; SHA-1's rotates.
+         ;; And x86 masks a 32-bit shift count to 5 bits, while that path lets
+         ;; counts up to 61 through: shifting by 40 would shift by 8 and pass the
+         ;; shift-back check.  So the shift is done in two halves, C>>1 and
+         ;; C-(C>>1), each at most 31: a left shift by 32..61 is 0 (which the
+         ;; check rejects to BIGNUM-ASH), a right shift is the sign fill.
+         ;; EAX = source, ECX = count, EDX = the second half (scratch1).
+         (let ((vd (first operands)) (vs (second operands)) (vc (third operands))
+               (left (op= +op-shlv+)))
            (i386-load-vreg buf +i386-ecx+ vc)
            (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-shl-reg-cl buf +i386-eax+)
-           (i386-store-vreg buf vd +i386-eax+)))
-
-        ((op= +op-sarv+)
-         ;; (sarv Vd Vs Vc) — arithmetic shift right by register count
-         (let ((vd (first operands)) (vs (second operands)) (vc (third operands)))
-           (i386-load-vreg buf +i386-ecx+ vc)
-           (i386-load-vreg buf +i386-eax+ vs)
-           (i386-emit-sar-reg-cl buf +i386-eax+)
+           (i386-emit-sar-reg-imm buf +i386-ecx+ 1)          ; untag the count
+           (i386-emit-mov-reg-reg buf +i386-edx+ +i386-ecx+)
+           (i386-emit-shr-reg-imm buf +i386-ecx+ 1)          ; ECX = C>>1
+           (i386-emit-byte buf #x29)                         ; SUB EDX, ECX
+           (i386-emit-byte buf (i386-modrm #b11 +i386-ecx+ +i386-edx+))
+           (if left (i386-emit-shl-reg-cl buf +i386-eax+) (i386-emit-sar-reg-cl buf +i386-eax+))
+           (i386-emit-mov-reg-reg buf +i386-ecx+ +i386-edx+)
+           (if left (i386-emit-shl-reg-cl buf +i386-eax+) (i386-emit-sar-reg-cl buf +i386-eax+))
            (i386-store-vreg buf vd +i386-eax+)))
 
         ((op= +op-ldb+)
